@@ -2,6 +2,7 @@ import { Button, Tabs, Toast, toast } from "@heroui/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { load } from "@tauri-apps/plugin-store";
 import { useEffect, useRef, useState, type Key } from "react";
 import { useTranslation } from "react-i18next";
 import { CommitTimeline } from "./components/commit-timeline";
@@ -14,11 +15,16 @@ import type { CopyOutcome } from "./generated/CopyOutcome";
 import type { CopyRequest } from "./generated/CopyRequest";
 import { commitCopyNote, copyNote, type CopyKind, type CopyNote } from "./lib/copy-message";
 import { errorText, setLanguage } from "./lib/i18n";
+import { showCopyNotification } from "./lib/settings";
 
 type Tab = "files" | "commits" | "paste";
 
-function showNote(note: CopyNote) {
-	toast[note.severity](note.text);
+// Copy-success toasts honour showCopyNotification like TS; errors always show.
+async function showNote(note: CopyNote) {
+	const stored = await load("settings.json")
+		.then((store) => store.get("settings"))
+		.catch(() => undefined);
+	if (showCopyNotification(stored)) toast[note.severity](note.text);
 }
 
 export default function App() {
@@ -38,7 +44,7 @@ export default function App() {
 		const offs = [
 			listen<CopyDone>("tray-copied", ({ payload }) => {
 				const { t } = live.current;
-				showNote(
+				void showNote(
 					payload.mode === "commits"
 						? commitCopyNote(t, payload)
 						: copyNote(t, lastCopyKind.current, payload),
@@ -81,7 +87,7 @@ export default function App() {
 			const outcome = await invoke<CopyOutcome>("copy", { request });
 			const kind: CopyKind = request.kind === "files" ? "files" : "git";
 			lastCopyKind.current = kind;
-			showNote(copyNote(t, kind, outcome));
+			void showNote(copyNote(t, kind, outcome));
 		} catch (error: unknown) {
 			toast.danger(errorText(t, error));
 		}
@@ -89,7 +95,7 @@ export default function App() {
 
 	async function handleCopyCommits(selection: CommitSelection) {
 		try {
-			showNote(
+			void showNote(
 				commitCopyNote(t, await invoke<CommitCopySummary>("copy_commits", { repo, selection })),
 			);
 		} catch (error: unknown) {
