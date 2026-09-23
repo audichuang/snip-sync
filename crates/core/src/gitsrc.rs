@@ -2,15 +2,23 @@
 //!
 //! Replaces the VS Code git API layer of ClipCodeVSCode (`gitCopy.ts`,
 //! `gitHistory.ts`, `graphCopy.ts`, `catFile.ts`, commit 0aa24c8) with direct
-//! git plumbing calls (porting-notes section 5). Filters, size and count
-//! limits are the caller's bookkeeping; this module only yields the files.
+//! git plumbing calls (porting-notes section 5). `collect` only yields the
+//! files; `collect_payload` applies filters, limits and counts on top.
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use crate::format::{ChangeType, PayloadFile};
+use crate::copy::CopyResult;
+use crate::filter::file_matches_filters;
+use crate::format::{
+	build_git_payload, build_payload, BuildPayloadOptions, ChangeType,
+	PayloadFile,
+};
 use crate::fsutil::{decode_utf8_or_skip, read_text_file};
+use crate::paths::{source_root_name, to_clipboard_path_from_roots};
+use crate::settings::Settings;
 
 /// The well-known OID of git's empty tree: the "parent" of a root commit.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -417,6 +425,28 @@ fn diff(git: &Git, args: &[&str]) -> Result<Vec<RawEntry>, GitError> {
 
 /// Collects the changed files of `source` as payload files.
 pub fn collect(git: &Git, source: &GitSource) -> Result<GitFiles, GitError> {
+	let (all, mut skipped) = collect_raw(git, source)?;
+	let mut files = Vec::with_capacity(all.len());
+	for f in all {
+		if f.content.is_some() {
+			files.push(f);
+		} else {
+			skipped += 1;
+		}
+	}
+	Ok(GitFiles {
+		files,
+		skipped_unreadable_count: skipped,
+	})
+}
+
+/// The files of `source` in order, an unreadable one kept with `content:
+/// None` so callers can filter before counting it; plus the number of
+/// entries dropped for a non-UTF-8 path name.
+fn collect_raw(
+	git: &Git,
+	source: &GitSource,
+) -> Result<(Vec<PayloadFile>, usize), GitError> {
 	let mut skipped = 0;
 	let mut changes = Vec::new();
 	match source {
@@ -510,26 +540,162 @@ pub fn collect(git: &Git, source: &GitSource) -> Result<GitFiles, GitError> {
 				}
 				// Staged content was asked for: an index entry that cannot
 				// be read is a visible placeholder, never a silent gap.
-				GitSource::Staged => match cat.read(&c.new_oid)? {
-					None => Some(UNREADABLE_FILE_MARKER.to_string()),
-					Some(bytes) => decode_utf8_or_skip(bytes),
-				},
+				// TS: `readRefContent(...) ?? UNREADABLE_FILE_MARKER`, so a
+				// non-UTF-8 blob is the marker too.
+				GitSource::Staged => Some(
+					cat.read(&c.new_oid)?
+						.and_then(decode_utf8_or_skip)
+						.unwrap_or_else(|| UNREADABLE_FILE_MARKER.to_string()),
+				),
 				_ => read_text(&mut cat, &c.new_oid)?,
 			}
 		};
-		match content {
-			Some(content) => files.push(PayloadFile {
-				path: c.path,
-				content: Some(content),
-				change_type: Some(change_type),
-				skipped_reason: None,
-			}),
-			None => skipped += 1,
-		}
+		files.push(PayloadFile {
+			path: c.path,
+			content,
+			change_type: Some(change_type),
+			skipped_reason: None,
+		});
 	}
-	Ok(GitFiles {
+	Ok((files, skipped))
+}
+
+/// TS `normalizeFsPath`: a comparison key only, case-folded on Windows.
+fn fs_path_key(path: &Path) -> String {
+	let key = path.to_string_lossy().replace('\\', "/");
+	let key = key.trim_end_matches('/');
+	if cfg!(windows) {
+		key.to_lowercase()
+	} else {
+		key.to_string()
+	}
+}
+
+/// Port of `collectGitPayloadFiles` (extension.ts) plus the payload build:
+/// the files of `source` with filters, limits and counts applied, labelled
+/// against `workspace_roots` (the repository root when there are none).
+pub fn collect_payload<P: AsRef<Path>>(
+	git: &Git,
+	source: &GitSource,
+	workspace_roots: &[P],
+	settings: &Settings,
+) -> Result<CopyResult, GitError> {
+	let mut roots: Vec<PathBuf> = workspace_roots
+		.iter()
+		.map(|r| r.as_ref().to_path_buf())
+		.collect();
+	if roots.is_empty() {
+		roots.push(git.root().to_path_buf());
+	}
+	let (collected, path_skips) = collect_raw(git, source)?;
+	let mut files = Vec::new();
+	let mut seen = HashSet::new();
+	let mut copied = 0;
+	let mut skipped_size = 0;
+	let mut skipped_unreadable = path_skips;
+	let mut limit_reached = false;
+	// Commit and range copies are the graph surface, which always uses the
+	// git builder; SCM falls back to it for deleted or index content.
+	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
+	let mut fallback = graph;
+	for file in collected {
+		let absolute = git.root().join(&file.path);
+		if !seen.insert(fs_path_key(&absolute)) {
+			continue;
+		}
+		let absolute = absolute.to_string_lossy().into_owned();
+		let filter_path = to_clipboard_path_from_roots(&roots, &absolute, None);
+		// graphCopy labels a single repo's files repo-relative and filters
+		// on the workspace-relative spelling; SCM uses the latter for both.
+		let path = if graph {
+			file.path.clone()
+		} else {
+			filter_path.clone()
+		};
+		if settings.use_filters
+			&& !file_matches_filters(
+				&filter_path,
+				&settings.filter_rules,
+				settings.use_include_filters,
+				settings.use_exclude_filters,
+				Some(&absolute),
+			) {
+			continue;
+		}
+		// Checked after dedupe and filtering, so the flag means a copyable
+		// candidate was actually dropped.
+		if settings.set_max_file_count
+			&& copied as f64 >= settings.file_count_limit
+		{
+			limit_reached = true;
+			break;
+		}
+		// Both TS surfaces check the limit first, then drop unreadable
+		// content; only graphCopy counts it (the SCM path just skips it).
+		let Some(content) = file.content else {
+			if graph {
+				skipped_unreadable += 1;
+			}
+			continue;
+		};
+		if file.change_type == Some(ChangeType::Deleted)
+			|| *source == GitSource::Staged
+		{
+			fallback = true;
+		}
+		let size = content.len();
+		if size as f64 > settings.max_file_size_kb * 1024.0 {
+			skipped_size += 1;
+			files.push(PayloadFile {
+				path,
+				content: None,
+				change_type: file.change_type,
+				skipped_reason: Some(format!(
+					"size exceeds limit ({size} bytes)"
+				)),
+			});
+			continue;
+		}
+		// The marker travels in the payload but is not a copied file and
+		// does not consume the limit.
+		if content == UNREADABLE_FILE_MARKER {
+			skipped_unreadable += 1;
+		} else {
+			copied += 1;
+		}
+		files.push(PayloadFile {
+			path,
+			content: Some(content),
+			change_type: file.change_type,
+			skipped_reason: None,
+		});
+	}
+	let options = BuildPayloadOptions {
+		header_format: settings.header_format.clone(),
+		pre_text: settings.pre_text.clone(),
+		post_text: settings.post_text.clone(),
+		add_extra_line_between_files: settings.add_extra_line_between_files,
 		files,
-		skipped_unreadable_count: skipped,
+		// graphCopy names the repository (`singleRepoRoot`), SCM the
+		// single workspace root.
+		source_root: if graph {
+			source_root_name(&[git.root()])
+		} else {
+			source_root_name(&roots)
+		},
+	};
+	let payload = if fallback {
+		build_git_payload(&options)
+	} else {
+		build_payload(&options)
+	};
+	Ok(CopyResult {
+		files: options.files,
+		payload,
+		copied_file_count: copied,
+		skipped_file_size_count: skipped_size,
+		skipped_unreadable_count: skipped_unreadable,
+		file_limit_reached: limit_reached,
 	})
 }
 
@@ -993,5 +1159,314 @@ mod tests {
 	fn staged_leaves_conflicts_out() {
 		let r = conflicted_repo();
 		assert_eq!(r.collect(GitSource::Staged), GitFiles::default());
+	}
+
+	// ---- collect_payload: stagedGitCopy.test.ts / graphCopy.test.ts ----
+
+	use crate::settings::{FilterAction, FilterRule, FilterType};
+
+	fn payload(r: &Repo, source: GitSource, settings: &Settings) -> CopyResult {
+		let git = Git::open(&r.path()).unwrap();
+		collect_payload(&git, &source, &[git.root()], settings).unwrap()
+	}
+
+	fn no_limit() -> Settings {
+		Settings {
+			set_max_file_count: false,
+			..Settings::default()
+		}
+	}
+
+	#[test]
+	fn payload_staged_preserves_index_bytes_plus_deleted_and_renamed() {
+		let r = Repo::new();
+		r.write("same.ts", b"head\n");
+		r.write("gone.ts", b"head:deleted\n");
+		r.write("old.ts", b"a renamed file body that stays the same\n");
+		r.commit("base");
+		r.write("same.ts", b"index:same\n");
+		r.git(&["add", "same.ts"]);
+		r.write("same.ts", b"working\n");
+		r.git(&["rm", "-q", "gone.ts"]);
+		r.git(&["mv", "old.ts", "new.ts"]);
+		let got = payload(&r, GitSource::Staged, &no_limit());
+		assert_eq!(
+			got.files,
+			vec![
+				file("gone.ts", "head:deleted\n", Deleted),
+				file(
+					"new.ts",
+					"a renamed file body that stays the same\n",
+					Moved
+				),
+				file("same.ts", "index:same\n", Modified),
+			]
+		);
+		assert_eq!(got.copied_file_count, 3);
+		assert!(!got.payload.contains("working"));
+	}
+
+	fn broken_index_repo() -> Repo {
+		let r = Repo::new();
+		r.write("broken.ts", b"head\n");
+		r.write("real.ts", b"head\n");
+		r.commit("base");
+		r.write("broken.ts", &[0xa4, 0xe9, 0xa5, 0xbb]); // Big5
+		r.write("real.ts", b"index:real\n");
+		r.git(&["add", "-A"]);
+		r.write("broken.ts", b"working\n");
+		r
+	}
+
+	#[test]
+	fn payload_unreadable_index_entry_is_the_marker_not_the_working_tree() {
+		let r = broken_index_repo();
+		let got = payload(&r, GitSource::Staged, &no_limit());
+		assert_eq!(
+			got.files,
+			vec![
+				file("broken.ts", UNREADABLE_FILE_MARKER, Modified),
+				file("real.ts", "index:real\n", Modified),
+			]
+		);
+		assert_eq!(got.copied_file_count, 1);
+		assert_eq!(got.skipped_unreadable_count, 1);
+	}
+
+	#[test]
+	fn payload_unreadable_placeholder_does_not_consume_the_limit() {
+		let r = broken_index_repo();
+		let settings = Settings {
+			set_max_file_count: true,
+			file_count_limit: 1.0,
+			..Settings::default()
+		};
+		let got = payload(&r, GitSource::Staged, &settings);
+		assert_eq!(
+			got.files,
+			vec![
+				file("broken.ts", UNREADABLE_FILE_MARKER, Modified),
+				file("real.ts", "index:real\n", Modified),
+			]
+		);
+		assert_eq!(got.copied_file_count, 1);
+		assert_eq!(got.skipped_unreadable_count, 1);
+		assert!(!got.file_limit_reached);
+	}
+
+	#[test]
+	fn payload_limit_trips_only_on_a_dropped_candidate() {
+		let r = Repo::new();
+		r.write("a.txt", b"a\n");
+		r.write("b.txt", b"b\n");
+		let sha = r.commit("init");
+		let limit = |n: f64| Settings {
+			set_max_file_count: true,
+			file_count_limit: n,
+			..Settings::default()
+		};
+		let got = payload(&r, GitSource::Commit(sha.clone()), &limit(1.0));
+		assert_eq!(got.files, vec![file("a.txt", "a\n", New)]);
+		assert!(got.file_limit_reached);
+		// The limit exactly fits: nothing was dropped.
+		let got = payload(&r, GitSource::Commit(sha), &limit(2.0));
+		assert_eq!(got.copied_file_count, 2);
+		assert!(!got.file_limit_reached);
+	}
+
+	#[test]
+	fn payload_oversize_file_is_skipped_with_reason() {
+		let r = Repo::new();
+		r.write("b.ts", "x".repeat(2 * 1024).as_bytes());
+		let sha = r.commit("init");
+		let settings = Settings {
+			max_file_size_kb: 1.0,
+			..Settings::default()
+		};
+		let got = payload(&r, GitSource::Commit(sha), &settings);
+		assert_eq!(got.skipped_file_size_count, 1);
+		assert_eq!(got.copied_file_count, 0);
+		assert_eq!(
+			got.files[0].skipped_reason.as_deref(),
+			Some("size exceeds limit (2048 bytes)")
+		);
+		assert_eq!(got.files[0].change_type, Some(New));
+		assert!(got.payload.contains("File skipped: size exceeds limit"));
+	}
+
+	#[test]
+	fn payload_honours_the_exclude_filters() {
+		let r = Repo::new();
+		r.write("secrets.env", b"SECRET\n");
+		r.write("src/a.ts", b"ok\n");
+		let sha = r.commit("init");
+		let settings = Settings {
+			use_filters: true,
+			use_exclude_filters: true,
+			filter_rules: vec![FilterRule {
+				kind: FilterType::Path,
+				action: FilterAction::Exclude,
+				value: "secrets.env".into(),
+				enabled: true,
+			}],
+			..Settings::default()
+		};
+		let got = payload(&r, GitSource::Commit(sha), &settings);
+		assert!(!got.payload.contains("SECRET"));
+		assert!(got.payload.contains("src/a.ts"));
+		assert_eq!(got.copied_file_count, 1);
+	}
+
+	#[test]
+	fn payload_counts_unreadable_only_after_filtering_on_the_graph() {
+		let r = Repo::new();
+		r.write("bin.dat", &[0xff, 0xfe, 0x00]);
+		r.write("a.ts", b"ok\n");
+		let sha = r.commit("init");
+		let exclude = Settings {
+			use_filters: true,
+			use_exclude_filters: true,
+			filter_rules: vec![FilterRule {
+				kind: FilterType::Path,
+				action: FilterAction::Exclude,
+				value: "bin.dat".into(),
+				enabled: true,
+			}],
+			..Settings::default()
+		};
+		let got = payload(&r, GitSource::Commit(sha.clone()), &exclude);
+		assert_eq!(
+			(got.skipped_unreadable_count, got.copied_file_count),
+			(0, 1)
+		);
+		let got = payload(&r, GitSource::Commit(sha), &Settings::default());
+		assert_eq!(
+			(got.skipped_unreadable_count, got.copied_file_count),
+			(1, 1)
+		);
+	}
+
+	#[test]
+	fn payload_working_unreadable_is_skipped_uncounted_like_scm() {
+		let r = Repo::new();
+		r.write("a.ts", b"ok\n");
+		r.commit("init");
+		r.write("bin.dat", &[0xff, 0xfe, 0x00]);
+		let got = payload(&r, GitSource::Working, &Settings::default());
+		assert_eq!(got.files, vec![]);
+		assert_eq!(got.skipped_unreadable_count, 0);
+	}
+
+	#[test]
+	fn payload_paths_are_workspace_relative_with_a_single_root_line() {
+		let r = Repo::new();
+		r.write("src/a.ts", b"a\n");
+		r.write("top.ts", b"top\n");
+		let sha = r.commit("init");
+		let git = Git::open(&r.path()).unwrap();
+		let src = git.root().join("src");
+		r.write("src/a.ts", b"a2\n");
+		r.git(&["add", "src/a.ts"]);
+		let s = Settings::default();
+		let got =
+			collect_payload(&git, &GitSource::Staged, &[&src], &s).unwrap();
+		assert_eq!(got.files[0].path, "a.ts");
+		assert!(got.payload.starts_with("// clipcode-root: src\n"));
+		r.git(&["reset", "-q", "--hard"]);
+		// The graph surface stays repo-relative and names the repository,
+		// while filters still see the workspace-relative path.
+		let parent = git.root().parent().unwrap().to_path_buf();
+		let repo = git.root().file_name().unwrap().to_string_lossy();
+		let exclude = Settings {
+			use_filters: true,
+			use_exclude_filters: true,
+			filter_rules: vec![FilterRule {
+				kind: FilterType::Path,
+				action: FilterAction::Exclude,
+				value: format!("{repo}/top.ts"),
+				enabled: true,
+			}],
+			..Settings::default()
+		};
+		let commit = GitSource::Commit(sha);
+		let got = collect_payload(&git, &commit, &[&parent], &exclude).unwrap();
+		assert_eq!(got.files, vec![file("src/a.ts", "a\n", New)]);
+		assert!(got
+			.payload
+			.starts_with(&format!("// clipcode-root: {repo}\n")));
+		// A deletion still carries its pre-deletion body.
+		fs::remove_file(r.path().join("top.ts")).unwrap();
+		let del = r.commit("rm");
+		let got = payload(&r, GitSource::Commit(del), &Settings::default());
+		assert_eq!(got.files, vec![file("top.ts", "top\n", Deleted)]);
+		assert!(got.payload.contains("[DELETED] top.ts"));
+	}
+
+	fn options(
+		files: &[PayloadFile],
+		roots: &[PathBuf],
+	) -> BuildPayloadOptions {
+		let s = Settings::default();
+		BuildPayloadOptions {
+			header_format: s.header_format,
+			pre_text: s.pre_text,
+			post_text: s.post_text,
+			add_extra_line_between_files: s.add_extra_line_between_files,
+			files: files.to_vec(),
+			source_root: source_root_name(roots),
+		}
+	}
+
+	#[test]
+	fn payload_builder_follows_the_ts_fallback_rule() {
+		let r = Repo::new();
+		r.write("keep.txt", b"v1\n");
+		r.write("gone.txt", b"gone\n");
+		r.commit("base");
+		let git = Git::open(&r.path()).unwrap();
+		let roots = [git.root().to_path_buf()];
+		let s = Settings::default();
+
+		r.write("keep.txt", b"v2\n");
+		let got =
+			collect_payload(&git, &GitSource::Working, &roots, &s).unwrap();
+		let regular = build_payload(&options(&got.files, &roots));
+		assert_ne!(regular, build_git_payload(&options(&got.files, &roots)));
+		assert_eq!(got.payload, regular, "working without deletions");
+
+		fs::remove_file(r.path().join("gone.txt")).unwrap();
+		let got =
+			collect_payload(&git, &GitSource::Working, &roots, &s).unwrap();
+		let opts = options(&got.files, &roots);
+		assert_eq!(got.payload, build_git_payload(&opts), "working deletion");
+
+		r.git(&["add", "keep.txt"]);
+		let got =
+			collect_payload(&git, &GitSource::Staged, &roots, &s).unwrap();
+		let opts = options(&got.files, &roots);
+		assert_eq!(got.payload, build_git_payload(&opts), "index content");
+
+		let head = GitSource::Commit("HEAD".into());
+		let got = collect_payload(&git, &head, &roots, &s).unwrap();
+		let opts = options(&got.files, &roots);
+		assert_eq!(got.payload, build_git_payload(&opts), "graph surface");
+	}
+
+	#[test]
+	fn payload_without_workspace_roots_labels_against_the_repo() {
+		let r = Repo::new();
+		r.write("a.txt", b"a\n");
+		let sha = r.commit("init");
+		let git = Git::open(&r.path()).unwrap();
+		let none: [&Path; 0] = [];
+		let got = collect_payload(
+			&git,
+			&GitSource::Commit(sha),
+			&none,
+			&Settings::default(),
+		)
+		.unwrap();
+		assert_eq!(got.files, vec![file("a.txt", "a\n", New)]);
+		assert!(got.payload.starts_with("// clipcode-root: r\n"));
 	}
 }
