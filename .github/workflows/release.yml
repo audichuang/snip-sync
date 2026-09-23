@@ -1,0 +1,327 @@
+name: Release
+
+on:
+    push:
+        tags:
+            - "v*"
+    workflow_dispatch:
+        inputs:
+            version:
+                description: "Version tag (e.g., v1.0.0)"
+                required: true
+                type: string
+            prerelease:
+                description: "Create as pre-release"
+                required: false
+                type: boolean
+                default: true
+
+# Never cancel a release mid-upload; a re-pushed tag waits for the earlier run.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+env:
+    CARGO_TERM_COLOR: always
+    RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
+    PRERELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || contains(github.ref_name, '-') }}
+
+jobs:
+    # Release gate: the tagged commit must already have a green push-to-main
+    # ci.yml run. pull_request runs are not trusted because their path filter
+    # can skip the test jobs (skipped != passed).
+    verify-ci:
+        name: Verify CI is green for this commit
+        runs-on: ubuntu-latest
+        permissions:
+            actions: read
+        steps:
+            - name: Assert ci.yml passed for the tagged commit
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  SHA: ${{ github.sha }}
+                  REPO: ${{ github.repository }}
+              run: |
+                  set -euo pipefail
+                  N=$(gh api \
+                    "/repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=completed&event=push" \
+                    --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')
+                  if [ "$N" -lt 1 ]; then
+                      echo "::error::No green push-to-main ci.yml run for $SHA." >&2
+                      echo "Push the commit to main, wait for CI to pass, then push the tag." >&2
+                      exit 1
+                  fi
+                  echo "ci.yml is green (push to main) for $SHA ($N run(s))."
+
+    changelog:
+        name: Generate Changelog
+        needs: verify-ci
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+            - name: Generate Changelog
+              uses: orhun/git-cliff-action@v4
+              with:
+                  config: cliff.toml
+                  args: -vv --latest --strip header
+              env:
+                  OUTPUT: CHANGES.md
+                  GITHUB_REPO: ${{ github.repository }}
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v3
+              with:
+                  tag_name: ${{ env.RELEASE_TAG }}
+                  name: "snip-sync ${{ env.RELEASE_TAG }}"
+                  body_path: CHANGES.md
+                  draft: false
+                  prerelease: ${{ env.PRERELEASE }}
+
+    build-tauri:
+        needs: [verify-ci, changelog]
+        name: Build Desktop (${{ matrix.target }})
+        runs-on: ${{ matrix.os }}
+        env:
+            SCCACHE_GHA_ENABLED: "true"
+            RUSTC_WRAPPER: "sccache"
+        permissions:
+            contents: write
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - os: macos-latest
+                      target: aarch64-apple-darwin
+                      bundles: dmg
+                      asset: snip-sync_mac_arm.dmg
+                      pattern: "*.dmg"
+                    - os: macos-latest
+                      target: x86_64-apple-darwin
+                      bundles: dmg
+                      asset: snip-sync_mac_intel.dmg
+                      pattern: "*.dmg"
+                    - os: ubuntu-22.04
+                      target: x86_64-unknown-linux-gnu
+                      bundles: appimage
+                      asset: snip-sync-linux.AppImage
+                      pattern: "*.AppImage"
+                    - os: windows-latest
+                      target: x86_64-pc-windows-msvc
+                      bundles: nsis
+                      asset: snip-sync-windows-setup.exe
+                      pattern: "*setup.exe"
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Exclude build dirs from Windows Defender (compile speedup)
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: |
+                  # Non-fatal: a runner with Defender tamper-protected just skips it.
+                  $ErrorActionPreference = 'SilentlyContinue'
+                  Add-MpPreference -ExclusionPath "${{ github.workspace }}\target"
+                  Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+                  Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
+                  exit 0
+
+            - name: Install Linux dependencies
+              if: runner.os == 'Linux'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.target }}
+
+            - name: Setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.10
+
+            - name: Rust Cache
+              uses: Swatinem/rust-cache@v2
+
+            - name: Setup Bun
+              uses: oven-sh/setup-bun@v2
+              with:
+                  # Keep in sync with ci.yml
+                  bun-version: 1.3.14
+
+            - name: Install frontend dependencies (frozen)
+              run: cd crates/desktop && bun install --frozen-lockfile
+
+            - name: Sync Version
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  VERSION="${RELEASE_TAG#v}"
+                  # perl -pi behaves the same on GNU, BSD and Git-for-Windows.
+                  perl -pi -e "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+                  perl -pi -e "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" crates/desktop/package.json crates/desktop/src-tauri/tauri.conf.json
+                  # perl exits 0 on no-match, so prove the sync took.
+                  grep -q "^version = \"$VERSION\"$" Cargo.toml
+                  grep -q "\"version\": \"$VERSION\"" crates/desktop/package.json
+                  grep -q "\"version\": \"$VERSION\"" crates/desktop/src-tauri/tauri.conf.json
+                  echo "Version synced: $VERSION"
+
+            - name: Build Tauri
+              uses: tauri-apps/tauri-action@v0
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  # Ad-hoc code signing: a literal "-", not a secret (an unset
+                  # secret becomes `codesign -s ""` and fails). Seals the bundle
+                  # resources so `codesign --verify --strict` passes; it is not
+                  # notarization, Gatekeeper still treats the app as unidentified.
+                  APPLE_SIGNING_IDENTITY: "-"
+              with:
+                  tagName: ${{ env.RELEASE_TAG }}
+                  releaseName: "snip-sync ${{ env.RELEASE_TAG }}"
+                  releaseDraft: false
+                  prerelease: ${{ env.PRERELEASE }}
+                  args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+                  # No updater: never publish latest.json.
+                  includeUpdaterJson: false
+                  projectPath: crates/desktop
+
+            - name: Verify macOS bundle signature
+              if: runner.os == 'macOS'
+              shell: bash
+              run: |
+                  set -eu
+                  # Exactly one .app, asserted: a find that matches nothing
+                  # exits 0 and would turn this gate into a silent no-op.
+                  # No mapfile: macOS /bin/bash is 3.2.
+                  found=$(find target -type d -path '*/bundle/macos/*.app' -prune)
+                  count=$(printf '%s' "$found" | grep -c . || true)
+                  if [ "$count" -ne 1 ]; then
+                      echo "expected exactly one bundled .app, found $count:" >&2
+                      echo "$found" >&2
+                      exit 1
+                  fi
+                  echo "verifying $found"
+                  codesign --verify --deep --strict --verbose=2 "$found"
+                  codesign --display --verbose=2 "$found" 2>&1 | sed 's/^/  /'
+
+            - name: Prepare generic artifact
+              shell: bash
+              env:
+                  ASSET: ${{ matrix.asset }}
+                  PATTERN: ${{ matrix.pattern }}
+              run: |
+                  set -euo pipefail
+                  found=$(find "target/${{ matrix.target }}/release/bundle" -type f -name "$PATTERN")
+                  count=$(printf '%s' "$found" | grep -c . || true)
+                  if [ "$count" -ne 1 ]; then
+                      echo "expected exactly one $PATTERN bundle, found $count:" >&2
+                      echo "$found" >&2
+                      exit 1
+                  fi
+                  cp "$found" "$ASSET"
+
+            - name: Upload generic release asset
+              uses: softprops/action-gh-release@v3
+              with:
+                  tag_name: ${{ env.RELEASE_TAG }}
+                  prerelease: ${{ env.PRERELEASE }}
+                  files: ${{ matrix.asset }}
+
+    build-cli:
+        needs: [verify-ci, changelog]
+        name: Build CLI (${{ matrix.target }})
+        runs-on: ${{ matrix.os }}
+        env:
+            SCCACHE_GHA_ENABLED: "true"
+            RUSTC_WRAPPER: "sccache"
+        permissions:
+            contents: write
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - os: macos-latest
+                      target: aarch64-apple-darwin
+                    - os: macos-latest
+                      target: x86_64-apple-darwin
+                    - os: ubuntu-22.04
+                      target: x86_64-unknown-linux-gnu
+                    - os: windows-latest
+                      target: x86_64-pc-windows-msvc
+        steps:
+            - uses: actions/checkout@v6
+
+            - name: Exclude build dirs from Windows Defender (compile speedup)
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: |
+                  $ErrorActionPreference = 'SilentlyContinue'
+                  Add-MpPreference -ExclusionPath "${{ github.workspace }}\target"
+                  Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+                  Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
+                  exit 0
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.target }}
+
+            - name: Setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.10
+
+            - name: Rust Cache
+              uses: Swatinem/rust-cache@v2
+
+            - name: Sync Version
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  VERSION="${RELEASE_TAG#v}"
+                  perl -pi -e "s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+                  grep -q "^version = \"$VERSION\"$" Cargo.toml
+
+            - name: Build CLI
+              run: cargo build --release -p snip-cli --target ${{ matrix.target }}
+
+            - name: Smoke test CLI
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  BIN="target/${{ matrix.target }}/release/snip"
+                  if [ "${{ runner.os }}" = "Windows" ]; then
+                      BIN="${BIN}.exe"
+                  fi
+                  # x86_64-apple-darwin is cross-built on an arm64 runner; running
+                  # it relies on Rosetta, which is not guaranteed.
+                  HOST_ARCH="$(uname -m)"
+                  case "${{ matrix.target }}" in
+                    x86_64-apple-darwin) [ "$HOST_ARCH" = "x86_64" ] || { echo "Skipping execution of $BIN on $HOST_ARCH"; file "$BIN"; exit 0; } ;;
+                  esac
+                  "$BIN" --help > /dev/null
+                  GOT="$("$BIN" --version)"
+                  echo "$GOT"
+                  # A binary that self-reports the wrong version must not ship.
+                  if [[ "$RELEASE_TAG" =~ ^v[0-9] ]]; then
+                      [[ "$GOT" == "snip ${RELEASE_TAG#v}" ]] \
+                        || { echo "version mismatch: got '$GOT', want 'snip ${RELEASE_TAG#v}'" >&2; exit 1; }
+                  fi
+
+            - name: Package CLI (Unix)
+              if: runner.os != 'Windows'
+              run: tar -czvf snip-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release snip
+
+            - name: Package CLI (Windows)
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: Compress-Archive -Path target/${{ matrix.target }}/release/snip.exe -DestinationPath snip-${{ matrix.target }}.zip
+
+            - name: Upload CLI to Release
+              uses: softprops/action-gh-release@v3
+              with:
+                  tag_name: ${{ env.RELEASE_TAG }}
+                  prerelease: ${{ env.PRERELEASE }}
+                  files: snip-${{ matrix.target }}.*
