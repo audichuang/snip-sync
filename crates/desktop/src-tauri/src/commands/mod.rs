@@ -194,6 +194,10 @@ fn copy_payload(
 ) -> CmdResult<CopyOutcome> {
 	let result = match request {
 		CopyRequest::Files { roots, paths } => {
+			// As TS: nothing selected leaves the clipboard alone.
+			if paths.is_empty() {
+				return Err("No files selected.".into());
+			}
 			if roots.is_empty() {
 				return Err("No workspace folder found.".into());
 			}
