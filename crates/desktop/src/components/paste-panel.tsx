@@ -84,8 +84,12 @@ export function usePaste(repo: string) {
 					count: plan.plan.skippedOperations.length,
 				}),
 			);
-			setState({ step: "idle" });
-			return;
+			// Still show what was skipped and why; TS only had the toast,
+			// which left the reason (e.g. a non-UTF-8 target) invisible.
+			if (plan.plan.skippedOperations.length === 0) {
+				setState({ step: "idle" });
+				return;
+			}
 		}
 		setState({
 			step: "files",
