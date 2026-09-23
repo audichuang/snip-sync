@@ -2,6 +2,8 @@
 	"$schema": "./node_modules/oxlint/configuration_schema.json",
 	// Every category that finds defects is an error; `style` and `restriction`
 	// are taste, left to prettier and review. CI adds --max-warnings 0.
+	// react-perf is left out: inline handlers and props are idiomatic React 19,
+	// and memoizing every prop in panels this small is noise, not speed.
 	"plugins": [
 		"eslint",
 		"typescript",
