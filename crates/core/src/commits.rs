@@ -384,6 +384,17 @@ pub struct CommitReplayPlan {
 /// resolver would rewrite (absolute, root-labelled, `./`) is refused: git
 /// only ever produces plain relative paths.
 fn target(root: &Path, path: &str) -> Option<PathBuf> {
+	// Like git ("beyond a symbolic link"), refuse paths whose parent
+	// directories go through a symlink: containment alone would let the
+	// write or delete land on another tracked path.
+	let mut dir = root.to_path_buf();
+	let parents = path.split('/').collect::<Vec<_>>();
+	for segment in &parents[..parents.len().saturating_sub(1)] {
+		dir.push(segment);
+		if is_symlink(&dir) {
+			return None;
+		}
+	}
 	resolve_write_target(&[root], path)
 		.ok()
 		.filter(|t| t.relative_path == path)
@@ -507,6 +518,26 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 	// --only` would reject it once `add` dropped it from the index.
 	let mut deleted: Vec<&str> = Vec::new();
 
+	// Recheck every write target before anything destructive happens, so a
+	// target that changed since planning stops the replay instead of
+	// leaving a commit that only records the rename's deletion.
+	for (f, src) in plan.files.iter().zip(&commit.files) {
+		let (ReplayAction::Write, Some(abs), Some(_)) =
+			(f.action, &f.absolute_path, &src.content)
+		else {
+			continue;
+		};
+		if escapes_all_roots(&[root], abs) {
+			return Err(format!("{}: unsafe path", f.path));
+		}
+		if !is_symlink(abs) && must_not_overwrite(abs) {
+			return Err(format!(
+				"{}: target is not UTF-8 or cannot be verified",
+				f.path
+			));
+		}
+	}
+
 	// Deletions first: a rename swap or a rename onto a re-added path must
 	// not delete what this commit just wrote.
 	for f in &plan.files {
@@ -531,8 +562,6 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 		if is_symlink(abs) {
 			// Replace the link itself; writing would follow it.
 			fs::remove_file(abs).map_err(|e| format!("{}: {e}", f.path))?;
-		} else if must_not_overwrite(abs) {
-			continue;
 		}
 		write_text_file(abs, content)
 			.map_err(|e| format!("{}: {e}", f.path))?;
@@ -1084,5 +1113,46 @@ mod tests {
 		assert_eq!(dst.git(&["diff", "--cached", "--name-only"]), "f");
 		let names = dst.git(&["ls-tree", "-r", "--name-only", "HEAD"]);
 		assert_eq!(names, "a\nl\nreal.txt");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn commits_replay_refuses_paths_through_a_symlinked_directory() {
+		let dst = Repo::new("main");
+		dst.write("other/x.txt", b"x\n");
+		dst.write("other/y.txt", b"y\n");
+		std::os::unix::fs::symlink("other", dst.path().join("d")).unwrap();
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		let file = |path: &str, change, content: Option<&str>| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change,
+			content: content.map(Into::into),
+			not_copied: None,
+		};
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "through link\n".into(),
+				author_name: "Bob".into(),
+				author_email: "bob@example.com".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files: vec![
+					file("d/y.txt", FileChange::Deleted, None),
+					file("d/x.txt", FileChange::Modified, Some("NEW\n")),
+				],
+			}],
+		};
+		let plan = plan_commit_replay(&dst.open(), &payload);
+		assert!(plan.commits[0]
+			.files
+			.iter()
+			.all(|f| f.action == ReplayAction::Skip));
+		replay(&dst.open(), &payload);
+		// The real files behind the link are untouched.
+		assert_eq!(
+			fs::read_to_string(dst.path().join("other/x.txt")).unwrap(),
+			"x\n"
+		);
+		assert!(dst.path().join("other/y.txt").exists());
 	}
 }

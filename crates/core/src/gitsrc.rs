@@ -600,7 +600,13 @@ pub fn collect_payload<P: AsRef<Path>>(
 	let mut fallback = graph;
 	for file in collected {
 		let absolute = git.root().join(&file.path);
-		if !seen.insert(fs_path_key(&absolute)) {
+		// graphCopy keys on the exact path; only SCM case-folds on Windows.
+		let key = if graph {
+			absolute.to_string_lossy().into_owned()
+		} else {
+			fs_path_key(&absolute)
+		};
+		if !seen.insert(key) {
 			continue;
 		}
 		let absolute = absolute.to_string_lossy().into_owned();
@@ -644,7 +650,11 @@ pub fn collect_payload<P: AsRef<Path>>(
 			fallback = true;
 		}
 		let size = content.len();
-		if size as f64 > settings.max_file_size_kb * 1024.0 {
+		// graphCopy pushes a deleted file's old body before any size check.
+		let deleted_on_graph =
+			graph && file.change_type == Some(ChangeType::Deleted);
+		if !deleted_on_graph && size as f64 > settings.max_file_size_kb * 1024.0
+		{
 			skipped_size += 1;
 			files.push(PayloadFile {
 				path,
@@ -670,6 +680,7 @@ pub fn collect_payload<P: AsRef<Path>>(
 			skipped_reason: None,
 		});
 	}
+	let has_files = !files.is_empty();
 	let options = BuildPayloadOptions {
 		header_format: settings.header_format.clone(),
 		pre_text: settings.pre_text.clone(),
@@ -679,7 +690,8 @@ pub fn collect_payload<P: AsRef<Path>>(
 		// graphCopy names the repository (`singleRepoRoot`), SCM the
 		// single workspace root.
 		source_root: if graph {
-			source_root_name(&[git.root()])
+			// `singleRepoRoot(files)` is undefined for an empty payload.
+			has_files.then(|| source_root_name(&[git.root()])).flatten()
 		} else {
 			source_root_name(&roots)
 		},
@@ -1344,6 +1356,35 @@ mod tests {
 			(got.skipped_unreadable_count, got.copied_file_count),
 			(1, 1)
 		);
+	}
+
+	#[test]
+	fn payload_graph_deleted_file_skips_the_size_limit() {
+		let r = Repo::new();
+		r.write("big.txt", "x".repeat(4096).as_bytes());
+		r.commit("init");
+		r.git(&["rm", "-q", "big.txt"]);
+		let sha = r.commit("drop");
+		let tiny = Settings {
+			max_file_size_kb: 1.0,
+			..Settings::default()
+		};
+		let got = payload(&r, GitSource::Commit(sha), &tiny);
+		assert_eq!(
+			(got.copied_file_count, got.skipped_file_size_count),
+			(1, 0)
+		);
+	}
+
+	#[test]
+	fn payload_graph_empty_commit_has_no_root_line() {
+		let r = Repo::new();
+		r.write("a.ts", b"a\n");
+		r.commit("init");
+		r.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+		let sha = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+		let got = payload(&r, GitSource::Commit(sha), &Settings::default());
+		assert_eq!(got.payload, "");
 	}
 
 	#[test]
