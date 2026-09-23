@@ -211,9 +211,10 @@ async function main() {
 		await until(
 			"app to render",
 			async () => {
+				// tauri://localhost on Linux/macOS, http://tauri.localhost on Windows.
 				const url = await wd("GET", s("/url"));
 				return (
-					url.startsWith("tauri://") &&
+					/^(tauri:\/\/|https?:\/\/tauri\.localhost)/.test(url) &&
 					(await js(
 						"return !!document.querySelector('[data-testid=\"repo-path\"]')",
 					))
