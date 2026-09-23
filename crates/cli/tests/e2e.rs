@@ -378,6 +378,11 @@ macro_rules! ts_ref_or_skip {
 		match ts_unavailable() {
 			Ok(dir) => dir,
 			Err(why) => {
+				// CI sets this so a silently skipped test cannot pass as green.
+				assert!(
+					std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+					"cross-tool test would be skipped: {why}"
+				);
 				eprintln!("SKIPPED cross-tool test: {why}");
 				return;
 			}

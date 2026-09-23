@@ -229,7 +229,11 @@ jobs:
                   node-version: 24
             - name: Unit + integration tests (Linux, under xvfb)
               if: runner.os == 'Linux'
+              env:
+                  SNIP_REQUIRE_ALL_TESTS: "1"
               run: xvfb-run -a cargo test --workspace --no-fail-fast
             - name: Unit + integration tests
               if: runner.os != 'Linux'
+              env:
+                  SNIP_REQUIRE_ALL_TESTS: "1"
               run: cargo test --workspace --no-fail-fast

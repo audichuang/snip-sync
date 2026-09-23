@@ -68,6 +68,11 @@ fn clipboard_round_trips_text() {
 		return;
 	}
 	if let Some(why) = no_display() {
+		// CI sets this so a silently skipped test cannot pass as green.
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"clipboard round trip would be skipped: {why}"
+		);
 		eprintln!("SKIPPED clipboard round trip: {why}");
 		return;
 	}
