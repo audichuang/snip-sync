@@ -1,0 +1,6 @@
+* text=auto eol=lf
+# Byte-exact golden shared with the IDE plugins (SHA-pinned): never convert.
+fixtures/clipboard-contract.json -text
+*.png binary
+*.ico binary
+*.icns binary

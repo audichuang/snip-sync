@@ -1,0 +1,123 @@
+import type en from "./en.ts";
+
+// Traditional Chinese. Must carry every key of `en` (checked by i18n.test.ts).
+const zhHant: Record<keyof typeof en, string> = {
+	appTitle: "snip-sync",
+	language: "English",
+	chooseRepo: "選擇 repo / 資料夾",
+	noRepo: "尚未選擇 repo 或資料夾",
+	tabFiles: "複製檔案",
+	tabCommits: "複製 commit",
+	tabPaste: "貼上",
+
+	sourceFiles: "檔案 / 資料夾",
+	sourceWorking: "Working tree",
+	sourceStaged: "Staged",
+	sourceCommit: "單一 commit",
+	sourceRange: "區間",
+	addFiles: "加入檔案",
+	addFolders: "加入資料夾",
+	clearPaths: "清除",
+	noPaths: "尚未選擇檔案。",
+	commitSha: "Commit",
+	rangeBase: "起點",
+	rangeTip: "終點",
+	copy: "複製",
+
+	loadHistory: "載入歷史",
+	timelineHint: "點選第一個 commit,再按住 Shift 點最後一個。",
+	selectedCommits: "已選取 {{count}} 個 commit",
+	copyCommits: "複製 commit",
+	clearSelection: "清除",
+	rootRangeUnsupported:
+		"從第一個 commit 開始的區間,必須以 HEAD 結尾才能複製。",
+	noHistory: "沒有載入任何 commit。",
+	discontinuous:
+		"選取的 commit 不連續:{{oldest}} 不在 {{tip}} 的 first-parent 鏈上。",
+
+	copiedFiles:
+		"已複製 {{count}} 個檔案{{sizeSuffix}}。{{limit}}{{unreadable}}",
+	copiedGitFiles: "已複製 {{count}} 個 Git 檔案{{skipped}}。{{limit}}",
+	sizeSkippedParen: "({{count}} 個超過大小上限而跳過)",
+	sizeSkipped: "{{count}} 個超過大小上限而跳過",
+	unreadableSkipped: "{{count}} 個不是 UTF-8 文字或讀不到而跳過",
+	unreadableSkippedSentence: "{{count}} 個不是 UTF-8 文字或讀不到而跳過。",
+	fileLimitReached: "已達檔案數上限 {{limit}}。",
+	copyStats:
+		"{{message}}{{chars}} 字元 · {{lines}} 行 · {{words}} 字 · ~{{tokens}} tokens。",
+	overTokens: "{{note}}超過 {{threshold}} tokens。",
+	copiedCommits:
+		"已複製 {{commits}} 個 commit:{{files}} 個檔案,{{chars}} 字元。",
+	notCopiedSuffix: "{{count}} 個檔案未複製。",
+
+	previewClipboard: "預覽剪貼簿",
+	noActionable: "沒有可執行的檔案。已跳過 {{count}} 個。",
+	confirmSummary:
+		"將新增 {{create}} 個、覆寫 {{overwrite}} 個、刪除 {{deleted}} 個,並跳過 {{skipped}} 個。",
+	existingFiles: "{{count}} 個檔案已存在。",
+	overwriteAll: "全部覆寫",
+	skipExisting: "略過已存在的檔案",
+	suggestBase:
+		"這些路徑看起來屬於這個工作區的其他位置。可以對全部 {{total}} 個檔案{{label}}。",
+	suggestExample: "例如:{{from}} → {{to}}",
+	baseStrip: "去掉開頭的「{{segment}}/」",
+	baseAdd: "全部放到「{{prefix}}/」底下",
+	adjustPaths: "調整路徑",
+	useAsIs: "照原樣",
+	proceed: "執行",
+	cancel: "取消",
+	back: "返回",
+	resultCreated: "新增 {{count}}",
+	resultOverwritten: "覆寫 {{count}}",
+	resultSkipped: "略過 {{count}}",
+	resultDeleted: "刪除 {{count}}",
+	resultNoChange: "沒有檔案變更。",
+	resultErrors: "{{count}} 個操作失敗:{{errors}}",
+	actionNew: "新增",
+	actionOverwrite: "覆寫",
+	actionDelete: "刪除",
+	actionSkip: "跳過",
+	showDiff: "Diff",
+	hideDiff: "隱藏 diff",
+	noDiff: "沒有差異。",
+	commitsToCreate: "將在目前分支上建立 {{count}} 個 commit。",
+	notCopiedCount: "{{count}} 個檔案未複製",
+	replayCommits: "建立 commit",
+	replayCreated: "已建立 {{count}} 個 commit。",
+	replayCreatedOf: "已建立 {{count}} / {{total}} 個 commit。",
+	replayFailed: "第 {{index}} 個 commit 失敗({{message}}):{{error}}",
+	changeADDED: "新增",
+	changeMODIFIED: "修改",
+	changeDELETED: "刪除",
+	changeRENAMED: "改名",
+
+	skipALREADY_ABSENT: "已不存在",
+	skipUNRESOLVED_PATH: "路徑不合法或超出工作區",
+	skipAMBIGUOUS_PATH: "路徑有歧義",
+	skipPLACEHOLDER_BODY: "內容是 placeholder",
+	skipNON_UTF8_TARGET: "目標不是 UTF-8、讀不到或大於 8 MiB",
+	replayNOT_COPIED: "未複製",
+	replayUNSAFE_PATH: "路徑不安全",
+	replayNON_UTF8_TARGET: "目標不是 UTF-8",
+	notCopiedBINARY: "二進位檔",
+	notCopiedNON_UTF8: "不是 UTF-8",
+	notCopiedNON_UTF8_PATH: "路徑不是 UTF-8",
+	notCopiedUNSUPPORTED_TYPE: "symlink 或 submodule",
+	notCopiedUNREADABLE: "讀不到",
+
+	trayPaste: "從剪貼簿貼上",
+	trayCopyLast: "複製上一次的選取",
+	trayShow: "開啟主視窗",
+	trayQuit: "結束 snip-sync",
+
+	"err.No files selected.": "沒有選取任何檔案。",
+	"err.No workspace folder found.": "找不到工作區資料夾。",
+	"err.No Git changes found to copy.": "沒有可複製的 Git 變更。",
+	"err.Clipboard is empty or does not contain text.":
+		"剪貼簿是空的或不含文字。",
+	"err.No Snipcode file headers found in clipboard.":
+		"剪貼簿中找不到 Snipcode 檔案標頭。",
+	"err.Nothing has been copied yet.": "還沒有複製過任何東西。",
+};
+
+export default zhHant;
