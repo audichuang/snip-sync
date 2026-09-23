@@ -2,3 +2,4 @@
 /.ts-ref
 node_modules
 .claude/
+/.ts-ref-src

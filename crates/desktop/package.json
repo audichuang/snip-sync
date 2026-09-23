@@ -16,7 +16,7 @@
 		"typecheck": "node ./node_modules/@typescript/native/bin/tsc -p tsconfig.json --noEmit && node ./node_modules/@typescript/native/bin/tsc -p tsconfig.node.json --noEmit --composite false --incremental false",
 		"format": "prettier --write .",
 		"format:check": "prettier --check .",
-		"e2e": "node e2e/commit-sync.mjs"
+		"e2e": "node e2e/scenarios.mjs"
 	},
 	"dependencies": {
 		"@heroui/react": "^3.2.5",

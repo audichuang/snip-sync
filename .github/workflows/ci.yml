@@ -1,5 +1,10 @@
 name: CI
 
+# Strict by design: every job runs on every pull request and push (no path
+# filters, so nothing is "skipped" into a green run), warnings are errors in
+# Rust, rustdoc and the frontend, lockfiles are enforced, and each job fails
+# if it leaves the checkout dirty. `CI gate` is the single required check.
+
 on:
     push:
         branches: ["main"]
@@ -13,8 +18,6 @@ concurrency:
 
 permissions:
     contents: read
-    # dorny/paths-filter lists the PR's files through the API.
-    pull-requests: read
 
 env:
     CARGO_TERM_COLOR: always
@@ -24,65 +27,31 @@ env:
     TZ: UTC
     # Pinned tool versions (keep BUN_VERSION in sync with release.yml)
     BUN_VERSION: 1.3.14
+    ACTIONLINT_VERSION: 1.7.12
     CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     SCCACHE_GHA_ENABLED: "true"
     RUSTC_WRAPPER: "sccache"
 
 jobs:
-    # Path filter: skip unrelated jobs on pull requests
-    changes:
-        name: Detect Changes
-        runs-on: ubuntu-latest
-        outputs:
-            rust: ${{ steps.filter.outputs.rust }}
-            desktop: ${{ steps.filter.outputs.desktop }}
-            workflows: ${{ steps.filter.outputs.workflows }}
-        steps:
-            - uses: actions/checkout@v6
-              with:
-                  fetch-depth: 0
-            - uses: dorny/paths-filter@v3
-              id: filter
-              with:
-                  filters: |
-                      rust:
-                          - 'crates/**'
-                          - 'fixtures/**'
-                          - 'Cargo.toml'
-                          - 'Cargo.lock'
-                          - 'rustfmt.toml'
-                      desktop:
-                          - 'crates/desktop/**'
-                      workflows:
-                          - '.github/workflows/**'
-
     actionlint:
         name: Lint Workflows
-        needs: changes
-        if: needs.changes.outputs.workflows == 'true'
         runs-on: ubuntu-latest
+        timeout-minutes: 10
         steps:
             - uses: actions/checkout@v6
             - name: Download actionlint (pinned)
-              shell: bash
               run: |
-                  set -e
-                  ACTIONLINT_VERSION="1.7.12"
-                  curl -sSL -o /tmp/actionlint.tar.gz \
+                  curl -sSfL -o /tmp/actionlint.tar.gz \
                       "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
                   sudo tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint
+            # shellcheck is preinstalled on ubuntu runners, so run: blocks are linted too.
             - name: Run actionlint
-              shell: bash
               run: actionlint -color
 
     format:
         name: Format Check
-        needs: changes
-        if: |
-            needs.changes.outputs.rust == 'true' ||
-            needs.changes.outputs.desktop == 'true' ||
-            needs.changes.outputs.workflows == 'true'
         runs-on: ubuntu-latest
+        timeout-minutes: 10
         steps:
             - uses: actions/checkout@v6
             - name: Install Rust toolchain
@@ -91,6 +60,8 @@ jobs:
                   components: rustfmt
             - name: Setup Bun
               uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: ${{ env.BUN_VERSION }}
             - name: Install desktop deps (frozen)
               run: cd crates/desktop && bun install --frozen-lockfile
             - name: Rust format
@@ -98,26 +69,24 @@ jobs:
             - name: Frontend format
               run: cd crates/desktop && bun run format:check
 
-    # Rust lint (clippy + audit) - 3 OS matrix
+    # clippy + rustdoc on all three OSes; audit and DTO drift once, on Linux.
     lint-rust:
         name: Rust Lint (${{ matrix.os }})
-        needs: changes
-        if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
         runs-on: ${{ matrix.os }}
+        timeout-minutes: 45
         strategy:
             fail-fast: false
             matrix:
                 os: [ubuntu-latest, macos-latest, windows-latest]
+        env:
+            RUSTFLAGS: "-D warnings"
+            RUSTDOCFLAGS: "-D warnings"
         steps:
             - uses: actions/checkout@v6
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
-            - name: Install cargo-audit
-              uses: taiki-e/install-action@v2
-              with:
-                  tool: cargo-audit
             - name: Setup sccache
               uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
@@ -130,24 +99,45 @@ jobs:
               run: |
                   sudo apt-get update
                   sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-            - name: Cargo audit (advisories; non-blocking until tree is clean)
-              continue-on-error: true
+            - name: Clippy (all targets, warnings as errors, locked)
+              run: cargo clippy --workspace --all-targets --locked -- -D warnings
+            - name: Rustdoc (broken links and doc warnings are errors)
+              run: cargo doc --workspace --no-deps --locked
+            # Blocks on vulnerabilities. The remaining informational warnings
+            # (unmaintained / unsound) all come from Tauri's gtk-rs stack on
+            # Linux and cannot be fixed here; they stay visible in the log.
+            - name: Install cargo-audit
+              if: runner.os == 'Linux'
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-audit
+            - name: Cargo audit (vulnerabilities fail the build)
+              if: runner.os == 'Linux'
               run: cargo audit
-            - name: Cargo clippy (warnings as errors, all targets)
-              run: cargo clippy --workspace --all-targets -- -D warnings
+            # The TS types in crates/desktop/src/generated must match the Rust DTOs.
+            - name: Setup Bun
+              if: runner.os == 'Linux'
+              uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: ${{ env.BUN_VERSION }}
+            - name: Generated DTOs are up to date
+              if: runner.os == 'Linux'
+              run: |
+                  cd crates/desktop
+                  bun install --frozen-lockfile
+                  bun run generate:dto
+                  bun run format
+                  git diff --exit-code -- src/generated
+                  test -z "$(git status --porcelain -- src/generated)"
+            - name: Checkout left clean
+              shell: bash
+              run: git diff --exit-code && test -z "$(git status --porcelain)"
 
-    # Frontend lint + unit tests + production build
+    # Frontend: types, lint, unit tests, production build.
     lint-frontend:
         name: Frontend Lint
-        needs: changes
-        # Always on push to main: release.yml's verify-ci trusts a green push
-        # run, and a skipped job still leaves the run `success`.
-        if: |
-            github.event_name == 'push' ||
-            github.event_name == 'workflow_dispatch' ||
-            needs.changes.outputs.desktop == 'true' ||
-            needs.changes.outputs.workflows == 'true'
         runs-on: ubuntu-latest
+        timeout-minutes: 15
         steps:
             - uses: actions/checkout@v6
             - name: Setup Bun
@@ -162,28 +152,28 @@ jobs:
               run: cd crates/desktop && bun install --frozen-lockfile
             - name: Type check
               run: cd crates/desktop && bun run typecheck
-            - name: Oxlint check (warnings as errors)
+            - name: Oxlint (warnings as errors)
               run: cd crates/desktop && bun run lint:check -- --max-warnings 0
             - name: Frontend unit tests
               run: cd crates/desktop && bun run test
             - name: Frontend build (Vite)
               run: cd crates/desktop && bun run build
+            - name: Checkout left clean
+              run: git diff --exit-code && test -z "$(git status --porcelain)"
 
-    # Unit + integration tests - 3 OS matrix
+    # Unit, integration, contract, CLI E2E and cross-tool tests on 3 OSes.
     test:
         name: Test (${{ matrix.os }})
-        needs: changes
-        # Always on push to main, for the same verify-ci reason as lint-frontend.
-        if: |
-            github.event_name == 'push' ||
-            github.event_name == 'workflow_dispatch' ||
-            needs.changes.outputs.rust == 'true' ||
-            needs.changes.outputs.workflows == 'true'
         runs-on: ${{ matrix.os }}
+        timeout-minutes: 45
         strategy:
             fail-fast: false
             matrix:
                 os: [ubuntu-latest, macos-latest, windows-latest]
+        env:
+            RUSTFLAGS: "-D warnings"
+            # A test that would skip for a missing prerequisite fails instead.
+            SNIP_REQUIRE_ALL_TESTS: "1"
         steps:
             - uses: actions/checkout@v6
             - name: Normalize git config (cross-platform line endings)
@@ -210,8 +200,7 @@ jobs:
               run: |
                   git config --global user.name "snip-ci"
                   git config --global user.email "snip-ci@example.invalid"
-            # Pinned TS reference for the cross-tool tests (plan.md section 5,
-            # layer 3); without it those tests skip instead of running.
+            # Pinned TS reference for the cross-tool tests (plan.md section 5, layer 3).
             - name: Checkout TS reference (ClipCodeVSCode @ 0aa24c8)
               uses: actions/checkout@v6
               with:
@@ -227,31 +216,24 @@ jobs:
               uses: actions/setup-node@v4
               with:
                   node-version: 24
-            - name: Unit + integration tests (Linux, under xvfb)
+            - name: Tests (Linux, under xvfb)
               if: runner.os == 'Linux'
-              env:
-                  SNIP_REQUIRE_ALL_TESTS: "1"
-              run: xvfb-run -a cargo test --workspace --no-fail-fast
-            - name: Unit + integration tests
+              run: xvfb-run -a cargo test --workspace --locked --no-fail-fast
+            - name: Tests
               if: runner.os != 'Linux'
-              env:
-                  SNIP_REQUIRE_ALL_TESTS: "1"
-              run: cargo test --workspace --no-fail-fast
+              run: cargo test --workspace --locked --no-fail-fast
+            - name: Checkout left clean
+              shell: bash
+              run: git diff --exit-code && test -z "$(git status --porcelain)"
 
-    # Drives the real app (Rust backend + WebView) through tauri-driver:
-    # copy three commits in one clone, replay them into another. Linux uses
+    # Drives the real app (Rust backend + WebView) through tauri-driver and
+    # runs every scenario in crates/desktop/e2e/scenarios.mjs. Linux uses
     # WebKitWebDriver, Windows msedgedriver; macOS WKWebView has no WebDriver
     # (plan.md section 5).
     desktop-e2e:
         name: Desktop E2E (${{ matrix.os }})
-        needs: changes
-        if: |
-            github.event_name == 'push' ||
-            github.event_name == 'workflow_dispatch' ||
-            needs.changes.outputs.rust == 'true' ||
-            needs.changes.outputs.desktop == 'true' ||
-            needs.changes.outputs.workflows == 'true'
         runs-on: ${{ matrix.os }}
+        timeout-minutes: 60
         strategy:
             fail-fast: false
             matrix:
@@ -292,33 +274,56 @@ jobs:
                   git config --global user.email "snip-ci@example.invalid"
             - name: Setup Bun
               uses: oven-sh/setup-bun@v2
+              with:
+                  bun-version: ${{ env.BUN_VERSION }}
             - name: Setup Node
               uses: actions/setup-node@v4
               with:
                   node-version: 24
             - name: Install desktop deps (frozen)
               run: cd crates/desktop && bun install --frozen-lockfile
-            - name: Build the app with the frontend embedded
+            - name: Build the app with the frontend embedded (warnings are errors)
+              env:
+                  RUSTFLAGS: "-D warnings"
               run: cd crates/desktop && bun run tauri build --debug --no-bundle
-            - name: Commit sync through the real app (Linux, under Xvfb)
+            - name: Real-app scenarios (Linux, under Xvfb)
               if: runner.os == 'Linux'
               env:
                   SNIP_E2E_OUT: ${{ runner.temp }}/e2e-shots
               run: |
                   mkdir -p "$SNIP_E2E_OUT"
-                  cd crates/desktop && xvfb-run -a node e2e/commit-sync.mjs
-            - name: Commit sync through the real app
+                  cd crates/desktop && xvfb-run -a node e2e/scenarios.mjs
+            - name: Real-app scenarios
               if: runner.os != 'Linux'
               shell: bash
               env:
                   SNIP_E2E_OUT: ${{ runner.temp }}/e2e-shots
               run: |
                   mkdir -p "$SNIP_E2E_OUT"
-                  cd crates/desktop && node e2e/commit-sync.mjs
-            - name: Upload screenshots
+                  cd crates/desktop && node e2e/scenarios.mjs
+            - name: Upload screenshots and results
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                  name: desktop-e2e-screenshots-${{ matrix.os }}
+                  name: desktop-e2e-${{ matrix.os }}
                   path: ${{ runner.temp }}/e2e-shots
-                  if-no-files-found: ignore
+                  if-no-files-found: error
+            - name: Checkout left clean
+              shell: bash
+              run: git diff --exit-code && test -z "$(git status --porcelain)"
+
+    # Single required check: fails unless every job above succeeded
+    # (a skipped or cancelled job counts as a failure).
+    gate:
+        name: CI gate
+        if: always()
+        needs: [actionlint, format, lint-rust, lint-frontend, test, desktop-e2e]
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: Every job succeeded
+              env:
+                  RESULTS: ${{ toJSON(needs.*.result) }}
+              run: |
+                  echo "$RESULTS"
+                  echo "$RESULTS" | jq -e 'all(. == "success")'
