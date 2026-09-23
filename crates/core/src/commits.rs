@@ -416,7 +416,8 @@ fn plan_file(root: &Path, f: &CommitFile) -> FilePlan {
 		plan.skip_reason = Some(ReplaySkipReason::UnsafePath);
 		return plan;
 	};
-	if !deleted && must_not_overwrite(&abs) {
+	// A symlink is replaced, not written through: its target is irrelevant.
+	if !deleted && !is_symlink(&abs) && must_not_overwrite(&abs) {
 		plan.skip_reason = Some(ReplaySkipReason::NonUtf8Target);
 		return plan;
 	}
@@ -501,8 +502,9 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 	let plan = plan_commit(root, commit);
 	// Paths whose change is on disk now; they alone go into the commit.
 	let mut paths: Vec<&str> = Vec::new();
-	// Deleted paths: staged only if the index tracks them (an untracked or
-	// already absent file has nothing to stage).
+	// Deleted paths: staged only if HEAD tracks them. A path that is only in
+	// the index (a staged new file) has nothing to commit, and `commit
+	// --only` would reject it once `add` dropped it from the index.
 	let mut deleted: Vec<&str> = Vec::new();
 
 	// Deletions first: a rename swap or a rename onto a re-added path must
@@ -526,7 +528,10 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 		if escapes_all_roots(&[root], abs) {
 			return Err(format!("{}: unsafe path", f.path));
 		}
-		if must_not_overwrite(abs) {
+		if is_symlink(abs) {
+			// Replace the link itself; writing would follow it.
+			fs::remove_file(abs).map_err(|e| format!("{}: {e}", f.path))?;
+		} else if must_not_overwrite(abs) {
 			continue;
 		}
 		write_text_file(abs, content)
@@ -536,9 +541,21 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 
 	let err = |e: GitError| e.to_string();
 	if !deleted.is_empty() {
-		let mut args = vec!["--literal-pathspecs", "ls-files", "-z", "--"];
+		let mut args = vec![
+			"--literal-pathspecs",
+			"ls-tree",
+			"-z",
+			"--name-only",
+			"HEAD",
+			"--",
+		];
 		args.extend(&deleted);
-		let out = git.run(&args).map_err(err)?;
+		// An unborn HEAD tracks nothing.
+		let out = if git.run(&["rev-parse", "-q", "--verify", "HEAD"]).is_ok() {
+			git.run(&args).map_err(err)?
+		} else {
+			Vec::new()
+		};
 		let tracked: Vec<&[u8]> =
 			out.split(|&b| b == 0).filter(|p| !p.is_empty()).collect();
 		paths
@@ -572,16 +589,30 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 	Ok(String::from_utf8_lossy(&head).trim().to_string())
 }
 
-/// Removes `abs`; already absent is fine.
+/// Removes `abs`; already absent is fine. Parent directories left empty go
+/// too (as git checkout does), so a later write may put a file there.
 fn delete(root: &Path, abs: &Path, rel: &str) -> Result<(), String> {
 	if escapes_all_roots(&[root], abs) {
 		return Err(format!("{rel}: unsafe path"));
 	}
 	match fs::remove_file(abs) {
-		Ok(()) => Ok(()),
-		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-		Err(e) => Err(format!("{rel}: {e}")),
+		Ok(()) => {}
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(e) => return Err(format!("{rel}: {e}")),
 	}
+	let mut dir = abs.parent();
+	// `remove_dir` fails on a non-empty directory, which ends the walk.
+	while let Some(d) = dir.filter(|d| *d != root && d.starts_with(root)) {
+		if fs::remove_dir(d).is_err() {
+			break;
+		}
+		dir = d.parent();
+	}
+	Ok(())
+}
+
+fn is_symlink(p: &Path) -> bool {
+	fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 fn run_commit(
@@ -1003,5 +1034,55 @@ mod tests {
 			dst.git(&["diff", "--cached", "--name-only"]),
 			"foreign.txt"
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn commits_replay_replaces_symlink_dir_and_keeps_staged_new_file() {
+		let dst = Repo::new("main");
+		dst.write("real.txt", b"real\n");
+		dst.write("a/b", b"nested\n");
+		std::os::unix::fs::symlink("real.txt", dst.path().join("l")).unwrap();
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		// A new file only in the index; the replayed commit deletes it.
+		dst.write("f", b"staged new\n");
+		dst.git(&["add", "f"]);
+		let file = |path: &str, change, content: Option<&str>| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change,
+			content: content.map(Into::into),
+			not_copied: None,
+		};
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "mixed\n".into(),
+				author_name: "Bob".into(),
+				author_email: "bob@example.com".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files: vec![
+					file("a/b", FileChange::Deleted, None),
+					file("a", FileChange::Added, Some("now a file\n")),
+					file("l", FileChange::Modified, Some("now regular\n")),
+					file("f", FileChange::Deleted, None),
+				],
+			}],
+		};
+		let result = replay(&dst.open(), &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 1);
+		let tree = dst.git(&["ls-tree", "-r", "HEAD"]);
+		assert!(tree.contains("100644 blob"), "{tree}");
+		assert!(!tree.contains("120000"), "{tree}");
+		assert_eq!(dst.git(&["show", "HEAD:a"]), "now a file");
+		assert_eq!(dst.git(&["show", "HEAD:l"]), "now regular");
+		assert_eq!(
+			fs::read_to_string(dst.path().join("real.txt")).unwrap(),
+			"real\n"
+		);
+		// `f` never reached HEAD, so it stays staged and out of the commit.
+		assert_eq!(dst.git(&["diff", "--cached", "--name-only"]), "f");
+		let names = dst.git(&["ls-tree", "-r", "--name-only", "HEAD"]);
+		assert_eq!(names, "a\nl\nreal.txt");
 	}
 }
