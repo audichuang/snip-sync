@@ -34,6 +34,8 @@ export function write(root, file, content) {
 }
 
 export const read = (root, file) => readFileSync(path.join(root, file), "utf8");
+/** Text with CRLF folded to LF: a Windows checkout (core.autocrlf) has CRLF. */
+export const readLf = (root, file) => read(root, file).replace(/\r\n/g, "\n");
 export const exists = (root, file) => existsSync(path.join(root, file));
 
 let commits = 0;
@@ -203,6 +205,15 @@ export async function openTab(key) {
 }
 
 // Toasts: HeroUI renders them as role=alert / status regions.
+const toastList = () =>
+	js(
+		'return [...document.querySelectorAll(\'[data-slot="toast"], [role="alert"], [role="status"]\')].map(e => e.innerText.trim()).filter(Boolean)',
+	);
+/** Toasts present now that were not in `before` (older ones may be leaving). */
+async function newToasts(before) {
+	const seen = new Set(before);
+	return (await toastList()).filter((t) => !seen.has(t));
+}
 export const toastText = () =>
 	js(
 		'return [...document.querySelectorAll(\'[data-slot="toast"], [role="alert"], [role="status"]\')].map(e => e.innerText).join(\' | \')',
@@ -210,14 +221,11 @@ export const toastText = () =>
 
 /** Runs `action`, then waits for a toast that was not there before. */
 export async function withToast(action) {
-	const before = await toastText();
+	const before = await toastList();
 	await action();
 	return until(
-		"a toast",
-		async () => {
-			const now = await toastText();
-			return now && now !== before ? now : false;
-		},
+		"a new toast",
+		async () => (await newToasts(before)).join(" | ") || false,
 		10000,
 	);
 }
@@ -252,13 +260,13 @@ export async function copyCommits(repo, newest, oldest) {
 export async function previewPaste(repo) {
 	await setRepo(repo);
 	await openTab("paste");
-	const before = await toastText();
+	const before = await toastList();
 	await clickId("preview-clipboard");
 	return until("a preview", async () => {
 		if (await present("replay-commits")) return "commits";
 		if (await present("apply-restore")) return "files";
-		const now = await toastText();
-		return now && now !== before ? `toast:${now}` : false;
+		const fresh = await newToasts(before);
+		return fresh.length ? `toast:${fresh.join(" | ")}` : false;
 	});
 }
 

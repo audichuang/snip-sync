@@ -15,7 +15,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as e from "./lib.mjs";
 
-const { git, write, read, exists, commit, newRepo, newFolder, clone } = e;
+const { git, write, read, readLf, exists, commit, newRepo, newFolder, clone } =
+	e;
 const here = path.dirname(fileURLToPath(import.meta.url));
 const exe = process.platform === "win32" ? "snip-sync.exe" : "snip-sync";
 const APP =
@@ -331,7 +332,7 @@ const scenarios = {
 		check(read(b, "mod.txt") === "new", "modified file restored");
 		check(read(b, "src/untracked.ts") === "u", "untracked file created");
 		check(!exists(b, "gone.txt"), "deleted file removed");
-		check(read(b, "keep.txt") === "k\n", "untouched file untouched");
+		check(readLf(b, "keep.txt") === "k\n", "untouched file untouched");
 	},
 
 	async F02_staged_content_only(check) {
@@ -350,7 +351,7 @@ const scenarios = {
 			read(b, "s.txt") === "staged",
 			"index content, not the later edit",
 		);
-		check(read(b, "w.txt") === "0\n", "worktree-only change not copied");
+		check(readLf(b, "w.txt") === "0\n", "worktree-only change not copied");
 	},
 
 	async F03_single_commit_into_a_plain_folder(check) {
