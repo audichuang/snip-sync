@@ -27,6 +27,10 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 - 過濾規則中「不含 `*` / `?` 的原始 regex pattern」直接交給 Rust `regex` 編譯:`.`、`\w`、`\d`、`\b` 是 Unicode 語意,
   少數 JS 視為字面字元的語法(如 `\pL`、巢狀字元類別)意義不同。glob 形式的 pattern 已經照 JS 語意轉換,不受影響。
   使用者寫原始 regex 時很少碰到;真的出現分歧再逐項轉譯。
+- git 來源(graph:commit / 區間)被過濾規則排除的**刪除檔**不會進 payload。TS graphCopy 會先放刪除檔再過濾,
+  會把被排除的檔案(例如 `secrets.env`)的舊內容帶出去;Rust 刻意不照做。
+- commit 模式重播時,路徑逐一放在 `git add` / `git commit` 的參數上。Windows 命令列約 32K 字元上限,
+  一個 commit 動到數千個檔案時會失敗;需要時改用 `--pathspec-from-file=- --pathspec-file-nul`。
 - `paths` 在 Windows 對超過 MAX_PATH 的路徑,`dunce::canonicalize` 會保留 `\\?\` 形式,containment 可能誤判為逃出 root 而拒絕(fail closed)。
 
 ## 2. 線上格式的不變量(摘要)
