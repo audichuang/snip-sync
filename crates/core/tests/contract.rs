@@ -282,9 +282,23 @@ fn parse_cases() {
 }
 
 #[test]
-#[ignore = "T-02"]
 fn token_cases() {
-	todo!()
+	for c in load().token_cases {
+		let s = snip_core::stats::payload_stats(&c.text);
+		let got = [s.chars, s.lines, s.words, s.tokens].map(|n| n as u64);
+		assert_eq!(
+			got,
+			[c.chars, c.lines, c.words, c.tokens],
+			"case {}",
+			c.name
+		);
+		assert_eq!(
+			snip_core::stats::estimate_tokens(&c.text) as u64,
+			c.tokens,
+			"case {}",
+			c.name
+		);
+	}
 }
 
 #[test]
