@@ -425,6 +425,28 @@ fn diff(git: &Git, args: &[&str]) -> Result<Vec<RawEntry>, GitError> {
 
 /// Collects the changed files of `source` as payload files.
 pub fn collect(git: &Git, source: &GitSource) -> Result<GitFiles, GitError> {
+	let (all, mut skipped) = collect_raw(git, source)?;
+	let mut files = Vec::with_capacity(all.len());
+	for f in all {
+		if f.content.is_some() {
+			files.push(f);
+		} else {
+			skipped += 1;
+		}
+	}
+	Ok(GitFiles {
+		files,
+		skipped_unreadable_count: skipped,
+	})
+}
+
+/// The files of `source` in order, an unreadable one kept with `content:
+/// None` so callers can filter before counting it; plus the number of
+/// entries dropped for a non-UTF-8 path name.
+fn collect_raw(
+	git: &Git,
+	source: &GitSource,
+) -> Result<(Vec<PayloadFile>, usize), GitError> {
 	let mut skipped = 0;
 	let mut changes = Vec::new();
 	match source {
@@ -528,20 +550,14 @@ pub fn collect(git: &Git, source: &GitSource) -> Result<GitFiles, GitError> {
 				_ => read_text(&mut cat, &c.new_oid)?,
 			}
 		};
-		match content {
-			Some(content) => files.push(PayloadFile {
-				path: c.path,
-				content: Some(content),
-				change_type: Some(change_type),
-				skipped_reason: None,
-			}),
-			None => skipped += 1,
-		}
+		files.push(PayloadFile {
+			path: c.path,
+			content,
+			change_type: Some(change_type),
+			skipped_reason: None,
+		});
 	}
-	Ok(GitFiles {
-		files,
-		skipped_unreadable_count: skipped,
-	})
+	Ok((files, skipped))
 }
 
 /// TS `normalizeFsPath`: a comparison key only, case-folded on Windows.
@@ -571,27 +587,34 @@ pub fn collect_payload<P: AsRef<Path>>(
 	if roots.is_empty() {
 		roots.push(git.root().to_path_buf());
 	}
-	let collected = collect(git, source)?;
+	let (collected, path_skips) = collect_raw(git, source)?;
 	let mut files = Vec::new();
 	let mut seen = HashSet::new();
 	let mut copied = 0;
 	let mut skipped_size = 0;
-	let mut skipped_unreadable = collected.skipped_unreadable_count;
+	let mut skipped_unreadable = path_skips;
 	let mut limit_reached = false;
 	// Commit and range copies are the graph surface, which always uses the
 	// git builder; SCM falls back to it for deleted or index content.
-	let mut fallback =
-		matches!(source, GitSource::Commit(_) | GitSource::Range(..));
-	for file in collected.files {
+	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
+	let mut fallback = graph;
+	for file in collected {
 		let absolute = git.root().join(&file.path);
 		if !seen.insert(fs_path_key(&absolute)) {
 			continue;
 		}
 		let absolute = absolute.to_string_lossy().into_owned();
-		let path = to_clipboard_path_from_roots(&roots, &absolute, None);
+		let filter_path = to_clipboard_path_from_roots(&roots, &absolute, None);
+		// graphCopy labels a single repo's files repo-relative and filters
+		// on the workspace-relative spelling; SCM uses the latter for both.
+		let path = if graph {
+			file.path.clone()
+		} else {
+			filter_path.clone()
+		};
 		if settings.use_filters
 			&& !file_matches_filters(
-				&path,
+				&filter_path,
 				&settings.filter_rules,
 				settings.use_include_filters,
 				settings.use_exclude_filters,
@@ -607,7 +630,14 @@ pub fn collect_payload<P: AsRef<Path>>(
 			limit_reached = true;
 			break;
 		}
-		let content = file.content.unwrap_or_default();
+		// Both TS surfaces check the limit first, then drop unreadable
+		// content; only graphCopy counts it (the SCM path just skips it).
+		let Some(content) = file.content else {
+			if graph {
+				skipped_unreadable += 1;
+			}
+			continue;
+		};
 		if file.change_type == Some(ChangeType::Deleted)
 			|| *source == GitSource::Staged
 		{
@@ -646,7 +676,13 @@ pub fn collect_payload<P: AsRef<Path>>(
 		post_text: settings.post_text.clone(),
 		add_extra_line_between_files: settings.add_extra_line_between_files,
 		files,
-		source_root: source_root_name(&roots),
+		// graphCopy names the repository (`singleRepoRoot`), SCM the
+		// single workspace root.
+		source_root: if graph {
+			source_root_name(&[git.root()])
+		} else {
+			source_root_name(&roots)
+		},
 	};
 	let payload = if fallback {
 		build_git_payload(&options)
@@ -1282,6 +1318,46 @@ mod tests {
 	}
 
 	#[test]
+	fn payload_counts_unreadable_only_after_filtering_on_the_graph() {
+		let r = Repo::new();
+		r.write("bin.dat", &[0xff, 0xfe, 0x00]);
+		r.write("a.ts", b"ok\n");
+		let sha = r.commit("init");
+		let exclude = Settings {
+			use_filters: true,
+			use_exclude_filters: true,
+			filter_rules: vec![FilterRule {
+				kind: FilterType::Path,
+				action: FilterAction::Exclude,
+				value: "bin.dat".into(),
+				enabled: true,
+			}],
+			..Settings::default()
+		};
+		let got = payload(&r, GitSource::Commit(sha.clone()), &exclude);
+		assert_eq!(
+			(got.skipped_unreadable_count, got.copied_file_count),
+			(0, 1)
+		);
+		let got = payload(&r, GitSource::Commit(sha), &Settings::default());
+		assert_eq!(
+			(got.skipped_unreadable_count, got.copied_file_count),
+			(1, 1)
+		);
+	}
+
+	#[test]
+	fn payload_working_unreadable_is_skipped_uncounted_like_scm() {
+		let r = Repo::new();
+		r.write("a.ts", b"ok\n");
+		r.commit("init");
+		r.write("bin.dat", &[0xff, 0xfe, 0x00]);
+		let got = payload(&r, GitSource::Working, &Settings::default());
+		assert_eq!(got.files, vec![]);
+		assert_eq!(got.skipped_unreadable_count, 0);
+	}
+
+	#[test]
 	fn payload_paths_are_workspace_relative_with_a_single_root_line() {
 		let r = Repo::new();
 		r.write("src/a.ts", b"a\n");
@@ -1289,15 +1365,35 @@ mod tests {
 		let sha = r.commit("init");
 		let git = Git::open(&r.path()).unwrap();
 		let src = git.root().join("src");
-		let got = collect_payload(
-			&git,
-			&GitSource::Commit(sha),
-			&[&src],
-			&Settings::default(),
-		)
-		.unwrap();
+		r.write("src/a.ts", b"a2\n");
+		r.git(&["add", "src/a.ts"]);
+		let s = Settings::default();
+		let got =
+			collect_payload(&git, &GitSource::Staged, &[&src], &s).unwrap();
 		assert_eq!(got.files[0].path, "a.ts");
 		assert!(got.payload.starts_with("// clipcode-root: src\n"));
+		r.git(&["reset", "-q", "--hard"]);
+		// The graph surface stays repo-relative and names the repository,
+		// while filters still see the workspace-relative path.
+		let parent = git.root().parent().unwrap().to_path_buf();
+		let repo = git.root().file_name().unwrap().to_string_lossy();
+		let exclude = Settings {
+			use_filters: true,
+			use_exclude_filters: true,
+			filter_rules: vec![FilterRule {
+				kind: FilterType::Path,
+				action: FilterAction::Exclude,
+				value: format!("{repo}/top.ts"),
+				enabled: true,
+			}],
+			..Settings::default()
+		};
+		let commit = GitSource::Commit(sha);
+		let got = collect_payload(&git, &commit, &[&parent], &exclude).unwrap();
+		assert_eq!(got.files, vec![file("src/a.ts", "a\n", New)]);
+		assert!(got
+			.payload
+			.starts_with(&format!("// clipcode-root: {repo}\n")));
 		// A deletion still carries its pre-deletion body.
 		fs::remove_file(r.path().join("top.ts")).unwrap();
 		let del = r.commit("rm");
