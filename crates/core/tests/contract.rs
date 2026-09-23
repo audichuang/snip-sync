@@ -220,15 +220,65 @@ fn fixture_deserializes() {
 }
 
 #[test]
-#[ignore = "T-01"]
 fn build_cases() {
-	todo!()
+	use snip_core::format::{
+		build_git_payload, build_payload, BuildPayloadOptions, ChangeType,
+		PayloadFile,
+	};
+	for c in load().build_cases {
+		let o = c.options;
+		let options = BuildPayloadOptions {
+			header_format: o.header_format,
+			pre_text: o.pre_text,
+			post_text: o.post_text,
+			add_extra_line_between_files: o.add_extra_line_between_files,
+			source_root: o.source_root,
+			files: o
+				.files
+				.into_iter()
+				.map(|f| PayloadFile {
+					path: f.path,
+					content: f.content,
+					skipped_reason: f.skipped_reason,
+					change_type: f.change_type.map(|t| {
+						ChangeType::from_label(&t).expect("known label")
+					}),
+				})
+				.collect(),
+		};
+		let built = if c.kind == "git" {
+			build_git_payload(&options)
+		} else {
+			build_payload(&options)
+		};
+		assert_eq!(built, c.wire, "build {}: {}", c.kind, c.name);
+	}
 }
 
 #[test]
-#[ignore = "T-01"]
 fn parse_cases() {
-	todo!()
+	use snip_core::format::parse_clipboard;
+	for c in load().parse_cases {
+		let parsed: Vec<(String, String, Vec<String>)> =
+			parse_clipboard(&c.input, &c.header_format)
+				.into_iter()
+				.map(|e| {
+					let mut types: Vec<String> = e
+						.change_types
+						.iter()
+						.map(|t| t.as_str().to_string())
+						.collect();
+					types.sort();
+					(e.path, e.content, types)
+				})
+				.collect();
+		let expected: Vec<(String, String, Vec<String>)> = c
+			.expected
+			.into_iter()
+			.map(|e| (e.path, e.content, e.change_types))
+			.collect();
+		assert_eq!(parsed, expected, "parse: {}", c.name);
+	}
 }
 
 #[test]
