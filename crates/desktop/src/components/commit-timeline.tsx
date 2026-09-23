@@ -5,7 +5,12 @@ import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { CommitSelection } from "../generated/CommitSelection";
 import type { CommitSummary } from "../generated/CommitSummary";
-import { chainBetween, clickCommit, toCommitSelection, type RangeEnds } from "../lib/commit-range";
+import {
+	chainBetween,
+	clickCommit,
+	toCommitSelection,
+	type RangeEnds,
+} from "../lib/commit-range";
 import { errorText } from "../lib/i18n";
 
 const HISTORY_LIMIT = 300;
@@ -30,7 +35,12 @@ export function CommitTimeline({
 	async function handleLoad() {
 		setLoading(true);
 		try {
-			setCommits(await invoke<CommitSummary[]>("list_commits", { repo, limit: HISTORY_LIMIT }));
+			setCommits(
+				await invoke<CommitSummary[]>("list_commits", {
+					repo,
+					limit: HISTORY_LIMIT,
+				}),
+			);
 			setEnds(null);
 		} catch (error: unknown) {
 			toast.danger(errorText(t, error));
@@ -66,7 +76,10 @@ export function CommitTimeline({
 			onCopy(request.selection);
 		} else if (request.reason === "discontinuous") {
 			toast.danger(
-				t("discontinuous", { tip: request.tip.slice(0, 8), oldest: request.oldest.slice(0, 8) }),
+				t("discontinuous", {
+					tip: request.tip.slice(0, 8),
+					oldest: request.oldest.slice(0, 8),
+				}),
 			);
 		} else {
 			toast.danger(t("rootRangeUnsupported"));
@@ -76,14 +89,25 @@ export function CommitTimeline({
 	return (
 		<div className="flex min-h-0 flex-1 flex-col gap-3">
 			<div className="flex flex-wrap items-center gap-2">
-				<Button size="sm" variant="secondary" onPress={() => void handleLoad()}>
+				<Button
+					size="sm"
+					variant="secondary"
+					onPress={() => void handleLoad()}
+				>
 					{loading ? <Spinner size="sm" /> : t("loadHistory")}
 				</Button>
 				<span className="text-sm text-muted">
-					{ends ? t("selectedCommits", { count: highlighted.size }) : t("timelineHint")}
+					{ends
+						? t("selectedCommits", { count: highlighted.size })
+						: t("timelineHint")}
 				</span>
 				<div className="ml-auto flex gap-2">
-					<Button size="sm" variant="ghost" isDisabled={!ends} onPress={() => setEnds(null)}>
+					<Button
+						size="sm"
+						variant="ghost"
+						isDisabled={!ends}
+						onPress={() => setEnds(null)}
+					>
 						{t("clearSelection")}
 					</Button>
 					<Button size="sm" isDisabled={!ends} onPress={handleCopy}>
@@ -110,22 +134,47 @@ export function CommitTimeline({
 						defaultGraphWidth={120}
 						onSelectCommit={(commit) => {
 							// Re-clicking the library's selected row reports undefined.
-							if (commit) setEnds((prev) => clickCommit(prev, commit.hash, shiftRef.current));
+							if (commit)
+								setEnds((prev) =>
+									clickCommit(
+										prev,
+										commit.hash,
+										shiftRef.current,
+									),
+								);
 						}}
 					>
 						<GitLog.GraphHTMLGrid nodeSize={12} />
 						<GitLog.Table
 							row={({ commit, backgroundColour }) => (
 								<div
-									data-selected={highlighted.has(commit.hash) || undefined}
+									data-selected={
+										highlighted.has(commit.hash) ||
+										undefined
+									}
 									className="flex h-10 cursor-pointer items-center gap-3 px-2 text-sm data-selected:bg-accent-soft"
-									style={highlighted.has(commit.hash) ? undefined : { backgroundColor: backgroundColour }}
+									style={
+										highlighted.has(commit.hash)
+											? undefined
+											: {
+													backgroundColor:
+														backgroundColour,
+												}
+									}
 								>
-									<span className="font-mono text-xs text-muted">{commit.hash.slice(0, 8)}</span>
-									<span className="min-w-0 flex-1 truncate">{commit.message}</span>
-									<span className="shrink-0 text-xs text-muted">{commit.author?.name}</span>
+									<span className="font-mono text-xs text-muted">
+										{commit.hash.slice(0, 8)}
+									</span>
+									<span className="min-w-0 flex-1 truncate">
+										{commit.message}
+									</span>
 									<span className="shrink-0 text-xs text-muted">
-										{(commit.authorDate ?? "").slice(0, 16).replace("T", " ")}
+										{commit.author?.name}
+									</span>
+									<span className="shrink-0 text-xs text-muted">
+										{(commit.authorDate ?? "")
+											.slice(0, 16)
+											.replace("T", " ")}
 									</span>
 								</div>
 							)}

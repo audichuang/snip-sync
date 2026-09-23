@@ -25,7 +25,11 @@ test("file copy message matches TS copySelectedFiles", async () => {
 		copyMessage(
 			t,
 			"files",
-			outcome({ skippedFileSizeCount: 2, fileLimitReached: true, skippedUnreadableCount: 1 }),
+			outcome({
+				skippedFileSizeCount: 2,
+				fileLimitReached: true,
+				skippedUnreadableCount: 1,
+			}),
 		),
 		"3 file(s) copied (2 skipped: size exceeded). File limit 500 reached. 1 skipped: not UTF-8 text or unreadable.",
 	);
@@ -35,11 +39,19 @@ test("git copy message matches TS copyGitChanges", async () => {
 	const t = await translator();
 	assert.equal(copyMessage(t, "git", outcome()), "3 Git file(s) copied.");
 	assert.equal(
-		copyMessage(t, "git", outcome({ skippedFileSizeCount: 2, skippedUnreadableCount: 1 })),
+		copyMessage(
+			t,
+			"git",
+			outcome({ skippedFileSizeCount: 2, skippedUnreadableCount: 1 }),
+		),
 		"3 Git file(s) copied (2 skipped: size exceeded, 1 skipped: not UTF-8 text or unreadable).",
 	);
 	assert.equal(
-		copyMessage(t, "git", outcome({ skippedUnreadableCount: 4, fileLimitReached: true })),
+		copyMessage(
+			t,
+			"git",
+			outcome({ skippedUnreadableCount: 4, fileLimitReached: true }),
+		),
 		"3 Git file(s) copied (4 skipped: not UTF-8 text or unreadable). File limit 500 reached.",
 	);
 });
@@ -61,11 +73,24 @@ test("stats line and token thresholds match TS notifyCopied", async () => {
 test("commit copy note reports not-copied files", async () => {
 	const t = await translator();
 	assert.deepEqual(
-		commitCopyNote(t, { commitCount: 3, fileCount: 7, chars: 5000, notCopiedCount: 0 }),
-		{ severity: "success", text: "3 commit(s) copied: 7 file(s), 5,000 chars." },
+		commitCopyNote(t, {
+			commitCount: 3,
+			fileCount: 7,
+			chars: 5000,
+			notCopiedCount: 0,
+		}),
+		{
+			severity: "success",
+			text: "3 commit(s) copied: 7 file(s), 5,000 chars.",
+		},
 	);
 	assert.deepEqual(
-		commitCopyNote(t, { commitCount: 3, fileCount: 7, chars: 5000, notCopiedCount: 1 }),
+		commitCopyNote(t, {
+			commitCount: 3,
+			fileCount: 7,
+			chars: 5000,
+			notCopiedCount: 1,
+		}),
 		{
 			severity: "warning",
 			text: "3 commit(s) copied: 7 file(s), 5,000 chars. 1 file(s) not copied.",

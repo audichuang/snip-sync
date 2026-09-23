@@ -2,7 +2,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { CommitSummary } from "../generated/CommitSummary";
-import { chainBetween, clickCommit, toCommitSelection } from "./commit-range.ts";
+import {
+	chainBetween,
+	clickCommit,
+	toCommitSelection,
+} from "./commit-range.ts";
 
 const c = (sha: string, ...parents: string[]): CommitSummary => ({
 	sha,
@@ -14,7 +18,14 @@ const c = (sha: string, ...parents: string[]): CommitSummary => ({
 });
 
 // Newest first, as `git log` lists them: e merges side branch s into d.
-const log = [c("e", "d", "s"), c("s", "b"), c("d", "c"), c("c", "b"), c("b", "a"), c("a")];
+const log = [
+	c("e", "d", "s"),
+	c("s", "b"),
+	c("d", "c"),
+	c("c", "b"),
+	c("b", "a"),
+	c("a"),
+];
 
 test("click sets the anchor, shift-click extends from it", () => {
 	const first = clickCommit(null, "d", false);
@@ -25,8 +36,18 @@ test("click sets the anchor, shift-click extends from it", () => {
 });
 
 test("chain follows first parents, in either click order", () => {
-	assert.deepEqual(chainBetween(log, { anchor: "b", end: "e" }), ["e", "d", "c", "b"]);
-	assert.deepEqual(chainBetween(log, { anchor: "e", end: "b" }), ["e", "d", "c", "b"]);
+	assert.deepEqual(chainBetween(log, { anchor: "b", end: "e" }), [
+		"e",
+		"d",
+		"c",
+		"b",
+	]);
+	assert.deepEqual(chainBetween(log, { anchor: "e", end: "b" }), [
+		"e",
+		"d",
+		"c",
+		"b",
+	]);
 	// s is not on e's first-parent chain: not contiguous.
 	assert.deepEqual(chainBetween(log, { anchor: "e", end: "s" }), []);
 });

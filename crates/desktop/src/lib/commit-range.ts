@@ -11,15 +11,24 @@ export interface RangeEnds {
 }
 
 /** Next state after a click; Shift extends from the anchor. */
-export function clickCommit(prev: RangeEnds | null, sha: string, shift: boolean): RangeEnds {
-	return shift && prev ? { anchor: prev.anchor, end: sha } : { anchor: sha, end: sha };
+export function clickCommit(
+	prev: RangeEnds | null,
+	sha: string,
+	shift: boolean,
+): RangeEnds {
+	return shift && prev
+		? { anchor: prev.anchor, end: sha }
+		: { anchor: sha, end: sha };
 }
 
 /**
  * The first-parent chain from the newer end down to the older one, newest
  * first. Empty when the older end is not on that chain (not contiguous).
  */
-export function chainBetween(commits: CommitSummary[], ends: RangeEnds): string[] {
+export function chainBetween(
+	commits: CommitSummary[],
+	ends: RangeEnds,
+): string[] {
 	const index = new Map(commits.map((c, i) => [c.sha, i]));
 	const a = index.get(ends.anchor);
 	const b = index.get(ends.end);
@@ -47,7 +56,10 @@ export type RangeRequest =
  * `base..tip` with base = the older end's first parent. A range reaching the
  * root commit has no base; it is expressible only as "last n" from HEAD.
  */
-export function toCommitSelection(commits: CommitSummary[], ends: RangeEnds): RangeRequest {
+export function toCommitSelection(
+	commits: CommitSummary[],
+	ends: RangeEnds,
+): RangeRequest {
 	const a = commits.findIndex((c) => c.sha === ends.anchor);
 	const b = commits.findIndex((c) => c.sha === ends.end);
 	const tipIndex = Math.min(a, b);
@@ -55,7 +67,12 @@ export function toCommitSelection(commits: CommitSummary[], ends: RangeEnds): Ra
 	const oldest = commits[Math.max(a, b)];
 	const chain = chainBetween(commits, ends);
 	if (chain.length === 0) {
-		return { ok: false, reason: "discontinuous", tip: tip.sha, oldest: oldest.sha };
+		return {
+			ok: false,
+			reason: "discontinuous",
+			tip: tip.sha,
+			oldest: oldest.sha,
+		};
 	}
 	const base = oldest.parents[0];
 	if (base !== undefined) {

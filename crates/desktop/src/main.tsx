@@ -17,5 +17,7 @@ initI18n()
 	.finally(() => {
 		// No <StrictMode>: its double-mounted ref callback leaves
 		// @pierre/diffs' PatchDiff with an empty <pre> (measured on 1.4.3).
-		ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(<App />);
+		ReactDOM.createRoot(
+			document.getElementById("root") as HTMLElement,
+		).render(<App />);
 	});

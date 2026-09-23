@@ -14,7 +14,15 @@ import type { GitSourceDto } from "../generated/GitSourceDto";
 
 type SourceKind = "files" | GitSourceDto["kind"];
 
-const SOURCES: { id: SourceKind; label: "sourceFiles" | "sourceWorking" | "sourceStaged" | "sourceCommit" | "sourceRange" }[] = [
+const SOURCES: {
+	id: SourceKind;
+	label:
+		| "sourceFiles"
+		| "sourceWorking"
+		| "sourceStaged"
+		| "sourceCommit"
+		| "sourceRange";
+}[] = [
 	{ id: "files", label: "sourceFiles" },
 	{ id: "working", label: "sourceWorking" },
 	{ id: "staged", label: "sourceStaged" },
@@ -38,8 +46,13 @@ export function CopyFilesPanel({
 	const [tip, setTip] = useState("HEAD");
 
 	async function handleAdd(directory: boolean) {
-		const picked = await open({ multiple: true, directory, defaultPath: repo });
-		const list = picked === null ? [] : Array.isArray(picked) ? picked : [picked];
+		const picked = await open({
+			multiple: true,
+			directory,
+			defaultPath: repo,
+		});
+		const list =
+			picked === null ? [] : Array.isArray(picked) ? picked : [picked];
 		setPaths((prev) => [...new Set([...prev, ...list])]);
 	}
 
@@ -81,10 +94,18 @@ export function CopyFilesPanel({
 			{kind === "files" && (
 				<div className="flex flex-col gap-2">
 					<div className="flex gap-2">
-						<Button size="sm" variant="secondary" onPress={() => void handleAdd(false)}>
+						<Button
+							size="sm"
+							variant="secondary"
+							onPress={() => void handleAdd(false)}
+						>
 							{t("addFiles")}
 						</Button>
-						<Button size="sm" variant="secondary" onPress={() => void handleAdd(true)}>
+						<Button
+							size="sm"
+							variant="secondary"
+							onPress={() => void handleAdd(true)}
+						>
 							{t("addFolders")}
 						</Button>
 						<Button

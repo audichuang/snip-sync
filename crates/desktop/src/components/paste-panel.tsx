@@ -63,7 +63,10 @@ export function usePaste(repo: string) {
 		const roots = repo ? [repo] : [];
 		setSeq((n) => n + 1);
 		const plan = await run(() =>
-			invoke<ClipboardPlan>("read_clipboard_plan", { roots, restoreBase: restoreBase ?? null }),
+			invoke<ClipboardPlan>("read_clipboard_plan", {
+				roots,
+				restoreBase: restoreBase ?? null,
+			}),
 		);
 		if (!plan) {
 			setState({ step: "idle" });
@@ -76,7 +79,11 @@ export function usePaste(repo: string) {
 		// TS asks about a folder offset first, so an adjusted plan can still
 		// turn out empty; an unadjusted one with a suggestion is shown as is.
 		if (!hasActionable(plan.plan) && !plan.suggestion) {
-			toast.warning(t("noActionable", { count: plan.plan.skippedOperations.length }));
+			toast.warning(
+				t("noActionable", {
+					count: plan.plan.skippedOperations.length,
+				}),
+			);
 			setState({ step: "idle" });
 			return;
 		}
@@ -91,7 +98,11 @@ export function usePaste(repo: string) {
 
 	async function apply() {
 		if (state.step !== "files") return;
-		const selection = toSelection(state.plan, new Set(state.checked), state.skipExisting);
+		const selection = toSelection(
+			state.plan,
+			new Set(state.checked),
+			state.skipExisting,
+		);
 		const result = await run(() =>
 			invoke<RestoreExecutionResult>("apply_restore", { selection }),
 		);
@@ -122,15 +133,32 @@ export function PastePanel({ paste }: { paste: Paste }) {
 					{busy ? <Spinner size="sm" /> : t("previewClipboard")}
 				</Button>
 			</div>
-			{state.step === "files" && <FilesPreview key={paste.seq} paste={paste} state={state} onCancel={reset} />}
+			{state.step === "files" && (
+				<FilesPreview
+					key={paste.seq}
+					paste={paste}
+					state={state}
+					onCancel={reset}
+				/>
+			)}
 			{state.step === "commits" && (
 				<CommitsPreview
 					key={paste.seq}
-					plan={state.plan} busy={busy} onReplay={paste.replay} onCancel={reset} />
+					plan={state.plan}
+					busy={busy}
+					onReplay={paste.replay}
+					onCancel={reset}
+				/>
 			)}
-			{state.step === "filesDone" && <FilesResult result={state.result} onBack={reset} />}
+			{state.step === "filesDone" && (
+				<FilesResult result={state.result} onBack={reset} />
+			)}
 			{state.step === "commitsDone" && (
-				<CommitsResult result={state.result} total={state.total} onBack={reset} />
+				<CommitsResult
+					result={state.result}
+					total={state.total}
+					onBack={reset}
+				/>
 			)}
 		</div>
 	);
@@ -179,7 +207,12 @@ function FilesPreview({
 							{suggestionText(t, plan, suggestion)}
 						</Alert.Description>
 						<div className="mt-2 flex gap-2">
-							<Button size="sm" onPress={() => void paste.preview(suggestion.base)}>
+							<Button
+								size="sm"
+								onPress={() =>
+									void paste.preview(suggestion.base)
+								}
+							>
 								{t("adjustPaths")}
 							</Button>
 							<Button
@@ -187,9 +220,17 @@ function FilesPreview({
 								variant="secondary"
 								onPress={() => {
 									if (hasActionable(plan)) {
-										paste.setState({ ...state, suggestion: null });
+										paste.setState({
+											...state,
+											suggestion: null,
+										});
 									} else {
-										toast.warning(t("noActionable", { count: plan.skippedOperations.length }));
+										toast.warning(
+											t("noActionable", {
+												count: plan.skippedOperations
+													.length,
+											}),
+										);
 										onCancel();
 									}
 								}}
@@ -211,7 +252,9 @@ function FilesPreview({
 					treeData={tree}
 					checkedKeys={state.checked}
 					onCheck={(checked) => {
-						const keys = Array.isArray(checked) ? checked : checked.checked;
+						const keys = Array.isArray(checked)
+							? checked
+							: checked.checked;
 						paste.setState({ ...state, checked: keys.map(String) });
 					}}
 					titleRender={(node) => (
@@ -219,10 +262,18 @@ function FilesPreview({
 							<span className="font-mono">{node.name}</span>
 							<OpChip node={node} />
 							{node.leaf?.reason && (
-								<span className="text-xs text-muted">{t(`skip${node.leaf.reason}`)}</span>
+								<span className="text-xs text-muted">
+									{t(`skip${node.leaf.reason}`)}
+								</span>
 							)}
 							{node.leaf?.kind === "overwrite" && (
-								<DiffButton diff={diff} target={{ kind: "restore", index: node.leaf.index }} />
+								<DiffButton
+									diff={diff}
+									target={{
+										kind: "restore",
+										index: node.leaf.index,
+									}}
+								/>
 							)}
 						</span>
 					)}
@@ -240,14 +291,18 @@ function FilesPreview({
 					<Button
 						size="sm"
 						variant={state.skipExisting ? "secondary" : "primary"}
-						onPress={() => paste.setState({ ...state, skipExisting: false })}
+						onPress={() =>
+							paste.setState({ ...state, skipExisting: false })
+						}
 					>
 						{t("overwriteAll")}
 					</Button>
 					<Button
 						size="sm"
 						variant={state.skipExisting ? "primary" : "secondary"}
-						onPress={() => paste.setState({ ...state, skipExisting: true })}
+						onPress={() =>
+							paste.setState({ ...state, skipExisting: true })
+						}
 					>
 						{t("skipExisting")}
 					</Button>
@@ -257,7 +312,11 @@ function FilesPreview({
 			<div className="flex gap-2">
 				<Button
 					onPress={() => void paste.apply()}
-					isDisabled={paste.busy || suggestion !== null || !hasActionable(plan)}
+					isDisabled={
+						paste.busy ||
+						suggestion !== null ||
+						!hasActionable(plan)
+					}
 				>
 					{t("proceed")}
 				</Button>
@@ -300,7 +359,9 @@ function FileRow({
 					{t(`replay${file.skipReason}`)}
 				</Chip>
 			)}
-			{file.action !== "SKIP" && <DiffButton diff={diff} target={target} />}
+			{file.action !== "SKIP" && (
+				<DiffButton diff={diff} target={target} />
+			)}
 			{diff.isOpen(target) && diff.patch !== null && (
 				<div className="basis-full">
 					<DiffBody patch={diff.patch} />
@@ -325,28 +386,50 @@ function CommitsPreview({
 	const diff = useDiff();
 	return (
 		<div className="flex min-h-0 flex-1 flex-col gap-3">
-			<p className="text-sm">{t("commitsToCreate", { count: plan.commits.length })}</p>
+			<p className="text-sm">
+				{t("commitsToCreate", { count: plan.commits.length })}
+			</p>
 			<div className="min-h-0 flex-1 overflow-auto rounded border border-border">
 				{plan.commits.map((c, ci) => {
 					const notCopied = c.files.filter((f) => f.notCopied).length;
 					return (
-						<details key={`${ci}-${c.authorDate}`} className="border-b border-border px-3 py-2">
+						<details
+							key={`${ci}-${c.authorDate}`}
+							className="border-b border-border px-3 py-2"
+						>
 							<summary className="flex cursor-pointer flex-wrap items-center gap-2 text-sm">
 								<span className="text-muted">#{ci + 1}</span>
-								<span className="font-medium">{c.message.split("\n")[0]}</span>
+								<span className="font-medium">
+									{c.message.split("\n")[0]}
+								</span>
 								<span className="text-xs text-muted">
-									{c.authorName} &lt;{c.authorEmail}&gt; · {c.authorDate}
+									{c.authorName} &lt;{c.authorEmail}&gt; ·{" "}
+									{c.authorDate}
 								</span>
 								{notCopied > 0 && (
-									<Chip size="sm" variant="soft" color="warning">
-										{t("notCopiedCount", { count: notCopied })}
+									<Chip
+										size="sm"
+										variant="soft"
+										color="warning"
+									>
+										{t("notCopiedCount", {
+											count: notCopied,
+										})}
 									</Chip>
 								)}
 							</summary>
-							<pre className="my-2 text-xs whitespace-pre-wrap text-muted">{c.message}</pre>
+							<pre className="my-2 text-xs whitespace-pre-wrap text-muted">
+								{c.message}
+							</pre>
 							<ul>
 								{c.files.map((f, fi) => (
-									<FileRow key={`${fi}-${f.path}`} commit={ci} file={f} index={fi} diff={diff} />
+									<FileRow
+										key={`${fi}-${f.path}`}
+										commit={ci}
+										file={f}
+										index={fi}
+										diff={diff}
+									/>
 								))}
 							</ul>
 						</details>
@@ -365,7 +448,13 @@ function CommitsPreview({
 	);
 }
 
-function FilesResult({ result, onBack }: { result: RestoreExecutionResult; onBack: () => void }) {
+function FilesResult({
+	result,
+	onBack,
+}: {
+	result: RestoreExecutionResult;
+	onBack: () => void;
+}) {
 	const { t } = useTranslation();
 	const { text, errors } = resultSummary(t, result);
 	return (
@@ -411,8 +500,13 @@ function CommitsResult({
 				<Alert.Content>
 					<Alert.Title>
 						{failure
-							? t("replayCreatedOf", { count: result.created.length, total })
-							: t("replayCreated", { count: result.created.length })}
+							? t("replayCreatedOf", {
+									count: result.created.length,
+									total,
+								})
+							: t("replayCreated", {
+									count: result.created.length,
+								})}
 					</Alert.Title>
 					{failure && (
 						<Alert.Description>

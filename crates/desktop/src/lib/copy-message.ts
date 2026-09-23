@@ -21,22 +21,34 @@ export const grouped = (n: number) => n.toLocaleString("en-US");
 export type CopyKind = "files" | "git";
 
 /** TS copySelectedFiles / copyGitChanges message, before the stats line. */
-export function copyMessage(t: Translate, kind: CopyKind, r: CopyOutcome): string {
-	const limit = r.fileLimitReached ? t("fileLimitReached", { limit: r.fileCountLimit }) : "";
+export function copyMessage(
+	t: Translate,
+	kind: CopyKind,
+	r: CopyOutcome,
+): string {
+	const limit = r.fileLimitReached
+		? t("fileLimitReached", { limit: r.fileCountLimit })
+		: "";
 	if (kind === "files") {
 		return t("copiedFiles", {
 			count: r.copiedFileCount,
 			sizeSuffix:
-				r.skippedFileSizeCount > 0 ? t("sizeSkippedParen", { count: r.skippedFileSizeCount }) : "",
+				r.skippedFileSizeCount > 0
+					? t("sizeSkippedParen", { count: r.skippedFileSizeCount })
+					: "",
 			limit,
 			unreadable:
 				r.skippedUnreadableCount > 0
-					? t("unreadableSkippedSentence", { count: r.skippedUnreadableCount })
+					? t("unreadableSkippedSentence", {
+							count: r.skippedUnreadableCount,
+						})
 					: "",
 		});
 	}
 	const reasons = [
-		...(r.skippedFileSizeCount > 0 ? [t("sizeSkipped", { count: r.skippedFileSizeCount })] : []),
+		...(r.skippedFileSizeCount > 0
+			? [t("sizeSkipped", { count: r.skippedFileSizeCount })]
+			: []),
 		...(r.skippedUnreadableCount > 0
 			? [t("unreadableSkipped", { count: r.skippedUnreadableCount })]
 			: []),
@@ -49,7 +61,11 @@ export function copyMessage(t: Translate, kind: CopyKind, r: CopyOutcome): strin
 }
 
 /** TS notifyCopied: stats line plus the token-size severity. */
-export function copyNote(t: Translate, kind: CopyKind, r: CopyOutcome): CopyNote {
+export function copyNote(
+	t: Translate,
+	kind: CopyKind,
+	r: CopyOutcome,
+): CopyNote {
 	const note = t("copyStats", {
 		message: copyMessage(t, kind, r),
 		chars: grouped(r.chars),
@@ -60,13 +76,19 @@ export function copyNote(t: Translate, kind: CopyKind, r: CopyOutcome): CopyNote
 	if (r.tokens >= TOKEN_DANGER_THRESHOLD) {
 		return {
 			severity: "danger",
-			text: t("overTokens", { note, threshold: grouped(TOKEN_DANGER_THRESHOLD) }),
+			text: t("overTokens", {
+				note,
+				threshold: grouped(TOKEN_DANGER_THRESHOLD),
+			}),
 		};
 	}
 	if (r.tokens >= TOKEN_WARN_THRESHOLD) {
 		return {
 			severity: "warning",
-			text: t("overTokens", { note, threshold: grouped(TOKEN_WARN_THRESHOLD) }),
+			text: t("overTokens", {
+				note,
+				threshold: grouped(TOKEN_WARN_THRESHOLD),
+			}),
 		};
 	}
 	return { severity: "success", text: note };
@@ -75,7 +97,13 @@ export function copyNote(t: Translate, kind: CopyKind, r: CopyOutcome): CopyNote
 /** Commit-mode notification (spec 4.2): commits, files, chars, not copied. */
 export function commitCopyNote(t: Translate, s: CommitCopySummary): CopyNote {
 	const text =
-		t("copiedCommits", { commits: s.commitCount, files: s.fileCount, chars: grouped(s.chars) }) +
-		(s.notCopiedCount > 0 ? t("notCopiedSuffix", { count: s.notCopiedCount }) : "");
+		t("copiedCommits", {
+			commits: s.commitCount,
+			files: s.fileCount,
+			chars: grouped(s.chars),
+		}) +
+		(s.notCopiedCount > 0
+			? t("notCopiedSuffix", { count: s.notCopiedCount })
+			: "");
 	return { severity: s.notCopiedCount > 0 ? "warning" : "success", text };
 }

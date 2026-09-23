@@ -4,7 +4,10 @@ import zhHant from "./locales/zh-Hant.ts";
 
 export type MessageKey = keyof typeof en;
 /** The slice of i18next's `t` the pure helpers need. */
-export type Translate = (key: MessageKey, params?: Record<string, unknown>) => string;
+export type Translate = (
+	key: MessageKey,
+	params?: Record<string, unknown>,
+) => string;
 
 export const resources = {
 	en: { translation: en },
@@ -16,7 +19,10 @@ export type Language = keyof typeof resources;
 const STORAGE_KEY = "language";
 
 /** Any Chinese locale gets Traditional Chinese; everything else English. */
-export function pickLanguage(stored: string | null, navigatorLanguage: string): Language {
+export function pickLanguage(
+	stored: string | null,
+	navigatorLanguage: string,
+): Language {
 	if (stored === "en" || stored === "zh-Hant") return stored;
 	return navigatorLanguage.toLowerCase().startsWith("zh") ? "zh-Hant" : "en";
 }

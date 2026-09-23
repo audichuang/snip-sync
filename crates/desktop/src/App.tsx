@@ -13,7 +13,12 @@ import type { CommitSelection } from "./generated/CommitSelection";
 import type { CopyDone } from "./generated/CopyDone";
 import type { CopyOutcome } from "./generated/CopyOutcome";
 import type { CopyRequest } from "./generated/CopyRequest";
-import { commitCopyNote, copyNote, type CopyKind, type CopyNote } from "./lib/copy-message";
+import {
+	commitCopyNote,
+	copyNote,
+	type CopyKind,
+	type CopyNote,
+} from "./lib/copy-message";
 import { errorText, setLanguage } from "./lib/i18n";
 import { showCopyNotification } from "./lib/settings";
 
@@ -58,7 +63,8 @@ export default function App() {
 				void live.current.paste.preview();
 			}),
 		];
-		return () => offs.forEach((off) => void off.then((unlisten) => unlisten()));
+		return () =>
+			offs.forEach((off) => void off.then((unlisten) => unlisten()));
 	}, []);
 
 	// The tray menu is native; hand it the current language's labels.
@@ -96,7 +102,13 @@ export default function App() {
 	async function handleCopyCommits(selection: CommitSelection) {
 		try {
 			void showNote(
-				commitCopyNote(t, await invoke<CommitCopySummary>("copy_commits", { repo, selection })),
+				commitCopyNote(
+					t,
+					await invoke<CommitCopySummary>("copy_commits", {
+						repo,
+						selection,
+					}),
+				),
 			);
 		} catch (error: unknown) {
 			toast.danger(errorText(t, error));
@@ -108,16 +120,25 @@ export default function App() {
 			<Toast.Provider placement="bottom end" />
 			<header className="flex items-center gap-3">
 				<h1 className="text-lg font-semibold">{t("appTitle")}</h1>
-				<Button size="sm" variant="secondary" onPress={() => void handleChooseRepo()}>
+				<Button
+					size="sm"
+					variant="secondary"
+					onPress={() => void handleChooseRepo()}
+				>
 					{t("chooseRepo")}
 				</Button>
-				<span className="min-w-0 flex-1 truncate font-mono text-sm text-muted" title={repo}>
+				<span
+					className="min-w-0 flex-1 truncate font-mono text-sm text-muted"
+					title={repo}
+				>
 					{repo || t("noRepo")}
 				</span>
 				<Button
 					size="sm"
 					variant="ghost"
-					onPress={() => setLanguage(i18n.language === "en" ? "zh-Hant" : "en")}
+					onPress={() =>
+						setLanguage(i18n.language === "en" ? "zh-Hant" : "en")
+					}
 				>
 					{t("language")}
 				</Button>
@@ -129,7 +150,10 @@ export default function App() {
 				onSelectionChange={(key: Key) => setTab(key as Tab)}
 			>
 				<Tabs.ListContainer>
-					<Tabs.List aria-label={t("appTitle")} className="inline-flex w-auto">
+					<Tabs.List
+						aria-label={t("appTitle")}
+						className="inline-flex w-auto"
+					>
 						<Tabs.Tab id="files" className="min-w-max">
 							{t("tabFiles")}
 							<Tabs.Indicator />
@@ -145,16 +169,25 @@ export default function App() {
 					</Tabs.List>
 				</Tabs.ListContainer>
 				<Tabs.Panel id="files" className="pt-3">
-					<CopyFilesPanel repo={repo} onCopy={(r) => void handleCopy(r)} />
+					<CopyFilesPanel
+						repo={repo}
+						onCopy={(r) => void handleCopy(r)}
+					/>
 				</Tabs.Panel>
-				<Tabs.Panel id="commits" className="flex min-h-0 flex-1 flex-col pt-3">
+				<Tabs.Panel
+					id="commits"
+					className="flex min-h-0 flex-1 flex-col pt-3"
+				>
 					<CommitTimeline
 						key={repo}
 						repo={repo}
 						onCopy={(s) => void handleCopyCommits(s)}
 					/>
 				</Tabs.Panel>
-				<Tabs.Panel id="paste" className="flex min-h-0 flex-1 flex-col pt-3">
+				<Tabs.Panel
+					id="paste"
+					className="flex min-h-0 flex-1 flex-col pt-3"
+				>
 					<PastePanel paste={paste} />
 				</Tabs.Panel>
 			</Tabs>

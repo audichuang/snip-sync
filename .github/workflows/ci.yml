@@ -87,11 +87,14 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: rustfmt
-            # Frontend (prettier) format check is omitted until crates/desktop
-            # ships prettier and a `format:check` script; oxlint in
-            # lint-frontend covers the frontend meanwhile.
+            - name: Setup Bun
+              uses: oven-sh/setup-bun@v2
+            - name: Install desktop deps (frozen)
+              run: cd crates/desktop && bun install --frozen-lockfile
             - name: Rust format
               run: cargo fmt --all -- --check
+            - name: Frontend format
+              run: cd crates/desktop && bun run format:check
 
     # Rust lint (clippy + audit) - 3 OS matrix
     lint-rust:

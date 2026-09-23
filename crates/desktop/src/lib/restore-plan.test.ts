@@ -24,8 +24,14 @@ const create = (relativePath: string, existed: boolean) => ({
 
 const plan: RestorePlan = {
 	roots: ["/w"],
-	createOperations: [create("src/a.ts", false), create("src/b.ts", true), create("README.md", true)],
-	deleteOperations: [{ relativePath: "src/old.ts", absolutePath: "/w/src/old.ts" }],
+	createOperations: [
+		create("src/a.ts", false),
+		create("src/b.ts", true),
+		create("README.md", true),
+	],
+	deleteOperations: [
+		{ relativePath: "src/old.ts", absolutePath: "/w/src/old.ts" },
+	],
 	skippedOperations: [
 		{ rawPath: "../evil", relativePath: null, reason: "UNRESOLVED_PATH" },
 		{ rawPath: "bin/x", relativePath: "bin/x", reason: "NON_UTF8_TARGET" },
@@ -67,7 +73,11 @@ test("unchecked rows become unchecked indices; overwrite by default", () => {
 
 test("empty plan has nothing actionable (TS 'No actionable files found')", async () => {
 	const t = await translator();
-	const empty: RestorePlan = { ...plan, createOperations: [], deleteOperations: [] };
+	const empty: RestorePlan = {
+		...plan,
+		createOperations: [],
+		deleteOperations: [],
+	};
 	assert.equal(hasActionable(empty), false);
 	assert.equal(hasActionable(plan), true);
 	assert.equal(
@@ -100,20 +110,35 @@ test("confirmation and result texts match TS", async () => {
 			deletedCount: 0,
 			errors: ["a: x", "b: y", "c: z", "d: w"],
 		}),
-		{ text: "No files changed.", errors: "Snipcode failed 4 operation(s): a: x; b: y; c: z" },
+		{
+			text: "No files changed.",
+			errors: "Snipcode failed 4 operation(s): a: x; b: y; c: z",
+		},
 	);
 });
 
 test("applyRestoreBase adds and strips a leading segment (TS restoreBase.test)", () => {
-	assert.equal(applyRestoreBase({ kind: "add", prefix: "repo" }, "src/a.ts"), "repo/src/a.ts");
-	assert.equal(applyRestoreBase({ kind: "strip", segment: "repo" }, "repo/src/a.ts"), "src/a.ts");
-	assert.equal(applyRestoreBase({ kind: "strip", segment: "repo" }, "src/a.ts"), "src/a.ts");
+	assert.equal(
+		applyRestoreBase({ kind: "add", prefix: "repo" }, "src/a.ts"),
+		"repo/src/a.ts",
+	);
+	assert.equal(
+		applyRestoreBase({ kind: "strip", segment: "repo" }, "repo/src/a.ts"),
+		"src/a.ts",
+	);
+	assert.equal(
+		applyRestoreBase({ kind: "strip", segment: "repo" }, "src/a.ts"),
+		"src/a.ts",
+	);
 });
 
 test("suggestion prompt carries the TS example", async () => {
 	const t = await translator();
 	assert.equal(
-		suggestionText(t, plan, { base: { kind: "strip", segment: "src" }, total: 3 }),
+		suggestionText(t, plan, {
+			base: { kind: "strip", segment: "src" },
+			total: 3,
+		}),
 		'These paths look like they belong elsewhere in this workspace. I can remove the leading "src/" for all 3 file(s).\n\nExample: src/a.ts → a.ts',
 	);
 });

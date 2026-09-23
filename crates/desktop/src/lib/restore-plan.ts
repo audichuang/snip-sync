@@ -61,7 +61,9 @@ export function planLeaves(plan: RestorePlan): PlanLeaf[] {
 export function buildPlanTree(plan: RestorePlan): PlanNode[] {
 	const root: PlanNode = { key: "", name: "", children: [] };
 	for (const leaf of planLeaves(plan)) {
-		const parts = leaf.raw ? [leaf.path] : leaf.path.replaceAll("\\", "/").split("/").filter(Boolean);
+		const parts = leaf.raw
+			? [leaf.path]
+			: leaf.path.replaceAll("\\", "/").split("/").filter(Boolean);
 		let node = root;
 		for (const part of parts.slice(0, -1)) {
 			const key = `dir:${node.key}/${part}`;
@@ -109,7 +111,9 @@ export function toSelection(
 	skipExisting: boolean,
 ): RestoreSelection {
 	const unchecked = (prefix: string, length: number) =>
-		Array.from({ length }, (_, i) => i).filter((i) => !checked.has(`${prefix}:${i}`));
+		Array.from({ length }, (_, i) => i).filter(
+			(i) => !checked.has(`${prefix}:${i}`),
+		);
 	return {
 		overwriteExisting: !skipExisting,
 		skipExisting,
@@ -143,12 +147,18 @@ export function resultSummary(
 	result: RestoreExecutionResult,
 ): { text: string; errors: string | null } {
 	const parts = [
-		result.createdCount > 0 ? t("resultCreated", { count: result.createdCount }) : "",
-		result.overwrittenCount > 0 ? t("resultOverwritten", { count: result.overwrittenCount }) : "",
+		result.createdCount > 0
+			? t("resultCreated", { count: result.createdCount })
+			: "",
+		result.overwrittenCount > 0
+			? t("resultOverwritten", { count: result.overwrittenCount })
+			: "",
 		result.skippedExistingCount > 0
 			? t("resultSkipped", { count: result.skippedExistingCount })
 			: "",
-		result.deletedCount > 0 ? t("resultDeleted", { count: result.deletedCount }) : "",
+		result.deletedCount > 0
+			? t("resultDeleted", { count: result.deletedCount })
+			: "",
 	].filter(Boolean);
 	return {
 		text: parts.length > 0 ? parts.join(", ") : t("resultNoChange"),
@@ -163,7 +173,10 @@ export function resultSummary(
 }
 
 /** TS restoreBase.ts applyRestoreBase. */
-export function applyRestoreBase(base: RestoreBase, relativePath: string): string {
+export function applyRestoreBase(
+	base: RestoreBase,
+	relativePath: string,
+): string {
 	if (base.kind === "add") return `${base.prefix}/${relativePath}`;
 	const slash = relativePath.indexOf("/");
 	return slash >= 0 && relativePath.slice(0, slash) === base.segment
@@ -173,7 +186,12 @@ export function applyRestoreBase(base: RestoreBase, relativePath: string): strin
 
 /** TS isRelativeEntryPath. */
 export function isRelativeEntryPath(p: string): boolean {
-	return !!p && !p.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(p) && !p.startsWith("\\");
+	return (
+		!!p &&
+		!p.startsWith("/") &&
+		!/^[A-Za-z]:[\\/]/.test(p) &&
+		!p.startsWith("\\")
+	);
 }
 
 /** TS confirmRestoreBaseOffset prompt, with its before -> after example. */
@@ -188,7 +206,11 @@ export function suggestionText(
 			? t("baseStrip", { segment: base.segment })
 			: t("baseAdd", { prefix: base.prefix });
 	const sample = planLeaves(plan)
-		.map((l) => (l.kind === "skip" ? plan.skippedOperations[l.index].rawPath : l.path))
+		.map((l) =>
+			l.kind === "skip"
+				? plan.skippedOperations[l.index].rawPath
+				: l.path,
+		)
 		.find((p) => isRelativeEntryPath(p) && p.includes("/"));
 	const example = sample
 		? `\n\n${t("suggestExample", { from: sample, to: applyRestoreBase(base, sample) })}`

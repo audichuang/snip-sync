@@ -5,5 +5,7 @@
  */
 export function withGitHeader(patch: string): string {
 	const m = /^--- (a\/.*)\n\+\+\+ (b\/.*)$/m.exec(patch);
-	return m && !patch.startsWith("diff --git") ? `diff --git ${m[1]} ${m[2]}\n${patch}` : patch;
+	return m && !patch.startsWith("diff --git")
+		? `diff --git ${m[1]} ${m[2]}\n${patch}`
+		: patch;
 }

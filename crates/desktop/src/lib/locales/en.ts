@@ -85,7 +85,8 @@ export default {
 	showDiff: "Diff",
 	hideDiff: "Hide diff",
 	noDiff: "No differences.",
-	commitsToCreate: "{{count}} commit(s) will be created on the current branch.",
+	commitsToCreate:
+		"{{count}} commit(s) will be created on the current branch.",
 	notCopiedCount: "{{count}} file(s) not copied",
 	replayCommits: "Create commits",
 	replayCreated: "Created {{count}} commit(s).",

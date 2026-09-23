@@ -29,11 +29,14 @@ const zhHant: Record<keyof typeof en, string> = {
 	selectedCommits: "已選取 {{count}} 個 commit",
 	copyCommits: "複製 commit",
 	clearSelection: "清除",
-	rootRangeUnsupported: "從第一個 commit 開始的區間,必須以 HEAD 結尾才能複製。",
+	rootRangeUnsupported:
+		"從第一個 commit 開始的區間,必須以 HEAD 結尾才能複製。",
 	noHistory: "沒有載入任何 commit。",
-	discontinuous: "選取的 commit 不連續:{{oldest}} 不在 {{tip}} 的 first-parent 鏈上。",
+	discontinuous:
+		"選取的 commit 不連續:{{oldest}} 不在 {{tip}} 的 first-parent 鏈上。",
 
-	copiedFiles: "已複製 {{count}} 個檔案{{sizeSuffix}}。{{limit}}{{unreadable}}",
+	copiedFiles:
+		"已複製 {{count}} 個檔案{{sizeSuffix}}。{{limit}}{{unreadable}}",
 	copiedGitFiles: "已複製 {{count}} 個 Git 檔案{{skipped}}。{{limit}}",
 	sizeSkippedParen: "({{count}} 個超過大小上限而跳過)",
 	sizeSkipped: "{{count}} 個超過大小上限而跳過",
