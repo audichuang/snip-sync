@@ -90,6 +90,7 @@ export function CommitTimeline({
 		<div className="flex min-h-0 flex-1 flex-col gap-3">
 			<div className="flex flex-wrap items-center gap-2">
 				<Button
+					data-testid="load-history"
 					size="sm"
 					variant="secondary"
 					onPress={() => void handleLoad()}
@@ -110,7 +111,12 @@ export function CommitTimeline({
 					>
 						{t("clearSelection")}
 					</Button>
-					<Button size="sm" isDisabled={!ends} onPress={handleCopy}>
+					<Button
+						data-testid="copy-commits"
+						size="sm"
+						isDisabled={!ends}
+						onPress={handleCopy}
+					>
 						{t("copyCommits")}
 					</Button>
 				</div>
@@ -148,6 +154,7 @@ export function CommitTimeline({
 						<GitLog.Table
 							row={({ commit, backgroundColour }) => (
 								<div
+									data-commit={commit.hash}
 									data-selected={
 										highlighted.has(commit.hash) ||
 										undefined

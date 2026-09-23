@@ -237,3 +237,57 @@ jobs:
               env:
                   SNIP_REQUIRE_ALL_TESTS: "1"
               run: cargo test --workspace --no-fail-fast
+
+    # Drives the real app (Rust backend + WebView) through tauri-driver:
+    # copy three commits in one clone, replay them into another. Linux only:
+    # macOS WKWebView has no WebDriver (plan.md section 5).
+    desktop-e2e:
+        name: Desktop E2E (ubuntu-latest)
+        needs: changes
+        if: |
+            github.event_name == 'push' ||
+            github.event_name == 'workflow_dispatch' ||
+            needs.changes.outputs.rust == 'true' ||
+            needs.changes.outputs.desktop == 'true' ||
+            needs.changes.outputs.workflows == 'true'
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.10
+            - name: Rust Cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  shared-key: ${{ runner.os }}-e2e
+                  cache-on-failure: true
+            - name: Install Linux system dependencies (Tauri, WebDriver, Xvfb)
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb webkit2gtk-driver
+            - name: Install tauri-driver
+              run: cargo install tauri-driver --locked
+            - name: Setup Bun
+              uses: oven-sh/setup-bun@v2
+            - name: Setup Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+            - name: Install desktop deps (frozen)
+              run: cd crates/desktop && bun install --frozen-lockfile
+            - name: Build the app with the frontend embedded
+              run: cd crates/desktop && bun run tauri build --debug --no-bundle
+            - name: Commit sync through the real app
+              env:
+                  SNIP_E2E_OUT: ${{ runner.temp }}/e2e-shots
+              run: |
+                  mkdir -p "$SNIP_E2E_OUT"
+                  cd crates/desktop && xvfb-run -a node e2e/commit-sync.mjs
+            - name: Upload screenshots
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: desktop-e2e-screenshots
+                  path: ${{ runner.temp }}/e2e-shots
+                  if-no-files-found: ignore
