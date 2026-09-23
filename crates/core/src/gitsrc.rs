@@ -580,9 +580,14 @@ pub fn collect_payload<P: AsRef<Path>>(
 	workspace_roots: &[P],
 	settings: &Settings,
 ) -> Result<CopyResult, GitError> {
+	// git reports its toplevel fully resolved (macOS `/private/var`, Windows
+	// long names), so the roots must be too or no file relativizes.
 	let mut roots: Vec<PathBuf> = workspace_roots
 		.iter()
-		.map(|r| r.as_ref().to_path_buf())
+		.map(|r| {
+			dunce::canonicalize(r.as_ref())
+				.unwrap_or_else(|_| r.as_ref().to_path_buf())
+		})
 		.collect();
 	if roots.is_empty() {
 		roots.push(git.root().to_path_buf());
@@ -1355,6 +1360,34 @@ mod tests {
 		assert_eq!(
 			(got.skipped_unreadable_count, got.copied_file_count),
 			(1, 1)
+		);
+	}
+
+	// macOS temp dirs live under the `/var` -> `/private/var` symlink, and git
+	// reports the resolved toplevel; a root spelled through the link must
+	// still relativize.
+	#[cfg(unix)]
+	#[test]
+	fn payload_relativizes_against_a_root_spelled_through_a_symlink() {
+		let r = Repo::new();
+		r.write("sub/a.txt", b"one");
+		r.commit("init");
+		r.write("sub/a.txt", b"two");
+		let outer = tempfile::tempdir().unwrap();
+		let link = outer.path().join("link");
+		std::os::unix::fs::symlink(r.path(), &link).unwrap();
+		let git = Git::open(&link.join("sub")).unwrap();
+		let got = collect_payload(
+			&git,
+			&GitSource::Working,
+			&[link.join("sub")],
+			&Settings::default(),
+		)
+		.unwrap();
+		assert!(
+			got.payload.contains("// file: [MODIFIED] a.txt"),
+			"{}",
+			got.payload
 		);
 	}
 
