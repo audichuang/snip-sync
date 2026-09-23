@@ -1,4 +1,4 @@
-import { Button, Tabs, Toast, toast } from "@heroui/react";
+import { Button, Input, Tabs, TextField, Toast, toast } from "@heroui/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -35,6 +35,8 @@ async function showNote(note: CopyNote) {
 export default function App() {
 	const { t, i18n } = useTranslation();
 	const [repo, setRepo] = useState("");
+	// The header path field: typed or pasted paths apply on Enter / blur.
+	const [repoDraft, setRepoDraft] = useState("");
 	const [tab, setTab] = useState<Tab>("files");
 	const paste = usePaste(repo);
 	// Which wording the tray's "copy last selection" result gets.
@@ -82,10 +84,15 @@ export default function App() {
 
 	async function handleChooseRepo() {
 		const dir = await open({ directory: true });
-		if (typeof dir === "string") {
-			setRepo(dir);
-			paste.setState({ step: "idle" });
-		}
+		if (typeof dir === "string") applyRepo(dir);
+	}
+
+	function applyRepo(dir: string) {
+		const next = dir.trim();
+		setRepoDraft(next);
+		if (next === repo) return;
+		setRepo(next);
+		paste.setState({ step: "idle" });
 	}
 
 	async function handleCopy(request: CopyRequest) {
@@ -127,12 +134,22 @@ export default function App() {
 				>
 					{t("chooseRepo")}
 				</Button>
-				<span
-					className="min-w-0 flex-1 truncate font-mono text-sm text-muted"
-					title={repo}
+				<TextField
+					aria-label={t("repoPath")}
+					className="min-w-0 flex-1"
 				>
-					{repo || t("noRepo")}
-				</span>
+					<Input
+						data-testid="repo-path"
+						className="font-mono text-sm"
+						value={repoDraft}
+						placeholder={t("noRepo")}
+						onChange={(e) => setRepoDraft(e.target.value)}
+						onBlur={() => applyRepo(repoDraft)}
+						onKeyDown={(e) => {
+							if (e.key === "Enter") applyRepo(repoDraft);
+						}}
+					/>
+				</TextField>
 				<Button
 					size="sm"
 					variant="ghost"

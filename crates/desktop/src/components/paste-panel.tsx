@@ -84,8 +84,12 @@ export function usePaste(repo: string) {
 					count: plan.plan.skippedOperations.length,
 				}),
 			);
-			setState({ step: "idle" });
-			return;
+			// Still show what was skipped and why; TS only had the toast,
+			// which left the reason (e.g. a non-UTF-8 target) invisible.
+			if (plan.plan.skippedOperations.length === 0) {
+				setState({ step: "idle" });
+				return;
+			}
 		}
 		setState({
 			step: "files",
@@ -129,7 +133,11 @@ export function PastePanel({ paste }: { paste: Paste }) {
 	return (
 		<div className="flex min-h-0 flex-1 flex-col gap-3">
 			<div className="flex items-center gap-2">
-				<Button onPress={() => void paste.preview()} isDisabled={busy}>
+				<Button
+					data-testid="preview-clipboard"
+					onPress={() => void paste.preview()}
+					isDisabled={busy}
+				>
 					{busy ? <Spinner size="sm" /> : t("previewClipboard")}
 				</Button>
 			</div>
@@ -437,7 +445,11 @@ function CommitsPreview({
 				})}
 			</div>
 			<div className="flex gap-2">
-				<Button onPress={() => void onReplay()} isDisabled={busy}>
+				<Button
+					data-testid="replay-commits"
+					onPress={() => void onReplay()}
+					isDisabled={busy}
+				>
 					{t("replayCommits")}
 				</Button>
 				<Button variant="secondary" onPress={onCancel}>

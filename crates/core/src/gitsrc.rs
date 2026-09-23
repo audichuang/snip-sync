@@ -36,6 +36,11 @@ pub enum GitError {
 	NotFound,
 	#[error("git {args} failed: {stderr}")]
 	Failed { args: String, stderr: String },
+	#[error(
+		"{} is not inside a git repository (commit mode and git sources need one)",
+		.0.display()
+	)]
+	NotARepository(PathBuf),
 	#[error("invalid revision: {0}")]
 	InvalidRevision(String),
 	#[error(
@@ -87,7 +92,16 @@ impl Git {
 		let probe = Self {
 			root: dir.to_path_buf(),
 		};
-		let out = probe.run(&["rev-parse", "--show-toplevel"])?;
+		let out = probe.run(&["rev-parse", "--show-toplevel"]).map_err(
+			|e| match e {
+				GitError::Failed { ref stderr, .. }
+					if stderr.contains("not a git repository") =>
+				{
+					GitError::NotARepository(dir.to_path_buf())
+				}
+				e => e,
+			},
+		)?;
 		let top = String::from_utf8(out).map_err(|_| {
 			GitError::Malformed("repository path is not UTF-8".into())
 		})?;
@@ -718,6 +732,15 @@ pub fn collect_payload<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
+
+	#[test]
+	fn open_outside_a_repository_says_so() {
+		let dir = tempfile::tempdir().unwrap();
+		let err = Git::open(dir.path()).err().unwrap();
+		assert!(matches!(err, GitError::NotARepository(_)), "{err}");
+		assert!(err.to_string().contains("is not inside a git repository"));
+	}
+
 	use super::*;
 	use std::fs;
 	use std::io::Cursor;

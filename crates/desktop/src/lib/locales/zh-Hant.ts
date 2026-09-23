@@ -6,6 +6,7 @@ const zhHant: Record<keyof typeof en, string> = {
 	language: "English",
 	chooseRepo: "選擇 repo / 資料夾",
 	noRepo: "尚未選擇 repo 或資料夾",
+	repoPath: "repo 或資料夾路徑",
 	tabFiles: "複製檔案",
 	tabCommits: "複製 commit",
 	tabPaste: "貼上",

@@ -5,6 +5,7 @@ export default {
 	language: "中文",
 	chooseRepo: "Choose repo / folder",
 	noRepo: "No repo or folder selected",
+	repoPath: "Repo or folder path",
 	tabFiles: "Copy files",
 	tabCommits: "Copy commits",
 	tabPaste: "Paste",
