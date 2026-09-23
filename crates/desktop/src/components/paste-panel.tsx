@@ -216,6 +216,7 @@ function FilesPreview({
 						</Alert.Description>
 						<div className="mt-2 flex gap-2">
 							<Button
+								data-testid="adjust-paths"
 								size="sm"
 								onPress={() =>
 									void paste.preview(suggestion.base)
@@ -224,6 +225,7 @@ function FilesPreview({
 								{t("adjustPaths")}
 							</Button>
 							<Button
+								data-testid="use-as-is"
 								size="sm"
 								variant="secondary"
 								onPress={() => {
@@ -297,6 +299,7 @@ function FilesPreview({
 				<div className="flex flex-wrap items-center gap-2 text-sm">
 					<span>{t("existingFiles", { count: existing })}</span>
 					<Button
+						data-testid="overwrite-all"
 						size="sm"
 						variant={state.skipExisting ? "secondary" : "primary"}
 						onPress={() =>
@@ -306,6 +309,7 @@ function FilesPreview({
 						{t("overwriteAll")}
 					</Button>
 					<Button
+						data-testid="skip-existing"
 						size="sm"
 						variant={state.skipExisting ? "primary" : "secondary"}
 						onPress={() =>
@@ -319,6 +323,7 @@ function FilesPreview({
 
 			<div className="flex gap-2">
 				<Button
+					data-testid="apply-restore"
 					onPress={() => void paste.apply()}
 					isDisabled={
 						paste.busy ||
@@ -470,7 +475,11 @@ function FilesResult({
 	const { t } = useTranslation();
 	const { text, errors } = resultSummary(t, result);
 	return (
-		<div className="flex flex-col gap-3">
+		<div
+			className="flex flex-col gap-3"
+			data-testid="restore-result"
+			data-status={errors ? "error" : "ok"}
+		>
 			<Alert status={errors ? "danger" : "success"}>
 				<Alert.Indicator />
 				<Alert.Content>
@@ -506,7 +515,11 @@ function CommitsResult({
 	const { t } = useTranslation();
 	const failure = result.failure;
 	return (
-		<div className="flex flex-col gap-3">
+		<div
+			className="flex flex-col gap-3"
+			data-testid="replay-result"
+			data-status={failure ? "error" : "ok"}
+		>
 			<Alert status={failure ? "danger" : "success"}>
 				<Alert.Indicator />
 				<Alert.Content>

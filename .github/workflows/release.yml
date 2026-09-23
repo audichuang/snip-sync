@@ -31,8 +31,8 @@ env:
 
 jobs:
     # Release gate: the tagged commit must already have a green push-to-main
-    # ci.yml run. pull_request runs are not trusted because their path filter
-    # can skip the test jobs (skipped != passed).
+    # ci.yml run (its `CI gate` fails on any non-success job). The run must be
+    # for the tagged SHA on main, not a pull_request merge ref.
     verify-ci:
         name: Verify CI is green for this commit
         runs-on: ubuntu-latest

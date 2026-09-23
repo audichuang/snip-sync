@@ -12,10 +12,12 @@ lint:
 fmt:
 	cargo fmt --all
 
+# Mirrors CI's Rust checks (see .github/workflows/ci.yml for the rest).
 preflight:
 	cargo fmt --all --check
-	cargo clippy --workspace --all-targets -- -D warnings
-	cargo test --workspace --no-fail-fast
+	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+	RUSTFLAGS="-D warnings" cargo test --workspace --locked --no-fail-fast
 
 # Run the desktop app in dev mode.
 desktop:
@@ -27,7 +29,7 @@ desktop-bundle:
 
 # Real-app E2E (Linux): needs webkit2gtk-driver, `cargo install tauri-driver`, xvfb.
 desktop-e2e:
-	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle && xvfb-run -a node e2e/commit-sync.mjs
+	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle && xvfb-run -a node e2e/scenarios.mjs
 
 # Bump the version in every manifest (perl -pi is portable across GNU/BSD).
 bump version:

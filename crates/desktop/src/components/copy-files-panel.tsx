@@ -84,7 +84,11 @@ export function CopyFilesPanel({
 				}}
 			>
 				{SOURCES.map((s, i) => (
-					<ToggleButton key={s.id} id={s.id}>
+					<ToggleButton
+						key={s.id}
+						id={s.id}
+						data-testid={`source-${s.id}`}
+					>
 						{i > 0 && <ToggleButtonGroup.Separator />}
 						{t(s.label)}
 					</ToggleButton>
@@ -134,7 +138,7 @@ export function CopyFilesPanel({
 			{kind === "commit" && (
 				<TextField className="max-w-sm" value={sha} onChange={setSha}>
 					<Label>{t("commitSha")}</Label>
-					<Input className="font-mono" />
+					<Input data-testid="commit-sha" className="font-mono" />
 				</TextField>
 			)}
 
@@ -142,17 +146,19 @@ export function CopyFilesPanel({
 				<div className="flex flex-wrap gap-4">
 					<TextField className="w-48" value={base} onChange={setBase}>
 						<Label>{t("rangeBase")}</Label>
-						<Input className="font-mono" />
+						<Input data-testid="range-base" className="font-mono" />
 					</TextField>
 					<TextField className="w-48" value={tip} onChange={setTip}>
 						<Label>{t("rangeTip")}</Label>
-						<Input className="font-mono" />
+						<Input data-testid="range-tip" className="font-mono" />
 					</TextField>
 				</div>
 			)}
 
 			<div>
-				<Button onPress={handleCopy}>{t("copy")}</Button>
+				<Button data-testid="copy-files" onPress={handleCopy}>
+					{t("copy")}
+				</Button>
 			</div>
 		</div>
 	);
