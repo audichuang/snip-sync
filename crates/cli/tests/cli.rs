@@ -269,3 +269,30 @@ fn discontinuous_commits_are_refused() {
 		text(&out.stderr)
 	);
 }
+
+#[test]
+fn git_sources_label_paths_against_repo_subdirectory() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("r");
+	fs::create_dir_all(repo.join("sub")).unwrap();
+	init_repo(&repo);
+	fs::write(repo.join("sub/a.txt"), "one").unwrap();
+	commit(&repo, "init", "2020-01-01T00:00:00+00:00");
+	fs::write(repo.join("sub/a.txt"), "two").unwrap();
+	let sub = repo.join("sub");
+	let out = snip(
+		&[
+			"--repo",
+			sub.to_str().unwrap(),
+			"copy",
+			"--working",
+			"--stdout",
+		],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let payload = text(&out.stdout);
+	// Same labelling as `snip copy <paths>` with the same --repo.
+	assert!(payload.contains("[MODIFIED] a.txt"), "{payload}");
+	assert!(!payload.contains("sub/a.txt"), "{payload}");
+}

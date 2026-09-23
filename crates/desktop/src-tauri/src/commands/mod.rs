@@ -427,10 +427,14 @@ pub async fn read_clipboard_plan(
 ) -> CmdResult<ClipboardPlan> {
 	let header_format = load_settings(&app).header_format;
 	blocking(move || {
-		let (plan, pending) =
-			plan_clipboard(&roots, restore_base.as_ref(), &header_format)?;
 		let state = tauri::Manager::state::<AppState>(&app);
-		*lock(&state.pending) = Some(pending);
+		// A failed preview must not leave an older plan applicable.
+		let planned =
+			plan_clipboard(&roots, restore_base.as_ref(), &header_format);
+		let mut pending = lock(&state.pending);
+		*pending = None;
+		let (plan, next) = planned?;
+		*pending = Some(next);
 		Ok(plan)
 	})
 	.await

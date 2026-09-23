@@ -240,8 +240,9 @@ fn copy_git(
 	stdout: bool,
 ) -> Outcome {
 	let git = Git::open(repo).map_err(|e| e.to_string())?;
-	// No workspace roots: files are labelled against the repository root.
-	let result = collect_payload(&git, source, &[] as &[&Path], settings)
+	// `--repo` is the workspace root, as for `snip copy <paths>` and the
+	// TS surfaces (which pass the workspace roots, not the git toplevel).
+	let result = collect_payload(&git, source, &[repo], settings)
 		.map_err(|e| e.to_string())?;
 	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
 	let message = if graph {
