@@ -4,7 +4,7 @@
  * an edit, only for git-style patches, so add the `diff --git` line.
  */
 export function withGitHeader(patch: string): string {
-	const m = /^--- (a\/.*)\n\+\+\+ (b\/.*)$/m.exec(patch);
+	const m = /^--- (a\/.*)\n\+\+\+ (b\/.*)$/mu.exec(patch);
 	return m && !patch.startsWith("diff --git")
 		? `diff --git ${m[1]} ${m[2]}\n${patch}`
 		: patch;

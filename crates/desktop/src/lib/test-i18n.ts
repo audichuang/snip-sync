@@ -12,5 +12,6 @@ export async function translator(lng: Language = "en"): Promise<Translate> {
 		nsSeparator: false,
 		interpolation: { escapeValue: false },
 	});
-	return (key, params) => i18n.t(key, params);
+	return (...args) =>
+		args.length === 1 ? i18n.t(args[0]) : i18n.t(args[0], args[1]);
 }

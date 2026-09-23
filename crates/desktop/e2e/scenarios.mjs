@@ -12,12 +12,11 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import * as e from "./lib.mjs";
 
 const { git, write, read, readLf, exists, commit, newRepo, newFolder, clone } =
 	e;
-const here = path.dirname(fileURLToPath(import.meta.url));
+const here = import.meta.dirname;
 const exe = process.platform === "win32" ? "snip-sync.exe" : "snip-sync";
 const APP =
 	process.env.SNIP_APP ?? path.join(here, "../../../target/debug", exe);
@@ -27,6 +26,11 @@ const OUT =
 const ONLY = (process.env.SNIP_E2E_ONLY ?? "").split(",").filter(Boolean);
 
 const tree = (repo) => git(repo, "ls-tree", "-r", "HEAD");
+const noLogo = (repo) =>
+	tree(repo)
+		.split("\n")
+		.filter((l) => !l.endsWith("logo.png"))
+		.join("\n");
 const log = (repo, n) => git(repo, "log", `-${n}`, "--format=%s|%an <%ae>|%aI");
 const count = (repo, range) => git(repo, "rev-list", "--count", range);
 
@@ -72,11 +76,6 @@ const scenarios = {
 			log(a, 3) === log(b, 3),
 			"same messages, authors and author dates",
 		);
-		const noLogo = (r) =>
-			tree(r)
-				.split("\n")
-				.filter((l) => !l.endsWith("logo.png"))
-				.join("\n");
 		check(noLogo(a) === noLogo(b), "same tree apart from the binary");
 		check(
 			!git(b, "ls-tree", "-r", "--name-only", "HEAD").includes(
@@ -425,7 +424,7 @@ const results = [];
 const stop = await e.start(APP, OUT);
 try {
 	for (const [name, run] of Object.entries(scenarios)) {
-		if (ONLY.length && !ONLY.some((p) => name.startsWith(p))) continue;
+		if (ONLY.length > 0 && !ONLY.some((p) => name.startsWith(p))) continue;
 		const failures = [];
 		const check = (ok, what) => {
 			if (!ok) failures.push(what);
@@ -437,14 +436,16 @@ try {
 			failures.push(`error: ${error.message}`);
 		}
 		const ms = Date.now() - t0;
-		if (failures.length) {
-			await e.shot(`${name}-failure`).catch(() => undefined);
-			await e.saveSource(`${name}-failure`).catch(() => undefined);
+		if (failures.length > 0) {
+			await e.shot(`${name}-failure`).catch(() => {});
+			await e.saveSource(`${name}-failure`).catch(() => {});
 		} else {
-			await e.shot(`${name}`).catch(() => undefined);
+			await e.shot(`${name}`).catch(() => {});
 		}
 		results.push({ name, ok: failures.length === 0, ms, failures });
-		console.log(`${failures.length ? "FAIL" : "PASS"} ${name} (${ms} ms)`);
+		console.log(
+			`${failures.length > 0 ? "FAIL" : "PASS"} ${name} (${ms} ms)`,
+		);
 		for (const f of failures) console.log(`     - ${f}`);
 	}
 } finally {
@@ -459,4 +460,4 @@ const failed = results.filter((r) => !r.ok);
 console.log(
 	`\n${results.length - failed.length}/${results.length} scenarios passed; screenshots in ${OUT}`,
 );
-if (failed.length || results.length === 0) process.exit(1);
+if (failed.length > 0 || results.length === 0) process.exit(1);

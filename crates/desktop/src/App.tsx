@@ -28,7 +28,7 @@ type Tab = "files" | "commits" | "paste";
 async function showNote(note: CopyNote) {
 	const stored = await load("settings.json")
 		.then((store) => store.get("settings"))
-		.catch(() => undefined);
+		.catch(() => {});
 	if (showCopyNotification(stored)) toast[note.severity](note.text);
 }
 
@@ -50,11 +50,11 @@ export default function App() {
 	useEffect(() => {
 		const offs = [
 			listen<CopyDone>("tray-copied", ({ payload }) => {
-				const { t } = live.current;
+				const tr = live.current.t;
 				void showNote(
 					payload.mode === "commits"
-						? commitCopyNote(t, payload)
-						: copyNote(t, lastCopyKind.current, payload),
+						? commitCopyNote(tr, payload)
+						: copyNote(tr, lastCopyKind.current, payload),
 				);
 			}),
 			listen<string>("tray-copy-failed", ({ payload }) => {

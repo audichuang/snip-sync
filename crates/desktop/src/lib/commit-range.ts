@@ -34,15 +34,16 @@ export function chainBetween(
 	const b = index.get(ends.end);
 	if (a === undefined || b === undefined) return [];
 	// `list_commits` is newest first: the smaller index is the tip.
-	const tip = commits[Math.min(a, b)].sha;
-	const oldest = commits[Math.max(a, b)].sha;
+	const tip = commits[Math.min(a, b)]?.sha;
+	const oldest = commits[Math.max(a, b)]?.sha;
+	if (tip === undefined || oldest === undefined) return [];
 	const chain: string[] = [];
 	let sha: string | undefined = tip;
 	while (sha !== undefined) {
 		chain.push(sha);
 		if (sha === oldest) return chain;
 		const at = index.get(sha);
-		sha = at === undefined ? undefined : commits[at].parents[0];
+		sha = at === undefined ? undefined : commits[at]?.parents[0];
 	}
 	return [];
 }
@@ -65,6 +66,10 @@ export function toCommitSelection(
 	const tipIndex = Math.min(a, b);
 	const tip = commits[tipIndex];
 	const oldest = commits[Math.max(a, b)];
+	// Both ends come from `commits`; a miss is a caller bug, not a user state.
+	if (a < 0 || b < 0 || tip === undefined || oldest === undefined) {
+		throw new Error("range ends are not in the commit list");
+	}
 	const chain = chainBetween(commits, ends);
 	if (chain.length === 0) {
 		return {

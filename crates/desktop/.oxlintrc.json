@@ -1,0 +1,47 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	// Every category that finds defects is an error; `style` and `restriction`
+	// are taste, left to prettier and review. CI adds --max-warnings 0.
+	"plugins": [
+		"eslint",
+		"typescript",
+		"unicorn",
+		"oxc",
+		"react",
+		"import",
+		"jsx-a11y",
+		"promise",
+		"node"
+	],
+	"categories": {
+		"correctness": "error",
+		"suspicious": "error",
+		"perf": "error",
+		"pedantic": "error"
+	},
+	"env": { "browser": true, "es2024": true },
+	"ignorePatterns": ["dist", "src/generated"],
+	"rules": {
+		// The react-jsx runtime needs no React in scope.
+		"react/react-in-jsx-scope": "off",
+		// A component is one function; file size is capped by max-lines instead.
+		"eslint/max-lines-per-function": "off",
+		"eslint/max-lines": [
+			"error",
+			{ "max": 600, "skipBlankLines": true, "skipComments": true }
+		],
+		"import/max-dependencies": "off",
+		// Passing `undefined` on purpose (tests of absent input) stays legal.
+		"unicorn/no-useless-undefined": ["error", { "checkArguments": false }],
+		// Stylesheets are imported for their side effect.
+		"import/no-unassigned-import": ["error", { "allow": ["**/*.css"] }]
+	},
+	"overrides": [
+		{
+			// E2E drives one real app: steps must run in order.
+			"files": ["e2e/**"],
+			"env": { "node": true },
+			"rules": { "eslint/no-await-in-loop": "off" }
+		}
+	]
+}
