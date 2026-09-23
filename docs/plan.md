@@ -143,7 +143,7 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
 - **macOS 簽章:** 比照 aghub 用 ad-hoc(`APPLE_SIGNING_IDENTITY: "-"`),並在 CI 以
   `codesign --verify --deep --strict` 驗證。只給自己用,不做 Apple Developer 憑證與公證。
 - **不做:** `tauri-plugin-updater`、Homebrew tap。要給別人用時再從 aghub 的 release.yml 搬過來。
-- 本機快速測試用 `just desktop-dmg`(macOS)與 `just desktop-bundle`,不必走完 tag → CI → 下載。
+- 本機快速測試用 `just desktop-bundle`,不必走完 tag → CI → 下載(aghub 的 `desktop-dmg` 尚未搬過來)。
 
 ## 5. 測試策略
 

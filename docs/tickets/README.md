@@ -14,6 +14,19 @@
 | L4 | [T-11](T-11-desktop-shell.md) Tauri 殼 · [T-13](T-13-ci-release.md) CI / release · [T-14](T-14-e2e.md) E2E | T-10 |
 | L5 | [T-12](T-12-desktop-ui.md) 前端畫面 | T-11 |
 
+## 狀態(2026-09-23)
+
+T-00 ~ T-15 全部完成並合併到 `feat/snip-core`,本機(Linux)gate 全綠:fmt、clippy `-D warnings`、`cargo test --workspace --locked`、
+前端 typecheck / oxlint / prettier / node test / build、actionlint。
+
+**尚未驗證:** CI 實際執行、Windows 與 macOS(含 `#[cfg(unix)]` 以外的路徑與 symlink 行為)、T-13 的 tag 發版、Phase 0 兩台實機。
+
+**已知且接受的小問題(未修):**
+- T-12:「調整路徑」提示的範例路徑取自計畫順序,不是剪貼簿原始順序;按「調整路徑」會重新讀一次剪貼簿(執行前仍會顯示新計畫)。
+- T-13:push 時 format / clippy 依路徑變更才跑,`verify-ci` 看到的綠燈不一定包含 clippy。
+- T-14:本機跑 `clipboard_roundtrip` 會把系統剪貼簿換成測試內容(Linux 上還原無效)。
+- T-10:Linux 背景剪貼簿子程序若寫入失敗,`snip copy` 仍回傳 0。
+
 ## 所有 ticket 共通規則
 
 - **TS 參考原始碼**在 repo 根目錄的 `.ts-ref/`(gitignored)。不存在時執行:

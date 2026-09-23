@@ -1,6 +1,7 @@
 # snip-sync — 規劃與可行性評估
 
-> 狀態:**規格已定稿([docs/spec.md](docs/spec.md)),尚未開始實作。**
+> 狀態:**核心、CLI、桌面 App、CI 已實作於 `feat/snip-core`**(見 [docs/tickets](docs/tickets/README.md))。
+> 尚未在 CI、Windows、macOS 與兩台實機上驗證(Phase 0)。
 
 ## 一句話
 

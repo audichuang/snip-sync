@@ -208,6 +208,23 @@ jobs:
               run: |
                   git config --global user.name "snip-ci"
                   git config --global user.email "snip-ci@example.invalid"
+            # Pinned TS reference for the cross-tool tests (plan.md section 5,
+            # layer 3); without it those tests skip instead of running.
+            - name: Checkout TS reference (ClipCodeVSCode @ 0aa24c8)
+              uses: actions/checkout@v6
+              with:
+                  repository: audichuang/ClipCodeVSCode
+                  ref: 0aa24c8ea2d9c7cd7fe4a8f390110c3c7efd5fd9
+                  path: .ts-ref-src
+            - name: Extract TS reference
+              shell: bash
+              run: |
+                  mkdir -p .ts-ref
+                  git -C .ts-ref-src archive HEAD src test scripts AGENTS.md | tar -x -C .ts-ref
+            - name: Setup Node (cross-tool tests)
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 24
             - name: Unit + integration tests (Linux, under xvfb)
               if: runner.os == 'Linux'
               run: xvfb-run -a cargo test --workspace --no-fail-fast
