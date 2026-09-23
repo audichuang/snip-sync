@@ -238,9 +238,112 @@ fn token_cases() {
 }
 
 #[test]
-#[ignore = "T-03"]
 fn path_cases() {
-	todo!()
+	use snip_core::paths::{
+		resolve_delete_target, resolve_write_target, RejectReason,
+		RestoreTargetResolution,
+	};
+	use std::path::{Path, PathBuf};
+
+	#[cfg(unix)]
+	fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+		std::os::unix::fs::symlink(target, link)
+	}
+	#[cfg(windows)]
+	fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+		std::os::windows::fs::symlink_dir(target, link)
+	}
+
+	// Mirrors the TS `outcome` helper: {root, path} relative to the layout
+	// base, or a verdict string.
+	fn outcome(parent: &Path, r: &RestoreTargetResolution) -> String {
+		match r {
+			Ok(t) => {
+				let rel =
+					t.absolute_path.strip_prefix(parent).unwrap_or_else(|_| {
+						panic!(
+							"{} is outside the layout",
+							t.absolute_path.display()
+						)
+					});
+				let mut parts =
+					rel.components().map(|c| c.as_os_str().to_string_lossy());
+				let root = parts.next().unwrap_or_default();
+				let rest: Vec<_> = parts.collect();
+				format!("{root}:{}", rest.join("/"))
+			}
+			Err(e) if e.reason == RejectReason::MissingPath => "missing".into(),
+			Err(e) if e.reason == RejectReason::AmbiguousPath => {
+				"ambiguous".into()
+			}
+			Err(_) => "refused".into(),
+		}
+	}
+
+	let fixture = load();
+	let layout = &fixture.path_layout;
+	let tmp = tempfile::tempdir().unwrap();
+	// Canonicalize first: macOS /var is a symlink to /private/var.
+	let parent = dunce::canonicalize(tmp.path()).unwrap();
+	for dir in &layout.dirs {
+		std::fs::create_dir_all(parent.join(dir)).unwrap();
+	}
+	for (file, text) in &layout.files {
+		std::fs::write(parent.join(file), text).unwrap();
+	}
+	// A directory symlink needs privileges on Windows outside developer mode;
+	// only the rows that depend on it are skipped, and loudly.
+	let mut symlinks = true;
+	for (link, target) in &layout.symlinks {
+		match symlink_dir(&parent.join(target), &parent.join(link)) {
+			Ok(()) => {}
+			// 1314 = ERROR_PRIVILEGE_NOT_HELD on Windows.
+			Err(e)
+				if e.kind() == std::io::ErrorKind::PermissionDenied
+					|| e.raw_os_error() == Some(1314) =>
+			{
+				symlinks = false;
+			}
+			Err(e) => panic!("symlink {link}: {e}"),
+		}
+	}
+	let roots: Vec<PathBuf> =
+		layout.roots.iter().map(|r| parent.join(r)).collect();
+
+	let mut skipped = Vec::new();
+	let mut failures = Vec::new();
+	for c in &fixture.path_cases {
+		if c.needs_symlink && !symlinks {
+			skipped.push(c.input.clone());
+			continue;
+		}
+		let input = c
+			.input
+			.replace("@ROOT@", &roots[0].to_string_lossy())
+			.replace("@SIBLING@", &roots[1].to_string_lossy());
+		let expected_write = match &c.write {
+			PathOutcome::Target(t) => format!("{}:{}", t.root, t.path),
+			PathOutcome::Verdict(v) => v.clone(),
+		};
+		let actual = (
+			outcome(&parent, &resolve_write_target(&roots, &input)),
+			outcome(&parent, &resolve_delete_target(&roots, &input)),
+		);
+		if actual != (expected_write.clone(), c.delete.clone()) {
+			failures.push(format!(
+				"{:?}: expected ({expected_write}, {}), got {actual:?}",
+				c.input, c.delete
+			));
+		}
+	}
+	if !skipped.is_empty() {
+		println!(
+			"SKIPPED {} symlink row(s): this platform refused to create a \
+			 directory symlink: {skipped:?}",
+			skipped.len()
+		);
+	}
+	assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
