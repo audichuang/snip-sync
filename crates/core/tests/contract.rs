@@ -411,7 +411,158 @@ fn path_cases() {
 }
 
 #[test]
-#[ignore = "T-05"]
 fn restore_cases() {
-	todo!()
+	use snip_core::format::parse_clipboard;
+	use snip_core::restore::plan_restore;
+	use std::path::{Path, PathBuf};
+
+	#[cfg(unix)]
+	fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+		std::os::unix::fs::symlink(target, link)
+	}
+	#[cfg(windows)]
+	fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+		std::os::windows::fs::symlink_dir(target, link)
+	}
+
+	// {root, path} of an absolute path relative to the layout base.
+	fn place(parent: &Path, abs: &Path) -> (String, String) {
+		let rel = abs.strip_prefix(parent).unwrap_or_else(|_| {
+			panic!("{} is outside the layout", abs.display())
+		});
+		let mut parts =
+			rel.components().map(|c| c.as_os_str().to_string_lossy());
+		let root = parts.next().unwrap_or_default().into_owned();
+		let rest: Vec<_> = parts.collect();
+		(root, rest.join("/"))
+	}
+
+	type Planned = (
+		Vec<(String, String, String, String, bool)>,
+		Vec<(String, String, String)>,
+		Vec<(String, Option<String>, String)>,
+	);
+
+	let fixture = load();
+	let layout = &fixture.restore_layout;
+	let tmp = tempfile::tempdir().unwrap();
+	// Canonicalize first: macOS /var is a symlink to /private/var.
+	let parent = dunce::canonicalize(tmp.path()).unwrap();
+	for dir in &layout.dirs {
+		std::fs::create_dir_all(parent.join(dir)).unwrap();
+	}
+	for (file, spec) in &layout.files {
+		let bytes = match spec {
+			LayoutFile::Text(t) => t.as_bytes().to_vec(),
+			LayoutFile::Base64(b) => base64_decode(b),
+		};
+		std::fs::write(parent.join(file), bytes).unwrap();
+	}
+	let mut symlinks = true;
+	for (link, target) in &layout.symlinks {
+		match symlink_dir(&parent.join(target), &parent.join(link)) {
+			Ok(()) => {}
+			// 1314 = ERROR_PRIVILEGE_NOT_HELD on Windows.
+			Err(e)
+				if e.kind() == std::io::ErrorKind::PermissionDenied
+					|| e.raw_os_error() == Some(1314) =>
+			{
+				symlinks = false;
+			}
+			Err(e) => panic!("symlink {link}: {e}"),
+		}
+	}
+	let roots: Vec<PathBuf> =
+		layout.roots.iter().map(|r| parent.join(r)).collect();
+
+	let mut failures = Vec::new();
+	for c in &fixture.restore_cases {
+		if c.needs_symlink && !symlinks {
+			println!(
+				"SKIPPED {:?}: this platform refused to create a directory \
+				 symlink",
+				c.name
+			);
+			continue;
+		}
+		let plan = plan_restore(
+			&roots,
+			&parse_clipboard(&c.payload, &c.header_format),
+		);
+		let actual: Planned = (
+			plan.create_operations
+				.iter()
+				.map(|op| {
+					let (root, path) = place(&parent, &op.absolute_path);
+					let rel = op.relative_path.clone();
+					(root, path, rel, op.content.clone(), op.existed)
+				})
+				.collect(),
+			plan.delete_operations
+				.iter()
+				.map(|op| {
+					let (root, path) = place(&parent, &op.absolute_path);
+					(root, path, op.relative_path.clone())
+				})
+				.collect(),
+			plan.skipped_operations
+				.iter()
+				.map(|op| {
+					let reason = op.reason.as_str().to_string();
+					(op.raw_path.clone(), op.relative_path.clone(), reason)
+				})
+				.collect(),
+		);
+		let expected: Planned = (
+			c.creates
+				.iter()
+				.map(|o| {
+					let (root, path) = (o.root.clone(), o.path.clone());
+					let rel = o.relative_path.clone();
+					(root, path, rel, o.content.clone(), o.existed)
+				})
+				.collect(),
+			c.deletes
+				.iter()
+				.map(|o| {
+					(o.root.clone(), o.path.clone(), o.relative_path.clone())
+				})
+				.collect(),
+			c.skips
+				.iter()
+				.map(|o| {
+					(
+						o.raw_path.clone(),
+						o.relative_path.clone(),
+						o.reason.clone(),
+					)
+				})
+				.collect(),
+		);
+		if actual != expected {
+			failures.push(format!(
+				"{}:\n  expected {expected:?}\n  got      {actual:?}",
+				c.name
+			));
+		}
+	}
+	assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Minimal standard base64 decoder for layout files (no new dependency).
+fn base64_decode(s: &str) -> Vec<u8> {
+	const ALPHABET: &[u8] =
+		b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut out = Vec::new();
+	let (mut acc, mut bits) = (0u32, 0);
+	for b in s.bytes().filter(|&b| b != b'=') {
+		let v = ALPHABET.iter().position(|&a| a == b).expect("base64") as u32;
+		acc = (acc << 6) | v;
+		bits += 6;
+		if bits >= 8 {
+			bits -= 8;
+			out.push((acc >> bits) as u8);
+		}
+	}
+	out
 }
