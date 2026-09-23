@@ -11,16 +11,23 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 | 陷阱 | 為什麼會錯 | 正確做法 |
 |---|---|---|
-| `regex` crate 的 `.` 預設只排除 `\n` | Java 的 `.` 排除五個換行類字元,JS 排除四個,Rust 又是另一套 | 需要「任意字元」時寫 `[\s\S]`,不用 `.` |
+| `regex` crate 的 `.` 預設只排除 `\n` | Java 的 `.` 排除五個換行類字元,JS 排除四個(`\n` `\r` U+2028 U+2029),Rust 又是另一套 | 需要「任意字元」時寫 `[\s\S]`;移植 JS 的 `.` 時寫 `[^\n\r\x{2028}\x{2029}]` |
 | `regex` crate 的 `\s`、`\w` 預設是 **Unicode** | header 與標籤只能認 ASCII 空白 | 明確寫出字元類別 `[ \t\n\x0B\x0C\r]`,不依賴 `\s` 或 `(?-u:\s)` 的定義 |
 | `str::trim()` 會處理 Unicode 空白;`trim_ascii()` / `is_ascii_whitespace()` **不含** `\x0B` | 兩個套件曾因 trim 的字元集不同,寫出**不同檔名** | 自己寫:`s.trim_matches(\|c\| matches!(c, ' ' \| '\t' \| '\n' \| '\x0B' \| '\x0C' \| '\r'))` |
 | `str::len()` 是 byte 數 | 通知的字元數必須是 **UTF-16 code unit**(emoji 算 2) | 用 `s.encode_utf16().count()` |
 | `to_lowercase()` 做 Unicode 轉換 | 例如 Kelvin 符號 `K` 會對到 `k`;header 的 `file:` 曾因 case folding 在一邊是 header、另一邊是內容 | 只用 `eq_ignore_ascii_case`,或 regex 寫 `[Ff][Ii][Ll][Ee]:` |
-| `str::lines()` 會吃掉 `\r\n` 的 `\r`、也不回傳結尾的空行 | 切行規則必須跟 TS 的 `/\r?\n/` 逐項相同 | 用 `split('\n')`,每段再 `strip_suffix('\r')` 去掉一個 `\r` |
+| `str::lines()` 會吃掉 `\r\n` 的 `\r`、也不回傳結尾的空行 | 切行規則必須跟 TS 的 `split(/\r?\n/)` 逐項相同 | 用 `split('\n')`,**除了最後一段以外**每段 `strip_suffix('\r')`(最後一段後面沒有 `\n`,結尾的 `\r` 要保留) |
 | `String::from_utf8_lossy` 會把錯誤位元組換成 U+FFFD | 非 UTF-8 檔案必須被跳過,不能帶著替換字元寫出去 | 一律 `String::from_utf8` / `std::str::from_utf8`,失敗就跳過並計數(會保留開頭的 BOM,符合規則) |
 | `std::fs::canonicalize` 在 Windows 回傳 `\\?\C:\...` | 與使用者路徑做 containment 比對時永遠對不上 | 用 `dunce::canonicalize`;比對用解析後的 `Path` 元件,不用字串 |
 | `std::path` 依 OS 而異 | 分隔符號、大小寫、磁碟機代號 | 回傳原生路徑;containment 用真實路徑比對,不用字串比對 |
 | `Command` 經過 shell 會被引號規則影響;Windows GUI 程序呼叫 git 會閃出主控台視窗 | 兩個套件的測試曾在 Windows 上因 `cmd.exe` 不認 `'` 而全部失敗 | 一律 `Command::new("git").args(..)`,不經 shell;Windows 上加 `creation_flags(CREATE_NO_WINDOW)`(aghub 的 `src-tauri/src/lib.rs` 已有這個常數) |
+
+### 已知且接受的差異
+
+- 過濾規則中「不含 `*` / `?` 的原始 regex pattern」直接交給 Rust `regex` 編譯:`.`、`\w`、`\d`、`\b` 是 Unicode 語意,
+  少數 JS 視為字面字元的語法(如 `\pL`、巢狀字元類別)意義不同。glob 形式的 pattern 已經照 JS 語意轉換,不受影響。
+  使用者寫原始 regex 時很少碰到;真的出現分歧再逐項轉譯。
+- `paths` 在 Windows 對超過 MAX_PATH 的路徑,`dunce::canonicalize` 會保留 `\\?\` 形式,containment 可能誤判為逃出 root 而拒絕(fail closed)。
 
 ## 2. 線上格式的不變量(摘要)
 

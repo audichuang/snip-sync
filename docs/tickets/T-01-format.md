@@ -16,4 +16,4 @@ regex 的 `.` 與 `\s`(一律寫明確的 ASCII 字元類別)、`ascii_trim` 必
 `crates/core/src/format.rs`、`crates/core/tests/contract.rs` 中的 `build_cases` 與 `parse_cases` 兩個函式(移除 `#[ignore]` 並實作)。
 
 ## 驗收
-`cargo test -p snip-core --test contract build_cases parse_cases` 與 `cargo test -p snip-core --lib format` 全綠。
+`cargo test -p snip-core --test contract -- build_cases parse_cases` 與 `cargo test -p snip-core --lib format` 全綠。

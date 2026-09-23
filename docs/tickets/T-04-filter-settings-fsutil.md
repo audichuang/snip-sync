@@ -16,4 +16,4 @@
 `crates/core/src/settings.rs`、`crates/core/src/filter.rs`、`crates/core/src/fsutil.rs`。
 
 ## 驗收
-`cargo test -p snip-core --lib settings filter fsutil` 全綠。
+`cargo test -p snip-core --lib -- settings filter fsutil` 全綠。

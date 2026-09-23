@@ -671,9 +671,7 @@ fn lossy(p: &Path) -> String {
 }
 
 /// Trim only the six ASCII whitespace characters, never Unicode ones.
-fn ascii_trim(s: &str) -> &str {
-	s.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0B' | '\x0C' | '\r'))
-}
+use crate::format::ascii_trim;
 
 /// Replace `\` with `/` and collapse runs of `/`.
 fn collapse_slashes(s: &str) -> String {
@@ -781,7 +779,19 @@ fn relativize_path(absolute_path: &str, root_path: &str) -> Option<String> {
 	if !abs_key.starts_with(&format!("{root_key}/")) {
 		return None;
 	}
-	sanitize_relative_path(abs.get(root.len() + 1..)?)
+	// TS slices at the root's UTF-16 length; case folding can change the byte
+	// length (e.g. U+1E9E vs U+00DF), so byte offsets from `root` are wrong here.
+	let skip = root.encode_utf16().count() + 1;
+	let mut units = 0;
+	let mut start = abs.len();
+	for (i, c) in abs.char_indices() {
+		if units >= skip {
+			start = i;
+			break;
+		}
+		units += c.len_utf16();
+	}
+	sanitize_relative_path(&abs[start..])
 }
 
 fn same_path(left: &str, right: &str) -> bool {
@@ -925,6 +935,13 @@ fn real_or_self(p: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+	#[test]
+	fn relativize_uses_utf16_offset_when_case_folding_changes_byte_length() {
+		// U+1E9E lowercases to U+00DF: same UTF-16 length, different UTF-8 length.
+		assert_eq!(relativize_path("C:/\u{DF}/abc", "C:/\u{1E9E}").as_deref(), Some("abc"));
+	}
+
 	use super::*;
 
 	fn tmp() -> (tempfile::TempDir, PathBuf) {
