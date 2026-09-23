@@ -49,9 +49,12 @@ pub fn write_text(text: &str) -> Result<()> {
 	with_clipboard(|c| c.set_text(text))
 }
 
-/// For short-lived processes (the CLI): on Linux, blocks until another program takes
-/// the clipboard contents, since they vanish when the owning process exits.
-/// Elsewhere it is the same as `write_text`.
+/// For short-lived processes (the CLI): on Linux the contents vanish when the owning
+/// process exits, so this keeps serving paste requests and blocks until the clipboard is
+/// overwritten (i.e. the user copies something else); a paste does NOT end the wait.
+/// Callers must therefore run it in a background (forked/daemonized) process, as in
+/// arboard's `examples/daemonize.rs`, not in the foreground.
+/// Elsewhere it is the same as `write_text` and returns immediately.
 pub fn write_text_and_wait(text: &str) -> Result<()> {
 	#[cfg(target_os = "linux")]
 	{
