@@ -255,7 +255,10 @@ jobs:
         strategy:
             fail-fast: false
             matrix:
-                os: [ubuntu-latest, windows-latest]
+                # windows-2022, not windows-latest: on the windows-2025 image WebView2
+                # never opens its DevTools port for msedgedriver
+                # (actions/runner-images#14738).
+                os: [ubuntu-latest, windows-2022]
         steps:
             - uses: actions/checkout@v6
             - name: Install Rust toolchain
