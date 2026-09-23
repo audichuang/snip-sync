@@ -62,6 +62,9 @@ jobs:
         runs-on: ubuntu-latest
         permissions:
             contents: write
+            # git-cliff reads merged PRs for the changelog; a private repo
+            # needs the token to be allowed to list them.
+            pull-requests: read
         steps:
             - uses: actions/checkout@v6
               with:
