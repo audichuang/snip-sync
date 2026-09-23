@@ -35,6 +35,6 @@
   (連續 commit 在另一台重播成同樣 message、作者、時間與檔案異動)。
 - 完全雙向;macOS、Windows、Linux。
 - 不管傳輸通道、不做分段與雜湊、不做衝突偵測、不做精確模式、不保留 commit hash。
-- 只給自己用:不做簽章公證、自動更新、Homebrew。
+- 只給自己用:不做簽章公證、自動更新。正式版發到 Homebrew tap(`brew install --cask audichuang/tap/snip-sync`、`brew install audichuang/tap/snip-cli`)。
 
 其他疑問或反對意見,直接開 issue 或在文件上註記即可。

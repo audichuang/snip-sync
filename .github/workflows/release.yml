@@ -337,3 +337,101 @@ jobs:
                   tag_name: ${{ env.RELEASE_TAG }}
                   prerelease: ${{ env.PRERELEASE }}
                   files: snip-${{ matrix.target }}.*
+
+    # Stable tags only: `brew install` must keep pointing at the last stable
+    # version, RC testers download the prerelease assets directly.
+    publish-homebrew:
+        name: Update Homebrew Tap
+        needs: [build-tauri, build-cli]
+        if: ${{ !contains(github.event.inputs.version || github.ref_name, '-') }}
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout Homebrew Tap
+              uses: actions/checkout@v6
+              with:
+                  repository: audichuang/homebrew-tap
+                  token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+                  path: tap
+
+            - name: Write Formula and Cask
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  VERSION="${RELEASE_TAG#v}"
+                  BASE="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
+                  # -f: a missing asset fails the job instead of hashing an error page.
+                  sha() { curl -fsSL "$BASE/$1" | sha256sum | awk '{print $1}'; }
+                  CLI_ARM=$(sha snip-aarch64-apple-darwin.tar.gz)
+                  CLI_INTEL=$(sha snip-x86_64-apple-darwin.tar.gz)
+                  CLI_LINUX=$(sha snip-x86_64-unknown-linux-gnu.tar.gz)
+                  APP_ARM=$(sha "snip-sync_${VERSION}_aarch64.dmg")
+                  APP_INTEL=$(sha "snip-sync_${VERSION}_x64.dmg")
+
+                  # Formulae must live in Formula/: Homebrew ignores the tap root.
+                  mkdir -p tap/Formula tap/Casks
+                  cat > tap/Formula/snip-cli.rb <<INNER
+                  class SnipCli < Formula
+                    desc "Sync code snippets between machines through the clipboard (CLI)"
+                    homepage "https://github.com/${{ github.repository }}"
+                    version "${VERSION}"
+
+                    on_macos do
+                      if Hardware::CPU.arm?
+                        url "${BASE}/snip-aarch64-apple-darwin.tar.gz"
+                        sha256 "${CLI_ARM}"
+                      else
+                        url "${BASE}/snip-x86_64-apple-darwin.tar.gz"
+                        sha256 "${CLI_INTEL}"
+                      end
+                    end
+
+                    on_linux do
+                      if Hardware::CPU.intel?
+                        url "${BASE}/snip-x86_64-unknown-linux-gnu.tar.gz"
+                        sha256 "${CLI_LINUX}"
+                      end
+                    end
+
+                    def install
+                      bin.install "snip"
+                    end
+
+                    test do
+                      system "#{bin}/snip", "--version"
+                    end
+                  end
+                  INNER
+
+                  cat > tap/Casks/snip-sync.rb <<INNER
+                  cask "snip-sync" do
+                    arch arm: "aarch64", intel: "x64"
+
+                    version "${VERSION}"
+                    sha256 arm:   "${APP_ARM}",
+                           intel: "${APP_INTEL}"
+
+                    url "https://github.com/${{ github.repository }}/releases/download/v#{version}/snip-sync_#{version}_#{arch}.dmg"
+                    name "snip-sync"
+                    desc "Sync code snippets between machines through the clipboard (Desktop App)"
+                    homepage "https://github.com/${{ github.repository }}"
+
+                    app "snip-sync.app"
+
+                    zap trash: [
+                      "~/Library/Application Support/com.audichuang.snip-sync",
+                      "~/Library/Preferences/com.audichuang.snip-sync.plist",
+                      "~/Library/Saved Application State/com.audichuang.snip-sync.savedState"
+                    ]
+                  end
+                  INNER
+
+            - name: Commit and Push
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  cd tap
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  git add Formula/snip-cli.rb Casks/snip-sync.rb
+                  git commit -m "snip-sync ${RELEASE_TAG}" || { echo "No changes"; exit 0; }
+                  git push
