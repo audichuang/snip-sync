@@ -17,7 +17,7 @@
 - 不做即時同步或網路傳輸,只走剪貼簿;剪貼簿通道本身(大小上限、截斷)不在範圍內,不做分段與雜湊。
 - 不追求逐位元組還原(不做精確模式):檔案模式沿用現有格式的限制(不保留檔尾換行與前後空行,CRLF 變 LF)。
 - 不做衝突偵測與合併,一律覆蓋;不保留 commit hash。
-- 不處理簽章、公證、自動更新與 Homebrew(只給自己用)。
+- 不處理簽章、公證與自動更新(只給自己用)。
 
 ## 2. 架構
 
@@ -138,11 +138,12 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
 - **發布流程照 aghub:** 推 `vX.Y.Z` tag → `verify-ci` 確認該 commit 的 CI 是綠燈 →
   git-cliff 產生 changelog 並建立 Release → `build-tauri` 四個 target 以 `tauri-action` 打包 →
   `build-cli` 四個 target 編 `snip`、跑 smoke test、打包成 tar.gz / zip → 上傳到 Release。
-  (不含 aghub 的 `publish-homebrew` 與 updater 的 `latest.json`。)
+  正式版(tag 不含 `-`)再由 `publish-homebrew` 更新 `audichuang/homebrew-tap` 的
+  `Formula/snip-cli.rb` 與 `Casks/snip-sync.rb`(需要 repo secret `HOMEBREW_TAP_TOKEN`)。不含 updater 的 `latest.json`。
   `just bump` 同步 `Cargo.toml`、`package.json`、`tauri.conf.json` 的版本號;`just release` 包辦 tag 與驗證。
 - **macOS 簽章:** 比照 aghub 用 ad-hoc(`APPLE_SIGNING_IDENTITY: "-"`),並在 CI 以
   `codesign --verify --deep --strict` 驗證。只給自己用,不做 Apple Developer 憑證與公證。
-- **不做:** `tauri-plugin-updater`、Homebrew tap。要給別人用時再從 aghub 的 release.yml 搬過來。
+- **不做:** `tauri-plugin-updater`。
 - 本機快速測試用 `just desktop-bundle`,不必走完 tag → CI → 下載(aghub 的 `desktop-dmg` 尚未搬過來)。
 
 ## 5. 測試策略
