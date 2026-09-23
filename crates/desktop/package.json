@@ -9,17 +9,26 @@
 		"preview": "vite preview",
 		"tauri": "tauri",
 		"start": "tauri dev",
+		"lint": "oxlint --fix",
+		"lint:check": "oxlint",
+		"test": "node --experimental-strip-types --test 'src/**/*.test.ts'",
 		"generate:dto": "cargo test --manifest-path src-tauri/Cargo.toml --lib export_dto -- --ignored",
 		"typecheck": "node ./node_modules/@typescript/native/bin/tsc -p tsconfig.json --noEmit && node ./node_modules/@typescript/native/bin/tsc -p tsconfig.node.json --noEmit --composite false --incremental false"
 	},
 	"dependencies": {
 		"@heroui/react": "^3.2.5",
 		"@heroui/styles": "^3.2.5",
+		"@pierre/diffs": "^1.4.3",
+		"@rc-component/tree": "^1.5.3",
 		"@tauri-apps/api": "^2.11.1",
 		"@tauri-apps/plugin-dialog": "^2.7.3",
 		"@tauri-apps/plugin-log": "^2.9.1",
+		"@tauri-apps/plugin-store": "^2.4.5",
+		"@tomplum/react-git-log": "^3.5.1",
+		"i18next": "^26.4.2",
 		"react": "19.2.7",
-		"react-dom": "19.2.7"
+		"react-dom": "19.2.7",
+		"react-i18next": "^17.0.15"
 	},
 	"devDependencies": {
 		"@tailwindcss/vite": "^4.3.3",
@@ -29,6 +38,7 @@
 		"@types/react-dom": "^19.3.0",
 		"@typescript/native": "npm:typescript@^7.0.2",
 		"@vitejs/plugin-react": "^6.1.1",
+		"oxlint": "1.85.0",
 		"tailwindcss": "^4.3.3",
 		"vite": "^8.3.0"
 	}

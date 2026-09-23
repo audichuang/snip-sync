@@ -1,168 +1,163 @@
-// Debug page: one button per Tauri command. The real screens land in T-12.
+import { Button, Tabs, Toast, toast } from "@heroui/react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import type { ClipboardPlan } from "./generated/ClipboardPlan";
+import { load } from "@tauri-apps/plugin-store";
+import { useEffect, useRef, useState, type Key } from "react";
+import { useTranslation } from "react-i18next";
+import { CommitTimeline } from "./components/commit-timeline";
+import { CopyFilesPanel } from "./components/copy-files-panel";
+import { PastePanel, usePaste } from "./components/paste-panel";
 import type { CommitCopySummary } from "./generated/CommitCopySummary";
 import type { CommitSelection } from "./generated/CommitSelection";
-import type { CommitSummary } from "./generated/CommitSummary";
 import type { CopyDone } from "./generated/CopyDone";
 import type { CopyOutcome } from "./generated/CopyOutcome";
 import type { CopyRequest } from "./generated/CopyRequest";
-import type { DiffTarget } from "./generated/DiffTarget";
-import type { GitSourceDto } from "./generated/GitSourceDto";
-import type { ReplayResult } from "./generated/ReplayResult";
-import type { RestoreExecutionResult } from "./generated/RestoreExecutionResult";
-import type { RestoreSelection } from "./generated/RestoreSelection";
+import { commitCopyNote, copyNote, type CopyKind, type CopyNote } from "./lib/copy-message";
+import { errorText, setLanguage } from "./lib/i18n";
+import { showCopyNotification } from "./lib/settings";
 
-function Btn({ onClick, children }: { onClick: () => void; children: ReactNode }) {
-	return (
-		<button
-			type="button"
-			className="rounded border border-gray-400 px-2 py-1 text-sm hover:bg-gray-100"
-			onClick={onClick}
-		>
-			{children}
-		</button>
-	);
+type Tab = "files" | "commits" | "paste";
+
+// Copy-success toasts honour showCopyNotification like TS; errors always show.
+async function showNote(note: CopyNote) {
+	const stored = await load("settings.json")
+		.then((store) => store.get("settings"))
+		.catch(() => undefined);
+	if (showCopyNotification(stored)) toast[note.severity](note.text);
 }
 
 export default function App() {
+	const { t, i18n } = useTranslation();
 	const [repo, setRepo] = useState("");
-	const [paths, setPaths] = useState("");
-	const [rev, setRev] = useState("HEAD");
-	const [base, setBase] = useState("HEAD~3");
-	const [count, setCount] = useState(3);
-	const [diffIndex, setDiffIndex] = useState("0");
-	const [output, setOutput] = useState("");
+	const [tab, setTab] = useState<Tab>("files");
+	const paste = usePaste(repo);
+	// Which wording the tray's "copy last selection" result gets.
+	const lastCopyKind = useRef<CopyKind>("files");
 
-	const show = (value: unknown) =>
-		setOutput(typeof value === "string" ? value : JSON.stringify(value, null, 2));
+	// Latest values for the long-lived tray listeners below.
+	const live = useRef({ paste, t });
+	live.current = { paste, t };
 
-	async function run<T>(cmd: string, args?: Record<string, unknown>) {
-		try {
-			show(await invoke<T>(cmd, args));
-		} catch (error: unknown) {
-			show(`ERROR: ${String(error)}`);
-		}
-	}
-
-	const repoRef = useRef(repo);
-	repoRef.current = repo;
-	// Tray events: subscribed for the page's lifetime.
+	// Tray events: subscribed for the app's lifetime.
 	useEffect(() => {
 		const offs = [
-			listen<CopyDone>("tray-copied", (e) => show(e.payload)),
-			listen<string>("tray-copy-failed", (e) => show(`ERROR: ${e.payload}`)),
+			listen<CopyDone>("tray-copied", ({ payload }) => {
+				const { t } = live.current;
+				void showNote(
+					payload.mode === "commits"
+						? commitCopyNote(t, payload)
+						: copyNote(t, lastCopyKind.current, payload),
+				);
+			}),
+			listen<string>("tray-copy-failed", ({ payload }) => {
+				toast.danger(errorText(live.current.t, payload));
+			}),
 			listen("tray-paste", () => {
-				const roots = repoRef.current ? [repoRef.current] : [];
-				void run<ClipboardPlan>("read_clipboard_plan", { roots });
+				setTab("paste");
+				void live.current.paste.preview();
 			}),
 		];
 		return () => offs.forEach((off) => void off.then((unlisten) => unlisten()));
 	}, []);
 
-	const roots = repo ? [repo] : [];
-	const copyGit = (source: GitSourceDto) => {
-		const request: CopyRequest = { kind: "git", repo, roots, source };
-		void run<CopyOutcome>("copy", { request });
-	};
-	const copyCommits = (selection: CommitSelection) =>
-		void run<CommitCopySummary>("copy_commits", { repo, selection });
-	const diff = () => {
-		const [a, b] = diffIndex.split(":").map(Number);
-		const target: DiffTarget =
-			b === undefined ? { kind: "restore", index: a } : { kind: "commit", commit: a, file: b };
-		void run<string>("diff", { target });
-	};
-	const selection: RestoreSelection = {
-		overwriteExisting: true,
-		skipExisting: false,
-		uncheckedCreates: [],
-		uncheckedDeletes: [],
-	};
+	// The tray menu is native; hand it the current language's labels.
+	useEffect(() => {
+		const labels = {
+			paste: t("trayPaste"),
+			copyLast: t("trayCopyLast"),
+			show: t("trayShow"),
+			quit: t("trayQuit"),
+		};
+		invoke("set_tray_labels", { labels }).catch((error: unknown) => {
+			console.error("Failed to update tray labels:", error);
+		});
+	}, [t, i18n.language]);
+
+	async function handleChooseRepo() {
+		const dir = await open({ directory: true });
+		if (typeof dir === "string") {
+			setRepo(dir);
+			paste.setState({ step: "idle" });
+		}
+	}
+
+	async function handleCopy(request: CopyRequest) {
+		try {
+			const outcome = await invoke<CopyOutcome>("copy", { request });
+			const kind: CopyKind = request.kind === "files" ? "files" : "git";
+			lastCopyKind.current = kind;
+			void showNote(copyNote(t, kind, outcome));
+		} catch (error: unknown) {
+			toast.danger(errorText(t, error));
+		}
+	}
+
+	async function handleCopyCommits(selection: CommitSelection) {
+		try {
+			void showNote(
+				commitCopyNote(t, await invoke<CommitCopySummary>("copy_commits", { repo, selection })),
+			);
+		} catch (error: unknown) {
+			toast.danger(errorText(t, error));
+		}
+	}
 
 	return (
-		<main className="flex flex-col gap-3 p-4 font-mono text-sm">
-			<h1 className="text-lg font-bold">snip-sync debug</h1>
-			<div className="flex items-center gap-2">
-				<input
-					className="flex-1 rounded border px-2 py-1"
-					placeholder="repo / workspace root"
-					value={repo}
-					onChange={(e) => setRepo(e.target.value)}
-				/>
-				<Btn
-					onClick={() =>
-						void open({ directory: true }).then((dir) => {
-							if (typeof dir === "string") setRepo(dir);
-						})
-					}
+		<div className="flex h-screen flex-col gap-3 bg-background p-4 text-foreground">
+			<Toast.Provider placement="bottom end" />
+			<header className="flex items-center gap-3">
+				<h1 className="text-lg font-semibold">{t("appTitle")}</h1>
+				<Button size="sm" variant="secondary" onPress={() => void handleChooseRepo()}>
+					{t("chooseRepo")}
+				</Button>
+				<span className="min-w-0 flex-1 truncate font-mono text-sm text-muted" title={repo}>
+					{repo || t("noRepo")}
+				</span>
+				<Button
+					size="sm"
+					variant="ghost"
+					onPress={() => setLanguage(i18n.language === "en" ? "zh-Hant" : "en")}
 				>
-					Browse
-				</Btn>
-			</div>
+					{t("language")}
+				</Button>
+			</header>
 
-			<section className="flex flex-wrap items-center gap-2">
-				<input
-					className="flex-1 rounded border px-2 py-1"
-					placeholder="paths, comma separated"
-					value={paths}
-					onChange={(e) => setPaths(e.target.value)}
-				/>
-				<Btn
-					onClick={() => {
-						const request: CopyRequest = {
-							kind: "files",
-							roots,
-							paths: paths.split(",").map((p) => p.trim()).filter(Boolean),
-						};
-						void run<CopyOutcome>("copy", { request });
-					}}
-				>
-					copy files
-				</Btn>
-			</section>
-
-			<section className="flex flex-wrap items-center gap-2">
-				<Btn onClick={() => copyGit({ kind: "working" })}>copy working</Btn>
-				<Btn onClick={() => copyGit({ kind: "staged" })}>copy staged</Btn>
-				<input className="w-28 rounded border px-2 py-1" value={base} onChange={(e) => setBase(e.target.value)} />
-				<input className="w-28 rounded border px-2 py-1" value={rev} onChange={(e) => setRev(e.target.value)} />
-				<Btn onClick={() => copyGit({ kind: "commit", sha: rev })}>copy commit</Btn>
-				<Btn onClick={() => copyGit({ kind: "range", base, tip: rev })}>copy range</Btn>
-			</section>
-
-			<section className="flex flex-wrap items-center gap-2">
-				<Btn onClick={() => void run<CommitSummary[]>("list_commits", { repo, limit: 50 })}>list_commits</Btn>
-				<input
-					className="w-16 rounded border px-2 py-1"
-					type="number"
-					min={1}
-					value={count}
-					onChange={(e) => setCount(Number(e.target.value))}
-				/>
-				<Btn onClick={() => copyCommits({ kind: "last", n: count })}>copy_commits -n</Btn>
-				<Btn onClick={() => copyCommits({ kind: "range", base, tip: rev })}>copy_commits base..tip</Btn>
-			</section>
-
-			<section className="flex flex-wrap items-center gap-2">
-				<Btn onClick={() => void run<ClipboardPlan>("read_clipboard_plan", { roots })}>read_clipboard_plan</Btn>
-				<Btn onClick={() => void run<RestoreExecutionResult>("apply_restore", { selection })}>
-					apply_restore (overwrite)
-				</Btn>
-				<Btn onClick={() => void run<ReplayResult>("replay_commits")}>replay_commits</Btn>
-				<input
-					className="w-20 rounded border px-2 py-1"
-					placeholder="i or c:f"
-					value={diffIndex}
-					onChange={(e) => setDiffIndex(e.target.value)}
-				/>
-				<Btn onClick={diff}>diff</Btn>
-			</section>
-
-			<pre className="max-h-[60vh] overflow-auto rounded bg-gray-100 p-2 whitespace-pre-wrap">{output}</pre>
-		</main>
+			<Tabs
+				className="flex min-h-0 flex-1 flex-col"
+				selectedKey={tab}
+				onSelectionChange={(key: Key) => setTab(key as Tab)}
+			>
+				<Tabs.ListContainer>
+					<Tabs.List aria-label={t("appTitle")} className="inline-flex w-auto">
+						<Tabs.Tab id="files" className="min-w-max">
+							{t("tabFiles")}
+							<Tabs.Indicator />
+						</Tabs.Tab>
+						<Tabs.Tab id="commits" className="min-w-max">
+							{t("tabCommits")}
+							<Tabs.Indicator />
+						</Tabs.Tab>
+						<Tabs.Tab id="paste" className="min-w-max">
+							{t("tabPaste")}
+							<Tabs.Indicator />
+						</Tabs.Tab>
+					</Tabs.List>
+				</Tabs.ListContainer>
+				<Tabs.Panel id="files" className="pt-3">
+					<CopyFilesPanel repo={repo} onCopy={(r) => void handleCopy(r)} />
+				</Tabs.Panel>
+				<Tabs.Panel id="commits" className="flex min-h-0 flex-1 flex-col pt-3">
+					<CommitTimeline
+						key={repo}
+						repo={repo}
+						onCopy={(s) => void handleCopyCommits(s)}
+					/>
+				</Tabs.Panel>
+				<Tabs.Panel id="paste" className="flex min-h-0 flex-1 flex-col pt-3">
+					<PastePanel paste={paste} />
+				</Tabs.Panel>
+			</Tabs>
+		</div>
 	);
 }
