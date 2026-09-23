@@ -197,19 +197,28 @@ jobs:
               shell: bash
               run: |
                   set -eu
-                  # Exactly one .app, asserted: a find that matches nothing
-                  # exits 0 and would turn this gate into a silent no-op.
+                  # Verify the .app inside the shipped .dmg: with only the dmg
+                  # bundle requested, tauri deletes the intermediate .app.
+                  # Exactly one dmg, asserted, so an empty find cannot pass.
                   # No mapfile: macOS /bin/bash is 3.2.
-                  found=$(find target -type d -path '*/bundle/macos/*.app' -prune)
-                  count=$(printf '%s' "$found" | grep -c . || true)
+                  dmg=$(find target -type f -path '*/bundle/dmg/*.dmg')
+                  count=$(printf '%s' "$dmg" | grep -c . || true)
                   if [ "$count" -ne 1 ]; then
-                      echo "expected exactly one bundled .app, found $count:" >&2
-                      echo "$found" >&2
+                      echo "expected exactly one .dmg, found $count:" >&2
+                      echo "$dmg" >&2
                       exit 1
                   fi
-                  echo "verifying $found"
-                  codesign --verify --deep --strict --verbose=2 "$found"
-                  codesign --display --verbose=2 "$found" 2>&1 | sed 's/^/  /'
+                  mnt=$(mktemp -d)
+                  hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
+                  trap 'hdiutil detach "$mnt" >/dev/null || true' EXIT
+                  app=$(find "$mnt" -maxdepth 1 -type d -name '*.app')
+                  if [ "$(printf '%s' "$app" | grep -c . || true)" -ne 1 ]; then
+                      echo "expected exactly one .app in $dmg, found: $app" >&2
+                      exit 1
+                  fi
+                  echo "verifying $app (from $dmg)"
+                  codesign --verify --deep --strict --verbose=2 "$app"
+                  codesign --display --verbose=2 "$app" 2>&1 | sed 's/^/  /'
 
             - name: Prepare generic artifact
               shell: bash
