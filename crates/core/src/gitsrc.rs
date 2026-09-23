@@ -5,7 +5,6 @@
 //! git plumbing calls (porting-notes section 5). Filters, size and count
 //! limits are the caller's bookkeeping; this module only yields the files.
 
-use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -362,6 +361,52 @@ fn deleted_content(cat: &mut CatFile, oids: &[String]) -> io::Result<String> {
 	Ok(DELETED_FILE_MARKER.to_string())
 }
 
+fn path_entry(status: u8, path: Vec<u8>) -> RawEntry {
+	RawEntry {
+		status,
+		old_mode: String::new(),
+		new_mode: String::new(),
+		old_oid: String::new(),
+		new_oid: String::new(),
+		old_path: None,
+		path,
+	}
+}
+
+/// Unmerged paths from `git ls-files -u -z`, labelled like VS Code's merge
+/// changes: a conflict missing ours or theirs (UD, DU, DD) is `D`, every
+/// other kind (UU, AA, AU, UA) is `M`.
+fn unmerged(git: &Git) -> Result<Vec<RawEntry>, GitError> {
+	let out = git.run(&["ls-files", "-u", "-z"])?;
+	// Each record is `<mode> <oid> <stage>\t<path>`, one per stage.
+	let mut stages: Vec<(Vec<u8>, [bool; 3])> = Vec::new();
+	for rec in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+		let bad = || GitError::Malformed("ls-files -u record".into());
+		let tab = rec.iter().position(|&b| b == b'\t').ok_or_else(bad)?;
+		let stage = match rec[..tab].last() {
+			Some(b @ b'1'..=b'3') => usize::from(b - b'1'),
+			_ => return Err(bad()),
+		};
+		let path = rec[tab + 1..].to_vec();
+		// Stages of one path are adjacent.
+		match stages.last_mut() {
+			Some((p, s)) if *p == path => s[stage] = true,
+			_ => {
+				let mut s = [false; 3];
+				s[stage] = true;
+				stages.push((path, s));
+			}
+		}
+	}
+	Ok(stages
+		.into_iter()
+		.map(|(path, [base, ours, theirs])| {
+			let deleted = base && !(ours && theirs);
+			path_entry(if deleted { b'D' } else { b'M' }, path)
+		})
+		.collect())
+}
+
 const RAW: [&str; 4] = ["-z", "--raw", "--no-abbrev", "-M"];
 
 fn diff(git: &Git, args: &[&str]) -> Result<Vec<RawEntry>, GitError> {
@@ -376,52 +421,45 @@ pub fn collect(git: &Git, source: &GitSource) -> Result<GitFiles, GitError> {
 	let mut changes = Vec::new();
 	match source {
 		GitSource::Working => {
-			union_into(&mut changes, diff(git, &RAW)?, &mut skipped);
+			// VS Code keeps conflicts out of the working and index lists and
+			// reports them as merge changes between untracked and index.
+			let conflicts = unmerged(git)?;
+			let resolved =
+				|e: &RawEntry| !conflicts.iter().any(|c| c.path == e.path);
+			let worktree =
+				diff(git, &RAW)?.into_iter().filter(resolved).collect();
+			union_into(&mut changes, worktree, &mut skipped);
 			let out =
 				git.run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
 			let untracked = out
 				.split(|&b| b == 0)
 				// A trailing `/` is a nested repository, not a file.
 				.filter(|p| !p.is_empty() && !p.ends_with(b"/"))
-				.map(|p| RawEntry {
-					status: b'A',
-					old_mode: String::new(),
-					new_mode: String::new(),
-					old_oid: String::new(),
-					new_oid: String::new(),
-					old_path: None,
-					path: p.to_vec(),
-				})
+				.map(|p| path_entry(b'A', p.to_vec()))
 				.collect();
 			union_into(&mut changes, untracked, &mut skipped);
+			let merge = conflicts.clone();
+			union_into(&mut changes, merge, &mut skipped);
 			let mut cached = vec!["--cached"];
 			cached.extend_from_slice(&RAW);
-			union_into(&mut changes, diff(git, &cached)?, &mut skipped);
-			// TS reads a deleted file at `HEAD:<path>`; take those OIDs from
-			// one HEAD-vs-worktree diff (no rename pairing). No HEAD yet =
-			// nothing to read.
-			if changes.iter().any(|c| c.status == b'D') {
-				let head: HashMap<Vec<u8>, String> = diff(
-					git,
-					&["HEAD", "-z", "--raw", "--no-abbrev", "--no-renames"],
-				)
-				.unwrap_or_default()
-				.into_iter()
-				.map(|e| (e.path, e.old_oid))
-				.collect();
-				for c in changes.iter_mut().filter(|c| c.status == b'D') {
-					c.deleted_from = head
-						.get(c.path.as_bytes())
-						.cloned()
-						.into_iter()
-						.collect();
-				}
+			let index =
+				diff(git, &cached)?.into_iter().filter(resolved).collect();
+			union_into(&mut changes, index, &mut skipped);
+			// TS reads every deletion at `HEAD:<path>`; an unborn HEAD is
+			// simply missing there, so the marker follows.
+			for c in changes.iter_mut().filter(|c| c.status == b'D') {
+				c.deleted_from = vec![format!("HEAD:{}", c.path)];
 			}
 		}
 		GitSource::Staged => {
 			let mut cached = vec!["--cached"];
 			cached.extend_from_slice(&RAW);
-			union_into(&mut changes, diff(git, &cached)?, &mut skipped);
+			// A conflict is a merge change, not an index change.
+			let index = diff(git, &cached)?
+				.into_iter()
+				.filter(|e| e.status != b'U')
+				.collect();
+			union_into(&mut changes, index, &mut skipped);
 		}
 		GitSource::Commit(rev) => {
 			let sha = git.resolve_commit(rev)?;
@@ -899,5 +937,61 @@ mod tests {
 		let err =
 			collect(&git, &GitSource::Commit("--output=x".into())).unwrap_err();
 		assert!(matches!(err, GitError::InvalidRevision(_)));
+	}
+
+	#[test]
+	fn working_deletion_reads_head_even_with_a_file_named_head() {
+		let r = Repo::new();
+		r.write("HEAD", b"a file named HEAD\n");
+		r.write("d.txt", b"gone\n");
+		r.commit("base");
+		fs::remove_file(r.path().join("d.txt")).unwrap();
+		let got = r.collect(GitSource::Working);
+		assert_eq!(got.files, vec![file("d.txt", "gone\n", Deleted)]);
+	}
+
+	/// Conflicts: f.txt both modified (UU), del.txt deleted by them (UD).
+	fn conflicted_repo() -> Repo {
+		let r = Repo::new();
+		r.write("f.txt", b"base\n");
+		r.write("del.txt", b"base del\n");
+		r.commit("base");
+		r.git(&["checkout", "-q", "-b", "side"]);
+		r.write("f.txt", b"side\n");
+		fs::remove_file(r.path().join("del.txt")).unwrap();
+		r.commit("side");
+		r.git(&["checkout", "-q", "main"]);
+		r.write("f.txt", b"main\n");
+		r.write("del.txt", b"main del\n");
+		r.commit("main");
+		let out = Command::new("git")
+			.args(["merge", "-q", "side"])
+			.current_dir(r.path())
+			.env("GIT_CONFIG_GLOBAL", &r.cfg)
+			.env("GIT_CONFIG_NOSYSTEM", "1")
+			.output()
+			.unwrap();
+		assert!(!out.status.success(), "merge must conflict");
+		r
+	}
+
+	#[test]
+	fn working_labels_conflicts_like_scm_merge_changes() {
+		let r = conflicted_repo();
+		let got = r.collect(GitSource::Working);
+		let disk = fs::read_to_string(r.path().join("f.txt")).unwrap();
+		assert_eq!(
+			got.files,
+			vec![
+				file("del.txt", "main del\n", Deleted),
+				file("f.txt", &disk, Modified),
+			]
+		);
+	}
+
+	#[test]
+	fn staged_leaves_conflicts_out() {
+		let r = conflicted_repo();
+		assert_eq!(r.collect(GitSource::Staged), GitFiles::default());
 	}
 }
