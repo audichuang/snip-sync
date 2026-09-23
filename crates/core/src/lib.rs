@@ -1,0 +1,13 @@
+//! snip-core: shared logic for the snip CLI and desktop app.
+
+pub mod clip;
+pub mod commits;
+pub mod copy;
+pub mod filter;
+pub mod format;
+pub mod fsutil;
+pub mod gitsrc;
+pub mod paths;
+pub mod restore;
+pub mod settings;
+pub mod stats;
