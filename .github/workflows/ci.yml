@@ -131,7 +131,7 @@ jobs:
                   test -z "$(git status --porcelain -- src/generated)"
             - name: Checkout left clean
               shell: bash
-              run: git diff --exit-code && test -z "$(git status --porcelain)"
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
     # Frontend: types, lint, unit tests, production build.
     lint-frontend:
@@ -159,7 +159,7 @@ jobs:
             - name: Frontend build (Vite)
               run: cd crates/desktop && bun run build
             - name: Checkout left clean
-              run: git diff --exit-code && test -z "$(git status --porcelain)"
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
     # Unit, integration, contract, CLI E2E and cross-tool tests on 3 OSes.
     test:
@@ -224,7 +224,7 @@ jobs:
               run: cargo test --workspace --locked --no-fail-fast
             - name: Checkout left clean
               shell: bash
-              run: git diff --exit-code && test -z "$(git status --porcelain)"
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
     # Drives the real app (Rust backend + WebView) through tauri-driver and
     # runs every scenario in crates/desktop/e2e/scenarios.mjs. Linux uses
@@ -265,8 +265,13 @@ jobs:
               shell: pwsh
               run: |
                   cargo install --git https://github.com/chippers/msedgedriver-tool
+                  # The tool downloads into the current directory; keep it out of the checkout.
+                  $dir = Join-Path $env:RUNNER_TEMP "msedgedriver"
+                  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+                  Push-Location $dir
                   & "$HOME/.cargo/bin/msedgedriver-tool.exe"
-                  $PWD.Path >> $env:GITHUB_PATH
+                  Pop-Location
+                  $dir >> $env:GITHUB_PATH
             # The replayed commits need a committer; runners have none.
             - name: Configure git identity
               run: |
@@ -310,7 +315,7 @@ jobs:
                   if-no-files-found: error
             - name: Checkout left clean
               shell: bash
-              run: git diff --exit-code && test -z "$(git status --porcelain)"
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
     # Single required check: fails unless every job above succeeded
     # (a skipped or cancelled job counts as a failure).
