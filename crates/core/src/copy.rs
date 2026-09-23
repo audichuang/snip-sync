@@ -253,7 +253,6 @@ fn resolve(path: &Path) -> PathBuf {
 mod tests {
 	use super::*;
 	use crate::format::{extract_source_root, parse_clipboard};
-	use crate::fsutil::write_text_file;
 	use crate::settings::{FilterAction, FilterRule, FilterType};
 	use std::collections::BTreeMap;
 
@@ -521,8 +520,6 @@ mod tests {
 			.collect()
 	}
 
-	// ponytail: restores via parse_clipboard + write_text_file because
-	// restore::plan_restore (T-05) is not merged yet; swap it in then.
 	#[test]
 	fn copy_round_trip_reproduces_file_tree() {
 		let src = tempfile::tempdir().unwrap();
@@ -543,10 +540,18 @@ mod tests {
 		assert_eq!(result.copied_file_count, 3);
 
 		let dst = tempfile::tempdir().unwrap();
-		for entry in parse_clipboard(&result.payload, &settings.header_format) {
-			write_text_file(&dst.path().join(&entry.path), &entry.content)
-				.unwrap();
-		}
+		let entries = parse_clipboard(&result.payload, &settings.header_format);
+		let plan = crate::restore::plan_restore(&[dst.path()], &entries);
+		assert!(
+			plan.skipped_operations.is_empty(),
+			"{:?}",
+			plan.skipped_operations
+		);
+		let done = crate::restore::execute_restore_plan(
+			&plan,
+			&crate::restore::RestoreSelection::default(),
+		);
+		assert!(done.errors.is_empty(), "{:?}", done.errors);
 		assert_eq!(tree(dst.path()), tree(root));
 	}
 }

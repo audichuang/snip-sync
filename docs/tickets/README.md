@@ -9,7 +9,8 @@
 | L0 | [T-00](T-00-skeleton.md) workspace 骨架 | — |
 | L1 | [T-01](T-01-format.md) format · [T-02](T-02-stats.md) stats · [T-03](T-03-paths.md) paths · [T-04](T-04-filter-settings-fsutil.md) filter / settings / fsutil | T-00 |
 | L2 | [T-05](T-05-restore.md) restore · [T-06](T-06-copy-files.md) 檔案模式 copy · [T-07](T-07-gitsrc.md) gitsrc · [T-09](T-09-clip.md) clip | T-01~T-04 |
-| L3 | [T-08](T-08-commit-mode.md) commit 模式 · [T-10](T-10-cli.md) CLI | T-05~T-07、T-09 |
+| L3 | [T-08](T-08-commit-mode.md) commit 模式 · [T-15](T-15-git-payload.md) git 來源 payload 組裝 | T-05~T-07、T-09 |
+| L3b | [T-10](T-10-cli.md) CLI | T-08、T-15 |
 | L4 | [T-11](T-11-desktop-shell.md) Tauri 殼 · [T-13](T-13-ci-release.md) CI / release · [T-14](T-14-e2e.md) E2E | T-10 |
 | L5 | [T-12](T-12-desktop-ui.md) 前端畫面 | T-11 |
 

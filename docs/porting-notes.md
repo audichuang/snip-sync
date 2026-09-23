@@ -65,7 +65,8 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 - merge commit 的檔案集是**與每一個 parent 的 diff 的聯集**(依路徑去重)。
 - 刪除的檔案帶**刪除前的內容**;只有當沒有任何 parent 有這個檔案時,才輸出
   `// This file has been deleted in this change`。
-- 讀不到的 placeholder 仍放進 payload,但**不算已複製**,也**不佔檔案數上限**。
+- **git 來源**讀不到的檔案放 placeholder(`// Unable to read file content`)進 payload,但**不算已複製**,也**不佔檔案數上限**。
+  **磁碟來源**(檔案模式)讀不到或非 UTF-8 的檔案不放 placeholder,只計數;超過大小上限的放 skipped marker。
 - 目錄 symlink 只在它本身就是被選取的輸入時才跟進,遞迴過程中不跟進(避免 pnpm / Bazel 的交叉連結爆量)。
 
 ## 5. Git plumbing 對照
