@@ -939,7 +939,10 @@ mod tests {
 	#[test]
 	fn relativize_uses_utf16_offset_when_case_folding_changes_byte_length() {
 		// U+1E9E lowercases to U+00DF: same UTF-16 length, different UTF-8 length.
-		assert_eq!(relativize_path("C:/\u{DF}/abc", "C:/\u{1E9E}").as_deref(), Some("abc"));
+		assert_eq!(
+			relativize_path("C:/\u{DF}/abc", "C:/\u{1E9E}").as_deref(),
+			Some("abc")
+		);
 	}
 
 	use super::*;
