@@ -9,11 +9,15 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 - `fixtures/clipboard-contract.json` is a byte-exact copy owned by ClipCodeVSCode, and its SHA is pinned in `crates/core/tests/contract.rs`. Never edit or regenerate it here. To update it, copy it from ClipCodeVSCode and update the SHA in all three repos.
 - A deliberate divergence from the TS goes into the "已知且接受的差異" list in `docs/porting-notes.md`. Without that entry, a later port "fixes" it back.
 
+## Branches and releases
+
+- `main` only holds released code; `develop` is the integration branch; every change gets its own `feature/<name>` (or `fix/<name>`) branch cut from `develop`, and its PR targets `develop`.
+- To release, open a PR `develop` → `main`, merge it once green, then run `just release X.Y.Z` on `main` (it pushes the tag; `release.yml` builds, publishes and bumps the Homebrew tap). Release only when there is something worth shipping, not per merge.
+
 ## Before you call a change done
 
-- Rust: `just preflight`. CI is stricter (`-D warnings` incl. rustdoc, `--locked`, audit, DTO drift, clean checkout); see `.github/workflows/ci.yml`.
-- Frontend (`crates/desktop`): `bun run typecheck && bun run lint:check && bun run format:check && bun run test`.
-- UI or command changes: `just desktop-e2e` (real app, every scenario in `crates/desktop/e2e/scenarios.mjs`). New UI controls the scenarios use get a `data-testid`.
+- Run `just preflight` before every push. It runs everything CI runs that Linux can run: Rust fmt/clippy/doc/test, frontend format/typecheck/oxlint/test/build, and the real-app E2E (`just desktop-e2e`, every scenario in `crates/desktop/e2e/scenarios.mjs`). A Linux failure found by CI instead of locally is a process bug. CI adds audit, DTO drift, clean checkout and Windows/macOS; see `.github/workflows/ci.yml`.
+- New UI controls the scenarios use get a `data-testid`.
 - After changing any `#[derive(TS)]` type, run `bun run generate:dto && bun run format` in `crates/desktop` and commit `src/generated/`.
 
 ## Cross-platform
