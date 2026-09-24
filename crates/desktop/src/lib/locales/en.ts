@@ -24,6 +24,12 @@ export default {
 	rangeBase: "Base",
 	rangeTip: "Tip",
 	copy: "Copy",
+	recentCommits: "Recent commits",
+	gitChanges: "Git changes",
+	selectedFiles: "{{count}} selected",
+	refreshChanges: "Refresh",
+	selectAll: "Select all",
+	noGitChanges: "No changes in this folder.",
 
 	// Copy: commit mode
 	loadHistory: "Load history",

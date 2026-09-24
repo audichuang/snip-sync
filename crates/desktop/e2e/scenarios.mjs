@@ -418,6 +418,49 @@ const scenarios = {
 		);
 		check(!exists(b, "packages/api/packages"), "no doubled path");
 	},
+
+	async F06_monorepo_browser_selects_only_checked_path(check) {
+		const a = newRepo("a");
+		for (const file of [
+			"packages/api/a.ts",
+			"packages/api/b.ts",
+			"packages/web/c.ts",
+		])
+			write(a, file, "old\n");
+		const base = commit(a, "base");
+		for (const file of [
+			"packages/api/a.ts",
+			"packages/api/b.ts",
+			"packages/web/c.ts",
+		])
+			write(a, file, "new\n");
+		const b = clone(a, base);
+		await e.setRepo(path.join(a, "packages", "api"));
+		await e.openTab("files");
+		await e.clickId("source-working");
+		await e.until("monorepo Git changes", () =>
+			e.present("git-change-packages/api/b.ts"),
+		);
+		check(
+			!(await e.present("git-change-packages/web/c.ts")),
+			"browser stays in selected package",
+		);
+		await e.clickId("git-change-packages/api/b.ts");
+		await e.withToast(() => e.clickId("copy-files"));
+		check(
+			(await e.restoreFiles(path.join(b, "packages", "api"))) === "ok",
+			"restore reports success",
+		);
+		check(read(b, "packages/api/a.ts") === "new", "checked file copied");
+		check(
+			readLf(b, "packages/api/b.ts") === "old\n",
+			"unchecked file stayed old",
+		);
+		check(
+			readLf(b, "packages/web/c.ts") === "old\n",
+			"other package stayed old",
+		);
+	},
 };
 
 const results = [];

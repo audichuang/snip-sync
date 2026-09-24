@@ -1,6 +1,7 @@
 //! Thin Tauri commands over `snip-core`. Every piece of logic lives in the
 //! core; these only move data between the webview, the clipboard and it.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -83,7 +84,24 @@ pub enum CopyRequest {
 		repo: PathBuf,
 		roots: Vec<PathBuf>,
 		source: GitSourceDto,
+		selected_paths: Option<Vec<String>>,
 	},
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct GitChange {
+	pub path: String,
+	pub change_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBrowse {
+	pub root: String,
+	pub branch: String,
+	pub scope: String,
+	pub changes: Vec<GitChange>,
 }
 
 #[derive(Debug, Clone, Deserialize, TS)]
@@ -207,11 +225,22 @@ fn copy_payload(
 			repo,
 			roots,
 			source,
+			selected_paths,
 		} => {
 			let git = Git::open(repo).map_err(|e| e.to_string())?;
 			let source = source.clone().into();
-			let r = gitsrc::collect_payload(&git, &source, roots, settings)
-				.map_err(|e| e.to_string())?;
+			let selected = selected_paths
+				.as_ref()
+				.map(|p| p.iter().cloned().collect::<HashSet<_>>());
+			let r = gitsrc::collect_payload_with_selection(
+				&git,
+				&source,
+				roots,
+				settings,
+				Some(repo),
+				selected.as_ref(),
+			)
+			.map_err(|e| e.to_string())?;
 			// As TS: an empty git copy leaves the clipboard alone.
 			if r.files.is_empty() {
 				return Err("No Git changes found to copy.".into());
@@ -221,6 +250,43 @@ fn copy_payload(
 	};
 	clip::write_text(&result.payload).map_err(|e| e.to_string())?;
 	Ok(outcome(&result, settings))
+}
+
+#[tauri::command]
+pub async fn browse_git(
+	repo: PathBuf,
+	source: GitSourceDto,
+) -> CmdResult<GitBrowse> {
+	blocking(move || {
+		let git = Git::open(&repo).map_err(|e| e.to_string())?;
+		let scope = dunce::canonicalize(&repo).map_err(|e| e.to_string())?;
+		let branch = git
+			.run(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+			.map(|b| String::from_utf8_lossy(&b).trim().to_string())
+			.unwrap_or_else(|_| "HEAD".to_string());
+		let changes = gitsrc::list_changed_paths(&git, &source.into())
+			.map_err(|e| e.to_string())?
+			.into_iter()
+			.filter(|(path, _)| git.root().join(path).starts_with(&scope))
+			.map(|(path, change_type)| GitChange {
+				path,
+				change_type: change_type
+					.map(|c| c.as_str().to_string())
+					.unwrap_or_default(),
+			})
+			.collect();
+		Ok(GitBrowse {
+			root: git.root().to_string_lossy().into_owned(),
+			branch,
+			scope: scope
+				.strip_prefix(git.root())
+				.unwrap_or(Path::new(""))
+				.to_string_lossy()
+				.into_owned(),
+			changes,
+		})
+	})
+	.await
 }
 
 fn copy_commit_range(
@@ -574,6 +640,7 @@ mod tests {
 			.with_out_dir(dir)
 			.with_large_int("number");
 		CopyRequest::export_all(&cfg).unwrap();
+		GitBrowse::export_all(&cfg).unwrap();
 		CopyOutcome::export_all(&cfg).unwrap();
 		CopyDone::export_all(&cfg).unwrap();
 		CommitSelection::export_all(&cfg).unwrap();

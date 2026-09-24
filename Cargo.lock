@@ -3593,6 +3593,7 @@ dependencies = [
 name = "snip-sync"
 version = "0.1.2"
 dependencies = [
+ "dunce",
  "log",
  "serde",
  "serde_json",

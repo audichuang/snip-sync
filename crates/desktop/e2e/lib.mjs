@@ -197,6 +197,11 @@ export async function setInput(css, value, { enter = false } = {}) {
 
 export async function setRepo(dir) {
 	await setInput(q("repo-path"), dir, { enter: true });
+	await until("repo path to apply", () =>
+		attr("repo-path", "data-applied-path").then(
+			(appliedPath) => appliedPath === dir,
+		),
+	);
 }
 
 export async function openTab(key) {
@@ -215,8 +220,13 @@ const toastList = () =>
 	);
 /** Toasts present now that were not in `before` (older ones may be leaving). */
 async function newToasts(before) {
-	const seen = new Set(before);
-	return (await toastList()).filter((t) => !seen.has(t));
+	const remaining = [...before];
+	return (await toastList()).filter((message) => {
+		const old = remaining.indexOf(message);
+		if (old < 0) return true;
+		remaining.splice(old, 1);
+		return false;
+	});
 }
 export const toastText = () =>
 	js(

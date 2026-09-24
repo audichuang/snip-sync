@@ -1,7 +1,7 @@
 import { Button, Spinner, toast } from "@heroui/react";
 import { GitLog, type GitLogEntry } from "@tomplum/react-git-log";
 import { invoke } from "@tauri-apps/api/core";
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { CommitSelection } from "../generated/CommitSelection";
 import type { CommitSummary } from "../generated/CommitSummary";
@@ -32,7 +32,8 @@ export function CommitTimeline({
 	// GitLog's onSelectCommit carries no event; remember the click's Shift.
 	const shiftRef = useRef(false);
 
-	async function handleLoad() {
+	const handleLoad = useCallback(async () => {
+		if (!repo) return;
 		setLoading(true);
 		try {
 			setCommits(
@@ -47,7 +48,12 @@ export function CommitTimeline({
 		} finally {
 			setLoading(false);
 		}
-	}
+	}, [repo, t]);
+
+	useEffect(() => {
+		const timer = setTimeout(() => void handleLoad(), 0);
+		return () => clearTimeout(timer);
+	}, [handleLoad]);
 
 	const entries = useMemo<GitLogEntry[]>(
 		() =>
