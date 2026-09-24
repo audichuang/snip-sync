@@ -267,6 +267,7 @@ function FilesPreview({
 							: checked.checked;
 						paste.setState({ ...state, checked: keys.map(String) });
 					}}
+					// oxlint-disable-next-line react/no-unstable-nested-components -- rc-tree calls `titleRender` as a plain function, never mounts it
 					titleRender={(node) => (
 						<span className="inline-flex flex-wrap items-center gap-2 text-sm">
 							<span className="font-mono">{node.name}</span>
@@ -407,6 +408,7 @@ function CommitsPreview({
 					const notCopied = c.files.filter((f) => f.notCopied).length;
 					return (
 						<details
+							// oxlint-disable-next-line react/no-array-index-key -- the plan is fixed while shown, and replayed commits have no id of their own
 							key={`${ci}-${c.authorDate}`}
 							className="border-b border-border px-3 py-2"
 						>
@@ -437,6 +439,7 @@ function CommitsPreview({
 							<ul>
 								{c.files.map((f, fi) => (
 									<FileRow
+										// oxlint-disable-next-line react/no-array-index-key -- same fixed plan; the index is also the row's identity for the diff
 										key={`${fi}-${f.path}`}
 										commit={ci}
 										file={f}

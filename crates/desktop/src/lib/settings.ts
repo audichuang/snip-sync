@@ -5,7 +5,7 @@
 export function showCopyNotification(stored: unknown): boolean {
 	const v =
 		stored !== null && typeof stored === "object"
-			? (stored as Record<string, unknown>).showCopyNotification
+			? (stored as Record<string, unknown>)["showCopyNotification"]
 			: undefined;
 	return typeof v === "boolean" ? v : true;
 }

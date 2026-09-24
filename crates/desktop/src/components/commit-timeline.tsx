@@ -152,6 +152,7 @@ export function CommitTimeline({
 					>
 						<GitLog.GraphHTMLGrid nodeSize={12} />
 						<GitLog.Table
+							// oxlint-disable-next-line react/no-unstable-nested-components -- react-git-log calls `row` as a plain function, never mounts it
 							row={({ commit, backgroundColour }) => (
 								<div
 									data-commit={commit.hash}

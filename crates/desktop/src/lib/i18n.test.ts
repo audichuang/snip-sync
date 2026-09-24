@@ -6,9 +6,13 @@ import en from "./locales/en.ts";
 import zhHant from "./locales/zh-Hant.ts";
 import { translator } from "./test-i18n.ts";
 
+const holes = (s: string) => (s.match(/\{\{\w+\}\}/gu) ?? []).toSorted();
+
 test("both languages carry the same keys and placeholders", () => {
-	assert.deepEqual(Object.keys(zhHant).sort(), Object.keys(en).sort());
-	const holes = (s: string) => (s.match(/{{\w+}}/g) ?? []).sort();
+	assert.deepEqual(
+		Object.keys(zhHant).toSorted(),
+		Object.keys(en).toSorted(),
+	);
 	for (const key of Object.keys(en) as (keyof typeof en)[]) {
 		assert.deepEqual(holes(zhHant[key]), holes(en[key]), key);
 	}

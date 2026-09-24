@@ -89,7 +89,9 @@ export function buildPlanTree(plan: RestorePlan): PlanNode[] {
 /** A folder holding only skipped rows has nothing to check either. */
 function markSkipOnlyFolders(node: PlanNode): boolean {
 	if (node.leaf) return node.leaf.kind === "skip";
-	const allSkipped = node.children!.map(markSkipOnlyFolders).every(Boolean);
+	const allSkipped = node
+		.children!.map((c) => markSkipOnlyFolders(c))
+		.every(Boolean);
 	if (allSkipped) node.disableCheckbox = true;
 	return allSkipped;
 }
@@ -189,7 +191,7 @@ export function isRelativeEntryPath(p: string): boolean {
 	return (
 		!!p &&
 		!p.startsWith("/") &&
-		!/^[A-Za-z]:[\\/]/.test(p) &&
+		!/^[A-Za-z]:[\\/]/u.test(p) &&
 		!p.startsWith("\\")
 	);
 }
@@ -208,7 +210,7 @@ export function suggestionText(
 	const sample = planLeaves(plan)
 		.map((l) =>
 			l.kind === "skip"
-				? plan.skippedOperations[l.index].rawPath
+				? (plan.skippedOperations[l.index]?.rawPath ?? "")
 				: l.path,
 		)
 		.find((p) => isRelativeEntryPath(p) && p.includes("/"));

@@ -15,7 +15,8 @@ import path from "node:path";
 
 const PORT = 4444;
 const DRIVER = `http://127.0.0.1:${PORT}`;
-const ELEMENT = "element-6066-11e4-a52e-4f735466cecf"; // W3C element key
+// W3C element key
+const ELEMENT = "element-6066-11e4-a52e-4f735466cecf";
 let sid;
 let out;
 
@@ -23,7 +24,7 @@ let out;
 
 export function git(cwd, ...args) {
 	return execFileSync("git", args, { cwd, encoding: "utf8" }).replace(
-		/\n$/,
+		/\n$/u,
 		"",
 	);
 }
@@ -35,7 +36,7 @@ export function write(root, file, content) {
 
 export const read = (root, file) => readFileSync(path.join(root, file), "utf8");
 /** Text with CRLF folded to LF: a Windows checkout (core.autocrlf) has CRLF. */
-export const readLf = (root, file) => read(root, file).replace(/\r\n/g, "\n");
+export const readLf = (root, file) => read(root, file).replaceAll("\r\n", "\n");
 export const exists = (root, file) => existsSync(path.join(root, file));
 
 let commits = 0;
@@ -115,7 +116,10 @@ async function wd(method, url, body) {
 const s = (p) => `/session/${sid}${p}`;
 export const js = (script, ...args) =>
 	wd("POST", s("/execute/sync"), { script, args });
-export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export const sleep = (ms) =>
+	new Promise((r) => {
+		setTimeout(r, ms);
+	});
 
 export async function until(what, fn, timeoutMs = 20000) {
 	const end = Date.now() + timeoutMs;
@@ -266,7 +270,7 @@ export async function previewPaste(repo) {
 		if (await present("replay-commits")) return "commits";
 		if (await present("apply-restore")) return "files";
 		const fresh = await newToasts(before);
-		return fresh.length ? `toast:${fresh.join(" | ")}` : false;
+		return fresh.length > 0 ? `toast:${fresh.join(" | ")}` : false;
 	});
 }
 
@@ -326,13 +330,13 @@ export async function start(app, outDir) {
 	await until(
 		"app to render",
 		async () =>
-			/^(tauri:\/\/|https?:\/\/tauri\.localhost)/.test(
+			/^(tauri:\/\/|https?:\/\/tauri\.localhost)/u.test(
 				await wd("GET", s("/url")),
 			) && (await present("repo-path")),
 		30000,
 	);
 	return async () => {
-		await wd("DELETE", `/session/${sid}`).catch(() => undefined);
+		await wd("DELETE", `/session/${sid}`).catch(() => {});
 		driver.kill();
 	};
 }
