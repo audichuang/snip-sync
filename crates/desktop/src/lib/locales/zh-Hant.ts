@@ -24,6 +24,12 @@ const zhHant: Record<keyof typeof en, string> = {
 	rangeBase: "起點",
 	rangeTip: "終點",
 	copy: "複製",
+	recentCommits: "最近的 commit",
+	gitChanges: "Git 變更",
+	selectedFiles: "已選 {{count}} 個",
+	refreshChanges: "重新整理",
+	selectAll: "全選",
+	noGitChanges: "此資料夾沒有變更。",
 
 	loadHistory: "載入歷史",
 	timelineHint: "點選第一個 commit,再按住 Shift 點最後一個。",

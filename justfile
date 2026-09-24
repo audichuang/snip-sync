@@ -35,7 +35,7 @@ desktop-bundle:
 
 # Real-app E2E (Linux): needs webkit2gtk-driver, `cargo install tauri-driver`, xvfb.
 desktop-e2e:
-	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle && xvfb-run -a node e2e/scenarios.mjs
+	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle && SNIP_REQUIRE_ALL_TESTS=1 xvfb-run -a node e2e/scenarios.mjs
 
 # Bump the version in every manifest (perl -pi is portable across GNU/BSD).
 bump version:

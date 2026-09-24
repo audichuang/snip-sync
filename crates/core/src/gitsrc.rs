@@ -454,6 +454,19 @@ pub fn collect(git: &Git, source: &GitSource) -> Result<GitFiles, GitError> {
 	})
 }
 
+/// Changed paths for the desktop browser, including files whose content
+/// cannot be put on the clipboard (binary or unreadable).
+pub fn list_changed_paths(
+	git: &Git,
+	source: &GitSource,
+) -> Result<Vec<(String, Option<ChangeType>)>, GitError> {
+	Ok(collect_raw(git, source)?
+		.0
+		.into_iter()
+		.map(|f| (f.path, f.change_type))
+		.collect())
+}
+
 /// The files of `source` in order, an unreadable one kept with `content:
 /// None` so callers can filter before counting it; plus the number of
 /// entries dropped for a non-UTF-8 path name.
@@ -594,6 +607,26 @@ pub fn collect_payload<P: AsRef<Path>>(
 	workspace_roots: &[P],
 	settings: &Settings,
 ) -> Result<CopyResult, GitError> {
+	collect_payload_with_selection(
+		git,
+		source,
+		workspace_roots,
+		settings,
+		None,
+		None,
+	)
+}
+
+/// Desktop selection: constrain a source to a monorepo folder and optional
+/// repository-relative paths without changing the CLI's all-files behavior.
+pub fn collect_payload_with_selection<P: AsRef<Path>>(
+	git: &Git,
+	source: &GitSource,
+	workspace_roots: &[P],
+	settings: &Settings,
+	scope: Option<&Path>,
+	selected: Option<&HashSet<String>>,
+) -> Result<CopyResult, GitError> {
 	// git reports its toplevel fully resolved (macOS `/private/var`, Windows
 	// long names), so the roots must be too or no file relativizes.
 	let mut roots: Vec<PathBuf> = workspace_roots
@@ -617,8 +650,15 @@ pub fn collect_payload<P: AsRef<Path>>(
 	// git builder; SCM falls back to it for deleted or index content.
 	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
 	let mut fallback = graph;
+	let scope = scope
+		.map(|p| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
 	for file in collected {
 		let absolute = git.root().join(&file.path);
+		if scope.as_ref().is_some_and(|p| !absolute.starts_with(p))
+			|| selected.is_some_and(|paths| !paths.contains(&file.path))
+		{
+			continue;
+		}
 		// graphCopy keys on the exact path; only SCM case-folds on Windows.
 		let key = if graph {
 			absolute.to_string_lossy().into_owned()
@@ -1497,6 +1537,43 @@ mod tests {
 		let got = payload(&r, GitSource::Commit(del), &Settings::default());
 		assert_eq!(got.files, vec![file("top.ts", "top\n", Deleted)]);
 		assert!(got.payload.contains("[DELETED] top.ts"));
+	}
+
+	#[test]
+	fn desktop_selection_stays_inside_monorepo_folder() {
+		let r = Repo::new();
+		r.write("packages/api/a.ts", b"old\n");
+		r.write("packages/api/b.ts", b"old\n");
+		r.write("packages/web/a.ts", b"old\n");
+		r.commit("base");
+		r.write("packages/api/a.ts", b"new\n");
+		r.write("packages/api/b.ts", b"new\n");
+		r.write("packages/web/a.ts", b"new\n");
+		let scope = r.path().join("packages/api");
+		let git = Git::open(&scope).unwrap();
+		let selected = HashSet::from([
+			"packages/api/b.ts".to_string(),
+			"packages/web/a.ts".to_string(),
+		]);
+		let result = collect_payload_with_selection(
+			&git,
+			&GitSource::Working,
+			&[&scope],
+			&Settings::default(),
+			Some(&scope),
+			Some(&selected),
+		)
+		.unwrap();
+		assert_eq!(
+			result
+				.files
+				.iter()
+				.map(|f| f.path.as_str())
+				.collect::<Vec<_>>(),
+			["b.ts"]
+		);
+		assert!(result.payload.contains("b.ts"));
+		assert!(!result.payload.contains("web"));
 	}
 
 	fn options(

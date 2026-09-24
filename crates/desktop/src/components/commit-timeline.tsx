@@ -1,7 +1,7 @@
 import { Button, Spinner, toast } from "@heroui/react";
 import { GitLog, type GitLogEntry } from "@tomplum/react-git-log";
 import { invoke } from "@tauri-apps/api/core";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { CommitSelection } from "../generated/CommitSelection";
 import type { CommitSummary } from "../generated/CommitSummary";
@@ -31,23 +31,38 @@ export function CommitTimeline({
 	const [ends, setEnds] = useState<RangeEnds | null>(null);
 	// GitLog's onSelectCommit carries no event; remember the click's Shift.
 	const shiftRef = useRef(false);
+	const [reload, setReload] = useState(0);
+	const [loadError, setLoadError] = useState("");
 
-	async function handleLoad() {
-		setLoading(true);
-		try {
-			setCommits(
-				await invoke<CommitSummary[]>("list_commits", {
-					repo,
-					limit: HISTORY_LIMIT,
-				}),
-			);
-			setEnds(null);
-		} catch (error: unknown) {
-			toast.danger(errorText(t, error));
-		} finally {
-			setLoading(false);
-		}
-	}
+	useEffect(() => {
+		if (!repo) return;
+		let cancelled = false;
+		const timer = setTimeout(() => {
+			setLoading(true);
+			setLoadError("");
+			void (async () => {
+				try {
+					const data = await invoke<CommitSummary[]>("list_commits", {
+						repo,
+						limit: HISTORY_LIMIT,
+					});
+					if (!cancelled) {
+						setCommits(data);
+						setEnds(null);
+					}
+				} catch (error: unknown) {
+					if (!cancelled) setLoadError(errorText(t, error));
+				} finally {
+					if (!cancelled) setLoading(false);
+				}
+			})();
+		}, 0);
+		return () => {
+			cancelled = true;
+			clearTimeout(timer);
+		};
+		// oxlint-disable-next-line react/exhaustive-effect-dependencies -- reload explicitly refreshes history
+	}, [repo, t, reload]);
 
 	const entries = useMemo<GitLogEntry[]>(
 		() =>
@@ -93,7 +108,8 @@ export function CommitTimeline({
 					data-testid="load-history"
 					size="sm"
 					variant="secondary"
-					onPress={() => void handleLoad()}
+					isDisabled={loading}
+					onPress={() => setReload((n) => n + 1)}
 				>
 					{loading ? <Spinner size="sm" /> : t("loadHistory")}
 				</Button>
@@ -122,8 +138,19 @@ export function CommitTimeline({
 				</div>
 			</div>
 
+			{loadError && (
+				<p
+					data-testid="history-error"
+					role="alert"
+					className="text-sm text-danger"
+				>
+					{loadError}
+				</p>
+			)}
 			{commits !== null && commits.length === 0 && (
-				<p className="text-sm text-muted">{t("noHistory")}</p>
+				<p data-testid="empty-history" className="text-sm text-muted">
+					{t("noHistory")}
+				</p>
 			)}
 			{commits !== null && commits.length > 0 && (
 				<div

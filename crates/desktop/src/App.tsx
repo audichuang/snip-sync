@@ -140,6 +140,7 @@ export default function App() {
 				>
 					<Input
 						data-testid="repo-path"
+						data-applied-path={repo}
 						className="font-mono text-sm"
 						value={repoDraft}
 						placeholder={t("noRepo")}
@@ -187,6 +188,7 @@ export default function App() {
 				</Tabs.ListContainer>
 				<Tabs.Panel id="files" className="pt-3">
 					<CopyFilesPanel
+						key={repo}
 						repo={repo}
 						onCopy={(r) => void handleCopy(r)}
 					/>
