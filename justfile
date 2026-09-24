@@ -41,6 +41,8 @@ desktop-e2e:
 bump version:
 	perl -pi -e 's/^version = .*/version = "{{version}}"/' Cargo.toml
 	perl -pi -e 's/"version": "[^"]*"/"version": "{{version}}"/' crates/desktop/package.json crates/desktop/src-tauri/tauri.conf.json
+	# Keep Cargo.lock in step, or every --locked build fails.
+	cargo update -w
 
 # Cut a release (green CI on HEAD -> tag -> watch release.yml -> verify assets); --yes skips the prompt.
 release version *flags:
