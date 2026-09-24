@@ -5,6 +5,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import {
 	existsSync,
+	appendFileSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -104,9 +105,16 @@ export function clone(src, at, name = "clone") {
 // ---- WebDriver ----
 
 async function wd(method, url, body) {
-	const init = { method, headers: { "content-type": "application/json" } };
+	const init = {
+		method,
+		headers: { "content-type": "application/json" },
+		// WebView cold startup is slower than an interaction on hosted runners.
+		signal: AbortSignal.timeout(url === "/session" ? 120000 : 30000),
+	};
 	if (body !== undefined) init.body = JSON.stringify(body);
-	const res = await fetch(DRIVER + url, init);
+	const res = await fetch(DRIVER + url, init).catch((error) => {
+		throw new Error(`${method} ${url}: ${error.message}`, { cause: error });
+	});
 	const json = await res.json();
 	if (!res.ok)
 		throw new Error(`${method} ${url}: ${JSON.stringify(json.value)}`);
@@ -197,6 +205,11 @@ export async function setInput(css, value, { enter = false } = {}) {
 
 export async function setRepo(dir) {
 	await setInput(q("repo-path"), dir, { enter: true });
+	await until("repo path to apply", () =>
+		attr("repo-path", "data-applied-path").then(
+			(appliedPath) => appliedPath === dir,
+		),
+	);
 }
 
 export async function openTab(key) {
@@ -215,8 +228,13 @@ const toastList = () =>
 	);
 /** Toasts present now that were not in `before` (older ones may be leaving). */
 async function newToasts(before) {
-	const seen = new Set(before);
-	return (await toastList()).filter((t) => !seen.has(t));
+	const remaining = [...before];
+	return (await toastList()).filter((message) => {
+		const old = remaining.indexOf(message);
+		if (old < 0) return true;
+		remaining.splice(old, 1);
+		return false;
+	});
 }
 export const toastText = () =>
 	js(
@@ -240,23 +258,39 @@ export async function withToast(action) {
 export async function copyCommits(repo, newest, oldest) {
 	await setRepo(repo);
 	await openTab("commits");
-	// A press that lands while the panel is still mounting is dropped.
-	await until("timeline rows", async () => {
-		if (
-			await js(
-				"return document.querySelectorAll('[data-commit]').length > 0",
-			)
-		)
-			return true;
-		await clickId("load-history");
-		return false;
+	// Auto-loading is part of the feature: never mask it by pressing reload.
+	await find(`[data-commit="${newest}"]`);
+	await click(`[data-commit="${newest}"] span`);
+	await wd("POST", s("/actions"), {
+		actions: [
+			{
+				type: "key",
+				id: "keyboard",
+				actions: [{ type: "keyDown", value: "\uE008" }],
+			},
+		],
 	});
-	await click(`[data-commit="${newest}"]`);
-	// Shift+click as a real bubbling event; the timeline reads e.shiftKey.
-	await js(
-		"arguments[0].dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }))",
-		{ [ELEMENT]: await find(`[data-commit="${oldest}"]`) },
+	try {
+		// Click the SHA at the left: bottom-right toast overlays can cover the row center.
+		await click(`[data-commit="${oldest}"] span`);
+	} finally {
+		await wd("DELETE", s("/actions"));
+	}
+	const chain = git(repo, "rev-list", "--first-parent", newest).split("\n");
+	const end = chain.indexOf(oldest);
+	const expected = (
+		end >= 0 ? chain.slice(0, end + 1) : [newest, oldest]
+	).toSorted();
+	await until(
+		"exact selected commit range",
+		async () =>
+			JSON.stringify(
+				await js(
+					"return [...document.querySelectorAll('[data-commit][data-selected=true]')].map(e => e.dataset.commit).sort()",
+				),
+			) === JSON.stringify(expected),
 	);
+
 	return withToast(() => clickId("copy-commits"));
 }
 
@@ -264,13 +298,13 @@ export async function copyCommits(repo, newest, oldest) {
 export async function previewPaste(repo) {
 	await setRepo(repo);
 	await openTab("paste");
-	const before = await toastList();
 	await clickId("preview-clipboard");
 	return until("a preview", async () => {
 		if (await present("replay-commits")) return "commits";
 		if (await present("apply-restore")) return "files";
-		const fresh = await newToasts(before);
-		return fresh.length > 0 ? `toast:${fresh.join(" | ")}` : false;
+		if (await present("paste-error"))
+			return `error:${await js('return document.querySelector("[data-testid=paste-error]").innerText')}`;
+		return false;
 	});
 }
 
@@ -304,6 +338,9 @@ export async function copyGitSource(repo, source, { sha, base, tip } = {}) {
 	if (sha) await setInput(q("commit-sha"), sha);
 	if (base) await setInput(q("range-base"), base);
 	if (tip) await setInput(q("range-tip"), tip);
+	await until("Git source to load", () =>
+		attr("git-browser", "data-loading").then((v) => v === "false"),
+	);
 	return withToast(() => clickId("copy-files"));
 }
 
@@ -312,31 +349,120 @@ export async function copyGitSource(repo, source, { sha, base, tip } = {}) {
 export async function start(app, outDir) {
 	out = outDir;
 	const driver = spawn("tauri-driver", ["--port", String(PORT)], {
-		stdio: "inherit",
+		stdio: ["ignore", "pipe", "pipe"],
 	});
-	await until(
-		"tauri-driver",
-		() => fetch(`${DRIVER}/status`).then((r) => r.ok),
-		10000,
-	);
-	sid = (
-		await wd("POST", "/session", {
-			capabilities: {
-				alwaysMatch: { "tauri:options": { application: app } },
-			},
-		})
-	).sessionId;
-	// tauri://localhost on Linux/macOS, http://tauri.localhost on Windows.
-	await until(
-		"app to render",
-		async () =>
-			/^(tauri:\/\/|https?:\/\/tauri\.localhost)/u.test(
-				await wd("GET", s("/url")),
-			) && (await present("repo-path")),
-		30000,
-	);
-	return async () => {
-		await wd("DELETE", `/session/${sid}`).catch(() => {});
+	const logOutput = (data) => {
+		appendFileSync(path.join(outDir, "driver.log"), data);
+		process.stderr.write(data);
+	};
+	driver.stdout.on("data", logOutput);
+	driver.stderr.on("data", logOutput);
+	let spawnError;
+	driver.on("error", (error) => {
+		spawnError = error;
+	});
+	const stop = async () => {
+		if (sid) await wd("DELETE", `/session/${sid}`).catch(() => {});
 		driver.kill();
 	};
+	try {
+		await until(
+			"tauri-driver",
+			async () => {
+				if (spawnError) throw spawnError;
+				return (
+					await fetch(`${DRIVER}/status`, {
+						signal: AbortSignal.timeout(2000),
+					})
+				).ok;
+			},
+			10000,
+		);
+		sid = (
+			await wd("POST", "/session", {
+				capabilities: {
+					alwaysMatch: { "tauri:options": { application: app } },
+				},
+			})
+		).sessionId;
+		// tauri://localhost on Linux/macOS, http://tauri.localhost on Windows.
+		await until(
+			"app to render",
+			async () =>
+				/^(tauri:\/\/|https?:\/\/tauri\.localhost)/u.test(
+					await wd("GET", s("/url")),
+				) && (await present("repo-path")),
+			30000,
+		);
+		return stop;
+	} catch (error) {
+		await stop();
+		throw error;
+	}
+}
+
+export async function runScenarios(scenarios, APP, OUT, ONLY) {
+	const results = [];
+	let stop;
+	try {
+		stop = await start(APP, OUT);
+		for (const [name, run] of Object.entries(scenarios)) {
+			if (ONLY.length > 0 && !ONLY.some((p) => name.startsWith(p)))
+				continue;
+			const failures = [];
+			let assertions = 0;
+			const check = (ok, what) => {
+				assertions++;
+				if (!ok) failures.push(what);
+			};
+			const t0 = Date.now();
+			try {
+				await js(`window.__e2eErrors = [];
+				window.onerror = (message) => { window.__e2eErrors.push(String(message)); };
+				window.onunhandledrejection = (event) => { window.__e2eErrors.push(String(event.reason)); };`);
+				await run(check);
+				check(assertions > 0, "scenario must assert its outcome");
+				const errors = await js("return window.__e2eErrors");
+				check(
+					errors.length === 0,
+					`no uncaught frontend errors: ${errors.join(" | ")}`,
+				);
+			} catch (error) {
+				failures.push(`error: ${error.message}`);
+			}
+			const ms = Date.now() - t0;
+			if (failures.length > 0) {
+				await shot(`${name}-failure`).catch(() => {});
+				await saveSource(`${name}-failure`).catch(() => {});
+			} else {
+				await shot(`${name}`).catch(() => {});
+			}
+			results.push({
+				name,
+				ok: failures.length === 0,
+				ms,
+				assertions,
+				failures,
+			});
+			console.log(
+				`${failures.length > 0 ? "FAIL" : "PASS"} ${name} (${ms} ms)`,
+			);
+			for (const f of failures) console.log(`     - ${f}`);
+		}
+	} catch (error) {
+		results.push({ name: "session", ok: false, failures: [error.stack] });
+		console.error(error);
+	} finally {
+		await stop?.();
+		writeFileSync(
+			path.join(OUT, "results.json"),
+			JSON.stringify(results, null, 2),
+		);
+	}
+
+	const failed = results.filter((r) => !r.ok);
+	console.log(
+		`\n${results.length - failed.length}/${results.length} scenarios passed; screenshots in ${OUT}`,
+	);
+	if (failed.length > 0 || results.length === 0) process.exit(1);
 }

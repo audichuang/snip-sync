@@ -185,6 +185,7 @@ pub fn run() {
 			set_tray_labels,
 			commands::copy,
 			commands::list_commits,
+			commands::browse_git,
 			commands::copy_commits,
 			commands::read_clipboard_plan,
 			commands::apply_restore,
