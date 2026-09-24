@@ -64,10 +64,10 @@ test("stats line and token thresholds match TS notifyCopied", async () => {
 	});
 	const warn = copyNote(t, "files", outcome({ tokens: 1_000_000 }));
 	assert.equal(warn.severity, "warning");
-	assert.match(warn.text, /~1,000,000 tokens\. Over 1,000,000 tokens\.$/);
+	assert.match(warn.text, /~1,000,000 tokens\. Over 1,000,000 tokens\.$/u);
 	const danger = copyNote(t, "files", outcome({ tokens: 2_500_000 }));
 	assert.equal(danger.severity, "danger");
-	assert.match(danger.text, / Over 2,000,000 tokens\.$/);
+	assert.match(danger.text, / Over 2,000,000 tokens\.$/u);
 });
 
 test("commit copy note reports not-copied files", async () => {

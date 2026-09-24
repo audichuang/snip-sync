@@ -164,7 +164,7 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
   DTO 必須與 Rust 型別同步;前端 typecheck / oxlint 零警告 / prettier / 測試 / build;
   Linux 與 Windows 跑真實 App 情境;每個 job 結束時 checkout 必須乾淨。
   `CI gate` 彙整全部 job,任何一個不是 success(含 skipped)就失敗。
-- **本機:** `just preflight` 跑一遍 CI 會跑的東西,push 或打 tag 前必跑。
+- **本機:** `just preflight` 跑一遍 CI 在 Linux 上會跑的全部東西(含前端與真實 App E2E),push 或打 tag 前必跑。
   它只能跑本機平台,碰到路徑 / 檔案系統的程式碼要在 Linux 上**模擬**其他平台的情況
   (例如透過 symlink 的暫存目錄模擬 macOS 的 `/var` → `/private/var`)。
 

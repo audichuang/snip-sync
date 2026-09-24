@@ -13,11 +13,17 @@ fmt:
 	cargo fmt --all
 
 # Mirrors CI's Rust checks (see .github/workflows/ci.yml for the rest).
-preflight:
+preflight: preflight-rust preflight-frontend desktop-e2e
+
+preflight-rust:
 	cargo fmt --all --check
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	RUSTFLAGS="-D warnings" cargo test --workspace --locked --no-fail-fast
+
+# Same frontend checks as CI's Frontend Lint and Format Check jobs.
+preflight-frontend:
+	cd crates/desktop && bun install --frozen-lockfile && bun run format:check && bun run typecheck && bun run lint:check -- --max-warnings 0 && bun run test && bun run build
 
 # Run the desktop app in dev mode.
 desktop:
@@ -35,6 +41,8 @@ desktop-e2e:
 bump version:
 	perl -pi -e 's/^version = .*/version = "{{version}}"/' Cargo.toml
 	perl -pi -e 's/"version": "[^"]*"/"version": "{{version}}"/' crates/desktop/package.json crates/desktop/src-tauri/tauri.conf.json
+	# Keep Cargo.lock in step, or every --locked build fails.
+	cargo update -w
 
 # Cut a release (green CI on HEAD -> tag -> watch release.yml -> verify assets); --yes skips the prompt.
 release version *flags:

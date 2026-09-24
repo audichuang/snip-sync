@@ -29,6 +29,8 @@
 | [docs/plan.md](docs/plan.md) | 實作規劃:架構、打包、測試、分階段計畫 |
 | [docs/porting-notes.md](docs/porting-notes.md) | 從 TS 移植到 Rust 的技術細節與已知陷阱 |
 
+各模組的規範寫在模組自己的 README:[core](crates/core/README.md) · [cli](crates/cli/README.md) · [desktop](crates/desktop/README.md)。
+
 ## 已定案的範圍(2026-09-23)
 
 - 兩種模式:**檔案模式**(與 IDE 套件同格式、覆蓋還原)與 **commit 模式**

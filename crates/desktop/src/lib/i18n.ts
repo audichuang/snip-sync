@@ -1,12 +1,15 @@
-import i18n from "i18next";
+import i18n, { changeLanguage, init } from "i18next";
 import en from "./locales/en.ts";
 import zhHant from "./locales/zh-Hant.ts";
 
 export type MessageKey = keyof typeof en;
+// A tuple union, not `params?`: under exactOptionalPropertyTypes an optional
+// tuple element admits `undefined`, which i18next's `t` overloads reject.
 /** The slice of i18next's `t` the pure helpers need. */
 export type Translate = (
-	key: MessageKey,
-	params?: Record<string, unknown>,
+	...args:
+		| [key: MessageKey]
+		| [key: MessageKey, params: Record<string, unknown>]
 ) => string;
 
 export const resources = {
@@ -41,12 +44,12 @@ export function setLanguage(lng: Language): void {
 	} catch {
 		// Remembering the choice is a convenience only.
 	}
-	void i18n.changeLanguage(lng);
+	void changeLanguage(lng);
 }
 
 /** Initialises the shared instance for the webview. */
 export function initI18n() {
-	return i18n.init({
+	return init({
 		resources,
 		lng: pickLanguage(storedLanguage(), navigator.language),
 		fallbackLng: "en",
