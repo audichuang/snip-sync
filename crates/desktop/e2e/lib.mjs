@@ -5,6 +5,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import {
 	existsSync,
+	appendFileSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -107,10 +108,13 @@ async function wd(method, url, body) {
 	const init = {
 		method,
 		headers: { "content-type": "application/json" },
-		signal: AbortSignal.timeout(30000),
+		// WebView cold startup is slower than an interaction on hosted runners.
+		signal: AbortSignal.timeout(url === "/session" ? 120000 : 30000),
 	};
 	if (body !== undefined) init.body = JSON.stringify(body);
-	const res = await fetch(DRIVER + url, init);
+	const res = await fetch(DRIVER + url, init).catch((error) => {
+		throw new Error(`${method} ${url}: ${error.message}`, { cause: error });
+	});
 	const json = await res.json();
 	if (!res.ok)
 		throw new Error(`${method} ${url}: ${JSON.stringify(json.value)}`);
@@ -345,39 +349,63 @@ export async function copyGitSource(repo, source, { sha, base, tip } = {}) {
 export async function start(app, outDir) {
 	out = outDir;
 	const driver = spawn("tauri-driver", ["--port", String(PORT)], {
-		stdio: "inherit",
+		stdio: ["ignore", "pipe", "pipe"],
 	});
-	await until(
-		"tauri-driver",
-		() => fetch(`${DRIVER}/status`).then((r) => r.ok),
-		10000,
-	);
-	sid = (
-		await wd("POST", "/session", {
-			capabilities: {
-				alwaysMatch: { "tauri:options": { application: app } },
-			},
-		})
-	).sessionId;
-	// tauri://localhost on Linux/macOS, http://tauri.localhost on Windows.
-	await until(
-		"app to render",
-		async () =>
-			/^(tauri:\/\/|https?:\/\/tauri\.localhost)/u.test(
-				await wd("GET", s("/url")),
-			) && (await present("repo-path")),
-		30000,
-	);
-	return async () => {
-		await wd("DELETE", `/session/${sid}`).catch(() => {});
+	const logOutput = (data) => {
+		appendFileSync(path.join(outDir, "driver.log"), data);
+		process.stderr.write(data);
+	};
+	driver.stdout.on("data", logOutput);
+	driver.stderr.on("data", logOutput);
+	let spawnError;
+	driver.on("error", (error) => {
+		spawnError = error;
+	});
+	const stop = async () => {
+		if (sid) await wd("DELETE", `/session/${sid}`).catch(() => {});
 		driver.kill();
 	};
+	try {
+		await until(
+			"tauri-driver",
+			async () => {
+				if (spawnError) throw spawnError;
+				return (
+					await fetch(`${DRIVER}/status`, {
+						signal: AbortSignal.timeout(2000),
+					})
+				).ok;
+			},
+			10000,
+		);
+		sid = (
+			await wd("POST", "/session", {
+				capabilities: {
+					alwaysMatch: { "tauri:options": { application: app } },
+				},
+			})
+		).sessionId;
+		// tauri://localhost on Linux/macOS, http://tauri.localhost on Windows.
+		await until(
+			"app to render",
+			async () =>
+				/^(tauri:\/\/|https?:\/\/tauri\.localhost)/u.test(
+					await wd("GET", s("/url")),
+				) && (await present("repo-path")),
+			30000,
+		);
+		return stop;
+	} catch (error) {
+		await stop();
+		throw error;
+	}
 }
 
 export async function runScenarios(scenarios, APP, OUT, ONLY) {
 	const results = [];
-	const stop = await start(APP, OUT);
+	let stop;
 	try {
+		stop = await start(APP, OUT);
 		for (const [name, run] of Object.entries(scenarios)) {
 			if (ONLY.length > 0 && !ONLY.some((p) => name.startsWith(p)))
 				continue;
@@ -421,8 +449,11 @@ export async function runScenarios(scenarios, APP, OUT, ONLY) {
 			);
 			for (const f of failures) console.log(`     - ${f}`);
 		}
+	} catch (error) {
+		results.push({ name: "session", ok: false, failures: [error.stack] });
+		console.error(error);
 	} finally {
-		await stop();
+		await stop?.();
 		writeFileSync(
 			path.join(OUT, "results.json"),
 			JSON.stringify(results, null, 2),
