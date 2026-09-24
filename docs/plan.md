@@ -155,7 +155,7 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
 | 3 跨工具 | 同一 repo 與設定下,Rust 產生的 payload 等於 TS 產生的;Rust 能還原 TS 與 Kotlin 產生的 payload,反之亦然 | ✅ |
 | 4 真實剪貼簿 | 寫入系統剪貼簿再讀回:Unicode、大 payload、換行 | ✅ Windows / macOS runner 有桌面;Linux 用 xvfb |
 | 5 前端 | 比照 aghub:`node --test` 跑 `src/**/*.test.ts`(純邏輯與 source-scan 守衛);`typecheck`、oxlint、prettier | ✅ |
-| 6 操作真實 App | `crates/desktop/e2e/scenarios.mjs`:`tauri-driver`(WebDriver)操作真的 App,16 個情境(commit 模式與檔案模式)各建新的 git repo,完成後以 git 驗證。Windows 走 msedgedriver(`windows-2022`)、Linux 走 WebKitWebDriver | ✅ Windows / Linux |
+| 6 操作真實 App | `crates/desktop/e2e/scenarios.mjs`:`tauri-driver`(WebDriver)操作真的 App,19 個情境(commit 模式、檔案模式、Git 瀏覽器與 monorepo 選取)各建新的 git repo,完成後以 git 驗證。Windows 走 msedgedriver(`windows-2022`)、Linux 走 WebKitWebDriver | ✅ Windows / Linux |
 | | macOS 的 WKWebView 沒有 WebDriver | ❌ 手動 |
 | | 系統匣選單本身 | ❌ 各平台都難以自動化 |
 
@@ -164,6 +164,7 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
   DTO 必須與 Rust 型別同步;前端 typecheck / oxlint 零警告 / prettier / 測試 / build;
   Linux 與 Windows 跑真實 App 情境;每個 job 結束時 checkout 必須乾淨。
   `CI gate` 彙整全部 job,任何一個不是 success(含 skipped)就失敗。
+- **E2E 驗收:** 歷史必須自動載入;以原生 Shift+click 選取並比對完整 commit 集合。貼上等待自己的預覽／錯誤,不把背景 toast 當結果。檢查精確路徑、勾選集合、來源切換、重新整理與 commit 快照;每個情境必須有斷言,未捕捉的前端錯誤會使測試失敗。CI 與 preflight 禁止以 `SNIP_E2E_ONLY` 略過情境。
 - **本機:** `just preflight` 跑一遍 CI 在 Linux 上會跑的全部東西(含前端與真實 App E2E),push 或打 tag 前必跑。
   它只能跑本機平台,碰到路徑 / 檔案系統的程式碼要在 Linux 上**模擬**其他平台的情況
   (例如透過 symlink 的暫存目錄模擬 macOS 的 `/var` → `/private/var`)。

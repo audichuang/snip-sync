@@ -3564,7 +3564,7 @@ checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 
 [[package]]
 name = "snip-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "serde",
@@ -3575,7 +3575,7 @@ dependencies = [
 
 [[package]]
 name = "snip-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "arboard",
  "dunce",
@@ -3591,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "snip-sync"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "dunce",
  "log",

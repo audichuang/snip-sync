@@ -369,6 +369,9 @@ pub async fn list_commits(
 		let out = git
 			.run(&[
 				"log",
+				// An unborn HEAD has an empty history. Other git errors still propagate.
+				"--ignore-missing",
+				"HEAD",
 				"-n",
 				&n,
 				"--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x1e",

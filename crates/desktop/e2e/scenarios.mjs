@@ -7,9 +7,9 @@
 //   node e2e/scenarios.mjs                        # Windows (msedgedriver on PATH)
 //
 // SNIP_APP overrides the app binary, SNIP_E2E_OUT the screenshot directory,
-// SNIP_E2E_ONLY=C3,F1 runs a subset (name prefixes).
+// SNIP_E2E_ONLY=C03,F01 runs a subset (name prefixes).
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as e from "./lib.mjs";
@@ -25,6 +25,28 @@ const OUT =
 	mkdtempSync(path.join(tmpdir(), "snip-e2e-shots-"));
 const ONLY = (process.env.SNIP_E2E_ONLY ?? "").split(",").filter(Boolean);
 
+if (ONLY.length > 0 && (process.env.CI || process.env.SNIP_REQUIRE_ALL_TESTS)) {
+	throw new Error(
+		"CI/preflight must run every scenario; unset SNIP_E2E_ONLY",
+	);
+}
+
+const browserPaths = () =>
+	e.js(
+		"return [...document.querySelectorAll('[data-testid^=git-change-]')].map(e => e.dataset.testid.slice('git-change-'.length)).sort()",
+	);
+const checkedPaths = () =>
+	e.js(
+		"return [...document.querySelectorAll('[data-testid^=git-change-]:checked')].map(e => e.dataset.testid.slice('git-change-'.length)).sort()",
+	);
+const waitPaths = (paths) =>
+	e.until(
+		"exact Git paths",
+		async () =>
+			JSON.stringify(await browserPaths()) ===
+			JSON.stringify(paths.toSorted()),
+	);
+
 const tree = (repo) => git(repo, "ls-tree", "-r", "HEAD");
 const noLogo = (repo) =>
 	tree(repo)
@@ -35,6 +57,36 @@ const log = (repo, n) => git(repo, "log", `-${n}`, "--format=%s|%an <%ae>|%aI");
 const count = (repo, range) => git(repo, "rev-list", "--count", range);
 
 const scenarios = {
+	async H01_empty_history_then_switch_repo(check) {
+		const empty = newRepo("empty-history");
+		await e.setRepo(empty);
+		await e.openTab("commits");
+		await e.until("empty history state", async () =>
+			/No commits loaded\.|沒有載入任何 commit。/u.test(
+				await e.bodyText(),
+			),
+		);
+		check(
+			!(await e.toastText()).includes("git log"),
+			"empty repo is not a history error",
+		);
+		check(
+			(await e.attr("copy-commits", "disabled")) !== null,
+			"empty history cannot be copied",
+		);
+		const populated = newRepo("populated-history");
+		write(populated, "a.txt", "a\n");
+		const sha = commit(populated, "first commit");
+		await e.setRepo(populated);
+		await e.find(`[data-commit="${sha}"]`);
+		check(
+			(await e.js(
+				"return document.querySelectorAll('[data-commit]').length",
+			)) === 1,
+			"switch loads exactly the new repo history automatically",
+		);
+	},
+
 	// The monorepo sync from the original smoke test: add, rename, delete and
 	// a binary that must be reported as not copied.
 	async S00_monorepo_three_commits(check) {
@@ -283,7 +335,7 @@ const scenarios = {
 		await e.copyCommits(a, c1, c1);
 		const kind = await e.previewPaste(plain);
 		check(
-			kind.startsWith("toast:") &&
+			kind.startsWith("error:") &&
 				kind.includes("is not inside a git repository"),
 			`clear error: ${kind}`,
 		);
@@ -438,14 +490,22 @@ const scenarios = {
 		await e.setRepo(path.join(a, "packages", "api"));
 		await e.openTab("files");
 		await e.clickId("source-working");
-		await e.until("monorepo Git changes", () =>
-			e.present("git-change-packages/api/b.ts"),
+		await waitPaths(["packages/api/a.ts", "packages/api/b.ts"]);
+		check(
+			JSON.stringify(await checkedPaths()) ===
+				JSON.stringify(await browserPaths()),
+			"all scoped changes selected initially",
 		);
 		check(
 			!(await e.present("git-change-packages/web/c.ts")),
 			"browser stays in selected package",
 		);
 		await e.clickId("git-change-packages/api/b.ts");
+		check(
+			JSON.stringify(await checkedPaths()) ===
+				JSON.stringify(["packages/api/a.ts"]),
+			"only requested path selected",
+		);
 		await e.withToast(() => e.clickId("copy-files"));
 		check(
 			(await e.restoreFiles(path.join(b, "packages", "api"))) === "ok",
@@ -461,46 +521,74 @@ const scenarios = {
 			"other package stayed old",
 		);
 	},
+	async F07_sources_refresh_and_recent_commit(check) {
+		const a = newRepo("多語 monorepo");
+		write(a, "packages/api/a.ts", "base\n");
+		write(a, "packages/web/b.ts", "base\n");
+		const base = commit(a, "base");
+		write(a, "packages/api/a.ts", "committed snapshot\n");
+		const sha = commit(a, "api snapshot");
+		write(a, "packages/api/a.ts", "staged snapshot\n");
+		git(a, "add", ".");
+		write(a, "packages/api/a.ts", "working snapshot\n");
+		write(a, "packages/web/b.ts", "working only\n");
+		const b = clone(a, base);
+		await e.setRepo(a);
+		await e.openTab("files");
+		await waitPaths(["packages/api/a.ts", "packages/web/b.ts"]);
+		await e.clickId("clear-changes");
+		check((await checkedPaths()).length === 0, "clear unchecks every path");
+		check(
+			(await e.attr("copy-files", "disabled")) !== null,
+			"empty selection cannot copy",
+		);
+		await e.clickId("select-all-changes");
+		check(
+			(await checkedPaths()).length === 2,
+			"select all restores both paths",
+		);
+		await e.clickId("source-staged");
+		await waitPaths(["packages/api/a.ts"]);
+		check(
+			(await checkedPaths()).length === 1,
+			"source switch resets selection",
+		);
+		await e.clickId("source-working");
+		await waitPaths(["packages/api/a.ts", "packages/web/b.ts"]);
+		write(a, "new file.txt", "fresh\n");
+		await e.clickId("refresh-changes");
+		await waitPaths([
+			"new file.txt",
+			"packages/api/a.ts",
+			"packages/web/b.ts",
+		]);
+		check(
+			(await checkedPaths()).length === 3,
+			"refresh includes newly created file",
+		);
+		await e.clickId(`history-row-${sha}`);
+		await waitPaths(["packages/api/a.ts"]);
+		check(
+			(await e.js(
+				'return document.querySelector("[data-testid=commit-sha]").value',
+			)) === sha,
+			"history row selects exact commit",
+		);
+		await e.withToast(() => e.clickId("copy-files"));
+		check(
+			(await e.restoreFiles(b)) === "ok",
+			"selected history snapshot restores",
+		);
+		check(
+			read(b, "packages/api/a.ts") === "committed snapshot",
+			"copied commit content, not index or working content",
+		);
+		check(
+			readLf(b, "packages/web/b.ts") === "base\n" &&
+				!exists(b, "new file.txt"),
+			"unselected files remain untouched",
+		);
+	},
 };
 
-const results = [];
-const stop = await e.start(APP, OUT);
-try {
-	for (const [name, run] of Object.entries(scenarios)) {
-		if (ONLY.length > 0 && !ONLY.some((p) => name.startsWith(p))) continue;
-		const failures = [];
-		const check = (ok, what) => {
-			if (!ok) failures.push(what);
-		};
-		const t0 = Date.now();
-		try {
-			await run(check);
-		} catch (error) {
-			failures.push(`error: ${error.message}`);
-		}
-		const ms = Date.now() - t0;
-		if (failures.length > 0) {
-			await e.shot(`${name}-failure`).catch(() => {});
-			await e.saveSource(`${name}-failure`).catch(() => {});
-		} else {
-			await e.shot(`${name}`).catch(() => {});
-		}
-		results.push({ name, ok: failures.length === 0, ms, failures });
-		console.log(
-			`${failures.length > 0 ? "FAIL" : "PASS"} ${name} (${ms} ms)`,
-		);
-		for (const f of failures) console.log(`     - ${f}`);
-	}
-} finally {
-	await stop();
-	writeFileSync(
-		path.join(OUT, "results.json"),
-		JSON.stringify(results, null, 2),
-	);
-}
-
-const failed = results.filter((r) => !r.ok);
-console.log(
-	`\n${results.length - failed.length}/${results.length} scenarios passed; screenshots in ${OUT}`,
-);
-if (failed.length > 0 || results.length === 0) process.exit(1);
+await e.runScenarios(scenarios, APP, OUT, ONLY);

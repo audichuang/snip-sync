@@ -232,6 +232,8 @@ jobs:
     # (plan.md section 5).
     desktop-e2e:
         name: Desktop E2E (${{ matrix.os }})
+        env:
+            SNIP_REQUIRE_ALL_TESTS: "1"
         runs-on: ${{ matrix.os }}
         timeout-minutes: 60
         strategy:

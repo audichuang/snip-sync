@@ -104,7 +104,11 @@ export function clone(src, at, name = "clone") {
 // ---- WebDriver ----
 
 async function wd(method, url, body) {
-	const init = { method, headers: { "content-type": "application/json" } };
+	const init = {
+		method,
+		headers: { "content-type": "application/json" },
+		signal: AbortSignal.timeout(30000),
+	};
 	if (body !== undefined) init.body = JSON.stringify(body);
 	const res = await fetch(DRIVER + url, init);
 	const json = await res.json();
@@ -250,23 +254,39 @@ export async function withToast(action) {
 export async function copyCommits(repo, newest, oldest) {
 	await setRepo(repo);
 	await openTab("commits");
-	// A press that lands while the panel is still mounting is dropped.
-	await until("timeline rows", async () => {
-		if (
-			await js(
-				"return document.querySelectorAll('[data-commit]').length > 0",
-			)
-		)
-			return true;
-		await clickId("load-history");
-		return false;
+	// Auto-loading is part of the feature: never mask it by pressing reload.
+	await find(`[data-commit="${newest}"]`);
+	await click(`[data-commit="${newest}"] span`);
+	await wd("POST", s("/actions"), {
+		actions: [
+			{
+				type: "key",
+				id: "keyboard",
+				actions: [{ type: "keyDown", value: "\uE008" }],
+			},
+		],
 	});
-	await click(`[data-commit="${newest}"]`);
-	// Shift+click as a real bubbling event; the timeline reads e.shiftKey.
-	await js(
-		"arguments[0].dispatchEvent(new MouseEvent('click', { bubbles: true, shiftKey: true }))",
-		{ [ELEMENT]: await find(`[data-commit="${oldest}"]`) },
+	try {
+		// Click the SHA at the left: bottom-right toast overlays can cover the row center.
+		await click(`[data-commit="${oldest}"] span`);
+	} finally {
+		await wd("DELETE", s("/actions"));
+	}
+	const chain = git(repo, "rev-list", "--first-parent", newest).split("\n");
+	const end = chain.indexOf(oldest);
+	const expected = (
+		end >= 0 ? chain.slice(0, end + 1) : [newest, oldest]
+	).toSorted();
+	await until(
+		"exact selected commit range",
+		async () =>
+			JSON.stringify(
+				await js(
+					"return [...document.querySelectorAll('[data-commit][data-selected=true]')].map(e => e.dataset.commit).sort()",
+				),
+			) === JSON.stringify(expected),
 	);
+
 	return withToast(() => clickId("copy-commits"));
 }
 
@@ -274,13 +294,13 @@ export async function copyCommits(repo, newest, oldest) {
 export async function previewPaste(repo) {
 	await setRepo(repo);
 	await openTab("paste");
-	const before = await toastList();
 	await clickId("preview-clipboard");
 	return until("a preview", async () => {
 		if (await present("replay-commits")) return "commits";
 		if (await present("apply-restore")) return "files";
-		const fresh = await newToasts(before);
-		return fresh.length > 0 ? `toast:${fresh.join(" | ")}` : false;
+		if (await present("paste-error"))
+			return `error:${await js('return document.querySelector("[data-testid=paste-error]").innerText')}`;
+		return false;
 	});
 }
 
@@ -314,6 +334,9 @@ export async function copyGitSource(repo, source, { sha, base, tip } = {}) {
 	if (sha) await setInput(q("commit-sha"), sha);
 	if (base) await setInput(q("range-base"), base);
 	if (tip) await setInput(q("range-tip"), tip);
+	await until("Git source to load", () =>
+		attr("git-browser", "data-loading").then((v) => v === "false"),
+	);
 	return withToast(() => clickId("copy-files"));
 }
 
@@ -349,4 +372,66 @@ export async function start(app, outDir) {
 		await wd("DELETE", `/session/${sid}`).catch(() => {});
 		driver.kill();
 	};
+}
+
+export async function runScenarios(scenarios, APP, OUT, ONLY) {
+	const results = [];
+	const stop = await start(APP, OUT);
+	try {
+		for (const [name, run] of Object.entries(scenarios)) {
+			if (ONLY.length > 0 && !ONLY.some((p) => name.startsWith(p)))
+				continue;
+			const failures = [];
+			let assertions = 0;
+			const check = (ok, what) => {
+				assertions++;
+				if (!ok) failures.push(what);
+			};
+			const t0 = Date.now();
+			try {
+				await js(`window.__e2eErrors = [];
+				window.onerror = (message) => { window.__e2eErrors.push(String(message)); };
+				window.onunhandledrejection = (event) => { window.__e2eErrors.push(String(event.reason)); };`);
+				await run(check);
+				check(assertions > 0, "scenario must assert its outcome");
+				const errors = await js("return window.__e2eErrors");
+				check(
+					errors.length === 0,
+					`no uncaught frontend errors: ${errors.join(" | ")}`,
+				);
+			} catch (error) {
+				failures.push(`error: ${error.message}`);
+			}
+			const ms = Date.now() - t0;
+			if (failures.length > 0) {
+				await shot(`${name}-failure`).catch(() => {});
+				await saveSource(`${name}-failure`).catch(() => {});
+			} else {
+				await shot(`${name}`).catch(() => {});
+			}
+			results.push({
+				name,
+				ok: failures.length === 0,
+				ms,
+				assertions,
+				failures,
+			});
+			console.log(
+				`${failures.length > 0 ? "FAIL" : "PASS"} ${name} (${ms} ms)`,
+			);
+			for (const f of failures) console.log(`     - ${f}`);
+		}
+	} finally {
+		await stop();
+		writeFileSync(
+			path.join(OUT, "results.json"),
+			JSON.stringify(results, null, 2),
+		);
+	}
+
+	const failed = results.filter((r) => !r.ok);
+	console.log(
+		`\n${results.length - failed.length}/${results.length} scenarios passed; screenshots in ${OUT}`,
+	);
+	if (failed.length > 0 || results.length === 0) process.exit(1);
 }

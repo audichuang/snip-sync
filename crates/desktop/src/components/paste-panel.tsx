@@ -28,6 +28,7 @@ import { DiffBody, DiffButton, useDiff } from "./diff-view";
 
 type PasteState =
 	| { step: "idle" }
+	| { step: "error"; message: string }
 	| {
 			step: "files";
 			plan: RestorePlan;
@@ -52,7 +53,9 @@ export function usePaste(repo: string) {
 		try {
 			return await work();
 		} catch (error: unknown) {
-			toast.danger(errorText(t, error));
+			const message = errorText(t, error);
+			setState({ step: "error", message });
+			toast.danger(message);
 			return undefined;
 		} finally {
 			setBusy(false);
@@ -62,16 +65,14 @@ export function usePaste(repo: string) {
 	async function preview(restoreBase?: RestoreBase) {
 		const roots = repo ? [repo] : [];
 		setSeq((n) => n + 1);
+		setState({ step: "idle" });
 		const plan = await run(() =>
 			invoke<ClipboardPlan>("read_clipboard_plan", {
 				roots,
 				restoreBase: restoreBase ?? null,
 			}),
 		);
-		if (!plan) {
-			setState({ step: "idle" });
-			return;
-		}
+		if (!plan) return;
 		if (plan.mode === "commits") {
 			setState({ step: "commits", plan: plan.plan });
 			return;
@@ -141,6 +142,15 @@ export function PastePanel({ paste }: { paste: Paste }) {
 					{busy ? <Spinner size="sm" /> : t("previewClipboard")}
 				</Button>
 			</div>
+			{state.step === "error" && (
+				<p
+					data-testid="paste-error"
+					role="alert"
+					className="text-sm text-danger"
+				>
+					{state.message}
+				</p>
+			)}
 			{state.step === "files" && (
 				<FilesPreview
 					key={paste.seq}

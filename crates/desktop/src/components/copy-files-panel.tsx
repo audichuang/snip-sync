@@ -113,11 +113,13 @@ export function CopyFilesPanel({
 	function changeSource(next: SourceKind) {
 		setKind(next);
 		setBrowse(null);
+		setBrowseError("");
 		setSelectedPaths(null);
 	}
 	function changeRevision(setter: (value: string) => void, value: string) {
 		setter(value);
 		setBrowse(null);
+		setBrowseError("");
 		setSelectedPaths(null);
 	}
 
@@ -267,7 +269,11 @@ export function CopyFilesPanel({
 			)}
 
 			{kind !== "files" && (
-				<section className="flex min-h-0 flex-col gap-2 rounded border border-border p-3">
+				<section
+					data-testid="git-browser"
+					data-loading={!browse && !browseError}
+					className="flex min-h-0 flex-col gap-2 rounded border border-border p-3"
+				>
 					<div className="flex flex-wrap items-center gap-2 text-sm">
 						<strong>
 							{browse
@@ -291,6 +297,8 @@ export function CopyFilesPanel({
 							data-testid="refresh-changes"
 							onPress={() => {
 								setSelectedPaths(null);
+								setBrowse(null);
+								setBrowseError("");
 								setRefresh((n) => n + 1);
 							}}
 						>
@@ -305,12 +313,14 @@ export function CopyFilesPanel({
 							<div className="flex gap-3 text-xs">
 								<button
 									type="button"
+									data-testid="select-all-changes"
 									onClick={() => setSelectedPaths(null)}
 								>
 									{t("selectAll")}
 								</button>
 								<button
 									type="button"
+									data-testid="clear-changes"
 									onClick={() => setSelectedPaths(new Set())}
 								>
 									{t("clearSelection")}
@@ -436,7 +446,13 @@ export function CopyFilesPanel({
 			)}
 
 			<div>
-				<Button data-testid="copy-files" onPress={handleCopy}>
+				<Button
+					data-testid="copy-files"
+					isDisabled={
+						kind !== "files" && (!browse || selectedCount === 0)
+					}
+					onPress={handleCopy}
+				>
 					{t("copy")}
 				</Button>
 			</div>
