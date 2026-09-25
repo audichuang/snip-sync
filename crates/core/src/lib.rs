@@ -8,6 +8,7 @@ pub mod filter;
 pub mod format;
 pub mod fsutil;
 pub mod gitsrc;
+pub mod graph;
 pub mod paths;
 pub mod restore;
 pub mod settings;
