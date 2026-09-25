@@ -13,6 +13,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as e from "./lib.mjs";
+import { ideScenarios } from "./workspace-scenarios.mjs";
 
 const { git, write, read, readLf, exists, commit, newRepo, newFolder, clone } =
 	e;
@@ -57,6 +58,7 @@ const log = (repo, n) => git(repo, "log", `-${n}`, "--format=%s|%an <%ae>|%aI");
 const count = (repo, range) => git(repo, "rev-list", "--count", range);
 
 const scenarios = {
+	...ideScenarios,
 	async H01_empty_history_then_switch_repo(check) {
 		const empty = newRepo("empty-history");
 		await e.setRepo(empty);
@@ -535,6 +537,7 @@ const scenarios = {
 		const b = clone(a, base);
 		await e.setRepo(a);
 		await e.openTab("files");
+		await e.clickId("source-working");
 		await waitPaths(["packages/api/a.ts", "packages/web/b.ts"]);
 		await e.clickId("clear-changes");
 		check((await checkedPaths()).length === 0, "clear unchecks every path");

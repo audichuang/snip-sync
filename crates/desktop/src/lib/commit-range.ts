@@ -55,7 +55,7 @@ export type RangeRequest =
 
 /**
  * `base..tip` with base = the older end's first parent. A range reaching the
- * root commit has no base; it is expressible only as "last n" from HEAD.
+ * root commit has no base; select an explicit number from the chosen tip.
  */
 export function toCommitSelection(
 	commits: CommitSummary[],
@@ -83,9 +83,8 @@ export function toCommitSelection(
 	if (base !== undefined) {
 		return { ok: true, selection: { kind: "range", base, tip: tip.sha } };
 	}
-	// `list_commits` starts at HEAD, so index 0 is HEAD.
-	if (tipIndex === 0) {
-		return { ok: true, selection: { kind: "last", n: chain.length } };
-	}
-	return { ok: false, reason: "rootRangeUnsupported" };
+	return {
+		ok: true,
+		selection: { kind: "from", tip: tip.sha, n: chain.length },
+	};
 }

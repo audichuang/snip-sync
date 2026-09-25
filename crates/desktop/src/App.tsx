@@ -186,7 +186,10 @@ export default function App() {
 						</Tabs.Tab>
 					</Tabs.List>
 				</Tabs.ListContainer>
-				<Tabs.Panel id="files" className="pt-3">
+				<Tabs.Panel
+					id="files"
+					className="flex min-h-0 flex-1 flex-col pt-3"
+				>
 					<CopyFilesPanel
 						key={repo}
 						repo={repo}

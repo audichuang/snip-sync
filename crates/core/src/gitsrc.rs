@@ -460,20 +460,19 @@ pub fn list_changed_paths(
 	git: &Git,
 	source: &GitSource,
 ) -> Result<Vec<(String, Option<ChangeType>)>, GitError> {
-	Ok(collect_raw(git, source)?
+	Ok(collect_changes(git, source)?
 		.0
 		.into_iter()
-		.map(|f| (f.path, f.change_type))
+		.map(|c| (c.path, Some(change_type_for_status(c.status))))
 		.collect())
 }
 
-/// The files of `source` in order, an unreadable one kept with `content:
-/// None` so callers can filter before counting it; plus the number of
+/// Ordered change metadata without reading file contents, plus the number of
 /// entries dropped for a non-UTF-8 path name.
-fn collect_raw(
+fn collect_changes(
 	git: &Git,
 	source: &GitSource,
-) -> Result<(Vec<PayloadFile>, usize), GitError> {
+) -> Result<(Vec<Change>, usize), GitError> {
 	let mut skipped = 0;
 	let mut changes = Vec::new();
 	match source {
@@ -554,6 +553,37 @@ fn collect_raw(
 		}
 	}
 
+	Ok((changes, skipped))
+}
+
+fn collect_raw(
+	git: &Git,
+	source: &GitSource,
+) -> Result<(Vec<PayloadFile>, usize), GitError> {
+	let (changes, skipped) = collect_changes(git, source)?;
+	Ok((read_changes(git, source, changes)?, skipped))
+}
+
+/// Read only the clicked path; listing a large repository never reads blobs.
+pub fn read_changed_file(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+) -> Result<Option<PayloadFile>, GitError> {
+	let (changes, _) = collect_changes(git, source)?;
+	Ok(read_changes(
+		git,
+		source,
+		changes.into_iter().filter(|c| c.path == path).collect(),
+	)?
+	.pop())
+}
+
+fn read_changes(
+	git: &Git,
+	source: &GitSource,
+	changes: Vec<Change>,
+) -> Result<Vec<PayloadFile>, GitError> {
 	let mut cat = git.cat_file()?;
 	let mut files = Vec::new();
 	for c in changes {
@@ -584,7 +614,7 @@ fn collect_raw(
 			skipped_reason: None,
 		});
 	}
-	Ok((files, skipped))
+	Ok(files)
 }
 
 /// TS `normalizeFsPath`: a comparison key only, case-folded on Windows.

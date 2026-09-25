@@ -1,6 +1,23 @@
 // English strings. Messages marked "TS" are verbatim from the VS Code
 // extension (extension.ts / notify.ts) and must stay byte-identical.
 export default {
+	projectFiles: "Project",
+	sourcePreview: "Preview",
+	choosePreview: "Select a file to preview its content before copying.",
+	fileContent: "Content",
+	loadingPreview: "Loading preview…",
+	binaryPreview:
+		"Binary or non-UTF-8 content cannot be previewed or copied as text.",
+	emptyDirectory: "Empty directory",
+	branchesAndTags: "Branches & tags",
+	allBranches: "All branches",
+	localBranches: "Local branches",
+	remoteBranches: "Remote branches",
+	tags: "Tags",
+	searchHistory: "Search commit message or SHA",
+	loadedCommits: "{{count}} commits loaded",
+	loadMoreHistory: "Load older commits",
+
 	appTitle: "snip-sync",
 	language: "中文",
 	chooseRepo: "Choose repo / folder",

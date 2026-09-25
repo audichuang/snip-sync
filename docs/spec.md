@@ -73,6 +73,8 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 ### 4.1 選擇 commit
 
 - GUI:在**歷史時間軸**(commit graph)上選一段:點起點,Shift + 點終點。
+- 顯示本機所有分支、遠端追蹤分支、標籤與 HEAD 的拓撲圖;可依 ref 篩選、搜尋 message / SHA,每頁 300 筆並能繼續載入。瀏覽不切換分支、不自動 fetch。
+- 點 commit 顯示它的檔案樹、內容與 diff;包含 root 的選取固定從所選 tip 回溯,也支援尚未合併的其他分支。
 - CLI:`snip copy --commits -n <N>`(從 HEAD 往回 N 個)、`snip copy --commits <a>..<b>`。
 - **必須連續**:選取的 commit 必須能從起點沿著 **first parent** 一路走到終點。
   不連續就在複製時拒絕,並說明哪裡斷開。
@@ -127,7 +129,7 @@ snip-sync 自訂,只要求 snip ↔ snip 互通:
 - **常駐系統匣**。選單:從剪貼簿貼上、複製上一次的選取、開啟主視窗、結束。
 - **主視窗**(同一個視窗,可從系統匣的小尺寸展開):
   - 選 repo / 資料夾。
-  - 檔案模式:選來源(檔案、working tree、staged、commit、區間);Git 來源顯示分支、變更檔案與最近 commit,可逐檔選取再複製。選 monorepo 子資料夾時只列出並複製該資料夾內的變更。
+  - 檔案模式:預設顯示可展開與勾選的專案檔案樹,逐層載入目錄,點檔案在右側預覽內容。選來源(檔案、working tree、staged、commit、區間);Git 來源顯示真正的目錄階層、變更狀態與 diff,可逐檔或整個資料夾選取再複製。選 monorepo 子資料夾時只列出並複製該資料夾內的變更。一般文字預覽上限 1 MiB,二進位不顯示文字內容。
   - commit 模式:歷史時間軸,選一段連續 commit → 複製。
   - 貼上:預覽(3.2 / 4.3)→ 確認 → 結果。
 - 複製與貼上的通知內容見 3.1、4.2。

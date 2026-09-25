@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
+use snip_core::browser::{
+	self, CommitSummary, DirectoryEntry, RepositoryHistory, SourcePreview,
+};
 use snip_core::commits::{
 	self, CommitCopySummary, CommitReplayPlan, CommitsPayload, ReplayResult,
 };
@@ -108,9 +111,18 @@ pub struct GitBrowse {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CommitSelection {
 	/// The last `n` commits on HEAD's first-parent chain.
-	Last { n: usize },
+	Last {
+		n: usize,
+	},
+	From {
+		tip: String,
+		n: usize,
+	},
 	/// `base..tip`, base excluded.
-	Range { base: String, tip: String },
+	Range {
+		base: String,
+		tip: String,
+	},
 }
 
 /// Copy notification numbers (spec 3.1).
@@ -157,17 +169,6 @@ pub enum DiffTarget {
 	Restore { index: usize },
 	/// A file of the pending commit payload.
 	Commit { commit: usize, file: usize },
-}
-
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct CommitSummary {
-	pub sha: String,
-	pub parents: Vec<String>,
-	pub author_name: String,
-	pub author_email: String,
-	pub author_date: String,
-	pub subject: String,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -296,6 +297,9 @@ fn copy_commit_range(
 	let git = Git::open(repo).map_err(|e| e.to_string())?;
 	let shas = match selection {
 		CommitSelection::Last { n } => commits::select_last(&git, *n),
+		CommitSelection::From { tip, n } => {
+			commits::select_last_from(&git, tip, *n)
+		}
 		CommitSelection::Range { base, tip } => {
 			commits::select_range(&git, base, tip)
 		}
@@ -377,28 +381,52 @@ pub async fn list_commits(
 				"--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x1e",
 			])
 			.map_err(|e| e.to_string())?;
-		Ok(parse_log(&String::from_utf8_lossy(&out)))
+		Ok(browser::parse_log(&String::from_utf8_lossy(&out)))
 	})
 	.await
 }
 
-fn parse_log(out: &str) -> Vec<CommitSummary> {
-	out.split('\x1e')
-		.filter_map(|record| {
-			let mut f = record.trim_start_matches('\n').split('\0');
-			let sha = f.next().filter(|s| !s.is_empty())?.to_string();
-			let parents =
-				f.next()?.split_whitespace().map(str::to_string).collect();
-			Some(CommitSummary {
-				sha,
-				parents,
-				author_name: f.next()?.to_string(),
-				author_email: f.next()?.to_string(),
-				author_date: f.next()?.to_string(),
-				subject: f.next()?.to_string(),
-			})
-		})
-		.collect()
+#[tauri::command]
+pub async fn browse_history(
+	repo: PathBuf,
+	reference: Option<String>,
+	query: String,
+	skip: usize,
+) -> CmdResult<RepositoryHistory> {
+	blocking(move || {
+		let git = Git::open(&repo).map_err(|e| e.to_string())?;
+		browser::history(&git, reference.as_deref(), &query, skip, 300)
+			.map_err(|e| e.to_string())
+	})
+	.await
+}
+
+#[tauri::command]
+pub async fn browse_directory(
+	repo: PathBuf,
+	path: String,
+) -> CmdResult<Vec<DirectoryEntry>> {
+	blocking(move || {
+		browser::directory(&repo, &path).map_err(|e| e.to_string())
+	})
+	.await
+}
+
+#[tauri::command]
+pub async fn preview_source(
+	repo: PathBuf,
+	path: String,
+	source: Option<GitSourceDto>,
+) -> CmdResult<SourcePreview> {
+	blocking(move || match source {
+		Some(source) => {
+			let git = Git::open(&repo).map_err(|e| e.to_string())?;
+			browser::git_preview(&git, &source.into(), &path)
+				.map_err(|e| e.to_string())
+		}
+		None => browser::file_preview(&repo, &path).map_err(|e| e.to_string()),
+	})
+	.await
 }
 
 struct FsProbe;
@@ -618,7 +646,7 @@ mod tests {
 		let out =
 			"aaa\0p1 p2\0Ann\0a@x\x002026-01-01T00:00:00+08:00\0subj one\x1e\n\
 			bbb\0\0Bob\0b@x\x002026-01-02T00:00:00Z\0\x1e\n";
-		let got = parse_log(out);
+		let got = browser::parse_log(out);
 		assert_eq!(got.len(), 2);
 		assert_eq!(got[0].parents, ["p1", "p2"]);
 		assert_eq!(got[0].subject, "subj one");
@@ -644,6 +672,9 @@ mod tests {
 			.with_large_int("number");
 		CopyRequest::export_all(&cfg).unwrap();
 		GitBrowse::export_all(&cfg).unwrap();
+		RepositoryHistory::export_all(&cfg).unwrap();
+		DirectoryEntry::export_all(&cfg).unwrap();
+		SourcePreview::export_all(&cfg).unwrap();
 		CopyOutcome::export_all(&cfg).unwrap();
 		CopyDone::export_all(&cfg).unwrap();
 		CommitSelection::export_all(&cfg).unwrap();
