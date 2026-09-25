@@ -6,16 +6,17 @@
 //! user had staged stays out of the new commits.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::fsutil::{must_not_overwrite, write_text_file};
+use crate::gitrun::RunOptions;
 use crate::gitsrc::{parse_raw_z, Git, GitError, EMPTY_TREE};
 use crate::paths::{escapes_all_roots, resolve_write_target};
+use crate::workspace::{lock_heavy, RepoIdentity};
 
 /// First line of a commit-mode payload; the rest is JSON.
 pub use crate::clip::COMMIT_MARKER;
@@ -190,11 +191,12 @@ fn lossy(bytes: &[u8]) -> String {
 }
 
 /// Reads one commit: metadata plus its change against the first parent.
+/// File contents are left for [`copy_commits`] to fill in: the returned
+/// list pairs a file index with the blob to read.
 fn read_commit(
 	git: &Git,
-	cat: &mut crate::gitsrc::CatFile,
 	sha: &str,
-) -> Result<CommitRecord, CommitError> {
+) -> Result<(CommitRecord, Vec<(usize, String)>), CommitError> {
 	let out =
 		git.run(&["log", "-1", "-z", "--format=%an%x00%ae%x00%aI%x00%B", sha])?;
 	let mut fields = out.splitn(4, |&b| b == 0);
@@ -229,6 +231,7 @@ fn read_commit(
 	])?;
 
 	let mut files = Vec::new();
+	let mut blobs = Vec::new();
 	for e in parse_raw_z(&raw)? {
 		let change = match e.status {
 			b'A' | b'C' => FileChange::Added,
@@ -251,19 +254,11 @@ fn read_commit(
 			(None, Some(NotCopiedReason::NonUtf8Path))
 		} else if special {
 			(None, Some(NotCopiedReason::UnsupportedType))
-		} else if change == FileChange::Deleted {
-			(None, None)
 		} else {
-			match cat.read(&e.new_oid).map_err(GitError::from)? {
-				None => (None, Some(NotCopiedReason::Unreadable)),
-				Some(b) if b.contains(&0) => {
-					(None, Some(NotCopiedReason::Binary))
-				}
-				Some(b) => match String::from_utf8(b) {
-					Ok(s) => (Some(s), None),
-					Err(_) => (None, Some(NotCopiedReason::NonUtf8)),
-				},
+			if change != FileChange::Deleted {
+				blobs.push((files.len(), e.new_oid.clone()));
 			}
+			(None, None)
 		};
 		files.push(CommitFile {
 			path: lossy(&e.path),
@@ -273,13 +268,14 @@ fn read_commit(
 			not_copied,
 		});
 	}
-	Ok(CommitRecord {
+	let record = CommitRecord {
 		message,
 		author_name,
 		author_email,
 		author_date,
 		files,
-	})
+	};
+	Ok((record, blobs))
 }
 
 /// Reads `shas` (oldest first, as the selectors return them).
@@ -287,11 +283,32 @@ pub fn copy_commits(
 	git: &Git,
 	shas: &[String],
 ) -> Result<CommitsPayload, CommitError> {
-	let mut cat = git.cat_file()?;
-	let commits = shas
+	// Every metadata and diff call first: while this thread holds the
+	// cat-file slot it must not start another Git process.
+	let (mut commits, pending): (Vec<_>, Vec<_>) = shas
 		.iter()
-		.map(|sha| read_commit(git, &mut cat, sha))
-		.collect::<Result<_, _>>()?;
+		.map(|sha| read_commit(git, sha))
+		.collect::<Result<Vec<_>, _>>()?
+		.into_iter()
+		.unzip();
+	let mut cat = git.cat_file()?;
+	for (record, blobs) in commits.iter_mut().zip(pending) {
+		for (i, oid) in blobs {
+			let (content, not_copied) = match cat.read(&oid)? {
+				None => (None, Some(NotCopiedReason::Unreadable)),
+				Some(b) if b.contains(&0) => {
+					(None, Some(NotCopiedReason::Binary))
+				}
+				Some(b) => match String::from_utf8(b) {
+					Ok(s) => (Some(s), None),
+					Err(_) => (None, Some(NotCopiedReason::NonUtf8)),
+				},
+			};
+			record.files[i].content = content;
+			record.files[i].not_copied = not_copied;
+		}
+	}
+	cat.close()?;
 	Ok(CommitsPayload { commits })
 }
 
@@ -502,6 +519,21 @@ pub struct ReplayResult {
 /// encoding checks see the disk as earlier commits left it.
 pub fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
 	let mut result = ReplayResult::default();
+	// Index- and ref-changing work runs one at a time per worktree.
+	let opts = RunOptions::default();
+	let guard =
+		RepoIdentity::resolve(git, &opts).and_then(|id| lock_heavy(&id, &opts));
+	let _guard = match guard {
+		Ok(g) => g,
+		Err(e) => {
+			result.failure = payload.commits.first().map(|c| ReplayFailure {
+				index: 0,
+				message: c.message.clone(),
+				error: e.to_string(),
+			});
+			return result;
+		}
+	};
 	for (index, commit) in payload.commits.iter().enumerate() {
 		match replay_commit(git, commit) {
 			Ok(sha) => result.created.push(sha),
@@ -590,7 +622,7 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 		];
 		args.extend(&deleted);
 		// An unborn HEAD tracks nothing.
-		let out = if git.run(&["rev-parse", "-q", "--verify", "HEAD"]).is_ok() {
+		let out = if git.head().map_err(err)?.is_some() {
 			git.run(&args).map_err(err)?
 		} else {
 			Vec::new()
@@ -661,26 +693,17 @@ fn run_commit(
 ) -> Result<(), GitError> {
 	// Author through the environment: `--author` would treat a value
 	// without `<email>` as a search pattern. The committer stays local.
-	let mut child = git
-		.command()
-		.args(args)
+	let mut cmd = git.command();
+	cmd.args(args)
 		.env("GIT_AUTHOR_NAME", &commit.author_name)
 		.env("GIT_AUTHOR_EMAIL", &commit.author_email)
-		.env("GIT_AUTHOR_DATE", &commit.author_date)
-		.stdin(Stdio::piped())
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.spawn()?;
-	if let Some(mut stdin) = child.stdin.take() {
-		stdin.write_all(commit.message.as_bytes())?;
-	}
-	let out = child.wait_with_output()?;
-	if !out.status.success() {
-		return Err(GitError::Failed {
-			args: args.join(" "),
-			stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-		});
-	}
+		.env("GIT_AUTHOR_DATE", &commit.author_date);
+	git.exec(
+		cmd,
+		&args.join(" "),
+		Some(commit.message.as_bytes()),
+		&RunOptions::default(),
+	)?;
 	Ok(())
 }
 

@@ -686,7 +686,7 @@ fn collapse_slashes(s: &str) -> String {
 	out
 }
 
-fn sanitize_relative_path(value: &str) -> Option<String> {
+pub(crate) fn sanitize_relative_path(value: &str) -> Option<String> {
 	let collapsed = collapse_slashes(ascii_trim(value));
 	let normalized = collapsed.trim_start_matches('/');
 	if normalized.is_empty() || is_absolute_path(normalized) {
@@ -750,7 +750,7 @@ fn is_windows_style_path(s: &str) -> bool {
 	has_drive(s) && (s.len() == 2 || s.as_bytes()[2] == b'/')
 }
 
-fn path_key(value: &str) -> String {
+pub(crate) fn path_key(value: &str) -> String {
 	let normalized = normalize_system_path(value);
 	// TS `toLowerCase()` folds Unicode, so `to_lowercase` matches it here.
 	if is_windows_style_path(&normalized) {

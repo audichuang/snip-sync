@@ -216,6 +216,10 @@ jobs:
               uses: actions/setup-node@v4
               with:
                   node-version: 24
+            - name: Git runner smoke test (macOS fast gate)
+              if: runner.os == 'macOS'
+              timeout-minutes: 5
+              run: cargo test -p snip-core --locked --test git_runner fast_child_rapid_cleanup_releases_all_permits_without_leftover_error -- --exact
             - name: Tests (Linux, under xvfb)
               if: runner.os == 'Linux'
               run: xvfb-run -a cargo test --workspace --locked --no-fail-fast
