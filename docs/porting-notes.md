@@ -40,6 +40,16 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   - Unix:root 自成 process group,以 `killpg` 殺整組。root 在殺 group 之前**不會被 reap**:結束狀態用 `waitid(WNOWAIT)`(Linux/FreeBSD)
     或 kqueue `NOTE_EXIT`(macOS)觀察,因此 group id 不可能被別的程序重用。刻意 `setsid` 脫離 group 的後代殺不到;
     它若握住管線,呼叫在期限到時回報 `OutputHeldOpen` 失敗,不會卡住也不會回報成功。
+    在 macOS / Darwin 上，XNU 核心的 `killpg1` (`bsd/kern/kern_sig.c`) 走訪 process group 時會過濾掉 zombie (`p->p_stat != SZOMB`)，
+    當群組內所有程序皆已結束(或未 reap 的 root 是唯一程序且已退出)，可發送信號之程序數為 0，在 POSIX 模式下會回傳 `EPERM` (`os error 1`)
+    而非 `ESRCH`。但 `EPERM` 亦可能因 MAC policy 或特權限制導致無法對存活後代發信號，因此 `gitrun` 不無條件忽略 `EPERM`，
+    而是在遇上 `EPERM` 時以 `/bin/ps -ax -o stat=,pgid=` 檢查該 PGID。此檢查有嚴格的生命週期時限與空間邊界：
+    500 ms 總 deadline（涵蓋 stdout 管線讀取與 EOF 後的程序退出等待，防止 helper 關閉 stdout 後卡死）、256 KiB 輸出上限、
+    以及 200 ms 終止寬限（kill 後輪詢 try_wait 確保 reap，並將 kill/reap 失敗向外傳播，絕不在 Drop 內無窮等待或遺留 stray/zombie helper）。
+    其代價為 $O(\text{processes})$ 的系統程序表掃描，且僅在 macOS / Darwin 遇上 `EPERM` 時才觸發。
+    解析器採零記憶體分配驗證（非 UTF-8、欄位數量不符、無效 primary stat、非數字 PGID、缺少換行截斷皆回報錯誤），
+    僅在確定該 PGID 僅剩 zombie (`'Z'`) 或無成員時才判定清理成功；任何非 `'Z'` 的存活成員、非零 exit code、超時、溢位或解析失敗一律嚴格 fail closed
+    回傳錯誤並保留名額（leak slot），確保活體後代絕不被假裝乾淨。
   - Windows:process-wrap 10 以 Job object 管理(先 suspended spawn、放進 job、再 resume;job 建立或 assign 失敗時它會終止那個 suspended 子程序,
     resume 失敗時終止整個 job)。取代了 command-group 5.0.1,後者在 assign 失敗時會留下 suspended 子程序與 job handle。
     process-wrap 的 std `JobObject` **不是** kill-on-close:`TerminateJobObject` 失敗時只能再殺 root,並回報 `Cleanup`、保留名額。

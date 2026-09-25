@@ -175,6 +175,73 @@ fn cancel_stops_a_running_process() {
 }
 
 #[test]
+fn cancel_kills_process_group_including_descendants_without_leak() {
+	let _s = serial();
+	let (dir, git) = repo();
+	let pidfile = dir.path().join("pid");
+	let script = format!(
+		"sleep 30 & echo $! > '{}'; wait",
+		pidfile.display().to_string().replace('\\', "/")
+	);
+	let cancel = CancelToken::new();
+	let trigger = cancel.clone();
+	let pidfile_clone = pidfile.clone();
+	let canceller = thread::spawn(move || {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while Instant::now() < deadline {
+			if let Ok(content) = std::fs::read_to_string(&pidfile_clone) {
+				if let Ok(pid) = content.trim().parse::<u32>() {
+					if pid > 0 {
+						trigger.cancel();
+						return Ok(pid);
+					}
+				}
+			}
+			thread::sleep(Duration::from_millis(20));
+		}
+		trigger.cancel();
+		Err("timed out waiting for descendant to write PID before cancel")
+	});
+	let start = Instant::now();
+	let run_res = alias(
+		&git,
+		&script,
+		&RunOptions {
+			cancel: Some(cancel),
+			..opts(Duration::from_secs(60))
+		},
+	);
+	let canceller_res = canceller.join().expect("canceller thread panicked");
+	assert!(start.elapsed() < Duration::from_secs(15));
+	let _descendant_pid = canceller_res.expect("descendant never became ready");
+	let err = run_res.expect_err("alias should have been cancelled");
+	assert!(matches!(err, GitError::Cancelled { .. }), "{err:?}");
+	assert_eq!(in_flight(), 0);
+	assert_eq!(leaked_slots(), 0);
+	#[cfg(unix)]
+	{
+		assert_dead(_descendant_pid);
+	}
+}
+
+#[test]
+fn fast_child_rapid_cleanup_releases_all_permits_without_leftover_error() {
+	let _s = serial();
+	let (_dir, git) = repo();
+	for _ in 0..10 {
+		let out = git.run(&["--version"]).unwrap();
+		assert!(!out.is_empty());
+		let out_echo =
+			alias(&git, "echo fast", &RunOptions::default()).unwrap();
+		assert_eq!(String::from_utf8_lossy(&out_echo).trim(), "fast");
+		let out_exit = alias(&git, "exit 0", &RunOptions::default()).unwrap();
+		assert!(out_exit.is_empty());
+		assert_eq!(in_flight(), 0);
+		assert_eq!(leaked_slots(), 0);
+	}
+}
+
+#[test]
 fn full_budget_queues_then_cancel_or_queue_timeout_never_spawn() {
 	let _s = serial();
 	let (_dir, git) = repo();

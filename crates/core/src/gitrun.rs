@@ -713,9 +713,39 @@ mod tree {
 		pub(super) fn kill_group(&mut self) -> io::Result<()> {
 			let pgid =
 				i32::try_from(self.child.id()).map_err(io::Error::other)?;
-			match killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
+
+			#[cfg(test)]
+			let killpg_res = match super::INJECT_GROUP_KILL_EPERM.get() {
+				super::InjectGroupKillEperm::None => {
+					killpg(Pid::from_raw(pgid), Signal::SIGKILL)
+				}
+				_ => Err(Errno::EPERM),
+			};
+			#[cfg(not(test))]
+			let killpg_res = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+
+			match killpg_res {
 				// ESRCH: the group is already empty.
 				Ok(()) | Err(Errno::ESRCH) => Ok(()),
+				// macOS / Darwin: XNU's `killpg1` iterates the process group excluding
+				// zombies (`!(p->p_flag & P_SYSTEM) && p->p_stat != SZOMB`, see XNU
+				// bsd/kern/kern_sig.c). When all processes in the group have exited
+				// (or the unreaped root was the only process and has exited), 0 processes
+				// are found to signal. In POSIX conformance mode, XNU returns EPERM
+				// (`error = (karg.nfound > 0 ? 0 : (posix ? EPERM : ESRCH))`).
+				// However, EPERM can also be returned if a live descendant process could
+				// not be signalled due to MAC policy or privilege restrictions.
+				// We confirm there are NO live (non-zombie) members in this PGID
+				// before treating EPERM as clean. Any live member or inspection error
+				// must fail closed.
+				#[cfg(any(target_os = "macos", target_os = "ios", test))]
+				Err(Errno::EPERM) => match check_group_liveness(pgid) {
+					Ok(false) => Ok(()),
+					Ok(true) => Err(io::Error::from(Errno::EPERM)),
+					Err(e) => Err(io::Error::other(format!(
+						"failed to inspect process group {pgid} members after EPERM: {e}"
+					))),
+				},
 				Err(e) => Err(e.into()),
 			}
 		}
@@ -727,6 +757,215 @@ mod tree {
 		pub(super) fn try_reap(&mut self) -> io::Result<Option<ExitStatus>> {
 			self.child.try_wait()
 		}
+	}
+
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	const MAX_PS_OUTPUT: usize = 256 * 1024;
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	const PS_TIMEOUT: std::time::Duration =
+		std::time::Duration::from_millis(500);
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	const HELPER_CLEANUP_GRACE: std::time::Duration =
+		std::time::Duration::from_millis(200);
+
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	struct HelperGuard {
+		child: Child,
+		reaped: bool,
+	}
+
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	impl HelperGuard {
+		fn new(child: Child) -> Self {
+			#[cfg(test)]
+			super::TEST_LAST_HELPER_PID.set(Some(child.id()));
+			Self {
+				child,
+				reaped: false,
+			}
+		}
+
+		fn id(&self) -> u32 {
+			self.child.id()
+		}
+
+		/// Non-blocking check for process exit. If exited, marks reaped.
+		fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+			if self.reaped {
+				return Ok(None);
+			}
+			match self.child.try_wait()? {
+				Some(status) => {
+					self.reaped = true;
+					Ok(Some(status))
+				}
+				None => Ok(None),
+			}
+		}
+
+		/// Actively terminates and reaps the helper child within `grace`.
+		/// Returns an error if killing or reaping fails.
+		fn kill_and_reap(
+			&mut self,
+			grace: std::time::Duration,
+		) -> io::Result<()> {
+			if self.reaped {
+				return Ok(());
+			}
+			if let Some(_status) = self.try_wait()? {
+				return Ok(());
+			}
+			if let Err(e) = self.child.kill() {
+				if self.try_wait()?.is_none() {
+					return Err(io::Error::other(format!(
+						"failed to kill helper process {}: {e}",
+						self.id()
+					)));
+				}
+				return Ok(());
+			}
+			let deadline = std::time::Instant::now() + grace;
+			while std::time::Instant::now() < deadline {
+				if self.try_wait()?.is_some() {
+					return Ok(());
+				}
+				std::thread::sleep(std::time::Duration::from_millis(5));
+			}
+			Err(io::Error::other(format!(
+				"helper process {} did not exit within {grace:?} after kill",
+				self.id()
+			)))
+		}
+	}
+
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	impl Drop for HelperGuard {
+		fn drop(&mut self) {
+			if !self.reaped {
+				let _ = self.kill_and_reap(HELPER_CLEANUP_GRACE);
+			}
+		}
+	}
+
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	pub(super) fn check_group_liveness(pgid: i32) -> io::Result<bool> {
+		#[cfg(test)]
+		match super::INJECT_GROUP_KILL_EPERM.get() {
+			super::InjectGroupKillEperm::None => {}
+			super::InjectGroupKillEperm::ZeroLive => {
+				let mock = format!("Ss 1\nZ {pgid}\n");
+				return super::parse_ps_group_liveness(mock.as_bytes(), pgid);
+			}
+			super::InjectGroupKillEperm::LiveRemaining => {
+				let mock = format!("Ss 1\nS {pgid}\n");
+				return super::parse_ps_group_liveness(mock.as_bytes(), pgid);
+			}
+			super::InjectGroupKillEperm::UnknownError => {
+				let mock = b"invalid output\n";
+				return super::parse_ps_group_liveness(mock, pgid);
+			}
+		}
+
+		let mut cmd = {
+			#[cfg(test)]
+			{
+				if let Some(args) =
+					super::TEST_PS_HELPER_OVERRIDE.with(|c| c.borrow().clone())
+				{
+					if args.is_empty() {
+						return Err(io::Error::other("empty helper override"));
+					}
+					let mut c = Command::new(&args[0]);
+					c.args(&args[1..]);
+					c
+				} else {
+					let mut c = Command::new("/bin/ps");
+					c.args(["-ax", "-o", "stat=,pgid="]);
+					c
+				}
+			}
+			#[cfg(not(test))]
+			{
+				let mut c = Command::new("/bin/ps");
+				c.args(["-ax", "-o", "stat=,pgid="]);
+				c
+			}
+		};
+		cmd.stdout(std::process::Stdio::piped());
+		cmd.stderr(std::process::Stdio::null());
+		cmd.stdin(std::process::Stdio::null());
+
+		let child = cmd.spawn()?;
+		let mut guard = HelperGuard::new(child);
+
+		let stdout =
+			guard.child.stdout.take().ok_or_else(|| {
+				io::Error::other("failed to capture ps stdout")
+			})?;
+
+		let mut pipes = super::pipes::Pipes::default();
+		pipes.attach_stdout(stdout)?;
+
+		let deadline = std::time::Instant::now() + PS_TIMEOUT;
+		let mut output = Vec::new();
+
+		// Phase 1: Read stdout non-blockingly while pipes are open and deadline not exceeded
+		while pipes.is_open() {
+			let now = std::time::Instant::now();
+			if now >= deadline {
+				guard.kill_and_reap(HELPER_CLEANUP_GRACE)?;
+				return Err(io::Error::new(
+					io::ErrorKind::TimedOut,
+					"ps inspection timed out reading output",
+				));
+			}
+			let wait =
+				(deadline - now).min(std::time::Duration::from_millis(50));
+			match pipes.next(wait) {
+				Ok(super::Event::Data(_, chunk)) => {
+					if output.len() + chunk.len() > MAX_PS_OUTPUT {
+						guard.kill_and_reap(HELPER_CLEANUP_GRACE)?;
+						return Err(io::Error::other(
+							"ps inspection output exceeded limit",
+						));
+					}
+					output.extend_from_slice(&chunk);
+				}
+				Ok(super::Event::Eof(_)) => break,
+				Ok(super::Event::Idle) => {}
+				Err(e) => {
+					guard.kill_and_reap(HELPER_CLEANUP_GRACE)?;
+					return Err(e);
+				}
+			}
+		}
+
+		// Phase 2: Pipes closed / EOF reached. Wait for helper process exit within remaining deadline!
+		let status = loop {
+			if let Some(status) = guard.try_wait()? {
+				break status;
+			}
+			let now = std::time::Instant::now();
+			if now >= deadline {
+				guard.kill_and_reap(HELPER_CLEANUP_GRACE)?;
+				return Err(io::Error::new(
+					io::ErrorKind::TimedOut,
+					"ps inspection timed out waiting for process exit",
+				));
+			}
+			let wait =
+				(deadline - now).min(std::time::Duration::from_millis(10));
+			std::thread::sleep(wait);
+		};
+
+		if !status.success() {
+			return Err(io::Error::other(format!(
+				"ps failed with status: {:?}",
+				status.code()
+			)));
+		}
+
+		super::parse_ps_group_liveness(&output, pgid)
 	}
 }
 
@@ -815,6 +1054,138 @@ thread_local! {
 #[cfg(test)]
 fn test_inject_kill_tree_failure(fail: bool) {
 	INJECT_KILL_TREE_FAILURE.set(fail);
+}
+
+#[cfg(all(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InjectGroupKillEperm {
+	None,
+	ZeroLive,
+	LiveRemaining,
+	UnknownError,
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+	static INJECT_GROUP_KILL_EPERM: Cell<InjectGroupKillEperm> =
+		const { Cell::new(InjectGroupKillEperm::None) };
+	static TEST_PS_HELPER_OVERRIDE: std::cell::RefCell<Option<Vec<String>>> =
+		const { std::cell::RefCell::new(None) };
+	static TEST_LAST_HELPER_PID: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn test_inject_group_kill_eperm(mode: InjectGroupKillEperm) {
+	INJECT_GROUP_KILL_EPERM.set(mode);
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn test_override_ps_helper(cmd: Option<Vec<String>>) {
+	TEST_PS_HELPER_OVERRIDE.with(|c| *c.borrow_mut() = cmd);
+}
+
+#[cfg(all(unix, test))]
+pub(crate) fn test_last_helper_pid() -> Option<u32> {
+	TEST_LAST_HELPER_PID.get()
+}
+
+/// Strictly inspects `ps -ax -o stat=,pgid=` output to determine if any live
+/// (non-zombie) processes belong to `target_pgid`.
+///
+/// Returns:
+/// - `Ok(false)`: Positive proof that no live members remain in `target_pgid`
+///   (either all records for `target_pgid` are in zombie state `'Z'`, or
+///   `target_pgid` is absent).
+/// - `Ok(true)`: At least one member of `target_pgid` is in a live (non-`'Z'`) state.
+/// - `Err(...)`: Parse failure, non-UTF-8, truncated output, invalid primary stat,
+///   unbounded/non-ASCII stat, or malformed columns. Must fail closed.
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+pub(crate) fn parse_ps_group_liveness(
+	output: &[u8],
+	target_pgid: i32,
+) -> io::Result<bool> {
+	if output.is_empty() {
+		return Err(io::Error::other("ps output is empty"));
+	}
+	if !output.ends_with(b"\n") {
+		return Err(io::Error::other(
+			"ps output is truncated or missing trailing newline",
+		));
+	}
+	let text = std::str::from_utf8(output).map_err(|e| {
+		io::Error::other(format!("ps output is not valid UTF-8: {e}"))
+	})?;
+
+	let mut has_live = false;
+
+	for (line_idx, line) in text.lines().enumerate() {
+		let line = line.trim();
+		if line.is_empty() {
+			return Err(io::Error::other(format!(
+				"ps output contains empty line at index {line_idx}"
+			)));
+		}
+
+		// Avoid per-line Vec allocation: exactly 2 whitespace-separated fields required
+		let mut fields = line.split_whitespace();
+		let stat = fields.next().ok_or_else(|| {
+			io::Error::other(format!("ps output line {line_idx} is empty"))
+		})?;
+		let pgid_str = fields.next().ok_or_else(|| {
+			io::Error::other(format!(
+				"ps output line {line_idx} missing pgid column: {line:?}"
+			))
+		})?;
+		if fields.next().is_some() {
+			return Err(io::Error::other(format!(
+				"ps output line {line_idx} has extra columns: {line:?}"
+			)));
+		}
+
+		// Bounded ASCII stat shape validation (1..=16 printable non-space ASCII chars)
+		if stat.len() > 16 || !stat.chars().all(|c| c.is_ascii_graphic()) {
+			return Err(io::Error::other(format!(
+				"invalid stat token format {:?} at line {line_idx}",
+				stat
+			)));
+		}
+
+		let primary = stat.as_bytes()[0];
+
+		// Valid primary process states on BSD/Darwin and Linux:
+		// BSD/Darwin: I (idle), R (running), S (sleeping), T (stopped), U (uninterruptible), Z (zombie)
+		// Linux: D, I, R, S, T, t, W, X, Z
+		let is_zombie = match primary {
+			b'Z' => true,
+			b'D' | b'I' | b'R' | b'S' | b'T' | b't' | b'U' | b'W' | b'X' => {
+				false
+			}
+			_ => {
+				return Err(io::Error::other(format!(
+					"unknown primary process state {:?} in line {line_idx}",
+					primary as char
+				)));
+			}
+		};
+
+		let pgid: i32 = pgid_str.parse::<i32>().map_err(|e| {
+			io::Error::other(format!(
+				"invalid non-numeric pgid {:?} in line {line_idx}: {e}",
+				pgid_str
+			))
+		})?;
+		if pgid < 0 {
+			return Err(io::Error::other(format!(
+				"negative pgid {pgid} in line {line_idx}"
+			)));
+		}
+
+		if pgid == target_pgid && !is_zombie {
+			has_live = true;
+		}
+	}
+
+	Ok(has_live)
 }
 
 /// A spawned Git process tree that holds a budget slot until the tree is
@@ -1375,6 +1746,12 @@ mod tests {
 	impl Drop for InjectionGuard {
 		fn drop(&mut self) {
 			test_inject_kill_tree_failure(false);
+			#[cfg(unix)]
+			{
+				test_inject_group_kill_eperm(InjectGroupKillEperm::None);
+				test_override_ps_helper(None);
+				TEST_LAST_HELPER_PID.set(None);
+			}
 		}
 	}
 
@@ -1506,5 +1883,354 @@ mod tests {
 		drop(proc);
 
 		assert_eq!(leaked_slots(), before_leaked);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn darwin_eperm_zero_live_succeeds_but_live_or_unknown_retains_leaked_slot()
+	{
+		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let exe = std::env::current_exe().expect("current test exe");
+			let status = Command::new(exe)
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args([
+					"--exact",
+					"gitrun::tests::darwin_eperm_zero_live_succeeds_but_live_or_unknown_retains_leaked_slot",
+					"--nocapture",
+				])
+				.status()
+				.expect("spawn isolated test subprocess");
+			assert!(status.success(), "isolated subprocess test failed");
+			return;
+		}
+
+		assert_eq!(leaked_slots(), 0);
+		assert_eq!(in_flight(), 0);
+
+		// Case 1: Zero live processes in group (normal fast exit on Darwin where all are zombies):
+		// EPERM is confirmed harmless, cleanup succeeds, permit released, no slot leak.
+		{
+			let cmd = test_exit_command();
+			let mut proc = ManagedChild::spawn(
+				cmd,
+				"test-zero-live",
+				false,
+				&RunOptions::default(),
+			)
+			.unwrap();
+
+			let _inj = InjectionGuard;
+			test_inject_group_kill_eperm(InjectGroupKillEperm::ZeroLive);
+			let res = proc.finish();
+			test_inject_group_kill_eperm(InjectGroupKillEperm::None);
+
+			assert!(res.is_ok(), "zero-live EPERM must succeed: {res:?}");
+			assert!(proc.clean);
+			assert!(proc.permit.is_none());
+			drop(proc);
+			assert_eq!(leaked_slots(), 0);
+			assert_eq!(in_flight(), 0);
+		}
+
+		// Case 2: Live members remaining in group:
+		// EPERM means live descendants could not be signalled. Must fail, retain permit, leak slot on Drop.
+		{
+			let cmd = test_long_running_command();
+			let mut proc = ManagedChild::spawn(
+				cmd,
+				"test-live-remaining",
+				false,
+				&RunOptions::default(),
+			)
+			.unwrap();
+
+			let _inj = InjectionGuard;
+			test_inject_group_kill_eperm(InjectGroupKillEperm::LiveRemaining);
+			let err = proc.finish().unwrap_err();
+			test_inject_group_kill_eperm(InjectGroupKillEperm::None);
+
+			assert!(matches!(err, GitError::Cleanup { .. }), "{err:?}");
+			assert!(!proc.clean);
+			assert!(proc.permit.is_some());
+
+			drop(proc);
+			assert_eq!(
+				leaked_slots(),
+				1,
+				"live-remaining EPERM must leak slot via sticky failure"
+			);
+			assert_eq!(in_flight(), 1);
+		}
+
+		// Case 3: Inspection fails / unknown state:
+		// Cannot confirm group is clean. Must fail closed, retain permit, leak slot on Drop.
+		{
+			let cmd = test_long_running_command();
+			let mut proc = ManagedChild::spawn(
+				cmd,
+				"test-unknown-error",
+				false,
+				&RunOptions::default(),
+			)
+			.unwrap();
+
+			let _inj = InjectionGuard;
+			test_inject_group_kill_eperm(InjectGroupKillEperm::UnknownError);
+			let err = proc.finish().unwrap_err();
+			test_inject_group_kill_eperm(InjectGroupKillEperm::None);
+
+			assert!(matches!(err, GitError::Cleanup { .. }), "{err:?}");
+			assert!(!proc.clean);
+			assert!(proc.permit.is_some());
+
+			drop(proc);
+			assert_eq!(
+				leaked_slots(),
+				2,
+				"unknown inspection error must fail closed and leak slot"
+			);
+			assert_eq!(in_flight(), 2);
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn unix_check_group_liveness_detects_real_process_liveness() {
+		let _s = serial();
+		use std::os::unix::process::CommandExt;
+		let mut cmd = Command::new("sh");
+		cmd.args(["-c", "sleep 10"]);
+		cmd.process_group(0);
+		let mut child = cmd.spawn().unwrap();
+		let pgid = child.id() as i32;
+
+		// While child is alive, check_group_liveness returns true
+		let has_live = tree::check_group_liveness(pgid).unwrap();
+		assert!(has_live, "active child must be detected as live member");
+
+		// Kill the whole process group and wait for child
+		let _ = nix::sys::signal::killpg(
+			nix::unistd::Pid::from_raw(pgid),
+			nix::sys::signal::Signal::SIGKILL,
+		);
+		let _ = child.wait();
+
+		// Wait up to 5s for OS process table to reflect SIGKILL
+		let deadline = Instant::now() + Duration::from_secs(5);
+		let mut has_live_after = true;
+		while Instant::now() < deadline {
+			has_live_after = tree::check_group_liveness(pgid).unwrap();
+			if !has_live_after {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(20));
+		}
+		assert!(
+			!has_live_after,
+			"killed process group must have zero live members"
+		);
+	}
+
+	#[cfg(unix)]
+	fn assert_helper_dead(pid: u32) {
+		let raw_pid = pid as i32;
+		let res =
+			nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw_pid), None);
+		assert_eq!(
+			res,
+			Err(nix::errno::Errno::ESRCH),
+			"helper PID {pid} must be dead and reaped, but kill(0) returned {res:?}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn check_group_liveness_timeout_kills_helper_and_fails() {
+		let _s = serial();
+		let _inj = InjectionGuard;
+		test_override_ps_helper(Some(vec![
+			"sh".to_string(),
+			"-c".to_string(),
+			"exec sleep 10".to_string(),
+		]));
+		let start = Instant::now();
+		let res = tree::check_group_liveness(12345);
+		let elapsed = start.elapsed();
+		assert!(res.is_err(), "hanging helper must return Err");
+		let err = res.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert!(
+			elapsed < Duration::from_secs(3),
+			"helper must be timed out quickly, took {elapsed:?}"
+		);
+		let pid = test_last_helper_pid().expect("helper PID must be recorded");
+		assert_helper_dead(pid);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn check_group_liveness_helper_closes_stdout_then_hangs_times_out_and_kills(
+	) {
+		let _s = serial();
+		let _inj = InjectionGuard;
+		test_override_ps_helper(Some(vec![
+			"sh".to_string(),
+			"-c".to_string(),
+			"exec 1>&-; exec sleep 10".to_string(),
+		]));
+		let start = Instant::now();
+		let res = tree::check_group_liveness(12345);
+		let elapsed = start.elapsed();
+		assert!(
+			res.is_err(),
+			"helper closing stdout then hanging must return Err"
+		);
+		let err = res.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert!(
+			elapsed < Duration::from_secs(3),
+			"helper must be timed out within deadline, took {elapsed:?}"
+		);
+		let pid = test_last_helper_pid().expect("helper PID must be recorded");
+		assert_helper_dead(pid);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn check_group_liveness_overflow_kills_helper_and_fails() {
+		let _s = serial();
+		let _inj = InjectionGuard;
+		test_override_ps_helper(Some(vec![
+			"sh".to_string(),
+			"-c".to_string(),
+			"exec head -c 300000 /dev/zero".to_string(),
+		]));
+		let res = tree::check_group_liveness(12345);
+		assert!(res.is_err(), "overflow helper must return Err");
+		let err = res.unwrap_err();
+		assert!(
+			err.to_string().contains("output exceeded limit"),
+			"unexpected err: {err}"
+		);
+		let pid = test_last_helper_pid().expect("helper PID must be recorded");
+		assert_helper_dead(pid);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn check_group_liveness_nonzero_exit_fails() {
+		let _s = serial();
+		let _inj = InjectionGuard;
+		test_override_ps_helper(Some(vec![
+			"sh".to_string(),
+			"-c".to_string(),
+			"exit 42".to_string(),
+		]));
+		let res = tree::check_group_liveness(12345);
+		assert!(res.is_err(), "non-zero exit must return Err");
+		let err = res.unwrap_err();
+		assert!(
+			err.to_string().contains("status: Some(42)"),
+			"unexpected err: {err}"
+		);
+		let pid = test_last_helper_pid().expect("helper PID must be recorded");
+		assert_helper_dead(pid);
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_zero_live() {
+		// All processes for PGID 100 are zombies ('Z')
+		let out = b"Ss 1\nZ 100\nZ+ 100\n";
+		let res = parse_ps_group_liveness(out, 100).unwrap();
+		assert!(!res, "zombie-only group must report zero live members");
+
+		// Target PGID not found in output
+		let res_absent = parse_ps_group_liveness(out, 999).unwrap();
+		assert!(!res_absent, "absent group must report zero live members");
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_live_remaining() {
+		let out = b"Ss 1\nS 100\n";
+		let res = parse_ps_group_liveness(out, 100).unwrap();
+		assert!(res, "live process must report live members remaining");
+
+		// Mixed: one zombie, one live
+		let out_mixed = b"Ss 1\nZ 100\nS+ 100\n";
+		let res_mixed = parse_ps_group_liveness(out_mixed, 100).unwrap();
+		assert!(
+			res_mixed,
+			"mixed zombie and live must report live members remaining"
+		);
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_darwin_valid_states() {
+		let out = b"I 10\nR+ 20\nSs 30\nT 40\nU 50\nZ 60\nZ+ 70\n";
+		assert!(parse_ps_group_liveness(out, 10).unwrap());
+		assert!(parse_ps_group_liveness(out, 20).unwrap());
+		assert!(parse_ps_group_liveness(out, 30).unwrap());
+		assert!(parse_ps_group_liveness(out, 40).unwrap());
+		assert!(parse_ps_group_liveness(out, 50).unwrap());
+		assert!(!parse_ps_group_liveness(out, 60).unwrap());
+		assert!(!parse_ps_group_liveness(out, 70).unwrap());
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_malformed_columns() {
+		// Line with 1 column
+		let out1 = b"Ss\n";
+		assert!(parse_ps_group_liveness(out1, 100).is_err());
+
+		// Line with 3 columns
+		let out3 = b"Ss 1 extra\n";
+		assert!(parse_ps_group_liveness(out3, 100).is_err());
+
+		// Empty line in output
+		let out_empty_line = b"Ss 1\n\nZ 100\n";
+		assert!(parse_ps_group_liveness(out_empty_line, 100).is_err());
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_non_utf8() {
+		let out = b"Ss 1\n\xff\xfe 100\n";
+		assert!(parse_ps_group_liveness(out, 100).is_err());
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_truncated() {
+		// Missing trailing newline
+		let out = b"Ss 1\nZ 100";
+		assert!(parse_ps_group_liveness(out, 100).is_err());
+
+		// Empty output
+		let empty = b"";
+		assert!(parse_ps_group_liveness(empty, 100).is_err());
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_invalid_stat() {
+		// Primary state invalid (digits, punctuation, unknown letters)
+		assert!(parse_ps_group_liveness(b"??? 100\n", 100).is_err());
+		assert!(parse_ps_group_liveness(b"123 100\n", 100).is_err());
+		assert!(parse_ps_group_liveness(b"K 100\n", 100).is_err());
+		assert!(parse_ps_group_liveness(b"@ 100\n", 100).is_err());
+
+		// Token too long (> 16 chars)
+		assert!(
+			parse_ps_group_liveness(b"S12345678901234567 100\n", 100).is_err()
+		);
+
+		// Non-graphic ASCII / control character
+		assert!(parse_ps_group_liveness(b"S\x01 100\n", 100).is_err());
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_non_numeric_or_negative_pgid() {
+		// Non-numeric
+		assert!(parse_ps_group_liveness(b"Ss abc\n", 100).is_err());
+		// Negative
+		assert!(parse_ps_group_liveness(b"Ss -10\n", 100).is_err());
 	}
 }
