@@ -20,7 +20,8 @@ use crate::format::{
 };
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitsrc::{
-	Git, GitError, DELETED_FILE_MARKER, UNREADABLE_FILE_MARKER,
+	CatFile, CatObject, Git, GitError, DELETED_FILE_MARKER,
+	UNREADABLE_FILE_MARKER,
 };
 use crate::paths::{self, escapes_all_roots, sanitize_relative_path};
 use crate::restore::{
@@ -75,8 +76,12 @@ impl std::fmt::Display for CanonicalRootId {
 pub enum SourceKind {
 	/// Workspace file mode (equivalent to copy.rs file collection).
 	File,
-	/// Uncommitted Git working tree change.
+	/// Uncommitted Git working tree change: the SCM view (legacy
+	/// `GitSource::Working`), a deletion reads HEAD.
 	Working,
+	/// Unstaged change only (working tree against the index): content from
+	/// disk, a deletion reads the index.
+	Unstaged,
 	/// Staged Git index change.
 	Staged,
 	/// Git commit change.
@@ -249,7 +254,9 @@ impl SourceFreshnessSnapshot {
 
 		for item in &selection.items {
 			match &item.source {
-				SourceKind::Working | SourceKind::File => {
+				SourceKind::Working
+				| SourceKind::Unstaged
+				| SourceKind::File => {
 					let file_path = item.root.path().join(&item.relative_path);
 					let freshness = capture_file_freshness(&file_path)?;
 					working_files.insert(
@@ -603,34 +610,9 @@ fn capture_repo_freshness(root: &Path) -> Result<RepoFreshness, TransferError> {
 		Err(e) => return Err(TransferError::Git(e)),
 	};
 
-	let head_commit =
-		match git.run(&["rev-parse", "--verify", "--quiet", "HEAD"]) {
-			Ok(out) => {
-				let s = String::from_utf8_lossy(&out).trim().to_string();
-				if s.is_empty() {
-					None
-				} else {
-					Some(s)
-				}
-			}
-			Err(GitError::Failed { ref stderr, .. })
-				if stderr.is_empty()
-					|| stderr.contains("Needed a single revision") =>
-			{
-				None
-			}
-			Err(e) => return Err(TransferError::Git(e)),
-		};
-
-	let head_ref = match git.run(&["symbolic-ref", "--quiet", "HEAD"]) {
-		Ok(out) => Some(String::from_utf8_lossy(&out).trim().to_string()),
-		Err(GitError::Failed { ref stderr, .. })
-			if stderr.is_empty() || stderr.contains("not a symbolic ref") =>
-		{
-			None
-		}
-		Err(e) => return Err(TransferError::Git(e)),
-	};
+	// Unborn and detached are answers; any other Git failure is an error.
+	let head_commit = git.head()?;
+	let head_ref = git.head_ref()?;
 
 	let index_hash = match git.run(&["rev-parse", "--git-path", "index"]) {
 		Ok(out) => {
@@ -812,10 +794,10 @@ pub fn validate_export_selection(
 	for item in &selection.items {
 		let key = (&item.root, item.relative_path.as_str());
 		let sources = seen_items.entry(key).or_default();
-		let is_worktree =
-			matches!(item.source, SourceKind::Working | SourceKind::File);
-		let has_worktree = sources.contains(&SourceKind::Working)
-			|| sources.contains(&SourceKind::File);
+		let worktree_kinds =
+			[SourceKind::Working, SourceKind::Unstaged, SourceKind::File];
+		let is_worktree = worktree_kinds.contains(&item.source);
+		let has_worktree = worktree_kinds.iter().any(|k| sources.contains(k));
 		if (is_worktree && sources.contains(&SourceKind::Staged))
 			|| (item.source == SourceKind::Staged && has_worktree)
 		{
@@ -879,46 +861,8 @@ pub fn validate_export_selection(
 	Ok(())
 }
 
-/// Helper to inspect Git blob size before reading content.
-fn git_blob_size(git: &Git, oid: &str) -> Result<u64, TransferError> {
-	let out = git.run(&["cat-file", "-s", oid])?;
-	let s = String::from_utf8_lossy(&out).trim().to_string();
-	s.parse::<u64>().map_err(|_| {
-		TransferError::Git(GitError::Malformed(
-			"invalid cat-file -s output".into(),
-		))
-	})
-}
-
-/// Helper to resolve Git blob OID distinguishing missing objects from permission/corruption errors.
-fn resolve_blob_oid(
-	git: &Git,
-	spec: &str,
-) -> Result<Option<String>, TransferError> {
-	match git.run(&["rev-parse", "--verify", spec]) {
-		Ok(out) => {
-			let oid = String::from_utf8_lossy(&out).trim().to_string();
-			if oid.is_empty() {
-				Ok(None)
-			} else {
-				Ok(Some(oid))
-			}
-		}
-		Err(GitError::Failed { args, stderr }) => {
-			if stderr.is_empty()
-				|| stderr.contains("Needed a single revision")
-				|| stderr.contains("Not a valid object name")
-				|| stderr.contains("does not exist")
-				|| stderr.contains("ambiguous argument")
-			{
-				Ok(None)
-			} else {
-				Err(TransferError::Git(GitError::Failed { args, stderr }))
-			}
-		}
-		Err(e) => Err(TransferError::Git(e)),
-	}
-}
+/// Content (`None`: not UTF-8) and why it was skipped, if it was.
+type ReadContent = (Option<String>, Option<String>);
 
 struct BlobBudget {
 	remaining_budget: Option<usize>,
@@ -928,38 +872,93 @@ struct BlobBudget {
 	bypass_per_file_size: bool,
 }
 
-/// Helper to read Git blob by immutable OID with strict budget cap.
-fn read_git_blob_bounded(
-	git: &Git,
-	oid: &str,
+/// Reads the blob `spec` names through one `cat-file --batch`. Its header
+/// fixes OID and size before any body byte, so an oversized blob is judged
+/// (skipped by the per-file limit, or refused by the payload budget) without
+/// being read. `Ok(None)`: `spec` names nothing. A name that resolves to a
+/// tree or commit is an error, not a missing file.
+fn read_blob_bounded(
+	cat: &mut CatFile,
+	spec: &str,
 	wire_path: &str,
 	budget: &BlobBudget,
-) -> Result<(Option<String>, Option<String>, usize), TransferError> {
-	let blob_size = git_blob_size(git, oid)?;
-	if !budget.bypass_per_file_size
-		&& blob_size as f64 > budget.max_file_size_kb * 1024.0
-	{
-		return Ok((
-			None,
-			Some(format!("size exceeds limit ({blob_size} bytes)")),
-			0,
-		));
+) -> Result<Option<ReadContent>, TransferError> {
+	// Integer sizes: `size > floor(limit)` is exactly `size > limit`.
+	let per_file = (budget.max_file_size_kb * 1024.0) as u64;
+	let mut cap = budget.remaining_budget.map_or(u64::MAX, |b| b as u64);
+	if !budget.bypass_per_file_size {
+		cap = cap.min(per_file);
 	}
-	if let Some(b) = budget.remaining_budget {
-		if blob_size as usize > b {
-			return Err(TransferError::PayloadLimitExceeded {
-				limit: budget.max_payload_bytes.unwrap_or(b),
-				actual: budget.current_total_bytes + blob_size as usize,
+	match cat.read_object(spec, cap)? {
+		CatObject::Missing => Ok(None),
+		CatObject::TooLarge { size, .. } => {
+			if !budget.bypass_per_file_size
+				&& size as f64 > budget.max_file_size_kb * 1024.0
+			{
+				return Ok(Some((
+					None,
+					Some(format!("size exceeds limit ({size} bytes)")),
+				)));
+			}
+			Err(TransferError::PayloadLimitExceeded {
+				limit: budget.max_payload_bytes.unwrap_or(cap as usize),
+				actual: budget
+					.current_total_bytes
+					.saturating_add(size as usize),
 				reason: format!(
 					"file '{wire_path}' exceeds remaining payload budget"
 				),
-			});
+			})
+		}
+		CatObject::Found { kind, body, .. } if kind == "blob" => {
+			Ok(Some((decode_utf8_or_skip(body), None)))
+		}
+		CatObject::Found { kind, .. } => Err(TransferError::Git(
+			GitError::Malformed(format!("'{spec}' is a {kind}, not a file")),
+		)),
+	}
+}
+
+/// One `cat-file --batch` at a time, reopened when the root changes: a
+/// thread holding the cat-file slot must not start a second Git process.
+#[derive(Default)]
+struct BlobReader {
+	open: Option<(CanonicalRootId, CatFile)>,
+}
+
+impl BlobReader {
+	fn get(
+		&mut self,
+		root: &CanonicalRootId,
+		gits: &HashMap<CanonicalRootId, Git>,
+	) -> Result<&mut CatFile, TransferError> {
+		if self.open.as_ref().is_some_and(|(r, _)| r != root) {
+			self.close()?;
+		}
+		if self.open.is_none() {
+			let git = gits.get(root).ok_or_else(|| {
+				TransferError::UnknownRoot(root.path().to_path_buf())
+			})?;
+			self.open = Some((root.clone(), git.cat_file()?));
+		}
+		match self.open.as_mut() {
+			Some((_, cat)) => Ok(cat),
+			None => Err(TransferError::Git(GitError::Malformed(
+				"cat-file unavailable".into(),
+			))),
 		}
 	}
-	let out = git.run(&["cat-file", "-p", oid])?;
-	let text = decode_utf8_or_skip(out);
-	let actual_size = text.as_ref().map_or(0, |s| s.len());
-	Ok((text, None, actual_size))
+
+	fn close(&mut self) -> Result<(), TransferError> {
+		if let Some((_, cat)) = self.open.take() {
+			cat.close()?;
+		}
+		Ok(())
+	}
+}
+
+fn deleted_marker() -> ReadContent {
+	(Some(DELETED_FILE_MARKER.to_string()), None)
 }
 
 fn make_payload_opts<'a, 'f>(
@@ -994,19 +993,49 @@ pub fn plan_export(
 		repos.insert(root.clone(), capture_repo_freshness(root.path())?);
 	}
 
+	// Every Git call except blob reads happens here, before a cat-file
+	// holds this thread's Git slot.
+	let mut gits: HashMap<CanonicalRootId, Git> = HashMap::new();
+	for item in &selection.items {
+		let needs_git = !matches!(item.source, SourceKind::File)
+			|| item.change_type == Some(ChangeType::Deleted);
+		if !needs_git || gits.contains_key(&item.root) {
+			continue;
+		}
+		match Git::open(item.root.path()) {
+			Ok(git) => {
+				gits.insert(item.root.clone(), git);
+			}
+			// A plain folder may still list a deleted file: it gets the marker.
+			Err(GitError::NotARepository(_))
+				if matches!(item.source, SourceKind::File) => {}
+			Err(e) => return Err(e.into()),
+		}
+	}
+	let git_for = |root: &CanonicalRootId| {
+		gits.get(root).ok_or_else(|| {
+			TransferError::UnknownRoot(root.path().to_path_buf())
+		})
+	};
+
 	let mut frozen_commits = HashMap::new();
+	// Frozen commit -> its first parent, where deleted files are read.
+	let mut first_parents: HashMap<String, Option<String>> = HashMap::new();
 	for item in &selection.items {
 		if let SourceKind::Commit { rev } = &item.source {
 			let key = (item.root.clone(), rev.clone());
 			if let std::collections::hash_map::Entry::Vacant(e) =
 				frozen_commits.entry(key)
 			{
-				let git = Git::open(item.root.path())?;
+				let git = git_for(&item.root)?;
 				let oid = git.resolve_commit(rev)?;
+				let parent = git.parents(&oid)?.into_iter().next();
+				first_parents.insert(oid.clone(), parent);
 				e.insert(oid);
 			}
 		}
 	}
+	let mut blobs = BlobReader::default();
 
 	let mut working_files = HashMap::new();
 
@@ -1140,7 +1169,15 @@ pub fn plan_export(
 			bypass_per_file_size: bypass,
 		};
 
-		let (content, skipped_reason, _, freshness_info) = match &item.source {
+		let deleted = item.change_type == Some(ChangeType::Deleted);
+		let rel = &item.relative_path;
+		// The outer `Option` says whether to record freshness; the inner
+		// one is the file's state (`None` = absent).
+		let (content, skipped_reason, freshness_info): (
+			Option<String>,
+			Option<String>,
+			Option<Option<FileFreshness>>,
+		) = match &item.source {
 			SourceKind::Commit { rev } => {
 				let frozen_oid = frozen_commits
 					.get(&(item.root.clone(), rev.clone()))
@@ -1149,231 +1186,187 @@ pub fn plan_export(
 							rev.clone(),
 						))
 					})?;
-				let git = Git::open(item.root.path())?;
-
-				if item.change_type == Some(ChangeType::Deleted) {
-					let parents = git.parents(frozen_oid)?;
-					let parent_oid = parents.first().cloned();
-					let (text, reason, bytes) = if let Some(p) = parent_oid {
-						let blob_rev = format!("{p}:{}", item.relative_path);
-						if let Some(blob_oid) =
-							resolve_blob_oid(&git, &blob_rev)?
-						{
+				let (text, reason) = if deleted {
+					match first_parents.get(frozen_oid).cloned().flatten() {
+						Some(p) => {
+							let spec = format!("{p}:{rel}");
 							// Deleted graph old content bypasses per-file size check!
-							read_git_blob_bounded(
-								&git,
-								&blob_oid,
+							read_blob_bounded(
+								blobs.get(&item.root, &gits)?,
+								&spec,
 								&wire_path,
 								&blob_budget(true),
 							)?
-						} else {
-							(
-								Some(DELETED_FILE_MARKER.to_string()),
-								None,
-								DELETED_FILE_MARKER.len(),
-							)
+							.unwrap_or_else(deleted_marker)
 						}
-					} else {
-						(
-							Some(DELETED_FILE_MARKER.to_string()),
-							None,
-							DELETED_FILE_MARKER.len(),
-						)
-					};
-					(text, reason, bytes, None)
+						None => deleted_marker(),
+					}
 				} else {
-					let blob_rev =
-						format!("{frozen_oid}:{}", item.relative_path);
-					let blob_oid = resolve_blob_oid(&git, &blob_rev)?.ok_or(
-						TransferError::Git(GitError::InvalidRevision(blob_rev)),
-					)?;
-					let (text, reason, bytes) = read_git_blob_bounded(
-						&git,
-						&blob_oid,
+					let spec = format!("{frozen_oid}:{rel}");
+					read_blob_bounded(
+						blobs.get(&item.root, &gits)?,
+						&spec,
 						&wire_path,
 						&blob_budget(false),
-					)?;
-					(text, reason, bytes, None)
-				}
+					)?
+					.ok_or(TransferError::Git(
+						GitError::InvalidRevision(spec),
+					))?
+				};
+				(text, reason, None)
 			}
 			SourceKind::Staged => {
-				let git = Git::open(item.root.path())?;
-				let (text, reason, bytes) = if item.change_type
-					== Some(ChangeType::Deleted)
-				{
-					let blob_rev = format!("HEAD:{}", item.relative_path);
-					if let Some(blob_oid) = resolve_blob_oid(&git, &blob_rev)? {
-						read_git_blob_bounded(
-							&git,
-							&blob_oid,
-							&wire_path,
-							&blob_budget(false),
-						)?
-					} else {
-						(
-							Some(DELETED_FILE_MARKER.to_string()),
-							None,
-							DELETED_FILE_MARKER.len(),
-						)
-					}
-				} else {
-					let blob_rev = format!(":{}", item.relative_path);
-					let blob_oid = resolve_blob_oid(&git, &blob_rev)?.ok_or(
-						TransferError::Git(GitError::InvalidRevision(blob_rev)),
-					)?;
-					let (text, reason, bytes) = read_git_blob_bounded(
-						&git,
-						&blob_oid,
+				let (text, reason) = if deleted {
+					// A staged deletion is gone from the index; HEAD has it.
+					let spec = format!("HEAD:{rel}");
+					read_blob_bounded(
+						blobs.get(&item.root, &gits)?,
+						&spec,
 						&wire_path,
 						&blob_budget(false),
-					)?;
+					)?
+					.unwrap_or_else(deleted_marker)
+				} else {
+					let spec = format!(":{rel}");
+					let (text, reason) = read_blob_bounded(
+						blobs.get(&item.root, &gits)?,
+						&spec,
+						&wire_path,
+						&blob_budget(false),
+					)?
+					.ok_or(TransferError::Git(
+						GitError::InvalidRevision(spec),
+					))?;
 					if reason.is_none() && text.is_none() {
-						(
-							Some(UNREADABLE_FILE_MARKER.to_string()),
-							None,
-							UNREADABLE_FILE_MARKER.len(),
-						)
+						(Some(UNREADABLE_FILE_MARKER.to_string()), None)
 					} else {
-						(text, reason, bytes)
+						(text, reason)
 					}
 				};
-				(text, reason, bytes, None)
+				(text, reason, None)
 			}
-			SourceKind::Working | SourceKind::File => {
-				if item.change_type == Some(ChangeType::Deleted) {
-					let git = Git::open(item.root.path());
-					let mut resolved = None;
-					if let Ok(ref g) = git {
-						for spec in &[
-							format!(":{}", item.relative_path),
-							format!("HEAD:{}", item.relative_path),
-						] {
-							if let Some(oid) = resolve_blob_oid(g, spec)? {
-								resolved = Some((g, oid));
-								break;
-							}
-						}
-					}
-					let (text, reason, bytes) =
-						if let Some((g, blob_oid)) = resolved {
-							read_git_blob_bounded(
-								g,
-								&blob_oid,
-								&wire_path,
-								&blob_budget(false),
-							)?
-						} else {
-							(
-								Some(DELETED_FILE_MARKER.to_string()),
-								None,
-								DELETED_FILE_MARKER.len(),
-							)
-						};
-					(text, reason, bytes, None)
+			SourceKind::Working | SourceKind::Unstaged | SourceKind::File
+				if deleted =>
+			{
+				// Pre-deletion content: `Unstaged` is the worktree against
+				// the index, so the index has it; `Working` is the SCM view
+				// and reads HEAD like gitsrc (TS parity), as does `File`.
+				let spec = if item.source == SourceKind::Unstaged {
+					format!(":{rel}")
 				} else {
-					let sym_meta = fs::symlink_metadata(&absolute)?;
-					let target_meta = if sym_meta.file_type().is_symlink() {
-						let roots = [item.root.path()];
-						if escapes_all_roots(&roots, &absolute) {
-							return Err(TransferError::UnsafePath(
-								absolute.to_string_lossy().into_owned(),
-							));
-						}
-						let canonical = dunce::canonicalize(&absolute)?;
-						if escapes_all_roots(&roots, &canonical) {
-							return Err(TransferError::UnsafePath(
-								canonical.to_string_lossy().into_owned(),
-							));
-						}
-						fs::metadata(&canonical)?
-					} else {
-						sym_meta
-					};
-
-					if !target_meta.file_type().is_file() {
-						return Err(TransferError::SpecialFile(
+					format!("HEAD:{rel}")
+				};
+				let (text, reason) = if gits.contains_key(&item.root) {
+					read_blob_bounded(
+						blobs.get(&item.root, &gits)?,
+						&spec,
+						&wire_path,
+						&blob_budget(false),
+					)?
+					.unwrap_or_else(deleted_marker)
+				} else {
+					deleted_marker()
+				};
+				// The absence is part of the snapshot: recreating the path
+				// before the clipboard write invalidates the export.
+				(text, reason, Some(None))
+			}
+			SourceKind::Working | SourceKind::Unstaged | SourceKind::File => {
+				let sym_meta = fs::symlink_metadata(&absolute)?;
+				let target_meta = if sym_meta.file_type().is_symlink() {
+					let roots = [item.root.path()];
+					if escapes_all_roots(&roots, &absolute) {
+						return Err(TransferError::UnsafePath(
 							absolute.to_string_lossy().into_owned(),
 						));
 					}
+					let canonical = dunce::canonicalize(&absolute)?;
+					if escapes_all_roots(&roots, &canonical) {
+						return Err(TransferError::UnsafePath(
+							canonical.to_string_lossy().into_owned(),
+						));
+					}
+					fs::metadata(&canonical)?
+				} else {
+					sym_meta
+				};
 
-					let file_size = target_meta.len();
-					let per_file_limit =
-						(settings.max_file_size_kb * 1024.0) as u64;
-					if file_size as f64 > settings.max_file_size_kb * 1024.0 {
+				if !target_meta.file_type().is_file() {
+					return Err(TransferError::SpecialFile(
+						absolute.to_string_lossy().into_owned(),
+					));
+				}
+
+				let file_size = target_meta.len();
+				let per_file_limit =
+					(settings.max_file_size_kb * 1024.0) as u64;
+				if file_size as f64 > settings.max_file_size_kb * 1024.0 {
+					(
+						None,
+						Some(format!("size exceeds limit ({file_size} bytes)")),
+						None,
+					)
+				} else {
+					if let Some(budget) = remaining_budget {
+						if file_size as usize > budget {
+							return Err(TransferError::PayloadLimitExceeded {
+								limit: max_payload_bytes.unwrap_or(budget),
+								actual: current_total_bytes
+									+ file_size as usize,
+								reason: format!(
+									"file '{wire_path}' exceeds remaining payload budget"
+								),
+							});
+						}
+					}
+					let read_cap = match remaining_budget {
+						Some(b) => (b as u64).min(per_file_limit),
+						None => per_file_limit,
+					};
+					let mut file = fs::File::open(&absolute)?;
+					let mut handle = (&mut file).take(read_cap + 1);
+					let mut bytes = Vec::with_capacity(file_size as usize);
+					handle.read_to_end(&mut bytes)?;
+					if bytes.len() as u64 > read_cap {
+						if remaining_budget.is_some_and(|b| bytes.len() > b) {
+							return Err(TransferError::PayloadLimitExceeded {
+								limit: max_payload_bytes
+									.unwrap_or(read_cap as usize),
+								actual: current_total_bytes + bytes.len(),
+								reason: format!(
+									"working file '{wire_path}' grew past limit during read"
+								),
+							});
+						}
 						(
 							None,
 							Some(format!(
-								"size exceeds limit ({file_size} bytes)"
+								"size exceeds limit ({} bytes)",
+								bytes.len()
 							)),
-							0,
 							None,
 						)
 					} else {
-						if let Some(budget) = remaining_budget {
-							if file_size as usize > budget {
-								return Err(
-									TransferError::PayloadLimitExceeded {
-										limit: max_payload_bytes
-											.unwrap_or(budget),
-										actual: current_total_bytes
-											+ file_size as usize,
-										reason: format!(
-											"file '{wire_path}' exceeds remaining payload budget"
-										),
-									},
-								);
-							}
-						}
-						let read_cap = match remaining_budget {
-							Some(b) => (b as u64).min(per_file_limit),
-							None => per_file_limit,
+						let mtime = target_meta.modified()?;
+						let content_hash = Sha256::digest(&bytes).into();
+						let freshness = FileFreshness {
+							size: bytes.len() as u64,
+							mtime,
+							content_hash,
 						};
-						let mut file = fs::File::open(&absolute)?;
-						let mut handle = (&mut file).take(read_cap + 1);
-						let mut bytes = Vec::with_capacity(file_size as usize);
-						handle.read_to_end(&mut bytes)?;
-						if bytes.len() as u64 > read_cap {
-							if remaining_budget.is_some_and(|b| bytes.len() > b)
-							{
-								return Err(
-									TransferError::PayloadLimitExceeded {
-										limit: max_payload_bytes
-											.unwrap_or(read_cap as usize),
-										actual: current_total_bytes
-											+ bytes.len(),
-										reason: format!(
-											"working file '{wire_path}' grew past limit during read"
-										),
-									},
-								);
-							} else {
-								(
-									None,
-									Some(format!(
-										"size exceeds limit ({} bytes)",
-										bytes.len()
-									)),
-									0,
-									None,
-								)
-							}
-						} else {
-							let mtime = target_meta.modified()?;
-							let content_hash = Sha256::digest(&bytes).into();
-							let freshness = FileFreshness {
-								size: bytes.len() as u64,
-								mtime,
-								content_hash,
-							};
-							let text = decode_utf8_or_skip(bytes);
-							let actual_len =
-								text.as_ref().map_or(0, |s| s.len());
-							(text, None, actual_len, Some(freshness))
-						}
+						(
+							decode_utf8_or_skip(bytes),
+							None,
+							Some(Some(freshness)),
+						)
 					}
 				}
 			}
 		};
+
+		if let Some(f) = freshness_info {
+			working_files.insert((item.root.clone(), rel.clone()), f);
+		}
 
 		// Drop unreadable/binary files (matching copy.rs and gitsrc.rs)
 		if skipped_reason.is_none() && content.is_none() {
@@ -1432,13 +1425,6 @@ pub fn plan_export(
 		}
 		current_total_bytes += file_delta;
 
-		if let Some(f) = freshness_info {
-			working_files.insert(
-				(item.root.clone(), item.relative_path.clone()),
-				Some(f),
-			);
-		}
-
 		files.push(payload_file);
 	}
 
@@ -1448,6 +1434,8 @@ pub fn plan_export(
 		default_source_root
 	};
 
+	// Revalidation runs Git: the cat-file slot must be free first.
+	blobs.close()?;
 	let freshness = SourceFreshnessSnapshot {
 		repos,
 		frozen_commits,

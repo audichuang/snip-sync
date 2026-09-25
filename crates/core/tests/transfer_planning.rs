@@ -2132,3 +2132,108 @@ fn test_graph_commit_filtered_selection_omits_source_root() {
 	assert_eq!(plan.payload, gitsrc_res.payload);
 	assert_eq!(plan.files, gitsrc_res.files);
 }
+
+// ---------------------------------------------------------------------------
+// Deleted working files: absence is part of the freshness snapshot
+// ---------------------------------------------------------------------------
+
+fn deleted_item(repo: &TestRepo, rel: &str, source: SourceKind) -> ExportItem {
+	ExportItem {
+		root: repo.canonical_id(),
+		relative_path: rel.to_string(),
+		source,
+		change_type: Some(ChangeType::Deleted),
+	}
+}
+
+#[test]
+fn test_working_deleted_absence_invalidates_export_when_recreated() {
+	let src = TestRepo::new("src-repo");
+	src.write("gone.txt", "old body\n");
+	src.commit("c1");
+	fs::remove_file(src.path().join("gone.txt")).unwrap();
+
+	let selection = ExportSelection::new(
+		vec![src.path().to_path_buf()],
+		None,
+		vec![deleted_item(&src, "gone.txt", SourceKind::Working)],
+	)
+	.unwrap();
+	let plan = plan_export(&selection, &Settings::default(), None).unwrap();
+	assert!(plan.payload.contains("old body"));
+	assert!(plan.revalidate().is_ok());
+
+	// Recreated after planning: the "deletion" on the clipboard is stale.
+	src.write("gone.txt", "recreated\n");
+	match plan.revalidate().unwrap_err() {
+		TransferError::StaleSource { reason, .. } => {
+			assert!(reason.contains("gone.txt"), "{reason}");
+		}
+		other => panic!("expected StaleSource, got {other:?}"),
+	}
+	// Planning a deletion whose path exists is stale from the start.
+	let err = plan_export(&selection, &Settings::default(), None).unwrap_err();
+	assert!(matches!(err, TransferError::StaleSource { .. }), "{err:?}");
+}
+
+#[test]
+fn test_deleted_sources_read_distinct_bases_and_match_legacy_working() {
+	let src = TestRepo::new("src-repo");
+	src.write("f.txt", "head body\n");
+	src.write("g.txt", "g head body\n");
+	src.commit("c1");
+	// f: newer content staged, then deleted in the worktree only.
+	src.write("f.txt", "index body\n");
+	src.git(&["add", "f.txt"]);
+	fs::remove_file(src.path().join("f.txt")).unwrap();
+	let payload_for = |source: SourceKind, rel: &str| {
+		let selection = ExportSelection::new(
+			vec![src.path().to_path_buf()],
+			None,
+			vec![deleted_item(&src, rel, source)],
+		)
+		.unwrap();
+		plan_export(&selection, &Settings::default(), None)
+			.unwrap()
+			.payload
+	};
+
+	// Unstaged compares the worktree with the index: the index had it.
+	let unstaged = payload_for(SourceKind::Unstaged, "f.txt");
+	assert!(unstaged.contains("index body") && !unstaged.contains("head body"));
+	// Working is the SCM view and reads HEAD, byte-identical to gitsrc.
+	let working = payload_for(SourceKind::Working, "f.txt");
+	assert!(working.contains("head body") && !working.contains("index body"));
+	let legacy = gitsrc::collect_payload(
+		&src.open(),
+		&GitSource::Working,
+		&[src.path().to_path_buf()],
+		&Settings::default(),
+	)
+	.unwrap();
+	assert_eq!(working, legacy.payload);
+
+	// A staged deletion is gone from the index; HEAD has the old body.
+	src.git(&["rm", "-q", "g.txt"]);
+	let staged = payload_for(SourceKind::Staged, "g.txt");
+	assert!(staged.contains("g head body"), "{staged}");
+}
+
+#[test]
+fn test_broken_index_is_an_error_not_a_deleted_marker() {
+	let src = TestRepo::new("src-repo");
+	src.write("f.txt", "body\n");
+	src.commit("c1");
+	fs::remove_file(src.path().join("f.txt")).unwrap();
+	let index = src.path().join(".git/index");
+	fs::write(&index, b"DIRC garbage that is not an index").unwrap();
+
+	let selection = ExportSelection::new(
+		vec![src.path().to_path_buf()],
+		None,
+		vec![deleted_item(&src, "f.txt", SourceKind::Unstaged)],
+	)
+	.unwrap();
+	let err = plan_export(&selection, &Settings::default(), None).unwrap_err();
+	assert!(matches!(err, TransferError::Git(_)), "{err:?}");
+}
