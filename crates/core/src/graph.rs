@@ -2271,7 +2271,7 @@ mod tests {
 			sha: "c1".into(),
 		};
 		let err = compute_graph_layout(
-			&[c_valid.clone()],
+			std::slice::from_ref(&c_valid),
 			&[bad_ref],
 			None,
 			&GraphConfig::default(),
@@ -2300,7 +2300,7 @@ mod tests {
 			},
 		];
 		let err = compute_graph_layout(
-			&[c_valid.clone()],
+			std::slice::from_ref(&c_valid),
 			&refs,
 			None,
 			&config_refs,
@@ -2467,9 +2467,13 @@ mod tests {
 				sha: "c1".into(),
 			},
 		];
-		let err =
-			fallback_linear_layout(&[c1.clone()], &refs, None, &config_refs)
-				.unwrap_err();
+		let err = fallback_linear_layout(
+			std::slice::from_ref(&c1),
+			&refs,
+			None,
+			&config_refs,
+		)
+		.unwrap_err();
 		assert!(matches!(err, GraphError::RefLimitExceeded { .. }));
 
 		// Exceeding max_total_bytes
