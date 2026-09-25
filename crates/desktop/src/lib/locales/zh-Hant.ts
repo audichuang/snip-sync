@@ -2,6 +2,22 @@ import type en from "./en.ts";
 
 // Traditional Chinese. Must carry every key of `en` (checked by i18n.test.ts).
 const zhHant: Record<keyof typeof en, string> = {
+	projectFiles: "專案檔案",
+	sourcePreview: "預覽",
+	choosePreview: "選取檔案，先確認內容再複製。",
+	fileContent: "內容",
+	loadingPreview: "正在載入預覽…",
+	binaryPreview: "二進位或非 UTF-8 內容無法預覽或以文字複製。",
+	emptyDirectory: "空資料夾",
+	branchesAndTags: "分支與標籤",
+	allBranches: "所有分支",
+	localBranches: "本機分支",
+	remoteBranches: "遠端分支",
+	tags: "標籤",
+	searchHistory: "搜尋 commit 訊息或 SHA",
+	loadedCommits: "已載入 {{count}} 個 commit",
+	loadMoreHistory: "載入更早的 commit",
+
 	appTitle: "snip-sync",
 	language: "English",
 	chooseRepo: "選擇 repo / 資料夾",

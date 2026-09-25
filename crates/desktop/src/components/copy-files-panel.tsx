@@ -14,26 +14,17 @@ import type { CopyRequest } from "../generated/CopyRequest";
 import type { CommitSummary } from "../generated/CommitSummary";
 import type { GitBrowse } from "../generated/GitBrowse";
 import type { GitSourceDto } from "../generated/GitSourceDto";
+import { ChangesTree, FileExplorer, SourcePreviewPane } from "./source-browser";
 
 type SourceKind = "files" | GitSourceDto["kind"];
-
-const SOURCES: {
-	id: SourceKind;
-	label:
-		| "sourceFiles"
-		| "sourceWorking"
-		| "sourceStaged"
-		| "sourceCommit"
-		| "sourceRange";
-}[] = [
+const SOURCES = [
 	{ id: "files", label: "sourceFiles" },
 	{ id: "working", label: "sourceWorking" },
 	{ id: "staged", label: "sourceStaged" },
 	{ id: "commit", label: "sourceCommit" },
 	{ id: "range", label: "sourceRange" },
-];
+] as const;
 
-/** File mode (spec 3.1): pick a source, then copy. */
 export function CopyFilesPanel({
 	repo,
 	onCopy,
@@ -42,8 +33,9 @@ export function CopyFilesPanel({
 	onCopy: (request: CopyRequest) => void;
 }) {
 	const { t } = useTranslation();
-	const [kind, setKind] = useState<SourceKind>("working");
+	const [kind, setKind] = useState<SourceKind>("files");
 	const [paths, setPaths] = useState<string[]>([]);
+	const [extraPaths, setExtraPaths] = useState<string[]>([]);
 	const [sha, setSha] = useState("HEAD");
 	const [base, setBase] = useState("HEAD~1");
 	const [tip, setTip] = useState("HEAD");
@@ -54,87 +46,78 @@ export function CopyFilesPanel({
 	);
 	const [history, setHistory] = useState<CommitSummary[]>([]);
 	const [refresh, setRefresh] = useState(0);
+	const [preview, setPreview] = useState<string | null>(null);
+	const source: GitSourceDto | null =
+		kind === "files"
+			? null
+			: kind === "commit"
+				? { kind, sha }
+				: kind === "range"
+					? { kind, base, tip }
+					: { kind };
+	const sourceKey = JSON.stringify(source);
 
 	useEffect(() => {
 		if (!repo || kind === "files") return;
 		let cancelled = false;
 		const timer = setTimeout(() => {
-			const source: GitSourceDto =
-				kind === "commit"
-					? { kind, sha }
-					: kind === "range"
-						? { kind, base, tip }
-						: { kind };
-			void (async () => {
-				try {
-					const data = await invoke<GitBrowse>("browse_git", {
-						repo,
-						source,
-					});
+			void invoke<GitBrowse>("browse_git", {
+				repo,
+				source: JSON.parse(sourceKey) as GitSourceDto,
+			})
+				.then((data) => {
 					if (!cancelled) {
 						setBrowse(data);
 						setBrowseError("");
 					}
-				} catch (error: unknown) {
+					return null;
+				})
+				.catch((error: unknown) => {
 					if (!cancelled) {
 						setBrowse(null);
 						setBrowseError(String(error));
 					}
-				}
-			})();
+				});
 		}, 200);
 		return () => {
 			cancelled = true;
 			clearTimeout(timer);
 		};
-		// oxlint-disable-next-line react/exhaustive-effect-dependencies -- refresh explicitly reloads the current source
-	}, [repo, kind, sha, base, tip, refresh]);
+		// oxlint-disable-next-line react/exhaustive-effect-dependencies -- explicit refresh reloads the source
+	}, [repo, kind, sourceKey, refresh]);
 
 	useEffect(() => {
-		if (!repo || kind === "files") return;
+		if (!repo) return;
 		let cancelled = false;
-		void (async () => {
-			try {
-				const data = await invoke<CommitSummary[]>("list_commits", {
-					repo,
-					limit: 20,
-				});
+		void invoke<CommitSummary[]>("list_commits", { repo, limit: 20 })
+			.then((data) => {
 				if (!cancelled) setHistory(data);
-			} catch {
+				return null;
+			})
+			.catch(() => {
 				if (!cancelled) setHistory([]);
-			}
-		})();
+			});
 		return () => {
 			cancelled = true;
 		};
-		// oxlint-disable-next-line react/exhaustive-effect-dependencies -- refresh reloads the recent commit picker
-	}, [repo, kind, refresh]);
+		// oxlint-disable-next-line react/exhaustive-effect-dependencies -- explicit refresh reloads history
+	}, [repo, refresh]);
 
+	function resetBrowse() {
+		setBrowse(null);
+		setBrowseError("");
+		setSelectedPaths(null);
+		setPreview(null);
+	}
 	function changeSource(next: SourceKind) {
 		setKind(next);
-		setBrowse(null);
-		setBrowseError("");
-		setSelectedPaths(null);
+		resetBrowse();
 	}
-	function changeRevision(setter: (value: string) => void, value: string) {
+	function revision(setter: (value: string) => void, value: string) {
 		setter(value);
-		setBrowse(null);
-		setBrowseError("");
-		setSelectedPaths(null);
+		resetBrowse();
 	}
-
-	function togglePath(path: string) {
-		setSelectedPaths((prev) => {
-			const next = new Set(
-				prev ?? browse?.changes.map((c) => c.path) ?? [],
-			);
-			if (next.has(path)) next.delete(path);
-			else next.add(path);
-			return next;
-		});
-	}
-
-	async function handleAdd(directory: boolean) {
+	async function addPaths(directory: boolean) {
 		const picked = await open({
 			multiple: true,
 			directory,
@@ -142,113 +125,83 @@ export function CopyFilesPanel({
 		});
 		const list =
 			picked === null ? [] : Array.isArray(picked) ? picked : [picked];
-		setPaths((prev) => [...new Set([...prev, ...list])]);
+		setExtraPaths((prev) => [...new Set([...prev, ...list])]);
 	}
-
-	function handleCopy() {
-		// No repo: send no roots so the backend reports "No workspace folder found."
+	const selected =
+		selectedPaths ?? new Set(browse?.changes.map((c) => c.path) ?? []);
+	const selectedCount =
+		kind === "files" ? paths.length + extraPaths.length : selected.size;
+	function copy() {
 		const roots = repo ? [repo] : [];
-		if (kind === "files") {
-			onCopy({ kind: "files", roots, paths });
+		if (source) {
+			onCopy({
+				kind: "git",
+				repo,
+				roots,
+				source,
+				selected_paths: [...selected],
+			});
 			return;
 		}
-		const source: GitSourceDto =
-			kind === "commit"
-				? { kind, sha }
-				: kind === "range"
-					? { kind, base, tip }
-					: { kind };
+		const top = paths.filter(
+			(p) =>
+				!paths.some(
+					(parent) => parent !== p && p.startsWith(`${parent}/`),
+				),
+		);
 		onCopy({
-			kind: "git",
-			repo,
+			kind: "files",
 			roots,
-			source,
-			selected_paths: selectedPaths ? [...selectedPaths] : null,
+			paths: [...top.map((p) => `${repo}/${p}`), ...extraPaths],
 		});
 	}
-
-	const folders = new Map<string, NonNullable<GitBrowse>["changes"]>();
-	for (const change of browse?.changes ?? []) {
-		const folder = change.path.includes("/")
-			? change.path.slice(0, change.path.lastIndexOf("/"))
-			: ".";
-		folders.set(folder, [...(folders.get(folder) ?? []), change]);
-	}
-	const selectedCount = selectedPaths
-		? selectedPaths.size
-		: (browse?.changes.length ?? 0);
-
 	return (
-		<div className="flex flex-col gap-4">
-			<ToggleButtonGroup
-				selectionMode="single"
-				disallowEmptySelection
-				selectedKeys={[kind]}
-				onSelectionChange={(keys) => {
-					const [next] = keys;
-					if (next !== undefined) changeSource(next as SourceKind);
-				}}
-			>
-				{SOURCES.map((s, i) => (
-					<ToggleButton
-						key={s.id}
-						id={s.id}
-						data-testid={`source-${s.id}`}
+		<div className="flex min-h-0 flex-1 flex-col gap-3">
+			<div className="flex flex-wrap items-center justify-between gap-2">
+				<ToggleButtonGroup
+					selectionMode="single"
+					disallowEmptySelection
+					selectedKeys={[kind]}
+					onSelectionChange={(keys) => {
+						const [next] = keys;
+						if (next !== undefined && next !== kind)
+							changeSource(next as SourceKind);
+					}}
+				>
+					{SOURCES.map((s, i) => (
+						<ToggleButton
+							key={s.id}
+							id={s.id}
+							data-testid={`source-${s.id}`}
+						>
+							{i > 0 && <ToggleButtonGroup.Separator />}
+							{t(s.label)}
+						</ToggleButton>
+					))}
+				</ToggleButtonGroup>
+				<div className="flex items-center gap-3">
+					<span className="text-sm text-muted">
+						{t("selectedFiles", { count: selectedCount })}
+					</span>
+					<Button
+						data-testid="copy-files"
+						isDisabled={
+							selectedCount === 0 || (kind !== "files" && !browse)
+						}
+						onPress={copy}
 					>
-						{i > 0 && <ToggleButtonGroup.Separator />}
-						{t(s.label)}
-					</ToggleButton>
-				))}
-			</ToggleButtonGroup>
-
-			{kind === "files" && (
-				<div className="flex flex-col gap-2">
-					<div className="flex gap-2">
-						<Button
-							size="sm"
-							variant="secondary"
-							onPress={() => void handleAdd(false)}
-						>
-							{t("addFiles")}
-						</Button>
-						<Button
-							size="sm"
-							variant="secondary"
-							onPress={() => void handleAdd(true)}
-						>
-							{t("addFolders")}
-						</Button>
-						<Button
-							size="sm"
-							variant="ghost"
-							isDisabled={paths.length === 0}
-							onPress={() => setPaths([])}
-						>
-							{t("clearPaths")}
-						</Button>
-					</div>
-					{paths.length === 0 ? (
-						<p className="text-sm text-muted">{t("noPaths")}</p>
-					) : (
-						<ul className="max-h-60 overflow-auto rounded border border-border p-2 font-mono text-xs">
-							{paths.map((p) => (
-								<li key={p} className="truncate">
-									{p}
-								</li>
-							))}
-						</ul>
-					)}
+						{t("copy")}
+					</Button>
 				</div>
-			)}
-
+			</div>
 			{kind === "commit" && (
-				<div className="flex flex-col gap-2">
+				<div className="flex gap-3">
 					<select
 						data-testid="history-commit"
 						aria-label={t("recentCommits")}
-						className="max-w-xl rounded border border-border bg-background p-2 text-sm"
 						value={history.some((c) => c.sha === sha) ? sha : ""}
-						onChange={(e) => changeRevision(setSha, e.target.value)}
+						onChange={(e) => revision(setSha, e.target.value)}
+						className="min-w-0 rounded border border-border p-2 text-sm"
 					>
 						<option value="">{t("recentCommits")}</option>
 						{history.map((c) => (
@@ -258,203 +211,202 @@ export function CopyFilesPanel({
 						))}
 					</select>
 					<TextField
-						className="max-w-sm"
 						value={sha}
-						onChange={(value) => changeRevision(setSha, value)}
+						onChange={(value) => revision(setSha, value)}
 					>
 						<Label>{t("commitSha")}</Label>
-						<Input data-testid="commit-sha" className="font-mono" />
+						<Input data-testid="commit-sha" />
 					</TextField>
 				</div>
 			)}
-
-			{kind !== "files" && (
-				<section
-					data-testid="git-browser"
-					data-loading={!browse && !browseError}
-					className="flex min-h-0 flex-col gap-2 rounded border border-border p-3"
+			{kind === "range" && (
+				<div className="flex gap-3">
+					<TextField
+						value={base}
+						onChange={(value) => revision(setBase, value)}
+					>
+						<Label>{t("rangeBase")}</Label>
+						<Input data-testid="range-base" />
+					</TextField>
+					<TextField
+						value={tip}
+						onChange={(value) => revision(setTip, value)}
+					>
+						<Label>{t("rangeTip")}</Label>
+						<Input data-testid="range-tip" />
+					</TextField>
+				</div>
+			)}
+			<div className="flex min-h-0 flex-1 gap-3">
+				<aside
+					className="flex min-h-0 w-80 shrink-0 resize-x flex-col overflow-auto rounded border border-border bg-default/30"
+					style={{ minWidth: 220, maxWidth: "50%" }}
 				>
-					<div className="flex flex-wrap items-center gap-2 text-sm">
-						<strong>
-							{browse
-								? `${browse.branch} · ${browse.scope || "."}`
+					<div className="flex items-center justify-between border-b border-border px-3 py-2">
+						<strong className="text-sm">
+							{kind === "files"
+								? t("projectFiles")
 								: t("gitChanges")}
 						</strong>
-						{browse && (
-							<span
-								className="truncate font-mono text-xs text-muted"
-								title={browse.root}
-							>
-								{browse.root}
-							</span>
-						)}
-						<span className="ml-auto">
-							{t("selectedFiles", { count: selectedCount })}
-						</span>
 						<Button
 							size="sm"
 							variant="ghost"
 							data-testid="refresh-changes"
 							onPress={() => {
-								setSelectedPaths(null);
-								setBrowse(null);
-								setBrowseError("");
+								resetBrowse();
 								setRefresh((n) => n + 1);
 							}}
 						>
 							{t("refreshChanges")}
 						</Button>
 					</div>
-					{browseError && (
-						<p className="text-sm text-danger">{browseError}</p>
-					)}
-					{browse && (
+					{kind === "files" ? (
 						<>
-							<div className="flex gap-3 text-xs">
-								<button
-									type="button"
-									data-testid="select-all-changes"
-									onClick={() => setSelectedPaths(null)}
-								>
-									{t("selectAll")}
-								</button>
-								<button
-									type="button"
-									data-testid="clear-changes"
-									onClick={() => setSelectedPaths(new Set())}
-								>
-									{t("clearSelection")}
-								</button>
-							</div>
-							{browse.changes.length === 0 ? (
-								<p className="text-sm text-muted">
-									{t("noGitChanges")}
-								</p>
-							) : (
-								<div
-									data-testid="git-changes"
-									className="max-h-64 overflow-auto font-mono text-xs"
-								>
-									{[...folders]
-										.toSorted(([a], [b]) =>
-											a.localeCompare(b),
-										)
-										.map(([folder, changes]) => (
-											<details key={folder} open>
-												<summary className="cursor-pointer py-1 font-semibold">
-													{folder}
-												</summary>
-												{changes.map((change) => (
-													<label
-														key={change.path}
-														className="flex cursor-pointer items-center gap-2 py-1 pl-4"
-													>
-														<input
-															type="checkbox"
-															data-testid={`git-change-${change.path}`}
-															checked={
-																selectedPaths
-																	? selectedPaths.has(
-																			change.path,
-																		)
-																	: true
-															}
-															onChange={() =>
-																togglePath(
-																	change.path,
-																)
-															}
-														/>
-														<span className="w-20 shrink-0 text-muted">
-															{change.changeType}
-														</span>
-														<span
-															className="truncate"
-															title={change.path}
-														>
-															{change.path.slice(
-																folder === "."
-																	? 0
-																	: folder.length +
-																			1,
-															)}
-														</span>
-													</label>
-												))}
-											</details>
-										))}
-								</div>
+							{repo && (
+								<FileExplorer
+									key={`${repo}:${refresh}`}
+									repo={repo}
+									paths={paths}
+									onPaths={setPaths}
+									onPreview={setPreview}
+								/>
 							)}
-							{history.length > 0 && (
-								<div className="border-t border-border pt-2">
-									<strong className="text-sm">
-										{t("recentCommits")}
+							<div className="mt-auto border-t border-border p-2">
+								<div className="flex flex-wrap gap-1">
+									<Button
+										size="sm"
+										variant="ghost"
+										onPress={() => void addPaths(false)}
+									>
+										{t("addFiles")}
+									</Button>
+									<Button
+										size="sm"
+										variant="ghost"
+										onPress={() => void addPaths(true)}
+									>
+										{t("addFolders")}
+									</Button>
+									<Button
+										size="sm"
+										variant="ghost"
+										onPress={() => {
+											setPaths([]);
+											setExtraPaths([]);
+										}}
+									>
+										{t("clearPaths")}
+									</Button>
+								</div>
+								{extraPaths.map((p) => (
+									<p key={p} className="truncate text-xs">
+										{p}
+									</p>
+								))}
+							</div>
+						</>
+					) : (
+						<div
+							data-testid="git-browser"
+							data-loading={!browse && !browseError}
+							className="flex min-h-0 flex-1 flex-col"
+						>
+							{browse && (
+								<div className="border-b border-border p-2 text-xs">
+									<strong>
+										{browse.branch} · {browse.scope || "."}
 									</strong>
-									<div className="max-h-36 overflow-auto">
-										{history.map((c) => (
-											<button
-												key={c.sha}
-												type="button"
-												data-testid={`history-row-${c.sha}`}
-												className="flex w-full items-center gap-3 rounded px-2 py-1 text-left text-xs hover:bg-accent-soft"
-												onClick={() => {
-													changeSource("commit");
-													changeRevision(
-														setSha,
-														c.sha,
-													);
-												}}
-											>
-												<span className="font-mono text-muted">
-													{c.sha.slice(0, 8)}
-												</span>
-												<span className="min-w-0 flex-1 truncate">
-													{c.subject}
-												</span>
-												<span className="shrink-0 text-muted">
-													{c.authorName}
-												</span>
-											</button>
-										))}
+									<p
+										className="truncate text-muted"
+										title={browse.root}
+									>
+										{browse.root}
+									</p>
+									<div className="mt-2 flex gap-3">
+										<button
+											type="button"
+											data-testid="select-all-changes"
+											onClick={() =>
+												setSelectedPaths(null)
+											}
+										>
+											{t("selectAll")}
+										</button>
+										<button
+											type="button"
+											data-testid="clear-changes"
+											onClick={() =>
+												setSelectedPaths(new Set())
+											}
+										>
+											{t("clearSelection")}
+										</button>
 									</div>
 								</div>
 							)}
-						</>
+							{browseError && (
+								<p
+									role="alert"
+									className="p-3 text-sm text-danger"
+								>
+									{browseError}
+								</p>
+							)}
+							{browse && (
+								<div
+									data-testid="git-changes"
+									className="min-h-32 flex-1 overflow-auto p-2"
+								>
+									{browse.changes.length > 0 ? (
+										<ChangesTree
+											changes={browse.changes}
+											selected={selected}
+											onSelected={setSelectedPaths}
+											onPreview={setPreview}
+										/>
+									) : (
+										<p className="text-sm text-muted">
+											{t("noGitChanges")}
+										</p>
+									)}
+								</div>
+							)}
+							{history.length > 0 && (
+								<details
+									open
+									className="border-t border-border p-2"
+								>
+									<summary className="text-sm">
+										{t("recentCommits")}
+									</summary>
+									<div className="max-h-36 overflow-auto">
+										{history.map((c) => (
+											<button
+												type="button"
+												key={c.sha}
+												data-testid={`history-row-${c.sha}`}
+												className="block w-full truncate py-1 text-left text-xs"
+												onClick={() => {
+													changeSource("commit");
+													setSha(c.sha);
+												}}
+											>
+												{c.sha.slice(0, 8)} ·{" "}
+												{c.subject}
+											</button>
+										))}
+									</div>
+								</details>
+							)}
+						</div>
 					)}
-				</section>
-			)}
-
-			{kind === "range" && (
-				<div className="flex flex-wrap gap-4">
-					<TextField
-						className="w-48"
-						value={base}
-						onChange={(value) => changeRevision(setBase, value)}
-					>
-						<Label>{t("rangeBase")}</Label>
-						<Input data-testid="range-base" className="font-mono" />
-					</TextField>
-					<TextField
-						className="w-48"
-						value={tip}
-						onChange={(value) => changeRevision(setTip, value)}
-					>
-						<Label>{t("rangeTip")}</Label>
-						<Input data-testid="range-tip" className="font-mono" />
-					</TextField>
-				</div>
-			)}
-
-			<div>
-				<Button
-					data-testid="copy-files"
-					isDisabled={
-						kind !== "files" && (!browse || selectedCount === 0)
-					}
-					onPress={handleCopy}
-				>
-					{t("copy")}
-				</Button>
+				</aside>
+				<SourcePreviewPane
+					key={`${sourceKey}:${preview ?? ""}`}
+					repo={repo}
+					path={preview}
+					source={source}
+				/>
 			</div>
 		</div>
 	);

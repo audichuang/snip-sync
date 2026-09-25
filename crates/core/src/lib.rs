@@ -1,5 +1,6 @@
 //! snip-core: shared logic for the snip CLI and desktop app.
 
+pub mod browser;
 pub mod clip;
 pub mod commits;
 pub mod copy;
