@@ -54,8 +54,9 @@ impl TestRepo {
 		let dir = tempfile::tempdir().unwrap();
 		let cfg = dir.path().join("empty.gitconfig");
 		fs::write(&cfg, "").unwrap();
-		let repo_path = dir.path().join(name);
-		fs::create_dir_all(&repo_path).unwrap();
+		let raw_path = dir.path().join(name);
+		fs::create_dir_all(&raw_path).unwrap();
+		let repo_path = dunce::canonicalize(&raw_path).unwrap_or(raw_path);
 		let repo = Self {
 			_dir: dir,
 			repo_path,
@@ -943,10 +944,37 @@ content 2
 
 	match err {
 		TransferError::TargetCollision { path, msg } => {
-			assert_eq!(path, dst.path().join("target.txt"));
+			assert_eq!(path, dst.canonical_id().path().join("target.txt"));
 			assert!(msg.contains("multiple operations target"));
 		}
 		other => panic!("expected TargetCollision, got {other:?}"),
+	}
+	assert!(!dst.canonical_id().path().join("target.txt").exists());
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_root = symlink_dir.path().join("symlink_collision_dst");
+		std::os::unix::fs::symlink(dst.path(), &symlink_root).unwrap();
+
+		// Even when destination root is spelled through a symlink alias,
+		// plan_import canonicalizes it, rejects duplicate target, and reports the canonical target.
+		let err_symlink = plan_import(
+			clipboard_text,
+			"// file: $FILE_PATH",
+			&[symlink_root],
+			&mapping,
+		)
+		.unwrap_err();
+
+		match err_symlink {
+			TransferError::TargetCollision { path, msg } => {
+				assert_eq!(path, dst.canonical_id().path().join("target.txt"));
+				assert!(msg.contains("multiple operations target"));
+			}
+			other => panic!("expected TargetCollision, got {other:?}"),
+		}
+		assert!(!dst.canonical_id().path().join("target.txt").exists());
 	}
 }
 
@@ -1308,11 +1336,13 @@ fn test_missing_root_rejected_at_boundaries() {
 	let err2 = ExportSelection::new(
 		vec![r1.path().to_path_buf()],
 		None,
-		vec![undeclared_item],
+		vec![undeclared_item.clone()],
 	)
 	.unwrap_err();
 	match err2 {
-		TransferError::UnknownRoot(p) => assert_eq!(p, r2.path()),
+		TransferError::UnknownRoot(p) => {
+			assert_eq!(p, r2.canonical_id().path())
+		}
 		other => panic!("expected UnknownRoot, got: {other:?}"),
 	}
 
@@ -1326,8 +1356,77 @@ fn test_missing_root_rejected_at_boundaries() {
 	)
 	.unwrap_err();
 	match err3 {
-		TransferError::UnknownRoot(p) => assert_eq!(p, r2.path()),
+		TransferError::UnknownRoot(p) => {
+			assert_eq!(p, r2.canonical_id().path())
+		}
 		other => panic!("expected UnknownRoot, got: {other:?}"),
+	}
+
+	// Deleted root: capture canonical identity BEFORE deletion, then delete from filesystem.
+	let deleted_temp = tempfile::tempdir().unwrap();
+	let deleted_path = dunce::canonicalize(deleted_temp.path()).unwrap();
+	let deleted_id = CanonicalRootId::new(&deleted_path).unwrap();
+	let expected_deleted_path = deleted_id.path().to_path_buf();
+	// Drop the TempDir so the root no longer exists on disk
+	drop(deleted_temp);
+	assert!(!expected_deleted_path.exists());
+
+	// Attempting to declare the deleted root in ExportSelection fails because validate() requires existing canonical root
+	let err_deleted_selection =
+		ExportSelection::new(vec![expected_deleted_path.clone()], None, vec![])
+			.unwrap_err();
+	assert!(matches!(err_deleted_selection, TransferError::Io(_)));
+
+	// If an undeclared item references this deleted root id, UnknownRoot accurately reports the pre-captured identity
+	let undeclared_deleted_item = ExportItem {
+		root: deleted_id,
+		relative_path: "test.txt".to_string(),
+		source: SourceKind::Working,
+		change_type: None,
+	};
+	let err_undeclared_deleted = ExportSelection::new(
+		vec![r1.path().to_path_buf()],
+		None,
+		vec![undeclared_deleted_item],
+	)
+	.unwrap_err();
+	match err_undeclared_deleted {
+		TransferError::UnknownRoot(p) => assert_eq!(p, expected_deleted_path),
+		other => panic!("expected UnknownRoot, got: {other:?}"),
+	}
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let r1_symlink = symlink_dir.path().join("r1_symlink");
+		std::os::unix::fs::symlink(r1.path(), &r1_symlink).unwrap();
+
+		let err_symlink = ExportSelection::new(
+			vec![r1_symlink.clone()],
+			None,
+			vec![undeclared_item],
+		)
+		.unwrap_err();
+		match err_symlink {
+			TransferError::UnknownRoot(p) => {
+				assert_eq!(p, r2.canonical_id().path())
+			}
+			other => panic!("expected UnknownRoot, got: {other:?}"),
+		}
+
+		let err_import_symlink = plan_import(
+			"// file: test.txt\ncontent\n",
+			"// file: $FILE_PATH",
+			&[r1_symlink],
+			&mapping,
+		)
+		.unwrap_err();
+		match err_import_symlink {
+			TransferError::UnknownRoot(p) => {
+				assert_eq!(p, r2.canonical_id().path())
+			}
+			other => panic!("expected UnknownRoot, got: {other:?}"),
+		}
 	}
 }
 
