@@ -155,7 +155,7 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
 | 3 跨工具 | 同一 repo 與設定下,Rust 產生的 payload 等於 TS 產生的;Rust 能還原 TS 與 Kotlin 產生的 payload,反之亦然 | ✅ |
 | 4 真實剪貼簿 | 寫入系統剪貼簿再讀回:Unicode、大 payload、換行 | ✅ Windows / macOS runner 有桌面;Linux 用 xvfb |
 | 5 前端 | 比照 aghub:`node --test` 跑 `src/**/*.test.ts`(純邏輯與 source-scan 守衛);`typecheck`、oxlint、prettier | ✅ |
-| 6 操作真實 App | `crates/desktop/e2e/scenarios.mjs`:`tauri-driver`(WebDriver)操作真的 App,19 個情境(commit 模式、檔案模式、Git 瀏覽器與 monorepo 選取)各建新的 git repo,完成後以 git 驗證。Windows 走 msedgedriver(`windows-2022`)、Linux 走 WebKitWebDriver | ✅ Windows / Linux |
+| 6 操作真實 App | `crates/desktop/e2e/scenarios.mjs`:`tauri-driver`(WebDriver)操作真的 App,22 個情境(commit 模式、檔案模式、Git 瀏覽器、monorepo 檔案樹與預覽、分支圖和歷史分頁;IDE 情境放在 `workspace-scenarios.mjs`)各建新的 git repo,完成後以 git 驗證。Windows 走 msedgedriver(`windows-2022`)、Linux 走 WebKitWebDriver | ✅ Windows / Linux |
 | | macOS 的 WKWebView 沒有 WebDriver | ❌ 手動 |
 | | 系統匣選單本身 | ❌ 各平台都難以自動化 |
 

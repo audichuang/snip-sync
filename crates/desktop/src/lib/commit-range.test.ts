@@ -66,13 +66,13 @@ test("range selection uses the older end's first parent as base", () => {
 	});
 });
 
-test("a range down to the root commit is 'last n' only from HEAD", () => {
+test("root-inclusive ranges are pinned to their chosen tip, even off HEAD", () => {
 	assert.deepEqual(toCommitSelection(log, { anchor: "a", end: "e" }), {
 		ok: true,
-		selection: { kind: "last", n: 5 },
+		selection: { kind: "from", tip: "e", n: 5 },
 	});
 	assert.deepEqual(toCommitSelection(log, { anchor: "a", end: "c" }), {
-		ok: false,
-		reason: "rootRangeUnsupported",
+		ok: true,
+		selection: { kind: "from", tip: "c", n: 3 },
 	});
 });

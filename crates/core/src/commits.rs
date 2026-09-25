@@ -148,9 +148,19 @@ pub fn select_range(
 
 /// The last `n` commits on HEAD's first-parent chain, oldest first.
 pub fn select_last(git: &Git, n: usize) -> Result<Vec<String>, CommitError> {
+	select_last_from(git, "HEAD", n)
+}
+
+/// Select from an explicit tip, including a root on a non-current branch.
+pub fn select_last_from(
+	git: &Git,
+	tip: &str,
+	n: usize,
+) -> Result<Vec<String>, CommitError> {
 	if n == 0 {
 		return Err(CommitError::Empty);
 	}
+	let tip = git.resolve_commit(tip)?;
 	let count = n.to_string();
 	let out = git.run(&[
 		"rev-list",
@@ -158,7 +168,7 @@ pub fn select_last(git: &Git, n: usize) -> Result<Vec<String>, CommitError> {
 		"--parents",
 		"-n",
 		&count,
-		"HEAD",
+		&tip,
 	])?;
 	let chain = contiguous_chain(git, &out)?;
 	if chain.len() < n {
