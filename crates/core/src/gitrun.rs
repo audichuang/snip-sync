@@ -1150,24 +1150,6 @@ pub(crate) fn parse_ps_group_liveness(
 			)));
 		}
 
-		let primary = stat.as_bytes()[0];
-
-		// Valid primary process states on BSD/Darwin and Linux:
-		// BSD/Darwin: I (idle), R (running), S (sleeping), T (stopped), U (uninterruptible), Z (zombie)
-		// Linux: D, I, R, S, T, t, W, X, Z
-		let is_zombie = match primary {
-			b'Z' => true,
-			b'D' | b'I' | b'R' | b'S' | b'T' | b't' | b'U' | b'W' | b'X' => {
-				false
-			}
-			_ => {
-				return Err(io::Error::other(format!(
-					"unknown primary process state {:?} in line {line_idx}",
-					primary as char
-				)));
-			}
-		};
-
 		let pgid: i32 = pgid_str.parse::<i32>().map_err(|e| {
 			io::Error::other(format!(
 				"invalid non-numeric pgid {:?} in line {line_idx}: {e}",
@@ -1180,8 +1162,28 @@ pub(crate) fn parse_ps_group_liveness(
 			)));
 		}
 
-		if pgid == target_pgid && !is_zombie {
-			has_live = true;
+		// Only inspect process state for processes belonging to the target process group.
+		// Unrelated system processes (which may have Darwin '?' or other states) must not
+		// poison the target group's cleanup.
+		if pgid == target_pgid {
+			let primary = stat.as_bytes()[0];
+			match primary {
+				// Only 'Z' (SZOMB) is proven dead.
+				b'Z' => {}
+				// Recognized live process states on BSD/Darwin and Linux:
+				b'D' | b'I' | b'R' | b'S' | b'T' | b't' | b'U' | b'W'
+				| b'X' => {
+					has_live = true;
+				}
+				// Any unknown state (including '?') for the target group must stay fail-closed
+				// and must never count as dead.
+				_ => {
+					return Err(io::Error::other(format!(
+						"unknown primary process state {:?} for target process group {target_pgid} in line {line_idx}",
+						primary as char
+					)));
+				}
+			}
 		}
 	}
 
@@ -2232,5 +2234,57 @@ mod tests {
 		assert!(parse_ps_group_liveness(b"Ss abc\n", 100).is_err());
 		// Negative
 		assert!(parse_ps_group_liveness(b"Ss -10\n", 100).is_err());
+	}
+
+	#[test]
+	fn parse_ps_group_liveness_regression_matrix() {
+		// 1. Unrelated group has '?' status, target group has 'Z': must succeed (clean, zero live)
+		let out_unrelated_unknown = b"? 999\nZ 100\n";
+		assert!(
+			!parse_ps_group_liveness(out_unrelated_unknown, 100).unwrap(),
+			"unrelated '?' must not poison clean target 'Z'"
+		);
+
+		// 2. Target group has unknown '?' status: must stay fail closed (Err)
+		let out_target_unknown = b"Ss 1\n? 100\n";
+		assert!(
+			parse_ps_group_liveness(out_target_unknown, 100).is_err(),
+			"target '?' must fail closed"
+		);
+
+		// 3. Target group has 'S': must report live remaining (true)
+		let out_target_live = b"? 999\nS 100\n";
+		assert!(
+			parse_ps_group_liveness(out_target_live, 100).unwrap(),
+			"target 'S' must report live remaining"
+		);
+
+		// 4. Mixed target rows: 'Z' and 'S': must report live remaining (true)
+		let out_target_mixed = b"Z 100\nS 100\n";
+		assert!(
+			parse_ps_group_liveness(out_target_mixed, 100).unwrap(),
+			"mixed target Z and S must report live remaining"
+		);
+
+		// 5. Invalid PGID: must strictly fail (Err)
+		let out_invalid_pgid = b"Z 100\nS not_a_number\n";
+		assert!(
+			parse_ps_group_liveness(out_invalid_pgid, 100).is_err(),
+			"invalid PGID must strictly fail"
+		);
+
+		// 6. Negative PGID: must strictly fail (Err)
+		let out_neg_pgid = b"Z 100\nS -1\n";
+		assert!(
+			parse_ps_group_liveness(out_neg_pgid, 100).is_err(),
+			"negative PGID must strictly fail"
+		);
+
+		// 7. Malformed columns: must strictly fail (Err)
+		let out_malformed = b"Z 100\nS 100 extra\n";
+		assert!(
+			parse_ps_group_liveness(out_malformed, 100).is_err(),
+			"extra columns must strictly fail"
+		);
 	}
 }
