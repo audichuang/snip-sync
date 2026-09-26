@@ -10,7 +10,6 @@ Exit codes:
   2  required checks failed, or a required tool/display/IME is missing while
      SNIP_REQUIRE_ALL_TESTS=1
   3  required checks passed, but a documented platform limit remains
-     (internal focus change does not reset the XIM context)
   0  when tools are missing and SNIP_REQUIRE_ALL_TESTS is unset: prints
      UNSUPPORTED and does not claim the IME was exercised
 """
@@ -1222,9 +1221,9 @@ def _exercise(session: Session, result: dict) -> int:
             "fieldCopy": back_copy,
         }
     if focus_limit:
-        result["platformLimits"].append(
-            "Clicking btn-head keeps the Fcitx candidate. GPUI resets XIM only on "
-            "X11 FocusOut, and an in-window focus change is not one."
+        failures.append(
+            "Clicking btn-head keeps the Fcitx candidate; the vendored GPUI "
+            "click-reset patch (vendor/gpui/SNIP_PATCH.md) is not in effect."
         )
     result["phases"].append(
         {"name": "focus-switch", "candidateCleared": not focus_limit}

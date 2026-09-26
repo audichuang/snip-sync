@@ -110,7 +110,9 @@ just preflight
 ## 4. 平台實況、已知限制與阻礙（Blockers & Gaps）
 
 1. **中文輸入（IME）**：
-   - 在當前 Linux X11 測試主機上，GPUI 僅驗證繁體中文字型渲染（`Noto Sans CJK TC`）；中文輸入法候選字窗定位與預編輯字串（pre-edit string）**目前未在實體輸入環境下驗證，標記為未驗證之缺口**。
+   - Linux X11 + Fcitx5 拼音已用 `scripts/check_native_ime.py` 實測（私有 Xvfb／D-Bus／Fcitx 設定，結束碼 0）：候選窗跟著搜尋框插入點、縮放後跟著移動，組字／送出／搜尋／退格正確，組字中點其他控制項候選窗會消失。
+   - 最後一項靠 `vendor/gpui` 的本地 patch：GPUI 0.2.2 只在 `composing` 時於點擊 reset XIM，Fcitx 預設 off-the-spot 模式不會設它。升級 gpui 時照 `vendor/gpui/SNIP_PATCH.md` 重做。
+   - 未驗證：Wayland（text-input-v3）、macOS、Windows 的 IME。
 2. **跨平台實機**：
    - 本機為 Linux x86_64；macOS（Metal）與 Windows（DirectX）實機效能與記憶體開銷尚未於對應硬體上實測，不可假定數值與 Linux 一致。
 3. **Linux 系統編譯先決條件（Defect 7）**：
