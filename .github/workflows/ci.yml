@@ -368,9 +368,10 @@ jobs:
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
     # Native real OS input E2E test on Linux X11 (headless with Xvfb and xdotool).
-    # Tests crates/desktop-native/tests/smoke.rs with real input events, screenshots,
-    # and software graphics fallback (Mesa/Gallium llvmpipe). Runs in isolation
-    # to avoid display or system clipboard contention with other test suites.
+    # Tests crates/desktop-native/tests/smoke.rs and tests/lifecycle.rs with real
+    # input events, screenshots, and software graphics fallback (Mesa/Gallium
+    # llvmpipe). Runs in isolation to avoid display or system clipboard
+    # contention with other test suites.
     native-smoke:
         name: Native Smoke (Linux)
         runs-on: ubuntu-24.04
@@ -391,12 +392,12 @@ jobs:
               with:
                   shared-key: ${{ runner.os }}-native-smoke
                   cache-on-failure: true
-            - name: Install Linux system dependencies (X11, Xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts, software GL/Vulkan, Wayland)
+            - name: Install Linux system dependencies (X11, Xvfb, xdotool, xclip, x11-apps, imagemagick, xkbcommon, fonts, software GL/Vulkan, Wayland)
               run: |
                   sudo apt-get update
                   sudo apt-get install -y \
-                      libxkbcommon-dev libxkbcommon-x11-dev \
-                      xvfb xdotool x11-apps imagemagick \
+                      libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
+                      xvfb xdotool xclip x11-apps imagemagick \
                       fonts-dejavu-core fonts-noto-cjk \
                       libfontconfig1-dev libfreetype6-dev \
                       libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
@@ -416,6 +417,15 @@ jobs:
                   ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$SNIP_E2E_OUT/smoke.log"
                   test -s "$SNIP_E2E_OUT/smoke.log" || { echo "Missing or empty smoke.log" >&2; exit 1; }
                   python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "$SNIP_E2E_OUT"
+            - name: Run native lifecycle tests (close/reopen/quit drain, copy and paste cancel)
+              shell: bash
+              env:
+                  SNIP_E2E_OUT: ${{ runner.temp }}/native-e2e-artifacts
+              run: |
+                  mkdir -p "$SNIP_E2E_OUT"
+                  set -o pipefail
+                  ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test lifecycle --locked -- --nocapture 2>&1 | tee "$SNIP_E2E_OUT/lifecycle.log"
+                  test -s "$SNIP_E2E_OUT/lifecycle.log" || { echo "Missing or empty lifecycle.log" >&2; exit 1; }
             - name: Upload native smoke screenshots and logs
               if: always()
               uses: actions/upload-artifact@v4

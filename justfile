@@ -13,7 +13,7 @@ fmt:
 	cargo fmt --all
 
 # Mirrors CI's Rust checks (see .github/workflows/ci.yml for the rest).
-preflight: preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke
+preflight: preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke native-lifecycle
 
 preflight-rust:
 	cargo fmt --all --check
@@ -53,6 +53,12 @@ native-smoke out="target/native-e2e-artifacts":
 	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$1/smoke.log"' _ "{{out}}"
 	test -s "{{out}}/smoke.log"
 	python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "{{out}}"
+
+# Real X11 close/reopen/quit drain and copy/paste cancel checks (tests/lifecycle.rs).
+native-lifecycle out="target/native-e2e-artifacts":
+	mkdir -p "{{out}}"
+	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test lifecycle --locked -- --nocapture 2>&1 | tee "$1/lifecycle.log"' _ "{{out}}"
+	test -s "{{out}}/lifecycle.log"
 
 # Package native desktop candidate bundle (Linux, macOS, Windows).
 package-native target out bin version:
