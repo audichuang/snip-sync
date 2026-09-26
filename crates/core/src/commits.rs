@@ -1157,15 +1157,40 @@ pub fn plan_commit_replay(
 	git: &Git,
 	payload: &CommitsPayload,
 ) -> CommitReplayPlan {
+	plan_commit_replay_with(git, payload, &RunOptions::default())
+		.expect("replay planning with default options has no cancel token")
+}
+
+/// [`plan_commit_replay`] that polls `opts` before each commit and file.
+///
+/// Each file still goes through the same `plan_file` rules. Encoding classification reads
+/// at most 8 MiB in one `read` ([`crate::fsutil::must_not_overwrite`]); that
+/// call cannot be interrupted. The token is checked before the next file.
+pub fn plan_commit_replay_with(
+	git: &Git,
+	payload: &CommitsPayload,
+	opts: &RunOptions,
+) -> Result<CommitReplayPlan, CommitError> {
+	refuse_if_cancelled(opts, "replay-plan")?;
 	let root = git.root().to_path_buf();
-	CommitReplayPlan {
-		commits: payload
-			.commits
-			.iter()
-			.map(|c| plan_commit(&root, c))
-			.collect(),
-		root,
+	let mut commits = Vec::new();
+	for commit in &payload.commits {
+		refuse_if_cancelled(opts, "replay-plan")?;
+		let mut files = Vec::new();
+		for file in &commit.files {
+			refuse_if_cancelled(opts, "replay-plan")?;
+			files.push(plan_file(&root, file));
+		}
+		commits.push(CommitPlan {
+			message: commit.message.clone(),
+			author_name: commit.author_name.clone(),
+			author_email: commit.author_email.clone(),
+			author_date: commit.author_date.clone(),
+			files,
+		});
 	}
+	refuse_if_cancelled(opts, "replay-plan")?;
+	Ok(CommitReplayPlan { commits, root })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]

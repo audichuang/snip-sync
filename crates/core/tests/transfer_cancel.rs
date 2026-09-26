@@ -11,6 +11,9 @@ use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use snip_core::commits::{
+	CommitFile, CommitRecord, CommitsPayload, FileChange,
+};
 use snip_core::copy;
 use snip_core::format::ChangeType;
 use snip_core::gitrun::{
@@ -20,7 +23,8 @@ use snip_core::gitsrc::{self, Git, GitError, GitSource};
 use snip_core::settings::Settings;
 use snip_core::transfer::{
 	plan_commit_export_exact_with, plan_export, plan_export_with,
-	CanonicalRootId, ExportItem, ExportSelection, SourceKind, TransferError,
+	plan_import_with, CanonicalRootId, CommitReplayPreview, ExportItem,
+	ExportSelection, ImportMapping, SourceKind, TransferError,
 };
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -813,4 +817,306 @@ fn inflight_cancel_during_exact_selector_sees_real_work() {
 	if let Some(handle) = owned.handle.take() {
 		handle.join().expect("selector thread panicked");
 	}
+}
+
+/// Stalls `phase`, cancels only after that git is inside the shim, and
+/// returns the error plus the argv log. The permit must already be free
+/// and the descendant dead when this returns.
+fn stall_then_cancel(
+	phase: &str,
+	run: impl FnOnce(RunOptions) -> Result<(), TransferError> + Send + 'static,
+) -> (TransferError, String) {
+	let ready_dir = tempfile::tempdir().unwrap();
+	let ready = ready_dir.path().join("ready");
+	let log_path = ready_dir.path().join("git.log");
+	std::env::set_var("SNIP_GIT_LOG", &log_path);
+	let _env = EnvGuard::arm(phase, &ready);
+	let cancel = CancelToken::new();
+	let token = cancel.clone();
+	let (tx, rx) = mpsc::channel();
+	let handle = thread::spawn(move || {
+		let opts = cancelled_opts(token);
+		let _ = tx.send(run(opts));
+	});
+	let mut owned = ExportThread {
+		cancel: cancel.clone(),
+		pid: None,
+		handle: Some(handle),
+	};
+	let deadline = Instant::now() + Duration::from_secs(8);
+	let pid = loop {
+		if owned.handle.as_ref().is_some_and(|h| h.is_finished()) {
+			panic!(
+				"{phase} returned before the shim stalled: {:?}",
+				rx.try_recv()
+			);
+		}
+		if let Ok(text) = fs::read_to_string(&ready) {
+			if let Ok(pid) = text.trim().parse::<u32>() {
+				if pid > 0 {
+					break pid;
+				}
+			}
+		}
+		assert!(Instant::now() < deadline, "git shim never reached {phase}");
+		thread::sleep(Duration::from_millis(10));
+	};
+	owned.pid = Some(pid);
+	let log = fs::read_to_string(&log_path).unwrap_or_default();
+	assert!(
+		in_flight() >= 1,
+		"{phase} did not hold a runner slot; log:\n{log}"
+	);
+	cancel.cancel();
+	let result = match rx.recv_timeout(Duration::from_secs(5)) {
+		Ok(result) => result,
+		Err(timeout) => panic!(
+			"{phase} did not return within 5s ({timeout}); opts were not connected to that git call\n{log}"
+		),
+	};
+	let err = result.expect_err("cancelled preview returned a plan");
+	assert_cancelled(err_ref(&err));
+	assert_dead(pid);
+	assert_runner_idle();
+	owned.pid = None;
+	if let Some(handle) = owned.handle.take() {
+		handle.join().expect("preview thread panicked");
+	}
+	(err, log)
+}
+
+fn err_ref(err: &TransferError) -> TransferError {
+	match err {
+		TransferError::Git(GitError::Cancelled { args }) => {
+			TransferError::Git(GitError::Cancelled { args: args.clone() })
+		}
+		other => panic!("expected Cancelled, got {other:?}"),
+	}
+}
+
+fn assert_index_git_after_head(log: &str) {
+	let lines: Vec<&str> = log.lines().collect();
+	let head = lines.iter().position(|line| {
+		let args: Vec<&str> = line.split('\t').collect();
+		args.contains(&"symbolic-ref")
+	});
+	let index = lines.iter().position(|line| {
+		let args: Vec<&str> = line.split('\t').collect();
+		args.contains(&"--git-path")
+	});
+	let head = head.unwrap_or_else(|| panic!("no symbolic-ref; log:\n{log}"));
+	let index = index.unwrap_or_else(|| panic!("no index git; log:\n{log}"));
+	assert!(head < index, "index git ran before HEAD ref; log:\n{log}");
+	assert!(
+		lines[..head]
+			.iter()
+			.any(|line| line.split('\t').any(|arg| arg == "rev-parse")),
+		"no rev-parse before HEAD ref; log:\n{log}"
+	);
+}
+
+fn repo_fingerprint(repo: &TestRepo) -> (String, String, Vec<u8>, Vec<u8>) {
+	let head = repo.git(&["rev-parse", "HEAD"]);
+	let branch = repo.git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+	let index = fs::read(repo.path().join(".git/index")).unwrap();
+	let keep = fs::read(repo.path().join("keep.txt")).unwrap();
+	(head, branch, index, keep)
+}
+
+#[test]
+fn inflight_cancel_during_replay_preview_after_head_and_index_git() {
+	let _s = serial();
+	let repo = TestRepo::new("replay-preview-cancel");
+	repo.write("keep.txt", "keep\n");
+	repo.write("big.txt", &"x".repeat(32 * 1024));
+	repo.commit("base");
+	let before = repo_fingerprint(&repo);
+	let big_before = fs::read(repo.path().join("big.txt")).unwrap();
+	assert!(!repo.path().join("added.txt").exists());
+	let path = repo.path().to_path_buf();
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files: vec![
+				CommitFile {
+					path: "big.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some("incoming\n".into()),
+					not_copied: None,
+				},
+				CommitFile {
+					path: "added.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("new\n".into()),
+					not_copied: None,
+				},
+			],
+		}],
+	};
+	let (_err, log) = stall_then_cancel("--git-path", move |opts| {
+		CommitReplayPreview::capture_with(&path, &payload, &opts).map(|_| ())
+	});
+	assert_index_git_after_head(&log);
+	assert_eq!(repo_fingerprint(&repo), before);
+	assert_eq!(fs::read(repo.path().join("big.txt")).unwrap(), big_before);
+	assert!(!repo.path().join("added.txt").exists());
+	assert_runner_idle();
+}
+
+#[test]
+fn inflight_cancel_during_plan_import_after_head_and_index_git() {
+	let _s = serial();
+	let repo = TestRepo::new("import-preview-cancel");
+	repo.write("keep.txt", "keep\n");
+	repo.commit("base");
+	let before = repo_fingerprint(&repo);
+	assert!(!repo.path().join("incoming.txt").exists());
+	let path = repo.path().to_path_buf();
+	let root_id = repo.canonical_id();
+	let text = "\
+// file: incoming.txt
+hello preview
+// file: more.txt
+second
+";
+	let (_err, log) = stall_then_cancel("--git-path", move |opts| {
+		let mapping = ImportMapping::with_primary(root_id);
+		plan_import_with(text, "// file: $FILE_PATH", &[path], &mapping, &opts)
+			.map(|_| ())
+	});
+	assert_index_git_after_head(&log);
+	assert_eq!(repo_fingerprint(&repo), before);
+	assert!(!repo.path().join("incoming.txt").exists());
+	assert!(!repo.path().join("more.txt").exists());
+	assert_runner_idle();
+}
+
+#[test]
+fn precancel_replay_preview_and_plan_import_write_nothing() {
+	let _s = serial();
+	let repo = TestRepo::new("preview-precancel");
+	repo.write("keep.txt", "keep\n");
+	repo.commit("base");
+	let before = repo_fingerprint(&repo);
+	let token = CancelToken::new();
+	token.cancel();
+	let opts = cancelled_opts(token);
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "added.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("new\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let replay_err =
+		CommitReplayPreview::capture_with(repo.path(), &payload, &opts)
+			.expect_err("precancel must not capture a replay preview");
+	assert_cancelled(replay_err);
+	let import_err = plan_import_with(
+		"// file: incoming.txt\nhello\n",
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&ImportMapping::with_primary(repo.canonical_id()),
+		&opts,
+	)
+	.expect_err("precancel must not build an import plan");
+	assert_cancelled(import_err);
+	assert_eq!(repo_fingerprint(&repo), before);
+	assert!(!repo.path().join("added.txt").exists());
+	assert!(!repo.path().join("incoming.txt").exists());
+	assert_runner_idle();
+}
+
+#[test]
+fn inflight_cancel_during_replay_revalidate_after_head_and_index_git() {
+	let _s = serial();
+	let repo = TestRepo::new("replay-revalidate-cancel");
+	repo.write("keep.txt", "keep\n");
+	repo.write("big.txt", &"x".repeat(32 * 1024));
+	repo.commit("base");
+	let before = repo_fingerprint(&repo);
+	let big_before = fs::read(repo.path().join("big.txt")).unwrap();
+	assert!(!repo.path().join("added.txt").exists());
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files: vec![
+				CommitFile {
+					path: "big.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some("incoming\n".into()),
+					not_copied: None,
+				},
+				CommitFile {
+					path: "added.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("new\n".into()),
+					not_copied: None,
+				},
+			],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload)
+		.expect("setup capture must succeed");
+	let (_err, log) = stall_then_cancel("--git-path", move |opts| {
+		preview.revalidate_with(&opts)
+	});
+	assert_index_git_after_head(&log);
+	assert_eq!(repo_fingerprint(&repo), before);
+	assert_eq!(fs::read(repo.path().join("big.txt")).unwrap(), big_before);
+	assert!(!repo.path().join("added.txt").exists());
+	assert_runner_idle();
+}
+
+#[test]
+fn precancel_replay_revalidate_writes_nothing() {
+	let _s = serial();
+	let repo = TestRepo::new("replay-revalidate-precancel");
+	repo.write("keep.txt", "keep\n");
+	repo.commit("base");
+	let before = repo_fingerprint(&repo);
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "keep.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("new\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload)
+		.expect("setup capture must succeed");
+	let token = CancelToken::new();
+	token.cancel();
+	let opts = cancelled_opts(token);
+	let err = preview
+		.revalidate_with(&opts)
+		.expect_err("precancel must not revalidate");
+	assert_cancelled(err);
+	assert_eq!(repo_fingerprint(&repo), before);
+	assert_runner_idle();
 }
