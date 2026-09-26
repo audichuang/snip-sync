@@ -21,7 +21,7 @@
 //!   returns an error. It reads with `std::fs`.
 //! - `gitsrc::list_changed_paths` from `load_change_list` in `history.rs`.
 //! - `gitsrc::read_changed_file` and the private `collect_changes` it uses,
-//!   both via `Git::run` with [`RunOptions::default`]. `browser::git_preview_with`
+//!   both via `Git::run` with [`snip_core::gitrun::RunOptions::default`]. `browser::git_preview_with`
 //!   calls `read_changed_file` before its own diff. Native reaches that from
 //!   `read_preview`, `select_commit_file`, and `load_change_list`.
 //! - Paste-preview planning is a separate core API and is not wired here.
@@ -48,7 +48,7 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
-	/// Read whose [`RunOptions`] receives this job's token.
+	/// Read whose [`snip_core::gitrun::RunOptions`] receives this job's token.
 	CancellableRead,
 	/// Read or export preparation whose core API has no token. Drain it.
 	UncancellableRead,
