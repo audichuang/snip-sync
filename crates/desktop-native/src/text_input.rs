@@ -17,6 +17,14 @@ use gpui::{
 
 use crate::theme::*;
 
+macro_rules! ime_trace {
+	($($arg:tt)*) => {
+		if std::env::var_os("SNIP_IME_TRACE").is_some() {
+			eprintln!("[IME_TRACE] {}", format!($($arg)*));
+		}
+	};
+}
+
 gpui::actions!(
 	text_input,
 	[
@@ -91,6 +99,11 @@ pub struct TextInput {
 	last_layout: Option<ShapedLine>,
 	last_bounds: Option<Bounds<Pixels>>,
 	is_selecting: bool,
+	/// Last caret rectangle published to the platform IME, in logical pixels.
+	last_ime_anchor: Option<[i32; 4]>,
+	/// Extra publishes after the caret moves. XIM may not be connected on the
+	/// first frame, and `invalidate_character_coordinates` runs on a later frame.
+	ime_anchor_retries: u8,
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -113,6 +126,8 @@ impl TextInput {
 			last_layout: None,
 			last_bounds: None,
 			is_selecting: false,
+			last_ime_anchor: None,
+			ime_anchor_retries: 0,
 		}
 	}
 
@@ -131,6 +146,8 @@ impl TextInput {
 			last_layout: None,
 			last_bounds: None,
 			is_selecting: false,
+			last_ime_anchor: None,
+			ime_anchor_retries: 0,
 		}
 	}
 
@@ -150,6 +167,9 @@ impl TextInput {
 
 	pub const MAX_INPUT_CHARS: usize = 1024;
 	pub const MAX_TOTAL_CHARS: usize = 4096;
+	/// Frames to republish the caret after it moves. The XIM connection is
+	/// created asynchronously, and GPUI applies the spot on a later frame.
+	const IME_ANCHOR_REPUBLISH: u8 = 3;
 
 	pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
 		let bounded: String =
@@ -481,6 +501,12 @@ impl TextInput {
 			.map(|r| utf16_range_in_str(&to_insert, r))
 			.map(|r| r.start + start..r.end + start)
 			.unwrap_or_else(|| start + inserted_len..start + inserted_len);
+		ime_trace!(
+			"mark bytes={} marked={:?} selected={:?}",
+			to_insert.len(),
+			self.marked_range,
+			self.selected_range
+		);
 	}
 
 	pub fn handle_unmark(&mut self) -> bool {
@@ -579,15 +605,10 @@ impl EntityInputHandler for TextInput {
 	) -> Option<Bounds<Pixels>> {
 		let last_layout = self.last_layout.as_ref()?;
 		let range = self.range_from_utf16(&range_utf16);
-		Some(Bounds::from_corners(
-			point(
-				bounds.left() + last_layout.x_for_index(range.start),
-				bounds.top(),
-			),
-			point(
-				bounds.left() + last_layout.x_for_index(range.end),
-				bounds.bottom(),
-			),
+		Some(range_bounds_in_element(
+			bounds,
+			last_layout.x_for_index(range.start),
+			last_layout.x_for_index(range.end),
 		))
 	}
 
@@ -644,6 +665,31 @@ pub fn grapheme_next_boundary(s: &str, offset: usize) -> usize {
 		.next()
 		.map(|(i, g)| clamped + i + g.len())
 		.unwrap_or(s.len())
+}
+
+/// Rectangle of a text range inside a single-line element. A caret passes
+/// the same x twice; GPUI sends that rectangle's bottom-right corner as
+/// the XIM spot.
+pub fn range_bounds_in_element(
+	element: Bounds<Pixels>,
+	x_start: Pixels,
+	x_end: Pixels,
+) -> Bounds<Pixels> {
+	Bounds::from_corners(
+		point(element.left() + x_start, element.top()),
+		point(element.left() + x_end, element.bottom()),
+	)
+}
+
+/// Stable logical-pixel key for the caret rectangle. Used only to avoid
+/// republishing an unchanged spot every frame.
+pub fn ime_anchor_key(bounds: Bounds<Pixels>) -> [i32; 4] {
+	[
+		f32::from(bounds.origin.x).round() as i32,
+		f32::from(bounds.origin.y).round() as i32,
+		f32::from(bounds.size.width).round() as i32,
+		f32::from(bounds.size.height).round() as i32,
+	]
 }
 
 pub fn bound_text_admission(
@@ -830,18 +876,52 @@ impl Element for TextElement {
 			return;
 		};
 		let _ = line.paint(bounds.origin, window.line_height(), window, cx);
-		if focus_handle
+		let focused = focus_handle
 			.as_ref()
-			.is_some_and(|fh| fh.is_focused(window))
-		{
+			.is_some_and(|fh| fh.is_focused(window));
+		if focused {
 			if let Some(cursor) = prepaint.cursor.take() {
 				window.paint_quad(cursor);
 			}
 		}
+		// GPUI forwards XNSpotLocation only after invalidate_character_coordinates.
+		// Fcitx places the candidate on the client-window bottom when that spot
+		// was never set. Republish for a few frames so a late XIM connection
+		// still receives the caret.
+		let anchor = {
+			let input = self.input.read(cx);
+			let x = line.x_for_index(input.cursor_offset());
+			ime_anchor_key(range_bounds_in_element(bounds, x, x))
+		};
+		let mut publish_ime = false;
 		self.input.update(cx, |input, _| {
 			input.last_layout = Some(line);
 			input.last_bounds = Some(bounds);
+			if focused {
+				if input.last_ime_anchor != Some(anchor) {
+					input.last_ime_anchor = Some(anchor);
+					input.ime_anchor_retries = TextInput::IME_ANCHOR_REPUBLISH;
+				}
+				if input.ime_anchor_retries > 0 {
+					input.ime_anchor_retries -= 1;
+					publish_ime = true;
+				}
+			} else {
+				input.last_ime_anchor = None;
+				input.ime_anchor_retries = 0;
+			}
 		});
+		if publish_ime {
+			ime_trace!(
+				"anchor x={} y={} w={} h={}",
+				anchor[0],
+				anchor[1],
+				anchor[2],
+				anchor[3]
+			);
+			window.invalidate_character_coordinates();
+			window.request_animation_frame();
+		}
 	}
 }
 
@@ -1087,5 +1167,28 @@ mod tests {
 			outside_pt,
 		);
 		assert_eq!(outside_index, None);
+	}
+
+	#[test]
+	fn test_caret_anchor_is_the_field_baseline() {
+		// Field sits inside the window. The spot GPUI sends is this
+		// rectangle's bottom-right corner, which is the caret baseline.
+		let field =
+			Bounds::new(point(px(120.0), px(470.0)), size(px(180.0), px(16.0)));
+		let caret = range_bounds_in_element(field, px(0.0), px(0.0));
+		assert_eq!(f32::from(caret.origin.x), 120.0);
+		assert_eq!(f32::from(caret.origin.y), 470.0);
+		assert_eq!(f32::from(caret.bottom()), 486.0);
+		let spot_y = f32::from(caret.origin.y + caret.size.height);
+		assert_eq!(spot_y, 486.0);
+
+		let moved = range_bounds_in_element(
+			Bounds::new(point(px(120.0), px(350.0)), size(px(180.0), px(16.0))),
+			px(12.0),
+			px(12.0),
+		);
+		assert_ne!(ime_anchor_key(caret), ime_anchor_key(moved));
+		assert_eq!(ime_anchor_key(moved)[0], 132);
+		assert_eq!(ime_anchor_key(moved)[1], 350);
 	}
 }
