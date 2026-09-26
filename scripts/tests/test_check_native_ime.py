@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import unittest
 
-from PIL import Image
-
 from scripts.check_native_ime import (
     associated_candidate,
     bright_popups,
@@ -17,6 +15,27 @@ from scripts.check_native_ime import (
     rect,
     shutdown_graceful,
 )
+
+
+class Bitmap:
+    """The three Pillow calls `bright_popups` makes, so this suite stays stdlib-only."""
+
+    def __init__(self, width: int, height: int) -> None:
+        self.size = (width, height)
+        self._lit: dict[tuple[int, int], tuple[int, int, int]] = {}
+
+    def putpixel(self, xy: tuple[int, int], colour: tuple[int, int, int]) -> None:
+        self._lit[xy] = colour
+
+    def convert(self, mode: str) -> "Bitmap":
+        assert mode == "RGB", mode
+        return self
+
+    def load(self) -> "Bitmap":
+        return self
+
+    def __getitem__(self, xy: tuple[int, int]) -> tuple[int, int, int]:
+        return self._lit.get(xy, (0, 0, 0))
 
 
 class TestImeGate(unittest.TestCase):
@@ -51,7 +70,7 @@ class TestImeGate(unittest.TestCase):
         self.assertFalse(verdict["anchored"])
 
     def test_bright_bar_is_measured_from_pixels(self) -> None:
-        image = Image.new("RGB", (160, 100), (0, 0, 0))
+        image = Bitmap(160, 100)
         for y in range(60, 88):
             for x in range(12, 140):
                 image.putpixel((x, y), (250, 250, 250))
