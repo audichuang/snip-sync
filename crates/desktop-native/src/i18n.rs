@@ -1,0 +1,601 @@
+//! Internationalization (i18n) dictionary for snip-desktop-native.
+//!
+//! Provides clean zh-TW (traditional Chinese, default) and en (English) translations
+//! to avoid messy inline mixed bilingual strings.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Locale {
+	#[default]
+	ZhTw,
+	En,
+}
+
+pub trait IntoMsgArgs {
+	fn into_args(self) -> Vec<String>;
+}
+
+impl<const N: usize> IntoMsgArgs for [String; N] {
+	fn into_args(self) -> Vec<String> {
+		self.into_iter().collect()
+	}
+}
+
+impl IntoMsgArgs for Vec<String> {
+	fn into_args(self) -> Vec<String> {
+		self
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Msg {
+	pub key: &'static str,
+	pub args: Vec<String>,
+}
+
+impl Msg {
+	pub fn new(key: &'static str, args: impl IntoMsgArgs) -> Self {
+		Self {
+			key,
+			args: args.into_args(),
+		}
+	}
+
+	pub fn render(&self, loc: Locale) -> String {
+		let arg_strs: Vec<&str> =
+			self.args.iter().map(|s| s.as_str()).collect();
+		tf(self.key, loc, &arg_strs)
+	}
+}
+
+impl std::fmt::Display for Msg {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.render(Locale::ZhTw))
+	}
+}
+
+pub fn tf<T: std::fmt::Display>(key: &str, loc: Locale, args: &[T]) -> String {
+	let raw = t(key, loc);
+	if raw.is_empty() {
+		if args.is_empty() {
+			return key.to_string();
+		}
+		let mut res = key.to_string();
+		res.push_str(" (");
+		for (i, a) in args.iter().enumerate() {
+			if i > 0 {
+				res.push_str(", ");
+			}
+			res.push_str(&a.to_string());
+		}
+		res.push(')');
+		return res;
+	}
+	let mut res = String::new();
+	let mut arg_iter = args.iter();
+	let mut chars = raw.chars().peekable();
+	while let Some(c) = chars.next() {
+		if c == '{' && chars.peek() == Some(&'}') {
+			chars.next();
+			if let Some(arg) = arg_iter.next() {
+				res.push_str(&arg.to_string());
+			} else {
+				res.push_str("{}");
+			}
+		} else {
+			res.push(c);
+		}
+	}
+	let remaining: Vec<String> = arg_iter.map(|a| a.to_string()).collect();
+	if !remaining.is_empty() {
+		res.push_str(" [");
+		res.push_str(&remaining.join(", "));
+		res.push(']');
+	}
+	res
+}
+
+pub fn t(key: &str, loc: Locale) -> &'static str {
+	match loc {
+		Locale::ZhTw => match key {
+			"app_title" => "snip-sync 原生工作台",
+			"prototype_tag" => "GPUI 原生切片原型",
+			"repos_title" => "儲存庫列表",
+			"tab_changes" => "變更清單",
+			"tab_files" => "檔案總覽",
+			"history_title" => "Commit 歷史",
+			"preview_title" => "內容預覽",
+			"btn_copy" => "複製選取籃",
+			"btn_copying" => "正在複製...",
+			"btn_copy_empty" => "未選取檔案 (無法複製)",
+			"btn_copy_commit_readonly" => "Commit 歷史唯讀 (無法複製)",
+			"btn_paste" => "貼上預覽",
+			"btn_deselect_all" => "全不選",
+			"btn_select_all" => "全選",
+			"btn_refresh" => "重新整理",
+			"btn_discovery_continue" => "繼續搜尋",
+			"btn_discovery_retry" => "重試搜尋",
+			"btn_add_repo" => "新增",
+			"add_repo_placeholder" => "儲存庫路徑...",
+			"repo_kind_worktree" => "工作樹",
+			"repo_kind_submodule" => "子模組",
+			"repo_kind_uninit_submodule" => "未初始化",
+			"repo_detached" => "分離 HEAD",
+			"repo_unborn" => "未建立分支",
+			"btn_apply_paste" => "確認套用還原",
+			"btn_cancel_paste" => "取消還原",
+			"btn_toggle_lang" => "EN",
+			"tag_staged" => "已暫存",
+			"tag_unstaged" => "未暫存",
+			"tag_untracked" => "未追蹤",
+			"tag_conflict" => "衝突",
+			"tag_nested_repo" => "巢狀儲存庫",
+			"destination_label" => "還原目的目錄",
+			"overwrite_label" => "允許覆寫既有檔案",
+			"overwrite_off_default" => "(預設關閉)",
+			"paste_preview_heading" => "剪貼簿貼上預覽",
+			"paste_apply_busy" => "正在套用還原至目的目錄...",
+			"paste_applied" => "貼上還原完成",
+			"paste_cancelled" => "已取消貼上預覽",
+			"clean_working_copy" => "目前沒有未提交的變更檔案。",
+			"find_placeholder" => "在檔案中搜尋",
+			"jump_placeholder" => "行號...",
+			"btn_jump" => "跳至行",
+			"btn_copy_view" => "複製預覽文字",
+			"truncated_notice" => "[注意: 內容過長，已截斷顯示前 {} 行 / {}KB]",
+			"binary_notice" => "[二進位檔案，無法顯示文字預覽 (包含 NUL 位元組)]",
+			"nav_hint" => "↑/↓ 導覽, 空白鍵切換選取, Alt+1/2 切換儲存庫, Ctrl+C 複製, Ctrl+V 貼上預覽, Ctrl+Q 退出",
+			"filter_all_refs" => "全部分支與標籤",
+			"filter_head" => "HEAD",
+			"page_prev" => "◀ 上一頁",
+			"page_next" => "下一頁 ▶",
+			"tree_truncated" => "[已截斷顯示前 150 項]",
+			"tree_read_error" => "[無法讀取目錄]",
+			"dest_changed_error" => "目的地檔案在預覽建立後已被修改，已阻止套用以維護安全，請重新預覽。",
+			"project" => "專案",
+			"changes" => "變更",
+			"git_log" => "Git 記錄",
+			"log_tab" => "記錄",
+			"hide" => "隱藏",
+			"working_changes" => "工作目錄變更",
+			"select_none" => "全不選",
+			"clean" => "乾淨",
+			"counts_tip" => "+ 已暫存　~ 未暫存　? 未追蹤　! 衝突",
+			"refs_all" => "全部 refs",
+			"refs_local" => "本機分支",
+			"refs_remote" => "遠端追蹤分支",
+			"refs_tags" => "標籤",
+			"col_message" => "訊息",
+			"col_author" => "作者",
+			"col_date" => "日期",
+			"col_hash" => "雜湊",
+			"empty_log" => "沒有 commit",
+			"src_working_file" => "工作目錄檔案",
+			"src_working_diff" => "工作目錄變更",
+			"commit_files" => "此 commit 變更的檔案（唯讀）",
+			"no_file" => "未開啟檔案",
+			"paste_tab" => "貼上預覽",
+			"apply" => "套用",
+			"cancel" => "取消",
+			"applying" => "套用中…",
+			"paste_busy_refused" => "正在寫入目的地，無法中途取消或變更；請等待完成",
+			"op_create" => "建立",
+			"op_overwrite" => "覆寫",
+			"op_delete" => "刪除",
+			"op_skip" => "跳過",
+			"op_excluded" => "已排除",
+			"overwrite_toggle" => "覆寫",
+			"reason_create" => "目的地不存在，將建立新檔",
+			"reason_overwrite" => "將覆寫目的地既有檔案",
+			"reason_exists" => "目的地已存在；覆寫預設關閉，將跳過",
+			"reason_delete" => "將刪除目的地檔案，不寫入內容",
+			"reason_delete_missing" => "目的地不存在，無需刪除",
+			"reason_excluded" => "已排除，不會寫入",
+			"paste_keys" => "Enter 套用 · Esc 取消 · ↑↓ 切換項目 · 空白鍵切換",
+			"copy_from" => "複製來源",
+			"selected" => "已選",
+			"repos_count" => "個儲存庫",
+			"no_repo" => "未選取儲存庫",
+			"project_rev_title" => "專案 (commit {})",
+			"changes_title" => "變更 ({})",
+			"tip_ref_selector" => "切換分支 / 標籤 (目前: {})",
+			"src_vs_first_parent_merge" => "與 first-parent 比較 (共 {} 個 parent)",
+			"src_commit_file" => "Commit {} 的檔案",
+			"src_compare" => "比較 {}..{}",
+			"compare_header" => "比較 {}..{}",
+			"commit_meta" => "作者: {} · 日期: {} · 父節點: {}",
+			"changed_files" => "{} 個變更檔案",
+			"tip_compare" => "已選取 {} 個 commit 進行比較",
+			"error_history" => "無法讀取 Git 歷史: {}",
+			"group_staged" => "已暫存變更",
+			"group_unstaged" => "變更",
+			"group_untracked" => "未追蹤檔案",
+			"group_conflicted" => "衝突檔案",
+			"src_staged_diff" => "已暫存變更",
+			"src_unstaged_diff" => "未暫存變更",
+			"btn_copy_commits" => "複製 Commits",
+			"tip_copy_commits" => "複製選取的 commits 範圍至剪貼簿",
+			"status_commits_copied" => "已複製 {} 個 commit 至剪貼簿",
+			"status_replay_done" => "Replay 完成：建立 {} 個 commit",
+			"search_note" => "找到 {} 筆符合的 commit",
+			"collapsed_n" => "+{} 個已收合節點",
+			"status_copy_source" => "選取籃 {} 項",
+			"status_repo_count" => "{} 個儲存庫 ({} 個異常)",
+			"status_goto" => "已跳至第 {} 行",
+			"status_goto_invalid" => "無效的行號 (總行數: {})",
+			"status_copied_selection" => "已複製選取文字 ({} 個字元)",
+			"status_clipboard_failed" => "剪貼簿操作失敗: {}",
+			"status_clipboard_read_failed" => "讀取剪貼簿失敗: {}",
+			"status_copied_preview" => "已複製預覽文字",
+			"status_deselected_all" => "已全部取消選取",
+			"status_selected_all" => "已全部選取",
+			"status_toggled_file" => "切換檔案選取: {}",
+			"status_scanning" => "正在掃描儲存庫...",
+			"status_repo_loading" => "正在載入儲存庫「{}」...",
+			"status_repo_loaded" => "儲存庫「{}」載入完成",
+			"status_repos_loaded" => "已載入 {} 個儲存庫",
+			"status_no_repo" => "未選取儲存庫",
+			"status_copy_empty" => "未選取檔案 (無法複製)",
+			"status_copying" => "正在複製「{}」的選取檔案...",
+			"status_copied" => "已複製 {} 個檔案 ({} 位元組) 至剪貼簿",
+			"status_copy_nothing" => "沒有可複製的檔案內容",
+			"status_paste_preview" => "貼上預覽已就緒: {} 項變更",
+			"paste_err_not_payload" => "剪貼簿內容不是有效的 snip-sync payload",
+			"paste_err_nothing" => "剪貼簿 payload 不包含任何檔案",
+			"stale_created" => "目的地檔案已在外部建立: {}",
+			"stale_deleted" => "目的地檔案已在外部刪除: {}",
+			"stale_modified" => "目的地檔案已在外部修改: {}",
+			"error_repo_status" => "讀取儲存庫狀態失敗: {}",
+			"error_repo_changes" => "讀取儲存庫「{}」變更失敗: {}",
+			"error_binary" => "[二進位檔案，無法顯示文字預覽: {}]",
+			"error_preview" => "預覽「{}」失敗: {}",
+			"error_open_repo" => "開啟儲存庫失敗: {}",
+			"error_payload" => "產生 payload 失敗: {}",
+			"error_tree" => "讀取 commit 檔案樹失敗: {}",
+			"status_loading" => "載入中...",
+			"tree_rows_capped" => "[超過上限: 僅顯示前 {} 個項目]",
+			"tree_dir_truncated" => "[目錄項目過多，已截斷顯示前 {} 項]",
+			"status_no_changes" => "此 commit 沒有檔案變更",
+			"error_not_utf8" => "[非 UTF-8 文字檔案: {}]",
+			"error_too_large" => "[檔案「{}」過大 ({} 位元組)，超出預覽上限]",
+			"log_scope_author" => "作者篩選: {}",
+			"log_scope_search" => "搜尋: {}",
+			"repo_error_short" => "異常",
+			"btn_back_to_working" => "返回工作目錄",
+			"btn_browse_tree" => "瀏覽檔案樹",
+			"btn_compare" => "比較",
+			"diff_inline" => "行內",
+			"diff_side" => "並排",
+			"empty_project" => "此目錄沒有檔案",
+			"goto_placeholder" => "行號...",
+			"log_search_placeholder" => "SHA／訊息／作者",
+			"root_commit" => "（根 commit）",
+			"search_author" => "作者",
+			"selector_empty" => "無相符項目",
+			"selector_filter_placeholder" => "輸入文字進行篩選...",
+			"selector_ref_title" => "分支與標籤",
+			"selector_repo_title" => "儲存庫列表",
+			"src_vs_empty_tree" => "與空樹比較 (根 commit)",
+			"src_vs_first_parent" => "與 first-parent 比較",
+			"status_history_loaded" => "已載入 {} 筆 commit (第 {} 頁)",
+			"status_paste_done" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}、失敗 {}",
+			"submodule" => "子模組",
+			"tip_browse_tree" => "瀏覽此 commit 的完整檔案樹（唯讀）",
+			"tip_changes" => "變更工具視窗 (Alt+0)",
+			"tip_compare_disabled" => "按住 Shift 點選多個 commit 即可進行比較",
+			"tip_copy_view" => "複製目前預覽文字至剪貼簿",
+			"tip_find_next" => "下一處相符項目 (Enter / F3)",
+			"tip_find_prev" => "上一處相符項目 (Shift+Enter / Shift+F3)",
+			"tip_git_log" => "Git 記錄工具視窗 (Alt+9)",
+			"tip_head" => "跳至 HEAD commit",
+			"tip_project" => "專案工具視窗 (Alt+1)",
+			"tip_repo_selector" => "切換儲存庫 (Alt+Shift+R)",
+			"tip_search_author" => "切換作者搜尋模式",
+			"mapping_required" => "請先為每個來源前綴選擇目的地，套用前不會寫入",
+			"mapping_prefix" => "來源 {}",
+			"mapping_unresolved" => "尚未選擇目的地",
+			"mapping_keep" => "留在主要目錄",
+			"basket_clear" => "清空",
+			"basket_cleared" => "選取籃已清空",
+			"mapping_unknown_prefix" => "未知的來源前綴 {}",
+			"mapping_unknown_dest" => "目的地不在可選清單：{}",
+			"commit_subset_rejected" => "提交重放必須套用整段內容與中繼資料。取消任一項會在寫入前拒絕，不會只寫其餘檔案",
+			"commit_overwrite_required" => "目的地已有檔案，覆寫預設關閉。請允許覆寫後再套用，否則不會寫入",
+			"commit_replay_partial" => "重放中途失敗。已建立且不會丟棄的提交：{}。錯誤：{}",
+			"commit_replay_done" => "提交重放完成：{}",
+			"commit_whole_note" => "這是整段提交重放。取消任一檔會拒絕整段寫入；覆寫既有檔案必須另外確認",
+			"basket_summary" => "選取籃 {}：{}",
+			"basket_empty" => "選取籃是空的",
+			"basket_collision" => "同一路徑選了兩個版本，剪貼簿無法合併：{}",
+			"tip_add_repo" => "新增儲存庫…",
+			"hint_switch_repo" => "切換儲存庫",
+			"hint_switch_ref" => "切換分支 / 標籤",
+			_ => "",
+		},
+		Locale::En => match key {
+			"app_title" => "snip-sync Native Workbench",
+			"prototype_tag" => "GPUI Native Prototype",
+			"repos_title" => "Repositories",
+			"tab_changes" => "Git Changes",
+			"tab_files" => "File Explorer",
+			"history_title" => "Commit History",
+			"preview_title" => "Content Preview",
+			"btn_copy" => "Copy basket",
+			"btn_copying" => "Copying...",
+			"btn_copy_empty" => "No Selection (Cannot Copy)",
+			"btn_copy_commit_readonly" => "Commit Read-Only (Cannot Copy)",
+			"btn_paste" => "Paste Preview",
+			"btn_deselect_all" => "Deselect All",
+			"btn_select_all" => "Select All",
+			"btn_refresh" => "Refresh",
+			"btn_discovery_continue" => "Continue Discovery",
+			"btn_discovery_retry" => "Retry Discovery",
+			"btn_add_repo" => "Add",
+			"add_repo_placeholder" => "Repository path...",
+			"repo_kind_worktree" => "worktree",
+			"repo_kind_submodule" => "submodule",
+			"repo_kind_uninit_submodule" => "uninitialized",
+			"repo_detached" => "detached",
+			"repo_unborn" => "unborn",
+			"btn_apply_paste" => "Apply Restore",
+			"btn_cancel_paste" => "Cancel Restore",
+			"btn_toggle_lang" => "繁中",
+			"tag_staged" => "staged",
+			"tag_unstaged" => "unstaged",
+			"tag_untracked" => "untracked",
+			"tag_conflict" => "conflict",
+			"tag_nested_repo" => "nested repo",
+			"destination_label" => "Restore Destination",
+			"overwrite_label" => "Allow overwriting existing files",
+			"overwrite_off_default" => "(Off by default)",
+			"paste_preview_heading" => "Paste Restore Preview",
+			"paste_apply_busy" => "Applying restore to destination...",
+			"paste_applied" => "Paste restore completed",
+			"paste_cancelled" => "Paste preview cancelled",
+			"clean_working_copy" => "Working tree is clean.",
+			"find_placeholder" => "Find in file",
+			"jump_placeholder" => "Line #...",
+			"btn_jump" => "Jump",
+			"btn_copy_view" => "Copy Preview Text",
+			"truncated_notice" => "[Notice: Content too long, truncated to first {} lines / {}KB]",
+			"binary_notice" => "[Binary file, text preview unavailable (contains NUL bytes)]",
+			"nav_hint" => "↑/↓ Navigate, Space Toggle, Alt+1/2 Switch Repo, Ctrl+C Copy, Ctrl+V Paste Preview, Ctrl+Q Quit",
+			"filter_all_refs" => "All Branches & Tags",
+			"filter_head" => "HEAD",
+			"page_prev" => "◀ Prev",
+			"page_next" => "Next ▶",
+			"tree_truncated" => "[Truncated: first 150 entries]",
+			"tree_read_error" => "[Cannot read directory]",
+			"dest_changed_error" => "Destination files changed after preview was built. Apply was blocked for safety; please regenerate preview.",
+			"project" => "Project",
+			"changes" => "Changes",
+			"git_log" => "Git Log",
+			"log_tab" => "Log",
+			"hide" => "Hide",
+			"working_changes" => "Working changes",
+			"select_none" => "None",
+			"clean" => "clean",
+			"counts_tip" => "+ staged  ~ unstaged  ? untracked  ! conflicts",
+			"refs_all" => "All refs",
+			"refs_local" => "Local",
+			"refs_remote" => "Remote",
+			"refs_tags" => "Tags",
+			"col_message" => "Message",
+			"col_author" => "Author",
+			"col_date" => "Date",
+			"col_hash" => "Hash",
+			"empty_log" => "No commits",
+			"src_working_file" => "Working tree file",
+			"src_working_diff" => "Working changes",
+			"commit_files" => "Files changed in this commit (read-only)",
+			"no_file" => "No file open",
+			"paste_tab" => "Paste Preview",
+			"apply" => "Apply",
+			"cancel" => "Cancel",
+			"applying" => "Applying…",
+			"paste_busy_refused" => "Writing to the destination; it cannot be cancelled or changed midway. Wait for it to finish.",
+			"op_create" => "Create",
+			"op_overwrite" => "Overwrite",
+			"op_delete" => "Delete",
+			"op_skip" => "Skip",
+			"op_excluded" => "Excluded",
+			"overwrite_toggle" => "Overwrite",
+			"reason_create" => "Not present at destination; will be created",
+			"reason_overwrite" => "Will overwrite the existing destination file",
+			"reason_exists" => "Exists at destination; overwrite is off, will skip",
+			"reason_delete" => "Will delete the destination file",
+			"reason_delete_missing" => "Not present at destination; nothing to delete",
+			"reason_excluded" => "Excluded; nothing will be written",
+			"paste_keys" => "Enter apply · Esc cancel · ↑↓ item · Space toggle",
+			"copy_from" => "Copy from",
+			"selected" => "selected",
+			"repos_count" => "repos",
+			"no_repo" => "No repository",
+			"project_rev_title" => "Project (commit {})",
+			"changes_title" => "Changes ({})",
+			"tip_ref_selector" => "Switch branch / tag (current: {})",
+			"src_vs_first_parent_merge" => "Compare vs first-parent ({} parents)",
+			"src_commit_file" => "File in commit {}",
+			"src_compare" => "Compare {}..{}",
+			"compare_header" => "Compare {}..{}",
+			"commit_meta" => "Author: {} · Date: {} · Parents: {}",
+			"changed_files" => "{} changed files",
+			"tip_compare" => "{} commits selected for compare",
+			"error_history" => "Failed to read Git history: {}",
+			"group_staged" => "Staged Changes",
+			"group_unstaged" => "Changes",
+			"group_untracked" => "Untracked Files",
+			"group_conflicted" => "Conflicted Files",
+			"src_staged_diff" => "Staged changes",
+			"src_unstaged_diff" => "Unstaged changes",
+			"btn_copy_commits" => "Copy Commits",
+			"tip_copy_commits" => "Copy selected commit range to clipboard",
+			"status_commits_copied" => "Copied {} commit(s) to clipboard",
+			"status_replay_done" => "Replay complete: {} commit(s) created",
+			"search_note" => "Found {} matching commits",
+			"collapsed_n" => "+{} collapsed nodes",
+			"status_copy_source" => "Basket {}",
+			"status_repo_count" => "{} repos ({} errors)",
+			"status_goto" => "Jumped to line {}",
+			"status_goto_invalid" => "Invalid line number (total lines: {})",
+			"status_copied_selection" => "Copied selection ({} chars)",
+			"status_clipboard_failed" => "Clipboard operation failed: {}",
+			"status_clipboard_read_failed" => "Failed to read clipboard: {}",
+			"status_copied_preview" => "Copied preview text",
+			"status_deselected_all" => "Deselected all",
+			"status_selected_all" => "Selected all",
+			"status_toggled_file" => "Toggled file selection: {}",
+			"status_scanning" => "Scanning repositories...",
+			"status_repo_loading" => "Loading repository '{}'...",
+			"status_repo_loaded" => "Repository '{}' loaded",
+			"status_repos_loaded" => "Loaded {} repositories",
+			"status_no_repo" => "No repository selected",
+			"status_copy_empty" => "No selection (cannot copy)",
+			"status_copying" => "Copying selection from '{}'...",
+			"status_copied" => "Copied {} files ({} bytes) to clipboard",
+			"status_copy_nothing" => "No file content to copy",
+			"status_paste_preview" => "Paste preview ready: {} items",
+			"paste_err_not_payload" => "Clipboard content is not a valid snip-sync payload",
+			"paste_err_nothing" => "Clipboard payload contains no files",
+			"stale_created" => "Destination file was created externally: {}",
+			"stale_deleted" => "Destination file was deleted externally: {}",
+			"stale_modified" => "Destination file was modified externally: {}",
+			"error_repo_status" => "Failed to read repository status: {}",
+			"error_repo_changes" => "Failed to read changes for '{}': {}",
+			"error_binary" => "[Binary file, cannot display text preview: {}]",
+			"error_preview" => "Failed to preview '{}': {}",
+			"error_open_repo" => "Failed to open repository: {}",
+			"error_payload" => "Failed to generate payload: {}",
+			"error_tree" => "Failed to read commit tree: {}",
+			"status_loading" => "Loading...",
+			"tree_rows_capped" => "[Capped: showing first {} items]",
+			"tree_dir_truncated" => "[Directory truncated to first {} entries]",
+			"status_no_changes" => "No file changes in this commit",
+			"error_not_utf8" => "[Non-UTF-8 text file: {}]",
+			"error_too_large" => "[File '{}' is too large ({} bytes), exceeds preview limit]",
+			"log_scope_author" => "Author filter: {}",
+			"log_scope_search" => "Search: {}",
+			"repo_error_short" => "error",
+			"btn_back_to_working" => "Back to Working",
+			"btn_browse_tree" => "Browse Tree",
+			"btn_compare" => "Compare",
+			"diff_inline" => "Inline",
+			"diff_side" => "Side-by-side",
+			"empty_project" => "No files in this directory",
+			"goto_placeholder" => "Line #...",
+			"log_search_placeholder" => "SHA, message, author",
+			"root_commit" => "(root commit)",
+			"search_author" => "Author",
+			"selector_empty" => "No matches found",
+			"selector_filter_placeholder" => "Type to filter...",
+			"selector_ref_title" => "Branches & Tags",
+			"selector_repo_title" => "Repositories",
+			"src_vs_empty_tree" => "Compare vs empty tree (root commit)",
+			"src_vs_first_parent" => "Compare vs first-parent",
+			"status_history_loaded" => "Loaded {} commits (page {})",
+			"status_paste_done" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}, errors {}",
+			"submodule" => "Submodule",
+			"tip_browse_tree" => "Browse full file tree of this commit (read-only)",
+			"tip_changes" => "Changes tool window (Alt+0)",
+			"tip_compare_disabled" => "Shift-click multiple commits to compare",
+			"tip_copy_view" => "Copy preview text to clipboard",
+			"tip_find_next" => "Next match (Enter / F3)",
+			"tip_find_prev" => "Previous match (Shift+Enter / Shift+F3)",
+			"tip_git_log" => "Git Log tool window (Alt+9)",
+			"tip_head" => "Jump to HEAD commit",
+			"tip_project" => "Project tool window (Alt+1)",
+			"tip_repo_selector" => "Switch repository (Alt+Shift+R)",
+			"tip_search_author" => "Toggle author search mode",
+			"mapping_required" => "Choose a destination for every source prefix. Nothing is written until you do",
+			"mapping_prefix" => "Source {}",
+			"mapping_unresolved" => "No destination chosen",
+			"mapping_keep" => "Keep under primary",
+			"basket_clear" => "Clear",
+			"basket_cleared" => "Basket cleared",
+			"mapping_unknown_prefix" => "Unknown source prefix {}",
+			"mapping_unknown_dest" => "Destination is not a candidate: {}",
+			"commit_subset_rejected" => "Commit replay keeps the whole commit content and metadata. Unchecking any item rejects the replay before any write",
+			"commit_overwrite_required" => "A destination file already exists and overwrite starts off. Allow overwrite before applying; nothing is written until you do",
+			"commit_replay_partial" => "Replay stopped midway. Commits already created are kept: {}. Error: {}",
+			"commit_replay_done" => "Commit replay finished: {}",
+			"commit_whole_note" => "This replays the whole commit. Unchecking any file rejects the entire write. Overwriting existing files needs a separate confirmation",
+			"basket_summary" => "Basket {}: {}",
+			"basket_empty" => "Basket is empty",
+			"basket_collision" => "Two versions of the same path are selected and cannot share one clipboard entry: {}",
+			"tip_add_repo" => "Add repository…",
+			"hint_switch_repo" => "Switch repository",
+			"hint_switch_ref" => "Switch branch / tag",
+			_ => "",
+		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_status_history_loaded_renders_without_raw_key() {
+		let msg = Msg::new(
+			"status_history_loaded",
+			["4".to_string(), "1".to_string()],
+		);
+		let zh = msg.render(Locale::ZhTw);
+		assert_eq!(zh, "已載入 4 筆 commit (第 1 頁)");
+		let en = msg.render(Locale::En);
+		assert_eq!(en, "Loaded 4 commits (page 1)");
+	}
+
+	#[test]
+	fn test_i18n_keys_parity() {
+		let test_keys = [
+			"btn_back_to_working",
+			"btn_browse_tree",
+			"btn_compare",
+			"diff_inline",
+			"diff_side",
+			"empty_project",
+			"goto_placeholder",
+			"log_search_placeholder",
+			"root_commit",
+			"search_author",
+			"selector_empty",
+			"selector_filter_placeholder",
+			"selector_ref_title",
+			"selector_repo_title",
+			"src_vs_empty_tree",
+			"src_vs_first_parent",
+			"status_history_loaded",
+			"status_paste_done",
+			"submodule",
+			"tip_browse_tree",
+			"tip_changes",
+			"tip_compare_disabled",
+			"tip_copy_view",
+			"tip_find_next",
+			"tip_find_prev",
+			"tip_git_log",
+			"tip_head",
+			"tip_project",
+			"tip_repo_selector",
+			"tip_search_author",
+			"col_message",
+			"col_author",
+			"col_date",
+			"col_hash",
+			"group_staged",
+			"group_unstaged",
+			"group_untracked",
+			"group_conflicted",
+			"src_staged_diff",
+			"src_unstaged_diff",
+			"btn_copy_commits",
+		];
+		for key in test_keys {
+			assert!(
+				!t(key, Locale::ZhTw).is_empty(),
+				"Missing ZhTw key: {key}"
+			);
+			assert!(!t(key, Locale::En).is_empty(), "Missing En key: {key}");
+		}
+	}
+}

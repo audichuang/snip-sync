@@ -1,0 +1,2939 @@
+//! snip-desktop-native: Native Rust GPUI Git Workbench.
+//!
+//! Shares `snip-core` directly for Git inspection, preview, and clipboard
+//! operations. Stdout carries no logs in normal runs: `app_log!` events and
+//! E2E probes are only emitted when `SNIP_NATIVE_E2E=1` (set by the tests);
+//! `[READY:*]` markers for the memory harness are printed only in their
+//! explicit `--mode`.
+
+#![cfg_attr(
+	all(target_os = "windows", not(test)),
+	windows_subsystem = "windows"
+)]
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static E2E: OnceLock<bool> = OnceLock::new();
+
+/// True only when the E2E harness opted in with `SNIP_NATIVE_E2E=1`.
+pub fn e2e_on() -> bool {
+	*E2E.get_or_init(|| {
+		std::env::var_os("SNIP_NATIVE_E2E").is_some_and(|v| v == "1")
+	})
+}
+
+/// Cancels the previous job in `slot` and returns the token for the new one.
+pub(crate) fn arm_cancel(slot: &mut Option<CancelToken>) -> CancelToken {
+	if let Some(prev) = slot.take() {
+		prev.cancel();
+	}
+	let token = CancelToken::new();
+	*slot = Some(token.clone());
+	token
+}
+
+/// Test-harness event line.
+macro_rules! app_log {
+	($($arg:tt)*) => {{
+		println!($($arg)*);
+		let _ = std::io::Write::flush(&mut std::io::stdout());
+	}};
+}
+
+/// Measurement harness readiness marker (`--mode idle|overview|preview`).
+fn ready_marker(name: &str) {
+	println!("[READY:{name}]");
+	let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+pub mod graph_view;
+mod history;
+pub mod i18n;
+mod icons;
+pub mod paste;
+mod reader;
+mod selector;
+pub mod syntax;
+mod text_input;
+pub mod theme;
+pub mod tree;
+mod ui;
+
+use gpui::{
+	actions, prelude::*, px, size, App, Application, Bounds, Context, Entity,
+	FocusHandle, KeyBinding, WindowBounds, WindowOptions,
+};
+use snip_core::browser::{self, CommitSummary, GitReference};
+use snip_core::clip;
+use snip_core::commits;
+use snip_core::format::ChangeType;
+use snip_core::gitrun::{CancelToken, Overflow, RunOptions};
+use snip_core::gitsrc::{Git, GitSource};
+use snip_core::graph::GraphLayout;
+use snip_core::settings::Settings;
+use snip_core::transfer::{
+	plan_commit_export_exact, plan_export, CanonicalRootId, ExportItem,
+	ExportSelection, SourceKind,
+};
+use snip_core::workspace::{
+	declared_submodules, status_details, summarize, DiscoveredRepo, Discovery,
+	RepoIdentity, RepoKind, RepoSummary, ScanBudget, ScanStatus,
+	SubmoduleState,
+};
+
+use crate::history::{LogSearch, RevTree};
+use crate::i18n::{Locale, Msg};
+use crate::paste::PastePreviewPlan;
+use crate::reader::{Preview, PreviewSource, Reader};
+use crate::syntax::Language;
+use crate::text_input::{InputEvent, TextInput};
+use crate::tree::FileTreeNode;
+use crate::tree::{NodeKey, TreeCommand, TreeEffect, TreeIo};
+
+actions!(
+	workbench,
+	[
+		Quit,
+		CopySelection,
+		PastePreview,
+		ApplyPaste,
+		CancelPaste,
+		Refresh,
+		DeselectAllFiles,
+		SelectAllFiles,
+		NavUp,
+		NavDown,
+		NavToggle,
+		SelectRepo1,
+		SelectRepo2,
+		ToggleTab,
+		FocusNext,
+		FocusPrev,
+		ShowProject,
+		ShowChanges,
+		ToggleLog,
+		OpenRepoSelector,
+		OpenRefSelector,
+		ToggleLocale,
+		HistoryNextPage,
+		HistoryPrevPage,
+		FindInFile,
+		GotoLine,
+		FindNext,
+		FindPrev,
+		ReaderCopy,
+		ReaderSelectAll,
+		ReaderUp,
+		ReaderDown,
+		ReaderPageUp,
+		ReaderPageDown,
+		ReaderClear,
+		TreeUp,
+		TreeDown,
+		TreeExpand,
+		TreeCollapse,
+		TreeOpen,
+		TreeToggle,
+		LogUp,
+		LogDown,
+		LogExtendUp,
+		LogExtendDown,
+		LogOpen,
+		LogSearchFocus,
+		LogHead,
+	]
+);
+
+#[derive(Clone, Debug)]
+pub struct FileChangeItem {
+	pub path: String,
+	pub change_type: Option<ChangeType>,
+	pub source: SourceKind,
+	pub is_conflict: bool,
+	pub selected: bool,
+}
+
+type WorkingChangeTuple = (String, Option<ChangeType>, SourceKind, bool);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkbenchTab {
+	GitChanges,
+	FileExplorer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoEntryKind {
+	Main,
+	LinkedWorktree,
+	Submodule,
+	UninitializedSubmodule,
+}
+
+/// One discovered repository; a failed status read stays visible as an error
+/// instead of silently disappearing or showing as clean.
+#[derive(Clone, Debug)]
+pub struct RepoEntry {
+	pub root: PathBuf,
+	pub name: String,
+	pub kind: RepoEntryKind,
+	pub identity: Option<RepoIdentity>,
+	pub summary: Result<RepoSummary, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Popover {
+	Repo,
+	Ref,
+}
+
+pub struct WorkbenchModel {
+	pub workspace_root: PathBuf,
+	pub restore_dir: Option<PathBuf>,
+	pub repos: Vec<RepoEntry>,
+	pub selected_repo_idx: Option<usize>,
+
+	// Git log.
+	pub commits: Vec<CommitSummary>,
+	pub refs: Vec<GitReference>,
+	pub head_sha: Option<String>,
+	/// Layout of the loaded page as displayed (collapse applied).
+	pub graph_layout: Option<GraphLayout>,
+	pub active_ref_filter: Option<String>,
+	pub commit_page: usize,
+	pub history_has_more: bool,
+	pub history_page_size: usize,
+	pub history_error: Option<String>,
+	pub page_checkpoints: Vec<Option<snip_core::graph::GraphCheckpoint>>,
+	pub log_search: Option<LogSearch>,
+	pub search_by_author: bool,
+	pub collapsed_merges: HashSet<String>,
+	/// Commits hidden on this page by collapsed merges.
+	pub hidden_commits: HashSet<String>,
+	pub selected_commit: Option<String>,
+	/// Range endpoint picked with shift (anchor is `selected_commit`).
+	pub range_head: Option<String>,
+	pub log_scroll: gpui::UniformListScrollHandle,
+	pub select_head_after_load: bool,
+
+	// Files of the selected commit or compare.
+	pub commit_files: Vec<(String, Option<ChangeType>)>,
+	pub selected_commit_file: Option<String>,
+	pub compare: Option<(String, String)>,
+
+	// Tool windows.
+	pub files: Vec<FileChangeItem>,
+	pub file_tree: Option<FileTreeNode>,
+	pub rev_tree: Option<RevTree>,
+	pub active_tab: WorkbenchTab,
+	pub selected_file: Option<String>,
+	pub selected_file_source: Option<SourceKind>,
+	pub tree_cursor: usize,
+	pub selected_list_row: usize,
+
+	// Reader.
+	pub preview: Option<Preview>,
+	pub preview_loading: bool,
+	pub preview_error: Option<Msg>,
+	pub reader: Reader,
+	pub find_input: Entity<TextInput>,
+	pub goto_input: Entity<TextInput>,
+	pub log_search_input: Entity<TextInput>,
+	pub selector_input: Entity<TextInput>,
+	pub popover: Option<Popover>,
+	pub popover_cursor: usize,
+
+	pub basket: HashMap<CanonicalRootId, Vec<ExportItem>>,
+	pub history_cancel: Option<CancelToken>,
+	pub preview_cancel: Option<CancelToken>,
+	pub tree_cancel: Option<CancelToken>,
+	pub repo_cancel: Option<CancelToken>,
+	pub scan_cancel: Option<CancelToken>,
+	pub discovery: Option<Discovery>,
+	pub discovery_status: Option<ScanStatus>,
+	pub discovery_errors: Vec<(PathBuf, String)>,
+	pub discovery_depth_limited: Vec<PathBuf>,
+	pub discovery_error_overflow: usize,
+	pub discovery_depth_overflow: usize,
+	discovery_generation: u64,
+	discovery_task: Option<gpui::Task<()>>,
+	pinned_repo: Option<(PathBuf, PathBuf)>,
+	manual_repos: Vec<RepoEntry>,
+	tree_task: Option<gpui::Task<()>>,
+	tree_queue: VecDeque<TreeIo>,
+	tree_worker: u64,
+	tree_worker_alive: bool,
+	restore_expanded: Vec<String>,
+	add_cancel: Option<CancelToken>,
+	add_repo_task: Option<gpui::Task<()>>,
+	pub is_adding_repo: bool,
+	pub add_repo_input: Entity<TextInput>,
+	pub paste_preview: Option<PastePreviewPlan>,
+	/// Text of the selected paste item (one at a time).
+	pub paste_detail: Option<Preview>,
+	pub paste_scroll: gpui::UniformListScrollHandle,
+	pub status: Msg,
+	pub is_loading: bool,
+	pub is_copying: bool,
+	pub locale: Locale,
+	pub generation: u64,
+	pub preview_generation: u64,
+	pub history_generation: u64,
+	pub tree_generation: u64,
+	pub mode: String,
+	pub focus_handle: FocusHandle,
+	pub reader_focus: FocusHandle,
+	pub tree_focus: FocusHandle,
+	/// Left tool window held focus at the last render (IntelliJ-style
+	/// active vs inactive selection).
+	pub left_active: bool,
+	pub log_active: bool,
+	pub reader_active: bool,
+	pub log_focus: FocusHandle,
+	pub paste_focus: FocusHandle,
+	// Tool window layout; stored sizes survive collapse/restore.
+	pub left_w: f32,
+	pub bottom_h: f32,
+	pub left_visible: bool,
+	pub bottom_visible: bool,
+	/// Log visibility saved when the paste preview auto-collapsed it;
+	/// cleared once restored or when the user toggles the log themselves.
+	pub log_before_paste: Option<bool>,
+	pub dragging: Option<Splitter>,
+	pub last_viewport: (i32, i32),
+	/// E2E control-bounds reporting; `None` unless `SNIP_NATIVE_E2E=1`.
+	pub probes: Option<ui::Probes>,
+	/// Test-only delay before a confirmed write, honoured only in E2E mode.
+	pub e2e_apply_delay: Option<std::time::Duration>,
+	/// Focus requested from a context without a `Window`; applied on render.
+	pub pending_focus: Option<FocusHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Splitter {
+	Left,
+	Bottom,
+}
+
+impl WorkbenchModel {
+	pub fn new(
+		workspace_root: PathBuf,
+		restore_dir: Option<PathBuf>,
+		mode: String,
+		cx: &mut Context<Self>,
+	) -> Self {
+		let loc = Locale::ZhTw;
+		let find_input = cx
+			.new(|cx| TextInput::new(i18n::t("find_placeholder", loc), 30, cx));
+		let goto_input = cx
+			.new(|cx| TextInput::new(i18n::t("goto_placeholder", loc), 31, cx));
+		let log_search_input = cx.new(|cx| {
+			TextInput::new(i18n::t("log_search_placeholder", loc), 40, cx)
+		});
+		let selector_input = cx.new(|cx| {
+			TextInput::new(i18n::t("selector_filter_placeholder", loc), 0, cx)
+		});
+		cx.subscribe(&find_input, |this, input, ev: &InputEvent, cx| {
+			let q = input.read(cx).text().to_string();
+			match ev {
+				InputEvent::Changed => this.run_find(&q, cx),
+				InputEvent::Submit | InputEvent::Down
+					if this.reader.matches.is_empty() =>
+				{
+					this.run_find(&q, cx)
+				}
+				InputEvent::Submit | InputEvent::Down => {
+					this.find_step(true, cx)
+				}
+				InputEvent::SubmitPrev | InputEvent::Up => {
+					this.find_step(false, cx)
+				}
+				InputEvent::Dismiss => {
+					this.pending_focus = Some(this.reader_focus.clone());
+					cx.notify();
+				}
+			}
+		})
+		.detach();
+		cx.subscribe(
+			&goto_input,
+			|this, input, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => {
+					let q = input.read(cx).text().to_string();
+					this.goto_line(&q, cx);
+					this.pending_focus = Some(this.reader_focus.clone());
+				}
+				InputEvent::Dismiss => {
+					this.pending_focus = Some(this.reader_focus.clone());
+					cx.notify();
+				}
+				_ => {}
+			},
+		)
+		.detach();
+		cx.subscribe(&log_search_input, |this, input, ev: &InputEvent, cx| {
+			match ev {
+				InputEvent::Submit => {
+					let q = input.read(cx).text().trim().to_string();
+					this.start_log_search(q, cx);
+				}
+				InputEvent::Dismiss => {
+					input.update(cx, |i, cx| i.set_text("", cx));
+					this.start_log_search(String::new(), cx);
+				}
+				InputEvent::Changed => {
+					let q = input.read(cx).text().trim().to_string();
+					if q.is_empty() && this.log_search.is_some() {
+						this.start_log_search(String::new(), cx);
+					}
+				}
+				_ => {}
+			}
+		})
+		.detach();
+		cx.subscribe(&selector_input, |this, _, ev: &InputEvent, cx| {
+			this.selector_event(ev.clone(), cx)
+		})
+		.detach();
+
+		let add_repo_input = cx.new(|cx| {
+			TextInput::new(i18n::t("add_repo_placeholder", loc), 0, cx)
+		});
+		cx.subscribe(&add_repo_input, |this, input, ev: &InputEvent, cx| {
+			match ev {
+				InputEvent::Submit => {
+					let text = input.read(cx).text().trim().to_string();
+					if !text.is_empty() {
+						this.add_repo_path(PathBuf::from(text), cx);
+						input.update(cx, |i, cx| i.set_text("", cx));
+						this.is_adding_repo = false;
+					}
+				}
+				InputEvent::Dismiss => {
+					this.is_adding_repo = false;
+					cx.notify();
+				}
+				_ => {}
+			}
+		})
+		.detach();
+
+		let mut model = Self {
+			workspace_root,
+			restore_dir,
+			repos: Vec::new(),
+			selected_repo_idx: None,
+			commits: Vec::new(),
+			refs: Vec::new(),
+			head_sha: None,
+			graph_layout: None,
+			active_ref_filter: None,
+			commit_page: 0,
+			history_has_more: false,
+			history_page_size: 50,
+			history_error: None,
+			page_checkpoints: vec![None],
+			log_search: None,
+			search_by_author: false,
+			collapsed_merges: HashSet::new(),
+			hidden_commits: HashSet::new(),
+			selected_commit: None,
+			range_head: None,
+			log_scroll: gpui::UniformListScrollHandle::new(),
+			select_head_after_load: false,
+			commit_files: Vec::new(),
+			selected_commit_file: None,
+			compare: None,
+			files: Vec::new(),
+			file_tree: None,
+			rev_tree: None,
+			active_tab: WorkbenchTab::GitChanges,
+			selected_file: None,
+			selected_file_source: None,
+			tree_cursor: 0,
+			selected_list_row: 0,
+			preview: None,
+			preview_loading: false,
+			preview_error: None,
+			reader: Reader::default(),
+			find_input,
+			goto_input,
+			log_search_input,
+			selector_input,
+			add_repo_input,
+			popover: None,
+			popover_cursor: 0,
+			basket: HashMap::new(),
+			history_cancel: None,
+			preview_cancel: None,
+			tree_cancel: None,
+			repo_cancel: None,
+			scan_cancel: None,
+			discovery: None,
+			discovery_status: None,
+			discovery_errors: Vec::new(),
+			discovery_depth_limited: Vec::new(),
+			discovery_error_overflow: 0,
+			discovery_depth_overflow: 0,
+			discovery_generation: 0,
+			discovery_task: None,
+			pinned_repo: None,
+			manual_repos: Vec::new(),
+			tree_task: None,
+			tree_queue: VecDeque::new(),
+			tree_worker: 0,
+			tree_worker_alive: false,
+			restore_expanded: Vec::new(),
+			add_cancel: None,
+			add_repo_task: None,
+			is_adding_repo: false,
+			paste_preview: None,
+			paste_detail: None,
+			paste_scroll: gpui::UniformListScrollHandle::new(),
+			status: Msg::new("status_scanning", []),
+			is_loading: true,
+			is_copying: false,
+			locale: loc,
+			generation: 0,
+			preview_generation: 0,
+			history_generation: 0,
+			tree_generation: 0,
+			mode,
+			focus_handle: cx.focus_handle(),
+			reader_focus: cx.focus_handle().tab_index(34).tab_stop(true),
+			tree_focus: cx.focus_handle().tab_index(20).tab_stop(true),
+			left_active: false,
+			log_active: false,
+			reader_active: false,
+			log_focus: cx.focus_handle().tab_index(46).tab_stop(true),
+			paste_focus: cx.focus_handle(),
+			left_w: theme::LEFT_W_DEFAULT,
+			bottom_h: theme::BOTTOM_H_DEFAULT,
+			left_visible: true,
+			bottom_visible: true,
+			log_before_paste: None,
+			dragging: None,
+			last_viewport: (0, 0),
+			probes: ui::Probes::from_env(),
+			e2e_apply_delay: ui::e2e_apply_delay(),
+			pending_focus: None,
+		};
+		model.reload_repos(cx);
+		model
+	}
+
+	pub fn set_status(
+		&mut self,
+		key: &'static str,
+		args: impl crate::i18n::IntoMsgArgs,
+	) {
+		self.status = Msg::new(key, args);
+	}
+
+	pub fn repo(&self) -> Option<&RepoEntry> {
+		self.selected_repo_idx.and_then(|i| self.repos.get(i))
+	}
+
+	pub fn repo_root(&self) -> Option<PathBuf> {
+		self.repo().map(|r| r.root.clone())
+	}
+
+	pub fn current_restore_destination(&self) -> PathBuf {
+		if let Some(ref d) = self.restore_dir {
+			d.clone()
+		} else if let Some(root) = self.repo_root() {
+			root
+		} else {
+			self.workspace_root.clone()
+		}
+	}
+
+	pub fn set_preview(&mut self, p: Preview) {
+		if e2e_on() {
+			let (kind, rev) = match &p.source {
+				PreviewSource::WorkingFile => ("working_file", "-".to_string()),
+				PreviewSource::WorkingChanges => {
+					("working_changes", "-".into())
+				}
+				PreviewSource::StagedChanges => ("staged_changes", "-".into()),
+				PreviewSource::UnstagedChanges => {
+					("unstaged_changes", "-".into())
+				}
+				PreviewSource::CommitDiff { sha } => {
+					("commit_diff", sha.clone())
+				}
+				PreviewSource::CommitFile { sha } => {
+					("commit_file", sha.clone())
+				}
+				PreviewSource::Compare { from, to } => {
+					("compare", format!("{from}..{to}"))
+				}
+				PreviewSource::PasteItem => ("paste_item", "-".into()),
+			};
+			app_log!(
+				"[APP:E2E_PREVIEW: source={} rev={} path={} lines={} fnv={:x}]",
+				kind,
+				rev,
+				p.path.as_deref().unwrap_or("-"),
+				p.lines.len(),
+				p.fingerprint()
+			);
+		}
+		self.preview = Some(p);
+		self.preview_loading = false;
+		self.preview_error = None;
+		self.reader.reset_for_new_preview();
+		// Re-run an active find against the new text.
+		self.reader.matches.clear();
+	}
+
+	pub fn deselect_all_files(&mut self, cx: &mut Context<Self>) {
+		for f in &mut self.files {
+			f.selected = false;
+		}
+		if let Some(ref mut tree) = self.file_tree {
+			tree.set_all_selected(false);
+		}
+		if let Some(repo) = self.repo() {
+			if let Ok(c) = CanonicalRootId::new(&repo.root) {
+				self.set_basket_group(c, false, Vec::new());
+			}
+		}
+		self.remember_tree_selection();
+		app_log!("[APP:FILES_DESELECTED]");
+		self.set_status("status_deselected_all", []);
+		cx.notify();
+	}
+
+	pub fn select_all_files(&mut self, cx: &mut Context<Self>) {
+		for f in &mut self.files {
+			f.selected = true;
+		}
+		if let Some(ref mut tree) = self.file_tree {
+			tree.set_all_selected(true);
+		}
+		self.sync_git_selection_to_basket();
+		self.remember_tree_selection();
+		app_log!("[APP:FILES_SELECTED_ALL]");
+		self.set_status("status_selected_all", []);
+		cx.notify();
+	}
+
+	pub fn toggle_file(&mut self, idx: usize, cx: &mut Context<Self>) {
+		if let Some(f) = self.files.get_mut(idx) {
+			f.selected = !f.selected;
+			let path = f.path.clone();
+			let selected = f.selected;
+			self.sync_git_selection_to_basket();
+			app_log!(
+				"[APP:FILE_TOGGLED: {}: {}: selected={}]",
+				idx,
+				path,
+				selected
+			);
+			self.set_status("status_toggled_file", [path]);
+			cx.notify();
+		}
+	}
+
+	pub fn toggle_locale(&mut self, cx: &mut Context<Self>) {
+		self.locale = match self.locale {
+			Locale::ZhTw => Locale::En,
+			Locale::En => Locale::ZhTw,
+		};
+		let loc = self.locale;
+		for (input, key) in [
+			(self.find_input.clone(), "find_placeholder"),
+			(self.goto_input.clone(), "goto_placeholder"),
+			(self.log_search_input.clone(), "log_search_placeholder"),
+			(self.selector_input.clone(), "selector_filter_placeholder"),
+		] {
+			input.update(cx, |i, _| i.set_placeholder(i18n::t(key, loc)));
+		}
+		app_log!("[APP:LOCALE: {:?}]", self.locale);
+		cx.notify();
+	}
+
+	pub fn process_discovery_repos(
+		discovered: Vec<DiscoveredRepo>,
+		opts: &RunOptions,
+	) -> (Vec<RepoEntry>, Vec<(PathBuf, String)>) {
+		let mut seen_identities: HashSet<(PathBuf, PathBuf)> = HashSet::new();
+		let mut seen_roots: HashSet<PathBuf> = HashSet::new();
+		let mut list = Vec::new();
+		let mut errors = Vec::new();
+
+		for r in discovered {
+			let canonical_path =
+				dunce::canonicalize(&r.path).unwrap_or_else(|_| r.path.clone());
+			let name = r
+				.path
+				.file_name()
+				.map(|n| n.to_string_lossy().into_owned())
+				.unwrap_or_else(|| r.path.display().to_string());
+
+			match Git::open(&r.path) {
+				Ok(git) => {
+					let id_res = RepoIdentity::resolve(&git, opts);
+					let (kind, identity) = match &id_res {
+						Ok(id) => {
+							// Symlink alias dedup:
+							if !seen_identities.insert((
+								id.toplevel.clone(),
+								id.git_dir.clone(),
+							)) {
+								continue;
+							}
+							seen_roots.insert(canonical_path.clone());
+							let k = match id.kind {
+								RepoKind::LinkedWorktree => {
+									RepoEntryKind::LinkedWorktree
+								}
+								RepoKind::Submodule => RepoEntryKind::Submodule,
+								RepoKind::Main => RepoEntryKind::Main,
+							};
+							(k, Some(id.clone()))
+						}
+						Err(err) => {
+							let root = git.root().to_path_buf();
+							if !seen_roots.insert(root.clone()) {
+								continue;
+							}
+							list.push(RepoEntry {
+								root,
+								name,
+								kind: RepoEntryKind::Main,
+								identity: None,
+								summary: Err(format!(
+									"repository identity: {err}"
+								)),
+							});
+							continue;
+						}
+					};
+
+					let root = identity
+						.as_ref()
+						.map(|id| id.toplevel.clone())
+						.unwrap_or_else(|| git.root().to_path_buf());
+					let name = root
+						.file_name()
+						.map(|n| n.to_string_lossy().into_owned())
+						.unwrap_or(name);
+					let summary =
+						summarize(&git, opts).map_err(|e| e.to_string());
+
+					list.push(RepoEntry {
+						root: root.clone(),
+						name,
+						kind,
+						identity,
+						summary,
+					});
+
+					let submodules = match declared_submodules(&git, opts) {
+						Ok(submodules) => submodules,
+						Err(err) => {
+							errors.push((root, format!("submodules: {err}")));
+							Vec::new()
+						}
+					};
+					{
+						for subm in submodules {
+							let sub_path = git.root().join(&subm.path);
+							let canonical_sub = dunce::canonicalize(&sub_path)
+								.unwrap_or_else(|_| sub_path.clone());
+							match subm.state {
+								SubmoduleState::NotCheckedOut
+									if seen_roots
+										.insert(canonical_sub.clone()) =>
+								{
+									list.push(RepoEntry {
+									root: sub_path,
+									name: subm.name,
+									kind: RepoEntryKind::UninitializedSubmodule,
+									identity: None,
+									summary: Err(
+										"Submodule not checked out (uninitialized)"
+											.into(),
+									),
+								});
+								}
+								SubmoduleState::Unreadable(reason)
+									if seen_roots.insert(canonical_sub) =>
+								{
+									list.push(RepoEntry {
+									root: sub_path,
+									name: subm.name,
+									kind: RepoEntryKind::UninitializedSubmodule,
+									identity: None,
+									summary: Err(format!(
+										"Submodule unreadable: {reason}"
+									)),
+								});
+								}
+								_ => {}
+							}
+						}
+					}
+				}
+				Err(e) => {
+					if seen_roots.insert(canonical_path) {
+						list.push(RepoEntry {
+							root: r.path,
+							name,
+							kind: RepoEntryKind::Main,
+							identity: None,
+							summary: Err(e.to_string()),
+						});
+					}
+				}
+			}
+		}
+
+		(list, errors)
+	}
+
+	pub fn disambiguate_repo_names(
+		repos: &mut [RepoEntry],
+		workspace_root: &std::path::Path,
+	) {
+		let mut counts: HashMap<String, usize> = HashMap::new();
+		for r in repos.iter() {
+			*counts.entry(r.name.clone()).or_insert(0) += 1;
+		}
+		for r in repos.iter_mut() {
+			if counts.get(&r.name).copied().unwrap_or(0) > 1 {
+				if let Ok(rel) = r.root.strip_prefix(workspace_root) {
+					r.name = rel.display().to_string();
+				} else if let Some(parent) =
+					r.root.parent().and_then(|p| p.file_name())
+				{
+					r.name = format!("{}/{}", parent.to_string_lossy(), r.name);
+				}
+			}
+		}
+	}
+
+	pub fn reload_repos(&mut self, cx: &mut Context<Self>) {
+		self.discovery_errors.clear();
+		self.discovery_depth_limited.clear();
+		self.discovery_error_overflow = 0;
+		self.discovery_depth_overflow = 0;
+		let ws = self.workspace_root.clone();
+		self.launch_fresh_discovery(ws, true, cx);
+	}
+
+	pub fn continue_discovery(&mut self, cx: &mut Context<Self>) {
+		if self.is_loading {
+			return;
+		}
+		if matches!(self.discovery_status, Some(ScanStatus::LimitReached)) {
+			if let Some(disc) = self.discovery.as_mut() {
+				disc.raise_found_page();
+			}
+		}
+		if self.discovery.as_ref().is_some_and(Discovery::has_cursor) {
+			let Some(disc) = self.discovery.take() else {
+				return;
+			};
+			self.launch_discovery_cursor(disc, false, cx);
+			return;
+		}
+		let Some(path) = self.discovery_depth_limited.first().cloned() else {
+			return;
+		};
+		self.discovery_depth_limited.remove(0);
+		self.launch_fresh_discovery(path, false, cx);
+	}
+
+	pub fn add_repo_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+		let cancel = arm_cancel(&mut self.add_cancel);
+		let task = cx.spawn(async move |this, cx| {
+			let bg = cx.background_executor().clone();
+			let cancel_bg = cancel.clone();
+			let outcome = bg
+				.spawn(async move { resolve_added_repo(path, &cancel_bg) })
+				.await;
+			let _ = this.update(cx, |model, cx| {
+				if cancel.is_cancelled() {
+					return;
+				}
+				model.install_added_repo(outcome, cx);
+			});
+		});
+		self.add_repo_task = Some(task);
+	}
+
+	fn launch_fresh_discovery(
+		&mut self,
+		root: PathBuf,
+		wipe: bool,
+		cx: &mut Context<Self>,
+	) {
+		self.discovery_generation = self.discovery_generation.wrapping_add(1);
+		let generation = self.discovery_generation;
+		let cancel = arm_cancel(&mut self.scan_cancel);
+		self.is_loading = true;
+		self.set_status("status_scanning", []);
+		let task = cx.spawn(async move |this, cx| {
+			let bg = cx.background_executor().clone();
+			let open_root = root.clone();
+			let opened = bg
+				.spawn(async move { Discovery::new(&open_root, 8, 256) })
+				.await;
+			let disc = match opened {
+				Ok(disc) => disc,
+				Err(err) => {
+					let _ = this.update(cx, |model, cx| {
+						if model.discovery_generation != generation {
+							return;
+						}
+						model.discovery = None;
+						model.discovery_status = Some(ScanStatus::Incomplete);
+						model.push_discovery_error((root, err.to_string()));
+						model.finish_discovery(cx);
+					});
+					return;
+				}
+			};
+			drive_discovery(this, cx, disc, generation, cancel, wipe).await;
+		});
+		self.discovery_task = Some(task);
+	}
+
+	fn launch_discovery_cursor(
+		&mut self,
+		disc: Discovery,
+		wipe: bool,
+		cx: &mut Context<Self>,
+	) {
+		self.discovery_generation = self.discovery_generation.wrapping_add(1);
+		let generation = self.discovery_generation;
+		let cancel = arm_cancel(&mut self.scan_cancel);
+		self.is_loading = true;
+		self.set_status("status_scanning", []);
+		let task = cx.spawn(async move |this, cx| {
+			drive_discovery(this, cx, disc, generation, cancel, wipe).await;
+		});
+		self.discovery_task = Some(task);
+	}
+
+	fn merge_repo_entries(&mut self, extra: Vec<RepoEntry>) {
+		for entry in extra {
+			let key = repo_key(&entry);
+			if self.repos.iter().any(|have| repo_key(have) == key) {
+				continue;
+			}
+			self.repos.push(entry);
+		}
+		Self::disambiguate_repo_names(&mut self.repos, &self.workspace_root);
+		self.repos
+			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
+	}
+
+	fn push_discovery_error(&mut self, item: (PathBuf, String)) {
+		if self.discovery_errors.len() < 64 {
+			self.discovery_errors.push(item);
+		} else {
+			self.discovery_error_overflow =
+				self.discovery_error_overflow.saturating_add(1);
+		}
+	}
+
+	fn push_depth_limit(&mut self, path: PathBuf) {
+		if self.discovery_depth_limited.len() < 64 {
+			self.discovery_depth_limited.push(path);
+		} else {
+			self.discovery_depth_overflow =
+				self.discovery_depth_overflow.saturating_add(1);
+		}
+	}
+
+	fn place_selection(&mut self, cx: &mut Context<Self>) {
+		let Some(key) = self.pinned_repo.clone() else {
+			if self.selected_repo_idx.is_none() && !self.repos.is_empty() {
+				self.pinned_repo = self.repos.first().map(repo_key);
+				self.select_repo_internal(0, false, cx);
+			}
+			return;
+		};
+		let Some(pos) =
+			self.repos.iter().position(|entry| repo_key(entry) == key)
+		else {
+			if self
+				.selected_repo_idx
+				.is_some_and(|idx| idx >= self.repos.len())
+			{
+				self.selected_repo_idx = None;
+			}
+			return;
+		};
+		let root = self.repos[pos].root.clone();
+		if self.repo_root().as_ref() == Some(&root) {
+			self.selected_repo_idx = Some(pos);
+		} else if self.file_tree.is_none() || self.selected_repo_idx.is_none() {
+			self.select_repo_internal(pos, false, cx);
+		} else {
+			self.selected_repo_idx = Some(pos);
+		}
+	}
+
+	fn finish_discovery(&mut self, cx: &mut Context<Self>) {
+		self.is_loading = false;
+		if self.discovery_error_overflow > 0 {
+			self.discovery_errors.push((
+				self.workspace_root.clone(),
+				format!(
+					"{} more discovery errors omitted",
+					self.discovery_error_overflow
+				),
+			));
+			self.discovery_error_overflow = 0;
+		}
+		if self.discovery_depth_overflow > 0 {
+			self.discovery_errors.push((
+				self.workspace_root.clone(),
+				format!(
+					"{} more depth-limited directories omitted",
+					self.discovery_depth_overflow
+				),
+			));
+			self.discovery_depth_overflow = 0;
+		}
+		self.place_selection(cx);
+		let errors = self.repos.iter().filter(|r| r.summary.is_err()).count();
+		self.set_status(
+			"status_repos_loaded",
+			[self.repos.len().to_string(), errors.to_string()],
+		);
+		app_log!("[APP:READY_REPOS: {}]", self.repos.len());
+		if e2e_on() {
+			for r in &self.repos {
+				match &r.summary {
+					Ok(s) => app_log!(
+						"[APP:E2E_REPO: name={} ok=true branch={} staged={} unstaged={} untracked={} conflicts={}]",
+						r.name,
+						s.branch.as_deref().unwrap_or(""),
+						s.changes.staged,
+						s.changes.unstaged,
+						s.changes.untracked,
+						s.changes.conflicted
+					),
+					Err(_) => app_log!("[APP:E2E_REPO: name={} ok=false]", r.name),
+				}
+			}
+		}
+		if self.mode == "overview"
+			&& matches!(
+				self.discovery_status,
+				Some(ScanStatus::Complete | ScanStatus::Incomplete)
+			) {
+			ready_marker("OVERVIEW");
+		}
+		cx.notify();
+	}
+
+	fn install_added_repo(
+		&mut self,
+		outcome: Result<RepoEntry, String>,
+		cx: &mut Context<Self>,
+	) {
+		let entry = match outcome {
+			Ok(entry) => entry,
+			Err(err) => {
+				self.set_status("error_repo_status", [err]);
+				cx.notify();
+				return;
+			}
+		};
+		let key = repo_key(&entry);
+		if let Some(pos) =
+			self.repos.iter().position(|have| repo_key(have) == key)
+		{
+			self.pinned_repo = Some(key);
+			self.select_repo_internal(pos, false, cx);
+			return;
+		}
+		if !self.manual_repos.iter().any(|have| repo_key(have) == key) {
+			self.manual_repos.push(entry.clone());
+		}
+		self.repos.push(entry);
+		Self::disambiguate_repo_names(&mut self.repos, &self.workspace_root);
+		self.repos
+			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
+		if let Some(pos) =
+			self.repos.iter().position(|have| repo_key(have) == key)
+		{
+			self.pinned_repo = Some(key);
+			self.select_repo_internal(pos, false, cx);
+		}
+		cx.notify();
+	}
+
+	pub fn select_repo(&mut self, idx: usize, cx: &mut Context<Self>) {
+		if let Some(entry) = self.repos.get(idx) {
+			self.pinned_repo = Some(repo_key(entry));
+		}
+		self.select_repo_internal(idx, false, cx);
+	}
+
+	pub fn dispatch_tree(
+		&mut self,
+		cmd: Option<TreeCommand>,
+		cx: &mut Context<Self>,
+	) {
+		let Some(cmd) = cmd else {
+			return;
+		};
+		match &cmd {
+			TreeCommand::OpenFile(rel) => {
+				let rel = rel.clone();
+				app_log!("[APP:TREE_FILE_SELECTED: {}]", rel);
+				self.select_file(&rel, cx);
+				return;
+			}
+			TreeCommand::ToggleSelect(key) => {
+				if let Some(rel) = key.utf8_rel() {
+					app_log!("[APP:TREE_TOGGLED: {}]", rel);
+				}
+			}
+			TreeCommand::Collapse(key) => {
+				if let Some(rel) = key.utf8_rel().filter(|rel| !rel.is_empty())
+				{
+					app_log!("[APP:TREE_EXPANDED: {}]", rel);
+				}
+			}
+			_ => {}
+		}
+		let effect = self.file_tree.as_mut().map(|tree| tree.start(cmd));
+		match effect {
+			Some(TreeEffect::Io(io)) => self.submit_tree_io(io, cx),
+			Some(TreeEffect::OpenFile(rel)) => {
+				self.select_file(&rel, cx);
+				app_log!("[APP:TREE_FILE_SELECTED: {}]", rel);
+			}
+			Some(TreeEffect::Idle) => {
+				self.remember_tree_selection();
+				cx.notify();
+			}
+			None => {}
+		}
+	}
+
+	fn submit_tree_io(&mut self, io: TreeIo, cx: &mut Context<Self>) {
+		if self.tree_worker_alive {
+			self.tree_queue.push_back(io);
+			return;
+		}
+		self.tree_worker = self.tree_worker.wrapping_add(1);
+		let worker = self.tree_worker;
+		self.tree_worker_alive = true;
+		if self.tree_cancel.is_none() {
+			self.tree_cancel = Some(CancelToken::new());
+		}
+		let cancel = self.tree_cancel.clone().unwrap();
+		let task = cx.spawn(async move |this, cx| {
+			let mut pending = Some(io);
+			while let Some(io) = pending.take() {
+				if cancel.is_cancelled() {
+					break;
+				}
+				let bg = cx.background_executor().clone();
+				let cancel_bg = cancel.clone();
+				let result = bg
+					.spawn(async move {
+						crate::tree::execute_tree_io(io, &cancel_bg)
+					})
+					.await;
+				pending = this
+					.update(cx, |model, cx| {
+						if model.tree_worker != worker {
+							return None;
+						}
+						model.apply_tree_result(result);
+						let next = model.next_tree_io();
+						if next.is_none() {
+							model.tree_worker_alive = false;
+						}
+						cx.notify();
+						next
+					})
+					.ok()
+					.flatten();
+			}
+			let _ = this.update(cx, |model, _| {
+				if model.tree_worker == worker {
+					model.tree_worker_alive = false;
+				}
+			});
+		});
+		self.tree_task = Some(task);
+	}
+
+	fn apply_tree_result(&mut self, result: crate::tree::TreeIoResult) {
+		let Some(tree) = self.file_tree.as_mut() else {
+			return;
+		};
+		if tree.full_path != result.base {
+			return;
+		}
+		let Some(applied) = tree.apply_io_result(result) else {
+			return;
+		};
+		if applied.kind == crate::tree::TreeIoKind::Expand
+			&& !applied.rel.is_empty()
+		{
+			app_log!("[APP:TREE_EXPANDED: {}]", applied.rel);
+		}
+		app_log!(
+			"[APP:TREE_PAGE: rel={} kind={:?} children={} has_more={} selected={}]",
+			applied.rel,
+			applied.kind,
+			applied.child_count,
+			applied.has_more,
+			applied.selected_count
+		);
+		self.remember_tree_selection();
+	}
+
+	fn next_tree_io(&mut self) -> Option<TreeIo> {
+		if let Some(io) = self.tree_queue.pop_front() {
+			return Some(io);
+		}
+		while let Some(rel) = self.restore_expanded.first().cloned() {
+			self.restore_expanded.remove(0);
+			let key = NodeKey::from_utf8_rel(&rel);
+			let tree = self.file_tree.as_mut()?;
+			if !tree.contains_dir(&key) {
+				continue;
+			}
+			if let TreeEffect::Io(io) = tree.start(TreeCommand::Expand(key)) {
+				return Some(io);
+			}
+		}
+		None
+	}
+
+	pub fn select_repo_internal(
+		&mut self,
+		idx: usize,
+		preserve_anchors: bool,
+		cx: &mut Context<Self>,
+	) {
+		if idx >= self.repos.len() {
+			return;
+		}
+		self.remember_tree_selection();
+		self.generation += 1;
+		self.preview_generation += 1;
+		self.history_generation += 1;
+		self.tree_generation += 1;
+		let task_generation = self.generation;
+		self.preview_loading = false;
+		let _ = arm_cancel(&mut self.preview_cancel);
+		let _ = arm_cancel(&mut self.tree_cancel);
+		let _ = arm_cancel(&mut self.history_cancel);
+		let cancel = arm_cancel(&mut self.repo_cancel);
+
+		let anchor_file = if preserve_anchors {
+			self.selected_file.clone()
+		} else {
+			None
+		};
+		let anchor_commit = if preserve_anchors {
+			self.selected_commit.clone()
+		} else {
+			None
+		};
+		let mut expanded_paths = Vec::new();
+		if preserve_anchors {
+			if let Some(ref t) = self.file_tree {
+				t.collect_expanded_paths(&mut expanded_paths);
+			}
+		}
+
+		self.selected_repo_idx = Some(idx);
+		self.selected_file = anchor_file.clone();
+		self.selected_commit = anchor_commit.clone();
+		self.range_head = None;
+		self.compare = None;
+		self.commit_files.clear();
+		self.commits.clear();
+		self.refs.clear();
+		self.head_sha = None;
+		self.graph_layout = None;
+		self.files.clear();
+		self.commit_page = 0;
+		self.page_checkpoints = vec![None];
+		self.active_ref_filter = None;
+		self.log_search = None;
+		self.collapsed_merges.clear();
+		self.hidden_commits.clear();
+		self.history_error = None;
+		if !preserve_anchors {
+			self.preview = None;
+			self.preview_error = None;
+			self.rev_tree = None;
+		}
+		self.tree_cursor = 0;
+
+		let repo_root = self.repos[idx].root.clone();
+		let repo_name = self.repos[idx].name.clone();
+		app_log!(
+			"[APP:REPO_SELECTING: {} ({}) root={}]",
+			idx,
+			repo_name,
+			repo_root.display()
+		);
+		self.set_status("status_repo_loading", [repo_name.clone()]);
+		if let Err(e) = &self.repos[idx].summary {
+			self.preview_error =
+				Some(Msg::new("error_repo_status", [e.clone()]));
+		}
+
+		let saved_files = self.file_paths_in_basket(&repo_root);
+		self.tree_queue.clear();
+		self.tree_worker = self.tree_worker.wrapping_add(1);
+		self.tree_worker_alive = false;
+		let _ = arm_cancel(&mut self.tree_cancel);
+		let mut tree = FileTreeNode::unloaded_root(&repo_root);
+		tree.apply_selection(&saved_files);
+		self.restore_expanded = if preserve_anchors {
+			expanded_paths
+		} else {
+			Vec::new()
+		};
+		self.file_tree = Some(tree);
+		let root_io = self.file_tree.as_mut().and_then(|tree| {
+			match tree.start(TreeCommand::Expand(NodeKey::root())) {
+				TreeEffect::Io(io) => Some(io),
+				_ => None,
+			}
+		});
+		if let Some(io) = root_io {
+			self.submit_tree_io(io, cx);
+		}
+
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		let cancel_bg = cancel.clone();
+
+		let repo_root_for_update = repo_root.clone();
+		cx.foreground_executor()
+			.spawn(async move {
+				let working_res: Result<Vec<WorkingChangeTuple>, String> = bg
+					.spawn(async move {
+						let git =
+							Git::open(&repo_root).map_err(|e| e.to_string())?;
+						let opts = RunOptions {
+							cancel: Some(cancel_bg),
+							..RunOptions::interactive(None)
+						};
+						let details = status_details(&git, &opts)
+							.map_err(|e| e.to_string())?;
+						let mut items = Vec::new();
+						for (p, ct) in details.staged {
+							items.push((p, ct, SourceKind::Staged, false));
+						}
+						for (p, ct) in details.unstaged {
+							items.push((p, ct, SourceKind::Unstaged, false));
+						}
+						for p in details.untracked {
+							items.push((
+								p,
+								Some(ChangeType::New),
+								SourceKind::Working,
+								false,
+							));
+						}
+						for p in details.conflicted {
+							items.push((
+								p,
+								Some(ChangeType::Modified),
+								SourceKind::Working,
+								true,
+							));
+						}
+						items.sort_by(|a, b| a.0.cmp(&b.0));
+						Ok(items)
+					})
+					.await;
+
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.generation != task_generation {
+						return;
+					}
+					match working_res {
+						Ok(changes) => {
+							let canonical =
+								CanonicalRootId::new(&repo_root_for_update)
+									.ok();
+							let basket_items = canonical
+								.as_ref()
+								.and_then(|c| model.basket.get(c));
+							model.files = changes
+								.into_iter()
+								.map(
+									|(
+										path,
+										change_type,
+										source,
+										is_conflict,
+									)| {
+										let selected = basket_items
+											.is_some_and(|items| {
+												items.iter().any(|i| {
+													i.relative_path == path
+														&& i.source == source
+												})
+											});
+										FileChangeItem {
+											path,
+											change_type,
+											source,
+											is_conflict,
+											selected,
+										}
+									},
+								)
+								.collect();
+							app_log!(
+								"[APP:REPO_LOADED: {} files={}]",
+								repo_name,
+								model.files.len()
+							);
+							model.set_status(
+								"status_repo_loaded",
+								[
+									repo_name.clone(),
+									model.files.len().to_string(),
+								],
+							);
+							if let Some(ref anchor) = anchor_file {
+								if model.files.iter().any(|f| &f.path == anchor)
+								{
+									model.select_file(anchor, cx);
+								} else if let Some(first) = model.files.first()
+								{
+									let first_path = first.path.clone();
+									model.select_file(&first_path, cx);
+								} else {
+									model.selected_file = None;
+									model.preview = None;
+									if model.mode == "preview" {
+										ready_marker("PREVIEW");
+									}
+								}
+							} else if let Some(first) = model.files.first() {
+								let first_path = first.path.clone();
+								model.select_file(&first_path, cx);
+							} else if model.mode == "preview" {
+								ready_marker("PREVIEW");
+							}
+						}
+						Err(err) => {
+							app_log!("[APP:REPO_ERROR: {}]", repo_name);
+							model.set_status(
+								"error_repo_changes",
+								[repo_name.clone(), err.clone()],
+							);
+							model.preview_error = Some(Msg::new(
+								"error_repo_changes",
+								[repo_name.clone(), err],
+							));
+						}
+					}
+					model.load_history(cx);
+					cx.notify();
+				});
+			})
+			.detach();
+	}
+
+	/// Selects a file, using its known source identity if in the changes list.
+	pub fn select_file(&mut self, path: &str, cx: &mut Context<Self>) {
+		let source = self
+			.files
+			.iter()
+			.find(|f| f.path == path)
+			.map(|f| f.source.clone())
+			.unwrap_or(SourceKind::Working);
+		self.select_file_with_source(path, source, cx);
+	}
+
+	/// Selects a file item directly from the changes list.
+	pub fn select_file_item(
+		&mut self,
+		item: &FileChangeItem,
+		cx: &mut Context<Self>,
+	) {
+		self.select_file_with_source(&item.path, item.source.clone(), cx);
+	}
+
+	/// Opens a working-tree file (Project) or its staged/unstaged changes (Changes).
+	pub fn select_file_with_source(
+		&mut self,
+		path: &str,
+		source: SourceKind,
+		cx: &mut Context<Self>,
+	) {
+		self.preview_generation += 1;
+		let task_generation = self.preview_generation;
+		self.selected_file = Some(path.to_string());
+		self.selected_file_source = Some(source.clone());
+		self.selected_commit = None;
+		self.range_head = None;
+		self.compare = None;
+		self.commit_files.clear();
+		let Some(repo_root) = self.repo_root() else {
+			return;
+		};
+		let file_path = path.to_string();
+		self.preview_loading = true;
+		self.preview_error = None;
+		let is_tree = self.active_tab == WorkbenchTab::FileExplorer;
+
+		let cancel = arm_cancel(&mut self.preview_cancel);
+
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+
+		cx.foreground_executor()
+			.spawn(async move {
+				let for_bg = file_path.clone();
+				let result = bg
+					.spawn(async move {
+						if is_tree || matches!(source, SourceKind::File) {
+							return browser::file_preview(&repo_root, &for_bg)
+								.map(|p| (p, PreviewSource::WorkingFile))
+								.map_err(|e| e.to_string());
+						}
+						let git =
+							Git::open(&repo_root).map_err(|e| e.to_string())?;
+						let opts = RunOptions {
+							cancel: Some(cancel),
+							max_stdout: browser::PREVIEW_LIMIT,
+							overflow: Overflow::Error,
+							..RunOptions::interactive(None)
+						};
+						let (git_source, preview_source) = match source {
+							SourceKind::Staged => (
+								GitSource::Staged,
+								PreviewSource::StagedChanges,
+							),
+							SourceKind::Unstaged => (
+								GitSource::Working,
+								PreviewSource::UnstagedChanges,
+							),
+							SourceKind::Working => (
+								GitSource::Working,
+								PreviewSource::WorkingChanges,
+							),
+							SourceKind::Commit { rev } => (
+								GitSource::Commit(rev.clone()),
+								PreviewSource::CommitFile { sha: rev },
+							),
+							SourceKind::File => {
+								(GitSource::Working, PreviewSource::WorkingFile)
+							}
+						};
+						match browser::git_preview_with(
+							&git,
+							&git_source,
+							&for_bg,
+							&opts,
+						) {
+							Ok(p) => Ok((
+								browser::SourcePreview {
+									content: p.content,
+									patch: p.patch,
+								},
+								preview_source,
+							)),
+							// Not a change (or vanished): show the file itself.
+							Err(_) => {
+								browser::file_preview(&repo_root, &for_bg)
+									.map(|p| (p, PreviewSource::WorkingFile))
+									.map_err(|e| e.to_string())
+							}
+						}
+					})
+					.await;
+
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.preview_generation != task_generation {
+						return;
+					}
+					model.apply_source_preview(file_path.clone(), result);
+					app_log!("[APP:PREVIEW_LOADED: {}]", file_path);
+					if model.mode == "preview" {
+						ready_marker("PREVIEW");
+					}
+					cx.notify();
+				});
+			})
+			.detach();
+	}
+
+	/// Turns a core `SourcePreview` into the single retained preview.
+	pub fn apply_source_preview(
+		&mut self,
+		path: String,
+		result: Result<(browser::SourcePreview, PreviewSource), String>,
+	) {
+		match result {
+			Ok((p, source)) => {
+				if !p.patch.is_empty() {
+					self.set_preview(Preview::new(
+						source,
+						Some(path),
+						p.patch,
+						true,
+						Language::Diff,
+					));
+				} else if let Some(content) = p.content {
+					let lang = Language::from_path_or_ext(&path, false);
+					self.set_preview(Preview::new(
+						source,
+						Some(path),
+						content,
+						false,
+						lang,
+					));
+				} else {
+					self.preview = None;
+					self.preview_loading = false;
+					self.preview_error = Some(Msg::new("error_binary", [path]));
+				}
+			}
+			Err(e) => {
+				self.preview = None;
+				self.preview_loading = false;
+				self.preview_error = Some(Msg::new("error_preview", [path, e]));
+			}
+		}
+	}
+
+	fn source_label(source: &SourceKind) -> &'static str {
+		match source {
+			SourceKind::Staged => "staged",
+			SourceKind::Unstaged => "unstaged",
+			SourceKind::Working => "untracked",
+			SourceKind::File => "file",
+			SourceKind::Commit { .. } => "commit",
+		}
+	}
+
+	fn set_basket_group(
+		&mut self,
+		root: CanonicalRootId,
+		file_group: bool,
+		new_items: Vec<ExportItem>,
+	) {
+		let mut kept = self.basket.remove(&root).unwrap_or_default();
+		kept.retain(|item| {
+			matches!(item.source, SourceKind::File) != file_group
+		});
+		kept.extend(new_items);
+		if !kept.is_empty() {
+			self.basket.insert(root, kept);
+		}
+		self.log_basket();
+	}
+
+	fn log_basket(&self) {
+		app_log!(
+			"[APP:BASKET: n={} summary={}]",
+			self.basket_count(),
+			self.basket_summary()
+		);
+		if let Some(collision) = self.basket_collision_text() {
+			app_log!("[APP:BASKET_COLLISION: {}]", collision);
+		}
+	}
+
+	pub fn basket_count(&self) -> usize {
+		self.basket.values().map(|items| items.len()).sum()
+	}
+
+	pub fn basket_summary(&self) -> String {
+		let mut parts = Vec::new();
+		let mut rows: Vec<_> = self.basket.iter().collect();
+		rows.sort_by_key(|(root, _)| {
+			root.path().to_string_lossy().into_owned()
+		});
+		for (root, items) in rows {
+			let name = self
+				.repos
+				.iter()
+				.find(|repo| {
+					CanonicalRootId::new(&repo.root).ok().as_ref() == Some(root)
+				})
+				.map(|repo| repo.name.clone())
+				.unwrap_or_else(|| root.path().display().to_string());
+			let mut items = items.clone();
+			items.sort_by(|a, b| {
+				(&a.relative_path, Self::source_label(&a.source))
+					.cmp(&(&b.relative_path, Self::source_label(&b.source)))
+			});
+			for item in items {
+				parts.push(format!(
+					"{name} {} {}",
+					Self::source_label(&item.source),
+					item.relative_path
+				));
+			}
+		}
+		parts.join("; ")
+	}
+
+	/// Two selections of one path cannot share a wire header. File rows count;
+	/// a matching basename is not a reason to drop one of them.
+	pub fn basket_collision_text(&self) -> Option<String> {
+		let mut seen: HashMap<(String, String), usize> = HashMap::new();
+		for (root, items) in &self.basket {
+			for item in items {
+				*seen
+					.entry((
+						root.path().display().to_string(),
+						item.relative_path.clone(),
+					))
+					.or_default() += 1;
+			}
+		}
+		let mut hits = Vec::new();
+		for ((root, path), count) in seen {
+			if count > 1 {
+				hits.push(format!("{root}:{path}"));
+			}
+		}
+		hits.sort();
+		if hits.is_empty() {
+			None
+		} else {
+			Some(hits.join(", "))
+		}
+	}
+
+	fn file_paths_in_basket(&self, root: &std::path::Path) -> HashSet<String> {
+		let Ok(id) = CanonicalRootId::new(root) else {
+			return HashSet::new();
+		};
+		self.basket
+			.get(&id)
+			.map(|items| {
+				items
+					.iter()
+					.filter(|item| matches!(item.source, SourceKind::File))
+					.map(|item| item.relative_path.clone())
+					.collect()
+			})
+			.unwrap_or_default()
+	}
+
+	/// Keeps Project checkboxes without replacing Git change entries.
+	pub fn remember_tree_selection(&mut self) {
+		let Some(repo) = self.repo() else {
+			return;
+		};
+		let Ok(id) = CanonicalRootId::new(&repo.root) else {
+			return;
+		};
+		let mut paths = Vec::new();
+		if let Some(tree) = &self.file_tree {
+			tree.collect_selected_paths(&mut paths);
+		}
+		paths.sort();
+		paths.dedup();
+		let items = paths
+			.into_iter()
+			.map(|path| ExportItem {
+				root: id.clone(),
+				relative_path: path,
+				source: SourceKind::File,
+				change_type: None,
+			})
+			.collect();
+		self.set_basket_group(id, true, items);
+	}
+
+	pub fn reapply_tree_selection(&mut self) {
+		let Some(root) = self.repo_root() else {
+			return;
+		};
+		let saved = self.file_paths_in_basket(&root);
+		if let Some(tree) = self.file_tree.as_mut() {
+			tree.apply_selection(&saved);
+		}
+	}
+
+	pub fn sync_git_selection_to_basket(&mut self) {
+		let Some(repo) = self.repo() else {
+			return;
+		};
+		let Ok(id) = CanonicalRootId::new(&repo.root) else {
+			return;
+		};
+		let items = self
+			.files
+			.iter()
+			.filter(|file| file.selected)
+			.map(|file| ExportItem {
+				root: id.clone(),
+				relative_path: file.path.clone(),
+				source: file.source.clone(),
+				change_type: file.change_type,
+			})
+			.collect();
+		self.set_basket_group(id, false, items);
+	}
+
+	pub fn clear_basket(&mut self, cx: &mut Context<Self>) {
+		self.basket.clear();
+		for file in &mut self.files {
+			file.selected = false;
+		}
+		if let Some(tree) = self.file_tree.as_mut() {
+			tree.set_all_selected(false);
+		}
+		self.log_basket();
+		app_log!("[APP:BASKET_CLEARED]");
+		self.set_status("basket_cleared", []);
+		cx.notify();
+	}
+
+	pub fn sync_current_selection_to_basket(&mut self) {
+		match self.active_tab {
+			WorkbenchTab::FileExplorer => self.remember_tree_selection(),
+			WorkbenchTab::GitChanges => self.sync_git_selection_to_basket(),
+		}
+	}
+
+	pub fn copy_selection_to_clipboard(&mut self, cx: &mut Context<Self>) {
+		if self.is_copying {
+			app_log!("[APP:COPY_BUSY]");
+			return;
+		}
+		self.remember_tree_selection();
+		self.sync_git_selection_to_basket();
+		if self.basket_count() == 0
+			&& self.selected_commit.is_some()
+			&& self.selected_file.is_none()
+		{
+			app_log!("[APP:COPY_REFUSED: commit_readonly]");
+			self.set_status("btn_copy_commit_readonly", []);
+			cx.notify();
+			return;
+		}
+		if let Some(collision) = self.basket_collision_text() {
+			app_log!("[APP:COPY_REFUSED: collision]");
+			self.set_status("basket_collision", [collision]);
+			cx.notify();
+			return;
+		}
+		let repo_name = self
+			.repo()
+			.map(|repo| repo.name.clone())
+			.unwrap_or_else(|| "basket".into());
+		let mut items = Vec::new();
+		let mut roots = Vec::new();
+		for repo_items in self.basket.values() {
+			for item in repo_items {
+				let path = item.root.path().to_path_buf();
+				if !roots.iter().any(|root| root == &path) {
+					roots.push(path);
+				}
+				items.push(item.clone());
+			}
+		}
+		if items.is_empty() {
+			app_log!("[APP:COPY_REFUSED: empty_selection]");
+			self.set_status("status_copy_empty", []);
+			cx.notify();
+			return;
+		}
+		let repo_root = self
+			.repo_root()
+			.filter(|root| roots.iter().any(|have| have == root))
+			.unwrap_or_else(|| roots[0].clone());
+
+		let export_sel =
+			match ExportSelection::new(roots, Some(repo_root.clone()), items) {
+				Ok(s) => s,
+				Err(e) => {
+					self.set_status("error_payload", [e.to_string()]);
+					cx.notify();
+					return;
+				}
+			};
+
+		self.is_copying = true;
+		self.set_status("status_copying", [repo_name.clone()]);
+		cx.notify();
+
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+
+		cx.foreground_executor()
+			.spawn(async move {
+				let result: Result<Msg, Msg> = bg
+					.spawn(async move {
+						let settings = Settings::default();
+						let plan = plan_export(&export_sel, &settings, None)
+							.map_err(|e| {
+								Msg::new("error_payload", [e.to_string()])
+							})?;
+						if plan.files.is_empty() {
+							return Ok(Msg::new("status_copy_nothing", []));
+						}
+						plan.revalidate().map_err(|e| {
+							Msg::new("error_payload", [e.to_string()])
+						})?;
+						clip::write_text(&plan.payload).map_err(|e| {
+							Msg::new("status_clipboard_failed", [e.to_string()])
+						})?;
+						app_log!(
+							"[APP:COPY_DONE: copied={}]",
+							plan.copied_file_count
+						);
+						let skipped = plan.skipped_unreadable_count
+							+ plan.skipped_file_size_count;
+						Ok(Msg::new(
+							"status_copied",
+							[
+								repo_name,
+								plan.copied_file_count.to_string(),
+								plan.stats.chars.to_string(),
+								plan.stats.lines.to_string(),
+								skipped.to_string(),
+							],
+						))
+					})
+					.await;
+
+				match this.update(&mut async_app, |model, cx| {
+					model.is_copying = false;
+					app_log!("[APP:COPY_IDLE]");
+					model.status = match result {
+						Ok(m) | Err(m) => m,
+					};
+					cx.notify();
+				}) {
+					Ok(()) => {}
+					Err(err) => {
+						app_log!("[APP:COPY_IDLE_FAILED: {err}]");
+					}
+				}
+			})
+			.detach();
+	}
+
+	/// Exports the selected commit or first-parent commit range to the clipboard.
+	pub fn copy_commits_to_clipboard(&mut self, cx: &mut Context<Self>) {
+		if self.is_copying {
+			self.set_status("status_copying", []);
+			cx.notify();
+			return;
+		}
+		let Some(repo_root) = self.repo_root() else {
+			return;
+		};
+		let repo_name = self.repo().map(|r| r.name.clone()).unwrap_or_default();
+		let rows = self.display_commits();
+		let (tip_sha, selected) = if let Some((top, bottom)) = self.range_rows()
+		{
+			let slice = &rows[top..=bottom];
+			let tip = slice[0].sha.clone();
+			let selected = slice.iter().map(|c| c.sha.clone()).collect();
+			(tip, selected)
+		} else if let Some(ref sel) = self.selected_commit {
+			if rows.iter().any(|c| &c.sha == sel) {
+				(sel.clone(), vec![sel.clone()])
+			} else {
+				app_log!("[APP:COPY_COMMITS_REFUSED: no_selection]");
+				self.set_status("status_copy_empty", []);
+				cx.notify();
+				return;
+			}
+		} else {
+			app_log!("[APP:COPY_COMMITS_REFUSED: no_selection]");
+			self.set_status("status_copy_empty", []);
+			cx.notify();
+			return;
+		};
+		drop(rows);
+
+		self.is_copying = true;
+		self.set_status("status_copying", [repo_name.clone()]);
+		cx.notify();
+
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+
+		cx.foreground_executor()
+			.spawn(async move {
+				let result: Result<usize, String> = bg
+					.spawn(async move {
+						let git =
+							Git::open(&repo_root).map_err(|e| e.to_string())?;
+						let payload =
+							plan_commit_export_exact(&git, &tip_sha, &selected)
+								.map_err(|e| e.to_string())?;
+						let n_commits = payload.commits.len();
+						let text = commits::to_clipboard_text(&payload);
+						clip::write_text(&text).map_err(|e| e.to_string())?;
+						Ok(n_commits)
+					})
+					.await;
+
+				let _ = this.update(&mut async_app, |model, cx| {
+					model.is_copying = false;
+					match result {
+						Ok(n_commits) => {
+							app_log!(
+								"[APP:COPY_COMMITS_DONE: commits={}]",
+								n_commits
+							);
+							model.set_status(
+								"status_commits_copied",
+								[n_commits.to_string()],
+							);
+						}
+						Err(err) => {
+							app_log!("[APP:COPY_COMMITS_ERR: {}]", err);
+							model.set_status("error_payload", [err]);
+						}
+					}
+					cx.notify();
+				});
+			})
+			.detach();
+	}
+
+	/// True while a confirmed plan is being written. The write is not
+	/// cancellable, so every control that would change or discard the plan
+	/// is refused until it finishes.
+	pub fn paste_busy(&self) -> bool {
+		self.paste_preview.as_ref().is_some_and(|p| p.is_applying)
+	}
+
+	fn refuse_while_applying(
+		&mut self,
+		action: &str,
+		cx: &mut Context<Self>,
+	) -> bool {
+		if !self.paste_busy() {
+			return false;
+		}
+		app_log!("[APP:PASTE_BUSY: refused={action}]");
+		self.set_status("paste_busy_refused", []);
+		cx.notify();
+		true
+	}
+
+	pub fn trigger_paste_preview(
+		&mut self,
+		window: &mut gpui::Window,
+		cx: &mut Context<Self>,
+	) {
+		if self.refuse_while_applying("preview", cx) {
+			return;
+		}
+		// A new paste always invalidates the previous plan first, so a failed
+		// read/parse can never leave an older plan armed for Apply.
+		if self.paste_preview.take().is_some() {
+			app_log!("[APP:PASTE_PLAN_CLEARED]");
+		}
+		let text = match clip::read_text() {
+			Ok(t) => t,
+			Err(e) => {
+				app_log!("[APP:PASTE_ERR: clipboard]");
+				self.restore_log_after_paste();
+				self.set_status(
+					"status_clipboard_read_failed",
+					[e.to_string()],
+				);
+				self.pending_focus = Some(self.focus_handle.clone());
+				cx.notify();
+				return;
+			}
+		};
+
+		let target_dest = self.current_restore_destination();
+		let known_roots: Vec<std::path::PathBuf> =
+			self.repos.iter().map(|r| r.root.clone()).collect();
+		match PastePreviewPlan::build_from_clipboard_text(
+			&text,
+			&target_dest,
+			&known_roots,
+			self.generation,
+		) {
+			Ok(plan) => {
+				for choice in &plan.prefix_choices {
+					for (idx, path) in choice.candidates.iter().enumerate() {
+						app_log!(
+							"[APP:PASTE_MAP_CANDIDATE: prefix={} idx={} path={}]",
+							choice.prefix,
+							idx,
+							path.display()
+						);
+					}
+				}
+				app_log!(
+					"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
+					plan.items.len(),
+					target_dest.display(),
+					plan.mapping_ready()
+				);
+				self.set_status(
+					"status_paste_preview",
+					[plan.items.len().to_string()],
+				);
+				self.paste_preview = Some(plan);
+				if collapse_log_for_paste(
+					&mut self.log_before_paste,
+					&mut self.bottom_visible,
+				) {
+					app_log!(
+						"[APP:LOG_PANEL: visible=false reason=paste_open]"
+					);
+				}
+				self.refresh_paste_detail();
+				window.focus(&self.paste_focus);
+			}
+			Err(err) => {
+				app_log!("[APP:PASTE_ERR: {}]", err.key);
+				self.restore_log_after_paste();
+				self.status = err;
+				self.pending_focus = Some(self.focus_handle.clone());
+			}
+		}
+		cx.notify();
+	}
+
+	pub fn choose_paste_keep(&mut self, prefix: &str, cx: &mut Context<Self>) {
+		if self.refuse_while_applying("mapping", cx) {
+			return;
+		}
+		let Some(plan) = self.paste_preview.as_mut() else {
+			return;
+		};
+		match plan.set_keep_relative(prefix) {
+			Ok(()) => {
+				let dest = plan.destination.display().to_string();
+				app_log!(
+					"[APP:PASTE_MAPPED: prefix={} keep=primary dest={} items={}]",
+					prefix,
+					dest,
+					plan.items.len()
+				);
+				self.refresh_paste_detail();
+			}
+			Err(err) => {
+				app_log!("[APP:PASTE_ERR: {}]", err.key);
+				plan.error = Some(err);
+			}
+		}
+		cx.notify();
+	}
+
+	pub fn choose_paste_prefix(
+		&mut self,
+		prefix: &str,
+		candidate_idx: usize,
+		cx: &mut Context<Self>,
+	) {
+		if self.refuse_while_applying("mapping", cx) {
+			return;
+		}
+		let Some(dest) = self.paste_preview.as_ref().and_then(|plan| {
+			plan.prefix_choices
+				.iter()
+				.find(|c| c.prefix == prefix)
+				.and_then(|choice| {
+					choice.candidates.get(candidate_idx).cloned()
+				})
+		}) else {
+			return;
+		};
+		let Some(plan) = self.paste_preview.as_mut() else {
+			return;
+		};
+		match plan.set_prefix_destination(prefix, &dest) {
+			Ok(()) => {
+				app_log!(
+					"[APP:PASTE_MAPPED: prefix={} dest={} items={}]",
+					prefix,
+					dest.display(),
+					plan.items.len()
+				);
+				self.refresh_paste_detail();
+			}
+			Err(err) => {
+				app_log!("[APP:PASTE_ERR: {}]", err.key);
+				plan.error = Some(err);
+			}
+		}
+		cx.notify();
+	}
+
+	pub fn toggle_paste_overwrite(
+		&mut self,
+		idx: usize,
+		cx: &mut Context<Self>,
+	) {
+		if self.refuse_while_applying("overwrite", cx) {
+			return;
+		}
+		if let Some(ref mut p) = self.paste_preview {
+			p.toggle_overwrite(idx);
+			let st = p
+				.items
+				.get(idx)
+				.map(|i| i.overwrite_allowed)
+				.unwrap_or(false);
+			app_log!("[APP:PASTE_TOGGLED: idx={} state={}]", idx, st);
+			cx.notify();
+		}
+	}
+
+	pub fn toggle_paste_selected(
+		&mut self,
+		idx: usize,
+		cx: &mut Context<Self>,
+	) {
+		if self.refuse_while_applying("include", cx) {
+			return;
+		}
+		if let Some(ref mut p) = self.paste_preview {
+			p.toggle_selected(idx);
+			let st = p.items.get(idx).map(|i| i.selected).unwrap_or(false);
+			app_log!("[APP:PASTE_SEL_TOGGLED: idx={} state={}]", idx, st);
+			cx.notify();
+		}
+	}
+
+	pub fn select_paste_item(&mut self, idx: usize, cx: &mut Context<Self>) {
+		// Read-only navigation stays available while applying.
+		if let Some(ref mut p) = self.paste_preview {
+			if idx < p.items.len() {
+				p.selected_item_idx = idx;
+				app_log!("[APP:PASTE_NAV: idx={}]", idx);
+				self.refresh_paste_detail();
+				cx.notify();
+			}
+		}
+	}
+
+	/// Builds the one retained detail text for the selected paste item.
+	fn refresh_paste_detail(&mut self) {
+		self.paste_detail = self
+			.paste_preview
+			.as_ref()
+			.and_then(|p| p.items.get(p.selected_item_idx))
+			.filter(|i| !i.is_delete)
+			.map(|i| {
+				Preview::new(
+					PreviewSource::PasteItem,
+					Some(i.path.clone()),
+					i.content.to_string(),
+					false,
+					Language::from_path_or_ext(&i.path, false),
+				)
+			});
+		self.paste_scroll
+			.scroll_to_item(0, gpui::ScrollStrategy::Top);
+	}
+
+	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
+		let Some(ref mut plan) = self.paste_preview else {
+			app_log!("[APP:APPLY_IGNORED: no_plan]");
+			return;
+		};
+		if plan.is_applying {
+			app_log!("[APP:PASTE_BUSY: refused=apply]");
+			return;
+		}
+		if !plan.mapping_ready() {
+			app_log!("[APP:PASTE_ERR: mapping_required]");
+			plan.error = Some(Msg::new("mapping_required", []));
+			self.set_status("mapping_required", []);
+			cx.notify();
+			return;
+		}
+
+		plan.is_applying = true;
+		self.pending_focus = Some(self.paste_focus.clone());
+		// The worker gets a cheap handle: the plan's contents are shared.
+		let plan_clone = plan.clone();
+		self.set_status("paste_apply_busy", []);
+		app_log!("[APP:PASTE_APPLYING]");
+		cx.notify();
+
+		let delay = self.e2e_apply_delay;
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+
+		cx.foreground_executor()
+			.spawn(async move {
+				let exec_res = bg
+					.spawn(async move {
+						if let Some(d) = delay {
+							std::thread::sleep(d);
+						}
+						plan_clone.execute()
+					})
+					.await;
+
+				// No generation check: the write already happened (or was
+				// refused as stale), and its result must always be shown.
+				// The plan cannot be replaced while applying.
+				let _ = this.update(&mut async_app, |model, cx| {
+					match exec_res {
+						Ok(result) => {
+							app_log!(
+								"[APP:PASTE_DONE: created={} overwritten={} skipped={} deleted={} errors={} commits={}]",
+								result.files.created_count,
+								result.files.overwritten_count,
+								result.files.skipped_existing_count,
+								result.files.deleted_count,
+								result.files.errors.len(),
+								result.created_commits.len()
+							);
+							if result.created_commits.is_empty() {
+								model.set_status(
+									"status_paste_done",
+									[
+										result.files.created_count.to_string(),
+										result
+											.files
+											.overwritten_count
+											.to_string(),
+										result
+											.files
+											.skipped_existing_count
+											.to_string(),
+										result.files.deleted_count.to_string(),
+										result.files.errors.len().to_string(),
+									],
+								);
+							} else {
+								model.set_status(
+									"commit_replay_done",
+									[result.created_commits.join(", ")],
+								);
+							}
+							model.paste_preview = None;
+							model.restore_log_after_paste();
+							model.pending_focus =
+								Some(model.focus_handle.clone());
+							if let Some(idx) = model.selected_repo_idx {
+								model.select_repo(idx, cx);
+							}
+						}
+						Err(err) => {
+							app_log!("[APP:PASTE_STALE_DETECTED: {}]", err.key);
+							model.status = err.clone();
+							if let Some(ref mut p) = model.paste_preview {
+								p.is_applying = false;
+								p.error = Some(err);
+							}
+						}
+					}
+					cx.notify();
+				});
+			})
+			.detach();
+	}
+
+	/// Called on every path that closes the paste preview.
+	fn restore_log_after_paste(&mut self) {
+		if restore_log_after_paste(
+			&mut self.log_before_paste,
+			&mut self.bottom_visible,
+		) {
+			app_log!("[APP:LOG_PANEL: visible=true reason=paste_close]");
+		}
+	}
+
+	pub fn cancel_paste_preview(&mut self, cx: &mut Context<Self>) {
+		if self.refuse_while_applying("cancel", cx) {
+			return;
+		}
+		if self.paste_preview.take().is_none() {
+			return;
+		}
+		self.restore_log_after_paste();
+		self.pending_focus = Some(self.focus_handle.clone());
+		self.set_status("paste_cancelled", []);
+		app_log!("[APP:PASTE_CANCELLED]");
+		cx.notify();
+	}
+
+	pub fn copy_current_preview_content(&mut self, cx: &mut Context<Self>) {
+		// Copies the selection if any, otherwise the whole retained preview.
+		if self.copy_reader_selection(cx) {
+			return;
+		}
+		if let Some(p) = &self.preview {
+			let text = p.text.clone();
+			let len = text.len();
+			let fp = p.fingerprint();
+			match clip::write_text(&text) {
+				Ok(()) => {
+					self.set_status("status_copied_preview", []);
+					app_log!(
+						"[APP:PREVIEW_COPIED: bytes={} fnv={:x}]",
+						len,
+						fp
+					);
+				}
+				Err(e) => {
+					self.set_status("status_clipboard_failed", [e.to_string()])
+				}
+			}
+			cx.notify();
+		}
+	}
+}
+
+fn repo_key(entry: &RepoEntry) -> (PathBuf, PathBuf) {
+	if let Some(id) = &entry.identity {
+		(id.toplevel.clone(), id.git_dir.clone())
+	} else {
+		(entry.root.clone(), PathBuf::new())
+	}
+}
+
+async fn drive_discovery(
+	this: gpui::WeakEntity<WorkbenchModel>,
+	cx: &mut gpui::AsyncApp,
+	mut disc: Discovery,
+	generation: u64,
+	cancel: CancelToken,
+	mut wipe: bool,
+) {
+	loop {
+		if cancel.is_cancelled() {
+			let _ = this.update(cx, |model, cx| {
+				if model.discovery_generation != generation {
+					return;
+				}
+				model.discovery = Some(disc);
+				model.discovery_status = Some(ScanStatus::Cancelled);
+				model.is_loading = false;
+				cx.notify();
+			});
+			return;
+		}
+		let cancel_page = cancel.clone();
+		let bg = cx.background_executor().clone();
+		let (returned, page) = bg
+			.spawn(async move {
+				if cancel_page.is_cancelled() {
+					return (disc, None);
+				}
+				let mut budget = ScanBudget::visits(2_000);
+				budget.cancel = Some(cancel_page);
+				let page = disc.next_page(&budget);
+				(disc, Some(page))
+			})
+			.await;
+		disc = returned;
+		let Some(page) = page else {
+			let _ = this.update(cx, |model, cx| {
+				if model.discovery_generation != generation {
+					return;
+				}
+				model.discovery = Some(disc);
+				model.discovery_status = Some(ScanStatus::Cancelled);
+				model.is_loading = false;
+				cx.notify();
+			});
+			return;
+		};
+		let status = page.status;
+		let visited = page.visited;
+		let found = page.repos;
+		let page_errors = page.errors;
+		let depth = page.depth_limited;
+		let cancel_git = cancel.clone();
+		let bg = cx.background_executor().clone();
+		let processed = bg
+			.spawn(async move {
+				let opts = RunOptions {
+					cancel: Some(cancel_git),
+					..RunOptions::interactive(None)
+				};
+				WorkbenchModel::process_discovery_repos(found, &opts)
+			})
+			.await;
+		let stop = !matches!(status, ScanStatus::More);
+		let done = this.update(cx, |model, cx| {
+			if model.discovery_generation != generation {
+				return true;
+			}
+			if wipe {
+				model.repos.clear();
+				let manual = model.manual_repos.clone();
+				model.merge_repo_entries(manual);
+				wipe = false;
+			}
+			model.merge_repo_entries(processed.0);
+			for err in processed.1 {
+				model.push_discovery_error(err);
+			}
+			for err in page_errors {
+				model.push_discovery_error(err);
+			}
+			for path in depth {
+				model.push_depth_limit(path);
+			}
+			model.discovery_status = Some(status);
+			app_log!(
+				"[APP:DISCOVERY_PROGRESS: repos={} status={status:?} visited={visited}]",
+				model.repos.len()
+			);
+			model.place_selection(cx);
+			cx.notify();
+			stop
+		});
+		if done.unwrap_or(true) {
+			let _ = this.update(cx, |model, cx| {
+				if model.discovery_generation != generation {
+					return;
+				}
+				model.discovery = Some(disc);
+				model.finish_discovery(cx);
+			});
+			return;
+		}
+	}
+}
+
+fn resolve_added_repo(
+	path: PathBuf,
+	cancel: &CancelToken,
+) -> Result<RepoEntry, String> {
+	if cancel.is_cancelled() {
+		return Err("cancelled".to_string());
+	}
+	let path = dunce::canonicalize(&path).map_err(|err| err.to_string())?;
+	let opts = RunOptions {
+		cancel: Some(cancel.clone()),
+		..RunOptions::interactive(None)
+	};
+	let (root, kind, identity, summary) = match Git::open(&path) {
+		Ok(git) => {
+			let root = git.root().to_path_buf();
+			match RepoIdentity::resolve(&git, &opts) {
+				Ok(id) => {
+					let kind = match id.kind {
+						RepoKind::LinkedWorktree => {
+							RepoEntryKind::LinkedWorktree
+						}
+						RepoKind::Submodule => RepoEntryKind::Submodule,
+						RepoKind::Main => RepoEntryKind::Main,
+					};
+					let summary =
+						summarize(&git, &opts).map_err(|err| err.to_string());
+					(id.toplevel.clone(), kind, Some(id), summary)
+				}
+				Err(err) => (
+					root,
+					RepoEntryKind::Main,
+					None,
+					Err(format!("repository identity: {err}")),
+				),
+			}
+		}
+		Err(err) => (path, RepoEntryKind::Main, None, Err(err.to_string())),
+	};
+	let name = root
+		.file_name()
+		.map(|n| n.to_string_lossy().into_owned())
+		.unwrap_or_else(|| root.display().to_string());
+	Ok(RepoEntry {
+		root,
+		name,
+		kind,
+		identity,
+		summary,
+	})
+}
+
+fn parse_cli_args() -> (PathBuf, String, Option<PathBuf>) {
+	let mut workspace =
+		std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+	let mut mode = "normal".to_string();
+	let mut restore_dir = None;
+
+	let args: Vec<String> = std::env::args().collect();
+
+	// Reject --version or --help combined with other arguments
+	if args.iter().any(|a| a == "--version" || a == "-V") && args.len() > 2 {
+		eprintln!("Error: --version cannot be combined with other arguments");
+		std::process::exit(2);
+	}
+	if args.iter().any(|a| a == "--help" || a == "-h") && args.len() > 2 {
+		eprintln!("Error: --help cannot be combined with other arguments");
+		std::process::exit(2);
+	}
+
+	let mut i = 1;
+	while i < args.len() {
+		match args[i].as_str() {
+			"--version" | "-V" => {
+				println!("snip-desktop-native {}", env!("CARGO_PKG_VERSION"));
+				std::process::exit(0);
+			}
+			"--help" | "-h" => {
+				println!("snip-desktop-native: GPUI Native Git Workbench");
+				println!("Usage: snip-desktop-native [OPTIONS]");
+				println!("Options:");
+				println!("  --workspace <DIR>    Set workspace folder containing repos");
+				println!("  --mode <MODE>        Run mode: normal, idle, overview, preview");
+				println!("  --restore-dir <DIR>  Target folder for paste restore operations");
+				println!("  -V, --version        Print version information");
+				println!("  -h, --help           Print help");
+				std::process::exit(0);
+			}
+			"--workspace" => {
+				if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+					workspace = PathBuf::from(&args[i + 1]);
+					i += 1;
+				} else {
+					eprintln!(
+						"Error: --workspace requires a directory argument"
+					);
+					std::process::exit(2);
+				}
+			}
+			"--mode" => {
+				if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+					let val = &args[i + 1];
+					if !matches!(
+						val.as_str(),
+						"normal" | "idle" | "overview" | "preview"
+					) {
+						eprintln!(
+							"Error: invalid --mode: {val}. Valid modes: normal, idle, overview, preview"
+						);
+						std::process::exit(2);
+					}
+					mode = val.clone();
+					i += 1;
+				} else {
+					eprintln!("Error: --mode requires a mode argument");
+					std::process::exit(2);
+				}
+			}
+			"--restore-dir" => {
+				if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+					restore_dir = Some(PathBuf::from(&args[i + 1]));
+					i += 1;
+				} else {
+					eprintln!(
+						"Error: --restore-dir requires a directory argument"
+					);
+					std::process::exit(2);
+				}
+			}
+			unknown => {
+				eprintln!("Error: unrecognized argument: {unknown}");
+				std::process::exit(2);
+			}
+		}
+		i += 1;
+	}
+
+	(workspace, mode, restore_dir)
+}
+
+fn key_bindings() -> Vec<KeyBinding> {
+	let mut b = vec![
+		KeyBinding::new("ctrl-q", Quit, None),
+		KeyBinding::new("cmd-q", Quit, None),
+		KeyBinding::new("ctrl-c", CopySelection, None),
+		KeyBinding::new("cmd-c", CopySelection, None),
+		KeyBinding::new("ctrl-v", PastePreview, None),
+		KeyBinding::new("cmd-v", PastePreview, None),
+		KeyBinding::new("ctrl-r", Refresh, None),
+		KeyBinding::new("cmd-r", Refresh, None),
+		KeyBinding::new("alt-d", DeselectAllFiles, None),
+		KeyBinding::new("alt-s", SelectAllFiles, None),
+		KeyBinding::new("tab", FocusNext, None),
+		KeyBinding::new("shift-tab", FocusPrev, None),
+		KeyBinding::new("ctrl-tab", FocusNext, None),
+		KeyBinding::new("ctrl-shift-tab", FocusPrev, None),
+		// IntelliJ tool window shortcuts.
+		KeyBinding::new("alt-1", ShowProject, None),
+		KeyBinding::new("alt-0", ShowChanges, None),
+		KeyBinding::new("alt-9", ToggleLog, None),
+		KeyBinding::new("alt-shift-r", OpenRepoSelector, None),
+		KeyBinding::new("alt-shift-b", OpenRefSelector, None),
+		KeyBinding::new("alt-l", ToggleLocale, None),
+		KeyBinding::new("alt-n", HistoryNextPage, None),
+		KeyBinding::new("alt-p", HistoryPrevPage, None),
+		KeyBinding::new("ctrl-f", FindInFile, None),
+		KeyBinding::new("ctrl-g", GotoLine, None),
+		KeyBinding::new("f3", FindNext, None),
+		KeyBinding::new("shift-f3", FindPrev, None),
+		// Paste preview panel.
+		KeyBinding::new("enter", ApplyPaste, Some("PastePanel")),
+		KeyBinding::new("escape", CancelPaste, Some("PastePanel")),
+		KeyBinding::new("up", NavUp, Some("PastePanel")),
+		KeyBinding::new("down", NavDown, Some("PastePanel")),
+		KeyBinding::new("space", NavToggle, Some("PastePanel")),
+		// Reader.
+		KeyBinding::new("ctrl-c", ReaderCopy, Some("Reader")),
+		KeyBinding::new("cmd-c", ReaderCopy, Some("Reader")),
+		KeyBinding::new("ctrl-a", ReaderSelectAll, Some("Reader")),
+		KeyBinding::new("up", ReaderUp, Some("Reader")),
+		KeyBinding::new("down", ReaderDown, Some("Reader")),
+		KeyBinding::new("pageup", ReaderPageUp, Some("Reader")),
+		KeyBinding::new("pagedown", ReaderPageDown, Some("Reader")),
+		KeyBinding::new("escape", ReaderClear, Some("Reader")),
+		// Project / Changes list.
+		KeyBinding::new("up", TreeUp, Some("ToolList")),
+		KeyBinding::new("down", TreeDown, Some("ToolList")),
+		KeyBinding::new("right", TreeExpand, Some("ToolList")),
+		KeyBinding::new("left", TreeCollapse, Some("ToolList")),
+		KeyBinding::new("enter", TreeOpen, Some("ToolList")),
+		KeyBinding::new("space", TreeToggle, Some("ToolList")),
+		// Git log.
+		KeyBinding::new("up", LogUp, Some("GitLog")),
+		KeyBinding::new("down", LogDown, Some("GitLog")),
+		KeyBinding::new("shift-up", LogExtendUp, Some("GitLog")),
+		KeyBinding::new("shift-down", LogExtendDown, Some("GitLog")),
+		KeyBinding::new("enter", LogOpen, Some("GitLog")),
+		KeyBinding::new("ctrl-f", LogSearchFocus, Some("GitLog")),
+		KeyBinding::new("pagedown", HistoryNextPage, Some("GitLog")),
+		KeyBinding::new("pageup", HistoryPrevPage, Some("GitLog")),
+		KeyBinding::new("h", LogHead, Some("GitLog")),
+	];
+	b.extend(text_input::bindings());
+	b
+}
+
+fn main() {
+	let (workspace, mode, restore_dir) = parse_cli_args();
+	let app = Application::new();
+
+	app.run(move |cx: &mut App| {
+		cx.bind_keys(key_bindings());
+
+		let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
+		let ws = workspace.clone();
+		let app_mode = mode.clone();
+		let paste_dir = restore_dir.clone();
+
+		let window_result = cx.open_window(
+			WindowOptions {
+				window_bounds: Some(WindowBounds::Windowed(bounds)),
+				titlebar: Some(gpui::TitlebarOptions {
+					title: Some("snip-sync".into()),
+					..Default::default()
+				}),
+				app_id: Some("snip-desktop-native".to_string()),
+				..Default::default()
+			},
+			|window, cx| {
+				if app_mode == "idle" {
+					ready_marker("IDLE");
+				}
+				let model = cx
+					.new(|cx| WorkbenchModel::new(ws, paste_dir, app_mode, cx));
+				let fh = model.read(cx).focus_handle.clone();
+				window.focus(&fh);
+				app_log!("[APP:WINDOW_READY]");
+				model
+			},
+		);
+
+		if let Err(e) = window_result {
+			eprintln!("Failed to open native window: {:?}", e);
+			std::process::exit(1);
+		}
+	});
+}
+
+/// Hides the Git Log for the paste preview, remembering the prior state once
+/// (a re-paste over an open preview keeps the first saved value). Returns
+/// whether visibility changed.
+fn collapse_log_for_paste(
+	saved: &mut Option<bool>,
+	visible: &mut bool,
+) -> bool {
+	saved.get_or_insert(*visible);
+	std::mem::replace(visible, false)
+}
+
+/// Restores the saved visibility when the preview closes. No-op if nothing
+/// was saved (already restored, or the user toggled the log) or if the log
+/// is already shown again. Returns whether visibility changed.
+fn restore_log_after_paste(
+	saved: &mut Option<bool>,
+	visible: &mut bool,
+) -> bool {
+	match saved.take() {
+		Some(true) if !*visible => {
+			*visible = true;
+			true
+		}
+		_ => false,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn test_paste_log_collapse_and_restore() {
+		// Open then close restores the visible log, exactly once.
+		let (mut saved, mut vis) = (None, true);
+		assert!(super::collapse_log_for_paste(&mut saved, &mut vis));
+		assert!(!vis);
+		// A re-paste over the open preview keeps the first saved state.
+		assert!(!super::collapse_log_for_paste(&mut saved, &mut vis));
+		assert!(super::restore_log_after_paste(&mut saved, &mut vis));
+		assert!(vis);
+		vis = false;
+		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
+		assert!(!vis, "must not restore twice");
+
+		// A log that was already hidden stays hidden.
+		let (mut saved, mut vis) = (None, false);
+		assert!(!super::collapse_log_for_paste(&mut saved, &mut vis));
+		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
+		assert!(!vis);
+
+		// A manual toggle (toggle_log clears the saved state) wins.
+		let (mut saved, mut vis) = (None, true);
+		super::collapse_log_for_paste(&mut saved, &mut vis);
+		saved = None;
+		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
+		assert!(!vis);
+
+		// Reopened by a path that does not clear the saved state: no flip.
+		let (mut saved, mut vis) = (None, true);
+		super::collapse_log_for_paste(&mut saved, &mut vis);
+		vis = true;
+		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
+		assert!(vis && saved.is_none());
+	}
+
+	use super::*;
+	use snip_core::workspace::GitMarker;
+	use std::fs;
+	use std::process::Command;
+
+	fn run_git(cwd: &std::path::Path, args: &[&str]) {
+		let st = Command::new("git")
+			.args(args)
+			.current_dir(cwd)
+			.status()
+			.expect("git must run");
+		assert!(st.success(), "git failed: {args:?}");
+	}
+
+	#[test]
+	fn test_disambiguate_repo_names() {
+		let mut repos = vec![
+			RepoEntry {
+				root: PathBuf::from("/workspace/a/core"),
+				name: "core".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+			RepoEntry {
+				root: PathBuf::from("/workspace/b/core"),
+				name: "core".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+			RepoEntry {
+				root: PathBuf::from("/workspace/other"),
+				name: "other".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+		];
+		let ws = PathBuf::from("/workspace");
+		WorkbenchModel::disambiguate_repo_names(&mut repos, &ws);
+		assert_eq!(repos[0].name, "a/core");
+		assert_eq!(repos[1].name, "b/core");
+		assert_eq!(repos[2].name, "other");
+	}
+
+	#[test]
+	fn test_discovery_processing_symlink_dedup_and_submodules() {
+		let temp = tempfile::tempdir().unwrap();
+		let root = temp.path();
+
+		let main = root.join("main");
+		fs::create_dir_all(&main).unwrap();
+		run_git(&main, &["init"]);
+		run_git(&main, &["config", "user.name", "Test"]);
+		run_git(&main, &["config", "user.email", "test@test.local"]);
+		fs::write(main.join("file.txt"), "hello").unwrap();
+		run_git(&main, &["add", "."]);
+		run_git(&main, &["commit", "-m", "init"]);
+
+		#[cfg(unix)]
+		{
+			std::os::unix::fs::symlink(&main, root.join("main-alias")).unwrap();
+		}
+
+		let gitmodules_content = "[submodule \"vendor/sub\"]\n\tpath = vendor/sub\n\turl = https://example.invalid/sub.git\n";
+		fs::write(main.join(".gitmodules"), gitmodules_content).unwrap();
+
+		let opts = RunOptions::default();
+		#[allow(unused_mut)]
+		let mut disc = vec![DiscoveredRepo {
+			path: main.clone(),
+			marker: GitMarker::Directory,
+		}];
+		#[cfg(unix)]
+		{
+			disc.push(DiscoveredRepo {
+				path: root.join("main-alias"),
+				marker: GitMarker::Directory,
+			});
+		}
+
+		let (list, _errors) =
+			WorkbenchModel::process_discovery_repos(disc, &opts);
+
+		let main_entries: Vec<_> = list
+			.iter()
+			.filter(|r| r.name == "main" || r.name == "main-alias")
+			.collect();
+		assert_eq!(
+			main_entries.len(),
+			1,
+			"symlink alias must be deduplicated: {main_entries:?}"
+		);
+		assert_eq!(main_entries[0].kind, RepoEntryKind::Main);
+
+		let sub_entries: Vec<_> =
+			list.iter().filter(|r| r.name == "vendor/sub").collect();
+		assert_eq!(
+			sub_entries.len(),
+			1,
+			"uninitialized submodule must be listed: {list:?}"
+		);
+		assert_eq!(sub_entries[0].kind, RepoEntryKind::UninitializedSubmodule);
+		assert!(sub_entries[0].identity.is_none());
+		assert!(sub_entries[0].summary.is_err());
+	}
+}

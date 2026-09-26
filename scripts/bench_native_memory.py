@@ -1,0 +1,1795 @@
+#!/usr/bin/env python3
+"""
+bench_native_memory.py - memory driver for the native GPUI workbench (Linux/X11 only).
+
+Reuses memory_harness.py (attach mode) and bench_tauri_memory.py (process identity,
+isolation, teardown, summaries); nothing here samples memory itself.
+
+Per run it owns: a private Xvfb (display number from -displayfd, never guessed), a private
+D-Bus with no service activation, fresh XDG dirs, and the app started under that bus. The app
+PID is the unique descendant of our dbus-run-session whose exe is the binary under test.
+
+Rendering uses Mesa lavapipe selected explicitly through VK_DRIVER_FILES (Xvfb has no DRI3).
+Input is real X11 input through XTEST (`xdotool key`/`click` without --window, after
+XSetInputFocus via `windowfocus`); no product call is made on the app's behalf.
+
+Screenshots are taken from the root window and cropped to the app window's absolute
+geometry; `xwd -id` of the window is captured alongside only to document how the two differ.
+
+Readiness is not a startup log line: the app's own state lines (repo count, changed files,
+history rows, previewed path) must match an independent `git` oracle, and the cropped
+screenshot must be non-blank. See docs/native-perf-harness.md for what is and is not measured.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from typing import Any, Callable
+
+SCRIPTS_DIR = os.path.abspath(os.path.dirname(__file__))
+REPO_ROOT = os.path.dirname(SCRIPTS_DIR)
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
+
+from bench_tauri_memory import (  # noqa: E402
+    changed_lines,
+    descendants,
+    finalize_run,
+    find_owned_app_pid,
+    git,
+    identity,
+    isolated_env,
+    load_build_receipt,
+    loaded_graphics_libs,
+    mib,
+    process_age_sec,
+    reap_owned,
+    run_text,
+    sample_processes,
+    sha256_file,
+    spawn_attached_harness,
+    summarize,
+)
+from memory_harness import HARNESS_REVISION, calculate_p95, cleanup_process_group, get_system_environment, read_proc_starttime  # noqa: E402
+
+SCREEN = "1280x900x24"
+ICD_DIR = "/usr/share/vulkan/icd.d"
+# Same process waits for the sampler gate, then replaces itself. NativeSession writes this file.
+PREEXEC_LAUNCHER = r"""import os, sys, time, json
+ident_path, ready_path, bin_path = sys.argv[1], sys.argv[2], sys.argv[3]
+app_args = sys.argv[4:]
+pid = os.getpid()
+try:
+    with open(f'/proc/{pid}/stat') as f:
+        starttime = int(f.read().rsplit(')', 1)[1].split()[19])
+except Exception as e:
+    sys.stderr.write(f'failed reading starttime: {e}\n')
+    sys.exit(1)
+tmp = ident_path + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump({'pid': pid, 'starttime': starttime}, f)
+os.replace(tmp, ident_path)
+deadline = time.monotonic() + 45.0
+while time.monotonic() < deadline:
+    if os.path.exists(ready_path):
+        break
+    time.sleep(0.005)
+else:
+    sys.stderr.write('launcher timed out waiting for sampler_ready\n')
+    sys.exit(1)
+os.execv(bin_path, [bin_path] + app_args)
+"""
+
+
+def write_preexec_launcher(path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(PREEXEC_LAUNCHER)
+PROFILES = ("idle", "1repo", "15overview", "15active", "soak")
+# Built into WorkbenchModel::new of the D3 workbench (mov immediate 0x32). Not a CLI flag.
+APPLICATION_HISTORY_PAGE_LENGTH = 50
+DELETED_FILE_MARKER = b"// This file has been deleted in this change"
+BOUNDS_RE = re.compile(r"\[APP:CTRL_BOUNDS: id=(?P<id>.+?) x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+)\]")
+REPO_SELECT_RE = re.compile(r"\[APP:REPO_SELECTING: (?P<idx>\d+) \((?P<name>[^)]+)\)")
+BASKET_RE = re.compile(r"\[APP:BASKET: n=(?P<n>\d+) summary=(?P<summary>.*)\]")
+FILE_HEADER_RE = re.compile(
+    rb"(?:^|\n)// file: (?:\[(?:NEW|MODIFIED|DELETED|MOVED)\] )*([^\r\n]+)\r?\n"
+)
+# Basket / preview labels for the three change groups the D3 list actually copies.
+PREVIEW_KIND = {
+    "staged": "staged_changes",
+    "unstaged": "unstaged_changes",
+    "untracked": "working_changes",
+}
+
+
+class NativeBenchError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- pure helpers (tested)
+
+
+def lavapipe_icd(icd_dir: str = ICD_DIR, machine: str | None = None) -> str:
+    """The lavapipe ICD manifest; file name differs between Mesa builds. Fails if absent."""
+    machine = machine or os.uname().machine
+    for name in ("lvp_icd.json", f"lvp_icd.{machine}.json"):
+        path = os.path.join(icd_dir, name)
+        if os.path.isfile(path):
+            return path
+    if os.path.isdir(icd_dir):
+        for fname in sorted(os.listdir(icd_dir)):
+            if fname.startswith("lvp_icd") and fname.endswith(".json"):
+                return os.path.join(icd_dir, fname)
+    raise NativeBenchError(f"no lavapipe ICD in {icd_dir} (install mesa-vulkan-drivers)")
+
+
+def parse_bounds(lines: list[str]) -> dict[str, tuple[int, int, int, int]]:
+    """Latest reported bounds per control id; a later CTRL_GONE removes it."""
+    out: dict[str, tuple[int, int, int, int]] = {}
+    for line in lines:
+        m = BOUNDS_RE.search(line)
+        if m:
+            out[m["id"]] = (int(m["x"]), int(m["y"]), int(m["w"]), int(m["h"]))
+            continue
+        gone = re.search(r"\[APP:CTRL_GONE: id=(.+?)\]", line)
+        if gone:
+            out.pop(gone[1], None)
+    return out
+
+
+def parse_xwininfo(text: str) -> dict[str, Any]:
+    """Absolute client geometry and map state from `xwininfo -id` output."""
+    def field(label: str) -> str:
+        m = re.search(rf"^\s*{re.escape(label)}:\s*(.+)$", text, re.M)
+        if not m:
+            raise NativeBenchError(f"xwininfo output lacks {label!r}")
+        return m[1].strip()
+
+    return {
+        "x": int(field("Absolute upper-left X")),
+        "y": int(field("Absolute upper-left Y")),
+        "width": int(field("Width")),
+        "height": int(field("Height")),
+        "mapState": field("Map State"),
+    }
+
+
+def parse_repo_select(line: str) -> tuple[int, str]:
+    """Index and repo name from `[APP:REPO_SELECTING: idx (name) root=...]`."""
+    m = REPO_SELECT_RE.search(line)
+    if not m:
+        raise NativeBenchError(f"unparsed REPO_SELECTING line: {line}")
+    return int(m["idx"]), m["name"]
+
+
+def source_rows(repo: str) -> list[dict[str, Any]]:
+    """Source-aware change rows, in the app's order.
+
+    Matches `status_details`: porcelain v2, `--untracked-files=normal`, `--no-renames`.
+    A path that is both staged and unstaged is two rows. The count is not the
+    number of distinct paths.
+    """
+    raw = git(
+        repo, "status", "--porcelain=v2", "-z",
+        "--untracked-files=normal", "--no-renames", text=False,
+    )
+    staged: list[tuple[str, str]] = []
+    unstaged: list[tuple[str, str]] = []
+    untracked: list[str] = []
+    conflicted: list[str] = []
+    entries = raw.split(b"\0")
+    i = 0
+    while i < len(entries):
+        rec = entries[i]
+        i += 1
+        if not rec:
+            continue
+        text = rec.decode("utf-8", "surrogateescape")
+        if text.startswith("#") or text.startswith("!"):
+            continue
+        if text.startswith("? "):
+            untracked.append(text[2:])
+            continue
+        if text.startswith("u "):
+            parts = text[2:].split(" ", 9)
+            if len(parts) < 10:
+                raise NativeBenchError(f"unparsed conflict record: {text!r}")
+            conflicted.append(parts[9])
+            continue
+        if text.startswith("1 "):
+            parts = text[2:].split(" ", 7)
+            if len(parts) < 8 or len(parts[0]) < 2:
+                raise NativeBenchError(f"unparsed ordinary status record: {text!r}")
+            x, y, path = parts[0][0], parts[0][1], parts[7]
+            if x != ".":
+                staged.append((path, x))
+            if y != ".":
+                unstaged.append((path, y))
+            continue
+        if text.startswith("2 "):
+            parts = text[2:].split(" ", 8)
+            if len(parts) < 9 or len(parts[0]) < 2:
+                raise NativeBenchError(f"unparsed rename status record: {text!r}")
+            x, y, path = parts[0][0], parts[0][1], parts[8]
+            if x != ".":
+                staged.append((path, x))
+            if y != ".":
+                unstaged.append((path, y))
+            if i < len(entries):
+                i += 1  # original path is the next NUL field
+            continue
+        raise NativeBenchError(f"unparsed status record: {text!r}")
+
+    rows: list[dict[str, Any]] = []
+    for path, xy in staged:
+        rows.append({"path": path, "source": "staged", "deleted": xy == "D", "conflict": False})
+    for path, xy in unstaged:
+        rows.append({"path": path, "source": "unstaged", "deleted": xy == "D", "conflict": False})
+    for path in untracked:
+        rows.append({"path": path, "source": "untracked", "deleted": False, "conflict": False})
+    for path in conflicted:
+        rows.append({"path": path, "source": "conflicted", "deleted": False, "conflict": True})
+    rows.sort(key=lambda row: row["path"])
+    return rows
+
+
+def history_page(repo: str, page_len: int = APPLICATION_HISTORY_PAGE_LENGTH) -> dict[str, Any]:
+    """First history page the way `browser::history_with` asks git for it."""
+    raw = git(
+        repo, "log", "--topo-order", "--ignore-missing", f"-n{page_len + 1}",
+        "--format=%H%x00%s", "--all", "HEAD", "--",
+    )
+    lines = [line for line in raw.splitlines() if line]
+    if len(lines) > page_len:
+        page = lines[:page_len]
+        expected = page_len
+    else:
+        page = lines
+        expected = len(page)
+    tokens: list[str] = []
+    first = None
+    for line in page[:5]:
+        sha, subject = line.split("\0", 1)
+        short = sha[:7]
+        if first is None:
+            first = short
+        tokens.extend((short, subject))
+    if page and first is None:
+        first = page[0].split("\0", 1)[0][:7]
+    return {
+        "historyRowsExpected": expected,
+        "historyFirst": first,
+        "newestCommits": tokens,
+        "commitsReachable": int(git(repo, "rev-list", "--all", "--count")),
+    }
+
+
+def repo_oracle(repo: str) -> dict[str, Any]:
+    rows = source_rows(repo)
+    page = history_page(repo)
+    return {
+        "name": os.path.basename(repo.rstrip("/")),
+        "repoPath": os.path.realpath(repo),
+        "sourceRows": rows,
+        "distinctPaths": len({row["path"] for row in rows}),
+        **page,
+    }
+
+
+def source_file_bytes(repo: str, row: dict[str, Any]) -> bytes | None:
+    """Bytes the basket export stores for this row, or None when they are not UTF-8 text.
+
+    Staged content is the index blob. Unstaged and untracked content is the worktree
+    file. A deletion is the core deleted-file marker, not the missing worktree bytes.
+    """
+    if row["deleted"]:
+        return DELETED_FILE_MARKER
+    if row["source"] == "staged":
+        try:
+            data = git(repo, "show", f":{row['path']}", text=False)
+        except subprocess.CalledProcessError:
+            return None
+    else:
+        disk = os.path.join(repo, row["path"])
+        if not os.path.isfile(disk):
+            return None
+        try:
+            with open(disk, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return data
+
+
+def oracle_kind(row: dict[str, Any]) -> str:
+    if row["deleted"]:
+        return "deleted-marker"
+    if row["source"] == "staged":
+        return "index"
+    return "worktree"
+
+
+def choose_copy_target(repo: str, rows: list[dict[str, Any]]) -> tuple[dict[str, Any], bytes]:
+    """One explicit row whose bytes identify the source.
+
+    Prefer a path whose staged index bytes differ from the worktree (index A / working B).
+    Otherwise the first non-deleted UTF-8 row in staged, unstaged, untracked order.
+    """
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_path.setdefault(row["path"], []).append(row)
+    for path in sorted(by_path):
+        group = by_path[path]
+        staged = next((r for r in group if r["source"] == "staged" and not r["deleted"]), None)
+        other = next((r for r in group if r["source"] in ("unstaged", "untracked") and not r["deleted"]), None)
+        if staged is None or other is None:
+            continue
+        staged_bytes = source_file_bytes(repo, staged)
+        other_bytes = source_file_bytes(repo, other)
+        if staged_bytes is not None and other_bytes is not None and staged_bytes != other_bytes:
+            return staged, staged_bytes
+    for source in ("staged", "unstaged", "untracked"):
+        for row in rows:
+            if row["source"] != source or row["deleted"] or row["conflict"]:
+                continue
+            data = source_file_bytes(repo, row)
+            if data is not None:
+                return row, data
+    raise NativeBenchError(
+        f"no UTF-8 staged, unstaged, or untracked row to copy among {len(rows)} source rows"
+    )
+
+
+def clipcode_paths(payload: bytes) -> list[str]:
+    """File paths declared by ClipCode `// file:` headers, in payload order."""
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise NativeBenchError(f"clipboard payload is not valid UTF-8: {e}") from e
+    return [m.group(1).decode("utf-8") for m in FILE_HEADER_RE.finditer(payload)]
+
+
+def assert_copied_payload(
+    clip_bytes: bytes,
+    *,
+    root: str,
+    path: str,
+    expected: bytes,
+    copied_count: int,
+    sentinel: bytes | None = None,
+) -> dict[str, Any]:
+    """Byte oracle for one explicitly selected basket entry."""
+    if sentinel is not None and (clip_bytes == sentinel or sentinel in clip_bytes):
+        raise NativeBenchError("copy left the clipboard sentinel in place")
+    if not clip_bytes:
+        raise NativeBenchError("X11 clipboard is empty after COPY_DONE")
+    try:
+        clip_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise NativeBenchError(f"clipboard payload is not valid UTF-8: {e}") from e
+    try:
+        expected.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise NativeBenchError(f"oracle bytes are not valid UTF-8: {e}") from e
+
+    expected_root = f"// clipcode-root: {root}"
+    first_line = clip_bytes.split(b"\n", 1)[0].rstrip(b"\r")
+    if first_line != expected_root.encode("utf-8"):
+        got = first_line.decode("utf-8", errors="replace")
+        raise NativeBenchError(f"clipboard lacks expected root header {expected_root!r}, got {got!r}")
+
+    paths = clipcode_paths(clip_bytes)
+    if paths != [path]:
+        raise NativeBenchError(
+            f"clipboard entries {paths} are not exactly the selected path [{path!r}]"
+        )
+    if copied_count != 1:
+        raise NativeBenchError(f"COPY_DONE copied={copied_count}, expected 1 selected entry")
+
+    extracted = extract_clipcode_file_bytes(clip_bytes, path, expected_root=root)
+    if extracted is None:
+        raise NativeBenchError(f"clipboard payload lacks entry for selected path {path!r}")
+    if extracted != expected:
+        raise NativeBenchError(
+            f"copied bytes for {path!r} do not match the source oracle: "
+            f"extracted {len(extracted)} bytes (sha256={hashlib.sha256(extracted).hexdigest()}), "
+            f"oracle {len(expected)} bytes (sha256={hashlib.sha256(expected).hexdigest()})"
+        )
+    return {
+        "verified": True,
+        "copiedCount": copied_count,
+        "paths": paths,
+        "rootHeader": expected_root,
+        "clipboardBytes": len(clip_bytes),
+        "extractedBytes": len(extracted),
+        "extractedSha256": hashlib.sha256(extracted).hexdigest(),
+        "oracleBytes": len(expected),
+        "oracleSha256": hashlib.sha256(expected).hexdigest(),
+    }
+
+
+def basket_events(lines: list[str]) -> list[dict[str, Any]]:
+    events = []
+    for line in lines:
+        m = BASKET_RE.search(line)
+        if not m:
+            continue
+        summary = m["summary"]
+        entries = []
+        if summary:
+            for part in summary.split("; "):
+                bits = part.split(" ", 2)
+                if len(bits) != 3:
+                    raise NativeBenchError(f"unparsed basket summary {summary!r}")
+                entries.append({"repo": bits[0], "source": bits[1], "path": bits[2]})
+        events.append({"n": int(m["n"]), "summary": summary, "entries": entries, "line": line})
+    return events
+
+
+def assert_basket_empty(lines: list[str], what: str) -> dict[str, Any]:
+    """Any earlier non-empty basket event or selected toggle fails. Fresh slices use this."""
+    events = basket_events(lines)
+    bad = [event for event in events if event["n"] != 0]
+    toggles = [line for line in lines if "[APP:FILE_TOGGLED:" in line and "selected=true" in line]
+    if bad or toggles:
+        detail = bad[-1]["line"] if bad else toggles[-1]
+        raise NativeBenchError(f"{what} put entries in the basket: {detail}")
+    return {"events": len(events), "nonEmpty": 0, "empty": True}
+
+
+def assert_current_basket_empty(lines: list[str], what: str) -> dict[str, Any]:
+    """Precondition: the latest basket event is empty. An earlier n=1 that was cleared does not count."""
+    events = basket_events(lines)
+    current = events[-1] if events else None
+    if current is not None and current["n"] != 0:
+        raise NativeBenchError(f"{what} put entries in the basket: {current['line']}")
+    return {
+        "events": len(events),
+        "currentN": None if current is None else current["n"],
+        "empty": True,
+    }
+
+
+def preview_lines(repo: str, path: str, source: str, limit: int = 5) -> list[str]:
+    """Lines the source-specific preview diff must show."""
+    if source == "staged":
+        patch = git(repo, "diff", "--cached", "--no-color", "--no-ext-diff", "--", path)
+    else:
+        head = git(repo, "rev-parse", "--verify", "HEAD").strip()
+        patch = git(repo, "diff", "--no-color", "--no-ext-diff", head, "--", path)
+    lines = changed_lines(patch)
+    if not lines:
+        row = {"path": path, "source": source, "deleted": False}
+        data = source_file_bytes(repo, row)
+        if data:
+            lines = [line for line in data.decode("utf-8").splitlines() if line.strip()]
+    return lines[:limit]
+
+
+def extract_clipcode_file_bytes(
+    payload: bytes,
+    path: str,
+    *,
+    expected_root: str | None = None,
+    add_extra_line_between_files: bool = True,
+) -> bytes | None:
+    r"""Extracts exact raw unescaped file bytes for `path` from a ClipCode clipboard payload.
+
+    Respects the ClipCode wire contract (default header '// file: $FILE_PATH'):
+    - Strict UTF-8 validation (raises NativeBenchError on decode error; never lossy).
+    - Anchors root header '// clipcode-root: <name>' if expected_root is provided.
+    - Anchors file header line '^// file: (?:\[[A-Z]+\] )?<path>$' (with CRLF or LF).
+    - Preserves file's exact line endings (CRLF or LF), trailing blank lines, and non-ASCII / BOM.
+    - Reverses ClipCode escaping: strips leading '//clipcode-esc: ' from escaped body lines.
+    - Reverses trailing inter-file delimiter added by serializer.
+    - Returns None if the file header for `path` is not present in payload.
+    """
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise NativeBenchError(f"clipboard payload is not valid UTF-8: {e}") from e
+
+    if expected_root is not None:
+        first_line = payload.split(b"\n", 1)[0].rstrip(b"\r")
+        exp = b"// clipcode-root: " + expected_root.encode("utf-8")
+        if first_line != exp:
+            first_line_str = first_line.decode("utf-8", errors="replace")
+            raise NativeBenchError(
+                f"clipboard payload root header mismatch: expected {exp.decode('utf-8')!r}, got {first_line_str!r}"
+            )
+
+    pattern = re.compile(
+        rb"(?:^|\n)// file: (?:\[(?:NEW|MODIFIED|DELETED|MOVED)\] )*"
+        + re.escape(path.encode("utf-8"))
+        + rb"\r?\n"
+    )
+    m = pattern.search(payload)
+    if not m:
+        return None
+    body_start = m.end()
+
+    boundary_re = re.compile(rb"\n// file: |\n// clipcode-end(?:\r?\n|$)")
+    next_m = boundary_re.search(payload, pos=body_start)
+    if next_m:
+        body_end = next_m.start()
+        raw_body = payload[body_start:body_end]
+        if add_extra_line_between_files and raw_body.endswith(b"\n"):
+            raw_body = raw_body[:-1]
+    else:
+        # One between-files delimiter, and, when empty pre/post wrappers are on
+        # (unstaged/untracked; not the staged/deleted fallback), one more newline
+        # from the empty post-text. The file's own trailing newline stays.
+        raw_body = payload[body_start:]
+        if add_extra_line_between_files and raw_body.endswith(b"\n"):
+            if _empty_text_wrappers(payload) and raw_body.endswith(b"\n\n"):
+                raw_body = raw_body[:-1]
+            raw_body = raw_body[:-1]
+
+    lines = raw_body.split(b"\n")
+    esc = b"//clipcode-esc: "
+    unescaped = [l[len(esc):] if l.startswith(esc) else l for l in lines]
+    return b"\n".join(unescaped)
+
+
+def _empty_text_wrappers(payload: bytes) -> bool:
+    """True when the root header is followed by a blank line, then a file header.
+
+    Default settings write that blank line for empty pre-text only when the basket
+    is not staged/deleted fallback. The same mode appends an empty post-text newline
+    after the last file and does not write `// clipcode-end`.
+    """
+    nl = payload.find(b"\n")
+    if nl < 0 or not payload.startswith(b"// clipcode-root:"):
+        return False
+    return payload[nl + 1:].startswith(b"\n// file:")
+
+
+def extract_clipcode_file_content(payload: str, path: str) -> str | None:
+    """Compatibility text wrapper over extract_clipcode_file_bytes."""
+    b = extract_clipcode_file_bytes(payload.encode("utf-8"), path)
+    return b.decode("utf-8") if b is not None else None
+
+
+def copy_explicit_selection(
+    s: NativeSession,
+    win: dict[str, Any],
+    oracle: dict[str, Any],
+    selection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Select one source row with its real checkbox and copy it through btn-copy.
+
+    The basket starts empty. Ctrl+C is not used: with the reader focused it copies
+    the preview text instead of the basket. A path-only control id is not a substitute.
+    `selection` picks one source row; otherwise the driver chooses a row whose bytes
+    identify the source.
+    """
+    if selection is None:
+        row, expected = choose_copy_target(oracle["repoPath"], oracle["sourceRows"])
+    else:
+        matches = [
+            item for item in oracle["sourceRows"]
+            if item["path"] == selection["path"] and item["source"] == selection["source"]
+        ]
+        if len(matches) != 1:
+            raise NativeBenchError(
+                f"selection {selection['source']} {selection['path']} is not one source row"
+            )
+        row = matches[0]
+        expected = source_file_bytes(oracle["repoPath"], row)
+        if expected is None:
+            raise NativeBenchError(f"no UTF-8 oracle bytes for {row['source']} {row['path']}")
+    path, source = row["path"], row["source"]
+    if source not in PREVIEW_KIND:
+        raise NativeBenchError(f"refusing to copy unsupported source {source!r} for {path}")
+    kind = PREVIEW_KIND[source]
+    row_id = f"change-row:{source}:{path}"
+    chk_id = f"change-chk:{source}:{path}"
+    show_changes(s, win)
+
+    row_bounds = scroll_into_view(s, win, row_id)
+    assert_on_window(row_bounds, win, row_id)
+    before = len(s.lines)
+    s.click(win, row_bounds)
+    try:
+        s.wait_line(lambda line: f"[APP:PREVIEW_LOADED: {path}]" in line, start=before, timeout=15)
+        s.wait_line(
+            lambda line: f"[APP:E2E_PREVIEW: source={kind} " in line and f"path={path} " in line,
+            start=before, timeout=15,
+        )
+    except NativeBenchError as e:
+        raise NativeBenchError(f"clicking {row_id} did not preview {kind} {path}: {e}") from e
+
+    chk_bounds = scroll_into_view(s, win, chk_id)
+    assert_on_window(chk_bounds, win, chk_id)
+    before = len(s.lines)
+    s.click(win, chk_bounds)
+    try:
+        _, _, basket_line = s.wait_line(lambda line: "[APP:BASKET: n=" in line, start=before, timeout=10)
+    except NativeBenchError as e:
+        raise NativeBenchError(f"clicking {chk_id} did not log a basket change: {e}") from e
+    event = basket_events([basket_line])[0]
+    wanted = [{"repo": oracle["name"], "source": source, "path": path}]
+    if event["n"] != 1 or event["entries"] != wanted:
+        raise NativeBenchError(
+            f"basket after {chk_id} is n={event['n']} {event['entries']}, expected {wanted}"
+        )
+
+    # The copy button enables on the frame after the basket update.
+    time.sleep(0.4)
+    copy_bounds = require_control(s.texts(), "btn-copy")
+    assert_on_window(copy_bounds, win, "btn-copy")
+    sentinel = f"SNIP-DRIVER-SENTINEL-{uuid.uuid4().hex}\n".encode()
+    s.set_clipboard(sentinel)
+    stuck = s.read_clipboard()
+    if stuck != sentinel:
+        raise NativeBenchError("clipboard sentinel did not stick before copy")
+
+    before = len(s.lines)
+    s.click(win, copy_bounds)
+    try:
+        _, _, copy_line = s.wait_line(lambda line: "[APP:COPY_DONE:" in line, start=before, timeout=8)
+    except NativeBenchError as e:
+        refused = [line for line in s.texts(before) if "COPY_REFUSED" in line or "COPY_DONE" in line]
+        raise NativeBenchError(f"btn-copy did not log COPY_DONE ({refused or 'no copy log'}): {e}") from e
+    copied_m = re.search(r"copied=(\d+)", copy_line)
+    if not copied_m:
+        raise NativeBenchError(f"COPY_DONE line has no copied count: {copy_line}")
+    copied_n = int(copied_m[1])
+
+    deadline = time.monotonic() + 2.0
+    clip_bytes = b""
+    while True:
+        try:
+            clip_bytes = s.read_clipboard()
+        except NativeBenchError:
+            clip_bytes = b""
+        if clip_bytes and sentinel not in clip_bytes:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    clip_path = os.path.join(s.run_dir, "clipboard.bin")
+    with open(clip_path, "wb") as f:
+        f.write(clip_bytes)
+    checked = assert_copied_payload(
+        clip_bytes, root=oracle["name"], path=path, expected=expected,
+        copied_count=copied_n, sentinel=sentinel,
+    )
+    worktree_differs = None
+    disk = os.path.join(oracle["repoPath"], path)
+    if source == "staged" and not row["deleted"] and os.path.isfile(disk):
+        with open(disk, "rb") as f:
+            worktree = f.read()
+        worktree_differs = worktree != expected
+    return {
+        "supported": True,
+        "path": path,
+        "source": source,
+        "previewSource": kind,
+        "oracleKind": oracle_kind(row),
+        "worktreeDiffers": worktree_differs,
+        "sentinelReplaced": True,
+        "controls": {"row": row_id, "checkbox": chk_id, "copy": "btn-copy"},
+        "basket": {"n": event["n"], "summary": event["summary"], "entries": event["entries"]},
+        **checked,
+    }
+
+
+def normalize(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", text.lower())
+
+
+# `hdr-workspace` is max-width 140px and ends in an ellipsis (ui.rs render_header).
+# On this binary's 1080x720 window, tesseract reads 21 ASCII characters of a longer
+# leaf before that ellipsis (`snip-driver-small-fix.`). Shorter leaves are painted whole.
+HEADER_PAINTED_TITLE_CHARS = 21
+
+
+def painted_title_token(name: str) -> str:
+    """Workspace leaf the header paints. A longer leaf is checked by the visible prefix."""
+    if len(name) <= HEADER_PAINTED_TITLE_CHARS:
+        return name
+    return name[:HEADER_PAINTED_TITLE_CHARS]
+
+
+def ocr_check(text: str, must: list[str], any_of: dict[str, list[str]]) -> dict[str, Any]:
+    """Token presence in OCR text after dropping case and punctuation (OCR mangles both).
+
+    Every `must` token has to appear, and each non-empty `any_of` group needs at least one hit.
+    """
+    squashed = normalize(text)
+    found_must = {t: normalize(t) in squashed for t in must if normalize(t)}
+    groups = {g: {t: normalize(t) in squashed for t in ts if normalize(t)} for g, ts in any_of.items()}
+    ok = all(found_must.values()) and all(any(hits.values()) for hits in groups.values() if hits)
+    return {"must": found_must, "anyOf": groups, "ok": ok}
+
+
+def workspace_repos(workspace: str) -> list[str]:
+    """Repos the workspace holds, per core's rule: the root if it is one, plus direct children with .git."""
+    repos = []
+    if os.path.exists(os.path.join(workspace, ".git")):
+        repos.append(workspace)
+    if os.path.isdir(workspace):
+        repos += sorted(
+            os.path.join(workspace, d) for d in os.listdir(workspace)
+            if os.path.exists(os.path.join(workspace, d, ".git"))
+        )
+    return repos
+
+
+def check_repo_state(lines: list[str], oracle: dict[str, Any]) -> dict[str, Any]:
+    """REPO_LOADED file count is source rows, not distinct paths. History is one built-in page."""
+    name = oracle["name"]
+    loaded = [line for line in lines if f"[APP:REPO_LOADED: {name} files=" in line]
+    if not loaded:
+        raise NativeBenchError(f"app never reported {name} loaded")
+    files = int(re.search(r"files=(\d+)", loaded[-1])[1])
+    rows = oracle["sourceRows"]
+    distinct = len({row["path"] for row in rows})
+    if files != len(rows):
+        raise NativeBenchError(
+            f"{name}: app lists {files} source rows, git status has {len(rows)} "
+            f"source rows across {distinct} distinct paths"
+        )
+    graphs = [int(re.search(r"commits=(\d+)", line)[1]) for line in lines if "[APP:GRAPH_LOADED:" in line]
+    expected_rows = oracle["historyRowsExpected"]
+    if not graphs or graphs[-1] != expected_rows:
+        raise NativeBenchError(
+            f"{name}: history rows {graphs[-1:] or 'none'}, expected {expected_rows} "
+            f"(application page length {APPLICATION_HISTORY_PAGE_LENGTH})"
+        )
+    first = oracle.get("historyFirst")
+    if first:
+        e2e = [line for line in lines if "[APP:E2E_LOG: mode=graph " in line]
+        if not e2e:
+            raise NativeBenchError(f"{name}: missing [APP:E2E_LOG] for the history page")
+        got = re.search(r"first=(\S+)", e2e[-1])
+        if not got or got[1] != first:
+            raise NativeBenchError(
+                f"{name}: history first {got[1] if got else 'missing'}, git topo-order page starts at {first}"
+            )
+    paths = {row["path"] for row in rows}
+    previews = [
+        line.split("[APP:PREVIEW_LOADED: ", 1)[1].rstrip("]")
+        for line in lines if "[APP:PREVIEW_LOADED: " in line
+    ]
+    if rows:
+        if not previews or previews[-1] not in paths:
+            raise NativeBenchError(f"{name}: previewed {previews[-1:] or 'nothing'}, not a source-row path")
+    elif previews:
+        raise NativeBenchError(f"{name}: previewed {previews[-1]} but git status has no source rows")
+    return {
+        "changedFiles": files,
+        "sourceRows": len(rows),
+        "distinctPaths": distinct,
+        "sourceIdentities": rows,
+        "historyRows": graphs[-1],
+        "historyFirst": first,
+        "previewPath": previews[-1] if previews else None,
+    }
+
+
+def latency_stats(values_ms: list[float]) -> dict[str, Any] | None:
+    if not values_ms:
+        return None
+    return {"n": len(values_ms), "medianMs": round(statistics.median(values_ms), 1),
+            "p95Ms": round(calculate_p95(values_ms), 1), "maxMs": round(max(values_ms), 1)}
+
+
+def tree_cpu_ticks(pids: list[int]) -> int:
+    total = 0
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            total += int(fields[11]) + int(fields[12])  # utime, stime
+        except (OSError, IndexError, ValueError):
+            pass
+    return total
+
+
+# ---------------------------------------------------------------- owned X session
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while this pid still exists, including a zombie that has not been waited."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class NativeSession:
+    """A private Xvfb + D-Bus + the app, all owned by this process."""
+
+    def __init__(self, bin_path: str, workspace: str, mode: str, run_dir: str, e2e: bool):
+        self.bin_path = os.path.realpath(bin_path)
+        self.run_dir = run_dir
+        self.iso_root: str | None = None
+        self.xvfb_log = None
+        self.xvfb = None
+        self.proc = None
+        self.reader = None
+        self.log = None
+        self._clip_proc = None
+        self._pipe_fds: list[int] = []
+        self.owned: list[dict[str, Any]] = []
+        self.app = None
+        self.lines: list[tuple[float, str]] = []
+        self.env: dict[str, str] = {}
+        try:
+            self._open(workspace, mode, e2e)
+        except BaseException:
+            self.stop()
+            raise
+
+    def _close_fd(self, fd: int | None) -> None:
+        if fd is None:
+            return
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            self._pipe_fds.remove(fd)
+        except ValueError:
+            pass
+
+    def _open(self, workspace: str, mode: str, e2e: bool) -> None:
+        self.iso_root = tempfile.mkdtemp(prefix="snip-native-bench-")
+        env, bus_config = isolated_env(self.iso_root)
+        self.icd = lavapipe_icd()
+        self.xvfb_log = open(os.path.join(self.run_dir, "xvfb.log"), "wb")
+        read_fd, write_fd = os.pipe()
+        self._pipe_fds.extend((read_fd, write_fd))
+        self.xvfb = subprocess.Popen(
+            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", SCREEN, "-nolisten", "tcp"],
+            pass_fds=(write_fd,), stdout=self.xvfb_log, stderr=self.xvfb_log, start_new_session=True,
+        )
+        self._close_fd(write_fd)
+        self.owned.append(identity(self.xvfb.pid))
+        ready, _, _ = select.select([read_fd], [], [], 15.0)
+        display = os.read(read_fd, 64).decode().strip() if ready else ""
+        self._close_fd(read_fd)
+        if not display.isdigit():
+            raise NativeBenchError(f"Xvfb did not report a display number (got {display!r})")
+        env["DISPLAY"] = f":{display}"
+        env.pop("WAYLAND_DISPLAY", None)
+        env["VK_DRIVER_FILES"] = self.icd
+        env.pop("SNIP_NATIVE_E2E", None)
+        if e2e:
+            env["SNIP_NATIVE_E2E"] = "1"
+        self.env = env
+        # Pre-exec launcher gate: arranges sampler readiness before actual app execution.
+        # The launcher runs inside dbus-run-session with fresh isolated XDG/bus env, writes its
+        # (pid, starttime), waits for sampler_ready.signal from memory_harness, and then execv's
+        # the target binary into the exact same PID and process tree without wrapper RAM overhead.
+        self.ident_file = os.path.join(self.iso_root, "launcher_ident.json")
+        self.sampler_ready_file = os.path.join(self.iso_root, "sampler_ready.signal")
+        launcher_py = os.path.join(self.iso_root, "launcher.py")
+        write_preexec_launcher(launcher_py)
+
+        self.cmd = [
+            "dbus-run-session", f"--config-file={bus_config}", "--",
+            sys.executable, "-B", launcher_py, self.ident_file, self.sampler_ready_file,
+            self.bin_path, "--workspace", workspace, "--mode", mode,
+        ]
+        self.isolation = {
+            "display": env["DISPLAY"], "screen": SCREEN, "vkDriverFiles": self.icd,
+            "xdgRoot": self.iso_root, "dbus": "private session bus, no service activation",
+            "e2eInstrumentation": e2e,
+            "samplerGatedExec": True,
+        }
+        self.log = open(os.path.join(self.run_dir, "app.log"), "w")
+        self.proc = subprocess.Popen(
+            self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True,
+        )
+        self.reader = threading.Thread(target=self._read, name="native-app-log", daemon=True)
+        self.reader.start()
+
+    def _read(self) -> None:
+        assert self.proc.stdout is not None
+        for raw in self.proc.stdout:
+            t = time.monotonic()
+            text = raw.decode("utf-8", errors="replace").rstrip("\n")
+            self.lines.append((t, text))
+            self.log.write(f"{t:.4f} {text}\n")
+            self.log.flush()
+
+    def texts(self, start: int = 0) -> list[str]:
+        return [t for _, t in self.lines[start:]]
+
+    def wait_line(self, pred: Callable[[str], bool], start: int = 0, timeout: float = 60.0) -> tuple[int, float, str]:
+        end = time.monotonic() + timeout
+        i = start
+        while time.monotonic() < end:
+            while i < len(self.lines):
+                t, text = self.lines[i]
+                if pred(text):
+                    return i, t, text
+                i += 1
+            if self.proc.poll() is not None and i >= len(self.lines):
+                raise NativeBenchError(f"app exited with {self.proc.returncode} while waiting")
+            time.sleep(0.01)
+        raise NativeBenchError(f"timed out after {timeout}s waiting for app log line")
+
+    def wait_app(self, on_app: Callable[[dict[str, Any]], None], timeout: float = 30.0) -> dict[str, Any]:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if hasattr(self, "ident_file") and os.path.exists(self.ident_file):
+                try:
+                    with open(self.ident_file) as f:
+                        data = json.load(f)
+                    pid, start = data["pid"], data["starttime"]
+                    if read_proc_starttime(pid) == start:
+                        ident = identity(pid)
+                        ident["ageAtDiscoverySec"] = 0.0
+                        ident["discoveryMonotonic"] = time.monotonic()
+                        self.app = ident
+                        on_app(ident)
+                        self.remember_owned()
+                        return ident
+                except (json.JSONDecodeError, OSError):
+                    pass
+            pid = find_owned_app_pid(self.proc.pid, self.bin_path)
+            if pid is not None:
+                ident = identity(pid)
+                if ident["starttime"] is not None:
+                    ident["ageAtDiscoverySec"] = process_age_sec(pid)
+                    ident["discoveryMonotonic"] = time.monotonic()
+                    self.app = ident
+                    on_app(ident)
+                    self.remember_owned()
+                    return ident
+            if self.proc.poll() is not None:
+                raise NativeBenchError(f"dbus-run-session exited with {self.proc.returncode} before the app appeared")
+            time.sleep(0.005)
+        raise NativeBenchError(f"no owned process running {self.bin_path} within {timeout}s")
+
+    def assert_app_alive(self) -> None:
+        if self.app is None or read_proc_starttime(self.app["pid"]) != self.app["starttime"]:
+            raise NativeBenchError(f"app {self.app} exited or its PID was reused")
+
+    def app_tree_pids(self) -> list[int]:
+        if self.app is None:
+            return []
+        return [self.app["pid"], *descendants(self.app["pid"])]
+
+    def remember_owned(self) -> None:
+        if self.proc is None:
+            return
+        known = {(i["pid"], i["starttime"]) for i in self.owned}
+        for p in [self.proc.pid, *descendants(self.proc.pid)]:
+            ident = identity(p)
+            if ident["starttime"] is not None and (ident["pid"], ident["starttime"]) not in known:
+                self.owned.append(ident)
+
+    # ---- X11
+
+    def x(self, *args: str, timeout: float = 20.0) -> str:
+        res = subprocess.run(list(args), env=self.env, capture_output=True, text=True, timeout=timeout)
+        if res.returncode != 0:
+            raise NativeBenchError(f"{' '.join(args)} exited {res.returncode}: {res.stderr.strip()[:300]}")
+        return res.stdout
+
+    def x_bytes(self, *args: str, timeout: float = 20.0) -> bytes:
+        res = subprocess.run(list(args), env=self.env, capture_output=True, timeout=timeout)
+        if res.returncode != 0:
+            err = res.stderr.decode("utf-8", errors="replace").strip()[:300]
+            raise NativeBenchError(f"{' '.join(args)} exited {res.returncode}: {err}")
+        return res.stdout
+
+    def set_clipboard(self, payload: bytes) -> None:
+        """Own the clipboard with one foreground xclip process.
+
+        `-silent` (the default) forks and the parent exits 0 while a daemon keeps
+        the selection. `-quiet` stays in the foreground, so this Popen pid is the
+        owner until another client replaces the selection or we signal that pid.
+        """
+        proc = subprocess.Popen(
+            ["xclip", "-selection", "clipboard", "-i", "-quiet"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.env,
+            start_new_session=True,
+        )
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=2)
+            raise
+        previous = self._clip_proc
+        self._clip_proc = proc
+        if previous is not None:
+            self._release_clip(previous, kill=False)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise NativeBenchError(
+                    f"xclip -quiet pid {proc.pid} exited {proc.returncode} before the clipboard could be read"
+                )
+            try:
+                if self.read_clipboard(timeout=1) == payload:
+                    return
+            except (NativeBenchError, subprocess.TimeoutExpired):
+                pass
+            time.sleep(0.05)
+        raise NativeBenchError("clipboard sentinel was not readable within 5s")
+
+    def _release_clip(self, proc: subprocess.Popen, *, kill: bool) -> None:
+        """Reap this exact xclip pid. `kill` is for teardown; a handoff waits first.
+
+        Exit status 0 is not treated as proof the owner is gone until `wait` has
+        reaped this pid. No other xclip process is signalled.
+        """
+        if kill and proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                raise NativeBenchError(f"xclip clipboard owner pid {proc.pid} did not exit") from None
+        if _pid_alive(proc.pid):
+            raise NativeBenchError(f"xclip clipboard owner pid {proc.pid} still alive after wait")
+
+    def read_clipboard(self, timeout: float = 20.0) -> bytes:
+        return self.x_bytes("xclip", "-selection", "clipboard", "-o", timeout=timeout)
+
+    def window(self, timeout: float = 20.0) -> dict[str, Any]:
+        assert self.app is not None
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            res = subprocess.run(["xdotool", "search", "--pid", str(self.app["pid"])], env=self.env, capture_output=True, text=True)
+            for wid in res.stdout.split():
+                geo = parse_xwininfo(self.x("xwininfo", "-id", wid))
+                if geo["mapState"] == "IsViewable" and geo["width"] > 1:
+                    return {"wid": wid, **geo}
+            time.sleep(0.1)
+        raise NativeBenchError("no viewable window for the app PID")
+
+    def focus(self, wid: str) -> None:
+        # No window manager on Xvfb, so `windowactivate` is unsupported; set X input focus directly.
+        self.x("xdotool", "windowfocus", "--sync", wid)
+        focused = self.x("xdotool", "getwindowfocus").strip()
+        if focused != wid:
+            raise NativeBenchError(f"X focus is {focused}, not the app window {wid}")
+
+    def key(self, wid: str, keys: str) -> float:
+        """Real XTEST key press on the focused window; returns the monotonic send time."""
+        self.focus(wid)
+        time.sleep(0.05)
+        t = time.monotonic()
+        self.x("xdotool", "key", keys)
+        self.x("xdotool", "keyup", "ctrl", "alt", "shift", "super")
+        return t
+
+    def click(self, win: dict[str, Any], bounds: tuple[int, int, int, int]) -> float:
+        x, y, w, h = bounds
+        ax, ay = win["x"] + x + w // 2, win["y"] + y + h // 2
+        self.focus(win["wid"])
+        time.sleep(0.05)
+        t = time.monotonic()
+        # No --sync: xdotool waits for a motion event, which never comes when the
+        # pointer is already on this pixel. Move and click are one invocation.
+        self.x("xdotool", "mousemove", str(ax), str(ay), "click", "1")
+        return t
+
+    def capture(self, win: dict[str, Any], name: str, timeout: float = 20.0) -> dict[str, Any]:
+        """Root screenshot cropped to the window's absolute geometry, plus `xwd -id` for comparison.
+
+        Both are retried every 0.5 s until the root crop is non-blank or timeout; the attempt log
+        records when each path first showed content, which is the evidence for the capture method.
+        """
+        root_xwd = os.path.join(self.iso_root, f"{name}-root.xwd")
+        win_xwd = os.path.join(self.iso_root, f"{name}-window.xwd")
+        png = os.path.join(self.run_dir, f"{name}.png")
+        win_png = os.path.join(self.run_dir, f"{name}-xwd-id.png")
+        # On this Xvfb (no WM) the app presents no frame until it holds X input focus; mapping
+        # alone is not enough (docs/native-perf-harness.md, first-paint probe).
+        self.focus(win["wid"])
+        start = time.monotonic()
+        attempts = []
+        while True:
+            self.x("xwd", "-root", "-silent", "-out", root_xwd)
+            self.x("convert", root_xwd, "-crop", f"{win['width']}x{win['height']}+{win['x']}+{win['y']}", "+repage", png)
+            self.x("xwd", "-id", win["wid"], "-silent", "-out", win_xwd)
+            self.x("convert", win_xwd, win_png)
+            stats = {"rootCrop": image_stats(self, png), "xwdId": image_stats(self, win_png)}
+            attempts.append({"afterFocusSec": round(time.monotonic() - start, 2), **{k: v["stddev"] for k, v in stats.items()}})
+            if stats["rootCrop"]["stddev"] >= 0.02 or time.monotonic() - start > timeout:
+                break
+            time.sleep(0.5)
+        if stats["rootCrop"]["stddev"] < 0.02:
+            raise NativeBenchError(f"root-cropped screenshot {png} still blank after {timeout}s: {attempts}")
+        return {"rootCrop": png, "rootCropStats": stats["rootCrop"], "xwdId": win_png, "xwdIdStats": stats["xwdId"],
+                "attempts": attempts, "geometry": {k: win[k] for k in ("x", "y", "width", "height")}}
+
+    def ocr(self, png: str) -> str:
+        return self.x("tesseract", png, "-", "--psm", "11", timeout=120)
+
+    def capture_verified(self, win: dict[str, Any], name: str, must: list[str], any_of: dict[str, list[str]],
+                         wait: float = 5.0) -> dict[str, Any]:
+        """A screenshot whose OCR shows the oracle state, first without any input.
+
+        If the frame stays stale (the app has not presented its latest state), the stale frame is
+        kept as evidence, one pointer motion inside the window (no click) is sent, and the check
+        repeats. `presentStall` records whether that was needed; it is a product finding, not noise.
+        """
+        stall = None
+        for nudged in (False, True):
+            if nudged:
+                stale = os.path.join(self.run_dir, f"{name}-stale.png")
+                shutil.copyfile(shot["rootCrop"], stale)
+                stall = {"staleScreenshot": stale, "staleOcr": check, "nudge": "xdotool mousemove inside the window, no click"}
+                self.x("xdotool", "mousemove", str(win["x"] + win["width"] // 2), str(win["y"] + win["height"] // 2 + 1))
+            end = time.monotonic() + wait
+            while True:
+                shot = self.capture(win, name)
+                text = self.ocr(shot["rootCrop"])
+                check = ocr_check(text, must, any_of)
+                if check["ok"] or time.monotonic() > end:
+                    break
+                time.sleep(0.5)
+            if check["ok"]:
+                with open(os.path.join(self.run_dir, f"{name}.ocr.txt"), "w") as f:
+                    f.write(text)
+                return {**shot, "ocr": check, "presentStall": stall}
+        raise NativeBenchError(f"screenshot never showed the oracle state: {check}")
+
+    def _close_handle(self, attr: str) -> None:
+        handle = getattr(self, attr, None)
+        if handle is None or getattr(handle, "closed", True):
+            return
+        handle.close()
+
+    def _close_stdout(self) -> None:
+        proc = self.proc
+        if proc is None:
+            return
+        stdout = getattr(proc, "stdout", None)
+        if stdout is not None and not stdout.closed:
+            stdout.close()
+
+    def stop(self, reader_join_timeout: float = 2.0) -> list[str]:
+        """Release every helper this session started. Safe to call more than once.
+
+        The clipboard owner is reaped by its own pid before Xvfb is killed. Closing
+        the display is not what proves that xclip exited. The app-log file stays
+        open while its reader thread is still alive.
+        """
+        problems: list[str] = []
+        for fd in list(getattr(self, "_pipe_fds", ())):
+            self._close_fd(fd)
+        clip = getattr(self, "_clip_proc", None)
+        self._clip_proc = None
+        if clip is not None:
+            try:
+                self._release_clip(clip, kill=True)
+            except NativeBenchError as e:
+                problems.append(str(e))
+        try:
+            self.remember_owned()
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"remember owned processes: {e}")
+        for proc in (self.proc, self.xvfb):
+            if proc is None:
+                continue
+            try:
+                cleanup_process_group(os.getpgid(proc.pid), proc)
+            except ProcessLookupError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"process group of {proc.args[0]}: {e}")
+        problems += reap_owned(self.owned)
+        reader = self.reader
+        reader_alive = False
+        if reader is not None and reader.ident is not None:
+            reader.join(timeout=reader_join_timeout)
+            reader_alive = reader.is_alive()
+            if reader_alive:
+                problems.append("app log reader did not stop")
+        if not reader_alive:
+            self._close_stdout()
+            self._close_handle("log")
+        self._close_handle("xvfb_log")
+        if self.iso_root and os.path.isdir(self.iso_root):
+            shutil.rmtree(self.iso_root, ignore_errors=True)
+        return problems
+
+
+def image_stats(s: NativeSession, png: str) -> dict[str, Any]:
+    out = s.x("convert", png, "-colorspace", "Gray", "-format", "%[fx:mean] %[fx:standard_deviation] %w %h", "info:").split()
+    return {"mean": round(float(out[0]), 4), "stddev": round(float(out[1]), 4), "width": int(out[2]), "height": int(out[3]),
+            "bytes": os.path.getsize(png)}
+
+
+# ---------------------------------------------------------------- profiles
+
+
+def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: float, interval: float,
+          soak_switches: int, result: dict[str, Any], build_profile: str = "unknown") -> None:
+    ready_file = os.path.join(run_dir, f"ready-{uuid.uuid4().hex}.signal")
+    marker = f"[READY:NATIVE:{profile.upper()}:{uuid.uuid4().hex}]"
+    harness: subprocess.Popen | None = None
+    harness_log = open(os.path.join(run_dir, "harness.log"), "wb")
+    profile_label = f"native {build_profile} {profile}"
+    sampler_ready = getattr(s, "sampler_ready_file", None)
+    try:
+        def attach(app: dict[str, Any]) -> None:
+            nonlocal harness
+            harness = spawn_attached_harness(
+                app, run_dir, ready_file, marker, steady, interval,
+                profile_label, harness_log, readiness_timeout=900,
+                sampler_ready_file=sampler_ready, expected_exe=s.bin_path,
+            )
+
+        result["app"] = s.wait_app(attach)
+        s.wait_line(lambda l: "[APP:WINDOW_READY]" in l)
+        repos = workspace_repos(workspace)
+        _, _, line = s.wait_line(lambda l: "[APP:READY_REPOS:" in l, timeout=120)
+        count = int(re.search(r"READY_REPOS: (\d+)", line)[1])
+        if count != len(repos):
+            raise NativeBenchError(f"app reports {count} repos, workspace holds {len(repos)}")
+        state: dict[str, Any] = {"reposReported": count, "reposExpected": len(repos)}
+        latencies: dict[str, list[float]] = {}
+        selected_repo: str | None = None
+
+        if repos:
+            _, _, sel = s.wait_line(lambda l: "[APP:REPO_SELECTING:" in l)
+            idx, name = parse_repo_select(sel)
+            if idx != 0:
+                raise NativeBenchError(f"startup selected index {idx} ({name}), expected repository 0")
+            selected_repo = next(r for r in repos if os.path.basename(r) == name)
+            wait_repo_loaded(s, selected_repo, 0)
+            state["selected"] = check_repo_state(s.texts(), repo_oracle(selected_repo))
+            state["basketAfterLoad"] = assert_basket_empty(s.texts(), f"loading {name}")
+
+        win = s.window()
+        result["window"] = win
+        if profile == "15active":
+            if len(repos) < 2:
+                raise NativeBenchError("15active needs at least two repositories")
+            target = repos[1]
+            sent, t_loaded, t_graph, switched = click_repo(s, win, target)
+            latencies = {
+                "clickToRepoLoadedMs": [(t_loaded - sent) * 1000],
+                "clickToGraphLoadedMs": [(t_graph - sent) * 1000],
+            }
+            state["switch"] = {
+                "method": "repo-row click",
+                "control": f"repo-row:{os.path.basename(target)}",
+                "alt2Bound": False,
+            }
+            selected_repo = target
+            state["selected"] = check_repo_state(s.texts(switched), repo_oracle(selected_repo))
+        elif profile == "soak":
+            latencies, state["soak"] = run_soak(s, win, repos, soak_switches)
+            selected_repo = next(r for r in repos if os.path.basename(r) == state["soak"]["lastRepo"])
+            state["selected"] = state["soak"].pop("lastState")
+
+        # Screenshot shows the explicitly selected source, not whatever the app previewed on load.
+        # The header clips a long workspace leaf; the must-token is the painted prefix.
+        must = [painted_title_token(os.path.basename(workspace.rstrip("/")))]
+        any_of: dict[str, list[str]] = {}
+        if selected_repo:
+            oracle = repo_oracle(selected_repo)
+            if not oracle["sourceRows"]:
+                raise NativeBenchError(f"{oracle['name']} has no source rows to copy")
+            state["basketBeforeCopy"] = assert_basket_empty(s.texts(), "before explicit copy")
+            state["selected"]["autoPreviewPath"] = state["selected"].get("previewPath")
+            copied = copy_explicit_selection(s, win, oracle)
+            state["selected"]["clipboard"] = copied
+            state["selected"]["previewPath"] = copied["path"]
+            state["selected"]["previewSource"] = copied["previewSource"]
+            must.append(oracle["name"])
+            must.append(copied["path"])
+            any_of["history"] = oracle["newestCommits"]
+            shown = preview_lines(selected_repo, copied["path"], copied["source"])
+            if not shown:
+                raise NativeBenchError(
+                    f"no preview oracle lines for {copied['source']} {copied['path']}"
+                )
+            any_of["preview"] = shown
+        else:
+            state["clipboard"] = {"supported": False, "reason": f"{profile} has no selected repo"}
+
+        s.assert_app_alive()
+        shot = s.capture_verified(s.window(), f"ready-{profile}", must, any_of)
+        result["ui"] = {"state": state, "screenshot": shot,
+                        "latency": {k: latency_stats(v) for k, v in latencies.items()}}
+        s.remember_owned()
+        result["appTreeAtReady"] = [identity(p) for p in s.app_tree_pids()]
+
+        ticks0, t0 = tree_cpu_ticks(s.app_tree_pids()), time.monotonic()
+        tmp = ready_file + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(marker + "\n")
+        os.replace(tmp, ready_file)
+        assert harness is not None
+        code = harness.wait(timeout=steady + 900)
+        ticks1, t1 = tree_cpu_ticks(s.app_tree_pids()), time.monotonic()
+        if code != 0:
+            raise NativeBenchError(f"memory_harness exited {code}; see {run_dir}/harness.log")
+        s.assert_app_alive()
+        result["steadyCpuPercent"] = round(100 * (ticks1 - ticks0) / os.sysconf("SC_CLK_TCK") / (t1 - t0), 2)
+        with open(os.path.join(run_dir, "benchmark_report.json")) as f:
+            result["measurement"] = json.load(f)["results"][0]
+        app = s.app
+        assert app is not None
+        result["processAgeAtSamplerStartSec"] = round(
+            app["ageAtDiscoverySec"] + result["measurement"]["timestamps"]["startMonotonic"] - app["discoveryMonotonic"], 3)
+        s.remember_owned()
+        result["appTreeAtEnd"] = [identity(p) for p in s.app_tree_pids()]
+        result["controllerAtEnd"] = sample_processes([s.xvfb.pid, s.proc.pid])
+        result["graphicsLibsMapped"] = loaded_graphics_libs(app["pid"])
+    finally:
+        if harness is not None and harness.poll() is None:
+            harness.kill()
+            harness.wait()
+        harness_log.close()
+        for leftover in (ready_file, ready_file + ".tmp"):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+
+
+def wait_repo_loaded(s: NativeSession, repo: str, start: int, timeout: float = 120.0) -> tuple[float, float]:
+    """Monotonic times of this repo's REPO_LOADED and the GRAPH_LOADED after it.
+
+    Also waits for PREVIEW_LOADED when git says the repo has changes (the app previews the
+    first one); preview and history load concurrently, so their order is not fixed.
+    """
+    name = os.path.basename(repo)
+    i, t_loaded, _ = s.wait_line(lambda l: f"[APP:REPO_LOADED: {name} files=" in l, start=start, timeout=timeout)
+    _, t_graph, _ = s.wait_line(lambda l: "[APP:GRAPH_LOADED:" in l, start=i, timeout=timeout)
+    if source_rows(repo):
+        s.wait_line(lambda l: "[APP:PREVIEW_LOADED: " in l, start=start, timeout=timeout)
+    return t_loaded, t_graph
+
+
+def visible_in(row: tuple[int, int, int, int], viewport: tuple[int, int, int, int]) -> int:
+    """0 if row lies fully inside viewport vertically (with 2px tolerance), else the wheel direction to bring it in (+1 down, -1 up)."""
+    if row[1] + 2 < viewport[1]:
+        return -1
+    if row[1] + row[3] - 2 > viewport[1] + viewport[3]:
+        return 1
+    return 0
+
+
+def require_control(lines: list[str], control_id: str) -> tuple[int, int, int, int]:
+    """Latest bounds for one control. A path-only id is not a stand-in for a source-aware id."""
+    bounds = parse_bounds(lines)
+    if control_id not in bounds:
+        extra = ""
+        head, sep, tail = control_id.partition(":")
+        if sep and ":" in tail and head in ("change-row", "change-chk"):
+            legacy = f"{head}:{tail.split(':', 1)[1]}"
+            if legacy in bounds:
+                extra = f"; {legacy} is visible and is not accepted"
+        raise NativeBenchError(f"required control {control_id} has no [APP:CTRL_BOUNDS]{extra}")
+    box = bounds[control_id]
+    if box[2] <= 0 or box[3] <= 0:
+        raise NativeBenchError(f"required control {control_id} has empty bounds {box}")
+    return box
+
+
+def assert_on_window(bounds: tuple[int, int, int, int], win: dict[str, Any], control_id: str) -> None:
+    x, y, w, h = bounds
+    if x < -2 or y < -2 or x + w > win["width"] + 2 or y + h > win["height"] + 2:
+        raise NativeBenchError(
+            f"{control_id} bounds {bounds} are outside the window {win['width']}x{win['height']}"
+        )
+
+
+def left_viewport(lines: list[str]) -> tuple[int, int, int, int]:
+    """Visible area of the left list. `left-list` is that viewport; `left-scroll` is not accepted."""
+    box = parse_bounds(lines).get("left-list")
+    if box is None:
+        raise NativeBenchError(
+            "required control 'left-list' has no [APP:CTRL_BOUNDS]; refusing to use left-scroll"
+        )
+    return box
+
+
+def _last_reported_bounds(lines: list[str], control: str) -> tuple[int, int, int, int] | None:
+    """Last bounds emitted for control, kept even after CTRL_GONE removed it from the live set."""
+    found: tuple[int, int, int, int] | None = None
+    for line in lines:
+        match = BOUNDS_RE.search(line)
+        if match and match["id"] == control:
+            found = (int(match["x"]), int(match["y"]), int(match["w"]), int(match["h"]))
+    return found
+
+
+def scroll_into_view(
+    s: NativeSession,
+    win: dict[str, Any],
+    control: str,
+    max_steps: int = 60,
+    settle_seconds: float = 0.2,
+) -> tuple[int, int, int, int]:
+    """Bounds of a control after it has stopped moving inside the left list.
+
+    A repo click reflows the project tree. Clicking the first in-view sample
+    hits whichever row has since moved onto that rectangle.
+    """
+    s.wait_line(lambda line: "id=left-list " in line, timeout=10)
+    steps = 0
+    last: tuple[int, int, int, int] | None = None
+    stable_at: float | None = None
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and steps <= max_steps:
+        lines = s.texts()
+        viewport = left_viewport(lines)
+        box = parse_bounds(lines).get(control)
+        if box is not None and visible_in(box, viewport) == 0:
+            if box == last and stable_at is not None and time.monotonic() - stable_at >= settle_seconds:
+                return box
+            if box != last:
+                last = box
+                stable_at = time.monotonic()
+            time.sleep(0.04)
+            continue
+        if steps == max_steps:
+            break
+        last = None
+        stable_at = None
+        remembered = _last_reported_bounds(lines, control)
+        if box is not None:
+            direction = visible_in(box, viewport)
+        elif remembered is not None and remembered[1] < viewport[1] + viewport[3] // 2:
+            direction = -1  # the row left upward; wheel down would stay at the bottom
+        else:
+            direction = 1
+        before = len(s.lines)
+        s.focus(win["wid"])
+        cx = win["x"] + viewport[0] + viewport[2] // 2
+        cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
+        s.x("xdotool", "mousemove", str(cx), str(cy), "click", "5" if direction > 0 else "4")
+        s.wait_line(lambda line: "id=left-list " in line or f"id={control} " in line, start=before, timeout=5)
+        steps += 1
+        time.sleep(0.03)
+    raise NativeBenchError(f"required control {control} not settled inside left-list after {steps} wheel steps")
+
+
+def tab_state(lines: list[str]) -> tuple[str, bool]:
+    """Last tool tab. The app starts on Git Changes with the panel open, and does not log that."""
+    tabs = [line for line in lines if "[APP:TAB_SWITCHED:" in line]
+    if not tabs:
+        return "GitChanges", True
+    last = tabs[-1]
+    if "FileExplorer" in last:
+        name = "FileExplorer"
+    elif "GitChanges" in last:
+        name = "GitChanges"
+    else:
+        name = "unknown"
+    return name, "visible=true" in last
+
+
+def show_tab(s: NativeSession, win: dict[str, Any], tab: str, rail_id: str) -> None:
+    """Open a tool. Clicking the rail of the already-open tool collapses it, so that click is not sent."""
+    current, visible = tab_state(s.texts())
+    if current == tab and visible:
+        return
+    bounds = require_control(s.texts(), rail_id)
+    assert_on_window(bounds, win, rail_id)
+    before = len(s.lines)
+    s.click(win, bounds)
+    s.wait_line(
+        lambda line: f"TAB_SWITCHED: {tab}" in line and "visible=true" in line,
+        start=before, timeout=10,
+    )
+
+
+def show_changes(s: NativeSession, win: dict[str, Any]) -> None:
+    show_tab(s, win, "GitChanges", "rail-changes")
+
+
+def open_project_list(s: NativeSession, win: dict[str, Any]) -> None:
+    show_tab(s, win, "FileExplorer", "rail-project")
+    s.wait_line(lambda line: "id=repo-row:" in line, timeout=10)
+
+
+def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[float, float, float, int]:
+    """Click one repo row. Returns click time, load times, and the log index of the click."""
+    open_project_list(s, win)
+    name = os.path.basename(repo_path)
+    assert_current_basket_empty(s.texts(), f"before opening {name}")
+    bounds = scroll_into_view(s, win, f"repo-row:{name}")
+    assert_on_window(bounds, win, f"repo-row:{name}")
+    before = len(s.lines)
+    sent = s.click(win, bounds)
+    _, _, sel = s.wait_line(lambda line: "[APP:REPO_SELECTING:" in line, start=before, timeout=30)
+    idx, got = parse_repo_select(sel)
+    if got != name:
+        raise NativeBenchError(f"clicked repo-row:{name} but app selected {got} at index {idx}")
+    t_loaded, t_graph = wait_repo_loaded(s, repo_path, before)
+    fresh = s.texts(before)
+    bad = [event for event in basket_events(fresh) if event["n"] != 0]
+    toggles = [line for line in fresh if "[APP:FILE_TOGGLED:" in line and "selected=true" in line]
+    if bad or toggles:
+        raise NativeBenchError(f"opening {name} added a basket entry: {(bad or toggles)[-1]}")
+    return sent, t_loaded, t_graph, before
+
+
+def run_soak(s: NativeSession, win: dict[str, Any], repos: list[str], switches: int) -> tuple[dict[str, list[float]], dict[str, Any]]:
+    """Clicks repo rows round-robin. Each switch must load, and must not check a file."""
+    names = [os.path.basename(r) for r in repos]
+    clicks: list[float] = []
+    graphs: list[float] = []
+    current = None
+    checked = 0
+    last_state: dict[str, Any] = {}
+    for n in range(switches):
+        name = names[(n + 1) % len(names)]
+        if name == current:
+            name = names[(n + 2) % len(names)]
+        repo = next(r for r in repos if os.path.basename(r) == name)
+        sent, t_loaded, t_graph, before = click_repo(s, win, repo)
+        clicks.append((t_loaded - sent) * 1000)
+        graphs.append((t_graph - sent) * 1000)
+        current = name
+        if n % 10 == 0 or n == switches - 1:
+            last_state = check_repo_state(s.texts(before), repo_oracle(repo))
+            checked += 1
+    if len(clicks) != switches:
+        raise NativeBenchError(f"soak recorded {len(clicks)} switches, requested {switches}")
+    return ({"clickToRepoLoadedMs": clicks, "clickToGraphLoadedMs": graphs},
+            {"switches": len(clicks), "oracleChecks": checked, "lastRepo": current,
+             "basketEmpty": True, "lastState": last_state})
+
+
+PROFILE_SETUP = {
+    # profile: (workspace kind, --mode, needs SNIP_NATIVE_E2E probes)
+    # Bounds exist only when SNIP_NATIVE_E2E=1, so every profile that clicks a control opts in.
+    "idle": ("empty", "idle", False),
+    "1repo": ("repo", "normal", True),
+    "15overview": ("dataset", "overview", True),
+    "15active": ("dataset", "normal", True),
+    "soak": ("dataset", "normal", True),
+}
+
+
+def run_profile(profile: str, bin_path: str, dataset: str, repo: str, run_dir: str, steady: float, interval: float,
+                soak_switches: int, build_profile: str = "unknown") -> dict[str, Any]:
+    os.makedirs(run_dir, exist_ok=True)
+    kind, mode, e2e = PROFILE_SETUP[profile]
+    empty = None
+    if kind == "empty":
+        # Fixed leaf name: the title bar shows it and the screenshot check reads it back.
+        empty = os.path.join(tempfile.mkdtemp(prefix="snip-native-"), "empty-workspace")
+        os.makedirs(empty)
+    workspace = empty or (repo if kind == "repo" else dataset)
+    result: dict[str, Any] = {"profile": profile, "runDir": run_dir, "workspace": workspace, "mode": mode}
+    error = None
+    s: NativeSession | None = None
+    try:
+        s = NativeSession(bin_path, workspace, mode, run_dir, e2e)
+        result["command"] = s.cmd
+        result["isolation"] = s.isolation
+        drive(s, profile, workspace, run_dir, steady, interval, soak_switches, result, build_profile=build_profile)
+    except Exception as e:  # noqa: BLE001 - recorded; the run fails after teardown
+        error = f"{type(e).__name__}: {e}"
+    finally:
+        result["cleanupProblems"] = s.stop() if s is not None else []
+        if empty:
+            shutil.rmtree(os.path.dirname(empty), ignore_errors=True)
+    return finalize_run(result, error)
+
+
+# ---------------------------------------------------------------- report
+
+def markdown(report: dict[str, Any]) -> str:
+    meta = report["metadata"]
+    has_launch = any("launchSampledPeakRssMib" in prof.get("summary", {}) for prof in report["profiles"].values())
+    peak_col = "Launch peak RSS" if has_launch else "Pre-ready peak RSS"
+    lines = [
+        f"# Native memory run — {meta['binary']['label']}",
+        "",
+        f"- Binary `{meta['binary']['path']}` sha256 `{meta['binary']['sha256']}` ({meta['binary']['buildProfile']})",
+        f"- Source note: {meta['binary']['sourceNote']}",
+        _receipt_line(meta["binary"].get("buildReceipt")),
+        f"- Harness {meta['harnessRevision']}; steady {report['steadySeconds']} s at {report['sampleIntervalSec']} s; runs/profile {report['runsPerProfile']}",
+        f"- {meta['system']['os']} {meta['system']['kernel']}; Xvfb is started with screen argument {SCREEN}; Vulkan {meta['vkDriverFiles']}",
+        "- Observed window geometry is per run (`window` from xwininfo), not a screen flag.",
+        "",
+        f"| Profile | OK | Steady PSS median | Steady RSS median | {peak_col} | Steady peak RSS | Steady CPU % | Latency (median/p95 ms) | E2E probes |",
+        "| --- | :-: | --- | --- | --- | --- | --- | --- | :-: |",
+    ]
+    f = lambda s: f"{s['median']}/{s['p95']}/{s['worst']}" if s else "n/a"  # noqa: E731
+    for name, prof in report["profiles"].items():
+        if "summary" not in prof:
+            lines.append(f"| {name} | {prof['status']} | – | – | – | – | – | – | – |")
+            continue
+        s = prof["summary"]
+        runs = prof["runs"]
+        done = [r for r in runs if r["status"] == "COMPLETED"]
+        cpu = [r["steadyCpuPercent"] for r in done]
+        lat = "; ".join(f"{k} {v['medianMs']}/{v['p95Ms']}" for r in done[:1] for k, v in r["ui"]["latency"].items() if v) or "–"
+        peak_val = s.get('launchSampledPeakRssMib') if has_launch else s.get('preReadySampledPeakRssMib')
+        lines.append(
+            f"| {name} | {s['completedRuns']}/{len(runs)} | {f(s.get('steadyPssMedianMib'))} | {f(s.get('steadyRssMedianMib'))} | "
+            f"{f(peak_val)} | {f(s.get('steadySampledPeakRssMib'))} | {f(mib(cpu)) if cpu else 'n/a'} | {lat} | "
+            f"{'yes' if PROFILE_SETUP[name][2] else 'no'} |"
+        )
+
+    lines += [
+        "",
+        "Values are median/p95/worst across runs in MiB. Peaks are ~50 ms discrete samples inside the named phase. None is a continuous hardware peak, a first-instruction peak, or a filesystem-cold peak.",
+        "",
+        "### Profile Semantics & Notes",
+        f"- **Artifact status**: {meta['binary']['label']} (build profile `{meta['binary'].get('buildProfile')}`). A profile label or a receipt does not pass the release D4 gate.",
+        "- **Release comparison**: this driver does not emit one. `--compare-baseline` exits UNSUPPORTED. The supervisor compares matched run artifacts.",
+        "- **Cache**: process-cold (fresh process, private XDG and D-Bus). Filesystem cache is uncontrolled. Filesystem-cold is UNSUPPORTED. This driver does not drop caches.",
+        "- **15overview Semantics**: In current prototype, repository 0 is automatically selected upon launch, loading its graph and preview into memory. 15overview reflects 15 discovered repos + 1 loaded active repo; it does not certify summary-only overview memory until app mode defers graph/preview retention. Auto-preview does not fill the basket.",
+        "- **Explicit copy**: one source-aware checkbox, then `btn-copy`. Staged bytes are the index. Unstaged and untracked bytes are the worktree. `files=` is source rows, not distinct paths. A non-empty basket before that click fails the run.",
+        "- **History page**: the application built-in length is "
+        f"{APPLICATION_HISTORY_PAGE_LENGTH}. There is no history-page CLI. Observed row counts stay on each run.",
+        "- **Steady CPU %**: Reflects Mesa lavapipe (llvmpipe) software rasterization overhead on CPU under headless Xvfb.",
+        "- **Latencies**: Measured from a real repo-row click to literal log responses. This checkpoint does not bind Alt+2. '–' is idle.",
+        "",
+        "## Runs",
+        "",
+    ]
+    for name, prof in report["profiles"].items():
+        for r in prof.get("runs", []):
+            if r["status"] != "COMPLETED":
+                lines.append(f"- {name} `{r['runDir']}`: FAILED {r.get('error')}")
+                continue
+            shot = r["ui"]["screenshot"]
+            win = r.get("window") or {}
+            geo = ""
+            if win.get("width"):
+                geo = f"; observed window {win['width']}x{win['height']}+{win.get('x')}+{win.get('y')} {win.get('mapState')}"
+            lines.append(
+                f"- {name} `{r['runDir']}`: state {json.dumps(r['ui']['state'])}; screenshot `{shot['rootCrop']}` "
+                f"(stddev {shot['rootCropStats']['stddev']}; xwd -id stddev {shot['xwdIdStats']['stddev']}); OCR {shot['ocr']}"
+                f"{geo}; cleanup {r['cleanupProblems'] or 'clean'}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _receipt_line(receipt: dict[str, Any] | None) -> str:
+    if not receipt:
+        return "- Build receipt: none recorded"
+    checked = "sha256 matches the binary" if receipt.get("sha256MatchesBinary") else "no sha256 field; hash not checked"
+    return f"- Build receipt ({receipt.get('origin')}): `{receipt.get('path')}` ({checked})"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--bin", required=True)
+    ap.add_argument("--label", required=True, help="Recorded verbatim, e.g. 'DEBUG PILOT ONLY'.")
+    ap.add_argument("--build-profile", default="unknown")
+    ap.add_argument("--build-receipt", default=None, help="User-supplied build receipt JSON. Recorded as user-supplied. A sha256 field must match --bin or the run is refused.")
+    ap.add_argument("--source-note", default="unknown", help="Where the binary came from (tree, revision, dirty state).")
+    ap.add_argument("--workspace", required=True, help="Standard dataset dir with workload_manifest.json.")
+    ap.add_argument("--repo", default="repo-01-core")
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--profile", action="append", choices=PROFILES, help="Repeatable; default all.")
+    ap.add_argument("--runs", type=int, default=1)
+    ap.add_argument("--steady-seconds", type=float, default=30.0)
+    ap.add_argument("--sample-interval", type=float, default=0.05)
+    ap.add_argument("--soak-switches", type=int, default=100)
+    ap.add_argument("--compare-baseline", default=None, help="UNSUPPORTED. Does not compare releases; exits nonzero.")
+    args = ap.parse_args(argv)
+    if args.compare_baseline:
+        print(
+            "UNSUPPORTED: --compare-baseline does not compare releases. "
+            "This flag has no observed per-run dataset fingerprint, viewport, or workload oracle. "
+            "The supervisor compares matched run artifacts. The release D4 gate is not passed here.",
+            file=sys.stderr,
+        )
+        return 2
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+
+    bin_path = os.path.realpath(args.bin)
+    try:
+        receipt = load_build_receipt(bin_path, args.build_receipt)
+    except (OSError, ValueError) as e:
+        print(f"build receipt rejected: {e}", file=sys.stderr)
+        return 1
+    dataset = os.path.realpath(args.workspace)
+    out_dir = os.path.abspath(args.out_dir)
+    if os.path.exists(out_dir) and os.listdir(out_dir):
+        print(f"refusing to write into non-empty {out_dir}", file=sys.stderr)
+        return 1
+    os.makedirs(out_dir, exist_ok=True)
+
+    with open(os.path.join(dataset, "workload_manifest.json")) as f:
+        manifest = json.load(f)
+    report: dict[str, Any] = {
+        "timestampUtc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "metadata": {
+            "harnessRevision": HARNESS_REVISION,
+            "binary": {"path": bin_path, "sha256": sha256_file(bin_path), "label": args.label,
+                       "buildProfile": args.build_profile, "sourceNote": args.source_note,
+                       "buildReceipt": receipt},
+            "vkDriverFiles": lavapipe_icd(),
+            "system": get_system_environment(),
+            "xvfb": run_text("Xvfb", "-version"),
+            "dataset": {"path": dataset, "workloadRevision": manifest["workloadRevision"], "seed": manifest["seed"],
+                        "summary": manifest["summary"]},
+            "applicationHistoryPageLength": APPLICATION_HISTORY_PAGE_LENGTH,
+            "applicationHistoryPageLengthRole": (
+                "built-in of the tested workbench, checked against [APP:GRAPH_LOADED] and "
+                "[APP:E2E_LOG]; not a CLI flag, not a viewport, and not a comparison acceptance"
+            ),
+            "cacheProvenance": {
+                "processState": "cold",
+                "processIsolation": "fresh process tree, private XDG dirs, private D-Bus session per run",
+                "filesystemCache": "uncontrolled",
+                "filesystemColdDemonstrated": False,
+                "filesystemColdStatus": "UNSUPPORTED (filesystem-cold start requires kernel drop_caches; host page cache is uncontrolled)",
+                "runRepeatability": "unpurged host page cache; cold process memory",
+            },
+            "coldStart": "UNSUPPORTED (process-cold only; filesystem cache uncontrolled; drop_caches not performed)",
+            "tauri15RepoComparison": "UNSUPPORTED (Tauri baseline only supports 1 active repo; comparison cannot be fabricated)",
+        },
+        "runsPerProfile": args.runs,
+        "steadySeconds": args.steady_seconds,
+        "sampleIntervalSec": args.sample_interval,
+        "profiles": {},
+    }
+    failed = False
+    for profile in args.profile or list(PROFILES):
+        runs = []
+        for i in range(1, args.runs + 1):
+            run_dir = os.path.join(out_dir, profile, f"run-{i:02d}")
+            print(f"[{profile} {i}/{args.runs}] {run_dir}", flush=True)
+            r = run_profile(profile, bin_path, dataset, os.path.join(dataset, args.repo), run_dir, args.steady_seconds,
+                            args.sample_interval, args.soak_switches, build_profile=args.build_profile)
+            if r["status"] == "COMPLETED":
+                m = r["measurement"]["steadyMetrics"]
+                print(f"  steady PSS {m['pssMedianMib']} MiB, RSS {m['rssMedianMib']} MiB, CPU {r['steadyCpuPercent']}%", flush=True)
+            else:
+                failed = True
+                print(f"  FAILED: {r['error']}", file=sys.stderr, flush=True)
+            runs.append(r)
+        prof_failed = any(run.get("status") != "COMPLETED" for run in runs)
+        report["profiles"][profile] = {
+            "status": "FAILED" if prof_failed else "COMPLETED",
+            "summary": summarize(runs),
+            "runs": runs,
+        }
+    report["status"] = "FAILED" if failed else "COMPLETED"
+    with open(os.path.join(out_dir, "native_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+    with open(os.path.join(out_dir, "native_report.md"), "w") as f:
+        f.write(markdown(report))
+    print(f"report: {out_dir}/native_report.md")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

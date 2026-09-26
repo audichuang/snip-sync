@@ -13,13 +13,18 @@ fmt:
 	cargo fmt --all
 
 # Mirrors CI's Rust checks (see .github/workflows/ci.yml for the rest).
-preflight: preflight-rust preflight-frontend desktop-e2e
+preflight: preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke
 
 preflight-rust:
 	cargo fmt --all --check
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-	RUSTFLAGS="-D warnings" cargo test --workspace --locked --no-fail-fast
+	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-desktop-native --locked --no-fail-fast
+	RUSTFLAGS="-D warnings" cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
+
+# Python stdlib memory harness contracts and workload generator tests.
+preflight-harness:
+	SNIP_REQUIRE_ALL_TESTS=1 python3 -B -m unittest discover -s scripts/tests
 
 # Same frontend checks as CI's Frontend Lint and Format Check jobs.
 preflight-frontend:
@@ -29,6 +34,10 @@ preflight-frontend:
 desktop:
 	cd crates/desktop && bun install --frozen-lockfile && bun run start
 
+# Run the native GPUI desktop prototype.
+native *args:
+	cargo run -p snip-desktop-native -- {{args}}
+
 # Build the desktop installers for this platform.
 desktop-bundle:
 	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build
@@ -36,6 +45,31 @@ desktop-bundle:
 # Real-app E2E (Linux): needs webkit2gtk-driver, `cargo install tauri-driver`, xvfb.
 desktop-e2e:
 	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle && SNIP_REQUIRE_ALL_TESTS=1 xvfb-run -a node e2e/scenarios.mjs
+
+# Native real-app smoke test (Linux X11): needs xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts, software graphics.
+native-smoke out="target/native-e2e-artifacts":
+	mkdir -p "{{out}}"
+	rm -f "{{out}}/graph.png" "{{out}}/file_tree.png" "{{out}}/paste_preview.png"
+	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$1/smoke.log"' _ "{{out}}"
+	test -s "{{out}}/smoke.log"
+	python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "{{out}}"
+
+# Package native desktop candidate bundle (Linux, macOS, Windows).
+package-native target out bin version:
+	./scripts/package_native.sh "{{target}}" "{{out}}" "{{bin}}" "{{version}}"
+
+# Verify build/package artifacts in target directory.
+verify-artifacts dir version="" target="":
+	#!/usr/bin/env bash
+	set -euo pipefail
+	CMD=(python3 scripts/verify_artifacts.py --dir "{{dir}}")
+	[ -n "{{version}}" ] && CMD+=(--version "{{version}}")
+	[ -n "{{target}}" ] && CMD+=(--target "{{target}}")
+	"${CMD[@]}"
+
+# Run strict native CLI smoke check on native binary.
+native-cli-smoke bin version:
+	python3 scripts/smoke_native.py --bin "{{bin}}" --expected-version "{{version}}"
 
 # Bump the version in every manifest (perl -pi is portable across GNU/BSD).
 bump version:

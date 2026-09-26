@@ -1,5 +1,8 @@
 /target
+/crates/*/target
 /.ts-ref
 node_modules
 .claude/
 /.ts-ref-src
+__pycache__/
+*.pyc
