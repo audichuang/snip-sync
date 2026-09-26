@@ -4,6 +4,24 @@
 
 > 🧠 **From Hindsight memory (Initiatives and enhancements)** — 既定交付範圍仍包含 D0–D5、15 repo、多機雙向剪貼簿同步、記憶體與真實 UI 驗收；UI 或局部測試通過不等於可以發版。以下當前狀態以 2026-09-27 的工作樹、程式碼與測試紀錄為準。
 
+## 0. 接手結果（2026-09-27，第一批）
+
+第 1–5 項與第 13 項的 lifecycle 部分已完成並提交；其餘項目未動。程式碼提交到 `c92598f`，完整 `just preflight` 在該提交 exit 0。未推送、未開 PR。
+
+| 項目 | 結果 | 提交 |
+| --- | --- | --- |
+| 1 保存證據 | diff、新檔與第 6 節的 `/tmp` 證據複製到 `/home/audichuang/research/snip-sync-handoff-20260927/`，附 `SHA256SUMS`；之後的工作都已 commit | `0087803`、`6154d09`、`c9445bf` |
+| 2 目錄樹 lifecycle | 完成。關閉與退出各一個卡住目錄讀取的回歸測試；還原成舊寫法時兩個都失敗 | `c940ba9`、`c92598f` |
+| 3 Copy 取消真實 UI | 完成：取消按鈕（檔案與 commit）、退出取消 commit 複製、Apply 中拒絕切換工作區 | `c940ba9` |
+| 4 貼上預覽 core patch | 完成，三檔 SHA256 與收據相同 | `543704e` |
+| 5 native 貼上預覽非同步取消 | 完成：檔案與 commit 預覽、對應重算、取消、連續貼上、關閉與重開 | `ca4169a`、`c92598f` |
+| 13 lifecycle gate | lifecycle 測試已進 `just preflight` 與 CI。IME／協作／資源驗收的入口與標準 workload 測試尚未處理 | `a4f7a20` |
+| 併入 develop | `origin/develop` 已是祖先，合併前後檔案樹相同 | `a990e4c` |
+
+另外修正了兩個會讓必要關卡失敗的既有問題：`lifecycle.rs` 文件註解的連結（`4788943`），以及 IME 判斷測試匯入 Pillow（`2c8e04f`）。
+
+測試數字與尚未驗證的部分見 [監督紀錄](native-workbench-supervision.md) 最上方的 checkpoint。測試記錄在 `/home/audichuang/research/snip-sync-handoff-20260927/logs/`。
+
 ## 1. 接手基準與已完成事項
 
 - 主工作目錄：`/home/audichuang/research/snip-sync`
@@ -25,7 +43,7 @@
 
 ## 2. 第一批：先補目前已知缺口
 
-### [ ] 1. 保存接手證據與工作樹
+### [x] 1. 保存接手證據與工作樹
 
 先確認 root／branch／HEAD，備份 tracked diff 與 untracked 新檔。單純 `git diff` 不包含新檔。將下節列出的 `/tmp` patch、receipt、測試 log 複製到穩定位置；它們目前尚未成為 Git 裡的交付物。
 
@@ -38,7 +56,7 @@
 - `crates/desktop-native/src/lifecycle.rs`
 - `crates/desktop-native/tests/lifecycle.rs`
 
-### [ ] 2. 修正目錄樹背景工作沒有納入 lifecycle 等待
+### [x] 2. 修正目錄樹背景工作沒有納入 lifecycle 等待
 
 **已確認的第一優先問題。** 主工作樹 `crates/desktop-native/src/main.rs` 的 `submit_tree_io` 約第 1631 行，仍以 `cx.spawn` + `self.tree_task = Some(task)` 啟動工作，內部再啟動 background executor 執行 `execute_tree_io`。它沒有登錄到目前 lifecycle 的 owned jobs。
 
@@ -54,7 +72,7 @@
 
 最小回歸驗收：刻意阻塞「沒有 Git child 的真 tree background operation」，再要求 Close／Quit；阻塞解除前不得宣告 drained，解除後才可完成。相同 PID reopen 後舊結果不能更新畫面，queue／retained capacity 釋放。沿用真實 OS 事件與 app 報出的控制項位置。
 
-### [ ] 3. 補 Copy 取消的真實 UI 驗收
+### [x] 3. 補 Copy 取消的真實 UI 驗收
 
 目前 3 個 lifecycle scenarios 是：close/reopen 丟棄舊 preview、Quit 等待被卡住的 Git child、Close 取消進行中的 file Copy。仍缺：
 
@@ -63,7 +81,7 @@
 - Close／Quit 對 file 與 commit copy 的共用取消行為，確認沒有只修到其中一條。
 - 已確認 Apply 正在寫入時，Close／Open／Quit 被拒絕並顯示原因；等待寫入完成與呈現結果，不中途取消已確認的寫入。
 
-### [ ] 4. 合入已驗證的貼上預覽 core patch
+### [x] 4. 合入已驗證的貼上預覽 core patch
 
 使用現成 patch，不重寫已驗證的實作：
 
@@ -78,7 +96,7 @@ Patch 已包含 review 發現的最後取消檢查：payload clone 後、revalid
 
 接手時重新驗證 patch hash、`git apply --check`，再套用；套用後核對 receipt 的三個檔案 hash，跑相關與完整 core tests。未來若主工作樹先修改這三檔，應做語意整合，不硬覆蓋。
 
-### [ ] 5. 將 native 貼上預覽接上非同步取消流程
+### [x] 5. 將 native 貼上預覽接上非同步取消流程
 
 目前 `main.rs` 的 `trigger_paste_preview`、`choose_paste_keep`、`choose_paste_prefix`，以及 `paste.rs` 的 `build_from_clipboard_text`、`set_prefix_destination`、`set_keep_relative` 還需共同追蹤與接線。不要只改第一次打開貼上面板的入口。
 
@@ -179,7 +197,7 @@ Patch 已包含 review 發現的最後取消檢查：payload clone 後、revalid
 
 ## 5. 第四批：把驗收變成 gate，整理與交付
 
-### [ ] 13. 修正 preflight／CI 漏跑 lifecycle tests
+### [ ] 13. 修正 preflight／CI 漏跑 lifecycle tests（lifecycle 部分已完成，其餘未動）
 
 **目前已確認：** `just preflight` 依賴 `preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke`；Rust recipe 對 native 只跑 `--bin`，native-smoke 只跑 `--test smoke`。`.github/workflows/ci.yml` 也如此。因此新增的 `tests/lifecycle.rs` 目前不會被這些 required gates 自動跑到。
 

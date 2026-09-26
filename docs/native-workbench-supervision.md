@@ -1,5 +1,30 @@
 # Native workbench — supervisor checkpoint
 
+## 2026-09-27 Checkpoint: 第一批缺口補齊並併入 develop（未完工宣告）
+
+- **當前基準**：工作目錄 `/home/audichuang/research/snip-sync`，分支 `feature/lightweight-git-workbench-plan`，程式碼提交到 `c92598f`，`origin/develop`（`c05658e`）已是祖先。未修改 vendor/gpui、clipboard contract fixture、DTO 或依賴版本。未推送、未開 PR、未發版。
+- **執行者與驗證者**：本輪由接手者（Claude）實作並在同一台機器驗證，沒有另一方的獨立驗證。以下數字是接手者自己執行的結果。
+- **本次範圍**：
+  - `c940ba9` 目錄樹讀取納入 lifecycle 與回歸測試；Copy 取消的真實 UI 測試。
+  - `543704e` 貼上預覽 core patch（patch SHA256 `50c18f9a…fb3b`，套用後三檔 SHA256 與收據相同）。
+  - `ca4169a` native 貼上預覽非同步可取消與測試。
+  - `a4f7a20` lifecycle 測試接入 `just preflight` 與 CI；補上 CI 缺少的 `xclip`、`libx11-dev`，截圖改用 ImageMagick 6 也有的 `convert`。
+  - `4788943`、`2c8e04f` 修正會讓 `cargo doc` 與 harness 失敗的既有問題。
+  - `a990e4c` 併入 `origin/develop`。八個衝突檔採本分支版本，合併前後檔案樹相同。
+  - `c92598f` 排乾失敗後目錄樹與貼上預覽的狀態還原。
+- **驗證結果**（`c92598f`，完整 `just preflight` exit 0）：
+  - core：347 個執行期測試與 1 個 doctest 通過。忽略 2 個：硬綁 `/tmp/snip-workload-standard-20260925` 的標準 workload 測試，以及 1 個說明用 doctest。
+  - native：67 個單元測試、5 個 smoke、12 個 lifecycle（真實 X11）。
+  - 其餘：CLI 15、Tauri 真實 App E2E 22/22、harness 172、前端檢查與建置。
+  - 變異驗證：把目錄樹工作改回不納入 lifecycle，兩個目錄樹測試失敗；貼上預覽不把 token 傳進 core，三個貼上測試失敗。兩者還原後通過。
+- **更正下方兩個 checkpoint**：core 334 是舊數字；「所有原生背景任務均由 Lifecycle 追蹤」當時不成立，目錄樹讀取沒有納入；`preflight-rust` 全綠是加入 `lifecycle.rs` 之前的結果。
+- **尚未完成**：
+  1. CI 尚未執行；lifecycle 測試在 CI 的時間餘裕未知。
+  2. Fixed-OID basket 支援。
+  3. 雙機器 × 各 15 repo 真 UI 雙向協同驗收。
+  4. D4 資源洩漏關卡與記憶體驗收。
+  5. 跨平台（Wayland／macOS／Windows）實機驗證與 D5 promotion gates。整體產品尚未完成，未宣稱發布。
+
 ## 2026-09-27 Checkpoint: 原生任務擁有權、匯出取消與工作區生命週期整合完成（未完工宣告）
 
 - **當前基準與 UI/IME 現況**：工作目錄為 `/home/audichuang/research/snip-sync`，分支 `feature/lightweight-git-workbench-plan`（HEAD `9ecc8d7`，完整保留 `cdcb525` 原生 IntelliJ 風格 UI、`734fd93` IME 插入點座標與 `9ecc8d7` XIM 候選窗點擊重設）。未修改任何 vendor/gpui、clipboard contract fixture、DTO 或依賴版本。
@@ -44,10 +69,10 @@
 | Owner | 範圍 | 狀態 |
 | --- | --- | --- |
 | Grok native-tree-discovery | main native/workspace tree、discovery | AGY額度中斷，保留tree/workspace兩個partial檔，Grok接續完整修正 |
-| AGY shared-core-integration | strict commit export＋file export取消＋exact selection／replay freshness | 已正式整合至 feature 分支並驗證（334 core tests、preflight-rust、native-smoke 全綠）；native paste preview 取消接線為後續檢查點 |
+| AGY shared-core-integration | strict commit export＋file export取消＋exact selection／replay freshness | 已整合至 feature 分支；read-only paste preview 取消已由接手者接到 native（`ca4169a`），數字見最上方 checkpoint |
 | export_cancel_supervisor → Grok | file export API驗收；resource leak evaluator監督 | file API 79項獨立檢查及token斷線mutation通過；leak gate漏洞退回 |
 | Grok memory-harness review4 | 真UI benchmark driver staged/index oracle與100switch回歸 | scoped接受並整合main：current-basket修正後67driver tests通過；完整leak gate仍未接受 |
-| Grok native-lifecycle | isolated frozen native同PID close/reopen/quit drain | 51unit＋2真OS測試已獨立通過；接accepted export token與關閉時釋放容量，paste preview取消仍待core |
+| Grok native-lifecycle | isolated frozen native同PID close/reopen/quit drain | 已整合主工作樹；目錄樹讀取與 paste preview 取消由接手者補齊（`c940ba9`、`ca4169a`），12 個真 OS lifecycle 測試已進 preflight 與 CI |
 | Grok resource-leak-gate | Linux resource sampling、真UI soak verdict與故障注入驗證 | 開發中，尚未通過app gate |
 | Grok native-ime | isolated TextInput與實際Fcitx輸入驗證 | 中文輸入／搜尋已重現；候選位置與focus問題另案修正中 |
 | desktop_quality_supervisor → Grok | 新2machine×15repo fixture/oracle及後續UI runner | fixture已接受並整合main，required9tests通過；雙Xvfb實際UI runner開發中 |

@@ -2,6 +2,25 @@
 
 # 原生 Git 工作台驗證進度
 
+## 2026-09-27 進度檢查點：第一批缺口補齊並併入 develop（產品尚未完工）
+
+- **當前基準**：`feature/lightweight-git-workbench-plan`，程式碼提交到 `c92598f`。`origin/develop`（`c05658e`）已是祖先；合併後的檔案樹與合併前相同。未推送、未開 PR、未發版。
+- **本輪完成**（[接手清單](native-workbench-handoff-2026-09-27.md)第 1–5 項，以及第 13 項的 lifecycle 部分）：
+  - 目錄樹讀取納入 lifecycle：`submit_tree_io` 改走 `spawn_owned`，關閉與退出會等讀取本身結束；排乾期間不接受新的目錄樹工作；關閉或重開後才到的結果以 lifecycle generation 丟棄。
+  - Copy 取消：實際點擊 `btn-copy-cancel`，涵蓋檔案與 commit 複製；退出會取消進行中的 commit 複製；Apply 寫入中拒絕切換工作區。
+  - 貼上預覽 core patch 已合入，三個檔案的 SHA256 與收據相同。
+  - native 貼上預覽改在背景建立並可取消：首次預覽與對應變更後的重算都帶取消 token；建立中不能套用；新貼上、變更對應、取消、Escape、關閉工作區都會作廢舊的讀取。確認後的 Apply 仍不可中途取消。
+  - `tests/lifecycle.rs` 已接入 `just preflight`（`just native-lifecycle`）與 CI 的 Native Smoke 工作。
+  - 順帶修正兩個會讓必要關卡失敗的既有問題：`lifecycle.rs` 文件註解的連結（`cargo doc`），以及 IME 判斷測試在模組層級匯入 Pillow（harness）。
+- **本地驗證**（接手者在 `c92598f` 執行完整 `just preflight`，exit 0）：
+  - core：347 個執行期測試與 1 個 doctest 通過。忽略 2 個：硬綁 `/tmp/snip-workload-standard-20260925` 的標準 workload 測試，以及 1 個說明用 doctest。
+  - native：67 個單元測試、5 個 smoke、12 個 lifecycle（真實 X11）。
+  - 其餘：CLI 15、Tauri 真實 App E2E 22/22、harness 172、前端檢查與建置。
+  - 變異驗證：把目錄樹工作改回不納入 lifecycle，兩個目錄樹測試失敗；貼上預覽不把 token 傳進 core，三個貼上測試失敗。兩者還原後通過。
+- **更正下方兩個檢查點**：core 334 是舊數字；當時 lifecycle 還有目錄樹缺口，3 個 lifecycle 測試通過不代表所有背景工作都已納管；加入 `lifecycle.rs` 之後 `cargo doc` 其實會失敗，所以當時的 `preflight-rust` 結果不適用於含 lifecycle 的工作樹。
+- **尚未驗證**：未推送，CI 尚未執行；lifecycle 與 smoke 只在本機 Linux X11 跑過。Wayland、macOS、Windows 未驗證。排乾失敗後的狀態還原（`c92598f`）沒有專屬測試。
+- **後續待辦**：接手清單第 6–12 項，以及第 13 項其餘關卡（IME／協作／資源驗收的入口、標準 workload 測試）。整體產品尚未完成。
+
 ## 2026-09-27 進度檢查點：原生任務擁有權、匯出取消與工作區生命週期整合完成（產品尚未完工）
 
 - **當前基準**：UI/IME 基準維持 `feature/lightweight-git-workbench-plan`（HEAD `9ecc8d7`，保留 `cdcb525` 原生 IntelliJ 風格 UI、`734fd93` 輸入框 XIM 游標跟隨與 `9ecc8d7` 點擊失焦候選窗重設），未碰觸 DTO 或 vendor/gpui。

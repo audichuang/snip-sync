@@ -30,6 +30,8 @@
 - **獨立無頭執行環境**：專屬 `xvfb-run -a` 實體，杜絕 display 與 clipboard 爭用。
 - **指令**：
   - `just native-smoke`：建立輸出目錄，透過 `scripts/headless-x11.sh` 設定獨立 Xvfb 與 lavapipe，強制 `SNIP_REQUIRE_ALL_TESTS=1`，保留測試失敗狀態並驗證必要截圖。
+  - `just native-lifecycle`：同樣的無頭環境，執行 `tests/lifecycle.rs`（關閉／重開／退出的排乾，以及複製與貼上預覽的取消）。記錄寫到 `lifecycle.log`，截圖寫到輸出目錄下的 `lifecycle/`。
+  - 除了 smoke 需要的工具，lifecycle 另外需要 `xclip`，以及 `cc` 與 `libx11-dev`（編譯送出 `WM_DELETE_WINDOW` 的小工具）。截圖用 `convert`，ImageMagick 6 與 7 都有。
 
 ### C. 跨平台驗證現況與發布門檻
 - **全三平台（Linux, macOS, Windows）之原生 UI / IME 互動目前均為尚未完成驗證（pending）**。
@@ -86,9 +88,12 @@ just preflight-harness
 # 執行原生 X11 煙霧測試（產出至 target/native-e2e-artifacts 並驗證 3 張 PNG 與 smoke.log）
 just native-smoke
 
+# 執行原生 lifecycle 測試（產出 lifecycle.log 與 lifecycle/ 下的截圖）
+just native-lifecycle
+
 # 預覽 dry-run
 just --dry-run native-smoke
 
-# 執行完整本機預檢（含 preflight-rust、preflight-frontend、desktop-e2e、preflight-harness、native-smoke）
+# 執行完整本機預檢（含 preflight-rust、preflight-frontend、desktop-e2e、preflight-harness、native-smoke、native-lifecycle）
 just preflight
 ```
