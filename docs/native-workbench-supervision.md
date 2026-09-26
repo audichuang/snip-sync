@@ -1,5 +1,37 @@
 # Native workbench — supervisor checkpoint
 
+## 2026-09-27 Checkpoint: 原生任務擁有權、匯出取消與工作區生命週期整合完成（未完工宣告）
+
+- **當前基準與 UI/IME 現況**：工作目錄為 `/home/audichuang/research/snip-sync`，分支 `feature/lightweight-git-workbench-plan`（HEAD `9ecc8d7`，完整保留 `cdcb525` 原生 IntelliJ 風格 UI、`734fd93` IME 插入點座標與 `9ecc8d7` XIM 候選窗點擊重設）。未修改任何 vendor/gpui、clipboard contract fixture、DTO 或依賴版本。
+- **本次整合與驗證範圍**：
+  - 語意整合 native task ownership、export cancellation 與 workspace drain 機制入當前 native UI（不盲目整檔覆蓋，完整保留 `cdcb525` 樹狀非同步串流 `TreeIo`、`discovery_generation` 與 IME 游標追蹤）。
+  - 所有原生背景任務（儲存庫探索/新增/載入、working tree 狀態、檔案預覽、commit history/diff/tree/blob、檔案與 commit 複製、確認之 Apply 寫入）均由 `Lifecycle` 嚴格追蹤擁有權（`spawn_owned`），傳遞 `CancelToken` 與 `Git::open_with`。
+  - 複製流程完整接入已整合之 `plan_export_with`、`revalidate_with` 與 `plan_commit_export_exact_with`，使用呼叫端計數與 `RunOptions`；取消或過期匯出（`accept_copy_result`）一律不寫入 OS 剪貼簿，且提供 UI `btn-copy-cancel` 取消控制。
+  - 工作區關閉（Close Workspace）與同行程重開（Open Workspace）及退出（Ctrl+Q / OS 視窗關閉）：先行取消所有可取消之讀取任務，等待 Git 子進程/信號與任務排乾（drain，最多 8 秒），超時或洩漏時維持 app 存活並呈現失敗狀態；授權之 Apply / Replay 進行中時一律拒絕關閉/退出，不可中途取消。
+  - 工作區關閉時主動釋放容器容量（`release_vec`、`release_map`、`release_set`、`release_path`、`reader.release_retained()`、`text_input.clear_retained()`），且不清除 OS 剪貼簿。
+  - 修正 doctest 事實說明：`snip-core --doc` 實際包含 1 個 passed 與 1 個 ignored illustrative doctest（`commits::copy_commits_with`），而非「0 ignored」。
+  - 驗證結果：`cargo fmt --all --check` 通過；`cargo clippy -p snip-desktop-native --all-targets --locked -- -D warnings` 通過；`SNIP_REQUIRE_ALL_TESTS=1 scripts/headless-x11.sh cargo test -p snip-desktop-native --locked`（67 unit tests、3 real-OS lifecycle tests、5 smoke tests）全數通過；`just native-smoke`（產出 3 張有效 PNG）全數通過；`cargo test -p snip-core --locked` 334 required tests + 1 passed doctest 全數通過。所有工作樹變更均維持 uncommitted。
+- **尚未完成之項目（未達發版或整體驗收門檻）**：
+  1. Core 端唯讀 paste-preview 取消 API 尚未併入，目前 native paste-preview 建立仍為同步唯讀；
+  2. Fixed-OID basket 支援（UI 缺少加入 basket 控制項）；
+  3. 雙機器 × 各 15 repo 真 UI 雙向協同驗收 runner；
+  4. D4 資源洩漏關卡（fd/inotify watch/PID/記憶體 soak）；
+  5. 跨平台（Windows / macOS）實機驗證與 D5 promotion gates。整體產品尚未完成，未宣稱發布。
+
+## 2026-09-27 Checkpoint: 共享 Core 匯出正式整合至 feature 分支完成（未完工宣告）
+
+- **當前基準與 UI/IME 現況**：工作目錄為 `/home/audichuang/research/snip-sync`，分支 `feature/lightweight-git-workbench-plan`（HEAD `9ecc8d7`，完整保留 `cdcb525` 原生 IntelliJ 風格 UI、`734fd93` IME 插入點座標與 `9ecc8d7` XIM 候選窗點擊重設）。未修改任何 UI、vendor/gpui、clipboard contract fixture、DTO 或依賴版本。
+- **本次整合與驗證範圍**：
+  - 將已受審查之共享 Core 匯出候選快照（`/tmp/snip-shared-core-export-accepted-20260926/receipt.json` 涵蓋之 9 檔）正式併入本功能分支，保留 main 新增之 `NonUtf8Target` freshness 路徑、`capture_paths`、`CommitReplayPreview` 與既有 legacy wrapper 簽章相容。
+  - 核心變更包含：嚴格有界 exact commit export（`plan_commit_export_exact_with`、`copy_commits_with`，整份文件 wire overhead 邊界檢查）、串接 `RunOptions` / `CancelToken` 的檔案匯出（`plan_export_with`、`revalidate_with`，取消抵達 Git、bounded file/hash 讀取、freshness snapshot 與 final payload 驗證）、`Session` 取消死迴圈修復（避免 `read_exact` 重試 `Interrupted`），且確認後 Apply 保持不可取消。
+  - 驗證結果：`cargo fmt --all --check` 通過；`snip-core` 警告拒絕 clippy 通過；private X11 下 `SNIP_REQUIRE_ALL_TESTS=1 cargo test -p snip-core --locked` 334 項 required tests 與 1 個 doctest 通過（1 個 ignored 說明範例、0 失敗）；`LIBRARY_PATH=/home/audichuang/.local/lib just preflight-rust` 全綠；`just native-smoke` 5 項 real-app E2E 場景通過並產出 3 份有效 PNG 產物。
+- **尚未完成之項目（未達發版或整體驗收門檻）**：
+  1. Native 端尚未接入新版取消 token 與背景 lifecycle 工作（目前 native paste preview 仍同步呼叫無 token 之 legacy API）。
+  2. Fixed-OID file 仍只有預覽、缺少加入 basket 之 UI 控制項。
+  3. 雙機器 × 各 15 repo 真 UI 雙向協同驗收 runner 尚未完成（僅資料集/oracle 存在）。
+  4. D4 資源洩漏（fd/inotify watch/PID/記憶體 soak）尚未通過 app release gate。
+  5. 跨平台（Windows / macOS）實機驗證與 D5 promotion gates 尚未達成。整體產品尚未完成，未宣稱發布。
+
 ## 2026-09-26 新增最終驗收與當前責任
 
 使用者新增兩項必要交付門檻（詳細定義見 delivery-spec 第10節）：
@@ -12,7 +44,7 @@
 | Owner | 範圍 | 狀態 |
 | --- | --- | --- |
 | Grok native-tree-discovery | main native/workspace tree、discovery | AGY額度中斷，保留tree/workspace兩個partial檔，Grok接續完整修正 |
-| Grok shared-core-integration | strict commit export＋file export取消＋exact selection／replay freshness | 整合API已334項required tests獨立接受；read-only paste preview取消接線另行補齊，未接native |
+| AGY shared-core-integration | strict commit export＋file export取消＋exact selection／replay freshness | 已正式整合至 feature 分支並驗證（334 core tests、preflight-rust、native-smoke 全綠）；native paste preview 取消接線為後續檢查點 |
 | export_cancel_supervisor → Grok | file export API驗收；resource leak evaluator監督 | file API 79項獨立檢查及token斷線mutation通過；leak gate漏洞退回 |
 | Grok memory-harness review4 | 真UI benchmark driver staged/index oracle與100switch回歸 | scoped接受並整合main：current-basket修正後67driver tests通過；完整leak gate仍未接受 |
 | Grok native-lifecycle | isolated frozen native同PID close/reopen/quit drain | 51unit＋2真OS測試已獨立通過；接accepted export token與關閉時釋放容量，paste preview取消仍待core |

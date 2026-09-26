@@ -1,6 +1,40 @@
 > **歷史 worker 紀錄，非驗收報告。** 本文描述的舊 UI 與記憶體數據已被後續審查取代或拒絕；不得據此宣稱完成或通過效能門檻。請以 [交付規格](native-workbench-delivery-spec.md)、[監督紀錄](native-workbench-supervision.md) 和經獨立核實的 checkpoint 為準。
 
-# 原生 Git 工作台驗證進度（垂直原型審查版）
+# 原生 Git 工作台驗證進度
+
+## 2026-09-27 進度檢查點：原生任務擁有權、匯出取消與工作區生命週期整合完成（產品尚未完工）
+
+- **當前基準**：UI/IME 基準維持 `feature/lightweight-git-workbench-plan`（HEAD `9ecc8d7`，保留 `cdcb525` 原生 IntelliJ 風格 UI、`734fd93` 輸入框 XIM 游標跟隨與 `9ecc8d7` 點擊失焦候選窗重設），未碰觸 DTO 或 vendor/gpui。
+- **Native 整合完成**：
+  - 語意整合任務擁有權（`Lifecycle` 與 `spawn_owned`）覆蓋所有背景讀寫任務（儲存庫探索/載入、變更狀態、預覽、commit 記錄/diff/tree、檔案/commit 複製、確認之 Apply 寫入）。
+  - 複製流程接入 `plan_export_with`、`revalidate_with` 與 `plan_commit_export_exact_with`，支援呼叫端 token 與 UI `btn-copy-cancel`，取消或過期時保證不覆寫剪貼簿。
+  - 工作區 Close / Open 同行程切換與 Quit 均排乾所有背景任務與 Git 子進程（最多 8 秒），超時或洩漏維持存活並報錯；進行中之 Apply/Replay 嚴格拒絕關閉/退出。
+  - 工作區關閉釋放容量（`release_vec`、`release_map`、`release_set`、`release_path`、`reader.release_retained()`、`text_input.clear_retained()`），不清除 OS 剪貼簿。
+- **本地驗證**：
+  - `cargo fmt --all --check` 與 warnings-denied clippy 通過。
+  - `SNIP_REQUIRE_ALL_TESTS=1 scripts/headless-x11.sh cargo test -p snip-desktop-native --locked`（67 unit tests、3 real-OS lifecycle tests、5 smoke tests）全數通過。
+  - `just native-smoke`（含截圖校驗）全數通過。
+  - `cargo test -p snip-core --locked` 334 required tests + 1 passed doctest（1 ignored 說明範例）通過。所有變更均未 commit。
+- **後續待辦**：
+  1. Core 唯讀 paste-preview 取消 API 與 native 非同步接線（目前 paste-preview 仍為同步唯讀）；
+  2. Fixed-OID basket 支援（UI 缺少加入 basket 控制項）；
+  3. 雙機器 × 各 15 repo 真 UI 雙向協同驗收；
+  4. D4 記憶體與 fd/watch 資源洩漏關卡；
+  5. 跨平台（macOS/Windows）及 D5 交付門檻。整體產品尚未完成。
+
+## 2026-09-27 進度檢查點：共享 Core 匯出整合完成（產品尚未完工）
+
+- **當前基準**：UI/IME 基準維持 `feature/lightweight-git-workbench-plan`（HEAD `9ecc8d7`，保留 `cdcb525` 原生 IntelliJ 風格 UI、`734fd93` 輸入框 XIM 游標跟隨與 `9ecc8d7` 點擊失焦候選窗重設），未碰觸 UI、DTO 或 vendor/gpui。
+- **Core 整合完成**：已將受審查之 9 個核心原始碼與測試檔案（嚴格 exact commit export、可取消有界 file export、Session 取消修復、main replay freshness）正式併入本功能分支。保留 legacy wrappers 相容性。
+- **本地驗證**：334 項 core tests（含 private X11、`SNIP_REQUIRE_ALL_TESTS=1`）與 1 個 doctest 通過（1 個 ignored 說明範例、0 失敗）；fmt、warnings-denied clippy、`just preflight-rust` 及 `just native-smoke`（5 項 real-app E2E 場景與產物截圖）全數通過。
+- **後續待辦**：
+  1. Native paste preview 的背景取消 token 與生命週期接線；
+  2. Fixed-OID basket 支援；
+  3. 2×15-repo 雙端真 UI 驗收；
+  4. D4 記憶體與 fd/watch 資源洩漏關卡；
+  5. 跨平台（macOS/Windows）及 D5 交付門檻。整體產品尚未完成。
+
+---
 
 日期：2026-09-25。狀態：**GPUI 原生垂直切片原型與量測基線實作完成，正接受審查與缺陷修正；尚未宣稱預算達標或取代 Tauri 正式版本。**
 
