@@ -1021,13 +1021,13 @@ impl WorkbenchModel {
 					&mut self.repo_cancel,
 					&mut self.scan_cancel,
 					&mut self.copy_cancel,
-					&mut self.paste_cancel,
 					&mut self.add_cancel,
 				] {
 					if let Some(token) = slot.as_ref() {
 						token.cancel();
 					}
 				}
+				self.invalidate_paste_job();
 				let name = intent.name();
 				self.emit_life("draining", name, None);
 				self.set_status("workspace_draining", []);
@@ -1707,10 +1707,10 @@ impl WorkbenchModel {
 						.ok()
 						.flatten();
 				}
+				// Not gated on the generation: after a failed drain the
+				// workspace stays open and must be able to read again.
 				let _ = this.update(&mut async_app, |model, _| {
-					if model.lifecycle.generation() == ws_gen
-						&& model.tree_worker == worker
-					{
+					if model.tree_worker == worker {
 						model.tree_worker_alive = false;
 					}
 				});
