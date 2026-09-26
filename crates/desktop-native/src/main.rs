@@ -278,6 +278,7 @@ pub struct WorkbenchModel {
 	pub repo_cancel: Option<CancelToken>,
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
+	pub paste_cancel: Option<CancelToken>,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, String)>,
@@ -295,6 +296,12 @@ pub struct WorkbenchModel {
 	pub is_adding_repo: bool,
 	pub add_repo_input: Entity<TextInput>,
 	pub paste_preview: Option<PastePreviewPlan>,
+	/// A read-only preview or mapping rebuild is running in the background.
+	/// Nothing can be applied until it lands.
+	pub paste_loading: bool,
+	/// Bumped for every paste request, remap and cancel; a background
+	/// result from an older value is dropped.
+	pub paste_generation: u64,
 	/// Text of the selected paste item (one at a time).
 	pub paste_detail: Option<Preview>,
 	pub paste_scroll: gpui::UniformListScrollHandle,
@@ -530,6 +537,7 @@ impl WorkbenchModel {
 			repo_cancel: None,
 			scan_cancel: None,
 			copy_cancel: None,
+			paste_cancel: None,
 			discovery: None,
 			discovery_status: None,
 			discovery_errors: Vec::new(),
@@ -546,6 +554,8 @@ impl WorkbenchModel {
 			add_cancel: None,
 			is_adding_repo: false,
 			paste_preview: None,
+			paste_loading: false,
+			paste_generation: 0,
 			paste_detail: None,
 			paste_scroll: gpui::UniformListScrollHandle::new(),
 			status: Msg::new("status_scanning", []),
@@ -1011,6 +1021,7 @@ impl WorkbenchModel {
 					&mut self.repo_cancel,
 					&mut self.scan_cancel,
 					&mut self.copy_cancel,
+					&mut self.paste_cancel,
 					&mut self.add_cancel,
 				] {
 					if let Some(token) = slot.as_ref() {
@@ -1123,6 +1134,7 @@ impl WorkbenchModel {
 		self.reader.release_retained();
 		release_map(&mut self.basket);
 		self.paste_detail = None;
+		self.invalidate_paste_job();
 		if !self.paste_busy() {
 			self.paste_preview = None;
 		}
@@ -2603,19 +2615,58 @@ impl WorkbenchModel {
 		true
 	}
 
-	pub fn trigger_paste_preview(
+	/// Cancels the read-only paste job in flight, if any, and makes its
+	/// result stale. Does not touch a confirmed write.
+	fn invalidate_paste_job(&mut self) {
+		if let Some(token) = self.paste_cancel.take() {
+			token.cancel();
+		}
+		self.paste_generation = self.paste_generation.wrapping_add(1);
+		self.paste_loading = false;
+	}
+
+	/// Arms a new read-only paste job and returns what its result must match.
+	fn arm_paste_job(&mut self) -> (CancelToken, u64, u64) {
+		self.invalidate_paste_job();
+		let cancel = arm_cancel(&mut self.paste_cancel);
+		self.paste_loading = true;
+		(cancel, self.paste_generation, self.lifecycle.generation())
+	}
+
+	/// True when a background paste result may be shown. A cancelled token,
+	/// a newer paste job, or a workspace change drops it.
+	fn accept_paste_result(
 		&mut self,
-		window: &mut gpui::Window,
-		cx: &mut Context<Self>,
-	) {
+		seq: u64,
+		ws_gen: u64,
+		token: &CancelToken,
+	) -> bool {
+		let cancelled = token.is_cancelled();
+		let stale = self.paste_generation != seq
+			|| self.lifecycle.generation() != ws_gen;
+		if !cancelled && !stale {
+			self.paste_loading = false;
+			return true;
+		}
+		let why = if cancelled { "cancelled" } else { "stale" };
+		app_log!("[APP:PASTE_DISCARDED: {why}]");
+		false
+	}
+
+	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
 		if self.refuse_while_applying("preview", cx) {
+			return;
+		}
+		if !self.accepting_work() {
 			return;
 		}
 		// A new paste always invalidates the previous plan first, so a failed
 		// read/parse can never leave an older plan armed for Apply.
+		self.invalidate_paste_job();
 		if self.paste_preview.take().is_some() {
 			app_log!("[APP:PASTE_PLAN_CLEARED]");
 		}
+		self.paste_detail = None;
 		let text = match clip::read_text() {
 			Ok(t) => t,
 			Err(e) => {
@@ -2634,12 +2685,54 @@ impl WorkbenchModel {
 		let target_dest = self.current_restore_destination();
 		let known_roots: Vec<std::path::PathBuf> =
 			self.repos.iter().map(|r| r.root.clone()).collect();
-		match PastePreviewPlan::build_from_clipboard_text(
-			&text,
-			&target_dest,
-			&known_roots,
-			self.generation,
-		) {
+		let generation = self.generation;
+		let (cancel, seq, ws_gen) = self.arm_paste_job();
+		self.set_status("paste_loading", []);
+		app_log!("[APP:PASTE_LOADING]");
+		// The loading panel owns Escape, so the read can be cancelled.
+		self.pending_focus = Some(self.paste_focus.clone());
+		cx.notify();
+
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		let cancel_bg = cancel.clone();
+		let dest_bg = target_dest.clone();
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
+				let built = bg
+					.spawn(async move {
+						let opts = interactive_read_opts(cancel_bg);
+						PastePreviewPlan::build_from_clipboard_text_with(
+							&text,
+							&dest_bg,
+							&known_roots,
+							generation,
+							&opts,
+						)
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if !model.accept_paste_result(seq, ws_gen, &cancel) {
+						cx.notify();
+						return;
+					}
+					model.show_paste_plan(built, &target_dest);
+					cx.notify();
+				});
+			},
+		);
+	}
+
+	fn show_paste_plan(
+		&mut self,
+		built: Result<PastePreviewPlan, Msg>,
+		target_dest: &std::path::Path,
+	) {
+		match built {
 			Ok(plan) => {
 				for choice in &plan.prefix_choices {
 					for (idx, path) in choice.candidates.iter().enumerate() {
@@ -2671,7 +2764,7 @@ impl WorkbenchModel {
 					);
 				}
 				self.refresh_paste_detail();
-				window.focus(&self.paste_focus);
+				self.pending_focus = Some(self.paste_focus.clone());
 			}
 			Err(err) => {
 				app_log!("[APP:PASTE_ERR: {}]", err.key);
@@ -2680,7 +2773,6 @@ impl WorkbenchModel {
 				self.pending_focus = Some(self.focus_handle.clone());
 			}
 		}
-		cx.notify();
 	}
 
 	pub fn choose_paste_keep(&mut self, prefix: &str, cx: &mut Context<Self>) {
@@ -2690,23 +2782,14 @@ impl WorkbenchModel {
 		let Some(plan) = self.paste_preview.as_mut() else {
 			return;
 		};
-		match plan.set_keep_relative(prefix) {
-			Ok(()) => {
-				let dest = plan.destination.display().to_string();
-				app_log!(
-					"[APP:PASTE_MAPPED: prefix={} keep=primary dest={} items={}]",
-					prefix,
-					dest,
-					plan.items.len()
-				);
-				self.refresh_paste_detail();
-			}
+		match plan.choose_keep_relative(prefix) {
+			Ok(()) => self.rebuild_paste_plan(prefix.to_string(), true, cx),
 			Err(err) => {
 				app_log!("[APP:PASTE_ERR: {}]", err.key);
 				plan.error = Some(err);
+				cx.notify();
 			}
 		}
-		cx.notify();
 	}
 
 	pub fn choose_paste_prefix(
@@ -2731,22 +2814,91 @@ impl WorkbenchModel {
 		let Some(plan) = self.paste_preview.as_mut() else {
 			return;
 		};
-		match plan.set_prefix_destination(prefix, &dest) {
-			Ok(()) => {
-				app_log!(
-					"[APP:PASTE_MAPPED: prefix={} dest={} items={}]",
-					prefix,
-					dest.display(),
-					plan.items.len()
-				);
-				self.refresh_paste_detail();
-			}
+		match plan.choose_prefix_destination(prefix, &dest) {
+			Ok(()) => self.rebuild_paste_plan(prefix.to_string(), false, cx),
 			Err(err) => {
 				app_log!("[APP:PASTE_ERR: {}]", err.key);
 				plan.error = Some(err);
+				cx.notify();
 			}
 		}
+	}
+
+	/// Replans the writes for the mapping just chosen. The choice is already
+	/// on the visible plan and its old writes are dropped here, so neither a
+	/// second choice nor Apply can act on the previous mapping.
+	fn rebuild_paste_plan(
+		&mut self,
+		prefix: String,
+		keep: bool,
+		cx: &mut Context<Self>,
+	) {
+		if !self.accepting_work() {
+			return;
+		}
+		let Some(plan) = self.paste_preview.as_mut() else {
+			return;
+		};
+		plan.clear_file_plan();
+		plan.error = None;
+		let mut work = plan.clone();
+		self.paste_detail = None;
+		let (cancel, seq, ws_gen) = self.arm_paste_job();
+		self.set_status("paste_loading", []);
+		app_log!("[APP:PASTE_LOADING]");
 		cx.notify();
+
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		let cancel_bg = cancel.clone();
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
+				let (work, rebuilt) = bg
+					.spawn(async move {
+						let opts = interactive_read_opts(cancel_bg);
+						let rebuilt = work.rebuild_file_plan_with(&opts);
+						(work, rebuilt)
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if !model.accept_paste_result(seq, ws_gen, &cancel) {
+						cx.notify();
+						return;
+					}
+					match rebuilt {
+						Ok(()) => {
+							let dest = prefix_target(&work, &prefix, keep);
+							let keep_note =
+								if keep { " keep=primary" } else { "" };
+							app_log!(
+								"[APP:PASTE_MAPPED: prefix={}{} dest={} items={}]",
+								prefix,
+								keep_note,
+								dest,
+								work.items.len()
+							);
+							model.set_status(
+								"status_paste_preview",
+								[work.items.len().to_string()],
+							);
+							model.paste_preview = Some(work);
+							model.refresh_paste_detail();
+						}
+						Err(err) => {
+							app_log!("[APP:PASTE_ERR: {}]", err.key);
+							if let Some(plan) = model.paste_preview.as_mut() {
+								plan.error = Some(err);
+							}
+						}
+					}
+					cx.notify();
+				});
+			},
+		);
 	}
 
 	pub fn toggle_paste_overwrite(
@@ -2754,7 +2906,7 @@ impl WorkbenchModel {
 		idx: usize,
 		cx: &mut Context<Self>,
 	) {
-		if self.refuse_while_applying("overwrite", cx) {
+		if self.refuse_while_applying("overwrite", cx) || self.paste_loading {
 			return;
 		}
 		if let Some(ref mut p) = self.paste_preview {
@@ -2774,7 +2926,7 @@ impl WorkbenchModel {
 		idx: usize,
 		cx: &mut Context<Self>,
 	) {
-		if self.refuse_while_applying("include", cx) {
+		if self.refuse_while_applying("include", cx) || self.paste_loading {
 			return;
 		}
 		if let Some(ref mut p) = self.paste_preview {
@@ -2818,6 +2970,12 @@ impl WorkbenchModel {
 	}
 
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
+		if self.paste_loading {
+			app_log!("[APP:APPLY_IGNORED: loading]");
+			self.set_status("paste_loading_refused", []);
+			cx.notify();
+			return;
+		}
 		let Some(ref mut plan) = self.paste_preview else {
 			app_log!("[APP:APPLY_IGNORED: no_plan]");
 			return;
@@ -2936,9 +3094,12 @@ impl WorkbenchModel {
 		if self.refuse_while_applying("cancel", cx) {
 			return;
 		}
-		if self.paste_preview.take().is_none() {
+		let was_loading = self.paste_loading;
+		self.invalidate_paste_job();
+		if self.paste_preview.take().is_none() && !was_loading {
 			return;
 		}
+		self.paste_detail = None;
 		self.restore_log_after_paste();
 		self.pending_focus = Some(self.focus_handle.clone());
 		self.set_status("paste_cancelled", []);
@@ -2971,6 +3132,19 @@ impl WorkbenchModel {
 			cx.notify();
 		}
 	}
+}
+
+/// Where `prefix` lands, as printed in `[APP:PASTE_MAPPED]`.
+fn prefix_target(plan: &PastePreviewPlan, prefix: &str, keep: bool) -> String {
+	if keep {
+		return plan.destination.display().to_string();
+	}
+	plan.prefix_choices
+		.iter()
+		.find(|choice| choice.prefix == prefix)
+		.and_then(|choice| choice.destination.as_ref())
+		.map(|dest| dest.display().to_string())
+		.unwrap_or_default()
 }
 
 /// E2E only: keeps a finished tree read on its background thread while the

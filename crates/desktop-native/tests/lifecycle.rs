@@ -93,7 +93,7 @@ fn require_display_tools() -> bool {
 		eprintln!("skip: no DISPLAY");
 		return false;
 	}
-	for tool in ["xdotool", "xclip", "xwd", "convert", "git"] {
+	for tool in ["xdotool", "xclip", "xwd", "convert", "git", "cc"] {
 		let found = Command::new("which")
 			.arg(tool)
 			.output()
@@ -454,12 +454,13 @@ fn capture(wid: &str, path: &Path) {
 			.status()
 			.expect("xwd");
 		assert!(st.success(), "xwd failed for {}", path.display());
-		let st = Command::new("magick")
+		// `convert` exists in ImageMagick 6 (CI) and 7; `magick` is 7 only.
+		let st = Command::new("convert")
 			.arg(&xwd)
 			.args(["-depth", "8", &format!("PNG24:{}", path.display())])
 			.status()
-			.expect("magick");
-		assert!(st.success(), "magick failed for {}", path.display());
+			.expect("convert");
+		assert!(st.success(), "convert failed for {}", path.display());
 		len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 		if len > 15_000 {
 			break;
@@ -527,8 +528,17 @@ fn wait_exit(app: &mut App, timeout: Duration) -> std::process::ExitStatus {
 	status
 }
 
+/// Screenshots go next to the smoke artifacts when the runner names a
+/// directory, so CI uploads them; otherwise to a fixed local directory.
+fn shot_dir(local: &str) -> PathBuf {
+	match std::env::var_os("SNIP_E2E_OUT") {
+		Some(out) if !out.is_empty() => PathBuf::from(out).join("lifecycle"),
+		_ => PathBuf::from(local),
+	}
+}
+
 fn shots() -> PathBuf {
-	PathBuf::from("/tmp/snip-native-lifecycle-20260926-shots")
+	shot_dir("/tmp/snip-native-lifecycle-20260926-shots")
 }
 
 #[test]
@@ -836,9 +846,7 @@ fn quit_drains_a_held_git_child_before_the_process_exits() {
 }
 
 fn integration_shots() -> PathBuf {
-	PathBuf::from(
-		"/tmp/snip-native-lifecycle-export-integration-20260926-shots",
-	)
+	shot_dir("/tmp/snip-native-lifecycle-export-integration-20260926-shots")
 }
 
 fn hold_all_git_wrapper(git_bin: &Path, wrap: &Path) {
@@ -1772,6 +1780,404 @@ fn open_workspace_is_refused_while_apply_writes() {
 	lines_until(&app.rx, "[APP:QUIT: deferred]", Duration::from_secs(6));
 	let status = wait_exit(&mut app, Duration::from_secs(8));
 	assert!(status.success(), "window close exited uncleanly: {status}");
+}
+
+/// Starts a paste preview that blocks inside its first Git child.
+fn start_held_paste(
+	app: &mut App,
+	wid: &str,
+	fx: &CopyFixture,
+) -> (u32, String) {
+	fs::write(&fx.hold, b"hold").unwrap();
+	assert!(
+		no_git_children(app.pid),
+		"a git child existed before the paste; that would not prove the paste token"
+	);
+	click(wid, "btn-paste");
+	let lines =
+		lines_until(&app.rx, "[APP:PASTE_LOADING]", Duration::from_secs(4));
+	assert!(
+		position(&lines, "[APP:PASTE_PREVIEW:").is_none(),
+		"the preview was ready before its read started: {lines:?}"
+	);
+	let child = wait_copy_git(app.pid, &app.starttime);
+	app.tracked.push(child.clone());
+	child
+}
+
+/// After a cancel: the read was dropped, its child is gone, no plan is shown.
+fn assert_paste_dropped(
+	app: &App,
+	fx: &CopyFixture,
+	child: &(u32, String),
+	lines: &[String],
+) {
+	assert!(
+		position(lines, "[APP:PASTE_DISCARDED: cancelled]").is_some(),
+		"the cancelled read was not dropped: {lines:?}"
+	);
+	assert!(
+		position(lines, "[APP:PASTE_PREVIEW:").is_none()
+			&& position(lines, "[APP:PASTE_MAPPED:").is_none(),
+		"a cancelled read still produced a plan: {lines:?}"
+	);
+	assert!(
+		fx.hold.is_file(),
+		"hold file was removed; the child could have finished instead of being cancelled"
+	);
+	wait_gone(child.0, &child.1, "cancelled paste git child");
+	wait_git_idle(app.pid, &app.starttime);
+	assert!(same_proc(app.pid, &app.starttime), "cancel exited the app");
+}
+
+fn quit_cleanly(app: &mut App, wid: &str) {
+	request_wm_delete(wid);
+	lines_until(&app.rx, "[APP:QUIT: deferred]", Duration::from_secs(6));
+	let status = wait_exit(app, Duration::from_secs(8));
+	assert!(status.success(), "window close exited uncleanly: {status}");
+	assert!(
+		descendants(app.pid).is_empty(),
+		"owned children survived quit"
+	);
+}
+
+/// Cancel button, Escape, and Apply while the first preview is still read.
+#[test]
+fn paste_preview_cancel_stops_the_read_and_writes_nothing() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = copy_fixture();
+	let (mut app, wid) = spawn_copy_app(&fx);
+	let payload = "// FILE: pasted.txt\npaste-bytes\n";
+	clip_set(payload);
+
+	let child = start_held_paste(&mut app, &wid, &fx);
+	let _ = control("paste-loading");
+	capture(&wid, &integration_shots().join("04-paste-loading.png"));
+	// Apply is locked: neither the button nor Enter may act on a plan that
+	// does not exist yet.
+	click(&wid, "btn-apply");
+	key(&wid, "Return");
+	let refused = lines_until(
+		&app.rx,
+		"[APP:APPLY_IGNORED: loading]",
+		Duration::from_secs(4),
+	);
+	assert!(
+		position(&refused, "[APP:PASTE_APPLYING]").is_none(),
+		"apply ran while the preview was loading: {refused:?}"
+	);
+	click(&wid, "btn-cancel");
+	let lines = lines_until(
+		&app.rx,
+		"[APP:PASTE_DISCARDED: cancelled]",
+		Duration::from_secs(8),
+	);
+	assert!(
+		position(&lines, "[APP:PASTE_CANCELLED]").is_some(),
+		"the cancel button did not reach the model: {lines:?}"
+	);
+	assert_paste_dropped(&app, &fx, &child, &lines);
+	absent("btn-apply");
+	assert!(!fx.dest.join("pasted.txt").exists(), "cancel wrote a file");
+	assert_eq!(clip_get(), payload, "clipboard changed after cancel");
+
+	// Escape takes the same path.
+	fs::remove_file(&fx.hold).unwrap();
+	let child = start_held_paste(&mut app, &wid, &fx);
+	let _ = control("paste-loading");
+	key(&wid, "Escape");
+	let lines = lines_until(
+		&app.rx,
+		"[APP:PASTE_DISCARDED: cancelled]",
+		Duration::from_secs(8),
+	);
+	assert!(
+		position(&lines, "[APP:PASTE_CANCELLED]").is_some(),
+		"Escape did not cancel the loading preview: {lines:?}"
+	);
+	assert_paste_dropped(&app, &fx, &child, &lines);
+	absent("btn-apply");
+	assert!(!fx.dest.join("pasted.txt").exists(), "Escape wrote a file");
+
+	// The same paste still works once Git is released.
+	fs::remove_file(&fx.hold).unwrap();
+	click(&wid, "btn-paste");
+	lines_until(
+		&app.rx,
+		"[APP:PASTE_PREVIEW: items=1",
+		Duration::from_secs(8),
+	);
+	click(&wid, "btn-apply");
+	lines_until(&app.rx, "[APP:PASTE_DONE:", Duration::from_secs(8));
+	assert_eq!(
+		fs::read(fx.dest.join("pasted.txt")).expect("apply wrote the file"),
+		b"paste-bytes"
+	);
+	quit_cleanly(&mut app, &wid);
+}
+
+/// A second paste while the first is still read: only the newer one lands.
+#[test]
+fn newer_paste_replaces_the_one_still_loading() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = copy_fixture();
+	let (mut app, wid) = spawn_copy_app(&fx);
+
+	clip_set("// FILE: first.txt\nfirst-bytes\n");
+	let first = start_held_paste(&mut app, &wid, &fx);
+	clip_set("// FILE: second.txt\nsecond-bytes\n");
+	click(&wid, "btn-paste");
+	let lines = lines_until(
+		&app.rx,
+		"[APP:PASTE_DISCARDED: cancelled]",
+		Duration::from_secs(8),
+	);
+	assert!(
+		position(&lines, "[APP:PASTE_LOADING]").is_some(),
+		"the second paste did not start: {lines:?}"
+	);
+	assert!(
+		position(&lines, "[APP:PASTE_PREVIEW:").is_none(),
+		"a preview appeared while Git was held: {lines:?}"
+	);
+	wait_gone(first.0, &first.1, "superseded paste git child");
+	assert!(fx.hold.is_file());
+
+	fs::remove_file(&fx.hold).unwrap();
+	let ready = lines_until(
+		&app.rx,
+		"[APP:PASTE_PREVIEW: items=1",
+		Duration::from_secs(8),
+	);
+	assert_eq!(
+		ready
+			.iter()
+			.filter(|l| l.contains("[APP:PASTE_PREVIEW:"))
+			.count(),
+		1,
+		"more than one preview landed: {ready:?}"
+	);
+	let _ = control("paste-row:second.txt");
+	absent("paste-row:first.txt");
+	click(&wid, "btn-apply");
+	lines_until(&app.rx, "[APP:PASTE_DONE:", Duration::from_secs(8));
+	assert_eq!(
+		fs::read(fx.dest.join("second.txt")).expect("apply wrote second"),
+		b"second-bytes"
+	);
+	assert!(
+		!fx.dest.join("first.txt").exists(),
+		"the superseded paste was written"
+	);
+	quit_cleanly(&mut app, &wid);
+}
+
+/// A mapping change replans in the background. The old writes are gone as
+/// soon as the choice is made, and a second choice replaces the first.
+#[test]
+fn mapping_change_replans_and_cannot_apply_the_old_plan() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = copy_fixture();
+	let (mut app, wid) = spawn_copy_app(&fx);
+
+	clip_set("// FILE: lib/mapped.txt\nmapped-bytes\n");
+	click(&wid, "btn-paste");
+	let ready =
+		lines_until(&app.rx, "[APP:PASTE_PREVIEW:", Duration::from_secs(8));
+	let repo_text = fx.repo.to_string_lossy().to_string();
+	let repo_idx = ready
+		.iter()
+		.find_map(|l| {
+			let rest = l
+				.split("[APP:PASTE_MAP_CANDIDATE: prefix=lib idx=")
+				.nth(1)?;
+			let (idx, path) = rest.split_once(" path=")?;
+			(path.trim_end_matches(']') == repo_text).then(|| idx.to_string())
+		})
+		.unwrap_or_else(|| panic!("repo is not a candidate: {ready:?}"));
+	wait_git_idle(app.pid, &app.starttime);
+
+	fs::write(&fx.hold, b"hold").unwrap();
+	click(&wid, "paste-map-keep:lib");
+	lines_until(&app.rx, "[APP:PASTE_LOADING]", Duration::from_secs(4));
+	let first = wait_copy_git(app.pid, &app.starttime);
+	app.tracked.push(first.clone());
+	let _ = control("paste-loading");
+	key(&wid, "Return");
+	let refused = lines_until(
+		&app.rx,
+		"[APP:APPLY_IGNORED: loading]",
+		Duration::from_secs(4),
+	);
+	assert!(
+		position(&refused, "[APP:PASTE_APPLYING]").is_none(),
+		"apply ran while the mapping was being replanned: {refused:?}"
+	);
+
+	click(&wid, &format!("paste-map-pick:lib:{repo_idx}"));
+	let lines = lines_until(
+		&app.rx,
+		"[APP:PASTE_DISCARDED: cancelled]",
+		Duration::from_secs(8),
+	);
+	assert!(
+		position(&lines, "[APP:PASTE_MAPPED:").is_none(),
+		"the superseded mapping still landed: {lines:?}"
+	);
+	wait_gone(first.0, &first.1, "superseded mapping git child");
+
+	fs::remove_file(&fx.hold).unwrap();
+	let mapped =
+		lines_until(&app.rx, "[APP:PASTE_MAPPED:", Duration::from_secs(8));
+	let line = mapped.last().unwrap();
+	assert!(
+		line.contains(&format!("prefix=lib dest={repo_text} items=1")),
+		"the landed mapping is not the second choice: {line}"
+	);
+	click(&wid, "btn-apply");
+	lines_until(&app.rx, "[APP:PASTE_DONE:", Duration::from_secs(8));
+	assert_eq!(
+		fs::read(fx.repo.join("mapped.txt")).expect("apply wrote the file"),
+		b"mapped-bytes"
+	);
+	assert!(
+		!fx.dest.join("lib").exists(),
+		"the first mapping choice was written"
+	);
+	quit_cleanly(&mut app, &wid);
+}
+
+fn repo_state(git_bin: &Path, repo: &Path) -> String {
+	let mut out = String::new();
+	for args in [
+		vec!["rev-parse", "HEAD"],
+		vec!["for-each-ref"],
+		vec!["status", "--porcelain=v1", "--untracked-files=all"],
+		vec!["ls-files", "--stage"],
+	] {
+		let res = Command::new(git_bin)
+			.args(&args)
+			.current_dir(repo)
+			.output()
+			.expect("git");
+		assert!(res.status.success(), "git {args:?} failed");
+		out.push_str(&String::from_utf8_lossy(&res.stdout));
+		out.push('\n');
+	}
+	out
+}
+
+/// A commit preview reads the destination repository. Cancelling it and
+/// closing the workspace over it must leave HEAD, refs and the index alone.
+#[test]
+fn commit_preview_cancel_and_close_leave_the_destination_untouched() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let mut fx = copy_fixture();
+	let dest_repo = fx.dest.join("dest-repo");
+	init_repo(&fx.git_bin, &dest_repo);
+	fx.dest = dest_repo.clone();
+	// A second commit so the payload is not the destination's own history.
+	git(&fx.git_bin, &fx.repo, &["add", "note.txt"]);
+	git(&fx.git_bin, &fx.repo, &["commit", "-q", "-m", "add note"]);
+	// Startup waits for a preview, so keep one change in the working tree.
+	fs::write(fx.repo.join("extra.txt"), "extra\n").unwrap();
+	let (mut app, wid) = spawn_copy_app(&fx);
+
+	let sha = head_short(&fx.git_bin, &fx.repo);
+	click(&wid, &format!("commit-row:{sha}"));
+	lines_until(&app.rx, "[APP:COMMIT_SELECTED:", Duration::from_secs(4));
+	lines_until(
+		&app.rx,
+		"[APP:E2E_PREVIEW: source=commit_diff",
+		Duration::from_secs(8),
+	);
+	click(&wid, "btn-copy-commits");
+	lines_until(&app.rx, "[APP:COPY_COMMITS_DONE:", Duration::from_secs(8));
+	wait_git_idle(app.pid, &app.starttime);
+	let payload = clip_get();
+	let before = repo_state(&fx.git_bin, &dest_repo);
+
+	let child = start_held_paste(&mut app, &wid, &fx);
+	click(&wid, "btn-cancel");
+	let lines = lines_until(
+		&app.rx,
+		"[APP:PASTE_DISCARDED: cancelled]",
+		Duration::from_secs(8),
+	);
+	assert_paste_dropped(&app, &fx, &child, &lines);
+	absent("btn-apply");
+	assert_eq!(repo_state(&fx.git_bin, &dest_repo), before);
+	assert_eq!(clip_get(), payload, "clipboard changed after cancel");
+
+	// Released, the same commit preview is built off the UI thread.
+	fs::remove_file(&fx.hold).unwrap();
+	click(&wid, "btn-paste");
+	lines_until(&app.rx, "[APP:PASTE_PREVIEW:", Duration::from_secs(8));
+	let _ = control("paste-commit-whole");
+	click(&wid, "btn-cancel");
+	lines_until(&app.rx, "[APP:PASTE_CANCELLED]", Duration::from_secs(4));
+	wait_git_idle(app.pid, &app.starttime);
+
+	// Close while a preview is still being read.
+	let child = start_held_paste(&mut app, &wid, &fx);
+	click(&wid, "btn-workspace-menu");
+	click(&wid, "btn-close-workspace");
+	let closed = lines_until(
+		&app.rx,
+		"[APP:WORKSPACE: state=closed",
+		Duration::from_secs(12),
+	);
+	assert!(
+		position(&closed, "[APP:PASTE_DISCARDED:").is_some(),
+		"close did not drop the loading preview: {closed:?}"
+	);
+	assert!(
+		position(&closed, "[APP:PASTE_PREVIEW:").is_none(),
+		"a preview landed during close: {closed:?}"
+	);
+	assert!(
+		closed.iter().any(|l| is_drained(l, "close-workspace")),
+		"close did not report a real drain: {closed:?}"
+	);
+	assert!(fx.hold.is_file());
+	wait_gone(child.0, &child.1, "paste git child after close");
+	let _ = control("workspace-closed");
+	absent("btn-apply");
+	assert_eq!(repo_state(&fx.git_bin, &dest_repo), before);
+	assert_eq!(clip_get(), payload, "clipboard changed across close");
+
+	// Reopened in the same process: the dropped preview does not come back.
+	fs::remove_file(&fx.hold).unwrap();
+	open_workspace(&wid, &fx.ws);
+	let opened = lines_until_all(
+		&app.rx,
+		&["[APP:WORKSPACE: state=open path=", "[APP:READY_REPOS: 1]"],
+		Duration::from_secs(12),
+	);
+	let settle = lines_for(&app.rx, Duration::from_millis(800));
+	assert!(
+		opened
+			.iter()
+			.chain(&settle)
+			.all(|l| !l.contains("[APP:PASTE_PREVIEW:")),
+		"the old preview appeared in the reopened workspace: {opened:?} {settle:?}"
+	);
+	absent("btn-apply");
+	assert_eq!(repo_state(&fx.git_bin, &dest_repo), before);
+	assert!(same_proc(app.pid, &app.starttime));
+	quit_cleanly(&mut app, &wid);
 }
 
 fn request_wm_delete(wid: &str) {

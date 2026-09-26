@@ -1114,8 +1114,8 @@ impl WorkbenchModel {
 							true,
 							4,
 						)
-						.on_click(cx.listener(|this, _, window, cx| {
-							this.trigger_paste_preview(window, cx)
+						.on_click(cx.listener(|this, _, _, cx| {
+							this.trigger_paste_preview(cx)
 						}))
 						.children(probe(log, "btn-paste")),
 					)
@@ -2885,33 +2885,20 @@ impl WorkbenchModel {
 		labels
 	}
 
-	fn render_paste(
+	/// Destination, Apply and Cancel. Apply stays locked while a read-only
+	/// preview or remap is still running, so an older plan cannot be written.
+	fn paste_action_bar(
 		&self,
-		plan: &PastePreviewPlan,
+		dest: String,
+		applying: bool,
+		mapping_ready: bool,
 		cx: &mut Context<Self>,
-	) -> AnyElement {
+	) -> Div {
 		let loc = self.locale;
 		let log = &self.probes;
-		let mut skips = plan.plan.skipped_operations.len();
-		let (mut creates, mut overwrites, mut existing, mut deletes) =
-			(0, 0, 0, 0);
-		for it in &plan.items {
-			if it.dest_exists && !it.is_delete {
-				existing += 1;
-			}
-			match paste_op(it).0 {
-				"op_create" => creates += 1,
-				"op_overwrite" => overwrites += 1,
-				"op_delete" => deletes += 1,
-				_ => skips += 1,
-			}
-		}
-		let dest = plan.destination.display().to_string();
-		let applying = plan.is_applying;
-		let mapping_ready = plan.mapping_ready();
-		let selected = plan.items.get(plan.selected_item_idx);
-
-		let action_bar = div()
+		let loading = self.paste_loading;
+		let can_apply = !applying && mapping_ready && !loading;
+		div()
 			.flex()
 			.flex_row()
 			.items_center()
@@ -2949,13 +2936,16 @@ impl WorkbenchModel {
 						t("apply", loc)
 					},
 					Btn::Primary,
-					!applying && mapping_ready,
+					can_apply,
 					50,
 				)
-				.when(!mapping_ready, |b| {
+				.when(loading, |b| {
+					b.tooltip(tip(t("paste_loading_refused", loc)))
+				})
+				.when(!loading && !mapping_ready, |b| {
 					b.tooltip(tip(t("mapping_required", loc)))
 				})
-				.when(!applying && mapping_ready, |b| {
+				.when(can_apply, |b| {
 					b.on_click(cx.listener(|this, _, _, cx| {
 						this.apply_paste_restore(cx)
 					}))
@@ -2981,7 +2971,75 @@ impl WorkbenchModel {
 					b.tooltip(tip(t("paste_busy_refused", loc)))
 				})
 				.children(probe(log, "btn-cancel")),
-			);
+			)
+	}
+
+	fn paste_loading_note(&self) -> Stateful<Div> {
+		div()
+			.id("paste-loading")
+			.relative()
+			.flex_shrink_0()
+			.px(px(12.))
+			.py(px(6.))
+			.text_size(px(SMALL_TEXT))
+			.text_color(rgb(TEXT_MUTED))
+			.child(t("paste_loading", self.locale))
+			.children(probe(&self.probes, "paste-loading"))
+	}
+
+	/// First preview still being read: no plan exists, so only Cancel works.
+	fn render_paste_loading(&self, cx: &mut Context<Self>) -> AnyElement {
+		let dest = self.current_restore_destination().display().to_string();
+		div()
+			.id("paste-panel")
+			.key_context("PastePanel")
+			.track_focus(&self.paste_focus)
+			.flex()
+			.flex_col()
+			.flex_1()
+			.min_w_0()
+			.min_h_0()
+			.h_full()
+			.overflow_hidden()
+			.bg(rgb(EDITOR_BG))
+			.child(self.tab_strip(
+				t("paste_tab", self.locale).to_string(),
+				Icon::Changes,
+			))
+			.child(self.paste_action_bar(dest, false, false, cx))
+			.child(self.paste_loading_note())
+			.into_any_element()
+	}
+
+	fn render_paste(
+		&self,
+		plan: &PastePreviewPlan,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let mut skips = plan.plan.skipped_operations.len();
+		let (mut creates, mut overwrites, mut existing, mut deletes) =
+			(0, 0, 0, 0);
+		for it in &plan.items {
+			if it.dest_exists && !it.is_delete {
+				existing += 1;
+			}
+			match paste_op(it).0 {
+				"op_create" => creates += 1,
+				"op_overwrite" => overwrites += 1,
+				"op_delete" => deletes += 1,
+				_ => skips += 1,
+			}
+		}
+		let dest = plan.destination.display().to_string();
+		let applying = plan.is_applying;
+		let mapping_ready = plan.mapping_ready();
+		let selected = plan.items.get(plan.selected_item_idx);
+
+		let loading = self.paste_loading;
+		let action_bar =
+			self.paste_action_bar(dest, applying, mapping_ready, cx);
 
 		let summary = div()
 			.flex()
@@ -3350,6 +3408,7 @@ impl WorkbenchModel {
 			))
 			.child(action_bar)
 			.child(summary)
+			.when(loading, |d| d.child(self.paste_loading_note()))
 			.when(plan.whole_commit, |d| {
 				d.child(
 					div()
@@ -4323,6 +4382,7 @@ impl Render for WorkbenchModel {
 		} else {
 			match self.paste_preview {
 				Some(ref plan) => self.render_paste(plan, cx),
+				None if self.paste_loading => self.render_paste_loading(cx),
 				None => self.render_editor(cx),
 			}
 		};
@@ -4345,8 +4405,8 @@ impl Render for WorkbenchModel {
 			.on_action(cx.listener(|this, _: &CopySelection, _, cx| {
 				this.copy_selection_to_clipboard(cx)
 			}))
-			.on_action(cx.listener(|this, _: &PastePreview, window, cx| {
-				this.trigger_paste_preview(window, cx)
+			.on_action(cx.listener(|this, _: &PastePreview, _, cx| {
+				this.trigger_paste_preview(cx)
 			}))
 			.on_action(cx.listener(|this, _: &ApplyPaste, _, cx| {
 				this.apply_paste_restore(cx)

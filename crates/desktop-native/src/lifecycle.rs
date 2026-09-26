@@ -24,7 +24,14 @@
 //!   both via `Git::run` with [`snip_core::gitrun::RunOptions::default`]. `browser::git_preview_with`
 //!   calls `read_changed_file` before its own diff. Native reaches that from
 //!   `read_preview`, `select_commit_file`, and `load_change_list`.
-//! - Paste-preview planning is a separate core API and is not wired here.
+//!
+//! Paste-preview planning is read-only and receives the paste job's token:
+//! `PastePreviewPlan::build_from_clipboard_text_with` and
+//! `rebuild_file_plan_with` reach `transfer::plan_import_with` and
+//! `CommitReplayPreview::capture_with`. A new paste, a mapping change,
+//! Cancel, Escape and a workspace close all cancel the job in flight.
+//!
+//! Writes are the opposite:
 //! - Confirmed paste/replay (`PastePreviewPlan::execute`, including
 //!   `Git::open` in `paste.rs` `execute_commit`) must not be cancelled
 //!   mid-write. Close, open, and quit are refused until that job finishes.

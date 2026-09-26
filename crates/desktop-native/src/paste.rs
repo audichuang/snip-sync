@@ -14,12 +14,13 @@ use std::sync::Arc;
 
 use snip_core::commits::{self, ReplayAction};
 use snip_core::format;
+use snip_core::gitrun::RunOptions;
 use snip_core::gitsrc::Git;
 use snip_core::restore::{
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
 };
 use snip_core::transfer::{
-	detect_clipboard_prefixes, plan_import, CanonicalRootId,
+	detect_clipboard_prefixes, plan_import_with, CanonicalRootId,
 	CommitReplayPreview, ImportMapping, TransferError, TransferImportPlan,
 };
 
@@ -77,7 +78,8 @@ pub struct PastePreviewPlan {
 	pub is_applying: bool,
 	pub generation_snapshot: u64,
 	pub error: Option<Msg>,
-	raw_payload: String,
+	/// Shared so a clone for a background rebuild or an apply is cheap.
+	raw_payload: Arc<str>,
 }
 
 fn empty_plan() -> Arc<RestorePlan> {
@@ -135,8 +137,26 @@ impl PastePreviewPlan {
 		known_roots: &[PathBuf],
 		generation: u64,
 	) -> Result<Self, Msg> {
+		Self::build_from_clipboard_text_with(
+			raw_text,
+			dest,
+			known_roots,
+			generation,
+			&RunOptions::default(),
+		)
+	}
+
+	/// [`Self::build_from_clipboard_text`] with the caller's runner options,
+	/// so a read-only preview can be cancelled. Nothing is written.
+	pub fn build_from_clipboard_text_with(
+		raw_text: &str,
+		dest: &Path,
+		known_roots: &[PathBuf],
+		generation: u64,
+		opts: &RunOptions,
+	) -> Result<Self, Msg> {
 		if commits::is_commit_payload(raw_text) {
-			return Self::build_commit(raw_text, dest, generation);
+			return Self::build_commit(raw_text, dest, generation, opts);
 		}
 		let entries = format::parse_clipboard(raw_text, "");
 		if entries.is_empty() {
@@ -177,9 +197,9 @@ impl PastePreviewPlan {
 			is_applying: false,
 			generation_snapshot: generation,
 			error: None,
-			raw_payload: raw_text.to_string(),
+			raw_payload: raw_text.into(),
 		};
-		plan.rebuild_file_plan()?;
+		plan.rebuild_file_plan_with(opts)?;
 		if plan.prefix_choices.is_empty() && plan.import_plan.is_none() {
 			return Err(plan
 				.error
@@ -192,11 +212,14 @@ impl PastePreviewPlan {
 		raw_text: &str,
 		dest: &Path,
 		generation: u64,
+		opts: &RunOptions,
 	) -> Result<Self, Msg> {
 		let payload = commits::parse_commit_payload(raw_text)
 			.map_err(|e| Msg::new("paste_err_plan", [e.to_string()]))?;
-		let preview = CommitReplayPreview::capture(dest, &payload)
-			.map_err(|e| Msg::new("paste_err_destination", [e.to_string()]))?;
+		let preview = CommitReplayPreview::capture_with(dest, &payload, opts)
+			.map_err(|e| {
+			Msg::new("paste_err_destination", [e.to_string()])
+		})?;
 		let dest_name = root_name(dest);
 		let mut items = Vec::new();
 		for (c_idx, (commit, record)) in preview
@@ -258,13 +281,24 @@ impl PastePreviewPlan {
 			is_applying: false,
 			generation_snapshot: generation,
 			error: None,
-			raw_payload: raw_text.to_string(),
+			raw_payload: raw_text.into(),
 		})
 	}
 
 	/// Points `prefix` at a candidate directory and rebuilds the file plan.
 	/// Same basenames stay distinct because the stored path is canonical.
 	pub fn set_prefix_destination(
+		&mut self,
+		prefix: &str,
+		dest: &Path,
+	) -> Result<(), Msg> {
+		self.choose_prefix_destination(prefix, dest)?;
+		self.rebuild_file_plan_with(&RunOptions::default())
+	}
+
+	/// Records the choice only. The file plan is stale until
+	/// [`Self::rebuild_file_plan_with`] has run.
+	pub fn choose_prefix_destination(
 		&mut self,
 		prefix: &str,
 		dest: &Path,
@@ -292,12 +326,17 @@ impl PastePreviewPlan {
 		}
 		choice.keep_relative = false;
 		choice.destination = Some(id.path().to_path_buf());
-		self.rebuild_file_plan()?;
 		Ok(())
 	}
 
 	/// Confirms that `prefix` is a directory under the primary destination.
 	pub fn set_keep_relative(&mut self, prefix: &str) -> Result<(), Msg> {
+		self.choose_keep_relative(prefix)?;
+		self.rebuild_file_plan_with(&RunOptions::default())
+	}
+
+	/// Records the choice only, like [`Self::choose_prefix_destination`].
+	pub fn choose_keep_relative(&mut self, prefix: &str) -> Result<(), Msg> {
 		let choice = self
 			.prefix_choices
 			.iter_mut()
@@ -307,17 +346,31 @@ impl PastePreviewPlan {
 			})?;
 		choice.keep_relative = true;
 		choice.destination = None;
-		self.rebuild_file_plan()?;
 		Ok(())
 	}
 
-	fn rebuild_file_plan(&mut self) -> Result<(), Msg> {
+	/// Drops the planned writes so a changed mapping cannot apply the old
+	/// ones. A whole-commit replay has no mapping and keeps its plan.
+	pub fn clear_file_plan(&mut self) {
+		if self.whole_commit {
+			return;
+		}
+		self.items = Vec::new();
+		self.selected_item_idx = 0;
+		self.import_plan = None;
+		self.plan = empty_plan();
+	}
+
+	/// Plans the writes for the current mapping. Read-only; `opts` carries
+	/// the caller's cancel token into the destination reads.
+	pub fn rebuild_file_plan_with(
+		&mut self,
+		opts: &RunOptions,
+	) -> Result<(), Msg> {
 		if self.whole_commit {
 			return Ok(());
 		}
-		self.items.clear();
-		self.import_plan = None;
-		self.plan = empty_plan();
+		self.clear_file_plan();
 		if !self.mapping_ready() {
 			self.error = Some(Msg::new("mapping_required", []));
 			return Ok(());
@@ -341,15 +394,19 @@ impl PastePreviewPlan {
 			})?;
 			mapping.map_prefix(&choice.prefix, id);
 		}
-		let import_plan =
-			match plan_import(&self.raw_payload, "", &dest_roots, &mapping) {
-				Ok(plan) => plan,
-				Err(e) => {
-					self.error =
-						Some(Msg::new("paste_err_plan", [e.to_string()]));
-					return Ok(());
-				}
-			};
+		let import_plan = match plan_import_with(
+			&self.raw_payload,
+			"",
+			&dest_roots,
+			&mapping,
+			opts,
+		) {
+			Ok(plan) => plan,
+			Err(e) => {
+				self.error = Some(Msg::new("paste_err_plan", [e.to_string()]));
+				return Ok(());
+			}
+		};
 		let planned = import_plan.restore_plan().clone();
 		if planned.create_operations.is_empty()
 			&& planned.delete_operations.is_empty()
