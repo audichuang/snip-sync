@@ -285,16 +285,13 @@ pub struct WorkbenchModel {
 	pub discovery_error_overflow: usize,
 	pub discovery_depth_overflow: usize,
 	discovery_generation: u64,
-	discovery_task: Option<gpui::Task<()>>,
 	pinned_repo: Option<(PathBuf, PathBuf)>,
 	manual_repos: Vec<RepoEntry>,
-	tree_task: Option<gpui::Task<()>>,
 	tree_queue: VecDeque<TreeIo>,
 	tree_worker: u64,
 	tree_worker_alive: bool,
 	restore_expanded: Vec<String>,
 	add_cancel: Option<CancelToken>,
-	add_repo_task: Option<gpui::Task<()>>,
 	pub is_adding_repo: bool,
 	pub add_repo_input: Entity<TextInput>,
 	pub paste_preview: Option<PastePreviewPlan>,
@@ -337,6 +334,8 @@ pub struct WorkbenchModel {
 	/// Focus requested from a context without a `Window`; applied on render.
 	pub pending_focus: Option<FocusHandle>,
 	pub e2e_read_delay: Option<std::time::Duration>,
+	/// Test-only hold file for project-tree reads, honoured only in E2E mode.
+	pub e2e_tree_hold: Option<PathBuf>,
 	pub workspace_open: bool,
 	pub workspace_menu: bool,
 	pub workspace_picker: bool,
@@ -538,16 +537,13 @@ impl WorkbenchModel {
 			discovery_error_overflow: 0,
 			discovery_depth_overflow: 0,
 			discovery_generation: 0,
-			discovery_task: None,
 			pinned_repo: None,
 			manual_repos: Vec::new(),
-			tree_task: None,
 			tree_queue: VecDeque::new(),
 			tree_worker: 0,
 			tree_worker_alive: false,
 			restore_expanded: Vec::new(),
 			add_cancel: None,
-			add_repo_task: None,
 			is_adding_repo: false,
 			paste_preview: None,
 			paste_detail: None,
@@ -580,6 +576,7 @@ impl WorkbenchModel {
 			e2e_apply_delay: ui::e2e_apply_delay(),
 			pending_focus: None,
 			e2e_read_delay: ui::e2e_read_delay(),
+			e2e_tree_hold: ui::e2e_tree_hold(),
 			workspace_open: true,
 			workspace_menu: false,
 			workspace_picker: false,
@@ -1135,16 +1132,12 @@ impl WorkbenchModel {
 		release_vec(&mut self.discovery_depth_limited);
 		self.discovery_error_overflow = 0;
 		self.discovery_depth_overflow = 0;
-		self.discovery_task = None;
 		self.pinned_repo = None;
 		release_vec(&mut self.manual_repos);
-		self.tree_task = None;
 		self.tree_queue = VecDeque::new();
-		self.tree_worker = 0;
 		self.tree_worker_alive = false;
 		release_vec(&mut self.restore_expanded);
 		self.add_cancel = None;
-		self.add_repo_task = None;
 		self.is_loading = false;
 		self.is_copying = false;
 		self.is_adding_repo = false;
@@ -1593,6 +1586,9 @@ impl WorkbenchModel {
 		let Some(cmd) = cmd else {
 			return;
 		};
+		if !self.accepting_work() {
+			return;
+		}
 		match &cmd {
 			TreeCommand::OpenFile(rel) => {
 				let rel = rel.clone();
@@ -1628,7 +1624,12 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// Runs project-tree reads one at a time as an owned job, so close and
+	/// quit wait for the directory read itself and not only for Git children.
 	fn submit_tree_io(&mut self, io: TreeIo, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		if self.tree_worker_alive {
 			self.tree_queue.push_back(io);
 			return;
@@ -1636,46 +1637,73 @@ impl WorkbenchModel {
 		self.tree_worker = self.tree_worker.wrapping_add(1);
 		let worker = self.tree_worker;
 		self.tree_worker_alive = true;
-		if self.tree_cancel.is_none() {
-			self.tree_cancel = Some(CancelToken::new());
-		}
-		let cancel = self.tree_cancel.clone().unwrap();
-		let task = cx.spawn(async move |this, cx| {
-			let mut pending = Some(io);
-			while let Some(io) = pending.take() {
-				if cancel.is_cancelled() {
-					break;
+		let cancel = self
+			.tree_cancel
+			.get_or_insert_with(CancelToken::new)
+			.clone();
+		let ws_gen = self.lifecycle.generation();
+		let hold = self.e2e_tree_hold.clone();
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
+				let mut pending = Some(io);
+				while let Some(io) = pending.take() {
+					if cancel.is_cancelled() {
+						break;
+					}
+					let cancel_bg = cancel.clone();
+					let hold_bg = hold.clone();
+					let result = bg
+						.spawn(async move {
+							let result =
+								crate::tree::execute_tree_io(io, &cancel_bg);
+							hold_tree_read(hold_bg.as_deref());
+							result
+						})
+						.await;
+					pending = this
+						.update(&mut async_app, |model, cx| {
+							// A close or reopen bumps the lifecycle generation;
+							// a repo switch bumps the worker id.
+							if model.lifecycle.generation() != ws_gen
+								|| model.tree_worker != worker
+							{
+								if e2e_on() {
+									app_log!(
+										"[APP:TREE_IO_DISCARDED: stale rel={}]",
+										result
+											.key
+											.utf8_rel()
+											.unwrap_or_default()
+									);
+								}
+								return None;
+							}
+							model.apply_tree_result(result);
+							let next = model.next_tree_io();
+							if next.is_none() {
+								model.tree_worker_alive = false;
+							}
+							cx.notify();
+							next
+						})
+						.ok()
+						.flatten();
 				}
-				let bg = cx.background_executor().clone();
-				let cancel_bg = cancel.clone();
-				let result = bg
-					.spawn(async move {
-						crate::tree::execute_tree_io(io, &cancel_bg)
-					})
-					.await;
-				pending = this
-					.update(cx, |model, cx| {
-						if model.tree_worker != worker {
-							return None;
-						}
-						model.apply_tree_result(result);
-						let next = model.next_tree_io();
-						if next.is_none() {
-							model.tree_worker_alive = false;
-						}
-						cx.notify();
-						next
-					})
-					.ok()
-					.flatten();
-			}
-			let _ = this.update(cx, |model, _| {
-				if model.tree_worker == worker {
-					model.tree_worker_alive = false;
-				}
-			});
-		});
-		self.tree_task = Some(task);
+				let _ = this.update(&mut async_app, |model, _| {
+					if model.lifecycle.generation() == ws_gen
+						&& model.tree_worker == worker
+					{
+						model.tree_worker_alive = false;
+					}
+				});
+			},
+		);
 	}
 
 	fn apply_tree_result(&mut self, result: crate::tree::TreeIoResult) {
@@ -2942,6 +2970,21 @@ impl WorkbenchModel {
 			}
 			cx.notify();
 		}
+	}
+}
+
+/// E2E only: keeps a finished tree read on its background thread while the
+/// hold file exists. `hold` is `None` in every normal run.
+fn hold_tree_read(hold: Option<&std::path::Path>) {
+	let Some(hold) = hold else {
+		return;
+	};
+	if !hold.exists() {
+		return;
+	}
+	app_log!("[APP:TREE_IO_HELD]");
+	while hold.exists() {
+		std::thread::sleep(std::time::Duration::from_millis(20));
 	}
 }
 

@@ -30,10 +30,10 @@
 //!   mid-write. Close, open, and quit are refused until that job finishes.
 //!
 //! `DirectoryScan` / `ScanBudget::cancel` already accepts a token; discovery
-//! passes it. Synchronous project-tree expansion runs on the UI thread, so it
-//! is not in flight when a close handler starts. Routing those actions through
-//! [`crate::WorkbenchModel::spawn_owned`] is the integration point for the
-//! separate tree revision.
+//! passes it. Project-tree reads have no Git child, so the Git counters never
+//! see them: `submit_tree_io` in `main.rs` runs its worker through
+//! [`crate::WorkbenchModel::spawn_owned`], and a result that arrives after a
+//! close or reopen is dropped by the lifecycle generation.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

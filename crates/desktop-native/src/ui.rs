@@ -70,6 +70,18 @@ pub fn e2e_read_delay() -> Option<std::time::Duration> {
 		.map(std::time::Duration::from_millis)
 }
 
+/// Test-only hold for a project-tree directory read: the background worker
+/// keeps its result while this file exists, so close and quit can be raced
+/// against a read that has no Git child. Ignored outside E2E mode.
+pub fn e2e_tree_hold() -> Option<std::path::PathBuf> {
+	if !crate::e2e_on() {
+		return None;
+	}
+	std::env::var_os("SNIP_NATIVE_E2E_TREE_HOLD_FILE")
+		.filter(|v| !v.is_empty())
+		.map(std::path::PathBuf::from)
+}
+
 /// Control bounds of the last two frames only, so the bookkeeping is
 /// bounded by what is on screen, never by what was ever shown.
 #[derive(Default)]

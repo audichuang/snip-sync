@@ -237,6 +237,7 @@ struct SpawnOpts<'a> {
 	apply_delay_ms: Option<u64>,
 	hold_file: Option<&'a Path>,
 	path_prefix: Option<&'a Path>,
+	tree_hold: Option<&'a Path>,
 }
 
 fn spawn_app(opts: SpawnOpts) -> App {
@@ -253,7 +254,8 @@ fn spawn_app(opts: SpawnOpts) -> App {
 	.env("SNIP_NATIVE_E2E", "1")
 	.env_remove("SNIP_E2E_GIT_HOLD_FILE")
 	.env_remove("SNIP_NATIVE_E2E_READ_DELAY_MS")
-	.env_remove("SNIP_NATIVE_E2E_APPLY_DELAY_MS");
+	.env_remove("SNIP_NATIVE_E2E_APPLY_DELAY_MS")
+	.env_remove("SNIP_NATIVE_E2E_TREE_HOLD_FILE");
 	if let Some(ms) = opts.read_delay_ms {
 		cmd.env("SNIP_NATIVE_E2E_READ_DELAY_MS", ms.to_string());
 	}
@@ -262,6 +264,9 @@ fn spawn_app(opts: SpawnOpts) -> App {
 	}
 	if let Some(hold) = opts.hold_file {
 		cmd.env("SNIP_E2E_GIT_HOLD_FILE", hold);
+	}
+	if let Some(hold) = opts.tree_hold {
+		cmd.env("SNIP_NATIVE_E2E_TREE_HOLD_FILE", hold);
 	}
 	if let Some(prefix) = opts.path_prefix {
 		let old = std::env::var_os("PATH").unwrap_or_default();
@@ -552,6 +557,7 @@ fn close_reopen_same_pid_discards_stale_preview_and_keeps_clipboard() {
 		apply_delay_ms: Some(2000),
 		hold_file: None,
 		path_prefix: None,
+		tree_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(12));
@@ -751,6 +757,7 @@ fn quit_drains_a_held_git_child_before_the_process_exits() {
 		apply_delay_ms: None,
 		hold_file: Some(&hold),
 		path_prefix: Some(&wrap_dir),
+		tree_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until(&app.rx, "[APP:READY_REPOS:", Duration::from_secs(12));
@@ -938,6 +945,7 @@ fn close_cancels_in_flight_copy_without_writing_clipboard() {
 		apply_delay_ms: None,
 		hold_file: Some(&hold),
 		path_prefix: Some(wrap.parent().unwrap()),
+		tree_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(12));
@@ -1086,6 +1094,684 @@ fn close_cancels_in_flight_copy_without_writing_clipboard() {
 		descendants(app.pid).is_empty(),
 		"owned children survived quit"
 	);
+}
+
+/// Reads until every pattern has been seen, in any order.
+fn lines_until_all(
+	rx: &Receiver<String>,
+	patterns: &[&str],
+	timeout: Duration,
+) -> Vec<String> {
+	let deadline = Instant::now() + timeout;
+	let mut seen = Vec::new();
+	let mut missing: Vec<&str> = patterns.to_vec();
+	while Instant::now() < deadline {
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		match rx.recv_timeout(remaining.min(Duration::from_millis(40))) {
+			Ok(line) => {
+				missing.retain(|pattern| !line.contains(pattern));
+				seen.push(line);
+				if missing.is_empty() {
+					return seen;
+				}
+			}
+			Err(RecvTimeoutError::Timeout) => continue,
+			Err(RecvTimeoutError::Disconnected) => break,
+		}
+	}
+	panic!("timed out after {timeout:?} waiting for {missing:?}; saw {seen:?}");
+}
+
+/// Every line the app prints during `window`.
+fn lines_for(rx: &Receiver<String>, window: Duration) -> Vec<String> {
+	let deadline = Instant::now() + window;
+	let mut seen = Vec::new();
+	while Instant::now() < deadline {
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		match rx.recv_timeout(remaining.min(Duration::from_millis(40))) {
+			Ok(line) => seen.push(line),
+			Err(RecvTimeoutError::Timeout) => continue,
+			Err(RecvTimeoutError::Disconnected) => break,
+		}
+	}
+	seen
+}
+
+fn position(lines: &[String], pattern: &str) -> Option<usize> {
+	lines.iter().position(|l| l.contains(pattern))
+}
+
+/// Waits until the app reports the control as no longer drawn.
+fn absent(id: &str) {
+	let deadline = Instant::now() + Duration::from_secs(4);
+	loop {
+		let shown = BOUNDS.with(|slot| {
+			slot.borrow()
+				.as_ref()
+				.is_some_and(|b| b.lock().unwrap().contains_key(id))
+		});
+		if !shown {
+			return;
+		}
+		assert!(Instant::now() < deadline, "control {id} is still drawn");
+		std::thread::sleep(Duration::from_millis(40));
+	}
+}
+
+fn no_git_children(pid: u32) -> bool {
+	descendants(pid).into_iter().all(|child| !git_busy(child))
+}
+
+fn open_workspace(wid: &str, path: &Path) {
+	click(wid, "btn-open-workspace");
+	click(wid, "workspace-path-input");
+	focus(wid);
+	let st = Command::new("xdotool")
+		.args([
+			"type",
+			"--delay",
+			"15",
+			"--window",
+			wid,
+			&path.to_string_lossy(),
+		])
+		.status()
+		.expect("xdotool type");
+	assert!(st.success(), "typing the workspace path failed");
+	click(wid, "btn-workspace-open-confirm");
+}
+
+fn is_drained(line: &str, intent: &str) -> bool {
+	line.contains(&format!("phase=drained intent={intent}"))
+		&& line.contains("jobs=0")
+		&& line.contains("inflight=0")
+		&& line.contains("queued=0")
+		&& line.contains("leaked=0")
+}
+
+fn tree_workspace(git_bin: &Path, root: &Path) -> (PathBuf, PathBuf) {
+	let ws = root.join("ws");
+	let repo = ws.join("repo");
+	init_repo(git_bin, &repo);
+	fs::create_dir_all(repo.join("sub")).unwrap();
+	fs::write(repo.join("sub").join("nested.txt"), "nested\n").unwrap();
+	let dest = root.join("dest");
+	fs::create_dir_all(&dest).unwrap();
+	(ws, dest)
+}
+
+/// A project-tree directory read has no Git child. Close must still wait for
+/// the read itself, and the late result must not reach the reopened workspace.
+#[test]
+fn close_waits_for_a_held_tree_read_and_reopen_ignores_it() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let (ws, dest) = tree_workspace(&git_bin, root.path());
+	let hold = root.path().join("tree-hold");
+	fs::write(&hold, b"hold").unwrap();
+
+	let mut app = spawn_app(SpawnOpts {
+		workspace: &ws,
+		restore: &dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: None,
+		path_prefix: None,
+		tree_hold: Some(&hold),
+	});
+	let wid = find_wid(app.pid);
+	let started = lines_until_all(
+		&app.rx,
+		&[
+			"[APP:READY_REPOS: 1]",
+			"[APP:REPO_LOADED:",
+			"[APP:GRAPH_LOADED:",
+			"[APP:TREE_IO_HELD]",
+		],
+		Duration::from_secs(12),
+	);
+	assert!(
+		position(&started, "[APP:TREE_PAGE:").is_none(),
+		"the held root read was applied before release: {started:?}"
+	);
+	wait_git_idle(app.pid, &app.starttime);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+
+	click(&wid, "btn-workspace-menu");
+	click(&wid, "btn-close-workspace");
+	lines_until(
+		&app.rx,
+		"phase=draining intent=close-workspace",
+		Duration::from_secs(4),
+	);
+	let held = lines_for(&app.rx, Duration::from_millis(1500));
+	assert!(
+		held.iter().all(|l| {
+			!l.contains("phase=drained")
+				&& !l.contains("[APP:WORKSPACE: state=closed")
+		}),
+		"close finished while the tree read was still held: {held:?}"
+	);
+	assert!(hold.is_file(), "the hold file vanished on its own");
+	assert!(
+		no_git_children(app.pid),
+		"a git child was running; this must be the non-Git read"
+	);
+	assert!(
+		same_proc(app.pid, &app.starttime),
+		"close exited the process"
+	);
+
+	fs::remove_file(&hold).unwrap();
+	let closed = lines_until(
+		&app.rx,
+		"[APP:WORKSPACE: state=closed",
+		Duration::from_secs(8),
+	);
+	let discarded = position(&closed, "[APP:TREE_IO_DISCARDED: stale");
+	let drained = closed.iter().position(|l| is_drained(l, "close-workspace"));
+	let closed_at = position(&closed, "[APP:WORKSPACE: state=closed");
+	assert!(
+		discarded.is_some() && drained.is_some(),
+		"close did not wait for the tree read: {closed:?}"
+	);
+	assert!(
+		discarded < drained && drained < closed_at,
+		"drain was reported before the tree read settled: {closed:?}"
+	);
+	assert!(
+		position(&closed, "[APP:TREE_PAGE:").is_none(),
+		"the stale tree read was applied during close: {closed:?}"
+	);
+	let _ = control("workspace-closed");
+
+	// Same path, same process: only the new read may fill the tree.
+	open_workspace(&wid, &ws);
+	let opened = lines_until_all(
+		&app.rx,
+		&[
+			"[APP:WORKSPACE: state=open path=",
+			"[APP:READY_REPOS: 1]",
+			"[APP:TREE_PAGE:",
+		],
+		Duration::from_secs(12),
+	);
+	let open_at = position(&opened, "[APP:WORKSPACE: state=open path=");
+	let page_at = position(&opened, "[APP:TREE_PAGE:");
+	assert!(
+		open_at < page_at,
+		"a tree page arrived before the workspace reopened: {opened:?}"
+	);
+	assert!(
+		position(&opened, "[APP:TREE_IO_DISCARDED:").is_none(),
+		"the reopened workspace discarded its own read: {opened:?}"
+	);
+	assert!(
+		same_proc(app.pid, &app.starttime),
+		"reopen changed the process"
+	);
+
+	request_wm_delete(&wid);
+	lines_until(&app.rx, "[APP:QUIT: deferred]", Duration::from_secs(6));
+	let status = wait_exit(&mut app, Duration::from_secs(8));
+	assert!(status.success(), "window close exited uncleanly: {status}");
+	assert!(!same_proc(app.pid, &app.starttime));
+}
+
+#[test]
+fn quit_waits_for_a_held_tree_read() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let (ws, dest) = tree_workspace(&git_bin, root.path());
+	let hold = root.path().join("tree-hold");
+	fs::write(&hold, b"hold").unwrap();
+
+	let mut app = spawn_app(SpawnOpts {
+		workspace: &ws,
+		restore: &dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: None,
+		path_prefix: None,
+		tree_hold: Some(&hold),
+	});
+	let wid = find_wid(app.pid);
+	lines_until_all(
+		&app.rx,
+		&[
+			"[APP:READY_REPOS: 1]",
+			"[APP:REPO_LOADED:",
+			"[APP:GRAPH_LOADED:",
+			"[APP:TREE_IO_HELD]",
+		],
+		Duration::from_secs(12),
+	);
+	wait_git_idle(app.pid, &app.starttime);
+
+	key(&wid, "ctrl+q");
+	lines_until(&app.rx, "[APP:QUIT: deferred]", Duration::from_secs(4));
+	let held = lines_for(&app.rx, Duration::from_millis(1500));
+	assert!(
+		held.iter().all(|l| !l.contains("phase=drained")),
+		"quit drained while the tree read was still held: {held:?}"
+	);
+	assert!(
+		same_proc(app.pid, &app.starttime),
+		"quit exited while the tree read was still held"
+	);
+	assert!(
+		no_git_children(app.pid),
+		"a git child was running; this must be the non-Git read"
+	);
+
+	fs::remove_file(&hold).unwrap();
+	let status = wait_exit(&mut app, Duration::from_secs(8));
+	assert!(status.success(), "quit status {status}");
+	assert!(!same_proc(app.pid, &app.starttime));
+	let mut lines = held;
+	while let Ok(line) = app.rx.try_recv() {
+		lines.push(line);
+	}
+	assert!(
+		lines.iter().any(|l| is_drained(l, "quit")),
+		"missing drained evidence: {lines:?}"
+	);
+	assert!(
+		position(&lines, "[APP:TREE_PAGE:").is_none(),
+		"the stale tree read was applied during quit: {lines:?}"
+	);
+}
+
+fn head_short(git_bin: &Path, repo: &Path) -> String {
+	let out = Command::new(git_bin)
+		.args(["rev-parse", "--short=7", "HEAD"])
+		.current_dir(repo)
+		.output()
+		.expect("git rev-parse");
+	assert!(out.status.success(), "rev-parse HEAD failed");
+	String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn wait_gone(pid: u32, start: &str, what: &str) {
+	let deadline = Instant::now() + Duration::from_secs(6);
+	while same_proc(pid, start) {
+		assert!(
+			Instant::now() < deadline,
+			"{what} {pid} survived: {}",
+			cmdline(pid)
+		);
+		std::thread::sleep(Duration::from_millis(30));
+	}
+}
+
+struct CopyFixture {
+	_root: tempfile::TempDir,
+	ws: PathBuf,
+	repo: PathBuf,
+	dest: PathBuf,
+	hold: PathBuf,
+	wrap_dir: PathBuf,
+	git_bin: PathBuf,
+}
+
+fn copy_fixture() -> CopyFixture {
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let ws = root.path().join("ws");
+	let repo = ws.join("repo");
+	let dest = root.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+	init_repo(&git_bin, &repo);
+	fs::write(repo.join("note.txt"), "copy-bytes\n").unwrap();
+	let wrap = root.path().join("bin").join("git");
+	hold_all_git_wrapper(&git_bin, &wrap);
+	CopyFixture {
+		ws,
+		repo,
+		dest,
+		hold: root.path().join("hold"),
+		wrap_dir: wrap.parent().unwrap().to_path_buf(),
+		git_bin,
+		_root: root,
+	}
+}
+
+fn spawn_copy_app(fx: &CopyFixture) -> (App, String) {
+	let app = spawn_app(SpawnOpts {
+		workspace: &fx.ws,
+		restore: &fx.dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: Some(&fx.hold),
+		path_prefix: Some(&fx.wrap_dir),
+		tree_hold: None,
+	});
+	let wid = find_wid(app.pid);
+	lines_until_all(
+		&app.rx,
+		&[
+			"[APP:READY_REPOS: 1]",
+			"[APP:REPO_LOADED:",
+			"[APP:GRAPH_LOADED:",
+			"[APP:PREVIEW_LOADED:",
+		],
+		Duration::from_secs(12),
+	);
+	wait_git_idle(app.pid, &app.starttime);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	(app, wid)
+}
+
+/// Starts a copy that blocks inside its first Git child and returns the child.
+fn start_held_copy(
+	app: &mut App,
+	wid: &str,
+	fx: &CopyFixture,
+	button: &str,
+	prep: &str,
+	done: &str,
+) -> (u32, String) {
+	fs::write(&fx.hold, b"hold").unwrap();
+	assert!(
+		no_git_children(app.pid),
+		"a git child existed before the copy; that would not prove the copy token"
+	);
+	click(wid, button);
+	let lines = lines_until(&app.rx, prep, Duration::from_secs(4));
+	assert!(
+		position(&lines, done).is_none(),
+		"copy finished before its git child was observed: {lines:?}"
+	);
+	let child = wait_copy_git(app.pid, &app.starttime);
+	app.tracked.push(child.clone());
+	assert!(
+		same_proc(child.0, &child.1),
+		"copy git exited before cancel"
+	);
+	child
+}
+
+/// Clicks the cancel button of a held copy and checks nothing was published.
+fn cancel_held_copy(
+	app: &App,
+	wid: &str,
+	fx: &CopyFixture,
+	child: &(u32, String),
+	done: &str,
+	sentinel: &str,
+) {
+	click(wid, "btn-copy-cancel");
+	let lines = lines_until(
+		&app.rx,
+		"[APP:COPY_DISCARDED: cancelled]",
+		Duration::from_secs(8),
+	);
+	assert!(
+		position(&lines, "[APP:COPY_CANCEL]").is_some(),
+		"the cancel button did not reach the model: {lines:?}"
+	);
+	assert!(
+		position(&lines, done).is_none(),
+		"cancelled copy still reported done: {lines:?}"
+	);
+	assert!(
+		fx.hold.is_file(),
+		"hold file was removed; the child could have finished instead of being cancelled"
+	);
+	wait_gone(child.0, &child.1, "cancelled git child");
+	wait_git_idle(app.pid, &app.starttime);
+	absent("btn-copy-cancel");
+	assert_eq!(clip_get(), sentinel, "clipboard changed after cancel");
+	assert!(same_proc(app.pid, &app.starttime), "cancel exited the app");
+}
+
+/// The cancel button itself, for a file copy and then a commit copy.
+#[test]
+fn copy_cancel_button_stops_file_and_commit_copy() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = copy_fixture();
+	let (mut app, wid) = spawn_copy_app(&fx);
+
+	let sentinel = "CLIP-SENTINEL-copy-button-file";
+	clip_set(sentinel);
+	click(&wid, "change-chk:note.txt");
+	lines_until(&app.rx, "[APP:FILE_TOGGLED:", Duration::from_secs(4));
+	let child = start_held_copy(
+		&mut app,
+		&wid,
+		&fx,
+		"btn-copy",
+		"[APP:COPY_PREP:",
+		"[APP:COPY_DONE:",
+	);
+	cancel_held_copy(&app, &wid, &fx, &child, "[APP:COPY_DONE:", sentinel);
+
+	// Busy is cleared: the same copy runs to the end once Git is released.
+	fs::remove_file(&fx.hold).unwrap();
+	click(&wid, "btn-copy");
+	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(8));
+	let copied = clip_get();
+	assert!(
+		copied.contains("note.txt") && copied.contains("copy-bytes"),
+		"the copy after cancel did not publish the file: {copied:?}"
+	);
+	wait_git_idle(app.pid, &app.starttime);
+
+	let sentinel = "CLIP-SENTINEL-copy-button-commit";
+	clip_set(sentinel);
+	let sha = head_short(&fx.git_bin, &fx.repo);
+	click(&wid, &format!("commit-row:{sha}"));
+	lines_until(&app.rx, "[APP:COMMIT_SELECTED:", Duration::from_secs(4));
+	lines_until(
+		&app.rx,
+		"[APP:E2E_PREVIEW: source=commit_diff",
+		Duration::from_secs(8),
+	);
+	wait_git_idle(app.pid, &app.starttime);
+	let child = start_held_copy(
+		&mut app,
+		&wid,
+		&fx,
+		"btn-copy-commits",
+		"[APP:COPY_COMMITS_PREP:",
+		"[APP:COPY_COMMITS_DONE:",
+	);
+	cancel_held_copy(
+		&app,
+		&wid,
+		&fx,
+		&child,
+		"[APP:COPY_COMMITS_DONE:",
+		sentinel,
+	);
+
+	fs::remove_file(&fx.hold).unwrap();
+	click(&wid, "btn-copy-commits");
+	lines_until(&app.rx, "[APP:COPY_COMMITS_DONE:", Duration::from_secs(8));
+	assert_ne!(
+		clip_get(),
+		sentinel,
+		"the commit copy after cancel did not publish"
+	);
+
+	request_wm_delete(&wid);
+	lines_until(&app.rx, "[APP:QUIT: deferred]", Duration::from_secs(6));
+	let status = wait_exit(&mut app, Duration::from_secs(8));
+	assert!(status.success(), "window close exited uncleanly: {status}");
+	assert!(
+		descendants(app.pid).is_empty(),
+		"owned children survived quit"
+	);
+}
+
+/// Quit shares the copy token with close, and a commit copy shares it with a
+/// file copy.
+#[test]
+fn quit_cancels_in_flight_commit_copy_without_writing_clipboard() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = copy_fixture();
+	let (mut app, wid) = spawn_copy_app(&fx);
+
+	let sentinel = "CLIP-SENTINEL-quit-commit-copy";
+	clip_set(sentinel);
+	let sha = head_short(&fx.git_bin, &fx.repo);
+	click(&wid, &format!("commit-row:{sha}"));
+	lines_until(&app.rx, "[APP:COMMIT_SELECTED:", Duration::from_secs(4));
+	lines_until(
+		&app.rx,
+		"[APP:E2E_PREVIEW: source=commit_diff",
+		Duration::from_secs(8),
+	);
+	wait_git_idle(app.pid, &app.starttime);
+	let child = start_held_copy(
+		&mut app,
+		&wid,
+		&fx,
+		"btn-copy-commits",
+		"[APP:COPY_COMMITS_PREP:",
+		"[APP:COPY_COMMITS_DONE:",
+	);
+
+	key(&wid, "ctrl+q");
+	let status = wait_exit(&mut app, Duration::from_secs(10));
+	assert!(status.success(), "quit status {status}");
+	assert!(
+		fx.hold.is_file(),
+		"hold file was removed; the child could have finished instead of being cancelled"
+	);
+	assert!(
+		!same_proc(child.0, &child.1),
+		"git child survived quit: {}",
+		cmdline(child.0)
+	);
+	let mut lines = Vec::new();
+	while let Ok(line) = app.rx.try_recv() {
+		lines.push(line);
+	}
+	assert!(
+		position(&lines, "[APP:QUIT: deferred]").is_some(),
+		"missing deferred quit: {lines:?}"
+	);
+	assert!(
+		position(&lines, "[APP:COPY_DISCARDED:").is_some(),
+		"quit did not discard the in-flight commit copy: {lines:?}"
+	);
+	assert!(
+		position(&lines, "[APP:COPY_COMMITS_DONE:").is_none(),
+		"cancelled commit copy still reported done: {lines:?}"
+	);
+	assert!(
+		lines.iter().any(|l| is_drained(l, "quit")),
+		"missing drained evidence: {lines:?}"
+	);
+	assert_eq!(clip_get(), sentinel, "clipboard changed after quit");
+}
+
+/// A confirmed write is never interrupted: switching workspace is refused
+/// with a reason until the write has finished and reported its result.
+#[test]
+fn open_workspace_is_refused_while_apply_writes() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let ws_a = root.path().join("ws-a");
+	let ws_b = root.path().join("ws-b");
+	let dest = root.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+	init_repo(&git_bin, &ws_a.join("repo-a"));
+	init_repo(&git_bin, &ws_b.join("repo-b"));
+	fs::write(ws_a.join("repo-a").join("note.txt"), "apply-bytes\n").unwrap();
+
+	let mut app = spawn_app(SpawnOpts {
+		workspace: &ws_a,
+		restore: &dest,
+		read_delay_ms: None,
+		apply_delay_ms: Some(6000),
+		hold_file: None,
+		path_prefix: None,
+		tree_hold: None,
+	});
+	let wid = find_wid(app.pid);
+	lines_until_all(
+		&app.rx,
+		&[
+			"[APP:READY_REPOS: 1]",
+			"[APP:REPO_LOADED:",
+			"[APP:PREVIEW_LOADED:",
+		],
+		Duration::from_secs(12),
+	);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+
+	click(&wid, "change-chk:note.txt");
+	lines_until(&app.rx, "[APP:FILE_TOGGLED:", Duration::from_secs(4));
+	click(&wid, "btn-copy");
+	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(8));
+	click(&wid, "btn-paste");
+	lines_until(&app.rx, "[APP:PASTE_PREVIEW:", Duration::from_secs(6));
+	click(&wid, "btn-apply");
+	lines_until(&app.rx, "[APP:PASTE_APPLYING]", Duration::from_secs(4));
+
+	click(&wid, "btn-workspace-menu");
+	open_workspace(&wid, &ws_b);
+	let refused = lines_until(
+		&app.rx,
+		"phase=refused intent=open-workspace reason=applying",
+		Duration::from_secs(5),
+	);
+	assert!(
+		position(&refused, "[APP:PASTE_DONE:").is_none(),
+		"the write had already finished; the refusal proves nothing: {refused:?}"
+	);
+	assert!(
+		position(&refused, "[APP:PASTE_BUSY: refused=open-workspace]")
+			.is_some(),
+		"the refusal carried no reason: {refused:?}"
+	);
+
+	let done =
+		lines_until(&app.rx, "[APP:PASTE_DONE:", Duration::from_secs(10));
+	assert!(
+		done.iter().chain(&refused).all(|l| {
+			!l.contains("[APP:WORKSPACE: state=")
+				&& !l.contains("phase=draining")
+		}),
+		"the workspace changed during a confirmed write: {refused:?} {done:?}"
+	);
+	assert_eq!(
+		fs::read(dest.join("note.txt")).expect("apply wrote note.txt"),
+		b"apply-bytes",
+		"wire format drops the trailing newline"
+	);
+	assert!(same_proc(app.pid, &app.starttime));
+
+	request_wm_delete(&wid);
+	lines_until(&app.rx, "[APP:QUIT: deferred]", Duration::from_secs(6));
+	let status = wait_exit(&mut app, Duration::from_secs(8));
+	assert!(status.success(), "window close exited uncleanly: {status}");
 }
 
 fn request_wm_delete(wid: &str) {
