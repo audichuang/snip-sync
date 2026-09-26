@@ -1568,7 +1568,11 @@ fn pump(
 // ---------------------------------------------------------------------------
 
 /// A [`ManagedChild`] whose stdout is read as a `BufRead` with a per-request
-/// deadline. Timeouts surface as `TimedOut`, cancellation as `Interrupted`.
+/// deadline. Timeouts surface as `TimedOut`. Cancellation is not
+/// `Interrupted`: `read_exact` / `read_until` retry that forever, so a
+/// cancelled read would spin and never reap the child. The reader stops the
+/// process tree first and returns a non-retryable error; [`Session::error`]
+/// maps it back to [`GitError::Cancelled`].
 pub(crate) struct Session {
 	proc: ManagedChild,
 	opts: RunOptions,
@@ -1606,6 +1610,13 @@ impl Session {
 
 	/// Maps an io error raised by this reader back to the Git error.
 	pub(crate) fn error(&self, e: io::Error) -> GitError {
+		// Checked first: a cancelled read is reported as `Other` so std::io
+		// does not retry it, and cleanup may already have dropped the child.
+		if self.opts.cancelled() {
+			return GitError::Cancelled {
+				args: self.proc.args.clone(),
+			};
+		}
 		match e.kind() {
 			io::ErrorKind::TimedOut => GitError::Timeout {
 				args: self.proc.args.clone(),
@@ -1652,7 +1663,10 @@ impl BufRead for Session {
 				return Ok(&[]);
 			}
 			if self.opts.cancelled() {
-				return Err(io::ErrorKind::Interrupted.into());
+				// Reap before returning. Drop would also finish, but only if
+				// this error is allowed to propagate; Interrupted would not.
+				let _ = self.proc.finish();
+				return Err(io::Error::other("cancelled"));
 			}
 			let now = Instant::now();
 			if now >= self.deadline {

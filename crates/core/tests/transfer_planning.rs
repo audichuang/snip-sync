@@ -2556,6 +2556,7 @@ fn skipped_non_utf8_replay_target_becomes_stale_when_it_turns_writable() {
 	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head);
 }
 
+#[cfg(unix)]
 #[test]
 fn unsafe_symlink_replay_parent_is_not_followed_and_becomes_stale() {
 	let repo = TestRepo::new("skip-link");

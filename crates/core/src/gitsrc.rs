@@ -17,7 +17,7 @@ use crate::format::{
 	PayloadFile,
 };
 use crate::fsutil::{decode_utf8_or_skip, read_text_file};
-use crate::gitrun::{self, RunOptions, RunOutput};
+use crate::gitrun::{self, CancelToken, RunOptions, RunOutput};
 use crate::paths::{source_root_name, to_clipboard_path_from_roots};
 use crate::settings::Settings;
 
@@ -119,28 +119,60 @@ fn is_quiet_miss(e: &GitError) -> bool {
 	matches!(e, GitError::Failed { code: Some(1), stderr, .. } if stderr.is_empty())
 }
 
+fn already_cancelled(opts: &RunOptions, args: &str) -> Result<(), GitError> {
+	if opts.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+		return Err(GitError::Cancelled {
+			args: args.to_string(),
+		});
+	}
+	Ok(())
+}
+
 impl Git {
 	/// Checks that git is installed, then resolves the repository top level
 	/// containing `dir`.
 	pub fn open(dir: &Path) -> Result<Self, GitError> {
+		Self::open_with(dir, &RunOptions::default())
+	}
+
+	/// [`Git::open`] with explicit limits, deadline and cancellation.
+	///
+	/// Both `git --version` and `rev-parse --show-toplevel` use `opts`.
+	/// A truncated read is [`GitError::OutputLimit`], not a partial root.
+	/// A directory outside a repository is still [`GitError::NotARepository`].
+	pub fn open_with(dir: &Path, opts: &RunOptions) -> Result<Self, GitError> {
+		already_cancelled(opts, "--version")?;
 		let mut version = git_command();
 		version.arg("--version");
-		gitrun::run(version, "--version", None, &RunOptions::default())?;
+		let version = gitrun::run(version, "--version", None, opts)?;
+		if version.truncated {
+			return Err(GitError::OutputLimit {
+				args: "--version".into(),
+				limit: opts.max_stdout,
+			});
+		}
 		let probe = Self {
 			root: dir.to_path_buf(),
 		};
-		let out = probe.run(&["rev-parse", "--show-toplevel"]).map_err(
-			|e| match e {
+		already_cancelled(opts, "rev-parse --show-toplevel")?;
+		let out = probe
+			.run_with(&["rev-parse", "--show-toplevel"], opts)
+			.map_err(|e| match e {
 				GitError::Failed { ref stderr, .. }
 					if stderr.contains("not a git repository") =>
 				{
 					GitError::NotARepository(dir.to_path_buf())
 				}
 				e => e,
-			},
-		)?;
+			})?;
+		if out.truncated {
+			return Err(GitError::OutputLimit {
+				args: "rev-parse --show-toplevel".into(),
+				limit: opts.max_stdout,
+			});
+		}
 		// Exactly one terminating newline: a path may end in another.
-		let top = out.strip_suffix(b"\n").ok_or_else(|| {
+		let top = out.stdout.strip_suffix(b"\n").ok_or_else(|| {
 			GitError::Malformed("rev-parse --show-toplevel output".into())
 		})?;
 		Ok(Self {
@@ -269,11 +301,30 @@ impl Git {
 	}
 
 	/// The symbolic ref HEAD points at, `None` when detached.
+	/// An unborn branch still returns its symbolic name.
 	pub fn head_ref(&self) -> Result<Option<String>, GitError> {
-		match self.run(&["symbolic-ref", "--quiet", "HEAD"]) {
-			Ok(out) => {
-				Ok(Some(String::from_utf8_lossy(&out).trim().to_string()))
-			}
+		self.head_ref_with(&RunOptions::default())
+	}
+
+	/// [`Git::head_ref`] under explicit runner options.
+	///
+	/// `symbolic-ref --quiet HEAD` uses `opts`. A quiet miss (detached HEAD)
+	/// is still `Ok(None)`. Any other failure, including a truncated name,
+	/// is returned as itself rather than a shortened ref.
+	pub fn head_ref_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<Option<String>, GitError> {
+		const ARGS: &str = "symbolic-ref --quiet HEAD";
+		already_cancelled(opts, ARGS)?;
+		match self.run_with(&["symbolic-ref", "--quiet", "HEAD"], opts) {
+			Ok(out) if out.truncated => Err(GitError::OutputLimit {
+				args: ARGS.into(),
+				limit: opts.max_stdout,
+			}),
+			Ok(out) => Ok(Some(
+				String::from_utf8_lossy(&out.stdout).trim().to_string(),
+			)),
 			Err(e) if is_quiet_miss(&e) => Ok(None),
 			Err(e) => Err(e),
 		}
@@ -281,8 +332,26 @@ impl Git {
 
 	/// The parents of `sha`, in order (empty for a root or grafted commit).
 	pub fn parents(&self, sha: &str) -> Result<Vec<String>, GitError> {
-		let out = self.run(&["rev-list", "--parents", "-n", "1", sha])?;
-		Ok(String::from_utf8_lossy(&out)
+		self.parents_with(sha, &RunOptions::default())
+	}
+
+	/// [`Git::parents`] under explicit runner options. A truncated listing is
+	/// [`GitError::OutputLimit`], not a shorter parent list.
+	pub fn parents_with(
+		&self,
+		sha: &str,
+		opts: &RunOptions,
+	) -> Result<Vec<String>, GitError> {
+		let label = format!("rev-list --parents -n 1 {sha}");
+		let out =
+			self.run_with(&["rev-list", "--parents", "-n", "1", sha], opts)?;
+		if out.truncated {
+			return Err(GitError::OutputLimit {
+				args: label,
+				limit: opts.max_stdout,
+			});
+		}
+		Ok(String::from_utf8_lossy(&out.stdout)
 			.split_ascii_whitespace()
 			.skip(1)
 			.map(str::to_string)
@@ -290,8 +359,20 @@ impl Git {
 	}
 
 	pub fn is_shallow(&self) -> Result<bool, GitError> {
-		let out = self.run(&["rev-parse", "--is-shallow-repository"])?;
-		Ok(out.trim_ascii() == b"true")
+		self.is_shallow_with(&RunOptions::default())
+	}
+
+	/// [`Git::is_shallow`] under explicit runner options.
+	pub fn is_shallow_with(&self, opts: &RunOptions) -> Result<bool, GitError> {
+		let out =
+			self.run_with(&["rev-parse", "--is-shallow-repository"], opts)?;
+		if out.truncated {
+			return Err(GitError::OutputLimit {
+				args: "rev-parse --is-shallow-repository".into(),
+				limit: opts.max_stdout,
+			});
+		}
+		Ok(out.stdout.trim_ascii() == b"true")
 	}
 
 	/// Starts a long-lived `git cat-file --batch`. It holds one budget slot
@@ -325,17 +406,34 @@ pub struct RawEntry {
 	pub path: Vec<u8>,
 }
 
-/// Parses `--raw -z` output at the byte level (paths may not be UTF-8):
-/// `:<om> <nm> <ooid> <noid> <S>[score]\0<path>\0`, with two paths for
-/// renames and copies.
-pub fn parse_raw_z(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
-	let bad = || GitError::Malformed("raw diff record".into());
-	let mut fields = out.split(|&b| b == 0);
-	let mut entries = Vec::new();
-	while let Some(header) = fields.next() {
-		if header.is_empty() {
-			continue;
+fn is_nul(b: &u8) -> bool {
+	*b == 0
+}
+
+/// One-pass reader for [`parse_raw_z`]. Callers that must stop before the
+/// end of a diff (a budget, a cancel) use this instead of collecting every
+/// record first. Field splitting matches `split(0)`, including a trailing
+/// empty field.
+pub(crate) struct RawZ<'a> {
+	fields: std::slice::Split<'a, u8, fn(&u8) -> bool>,
+}
+
+impl<'a> RawZ<'a> {
+	pub(crate) fn new(out: &'a [u8]) -> Self {
+		Self {
+			fields: out.split(is_nul),
 		}
+	}
+
+	pub(crate) fn next_entry(&mut self) -> Result<Option<RawEntry>, GitError> {
+		let bad = || GitError::Malformed("raw diff record".into());
+		let header = loop {
+			match self.fields.next() {
+				None => return Ok(None),
+				Some([]) => continue,
+				Some(header) => break header,
+			}
+		};
 		let header =
 			std::str::from_utf8(header.strip_prefix(b":").ok_or_else(bad)?)
 				.map_err(|_| bad())?;
@@ -344,13 +442,13 @@ pub fn parse_raw_z(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
 			return Err(bad());
 		};
 		let status = *status.as_bytes().first().ok_or_else(bad)?;
-		let first = fields.next().ok_or_else(bad)?.to_vec();
+		let first = self.fields.next().ok_or_else(bad)?.to_vec();
 		let (old_path, path) = if matches!(status, b'R' | b'C') {
-			(Some(first), fields.next().ok_or_else(bad)?.to_vec())
+			(Some(first), self.fields.next().ok_or_else(bad)?.to_vec())
 		} else {
 			(None, first)
 		};
-		entries.push(RawEntry {
+		Ok(Some(RawEntry {
 			status,
 			old_mode: old_mode.to_string(),
 			new_mode: new_mode.to_string(),
@@ -358,7 +456,18 @@ pub fn parse_raw_z(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
 			new_oid: new_oid.to_string(),
 			old_path,
 			path,
-		});
+		}))
+	}
+}
+
+/// Parses `--raw -z` output at the byte level (paths may not be UTF-8):
+/// `:<om> <nm> <ooid> <noid> <S>[score]\0<path>\0`, with two paths for
+/// renames and copies.
+pub fn parse_raw_z(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
+	let mut records = RawZ::new(out);
+	let mut entries = Vec::new();
+	while let Some(entry) = records.next_entry()? {
+		entries.push(entry);
 	}
 	Ok(entries)
 }
@@ -450,10 +559,131 @@ impl CatFile {
 		Ok(CatObject::Found { oid, kind, body })
 	}
 
+	/// Reads a blob, retaining its body only when `size <= max_retain`.
+	///
+	/// A larger body is scanned and discarded: a NUL is [`SkippedBlob::Binary`],
+	/// invalid UTF-8 is [`SkippedBlob::NotUtf8`], and valid UTF-8 is
+	/// [`SkippedBlob::TextLargerThanCap`]. The batch stays in sync either way.
+	/// `max_retain` is a raw-byte cap, not a JSON cap; callers that need the
+	/// escaped size check that after a retained body comes back.
+	pub(crate) fn read_blob_capped(
+		&mut self,
+		object: &str,
+		max_retain: u64,
+	) -> Result<CappedBlob, GitError> {
+		if object.contains(['\n', '\r']) {
+			return Ok(CappedBlob::Missing);
+		}
+		self.request(object)?;
+		let s = &mut self.session;
+		let header = read_batch_header(s).map_err(|e| s.error(e))?;
+		let Some((_oid, _kind, size)) = header else {
+			return Ok(CappedBlob::Missing);
+		};
+		if size <= max_retain {
+			let body = read_batch_body(s, size).map_err(|e| s.error(e))?;
+			return Ok(CappedBlob::Retained(body));
+		}
+		let class = scan_discarded_body(s, size).map_err(|e| s.error(e))?;
+		Ok(CappedBlob::Skipped(class))
+	}
+
 	/// Ends the batch and reports any cleanup failure. Dropping a
 	/// `CatFile` kills the process instead.
 	pub fn close(self) -> Result<(), GitError> {
 		self.session.close()
+	}
+}
+
+/// A blob read by [`CatFile::read_blob_capped`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CappedBlob {
+	Missing,
+	/// `size <= max_retain`. The caller still applies NUL / UTF-8 rules.
+	Retained(Vec<u8>),
+	/// Body was not stored.
+	Skipped(SkippedBlob),
+}
+
+/// Why [`CappedBlob::Skipped`] did not keep the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkippedBlob {
+	/// A NUL byte. Same rule as `content.contains(&0)` on a retained body.
+	Binary,
+	NotUtf8,
+	/// Valid UTF-8 whose raw size is above the retain cap.
+	TextLargerThanCap {
+		size: u64,
+	},
+}
+
+/// Consumes a cat-file body of `size` bytes plus its trailing LF without
+/// storing it. NUL wins over invalid UTF-8, matching a full-buffer check.
+fn scan_discarded_body<R: BufRead>(
+	reader: &mut R,
+	size: u64,
+) -> io::Result<SkippedBlob> {
+	let mut left = size;
+	let mut saw_nul = false;
+	let mut invalid = false;
+	let mut carry = Vec::new();
+	let mut buf = [0u8; 8192];
+	while left > 0 {
+		let n = usize::try_from(left.min(buf.len() as u64))
+			.map_err(io::Error::other)?;
+		reader.read_exact(&mut buf[..n])?;
+		left -= n as u64;
+		if !saw_nul && buf[..n].contains(&0) {
+			saw_nul = true;
+		}
+		if !saw_nul
+			&& !invalid
+			&& utf8_chunk_invalid(&mut carry, &buf[..n], left == 0)
+		{
+			invalid = true;
+		}
+	}
+	let mut lf = [0u8; 1];
+	reader.read_exact(&mut lf)?;
+	if saw_nul {
+		Ok(SkippedBlob::Binary)
+	} else if invalid {
+		Ok(SkippedBlob::NotUtf8)
+	} else {
+		Ok(SkippedBlob::TextLargerThanCap { size })
+	}
+}
+
+/// `true` when `carry` + `chunk` is not valid UTF-8. An incomplete sequence
+/// at the end is kept in `carry` (at most 3 bytes) unless this is the last
+/// chunk, in which case it is invalid. A chunk is at most 8 KiB; the object
+/// body is not assembled.
+fn utf8_chunk_invalid(carry: &mut Vec<u8>, chunk: &[u8], eof: bool) -> bool {
+	if carry.is_empty() {
+		return match std::str::from_utf8(chunk) {
+			Ok(_) => false,
+			Err(e) => match e.error_len() {
+				Some(_) => true,
+				None => {
+					carry.extend_from_slice(&chunk[e.valid_up_to()..]);
+					eof
+				}
+			},
+		};
+	}
+	let mut tmp = Vec::with_capacity(carry.len() + chunk.len());
+	tmp.extend_from_slice(carry);
+	tmp.extend_from_slice(chunk);
+	carry.clear();
+	match std::str::from_utf8(&tmp) {
+		Ok(_) => false,
+		Err(e) => match e.error_len() {
+			Some(_) => true,
+			None => {
+				carry.extend_from_slice(&tmp[e.valid_up_to()..]);
+				eof
+			}
+		},
 	}
 }
 
@@ -1170,6 +1400,74 @@ mod tests {
 		);
 		assert_eq!(cat.read("HEAD:nope.txt").unwrap(), None);
 		assert_eq!(cat.read("HEAD:a.txt").unwrap().map(|b| b.len()), Some(11));
+	}
+
+	#[test]
+	fn discarded_body_scan_matches_full_buffer_classification() {
+		let mut split = vec![b'a'; 8191];
+		split.extend_from_slice("你".as_bytes());
+		assert_eq!(
+			classify_discarded(&split),
+			SkippedBlob::TextLargerThanCap {
+				size: split.len() as u64
+			}
+		);
+		let mut broken = vec![b'a'; 8191];
+		broken.push(0xE4);
+		broken.push(b' ');
+		assert_eq!(classify_discarded(&broken), SkippedBlob::NotUtf8);
+		let mut binary = vec![b'a'; 9000];
+		binary.push(0);
+		assert_eq!(classify_discarded(&binary), SkippedBlob::Binary);
+	}
+
+	fn classify_discarded(body: &[u8]) -> SkippedBlob {
+		let mut raw = body.to_vec();
+		raw.push(b'\n');
+		scan_discarded_body(&mut std::io::Cursor::new(raw), body.len() as u64)
+			.unwrap()
+	}
+
+	#[test]
+	fn capped_blob_does_not_keep_an_oversize_body_and_stays_in_sync() {
+		let r = Repo::new();
+		let big = "你".repeat(12_000);
+		r.write("big.txt", big.as_bytes());
+		r.write("late.bin", &{
+			let mut v = vec![b'B'; 20_000];
+			v.push(0);
+			v
+		});
+		r.write("bad.txt", &{
+			let v = vec![0xFF; 10_000];
+			v
+		});
+		r.write("small.txt", b"small\n");
+		r.commit("blobs");
+		let git = Git::open(&r.path()).unwrap();
+		let big_oid = git.run(&["rev-parse", "HEAD:big.txt"]).unwrap();
+		let big_oid = String::from_utf8(big_oid).unwrap();
+		let big_oid = big_oid.trim();
+		let mut cat = git.cat_file().unwrap();
+		match cat.read_blob_capped(big_oid, 64).unwrap() {
+			CappedBlob::Skipped(SkippedBlob::TextLargerThanCap { size }) => {
+				assert_eq!(size, big.len() as u64);
+			}
+			other => panic!("{other:?}"),
+		}
+		match cat.read_blob_capped("HEAD:late.bin", 32).unwrap() {
+			CappedBlob::Skipped(SkippedBlob::Binary) => {}
+			other => panic!("{other:?}"),
+		}
+		match cat.read_blob_capped("HEAD:bad.txt", 32).unwrap() {
+			CappedBlob::Skipped(SkippedBlob::NotUtf8) => {}
+			other => panic!("{other:?}"),
+		}
+		match cat.read_blob_capped("HEAD:small.txt", 64).unwrap() {
+			CappedBlob::Retained(body) => assert_eq!(body, b"small\n"),
+			other => panic!("{other:?}"),
+		}
+		cat.close().unwrap();
 	}
 
 	// ---- gitCopy.test.ts ----
