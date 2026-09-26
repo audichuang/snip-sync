@@ -165,6 +165,17 @@ impl TextInput {
 		self.placeholder = p.into();
 	}
 
+	/// Drops the retained text without emitting [`InputEvent::Changed`].
+	pub fn clear_retained(&mut self) {
+		self.content = SharedString::default();
+		self.selected_range = 0..0;
+		self.selection_reversed = false;
+		self.marked_range = None;
+		self.last_layout = None;
+		self.last_bounds = None;
+		self.is_selecting = false;
+	}
+
 	pub const MAX_INPUT_CHARS: usize = 1024;
 	pub const MAX_TOTAL_CHARS: usize = 4096;
 	/// Frames to republish the caret after it moves. The XIM connection is
@@ -1023,6 +1034,19 @@ impl Focusable for TextInput {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn clear_retained_drops_text_without_touching_placeholder() {
+		let mut input = TextInput::new_for_test("workspace/repo");
+		input.placeholder = "路徑".into();
+		input.marked_range = Some(0..4);
+		input.clear_retained();
+		assert_eq!(input.text(), "");
+		assert_eq!(input.selected_range, 0..0);
+		assert!(input.marked_range.is_none());
+		assert!(input.last_layout.is_none());
+		assert_eq!(input.placeholder.as_ref(), "路徑");
+	}
 
 	#[test]
 	fn test_utf16_range_in_str_ascii_and_cjk_and_surrogate() {

@@ -539,6 +539,9 @@ impl WorkbenchModel {
 	}
 
 	pub fn load_history(&mut self, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		let Some(repo_root) = self.repo_root() else {
 			return;
 		};
@@ -559,16 +562,16 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let cancel_bg = cancel.clone();
 
-		cx.foreground_executor()
-			.spawn(async move {
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel),
+			async move {
 				let res = bg
 					.spawn(async move {
-						let git =
-							Git::open(&repo_root).map_err(|e| e.to_string())?;
-						let opts = RunOptions {
-							cancel: Some(cancel_bg),
-							..RunOptions::interactive(None)
-						};
+						let opts = crate::interactive_read_opts(cancel_bg);
+						let git = Git::open_with(&repo_root, &opts)
+							.map_err(|e| e.to_string())?;
 						match &search {
 							Some(LogSearch {
 								query,
@@ -698,8 +701,8 @@ impl WorkbenchModel {
 						}
 						cx.notify();
 					});
-			})
-			.detach();
+			},
+		);
 	}
 
 	/// Recomputes the displayed layout for the collapsed merges on this page.
@@ -941,24 +944,31 @@ impl WorkbenchModel {
 		task_generation: u64,
 		cx: &mut Context<Self>,
 	) {
+		if !self.accepting_work() {
+			return;
+		}
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		cx.foreground_executor()
-			.spawn(async move {
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
 				let res = bg
 					.spawn(async move {
-						let git =
-							Git::open(&root).map_err(|e| e.to_string())?;
-						let files = gitsrc::list_changed_paths(&git, &source)
-							.map_err(|e| e.to_string())?;
 						let opts = RunOptions {
 							cancel: Some(cancel),
 							max_stdout: browser::PREVIEW_LIMIT,
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
+						let git = Git::open_with(&root, &opts)
+							.map_err(|e| e.to_string())?;
+						// `list_changed_paths` still uses default Git options.
+						let files = gitsrc::list_changed_paths(&git, &source)
+							.map_err(|e| e.to_string())?;
 						let first = files.first().map(|(p, _)| {
 							(
 								p.clone(),
@@ -1009,12 +1019,15 @@ impl WorkbenchModel {
 					}
 					cx.notify();
 				});
-			})
-			.detach();
+			},
+		);
 	}
 
 	/// Opens one file of the selected commit or compare as a diff.
 	pub fn select_commit_file(&mut self, path: &str, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		let (source, psource) = match (&self.compare, &self.selected_commit) {
 			(Some((a, b)), _) => (
 				GitSource::Range(a.clone(), b.clone()),
@@ -1042,18 +1055,21 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		cx.foreground_executor()
-			.spawn(async move {
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
 				let res = bg
 					.spawn(async move {
-						let git =
-							Git::open(&root).map_err(|e| e.to_string())?;
 						let opts = RunOptions {
 							cancel: Some(cancel),
 							max_stdout: browser::PREVIEW_LIMIT,
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
+						let git = Git::open_with(&root, &opts)
+							.map_err(|e| e.to_string())?;
 						browser::git_preview_with(&git, &source, &for_bg, &opts)
 							.map(|p| browser::SourcePreview {
 								content: p.content,
@@ -1073,8 +1089,8 @@ impl WorkbenchModel {
 					app_log!("[APP:PREVIEW_LOADED: {}]", path);
 					cx.notify();
 				});
-			})
-			.detach();
+			},
+		);
 	}
 
 	/// Keyboard move in the log; `extend` grows the range instead.
@@ -1135,6 +1151,9 @@ impl WorkbenchModel {
 	}
 
 	fn load_rev_dir(&mut self, dir: String, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		let (Some(root), Some(tree)) =
 			(self.repo_root(), self.rev_tree.as_ref())
 		else {
@@ -1148,17 +1167,17 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		cx.foreground_executor()
-			.spawn(async move {
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel),
+			async move {
 				let (sha_bg, dir_bg) = (sha.clone(), dir.clone());
 				let res = bg
 					.spawn(async move {
-						let git =
-							Git::open(&root).map_err(|e| e.to_string())?;
-						let opts = RunOptions {
-							cancel: Some(cancel_bg),
-							..RunOptions::interactive(None)
-						};
+						let opts = crate::interactive_read_opts(cancel_bg);
+						let git = Git::open_with(&root, &opts)
+							.map_err(|e| e.to_string())?;
 						browser::commit_directory_with(
 							&git,
 							&sha_bg,
@@ -1199,8 +1218,8 @@ impl WorkbenchModel {
 					}
 					cx.notify();
 				});
-			})
-			.detach();
+			},
+		);
 	}
 
 	pub fn rev_tree_click(
@@ -1235,6 +1254,9 @@ impl WorkbenchModel {
 		path: String,
 		cx: &mut Context<Self>,
 	) {
+		if !self.accepting_work() {
+			return;
+		}
 		let Some(root) = self.repo_root() else {
 			return;
 		};
@@ -1252,16 +1274,19 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
-		cx.foreground_executor()
-			.spawn(async move {
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel),
+			async move {
 				let res = bg
 					.spawn(async move {
-						let git =
-							Git::open(&root).map_err(|e| e.to_string())?;
 						let opts = RunOptions {
 							cancel: Some(cancel_bg),
 							..RunOptions::preview(None)
 						};
+						let git = Git::open_with(&root, &opts)
+							.map_err(|e| e.to_string())?;
 						browser::commit_blob_with(
 							&git,
 							&sha_bg,
@@ -1312,8 +1337,8 @@ impl WorkbenchModel {
 					app_log!("[APP:PREVIEW_LOADED: {}]", path);
 					cx.notify();
 				});
-			})
-			.detach();
+			},
+		);
 	}
 }
 

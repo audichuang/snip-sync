@@ -34,6 +34,31 @@ pub(crate) fn arm_cancel(slot: &mut Option<CancelToken>) -> CancelToken {
 	token
 }
 
+/// Interactive read options that carry `cancel` into `Git::open_with`.
+pub(crate) fn interactive_read_opts(cancel: CancelToken) -> RunOptions {
+	RunOptions {
+		cancel: Some(cancel),
+		..RunOptions::interactive(None)
+	}
+}
+
+/// Replace the container so its backing store is dropped. `clear` keeps it.
+fn release_vec<T>(slot: &mut Vec<T>) {
+	*slot = Vec::new();
+}
+
+fn release_map<K, V, S: Default>(slot: &mut HashMap<K, V, S>) {
+	*slot = HashMap::default();
+}
+
+fn release_set<T, S: Default>(slot: &mut HashSet<T, S>) {
+	*slot = HashSet::default();
+}
+
+fn release_path(slot: &mut PathBuf) {
+	*slot = PathBuf::new();
+}
+
 /// Test-harness event line.
 macro_rules! app_log {
 	($($arg:tt)*) => {{
@@ -52,6 +77,7 @@ pub mod graph_view;
 mod history;
 pub mod i18n;
 mod icons;
+pub mod lifecycle;
 pub mod paste;
 mod reader;
 mod selector;
@@ -67,15 +93,14 @@ use gpui::{
 };
 use snip_core::browser::{self, CommitSummary, GitReference};
 use snip_core::clip;
-use snip_core::commits;
 use snip_core::format::ChangeType;
 use snip_core::gitrun::{CancelToken, Overflow, RunOptions};
 use snip_core::gitsrc::{Git, GitSource};
 use snip_core::graph::GraphLayout;
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	plan_commit_export_exact, plan_export, CanonicalRootId, ExportItem,
-	ExportSelection, SourceKind,
+	plan_commit_export_exact_with, plan_export_with, CanonicalRootId,
+	ExportItem, ExportSelection, SourceKind,
 };
 use snip_core::workspace::{
 	declared_submodules, status_details, summarize, DiscoveredRepo, Discovery,
@@ -116,6 +141,8 @@ actions!(
 		ToggleLog,
 		OpenRepoSelector,
 		OpenRefSelector,
+		CloseWorkspace,
+		OpenWorkspace,
 		ToggleLocale,
 		HistoryNextPage,
 		HistoryPrevPage,
@@ -250,6 +277,7 @@ pub struct WorkbenchModel {
 	pub tree_cancel: Option<CancelToken>,
 	pub repo_cancel: Option<CancelToken>,
 	pub scan_cancel: Option<CancelToken>,
+	pub copy_cancel: Option<CancelToken>,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, String)>,
@@ -308,6 +336,14 @@ pub struct WorkbenchModel {
 	pub e2e_apply_delay: Option<std::time::Duration>,
 	/// Focus requested from a context without a `Window`; applied on render.
 	pub pending_focus: Option<FocusHandle>,
+	pub e2e_read_delay: Option<std::time::Duration>,
+	pub workspace_open: bool,
+	pub workspace_menu: bool,
+	pub workspace_picker: bool,
+	pub workspace_path_input: Entity<TextInput>,
+	pub lifecycle: lifecycle::Lifecycle,
+	pub watch_running: bool,
+	pub last_life_log: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,6 +455,30 @@ impl WorkbenchModel {
 		})
 		.detach();
 
+		let workspace_path_input = cx.new(|cx| {
+			TextInput::new(i18n::t("workspace_path_placeholder", loc), 70, cx)
+		});
+		cx.subscribe(
+			&workspace_path_input,
+			|this, input, ev: &InputEvent, cx| {
+				if matches!(ev, InputEvent::Submit) {
+					let text = input.read(cx).text().trim().to_string();
+					this.confirm_open_workspace(&text, cx);
+				}
+			},
+		)
+		.detach();
+		cx.on_release(|this, _| {
+			this.lifecycle.cancel_cancellable();
+			if e2e_on() {
+				app_log!(
+					"[APP:LIFECYCLE: phase=released reason=on_release jobs={}]",
+					this.lifecycle.unfinished()
+				);
+			}
+		})
+		.detach();
+
 		let mut model = Self {
 			workspace_root,
 			restore_dir,
@@ -470,6 +530,7 @@ impl WorkbenchModel {
 			tree_cancel: None,
 			repo_cancel: None,
 			scan_cancel: None,
+			copy_cancel: None,
 			discovery: None,
 			discovery_status: None,
 			discovery_errors: Vec::new(),
@@ -518,6 +579,14 @@ impl WorkbenchModel {
 			probes: ui::Probes::from_env(),
 			e2e_apply_delay: ui::e2e_apply_delay(),
 			pending_focus: None,
+			e2e_read_delay: ui::e2e_read_delay(),
+			workspace_open: true,
+			workspace_menu: false,
+			workspace_picker: false,
+			workspace_path_input,
+			lifecycle: lifecycle::Lifecycle::new(1),
+			watch_running: false,
+			last_life_log: String::new(),
 		};
 		model.reload_repos(cx);
 		model
@@ -673,7 +742,7 @@ impl WorkbenchModel {
 				.map(|n| n.to_string_lossy().into_owned())
 				.unwrap_or_else(|| r.path.display().to_string());
 
-			match Git::open(&r.path) {
+			match Git::open_with(&r.path, opts) {
 				Ok(git) => {
 					let id_res = RepoIdentity::resolve(&git, opts);
 					let (kind, identity) = match &id_res {
@@ -816,7 +885,397 @@ impl WorkbenchModel {
 		}
 	}
 
+	pub(crate) fn accepting_work(&self) -> bool {
+		self.workspace_open && !self.lifecycle.is_draining()
+	}
+
+	fn needs_watch(&mut self) -> bool {
+		self.lifecycle.unfinished() > 0 || self.lifecycle.is_draining()
+	}
+
+	/// Reaps owned jobs only while one is live or a drain is in progress.
+	fn arm_watch(&mut self, cx: &mut Context<Self>) {
+		if self.watch_running || !self.needs_watch() {
+			return;
+		}
+		self.watch_running = true;
+		cx.spawn(async move |this, cx| loop {
+			cx.background_executor()
+				.timer(std::time::Duration::from_millis(40))
+				.await;
+			let keep = this.update(cx, |model, cx| {
+				model.poll_lifecycle(cx);
+				if model.needs_watch() {
+					return true;
+				}
+				model.watch_running = false;
+				if model.needs_watch() {
+					model.arm_watch(cx);
+				}
+				false
+			});
+			match keep {
+				Ok(true) => continue,
+				Ok(false) | Err(_) => break,
+			}
+		})
+		.detach();
+	}
+
+	pub(crate) fn spawn_owned(
+		&mut self,
+		cx: &mut Context<Self>,
+		kind: lifecycle::JobKind,
+		cancel: Option<CancelToken>,
+		fut: impl std::future::Future<Output = ()> + 'static,
+	) {
+		let (id, flag) = self.lifecycle.register(kind, cancel);
+		let task = cx.foreground_executor().spawn(async move {
+			fut.await;
+			drop(flag);
+		});
+		self.lifecycle.attach(id, task);
+		self.arm_watch(cx);
+	}
+
+	fn emit_life(&mut self, phase: &str, intent: &str, reason: Option<&str>) {
+		let git = lifecycle::GitLoad::current();
+		let jobs = self.lifecycle.unfinished();
+		let line = lifecycle::format_line(
+			phase,
+			intent,
+			reason,
+			jobs,
+			git,
+			self.lifecycle.generation(),
+		);
+		if self.last_life_log == line {
+			return;
+		}
+		self.last_life_log = line.clone();
+		if e2e_on() {
+			app_log!("[APP:LIFECYCLE: {line}]");
+		}
+	}
+
+	/// Ctrl/Cmd-Q and the OS close button. Does not call `cx.quit`.
+	pub fn begin_quit(&mut self, cx: &mut Context<Self>) {
+		if e2e_on() {
+			app_log!("[APP:QUIT: deferred]");
+		}
+		self.request_user_close(lifecycle::Intent::Quit, cx);
+	}
+
+	/// Shared close for Quit, the OS window button, and workspace switching.
+	/// Does not call `cx.quit`; that happens only after a clear drain.
+	pub fn request_user_close(
+		&mut self,
+		intent: lifecycle::Intent,
+		cx: &mut Context<Self>,
+	) {
+		if self.paste_busy() || self.lifecycle.has_mutating() {
+			let name = intent.name();
+			app_log!("[APP:PASTE_BUSY: refused={name}]");
+			self.emit_life("refused", name, Some("applying"));
+			self.set_status("workspace_busy_applying", []);
+			cx.notify();
+			return;
+		}
+		if !self.workspace_open
+			&& matches!(intent, lifecycle::Intent::CloseWorkspace)
+		{
+			return;
+		}
+		match self
+			.lifecycle
+			.request(intent.clone(), std::time::Instant::now())
+		{
+			lifecycle::Request::RefusedApplying => {
+				let name = intent.name();
+				app_log!("[APP:PASTE_BUSY: refused={name}]");
+				self.emit_life("refused", name, Some("applying"));
+				self.set_status("workspace_busy_applying", []);
+			}
+			lifecycle::Request::Busy => {
+				let intent = self.lifecycle.intent_name();
+				self.emit_life("draining", intent, None);
+			}
+			lifecycle::Request::Accepted => {
+				self.generation = self.generation.wrapping_add(1);
+				self.preview_generation =
+					self.preview_generation.wrapping_add(1);
+				self.history_generation =
+					self.history_generation.wrapping_add(1);
+				self.tree_generation = self.tree_generation.wrapping_add(1);
+				for slot in [
+					&mut self.history_cancel,
+					&mut self.preview_cancel,
+					&mut self.tree_cancel,
+					&mut self.repo_cancel,
+					&mut self.scan_cancel,
+					&mut self.copy_cancel,
+					&mut self.add_cancel,
+				] {
+					if let Some(token) = slot.as_ref() {
+						token.cancel();
+					}
+				}
+				let name = intent.name();
+				self.emit_life("draining", name, None);
+				self.set_status("workspace_draining", []);
+			}
+		}
+		self.arm_watch(cx);
+		cx.notify();
+	}
+
+	fn poll_lifecycle(&mut self, cx: &mut Context<Self>) {
+		let now = std::time::Instant::now();
+		let git = lifecycle::GitLoad::current();
+		match self.lifecycle.poll_at(now, git) {
+			lifecycle::Step::Idle | lifecycle::Step::Draining => {
+				if self.lifecycle.is_draining() {
+					let intent = self.lifecycle.intent_name();
+					self.emit_life("draining", intent, None);
+				}
+			}
+			lifecycle::Step::Ready(intent) => {
+				let git = lifecycle::GitLoad::current();
+				if self.lifecycle.unfinished() > 0 || !git.is_clear() {
+					self.lifecycle.resume(intent, now);
+					let intent = self.lifecycle.intent_name();
+					self.emit_life("draining", intent, None);
+					return;
+				}
+				self.finish_intent(intent, cx);
+			}
+			lifecycle::Step::Failed { intent, reason } => {
+				let key = match reason {
+					"leaked" => "workspace_drain_leaked",
+					_ => "workspace_drain_timeout",
+				};
+				let name = intent.name();
+				self.emit_life("failed", name, Some(reason));
+				self.set_status(key, []);
+				cx.notify();
+			}
+		}
+	}
+
+	fn finish_intent(
+		&mut self,
+		intent: lifecycle::Intent,
+		cx: &mut Context<Self>,
+	) {
+		let git = lifecycle::GitLoad::current();
+		if self.lifecycle.unfinished() > 0 || !git.is_clear() {
+			if e2e_on() {
+				app_log!(
+					"[APP:LIFECYCLE: phase=blocked jobs={} inflight={} queued={} leaked={}]",
+					self.lifecycle.live_jobs(),
+					git.in_flight,
+					git.queued,
+					git.leaked
+				);
+			}
+			self.lifecycle.resume(intent, std::time::Instant::now());
+			return;
+		}
+		let name = intent.name();
+		self.emit_life("drained", name, None);
+		match intent {
+			lifecycle::Intent::Quit => cx.quit(),
+			lifecycle::Intent::CloseWorkspace => self.finish_close(cx),
+			lifecycle::Intent::OpenWorkspace(path) => {
+				self.finish_open(path, cx)
+			}
+		}
+	}
+
+	fn release_workspace_state(&mut self, cx: &mut Context<Self>) {
+		release_vec(&mut self.repos);
+		self.selected_repo_idx = None;
+		release_vec(&mut self.commits);
+		release_vec(&mut self.refs);
+		self.head_sha = None;
+		self.graph_layout = None;
+		self.active_ref_filter = None;
+		self.commit_page = 0;
+		self.history_has_more = false;
+		self.history_error = None;
+		release_vec(&mut self.page_checkpoints);
+		self.log_search = None;
+		release_set(&mut self.collapsed_merges);
+		release_set(&mut self.hidden_commits);
+		self.selected_commit = None;
+		self.range_head = None;
+		self.select_head_after_load = false;
+		release_vec(&mut self.commit_files);
+		self.selected_commit_file = None;
+		self.compare = None;
+		release_vec(&mut self.files);
+		self.file_tree = None;
+		self.rev_tree = None;
+		self.selected_file = None;
+		self.selected_file_source = None;
+		self.tree_cursor = 0;
+		self.selected_list_row = 0;
+		self.preview = None;
+		self.preview_loading = false;
+		self.preview_error = None;
+		self.reader.release_retained();
+		release_map(&mut self.basket);
+		self.paste_detail = None;
+		if !self.paste_busy() {
+			self.paste_preview = None;
+		}
+		self.discovery = None;
+		self.discovery_status = None;
+		release_vec(&mut self.discovery_errors);
+		release_vec(&mut self.discovery_depth_limited);
+		self.discovery_error_overflow = 0;
+		self.discovery_depth_overflow = 0;
+		self.discovery_task = None;
+		self.pinned_repo = None;
+		release_vec(&mut self.manual_repos);
+		self.tree_task = None;
+		self.tree_queue = VecDeque::new();
+		self.tree_worker = 0;
+		self.tree_worker_alive = false;
+		release_vec(&mut self.restore_expanded);
+		self.add_cancel = None;
+		self.add_repo_task = None;
+		self.is_loading = false;
+		self.is_copying = false;
+		self.is_adding_repo = false;
+		self.popover = None;
+		self.popover_cursor = 0;
+		self.history_cancel = None;
+		self.preview_cancel = None;
+		self.tree_cancel = None;
+		self.repo_cancel = None;
+		self.scan_cancel = None;
+		self.copy_cancel = None;
+		release_path(&mut self.workspace_root);
+		self.clear_workspace_inputs(cx);
+	}
+
+	/// Drops workspace text without `InputEvent::Changed`, which would start
+	/// a find or a log search.
+	fn clear_workspace_inputs(&mut self, cx: &mut Context<Self>) {
+		for input in [
+			self.find_input.clone(),
+			self.goto_input.clone(),
+			self.log_search_input.clone(),
+			self.selector_input.clone(),
+			self.add_repo_input.clone(),
+			self.workspace_path_input.clone(),
+		] {
+			input.update(cx, |field, _| field.clear_retained());
+		}
+	}
+
+	fn finish_close(&mut self, cx: &mut Context<Self>) {
+		self.release_workspace_state(cx);
+		self.workspace_open = false;
+		self.workspace_menu = true;
+		self.workspace_picker = false;
+		if e2e_on() {
+			app_log!(
+				"[APP:WORKSPACE: state=closed generation={}]",
+				self.lifecycle.generation()
+			);
+		}
+		self.set_status("workspace_closed", []);
+		cx.notify();
+	}
+
+	fn finish_open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+		self.release_workspace_state(cx);
+		self.workspace_root = path.clone();
+		self.workspace_open = true;
+		self.workspace_menu = false;
+		self.workspace_picker = false;
+		if e2e_on() {
+			app_log!(
+				"[APP:WORKSPACE: state=open path={} generation={}]",
+				path.display(),
+				self.lifecycle.generation()
+			);
+		}
+		self.set_status("workspace_opening", [path.display().to_string()]);
+		self.reload_repos(cx);
+	}
+
+	pub fn toggle_workspace_menu(&mut self, cx: &mut Context<Self>) {
+		self.workspace_menu = !self.workspace_menu;
+		if !self.workspace_menu {
+			self.workspace_picker = false;
+		}
+		cx.notify();
+	}
+
+	pub fn show_workspace_picker(&mut self, cx: &mut Context<Self>) {
+		self.workspace_menu = true;
+		self.workspace_picker = true;
+		self.pending_focus = Some(self.workspace_path_input.read(cx).handle());
+		cx.notify();
+	}
+
+	pub fn confirm_open_workspace(
+		&mut self,
+		text: &str,
+		cx: &mut Context<Self>,
+	) {
+		let text = text.trim();
+		if text.is_empty() {
+			return;
+		}
+		let path = PathBuf::from(text);
+		if !path.is_dir() {
+			self.set_status("workspace_bad_path", [path.display().to_string()]);
+			cx.notify();
+			return;
+		}
+		let path = dunce::canonicalize(&path).unwrap_or(path);
+		self.workspace_path_input
+			.update(cx, |input, _| input.clear_retained());
+		self.request_user_close(lifecycle::Intent::OpenWorkspace(path), cx);
+	}
+
+	/// True when this copy may write the clipboard. A cancelled token or a
+	/// generation change drops the text.
+	fn accept_copy_result(&mut self, ws_gen: u64, token: &CancelToken) -> bool {
+		self.is_copying = false;
+		let cancelled = token.is_cancelled();
+		let stale = self.lifecycle.generation() != ws_gen;
+		if !cancelled && !stale {
+			return true;
+		}
+		let why = if cancelled { "cancelled" } else { "stale" };
+		app_log!("[APP:COPY_DISCARDED: {why}]");
+		if cancelled && !stale {
+			self.set_status("status_copy_cancelled", []);
+		}
+		false
+	}
+
+	pub fn cancel_copy(&mut self, cx: &mut Context<Self>) {
+		if !self.is_copying {
+			return;
+		}
+		if let Some(token) = &self.copy_cancel {
+			token.cancel();
+		}
+		self.set_status("status_copy_cancelled", []);
+		app_log!("[APP:COPY_CANCEL]");
+		cx.notify();
+	}
+
 	pub fn reload_repos(&mut self, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		self.discovery_errors.clear();
 		self.discovery_depth_limited.clear();
 		self.discovery_error_overflow = 0;
@@ -826,7 +1285,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn continue_discovery(&mut self, cx: &mut Context<Self>) {
-		if self.is_loading {
+		if !self.accepting_work() || self.is_loading {
 			return;
 		}
 		if matches!(self.discovery_status, Some(ScanStatus::LimitReached)) {
@@ -849,21 +1308,31 @@ impl WorkbenchModel {
 	}
 
 	pub fn add_repo_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		let cancel = arm_cancel(&mut self.add_cancel);
-		let task = cx.spawn(async move |this, cx| {
-			let bg = cx.background_executor().clone();
-			let cancel_bg = cancel.clone();
-			let outcome = bg
-				.spawn(async move { resolve_added_repo(path, &cancel_bg) })
-				.await;
-			let _ = this.update(cx, |model, cx| {
-				if cancel.is_cancelled() {
-					return;
-				}
-				model.install_added_repo(outcome, cx);
-			});
-		});
-		self.add_repo_task = Some(task);
+		let cancel_job = cancel.clone();
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel_job),
+			async move {
+				let bg = async_app.background_executor().clone();
+				let cancel_bg = cancel.clone();
+				let outcome = bg
+					.spawn(async move { resolve_added_repo(path, &cancel_bg) })
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if cancel.is_cancelled() {
+						return;
+					}
+					model.install_added_repo(outcome, cx);
+				});
+			},
+		);
 	}
 
 	fn launch_fresh_discovery(
@@ -872,35 +1341,54 @@ impl WorkbenchModel {
 		wipe: bool,
 		cx: &mut Context<Self>,
 	) {
+		if !self.accepting_work() {
+			return;
+		}
 		self.discovery_generation = self.discovery_generation.wrapping_add(1);
 		let generation = self.discovery_generation;
 		let cancel = arm_cancel(&mut self.scan_cancel);
 		self.is_loading = true;
 		self.set_status("status_scanning", []);
-		let task = cx.spawn(async move |this, cx| {
-			let bg = cx.background_executor().clone();
-			let open_root = root.clone();
-			let opened = bg
-				.spawn(async move { Discovery::new(&open_root, 8, 256) })
+		let cancel_job = cancel.clone();
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel_job),
+			async move {
+				let bg = async_app.background_executor().clone();
+				let open_root = root.clone();
+				let opened = bg
+					.spawn(async move { Discovery::new(&open_root, 8, 256) })
+					.await;
+				let disc = match opened {
+					Ok(disc) => disc,
+					Err(err) => {
+						let _ = this.update(&mut async_app, |model, cx| {
+							if model.discovery_generation != generation {
+								return;
+							}
+							model.discovery = None;
+							model.discovery_status =
+								Some(ScanStatus::Incomplete);
+							model.push_discovery_error((root, err.to_string()));
+							model.finish_discovery(cx);
+						});
+						return;
+					}
+				};
+				drive_discovery(
+					this,
+					&mut async_app,
+					disc,
+					generation,
+					cancel,
+					wipe,
+				)
 				.await;
-			let disc = match opened {
-				Ok(disc) => disc,
-				Err(err) => {
-					let _ = this.update(cx, |model, cx| {
-						if model.discovery_generation != generation {
-							return;
-						}
-						model.discovery = None;
-						model.discovery_status = Some(ScanStatus::Incomplete);
-						model.push_discovery_error((root, err.to_string()));
-						model.finish_discovery(cx);
-					});
-					return;
-				}
-			};
-			drive_discovery(this, cx, disc, generation, cancel, wipe).await;
-		});
-		self.discovery_task = Some(task);
+			},
+		);
 	}
 
 	fn launch_discovery_cursor(
@@ -909,15 +1397,33 @@ impl WorkbenchModel {
 		wipe: bool,
 		cx: &mut Context<Self>,
 	) {
+		if !self.accepting_work() {
+			return;
+		}
 		self.discovery_generation = self.discovery_generation.wrapping_add(1);
 		let generation = self.discovery_generation;
 		let cancel = arm_cancel(&mut self.scan_cancel);
 		self.is_loading = true;
 		self.set_status("status_scanning", []);
-		let task = cx.spawn(async move |this, cx| {
-			drive_discovery(this, cx, disc, generation, cancel, wipe).await;
-		});
-		self.discovery_task = Some(task);
+		let cancel_job = cancel.clone();
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel_job),
+			async move {
+				drive_discovery(
+					this,
+					&mut async_app,
+					disc,
+					generation,
+					cancel,
+					wipe,
+				)
+				.await;
+			},
+		);
 	}
 
 	fn merge_repo_entries(&mut self, extra: Vec<RepoEntry>) {
@@ -1222,6 +1728,9 @@ impl WorkbenchModel {
 		preserve_anchors: bool,
 		cx: &mut Context<Self>,
 	) {
+		if !self.accepting_work() {
+			return;
+		}
 		if idx >= self.repos.len() {
 			return;
 		}
@@ -1322,16 +1831,16 @@ impl WorkbenchModel {
 		let cancel_bg = cancel.clone();
 
 		let repo_root_for_update = repo_root.clone();
-		cx.foreground_executor()
-			.spawn(async move {
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel),
+			async move {
 				let working_res: Result<Vec<WorkingChangeTuple>, String> = bg
 					.spawn(async move {
-						let git =
-							Git::open(&repo_root).map_err(|e| e.to_string())?;
-						let opts = RunOptions {
-							cancel: Some(cancel_bg),
-							..RunOptions::interactive(None)
-						};
+						let opts = interactive_read_opts(cancel_bg);
+						let git = Git::open_with(&repo_root, &opts)
+							.map_err(|e| e.to_string())?;
 						let details = status_details(&git, &opts)
 							.map_err(|e| e.to_string())?;
 						let mut items = Vec::new();
@@ -1449,8 +1958,8 @@ impl WorkbenchModel {
 					model.load_history(cx);
 					cx.notify();
 				});
-			})
-			.detach();
+			},
+		);
 	}
 
 	/// Selects a file, using its known source identity if in the changes list.
@@ -1480,6 +1989,9 @@ impl WorkbenchModel {
 		source: SourceKind,
 		cx: &mut Context<Self>,
 	) {
+		if !self.accepting_work() {
+			return;
+		}
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
 		self.selected_file = Some(path.to_string());
@@ -1497,86 +2009,53 @@ impl WorkbenchModel {
 		let is_tree = self.active_tab == WorkbenchTab::FileExplorer;
 
 		let cancel = arm_cancel(&mut self.preview_cancel);
+		let fs_only = is_tree || matches!(source, SourceKind::File);
+		let kind = if fs_only {
+			lifecycle::JobKind::UncancellableRead
+		} else {
+			lifecycle::JobKind::CancellableRead
+		};
+		let job_cancel = (!fs_only).then(|| cancel.clone());
+		let delay = self.e2e_read_delay;
+		if e2e_on() {
+			app_log!("[APP:PREVIEW_LOADING: {file_path}]");
+		}
 
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 
-		cx.foreground_executor()
-			.spawn(async move {
-				let for_bg = file_path.clone();
-				let result = bg
-					.spawn(async move {
-						if is_tree || matches!(source, SourceKind::File) {
-							return browser::file_preview(&repo_root, &for_bg)
-								.map(|p| (p, PreviewSource::WorkingFile))
-								.map_err(|e| e.to_string());
-						}
-						let git =
-							Git::open(&repo_root).map_err(|e| e.to_string())?;
-						let opts = RunOptions {
-							cancel: Some(cancel),
-							max_stdout: browser::PREVIEW_LIMIT,
-							overflow: Overflow::Error,
-							..RunOptions::interactive(None)
-						};
-						let (git_source, preview_source) = match source {
-							SourceKind::Staged => (
-								GitSource::Staged,
-								PreviewSource::StagedChanges,
-							),
-							SourceKind::Unstaged => (
-								GitSource::Working,
-								PreviewSource::UnstagedChanges,
-							),
-							SourceKind::Working => (
-								GitSource::Working,
-								PreviewSource::WorkingChanges,
-							),
-							SourceKind::Commit { rev } => (
-								GitSource::Commit(rev.clone()),
-								PreviewSource::CommitFile { sha: rev },
-							),
-							SourceKind::File => {
-								(GitSource::Working, PreviewSource::WorkingFile)
-							}
-						};
-						match browser::git_preview_with(
-							&git,
-							&git_source,
-							&for_bg,
-							&opts,
-						) {
-							Ok(p) => Ok((
-								browser::SourcePreview {
-									content: p.content,
-									patch: p.patch,
-								},
-								preview_source,
-							)),
-							// Not a change (or vanished): show the file itself.
-							Err(_) => {
-								browser::file_preview(&repo_root, &for_bg)
-									.map(|p| (p, PreviewSource::WorkingFile))
-									.map_err(|e| e.to_string())
-							}
-						}
-					})
-					.await;
+		self.spawn_owned(cx, kind, job_cancel, async move {
+			let for_bg = file_path.clone();
+			let result = bg
+				.spawn(async move {
+					let result = read_preview(
+						&repo_root, &for_bg, &source, is_tree, cancel,
+					);
+					if let Some(delay) = delay {
+						std::thread::sleep(delay);
+					}
+					result
+				})
+				.await;
 
-				let _ = this.update(&mut async_app, |model, cx| {
-					if model.preview_generation != task_generation {
-						return;
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.preview_generation != task_generation {
+					if e2e_on() {
+						app_log!(
+							"[APP:PREVIEW_DISCARDED: stale path={file_path}]"
+						);
 					}
-					model.apply_source_preview(file_path.clone(), result);
-					app_log!("[APP:PREVIEW_LOADED: {}]", file_path);
-					if model.mode == "preview" {
-						ready_marker("PREVIEW");
-					}
-					cx.notify();
-				});
-			})
-			.detach();
+					return;
+				}
+				model.apply_source_preview(file_path.clone(), result);
+				app_log!("[APP:PREVIEW_LOADED: {}]", file_path);
+				if model.mode == "preview" {
+					ready_marker("PREVIEW");
+				}
+				cx.notify();
+			});
+		});
 	}
 
 	/// Turns a core `SourcePreview` into the single retained preview.
@@ -1814,6 +2293,9 @@ impl WorkbenchModel {
 	}
 
 	pub fn copy_selection_to_clipboard(&mut self, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		if self.is_copying {
 			app_log!("[APP:COPY_BUSY]");
 			return;
@@ -1873,37 +2355,48 @@ impl WorkbenchModel {
 
 		self.is_copying = true;
 		self.set_status("status_copying", [repo_name.clone()]);
+		if e2e_on() {
+			app_log!("[APP:COPY_PREP: files={}]", export_sel.items.len());
+		}
 		cx.notify();
 
+		let cancel = arm_cancel(&mut self.copy_cancel);
+		let job_token = cancel.clone();
+		let run_token = cancel.clone();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
+		let ws_gen = self.lifecycle.generation();
 
-		cx.foreground_executor()
-			.spawn(async move {
-				let result: Result<Msg, Msg> = bg
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(job_token),
+			async move {
+				let result: Result<(String, usize, Msg), Msg> = bg
 					.spawn(async move {
+						let opts = interactive_read_opts(run_token);
 						let settings = Settings::default();
-						let plan = plan_export(&export_sel, &settings, None)
-							.map_err(|e| {
-								Msg::new("error_payload", [e.to_string()])
-							})?;
-						if plan.files.is_empty() {
-							return Ok(Msg::new("status_copy_nothing", []));
-						}
-						plan.revalidate().map_err(|e| {
+						// Document cap is the retained UI output ceiling.
+						// It is not `RunOptions::max_stdout`.
+						let plan = plan_export_with(
+							&export_sel,
+							&settings,
+							Some(RunOptions::INTERACTIVE_MAX_STDOUT),
+							&opts,
+						)
+						.map_err(|e| {
 							Msg::new("error_payload", [e.to_string()])
 						})?;
-						clip::write_text(&plan.payload).map_err(|e| {
-							Msg::new("status_clipboard_failed", [e.to_string()])
+						if plan.files.is_empty() {
+							return Err(Msg::new("status_copy_nothing", []));
+						}
+						plan.revalidate_with(&opts).map_err(|e| {
+							Msg::new("error_payload", [e.to_string()])
 						})?;
-						app_log!(
-							"[APP:COPY_DONE: copied={}]",
-							plan.copied_file_count
-						);
 						let skipped = plan.skipped_unreadable_count
 							+ plan.skipped_file_size_count;
-						Ok(Msg::new(
+						let msg = Msg::new(
 							"status_copied",
 							[
 								repo_name,
@@ -1912,16 +2405,35 @@ impl WorkbenchModel {
 								plan.stats.lines.to_string(),
 								skipped.to_string(),
 							],
-						))
+						);
+						Ok((plan.payload, plan.copied_file_count, msg))
 					})
 					.await;
 
 				match this.update(&mut async_app, |model, cx| {
-					model.is_copying = false;
+					if !model.accept_copy_result(ws_gen, &cancel) {
+						cx.notify();
+						return;
+					}
+					match result {
+						Ok((text, copied_count, msg)) => {
+							if let Err(e) = clip::write_text(&text) {
+								model.set_status(
+									"status_clipboard_failed",
+									[e.to_string()],
+								);
+							} else {
+								app_log!(
+									"[APP:COPY_DONE: copied={copied_count}]"
+								);
+								model.status = msg;
+							}
+						}
+						Err(err) => {
+							model.status = err;
+						}
+					}
 					app_log!("[APP:COPY_IDLE]");
-					model.status = match result {
-						Ok(m) | Err(m) => m,
-					};
 					cx.notify();
 				}) {
 					Ok(()) => {}
@@ -1929,12 +2441,15 @@ impl WorkbenchModel {
 						app_log!("[APP:COPY_IDLE_FAILED: {err}]");
 					}
 				}
-			})
-			.detach();
+			},
+		);
 	}
 
 	/// Exports the selected commit or first-parent commit range to the clipboard.
 	pub fn copy_commits_to_clipboard(&mut self, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			return;
+		}
 		if self.is_copying {
 			self.set_status("status_copying", []);
 			cx.notify();
@@ -1970,50 +2485,73 @@ impl WorkbenchModel {
 
 		self.is_copying = true;
 		self.set_status("status_copying", [repo_name.clone()]);
+		if e2e_on() {
+			app_log!("[APP:COPY_COMMITS_PREP: commits={}]", selected.len());
+		}
 		cx.notify();
 
+		let cancel = arm_cancel(&mut self.copy_cancel);
+		let job_token = cancel.clone();
+		let run_token = cancel.clone();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
+		let ws_gen = self.lifecycle.generation();
 
-		cx.foreground_executor()
-			.spawn(async move {
-				let result: Result<usize, String> = bg
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(job_token),
+			async move {
+				let result: Result<(String, usize), String> = bg
 					.spawn(async move {
-						let git =
-							Git::open(&repo_root).map_err(|e| e.to_string())?;
-						let payload =
-							plan_commit_export_exact(&git, &tip_sha, &selected)
-								.map_err(|e| e.to_string())?;
-						let n_commits = payload.commits.len();
-						let text = commits::to_clipboard_text(&payload);
-						clip::write_text(&text).map_err(|e| e.to_string())?;
-						Ok(n_commits)
+						let opts = interactive_read_opts(run_token);
+						let git = Git::open_with(&repo_root, &opts)
+							.map_err(|e| e.to_string())?;
+						let exported = plan_commit_export_exact_with(
+							&git,
+							&tip_sha,
+							&selected,
+							&opts,
+							RunOptions::INTERACTIVE_MAX_STDOUT,
+						)
+						.map_err(|e| e.to_string())?;
+						let n_commits = exported.payload.commits.len();
+						Ok((exported.text, n_commits))
 					})
 					.await;
 
 				let _ = this.update(&mut async_app, |model, cx| {
-					model.is_copying = false;
+					if !model.accept_copy_result(ws_gen, &cancel) {
+						cx.notify();
+						return;
+					}
 					match result {
-						Ok(n_commits) => {
-							app_log!(
-								"[APP:COPY_COMMITS_DONE: commits={}]",
-								n_commits
-							);
-							model.set_status(
-								"status_commits_copied",
-								[n_commits.to_string()],
-							);
+						Ok((text, n_commits)) => {
+							if let Err(e) = clip::write_text(&text) {
+								model.set_status(
+									"status_clipboard_failed",
+									[e.to_string()],
+								);
+							} else {
+								app_log!(
+									"[APP:COPY_COMMITS_DONE: commits={n_commits}]"
+								);
+								model.set_status(
+									"status_commits_copied",
+									[n_commits.to_string()],
+								);
+							}
 						}
 						Err(err) => {
-							app_log!("[APP:COPY_COMMITS_ERR: {}]", err);
+							app_log!("[APP:COPY_COMMITS_ERR: {err}]");
 							model.set_status("error_payload", [err]);
 						}
 					}
 					cx.notify();
 				});
-			})
-			.detach();
+			},
+		);
 	}
 
 	/// True while a confirmed plan is being written. The write is not
@@ -2281,8 +2819,11 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 
-		cx.foreground_executor()
-			.spawn(async move {
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::Mutating,
+			None,
+			async move {
 				let exec_res = bg
 					.spawn(async move {
 						if let Some(d) = delay {
@@ -2349,8 +2890,8 @@ impl WorkbenchModel {
 					}
 					cx.notify();
 				});
-			})
-			.detach();
+			},
+		);
 	}
 
 	/// Called on every path that closes the paste preview.
@@ -2530,7 +3071,7 @@ fn resolve_added_repo(
 		cancel: Some(cancel.clone()),
 		..RunOptions::interactive(None)
 	};
-	let (root, kind, identity, summary) = match Git::open(&path) {
+	let (root, kind, identity, summary) = match Git::open_with(&path, &opts) {
 		Ok(git) => {
 			let root = git.root().to_path_buf();
 			match RepoIdentity::resolve(&git, &opts) {
@@ -2567,6 +3108,53 @@ fn resolve_added_repo(
 		identity,
 		summary,
 	})
+}
+
+fn read_preview(
+	repo_root: &std::path::Path,
+	path: &str,
+	source: &SourceKind,
+	is_tree: bool,
+	cancel: CancelToken,
+) -> Result<(browser::SourcePreview, PreviewSource), String> {
+	if is_tree || matches!(source, SourceKind::File) {
+		return browser::file_preview(repo_root, path)
+			.map(|p| (p, PreviewSource::WorkingFile))
+			.map_err(|e| e.to_string());
+	}
+	let opts = RunOptions {
+		cancel: Some(cancel),
+		max_stdout: browser::PREVIEW_LIMIT,
+		overflow: Overflow::Error,
+		..RunOptions::interactive(None)
+	};
+	let git = Git::open_with(repo_root, &opts).map_err(|e| e.to_string())?;
+	let (git_source, preview_source) = match source {
+		SourceKind::Staged => (GitSource::Staged, PreviewSource::StagedChanges),
+		SourceKind::Unstaged => {
+			(GitSource::Working, PreviewSource::UnstagedChanges)
+		}
+		SourceKind::Working => {
+			(GitSource::Working, PreviewSource::WorkingChanges)
+		}
+		SourceKind::Commit { rev } => (
+			GitSource::Commit(rev.clone()),
+			PreviewSource::CommitFile { sha: rev.clone() },
+		),
+		SourceKind::File => (GitSource::Working, PreviewSource::WorkingFile),
+	};
+	match browser::git_preview_with(&git, &git_source, path, &opts) {
+		Ok(p) => Ok((
+			browser::SourcePreview {
+				content: p.content,
+				patch: p.patch,
+			},
+			preview_source,
+		)),
+		Err(_) => browser::file_preview(repo_root, path)
+			.map(|p| (p, PreviewSource::WorkingFile))
+			.map_err(|e| e.to_string()),
+	}
 }
 
 fn parse_cli_args() -> (PathBuf, String, Option<PathBuf>) {
@@ -2679,6 +3267,10 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("alt-9", ToggleLog, None),
 		KeyBinding::new("alt-shift-r", OpenRepoSelector, None),
 		KeyBinding::new("alt-shift-b", OpenRefSelector, None),
+		KeyBinding::new("ctrl-shift-w", CloseWorkspace, None),
+		KeyBinding::new("cmd-shift-w", CloseWorkspace, None),
+		KeyBinding::new("ctrl-shift-o", OpenWorkspace, None),
+		KeyBinding::new("cmd-shift-o", OpenWorkspace, None),
 		KeyBinding::new("alt-l", ToggleLocale, None),
 		KeyBinding::new("alt-n", HistoryNextPage, None),
 		KeyBinding::new("alt-p", HistoryPrevPage, None),
@@ -2753,6 +3345,11 @@ fn main() {
 					.new(|cx| WorkbenchModel::new(ws, paste_dir, app_mode, cx));
 				let fh = model.read(cx).focus_handle.clone();
 				window.focus(&fh);
+				let close_target = model.clone();
+				window.on_window_should_close(cx, move |_window, cx| {
+					close_target.update(cx, |model, cx| model.begin_quit(cx));
+					false
+				});
 				app_log!("[APP:WINDOW_READY]");
 				model
 			},
@@ -2935,5 +3532,32 @@ mod tests {
 		assert_eq!(sub_entries[0].kind, RepoEntryKind::UninitializedSubmodule);
 		assert!(sub_entries[0].identity.is_none());
 		assert!(sub_entries[0].summary.is_err());
+	}
+
+	#[test]
+	fn release_helpers_drop_backing_capacity() {
+		let mut values = Vec::<u8>::with_capacity(64);
+		values.extend_from_slice(&[1, 2, 3]);
+		release_vec(&mut values);
+		assert!(values.is_empty());
+		assert_eq!(values.capacity(), 0);
+
+		let mut names = HashMap::<String, String>::with_capacity(16);
+		names.insert("root".into(), "x".repeat(128));
+		release_map(&mut names);
+		assert!(names.is_empty());
+		assert_eq!(names.capacity(), 0);
+
+		let mut shas = HashSet::<String>::with_capacity(16);
+		shas.insert("a".repeat(40));
+		release_set(&mut shas);
+		assert!(shas.is_empty());
+		assert_eq!(shas.capacity(), 0);
+
+		let mut path = PathBuf::with_capacity(128);
+		path.push("/tmp/workspace");
+		release_path(&mut path);
+		assert!(path.as_os_str().is_empty());
+		assert_eq!(path.capacity(), 0);
 	}
 }

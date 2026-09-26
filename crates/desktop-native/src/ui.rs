@@ -30,16 +30,16 @@ use crate::selector::Pick;
 use crate::theme::*;
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
-	ApplyPaste, CancelPaste, CopySelection, DeselectAllFiles, FindInFile,
-	FindNext, FindPrev, FocusNext, FocusPrev, GotoLine, HistoryNextPage,
-	HistoryPrevPage, LogDown, LogExtendDown, LogExtendUp, LogHead, LogOpen,
-	LogSearchFocus, LogUp, NavDown, NavToggle, NavUp, OpenRefSelector,
-	OpenRepoSelector, PastePreview, Popover, Quit, ReaderClear, ReaderCopy,
-	ReaderDown, ReaderPageDown, ReaderPageUp, ReaderSelectAll, ReaderUp,
-	Refresh, RepoEntryKind, SelectAllFiles, SelectRepo1, SelectRepo2,
-	ShowChanges, ShowProject, Splitter, ToggleLocale, ToggleLog, ToggleTab,
-	TreeCollapse, TreeDown, TreeExpand, TreeOpen, TreeToggle, TreeUp,
-	WorkbenchModel, WorkbenchTab,
+	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, DeselectAllFiles,
+	FindInFile, FindNext, FindPrev, FocusNext, FocusPrev, GotoLine,
+	HistoryNextPage, HistoryPrevPage, LogDown, LogExtendDown, LogExtendUp,
+	LogHead, LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle, NavUp,
+	OpenRefSelector, OpenRepoSelector, OpenWorkspace, PastePreview, Popover,
+	Quit, ReaderClear, ReaderCopy, ReaderDown, ReaderPageDown, ReaderPageUp,
+	ReaderSelectAll, ReaderUp, Refresh, RepoEntryKind, SelectAllFiles,
+	SelectRepo1, SelectRepo2, ShowChanges, ShowProject, Splitter, ToggleLocale,
+	ToggleLog, ToggleTab, TreeCollapse, TreeDown, TreeExpand, TreeOpen,
+	TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
 };
 
 // ───────────────────────── E2E probes (opt-in) ─────────────────────────
@@ -51,6 +51,19 @@ pub fn e2e_apply_delay() -> Option<std::time::Duration> {
 		return None;
 	}
 	std::env::var("SNIP_NATIVE_E2E_APPLY_DELAY_MS")
+		.ok()?
+		.parse()
+		.ok()
+		.map(std::time::Duration::from_millis)
+}
+
+/// Test-only hold after a preview read so close can race a finished result.
+/// Ignored outside E2E mode. Not a product timer.
+pub fn e2e_read_delay() -> Option<std::time::Duration> {
+	if !crate::e2e_on() {
+		return None;
+	}
+	std::env::var("SNIP_NATIVE_E2E_READ_DELAY_MS")
 		.ok()?
 		.parse()
 		.ok()
@@ -741,14 +754,164 @@ impl WorkbenchModel {
 
 	// ───────────────────────── header ─────────────────────────
 
+	fn render_workspace_chip(&self, cx: &mut Context<Self>) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let label = if self.workspace_open {
+			self.workspace_root
+				.file_name()
+				.map(|n| n.to_string_lossy().to_string())
+				.filter(|n| !n.is_empty())
+				.unwrap_or_else(|| self.workspace_root.display().to_string())
+		} else {
+			t("workspace_none", loc).to_string()
+		};
+		let tip_text = if self.workspace_open {
+			self.workspace_root.display().to_string()
+		} else {
+			t("workspace_none", loc).to_string()
+		};
+		let panel = div()
+			.id("workspace-menu")
+			.occlude()
+			.w(px(300.))
+			.flex()
+			.flex_col()
+			.gap(px(6.))
+			.p(px(6.))
+			.bg(rgb(PANEL_BG))
+			.border_1()
+			.border_color(rgb(BUTTON_BORDER))
+			.rounded(px(6.))
+			.shadow_lg()
+			.on_mouse_down_out(cx.listener(|this, _, _, cx| {
+				this.workspace_menu = false;
+				this.workspace_picker = false;
+				cx.notify();
+			}))
+			.child(
+				button(
+					"btn-close-workspace",
+					t("workspace_close", loc),
+					Btn::Default,
+					true,
+					61,
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.workspace_menu = false;
+					this.request_user_close(
+						crate::lifecycle::Intent::CloseWorkspace,
+						cx,
+					);
+				}))
+				.children(probe(log, "btn-close-workspace")),
+			)
+			.child(
+				button(
+					"btn-open-workspace",
+					t("workspace_open", loc),
+					Btn::Default,
+					true,
+					62,
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.show_workspace_picker(cx);
+				}))
+				.children(probe(log, "btn-open-workspace")),
+			)
+			.when(self.workspace_picker, |d| {
+				d.child(
+					div()
+						.id("workspace-path-input")
+						.relative()
+						.child(self.workspace_path_input.clone())
+						.children(probe(log, "workspace-path-input")),
+				)
+				.child(
+					button(
+						"btn-workspace-open-confirm",
+						t("workspace_open_confirm", loc),
+						Btn::Primary,
+						true,
+						63,
+					)
+					.on_click(cx.listener(|this, _, _, cx| {
+						let text = this
+							.workspace_path_input
+							.read(cx)
+							.text()
+							.trim()
+							.to_string();
+						this.confirm_open_workspace(&text, cx);
+					}))
+					.children(probe(log, "btn-workspace-open-confirm")),
+				)
+			});
+		div()
+			.relative()
+			.flex_shrink_0()
+			.max_w(px(180.))
+			.child(
+				div()
+					.id("btn-workspace-menu")
+					.relative()
+					.flex()
+					.items_center()
+					.min_w_0()
+					.max_w(px(160.))
+					.h(px(26.))
+					.px(px(8.))
+					.rounded(px(4.))
+					.cursor_pointer()
+					.hover(|s| s.bg(rgb(HOVER_BG)))
+					.when(self.workspace_menu, |d| d.bg(rgb(HOVER_BG)))
+					.tooltip(tip(format!(
+						"{tip_text} · {}",
+						t("tip_workspace_menu", loc)
+					)))
+					.on_click(cx.listener(|this, _, _, cx| {
+						this.toggle_workspace_menu(cx);
+					}))
+					.child(clip_text(label))
+					.children(probe(log, "btn-workspace-menu")),
+			)
+			.when(self.workspace_menu, |d| {
+				d.child(
+					div().absolute().top(px(28.)).left_0().child(
+						deferred(anchored().snap_to_window().child(panel))
+							.with_priority(1),
+					),
+				)
+			})
+			.into_any_element()
+	}
+
+	fn render_workspace_closed(&self) -> AnyElement {
+		let loc = self.locale;
+		div()
+			.id("workspace-closed")
+			.relative()
+			.flex_1()
+			.min_w_0()
+			.flex()
+			.items_center()
+			.justify_center()
+			.bg(rgb(EDITOR_BG))
+			.child(
+				div()
+					.max_w(px(420.))
+					.px(px(16.))
+					.text_color(rgb(TEXT_MUTED))
+					.child(t("workspace_closed", loc)),
+			)
+			.children(probe(&self.probes, "workspace-closed"))
+			.into_any_element()
+	}
+
 	fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
-		let ws_name = self
-			.workspace_root
-			.file_name()
-			.map(|n| n.to_string_lossy().to_string())
-			.unwrap_or_else(|| self.workspace_root.display().to_string());
+
 		let repo = self.repo();
 		let count = self.basket_count();
 		let copy_reason = if self.is_copying {
@@ -828,16 +991,7 @@ impl WorkbenchModel {
 					.text_color(rgb(ACCENT_TEXT))
 					.child("S"),
 			)
-			.child(
-				div()
-					.id("hdr-workspace")
-					.min_w_0()
-					.max_w(px(140.))
-					.px(px(4.))
-					.text_color(rgb(TEXT_MUTED))
-					.tooltip(tip(self.workspace_root.display().to_string()))
-					.child(clip_text(ws_name)),
-			)
+			.child(self.render_workspace_chip(cx))
 			.child(toolbar_divider())
 			.child(
 				div()
@@ -912,6 +1066,21 @@ impl WorkbenchModel {
 						.when_some(copy_reason, |b, r| b.tooltip(tip(r)))
 						.children(probe(log, "btn-copy")),
 					)
+					.when(self.is_copying, |row| {
+						row.child(
+							button(
+								"btn-copy-cancel",
+								t("btn_copy_cancel", loc),
+								Btn::Default,
+								true,
+								32,
+							)
+							.on_click(cx.listener(|this, _, _, cx| {
+								this.cancel_copy(cx)
+							}))
+							.children(probe(log, "btn-copy-cancel")),
+						)
+					})
 					.child(
 						icon_button(
 							"btn-basket-clear",
@@ -4099,6 +4268,16 @@ impl WorkbenchModel {
 						&[&repos_s, &errors_s],
 					)),
 			)
+			.child(status_sep())
+			.child({
+				let jobs = self.lifecycle.live_jobs().to_string();
+				div()
+					.id("lifecycle-jobs")
+					.relative()
+					.flex_shrink_0()
+					.child(tf("lifecycle_jobs", loc, &[&jobs]))
+					.children(probe(&self.probes, "lifecycle-jobs"))
+			})
 			.children(probe(&self.probes, "status-bar"))
 			.into_any_element()
 	}
@@ -4127,15 +4306,30 @@ impl Render for WorkbenchModel {
 		let left_w = self.effective_left_w(vw);
 		let bottom_h = self.effective_bottom_h(vh);
 
-		let center = match self.paste_preview {
-			Some(ref plan) => self.render_paste(plan, cx),
-			None => self.render_editor(cx),
+		let center = if !self.workspace_open && self.paste_preview.is_none() {
+			self.render_workspace_closed()
+		} else {
+			match self.paste_preview {
+				Some(ref plan) => self.render_paste(plan, cx),
+				None => self.render_editor(cx),
+			}
 		};
 
 		div()
 			.track_focus(&self.focus_handle)
 			.key_context("Workbench")
-			.on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
+			.on_action(cx.listener(|this, _: &Quit, _, cx| {
+				this.begin_quit(cx);
+			}))
+			.on_action(cx.listener(|this, _: &CloseWorkspace, _, cx| {
+				this.request_user_close(
+					crate::lifecycle::Intent::CloseWorkspace,
+					cx,
+				);
+			}))
+			.on_action(cx.listener(|this, _: &OpenWorkspace, _, cx| {
+				this.show_workspace_picker(cx);
+			}))
 			.on_action(cx.listener(|this, _: &CopySelection, _, cx| {
 				this.copy_selection_to_clipboard(cx)
 			}))

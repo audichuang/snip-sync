@@ -462,6 +462,13 @@ impl Reader {
 		self.scroll.scroll_to_item(0, ScrollStrategy::Top);
 	}
 
+	pub fn release_retained(&mut self) {
+		self.matches = Vec::new();
+		self.anchor = None;
+		self.head = None;
+		self.current = None;
+	}
+
 	pub fn selection(&self) -> Option<(Pos, Pos)> {
 		let (a, h) = (self.anchor?, self.head?);
 		(a != h).then(|| if a <= h { (a, h) } else { (h, a) })
@@ -1407,5 +1414,21 @@ mod tests {
 		// Subslice spanning the 4096 boundary preserves multibyte characters exactly
 		let cross_sel_text = selected_text(&p, ((0, 4090), (0, 4110)));
 		assert!(cross_sel_text.starts_with("繁體"));
+	}
+
+	#[test]
+	fn release_retained_drops_match_capacity() {
+		let mut reader = Reader::default();
+		reader.matches.reserve(32);
+		reader.matches.push((0, 1, 2));
+		reader.anchor = Some((3, 4));
+		reader.head = Some((5, 6));
+		reader.current = Some(0);
+		reader.release_retained();
+		assert!(reader.matches.is_empty());
+		assert_eq!(reader.matches.capacity(), 0);
+		assert!(reader.anchor.is_none());
+		assert!(reader.head.is_none());
+		assert!(reader.current.is_none());
 	}
 }
