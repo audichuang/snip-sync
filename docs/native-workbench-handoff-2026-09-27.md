@@ -4,13 +4,13 @@
 
 > 🧠 **From Hindsight memory (Initiatives and enhancements)** — 既定交付範圍仍包含 D0–D5、15 repo、多機雙向剪貼簿同步、記憶體與真實 UI 驗收；UI 或局部測試通過不等於可以發版。以下當前狀態以 2026-09-27 的工作樹、程式碼與測試紀錄為準。
 
-## 0.1 第四段已完成增量
+## 0.1 第四段已完成增量（截至 `e2a542f`）
 
-XIM 啟動競態 `09c9927`、Graph 16 MiB／失敗換頁一致性 `708cd08`、共享 core 讀取取消與錯誤分類 `c77a516`、已接納 UI 預覽 32 MiB `bceffed`、真鍵盤焦點與操作 `76bcdd2`、Reader 行座標清理 `c020391` 已提交。各有對應單元或真 UI 回歸及主 agent 獨立驗證；詳見 [最新監督紀錄](native-workbench-supervision.md)。
+最新接受範圍與逐批證據見 [監督紀錄](native-workbench-supervision.md)。Graph 16 MiB／換頁一致性、release XIM 啟動競態、共享預覽／paste pending 32 MiB、selector 可見列、真鍵盤焦點、Reader 錯誤清理與原始 byte 全選均已提交並有相應獨立驗證。尚不能宣稱全域 retained 64 MiB 或所有一般讀取工作有界。
 
-協作 runner `4724e92` 的歷史凍結 binary run4 已通過雙端各 15 repo 的 18 案、36 次乾淨退出；可比效能／資源 drivers `6b5f50b` 已整合，Python harness 340 tests 通過。這些不代替最終 binary 的全組驗收。證據在 `session4/`，原始失敗輪次保留。
+IME／協作／資源的 build-pinned 入口已接入 just、preflight 和 Linux CI。`8dfd3db` 的 all run 通過 IME startup＋九階段、協作 18/18／36 次正常退出，資源部分失敗；來源錯誤與 driver 例外處理修正後，乾淨 `2f11854` 的 release medium-fixture 100 次切換為 `SUBGATE_ACCEPTED`。這些是各自來源的證據，最終整合版仍須全組重跑。
 
-目前仍在完成 pending paste/read 工作的容量與數量界線、tree/basket/selector 8 MiB、D3 剩餘可見退化／平台案例、正式十輪效能、完整資源長測及 just/CI 入口。highlight/input source audit 的當前 toolchain 保守 retained 上界低於 1.77 MiB，未宣稱 renderer/RSS 或全域 64 MiB。最後完整 preflight 仍是 `fbec418`，不是目前所有變更的綠燈；未推送／PR／CI／發版。
+接續：部分套用結果、tree/basket 8 MiB 與非 paste worker ownership、D3 剩餘 graph／workspace／平台證據、正式十輪可比效能、watcher／hide／tray 及長測。Linux tray 的依賴／vendor 例外待使用者回答。最後完整 preflight 仍是歷史 `fbec418`；未推送／PR／CI／發版。先完成 Linux，再跑真正 macOS arm64／Intel CI，安裝後由使用者驗證 Mac GUI／IME。`session4/` 收據保留所有失敗與被退回的中間結果。
 
 ## 0. 最新接續結果（2026-09-27，第三段）
 

@@ -1,5 +1,17 @@
 # Native workbench — supervisor checkpoint
 
+## 2026-09-27 Checkpoint: 共享預覽、驗收入口與 Linux 資源短測
+
+- **新增提交**：`07ea0e7` 將已接納預覽、paste worker、最新待處理輸入、完成結果與 Apply clone 納入共享 32 MiB 計帳；`c2a61ca` 改為借用 selector 資料，只建立可見列。這兩項不代表所有一般讀取工作或全域 retained 64 MiB 已有界。
+- **驗收入口**：`2eb170a` 把凍結 release build／來源收據、IME、18 案協作、資源短測接入 just、preflight 和必要 Linux CI。`613d93b` 修正隔離 D-Bus 的 socket 路徑限制，`8dfd3db` 讓產物與 disposable fixture 留在工作樹外。實跑 `8dfd3db` 的 IME startup＋九階段、協作 18/18／36 次正常退出均通過；資源短測當時失敗，整次 all gate 未通過。
+- **已定位並修復該失敗**：`2f11854` 讓預覽遵守明確 SourceKind，Project 開檔明確使用 File；不再由可見分頁把 Staged 偷換成 filesystem，已刪除 staged 檔可正確預覽。實際 unit red 為 WorkingFile 與 StagedChanges 不符，修正後 88 native units 通過、1 個既有 ignored；all-target clippy 通過。`9239510` 讓資源 driver 保留原始例外，清理仍由 finally 執行；66 harness tests 通過。
+- **獨立 release 短測**：乾淨 `2f11854`、binary `4941b049…`、medium fixture：20 次暖身、100 次量測切換、15 repo、10 個靜止檢查點，`SUBGATE_ACCEPTED`。RSS/PSS 首尾三分段中位數增量 872,448 bytes；FD 19→19、thread 70→70，正常退出且無 owned survivors。這不是 standard workload 的正式十輪對照、30% 改善、絕對記憶體目標或長測通過；watch=0 也不是 watcher 功能驗證。
+- **Reader**：`73dd20b` 修正讀取錯誤後仍可複製舊預覽，清除隱藏來源與選取；hit test 與畫面使用同一段 4096-byte clipping。900×600 且 Git log 開啟時，中英文長行警告和完整一列程式碼可見。實際舊版失敗、修正版與主 agent 獨立 GUI 均有收據；第一輪英文截图尚未完成重繪而被退回，最終以實際警告區域 pixel 穩定為準。
+- **全選 byte integrity**：`e2a542f` 改以原始 retained text 的 byte 範圍複製；Ctrl+A 包含 BOM、CRLF、尾端空白行與 50,000 行索引之外的文字。同一真 UI 測試先在舊版取得 30/34 與 199999/200004 bytes 的錯誤，再於修正版及主 agent 獨立跑出完整 bytes。91 native units 通過、1 既有 ignored，clippy／fmt 通過；證據在 `session4/reader-selection/`。
+- **接續與界線**：部分套用結果、tree/basket 8 MiB 與非 paste worker ownership 仍在分批實作。tray 的依賴／vendor 例外仍待使用者回答；未擅自加入。最後完整 preflight 仍是 `fbec418`，最終整合後必須重跑。尚未推送、PR、CI 或發版；依使用者指示先完成 Linux，再跑真正 macOS arm64／Intel CI，安裝後的 Mac GUI／IME 由使用者實測。
+
+本節證據：`/home/audichuang/research/snip-sync-handoff-20260927/session4/` 下的 `pending-paste/`、`selector/`、`acceptance-wiring/`、`acceptance-8dfd3db/`、`reader-errors-and-notice/`、`source-preview-and-driver/`、`resource-short-2f11854/`。舊 checkpoint 的數字與尚未事項只代表當時來源。
+
 ## 2026-09-27 Checkpoint: 預覽容量、共享讀取、協作與鍵盤回歸
 
 - **已提交**：`c77a516` 將 native preview/change-list 的取消與輸出限制傳到底層 Git 讀取，並保留 cat-file 的非零退出錯誤；`bceffed` 限制已接納的 ordinary preview、paste plan/detail 合計 32 MiB，拒絕超限的新貼上時撤銷旧 Apply，移除 Git 讀取失敗後偷換成 working-file 的 fallback。Apply 仍不可取消，contract、DTO 與相依版本未改。
