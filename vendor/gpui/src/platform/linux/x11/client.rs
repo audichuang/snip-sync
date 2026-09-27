@@ -257,7 +257,10 @@ impl X11ClientStatePtr {
             return;
         };
         let mut state = client.0.borrow_mut();
-        if state.composing || state.ximc.is_none() {
+        if state.composing
+            || state.ximc.is_none()
+            || !state.xim_handler.as_ref().is_some_and(|handler| handler.connected)
+        {
             return;
         }
 
@@ -671,7 +674,7 @@ impl X11Client {
 
     pub fn enable_ime(&self) {
         let mut state = self.0.borrow_mut();
-        if !state.has_xim() {
+        if !state.xim_handler.as_ref().is_some_and(|handler| handler.connected) {
             return;
         }
 
@@ -716,6 +719,9 @@ impl X11Client {
     pub fn reset_ime(&self) {
         let mut state = self.0.borrow_mut();
         state.composing = false;
+        if !state.xim_handler.as_ref().is_some_and(|handler| handler.connected) {
+            return;
+        }
         if let Some(mut ximc) = state.ximc.take() {
             if let Some(xim_handler) = state.xim_handler.as_ref() {
                 ximc.reset_ic(xim_handler.im_id, xim_handler.ic_id).ok();

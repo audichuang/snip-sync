@@ -293,7 +293,7 @@ def git_env() -> dict[str, str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
-    require_all = os.environ.get("SNIP_REQUIRE_ALL_TESTS") == "1"
+    require_all = "SNIP_REQUIRE_ALL_TESTS" in os.environ
     missing = missing_tools()
     decision = decide_run(missing, require_all)
     if decision == "unsupported":
