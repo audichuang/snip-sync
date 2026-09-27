@@ -588,12 +588,16 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	};
 
 	// Asserts a control is no longer drawn (the app reported it gone).
+	// Polls: the frame that drops the control can land well after the event.
 	let absent = |id: &str| {
-		std::thread::sleep(Duration::from_millis(300));
-		assert!(
-			!bounds.lock().unwrap().contains_key(id),
-			"control {id} must not be drawn"
-		);
+		let deadline = Instant::now() + Duration::from_secs(4);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(
+				Instant::now() < deadline,
+				"control {id} must not be drawn"
+			);
+			std::thread::sleep(Duration::from_millis(40));
+		}
 	};
 
 	let click = |id: &str| {

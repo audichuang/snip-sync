@@ -632,6 +632,28 @@ impl WorkbenchModel {
 		rows
 	}
 
+	/// Puts the keyboard row on the selected change (else the first change),
+	/// never on a group header where Space/Enter do nothing.
+	pub(crate) fn sync_list_row(&mut self) {
+		let rows = self.change_item_rows();
+		let file_row = |pred: &dyn Fn(&crate::FileChangeItem) -> bool| {
+			rows.iter().position(|row| {
+				matches!(row, ChangeItemRow::File { file_idx }
+					if self.files.get(*file_idx).is_some_and(pred))
+			})
+		};
+		let row = file_row(&|f| {
+			self.selected_file.as_deref() == Some(f.path.as_str())
+				&& self
+					.selected_file_source
+					.as_ref()
+					.is_none_or(|s| s == &f.source)
+		})
+		.or_else(|| file_row(&|_| true))
+		.unwrap_or(0);
+		self.selected_list_row = row;
+	}
+
 	/// Keyboard: activate / expand / toggle the row under the tool cursor.
 	fn tool_action(
 		&mut self,
@@ -2204,8 +2226,24 @@ impl WorkbenchModel {
 		};
 		let row_id = format!("change-row:{path}");
 		let src_row_id = format!("change-row:{source_str}:{path}");
-		let chk_id = format!("change-chk:{path}");
-		let src_chk_id = format!("change-chk:{source_str}:{path}");
+		// Like the project tree, a name that is not UTF-8 cannot be selected.
+		let checkable = item.is_valid_utf8();
+		let (chk_id, src_chk_id) = if checkable {
+			(
+				format!("change-chk:{path}"),
+				format!("change-chk:{source_str}:{path}"),
+			)
+		} else {
+			(
+				format!("change-chk-invalid:{ix}"),
+				format!("change-chk-invalid:{source_str}:{ix}"),
+			)
+		};
+		let tooltip = if checkable {
+			format!("{path}  ({letter})")
+		} else {
+			format!("{path}  ({letter})\n{}", t("change_not_utf8", self.locale))
+		};
 		let path_click = path.clone();
 		let item_source = item.source.clone();
 
@@ -2226,7 +2264,7 @@ impl WorkbenchModel {
 			.when(cursor && !selected && self.left_active, |d| {
 				d.border_1().border_color(rgb(FOCUS_RING))
 			})
-			.tooltip(tip(format!("{path}  ({letter})")))
+			.tooltip(tip(tooltip))
 			.on_click(cx.listener(move |this, _, _, cx| {
 				this.selected_list_row = row_idx;
 				this.select_file_with_source(
@@ -2244,11 +2282,21 @@ impl WorkbenchModel {
 					.flex()
 					.items_center()
 					.justify_center()
-					.on_click(cx.listener(move |this, _, _, cx| {
-						cx.stop_propagation();
-						this.toggle_file(ix, cx);
-					}))
-					.child(checkbox(item.selected))
+					.when(checkable, |d| {
+						d.on_click(cx.listener(move |this, _, _, cx| {
+							cx.stop_propagation();
+							this.toggle_file(ix, cx);
+						}))
+					})
+					.child(if checkable {
+						checkbox(item.selected).into_any_element()
+					} else {
+						div()
+							.text_size(px(9.))
+							.text_color(rgb(TEXT_MUTED))
+							.child("×")
+							.into_any_element()
+					})
 					.children(probe(log, chk_id))
 					.children(probe(log, src_chk_id)),
 			)
@@ -4365,14 +4413,13 @@ impl WorkbenchModel {
 		let errors = self.repos.iter().filter(|r| r.summary.is_err()).count();
 		let count_s = self.basket_count().to_string();
 		let basket_n = count_s.clone();
-		let basket_detail = self.basket_summary_localized(loc);
-		let basket_label = if let Some(collision) = self.basket_collision_text()
-		{
-			tf("basket_collision", loc, &[&collision])
+		let (basket_detail, collision) = &self.basket_view;
+		let basket_label = if let Some(collision) = collision {
+			tf("basket_collision", loc, &[collision])
 		} else if self.basket_count() == 0 {
 			t("basket_empty", loc).to_string()
 		} else {
-			tf("basket_summary", loc, &[&basket_n, &basket_detail])
+			tf("basket_summary", loc, &[&basket_n, basket_detail])
 		};
 		let repos_s = self.repos.len().to_string();
 		let errors_s = errors.to_string();

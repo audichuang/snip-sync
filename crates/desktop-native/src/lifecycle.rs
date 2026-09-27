@@ -244,8 +244,10 @@ impl Lifecycle {
 			intent: current, ..
 		} = &mut self.phase
 		{
-			if matches!(intent, Intent::Quit) {
-				*current = Intent::Quit;
+			// The drain is the same for every intent, so the newest request
+			// is what it finishes into; only Quit is never taken back.
+			if !matches!(current, Intent::Quit) {
+				*current = intent;
 			}
 			return Request::Busy;
 		}
@@ -464,6 +466,36 @@ mod tests {
 		assert_eq!(life.generation(), 2);
 		assert_eq!(life.request(Intent::Quit, now), Request::Busy);
 		assert_eq!(life.generation(), 2);
+		assert_eq!(life.intent_name(), "quit");
+	}
+
+	#[test]
+	fn open_during_close_drain_is_kept_and_quit_stays_final() {
+		let mut life = fresh();
+		let now = Instant::now();
+		let flag = life.register(JobKind::CancellableRead, None).1;
+		let path = std::path::PathBuf::from("/next");
+		assert_eq!(
+			life.request(Intent::CloseWorkspace, now),
+			Request::Accepted
+		);
+		assert_eq!(
+			life.request(Intent::OpenWorkspace(path.clone()), now),
+			Request::Busy
+		);
+		assert_eq!(life.generation(), 2);
+		drop(flag);
+		assert_eq!(
+			life.poll_at(now, GitLoad::idle()),
+			Step::Ready(Intent::OpenWorkspace(path.clone()))
+		);
+
+		let _live = life.register(JobKind::CancellableRead, None).1;
+		assert_eq!(life.request(Intent::Quit, now), Request::Accepted);
+		assert_eq!(
+			life.request(Intent::OpenWorkspace(path), now),
+			Request::Busy
+		);
 		assert_eq!(life.intent_name(), "quit");
 	}
 
