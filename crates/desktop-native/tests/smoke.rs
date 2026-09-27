@@ -1956,7 +1956,7 @@ fn native_graph_failed_next_page_is_transactional() {
 				assert_eq!(pixels.stdout.len(), (w * h * 3) as usize);
 				let pixels = pixels.stdout.as_chunks::<3>().0;
 				// Existing theme ERROR_BG and antialiased ERROR text.
-				pixels.iter().any(|p| *p == [64, 41, 41])
+				pixels.contains(&[64, 41, 41])
 					&& pixels.iter().any(|p| {
 						p[0].abs_diff(247) <= 16
 							&& p[1].abs_diff(84) <= 16
