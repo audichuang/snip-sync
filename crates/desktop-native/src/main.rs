@@ -1642,6 +1642,8 @@ impl WorkbenchModel {
 				p.fingerprint()
 			);
 		}
+		// The caller that read it names its repo again after installing.
+		self.preview_root = None;
 		self.preview = Some(p);
 		self.preview_loading = false;
 		self.preview_error = None;
@@ -1655,6 +1657,7 @@ impl WorkbenchModel {
 		let pool = self.paste_pending.clone();
 		let mut state = paste::lock_pending(&pool);
 		self.preview = None;
+		self.preview_root = None;
 		state
 			.admit_ui(
 				None,
@@ -3160,6 +3163,19 @@ impl WorkbenchModel {
 			}
 		}
 
+		// A superseded read of the previously open repo is dropped when it
+		// lands; the queue reads that repo instead of leaving it loading.
+		let previous = self.repo_root();
+		if previous.as_ref() != Some(&self.repos[idx].root) {
+			if let Some(prev) = previous.filter(|prev| {
+				self.change_repos.iter().any(|s| {
+					&s.root == prev && s.state == ChangeRepoState::Loading
+				})
+			}) {
+				self.changes_queue.push(prev);
+				self.pump_changes(cx);
+			}
+		}
 		self.selected_repo_idx = Some(idx);
 		self.selected_file = anchor_file.clone();
 		self.selected_commit = anchor_commit.clone();
