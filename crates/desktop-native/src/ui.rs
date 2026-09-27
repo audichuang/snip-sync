@@ -5118,6 +5118,7 @@ impl WorkbenchModel {
 						!all && scope.iter().any(|(r, _)| *r == repo.root);
 					let root = repo.root.clone();
 					let id = format!("log-repo:{}", repo.name);
+					let check_id = format!("log-repo-check:{}", repo.name);
 					items.push(
 						div()
 							.id(SharedString::from(id.clone()))
@@ -5130,11 +5131,32 @@ impl WorkbenchModel {
 							.rounded(px(4.))
 							.cursor_pointer()
 							.hover(|s| s.bg(rgb(pal().hover_bg)))
-							.on_click(cx.listener(move |this, _, _, cx| {
-								cx.stop_propagation();
-								this.toggle_log_repo(root.clone(), cx)
-							}))
-							.child(checkbox(checked))
+							// The row picks only this repository; its checkbox
+							// adds or removes it.
+							.on_click({
+								let root = root.clone();
+								cx.listener(move |this, _, _, cx| {
+									cx.stop_propagation();
+									this.set_log_repos(vec![root.clone()], cx)
+								})
+							})
+							.child(
+								div()
+									.id(SharedString::from(check_id.clone()))
+									.relative()
+									.flex_shrink_0()
+									.on_click(cx.listener(
+										move |this, _, _, cx| {
+											cx.stop_propagation();
+											this.toggle_log_repo(
+												root.clone(),
+												cx,
+											)
+										},
+									))
+									.child(checkbox(checked))
+									.children(probe(log, check_id)),
+							)
 							.child(
 								div()
 									.flex_shrink_0()
@@ -5383,7 +5405,7 @@ impl WorkbenchModel {
 			.occlude()
 			.min_w(px(200.))
 			.max_w(px(360.))
-			.max_h(px(320.))
+			.max_h(px(if menu == LogMenu::Repo { 480. } else { 320. }))
 			.overflow_y_scroll()
 			.flex()
 			.flex_col()
@@ -5950,7 +5972,16 @@ impl WorkbenchModel {
 			.border_color(rgb(pal().divider))
 			.child(
 				div()
-					.w(px(240.))
+					// A narrow log keeps room for the filter chips.
+					.w(px(
+						if self.log_width.get() > 0.
+							&& self.log_width.get() < 1200.
+						{
+							160.
+						} else {
+							240.
+						},
+					))
 					.min_w(px(96.))
 					.h(px(26.))
 					.px(px(6.))
@@ -5995,6 +6026,14 @@ impl WorkbenchModel {
 					.flex_1()
 					.min_w_0()
 					.overflow_hidden()
+					.when(self.repos.len() > 1, |d| {
+						d.child(self.log_chip(
+							LogMenu::Repo,
+							t("log_chip_repo", loc),
+							repo_value,
+							cx,
+						))
+					})
 					.child(self.log_chip(
 						LogMenu::Branch,
 						t("log_chip_branch", loc),
@@ -6018,15 +6057,7 @@ impl WorkbenchModel {
 						t("log_chip_paths", loc),
 						paths_value,
 						cx,
-					))
-					.when(self.repos.len() > 1, |d| {
-						d.child(self.log_chip(
-							LogMenu::Repo,
-							t("log_chip_repo", loc),
-							repo_value,
-							cx,
-						))
-					}),
+					)),
 			)
 			.child(
 				log_icon_button(
