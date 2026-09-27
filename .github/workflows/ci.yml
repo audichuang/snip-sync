@@ -219,7 +219,8 @@ jobs:
               shell: bash
               run: |
                   mkdir -p .ts-ref
-                  git -C .ts-ref-src archive HEAD src test scripts AGENTS.md | tar -x -C .ts-ref
+                  git -C .ts-ref-src archive --format=tar --output="$RUNNER_TEMP/ts-reference.tar" HEAD src test scripts AGENTS.md
+                  tar -xf "$RUNNER_TEMP/ts-reference.tar" -C .ts-ref
             - name: Setup Node (cross-tool tests)
               uses: actions/setup-node@v4
               with:
