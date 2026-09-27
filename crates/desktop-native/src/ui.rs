@@ -505,11 +505,24 @@ fn short_ref(name: &str) -> &str {
 		.unwrap_or(name)
 }
 
-/// Rough rendered width: CJK and other wide glyphs are a full em.
-fn approx_text_w(s: &str, size: f32) -> f32 {
-	s.chars()
-		.map(|c| if c.is_ascii() { size * 0.55 } else { size })
-		.sum()
+/// Width of `s` laid out in the UI font at `size`, from the text system
+/// (shaped lines are cached per frame, so a redraw does not reshape).
+fn text_width(window: &Window, s: &str, size: f32) -> f32 {
+	let s = s.replace(['\n', '\r'], " ");
+	let run = gpui::TextRun {
+		len: s.len(),
+		font: gpui::font(UI_FONT),
+		color: gpui::black(),
+		background_color: None,
+		underline: None,
+		strikethrough: None,
+	};
+	f32::from(
+		window
+			.text_system()
+			.shape_line(s.into(), px(size), &[run], None)
+			.width,
+	)
 }
 
 /// [`log_date_in`] in the viewer's time zone, now.
@@ -584,20 +597,22 @@ fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
 
 /// A row's ref labels, right-aligned at the end of the subject: label icon
 /// plus name, at most two, the rest folded into `+N`. Also returns their
-/// estimated width.
+/// laid-out width (`measure` gives a name's text width).
 fn ref_label_elements(
 	refs: &[snip_core::graph::RefInfo],
 	current_branch: Option<&str>,
 	row: &str,
 	show_tips: bool,
+	measure: &dyn Fn(&str) -> f32,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	let mut width = 0.;
+	// Labels are 8px apart; each is icon (14) + 3 + name, at most 160.
+	let mut width = shown.len().saturating_sub(1) as f32 * 8.;
 	let mut out: Vec<AnyElement> = shown
 		.iter()
 		.map(|b| {
 			let l = graph_view::ref_label(b, current_branch);
-			width += 18. + approx_text_w(&l.text, SMALL_TEXT).min(140.) + 8.;
+			width += (17. + measure(&l.text)).min(160.);
 			let tooltip = std::iter::once(b.primary)
 				.chain(b.merged.iter().copied())
 				.map(|i| graph_view::format_ref_badge(i).0)
@@ -620,7 +635,7 @@ fn ref_label_elements(
 		})
 		.collect();
 	if hidden > 0 {
-		width += 30.;
+		width += 8. + measure(&format!("+{hidden}"));
 		let all = refs
 			.iter()
 			.map(|i| graph_view::format_ref_badge(i).0)
@@ -5168,18 +5183,21 @@ impl WorkbenchModel {
 		let list = uniform_list(
 			"log-rows",
 			n + usize::from(loading_row),
-			cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-				this.autoload_near(n, cx);
-				range
-					.map(|ix| {
-						if ix >= n {
-							return this.log_loading_row();
-						}
-						let tint = on_head.get(ix).copied().unwrap_or(false);
-						this.log_row(ix, gutter_w, list_w, tint, cx)
-					})
-					.collect::<Vec<_>>()
-			}),
+			cx.processor(
+				move |this, range: std::ops::Range<usize>, window, cx| {
+					this.autoload_near(n, cx);
+					range
+						.map(|ix| {
+							if ix >= n {
+								return this.log_loading_row();
+							}
+							let tint =
+								on_head.get(ix).copied().unwrap_or(false);
+							this.log_row(ix, gutter_w, list_w, tint, window, cx)
+						})
+						.collect::<Vec<_>>()
+				},
+			),
 		)
 		.track_scroll(self.log_scroll.clone())
 		.size_full();
@@ -5366,6 +5384,7 @@ impl WorkbenchModel {
 		gutter_w: f32,
 		list_w: f32,
 		on_head: bool,
+		window: &Window,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let rows = self.display_commits();
@@ -5411,6 +5430,7 @@ impl WorkbenchModel {
 					current_branch.as_deref(),
 					short(&sha),
 					show_tips,
+					&|s: &str| text_width(window, s, SMALL_TEXT),
 				)
 			})
 			.unwrap_or_default();
@@ -5419,11 +5439,15 @@ impl WorkbenchModel {
 			.as_deref()
 			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email));
 		let hash_w = if self.log_show_hash { 64. } else { 0. };
-		// ponytail: estimated text width (no shaping per row); a subject
-		// near the edge may miss or gain its tooltip.
+		// The subject cell is what the row's fixed parts leave (8px right
+		// padding, 8px gaps between the cells, 6px before the labels).
+		let gaps = if self.log_show_hash { 4. } else { 3. } * 8.;
 		let subject_room =
-			list_w - gutter_w - AUTHOR_W - DATE_W - hash_w - labels_w - 40.;
-		let truncated = approx_text_w(&c.subject, UI_TEXT) > subject_room;
+			list_w
+				- 8. - gaps - gutter_w
+				- AUTHOR_W - DATE_W
+				- hash_w - if labels_w > 0. { labels_w + 6. } else { 0. };
+		let truncated = text_width(window, &c.subject, UI_TEXT) > subject_room;
 		let row_id = format!("commit-row:{}", short(&sha));
 		let col_id = format!("collapse:{}", short(&sha));
 		let merge_sha = sha.clone();
