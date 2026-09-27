@@ -400,6 +400,8 @@ pub struct LogQuery {
 	pub author: Option<String>,
 	/// Lower date bound in any form `git log --since` accepts.
 	pub since: Option<String>,
+	/// Upper date bound in any form `git log --until` accepts.
+	pub until: Option<String>,
 	/// Only commits touching one of these repository-relative paths.
 	pub paths: Vec<String>,
 }
@@ -409,6 +411,7 @@ impl LogQuery {
 		self.text.trim().is_empty()
 			&& self.author.is_none()
 			&& self.since.is_none()
+			&& self.until.is_none()
 			&& self.paths.is_empty()
 	}
 }
@@ -471,6 +474,14 @@ pub fn history_query_with(
 	}
 	if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
 		args.push(format!("--since={since}"));
+	}
+	if let Some(until) = query.until.as_deref().filter(|s| !s.is_empty()) {
+		args.push(format!("--until={until}"));
+	}
+	// With paths, git rewrites parents to the nearest commit that touches
+	// them too, so the graph of the matches stays connected.
+	if query.paths.iter().any(|p| !p.is_empty()) {
+		args.push("--parents".into());
 	}
 	match (hash, reference.filter(|s| !s.is_empty())) {
 		(Some(sha), _) => args.extend(["--no-walk".into(), sha]),
@@ -1482,6 +1493,30 @@ mod tests {
 			..Default::default()
 		};
 		assert!(subjects(&future).is_empty());
+		let until = |u: &str| LogQuery {
+			until: Some(u.into()),
+			..Default::default()
+		};
+		assert!(subjects(&until("2000-01-01")).is_empty());
+		assert_eq!(subjects(&until("2099-01-01")).len(), 3);
+		let range = LogQuery {
+			since: Some("2000-01-01".into()),
+			until: Some("2099-01-01 23:59:59".into()),
+			..Default::default()
+		};
+		assert_eq!(subjects(&range).len(), 3);
+		// Several paths combine; parents skip the commits between matches.
+		let two = LogQuery {
+			paths: vec!["a.txt".into(), "docs/c.md".into()],
+			..Default::default()
+		};
+		let (commits, _) =
+			history_query_with(&g, None, &two, 0, 10, &RunOptions::default())
+				.unwrap();
+		let names: Vec<_> =
+			commits.iter().map(|c| c.subject.as_str()).collect();
+		assert_eq!(names, ["Add docs", "Fix login"]);
+		assert_eq!(commits[0].parents, [commits[1].sha.clone()]);
 		// A hash shows just that commit, not its ancestors.
 		let top = run(root, &["rev-parse", "HEAD"]);
 		assert_eq!(subjects(&q(&top[..8])), ["Add docs"]);
