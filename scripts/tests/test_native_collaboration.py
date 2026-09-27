@@ -1886,7 +1886,7 @@ class DiscontinuousFlowTests(unittest.TestCase):
     def test_real_copy_refusal_keeps_the_same_sentinel_and_selects_actual_tips(self):
         session = _FlowSession()
         session.click_result = "[APP:COPY_COMMITS_ERR: commits are not contiguous: following first parents back from tip]"
-        native = SimpleNamespace(require_control=lambda *a: (0, 0, 10, 10), assert_on_window=lambda *a: None)
+        native = SimpleNamespace(parse_bounds=lambda lines: {"btn-copy-commits": (0, 0, 10, 10)}, require_control=lambda *a: (0, 0, 10, 10), assert_on_window=lambda *a: None)
         manifest = {"repos": [{"repoId": "a-west-billing", "basename": "billing", "relativePath": "machine-a/west/billing"}]}
         step = {"selection": {"baseOid": "base", "tipOid": "tip", "oids": ["different", "tip"]}}
         selected = []

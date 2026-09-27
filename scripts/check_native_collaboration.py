@@ -1072,6 +1072,17 @@ def scroll_in_view(native: Any, session: Any, win: dict[str, Any], control: str,
     raise MissingControl(control, f"not inside {viewport_id} after {steps} wheel steps")
 
 
+def wait_control(native: Any, session: Any, control: str, timeout: float) -> tuple[int, int, int, int]:
+    """Bounds of a control once the app reports it; it can lag the event that enables it by a frame."""
+    deadline = time.monotonic() + timeout
+    while True:
+        lines = session.texts()
+        remaining = deadline - time.monotonic()
+        if control in native.parse_bounds(lines) or remaining <= 0:
+            return native.require_control(lines, control)
+        time.sleep(min(0.05, remaining))
+
+
 def click_control(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, viewport: str | None = None) -> None:
     left_row = control.startswith(("change-", "tree-", "left-"))
     if viewport == "left-list" or (viewport is None and left_row):
@@ -1085,15 +1096,8 @@ def click_control(native: Any, session: Any, win: dict[str, Any], control: str, 
     elif viewport:
         box = scroll_in_view(native, session, win, control, viewport, timeout)
     else:
-        deadline = time.monotonic() + timeout
-        while True:
-            lines = session.texts()
-            remaining = deadline - time.monotonic()
-            if control in native.parse_bounds(lines) or remaining <= 0:
-                break
-            time.sleep(min(0.05, remaining))
         try:
-            box = native.require_control(lines, control)
+            box = wait_control(native, session, control, timeout)
         except Exception as exc:
             raise MissingControl(control, str(exc)) from exc
     native.assert_on_window(box, win, control)
@@ -1224,7 +1228,7 @@ def copy_from_button(native: Any, session: Any, win: dict[str, Any], timeout: fl
     session.set_clipboard(sentinel)
     if session.read_clipboard() != sentinel:
         raise ClipboardMismatch("sentinel did not stick on the source clipboard")
-    box = native.require_control(session.texts(), "btn-copy")
+    box = wait_control(native, session, "btn-copy", timeout)
     native.assert_on_window(box, win, "btn-copy")
     before = len(session.lines)
     session.click(win, box)
@@ -1245,7 +1249,7 @@ def copy_from_button(native: Any, session: Any, win: dict[str, Any], timeout: fl
 
 
 def paste_preview(native: Any, session: Any, win: dict[str, Any], timeout: float, trace: list[dict[str, Any]]) -> str:
-    box = native.require_control(session.texts(), "btn-paste")
+    box = wait_control(native, session, "btn-paste", timeout)
     native.assert_on_window(box, win, "btn-paste")
     before = len(session.lines)
     session.click(win, box)
@@ -1413,7 +1417,7 @@ def resolve_paste_mappings(
 
 
 def apply_or_cancel(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, trace: list[dict[str, Any]]) -> str:
-    box = native.require_control(session.texts(), control)
+    box = wait_control(native, session, control, timeout)
     native.assert_on_window(box, win, control)
     before = len(session.lines)
     session.click(win, box)
@@ -1610,7 +1614,7 @@ def copy_commits(native: Any, session: Any, win: dict[str, Any], timeout: float,
     session.set_clipboard(sentinel)
     if session.read_clipboard() != sentinel:
         raise ClipboardMismatch("commit sentinel did not stick on the source clipboard")
-    box = native.require_control(session.texts(), "btn-copy-commits")
+    box = wait_control(native, session, "btn-copy-commits", timeout)
     native.assert_on_window(box, win, "btn-copy-commits")
     before = len(session.lines)
     session.click(win, box)
