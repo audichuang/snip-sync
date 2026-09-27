@@ -1,7 +1,7 @@
 # snip-sync — 規劃與可行性評估
 
-> 狀態:**核心、CLI、桌面 App、CI 已實作於 `feat/snip-core`**(見 [docs/tickets](docs/tickets/README.md))。
-> 尚未在 CI、Windows、macOS 與兩台實機上驗證(Phase 0)。
+> 正式版包含核心、CLI 與 Tauri 桌面 App；正在準備 v0.2.0，另提供 GPUI 原生 Git 工作臺候選包。
+> 原生版的 Mac／Windows 實機輸入、系統匣與完整效能驗收仍未完成；本次不切換既有桌面版。詳見 [交付狀態](docs/native-workbench-supervision.md)。
 
 ## 一句話
 

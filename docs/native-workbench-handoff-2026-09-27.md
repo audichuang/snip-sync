@@ -4,6 +4,10 @@
 
 > 🧠 **From Hindsight memory (Initiatives and enhancements)** — 既定交付範圍仍包含 D0–D5、15 repo、多機雙向剪貼簿同步、記憶體與真實 UI 驗收；UI 或局部測試通過不等於可以發版。以下當前狀態以 2026-09-27 的工作樹、程式碼與測試紀錄為準。
 
+## 0.2 使用者收斂發布範圍（最新）
+
+已停止新功能，準備 v0.2.0。tree/basket 階段 1–2 收尾於 `11ad114`；部分套用結果與 graph 草稿保留但不整合。最新驗證及明確限制見[監督紀錄最上方](native-workbench-supervision.md)。以下歷史「接續」清單保留供下一輪使用，不是本次繼續開發的授權。完整 preflight、PR 與 CI／發布目前待跑。
+
 ## 0.1 第四段已完成增量（截至 `e2a542f`）
 
 最新接受範圍與逐批證據見 [監督紀錄](native-workbench-supervision.md)。Graph 16 MiB／換頁一致性、release XIM 啟動競態、共享預覽／paste pending 32 MiB、selector 可見列、真鍵盤焦點、Reader 錯誤清理與原始 byte 全選均已提交並有相應獨立驗證。尚不能宣稱全域 retained 64 MiB 或所有一般讀取工作有界。

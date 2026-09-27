@@ -1,5 +1,15 @@
 # Native workbench — supervisor checkpoint
 
+## 2026-09-27 發布範圍凍結（準備 v0.2.0）
+
+使用者要求停止擴張功能，準備推送與發布。此指示取代繼續逐項完成 D3–D5 後才開始交付的排程；尚未完成的原生驗收仍如實列出，不視為通過。預備方案為既有桌面版／CLI 正式更新，另附原生工作臺候選包，不切換 Homebrew cask。最後狀態以實際 PR、CI 與 release 收據為準。
+
+- `11ad114` 接納 tree/basket 階段 1–2：以實際容量計帳，checkbox／路徑／完整 root＋source＋OID 的籃子整批准入，超限不安裝前綴；不重複配置既有選取。主 agent 重跑 native 100 passed＋1 既有 ignored、core/native clippy。原 historical GUI 因 action/basket 事件順序回歸失敗；修正 production 通知顺序後，未改測試的 historical basket 與 900×600 paging/retry 均通過，截圖已核對。證據 `session4/tree8-stage12/`。
+- source list 的 5,000 上限、revision tree pop-to-fit、tree workers／Copy metadata／同步候選的暫存重疊尚未全面納入限制；不能宣稱完整 8 MiB concurrent tree 或全域 64 MiB。正式十輪效能、watcher／hide／tray、長測及非 Linux 實機仍待完成。
+- 部分套用結果候選保留於 `session4/partial-results-deferred/` 與原 managed worktree；core 測試通過，但未整合、未 native 編譯、未取得修復後 GUI green，不列入本次版本。Graph shallow/page-top 草稿也未整合。
+- 本次凍結後重新跑完整 `just preflight`，通過才推 feature → develop PR，再按 CI green → develop → main → main CI green → tag/release 的流程交付。此段記錄準備狀態，並非完成通知。
+
+
 ## 2026-09-27 Checkpoint: 共享預覽、驗收入口與 Linux 資源短測
 
 - **新增提交**：`07ea0e7` 將已接納預覽、paste worker、最新待處理輸入、完成結果與 Apply clone 納入共享 32 MiB 計帳；`c2a61ca` 改為借用 selector 資料，只建立可見列。這兩項不代表所有一般讀取工作或全域 retained 64 MiB 已有界。
