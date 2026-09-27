@@ -1,7 +1,6 @@
 //! Git log behaviour: paged graph, search, merge collapse, commit / range
 //! selection, endpoint compare, HEAD, and a read-only tree of any commit.
-//! Reads go through `snip-core` (`browser::history`, `gitsrc`, `graph`);
-//! the few missing reads use `core_shim` until core exposes them.
+//! Reads go through `snip-core` (`browser::history`, `gitsrc`, `graph`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -16,6 +15,7 @@ use gpui::{Context, ScrollStrategy};
 use snip_core::browser::{self, BlobText, CommitSummary, TreeEntry, TreeKind};
 use snip_core::gitrun::RunOptions;
 use snip_core::gitsrc::{self, Git, GitSource};
+use snip_core::graph::{GraphCheckpoint, GraphLayout, MAX_SHA_LEN};
 
 /// Files listed for one commit or compare; more are counted, not kept.
 pub const MAX_COMMIT_FILES: usize = 5_000;
@@ -31,6 +31,26 @@ pub const MAX_CACHED_ENTRIES: usize = 10_000;
 pub const MAX_RETAINED_TREE_BYTES: usize = 256 * 1024;
 /// Long Git errors are clipped before they are retained.
 const MAX_STORED_ERROR_BYTES: usize = 240;
+pub const MAX_RETAINED_GRAPH_BYTES: usize = 16 * 1024 * 1024;
+
+// Metadata can change between page admissions. Selection/range/compare OIDs
+// are length-checked and copied into compact strings. TextInput separately
+// retains the typed query as Arc<str> (no spare capacity), bounded by its
+// existing Unicode-character limit; its placeholder is a static translation.
+// Both history_error and the status Msg retain the bounded error. Two Msg
+// argument slots also cover the success status's count/page strings.
+// Framework glyph/layout caches, allocator overhead and temporary candidate
+// copies are outside this application-data accounting. Ref-selector copies
+// belong to the separate selector/tree tier, not this history model.
+const GRAPH_METADATA_RESERVE: usize = 4
+	* (MAX_SHA_LEN + std::mem::size_of::<Option<String>>())
+	+ 4 * crate::text_input::TextInput::MAX_TOTAL_CHARS
+	+ std::mem::size_of::<crate::text_input::TextInput>()
+	+ 2 * std::mem::size_of::<usize>() // Arc<str> reference counts
+	+ 2 * MAX_STORED_ERROR_BYTES
+	+ std::mem::size_of::<Option<String>>()
+	+ std::mem::size_of::<Msg>()
+	+ 2 * std::mem::size_of::<String>();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogSearch {
@@ -529,6 +549,197 @@ pub fn side_only(commits: &[CommitSummary], merge: &str) -> HashSet<String> {
 		.collect()
 }
 
+/// A complete replacement page. Construction only borrows the current cache;
+/// failure cannot attach old rails/checkpoints to new commits or move the page.
+struct PreparedHistory {
+	commits: Vec<CommitSummary>,
+	refs: Vec<browser::GitReference>,
+	head_sha: Option<String>,
+	graph_layout: Option<GraphLayout>,
+	page_checkpoints: Vec<Option<GraphCheckpoint>>,
+	// ponytail: linear membership, bounded by 16 MiB; add a countable index only
+	// if profiling shows collapse lookup matters. No opaque hash-table capacity.
+	collapsed_merges: Vec<String>,
+	hidden_commits: Vec<String>,
+	active_ref_filter: Option<String>,
+	log_search: Option<LogSearch>,
+	commit_page: usize,
+	history_has_more: bool,
+}
+
+#[derive(Debug)]
+enum GraphAdmissionError {
+	Budget,
+	Layout(String),
+}
+
+impl PreparedHistory {
+	fn prepare(
+		history: browser::RepositoryHistory,
+		page: usize,
+		checkpoints: &[Option<GraphCheckpoint>],
+		collapsed_merges: Vec<String>,
+		active_ref_filter: Option<String>,
+		log_search: Option<LogSearch>,
+	) -> Result<Self, GraphAdmissionError> {
+		let mut candidate = Self {
+			commits: history.commits,
+			refs: history.refs,
+			head_sha: history.head,
+			graph_layout: None,
+			page_checkpoints: checkpoints.to_vec(),
+			collapsed_merges,
+			hidden_commits: Vec::new(),
+			active_ref_filter,
+			log_search,
+			commit_page: page,
+			history_has_more: history.has_more,
+		};
+		candidate.check_budget()?;
+		if candidate.commits.iter().any(|commit| {
+			commit.sha.len() > MAX_SHA_LEN
+				|| commit.parents.iter().any(|sha| sha.len() > MAX_SHA_LEN)
+		}) || candidate
+			.head_sha
+			.as_ref()
+			.is_some_and(|sha| sha.len() > MAX_SHA_LEN)
+			|| candidate
+				.refs
+				.iter()
+				.any(|reference| reference.sha.len() > MAX_SHA_LEN)
+		{
+			return Err(GraphAdmissionError::Layout(
+				"Commit ID exceeds graph limit".into(),
+			));
+		}
+		if candidate.log_search.is_none() {
+			let checkpoint = checkpoints.get(page).and_then(Option::as_ref);
+			if page > 0 && checkpoint.is_none() {
+				return Err(GraphAdmissionError::Layout(
+					"Missing graph page checkpoint".into(),
+				));
+			}
+			let full = graph_view::layout_commits_paged(
+				&candidate.commits,
+				&candidate.refs,
+				candidate.head_sha.as_deref(),
+				checkpoint,
+			)
+			.map_err(GraphAdmissionError::Layout)?;
+			if let Some(next) = &full.checkpoint {
+				let slots =
+					page.checked_add(2).ok_or(GraphAdmissionError::Budget)?;
+				if slots.saturating_mul(std::mem::size_of::<
+					Option<GraphCheckpoint>,
+				>()) > MAX_RETAINED_GRAPH_BYTES
+				{
+					return Err(GraphAdmissionError::Budget);
+				}
+				if candidate.page_checkpoints.len() < slots {
+					candidate.page_checkpoints.resize(slots, None);
+				}
+				candidate.page_checkpoints[page + 1] = Some(next.clone());
+			}
+			let hidden: HashSet<String> = candidate
+				.collapsed_merges
+				.iter()
+				.flat_map(|merge| side_only(&candidate.commits, merge))
+				.collect();
+			candidate.graph_layout = Some(if hidden.is_empty() {
+				full
+			} else {
+				let shown: Vec<CommitSummary> = candidate
+					.commits
+					.iter()
+					.filter(|commit| !hidden.contains(&commit.sha))
+					.cloned()
+					.collect();
+				graph_view::layout_commits_filtered(
+					&shown,
+					&candidate.refs,
+					candidate.head_sha.as_deref(),
+					checkpoint,
+					hidden.clone(),
+				)
+				.map_err(GraphAdmissionError::Layout)?
+			});
+			candidate.hidden_commits = hidden.into_iter().collect();
+			candidate.hidden_commits.sort();
+		}
+		candidate.check_budget()?;
+		Ok(candidate)
+	}
+
+	fn retained_bytes(&self) -> usize {
+		use graph_view::vec_bytes;
+		let mut bytes = std::mem::size_of::<Self>()
+			.saturating_add(GRAPH_METADATA_RESERVE)
+			.saturating_add(vec_bytes(&self.commits))
+			.saturating_add(vec_bytes(&self.refs))
+			.saturating_add(vec_bytes(&self.page_checkpoints))
+			.saturating_add(vec_bytes(&self.collapsed_merges))
+			.saturating_add(vec_bytes(&self.hidden_commits));
+		for commit in &self.commits {
+			bytes = bytes
+				.saturating_add(commit.sha.capacity())
+				.saturating_add(commit.author_name.capacity())
+				.saturating_add(commit.author_email.capacity())
+				.saturating_add(commit.author_date.capacity())
+				.saturating_add(commit.subject.capacity())
+				.saturating_add(vec_bytes(&commit.parents));
+			for parent in &commit.parents {
+				bytes = bytes.saturating_add(parent.capacity());
+			}
+		}
+		for reference in &self.refs {
+			bytes = bytes
+				.saturating_add(reference.name.capacity())
+				.saturating_add(reference.sha.capacity());
+		}
+		for value in self
+			.head_sha
+			.iter()
+			.chain(self.active_ref_filter.iter())
+			.chain(self.log_search.iter().map(|search| &search.query))
+			.chain(self.collapsed_merges.iter())
+			.chain(self.hidden_commits.iter())
+		{
+			bytes = bytes.saturating_add(value.capacity());
+		}
+		for checkpoint in self.page_checkpoints.iter().flatten() {
+			bytes = bytes
+				.saturating_add(graph_view::checkpoint_heap_bytes(checkpoint));
+		}
+		if let Some(layout) = &self.graph_layout {
+			bytes = bytes.saturating_add(graph_view::layout_heap_bytes(layout));
+		}
+		bytes
+	}
+
+	fn check_budget(&self) -> Result<(), GraphAdmissionError> {
+		if self.retained_bytes() > MAX_RETAINED_GRAPH_BYTES {
+			Err(GraphAdmissionError::Budget)
+		} else {
+			Ok(())
+		}
+	}
+
+	fn install(self, model: &mut WorkbenchModel) {
+		model.commits = self.commits;
+		model.refs = self.refs;
+		model.head_sha = self.head_sha;
+		model.graph_layout = self.graph_layout;
+		model.page_checkpoints = self.page_checkpoints;
+		model.collapsed_merges = self.collapsed_merges;
+		model.hidden_commits = self.hidden_commits;
+		model.active_ref_filter = self.active_ref_filter;
+		model.log_search = self.log_search;
+		model.commit_page = self.commit_page;
+		model.history_has_more = self.history_has_more;
+		model.history_error = None;
+	}
+}
+
 impl WorkbenchModel {
 	/// Commits visible in the log, in display order.
 	pub fn display_commits(&self) -> Vec<&CommitSummary> {
@@ -539,6 +750,10 @@ impl WorkbenchModel {
 	}
 
 	pub fn load_history(&mut self, cx: &mut Context<Self>) {
+		self.load_history_page(self.commit_page, cx);
+	}
+
+	fn load_history_page(&mut self, page: usize, cx: &mut Context<Self>) {
 		if !self.accepting_work() {
 			return;
 		}
@@ -547,10 +762,12 @@ impl WorkbenchModel {
 		};
 		let ref_filter = self.active_ref_filter.clone();
 		let search = self.log_search.clone();
-		let page = self.commit_page;
 		let page_size = self.history_page_size;
-		let skip = page * page_size;
-		let checkpoint = self.page_checkpoints.get(page).cloned().flatten();
+		let Some(skip) = page.checked_mul(page_size) else {
+			self.report_graph_error(GraphAdmissionError::Budget);
+			cx.notify();
+			return;
+		};
 
 		self.history_generation += 1;
 		let task_generation = self.history_generation;
@@ -617,42 +834,18 @@ impl WorkbenchModel {
 						}
 						match res {
 							Ok(hist) => {
-								model.commits = hist.commits;
-								model.refs = hist.refs;
-								model.head_sha = hist.head;
-								model.history_has_more = hist.has_more;
-								model.hidden_commits.clear();
-								if model.log_search.is_none() {
-									// Checkpoint for the next page comes from the
-									// full (uncollapsed) layout of this page.
-									if let Ok(full) =
-										graph_view::layout_commits_paged(
-											&model.commits,
-											&model.refs,
-											model.head_sha.as_deref(),
-											checkpoint.as_ref(),
-										) {
-										if let Some(next_cp) =
-											full.checkpoint.clone()
-										{
-											if model.page_checkpoints.len()
-												<= page + 1
-											{
-												model
-													.page_checkpoints
-													.resize(page + 2, None);
-											}
-											model.page_checkpoints[page + 1] =
-												Some(next_cp);
-										}
-										model.graph_layout = Some(full);
-									}
-									model.apply_collapse(checkpoint.as_ref());
-								} else {
-									// Search results are not a history: no rails, so
-									// no parent relation is implied between them.
-									model.graph_layout = None;
-								}
+								match PreparedHistory::prepare(hist, page, &model.page_checkpoints,
+                                    model.collapsed_merges.clone(), model.active_ref_filter.clone(), model.log_search.clone()) {
+                                    Ok(candidate) => {
+                                        app_log!("[APP:GRAPH_RETAINED: bytes={} limit={}]", candidate.retained_bytes(), MAX_RETAINED_GRAPH_BYTES);
+                                        candidate.install(model);
+                                    }
+                                    Err(error) => {
+                                        model.report_graph_error(error);
+                                        cx.notify();
+                                        return;
+                                    }
+                                }
 								model.set_status(
 									"status_history_loaded",
 									[
@@ -692,11 +885,7 @@ impl WorkbenchModel {
 								}
 							}
 							Err(e) => {
-								app_log!("[APP:HISTORY_ERROR]");
-								model.commits.clear();
-								model.graph_layout = None;
-								model.history_error = Some(e.clone());
-								model.set_status("error_history", [e]);
+								model.report_graph_error(GraphAdmissionError::Layout(e));
 							}
 						}
 						cx.notify();
@@ -705,81 +894,103 @@ impl WorkbenchModel {
 		);
 	}
 
-	/// Recomputes the displayed layout for the collapsed merges on this page.
-	fn apply_collapse(
-		&mut self,
-		checkpoint: Option<&snip_core::graph::GraphCheckpoint>,
-	) {
-		let mut hidden = HashSet::new();
-		for m in &self.collapsed_merges {
-			hidden.extend(side_only(&self.commits, m));
+	fn report_graph_error(&mut self, error: GraphAdmissionError) {
+		let mut message = match error {
+			GraphAdmissionError::Budget => {
+				crate::i18n::t("error_graph_budget", self.locale).to_string()
+			}
+			GraphAdmissionError::Layout(message) => message,
+		};
+		let mut end = message.len().min(MAX_STORED_ERROR_BYTES);
+		while !message.is_char_boundary(end) {
+			end -= 1;
 		}
-		self.hidden_commits = hidden;
-		if self.hidden_commits.is_empty() {
-			return;
-		}
-		let shown: Vec<CommitSummary> = self
-			.commits
-			.iter()
-			.filter(|c| !self.hidden_commits.contains(&c.sha))
-			.cloned()
-			.collect();
-		match graph_view::layout_commits_filtered(
-			&shown,
-			&self.refs,
-			self.head_sha.as_deref(),
-			checkpoint,
-			self.hidden_commits.clone(),
-		) {
-			Ok(l) => self.graph_layout = Some(l),
-			Err(e) => self.history_error = Some(e),
-		}
+		message.truncate(end);
+		// Boxed str has no spare capacity; errors cannot consume page headroom.
+		let message = message.into_boxed_str().into_string();
+		self.history_error = Some(message.clone());
+		self.set_status("error_history", [message]);
+		app_log!("[APP:HISTORY_ERROR]");
 	}
 
 	pub fn toggle_collapse(&mut self, merge: String, cx: &mut Context<Self>) {
-		let collapsed = if self.collapsed_merges.remove(&merge) {
+		let mut collapsed_merges = self.collapsed_merges.clone();
+		let collapsed = if let Some(index) =
+			collapsed_merges.iter().position(|sha| sha == &merge)
+		{
+			collapsed_merges.remove(index);
 			false
 		} else {
-			self.collapsed_merges.insert(merge.clone());
+			collapsed_merges.push(merge.clone());
 			true
 		};
-		// Re-layout from scratch for this page (checkpoint stays per page).
-		let checkpoint = self
-			.page_checkpoints
-			.get(self.commit_page)
-			.cloned()
-			.flatten();
-		if let Ok(full) = graph_view::layout_commits_paged(
-			&self.commits,
-			&self.refs,
-			self.head_sha.as_deref(),
-			checkpoint.as_ref(),
+		let history = browser::RepositoryHistory {
+			root: String::new(),
+			commits: self.commits.clone(),
+			refs: self.refs.clone(),
+			head: self.head_sha.clone(),
+			has_more: self.history_has_more,
+		};
+		match PreparedHistory::prepare(
+			history,
+			self.commit_page,
+			&self.page_checkpoints,
+			collapsed_merges,
+			self.active_ref_filter.clone(),
+			self.log_search.clone(),
 		) {
-			self.graph_layout = Some(full);
+			Ok(candidate) => {
+				candidate.install(self);
+				app_log!("[APP:MERGE_COLLAPSE: sha={} collapsed={} hidden={} shown={}]",
+                    &merge[..7.min(merge.len())], collapsed, side_only(&self.commits, &merge).len(), self.display_commits().len());
+			}
+			Err(error) => self.report_graph_error(error),
 		}
-		self.apply_collapse(checkpoint.as_ref());
-		let hidden = side_only(&self.commits, &merge).len();
-		app_log!(
-			"[APP:MERGE_COLLAPSE: sha={} collapsed={} hidden={} shown={}]",
-			&merge[..7.min(merge.len())],
-			collapsed,
-			hidden,
-			self.display_commits().len()
-		);
 		cx.notify();
 	}
 
 	pub fn history_next_page(&mut self, cx: &mut Context<Self>) {
 		if self.history_has_more {
-			self.commit_page += 1;
-			self.load_history(cx);
+			self.load_history_page(self.commit_page.saturating_add(1), cx);
 		}
 	}
 
 	pub fn history_prev_page(&mut self, cx: &mut Context<Self>) {
 		if self.commit_page > 0 {
-			self.commit_page -= 1;
-			self.load_history(cx);
+			self.load_history_page(self.commit_page - 1, cx);
+		}
+	}
+
+	/// Changing query identity clears the old graph before the async read.
+	/// Oversized metadata is refused without changing the previous query/page.
+	fn reset_history_query(
+		&mut self,
+		reference: Option<String>,
+		search: Option<LogSearch>,
+	) -> bool {
+		let empty = browser::RepositoryHistory {
+			root: String::new(),
+			commits: Vec::new(),
+			refs: Vec::new(),
+			head: None,
+			has_more: false,
+		};
+		match PreparedHistory::prepare(
+			empty,
+			0,
+			&[],
+			Vec::new(),
+			reference,
+			search,
+		) {
+			Ok(candidate) => {
+				candidate.install(self);
+				true
+			}
+			Err(error) => {
+				self.report_graph_error(error);
+				false
+			}
 		}
 	}
 
@@ -788,28 +999,31 @@ impl WorkbenchModel {
 		ref_name: Option<String>,
 		cx: &mut Context<Self>,
 	) {
-		app_log!("[APP:REF_FILTER: {}]", ref_name.as_deref().unwrap_or("all"));
-		self.active_ref_filter = ref_name;
-		self.log_search = None;
-		self.commit_page = 0;
-		self.page_checkpoints = vec![None];
-		self.collapsed_merges.clear();
+		if !self.reset_history_query(ref_name, None) {
+			cx.notify();
+			return;
+		}
+		app_log!(
+			"[APP:REF_FILTER: {}]",
+			self.active_ref_filter.as_deref().unwrap_or("all")
+		);
 		self.load_history(cx);
 	}
 
 	pub fn start_log_search(&mut self, query: String, cx: &mut Context<Self>) {
-		self.log_search = (!query.is_empty()).then_some(LogSearch {
+		let search = (!query.is_empty()).then_some(LogSearch {
 			query,
 			author: self.search_by_author,
 		});
+		if !self.reset_history_query(self.active_ref_filter.clone(), search) {
+			cx.notify();
+			return;
+		}
 		app_log!(
 			"[APP:LOG_SEARCH: active={} author={}]",
 			self.log_search.is_some(),
 			self.search_by_author
 		);
-		self.commit_page = 0;
-		self.page_checkpoints = vec![None];
-		self.collapsed_merges.clear();
 		self.load_history(cx);
 	}
 
@@ -824,11 +1038,10 @@ impl WorkbenchModel {
 			self.focus_head(cx);
 			return;
 		}
-		self.log_search = None;
-		self.active_ref_filter = None;
-		self.commit_page = 0;
-		self.page_checkpoints = vec![None];
-		self.collapsed_merges.clear();
+		if !self.reset_history_query(None, None) {
+			cx.notify();
+			return;
+		}
 		self.select_head_after_load = true;
 		self.load_history(cx);
 	}
@@ -853,9 +1066,14 @@ impl WorkbenchModel {
 	}
 
 	pub fn select_commit(&mut self, sha: &str, cx: &mut Context<Self>) {
+		if sha.len() > MAX_SHA_LEN {
+			self.report_graph_error(GraphAdmissionError::Budget);
+			cx.notify();
+			return;
+		}
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
-		self.selected_commit = Some(sha.to_string());
+		self.selected_commit = Some(Box::<str>::from(sha).into_string());
 		self.range_head = None;
 		self.compare = None;
 		self.selected_file = None;
@@ -880,12 +1098,17 @@ impl WorkbenchModel {
 
 	/// Shift-selection: `selected_commit` stays the anchor.
 	pub fn extend_range(&mut self, sha: &str, cx: &mut Context<Self>) {
+		if sha.len() > MAX_SHA_LEN {
+			self.report_graph_error(GraphAdmissionError::Budget);
+			cx.notify();
+			return;
+		}
 		if self.selected_commit.is_none() {
 			self.select_commit(sha, cx);
 			return;
 		}
 		self.range_head = (self.selected_commit.as_deref() != Some(sha))
-			.then(|| sha.to_string());
+			.then(|| Box::<str>::from(sha).into_string());
 		let n = self.range_rows().map(|(a, b)| b - a + 1).unwrap_or(1);
 		app_log!("[APP:RANGE: commits={}]", n);
 		cx.notify();
@@ -909,7 +1132,10 @@ impl WorkbenchModel {
 			return;
 		};
 		let rows = self.display_commits();
-		let (newer, older) = (rows[top].sha.clone(), rows[bottom].sha.clone());
+		let (newer, older) = (
+			Box::<str>::from(rows[top].sha.as_str()).into_string(),
+			Box::<str>::from(rows[bottom].sha.as_str()).into_string(),
+		);
 		drop(rows);
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
@@ -1357,6 +1583,318 @@ mod tests {
 			author_date: String::new(),
 			subject: String::new(),
 		}
+	}
+
+	fn history(commits: Vec<CommitSummary>) -> browser::RepositoryHistory {
+		browser::RepositoryHistory {
+			root: String::new(),
+			commits,
+			refs: Vec::new(),
+			head: None,
+			has_more: true,
+		}
+	}
+
+	fn first_page() -> PreparedHistory {
+		PreparedHistory::prepare(
+			history(vec![c("c2", &["c1"])]),
+			0,
+			&[],
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap()
+	}
+
+	fn oversized_short_string() -> String {
+		let mut value = String::with_capacity(MAX_RETAINED_GRAPH_BYTES);
+		value.push('x');
+		value
+	}
+
+	#[test]
+	fn graph_admission_refuses_spare_capacity_in_page_and_metadata() {
+		let previous = first_page();
+		let mut next = c("c1", &["c0"]);
+		next.subject = oversized_short_string();
+		let rejected = PreparedHistory::prepare(
+			history(vec![next]),
+			1,
+			&previous.page_checkpoints,
+			Vec::new(),
+			None,
+			None,
+		);
+		assert!(matches!(rejected, Err(GraphAdmissionError::Budget)));
+
+		let rejected = PreparedHistory::prepare(
+			history(vec![c("c1", &["c0"])]),
+			1,
+			&previous.page_checkpoints,
+			vec![oversized_short_string()],
+			None,
+			None,
+		);
+		assert!(matches!(rejected, Err(GraphAdmissionError::Budget)));
+		let rejected = PreparedHistory::prepare(
+			history(Vec::new()),
+			0,
+			&[],
+			Vec::new(),
+			None,
+			Some(LogSearch {
+				query: oversized_short_string(),
+				author: false,
+			}),
+		);
+		assert!(matches!(rejected, Err(GraphAdmissionError::Budget)));
+	}
+
+	#[test]
+	fn graph_admission_leaves_room_for_the_separate_search_input() {
+		let input = crate::text_input::TextInput::new_for_test(
+			&"🦀".repeat(crate::text_input::TextInput::MAX_TOTAL_CHARS + 1),
+		);
+		assert_eq!(input.text().len(), 16 * 1024);
+		// This page itself fits, but would leave only 8 KiB for independently
+		// edited metadata. Reserving the existing input bound must reject it.
+		let mut commit = c("c1", &[]);
+		commit.subject =
+			String::with_capacity(MAX_RETAINED_GRAPH_BYTES - 8 * 1024);
+		commit.subject.push('x');
+		assert!(matches!(
+			PreparedHistory::prepare(
+				history(vec![commit]),
+				0,
+				&[],
+				Vec::new(),
+				None,
+				None,
+			),
+			Err(GraphAdmissionError::Budget)
+		));
+	}
+
+	#[test]
+	fn graph_admission_propagates_layout_failure() {
+		let previous = first_page();
+		let mut bad = history(vec![c("c1", &["c0"])]);
+		bad.refs = (0..1001)
+			.map(|n| browser::GitReference {
+				name: format!("refs/heads/b{n}"),
+				sha: "c1".into(),
+			})
+			.collect();
+		let rejected = PreparedHistory::prepare(
+			bad,
+			1,
+			&previous.page_checkpoints,
+			Vec::new(),
+			None,
+			None,
+		);
+		assert!(
+			matches!(rejected, Err(GraphAdmissionError::Layout(message)) if message.contains("refs limit"))
+		);
+	}
+
+	#[test]
+	fn graph_budget_counts_nested_output_and_all_checkpoint_and_collapse_storage(
+	) {
+		let mut page = first_page();
+		page.graph_layout.as_mut().unwrap().rows[0].parent_edges[0]
+			.parent_sha = oversized_short_string();
+		assert!(matches!(
+			page.check_budget(),
+			Err(GraphAdmissionError::Budget)
+		));
+		page = first_page();
+		page.graph_layout.as_mut().unwrap().paths[0].points.reserve(
+			MAX_RETAINED_GRAPH_BYTES
+				/ std::mem::size_of::<snip_core::graph::Point>(),
+		);
+		assert!(matches!(
+			page.check_budget(),
+			Err(GraphAdmissionError::Budget)
+		));
+		page = first_page();
+		page.page_checkpoints[1].as_mut().unwrap().frontier[0].next_sha =
+			oversized_short_string();
+		assert!(matches!(
+			page.check_budget(),
+			Err(GraphAdmissionError::Budget)
+		));
+		page = first_page();
+		page.page_checkpoints.reserve(
+			MAX_RETAINED_GRAPH_BYTES
+				/ std::mem::size_of::<Option<GraphCheckpoint>>(),
+		);
+		assert!(matches!(
+			page.check_budget(),
+			Err(GraphAdmissionError::Budget)
+		));
+		page = first_page();
+		page.collapsed_merges =
+			(0..150_000).map(|n| format!("{n:0128x}")).collect();
+		assert!(matches!(
+			page.check_budget(),
+			Err(GraphAdmissionError::Budget)
+		));
+		page = first_page();
+		let mut checkpoint = page.page_checkpoints[1].clone().unwrap();
+		checkpoint
+			.frontier
+			.resize(64, checkpoint.frontier[0].clone());
+		for rail in &mut checkpoint.frontier {
+			rail.next_sha = "a".repeat(MAX_SHA_LEN);
+		}
+		page.page_checkpoints = vec![Some(checkpoint); 2000];
+		assert!(matches!(
+			page.check_budget(),
+			Err(GraphAdmissionError::Budget)
+		));
+	}
+
+	#[test]
+	fn graph_collapse_keeps_true_edges_and_checkpoint_for_backward_navigation()
+	{
+		let commits = vec![
+			c("m", &["a", "f"]),
+			c("f", &["base"]),
+			c("a", &["base"]),
+			c("base", &[]),
+		];
+		let full = PreparedHistory::prepare(
+			history(commits.clone()),
+			0,
+			&[],
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap();
+		let collapsed = PreparedHistory::prepare(
+			history(commits),
+			0,
+			&[],
+			vec!["m".into(), "earlier-page-merge".into()],
+			None,
+			None,
+		)
+		.unwrap();
+		assert_eq!(collapsed.hidden_commits, ["f"]);
+		assert_eq!(collapsed.collapsed_merges, ["m", "earlier-page-merge"]);
+		assert_eq!(collapsed.page_checkpoints, full.page_checkpoints);
+		let merge = &collapsed.graph_layout.as_ref().unwrap().rows[0];
+		let edge = merge
+			.parent_edges
+			.iter()
+			.find(|edge| edge.parent_sha == "f")
+			.unwrap();
+		assert_eq!(
+			edge.continuation,
+			snip_core::graph::ContinuationKind::FilteredGap
+		);
+		assert!(edge.to_row.is_none());
+	}
+
+	fn walk_standard_history(
+		mut load: impl FnMut(usize) -> browser::RepositoryHistory,
+	) -> usize {
+		let mut page =
+			PreparedHistory::prepare(load(0), 0, &[], Vec::new(), None, None)
+				.unwrap();
+		let mut peak = page.retained_bytes();
+		let mut total = page.commits.len();
+		for index in 1..400 {
+			assert!(page.history_has_more, "history stopped at page {index}");
+			page = PreparedHistory::prepare(
+				load(index),
+				index,
+				&page.page_checkpoints,
+				page.collapsed_merges.clone(),
+				None,
+				None,
+			)
+			.unwrap();
+			assert_eq!(
+				page.graph_layout.as_ref().unwrap().rows[0].global_row,
+				index * 50
+			);
+			total += page.commits.len();
+			peak = peak.max(page.retained_bytes());
+		}
+		assert_eq!(total, 20_000);
+		assert!(!page.history_has_more);
+		assert!(peak <= MAX_RETAINED_GRAPH_BYTES);
+		for index in [398, 200, 0] {
+			page = PreparedHistory::prepare(
+				load(index),
+				index,
+				&page.page_checkpoints,
+				page.collapsed_merges.clone(),
+				None,
+				None,
+			)
+			.unwrap();
+			assert_eq!(page.commit_page, index);
+			assert_eq!(
+				page.graph_layout.as_ref().unwrap().rows[0].global_row,
+				index * 50
+			);
+		}
+		peak
+	}
+
+	#[test]
+	fn graph_standard_20k_history_remains_navigable_with_100_refs() {
+		let commits: Vec<_> = (0..20_000)
+			.rev()
+			.map(|n| {
+				let parents = match n {
+					0 => vec![],
+					1 | 2 => vec![0],
+					3 => vec![2, 1],
+					_ => vec![n - 1],
+				};
+				let mut commit = c(&format!("{n:040x}"), &[]);
+				commit.parents = parents
+					.into_iter()
+					.map(|parent| format!("{parent:040x}"))
+					.collect();
+				commit
+			})
+			.collect();
+		let peak = walk_standard_history(|page| browser::RepositoryHistory {
+			root: String::new(),
+			commits: commits[page * 50..(page + 1) * 50].to_vec(),
+			refs: (0..100)
+				.map(|n| browser::GitReference {
+					name: format!("refs/heads/b{n}"),
+					sha: format!("{:040x}", 19_999 - n),
+				})
+				.collect(),
+			head: Some(format!("{:040x}", 19_999)),
+			has_more: page < 399,
+		});
+		println!("20k/100-ref graph peak retained capacity: {peak} bytes");
+	}
+
+	#[test]
+	#[ignore = "read-only standard workload proof; set SNIP_STANDARD_WORKLOAD and run explicitly"]
+	fn graph_standard_fixture_20k_paging() {
+		let fixture = std::env::var_os("SNIP_STANDARD_WORKLOAD").expect(
+			"SNIP_STANDARD_WORKLOAD must point to the standard fixture",
+		);
+		let repo = std::path::PathBuf::from(fixture).join("repo-01-core");
+		let git = Git::open(&repo).expect("standard fixture repo must exist");
+		let peak = walk_standard_history(|page| {
+			browser::history(&git, None, "", page * 50, 50).unwrap()
+		});
+		println!(
+			"Standard Git fixture peak retained graph capacity: {peak} bytes"
+		);
 	}
 
 	#[test]

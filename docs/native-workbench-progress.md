@@ -1,5 +1,10 @@
 > **歷史 worker 紀錄，非驗收報告。** 本文描述的舊 UI 與記憶體數據已被後續審查取代或拒絕；不得據此宣稱完成或通過效能門檻。請以 [交付規格](native-workbench-delivery-spec.md)、[監督紀錄](native-workbench-supervision.md) 和經獨立核實的 checkpoint 為準。
 
+## 2026-09-27 最新增量：Graph 容量與 XIM 啟動競態
+
+已提交 `09c9927`：GPUI 等待 XIM 握手完成後才發送 IC 操作，避免早期搜尋框點擊永久破壞輸入法連線。原 release 驗收與獨立的強制握手時序回歸均通過全部九階段；詳見 [監督紀錄](native-workbench-supervision.md)。AGY 額度耗盡後已依使用者授權改派 Codex 子 agent。Graph 16 MiB admission 與失敗換頁回歸已通過獨立 unit／真 UI 驗證，20k commits 實際分頁通過；協作、preview 等容量層與正式效能量測仍在接續；完整 Linux、CI 與跨平台 runtime 仍未驗收。
+
+
 # 原生 Git 工作台驗證進度
 
 ## 2026-09-27 進度檢查點：歷史檔案選取與排乾失敗恢復

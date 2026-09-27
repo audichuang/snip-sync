@@ -1,5 +1,20 @@
 # Native workbench — supervisor checkpoint
 
+## 2026-09-27 Checkpoint: Graph 容量與換頁失敗一致性
+
+- **變更**：Graph 的 commits／refs／layout／checkpoint／collapse／搜尋 metadata 以實際 String／Vec capacity 累加，整頁候選通過 16 MiB admission 後才一次安裝。Next／Prev 失敗不提前改頁碼，不會把新 commits 掛到舊 rails；切換查詢會清除不屬於新查詢的舊圖。未改 core graph 演算法、依賴、contract 或 Apply。
+- **驗證**：73 unit 通過（主 agent 獨立重跑）；標準真 repo 的 20,000 commits、400 頁及回翻 398／200／0 通過，該資料的 retained-model peak 220,516 bytes。Clippy／fmt 在產品修改完成時通過；後續截圖 helper 調整已編譯並真 UI 驗證，完整 preflight 仍待最終整合。
+- **真 UI 回歸**：在 disposable repo 第 1 頁加入 1001 個 refs 後按 Next，舊版會吞 layout error 並換頁，測試 exit 101。修正版顯示錯誤、保留原頁與 pixel-identical 第一列／rails，移除 refs 後 Next 正確到第 2 頁。主 agent 用凍結 graph binary `ae66f18d58098e7891bf307f09270bd5d832b846e1049ad91c9b10abd59f8eec` 獨立重跑 exit 0、檢查截圖及乾淨退出。
+- **界線與接續**：這是 graph 的 16 MiB 層；selector、tree/basket、preview/paste、highlight、pending workers 仍需各自計算／限制，未宣稱總 64 MiB 或完整 Linux/D3/D4 通過。證據保存在 `/home/audichuang/research/snip-sync-handoff-20260927/session4/graph/`。AGY 額度不足時使用 Codex 子 agent；使用者另授權 Cursor Agent Grok 協助，CLI 實際模型名稱為 `grok-4.7-high`。
+
+## 2026-09-27 Checkpoint: XIM 啟動競態修復（完整 Linux 驗收仍未完成）
+
+- **提交與分工**：`09c9927`，使用者已授權 AGY 額度耗盡時改派 Codex 子 agent；主 agent 繼續指揮、審查、獨立驗證及整合。Graph 容量與驗收 drivers 仍在進行，未推送、未開 PR、未跑 CI。
+- **根因與修正**：XIM 握手完成前的搜尋框點擊送出 `SET_IC_VALUES(0,0)`，Fcitx 的錯誤回覆使 parser 失敗，GPUI 丟棄連線。已用凍結 release binary 和延後交付 `CONNECT_REPLY` 的真 UI 操作重現，並區分 SET／RESET 請求的因果關係。Vendor 的三個 IC 入口改以既有 `connected` 狀態守門，握手事件仍正常處理；未加入啟動 sleep 或升級依賴。
+- **獨立驗證**：未修補版的最終回歸腳本 exit 2；修補 release binary `b11e6724b9689ae49fe8860caf57e0ff7dbda91ac7673ea61c7cb50878bc53b1` 的原九階段驗收通過。主 agent 獨立執行最終 atom／connection／window 限定的握手回歸，九階段通過、exit 0、graceful、host Fcitx profile 未變，900×600 縮放截圖已檢查。另六項既有 IME 判斷 unit tests 與四個 required-env presence 檢查通過。
+- **證據**：`/home/audichuang/research/snip-sync-handoff-20260927/session4/ime/` 保存 source patch／binary、因果實驗、未修補 red、主 agent green、原流程 green 與 `supervisor-receipt.json`。這項修補的完整 preflight 尚待整合後重跑；不套用上一個 checkpoint 的完整綠燈，也不代表 Wayland／macOS／Windows IME 通過。
+
+
 ## 2026-09-27 Checkpoint: 歷史檔案選取與排乾失敗恢復（Linux checkpoint，非完整驗收）
 
 - **來源與分工**：基於 `4c38d79` 的本節隨附變更由 AGY 實作，Codex 審查並獨立跑完整驗證。凍結的程式碼 patch SHA256 為 `f52b3e9fa085b3cd656c4115652b356c97de8d6e94697a2037159e4ac02219e1`；完整 preflight 前後相同，之後只更新本批進度文件。未修改 vendor/gpui、contract fixture、DTO 或依賴。未推送、未開 PR、未發版。

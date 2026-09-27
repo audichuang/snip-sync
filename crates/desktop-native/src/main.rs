@@ -51,10 +51,6 @@ fn release_map<K, V, S: Default>(slot: &mut HashMap<K, V, S>) {
 	*slot = HashMap::default();
 }
 
-fn release_set<T, S: Default>(slot: &mut HashSet<T, S>) {
-	*slot = HashSet::default();
-}
-
 fn release_path(slot: &mut PathBuf) {
 	*slot = PathBuf::new();
 }
@@ -235,9 +231,9 @@ pub struct WorkbenchModel {
 	pub page_checkpoints: Vec<Option<snip_core::graph::GraphCheckpoint>>,
 	pub log_search: Option<LogSearch>,
 	pub search_by_author: bool,
-	pub collapsed_merges: HashSet<String>,
+	pub collapsed_merges: Vec<String>,
 	/// Commits hidden on this page by collapsed merges.
-	pub hidden_commits: HashSet<String>,
+	pub hidden_commits: Vec<String>,
 	pub selected_commit: Option<String>,
 	/// Range endpoint picked with shift (anchor is `selected_commit`).
 	pub range_head: Option<String>,
@@ -513,8 +509,8 @@ impl WorkbenchModel {
 			page_checkpoints: vec![None],
 			log_search: None,
 			search_by_author: false,
-			collapsed_merges: HashSet::new(),
-			hidden_commits: HashSet::new(),
+			collapsed_merges: Vec::new(),
+			hidden_commits: Vec::new(),
 			selected_commit: None,
 			range_head: None,
 			log_scroll: gpui::UniformListScrollHandle::new(),
@@ -1137,8 +1133,8 @@ impl WorkbenchModel {
 		self.history_error = None;
 		release_vec(&mut self.page_checkpoints);
 		self.log_search = None;
-		release_set(&mut self.collapsed_merges);
-		release_set(&mut self.hidden_commits);
+		release_vec(&mut self.collapsed_merges);
+		release_vec(&mut self.hidden_commits);
 		self.selected_commit = None;
 		self.range_head = None;
 		self.select_head_after_load = false;
@@ -3912,12 +3908,6 @@ mod tests {
 		release_map(&mut names);
 		assert!(names.is_empty());
 		assert_eq!(names.capacity(), 0);
-
-		let mut shas = HashSet::<String>::with_capacity(16);
-		shas.insert("a".repeat(40));
-		release_set(&mut shas);
-		assert!(shas.is_empty());
-		assert_eq!(shas.capacity(), 0);
 
 		let mut path = PathBuf::with_capacity(128);
 		path.push("/tmp/workspace");

@@ -8,6 +8,8 @@
 
 後續分工更新（2026-09-26）：使用者先自行建立開發checkpoint commit，同事在另一個worktree負責UI視覺優化。本工作繼續Git／檔案同步正確性、bounded memory、背景工作與資源回收、E2E、CI及發版驗收；不另派視覺重做。保留使用者合法前進的HEAD與同事改動，最終整合版本重新綁定source／binary身份並跑必要驗收。
 
+最新分工（2026-09-27）：AGY 額度耗盡後，使用者明確授權改派 Codex 子 agent 完成實作；Codex 主 agent 繼續指揮、決策、審查與獨立驗證。這項授權取代上方 AGY／Grok 專責實作的限制，產品範圍與每批單一檔案 owner 不變。先完成 Linux，再跑實際 macOS CI runner，由使用者安裝候選包做 Mac runtime 驗收。
+
 本文件把既有規劃轉成可執行的交付順序與驗收清單。完整功能／數值依 `native-git-workbench-plan.md`；視覺依 `native-workbench-ui-acceptance.md`；已驗證成果與未解缺陷依 `native-workbench-supervision.md`。既有正式行為仍依 `spec.md`、`plan.md`、`porting-notes.md`。剪貼簿相容性以 pinned TS reference 和 immutable contract fixture 為準。若有矛盾，先記錄實際差異，由監督者裁定，不可自行縮減需求或宣告完成。
 
 交付不是只有 mockup、只有文件、只有原型，或只改顏色。要讓使用者以清楚、低記憶體的介面判斷來源並完成兩台電腦間的剪貼簿同步。

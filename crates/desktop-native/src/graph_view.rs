@@ -17,6 +17,75 @@ pub const ROW_HEIGHT: f32 = crate::theme::ROW_H;
 pub const LANE_WIDTH: f32 = 16.0;
 pub const OFFSET_X: f32 = 14.0;
 
+/// Owned backing storage only; the enclosing struct/vector accounts for headers.
+pub(crate) fn vec_bytes<T>(values: &Vec<T>) -> usize {
+	values.capacity().saturating_mul(std::mem::size_of::<T>())
+}
+
+fn optional_string_bytes(value: &Option<String>) -> usize {
+	value.as_ref().map_or(0, String::capacity)
+}
+
+pub(crate) fn checkpoint_heap_bytes(checkpoint: &GraphCheckpoint) -> usize {
+	let mut bytes = vec_bytes(&checkpoint.frontier)
+		.saturating_add(optional_string_bytes(&checkpoint.last_seen_sha));
+	for rail in &checkpoint.frontier {
+		bytes = bytes
+			.saturating_add(rail.next_sha.capacity())
+			.saturating_add(optional_string_bytes(&rail.color_override));
+	}
+	bytes
+}
+
+/// Capacity of every nested buffer in the retained renderer-neutral layout.
+/// This is application-owned storage, not allocator overhead or process RSS.
+pub(crate) fn layout_heap_bytes(layout: &GraphLayout) -> usize {
+	let mut bytes = vec_bytes(&layout.rows)
+		.saturating_add(vec_bytes(&layout.paths))
+		.saturating_add(vec_bytes(&layout.links))
+		.saturating_add(vec_bytes(&layout.commit_left_margin));
+	for row in &layout.rows {
+		bytes = bytes
+			.saturating_add(row.sha.capacity())
+			.saturating_add(optional_string_bytes(&row.node.color_override))
+			.saturating_add(vec_bytes(&row.passing_lanes))
+			.saturating_add(vec_bytes(&row.parent_edges))
+			.saturating_add(vec_bytes(&row.refs));
+		for lane in &row.passing_lanes {
+			bytes = bytes
+				.saturating_add(optional_string_bytes(&lane.color_override));
+		}
+		for edge in &row.parent_edges {
+			bytes = bytes
+				.saturating_add(edge.parent_sha.capacity())
+				.saturating_add(optional_string_bytes(&edge.color_override));
+		}
+		for reference in &row.refs {
+			bytes = bytes
+				.saturating_add(reference.raw_name.capacity())
+				.saturating_add(reference.display_name.capacity());
+			if let RefKind::RemoteBranch { remote, name } = &reference.kind {
+				bytes = bytes
+					.saturating_add(remote.capacity())
+					.saturating_add(name.capacity());
+			}
+		}
+	}
+	for path in &layout.paths {
+		bytes = bytes
+			.saturating_add(vec_bytes(&path.points))
+			.saturating_add(optional_string_bytes(&path.color_override));
+	}
+	for link in &layout.links {
+		bytes =
+			bytes.saturating_add(optional_string_bytes(&link.color_override));
+	}
+	if let Some(checkpoint) = &layout.checkpoint {
+		bytes = bytes.saturating_add(checkpoint_heap_bytes(checkpoint));
+	}
+	bytes
+}
+
 pub fn palette_rgb(index: usize) -> Rgba {
 	let hex = COLOR_PALETTE[index % COLOR_PALETTE.len()];
 	let hex = hex.trim_start_matches('#');

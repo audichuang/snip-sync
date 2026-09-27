@@ -1619,6 +1619,246 @@ fn capture_window(wid: &str, out_png: &Path) {
 	assert!(fs::metadata(out_png).unwrap().len() > 1024);
 }
 
+/// A failed layout must leave the rendered page intact and retry page 2,
+/// rather than combining new commits with old rails or advancing to page 3.
+#[test]
+fn native_graph_failed_next_page_is_transactional() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("history");
+	fs::create_dir(&repo).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.name", "Graph Test"]);
+	git_ok(&repo, &["config", "user.email", "graph@example.com"]);
+	for n in 0..120 {
+		git_ok(
+			&repo,
+			&[
+				"commit",
+				"--allow-empty",
+				"-qm",
+				&format!("page commit {n}"),
+			],
+		);
+	}
+	let commits = Command::new("git")
+		.current_dir(&repo)
+		.args(["log", "--format=%H"])
+		.output()
+		.unwrap();
+	assert!(commits.status.success());
+	let commits: Vec<String> = String::from_utf8(commits.stdout)
+		.unwrap()
+		.lines()
+		.map(str::to_owned)
+		.collect();
+	let first = &commits[0][..7];
+	let second = &commits[50][..7];
+	let first_row = format!("commit-row:{first}");
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app = spawn_app(
+		ws.path(),
+		ws.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(8))
+		.unwrap();
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	let loaded =
+		lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8)).unwrap();
+	assert!(loaded
+		.last()
+		.unwrap()
+		.contains(&format!("mode=graph n=50 first={first} page=1]")));
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				let (w, h) = *viewport.lock().unwrap();
+				assert!(
+					v[0] >= 0
+						&& v[1] >= 0 && v[2] > 0
+						&& v[3] > 0 && v[0] + v[2] <= w
+						&& v[1] + v[3] <= h,
+					"{id} {v:?} outside {w}x{h}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} must be rendered");
+			std::thread::sleep(Duration::from_millis(20));
+		}
+	};
+	let next = || {
+		let [x, y, w, h] = control("btn-next-page");
+		assert!(Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&(x + w / 2).to_string(),
+				&(y + h / 2).to_string(),
+				"click",
+				"1",
+				"mousemove",
+				"--window",
+				&wid,
+				"0",
+				"0",
+			])
+			.status()
+			.unwrap()
+			.success());
+	};
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	// Vulkan's presented pixels live on the root surface under Xvfb; -id can
+	// return a black backing pixmap. Use the same root/crop path as full smoke.
+	let capture = |path: &Path| {
+		let geometry = Command::new("xdotool")
+			.args(["getwindowgeometry", "--shell", &wid])
+			.output()
+			.unwrap();
+		assert!(geometry.status.success());
+		let text = String::from_utf8(geometry.stdout).unwrap();
+		let geometry: HashMap<_, _> = text
+			.lines()
+			.filter_map(|line| line.split_once('='))
+			.collect();
+		let crop = format!(
+			"{}x{}+{}+{}",
+			geometry["WIDTH"], geometry["HEIGHT"], geometry["X"], geometry["Y"]
+		);
+		let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			assert!(Command::new("xwd")
+				.args(["-root", "-silent", "-out"])
+				.arg(xwd.path())
+				.status()
+				.unwrap()
+				.success());
+			assert!(Command::new("convert")
+				.arg(xwd.path())
+				.args(["-crop", &crop, "+repage"])
+				.arg(path)
+				.status()
+				.unwrap()
+				.success());
+			if fs::metadata(path).unwrap().len() > 1024 {
+				break;
+			}
+			assert!(
+				Instant::now() < deadline,
+				"window must present a nonblank frame"
+			);
+			std::thread::sleep(Duration::from_millis(20));
+		}
+	};
+	let crop_row = |name: &str| {
+		let image = out.join(format!("graph-admission-{name}.png"));
+		capture(&image);
+		let [x, y, w, h] = control(&first_row);
+		let crop = out.join(format!("graph-admission-{name}-row.png"));
+		assert!(Command::new("convert")
+			.arg(&image)
+			.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
+			.arg(&crop)
+			.status()
+			.unwrap()
+			.success());
+		crop
+	};
+	let before_y = control(&first_row)[1];
+	let before = crop_row("before");
+	// Only this test's disposable repository is mutated, never the standard
+	// workload. All refs target the same tip, so commit order stays identical.
+	let update_refs = |create: bool| {
+		let mut child = Command::new("git")
+			.current_dir(&repo)
+			.args(["update-ref", "--stdin"])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::null())
+			.spawn()
+			.unwrap();
+		let mut input = child.stdin.take().unwrap();
+		for n in 0..1001 {
+			if create {
+				writeln!(
+					input,
+					"create refs/heads/overflow-{n} {}",
+					commits[0]
+				)
+				.unwrap();
+			} else {
+				writeln!(input, "delete refs/heads/overflow-{n}").unwrap();
+			}
+		}
+		drop(input);
+		assert!(child.wait().unwrap().success());
+	};
+	update_refs(true);
+	next();
+	let rejected =
+		lines_until(&app.rx, "[APP:HISTORY_ERROR]", Duration::from_secs(8))
+			.expect("layout failure must be reported, not silently swallowed");
+	assert!(!rejected.iter().any(|line| line.contains("[APP:E2E_LOG:")));
+	control("log-error");
+	let deadline = Instant::now() + Duration::from_secs(5);
+	while control(&first_row)[1] == before_y {
+		assert!(
+			Instant::now() < deadline,
+			"prior first row must remain below the visible error"
+		);
+		std::thread::sleep(Duration::from_millis(20));
+	}
+	let after = crop_row("refused");
+	let comparison = Command::new("compare")
+		.args(["-metric", "AE"])
+		.arg(&before)
+		.arg(&after)
+		.arg("null:")
+		.output()
+		.unwrap();
+	assert!(
+		comparison.status.success(),
+		"prior rendered row text and graph rails must remain identical: {}",
+		String::from_utf8_lossy(&comparison.stderr)
+	);
+	update_refs(false);
+	next();
+	let retried =
+		lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8)).unwrap();
+	assert!(
+		retried
+			.last()
+			.unwrap()
+			.contains(&format!("mode=graph n=50 first={second} page=2]")),
+		"retry must load the real second page: {retried:?}"
+	);
+	control(&format!("commit-row:{second}"));
+	let deadline = Instant::now() + Duration::from_secs(5);
+	while bounds.lock().unwrap().contains_key("log-error") {
+		assert!(
+			Instant::now() < deadline,
+			"successful retry must clear the error"
+		);
+		std::thread::sleep(Duration::from_millis(20));
+	}
+	capture(&out.join("graph-admission-retried.png"));
+	quit_cleanly(&mut app, &wid);
+}
+
 /// Real clipboard and git oracles for basket, mapping, and commit replay.
 #[test]
 fn native_d3_basket_mapping_and_replay() {
