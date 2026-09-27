@@ -753,18 +753,22 @@ pub fn git_preview_with(
 	if matches!(source, GitSource::Working) && git.root().join(path).exists() {
 		inside(git.root(), path)?;
 	}
+	// The listing is metadata for every change in the source, not the
+	// preview: thousands of changed paths must not trip the preview's
+	// 1 MiB limit. Content stays strict at `max` either way.
+	let listing = RunOptions {
+		max_stdout: opts.max_stdout.max(RunOptions::INTERACTIVE_MAX_STDOUT),
+		overflow: Overflow::Error,
+		..opts.clone()
+	};
 	// Content is strict: a partial file would read as the whole file.
-	let file =
-		gitsrc::read_changed_file_with(git, source, path, max as u64, opts)?
-			.ok_or_else(|| {
-				GitError::Malformed("Path is not in this Git source".into())
-			})?;
-	let mut args = vec![
-		"diff".to_string(),
-		"--no-ext-diff".into(),
-		"--no-textconv".into(),
-		"--no-color".into(),
-	];
+	let file = gitsrc::read_changed_file_with(
+		git, source, path, max as u64, &listing,
+	)?
+	.ok_or_else(|| {
+		GitError::Malformed("Path is not in this Git source".into())
+	})?;
+	let mut args = Vec::new();
 	match source {
 		GitSource::Working => {
 			args.push(git.head_with(opts)?.unwrap_or_else(|| EMPTY_TREE.into()))
@@ -785,6 +789,86 @@ pub fn git_preview_with(
 			args.push(git.resolve_commit_with(tip, opts)?);
 		}
 	}
+	finish_preview(git, args, path, file.content, file.change_type, opts)
+}
+
+/// [`git_preview_with`] for one path of a commit the caller already knows,
+/// full SHA and parents included (e.g. a log row), with the change type from
+/// its own listing: no revision re-resolution and no re-listing, just one
+/// `cat-file` and one `diff`. Content follows the listing's rules: the
+/// commit's blob, or for a deletion the first parent's version that decodes.
+pub fn commit_preview_with(
+	git: &Git,
+	sha: &str,
+	parents: &[String],
+	path: &str,
+	change: Option<crate::format::ChangeType>,
+	opts: &RunOptions,
+) -> Result<GitPreview, GitError> {
+	use crate::format::ChangeType;
+	use gitsrc::CatObject;
+	let max = opts.max_stdout;
+	let deleted = change == Some(ChangeType::Deleted);
+	let objects: Vec<String> = if deleted {
+		parents.iter().map(|p| format!("{p}:{path}")).collect()
+	} else {
+		vec![format!("{sha}:{path}")]
+	};
+	let mut cat = git.cat_file_with(opts.clone())?;
+	let mut content = None;
+	for object in &objects {
+		match cat.read_object(object, max as u64)? {
+			CatObject::Missing => {}
+			CatObject::TooLarge { .. } => {
+				return Err(GitError::OutputLimit {
+					args: format!("cat-file {object}"),
+					limit: max,
+				})
+			}
+			CatObject::Found { body, .. } => {
+				content = decode_utf8_or_skip(body);
+				if content.is_some() {
+					break;
+				}
+			}
+		}
+	}
+	cat.close()?;
+	if deleted && content.is_none() {
+		content = Some(gitsrc::DELETED_FILE_MARKER.to_string());
+	}
+	let base = parents
+		.first()
+		.cloned()
+		.unwrap_or_else(|| EMPTY_TREE.into());
+	finish_preview(
+		git,
+		vec![base, sha.to_string()],
+		path,
+		content,
+		change,
+		opts,
+	)
+}
+
+/// Runs the path's `diff` for `revs` and builds the preview around
+/// `content`; a new file with no diff text gets a synthesized patch.
+fn finish_preview(
+	git: &Git,
+	revs: Vec<String>,
+	path: &str,
+	content: Option<String>,
+	change: Option<crate::format::ChangeType>,
+	opts: &RunOptions,
+) -> Result<GitPreview, GitError> {
+	let max = opts.max_stdout;
+	let mut args = vec![
+		"diff".to_string(),
+		"--no-ext-diff".into(),
+		"--no-textconv".into(),
+		"--no-color".into(),
+	];
+	args.extend(revs);
 	args.extend(["--".into(), format!(":(literal){path}")]);
 	let diff = git
 		.run_with(&args.iter().map(String::as_str).collect::<Vec<_>>(), opts)?;
@@ -793,10 +877,8 @@ pub fn git_preview_with(
 	} else {
 		(diff.stdout, false)
 	};
-	if patch.is_empty()
-		&& file.change_type == Some(crate::format::ChangeType::New)
-	{
-		if let Some(content) = &file.content {
+	if patch.is_empty() && change == Some(crate::format::ChangeType::New) {
+		if let Some(content) = &content {
 			let (synth, cut) = new_file_patch(path, content, max);
 			if cut && opts.overflow == Overflow::Error {
 				return Err(GitError::OutputLimit {
@@ -809,7 +891,7 @@ pub fn git_preview_with(
 	}
 	gitsrc::already_cancelled(opts, "Git preview")?;
 	Ok(GitPreview {
-		content: file.content,
+		content,
 		// Cut at a line start, so only an invalid byte in the file itself
 		// can be replaced here.
 		patch: String::from_utf8_lossy(&patch).into_owned(),
