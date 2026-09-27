@@ -512,57 +512,28 @@ fn approx_text_w(s: &str, size: f32) -> f32 {
 		.sum()
 }
 
-fn unix_now() -> i64 {
-	std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.map(|d| d.as_secs() as i64)
-		.unwrap_or(0)
+/// [`log_date_in`] in the viewer's time zone, now.
+fn log_date(iso: &str, loc: Locale) -> String {
+	log_date_in(iso, loc, chrono::Utc::now(), &chrono::Local)
 }
 
-/// Days since 1970-01-01 of a proleptic Gregorian date.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-	let y = if m <= 2 { y - 1 } else { y };
-	let era = if y >= 0 { y } else { y - 399 } / 400;
-	let yoe = y - era * 400;
-	let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-	era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
-}
-
-/// IntelliJ-style short date of an ISO-8601 commit date: "Today 20:57",
-/// "Yesterday 20:57", else a locale short date.
-// ponytail: "today" is judged in the commit's own UTC offset (no tz
-// database); a commit made in another zone near midnight may be off by one.
-fn log_date(iso: &str, loc: Locale, now_unix: i64) -> String {
-	let num = |r: std::ops::Range<usize>| iso.get(r)?.parse::<i64>().ok();
-	let (Some(y), Some(mo), Some(d), Some(hh), Some(mm)) =
-		(num(0..4), num(5..7), num(8..10), num(11..13), num(14..16))
-	else {
+/// IntelliJ-style short date of an ISO-8601 commit date, shown in `tz`:
+/// "Today 20:57", "Yesterday 20:57", else a locale short date.
+fn log_date_in<Tz: chrono::TimeZone>(
+	iso: &str,
+	loc: Locale,
+	now: chrono::DateTime<chrono::Utc>,
+	tz: &Tz,
+) -> String {
+	use chrono::{Datelike, Timelike};
+	let Ok(at) = chrono::DateTime::parse_from_rfc3339(iso) else {
 		return short_date(iso);
 	};
-	let offset = match iso
-		.get(19..)
-		.map(|s| s.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit()))
-	{
-		Some(tz)
-			if tz.len() >= 6
-				&& (tz.starts_with('+') || tz.starts_with('-')) =>
-		{
-			let sign = if tz.starts_with('-') { -1 } else { 1 };
-			let h = tz
-				.get(1..3)
-				.and_then(|v| v.parse::<i64>().ok())
-				.unwrap_or(0);
-			let m = tz
-				.get(4..6)
-				.and_then(|v| v.parse::<i64>().ok())
-				.unwrap_or(0);
-			sign * (h * 3600 + m * 60)
-		}
-		_ => 0,
-	};
-	let today = (now_unix + offset).div_euclid(86_400);
-	let time = format!("{hh:02}:{mm:02}");
-	match today - days_from_civil(y, mo, d) {
+	let at = at.with_timezone(tz);
+	let today = now.with_timezone(tz).date_naive();
+	let time = format!("{:02}:{:02}", at.hour(), at.minute());
+	let (y, mo, d) = (at.year(), at.month(), at.day());
+	match (today - at.date_naive()).num_days() {
 		0 => tf("log_today", loc, &[&time]),
 		1 => tf("log_yesterday", loc, &[&time]),
 		_ => match loc {
@@ -5460,7 +5431,7 @@ impl WorkbenchModel {
 			.as_ref()
 			.map(|r| graph_view::lane_x(r.node.lane))
 			.unwrap_or(0.);
-		let date = log_date(&c.author_date, loc, unix_now());
+		let date = log_date(&c.author_date, loc);
 		div()
 			.id(SharedString::from(row_id.clone()))
 			.relative()
@@ -5868,7 +5839,6 @@ impl WorkbenchModel {
 	/// that contain it, like IntelliJ's commit details.
 	fn commit_details_view(&self, sha: &str) -> Div {
 		let loc = self.locale;
-		let now = unix_now();
 		let row = self.commits.iter().find(|c| c.sha == sha);
 		let details = self.commit_details.as_ref().filter(|d| d.sha == sha);
 		let message = details
@@ -5940,11 +5910,7 @@ impl WorkbenchModel {
 						)
 					}),
 			)
-			.child(muted(tf(
-				"log_details_on",
-				loc,
-				&[&log_date(&date, loc, now)],
-			)))
+			.child(muted(tf("log_details_on", loc, &[&log_date(&date, loc)])))
 			.when_some(
 				details.filter(|d| {
 					d.commit_date != d.author_date
@@ -5954,7 +5920,7 @@ impl WorkbenchModel {
 					el.child(muted(tf(
 						"log_details_committed",
 						loc,
-						&[&d.committer, &log_date(&d.commit_date, loc, now)],
+						&[&d.committer, &log_date(&d.commit_date, loc)],
 					)))
 				},
 			)
@@ -6435,30 +6401,30 @@ mod tests {
 	}
 
 	#[test]
-	fn log_dates_are_relative_then_locale_short() {
-		assert_eq!(days_from_civil(1970, 1, 1), 0);
-		assert_eq!(days_from_civil(2000, 3, 1), 11_017);
-		// 2026-09-28 10:00 UTC.
-		let now = days_from_civil(2026, 9, 28) * 86_400 + 10 * 3600;
-		let d = |iso: &str, loc| log_date(iso, loc, now);
-		assert_eq!(d("2026-09-28T08:05:00+00:00", Locale::En), "Today 08:05");
-		assert_eq!(d("2026-09-27T23:59:00Z", Locale::ZhTw), "昨天 23:59");
+	fn log_dates_are_relative_in_the_viewers_zone() {
+		use chrono::{FixedOffset, TimeZone, Utc};
+		// Viewer at UTC+8; now is 2026-09-28 10:00 UTC = 18:00 local.
+		let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+		let now = Utc.with_ymd_and_hms(2026, 9, 28, 10, 0, 0).unwrap();
+		let d = |iso: &str, loc| log_date_in(iso, loc, now, &tz);
+		// Shown in the viewer's zone, whatever zone the commit was made in.
+		assert_eq!(d("2026-09-28T00:05:00+00:00", Locale::En), "Today 08:05");
+		assert_eq!(d("2026-09-27T15:59:00Z", Locale::ZhTw), "昨天 23:59");
+		// 16:30 UTC on the 27th is already the 28th at +08:00.
+		assert_eq!(d("2026-09-27T16:30:00Z", Locale::En), "Today 00:30");
+		// A commit at 02:00 on the 29th in +14:00 is the 28th at 20:00 here.
+		assert_eq!(d("2026-09-29T02:00:00+14:00", Locale::En), "Today 20:00");
 		assert_eq!(
-			d("2026-08-19T20:57:00+02:00", Locale::En),
+			d("2026-08-19T20:57:00+08:00", Locale::En),
 			"8/19/26, 20:57"
 		);
 		assert_eq!(
-			d("2025-08-19T20:57:00+02:00", Locale::ZhTw),
+			d("2025-08-19T12:57:00+00:00", Locale::ZhTw),
 			"2025/8/19 20:57"
 		);
-		// Judged in the commit's offset: 02:00 on the 29th at +08:00 is
-		// "today" when UTC is still the 28th at 18:00.
-		let evening = days_from_civil(2026, 9, 28) * 86_400 + 18 * 3600;
-		assert_eq!(
-			log_date("2026-09-29T02:00:00+08:00", Locale::En, evening),
-			"Today 02:00"
-		);
-		assert_eq!(log_date("garbage", Locale::En, now), "garbage");
+		assert_eq!(d("garbage", Locale::En), "garbage");
+		// The real local zone formats without panicking.
+		assert!(!log_date("2026-09-28T00:05:00+00:00", Locale::En).is_empty());
 	}
 
 	#[test]
