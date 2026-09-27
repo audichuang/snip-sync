@@ -220,7 +220,7 @@ jobs:
               run: |
                   mkdir -p .ts-ref
                   git -C .ts-ref-src archive --format=tar --output="$RUNNER_TEMP/ts-reference.tar" HEAD src test scripts AGENTS.md
-                  tar -xf "$RUNNER_TEMP/ts-reference.tar" -C .ts-ref
+                  tar -x -f - -C .ts-ref < "$RUNNER_TEMP/ts-reference.tar"
             - name: Setup Node (cross-tool tests)
               uses: actions/setup-node@v4
               with:
