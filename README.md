@@ -1,11 +1,11 @@
 # snip-sync — 規劃與可行性評估
 
-> 正式版包含核心、CLI 與 Tauri 桌面 App；v0.2.0 另提供 GPUI 原生 Git 工作臺候選包。
-> 原生版的 Mac／Windows 實機輸入、系統匣與完整效能驗收仍未完成；本次不切換既有桌面版。詳見 [交付狀態](docs/native-workbench-supervision.md)。
+> 自 v0.3.0 起，正式版的桌面 App 是 GPUI 原生版（`crates/desktop-native`，產品名 snip-sync），CLI 照舊。
+> Tauri 版（`crates/desktop`）仍在 CI 建置與測試以便回退，但不再發布。各平台驗收狀態見 [交付狀態](docs/native-workbench-supervision.md)。
 
 ## 一句話
 
-做一個**獨立的桌面小工具**(Rust + Tauri 2,常駐系統匣;技術棧與打包流程比照 [aghub](https://github.com/audichuang/aghub)),讓兩台只能透過**剪貼簿**互通的電腦,
+做一個**獨立的桌面小工具**(Rust;v0.3.0 起桌面 App 為 GPUI 原生版,v0.2.x 為 Tauri 2),讓兩台只能透過**剪貼簿**互通的電腦,
 同步檔案或 commit:在任一台複製 → 在另一台預覽並還原。
 
 ## 為什麼不繼續只用 IDE 套件
@@ -30,6 +30,30 @@
 | [docs/porting-notes.md](docs/porting-notes.md) | 從 TS 移植到 Rust 的技術細節與已知陷阱 |
 
 各模組的規範寫在模組自己的 README:[core](crates/core/README.md) · [cli](crates/cli/README.md) · [desktop](crates/desktop/README.md)。
+
+## 安裝
+
+從 [Releases](https://github.com/audichuang/snip-sync/releases) 下載，或用 Homebrew（macOS）：
+
+```bash
+brew install --cask audichuang/tap/snip-sync   # 桌面 App
+brew install audichuang/tap/snip-cli           # CLI（snip）
+```
+
+| 平台 | 桌面 App | CLI |
+|---|---|---|
+| macOS Apple Silicon | `snip-sync_mac_arm.dmg`（或 `snip-sync_mac_arm.app.tar.gz`） | `snip-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `snip-sync_mac_intel.dmg`（或 `snip-sync_mac_intel.app.tar.gz`） | `snip-x86_64-apple-darwin.tar.gz` |
+| Windows x64 | `snip-sync-windows-setup.exe`（免管理員權限，裝到 `%LOCALAPPDATA%\Programs\snip-sync`）或 `snip-sync-windows-x64.zip` | `snip-x86_64-pc-windows-msvc.zip` |
+| Linux x64 | `snip-sync-linux-x86_64.tar.gz`（`bin/snip-desktop-native` 放進 PATH；需 glibc 2.39 以上，即 Ubuntu 24.04 世代） | `snip-x86_64-unknown-linux-gnu.tar.gz` |
+
+`snip-sync-desktop-SHA256SUMS.txt` 列出桌面檔案的 SHA-256；這些檔案就是 CI 驗收過的同一批位元組，發版時不重新建置（見 [打包文件](docs/native-cross-platform-ci-and-packaging.md)）。
+
+**未簽章**：沒有 Apple／Windows 憑證，macOS 版只有 ad-hoc 簽章、未公證。
+
+- macOS 第一次開啟若被擋：系統設定 → 隱私權與安全性 → 「強制打開」（Open Anyway）；舊版 macOS 可在 Finder 對 App 按右鍵 → 打開。或直接移除隔離屬性：`xattr -cr /Applications/snip-sync.app`。
+- Windows SmartScreen 警告：「其他資訊」→「仍要執行」。
+- 從 v0.2.x（Tauri 版）升級：macOS 的 `snip-sync.app` 沿用同一個 bundle id，直接覆蓋；Windows 安裝檔會偵測舊的 Tauri 版（`%LOCALAPPDATA%\snip-sync`）並詢問是否先解除安裝；選「否」則兩版並存，之後可在「設定 → 應用程式」移除舊版。
 
 ## 已定案的範圍(2026-09-23)
 
