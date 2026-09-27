@@ -6,7 +6,7 @@
 //! wires real controls to those methods. Long lists use `uniform_list`.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -489,6 +489,7 @@ fn short(sha: &str) -> &str {
 /// Dropdowns of the log: the filter chips and the More (⋮) button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogMenu {
+	Repo,
 	Branch,
 	User,
 	Date,
@@ -499,6 +500,7 @@ pub enum LogMenu {
 impl LogMenu {
 	fn key(self) -> &'static str {
 		match self {
+			LogMenu::Repo => "repo",
 			LogMenu::Branch => "branch",
 			LogMenu::User => "user",
 			LogMenu::Date => "date",
@@ -551,6 +553,12 @@ fn branch_rows(
 	loc: Locale,
 ) -> Vec<BranchRow> {
 	let is_collapsed = |k: &str| collapsed.iter().any(|c| c == k);
+	// The merged log has a `main` per repository: one row filters them all.
+	let mut seen = HashSet::new();
+	let refs: Vec<&snip_core::browser::GitReference> = refs
+		.iter()
+		.filter(|r| seen.insert(r.name.as_str()))
+		.collect();
 	let mut out = Vec::new();
 	for (key, prefix) in [
 		("refs_local", "refs/heads/"),
@@ -5041,6 +5049,7 @@ impl WorkbenchModel {
 	fn clear_log_chip(&mut self, menu: LogMenu, cx: &mut Context<Self>) {
 		self.log_menu = None;
 		match menu {
+			LogMenu::Repo => self.set_log_repos(Vec::new(), cx),
 			LogMenu::Branch => self.filter_by_ref(None, cx),
 			LogMenu::User => self.set_log_author(None, cx),
 			LogMenu::Date => self.set_log_since(None, cx),
@@ -5092,10 +5101,59 @@ impl WorkbenchModel {
 		};
 		let mut items: Vec<AnyElement> = Vec::new();
 		match menu {
+			LogMenu::Repo => {
+				let all = self.log_repo_filter.is_empty();
+				items.push(item(
+					"log-repo:all".into(),
+					t("log_repo_all", loc).to_string(),
+					all,
+					Box::new(|this, cx| this.set_log_repos(Vec::new(), cx)),
+					cx,
+				));
+				let scope = self.log_scope();
+				for (ix, repo) in
+					self.repos.iter().enumerate().take(MAX_LOG_MENU_ITEMS)
+				{
+					let checked =
+						!all && scope.iter().any(|(r, _)| *r == repo.root);
+					let root = repo.root.clone();
+					let id = format!("log-repo:{}", repo.name);
+					items.push(
+						div()
+							.id(SharedString::from(id.clone()))
+							.relative()
+							.h(px(24.))
+							.px(px(8.))
+							.flex()
+							.items_center()
+							.gap(px(6.))
+							.rounded(px(4.))
+							.cursor_pointer()
+							.hover(|s| s.bg(rgb(pal().hover_bg)))
+							.on_click(cx.listener(move |this, _, _, cx| {
+								cx.stop_propagation();
+								this.toggle_log_repo(root.clone(), cx)
+							}))
+							.child(checkbox(checked))
+							.child(
+								div()
+									.flex_shrink_0()
+									.size(px(8.))
+									.rounded(px(2.))
+									.bg(graph_view::palette_rgb(ix)),
+							)
+							.child(fill_text(repo.name.clone()))
+							.children(probe(log, id))
+							.into_any_element(),
+					);
+				}
+			}
 			LogMenu::Branch => {
+				let mut seen = HashSet::new();
 				let refs = std::iter::once("HEAD".to_string())
-					.filter(|_| self.head_sha.is_some())
+					.filter(|_| self.head_sha.is_some() || self.log_is_merged())
 					.chain(self.refs.iter().map(|r| r.name.clone()))
+					.filter(|name| seen.insert(name.clone()))
 					.take(MAX_LOG_MENU_ITEMS);
 				for name in refs {
 					let label = short_ref(&name).to_string();
@@ -5251,6 +5309,7 @@ impl WorkbenchModel {
 				// folder) are listed above it.
 				let chosen = &self.log_filter.paths;
 				let tree_rows = match self.file_tree.as_ref() {
+					_ if self.log_is_merged() => self.merged_path_picks(),
 					Some(tree) if tree.is_loaded => path_picker_rows(
 						tree,
 						&self.log_paths_expanded,
@@ -5349,6 +5408,50 @@ impl WorkbenchModel {
 					.with_priority(1),
 			)
 			.into_any_element()
+	}
+
+	/// The merged log's Paths picker: its repositories on top; the selected
+	/// one opens into the project tree's loaded folders. A path is
+	/// `<repository>/<path>`, a repository alone keeps all its history.
+	fn merged_path_picks(&self) -> Vec<PathPick> {
+		let selected = self.repo().map(|r| r.name.clone());
+		let tree = self.file_tree.as_ref().filter(|t| t.is_loaded);
+		let mut out = Vec::new();
+		for (_, name) in self.log_scope() {
+			let mine = tree.filter(|_| selected.as_deref() == Some(&name));
+			let expanded =
+				mine.is_some() && self.log_paths_expanded.contains(&name);
+			out.push(PathPick {
+				rel: name.clone(),
+				name: name.clone(),
+				is_dir: Some(true),
+				depth: 0,
+				expandable: mine.is_some(),
+				expanded,
+			});
+			if let (true, Some(tree)) = (expanded, mine) {
+				let prefix = format!("{name}/");
+				let open: Vec<String> = self
+					.log_paths_expanded
+					.iter()
+					.filter_map(|p| p.strip_prefix(&prefix).map(str::to_string))
+					.collect();
+				out.extend(
+					path_picker_rows(tree, &open, MAX_PATH_PICKS)
+						.into_iter()
+						.map(|mut pick| {
+							pick.rel = format!("{prefix}{}", pick.rel);
+							pick.depth += 1;
+							pick
+						}),
+				);
+			}
+			if out.len() >= MAX_PATH_PICKS {
+				out.truncate(MAX_PATH_PICKS);
+				break;
+			}
+		}
+		out
 	}
 
 	/// One row of the Paths picker: chevron (a loaded folder), checkbox,
@@ -5477,7 +5580,9 @@ impl WorkbenchModel {
 				.children(probe(log, id))
 				.into_any_element()
 		};
-		if self.head_sha.is_some() && needle.is_empty() {
+		if (self.head_sha.is_some() || self.log_is_merged())
+			&& needle.is_empty()
+		{
 			rows.push(entry(
 				"ref:HEAD".into(),
 				t("log_head_current", loc).to_string(),
@@ -5817,6 +5922,16 @@ impl WorkbenchModel {
 			}
 			(since, until) => Some(format!("{} – {}", day(since), day(until))),
 		};
+		let repo_value = match self.log_repo_filter.as_slice() {
+			[] => None,
+			_ => {
+				let scope = self.log_scope();
+				scope.first().map(|(_, name)| match scope.len() {
+					1 => name.clone(),
+					n => format!("{name} +{}", n - 1),
+				})
+			}
+		};
 		let paths_value = self.log_filter.paths.first().map(|p| {
 			match self.log_filter.paths.len() {
 				1 => p.clone(),
@@ -5880,6 +5995,14 @@ impl WorkbenchModel {
 					.flex_1()
 					.min_w_0()
 					.overflow_hidden()
+					.when(self.repos.len() > 1, |d| {
+						d.child(self.log_chip(
+							LogMenu::Repo,
+							t("log_chip_repo", loc),
+							repo_value,
+							cx,
+						))
+					})
 					.child(self.log_chip(
 						LogMenu::Branch,
 						t("log_chip_branch", loc),
@@ -5924,7 +6047,7 @@ impl WorkbenchModel {
 					"btn-head",
 					Icon::Locate,
 					t("tip_head", loc),
-					self.head_sha.is_some(),
+					self.head_sha.is_some() || self.log_is_merged(),
 					false,
 				)
 				.tab_index(42)
@@ -5936,7 +6059,9 @@ impl WorkbenchModel {
 					"btn-compare",
 					Icon::Diff,
 					match range {
-						Some((a, b)) => tf("tip_compare", loc, &[&(b - a + 1)]),
+						Some(_) => {
+							tf("tip_compare", loc, &[&self.range_ids().len()])
+						}
 						None => t("tip_compare_disabled", loc).to_string(),
 					},
 					range.is_some(),
@@ -6211,9 +6336,27 @@ impl WorkbenchModel {
 		// draw over it).
 		let show_tips = self.chrome.menu.is_none();
 		let selected = self.selected_commit.as_deref() == Some(&c.sha);
+		// A range selects its anchor's repository only.
 		let in_range =
-			self.range_rows().is_some_and(|(a, b)| ix >= a && ix <= b);
+			self.range_rows().is_some_and(|(a, b)| ix >= a && ix <= b)
+				&& self
+					.selected_commit
+					.as_deref()
+					.is_some_and(|s| crate::history::same_repo(s, &c.sha));
 		let sha = c.sha.clone();
+		// The merged log: the row's repository (root stripe, ids).
+		let repo = self.log_row_repo(&c.sha);
+		let key = match repo {
+			Some((feed, _)) => format!("{}:{}", feed.name, short(&sha)),
+			None => short(&sha).to_string(),
+		};
+		// Drivers address the selected repository's rows by SHA alone.
+		let legacy_id = repo
+			.filter(|(feed, _)| self.repo_root().as_ref() == Some(&feed.root))
+			.map(|_| format!("commit-row:{}", short(&sha)));
+		let stripe = repo.map(|(feed, color)| {
+			(graph_view::palette_rgb(color), feed.name.clone())
+		});
 		let sha_click = sha.clone();
 		let graph_row = self
 			.graph_layout
@@ -6233,17 +6376,14 @@ impl WorkbenchModel {
 		} else {
 			0
 		};
-		let current_branch = self
-			.repo()
-			.and_then(|r| r.summary.as_ref().ok())
-			.and_then(|s| s.branch.clone());
+		let current_branch = self.log_current_branch(&c.sha);
 		let (labels, labels_w) = graph_row
 			.as_ref()
 			.map(|r| {
 				ref_label_elements(
 					&r.refs,
 					current_branch.as_deref(),
-					short(&sha),
+					&key,
 					show_tips,
 					&|s: &str| text_width(window, s, SMALL_TEXT),
 				)
@@ -6263,8 +6403,8 @@ impl WorkbenchModel {
 				- AUTHOR_W - DATE_W
 				- hash_w - if labels_w > 0. { labels_w + 6. } else { 0. };
 		let truncated = text_width(window, &c.subject, UI_TEXT) > subject_room;
-		let row_id = format!("commit-row:{}", short(&sha));
-		let col_id = format!("collapse:{}", short(&sha));
+		let row_id = format!("commit-row:{key}");
+		let col_id = format!("collapse:{key}");
 		let merge_sha = sha.clone();
 		let node_x = graph_row
 			.as_ref()
@@ -6372,10 +6512,7 @@ impl WorkbenchModel {
 					.overflow_hidden()
 					.child(
 						div()
-							.id(SharedString::from(format!(
-								"subject:{}",
-								short(&sha)
-							)))
+							.id(SharedString::from(format!("subject:{key}")))
 							.flex_1()
 							.min_w_0()
 							.overflow_hidden()
@@ -6408,7 +6545,7 @@ impl WorkbenchModel {
 			)
 			.child(
 				div()
-					.id(SharedString::from(format!("author:{}", short(&sha))))
+					.id(SharedString::from(format!("author:{key}")))
 					.flex_shrink_0()
 					.w(px(AUTHOR_W))
 					.when(show_tips, |d| {
@@ -6425,7 +6562,7 @@ impl WorkbenchModel {
 			)
 			.child(
 				div()
-					.id(SharedString::from(format!("date:{}", short(&sha))))
+					.id(SharedString::from(format!("date:{key}")))
 					.flex_shrink_0()
 					.w(px(DATE_W))
 					.when(show_tips, |d| {
@@ -6436,17 +6573,38 @@ impl WorkbenchModel {
 			.when(self.log_show_hash, |d| {
 				d.child(
 					div()
-						.id(SharedString::from(format!("sha:{}", short(&sha))))
+						.id(SharedString::from(format!("sha:{key}")))
 						.flex_shrink_0()
 						.w(px(hash_w))
 						.font_family(CODE_FONT)
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
-						.when(show_tips, |d| d.tooltip(tip(c.sha.clone())))
+						.when(show_tips, |d| {
+							d.tooltip(tip(crate::multi_log::split_id(&c.sha)
+								.0
+								.to_string()))
+						})
 						.child(short(&c.sha).to_string()),
 				)
 			})
+			// IntelliJ's root stripe: the repository, at the row's left edge.
+			.when_some(stripe, |d, (color, name)| {
+				let id = format!("root-stripe:{key}");
+				d.child(
+					div()
+						.id(SharedString::from(id.clone()))
+						.absolute()
+						.left_0()
+						.top_0()
+						.w(px(4.))
+						.h_full()
+						.bg(color)
+						.when(show_tips, |d| d.tooltip(tip(name)))
+						.children(probe(&self.probes, id)),
+				)
+			})
 			.children(probe(&self.probes, row_id))
+			.children(legacy_id.and_then(|id| probe(&self.probes, id)))
 			.into_any_element()
 	}
 
@@ -6701,10 +6859,10 @@ impl WorkbenchModel {
 			),
 			_ => Default::default(),
 		};
-		let current_branch = self
-			.repo()
-			.and_then(|r| r.summary.as_ref().ok())
-			.and_then(|s| s.branch.clone());
+		let current_branch = self.log_current_branch(sha);
+		let repo = self.log_row_repo(sha).map(|(feed, color)| {
+			(feed.name.clone(), graph_view::palette_rgb(color))
+		});
 		let refs = self
 			.display_commits()
 			.iter()
@@ -6725,6 +6883,25 @@ impl WorkbenchModel {
 			.flex_col()
 			.gap(px(6.))
 			.text_color(rgb(pal().text))
+			.when_some(repo, |d, (name, color)| {
+				let id = format!("commit-details-repo:{name}");
+				d.child(
+					div()
+						.relative()
+						.flex()
+						.items_center()
+						.gap(px(6.))
+						.child(
+							div()
+								.flex_shrink_0()
+								.size(px(8.))
+								.rounded(px(2.))
+								.bg(color),
+						)
+						.child(muted(tf("log_details_repo", loc, &[&name])))
+						.children(probe(&self.probes, id)),
+				)
+			})
 			.child(div().font_weight(FontWeight::SEMIBOLD).child(subject))
 			.when(!body.is_empty(), |d| {
 				d.child(div().whitespace_normal().child(body))

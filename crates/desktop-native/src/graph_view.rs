@@ -265,13 +265,15 @@ pub fn visible_refs<'a>(
 pub const MAX_FRONTIER: usize = 256;
 /// Refs one page hands to the layout (labels and rail colors only).
 pub const MAX_LAYOUT_REFS: usize = 1000;
+/// Rows one layout takes: the log's whole window.
+pub const MAX_LAYOUT_ROWS: usize = 500;
 
 fn graph_config(
 	filtered: HashSet<String>,
 	shallow: HashSet<String>,
 ) -> GraphConfig {
 	GraphConfig {
-		max_rows: 500,
+		max_rows: MAX_LAYOUT_ROWS,
 		max_frontier_size: MAX_FRONTIER,
 		max_refs: MAX_LAYOUT_REFS,
 		unit_x: LANE_WIDTH as f64,

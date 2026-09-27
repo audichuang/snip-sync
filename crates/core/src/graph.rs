@@ -2971,4 +2971,105 @@ mod tests {
 		assert_eq!(end.next_global_row, 4);
 		assert_eq!(end.last_seen_sha.as_deref(), Some("base"));
 	}
+
+	/// A multi-root log lays several repositories out as one list: commits
+	/// interleaved by date, ids namespaced per repository. The engine must
+	/// treat them as unrelated histories: the drawing reaches exactly each
+	/// commit's own parents (never a row of another repository), and every
+	/// repository's rows keep the node and edge kinds of its standalone
+	/// layout.
+	#[test]
+	fn interleaved_repositories_never_connect() {
+		let ns =
+			|repo: &str, commits: &[CommitSummary]| -> Vec<CommitSummary> {
+				commits
+					.iter()
+					.map(|c| CommitSummary {
+						sha: format!("{}@{repo}", c.sha),
+						parents: c
+							.parents
+							.iter()
+							.map(|p| format!("{p}@{repo}"))
+							.collect(),
+						..c.clone()
+					})
+					.collect()
+			};
+		// Same SHAs in both repositories (a clone), a merge in each.
+		let a = ns(
+			"0",
+			&[
+				make_commit("m", &["x", "s"]),
+				make_commit("s", &["x"]),
+				make_commit("x", &["r"]),
+				make_commit("r", &[]),
+			],
+		);
+		let b = ns(
+			"1",
+			&[
+				make_commit("t", &["m"]),
+				make_commit("m", &["x", "s"]),
+				make_commit("x", &["r"]),
+				make_commit("s", &["r"]),
+				make_commit("r", &[]),
+			],
+		);
+		// Interleaved, each repository keeping its own order.
+		let order = [0, 1, 1, 0, 1, 0, 1, 0, 1];
+		let (mut ia, mut ib) = (0, 0);
+		let merged: Vec<CommitSummary> = order
+			.iter()
+			.map(|&r| {
+				if r == 0 {
+					ia += 1;
+					a[ia - 1].clone()
+				} else {
+					ib += 1;
+					b[ib - 1].clone()
+				}
+			})
+			.collect();
+		let config = geometry_config();
+		let want = true_parents(&merged);
+		for page in 1..=merged.len() {
+			assert_eq!(
+				drawn_parents(&merged, page, &config),
+				want,
+				"page size {page}"
+			);
+		}
+		let kinds =
+			|rows: Vec<&GraphRow>| -> Vec<(NodeType, Vec<ContinuationKind>)> {
+				rows.into_iter()
+					.map(|r| {
+						(
+							r.node.node_type,
+							r.parent_edges
+								.iter()
+								.map(|e| e.continuation)
+								.collect(),
+						)
+					})
+					.collect()
+			};
+		let layout =
+			compute_graph_layout(&merged, &[], None, &config, None).unwrap();
+		for (repo, alone) in [("@0", &a), ("@1", &b)] {
+			let solo =
+				compute_graph_layout(alone, &[], None, &config, None).unwrap();
+			let rows: Vec<&GraphRow> = layout
+				.rows
+				.iter()
+				.filter(|r| r.sha.ends_with(repo))
+				.collect();
+			for row in &rows {
+				for edge in &row.parent_edges {
+					assert!(edge.parent_sha.ends_with(repo));
+				}
+			}
+			assert_eq!(kinds(rows), kinds(solo.rows.iter().collect()));
+		}
+		assert!(verify_graph_invariants(&layout, &merged).is_ok());
+	}
 }

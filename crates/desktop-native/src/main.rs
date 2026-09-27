@@ -76,6 +76,7 @@ pub mod i18n;
 mod icons;
 pub mod lifecycle;
 mod menu;
+mod multi_log;
 pub mod paste;
 mod reader;
 mod recent;
@@ -1026,6 +1027,14 @@ pub struct WorkbenchModel {
 	pub changes_generation: u64,
 	/// Repo the shown preview was read from, with `preview_identity`.
 	pub preview_root: Option<(PathBuf, usize)>,
+	/// Repositories the log's Repository chip picked; empty is all of them.
+	pub log_repo_filter: Vec<PathBuf>,
+	/// Repositories the loaded log covers (two or more: the merged log).
+	pub log_scope_key: Vec<PathBuf>,
+	/// The merged log's per-repository feeds.
+	pub log_feeds: Vec<multi_log::Feed>,
+	/// Repository of the commit or compare the reader shows from the log.
+	pub log_commit_root: Option<PathBuf>,
 }
 
 /// Identity of a shown preview's text, as `reader.rs` compares it.
@@ -1346,6 +1355,10 @@ impl WorkbenchModel {
 			changes_cancel: None,
 			changes_generation: 0,
 			preview_root: None,
+			log_repo_filter: Vec::new(),
+			log_scope_key: Vec::new(),
+			log_feeds: Vec::new(),
+			log_commit_root: None,
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
@@ -1354,9 +1367,19 @@ impl WorkbenchModel {
 		model
 	}
 
-	/// The repo the shown preview came from; the open repo otherwise.
+	/// The repo the shown preview came from: a log commit's own repo, the
+	/// Changes row's repo, else the open repo.
 	pub fn preview_root(&self) -> Option<PathBuf> {
 		match (&self.preview_root, &self.preview) {
+			(_, Some(p))
+				if matches!(
+					p.source,
+					PreviewSource::CommitDiff { .. }
+						| PreviewSource::Compare { .. }
+				) =>
+			{
+				self.log_commit_root.clone().or_else(|| self.repo_root())
+			}
 			(Some((root, id)), Some(p)) if *id == preview_identity(p) => {
 				Some(root.clone())
 			}
@@ -2798,6 +2821,7 @@ impl WorkbenchModel {
 		}
 		self.sync_change_slots();
 		self.start_changes_queue(false, cx);
+		self.sync_log_scope(cx);
 		app_log!("[APP:READY_REPOS: {}]", self.repos.len());
 		if e2e_on() {
 			for r in &self.repos {
@@ -3129,16 +3153,20 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
+		// The log shows the workspace: a plain switch keeps it.
+		let reload_log = self.log_reloads_on_repo_switch(preserve_anchors);
 		self.generation += 1;
 		self.preview_generation += 1;
-		self.history_generation += 1;
+		if reload_log {
+			self.history_generation += 1;
+			let _ = arm_cancel(&mut self.history_cancel);
+		}
 		self.tree_generation += 1;
 		let task_generation = self.generation;
 		self.preview_loading = false;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		let _ = arm_cancel(&mut self.tree_cancel);
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
-		let _ = arm_cancel(&mut self.history_cancel);
 		let cancel = arm_cancel(&mut self.repo_cancel);
 
 		let anchor_file = if preserve_anchors {
@@ -3182,10 +3210,6 @@ impl WorkbenchModel {
 		self.range_head = None;
 		self.compare = None;
 		self.commit_files.clear();
-		self.commits.clear();
-		self.refs.clear();
-		self.head_sha = None;
-		self.graph_layout = None;
 		self.changes_loaded = false;
 		// Its rows stay shown but inert until the re-read lands: their
 		// checkboxes must not replace the repo's Git group meanwhile.
@@ -3197,23 +3221,33 @@ impl WorkbenchModel {
 				slot.state = ChangeRepoState::Loading;
 			}
 		}
-		self.commit_page = 0;
-		self.log_first_page = 0;
-		self.log_on_head.clear();
-		self.history_extending = false;
-		self.page_checkpoints = vec![None];
-		self.collapsed_merges.clear();
-		self.hidden_commits.clear();
-		self.history_walk = None;
-		self.history_error = None;
+		if reload_log {
+			self.commits.clear();
+			self.refs.clear();
+			self.head_sha = None;
+			self.graph_layout = None;
+			self.commit_page = 0;
+			self.log_first_page = 0;
+			self.log_on_head.clear();
+			self.history_extending = false;
+			self.page_checkpoints = vec![None];
+			self.collapsed_merges.clear();
+			self.hidden_commits.clear();
+			self.history_walk = None;
+			self.history_error = None;
+		}
 		if !preserve_anchors {
-			self.log_filter = LogQuery::default();
 			self.commit_details = None;
+		}
+		if !preserve_anchors && reload_log {
+			self.log_filter = LogQuery::default();
 			self.git_user_email = None;
 			// A reload of the same repo keeps the log's branch filter and
 			// search, which the history reload applies again.
 			self.active_ref_filter = None;
 			self.log_search = None;
+		}
+		if !preserve_anchors {
 			self.clear_preview();
 			self.preview_error = None;
 			self.rev_tree = None;
@@ -3360,7 +3394,11 @@ impl WorkbenchModel {
 							));
 						}
 					}
-					model.load_history(cx);
+					if reload_log {
+						model.load_history(cx);
+					} else {
+						model.log_kept_on_repo_switch();
+					}
 					cx.notify();
 				});
 			},
@@ -4209,33 +4247,25 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
-		let Some(repo_root) = self.repo_root() else {
-			return;
-		};
-		let repo_name = self.repo().map(|r| r.name.clone()).unwrap_or_default();
-		let rows = self.display_commits();
-		let (tip_sha, selected) = if let Some((top, bottom)) = self.range_rows()
-		{
-			let slice = &rows[top..=bottom];
-			let tip = slice[0].sha.clone();
-			let selected = slice.iter().map(|c| c.sha.clone()).collect();
-			(tip, selected)
-		} else if let Some(ref sel) = self.selected_commit {
-			if rows.iter().any(|c| &c.sha == sel) {
-				(sel.clone(), vec![sel.clone()])
-			} else {
-				app_log!("[APP:COPY_COMMITS_REFUSED: no_selection]");
-				self.set_status("status_copy_empty", []);
-				cx.notify();
-				return;
-			}
-		} else {
-			app_log!("[APP:COPY_COMMITS_REFUSED: no_selection]");
-			self.set_status("status_copy_empty", []);
-			cx.notify();
-			return;
-		};
-		drop(rows);
+		// The commits' own repository, not the selected one: the log shows
+		// every repository of the workspace.
+		let (repo_root, repo_name, tip_sha, selected) =
+			match self.commit_copy_target() {
+				Ok(target) => target,
+				Err(reason) => {
+					app_log!("[APP:COPY_COMMITS_REFUSED: {reason}]");
+					self.set_status(
+						if reason == "cross_repo" {
+							"status_log_cross_repo"
+						} else {
+							"status_copy_empty"
+						},
+						[],
+					);
+					cx.notify();
+					return;
+				}
+			};
 
 		self.is_copying = true;
 		self.set_status("status_copying", [repo_name.clone()]);

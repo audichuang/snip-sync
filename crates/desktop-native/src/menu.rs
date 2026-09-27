@@ -338,7 +338,9 @@ impl WorkbenchModel {
 				"copy-revision",
 				"menu_copy_revision",
 				None,
-				Some(MenuAct::CopyText(sha.to_string())),
+				Some(MenuAct::CopyText(
+					crate::multi_log::split_id(sha).0.to_string(),
+				)),
 			),
 			item(
 				"copy-commits",
