@@ -1804,8 +1804,10 @@ fn capture_window(wid: &str, out_png: &Path) {
 	assert!(fs::metadata(out_png).unwrap().len() > 1024);
 }
 
-/// A failed layout must leave the rendered page intact and retry page 2,
-/// rather than combining new commits with old rails or advancing to page 3.
+/// A failed next page must leave the rendered page intact and retry the same
+/// page, rather than combining new commits with old rails or skipping ahead.
+/// Pages 2-10 are sliced from the window page 1 fetched, so page 11 is the
+/// first that reads Git again; a repository gone missing fails exactly it.
 #[test]
 fn native_graph_failed_next_page_is_transactional() {
 	if std::env::var_os("DISPLAY").is_none() {
@@ -1822,17 +1824,28 @@ fn native_graph_failed_next_page_is_transactional() {
 	git_ok(&repo, &["init", "-q", "-b", "main"]);
 	git_ok(&repo, &["config", "user.name", "Graph Test"]);
 	git_ok(&repo, &["config", "user.email", "graph@example.com"]);
-	for n in 0..120 {
-		git_ok(
-			&repo,
-			&[
-				"commit",
-				"--allow-empty",
-				"-qm",
-				&format!("page commit {n}"),
-			],
-		);
+	let mut stream = String::new();
+	for n in 0..560 {
+		let msg = format!("page commit {n}");
+		stream.push_str(&format!(
+			"commit refs/heads/main\ncommitter Graph Test <graph@example.com> {} +0000\ndata {}\n{msg}\n\n",
+			1_700_000_000 + n * 60,
+			msg.len()
+		));
 	}
+	let mut import = Command::new("git")
+		.current_dir(&repo)
+		.args(["fast-import", "--quiet"])
+		.stdin(Stdio::piped())
+		.spawn()
+		.unwrap();
+	import
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(stream.as_bytes())
+		.unwrap();
+	assert!(import.wait().unwrap().success());
 	let commits = Command::new("git")
 		.current_dir(&repo)
 		.args(["log", "--format=%H"])
@@ -1845,8 +1858,9 @@ fn native_graph_failed_next_page_is_transactional() {
 		.map(str::to_owned)
 		.collect();
 	let first = &commits[0][..7];
-	let second = &commits[50][..7];
-	let first_row = format!("commit-row:{first}");
+	let tenth = &commits[450][..7];
+	let second = &commits[500][..7];
+	let first_row = format!("commit-row:{tenth}");
 	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
 	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
 	let mut app = spawn_app(
@@ -1954,10 +1968,32 @@ fn native_graph_failed_next_page_is_transactional() {
 		let image = out.join(format!("graph-admission-{name}.png"));
 		let crop = out.join(format!("graph-admission-{name}-row.png"));
 		let deadline = Instant::now() + Duration::from_secs(5);
+		// The row probe is identical across pages, so a frame still showing
+		// the previous page passes every bounds check. Only accept a row
+		// whose pixels match the capture before it.
+		let mut previous: Option<([i32; 4], Vec<u8>)> = None;
 		loop {
 			let row = control(&first_row);
 			let error = require_error.then(|| control("log-error"));
 			capture(&image);
+			let [x, y, w, h] = row;
+			let pixels = Command::new("convert")
+				.arg(&image)
+				.args([
+					"-crop",
+					&format!("{w}x{h}+{x}+{y}"),
+					"+repage",
+					"-depth",
+					"8",
+					"RGB:-",
+				])
+				.output()
+				.unwrap();
+			assert!(pixels.status.success(), "row crop failed");
+			let settled = previous
+				.as_ref()
+				.is_some_and(|(r, p)| *r == row && *p == pixels.stdout);
+			previous = Some((row, pixels.stdout));
 			let stable = control(&first_row) == row
 				&& error.is_none_or(|rect| control("log-error") == rect);
 			// Probes run during prepaint, before Vulkan presents this frame.
@@ -1986,8 +2022,7 @@ fn native_graph_failed_next_page_is_transactional() {
 							&& p[2].abs_diff(100) <= 16
 					})
 			});
-			if stable && presented {
-				let [x, y, w, h] = row;
+			if stable && presented && settled {
 				assert!(Command::new("convert")
 					.arg(&image)
 					.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
@@ -2004,38 +2039,34 @@ fn native_graph_failed_next_page_is_transactional() {
 				Instant::now() < deadline,
 				"graph {name} frame did not present: row={row:?} error={error:?}"
 			);
-			std::thread::sleep(Duration::from_millis(20));
+			std::thread::sleep(Duration::from_millis(150));
 		}
 	};
+	for page in 2..=10 {
+		// Click only once the current page has been painted.
+		control(&format!("commit-row:{}", &commits[(page - 2) * 50][..7]));
+		next();
+		let loaded =
+			lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8))
+				.unwrap();
+		let want =
+			format!("first={} page={page}]", &commits[(page - 1) * 50][..7]);
+		assert!(loaded.last().unwrap().contains(&want), "{loaded:?}");
+	}
 	let before_y = control(&first_row)[1];
 	let before = crop_row("before", false);
-	// Only this test's disposable repository is mutated, never the standard
-	// workload. All refs target the same tip, so commit order stays identical.
-	let update_refs = |create: bool| {
-		let mut child = Command::new("git")
-			.current_dir(&repo)
-			.args(["update-ref", "--stdin"])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::null())
-			.spawn()
-			.unwrap();
-		let mut input = child.stdin.take().unwrap();
-		for n in 0..1001 {
-			if create {
-				writeln!(
-					input,
-					"create refs/heads/overflow-{n} {}",
-					commits[0]
-				)
-				.unwrap();
-			} else {
-				writeln!(input, "delete refs/heads/overflow-{n}").unwrap();
-			}
+	// Only this test's disposable repository is touched, never the standard
+	// workload: without `.git` every Git call fails until it is put back.
+	let dot_git = repo.join(".git");
+	let parked = repo.join("git-parked");
+	let park = |away: bool| {
+		if away {
+			fs::rename(&dot_git, &parked).unwrap();
+		} else {
+			fs::rename(&parked, &dot_git).unwrap();
 		}
-		drop(input);
-		assert!(child.wait().unwrap().success());
 	};
-	update_refs(true);
+	park(true);
 	next();
 	let rejected =
 		lines_until(&app.rx, "[APP:HISTORY_ERROR]", Duration::from_secs(8))
@@ -2063,7 +2094,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		"prior rendered row text and graph rails must remain identical: {}",
 		String::from_utf8_lossy(&comparison.stderr)
 	);
-	update_refs(false);
+	park(false);
 	next();
 	let retried =
 		lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8)).unwrap();
@@ -2071,7 +2102,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		retried
 			.last()
 			.unwrap()
-			.contains(&format!("mode=graph n=50 first={second} page=2]")),
+			.contains(&format!("mode=graph n=50 first={second} page=11]")),
 		"retry must load the real second page: {retried:?}"
 	);
 	control(&format!("commit-row:{second}"));

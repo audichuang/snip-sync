@@ -4,13 +4,17 @@
 //! passing lanes, ref badges (HEAD, branches, remotes, tags), bounded history paging,
 //! and historical commit file inspection.
 
+use std::collections::HashSet;
+
 use gpui::{
-	point, px, quad, rgb, size, Bounds, PathBuilder, Pixels, Rgba, Window,
+	point, px, quad, rgb, size, Bounds, ContentMask, PathBuilder, Pixels, Rgba,
+	Window,
 };
 use snip_core::browser::{CommitSummary, GitReference};
 use snip_core::graph::{
-	compute_graph_layout, ContinuationKind, GraphCheckpoint, GraphConfig,
-	GraphLayout, GraphRow, NodeType, RefInfo, RefKind, COLOR_PALETTE,
+	compute_graph_layout, fallback_linear_layout, ContinuationKind,
+	GraphCheckpoint, GraphConfig, GraphError, GraphLayout, GraphRow, NodeType,
+	RefInfo, RefKind, COLOR_PALETTE,
 };
 
 pub const ROW_HEIGHT: f32 = crate::theme::ROW_H;
@@ -99,9 +103,12 @@ pub fn lane_x(lane: usize) -> f32 {
 	OFFSET_X + (lane as f32) * LANE_WIDTH
 }
 
+/// Lanes the gutter grows to; lanes past it are clipped at its edge.
+pub const MAX_GUTTER_LANES: usize = 24;
+
 pub fn gutter_width(layout: &GraphLayout) -> f32 {
 	let max_lane = layout.rows.iter().map(|r| r.max_lane).max().unwrap_or(0);
-	((max_lane + 1) as f32) * LANE_WIDTH + 24.0
+	((max_lane + 1).min(MAX_GUTTER_LANES) as f32) * LANE_WIDTH + 24.0
 }
 
 /// Label text and text color for a ref; the background is the shared `REF_BG`.
@@ -207,6 +214,94 @@ pub fn visible_refs<'a>(
 	(sorted, hidden)
 }
 
+/// Rails one page may keep open. Beyond it the page is a plain list (with a
+/// warning) rather than an error; the lanes themselves are clipped to the
+/// gutter, so this only bounds layout memory.
+pub const MAX_FRONTIER: usize = 256;
+/// Refs one page hands to the layout (labels and rail colors only).
+pub const MAX_LAYOUT_REFS: usize = 1000;
+
+fn graph_config(
+	filtered: HashSet<String>,
+	shallow: HashSet<String>,
+) -> GraphConfig {
+	GraphConfig {
+		max_rows: 500,
+		max_frontier_size: MAX_FRONTIER,
+		max_refs: MAX_LAYOUT_REFS,
+		unit_x: LANE_WIDTH as f64,
+		unit_y: ROW_HEIGHT as f64,
+		offset_x: OFFSET_X as f64,
+		filtered_commits: filtered,
+		shallow_roots: shallow,
+		..Default::default()
+	}
+}
+
+/// The refs a page's layout needs: those on its commits (labels) or on
+/// their parents (merge-rail colors), page commits first, at most
+/// [`MAX_LAYOUT_REFS`]. A detached HEAD gets its own `HEAD` badge. The full
+/// ref list stays with the caller for the ref selector.
+pub fn page_refs(
+	commits: &[CommitSummary],
+	refs: &[GitReference],
+	head: Option<&str>,
+	detached: bool,
+) -> Vec<GitReference> {
+	let on_page: HashSet<&str> =
+		commits.iter().map(|c| c.sha.as_str()).collect();
+	let parents: HashSet<&str> = commits
+		.iter()
+		.flat_map(|c| c.parents.iter().map(String::as_str))
+		.collect();
+	let mut out: Vec<GitReference> = Vec::new();
+	if let Some(head) = head.filter(|h| detached && on_page.contains(h)) {
+		out.push(GitReference {
+			name: "HEAD".into(),
+			sha: head.to_string(),
+		});
+	}
+	// ponytail: refs past the cap lose their badge on this page only;
+	// a +N for them needs the layout to accept more refs.
+	out.extend(
+		refs.iter()
+			.filter(|r| on_page.contains(r.sha.as_str()))
+			.chain(refs.iter().filter(|r| {
+				!on_page.contains(r.sha.as_str())
+					&& parents.contains(r.sha.as_str())
+			}))
+			.take(MAX_LAYOUT_REFS.saturating_sub(out.len()))
+			.cloned(),
+	);
+	out
+}
+
+/// Lays out one page. Too many concurrent rails (or no checkpoint to
+/// continue from, after such a page) gives a plain list with
+/// `is_fallback`, never an error that would leave history unpageable.
+pub fn layout_page(
+	commits: &[CommitSummary],
+	refs: &[GitReference],
+	head_sha: Option<&str>,
+	checkpoint: Option<&GraphCheckpoint>,
+	resume: bool,
+	filtered: HashSet<String>,
+	shallow: HashSet<String>,
+) -> Result<GraphLayout, String> {
+	let config = graph_config(filtered, shallow);
+	let fallback = |config: &GraphConfig| {
+		fallback_linear_layout(commits, refs, head_sha, config)
+			.map_err(|e| format!("Graph layout error: {e}"))
+	};
+	if resume && checkpoint.is_none() {
+		return fallback(&config);
+	}
+	match compute_graph_layout(commits, refs, head_sha, &config, checkpoint) {
+		Err(GraphError::FrontierLimitExceeded { .. }) => fallback(&config),
+		other => other.map_err(|e| format!("Graph layout error: {e}")),
+	}
+}
+
 pub fn layout_commits(
 	commits: &[CommitSummary],
 	refs: &[GitReference],
@@ -221,160 +316,155 @@ pub fn layout_commits_paged(
 	head_sha: Option<&str>,
 	checkpoint: Option<&GraphCheckpoint>,
 ) -> Result<GraphLayout, String> {
-	let config = GraphConfig {
-		max_rows: 500,
-		max_frontier_size: 64,
-		max_refs: 1000,
-		unit_x: LANE_WIDTH as f64,
-		unit_y: ROW_HEIGHT as f64,
-		offset_x: OFFSET_X as f64,
-		..Default::default()
-	};
-	compute_graph_layout(commits, refs, head_sha, &config, checkpoint)
-		.map_err(|e| format!("Graph layout error: {e}"))
+	layout_page(
+		commits,
+		refs,
+		head_sha,
+		checkpoint,
+		false,
+		HashSet::new(),
+		HashSet::new(),
+	)
 }
 
-/// Layout where `filtered` commits are known to be hidden: edges into them
-/// become `FilteredGap` instead of looking like page boundaries.
-pub fn layout_commits_filtered(
-	commits: &[CommitSummary],
-	refs: &[GitReference],
-	head_sha: Option<&str>,
-	checkpoint: Option<&GraphCheckpoint>,
-	filtered: std::collections::HashSet<String>,
-) -> Result<GraphLayout, String> {
-	let config = GraphConfig {
-		max_rows: 500,
-		max_frontier_size: 64,
-		max_refs: 1000,
-		unit_x: LANE_WIDTH as f64,
-		unit_y: ROW_HEIGHT as f64,
-		offset_x: OFFSET_X as f64,
-		filtered_commits: filtered,
-		..Default::default()
-	};
-	compute_graph_layout(commits, refs, head_sha, &config, checkpoint)
-		.map_err(|e| format!("Graph layout error: {e}"))
+/// How a [`Stroke`] is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrokeKind {
+	/// A rail: straight segments through `points`.
+	Rail,
+	/// A merge curve: `points` is start, control, end (quadratic).
+	Merge,
+	/// Collapsed history below the dot: a dotted stub, not a join.
+	Gap,
+	/// A shallow clone's cut: dashed, the parents exist but are not here.
+	Shallow,
 }
 
-/// Paints the commit row's vector graph rails, passing lanes, curves, and node glyph onto the canvas.
+/// One line drawn in a row, in row-local pixels (y = 0 is the row top).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stroke {
+	pub kind: StrokeKind,
+	pub color: usize,
+	pub points: Vec<(f32, f32)>,
+}
+
+/// Everything a row draws besides its dot: the part of every rail inside
+/// the row's y-range, the merge curves that start on it, and gap / shallow
+/// stubs. Rails are clipped from whole-page polylines, so a bend, a lane
+/// shift or a converging branch is drawn exactly where the layout put it
+/// and each row's lines meet the next row's at the shared edge.
+pub fn row_strokes(layout: &GraphLayout, row: &GraphRow) -> Vec<Stroke> {
+	let h = ROW_HEIGHT as f64;
+	let top = row.global_row as f64 * h;
+	let bottom = top + h;
+	let local = |x: f64, y: f64| (x as f32, (y - top) as f32);
+	let mut out = Vec::new();
+	for path in &layout.paths {
+		let points = path.clip_y(top, bottom);
+		if points.len() >= 2 {
+			out.push(Stroke {
+				kind: StrokeKind::Rail,
+				color: path.color,
+				points: points.iter().map(|p| local(p.x, p.y)).collect(),
+			});
+		}
+	}
+	for link in &layout.links {
+		if link.start.y >= top && link.start.y < bottom {
+			out.push(Stroke {
+				kind: StrokeKind::Merge,
+				color: link.color,
+				points: [link.start, link.control, link.end]
+					.iter()
+					.map(|p| local(p.x, p.y))
+					.collect(),
+			});
+		}
+	}
+	let mid = ROW_HEIGHT * 0.5;
+	for edge in &row.parent_edges {
+		let x = lane_x(edge.from_lane);
+		let (kind, end) = match edge.continuation {
+			ContinuationKind::FilteredGap => {
+				(StrokeKind::Gap, (x, mid + (ROW_HEIGHT - mid) * 0.7))
+			}
+			ContinuationKind::ShallowBoundary => {
+				(StrokeKind::Shallow, (x, ROW_HEIGHT))
+			}
+			_ => continue,
+		};
+		out.push(Stroke {
+			kind,
+			color: edge.color_index,
+			points: vec![(x, mid), end],
+		});
+	}
+	out
+}
+
+/// Paints a row's strokes and dot, clipped to the gutter so a wide graph
+/// never draws over the commit message.
 pub fn paint_row_graph(
 	window: &mut Window,
 	row: &GraphRow,
-	incoming_from_above: bool,
+	strokes: &[Stroke],
+	bounds: Bounds<Pixels>,
+) {
+	window.with_content_mask(Some(ContentMask { bounds }), |window| {
+		paint_strokes(window, row, strokes, bounds)
+	});
+}
+
+fn paint_strokes(
+	window: &mut Window,
+	row: &GraphRow,
+	strokes: &[Stroke],
 	bounds: Bounds<Pixels>,
 ) {
 	let mid_y = ROW_HEIGHT * 0.5;
 	let ox = bounds.origin.x;
 	let oy = bounds.origin.y;
+	let at = |(x, y): (f32, f32)| point(ox + px(x), oy + px(y));
 
-	// 1. Passing lanes: straight vertical line passing uninterrupted through this row
-	for p in &row.passing_lanes {
-		let x = lane_x(p.lane);
-		let color = palette_rgb(p.color_index);
-		let mut builder = PathBuilder::stroke(px(2.0));
-		builder.move_to(point(ox + px(x), oy + px(0.0)));
-		builder.line_to(point(ox + px(x), oy + px(ROW_HEIGHT)));
-		if let Ok(path) = builder.build() {
-			window.paint_path(path, color);
-		}
-	}
-
-	// 2. Incoming rail from row above to this commit node
-	if incoming_from_above {
-		let x = lane_x(row.node.lane);
-		let color = palette_rgb(row.node.color_index);
-		let mut builder = PathBuilder::stroke(px(2.0));
-		builder.move_to(point(ox + px(x), oy + px(0.0)));
-		builder.line_to(point(ox + px(x), oy + px(mid_y)));
-		if let Ok(path) = builder.build() {
-			window.paint_path(path, color);
-		}
-	}
-
-	// 3. Outgoing parent edges (connecting downwards to parents or page boundary)
-	for edge in &row.parent_edges {
-		let from_x = lane_x(edge.from_lane);
-		let to_x = lane_x(edge.to_lane);
-		let color = palette_rgb(edge.color_index);
-
-		if edge.continuation == ContinuationKind::FilteredGap {
-			// Collapsed / filtered history: a dotted stub that stops short
-			// with a gap mark, never a line into another commit.
-			let end_x = from_x + (to_x - from_x) * 0.5;
-			let end_y = mid_y + (ROW_HEIGHT - mid_y) * 0.7;
-			let mut builder =
-				PathBuilder::stroke(px(1.5)).dash_array(&[px(2.0), px(2.0)]);
-			builder.move_to(point(ox + px(from_x), oy + px(mid_y)));
-			builder.line_to(point(ox + px(end_x), oy + px(end_y)));
-			if let Ok(path) = builder.build() {
-				window.paint_path(path, color);
+	for stroke in strokes {
+		let color = palette_rgb(stroke.color);
+		let mut builder = match stroke.kind {
+			StrokeKind::Rail | StrokeKind::Merge => {
+				PathBuilder::stroke(px(2.0))
 			}
+			StrokeKind::Gap => {
+				PathBuilder::stroke(px(1.5)).dash_array(&[px(2.0), px(2.0)])
+			}
+			StrokeKind::Shallow => {
+				PathBuilder::stroke(px(2.0)).dash_array(&[px(3.0), px(2.0)])
+			}
+		};
+		let Some((&first, rest)) = stroke.points.split_first() else {
+			continue;
+		};
+		builder.move_to(at(first));
+		match (stroke.kind, rest) {
+			(StrokeKind::Merge, [ctrl, end]) => {
+				builder.curve_to(at(*end), at(*ctrl))
+			}
+			_ => rest.iter().for_each(|p| builder.line_to(at(*p))),
+		}
+		if let Ok(path) = builder.build() {
+			window.paint_path(path, color);
+		}
+		if stroke.kind == StrokeKind::Gap {
+			// Collapsed history ends in a gap mark, never at a commit.
+			let (x, y) = stroke.points[stroke.points.len() - 1];
 			let mut tick = PathBuilder::stroke(px(1.5));
-			tick.move_to(point(ox + px(end_x - 3.0), oy + px(end_y + 1.0)));
-			tick.line_to(point(ox + px(end_x + 3.0), oy + px(end_y - 1.0)));
+			tick.move_to(at((x - 3.0, y + 1.0)));
+			tick.line_to(at((x + 3.0, y - 1.0)));
 			if let Ok(path) = tick.build() {
 				window.paint_path(path, color);
 			}
-			continue;
-		}
-
-		if edge.from_lane == edge.to_lane {
-			if edge.continuation == ContinuationKind::UnresolvedPageBoundary {
-				// Page boundary continuation: dashed line
-				let mut builder = PathBuilder::stroke(px(2.0))
-					.dash_array(&[px(3.0), px(2.0)]);
-				builder.move_to(point(ox + px(from_x), oy + px(mid_y)));
-				builder.line_to(point(ox + px(from_x), oy + px(ROW_HEIGHT)));
-				if let Ok(path) = builder.build() {
-					window.paint_path(path, color);
-				}
-			} else if edge.continuation != ContinuationKind::Terminated {
-				let mut builder = PathBuilder::stroke(px(2.0));
-				builder.move_to(point(ox + px(from_x), oy + px(mid_y)));
-				builder.line_to(point(ox + px(from_x), oy + px(ROW_HEIGHT)));
-				if let Ok(path) = builder.build() {
-					window.paint_path(path, color);
-				}
-			} else {
-				// Root commit: short stub with stop crossbar
-				let mut builder = PathBuilder::stroke(px(2.0));
-				builder.move_to(point(ox + px(from_x), oy + px(mid_y)));
-				builder.line_to(point(ox + px(from_x), oy + px(mid_y + 6.0)));
-				builder.move_to(point(
-					ox + px(from_x - 3.0),
-					oy + px(mid_y + 6.0),
-				));
-				builder.line_to(point(
-					ox + px(from_x + 3.0),
-					oy + px(mid_y + 6.0),
-				));
-				if let Ok(path) = builder.build() {
-					window.paint_path(path, color);
-				}
-			}
-		} else {
-			// Branch fork or merge curve: smooth cubic Bézier S-curve connecting from_lane to to_lane
-			let mut builder = PathBuilder::stroke(px(2.0));
-			let p_start = point(ox + px(from_x), oy + px(mid_y));
-			let p_end = point(ox + px(to_x), oy + px(ROW_HEIGHT));
-			let p_c1 = point(
-				ox + px(from_x),
-				oy + px(mid_y + (ROW_HEIGHT - mid_y) * 0.5),
-			);
-			let p_c2 = point(
-				ox + px(to_x),
-				oy + px(mid_y + (ROW_HEIGHT - mid_y) * 0.5),
-			);
-			builder.move_to(p_start);
-			builder.cubic_bezier_to(p_end, p_c1, p_c2);
-			if let Ok(path) = builder.build() {
-				window.paint_path(path, color);
-			}
 		}
 	}
 
-	// 4. Commit node glyph (Merge diamond, Head double circle, Normal circle, Hollow boundary)
+	// Commit node glyph (Merge diamond, Head double circle, Normal circle, Hollow boundary)
 	let nx = ox + px(lane_x(row.node.lane));
 	let ny = oy + px(mid_y);
 	let color = palette_rgb(row.node.color_index);
@@ -583,6 +673,126 @@ mod tests {
 		assert_eq!((shown.len(), hidden), (2, 0));
 	}
 
+	/// x of every rail end on the row's top (`at_top`) or bottom edge.
+	fn edge_xs(strokes: &[Stroke], at_top: bool) -> Vec<i32> {
+		let y = if at_top { 0.0 } else { ROW_HEIGHT };
+		let mut xs: Vec<i32> = strokes
+			.iter()
+			.filter(|s| matches!(s.kind, StrokeKind::Rail | StrokeKind::Merge))
+			.flat_map(|s| [s.points[0], s.points[s.points.len() - 1]])
+			.filter(|p| (p.1 - y).abs() < 0.01)
+			.map(|p| (p.0 * 100.0).round() as i32)
+			.collect();
+		xs.sort_unstable();
+		xs.dedup();
+		xs
+	}
+
+	#[test]
+	fn rows_join_at_their_edges_and_bend_where_the_layout_does() {
+		// base; branch side; m1; m2; side: s1; main: m3; m4;
+		// merge --no-ff side; m5. The old renderer drew s1 as m4's child.
+		let commits = [
+			make_summary("m5", &["mg"], ""),
+			make_summary("mg", &["m4", "s1"], ""),
+			make_summary("s1", &["base"], ""),
+			make_summary("m4", &["m3"], ""),
+			make_summary("m3", &["m2"], ""),
+			make_summary("m2", &["m1"], ""),
+			make_summary("m1", &["base"], ""),
+			make_summary("base", &[], ""),
+		];
+		for split in 1..commits.len() {
+			let first = layout_commits(&commits[..split], &[], None).unwrap();
+			let rest = layout_commits_paged(
+				&commits[split..],
+				&[],
+				None,
+				first.checkpoint.as_ref(),
+			)
+			.unwrap();
+			let rows: Vec<(&GraphLayout, &GraphRow)> = first
+				.rows
+				.iter()
+				.map(|r| (&first, r))
+				.chain(rest.rows.iter().map(|r| (&rest, r)))
+				.collect();
+			let strokes: Vec<Vec<Stroke>> =
+				rows.iter().map(|(l, r)| row_strokes(l, r)).collect();
+			for s in strokes.iter().flatten() {
+				assert!(s
+					.points
+					.iter()
+					.all(|p| (0.0..=ROW_HEIGHT).contains(&p.1)));
+			}
+			for i in 1..rows.len() {
+				assert_eq!(
+					edge_xs(&strokes[i - 1], false),
+					edge_xs(&strokes[i], true),
+					"split {split}: rows {} and {i} do not meet",
+					i - 1
+				);
+			}
+			// A rail runs through s1's dot on to the row's bottom edge.
+			let s1 = rows.iter().position(|(_, r)| r.sha == "s1").unwrap();
+			let s1_x = lane_x(rows[s1].1.node.lane);
+			assert!(strokes[s1].iter().any(|s| s.kind == StrokeKind::Rail
+				&& s.points[0].0 == s1_x
+				&& s.points[0].1 <= ROW_HEIGHT * 0.5
+				&& s.points.last().unwrap().1 == ROW_HEIGHT));
+			let base = rows.len() - 1;
+			let base_dot = (lane_x(rows[base].1.node.lane), ROW_HEIGHT * 0.5);
+			assert!(
+				strokes[base]
+					.iter()
+					.filter(|s| s.points.last() == Some(&base_dot))
+					.count() >= 2,
+				"split {split}: m1 and s1 both end in base"
+			);
+		}
+	}
+
+	#[test]
+	fn page_refs_keep_page_and_parent_refs_and_cap_the_rest() {
+		let commits = vec![make_summary("a", &["p"], "")];
+		let r = |name: &str, sha: &str| GitReference {
+			name: name.into(),
+			sha: sha.into(),
+		};
+		let refs = vec![
+			r("refs/heads/far", "zz"),
+			r("refs/heads/parent", "p"),
+			r("refs/heads/here", "a"),
+		];
+		let names = |v: Vec<GitReference>| {
+			v.into_iter().map(|r| r.name).collect::<Vec<_>>()
+		};
+		assert_eq!(
+			names(page_refs(&commits, &refs, Some("a"), false)),
+			["refs/heads/here", "refs/heads/parent"]
+		);
+		assert_eq!(
+			names(page_refs(&commits, &refs, Some("a"), true)),
+			["HEAD", "refs/heads/here", "refs/heads/parent"]
+		);
+		let many: Vec<_> = (0..2000)
+			.map(|n| r(&format!("refs/tags/t{n}"), "a"))
+			.collect();
+		assert_eq!(
+			page_refs(&commits, &many, None, false).len(),
+			MAX_LAYOUT_REFS
+		);
+		// A wide graph never grows the gutter past the cap.
+		let wide: Vec<_> = (0..60)
+			.map(|n| make_summary(&format!("t{n}"), &[&format!("p{n}")], ""))
+			.collect();
+		let layout = layout_commits(&wide, &[], None).unwrap();
+		assert_eq!(
+			gutter_width(&layout),
+			MAX_GUTTER_LANES as f32 * LANE_WIDTH + 24.0
+		);
+	}
+
 	#[test]
 	fn test_render_geometry_against_layout_parent_oracle() {
 		// Realistic DAG fixture:
@@ -674,9 +884,16 @@ mod tests {
 		];
 		let hidden: std::collections::HashSet<String> =
 			["f".to_string()].into();
-		let layout =
-			layout_commits_filtered(&shown, &[], Some("m"), None, hidden)
-				.unwrap();
+		let layout = layout_page(
+			&shown,
+			&[],
+			Some("m"),
+			None,
+			false,
+			hidden,
+			HashSet::new(),
+		)
+		.unwrap();
 		let m = &layout.rows[0];
 		let side = m.parent_edges.iter().find(|e| e.parent_sha == "f").unwrap();
 		assert_eq!(side.continuation, ContinuationKind::FilteredGap);

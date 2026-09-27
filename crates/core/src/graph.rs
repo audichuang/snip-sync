@@ -237,7 +237,9 @@ pub struct ParentEdge {
 	pub parent_index: usize,
 	/// Originating lane of the child commit.
 	pub from_lane: usize,
-	/// Target lane for this parent connection.
+	/// Lane this connection leaves the row in: the node's lane for the first
+	/// parent, the merge rail's lane otherwise. It is not the parent's lane;
+	/// rails bend on later rows, so renderers draw [`GraphLayout::paths`].
 	pub to_lane: usize,
 	/// Target row index if resolved within the current layout page.
 	pub to_row: Option<usize>,
@@ -498,6 +500,37 @@ pub fn parse_ref_name(name: &str) -> RefInfo {
 	}
 }
 
+impl GraphPath {
+	/// The part of this path with `top <= y <= bottom`, as one polyline
+	/// (points are ordered by strictly increasing `y`). Adjacent row ranges
+	/// share their boundary point exactly, so rows drawn one by one join up.
+	pub fn clip_y(&self, top: f64, bottom: f64) -> Vec<Point> {
+		let pts = &self.points;
+		let first = pts.partition_point(|p| p.y <= top).saturating_sub(1);
+		let mut out = Vec::new();
+		for w in pts[first.min(pts.len())..].windows(2) {
+			let (a, b) = (w[0], w[1]);
+			if a.y >= bottom {
+				break;
+			}
+			if b.y <= top {
+				continue;
+			}
+			let at = |y: f64| Point {
+				x: a.x + (b.x - a.x) * (y - a.y) / (b.y - a.y),
+				y,
+			};
+			let start = if a.y < top { at(top) } else { a };
+			let end = if b.y > bottom { at(bottom) } else { b };
+			if out.last() != Some(&start) {
+				out.push(start);
+			}
+			out.push(end);
+		}
+		out
+	}
+}
+
 // ── Internal PathHelper (SourceGit faithful) ──
 
 struct PathHelper {
@@ -552,22 +585,28 @@ impl PathHelper {
 		}
 	}
 
-	fn from_frontier(rail: &FrontierRail) -> Self {
-		let pt = Point {
-			x: rail.last_x,
-			y: rail.last_y,
-		};
-		Self {
+	/// Resumes a rail at the top of a new page. The previous page drew it
+	/// straight down to its bottom edge at `last_x`, so this page continues
+	/// from `(last_x, page_top)`: a bend on the first row then starts where
+	/// the previous page stopped instead of cutting across the boundary.
+	fn from_frontier(rail: &FrontierRail, page_top: f64) -> Self {
+		let mut helper = Self {
 			next: rail.next_sha.clone(),
 			color: rail.color_index,
 			color_override: rail.color_override.clone(),
 			highlighted: rail.highlighted,
 			rail_id: rail.rail_id,
-			points: vec![pt],
+			points: vec![Point {
+				x: rail.last_x,
+				y: rail.last_y,
+			}],
 			last_x: rail.last_x,
 			last_y: rail.last_y,
 			end_y: rail.last_y,
-		}
+		};
+		helper.add_point(rail.last_x, page_top);
+		helper.last_y = helper.last_y.max(page_top);
+		helper
 	}
 
 	fn add_point(&mut self, x: f64, y: f64) {
@@ -887,8 +926,14 @@ pub fn compute_graph_layout(
 	let unit_h = config.unit_y;
 	let half_h = unit_h / 2.0;
 
+	let page_top = (global_row_offset as f64) * unit_h;
 	let mut unsolved: Vec<PathHelper> = checkpoint
-		.map(|cp| cp.frontier.iter().map(PathHelper::from_frontier).collect())
+		.map(|cp| {
+			cp.frontier
+				.iter()
+				.map(|rail| PathHelper::from_frontier(rail, page_top))
+				.collect()
+		})
 		.unwrap_or_default();
 
 	let mut completed_paths: Vec<GraphPath> = Vec::new();
@@ -901,6 +946,12 @@ pub fn compute_graph_layout(
 		let global_row = global_row_offset + row_idx;
 		let offset_y = (global_row as f64) * unit_h + half_h;
 		let mut offset_x = config.offset_x - unit_w;
+		// A hidden (collapsed) parent gets no rail: nothing below would
+		// ever consume it, so it would hang on as a ghost lane.
+		let first_parent = commit
+			.parents
+			.first()
+			.filter(|p| !config.filtered_commits.contains(*p));
 
 		let max_offset_old = if let Some(last_rail) = unsolved.last() {
 			last_rail.last_x
@@ -937,8 +988,8 @@ pub fn compute_graph_layout(
 						rail.highlighted = true;
 						incoming_highlighted = true;
 					}
-					if !commit.parents.is_empty() {
-						rail.next = commit.parents[0].clone();
+					if let Some(parent) = first_parent {
+						rail.next = parent.clone();
 						rail.goto(offset_x, offset_y, half_h);
 					} else {
 						rail.end(offset_x, offset_y, half_h);
@@ -969,7 +1020,7 @@ pub fn compute_graph_layout(
 				let was_major = major_idx == Some(i);
 				let matched_commit = rail.next == commit.sha;
 				if was_major {
-					if commit.parents.is_empty() {
+					if first_parent.is_none() {
 						ended.push(rail);
 					} else {
 						remaining.push(rail);
@@ -996,7 +1047,7 @@ pub fn compute_graph_layout(
 		if major_idx.is_none() {
 			offset_x += unit_w;
 			major_x = Some(offset_x);
-			if !commit.parents.is_empty() {
+			if let Some(parent) = first_parent {
 				if unsolved.len() >= config.max_frontier_size {
 					return Err(GraphError::FrontierLimitExceeded {
 						current: unsolved.len() + 1,
@@ -1013,7 +1064,7 @@ pub fn compute_graph_layout(
 				}
 				let color = pick_color(mask, preferred);
 				let mut rail = PathHelper::new_start(
-					commit.parents[0].clone(),
+					parent.clone(),
 					color,
 					Point {
 						x: offset_x,
@@ -1061,6 +1112,15 @@ pub fn compute_graph_layout(
 		let mut merge_parent_info: Vec<(usize, usize, usize)> = Vec::new();
 		if commit.parents.len() > 1 {
 			for parent_sha in commit.parents.iter().skip(1) {
+				if config.filtered_commits.contains(parent_sha) {
+					// Drawn as a gap stub from the row's edge instead.
+					merge_parent_info.push((
+						major_rail_id.unwrap_or(0),
+						node_lane,
+						dot_color,
+					));
+					continue;
+				}
 				if let Some(target_rail) =
 					unsolved.iter().find(|r| &r.next == parent_sha)
 				{
@@ -1219,21 +1279,11 @@ pub fn compute_graph_layout(
 		completed_paths.push(p.to_graph_path());
 	}
 
-	// Resolve target lanes for edges resolved within this page
-	let row_lanes: Vec<usize> = rows.iter().map(|r| r.node.lane).collect();
-	for row in &mut rows {
-		for edge in &mut row.parent_edges {
-			if let Some(target_row) = edge.to_row {
-				if let Some(&lane) = row_lanes.get(target_row) {
-					edge.to_lane = lane;
-				}
-			}
-		}
-	}
-
-	// Checkpoint creation or termination at page bottom
+	// Checkpoint at the page bottom. Emitted even with no open rail, so the
+	// next page always has one: a missing checkpoint then means the previous
+	// page had no graph at all, never "every rail happened to end here".
 	let end_y = ((global_row_offset + commits.len()) as f64 - 0.5) * unit_h;
-	let checkpoint_out = if !unsolved.is_empty() {
+	let checkpoint_out = {
 		let frontier = unsolved
 			.iter()
 			.map(|r| {
@@ -1265,20 +1315,17 @@ pub fn compute_graph_layout(
 			next_global_row: global_row_offset + commits.len(),
 			next_rail_id,
 			used_colors_mask: mask,
-			last_seen_sha: commits.last().map(|c| c.sha.clone()),
+			last_seen_sha: commits
+				.last()
+				.map(|c| c.sha.clone())
+				.or_else(|| checkpoint.and_then(|c| c.last_seen_sha.clone())),
 		})
-	} else {
-		None
 	};
 
-	// Finalize remaining paths
+	// Open rails run to the page's bottom edge, including one that starts on
+	// the last row (a single point there would draw nothing below its node).
 	for mut rail in unsolved {
-		if rail.points.len() > 1
-			|| (rail.points.len() == 1
-				&& (rail.points[0].y - end_y).abs() > 1e-4)
-		{
-			rail.end(rail.last_x, end_y + half_h, half_h);
-		}
+		rail.end(rail.last_x, end_y + half_h, half_h);
 		completed_paths.push(rail.to_graph_path());
 	}
 
@@ -2522,7 +2569,7 @@ mod tests {
 			ContinuationKind::ShallowBoundary
 		);
 		// Frontier must now be empty since c1 terminates the rail at the shallow boundary
-		assert!(p2.checkpoint.is_none());
+		assert!(p2.checkpoint.as_ref().unwrap().frontier.is_empty());
 	}
 
 	#[test]
@@ -2661,5 +2708,267 @@ mod tests {
 			ContinuationKind::ShallowBoundary
 		);
 		assert!(verify_graph_invariants(&layout, &history.commits).is_ok());
+	}
+
+	fn geometry_config() -> GraphConfig {
+		GraphConfig {
+			unit_x: 16.0,
+			unit_y: 24.0,
+			offset_x: 14.0,
+			..Default::default()
+		}
+	}
+
+	/// Lays `commits` out in pages of `page`, clips every path to each row
+	/// the way a per-row renderer does, adds each row's merge links, then
+	/// follows the strokes downward from every dot. The dots reached are
+	/// what a reader of the drawing takes as that commit's parents.
+	fn drawn_parents(
+		commits: &[CommitSummary],
+		page: usize,
+		config: &GraphConfig,
+	) -> Vec<Vec<usize>> {
+		let unit = config.unit_y;
+		let mut segments = Vec::new();
+		let mut dots = Vec::new();
+		let mut checkpoint = None;
+		for chunk in commits.chunks(page) {
+			let layout = compute_graph_layout(
+				chunk,
+				&[],
+				None,
+				config,
+				checkpoint.as_ref(),
+			)
+			.unwrap();
+			for row in &layout.rows {
+				let top = row.global_row as f64 * unit;
+				let bottom = top + unit;
+				dots.push(Point {
+					x: config.offset_x + row.node.lane as f64 * config.unit_x,
+					y: top + unit / 2.0,
+				});
+				for path in &layout.paths {
+					for w in path.clip_y(top, bottom).windows(2) {
+						segments.push((w[0], w[1]));
+					}
+				}
+				for link in &layout.links {
+					if link.start.y >= top && link.start.y < bottom {
+						segments.push((link.start, link.end));
+					}
+				}
+			}
+			checkpoint = layout.checkpoint;
+		}
+		let key = |p: Point| {
+			((p.x * 100.0).round() as i64, (p.y * 100.0).round() as i64)
+		};
+		let mut down: HashMap<(i64, i64), Vec<(i64, i64)>> = HashMap::new();
+		for (a, b) in segments {
+			assert!(a.y < b.y, "strokes run downward");
+			// A line through a dot reads as a join, so it is cut there.
+			let mut cuts = vec![a];
+			for d in &dots {
+				if d.y > a.y && d.y < b.y {
+					let x = a.x + (b.x - a.x) * (d.y - a.y) / (b.y - a.y);
+					if (x - d.x).abs() < 0.01 {
+						cuts.push(*d);
+					}
+				}
+			}
+			cuts.push(b);
+			for w in cuts.windows(2) {
+				down.entry(key(w[0])).or_default().push(key(w[1]));
+			}
+		}
+		let dot_at: HashMap<(i64, i64), usize> =
+			dots.iter().enumerate().map(|(i, d)| (key(*d), i)).collect();
+		dots.iter()
+			.map(|d| {
+				let mut reached = Vec::new();
+				let mut stack = vec![key(*d)];
+				let mut seen = HashSet::new();
+				while let Some(v) = stack.pop() {
+					if !seen.insert(v) {
+						continue;
+					}
+					for w in down.get(&v).into_iter().flatten() {
+						match dot_at.get(w) {
+							Some(&j) => reached.push(j),
+							None => stack.push(*w),
+						}
+					}
+				}
+				reached.sort_unstable();
+				reached.dedup();
+				reached
+			})
+			.collect()
+	}
+
+	fn true_parents(commits: &[CommitSummary]) -> Vec<Vec<usize>> {
+		commits
+			.iter()
+			.map(|c| {
+				let mut rows: Vec<usize> = c
+					.parents
+					.iter()
+					.filter_map(|p| commits.iter().position(|x| &x.sha == p))
+					.collect();
+				rows.sort_unstable();
+				rows
+			})
+			.collect()
+	}
+
+	#[test]
+	fn drawn_rails_reach_exactly_the_true_parents_at_every_page_split() {
+		// base; branch side; m1; m2; side: s1; main: m3; m4;
+		// merge --no-ff side; m5 (both topological orders git can print).
+		let side_first = vec![
+			make_commit("m5", &["mg"]),
+			make_commit("mg", &["m4", "s1"]),
+			make_commit("s1", &["base"]),
+			make_commit("m4", &["m3"]),
+			make_commit("m3", &["m2"]),
+			make_commit("m2", &["m1"]),
+			make_commit("m1", &["base"]),
+			make_commit("base", &[]),
+		];
+		let main_first = vec![
+			make_commit("m5", &["mg"]),
+			make_commit("mg", &["m4", "s1"]),
+			make_commit("m4", &["m3"]),
+			make_commit("m3", &["m2"]),
+			make_commit("m2", &["m1"]),
+			make_commit("m1", &["base"]),
+			make_commit("s1", &["base"]),
+			make_commit("base", &[]),
+		];
+		// A left rail ends (root) while rails to its right go on, and three
+		// branch tips converge on one parent.
+		let shifting = vec![
+			make_commit("a", &["x"]),
+			make_commit("b", &["y"]),
+			make_commit("c", &["y"]),
+			make_commit("d", &["y"]),
+			make_commit("x", &[]),
+			make_commit("e", &["y"]),
+			make_commit("y", &["z"]),
+			make_commit("z", &[]),
+		];
+		// Branch tips on what becomes the last row of a page.
+		let tips = vec![
+			make_commit("t1", &["p"]),
+			make_commit("t2", &["p"]),
+			make_commit("t3", &["q"]),
+			make_commit("p", &["q"]),
+			make_commit("o", &["q", "t9"]),
+			make_commit("t9", &["q"]),
+			make_commit("q", &[]),
+		];
+		// The left rail ends on a root, so the right rail bends left on the
+		// very row it reaches its commit (a page's first row at split 3).
+		let bend_on_arrival = vec![
+			make_commit("a", &["x"]),
+			make_commit("b", &["y"]),
+			make_commit("x", &[]),
+			make_commit("y", &["z"]),
+			make_commit("z", &[]),
+		];
+		let config = geometry_config();
+		for commits in
+			[&side_first, &main_first, &shifting, &tips, &bend_on_arrival]
+		{
+			let want = true_parents(commits);
+			for page in 1..=commits.len() {
+				assert_eq!(
+					drawn_parents(commits, page, &config),
+					want,
+					"page size {page}: {:?}",
+					commits.iter().map(|c| &c.sha).collect::<Vec<_>>()
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn clip_y_joins_adjacent_rows_exactly() {
+		let path = GraphPath {
+			points: vec![
+				Point { x: 30.0, y: 12.0 },
+				Point { x: 30.0, y: 48.0 },
+				Point { x: 14.0, y: 72.0 },
+			],
+			color: 0,
+			color_override: None,
+			highlighted: false,
+			rail_id: 0,
+		};
+		assert!(path.clip_y(0.0, 12.0).is_empty());
+		assert_eq!(
+			path.clip_y(24.0, 48.0),
+			vec![Point { x: 30.0, y: 24.0 }, Point { x: 30.0, y: 48.0 }]
+		);
+		assert_eq!(
+			path.clip_y(48.0, 60.0),
+			vec![Point { x: 30.0, y: 48.0 }, Point { x: 22.0, y: 60.0 }]
+		);
+		assert_eq!(
+			path.clip_y(60.0, 96.0),
+			vec![Point { x: 22.0, y: 60.0 }, Point { x: 14.0, y: 72.0 }]
+		);
+		assert!(path.clip_y(72.0, 96.0).is_empty());
+	}
+
+	#[test]
+	fn hidden_parents_get_no_rail_and_every_page_has_a_checkpoint() {
+		// m merges f; f is collapsed. g's first parent h is hidden too.
+		let shown = [
+			make_commit("m", &["a", "f"]),
+			make_commit("g", &["h"]),
+			make_commit("a", &["base"]),
+			make_commit("base", &[]),
+		];
+		let config = GraphConfig {
+			filtered_commits: ["f".to_string(), "h".to_string()].into(),
+			..geometry_config()
+		};
+		let layout =
+			compute_graph_layout(&shown[..2], &[], None, &config, None)
+				.unwrap();
+		let frontier = &layout.checkpoint.as_ref().unwrap().frontier;
+		assert_eq!(
+			frontier
+				.iter()
+				.map(|r| r.next_sha.as_str())
+				.collect::<Vec<_>>(),
+			["a"],
+			"a hidden parent must not keep a lane open"
+		);
+		assert!(layout.links.is_empty());
+		let gap = |row: &GraphRow, sha: &str| {
+			row.parent_edges
+				.iter()
+				.find(|e| e.parent_sha == sha)
+				.unwrap()
+				.continuation
+		};
+		assert_eq!(gap(&layout.rows[0], "f"), ContinuationKind::FilteredGap);
+		assert_eq!(gap(&layout.rows[1], "h"), ContinuationKind::FilteredGap);
+		// Every rail ends on `base`: the next page still gets a checkpoint.
+		let rest = compute_graph_layout(
+			&shown[2..],
+			&[],
+			None,
+			&config,
+			layout.checkpoint.as_ref(),
+		)
+		.unwrap();
+		let end = rest.checkpoint.unwrap();
+		assert!(end.frontier.is_empty());
+		assert_eq!(end.next_global_row, 4);
+		assert_eq!(end.last_seen_sha.as_deref(), Some("base"));
 	}
 }

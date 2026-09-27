@@ -623,6 +623,8 @@ pub struct WorkbenchModel {
 	pub collapsed_merges: Vec<String>,
 	/// Commits hidden on this page by collapsed merges.
 	pub hidden_commits: Vec<String>,
+	/// Snapshot and commit window later graph pages continue from.
+	pub history_walk: Option<crate::history::HistoryWalk>,
 	pub selected_commit: Option<String>,
 	/// Range endpoint picked with shift (anchor is `selected_commit`).
 	pub range_head: Option<String>,
@@ -906,6 +908,7 @@ impl WorkbenchModel {
 			search_by_author: false,
 			collapsed_merges: Vec::new(),
 			hidden_commits: Vec::new(),
+			history_walk: None,
 			selected_commit: None,
 			range_head: None,
 			log_scroll: gpui::UniformListScrollHandle::new(),
@@ -1682,6 +1685,7 @@ impl WorkbenchModel {
 		self.log_search = None;
 		release_vec(&mut self.collapsed_merges);
 		release_vec(&mut self.hidden_commits);
+		self.history_walk = None;
 		self.selected_commit = None;
 		self.range_head = None;
 		self.select_head_after_load = false;
@@ -2503,6 +2507,7 @@ impl WorkbenchModel {
 		self.page_checkpoints = vec![None];
 		self.collapsed_merges.clear();
 		self.hidden_commits.clear();
+		self.history_walk = None;
 		self.history_error = None;
 		if !preserve_anchors {
 			// A reload of the same repo keeps the log's branch filter and

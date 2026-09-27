@@ -588,6 +588,185 @@ pub fn side_only(commits: &[CommitSummary], merge: &str) -> HashSet<String> {
 		.collect()
 }
 
+/// Commits one `git log` fetches; graph pages are sliced from this window,
+/// so paging does not re-run the topological sort per page.
+pub const HISTORY_WINDOW: usize = 500;
+
+/// One graph walk: the refs and HEAD read when page 0 loaded (kept in the
+/// model's `refs` / `head_sha`), what else that snapshot knew, and the
+/// window of commits pages are sliced from. Later pages walk the snapshot's
+/// tips, so refs moving meanwhile cannot duplicate or skip commits.
+#[derive(Clone, Debug, Default)]
+pub struct HistoryWalk {
+	ref_filter: Option<String>,
+	/// The ref filter's commit, resolved once for the whole walk.
+	filter_tip: Option<String>,
+	detached: bool,
+	shallow: Vec<String>,
+	start: usize,
+	window: Vec<CommitSummary>,
+	more: bool,
+}
+
+impl HistoryWalk {
+	/// The page at `skip`, when the window holds all of it.
+	fn page(
+		&self,
+		skip: usize,
+		size: usize,
+	) -> Option<(Vec<CommitSummary>, bool)> {
+		let from = skip.checked_sub(self.start)?;
+		let end = from.checked_add(size)?;
+		let len = self.window.len();
+		if end > len && self.more {
+			return None;
+		}
+		let rows = self.window.get(from.min(len)..end.min(len))?.to_vec();
+		Some((rows, end < len || self.more))
+	}
+
+	fn retained_bytes(&self) -> usize {
+		let mut bytes = graph_view::vec_bytes(&self.window)
+			.saturating_add(graph_view::vec_bytes(&self.shallow));
+		for value in self
+			.ref_filter
+			.iter()
+			.chain(self.filter_tip.iter())
+			.chain(self.shallow.iter())
+		{
+			bytes = bytes.saturating_add(value.capacity());
+		}
+		for commit in &self.window {
+			bytes = bytes.saturating_add(commit_bytes(commit));
+		}
+		bytes
+	}
+}
+
+fn commit_bytes(commit: &CommitSummary) -> usize {
+	let mut bytes = commit
+		.sha
+		.capacity()
+		.saturating_add(commit.author_name.capacity())
+		.saturating_add(commit.author_email.capacity())
+		.saturating_add(commit.author_date.capacity())
+		.saturating_add(commit.subject.capacity())
+		.saturating_add(graph_view::vec_bytes(&commit.parents));
+	for parent in &commit.parents {
+		bytes = bytes.saturating_add(parent.capacity());
+	}
+	bytes
+}
+
+/// Reads one graph page. Page 0 (no `walk`) snapshots refs, HEAD and the
+/// ref filter's commit; later pages reuse that snapshot, and need no Git at
+/// all while the window already holds them.
+fn read_graph_page(
+	repo_root: &std::path::Path,
+	walk: Option<(HistoryWalk, Vec<browser::GitReference>, Option<String>)>,
+	ref_filter: Option<String>,
+	skip: usize,
+	size: usize,
+	opts: &RunOptions,
+) -> Result<(browser::RepositoryHistory, HistoryWalk), String> {
+	let mut git = None;
+	let open = || -> Result<Git, String> {
+		Git::open_with(repo_root, opts).map_err(|e| e.to_string())
+	};
+	let (mut walk, refs, head) = match walk {
+		Some(reused) if reused.0.ref_filter == ref_filter => reused,
+		_ => {
+			let g = open()?;
+			let snap =
+				browser::refs_with(&g, opts).map_err(|e| e.to_string())?;
+			let filter_tip =
+				match ref_filter.as_deref().filter(|r| !r.is_empty()) {
+					Some(r) => Some(
+						g.resolve_commit_with(r, opts)
+							.map_err(|e| e.to_string())?,
+					),
+					None => None,
+				};
+			git = Some(g);
+			let walk = HistoryWalk {
+				ref_filter,
+				filter_tip,
+				detached: snap.detached,
+				shallow: snap.shallow,
+				more: true,
+				..Default::default()
+			};
+			(walk, snap.refs, snap.head)
+		}
+	};
+	if walk.page(skip, size).is_none() {
+		let git = match git {
+			Some(g) => g,
+			None => open()?,
+		};
+		let tips = match &walk.filter_tip {
+			Some(tip) => vec![tip.clone()],
+			None => browser::RefSnapshot {
+				refs: refs.clone(),
+				head: head.clone(),
+				..Default::default()
+			}
+			.tips(),
+		};
+		let mut start = skip / HISTORY_WINDOW * HISTORY_WINDOW;
+		if skip.saturating_add(size) > start.saturating_add(HISTORY_WINDOW) {
+			start = skip;
+		}
+		let (window, more) = browser::log_from_tips_with(
+			&git,
+			&tips,
+			start,
+			HISTORY_WINDOW.max(size),
+			opts,
+		)
+		.map_err(|e| e.to_string())?;
+		walk.start = start;
+		walk.window = window;
+		walk.more = more;
+	}
+	let (commits, has_more) = walk.page(skip, size).unwrap_or_default();
+	Ok((
+		browser::RepositoryHistory {
+			root: String::new(),
+			commits,
+			refs,
+			head,
+			has_more,
+		},
+		walk,
+	))
+}
+
+/// One path's preview. The change type comes from our own listing and a log
+/// row carries the commit's full SHA and parents, so the preview neither
+/// re-lists the source nor re-resolves the commit.
+fn read_preview(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+	change: Option<snip_core::format::ChangeType>,
+	parents: Option<&[String]>,
+	opts: &RunOptions,
+) -> Result<browser::SourcePreview, String> {
+	let preview = match change {
+		Some(change) => {
+			browser::git_preview_for(git, source, path, change, parents, opts)
+		}
+		None => browser::git_preview_with(git, source, path, opts),
+	};
+	preview
+		.map(|p| browser::SourcePreview {
+			content: p.content,
+			patch: p.patch,
+		})
+		.map_err(|e| e.to_string())
+}
+
 /// A complete replacement page. Construction only borrows the current cache;
 /// failure cannot attach old rails/checkpoints to new commits or move the page.
 struct PreparedHistory {
@@ -604,6 +783,8 @@ struct PreparedHistory {
 	log_search: Option<LogSearch>,
 	commit_page: usize,
 	history_has_more: bool,
+	/// The graph walk this page belongs to; `None` for search results.
+	walk: Option<HistoryWalk>,
 }
 
 #[derive(Debug)]
@@ -613,8 +794,29 @@ enum GraphAdmissionError {
 }
 
 impl PreparedHistory {
+	#[cfg(test)]
 	fn prepare(
 		history: browser::RepositoryHistory,
+		page: usize,
+		checkpoints: &[Option<GraphCheckpoint>],
+		collapsed_merges: Vec<String>,
+		active_ref_filter: Option<String>,
+		log_search: Option<LogSearch>,
+	) -> Result<Self, GraphAdmissionError> {
+		Self::prepare_with(
+			history,
+			None,
+			page,
+			checkpoints,
+			collapsed_merges,
+			active_ref_filter,
+			log_search,
+		)
+	}
+
+	fn prepare_with(
+		history: browser::RepositoryHistory,
+		walk: Option<HistoryWalk>,
 		page: usize,
 		checkpoints: &[Option<GraphCheckpoint>],
 		collapsed_merges: Vec<String>,
@@ -633,6 +835,7 @@ impl PreparedHistory {
 			log_search,
 			commit_page: page,
 			history_has_more: history.has_more,
+			walk,
 		};
 		candidate.check_budget()?;
 		if candidate.commits.iter().any(|commit| {
@@ -652,19 +855,44 @@ impl PreparedHistory {
 			));
 		}
 		if candidate.log_search.is_none() {
+			// Every graph page leaves a checkpoint; none means the previous
+			// page fell back to a plain list, so this one continues as one.
 			let checkpoint = checkpoints.get(page).and_then(Option::as_ref);
-			if page > 0 && checkpoint.is_none() {
-				return Err(GraphAdmissionError::Layout(
-					"Missing graph page checkpoint".into(),
-				));
-			}
-			let full = graph_view::layout_commits_paged(
+			let (detached, shallow) = candidate
+				.walk
+				.as_ref()
+				.map(|w| {
+					(
+						w.detached,
+						w.shallow.iter().cloned().collect::<HashSet<String>>(),
+					)
+				})
+				.unwrap_or_default();
+			let layout_refs = graph_view::page_refs(
 				&candidate.commits,
 				&candidate.refs,
 				candidate.head_sha.as_deref(),
-				checkpoint,
-			)
-			.map_err(GraphAdmissionError::Layout)?;
+				detached,
+			);
+			let layout = |commits: &[CommitSummary],
+			              filtered: HashSet<String>| {
+				graph_view::layout_page(
+					commits,
+					&layout_refs,
+					candidate.head_sha.as_deref(),
+					checkpoint,
+					page > 0,
+					filtered,
+					shallow.clone(),
+				)
+				.map_err(GraphAdmissionError::Layout)
+			};
+			let full = layout(&candidate.commits, HashSet::new())?;
+			if full.checkpoint.is_none()
+				&& candidate.page_checkpoints.len() > page + 1
+			{
+				candidate.page_checkpoints[page + 1] = None;
+			}
 			if let Some(next) = &full.checkpoint {
 				let slots =
 					page.checked_add(2).ok_or(GraphAdmissionError::Budget)?;
@@ -693,14 +921,7 @@ impl PreparedHistory {
 					.filter(|commit| !hidden.contains(&commit.sha))
 					.cloned()
 					.collect();
-				graph_view::layout_commits_filtered(
-					&shown,
-					&candidate.refs,
-					candidate.head_sha.as_deref(),
-					checkpoint,
-					hidden.clone(),
-				)
-				.map_err(GraphAdmissionError::Layout)?
+				layout(&shown, hidden.clone())?
 			});
 			candidate.hidden_commits = hidden.into_iter().collect();
 			candidate.hidden_commits.sort();
@@ -719,16 +940,10 @@ impl PreparedHistory {
 			.saturating_add(vec_bytes(&self.collapsed_merges))
 			.saturating_add(vec_bytes(&self.hidden_commits));
 		for commit in &self.commits {
-			bytes = bytes
-				.saturating_add(commit.sha.capacity())
-				.saturating_add(commit.author_name.capacity())
-				.saturating_add(commit.author_email.capacity())
-				.saturating_add(commit.author_date.capacity())
-				.saturating_add(commit.subject.capacity())
-				.saturating_add(vec_bytes(&commit.parents));
-			for parent in &commit.parents {
-				bytes = bytes.saturating_add(parent.capacity());
-			}
+			bytes = bytes.saturating_add(commit_bytes(commit));
+		}
+		if let Some(walk) = &self.walk {
+			bytes = bytes.saturating_add(walk.retained_bytes());
 		}
 		for reference in &self.refs {
 			bytes = bytes
@@ -775,6 +990,7 @@ impl PreparedHistory {
 		model.log_search = self.log_search;
 		model.commit_page = self.commit_page;
 		model.history_has_more = self.history_has_more;
+		model.history_walk = self.walk;
 		model.history_error = None;
 	}
 }
@@ -817,6 +1033,12 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 		let cancel_bg = cancel.clone();
+		// Page 0 takes a fresh snapshot; later pages continue its walk.
+		let walk = self
+			.history_walk
+			.clone()
+			.filter(|_| page > 0 && search.is_none())
+			.map(|w| (w, self.refs.clone(), self.head_sha.clone()));
 
 		self.spawn_owned(
 			cx,
@@ -826,43 +1048,49 @@ impl WorkbenchModel {
 				let res = bg
 					.spawn(async move {
 						let opts = crate::interactive_read_opts(cancel_bg);
+						let Some(search) = &search else {
+							return read_graph_page(
+								&repo_root, walk, ref_filter, skip,
+								page_size, &opts,
+							)
+							.map(|(h, w)| (h, Some(w)));
+						};
 						let git = Git::open_with(&repo_root, &opts)
 							.map_err(|e| e.to_string())?;
-						match &search {
-							Some(LogSearch {
-								query,
-								author: true,
-							}) => {
-								let refs = browser::history_with(
-									&git, None, "", 0, 0, &opts,
+						if search.author {
+							// Refs only: no topological walk just for labels.
+							let snap = browser::refs_with(&git, &opts)
+								.map_err(|e| e.to_string())?;
+							let (commits, more) =
+								browser::history_by_author_with(
+									&git,
+									&search.query,
+									skip,
+									page_size,
+									&opts,
 								)
 								.map_err(|e| e.to_string())?;
-								let (commits, more) =
-									browser::history_by_author_with(
-										&git, query, skip, page_size, &opts,
-									)
-									.map_err(|e| e.to_string())?;
-								Ok(browser::RepositoryHistory {
-									root: refs.root,
+							return Ok((
+								browser::RepositoryHistory {
+									root: String::new(),
 									commits,
-									refs: refs.refs,
-									head: refs.head,
+									refs: snap.refs,
+									head: snap.head,
 									has_more: more,
-								})
-							}
-							_ => browser::history_with(
-								&git,
-								ref_filter.as_deref(),
-								search
-									.as_ref()
-									.map(|s| s.query.as_str())
-									.unwrap_or(""),
-								skip,
-								page_size,
-								&opts,
-							)
-							.map_err(|e| e.to_string()),
+								},
+								None,
+							));
 						}
+						browser::history_with(
+							&git,
+							ref_filter.as_deref(),
+							&search.query,
+							skip,
+							page_size,
+							&opts,
+						)
+						.map(|h| (h, None))
+						.map_err(|e| e.to_string())
 					})
 					.await;
 
@@ -872,8 +1100,8 @@ impl WorkbenchModel {
 							return;
 						}
 						match res {
-							Ok(hist) => {
-								match PreparedHistory::prepare(hist, page, &model.page_checkpoints,
+							Ok((hist, walk)) => {
+								match PreparedHistory::prepare_with(hist, walk, page, &model.page_checkpoints,
                                     model.collapsed_merges.clone(), model.active_ref_filter.clone(), model.log_search.clone()) {
                                     Ok(candidate) => {
                                         app_log!("[APP:GRAPH_RETAINED: bytes={} limit={}]", candidate.retained_bytes(), MAX_RETAINED_GRAPH_BYTES);
@@ -885,8 +1113,17 @@ impl WorkbenchModel {
                                         return;
                                     }
                                 }
+								let fallback = model
+									.graph_layout
+									.as_ref()
+									.is_some_and(|l| l.is_fallback);
 								model.set_status(
-									"status_history_loaded",
+									if fallback {
+										app_log!("[APP:GRAPH_FALLBACK]");
+										"status_graph_fallback"
+									} else {
+										"status_history_loaded"
+									},
 									[
 										model.commits.len().to_string(),
 										(page + 1).to_string(),
@@ -970,8 +1207,9 @@ impl WorkbenchModel {
 			head: self.head_sha.clone(),
 			has_more: self.history_has_more,
 		};
-		match PreparedHistory::prepare(
+		match PreparedHistory::prepare_with(
 			history,
+			self.history_walk.clone(),
 			self.commit_page,
 			&self.page_checkpoints,
 			collapsed_merges,
@@ -1014,8 +1252,9 @@ impl WorkbenchModel {
 			head: None,
 			has_more: false,
 		};
-		match PreparedHistory::prepare(
+		match PreparedHistory::prepare_with(
 			empty,
+			None,
 			0,
 			&[],
 			Vec::new(),
@@ -1104,6 +1343,14 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// Parents of a loaded commit, keyed by its full SHA.
+	fn known_parents(&self, sha: &str) -> Option<Vec<String>> {
+		self.commits
+			.iter()
+			.find(|c| c.sha == sha)
+			.map(|c| c.parents.clone())
+	}
+
 	pub fn select_commit(&mut self, sha: &str, cx: &mut Context<Self>) {
 		if sha.len() > MAX_SHA_LEN {
 			self.report_graph_error(GraphAdmissionError::Budget);
@@ -1126,10 +1373,12 @@ impl WorkbenchModel {
 		};
 		let sha = sha.to_string();
 		app_log!("[APP:COMMIT_SELECTED: {}]", &sha[..7.min(sha.len())]);
+		let parents = self.known_parents(&sha);
 		self.load_change_list(
 			root,
 			GitSource::Commit(sha.clone()),
 			PreviewSource::CommitDiff { sha },
+			parents,
 			task_generation,
 			cx,
 		);
@@ -1195,6 +1444,7 @@ impl WorkbenchModel {
 				from: older,
 				to: newer,
 			},
+			None,
 			task_generation,
 			cx,
 		);
@@ -1206,6 +1456,7 @@ impl WorkbenchModel {
 		root: std::path::PathBuf,
 		source: GitSource,
 		preview_source: PreviewSource,
+		parents: Option<Vec<String>>,
 		task_generation: u64,
 		cx: &mut Context<Self>,
 	) {
@@ -1223,29 +1474,34 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
+						// The listing is metadata: a commit touching tens of
+						// thousands of files lists under the interactive limit
+						// and is cut to MAX_COMMIT_FILES afterwards.
+						let listing =
+							crate::interactive_read_opts(cancel.clone());
 						let opts = RunOptions {
 							cancel: Some(cancel),
 							max_stdout: browser::PREVIEW_LIMIT,
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						let git = Git::open_with(&root, &opts)
-							.map_err(|e| e.to_string())?;
+						// The repository's root is known: no probe processes.
+						let git = Git::at_known_root(root);
 						let files = gitsrc::list_changed_paths_with(
-							&git, &source, &opts,
+							&git, &source, &listing,
 						)
 						.map_err(|e| e.to_string())?;
-						let first = files.first().map(|(p, _)| {
+						let first = files.first().map(|(p, change)| {
 							(
 								p.clone(),
-								browser::git_preview_with(
-									&git, &source, p, &opts,
-								)
-								.map(|p| browser::SourcePreview {
-									content: p.content,
-									patch: p.patch,
-								})
-								.map_err(|e| e.to_string()),
+								read_preview(
+									&git,
+									&source,
+									p,
+									*change,
+									parents.as_deref(),
+									&opts,
+								),
 							)
 						});
 						Ok::<_, String>((files, first))
@@ -1259,7 +1515,17 @@ impl WorkbenchModel {
 						Ok((mut files, first)) => {
 							let total = files.len();
 							files.truncate(MAX_COMMIT_FILES);
+							files.shrink_to_fit();
 							app_log!("[APP:E2E_CHANGES: files={}]", total);
+							if total > MAX_COMMIT_FILES {
+								model.set_status(
+									"status_commit_files_truncated",
+									[
+										total.to_string(),
+										MAX_COMMIT_FILES.to_string(),
+									],
+								);
+							}
 							model.commit_files = files;
 							match first {
 								Some((path, p)) => {
@@ -1310,6 +1576,15 @@ impl WorkbenchModel {
 			),
 			_ => return,
 		};
+		let change = self
+			.commit_files
+			.iter()
+			.find(|(p, _)| p == path)
+			.and_then(|(_, c)| *c);
+		let parents = match &source {
+			GitSource::Commit(sha) => self.known_parents(sha),
+			_ => None,
+		};
 		let Some(root) = self.repo_root() else {
 			return;
 		};
@@ -1336,14 +1611,15 @@ impl WorkbenchModel {
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						let git = Git::open_with(&root, &opts)
-							.map_err(|e| e.to_string())?;
-						browser::git_preview_with(&git, &source, &for_bg, &opts)
-							.map(|p| browser::SourcePreview {
-								content: p.content,
-								patch: p.patch,
-							})
-							.map_err(|e| e.to_string())
+						let git = Git::at_known_root(root);
+						read_preview(
+							&git,
+							&source,
+							&for_bg,
+							change,
+							parents.as_deref(),
+							&opts,
+						)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -1752,26 +2028,173 @@ mod tests {
 	}
 
 	#[test]
-	fn graph_admission_propagates_layout_failure() {
+	fn thousands_of_refs_keep_the_page_and_the_selector_complete() {
 		let previous = first_page();
-		let mut bad = history(vec![c("c1", &["c0"])]);
-		bad.refs = (0..1001)
+		let mut many = history(vec![c("c1", &["c0"])]);
+		// 5000 refs elsewhere in the repository plus 1001 on this page.
+		many.refs = (0..6001)
 			.map(|n| browser::GitReference {
 				name: format!("refs/heads/b{n}"),
-				sha: "c1".into(),
+				sha: if n < 1001 {
+					"c1".into()
+				} else {
+					format!("{n:040x}")
+				},
 			})
 			.collect();
-		let rejected = PreparedHistory::prepare(
-			bad,
+		let page = PreparedHistory::prepare(
+			many,
 			1,
 			&previous.page_checkpoints,
 			Vec::new(),
 			None,
 			None,
+		)
+		.unwrap();
+		assert_eq!(page.refs.len(), 6001, "the ref selector keeps every ref");
+		let row = &page.graph_layout.as_ref().unwrap().rows[0];
+		assert_eq!(row.refs.len(), graph_view::MAX_LAYOUT_REFS);
+	}
+
+	#[test]
+	fn too_many_rails_fall_back_to_a_list_and_later_pages_still_load() {
+		// 300 branch tips whose parents are all on later pages.
+		let tips: Vec<CommitSummary> = (0..300)
+			.map(|n| c(&format!("t{n}"), &[&format!("p{n}")]))
+			.collect();
+		let page0 = PreparedHistory::prepare(
+			history(tips),
+			0,
+			&[],
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap();
+		assert!(page0.graph_layout.as_ref().unwrap().is_fallback);
+		assert_eq!(page0.page_checkpoints.get(1).cloned().flatten(), None);
+		let page1 = PreparedHistory::prepare(
+			history(vec![c("p0", &[])]),
+			1,
+			&page0.page_checkpoints,
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap();
+		assert!(page1.graph_layout.as_ref().unwrap().is_fallback);
+		assert_eq!(page1.commits.len(), 1);
+	}
+
+	#[test]
+	fn detached_head_gets_a_badge_and_shallow_cut_is_not_a_root() {
+		let mut page = history(vec![c("h", &["b"]), c("b", &[])]);
+		page.head = Some("h".into());
+		let walk = HistoryWalk {
+			detached: true,
+			shallow: vec!["b".into()],
+			..Default::default()
+		};
+		let prepared = PreparedHistory::prepare_with(
+			page,
+			Some(walk),
+			0,
+			&[],
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap();
+		let layout = prepared.graph_layout.as_ref().unwrap();
+		assert!(layout.rows[0]
+			.refs
+			.iter()
+			.any(|r| r.kind == snip_core::graph::RefKind::Head));
+		assert_eq!(
+			layout.rows[1].node.node_type,
+			snip_core::graph::NodeType::ShallowRoot
 		);
-		assert!(
-			matches!(rejected, Err(GraphAdmissionError::Layout(message)) if message.contains("refs limit"))
-		);
+		assert!(prepared.refs.is_empty(), "HEAD is a badge, not a ref");
+	}
+
+	#[test]
+	fn history_walk_slices_pages_and_knows_when_to_fetch() {
+		let walk = HistoryWalk {
+			start: 100,
+			window: (0..120).map(|n| c(&n.to_string(), &[])).collect(),
+			more: true,
+			..Default::default()
+		};
+		let (rows, more) = walk.page(150, 50).unwrap();
+		assert_eq!((rows[0].sha.as_str(), rows.len(), more), ("50", 50, true));
+		assert!(walk.page(200, 50).is_none(), "runs past the window");
+		assert!(walk.page(50, 50).is_none(), "before the window");
+		let last = HistoryWalk {
+			more: false,
+			..walk
+		};
+		let (rows, more) = last.page(200, 50).unwrap();
+		assert_eq!((rows.len(), more), (20, false));
+		assert_eq!(last.page(250, 50).unwrap().0.len(), 0);
+	}
+
+	#[test]
+	fn later_graph_pages_come_from_the_page_zero_window() {
+		use std::process::Command;
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		let git = |args: &[&str]| {
+			let out = Command::new("git")
+				.current_dir(root)
+				.args(args)
+				.output()
+				.unwrap();
+			assert!(out.status.success(), "{args:?}");
+			String::from_utf8(out.stdout).unwrap().trim().to_string()
+		};
+		git(&["init", "-q", "-b", "main"]);
+		for n in 0..6 {
+			git(&[
+				"-c",
+				"user.name=A",
+				"-c",
+				"user.email=a@x",
+				"commit",
+				"-q",
+				"--allow-empty",
+				"-m",
+				&format!("c{n}"),
+			]);
+		}
+		let opts = RunOptions::default();
+		let (first, walk) =
+			read_graph_page(root, None, None, 0, 2, &opts).unwrap();
+		assert!(first.has_more);
+		// The repository moves on; later pages are sliced from the window
+		// page 0 fetched (frozen tips on refetch are covered in browser.rs).
+		git(&[
+			"-c",
+			"user.name=A",
+			"-c",
+			"user.email=a@x",
+			"commit",
+			"-q",
+			"--allow-empty",
+			"-m",
+			"new",
+		]);
+		let reuse = Some((walk, first.refs.clone(), first.head.clone()));
+		let (second, walk) =
+			read_graph_page(root, reuse, None, 2, 2, &opts).unwrap();
+		let reuse = Some((walk, second.refs.clone(), second.head.clone()));
+		let (third, _) =
+			read_graph_page(root, reuse, None, 4, 2, &opts).unwrap();
+		assert!(!third.has_more);
+		let seen: Vec<String> = [first, second, third]
+			.into_iter()
+			.flat_map(|h| h.commits.into_iter().map(|c| c.subject))
+			.collect();
+		assert_eq!(seen, ["c5", "c4", "c3", "c2", "c1", "c0"]);
 	}
 
 	#[test]

@@ -4128,12 +4128,12 @@ impl WorkbenchModel {
 			.as_ref()
 			.and_then(|l| l.rows.get(ix))
 			.cloned();
-		let incoming = ix > 0
-			&& self.graph_layout.as_ref().is_some_and(|l| {
-				l.rows[..ix.min(l.rows.len())].iter().any(|prev| {
-					prev.parent_edges.iter().any(|e| e.to_row == Some(ix))
-				})
-			});
+		let strokes = self
+			.graph_layout
+			.as_ref()
+			.zip(graph_row.as_ref())
+			.map(|(l, r)| graph_view::row_strokes(l, r))
+			.unwrap_or_default();
 		let is_merge = c.parents.len() > 1 && self.log_search.is_none();
 		let collapsed = self.collapsed_merges.contains(&c.sha);
 		let hidden_n = if collapsed {
@@ -4287,7 +4287,7 @@ impl WorkbenchModel {
 										|_, _, _| {},
 										move |bounds, _, window, _| {
 											graph_view::paint_row_graph(
-												window, &r, incoming, bounds,
+												window, &r, &strokes, bounds,
 											);
 										},
 									)
