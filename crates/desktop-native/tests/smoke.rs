@@ -1968,10 +1968,32 @@ fn native_graph_failed_next_page_is_transactional() {
 		let image = out.join(format!("graph-admission-{name}.png"));
 		let crop = out.join(format!("graph-admission-{name}-row.png"));
 		let deadline = Instant::now() + Duration::from_secs(5);
+		// The row probe is identical across pages, so a frame still showing
+		// the previous page passes every bounds check. Only accept a row
+		// whose pixels match the capture before it.
+		let mut previous: Option<([i32; 4], Vec<u8>)> = None;
 		loop {
 			let row = control(&first_row);
 			let error = require_error.then(|| control("log-error"));
 			capture(&image);
+			let [x, y, w, h] = row;
+			let pixels = Command::new("convert")
+				.arg(&image)
+				.args([
+					"-crop",
+					&format!("{w}x{h}+{x}+{y}"),
+					"+repage",
+					"-depth",
+					"8",
+					"RGB:-",
+				])
+				.output()
+				.unwrap();
+			assert!(pixels.status.success(), "row crop failed");
+			let settled = previous
+				.as_ref()
+				.is_some_and(|(r, p)| *r == row && *p == pixels.stdout);
+			previous = Some((row, pixels.stdout));
 			let stable = control(&first_row) == row
 				&& error.is_none_or(|rect| control("log-error") == rect);
 			// Probes run during prepaint, before Vulkan presents this frame.
@@ -2000,8 +2022,7 @@ fn native_graph_failed_next_page_is_transactional() {
 							&& p[2].abs_diff(100) <= 16
 					})
 			});
-			if stable && presented {
-				let [x, y, w, h] = row;
+			if stable && presented && settled {
 				assert!(Command::new("convert")
 					.arg(&image)
 					.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
@@ -2018,7 +2039,7 @@ fn native_graph_failed_next_page_is_transactional() {
 				Instant::now() < deadline,
 				"graph {name} frame did not present: row={row:?} error={error:?}"
 			);
-			std::thread::sleep(Duration::from_millis(20));
+			std::thread::sleep(Duration::from_millis(150));
 		}
 	};
 	for page in 2..=10 {
