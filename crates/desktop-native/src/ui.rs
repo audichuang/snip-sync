@@ -492,6 +492,116 @@ const DATE_PRESETS: [(&str, &str, &str); 4] = [
 ];
 /// Entries one filter dropdown lists; the branches pane search reaches more.
 const MAX_LOG_MENU_ITEMS: usize = 200;
+
+/// One row of the branches pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BranchRow {
+	/// A collapsible group: Local / Remote / Tags (`key` is the i18n key)
+	/// or one remote under Remote (`key` is `remote:<name>`).
+	Group {
+		key: String,
+		label: String,
+		depth: usize,
+		collapsed: bool,
+	},
+	/// A ref (full name) shown as `label`.
+	Ref {
+		name: String,
+		label: String,
+		depth: usize,
+	},
+}
+
+/// The branches pane like IntelliJ's: Local, Remote grouped by remote
+/// name, Tags; names matching `needle` (lowercase) only; at most
+/// [`MAX_BRANCH_ROWS`] refs per group; `<remote>/HEAD` is not listed.
+fn branch_rows(
+	refs: &[snip_core::browser::GitReference],
+	needle: &str,
+	collapsed: &[String],
+	loc: Locale,
+) -> Vec<BranchRow> {
+	let is_collapsed = |k: &str| collapsed.iter().any(|c| c == k);
+	let mut out = Vec::new();
+	for (key, prefix) in [
+		("refs_local", "refs/heads/"),
+		("refs_remote", "refs/remotes/"),
+		("refs_tags", "refs/tags/"),
+	] {
+		let members: Vec<(&str, &str)> = refs
+			.iter()
+			.filter_map(|r| {
+				Some((r.name.as_str(), r.name.strip_prefix(prefix)?))
+			})
+			.filter(|(_, short)| {
+				!(prefix == "refs/remotes/" && short.ends_with("/HEAD"))
+			})
+			.filter(|(_, short)| {
+				needle.is_empty() || short.to_lowercase().contains(needle)
+			})
+			.collect();
+		if members.is_empty() {
+			continue;
+		}
+		let group_collapsed = is_collapsed(key);
+		out.push(BranchRow::Group {
+			key: key.into(),
+			label: t(key, loc).into(),
+			depth: 0,
+			collapsed: group_collapsed,
+		});
+		if group_collapsed {
+			continue;
+		}
+		if prefix != "refs/remotes/" {
+			out.extend(members.iter().take(MAX_BRANCH_ROWS).map(
+				|(name, short)| BranchRow::Ref {
+					name: name.to_string(),
+					label: short.to_string(),
+					depth: 1,
+				},
+			));
+			continue;
+		}
+		let mut remotes: Vec<&str> = Vec::new();
+		for (_, short) in &members {
+			let remote = short.split_once('/').map_or(*short, |(r, _)| r);
+			if !remotes.contains(&remote) {
+				remotes.push(remote);
+			}
+		}
+		remotes.sort_unstable();
+		for remote in remotes {
+			let key = format!("remote:{remote}");
+			let sub_collapsed = is_collapsed(&key);
+			out.push(BranchRow::Group {
+				key,
+				label: remote.to_string(),
+				depth: 1,
+				collapsed: sub_collapsed,
+			});
+			if sub_collapsed {
+				continue;
+			}
+			out.extend(
+				members
+					.iter()
+					.filter_map(|(name, short)| {
+						let rest =
+							short.strip_prefix(remote)?.strip_prefix('/')?;
+						Some(BranchRow::Ref {
+							name: name.to_string(),
+							label: rest.to_string(),
+							depth: 2,
+						})
+					})
+					.take(MAX_BRANCH_ROWS),
+			);
+		}
+	}
+	out
+}
+
 /// Rows per branches-pane group.
 const MAX_BRANCH_ROWS: usize = 200;
 const AUTHOR_W: f32 = 120.;
@@ -4682,92 +4792,83 @@ impl WorkbenchModel {
 				cx,
 			));
 		}
-		for (key, prefix) in [
-			("refs_local", "refs/heads/"),
-			("refs_remote", "refs/remotes/"),
-			("refs_tags", "refs/tags/"),
-		] {
-			let members: Vec<_> = self
-				.refs
-				.iter()
-				.filter(|r| r.name.starts_with(prefix))
-				.filter(|r| {
-					needle.is_empty()
-						|| r.name[prefix.len()..]
-							.to_lowercase()
-							.contains(&needle)
-				})
-				.collect();
-			if members.is_empty() {
-				continue;
-			}
-			let collapsed = self.branch_groups_collapsed.contains(&key);
-			let gid = format!("branch-group:{key}");
-			rows.push(
-				div()
-					.id(SharedString::from(gid.clone()))
-					.relative()
-					.flex_shrink_0()
-					.h(px(24.))
-					.mx(px(4.))
-					.px(px(6.))
-					.flex()
-					.items_center()
-					.gap(px(4.))
-					.rounded(px(4.))
-					.cursor_pointer()
-					.hover(|s| s.bg(rgb(pal().hover_bg)))
-					.on_click(cx.listener(move |this, _, _, cx| {
-						match this
-							.branch_groups_collapsed
-							.iter()
-							.position(|k| *k == key)
-						{
-							Some(i) => {
-								this.branch_groups_collapsed.remove(i);
-							}
-							None => this.branch_groups_collapsed.push(key),
-						}
-						cx.notify();
-					}))
-					.child(icon(
-						if collapsed {
-							Icon::ChevronRight
-						} else {
-							Icon::ChevronDown
-						},
-						12.,
-					))
-					.child(clip_text(t(key, loc)).text_color(rgb(pal().text)))
-					.children(probe(log, gid))
-					.into_any_element(),
-			);
-			if collapsed {
-				continue;
-			}
-			// Bounded: very large ref sets are reached through the search.
-			for r in members.iter().take(MAX_BRANCH_ROWS) {
-				let name = &r.name[prefix.len()..];
-				let is_current =
-					prefix == "refs/heads/" && current.as_deref() == Some(name);
-				let glyph = match prefix {
-					"refs/tags/" => icon_tinted(Icon::Tag, 14., pal().ref_tag)
-						.into_any_element(),
-					_ if is_current => {
+		for row in
+			branch_rows(&self.refs, &needle, &self.branch_groups_collapsed, loc)
+		{
+			match row {
+				BranchRow::Group {
+					key,
+					label,
+					depth,
+					collapsed,
+				} => {
+					let gid = format!("branch-group:{key}");
+					rows.push(
+						div()
+							.id(SharedString::from(gid.clone()))
+							.relative()
+							.flex_shrink_0()
+							.h(px(24.))
+							.mx(px(4.))
+							.pl(px(6. + depth as f32 * 16.))
+							.pr(px(6.))
+							.flex()
+							.items_center()
+							.gap(px(4.))
+							.rounded(px(4.))
+							.cursor_pointer()
+							.hover(|s| s.bg(rgb(pal().hover_bg)))
+							.on_click(cx.listener(move |this, _, _, cx| {
+								let groups = &mut this.branch_groups_collapsed;
+								match groups.iter().position(|k| *k == key) {
+									Some(i) => {
+										groups.remove(i);
+									}
+									None => groups.push(key.clone()),
+								}
+								cx.notify();
+							}))
+							.child(icon(
+								if collapsed {
+									Icon::ChevronRight
+								} else {
+									Icon::ChevronDown
+								},
+								12.,
+							))
+							.when(depth > 0, |d| {
+								d.child(icon(Icon::Folder, 14.))
+							})
+							.child(clip_text(label).text_color(rgb(pal().text)))
+							.children(probe(log, gid))
+							.into_any_element(),
+					);
+				}
+				BranchRow::Ref { name, label, depth } => {
+					let is_current = name.strip_prefix("refs/heads/").is_some()
+						&& current.as_deref()
+							== name.strip_prefix("refs/heads/");
+					let glyph = if name.starts_with("refs/tags/") {
+						icon_tinted(Icon::Tag, 14., pal().ref_tag)
+							.into_any_element()
+					} else if is_current {
 						icon_tinted(Icon::Head, 14., pal().ref_head)
 							.into_any_element()
-					}
-					_ => icon(Icon::Branch, 14.).into_any_element(),
-				};
-				rows.push(entry(
-					format!("ref:{}", r.name),
-					name.to_string(),
-					glyph,
-					24.,
-					Some(r.name.clone()),
-					self.active_ref_filter.as_deref() == Some(r.name.as_str()),
-					cx,
-				));
+					} else {
+						icon(Icon::Branch, 14.).into_any_element()
+					};
+					let active = self.active_ref_filter.as_deref()
+						== Some(name.as_str());
+					rows.push(entry(
+						format!("ref:{name}"),
+						label,
+						glyph,
+						8. + depth as f32 * 16.,
+						Some(name),
+						active,
+						cx,
+					));
+				}
 			}
 		}
 		div()
@@ -4882,7 +4983,9 @@ impl WorkbenchModel {
 				.when(shown, |d| {
 					d.on_click(cx.listener(|this, _, _, cx| {
 						this.branch_groups_collapsed =
-							vec!["refs_local", "refs_remote", "refs_tags"];
+							["refs_local", "refs_remote", "refs_tags"]
+								.map(String::from)
+								.to_vec();
 						cx.notify();
 					}))
 				})
@@ -6422,6 +6525,69 @@ mod tests {
 		f.end_frame();
 		assert_eq!(f.end_frame(), vec!["btn-apply".to_string()]);
 		assert!(f.report("btn-apply", [5, 2, 3, 4]), "reappearing is new");
+	}
+
+	#[test]
+	fn remote_branches_group_by_remote_name() {
+		let refs: Vec<_> = [
+			"refs/heads/main",
+			"refs/remotes/upstream/main",
+			"refs/remotes/origin/HEAD",
+			"refs/remotes/origin/main",
+			"refs/remotes/origin/feature/x",
+			"refs/tags/v1",
+		]
+		.iter()
+		.map(|n| snip_core::browser::GitReference {
+			name: n.to_string(),
+			sha: "a".into(),
+		})
+		.collect();
+		let shape = |rows: Vec<BranchRow>| -> Vec<String> {
+			rows.into_iter()
+				.map(|r| match r {
+					BranchRow::Group {
+						key,
+						depth,
+						collapsed,
+						..
+					} => format!(
+						"{depth}G {key}{}",
+						if collapsed { " +" } else { "" }
+					),
+					BranchRow::Ref { label, depth, .. } => {
+						format!("{depth} {label}")
+					}
+				})
+				.collect()
+		};
+		assert_eq!(
+			shape(branch_rows(&refs, "", &[], Locale::En)),
+			[
+				"0G refs_local",
+				"1 main",
+				"0G refs_remote",
+				"1G remote:origin",
+				"2 main",
+				"2 feature/x",
+				"1G remote:upstream",
+				"2 main",
+				"0G refs_tags",
+				"1 v1",
+			]
+		);
+		let collapsed = ["remote:origin".to_string(), "refs_tags".to_string()];
+		assert_eq!(
+			shape(branch_rows(&refs, "main", &collapsed, Locale::En)),
+			[
+				"0G refs_local",
+				"1 main",
+				"0G refs_remote",
+				"1G remote:origin +",
+				"1G remote:upstream",
+				"2 main",
+			]
+		);
 	}
 
 	#[test]

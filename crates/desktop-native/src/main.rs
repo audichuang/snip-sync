@@ -666,7 +666,7 @@ pub struct WorkbenchModel {
 	pub log_path_input: Entity<TextInput>,
 	pub branch_filter_input: Entity<TextInput>,
 	/// Collapsed groups of the branches pane ("refs_local", …).
-	pub branch_groups_collapsed: Vec<&'static str>,
+	pub branch_groups_collapsed: Vec<String>,
 	pub log_branches_visible: bool,
 	pub log_details_visible: bool,
 	pub log_show_hash: bool,
