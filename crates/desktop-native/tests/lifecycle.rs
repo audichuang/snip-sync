@@ -582,7 +582,8 @@ fn close_reopen_same_pid_discards_stale_preview_and_keeps_clipboard() {
 		.args(["windowsize", "--sync", &wid, "1080", "720"])
 		.status();
 	let _ = control("btn-workspace-menu");
-	let _ = control("lifecycle-jobs");
+	// Jobs show in the status bar only while some run (no "0" counter).
+	let _ = control("status-bar");
 	capture(&wid, &shots().join("01-workspace-open.png"));
 	snapshot(app.pid, &app.starttime);
 

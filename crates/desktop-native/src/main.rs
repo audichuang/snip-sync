@@ -75,6 +75,7 @@ mod history;
 pub mod i18n;
 mod icons;
 pub mod lifecycle;
+mod menu;
 pub mod paste;
 mod reader;
 mod selector;
@@ -167,6 +168,22 @@ actions!(
 		LogOpen,
 		LogSearchFocus,
 		LogHead,
+		// IntelliJ chrome (IJ-2c).
+		NextDiff,
+		PrevDiff,
+		MenuUp,
+		MenuDown,
+		MenuConfirm,
+		MenuCancel,
+		LogParent,
+		LogChild,
+		LogPageUp,
+		LogPageDown,
+		ToolPageUp,
+		ToolPageDown,
+		HideToolWindow,
+		FocusEditor,
+		OpenTabMenu,
 	]
 );
 
@@ -754,6 +771,8 @@ pub struct WorkbenchModel {
 	pub lifecycle: lifecycle::Lifecycle,
 	pub watch_running: bool,
 	pub last_life_log: String,
+	/// Context menus, speed search and Changes group state.
+	pub chrome: menu::Chrome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -779,6 +798,7 @@ impl WorkbenchModel {
 		});
 		let selector_input = cx.new(|cx| {
 			TextInput::new(i18n::t("selector_filter_placeholder", loc), 0, cx)
+				.borderless()
 		});
 		cx.subscribe(&find_input, |this, input, ev: &InputEvent, cx| {
 			let q = input.read(cx).text().to_string();
@@ -1007,6 +1027,7 @@ impl WorkbenchModel {
 			lifecycle: lifecycle::Lifecycle::new(1),
 			watch_running: false,
 			last_life_log: String::new(),
+			chrome: menu::Chrome::new(cx),
 		};
 		model.reload_repos(cx);
 		model
@@ -4192,6 +4213,54 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// Editor tabs open: the paste preview, or the one reader tab.
+	pub fn open_tab_count(&self) -> usize {
+		let paste = self.paste_preview.is_some() || self.paste_loading;
+		let reader = self.preview.is_some()
+			|| self.preview_loading
+			|| self.selected_commit.is_some()
+			|| self.compare.is_some();
+		usize::from(paste || reader)
+	}
+
+	/// Closes editor tab `idx`. The workbench shows one tab at a time, so
+	/// only index 0 exists: the paste preview is cancelled, a reader tab
+	/// clears what it shows (the Git selection that opened it included).
+	pub fn close_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
+		if idx != 0 || self.open_tab_count() == 0 {
+			return;
+		}
+		if self.paste_preview.is_some() || self.paste_loading {
+			self.cancel_paste_preview(cx);
+			return;
+		}
+		// Drop in-flight reads for the closed tab.
+		self.preview_generation += 1;
+		let _ = arm_cancel(&mut self.preview_cancel);
+		self.clear_preview();
+		self.preview_loading = false;
+		self.preview_error = None;
+		self.selected_file = None;
+		self.selected_file_source = None;
+		self.selected_commit = None;
+		self.range_head = None;
+		self.compare = None;
+		self.selected_commit_file = None;
+		self.commit_files.clear();
+		app_log!("[APP:TAB_CLOSED: {idx}]");
+		cx.notify();
+	}
+
+	/// With a single tab there is never another one to close.
+	pub fn close_other_tabs(&mut self, idx: usize, cx: &mut Context<Self>) {
+		let _ = idx;
+		cx.notify();
+	}
+
+	pub fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+		self.close_tab(0, cx);
+	}
+
 	pub fn cancel_paste_preview(&mut self, cx: &mut Context<Self>) {
 		if self.refuse_while_applying("cancel", cx) {
 			return;
@@ -4606,8 +4675,15 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("alt-1", ShowProject, None),
 		KeyBinding::new("alt-0", ShowChanges, None),
 		KeyBinding::new("alt-9", ToggleLog, None),
+		// Repo selector has no IntelliJ counterpart; the branches popup is
+		// IntelliJ's Ctrl+Shift+` (X11 may report the shifted key as `~`).
 		KeyBinding::new("alt-shift-r", OpenRepoSelector, None),
-		KeyBinding::new("alt-shift-b", OpenRefSelector, None),
+		KeyBinding::new("secondary-shift-`", OpenRefSelector, None),
+		KeyBinding::new("secondary-shift-~", OpenRefSelector, None),
+		KeyBinding::new("secondary-~", OpenRefSelector, None),
+		KeyBinding::new("shift-escape", HideToolWindow, None),
+		KeyBinding::new("f7", NextDiff, None),
+		KeyBinding::new("shift-f7", PrevDiff, None),
 		KeyBinding::new("ctrl-shift-w", CloseWorkspace, None),
 		KeyBinding::new("cmd-shift-w", CloseWorkspace, None),
 		KeyBinding::new("ctrl-shift-o", OpenWorkspace, None),
@@ -4641,6 +4717,15 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("left", TreeCollapse, Some("ToolList")),
 		KeyBinding::new("enter", TreeOpen, Some("ToolList")),
 		KeyBinding::new("space", TreeToggle, Some("ToolList")),
+		KeyBinding::new("secondary-d", TreeOpen, Some("ToolList")),
+		KeyBinding::new("pageup", ToolPageUp, Some("ToolList")),
+		KeyBinding::new("pagedown", ToolPageDown, Some("ToolList")),
+		KeyBinding::new("escape", FocusEditor, Some("ToolList")),
+		// Context menu.
+		KeyBinding::new("up", MenuUp, Some("ContextMenu")),
+		KeyBinding::new("down", MenuDown, Some("ContextMenu")),
+		KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
+		KeyBinding::new("escape", MenuCancel, Some("ContextMenu")),
 		// Git log.
 		KeyBinding::new("up", LogUp, Some("GitLog")),
 		KeyBinding::new("down", LogDown, Some("GitLog")),
@@ -4648,8 +4733,13 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("shift-down", LogExtendDown, Some("GitLog")),
 		KeyBinding::new("enter", LogOpen, Some("GitLog")),
 		KeyBinding::new("ctrl-f", LogSearchFocus, Some("GitLog")),
-		KeyBinding::new("pagedown", HistoryNextPage, Some("GitLog")),
-		KeyBinding::new("pageup", HistoryPrevPage, Some("GitLog")),
+		KeyBinding::new("secondary-d", LogOpen, Some("GitLog")),
+		KeyBinding::new("left", LogParent, Some("GitLog")),
+		KeyBinding::new("right", LogChild, Some("GitLog")),
+		KeyBinding::new("pagedown", LogPageDown, Some("GitLog")),
+		KeyBinding::new("pageup", LogPageUp, Some("GitLog")),
+		KeyBinding::new("escape", FocusEditor, Some("GitLog")),
+		// No IntelliJ key for "go to HEAD" in the Log; kept.
 		KeyBinding::new("h", LogHead, Some("GitLog")),
 	];
 	b.extend(text_input::bindings());

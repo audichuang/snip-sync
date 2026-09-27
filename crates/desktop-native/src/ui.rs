@@ -178,26 +178,53 @@ pub fn probe(
 	)
 }
 
-/// E2E only: last child of the root, so its prepaint runs after every probe
-/// of the frame; announces controls that are no longer drawn.
+/// E2E only: last child of the root, deferred above every popup and menu,
+/// so its prepaint runs after every probe of the frame; announces controls
+/// that are no longer drawn.
 fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
 	let frame = probes.as_ref()?.0.clone();
 	Some(
-		canvas(
-			move |_, _, _| {
-				for id in frame.borrow_mut().end_frame() {
-					app_log!("[APP:CTRL_GONE: id={}]", id);
-				}
-			},
-			|_, _, _, _| {},
+		deferred(
+			canvas(
+				move |_, _, _| {
+					for id in frame.borrow_mut().end_frame() {
+						app_log!("[APP:CTRL_GONE: id={}]", id);
+					}
+				},
+				|_, _, _, _| {},
+			)
+			.absolute()
+			.size_0(),
 		)
-		.absolute()
-		.size_0()
+		.with_priority(usize::MAX)
 		.into_any_element(),
 	)
 }
 
 // ───────────────────────── small building blocks ─────────────────────────
+
+/// Focus rings show only while the user navigates with the keyboard, like
+/// IntelliJ; a mouse press hides them again.
+static KEYBOARD_NAV: std::sync::atomic::AtomicBool =
+	std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn keyboard_nav() -> bool {
+	KEYBOARD_NAV.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns whether the mode changed (the caller re-renders).
+pub(crate) fn set_keyboard_nav(on: bool) -> bool {
+	KEYBOARD_NAV.swap(on, std::sync::atomic::Ordering::Relaxed) != on
+}
+
+/// Focus ring on a focusable control, drawn only in keyboard mode.
+fn focus_ring<E: Styled + InteractiveElement>(el: E) -> E {
+	if keyboard_nav() {
+		el.focus(|s| s.border_color(rgb(pal().focus_ring)))
+	} else {
+		el
+	}
+}
 
 struct Tip(SharedString);
 
@@ -285,7 +312,7 @@ fn button(
 		.when(enabled && kind != Btn::Primary, |d| {
 			d.hover(|s| s.bg(rgb(pal().hover_bg)))
 		})
-		.focus(|s| s.border_color(rgb(pal().focus_ring)))
+		.map(focus_ring)
 		.child(label.into())
 }
 
@@ -310,6 +337,12 @@ fn clip_text(text: impl Into<SharedString>) -> Div {
 }
 
 fn checkbox(checked: bool) -> Div {
+	tri_checkbox(Some(checked))
+}
+
+/// IntelliJ checkbox with the "some children" state (`None`: a dash).
+fn tri_checkbox(state: Option<bool>) -> Div {
+	let on = state != Some(false);
 	// IntelliJ-style: small, thin border, accent fill with a painted check.
 	div()
 		.flex_shrink_0()
@@ -319,17 +352,22 @@ fn checkbox(checked: bool) -> Div {
 		.flex()
 		.items_center()
 		.justify_center()
-		.border_color(rgb(if checked {
-			pal().accent
-		} else {
-			pal().check_border
-		}))
-		.when(checked, |d| {
+		.border_color(rgb(if on { pal().accent } else { pal().check_border }))
+		.when(state == Some(true), |d| {
 			d.bg(rgb(pal().accent)).child(icon_tinted(
 				Icon::Checked,
 				10.,
 				pal().accent_text,
 			))
+		})
+		.when(state.is_none(), |d| {
+			d.bg(rgb(pal().accent)).child(
+				div()
+					.w(px(6.))
+					.h(px(2.))
+					.rounded(px(1.))
+					.bg(rgb(pal().accent_text)),
+			)
 		})
 }
 
@@ -359,21 +397,13 @@ fn icon_button(
 				.tab_index(tab)
 				.hover(|s| s.bg(rgb(pal().hover_bg)))
 		})
-		.focus(|s| s.border_color(rgb(pal().focus_ring)))
+		.map(focus_ring)
 		.child(
 			div()
 				.flex()
 				.when(!enabled, |d| d.opacity(0.4))
 				.child(icon(ic, 14.)),
 		)
-}
-
-fn status_sep() -> Div {
-	div()
-		.flex_shrink_0()
-		.w(px(1.))
-		.h(px(12.))
-		.bg(rgb(pal().divider))
 }
 
 fn toolbar_divider() -> Div {
@@ -574,79 +604,30 @@ impl WorkbenchModel {
 
 	fn change_item_rows(&self) -> Vec<ChangeItemRow> {
 		let mut rows = Vec::new();
-
-		let conflicted: Vec<usize> = self
-			.files
-			.iter()
-			.enumerate()
-			.filter(|(_, f)| f.is_conflict)
-			.map(|(i, _)| i)
-			.collect();
-		if !conflicted.is_empty() {
+		for (group_id, label) in crate::menu::CHANGE_GROUPS {
+			let members: Vec<usize> = self
+				.files
+				.iter()
+				.enumerate()
+				.filter(|(_, f)| crate::menu::change_group(f) == Some(group_id))
+				.map(|(i, _)| i)
+				.collect();
+			if members.is_empty() {
+				continue;
+			}
 			rows.push(ChangeItemRow::Header {
-				label: "group_conflicted",
-				count: conflicted.len(),
-				group_id: "conflicted",
+				label,
+				count: members.len(),
+				group_id,
 			});
-			for idx in conflicted {
-				rows.push(ChangeItemRow::File { file_idx: idx });
+			if !self.chrome.collapsed_groups.contains(&group_id) {
+				rows.extend(
+					members
+						.into_iter()
+						.map(|file_idx| ChangeItemRow::File { file_idx }),
+				);
 			}
 		}
-
-		let staged: Vec<usize> = self
-			.files
-			.iter()
-			.enumerate()
-			.filter(|(_, f)| !f.is_conflict && f.source == SourceKind::Staged)
-			.map(|(i, _)| i)
-			.collect();
-		if !staged.is_empty() {
-			rows.push(ChangeItemRow::Header {
-				label: "group_staged",
-				count: staged.len(),
-				group_id: "staged",
-			});
-			for idx in staged {
-				rows.push(ChangeItemRow::File { file_idx: idx });
-			}
-		}
-
-		let unstaged: Vec<usize> = self
-			.files
-			.iter()
-			.enumerate()
-			.filter(|(_, f)| !f.is_conflict && f.source == SourceKind::Unstaged)
-			.map(|(i, _)| i)
-			.collect();
-		if !unstaged.is_empty() {
-			rows.push(ChangeItemRow::Header {
-				label: "group_unstaged",
-				count: unstaged.len(),
-				group_id: "unstaged",
-			});
-			for idx in unstaged {
-				rows.push(ChangeItemRow::File { file_idx: idx });
-			}
-		}
-
-		let untracked: Vec<usize> = self
-			.files
-			.iter()
-			.enumerate()
-			.filter(|(_, f)| !f.is_conflict && f.source == SourceKind::Working)
-			.map(|(i, _)| i)
-			.collect();
-		if !untracked.is_empty() {
-			rows.push(ChangeItemRow::Header {
-				label: "group_untracked",
-				count: untracked.len(),
-				group_id: "untracked",
-			});
-			for idx in untracked {
-				rows.push(ChangeItemRow::File { file_idx: idx });
-			}
-		}
-
 		rows
 	}
 
@@ -672,6 +653,150 @@ impl WorkbenchModel {
 		self.selected_list_row = row;
 	}
 
+	/// Moves the tool-window cursor by `delta` rows (arrows, PageUp/Down).
+	/// In Changes a file row also opens that change, like before.
+	fn tool_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+		let n = if self.active_tab == WorkbenchTab::GitChanges {
+			self.change_item_rows().len()
+		} else {
+			self.project_rows().len()
+		};
+		if n == 0 {
+			return;
+		}
+		let cur = if self.active_tab == WorkbenchTab::GitChanges {
+			self.selected_list_row
+		} else {
+			self.tree_cursor
+		}
+		.min(n - 1);
+		let next = (cur as isize + delta).clamp(0, n as isize - 1) as usize;
+		self.set_tool_cursor(next, cx);
+	}
+
+	fn set_tool_cursor(&mut self, row: usize, cx: &mut Context<Self>) {
+		self.chrome
+			.left_scroll
+			.scroll_to_item(row, gpui::ScrollStrategy::Top);
+		if self.active_tab == WorkbenchTab::GitChanges {
+			self.selected_list_row = row;
+			if let Some(ChangeItemRow::File { file_idx }) =
+				self.change_item_rows().get(row)
+			{
+				if let Some(f) = self.files.get(*file_idx) {
+					let (p, s) = (f.path.clone(), f.source.clone());
+					self.select_file_with_source(&p, s, cx);
+				}
+			}
+		} else {
+			self.tree_cursor = row;
+		}
+		cx.notify();
+	}
+
+	/// Rows one PageUp/PageDown moves in the left tool window.
+	fn tool_page_rows(&self, window: &Window) -> isize {
+		let h = f32::from(window.viewport_size().height);
+		((h - HEADER_H - STATUS_H - PANEL_HEADER_H) / ROW_H) as isize - 2
+	}
+
+	/// Row labels the speed search matches against.
+	fn tool_row_labels(&self) -> Vec<String> {
+		if self.active_tab == WorkbenchTab::GitChanges {
+			self.change_item_rows()
+				.into_iter()
+				.map(|r| match r {
+					ChangeItemRow::Header { label, .. } => {
+						t(label, self.locale).to_string()
+					}
+					ChangeItemRow::File { file_idx } => self
+						.files
+						.get(file_idx)
+						.map(|f| {
+							let p = f.path.trim_end_matches('/');
+							p.rsplit('/').next().unwrap_or(p).to_string()
+						})
+						.unwrap_or_default(),
+				})
+				.collect()
+		} else {
+			self.project_rows()
+				.into_iter()
+				.map(|r| match r {
+					ProjRow::Repo(i) => self.repos[i].name.clone(),
+					ProjRow::Work(w) => w.name,
+					ProjRow::Rev(r) => r.name,
+				})
+				.collect()
+		}
+	}
+
+	/// Speed search: the next row (from the cursor, `step` 0 = the cursor
+	/// itself) whose label contains the typed text, case-insensitively.
+	fn speed_jump(&mut self, step: isize, cx: &mut Context<Self>) {
+		let q = self.chrome.speed.to_lowercase();
+		let labels = self.tool_row_labels();
+		let n = labels.len();
+		if n == 0 {
+			return;
+		}
+		let cur = if self.active_tab == WorkbenchTab::GitChanges {
+			self.selected_list_row
+		} else {
+			self.tree_cursor
+		}
+		.min(n - 1);
+		let first = usize::from(step != 0);
+		let hit = (first..n + first)
+			.map(|k| {
+				if step < 0 {
+					(cur + n - k % n) % n
+				} else {
+					(cur + k) % n
+				}
+			})
+			.find(|&i| labels[i].to_lowercase().contains(&q));
+		app_log!(
+			"[APP:SPEED_SEARCH: q={} row={}]",
+			self.chrome.speed,
+			hit.map(|r| r.to_string()).unwrap_or_else(|| "none".into())
+		);
+		match hit {
+			Some(row) => self.set_tool_cursor(row, cx),
+			None => cx.notify(),
+		}
+	}
+
+	/// Typing in the Project / Changes list starts IntelliJ speed search.
+	fn speed_key(&mut self, ev: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+		let k = &ev.keystroke;
+		let m = &k.modifiers;
+		if m.control || m.alt || m.platform || m.function {
+			return;
+		}
+		if k.key == "backspace" {
+			if self.chrome.speed.pop().is_none() {
+				return;
+			}
+		} else {
+			match k.key_char.as_deref() {
+				Some(c)
+					if !c.chars().any(char::is_control) && !c.is_empty() =>
+				{
+					self.chrome.speed.push_str(c)
+				}
+				_ => return,
+			}
+		}
+		cx.stop_propagation();
+		if self.chrome.speed.is_empty() {
+			app_log!("[APP:SPEED_SEARCH: off]");
+			cx.notify();
+		} else {
+			self.speed_jump(0, cx);
+		}
+	}
+
 	/// Keyboard: activate / expand / toggle the row under the tool cursor.
 	fn tool_action(
 		&mut self,
@@ -679,58 +804,50 @@ impl WorkbenchModel {
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
+		if matches!(action, "up" | "down") {
+			let delta = if action == "up" { -1 } else { 1 };
+			if self.chrome.speed.is_empty() {
+				self.tool_move(delta, cx);
+			} else {
+				self.speed_jump(delta, cx);
+			}
+			return;
+		}
 		if self.active_tab == WorkbenchTab::GitChanges {
 			let rows = self.change_item_rows();
-			let n = rows.len();
-			if n == 0 {
+			let Some(cur) = rows.len().checked_sub(1) else {
 				return;
-			}
-			match action {
-				"up" | "down" => {
-					let mut cur = self.selected_list_row.min(n - 1);
-					if action == "down" {
-						if let Some((i, _)) =
-							rows.iter().enumerate().skip(cur + 1).find(
-								|(_, r)| {
-									matches!(r, ChangeItemRow::File { .. })
-								},
-							) {
-							cur = i;
+			};
+			let cur = self.selected_list_row.min(cur);
+			match (&rows[cur], action) {
+				(ChangeItemRow::Header { group_id, .. }, _) => {
+					let group = *group_id;
+					let collapsed =
+						self.chrome.collapsed_groups.contains(&group);
+					match action {
+						"toggle" => self.toggle_change_group(group, cx),
+						"open" => self.toggle_group_collapsed(group, cx),
+						"expand" if collapsed => {
+							self.toggle_group_collapsed(group, cx)
 						}
-					} else if let Some((i, _)) = rows[..cur]
-						.iter()
-						.enumerate()
-						.rfind(|(_, r)| matches!(r, ChangeItemRow::File { .. }))
-					{
-						cur = i;
-					}
-					self.selected_list_row = cur;
-					if let Some(ChangeItemRow::File { file_idx }) =
-						rows.get(cur)
-					{
-						if let Some(f) = self.files.get(*file_idx) {
-							let (p, s) = (f.path.clone(), f.source.clone());
-							self.select_file_with_source(&p, s, cx);
+						"collapse" if !collapsed => {
+							self.toggle_group_collapsed(group, cx)
 						}
+						_ => {}
 					}
 				}
-				"toggle" => {
-					let cur = self.selected_list_row.min(n - 1);
-					if let Some(ChangeItemRow::File { file_idx }) =
-						rows.get(cur)
-					{
-						self.toggle_file(*file_idx, cx);
-					}
+				(ChangeItemRow::File { file_idx }, "toggle") => {
+					self.toggle_file(*file_idx, cx);
 				}
-				"open" => {
-					let cur = self.selected_list_row.min(n - 1);
-					if let Some(ChangeItemRow::File { file_idx }) =
-						rows.get(cur)
-					{
-						if let Some(f) = self.files.get(*file_idx) {
-							let (p, s) = (f.path.clone(), f.source.clone());
-							self.select_file_with_source(&p, s, cx);
-						}
+				(ChangeItemRow::File { .. }, "open") => {
+					self.set_tool_cursor(cur, cx);
+				}
+				(ChangeItemRow::File { .. }, "collapse") => {
+					// IntelliJ: Left on a leaf goes to its parent node.
+					if let Some(h) = rows[..cur].iter().rposition(|r| {
+						matches!(r, ChangeItemRow::Header { .. })
+					}) {
+						self.set_tool_cursor(h, cx);
 					}
 				}
 				_ => {}
@@ -743,57 +860,67 @@ impl WorkbenchModel {
 		}
 		let last = rows.len() - 1;
 		self.tree_cursor = self.tree_cursor.min(last);
-		match action {
-			"up" => self.tree_cursor = self.tree_cursor.saturating_sub(1),
-			"down" => self.tree_cursor = (self.tree_cursor + 1).min(last),
-			_ => {
-				let expand = action == "expand";
-				let collapse = action == "collapse";
-				match &rows[self.tree_cursor] {
-					ProjRow::Repo(i) => {
-						if action == "open" || expand {
-							self.select_repo(*i, cx);
-						}
-					}
-					ProjRow::Work(r) => {
-						let gesture = match action {
-							"toggle" => Some(RowGesture::Toggle),
-							"expand" => Some(RowGesture::Expand),
-							"collapse" => Some(RowGesture::Collapse),
-							"open" => Some(RowGesture::Primary),
-							_ => None,
-						};
-						if let Some(gesture) = gesture {
-							let cmd = command_for_row(r, gesture);
-							self.dispatch_tree(cmd, cx);
-						}
-					}
-					ProjRow::Rev(r) if r.marker.is_none() => {
-						let dir = r.kind == snip_core::browser::TreeKind::Tree;
-						let path = r.path.clone();
-						if action == "toggle" {
-							if r.kind == snip_core::browser::TreeKind::Blob {
-								if let Some(tree) = &self.rev_tree {
-									let sha = tree.sha.clone();
-									self.toggle_rev_file_selection(
-										&sha, &path, cx,
-									);
-								}
-							}
-						} else if (dir
-							&& ((expand && !r.expanded)
-								|| (collapse && r.expanded)))
-							|| action == "open"
-						{
-							self.rev_tree_click(&path, dir, cx);
-						}
-					}
-					_ => {}
+		let expand = action == "expand";
+		let collapse = action == "collapse";
+		match &rows[self.tree_cursor] {
+			ProjRow::Repo(i) => {
+				if action == "open" || expand {
+					self.select_repo(*i, cx);
 				}
 			}
+			ProjRow::Work(r) => {
+				let gesture = match action {
+					"toggle" => Some(RowGesture::Toggle),
+					"expand" => Some(RowGesture::Expand),
+					"collapse" => Some(RowGesture::Collapse),
+					"open" => Some(RowGesture::Primary),
+					_ => None,
+				};
+				if let Some(gesture) = gesture {
+					let cmd = command_for_row(r, gesture);
+					self.dispatch_tree(cmd, cx);
+				}
+			}
+			ProjRow::Rev(r) if r.marker.is_none() => {
+				let dir = r.kind == snip_core::browser::TreeKind::Tree;
+				let path = r.path.clone();
+				if action == "toggle" {
+					if r.kind == snip_core::browser::TreeKind::Blob {
+						if let Some(tree) = &self.rev_tree {
+							let sha = tree.sha.clone();
+							self.toggle_rev_file_selection(&sha, &path, cx);
+						}
+					}
+				} else if (dir
+					&& ((expand && !r.expanded) || (collapse && r.expanded)))
+					|| action == "open"
+				{
+					self.rev_tree_click(&path, dir, cx);
+				}
+			}
+			_ => {}
 		}
 		let _ = window;
 		cx.notify();
+	}
+
+	/// Right-click on a left tool-window row: focus the list (the row is
+	/// already the cursor) and open its menu.
+	fn open_left_menu(
+		&mut self,
+		items: Vec<crate::menu::MenuEntry>,
+		ev: &MouseDownEvent,
+		window: &mut Window,
+		cx: &mut Context<Self>,
+	) {
+		window.focus(&self.tree_focus);
+		self.open_menu(
+			crate::menu::MenuOrigin::Left,
+			items,
+			ev.position,
+			window,
+			cx,
+		);
 	}
 
 	fn splitter(&self, which: Splitter, cx: &mut Context<Self>) -> AnyElement {
@@ -1030,8 +1157,9 @@ impl WorkbenchModel {
 				.tab_index(tab)
 				.hover(|s| s.bg(rgb(pal().hover_bg)))
 				.when(open, |d| d.bg(rgb(pal().hover_bg)))
-				.focus(|s| s.border_color(rgb(pal().focus_ring)))
-				.tooltip(tip(tooltip))
+				.map(focus_ring)
+				// No tooltip over an open popup (IntelliJ hides it).
+				.when(!open, |d| d.tooltip(tip(tooltip)))
 				.child(icon(ic, 14.))
 				.child(clip_text(label).font_weight(FontWeight::SEMIBOLD))
 				.child(icon(Icon::ChevronDown, 10.))
@@ -1118,13 +1246,17 @@ impl WorkbenchModel {
 					.flex()
 					.flex_row()
 					.items_center()
-					.gap(px(4.))
+					.gap(px(2.))
 					.flex_shrink_0()
 					.child(
-						button(
+						// IntelliJ main toolbar widget: a transparent icon with a
+						// small count badge instead of a filled button.
+						icon_button(
 							"btn-copy",
-							format!("{} ({count})", t("btn_copy", loc)),
-							Btn::Primary,
+							Icon::Basket,
+							copy_reason.map(str::to_string).unwrap_or_else(
+								|| tf("tip_basket_copy", loc, &[count]),
+							),
 							copy_enabled,
 							3,
 						)
@@ -1133,7 +1265,26 @@ impl WorkbenchModel {
 								this.copy_selection_to_clipboard(cx)
 							}))
 						})
-						.when_some(copy_reason, |b, r| b.tooltip(tip(r)))
+						.when(count > 0, |b| {
+							b.child(
+								div()
+									.absolute()
+									.top(px(-3.))
+									.right(px(-4.))
+									.min_w(px(13.))
+									.h(px(13.))
+									.px(px(3.))
+									.rounded(px(7.))
+									.flex()
+									.items_center()
+									.justify_center()
+									.bg(rgb(pal().accent))
+									.text_size(px(9.))
+									.font_weight(FontWeight::SEMIBOLD)
+									.text_color(rgb(pal().accent_text))
+									.child(count.to_string()),
+							)
+						})
 						.children(probe(log, "btn-copy")),
 					)
 					.when(self.is_copying, |row| {
@@ -1151,24 +1302,26 @@ impl WorkbenchModel {
 							.children(probe(log, "btn-copy-cancel")),
 						)
 					})
+					.when(count > 0, |row| {
+						row.child(
+							icon_button(
+								"btn-basket-clear",
+								Icon::Close,
+								t("basket_clear", loc),
+								true,
+								31,
+							)
+							.on_click(cx.listener(|this, _, _, cx| {
+								this.clear_basket(cx);
+							}))
+							.children(probe(log, "btn-basket-clear")),
+						)
+					})
 					.child(
 						icon_button(
-							"btn-basket-clear",
-							Icon::Close,
-							t("basket_clear", loc),
-							self.basket_count() > 0,
-							31,
-						)
-						.on_click(cx.listener(|this, _, _, cx| {
-							this.clear_basket(cx);
-						}))
-						.children(probe(log, "btn-basket-clear")),
-					)
-					.child(
-						button(
 							"btn-paste",
+							Icon::Paste,
 							t("btn_paste", loc),
-							Btn::Default,
 							true,
 							4,
 						)
@@ -1177,7 +1330,6 @@ impl WorkbenchModel {
 						}))
 						.children(probe(log, "btn-paste")),
 					)
-					.child(toolbar_divider())
 					.child(
 						icon_button(
 							"btn-refresh",
@@ -1190,121 +1342,93 @@ impl WorkbenchModel {
 							cx.listener(|this, _, _, cx| this.reload_repos(cx)),
 						)
 						.children(probe(log, "btn-refresh")),
-					)
-					.child(
-						button(
-							"btn-locale",
-							t("btn_toggle_lang", loc),
-							Btn::Ghost,
-							true,
-							6,
-						)
-						.px(px(6.))
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().text_muted))
-						.on_click(
-							cx.listener(|this, _, _, cx| {
-								this.toggle_locale(cx)
-							}),
-						)
-						.children(probe(log, "btn-locale")),
 					),
 			)
 			.into_any_element()
 	}
 
+	/// IntelliJ branches / repositories popup: search field on top, then the
+	/// list with Local / Remote / Tags section headers. Headers are display
+	/// rows only; `popover_cursor` and the filter count stay over items.
 	fn render_popover(&self, cx: &mut Context<Self>) -> AnyElement {
-		let loc = self.locale;
+		const ITEM_H: f32 = 24.0;
 		let log = &self.probes;
 		let q = self.selector_input.read(cx).text().to_string();
-		let n = self.selector_candidates(&q).count();
-		let title = match self.popover {
-			Some(Popover::Repo) => t("selector_repo_title", loc),
-			_ => t("selector_ref_title", loc),
-		};
-		let list_h = (n.max(1) as f32 * 26.0).min(300.0);
+		// (first item index, group) of each section, at most three.
+		let mut sections: Vec<(usize, &'static str)> = Vec::new();
+		let mut n = 0;
+		let mut prev = None;
+		for c in self.selector_candidates(&q) {
+			let g = c.group();
+			if g.is_some() && g != prev {
+				sections.push((n, g.unwrap_or_default()));
+			}
+			prev = g;
+			n += 1;
+		}
+		let rows = n + sections.len();
+		let list_h = (rows.max(1) as f32 * ITEM_H).min(360.0);
 		let cursor = self.popover_cursor;
 		let panel = div()
 			.id("selector-popover")
 			.occlude()
-			.w(px(340.))
+			.w(px(360.))
 			.flex()
 			.flex_col()
-			.bg(rgb(pal().panel_bg))
+			.bg(rgb(pal().popup_bg))
 			.border_1()
-			.border_color(rgb(pal().button_border))
-			.rounded(px(6.))
+			.border_color(rgb(pal().popup_border))
+			.rounded(px(ISLAND_RADIUS))
 			.shadow_lg()
-			.p(px(6.))
-			.gap(px(6.))
-			.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popover(cx)))
-			.child(div().text_size(px(SMALL_TEXT)).text_color(rgb(pal().text_muted)).child(title))
+			.p(px(4.))
+			.gap(px(4.))
+			.on_mouse_down_out(
+				cx.listener(|this, _, _, cx| this.close_popover(cx)),
+			)
 			.child(
 				div()
 					.id("selector-input")
 					.relative()
-					.child(self.selector_input.clone())
+					.flex()
+					.items_center()
+					.gap(px(4.))
+					.pl(px(6.))
+					.child(icon(Icon::Search, 14.))
+					.child(
+						div()
+							.flex_1()
+							.min_w_0()
+							.child(self.selector_input.clone()),
+					)
 					.children(probe(log, "selector-input")),
 			)
+			.child(div().h(px(1.)).mx(px(-4.)).bg(rgb(pal().popup_border)))
 			.child(
 				div()
 					.h(px(list_h))
 					.when(n == 0, |d| {
-						d.child(div().p(px(6.)).text_color(rgb(pal().text_muted)).child(t("selector_empty", loc)))
+						d.child(
+							div()
+								.p(px(6.))
+								.text_color(rgb(pal().text_muted))
+								.child(t("selector_empty", self.locale)),
+						)
 					})
 					.when(n > 0, |d| {
 						d.child(
 							uniform_list(
 								"selector-items",
-								n,
-								cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-									let q = this.selector_input.read(cx).text().to_string();
-									this.selector_items(&q, range)
-										.map(|(ix, it)| {
-											let pick = it.pick.clone();
-											let active = match &it.pick {
-												Pick::Repo(i) => this.selected_repo_idx == Some(*i),
-												Pick::Ref(r) => r == &this.active_ref_filter,
-											};
-											div()
-												.id(SharedString::from(it.id.clone()))
-												.relative()
-												.flex()
-												.items_center()
-												.gap(px(6.))
-												.h(px(26.))
-												.px(px(6.))
-												.rounded(px(4.))
-												.cursor_pointer()
-												.when(ix == cursor, |d| d.bg(rgb(pal().selection_bg)))
-												.when(ix != cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-												.on_click(cx.listener(move |this, _, _, cx| this.choose(pick.clone(), cx)))
-												.child(icon(
-													if it.error {
-														Icon::Warning
-													} else {
-														match it.pick {
-															Pick::Repo(_) => Icon::Project,
-															Pick::Ref(_) => Icon::Branch,
-														}
-													},
-													14.,
-												))
-												.child(fill_text(it.label.clone()).when(active, |d| d.font_weight(FontWeight::SEMIBOLD)))
-												.when_some(it.group, |d, g| {
-													d.child(div().flex_shrink_0().text_size(px(11.)).text_color(rgb(pal().text_disabled)).child(t(g, this.locale)))
-												})
-												.child(
-													div()
-														.flex_shrink_0()
-														.text_size(px(11.))
-														.text_color(rgb(if it.error { pal().error } else { pal().text_muted }))
-														.child(it.detail.clone()),
-												)
-												.children(probe(&this.probes, it.id.clone()))
-										})
-										.collect::<Vec<_>>()
-								}),
+								rows,
+								cx.processor(
+									move |this,
+									      range: std::ops::Range<usize>,
+									      _,
+									      cx| {
+										this.popover_rows(
+											&sections, range, cursor, cx,
+										)
+									},
+								),
 							)
 							.size_full(),
 						)
@@ -1319,6 +1443,127 @@ impl WorkbenchModel {
 					.with_priority(1),
 			)
 			.into_any_element()
+	}
+
+	/// Display rows `range` of the popup: section headers and items.
+	fn popover_rows(
+		&self,
+		sections: &[(usize, &'static str)],
+		range: std::ops::Range<usize>,
+		cursor: usize,
+		cx: &mut Context<Self>,
+	) -> Vec<Stateful<Div>> {
+		// Display index -> Err(header group) or Ok(item index).
+		let map = |d: usize| {
+			let mut shift = 0;
+			for (k, (start, g)) in sections.iter().enumerate() {
+				if d == start + k {
+					return Err(*g);
+				}
+				if d > start + k {
+					shift = k + 1;
+				}
+			}
+			Ok(d - shift)
+		};
+		let items: Vec<usize> =
+			range.clone().filter_map(|d| map(d).ok()).collect();
+		let q = self.selector_input.read(cx).text().to_string();
+		let mut picked = match (items.first(), items.last()) {
+			(Some(&a), Some(&b)) => self.selector_items(&q, a..b + 1).collect(),
+			_ => Vec::new(),
+		}
+		.into_iter();
+		let current_branch = self
+			.repo()
+			.and_then(|r| r.summary.as_ref().ok())
+			.and_then(|s| s.branch.clone());
+		range
+			.map(|d| match map(d) {
+				Err(g) => div()
+					.id(SharedString::from(format!("selector-group:{g}")))
+					.w_full()
+					.flex()
+					.items_center()
+					.h(px(24.))
+					.px(px(8.))
+					.text_size(px(11.))
+					.font_weight(FontWeight::SEMIBOLD)
+					.text_color(rgb(pal().text_muted))
+					.child(t(g, self.locale)),
+				Ok(_) => {
+					let Some((ix, it)) = picked.next() else {
+						return div().id(SharedString::from(format!(
+							"selector-gap:{d}"
+						)));
+					};
+					let pick = it.pick.clone();
+					let active = match &it.pick {
+						Pick::Repo(i) => self.selected_repo_idx == Some(*i),
+						Pick::Ref(r) => r == &self.active_ref_filter,
+					};
+					let ic = if it.error {
+						Icon::Warning
+					} else {
+						match (&it.pick, it.group) {
+							(Pick::Repo(_), _) => Icon::Project,
+							(Pick::Ref(None), _) => Icon::GitLog,
+							(Pick::Ref(Some(r)), _) if r == "HEAD" => {
+								Icon::Head
+							}
+							(_, Some("refs_tags")) => Icon::Tag,
+							(_, Some("refs_remote")) => Icon::RemoteBranch,
+							_ if current_branch.as_deref()
+								== Some(it.label.as_str()) =>
+							{
+								Icon::Head
+							}
+							_ => Icon::Branch,
+						}
+					};
+					div()
+						.id(SharedString::from(it.id.clone()))
+						.relative()
+						.w_full()
+						.flex()
+						.items_center()
+						.gap(px(6.))
+						.h(px(24.))
+						.px(px(8.))
+						.rounded(px(4.))
+						.cursor_pointer()
+						.when(ix == cursor, |d| d.bg(rgb(pal().selection_bg)))
+						.when(ix != cursor, |d| {
+							d.hover(|s| s.bg(rgb(pal().hover_bg)))
+						})
+						.on_click(cx.listener(move |this, _, _, cx| {
+							this.choose(pick.clone(), cx)
+						}))
+						.child(icon(ic, 14.))
+						.child(fill_text(it.label.clone()))
+						.child(
+							div()
+								.flex_shrink_0()
+								.text_size(px(11.))
+								.text_color(rgb(if it.error {
+									pal().error
+								} else {
+									pal().text_muted
+								}))
+								.child(it.detail.clone()),
+						)
+						.child(
+							div()
+								.flex_shrink_0()
+								.w(px(14.))
+								.when(active, |d| {
+									d.child(icon(Icon::Checked, 14.))
+								}),
+						)
+						.children(probe(&self.probes, it.id.clone()))
+				}
+			})
+			.collect()
 	}
 
 	// ───────────────────────── rail ─────────────────────────
@@ -1350,7 +1595,7 @@ impl WorkbenchModel {
 				// Islands: the open tool is a filled accent pill on the frame.
 				.when(on, |d| d.bg(rgb(pal().rail_active_bg)))
 				.when(!on, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-				.focus(|s| s.border_color(rgb(pal().focus_ring)))
+				.map(focus_ring)
 				.tooltip(tip(label))
 				.child(if on {
 					icon_tinted(ic, 16., pal().accent_text).into_any_element()
@@ -1565,7 +1810,7 @@ impl WorkbenchModel {
 									group_id,
 								} => {
 									out.push(this.change_header_row(
-										label, count, group_id,
+										label, count, group_id, row_idx, cx,
 									));
 								}
 								ChangeItemRow::File { file_idx } => {
@@ -1580,6 +1825,9 @@ impl WorkbenchModel {
 				}
 			}),
 		)
+		// Islands: rows are inset and rounded inside the island.
+		.px(px(4.))
+		.track_scroll(self.chrome.left_scroll.clone())
 		.size_full();
 
 		div()
@@ -1653,6 +1901,21 @@ impl WorkbenchModel {
 					.on_action(cx.listener(|this, _: &TreeToggle, w, cx| {
 						this.tool_action("toggle", w, cx)
 					}))
+					.on_action(cx.listener(
+						|this, _: &crate::ToolPageUp, w, cx| {
+							this.tool_move(-this.tool_page_rows(w), cx)
+						},
+					))
+					.on_action(cx.listener(
+						|this, _: &crate::ToolPageDown, w, cx| {
+							this.tool_move(this.tool_page_rows(w), cx)
+						},
+					))
+					.on_key_down(cx.listener(
+						|this, ev: &gpui::KeyDownEvent, _, cx| {
+							this.speed_key(ev, cx)
+						},
+					))
 					.flex_1()
 					.min_h_0()
 					.when(n == 0, |d| {
@@ -1668,8 +1931,89 @@ impl WorkbenchModel {
 						)
 					})
 					.child(list)
+					.when(!self.chrome.speed.is_empty(), |d| {
+						d.child(self.speed_search_popup())
+					})
 					.children(probe(&self.probes, "left-list")),
 			)
+			.into_any_element()
+	}
+
+	/// Row label with the speed-search match highlighted (IntelliJ paints
+	/// the matched substring), plain text otherwise.
+	fn speed_label(&self, text: String) -> Div {
+		let q = self.chrome.speed.to_lowercase();
+		let hit = (!q.is_empty() && self.left_active)
+			.then(|| {
+				// Lowercasing may change byte lengths; only highlight when
+				// the match maps back onto the original text.
+				let lower = text.to_lowercase();
+				(lower.len() == text.len())
+					.then(|| lower.find(&q).map(|i| i..i + q.len()))
+					.flatten()
+			})
+			.flatten()
+			.filter(|r| {
+				text.is_char_boundary(r.start) && text.is_char_boundary(r.end)
+			});
+		let base = div()
+			.min_w_0()
+			.overflow_hidden()
+			.line_clamp(1)
+			.text_ellipsis();
+		match hit {
+			Some(range) => {
+				base.child(gpui::StyledText::new(text).with_highlights([(
+					range,
+					gpui::HighlightStyle {
+						// IntelliJ paints speed-search matches amber with
+						// dark text in both themes.
+						background_color: Some(rgb(LIGHT.find_bg).into()),
+						color: Some(rgb(0x000000).into()),
+						..Default::default()
+					},
+				)]))
+			}
+			None => base.child(text),
+		}
+	}
+
+	/// IntelliJ speed search field, floating over the tool window header
+	/// at the top-left of the list so no row is covered.
+	fn speed_search_popup(&self) -> AnyElement {
+		let none = self.tool_row_labels().iter().all(|l| {
+			!l.to_lowercase().contains(&self.chrome.speed.to_lowercase())
+		});
+		div()
+			.id("speed-search")
+			.absolute()
+			.top(px(3. - PANEL_HEADER_H))
+			.left(px(6.))
+			.flex()
+			.items_center()
+			.gap(px(4.))
+			.h(px(22.))
+			.px(px(6.))
+			.max_w(px(240.))
+			.rounded(px(4.))
+			.bg(rgb(pal().popup_bg))
+			.border_1()
+			.border_color(rgb(if none {
+				pal().error
+			} else {
+				pal().popup_border
+			}))
+			.shadow_md()
+			.text_size(px(SMALL_TEXT))
+			.child(icon(Icon::Search, 12.))
+			.child(
+				clip_text(self.chrome.speed.clone()).text_color(rgb(if none {
+					pal().error
+				} else {
+					pal().text
+				})),
+			)
+			.children(probe(&self.probes, "speed-search"))
 			.into_any_element()
 	}
 
@@ -1780,16 +2124,24 @@ impl WorkbenchModel {
 					.px(px(6.))
 					.gap(px(5.))
 					.cursor_pointer()
-					.when(selected, |d| d.bg(rgb(self.left_selection_bg())))
-					.when(!selected, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.when(cursor && self.left_active, |d| {
-						d.border_1().border_color(rgb(pal().focus_ring))
+					.rounded(px(4.))
+					.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
+					.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+					.when(self.chrome.menu.is_none(), |d| {
+						d.tooltip(tip(tooltip))
 					})
-					.tooltip(tip(tooltip))
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.tree_cursor = ix;
 						this.select_repo(idx, cx);
 					}))
+					.on_mouse_down(
+						MouseButton::Right,
+						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+							this.tree_cursor = ix;
+							let items = this.repo_row_menu(idx);
+							this.open_left_menu(items, ev, w, cx);
+						}),
+					)
 					.child(icon(
 						if selected {
 							Icon::ChevronDown
@@ -1803,7 +2155,7 @@ impl WorkbenchModel {
 						14.,
 					))
 					.child(
-						clip_text(repo.name.clone())
+						self.speed_label(repo.name.clone())
 							.font_weight(FontWeight::SEMIBOLD),
 					)
 					.when_some(kind_badge, |d, badge| {
@@ -1892,8 +2244,8 @@ impl WorkbenchModel {
 		let rel = row.rel_path.clone();
 		let click_row = row.clone();
 		let check_row = row.clone();
+		let menu_row = row.clone();
 		let is_dir = row.is_dir;
-		let selected_file = self.selected_file.as_deref() == Some(&rel);
 		let row_id = if row.is_valid_utf8 {
 			format!("tree-row:{rel}")
 		} else {
@@ -1928,11 +2280,17 @@ impl WorkbenchModel {
 			.pr(px(6.))
 			.gap(px(5.))
 			.when(is_valid_utf8, |d| d.cursor_pointer())
-			.when(selected_file, |d| d.bg(rgb(self.left_selection_bg())))
-			.when(!selected_file, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-			.when(cursor && self.left_active, |d| {
-				d.border_1().border_color(rgb(pal().focus_ring))
-			})
+			.rounded(px(4.))
+			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
+			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			.on_mouse_down(
+				MouseButton::Right,
+				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+					this.tree_cursor = ix;
+					let items = this.work_row_menu(&menu_row);
+					this.open_left_menu(items, ev, w, cx);
+				}),
+			)
 			.when(is_valid_utf8, |d| {
 				d.on_click(cx.listener(move |this, _, _, cx| {
 					this.tree_cursor = ix;
@@ -1968,6 +2326,7 @@ impl WorkbenchModel {
 						d.cursor_pointer().on_click(cx.listener(
 							move |this, _, _, cx| {
 								cx.stop_propagation();
+								this.tree_cursor = ix;
 								this.dispatch_tree(
 									command_for_row(
 										&check_row,
@@ -2002,7 +2361,8 @@ impl WorkbenchModel {
 				14.,
 			))
 			.child(
-				fill_text(row.name.clone())
+				self.speed_label(row.name.clone())
+					.flex_1()
 					.when_some(name_color, |d, c| d.text_color(rgb(c))),
 			)
 			.when(row.is_nested_repo, |d| {
@@ -2059,8 +2419,6 @@ impl WorkbenchModel {
 		let submodule = row.kind == snip_core::browser::TreeKind::Submodule;
 		let is_file = row.kind == snip_core::browser::TreeKind::Blob;
 		let path = row.path.clone();
-		let selected = self.selected_commit_file.as_deref() == Some(&path)
-			&& self.rev_tree.is_some();
 		let tree_sha = self
 			.rev_tree
 			.as_ref()
@@ -2082,10 +2440,16 @@ impl WorkbenchModel {
 			.pr(px(6.))
 			.gap(px(5.))
 			.cursor_pointer()
-			.when(selected, |d| d.bg(rgb(self.left_selection_bg())))
-			.when(!selected, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-			.when(cursor && self.left_active, |d| {
-				d.border_1().border_color(rgb(pal().focus_ring))
+			.rounded(px(4.))
+			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
+			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			.on_mouse_down(MouseButton::Right, {
+				let menu_path = path.clone();
+				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+					this.tree_cursor = ix;
+					let items = this.rev_row_menu(&menu_path, is_file);
+					this.open_left_menu(items, ev, w, cx);
+				})
 			})
 			.when(!submodule, |d| {
 				let row_path = path.clone();
@@ -2122,6 +2486,7 @@ impl WorkbenchModel {
 						let sha = tree_sha.clone();
 						move |this, _, _, cx| {
 							cx.stop_propagation();
+							this.tree_cursor = ix;
 							this.toggle_rev_file_selection(&sha, &chk_path, cx);
 						}
 					}))
@@ -2145,7 +2510,7 @@ impl WorkbenchModel {
 				},
 				14.,
 			))
-			.child(fill_text(row.name.clone()))
+			.child(self.speed_label(row.name.clone()).flex_1())
 			.when(submodule, |d| {
 				d.child(
 					div()
@@ -2159,16 +2524,23 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
+	/// Changes group node, like IntelliJ's commit tool window: chevron,
+	/// tri-state group checkbox, name and count.
 	fn change_header_row(
 		&self,
 		label_key: &'static str,
 		count: usize,
 		group_id: &'static str,
+		row_idx: usize,
+		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
-		let text = format!("{} ({})", t(label_key, loc), count);
+		let collapsed = self.chrome.collapsed_groups.contains(&group_id);
+		let cursor = row_idx == self.selected_list_row;
 		let id = format!("change-header:{group_id}");
+		let chk_id = format!("change-group-chk:{group_id}");
+		let toggle_id = format!("change-group-toggle:{group_id}");
 		div()
 			.id(SharedString::from(id.clone()))
 			.relative()
@@ -2177,13 +2549,81 @@ impl WorkbenchModel {
 			.items_center()
 			.w_full()
 			.h(px(ROW_H))
-			.pl(px(10.))
+			.pl(px(4.))
 			.pr(px(6.))
-			.gap(px(6.))
-			.text_size(px(11.))
-			.font_weight(FontWeight::SEMIBOLD)
-			.text_color(rgb(pal().text_muted))
-			.child(text)
+			.gap(px(2.))
+			.rounded(px(4.))
+			.cursor_pointer()
+			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
+			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			.on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+				this.selected_list_row = row_idx;
+				if ev.click_count() >= 2 {
+					this.toggle_group_collapsed(group_id, cx);
+				}
+				cx.notify();
+			}))
+			.on_mouse_down(
+				MouseButton::Right,
+				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+					this.selected_list_row = row_idx;
+					let items = this.change_group_menu(group_id);
+					this.open_left_menu(items, ev, w, cx);
+				}),
+			)
+			.child(
+				div()
+					.id(SharedString::from(toggle_id.clone()))
+					.relative()
+					.flex_shrink_0()
+					.size(px(16.))
+					.flex()
+					.items_center()
+					.justify_center()
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.selected_list_row = row_idx;
+						this.toggle_group_collapsed(group_id, cx);
+					}))
+					.child(icon(
+						if collapsed {
+							Icon::ChevronRight
+						} else {
+							Icon::ChevronDown
+						},
+						10.,
+					))
+					.children(probe(log, toggle_id)),
+			)
+			.child(
+				div()
+					.id(SharedString::from(chk_id.clone()))
+					.relative()
+					.flex_shrink_0()
+					.size(px(18.))
+					.flex()
+					.items_center()
+					.justify_center()
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.toggle_change_group(group_id, cx);
+					}))
+					.child(tri_checkbox(self.group_state(group_id)))
+					.children(probe(log, chk_id)),
+			)
+			.child(
+				clip_text(t(label_key, loc))
+					.ml(px(4.))
+					.font_weight(FontWeight::SEMIBOLD),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.ml(px(6.))
+					.text_size(px(SMALL_TEXT))
+					.text_color(rgb(pal().text_muted))
+					.child(tf("n_files", loc, &[count])),
+			)
 			.children(probe(log, id))
 			.into_any_element()
 	}
@@ -2216,11 +2656,6 @@ impl WorkbenchModel {
 			Some((d, n)) => (d.to_string(), n.to_string()),
 			None => (String::new(), path.trim_end_matches('/').to_string()),
 		};
-		let selected = self.selected_file.as_deref() == Some(&path)
-			&& self
-				.selected_file_source
-				.as_ref()
-				.is_none_or(|s| s == &item.source);
 		let cursor = row_idx == self.selected_list_row;
 		let source_str = if item.is_conflict {
 			"conflicted"
@@ -2263,16 +2698,22 @@ impl WorkbenchModel {
 			.items_center()
 			.w_full()
 			.h(px(ROW_H))
-			.pl(px(10.))
+			.pl(px(20.))
 			.pr(px(6.))
 			.gap(px(6.))
 			.cursor_pointer()
-			.when(selected, |d| d.bg(rgb(self.left_selection_bg())))
-			.when(!selected, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-			.when(cursor && !selected && self.left_active, |d| {
-				d.border_1().border_color(rgb(pal().focus_ring))
-			})
-			.tooltip(tip(tooltip))
+			.rounded(px(4.))
+			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
+			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			.on_mouse_down(
+				MouseButton::Right,
+				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+					this.selected_list_row = row_idx;
+					let items = this.change_row_menu(ix);
+					this.open_left_menu(items, ev, w, cx);
+				}),
+			)
+			.when(self.chrome.menu.is_none(), |d| d.tooltip(tip(tooltip)))
 			.on_click(cx.listener(move |this, _, _, cx| {
 				this.selected_list_row = row_idx;
 				this.select_file_with_source(
@@ -2293,6 +2734,7 @@ impl WorkbenchModel {
 					.when(checkable, |d| {
 						d.on_click(cx.listener(move |this, _, _, cx| {
 							cx.stop_propagation();
+							this.selected_list_row = row_idx;
 							this.toggle_file(ix, cx);
 						}))
 					})
@@ -2317,7 +2759,7 @@ impl WorkbenchModel {
 				14.,
 			))
 			.child(
-				clip_text(name)
+				self.speed_label(name)
 					.flex_shrink_0()
 					.max_w(gpui::relative(0.7))
 					.text_color(rgb(color))
@@ -2347,6 +2789,9 @@ impl WorkbenchModel {
 			.items_center()
 			.border_b_1()
 			.border_color(rgb(pal().divider))
+			.on_mouse_down(MouseButton::Right, |_, w, cx| {
+				w.dispatch_action(Box::new(crate::OpenTabMenu), cx)
+			})
 			.when(!label.is_empty(), |d| {
 				d.child(
 					div()
@@ -4289,6 +4734,13 @@ impl WorkbenchModel {
 					}
 				},
 			))
+			.on_mouse_down(MouseButton::Right, {
+				let sha = sha.clone();
+				cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+					window.focus(&this.log_focus);
+					this.open_log_menu(&sha, ev.position, window, cx);
+				})
+			})
 			.child(
 				div()
 					.flex_1()
@@ -4429,11 +4881,12 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
-	fn render_status(&self) -> AnyElement {
+	/// IntelliJ status bar: message on the left, borderless widgets on the
+	/// right with no separators; zero counters are not shown.
+	fn render_status(&self, cx: &mut Context<Self>) -> AnyElement {
 		let loc = self.locale;
 		let errors = self.repos.iter().filter(|r| r.summary.is_err()).count();
-		let count_s = self.basket_count().to_string();
-		let basket_n = count_s.clone();
+		let basket_n = self.basket_count().to_string();
 		let (basket_detail, collision) = &self.basket_view;
 		let basket_label = if let Some(collision) = collision {
 			tf("basket_collision", loc, &[collision])
@@ -4443,7 +4896,30 @@ impl WorkbenchModel {
 			tf("basket_summary", loc, &[&basket_n, basket_detail])
 		};
 		let repos_s = self.repos.len().to_string();
-		let errors_s = errors.to_string();
+		let repo_label = if errors > 0 {
+			tf("status_repo_count", loc, &[&repos_s, &errors.to_string()])
+		} else {
+			tf("status_repo_count_ok", loc, &[&repos_s])
+		};
+		let jobs = self.lifecycle.live_jobs();
+		let branch =
+			self.repo().and_then(|r| r.summary.as_ref().ok()).map(|s| {
+				match (&s.branch, &s.head) {
+					(Some(b), _) => b.clone(),
+					(None, Some(h)) => short(h).to_string(),
+					(None, None) => t("repo_unborn", loc).to_string(),
+				}
+			});
+		let widget = || {
+			div()
+				.flex_shrink_0()
+				.flex()
+				.items_center()
+				.gap(px(4.))
+				.h(px(STATUS_H - 4.))
+				.px(px(6.))
+				.rounded(px(4.))
+		};
 		div()
 			.id("status-bar")
 			.relative()
@@ -4452,57 +4928,76 @@ impl WorkbenchModel {
 			.items_center()
 			.flex_shrink_0()
 			.h(px(STATUS_H))
-			.px(px(10.))
-			.gap(px(8.))
+			.pl(px(10.))
+			.pr(px(6.))
+			.gap(px(2.))
 			.bg(rgb(pal().frame_bg))
 			.text_size(px(SMALL_TEXT))
 			.text_color(rgb(pal().text_muted))
-			.child(fill_text(self.status.render(loc)))
-			.child(status_sep())
-			.child(div().flex_shrink_0().child(tf(
-				"status_copy_source",
-				loc,
-				&[&count_s],
-			)))
-			.child(status_sep())
+			.child(fill_text(self.status.render(loc)).mr(px(8.)))
 			.child(
-				div()
+				widget()
 					.id("basket-summary")
 					.relative()
-					.flex_shrink_0()
 					.max_w(px(360.))
-					.min_w(px(80.))
+					.min_w(px(40.))
 					.overflow_hidden()
-					.text_ellipsis()
 					.tooltip(tip(basket_label.clone()))
-					.child(basket_label)
+					.child(clip_text(basket_label))
 					.children(probe(&self.probes, "basket-summary")),
 			)
-			.child(status_sep())
 			.child(
-				div()
-					.flex_shrink_0()
+				widget()
 					.text_color(rgb(if errors > 0 {
 						pal().error
 					} else {
 						pal().text_muted
 					}))
-					.child(tf(
-						"status_repo_count",
-						loc,
-						&[&repos_s, &errors_s],
-					)),
+					.child(repo_label),
 			)
-			.child(status_sep())
-			.child({
-				let jobs = self.lifecycle.live_jobs().to_string();
-				div()
-					.id("lifecycle-jobs")
-					.relative()
-					.flex_shrink_0()
-					.child(tf("lifecycle_jobs", loc, &[&jobs]))
-					.children(probe(&self.probes, "lifecycle-jobs"))
+			.when(jobs > 0, |d| {
+				d.child(
+					widget()
+						.id("lifecycle-jobs")
+						.relative()
+						.child(tf("lifecycle_jobs", loc, &[&jobs.to_string()]))
+						.children(probe(&self.probes, "lifecycle-jobs")),
+				)
 			})
+			.when_some(branch, |d, b| {
+				// VCS widget: branch icon and name, like IntelliJ's Git widget.
+				d.child(
+					widget()
+						.id("status-vcs")
+						.relative()
+						.max_w(px(200.))
+						.cursor_pointer()
+						.hover(|s| s.bg(rgb(pal().hover_bg)))
+						.tooltip(tip(t("tip_vcs_branch", loc)))
+						.on_click(cx.listener(|this, _, window, cx| {
+							this.open_popover(Popover::Ref, window, cx)
+						}))
+						.child(icon(Icon::Branch, 12.))
+						.child(clip_text(b).text_color(rgb(pal().text)))
+						.children(probe(&self.probes, "status-vcs")),
+				)
+			})
+			.child(
+				button(
+					"btn-locale",
+					t("btn_toggle_lang", loc),
+					Btn::Ghost,
+					true,
+					6,
+				)
+				.h(px(STATUS_H - 4.))
+				.px(px(6.))
+				.text_size(px(SMALL_TEXT))
+				.text_color(rgb(pal().text_muted))
+				.tooltip(tip(t("tip_language", loc)))
+				.on_click(cx.listener(|this, _, _, cx| this.toggle_locale(cx)))
+				.children(probe(&self.probes, "btn-locale")),
+			)
 			.children(probe(&self.probes, "status-bar"))
 			.into_any_element()
 	}
@@ -4525,8 +5020,16 @@ impl Render for WorkbenchModel {
 			self.last_viewport = phys;
 			app_log!("[APP:VIEWPORT: {}x{}]", phys.0, phys.1);
 		}
-		self.left_active = self.tree_focus.is_focused(window);
-		self.log_active = self.log_focus.is_focused(window);
+		// A context menu keeps its list looking focused while it is open.
+		let menu_origin = self.chrome.menu.as_ref().map(|m| m.origin);
+		self.left_active = self.tree_focus.is_focused(window)
+			|| menu_origin == Some(crate::menu::MenuOrigin::Left);
+		self.log_active = self.log_focus.is_focused(window)
+			|| menu_origin == Some(crate::menu::MenuOrigin::Log);
+		if !self.left_active && !self.chrome.speed.is_empty() {
+			// IntelliJ ends speed search when the list loses focus.
+			self.chrome.speed.clear();
+		}
 		self.reader_active = self.reader_focus.is_focused(window);
 		let left_w = self.effective_left_w(vw);
 		let bottom_h = self.effective_bottom_h(vh);
@@ -4601,14 +5104,63 @@ impl Render for WorkbenchModel {
 				this.show_tool(next, window, cx);
 			}))
 			.on_action(cx.listener(|_, _: &FocusNext, window, cx| {
+				set_keyboard_nav(true);
 				window.focus_next();
 				app_log!("[APP:FOCUS: next]");
 				cx.notify();
 			}))
 			.on_action(cx.listener(|_, _: &FocusPrev, window, cx| {
+				set_keyboard_nav(true);
 				window.focus_prev();
 				app_log!("[APP:FOCUS: prev]");
 				cx.notify();
+			}))
+			// Any mouse press leaves keyboard mode (focus rings off).
+			.capture_any_mouse_down(cx.listener(|_, _, _, cx| {
+				if set_keyboard_nav(false) {
+					cx.notify();
+				}
+			}))
+			.on_action(cx.listener(|this, _: &crate::OpenTabMenu, w, cx| {
+				let (items, pos) = (this.tab_menu(), w.mouse_position());
+				this.open_menu(
+					crate::menu::MenuOrigin::Editor,
+					items,
+					pos,
+					w,
+					cx,
+				)
+			}))
+			// Arrow keys count as keyboard navigation, like Tab.
+			.capture_action(|_: &TreeUp, _, _| {
+				set_keyboard_nav(true);
+			})
+			.capture_action(|_: &TreeDown, _, _| {
+				set_keyboard_nav(true);
+			})
+			.capture_action(|_: &LogUp, _, _| {
+				set_keyboard_nav(true);
+			})
+			.capture_action(|_: &LogDown, _, _| {
+				set_keyboard_nav(true);
+			})
+			.on_action(cx.listener(|this, _: &crate::HideToolWindow, w, cx| {
+				this.hide_active_tool(w, cx)
+			}))
+			.on_action(cx.listener(|this, _: &crate::FocusEditor, w, cx| {
+				this.escape_to_editor(w, cx)
+			}))
+			.on_action(cx.listener(|this, _: &crate::LogParent, _, cx| {
+				this.log_go(true, cx)
+			}))
+			.on_action(cx.listener(|this, _: &crate::LogChild, _, cx| {
+				this.log_go(false, cx)
+			}))
+			.on_action(cx.listener(|this, _: &crate::LogPageUp, _, cx| {
+				this.log_move(-this.log_page_rows(), false, cx)
+			}))
+			.on_action(cx.listener(|this, _: &crate::LogPageDown, _, cx| {
+				this.log_move(this.log_page_rows(), false, cx)
 			}))
 			.on_action(cx.listener(|this, _: &ShowProject, window, cx| {
 				this.show_tool(WorkbenchTab::FileExplorer, window, cx)
@@ -4731,7 +5283,8 @@ impl Render for WorkbenchModel {
 							}),
 					),
 			)
-			.child(self.render_status())
+			.child(self.render_status(cx))
+			.children(self.render_context_menu(cx))
 			.children(probe_frame_end(&self.probes))
 	}
 }

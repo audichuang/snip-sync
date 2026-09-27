@@ -67,6 +67,9 @@ pub struct Palette {
 	/// Active tool-window stripe button (`ToolWindow.Button.selectedBackground`).
 	pub rail_active_bg: u32,
 	pub tooltip_bg: u32,
+	/// Popups and context menus (`Popup.background` / `Popup.borderColor`).
+	pub popup_bg: u32,
+	pub popup_border: u32,
 	// Text.
 	pub text: u32,
 	pub text_muted: u32,
@@ -135,6 +138,8 @@ pub static DARK: Palette = Palette {
 	range_bg: 0x233558,              // selection-bg-active-muted
 	rail_active_bg: 0x3871e1,        // toolbar-selected-bg-active
 	tooltip_bg: 0x33353b,            // ToolTip.background = feedback-bg
+	popup_bg: 0x26282c,              // popup-bg = layer-1-bg
+	popup_border: 0x33353b,          // popup-border = layer-1-border
 	text: 0xd1d3d9,                  // text-default
 	text_muted: 0x9fa2a8,            // text-muted
 	text_disabled: 0x4c4f56,         // text-disabled
@@ -198,6 +203,8 @@ pub static LIGHT: Palette = Palette {
 	range_bg: 0xe3ebfe,              // selection-bg-active-muted
 	rail_active_bg: 0x3871e1,        // toolbar-selected-bg-active
 	tooltip_bg: 0xf7f8f9,            // popup-bg-inline
+	popup_bg: 0xffffff,              // popup-bg = layer-2-bg
+	popup_border: 0xe9eaee,          // popup-border = layer-2-border
 	text: 0x000000,                  // text-default
 	text_muted: 0x5f6269,            // text-muted
 	text_disabled: 0x9fa2a8,         // text-disabled
@@ -336,6 +343,8 @@ mod tests {
 			),
 			("range_bg", d.range_bg, l.range_bg),
 			("tooltip_bg", d.tooltip_bg, l.tooltip_bg),
+			("popup_bg", d.popup_bg, l.popup_bg),
+			("popup_border", d.popup_border, l.popup_border),
 			("text", d.text, l.text),
 			("text_muted", d.text_muted, l.text_muted),
 			("text_disabled", d.text_disabled, l.text_disabled),
