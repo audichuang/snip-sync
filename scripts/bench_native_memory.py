@@ -1622,7 +1622,10 @@ def scroll_into_view(
         cx = win["x"] + viewport[0] + viewport[2] // 2
         cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
         s.x("xdotool", "mousemove", str(cx), str(cy), "click", "5" if direction > 0 else "4")
-        s.wait_line(lambda line: "id=left-list " in line or f"id={control} " in line, start=before, timeout=5)
+        try:
+            s.wait_line(lambda line: "id=left-list " in line or f"id={control} " in line, start=before, timeout=5)
+        except NativeBenchError:
+            pass  # a wheel event can be dropped; the next step sends another
         steps += 1
         time.sleep(0.03)
     raise NativeBenchError(f"required control {control} not settled inside left-list after {steps} wheel steps")

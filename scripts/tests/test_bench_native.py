@@ -1196,6 +1196,37 @@ class TestScrollSettlesAfterReflow(unittest.TestCase):
         self.assertEqual(box, (10, 211, 200, 24))
 
 
+    def test_scroll_into_view_resends_a_dropped_wheel(self) -> None:
+        class Dropped:
+            def __init__(self) -> None:
+                self.lines: list[str] = []
+                self.wheels = 0
+
+            def texts(self, start: int = 0) -> list[str]:
+                rows = ["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=300 h=400]"]
+                if self.wheels >= 2:
+                    rows.append("[APP:CTRL_BOUNDS: id=tree-row:src x=10 y=200 w=200 h=24]")
+                return rows
+
+            def wait_line(self, pred: Any, start: int = 0, timeout: float = 10) -> tuple[int, float, str]:
+                # The pre-scroll paint wait (0.5s) and the first wheel get no reaction.
+                if timeout < 1 or self.wheels == 1:
+                    raise NativeBenchError("timed out waiting for app log line")
+                return 0, 0.0, "id=left-list x=0"
+
+            def focus(self, wid: str) -> None:
+                return None
+
+            def x(self, *args: str, timeout: float = 20) -> str:
+                self.wheels += 1
+                return ""
+
+        session = Dropped()
+        box = scroll_into_view(session, {"wid": "1", "x": 0, "y": 0, "width": 800, "height": 600}, "tree-row:src", settle_seconds=0.05)
+        self.assertEqual(box, (10, 200, 200, 24))
+        self.assertEqual(session.wheels, 2)
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
