@@ -41,6 +41,10 @@ pub const LEFT_W_DEFAULT: f32 = 280.0;
 pub const LEFT_W_MIN: f32 = 160.0;
 pub const BOTTOM_H_DEFAULT: f32 = 230.0;
 pub const BOTTOM_H_MIN: f32 = 100.0;
+// Log tool window (IJ-2a).
+pub const LOG_DETAILS_W_DEFAULT: f32 = 280.0;
+pub const LOG_DETAILS_W_MIN: f32 = 180.0;
+pub const LOG_BRANCHES_W: f32 = 200.0;
 
 /// UI font, embedded and registered at startup (see [`register_fonts`]).
 pub const UI_FONT: &str = "Inter";
@@ -124,6 +128,11 @@ pub struct Palette {
 	// Icons.
 	pub folder: u32,
 	pub file: u32,
+	// Log tool window (IJ-2a).
+	/// Rows reachable from HEAD (`VersionControl.Log.Commit.currentBranchBackground`).
+	pub log_current_branch_bg: u32,
+	/// Ref label text (`VersionControl.Log.Commit.Reference.foreground`).
+	pub log_ref_text: u32,
 }
 
 /// Islands Dark.
@@ -190,6 +199,8 @@ pub static DARK: Palette = Palette {
 	diff_hunk_text: 0x6f737a,  // WHITESPACES
 	folder: 0xced0d6,          // New UI dark icon ink
 	file: 0x9fa2a8,            // text-muted
+	log_current_branch_bg: 0x1d2336,
+	log_ref_text: 0x6f737a,
 };
 
 /// Islands Light.
@@ -256,6 +267,8 @@ pub static LIGHT: Palette = Palette {
 	diff_hunk_text: 0x8c8c8c,  // DEFAULT_LINE_COMMENT
 	folder: 0x6c707e,          // New UI light icon ink
 	file: 0x818594,            // unmatchedForeground
+	log_current_branch_bg: 0xedf3ff,
+	log_ref_text: 0x6c707e,
 };
 
 static LIGHT_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -393,6 +406,12 @@ mod tests {
 			("diff_hunk_text", d.diff_hunk_text, l.diff_hunk_text),
 			("folder", d.folder, l.folder),
 			("file", d.file, l.file),
+			(
+				"log_current_branch_bg",
+				d.log_current_branch_bg,
+				l.log_current_branch_bg,
+			),
+			("log_ref_text", d.log_ref_text, l.log_ref_text),
 		];
 		for (name, dark, light) in pairs {
 			assert_ne!(

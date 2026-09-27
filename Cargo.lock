@@ -6837,6 +6837,7 @@ name = "snip-desktop-native"
 version = "0.2.0"
 dependencies = [
  "arboard",
+ "chrono",
  "dunce",
  "gpui",
  "regex",

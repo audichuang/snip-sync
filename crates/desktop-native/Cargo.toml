@@ -13,6 +13,8 @@ arboard = "3"
 dunce = "1"
 regex = "1"
 unicode-segmentation = "1"
+# Viewer-local dates in the log (already in the workspace lock).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { version = "3", features = ["wayland-data-control"] }
