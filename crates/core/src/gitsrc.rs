@@ -1975,6 +1975,21 @@ mod tests {
 		// The listing agrees on the label.
 		let listed = list_changed_paths(&g, &rename).unwrap();
 		assert_eq!(listed, [("new.txt".to_string(), Some(Moved))]);
+		// Staged content is the index entry, not the disk.
+		r.write("new.txt", b"staged\n");
+		r.git(&["add", "new.txt"]);
+		r.write("new.txt", b"disk\n");
+		let got = read_changed_file_for(
+			&g,
+			&GitSource::Staged,
+			"new.txt",
+			Modified,
+			None,
+			1024,
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(got, file("new.txt", "staged\n", Modified));
 		// Staged and working deletions read HEAD.
 		r.git(&["rm", "-q", "base.txt"]);
 		for source in [GitSource::Staged, GitSource::Working] {
