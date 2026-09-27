@@ -661,6 +661,8 @@ pub struct WorkbenchModel {
 	/// The filter bar as edited; `log_search` is what the log shows.
 	pub log_filter: LogQuery,
 	pub log_menu: Option<ui::LogMenu>,
+	/// The menu a mouse-down outside it just closed, and when.
+	pub log_menu_dismissed: Option<(ui::LogMenu, std::time::Instant)>,
 	pub log_path_input: Entity<TextInput>,
 	pub branch_filter_input: Entity<TextInput>,
 	/// Collapsed groups of the branches pane ("refs_local", …).
@@ -984,6 +986,7 @@ impl WorkbenchModel {
 			log_on_head: Vec::new(),
 			log_filter: LogQuery::default(),
 			log_menu: None,
+			log_menu_dismissed: None,
 			log_path_input,
 			branch_filter_input,
 			branch_groups_collapsed: Vec::new(),

@@ -1597,6 +1597,12 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// Keymap alias of [`Self::history_next_page`] ("load more").
+	#[allow(dead_code)] // bound by the chrome keymap at merge
+	pub fn history_load_more(&mut self, cx: &mut Context<Self>) {
+		self.history_next_page(cx);
+	}
+
 	/// Loads the page after the window (scrolling near the end does this).
 	pub fn history_next_page(&mut self, cx: &mut Context<Self>) {
 		if self.history_has_more && !self.history_extending {
@@ -1793,13 +1799,28 @@ impl WorkbenchModel {
 		menu: crate::ui::LogMenu,
 		cx: &mut Context<Self>,
 	) {
+		// The click that dismissed this menu (mouse down outside it) lands on
+		// its own chip: that click closes, it does not reopen.
+		// ponytail: time window, not hit testing; a >400ms press reopens.
+		if let Some((m, at)) = self.log_menu_dismissed.take() {
+			if m == menu && at.elapsed() < std::time::Duration::from_millis(400)
+			{
+				cx.notify();
+				return;
+			}
+		}
 		self.log_menu = (self.log_menu != Some(menu)).then_some(menu);
+		if self.log_menu == Some(crate::ui::LogMenu::Paths) {
+			self.pending_focus =
+				Some(self.log_path_input.read(cx).handle().clone());
+		}
 		app_log!("[APP:LOG_MENU: {:?}]", self.log_menu);
 		cx.notify();
 	}
 
 	pub fn close_log_menu(&mut self, cx: &mut Context<Self>) {
-		if self.log_menu.take().is_some() {
+		if let Some(menu) = self.log_menu.take() {
+			self.log_menu_dismissed = Some((menu, std::time::Instant::now()));
 			cx.notify();
 		}
 	}
