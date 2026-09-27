@@ -317,6 +317,26 @@ fn button(
 		.child(label.into())
 }
 
+/// A popup row styled like the context menu's items: no frame, hover fill.
+fn menu_row(id: impl Into<ElementId>, tab: isize) -> Stateful<Div> {
+	div()
+		.id(id)
+		.relative()
+		.flex()
+		.flex_row()
+		.items_center()
+		.gap(px(8.))
+		.min_h(px(ROW_H + 4.))
+		.px(px(8.))
+		.rounded(px(4.))
+		.border_1()
+		.border_color(transparent_black())
+		.cursor_pointer()
+		.tab_index(tab)
+		.hover(|s| s.bg(rgb(pal().selection_bg)))
+		.map(focus_ring)
+}
+
 /// Flexible text slot that ends in "…" when it does not fit.
 fn fill_text(text: impl Into<SharedString>) -> Div {
 	div()
@@ -1352,18 +1372,71 @@ impl WorkbenchModel {
 		} else {
 			t("workspace_none", loc).to_string()
 		};
+		let open = self.workspace_open;
+		let current = self.workspace_root.clone();
+		let recent: Vec<AnyElement> = self
+			.recent_workspaces
+			.iter()
+			.enumerate()
+			.map(|(ix, path)| {
+				let name = path
+					.file_name()
+					.map(|n| n.to_string_lossy().to_string())
+					.unwrap_or_else(|| path.display().to_string());
+				let is_current = open && *path == current;
+				let target = path.clone();
+				menu_row(
+					SharedString::from(format!("workspace-recent:{ix}")),
+					70 + ix as isize,
+				)
+				.h(px(38.))
+				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
+				.on_click(cx.listener(move |this, _, _, cx| {
+					this.workspace_menu = false;
+					this.open_workspace_path(target.clone(), cx);
+				}))
+				.child(div().flex_shrink_0().child(icon(Icon::Folder, 16.)))
+				.child(
+					div()
+						.flex()
+						.flex_col()
+						.min_w_0()
+						.child(
+							div()
+								.font_weight(FontWeight::SEMIBOLD)
+								.child(clip_text(name)),
+						)
+						.child(
+							div()
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(clip_text(crate::recent::tilde(path))),
+						),
+				)
+				.children(probe(log, format!("workspace-recent:{ix}")))
+				.into_any_element()
+			})
+			.collect();
+		let sep = || {
+			div()
+				.h(px(1.))
+				.mx(px(8.))
+				.my(px(4.))
+				.bg(rgb(pal().popup_border))
+		};
 		let panel = div()
 			.id("workspace-menu")
 			.occlude()
-			.w(px(300.))
+			.w(px(340.))
 			.flex()
 			.flex_col()
-			.gap(px(6.))
-			.p(px(6.))
-			.bg(rgb(pal().panel_bg))
+			.p(px(4.))
+			.text_size(px(UI_TEXT))
+			.text_color(rgb(pal().text))
+			.bg(rgb(pal().popup_bg))
 			.border_1()
-			.border_color(rgb(pal().button_border))
-			.rounded(px(6.))
+			.border_color(rgb(pal().popup_border))
+			.rounded(px(8.))
 			.shadow_lg()
 			.on_mouse_down_out(cx.listener(|this, _, _, cx| {
 				this.workspace_menu = false;
@@ -1371,63 +1444,97 @@ impl WorkbenchModel {
 				cx.notify();
 			}))
 			.child(
-				button(
-					"btn-close-workspace",
-					t("workspace_close", loc),
-					Btn::Default,
-					true,
-					61,
-				)
-				.on_click(cx.listener(|this, _, _, cx| {
-					this.workspace_menu = false;
-					this.request_user_close(
-						crate::lifecycle::Intent::CloseWorkspace,
-						cx,
-					);
-				}))
-				.children(probe(log, "btn-close-workspace")),
+				menu_row("btn-open-folder", 60)
+					.on_click(cx.listener(|this, _, _, cx| {
+						this.open_folder_dialog(cx);
+					}))
+					.child(icon(Icon::Folder, 16.))
+					.child(fill_text(t("workspace_open_folder", loc)))
+					.child(div().text_color(rgb(pal().text_muted)).child(
+						if cfg!(target_os = "macos") {
+							"⇧⌘O"
+						} else {
+							"Ctrl+Shift+O"
+						},
+					))
+					.children(probe(log, "btn-open-folder")),
 			)
 			.child(
-				button(
-					"btn-open-workspace",
-					t("workspace_open", loc),
-					Btn::Default,
-					true,
-					62,
-				)
-				.on_click(cx.listener(|this, _, _, cx| {
-					this.show_workspace_picker(cx);
-				}))
-				.children(probe(log, "btn-open-workspace")),
+				menu_row("btn-open-workspace", 62)
+					.on_click(cx.listener(|this, _, _, cx| {
+						this.show_workspace_picker(cx);
+					}))
+					.child(div().w(px(16.)))
+					.child(fill_text(t("workspace_open", loc)))
+					.children(probe(log, "btn-open-workspace")),
 			)
 			.when(self.workspace_picker, |d| {
 				d.child(
 					div()
-						.id("workspace-path-input")
-						.relative()
-						.child(self.workspace_path_input.clone())
-						.children(probe(log, "workspace-path-input")),
+						.flex()
+						.flex_row()
+						.gap(px(6.))
+						.px(px(8.))
+						.py(px(4.))
+						.child(
+							div()
+								.id("workspace-path-input")
+								.relative()
+								.flex_1()
+								.min_w_0()
+								.child(self.workspace_path_input.clone())
+								.children(probe(log, "workspace-path-input")),
+						)
+						.child(
+							button(
+								"btn-workspace-open-confirm",
+								t("workspace_open_confirm", loc),
+								Btn::Primary,
+								true,
+								63,
+							)
+							.on_click(cx.listener(|this, _, _, cx| {
+								let text = this
+									.workspace_path_input
+									.read(cx)
+									.text()
+									.trim()
+									.to_string();
+								this.confirm_open_workspace(&text, cx);
+							}))
+							.children(probe(log, "btn-workspace-open-confirm")),
+						),
 				)
-				.child(
-					button(
-						"btn-workspace-open-confirm",
-						t("workspace_open_confirm", loc),
-						Btn::Primary,
-						true,
-						63,
+			})
+			.when(!recent.is_empty(), |d| {
+				d.child(sep())
+					.child(
+						div()
+							.px(px(8.))
+							.py(px(2.))
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().text_muted))
+							.child(t("workspace_recent", loc)),
 					)
-					.on_click(cx.listener(|this, _, _, cx| {
-						let text = this
-							.workspace_path_input
-							.read(cx)
-							.text()
-							.trim()
-							.to_string();
-						this.confirm_open_workspace(&text, cx);
-					}))
-					.children(probe(log, "btn-workspace-open-confirm")),
-				)
-			});
+					.children(recent)
+			})
+			.child(sep())
+			.child(
+				menu_row("btn-close-workspace", 61)
+					.when(!open, |d| d.text_color(rgb(pal().text_disabled)))
+					.when(open, |d| {
+						d.on_click(cx.listener(|this, _, _, cx| {
+							this.workspace_menu = false;
+							this.request_user_close(
+								crate::lifecycle::Intent::CloseWorkspace,
+								cx,
+							);
+						}))
+					})
+					.child(div().w(px(16.)))
+					.child(fill_text(t("workspace_close", loc)))
+					.children(probe(log, "btn-close-workspace")),
+			);
 		div()
 			.relative()
 			.flex_shrink_0()
@@ -1467,7 +1574,7 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
-	fn render_workspace_closed(&self) -> AnyElement {
+	fn render_workspace_closed(&self, cx: &mut Context<Self>) -> AnyElement {
 		let loc = self.locale;
 		div()
 			.id("workspace-closed")
@@ -1481,10 +1588,33 @@ impl WorkbenchModel {
 			.rounded(px(ISLAND_RADIUS))
 			.child(
 				div()
-					.max_w(px(420.))
+					.flex()
+					.flex_col()
+					.items_center()
+					.gap(px(12.))
+					.max_w(px(520.))
 					.px(px(16.))
-					.text_color(rgb(pal().text_muted))
-					.child(t("workspace_closed", loc)),
+					.child(
+						div()
+							.text_color(rgb(pal().text_muted))
+							.child(t("workspace_closed", loc)),
+					)
+					.child(
+						button(
+							"btn-welcome-open-folder",
+							t("workspace_open_folder", loc),
+							Btn::Primary,
+							true,
+							64,
+						)
+						.on_click(cx.listener(|this, _, _, cx| {
+							this.open_folder_dialog(cx);
+						}))
+						.children(probe(
+							&self.probes,
+							"btn-welcome-open-folder",
+						)),
+					),
 			)
 			.children(probe(&self.probes, "workspace-closed"))
 			.into_any_element()
@@ -6501,7 +6631,7 @@ impl Render for WorkbenchModel {
 		let bottom_h = self.effective_bottom_h(vh);
 
 		let center = if !self.workspace_open && self.paste_preview.is_none() {
-			self.render_workspace_closed()
+			self.render_workspace_closed(cx)
 		} else {
 			match self.paste_preview {
 				Some(ref plan) => self.render_paste(plan, cx),
@@ -6523,7 +6653,7 @@ impl Render for WorkbenchModel {
 				);
 			}))
 			.on_action(cx.listener(|this, _: &OpenWorkspace, _, cx| {
-				this.show_workspace_picker(cx);
+				this.open_folder_dialog(cx);
 			}))
 			.on_action(cx.listener(|this, _: &CopySelection, _, cx| {
 				this.copy_selection_to_clipboard(cx)

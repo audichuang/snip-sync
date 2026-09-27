@@ -1,5 +1,28 @@
 # Native workbench — supervisor checkpoint
 
+## 2026-09-28 v0.3.0：原生工作臺取代 Tauri 成為正式桌面版
+
+使用者要求 0.3.0 以 GPUI 原生版取代 Tauri，並「全部做完才發」：五項深度審查的所有發現、IntelliJ 對照的 26 項缺口，以及 P5 發布管線。以下 PR 均經 `just preflight`（含 native-acceptance：IME、協作 18 案、workload／resource 短測）與完整 CI 後 squash 進 `develop`。
+
+| PR | 內容 |
+| --- | --- |
+| #23 | core：hooks 走 `core.hooksPath`、`--no-show-signature`、`--no-optional-locks`、commit 重播／匯出正確性，減少 Git 子程序 |
+| #24 | 儲存庫選取、選取籃與重新整理的狀態錯誤；移除 UI 執行緒上的平方成本 |
+| #25 | 分支圖依 rail 折線繪製；ref、編碼、分頁與上限造成的整頁失敗 |
+| #26 | vendor gpui：X 連線中斷時結束事件迴圈（見 `vendor/gpui/SNIP_PATCH.md`） |
+| #27 | 發布改為 CI 驗收過的原生桌面版：雜湊綁定、草稿後原子發布、Inno Setup 安裝檔（偵測舊 Tauri 版）、macOS ad-hoc 簽章 |
+| #28–#29 | IntelliJ Islands Dark／Light 色票、內嵌 Inter／JetBrains Mono、expui SVG 圖示與第三方授權 |
+| #30 | 右鍵選單、快捷鍵、速搜、工具列與分支彈窗 |
+| #31 | 差異檢視（摺疊、字詞差異、並排緞帶）、編輯器分頁、Apply Patch 式貼上預覽 |
+| #32 | Git 記錄：`LogQuery` 篩選、IntelliJ 樣式分支圖、分支／詳細資料窗格、捲動分頁 |
+
+多 repo 資料夾（例如內含 15 個獨立 repo 的上層目錄）由原生版的工作區探索處理；Tauri 版的「is not inside a git repository」限制不再適用於正式版。
+
+**已知且接受的限制**（非 bug，未列入本版）：Log 的文字／作者／日期篩選不會跨過被略過的 commit 串接分支線；無檔案歷史；Log 的 commit 無法加入選取籃（core 不支援）；只有一個編輯器分頁群組，「關閉其他」維持停用；Linux 版需 glibc 2.39+。commit 模式不保留檔案權限位元，見 porting-notes。
+
+**發版前仍待**：使用者在 Mac（15 repo 資料夾、複製／貼上、IME）與 Windows（安裝檔、舊 Tauri 版解除安裝提示）實機驗收候選包；發現的問題修正後才執行 `just release 0.3.0`。
+
+
 ## 2026-09-27 發布範圍凍結（準備 v0.2.0）
 
 使用者要求停止擴張功能，準備推送與發布。此指示取代繼續逐項完成 D3–D5 後才開始交付的排程；尚未完成的原生驗收仍如實列出，不視為通過。預備方案為既有桌面版／CLI 正式更新，另附原生工作臺候選包，不切換 Homebrew cask。最後狀態以實際 PR、CI 與 release 收據為準。

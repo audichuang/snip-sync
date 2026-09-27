@@ -2072,6 +2072,10 @@ fn native_graph_failed_next_page_is_transactional() {
 					})
 			});
 			if stable && presented && settled {
+				// Inset 1px top and bottom: the edge pixel rows blend with the
+				// neighbouring row at a fractional scroll offset, while the
+				// text and every rail crossing the row stay inside.
+				let (y, h) = (y + 1, h - 2);
 				assert!(Command::new("convert")
 					.arg(&image)
 					.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
