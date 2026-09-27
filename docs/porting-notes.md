@@ -66,6 +66,9 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   沒有 checkout 的 submodule 沒有 `.git`,探索看不到,要用 `declared_submodules` 從 `.gitmodules` 列出。
 - 桌面預覽(`browser::git_preview`)的內容與 patch 都是嚴格的:超過 1 MiB 就報錯,因為現有 UI 無法表達「已截斷」。
   可截斷的版本是 `git_preview_with` + `RunOptions::preview`:只保留完整的 hunk,每個 hunk header 的行數與內容一致;新檔案合成的 patch 同樣只保留完整的行。
+  `list_changed_paths_with`／`read_changed_file_with` 把取消、逾時與 stdout 上限傳到內層 metadata、revision 與 cat-file；metadata 和完整檔案內容即使選用 Truncate 也拒絕殘缺結果。
+  明確 options API 保留 `Cancelled`／`Timeout`／`OutputLimit` 類別；舊 `git_preview` wrapper 保留原本的大檔提示。
+  cat-file 的非零退出以 `Failed` 回報真實 exit code 與最多 64 KiB stderr；正常退出但 protocol 不完整仍為 I/O 錯誤，EOF 但程序未退出仍受逾時／取消限制。清理失敗優先回報，不能偽裝為取消成功。
 - transfer 的刪除來源分開:`Working` 讀 `HEAD:<path>`(與 gitsrc / TS 的 SCM 行為一致)、`Unstaged` 讀 index(`:<path>`)、`Staged` 讀 `HEAD:<path>`。
   工作區的刪除會把「不存在」記入 freshness,寫剪貼簿前若路徑又出現就視為過期。
 - 瀏覽 commit 目錄(`browser::commit_directory`)、blob(`browser::commit_blob`)與作者歷史(`browser::history_by_author`):

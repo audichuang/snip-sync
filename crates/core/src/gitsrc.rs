@@ -119,13 +119,33 @@ fn is_quiet_miss(e: &GitError) -> bool {
 	matches!(e, GitError::Failed { code: Some(1), stderr, .. } if stderr.is_empty())
 }
 
-fn already_cancelled(opts: &RunOptions, args: &str) -> Result<(), GitError> {
+pub(crate) fn already_cancelled(
+	opts: &RunOptions,
+	args: &str,
+) -> Result<(), GitError> {
 	if opts.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
 		return Err(GitError::Cancelled {
 			args: args.to_string(),
 		});
 	}
 	Ok(())
+}
+
+/// Metadata cannot be interpreted from a truncated prefix, even when the
+/// same caller explicitly permits truncating a display-only patch.
+fn run_strict(
+	git: &Git,
+	args: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<u8>, GitError> {
+	let output = git.run_with(args, opts)?;
+	if output.truncated {
+		return Err(GitError::OutputLimit {
+			args: args.join(" "),
+			limit: opts.max_stdout,
+		});
+	}
+	Ok(output.stdout)
 }
 
 impl Git {
@@ -861,8 +881,8 @@ fn path_entry(status: u8, path: Vec<u8>) -> RawEntry {
 /// Unmerged paths from `git ls-files -u -z`, labelled like VS Code's merge
 /// changes: a conflict missing ours or theirs (UD, DU, DD) is `D`, every
 /// other kind (UU, AA, AU, UA) is `M`.
-fn unmerged(git: &Git) -> Result<Vec<RawEntry>, GitError> {
-	let out = git.run(&["ls-files", "-u", "-z"])?;
+fn unmerged(git: &Git, opts: &RunOptions) -> Result<Vec<RawEntry>, GitError> {
+	let out = run_strict(git, &["ls-files", "-u", "-z"], opts)?;
 	// Each record is `<mode> <oid> <stage>\t<path>`, one per stage.
 	let mut stages: Vec<(Vec<u8>, [bool; 3])> = Vec::new();
 	for rec in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
@@ -894,10 +914,14 @@ fn unmerged(git: &Git) -> Result<Vec<RawEntry>, GitError> {
 
 const RAW: [&str; 4] = ["-z", "--raw", "--no-abbrev", "-M"];
 
-fn diff(git: &Git, args: &[&str]) -> Result<Vec<RawEntry>, GitError> {
+fn diff(
+	git: &Git,
+	args: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<RawEntry>, GitError> {
 	let mut all = vec!["diff"];
 	all.extend_from_slice(args);
-	parse_raw_z(&git.run(&all)?)
+	parse_raw_z(&run_strict(git, &all, opts)?)
 }
 
 /// Collects the changed files of `source` as payload files.
@@ -923,11 +947,23 @@ pub fn list_changed_paths(
 	git: &Git,
 	source: &GitSource,
 ) -> Result<Vec<(String, Option<ChangeType>)>, GitError> {
-	Ok(collect_changes(git, source)?
+	list_changed_paths_with(git, source, &RunOptions::default())
+}
+
+/// [`list_changed_paths`] with cancellation, deadlines and strict metadata
+/// output limits propagated through every nested Git command.
+pub fn list_changed_paths_with(
+	git: &Git,
+	source: &GitSource,
+	opts: &RunOptions,
+) -> Result<Vec<(String, Option<ChangeType>)>, GitError> {
+	let paths = collect_changes(git, source, opts)?
 		.0
 		.into_iter()
 		.map(|c| (c.path, Some(change_type_for_status(c.status))))
-		.collect())
+		.collect();
+	already_cancelled(opts, "list changed paths")?;
+	Ok(paths)
 }
 
 /// Ordered change metadata without reading file contents, plus the number of
@@ -935,21 +971,28 @@ pub fn list_changed_paths(
 fn collect_changes(
 	git: &Git,
 	source: &GitSource,
+	opts: &RunOptions,
 ) -> Result<(Vec<Change>, usize), GitError> {
+	already_cancelled(opts, "collect changes")?;
 	let mut skipped = 0;
 	let mut changes = Vec::new();
 	match source {
 		GitSource::Working => {
 			// VS Code keeps conflicts out of the working and index lists and
 			// reports them as merge changes between untracked and index.
-			let conflicts = unmerged(git)?;
+			let conflicts = unmerged(git, opts)?;
 			let resolved =
 				|e: &RawEntry| !conflicts.iter().any(|c| c.path == e.path);
-			let worktree =
-				diff(git, &RAW)?.into_iter().filter(resolved).collect();
+			let worktree = diff(git, &RAW, opts)?
+				.into_iter()
+				.filter(resolved)
+				.collect();
 			union_into(&mut changes, worktree, &mut skipped);
-			let out =
-				git.run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+			let out = run_strict(
+				git,
+				&["ls-files", "--others", "--exclude-standard", "-z"],
+				opts,
+			)?;
 			let untracked = out
 				.split(|&b| b == 0)
 				// A trailing `/` is a nested repository, not a file.
@@ -961,8 +1004,10 @@ fn collect_changes(
 			union_into(&mut changes, merge, &mut skipped);
 			let mut cached = vec!["--cached"];
 			cached.extend_from_slice(&RAW);
-			let index =
-				diff(git, &cached)?.into_iter().filter(resolved).collect();
+			let index = diff(git, &cached, opts)?
+				.into_iter()
+				.filter(resolved)
+				.collect();
 			union_into(&mut changes, index, &mut skipped);
 			// TS reads every deletion at `HEAD:<path>`; an unborn HEAD is
 			// simply missing there, so the marker follows.
@@ -974,48 +1019,53 @@ fn collect_changes(
 			let mut cached = vec!["--cached"];
 			cached.extend_from_slice(&RAW);
 			// A conflict is a merge change, not an index change.
-			let index = diff(git, &cached)?
+			let index = diff(git, &cached, opts)?
 				.into_iter()
 				.filter(|e| e.status != b'U')
 				.collect();
 			union_into(&mut changes, index, &mut skipped);
 		}
 		GitSource::Commit(rev) => {
-			let sha = git.resolve_commit(rev)?;
-			let mut parents = git.parents(&sha)?;
+			let sha = git.resolve_commit_with(rev, opts)?;
+			let mut parents = git.parents_with(&sha, opts)?;
 			if parents.is_empty() {
 				// A shallow clone grafts its boundary commits to look
 				// parentless; diffing one against the empty tree would copy
 				// the whole repository as "this commit's change".
-				if git.is_shallow()? {
+				if git.is_shallow_with(opts)? {
 					return Err(GitError::Shallow(sha));
 				}
 				parents.push(EMPTY_TREE.to_string());
 			}
 			for parent in &parents {
-				let out = git.run(&[
-					"diff-tree",
-					"-r",
-					"-z",
-					"--raw",
-					"--no-abbrev",
-					"--no-commit-id",
-					"-M",
-					parent,
-					&sha,
-				])?;
+				let out = run_strict(
+					git,
+					&[
+						"diff-tree",
+						"-r",
+						"-z",
+						"--raw",
+						"--no-abbrev",
+						"--no-commit-id",
+						"-M",
+						parent,
+						&sha,
+					],
+					opts,
+				)?;
 				union_into(&mut changes, parse_raw_z(&out)?, &mut skipped);
 			}
 		}
 		GitSource::Range(from, to) => {
-			let from = git.resolve_commit(from)?;
-			let to = git.resolve_commit(to)?;
+			let from = git.resolve_commit_with(from, opts)?;
+			let to = git.resolve_commit_with(to, opts)?;
 			let mut args = RAW.to_vec();
 			args.extend([from.as_str(), to.as_str()]);
-			union_into(&mut changes, diff(git, &args)?, &mut skipped);
+			union_into(&mut changes, diff(git, &args, opts)?, &mut skipped);
 		}
 	}
 
+	already_cancelled(opts, "collect changes")?;
 	Ok((changes, skipped))
 }
 
@@ -1023,8 +1073,9 @@ fn collect_raw(
 	git: &Git,
 	source: &GitSource,
 ) -> Result<(Vec<PayloadFile>, usize), GitError> {
-	let (changes, skipped) = collect_changes(git, source)?;
-	Ok((read_changes(git, source, changes, None)?, skipped))
+	let opts = RunOptions::default();
+	let (changes, skipped) = collect_changes(git, source, &opts)?;
+	Ok((read_changes(git, source, changes, None, &opts)?, skipped))
 }
 
 /// Read only the clicked path; listing a large repository never reads blobs.
@@ -1038,12 +1089,43 @@ pub fn read_changed_file(
 	path: &str,
 	max: u64,
 ) -> Result<Option<PayloadFile>, GitError> {
-	let (changes, _) = collect_changes(git, source)?;
+	read_changed_file_inner(git, source, path, max, &RunOptions::default())
+}
+
+/// [`read_changed_file`] with explicit runner options through membership,
+/// revision resolution, deleted-content lookup and blob reads. Both metadata
+/// and content are strict even with [`crate::gitrun::Overflow::Truncate`].
+/// Content is capped at the smaller of `max` and `opts.max_stdout`.
+pub fn read_changed_file_with(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+	max: u64,
+	opts: &RunOptions,
+) -> Result<Option<PayloadFile>, GitError> {
+	read_changed_file_inner(
+		git,
+		source,
+		path,
+		max.min(opts.max_stdout as u64),
+		opts,
+	)
+}
+
+fn read_changed_file_inner(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+	max: u64,
+	opts: &RunOptions,
+) -> Result<Option<PayloadFile>, GitError> {
+	let (changes, _) = collect_changes(git, source, opts)?;
 	Ok(read_changes(
 		git,
 		source,
 		changes.into_iter().filter(|c| c.path == path).collect(),
 		Some(max),
+		opts,
 	)?
 	.pop())
 }
@@ -1076,10 +1158,13 @@ fn read_changes(
 	source: &GitSource,
 	changes: Vec<Change>,
 	max: Option<u64>,
+	opts: &RunOptions,
 ) -> Result<Vec<PayloadFile>, GitError> {
-	let mut cat = git.cat_file()?;
+	already_cancelled(opts, "read changes")?;
+	let mut cat = git.cat_file_with(opts.clone())?;
 	let mut files = Vec::new();
 	for c in changes {
+		already_cancelled(opts, "read changed file")?;
 		let change_type = change_type_for_status(c.status);
 		let content = if change_type == ChangeType::Deleted {
 			Some(deleted_content(&mut cat, &c.deleted_from, max)?)
@@ -1100,6 +1185,7 @@ fn read_changes(
 				_ => read_text(&mut cat, &c.new_oid, max)?,
 			}
 		};
+		already_cancelled(opts, "read changed file")?;
 		files.push(PayloadFile {
 			path: c.path,
 			content,
@@ -1108,6 +1194,7 @@ fn read_changes(
 		});
 	}
 	cat.close()?;
+	already_cancelled(opts, "read changes")?;
 	Ok(files)
 }
 

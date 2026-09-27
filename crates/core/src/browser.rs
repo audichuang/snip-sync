@@ -586,7 +586,13 @@ pub fn git_preview(
 		overflow: Overflow::Error,
 		..RunOptions::default()
 	};
-	let p = git_preview_with(git, source, path, &opts)?;
+	let p =
+		git_preview_with(git, source, path, &opts).map_err(
+			|error| match error {
+				GitError::OutputLimit { .. } => too_large(),
+				other => other,
+			},
+		)?;
 	Ok(SourcePreview {
 		content: p.content,
 		patch: p.patch,
@@ -610,12 +616,11 @@ pub fn git_preview_with(
 		inside(git.root(), path)?;
 	}
 	// Content is strict: a partial file would read as the whole file.
-	let file = match gitsrc::read_changed_file(git, source, path, max as u64) {
-		Err(GitError::OutputLimit { .. }) => return Err(too_large()),
-		other => other?.ok_or_else(|| {
-			GitError::Malformed("Path is not in this Git source".into())
-		})?,
-	};
+	let file =
+		gitsrc::read_changed_file_with(git, source, path, max as u64, opts)?
+			.ok_or_else(|| {
+				GitError::Malformed("Path is not in this Git source".into())
+			})?;
 	let mut args = vec![
 		"diff".to_string(),
 		"--no-ext-diff".into(),
@@ -624,13 +629,13 @@ pub fn git_preview_with(
 	];
 	match source {
 		GitSource::Working => {
-			args.push(git.head()?.unwrap_or_else(|| EMPTY_TREE.into()))
+			args.push(git.head_with(opts)?.unwrap_or_else(|| EMPTY_TREE.into()))
 		}
 		GitSource::Staged => args.push("--cached".into()),
 		GitSource::Commit(rev) => {
-			let sha = git.resolve_commit(rev)?;
+			let sha = git.resolve_commit_with(rev, opts)?;
 			args.push(
-				git.parents(&sha)?
+				git.parents_with(&sha, opts)?
 					.into_iter()
 					.next()
 					.unwrap_or_else(|| EMPTY_TREE.into()),
@@ -638,17 +643,13 @@ pub fn git_preview_with(
 			args.push(sha);
 		}
 		GitSource::Range(base, tip) => {
-			args.push(git.resolve_commit(base)?);
-			args.push(git.resolve_commit(tip)?);
+			args.push(git.resolve_commit_with(base, opts)?);
+			args.push(git.resolve_commit_with(tip, opts)?);
 		}
 	}
 	args.extend(["--".into(), format!(":(literal){path}")]);
-	let diff = match git
-		.run_with(&args.iter().map(String::as_str).collect::<Vec<_>>(), opts)
-	{
-		Err(GitError::OutputLimit { .. }) => return Err(too_large()),
-		other => other?,
-	};
+	let diff = git
+		.run_with(&args.iter().map(String::as_str).collect::<Vec<_>>(), opts)?;
 	let (mut patch, mut patch_truncated) = if diff.truncated {
 		(whole_hunks(diff.stdout), true)
 	} else {
@@ -660,11 +661,15 @@ pub fn git_preview_with(
 		if let Some(content) = &file.content {
 			let (synth, cut) = new_file_patch(path, content, max);
 			if cut && opts.overflow == Overflow::Error {
-				return Err(too_large());
+				return Err(GitError::OutputLimit {
+					args: format!("preview patch {path}"),
+					limit: max,
+				});
 			}
 			(patch, patch_truncated) = (synth.into_bytes(), cut);
 		}
 	}
+	gitsrc::already_cancelled(opts, "Git preview")?;
 	Ok(GitPreview {
 		content: file.content,
 		// Cut at a line start, so only an invalid byte in the file itself

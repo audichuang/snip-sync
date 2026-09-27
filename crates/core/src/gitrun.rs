@@ -1508,9 +1508,20 @@ fn pump(
 	proc: &mut ManagedChild,
 	opts: &RunOptions,
 ) -> Result<Finished, GitError> {
-	let deadline = Instant::now() + opts.timeout;
+	pump_until(proc, opts, Instant::now() + opts.timeout, true, Vec::new())
+}
+
+/// The same observed-exit/pipe-drain path for commands and batch sessions.
+/// A session has already consumed its protocol output; its tail is discarded
+/// while previously collected stderr is retained under the same fixed cap.
+fn pump_until(
+	proc: &mut ManagedChild,
+	opts: &RunOptions,
+	deadline: Instant,
+	retain_stdout: bool,
+	mut stderr: Vec<u8>,
+) -> Result<Finished, GitError> {
 	let mut stdout = Vec::new();
-	let mut stderr = Vec::new();
 	let mut leftovers_killed = false;
 	loop {
 		let exited = proc.poll_exit()?;
@@ -1527,7 +1538,7 @@ fn pump(
 			})?;
 		}
 		match proc.next_event(deadline, opts)? {
-			Event::Data(STDOUT, chunk) => {
+			Event::Data(STDOUT, chunk) if retain_stdout => {
 				if stdout.len() + chunk.len() > opts.max_stdout {
 					proc.finish()?;
 					if opts.overflow == Overflow::Error {
@@ -1547,6 +1558,7 @@ fn pump(
 				}
 				stdout.extend_from_slice(&chunk);
 			}
+			Event::Data(STDOUT, _) => {}
 			Event::Data(_, chunk) => {
 				let room = STDERR_CAP.saturating_sub(stderr.len());
 				stderr.extend_from_slice(&chunk[..room.min(chunk.len())]);
@@ -1581,6 +1593,7 @@ pub(crate) struct Session {
 	deadline: Instant,
 	stdin: Option<ChildStdin>,
 	stdout_eof: bool,
+	stderr: Vec<u8>,
 }
 
 impl Session {
@@ -1599,6 +1612,7 @@ impl Session {
 			pos: 0,
 			stdin,
 			stdout_eof: false,
+			stderr: Vec::new(),
 		})
 	}
 
@@ -1609,37 +1623,71 @@ impl Session {
 	}
 
 	/// Maps an io error raised by this reader back to the Git error.
-	pub(crate) fn error(&self, e: io::Error) -> GitError {
+	pub(crate) fn error(&mut self, e: io::Error) -> GitError {
+		// BufRead must return io::Error. Keep cleanup failures carried through
+		// it ahead of cancellation, rather than replacing them with Cancelled.
+		if e.get_ref().is_some_and(|cause| cause.is::<GitError>()) {
+			return *e.into_inner().unwrap().downcast::<GitError>().unwrap();
+		}
 		// Checked first: a cancelled read is reported as `Other` so std::io
 		// does not retry it, and cleanup may already have dropped the child.
-		if self.opts.cancelled() {
-			return GitError::Cancelled {
+		let error = if self.opts.cancelled() {
+			GitError::Cancelled {
 				args: self.proc.args.clone(),
-			};
-		}
-		match e.kind() {
-			io::ErrorKind::TimedOut => GitError::Timeout {
+			}
+		} else {
+			match e.kind() {
+				io::ErrorKind::TimedOut => GitError::Timeout {
+					args: self.proc.args.clone(),
+					secs: self.opts.timeout.as_secs(),
+				},
+				io::ErrorKind::Interrupted => GitError::Cancelled {
+					args: self.proc.args.clone(),
+				},
+				io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe => {
+					// EOF is not evidence of an exit code. Wait under the current
+					// request deadline; a still-live child can only time out/cancel.
+					return match self.finish(self.deadline) {
+						Err(error) => error,
+						Ok(()) => GitError::Io(e),
+					};
+				}
+				_ => GitError::Io(e),
+			}
+		};
+		self.proc.finish().err().unwrap_or(error)
+	}
+
+	fn finish(&mut self, deadline: Instant) -> Result<(), GitError> {
+		self.stdin = None;
+		let result = pump_until(
+			&mut self.proc,
+			&self.opts,
+			deadline,
+			false,
+			std::mem::take(&mut self.stderr),
+		);
+		// Idempotent after the pump's successful cleanup. On other errors,
+		// explicitly report cleanup failure instead of losing it in Drop.
+		self.proc.finish()?;
+		let done = result?;
+		match done.status {
+			Some(status) if !status.success() => Err(GitError::Failed {
 				args: self.proc.args.clone(),
-				secs: self.opts.timeout.as_secs(),
-			},
-			io::ErrorKind::Interrupted => GitError::Cancelled {
-				args: self.proc.args.clone(),
-			},
-			_ => GitError::Io(e),
+				stderr: String::from_utf8_lossy(&done.stderr)
+					.trim()
+					.to_string(),
+				code: status.code(),
+			}),
+			_ => Ok(()),
 		}
 	}
 
 	/// Ends the session: closes stdin so the process exits, then cleans up
 	/// the tree. Reports cleanup failures; dropping instead kills silently.
 	pub(crate) fn close(mut self) -> Result<(), GitError> {
-		self.stdin = None;
 		let deadline = Instant::now() + self.opts.timeout;
-		// Past the deadline `next_event` kills the tree and reports it.
-		while !self.proc.poll_exit()? {
-			self.proc.next_event(deadline, &self.opts)?;
-		}
-		self.proc.finish()?;
-		Ok(())
+		self.finish(deadline)
 	}
 }
 
@@ -1665,7 +1713,7 @@ impl BufRead for Session {
 			if self.opts.cancelled() {
 				// Reap before returning. Drop would also finish, but only if
 				// this error is allowed to propagate; Interrupted would not.
-				let _ = self.proc.finish();
+				self.proc.finish().map_err(io::Error::other)?;
 				return Err(io::Error::other("cancelled"));
 			}
 			let now = Instant::now();
@@ -1678,9 +1726,12 @@ impl BufRead for Session {
 					self.pos = 0;
 				}
 				Event::Eof(STDOUT) => self.stdout_eof = true,
-				// stderr is not part of the protocol; its pipe just has to
-				// keep draining so the process never blocks on it.
-				Event::Data(..) | Event::Eof(_) | Event::Idle => {}
+				Event::Data(_, chunk) => {
+					let room = STDERR_CAP.saturating_sub(self.stderr.len());
+					self.stderr
+						.extend_from_slice(&chunk[..room.min(chunk.len())]);
+				}
+				Event::Eof(_) | Event::Idle => {}
 			}
 		}
 		Ok(&self.buf[self.pos..])
@@ -1798,6 +1849,43 @@ mod tests {
 			"--nocapture",
 		]);
 		cmd
+	}
+
+	#[test]
+	fn session_cleanup_failure_is_not_reported_as_cancelled() {
+		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let status = Command::new(std::env::current_exe().unwrap())
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args(["--exact", "gitrun::tests::session_cleanup_failure_is_not_reported_as_cancelled", "--nocapture"])
+				.status().unwrap();
+			assert!(status.success());
+			return;
+		}
+		let cancel = CancelToken::new();
+		let opts = RunOptions {
+			cancel: Some(cancel.clone()),
+			..RunOptions::default()
+		};
+		let mut session = Session::spawn(
+			test_long_running_command(),
+			"session cleanup",
+			opts,
+		)
+		.unwrap();
+		let _inj = InjectionGuard;
+		test_inject_kill_tree_failure(true);
+		cancel.cancel();
+		let io_error = session.read(&mut [0u8; 1]).unwrap_err();
+		let error = session.error(io_error);
+		assert!(matches!(error, GitError::Cleanup { .. }), "{error}");
+		assert!(
+			session.proc.status.is_some(),
+			"fallback must reap owned root"
+		);
+		test_inject_kill_tree_failure(false);
+		drop(session);
+		assert_eq!(leaked_slots(), 1, "unconfirmed tree must keep its permit");
 	}
 
 	#[test]
