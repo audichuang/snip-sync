@@ -2475,12 +2475,14 @@ impl WorkbenchModel {
 		self.changes_loaded = false;
 		self.commit_page = 0;
 		self.page_checkpoints = vec![None];
-		self.active_ref_filter = None;
-		self.log_search = None;
 		self.collapsed_merges.clear();
 		self.hidden_commits.clear();
 		self.history_error = None;
 		if !preserve_anchors {
+			// A reload of the same repo keeps the log's branch filter and
+			// search, which the history reload applies again.
+			self.active_ref_filter = None;
+			self.log_search = None;
 			self.clear_preview();
 			self.preview_error = None;
 			self.rev_tree = None;
