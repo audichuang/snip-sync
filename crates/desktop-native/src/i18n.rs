@@ -167,6 +167,41 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"col_author" => "作者",
 			"col_date" => "日期",
 			"col_hash" => "雜湊",
+			// log pane (IJ-2a)
+			"log_chip_branch" => "分支",
+			"log_chip_user" => "使用者",
+			"log_chip_date" => "日期",
+			"log_chip_paths" => "路徑",
+			"log_user_me" => "我",
+			"log_date_1d" => "過去 24 小時",
+			"log_date_7d" => "過去 7 天",
+			"log_date_30d" => "過去 30 天",
+			"log_date_1y" => "過去 1 年",
+			"log_paths_placeholder" => "路徑，例如 src/app",
+			"log_paths_hint" => "按 Enter 套用；清空後按 Enter 取消篩選",
+			"log_branch_placeholder" => "分支或標籤",
+			"log_head_current" => "HEAD（目前分支）",
+			"log_clear_filter" => "清除篩選",
+			"tip_log_refresh" => "重新整理",
+			"tip_log_more" => "更多",
+			"tip_log_regex" => "規則運算式",
+			"tip_log_case" => "區分大小寫",
+			"tip_branches_hide" => "隱藏分支窗格",
+			"tip_branches_show" => "顯示分支窗格",
+			"tip_expand_all" => "全部展開",
+			"tip_collapse_all" => "全部收合",
+			"log_more_details" => "顯示 commit 詳細資料",
+			"log_more_branches" => "顯示分支窗格",
+			"log_more_hash" => "顯示雜湊欄",
+			"log_loading_more" => "正在載入更多 commit…",
+			"log_dir_files" => "{} 個檔案",
+			"log_details_empty" => "選取 commit 以檢視詳細資料",
+			"log_details_on" => "於 {}",
+			"log_details_committed" => "由 {} 提交於 {}",
+			"log_details_in_branches" => "包含於 {} 個分支：{}",
+			"log_today" => "今天 {}",
+			"log_yesterday" => "昨天 {}",
+			// end log pane (IJ-2a)
 			"empty_log" => "沒有 commit",
 			"src_working_file" => "工作目錄檔案",
 			"src_working_diff" => "工作目錄變更",
@@ -284,8 +319,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"selector_repo_title" => "儲存庫列表",
 			"src_vs_empty_tree" => "與空樹比較 (根 commit)",
 			"src_vs_first_parent" => "與 first-parent 比較",
-			"status_history_loaded" => "已載入 {} 筆 commit (第 {} 頁)",
-			"status_graph_fallback" => "已載入 {} 筆 commit (第 {} 頁)；同時進行的分支太多，本頁改以清單顯示，不畫線圖",
+			"status_history_loaded" => "已載入 {} 筆 commit",
+			"status_graph_fallback" => "已載入 {} 筆 commit；同時進行的分支太多，本頁改以清單顯示，不畫線圖",
 			"status_commit_files_truncated" => "此 commit 變更 {} 個檔案，只列出前 {} 個",
 			"status_paste_done" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}、失敗 {}",
 			"submodule" => "子模組",
@@ -453,6 +488,41 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"col_author" => "Author",
 			"col_date" => "Date",
 			"col_hash" => "Hash",
+			// log pane (IJ-2a)
+			"log_chip_branch" => "Branch",
+			"log_chip_user" => "User",
+			"log_chip_date" => "Date",
+			"log_chip_paths" => "Paths",
+			"log_user_me" => "me",
+			"log_date_1d" => "Last 24 hours",
+			"log_date_7d" => "Last 7 days",
+			"log_date_30d" => "Last 30 days",
+			"log_date_1y" => "Last year",
+			"log_paths_placeholder" => "Path, e.g. src/app",
+			"log_paths_hint" => "Enter applies; Enter on an empty field clears",
+			"log_branch_placeholder" => "Branch or tag",
+			"log_head_current" => "HEAD (Current Branch)",
+			"log_clear_filter" => "Clear filter",
+			"tip_log_refresh" => "Refresh",
+			"tip_log_more" => "More",
+			"tip_log_regex" => "Regex",
+			"tip_log_case" => "Match case",
+			"tip_branches_hide" => "Hide branches",
+			"tip_branches_show" => "Show branches",
+			"tip_expand_all" => "Expand all",
+			"tip_collapse_all" => "Collapse all",
+			"log_more_details" => "Show commit details",
+			"log_more_branches" => "Show branches",
+			"log_more_hash" => "Show hash column",
+			"log_loading_more" => "Loading more commits…",
+			"log_dir_files" => "{} files",
+			"log_details_empty" => "Select a commit to see its details",
+			"log_details_on" => "on {}",
+			"log_details_committed" => "committed by {} on {}",
+			"log_details_in_branches" => "In {} branches: {}",
+			"log_today" => "Today {}",
+			"log_yesterday" => "Yesterday {}",
+			// end log pane (IJ-2a)
 			"empty_log" => "No commits",
 			"src_working_file" => "Working tree file",
 			"src_working_diff" => "Working changes",
@@ -570,8 +640,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"selector_repo_title" => "Repositories",
 			"src_vs_empty_tree" => "Compare vs empty tree (root commit)",
 			"src_vs_first_parent" => "Compare vs first-parent",
-			"status_history_loaded" => "Loaded {} commits (page {})",
-			"status_graph_fallback" => "Loaded {} commits (page {}); too many concurrent branches, so this page is a plain list without graph lines",
+			"status_history_loaded" => "Loaded {} commits",
+			"status_graph_fallback" => "Loaded {} commits; too many concurrent branches, so this page is a plain list without graph lines",
 			"status_commit_files_truncated" => "This commit changes {} files; showing the first {}",
 			"status_paste_done" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}, errors {}",
 			"submodule" => "Submodule",
@@ -672,14 +742,11 @@ mod tests {
 
 	#[test]
 	fn test_status_history_loaded_renders_without_raw_key() {
-		let msg = Msg::new(
-			"status_history_loaded",
-			["4".to_string(), "1".to_string()],
-		);
+		let msg = Msg::new("status_history_loaded", ["4".to_string()]);
 		let zh = msg.render(Locale::ZhTw);
-		assert_eq!(zh, "已載入 4 筆 commit (第 1 頁)");
+		assert_eq!(zh, "已載入 4 筆 commit");
 		let en = msg.render(Locale::En);
-		assert_eq!(en, "Loaded 4 commits (page 1)");
+		assert_eq!(en, "Loaded 4 commits");
 	}
 
 	#[test]
@@ -767,6 +834,14 @@ mod tests {
 			"status_fold_failed",
 			"status_fold_stale",
 			"status_fold_too_large",
+			"log_chip_branch",
+			"log_paths_placeholder",
+			"log_branch_placeholder",
+			"log_loading_more",
+			"log_dir_files",
+			"log_details_in_branches",
+			"log_today",
+			"log_yesterday",
 		];
 		for key in test_keys {
 			assert!(

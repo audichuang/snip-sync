@@ -1203,24 +1203,34 @@ fn native_desktop_smoke_and_clipboard_verification() {
 
 	// 10. Git Log: search by author, HEAD jump, merge collapse, range compare
 	println!("[TEST DRIVER] Testing Git Log author search...");
-	click("btn-search-author");
-	wait_for_pattern("[APP:SEARCH_AUTHOR: true]", Duration::from_secs(3))
-		.expect("search author toggle must be active");
-	click("log-search-input");
-	xdo(&["type", "--window", &wid, "Tester"]);
-	send_key("Return");
+	click("log-filter-user");
+	wait_for_pattern("[APP:LOG_MENU: Some(User)]", Duration::from_secs(3))
+		.expect("User chip must open its menu");
+	click("log-user:Tester");
 	wait_for_pattern(
 		"[APP:LOG_SEARCH: active=true author=true]",
 		Duration::from_secs(3),
 	)
 	.expect("log search for author must execute");
 
-	// Reset author search
-	click("btn-search-author");
-	wait_for_pattern("[APP:SEARCH_AUTHOR: false]", Duration::from_secs(3))
-		.expect("search author toggle must deactivate");
+	// Text search combines with the author filter.
 	click("log-search-input");
+	xdo(&["type", "--window", &wid, "commit"]);
+	send_key("Return");
+	wait_for_pattern(
+		"[APP:LOG_SEARCH: active=true author=true]",
+		Duration::from_secs(3),
+	)
+	.expect("text search must keep the author filter");
 	send_key("Escape");
+	wait_for_pattern(
+		"[APP:LOG_SEARCH: active=true author=true]",
+		Duration::from_secs(3),
+	)
+	.expect("clearing the text keeps the author filter");
+
+	// Reset author search from the chip's clear button.
+	click("log-filter-user-clear");
 	wait_for_pattern("[APP:LOG_SEARCH: active=false", Duration::from_secs(3))
 		.expect("clearing log search must restore full graph");
 
@@ -1816,9 +1826,10 @@ fn capture_window(wid: &str, out_png: &Path) {
 	assert!(fs::metadata(out_png).unwrap().len() > 1024);
 }
 
-/// A failed next page must leave the rendered page intact and retry the same
-/// page, rather than combining new commits with old rails or skipping ahead.
-/// Pages 2-10 are sliced from the window page 1 fetched, so page 11 is the
+/// Scrolling to the end of the log reads the next page into the window. A
+/// failed read must leave the rendered rows intact and stop loading until the
+/// user scrolls again, then retry the same page rather than combining new
+/// commits with old rails or skipping ahead. Pages 2-10 are sliced from the window page 1 fetched, so page 11 is the
 /// first that reads Git again; a repository gone missing fails exactly it.
 #[test]
 fn native_graph_failed_next_page_is_transactional() {
@@ -1870,9 +1881,10 @@ fn native_graph_failed_next_page_is_transactional() {
 		.map(str::to_owned)
 		.collect();
 	let first = &commits[0][..7];
-	let tenth = &commits[450][..7];
-	let second = &commits[500][..7];
-	let first_row = format!("commit-row:{tenth}");
+	let second = &commits[50][..7];
+	// A row near the end of the full ten-page window: on screen when the
+	// failed eleventh page is attempted and again after the retry.
+	let probe_row = format!("commit-row:{}", &commits[496][..7]);
 	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
 	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
 	let mut app = spawn_app(
@@ -1908,8 +1920,9 @@ fn native_graph_failed_next_page_is_transactional() {
 			std::thread::sleep(Duration::from_millis(20));
 		}
 	};
-	let next = || {
-		let [x, y, w, h] = control("btn-next-page");
+	// There is no pager: scrolling the list to its end reads the next page.
+	let wheel_down = || {
+		let [x, y, w, h] = control("log-list");
 		assert!(Command::new("xdotool")
 			.args([
 				"mousemove",
@@ -1918,16 +1931,33 @@ fn native_graph_failed_next_page_is_transactional() {
 				&(x + w / 2).to_string(),
 				&(y + h / 2).to_string(),
 				"click",
-				"1",
-				"mousemove",
-				"--window",
-				&wid,
-				"0",
-				"0",
+				"--repeat",
+				"4",
+				"--delay",
+				"15",
+				"5",
 			])
 			.status()
 			.unwrap()
 			.success());
+	};
+	// Scrolls until `pattern` is logged (a page read, or its failure).
+	let scroll_until = |pattern: &str| -> Vec<String> {
+		let deadline = Instant::now() + Duration::from_secs(40);
+		let mut seen = Vec::new();
+		loop {
+			wheel_down();
+			match lines_until(&app.rx, pattern, Duration::from_millis(250)) {
+				Ok(lines) => {
+					seen.extend(lines);
+					return seen;
+				}
+				Err(_) => assert!(
+					Instant::now() < deadline,
+					"scrolling never produced {pattern}"
+				),
+			}
+		}
 	};
 	let out = std::env::var_os("SNIP_E2E_OUT")
 		.map(PathBuf::from)
@@ -1980,12 +2010,11 @@ fn native_graph_failed_next_page_is_transactional() {
 		let image = out.join(format!("graph-admission-{name}.png"));
 		let crop = out.join(format!("graph-admission-{name}-row.png"));
 		let deadline = Instant::now() + Duration::from_secs(5);
-		// The row probe is identical across pages, so a frame still showing
-		// the previous page passes every bounds check. Only accept a row
-		// whose pixels match the capture before it.
+		// Only accept a row whose pixels match the capture before it, so a
+		// frame still moving (scroll, banner) is never the evidence.
 		let mut previous: Option<([i32; 4], Vec<u8>)> = None;
 		loop {
-			let row = control(&first_row);
+			let row = control(&probe_row);
 			let error = require_error.then(|| control("log-error"));
 			capture(&image);
 			let [x, y, w, h] = row;
@@ -2006,7 +2035,7 @@ fn native_graph_failed_next_page_is_transactional() {
 				.as_ref()
 				.is_some_and(|(r, p)| *r == row && *p == pixels.stdout);
 			previous = Some((row, pixels.stdout));
-			let stable = control(&first_row) == row
+			let stable = control(&probe_row) == row
 				&& error.is_none_or(|rect| control("log-error") == rect);
 			// Probes run during prepaint, before Vulkan presents this frame.
 			// Wait for the actual error banner, never for a matching row.
@@ -2054,19 +2083,7 @@ fn native_graph_failed_next_page_is_transactional() {
 			std::thread::sleep(Duration::from_millis(150));
 		}
 	};
-	for page in 2..=10 {
-		// Click only once the current page has been painted.
-		control(&format!("commit-row:{}", &commits[(page - 2) * 50][..7]));
-		next();
-		let loaded =
-			lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8))
-				.unwrap();
-		let want =
-			format!("first={} page={page}]", &commits[(page - 1) * 50][..7]);
-		assert!(loaded.last().unwrap().contains(&want), "{loaded:?}");
-	}
-	let before_y = control(&first_row)[1];
-	let before = crop_row("before", false);
+	// Pages 2-10 are sliced from the window page 1 fetched: no Git at all.
 	// Only this test's disposable repository is touched, never the standard
 	// workload: without `.git` every Git call fails until it is put back.
 	let dot_git = repo.join(".git");
@@ -2079,24 +2096,56 @@ fn native_graph_failed_next_page_is_transactional() {
 		}
 	};
 	park(true);
-	next();
-	let rejected =
-		lines_until(&app.rx, "[APP:HISTORY_ERROR]", Duration::from_secs(8))
-			.expect("layout failure must be reported, not silently swallowed");
+	for page in 2..=10 {
+		let loaded = scroll_until(&format!("page={page}]"));
+		let line = loaded
+			.iter()
+			.find(|l| l.contains("[APP:E2E_LOG:"))
+			.expect("page read must log E2E_LOG");
+		// The window grows page by page and keeps its first row.
+		assert!(
+			line.contains(&format!(
+				"mode=graph n={} first={first} page={page}]",
+				page * 50
+			)),
+			"{loaded:?}"
+		);
+	}
+	// Page 11 is the first read that needs Git, and it fails.
+	let rejected = scroll_until("[APP:HISTORY_ERROR]");
 	assert!(!rejected.iter().any(|line| line.contains("[APP:E2E_LOG:")));
 	control("log-error");
+	let refused = crop_row("refused", true);
+	// A failed read stops the automatic loading: no retry loop.
+	assert!(
+		lines_until(&app.rx, "[APP:HISTORY_ERROR]", Duration::from_secs(1))
+			.is_err(),
+		"a failed page must not be retried until the user scrolls again"
+	);
+	park(false);
+	let retried = scroll_until("[APP:E2E_LOG:");
+	assert!(
+		retried
+			.last()
+			.unwrap()
+			.contains(&format!("mode=graph n=500 first={second} page=11]")),
+		"retry must load the real eleventh page and evict the first: {retried:?}"
+	);
+	control(&format!("commit-row:{}", &commits[500][..7]));
 	let deadline = Instant::now() + Duration::from_secs(5);
-	while control(&first_row)[1] == before_y {
+	while bounds.lock().unwrap().contains_key("log-error") {
 		assert!(
 			Instant::now() < deadline,
-			"prior first row must remain below the visible error"
+			"successful retry must clear the error"
 		);
 		std::thread::sleep(Duration::from_millis(20));
 	}
-	let after = crop_row("refused", true);
+	// The row the failure was drawn over is unchanged: the refused page
+	// attached nothing to the old rails.
+	let after = crop_row("retried", false);
 	let comparison = Command::new("compare")
 		.args(["-metric", "AE"])
-		.arg(&before)
+		.arg(&refused)
 		.arg(&after)
 		.arg("null:")
 		.output()
@@ -2106,27 +2155,6 @@ fn native_graph_failed_next_page_is_transactional() {
 		"prior rendered row text and graph rails must remain identical: {}",
 		String::from_utf8_lossy(&comparison.stderr)
 	);
-	park(false);
-	next();
-	let retried =
-		lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8)).unwrap();
-	assert!(
-		retried
-			.last()
-			.unwrap()
-			.contains(&format!("mode=graph n=50 first={second} page=11]")),
-		"retry must load the real second page: {retried:?}"
-	);
-	control(&format!("commit-row:{second}"));
-	let deadline = Instant::now() + Duration::from_secs(5);
-	while bounds.lock().unwrap().contains_key("log-error") {
-		assert!(
-			Instant::now() < deadline,
-			"successful retry must clear the error"
-		);
-		std::thread::sleep(Duration::from_millis(20));
-	}
-	capture(&out.join("graph-admission-retried.png"));
 	quit_cleanly(&mut app, &wid);
 }
 

@@ -14,7 +14,7 @@ use gpui::{
 	anchored, canvas, deferred, div, prelude::*, px, rgb, transparent_black,
 	uniform_list, AnyElement, AnyView, App, Context, Div, ElementId,
 	FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-	SharedString, Stateful, Window,
+	ScrollWheelEvent, SharedString, Stateful, Window,
 };
 use snip_core::format::ChangeType;
 use snip_core::transfer::SourceKind;
@@ -22,7 +22,7 @@ use snip_core::workspace::ScanStatus;
 
 use crate::graph_view;
 use crate::history::RevRow;
-use crate::i18n::{t, tf};
+use crate::i18n::{t, tf, Locale};
 use crate::icons::{file_icon, icon, icon_tinted, Icon};
 use crate::paste::{split_dir, PasteItem, PasteNode, PastePreviewPlan};
 use crate::reader::{DiffMode, PreviewSource};
@@ -455,6 +455,219 @@ fn short(sha: &str) -> &str {
 	sha.get(..7).unwrap_or(sha)
 }
 
+// ───────────────────────── log helpers (IJ-2a) ─────────────────────────
+
+/// Dropdowns of the log: the filter chips and the More (⋮) button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogMenu {
+	Branch,
+	User,
+	Date,
+	Paths,
+	More,
+}
+
+impl LogMenu {
+	fn key(self) -> &'static str {
+		match self {
+			LogMenu::Branch => "branch",
+			LogMenu::User => "user",
+			LogMenu::Date => "date",
+			LogMenu::Paths => "paths",
+			LogMenu::More => "more",
+		}
+	}
+}
+
+/// What a log dropdown entry does when clicked.
+type MenuAction =
+	Box<dyn Fn(&mut WorkbenchModel, &mut Context<WorkbenchModel>)>;
+
+/// Date chip presets: probe key, `git log --since` value, label key.
+const DATE_PRESETS: [(&str, &str, &str); 4] = [
+	("1d", "24 hours ago", "log_date_1d"),
+	("7d", "7 days ago", "log_date_7d"),
+	("30d", "30 days ago", "log_date_30d"),
+	("1y", "1 year ago", "log_date_1y"),
+];
+/// Entries one filter dropdown lists; the branches pane search reaches more.
+const MAX_LOG_MENU_ITEMS: usize = 200;
+/// Rows per branches-pane group.
+const MAX_BRANCH_ROWS: usize = 200;
+const AUTHOR_W: f32 = 120.;
+const DATE_W: f32 = 118.;
+
+/// `refs/heads/main` → `main`, `refs/remotes/origin/x` → `origin/x`.
+fn short_ref(name: &str) -> &str {
+	["refs/heads/", "refs/remotes/", "refs/tags/"]
+		.iter()
+		.find_map(|p| name.strip_prefix(p))
+		.unwrap_or(name)
+}
+
+/// Rough rendered width: CJK and other wide glyphs are a full em.
+fn approx_text_w(s: &str, size: f32) -> f32 {
+	s.chars()
+		.map(|c| if c.is_ascii() { size * 0.55 } else { size })
+		.sum()
+}
+
+fn unix_now() -> i64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs() as i64)
+		.unwrap_or(0)
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+	let y = if m <= 2 { y - 1 } else { y };
+	let era = if y >= 0 { y } else { y - 399 } / 400;
+	let yoe = y - era * 400;
+	let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+	era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+}
+
+/// IntelliJ-style short date of an ISO-8601 commit date: "Today 20:57",
+/// "Yesterday 20:57", else a locale short date.
+// ponytail: "today" is judged in the commit's own UTC offset (no tz
+// database); a commit made in another zone near midnight may be off by one.
+fn log_date(iso: &str, loc: Locale, now_unix: i64) -> String {
+	let num = |r: std::ops::Range<usize>| iso.get(r)?.parse::<i64>().ok();
+	let (Some(y), Some(mo), Some(d), Some(hh), Some(mm)) =
+		(num(0..4), num(5..7), num(8..10), num(11..13), num(14..16))
+	else {
+		return short_date(iso);
+	};
+	let offset = match iso
+		.get(19..)
+		.map(|s| s.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit()))
+	{
+		Some(tz)
+			if tz.len() >= 6
+				&& (tz.starts_with('+') || tz.starts_with('-')) =>
+		{
+			let sign = if tz.starts_with('-') { -1 } else { 1 };
+			let h = tz
+				.get(1..3)
+				.and_then(|v| v.parse::<i64>().ok())
+				.unwrap_or(0);
+			let m = tz
+				.get(4..6)
+				.and_then(|v| v.parse::<i64>().ok())
+				.unwrap_or(0);
+			sign * (h * 3600 + m * 60)
+		}
+		_ => 0,
+	};
+	let today = (now_unix + offset).div_euclid(86_400);
+	let time = format!("{hh:02}:{mm:02}");
+	match today - days_from_civil(y, mo, d) {
+		0 => tf("log_today", loc, &[&time]),
+		1 => tf("log_yesterday", loc, &[&time]),
+		_ => match loc {
+			Locale::ZhTw => format!("{y}/{mo}/{d} {time}"),
+			Locale::En => format!("{mo}/{d}/{:02}, {time}", y % 100),
+		},
+	}
+}
+
+/// Square ghost icon button of the log toolbars (IntelliJ's 26px action
+/// buttons); the label is its tooltip.
+fn log_icon_button(
+	id: &'static str,
+	ic: Icon,
+	tooltip: impl Into<SharedString>,
+	enabled: bool,
+	active: bool,
+) -> Stateful<Div> {
+	div()
+		.id(id)
+		.relative()
+		.flex_shrink_0()
+		.size(px(26.))
+		.flex()
+		.items_center()
+		.justify_center()
+		.rounded(px(4.))
+		.border_1()
+		.border_color(transparent_black())
+		.tooltip(tip(tooltip))
+		.when(active, |d| d.bg(rgb(pal().hover_bg)))
+		.when(enabled, |d| {
+			d.cursor_pointer().hover(|s| s.bg(rgb(pal().hover_bg)))
+		})
+		.focus(|s| s.border_color(rgb(pal().focus_ring)))
+		.child(
+			div()
+				.flex()
+				.when(!enabled, |d| d.opacity(0.4))
+				.child(icon(ic, 16.)),
+		)
+}
+
+/// The coloured label glyph of a ref.
+fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
+	icon_tinted(if l.current { Icon::Head } else { Icon::Tag }, 14., l.color)
+}
+
+/// A row's ref labels, right-aligned at the end of the subject: label icon
+/// plus name, at most two, the rest folded into `+N`. Also returns their
+/// estimated width.
+fn ref_label_elements(
+	refs: &[snip_core::graph::RefInfo],
+	current_branch: Option<&str>,
+	row: &str,
+) -> (Vec<AnyElement>, f32) {
+	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
+	let mut width = 0.;
+	let mut out: Vec<AnyElement> = shown
+		.iter()
+		.map(|b| {
+			let l = graph_view::ref_label(b, current_branch);
+			width += 18. + approx_text_w(&l.text, SMALL_TEXT).min(140.) + 8.;
+			let tooltip = std::iter::once(b.primary)
+				.chain(b.merged.iter().copied())
+				.map(|i| graph_view::format_ref_badge(i).0)
+				.collect::<Vec<_>>()
+				.join("\n");
+			div()
+				.id(SharedString::from(format!("ref-badge:{row}:{}", l.text)))
+				.flex()
+				.items_center()
+				.gap(px(3.))
+				.max_w(px(160.))
+				.tooltip(tip(tooltip))
+				.child(label_icon(&l))
+				.child(
+					clip_text(l.text.clone())
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().log_ref_text)),
+				)
+				.into_any_element()
+		})
+		.collect();
+	if hidden > 0 {
+		width += 30.;
+		let all = refs
+			.iter()
+			.map(|i| graph_view::format_ref_badge(i).0)
+			.collect::<Vec<_>>()
+			.join("\n");
+		out.push(
+			div()
+				.id(SharedString::from(format!("ref-more:{row}")))
+				.flex_shrink_0()
+				.text_size(px(SMALL_TEXT))
+				.text_color(rgb(pal().log_ref_text))
+				.tooltip(tip(all))
+				.child(format!("+{hidden}"))
+				.into_any_element(),
+		);
+	}
+	(out, width)
+}
+
 /// One row of the Project tool window.
 enum ProjRow {
 	Repo(usize),
@@ -568,6 +781,10 @@ impl WorkbenchModel {
 				self.bottom_h = want
 					.min((vh - HEADER_H - STATUS_H) * 0.55)
 					.max(BOTTOM_H_MIN);
+			}
+			Splitter::LogDetails => {
+				let want = vw - SPLITTER - f32::from(ev.position.x);
+				self.log_details_w = want.min(vw * 0.5).max(LOG_DETAILS_W_MIN);
 			}
 		}
 		cx.notify();
@@ -930,6 +1147,7 @@ impl WorkbenchModel {
 		let id = match which {
 			Splitter::Left => "splitter-left",
 			Splitter::Bottom => "splitter-bottom",
+			Splitter::LogDetails => "splitter-log-details",
 		};
 		let d = div()
 			.id(id)
@@ -949,6 +1167,12 @@ impl WorkbenchModel {
 		match which {
 			Splitter::Left => d.w(px(SPLITTER)).h_full().cursor_ew_resize(),
 			Splitter::Bottom => d.h(px(SPLITTER)).w_full().cursor_ns_resize(),
+			Splitter::LogDetails => d
+				.w(px(SPLITTER))
+				.h_full()
+				.border_l_1()
+				.border_color(rgb(pal().divider))
+				.cursor_ew_resize(),
 		}
 		.into_any_element()
 	}
@@ -3463,166 +3687,8 @@ impl WorkbenchModel {
 					})
 					.child(toolbar),
 			)
-			.when(
-				self.selected_commit.is_some() || self.compare.is_some(),
-				|d| {
-					d.child(
-						div()
-							.id("editor-commit-scroll")
-							.min_h_0()
-							.flex_shrink()
-							.overflow_y_scroll()
-							.child(self.render_commit_panel(cx)),
-					)
-				},
-			)
 			.when(self.reader.find_open, |d| d.child(self.find_bar(cx)))
 			.child(body)
-			.into_any_element()
-	}
-
-	/// Commit / compare header plus its changed files (virtualized).
-	fn render_commit_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-		let loc = self.locale;
-		let log = &self.probes;
-		let header: AnyElement = if let Some((from, to)) = &self.compare {
-			div()
-				.text_color(rgb(pal().text))
-				.child(tf("compare_header", loc, &[&short(from), &short(to)]))
-				.into_any_element()
-		} else if let Some(c) = self
-			.selected_commit
-			.as_ref()
-			.and_then(|s| self.commits.iter().find(|c| &c.sha == s))
-		{
-			let parents = if c.parents.is_empty() {
-				t("root_commit", loc).to_string()
-			} else {
-				c.parents
-					.iter()
-					.map(|p| short(p).to_string())
-					.collect::<Vec<_>>()
-					.join(", ")
-			};
-			div()
-				.flex()
-				.flex_col()
-				.child(
-					div()
-						.flex()
-						.gap(px(8.))
-						.child(
-							div()
-								.flex_shrink_0()
-								.font_family(EDITOR_FONT)
-								.text_color(rgb(pal().text_muted))
-								.child(short(&c.sha).to_string()),
-						)
-						.child(
-							fill_text(c.subject.clone())
-								.font_weight(FontWeight::SEMIBOLD),
-						),
-				)
-				.child(
-					div()
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().text_muted))
-						.child(tf(
-							"commit_meta",
-							loc,
-							&[
-								&c.author_name,
-								&short_date(&c.author_date),
-								&parents,
-							],
-						)),
-				)
-				.into_any_element()
-		} else {
-			div().into_any_element()
-		};
-		let n = self.commit_files.len();
-		div()
-			.id("commit-panel")
-			.relative()
-			.flex()
-			.flex_col()
-			.flex_shrink_0()
-			.px(px(12.))
-			.py(px(6.))
-			.gap(px(4.))
-			.bg(rgb(pal().panel_bg))
-			.border_b_1()
-			.border_color(rgb(pal().divider))
-			.child(header)
-			.child(
-				div()
-					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(pal().text_muted))
-					.child(tf("changed_files", loc, &[&n])),
-			)
-			.child(
-				div().h(px((n.max(1) as f32 * 22.0).min(110.0))).child(
-					uniform_list(
-						"commit-files",
-						n,
-						cx.processor(
-							|this, range: std::ops::Range<usize>, _, cx| {
-								range
-									.filter_map(|ix| {
-										this.commit_files.get(ix).cloned()
-									})
-									.map(|(path, ct)| {
-										let (letter, color) = change_style(ct);
-										let sel = this
-											.selected_commit_file
-											.as_deref() == Some(&path)
-											&& this.rev_tree.is_none();
-										let id = format!("commit-file:{path}");
-										let p2 = path.clone();
-										div()
-											.id(SharedString::from(id.clone()))
-											.relative()
-											.flex()
-											.items_center()
-											.gap(px(6.))
-											.h(px(22.))
-											.px(px(4.))
-											.cursor_pointer()
-											.when(sel, |d| {
-												d.bg(rgb(pal().selection_bg))
-											})
-											.when(!sel, |d| {
-												d.hover(|s| {
-													s.bg(rgb(pal().hover_bg))
-												})
-											})
-											.on_click(cx.listener(
-												move |this, _, _, cx| {
-													this.select_commit_file(
-														&p2, cx,
-													)
-												},
-											))
-											.child(
-												div()
-													.w(px(10.))
-													.flex_shrink_0()
-													.text_color(rgb(color))
-													.child(letter),
-											)
-											.child(icon(file_icon(&path), 13.))
-											.child(fill_text(path))
-											.children(probe(&this.probes, id))
-									})
-									.collect::<Vec<_>>()
-							},
-						),
-					)
-					.size_full(),
-				),
-			)
-			.children(probe(log, "commit-panel"))
 			.into_any_element()
 	}
 
@@ -4295,23 +4361,552 @@ impl WorkbenchModel {
 
 	// ───────────────────────── git log ─────────────────────────
 
+	// ───────────────────────── log (IJ-2a) ─────────────────────────
+
+	/// Filter chip of the log's filter bar: `Name▾`, or `Name: value ✕`.
+	fn log_chip(
+		&self,
+		menu: LogMenu,
+		label: &str,
+		value: Option<String>,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let log = &self.probes;
+		let key = menu.key();
+		let id = format!("log-filter-{key}");
+		let clear_id = format!("log-filter-{key}-clear");
+		let open = self.log_menu == Some(menu);
+		let active = value.is_some();
+		div()
+			.id(SharedString::from(id.clone()))
+			.relative()
+			.flex_shrink_0()
+			.h(px(24.))
+			.px(px(6.))
+			.flex()
+			.items_center()
+			.gap(px(3.))
+			.rounded(px(4.))
+			.cursor_pointer()
+			.text_size(px(UI_TEXT))
+			.when(open, |d| d.bg(rgb(pal().hover_bg)))
+			.hover(|s| s.bg(rgb(pal().hover_bg)))
+			.on_click(
+				cx.listener(move |this, _, _, cx| {
+					this.toggle_log_menu(menu, cx)
+				}),
+			)
+			.child(
+				div()
+					.max_w(px(180.))
+					.overflow_hidden()
+					.line_clamp(1)
+					.text_ellipsis()
+					.text_color(rgb(pal().text))
+					.child(match &value {
+						Some(v) => format!("{label}: {v}"),
+						None => label.to_string(),
+					}),
+			)
+			.child(if active {
+				div()
+					.id(SharedString::from(clear_id.clone()))
+					.relative()
+					.flex()
+					.rounded(px(3.))
+					.hover(|s| s.bg(rgb(pal().divider)))
+					.tooltip(tip(t("log_clear_filter", self.locale)))
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.clear_log_chip(menu, cx);
+					}))
+					.child(icon(Icon::Close, 12.))
+					.children(probe(log, clear_id))
+					.into_any_element()
+			} else {
+				icon(Icon::ChevronDown, 12.).into_any_element()
+			})
+			.when(open, |d| d.child(self.log_menu_panel(menu, cx)))
+			.children(probe(log, id))
+			.into_any_element()
+	}
+
+	fn clear_log_chip(&mut self, menu: LogMenu, cx: &mut Context<Self>) {
+		self.log_menu = None;
+		match menu {
+			LogMenu::Branch => self.filter_by_ref(None, cx),
+			LogMenu::User => self.set_log_author(None, cx),
+			LogMenu::Date => self.set_log_since(None, cx),
+			LogMenu::Paths => {
+				self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
+				self.set_log_paths(String::new(), cx)
+			}
+			LogMenu::More => cx.notify(),
+		}
+	}
+
+	/// The dropdown under a filter chip or the More button.
+	fn log_menu_panel(
+		&self,
+		menu: LogMenu,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let item = |id: String,
+		            label: String,
+		            checked: bool,
+		            on: MenuAction,
+		            cx: &mut Context<Self>| {
+			div()
+				.id(SharedString::from(id.clone()))
+				.relative()
+				.h(px(24.))
+				.px(px(8.))
+				.flex()
+				.items_center()
+				.gap(px(6.))
+				.rounded(px(4.))
+				.cursor_pointer()
+				.hover(|s| s.bg(rgb(pal().hover_bg)))
+				.on_click(cx.listener(move |this, _, _, cx| {
+					cx.stop_propagation();
+					on(this, cx)
+				}))
+				.child(
+					div()
+						.flex_shrink_0()
+						.w(px(14.))
+						.when(checked, |d| d.child(icon(Icon::Checked, 14.))),
+				)
+				.child(fill_text(label))
+				.children(probe(log, id))
+				.into_any_element()
+		};
+		let mut items: Vec<AnyElement> = Vec::new();
+		match menu {
+			LogMenu::Branch => {
+				let refs = std::iter::once("HEAD".to_string())
+					.filter(|_| self.head_sha.is_some())
+					.chain(self.refs.iter().map(|r| r.name.clone()))
+					.take(MAX_LOG_MENU_ITEMS);
+				for name in refs {
+					let label = short_ref(&name).to_string();
+					let checked =
+						self.active_ref_filter.as_deref() == Some(&name);
+					let target = name.clone();
+					items.push(item(
+						format!("log-branch:{name}"),
+						label,
+						checked,
+						Box::new(move |this, cx| {
+							this.log_menu = None;
+							this.filter_by_ref(Some(target.clone()), cx)
+						}),
+						cx,
+					));
+				}
+			}
+			LogMenu::User => {
+				if let Some(email) = self.git_user_email.clone() {
+					let checked =
+						self.log_filter.author.as_deref() == Some(&email);
+					items.push(item(
+						"log-user:me".into(),
+						format!("{} ({email})", t("log_user_me", loc)),
+						checked,
+						Box::new(move |this, cx| {
+							this.set_log_author(Some(email.clone()), cx)
+						}),
+						cx,
+					));
+				}
+				for name in self.log_authors(MAX_LOG_MENU_ITEMS) {
+					let checked =
+						self.log_filter.author.as_deref() == Some(&name);
+					let target = name.clone();
+					items.push(item(
+						format!("log-user:{name}"),
+						name,
+						checked,
+						Box::new(move |this, cx| {
+							this.set_log_author(Some(target.clone()), cx)
+						}),
+						cx,
+					));
+				}
+			}
+			LogMenu::Date => {
+				for (key, since, label) in DATE_PRESETS {
+					let checked =
+						self.log_filter.since.as_deref() == Some(since);
+					items.push(item(
+						format!("log-date:{key}"),
+						t(label, loc).to_string(),
+						checked,
+						Box::new(move |this, cx| {
+							this.set_log_since(Some(since), cx)
+						}),
+						cx,
+					));
+				}
+			}
+			LogMenu::Paths => {
+				items.push(
+					div()
+						.id("log-path-input")
+						.relative()
+						.w(px(240.))
+						.child(self.log_path_input.clone())
+						.children(probe(log, "log-path-input"))
+						.into_any_element(),
+				);
+				items.push(
+					div()
+						.px(px(2.))
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text_muted))
+						.child(t("log_paths_hint", loc))
+						.into_any_element(),
+				);
+			}
+			LogMenu::More => {
+				for (key, label, checked) in [
+					("details", "log_more_details", self.log_details_visible),
+					(
+						"branches",
+						"log_more_branches",
+						self.log_branches_visible,
+					),
+					("hash", "log_more_hash", self.log_show_hash),
+				] {
+					items.push(item(
+						format!("log-more:{key}"),
+						t(label, loc).to_string(),
+						checked,
+						Box::new(move |this, cx| {
+							this.log_menu = None;
+							match key {
+								"details" => {
+									this.log_details_visible =
+										!this.log_details_visible
+								}
+								"branches" => {
+									this.log_branches_visible =
+										!this.log_branches_visible
+								}
+								_ => this.log_show_hash = !this.log_show_hash,
+							}
+							app_log!("[APP:LOG_VIEW: {}]", key);
+							cx.notify();
+						}),
+						cx,
+					));
+				}
+			}
+		}
+		let panel = div()
+			.id("log-menu")
+			.occlude()
+			.min_w(px(200.))
+			.max_w(px(360.))
+			.max_h(px(320.))
+			.overflow_y_scroll()
+			.flex()
+			.flex_col()
+			.p(px(4.))
+			.bg(rgb(pal().panel_bg))
+			.border_1()
+			.border_color(rgb(pal().button_border))
+			.rounded(px(6.))
+			.shadow_lg()
+			.text_size(px(UI_TEXT))
+			.text_color(rgb(pal().text))
+			.on_mouse_down_out(
+				cx.listener(|this, _, _, cx| this.close_log_menu(cx)),
+			)
+			.children(items);
+		div()
+			.absolute()
+			.top(px(26.))
+			.left_0()
+			.child(
+				deferred(anchored().snap_to_window().child(panel))
+					.with_priority(1),
+			)
+			.into_any_element()
+	}
+
+	/// IntelliJ's branches pane: search, HEAD, collapsible Local / Remote /
+	/// Tags groups (no counts).
+	fn render_branches(&self, cx: &mut Context<Self>) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let needle = self
+			.branch_filter_input
+			.read(cx)
+			.text()
+			.trim()
+			.to_lowercase();
+		let current = self
+			.repo()
+			.and_then(|r| r.summary.as_ref().ok())
+			.and_then(|s| s.branch.clone());
+		let mut rows: Vec<AnyElement> = Vec::new();
+		let entry = |id: String,
+		             label: String,
+		             glyph: AnyElement,
+		             indent: f32,
+		             target: Option<String>,
+		             active: bool,
+		             cx: &mut Context<Self>| {
+			div()
+				.id(SharedString::from(id.clone()))
+				.relative()
+				.flex_shrink_0()
+				.h(px(24.))
+				.mx(px(4.))
+				.pl(px(indent))
+				.pr(px(6.))
+				.flex()
+				.items_center()
+				.gap(px(6.))
+				.rounded(px(4.))
+				.cursor_pointer()
+				.when(active, |d| d.bg(rgb(pal().selection_inactive_bg)))
+				.when(!active, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+				.tooltip(tip(label.clone()))
+				.on_click(cx.listener(move |this, _, _, cx| {
+					this.filter_by_ref(target.clone(), cx)
+				}))
+				.child(glyph)
+				.child(clip_text(label).text_color(rgb(pal().text)))
+				.children(probe(log, id))
+				.into_any_element()
+		};
+		if self.head_sha.is_some() && needle.is_empty() {
+			rows.push(entry(
+				"ref:HEAD".into(),
+				t("log_head_current", loc).to_string(),
+				div().w(px(14.)).into_any_element(),
+				10.,
+				Some("HEAD".into()),
+				self.active_ref_filter.as_deref() == Some("HEAD"),
+				cx,
+			));
+		}
+		for (key, prefix) in [
+			("refs_local", "refs/heads/"),
+			("refs_remote", "refs/remotes/"),
+			("refs_tags", "refs/tags/"),
+		] {
+			let members: Vec<_> = self
+				.refs
+				.iter()
+				.filter(|r| r.name.starts_with(prefix))
+				.filter(|r| {
+					needle.is_empty()
+						|| r.name[prefix.len()..]
+							.to_lowercase()
+							.contains(&needle)
+				})
+				.collect();
+			if members.is_empty() {
+				continue;
+			}
+			let collapsed = self.branch_groups_collapsed.contains(&key);
+			let gid = format!("branch-group:{key}");
+			rows.push(
+				div()
+					.id(SharedString::from(gid.clone()))
+					.relative()
+					.flex_shrink_0()
+					.h(px(24.))
+					.mx(px(4.))
+					.px(px(6.))
+					.flex()
+					.items_center()
+					.gap(px(4.))
+					.rounded(px(4.))
+					.cursor_pointer()
+					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.on_click(cx.listener(move |this, _, _, cx| {
+						match this
+							.branch_groups_collapsed
+							.iter()
+							.position(|k| *k == key)
+						{
+							Some(i) => {
+								this.branch_groups_collapsed.remove(i);
+							}
+							None => this.branch_groups_collapsed.push(key),
+						}
+						cx.notify();
+					}))
+					.child(icon(
+						if collapsed {
+							Icon::ChevronRight
+						} else {
+							Icon::ChevronDown
+						},
+						12.,
+					))
+					.child(clip_text(t(key, loc)).text_color(rgb(pal().text)))
+					.children(probe(log, gid))
+					.into_any_element(),
+			);
+			if collapsed {
+				continue;
+			}
+			// Bounded: very large ref sets are reached through the search.
+			for r in members.iter().take(MAX_BRANCH_ROWS) {
+				let name = &r.name[prefix.len()..];
+				let is_current =
+					prefix == "refs/heads/" && current.as_deref() == Some(name);
+				let glyph = match prefix {
+					"refs/tags/" => icon_tinted(Icon::Tag, 14., pal().ref_tag)
+						.into_any_element(),
+					_ if is_current => {
+						icon_tinted(Icon::Head, 14., pal().ref_head)
+							.into_any_element()
+					}
+					_ => icon(Icon::Branch, 14.).into_any_element(),
+				};
+				rows.push(entry(
+					format!("ref:{}", r.name),
+					name.to_string(),
+					glyph,
+					24.,
+					Some(r.name.clone()),
+					self.active_ref_filter.as_deref() == Some(r.name.as_str()),
+					cx,
+				));
+			}
+		}
+		div()
+			.flex()
+			.flex_col()
+			.flex_shrink_0()
+			.w(px(LOG_BRANCHES_W))
+			.h_full()
+			.border_r_1()
+			.border_color(rgb(pal().divider))
+			.child(
+				div()
+					.flex_shrink_0()
+					.h(px(32.))
+					.px(px(6.))
+					.flex()
+					.items_center()
+					.gap(px(4.))
+					.child(icon(Icon::Search, 14.))
+					.child(
+						div()
+							.id("branch-filter-input")
+							.relative()
+							.flex_1()
+							.min_w_0()
+							.child(self.branch_filter_input.clone())
+							.children(probe(log, "branch-filter-input")),
+					),
+			)
+			.child(
+				div()
+					.id("refs-scroll")
+					.flex()
+					.flex_col()
+					.flex_1()
+					.min_h_0()
+					.overflow_y_scroll()
+					.text_size(px(UI_TEXT))
+					.pb(px(4.))
+					.children(rows),
+			)
+			.into_any_element()
+	}
+
+	/// The thin icon toolbar at the log's left edge (IntelliJ's branches
+	/// toolbar).
+	fn render_branch_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let shown = self.log_branches_visible;
+		div()
+			.flex()
+			.flex_col()
+			.items_center()
+			.flex_shrink_0()
+			.w(px(32.))
+			.h_full()
+			.py(px(4.))
+			.gap(px(2.))
+			.border_r_1()
+			.border_color(rgb(pal().divider))
+			.child(
+				log_icon_button(
+					"branches-toggle",
+					if shown {
+						Icon::Back
+					} else {
+						Icon::ChevronRight
+					},
+					t(
+						if shown {
+							"tip_branches_hide"
+						} else {
+							"tip_branches_show"
+						},
+						loc,
+					),
+					true,
+					false,
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.log_branches_visible = !this.log_branches_visible;
+					app_log!("[APP:LOG_VIEW: branches]");
+					cx.notify();
+				}))
+				.children(probe(log, "branches-toggle")),
+			)
+			.child(
+				log_icon_button(
+					"branches-expand-all",
+					Icon::ExpandAll,
+					t("tip_expand_all", loc),
+					shown,
+					false,
+				)
+				.when(shown, |d| {
+					d.on_click(cx.listener(|this, _, _, cx| {
+						this.branch_groups_collapsed.clear();
+						cx.notify();
+					}))
+				})
+				.children(probe(log, "branches-expand-all")),
+			)
+			.child(
+				log_icon_button(
+					"branches-collapse-all",
+					Icon::CollapseAll,
+					t("tip_collapse_all", loc),
+					shown,
+					false,
+				)
+				.when(shown, |d| {
+					d.on_click(cx.listener(|this, _, _, cx| {
+						this.branch_groups_collapsed =
+							vec!["refs_local", "refs_remote", "refs_tags"];
+						cx.notify();
+					}))
+				})
+				.children(probe(log, "branches-collapse-all")),
+			)
+			.into_any_element()
+	}
+
 	fn render_log(&self, height: f32, cx: &mut Context<Self>) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
-		let repo_name = self.repo().map(|r| r.name.clone()).unwrap_or_default();
-		let scope = match (&self.log_search, &self.active_ref_filter) {
-			(Some(s), _) => tf(
-				if s.author {
-					"log_scope_author"
-				} else {
-					"log_scope_search"
-				},
-				loc,
-				&[&s.query],
-			),
-			(None, Some(r)) => r.trim_start_matches("refs/heads/").to_string(),
-			(None, None) => t("refs_all", loc).to_string(),
-		};
 		let range = self.range_rows();
 		let header = div()
 			.flex()
@@ -4320,9 +4915,9 @@ impl WorkbenchModel {
 			.flex_shrink_0()
 			.h(px(PANEL_HEADER_H + 2.0))
 			.px(px(8.))
-			.gap(px(6.))
+			.gap(px(8.))
 			.border_b_1()
-			.border_color(rgb(pal().border))
+			.border_color(rgb(pal().divider))
 			.child(
 				div()
 					.flex_shrink_0()
@@ -4332,270 +4927,241 @@ impl WorkbenchModel {
 			.child(
 				div()
 					.flex_shrink_0()
-					.h_full()
+					.h(px(22.))
+					.px(px(8.))
 					.flex()
 					.items_center()
-					.border_b_2()
-					.border_color(rgb(pal().accent))
-					.child(t("log_tab", loc)),
+					.rounded(px(4.))
+					.bg(rgb(pal().selection_inactive_bg))
+					.child(match &self.active_ref_filter {
+						Some(r) => {
+							format!("{}: {}", t("log_tab", loc), short_ref(r))
+						}
+						None => t("log_tab", loc).to_string(),
+					}),
 			)
-			.child(icon(Icon::Search, 13.))
+			.child(div().flex_1())
+			.child(
+				log_icon_button(
+					"btn-log-more",
+					Icon::More,
+					t("tip_log_more", loc),
+					true,
+					self.log_menu == Some(LogMenu::More),
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.toggle_log_menu(LogMenu::More, cx)
+				}))
+				.when(self.log_menu == Some(LogMenu::More), |d| {
+					d.child(self.log_menu_panel(LogMenu::More, cx))
+				})
+				.children(probe(log, "btn-log-more")),
+			)
+			.child(
+				log_icon_button(
+					"btn-log-hide",
+					Icon::Hide,
+					t("hide", loc),
+					true,
+					false,
+				)
+				.tab_index(47)
+				.on_click(cx.listener(|this, _, _, cx| this.toggle_log(cx)))
+				.children(probe(log, "btn-log-hide")),
+			);
+
+		let text_toggle = |id: &'static str,
+		                   ic: Icon,
+		                   tooltip: &'static str,
+		                   on: bool,
+		                   cx: &mut Context<Self>| {
+			div()
+				.id(id)
+				.relative()
+				.flex_shrink_0()
+				.size(px(20.))
+				.flex()
+				.items_center()
+				.justify_center()
+				.rounded(px(3.))
+				.cursor_pointer()
+				.tooltip(tip(t(tooltip, loc)))
+				.when(on, |d| {
+					d.bg(rgb(pal().selection_bg))
+						.border_1()
+						.border_color(rgb(pal().focus_ring))
+				})
+				.when(!on, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+				.on_click(cx.listener(move |this, _, _, cx| {
+					if id == "btn-log-regex" {
+						this.toggle_log_regex(cx)
+					} else {
+						this.toggle_log_match_case(cx)
+					}
+				}))
+				.child(icon(ic, 14.))
+				.children(probe(log, id))
+		};
+		let branch_value = self
+			.active_ref_filter
+			.as_deref()
+			.map(|r| short_ref(r).to_string());
+		let user_value = self.log_filter.author.clone().map(|a| {
+			if self.git_user_email.as_deref() == Some(a.as_str()) {
+				t("log_user_me", loc).to_string()
+			} else {
+				a
+			}
+		});
+		let date_value = self.log_filter.since.as_deref().map(|s| {
+			DATE_PRESETS
+				.iter()
+				.find(|(_, since, _)| *since == s)
+				.map(|(_, _, label)| t(label, loc).to_string())
+				.unwrap_or_else(|| s.to_string())
+		});
+		let paths_value = self.log_filter.paths.first().cloned();
+		let filter_bar = div()
+			.flex()
+			.flex_row()
+			.items_center()
+			.flex_shrink_0()
+			.h(px(34.))
+			.px(px(6.))
+			.gap(px(4.))
+			.border_b_1()
+			.border_color(rgb(pal().divider))
 			.child(
 				div()
-					.id("log-search-input")
-					.relative()
-					.w(px(170.))
-					.min_w(px(80.))
-					.child(self.log_search_input.clone())
-					.children(probe(log, "log-search-input")),
+					.w(px(240.))
+					.min_w(px(96.))
+					.h(px(26.))
+					.px(px(6.))
+					.flex()
+					.items_center()
+					.gap(px(4.))
+					.rounded(px(4.))
+					.border_1()
+					.border_color(rgb(pal().button_border))
+					.child(icon(Icon::Search, 14.))
+					.child(
+						div()
+							.id("log-search-input")
+							.relative()
+							.flex_1()
+							.min_w_0()
+							.child(self.log_search_input.clone())
+							.children(probe(log, "log-search-input")),
+					)
+					.child(text_toggle(
+						"btn-log-regex",
+						Icon::Regex,
+						"tip_log_regex",
+						self.log_filter.regex,
+						cx,
+					))
+					.child(text_toggle(
+						"btn-log-case",
+						Icon::MatchCase,
+						"tip_log_case",
+						self.log_filter.match_case,
+						cx,
+					)),
+			)
+			// Chips give way first on a narrow window; the actions stay.
+			.child(
+				div()
+					.flex()
+					.flex_row()
+					.items_center()
+					.gap(px(4.))
+					.flex_1()
+					.min_w_0()
+					.overflow_hidden()
+					.child(self.log_chip(
+						LogMenu::Branch,
+						t("log_chip_branch", loc),
+						branch_value,
+						cx,
+					))
+					.child(self.log_chip(
+						LogMenu::User,
+						t("log_chip_user", loc),
+						user_value,
+						cx,
+					))
+					.child(self.log_chip(
+						LogMenu::Date,
+						t("log_chip_date", loc),
+						date_value,
+						cx,
+					))
+					.child(self.log_chip(
+						LogMenu::Paths,
+						t("log_chip_paths", loc),
+						paths_value,
+						cx,
+					)),
 			)
 			.child(
-				button(
-					"btn-search-author",
-					t("search_author", loc),
-					if self.search_by_author {
-						Btn::Default
-					} else {
-						Btn::Ghost
-					},
+				log_icon_button(
+					"btn-log-refresh",
+					Icon::Refresh,
+					t("tip_log_refresh", loc),
 					true,
-					41,
+					false,
 				)
-				.px(px(6.))
-				.h(px(20.))
-				.text_size(px(SMALL_TEXT))
-				.tooltip(tip(t("tip_search_author", loc)))
 				.on_click(cx.listener(|this, _, _, cx| {
-					this.search_by_author = !this.search_by_author;
-					app_log!("[APP:SEARCH_AUTHOR: {}]", this.search_by_author);
-					let q = this
-						.log_search_input
-						.read(cx)
-						.text()
-						.trim()
-						.to_string();
-					if !q.is_empty() {
-						this.start_log_search(q, cx);
-					}
-					cx.notify();
+					app_log!("[APP:LOG_REFRESH]");
+					this.apply_log_filter(cx)
 				}))
-				.children(probe(log, "btn-search-author")),
+				.children(probe(log, "btn-log-refresh")),
 			)
 			.child(
-				fill_text(format!("{repo_name} · {scope}"))
-					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(pal().text_muted)),
-			)
-			.child(
-				button(
+				log_icon_button(
 					"btn-head",
-					"HEAD",
-					Btn::Ghost,
+					Icon::Locate,
+					t("tip_head", loc),
 					self.head_sha.is_some(),
-					42,
+					false,
 				)
-				.px(px(6.))
-				.h(px(20.))
-				.text_size(px(SMALL_TEXT))
-				.tooltip(tip(t("tip_head", loc)))
+				.tab_index(42)
 				.on_click(cx.listener(|this, _, _, cx| this.locate_head(cx)))
 				.children(probe(log, "btn-head")),
 			)
 			.child(
-				button(
+				log_icon_button(
 					"btn-compare",
-					t("btn_compare", loc),
-					Btn::Ghost,
+					Icon::Diff,
+					match range {
+						Some((a, b)) => tf("tip_compare", loc, &[&(b - a + 1)]),
+						None => t("tip_compare_disabled", loc).to_string(),
+					},
 					range.is_some(),
-					45,
+					false,
 				)
-				.px(px(6.))
-				.h(px(20.))
-				.text_size(px(SMALL_TEXT))
-				.tooltip(tip(match range {
-					Some((a, b)) => tf("tip_compare", loc, &[&(b - a + 1)]),
-					None => t("tip_compare_disabled", loc).to_string(),
-				}))
 				.when(range.is_some(), |b| {
-					b.on_click(
+					b.tab_index(45).on_click(
 						cx.listener(|this, _, _, cx| this.compare_range(cx)),
 					)
 				})
 				.children(probe(log, "btn-compare")),
 			)
 			.child(
-				button(
+				log_icon_button(
 					"btn-copy-commits",
-					t("btn_copy_commits", loc),
-					Btn::Ghost,
+					Icon::Copy,
+					t("tip_copy_commits", loc),
 					self.selected_commit.is_some(),
-					46,
+					false,
 				)
-				.px(px(6.))
-				.h(px(20.))
-				.text_size(px(SMALL_TEXT))
-				.tooltip(tip(t("tip_copy_commits", loc)))
 				.when(self.selected_commit.is_some(), |b| {
-					b.on_click(cx.listener(|this, _, _, cx| {
+					b.tab_index(46).on_click(cx.listener(|this, _, _, cx| {
 						this.copy_commits_to_clipboard(cx)
 					}))
 				})
 				.children(probe(log, "btn-copy-commits")),
-			)
-			.child(
-				button(
-					"btn-prev-page",
-					"‹",
-					Btn::Ghost,
-					self.commit_page > 0,
-					43,
-				)
-				.px(px(6.))
-				.h(px(20.))
-				.tooltip(tip(t("page_prev", loc)))
-				.when(self.commit_page > 0, |b| {
-					b.on_click(
-						cx.listener(|this, _, _, cx| {
-							this.history_prev_page(cx)
-						}),
-					)
-				})
-				.children(probe(log, "btn-prev-page")),
-			)
-			.child(
-				div()
-					.id("page-indicator")
-					.flex_shrink_0()
-					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(pal().text_muted))
-					.child(format!("{}", self.commit_page + 1)),
-			)
-			.child(
-				button(
-					"btn-next-page",
-					"›",
-					Btn::Ghost,
-					self.history_has_more,
-					44,
-				)
-				.px(px(6.))
-				.h(px(20.))
-				.tooltip(tip(t("page_next", loc)))
-				.when(self.history_has_more, |b| {
-					b.on_click(
-						cx.listener(|this, _, _, cx| {
-							this.history_next_page(cx)
-						}),
-					)
-				})
-				.children(probe(log, "btn-next-page")),
-			)
-			.child(
-				button("btn-log-hide", t("hide", loc), Btn::Ghost, true, 47)
-					.px(px(6.))
-					.h(px(20.))
-					.text_size(px(SMALL_TEXT))
-					.on_click(cx.listener(|this, _, _, cx| this.toggle_log(cx)))
-					.children(probe(log, "btn-log-hide")),
 			);
-
-		// Refs sidebar grouped like IntelliJ's branches pane.
-		let mut ref_rows: Vec<AnyElement> = Vec::new();
-		let ref_entry = |id: String,
-		                 label: String,
-		                 glyph: Option<Icon>,
-		                 indent: f32,
-		                 target: Option<String>,
-		                 active: bool,
-		                 cx: &mut Context<Self>| {
-			div()
-				.id(SharedString::from(id.clone()))
-				.relative()
-				.flex_shrink_0()
-				.h(px(22.))
-				.pl(px(indent))
-				.pr(px(8.))
-				.flex()
-				.items_center()
-				.gap(px(5.))
-				.cursor_pointer()
-				.when(active, |d| d.bg(rgb(pal().selection_bg)))
-				.when(!active, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-				.tooltip(tip(label.clone()))
-				.on_click(cx.listener(move |this, _, _, cx| {
-					this.filter_by_ref(target.clone(), cx)
-				}))
-				.when_some(glyph, |d, g| d.child(icon(g, 12.)))
-				.child(clip_text(label).text_color(rgb(pal().text)))
-				.children(probe(log, id))
-				.into_any_element()
-		};
-		ref_rows.push(ref_entry(
-			"ref-all".into(),
-			t("refs_all", loc).to_string(),
-			None,
-			10.,
-			None,
-			self.active_ref_filter.is_none() && self.log_search.is_none(),
-			cx,
-		));
-		if self.head_sha.is_some() {
-			ref_rows.push(ref_entry(
-				"ref:HEAD".into(),
-				"HEAD".into(),
-				Some(Icon::Head),
-				10.,
-				Some("HEAD".into()),
-				self.active_ref_filter.as_deref() == Some("HEAD"),
-				cx,
-			));
-		}
-		for (key, prefix, glyph) in [
-			("refs_local", "refs/heads/", Icon::Branch),
-			("refs_remote", "refs/remotes/", Icon::RemoteBranch),
-			("refs_tags", "refs/tags/", Icon::Tag),
-		] {
-			let members: Vec<_> = self
-				.refs
-				.iter()
-				.filter(|r| r.name.starts_with(prefix))
-				.collect();
-			if members.is_empty() {
-				continue;
-			}
-			ref_rows.push(
-				div()
-					.flex_shrink_0()
-					.h(px(22.))
-					.mt(px(4.))
-					.px(px(6.))
-					.flex()
-					.items_center()
-					.gap(px(3.))
-					.text_size(px(11.))
-					.font_weight(FontWeight::SEMIBOLD)
-					.text_color(rgb(pal().text_muted))
-					.child(icon(Icon::ChevronDown, 10.))
-					.child(clip_text(format!(
-						"{} ({})",
-						t(key, loc),
-						members.len()
-					)))
-					.into_any_element(),
-			);
-			// Bounded: very large ref sets are reached through the selector.
-			for r in members.iter().take(200) {
-				ref_rows.push(ref_entry(
-					format!("ref:{}", r.name),
-					r.name[prefix.len()..].to_string(),
-					Some(glyph),
-					22.,
-					Some(r.name.clone()),
-					self.active_ref_filter.as_deref() == Some(r.name.as_str()),
-					cx,
-				));
-			}
-		}
 
 		let searching = self.log_search.is_some();
 		let gutter_w = if searching {
@@ -4606,37 +5172,44 @@ impl WorkbenchModel {
 				.map(graph_view::gutter_width)
 				.unwrap_or(40.0)
 		};
-		let col_header = div()
-			.relative()
-			.w_full()
-			.flex()
-			.flex_row()
-			.items_center()
-			.flex_shrink_0()
-			.h(px(22.))
-			.pr(px(6.))
-			.gap(px(6.))
-			.border_b_1()
-			.border_color(rgb(pal().divider))
-			.text_size(px(SMALL_TEXT))
-			.text_color(rgb(pal().text_muted))
-			.child(fill_text(t("col_message", loc)).pl(px(gutter_w)))
-			.child(
-				div()
-					.flex_shrink_0()
-					.w(px(100.))
-					.child(t("col_author", loc)),
-			)
-			.child(div().flex_shrink_0().w(px(115.)).child(t("col_date", loc)))
-			.child(div().flex_shrink_0().w(px(60.)).child(t("col_hash", loc)));
-
-		let n = self.display_commits().len();
+		let rows = self.display_commits();
+		let n = rows.len();
+		// Tint rows on the current branch only when others are shown too.
+		let on_head: Rc<Vec<bool>> = {
+			let marks: HashMap<&str, bool> = self
+				.commits
+				.iter()
+				.zip(&self.log_on_head)
+				.map(|(c, on)| (c.sha.as_str(), *on))
+				.collect();
+			let v: Vec<bool> = rows
+				.iter()
+				.map(|c| marks.get(c.sha.as_str()).copied().unwrap_or(false))
+				.collect();
+			Rc::new(if v.iter().all(|on| *on) {
+				Vec::new()
+			} else {
+				v
+			})
+		};
+		drop(rows);
+		let list_w = f32::from(
+			self.log_scroll.0.borrow().base_handle.bounds().size.width,
+		);
+		let loading_row = self.history_extending && self.history_has_more;
 		let list = uniform_list(
 			"log-rows",
-			n,
+			n + usize::from(loading_row),
 			cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+				this.autoload_near(n, cx);
 				range
-					.map(|ix| this.log_row(ix, gutter_w, cx))
+					.map(|ix| {
+						if ix >= n {
+							return this.log_loading_row();
+						}
+						let tint = on_head.get(ix).copied().unwrap_or(false);
+						this.log_row(ix, gutter_w, list_w, tint, cx)
+					})
 					.collect::<Vec<_>>()
 			}),
 		)
@@ -4652,6 +5225,7 @@ impl WorkbenchModel {
 			.h(px(height))
 			.bg(rgb(pal().panel_bg))
 			.rounded(px(ISLAND_RADIUS))
+			.overflow_hidden()
 			.child(header)
 			.when_some(self.history_error.clone(), |d, err| {
 				d.child(
@@ -4668,46 +5242,23 @@ impl WorkbenchModel {
 						.children(probe(log, "log-error")),
 				)
 			})
-			.when(searching, |d| {
-				d.child(
-					div()
-						.flex_shrink_0()
-						.px(px(10.))
-						.py(px(2.))
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().warning))
-						.child(tf("search_note", loc, &[&n])),
-				)
-			})
 			.child(
 				div()
 					.flex()
 					.flex_row()
 					.flex_1()
 					.min_h_0()
-					.child(
-						div()
-							.id("refs-scroll")
-							.flex()
-							.flex_col()
-							.flex_shrink_0()
-							.w(px(180.))
-							.h_full()
-							.overflow_y_scroll()
-							.border_r_1()
-							.border_color(rgb(pal().border))
-							.text_size(px(SMALL_TEXT))
-							.py(px(2.))
-							.children(ref_rows),
-					)
+					.child(self.render_branch_toolbar(cx))
+					.when(self.log_branches_visible, |d| {
+						d.child(self.render_branches(cx))
+					})
 					.child(
 						div()
 							.flex()
 							.flex_col()
 							.flex_1()
 							.min_w_0()
-							.bg(rgb(pal().editor_bg))
-							.child(col_header)
+							.child(filter_bar)
 							.child(
 								div()
 									.id("log-list")
@@ -4758,10 +5309,20 @@ impl WorkbenchModel {
 											this.locate_head(cx)
 										},
 									))
+									.on_scroll_wheel(cx.listener(
+										|this, _: &ScrollWheelEvent, _, cx| {
+											if !this.history_autoload {
+												this.rearm_autoload();
+												cx.notify();
+											}
+										},
+									))
 									.flex_1()
 									.min_h_0()
 									.when(
-										n == 0 && self.history_error.is_none(),
+										n == 0
+											&& self.history_error.is_none()
+											&& !self.history_extending,
 										|d| {
 											d.child(
 												div()
@@ -4776,8 +5337,28 @@ impl WorkbenchModel {
 									.child(list)
 									.children(probe(log, "log-list")),
 							),
-					),
+					)
+					.when(self.log_details_visible, |d| {
+						d.child(self.splitter(Splitter::LogDetails, cx))
+							.child(self.render_commit_panel(cx))
+					}),
 			)
+			.into_any_element()
+	}
+
+	fn log_loading_row(&self) -> AnyElement {
+		div()
+			.id("log-loading")
+			.relative()
+			.w_full()
+			.h(px(graph_view::ROW_HEIGHT))
+			.px(px(10.))
+			.flex()
+			.items_center()
+			.text_size(px(SMALL_TEXT))
+			.text_color(rgb(pal().text_muted))
+			.child(t("log_loading_more", self.locale))
+			.children(probe(&self.probes, "log-loading"))
 			.into_any_element()
 	}
 
@@ -4785,12 +5366,15 @@ impl WorkbenchModel {
 		&self,
 		ix: usize,
 		gutter_w: f32,
+		list_w: f32,
+		on_head: bool,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let rows = self.display_commits();
 		let Some(c) = rows.get(ix).copied() else {
 			return div().into_any_element();
 		};
+		let loc = self.locale;
 		let selected = self.selected_commit.as_deref() == Some(&c.sha);
 		let in_range =
 			self.range_rows().is_some_and(|(a, b)| ix >= a && ix <= b);
@@ -4814,102 +5398,38 @@ impl WorkbenchModel {
 		} else {
 			0
 		};
-		// Display only: at most two readable badges, the rest fold into `+N`
-		// (full list in its tooltip). Ref data and filtering keep every ref.
 		let current_branch = self
 			.repo()
 			.and_then(|r| r.summary.as_ref().ok())
 			.and_then(|s| s.branch.clone());
-		let badge = |id: String, color: gpui::Rgba, strong: bool| {
-			let tint = |a: f32| gpui::Rgba { a, ..color };
-			div()
-				.id(SharedString::from(id))
-				.min_w(px(24.))
-				.max_w(px(120.))
-				.h(px(16.))
-				.px(px(5.))
-				.flex()
-				.items_center()
-				.rounded(px(3.))
-				.border_1()
-				.border_color(tint(if strong { 0.7 } else { 0.35 }))
-				.bg(tint(if strong { 0.25 } else { 0.12 }))
-				.text_size(px(11.))
-				.text_color(color)
-				.when(strong, |d| d.font_weight(FontWeight::SEMIBOLD))
-		};
-		let labels: Vec<AnyElement> = graph_row
+		let (labels, labels_w) = graph_row
 			.as_ref()
 			.map(|r| {
-				let (shown, hidden) = graph_view::visible_refs(
+				ref_label_elements(
 					&r.refs,
 					current_branch.as_deref(),
-				);
-				let mut out: Vec<AnyElement> = shown
-					.into_iter()
-					.map(|b| {
-						let info = b.primary;
-						let (name, color) = graph_view::format_ref_badge(info);
-						let strong = matches!(
-							info.kind,
-							snip_core::graph::RefKind::Head
-						) || (matches!(
-							info.kind,
-							snip_core::graph::RefKind::Branch
-						) && current_branch.as_deref()
-							== Some(info.display_name.as_str()));
-						let tooltip = std::iter::once(info)
-							.chain(b.merged.iter().copied())
-							.map(|i| graph_view::format_ref_badge(i).0)
-							.collect::<Vec<_>>()
-							.join("\n");
-						badge(
-							format!("ref-badge:{}:{}", short(&sha), name),
-							color,
-							strong,
-						)
-						.gap(px(3.))
-						.tooltip(tip(tooltip))
-						.child(clip_text(name))
-						// Merged remote-tracking refs: small remote marker.
-						.when(!b.merged.is_empty(), |d| {
-							d.child(
-								div()
-									.flex_shrink_0()
-									.text_size(px(10.))
-									.text_color(rgb(pal().ref_remote))
-									.child("⇅"),
-							)
-						})
-						.into_any_element()
-					})
-					.collect();
-				if hidden > 0 {
-					let all = r
-						.refs
-						.iter()
-						.map(|i| graph_view::format_ref_badge(i).0)
-						.collect::<Vec<_>>()
-						.join("\n");
-					out.push(
-						badge(
-							format!("ref-more:{}", short(&sha)),
-							rgb(pal().text_muted),
-							false,
-						)
-						.flex_shrink_0()
-						.min_w(px(0.))
-						.tooltip(tip(all))
-						.child(format!("+{hidden}"))
-						.into_any_element(),
-					);
-				}
-				out
+					short(&sha),
+				)
 			})
 			.unwrap_or_default();
+		let mine = self
+			.git_user_email
+			.as_deref()
+			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email));
+		let hash_w = if self.log_show_hash { 64. } else { 0. };
+		// ponytail: estimated text width (no shaping per row); a subject
+		// near the edge may miss or gain its tooltip.
+		let subject_room =
+			list_w - gutter_w - AUTHOR_W - DATE_W - hash_w - labels_w - 40.;
+		let truncated = approx_text_w(&c.subject, UI_TEXT) > subject_room;
 		let row_id = format!("commit-row:{}", short(&sha));
 		let col_id = format!("collapse:{}", short(&sha));
 		let merge_sha = sha.clone();
+		let node_x = graph_row
+			.as_ref()
+			.map(|r| graph_view::lane_x(r.node.lane))
+			.unwrap_or(0.);
+		let date = log_date(&c.author_date, loc, unix_now());
 		div()
 			.id(SharedString::from(row_id.clone()))
 			.relative()
@@ -4918,9 +5438,12 @@ impl WorkbenchModel {
 			.flex_row()
 			.items_center()
 			.h(px(graph_view::ROW_HEIGHT))
-			.pr(px(6.))
-			.gap(px(6.))
+			.pr(px(8.))
+			.gap(px(8.))
 			.cursor_pointer()
+			.when(on_head && !selected && !in_range, |d| {
+				d.bg(rgb(pal().log_current_branch_bg))
+			})
 			.when(selected, |d| {
 				d.bg(rgb(if self.log_active {
 					pal().selection_bg
@@ -4951,43 +5474,33 @@ impl WorkbenchModel {
 			})
 			.child(
 				div()
-					.flex_1()
-					.min_w_0()
-					.flex()
-					.flex_row()
-					.items_center()
-					.gap(px(4.))
-					.overflow_hidden()
-					.child(
-						div()
-							.flex_shrink_0()
-							.w(px(gutter_w))
-							.h(px(graph_view::ROW_HEIGHT))
-							.when_some(graph_row, |el, r| {
-								el.child(
-									canvas(
-										|_, _, _| {},
-										move |bounds, _, window, _| {
-											graph_view::paint_row_graph(
-												window, &r, &strokes, bounds,
-											);
-										},
-									)
-									.size_full(),
-								)
-							}),
-					)
+					.relative()
+					.flex_shrink_0()
+					.w(px(gutter_w))
+					.h(px(graph_view::ROW_HEIGHT))
+					.when_some(graph_row, |el, r| {
+						el.child(
+							canvas(
+								|_, _, _| {},
+								move |bounds, _, window, _| {
+									graph_view::paint_row_graph(
+										window, &r, &strokes, bounds,
+									);
+								},
+							)
+							.size_full(),
+						)
+					})
+					// Merge rows collapse from their graph node.
 					.when(is_merge, |d| {
 						d.child(
 							div()
 								.id(SharedString::from(col_id.clone()))
-								.relative()
-								.flex_shrink_0()
-								.flex()
-								.items_center()
-								.gap(px(2.))
-								.px(px(2.))
-								.rounded(px(3.))
+								.absolute()
+								.left(px(node_x - 7.))
+								.top(px(graph_view::ROW_HEIGHT / 2. - 7.))
+								.size(px(14.))
+								.rounded(px(7.))
 								.hover(|s| s.bg(rgb(pal().hover_bg)))
 								.tooltip(tip(t(
 									if collapsed {
@@ -4995,46 +5508,25 @@ impl WorkbenchModel {
 									} else {
 										"tip_collapse_merge"
 									},
-									self.locale,
+									loc,
 								)))
 								.on_click(cx.listener(move |this, _, _, cx| {
 									cx.stop_propagation();
 									this.toggle_collapse(merge_sha.clone(), cx);
 								}))
-								.child(icon(
-									if collapsed {
-										Icon::ChevronRight
-									} else {
-										Icon::ChevronDown
-									},
-									10.,
-								))
-								.when(collapsed, |d| {
-									d.child(
-										div()
-											.text_size(px(11.))
-											.text_color(rgb(pal().warning))
-											.child(tf(
-												"collapsed_n",
-												self.locale,
-												&[&hidden_n],
-											)),
-									)
-								})
 								.children(probe(&self.probes, col_id.clone())),
 						)
-					})
-					.child(
-						div()
-							.flex()
-							.flex_row()
-							.items_center()
-							.gap(px(3.))
-							.min_w_0()
-							.max_w(gpui::relative(0.45))
-							.overflow_hidden()
-							.children(labels),
-					)
+					}),
+			)
+			.child(
+				div()
+					.flex_1()
+					.min_w_0()
+					.flex()
+					.flex_row()
+					.items_center()
+					.gap(px(6.))
+					.overflow_hidden()
 					.child(
 						div()
 							.id(SharedString::from(format!(
@@ -5046,47 +5538,422 @@ impl WorkbenchModel {
 							.overflow_hidden()
 							.line_clamp(1)
 							.text_ellipsis()
-							.tooltip(tip(c.subject.clone()))
+							.when(truncated, |d| {
+								d.tooltip(tip(c.subject.clone()))
+							})
 							.child(c.subject.clone()),
+					)
+					.when(collapsed, |d| {
+						d.child(
+							div()
+								.flex_shrink_0()
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(tf("collapsed_n", loc, &[&hidden_n])),
+						)
+					})
+					.child(
+						div()
+							.flex_shrink_0()
+							.ml_auto()
+							.flex()
+							.flex_row()
+							.items_center()
+							.gap(px(8.))
+							.children(labels),
 					),
 			)
 			.child(
 				div()
 					.id(SharedString::from(format!("author:{}", short(&sha))))
 					.flex_shrink_0()
-					.text_size(px(SMALL_TEXT))
-					.w(px(100.))
-					.tooltip(tip(c.author_name.clone()))
+					.w(px(AUTHOR_W))
+					.tooltip(tip(format!(
+						"{} <{}>",
+						c.author_name, c.author_email
+					)))
 					.child(
-						clip_text(c.author_name.clone())
-							.text_color(rgb(pal().text_muted)),
+						clip_text(c.author_name.clone()).when(mine, |d| {
+							d.font_weight(FontWeight::SEMIBOLD)
+						}),
 					),
 			)
 			.child(
 				div()
 					.id(SharedString::from(format!("date:{}", short(&sha))))
 					.flex_shrink_0()
-					.text_size(px(SMALL_TEXT))
-					.w(px(115.))
+					.w(px(DATE_W))
 					.tooltip(tip(short_date(&c.author_date)))
-					.child(
-						clip_text(short_date(&c.author_date))
-							.text_color(rgb(pal().text_muted)),
-					),
+					.child(clip_text(date)),
+			)
+			.when(self.log_show_hash, |d| {
+				d.child(
+					div()
+						.id(SharedString::from(format!("sha:{}", short(&sha))))
+						.flex_shrink_0()
+						.w(px(hash_w))
+						.font_family(CODE_FONT)
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text_muted))
+						.tooltip(tip(c.sha.clone()))
+						.child(short(&c.sha).to_string()),
+				)
+			})
+			.children(probe(&self.probes, row_id))
+			.into_any_element()
+	}
+
+	/// The log's right pane: the selected commit's changed files grouped by
+	/// directory, then its details (or the compare's range).
+	fn render_commit_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let rows = Rc::new(crate::history::changed_file_rows(
+			&self.commit_files,
+			&self.changed_dirs_collapsed,
+		));
+		let n = self.commit_files.len();
+		let files_header = div()
+			.flex()
+			.flex_row()
+			.items_center()
+			.flex_shrink_0()
+			.h(px(30.))
+			.px(px(8.))
+			.gap(px(4.))
+			.border_b_1()
+			.border_color(rgb(pal().divider))
+			.child(
+				fill_text(if n > 0 {
+					tf("changed_files", loc, &[&n])
+				} else {
+					String::new()
+				})
+				.text_size(px(SMALL_TEXT))
+				.text_color(rgb(pal().text_muted)),
+			)
+			.child(
+				log_icon_button(
+					"details-expand-all",
+					Icon::ExpandAll,
+					t("tip_expand_all", loc),
+					n > 0,
+					false,
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.changed_dirs_collapsed.clear();
+					cx.notify();
+				}))
+				.children(probe(log, "details-expand-all")),
+			)
+			.child(
+				log_icon_button(
+					"details-collapse-all",
+					Icon::CollapseAll,
+					t("tip_collapse_all", loc),
+					n > 0,
+					false,
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.changed_dirs_collapsed =
+						crate::history::changed_file_rows(
+							&this.commit_files,
+							&[],
+						)
+						.into_iter()
+						.filter_map(|r| match r {
+							crate::history::ChangedRow::Dir {
+								path, ..
+							} => Some(path),
+							_ => None,
+						})
+						.collect();
+					cx.notify();
+				}))
+				.children(probe(log, "details-collapse-all")),
+			);
+		let files = uniform_list(
+			"commit-files",
+			rows.len(),
+			cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+				range
+					.filter_map(|ix| rows.get(ix).cloned())
+					.map(|row| this.changed_file_row(row, cx))
+					.collect::<Vec<_>>()
+			}),
+		)
+		.size_full();
+
+		let details: AnyElement = if let Some((from, to)) = &self.compare {
+			div()
+				.text_color(rgb(pal().text))
+				.font_weight(FontWeight::SEMIBOLD)
+				.child(tf("compare_header", loc, &[&short(from), &short(to)]))
+				.into_any_element()
+		} else if let Some(sha) = self.selected_commit.as_deref() {
+			self.commit_details_view(sha).into_any_element()
+		} else {
+			div()
+				.text_color(rgb(pal().text_muted))
+				.child(t("log_details_empty", loc))
+				.into_any_element()
+		};
+		div()
+			.id("commit-panel")
+			.relative()
+			.flex()
+			.flex_col()
+			.flex_shrink_0()
+			.w(px(self.log_details_w))
+			.h_full()
+			.child(
+				div()
+					.flex()
+					.flex_col()
+					.flex_1()
+					.min_h_0()
+					.child(files_header)
+					.child(div().flex_1().min_h_0().py(px(2.)).child(files)),
 			)
 			.child(
 				div()
-					.id(SharedString::from(format!("sha:{}", short(&sha))))
-					.flex_shrink_0()
-					.w(px(60.))
-					.font_family(CODE_FONT)
-					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(pal().text_muted))
-					.tooltip(tip(c.sha.clone()))
-					.child(short(&c.sha).to_string()),
+					.id("commit-details")
+					.relative()
+					.flex_1()
+					.min_h_0()
+					.overflow_y_scroll()
+					.border_t_1()
+					.border_color(rgb(pal().divider))
+					.p(px(12.))
+					.child(details)
+					.children(probe(log, "commit-details")),
 			)
-			.children(probe(&self.probes, row_id))
+			.children(probe(log, "commit-panel"))
 			.into_any_element()
+	}
+
+	fn changed_file_row(
+		&self,
+		row: crate::history::ChangedRow,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		use crate::history::ChangedRow;
+		let loc = self.locale;
+		match row {
+			ChangedRow::Dir {
+				path,
+				files,
+				expanded,
+			} => {
+				let id = format!("commit-dir:{path}");
+				let p2 = path.clone();
+				div()
+					.id(SharedString::from(id.clone()))
+					.relative()
+					.flex()
+					.items_center()
+					.gap(px(5.))
+					.h(px(ROW_H))
+					.w_full()
+					.px(px(8.))
+					.cursor_pointer()
+					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.on_click(cx.listener(move |this, _, _, cx| {
+						let dirs = &mut this.changed_dirs_collapsed;
+						match dirs.iter().position(|d| d == &p2) {
+							Some(i) => {
+								dirs.remove(i);
+							}
+							None => dirs.push(p2.clone()),
+						}
+						cx.notify();
+					}))
+					.child(icon(
+						if expanded {
+							Icon::ChevronDown
+						} else {
+							Icon::ChevronRight
+						},
+						12.,
+					))
+					.child(icon(Icon::Folder, 14.))
+					.child(clip_text(path).text_color(rgb(pal().text)))
+					.child(
+						div()
+							.flex_shrink_0()
+							.text_color(rgb(pal().text_muted))
+							.child(tf("log_dir_files", loc, &[&files])),
+					)
+					.children(probe(&self.probes, id))
+					.into_any_element()
+			}
+			ChangedRow::File { idx, nested } => {
+				let Some((path, ct)) = self.commit_files.get(idx).cloned()
+				else {
+					return div().into_any_element();
+				};
+				let (_, color) = change_style(ct);
+				let sel = self.selected_commit_file.as_deref() == Some(&path)
+					&& self.rev_tree.is_none();
+				let id = format!("commit-file:{path}");
+				let name = if nested {
+					path.rsplit('/').next().unwrap_or(&path).to_string()
+				} else {
+					path.clone()
+				};
+				let p2 = path.clone();
+				div()
+					.id(SharedString::from(id.clone()))
+					.relative()
+					.flex()
+					.items_center()
+					.gap(px(5.))
+					.h(px(ROW_H))
+					.w_full()
+					.pl(px(if nested { 42. } else { 8. }))
+					.pr(px(8.))
+					.cursor_pointer()
+					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
+					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+					.tooltip(tip(path.clone()))
+					.on_click(cx.listener(move |this, _, _, cx| {
+						this.select_commit_file(&p2, cx)
+					}))
+					.child(icon(file_icon(&path), 14.))
+					.child(fill_text(name).text_color(rgb(color)))
+					.children(probe(&self.probes, id))
+					.into_any_element()
+			}
+		}
+	}
+
+	/// Message, hash, author and date, the commit's refs and the branches
+	/// that contain it, like IntelliJ's commit details.
+	fn commit_details_view(&self, sha: &str) -> Div {
+		let loc = self.locale;
+		let now = unix_now();
+		let row = self.commits.iter().find(|c| c.sha == sha);
+		let details = self.commit_details.as_ref().filter(|d| d.sha == sha);
+		let message = details
+			.map(|d| d.message.clone())
+			.or_else(|| row.map(|c| c.subject.clone()))
+			.unwrap_or_default();
+		let (subject, body) = match message.split_once('\n') {
+			Some((s, b)) => (s.to_string(), b.trim().to_string()),
+			None => (message, String::new()),
+		};
+		let (author, email, date) = match (details, row) {
+			(Some(d), _) => (
+				d.author.clone(),
+				d.author_email.clone(),
+				d.author_date.clone(),
+			),
+			(None, Some(c)) => (
+				c.author_name.clone(),
+				c.author_email.clone(),
+				c.author_date.clone(),
+			),
+			_ => Default::default(),
+		};
+		let current_branch = self
+			.repo()
+			.and_then(|r| r.summary.as_ref().ok())
+			.and_then(|s| s.branch.clone());
+		let refs = self
+			.display_commits()
+			.iter()
+			.position(|c| c.sha == sha)
+			.and_then(|ix| {
+				self.graph_layout.as_ref().and_then(|l| l.rows.get(ix))
+			})
+			.map(|r| r.refs.clone())
+			.unwrap_or_default();
+		let muted = |s: String| {
+			div()
+				.text_size(px(SMALL_TEXT))
+				.text_color(rgb(pal().text_muted))
+				.child(s)
+		};
+		div()
+			.flex()
+			.flex_col()
+			.gap(px(6.))
+			.text_color(rgb(pal().text))
+			.child(div().font_weight(FontWeight::SEMIBOLD).child(subject))
+			.when(!body.is_empty(), |d| {
+				d.child(div().whitespace_normal().child(body))
+			})
+			.child(
+				div()
+					.flex()
+					.flex_wrap()
+					.gap(px(4.))
+					.child(
+						div()
+							.font_family(CODE_FONT)
+							.text_size(px(SMALL_TEXT))
+							.child(short(sha).to_string()),
+					)
+					.child(div().child(author))
+					.when(!email.is_empty(), |d| {
+						d.child(
+							div()
+								.text_color(rgb(pal().link))
+								.child(format!("<{email}>")),
+						)
+					}),
+			)
+			.child(muted(tf(
+				"log_details_on",
+				loc,
+				&[&log_date(&date, loc, now)],
+			)))
+			.when_some(
+				details.filter(|d| {
+					d.commit_date != d.author_date
+						|| d.committer_email != d.author_email
+				}),
+				|el, d| {
+					el.child(muted(tf(
+						"log_details_committed",
+						loc,
+						&[&d.committer, &log_date(&d.commit_date, loc, now)],
+					)))
+				},
+			)
+			.when(!refs.is_empty(), |d| {
+				let badges = graph_view::merge_tracking_refs(&refs);
+				d.child(div().flex().flex_col().gap(px(2.)).children(
+					badges.iter().map(|b| {
+						let l =
+							graph_view::ref_label(b, current_branch.as_deref());
+						div()
+							.flex()
+							.items_center()
+							.gap(px(4.))
+							.child(label_icon(&l))
+							.child(l.text)
+					}),
+				))
+			})
+			.when_some(details.filter(|d| !d.branches.is_empty()), |el, d| {
+				let mut list = d.branches.join(", ");
+				if d.branches_more {
+					list.push_str(", …");
+				}
+				el.child(muted(tf(
+					"log_details_in_branches",
+					loc,
+					&[
+						&format!(
+							"{}{}",
+							d.branches.len(),
+							if d.branches_more { "+" } else { "" }
+						),
+						&list,
+					],
+				)))
+			})
 	}
 
 	/// IntelliJ status bar: message on the left, borderless widgets on the
@@ -5528,6 +6395,33 @@ mod tests {
 		f.end_frame();
 		assert_eq!(f.end_frame(), vec!["btn-apply".to_string()]);
 		assert!(f.report("btn-apply", [5, 2, 3, 4]), "reappearing is new");
+	}
+
+	#[test]
+	fn log_dates_are_relative_then_locale_short() {
+		assert_eq!(days_from_civil(1970, 1, 1), 0);
+		assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+		// 2026-09-28 10:00 UTC.
+		let now = days_from_civil(2026, 9, 28) * 86_400 + 10 * 3600;
+		let d = |iso: &str, loc| log_date(iso, loc, now);
+		assert_eq!(d("2026-09-28T08:05:00+00:00", Locale::En), "Today 08:05");
+		assert_eq!(d("2026-09-27T23:59:00Z", Locale::ZhTw), "昨天 23:59");
+		assert_eq!(
+			d("2026-08-19T20:57:00+02:00", Locale::En),
+			"8/19/26, 20:57"
+		);
+		assert_eq!(
+			d("2025-08-19T20:57:00+02:00", Locale::ZhTw),
+			"2025/8/19 20:57"
+		);
+		// Judged in the commit's offset: 02:00 on the 29th at +08:00 is
+		// "today" when UTC is still the 28th at 18:00.
+		let evening = days_from_civil(2026, 9, 28) * 86_400 + 18 * 3600;
+		assert_eq!(
+			log_date("2026-09-29T02:00:00+08:00", Locale::En, evening),
+			"Today 02:00"
+		);
+		assert_eq!(log_date("garbage", Locale::En, now), "garbage");
 	}
 
 	#[test]

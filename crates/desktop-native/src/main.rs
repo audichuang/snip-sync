@@ -106,7 +106,7 @@ use snip_core::workspace::{
 	RepoSummary, ScanBudget, ScanStatus, SubmoduleState,
 };
 
-use crate::history::{LogSearch, RevTree};
+use crate::history::RevTree;
 use crate::i18n::{Locale, Msg};
 use crate::paste::PastePreviewPlan;
 use crate::reader::{Preview, PreviewSource, Reader};
@@ -114,6 +114,7 @@ use crate::syntax::Language;
 use crate::text_input::{InputEvent, TextInput};
 use crate::tree::FileTreeNode;
 use crate::tree::{NodeKey, TreeCommand, TreeEffect, TreeIo};
+use snip_core::browser::LogQuery;
 
 actions!(
 	workbench,
@@ -635,8 +636,7 @@ pub struct WorkbenchModel {
 	pub history_page_size: usize,
 	pub history_error: Option<String>,
 	pub page_checkpoints: Vec<Option<snip_core::graph::GraphCheckpoint>>,
-	pub log_search: Option<LogSearch>,
-	pub search_by_author: bool,
+	pub log_search: Option<LogQuery>,
 	pub collapsed_merges: Vec<String>,
 	/// Commits hidden on this page by collapsed merges.
 	pub hidden_commits: Vec<String>,
@@ -647,6 +647,34 @@ pub struct WorkbenchModel {
 	pub range_head: Option<String>,
 	pub log_scroll: gpui::UniformListScrollHandle,
 	pub select_head_after_load: bool,
+
+	// Git log pane (IJ-2a).
+	/// First page of the loaded window (`commit_page` is the last).
+	pub log_first_page: usize,
+	/// A neighbouring page is being read into the window.
+	pub history_extending: bool,
+	/// Scrolling to either end reads the next page; off after a failed read
+	/// until the user scrolls again.
+	pub history_autoload: bool,
+	/// Per loaded commit: reachable from HEAD (tinted rows).
+	pub log_on_head: Vec<bool>,
+	/// The filter bar as edited; `log_search` is what the log shows.
+	pub log_filter: LogQuery,
+	pub log_menu: Option<ui::LogMenu>,
+	pub log_path_input: Entity<TextInput>,
+	pub branch_filter_input: Entity<TextInput>,
+	/// Collapsed groups of the branches pane ("refs_local", …).
+	pub branch_groups_collapsed: Vec<&'static str>,
+	pub log_branches_visible: bool,
+	pub log_details_visible: bool,
+	pub log_show_hash: bool,
+	pub log_details_w: f32,
+	/// Collapsed directories of the changed-files tree.
+	pub changed_dirs_collapsed: Vec<String>,
+	pub commit_details: Option<crate::history::CommitDetails>,
+	pub details_generation: u64,
+	pub details_cancel: Option<CancelToken>,
+	pub git_user_email: Option<String>,
 
 	// Files of the selected commit or compare.
 	pub commit_files: Vec<(String, Option<ChangeType>)>,
@@ -779,6 +807,7 @@ pub struct WorkbenchModel {
 pub enum Splitter {
 	Left,
 	Bottom,
+	LogDetails,
 }
 
 impl WorkbenchModel {
@@ -800,6 +829,29 @@ impl WorkbenchModel {
 			TextInput::new(i18n::t("selector_filter_placeholder", loc), 0, cx)
 				.borderless()
 		});
+		let log_path_input = cx.new(|cx| {
+			TextInput::new(i18n::t("log_paths_placeholder", loc), 0, cx)
+		});
+		cx.subscribe(&log_path_input, |this, input, ev: &InputEvent, cx| {
+			match ev {
+				InputEvent::Submit => {
+					let p = input.read(cx).text().trim().to_string();
+					this.set_log_paths(p, cx);
+				}
+				InputEvent::Dismiss => this.close_log_menu(cx),
+				_ => {}
+			}
+		})
+		.detach();
+		let branch_filter_input = cx.new(|cx| {
+			TextInput::new(i18n::t("log_branch_placeholder", loc), 39, cx)
+		});
+		cx.subscribe(&branch_filter_input, |_, _, ev: &InputEvent, cx| {
+			if matches!(ev, InputEvent::Changed) {
+				cx.notify();
+			}
+		})
+		.detach();
 		cx.subscribe(&find_input, |this, input, ev: &InputEvent, cx| {
 			let q = input.read(cx).text().to_string();
 			match ev {
@@ -919,7 +971,6 @@ impl WorkbenchModel {
 			history_error: None,
 			page_checkpoints: vec![None],
 			log_search: None,
-			search_by_author: false,
 			collapsed_merges: Vec::new(),
 			hidden_commits: Vec::new(),
 			history_walk: None,
@@ -927,6 +978,24 @@ impl WorkbenchModel {
 			range_head: None,
 			log_scroll: gpui::UniformListScrollHandle::new(),
 			select_head_after_load: false,
+			log_first_page: 0,
+			history_extending: false,
+			history_autoload: true,
+			log_on_head: Vec::new(),
+			log_filter: LogQuery::default(),
+			log_menu: None,
+			log_path_input,
+			branch_filter_input,
+			branch_groups_collapsed: Vec::new(),
+			log_branches_visible: true,
+			log_details_visible: true,
+			log_show_hash: false,
+			log_details_w: theme::LOG_DETAILS_W_DEFAULT,
+			changed_dirs_collapsed: Vec::new(),
+			commit_details: None,
+			details_generation: 0,
+			details_cancel: None,
+			git_user_email: None,
 			commit_files: Vec::new(),
 			selected_commit_file: None,
 			compare: None,
@@ -1226,6 +1295,8 @@ impl WorkbenchModel {
 			(self.goto_input.clone(), "goto_placeholder"),
 			(self.log_search_input.clone(), "log_search_placeholder"),
 			(self.selector_input.clone(), "selector_filter_placeholder"),
+			(self.log_path_input.clone(), "log_paths_placeholder"),
+			(self.branch_filter_input.clone(), "log_branch_placeholder"),
 		] {
 			input.update(cx, |i, _| i.set_placeholder(i18n::t(key, loc)));
 		}
@@ -1683,6 +1754,7 @@ impl WorkbenchModel {
 			&mut self.tree_cancel,
 			&mut self.rev_tree_cancel,
 			&mut self.repo_cancel,
+			&mut self.details_cancel,
 		] {
 			if let Some(token) = slot.take() {
 				token.cancel();
@@ -1705,6 +1777,16 @@ impl WorkbenchModel {
 		self.range_head = None;
 		self.select_head_after_load = false;
 		release_vec(&mut self.commit_files);
+		self.log_first_page = 0;
+		self.history_extending = false;
+		self.history_autoload = true;
+		release_vec(&mut self.log_on_head);
+		self.log_filter = LogQuery::default();
+		self.log_menu = None;
+		release_vec(&mut self.changed_dirs_collapsed);
+		self.commit_details = None;
+		self.details_generation = self.details_generation.wrapping_add(1);
+		self.git_user_email = None;
 		self.selected_commit_file = None;
 		self.compare = None;
 		release_vec(&mut self.files);
@@ -1735,6 +1817,8 @@ impl WorkbenchModel {
 			self.selector_input.clone(),
 			self.add_repo_input.clone(),
 			self.workspace_path_input.clone(),
+			self.log_path_input.clone(),
+			self.branch_filter_input.clone(),
 		] {
 			input.update(cx, |field, _| field.clear_retained());
 		}
@@ -2519,12 +2603,18 @@ impl WorkbenchModel {
 		self.files.clear();
 		self.changes_loaded = false;
 		self.commit_page = 0;
+		self.log_first_page = 0;
+		self.log_on_head.clear();
+		self.history_extending = false;
 		self.page_checkpoints = vec![None];
 		self.collapsed_merges.clear();
 		self.hidden_commits.clear();
 		self.history_walk = None;
 		self.history_error = None;
 		if !preserve_anchors {
+			self.log_filter = LogQuery::default();
+			self.commit_details = None;
+			self.git_user_email = None;
 			// A reload of the same repo keeps the log's branch filter and
 			// search, which the history reload applies again.
 			self.active_ref_filter = None;
