@@ -126,6 +126,12 @@ def _flat_endpoints(rss0: int = 200 * MIB, pss0: int = 120 * MIB) -> list[dict]:
     return rows
 
 
+def _flat_heap(span: int = 50 * MIB, resident: int = 26 * MIB) -> list[dict]:
+    """A constant `[heap]` span with a constant untouched part for every endpoint id."""
+    ids = [f"s-{done}" for done in range(10, 101, 10)] + ["terminal-final"]
+    return [{"sampleId": sid, "heapVmaBytes": span, "heapRssBytes": resident} for sid in ids]
+
+
 def stable_interactions() -> list[dict]:
     return [
         {"item": "tree", "ok": True, "input": "click", "log": "[APP:TREE_FILE_SELECTED: README.md]", "root": dict(ROOT)},
@@ -190,6 +196,7 @@ def stable_report() -> dict:
         "samples": _flat_endpoints(),
         "evidence": {"measuredSwitches": _actions(100, "measured"), "warmupSwitches": _actions(20, "warmup")},
         "interactions": stable_interactions(),
+        "heapReserve": _flat_heap(),
         "cleanup": {
             "checked": True, "problems": [], "survivors": [],
             "harnessForced": False, "productQuit": True, "graceful": True,
@@ -313,6 +320,58 @@ class TestVerdictMath(unittest.TestCase):
     def test_tiny_standard_preset_is_not_the_release_workload(self) -> None:
         kind = classify_workload({"preset": "standard", "summary": {"totalRepos": 15, "totalTrackedPaths": 1, "totalCommits": 1}})
         self.assertNotEqual(kind, "standard-release")
+
+    # CI run 36313388774: (switches, rss, pss, [heap] span, [heap] rss) per endpoint.
+    CI_HEAP_RESERVE_FILL = (
+        (10, 177709056, 153857024, 52363264, 26791936),
+        (20, 177840128, 153988096, 52363264, 26828800),
+        (30, 177958912, 154106880, 52363264, 26845184),
+        (40, 178024448, 154172416, 52363264, 26857472),
+        (50, 178044928, 154192896, 52363264, 26857472),
+        (60, 178094080, 154242048, 52363264, 26865664),
+        (70, 187924480, 164072448, 52363264, 36683776),
+        (80, 187924480, 164072448, 52363264, 36683776),
+        (90, 197152768, 173300736, 52363264, 45895680),
+        (100, 203350016, 179497984, 52363264, 52084736),
+    )
+
+    def _heap_series(self, rows) -> dict:
+        report = stable_report()
+        report["samples"] = [_endpoint(i, done, rss, pss) for i, (done, rss, pss, _span, _res) in enumerate(rows)]
+        report["heapReserve"] = [
+            {"sampleId": f"s-{done}", "heapVmaBytes": span, "heapRssBytes": res}
+            for done, _rss, _pss, span, res in rows
+        ]
+        return report
+
+    def test_touching_the_startup_heap_reserve_is_not_a_trend(self) -> None:
+        result = evaluate_report(self._heap_series(self.CI_HEAP_RESERVE_FILL))
+        self.assertGreater(result["analysis"]["rssBytes"]["slopePerSwitch"], gate.TREND_BYTES_PER_SWITCH)
+        self.assertNotIn("memory-trend", result["reasons"])
+        self.assertNotIn("missing-samples", result["reasons"])
+
+    def test_heap_span_growth_is_still_a_trend(self) -> None:
+        rows = [
+            (done, rss, pss, span + (rss - self.CI_HEAP_RESERVE_FILL[0][1]), res + (rss - self.CI_HEAP_RESERVE_FILL[0][1]))
+            for done, rss, pss, span, res in ((d, r, p, 52363264, 26791936) for d, r, p, _s, _h in self.CI_HEAP_RESERVE_FILL)
+        ]
+        self.assertIn("memory-trend", evaluate_report(self._heap_series(rows))["reasons"])
+
+    def test_endpoint_without_heap_snapshot_is_missing_samples(self) -> None:
+        report = stable_report()
+        report["heapReserve"] = report["heapReserve"][1:]
+        self.assertIn("missing-samples", evaluate_report(report)["reasons"])
+
+    def test_heap_mapping_reads_span_and_resident_bytes(self) -> None:
+        smaps = (
+            b"55d000000000-55d000001000 r-xp 00000000 08:01 1 /bin/app\n"
+            b"Rss:                   4 kB\n"
+            b"55d001000000-55d004000000 rw-p 00000000 00:00 0                          [heap]\n"
+            b"Size:              49152 kB\n"
+            b"Rss:               26624 kB\n"
+        )
+        self.assertEqual(gate.heap_mapping(smaps), {"heapVmaBytes": 48 * MIB, "heapRssBytes": 26 * MIB})
+        self.assertIsNone(gate.heap_mapping(b"Rss: 4 kB\n"))
 
     def test_memory_fd_thread_and_watcher_growth_are_rejected(self) -> None:
         memory = stable_report()

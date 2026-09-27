@@ -106,7 +106,8 @@ THRESHOLDS: dict[str, Any] = {
     "watcherGrowthMax": WATCHER_GROWTH_MAX,
     "calibration": (
         "Initial regression gates, including a zero retained-watcher budget. "
-        "Calibrate only from genuine stable runs. Do not raise these numbers to make a run pass."
+        "Calibrate only from genuine stable runs. Do not raise these numbers to make a run pass. "
+        "The trend is taken over RSS/PSS plus the not-yet-resident part of [heap] (see _trend_slope)."
     ),
 }
 FLOORS: dict[str, dict[str, Any]] = {
@@ -414,6 +415,38 @@ def _series_growth(samples: list[dict[str, Any]], key: str) -> dict[str, Any]:
         "growthLimit": _growth_limit(first_med) if key in ("rssBytes", "pssBytes") else None,
         "slopePerSwitch": _slope(xs, ys),
     }
+
+
+def _heap_untouched(report: dict[str, Any]) -> dict[str, float]:
+    """Per-sample `[heap]` address space that is mapped but not yet resident."""
+    out: dict[str, float] = {}
+    for row in report.get("heapReserve") or []:
+        if not isinstance(row, dict) or not isinstance(row.get("sampleId"), str):
+            continue
+        size, rss = row.get("heapVmaBytes"), row.get("heapRssBytes")
+        if _finite(size) and _finite(rss) and 0 <= rss <= size:
+            out[row["sampleId"]] = float(size - rss)
+    return out
+
+
+def _trend_slope(samples: list[dict[str, Any]], key: str, untouched: dict[str, float]) -> float | None:
+    """Slope of memory plus not-yet-resident main heap.
+
+    Lavapipe/LLVM leave ~24 MiB of `[heap]` mapped but never written at startup. Later
+    allocations reuse it, so RSS can climb late in a run with no new memory: CI runs
+    36310256622 and 36313388774 both kept `[heap]` at a constant 50 MiB span and both
+    ended at 49.7 MiB resident, one filling it before the measured window and one inside
+    it. Adding the untouched part back keeps that flat, while heap span growth and every
+    other mapping (thread arenas, mmap, GPU memfd) still count in full.
+    """
+    # ponytail: blind to main-arena leaks smaller than the startup heap reserve inside
+    # one short run; mallinfo2 in-use bytes from the app would close that gap.
+    if any(row.get("sampleId") not in untouched for row in samples):
+        return None
+    ordered = sorted(samples, key=lambda row: row["measuredSwitchesCompleted"])
+    xs = [float(row["measuredSwitchesCompleted"]) for row in ordered]
+    ys = [float(row[key]) + untouched[row["sampleId"]] for row in ordered]
+    return _slope(xs, ys)
 
 
 def _log_supports(item: str, row: dict[str, Any]) -> bool:
@@ -1082,14 +1115,18 @@ def evaluate_report(report: dict[str, Any]) -> dict[str, Any]:
         _add(reasons, "equivalent-state")
     analysis: dict[str, Any] = {}
     if status == "COMPLETED" and same_state and len(good) >= 3 and len(good) == len(endpoints):
+        untouched = _heap_untouched(out)
         for key in ("rssBytes", "pssBytes"):
             stats = _series_growth(good, key)
+            stats["trendSlopePerSwitch"] = _trend_slope(good, key, untouched)
             analysis[key] = stats
             if stats["slopePerSwitch"] is None or not _positive(stats["firstThirdMedian"]):
                 _add(reasons, "missing-samples")
             elif stats["growth"] > stats["growthLimit"]:
                 _add(reasons, "memory-growth")
-            elif stats["slopePerSwitch"] > TREND_BYTES_PER_SWITCH:
+            elif stats["trendSlopePerSwitch"] is None:
+                _add(reasons, "missing-samples")
+            elif stats["trendSlopePerSwitch"] > TREND_BYTES_PER_SWITCH:
                 _add(reasons, "memory-trend")
         for key, limit, code in (("fdCount", FD_GROWTH_MAX, "fd-growth"), ("threadCount", THREAD_GROWTH_MAX, "thread-growth"), ("watchCount", WATCHER_GROWTH_MAX, "watcher-growth")):
             stats = _series_growth(good, key)
@@ -1419,6 +1456,7 @@ def assemble_report(args: argparse.Namespace) -> dict[str, Any]:
         "sampleOrder": [],
         "evidence": {"measuredSwitches": [], "warmupSwitches": []},
         "interactions": [],
+        "heapReserve": [],
         "rawSamples": None,
         "coverage": {},
         "thresholds": dict(THRESHOLDS),
@@ -1603,7 +1641,23 @@ def _settle(session: NativeSession, exclude: set[int], seconds: float, meta: dic
     return rows
 
 
-def _capture_proc_snapshot(app: dict[str, Any], sample: dict[str, Any], out_dir: str, proc_root: str = "/proc") -> None:
+def heap_mapping(smaps: bytes) -> dict[str, int] | None:
+    """Address-space size and resident bytes of the main-arena `[heap]` mapping, if any."""
+    size = rss = None
+    for line in smaps.decode(errors="replace").splitlines():
+        head = line.split()
+        if len(head) >= 6 and "-" in head[0] and head[-1] == "[heap]":
+            start, end = (int(part, 16) for part in head[0].split("-"))
+            size = end - start
+        elif size is not None and head[:1] == ["Rss:"]:
+            rss = int(head[1]) * 1024
+            break
+    if size is None or rss is None:
+        return None
+    return {"heapVmaBytes": size, "heapRssBytes": rss}
+
+
+def _capture_proc_snapshot(app: dict[str, Any], sample: dict[str, Any], out_dir: str, proc_root: str = "/proc") -> dict[str, int] | None:
     """Read diagnostic sidecars after an endpoint is emitted, outside its settle window."""
     keys = ("pid", "starttime", "exe")
     expected = {key: app.get(key) for key in keys}
@@ -1648,6 +1702,7 @@ def _capture_proc_snapshot(app: dict[str, Any], sample: dict[str, Any], out_dir:
         })
     except OSError as exc:
         raise LeakError(f"proc snapshot failed for owned app {pid}: {exc}") from exc
+    return heap_mapping(contents["smaps"])
 
 
 def _resource_settled(row: dict[str, Any]) -> bool:
@@ -1965,7 +2020,9 @@ def drive_product(report: dict[str, Any], out_dir: str) -> None:
         report["samples"].append(payload)
         report["sampleOrder"].append(payload["sampleId"])
         if kind in ("endpoint", "terminal") and session is not None:
-            _capture_proc_snapshot(session.app, payload, out_dir)
+            heap = _capture_proc_snapshot(session.app, payload, out_dir)
+            if heap is not None:
+                report["heapReserve"].append({"sampleId": payload["sampleId"], **heap})
         return payload
 
     try:
