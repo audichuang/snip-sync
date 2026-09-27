@@ -143,6 +143,33 @@ def add_tar_bytes(tf: tarfile.TarFile, name: str, data: bytes, mode: int) -> Non
     tf.addfile(info, io.BytesIO(data))
 
 
+LICENSE_NAMES = (
+    "Inter-OFL.txt",
+    "JetBrainsMono-OFL.txt",
+    "expui-icons-LICENSE.txt",
+    "expui-icons-NOTICE.txt",
+)
+MAC_LICENSES = "snip-sync.app/Contents/Resources/licenses"
+WIN_LICENSES = "snip-sync/licenses"
+
+
+def add_tar_licenses(tf: tarfile.TarFile, lic_dir: str) -> None:
+    for name in LICENSE_NAMES:
+        add_tar_bytes(tf, f"{lic_dir}/{name}", b"license text\n", 0o644)
+
+
+def add_zip_licenses(zf: zipfile.ZipFile, lic_dir: str = WIN_LICENSES) -> None:
+    for name in LICENSE_NAMES:
+        zf.writestr(f"{lic_dir}/{name}", "license text\n")
+
+
+def write_bundle_licenses(contents: Path) -> None:
+    lic = contents / "Resources" / "licenses"
+    lic.mkdir(parents=True, exist_ok=True)
+    for name in LICENSE_NAMES:
+        (lic / name).write_text("license text\n")
+
+
 class TestVerifyArtifacts(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -212,6 +239,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         contents = bundle / "Contents"
         macos = contents / "MacOS"
         macos.mkdir(parents=True)
+        write_bundle_licenses(macos.parent)
 
         bin_path = macos / "snip-desktop-native"
         bin_path.write_bytes(make_macho(CPU_ARM64))
@@ -242,6 +270,7 @@ class TestVerifyArtifacts(unittest.TestCase):
 
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, MAC_BINARY, macho_arm64, 0o755)
+            add_tar_licenses(tf, MAC_LICENSES)
             add_tar_bytes(tf, MAC_PLIST, plist_bytes, 0o644)
 
         # Verification with target triple passes
@@ -253,6 +282,60 @@ class TestVerifyArtifacts(unittest.TestCase):
         with self.assertRaises(VerificationError):
             verify_tar_archive(tar_path, expected_version="0.2.0", target="aarch64-apple-darwin")
 
+    def test_license_members_must_be_exact(self) -> None:
+        """Every package carries exactly the third-party license set, non-empty, in its licenses/."""
+        pkg = "snip-sync-0.1.4"
+
+        def linux_tar(name: str, licenses: dict) -> Path:
+            path = self.test_dir / name
+            with tarfile.open(path, "w:gz") as tf:
+                add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", make_elf(), 0o755)
+                add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
+                add_tar_bytes(tf, f"{pkg}/share/applications/snip-sync.desktop", desktop_entry(), 0o644)
+                for member, data in licenses.items():
+                    add_tar_bytes(tf, member, data, 0o644)
+            return path
+
+        full = {f"{pkg}/licenses/{n}": b"text\n" for n in LICENSE_NAMES}
+        verify_tar_archive(linux_tar("ok.tar.gz", full), target="x86_64-unknown-linux-gnu", expected_version="0.1.4")
+
+        missing = dict(full)
+        missing.pop(f"{pkg}/licenses/expui-icons-NOTICE.txt")
+        extra = {**full, f"{pkg}/licenses/Other-OFL.txt": b"text\n"}
+        empty = {**full, f"{pkg}/licenses/Inter-OFL.txt": b""}
+        moved = {f"{pkg}/share/licenses/{n}": b"text\n" for n in LICENSE_NAMES}
+        for label, licenses, needle in (
+            ("missing", missing, "must be exactly"),
+            ("extra", extra, "must be exactly"),
+            ("empty", empty, "Empty license"),
+            ("moved", moved, "must be exactly"),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(VerificationError) as cm:
+                    verify_tar_archive(
+                        linux_tar(f"{label}.tar.gz", licenses),
+                        target="x86_64-unknown-linux-gnu",
+                        expected_version="0.1.4",
+                    )
+                self.assertIn(needle, str(cm.exception))
+
+        zip_path = self.test_dir / "no-lic.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr(WIN_BINARY, make_pe())
+            zf.writestr(WIN_README, "Version: 0.1.4\n")
+        with self.assertRaises(VerificationError) as cm:
+            verify_zip_archive(zip_path, target="x86_64-pc-windows-msvc", expected_version="0.1.4")
+        self.assertIn(WIN_LICENSES, str(cm.exception))
+
+        contents = self.test_dir / "snip-sync.app" / "Contents"
+        (contents / "MacOS").mkdir(parents=True)
+        (contents / "MacOS" / "snip-desktop-native").write_bytes(make_macho(CPU_ARM64))
+        (contents / "MacOS" / "snip-desktop-native").chmod(0o755)
+        (contents / "Info.plist").write_bytes(app_plist("0.1.4"))
+        with self.assertRaises(VerificationError) as cm:
+            verify_macos_bundle(contents.parent, expected_version="0.1.4")
+        self.assertIn(MAC_LICENSES, str(cm.exception))
+
     def test_verify_tar_archive_version_and_security(self) -> None:
         """Tests verifying a Linux .tar.gz archive with exact version check and path traversal rejection."""
         elf_x86_64 = make_elf()
@@ -260,6 +343,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         tar_path = self.test_dir / "snip-sync-linux-x86_64.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf_x86_64, 0o755)
+            add_tar_licenses(tf, f"{pkg}/licenses")
             add_tar_bytes(
                 tf,
                 f"{pkg}/README.txt",
@@ -289,6 +373,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         tar_bad_ver = self.test_dir / "tar_bad_ver.tar.gz"
         with tarfile.open(tar_bad_ver, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf_x86_64, 0o755)
+            add_tar_licenses(tf, f"{pkg}/licenses")
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 10.1.40\n", 0o644)
             add_tar_bytes(
                 tf,
@@ -320,6 +405,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
                 zf.writestr("snip-sync/snip-desktop-native.exe", elf_x86_64)
+                add_zip_licenses(zf)
                 zf.writestr("snip-sync/README.txt", "Version: 0.1.4\n")
 
         with self.assertRaises(VerificationError) as cm:
@@ -358,6 +444,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
                 zf.writestr(WIN_BINARY, pe_x86_64)
+                add_zip_licenses(zf)
                 zf.writestr(WIN_README, "Version: 0.1.4\nTarget: x86_64-pc-windows-msvc\n")
 
         res = verify_zip_archive(
@@ -493,6 +580,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
                 zf.writestr("snip-sync/snip-desktop-native.exe", pe_x86_64)
+                add_zip_licenses(zf)
                 zf.writestr("snip-sync/README.txt", "Version: 0.1.4\n")
                 zinfo = zipfile.ZipInfo("snip-sync/link.exe")
                 zinfo.create_system = 3  # Unix
@@ -564,6 +652,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
                 zf.writestr("snip-sync/snip-desktop-native.exe", pe_x86_64)
+                add_zip_licenses(zf)
                 zf.writestr("snip-sync/README.txt", "Version: 0.1.4\n")
                 zf.writestr("snip-sync/docs/README.txt", "Version: 0.1.4\n")
 
@@ -645,6 +734,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         tar_path = self.test_dir / name
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, binary_path, binary, 0o755)
+            add_tar_licenses(tf, MAC_LICENSES)
             add_tar_bytes(tf, plist_path, app_plist("0.1.4"), 0o644)
         return tar_path
 
@@ -722,6 +812,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         readme_tar = self.test_dir / "disconnected-readme.tar.gz"
         with tarfile.open(readme_tar, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
+            add_tar_licenses(tf, f"{pkg}/licenses")
             add_tar_bytes(tf, "docs/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(tf, f"{pkg}/share/applications/snip-sync.desktop", desktop_entry(), 0o644)
         with self.assertRaises(VerificationError) as readme_err:
@@ -731,6 +822,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         good_tar = self.test_dir / "desktop-spec.tar.gz"
         with tarfile.open(good_tar, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
+            add_tar_licenses(tf, f"{pkg}/licenses")
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(tf, f"{pkg}/share/applications/snip-sync.desktop", desktop_entry(), 0o644)
         res = verify_tar_archive(good_tar, expected_version="0.1.4", target="x86_64-unknown-linux-gnu")
@@ -739,6 +831,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         bad_exec = self.test_dir / "bad-exec.tar.gz"
         with tarfile.open(bad_exec, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
+            add_tar_licenses(tf, f"{pkg}/licenses")
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(
                 tf,
@@ -753,6 +846,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         app_version_in_desktop = self.test_dir / "desktop-app-version.tar.gz"
         with tarfile.open(app_version_in_desktop, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
+            add_tar_licenses(tf, f"{pkg}/licenses")
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(
                 tf,
@@ -772,6 +866,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
                 zf.writestr(WIN_BINARY, make_pe())
+                add_zip_licenses(zf)
                 zf.writestr("other/README.txt", "Version: 0.1.4\n")
         with self.assertRaises(VerificationError) as zip_err:
             verify_zip_archive(zip_path, expected_version="0.1.4", target="x86_64-pc-windows-msvc")
@@ -781,6 +876,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         tar_path = self.test_dir / "mode.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, MAC_BINARY, make_macho(CPU_ARM64), 0o644)
+            add_tar_licenses(tf, MAC_LICENSES)
             add_tar_bytes(tf, MAC_PLIST, app_plist(), 0o644)
         with self.assertRaises(VerificationError) as plain:
             verify_tar_archive(tar_path, expected_version="0.1.4", target="aarch64-apple-darwin")
@@ -789,6 +885,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         setuid = self.test_dir / "setuid.tar.gz"
         with tarfile.open(setuid, "w:gz") as tf:
             add_tar_bytes(tf, MAC_BINARY, make_macho(CPU_ARM64), 0o4755)
+            add_tar_licenses(tf, MAC_LICENSES)
             add_tar_bytes(tf, MAC_PLIST, app_plist(), 0o644)
         with self.assertRaises(VerificationError) as special:
             verify_tar_archive(setuid, expected_version="0.1.4", target="aarch64-apple-darwin")
@@ -863,6 +960,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         tar_path = linux_dir / "snip-sync-linux-x86_64.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
+            add_tar_licenses(tf, f"{pkg}/licenses")
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(tf, f"{pkg}/share/applications/snip-sync.desktop", desktop_entry(), 0o644)
         (linux_dir / "extra.zip").write_bytes(b"PK extra")
@@ -882,6 +980,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
                 zf.writestr(WIN_BINARY, make_pe())
+                add_zip_licenses(zf)
                 zf.writestr(WIN_README, "Version: 0.1.4\n")
         setup_path = windows_ok / "snip-sync-windows-setup.exe"
         # The Inno Setup stub is a 32-bit x86 PE followed by its payload.
@@ -986,6 +1085,7 @@ class TestVerifyArtifacts(unittest.TestCase):
                 bundle = mnt / "snip-sync.app" / "Contents"
                 macos = bundle / "MacOS"
                 macos.mkdir(parents=True)
+                write_bundle_licenses(macos.parent)
                 binary = macos / "snip-desktop-native"
                 binary.write_bytes(make_macho(CPU_ARM64))
                 binary.chmod(0o755)
@@ -1013,6 +1113,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         tar_path = directory / "snip-sync-linux-x86_64.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
+            add_tar_licenses(tf, f"{pkg}/licenses")
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(
                 tf,
@@ -1135,6 +1236,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         bundle = self.test_dir / "snip-sync.app"
         macos = bundle / "Contents" / "MacOS"
         macos.mkdir(parents=True)
+        write_bundle_licenses(macos.parent)
         binary = macos / "snip-desktop-native"
         binary.write_bytes(make_macho(CPU_X86_64))
         binary.chmod(0o755)

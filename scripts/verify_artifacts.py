@@ -87,6 +87,16 @@ WIN_BINARY = "snip-sync/snip-desktop-native.exe"
 WIN_README = "snip-sync/README.txt"
 LINUX_PKG_PREFIX = "snip-sync-"
 DESKTOP_FILE_NAME = "snip-sync.desktop"
+# Third-party license texts staged by package_native.sh (stage_licenses).
+LICENSES_DIR_NAME = "licenses"
+LICENSE_FILES = (
+    "Inter-OFL.txt",
+    "JetBrainsMono-OFL.txt",
+    "expui-icons-LICENSE.txt",
+    "expui-icons-NOTICE.txt",
+)
+MAC_LICENSES_DIR = "snip-sync.app/Contents/Resources/licenses"
+WIN_LICENSES_DIR = "snip-sync/licenses"
 
 # Bounds for archive inspection. Large enough for a real universal binary's
 # slice headers, small enough that a hostile member cannot force an unbounded read.
@@ -1055,6 +1065,29 @@ def _bind_package_members(
     return bound
 
 
+def _licenses_dir(bound: Dict[str, str]) -> str:
+    if bound["os"] == "macos":
+        return MAC_LICENSES_DIR
+    if bound["os"] == "linux":
+        return f"{bound['package']}/{LICENSES_DIR_NAME}"
+    return WIN_LICENSES_DIR
+
+
+def _require_licenses(sizes: Dict[str, int], lic_dir: str, where: str) -> None:
+    """Require exactly LICENSE_FILES, non-empty, as the only files in any licenses/ folder."""
+    found = sorted(
+        name for name in sizes if LICENSES_DIR_NAME in name.split("/")[:-1]
+    )
+    wanted = sorted(f"{lic_dir}/{name}" for name in LICENSE_FILES)
+    if found != wanted:
+        raise VerificationError(
+            f"License files in {where} must be exactly {wanted}; found {found}"
+        )
+    empty = [name for name in found if sizes[name] <= 0]
+    if empty:
+        raise VerificationError(f"Empty license files in {where}: {empty}")
+
+
 def _read_exact(stream: BinaryIO, size: int, label: str) -> bytes:
     if size < 0 or size > MAX_METADATA_BYTES:
         raise VerificationError(f"{label} exceeds {MAX_METADATA_BYTES} byte metadata bound")
@@ -1106,6 +1139,15 @@ def verify_macos_bundle(
     bin_info = detect_binary_format_and_arch(exec_path)
     _require_format(bin_info, "macho", str(exec_path))
     _require_arch(bin_info, expected_arch, str(exec_path))
+    _require_licenses(
+        {
+            f"{MAC_LICENSES_DIR}/{f.name}": f.stat().st_size
+            for f in (contents / "Resources" / LICENSES_DIR_NAME).glob("*")
+            if not f.is_symlink() and f.is_file()
+        },
+        MAC_LICENSES_DIR,
+        str(bundle_path),
+    )
 
     # On macOS: verify ad-hoc code signature
     signature_info = {"verified": False, "adhoc": False}
@@ -1353,6 +1395,11 @@ def verify_tar_archive(
         bin_info = _inspect_tar_member(tf, target_member)
         _require_format(bin_info, expected_format, str(tar_path))
         _require_arch(bin_info, expected_arch, str(tar_path))
+        _require_licenses(
+            {name: m.size for name, m in by_name.items()},
+            _licenses_dir(bound),
+            f"archive {tar_path}",
+        )
 
     return {
         "archive": str(tar_path),
@@ -1485,6 +1532,11 @@ def verify_zip_archive(
                 bin_info = inspect_binary_stream(handle, target_info.file_size)
             _require_format(bin_info, expected_format, str(zip_path))
             _require_arch(bin_info, expected_arch, str(zip_path))
+            _require_licenses(
+                {name: i.file_size for name, i in by_name.items()},
+                _licenses_dir(bound),
+                f"zip {zip_path}",
+            )
 
     return {
         "archive": str(zip_path),

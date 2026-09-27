@@ -23,7 +23,7 @@ use snip_core::workspace::ScanStatus;
 use crate::graph_view;
 use crate::history::RevRow;
 use crate::i18n::{t, tf};
-use crate::icons::{icon, Icon};
+use crate::icons::{file_icon, icon, icon_tinted, Icon};
 use crate::paste::{PasteItem, PastePreviewPlan};
 use crate::reader::{DiffMode, PreviewSource};
 use crate::selector::Pick;
@@ -325,8 +325,8 @@ fn checkbox(checked: bool) -> Div {
 			pal().check_border
 		}))
 		.when(checked, |d| {
-			d.bg(rgb(pal().accent)).child(icon(
-				Icon::Check,
+			d.bg(rgb(pal().accent)).child(icon_tinted(
+				Icon::Checked,
 				10.,
 				pal().accent_text,
 			))
@@ -360,15 +360,12 @@ fn icon_button(
 				.hover(|s| s.bg(rgb(pal().hover_bg)))
 		})
 		.focus(|s| s.border_color(rgb(pal().focus_ring)))
-		.child(icon(
-			ic,
-			14.,
-			if enabled {
-				pal().text_muted
-			} else {
-				pal().text_disabled
-			},
-		))
+		.child(
+			div()
+				.flex()
+				.when(!enabled, |d| d.opacity(0.4))
+				.child(icon(ic, 14.)),
+		)
 }
 
 fn status_sep() -> Div {
@@ -1035,9 +1032,9 @@ impl WorkbenchModel {
 				.when(open, |d| d.bg(rgb(pal().hover_bg)))
 				.focus(|s| s.border_color(rgb(pal().focus_ring)))
 				.tooltip(tip(tooltip))
-				.child(icon(ic, 14., pal().text_muted))
+				.child(icon(ic, 14.))
 				.child(clip_text(label).font_weight(FontWeight::SEMIBOLD))
-				.child(icon(Icon::ChevronDown, 10., pal().text_muted))
+				.child(icon(Icon::ChevronDown, 10.))
 				.children(probe(log, id))
 		};
 
@@ -1077,7 +1074,7 @@ impl WorkbenchModel {
 							if repo_error {
 								Icon::Warning
 							} else {
-								Icon::Repo
+								Icon::Project
 							},
 							repo.map(|r| r.name.clone())
 								.unwrap_or_else(|| t("no_repo", loc).into()),
@@ -1157,7 +1154,7 @@ impl WorkbenchModel {
 					.child(
 						icon_button(
 							"btn-basket-clear",
-							Icon::Clear,
+							Icon::Close,
 							t("basket_clear", loc),
 							self.basket_count() > 0,
 							31,
@@ -1287,12 +1284,11 @@ impl WorkbenchModel {
 														Icon::Warning
 													} else {
 														match it.pick {
-															Pick::Repo(_) => Icon::Repo,
+															Pick::Repo(_) => Icon::Project,
 															Pick::Ref(_) => Icon::Branch,
 														}
 													},
 													14.,
-													if it.error { pal().error } else { pal().text_muted },
 												))
 												.child(fill_text(it.label.clone()).when(active, |d| d.font_weight(FontWeight::SEMIBOLD)))
 												.when_some(it.group, |d, g| {
@@ -1356,15 +1352,11 @@ impl WorkbenchModel {
 				.when(!on, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 				.focus(|s| s.border_color(rgb(pal().focus_ring)))
 				.tooltip(tip(label))
-				.child(icon(
-					ic,
-					16.,
-					if on {
-						pal().accent_text
-					} else {
-						pal().text_muted
-					},
-				))
+				.child(if on {
+					icon_tinted(ic, 16., pal().accent_text).into_any_element()
+				} else {
+					icon(ic, 16.).into_any_element()
+				})
 				.children(probe(log, id))
 		};
 		div()
@@ -1379,7 +1371,7 @@ impl WorkbenchModel {
 			.child(
 				rail_button(
 					"rail-project",
-					Icon::Folder,
+					Icon::Project,
 					project_on,
 					t("tip_project", loc),
 					10,
@@ -1404,7 +1396,7 @@ impl WorkbenchModel {
 			.child(
 				rail_button(
 					"rail-log",
-					Icon::Log,
+					Icon::GitLog,
 					self.bottom_visible,
 					t("tip_git_log", loc),
 					12,
@@ -1482,7 +1474,7 @@ impl WorkbenchModel {
 						d.child(
 							icon_button(
 								"btn-discovery-continue",
-								Icon::More,
+								Icon::ArrowDown,
 								t("btn_discovery_continue", loc),
 								true,
 								10,
@@ -1805,12 +1797,10 @@ impl WorkbenchModel {
 							Icon::ChevronRight
 						},
 						10.,
-						pal().text_muted,
 					))
 					.child(icon(
-						if is_err { Icon::Warning } else { Icon::Repo },
+						if is_err { Icon::Warning } else { Icon::Project },
 						14.,
-						if is_err { pal().error } else { pal().folder },
 					))
 					.child(
 						clip_text(repo.name.clone())
@@ -1960,7 +1950,6 @@ impl WorkbenchModel {
 						Icon::ChevronRight
 					},
 					10.,
-					pal().text_muted,
 				)
 				.into_any_element()
 			} else {
@@ -2008,10 +1997,9 @@ impl WorkbenchModel {
 						Icon::Folder
 					}
 				} else {
-					Icon::File
+					file_icon(&rel)
 				},
 				14.,
-				if is_dir { pal().folder } else { pal().file },
 			))
 			.child(
 				fill_text(row.name.clone())
@@ -2114,7 +2102,6 @@ impl WorkbenchModel {
 						Icon::ChevronRight
 					},
 					10.,
-					pal().text_muted,
 				)
 				.into_any_element()
 			} else {
@@ -2152,12 +2139,11 @@ impl WorkbenchModel {
 						Icon::Folder
 					}
 				} else if submodule {
-					Icon::Repo
+					Icon::Project
 				} else {
-					Icon::File
+					file_icon(&path)
 				},
 				14.,
-				if is_dir { pal().folder } else { pal().file },
 			))
 			.child(fill_text(row.name.clone()))
 			.when(submodule, |d| {
@@ -2323,9 +2309,12 @@ impl WorkbenchModel {
 					.children(probe(log, src_chk_id)),
 			)
 			.child(icon(
-				if is_dir { Icon::Folder } else { Icon::File },
+				if is_dir {
+					Icon::Folder
+				} else {
+					file_icon(&path)
+				},
 				14.,
-				if is_dir { pal().folder } else { pal().file },
 			))
 			.child(
 				clip_text(name)
@@ -2374,7 +2363,7 @@ impl WorkbenchModel {
 						.bg(rgb(pal().range_bg))
 						.text_size(px(UI_TEXT))
 						.text_color(rgb(pal().text))
-						.child(icon(ic, 14., pal().file))
+						.child(icon(ic, 14.))
 						.child(clip_text(label)),
 				)
 			})
@@ -2504,6 +2493,7 @@ impl WorkbenchModel {
 		let loc = self.locale;
 		let log = &self.probes;
 		let (tab_label, crumbs, badge) = self.source_labels();
+		let tab_icon = file_icon(&tab_label);
 		let is_diff = self.preview.as_ref().is_some_and(|p| p.is_diff);
 		let side = self.reader.diff_mode == DiffMode::SideBySide;
 		let n_matches = self.reader.matches.len();
@@ -2549,7 +2539,7 @@ impl WorkbenchModel {
 			.border_b_1()
 			.border_color(rgb(pal().divider))
 			.text_size(px(SMALL_TEXT))
-			.child(icon(Icon::Search, 13., pal().text_muted))
+			.child(icon(Icon::Search, 13.))
 			.child(
 				div()
 					.id("find-input")
@@ -2614,7 +2604,7 @@ impl WorkbenchModel {
 					)
 					.px(px(6.))
 					.text_size(px(SMALL_TEXT))
-					.child(icon(Icon::Diff, 12., pal().text_muted))
+					.child(icon(Icon::Diff, 12.))
 					.on_click(cx.listener(|this, _, _, cx| {
 						this.reader.diff_mode = match this.reader.diff_mode {
 							DiffMode::Inline => DiffMode::SideBySide,
@@ -2695,7 +2685,7 @@ impl WorkbenchModel {
 				.gap(px(6.))
 				.p(px(12.))
 				.text_color(rgb(pal().error))
-				.child(icon(Icon::Warning, 14., pal().error))
+				.child(icon(Icon::Warning, 14.))
 				.child(div().flex_1().child(err.render(loc)))
 				.children(probe(log, "editor-error"))
 				.into_any_element()
@@ -2774,7 +2764,7 @@ impl WorkbenchModel {
 				} else {
 					String::new()
 				},
-				Icon::File,
+				tab_icon,
 			))
 			.child(
 				div()
@@ -2970,7 +2960,7 @@ impl WorkbenchModel {
 													.text_color(rgb(color))
 													.child(letter),
 											)
-											.child(icon(Icon::File, 13., color))
+											.child(icon(file_icon(&path), 13.))
 											.child(fill_text(path))
 											.children(probe(&this.probes, id))
 									})
@@ -3696,7 +3686,7 @@ impl WorkbenchModel {
 					.border_color(rgb(pal().accent))
 					.child(t("log_tab", loc)),
 			)
-			.child(icon(Icon::Search, 13., pal().text_muted))
+			.child(icon(Icon::Search, 13.))
 			.child(
 				div()
 					.id("log-search-input")
@@ -3860,7 +3850,7 @@ impl WorkbenchModel {
 		let mut ref_rows: Vec<AnyElement> = Vec::new();
 		let ref_entry = |id: String,
 		                 label: String,
-		                 glyph: Option<(Icon, u32)>,
+		                 glyph: Option<Icon>,
 		                 indent: f32,
 		                 target: Option<String>,
 		                 active: bool,
@@ -3882,7 +3872,7 @@ impl WorkbenchModel {
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.filter_by_ref(target.clone(), cx)
 				}))
-				.when_some(glyph, |d, (g, c)| d.child(icon(g, 12., c)))
+				.when_some(glyph, |d, g| d.child(icon(g, 12.)))
 				.child(clip_text(label).text_color(rgb(pal().text)))
 				.children(probe(log, id))
 				.into_any_element()
@@ -3900,22 +3890,17 @@ impl WorkbenchModel {
 			ref_rows.push(ref_entry(
 				"ref:HEAD".into(),
 				"HEAD".into(),
-				Some((Icon::Commit, pal().ref_head)),
+				Some(Icon::Head),
 				10.,
 				Some("HEAD".into()),
 				self.active_ref_filter.as_deref() == Some("HEAD"),
 				cx,
 			));
 		}
-		for (key, prefix, color, glyph) in [
-			("refs_local", "refs/heads/", pal().ref_local, Icon::Branch),
-			(
-				"refs_remote",
-				"refs/remotes/",
-				pal().ref_remote,
-				Icon::Branch,
-			),
-			("refs_tags", "refs/tags/", pal().ref_tag, Icon::Commit),
+		for (key, prefix, glyph) in [
+			("refs_local", "refs/heads/", Icon::Branch),
+			("refs_remote", "refs/remotes/", Icon::RemoteBranch),
+			("refs_tags", "refs/tags/", Icon::Tag),
 		] {
 			let members: Vec<_> = self
 				.refs
@@ -3937,7 +3922,7 @@ impl WorkbenchModel {
 					.text_size(px(11.))
 					.font_weight(FontWeight::SEMIBOLD)
 					.text_color(rgb(pal().text_muted))
-					.child(icon(Icon::ChevronDown, 10., pal().text_muted))
+					.child(icon(Icon::ChevronDown, 10.))
 					.child(clip_text(format!(
 						"{} ({})",
 						t(key, loc),
@@ -3950,7 +3935,7 @@ impl WorkbenchModel {
 				ref_rows.push(ref_entry(
 					format!("ref:{}", r.name),
 					r.name[prefix.len()..].to_string(),
-					Some((glyph, color)),
+					Some(glyph),
 					22.,
 					Some(r.name.clone()),
 					self.active_ref_filter.as_deref() == Some(r.name.as_str()),
@@ -4363,7 +4348,6 @@ impl WorkbenchModel {
 										Icon::ChevronDown
 									},
 									10.,
-									pal().text_muted,
 								))
 								.when(collapsed, |d| {
 									d.child(

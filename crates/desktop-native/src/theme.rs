@@ -258,6 +258,11 @@ pub fn pal() -> &'static Palette {
 	}
 }
 
+/// Whether the light palette is active (icons pick their light files).
+pub fn is_light() -> bool {
+	LIGHT_ACTIVE.load(Ordering::Relaxed)
+}
+
 /// `SNIP_THEME=dark|light` pins the palette; anything else follows the OS.
 fn env_override() -> Option<bool> {
 	match std::env::var("SNIP_THEME")

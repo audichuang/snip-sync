@@ -1,6 +1,7 @@
 ; Inno Setup script for the native snip-sync desktop app (unsigned, per-user).
 ; Built by scripts/package_native.sh, which passes:
 ;   /DAppVersion=X.Y.Z /DSourceExe=<path to snip-desktop-native.exe> /DIconFile=<icon.ico>
+;   /DLicenseDir=<folder of third-party license texts>
 
 #ifndef AppVersion
   #error AppVersion must be defined
@@ -10,6 +11,9 @@
 #endif
 #ifndef IconFile
   #error IconFile must be defined
+#endif
+#ifndef LicenseDir
+  #error LicenseDir must be defined
 #endif
 
 [Setup]
@@ -41,6 +45,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "snip-desktop-native.exe"; Flags: ignoreversion
+Source: "{#LicenseDir}\*"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\snip-sync"; Filename: "{app}\snip-desktop-native.exe"

@@ -1,292 +1,208 @@
-//! Small vector icons painted with GPUI paths, so no icon font, emoji or
-//! missing-glyph box is ever shown.
+//! IntelliJ New UI ("expui") icons, vendored as SVG under
+//! `assets/icons/expui/` (Apache-2.0, see the README there) and embedded
+//! into the binary. Every icon has a light and a `_dark` file; the active
+//! palette picks one.
+//!
+//! [`icon`] paints the SVG in its own colours, like IntelliJ does for almost
+//! every icon. [`icon_tinted`] paints it as a one-colour mask, for the few
+//! places IntelliJ recolours an icon (white on an accent fill).
+
+use std::borrow::Cow;
 
 use gpui::{
-	canvas, point, prelude::*, px, rgb, Bounds, PathBuilder, Pixels, Window,
+	img, prelude::*, px, rgb, svg, AssetSource, Img, SharedString, Svg,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum Icon {
-	File,
-	Folder,
-	FolderOpen,
-	Repo,
-	Branch,
-	Commit,
-	Search,
-	Changes,
-	Log,
-	ChevronRight,
-	ChevronDown,
-	Diff,
-	Warning,
-	Check,
-	Plus,
-	Refresh,
-	Back,
-	SelectAll,
-	SelectNone,
-	More,
-	Clear,
+macro_rules! icons {
+	($($variant:ident => $stem:literal,)*) => {
+		/// One IntelliJ icon. Several variants may share a file where the
+		/// New UI set has no distinct glyph (e.g. `FolderOpen`).
+		#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+		#[allow(dead_code)]
+		pub enum Icon {
+			$($variant,)*
+		}
+
+		impl Icon {
+			pub const ALL: &'static [Icon] = &[$(Icon::$variant,)*];
+
+			/// Asset path of the light or dark file.
+			pub fn path(self, dark: bool) -> &'static str {
+				match (self, dark) {
+					$(
+						(Icon::$variant, false) => concat!("icons/expui/", $stem, ".svg"),
+						(Icon::$variant, true) => concat!("icons/expui/", $stem, "_dark.svg"),
+					)*
+				}
+			}
+
+			fn bytes(self, dark: bool) -> &'static [u8] {
+				match (self, dark) {
+					$(
+						(Icon::$variant, false) => include_bytes!(concat!("../assets/icons/expui/", $stem, ".svg")),
+						(Icon::$variant, true) => include_bytes!(concat!("../assets/icons/expui/", $stem, "_dark.svg")),
+					)*
+				}
+			}
+		}
+	};
 }
 
-/// A `size`×`size` icon element in `color`.
-pub fn icon(kind: Icon, size: f32, color: u32) -> impl IntoElement {
-	canvas(
-		|_, _, _| {},
-		move |b, _, window, _| paint(window, kind, b, color),
-	)
-	.flex_shrink_0()
-	.size(px(size))
+icons! {
+	Refresh => "general/refresh",
+	Locate => "general/locate",
+	Diff => "vcs/diff",
+	Copy => "general/copy",
+	Paste => "general/paste",
+	Basket => "vcs/shelve",
+	Eye => "general/show",
+	Hide => "general/hide",
+	More => "general/moreVertical",
+	Search => "general/search",
+	Regex => "inline/regex",
+	MatchCase => "inline/matchCase",
+	Close => "general/close",
+	ChevronDown => "general/chevronDown",
+	ChevronRight => "general/chevronRight",
+	Branch => "general/vcs",
+	RemoteBranch => "toolwindows/web",
+	Tag => "dvcs/branchLabel",
+	Head => "dvcs/currentBranchLabel",
+	Commit => "vcs/commit",
+	Folder => "nodes/folder",
+	FolderOpen => "nodes/folder",
+	File => "fileTypes/anyType",
+	FileRust => "language/rust",
+	FileTs => "fileTypes/typeScript",
+	FileJs => "fileTypes/javaScript",
+	FileJson => "fileTypes/json",
+	FileMarkdown => "fileTypes/markdown",
+	FileText => "fileTypes/text",
+	FileImage => "fileTypes/image",
+	FileToml => "fileTypes/toml",
+	FileYaml => "fileTypes/yaml",
+	Filter => "general/filter",
+	User => "general/user",
+	Calendar => "general/history",
+	Paths => "general/listFiles",
+	ArrowUp => "general/up",
+	ArrowDown => "general/down",
+	SideBySide => "diff/sideBySide",
+	Unified => "diff/unified",
+	GoToLine => "general/hashtag",
+	NextDiff => "general/down",
+	PrevDiff => "general/up",
+	Checked => "actions/checked",
+	Settings => "general/settings",
+	Project => "toolwindows/project",
+	Changes => "toolwindows/changes",
+	GitLog => "toolwindows/vcs",
+	Language => "general/language",
+	Warning => "status/warning",
+	Error => "status/error",
+	Info => "status/info",
+	Plus => "general/add",
+	Minus => "general/remove",
+	ExpandAll => "general/expandAll",
+	CollapseAll => "general/collapseAll",
+	Pin => "general/pin",
+	Cancel => "vcs/abort",
+	Apply => "general/greenCheckmark",
+	Back => "general/left",
+	SelectAll => "actions/selectAll",
+	SelectNone => "actions/unselectAll",
 }
 
-fn p(b: &Bounds<Pixels>, x: f32, y: f32) -> gpui::Point<Pixels> {
-	// Coordinates are in a 16×16 design grid scaled to the bounds.
-	let s = f32::from(b.size.width) / 16.0;
-	point(b.origin.x + px(x * s), b.origin.y + px(y * s))
+fn dark() -> bool {
+	!crate::theme::is_light()
 }
 
-fn stroke(
-	window: &mut Window,
-	b: &Bounds<Pixels>,
-	color: u32,
-	pts: &[(f32, f32)],
-) {
-	let s = f32::from(b.size.width) / 16.0;
-	let mut pb = PathBuilder::stroke(px(1.3 * s.max(0.8)));
-	let mut it = pts.iter();
-	if let Some(&(x, y)) = it.next() {
-		pb.move_to(p(b, x, y));
-	}
-	for &(x, y) in it {
-		pb.line_to(p(b, x, y));
-	}
-	if let Ok(path) = pb.build() {
-		window.paint_path(path, rgb(color));
-	}
+/// A `size`×`size` icon in IntelliJ's own colours for the active theme.
+pub fn icon(kind: Icon, size: f32) -> Img {
+	img(kind.path(dark())).flex_shrink_0().size(px(size))
 }
 
-fn filled(
-	window: &mut Window,
-	b: &Bounds<Pixels>,
-	color: u32,
-	pts: &[(f32, f32)],
-) {
-	let mut pb = PathBuilder::fill();
-	let mut it = pts.iter();
-	if let Some(&(x, y)) = it.next() {
-		pb.move_to(p(b, x, y));
-	}
-	for &(x, y) in it {
-		pb.line_to(p(b, x, y));
-	}
-	pb.close();
-	if let Ok(path) = pb.build() {
-		window.paint_path(path, rgb(color));
+/// A `size`×`size` icon painted entirely in `color` (IntelliJ's selected /
+/// accent-fill recolouring).
+pub fn icon_tinted(kind: Icon, size: f32, color: u32) -> Svg {
+	svg()
+		.path(kind.path(dark()))
+		.flex_shrink_0()
+		.size(px(size))
+		.text_color(rgb(color))
+}
+
+/// The icon IntelliJ shows for a file, chosen by name/extension.
+pub fn file_icon(path: &str) -> Icon {
+	let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+	let ext = name
+		.rsplit_once('.')
+		.map(|(_, e)| e.to_ascii_lowercase())
+		.unwrap_or_default();
+	match ext.as_str() {
+		"rs" => Icon::FileRust,
+		"ts" | "tsx" | "mts" | "cts" => Icon::FileTs,
+		"js" | "jsx" | "mjs" | "cjs" => Icon::FileJs,
+		"json" | "jsonc" | "json5" => Icon::FileJson,
+		"md" | "markdown" => Icon::FileMarkdown,
+		"txt" | "log" => Icon::FileText,
+		"png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico"
+		| "tif" | "tiff" => Icon::FileImage,
+		"toml" => Icon::FileToml,
+		"yaml" | "yml" => Icon::FileYaml,
+		_ => Icon::File,
 	}
 }
 
-fn circle(
-	window: &mut Window,
-	b: &Bounds<Pixels>,
-	color: u32,
-	cx: f32,
-	cy: f32,
-	r: f32,
-	fill_it: bool,
-) {
-	let steps = 12;
-	let pts: Vec<(f32, f32)> = (0..=steps)
-		.map(|i| {
-			let a = i as f32 / steps as f32 * std::f32::consts::TAU;
-			(cx + r * a.cos(), cy + r * a.sin())
-		})
-		.collect();
-	if fill_it {
-		filled(window, b, color, &pts);
-	} else {
-		stroke(window, b, color, &pts);
+/// Serves the embedded icons to GPUI (`img`/`svg` load through this).
+pub struct Assets;
+
+impl AssetSource for Assets {
+	fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+		Ok(lookup(path).map(Cow::Borrowed))
+	}
+
+	fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+		Ok(Vec::new())
 	}
 }
 
-fn paint(window: &mut Window, kind: Icon, b: Bounds<Pixels>, color: u32) {
-	let b = &b;
-	match kind {
-		Icon::File => {
-			// Page with a folded corner.
-			stroke(
-				window,
-				b,
-				color,
-				&[
-					(4., 2.),
-					(10., 2.),
-					(13., 5.),
-					(13., 14.),
-					(4., 14.),
-					(4., 2.),
-				],
-			);
-			stroke(window, b, color, &[(10., 2.), (10., 5.), (13., 5.)]);
+fn lookup(path: &str) -> Option<&'static [u8]> {
+	Icon::ALL.iter().find_map(|&i| {
+		[false, true]
+			.into_iter()
+			.find(|&d| i.path(d) == path)
+			.map(|d| i.bytes(d))
+	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn every_icon_resolves_for_both_themes() {
+		for &i in Icon::ALL {
+			for d in [false, true] {
+				let bytes = Assets.load(i.path(d)).unwrap().unwrap();
+				let text = std::str::from_utf8(&bytes).unwrap();
+				assert!(text.contains("<svg"), "{i:?} dark={d}");
+			}
+			assert_ne!(i.bytes(false), i.bytes(true), "{i:?} light == dark");
 		}
-		Icon::Folder => {
-			filled(
-				window,
-				b,
-				color,
-				&[
-					(1.5, 4.),
-					(6., 4.),
-					(7.5, 5.5),
-					(14.5, 5.5),
-					(14.5, 13.),
-					(1.5, 13.),
-				],
-			);
-		}
-		Icon::FolderOpen => {
-			filled(
-				window,
-				b,
-				color,
-				&[
-					(1.5, 4.),
-					(6., 4.),
-					(7.5, 5.5),
-					(13., 5.5),
-					(13., 7.),
-					(1.5, 7.),
-				],
-			);
-			filled(
-				window,
-				b,
-				color,
-				&[(3., 8.), (15., 8.), (13., 13.), (1.5, 13.)],
-			);
-		}
-		Icon::Repo => {
-			stroke(
-				window,
-				b,
-				color,
-				&[(3., 2.), (13., 2.), (13., 14.), (3., 14.), (3., 2.)],
-			);
-			stroke(window, b, color, &[(6., 5.), (10., 5.)]);
-			stroke(window, b, color, &[(6., 8.), (10., 8.)]);
-		}
-		Icon::Branch => {
-			circle(window, b, color, 5., 3.5, 1.8, false);
-			circle(window, b, color, 5., 12.5, 1.8, false);
-			circle(window, b, color, 11.5, 5.5, 1.8, false);
-			stroke(window, b, color, &[(5., 5.3), (5., 10.7)]);
-			stroke(window, b, color, &[(11.5, 7.3), (11.5, 8.5), (5.5, 10.5)]);
-		}
-		Icon::Commit => {
-			circle(window, b, color, 8., 8., 3., false);
-			stroke(window, b, color, &[(1., 8.), (5., 8.)]);
-			stroke(window, b, color, &[(11., 8.), (15., 8.)]);
-		}
-		Icon::Search => {
-			circle(window, b, color, 6.5, 6.5, 4., false);
-			stroke(window, b, color, &[(9.5, 9.5), (14., 14.)]);
-		}
-		Icon::Changes => {
-			stroke(window, b, color, &[(2., 4.), (14., 4.)]);
-			stroke(window, b, color, &[(2., 8.), (10., 8.)]);
-			stroke(window, b, color, &[(2., 12.), (14., 12.)]);
-		}
-		Icon::Log => {
-			circle(window, b, color, 5., 3.5, 1.8, true);
-			circle(window, b, color, 5., 12.5, 1.8, true);
-			circle(window, b, color, 11., 8., 1.8, true);
-			stroke(window, b, color, &[(5., 5.), (5., 11.)]);
-			stroke(window, b, color, &[(5., 5.), (11., 6.5)]);
-		}
-		Icon::ChevronRight => {
-			stroke(window, b, color, &[(6., 4.), (10., 8.), (6., 12.)])
-		}
-		Icon::ChevronDown => {
-			stroke(window, b, color, &[(4., 6.), (8., 10.), (12., 6.)])
-		}
-		Icon::Diff => {
-			stroke(window, b, color, &[(3., 5.), (7., 5.)]);
-			stroke(window, b, color, &[(5., 3.), (5., 7.)]);
-			stroke(window, b, color, &[(9., 11.), (13., 11.)]);
-			stroke(window, b, color, &[(4., 14.), (12., 2.)]);
-		}
-		Icon::Warning => {
-			stroke(
-				window,
-				b,
-				color,
-				&[(8., 2.), (15., 14.), (1., 14.), (8., 2.)],
-			);
-			stroke(window, b, color, &[(8., 6.), (8., 10.)]);
-			stroke(window, b, color, &[(8., 11.8), (8., 12.4)]);
-		}
-		Icon::Check => {
-			stroke(window, b, color, &[(3.5, 8.5), (6.5, 11.5), (12.5, 4.5)])
-		}
-		Icon::Plus => {
-			stroke(window, b, color, &[(8., 3.), (8., 13.)]);
-			stroke(window, b, color, &[(3., 8.), (13., 8.)]);
-		}
-		Icon::Refresh => {
-			// Open circular arrow with an arrowhead at the top-right end.
-			let pts: Vec<(f32, f32)> = (0..=10)
-				.map(|i| {
-					let a = -1.0 + i as f32 / 10.0 * 5.0;
-					(8. + 5. * a.cos(), 8. + 5. * a.sin())
-				})
-				.collect();
-			stroke(window, b, color, &pts);
-			stroke(window, b, color, &[(13.2, 1.8), (12.7, 3.8), (10.6, 3.2)]);
-		}
-		Icon::Back => {
-			stroke(window, b, color, &[(7., 3.), (2., 8.), (7., 13.)]);
-			stroke(window, b, color, &[(2., 8.), (14., 8.)]);
-		}
-		Icon::SelectAll => {
-			stroke(
-				window,
-				b,
-				color,
-				&[
-					(2.5, 2.5),
-					(13.5, 2.5),
-					(13.5, 13.5),
-					(2.5, 13.5),
-					(2.5, 2.5),
-				],
-			);
-			stroke(window, b, color, &[(5., 8.), (7., 10.5), (11., 5.5)]);
-		}
-		Icon::SelectNone => {
-			stroke(
-				window,
-				b,
-				color,
-				&[
-					(2.5, 2.5),
-					(13.5, 2.5),
-					(13.5, 13.5),
-					(2.5, 13.5),
-					(2.5, 2.5),
-				],
-			);
-			stroke(window, b, color, &[(5., 8.), (11., 8.)]);
-		}
-		Icon::More => {
-			// "Load more": arrow down onto a baseline.
-			stroke(window, b, color, &[(8., 2.), (8., 10.)]);
-			stroke(window, b, color, &[(4.5, 6.5), (8., 10.), (11.5, 6.5)]);
-			stroke(window, b, color, &[(3., 13.5), (13., 13.5)]);
-		}
-		Icon::Clear => {
-			stroke(window, b, color, &[(4., 4.), (12., 12.)]);
-			stroke(window, b, color, &[(12., 4.), (4., 12.)]);
-		}
+		assert!(Assets.load("icons/expui/nope.svg").unwrap().is_none());
+	}
+
+	#[test]
+	fn file_icon_by_extension() {
+		assert_eq!(file_icon("src/main.rs"), Icon::FileRust);
+		assert_eq!(file_icon("a/b.TSX"), Icon::FileTs);
+		assert_eq!(file_icon("pkg.json"), Icon::FileJson);
+		assert_eq!(file_icon("README.md"), Icon::FileMarkdown);
+		assert_eq!(file_icon("Cargo.toml"), Icon::FileToml);
+		assert_eq!(file_icon(".github\\ci.yml"), Icon::FileYaml);
+		assert_eq!(file_icon("logo.PNG"), Icon::FileImage);
+		assert_eq!(file_icon("Makefile"), Icon::File);
+		assert_eq!(file_icon("dir.d/noext"), Icon::File);
 	}
 }
