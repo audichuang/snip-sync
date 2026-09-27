@@ -320,6 +320,9 @@ impl WorkbenchModel {
 			return;
 		}
 		self.close_popover(cx);
+		// A popup closed by this same press queued focus for the root; the
+		// menu must keep it.
+		self.pending_focus = None;
 		self.workspace_menu = false;
 		let ids: Vec<&str> = entries
 			.iter()
