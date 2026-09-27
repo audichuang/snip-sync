@@ -386,6 +386,108 @@ pub fn history_by_author_with(
 	run_log(git, &args, None, limit, opts)
 }
 
+/// IntelliJ-style log filters, combined with AND. An empty query is the
+/// plain history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogQuery {
+	/// Message text, or a commit hash (4+ hex digits that resolve).
+	pub text: String,
+	/// `text` is an extended regular expression instead of a literal.
+	pub regex: bool,
+	/// Case-sensitive matching (text and author).
+	pub match_case: bool,
+	/// Literal author name or email fragment.
+	pub author: Option<String>,
+	/// Lower date bound in any form `git log --since` accepts.
+	pub since: Option<String>,
+	/// Only commits touching one of these repository-relative paths.
+	pub paths: Vec<String>,
+}
+
+impl LogQuery {
+	pub fn is_empty(&self) -> bool {
+		self.text.trim().is_empty()
+			&& self.author.is_none()
+			&& self.since.is_none()
+			&& self.paths.is_empty()
+	}
+}
+
+/// Escapes POSIX ERE metacharacters so `s` matches literally under `-E`.
+fn ere_escape(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	for c in s.chars() {
+		if r"\.^$|?*+()[]{}".contains(c) {
+			out.push('\\');
+		}
+		out.push(c);
+	}
+	out
+}
+
+/// One page of history under `query` (see [`LogQuery`]), from `reference`
+/// or every visible tip. A text that resolves as a hash shows just that
+/// commit.
+pub fn history_query_with(
+	git: &Git,
+	reference: Option<&str>,
+	query: &LogQuery,
+	skip: usize,
+	limit: usize,
+	opts: &RunOptions,
+) -> Result<(Vec<CommitSummary>, bool), GitError> {
+	let limit = limit.min(MAX_HISTORY_LIMIT);
+	let mut args = log_args(skip, limit);
+	let text = query.text.trim();
+	let hash = if text.len() >= 4 && text.bytes().all(|b| b.is_ascii_hexdigit())
+	{
+		match git.resolve_commit_with(text, opts) {
+			Ok(sha) => Some(sha),
+			Err(GitError::InvalidRevision(_)) => None,
+			Err(e) => return Err(e),
+		}
+	} else {
+		None
+	};
+	args.push(if query.regex {
+		"--extended-regexp".into()
+	} else {
+		"--fixed-strings".into()
+	});
+	if !query.match_case {
+		args.push("--regexp-ignore-case".into());
+	}
+	if hash.is_none() && !text.is_empty() {
+		args.push(format!("--grep={text}"));
+	}
+	if let Some(author) = query.author.as_deref().filter(|a| !a.is_empty()) {
+		// The author chip is always a literal, whatever the text mode.
+		let author = if query.regex {
+			ere_escape(author)
+		} else {
+			author.to_string()
+		};
+		args.push(format!("--author={author}"));
+	}
+	if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
+		args.push(format!("--since={since}"));
+	}
+	match (hash, reference.filter(|s| !s.is_empty())) {
+		(Some(sha), _) => args.extend(["--no-walk".into(), sha]),
+		(None, Some(r)) => args.push(git.resolve_commit_with(r, opts)?),
+		(None, None) => args.extend(VISIBLE_TIPS.map(String::from)),
+	}
+	args.push("--".into());
+	args.extend(
+		query
+			.paths
+			.iter()
+			.filter(|p| !p.is_empty())
+			.map(|p| format!(":(literal){p}")),
+	);
+	run_log(git, &args, None, limit, opts)
+}
+
 #[derive(Debug, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryEntry {
@@ -1300,6 +1402,90 @@ mod tests {
 
 		// Missing file in HEAD returns Err
 		assert!(commit_blob(&g, "HEAD", "sub/a.txt", 1024 * 1024).is_err());
+	}
+
+	#[test]
+	fn history_query_combines_text_author_since_and_paths() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		fs::create_dir(root.join("docs")).unwrap();
+		for (who, file, msg) in [
+			("Alice", "a.txt", "Fix login"),
+			("Bob", "docs/b.md", "fix docs (v2)"),
+			("Alice", "docs/c.md", "Add docs"),
+		] {
+			fs::write(root.join(file), msg).unwrap();
+			run(root, &["add", "."]);
+			run(
+				root,
+				&[
+					"-c",
+					&format!("user.name={who}"),
+					"-c",
+					"user.email=dev@example.com",
+					"commit",
+					"-qm",
+					msg,
+				],
+			);
+		}
+		let g = Git::open(root).unwrap();
+		let subjects = |q: &LogQuery| -> Vec<String> {
+			history_query_with(&g, None, q, 0, 10, &RunOptions::default())
+				.unwrap()
+				.0
+				.into_iter()
+				.map(|c| c.subject)
+				.collect()
+		};
+		let q = |text: &str| LogQuery {
+			text: text.into(),
+			..Default::default()
+		};
+		assert_eq!(subjects(&q("fix")), ["fix docs (v2)", "Fix login"]);
+		let case = LogQuery {
+			match_case: true,
+			..q("Fix")
+		};
+		assert_eq!(subjects(&case), ["Fix login"]);
+		let re = LogQuery {
+			regex: true,
+			..q(r"^fix .*\(v[0-9]\)$")
+		};
+		assert_eq!(subjects(&re), ["fix docs (v2)"]);
+		// Without regex, "(v2)" is literal text, not a group.
+		assert_eq!(subjects(&q("(v2)")), ["fix docs (v2)"]);
+		let author = LogQuery {
+			author: Some("alice".into()),
+			..q("docs")
+		};
+		assert_eq!(subjects(&author), ["Add docs"]);
+		let author_regex = LogQuery {
+			author: Some("Al.ce".into()),
+			regex: true,
+			..Default::default()
+		};
+		assert!(subjects(&author_regex).is_empty(), "author stays literal");
+		let paths = LogQuery {
+			paths: vec!["docs".into()],
+			..Default::default()
+		};
+		assert_eq!(subjects(&paths), ["Add docs", "fix docs (v2)"]);
+		let since = LogQuery {
+			since: Some("1 day ago".into()),
+			..Default::default()
+		};
+		assert_eq!(subjects(&since).len(), 3);
+		let future = LogQuery {
+			since: Some("2099-01-01".into()),
+			..Default::default()
+		};
+		assert!(subjects(&future).is_empty());
+		// A hash shows just that commit, not its ancestors.
+		let top = run(root, &["rev-parse", "HEAD"]);
+		assert_eq!(subjects(&q(&top[..8])), ["Add docs"]);
+		assert!(LogQuery::default().is_empty());
 	}
 
 	#[test]
