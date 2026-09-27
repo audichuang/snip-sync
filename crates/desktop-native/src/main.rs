@@ -404,10 +404,19 @@ impl PreparedSelection {
 			// Deselecting must not need the filesystem, clone roots per item, or
 			// rebuild spare vector capacity while the old allocation is near its cap.
 			if let Ok(index) = index {
-				let files = &self.files;
 				let paths = &self.paths;
 				let (replace_file, replace_git) =
 					(self.replace_file_group, self.replace_git_group);
+				// One pass over the checkboxes, not one per basket item.
+				let kept: HashSet<(&str, &SourceKind)> = if replace_git {
+					self.files
+						.iter()
+						.filter(|file| file.selected)
+						.map(|file| (file.path.as_str(), &file.source))
+						.collect()
+				} else {
+					HashSet::new()
+				};
 				self.basket[index].1.retain(|item| match &item.source {
 					SourceKind::File if replace_file => {
 						paths.binary_search(&item.relative_path).is_ok()
@@ -417,11 +426,10 @@ impl PreparedSelection {
 					| SourceKind::Staged
 						if replace_git =>
 					{
-						files.iter().any(|file| {
-							file.selected
-								&& file.path == item.relative_path
-								&& file.source == item.source
-						})
+						kept.contains(&(
+							item.relative_path.as_str(),
+							&item.source,
+						))
 					}
 					_ => true,
 				});
@@ -617,6 +625,9 @@ pub struct WorkbenchModel {
 
 	// Tool windows.
 	pub files: Vec<FileChangeItem>,
+	/// `files` holds the current repo's finished status listing. Until then
+	/// its empty checkboxes say nothing about the basket's Git group.
+	pub changes_loaded: bool,
 	pub file_tree: Option<FileTreeNode>,
 	pub rev_tree: Option<RevTree>,
 	pub active_tab: WorkbenchTab,
@@ -883,6 +894,7 @@ impl WorkbenchModel {
 			selected_commit_file: None,
 			compare: None,
 			files: Vec::new(),
+			changes_loaded: false,
 			file_tree: None,
 			rev_tree: None,
 			active_tab: WorkbenchTab::GitChanges,
@@ -1575,6 +1587,7 @@ impl WorkbenchModel {
 		self.selected_commit_file = None;
 		self.compare = None;
 		release_vec(&mut self.files);
+		self.changes_loaded = false;
 		self.file_tree = None;
 		self.rev_tree = None;
 		self.selected_file = None;
@@ -2308,6 +2321,7 @@ impl WorkbenchModel {
 		self.head_sha = None;
 		self.graph_layout = None;
 		self.files.clear();
+		self.changes_loaded = false;
 		self.commit_page = 0;
 		self.page_checkpoints = vec![None];
 		self.active_ref_filter = None;
@@ -2414,10 +2428,14 @@ impl WorkbenchModel {
 							let canonical =
 								CanonicalRootId::new(&repo_root_for_update)
 									.ok();
-							let basket_items = canonical
+							let saved: HashSet<(&str, &SourceKind)> = canonical
 								.as_ref()
-								.and_then(|c| model.basket_items(c));
-							model.files = changes
+								.and_then(|c| model.basket_items(c))
+								.into_iter()
+								.flatten()
+								.map(|i| (i.relative_path.as_str(), &i.source))
+								.collect();
+							let files = changes
 								.into_iter()
 								.map(
 									|(
@@ -2426,13 +2444,10 @@ impl WorkbenchModel {
 										source,
 										is_conflict,
 									)| {
-										let selected = basket_items
-											.is_some_and(|items| {
-												items.iter().any(|i| {
-													i.relative_path == path
-														&& i.source == source
-												})
-											});
+										let selected = saved.contains(&(
+											path.as_str(),
+											&source,
+										));
 										FileChangeItem {
 											path,
 											change_type,
@@ -2443,6 +2458,8 @@ impl WorkbenchModel {
 									},
 								)
 								.collect();
+							model.files = files;
+							model.changes_loaded = true;
 							app_log!(
 								"[APP:REPO_LOADED: {} files={}]",
 								repo_name,
@@ -2777,6 +2794,9 @@ impl WorkbenchModel {
 		&mut self,
 		mut candidate: PreparedSelection,
 	) -> bool {
+		// An unloaded or failed Changes list has no checkboxes to replace the
+		// Git group with; doing so would silently drop the repo's selections.
+		candidate.replace_git_group &= self.changes_loaded;
 		if candidate.replace_file_group || candidate.replace_git_group {
 			let admitted = self
 				.repo()
@@ -3074,9 +3094,10 @@ impl WorkbenchModel {
 			app_log!("[APP:COPY_BUSY]");
 			return;
 		}
+		// Change-list checkboxes already update the basket as they toggle;
+		// only the project tree's selection is synced lazily.
 		let mut candidate = self.selection_candidate();
 		candidate.replace_file_group = true;
-		candidate.replace_git_group = true;
 		if !self.install_selection_candidate(candidate) {
 			cx.notify();
 			return;
