@@ -1939,7 +1939,47 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
-	/// IntelliJ speed search field over the top of the list.
+	/// Row label with the speed-search match highlighted (IntelliJ paints
+	/// the matched substring), plain text otherwise.
+	fn speed_label(&self, text: String) -> Div {
+		let q = self.chrome.speed.to_lowercase();
+		let hit = (!q.is_empty() && self.left_active)
+			.then(|| {
+				// Lowercasing may change byte lengths; only highlight when
+				// the match maps back onto the original text.
+				let lower = text.to_lowercase();
+				(lower.len() == text.len())
+					.then(|| lower.find(&q).map(|i| i..i + q.len()))
+					.flatten()
+			})
+			.flatten()
+			.filter(|r| {
+				text.is_char_boundary(r.start) && text.is_char_boundary(r.end)
+			});
+		let base = div()
+			.min_w_0()
+			.overflow_hidden()
+			.line_clamp(1)
+			.text_ellipsis();
+		match hit {
+			Some(range) => {
+				base.child(gpui::StyledText::new(text).with_highlights([(
+					range,
+					gpui::HighlightStyle {
+						// IntelliJ paints speed-search matches amber with
+						// dark text in both themes.
+						background_color: Some(rgb(LIGHT.find_bg).into()),
+						color: Some(rgb(0x000000).into()),
+						..Default::default()
+					},
+				)]))
+			}
+			None => base.child(text),
+		}
+	}
+
+	/// IntelliJ speed search field, floating over the tool window header
+	/// at the top-left of the list so no row is covered.
 	fn speed_search_popup(&self) -> AnyElement {
 		let none = self.tool_row_labels().iter().all(|l| {
 			!l.to_lowercase().contains(&self.chrome.speed.to_lowercase())
@@ -1947,8 +1987,8 @@ impl WorkbenchModel {
 		div()
 			.id("speed-search")
 			.absolute()
-			.top(px(-2.))
-			.left(px(8.))
+			.top(px(3. - PANEL_HEADER_H))
+			.left(px(6.))
 			.flex()
 			.items_center()
 			.gap(px(4.))
@@ -2115,7 +2155,7 @@ impl WorkbenchModel {
 						14.,
 					))
 					.child(
-						clip_text(repo.name.clone())
+						self.speed_label(repo.name.clone())
 							.font_weight(FontWeight::SEMIBOLD),
 					)
 					.when_some(kind_badge, |d, badge| {
@@ -2321,7 +2361,8 @@ impl WorkbenchModel {
 				14.,
 			))
 			.child(
-				fill_text(row.name.clone())
+				self.speed_label(row.name.clone())
+					.flex_1()
 					.when_some(name_color, |d, c| d.text_color(rgb(c))),
 			)
 			.when(row.is_nested_repo, |d| {
@@ -2469,7 +2510,7 @@ impl WorkbenchModel {
 				},
 				14.,
 			))
-			.child(fill_text(row.name.clone()))
+			.child(self.speed_label(row.name.clone()).flex_1())
 			.when(submodule, |d| {
 				d.child(
 					div()
@@ -2718,7 +2759,7 @@ impl WorkbenchModel {
 				14.,
 			))
 			.child(
-				clip_text(name)
+				self.speed_label(name)
 					.flex_shrink_0()
 					.max_w(gpui::relative(0.7))
 					.text_color(rgb(color))
@@ -2748,6 +2789,9 @@ impl WorkbenchModel {
 			.items_center()
 			.border_b_1()
 			.border_color(rgb(pal().divider))
+			.on_mouse_down(MouseButton::Right, |_, w, cx| {
+				w.dispatch_action(Box::new(crate::OpenTabMenu), cx)
+			})
 			.when(!label.is_empty(), |d| {
 				d.child(
 					div()
@@ -5077,6 +5121,29 @@ impl Render for WorkbenchModel {
 					cx.notify();
 				}
 			}))
+			.on_action(cx.listener(|this, _: &crate::OpenTabMenu, w, cx| {
+				let (items, pos) = (this.tab_menu(), w.mouse_position());
+				this.open_menu(
+					crate::menu::MenuOrigin::Editor,
+					items,
+					pos,
+					w,
+					cx,
+				)
+			}))
+			// Arrow keys count as keyboard navigation, like Tab.
+			.capture_action(|_: &TreeUp, _, _| {
+				set_keyboard_nav(true);
+			})
+			.capture_action(|_: &TreeDown, _, _| {
+				set_keyboard_nav(true);
+			})
+			.capture_action(|_: &LogUp, _, _| {
+				set_keyboard_nav(true);
+			})
+			.capture_action(|_: &LogDown, _, _| {
+				set_keyboard_nav(true);
+			})
 			.on_action(cx.listener(|this, _: &crate::HideToolWindow, w, cx| {
 				this.hide_active_tool(w, cx)
 			}))

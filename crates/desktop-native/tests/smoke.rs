@@ -4271,7 +4271,8 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	right_click("tree-row:subfolder/nested.txt");
 	let open = wait("[APP:MENU_OPEN: Left");
 	assert!(
-		open.last().unwrap().contains("copy-relative-path"),
+		open.last().unwrap().contains("copy-relative-path")
+			&& open.last().unwrap().contains("reveal"),
 		"{open:?}"
 	);
 	control("context-menu");
@@ -4314,6 +4315,31 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	// A second Esc leaves the tool window for the editor.
 	key(&wid, "Escape");
 	wait("[APP:FOCUS: editor]");
+
+	// 3b. Editor tab menu: right-click the tab strip (just above the
+	// breadcrumb bar) and Close the tab.
+	let crumb = control("breadcrumb");
+	let (x, y) = (crumb[0] + 30, crumb[1] - 16);
+	Command::new("xdotool")
+		.args([
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+			"click",
+			"3",
+		])
+		.status()
+		.unwrap();
+	let open = wait("[APP:MENU_OPEN: Editor");
+	assert!(
+		open.last().unwrap().contains("close-tab,close-other-tabs"),
+		"{open:?}"
+	);
+	click("menu-item:close-tab");
+	wait("[APP:TAB_CLOSED: 0]");
+	absent("context-menu");
 
 	// 4. Shift+Esc hides the focused tool window.
 	click("tree-row:alpha.txt");

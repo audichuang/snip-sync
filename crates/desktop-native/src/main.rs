@@ -183,6 +183,7 @@ actions!(
 		ToolPageDown,
 		HideToolWindow,
 		FocusEditor,
+		OpenTabMenu,
 	]
 );
 
@@ -4210,6 +4211,54 @@ impl WorkbenchModel {
 		) {
 			app_log!("[APP:LOG_PANEL: visible=true reason=paste_close]");
 		}
+	}
+
+	/// Editor tabs open: the paste preview, or the one reader tab.
+	pub fn open_tab_count(&self) -> usize {
+		let paste = self.paste_preview.is_some() || self.paste_loading;
+		let reader = self.preview.is_some()
+			|| self.preview_loading
+			|| self.selected_commit.is_some()
+			|| self.compare.is_some();
+		usize::from(paste || reader)
+	}
+
+	/// Closes editor tab `idx`. The workbench shows one tab at a time, so
+	/// only index 0 exists: the paste preview is cancelled, a reader tab
+	/// clears what it shows (the Git selection that opened it included).
+	pub fn close_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
+		if idx != 0 || self.open_tab_count() == 0 {
+			return;
+		}
+		if self.paste_preview.is_some() || self.paste_loading {
+			self.cancel_paste_preview(cx);
+			return;
+		}
+		// Drop in-flight reads for the closed tab.
+		self.preview_generation += 1;
+		let _ = arm_cancel(&mut self.preview_cancel);
+		self.clear_preview();
+		self.preview_loading = false;
+		self.preview_error = None;
+		self.selected_file = None;
+		self.selected_file_source = None;
+		self.selected_commit = None;
+		self.range_head = None;
+		self.compare = None;
+		self.selected_commit_file = None;
+		self.commit_files.clear();
+		app_log!("[APP:TAB_CLOSED: {idx}]");
+		cx.notify();
+	}
+
+	/// With a single tab there is never another one to close.
+	pub fn close_other_tabs(&mut self, idx: usize, cx: &mut Context<Self>) {
+		let _ = idx;
+		cx.notify();
+	}
+
+	pub fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+		self.close_tab(0, cx);
 	}
 
 	pub fn cancel_paste_preview(&mut self, cx: &mut Context<Self>) {

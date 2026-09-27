@@ -12,7 +12,11 @@ use gpui::{
 };
 use snip_core::transfer::SourceKind;
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
 use crate::i18n::t;
+use crate::icons::{icon, Icon};
 use crate::theme::*;
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture, TreeCommand};
 use crate::ui::probe;
@@ -46,6 +50,7 @@ impl Chrome {
 pub enum MenuOrigin {
 	Left,
 	Log,
+	Editor,
 }
 
 pub struct ContextMenu {
@@ -68,6 +73,10 @@ pub enum MenuAct {
 	CopyCommits(String),
 	Select(String),
 	BrowseTree(String),
+	Reveal(PathBuf),
+	CloseTab(usize),
+	CloseOtherTabs(usize),
+	CloseAllTabs,
 }
 
 #[derive(Clone, Debug)]
@@ -142,13 +151,49 @@ impl WorkbenchModel {
 	}
 
 	pub(crate) fn repo_row_menu(&self, idx: usize) -> Vec<MenuEntry> {
-		let path = self.repos.get(idx).map(|r| r.root.display().to_string());
-		vec![item(
-			"copy-path",
-			"menu_copy_path",
-			None,
-			path.map(MenuAct::CopyText),
-		)]
+		let root = self.repos.get(idx).map(|r| r.root.clone());
+		vec![
+			item(
+				"copy-path",
+				"menu_copy_path",
+				None,
+				root.as_ref()
+					.map(|r| MenuAct::CopyText(r.display().to_string())),
+			),
+			reveal_entry(root),
+		]
+	}
+
+	fn reveal_rel(&self, rel: &str) -> MenuEntry {
+		reveal_entry(
+			self.repo_root().map(|r| r.join(rel.trim_end_matches('/'))),
+		)
+	}
+
+	/// Editor tab menu (IntelliJ: Close / Close Others / Close All).
+	pub(crate) fn tab_menu(&self) -> Vec<MenuEntry> {
+		let open = self.open_tab_count();
+		let on = |a: MenuAct| (open > 0).then_some(a);
+		vec![
+			item(
+				"close-tab",
+				"menu_close_tab",
+				Some(secondary("F4")),
+				on(MenuAct::CloseTab(0)),
+			),
+			item(
+				"close-other-tabs",
+				"menu_close_other_tabs",
+				None,
+				(open > 1).then_some(MenuAct::CloseOtherTabs(0)),
+			),
+			item(
+				"close-all-tabs",
+				"menu_close_all_tabs",
+				None,
+				on(MenuAct::CloseAllTabs),
+			),
+		]
 	}
 
 	pub(crate) fn work_row_menu(
@@ -162,6 +207,7 @@ impl WorkbenchModel {
 			.map(MenuAct::Tree);
 		let mut v = vec![basket_entry(row.selected, toggle), MenuEntry::Sep];
 		v.extend(copy_entries(self.abs_path(&row.rel_path), &row.rel_path));
+		v.push(self.reveal_rel(&row.rel_path));
 		v
 	}
 
@@ -215,6 +261,7 @@ impl WorkbenchModel {
 			MenuEntry::Sep,
 		];
 		v.extend(copy_entries(self.abs_path(&path), &path));
+		v.push(self.reveal_rel(&path));
 		v
 	}
 
@@ -356,6 +403,7 @@ impl WorkbenchModel {
 			window.focus(match m.origin {
 				MenuOrigin::Left => &self.tree_focus,
 				MenuOrigin::Log => &self.log_focus,
+				MenuOrigin::Editor => &self.reader_focus,
 			});
 		}
 		app_log!("[APP:MENU_CLOSED]");
@@ -484,6 +532,19 @@ impl WorkbenchModel {
 			}
 			MenuAct::CopyCommits(_) => self.copy_commits_to_clipboard(cx),
 			MenuAct::Select(sha) => self.log_select_row(&sha, cx),
+			MenuAct::Reveal(path) => {
+				let result = reveal_command(TargetOs::current(), &path)
+					.and_then(|(prog, args)| spawn_detached(&prog, &args));
+				match result {
+					Ok(()) => app_log!("[APP:REVEAL: {}]", path.display()),
+					Err(e) => {
+						self.set_status("status_reveal_failed", [e.to_string()])
+					}
+				}
+			}
+			MenuAct::CloseTab(ix) => self.close_tab(ix, cx),
+			MenuAct::CloseOtherTabs(ix) => self.close_other_tabs(ix, cx),
+			MenuAct::CloseAllTabs => self.close_all_tabs(cx),
 			MenuAct::BrowseTree(sha) => {
 				if self.selected_commit.as_deref() != Some(sha.as_str()) {
 					self.select_commit(&sha, cx);
@@ -626,6 +687,7 @@ impl WorkbenchModel {
 		let m = self.chrome.menu.as_ref()?;
 		let loc = self.locale;
 		let log = &self.probes;
+		let width = menu_width(&m.entries, loc);
 		let rows: Vec<AnyElement> = m
 			.entries
 			.iter()
@@ -682,10 +744,26 @@ impl WorkbenchModel {
 									},
 								))
 						})
+						// Leading icon column, empty for items without one.
 						.child(
 							div()
-								.flex_1()
-								.min_w_0()
+								.flex_shrink_0()
+								.w(px(16.))
+								.mr(px(-10.))
+								.children(item_icon(id).map(|ic| {
+									div()
+										.flex()
+										.when(!enabled, |d| d.opacity(0.4))
+										.child(icon(ic, 14.))
+								})),
+						)
+						.child(
+							// Never shrink: the menu grows to its longest label.
+							// `flex_grow` keeps the auto basis so the label's
+							// width counts toward the menu's own width.
+							div()
+								.flex_grow()
+								.flex_shrink_0()
 								.whitespace_nowrap()
 								.child(t(label, loc)),
 						)
@@ -729,8 +807,9 @@ impl WorkbenchModel {
 			)
 			// A right click inside the menu must not reach the row below.
 			.on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-			.min_w(px(200.))
-			.max_w(px(360.))
+			// An anchored popup gets no intrinsic text width from the
+			// layout engine, so size it from its labels.
+			.w(px(width))
 			.flex()
 			.flex_col()
 			.p(px(4.))
@@ -783,3 +862,158 @@ pub(crate) const CHANGE_GROUPS: [(&str, &str); 4] = [
 	("unstaged", "group_unstaged"),
 	("untracked", "group_untracked"),
 ];
+
+/// Approximate text width at `UI_TEXT`: CJK glyphs are full-width.
+fn text_w(s: &str) -> f32 {
+	s.chars()
+		.map(|c| if c.is_ascii() { 7.5 } else { UI_TEXT })
+		.sum()
+}
+
+/// Menu width: widest label plus its shortcut, icon column and padding.
+fn menu_width(entries: &[MenuEntry], loc: crate::i18n::Locale) -> f32 {
+	let widest = entries
+		.iter()
+		.filter_map(|e| match e {
+			MenuEntry::Item {
+				label, shortcut, ..
+			} => Some(
+				text_w(t(label, loc))
+					+ shortcut.as_deref().map_or(0., |k| 16. + text_w(k)),
+			),
+			MenuEntry::Sep => None,
+		})
+		.fold(0., f32::max);
+	// Panel padding 4+4, row padding 8+8, icon 16, icon gap 6, border 2.
+	(widest + 48.).clamp(200., 420.)
+}
+
+/// Leading icon of a menu item, as IntelliJ shows for common actions.
+fn item_icon(id: &str) -> Option<Icon> {
+	Some(match id {
+		"copy-path" | "copy-relative-path" | "copy-revision" => Icon::Copy,
+		"copy-commits" => Icon::Commit,
+		"show-diff" => Icon::Diff,
+		"add-basket" => Icon::Basket,
+		"remove-basket" => Icon::Minus,
+		// The Log lists newest first: the parent is below, the child above.
+		"go-parent" => Icon::ArrowDown,
+		"go-child" => Icon::ArrowUp,
+		"browse-tree" => Icon::Folder,
+		"reveal" => Icon::Locate,
+		"close-tab" => Icon::Close,
+		_ => return None,
+	})
+}
+
+fn reveal_entry(path: Option<PathBuf>) -> MenuEntry {
+	let label = match TargetOs::current() {
+		TargetOs::Mac => "menu_reveal_finder",
+		TargetOs::Windows => "menu_reveal_explorer",
+		TargetOs::Linux => "menu_reveal_files",
+	};
+	item("reveal", label, None, path.map(MenuAct::Reveal))
+}
+
+/// Platform whose file manager "Reveal" drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetOs {
+	Mac,
+	Windows,
+	Linux,
+}
+
+impl TargetOs {
+	pub(crate) fn current() -> Self {
+		if cfg!(target_os = "macos") {
+			Self::Mac
+		} else if cfg!(windows) {
+			Self::Windows
+		} else {
+			Self::Linux
+		}
+	}
+}
+
+/// Program and arguments that show `path` in the file manager: Finder and
+/// Explorer select the item itself; Linux has no portable "select", so the
+/// containing directory is opened.
+pub(crate) fn reveal_command(
+	os: TargetOs,
+	path: &Path,
+) -> std::io::Result<(String, Vec<OsString>)> {
+	Ok(match os {
+		TargetOs::Mac => (
+			"open".into(),
+			vec!["-R".into(), path.as_os_str().to_owned()],
+		),
+		TargetOs::Windows => {
+			// Explorer wants `/select,<path>` as one argument.
+			let mut arg = OsString::from("/select,");
+			arg.push(path.as_os_str());
+			("explorer".into(), vec![arg])
+		}
+		TargetOs::Linux => {
+			let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+			let dir = dir.ok_or_else(|| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidInput,
+					"path has no parent directory",
+				)
+			})?;
+			("xdg-open".into(), vec![dir.as_os_str().to_owned()])
+		}
+	})
+}
+
+/// Starts the file manager without tying it to the app; a thread reaps it
+/// so no zombie is left behind.
+fn spawn_detached(prog: &str, args: &[OsString]) -> std::io::Result<()> {
+	use std::process::{Command, Stdio};
+	let mut child = Command::new(prog)
+		.args(args)
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn()?;
+	std::thread::spawn(move || {
+		let _ = child.wait();
+	});
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn reveal_command_per_platform() {
+		let p = Path::new("/w/repo/src/a b.rs");
+		let (prog, args) = reveal_command(TargetOs::Mac, p).unwrap();
+		assert_eq!(prog, "open");
+		assert_eq!(args, vec![OsString::from("-R"), p.into()]);
+
+		let (prog, args) = reveal_command(TargetOs::Windows, p).unwrap();
+		assert_eq!(prog, "explorer");
+		assert_eq!(args, vec![OsString::from("/select,/w/repo/src/a b.rs")]);
+
+		let (prog, args) = reveal_command(TargetOs::Linux, p).unwrap();
+		assert_eq!(prog, "xdg-open");
+		assert_eq!(args, vec![OsString::from("/w/repo/src")]);
+		assert!(reveal_command(TargetOs::Linux, Path::new("/")).is_err());
+	}
+
+	#[test]
+	fn common_items_have_icons() {
+		for id in [
+			"copy-path",
+			"show-diff",
+			"add-basket",
+			"close-tab",
+			"reveal",
+		] {
+			assert!(item_icon(id).is_some(), "{id}");
+		}
+		assert!(item_icon("close-all-tabs").is_none());
+	}
+}
