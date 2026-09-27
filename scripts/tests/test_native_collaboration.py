@@ -250,6 +250,45 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(driver.ClipboardMismatch):
             driver.transfer_os_clipboard(source, dest)
 
+    def test_click_control_waits_only_for_current_nonviewport_bounds(self) -> None:
+        import bench_native_memory as native
+
+        oid = "38a46ceaf58b6eab895d12b4894d4b6cf38d8a0d"
+        control = f"btn-browse-tree:{oid}"
+        # CI emitted preview completion 44.7 ms before this ready prepaint probe.
+        preview = f"[APP:E2E_PREVIEW: source=commit_diff rev={oid} path=src/keep.txt]"
+        bounds = f"[APP:CTRL_BOUNDS: id={control} x=907 y=203 w=72 h=22]"
+        cases = (
+            ("delayed", [bounds], None, 0.05),
+            ("never", [], driver.MissingControl, 0.2),
+            ("wrong-revision", [bounds.replace(oid, "f" * 40)], driver.MissingControl, 0.2),
+            ("gone", [bounds, f"[APP:CTRL_GONE: id={control}]"], driver.MissingControl, 0.2),
+            ("empty", [bounds.replace("w=72", "w=0")], driver.MissingControl, 0.05),
+            ("off-window", [bounds.replace("x=907", "x=1070")], native.NativeBenchError, 0.05),
+        )
+        for name, frame, error, expected_elapsed in cases:
+            with self.subTest(case=name):
+                elapsed = [0.0]
+                clicks = []
+                session = _Session([preview])
+                session.click = lambda win, box: clicks.append(box)
+
+                def sleep(delay):
+                    elapsed[0] += delay
+                    if len(session.lines) == 1 and elapsed[0] >= 0.0447:
+                        session.lines.extend((elapsed[0], line) for line in frame)
+
+                win = {"width": 1080, "height": 720}
+                with patch.object(driver.time, "monotonic", side_effect=lambda: elapsed[0]), patch.object(driver.time, "sleep", side_effect=sleep):
+                    if error is None:
+                        driver.click_control(native, session, win, control, timeout=0.2)
+                        self.assertEqual(clicks, [(907, 203, 72, 22)])
+                    else:
+                        with self.assertRaises(error):
+                            driver.click_control(native, session, win, control, timeout=0.2)
+                        self.assertEqual(clicks, [])
+                self.assertAlmostEqual(elapsed[0], expected_elapsed)
+
     def test_graph_counts_do_not_prove_edges(self) -> None:
         observed = driver.graph_from_lines(["[APP:GRAPH_LOADED: commits=14]", "[APP:E2E_LOG: mode=graph n=14 first=c4ad19b page=1]"])
         self.assertFalse(observed["paintedEdgesProven"])
@@ -1319,6 +1358,7 @@ class _FlowSession(_Session):
 class ApplyRefusalTests(unittest.TestCase):
     def native(self):
         return SimpleNamespace(
+            parse_bounds=lambda lines: {"btn-apply": (0, 0, 10, 10)},
             require_control=lambda lines, control: (0, 0, 10, 10),
             assert_on_window=lambda *args: None,
         )

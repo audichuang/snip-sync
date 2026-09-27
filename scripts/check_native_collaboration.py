@@ -1085,8 +1085,15 @@ def click_control(native: Any, session: Any, win: dict[str, Any], control: str, 
     elif viewport:
         box = scroll_in_view(native, session, win, control, viewport, timeout)
     else:
+        deadline = time.monotonic() + timeout
+        while True:
+            lines = session.texts()
+            remaining = deadline - time.monotonic()
+            if control in native.parse_bounds(lines) or remaining <= 0:
+                break
+            time.sleep(min(0.05, remaining))
         try:
-            box = native.require_control(session.texts(), control)
+            box = native.require_control(lines, control)
         except Exception as exc:
             raise MissingControl(control, str(exc)) from exc
     native.assert_on_window(box, win, control)
