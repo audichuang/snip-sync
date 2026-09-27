@@ -1060,8 +1060,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	let git_oracle_text =
 		String::from_utf8(git_oracle_raw.stdout).expect("utf-8 oracle");
 	assert_eq!(
-		copied_hist.trim(),
-		git_oracle_text.trim(),
+		copied_hist, git_oracle_text,
 		"copied historical file must match Git oracle byte-for-byte"
 	);
 
@@ -3472,5 +3471,421 @@ fn native_historical_file_basket_and_collision() {
 		"repo-b must remain on initial commit"
 	);
 
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Error bodies must never copy hidden old text. Display clipping must not
+/// replace the retained source bytes used by Copy View or reader selection.
+#[test]
+fn native_reader_degradation_and_copy_integrity() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("reader");
+	fs::create_dir(&repo).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.name", "Reader Test"]);
+	git_ok(&repo, &["config", "user.email", "reader@example.com"]);
+	let good = "\u{feff}  exact source\t \r\n第二行\r\n\r\n";
+	let long = format!(
+		"{}繁體中文𝄞{}HIDDEN-END",
+		"a".repeat(4091),
+		"b".repeat(12_000)
+	);
+	let many = "row\n".repeat(50_001);
+	let files: Vec<(&str, Vec<u8>)> = vec![
+		("good.txt", good.as_bytes().to_vec()),
+		("long.txt", long.as_bytes().to_vec()),
+		("many-lines.txt", many.as_bytes().to_vec()),
+		("binary.bin", b"binary\0bytes".to_vec()),
+		("not-utf8.txt", vec![b'x', 0xff, b'y']),
+		("large.txt", vec![b'L'; 1024 * 1024 + 1]),
+	];
+	for (name, bytes) in &files {
+		fs::write(repo.join(name), bytes).unwrap();
+	}
+	git_ok(&repo, &["add", "."]);
+	git_ok(&repo, &["commit", "-qm", "reader fixtures"]);
+	let head = git_rev(&repo);
+	let index_before = fs::read(repo.join(".git/index")).unwrap();
+	let git_good = Command::new("git")
+		.current_dir(&repo)
+		.args(["show", &format!("{head}:good.txt")])
+		.output()
+		.unwrap();
+	assert!(git_good.status.success());
+	assert_eq!(git_good.stdout, good.as_bytes());
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let dest = tempfile::tempdir().unwrap();
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	let wait = |pattern: &str| {
+		lines_until(&app.rx, pattern, Duration::from_secs(8))
+			.unwrap_or_else(|error| panic!("{error}"))
+	};
+	wait("[APP:READY_REPOS: 1]");
+	wait("[APP:REPO_LOADED: reader");
+	wait("[APP:E2E_LOG:");
+	let wid = find_wid(app.pid);
+	// Map and focus the window on private X11 without a window manager.
+	key(&wid, "Escape");
+	assert!(Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "900", "600"])
+		.status()
+		.unwrap()
+		.success());
+	wait("[APP:VIEWPORT: 900x600]");
+	assert_eq!(*viewport.lock().unwrap(), (900, 600));
+	let capture = |path: &Path| {
+		let geometry = Command::new("xdotool")
+			.args(["getwindowgeometry", "--shell", &wid])
+			.output()
+			.unwrap();
+		assert!(geometry.status.success());
+		let text = String::from_utf8(geometry.stdout).unwrap();
+		let geometry: HashMap<_, _> = text
+			.lines()
+			.filter_map(|line| line.split_once('='))
+			.collect();
+		let crop = format!(
+			"{}x{}+{}+{}",
+			geometry["WIDTH"], geometry["HEIGHT"], geometry["X"], geometry["Y"]
+		);
+		let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			assert!(Command::new("xwd")
+				.args(["-root", "-silent", "-out"])
+				.arg(xwd.path())
+				.status()
+				.unwrap()
+				.success());
+			assert!(Command::new("convert")
+				.arg(xwd.path())
+				.args(["-crop", &crop, "+repage"])
+				.arg(path)
+				.status()
+				.unwrap()
+				.success());
+			if fs::metadata(path).unwrap().len() > 1024 {
+				break;
+			}
+			assert!(
+				Instant::now() < deadline,
+				"window must present a nonblank frame"
+			);
+			std::thread::sleep(Duration::from_millis(20));
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			let v = bounds.lock().unwrap().get(id).copied();
+			if let Some(v) = v {
+				let (w, h) = *viewport.lock().unwrap();
+				// A viewport event precedes the next frame's control bounds.
+				if v[2] > 0
+					&& v[3] > 0 && v[0] >= 0
+					&& v[1] >= 0 && v[0] + v[2] <= w
+					&& v[1] + v[3] <= h
+				{
+					return v;
+				}
+			}
+			if Instant::now() >= deadline {
+				capture(&out.join("reader-missing-control.png"));
+				fs::write(
+					out.join("reader-missing-control-bounds.txt"),
+					format!(
+						"missing or outside viewport={id}\n{:?}",
+						bounds.lock().unwrap()
+					),
+				)
+				.unwrap();
+				panic!("{id} not drawn fully inside viewport");
+			}
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		let v = loop {
+			let before = control(id);
+			std::thread::sleep(Duration::from_millis(150));
+			let after = control(id);
+			if before == after {
+				break after;
+			}
+			assert!(Instant::now() < deadline, "{id} bounds did not settle");
+		};
+		assert!(Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status()
+			.unwrap()
+			.success());
+		assert!(Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&(v[0] + v[2] / 2).to_string(),
+				&(v[1] + v[3] / 2).to_string(),
+				"click",
+				"1"
+			])
+			.status()
+			.unwrap()
+			.success());
+	};
+	let open = |prefix: &str, path: &str| {
+		click(&format!("{prefix}:{path}"));
+		wait(&format!("[APP:TREE_FILE_SELECTED: {path}]"));
+		wait(&format!("[APP:PREVIEW_LOADED: {path}]"));
+		control("reader");
+	};
+	let assert_no_copy = |sentinel: &str, evidence: &str| {
+		let deadline = Instant::now() + Duration::from_millis(400);
+		let mut events = Vec::new();
+		while Instant::now() < deadline {
+			match app.rx.recv_timeout(Duration::from_millis(40)) {
+				Ok(line) => events.push(line),
+				Err(RecvTimeoutError::Timeout) => {}
+				Err(RecvTimeoutError::Disconnected) => {
+					panic!("app exited during refusal")
+				}
+			}
+		}
+		let actual = clip_get();
+		fs::write(out.join(format!("{evidence}-clipboard.txt")), &actual)
+			.unwrap();
+		fs::write(
+			out.join(format!("{evidence}-events.txt")),
+			events.join("\n"),
+		)
+		.unwrap();
+		capture(&out.join(format!("{evidence}.png")));
+		// Keep this assertion first: the old product must fail on actual stale
+		// clipboard bytes, before any newly added notice probe is needed.
+		assert_eq!(
+			actual, sentinel,
+			"{evidence}: error body copied hidden old text"
+		);
+		assert!(
+			!events
+				.iter()
+				.any(|line| line.contains("[APP:PREVIEW_COPIED:")
+					|| line.contains("[APP:SELECTION_COPIED:")
+					|| line.contains("[APP:COPY_DONE:")),
+			"{evidence}: unexpected copy event: {events:?}"
+		);
+	};
+
+	click(&format!("commit-row:{}", &head[..7]));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &head[..7]));
+	wait("[APP:E2E_PREVIEW: source=commit_diff");
+	click("btn-browse-tree");
+	wait(&format!("[APP:REV_TREE: {}]", &head[..7]));
+	for path in ["binary.bin", "not-utf8.txt", "large.txt"] {
+		open("rev-row", "good.txt");
+		click("reader");
+		key(&wid, "ctrl+a");
+		key(&wid, "ctrl+c");
+		wait("[APP:SELECTION_COPIED:");
+		assert!(
+			!clip_get().is_empty(),
+			"old selection must exist before failure"
+		);
+		let sentinel = format!("reader refusal sentinel: {path}\r\n  ");
+		clip_set(&sentinel);
+		click(&format!("rev-row:{path}"));
+		wait(&format!("[APP:TREE_FILE_SELECTED: {path}]"));
+		control("editor-error");
+		std::thread::sleep(Duration::from_millis(100));
+		capture_window(
+			&wid,
+			&out.join(format!("reader-{path}-before-copy.png")),
+		);
+		click("btn-copy-view");
+		assert_no_copy(&sentinel, &format!("reader-{path}-refusal"));
+	}
+
+	open("rev-row", "good.txt");
+	click("btn-copy-view");
+	wait("[APP:PREVIEW_COPIED:");
+	assert_eq!(
+		clip_get().as_bytes(),
+		git_good.stdout,
+		"BOM, CRLF, spaces and final newlines survive Copy View"
+	);
+
+	open("rev-row", "long.txt");
+	std::thread::sleep(Duration::from_millis(150));
+	capture(&out.join("reader-long-zh.png"));
+	let notice = control("reader-truncated-notice");
+	let reader = control("reader");
+	assert!(
+		notice[0] >= reader[0]
+			&& notice[1] >= reader[1]
+			&& notice[0] + notice[2] <= reader[0] + reader[2]
+			&& notice[1] + notice[3] <= reader[1] + reader[3],
+		"line notice {notice:?} must be visible inside reader {reader:?}"
+	);
+	let row = bounds.lock().unwrap().get("code-text:1").copied().unwrap();
+	fs::write(out.join("reader-long-layout.txt"),
+		format!("viewport={:?}\nnotice={notice:?}\nreader={reader:?}\nrow={row:?}\n", *viewport.lock().unwrap())).unwrap();
+	assert!(row[3] >= 18 && row[1] >= notice[1] + notice[3]
+		&& row[1] + row[3] <= reader[1] + reader[3]
+		&& row[0] < reader[0] + reader[2] && row[0] + row[2] > reader[0],
+		"notice must leave a full actual text row: row={row:?}, reader={reader:?}");
+	control("log-list"); // The Git panel stays open throughout this proof.
+	click("btn-copy-view");
+	wait("[APP:PREVIEW_COPIED:");
+	assert_eq!(
+		clip_get(),
+		long,
+		"display clipping must not clip whole preview copy"
+	);
+
+	click("reader");
+	key(&wid, "ctrl+a");
+	key(&wid, "ctrl+c");
+	wait("[APP:SELECTION_COPIED:");
+	assert_eq!(
+		clip_get(),
+		long,
+		"Select All retains the hidden suffix, with no display marker"
+	);
+	// The locale event precedes paint. Compare only the warning rectangle,
+	// excluding the reader selection, pointer, and other changing controls.
+	let notice_pixels = |image: &Path, crop: &Path| {
+		let [x, y, w, h] = notice;
+		let pixels = Command::new("convert")
+			.arg(image)
+			.args([
+				"-crop",
+				&format!("{w}x{h}+{x}+{y}"),
+				"+repage",
+				"-depth",
+				"8",
+				"-write",
+			])
+			.arg(crop)
+			.arg("RGB:-")
+			.output()
+			.unwrap();
+		assert!(
+			pixels.status.success(),
+			"notice crop failed: {:?}",
+			pixels.stderr
+		);
+		assert_eq!(pixels.stdout.len(), (w * h * 3) as usize);
+		pixels.stdout
+	};
+	// Text antialiasing blends warning ink with its dark background.
+	let has_warning_ink = |pixels: &[u8]| {
+		pixels.as_chunks::<3>().0.iter().any(|p| {
+			p[0].abs_diff(242) <= 16
+				&& p[1].abs_diff(197) <= 16
+				&& p[2].abs_diff(92) <= 16
+		})
+	};
+	let deadline = Instant::now() + Duration::from_secs(5);
+	let mut previous = Vec::new();
+	let chinese_pixels = loop {
+		capture(&out.join("reader-long-zh.png"));
+		let pixels = notice_pixels(
+			&out.join("reader-long-zh.png"),
+			&out.join("reader-long-zh-notice.png"),
+		);
+		if has_warning_ink(&pixels) && pixels == previous {
+			break pixels;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"Chinese notice did not paint and settle"
+		);
+		previous = pixels;
+		std::thread::sleep(Duration::from_millis(100));
+	};
+	click("btn-locale");
+	wait("[APP:LOCALE: En]");
+	assert_eq!(control("reader-truncated-notice"), notice);
+	let deadline = Instant::now() + Duration::from_secs(5);
+	let mut previous = Vec::new();
+	loop {
+		capture(&out.join("reader-long-en.png"));
+		let pixels = notice_pixels(
+			&out.join("reader-long-en.png"),
+			&out.join("reader-long-en-notice.png"),
+		);
+		if has_warning_ink(&pixels)
+			&& pixels != chinese_pixels
+			&& pixels == previous
+		{
+			break;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"English notice did not paint and settle"
+		);
+		previous = pixels;
+		std::thread::sleep(Duration::from_millis(100));
+	}
+
+	open("rev-row", "many-lines.txt");
+	control("reader-truncated-notice");
+	capture(&out.join("reader-many-lines.png"));
+	click("btn-copy-view");
+	wait("[APP:PREVIEW_COPIED:");
+	assert_eq!(
+		clip_get(),
+		many,
+		"line indexing cap must not discard retained source bytes"
+	);
+
+	click("btn-leave-tree");
+	wait("[APP:REV_TREE: off]");
+	open("tree-row", "good.txt");
+	// Actual filesystem read failure, with a still-rendered tree row.
+	fs::remove_file(repo.join("good.txt")).unwrap();
+	let sentinel = "working read failure sentinel\n";
+	clip_set(sentinel);
+	click("tree-row:good.txt");
+	wait("[APP:TREE_FILE_SELECTED: good.txt]");
+	control("editor-error");
+	click("btn-copy-view");
+	assert_no_copy(sentinel, "reader-missing-working-file");
+	fs::write(repo.join("good.txt"), good).unwrap();
+	open("tree-row", "good.txt");
+	click("btn-copy-view");
+	wait("[APP:PREVIEW_COPIED:");
+	assert_eq!(
+		clip_get(),
+		good,
+		"valid read recovers raw copy after an error"
+	);
+	assert_eq!(git_rev(&repo), head);
+	assert_eq!(fs::read(repo.join(".git/index")).unwrap(), index_before);
+	for (name, bytes) in &files {
+		assert_eq!(
+			&fs::read(repo.join(name)).unwrap(),
+			bytes,
+			"{name} changed"
+		);
+	}
 	quit_cleanly(&mut app, &wid);
 }

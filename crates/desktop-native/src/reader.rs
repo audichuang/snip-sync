@@ -506,6 +506,7 @@ impl Reader {
 		self.anchor = None;
 		self.head = None;
 		self.current = None;
+		self.selecting = false;
 	}
 
 	pub fn selection(&self) -> Option<(Pos, Pos)> {
@@ -744,7 +745,8 @@ impl WorkbenchModel {
 				let last = geom.iter().max_by_key(|(l, _)| *l).copied()?;
 				Some(if pos.y < first.1.top() { first } else { last })
 			})?;
-		let text = p.line(line);
+		// Pointer coordinates belong to the clipped text rendered in this row.
+		let (text, _) = clip_line(p.line(line));
 		if text.is_empty() {
 			return Some((line, 0));
 		}
@@ -837,6 +839,9 @@ impl WorkbenchModel {
 
 	/// Copies the reader selection. Returns false when nothing is selected.
 	pub fn copy_reader_selection(&mut self, cx: &mut Context<Self>) -> bool {
+		if !self.can_copy_preview() {
+			return false;
+		}
 		let (Some(p), Some(sel)) = (&self.preview, self.reader.selection())
 		else {
 			return false;
@@ -982,7 +987,7 @@ impl WorkbenchModel {
 		interactive: bool,
 	) -> AnyElement {
 		let theme = SyntaxTheme::default();
-		let (render_text, is_line_truncated) = clip_line(p.line(ix));
+		let (render_text, _) = clip_line(p.line(ix));
 		let (finds, sel) = if interactive {
 			let current = self.reader.current;
 			let finds: Vec<(usize, usize, bool)> = self
@@ -1068,7 +1073,6 @@ impl WorkbenchModel {
 						))
 						.with_highlights(hl),
 					)
-					.when(is_line_truncated, |d| d.child(truncated_mark()))
 					.when_some(geom, |d, geom| {
 						d.child(
 							gpui::canvas(
@@ -1093,7 +1097,7 @@ impl WorkbenchModel {
 			return div().into_any_element();
 		};
 		if let Some(line) = r.full {
-			let (text, is_line_truncated) = clip_line(p.line(line));
+			let (text, _) = clip_line(p.line(line));
 			return div()
 				.id(("side-line", ix))
 				.flex()
@@ -1113,7 +1117,6 @@ impl WorkbenchModel {
 							None,
 						)),
 				)
-				.when(is_line_truncated, |d| d.child(truncated_mark()))
 				.into_any_element();
 		}
 		let num_w = gutter_num_w(p);
@@ -1123,8 +1126,7 @@ impl WorkbenchModel {
 				Some((n, line)) => {
 					let raw = p.line(line);
 					// Drop the +/-/space marker; the side already says it.
-					let (text, is_line_truncated) =
-						clip_line(raw.get(1..).unwrap_or(""));
+					let (text, _) = clip_line(raw.get(1..).unwrap_or(""));
 					let changed = raw.starts_with(if add { '+' } else { '-' });
 					(
 						changed.then_some(if add {
@@ -1148,10 +1150,7 @@ impl WorkbenchModel {
 									&[],
 									None,
 								)),
-							)
-							.when(is_line_truncated, |d| {
-								d.child(truncated_mark())
-							}),
+							),
 					)
 				}
 				None => (Some(DIFF_EMPTY_BG), div()),
@@ -1210,15 +1209,6 @@ fn clip_line(text: &str) -> (&str, bool) {
 		cut -= 1;
 	}
 	(&text[..cut], true)
-}
-
-fn truncated_mark() -> gpui::Div {
-	div()
-		.flex_shrink_0()
-		.px(px(4.))
-		.text_size(px(10.))
-		.text_color(rgb(TEXT_MUTED))
-		.child("… [line truncated for display]")
 }
 
 /// Colours the leading +/- marker of a diff line on its own.
@@ -1418,7 +1408,7 @@ mod tests {
 
 		// Construct a 1MiB line with multibyte CJK and surrogate characters near 4096 cut boundary
 		let mut line_content = String::with_capacity(1024 * 1024);
-		line_content.push_str(&"a".repeat(4090));
+		line_content.push_str(&"a".repeat(4091));
 		line_content.push_str("繁體中文𝄞符號"); // cross 4096 boundary
 		let remaining = (1024usize * 1024).saturating_sub(line_content.len());
 		line_content.push_str(&"b".repeat(remaining));
@@ -1437,20 +1427,13 @@ mod tests {
 		let theme = SyntaxTheme::default();
 		let start = Instant::now();
 
-		// Simulate reader row rendering logic
+		// Exercise the same clipping used by rendering and pointer hit-testing.
 		let raw = p.line(0);
-		let (render_text, is_truncated) = if raw.len() > MAX_RENDER_LINE_BYTES {
-			let mut cut = MAX_RENDER_LINE_BYTES;
-			while cut > 0 && !raw.is_char_boundary(cut) {
-				cut -= 1;
-			}
-			(&raw[..cut], true)
-		} else {
-			(raw, false)
-		};
+		let (render_text, is_truncated) = clip_line(raw);
 
 		assert!(is_truncated);
-		assert!(render_text.len() <= MAX_RENDER_LINE_BYTES);
+		assert_eq!(render_text.len(), 4094);
+		assert!(render_text.ends_with('繁'));
 		assert!(raw.is_char_boundary(render_text.len()));
 
 		// Shape & highlight the clipped render text
@@ -1481,7 +1464,7 @@ mod tests {
 		assert_eq!(full_sel_text, line_content);
 
 		// Subslice spanning the 4096 boundary preserves multibyte characters exactly
-		let cross_sel_text = selected_text(&p, ((0, 4090), (0, 4110)));
+		let cross_sel_text = selected_text(&p, ((0, 4091), (0, 4110)));
 		assert!(cross_sel_text.starts_with("繁體"));
 	}
 
@@ -1500,6 +1483,7 @@ mod tests {
 		reader.anchor = Some((3, 4));
 		reader.head = Some((5, 6));
 		reader.current = Some(0);
+		reader.selecting = true;
 		reader.release_retained();
 		assert!(reader.matches.is_empty());
 		assert_eq!(reader.matches.capacity(), 0);
@@ -1508,5 +1492,6 @@ mod tests {
 		assert!(reader.anchor.is_none());
 		assert!(reader.head.is_none());
 		assert!(reader.current.is_none());
+		assert!(!reader.selecting);
 	}
 }

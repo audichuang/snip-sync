@@ -1232,16 +1232,18 @@ impl WorkbenchModel {
 									);
 								}
 								None => {
-									model.preview_loading = false;
-									model.preview_error =
-										Some(Msg::new("status_no_changes", []));
+									model.show_preview_error(Msg::new(
+										"status_no_changes",
+										[],
+									));
 								}
 							}
 						}
 						Err(e) => {
-							model.preview_loading = false;
-							model.preview_error =
-								Some(Msg::new("error_history", [e]));
+							model.show_preview_error(Msg::new(
+								"error_history",
+								[e],
+							));
 						}
 					}
 					cx.notify();
@@ -1545,26 +1547,22 @@ impl WorkbenchModel {
 								app_log!("[APP:PREVIEW_LOADED: {}]", path);
 							}
 						}
-						Ok(BlobText::Binary) => {
-							model.preview_error =
-								Some(Msg::new("error_binary", [path.clone()]))
-						}
-						Ok(BlobText::NotUtf8) => {
-							model.preview_error =
-								Some(Msg::new("error_not_utf8", [path.clone()]))
-						}
+						Ok(BlobText::Binary) => model.show_preview_error(
+							Msg::new("error_binary", [path.clone()]),
+						),
+						Ok(BlobText::NotUtf8) => model.show_preview_error(
+							Msg::new("error_not_utf8", [path.clone()]),
+						),
 						Ok(BlobText::TooLarge(n)) => {
-							model.preview_error = Some(Msg::new(
+							model.show_preview_error(Msg::new(
 								"error_too_large",
 								[path.clone(), n.to_string()],
 							))
 						}
-						Err(e) => {
-							model.preview_error = Some(Msg::new(
-								"error_preview",
-								[path.clone(), e],
-							))
-						}
+						Err(e) => model.show_preview_error(Msg::new(
+							"error_preview",
+							[path.clone(), e],
+						)),
 					}
 					cx.notify();
 				});

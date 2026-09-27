@@ -2449,7 +2449,25 @@ impl WorkbenchModel {
 			}
 			_ => "0/0".into(),
 		};
-		let has_preview = self.preview.is_some();
+		let has_preview = self.can_copy_preview();
+		let preview_notice = self.preview.as_ref().and_then(|p| {
+			if p.notice.is_some() {
+				Some(tf(
+					"truncated_notice",
+					loc,
+					&[
+						&crate::reader::MAX_PREVIEW_LINES,
+						&(crate::reader::MAX_PREVIEW_BYTES / 1024),
+					],
+				))
+			} else if p.line(p.widest).len()
+				> crate::reader::MAX_RENDER_LINE_BYTES
+			{
+				Some(t("line_truncated_notice", loc).to_string())
+			} else {
+				None
+			}
+		});
 
 		let toolbar = div()
 			.flex()
@@ -2635,30 +2653,23 @@ impl WorkbenchModel {
 				.flex()
 				.flex_col()
 				.flex_1()
-				.min_h_0()
-				.when_some(
-					self.preview.as_ref().and_then(|p| p.notice.clone()),
-					|d, _| {
-						d.child(
-							div()
-								.flex_shrink_0()
-								.px(px(12.))
-								.py(px(2.))
-								.bg(rgb(PANEL_BG))
-								.text_size(px(SMALL_TEXT))
-								.text_color(rgb(WARNING))
-								.child(tf(
-									"truncated_notice",
-									loc,
-									&[
-										&crate::reader::MAX_PREVIEW_LINES,
-										&(crate::reader::MAX_PREVIEW_BYTES
-											/ 1024),
-									],
-								)),
-						)
-					},
-				)
+				// Keep the notice and at least one code row visible at compact sizes.
+				.min_h(px(48.))
+				.when_some(preview_notice, |d, notice| {
+					d.child(
+						div()
+							.id("reader-truncated-notice")
+							.relative()
+							.children(probe(log, "reader-truncated-notice"))
+							.flex_shrink_0()
+							.px(px(12.))
+							.py(px(2.))
+							.bg(rgb(PANEL_BG))
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(WARNING))
+							.child(notice),
+					)
+				})
 				.child(self.render_code_view(false, cx))
 				.children(probe(log, "reader"))
 				.into_any_element()
@@ -2732,7 +2743,16 @@ impl WorkbenchModel {
 			)
 			.when(
 				self.selected_commit.is_some() || self.compare.is_some(),
-				|d| d.child(self.render_commit_panel(cx)),
+				|d| {
+					d.child(
+						div()
+							.id("editor-commit-scroll")
+							.min_h_0()
+							.flex_shrink()
+							.overflow_y_scroll()
+							.child(self.render_commit_panel(cx)),
+					)
+				},
 			)
 			.child(toolbar)
 			.child(body)

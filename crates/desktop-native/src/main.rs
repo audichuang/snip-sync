@@ -704,6 +704,19 @@ impl WorkbenchModel {
 			.expect("dropping ordinary preview cannot grow retained data");
 	}
 
+	/// Replace a failed read with its error body, releasing the hidden source.
+	/// Capacity refusal instead keeps the previous preview in `set_preview`.
+	pub(crate) fn show_preview_error(&mut self, error: Msg) {
+		self.clear_preview();
+		self.reader.release_retained();
+		self.preview_loading = false;
+		self.preview_error = Some(error);
+	}
+
+	pub(crate) fn can_copy_preview(&self) -> bool {
+		self.preview.is_some() && self.preview_error.is_none()
+	}
+
 	fn clear_paste_state(&mut self) {
 		let pool = self.paste_pending.clone();
 		let mut state = paste::lock_pending(&pool);
@@ -1904,8 +1917,7 @@ impl WorkbenchModel {
 		);
 		self.set_status("status_repo_loading", [repo_name.clone()]);
 		if let Err(e) = &self.repos[idx].summary {
-			self.preview_error =
-				Some(Msg::new("error_repo_status", [e.clone()]));
+			self.show_preview_error(Msg::new("error_repo_status", [e.clone()]));
 		}
 
 		let saved_files = self.file_paths_in_basket(&repo_root);
@@ -2056,7 +2068,7 @@ impl WorkbenchModel {
 								"error_repo_changes",
 								[repo_name.clone(), err.clone()],
 							);
-							model.preview_error = Some(Msg::new(
+							model.show_preview_error(Msg::new(
 								"error_repo_changes",
 								[repo_name.clone(), err],
 							));
@@ -2192,16 +2204,12 @@ impl WorkbenchModel {
 						lang,
 					))
 				} else {
-					self.clear_preview();
-					self.preview_loading = false;
-					self.preview_error = Some(Msg::new("error_binary", [path]));
+					self.show_preview_error(Msg::new("error_binary", [path]));
 					false
 				}
 			}
 			Err(e) => {
-				self.clear_preview();
-				self.preview_loading = false;
-				self.preview_error = Some(Msg::new("error_preview", [path, e]));
+				self.show_preview_error(Msg::new("error_preview", [path, e]));
 				false
 			}
 		}
@@ -3367,6 +3375,9 @@ impl WorkbenchModel {
 	}
 
 	pub fn copy_current_preview_content(&mut self, cx: &mut Context<Self>) {
+		if !self.can_copy_preview() {
+			return;
+		}
 		// Copies the selection if any, otherwise the whole retained preview.
 		if self.copy_reader_selection(cx) {
 			return;
