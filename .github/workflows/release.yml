@@ -453,6 +453,11 @@ jobs:
 
                     app "snip-sync.app"
 
+                    # Ad-hoc signed only: Gatekeeper kills a quarantined copy on launch.
+                    postflight do
+                      system_command "/usr/bin/xattr", args: ["-cr", "#{appdir}/snip-sync.app"]
+                    end
+
                     caveats <<~EOS
                       snip-sync is not notarized (ad-hoc signed only). If macOS refuses to open it:
                         System Settings > Privacy & Security > Open Anyway
