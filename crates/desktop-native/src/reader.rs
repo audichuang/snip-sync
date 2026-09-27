@@ -1322,7 +1322,7 @@ impl WorkbenchModel {
 			}
 			_ => return,
 		};
-		let (Some(path), Some(root)) = (p.path.clone(), self.repo_root())
+		let (Some(path), Some(root)) = (p.path.clone(), self.preview_root())
 		else {
 			return;
 		};

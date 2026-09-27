@@ -231,6 +231,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"no_repo" => "未選取儲存庫",
 			"project_rev_title" => "專案 (commit {})",
 			"changes_title" => "變更 ({})",
+			"changes_repo_error" => "無法讀取變更：{}",
+			"changes_truncated" => "只顯示前 {} 個變更（共 {} 個）",
 			"tip_ref_selector" => "切換分支 / 標籤 (目前: {})",
 			"src_vs_first_parent_merge" => "與 first-parent 比較 (共 {} 個 parent)",
 			"src_commit_file" => "Commit {} 的檔案",
@@ -546,6 +548,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"no_repo" => "No repository",
 			"project_rev_title" => "Project (commit {})",
 			"changes_title" => "Changes ({})",
+			"changes_repo_error" => "Cannot read changes: {}",
+			"changes_truncated" => "Showing the first {} of {} changes",
 			"tip_ref_selector" => "Switch branch / tag (current: {})",
 			"src_vs_first_parent_merge" => "Compare vs first-parent ({} parents)",
 			"src_commit_file" => "File in commit {}",
@@ -823,6 +827,8 @@ mod tests {
 			"log_details_in_branches",
 			"log_today",
 			"log_yesterday",
+			"changes_repo_error",
+			"changes_truncated",
 		];
 		for key in test_keys {
 			assert!(
