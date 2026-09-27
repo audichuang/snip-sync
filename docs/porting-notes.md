@@ -32,6 +32,14 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   會把被排除的檔案(例如 `secrets.env`)的舊內容帶出去;Rust 刻意不照做。
 - commit 模式重播時,路徑逐一放在 `git add` / `git commit` 的參數上。Windows 命令列約 32K 字元上限,
   一個 commit 動到數千個檔案時會失敗;需要時改用 `--pathspec-from-file=- --pathspec-file-nul`。
+- commit 模式不帶檔案 mode(`CommitFile` 沒有 mode 欄位;剪貼簿格式由 ClipCodeVSCode 擁有,不在這裡改):
+  ADDED 的檔案重播後一律是 100644(來源的執行位元會掉);MODIFIED / RENAMED 是原地覆寫,保留目的端既有的 mode;
+  來源只改 mode(例如 `chmod +x`)的 commit,重播出來是空 commit。
+- commit 重播用 `-c core.hooksPath=<剛建立的空目錄>` 跑 `add` / `commit` 等 git 呼叫,目的端任何 hook
+  (包含 `--no-verify` 擋不住的 prepare-commit-msg、post-commit、post-index-change)都不會執行。
+- commit 重播前會先檢查整個 commit 的磁碟配置:要刪的路徑是目錄、要寫的路徑是目錄(且不會被同一個 commit 的刪除清空)、
+  或寫入路徑的上層是檔案(且不在同一個 commit 的刪除裡),預覽標成 `UNSAFE_PATH` 略過,重播則在動任何東西前拒絕該 commit,
+  不會留下寫了一半、stage 了一半的 worktree。
 - `paths` 在 Windows 對超過 MAX_PATH 的路徑,`dunce::canonicalize` 會保留 `\\?\` 形式,containment 可能誤判為逃出 root 而拒絕(fail closed)。
 - 所有 git 程序都經 `gitrun`:全域同時最多 2 個、最多 64 個呼叫排隊(一般並行碰不到,爆量才拒絕)(再多直接 `QueueFull`)、排隊可逾時或取消、每次呼叫有期限、stdout 有上限,
   結束時殺掉整棵程序樹、reap root、關閉管線後才釋放名額;清理無法確認時回報 `Cleanup` 並永久保留該名額(`leaked_slots`),不假裝已乾淨。TS 版沒有這些限制。
