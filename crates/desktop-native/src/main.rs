@@ -815,10 +815,7 @@ impl WorkbenchModel {
 				InputEvent::SubmitPrev | InputEvent::Up => {
 					this.find_step(false, cx)
 				}
-				InputEvent::Dismiss => {
-					this.pending_focus = Some(this.reader_focus.clone());
-					cx.notify();
-				}
+				InputEvent::Dismiss => this.close_find(cx),
 			}
 		})
 		.detach();
@@ -830,10 +827,7 @@ impl WorkbenchModel {
 					this.goto_line(&q, cx);
 					this.pending_focus = Some(this.reader_focus.clone());
 				}
-				InputEvent::Dismiss => {
-					this.pending_focus = Some(this.reader_focus.clone());
-					cx.notify();
-				}
+				InputEvent::Dismiss => this.close_find(cx),
 				_ => {}
 			},
 		)
@@ -4238,6 +4232,7 @@ impl WorkbenchModel {
 		self.preview_generation += 1;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		self.clear_preview();
+		self.reader.release_retained();
 		self.preview_loading = false;
 		self.preview_error = None;
 		self.selected_file = None;

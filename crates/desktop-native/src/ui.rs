@@ -24,7 +24,7 @@ use crate::graph_view;
 use crate::history::RevRow;
 use crate::i18n::{t, tf};
 use crate::icons::{file_icon, icon, icon_tinted, Icon};
-use crate::paste::{PasteItem, PastePreviewPlan};
+use crate::paste::{split_dir, PasteItem, PasteNode, PastePreviewPlan};
 use crate::reader::{DiffMode, PreviewSource};
 use crate::selector::Pick;
 use crate::theme::*;
@@ -41,6 +41,7 @@ use crate::{
 	ToggleLog, ToggleTab, TreeCollapse, TreeDown, TreeExpand, TreeOpen,
 	TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
 };
+use crate::{NextDiff, PrevDiff};
 
 // ───────────────────────── E2E probes (opt-in) ─────────────────────────
 
@@ -425,22 +426,24 @@ fn change_style(ct: Option<ChangeType>) -> (&'static str, u32) {
 	}
 }
 
-/// Operation label, color and reason key for a paste row.
+/// Operation label, file-name colour and reason key for a paste row. The
+/// colour follows IntelliJ's file status: created green, modified blue
+/// (whether or not overwriting is allowed yet), deleted grey.
 fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 	if !item.selected {
-		("op_excluded", pal().text_muted, "reason_excluded")
+		("op_excluded", pal().text_disabled, "reason_excluded")
 	} else if item.is_delete {
 		if item.dest_exists {
-			("op_delete", pal().error, "reason_delete")
+			("op_delete", pal().git_deleted, "reason_delete")
 		} else {
-			("op_skip", pal().text_muted, "reason_delete_missing")
+			("op_skip", pal().text_disabled, "reason_delete_missing")
 		}
 	} else if !item.dest_exists {
 		("op_create", pal().git_added, "reason_create")
 	} else if item.overwrite_allowed {
-		("op_overwrite", pal().warning, "reason_overwrite")
+		("op_overwrite", pal().git_modified, "reason_overwrite")
 	} else {
-		("op_skip", pal().text_muted, "reason_exists")
+		("op_skip", pal().git_modified, "reason_exists")
 	}
 }
 
@@ -2779,7 +2782,18 @@ impl WorkbenchModel {
 
 	/// Editor tab row. An empty `label` means nothing is open: the row stays
 	/// (stable layout) but shows no tab, like IntelliJ's empty editor.
-	fn tab_strip(&self, label: String, ic: Icon) -> Div {
+	/// Editor tab bar with one Islands pill: file-type icon, the name (italic
+	/// while it is a preview tab) and a ✕ when the tab can be closed.
+	fn tab_strip(
+		&self,
+		label: String,
+		ic: Icon,
+		preview: bool,
+		close: Option<fn(&mut Self, &mut Context<Self>)>,
+		cx: &mut Context<Self>,
+	) -> Div {
+		let loc = self.locale;
+		let log = &self.probes;
 		div()
 			.flex()
 			.flex_row()
@@ -2795,6 +2809,8 @@ impl WorkbenchModel {
 			.when(!label.is_empty(), |d| {
 				d.child(
 					div()
+						.id("editor-tab")
+						.relative()
 						.flex()
 						.flex_row()
 						.items_center()
@@ -2802,18 +2818,51 @@ impl WorkbenchModel {
 						.min_w_0()
 						.max_w(px(360.))
 						.h(px(24.))
-						.px(px(10.))
+						.pl(px(8.))
+						.pr(px(if close.is_some() { 4. } else { 10. }))
 						// Islands selected tab: filled rounded pill.
 						.rounded(px(6.))
 						.bg(rgb(pal().range_bg))
 						.text_size(px(UI_TEXT))
 						.text_color(rgb(pal().text))
+						.when(preview, |d| {
+							d.tooltip(tip(t("tip_preview_tab", loc)))
+								// Double-click keeps the tab, as in IntelliJ.
+								.on_click(cx.listener(
+									|this, ev: &gpui::ClickEvent, _, cx| {
+										if ev.click_count() >= 2
+											&& !this.reader.pinned
+										{
+											this.reader.pinned = true;
+											app_log!("[APP:TAB_PINNED]");
+											cx.notify();
+										}
+									},
+								))
+						})
 						.child(icon(ic, 14.))
-						.child(clip_text(label)),
+						.child(clip_text(label).when(preview, |d| d.italic()))
+						.when_some(close, |d, close| {
+							d.child(
+								icon_button(
+									"btn-tab-close",
+									Icon::Close,
+									t("tip_close_tab", loc),
+									true,
+									38,
+								)
+								.size(px(16.))
+								.on_click(cx.listener(move |this, _, _, cx| {
+									cx.stop_propagation();
+									close(this, cx)
+								}))
+								.children(probe(log, "btn-tab-close")),
+							)
+						})
+						.children(probe(log, "editor-tab")),
 				)
 			})
 	}
-
 	/// IntelliJ-style empty editor: the real shortcuts, centered and muted.
 	fn editor_empty_hints(&self) -> Div {
 		let loc = self.locale;
@@ -2934,14 +2983,14 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+	/// IntelliJ's search bar: an inline field with Match Case / Regex
+	/// toggles, match count, previous / next, go-to-line and close. Hidden
+	/// until Ctrl+F or Ctrl+G opens it; Esc closes it.
+	fn find_bar(&self, cx: &mut Context<Self>) -> Stateful<Div> {
 		let loc = self.locale;
 		let log = &self.probes;
-		let (tab_label, crumbs, badge) = self.source_labels();
-		let tab_icon = file_icon(&tab_label);
-		let is_diff = self.preview.as_ref().is_some_and(|p| p.is_diff);
-		let side = self.reader.diff_mode == DiffMode::SideBySide;
 		let n_matches = self.reader.matches.len();
+		let opts = self.reader.find_opts;
 		let find_label = match self.reader.current {
 			Some(c) if n_matches > 0 => {
 				let more = if n_matches >= crate::reader::MAX_MATCHES {
@@ -2953,6 +3002,165 @@ impl WorkbenchModel {
 			}
 			_ => "0/0".into(),
 		};
+		let toggle = |id: &'static str, ic: Icon, tip_key: &str, on: bool| {
+			icon_button(id, ic, t(tip_key, loc), true, 34)
+				.size(px(20.))
+				.when(on, |d| {
+					d.bg(rgb(pal().range_bg)).border_color(rgb(pal().accent))
+				})
+				.children(probe(log, id))
+		};
+		let field = div()
+			.flex()
+			.flex_row()
+			.items_center()
+			.gap(px(4.))
+			.flex_1()
+			.min_w(px(160.))
+			.max_w(px(420.))
+			.h(px(24.))
+			.child(icon(Icon::Search, 14.))
+			.child(
+				div()
+					.id("find-input")
+					.relative()
+					.flex_1()
+					.min_w(px(60.))
+					.child(self.find_input.clone())
+					.children(probe(log, "find-input")),
+			)
+			.child(
+				toggle(
+					"btn-find-case",
+					Icon::MatchCase,
+					"tip_match_case",
+					opts.match_case,
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.toggle_find_option(false, cx)
+				})),
+			)
+			.child(
+				toggle("btn-find-regex", Icon::Regex, "tip_regex", opts.regex)
+					.on_click(cx.listener(|this, _, _, cx| {
+						this.toggle_find_option(true, cx)
+					})),
+			);
+		div()
+			.id("find-bar")
+			.relative()
+			.flex()
+			.flex_row()
+			.items_center()
+			.flex_shrink_0()
+			.h(px(32.))
+			.px(px(8.))
+			.gap(px(6.))
+			.border_b_1()
+			.border_color(rgb(pal().divider))
+			.bg(rgb(pal().panel_bg))
+			.text_size(px(SMALL_TEXT))
+			.child(field)
+			.child(
+				div()
+					.id("find-count")
+					.flex_shrink_0()
+					.min_w(px(40.))
+					.text_color(rgb(
+						if self.reader.find_invalid
+							|| (n_matches == 0
+								&& !self.reader.find_query.is_empty())
+						{
+							pal().error
+						} else {
+							pal().text_muted
+						},
+					))
+					.child(find_label),
+			)
+			.child(
+				icon_button(
+					"btn-find-prev",
+					Icon::ArrowUp,
+					t("tip_find_prev", loc),
+					n_matches > 0,
+					32,
+				)
+				.when(n_matches > 0, |b| {
+					b.on_click(
+						cx.listener(|this, _, _, cx| this.find_step(false, cx)),
+					)
+				})
+				.children(probe(log, "btn-find-prev")),
+			)
+			.child(
+				icon_button(
+					"btn-find-next",
+					Icon::ArrowDown,
+					t("tip_find_next", loc),
+					n_matches > 0,
+					33,
+				)
+				.when(n_matches > 0, |b| {
+					b.on_click(
+						cx.listener(|this, _, _, cx| this.find_step(true, cx)),
+					)
+				})
+				.children(probe(log, "btn-find-next")),
+			)
+			.child(toolbar_divider())
+			.child(
+				div()
+					.id("goto-field")
+					.flex()
+					.flex_row()
+					.items_center()
+					.flex_shrink_0()
+					.gap(px(4.))
+					.h(px(24.))
+					.px(px(6.))
+					.rounded(px(4.))
+					.border_1()
+					.border_color(rgb(pal().button_border))
+					.bg(rgb(pal().button_bg))
+					.tooltip(tip(t("tip_goto", loc)))
+					.child(icon(Icon::GoToLine, 14.))
+					.child(
+						div()
+							.id("goto-input")
+							.relative()
+							.w(px(64.))
+							.child(self.goto_input.clone())
+							.children(probe(log, "goto-input")),
+					),
+			)
+			.child(div().flex_1())
+			.child(
+				icon_button(
+					"btn-find-close",
+					Icon::Close,
+					t("tip_find_close", loc),
+					true,
+					39,
+				)
+				.on_click(cx.listener(|this, _, _, cx| this.close_find(cx)))
+				.children(probe(log, "btn-find-close")),
+			)
+			.children(probe(log, "find-bar"))
+	}
+
+	fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let (tab_label, crumbs, badge) = self.source_labels();
+		let tab_icon = file_icon(&tab_label);
+		let is_diff = self.preview.as_ref().is_some_and(|p| p.is_diff);
+		let side = self.reader.diff_mode == DiffMode::SideBySide;
+		let has_folds = self.preview.as_ref().is_some_and(|p| {
+			p.diff.as_ref().is_some_and(|d| {
+				d.trailing || d.shown.iter().any(|&l| d.inline[l].fold > 0)
+			})
+		});
 		let has_preview = self.can_copy_preview();
 		let preview_notice = self.preview.as_ref().and_then(|p| {
 			if p.notice.is_some() {
@@ -2973,113 +3181,96 @@ impl WorkbenchModel {
 			}
 		});
 
+		// IntelliJ editor / diff toolbar: icon-only ghost buttons, the
+		// label in the tooltip.
 		let toolbar = div()
 			.flex()
 			.flex_row()
 			.items_center()
 			.flex_shrink_0()
-			.h(px(30.))
-			.px(px(8.))
-			.gap(px(6.))
-			.border_b_1()
-			.border_color(rgb(pal().divider))
-			.text_size(px(SMALL_TEXT))
-			.child(icon(Icon::Search, 13.))
-			.child(
-				div()
-					.id("find-input")
-					.relative()
-					.w(px(150.))
-					.min_w(px(80.))
-					.child(self.find_input.clone())
-					.children(probe(log, "find-input")),
-			)
-			.child(
-				div()
-					.id("find-count")
-					.flex_shrink_0()
-					.min_w(px(36.))
-					.text_color(rgb(if n_matches == 0 {
-						pal().text_disabled
-					} else {
-						pal().text_muted
-					}))
-					.child(find_label),
-			)
-			.child(
-				button("btn-find-prev", "↑", Btn::Ghost, n_matches > 0, 32)
-					.px(px(5.))
-					.tooltip(tip(t("tip_find_prev", loc)))
-					.on_click(
-						cx.listener(|this, _, _, cx| this.find_step(false, cx)),
-					)
-					.children(probe(log, "btn-find-prev")),
-			)
-			.child(
-				button("btn-find-next", "↓", Btn::Ghost, n_matches > 0, 33)
-					.px(px(5.))
-					.tooltip(tip(t("tip_find_next", loc)))
-					.on_click(
-						cx.listener(|this, _, _, cx| this.find_step(true, cx)),
-					)
-					.children(probe(log, "btn-find-next")),
-			)
-			.child(
-				div()
-					.id("goto-input")
-					.relative()
-					.w(px(64.))
-					.flex_shrink_0()
-					.child(self.goto_input.clone())
-					.children(probe(log, "goto-input")),
-			)
-			.child(div().flex_1())
+			.gap(px(2.))
 			.when(is_diff, |d| {
 				d.child(
-					button(
-						"btn-diff-mode",
-						if side {
-							t("diff_inline", loc)
-						} else {
-							t("diff_side", loc)
-						},
-						Btn::Ghost,
+					icon_button(
+						"btn-prev-diff",
+						Icon::PrevDiff,
+						t("tip_prev_diff", loc),
 						true,
 						35,
 					)
-					.px(px(6.))
-					.text_size(px(SMALL_TEXT))
-					.child(icon(Icon::Diff, 12.))
-					.on_click(cx.listener(|this, _, _, cx| {
-						this.reader.diff_mode = match this.reader.diff_mode {
-							DiffMode::Inline => DiffMode::SideBySide,
-							DiffMode::SideBySide => DiffMode::Inline,
-						};
-						this.reader.anchor = None;
-						this.reader.head = None;
-						app_log!(
-							"[APP:DIFF_MODE: {:?}]",
-							this.reader.diff_mode
-						);
-						cx.notify();
-					}))
+					.on_click(cx.listener(|this, _, _, cx| this.prev_diff(cx)))
+					.children(probe(log, "btn-prev-diff")),
+				)
+				.child(
+					icon_button(
+						"btn-next-diff",
+						Icon::NextDiff,
+						t("tip_next_diff", loc),
+						true,
+						35,
+					)
+					.on_click(cx.listener(|this, _, _, cx| this.next_diff(cx)))
+					.children(probe(log, "btn-next-diff")),
+				)
+				.when(has_folds, |d| {
+					d.child(
+						icon_button(
+							"btn-expand-folds",
+							Icon::ExpandAll,
+							t("tip_expand_folds", loc),
+							!self.reader.expanding,
+							35,
+						)
+						.when(!self.reader.expanding, |b| {
+							b.on_click(cx.listener(|this, _, _, cx| {
+								this.expand_folds(None, cx)
+							}))
+						})
+						.children(probe(log, "btn-expand-folds")),
+					)
+				})
+				.child(
+					// Shows the current viewer; clicking switches to the other.
+					icon_button(
+						"btn-diff-mode",
+						if side {
+							Icon::SideBySide
+						} else {
+							Icon::Unified
+						},
+						t(
+							if side {
+								"tip_diff_unified"
+							} else {
+								"tip_diff_side"
+							},
+							loc,
+						),
+						true,
+						35,
+					)
+					.on_click(
+						cx.listener(|this, _, _, cx| this.toggle_diff_mode(cx)),
+					)
 					.children(probe(log, "btn-diff-mode")),
 				)
+				.child(toolbar_divider())
 			})
 			.when(
 				self.selected_commit.is_some() && self.compare.is_none(),
 				|d| {
 					d.child(
-						button(
+						icon_button(
 							"btn-browse-tree",
-							t("btn_browse_tree", loc),
-							Btn::Ghost,
+							Icon::Project,
+							format!(
+								"{} — {}",
+								t("btn_browse_tree", loc),
+								t("tip_browse_tree", loc)
+							),
 							true,
 							36,
 						)
-						.px(px(6.))
-						.text_size(px(SMALL_TEXT))
-						.tooltip(tip(t("tip_browse_tree", loc)))
 						.on_click(cx.listener(|this, _, _, cx| {
 							this.browse_commit_tree(cx)
 						}))
@@ -3099,19 +3290,22 @@ impl WorkbenchModel {
 				},
 			)
 			.child(
-				button(
+				icon_button(
 					"btn-copy-view",
-					t("btn_copy_view", loc),
-					Btn::Ghost,
+					Icon::Copy,
+					format!(
+						"{} — {}",
+						t("btn_copy_view", loc),
+						t("tip_copy_view", loc)
+					),
 					has_preview,
 					37,
 				)
-				.px(px(6.))
-				.text_size(px(SMALL_TEXT))
-				.tooltip(tip(t("tip_copy_view", loc)))
-				.on_click(cx.listener(|this, _, _, cx| {
-					this.copy_current_preview_content(cx)
-				}))
+				.when(has_preview, |b| {
+					b.on_click(cx.listener(|this, _, _, cx| {
+						this.copy_current_preview_content(cx)
+					}))
+				})
 				.children(probe(log, "btn-copy-view")),
 			);
 
@@ -3161,9 +3355,14 @@ impl WorkbenchModel {
 					this.move_cursor_line(30, cx)
 				}))
 				.on_action(cx.listener(|this, _: &ReaderClear, _, cx| {
-					this.reader.anchor = None;
-					this.reader.head = None;
-					cx.notify();
+					// Esc clears the selection, then closes the find bar.
+					if this.reader.selection().is_some() {
+						this.reader.anchor = None;
+						this.reader.head = None;
+						cx.notify();
+					} else {
+						this.close_find(cx);
+					}
 				}))
 				.flex()
 				.flex_col()
@@ -3192,6 +3391,12 @@ impl WorkbenchModel {
 			self.editor_empty_hints().into_any_element()
 		};
 
+		let showing = self.preview.is_some()
+			|| self.selected_commit.is_some()
+			|| self.compare.is_some();
+		// Same model method as the tab menu's Close.
+		let closable =
+			self.open_tab_count() > 0 || self.preview_error.is_some();
 		div()
 			.flex()
 			.flex_col()
@@ -3201,15 +3406,14 @@ impl WorkbenchModel {
 			.bg(rgb(pal().editor_bg))
 			.rounded(px(ISLAND_RADIUS))
 			.child(self.tab_strip(
-				if self.preview.is_some()
-					|| self.selected_commit.is_some()
-					|| self.compare.is_some()
-				{
-					tab_label
-				} else {
-					String::new()
-				},
+				if showing { tab_label } else { String::new() },
 				tab_icon,
+				self.preview.is_some() && !self.reader.pinned,
+				closable.then_some(
+					(|this, cx| this.close_tab(0, cx))
+						as fn(&mut Self, &mut Context<Self>),
+				),
+				cx,
 			))
 			.child(
 				div()
@@ -3217,8 +3421,9 @@ impl WorkbenchModel {
 					.flex_row()
 					.items_center()
 					.flex_shrink_0()
-					.h(px(26.))
-					.px(px(12.))
+					.h(px(28.))
+					.pl(px(12.))
+					.pr(px(6.))
 					.gap(px(8.))
 					.border_b_1()
 					.border_color(rgb(pal().divider))
@@ -3255,7 +3460,8 @@ impl WorkbenchModel {
 								.child(badge)
 								.children(probe(log, "source-badge")),
 						)
-					}),
+					})
+					.child(toolbar),
 			)
 			.when(
 				self.selected_commit.is_some() || self.compare.is_some(),
@@ -3270,7 +3476,7 @@ impl WorkbenchModel {
 					)
 				},
 			)
-			.child(toolbar)
+			.when(self.reader.find_open, |d| d.child(self.find_bar(cx)))
 			.child(body)
 			.into_any_element()
 	}
@@ -3517,49 +3723,51 @@ impl WorkbenchModel {
 					.child(fill_text(dest)),
 			)
 			.child(
-				button(
-					"btn-apply",
-					if applying {
+				button("btn-apply", "", Btn::Primary, can_apply, 50)
+					.pl(px(6.))
+					.child(icon_tinted(
+						Icon::Apply,
+						14.,
+						if can_apply {
+							pal().accent_text
+						} else {
+							pal().text_disabled
+						},
+					))
+					.child(if applying {
 						t("applying", loc)
 					} else {
 						t("apply", loc)
-					},
-					Btn::Primary,
-					can_apply,
-					50,
-				)
-				.when(loading, |b| {
-					b.tooltip(tip(t("paste_loading_refused", loc)))
-				})
-				.when(!loading && !mapping_ready, |b| {
-					b.tooltip(tip(t("mapping_required", loc)))
-				})
-				.when(can_apply, |b| {
-					b.on_click(cx.listener(|this, _, _, cx| {
-						this.apply_paste_restore(cx)
-					}))
-				})
-				.children(probe(log, "btn-apply")),
+					})
+					.when(loading, |b| {
+						b.tooltip(tip(t("paste_loading_refused", loc)))
+					})
+					.when(!loading && !mapping_ready, |b| {
+						b.tooltip(tip(t("mapping_required", loc)))
+					})
+					.when(can_apply, |b| {
+						b.on_click(cx.listener(|this, _, _, cx| {
+							this.apply_paste_restore(cx)
+						}))
+					})
+					.children(probe(log, "btn-apply")),
 			)
 			.child(
 				// The write cannot be interrupted, so Cancel is locked until it
 				// finishes rather than pretending to cancel it.
-				button(
-					"btn-cancel",
-					t("cancel", loc),
-					Btn::Default,
-					!applying,
-					51,
-				)
-				.when(!applying, |b| {
-					b.on_click(cx.listener(|this, _, _, cx| {
-						this.cancel_paste_preview(cx)
-					}))
-				})
-				.when(applying, |b| {
-					b.tooltip(tip(t("paste_busy_refused", loc)))
-				})
-				.children(probe(log, "btn-cancel")),
+				button("btn-cancel", "", Btn::Default, !applying, 51)
+					.pl(px(6.))
+					.child(icon(Icon::Cancel, 14.))
+					.child(t("cancel", loc))
+					.when(!applying, |b| {
+						b.on_click(cx.listener(|this, _, _, cx| {
+							this.cancel_paste_preview(cx)
+						}))
+					})
+					.when(applying, |b| {
+						b.tooltip(tip(t("paste_busy_refused", loc)))
+					})
+					.children(probe(log, "btn-cancel")),
 			)
 	}
 
@@ -3594,7 +3802,10 @@ impl WorkbenchModel {
 			.rounded(px(ISLAND_RADIUS))
 			.child(self.tab_strip(
 				t("paste_tab", self.locale).to_string(),
-				Icon::Changes,
+				Icon::Paste,
+				false,
+				Some(|this, cx| this.close_tab(0, cx)),
+				cx,
 			))
 			.child(self.paste_action_bar(dest, false, false, false, cx))
 			.child(self.paste_loading_note())
@@ -3635,6 +3846,16 @@ impl WorkbenchModel {
 			plan.executable(),
 			cx,
 		);
+		let tab = self.tab_strip(
+			format!("{} ({})", t("paste_tab", loc), plan.items.len()),
+			Icon::Paste,
+			false,
+			(!applying).then_some(
+				(|this, cx| this.close_tab(0, cx))
+					as fn(&mut Self, &mut Context<Self>),
+			),
+			cx,
+		);
 
 		let summary = div()
 			.flex()
@@ -3653,13 +3874,19 @@ impl WorkbenchModel {
 					.text_color(rgb(pal().git_added))
 					.child(format!("{} {creates}", t("op_create", loc))),
 			)
-			.child(div().flex_shrink_0().text_color(rgb(pal().warning)).child(
-				format!("{} {overwrites}/{existing}", t("op_overwrite", loc)),
-			))
 			.child(
 				div()
 					.flex_shrink_0()
-					.text_color(rgb(pal().error))
+					.text_color(rgb(pal().git_modified))
+					.child(format!(
+						"{} {overwrites}/{existing}",
+						t("op_overwrite", loc)
+					)),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.text_color(rgb(pal().git_deleted))
 					.child(format!("{} {deletes}", t("op_delete", loc))),
 			)
 			.child(
@@ -3673,8 +3900,42 @@ impl WorkbenchModel {
 					.text_color(rgb(pal().text_disabled)),
 			);
 
-		let rows = plan.items.iter().enumerate().map(|(ix, item)| {
-			let (op, op_color, _) = paste_op(item);
+		// IntelliJ "Apply Patch": a change tree grouped by destination root
+		// and directory; the file name's colour says what happens to it.
+		let node_row = |depth: usize| {
+			div()
+				.flex()
+				.flex_row()
+				.items_center()
+				.flex_shrink_0()
+				.h(px(24.))
+				.pl(px(8. + 18. * depth as f32))
+				.pr(px(8.))
+				.gap(px(6.))
+		};
+		let rows = plan.tree_rows().into_iter().map(|node| {
+			let (ix, depth) = match node {
+				PasteNode::Root(ref name, n) | PasteNode::Dir(ref name, n) => {
+					let root = matches!(node, PasteNode::Root(..));
+					let name = name.clone();
+					return node_row(usize::from(!root))
+						.child(icon(Icon::Folder, 14.))
+						.child(clip_text(name).flex_shrink().when(root, |d| {
+							d.font_weight(FontWeight::SEMIBOLD)
+						}))
+						.child(
+							div()
+								.flex_shrink_0()
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(n.to_string()),
+						)
+						.into_any_element();
+				}
+				PasteNode::File(ix, depth) => (ix, depth),
+			};
+			let item = &plan.items[ix];
+			let (_, name_color, _) = paste_op(item);
 			let is_sel = ix == plan.selected_item_idx;
 			let path = item.path.clone();
 			let row_id = format!("paste-row:{path}");
@@ -3682,22 +3943,10 @@ impl WorkbenchModel {
 			let ow_id = format!("paste-overwrite:{path}");
 			let can_overwrite = item.dest_exists && !item.is_delete;
 			let ow_on = item.overwrite_allowed;
-			// IntelliJ-style: file name first, muted parent directory after it.
-			let (parent, name) = match path.rsplit_once('/') {
-				Some((p, n)) => (p.to_string(), n.to_string()),
-				None => (String::new(), path.clone()),
-			};
-			div()
+			let (_, name) = split_dir(&path);
+			node_row(depth)
 				.id(SharedString::from(row_id.clone()))
 				.relative()
-				.flex()
-				.flex_row()
-				.items_center()
-				.flex_shrink_0()
-				.h(px(26.))
-				.pl(px(12.))
-				.pr(px(8.))
-				.gap(px(8.))
 				.cursor_pointer()
 				.when(is_sel, |d| d.bg(rgb(pal().selection_bg)))
 				.when(!is_sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
@@ -3710,7 +3959,7 @@ impl WorkbenchModel {
 						.id(SharedString::from(inc_id.clone()))
 						.relative()
 						.flex_shrink_0()
-						.size(px(18.))
+						.size(px(16.))
 						.flex()
 						.items_center()
 						.justify_center()
@@ -3727,54 +3976,15 @@ impl WorkbenchModel {
 						.child(checkbox(item.selected))
 						.children(probe(log, inc_id)),
 				)
+				.child(icon(file_icon(name), 14.))
 				.child(
-					div()
-						.flex_shrink_0()
-						.w(px(60.))
-						.text_size(px(SMALL_TEXT))
-						.font_weight(FontWeight::SEMIBOLD)
-						.text_color(rgb(op_color))
-						.child(t(op, loc)),
-				)
-				.child(
-					div()
-						.flex()
-						.flex_row()
-						.items_center()
-						.gap(px(8.))
+					clip_text(name.to_string())
 						.flex_1()
-						.min_w_0()
-						.overflow_hidden()
-						.child(
-							clip_text(name)
-								.flex_shrink_0()
-								.max_w(gpui::relative(0.7))
-								.when(!item.selected, |d| {
-									d.text_color(rgb(pal().text_muted))
-								}),
-						)
-						.child(
-							fill_text(parent)
-								.text_size(px(SMALL_TEXT))
-								.text_color(rgb(pal().text_muted)),
-						),
-				)
-				.child(
-					clip_text(item.dest_root_name.clone())
-						.flex_shrink_0()
-						.max_w(px(110.))
-						.text_size(px(10.))
-						.px(px(5.))
-						.rounded(px(3.))
-						.bg(rgb(pal().ref_bg))
-						.text_color(rgb(pal().text_muted)),
+						.text_color(rgb(name_color)),
 				)
 				.child(
 					div()
-						.flex()
-						.justify_end()
 						.flex_shrink_0()
-						.min_w(px(44.))
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
 						.child(if item.is_delete {
@@ -3801,7 +4011,7 @@ impl WorkbenchModel {
 								.rounded(px(3.))
 								.text_size(px(SMALL_TEXT))
 								.text_color(rgb(if ow_on {
-									pal().warning
+									pal().text
 								} else {
 									pal().text_muted
 								}))
@@ -3826,6 +4036,7 @@ impl WorkbenchModel {
 					},
 				))
 				.children(probe(log, row_id))
+				.into_any_element()
 		});
 
 		let (detail_title, reason) = match selected {
@@ -3999,10 +4210,7 @@ impl WorkbenchModel {
 			.overflow_hidden()
 			.bg(rgb(pal().editor_bg))
 			.rounded(px(ISLAND_RADIUS))
-			.child(self.tab_strip(
-				format!("{} ({})", t("paste_tab", loc), plan.items.len()),
-				Icon::Changes,
-			))
+			.child(tab)
 			.child(action_bar)
 			.child(summary)
 			.when(loading, |d| d.child(self.paste_loading_note()))
@@ -5184,13 +5392,17 @@ impl Render for WorkbenchModel {
 				this.toggle_locale(cx)
 			}))
 			.on_action(cx.listener(|this, _: &FindInFile, window, cx| {
-				window.focus(&this.find_input.read(cx).handle());
-				cx.notify();
+				this.open_find(false, window, cx)
 			}))
 			.on_action(cx.listener(|this, _: &GotoLine, window, cx| {
-				window.focus(&this.goto_input.read(cx).handle());
-				cx.notify();
+				this.open_find(true, window, cx)
 			}))
+			.on_action(
+				cx.listener(|this, _: &NextDiff, _, cx| this.next_diff(cx)),
+			)
+			.on_action(
+				cx.listener(|this, _: &PrevDiff, _, cx| this.prev_diff(cx)),
+			)
 			.on_action(
 				cx.listener(|this, _: &FindNext, _, cx| {
 					this.find_step(true, cx)
