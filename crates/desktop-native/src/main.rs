@@ -4658,7 +4658,7 @@ fn key_bindings() -> Vec<KeyBinding> {
 
 fn main() {
 	let (workspace, mode, restore_dir) = parse_cli_args();
-	let app = Application::new();
+	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
 		cx.bind_keys(key_bindings());
