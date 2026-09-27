@@ -4419,7 +4419,7 @@ impl WorkbenchModel {
 		} else if self.basket_count() == 0 {
 			t("basket_empty", loc).to_string()
 		} else {
-			tf("basket_summary", loc, &[&basket_n, &basket_detail])
+			tf("basket_summary", loc, &[&basket_n, basket_detail])
 		};
 		let repos_s = self.repos.len().to_string();
 		let errors_s = errors.to_string();
