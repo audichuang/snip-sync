@@ -89,6 +89,12 @@ pub struct Git {
 	root: PathBuf,
 }
 
+#[cfg(test)]
+thread_local! {
+	/// `git --version` runs started by this thread.
+	static VERSION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn git_command() -> Command {
 	let mut cmd = Command::new("git");
 	// Byte-stable output, and never block on a credential prompt.
@@ -162,14 +168,32 @@ impl Git {
 	/// A directory outside a repository is still [`GitError::NotARepository`].
 	pub fn open_with(dir: &Path, opts: &RunOptions) -> Result<Self, GitError> {
 		already_cancelled(opts, "--version")?;
-		let mut version = git_command();
-		version.arg("--version");
-		let version = gitrun::run(version, "--version", None, opts)?;
-		if version.truncated {
-			return Err(GitError::OutputLimit {
-				args: "--version".into(),
-				limit: opts.max_stdout,
-			});
+		// `git --version` runs once per `PATH`: a changed `PATH` may find
+		// another git, or none. Only success is remembered.
+		static CHECKED_PATH: std::sync::Mutex<Option<std::ffi::OsString>> =
+			std::sync::Mutex::new(None);
+		let path = std::env::var_os("PATH").unwrap_or_default();
+		let checked = CHECKED_PATH
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.as_ref() == Some(&path);
+		if !checked {
+			#[cfg(test)]
+			VERSION_RUNS.with(|n| n.set(n.get() + 1));
+			let mut version = git_command();
+			version.arg("--version");
+			let version = gitrun::run(version, "--version", None, opts)?;
+			if version.truncated {
+				return Err(GitError::OutputLimit {
+					args: "--version".into(),
+					limit: opts.max_stdout,
+				});
+			}
+			if version.status.is_some_and(|s| s.success()) {
+				*CHECKED_PATH
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+			}
 		}
 		let probe = Self {
 			root: dir.to_path_buf(),
@@ -198,6 +222,14 @@ impl Git {
 		Ok(Self {
 			root: path_from_git_bytes(top)?,
 		})
+	}
+
+	/// A repository whose top level is already known, without starting git.
+	/// `root` must be git's own spelling (a previous [`Git::root`] or
+	/// `rev-parse --show-toplevel`), not a user path: through a symlink
+	/// (macOS `/var` -> `/private/var`) it would not match what git reports.
+	pub fn at_known_root(root: PathBuf) -> Self {
+		Self { root }
 	}
 
 	/// The repository top level; every git path is relative to it.
@@ -1390,6 +1422,19 @@ mod tests {
 		let err = Git::open(dir.path()).err().unwrap();
 		assert!(matches!(err, GitError::NotARepository(_)), "{err}");
 		assert!(err.to_string().contains("is not inside a git repository"));
+	}
+
+	#[test]
+	fn open_checks_the_git_version_once_and_known_roots_start_nothing() {
+		let r = Repo::new();
+		let g = Git::open(&r.path()).unwrap();
+		let runs = VERSION_RUNS.with(std::cell::Cell::get);
+		let again = Git::open(&r.path()).unwrap();
+		assert_eq!(VERSION_RUNS.with(std::cell::Cell::get), runs);
+		assert_eq!(again.root(), g.root());
+		let known = Git::at_known_root(g.root().to_path_buf());
+		assert_eq!(known.root(), g.root());
+		assert_eq!(known.head().unwrap(), g.head().unwrap());
 	}
 
 	use super::*;
