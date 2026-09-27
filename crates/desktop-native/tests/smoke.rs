@@ -2022,6 +2022,8 @@ fn native_graph_failed_next_page_is_transactional() {
 		}
 	};
 	for page in 2..=10 {
+		// Click only once the current page has been painted.
+		control(&format!("commit-row:{}", &commits[(page - 2) * 50][..7]));
 		next();
 		let loaded =
 			lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8))
