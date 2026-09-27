@@ -1999,6 +1999,43 @@ fn paste_budget_refusal_disarms_the_previous_plan() {
 		assert!(!fx.dest.join("oversized.txt").exists());
 		assert_eq!(clip_get(), payload, "{case} modified the clipboard");
 	}
+	// A prefix-only shell fits; resolving it amplifies the plan past32MiB.
+	// Its destinations are all chosen, but it has no executable import plan.
+	let mapped_payload = format!(
+		"// FILE: lib/oversized.txt\n{}",
+		"x".repeat(12 * 1024 * 1024)
+	);
+	clip_set(&mapped_payload);
+	click(&wid, "btn-paste");
+	lines_until(
+		&app.rx,
+		"[APP:PASTE_PREVIEW: items=0",
+		Duration::from_secs(8),
+	);
+	click(&wid, "paste-map-keep:lib");
+	lines_until(
+		&app.rx,
+		"[APP:PASTE_ERR: preview_memory_limit]",
+		Duration::from_secs(15),
+	);
+	let _ = control("btn-apply"); // visible but disabled; no click handler
+	capture(&wid, &integration_shots().join("paste-budget-remap.png"));
+	click(&wid, "btn-apply");
+	key(&wid, "Return");
+	let ignored = lines_until(
+		&app.rx,
+		"[APP:APPLY_IGNORED: no_plan]",
+		Duration::from_secs(4),
+	);
+	assert!(ignored
+		.iter()
+		.all(|line| !line.contains("[APP:PASTE_APPLYING]")
+			&& !line.contains("[APP:PASTE_DONE:")));
+	assert_eq!(fs::read(&protected).unwrap(), sentinel);
+	assert!(!would_create.exists());
+	assert!(!fx.dest.join("lib").exists());
+	assert_eq!(clip_get(), mapped_payload);
+
 	quit_cleanly(&mut app, &wid);
 }
 
@@ -2032,6 +2069,9 @@ fn newer_paste_replaces_the_one_still_loading() {
 	wait_gone(first.0, &first.1, "superseded paste git child");
 	assert!(fx.hold.is_file());
 
+	// Clipboard changes without another Paste must not replace the captured intent.
+	let after_gesture = "// FILE: never-pasted.txt\nnot requested\n";
+	clip_set(after_gesture);
 	fs::remove_file(&fx.hold).unwrap();
 	let ready = lines_until(
 		&app.rx,
@@ -2058,6 +2098,8 @@ fn newer_paste_replaces_the_one_still_loading() {
 		!fx.dest.join("first.txt").exists(),
 		"the superseded paste was written"
 	);
+	assert!(!fx.dest.join("never-pasted.txt").exists());
+	assert_eq!(clip_get(), after_gesture);
 	quit_cleanly(&mut app, &wid);
 }
 

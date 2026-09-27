@@ -11,11 +11,11 @@
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use snip_core::commits::{self, ReplayAction};
 use snip_core::format;
-use snip_core::gitrun::RunOptions;
+use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::Git;
 use snip_core::restore::{
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
@@ -29,8 +29,8 @@ use crate::i18n::Msg;
 use crate::reader::{Preview, PreviewSource};
 use crate::syntax::Language;
 
-/// Admitted UI preview state only. Pending worker copies and transient
-/// parsing/building allocations still require a separate lifecycle bound.
+/// Shared retained preview tier: UI, one active paste input, one latest
+/// captured request, and one result mailbox. Builder scratch is temporary.
 pub const MAX_RETAINED_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
 // Arc's two counters plus conservative alignment padding for these types.
 const ARC_ALLOWANCE: usize = 3 * size_of::<usize>();
@@ -61,19 +61,374 @@ pub fn admit_preview_state(
 	)
 }
 
+fn preview_state_bytes(
+	ordinary: Option<&Preview>,
+	plan: Option<&PastePreviewPlan>,
+	detail: Option<&Preview>,
+) -> usize {
+	ordinary
+		.map_or(0, Preview::retained_bytes)
+		.saturating_add(plan.map_or(0, PastePreviewPlan::retained_bytes))
+		.saturating_add(detail.map_or(0, Preview::retained_bytes))
+}
+
 fn admit_preview_state_with_limit(
 	ordinary: Option<&Preview>,
 	plan: Option<&PastePreviewPlan>,
 	detail: Option<&Preview>,
 	limit: usize,
 ) -> Result<(), Msg> {
-	check_budget(
-		ordinary
-			.map_or(0, Preview::retained_bytes)
-			.saturating_add(plan.map_or(0, PastePreviewPlan::retained_bytes))
-			.saturating_add(detail.map_or(0, Preview::retained_bytes)),
-		limit,
-	)
+	check_budget(preview_state_bytes(ordinary, plan, detail), limit)
+}
+
+/// Gesture-owned input. Deferred remaps keep choices in the disarmed UI shell.
+pub enum PasteRequest {
+	Clipboard {
+		text: String,
+		dest: PathBuf,
+		roots: Vec<PathBuf>,
+		generation: u64,
+	},
+	Remap {
+		prefix: String,
+		keep: bool,
+	},
+}
+
+impl PasteRequest {
+	fn bytes(&self) -> usize {
+		size_of::<Self>().saturating_add(match self {
+			Self::Clipboard {
+				text, dest, roots, ..
+			} => roots.iter().fold(
+				text.capacity()
+					.saturating_add(dest.capacity())
+					.saturating_add(roots.capacity() * size_of::<PathBuf>()),
+				|n, p| n.saturating_add(p.capacity()),
+			),
+			Self::Remap { prefix, .. } => prefix.capacity(),
+		})
+	}
+}
+
+pub struct PasteOutcome {
+	pub result: Result<PastePreviewPlan, Msg>,
+	pub remap: Option<(String, bool)>,
+}
+
+impl PasteOutcome {
+	fn bytes(&self) -> usize {
+		match &self.result {
+			Ok(plan) => plan.retained_bytes(),
+			Err(err) => msg_heap_bytes(err),
+		}
+		.saturating_add(self.remap.as_ref().map_or(0, |(p, _)| p.capacity()))
+	}
+}
+
+fn msg_heap_bytes(msg: &Msg) -> usize {
+	msg.args
+		.iter()
+		.fold(msg.args.capacity() * size_of::<String>(), |n, s| {
+			n.saturating_add(s.capacity())
+		})
+}
+
+/// One paste-specific mailbox, not a general job/resource manager. The UI's
+/// lifecycle id remains occupied independently until its FinishFlag drops.
+#[derive(Default)]
+pub struct PastePending {
+	ui_bytes: usize,
+	apply_allowance: usize,
+	apply_active: usize,
+	ui_raw: Option<Weak<str>>,
+	seq: u64,
+	input: Option<(u64, usize, Option<Weak<str>>)>,
+	latest: Option<PasteRequest>,
+	pub ready: Option<PasteOutcome>,
+}
+
+pub fn lock_pending(
+	pool: &Arc<Mutex<PastePending>>,
+) -> MutexGuard<'_, PastePending> {
+	// An unwinding worker still owns a charge guard. Recover this simple
+	// bookkeeping lock so its Drop can release that charge after its input.
+	pool.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl PastePending {
+	fn shared_raw(&self, ui: Option<&Weak<str>>) -> usize {
+		let held = self
+			.input
+			.as_ref()
+			.and_then(|(_, _, raw)| raw.as_ref())
+			.and_then(Weak::upgrade)
+			.or_else(|| {
+				self.ready
+					.as_ref()
+					.and_then(|r| r.result.as_ref().ok())
+					.map(|p| p.raw_payload.clone())
+			});
+		match (ui.and_then(Weak::upgrade), held) {
+			(Some(ui), Some(held)) if Arc::ptr_eq(&ui, &held) => {
+				held.len().saturating_add(ARC_ALLOWANCE)
+			}
+			_ => 0,
+		}
+	}
+
+	fn total_with_ui(
+		&self,
+		ui_bytes: usize,
+		allowance: usize,
+		raw: Option<&Weak<str>>,
+	) -> usize {
+		let held = self
+			.input
+			.as_ref()
+			.map_or(0, |(_, bytes, _)| *bytes)
+			.saturating_add(self.ready.as_ref().map_or(0, PasteOutcome::bytes));
+		// Subtract only a proven identical, live Arc, from its held charge.
+		let held = held
+			.checked_sub(self.shared_raw(raw))
+			.expect("shared raw exceeds owned paste input/result");
+		size_of::<Self>()
+			.saturating_add(ARC_ALLOWANCE)
+			.saturating_add(
+				size_of::<PasteWorker>() + size_of::<PasteApplyWorker>(),
+			)
+			.saturating_add(ui_bytes)
+			.saturating_add(held)
+			.saturating_add(self.latest.as_ref().map_or(0, PasteRequest::bytes))
+			.saturating_add(allowance.max(self.apply_active))
+	}
+
+	pub fn admit_ui(
+		&mut self,
+		ordinary: Option<&Preview>,
+		plan: Option<&PastePreviewPlan>,
+		detail: Option<&Preview>,
+	) -> Result<(), Msg> {
+		let bytes = preview_state_bytes(ordinary, plan, detail);
+		let allowance = plan
+			.filter(|p| p.executable())
+			.map_or(0, PastePreviewPlan::apply_clone_bytes);
+		let raw = plan.map(|p| Arc::downgrade(&p.raw_payload));
+		check_budget(
+			self.total_with_ui(bytes, allowance, raw.as_ref()),
+			MAX_RETAINED_PREVIEW_BYTES,
+		)?;
+		self.ui_bytes = bytes;
+		self.apply_allowance = allowance;
+		self.ui_raw = raw;
+		Ok(())
+	}
+
+	pub fn invalidate(&mut self, seq: u64) {
+		self.seq = seq;
+		self.latest = None;
+		self.ready = None;
+	}
+
+	pub fn enqueue(&mut self, request: PasteRequest) -> Result<(), Msg> {
+		self.latest = Some(request);
+		if check_budget(
+			self.total_with_ui(
+				self.ui_bytes,
+				self.apply_allowance,
+				self.ui_raw.as_ref(),
+			),
+			MAX_RETAINED_PREVIEW_BYTES,
+		)
+		.is_err()
+		{
+			self.latest = None;
+			return Err(preview_budget_error());
+		}
+		Ok(())
+	}
+
+	pub fn has_pending(&self) -> bool {
+		self.latest.is_some() || self.ready.is_some()
+	}
+
+	pub fn start(
+		pool: &Arc<Mutex<Self>>,
+		plan: Option<&PastePreviewPlan>,
+		cancel: CancelToken,
+	) -> Result<Option<PasteWorker>, Msg> {
+		let mut state = lock_pending(pool);
+		assert!(state.input.is_none() && state.ready.is_none());
+		let Some(request) = state.latest.take() else {
+			return Ok(None);
+		};
+		let input = match request {
+			PasteRequest::Clipboard { .. } => PasteInput::Clipboard(request),
+			PasteRequest::Remap { prefix, keep } => {
+				let Some(plan) = plan else { return Ok(None) };
+				PasteInput::Remap {
+					plan: plan.clone(),
+					prefix,
+					keep,
+				}
+			}
+		};
+		let raw = match &input {
+			PasteInput::Remap { plan, .. } => {
+				Some(Arc::downgrade(&plan.raw_payload))
+			}
+			_ => None,
+		};
+		let seq = state.seq;
+		state.input = Some((seq, input.bytes(), raw));
+		if check_budget(
+			state.total_with_ui(
+				state.ui_bytes,
+				state.apply_allowance,
+				state.ui_raw.as_ref(),
+			),
+			MAX_RETAINED_PREVIEW_BYTES,
+		)
+		.is_err()
+		{
+			state.input = None;
+			return Err(preview_budget_error());
+		}
+		Ok(Some(PasteWorker {
+			input: Some(input),
+			pool: pool.clone(),
+			cancel,
+			seq,
+		}))
+	}
+}
+
+enum PasteInput {
+	Clipboard(PasteRequest),
+	Remap {
+		plan: PastePreviewPlan,
+		prefix: String,
+		keep: bool,
+	},
+}
+impl PasteInput {
+	fn bytes(&self) -> usize {
+		size_of::<Self>().saturating_add(match self {
+			Self::Clipboard(request) => request.bytes(),
+			Self::Remap { plan, prefix, .. } => {
+				plan.retained_bytes().saturating_add(prefix.capacity())
+			}
+		})
+	}
+}
+
+pub struct PasteWorker {
+	input: Option<PasteInput>,
+	pool: Arc<Mutex<PastePending>>,
+	cancel: CancelToken,
+	seq: u64,
+}
+impl PasteWorker {
+	pub fn run(mut self, opts: &RunOptions) {
+		// Locals unwind before self's charge guard. Clipboard buffers drop at
+		// the end of this match; remap allocations move into the candidate.
+		let mut outcome = match self.input.take().expect("paste input") {
+			PasteInput::Clipboard(PasteRequest::Clipboard {
+				text,
+				dest,
+				roots,
+				generation,
+			}) => PasteOutcome {
+				result: PastePreviewPlan::build_from_clipboard_text_with(
+					&text, &dest, &roots, generation, opts,
+				),
+				remap: None,
+			},
+			PasteInput::Remap {
+				mut plan,
+				prefix,
+				keep,
+			} => {
+				let result = plan.rebuild_file_plan_with(opts).map(|()| plan);
+				PasteOutcome {
+					result,
+					remap: Some((prefix, keep)),
+				}
+			}
+			_ => unreachable!(
+				"deferred remap must capture its shell before spawn"
+			),
+		};
+		let mut state = lock_pending(&self.pool);
+		state.input = None;
+		if self.cancel.is_cancelled() || state.seq != self.seq {
+			drop(outcome);
+			return;
+		}
+		state.ready = Some(outcome);
+		if state.total_with_ui(
+			state.ui_bytes,
+			state.apply_allowance,
+			state.ui_raw.as_ref(),
+		) > MAX_RETAINED_PREVIEW_BYTES
+		{
+			outcome = state.ready.take().unwrap();
+			drop(outcome);
+			state.ready = Some(PasteOutcome {
+				result: Err(preview_budget_error()),
+				remap: None,
+			});
+		}
+	}
+}
+impl Drop for PasteWorker {
+	fn drop(&mut self) {
+		// Input must go first, including an unpolled/dropped future.
+		drop(self.input.take());
+		let mut state = lock_pending(&self.pool);
+		if state
+			.input
+			.as_ref()
+			.is_some_and(|(seq, _, _)| *seq == self.seq)
+		{
+			state.input = None;
+		}
+	}
+}
+
+pub struct PasteApplyWorker {
+	plan: Option<PastePreviewPlan>,
+	pool: Arc<Mutex<PastePending>>,
+}
+impl PasteApplyWorker {
+	pub fn new(
+		plan: &PastePreviewPlan,
+		pool: &Arc<Mutex<PastePending>>,
+	) -> Self {
+		let clone = plan.clone();
+		let mut state = lock_pending(pool);
+		let actual = clone.apply_clone_bytes();
+		assert!(
+			actual <= state.apply_allowance,
+			"Apply clone exceeds admitted metadata allowance"
+		);
+		assert_eq!(state.apply_active, 0);
+		state.apply_active = actual;
+		Self {
+			plan: Some(clone),
+			pool: pool.clone(),
+		}
+	}
+	pub fn execute(self) -> Result<PasteApplyResult, Msg> {
+		self.plan.as_ref().unwrap().execute()
+	}
+}
+impl Drop for PasteApplyWorker {
+	fn drop(&mut self) {
+		drop(self.plan.take());
+		lock_pending(&self.pool).apply_active = 0;
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -207,7 +562,7 @@ impl PastePreviewPlan {
 		self.detail_at(self.selected_item_idx)
 	}
 
-	fn detail_at(&self, idx: usize) -> Option<Preview> {
+	pub(crate) fn detail_at(&self, idx: usize) -> Option<Preview> {
 		self.items.get(idx).filter(|i| !i.is_delete).map(|i| {
 			Preview::new(
 				PreviewSource::PasteItem,
@@ -320,6 +675,36 @@ impl PastePreviewPlan {
 			}
 		}
 		bytes
+	}
+
+	fn apply_clone_bytes(&self) -> usize {
+		let mut bytes = size_of::<Self>()
+			.saturating_add(self.destination.capacity())
+			.saturating_add(
+				self.prefix_choices.capacity() * size_of::<PrefixChoice>(),
+			)
+			.saturating_add(self.items.capacity() * size_of::<PasteItem>());
+		for choice in &self.prefix_choices {
+			bytes = bytes.saturating_add(choice.retained_heap_bytes());
+		}
+		for item in &self.items {
+			bytes = bytes
+				.saturating_add(item.path.capacity())
+				.saturating_add(item.dest_root.capacity())
+				.saturating_add(item.dest_root_name.capacity())
+				.saturating_add(item.dest_path.capacity());
+		}
+		bytes.saturating_add(self.error.as_ref().map_or(0, msg_heap_bytes))
+	}
+
+	/// A complete mapping shell alone does not authorize any write.
+	pub fn executable(&self) -> bool {
+		self.mapping_ready()
+			&& if self.whole_commit {
+				self.commit_preview.is_some()
+			} else {
+				self.import_plan.is_some()
+			}
 	}
 
 	pub fn mapping_ready(&self) -> bool {
@@ -928,6 +1313,265 @@ impl PastePreviewPlan {
 mod tests {
 	use super::*;
 	use std::fs;
+
+	fn captured(text: String, dest: &Path) -> PasteRequest {
+		PasteRequest::Clipboard {
+			text,
+			dest: dest.into(),
+			roots: Vec::new(),
+			generation: 1,
+		}
+	}
+
+	#[test]
+	fn pending_repeated_paste_keeps_one_captured_latest_until_owned_job_finishes(
+	) {
+		let dir = tempfile::tempdir().unwrap();
+		let pool = Arc::new(Mutex::new(PastePending::default()));
+		let token = CancelToken::new();
+		lock_pending(&pool)
+			.enqueue(captured("// FILE: first.txt\nfirst".into(), dir.path()))
+			.unwrap();
+		let first = PastePending::start(&pool, None, token.clone())
+			.unwrap()
+			.unwrap();
+		let mut life = crate::lifecycle::Lifecycle::new(1);
+		let (id, held) = life.register(
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(token.clone()),
+		);
+		let input_bytes = lock_pending(&pool).input.as_ref().unwrap().1;
+		token.cancel();
+		for n in 1..=100 {
+			let mut pending = lock_pending(&pool);
+			pending.invalidate(n);
+			pending
+				.enqueue(captured(
+					format!("// FILE: latest-{n}.txt\ncaptured-{n}"),
+					dir.path(),
+				))
+				.unwrap();
+			assert_eq!(pending.input.as_ref().unwrap().1, input_bytes);
+			assert!(pending.ready.is_none());
+			assert!(
+				pending.total_with_ui(
+					pending.ui_bytes,
+					pending.apply_allowance,
+					pending.ui_raw.as_ref()
+				) <= MAX_RETAINED_PREVIEW_BYTES
+			);
+			assert!(life.is_live(id));
+			assert_eq!(life.live_jobs(), 1);
+		}
+		// Releasing input does not release the lifecycle slot prematurely.
+		drop(first);
+		assert!(lock_pending(&pool).input.is_none());
+		assert!(life.is_live(id));
+		drop(held);
+		assert!(!life.is_live(id));
+		PastePending::start(&pool, None, CancelToken::new())
+			.unwrap()
+			.unwrap()
+			.run(&RunOptions::default());
+		let plan = lock_pending(&pool).ready.take().unwrap().result.unwrap();
+		assert_eq!(plan.items[0].path, "latest-100.txt");
+		assert_eq!(&*plan.items[0].content, "captured-100");
+		assert!(plan.executable());
+		assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+	}
+
+	#[test]
+	fn pending_overflow_drops_older_intent_and_raw_share_requires_identical_arc(
+	) {
+		let dir = tempfile::tempdir().unwrap();
+		let raw = "// FILE: a.txt\nbody";
+		let mut shell = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		shell.clear_file_plan();
+		let pool = Arc::new(Mutex::new(PastePending::default()));
+		lock_pending(&pool)
+			.admit_ui(None, Some(&shell), None)
+			.unwrap();
+		lock_pending(&pool)
+			.enqueue(PasteRequest::Remap {
+				prefix: "a".into(),
+				keep: true,
+			})
+			.unwrap();
+		let work = PastePending::start(&pool, Some(&shell), CancelToken::new())
+			.unwrap()
+			.unwrap();
+		{
+			let mut state = lock_pending(&pool);
+			assert_eq!(
+				state.shared_raw(state.ui_raw.as_ref()),
+				raw.len() + ARC_ALLOWANCE
+			);
+			let independent: Arc<str> = raw.into();
+			assert_eq!(
+				state.shared_raw(Some(&Arc::downgrade(&independent))),
+				0
+			);
+			let held = state.input.as_ref().unwrap().1;
+			state.admit_ui(None, None, None).unwrap();
+			assert_eq!(state.shared_raw(state.ui_raw.as_ref()), 0);
+			assert_eq!(state.input.as_ref().unwrap().1, held);
+			state
+				.enqueue(captured(
+					"// FILE: stale.txt\nstale".into(),
+					dir.path(),
+				))
+				.unwrap();
+			assert!(state
+				.enqueue(captured(
+					"x".repeat(MAX_RETAINED_PREVIEW_BYTES),
+					dir.path()
+				))
+				.is_err());
+			assert!(state.latest.is_none());
+		}
+		drop(work);
+		assert!(lock_pending(&pool).input.is_none());
+		assert!(!shell.executable());
+		assert!(shell.mapping_ready());
+		assert!(shell.execute().is_err());
+		assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+	}
+
+	#[test]
+	fn pending_cancel_publication_orders_and_unwind_release_owned_input() {
+		let dir = tempfile::tempdir().unwrap();
+		for invalidate_before in [true, false] {
+			let pool = Arc::new(Mutex::new(PastePending::default()));
+			lock_pending(&pool)
+				.enqueue(captured("// FILE: a.txt\nbody".into(), dir.path()))
+				.unwrap();
+			let work = PastePending::start(&pool, None, CancelToken::new())
+				.unwrap()
+				.unwrap();
+			if invalidate_before {
+				lock_pending(&pool).invalidate(1);
+			}
+			work.run(&RunOptions::default());
+			assert!(lock_pending(&pool).input.is_none());
+			assert_eq!(lock_pending(&pool).ready.is_none(), invalidate_before);
+			lock_pending(&pool).invalidate(2);
+			assert!(lock_pending(&pool).ready.is_none());
+		}
+		let pool = Arc::new(Mutex::new(PastePending::default()));
+		lock_pending(&pool)
+			.enqueue(captured("// FILE: panic.txt\nbody".into(), dir.path()))
+			.unwrap();
+		let work = PastePending::start(&pool, None, CancelToken::new())
+			.unwrap()
+			.unwrap();
+		let result =
+			std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+				let _owned = work;
+				panic!("exercise owned input unwinding");
+			}));
+		assert!(result.is_err());
+		assert!(lock_pending(&pool).input.is_none());
+		assert!(lock_pending(&pool).ready.is_none());
+		assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+	}
+
+	#[test]
+	fn pending_mailbox_transfer_uses_one_charge_and_admitted_apply_needs_no_more_budget(
+	) {
+		let dir = tempfile::tempdir().unwrap();
+		let pool = Arc::new(Mutex::new(PastePending::default()));
+		lock_pending(&pool)
+			.enqueue(captured("// FILE: a.txt\nfull bytes".into(), dir.path()))
+			.unwrap();
+		PastePending::start(&pool, None, CancelToken::new())
+			.unwrap()
+			.unwrap()
+			.run(&RunOptions::default());
+		let outcome = lock_pending(&pool).ready.take().unwrap();
+		let plan = outcome.result.unwrap();
+		let detail = plan.detail_preview();
+		let mut ordinary = Preview::new(
+			PreviewSource::WorkingFile,
+			None,
+			"old".into(),
+			false,
+			Language::Plain,
+		);
+		{
+			let mut state = lock_pending(&pool);
+			state
+				.admit_ui(Some(&ordinary), Some(&plan), detail.as_ref())
+				.unwrap();
+			let used = state.total_with_ui(
+				state.ui_bytes,
+				state.apply_allowance,
+				state.ui_raw.as_ref(),
+			);
+			ordinary.source = PreviewSource::CommitFile {
+				sha: String::with_capacity(MAX_RETAINED_PREVIEW_BYTES - used),
+			};
+			state
+				.admit_ui(Some(&ordinary), Some(&plan), detail.as_ref())
+				.unwrap();
+			assert_eq!(
+				state.total_with_ui(
+					state.ui_bytes,
+					state.apply_allowance,
+					state.ui_raw.as_ref()
+				),
+				MAX_RETAINED_PREVIEW_BYTES
+			);
+			state.admit_ui(Some(&ordinary), None, None).unwrap();
+			state.ready = Some(PasteOutcome {
+				result: Ok(plan),
+				remap: None,
+			});
+			let duplicate = state
+				.ready
+				.as_ref()
+				.unwrap()
+				.result
+				.as_ref()
+				.unwrap()
+				.clone();
+			assert!(state
+				.admit_ui(Some(&ordinary), Some(&duplicate), detail.as_ref())
+				.is_err());
+		}
+		let plan = {
+			let mut state = lock_pending(&pool);
+			let plan = state.ready.take().unwrap().result.unwrap();
+			state
+				.admit_ui(Some(&ordinary), Some(&plan), detail.as_ref())
+				.unwrap();
+			plan
+		};
+		let apply = PasteApplyWorker::new(&plan, &pool);
+		{
+			let state = lock_pending(&pool);
+			assert!(
+				state.apply_active > 0
+					&& state.apply_active <= state.apply_allowance
+			);
+			assert_eq!(
+				state.total_with_ui(
+					state.ui_bytes,
+					state.apply_allowance,
+					state.ui_raw.as_ref()
+				),
+				MAX_RETAINED_PREVIEW_BYTES
+			);
+		}
+		apply.execute().unwrap();
+		assert_eq!(lock_pending(&pool).apply_active, 0);
+		assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"full bytes");
+	}
 
 	#[test]
 	fn retained_budget_refuses_raw_before_parsing_and_file_copy_amplification()

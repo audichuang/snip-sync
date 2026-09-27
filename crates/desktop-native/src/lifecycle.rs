@@ -210,6 +210,12 @@ impl Lifecycle {
 		}
 	}
 
+	pub fn is_live(&self, id: u64) -> bool {
+		self.jobs
+			.iter()
+			.any(|job| job.id == id && !job.finished.load(Ordering::SeqCst))
+	}
+
 	pub fn has_mutating(&self) -> bool {
 		self.jobs.iter().any(|job| {
 			job.kind == JobKind::Mutating

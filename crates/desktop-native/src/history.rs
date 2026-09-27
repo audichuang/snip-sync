@@ -1079,7 +1079,7 @@ impl WorkbenchModel {
 		self.selected_file = None;
 		self.selected_commit_file = None;
 		self.commit_files.clear();
-		self.preview = None;
+		self.clear_preview();
 		self.preview_loading = true;
 		self.preview_error = None;
 		let Some(root) = self.repo_root() else {
@@ -1142,7 +1142,7 @@ impl WorkbenchModel {
 		self.compare = Some((older.clone(), newer.clone()));
 		self.selected_commit_file = None;
 		self.commit_files.clear();
-		self.preview = None;
+		self.clear_preview();
 		self.preview_loading = true;
 		self.preview_error = None;
 		let Some(root) = self.repo_root() else {

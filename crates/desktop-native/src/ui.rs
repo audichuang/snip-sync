@@ -2945,12 +2945,13 @@ impl WorkbenchModel {
 		dest: String,
 		applying: bool,
 		mapping_ready: bool,
+		executable: bool,
 		cx: &mut Context<Self>,
 	) -> Div {
 		let loc = self.locale;
 		let log = &self.probes;
 		let loading = self.paste_loading;
-		let can_apply = !applying && mapping_ready && !loading;
+		let can_apply = !applying && executable && !loading;
 		div()
 			.flex()
 			.flex_row()
@@ -3059,7 +3060,7 @@ impl WorkbenchModel {
 				t("paste_tab", self.locale).to_string(),
 				Icon::Changes,
 			))
-			.child(self.paste_action_bar(dest, false, false, cx))
+			.child(self.paste_action_bar(dest, false, false, false, cx))
 			.child(self.paste_loading_note())
 			.into_any_element()
 	}
@@ -3091,8 +3092,13 @@ impl WorkbenchModel {
 		let selected = plan.items.get(plan.selected_item_idx);
 
 		let loading = self.paste_loading;
-		let action_bar =
-			self.paste_action_bar(dest, applying, mapping_ready, cx);
+		let action_bar = self.paste_action_bar(
+			dest,
+			applying,
+			mapping_ready,
+			plan.executable(),
+			cx,
+		);
 
 		let summary = div()
 			.flex()
