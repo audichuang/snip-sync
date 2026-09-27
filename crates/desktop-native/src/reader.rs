@@ -454,7 +454,8 @@ pub enum DiffMode {
 	SideBySide,
 }
 
-/// A text position: (line index, byte column).
+/// A text position: (line index, byte column). The line just beyond the
+/// index, with column zero, denotes the end of all retained preview text.
 pub type Pos = (usize, usize);
 
 /// Text bounds of the rows drawn in the last frame (bounded by viewport).
@@ -530,33 +531,25 @@ impl Reader {
 	}
 }
 
-/// Text of a selection, lines joined with '\n'.
+/// Copy the original byte span, preserving line endings and unindexed text.
 pub fn selected_text(p: &Preview, (a, b): (Pos, Pos)) -> String {
-	let mut out = String::new();
-	for line in a.0..=b.0.min(p.lines.len().saturating_sub(1)) {
-		let t = p.line(line);
-		let s = if line == a.0 { a.1.min(t.len()) } else { 0 };
-		let e = if line == b.0 {
-			b.1.min(t.len())
-		} else {
-			t.len()
+	let (a, b) = if a <= b { (a, b) } else { (b, a) };
+	let offset = |(line, column): Pos, round_up: bool| {
+		let Some(range) = p.lines.get(line) else {
+			return p.text.len();
 		};
-		if line > a.0 {
-			out.push('\n');
+		let mut byte = range.start as usize
+			+ column.min((range.end - range.start) as usize);
+		while !p.text.is_char_boundary(byte) {
+			if round_up {
+				byte += 1;
+			} else {
+				byte -= 1;
+			}
 		}
-		let mut s_clamped = s;
-		while s_clamped > 0 && !t.is_char_boundary(s_clamped) {
-			s_clamped -= 1;
-		}
-		let mut e_clamped = e;
-		while e_clamped < t.len() && !t.is_char_boundary(e_clamped) {
-			e_clamped += 1;
-		}
-		if s_clamped <= e_clamped {
-			out.push_str(&t[s_clamped..e_clamped.min(t.len())]);
-		}
-	}
-	out
+		byte
+	};
+	p.text[offset(a, false)..offset(b, true)].to_string()
 }
 
 /// Splits `line` into disjoint styled runs: syntax color, find match and
@@ -867,9 +860,8 @@ impl WorkbenchModel {
 
 	pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
 		if let Some(p) = &self.preview {
-			let last = p.lines.len().saturating_sub(1);
 			self.reader.anchor = Some((0, 0));
-			self.reader.head = Some((last, p.line(last).len()));
+			self.reader.head = Some((p.lines.len(), 0));
 			cx.notify();
 		}
 	}
@@ -1382,6 +1374,62 @@ mod tests {
 		let bin = "diff --git a/x b/x\nBinary files a/x and b/x differ\n";
 		let p = preview(bin, true);
 		assert_eq!(p.inline_rows(), 2);
+	}
+
+	#[test]
+	fn selection_preserves_raw_line_endings_and_utf8_endpoints() {
+		let p = preview("ab繁體\r\n第二𝄞行\r\nlast\n", false);
+		// Deliberately split UTF-8 characters at both endpoints; selection
+		// includes their whole bytes and preserves the intervening CRLF.
+		let reader = Reader {
+			anchor: Some((1, 8)),
+			head: Some((0, 3)),
+			..Default::default()
+		};
+		assert_eq!(
+			selected_text(&p, reader.selection().unwrap()),
+			"繁體\r\n第二𝄞"
+		);
+		assert_eq!(
+			selected_text(&p, ((0, 0), (0, p.line(0).len()))),
+			"ab繁體",
+			"a manual whole-line selection still excludes its terminator"
+		);
+		assert_eq!(selected_text(&p, ((1, 0), (1, 6))), "第二");
+	}
+
+	#[test]
+	fn selection_end_of_text_preserves_bom_and_terminal_newlines() {
+		for raw in [
+			"",
+			"\u{feff}  exact source\t \r\n第二行\r\n\r\n",
+			"one\n",
+			"one\r\n",
+			"\r\n\r\n",
+			"tail",
+		] {
+			let p = preview(raw, false);
+			assert_eq!(selected_text(&p, ((0, 0), (p.lines.len(), 0))), raw);
+		}
+	}
+
+	#[test]
+	fn selection_end_of_text_reaches_beyond_the_line_index_cap() {
+		let raw = "row\r\n".repeat(MAX_PREVIEW_LINES + 1);
+		let p = preview(&raw, false);
+		assert_eq!(p.lines.len(), MAX_PREVIEW_LINES);
+		assert_eq!(&*p.text, raw);
+		let reader = Reader {
+			anchor: Some((0, 0)),
+			head: Some((p.lines.len(), 0)),
+			..Default::default()
+		};
+		assert_eq!(selected_text(&p, reader.selection().unwrap()), raw);
+		assert_eq!(
+			reader.selected_in_line(MAX_PREVIEW_LINES - 1, 3),
+			Some(0..3),
+			"the last indexed row remains fully highlighted"
+		);
 	}
 
 	#[test]

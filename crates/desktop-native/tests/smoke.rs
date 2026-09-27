@@ -3493,6 +3493,7 @@ fn native_reader_degradation_and_copy_integrity() {
 	git_ok(&repo, &["config", "user.name", "Reader Test"]);
 	git_ok(&repo, &["config", "user.email", "reader@example.com"]);
 	let good = "\u{feff}  exact source\t \r\n第二行\r\n\r\n";
+	let mut selection_mismatches = Vec::new();
 	let long = format!(
 		"{}繁體中文𝄞{}HIDDEN-END",
 		"a".repeat(4091),
@@ -3731,6 +3732,18 @@ fn native_reader_degradation_and_copy_integrity() {
 		git_good.stdout,
 		"BOM, CRLF, spaces and final newlines survive Copy View"
 	);
+	click("reader");
+	key(&wid, "ctrl+a");
+	key(&wid, "ctrl+c");
+	wait("[APP:SELECTION_COPIED:");
+	let selected = clip_get();
+	fs::write(out.join("reader-good-selection.txt"), &selected).unwrap();
+	capture(&out.join("reader-good-selection.png"));
+	if selected.as_bytes() != git_good.stdout {
+		selection_mismatches.push(format!(
+			"good.txt Ctrl+A differs from git show: expected {} bytes, copied {} bytes",
+			git_good.stdout.len(), selected.len()));
+	}
 
 	open("rev-row", "long.txt");
 	std::thread::sleep(Duration::from_millis(150));
@@ -3856,6 +3869,18 @@ fn native_reader_degradation_and_copy_integrity() {
 		many,
 		"line indexing cap must not discard retained source bytes"
 	);
+	click("reader");
+	key(&wid, "ctrl+a");
+	key(&wid, "ctrl+c");
+	wait("[APP:SELECTION_COPIED:");
+	let selected = clip_get();
+	fs::write(out.join("reader-many-lines-selection.txt"), &selected).unwrap();
+	capture(&out.join("reader-many-lines-selection.png"));
+	if selected != many {
+		selection_mismatches.push(format!(
+			"many-lines.txt Ctrl+A omitted retained source: expected {} bytes, copied {} bytes",
+			many.len(), selected.len()));
+	}
 
 	click("btn-leave-tree");
 	wait("[APP:REV_TREE: off]");
@@ -3888,4 +3913,6 @@ fn native_reader_degradation_and_copy_integrity() {
 		);
 	}
 	quit_cleanly(&mut app, &wid);
+	// Preserve both actual clipboard mismatches in an old-product run.
+	assert!(selection_mismatches.is_empty(), "{selection_mismatches:?}");
 }
