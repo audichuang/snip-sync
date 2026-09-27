@@ -6,7 +6,13 @@ These do not open a display. The X11 script is the OS proof.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
+
+from scripts import check_native_ime as ime
 
 from scripts.check_native_ime import (
     associated_candidate,
@@ -39,6 +45,18 @@ class Bitmap:
 
 
 class TestImeGate(unittest.TestCase):
+    def test_private_session_preserves_only_caller_library_paths(self):
+        for supplied in ({}, {"LIBRARY_PATH": "/caller/build", "LD_LIBRARY_PATH": "/caller/runtime"}):
+            with self.subTest(supplied=supplied), tempfile.TemporaryDirectory() as directory:
+                with mock.patch.object(ime, "RUN", Path(directory)), \
+                        mock.patch.object(ime, "lavapipe_icd", return_value="/test/lvp.json"), \
+                        mock.patch.dict(os.environ, supplied, clear=True):
+                    session = ime.Session()
+                    session.prepare_env()
+                for key in ("LIBRARY_PATH", "LD_LIBRARY_PATH"):
+                    self.assertEqual(session.env.get(key), supplied.get(key))
+                self.assertEqual(session.env["HOME"], str(Path(directory) / "iso" / "home"))
+
     def test_missing_tools_fail_closed_when_required(self) -> None:
         self.assertEqual(decide_run(["Xvfb"], True), "fail")
         self.assertEqual(decide_run(["fcitx5"], False), "unsupported")

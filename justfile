@@ -1,5 +1,7 @@
 default: build
 
+native_python := env("SNIP_NATIVE_PYTHON", "python3")
+
 build:
 	cargo build --workspace
 
@@ -13,7 +15,7 @@ fmt:
 	cargo fmt --all
 
 # Mirrors CI's Rust checks (see .github/workflows/ci.yml for the rest).
-preflight: preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke native-lifecycle
+preflight: preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke native-lifecycle native-acceptance
 
 preflight-rust:
 	cargo fmt --all --check
@@ -24,7 +26,7 @@ preflight-rust:
 
 # Python stdlib memory harness contracts and workload generator tests.
 preflight-harness:
-	SNIP_REQUIRE_ALL_TESTS=1 python3 -B -m unittest discover -s scripts/tests
+	SNIP_REQUIRE_ALL_TESTS=1 "{{ native_python }}" -B -m unittest discover -s scripts/tests
 
 # Same frontend checks as CI's Frontend Lint and Format Check jobs.
 preflight-frontend:
@@ -59,6 +61,29 @@ native-lifecycle out="target/native-e2e-artifacts":
 	mkdir -p "{{out}}"
 	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test lifecycle --locked -- --nocapture 2>&1 | tee "$1/lifecycle.log"' _ "{{out}}"
 	test -s "{{out}}/lifecycle.log"
+
+# Current release build once, then private IME9+startup, collaboration18 and
+# functional short resource gate (20 warmup +100 measured switches).
+# Optional args include --output FRESH_DIR and --build-receipt EXISTING_RECEIPT.
+native-acceptance *args:
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate all {{ args }}
+
+native-acceptance-build *args:
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate build {{ args }}
+
+native-ime *args:
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate ime {{ args }}
+
+native-collaboration *args:
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate collaboration {{ args }}
+
+native-resources-short *args:
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate resource-short {{ args }}
+
+# Full/release resource acceptance: standard workload, original long gate.
+# Currently FAILS for missing real hide/tray coverage; never a substitute for D4.
+native-resources-long *args:
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate resource-long {{ args }}
 
 # Package native desktop candidate bundle (Linux, macOS, Windows).
 package-native target out bin version:

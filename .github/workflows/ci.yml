@@ -437,6 +437,57 @@ jobs:
               shell: bash
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
+    # Independent release-profile real-app gates. Each driver owns private
+    # Xvfb, HOME and D-Bus; no shared DISPLAY or guessed historical binary.
+    native-acceptance:
+        name: Native Acceptance (Linux)
+        runs-on: ubuntu-24.04
+        timeout-minutes: 120
+        env:
+            RUSTFLAGS: "-D warnings"
+            SNIP_REQUIRE_ALL_TESTS: "1"
+            SNIP_NATIVE_PYTHON: /usr/bin/python3
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Setup sccache
+              uses: mozilla-actions/sccache-action@v0.0.10
+            - name: Rust Cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  shared-key: ${{ runner.os }}-native-acceptance-release
+                  cache-on-failure: true
+            - name: Install native build and isolated acceptance dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                      build-essential libxcb1-dev libx11-dev \
+                      libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
+                      libwayland-dev libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
+                      xvfb xdotool xclip x11-apps x11-utils imagemagick dbus-x11 \
+                      fcitx5 fcitx5-pinyin python3-pil fonts-dejavu-core fonts-noto-cjk
+            - name: Configure git identity
+              run: |
+                  git config --global user.name "snip-ci"
+                  git config --global user.email "snip-ci@example.invalid"
+            - name: Build once and run IME, all collaboration cases, and functional short resource gate
+              env:
+                  ACCEPTANCE_OUT: ${{ runner.temp }}/native-acceptance
+              run: |
+                  "$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate all --output "$ACCEPTANCE_OUT"
+            - name: Upload acceptance receipts, driver results and logs
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: native-acceptance-linux
+                  path: ${{ runner.temp }}/native-acceptance
+                  if-no-files-found: error
+            - name: Checkout left clean
+              if: always()
+              shell: bash
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
+
     # Native candidate release packaging across 4 targets.
     # Produces candidate packages (macOS arm/intel, Linux x64, Windows x64)
     # verified with verify_artifacts.py and uploaded as CI artifacts only.
@@ -555,7 +606,7 @@ jobs:
     gate:
         name: CI gate
         if: always()
-        needs: [actionlint, format, lint-rust, lint-frontend, test, desktop-e2e, harness, native-smoke, native-candidate-artifacts]
+        needs: [actionlint, format, lint-rust, lint-frontend, test, desktop-e2e, harness, native-smoke, native-acceptance, native-candidate-artifacts]
         runs-on: ubuntu-24.04
         timeout-minutes: 5
         steps:

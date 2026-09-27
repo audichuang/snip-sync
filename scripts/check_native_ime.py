@@ -501,12 +501,7 @@ class Session:
                 "VK_DRIVER_FILES": lavapipe_icd(),
                 "LIBGL_ALWAYS_SOFTWARE": "1",
                 "GALLIUM_DRIVER": "llvmpipe",
-                "LIBRARY_PATH": "/home/audichuang/.local/lib",
             }
-        )
-        ld = env.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = "/home/audichuang/.local/lib" + (
-            os.pathsep + ld if ld else ""
         )
         self.env = env
         self._bus_config = str(bus)

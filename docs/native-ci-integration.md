@@ -1,5 +1,89 @@
 # 原生 CI／harness 整合收據
 
+## Current Linux acceptance entrypoints (2026-09-27)
+
+`just preflight` now also requires `just native-acceptance`. The required Linux
+CI job `Native Acceptance (Linux)` runs the same Python entrypoint; the existing
+Rust/frontend/Tauri, native smoke/lifecycle, audit/DTO and four-target candidate
+jobs and package names remain in place. A wiring change is not a recorded CI or
+product pass: current run evidence must come from the generated reports.
+
+| Entry | Checks |
+| --- | --- |
+| `just native-acceptance` | Build one release binary, then all three gates below |
+| `just native-ime` | Deterministic startup ordering plus all nine IME phases |
+| `just native-collaboration` | Canonical fixture and all 18 real-app cases; no step filter |
+| `just native-resources-short` | Medium 15-repo functional subgate; existing 20 warmup/100 measured switches and thresholds |
+| `just native-resources-long` | Standard workload and unchanged long resource gate; currently fails for missing real hide/tray coverage |
+| `just native-acceptance-build` | Build/freeze only; no GUI acceptance claim |
+
+All entries accept `--output FRESH_DIRECTORY` and `--build-receipt RECEIPT`.
+Without a receipt, the runner invokes a locked release Cargo build and freezes
+the emitted executable. With a receipt, it verifies that build and uses its
+frozen executable without rebuilding. The combined entry builds only once.
+
+One executable interpreter is selected by `SNIP_NATIVE_PYTHON` (default
+`python3`), including every driver subprocess. It is an executable name/path,
+not a shell command or a list of arguments. For example, when the system Python
+has Pillow but another Python on PATH does not:
+
+```bash
+SNIP_NATIVE_PYTHON=/usr/bin/python3 just native-acceptance
+```
+
+Do not globally install packages to repair a different interpreter. The Linux
+CI job installs `python3-pil`, `fcitx5`, `fcitx5-pinyin`, X11/Xvfb/input tools,
+D-Bus, fonts, Mesa and native build headers with apt, then explicitly invokes
+`/usr/bin/python3`. A local isolated Python environment with Pillow also works.
+Missing tools, Pillow, unsupported platforms, failed drivers and mismatched
+inputs fail closed; every driver gets `SNIP_REQUIRE_ALL_TESTS=1`. Local native
+linker configuration, when needed, remains caller-provided; the IME helper no
+longer inserts a particular developer's library directory.
+
+Evidence defaults to a unique directory under ignored
+`target/native-acceptance/`. An explicit output must not exist, and output
+inside the checkout must be gitignored. No historical run is deleted or reused.
+The runner clears inherited display/bus and Git-routing variables; existing
+drivers create their own private Xvfb, HOME and D-Bus. These entries do not wrap
+the drivers in the less-isolated smoke-test display helper.
+
+The build receipt binds actual Cargo exit status/command, build environment,
+HEAD and tree, dirty/staged/untracked state, source file hashes and the frozen
+binary SHA-256. Source snapshots are recorded before/after building and checked
+before/after each gate, including failed gates. A receipt from an old or changed
+checkout is refused even when its HEAD alone looks correct. This entrypoint
+issues its own receipts; an arbitrary historical binary or hand-written source
+claim is not an alternative. The resource driver's existing
+`sourceBuildAuthorized=false` receipt classification stays unchanged; the
+orchestrator's separately observed build provides the source/build evidence.
+
+For a single frozen source snapshot, preserve the receipt path printed by a
+build-only run, then run gates into new directories:
+
+```bash
+SNIP_NATIVE_PYTHON=/usr/bin/python3 just native-acceptance-build
+# Use the build-receipt.json from that fresh output, without editing the checkout:
+SNIP_NATIVE_PYTHON=/usr/bin/python3 just native-ime --build-receipt /absolute/run/build-receipt.json
+SNIP_NATIVE_PYTHON=/usr/bin/python3 just native-collaboration --build-receipt /absolute/run/build-receipt.json
+SNIP_NATIVE_PYTHON=/usr/bin/python3 just native-resources-short --build-receipt /absolute/run/build-receipt.json
+```
+
+Each run generates its own fixtures using the existing generators. Collaboration
+pins the canonical dataset hash and helper hashes; resources pin the workload
+manifest hash. Driver outputs and raw logs remain alongside `acceptance.json`,
+the build receipt and build-input snapshots. The CI job uploads these artifacts
+on success or failure and has a 120-minute budget for compilation plus all
+18 cases and 100 measured switches; actual timings still require a live run.
+
+The short gate is **functional-short**, not standard-release, full D4, an
+absolute-memory acceptance result or cross-platform UI verification. The long
+entry generates the real standard workload and propagates the existing
+`missing-coverage` failure until hide/tray are supported and observed. It must
+pass separately for full native resource/release acceptance. This wiring does
+not change release publishing or candidate-artifact promotion policy.
+
+The remainder of this document is the historical 2026-09-26 integration receipt.
+
 > **後續整合（2026-09-26）**：Codex 已將通過獨立審查的六個 packaging 檔由 `915ae79` 併入；下方 worker 交付時的「尚未進樹」是歷史狀態。完整 Python suite 已獨立通過 138 tests（12.620s），日誌 `/tmp/snip-integrated-harness-package-20260926.log`。建置文件的 headless 指令與舊測試數也已校正。完整 preflight、四目標 CI 與原生產品驗收仍未完成。
 
 日期：2026-09-26。工作樹 `/home/audichuang/research/snip-sync`，分支 `feature/lightweight-git-workbench-plan`，HEAD `7ed02790b63cb8e051bf726828daa1fbfcd765ce`。base `9be8684f0b7bd556f59159c6887fd5af339de148` 仍是 HEAD 的祖先。這次沒有 commit、push 或 release。

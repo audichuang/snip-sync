@@ -58,3 +58,12 @@ long 仍要求 600 秒浸泡、500 次切換、30 秒基線與結尾窗，以及
 SNIP_REQUIRE_ALL_TESTS=1 python3 -B -W error::ResourceWarning -m unittest scripts.tests.test_native_leaks scripts.tests.test_bench_native
 SNIP_REQUIRE_ALL_TESTS=1 python3 -B -W error::ResourceWarning -m unittest discover -s scripts/tests
 ```
+
+## Current entrypoints
+
+Use `just native-resources-short` for the required Linux functional-short gate
+or `just native-resources-long` for the unchanged standard-workload long gate.
+The long gate currently fails for missing observed hide/tray coverage. Neither
+a short pass nor an entrypoint build establishes full D4 or release acceptance.
+Fresh outputs, interpreter selection, source/build receipts and reuse of a
+frozen current binary are documented in [native-ci-integration.md](native-ci-integration.md#current-linux-acceptance-entrypoints-2026-09-27).
