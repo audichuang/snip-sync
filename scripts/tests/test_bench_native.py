@@ -1082,6 +1082,75 @@ class TestNativeSessionWaitApp(unittest.TestCase):
             self.assertIn("exited with 1 before the app appeared", str(cm.exception))
 
 
+class TestScrollHintScope(unittest.TestCase):
+    VIEWPORT = "[APP:CTRL_BOUNDS: id=left-list x=36 y=66 w=280 h=398]"
+    EAST = "[APP:REPO_SELECTING: 5 (east/docs) root=/fixture/machine-a/east/docs]"
+    WEST = "[APP:REPO_SELECTING: 14 (west/docs) root=/fixture/machine-a/west/docs]"
+
+    def first_wheel(self, lines: list[str], control: str) -> str:
+        class WheelObserved(Exception):
+            pass
+
+        class Recorded:
+            def __init__(self) -> None:
+                self.lines = lines
+                self.command: tuple[str, ...] = ()
+
+            def texts(self, start: int = 0) -> list[str]:
+                return self.lines[start:]
+
+            def wait_line(self, pred: Any, start: int = 0, timeout: float = 10) -> tuple[int, float, str]:
+                for index, line in enumerate(self.lines[start:], start):
+                    if pred(line):
+                        return index, 0.0, line
+                raise NativeBenchError("recorded stream has no matching event")
+
+            def focus(self, wid: str) -> None:
+                pass
+
+            def x(self, *args: str, timeout: float = 20) -> str:
+                self.command = args
+                raise WheelObserved
+
+        session = Recorded()
+        with self.assertRaises(WheelObserved):
+            scroll_into_view(session, {"wid": "1", "x": 102, "y": 90}, control)
+        self.assertEqual(session.command[:2], ("xdotool", "mousemove"))
+        self.assertEqual(session.command[-2], "click")
+        return session.command[-1]
+
+    def test_repo_selection_retires_prior_same_path_hint(self) -> None:
+        # Actual failed collision trace: east/docs src was y=204, then west/docs
+        # loads below 15 repo rows. Its src is not yet rendered and needs DOWN.
+        for selection in (self.WEST, self.EAST):
+            with self.subTest(selection=selection):
+                self.assertEqual(self.first_wheel([
+                    self.VIEWPORT, self.EAST,
+                    "[APP:CTRL_BOUNDS: id=tree-row:src x=36 y=204 w=280 h=24]",
+                    selection,
+                    "[APP:CTRL_GONE: id=tree-row:src]",
+                    "[APP:TREE_PAGE: rel= kind=Expand children=9 has_more=false selected=0]",
+                    "[APP:CTRL_BOUNDS: id=tree-row:assets x=36 y=426 w=280 h=24]",
+                ], "tree-row:src"), "5")
+
+    def test_same_view_retains_gone_row_upward_hint(self) -> None:
+        for control in ("tree-row:src", "rev-row:src", "rev-chk:bbbbbbb:src/app.txt"):
+            with self.subTest(control=control):
+                self.assertEqual(self.first_wheel([
+                    self.VIEWPORT, self.WEST, "[APP:REV_TREE: bbbbbbb]",
+                    f"[APP:CTRL_BOUNDS: id={control} x=36 y=80 w=280 h=24]",
+                    f"[APP:CTRL_GONE: id={control}]",
+                ], control), "4")
+
+    def test_revision_switch_retires_prior_path_hint(self) -> None:
+        self.assertEqual(self.first_wheel([
+            self.VIEWPORT, self.WEST, "[APP:REV_TREE: aaaaaaa]",
+            "[APP:CTRL_BOUNDS: id=rev-row:src x=36 y=80 w=280 h=24]",
+            "[APP:REV_TREE: off]", "[APP:REV_TREE: bbbbbbb]",
+            "[APP:CTRL_GONE: id=rev-row:src]",
+        ], "rev-row:src"), "5")
+
+
 class TestScrollSettlesAfterReflow(unittest.TestCase):
     def test_uses_bounds_after_the_row_moves(self) -> None:
         class Moving:

@@ -1543,9 +1543,13 @@ def left_viewport(lines: list[str]) -> tuple[int, int, int, int]:
 
 
 def _last_reported_bounds(lines: list[str], control: str) -> tuple[int, int, int, int] | None:
-    """Last bounds emitted for control, kept even after CTRL_GONE removed it from the live set."""
+    """Last bounds in this repo/view, retained after a same-view CTRL_GONE."""
     found: tuple[int, int, int, int] | None = None
     for line in lines:
+        if "[APP:REPO_SELECTING:" in line or (
+            control.startswith(("rev-row:", "rev-chk:")) and "[APP:REV_TREE:" in line
+        ):
+            found = None
         match = BOUNDS_RE.search(line)
         if match and match["id"] == control:
             found = (int(match["x"]), int(match["y"]), int(match["w"]), int(match["h"]))
