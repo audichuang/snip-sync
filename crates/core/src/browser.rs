@@ -747,108 +747,82 @@ pub fn git_preview_with(
 	path: &str,
 	opts: &RunOptions,
 ) -> Result<GitPreview, GitError> {
-	let max = opts.max_stdout;
 	// Verify membership before accepting a path from the WebView: the one
-	// listing `read_changed_file` does answers both.
+	// pathspec-limited listing `read_changed_file_with` does answers both.
 	if matches!(source, GitSource::Working) && git.root().join(path).exists() {
 		inside(git.root(), path)?;
 	}
-	// The listing is metadata for every change in the source, not the
-	// preview: thousands of changed paths must not trip the preview's
-	// 1 MiB limit. Content stays strict at `max` either way.
-	let listing = RunOptions {
-		max_stdout: opts.max_stdout.max(RunOptions::INTERACTIVE_MAX_STDOUT),
-		overflow: Overflow::Error,
-		..opts.clone()
-	};
 	// Content is strict: a partial file would read as the whole file.
 	let file = gitsrc::read_changed_file_with(
-		git, source, path, max as u64, &listing,
+		git,
+		source,
+		path,
+		opts.max_stdout as u64,
+		opts,
 	)?
 	.ok_or_else(|| {
 		GitError::Malformed("Path is not in this Git source".into())
 	})?;
-	let mut args = Vec::new();
-	match source {
-		GitSource::Working => {
-			args.push(git.head_with(opts)?.unwrap_or_else(|| EMPTY_TREE.into()))
-		}
-		GitSource::Staged => args.push("--cached".into()),
-		GitSource::Commit(rev) => {
-			let sha = git.resolve_commit_with(rev, opts)?;
-			args.push(
-				git.parents_with(&sha, opts)?
-					.into_iter()
-					.next()
-					.unwrap_or_else(|| EMPTY_TREE.into()),
-			);
-			args.push(sha);
-		}
-		GitSource::Range(base, tip) => {
-			args.push(git.resolve_commit_with(base, opts)?);
-			args.push(git.resolve_commit_with(tip, opts)?);
-		}
-	}
-	finish_preview(git, args, path, file.content, file.change_type, opts)
+	let revs = diff_revs(git, source, None, opts)?;
+	finish_preview(git, revs, path, file.content, file.change_type, opts)
 }
 
-/// [`git_preview_with`] for one path of a commit the caller already knows,
-/// full SHA and parents included (e.g. a log row), with the change type from
-/// its own listing: no revision re-resolution and no re-listing, just one
-/// `cat-file` and one `diff`. Content follows the listing's rules: the
-/// commit's blob, or for a deletion the first parent's version that decodes.
-pub fn commit_preview_with(
+/// [`git_preview_with`] for a change the caller listed itself (`path` and
+/// `change` from [`gitsrc::list_changed_paths_with`]): nothing is listed or,
+/// for a commit whose `parents` are known (a log row), resolved again; one
+/// `cat-file` and one `diff`. Only for paths from such a listing, never an
+/// untrusted path.
+pub fn git_preview_for(
 	git: &Git,
-	sha: &str,
-	parents: &[String],
+	source: &GitSource,
 	path: &str,
-	change: Option<crate::format::ChangeType>,
+	change: crate::format::ChangeType,
+	parents: Option<&[String]>,
 	opts: &RunOptions,
 ) -> Result<GitPreview, GitError> {
-	use crate::format::ChangeType;
-	use gitsrc::CatObject;
-	let max = opts.max_stdout;
-	let deleted = change == Some(ChangeType::Deleted);
-	let objects: Vec<String> = if deleted {
-		parents.iter().map(|p| format!("{p}:{path}")).collect()
-	} else {
-		vec![format!("{sha}:{path}")]
-	};
-	let mut cat = git.cat_file_with(opts.clone())?;
-	let mut content = None;
-	for object in &objects {
-		match cat.read_object(object, max as u64)? {
-			CatObject::Missing => {}
-			CatObject::TooLarge { .. } => {
-				return Err(GitError::OutputLimit {
-					args: format!("cat-file {object}"),
-					limit: max,
-				})
-			}
-			CatObject::Found { body, .. } => {
-				content = decode_utf8_or_skip(body);
-				if content.is_some() {
-					break;
-				}
-			}
-		}
-	}
-	cat.close()?;
-	if deleted && content.is_none() {
-		content = Some(gitsrc::DELETED_FILE_MARKER.to_string());
-	}
-	let base = parents
-		.first()
-		.cloned()
-		.unwrap_or_else(|| EMPTY_TREE.into());
-	finish_preview(
+	let file = gitsrc::read_changed_file_for(
 		git,
-		vec![base, sha.to_string()],
+		source,
 		path,
-		content,
 		change,
+		parents,
+		opts.max_stdout as u64,
 		opts,
-	)
+	)?;
+	let revs = diff_revs(git, source, parents, opts)?;
+	finish_preview(git, revs, path, file.content, Some(change), opts)
+}
+
+/// What `git diff` compares for `source`. A commit's first parent comes from
+/// `parents` when the caller knows them.
+fn diff_revs(
+	git: &Git,
+	source: &GitSource,
+	parents: Option<&[String]>,
+	opts: &RunOptions,
+) -> Result<Vec<String>, GitError> {
+	Ok(match source {
+		GitSource::Working => {
+			vec![git.head_with(opts)?.unwrap_or_else(|| EMPTY_TREE.into())]
+		}
+		GitSource::Staged => vec!["--cached".into()],
+		GitSource::Commit(rev) => {
+			let (sha, first) = match parents {
+				Some(parents) => (rev.clone(), parents.first().cloned()),
+				None => {
+					let sha = git.resolve_commit_with(rev, opts)?;
+					let first =
+						git.parents_with(&sha, opts)?.into_iter().next();
+					(sha, first)
+				}
+			};
+			vec![first.unwrap_or_else(|| EMPTY_TREE.into()), sha]
+		}
+		GitSource::Range(base, tip) => vec![
+			git.resolve_commit_with(base, opts)?,
+			git.resolve_commit_with(tip, opts)?,
+		],
+	})
 }
 
 /// Runs the path's `diff` for `revs` and builds the preview around
@@ -1937,6 +1911,48 @@ mod tests {
 		let shallow = Git::open(&clone.path().join("c")).unwrap();
 		let snap = refs_with(&shallow, &opts).unwrap();
 		assert_eq!(snap.shallow, vec![snap.head.clone().unwrap()]);
+	}
+
+	#[test]
+	fn preview_for_a_listed_change_matches_the_listing_preview() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		fs::write(root.join("keep.txt"), "a\n").unwrap();
+		fs::write(root.join("gone.txt"), "old\n").unwrap();
+		let base = commit(root, "base");
+		fs::write(root.join("keep.txt"), "a\nb\n").unwrap();
+		fs::remove_file(root.join("gone.txt")).unwrap();
+		fs::write(root.join("new.txt"), "fresh\n").unwrap();
+		run(root, &["add", "-A"]);
+		let tip = commit(root, "change");
+		let git = Git::at_known_root(root.to_path_buf());
+		let opts = RunOptions::default();
+		for source in [
+			GitSource::Commit(tip.clone()),
+			GitSource::Range(base.clone(), tip.clone()),
+		] {
+			let parents = [base.clone()];
+			let parents =
+				matches!(source, GitSource::Commit(_)).then_some(&parents[..]);
+			let files =
+				gitsrc::list_changed_paths_with(&git, &source, &opts).unwrap();
+			assert_eq!(files.len(), 3);
+			for (path, change) in files {
+				let listed =
+					git_preview_with(&git, &source, &path, &opts).unwrap();
+				let known = git_preview_for(
+					&git,
+					&source,
+					&path,
+					change.unwrap(),
+					parents,
+					&opts,
+				)
+				.unwrap();
+				assert_eq!(listed, known, "{path}");
+			}
+		}
 	}
 
 	#[test]

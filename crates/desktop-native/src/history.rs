@@ -742,21 +742,22 @@ fn read_graph_page(
 	))
 }
 
-/// One path's preview. A commit from the log already carries its full SHA and
-/// parents, and the listing its change type, so that preview skips the
-/// re-resolution and re-listing [`browser::git_preview_with`] does.
+/// One path's preview. The change type comes from our own listing and a log
+/// row carries the commit's full SHA and parents, so the preview neither
+/// re-lists the source nor re-resolves the commit.
 fn read_preview(
 	git: &Git,
 	source: &GitSource,
 	path: &str,
-	known: Option<(&[String], Option<snip_core::format::ChangeType>)>,
+	change: Option<snip_core::format::ChangeType>,
+	parents: Option<&[String]>,
 	opts: &RunOptions,
 ) -> Result<browser::SourcePreview, String> {
-	let preview = match (source, known) {
-		(GitSource::Commit(sha), Some((parents, change))) => {
-			browser::commit_preview_with(git, sha, parents, path, change, opts)
+	let preview = match change {
+		Some(change) => {
+			browser::git_preview_for(git, source, path, change, parents, opts)
 		}
-		_ => browser::git_preview_with(git, source, path, opts),
+		None => browser::git_preview_with(git, source, path, opts),
 	};
 	preview
 		.map(|p| browser::SourcePreview {
@@ -1484,18 +1485,23 @@ impl WorkbenchModel {
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						let git = Git::open_with(&root, &opts)
-							.map_err(|e| e.to_string())?;
+						// The repository's root is known: no probe processes.
+						let git = Git::at_known_root(root);
 						let files = gitsrc::list_changed_paths_with(
 							&git, &source, &listing,
 						)
 						.map_err(|e| e.to_string())?;
 						let first = files.first().map(|(p, change)| {
-							let known =
-								parents.as_deref().map(|ps| (ps, *change));
 							(
 								p.clone(),
-								read_preview(&git, &source, p, known, &opts),
+								read_preview(
+									&git,
+									&source,
+									p,
+									*change,
+									parents.as_deref(),
+									&opts,
+								),
 							)
 						});
 						Ok::<_, String>((files, first))
@@ -1570,15 +1576,13 @@ impl WorkbenchModel {
 			),
 			_ => return,
 		};
-		let known = match &source {
-			GitSource::Commit(sha) => self.known_parents(sha).map(|parents| {
-				let change = self
-					.commit_files
-					.iter()
-					.find(|(p, _)| p == path)
-					.and_then(|(_, c)| *c);
-				(parents, change)
-			}),
+		let change = self
+			.commit_files
+			.iter()
+			.find(|(p, _)| p == path)
+			.and_then(|(_, c)| *c);
+		let parents = match &source {
+			GitSource::Commit(sha) => self.known_parents(sha),
 			_ => None,
 		};
 		let Some(root) = self.repo_root() else {
@@ -1607,11 +1611,15 @@ impl WorkbenchModel {
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						let git = Git::open_with(&root, &opts)
-							.map_err(|e| e.to_string())?;
-						let known =
-							known.as_ref().map(|(ps, c)| (ps.as_slice(), *c));
-						read_preview(&git, &source, &for_bg, known, &opts)
+						let git = Git::at_known_root(root);
+						read_preview(
+							&git,
+							&source,
+							&for_bg,
+							change,
+							parents.as_deref(),
+							&opts,
+						)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
