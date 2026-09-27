@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime};
 
+use crate::format::ChangeType;
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{Git, GitError};
 use crate::transfer::SourceKind;
@@ -198,6 +199,13 @@ impl DirectoryScan {
 			status,
 		})
 	}
+
+	/// Bytes this cursor retains in the process: the struct, the owned path
+	/// heap, and the directory handle. The C library's `DIR` buffer is not
+	/// visible to safe Rust, so it is not guessed.
+	pub fn retained_bytes(&self) -> usize {
+		std::mem::size_of::<Self>().saturating_add(self.path.capacity())
+	}
 }
 
 fn sort_entries(entries: &mut [ScanEntry]) {
@@ -245,15 +253,32 @@ pub struct DiscoveryPage {
 	pub status: ScanStatus,
 }
 
+/// Sibling directories held so their `.git` can be classified before any of
+/// those directories are listed. Past this bound the walk descends
+/// immediately. It is not a queue of every directory in a wide tree.
+const MAX_PENDING_DIRS: usize = 64;
+
+/// Repositories added when a search continues past [`ScanStatus::LimitReached`].
+pub const DISCOVERY_REPO_PAGE: usize = 256;
+
+struct DiscoveryFrame {
+	path: PathBuf,
+	iter: fs::ReadDir,
+	/// Directories in this folder whose `.git` was already classified.
+	pending: Vec<PathBuf>,
+}
+
 /// A resumable depth-first search for repositories below a root, including
 /// nested repositories, submodule checkouts and linked worktrees. Symlinks
-/// are not followed; found repositories are searched too. The only state
-/// kept between calls is one open directory per level, at most
-/// `max_depth + 1` ([`Discovery::retained`]): no queue of paths grows with
-/// the width of the tree. Declared but not checked out submodules have no
-/// `.git`; list them with [`declared_submodules`].
+/// are not followed; found repositories are searched too. Open directory
+/// handles stay at one per level, at most `max_depth + 1`
+/// ([`Discovery::retained`]). A directory's child repositories are recorded
+/// while that directory is listed, before their contents are read, using at
+/// most `MAX_PENDING_DIRS` (64) deferred paths per open directory. Declared but
+/// not checked out submodules have no `.git`; list them with
+/// [`declared_submodules`].
 pub struct Discovery {
-	stack: Vec<(PathBuf, fs::ReadDir)>,
+	stack: Vec<DiscoveryFrame>,
 	/// The root, until it is opened on the first call.
 	root: Option<PathBuf>,
 	max_depth: usize,
@@ -297,9 +322,56 @@ impl Discovery {
 		self.stack.len()
 	}
 
+	/// Rust storage retained between pages: this value, stack allocation,
+	/// each frame path and pending-path allocation, and the unopened root.
+	/// `ReadDir`'s opaque OS/libc buffers are not visible to safe Rust and are
+	/// excluded, as in [`DirectoryScan::retained_bytes`].
+	pub fn retained_bytes(&self) -> usize {
+		let mut bytes = std::mem::size_of::<Self>()
+			.saturating_add(self.root.as_ref().map_or(0, PathBuf::capacity))
+			.saturating_add(
+				self.stack
+					.capacity()
+					.saturating_mul(std::mem::size_of::<DiscoveryFrame>()),
+			);
+		for frame in &self.stack {
+			bytes = bytes.saturating_add(frame.path.capacity());
+			bytes = bytes.saturating_add(
+				frame
+					.pending
+					.capacity()
+					.saturating_mul(std::mem::size_of::<PathBuf>()),
+			);
+			for path in &frame.pending {
+				bytes = bytes.saturating_add(path.capacity());
+			}
+		}
+		bytes
+	}
+
+	/// Repositories recorded so far. This is not the number of open handles.
+	pub fn found_repos(&self) -> usize {
+		self.found
+	}
+
+	pub fn repo_limit(&self) -> usize {
+		self.max_repos
+	}
+
+	/// The walk can yield another page without starting over.
+	pub fn has_cursor(&self) -> bool {
+		self.root.is_some() || !self.stack.is_empty()
+	}
+
 	/// Lets a search that stopped at `LimitReached` continue where it was.
 	pub fn raise_repo_limit(&mut self, max_repos: usize) {
 		self.max_repos = self.max_repos.max(max_repos);
+	}
+
+	/// Continues a capped search by one repository page, from `found` rather
+	/// than from the number of open directory handles.
+	pub fn raise_found_page(&mut self) {
+		self.raise_repo_limit(self.found.saturating_add(DISCOVERY_REPO_PAGE));
 	}
 
 	fn error(
@@ -312,10 +384,57 @@ impl Discovery {
 		page.errors.push((path, e.to_string()));
 	}
 
-	fn enter(&mut self, dir: PathBuf, page: &mut DiscoveryPage) {
+	fn note_repo(&mut self, dir: &Path, page: &mut DiscoveryPage) {
+		if self.found >= self.max_repos {
+			return;
+		}
+		match classify_git(dir) {
+			Ok(Some(marker)) => {
+				page.repos.push(DiscoveredRepo {
+					path: dir.to_path_buf(),
+					marker,
+				});
+				self.found += 1;
+			}
+			Ok(None) => {}
+			// Missing `.git` is not a repository. Permission denied on the
+			// marker usually means the directory itself cannot be searched;
+			// opening it reports that once. Any other metadata error stays
+			// visible.
+			Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+			Err(e) => self.error(page, dir.join(".git"), &e),
+		}
+	}
+
+	fn open_frame(&mut self, dir: PathBuf, page: &mut DiscoveryPage) {
 		match fs::read_dir(&dir) {
-			Ok(iter) => self.stack.push((dir, iter)),
+			Ok(iter) => self.stack.push(DiscoveryFrame {
+				path: dir,
+				iter,
+				pending: Vec::new(),
+			}),
 			Err(e) => self.error(page, dir, &e),
+		}
+	}
+
+	fn queue_child(
+		&mut self,
+		child: PathBuf,
+		depth: usize,
+		page: &mut DiscoveryPage,
+	) {
+		if depth >= self.max_depth {
+			self.left_out = true;
+			page.depth_limited.push(child);
+			return;
+		}
+		let pending = self.stack.last().map(|f| f.pending.len()).unwrap_or(0);
+		if pending < MAX_PENDING_DIRS {
+			if let Some(frame) = self.stack.last_mut() {
+				frame.pending.push(child);
+			}
+		} else {
+			self.open_frame(child, page);
 		}
 	}
 
@@ -335,61 +454,96 @@ impl Discovery {
 				break stop;
 			}
 			if let Some(root) = self.root.take() {
-				self.enter(root, &mut page);
+				self.note_repo(&root, &mut page);
+				self.open_frame(root, &mut page);
+				if self.found >= self.max_repos {
+					break ScanStatus::LimitReached;
+				}
 				continue;
 			}
-			// The stack holds the root at depth 0.
-			let depth = self.stack.len().saturating_sub(1);
-			let Some((dir, iter)) = self.stack.last_mut() else {
-				break if self.left_out {
-					ScanStatus::Incomplete
-				} else {
-					ScanStatus::Complete
+			let step = {
+				let Some(frame) = self.stack.last_mut() else {
+					break if self.left_out {
+						ScanStatus::Incomplete
+					} else {
+						ScanStatus::Complete
+					};
 				};
+				if let Some(entry) = frame.iter.next() {
+					DiscoveryStep::Entry(entry)
+				} else if let Some(path) = frame.pending.pop() {
+					DiscoveryStep::Pending(path)
+				} else {
+					DiscoveryStep::Pop
+				}
 			};
-			let Some(entry) = iter.next() else {
-				self.stack.pop();
-				continue;
-			};
-			page.visited += 1;
-			let entry = match entry {
-				Ok(e) => e,
-				Err(e) => {
-					let dir = dir.clone();
+			match step {
+				DiscoveryStep::Pop => {
+					self.stack.pop();
+				}
+				DiscoveryStep::Pending(path) => {
+					let depth = self.stack.len().saturating_sub(1);
+					if depth >= self.max_depth {
+						self.left_out = true;
+						page.depth_limited.push(path);
+					} else {
+						self.open_frame(path, &mut page);
+					}
+				}
+				DiscoveryStep::Entry(Err(e)) => {
+					let dir = self
+						.stack
+						.last()
+						.map(|f| f.path.clone())
+						.unwrap_or_default();
 					self.error(&mut page, dir, &e);
-					continue;
 				}
-			};
-			let kind = match entry.file_type() {
-				Ok(k) => k,
-				Err(e) => {
-					self.error(&mut page, entry.path(), &e);
-					continue;
-				}
-			};
-			if entry.file_name() == OsStr::new(".git") {
-				let marker = if kind.is_dir() {
-					GitMarker::Directory
-				} else if kind.is_file() {
-					GitMarker::File
-				} else {
-					continue;
-				};
-				page.repos.push(DiscoveredRepo {
-					path: dir.clone(),
-					marker,
-				});
-				self.found += 1;
-			} else if kind.is_dir() {
-				if depth < self.max_depth {
-					self.enter(entry.path(), &mut page);
-				} else {
-					self.left_out = true;
-					page.depth_limited.push(entry.path());
+				DiscoveryStep::Entry(Ok(entry)) => {
+					page.visited += 1;
+					if entry.file_name() == OsStr::new(".git") {
+						continue;
+					}
+					let kind = match entry.file_type() {
+						Ok(k) => k,
+						Err(e) => {
+							self.error(&mut page, entry.path(), &e);
+							continue;
+						}
+					};
+					if !kind.is_dir() {
+						continue;
+					}
+					let child = entry.path();
+					let depth = self.stack.len().saturating_sub(1);
+					self.note_repo(&child, &mut page);
+					self.queue_child(child, depth, &mut page);
+					if self.found >= self.max_repos {
+						break ScanStatus::LimitReached;
+					}
 				}
 			}
 		};
 		page
+	}
+}
+
+// DirEntry is large on macOS and Windows, but each step is consumed within a
+// synchronous loop iteration, never retained or stacked recursively. Keeping
+// it inline avoids a heap allocation for every directory entry.
+#[allow(clippy::large_enum_variant)]
+enum DiscoveryStep {
+	Entry(io::Result<fs::DirEntry>),
+	Pending(PathBuf),
+	Pop,
+}
+
+fn classify_git(dir: &Path) -> Result<Option<GitMarker>, io::Error> {
+	match fs::symlink_metadata(dir.join(".git")) {
+		Ok(m) if m.is_dir() => Ok(Some(GitMarker::Directory)),
+		Ok(m) if m.is_file() => Ok(Some(GitMarker::File)),
+		Ok(_) => Ok(None),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+		Err(e) => Err(e),
 	}
 }
 
@@ -766,11 +920,98 @@ pub fn summarize(
 	})
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusDetails {
+	pub staged: Vec<(String, Option<ChangeType>)>,
+	pub unstaged: Vec<(String, Option<ChangeType>)>,
+	pub untracked: Vec<String>,
+	pub conflicted: Vec<String>,
+}
+
+/// Categorizes changed paths into Staged, Unstaged, Untracked, and Conflicted.
+pub fn status_details(
+	git: &Git,
+	opts: &RunOptions,
+) -> Result<StatusDetails, GitError> {
+	let out = git.run_with(
+		&[
+			"status",
+			"--porcelain=v2",
+			"-z",
+			"--untracked-files=normal",
+			"--no-renames",
+		],
+		&RunOptions {
+			overflow: crate::gitrun::Overflow::Error,
+			..opts.clone()
+		},
+	)?;
+	parse_status_details(&out.stdout)
+}
+
+fn parse_status_details(out: &[u8]) -> Result<StatusDetails, GitError> {
+	let bad = || GitError::Malformed("status --porcelain=v2 record".into());
+	let mut details = StatusDetails::default();
+	let mut records = out.split(|&b| b == 0).filter(|r| !r.is_empty());
+	while let Some(rec) = records.next() {
+		let text = String::from_utf8_lossy(rec);
+		if text.starts_with('#') || text.starts_with('!') {
+			continue;
+		}
+		if let Some(path) = text.strip_prefix("? ") {
+			details.untracked.push(path.to_string());
+		} else if let Some(rest) = text.strip_prefix("u ") {
+			let parts: Vec<&str> = rest.splitn(10, ' ').collect();
+			let path = parts.get(9).ok_or_else(bad)?;
+			details.conflicted.push(path.to_string());
+		} else if let Some(rest) = text.strip_prefix("1 ") {
+			let parts: Vec<&str> = rest.splitn(8, ' ').collect();
+			let xy = parts.first().ok_or_else(bad)?.as_bytes();
+			let path = parts.get(7).ok_or_else(bad)?;
+			let (&x, &y) =
+				(xy.first().ok_or_else(bad)?, xy.get(1).ok_or_else(bad)?);
+			if x != b'.' {
+				details.staged.push((
+					path.to_string(),
+					Some(crate::gitsrc::change_type_for_status(x)),
+				));
+			}
+			if y != b'.' {
+				details.unstaged.push((
+					path.to_string(),
+					Some(crate::gitsrc::change_type_for_status(y)),
+				));
+			}
+		} else if let Some(rest) = text.strip_prefix("2 ") {
+			let parts: Vec<&str> = rest.splitn(9, ' ').collect();
+			let xy = parts.first().ok_or_else(bad)?.as_bytes();
+			let path = parts.get(8).ok_or_else(bad)?;
+			let (&x, &y) =
+				(xy.first().ok_or_else(bad)?, xy.get(1).ok_or_else(bad)?);
+			if x != b'.' {
+				details.staged.push((
+					path.to_string(),
+					Some(crate::gitsrc::change_type_for_status(x)),
+				));
+			}
+			if y != b'.' {
+				details.unstaged.push((
+					path.to_string(),
+					Some(crate::gitsrc::change_type_for_status(y)),
+				));
+			}
+			records.next(); // skip origPath
+		}
+	}
+	Ok(details)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::path::PathBuf;
 	use std::process::Command;
-	use std::time::Duration;
+	use std::time::{Duration, Instant};
 
 	fn git(dir: &Path, args: &[&str]) -> String {
 		let out = Command::new("git")
@@ -804,6 +1045,45 @@ mod tests {
 		fs::write(dir.join(name), body).unwrap();
 		git(dir, &["add", name]);
 		git(dir, &["commit", "-qm", name]);
+	}
+
+	#[test]
+	fn discovery_retained_bytes_counts_cursor_paths_and_spare_stack_slots() {
+		let temp = tempfile::tempdir().unwrap();
+		let mut discovery = Discovery::new(temp.path(), 3, 10).unwrap();
+		let before = discovery.retained_bytes();
+		let old_root = discovery.root.as_ref().unwrap().capacity();
+		discovery.root.as_mut().unwrap().reserve(8192);
+		assert_eq!(
+			discovery.retained_bytes() - before,
+			discovery.root.as_ref().unwrap().capacity() - old_root
+		);
+		let mut path = PathBuf::with_capacity(2048);
+		path.push(temp.path());
+		let mut pending = Vec::with_capacity(7);
+		let mut child = PathBuf::with_capacity(4096);
+		child.push(temp.path().join("not-yet-opened"));
+		pending.push(child);
+		discovery.stack = Vec::with_capacity(3);
+		discovery.stack.push(DiscoveryFrame {
+			path,
+			iter: fs::read_dir(temp.path()).unwrap(),
+			pending,
+		});
+		let frame = &discovery.stack[0];
+		let frame_heap = frame.path.capacity()
+			+ frame.pending.capacity() * std::mem::size_of::<PathBuf>()
+			+ frame.pending.iter().map(PathBuf::capacity).sum::<usize>();
+		let after = discovery.retained_bytes();
+		discovery.stack.clear();
+		assert_eq!(after - discovery.retained_bytes(), frame_heap);
+		assert_eq!(
+			discovery.retained_bytes(),
+			std::mem::size_of::<Discovery>()
+				+ discovery.root.as_ref().unwrap().capacity()
+				+ discovery.stack.capacity()
+					* std::mem::size_of::<DiscoveryFrame>()
+		);
 	}
 
 	#[test]
@@ -1115,6 +1395,134 @@ mod tests {
 	}
 
 	#[test]
+	fn discovery_detects_repositories_before_large_content_traversal() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(dir.path()).unwrap();
+		let r1 = root.join("repo-1");
+		let r2 = root.join("repo-2");
+		init(&r1);
+		init(&r2);
+		let src = r1.join("src");
+		fs::create_dir(&src).unwrap();
+		for i in 0..200 {
+			fs::write(src.join(format!("file_{i}.txt")), b"x").unwrap();
+		}
+		let mut discovery = Discovery::new(&root, 4, 10).unwrap();
+		let page = discovery.next_page(&ScanBudget::visits(50));
+		assert!(page.repos.iter().any(|r| r.path == r1));
+	}
+
+	#[test]
+	fn discovery_records_every_sibling_repo_before_their_files() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(dir.path()).unwrap();
+		for i in 0..15 {
+			let repo = root.join(format!("repo-{i:02}"));
+			init(&repo);
+			let src = repo.join("src");
+			fs::create_dir(&src).unwrap();
+			for j in 0..80 {
+				fs::write(src.join(format!("f{j}.txt")), b"x").unwrap();
+			}
+		}
+		let mut discovery = Discovery::new(&root, 6, 100).unwrap();
+		let page = discovery.next_page(&ScanBudget::visits(40));
+		assert_eq!(page.repos.len(), 15, "{:?}", page.repos);
+		assert!(page.visited <= 40, "{}", page.visited);
+		assert_eq!(page.status, ScanStatus::More);
+		assert!(discovery.retained() <= 6 + 1);
+		let mut all = page.repos;
+		loop {
+			let next = discovery.next_page(&ScanBudget::visits(500));
+			all.extend(next.repos);
+			if next.status != ScanStatus::More {
+				assert_eq!(next.status, ScanStatus::Complete);
+				break;
+			}
+		}
+		assert_eq!(all.len(), 15, "a repository must be reported once");
+	}
+
+	#[test]
+	fn raise_found_page_uses_discovered_repos_not_open_handles() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(dir.path()).unwrap();
+		for name in ["r1", "r2", "r3"] {
+			init(&root.join(name));
+		}
+		let mut discovery = Discovery::new(&root, 2, 1).unwrap();
+		let first = discovery.next_page(&ScanBudget::visits(1000));
+		assert_eq!(first.status, ScanStatus::LimitReached);
+		assert_eq!(discovery.found_repos(), 1);
+		let handles = discovery.retained();
+		assert!(handles < 8, "{handles}");
+		discovery.raise_found_page();
+		assert_eq!(discovery.repo_limit(), 1 + DISCOVERY_REPO_PAGE);
+		assert!(discovery.repo_limit() > handles);
+		assert_eq!(discovery.found_repos(), 1);
+	}
+
+	/// The standard 15×10k dataset is not on CI. Run with
+	/// `--ignored standard_workload` and `SNIP_STANDARD_WORKLOAD_REQUIRED=1`.
+	#[test]
+	#[ignore = "local standard workload /tmp/snip-workload-standard-20260925"]
+	fn standard_workload_discovers_fifteen_repos_before_finishing() {
+		let root = PathBuf::from("/tmp/snip-workload-standard-20260925");
+		let required =
+			std::env::var_os("SNIP_STANDARD_WORKLOAD_REQUIRED").is_some();
+		if !root.join("workload_manifest.json").is_file() {
+			assert!(
+				!required,
+				"SNIP_STANDARD_WORKLOAD_REQUIRED but {root:?} is missing"
+			);
+			return;
+		}
+		let mut discovery = Discovery::new(&root, 8, 256).unwrap();
+		let mut repos = Vec::new();
+		let mut pages = 0usize;
+		let mut saw_fifteen_early = false;
+		let started = Instant::now();
+		loop {
+			let page = discovery.next_page(&ScanBudget::visits(2_000));
+			pages += 1;
+			assert!(page.visited <= 2_000, "{}", page.visited);
+			repos.extend(page.repos);
+			if repos.len() >= 15 && pages == 1 {
+				saw_fifteen_early = true;
+			}
+			assert!(
+				pages < 500,
+				"discovery did not finish after {pages} pages"
+			);
+			if page.status != ScanStatus::More {
+				assert!(
+					matches!(
+						page.status,
+						ScanStatus::Complete | ScanStatus::Incomplete
+					),
+					"{:?}",
+					page.status
+				);
+				break;
+			}
+		}
+		assert!(
+			saw_fifteen_early,
+			"fifteen repos must be recorded on the first bounded page, not after walking every file"
+		);
+		assert_eq!(
+			repos.len(),
+			15,
+			"each repository is reported once: {repos:?}"
+		);
+		let mut paths: Vec<_> =
+			repos.into_iter().map(|repo| repo.path).collect();
+		paths.sort();
+		assert_eq!(paths.len(), 15, "{paths:?}");
+		assert!(started.elapsed().as_secs() < 180, "walk took too long");
+	}
+
+	#[test]
 	fn declared_submodules_include_those_not_checked_out() {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dunce::canonicalize(dir.path()).unwrap();
@@ -1386,5 +1794,31 @@ mod tests {
 			summarize(&git, &tiny),
 			Err(GitError::OutputLimit { .. })
 		));
+	}
+
+	#[test]
+	fn status_details_categorizes_staged_unstaged_untracked_conflicted() {
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("r");
+		init(&repo);
+		commit_file(&repo, "tracked.txt", "base\n");
+		// Unstaged modification
+		std::fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
+		// Staged new file
+		std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+		git(&repo, &["add", "staged.txt"]);
+		// Untracked file
+		std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+
+		let git = Git::open(&repo).unwrap();
+		let details =
+			status_details(&git, &RunOptions::interactive(None)).unwrap();
+		assert_eq!(details.staged.len(), 1);
+		assert_eq!(details.staged[0].0, "staged.txt");
+		assert_eq!(details.unstaged.len(), 1);
+		assert_eq!(details.unstaged[0].0, "tracked.txt");
+		assert_eq!(details.untracked.len(), 1);
+		assert_eq!(details.untracked[0], "untracked.txt");
+		assert_eq!(details.conflicted.len(), 0);
 	}
 }

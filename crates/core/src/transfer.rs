@@ -3,6 +3,14 @@
 //! Provides pure/shared planning for exporting from and importing to Git repositories
 //! and workspace roots, preserving v1 wire format compatibility while enforcing
 //! explicit root mapping, conflict detection, cumulative bounded reads, and freshness validation.
+//!
+//! `plan_export_with`, `plan_import_with` and `CommitReplayPreview::capture_with`
+//! thread one `RunOptions` through read-only Git and freshness reads. Cancellation
+//! is `TransferError::Git(GitError::Cancelled)` and does not produce a plan.
+//! A regular-file `read` cannot be stopped mid-syscall; the token is polled before
+//! open, between chunks and after the read. A FIFO or other non-regular file is
+//! rejected before `open`. Confirmed `TransferImportPlan::apply` and
+//! `commits::replay` do not poll a cancel token.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -13,12 +21,13 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::commits::{self, CommitError, CommitsPayload};
+use crate::commits::{self, CommitError, CommitExport, CommitsPayload};
 use crate::filter;
 use crate::format::{
 	self, BorrowedPayloadOptions, ChangeType, ParsedEntry, PayloadFile,
 };
 use crate::fsutil::decode_utf8_or_skip;
+use crate::gitrun::{CancelToken, RunOptions, RunOutput};
 use crate::gitsrc::{
 	CatFile, CatObject, Git, GitError, DELETED_FILE_MARKER,
 	UNREADABLE_FILE_MARKER,
@@ -62,6 +71,12 @@ impl CanonicalRootId {
 
 	pub fn path(&self) -> &Path {
 		&self.0
+	}
+
+	/// Heap storage owned by this canonical path; the enclosing owner counts
+	/// the inline `CanonicalRootId` once. Uses capacity, including spare bytes.
+	pub fn retained_heap_bytes(&self) -> usize {
+		self.0.capacity()
 	}
 }
 
@@ -244,9 +259,13 @@ impl SourceFreshnessSnapshot {
 		}
 		validate_export_selection(selection)?;
 
+		let opts = RunOptions::default();
 		let mut repos = HashMap::new();
 		for root in &selection.roots {
-			repos.insert(root.clone(), capture_repo_freshness(root.path())?);
+			repos.insert(
+				root.clone(),
+				capture_repo_freshness(root.path(), &opts)?,
+			);
 		}
 
 		let mut frozen_commits = HashMap::new();
@@ -258,7 +277,7 @@ impl SourceFreshnessSnapshot {
 				| SourceKind::Unstaged
 				| SourceKind::File => {
 					let file_path = item.root.path().join(&item.relative_path);
-					let freshness = capture_file_freshness(&file_path)?;
+					let freshness = capture_file_freshness(&file_path, &opts)?;
 					working_files.insert(
 						(item.root.clone(), item.relative_path.clone()),
 						freshness,
@@ -269,8 +288,8 @@ impl SourceFreshnessSnapshot {
 					if let std::collections::hash_map::Entry::Vacant(e) =
 						frozen_commits.entry(key)
 					{
-						let git = Git::open(item.root.path())?;
-						let oid = git.resolve_commit(rev)?;
+						let git = Git::open_with(item.root.path(), &opts)?;
+						let oid = git.resolve_commit_with(rev, &opts)?;
 						e.insert(oid);
 					}
 				}
@@ -286,13 +305,25 @@ impl SourceFreshnessSnapshot {
 	}
 
 	pub fn revalidate(&self) -> Result<(), TransferError> {
+		self.revalidate_with(&RunOptions::default())
+	}
+
+	/// Revalidates with the caller's runner options so a cancel token is still
+	/// honored immediately before the clipboard handoff.
+	pub fn revalidate_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<(), TransferError> {
+		cancelled_err(opts, "revalidate-source")?;
 		for (root, prev_repo) in &self.repos {
-			revalidate_repo_freshness(root.path(), prev_repo)?;
+			cancelled_err(opts, "revalidate-source")?;
+			revalidate_repo_freshness(root.path(), prev_repo, opts)?;
 		}
 
 		for ((root, rel), prev_file) in &self.working_files {
+			cancelled_err(opts, "revalidate-source")?;
 			let file_path = root.path().join(rel);
-			let current = capture_file_freshness(&file_path)?;
+			let current = capture_file_freshness(&file_path, opts)?;
 			if current != *prev_file {
 				return Err(TransferError::StaleSource {
 					root: root.path().to_path_buf(),
@@ -323,7 +354,15 @@ pub struct ExportPlan {
 impl ExportPlan {
 	/// Revalidates freshness right before clipboard writing.
 	pub fn revalidate(&self) -> Result<(), TransferError> {
-		self.freshness.revalidate()
+		self.revalidate_with(&RunOptions::default())
+	}
+
+	/// [`ExportPlan::revalidate`] with the caller's cancel token and limits.
+	pub fn revalidate_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<(), TransferError> {
+		self.freshness.revalidate_with(opts)
 	}
 }
 
@@ -403,20 +442,69 @@ pub struct DestinationFreshnessSnapshot {
 }
 
 impl DestinationFreshnessSnapshot {
+	/// Capacity estimate ONLY for fresh insertion-only capture tables below.
+	/// Removal/tombstones can make HashMap::capacity understate its buckets;
+	/// this is deliberately private, not an estimator for arbitrary public maps.
+	fn fresh_capture_heap_bytes(&self) -> usize {
+		let mut bytes = fresh_capture_table_bytes::<
+			CanonicalRootId,
+			RepoFreshness,
+		>(self.roots.capacity())
+		.saturating_add(fresh_capture_table_bytes::<
+			PathBuf,
+			TargetFileFreshness,
+		>(self.target_files.capacity()));
+		for (root, state) in &self.roots {
+			bytes = bytes
+				.saturating_add(root.0.capacity())
+				.saturating_add(
+					state.head_commit.as_ref().map_or(0, String::capacity),
+				)
+				.saturating_add(
+					state.head_ref.as_ref().map_or(0, String::capacity),
+				);
+		}
+		for (path, state) in &self.target_files {
+			bytes = bytes
+				.saturating_add(path.capacity())
+				.saturating_add(state.root.0.capacity())
+				.saturating_add(state.relative_path.capacity());
+		}
+		bytes
+	}
+
 	pub fn capture(
 		destination_roots: &[PathBuf],
 		plan: &RestorePlan,
 	) -> Result<Self, TransferError> {
+		Self::capture_with(destination_roots, plan, &RunOptions::default())
+	}
+
+	/// [`Self::capture`] with the caller's runner options.
+	///
+	/// Git open, HEAD, the symbolic ref, the index hash and each target hash
+	/// use `opts`. The token is polled before every root and target. One
+	/// freshness chunk is at most 8 KiB and cannot be interrupted mid-read.
+	pub fn capture_with(
+		destination_roots: &[PathBuf],
+		plan: &RestorePlan,
+		opts: &RunOptions,
+	) -> Result<Self, TransferError> {
+		cancelled_err(opts, "import-freshness")?;
+		// Fresh tables, insertion only: preserve this creation invariant for
+		// fresh_capture_heap_bytes. Do not reuse a previously edited snapshot.
 		let mut roots = HashMap::new();
 		for root in destination_roots {
+			cancelled_err(opts, "import-freshness")?;
 			let id = CanonicalRootId::new(root)?;
 			id.validate()?;
-			roots.insert(id, capture_repo_freshness(root)?);
+			roots.insert(id, capture_repo_freshness(root, opts)?);
 		}
 
 		let mut target_files = HashMap::new();
 		for op in &plan.create_operations {
-			let file_state = capture_file_freshness(&op.absolute_path)?;
+			cancelled_err(opts, "import-freshness")?;
+			let file_state = capture_file_freshness(&op.absolute_path, opts)?;
 			target_files.insert(
 				op.absolute_path.clone(),
 				TargetFileFreshness {
@@ -429,7 +517,8 @@ impl DestinationFreshnessSnapshot {
 		}
 
 		for op in &plan.delete_operations {
-			let file_state = capture_file_freshness(&op.absolute_path)?;
+			cancelled_err(opts, "import-freshness")?;
+			let file_state = capture_file_freshness(&op.absolute_path, opts)?;
 			let parent = op.absolute_path.parent().unwrap_or(&op.absolute_path);
 			target_files.insert(
 				op.absolute_path.clone(),
@@ -442,6 +531,50 @@ impl DestinationFreshnessSnapshot {
 			);
 		}
 
+		cancelled_err(opts, "import-freshness")?;
+		Ok(Self {
+			roots,
+			target_files,
+		})
+	}
+
+	/// Records repo HEAD/ref/index plus each target path's bytes or absence.
+	/// Absence is a snapshot: a path that appears after preview is stale.
+	///
+	/// File reads use the cancellable freshness helpers with default runner
+	/// options. Replay snapshots hash a symlink's own link text instead.
+	pub fn capture_paths(
+		destination_roots: &[PathBuf],
+		targets: &[(PathBuf, String)],
+	) -> Result<Self, TransferError> {
+		let opts = RunOptions::default();
+		let mut roots = HashMap::new();
+		for root in destination_roots {
+			let id = CanonicalRootId::new(root)?;
+			id.validate()?;
+			roots.insert(id, capture_repo_freshness(root, &opts)?);
+		}
+
+		let mut target_files = HashMap::new();
+		for (abs, rel) in targets {
+			let file_state = capture_file_freshness(abs, &opts)?;
+			let existed = file_state.is_some();
+			let root_path = destination_roots
+				.iter()
+				.find(|r| abs.starts_with(r))
+				.cloned()
+				.unwrap_or_else(|| abs.parent().unwrap_or(abs).to_path_buf());
+			target_files.insert(
+				abs.clone(),
+				TargetFileFreshness {
+					root: CanonicalRootId::new(&root_path)?,
+					relative_path: rel.clone(),
+					existed,
+					file_state,
+				},
+			);
+		}
+
 		Ok(Self {
 			roots,
 			target_files,
@@ -449,8 +582,13 @@ impl DestinationFreshnessSnapshot {
 	}
 
 	pub fn revalidate(&self) -> Result<(), TransferError> {
+		let opts = RunOptions::default();
 		for (root, prev_repo) in &self.roots {
-			revalidate_destination_repo_freshness(root.path(), prev_repo)?;
+			revalidate_destination_repo_freshness(
+				root.path(),
+				prev_repo,
+				&opts,
+			)?;
 		}
 
 		for (path, target) in &self.target_files {
@@ -474,7 +612,7 @@ impl DestinationFreshnessSnapshot {
 				});
 			}
 			if target.existed && current_exists {
-				let current_state = capture_file_freshness(path)?;
+				let current_state = capture_file_freshness(path, &opts)?;
 				if current_state != target.file_state {
 					return Err(TransferError::StaleDestination {
 						root: target.root.path().to_path_buf(),
@@ -500,6 +638,21 @@ pub struct TransferImportPlan {
 }
 
 impl TransferImportPlan {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. The private snapshot is captured into fresh insertion-only
+	/// maps and is never mutated, as required by its table-size estimate.
+	pub fn retained_heap_bytes(&self) -> usize {
+		let mut bytes = self.roots.capacity() * std::mem::size_of::<PathBuf>();
+		for root in &self.roots {
+			bytes = bytes.saturating_add(root.capacity());
+		}
+		bytes
+			.saturating_add(self.restore_plan.retained_heap_bytes())
+			.saturating_add(
+				self.destination_freshness.fresh_capture_heap_bytes(),
+			)
+	}
+
 	pub fn roots(&self) -> &[PathBuf] {
 		&self.roots
 	}
@@ -542,6 +695,26 @@ impl TransferImportPlan {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Conservative requested table bytes for std's current SwissTable, for
+/// insertion-only captures. A fresh table has at least half its buckets in
+/// capacity (small tables leave one free; large tables leave one eighth).
+/// Two buckets per capacity slot therefore overestimates storage. Include a
+/// control byte per bucket, a trailing control group and alignment padding.
+/// The supported std targets use groups at most 16 bytes wide; 64 is a
+/// conservative allowance. This is not allocator usable-size/RSS accounting
+/// and MUST be revisited if std changes its HashMap layout.
+fn fresh_capture_table_bytes<K, V>(capacity: usize) -> usize {
+	if capacity == 0 {
+		return 0;
+	}
+	let alignment = std::mem::align_of::<(K, V)>().max(64);
+	capacity
+		.saturating_mul(2)
+		.saturating_mul(std::mem::size_of::<(K, V)>().saturating_add(1))
+		.saturating_add(64)
+		.saturating_add(alignment - 1)
+}
+
 fn not_found_as_none<T>(
 	res: io::Result<T>,
 ) -> Result<Option<T>, TransferError> {
@@ -552,23 +725,264 @@ fn not_found_as_none<T>(
 	}
 }
 
-fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
-	let mut file = fs::File::open(path)?;
-	let mut hasher = Sha256::new();
-	let mut buf = [0u8; 8192];
+/// Longest regular-file read that cannot observe cancellation. The kernel
+/// does not interrupt an in-progress `read`; callers poll between chunks.
+const FILE_IO_CHUNK: usize = 8 * 1024;
+
+fn cancelled_err(opts: &RunOptions, args: &str) -> Result<(), TransferError> {
+	if opts.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+		Err(GitError::Cancelled {
+			args: args.to_string(),
+		}
+		.into())
+	} else {
+		Ok(())
+	}
+}
+
+/// Preview truncation is not metadata. A short `RunOptions` must surface
+/// [`GitError::OutputLimit`] instead of a parsed prefix.
+fn strict_git_stdout<'a>(
+	out: &'a RunOutput,
+	opts: &RunOptions,
+	args: &str,
+) -> Result<&'a [u8], TransferError> {
+	if out.truncated {
+		return Err(GitError::OutputLimit {
+			args: args.to_string(),
+			limit: opts.max_stdout,
+		}
+		.into());
+	}
+	Ok(out.stdout.as_slice())
+}
+
+/// Rejects anything that is not a regular file, or a symlink to one, before
+/// [`File::open`](fs::File::open). `stat` does not block on a FIFO; `open` does.
+fn ensure_regular_file(path: &Path) -> Result<(), TransferError> {
+	let listed = fs::symlink_metadata(path)?;
+	let target = if listed.file_type().is_symlink() {
+		fs::metadata(path)?
+	} else {
+		listed
+	};
+	if target.file_type().is_file() {
+		Ok(())
+	} else {
+		Err(TransferError::SpecialFile(
+			path.to_string_lossy().into_owned(),
+		))
+	}
+}
+
+/// Reads at most `max_bytes` (`None` means the whole stream). Each `read`
+/// slice is only the remaining cap, so a one-byte overflow probe never pulls
+/// a full chunk it will discard. The token is checked before every read and
+/// after the last one.
+fn read_limited<R: Read>(
+	reader: &mut R,
+	max_bytes: Option<u64>,
+	opts: &RunOptions,
+	label: &str,
+	mut on_chunk: impl FnMut(&[u8]),
+) -> Result<u64, TransferError> {
+	let mut buf = [0u8; FILE_IO_CHUNK];
+	let mut total = 0u64;
 	loop {
-		let n = file.read(&mut buf)?;
+		cancelled_err(opts, label)?;
+		let want = match max_bytes {
+			Some(max) if total >= max => break,
+			Some(max) => (max - total) as usize,
+			None => FILE_IO_CHUNK,
+		};
+		let want = want.min(FILE_IO_CHUNK);
+		if want == 0 {
+			break;
+		}
+		let n = reader.read(&mut buf[..want])?;
 		if n == 0 {
 			break;
 		}
-		hasher.update(&buf[..n]);
+		on_chunk(&buf[..n]);
+		total += n as u64;
 	}
+	cancelled_err(opts, label)?;
+	Ok(total)
+}
+
+/// Opens `path` only after [`ensure_regular_file`], then uses [`read_limited`].
+fn for_each_chunk(
+	path: &Path,
+	max_bytes: Option<u64>,
+	opts: &RunOptions,
+	label: &str,
+	on_chunk: impl FnMut(&[u8]),
+) -> Result<u64, TransferError> {
+	cancelled_err(opts, label)?;
+	ensure_regular_file(path)?;
+	let mut file = fs::File::open(path)?;
+	cancelled_err(opts, label)?;
+	read_limited(&mut file, max_bytes, opts, label, on_chunk)
+}
+
+fn hash_file(
+	path: &Path,
+	opts: &RunOptions,
+) -> Result<[u8; 32], TransferError> {
+	let mut hasher = Sha256::new();
+	for_each_chunk(path, None, opts, "hash-file", |chunk| {
+		#[cfg(test)]
+		note_hash_chunk(path, chunk);
+		hasher.update(chunk);
+	})?;
 	Ok(hasher.finalize().into())
+}
+
+/// Test-only record of one `hash_file` chunk. Production builds omit it.
+#[cfg(test)]
+struct HashChunkNote {
+	path: PathBuf,
+	len: usize,
+	head: [u8; 4],
+}
+
+#[cfg(test)]
+struct HashProbe {
+	arm: PathBuf,
+	cancel: CancelToken,
+	notes: Vec<HashChunkNote>,
+}
+
+#[cfg(test)]
+thread_local! {
+	static HASH_PROBE: std::cell::RefCell<Option<HashProbe>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct HashProbeGuard;
+
+#[cfg(test)]
+impl Drop for HashProbeGuard {
+	fn drop(&mut self) {
+		HASH_PROBE.with(|slot| *slot.borrow_mut() = None);
+	}
+}
+
+/// Arms a thread-local probe. The first chunk of `arm` cancels `cancel`.
+/// Other paths, including the Git index, are recorded and left running.
+#[cfg(test)]
+fn arm_hash_probe(arm: PathBuf, cancel: CancelToken) -> HashProbeGuard {
+	HASH_PROBE.with(|slot| {
+		*slot.borrow_mut() = Some(HashProbe {
+			arm,
+			cancel,
+			notes: Vec::new(),
+		});
+	});
+	HashProbeGuard
+}
+
+#[cfg(test)]
+fn hash_probe_notes() -> Vec<HashChunkNote> {
+	HASH_PROBE.with(|slot| {
+		slot.borrow()
+			.as_ref()
+			.map(|probe| {
+				probe
+					.notes
+					.iter()
+					.map(|note| HashChunkNote {
+						path: note.path.clone(),
+						len: note.len,
+						head: note.head,
+					})
+					.collect()
+			})
+			.unwrap_or_default()
+	})
+}
+
+#[cfg(test)]
+fn note_hash_chunk(path: &Path, chunk: &[u8]) {
+	HASH_PROBE.with(|slot| {
+		let mut guard = slot.borrow_mut();
+		let Some(probe) = guard.as_mut() else {
+			return;
+		};
+		let mut head = [0u8; 4];
+		let n = chunk.len().min(4);
+		head[..n].copy_from_slice(&chunk[..n]);
+		let is_arm = path == probe.arm;
+		probe.notes.push(HashChunkNote {
+			path: path.to_path_buf(),
+			len: chunk.len(),
+			head,
+		});
+		if is_arm
+			&& probe
+				.notes
+				.iter()
+				.filter(|note| note.path == probe.arm)
+				.count() == 1
+		{
+			probe.cancel.cancel();
+		}
+	});
+}
+
+#[cfg(test)]
+struct FinalBoundaryProbe {
+	target_stage: &'static str,
+	token: CancelToken,
+}
+
+#[cfg(test)]
+thread_local! {
+	static FINAL_BOUNDARY_PROBE: std::cell::RefCell<Option<FinalBoundaryProbe>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct FinalBoundaryGuard;
+
+#[cfg(test)]
+impl Drop for FinalBoundaryGuard {
+	fn drop(&mut self) {
+		FINAL_BOUNDARY_PROBE.with(|slot| *slot.borrow_mut() = None);
+	}
+}
+
+#[cfg(test)]
+fn arm_final_boundary_cancel(
+	target_stage: &'static str,
+	token: CancelToken,
+) -> FinalBoundaryGuard {
+	FINAL_BOUNDARY_PROBE.with(|slot| {
+		*slot.borrow_mut() = Some(FinalBoundaryProbe {
+			target_stage,
+			token,
+		});
+	});
+	FinalBoundaryGuard
+}
+
+#[cfg(test)]
+fn final_boundary_cancel_hook(stage: &'static str) {
+	FINAL_BOUNDARY_PROBE.with(|slot| {
+		if let Some(probe) = slot.borrow().as_ref() {
+			if probe.target_stage == stage {
+				probe.token.cancel();
+			}
+		}
+	});
 }
 
 fn capture_file_freshness(
 	path: &Path,
+	opts: &RunOptions,
 ) -> Result<Option<FileFreshness>, TransferError> {
+	cancelled_err(opts, "hash-file")?;
 	let sym_meta = match not_found_as_none(fs::symlink_metadata(path))? {
 		Some(m) => m,
 		None => return Ok(None),
@@ -589,7 +1003,7 @@ fn capture_file_freshness(
 	}
 	let size = target_meta.len();
 	let mtime = target_meta.modified()?;
-	let content_hash = hash_file(path)?;
+	let content_hash = hash_file(path, opts)?;
 	Ok(Some(FileFreshness {
 		size,
 		mtime,
@@ -597,8 +1011,12 @@ fn capture_file_freshness(
 	}))
 }
 
-fn capture_repo_freshness(root: &Path) -> Result<RepoFreshness, TransferError> {
-	let git = match Git::open(root) {
+fn capture_repo_freshness(
+	root: &Path,
+	opts: &RunOptions,
+) -> Result<RepoFreshness, TransferError> {
+	cancelled_err(opts, "plan-export")?;
+	let git = match Git::open_with(root, opts) {
 		Ok(g) => g,
 		Err(GitError::NotARepository(_)) => {
 			return Ok(RepoFreshness {
@@ -611,19 +1029,24 @@ fn capture_repo_freshness(root: &Path) -> Result<RepoFreshness, TransferError> {
 	};
 
 	// Unborn and detached are answers; any other Git failure is an error.
-	let head_commit = git.head()?;
-	let head_ref = git.head_ref()?;
+	let head_commit = git.head_with(opts)?;
+	let head_ref = git.head_ref_with(opts)?;
 
-	let index_hash = match git.run(&["rev-parse", "--git-path", "index"]) {
+	let index_hash = match git
+		.run_with(&["rev-parse", "--git-path", "index"], opts)
+	{
 		Ok(out) => {
-			let git_path_str = String::from_utf8_lossy(&out).trim().to_string();
+			let stdout =
+				strict_git_stdout(&out, opts, "rev-parse --git-path index")?;
+			let git_path_str =
+				String::from_utf8_lossy(stdout).trim().to_string();
 			let index_path = if Path::new(&git_path_str).is_absolute() {
 				PathBuf::from(git_path_str)
 			} else {
 				git.root().join(git_path_str)
 			};
 			if not_found_as_none(fs::metadata(&index_path))?.is_some() {
-				Some(hash_file(&index_path)?)
+				Some(hash_file(&index_path, opts)?)
 			} else {
 				None
 			}
@@ -641,8 +1064,9 @@ fn capture_repo_freshness(root: &Path) -> Result<RepoFreshness, TransferError> {
 fn revalidate_repo_freshness(
 	root: &Path,
 	prev: &RepoFreshness,
+	opts: &RunOptions,
 ) -> Result<(), TransferError> {
-	let current = capture_repo_freshness(root)?;
+	let current = capture_repo_freshness(root, opts)?;
 	if current.head_commit != prev.head_commit {
 		return Err(TransferError::StaleSource {
 			root: root.to_path_buf(),
@@ -675,8 +1099,9 @@ fn revalidate_repo_freshness(
 fn revalidate_destination_repo_freshness(
 	root: &Path,
 	prev: &RepoFreshness,
+	opts: &RunOptions,
 ) -> Result<(), TransferError> {
-	let current = capture_repo_freshness(root)?;
+	let current = capture_repo_freshness(root, opts)?;
 	if current.head_commit != prev.head_commit {
 		return Err(TransferError::StaleDestination {
 			root: root.to_path_buf(),
@@ -882,7 +1307,10 @@ fn read_blob_bounded(
 	spec: &str,
 	wire_path: &str,
 	budget: &BlobBudget,
+	opts: &RunOptions,
 ) -> Result<Option<ReadContent>, TransferError> {
+	// A cancelled blob read is not a skip and not an unreadable marker.
+	cancelled_err(opts, "cat-file --batch")?;
 	// Integer sizes: `size > floor(limit)` is exactly `size > limit`.
 	let per_file = (budget.max_file_size_kb * 1024.0) as u64;
 	let mut cap = budget.remaining_budget.map_or(u64::MAX, |b| b as u64);
@@ -931,15 +1359,19 @@ impl BlobReader {
 		&mut self,
 		root: &CanonicalRootId,
 		gits: &HashMap<CanonicalRootId, Git>,
+		opts: &RunOptions,
 	) -> Result<&mut CatFile, TransferError> {
 		if self.open.as_ref().is_some_and(|(r, _)| r != root) {
 			self.close()?;
 		}
 		if self.open.is_none() {
+			cancelled_err(opts, "cat-file --batch")?;
 			let git = gits.get(root).ok_or_else(|| {
 				TransferError::UnknownRoot(root.path().to_path_buf())
 			})?;
-			self.open = Some((root.clone(), git.cat_file()?));
+			// Other Git calls must already have finished: this session holds
+			// the thread's only runner slot until [`BlobReader::close`].
+			self.open = Some((root.clone(), git.cat_file_with(opts.clone())?));
 		}
 		match self.open.as_mut() {
 			Some((_, cat)) => Ok(cat),
@@ -978,6 +1410,57 @@ fn make_payload_opts<'a, 'f>(
 	}
 }
 
+/// Same bytes as [`format::write_payload_borrowed`], polling cancel between files.
+fn write_export_payload<W: std::fmt::Write>(
+	w: &mut W,
+	payload_opts: &BorrowedPayloadOptions<'_, '_>,
+	opts: &RunOptions,
+) -> Result<(), TransferError> {
+	cancelled_err(opts, "serialize-export")?;
+	let mut writer = format::PayloadLineWriter::new(w);
+	let custom = format::HeaderPattern::new(payload_opts.header_format);
+	let custom = custom.as_ref();
+	format::write_payload_envelope(&mut writer, payload_opts, custom)
+		.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
+	for file in payload_opts.files {
+		cancelled_err(opts, "serialize-export")?;
+		format::write_payload_file(
+			&mut writer,
+			file,
+			payload_opts.header_format,
+			payload_opts.add_extra_line_between_files,
+			custom,
+		)
+		.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
+	}
+	cancelled_err(opts, "serialize-export")?;
+	format::write_payload_footer(&mut writer, payload_opts, custom)
+		.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
+	Ok(())
+}
+
+/// Closes a cat-file session before the caller observes success. Cleanup
+/// errors win over a plan; `Drop` is not treated as a successful close.
+fn finish_reader<T>(
+	blobs: &mut BlobReader,
+	outcome: Result<T, TransferError>,
+) -> Result<T, TransferError> {
+	match blobs.close() {
+		Ok(()) => outcome,
+		Err(close_err) => {
+			let cleanup = matches!(
+				close_err,
+				TransferError::Git(GitError::Cleanup { .. })
+			);
+			if cleanup || outcome.is_ok() {
+				Err(close_err)
+			} else {
+				outcome
+			}
+		}
+	}
+}
+
 /// Plans and generates an export payload across one or multiple repositories.
 /// Freezes revisions once, enforces cumulative budget before retention, and revalidates freshness.
 pub fn plan_export(
@@ -985,12 +1468,32 @@ pub fn plan_export(
 	settings: &Settings,
 	max_payload_bytes: Option<usize>,
 ) -> Result<ExportPlan, TransferError> {
+	plan_export_with(
+		selection,
+		settings,
+		max_payload_bytes,
+		&RunOptions::default(),
+	)
+}
+
+/// [`plan_export`] with the caller's runner options. `opts.cancel` is polled
+/// through Git, bounded file reads, serialization and the final revalidation.
+/// Cancellation returns `TransferError::Git(GitError::Cancelled)` and never a
+/// partially usable plan.
+pub fn plan_export_with(
+	selection: &ExportSelection,
+	settings: &Settings,
+	max_payload_bytes: Option<usize>,
+	opts: &RunOptions,
+) -> Result<ExportPlan, TransferError> {
+	cancelled_err(opts, "plan-export")?;
 	validate_export_selection(selection)?;
 
 	// Freeze repo freshness and revisions once upfront (without hashing working files)
 	let mut repos = HashMap::new();
 	for root in &selection.roots {
-		repos.insert(root.clone(), capture_repo_freshness(root.path())?);
+		cancelled_err(opts, "plan-export")?;
+		repos.insert(root.clone(), capture_repo_freshness(root.path(), opts)?);
 	}
 
 	// Every Git call except blob reads happens here, before a cat-file
@@ -1002,7 +1505,7 @@ pub fn plan_export(
 		if !needs_git || gits.contains_key(&item.root) {
 			continue;
 		}
-		match Git::open(item.root.path()) {
+		match Git::open_with(item.root.path(), opts) {
 			Ok(git) => {
 				gits.insert(item.root.clone(), git);
 			}
@@ -1012,14 +1515,9 @@ pub fn plan_export(
 			Err(e) => return Err(e.into()),
 		}
 	}
-	let git_for = |root: &CanonicalRootId| {
-		gits.get(root).ok_or_else(|| {
-			TransferError::UnknownRoot(root.path().to_path_buf())
-		})
-	};
-
 	let mut frozen_commits = HashMap::new();
 	// Frozen commit -> its first parent, where deleted files are read.
+	// Resolved before any cat-file session so this thread does not nest Git.
 	let mut first_parents: HashMap<String, Option<String>> = HashMap::new();
 	for item in &selection.items {
 		if let SourceKind::Commit { rev } = &item.source {
@@ -1027,470 +1525,498 @@ pub fn plan_export(
 			if let std::collections::hash_map::Entry::Vacant(e) =
 				frozen_commits.entry(key)
 			{
-				let git = git_for(&item.root)?;
-				let oid = git.resolve_commit(rev)?;
-				let parent = git.parents(&oid)?.into_iter().next();
+				let git = gits.get(&item.root).ok_or_else(|| {
+					TransferError::UnknownRoot(item.root.path().to_path_buf())
+				})?;
+				let oid = git.resolve_commit_with(rev, opts)?;
+				let parent = git.parents_with(&oid, opts)?.into_iter().next();
 				first_parents.insert(oid.clone(), parent);
 				e.insert(oid);
 			}
 		}
 	}
 	let mut blobs = BlobReader::default();
+	let outcome = (|| -> Result<ExportPlan, TransferError> {
+		let mut working_files = HashMap::new();
 
-	let mut working_files = HashMap::new();
+		let primary = selection
+			.primary_root
+			.clone()
+			.or_else(|| selection.roots.first().cloned());
 
-	let primary = selection
-		.primary_root
-		.clone()
-		.or_else(|| selection.roots.first().cloned());
+		// Commit selections begin with fallback = true (omitting empty wrappers);
+		// Staged and Deleted only trigger fallback once an included entry is admitted.
+		let is_commit = selection
+			.items
+			.iter()
+			.any(|item| matches!(item.source, SourceKind::Commit { .. }));
+		let mut fallback = is_commit;
 
-	// Commit selections begin with fallback = true (omitting empty wrappers);
-	// Staged and Deleted only trigger fallback once an included entry is admitted.
-	let is_commit = selection
-		.items
-		.iter()
-		.any(|item| matches!(item.source, SourceKind::Commit { .. }));
-	let mut fallback = is_commit;
+		let default_source_root = if selection.roots.len() == 1 {
+			paths::source_root_name(&[selection.roots[0].path()])
+		} else {
+			None
+		};
 
-	let default_source_root = if selection.roots.len() == 1 {
-		paths::source_root_name(&[selection.roots[0].path()])
-	} else {
-		None
-	};
+		let custom_pattern =
+			format::HeaderPattern::new(&settings.header_format);
+		let custom = custom_pattern.as_ref();
 
-	let custom_pattern = format::HeaderPattern::new(&settings.header_format);
-	let custom = custom_pattern.as_ref();
+		let mut initial_counter = format::CountingWriter::default();
+		let mut initial_writer =
+			format::PayloadLineWriter::new(&mut initial_counter);
+		format::write_payload_envelope(
+			&mut initial_writer,
+			&make_payload_opts(
+				settings,
+				default_source_root.as_deref(),
+				&[],
+				!fallback,
+			),
+			custom,
+		)
+		.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
 
-	let mut initial_counter = format::CountingWriter::default();
-	let mut initial_writer =
-		format::PayloadLineWriter::new(&mut initial_counter);
-	format::write_payload_envelope(
-		&mut initial_writer,
-		&make_payload_opts(
-			settings,
-			default_source_root.as_deref(),
-			&[],
-			!fallback,
-		),
-		custom,
-	)
-	.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
+		format::write_payload_footer(
+			&mut initial_writer,
+			&make_payload_opts(
+				settings,
+				default_source_root.as_deref(),
+				&[],
+				!fallback,
+			),
+			custom,
+		)
+		.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
 
-	format::write_payload_footer(
-		&mut initial_writer,
-		&make_payload_opts(
-			settings,
-			default_source_root.as_deref(),
-			&[],
-			!fallback,
-		),
-		custom,
-	)
-	.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
+		let mut current_total_bytes = initial_counter.count;
 
-	let mut current_total_bytes = initial_counter.count;
-
-	if let Some(max_bytes) = max_payload_bytes {
-		if current_total_bytes > max_bytes {
-			return Err(TransferError::PayloadLimitExceeded {
+		if let Some(max_bytes) = max_payload_bytes {
+			if current_total_bytes > max_bytes {
+				return Err(TransferError::PayloadLimitExceeded {
 				limit: max_bytes,
 				actual: current_total_bytes,
 				reason:
 					"serialized wrapper overhead (pre/post-text, markers) exceeds payload budget"
 						.to_string(),
 			});
-		}
-	}
-
-	let mut files = Vec::new();
-	let mut copied_file_count = 0usize;
-	let mut skipped_file_size_count = 0usize;
-	let mut skipped_unreadable_count = 0usize;
-	let mut file_limit_reached = false;
-
-	for item in &selection.items {
-		let is_primary = primary.as_ref() == Some(&item.root);
-		let wire_path = if is_primary {
-			item.relative_path.clone()
-		} else {
-			let prefix = root_basename(item.root.path());
-			format!("{prefix}/{}", item.relative_path)
-		};
-
-		let absolute = item.root.path().join(&item.relative_path);
-
-		// Parity check:
-		// File mode (copy.rs): count limit checked BEFORE filtering candidate.
-		// Git sources (gitsrc.rs): filter checked BEFORE count limit.
-		if matches!(item.source, SourceKind::File) {
-			if settings.set_max_file_count
-				&& copied_file_count as f64 >= settings.file_count_limit
-			{
-				file_limit_reached = true;
-				break;
-			}
-			if settings.use_filters
-				&& !filter::file_matches_filters(
-					&wire_path,
-					&settings.filter_rules,
-					settings.use_include_filters,
-					settings.use_exclude_filters,
-					Some(&absolute.to_string_lossy()),
-				) {
-				continue;
-			}
-		} else {
-			if settings.use_filters
-				&& !filter::file_matches_filters(
-					&wire_path,
-					&settings.filter_rules,
-					settings.use_include_filters,
-					settings.use_exclude_filters,
-					Some(&absolute.to_string_lossy()),
-				) {
-				continue;
-			}
-			if settings.set_max_file_count
-				&& copied_file_count as f64 >= settings.file_count_limit
-			{
-				file_limit_reached = true;
-				break;
 			}
 		}
 
-		let remaining_budget =
-			max_payload_bytes.map(|m| m.saturating_sub(current_total_bytes));
+		let mut files = Vec::new();
+		let mut copied_file_count = 0usize;
+		let mut skipped_file_size_count = 0usize;
+		let mut skipped_unreadable_count = 0usize;
+		let mut file_limit_reached = false;
 
-		let blob_budget = |bypass: bool| BlobBudget {
-			remaining_budget,
-			max_payload_bytes,
-			current_total_bytes,
-			max_file_size_kb: settings.max_file_size_kb,
-			bypass_per_file_size: bypass,
-		};
+		for item in &selection.items {
+			cancelled_err(opts, "plan-export")?;
+			let is_primary = primary.as_ref() == Some(&item.root);
+			let wire_path = if is_primary {
+				item.relative_path.clone()
+			} else {
+				let prefix = root_basename(item.root.path());
+				format!("{prefix}/{}", item.relative_path)
+			};
 
-		let deleted = item.change_type == Some(ChangeType::Deleted);
-		let rel = &item.relative_path;
-		// The outer `Option` says whether to record freshness; the inner
-		// one is the file's state (`None` = absent).
-		let (content, skipped_reason, freshness_info): (
-			Option<String>,
-			Option<String>,
-			Option<Option<FileFreshness>>,
-		) = match &item.source {
-			SourceKind::Commit { rev } => {
-				let frozen_oid = frozen_commits
-					.get(&(item.root.clone(), rev.clone()))
-					.ok_or_else(|| {
-						TransferError::Git(GitError::InvalidRevision(
-							rev.clone(),
-						))
-					})?;
-				let (text, reason) = if deleted {
-					match first_parents.get(frozen_oid).cloned().flatten() {
-						Some(p) => {
-							let spec = format!("{p}:{rel}");
-							// Deleted graph old content bypasses per-file size check!
-							read_blob_bounded(
-								blobs.get(&item.root, &gits)?,
-								&spec,
-								&wire_path,
-								&blob_budget(true),
-							)?
-							.unwrap_or_else(deleted_marker)
+			let absolute = item.root.path().join(&item.relative_path);
+
+			// Parity check:
+			// File mode (copy.rs): count limit checked BEFORE filtering candidate.
+			// Git sources (gitsrc.rs): filter checked BEFORE count limit.
+			if matches!(item.source, SourceKind::File) {
+				if settings.set_max_file_count
+					&& copied_file_count as f64 >= settings.file_count_limit
+				{
+					file_limit_reached = true;
+					break;
+				}
+				if settings.use_filters
+					&& !filter::file_matches_filters(
+						&wire_path,
+						&settings.filter_rules,
+						settings.use_include_filters,
+						settings.use_exclude_filters,
+						Some(&absolute.to_string_lossy()),
+					) {
+					continue;
+				}
+			} else {
+				if settings.use_filters
+					&& !filter::file_matches_filters(
+						&wire_path,
+						&settings.filter_rules,
+						settings.use_include_filters,
+						settings.use_exclude_filters,
+						Some(&absolute.to_string_lossy()),
+					) {
+					continue;
+				}
+				if settings.set_max_file_count
+					&& copied_file_count as f64 >= settings.file_count_limit
+				{
+					file_limit_reached = true;
+					break;
+				}
+			}
+
+			let remaining_budget = max_payload_bytes
+				.map(|m| m.saturating_sub(current_total_bytes));
+
+			let blob_budget = |bypass: bool| BlobBudget {
+				remaining_budget,
+				max_payload_bytes,
+				current_total_bytes,
+				max_file_size_kb: settings.max_file_size_kb,
+				bypass_per_file_size: bypass,
+			};
+
+			let deleted = item.change_type == Some(ChangeType::Deleted);
+			let rel = &item.relative_path;
+			// The outer `Option` says whether to record freshness; the inner
+			// one is the file's state (`None` = absent).
+			let (content, skipped_reason, freshness_info): (
+				Option<String>,
+				Option<String>,
+				Option<Option<FileFreshness>>,
+			) = match &item.source {
+				SourceKind::Commit { rev } => {
+					let frozen_oid = frozen_commits
+						.get(&(item.root.clone(), rev.clone()))
+						.ok_or_else(|| {
+							TransferError::Git(GitError::InvalidRevision(
+								rev.clone(),
+							))
+						})?;
+					let (text, reason) = if deleted {
+						match first_parents.get(frozen_oid).cloned().flatten() {
+							Some(p) => {
+								let spec = format!("{p}:{rel}");
+								// Deleted graph old content bypasses per-file size check!
+								read_blob_bounded(
+									blobs.get(&item.root, &gits, opts)?,
+									&spec,
+									&wire_path,
+									&blob_budget(true),
+									opts,
+								)?
+								.unwrap_or_else(deleted_marker)
+							}
+							None => deleted_marker(),
 						}
-						None => deleted_marker(),
-					}
-				} else {
-					let spec = format!("{frozen_oid}:{rel}");
-					read_blob_bounded(
-						blobs.get(&item.root, &gits)?,
-						&spec,
-						&wire_path,
-						&blob_budget(false),
-					)?
-					.ok_or(TransferError::Git(
-						GitError::InvalidRevision(spec),
-					))?
-				};
-				(text, reason, None)
-			}
-			SourceKind::Staged => {
-				let (text, reason) = if deleted {
-					// A staged deletion is gone from the index; HEAD has it.
-					let spec = format!("HEAD:{rel}");
-					read_blob_bounded(
-						blobs.get(&item.root, &gits)?,
-						&spec,
-						&wire_path,
-						&blob_budget(false),
-					)?
-					.unwrap_or_else(deleted_marker)
-				} else {
-					let spec = format!(":{rel}");
-					let (text, reason) = read_blob_bounded(
-						blobs.get(&item.root, &gits)?,
-						&spec,
-						&wire_path,
-						&blob_budget(false),
-					)?
-					.ok_or(TransferError::Git(
-						GitError::InvalidRevision(spec),
-					))?;
-					if reason.is_none() && text.is_none() {
-						(Some(UNREADABLE_FILE_MARKER.to_string()), None)
 					} else {
-						(text, reason)
-					}
-				};
-				(text, reason, None)
-			}
-			SourceKind::Working | SourceKind::Unstaged | SourceKind::File
-				if deleted =>
-			{
-				// Pre-deletion content: `Unstaged` is the worktree against
-				// the index, so the index has it; `Working` is the SCM view
-				// and reads HEAD like gitsrc (TS parity), as does `File`.
-				let spec = if item.source == SourceKind::Unstaged {
-					format!(":{rel}")
-				} else {
-					format!("HEAD:{rel}")
-				};
-				let (text, reason) = if gits.contains_key(&item.root) {
-					read_blob_bounded(
-						blobs.get(&item.root, &gits)?,
-						&spec,
-						&wire_path,
-						&blob_budget(false),
-					)?
-					.unwrap_or_else(deleted_marker)
-				} else {
-					deleted_marker()
-				};
-				// The absence is part of the snapshot: recreating the path
-				// before the clipboard write invalidates the export.
-				(text, reason, Some(None))
-			}
-			SourceKind::Working | SourceKind::Unstaged | SourceKind::File => {
-				let sym_meta = fs::symlink_metadata(&absolute)?;
-				let target_meta = if sym_meta.file_type().is_symlink() {
-					let roots = [item.root.path()];
-					if escapes_all_roots(&roots, &absolute) {
-						return Err(TransferError::UnsafePath(
+						let spec = format!("{frozen_oid}:{rel}");
+						read_blob_bounded(
+							blobs.get(&item.root, &gits, opts)?,
+							&spec,
+							&wire_path,
+							&blob_budget(false),
+							opts,
+						)?
+						.ok_or(TransferError::Git(
+							GitError::InvalidRevision(spec),
+						))?
+					};
+					(text, reason, None)
+				}
+				SourceKind::Staged => {
+					let (text, reason) = if deleted {
+						// A staged deletion is gone from the index; HEAD has it.
+						let spec = format!("HEAD:{rel}");
+						read_blob_bounded(
+							blobs.get(&item.root, &gits, opts)?,
+							&spec,
+							&wire_path,
+							&blob_budget(false),
+							opts,
+						)?
+						.unwrap_or_else(deleted_marker)
+					} else {
+						let spec = format!(":{rel}");
+						let (text, reason) = read_blob_bounded(
+							blobs.get(&item.root, &gits, opts)?,
+							&spec,
+							&wire_path,
+							&blob_budget(false),
+							opts,
+						)?
+						.ok_or(TransferError::Git(
+							GitError::InvalidRevision(spec),
+						))?;
+						if reason.is_none() && text.is_none() {
+							(Some(UNREADABLE_FILE_MARKER.to_string()), None)
+						} else {
+							(text, reason)
+						}
+					};
+					(text, reason, None)
+				}
+				SourceKind::Working
+				| SourceKind::Unstaged
+				| SourceKind::File
+					if deleted =>
+				{
+					// Pre-deletion content: `Unstaged` is the worktree against
+					// the index, so the index has it; `Working` is the SCM view
+					// and reads HEAD like gitsrc (TS parity), as does `File`.
+					let spec = if item.source == SourceKind::Unstaged {
+						format!(":{rel}")
+					} else {
+						format!("HEAD:{rel}")
+					};
+					let (text, reason) = if gits.contains_key(&item.root) {
+						read_blob_bounded(
+							blobs.get(&item.root, &gits, opts)?,
+							&spec,
+							&wire_path,
+							&blob_budget(false),
+							opts,
+						)?
+						.unwrap_or_else(deleted_marker)
+					} else {
+						deleted_marker()
+					};
+					// The absence is part of the snapshot: recreating the path
+					// before the clipboard write invalidates the export.
+					(text, reason, Some(None))
+				}
+				SourceKind::Working
+				| SourceKind::Unstaged
+				| SourceKind::File => {
+					cancelled_err(opts, "read-file")?;
+					let sym_meta = fs::symlink_metadata(&absolute)?;
+					let target_meta = if sym_meta.file_type().is_symlink() {
+						let roots = [item.root.path()];
+						if escapes_all_roots(&roots, &absolute) {
+							return Err(TransferError::UnsafePath(
+								absolute.to_string_lossy().into_owned(),
+							));
+						}
+						let canonical = dunce::canonicalize(&absolute)?;
+						if escapes_all_roots(&roots, &canonical) {
+							return Err(TransferError::UnsafePath(
+								canonical.to_string_lossy().into_owned(),
+							));
+						}
+						fs::metadata(&canonical)?
+					} else {
+						sym_meta
+					};
+
+					if !target_meta.file_type().is_file() {
+						return Err(TransferError::SpecialFile(
 							absolute.to_string_lossy().into_owned(),
 						));
 					}
-					let canonical = dunce::canonicalize(&absolute)?;
-					if escapes_all_roots(&roots, &canonical) {
-						return Err(TransferError::UnsafePath(
-							canonical.to_string_lossy().into_owned(),
-						));
-					}
-					fs::metadata(&canonical)?
-				} else {
-					sym_meta
-				};
 
-				if !target_meta.file_type().is_file() {
-					return Err(TransferError::SpecialFile(
-						absolute.to_string_lossy().into_owned(),
-					));
-				}
-
-				let file_size = target_meta.len();
-				let per_file_limit =
-					(settings.max_file_size_kb * 1024.0) as u64;
-				if file_size as f64 > settings.max_file_size_kb * 1024.0 {
-					(
-						None,
-						Some(format!("size exceeds limit ({file_size} bytes)")),
-						None,
-					)
-				} else {
-					if let Some(budget) = remaining_budget {
-						if file_size as usize > budget {
-							return Err(TransferError::PayloadLimitExceeded {
-								limit: max_payload_bytes.unwrap_or(budget),
-								actual: current_total_bytes
-									+ file_size as usize,
-								reason: format!(
-									"file '{wire_path}' exceeds remaining payload budget"
-								),
-							});
-						}
-					}
-					let read_cap = match remaining_budget {
-						Some(b) => (b as u64).min(per_file_limit),
-						None => per_file_limit,
-					};
-					let mut file = fs::File::open(&absolute)?;
-					let mut handle = (&mut file).take(read_cap + 1);
-					let mut bytes = Vec::with_capacity(file_size as usize);
-					handle.read_to_end(&mut bytes)?;
-					if bytes.len() as u64 > read_cap {
-						if remaining_budget.is_some_and(|b| bytes.len() > b) {
-							return Err(TransferError::PayloadLimitExceeded {
-								limit: max_payload_bytes
-									.unwrap_or(read_cap as usize),
-								actual: current_total_bytes + bytes.len(),
-								reason: format!(
-									"working file '{wire_path}' grew past limit during read"
-								),
-							});
-						}
+					let file_size = target_meta.len();
+					let per_file_limit =
+						(settings.max_file_size_kb * 1024.0) as u64;
+					if file_size as f64 > settings.max_file_size_kb * 1024.0 {
 						(
 							None,
 							Some(format!(
-								"size exceeds limit ({} bytes)",
-								bytes.len()
+								"size exceeds limit ({file_size} bytes)"
 							)),
 							None,
 						)
 					} else {
-						let mtime = target_meta.modified()?;
-						let content_hash = Sha256::digest(&bytes).into();
-						let freshness = FileFreshness {
-							size: bytes.len() as u64,
-							mtime,
-							content_hash,
+						if let Some(budget) = remaining_budget {
+							if file_size as usize > budget {
+								return Err(
+									TransferError::PayloadLimitExceeded {
+										limit: max_payload_bytes
+											.unwrap_or(budget),
+										actual: current_total_bytes
+											+ file_size as usize,
+										reason: format!(
+									"file '{wire_path}' exceeds remaining payload budget"
+								),
+									},
+								);
+							}
+						}
+						let read_cap = match remaining_budget {
+							Some(b) => (b as u64).min(per_file_limit),
+							None => per_file_limit,
 						};
-						(
-							decode_utf8_or_skip(bytes),
-							None,
-							Some(Some(freshness)),
-						)
+						// Admit the metadata size before retaining the body.
+						cancelled_err(opts, "read-file")?;
+						let mut bytes = Vec::with_capacity(file_size as usize);
+						let mut hasher = Sha256::new();
+						let read_len = for_each_chunk(
+							&absolute,
+							Some(read_cap.saturating_add(1)),
+							opts,
+							"read-file",
+							|chunk| {
+								bytes.extend_from_slice(chunk);
+								hasher.update(chunk);
+							},
+						)?;
+						if read_len > read_cap {
+							if remaining_budget
+								.is_some_and(|b| read_len as usize > b)
+							{
+								return Err(
+									TransferError::PayloadLimitExceeded {
+										limit: max_payload_bytes
+											.unwrap_or(read_cap as usize),
+										actual: current_total_bytes
+											+ read_len as usize,
+										reason: format!(
+									"working file '{wire_path}' grew past limit during read"
+								),
+									},
+								);
+							}
+							(
+								None,
+								Some(format!(
+									"size exceeds limit ({read_len} bytes)"
+								)),
+								None,
+							)
+						} else {
+							let mtime = target_meta.modified()?;
+							let content_hash = hasher.finalize().into();
+							let freshness = FileFreshness {
+								size: read_len,
+								mtime,
+								content_hash,
+							};
+							(
+								decode_utf8_or_skip(bytes),
+								None,
+								Some(Some(freshness)),
+							)
+						}
 					}
 				}
+			};
+
+			if let Some(f) = freshness_info {
+				working_files.insert((item.root.clone(), rel.clone()), f);
 			}
-		};
 
-		if let Some(f) = freshness_info {
-			working_files.insert((item.root.clone(), rel.clone()), f);
-		}
+			// Drop unreadable/binary files (matching copy.rs and gitsrc.rs)
+			if skipped_reason.is_none() && content.is_none() {
+				skipped_unreadable_count += 1;
+				continue;
+			}
 
-		// Drop unreadable/binary files (matching copy.rs and gitsrc.rs)
-		if skipped_reason.is_none() && content.is_none() {
-			skipped_unreadable_count += 1;
-			continue;
-		}
+			if item.change_type == Some(ChangeType::Deleted)
+				|| matches!(item.source, SourceKind::Staged)
+			{
+				fallback = true;
+			}
 
-		if item.change_type == Some(ChangeType::Deleted)
-			|| matches!(item.source, SourceKind::Staged)
-		{
-			fallback = true;
-		}
+			if skipped_reason.is_some() {
+				skipped_file_size_count += 1;
+			} else if content.as_deref() == Some(UNREADABLE_FILE_MARKER) {
+				skipped_unreadable_count += 1;
+			} else {
+				copied_file_count += 1;
+			}
 
-		if skipped_reason.is_some() {
-			skipped_file_size_count += 1;
-		} else if content.as_deref() == Some(UNREADABLE_FILE_MARKER) {
-			skipped_unreadable_count += 1;
-		} else {
-			copied_file_count += 1;
-		}
+			let payload_file = PayloadFile {
+				path: wire_path,
+				content,
+				change_type: item.change_type,
+				skipped_reason,
+			};
 
-		let payload_file = PayloadFile {
-			path: wire_path,
-			content,
-			change_type: item.change_type,
-			skipped_reason,
-		};
+			cancelled_err(opts, "serialize-export")?;
+			let mut file_counter = format::CountingWriter::default();
+			let mut file_writer = format::PayloadLineWriter::new_with_written(
+				&mut file_counter,
+				true,
+			);
+			format::write_payload_file(
+				&mut file_writer,
+				&payload_file,
+				&settings.header_format,
+				settings.add_extra_line_between_files,
+				custom,
+			)
+			.map_err(|_| {
+				TransferError::UnsafePath("formatting error".into())
+			})?;
 
-		let mut file_counter = format::CountingWriter::default();
-		let mut file_writer = format::PayloadLineWriter::new_with_written(
-			&mut file_counter,
-			true,
-		);
-		format::write_payload_file(
-			&mut file_writer,
-			&payload_file,
-			&settings.header_format,
-			settings.add_extra_line_between_files,
-			custom,
-		)
-		.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
+			let file_delta = file_counter.count;
 
-		let file_delta = file_counter.count;
-
-		if let Some(max_bytes) = max_payload_bytes {
-			if current_total_bytes + file_delta > max_bytes {
-				return Err(TransferError::PayloadLimitExceeded {
-					limit: max_bytes,
-					actual: current_total_bytes + file_delta,
-					reason: format!(
+			if let Some(max_bytes) = max_payload_bytes {
+				if current_total_bytes + file_delta > max_bytes {
+					return Err(TransferError::PayloadLimitExceeded {
+						limit: max_bytes,
+						actual: current_total_bytes + file_delta,
+						reason: format!(
 						"file '{}' serialized overhead exceeds remaining payload budget",
 						payload_file.path
 					),
+					});
+				}
+			}
+			current_total_bytes += file_delta;
+
+			files.push(payload_file);
+		}
+
+		let final_source_root = if is_commit && files.is_empty() {
+			None
+		} else {
+			default_source_root
+		};
+
+		// Revalidation runs Git: the cat-file slot must be free first.
+		blobs.close()?;
+		let freshness = SourceFreshnessSnapshot {
+			repos,
+			frozen_commits,
+			working_files,
+		};
+		freshness.revalidate_with(opts)?;
+
+		let payload_opts = make_payload_opts(
+			settings,
+			final_source_root.as_deref(),
+			&files,
+			!fallback,
+		);
+		let mut final_counter = format::CountingWriter::default();
+		write_export_payload(&mut final_counter, &payload_opts, opts)?;
+
+		if let Some(max_bytes) = max_payload_bytes {
+			if final_counter.count > max_bytes {
+				return Err(TransferError::PayloadLimitExceeded {
+					limit: max_bytes,
+					actual: final_counter.count,
+					reason:
+						"serialized payload with headers/wrappers exceeds limit"
+							.to_string(),
 				});
 			}
 		}
-		current_total_bytes += file_delta;
 
-		files.push(payload_file);
-	}
+		cancelled_err(opts, "serialize-export")?;
+		let mut payload = String::with_capacity(final_counter.count);
+		write_export_payload(&mut payload, &payload_opts, opts)?;
 
-	let final_source_root = if is_commit && files.is_empty() {
-		None
-	} else {
-		default_source_root
-	};
+		let stats = payload_stats(&payload);
+		cancelled_err(opts, "serialize-export")?;
 
-	// Revalidation runs Git: the cat-file slot must be free first.
-	blobs.close()?;
-	let freshness = SourceFreshnessSnapshot {
-		repos,
-		frozen_commits,
-		working_files,
-	};
-	freshness.revalidate()?;
-
-	let mut final_counter = format::CountingWriter::default();
-	format::write_payload_borrowed(
-		&mut final_counter,
-		&make_payload_opts(
-			settings,
-			final_source_root.as_deref(),
-			&files,
-			!fallback,
-		),
-	)
-	.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
-
-	if let Some(max_bytes) = max_payload_bytes {
-		if final_counter.count > max_bytes {
-			return Err(TransferError::PayloadLimitExceeded {
-				limit: max_bytes,
-				actual: final_counter.count,
-				reason:
-					"serialized payload with headers/wrappers exceeds limit"
-						.to_string(),
-			});
-		}
-	}
-
-	let mut payload = String::with_capacity(final_counter.count);
-	format::write_payload_borrowed(
-		&mut payload,
-		&make_payload_opts(
-			settings,
-			final_source_root.as_deref(),
-			&files,
-			!fallback,
-		),
-	)
-	.map_err(|_| TransferError::UnsafePath("formatting error".into()))?;
-
-	let stats = payload_stats(&payload);
-
-	Ok(ExportPlan {
-		files,
-		payload,
-		stats,
-		freshness,
-		copied_file_count,
-		skipped_file_size_count,
-		skipped_unreadable_count,
-		file_limit_reached,
-	})
+		Ok(ExportPlan {
+			files,
+			payload,
+			stats,
+			freshness,
+			copied_file_count,
+			skipped_file_size_count,
+			skipped_unreadable_count,
+			file_limit_reached,
+		})
+	})();
+	finish_reader(&mut blobs, outcome)
 }
 
 /// Detects distinct top-level root prefixes from clipboard text entries.
@@ -1519,8 +2045,35 @@ pub fn plan_import(
 	destination_roots: &[PathBuf],
 	mapping: &ImportMapping,
 ) -> Result<TransferImportPlan, TransferError> {
-	let mut canonical_dest_roots = Vec::with_capacity(destination_roots.len());
+	plan_import_with(
+		clipboard_text,
+		header_format,
+		destination_roots,
+		mapping,
+		&RunOptions::default(),
+	)
+}
+
+/// [`plan_import`] with the caller's runner options.
+///
+/// The clipboard parser and per-file restore planner are the ones
+/// [`plan_import`] uses. The token is polled before and after parsing, and
+/// between roots, routed entries, per-file planning, target-identity checks
+/// and freshness reads. Encoding classification may `read` up to 8 MiB in
+/// one call, and one freshness chunk is at most 8 KiB; neither `read` can
+/// be interrupted mid-syscall. `canonicalize` for a target identity is one
+/// synchronous walk.
+pub fn plan_import_with(
+	clipboard_text: &str,
+	header_format: &str,
+	destination_roots: &[PathBuf],
+	mapping: &ImportMapping,
+	opts: &RunOptions,
+) -> Result<TransferImportPlan, TransferError> {
+	cancelled_err(opts, "plan-import")?;
+	let mut canonical_dest_roots = Vec::new();
 	for r in destination_roots {
+		cancelled_err(opts, "plan-import")?;
 		let id = CanonicalRootId::new(r)?;
 		id.validate()?;
 		canonical_dest_roots.push(id);
@@ -1528,6 +2081,7 @@ pub fn plan_import(
 
 	// Every mapped destination root must belong to the explicit destination_roots
 	if let Some(ref primary) = mapping.primary_destination {
+		cancelled_err(opts, "plan-import")?;
 		if !canonical_dest_roots.contains(primary) {
 			return Err(TransferError::UnknownRoot(
 				primary.path().to_path_buf(),
@@ -1535,11 +2089,13 @@ pub fn plan_import(
 		}
 	}
 	for root in mapping.prefix_destinations.values() {
+		cancelled_err(opts, "plan-import")?;
 		if !canonical_dest_roots.contains(root) {
 			return Err(TransferError::UnknownRoot(root.path().to_path_buf()));
 		}
 	}
 	for entry_mapping in mapping.entry_destinations.values() {
+		cancelled_err(opts, "plan-import")?;
 		if !canonical_dest_roots.contains(&entry_mapping.root) {
 			return Err(TransferError::UnknownRoot(
 				entry_mapping.root.path().to_path_buf(),
@@ -1547,13 +2103,16 @@ pub fn plan_import(
 		}
 	}
 
+	cancelled_err(opts, "plan-import")?;
 	let entries = format::parse_clipboard(clipboard_text, header_format);
+	cancelled_err(opts, "plan-import")?;
 
 	let mut root_to_entries: HashMap<CanonicalRootId, Vec<ParsedEntry>> =
 		HashMap::new();
 	let mut skipped_operations = Vec::new();
 
 	for entry in entries {
+		cancelled_err(opts, "plan-import")?;
 		let (target_root, rel_path) =
 			if let Some(em) = mapping.entry_destinations.get(&entry.path) {
 				let rel =
@@ -1615,17 +2174,26 @@ pub fn plan_import(
 	let mut combined_deletes = Vec::new();
 	let mut all_skipped = skipped_operations;
 
-	// Call core plan_restore for each destination root
+	// Same `plan_restore` as before, one entry at a time so a cancel is
+	// observed before the next file's encoding read.
 	for (root_id, root_entries) in root_to_entries {
-		let sub_plan = restore::plan_restore(&[root_id.path()], &root_entries);
-		combined_creates.extend(sub_plan.create_operations);
-		combined_deletes.extend(sub_plan.delete_operations);
-		all_skipped.extend(sub_plan.skipped_operations);
+		cancelled_err(opts, "plan-import")?;
+		for entry in &root_entries {
+			cancelled_err(opts, "plan-import")?;
+			let sub_plan = restore::plan_restore(
+				&[root_id.path()],
+				std::slice::from_ref(entry),
+			);
+			combined_creates.extend(sub_plan.create_operations);
+			combined_deletes.extend(sub_plan.delete_operations);
+			all_skipped.extend(sub_plan.skipped_operations);
+		}
 	}
 
 	// Reject if two entries map to the same target file (including symlinks and case aliases)
 	let mut target_identities: HashMap<String, String> = HashMap::new();
 	for op in &combined_creates {
+		cancelled_err(opts, "plan-import")?;
 		let identity = canonical_target_identity(&op.absolute_path);
 		if let Some(prev) = target_identities
 			.insert(identity.clone(), format!("create {}", op.relative_path))
@@ -1643,6 +2211,7 @@ pub fn plan_import(
 		}
 	}
 	for op in &combined_deletes {
+		cancelled_err(opts, "plan-import")?;
 		let identity = canonical_target_identity(&op.absolute_path);
 		if let Some(prev) = target_identities
 			.insert(identity.clone(), format!("delete {}", op.relative_path))
@@ -1667,9 +2236,11 @@ pub fn plan_import(
 		skipped_operations: all_skipped,
 	};
 
-	let destination_freshness = DestinationFreshnessSnapshot::capture(
+	cancelled_err(opts, "plan-import")?;
+	let destination_freshness = DestinationFreshnessSnapshot::capture_with(
 		destination_roots,
 		&restore_plan,
+		opts,
 	)?;
 
 	Ok(TransferImportPlan {
@@ -1719,4 +2290,839 @@ pub fn plan_commit_export(
 	};
 
 	commits::copy_commits(git, &shas).map_err(TransferError::Commit)
+}
+
+/// Exports exactly the commits in `selected`, which must be the contiguous
+/// first-parent chain that ends at `tip`. The selected tip is preserved when
+/// the chain includes a root; HEAD is never substituted.
+pub fn plan_commit_export_exact(
+	git: &Git,
+	tip: &str,
+	selected: &[String],
+) -> Result<CommitsPayload, TransferError> {
+	let chain =
+		select_exact_chain(git, tip, selected, &RunOptions::default(), None)?;
+	commits::copy_commits(git, &chain).map_err(TransferError::Commit)
+}
+
+/// [`plan_commit_export_exact`] with the caller's runner options and a hard
+/// cap on the clipboard document.
+///
+/// Every ref resolution uses `opts`. A truncated id is
+/// [`GitError::OutputLimit`], not a short OID. Cancellation is polled across
+/// the walk and after the chain is known, including a root that has no blob
+/// to read. `max_serialized_bytes` is the whole document
+/// [`commits::copy_commits_with`] counts. A selection that cannot fit is
+/// [`CommitError::PayloadLimit`]; commits are not dropped to succeed.
+/// [`plan_commit_export_exact`] stays uncapped.
+pub fn plan_commit_export_exact_with(
+	git: &Git,
+	tip: &str,
+	selected: &[String],
+	opts: &RunOptions,
+	max_serialized_bytes: usize,
+) -> Result<CommitExport, TransferError> {
+	let chain = select_exact_chain(
+		git,
+		tip,
+		selected,
+		opts,
+		Some(max_serialized_bytes),
+	)?;
+	commits::copy_commits_with(git, &chain, opts, max_serialized_bytes)
+		.map_err(TransferError::Commit)
+}
+
+/// First-parent chain of `selected` ending at `tip`, oldest first.
+///
+/// Each selected entry is resolved with `opts` and is not resolved again on
+/// the parent walk. A repeated `tip` string is resolved once. The retained
+/// OID set is not reserved to `selected.len()`.
+fn select_exact_chain(
+	git: &Git,
+	tip: &str,
+	selected: &[String],
+	opts: &RunOptions,
+	limit: Option<usize>,
+) -> Result<Vec<String>, TransferError> {
+	cancelled_err(opts, "select-commits")?;
+	if selected.is_empty() {
+		return Err(TransferError::EmptySelection);
+	}
+	if let Some(max) = limit {
+		let floor = commits::min_commit_document_len(1);
+		if floor > max {
+			return Err(CommitError::PayloadLimit {
+				limit: max,
+				actual: floor,
+			}
+			.into());
+		}
+	}
+
+	let mut wanted = HashSet::new();
+	let mut resolved_tip: Option<String> = None;
+	for sha in selected {
+		cancelled_err(opts, "select-commits")?;
+		let oid = if sha == tip {
+			if let Some(oid) = resolved_tip.clone() {
+				oid
+			} else {
+				let oid = git.resolve_commit_with(sha, opts)?;
+				resolved_tip = Some(oid.clone());
+				oid
+			}
+		} else {
+			git.resolve_commit_with(sha, opts)?
+		};
+		if wanted.contains(&oid) {
+			continue;
+		}
+		if let Some(max) = limit {
+			let floor = commits::min_commit_document_len(wanted.len() + 1);
+			if floor > max {
+				return Err(CommitError::PayloadLimit {
+					limit: max,
+					actual: floor,
+				}
+				.into());
+			}
+		}
+		wanted.insert(oid);
+	}
+	cancelled_err(opts, "select-commits")?;
+	let tip_oid = match resolved_tip {
+		Some(oid) => oid,
+		None => git.resolve_commit_with(tip, opts)?,
+	};
+	if !wanted.contains(&tip_oid) {
+		return Err(TransferError::DiscontinuousCommits {
+			base: selected.first().cloned().unwrap_or_default(),
+			tip: tip_oid,
+			at: tip.to_string(),
+			first_parent: None,
+		});
+	}
+
+	let mut chain = Vec::new();
+	let mut cursor = tip_oid.clone();
+	loop {
+		cancelled_err(opts, "select-commits")?;
+		if !wanted.remove(&cursor) {
+			cancelled_err(opts, "select-commits")?;
+			let parent = git.parents_with(&cursor, opts)?.into_iter().next();
+			return Err(TransferError::DiscontinuousCommits {
+				base: wanted.iter().next().cloned().unwrap_or_default(),
+				tip: tip_oid,
+				at: cursor,
+				first_parent: parent,
+			});
+		}
+		chain.push(cursor.clone());
+		if wanted.is_empty() {
+			break;
+		}
+		cancelled_err(opts, "select-commits")?;
+		match git.parents_with(&cursor, opts)?.into_iter().next() {
+			Some(parent) => cursor = parent,
+			None => {
+				return Err(TransferError::DiscontinuousCommits {
+					base: wanted.iter().next().cloned().unwrap_or_default(),
+					tip: tip_oid,
+					at: chain.last().cloned().unwrap_or_default(),
+					first_parent: None,
+				});
+			}
+		}
+	}
+	// Chain is complete, including a root. No blob is read on this path.
+	cancelled_err(opts, "select-commits")?;
+	chain.reverse();
+	Ok(chain)
+}
+
+/// Preview of replaying one commit payload onto `dest`, with destination
+/// HEAD, ref, index, content, and absence captured before any write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitReplayPreview {
+	pub destination: PathBuf,
+	pub payload: CommitsPayload,
+	pub replay: commits::CommitReplayPlan,
+	pub freshness: DestinationFreshnessSnapshot,
+}
+
+impl CommitReplayPreview {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. Call only on a fresh capture whose public freshness maps
+	/// have not been mutated: its conservative table estimate assumes the
+	/// insertion-only construction in capture_replay_freshness.
+	pub fn retained_heap_bytes(&self) -> usize {
+		self.destination
+			.capacity()
+			.saturating_add(self.payload.retained_heap_bytes())
+			.saturating_add(self.replay.retained_heap_bytes())
+			.saturating_add(self.freshness.fresh_capture_heap_bytes())
+	}
+
+	pub fn capture(
+		dest: &Path,
+		payload: &CommitsPayload,
+	) -> Result<Self, TransferError> {
+		Self::capture_with(dest, payload, &RunOptions::default())
+	}
+
+	/// [`Self::capture`] with the caller's runner options.
+	///
+	/// Opens the destination with `Git::open_with`. Eligibility planning polls
+	/// `opts` between files, then HEAD, the symbolic ref, the index and each
+	/// target hash use the same options. Nothing is written.
+	pub fn capture_with(
+		dest: &Path,
+		payload: &CommitsPayload,
+		opts: &RunOptions,
+	) -> Result<Self, TransferError> {
+		cancelled_err(opts, "replay-preview")?;
+		let git = Git::open_with(dest, opts)?;
+		let root = git.root().to_path_buf();
+		let replay = replay_plan(&git, payload, opts)?;
+		let freshness = capture_replay_freshness(&root, &replay, opts)?;
+		// Plan first, then the snapshot, then plan again. A change between
+		// those reads makes the preview unusable instead of storing a mix.
+		cancelled_err(opts, "replay-preview")?;
+		let again = replay_plan(&git, payload, opts)?;
+		if again != replay {
+			return Err(TransferError::StaleDestination {
+				root: root.clone(),
+				reason:
+					"destination changed while the replay preview was captured"
+						.into(),
+			});
+		}
+		revalidate_replay_freshness(&freshness, opts)?;
+		let preview = Self {
+			destination: root,
+			payload: payload.clone(),
+			replay,
+			freshness,
+		};
+		#[cfg(test)]
+		final_boundary_cancel_hook("replay-preview-capture");
+		cancelled_err(opts, "replay-preview")?;
+		Ok(preview)
+	}
+
+	/// Refuses when HEAD, the branch ref, the index, recorded bytes, absence,
+	/// or replay eligibility changed since [`Self::capture`]. A skipped
+	/// non-UTF-8 or unsafe path that becomes writable is stale. `NotCopied`
+	/// stays skipped because the payload itself has no bytes to write.
+	///
+	/// Checking freshness does not write. Confirmed replay stays in
+	/// [`commits::replay`] and is not cancelled here.
+	pub fn revalidate(&self) -> Result<(), TransferError> {
+		self.revalidate_with(&RunOptions::default())
+	}
+
+	/// [`Self::revalidate`] with the caller's runner options. Read-only.
+	pub fn revalidate_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<(), TransferError> {
+		cancelled_err(opts, "replay-preview")?;
+		revalidate_replay_freshness(&self.freshness, opts)?;
+		let git = Git::open_with(&self.destination, opts)?;
+		let now = replay_plan(&git, &self.payload, opts)?;
+		if now != self.replay {
+			return Err(TransferError::StaleDestination {
+				root: self.destination.clone(),
+				reason: "replay eligibility changed after preview".into(),
+			});
+		}
+		#[cfg(test)]
+		final_boundary_cancel_hook("replay-preview-revalidate");
+		cancelled_err(opts, "replay-preview")?;
+		Ok(())
+	}
+}
+
+fn replay_plan(
+	git: &Git,
+	payload: &CommitsPayload,
+	opts: &RunOptions,
+) -> Result<commits::CommitReplayPlan, TransferError> {
+	commits::plan_commit_replay_with(git, payload, opts).map_err(
+		|err| match err {
+			CommitError::Git(git_err) => TransferError::Git(git_err),
+			other => TransferError::Commit(other),
+		},
+	)
+}
+
+/// Repo freshness plus every path the replay plan named. Symlinks are hashed
+/// as the link itself; their targets are not opened.
+fn capture_replay_freshness(
+	root: &Path,
+	replay: &commits::CommitReplayPlan,
+	opts: &RunOptions,
+) -> Result<DestinationFreshnessSnapshot, TransferError> {
+	cancelled_err(opts, "replay-freshness")?;
+	// Fresh tables, insertion only: preserve this creation invariant for
+	// fresh_capture_heap_bytes. Do not reuse a previously edited snapshot.
+	let mut roots = HashMap::new();
+	let id = CanonicalRootId::new(root)?;
+	id.validate()?;
+	roots.insert(id, capture_repo_freshness(root, opts)?);
+
+	let mut target_files = HashMap::new();
+	for commit in &replay.commits {
+		cancelled_err(opts, "replay-freshness")?;
+		for file in &commit.files {
+			cancelled_err(opts, "replay-freshness")?;
+			// NotCopied never becomes a write; the payload has no bytes.
+			if file.skip_reason == Some(commits::ReplaySkipReason::NotCopied) {
+				continue;
+			}
+			for (abs, rel) in [
+				file.absolute_path.as_ref().map(|p| (p, file.path.as_str())),
+				file.old_absolute_path
+					.as_ref()
+					.zip(file.old_path.as_deref()),
+			]
+			.into_iter()
+			.flatten()
+			{
+				if target_files.contains_key(abs) {
+					continue;
+				}
+				let file_state = capture_replay_file_freshness(abs, opts)?;
+				target_files.insert(
+					abs.clone(),
+					TargetFileFreshness {
+						root: CanonicalRootId::new(root)?,
+						relative_path: rel.to_string(),
+						existed: file_state.is_some(),
+						file_state,
+					},
+				);
+			}
+		}
+	}
+	Ok(DestinationFreshnessSnapshot {
+		roots,
+		target_files,
+	})
+}
+
+/// Identity of a replay target. A symlink contributes its own link text, not
+/// the bytes reached by opening it.
+fn capture_replay_file_freshness(
+	path: &Path,
+	opts: &RunOptions,
+) -> Result<Option<FileFreshness>, TransferError> {
+	cancelled_err(opts, "replay-freshness")?;
+	let meta = match not_found_as_none(fs::symlink_metadata(path))? {
+		Some(meta) => meta,
+		None => return Ok(None),
+	};
+	if meta.file_type().is_symlink() {
+		// Link text only. `read_link` does not open the target.
+		let link = fs::read_link(path)?;
+		let bytes = link.as_os_str().as_encoded_bytes();
+		let mut hasher = Sha256::new();
+		hasher.update(bytes);
+		cancelled_err(opts, "replay-freshness")?;
+		return Ok(Some(FileFreshness {
+			size: bytes.len() as u64,
+			mtime: meta.modified()?,
+			content_hash: hasher.finalize().into(),
+		}));
+	}
+	if !meta.file_type().is_file() {
+		return Err(TransferError::SpecialFile(
+			path.to_string_lossy().into_owned(),
+		));
+	}
+	Ok(Some(FileFreshness {
+		size: meta.len(),
+		mtime: meta.modified()?,
+		content_hash: hash_file(path, opts)?,
+	}))
+}
+
+/// Same identity [`capture_replay_file_freshness`] stored. File-import
+/// revalidation follows symlinks; replay must not.
+fn revalidate_replay_freshness(
+	snapshot: &DestinationFreshnessSnapshot,
+	opts: &RunOptions,
+) -> Result<(), TransferError> {
+	for (root, prev_repo) in &snapshot.roots {
+		revalidate_destination_repo_freshness(root.path(), prev_repo, opts)?;
+	}
+	for (path, target) in &snapshot.target_files {
+		let current = capture_replay_file_freshness(path, opts)?;
+		let existed = current.is_some();
+		if existed == target.existed && current == target.file_state {
+			continue;
+		}
+		let reason = if !target.existed && existed {
+			format!(
+				"target file '{}' was created externally after preview",
+				target.relative_path
+			)
+		} else if target.existed && !existed {
+			format!(
+				"target file '{}' was deleted externally after preview",
+				target.relative_path
+			)
+		} else {
+			format!(
+				"target file '{}' was modified externally after preview",
+				target.relative_path
+			)
+		};
+		return Err(TransferError::StaleDestination {
+			root: target.root.path().to_path_buf(),
+			reason,
+		});
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod chunk_loop {
+	use std::io::{self, Read};
+
+	use super::{
+		read_limited, CancelToken, GitError, RunOptions, TransferError,
+		FILE_IO_CHUNK,
+	};
+
+	/// Records the slice length of every `read` and can cancel after one.
+	struct Scripted {
+		data: Vec<u8>,
+		pos: usize,
+		requests: Vec<usize>,
+		cancel_after: Option<(usize, CancelToken)>,
+	}
+
+	impl Read for Scripted {
+		fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+			self.requests.push(buf.len());
+			let n = buf.len().min(self.data.len() - self.pos);
+			if n == 0 {
+				return Ok(0);
+			}
+			buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+			self.pos += n;
+			if let Some((after, token)) = &self.cancel_after {
+				if self.requests.len() == *after {
+					token.cancel();
+				}
+			}
+			Ok(n)
+		}
+	}
+
+	#[test]
+	fn capped_read_requests_only_the_remaining_bytes() {
+		let mut reader = Scripted {
+			data: vec![b'x'; 100],
+			pos: 0,
+			requests: Vec::new(),
+			cancel_after: None,
+		};
+		let mut got = Vec::new();
+		let n = read_limited(
+			&mut reader,
+			Some(5),
+			&RunOptions::default(),
+			"read-file",
+			|chunk| got.extend_from_slice(chunk),
+		)
+		.unwrap();
+		assert_eq!(n, 5);
+		assert_eq!(got, vec![b'x'; 5]);
+		assert_eq!(reader.requests, vec![5]);
+		assert_eq!(reader.pos, 5);
+	}
+
+	#[test]
+	fn zero_cap_does_not_call_read() {
+		let mut reader = Scripted {
+			data: vec![b'x'; 8],
+			pos: 0,
+			requests: Vec::new(),
+			cancel_after: None,
+		};
+		let n = read_limited(
+			&mut reader,
+			Some(0),
+			&RunOptions::default(),
+			"read-file",
+			|_| panic!("zero cap delivered a chunk"),
+		)
+		.unwrap();
+		assert_eq!(n, 0);
+		assert!(reader.requests.is_empty());
+	}
+
+	#[test]
+	fn cancel_after_a_chunk_does_not_read_the_next_one() {
+		let token = CancelToken::new();
+		let mut reader = Scripted {
+			data: vec![b'y'; FILE_IO_CHUNK + 32],
+			pos: 0,
+			requests: Vec::new(),
+			cancel_after: Some((1, token.clone())),
+		};
+		let err = read_limited(
+			&mut reader,
+			None,
+			&RunOptions {
+				cancel: Some(token),
+				..RunOptions::default()
+			},
+			"hash-file",
+			|_| {},
+		)
+		.unwrap_err();
+		assert!(matches!(
+			err,
+			TransferError::Git(GitError::Cancelled { .. })
+		));
+		assert_eq!(reader.requests, vec![FILE_IO_CHUNK]);
+		assert_eq!(reader.pos, FILE_IO_CHUNK);
+	}
+}
+
+/// Real `CommitReplayPreview::capture_with` / `plan_import_with` paths.
+/// The probe sits in production `hash_file`, so a chunk is evidence that
+/// `read_limited` already copied bytes from that path.
+#[cfg(test)]
+mod preview_target_hash_cancel {
+	use std::fs;
+	use std::process::Command;
+
+	use super::{
+		arm_final_boundary_cancel, arm_hash_probe, hash_probe_notes,
+		CancelToken, CanonicalRootId, CommitReplayPreview, GitError,
+		ImportMapping, RunOptions, TransferError, FILE_IO_CHUNK,
+	};
+	use crate::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+
+	struct Repo {
+		_dir: tempfile::TempDir,
+		path: std::path::PathBuf,
+		cfg: std::path::PathBuf,
+	}
+
+	impl Repo {
+		fn new() -> Self {
+			let dir = tempfile::tempdir().unwrap();
+			let cfg = dir.path().join("empty.gitconfig");
+			fs::write(&cfg, b"").unwrap();
+			let raw = dir.path().join("repo");
+			fs::create_dir(&raw).unwrap();
+			let path = dunce::canonicalize(&raw).unwrap();
+			let repo = Self {
+				_dir: dir,
+				path,
+				cfg,
+			};
+			repo.git(&["init", "-q", "-b", "main"]);
+			repo.git(&["config", "user.name", "Test User"]);
+			repo.git(&["config", "user.email", "test@example.com"]);
+			repo.git(&["config", "commit.gpgsign", "false"]);
+			repo
+		}
+
+		fn git(&self, args: &[&str]) -> String {
+			let out = Command::new("git")
+				.args(args)
+				.current_dir(&self.path)
+				.env("GIT_CONFIG_GLOBAL", &self.cfg)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.env("LC_ALL", "C")
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"git {args:?}: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+			String::from_utf8_lossy(&out.stdout).trim().to_string()
+		}
+
+		fn write(&self, name: &str, bytes: &[u8]) {
+			fs::write(self.path.join(name), bytes).unwrap();
+		}
+	}
+
+	struct Disk {
+		head: String,
+		branch: String,
+		index: Vec<u8>,
+		first: Vec<u8>,
+		second: Vec<u8>,
+	}
+
+	fn disk(repo: &Repo, first: &str, second: &str) -> Disk {
+		Disk {
+			head: repo.git(&["rev-parse", "HEAD"]),
+			branch: repo.git(&["symbolic-ref", "HEAD"]),
+			index: fs::read(repo.path.join(".git/index")).unwrap(),
+			first: fs::read(repo.path.join(first)).unwrap(),
+			second: fs::read(repo.path.join(second)).unwrap(),
+		}
+	}
+
+	fn assert_same(before: &Disk, after: &Disk) {
+		assert_eq!(after.head, before.head);
+		assert_eq!(after.branch, before.branch);
+		assert_eq!(after.index, before.index);
+		assert_eq!(after.first, before.first);
+		assert_eq!(after.second, before.second);
+	}
+
+	fn assert_stopped_on_first_target(
+		err: TransferError,
+		arm: &std::path::Path,
+		second: &std::path::Path,
+		mark: [u8; 4],
+	) {
+		match err {
+			TransferError::Git(GitError::Cancelled { ref args }) => {
+				assert!(
+					args.contains("hash-file"),
+					"cancel did not come from hash_file: {args}"
+				);
+			}
+			other => panic!("expected hash_file cancellation, got {other}"),
+		}
+		let notes = hash_probe_notes();
+		let arm_at = notes.iter().position(|note| note.path == arm);
+		let arm_at = arm_at.unwrap_or_else(|| {
+			panic!(
+				"production hash_file never read {}:\n{}",
+				arm.display(),
+				notes
+					.iter()
+					.map(|note| format!(
+						"{} ({} bytes)",
+						note.path.display(),
+						note.len
+					))
+					.collect::<Vec<_>>()
+					.join("\n")
+			)
+		});
+		assert!(
+			notes[..arm_at].iter().any(|note| {
+				note.path.file_name().and_then(|n| n.to_str()) == Some("index")
+					&& note.head[..4] == *b"DIRC"
+			}),
+			"index hash did not precede the armed target"
+		);
+		let armed: Vec<_> =
+			notes.iter().filter(|note| note.path == arm).collect();
+		assert_eq!(armed.len(), 1, "more than one chunk of the first target");
+		assert_eq!(armed[0].len, FILE_IO_CHUNK);
+		assert_eq!(armed[0].head, mark);
+		assert!(
+			notes.iter().all(|note| note.path != second),
+			"second target was hashed: {}",
+			second.display()
+		);
+	}
+
+	#[test]
+	fn replay_preview_cancels_after_first_skipped_target_chunk() {
+		let repo = Repo::new();
+		let skip = repo.path.join("skip.bin");
+		let other = repo.path.join("other.txt");
+		let skip_bytes = vec![0xFFu8; FILE_IO_CHUNK + 64];
+		repo.write("skip.bin", &skip_bytes);
+		repo.write("other.txt", b"other\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let before = disk(&repo, "skip.bin", "other.txt");
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "incoming\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-26T00:00:00+00:00".into(),
+				files: vec![
+					CommitFile {
+						path: "skip.bin".into(),
+						old_path: None,
+						change: FileChange::Modified,
+						content: Some("text\n".into()),
+						not_copied: None,
+					},
+					CommitFile {
+						path: "other.txt".into(),
+						old_path: None,
+						change: FileChange::Modified,
+						content: Some("changed\n".into()),
+						not_copied: None,
+					},
+				],
+			}],
+		};
+		let token = CancelToken::new();
+		let opts = RunOptions {
+			cancel: Some(token.clone()),
+			..RunOptions::default()
+		};
+		let _probe = arm_hash_probe(skip.clone(), token);
+		let err =
+			CommitReplayPreview::capture_with(&repo.path, &payload, &opts)
+				.expect_err("preview must stop while hashing skip.bin");
+		assert_stopped_on_first_target(err, &skip, &other, [0xFF; 4]);
+		assert_same(&before, &disk(&repo, "skip.bin", "other.txt"));
+	}
+
+	#[test]
+	fn import_preview_cancels_after_first_target_chunk() {
+		let repo = Repo::new();
+		let wide = repo.path.join("wide.txt");
+		let other = repo.path.join("other.txt");
+		let wide_bytes = vec![b'a'; FILE_IO_CHUNK + 64];
+		repo.write("wide.txt", &wide_bytes);
+		repo.write("other.txt", b"other\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let before = disk(&repo, "wide.txt", "other.txt");
+		let text = "\
+// file: wide.txt
+replacement
+// file: other.txt
+replacement-two
+";
+		let token = CancelToken::new();
+		let opts = RunOptions {
+			cancel: Some(token.clone()),
+			..RunOptions::default()
+		};
+		let _probe = arm_hash_probe(wide.clone(), token);
+		let err = super::plan_import_with(
+			text,
+			"// file: $FILE_PATH",
+			std::slice::from_ref(&repo.path),
+			&ImportMapping::with_primary(
+				CanonicalRootId::new(&repo.path).unwrap(),
+			),
+			&opts,
+		)
+		.expect_err("import preview must stop while hashing wide.txt");
+		assert_stopped_on_first_target(err, &wide, &other, [b'a'; 4]);
+		assert_same(&before, &disk(&repo, "wide.txt", "other.txt"));
+	}
+
+	#[test]
+	fn replay_preview_capture_cancels_at_final_boundary_after_payload_clone() {
+		let repo = Repo::new();
+		repo.write("file.txt", b"hello\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let before = disk(&repo, "file.txt", "file.txt");
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "incoming\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-26T00:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "file.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some("changed\n".into()),
+					not_copied: None,
+				}],
+			}],
+		};
+		let token = CancelToken::new();
+		let opts = RunOptions {
+			cancel: Some(token.clone()),
+			..RunOptions::default()
+		};
+		let _guard = arm_final_boundary_cancel("replay-preview-capture", token);
+		let err =
+			CommitReplayPreview::capture_with(&repo.path, &payload, &opts)
+				.expect_err(
+				"capture_with must fail at final boundary when token cancelled",
+			);
+		match err {
+			TransferError::Git(GitError::Cancelled { ref args }) => {
+				assert_eq!(args, "replay-preview");
+			}
+			other => {
+				panic!("expected Cancelled(replay-preview), got {other:?}")
+			}
+		}
+		assert_same(&before, &disk(&repo, "file.txt", "file.txt"));
+	}
+
+	#[test]
+	fn replay_preview_revalidate_cancels_at_final_boundary() {
+		let repo = Repo::new();
+		repo.write("file.txt", b"hello\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let before = disk(&repo, "file.txt", "file.txt");
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "incoming\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-26T00:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "file.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some("changed\n".into()),
+					not_copied: None,
+				}],
+			}],
+		};
+		let preview = CommitReplayPreview::capture(&repo.path, &payload)
+			.expect("setup capture must succeed");
+		let token = CancelToken::new();
+		let opts = RunOptions {
+			cancel: Some(token.clone()),
+			..RunOptions::default()
+		};
+		let _guard =
+			arm_final_boundary_cancel("replay-preview-revalidate", token);
+		let err = preview.revalidate_with(&opts).expect_err(
+			"revalidate_with must fail at final boundary when token cancelled",
+		);
+		match err {
+			TransferError::Git(GitError::Cancelled { ref args }) => {
+				assert_eq!(args, "replay-preview");
+			}
+			other => {
+				panic!("expected Cancelled(replay-preview), got {other:?}")
+			}
+		}
+		assert_same(&before, &disk(&repo, "file.txt", "file.txt"));
+	}
+}
+
+#[cfg(test)]
+mod root_retained_tests {
+	use super::*;
+
+	#[test]
+	fn canonical_root_heap_accessor_includes_spare_path_storage() {
+		let temp = tempfile::tempdir().unwrap();
+		let mut root = CanonicalRootId::new(temp.path()).unwrap();
+		let before = root.retained_heap_bytes();
+		root.0.reserve(8192);
+		assert!(root.retained_heap_bytes() > before);
+		assert_eq!(root.retained_heap_bytes(), root.0.capacity());
+		assert!(root.retained_heap_bytes() > root.path().as_os_str().len());
+	}
 }

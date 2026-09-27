@@ -6,15 +6,17 @@
 //! user had staged stays out of the new commits.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::fsutil::{must_not_overwrite, write_text_file};
-use crate::gitrun::RunOptions;
-use crate::gitsrc::{parse_raw_z, Git, GitError, EMPTY_TREE};
+use crate::gitrun::{CancelToken, RunOptions};
+use crate::gitsrc::{
+	CappedBlob, CatFile, Git, GitError, RawZ, SkippedBlob, EMPTY_TREE,
+};
 use crate::paths::{escapes_all_roots, resolve_write_target};
 use crate::workspace::{lock_heavy, RepoIdentity};
 
@@ -41,6 +43,24 @@ pub enum CommitError {
 	NotCommitPayload,
 	#[error("invalid commits payload: {0}")]
 	InvalidPayload(String),
+	/// The clipboard document (marker, newline, JSON) would exceed the cap.
+	/// `actual` is the size already measured, or a lower bound when a blob
+	/// was refused from its header before the body was kept.
+	#[error(
+		"commit export exceeds {limit} serialized bytes (at least {actual})"
+	)]
+	PayloadLimit { limit: usize, actual: usize },
+}
+
+/// Clipboard document produced by [`copy_commits_with`].
+///
+/// `text` is exactly [`to_clipboard_text`] of `payload`, counted by the same
+/// serde JSON encoder. Native code can put `text` on the clipboard and use
+/// `payload` for [`copy_summary`] without serializing a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitExport {
+	pub payload: CommitsPayload,
+	pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -94,6 +114,36 @@ pub struct CommitRecord {
 pub struct CommitsPayload {
 	/// Oldest first, the order they are replayed in.
 	pub commits: Vec<CommitRecord>,
+}
+
+impl CommitsPayload {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. Wire fields and serialization are unchanged.
+	pub fn retained_heap_bytes(&self) -> usize {
+		let mut bytes =
+			self.commits.capacity() * std::mem::size_of::<CommitRecord>();
+		for commit in &self.commits {
+			bytes = bytes
+				.saturating_add(commit.message.capacity())
+				.saturating_add(commit.author_name.capacity())
+				.saturating_add(commit.author_email.capacity())
+				.saturating_add(commit.author_date.capacity())
+				.saturating_add(
+					commit.files.capacity() * std::mem::size_of::<CommitFile>(),
+				);
+			for file in &commit.files {
+				bytes = bytes
+					.saturating_add(file.path.capacity())
+					.saturating_add(
+						file.old_path.as_ref().map_or(0, String::capacity),
+					)
+					.saturating_add(
+						file.content.as_ref().map_or(0, String::capacity),
+					);
+			}
+		}
+		bytes
+	}
 }
 
 fn contiguous_chain(
@@ -190,133 +240,781 @@ fn lossy(bytes: &[u8]) -> String {
 	String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Reads one commit: metadata plus its change against the first parent.
-/// File contents are left for [`copy_commits`] to fill in: the returned
-/// list pairs a file index with the blob to read.
-fn read_commit(
-	git: &Git,
-	sha: &str,
-) -> Result<(CommitRecord, Vec<(usize, String)>), CommitError> {
-	let out =
-		git.run(&["log", "-1", "-z", "--format=%an%x00%ae%x00%aI%x00%B", sha])?;
-	let mut fields = out.splitn(4, |&b| b == 0);
-	let mut next = || fields.next().map(lossy);
-	let (Some(author_name), Some(author_email), Some(author_date)) =
-		(next(), next(), next())
-	else {
-		return Err(GitError::Malformed("commit metadata".into()).into());
-	};
-	let mut message = next().unwrap_or_default();
-	if message.ends_with('\0') {
-		message.pop();
-	}
-
-	let parent = match git.parents(sha)?.into_iter().next() {
-		Some(p) => p,
-		None if git.is_shallow()? => {
-			return Err(GitError::Shallow(sha.to_string()).into())
-		}
-		None => EMPTY_TREE.to_string(),
-	};
-	let raw = git.run(&[
-		"diff-tree",
-		"-r",
-		"-z",
-		"--raw",
-		"--no-abbrev",
-		"--no-commit-id",
-		"-M",
-		&parent,
-		sha,
-	])?;
-
-	let mut files = Vec::new();
-	let mut blobs = Vec::new();
-	for e in parse_raw_z(&raw)? {
-		let change = match e.status {
-			b'A' | b'C' => FileChange::Added,
-			b'D' => FileChange::Deleted,
-			b'R' => FileChange::Renamed,
-			_ => FileChange::Modified,
-		};
-		let path_ok = std::str::from_utf8(&e.path).is_ok()
-			&& e.old_path
-				.as_deref()
-				.is_none_or(|p| std::str::from_utf8(p).is_ok());
-		let special = if change == FileChange::Deleted {
-			is_special_mode(&e.old_mode)
-		} else {
-			is_special_mode(&e.new_mode)
-				|| (change == FileChange::Renamed
-					&& is_special_mode(&e.old_mode))
-		};
-		let (content, not_copied) = if !path_ok {
-			(None, Some(NotCopiedReason::NonUtf8Path))
-		} else if special {
-			(None, Some(NotCopiedReason::UnsupportedType))
-		} else {
-			if change != FileChange::Deleted {
-				blobs.push((files.len(), e.new_oid.clone()));
-			}
-			(None, None)
-		};
-		files.push(CommitFile {
-			path: lossy(&e.path),
-			old_path: e.old_path.as_deref().map(lossy),
-			change,
-			content,
-			not_copied,
-		});
-	}
-	let record = CommitRecord {
-		message,
-		author_name,
-		author_email,
-		author_date,
-		files,
-	};
-	Ok((record, blobs))
-}
-
 /// Reads `shas` (oldest first, as the selectors return them).
+///
+/// Legacy entry point: [`RunOptions::default`] and no total document cap.
+/// A UI that must cancel or bound the clipboard uses [`copy_commits_with`].
+/// Both share one reader. This wrapper does not apply the strict cap.
 pub fn copy_commits(
 	git: &Git,
 	shas: &[String],
 ) -> Result<CommitsPayload, CommitError> {
-	// Every metadata and diff call first: while this thread holds the
-	// cat-file slot it must not start another Git process.
-	let (mut commits, pending): (Vec<_>, Vec<_>) = shas
-		.iter()
-		.map(|sha| read_commit(git, sha))
-		.collect::<Result<Vec<_>, _>>()?
-		.into_iter()
-		.unzip();
-	let mut cat = git.cat_file()?;
-	for (record, blobs) in commits.iter_mut().zip(pending) {
-		for (i, oid) in blobs {
-			let (content, not_copied) = match cat.read(&oid)? {
-				None => (None, Some(NotCopiedReason::Unreadable)),
-				Some(b) if b.contains(&0) => {
-					(None, Some(NotCopiedReason::Binary))
-				}
-				Some(b) => match String::from_utf8(b) {
-					Ok(s) => (Some(s), None),
-					Err(_) => (None, Some(NotCopiedReason::NonUtf8)),
-				},
-			};
-			record.files[i].content = content;
-			record.files[i].not_copied = not_copied;
+	let (payload, _) =
+		export_commits_counted(git, shas, &RunOptions::default(), None)?;
+	Ok(payload)
+}
+
+/// Strict export of already-resolved commits for the native workbench.
+///
+/// `shas` is oldest first, the order [`select_last`] and [`select_range`]
+/// return. Selection itself stays with the caller. `opts` is passed into
+/// every Git process this call starts: commit metadata, the parent and
+/// shallow checks, `diff-tree`, each `cat-file --batch` read, and closing
+/// that session. Cancel kills and reaps that process tree; the budget slot
+/// is released only after cleanup.
+///
+/// `max_serialized_bytes` counts the whole clipboard document: the commit
+/// marker, the newline after it, and the JSON [`to_clipboard_text`] emits
+/// (keys, escapes, commas, nulls). It is not [`RunOptions::max_stdout`].
+/// A single Git command can still fail with [`GitError::OutputLimit`] when
+/// its own stdout cap is hit, including when `opts.overflow` is
+/// [`crate::gitrun::Overflow::Truncate`] — a short read is not a commit.
+///
+/// Admission walks one commit, then one diff record. A blob body is stored
+/// only when its raw size still fits in the bytes left for that file's
+/// JSON; a larger body is classified by a streaming scan and discarded.
+/// Valid text that cannot fit fails the whole export with
+/// [`CommitError::PayloadLimit`] (`actual` is then a lower bound: the
+/// document size if those bytes were inserted without JSON escapes).
+/// Binary, non-UTF-8, unreadable, symlink, and submodule files keep
+/// [`NotCopiedReason`] and omit content, so their raw size is not itself
+/// the budget. Nothing is truncated or dropped just to finish under the cap.
+///
+/// The returned [`CommitExport::text`] is `to_clipboard_text(&payload)` and
+/// its length is at most `max_serialized_bytes`. Replay and
+/// [`copy_summary`] keep using `payload`. Wire shape is unchanged.
+///
+/// ```ignore
+/// let export = copy_commits_with(&git, &oids, &opts, max_bytes)?;
+/// clipboard.write(&export.text);
+/// let summary = copy_summary(&export.payload, &export.text);
+/// ```
+pub fn copy_commits_with(
+	git: &Git,
+	shas: &[String],
+	opts: &RunOptions,
+	max_serialized_bytes: usize,
+) -> Result<CommitExport, CommitError> {
+	let (payload, total_wire_len) =
+		export_commits_counted(git, shas, opts, Some(max_serialized_bytes))?;
+	let text = to_clipboard_text_bounded(
+		&payload,
+		total_wire_len,
+		max_serialized_bytes,
+		opts.cancel.as_ref(),
+	)?;
+	debug_assert_eq!(text.len(), total_wire_len);
+	Ok(CommitExport { payload, text })
+}
+
+const EMPTY_PAYLOAD_WIRE_LEN: usize = COMMIT_MARKER.len() + 1 + 14;
+
+/// Lower bound on the clipboard document for `count` commits.
+///
+/// An empty record is the smallest [`CommitRecord`] serde emits. Real
+/// commits are at least this long, so a bound above `limit` cannot fit.
+/// This is one serialization of that empty record, not a growing prefix.
+pub(crate) fn min_commit_document_len(count: usize) -> usize {
+	let record = empty_commit_record_json_len();
+	if count == 0 {
+		EMPTY_PAYLOAD_WIRE_LEN
+	} else {
+		EMPTY_PAYLOAD_WIRE_LEN + count * record + (count - 1)
+	}
+}
+
+fn empty_commit_record_json_len() -> usize {
+	static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+	*LEN.get_or_init(|| {
+		let meta = CommitRecordMetaView {
+			message: "",
+			author_name: "",
+			author_email: "",
+			author_date: "",
+			files: &[],
+		};
+		serde_json::to_vec(&meta)
+			.expect("empty commit record serializes")
+			.len()
+	})
+}
+
+fn export_commits_counted(
+	git: &Git,
+	shas: &[String],
+	opts: &RunOptions,
+	limit: Option<usize>,
+) -> Result<(CommitsPayload, usize), CommitError> {
+	refuse_if_cancelled(opts, "commits")?;
+	let empty_wire_len = EMPTY_PAYLOAD_WIRE_LEN;
+	if let Some(max) = limit {
+		if empty_wire_len > max {
+			return Err(CommitError::PayloadLimit {
+				limit: max,
+				actual: empty_wire_len,
+			});
 		}
 	}
-	cat.close()?;
-	Ok(CommitsPayload { commits })
+	let mut commits = Vec::new();
+	let mut current_wire_len = empty_wire_len;
+	for sha in shas {
+		refuse_if_cancelled(opts, "commits")?;
+		export_one(git, sha, opts, limit, &mut commits, &mut current_wire_len)?;
+	}
+	refuse_if_cancelled(opts, "commits")?;
+	Ok((CommitsPayload { commits }, current_wire_len))
+}
+
+fn export_one(
+	git: &Git,
+	sha: &str,
+	opts: &RunOptions,
+	limit: Option<usize>,
+	commits: &mut Vec<CommitRecord>,
+	current_wire_len: &mut usize,
+) -> Result<(), CommitError> {
+	refuse_if_cancelled(opts, "export commit")?;
+	let out =
+		read_commit_meta_stdout(git, sha, opts, limit, *current_wire_len)?;
+	let (author_name, author_email, author_date, message) =
+		parse_commit_meta_borrowed(&out)?;
+	let meta_view = CommitRecordMetaView {
+		message: &message,
+		author_name: &author_name,
+		author_email: &author_email,
+		author_date: &author_date,
+		files: &[],
+	};
+	let meta_wire_len = measure_meta(&meta_view, opts.cancel.as_ref())?;
+	let commit_comma = if commits.is_empty() { 0 } else { 1 };
+	let projected_len = *current_wire_len + commit_comma + meta_wire_len;
+	if let Some(max) = limit {
+		if projected_len > max {
+			return Err(CommitError::PayloadLimit {
+				limit: max,
+				actual: projected_len,
+			});
+		}
+	}
+	refuse_if_cancelled(opts, "export commit")?;
+	let parent = parent_or_empty(git, sha, opts)?;
+	commits.push(CommitRecord {
+		message: message.into_owned(),
+		author_name: author_name.into_owned(),
+		author_email: author_email.into_owned(),
+		author_date: author_date.into_owned(),
+		files: Vec::new(),
+	});
+	*current_wire_len = projected_len;
+
+	// One diff buffer, capped by this call's stdout limit. Records are
+	// admitted as they are parsed; blob bodies are not queued ahead.
+	refuse_if_cancelled(opts, "diff-tree")?;
+	let raw = git_bytes(
+		git,
+		&[
+			"diff-tree",
+			"-r",
+			"-z",
+			"--raw",
+			"--no-abbrev",
+			"--no-commit-id",
+			"-M",
+			&parent,
+			sha,
+		],
+		opts,
+	)?;
+	#[cfg(test)]
+	trigger_post_diff_cancel_hook_if_active();
+
+	let mut records = RawZ::new(&raw);
+	let mut cat: Option<CatFile> = None;
+	let mut failed: Option<CommitError> = None;
+	while let Some(entry) = records.next_entry().transpose() {
+		refuse_if_cancelled(opts, "diff-tree scan")?;
+		match entry {
+			Ok(entry) => {
+				if let Err(err) = admit_entry(
+					git,
+					opts,
+					limit,
+					commits,
+					current_wire_len,
+					&mut cat,
+					entry,
+				) {
+					failed = Some(err);
+					break;
+				}
+			}
+			Err(err) => {
+				failed = Some(err.into());
+				break;
+			}
+		}
+	}
+	// Success closes the session (cleanup errors surface). Failure drops
+	// it, which kills and reaps the tree before the slot is released.
+	match (cat.take(), failed) {
+		(Some(cat), None) => cat.close()?,
+		(Some(cat), Some(err)) => {
+			drop(cat);
+			return Err(err);
+		}
+		(None, Some(err)) => return Err(err),
+		(None, None) => {}
+	}
+	refuse_if_cancelled(opts, "export commit")?;
+	Ok(())
+}
+
+fn read_commit_meta_stdout(
+	git: &Git,
+	sha: &str,
+	opts: &RunOptions,
+	limit: Option<usize>,
+	current_wire_len: usize,
+) -> Result<Vec<u8>, CommitError> {
+	let args = ["log", "-1", "-z", "--format=%an%x00%ae%x00%aI%x00%B", sha];
+	let label = args.join(" ");
+	refuse_if_cancelled(opts, &label)?;
+	let mut meta_opts = opts.clone();
+	let mut payload_limit_on_truncation = false;
+	if let Some(max) = limit {
+		let remaining = max.saturating_sub(current_wire_len);
+		if remaining < opts.max_stdout {
+			meta_opts.max_stdout = remaining.saturating_add(1);
+			payload_limit_on_truncation = true;
+		}
+	}
+	let out = match git.run_with(&args, &meta_opts) {
+		Ok(out) => out,
+		Err(GitError::OutputLimit { .. }) if payload_limit_on_truncation => {
+			return Err(CommitError::PayloadLimit {
+				limit: limit.unwrap(),
+				actual: current_wire_len.saturating_add(meta_opts.max_stdout),
+			});
+		}
+		Err(e) => return Err(e.into()),
+	};
+	if out.truncated {
+		if payload_limit_on_truncation {
+			return Err(CommitError::PayloadLimit {
+				limit: limit.unwrap(),
+				actual: current_wire_len.saturating_add(out.stdout.len()),
+			});
+		}
+		return Err(GitError::OutputLimit {
+			args: label,
+			limit: opts.max_stdout,
+		}
+		.into());
+	}
+	Ok(out.stdout)
+}
+
+fn parent_or_empty(
+	git: &Git,
+	sha: &str,
+	opts: &RunOptions,
+) -> Result<String, CommitError> {
+	match git.parents_with(sha, opts)?.into_iter().next() {
+		Some(parent) => Ok(parent),
+		None if git.is_shallow_with(opts)? => {
+			Err(GitError::Shallow(sha.to_string()).into())
+		}
+		None => Ok(EMPTY_TREE.to_string()),
+	}
+}
+
+type BorrowedMeta<'a> = (
+	std::borrow::Cow<'a, str>,
+	std::borrow::Cow<'a, str>,
+	std::borrow::Cow<'a, str>,
+	std::borrow::Cow<'a, str>,
+);
+
+fn parse_commit_meta_borrowed<'a>(
+	out: &'a [u8],
+) -> Result<BorrowedMeta<'a>, CommitError> {
+	let mut fields = out.splitn(4, |&b| b == 0);
+	let (Some(name), Some(email), Some(date)) =
+		(fields.next(), fields.next(), fields.next())
+	else {
+		return Err(GitError::Malformed("commit metadata".into()).into());
+	};
+	let mut msg = fields.next().unwrap_or_default();
+	if msg.ends_with(b"\0") {
+		msg = &msg[..msg.len().saturating_sub(1)];
+	}
+	Ok((
+		String::from_utf8_lossy(name),
+		String::from_utf8_lossy(email),
+		String::from_utf8_lossy(date),
+		String::from_utf8_lossy(msg),
+	))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitRecordMetaView<'a> {
+	message: &'a str,
+	author_name: &'a str,
+	author_email: &'a str,
+	author_date: &'a str,
+	files: &'a [CommitFile],
+}
+
+fn admit_entry(
+	git: &Git,
+	opts: &RunOptions,
+	limit: Option<usize>,
+	commits: &mut [CommitRecord],
+	current_wire_len: &mut usize,
+	cat: &mut Option<CatFile>,
+	entry: crate::gitsrc::RawEntry,
+) -> Result<(), CommitError> {
+	let change = match entry.status {
+		b'A' | b'C' => FileChange::Added,
+		b'D' => FileChange::Deleted,
+		b'R' => FileChange::Renamed,
+		_ => FileChange::Modified,
+	};
+	let path_ok = std::str::from_utf8(&entry.path).is_ok()
+		&& entry
+			.old_path
+			.as_deref()
+			.is_none_or(|p| std::str::from_utf8(p).is_ok());
+	let special = if change == FileChange::Deleted {
+		is_special_mode(&entry.old_mode)
+	} else {
+		is_special_mode(&entry.new_mode)
+			|| (change == FileChange::Renamed
+				&& is_special_mode(&entry.old_mode))
+	};
+	let mut file = CommitFile {
+		path: lossy(&entry.path),
+		old_path: entry.old_path.as_deref().map(lossy),
+		change,
+		content: None,
+		not_copied: None,
+	};
+	if !path_ok {
+		file.not_copied = Some(NotCopiedReason::NonUtf8Path);
+		return push_file(commits, current_wire_len, file, limit, opts);
+	}
+	if special {
+		file.not_copied = Some(NotCopiedReason::UnsupportedType);
+		return push_file(commits, current_wire_len, file, limit, opts);
+	}
+	if change == FileChange::Deleted {
+		return push_file(commits, current_wire_len, file, limit, opts);
+	}
+	let cat = open_cat(git, opts, cat)?;
+	admit_blob(
+		commits,
+		current_wire_len,
+		file,
+		cat,
+		&entry.new_oid,
+		opts,
+		limit,
+	)
+}
+
+fn open_cat<'a>(
+	git: &Git,
+	opts: &RunOptions,
+	slot: &'a mut Option<CatFile>,
+) -> Result<&'a mut CatFile, CommitError> {
+	if slot.is_none() {
+		refuse_if_cancelled(opts, "cat-file --batch")?;
+		*slot = Some(git.cat_file_with(opts.clone())?);
+	}
+	Ok(slot.as_mut().expect("cat-file open"))
+}
+
+fn admit_blob(
+	commits: &mut [CommitRecord],
+	current_wire_len: &mut usize,
+	mut file: CommitFile,
+	cat: &mut CatFile,
+	oid: &str,
+	opts: &RunOptions,
+	limit: Option<usize>,
+) -> Result<(), CommitError> {
+	let (max_retain, len_empty) = if let Some(max) = limit {
+		file.content = Some(String::new());
+		file.not_copied = None;
+		let commit = commits.last().expect("commit under admission");
+		let file_comma = if commit.files.is_empty() { 0 } else { 1 };
+		let empty_file_wire_len = measure_file(&file, opts.cancel.as_ref())?;
+		let len_empty = *current_wire_len + file_comma + empty_file_wire_len;
+		file.content = None;
+		if len_empty > max {
+			return Err(CommitError::PayloadLimit {
+				limit: max,
+				actual: len_empty,
+			});
+		}
+		((max - len_empty) as u64, Some(len_empty))
+	} else {
+		(u64::MAX, None)
+	};
+	file.content = None;
+	file.not_copied = None;
+	refuse_if_cancelled(opts, "cat-file")?;
+	match cat.read_blob_capped(oid, max_retain)? {
+		CappedBlob::Missing => {
+			file.not_copied = Some(NotCopiedReason::Unreadable);
+		}
+		CappedBlob::Retained(body) => {
+			if body.contains(&0) {
+				file.not_copied = Some(NotCopiedReason::Binary);
+			} else {
+				match String::from_utf8(body) {
+					Ok(text) => file.content = Some(text),
+					Err(_) => {
+						file.not_copied = Some(NotCopiedReason::NonUtf8);
+					}
+				}
+			}
+		}
+		CappedBlob::Skipped(SkippedBlob::Binary) => {
+			file.not_copied = Some(NotCopiedReason::Binary);
+		}
+		CappedBlob::Skipped(SkippedBlob::NotUtf8) => {
+			file.not_copied = Some(NotCopiedReason::NonUtf8);
+		}
+		CappedBlob::Skipped(SkippedBlob::TextLargerThanCap { size }) => {
+			let max = limit.expect("oversize text is only skipped under a cap");
+			let base = len_empty.expect("empty-content length");
+			let extra = usize::try_from(size).unwrap_or(usize::MAX);
+			return Err(CommitError::PayloadLimit {
+				limit: max,
+				actual: base.saturating_add(extra),
+			});
+		}
+	}
+	push_file(commits, current_wire_len, file, limit, opts)
+}
+
+fn push_file(
+	commits: &mut [CommitRecord],
+	current_wire_len: &mut usize,
+	file: CommitFile,
+	limit: Option<usize>,
+	opts: &RunOptions,
+) -> Result<(), CommitError> {
+	refuse_if_cancelled(opts, "commit file admission")?;
+	let commit = commits.last_mut().expect("commit under admission");
+	let file_comma = if commit.files.is_empty() { 0 } else { 1 };
+	let file_wire_len = measure_file(&file, opts.cancel.as_ref())?;
+	let new_wire_len = *current_wire_len + file_comma + file_wire_len;
+	if let Some(max) = limit {
+		if new_wire_len > max {
+			return Err(CommitError::PayloadLimit {
+				limit: max,
+				actual: new_wire_len,
+			});
+		}
+	}
+	commit.files.push(file);
+	*current_wire_len = new_wire_len;
+	Ok(())
+}
+
+fn git_bytes(
+	git: &Git,
+	args: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<u8>, CommitError> {
+	let label = args.join(" ");
+	refuse_if_cancelled(opts, &label)?;
+	let out = git.run_with(args, opts)?;
+	if out.truncated {
+		return Err(GitError::OutputLimit {
+			args: label,
+			limit: opts.max_stdout,
+		}
+		.into());
+	}
+	Ok(out.stdout)
+}
+
+fn refuse_if_cancelled(
+	opts: &RunOptions,
+	args: &str,
+) -> Result<(), CommitError> {
+	if opts.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+		return Err(GitError::Cancelled {
+			args: args.to_string(),
+		}
+		.into());
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct TestHookState {
+	token: Option<CancelToken>,
+	writes_before_cancel: usize,
+	writes_completed: usize,
+	bytes_before_cancel: usize,
+	writer_hook_triggered: bool,
+	cancel_post_diff: bool,
+	post_diff_hook_reached: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+	static TEST_HOOK: std::cell::RefCell<TestHookState> = std::cell::RefCell::new(TestHookState::default());
+	static TEST_SERDE_BYTES_COUNTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct TestHookGuard;
+
+#[cfg(test)]
+impl Drop for TestHookGuard {
+	fn drop(&mut self) {
+		TEST_HOOK.with(|h| *h.borrow_mut() = TestHookState::default());
+	}
+}
+
+#[cfg(test)]
+fn set_test_hook(state: TestHookState) -> TestHookGuard {
+	TEST_HOOK.with(|h| *h.borrow_mut() = state);
+	TestHookGuard
+}
+
+#[cfg(test)]
+fn get_test_hook_state() -> TestHookState {
+	TEST_HOOK.with(|h| h.borrow().clone())
+}
+
+#[cfg(test)]
+fn reset_serde_bytes_counted() {
+	TEST_SERDE_BYTES_COUNTED.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn get_serde_bytes_counted() -> usize {
+	TEST_SERDE_BYTES_COUNTED.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn trigger_writer_cancel_after_progress(buf_len: usize) {
+	TEST_HOOK.with(|hook| {
+		let mut state = hook.borrow_mut();
+		if state.writes_before_cancel > 0
+			&& state.token.is_some()
+			&& !state.writer_hook_triggered
+		{
+			state.writes_completed += 1;
+			state.bytes_before_cancel += buf_len;
+			if state.writes_completed >= state.writes_before_cancel {
+				if let Some(token) = &state.token {
+					token.cancel();
+				}
+				state.writer_hook_triggered = true;
+			}
+		}
+	});
+}
+
+#[cfg(test)]
+fn trigger_post_diff_cancel_hook_if_active() {
+	TEST_HOOK.with(|hook| {
+		let mut state = hook.borrow_mut();
+		if state.cancel_post_diff {
+			if let Some(token) = &state.token {
+				token.cancel();
+			}
+			state.post_diff_hook_reached = true;
+		}
+	});
+}
+
+#[cfg(test)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PayloadView<'a> {
+	commits: &'a [CommitRecord],
+}
+
+struct ByteCounter<'a> {
+	count: usize,
+	cancel: Option<&'a CancelToken>,
+}
+
+impl<'a> Write for ByteCounter<'a> {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		if let Some(token) = self.cancel {
+			if token.is_cancelled() {
+				return Err(io::Error::other("cancelled"));
+			}
+		}
+		self.count = self.count.saturating_add(buf.len());
+		#[cfg(test)]
+		{
+			TEST_SERDE_BYTES_COUNTED
+				.with(|c| c.set(c.get().saturating_add(buf.len())));
+			trigger_writer_cancel_after_progress(buf.len());
+		}
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
+fn measure_meta(
+	meta: &CommitRecordMetaView<'_>,
+	cancel: Option<&CancelToken>,
+) -> Result<usize, CommitError> {
+	let mut counter = ByteCounter { count: 0, cancel };
+	serde_json::to_writer(&mut counter, meta).map_err(|e| {
+		if cancel.is_some_and(CancelToken::is_cancelled) {
+			CommitError::Git(GitError::Cancelled {
+				args: "meta serialize".to_string(),
+			})
+		} else {
+			CommitError::InvalidPayload(e.to_string())
+		}
+	})?;
+	Ok(counter.count)
+}
+
+fn measure_file(
+	file: &CommitFile,
+	cancel: Option<&CancelToken>,
+) -> Result<usize, CommitError> {
+	let mut counter = ByteCounter { count: 0, cancel };
+	serde_json::to_writer(&mut counter, file).map_err(|e| {
+		if cancel.is_some_and(CancelToken::is_cancelled) {
+			CommitError::Git(GitError::Cancelled {
+				args: "file serialize".to_string(),
+			})
+		} else {
+			CommitError::InvalidPayload(e.to_string())
+		}
+	})?;
+	Ok(counter.count)
+}
+
+struct CancellableBoundedWriter<'a> {
+	buffer: Vec<u8>,
+	max_bytes: usize,
+	cancel: Option<&'a CancelToken>,
+}
+
+impl<'a> Write for CancellableBoundedWriter<'a> {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		if let Some(token) = self.cancel {
+			if token.is_cancelled() {
+				return Err(io::Error::other("cancelled"));
+			}
+		}
+		if self.buffer.len().saturating_add(buf.len()) > self.max_bytes {
+			return Err(io::Error::other("payload limit exceeded"));
+		}
+		self.buffer.extend_from_slice(buf);
+		#[cfg(test)]
+		{
+			TEST_SERDE_BYTES_COUNTED
+				.with(|c| c.set(c.get().saturating_add(buf.len())));
+			trigger_writer_cancel_after_progress(buf.len());
+		}
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
+fn to_clipboard_text_bounded(
+	payload: &CommitsPayload,
+	expected_len: usize,
+	max_bytes: usize,
+	cancel: Option<&CancelToken>,
+) -> Result<String, CommitError> {
+	if let Some(token) = cancel {
+		if token.is_cancelled() {
+			return Err(GitError::Cancelled {
+				args: "serialize".to_string(),
+			}
+			.into());
+		}
+	}
+	if expected_len > max_bytes {
+		return Err(CommitError::PayloadLimit {
+			limit: max_bytes,
+			actual: expected_len,
+		});
+	}
+	let mut buffer = Vec::with_capacity(expected_len);
+	buffer.extend_from_slice(COMMIT_MARKER.as_bytes());
+	buffer.push(b'\n');
+	let mut writer = CancellableBoundedWriter {
+		buffer,
+		max_bytes,
+		cancel,
+	};
+	serde_json::to_writer(&mut writer, payload).map_err(|_| {
+		if cancel.is_some_and(CancelToken::is_cancelled) {
+			CommitError::Git(GitError::Cancelled {
+				args: "serialize".to_string(),
+			})
+		} else {
+			CommitError::PayloadLimit {
+				limit: max_bytes,
+				actual: writer.buffer.len(),
+			}
+		}
+	})?;
+	if let Some(token) = cancel {
+		if token.is_cancelled() {
+			return Err(GitError::Cancelled {
+				args: "serialize".to_string(),
+			}
+			.into());
+		}
+	}
+	let text =
+		String::from_utf8(writer.buffer).expect("serde JSON is valid utf-8");
+	Ok(text)
+}
+
+/// Marker, newline, and serde JSON of `commits`. Same bytes as
+/// [`to_clipboard_text`] for that payload.
+#[cfg(test)]
+fn wire_len(commits: &[CommitRecord]) -> usize {
+	let mut counter = ByteCounter {
+		count: 0,
+		cancel: None,
+	};
+	counter
+		.write_all(COMMIT_MARKER.as_bytes())
+		.expect("counter write");
+	counter.write_all(b"\n").expect("counter write");
+	serde_json::to_writer(&mut counter, &PayloadView { commits })
+		.expect("commit payload serializes");
+	counter.count
 }
 
 /// The clipboard text: marker line, then JSON.
 pub fn to_clipboard_text(payload: &CommitsPayload) -> String {
-	let json = serde_json::to_string(payload)
+	let mut buf = Vec::new();
+	buf.extend_from_slice(COMMIT_MARKER.as_bytes());
+	buf.push(b'\n');
+	serde_json::to_writer(&mut buf, payload)
 		.expect("commit payload always serializes");
-	format!("{COMMIT_MARKER}\n{json}")
+	String::from_utf8(buf).expect("commit payload always produces valid utf-8")
 }
 
 /// Same rule as [`crate::clip::detect_mode`]: the marker is the first line.
@@ -407,6 +1105,43 @@ pub struct CommitReplayPlan {
 	pub commits: Vec<CommitPlan>,
 }
 
+impl CommitReplayPlan {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. Includes every replay path and repeated commit metadata.
+	pub fn retained_heap_bytes(&self) -> usize {
+		let mut bytes = self.root.capacity()
+			+ self.commits.capacity() * std::mem::size_of::<CommitPlan>();
+		for commit in &self.commits {
+			bytes = bytes
+				.saturating_add(commit.message.capacity())
+				.saturating_add(commit.author_name.capacity())
+				.saturating_add(commit.author_email.capacity())
+				.saturating_add(commit.author_date.capacity())
+				.saturating_add(
+					commit.files.capacity() * std::mem::size_of::<FilePlan>(),
+				);
+			for file in &commit.files {
+				bytes = bytes
+					.saturating_add(file.path.capacity())
+					.saturating_add(
+						file.old_path.as_ref().map_or(0, String::capacity),
+					)
+					.saturating_add(
+						file.absolute_path
+							.as_ref()
+							.map_or(0, PathBuf::capacity),
+					)
+					.saturating_add(
+						file.old_absolute_path
+							.as_ref()
+							.map_or(0, PathBuf::capacity),
+					);
+			}
+		}
+		bytes
+	}
+}
+
 /// A repo-relative path that passes the restore path rules. Anything the
 /// resolver would rewrite (absolute, root-labelled, `./`) is refused: git
 /// only ever produces plain relative paths.
@@ -455,8 +1190,12 @@ fn plan_file(root: &Path, f: &CommitFile) -> FilePlan {
 		return plan;
 	};
 	// A symlink is replaced, not written through: its target is irrelevant.
+	// Keep the path on a non-UTF-8 skip so freshness can see that exact file
+	// without inventing a second planner.
 	if !deleted && !is_symlink(&abs) && must_not_overwrite(&abs) {
 		plan.skip_reason = Some(ReplaySkipReason::NonUtf8Target);
+		plan.existed = abs.exists();
+		plan.absolute_path = Some(abs);
 		return plan;
 	}
 	plan.action = if deleted {
@@ -485,15 +1224,40 @@ pub fn plan_commit_replay(
 	git: &Git,
 	payload: &CommitsPayload,
 ) -> CommitReplayPlan {
+	plan_commit_replay_with(git, payload, &RunOptions::default())
+		.expect("replay planning with default options has no cancel token")
+}
+
+/// [`plan_commit_replay`] that polls `opts` before each commit and file.
+///
+/// Each file still goes through the same `plan_file` rules. Encoding classification reads
+/// at most 8 MiB in one `read` ([`crate::fsutil::must_not_overwrite`]); that
+/// call cannot be interrupted. The token is checked before the next file.
+pub fn plan_commit_replay_with(
+	git: &Git,
+	payload: &CommitsPayload,
+	opts: &RunOptions,
+) -> Result<CommitReplayPlan, CommitError> {
+	refuse_if_cancelled(opts, "replay-plan")?;
 	let root = git.root().to_path_buf();
-	CommitReplayPlan {
-		commits: payload
-			.commits
-			.iter()
-			.map(|c| plan_commit(&root, c))
-			.collect(),
-		root,
+	let mut commits = Vec::new();
+	for commit in &payload.commits {
+		refuse_if_cancelled(opts, "replay-plan")?;
+		let mut files = Vec::new();
+		for file in &commit.files {
+			refuse_if_cancelled(opts, "replay-plan")?;
+			files.push(plan_file(&root, file));
+		}
+		commits.push(CommitPlan {
+			message: commit.message.clone(),
+			author_name: commit.author_name.clone(),
+			author_email: commit.author_email.clone(),
+			author_date: commit.author_date.clone(),
+			files,
+		});
 	}
+	refuse_if_cancelled(opts, "replay-plan")?;
+	Ok(CommitReplayPlan { commits, root })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
@@ -711,6 +1475,7 @@ fn run_commit(
 mod tests {
 	use super::*;
 	use std::process::Command;
+	use std::time::Duration;
 
 	struct Repo {
 		dir: tempfile::TempDir,
@@ -1187,5 +1952,332 @@ mod tests {
 			"x\n"
 		);
 		assert!(dst.path().join("other/y.txt").exists());
+	}
+
+	#[test]
+	fn wire_len_matches_clipboard_text_for_escapes() {
+		let file = |path: &str, content: Option<&str>, reason| CommitFile {
+			path: path.into(),
+			old_path: Some("old \"name\".txt".into()),
+			change: FileChange::Renamed,
+			content: content.map(str::to_string),
+			not_copied: reason,
+		};
+		let payload = CommitsPayload {
+			commits: vec![
+				CommitRecord {
+					message: "say \"hi\"\nline\\two\n".into(),
+					author_name: "Alice \"A\"".into(),
+					author_email: "a@ex.com".into(),
+					author_date: "2024-03-04T05:06:07+08:00".into(),
+					files: vec![
+						file("你好.txt", Some("\"q\"\n\\p\n\u{1}😀"), None),
+						file("bin", None, Some(NotCopiedReason::Binary)),
+					],
+				},
+				CommitRecord {
+					message: String::new(),
+					author_name: String::new(),
+					author_email: String::new(),
+					author_date: String::new(),
+					files: Vec::new(),
+				},
+			],
+		};
+		let text = to_clipboard_text(&payload);
+		assert_eq!(wire_len(&payload.commits), text.len());
+		assert_eq!(parse_commit_payload(&text).unwrap(), payload);
+		assert!(text.contains("\\u0001"));
+		assert!(text.starts_with("// snip-sync commits v1\n{"));
+	}
+
+	#[test]
+	fn min_commit_document_len_matches_empty_commits() {
+		let empty = CommitRecord {
+			message: String::new(),
+			author_name: String::new(),
+			author_email: String::new(),
+			author_date: String::new(),
+			files: Vec::new(),
+		};
+		for n in 0..4 {
+			let payload = CommitsPayload {
+				commits: vec![empty.clone(); n],
+			};
+			assert_eq!(
+				min_commit_document_len(n),
+				to_clipboard_text(&payload).len(),
+				"n={n}"
+			);
+		}
+	}
+
+	#[test]
+	fn bounded_writer_matches_to_clipboard_text() {
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "test message\n".into(),
+				author_name: "Alice \"Special\"".into(),
+				author_email: "alice@example.com".into(),
+				author_date: "2024-01-01T00:00:00Z".into(),
+				files: vec![CommitFile {
+					path: "test.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("hello \"world\"\n\\escaped\n".into()),
+					not_copied: None,
+				}],
+			}],
+		};
+		let text = to_clipboard_text(&payload);
+		let bounded =
+			to_clipboard_text_bounded(&payload, text.len(), text.len(), None)
+				.unwrap();
+		assert_eq!(bounded, text);
+
+		let err = to_clipboard_text_bounded(
+			&payload,
+			text.len(),
+			text.len() - 1,
+			None,
+		)
+		.unwrap_err();
+		match err {
+			CommitError::PayloadLimit { limit, actual } => {
+				assert_eq!(limit, text.len() - 1);
+				assert_eq!(actual, text.len());
+			}
+			other => panic!("expected PayloadLimit, got {other}"),
+		}
+	}
+
+	#[test]
+	fn mid_count_cancellation_aborts_immediately_without_looping() {
+		let token = CancelToken::new();
+		let file = CommitFile {
+			path: "foo.txt".to_string(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("a".repeat(1000)),
+			not_copied: None,
+		};
+		let (tx, rx) = std::sync::mpsc::channel();
+		let token_clone = token.clone();
+		let handle = std::thread::spawn(move || {
+			let _guard = set_test_hook(TestHookState {
+				token: Some(token_clone.clone()),
+				writes_before_cancel: 2,
+				..TestHookState::default()
+			});
+			assert!(
+				!token_clone.is_cancelled(),
+				"token must be uncancelled at entry guard"
+			);
+			let res = measure_file(&file, Some(&token_clone));
+			let state = get_test_hook_state();
+			let _ = tx.send((res, state));
+		});
+		let (result, hook_state) =
+			rx.recv_timeout(Duration::from_secs(2)).expect(
+				"timed out: old Write::write_all retried Interrupted forever",
+			);
+		let _ = handle.join();
+
+		assert!(
+			hook_state.writer_hook_triggered,
+			"target writer hook must have triggered"
+		);
+		assert!(
+			hook_state.writes_completed >= 2,
+			"must have completed at least 2 writes before cancel"
+		);
+		assert!(
+			hook_state.bytes_before_cancel > 0,
+			"must have accepted bytes before cancel"
+		);
+		match result {
+			Err(CommitError::Git(GitError::Cancelled { args })) => {
+				assert!(
+					args.contains("file serialize"),
+					"unexpected args: {args}"
+				);
+			}
+			other => panic!("expected Cancelled, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn mid_final_serialization_cancellation_aborts_immediately_without_looping()
+	{
+		let token = CancelToken::new();
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "test message\n".to_string(),
+				author_name: "Ada".to_string(),
+				author_email: "ada@example.com".to_string(),
+				author_date: "2024-01-01T00:00:00Z".to_string(),
+				files: vec![CommitFile {
+					path: "foo.txt".to_string(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("hello world".to_string()),
+					not_copied: None,
+				}],
+			}],
+		};
+		let (tx, rx) = std::sync::mpsc::channel();
+		let token_clone = token.clone();
+		let handle = std::thread::spawn(move || {
+			let _guard = set_test_hook(TestHookState {
+				token: Some(token_clone.clone()),
+				writes_before_cancel: 2,
+				..TestHookState::default()
+			});
+			assert!(
+				!token_clone.is_cancelled(),
+				"token must be uncancelled at entry guard"
+			);
+			let res = to_clipboard_text_bounded(
+				&payload,
+				500,
+				1000,
+				Some(&token_clone),
+			);
+			let state = get_test_hook_state();
+			let _ = tx.send((res, state));
+		});
+		let (result, hook_state) =
+			rx.recv_timeout(Duration::from_secs(2)).expect(
+				"timed out: old Write::write_all retried Interrupted forever",
+			);
+		let _ = handle.join();
+
+		assert!(
+			hook_state.writer_hook_triggered,
+			"target writer hook must have triggered"
+		);
+		assert!(
+			hook_state.writes_completed >= 2,
+			"must have completed at least 2 writes before cancel"
+		);
+		assert!(
+			hook_state.bytes_before_cancel > 0,
+			"must have accepted bytes before cancel"
+		);
+		match result {
+			Err(CommitError::Git(GitError::Cancelled { args })) => {
+				assert!(args.contains("serialize"), "unexpected args: {args}");
+			}
+			other => panic!("expected Cancelled, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn no_blob_last_commit_post_diff_cancellation_returns_cancelled() {
+		let repo = Repo::new("main");
+		repo.write("a.txt", b"hello world\n");
+		let _sha1 = repo.commit("add a.txt", "2024-01-01T00:00:00Z");
+		repo.cmd(&["rm", "a.txt"]).output().unwrap();
+		let sha2 = repo.commit("delete a.txt", "2024-01-02T00:00:00Z");
+		let git = repo.open();
+
+		let token = CancelToken::new();
+		let (tx, rx) = std::sync::mpsc::channel();
+		let token_clone = token.clone();
+		let handle = std::thread::spawn(move || {
+			let _guard = set_test_hook(TestHookState {
+				token: Some(token_clone.clone()),
+				cancel_post_diff: true,
+				..TestHookState::default()
+			});
+			assert!(
+				!token_clone.is_cancelled(),
+				"token must be uncancelled at start"
+			);
+			let opts = RunOptions {
+				cancel: Some(token_clone),
+				..RunOptions::default()
+			};
+			let res = copy_commits_with(&git, &[sha2], &opts, usize::MAX);
+			let state = get_test_hook_state();
+			let _ = tx.send((res, state));
+		});
+		let (res, hook_state) = rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("worker timed out");
+		let _ = handle.join();
+
+		assert!(
+			hook_state.post_diff_hook_reached,
+			"post-diff hook must have been reached"
+		);
+		match res {
+			Err(CommitError::Git(GitError::Cancelled { .. })) => {}
+			Ok(_) => panic!("expected cancellation error, but export succeeded on cancelled deletion commit"),
+			Err(other) => panic!("expected Cancelled error, got: {other}"),
+		}
+	}
+
+	#[test]
+	fn many_files_scaling_proves_linear_serde_counting_not_quadratic() {
+		// Test with 40 files
+		let repo1 = Repo::new("main");
+		for i in 0..40 {
+			repo1.write(
+				&format!("file_{i:03}.txt"),
+				format!("content for file {i}\n").as_bytes(),
+			);
+		}
+		let sha1 = repo1.commit("40 files", "2024-01-01T00:00:00Z");
+		let git1 = repo1.open();
+		reset_serde_bytes_counted();
+		let export1 = copy_commits_with(
+			&git1,
+			&[sha1],
+			&RunOptions::default(),
+			usize::MAX,
+		)
+		.unwrap();
+		let counted1 = get_serde_bytes_counted();
+		let len1 = export1.text.len();
+
+		// Test with 80 files
+		let repo2 = Repo::new("main");
+		for i in 0..80 {
+			repo2.write(
+				&format!("file_{i:03}.txt"),
+				format!("content for file {i}\n").as_bytes(),
+			);
+		}
+		let sha2 = repo2.commit("80 files", "2024-01-01T00:00:00Z");
+		let git2 = repo2.open();
+		reset_serde_bytes_counted();
+		let export2 = copy_commits_with(
+			&git2,
+			&[sha2],
+			&RunOptions::default(),
+			usize::MAX,
+		)
+		.unwrap();
+		let counted2 = get_serde_bytes_counted();
+		let len2 = export2.text.len();
+
+		assert!(
+			counted1 < len1 * 3,
+			"counted1 {counted1} exceeded 3x text length {len1}"
+		);
+		assert!(
+			counted2 < len2 * 3,
+			"counted2 {counted2} exceeded 3x text length {len2}"
+		);
+		let scaling_ratio = (counted2 as f64) / (counted1 as f64);
+		let size_ratio = (len2 as f64) / (len1 as f64);
+		eprintln!(
+			"Scaling metrics: 40 files -> len={len1}, counted={counted1}; 80 files -> len={len2}, counted={counted2}; size_ratio={size_ratio:.2}, scaling_ratio={scaling_ratio:.2}"
+		);
+		assert!(
+			scaling_ratio < size_ratio * 1.5,
+			"scaling ratio {scaling_ratio:.2} indicates super-linear/quadratic growth (size ratio {size_ratio:.2})"
+		);
 	}
 }

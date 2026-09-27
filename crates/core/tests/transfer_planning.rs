@@ -37,10 +37,11 @@ use snip_core::gitsrc::{self, Git, GitSource};
 use snip_core::restore::{self, RestoreSelection, SkipReason};
 use snip_core::settings::{FilterAction, FilterRule, FilterType, Settings};
 use snip_core::transfer::{
-	detect_clipboard_prefixes, plan_commit_export, plan_export, plan_import,
-	validate_commit_selection, CanonicalRootId, DestinationFreshnessSnapshot,
-	ExportItem, ExportSelection, ImportMapping, SourceFreshnessSnapshot,
-	SourceKind, TransferError,
+	detect_clipboard_prefixes, plan_commit_export, plan_commit_export_exact,
+	plan_export, plan_import, validate_commit_selection, CanonicalRootId,
+	CommitReplayPreview, DestinationFreshnessSnapshot, ExportItem,
+	ExportSelection, ImportMapping, SourceFreshnessSnapshot, SourceKind,
+	TransferError,
 };
 
 struct TestRepo {
@@ -2319,6 +2320,137 @@ fn test_deleted_sources_read_distinct_bases_and_match_legacy_working() {
 }
 
 #[test]
+fn exact_commit_set_keeps_selected_tip_and_rejects_side_commits() {
+	let repo = TestRepo::new("exact-commits");
+	repo.write("root.txt", "root\n");
+	let root = repo.commit("root");
+	repo.write("main.txt", "main\n");
+	let _main_mid = repo.commit("on main");
+	repo.git(&["checkout", "-q", "-b", "side", &root]);
+	repo.write("side.txt", "side\n");
+	let side = repo.commit("on side");
+	repo.git(&["checkout", "-q", "main"]);
+	repo.write("main2.txt", "main2\n");
+	let main_tip = repo.commit("main tip");
+	let git = repo.open();
+
+	let err = plan_commit_export_exact(
+		&git,
+		&main_tip,
+		&[main_tip.clone(), side.clone(), root.clone()],
+	)
+	.unwrap_err();
+	assert!(
+		matches!(err, TransferError::DiscontinuousCommits { .. }),
+		"{err}"
+	);
+
+	let skipped = plan_commit_export_exact(
+		&git,
+		&main_tip,
+		&[main_tip.clone(), root.clone()],
+	)
+	.unwrap_err();
+	assert!(
+		matches!(skipped, TransferError::DiscontinuousCommits { .. }),
+		"{skipped}"
+	);
+
+	let payload =
+		plan_commit_export_exact(&git, &side, &[side.clone(), root.clone()])
+			.unwrap();
+	assert_eq!(payload.commits.len(), 2);
+	assert!(payload.commits[0].message.starts_with("root"));
+	assert!(payload.commits[1].message.starts_with("on side"));
+	assert!(payload
+		.commits
+		.iter()
+		.any(|c| { c.files.iter().any(|f| f.path == "side.txt") }));
+	assert!(!payload
+		.commits
+		.iter()
+		.any(|c| { c.files.iter().any(|f| f.path == "main2.txt") }));
+
+	let only_root =
+		plan_commit_export_exact(&git, &root, std::slice::from_ref(&root))
+			.unwrap();
+	assert_eq!(only_root.commits.len(), 1);
+	assert!(only_root.commits[0].message.starts_with("root"));
+
+	let head_last = plan_commit_export(&git, None, Some(2)).unwrap();
+	assert!(head_last.commits.iter().any(|c| {
+		c.message.starts_with("main tip")
+			|| c.files.iter().any(|f| f.path == "main2.txt")
+	}));
+	assert_ne!(
+		payload.commits.last().unwrap().message,
+		head_last.commits.last().unwrap().message
+	);
+}
+
+#[test]
+fn commit_replay_preview_rejects_head_index_content_and_absence_changes() {
+	use snip_core::commits::{
+		self, CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+
+	let repo = TestRepo::new("replay-fresh");
+	repo.write("a.txt", "base\n");
+	repo.commit("base");
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "a.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("incoming\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+	preview.revalidate().unwrap();
+
+	repo.write("a.txt", "external change\n");
+	assert!(preview.revalidate().is_err());
+	assert_eq!(
+		fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+		"external change\n"
+	);
+
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+	repo.git(&["add", "a.txt"]);
+	assert!(
+		preview.revalidate().is_err(),
+		"index change after preview must be stale"
+	);
+
+	let create = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "add b\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "b.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("new\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let absent = CommitReplayPreview::capture(repo.path(), &create).unwrap();
+	repo.write("b.txt", "appeared\n");
+	assert!(absent.revalidate().is_err());
+	assert!(!commits::to_clipboard_text(&create).is_empty());
+}
+
+#[test]
 fn test_broken_index_is_an_error_not_a_deleted_marker() {
 	let src = TestRepo::new("src-repo");
 	src.write("f.txt", "body\n");
@@ -2335,4 +2467,135 @@ fn test_broken_index_is_an_error_not_a_deleted_marker() {
 	.unwrap();
 	let err = plan_export(&selection, &Settings::default(), None).unwrap_err();
 	assert!(matches!(err, TransferError::Git(_)), "{err:?}");
+}
+
+#[test]
+fn skipped_non_utf8_replay_target_becomes_stale_when_it_turns_writable() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange, ReplayAction,
+		ReplaySkipReason,
+	};
+
+	let repo = TestRepo::new("skip-fresh");
+	repo.write("a.txt", "base\n");
+	repo.commit("base");
+	let head = repo.git(&["rev-parse", "HEAD"]);
+	let index = repo.git(&["rev-parse", ":a.txt"]);
+	fs::write(repo.path().join("a.txt"), [0xff, 0xfe, 0x01]).unwrap();
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "a.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("incoming\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+	assert_eq!(
+		preview.replay.commits[0].files[0].action,
+		ReplayAction::Skip
+	);
+	assert_eq!(
+		preview.replay.commits[0].files[0].skip_reason,
+		Some(ReplaySkipReason::NonUtf8Target)
+	);
+	assert!(
+		preview
+			.freshness
+			.target_files
+			.keys()
+			.any(|path| path.ends_with("a.txt")),
+		"the skipped file has to be in the freshness snapshot"
+	);
+	preview.revalidate().unwrap();
+
+	fs::write(repo.path().join("a.txt"), "external change\n").unwrap();
+	let err = preview.revalidate().unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"{err}"
+	);
+	assert_eq!(
+		fs::read(repo.path().join("a.txt")).unwrap(),
+		b"external change\n"
+	);
+	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head);
+	assert_eq!(repo.git(&["rev-parse", ":a.txt"]), index);
+
+	// A payload that was not copied stays skipped when the destination changes.
+	let not_copied = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "skip source\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "a.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: None,
+				not_copied: Some(snip_core::commits::NotCopiedReason::Binary),
+			}],
+		}],
+	};
+	let skipped =
+		CommitReplayPreview::capture(repo.path(), &not_copied).unwrap();
+	assert_eq!(
+		skipped.replay.commits[0].files[0].skip_reason,
+		Some(ReplaySkipReason::NotCopied)
+	);
+	fs::write(repo.path().join("a.txt"), "still external\n").unwrap();
+	skipped.revalidate().unwrap();
+	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head);
+}
+
+#[cfg(unix)]
+#[test]
+fn unsafe_symlink_replay_parent_is_not_followed_and_becomes_stale() {
+	let repo = TestRepo::new("skip-link");
+	repo.write("a.txt", "base\n");
+	repo.commit("base");
+	let outside = repo.path().parent().unwrap().join("outside-secret");
+	fs::write(&outside, b"secret-bytes").unwrap();
+	std::os::unix::fs::symlink(&outside, repo.path().join("link")).unwrap();
+	let payload = snip_core::commits::CommitsPayload {
+		commits: vec![snip_core::commits::CommitRecord {
+			message: "through link\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![snip_core::commits::CommitFile {
+				path: "link/a.txt".into(),
+				old_path: None,
+				change: snip_core::commits::FileChange::Added,
+				content: Some("incoming\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let before = fs::read(&outside).unwrap();
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+	assert_eq!(fs::read(&outside).unwrap(), before);
+	assert_eq!(
+		preview.replay.commits[0].files[0].skip_reason,
+		Some(snip_core::commits::ReplaySkipReason::UnsafePath)
+	);
+	assert!(preview.replay.commits[0].files[0].absolute_path.is_none());
+	assert!(preview.freshness.target_files.is_empty());
+	fs::remove_file(repo.path().join("link")).unwrap();
+	fs::create_dir(repo.path().join("link")).unwrap();
+	fs::write(repo.path().join("link/a.txt"), "external\n").unwrap();
+	assert!(preview.revalidate().is_err());
+	assert_eq!(
+		fs::read(repo.path().join("link/a.txt")).unwrap(),
+		b"external\n"
+	);
+	assert_eq!(fs::read(&outside).unwrap(), before);
 }
