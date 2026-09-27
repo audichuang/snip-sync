@@ -634,7 +634,18 @@ impl WorkbenchModel {
 		}
 	}
 
-	pub fn set_preview(&mut self, p: Preview) {
+	pub fn set_preview(&mut self, p: Preview) -> bool {
+		if let Err(err) = paste::admit_preview_state(
+			Some(&p),
+			self.paste_preview.as_ref(),
+			self.paste_detail.as_ref(),
+		) {
+			self.preview_loading = false;
+			self.preview_error = None;
+			self.status = err;
+			app_log!("[APP:PREVIEW_REFUSED: reason=retained_budget]");
+			return false;
+		}
 		if e2e_on() {
 			let (kind, rev) = match &p.source {
 				PreviewSource::WorkingFile => ("working_file", "-".to_string()),
@@ -671,6 +682,7 @@ impl WorkbenchModel {
 		self.reader.reset_for_new_preview();
 		// Re-run an active find against the new text.
 		self.reader.matches.clear();
+		true
 	}
 
 	pub fn deselect_all_files(&mut self, cx: &mut Context<Self>) {
@@ -2110,10 +2122,11 @@ impl WorkbenchModel {
 					}
 					return;
 				}
-				model.apply_source_preview(file_path.clone(), result);
-				app_log!("[APP:PREVIEW_LOADED: {}]", file_path);
-				if model.mode == "preview" {
-					ready_marker("PREVIEW");
+				if model.apply_source_preview(file_path.clone(), result) {
+					app_log!("[APP:PREVIEW_LOADED: {}]", file_path);
+					if model.mode == "preview" {
+						ready_marker("PREVIEW");
+					}
 				}
 				cx.notify();
 			});
@@ -2125,7 +2138,7 @@ impl WorkbenchModel {
 		&mut self,
 		path: String,
 		result: Result<(browser::SourcePreview, PreviewSource), String>,
-	) {
+	) -> bool {
 		match result {
 			Ok((p, source)) => {
 				if !p.patch.is_empty() {
@@ -2135,7 +2148,7 @@ impl WorkbenchModel {
 						p.patch,
 						true,
 						Language::Diff,
-					));
+					))
 				} else if let Some(content) = p.content {
 					let lang = Language::from_path_or_ext(&path, false);
 					self.set_preview(Preview::new(
@@ -2144,17 +2157,19 @@ impl WorkbenchModel {
 						content,
 						false,
 						lang,
-					));
+					))
 				} else {
 					self.preview = None;
 					self.preview_loading = false;
 					self.preview_error = Some(Msg::new("error_binary", [path]));
+					false
 				}
 			}
 			Err(e) => {
 				self.preview = None;
 				self.preview_loading = false;
 				self.preview_error = Some(Msg::new("error_preview", [path, e]));
+				false
 			}
 		}
 	}
@@ -2825,6 +2840,14 @@ impl WorkbenchModel {
 				return;
 			}
 		};
+		if text.len() > paste::MAX_RETAINED_PREVIEW_BYTES {
+			self.status = paste::preview_budget_error();
+			self.restore_log_after_paste();
+			self.pending_focus = Some(self.focus_handle.clone());
+			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
+			cx.notify();
+			return;
+		}
 
 		let target_dest = self.current_restore_destination();
 		let known_roots: Vec<std::path::PathBuf> =
@@ -2876,8 +2899,13 @@ impl WorkbenchModel {
 		built: Result<PastePreviewPlan, Msg>,
 		target_dest: &std::path::Path,
 	) {
-		match built {
-			Ok(plan) => {
+		// Clear first even if a future caller bypasses trigger_paste_preview.
+		self.paste_preview = None;
+		self.paste_detail = None;
+		match built
+			.and_then(|plan| plan.admit_with_preview(self.preview.as_ref()))
+		{
+			Ok((plan, detail)) => {
 				for choice in &plan.prefix_choices {
 					for (idx, path) in choice.candidates.iter().enumerate() {
 						app_log!(
@@ -2899,6 +2927,7 @@ impl WorkbenchModel {
 					[plan.items.len().to_string()],
 				);
 				self.paste_preview = Some(plan);
+				self.paste_detail = detail;
 				if collapse_log_for_paste(
 					&mut self.log_before_paste,
 					&mut self.bottom_visible,
@@ -2907,7 +2936,8 @@ impl WorkbenchModel {
 						"[APP:LOG_PANEL: visible=false reason=paste_open]"
 					);
 				}
-				self.refresh_paste_detail();
+				self.paste_scroll
+					.scroll_to_item(0, gpui::ScrollStrategy::Top);
 				self.pending_focus = Some(self.paste_focus.clone());
 			}
 			Err(err) => {
@@ -2915,6 +2945,26 @@ impl WorkbenchModel {
 				self.restore_log_after_paste();
 				self.status = err;
 				self.pending_focus = Some(self.focus_handle.clone());
+			}
+		}
+	}
+
+	/// Keep full write/read diagnostics in status, but do not let a newly
+	/// allocated diagnostic grow an already admitted plan past its tier.
+	fn set_paste_error(&mut self, err: Msg) {
+		self.status = err.clone();
+		if let Some(plan) = &mut self.paste_preview {
+			plan.error = Some(err);
+		}
+		if paste::admit_preview_state(
+			self.preview.as_ref(),
+			self.paste_preview.as_ref(),
+			self.paste_detail.as_ref(),
+		)
+		.is_err()
+		{
+			if let Some(plan) = &mut self.paste_preview {
+				plan.error = Some(paste::preview_budget_error());
 			}
 		}
 	}
@@ -2930,7 +2980,7 @@ impl WorkbenchModel {
 			Ok(()) => self.rebuild_paste_plan(prefix.to_string(), true, cx),
 			Err(err) => {
 				app_log!("[APP:PASTE_ERR: {}]", err.key);
-				plan.error = Some(err);
+				self.set_paste_error(err);
 				cx.notify();
 			}
 		}
@@ -2962,7 +3012,7 @@ impl WorkbenchModel {
 			Ok(()) => self.rebuild_paste_plan(prefix.to_string(), false, cx),
 			Err(err) => {
 				app_log!("[APP:PASTE_ERR: {}]", err.key);
-				plan.error = Some(err);
+				self.set_paste_error(err);
 				cx.notify();
 			}
 		}
@@ -2985,8 +3035,18 @@ impl WorkbenchModel {
 		};
 		plan.clear_file_plan();
 		plan.error = None;
-		let mut work = plan.clone();
 		self.paste_detail = None;
+		if let Err(err) =
+			paste::admit_preview_state(self.preview.as_ref(), Some(plan), None)
+		{
+			self.invalidate_paste_job();
+			self.paste_preview = None;
+			self.status = err;
+			self.restore_log_after_paste();
+			cx.notify();
+			return;
+		}
+		let mut work = plan.clone();
 		let (cancel, seq, ws_gen) = self.arm_paste_job();
 		self.set_status("paste_loading", []);
 		app_log!("[APP:PASTE_LOADING]");
@@ -3013,8 +3073,10 @@ impl WorkbenchModel {
 						cx.notify();
 						return;
 					}
-					match rebuilt {
-						Ok(()) => {
+					match rebuilt.and_then(|()| {
+						work.admit_with_preview(model.preview.as_ref())
+					}) {
+						Ok((work, detail)) => {
 							let dest = prefix_target(&work, &prefix, keep);
 							let keep_note =
 								if keep { " keep=primary" } else { "" };
@@ -3030,12 +3092,27 @@ impl WorkbenchModel {
 								[work.items.len().to_string()],
 							);
 							model.paste_preview = Some(work);
-							model.refresh_paste_detail();
+							model.paste_detail = detail;
+							model
+								.paste_scroll
+								.scroll_to_item(0, gpui::ScrollStrategy::Top);
 						}
 						Err(err) => {
 							app_log!("[APP:PASTE_ERR: {}]", err.key);
 							if let Some(plan) = model.paste_preview.as_mut() {
-								plan.error = Some(err);
+								plan.error = Some(err.clone());
+							}
+							model.status = err;
+							if paste::admit_preview_state(
+								model.preview.as_ref(),
+								model.paste_preview.as_ref(),
+								None,
+							)
+							.is_err()
+							{
+								model.paste_preview = None;
+								model.status = paste::preview_budget_error();
+								model.restore_log_after_paste();
 							}
 						}
 					}
@@ -3083,34 +3160,26 @@ impl WorkbenchModel {
 
 	pub fn select_paste_item(&mut self, idx: usize, cx: &mut Context<Self>) {
 		// Read-only navigation stays available while applying.
-		if let Some(ref mut p) = self.paste_preview {
-			if idx < p.items.len() {
-				p.selected_item_idx = idx;
-				app_log!("[APP:PASTE_NAV: idx={}]", idx);
-				self.refresh_paste_detail();
+		if let Some(plan) = &mut self.paste_preview {
+			if idx < plan.items.len() {
+				match plan.select_detail(
+					idx,
+					self.preview.as_ref(),
+					&mut self.paste_detail,
+				) {
+					Ok(()) => {
+						app_log!("[APP:PASTE_NAV: idx={}]", idx);
+						self.paste_scroll
+							.scroll_to_item(0, gpui::ScrollStrategy::Top);
+					}
+					Err(err) => {
+						self.status = err;
+						app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
+					}
+				}
 				cx.notify();
 			}
 		}
-	}
-
-	/// Builds the one retained detail text for the selected paste item.
-	fn refresh_paste_detail(&mut self) {
-		self.paste_detail = self
-			.paste_preview
-			.as_ref()
-			.and_then(|p| p.items.get(p.selected_item_idx))
-			.filter(|i| !i.is_delete)
-			.map(|i| {
-				Preview::new(
-					PreviewSource::PasteItem,
-					Some(i.path.clone()),
-					i.content.to_string(),
-					false,
-					Language::from_path_or_ext(&i.path, false),
-				)
-			});
-		self.paste_scroll
-			.scroll_to_item(0, gpui::ScrollStrategy::Top);
 	}
 
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
@@ -3215,6 +3284,13 @@ impl WorkbenchModel {
 							if let Some(ref mut p) = model.paste_preview {
 								p.is_applying = false;
 								p.error = Some(err);
+							}
+							if paste::admit_preview_state(model.preview.as_ref(), model.paste_preview.as_ref(), model.paste_detail.as_ref()).is_err() {
+								// Keep the actual write outcome in status. A large
+								// diagnostic must not grow the retained plan tier.
+								if let Some(p) = &mut model.paste_preview {
+									p.error = Some(paste::preview_budget_error());
+								}
 							}
 						}
 					}
@@ -3512,9 +3588,9 @@ fn read_preview(
 			},
 			preview_source,
 		)),
-		Err(_) => browser::file_preview(repo_root, path)
-			.map(|p| (p, PreviewSource::WorkingFile))
-			.map_err(|e| e.to_string()),
+		// A failed/cancelled Git source must never be replaced by current
+		// working-tree bytes. Explicit File/tree sources are handled above.
+		Err(e) => Err(e.to_string()),
 	}
 }
 
@@ -3752,6 +3828,72 @@ fn restore_log_after_paste(
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn read_preview_missing_revision_never_falls_back_to_working_bytes() {
+		let dir = tempfile::tempdir().unwrap();
+		let git = |args: &[&str]| {
+			let out = std::process::Command::new("git")
+				.current_dir(dir.path())
+				.args(args)
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"git {args:?}: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+		};
+		git(&["init", "-q", "-b", "main"]);
+		git(&["config", "user.name", "Preview test"]);
+		git(&["config", "user.email", "preview@example.invalid"]);
+		std::fs::write(dir.path().join("a.txt"), "committed A\n").unwrap();
+		git(&["add", "a.txt"]);
+		git(&["commit", "-qm", "A"]);
+		std::fs::write(dir.path().join("a.txt"), "staged A\n").unwrap();
+		git(&["add", "a.txt"]);
+		std::fs::write(dir.path().join("a.txt"), "working B\n").unwrap();
+		let result = super::read_preview(
+			dir.path(),
+			"a.txt",
+			&super::SourceKind::Commit {
+				rev: "refs/heads/missing-preview-revision".into(),
+			},
+			false,
+			super::CancelToken::new(),
+		);
+		assert!(
+			result.is_err(),
+			"missing commit must not display working B as a successful preview"
+		);
+		let (staged, source) = super::read_preview(
+			dir.path(),
+			"a.txt",
+			&super::SourceKind::Staged,
+			false,
+			super::CancelToken::new(),
+		)
+		.unwrap();
+		assert_eq!(source, super::PreviewSource::StagedChanges);
+		assert_eq!(staged.content.as_deref(), Some("staged A\n"));
+		assert!(!staged.patch.contains("working B"));
+		git(&["rm", "-q", "-f", "a.txt"]);
+		let (deleted, source) = super::read_preview(
+			dir.path(),
+			"a.txt",
+			&super::SourceKind::Staged,
+			false,
+			super::CancelToken::new(),
+		)
+		.unwrap();
+		assert_eq!(source, super::PreviewSource::StagedChanges);
+		assert!(deleted.patch.contains("-committed A"));
+		assert!(deleted
+			.content
+			.as_deref()
+			.is_some_and(|body| body.contains("committed A")
+				&& !body.contains("working B")));
+	}
+
 	#[test]
 	fn test_paste_log_collapse_and_restore() {
 		// Open then close restores the visible log, exactly once.

@@ -15,15 +15,13 @@
 //! `plan_commit_export_exact_with`. `Git::open_with` is used for every open
 //! that sits in front of a reader which already takes that token.
 //!
-//! Calls that still have no token are drained, not described as cancelled:
+//! Native change listing and preview pass the job's options through nested
+//! metadata, revision and cat-file reads (`list_changed_paths_with` and
+//! `git_preview_with`). Remaining blocking filesystem reads are drained:
 //! - `browser::file_preview` from `read_preview` in `main.rs`, for a project
-//!   tree file and for `SourceKind::File`, and again when `git_preview_with`
-//!   returns an error. It reads with `std::fs`.
-//! - `gitsrc::list_changed_paths` from `load_change_list` in `history.rs`.
-//! - `gitsrc::read_changed_file` and the private `collect_changes` it uses,
-//!   both via `Git::run` with [`snip_core::gitrun::RunOptions::default`]. `browser::git_preview_with`
-//!   calls `read_changed_file` before its own diff. Native reaches that from
-//!   `read_preview`, `select_commit_file`, and `load_change_list`.
+//!   tree file and for `SourceKind::File`, reads with bounded `std::fs` I/O.
+//! - Working-file content inside `read_changed_file_with` checks cancellation
+//!   around its bounded filesystem read, but cannot interrupt the OS read.
 //!
 //! Paste-preview planning is read-only and receives the paste job's token:
 //! `PastePreviewPlan::build_from_clipboard_text_with` and

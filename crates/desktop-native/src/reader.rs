@@ -64,6 +64,43 @@ pub struct Preview {
 }
 
 impl Preview {
+	/// Retained reader data, including spare vector/string/path capacity and
+	/// an Arc header/alignment allowance. Shared text is conservatively counted
+	/// again when two retained previews refer to it. Renderer/font allocations
+	/// and Reader's search/row-geometry metadata belong to other budget tiers.
+	pub fn retained_bytes(&self) -> usize {
+		let source_bytes = match &self.source {
+			PreviewSource::CommitDiff { sha }
+			| PreviewSource::CommitFile { sha } => sha.capacity(),
+			PreviewSource::Compare { from, to } => {
+				from.capacity().saturating_add(to.capacity())
+			}
+			_ => 0,
+		};
+		let mut bytes = std::mem::size_of::<Self>()
+			.saturating_add(source_bytes)
+			.saturating_add(self.path.as_ref().map_or(0, String::capacity))
+			.saturating_add(self.text.len())
+			.saturating_add(3 * std::mem::size_of::<usize>())
+			.saturating_add(
+				self.lines.capacity() * std::mem::size_of::<Range<u32>>(),
+			)
+			.saturating_add(self.notice.as_ref().map_or(0, String::capacity));
+		if let Some(diff) = &self.diff {
+			bytes = bytes
+				.saturating_add(
+					diff.inline.capacity() * std::mem::size_of::<InlineRow>(),
+				)
+				.saturating_add(
+					diff.side.capacity() * std::mem::size_of::<SideRow>(),
+				)
+				.saturating_add(
+					diff.shown.capacity() * std::mem::size_of::<usize>(),
+				);
+		}
+		bytes
+	}
+
 	pub fn new(
 		source: PreviewSource,
 		path: Option<String>,
@@ -1201,6 +1238,36 @@ fn tint_marker(hl: &mut Vec<(Range<usize>, HighlightStyle)>, c: gpui::Rgba) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn retained_bytes_counts_spare_diff_and_source_capacity() {
+		let mut p = Preview::new(
+			PreviewSource::CommitDiff {
+				sha: String::with_capacity(8192),
+			},
+			Some("a.txt".into()),
+			"@@ -1 +1 @@\n-a\n+b\n".into(),
+			true,
+			Language::Diff,
+		);
+		assert!(p.retained_bytes() > 8192);
+		let before = p.retained_bytes();
+		let rows = &mut p.diff.as_mut().unwrap().side;
+		let old = rows.capacity();
+		rows.reserve(4096);
+		let growth = (rows.capacity() - old) * std::mem::size_of::<SideRow>();
+		assert_eq!(p.retained_bytes(), before + growth);
+		let before = p.retained_bytes();
+		let old = p.lines.capacity();
+		p.lines.reserve(4096);
+		assert_eq!(
+			p.retained_bytes(),
+			before
+				+ (p.lines.capacity() - old)
+					* std::mem::size_of::<Range<u32>>()
+		);
+		assert_eq!(p.text.as_ref(), "@@ -1 +1 @@\n-a\n+b\n");
+	}
 
 	fn preview(text: &str, diff: bool) -> Preview {
 		Preview::new(

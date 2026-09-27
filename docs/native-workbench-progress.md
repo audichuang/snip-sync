@@ -1,6 +1,13 @@
 > **歷史 worker 紀錄，非驗收報告。** 本文描述的舊 UI 與記憶體數據已被後續審查取代或拒絕；不得據此宣稱完成或通過效能門檻。請以 [交付規格](native-workbench-delivery-spec.md)、[監督紀錄](native-workbench-supervision.md) 和經獨立核實的 checkpoint 為準。
 
-## 2026-09-27 最新增量：Graph 容量與 XIM 啟動競態
+## 2026-09-27 最新增量：來源安全、預覽容量與協作驗收
+
+- `c77a516` 修正內層 Git 讀取遺失取消／逾時／stdout 上限，以及 cat-file 非零退出被隱藏的問題；兩個根因均有舊版 red／修正版 green。242 core unit、94 parity 和 native 81 unit 通過；root 另重跑 12 read／runner 測試與 native all-targets clippy。
+- 原生預覽不再把失敗的 commit／staged 讀取改成工作目錄內容。已接納 reader／貼上 plan／detail 以 capacity 合計限制 32 MiB；原始與解析膨脹超限都拒絕整筆。root 真視窗回歸驗證先建立可覆寫 plan，再送出兩種超限 payload，錯誤可見、舊 Apply 撤銷、檔案與剪貼簿未變，且正常退出。
+- 協作 driver 已提交 `4724e92`：固定 X11 release pilot 的雙端各 15 repo、18/18 情境通過，36 apps 乾淨退出；root 核對 148 個 artifact hash、144 個程序身分無殘留。腳本整合後 340 harness tests 通過。最終產品 binary 仍須重跑。
+- 等待中的 worker、tree／basket／selector 合計與高亮清理尚在接續；32 MiB UI admission 不代表全域 64 MiB 達標。正式效能、資源長測、Linux 平台其餘項目、preflight 與 macOS／Windows CI 尚未完成，未推送、未發版。
+
+## 2026-09-27 增量：Graph 容量與 XIM 啟動競態
 
 已提交 `09c9927`：GPUI 等待 XIM 握手完成後才發送 IC 操作，避免早期搜尋框點擊永久破壞輸入法連線。原 release 驗收與獨立的強制握手時序回歸均通過全部九階段；詳見 [監督紀錄](native-workbench-supervision.md)。AGY 額度耗盡後已依使用者授權改派 Codex 子 agent。Graph 16 MiB admission 與失敗換頁回歸已通過獨立 unit／真 UI 驗證，20k commits 實際分頁通過；協作、preview 等容量層與正式效能量測仍在接續；完整 Linux、CI 與跨平台 runtime 仍未驗收。
 

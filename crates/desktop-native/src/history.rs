@@ -1192,9 +1192,10 @@ impl WorkbenchModel {
 						};
 						let git = Git::open_with(&root, &opts)
 							.map_err(|e| e.to_string())?;
-						// `list_changed_paths` still uses default Git options.
-						let files = gitsrc::list_changed_paths(&git, &source)
-							.map_err(|e| e.to_string())?;
+						let files = gitsrc::list_changed_paths_with(
+							&git, &source, &opts,
+						)
+						.map_err(|e| e.to_string())?;
 						let first = files.first().map(|(p, _)| {
 							(
 								p.clone(),
@@ -1308,11 +1309,12 @@ impl WorkbenchModel {
 					if model.preview_generation != task_generation {
 						return;
 					}
-					model.apply_source_preview(
+					if model.apply_source_preview(
 						path.clone(),
 						res.map(|p| (p, psource)),
-					);
-					app_log!("[APP:PREVIEW_LOADED: {}]", path);
+					) {
+						app_log!("[APP:PREVIEW_LOADED: {}]", path);
+					}
 					cx.notify();
 				});
 			},
@@ -1533,13 +1535,15 @@ impl WorkbenchModel {
 					match res {
 						Ok(BlobText::Text(s)) => {
 							let lang = Language::from_path_or_ext(&path, false);
-							model.set_preview(Preview::new(
+							if model.set_preview(Preview::new(
 								PreviewSource::CommitFile { sha: sha.clone() },
 								Some(path.clone()),
 								s,
 								false,
 								lang,
-							));
+							)) {
+								app_log!("[APP:PREVIEW_LOADED: {}]", path);
+							}
 						}
 						Ok(BlobText::Binary) => {
 							model.preview_error =
@@ -1562,7 +1566,6 @@ impl WorkbenchModel {
 							))
 						}
 					}
-					app_log!("[APP:PREVIEW_LOADED: {}]", path);
 					cx.notify();
 				});
 			},

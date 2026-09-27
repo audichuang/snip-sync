@@ -436,6 +436,37 @@ pub struct DestinationFreshnessSnapshot {
 }
 
 impl DestinationFreshnessSnapshot {
+	/// Capacity estimate ONLY for fresh insertion-only capture tables below.
+	/// Removal/tombstones can make HashMap::capacity understate its buckets;
+	/// this is deliberately private, not an estimator for arbitrary public maps.
+	fn fresh_capture_heap_bytes(&self) -> usize {
+		let mut bytes = fresh_capture_table_bytes::<
+			CanonicalRootId,
+			RepoFreshness,
+		>(self.roots.capacity())
+		.saturating_add(fresh_capture_table_bytes::<
+			PathBuf,
+			TargetFileFreshness,
+		>(self.target_files.capacity()));
+		for (root, state) in &self.roots {
+			bytes = bytes
+				.saturating_add(root.0.capacity())
+				.saturating_add(
+					state.head_commit.as_ref().map_or(0, String::capacity),
+				)
+				.saturating_add(
+					state.head_ref.as_ref().map_or(0, String::capacity),
+				);
+		}
+		for (path, state) in &self.target_files {
+			bytes = bytes
+				.saturating_add(path.capacity())
+				.saturating_add(state.root.0.capacity())
+				.saturating_add(state.relative_path.capacity());
+		}
+		bytes
+	}
+
 	pub fn capture(
 		destination_roots: &[PathBuf],
 		plan: &RestorePlan,
@@ -454,6 +485,8 @@ impl DestinationFreshnessSnapshot {
 		opts: &RunOptions,
 	) -> Result<Self, TransferError> {
 		cancelled_err(opts, "import-freshness")?;
+		// Fresh tables, insertion only: preserve this creation invariant for
+		// fresh_capture_heap_bytes. Do not reuse a previously edited snapshot.
 		let mut roots = HashMap::new();
 		for root in destination_roots {
 			cancelled_err(opts, "import-freshness")?;
@@ -599,6 +632,21 @@ pub struct TransferImportPlan {
 }
 
 impl TransferImportPlan {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. The private snapshot is captured into fresh insertion-only
+	/// maps and is never mutated, as required by its table-size estimate.
+	pub fn retained_heap_bytes(&self) -> usize {
+		let mut bytes = self.roots.capacity() * std::mem::size_of::<PathBuf>();
+		for root in &self.roots {
+			bytes = bytes.saturating_add(root.capacity());
+		}
+		bytes
+			.saturating_add(self.restore_plan.retained_heap_bytes())
+			.saturating_add(
+				self.destination_freshness.fresh_capture_heap_bytes(),
+			)
+	}
+
 	pub fn roots(&self) -> &[PathBuf] {
 		&self.roots
 	}
@@ -640,6 +688,26 @@ impl TransferImportPlan {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Conservative requested table bytes for std's current SwissTable, for
+/// insertion-only captures. A fresh table has at least half its buckets in
+/// capacity (small tables leave one free; large tables leave one eighth).
+/// Two buckets per capacity slot therefore overestimates storage. Include a
+/// control byte per bucket, a trailing control group and alignment padding.
+/// The supported std targets use groups at most 16 bytes wide; 64 is a
+/// conservative allowance. This is not allocator usable-size/RSS accounting
+/// and MUST be revisited if std changes its HashMap layout.
+fn fresh_capture_table_bytes<K, V>(capacity: usize) -> usize {
+	if capacity == 0 {
+		return 0;
+	}
+	let alignment = std::mem::align_of::<(K, V)>().max(64);
+	capacity
+		.saturating_mul(2)
+		.saturating_mul(std::mem::size_of::<(K, V)>().saturating_add(1))
+		.saturating_add(64)
+		.saturating_add(alignment - 1)
+}
 
 fn not_found_as_none<T>(
 	res: io::Result<T>,
@@ -2378,6 +2446,18 @@ pub struct CommitReplayPreview {
 }
 
 impl CommitReplayPreview {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. Call only on a fresh capture whose public freshness maps
+	/// have not been mutated: its conservative table estimate assumes the
+	/// insertion-only construction in capture_replay_freshness.
+	pub fn retained_heap_bytes(&self) -> usize {
+		self.destination
+			.capacity()
+			.saturating_add(self.payload.retained_heap_bytes())
+			.saturating_add(self.replay.retained_heap_bytes())
+			.saturating_add(self.freshness.fresh_capture_heap_bytes())
+	}
+
 	pub fn capture(
 		dest: &Path,
 		payload: &CommitsPayload,
@@ -2479,6 +2559,8 @@ fn capture_replay_freshness(
 	opts: &RunOptions,
 ) -> Result<DestinationFreshnessSnapshot, TransferError> {
 	cancelled_err(opts, "replay-freshness")?;
+	// Fresh tables, insertion only: preserve this creation invariant for
+	// fresh_capture_heap_bytes. Do not reuse a previously edited snapshot.
 	let mut roots = HashMap::new();
 	let id = CanonicalRootId::new(root)?;
 	id.validate()?;

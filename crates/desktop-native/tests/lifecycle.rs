@@ -1931,6 +1931,77 @@ fn paste_preview_cancel_stops_the_read_and_writes_nothing() {
 	quit_cleanly(&mut app, &wid);
 }
 
+/// Both raw and plan-amplified overflow invalidate a previously armed restore.
+#[test]
+fn paste_budget_refusal_disarms_the_previous_plan() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = copy_fixture();
+	let protected = fx.dest.join("protected.txt");
+	let would_create = fx.dest.join("would-create.txt");
+	let sentinel = b"keep these destination bytes\n";
+	fs::write(&protected, sentinel).unwrap();
+	let (mut app, wid) = spawn_copy_app(&fx);
+	click(&wid, "btn-locale");
+	lines_until(&app.rx, "[APP:LOCALE: En]", Duration::from_secs(4));
+
+	for (case, raw_bytes) in [
+		("raw", 32 * 1024 * 1024 + 1),
+		("amplified", 12 * 1024 * 1024),
+	] {
+		clip_set("// FILE: protected.txt\nreplacement\n// FILE: would-create.txt\nnew bytes\n");
+		click(&wid, "btn-paste");
+		lines_until(
+			&app.rx,
+			"[APP:PASTE_PREVIEW: items=2",
+			Duration::from_secs(8),
+		);
+		click(&wid, "paste-overwrite:protected.txt");
+		let armed =
+			lines_until(&app.rx, "[APP:PASTE_TOGGLED:", Duration::from_secs(4));
+		assert!(armed.last().unwrap().contains("state=true"));
+		let _ = control("btn-apply");
+
+		let mut payload = String::from("// FILE: oversized.txt\n");
+		payload.extend(std::iter::repeat_n('x', raw_bytes - payload.len()));
+		assert_eq!(payload.len(), raw_bytes);
+		clip_set(&payload);
+		click(&wid, "btn-paste");
+		let refused = lines_until(
+			&app.rx,
+			"[APP:PASTE_ERR: preview_memory_limit]",
+			Duration::from_secs(15),
+		);
+		assert!(position(&refused, "[APP:PASTE_PLAN_CLEARED]").is_some());
+		assert_eq!(
+			position(&refused, "[APP:PASTE_LOADING]").is_some(),
+			case == "amplified",
+			"{case} did not exercise its expected admission path: {refused:?}"
+		);
+		absent("btn-apply");
+		absent("paste-row:protected.txt");
+		let _ = control("status-bar");
+		capture(
+			&wid,
+			&integration_shots().join(format!("paste-budget-{case}.png")),
+		);
+		key(&wid, "Return");
+		let settled = lines_for(&app.rx, Duration::from_millis(500));
+		assert!(refused.iter().chain(&settled).all(|line| {
+			!line.contains("[APP:PASTE_APPLYING]")
+				&& !line.contains("[APP:PASTE_DONE:")
+				&& !line.contains("[APP:PASTE_PREVIEW:")
+		}));
+		assert_eq!(fs::read(&protected).unwrap(), sentinel);
+		assert!(!would_create.exists(), "{case} applied the stale create");
+		assert!(!fx.dest.join("oversized.txt").exists());
+		assert_eq!(clip_get(), payload, "{case} modified the clipboard");
+	}
+	quit_cleanly(&mut app, &wid);
+}
+
 /// A second paste while the first is still read: only the newer one lands.
 #[test]
 fn newer_paste_replaces_the_one_still_loading() {

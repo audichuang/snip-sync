@@ -116,6 +116,36 @@ pub struct CommitsPayload {
 	pub commits: Vec<CommitRecord>,
 }
 
+impl CommitsPayload {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. Wire fields and serialization are unchanged.
+	pub fn retained_heap_bytes(&self) -> usize {
+		let mut bytes =
+			self.commits.capacity() * std::mem::size_of::<CommitRecord>();
+		for commit in &self.commits {
+			bytes = bytes
+				.saturating_add(commit.message.capacity())
+				.saturating_add(commit.author_name.capacity())
+				.saturating_add(commit.author_email.capacity())
+				.saturating_add(commit.author_date.capacity())
+				.saturating_add(
+					commit.files.capacity() * std::mem::size_of::<CommitFile>(),
+				);
+			for file in &commit.files {
+				bytes = bytes
+					.saturating_add(file.path.capacity())
+					.saturating_add(
+						file.old_path.as_ref().map_or(0, String::capacity),
+					)
+					.saturating_add(
+						file.content.as_ref().map_or(0, String::capacity),
+					);
+			}
+		}
+		bytes
+	}
+}
+
 fn contiguous_chain(
 	git: &Git,
 	rev_list_out: &[u8],
@@ -1073,6 +1103,43 @@ pub struct CommitPlan {
 pub struct CommitReplayPlan {
 	pub root: PathBuf,
 	pub commits: Vec<CommitPlan>,
+}
+
+impl CommitReplayPlan {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. Includes every replay path and repeated commit metadata.
+	pub fn retained_heap_bytes(&self) -> usize {
+		let mut bytes = self.root.capacity()
+			+ self.commits.capacity() * std::mem::size_of::<CommitPlan>();
+		for commit in &self.commits {
+			bytes = bytes
+				.saturating_add(commit.message.capacity())
+				.saturating_add(commit.author_name.capacity())
+				.saturating_add(commit.author_email.capacity())
+				.saturating_add(commit.author_date.capacity())
+				.saturating_add(
+					commit.files.capacity() * std::mem::size_of::<FilePlan>(),
+				);
+			for file in &commit.files {
+				bytes = bytes
+					.saturating_add(file.path.capacity())
+					.saturating_add(
+						file.old_path.as_ref().map_or(0, String::capacity),
+					)
+					.saturating_add(
+						file.absolute_path
+							.as_ref()
+							.map_or(0, PathBuf::capacity),
+					)
+					.saturating_add(
+						file.old_absolute_path
+							.as_ref()
+							.map_or(0, PathBuf::capacity),
+					);
+			}
+		}
+		bytes
+	}
 }
 
 /// A repo-relative path that passes the restore path rules. Anything the
