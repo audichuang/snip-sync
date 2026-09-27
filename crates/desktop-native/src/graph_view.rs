@@ -22,6 +22,8 @@ use crate::theme::pal;
 pub const ROW_HEIGHT: f32 = crate::theme::ROW_H;
 pub const LANE_WIDTH: f32 = 16.0;
 pub const OFFSET_X: f32 = 14.0;
+/// Commit dot radius (IntelliJ's log dot at a 24px row).
+pub const NODE_RADIUS: f32 = 3.5;
 
 /// Owned backing storage only; the enclosing struct/vector accounts for headers.
 pub(crate) fn vec_bytes<T>(values: &Vec<T>) -> usize {
@@ -106,7 +108,7 @@ pub const MAX_GUTTER_LANES: usize = 24;
 
 pub fn gutter_width(layout: &GraphLayout) -> f32 {
 	let max_lane = layout.rows.iter().map(|r| r.max_lane).max().unwrap_or(0);
-	((max_lane + 1).min(MAX_GUTTER_LANES) as f32) * LANE_WIDTH + 24.0
+	((max_lane + 1).min(MAX_GUTTER_LANES) as f32) * LANE_WIDTH + 8.0
 }
 
 /// Label text and text color for a ref; the background is the shared `ref_bg`.
@@ -117,10 +119,54 @@ pub fn format_ref_badge(info: &RefInfo) -> (String, Rgba) {
 		RefKind::RemoteBranch { remote, name } => {
 			(format!("{remote}/{name}"), rgb(pal().ref_remote))
 		}
-		RefKind::Tag => {
-			(format!("tag: {}", info.display_name), rgb(pal().ref_tag))
-		}
+		RefKind::Tag => (info.display_name.clone(), rgb(pal().ref_tag)),
 		RefKind::Other => (info.display_name.clone(), rgb(pal().text_muted)),
+	}
+}
+
+/// How IntelliJ draws one ref label: a coloured label icon (the "current"
+/// shape for HEAD / the checked-out branch) and plain text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefLabel {
+	pub text: String,
+	pub color: u32,
+	pub current: bool,
+}
+
+/// Label for a badge. A local branch with same-named remote-tracking refs
+/// reads "origin & main", like IntelliJ.
+pub fn ref_label(badge: &RefBadge, current_branch: Option<&str>) -> RefLabel {
+	let info = badge.primary;
+	let is_current = match &info.kind {
+		RefKind::Head => true,
+		RefKind::Branch => current_branch == Some(info.display_name.as_str()),
+		_ => false,
+	};
+	let color = match &info.kind {
+		_ if is_current => pal().ref_head,
+		RefKind::Branch => pal().ref_local,
+		RefKind::RemoteBranch { .. } => pal().ref_remote,
+		RefKind::Tag => pal().ref_tag,
+		_ => pal().text_muted,
+	};
+	let mut remotes: Vec<&str> = Vec::new();
+	for r in &badge.merged {
+		if let RefKind::RemoteBranch { remote, .. } = &r.kind {
+			if !remotes.contains(&remote.as_str()) {
+				remotes.push(remote);
+			}
+		}
+	}
+	let name = format_ref_badge(info).0;
+	let text = if remotes.is_empty() {
+		name
+	} else {
+		format!("{} & {name}", remotes.join(", "))
+	};
+	RefLabel {
+		text,
+		color,
+		current: is_current,
 	}
 }
 
@@ -429,13 +475,13 @@ fn paint_strokes(
 		let color = palette_rgb(stroke.color);
 		let mut builder = match stroke.kind {
 			StrokeKind::Rail | StrokeKind::Merge => {
-				PathBuilder::stroke(px(2.0))
+				PathBuilder::stroke(px(1.5))
 			}
 			StrokeKind::Gap => {
 				PathBuilder::stroke(px(1.5)).dash_array(&[px(2.0), px(2.0)])
 			}
 			StrokeKind::Shallow => {
-				PathBuilder::stroke(px(2.0)).dash_array(&[px(3.0), px(2.0)])
+				PathBuilder::stroke(px(1.5)).dash_array(&[px(3.0), px(2.0)])
 			}
 		};
 		let Some((&first, rest)) = stroke.points.split_first() else {
@@ -463,83 +509,31 @@ fn paint_strokes(
 		}
 	}
 
-	// Commit node glyph (Merge diamond, Head double circle, Normal circle, Hollow boundary)
+	// IntelliJ draws every commit as the same filled dot; only a shallow
+	// boundary or uncommitted node is hollow.
 	let nx = ox + px(lane_x(row.node.lane));
 	let ny = oy + px(mid_y);
 	let color = palette_rgb(row.node.color_index);
-
-	match row.node.node_type {
-		NodeType::Merge => {
-			let r = px(5.5);
-			let mut builder = PathBuilder::fill();
-			builder.move_to(point(nx, ny - r));
-			builder.line_to(point(nx + r, ny));
-			builder.line_to(point(nx, ny + r));
-			builder.line_to(point(nx - r, ny));
-			builder.close();
-			if let Ok(path) = builder.build() {
-				window.paint_path(path, color);
-			}
-		}
-		NodeType::Head => {
-			let r_out = px(6.0);
-			let r_in = px(2.5);
-			let out_bounds = Bounds {
-				origin: point(nx - r_out, ny - r_out),
-				size: size(r_out * 2.0, r_out * 2.0),
-			};
-			window.paint_quad(quad(
-				out_bounds,
-				r_out,
-				color,
-				px(0.0),
-				gpui::transparent_black(),
-				Default::default(),
-			));
-			let in_bounds = Bounds {
-				origin: point(nx - r_in, ny - r_in),
-				size: size(r_in * 2.0, r_in * 2.0),
-			};
-			window.paint_quad(quad(
-				in_bounds,
-				r_in,
-				rgb(pal().editor_bg),
-				px(0.0),
-				gpui::transparent_black(),
-				Default::default(),
-			));
-		}
-		NodeType::Normal => {
-			let r = px(4.5);
-			let circle_bounds = Bounds {
-				origin: point(nx - r, ny - r),
-				size: size(r * 2.0, r * 2.0),
-			};
-			window.paint_quad(quad(
-				circle_bounds,
-				r,
-				color,
-				px(0.0),
-				gpui::transparent_black(),
-				Default::default(),
-			));
-		}
-		NodeType::ShallowRoot | NodeType::Uncommitted => {
-			let r = px(4.5);
-			let circle_bounds = Bounds {
-				origin: point(nx - r, ny - r),
-				size: size(r * 2.0, r * 2.0),
-			};
-			window.paint_quad(quad(
-				circle_bounds,
-				r,
-				gpui::transparent_black(),
-				px(1.5),
-				color,
-				Default::default(),
-			));
-		}
-	}
+	let r = px(NODE_RADIUS);
+	let hollow = matches!(
+		row.node.node_type,
+		NodeType::ShallowRoot | NodeType::Uncommitted
+	);
+	window.paint_quad(quad(
+		Bounds {
+			origin: point(nx - r, ny - r),
+			size: size(r * 2.0, r * 2.0),
+		},
+		r,
+		if hollow {
+			gpui::transparent_black()
+		} else {
+			color.into()
+		},
+		px(if hollow { 1.5 } else { 0.0 }),
+		color,
+		Default::default(),
+	));
 }
 
 #[cfg(test)]
@@ -788,7 +782,7 @@ mod tests {
 		let layout = layout_commits(&wide, &[], None).unwrap();
 		assert_eq!(
 			gutter_width(&layout),
-			MAX_GUTTER_LANES as f32 * LANE_WIDTH + 24.0
+			MAX_GUTTER_LANES as f32 * LANE_WIDTH + 8.0
 		);
 	}
 
