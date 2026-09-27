@@ -662,6 +662,10 @@ jobs:
                       (Get-FileHash (Join-Path $env:GITHUB_WORKSPACE 'target/${{ matrix.target }}/release/snip-desktop-native.exe') -Algorithm SHA256).Hash
                   )
                   if (($hashes | Select-Object -Unique).Count -ne 1) { throw "installed/zipped/built exe differ: $hashes" }
+                  # verify_artifacts pins the zip's licenses/; the installer must install the same set.
+                  $installedLic = (Get-ChildItem (Join-Path $dir 'licenses') -File | ForEach-Object Name | Sort-Object) -join ','
+                  $zipLic = (Get-ChildItem (Join-Path $zipDir 'snip-sync\licenses') -File | ForEach-Object Name | Sort-Object) -join ','
+                  if (-not $installedLic -or $installedLic -ne $zipLic) { throw "installed licenses '$installedLic' != zipped '$zipLic'" }
                   python scripts/smoke_native.py --bin $installed --expected-version $version
                   if ($LASTEXITCODE -ne 0) { throw "smoke failed" }
                   Write-Output "accepted binary sha256 $($hashes[0])"

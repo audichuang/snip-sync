@@ -69,10 +69,10 @@ v0.3.0 起，release 的桌面資產改為原生 GPUI App（`crates/desktop-nati
 
 | 平台 | Target Triple | Release 資產 | 內部結構 |
 | --- | --- | --- | --- |
-| **macOS (Apple Silicon)** | `aarch64-apple-darwin` | `snip-sync_mac_arm.dmg`<br>`snip-sync_mac_arm.app.tar.gz` | `snip-sync.app`（`CFBundleIdentifier=com.audichuang.snip-sync`、ad-hoc 簽章、`Contents/MacOS/snip-desktop-native`、`Contents/Resources/icon.icns`）<br>DMG 根目錄含 `/Applications` 連結 |
+| **macOS (Apple Silicon)** | `aarch64-apple-darwin` | `snip-sync_mac_arm.dmg`<br>`snip-sync_mac_arm.app.tar.gz` | `snip-sync.app`（`CFBundleIdentifier=com.audichuang.snip-sync`、ad-hoc 簽章、`Contents/MacOS/snip-desktop-native`、`Contents/Resources/icon.icns`、`Contents/Resources/licenses/`）<br>DMG 根目錄含 `/Applications` 連結 |
 | **macOS (Intel)** | `x86_64-apple-darwin` | `snip-sync_mac_intel.dmg`<br>`snip-sync_mac_intel.app.tar.gz` | 同上（Mach-O x86_64） |
-| **Linux (x64)** | `x86_64-unknown-linux-gnu` | `snip-sync-linux-x86_64.tar.gz` | `snip-sync-<version>/bin/snip-desktop-native`<br>`snip-sync-<version>/share/applications/snip-sync.desktop`<br>`snip-sync-<version>/README.txt` |
-| **Windows (x64)** | `x86_64-pc-windows-msvc` | `snip-sync-windows-setup.exe`<br>`snip-sync-windows-x64.zip` | 安裝檔：Inno Setup，per-user（不需 UAC），裝到 `%LOCALAPPDATA%\Programs\snip-sync\snip-desktop-native.exe`，開始功能表捷徑「snip-sync」<br>zip：`snip-sync/snip-desktop-native.exe`、`snip-sync/README.txt` |
+| **Linux (x64)** | `x86_64-unknown-linux-gnu` | `snip-sync-linux-x86_64.tar.gz` | `snip-sync-<version>/bin/snip-desktop-native`<br>`snip-sync-<version>/share/applications/snip-sync.desktop`<br>`snip-sync-<version>/README.txt`<br>`snip-sync-<version>/licenses/` |
+| **Windows (x64)** | `x86_64-pc-windows-msvc` | `snip-sync-windows-setup.exe`<br>`snip-sync-windows-x64.zip` | 安裝檔：Inno Setup，per-user（不需 UAC），裝到 `%LOCALAPPDATA%\Programs\snip-sync\snip-desktop-native.exe`，開始功能表捷徑「snip-sync」，授權文字裝到同目錄的 `licenses\`<br>zip：`snip-sync/snip-desktop-native.exe`、`snip-sync/README.txt`、`snip-sync/licenses/` |
 | 全部 | — | `snip-sync-desktop-SHA256SUMS.txt` | 上列桌面檔案的 sha256 |
 
 DMG 檔名沿用 Tauri 時代的 `snip-sync_mac_arm.dmg`／`snip-sync_mac_intel.dmg`，舊下載連結不斷。Tauri 的 `snip-sync-linux.AppImage` 與 Tauri 的 `snip-sync_<version>_<arch>.dmg` 不再產生。Homebrew cask 改指向 `snip-sync_mac_#{arch}.dmg`（`arch arm: "arm", intel: "intel"`）、`app "snip-sync.app"`，加上 `depends_on macos: ">= :big_sur"` 與 Gatekeeper caveats。
@@ -112,6 +112,7 @@ DMG 檔名沿用 Tauri 時代的 `snip-sync_mac_arm.dmg`／`snip-sync_mac_intel.
    - macOS tarball 的執行檔必須是 `snip-sync.app/Contents/MacOS/snip-desktop-native`，版本來自同一個 bundle 的 `Contents/Info.plist`（`CFBundlePackageType=APPL`、`CFBundleExecutable=snip-desktop-native`、`CFBundleShortVersionString` 與 `CFBundleVersion`）。
    - Linux tarball 的執行檔必須是 `snip-sync-<version>/bin/snip-desktop-native`，應用程式版本來自同一個 package 的 `README.txt`（精確一行 `Version: <version>`）。`share/applications/snip-sync.desktop` 要有 `[Desktop Entry]`、`Type=Application`，且 `Exec` 啟動 `snip-desktop-native`。`.desktop` 的 `Version=1.0` 是 Desktop Entry 規格版本，不是應用程式版本。
    - Windows zip 的執行檔必須是 `snip-sync/snip-desktop-native.exe`，版本來自同一個目錄的 `README.txt`。
+   - 每個套件（tarball、zip、DMG 內的 `.app`）的 `licenses/` 必須恰好是 `Inter-OFL.txt`、`JetBrainsMono-OFL.txt`、`expui-icons-LICENSE.txt`、`expui-icons-NOTICE.txt`，且都不是空檔；其他位置不得再有 `licenses/`。OFL 涵蓋 Inter 與 JetBrains Mono 的所有字重與斜體，新增字型檔不必多加授權檔。Windows 安裝檔裝好的 `licenses\` 由 CI 比對與 zip 相同。
    - 誘餌 plist / README、重複候選、缺少執行權限、setuid/setgid、以及 symlink 一律拒絕。
    - 有寫明的 target triple 就決定架構、二進位格式、執行檔名稱與產物種類。再傳入的架構、格式或執行檔名稱若跟該 target 衝突，直接拒絕，不能蓋過 target。`arm64` 與 `aarch64` 是同一架構。沒有 target 時維持結構檢查。
 4. **macOS DMG 與候選集合**：

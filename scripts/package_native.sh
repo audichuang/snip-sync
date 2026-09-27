@@ -6,6 +6,7 @@
 #   - macOS: snip-sync.app (ad-hoc signed) in snip-sync_mac_<arch>.dmg with an
 #     /Applications link, plus snip-sync_mac_<arch>.app.tar.gz
 #   - Linux: snip-sync-linux-x86_64.tar.gz with executable, .desktop entry, README
+#   Every package also carries licenses/ (third-party font and icon licenses).
 #   - Windows: snip-sync-windows-x64.zip and the Inno Setup installer
 #     snip-sync-windows-setup.exe (per-user, unsigned)
 #
@@ -45,6 +46,17 @@ require_tool() {
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # The Tauri crate stays in the tree for rollback; its icons are the product icons.
 ICON_DIR="$ROOT_DIR/crates/desktop/src-tauri/icons"
+
+# Third-party licenses for what the binary embeds: the OFL covers every Inter
+# and JetBrains Mono face (Regular, SemiBold, Italic, ...), Apache-2.0 the
+# IntelliJ expui icons. scripts/verify_artifacts.py requires exactly this set.
+stage_licenses() {
+    mkdir -p "$1"
+    cp "$ROOT_DIR/crates/desktop-native/assets/fonts/Inter-OFL.txt" "$1/Inter-OFL.txt"
+    cp "$ROOT_DIR/crates/desktop-native/assets/fonts/JetBrainsMono-OFL.txt" "$1/JetBrainsMono-OFL.txt"
+    cp "$ROOT_DIR/crates/desktop-native/assets/icons/LICENSE.txt" "$1/expui-icons-LICENSE.txt"
+    cp "$ROOT_DIR/crates/desktop-native/assets/icons/NOTICE.txt" "$1/expui-icons-NOTICE.txt"
+}
 
 # Darwin always gets an ad-hoc signature and a DMG, Windows always an installer.
 # Missing tools must fail the target instead of omitting that format.
@@ -93,6 +105,8 @@ case "$TARGET" in
         cp "$BIN_PATH" "$MACOS_DIR/snip-desktop-native"
         chmod 755 "$MACOS_DIR/snip-desktop-native"
         cp "$ICON_DIR/icon.icns" "$RESOURCES_DIR/icon.icns"
+        # Inside Resources so the code signature seals them.
+        stage_licenses "$RESOURCES_DIR/licenses"
 
         # Explicit macOS deployment target requirement (macOS 11.0 Big Sur)
         # Derived from Rust tier 1 Apple Silicon and GPUI Metal backend requirements.
@@ -161,6 +175,7 @@ PLIST
         mkdir -p "$PKG_DIR"
 
         cp "$BIN_PATH" "$PKG_DIR/snip-desktop-native.exe"
+        stage_licenses "$PKG_DIR/licenses"
 
         cat > "$PKG_DIR/README.txt" <<README
 snip-sync ${VERSION} (native desktop app, unsigned)
@@ -189,6 +204,7 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
             "/DAppVersion=${VERSION}" \
             "/DSourceExe=$(cygpath -w "$PKG_DIR/snip-desktop-native.exe")" \
             "/DIconFile=$(cygpath -w "$ICON_DIR/icon.ico")" \
+            "/DLicenseDir=$(cygpath -w "$PKG_DIR/licenses")" \
             "/O$(cygpath -w "$OUT_DIR")" \
             "/Fsnip-sync-windows-setup" \
             "$(cygpath -w "$ROOT_DIR/crates/desktop-native/packaging/windows/snip-sync.iss")"
@@ -204,6 +220,7 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
 
         cp "$BIN_PATH" "$PKG_DIR/bin/snip-desktop-native"
         chmod 755 "$PKG_DIR/bin/snip-desktop-native"
+        stage_licenses "$PKG_DIR/licenses"
 
         cat > "$PKG_DIR/share/applications/snip-sync.desktop" <<DESKTOP
 [Desktop Entry]
