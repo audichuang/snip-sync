@@ -131,6 +131,10 @@ pub enum TreeIoKind {
 	Retry,
 }
 
+// A transient command result, immediately unpacked by callers; only TreeIo
+// is queued. Its Windows directory cursor is large, but boxing this enum's
+// payload would add an allocation to every directory request.
+#[allow(clippy::large_enum_variant)]
 pub enum TreeEffect {
 	Idle,
 	OpenFile(String),
@@ -1208,6 +1212,7 @@ enum MarkerKind {
 #[cfg(test)]
 mod tests {
 	use std::collections::HashSet;
+	#[cfg(unix)]
 	use std::ffi::OsString;
 	use std::fs;
 	#[cfg(unix)]
@@ -1227,6 +1232,21 @@ mod tests {
 		tree.collect_selected_paths(&mut paths);
 		paths.sort();
 		paths
+	}
+
+	#[cfg(unix)]
+	fn tree_with_raw_entry(root: &Path, name: &[u8]) -> FileTreeNode {
+		let mut tree = FileTreeNode::new_root(root);
+		// APFS rejects these bytes on disk. Exercise the production entry-to-node
+		// boundary here; Linux also checks real directory scanning below.
+		let entry = ScanEntry {
+			name: OsString::from_vec(name.to_vec()),
+			directory: false,
+			symlink: false,
+		};
+		tree.children
+			.push(build_node(&entry, root, &NodeKey::root(), 1));
+		tree
 	}
 
 	#[test]
@@ -1402,14 +1422,9 @@ mod tests {
 	fn test_tree_non_utf8_path_safety_and_no_alias() {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path();
-		fs::write(
-			root.join(OsString::from_vec(b"invalid-\xff.txt".to_vec())),
-			b"invalid",
-		)
-		.unwrap();
 		fs::write(root.join("invalid-\u{fffd}.txt"), b"valid U+FFFD").unwrap();
 
-		let tree = FileTreeNode::new_root(root);
+		let tree = tree_with_raw_entry(root, b"invalid-\xff.txt");
 		let matches: Vec<_> = tree
 			.children
 			.iter()
@@ -1434,6 +1449,29 @@ mod tests {
 			"invalid UTF8 must have error note"
 		);
 		assert!(!invalid.selected, "invalid UTF8 cannot be selected");
+	}
+
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn directory_scan_preserves_non_utf8_filename() {
+		let dir = tempfile::tempdir().unwrap();
+		let name = OsString::from_vec(b"invalid-\xff.txt".to_vec());
+		fs::write(dir.path().join(&name), b"invalid").unwrap();
+		fs::write(dir.path().join("invalid-\u{fffd}.txt"), b"valid").unwrap();
+		let tree = FileTreeNode::new_root(dir.path());
+		assert_eq!(tree.children.len(), 2);
+		let invalid = tree.children.iter().find(|n| !n.is_valid_utf8).unwrap();
+		assert_eq!(invalid.key.relative.as_os_str(), name.as_os_str());
+		assert!(invalid.rel_path.is_empty());
+		assert!(invalid.read_error.is_some());
+		assert!(!invalid.selected);
+		assert_eq!(
+			tree.children
+				.iter()
+				.filter(|n| n.rel_path == "invalid-\u{fffd}.txt")
+				.count(),
+			1
+		);
 	}
 
 	#[test]
@@ -1527,14 +1565,9 @@ mod tests {
 	fn invalid_utf8_is_not_actionable_for_mouse_or_keyboard() {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path();
-		fs::write(
-			root.join(OsString::from_vec(b"aaa-\xff".to_vec())),
-			b"invalid",
-		)
-		.unwrap();
 		fs::write(root.join("zzz-valid.txt"), b"valid").unwrap();
 		fs::write(root.join("__invalid_utf8_name__"), b"real").unwrap();
-		let mut tree = FileTreeNode::new_root(root);
+		let mut tree = tree_with_raw_entry(root, b"aaa-\xff");
 		let rows = tree.flatten_visible(20);
 		let invalid = rows
 			.iter()

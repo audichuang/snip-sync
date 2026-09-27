@@ -1974,8 +1974,17 @@ mod tests {
 	#[test]
 	fn test_paste_multi_repo_prefix_mapping() {
 		let tmp = tempfile::tempdir().unwrap();
-		let repo_a = tmp.path().join("repo-a");
-		let repo_b = tmp.path().join("repo-b");
+		let root = tmp.path().join("repos");
+		fs::create_dir(&root).unwrap();
+		#[cfg(unix)]
+		let root = {
+			let alias = tmp.path().join("alias");
+			std::os::unix::fs::symlink(&root, &alias).unwrap();
+			assert_ne!(alias, CanonicalRootId::new(&alias).unwrap().path());
+			alias
+		};
+		let repo_a = root.join("repo-a");
+		let repo_b = root.join("repo-b");
 		fs::create_dir(&repo_a).unwrap();
 		fs::create_dir(&repo_b).unwrap();
 
@@ -1997,10 +2006,16 @@ mod tests {
 		assert_eq!(plan.items.len(), 2);
 		let item_a =
 			plan.items.iter().find(|i| i.path == "file_a.txt").unwrap();
-		assert_eq!(item_a.dest_root, repo_a);
+		assert_eq!(
+			item_a.dest_root,
+			CanonicalRootId::new(&repo_a).unwrap().path()
+		);
 		let item_b =
 			plan.items.iter().find(|i| i.path == "file_b.txt").unwrap();
-		assert_eq!(item_b.dest_root, repo_b);
+		assert_eq!(
+			item_b.dest_root,
+			CanonicalRootId::new(&repo_b).unwrap().path()
+		);
 
 		let res = plan.execute().unwrap().files;
 		assert_eq!(res.created_count, 2);

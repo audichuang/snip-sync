@@ -839,32 +839,34 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	// rather than accepting FOCUS next/prev handler logs as proof of focus.
 	let capture_focus = |filename: &str, expected: &[(&str, bool)]| {
 		let deadline = Instant::now() + Duration::from_secs(3);
-		let boxes = loop {
-			let boxes: Vec<_> =
-				expected.iter().map(|(id, _)| control(id)).collect();
-			std::thread::sleep(Duration::from_millis(150));
-			if expected
-				.iter()
-				.zip(&boxes)
-				.all(|((id, _), v)| control(id) == *v)
-			{
-				break boxes;
-			}
-			assert!(
-				Instant::now() < deadline,
-				"focus target bounds did not settle"
-			);
-		};
-		capture_artifact(filename);
-		for ((id, focused), v) in expected.iter().zip(boxes) {
-			assert_eq!(control(id), v, "focus target moved during capture");
-			// The absolute child probe covers the padding box, inside the
-			// declared border_1. Include that border at this 1x X11 scale.
-			let [x, y, w, h] = [v[0] - 1, v[1] - 1, v[2] + 2, v[3] + 2];
-			let (vw, vh) = *viewport.lock().unwrap();
-			assert!(x >= 0 && y >= 0 && x + w <= vw && y + h <= vh);
-			let crop = format!("{w}x{h}+{x}+{y}");
-			let out = Command::new("convert")
+		loop {
+			let boxes = loop {
+				let boxes: Vec<_> =
+					expected.iter().map(|(id, _)| control(id)).collect();
+				std::thread::sleep(Duration::from_millis(150));
+				if expected
+					.iter()
+					.zip(&boxes)
+					.all(|((id, _), v)| control(id) == *v)
+				{
+					break boxes;
+				}
+				assert!(
+					Instant::now() < deadline,
+					"focus target bounds did not settle"
+				);
+			};
+			capture_artifact(filename);
+			let mut presented = true;
+			for ((id, focused), v) in expected.iter().zip(boxes) {
+				assert_eq!(control(id), v, "focus target moved during capture");
+				// The absolute child probe covers the padding box, inside the
+				// declared border_1. Include that border at this 1x X11 scale.
+				let [x, y, w, h] = [v[0] - 1, v[1] - 1, v[2] + 2, v[3] + 2];
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(x >= 0 && y >= 0 && x + w <= vw && y + h <= vh);
+				let crop = format!("{w}x{h}+{x}+{y}");
+				let out = Command::new("convert")
 				.arg(out_dir.join(filename))
 				.args([
 					"-crop",
@@ -882,22 +884,34 @@ fn native_desktop_smoke_and_clipboard_verification() {
 				])
 				.output()
 				.expect("convert focus crop must run");
-			assert!(
-				out.status.success(),
-				"focus crop failed: {:?}",
-				out.stderr
-			);
-			let fraction: f64 = String::from_utf8(out.stdout)
-				.unwrap()
-				.trim()
-				.parse()
-				.unwrap();
-			let pixels = fraction * f64::from(w * h);
-			println!("[TEST DRIVER] focus {id} bounds={v:?} crop={crop} pixels={pixels} expected={focused}");
-			assert!(
-				if *focused { pixels >= 8.0 } else { pixels < 1.0 },
+				assert!(
+					out.status.success(),
+					"focus crop failed: {:?}",
+					out.stderr
+				);
+				let fraction: f64 = String::from_utf8(out.stdout)
+					.unwrap()
+					.trim()
+					.parse()
+					.unwrap();
+				let pixels = fraction * f64::from(w * h);
+				println!("[TEST DRIVER] focus {id} bounds={v:?} crop={crop} pixels={pixels} expected={focused}");
+				let matches = if *focused {
+					pixels >= 8.0
+				} else {
+					pixels < 1.0
+				};
+				assert!(
+				matches || Instant::now() < deadline,
 				"{id} focused={focused}, but its own crop contains {pixels} focus-ring pixels; {filename}"
 			);
+				presented &= matches;
+			}
+			if presented {
+				break;
+			}
+			// Focus does not move control bounds. Await its painted state without
+			// sending another key; persistent wrong focus still fails this deadline.
 		}
 	};
 
