@@ -476,7 +476,17 @@ fn read_commit_meta_stdout(
 	limit: Option<usize>,
 	current_wire_len: usize,
 ) -> Result<Vec<u8>, CommitError> {
-	let args = ["log", "-1", "-z", "--format=%an%x00%ae%x00%aI%x00%B", sha];
+	// Config such as log.showSignature or i18n.logOutputEncoding would
+	// change the bytes the parser reads.
+	let args = [
+		"log",
+		"-1",
+		"-z",
+		"--no-show-signature",
+		"--encoding=UTF-8",
+		"--format=%an%x00%ae%x00%aI%x00%B",
+		sha,
+	];
 	let label = args.join(" ");
 	refuse_if_cancelled(opts, &label)?;
 	let mut meta_opts = opts.clone();
@@ -1219,6 +1229,94 @@ fn plan_commit(root: &Path, c: &CommitRecord) -> CommitPlan {
 	}
 }
 
+/// Planned writes and deletes the disk layout would make fail halfway
+/// through a commit, as `(file index, reason)`: a directory where a file is
+/// deleted, a directory where a file is written (unless this commit's own
+/// deletions empty it, as `delete` removes emptied parents), or a file where
+/// a write needs a directory (unless this commit deletes that file).
+fn layout_conflicts(
+	root: &Path,
+	files: &[FilePlan],
+) -> Vec<(usize, &'static str)> {
+	let mut deleted = std::collections::HashSet::new();
+	for f in files.iter().filter(|f| f.action != ReplayAction::Skip) {
+		deleted.extend(f.old_absolute_path.as_deref());
+		if f.action == ReplayAction::Delete {
+			deleted.extend(f.absolute_path.as_deref());
+		}
+	}
+	let is_dir = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+	// Whether deleting `deleted` leaves `dir` empty and so removed. An empty
+	// directory is never on the upward walk, so it stays.
+	fn emptied(dir: &Path, deleted: &std::collections::HashSet<&Path>) -> bool {
+		let Ok(entries) = fs::read_dir(dir) else {
+			return false;
+		};
+		let mut any = false;
+		for entry in entries {
+			let Ok(entry) = entry else { return false };
+			let path = entry.path();
+			let ok = match entry.file_type() {
+				Ok(t) if t.is_dir() => emptied(&path, deleted),
+				Ok(_) => deleted.contains(path.as_path()),
+				Err(_) => false,
+			};
+			if !ok {
+				return false;
+			}
+			any = true;
+		}
+		any
+	}
+	let mut out = Vec::new();
+	for (i, f) in files.iter().enumerate() {
+		let Some(abs) = f.absolute_path.as_deref() else {
+			continue;
+		};
+		let old = f.old_absolute_path.as_deref().filter(|o| is_dir(o));
+		let conflict = match f.action {
+			ReplayAction::Skip => None,
+			_ if old.is_some() => Some("the renamed-from path is a directory"),
+			ReplayAction::Delete => {
+				is_dir(abs).then_some("the path to delete is a directory")
+			}
+			ReplayAction::Write if is_dir(abs) => (!emptied(abs, &deleted))
+				.then_some("a directory is in the way of the file"),
+			ReplayAction::Write => abs
+				.ancestors()
+				.skip(1)
+				.take_while(|a| *a != root && a.starts_with(root))
+				.find(|a| {
+					fs::symlink_metadata(a).is_ok_and(|m| !m.is_dir())
+						&& !deleted.contains(a)
+				})
+				.map(|_| "a file is in the way of its parent directory"),
+		};
+		if let Some(reason) = conflict {
+			out.push((i, reason));
+		}
+	}
+	out
+}
+
+/// Marks [`layout_conflicts`] as unsafe skips, until skipping one (and so
+/// not deleting its paths) uncovers no new conflict.
+fn skip_layout_conflicts(root: &Path, files: &mut [FilePlan]) {
+	loop {
+		let conflicts = layout_conflicts(root, files)
+			.into_iter()
+			.map(|(i, _)| i)
+			.collect::<Vec<_>>();
+		if conflicts.is_empty() {
+			return;
+		}
+		for i in conflicts {
+			files[i].action = ReplayAction::Skip;
+			files[i].skip_reason = Some(ReplaySkipReason::UnsafePath);
+		}
+	}
+}
+
 /// Preview: what replaying `payload` onto the current disk state would do.
 pub fn plan_commit_replay(
 	git: &Git,
@@ -1248,6 +1346,7 @@ pub fn plan_commit_replay_with(
 			refuse_if_cancelled(opts, "replay-plan")?;
 			files.push(plan_file(&root, file));
 		}
+		skip_layout_conflicts(&root, &mut files);
 		commits.push(CommitPlan {
 			message: commit.message.clone(),
 			author_name: commit.author_name.clone(),
@@ -1298,8 +1397,19 @@ pub fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
 			return result;
 		}
 	};
+	let no_hooks = match NoHooks::create() {
+		Ok(h) => h,
+		Err(e) => {
+			result.failure = payload.commits.first().map(|c| ReplayFailure {
+				index: 0,
+				message: c.message.clone(),
+				error: format!("cannot create an empty hooks directory: {e}"),
+			});
+			return result;
+		}
+	};
 	for (index, commit) in payload.commits.iter().enumerate() {
-		match replay_commit(git, commit) {
+		match replay_commit(git, commit, &no_hooks.config) {
 			Ok(sha) => result.created.push(sha),
 			Err(error) => {
 				result.failure = Some(ReplayFailure {
@@ -1314,9 +1424,52 @@ pub fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
 	result
 }
 
-fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
+/// A fresh empty directory for `core.hooksPath`, so replay runs none of the
+/// destination's hooks: `--no-verify` alone still runs prepare-commit-msg,
+/// post-commit and post-index-change. `/dev/null` does not exist on Windows.
+struct NoHooks {
+	dir: PathBuf,
+	/// `core.hooksPath=<dir>`, for `git -c`.
+	config: String,
+}
+
+impl NoHooks {
+	fn create() -> io::Result<Self> {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map_or(0, |d| d.as_nanos());
+		let dir = std::env::temp_dir()
+			.join(format!("snip-no-hooks-{}-{nanos}", std::process::id()));
+		// `create_dir`, not `create_dir_all`: an existing directory could
+		// already hold hooks.
+		fs::create_dir(&dir)?;
+		let Some(config) = dir.to_str().map(|d| format!("core.hooksPath={d}"))
+		else {
+			let _ = fs::remove_dir(&dir);
+			return Err(io::Error::other("temp directory is not UTF-8"));
+		};
+		Ok(Self { dir, config })
+	}
+}
+
+impl Drop for NoHooks {
+	fn drop(&mut self) {
+		let _ = fs::remove_dir(&self.dir);
+	}
+}
+
+fn replay_commit(
+	git: &Git,
+	commit: &CommitRecord,
+	no_hooks: &str,
+) -> Result<String, String> {
 	let root = git.root();
 	let plan = plan_commit(root, commit);
+	// The preview skips these; replay refuses the commit before touching
+	// anything rather than stop halfway with a half-staged worktree.
+	if let Some(&(i, reason)) = layout_conflicts(root, &plan.files).first() {
+		return Err(format!("{}: {reason}", plan.files[i].path));
+	}
 	// Paths whose change is on disk now; they alone go into the commit.
 	let mut paths: Vec<&str> = Vec::new();
 	// Deleted paths: staged only if HEAD tracks them. A path that is only in
@@ -1377,6 +1530,8 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 	let err = |e: GitError| e.to_string();
 	if !deleted.is_empty() {
 		let mut args = vec![
+			"-c",
+			no_hooks,
 			"--literal-pathspecs",
 			"ls-tree",
 			"-z",
@@ -1401,18 +1556,29 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 
 	if !paths.is_empty() {
 		// `-f`: the source tracked it, even if it is ignored here.
-		let mut args = vec!["--literal-pathspecs", "add", "-A", "-f", "--"];
+		let mut args = vec![
+			"-c",
+			no_hooks,
+			"--literal-pathspecs",
+			"add",
+			"-A",
+			"-f",
+			"--",
+		];
 		args.extend(&paths);
 		git.run(&args).map_err(err)?;
 	}
 	// `--only` with no paths still commits HEAD's tree, never the index.
 	let mut args = vec![
+		"-c",
+		no_hooks,
 		"--literal-pathspecs",
 		"commit",
 		"--quiet",
 		"--only",
 		"--no-verify",
 		"--allow-empty",
+		"--allow-empty-message",
 		"--cleanup=verbatim",
 		"-F",
 		"-",
@@ -1420,7 +1586,9 @@ fn replay_commit(git: &Git, commit: &CommitRecord) -> Result<String, String> {
 	];
 	args.extend(&paths);
 	run_commit(git, &args, commit).map_err(err)?;
-	let head = git.run(&["rev-parse", "HEAD"]).map_err(err)?;
+	let head = git
+		.run(&["-c", no_hooks, "rev-parse", "HEAD"])
+		.map_err(err)?;
 	Ok(String::from_utf8_lossy(&head).trim().to_string())
 }
 
@@ -1432,7 +1600,15 @@ fn delete(root: &Path, abs: &Path, rel: &str) -> Result<(), String> {
 	}
 	match fs::remove_file(abs) {
 		Ok(()) => {}
-		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+		// A file where a parent directory should be: the path is absent.
+		Err(e)
+			if matches!(
+				e.kind(),
+				io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+			) =>
+		{
+			return Ok(())
+		}
 		Err(e) => return Err(format!("{rel}: {e}")),
 	}
 	let mut dir = abs.parent();
@@ -2279,5 +2455,224 @@ mod tests {
 			scaling_ratio < size_ratio * 1.5,
 			"scaling ratio {scaling_ratio:.2} indicates super-linear/quadratic growth (size ratio {size_ratio:.2})"
 		);
+	}
+
+	fn bob(message: &str, files: Vec<CommitFile>) -> CommitsPayload {
+		CommitsPayload {
+			commits: vec![CommitRecord {
+				message: message.into(),
+				author_name: "Bob".into(),
+				author_email: "bob@example.com".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files,
+			}],
+		}
+	}
+
+	fn change(
+		path: &str,
+		change: FileChange,
+		content: Option<&str>,
+	) -> CommitFile {
+		CommitFile {
+			path: path.into(),
+			old_path: None,
+			change,
+			content: content.map(Into::into),
+			not_copied: None,
+		}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn commits_replay_runs_no_hooks() {
+		use std::os::unix::fs::PermissionsExt;
+		let dst = Repo::new("main");
+		dst.write("a.txt", b"a\n");
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		let hooks = dst.path().join(".git/hooks");
+		let marker = dst.dir.path().join("hook-ran");
+		for (name, body) in [
+			(
+				"prepare-commit-msg",
+				"echo rewritten > \"$1\"\n".to_string(),
+			),
+			("post-commit", format!("touch '{}'\n", marker.display())),
+			(
+				"post-index-change",
+				format!("touch '{}'\n", marker.display()),
+			),
+		] {
+			let p = hooks.join(name);
+			fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+			fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		let payload = bob(
+			"original\n",
+			vec![change("b.txt", FileChange::Added, Some("b\n"))],
+		);
+		let result = replay(&dst.open(), &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(dst.meta("HEAD").1, "original");
+		assert!(!marker.exists(), "a hook ran");
+	}
+
+	#[test]
+	fn commits_export_ignores_signature_and_encoding_config() {
+		let src = Repo::new("main");
+		src.write("a.txt", b"a\n");
+		let sha = src.commit("caf\u{e9}\n", "2019-01-01T00:00:00+00:00");
+		src.git(&["config", "i18n.logOutputEncoding", "ISO-8859-1"]);
+		src.git(&["config", "log.showSignature", "true"]);
+		let payload = copy_commits(&src.open(), &[sha]).unwrap();
+		assert_eq!(payload.commits[0].message, "caf\u{e9}\n");
+	}
+
+	#[test]
+	fn commits_export_of_a_signed_commit_ignores_show_signature() {
+		let src = Repo::new("main");
+		let key = src.dir.path().join("key");
+		let keygen = Command::new("ssh-keygen")
+			.args(["-q", "-t", "ed25519", "-N", "", "-C", "t", "-f"])
+			.arg(&key)
+			.output();
+		if !keygen.is_ok_and(|o| o.status.success()) {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"ssh-keygen is required"
+			);
+			eprintln!("skipping: no ssh-keygen");
+			return;
+		}
+		let public = fs::read_to_string(key.with_extension("pub")).unwrap();
+		let allowed = src.dir.path().join("allowed");
+		fs::write(&allowed, format!("alice@example.com {public}")).unwrap();
+		src.git(&["config", "gpg.format", "ssh"]);
+		src.git(&["config", "user.signingkey", key.to_str().unwrap()]);
+		src.git(&[
+			"config",
+			"gpg.ssh.allowedSignersFile",
+			allowed.to_str().unwrap(),
+		]);
+		src.git(&["config", "commit.gpgsign", "true"]);
+		src.write("a.txt", b"a\n");
+		let sha = src.commit("signed\n", "2019-01-01T00:00:00+00:00");
+		src.git(&["config", "log.showSignature", "true"]);
+		let payload = copy_commits(&src.open(), &[sha]).unwrap();
+		let c = &payload.commits[0];
+		assert_eq!(c.author_name, "Alice");
+		assert_eq!(c.message, "signed\n");
+	}
+
+	#[test]
+	fn commits_replay_refuses_a_directory_at_a_write_target_up_front() {
+		let dst = Repo::new("main");
+		dst.write("a.txt", b"a\n");
+		dst.write("d/keep.txt", b"keep\n");
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"write onto dir\n",
+			vec![
+				change("a.txt", FileChange::Deleted, None),
+				change("b.txt", FileChange::Added, Some("b\n")),
+				change("d", FileChange::Added, Some("file\n")),
+			],
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		assert_eq!(
+			plan.commits[0].files[2].skip_reason,
+			Some(ReplaySkipReason::UnsafePath)
+		);
+		let head = dst.git(&["rev-parse", "HEAD"]);
+		let result = replay(&g, &payload);
+		let failure = result.failure.expect("refused");
+		assert!(failure.error.contains("directory"), "{}", failure.error);
+		assert_eq!(dst.git(&["rev-parse", "HEAD"]), head);
+		assert!(dst.path().join("a.txt").exists());
+		assert!(!dst.path().join("b.txt").exists());
+		assert_eq!(dst.git(&["status", "--porcelain"]), "");
+	}
+
+	#[test]
+	fn commits_replay_refuses_a_directory_at_a_delete_target_up_front() {
+		let dst = Repo::new("main");
+		dst.write("a.txt", b"a\n");
+		dst.write("gone/inner.txt", b"x\n");
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"delete dir\n",
+			vec![
+				change("a.txt", FileChange::Modified, Some("changed\n")),
+				change("gone", FileChange::Deleted, None),
+			],
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		assert_eq!(
+			plan.commits[0].files[1].skip_reason,
+			Some(ReplaySkipReason::UnsafePath)
+		);
+		let result = replay(&g, &payload);
+		assert!(result.failure.is_some());
+		assert!(result.created.is_empty());
+		assert_eq!(
+			fs::read_to_string(dst.path().join("a.txt")).unwrap(),
+			"a\n"
+		);
+		assert!(dst.path().join("gone/inner.txt").exists());
+	}
+
+	#[test]
+	fn commits_replay_refuses_a_file_where_a_write_needs_a_directory() {
+		let dst = Repo::new("main");
+		dst.write("f", b"a file\n");
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"under a file\n",
+			vec![
+				change("b.txt", FileChange::Added, Some("b\n")),
+				change("f/x.txt", FileChange::Added, Some("x\n")),
+			],
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		assert_eq!(
+			plan.commits[0].files[1].skip_reason,
+			Some(ReplaySkipReason::UnsafePath)
+		);
+		let result = replay(&g, &payload);
+		assert!(result.failure.is_some());
+		assert!(!dst.path().join("b.txt").exists());
+	}
+
+	#[test]
+	fn commits_replay_deleting_under_a_file_is_already_absent() {
+		let dst = Repo::new("main");
+		dst.write("f", b"a file\n");
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"delete under a file\n",
+			vec![
+				change("b.txt", FileChange::Added, Some("b\n")),
+				change("f/x.txt", FileChange::Deleted, None),
+			],
+		);
+		let result = replay(&dst.open(), &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(dst.git(&["show", "HEAD:b.txt"]), "b");
+	}
+
+	#[test]
+	fn commits_replay_keeps_an_empty_message() {
+		let dst = Repo::new("main");
+		dst.write("a.txt", b"a\n");
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		let payload =
+			bob("", vec![change("b.txt", FileChange::Added, Some("b\n"))]);
+		let result = replay(&dst.open(), &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(dst.git(&["log", "-1", "--format=%B"]), "");
+		assert_eq!(dst.git(&["show", "HEAD:b.txt"]), "b");
 	}
 }

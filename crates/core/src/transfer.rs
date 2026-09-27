@@ -1393,6 +1393,27 @@ fn deleted_marker() -> ReadContent {
 	(Some(DELETED_FILE_MARKER.to_string()), None)
 }
 
+/// Pre-deletion content like gitsrc `deleted_content`: the first of `specs`
+/// that decodes, else the deleted marker (a binary or non-UTF-8 deletion
+/// included). A size skip is passed through.
+fn read_deleted(
+	cat: &mut CatFile,
+	specs: impl IntoIterator<Item = String>,
+	wire_path: &str,
+	budget: &BlobBudget,
+	opts: &RunOptions,
+) -> Result<ReadContent, TransferError> {
+	for spec in specs {
+		match read_blob_bounded(cat, &spec, wire_path, budget, opts)? {
+			Some(read @ (Some(_), _)) | Some(read @ (None, Some(_))) => {
+				return Ok(read)
+			}
+			Some((None, None)) | None => {}
+		}
+	}
+	Ok(deleted_marker())
+}
+
 fn make_payload_opts<'a, 'f>(
 	settings: &'a Settings,
 	source_root: Option<&'a str>,
@@ -1516,9 +1537,9 @@ pub fn plan_export_with(
 		}
 	}
 	let mut frozen_commits = HashMap::new();
-	// Frozen commit -> its first parent, where deleted files are read.
+	// Frozen commit -> its parents, where deleted files are read.
 	// Resolved before any cat-file session so this thread does not nest Git.
-	let mut first_parents: HashMap<String, Option<String>> = HashMap::new();
+	let mut parents: HashMap<String, Vec<String>> = HashMap::new();
 	for item in &selection.items {
 		if let SourceKind::Commit { rev } = &item.source {
 			let key = (item.root.clone(), rev.clone());
@@ -1529,8 +1550,7 @@ pub fn plan_export_with(
 					TransferError::UnknownRoot(item.root.path().to_path_buf())
 				})?;
 				let oid = git.resolve_commit_with(rev, opts)?;
-				let parent = git.parents_with(&oid, opts)?.into_iter().next();
-				first_parents.insert(oid.clone(), parent);
+				parents.insert(oid.clone(), git.parents_with(&oid, opts)?);
 				e.insert(oid);
 			}
 		}
@@ -1689,21 +1709,21 @@ pub fn plan_export_with(
 							))
 						})?;
 					let (text, reason) = if deleted {
-						match first_parents.get(frozen_oid).cloned().flatten() {
-							Some(p) => {
-								let spec = format!("{p}:{rel}");
-								// Deleted graph old content bypasses per-file size check!
-								read_blob_bounded(
-									blobs.get(&item.root, &gits, opts)?,
-									&spec,
-									&wire_path,
-									&blob_budget(true),
-									opts,
-								)?
-								.unwrap_or_else(deleted_marker)
-							}
-							None => deleted_marker(),
-						}
+						// Every parent in order, like gitsrc: a merge may
+						// delete a file only one side had. Deleted graph old
+						// content bypasses the per-file size check.
+						let specs = parents
+							.get(frozen_oid)
+							.into_iter()
+							.flatten()
+							.map(|p| format!("{p}:{rel}"));
+						read_deleted(
+							blobs.get(&item.root, &gits, opts)?,
+							specs,
+							&wire_path,
+							&blob_budget(true),
+							opts,
+						)?
 					} else {
 						let spec = format!("{frozen_oid}:{rel}");
 						read_blob_bounded(
@@ -1722,15 +1742,13 @@ pub fn plan_export_with(
 				SourceKind::Staged => {
 					let (text, reason) = if deleted {
 						// A staged deletion is gone from the index; HEAD has it.
-						let spec = format!("HEAD:{rel}");
-						read_blob_bounded(
+						read_deleted(
 							blobs.get(&item.root, &gits, opts)?,
-							&spec,
+							[format!("HEAD:{rel}")],
 							&wire_path,
 							&blob_budget(false),
 							opts,
 						)?
-						.unwrap_or_else(deleted_marker)
 					} else {
 						let spec = format!(":{rel}");
 						let (text, reason) = read_blob_bounded(
@@ -1765,14 +1783,13 @@ pub fn plan_export_with(
 						format!("HEAD:{rel}")
 					};
 					let (text, reason) = if gits.contains_key(&item.root) {
-						read_blob_bounded(
+						read_deleted(
 							blobs.get(&item.root, &gits, opts)?,
-							&spec,
+							[spec],
 							&wire_path,
 							&blob_budget(false),
 							opts,
 						)?
-						.unwrap_or_else(deleted_marker)
 					} else {
 						deleted_marker()
 					};
