@@ -52,16 +52,17 @@ v0.3.0 起，release 的桌面資產改為原生 GPUI App（`crates/desktop-nati
 
 1. **每個 target 只建置一次，而且在 `ci.yml`**。`release.yml` 不編譯原生版。
 2. **驗收跑在最終產物上**：
-   - Linux：`native-acceptance` 先用 `run_native_acceptance.py --gate all` 建置並凍結一個 release 執行檔，跑 IME、18 個協作案例與 functional-short 資源 gate；通過後才用 **該凍結執行檔**（`build-receipt.json` 的 `binary`）打包、`verify_artifacts.py` 審計、比對 tarball 內執行檔 sha256 等於 receipt 的 `sha256`，並對解開後的執行檔跑 `smoke_native.py`。上傳為 `native-candidate-x86_64-unknown-linux-gnu`；證據另上傳為 `native-acceptance-linux`。
+   - Linux：`native-acceptance` 先用 `run_native_acceptance.py --gate all` 建置並凍結一個 release 執行檔，跑 IME、18 個協作案例與 functional-short 資源 gate；通過後才用 **該凍結執行檔**（`build-receipt.json` 的 `binary`）打包、`verify_artifacts.py` 審計、比對 tarball 內執行檔 sha256 等於 receipt 的 `sha256`，並對解開後的執行檔跑 `smoke_native.py`。上傳為 `native-candidate-x86_64-unknown-linux-gnu`；完整證據另上傳為 `native-acceptance-linux`（除錯用），只含 `acceptance.json` 與 `build-receipt.json` 的小 artifact 上傳為 `native-acceptance-receipt`（release 用）。
    - macOS：`codesign` 會改寫 Mach-O，所以順序是 建置 → 打包（含 ad-hoc 簽章、DMG）→ `verify_artifacts.py`（在 Darwin 掛載 DMG、`codesign --verify --deep --strict`）→ 掛載 **要發布的 DMG**，對裡面的 `snip-sync.app/Contents/MacOS/snip-desktop-native` 跑 smoke，並要求它與 `.app.tar.gz` 內的執行檔 sha256 相同。Intel leg 在 `macos-26-intel` 上實際執行，架構不符即失敗。
    - Windows：打包（zip + Inno Setup 安裝檔）→ `verify_artifacts.py` → 以 `/VERYSILENT /DIR=…` 真的執行 **要發布的安裝檔**，要求安裝出的 exe、zip 內的 exe、建置出的 exe 三者 sha256 相同，再對安裝出的 exe 跑 smoke。
    - 每個 target 的輸出目錄都有 `SHA256SUMS-<target>.txt`，在跑上述檢查之前就寫好。
-3. **`release.yml` 只搬運**：`verify-ci` 找出 tag SHA 在 `main` 上最新一次成功的 push `ci.yml` run（`event=push`、`head_branch=main`、`head_sha` 相符、`conclusion=success`；整個 run 綠代表上面每個 gate 都過了），輸出 run id。`publish-native` 以 `gh run download` 取該 run 的四個 `native-candidate-*` 與 `native-acceptance-linux`，然後：
+3. **`release.yml` 只搬運**：`verify-ci` 找出 tag SHA 在 `main` 上最新一次成功的 push `ci.yml` run（`event=push`、`head_branch=main`、`head_sha` 相符、`conclusion=success`；整個 run 綠代表上面每個 gate 都過了），輸出 run id。`verify-native` 以 `gh run download` 取該 run 的四個 `native-candidate-*` 與 `native-acceptance-receipt`，然後：
    - tag 版本必須等於該 SHA 的 `Cargo.toml` 版本（CI 用它建置，發版不再改版號）；
    - 每個目錄的檔案集合必須剛好是下表的檔名，`sha256sum --check --strict` 對 `SHA256SUMS-<target>.txt` 全數通過；
    - Linux／Windows 再跑一次 `verify_artifacts.py --dir`；macOS 的 `.app.tar.gz` 跑結構檢查（DMG 無法在 Linux 掛載，它的內容已在 CI 的 macOS 上驗過，位元組由 SHA256SUMS 釘住）；
    - Linux：`acceptance.json` 為 `PASSED`／`gate=all`，`build-receipt.json` 的 `sourceSha` 等於 tag SHA，tarball 內執行檔 sha256 等於 receipt 的 `sha256`；
-   - 原封不動上傳，另產生 `snip-sync-desktop-SHA256SUMS.txt`，並在 release notes 附上 CI run 連結、Linux 已驗收執行檔 sha256、全部 sha256 與未簽章說明。
+   - 原封不動交給 `publish-release`（workflow artifact `desktop-assets`），另產生 `snip-sync-desktop-SHA256SUMS.txt` 與 release notes 的來源段落（CI run 連結、Linux 已驗收執行檔 sha256、全部 sha256、未簽章說明）。
+   - **發布是原子的**：`changelog`、`verify-native`、`build-cli` 都只產生 workflow artifact，不碰 GitHub Release。三者全部成功後，`publish-release` 才再核對一次桌面檔 sha256 與 12 個資產齊全，以 draft 建立 Release 並附上全部資產，確認 draft 上有 12 個資產後一次改為公開；已公開的同名 Release 一律拒絕，先前失敗留下的 draft 會被刪掉重建。任何檢查失敗都不會留下公開的 Release。`publish-homebrew` 只在 `publish-release` 成功後執行。
 4. 因此 RC tag（例如 `v0.3.0-rc.1`）也必須先把 `Cargo.toml` bump 成同一字串並在 `main` 上跑綠 CI；`just release` 的 CI 等待上限因 `native-acceptance`（120 分鐘 timeout）調為 150 分鐘。
 
 ### 2.2 發布資產（檔名固定）
@@ -76,7 +77,7 @@ v0.3.0 起，release 的桌面資產改為原生 GPUI App（`crates/desktop-nati
 
 DMG 檔名沿用 Tauri 時代的 `snip-sync_mac_arm.dmg`／`snip-sync_mac_intel.dmg`，舊下載連結不斷。Tauri 的 `snip-sync-linux.AppImage` 與 Tauri 的 `snip-sync_<version>_<arch>.dmg` 不再產生。Homebrew cask 改指向 `snip-sync_mac_#{arch}.dmg`（`arch arm: "arm", intel: "intel"`）、`app "snip-sync.app"`，加上 `depends_on macos: ">= :big_sur"` 與 Gatekeeper caveats。
 
-**Bundle id 沿用 Tauri 的 `com.audichuang.snip-sync`**。好處：cask 的 `zap` 路徑仍正確；同名同 id 直接覆蓋 `/Applications/snip-sync.app`，LaunchServices 視為同一 App 升級；回退到 Tauri 版也是覆蓋回去。代價：ad-hoc 簽章的 designated requirement 是 cdhash，TCC 權限（例如輔助使用）本來就不會跨版本延續；同時保留兩個同 id 的 App 會讓 LaunchServices 混淆，所以不要並存。Windows 安裝檔刻意 **不** 沿用 Tauri 的 `%LOCALAPPDATA%\snip-sync` 與其 NSIS 解除安裝項：兩者並存時「應用程式」清單會出現兩筆，舊版需手動解除安裝，但回退不會互相覆蓋檔案。
+**Bundle id 沿用 Tauri 的 `com.audichuang.snip-sync`**。好處：cask 的 `zap` 路徑仍正確；同名同 id 直接覆蓋 `/Applications/snip-sync.app`，LaunchServices 視為同一 App 升級；回退到 Tauri 版也是覆蓋回去。代價：ad-hoc 簽章的 designated requirement 是 cdhash，TCC 權限（例如輔助使用）本來就不會跨版本延續；同時保留兩個同 id 的 App 會讓 LaunchServices 混淆，所以不要並存。Windows 安裝檔刻意 **不** 沿用 Tauri 的 `%LOCALAPPDATA%\snip-sync` 與其 NSIS 解除安裝項，回退時不會互相覆蓋檔案。安裝時若偵測到舊的 Tauri 版（`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\snip-sync` 的 `UninstallString`，或 `%LOCALAPPDATA%\snip-sync\uninstall.exe`），會詢問是否先解除安裝（以 `/S _?=<dir>` 靜默執行其 NSIS 解除安裝程式並等待）；使用者拒絕或解除安裝失敗時，完成頁會提醒舊版仍在。靜默安裝預設為「否」，不會擅自移除軟體。
 
 ### 2.3 簽章
 

@@ -53,7 +53,7 @@ brew install audichuang/tap/snip-cli           # CLI（snip）
 
 - macOS 第一次開啟若被擋：系統設定 → 隱私權與安全性 → 「強制打開」（Open Anyway）；舊版 macOS 可在 Finder 對 App 按右鍵 → 打開。或直接移除隔離屬性：`xattr -cr /Applications/snip-sync.app`。
 - Windows SmartScreen 警告：「其他資訊」→「仍要執行」。
-- 從 v0.2.x（Tauri 版）升級：macOS 的 `snip-sync.app` 沿用同一個 bundle id，直接覆蓋；Windows 新安裝位置不同，舊的 Tauri 版請從「應用程式」另外解除安裝。
+- 從 v0.2.x（Tauri 版）升級：macOS 的 `snip-sync.app` 沿用同一個 bundle id，直接覆蓋；Windows 安裝檔會偵測舊的 Tauri 版（`%LOCALAPPDATA%\snip-sync`）並詢問是否先解除安裝；選「否」則兩版並存，之後可在「設定 → 應用程式」移除舊版。
 
 ## 已定案的範圍(2026-09-23)
 
