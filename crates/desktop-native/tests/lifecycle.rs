@@ -3055,3 +3055,81 @@ fn failed_drain_reloads_the_changes_it_cancelled() {
 	wait_git_idle(app.pid, &app.starttime);
 	quit_cleanly(&mut app, &wid);
 }
+
+/// Losing the X server must end the process instead of spinning on the
+/// dead connection's always-readable fd (vendor/gpui/SNIP_PATCH.md).
+#[test]
+fn x_server_loss_exits_instead_of_spinning() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	// A private server, so killing it leaves the shared DISPLAY alone.
+	let mut xvfb = Command::new("Xvfb")
+		.args(["-displayfd", "1", "-screen", "0", "1280x900x24"])
+		.args(["-nolisten", "tcp"])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::null())
+		.spawn()
+		.expect("Xvfb should start");
+	let mut display = String::new();
+	BufReader::new(xvfb.stdout.take().unwrap())
+		.read_line(&mut display)
+		.expect("Xvfb display number");
+	let display = format!(":{}", display.trim());
+	let root = tempfile::tempdir().unwrap();
+	let mut child = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"))
+		.args(["--workspace", &root.path().to_string_lossy()])
+		.args(["--restore-dir", &root.path().to_string_lossy()])
+		.env("DISPLAY", &display)
+		.env("XMODIFIERS", "@im=none")
+		.env("SNIP_NATIVE_E2E", "1")
+		.stdout(Stdio::piped())
+		.stderr(Stdio::inherit())
+		.spawn()
+		.expect("native desktop should run");
+	let pid = child.id();
+	let (tx, rx) = std::sync::mpsc::channel::<String>();
+	let stdout = child.stdout.take().unwrap();
+	let reader = std::thread::spawn(move || {
+		for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+			let _ = tx.send(line);
+		}
+	});
+	lines_until(&rx, "[APP:WINDOW_READY]", Duration::from_secs(20));
+	std::thread::sleep(Duration::from_millis(500));
+
+	let _ = xvfb.kill();
+	let _ = xvfb.wait();
+	// utime + stime in clock ticks.
+	let ticks = |pid: u32| -> Option<u64> {
+		let rest = proc_rest(pid)?;
+		Some(rest[11].parse::<u64>().ok()? + rest[12].parse::<u64>().ok()?)
+	};
+	let before = ticks(pid).expect("app cpu ticks");
+	let start = Instant::now();
+	let mut last = before;
+	let status = loop {
+		if let Some(status) = child.try_wait().unwrap() {
+			break status;
+		}
+		last = ticks(pid).unwrap_or(last);
+		if start.elapsed() > Duration::from_secs(5) {
+			let _ = child.kill();
+			let _ = child.wait();
+			panic!(
+				"app still running 5s after its X server died; cpu ticks {before}->{last} (cleanup kill)"
+			);
+		}
+		std::thread::sleep(Duration::from_millis(50));
+	};
+	let _ = reader.join();
+	println!(
+		"[LIFECYCLE-TEST] X loss: exited in {:?} with {status}, cpu ticks {before}->{last}",
+		start.elapsed()
+	);
+	assert!(
+		status.success(),
+		"app exited uncleanly after X loss: {status}"
+	);
+}
