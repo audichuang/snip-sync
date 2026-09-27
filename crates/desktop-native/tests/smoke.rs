@@ -933,7 +933,8 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	click("btn-locale");
 	wait_for_pattern("[APP:LOCALE: En]", Duration::from_secs(3))
 		.expect("harmless locale focus anchor must switch to English");
-	capture_focus("keyboard-anchor-locale.png", &[("btn-locale", true)]);
+	// IntelliJ draws no focus ring after a mouse click, only after keys.
+	capture_focus("keyboard-anchor-locale.png", &[("btn-locale", false)]);
 	println!("[TEST DRIVER] Disabled Copy must neither focus nor activate...");
 	// The basket is still empty. Clicking the disabled button must not focus it;
 	// Enter/Space may retain the harmless locale focus, but cannot invoke Copy.
@@ -4139,5 +4140,204 @@ fn native_light_theme_renders() {
 	};
 	println!("[TEST DRIVER] light theme mean luminance {mean:.3} -> {png:?}");
 	assert!(mean > 0.6, "light palette must render light, mean={mean}");
+	quit_cleanly(&mut app, &wid);
+}
+
+/// IntelliJ chrome through real input: a right-click context menu run by
+/// mouse and by keyboard, speed search in the Project tree, Esc / Shift+Esc,
+/// Log ← to the parent commit and Ctrl+Shift+` for the branches popup.
+#[test]
+fn native_intellij_menus_shortcuts_and_speed_search() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let xdotool = Command::new("xdotool").arg("--version").output();
+	if xdotool.is_err() || !xdotool.unwrap().status.success() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("chrome");
+	fs::create_dir_all(repo.join("subfolder")).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.email", "t@example.com"]);
+	git_ok(&repo, &["config", "user.name", "Chrome Test"]);
+	fs::write(repo.join("alpha.txt"), "alpha\n").unwrap();
+	fs::write(repo.join("subfolder/nested.txt"), "nested\n").unwrap();
+	git_ok(&repo, &["add", "."]);
+	git_ok(&repo, &["commit", "-qm", "first"]);
+	let first = git_rev(&repo);
+	fs::write(repo.join("alpha.txt"), "alpha two\n").unwrap();
+	git_ok(&repo, &["commit", "-qam", "second"]);
+	let second = git_rev(&repo);
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(12))
+		.expect("repo must load");
+	lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8))
+		.expect("log must load");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	let st = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let rx = &app.rx;
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(5))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(4);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, button: &str| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				button,
+			])
+			.status()
+			.unwrap();
+		assert!(st.success());
+	};
+	let click = |id: &str| press(id, "1");
+	let right_click = |id: &str| press(id, "3");
+
+	key(&wid, "alt+1");
+	wait("[APP:TAB_SWITCHED: FileExplorer visible=true");
+	click("tree-row:subfolder");
+	wait("[APP:TREE_EXPANDED: subfolder]");
+
+	// 1. Mouse: right-click a file, pick "Copy Relative Path".
+	clip_set("SENTINEL_CHROME_MENU");
+	right_click("tree-row:subfolder/nested.txt");
+	let open = wait("[APP:MENU_OPEN: Left");
+	assert!(
+		open.last().unwrap().contains("copy-relative-path"),
+		"{open:?}"
+	);
+	control("context-menu");
+	click("menu-item:copy-relative-path");
+	wait("[APP:MENU_ACTION: copy-relative-path]");
+	wait("[APP:TEXT_COPIED:");
+	absent("context-menu");
+	assert_eq!(clip_get(), "subfolder/nested.txt");
+
+	// 2. Keyboard: Down highlights the first item, Enter runs it.
+	right_click("tree-row:alpha.txt");
+	wait("[APP:MENU_OPEN: Left items=add-basket");
+	key(&wid, "Down");
+	key(&wid, "Return");
+	wait("[APP:MENU_ACTION: add-basket]");
+	wait("[APP:BASKET: n=1");
+	absent("context-menu");
+	// Escape closes a menu without running anything.
+	right_click("tree-row:alpha.txt");
+	wait("[APP:MENU_OPEN: Left items=remove-basket");
+	key(&wid, "Escape");
+	let closed = wait("[APP:MENU_CLOSED]");
+	assert!(
+		!closed.iter().any(|l| l.contains("MENU_ACTION")),
+		"{closed:?}"
+	);
+
+	// 3. Speed search: typing in the tree jumps to the first match.
+	click("tree-row:alpha.txt");
+	Command::new("xdotool")
+		.args(["type", "--window", &wid, "nest"])
+		.status()
+		.unwrap();
+	let found = wait("[APP:SPEED_SEARCH: q=nest row=");
+	assert!(!found.last().unwrap().contains("row=none"), "{found:?}");
+	control("speed-search");
+	key(&wid, "Escape");
+	wait("[APP:SPEED_SEARCH: off]");
+	absent("speed-search");
+	// A second Esc leaves the tool window for the editor.
+	key(&wid, "Escape");
+	wait("[APP:FOCUS: editor]");
+
+	// 4. Shift+Esc hides the focused tool window.
+	click("tree-row:alpha.txt");
+	key(&wid, "shift+Escape");
+	wait("[APP:TAB_SWITCHED: FileExplorer visible=false");
+	absent("left-list");
+
+	// 5. Log: Left goes to the parent commit.
+	click(&format!("commit-row:{}", &second[..7]));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &second[..7]));
+	key(&wid, "Left");
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &first[..7]));
+	// Right-click menu on a Log row offers the parent as well.
+	right_click(&format!("commit-row:{}", &second[..7]));
+	wait("[APP:MENU_OPEN: Log");
+	click("menu-item:copy-revision");
+	wait("[APP:MENU_ACTION: copy-revision]");
+	wait("[APP:TEXT_COPIED:");
+	assert_eq!(clip_get(), second);
+
+	// 6. Ctrl+Shift+` opens the branches popup.
+	key(&wid, "ctrl+shift+grave");
+	wait("[APP:SELECTOR_OPEN: Ref");
+	control("pick-ref:refs/heads/main");
+	key(&wid, "Escape");
+	wait("[APP:SELECTOR_CLOSED]");
+
 	quit_cleanly(&mut app, &wid);
 }
