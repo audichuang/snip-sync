@@ -70,23 +70,23 @@ SUPPORTED_TARGETS: Dict[str, Dict[str, Any]] = {
 # Documented package_native outputs. A targeted audit must see this set and nothing else.
 CANDIDATE_FILES: Dict[str, Tuple[str, ...]] = {
     "aarch64-apple-darwin": (
-        "snip-desktop-native-mac-arm.tar.gz",
-        "snip-desktop-native-mac-arm.dmg",
+        "snip-sync_mac_arm.app.tar.gz",
+        "snip-sync_mac_arm.dmg",
     ),
     "x86_64-apple-darwin": (
-        "snip-desktop-native-mac-intel.tar.gz",
-        "snip-desktop-native-mac-intel.dmg",
+        "snip-sync_mac_intel.app.tar.gz",
+        "snip-sync_mac_intel.dmg",
     ),
-    "x86_64-unknown-linux-gnu": ("snip-desktop-native-linux-x86_64.tar.gz",),
-    "x86_64-pc-windows-msvc": ("snip-desktop-native-windows-x64.zip",),
+    "x86_64-unknown-linux-gnu": ("snip-sync-linux-x86_64.tar.gz",),
+    "x86_64-pc-windows-msvc": ("snip-sync-windows-x64.zip", "snip-sync-windows-setup.exe"),
 }
 
-MAC_BINARY = "snip-desktop-native.app/Contents/MacOS/snip-desktop-native"
-MAC_PLIST = "snip-desktop-native.app/Contents/Info.plist"
-WIN_BINARY = "snip-desktop-native/snip-desktop-native.exe"
-WIN_README = "snip-desktop-native/README.txt"
-LINUX_PKG_PREFIX = "snip-desktop-native-"
-DESKTOP_FILE_NAME = "snip-desktop-native.desktop"
+MAC_BINARY = "snip-sync.app/Contents/MacOS/snip-desktop-native"
+MAC_PLIST = "snip-sync.app/Contents/Info.plist"
+WIN_BINARY = "snip-sync/snip-desktop-native.exe"
+WIN_README = "snip-sync/README.txt"
+LINUX_PKG_PREFIX = "snip-sync-"
+DESKTOP_FILE_NAME = "snip-sync.desktop"
 
 # Bounds for archive inspection. Large enough for a real universal binary's
 # slice headers, small enough that a hostile member cannot force an unbounded read.
@@ -1579,7 +1579,25 @@ def _verify_candidate_file(
             target=target,
         )
         return {"type": "zip", **info}
+    if path.name.endswith("-setup.exe"):
+        return {"type": "windows_installer", **verify_windows_installer(path)}
     raise VerificationError(f"No verifier for candidate file {path.name}")
+
+
+def verify_windows_installer(path: Path) -> Dict[str, Any]:
+    """
+    Structural check of the Inno Setup installer: a well-formed PE of plausible size.
+    The setup stub is a 32-bit x86 PE regardless of the payload, so no arch check.
+    The payload is bound to the packaged exe by the CI install-and-hash step.
+    """
+    if path.is_symlink() or not path.is_file():
+        raise VerificationError(f"Installer not found: {path}")
+    size = path.stat().st_size
+    if size < 1024 * 1024:
+        raise VerificationError(f"Installer suspiciously small ({size} bytes): {path}")
+    bin_info = detect_binary_format_and_arch(path)
+    _require_format(bin_info, "pe", str(path))
+    return {"installer": str(path), "format": bin_info["format"], "stub_arch": bin_info["arch"]}
 
 
 def audit_artifact_directory(

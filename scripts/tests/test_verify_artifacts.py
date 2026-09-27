@@ -40,10 +40,10 @@ from scripts.verify_artifacts import (
 
 CPU_X86_64 = 0x01000007
 CPU_ARM64 = 0x0100000C
-MAC_BINARY = "snip-desktop-native.app/Contents/MacOS/snip-desktop-native"
-MAC_PLIST = "snip-desktop-native.app/Contents/Info.plist"
-WIN_BINARY = "snip-desktop-native/snip-desktop-native.exe"
-WIN_README = "snip-desktop-native/README.txt"
+MAC_BINARY = "snip-sync.app/Contents/MacOS/snip-desktop-native"
+MAC_PLIST = "snip-sync.app/Contents/Info.plist"
+WIN_BINARY = "snip-sync/snip-desktop-native.exe"
+WIN_README = "snip-sync/README.txt"
 
 
 def make_elf(machine: int = 0x3E) -> bytes:
@@ -208,7 +208,7 @@ class TestVerifyArtifacts(unittest.TestCase):
 
     def test_verify_macos_bundle(self) -> None:
         """Tests verifying macOS .app bundle structure, plist, and executable."""
-        bundle = self.test_dir / "snip-desktop-native.app"
+        bundle = self.test_dir / "snip-sync.app"
         contents = bundle / "Contents"
         macos = contents / "MacOS"
         macos.mkdir(parents=True)
@@ -231,11 +231,11 @@ class TestVerifyArtifacts(unittest.TestCase):
     def test_verify_mac_tar_archive_with_plist(self) -> None:
         """
         Tests verifying a macOS .tar.gz archive with actual package layout:
-        snip-desktop-native.app/Contents/MacOS/snip-desktop-native
-        snip-desktop-native.app/Contents/Info.plist
+        snip-sync.app/Contents/MacOS/snip-desktop-native
+        snip-sync.app/Contents/Info.plist
         Verifies that it reads Info.plist stream to verify version.
         """
-        tar_path = self.test_dir / "snip-desktop-native-mac-arm.tar.gz"
+        tar_path = self.test_dir / "snip-sync_mac_arm.app.tar.gz"
 
         macho_arm64 = make_macho(CPU_ARM64)
         plist_bytes = app_plist("0.1.4")
@@ -256,8 +256,8 @@ class TestVerifyArtifacts(unittest.TestCase):
     def test_verify_tar_archive_version_and_security(self) -> None:
         """Tests verifying a Linux .tar.gz archive with exact version check and path traversal rejection."""
         elf_x86_64 = make_elf()
-        pkg = "snip-desktop-native-0.1.4"
-        tar_path = self.test_dir / "snip-desktop-native-linux-x86_64.tar.gz"
+        pkg = "snip-sync-0.1.4"
+        tar_path = self.test_dir / "snip-sync-linux-x86_64.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf_x86_64, 0o755)
             add_tar_bytes(
@@ -268,7 +268,7 @@ class TestVerifyArtifacts(unittest.TestCase):
             )
             add_tar_bytes(
                 tf,
-                f"{pkg}/share/applications/snip-desktop-native.desktop",
+                f"{pkg}/share/applications/snip-sync.desktop",
                 desktop_entry(),
                 0o644,
             )
@@ -292,7 +292,7 @@ class TestVerifyArtifacts(unittest.TestCase):
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 10.1.40\n", 0o644)
             add_tar_bytes(
                 tf,
-                f"{pkg}/share/applications/snip-desktop-native.desktop",
+                f"{pkg}/share/applications/snip-sync.desktop",
                 desktop_entry(),
                 0o644,
             )
@@ -319,8 +319,8 @@ class TestVerifyArtifacts(unittest.TestCase):
 
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
-                zf.writestr("snip-desktop-native/snip-desktop-native.exe", elf_x86_64)
-                zf.writestr("snip-desktop-native/README.txt", "Version: 0.1.4\n")
+                zf.writestr("snip-sync/snip-desktop-native.exe", elf_x86_64)
+                zf.writestr("snip-sync/README.txt", "Version: 0.1.4\n")
 
         with self.assertRaises(VerificationError) as cm:
             verify_zip_archive(zip_path, target="x86_64-pc-windows-msvc", expected_version="0.1.4")
@@ -352,7 +352,7 @@ class TestVerifyArtifacts(unittest.TestCase):
 
     def test_verify_zip_archive_version_and_security(self) -> None:
         """Tests verifying a Windows .zip archive with version check and path traversal rejection."""
-        zip_path = self.test_dir / "snip-desktop-native-windows-x64.zip"
+        zip_path = self.test_dir / "snip-sync-windows-x64.zip"
         pe_x86_64 = make_pe()
 
         with open(zip_path, "wb") as fp:
@@ -430,7 +430,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         self.assertEqual(res.returncode, 0, f"package_native.sh failed on path with spaces: {res.stderr}")
 
         # Verify produced tarball exists and passes artifact audit
-        tarball = out_with_spaces / "snip-desktop-native-linux-x86_64.tar.gz"
+        tarball = out_with_spaces / "snip-sync-linux-x86_64.tar.gz"
         self.assertTrue(tarball.is_file())
 
         audit_res = audit_artifact_directory(
@@ -492,9 +492,9 @@ class TestVerifyArtifacts(unittest.TestCase):
 
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
-                zf.writestr("snip-desktop-native/snip-desktop-native.exe", pe_x86_64)
-                zf.writestr("snip-desktop-native/README.txt", "Version: 0.1.4\n")
-                zinfo = zipfile.ZipInfo("snip-desktop-native/link.exe")
+                zf.writestr("snip-sync/snip-desktop-native.exe", pe_x86_64)
+                zf.writestr("snip-sync/README.txt", "Version: 0.1.4\n")
+                zinfo = zipfile.ZipInfo("snip-sync/link.exe")
                 zinfo.create_system = 3  # Unix
                 zinfo.external_attr = 0o120777 << 16  # S_IFLNK
                 zf.writestr(zinfo, "snip-desktop-native.exe")
@@ -563,9 +563,9 @@ class TestVerifyArtifacts(unittest.TestCase):
 
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
-                zf.writestr("snip-desktop-native/snip-desktop-native.exe", pe_x86_64)
-                zf.writestr("snip-desktop-native/README.txt", "Version: 0.1.4\n")
-                zf.writestr("snip-desktop-native/docs/README.txt", "Version: 0.1.4\n")
+                zf.writestr("snip-sync/snip-desktop-native.exe", pe_x86_64)
+                zf.writestr("snip-sync/README.txt", "Version: 0.1.4\n")
+                zf.writestr("snip-sync/docs/README.txt", "Version: 0.1.4\n")
 
         with self.assertRaises(VerificationError) as cm:
             verify_zip_archive(zip_path, target="x86_64-pc-windows-msvc", expected_version="0.1.4")
@@ -717,13 +717,13 @@ class TestVerifyArtifacts(unittest.TestCase):
             verify_tar_archive(disconnected, expected_version="0.1.4", target="aarch64-apple-darwin")
         self.assertIn("Info.plist", str(plist_err.exception))
 
-        pkg = "snip-desktop-native-0.1.4"
+        pkg = "snip-sync-0.1.4"
         elf = make_elf()
         readme_tar = self.test_dir / "disconnected-readme.tar.gz"
         with tarfile.open(readme_tar, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
             add_tar_bytes(tf, "docs/README.txt", b"Version: 0.1.4\n", 0o644)
-            add_tar_bytes(tf, f"{pkg}/share/applications/snip-desktop-native.desktop", desktop_entry(), 0o644)
+            add_tar_bytes(tf, f"{pkg}/share/applications/snip-sync.desktop", desktop_entry(), 0o644)
         with self.assertRaises(VerificationError) as readme_err:
             verify_tar_archive(readme_tar, expected_version="0.1.4", target="x86_64-unknown-linux-gnu")
         self.assertIn("README", str(readme_err.exception))
@@ -732,7 +732,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         with tarfile.open(good_tar, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
-            add_tar_bytes(tf, f"{pkg}/share/applications/snip-desktop-native.desktop", desktop_entry(), 0o644)
+            add_tar_bytes(tf, f"{pkg}/share/applications/snip-sync.desktop", desktop_entry(), 0o644)
         res = verify_tar_archive(good_tar, expected_version="0.1.4", target="x86_64-unknown-linux-gnu")
         self.assertEqual(res["format"], "elf")
 
@@ -742,7 +742,7 @@ class TestVerifyArtifacts(unittest.TestCase):
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(
                 tf,
-                f"{pkg}/share/applications/snip-desktop-native.desktop",
+                f"{pkg}/share/applications/snip-sync.desktop",
                 desktop_entry(exec_line="false"),
                 0o644,
             )
@@ -756,7 +756,7 @@ class TestVerifyArtifacts(unittest.TestCase):
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(
                 tf,
-                f"{pkg}/share/applications/snip-desktop-native.desktop",
+                f"{pkg}/share/applications/snip-sync.desktop",
                 desktop_entry(version="0.1.4"),
                 0o644,
             )
@@ -829,8 +829,8 @@ class TestVerifyArtifacts(unittest.TestCase):
         tar_only = self.test_dir / "tar-only"
         tar_only.mkdir()
         tar_bytes = self._mac_tar("ignored-name.tar.gz", make_macho(CPU_ARM64)).read_bytes()
-        (tar_only / "snip-desktop-native-mac-arm.tar.gz").write_bytes(tar_bytes)
-        self._write_sums(tar_only, ["snip-desktop-native-mac-arm.tar.gz"])
+        (tar_only / "snip-sync_mac_arm.app.tar.gz").write_bytes(tar_bytes)
+        self._write_sums(tar_only, ["snip-sync_mac_arm.app.tar.gz"])
         with self.assertRaises(VerificationError) as missing:
             audit_artifact_directory(
                 tar_only,
@@ -842,9 +842,9 @@ class TestVerifyArtifacts(unittest.TestCase):
 
         both = self.test_dir / "both"
         both.mkdir()
-        (both / "snip-desktop-native-mac-arm.tar.gz").write_bytes(tar_bytes)
-        (both / "snip-desktop-native-mac-arm.dmg").write_bytes(b"A" * 2048)
-        self._write_sums(both, ["snip-desktop-native-mac-arm.tar.gz", "snip-desktop-native-mac-arm.dmg"])
+        (both / "snip-sync_mac_arm.app.tar.gz").write_bytes(tar_bytes)
+        (both / "snip-sync_mac_arm.dmg").write_bytes(b"A" * 2048)
+        self._write_sums(both, ["snip-sync_mac_arm.app.tar.gz", "snip-sync_mac_arm.dmg"])
         with self.assertRaises(VerificationError) as unverified:
             audit_artifact_directory(
                 both,
@@ -858,15 +858,15 @@ class TestVerifyArtifacts(unittest.TestCase):
     def test_platform_candidate_set_must_be_complete(self) -> None:
         linux_dir = self.test_dir / "linux-extra"
         linux_dir.mkdir()
-        pkg = "snip-desktop-native-0.1.4"
+        pkg = "snip-sync-0.1.4"
         elf = make_elf()
-        tar_path = linux_dir / "snip-desktop-native-linux-x86_64.tar.gz"
+        tar_path = linux_dir / "snip-sync-linux-x86_64.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
-            add_tar_bytes(tf, f"{pkg}/share/applications/snip-desktop-native.desktop", desktop_entry(), 0o644)
+            add_tar_bytes(tf, f"{pkg}/share/applications/snip-sync.desktop", desktop_entry(), 0o644)
         (linux_dir / "extra.zip").write_bytes(b"PK extra")
-        self._write_sums(linux_dir, ["snip-desktop-native-linux-x86_64.tar.gz", "extra.zip"])
+        self._write_sums(linux_dir, ["snip-sync-linux-x86_64.tar.gz", "extra.zip"])
         with self.assertRaises(VerificationError) as extra:
             audit_artifact_directory(
                 linux_dir,
@@ -878,12 +878,15 @@ class TestVerifyArtifacts(unittest.TestCase):
 
         windows_ok = self.test_dir / "windows-ok"
         windows_ok.mkdir()
-        zip_path = windows_ok / "snip-desktop-native-windows-x64.zip"
+        zip_path = windows_ok / "snip-sync-windows-x64.zip"
         with open(zip_path, "wb") as fp:
             with zipfile.ZipFile(fp, "w") as zf:
                 zf.writestr(WIN_BINARY, make_pe())
                 zf.writestr(WIN_README, "Version: 0.1.4\n")
-        self._write_sums(windows_ok, [zip_path.name])
+        setup_path = windows_ok / "snip-sync-windows-setup.exe"
+        # The Inno Setup stub is a 32-bit x86 PE followed by its payload.
+        setup_path.write_bytes(make_pe(0x014C) + b"\0" * (1024 * 1024))
+        self._write_sums(windows_ok, [zip_path.name, setup_path.name])
         windows_res = audit_artifact_directory(
             windows_ok,
             expected_version="0.1.4",
@@ -891,7 +894,19 @@ class TestVerifyArtifacts(unittest.TestCase):
             require_checksums=True,
         )
         self.assertTrue(windows_res["full_audit"])
-        self.assertEqual(windows_res["artifacts_checked"], 1)
+        self.assertEqual(windows_res["artifacts_checked"], 2)
+
+        for bad, reason in ((make_pe(0x014C), "suspiciously small"), (b"MZ" + b"\0" * (1024 * 1024), "")):
+            setup_path.write_bytes(bad)
+            self._write_sums(windows_ok, [zip_path.name, setup_path.name])
+            with self.assertRaises(VerificationError) as bad_setup:
+                audit_artifact_directory(
+                    windows_ok,
+                    expected_version="0.1.4",
+                    target="x86_64-pc-windows-msvc",
+                    require_checksums=True,
+                )
+            self.assertIn(reason, str(bad_setup.exception))
 
         windows_dir = self.test_dir / "windows-missing"
         windows_dir.mkdir()
@@ -968,7 +983,7 @@ class TestVerifyArtifacts(unittest.TestCase):
                 self.assertIn("-nobrowse", cmd)
                 mnt = Path(cmd[cmd.index("-mountpoint") + 1])
                 mounts.append(mnt)
-                bundle = mnt / "snip-desktop-native.app" / "Contents"
+                bundle = mnt / "snip-sync.app" / "Contents"
                 macos = bundle / "MacOS"
                 macos.mkdir(parents=True)
                 binary = macos / "snip-desktop-native"
@@ -994,14 +1009,14 @@ class TestVerifyArtifacts(unittest.TestCase):
 
     def _linux_candidate(self, directory: Path, elf: bytes) -> None:
         directory.mkdir()
-        pkg = "snip-desktop-native-0.1.4"
-        tar_path = directory / "snip-desktop-native-linux-x86_64.tar.gz"
+        pkg = "snip-sync-0.1.4"
+        tar_path = directory / "snip-sync-linux-x86_64.tar.gz"
         with tarfile.open(tar_path, "w:gz") as tf:
             add_tar_bytes(tf, f"{pkg}/bin/snip-desktop-native", elf, 0o755)
             add_tar_bytes(tf, f"{pkg}/README.txt", b"Version: 0.1.4\n", 0o644)
             add_tar_bytes(
                 tf,
-                f"{pkg}/share/applications/snip-desktop-native.desktop",
+                f"{pkg}/share/applications/snip-sync.desktop",
                 desktop_entry(),
                 0o644,
             )
@@ -1117,7 +1132,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         self.assertEqual(code, 0, _err)
         self.assertIn("aarch64", out)
 
-        bundle = self.test_dir / "snip-desktop-native.app"
+        bundle = self.test_dir / "snip-sync.app"
         macos = bundle / "Contents" / "MacOS"
         macos.mkdir(parents=True)
         binary = macos / "snip-desktop-native"
