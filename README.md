@@ -73,7 +73,7 @@ brew install audichuang/tap/snip-cli           # CLI（snip）
 
 | 字型 | 版本 | 用途 | 授權檔 |
 |---|---|---|---|
-| [Inter](https://github.com/rsms/inter)(Regular、SemiBold) | 4.1 | UI 文字 | `Inter-OFL.txt` |
+| [Inter](https://github.com/rsms/inter)(Regular、Italic、SemiBold) | 4.1 | UI 文字(Italic 只用於預覽分頁名稱) | `Inter-OFL.txt` |
 | [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono)(Regular) | 2.304 | 程式碼／editor | `JetBrainsMono-OFL.txt` |
 
 字型未經修改,也不單獨販售。其餘專案程式碼仍為 MIT。

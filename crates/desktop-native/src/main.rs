@@ -815,10 +815,7 @@ impl WorkbenchModel {
 				InputEvent::SubmitPrev | InputEvent::Up => {
 					this.find_step(false, cx)
 				}
-				InputEvent::Dismiss => {
-					this.pending_focus = Some(this.reader_focus.clone());
-					cx.notify();
-				}
+				InputEvent::Dismiss => this.close_find(cx),
 			}
 		})
 		.detach();
@@ -830,10 +827,7 @@ impl WorkbenchModel {
 					this.goto_line(&q, cx);
 					this.pending_focus = Some(this.reader_focus.clone());
 				}
-				InputEvent::Dismiss => {
-					this.pending_focus = Some(this.reader_focus.clone());
-					cx.notify();
-				}
+				InputEvent::Dismiss => this.close_find(cx),
 				_ => {}
 			},
 		)

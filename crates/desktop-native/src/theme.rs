@@ -301,6 +301,10 @@ pub fn register_fonts(cx: &gpui::App) {
 		include_bytes!("../assets/fonts/Inter-SemiBold.ttf")
 			.as_slice()
 			.into(),
+		// IntelliJ's italic preview-tab name.
+		include_bytes!("../assets/fonts/Inter-Italic.ttf")
+			.as_slice()
+			.into(),
 		include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")
 			.as_slice()
 			.into(),

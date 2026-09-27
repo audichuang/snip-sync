@@ -24,7 +24,7 @@ use crate::graph_view;
 use crate::history::RevRow;
 use crate::i18n::{t, tf};
 use crate::icons::{file_icon, icon, icon_tinted, Icon};
-use crate::paste::{PasteItem, PastePreviewPlan};
+use crate::paste::{split_dir, PasteItem, PasteNode, PastePreviewPlan};
 use crate::reader::{DiffMode, PreviewSource};
 use crate::selector::Pick;
 use crate::theme::*;
@@ -41,6 +41,7 @@ use crate::{
 	ToggleLog, ToggleTab, TreeCollapse, TreeDown, TreeExpand, TreeOpen,
 	TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
 };
+use crate::{NextDiff, PrevDiff};
 
 // ───────────────────────── E2E probes (opt-in) ─────────────────────────
 
@@ -2779,7 +2780,18 @@ impl WorkbenchModel {
 
 	/// Editor tab row. An empty `label` means nothing is open: the row stays
 	/// (stable layout) but shows no tab, like IntelliJ's empty editor.
-	fn tab_strip(&self, label: String, ic: Icon) -> Div {
+	/// Editor tab bar with one Islands pill: file-type icon, the name (italic
+	/// while it is a preview tab) and a ✕ when the tab can be closed.
+	fn tab_strip(
+		&self,
+		label: String,
+		ic: Icon,
+		preview: bool,
+		close: Option<fn(&mut Self, &mut Context<Self>)>,
+		cx: &mut Context<Self>,
+	) -> Div {
+		let loc = self.locale;
+		let log = &self.probes;
 		div()
 			.flex()
 			.flex_row()
@@ -2795,6 +2807,8 @@ impl WorkbenchModel {
 			.when(!label.is_empty(), |d| {
 				d.child(
 					div()
+						.id("editor-tab")
+						.relative()
 						.flex()
 						.flex_row()
 						.items_center()
@@ -2802,18 +2816,51 @@ impl WorkbenchModel {
 						.min_w_0()
 						.max_w(px(360.))
 						.h(px(24.))
-						.px(px(10.))
+						.pl(px(8.))
+						.pr(px(if close.is_some() { 4. } else { 10. }))
 						// Islands selected tab: filled rounded pill.
 						.rounded(px(6.))
 						.bg(rgb(pal().range_bg))
 						.text_size(px(UI_TEXT))
 						.text_color(rgb(pal().text))
+						.when(preview, |d| {
+							d.tooltip(tip(t("tip_preview_tab", loc)))
+								// Double-click keeps the tab, as in IntelliJ.
+								.on_click(cx.listener(
+									|this, ev: &gpui::ClickEvent, _, cx| {
+										if ev.click_count() >= 2
+											&& !this.reader.pinned
+										{
+											this.reader.pinned = true;
+											app_log!("[APP:TAB_PINNED]");
+											cx.notify();
+										}
+									},
+								))
+						})
 						.child(icon(ic, 14.))
-						.child(clip_text(label)),
+						.child(clip_text(label).when(preview, |d| d.italic()))
+						.when_some(close, |d, close| {
+							d.child(
+								icon_button(
+									"btn-tab-close",
+									Icon::Close,
+									t("tip_close_tab", loc),
+									true,
+									38,
+								)
+								.size(px(16.))
+								.on_click(cx.listener(move |this, _, _, cx| {
+									cx.stop_propagation();
+									close(this, cx)
+								}))
+								.children(probe(log, "btn-tab-close")),
+							)
+						})
+						.children(probe(log, "editor-tab")),
 				)
 			})
 	}
-
 	/// IntelliJ-style empty editor: the real shortcuts, centered and muted.
 	fn editor_empty_hints(&self) -> Div {
 		let loc = self.locale;
@@ -2934,14 +2981,14 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+	/// IntelliJ's search bar: an inline field with Match Case / Regex
+	/// toggles, match count, previous / next, go-to-line and close. Hidden
+	/// until Ctrl+F or Ctrl+G opens it; Esc closes it.
+	fn find_bar(&self, cx: &mut Context<Self>) -> Stateful<Div> {
 		let loc = self.locale;
 		let log = &self.probes;
-		let (tab_label, crumbs, badge) = self.source_labels();
-		let tab_icon = file_icon(&tab_label);
-		let is_diff = self.preview.as_ref().is_some_and(|p| p.is_diff);
-		let side = self.reader.diff_mode == DiffMode::SideBySide;
 		let n_matches = self.reader.matches.len();
+		let opts = self.reader.find_opts;
 		let find_label = match self.reader.current {
 			Some(c) if n_matches > 0 => {
 				let more = if n_matches >= crate::reader::MAX_MATCHES {
@@ -2953,6 +3000,160 @@ impl WorkbenchModel {
 			}
 			_ => "0/0".into(),
 		};
+		let toggle = |id: &'static str, ic: Icon, tip_key: &str, on: bool| {
+			icon_button(id, ic, t(tip_key, loc), true, 34)
+				.size(px(20.))
+				.when(on, |d| {
+					d.bg(rgb(pal().range_bg)).border_color(rgb(pal().accent))
+				})
+				.children(probe(log, id))
+		};
+		let field = div()
+			.flex()
+			.flex_row()
+			.items_center()
+			.gap(px(4.))
+			.flex_1()
+			.min_w(px(160.))
+			.max_w(px(420.))
+			.h(px(24.))
+			.child(icon(Icon::Search, 14.))
+			.child(
+				div()
+					.id("find-input")
+					.relative()
+					.flex_1()
+					.min_w(px(60.))
+					.child(self.find_input.clone())
+					.children(probe(log, "find-input")),
+			)
+			.child(
+				toggle(
+					"btn-find-case",
+					Icon::MatchCase,
+					"tip_match_case",
+					opts.match_case,
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.toggle_find_option(false, cx)
+				})),
+			)
+			.child(
+				toggle("btn-find-regex", Icon::Regex, "tip_regex", opts.regex)
+					.on_click(cx.listener(|this, _, _, cx| {
+						this.toggle_find_option(true, cx)
+					})),
+			);
+		div()
+			.id("find-bar")
+			.relative()
+			.flex()
+			.flex_row()
+			.items_center()
+			.flex_shrink_0()
+			.h(px(32.))
+			.px(px(8.))
+			.gap(px(6.))
+			.border_b_1()
+			.border_color(rgb(pal().divider))
+			.bg(rgb(pal().panel_bg))
+			.text_size(px(SMALL_TEXT))
+			.child(field)
+			.child(
+				div()
+					.id("find-count")
+					.flex_shrink_0()
+					.min_w(px(40.))
+					.text_color(rgb(
+						if self.reader.find_invalid
+							|| (n_matches == 0
+								&& !self.reader.find_query.is_empty())
+						{
+							pal().error
+						} else {
+							pal().text_muted
+						},
+					))
+					.child(find_label),
+			)
+			.child(
+				icon_button(
+					"btn-find-prev",
+					Icon::ArrowUp,
+					t("tip_find_prev", loc),
+					n_matches > 0,
+					32,
+				)
+				.when(n_matches > 0, |b| {
+					b.on_click(
+						cx.listener(|this, _, _, cx| this.find_step(false, cx)),
+					)
+				})
+				.children(probe(log, "btn-find-prev")),
+			)
+			.child(
+				icon_button(
+					"btn-find-next",
+					Icon::ArrowDown,
+					t("tip_find_next", loc),
+					n_matches > 0,
+					33,
+				)
+				.when(n_matches > 0, |b| {
+					b.on_click(
+						cx.listener(|this, _, _, cx| this.find_step(true, cx)),
+					)
+				})
+				.children(probe(log, "btn-find-next")),
+			)
+			.child(toolbar_divider())
+			.child(
+				div()
+					.id("goto-field")
+					.flex()
+					.flex_row()
+					.items_center()
+					.flex_shrink_0()
+					.gap(px(4.))
+					.h(px(24.))
+					.px(px(6.))
+					.rounded(px(4.))
+					.border_1()
+					.border_color(rgb(pal().button_border))
+					.bg(rgb(pal().button_bg))
+					.tooltip(tip(t("tip_goto", loc)))
+					.child(icon(Icon::GoToLine, 14.))
+					.child(
+						div()
+							.id("goto-input")
+							.relative()
+							.w(px(64.))
+							.child(self.goto_input.clone())
+							.children(probe(log, "goto-input")),
+					),
+			)
+			.child(div().flex_1())
+			.child(
+				icon_button(
+					"btn-find-close",
+					Icon::Close,
+					t("tip_find_close", loc),
+					true,
+					39,
+				)
+				.on_click(cx.listener(|this, _, _, cx| this.close_find(cx)))
+				.children(probe(log, "btn-find-close")),
+			)
+			.children(probe(log, "find-bar"))
+	}
+
+	fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let (tab_label, crumbs, badge) = self.source_labels();
+		let tab_icon = file_icon(&tab_label);
+		let is_diff = self.preview.as_ref().is_some_and(|p| p.is_diff);
+		let side = self.reader.diff_mode == DiffMode::SideBySide;
 		let has_preview = self.can_copy_preview();
 		let preview_notice = self.preview.as_ref().and_then(|p| {
 			if p.notice.is_some() {
@@ -2973,113 +3174,87 @@ impl WorkbenchModel {
 			}
 		});
 
+		// IntelliJ editor / diff toolbar: icon-only ghost buttons, the
+		// label in the tooltip.
 		let toolbar = div()
 			.flex()
 			.flex_row()
 			.items_center()
 			.flex_shrink_0()
-			.h(px(30.))
-			.px(px(8.))
-			.gap(px(6.))
-			.border_b_1()
-			.border_color(rgb(pal().divider))
-			.text_size(px(SMALL_TEXT))
-			.child(icon(Icon::Search, 13.))
-			.child(
-				div()
-					.id("find-input")
-					.relative()
-					.w(px(150.))
-					.min_w(px(80.))
-					.child(self.find_input.clone())
-					.children(probe(log, "find-input")),
-			)
-			.child(
-				div()
-					.id("find-count")
-					.flex_shrink_0()
-					.min_w(px(36.))
-					.text_color(rgb(if n_matches == 0 {
-						pal().text_disabled
-					} else {
-						pal().text_muted
-					}))
-					.child(find_label),
-			)
-			.child(
-				button("btn-find-prev", "↑", Btn::Ghost, n_matches > 0, 32)
-					.px(px(5.))
-					.tooltip(tip(t("tip_find_prev", loc)))
-					.on_click(
-						cx.listener(|this, _, _, cx| this.find_step(false, cx)),
-					)
-					.children(probe(log, "btn-find-prev")),
-			)
-			.child(
-				button("btn-find-next", "↓", Btn::Ghost, n_matches > 0, 33)
-					.px(px(5.))
-					.tooltip(tip(t("tip_find_next", loc)))
-					.on_click(
-						cx.listener(|this, _, _, cx| this.find_step(true, cx)),
-					)
-					.children(probe(log, "btn-find-next")),
-			)
-			.child(
-				div()
-					.id("goto-input")
-					.relative()
-					.w(px(64.))
-					.flex_shrink_0()
-					.child(self.goto_input.clone())
-					.children(probe(log, "goto-input")),
-			)
-			.child(div().flex_1())
+			.gap(px(2.))
 			.when(is_diff, |d| {
 				d.child(
-					button(
-						"btn-diff-mode",
-						if side {
-							t("diff_inline", loc)
-						} else {
-							t("diff_side", loc)
-						},
-						Btn::Ghost,
+					icon_button(
+						"btn-prev-diff",
+						Icon::PrevDiff,
+						t("tip_prev_diff", loc),
 						true,
 						35,
 					)
-					.px(px(6.))
-					.text_size(px(SMALL_TEXT))
-					.child(icon(Icon::Diff, 12.))
-					.on_click(cx.listener(|this, _, _, cx| {
-						this.reader.diff_mode = match this.reader.diff_mode {
-							DiffMode::Inline => DiffMode::SideBySide,
-							DiffMode::SideBySide => DiffMode::Inline,
-						};
-						this.reader.anchor = None;
-						this.reader.head = None;
-						app_log!(
-							"[APP:DIFF_MODE: {:?}]",
-							this.reader.diff_mode
-						);
-						cx.notify();
-					}))
+					.on_click(
+						cx.listener(|this, _, _, cx| {
+							this.step_change(false, cx)
+						}),
+					)
+					.children(probe(log, "btn-prev-diff")),
+				)
+				.child(
+					icon_button(
+						"btn-next-diff",
+						Icon::NextDiff,
+						t("tip_next_diff", loc),
+						true,
+						35,
+					)
+					.on_click(
+						cx.listener(|this, _, _, cx| {
+							this.step_change(true, cx)
+						}),
+					)
+					.children(probe(log, "btn-next-diff")),
+				)
+				.child(
+					// Shows the current viewer; clicking switches to the other.
+					icon_button(
+						"btn-diff-mode",
+						if side {
+							Icon::SideBySide
+						} else {
+							Icon::Unified
+						},
+						t(
+							if side {
+								"tip_diff_unified"
+							} else {
+								"tip_diff_side"
+							},
+							loc,
+						),
+						true,
+						35,
+					)
+					.on_click(
+						cx.listener(|this, _, _, cx| this.toggle_diff_mode(cx)),
+					)
 					.children(probe(log, "btn-diff-mode")),
 				)
+				.child(toolbar_divider())
 			})
 			.when(
 				self.selected_commit.is_some() && self.compare.is_none(),
 				|d| {
 					d.child(
-						button(
+						icon_button(
 							"btn-browse-tree",
-							t("btn_browse_tree", loc),
-							Btn::Ghost,
+							Icon::Project,
+							format!(
+								"{} — {}",
+								t("btn_browse_tree", loc),
+								t("tip_browse_tree", loc)
+							),
 							true,
 							36,
 						)
-						.px(px(6.))
-						.text_size(px(SMALL_TEXT))
-						.tooltip(tip(t("tip_browse_tree", loc)))
 						.on_click(cx.listener(|this, _, _, cx| {
 							this.browse_commit_tree(cx)
 						}))
@@ -3099,19 +3274,22 @@ impl WorkbenchModel {
 				},
 			)
 			.child(
-				button(
+				icon_button(
 					"btn-copy-view",
-					t("btn_copy_view", loc),
-					Btn::Ghost,
+					Icon::Copy,
+					format!(
+						"{} — {}",
+						t("btn_copy_view", loc),
+						t("tip_copy_view", loc)
+					),
 					has_preview,
 					37,
 				)
-				.px(px(6.))
-				.text_size(px(SMALL_TEXT))
-				.tooltip(tip(t("tip_copy_view", loc)))
-				.on_click(cx.listener(|this, _, _, cx| {
-					this.copy_current_preview_content(cx)
-				}))
+				.when(has_preview, |b| {
+					b.on_click(cx.listener(|this, _, _, cx| {
+						this.copy_current_preview_content(cx)
+					}))
+				})
 				.children(probe(log, "btn-copy-view")),
 			);
 
@@ -3161,9 +3339,14 @@ impl WorkbenchModel {
 					this.move_cursor_line(30, cx)
 				}))
 				.on_action(cx.listener(|this, _: &ReaderClear, _, cx| {
-					this.reader.anchor = None;
-					this.reader.head = None;
-					cx.notify();
+					// Esc clears the selection, then closes the find bar.
+					if this.reader.selection().is_some() {
+						this.reader.anchor = None;
+						this.reader.head = None;
+						cx.notify();
+					} else {
+						this.close_find(cx);
+					}
 				}))
 				.flex()
 				.flex_col()
@@ -3192,6 +3375,13 @@ impl WorkbenchModel {
 			self.editor_empty_hints().into_any_element()
 		};
 
+		let showing = self.preview.is_some()
+			|| self.selected_commit.is_some()
+			|| self.compare.is_some();
+		// Only a file view closes; a commit or compare is left from the log.
+		let closable = (self.preview.is_some() || self.preview_error.is_some())
+			&& self.selected_commit.is_none()
+			&& self.compare.is_none();
 		div()
 			.flex()
 			.flex_col()
@@ -3201,15 +3391,13 @@ impl WorkbenchModel {
 			.bg(rgb(pal().editor_bg))
 			.rounded(px(ISLAND_RADIUS))
 			.child(self.tab_strip(
-				if self.preview.is_some()
-					|| self.selected_commit.is_some()
-					|| self.compare.is_some()
-				{
-					tab_label
-				} else {
-					String::new()
-				},
+				if showing { tab_label } else { String::new() },
 				tab_icon,
+				self.preview.is_some() && !self.reader.pinned,
+				closable.then_some(
+					Self::close_editor_tab as fn(&mut Self, &mut Context<Self>),
+				),
+				cx,
 			))
 			.child(
 				div()
@@ -3217,8 +3405,9 @@ impl WorkbenchModel {
 					.flex_row()
 					.items_center()
 					.flex_shrink_0()
-					.h(px(26.))
-					.px(px(12.))
+					.h(px(28.))
+					.pl(px(12.))
+					.pr(px(6.))
 					.gap(px(8.))
 					.border_b_1()
 					.border_color(rgb(pal().divider))
@@ -3255,7 +3444,8 @@ impl WorkbenchModel {
 								.child(badge)
 								.children(probe(log, "source-badge")),
 						)
-					}),
+					})
+					.child(toolbar),
 			)
 			.when(
 				self.selected_commit.is_some() || self.compare.is_some(),
@@ -3270,7 +3460,7 @@ impl WorkbenchModel {
 					)
 				},
 			)
-			.child(toolbar)
+			.when(self.reader.find_open, |d| d.child(self.find_bar(cx)))
 			.child(body)
 			.into_any_element()
 	}
@@ -3594,7 +3784,10 @@ impl WorkbenchModel {
 			.rounded(px(ISLAND_RADIUS))
 			.child(self.tab_strip(
 				t("paste_tab", self.locale).to_string(),
-				Icon::Changes,
+				Icon::Paste,
+				false,
+				Some(Self::cancel_paste_preview),
+				cx,
 			))
 			.child(self.paste_action_bar(dest, false, false, false, cx))
 			.child(self.paste_loading_note())
@@ -3633,6 +3826,15 @@ impl WorkbenchModel {
 			applying,
 			mapping_ready,
 			plan.executable(),
+			cx,
+		);
+		let tab = self.tab_strip(
+			format!("{} ({})", t("paste_tab", loc), plan.items.len()),
+			Icon::Paste,
+			false,
+			(!applying).then_some(
+				Self::cancel_paste_preview as fn(&mut Self, &mut Context<Self>),
+			),
 			cx,
 		);
 
@@ -3999,10 +4201,7 @@ impl WorkbenchModel {
 			.overflow_hidden()
 			.bg(rgb(pal().editor_bg))
 			.rounded(px(ISLAND_RADIUS))
-			.child(self.tab_strip(
-				format!("{} ({})", t("paste_tab", loc), plan.items.len()),
-				Icon::Changes,
-			))
+			.child(tab)
 			.child(action_bar)
 			.child(summary)
 			.when(loading, |d| d.child(self.paste_loading_note()))
@@ -5184,12 +5383,16 @@ impl Render for WorkbenchModel {
 				this.toggle_locale(cx)
 			}))
 			.on_action(cx.listener(|this, _: &FindInFile, window, cx| {
-				window.focus(&this.find_input.read(cx).handle());
-				cx.notify();
+				this.open_find(false, window, cx)
 			}))
 			.on_action(cx.listener(|this, _: &GotoLine, window, cx| {
-				window.focus(&this.goto_input.read(cx).handle());
-				cx.notify();
+				this.open_find(true, window, cx)
+			}))
+			.on_action(cx.listener(|this, _: &NextDiff, _, cx| {
+				this.step_change(true, cx)
+			}))
+			.on_action(cx.listener(|this, _: &PrevDiff, _, cx| {
+				this.step_change(false, cx)
 			}))
 			.on_action(
 				cx.listener(|this, _: &FindNext, _, cx| {

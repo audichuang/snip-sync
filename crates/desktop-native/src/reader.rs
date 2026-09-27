@@ -14,6 +14,7 @@ use gpui::{
 	TextRun, UniformListScrollHandle, Window,
 };
 
+use crate::i18n::tf;
 use crate::syntax::{highlight_line, Language, SyntaxTheme};
 use crate::theme::*;
 use crate::WorkbenchModel;
@@ -202,6 +203,24 @@ impl Preview {
 			.is_none_or(|d| d.shown.binary_search(&line).is_ok())
 	}
 
+	/// Bytes of `line` hidden before its text: the `+`/`-`/space marker of
+	/// a diff body line. Columns stay raw byte offsets everywhere.
+	pub fn text_start(&self, line: usize) -> usize {
+		self.diff
+			.as_ref()
+			.and_then(|d| d.inline.get(line))
+			.filter(|r| r.is_code())
+			.map_or(0, |_| self.line(line).len().min(1))
+	}
+
+	/// True when `line` shows its own text (not hidden, not a fold row).
+	pub fn is_text_row(&self, line: usize) -> bool {
+		self.is_shown(line)
+			&& self.diff.as_ref().is_none_or(|d| {
+				d.inline.get(line).is_none_or(|r| r.kind != RowKind::Hunk)
+			})
+	}
+
 	/// Language used to colour code: a diff body is coloured as its file.
 	pub fn code_lang(&self) -> Language {
 		match (&self.path, self.is_diff) {
@@ -249,6 +268,80 @@ pub struct InlineRow {
 	pub kind: RowKind,
 	pub old: Option<u32>,
 	pub new: Option<u32>,
+	/// Added/removed line of a block that both removes and adds (IntelliJ
+	/// "modified"); a lone insertion or deletion keeps its own colour.
+	pub modified: bool,
+	/// Hunk rows: unchanged lines left out of the patch before this hunk,
+	/// drawn as a collapsed "⋯ N unchanged lines" row instead of the `@@`.
+	pub fold: u32,
+}
+
+impl InlineRow {
+	fn new(kind: RowKind, old: Option<u32>, new: Option<u32>) -> Self {
+		Self {
+			kind,
+			old,
+			new,
+			modified: false,
+			fold: 0,
+		}
+	}
+
+	/// A body line of a hunk: its first byte is the `+`/`-`/space marker.
+	pub fn is_code(&self) -> bool {
+		matches!(
+			self.kind,
+			RowKind::Context | RowKind::Added | RowKind::Removed
+		)
+	}
+
+	/// Background of a changed line, as IntelliJ colours its block.
+	pub fn change(&self) -> Option<Change> {
+		match (self.kind, self.modified) {
+			(RowKind::Added | RowKind::Removed, true) => Some(Change::Modified),
+			(RowKind::Added, false) => Some(Change::Inserted),
+			(RowKind::Removed, false) => Some(Change::Deleted),
+			_ => None,
+		}
+	}
+}
+
+/// A side-by-side row's place in its change block: the row's offset and
+/// how many lines the block has on each side. Drives the tint and the
+/// ribbon between the panes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+	pub at: u32,
+	pub left: u32,
+	pub right: u32,
+}
+
+/// Which change a block (or a line of it) makes, as IntelliJ colours it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+	Inserted,
+	Deleted,
+	Modified,
+}
+
+impl Block {
+	pub fn change(&self) -> Change {
+		match (self.left, self.right) {
+			(0, _) => Change::Inserted,
+			(_, 0) => Change::Deleted,
+			_ => Change::Modified,
+		}
+	}
+}
+
+impl Change {
+	pub fn bg(self) -> u32 {
+		match self {
+			Change::Inserted => pal().diff_add_bg,
+			Change::Deleted => pal().diff_del_bg,
+			Change::Modified => pal().diff_mod_bg,
+		}
+	}
 }
 
 /// One side-by-side row: indices into preview lines for each side.
@@ -257,28 +350,34 @@ pub struct SideRow {
 	pub kind: RowKind,
 	pub left: Option<(u32, usize)>,
 	pub right: Option<(u32, usize)>,
-	/// Header/hunk rows span both sides with this preview line.
+	/// Fold (hunk) and patch-header rows span both sides with this line.
 	pub full: Option<usize>,
+	/// Set on rows of a change block.
+	pub block: Option<Block>,
 }
 
 pub struct DiffRows {
 	/// One entry per preview line (row kinds and numbers).
 	pub inline: Vec<InlineRow>,
 	pub side: Vec<SideRow>,
-	/// Preview lines drawn in inline mode: patch headers (`diff --git`,
-	/// `index`, `---`/`+++`, mode lines) are hidden once a hunk exists.
+	/// Preview lines drawn in unified mode, in order: hunk bodies plus one
+	/// fold row per skipped unchanged region. Patch headers, `@@` lines and
+	/// "\ No newline at end of file" are never drawn once a hunk exists.
 	pub shown: Vec<usize>,
 	/// Largest old/new line number, sizes the gutter.
 	pub max_num: u32,
 }
 
-fn parse_hunk(line: &str) -> Option<(u32, u32)> {
-	// "@@ -a[,b] +c[,d] @@"
+/// "@@ -a[,b] +c[,d] @@" as (a, b, c).
+fn parse_hunk(line: &str) -> Option<(u32, u32, u32)> {
 	let rest = line.strip_prefix("@@ -")?;
 	let (old, rest) = rest.split_once(' ')?;
 	let new = rest.strip_prefix('+')?.split(' ').next()?;
-	let first = |s: &str| s.split(',').next()?.parse().ok();
-	Some((first(old)?, first(new)?))
+	let (start, len) = match old.split_once(',') {
+		Some((s, l)) => (s.parse().ok()?, l.parse().ok()?),
+		None => (old.parse().ok()?, 1),
+	};
+	Some((start, len, new.split(',').next()?.parse().ok()?))
 }
 
 impl DiffRows {
@@ -288,14 +387,23 @@ impl DiffRows {
 		let mut inline = Vec::with_capacity(lines.len());
 		let mut side = Vec::new();
 		let (mut old, mut new) = (0u32, 0u32);
+		// First old line not yet accounted for; the gap up to the next hunk
+		// is folded.
+		let mut next_old = 1u32;
 		let mut in_hunk = false;
 		let mut dels: Vec<(u32, usize)> = Vec::new();
 		let mut adds: Vec<(u32, usize)> = Vec::new();
-		let flush = |side: &mut Vec<SideRow>,
+		let flush = |inline: &mut Vec<InlineRow>,
+		             side: &mut Vec<SideRow>,
 		             dels: &mut Vec<(u32, usize)>,
 		             adds: &mut Vec<(u32, usize)>| {
-			let n = dels.len().max(adds.len());
-			for k in 0..n {
+			let (nl, nr) = (dels.len(), adds.len());
+			if nl > 0 && nr > 0 {
+				for &(_, i) in dels.iter().chain(adds.iter()) {
+					inline[i].modified = true;
+				}
+			}
+			for k in 0..nl.max(nr) {
 				let l = dels.get(k).copied();
 				let r = adds.get(k).copied();
 				side.push(SideRow {
@@ -307,6 +415,11 @@ impl DiffRows {
 					left: l,
 					right: r,
 					full: None,
+					block: Some(Block {
+						at: k as u32,
+						left: nl as u32,
+						right: nr as u32,
+					}),
 				});
 			}
 			dels.clear();
@@ -314,92 +427,95 @@ impl DiffRows {
 		};
 		for i in 0..lines.len() {
 			let l = get(i);
-			if let Some((o, n)) =
+			if let Some((o, olen, n)) =
 				l.starts_with("@@").then(|| parse_hunk(l)).flatten()
 			{
-				flush(&mut side, &mut dels, &mut adds);
+				flush(&mut inline, &mut side, &mut dels, &mut adds);
+				// An empty old range names the line *before* it.
+				let first = if olen == 0 { o + 1 } else { o };
+				let fold = first.saturating_sub(next_old);
 				old = o;
 				new = n;
 				in_hunk = true;
 				inline.push(InlineRow {
-					kind: RowKind::Hunk,
-					old: None,
-					new: None,
+					fold,
+					..InlineRow::new(RowKind::Hunk, None, None)
 				});
-				side.push(SideRow {
-					kind: RowKind::Hunk,
-					left: None,
-					right: None,
-					full: Some(i),
-				});
+				if fold > 0 {
+					side.push(SideRow {
+						kind: RowKind::Hunk,
+						left: None,
+						right: None,
+						full: Some(i),
+						block: None,
+					});
+				}
 				continue;
 			}
 			if l.starts_with("diff --git") {
 				in_hunk = false;
+				next_old = 1;
 			}
 			if !in_hunk || l.starts_with('\\') {
-				flush(&mut side, &mut dels, &mut adds);
-				inline.push(InlineRow {
-					kind: RowKind::Header,
-					old: None,
-					new: None,
-				});
+				flush(&mut inline, &mut side, &mut dels, &mut adds);
+				inline.push(InlineRow::new(RowKind::Header, None, None));
 				side.push(SideRow {
 					kind: RowKind::Header,
 					left: None,
 					right: None,
 					full: Some(i),
+					block: None,
 				});
 				continue;
 			}
 			match l.as_bytes().first() {
 				Some(b'-') => {
-					inline.push(InlineRow {
-						kind: RowKind::Removed,
-						old: Some(old),
-						new: None,
-					});
+					inline.push(InlineRow::new(
+						RowKind::Removed,
+						Some(old),
+						None,
+					));
 					dels.push((old, i));
 					old += 1;
 				}
 				Some(b'+') => {
-					inline.push(InlineRow {
-						kind: RowKind::Added,
-						old: None,
-						new: Some(new),
-					});
+					inline.push(InlineRow::new(
+						RowKind::Added,
+						None,
+						Some(new),
+					));
 					adds.push((new, i));
 					new += 1;
 				}
 				_ => {
-					flush(&mut side, &mut dels, &mut adds);
-					inline.push(InlineRow {
-						kind: RowKind::Context,
-						old: Some(old),
-						new: Some(new),
-					});
+					flush(&mut inline, &mut side, &mut dels, &mut adds);
+					inline.push(InlineRow::new(
+						RowKind::Context,
+						Some(old),
+						Some(new),
+					));
 					side.push(SideRow {
 						kind: RowKind::Context,
 						left: Some((old, i)),
 						right: Some((new, i)),
 						full: None,
+						block: None,
 					});
 					old += 1;
 					new += 1;
 				}
 			}
+			next_old = old;
 		}
-		flush(&mut side, &mut dels, &mut adds);
-		// Hide the raw patch header, but never everything: a binary or
+		flush(&mut inline, &mut side, &mut dels, &mut adds);
+		// Patch chrome is hidden, but never everything: a binary or
 		// mode-only patch has no hunk and keeps its header visible.
 		let has_hunk = inline.iter().any(|r| r.kind == RowKind::Hunk);
-		let hidden = |i: usize| {
-			has_hunk
-				&& inline[i].kind == RowKind::Header
-				&& !get(i).starts_with('\\')
+		let drawn = |r: &InlineRow| {
+			!has_hunk || r.is_code() || (r.kind == RowKind::Hunk && r.fold > 0)
 		};
-		let shown = (0..lines.len()).filter(|&i| !hidden(i)).collect();
-		side.retain(|r| r.full.is_none_or(|i| !hidden(i)));
+		let shown = (0..lines.len()).filter(|&i| drawn(&inline[i])).collect();
+		side.retain(|r| r.full.is_none_or(|i| drawn(&inline[i])));
 		let max_num = inline
 			.iter()
 			.flat_map(|r| [r.old, r.new])
@@ -417,13 +533,37 @@ impl DiffRows {
 
 /// All matches of `query` (ASCII case-insensitive when the query is ASCII),
 /// as (line, byte start, byte end), capped at `MAX_MATCHES`.
-pub fn find_matches(p: &Preview, query: &str) -> Vec<(usize, usize, usize)> {
+/// With `match_case` the search is exact; with `regex` the query is a
+/// regular expression (None when it does not compile).
+pub fn find_matches(
+	p: &Preview,
+	query: &str,
+	opts: FindOptions,
+) -> Option<Vec<(usize, usize, usize)>> {
 	let mut out = Vec::new();
 	if query.is_empty() {
-		return out;
+		return Some(out);
+	}
+	if opts.regex {
+		let re = regex::RegexBuilder::new(query)
+			.case_insensitive(!opts.match_case)
+			.size_limit(1 << 20)
+			.build()
+			.ok()?;
+		for ix in 0..p.lines.len() {
+			for m in re.find_iter(p.line(ix)) {
+				if m.start() < m.end() {
+					out.push((ix, m.start(), m.end()));
+					if out.len() >= MAX_MATCHES {
+						return Some(out);
+					}
+				}
+			}
+		}
+		return Some(out);
 	}
 	let q = query.as_bytes();
-	let fold = query.is_ascii();
+	let fold = !opts.match_case && query.is_ascii();
 	for ix in 0..p.lines.len() {
 		let line = p.line(ix).as_bytes();
 		let mut i = 0;
@@ -437,7 +577,7 @@ pub fn find_matches(p: &Preview, query: &str) -> Vec<(usize, usize, usize)> {
 			if hit {
 				out.push((ix, i, i + q.len()));
 				if out.len() >= MAX_MATCHES {
-					return out;
+					return Some(out);
 				}
 				i += q.len();
 			} else {
@@ -445,7 +585,13 @@ pub fn find_matches(p: &Preview, query: &str) -> Vec<(usize, usize, usize)> {
 			}
 		}
 	}
-	out
+	Some(out)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FindOptions {
+	pub match_case: bool,
+	pub regex: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +619,14 @@ pub struct Reader {
 	pub row_geom: RowGeometry,
 	/// Last find query, re-applied when a new preview replaces the text.
 	pub find_query: String,
+	/// The find / go-to row is shown (Ctrl+F / Ctrl+G open it, Esc closes).
+	pub find_open: bool,
+	pub find_opts: FindOptions,
+	/// The regex query does not compile.
+	pub find_invalid: bool,
+	/// The tab was pinned (double-clicked); otherwise it is IntelliJ's
+	/// italic preview tab that the next opened file replaces.
+	pub pinned: bool,
 }
 
 impl Default for Reader {
@@ -488,6 +642,10 @@ impl Default for Reader {
 			scroll: UniformListScrollHandle::new(),
 			row_geom: Rc::default(),
 			find_query: String::new(),
+			find_open: false,
+			find_opts: FindOptions::default(),
+			find_invalid: false,
+			pinned: false,
 		}
 	}
 }
@@ -501,6 +659,7 @@ impl Reader {
 		self.head = None;
 		self.selecting = false;
 		self.cursor_line = 0;
+		self.pinned = false;
 		self.scroll.scroll_to_item(0, ScrollStrategy::Top);
 	}
 
@@ -535,8 +694,45 @@ impl Reader {
 }
 
 /// Copy the original byte span, preserving line endings and unindexed text.
+/// A diff copies what is on screen instead: body lines without their
+/// markers, patch chrome and fold rows left out.
 pub fn selected_text(p: &Preview, (a, b): (Pos, Pos)) -> String {
 	let (a, b) = if a <= b { (a, b) } else { (b, a) };
+	if let Some(d) = p
+		.diff
+		.as_ref()
+		.filter(|d| d.inline.iter().any(|r| r.kind == RowKind::Hunk))
+	{
+		let raw = |line: usize| {
+			let r = &p.lines[line];
+			(r.start as usize, r.end as usize)
+		};
+		let mut out = String::new();
+		let last = b.0.min(p.lines.len().saturating_sub(1));
+		let mut first = true;
+		for line in a.0..=last {
+			if line >= p.lines.len() || !d.inline[line].is_code() {
+				continue;
+			}
+			let (start, end) = raw(line);
+			let mut s = start + if line == a.0 { a.1.max(1) } else { 1 };
+			let mut e = if line == b.0 { start + b.1 } else { end };
+			s = s.min(end);
+			e = e.clamp(s, end);
+			while !p.text.is_char_boundary(s) {
+				s -= 1;
+			}
+			while !p.text.is_char_boundary(e) {
+				e += 1;
+			}
+			if !first {
+				out.push('\n');
+			}
+			first = false;
+			out.push_str(&p.text[s..e]);
+		}
+		return out;
+	}
 	let offset = |(line, column): Pos, round_up: bool| {
 		let Some(range) = p.lines.get(line) else {
 			return p.text.len();
@@ -687,10 +883,112 @@ impl WorkbenchModel {
 		let Some(p) = &self.preview else {
 			return;
 		};
-		self.reader.matches = find_matches(p, &self.reader.find_query);
-		// Matches inside hidden patch headers cannot be shown.
-		self.reader.matches.retain(|m| p.is_shown(m.0));
+		let found =
+			find_matches(p, &self.reader.find_query, self.reader.find_opts);
+		self.reader.find_invalid = found.is_none();
+		self.reader.matches = found.unwrap_or_default();
+		// Matches in hidden patch chrome or on a diff marker cannot be shown.
+		self.reader
+			.matches
+			.retain(|m| p.is_text_row(m.0) && m.1 >= p.text_start(m.0));
 		self.reader.current = (!self.reader.matches.is_empty()).then_some(0);
+	}
+
+	/// Ctrl+F / Ctrl+G: reveal the find row and focus its find or go-to
+	/// field; the query typed before is searched again.
+	pub fn open_find(
+		&mut self,
+		goto: bool,
+		window: &mut Window,
+		cx: &mut Context<Self>,
+	) {
+		if !self.reader.find_open {
+			self.reader.find_open = true;
+			let q = self.find_input.read(cx).text().to_string();
+			self.run_find(&q, cx);
+			app_log!("[APP:FIND_BAR: open]");
+		}
+		let input = if goto {
+			&self.goto_input
+		} else {
+			&self.find_input
+		};
+		window.focus(&input.read(cx).handle());
+		cx.notify();
+	}
+
+	/// Esc: hide the find row and its highlights, back to the text.
+	pub fn close_find(&mut self, cx: &mut Context<Self>) {
+		self.pending_focus = Some(self.reader_focus.clone());
+		if self.reader.find_open {
+			self.reader.find_open = false;
+			self.reader.find_query.clear();
+			self.reader.matches.clear();
+			self.reader.current = None;
+			self.reader.find_invalid = false;
+			app_log!("[APP:FIND_BAR: closed]");
+		}
+		cx.notify();
+	}
+
+	pub fn toggle_find_option(&mut self, regex: bool, cx: &mut Context<Self>) {
+		let o = &mut self.reader.find_opts;
+		if regex {
+			o.regex = !o.regex;
+		} else {
+			o.match_case = !o.match_case;
+		}
+		app_log!(
+			"[APP:FIND_OPTS: match_case={} regex={}]",
+			o.match_case,
+			o.regex
+		);
+		let q = self.reader.find_query.clone();
+		self.run_find(&q, cx);
+	}
+
+	/// F7 / Shift+F7: the next or previous change block, wrapping around.
+	pub fn step_change(&mut self, forward: bool, cx: &mut Context<Self>) {
+		let Some(d) = self.preview.as_ref().and_then(|p| p.diff.as_ref())
+		else {
+			return;
+		};
+		let changed = |k: usize| d.inline[d.shown[k]].change().is_some();
+		let starts: Vec<usize> = (0..d.shown.len())
+			.filter(|&k| changed(k) && (k == 0 || !changed(k - 1)))
+			.map(|k| d.shown[k])
+			.collect();
+		let cur = self.reader.cursor_line;
+		let target = if forward {
+			starts.iter().find(|&&l| l > cur).or(starts.first())
+		} else {
+			starts.iter().rev().find(|&&l| l < cur).or(starts.last())
+		};
+		if let Some(&line) = target {
+			self.reader_scroll_to(line);
+			app_log!("[APP:DIFF_STEP: line={}]", line + 1);
+			cx.notify();
+		}
+	}
+
+	pub fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
+		self.reader.diff_mode = match self.reader.diff_mode {
+			DiffMode::Inline => DiffMode::SideBySide,
+			DiffMode::SideBySide => DiffMode::Inline,
+		};
+		self.reader.anchor = None;
+		self.reader.head = None;
+		app_log!("[APP:DIFF_MODE: {:?}]", self.reader.diff_mode);
+		cx.notify();
+	}
+
+	/// The editor tab's ✕: drop the shown file (the tree keeps its row).
+	pub fn close_editor_tab(&mut self, cx: &mut Context<Self>) {
+		self.clear_preview();
+		self.preview_error = None;
+		self.reader.release_retained();
+		app_log!("[APP:TAB_CLOSED]");
+		cx.notify();
 	}
 
 	pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -755,10 +1053,12 @@ impl WorkbenchModel {
 				let last = geom.iter().max_by_key(|(l, _)| *l).copied()?;
 				Some(if pos.y < first.1.top() { first } else { last })
 			})?;
-		// Pointer coordinates belong to the clipped text rendered in this row.
-		let (text, _) = clip_line(p.line(line));
-		if text.is_empty() {
-			return Some((line, 0));
+		// Pointer coordinates belong to the clipped text rendered in this row
+		// (after a hidden diff marker).
+		let off = p.text_start(line);
+		let (text, _) = clip_line(&p.line(line)[off..]);
+		if text.is_empty() || !p.is_text_row(line) {
+			return Some((line, off));
 		}
 		let run = TextRun {
 			len: text.len(),
@@ -774,7 +1074,7 @@ impl WorkbenchModel {
 			&[run],
 			None,
 		);
-		Some((line, shaped.closest_index_for_x(pos.x - b.left())))
+		Some((line, off + shaped.closest_index_for_x(pos.x - b.left())))
 	}
 
 	fn reader_mouse_down(
@@ -996,7 +1296,31 @@ impl WorkbenchModel {
 		interactive: bool,
 	) -> AnyElement {
 		let theme = SyntaxTheme::default();
-		let (render_text, _) = clip_line(p.line(ix));
+		let diff_row = p.diff.as_ref().and_then(|d| d.inline.get(ix)).copied();
+		let num_w = gutter_num_w(p);
+		let geom = interactive.then(|| self.reader.row_geom.clone());
+		let geom_probe = move |d: gpui::Div| match geom {
+			Some(geom) => d.child(
+				gpui::canvas(
+					move |b, _, _| geom.borrow_mut().push((ix, b)),
+					|_, _, _, _| {},
+				)
+				.absolute()
+				.top_0()
+				.left_0()
+				.size_full(),
+			),
+			None => d,
+		};
+		if let Some(r) = diff_row.filter(|r| r.kind == RowKind::Hunk) {
+			return self
+				.fold_row(("code-line", ix), r.fold, num_w * 2.0 + GUTTER_GAP)
+				.min_w_full()
+				.child(geom_probe(div().absolute().size_full()))
+				.into_any_element();
+		}
+		let off = p.text_start(ix);
+		let (render_text, _) = clip_line(&p.line(ix)[off..]);
 		let (finds, sel) = if interactive {
 			let current = self.reader.current;
 			let finds: Vec<(usize, usize, bool)> = self
@@ -1005,37 +1329,39 @@ impl WorkbenchModel {
 				.iter()
 				.enumerate()
 				.filter(|(_, m)| m.0 == ix)
-				.map(|(i, m)| (m.1, m.2, Some(i) == current))
+				.map(|(i, m)| (m.1 - off, m.2 - off, Some(i) == current))
 				.collect();
-			(finds, self.reader.selected_in_line(ix, render_text.len()))
+			let sel = self
+				.reader
+				.selected_in_line(ix, off + render_text.len())
+				.map(|r| {
+					r.start.saturating_sub(off)..r.end.saturating_sub(off)
+				});
+			(finds, sel)
 		} else {
 			(Vec::new(), None)
 		};
-		let diff_row = p.diff.as_ref().and_then(|d| d.inline.get(ix)).copied();
-		let kind = diff_row.map(|r| r.kind);
-		// Hunk and header rows keep diff colouring; code is coloured as its
-		// file with the +/- marker tinted.
-		let lang = match kind {
-			Some(RowKind::Hunk | RowKind::Header) => Language::Diff,
+		// Visible patch headers (a patch without hunks) keep diff colouring;
+		// hunk bodies are coloured as their file.
+		let lang = match diff_row.map(|r| r.kind) {
+			Some(RowKind::Header) => Language::Diff,
 			_ => p.code_lang(),
 		};
-		let mut hl = line_highlights(render_text, lang, &theme, &finds, sel);
-		match kind {
-			Some(RowKind::Added) => tint_marker(&mut hl, theme.diff_add),
-			Some(RowKind::Removed) => tint_marker(&mut hl, theme.diff_remove),
-			_ => {}
-		}
-		let row_bg = match kind {
-			Some(RowKind::Added) => Some(pal().diff_add_bg),
-			Some(RowKind::Removed) => Some(pal().diff_del_bg),
-			Some(RowKind::Hunk) => Some(pal().diff_hunk_bg),
-			_ if interactive && ix == self.reader.cursor_line => {
+		let hl = line_highlights(render_text, lang, &theme, &finds, sel);
+		let row_bg = match diff_row.and_then(|r| r.change()) {
+			Some(c) => Some(c.bg()),
+			None if interactive && ix == self.reader.cursor_line => {
 				Some(pal().current_line_bg)
 			}
-			_ => None,
+			None => None,
 		};
-		let num_w = gutter_num_w(p);
-		let num = |n: Option<u32>| gutter_num(num_w, n);
+		// Line numbers stay legible on a tinted row.
+		let num = |n: Option<u32>| {
+			gutter_num(num_w, n)
+				.when(row_bg.is_some() && diff_row.is_some(), |d| {
+					d.text_color(rgb(pal().text_muted))
+				})
+		};
 		let gutter = match diff_row {
 			Some(r) => div()
 				.flex()
@@ -1046,7 +1372,6 @@ impl WorkbenchModel {
 				div().flex().flex_shrink_0().child(num(Some(ix as u32 + 1)))
 			}
 		};
-		let geom = interactive.then(|| self.reader.row_geom.clone());
 		let probe_id = format!("code-text:{}", ix + 1);
 		div()
 			.id(("code-line", ix))
@@ -1072,31 +1397,43 @@ impl WorkbenchModel {
 			)
 			.child(gutter.mr(px(GUTTER_GAP)))
 			.child(
-				div()
-					.relative()
-					.flex_shrink_0()
-					.pr(px(16.))
-					.child(
+				geom_probe(
+					div().relative().flex_shrink_0().pr(px(16.)).child(
 						StyledText::new(SharedString::from(
 							render_text.to_string(),
 						))
 						.with_highlights(hl),
-					)
-					.when_some(geom, |d, geom| {
-						d.child(
-							gpui::canvas(
-								move |b, _, _| geom.borrow_mut().push((ix, b)),
-								|_, _, _, _| {},
-							)
-							.absolute()
-							.top_0()
-							.left_0()
-							.size_full(),
-						)
-						.children(crate::ui::probe(&self.probes, probe_id))
-					}),
+					),
+				)
+				.when(interactive, |d| {
+					d.children(crate::ui::probe(&self.probes, probe_id))
+				}),
 			)
 			.into_any_element()
+	}
+
+	/// IntelliJ's collapsed unchanged fragment: a muted band in place of
+	/// the `@@` header, saying how many lines the patch left out.
+	fn fold_row(
+		&self,
+		id: (&'static str, usize),
+		count: u32,
+		indent: f32,
+	) -> gpui::Stateful<gpui::Div> {
+		div()
+			.id(id)
+			.relative()
+			.flex()
+			.flex_row()
+			.items_center()
+			.h(px(LINE_H))
+			.pl(px(indent))
+			.whitespace_nowrap()
+			.bg(rgb(pal().diff_hunk_bg))
+			.font_family(UI_FONT)
+			.text_size(px(SMALL_TEXT))
+			.text_color(rgb(pal().text_muted))
+			.child(tf("diff_fold", self.locale, &[count]))
 	}
 
 	fn side_row(&self, p: &Preview, ix: usize) -> AnyElement {
@@ -1105,7 +1442,19 @@ impl WorkbenchModel {
 		else {
 			return div().into_any_element();
 		};
+		let num_w = gutter_num_w(p);
 		if let Some(line) = r.full {
+			if r.kind == RowKind::Hunk {
+				let fold = p
+					.diff
+					.as_ref()
+					.and_then(|d| d.inline.get(line))
+					.map_or(0, |r| r.fold);
+				return self
+					.fold_row(("side-line", ix), fold, num_w + GUTTER_GAP)
+					.w_full()
+					.into_any_element();
+			}
 			let (text, _) = clip_line(p.line(line));
 			return div()
 				.id(("side-line", ix))
@@ -1115,9 +1464,6 @@ impl WorkbenchModel {
 				.pl(px(8.))
 				.whitespace_nowrap()
 				.overflow_hidden()
-				.when(r.kind == RowKind::Hunk, |d| {
-					d.bg(rgb(pal().diff_hunk_bg))
-				})
 				.child(
 					StyledText::new(SharedString::from(text.to_string()))
 						.with_highlights(line_highlights(
@@ -1130,50 +1476,53 @@ impl WorkbenchModel {
 				)
 				.into_any_element();
 		}
-		let num_w = gutter_num_w(p);
 		let lang = p.code_lang();
-		let half = |cell: Option<(u32, usize)>, add: bool, side_id: String| {
-			let (bg, body) = match cell {
-				Some((n, line)) => {
-					let raw = p.line(line);
-					// Drop the +/-/space marker; the side already says it.
-					let (text, _) = clip_line(raw.get(1..).unwrap_or(""));
-					let changed = raw.starts_with(if add { '+' } else { '-' });
-					(
-						changed.then_some(if add {
-							pal().diff_add_bg
-						} else {
-							pal().diff_del_bg
-						}),
-						div()
-							.flex()
-							.child(
-								gutter_num(num_w, Some(n)).mr(px(GUTTER_GAP)),
-							)
-							.child(
-								StyledText::new(SharedString::from(
-									text.to_string(),
-								))
-								.with_highlights(line_highlights(
-									text,
-									lang,
-									&theme,
-									&[],
-									None,
-								)),
-							),
-					)
+		let tint = r.block.map(|b| b.change().bg());
+		// IntelliJ mirrors the left gutter: both line-number columns sit
+		// against the divider, with the ribbons between them.
+		let half = |cell: Option<(u32, usize)>, left: bool, side_id: String| {
+			let body = cell.map(|(n, line)| {
+				let off = p.text_start(line);
+				let (text, _) = clip_line(&p.line(line)[off..]);
+				let finds: Vec<(usize, usize, bool)> = self
+					.reader
+					.matches
+					.iter()
+					.enumerate()
+					.filter(|(_, m)| m.0 == line)
+					.map(|(i, m)| {
+						(m.1 - off, m.2 - off, Some(i) == self.reader.current)
+					})
+					.collect();
+				let code = div()
+					.flex_1()
+					.min_w_0()
+					.overflow_hidden()
+					.pl(px(if left { 8. } else { GUTTER_GAP }))
+					.child(
+						StyledText::new(SharedString::from(text.to_string()))
+							.with_highlights(line_highlights(
+								text, lang, &theme, &finds, None,
+							)),
+					);
+				let num = gutter_num(num_w, Some(n))
+					.when(tint.is_some(), |d| {
+						d.text_color(rgb(pal().text_muted))
+					});
+				if left {
+					div().flex().size_full().child(code).child(num)
+				} else {
+					div().flex().size_full().child(num).child(code)
 				}
-				None => (Some(pal().diff_empty_bg), div()),
-			};
+			});
 			div()
 				.relative()
 				.flex_1()
 				.min_w_0()
 				.overflow_hidden()
 				.whitespace_nowrap()
-				.when_some(bg, |d, c| d.bg(rgb(c)))
-				.child(body)
+				.when_some(tint.filter(|_| cell.is_some()), |d, c| d.bg(rgb(c)))
+				.children(body)
 				.children(crate::ui::probe(&self.probes, side_id))
 		};
 		div()
@@ -1182,15 +1531,71 @@ impl WorkbenchModel {
 			.flex_row()
 			.w_full()
 			.h(px(LINE_H))
-			.child(half(r.left, false, format!("side-left:{ix}")))
-			.child(div().w(px(1.)).h_full().bg(rgb(pal().divider)))
-			.child(half(r.right, true, format!("side-right:{ix}")))
+			.child(half(r.left, true, format!("side-left:{ix}")))
+			.child(
+				div()
+					.flex_shrink_0()
+					.w(px(RIBBON_W))
+					.h_full()
+					.border_l_1()
+					.border_r_1()
+					.border_color(rgb(pal().divider))
+					.children(r.block.map(|b| ribbon(b, b.change().bg()))),
+			)
+			.child(half(r.right, false, format!("side-right:{ix}")))
 			.into_any_element()
 	}
 }
 
 /// Space between the line-number gutter and the code.
 const GUTTER_GAP: f32 = 8.0;
+/// Width of the divider between side-by-side panes that holds the ribbons.
+const RIBBON_W: f32 = 28.0;
+
+/// This row's slice of the polygon joining a change block on the left to
+/// its counterpart on the right. Both sides start on the block's first row;
+/// the bottom edge runs from the left block's end to the right block's end.
+fn ribbon(block: Block, color: u32) -> impl IntoElement {
+	gpui::canvas(
+		|_, _, _| {},
+		move |b, _, window, _| {
+			let at = block.at as f32;
+			let (l, r) = (block.left as f32 - at, block.right as f32 - at);
+			// Bottom edge at x (0 = left pane, 1 = right pane), clipped to this row.
+			let y = |x: f32| (l + (r - l) * x).clamp(0., 1.);
+			let mut xs = vec![0., 1.];
+			if r != l {
+				for edge in [0., 1.] {
+					let x = (edge - l) / (r - l);
+					if x > 0. && x < 1. {
+						xs.push(x);
+					}
+				}
+			}
+			xs.sort_by(f32::total_cmp);
+			if xs.iter().all(|&x| y(x) <= 0.) {
+				return;
+			}
+			let pt = |x: f32, yy: f32| {
+				gpui::point(
+					b.left() + b.size.width * x,
+					b.top() + b.size.height * yy,
+				)
+			};
+			let mut path = gpui::PathBuilder::fill();
+			path.move_to(pt(0., 0.));
+			path.line_to(pt(1., 0.));
+			for &x in xs.iter().rev() {
+				path.line_to(pt(x, y(x)));
+			}
+			path.close();
+			if let Ok(path) = path.build() {
+				window.paint_path(path, rgb(color));
+			}
+		},
+	)
+	.size_full()
+}
 
 /// Width of one line-number column, sized for the largest number shown.
 fn gutter_num_w(p: &Preview) -> f32 {
@@ -1220,22 +1625,6 @@ fn clip_line(text: &str) -> (&str, bool) {
 		cut -= 1;
 	}
 	(&text[..cut], true)
-}
-
-/// Colours the leading +/- marker of a diff line on its own.
-fn tint_marker(hl: &mut Vec<(Range<usize>, HighlightStyle)>, c: gpui::Rgba) {
-	let Some(first) = hl.first_mut().filter(|(r, _)| r.start == 0) else {
-		return;
-	};
-	if first.0.end > 1 {
-		let mut rest = first.clone();
-		rest.0.start = 1;
-		first.0.end = 1;
-		first.1.color = Some(c.into());
-		hl.insert(1, rest);
-	} else {
-		first.1.color = Some(c.into());
-	}
 }
 
 #[cfg(test)]
@@ -1307,8 +1696,21 @@ mod tests {
 	#[test]
 	fn find_is_case_insensitive_for_ascii_and_exact_for_cjk() {
 		let p = preview("Hello hello\n中文測試 中文\n", false);
-		assert_eq!(find_matches(&p, "HELLO"), vec![(0, 0, 5), (0, 6, 11)]);
-		let m = find_matches(&p, "中文");
+		let find = |q: &str, match_case: bool, regex: bool| {
+			find_matches(&p, q, FindOptions { match_case, regex })
+		};
+		assert_eq!(
+			find("HELLO", false, false),
+			Some(vec![(0, 0, 5), (0, 6, 11)])
+		);
+		assert_eq!(find("HELLO", true, false), Some(vec![]));
+		assert_eq!(
+			find("h.llo", false, true),
+			Some(vec![(0, 0, 5), (0, 6, 11)])
+		);
+		assert_eq!(find("h.llo", true, true), Some(vec![(0, 6, 11)]));
+		assert_eq!(find("(", false, true), None, "invalid regex");
+		let m = find("中文", false, false).unwrap();
 		assert_eq!(m.len(), 2);
 		assert_eq!(&p.line(1)[m[1].1..m[1].2], "中文");
 	}
@@ -1333,12 +1735,16 @@ mod tests {
 		let p = preview(diff, true);
 		let d = p.diff.as_ref().unwrap();
 		assert_eq!(d.inline[3].kind, RowKind::Hunk);
+		assert_eq!(d.inline[3].fold, 2, "old lines 1-2 are folded");
+		assert_eq!(d.shown[0], 3, "the fold row replaces the @@ header");
 		assert_eq!(
 			d.inline[4],
 			InlineRow {
 				kind: RowKind::Context,
 				old: Some(3),
-				new: Some(3)
+				new: Some(3),
+				modified: false,
+				fold: 0
 			}
 		);
 		assert_eq!(
@@ -1346,7 +1752,9 @@ mod tests {
 			InlineRow {
 				kind: RowKind::Removed,
 				old: Some(4),
-				new: None
+				new: None,
+				modified: true,
+				fold: 0
 			}
 		);
 		assert_eq!(
@@ -1354,7 +1762,9 @@ mod tests {
 			InlineRow {
 				kind: RowKind::Added,
 				old: None,
-				new: Some(4)
+				new: Some(4),
+				modified: true,
+				fold: 0
 			}
 		);
 		assert_eq!(
@@ -1362,7 +1772,9 @@ mod tests {
 			InlineRow {
 				kind: RowKind::Context,
 				old: Some(5),
-				new: Some(6)
+				new: Some(6),
+				modified: false,
+				fold: 0
 			}
 		);
 		// Side by side: old/new paired on one row, extra addition alone.
@@ -1372,6 +1784,68 @@ mod tests {
 		assert_eq!(changed[1].right, Some((4, 6)));
 		assert_eq!(changed[2].left, None);
 		assert_eq!(changed[2].right, Some((5, 7)));
+		// One modified block (1 old line, 2 new) drives tint and ribbon.
+		assert_eq!(changed[0].block, None);
+		assert_eq!(
+			changed[2].block,
+			Some(Block {
+				at: 1,
+				left: 1,
+				right: 2
+			})
+		);
+		assert_eq!(changed[1].block.unwrap().change(), Change::Modified);
+		assert_eq!(d.inline[5].change(), Some(Change::Modified));
+		assert_eq!(d.inline[4].change(), None);
+	}
+
+	#[test]
+	fn folds_count_the_lines_between_hunks() {
+		// New file (-0,0), deletion (+0,0) and a pure insertion after line 5.
+		for (patch, folds) in [
+			("@@ -0,0 +1,2 @@\n+a\n+b\n", vec![]),
+			("@@ -1,2 +0,0 @@\n-a\n-b\n", vec![]),
+			("@@ -5,0 +6,1 @@\n+x\n", vec![5]),
+			(
+				"@@ -2,2 +2,2 @@\n-a\n+b\n c\n@@ -10,1 +10,1 @@\n-d\n+e\n",
+				vec![1, 6],
+			),
+		] {
+			let p = preview(patch, true);
+			let d = p.diff.as_ref().unwrap();
+			let got: Vec<u32> = d
+				.shown
+				.iter()
+				.map(|&l| d.inline[l])
+				.filter(|r| r.kind == RowKind::Hunk)
+				.map(|r| r.fold)
+				.collect();
+			assert_eq!(got, folds, "{patch}");
+			let side_folds =
+				d.side.iter().filter(|r| r.kind == RowKind::Hunk).count();
+			assert_eq!(side_folds, folds.len());
+		}
+	}
+
+	#[test]
+	fn diff_copy_and_find_skip_markers_and_chrome() {
+		let diff =
+			"@@ -3,2 +3,2 @@\n ctx\n-old\n+new\n\\ No newline at end of file\n";
+		let p = preview(diff, true);
+		// Select all copies the lines on screen without +/-/space markers.
+		assert_eq!(
+			selected_text(&p, ((0, 0), (p.lines.len(), 0))),
+			"ctx\nold\nnew"
+		);
+		// A partial selection keeps raw columns (marker at column 0).
+		assert_eq!(selected_text(&p, ((1, 2), (3, 2))), "tx\nold\nn");
+		assert_eq!(p.text_start(1), 1);
+		assert_eq!(p.text_start(0), 0);
+		assert!(!p.is_text_row(0), "fold row");
+		assert!(!p.is_text_row(4), "no-newline marker is hidden");
+		let hits = find_matches(&p, "+new", FindOptions::default()).unwrap();
+		assert_eq!(hits, vec![(3, 0, 4)]);
+		assert!(hits.iter().all(|m| m.1 < p.text_start(m.0)));
 	}
 
 	#[test]
@@ -1379,16 +1853,17 @@ mod tests {
 		let diff = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+b\n c\n\\ No newline at end of file\n";
 		let p = preview(diff, true);
 		let d = p.diff.as_ref().unwrap();
-		// Hunk, body and the "\ No newline" marker are drawn; headers not.
-		assert_eq!(d.shown, vec![4, 5, 6, 7, 8]);
-		assert_eq!(p.inline_rows(), 5);
-		assert_eq!(p.inline_line(0), 4);
+		// Only the body is drawn: headers, the `@@` line (nothing folded
+		// before line 1) and "\ No newline at end of file" are not.
+		assert_eq!(d.shown, vec![5, 6, 7]);
+		assert_eq!(p.inline_rows(), 3);
+		assert_eq!(p.inline_line(0), 5);
 		assert_eq!(p.inline_row_of(0), 0, "hidden line maps to next row");
-		assert_eq!(p.inline_row_of(6), 2);
-		assert!(!p.is_shown(3) && p.is_shown(4));
-		assert!(d.side.iter().all(|r| r.full.is_none_or(|i| i >= 4)));
+		assert_eq!(p.inline_row_of(6), 1);
+		assert!(!p.is_shown(4) && p.is_shown(5) && !p.is_shown(8));
+		assert!(d.side.iter().all(|r| r.full.is_none()));
 		assert_eq!(&*p.text, diff, "retained text (copy source) unchanged");
-		assert_eq!(p.widest, 8);
+		assert_eq!(p.widest, 7);
 		// No hunk (binary patch): nothing is hidden.
 		let bin = "diff --git a/x b/x\nBinary files a/x and b/x differ\n";
 		let p = preview(bin, true);

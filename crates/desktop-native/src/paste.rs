@@ -461,6 +461,22 @@ impl PasteItem {
 	}
 }
 
+/// One row of the paste change tree (built per frame, never retained).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteNode {
+	/// A destination repository and how many items land in it.
+	Root(String, usize),
+	/// A directory under that root, as one compressed path ("src/app").
+	Dir(String, usize),
+	/// An item (index into `items`) at this tree depth.
+	File(usize, usize),
+}
+
+/// "a/b/c.txt" as ("a/b", "c.txt"); a top-level file has an empty dir.
+pub fn split_dir(path: &str) -> (&str, &str) {
+	path.rsplit_once('/').unwrap_or(("", path))
+}
+
 /// One source-prefix row. Nothing is chosen until the user picks a path.
 #[derive(Debug, Clone)]
 pub struct PrefixChoice {
@@ -1179,16 +1195,83 @@ impl PastePreviewPlan {
 		}
 	}
 
+	/// Up / Down follow the rows on screen (the change tree's order).
 	pub fn select_prev(&mut self) {
-		if self.selected_item_idx > 0 {
-			self.selected_item_idx -= 1;
-		}
+		self.step_selection(false);
 	}
 
 	pub fn select_next(&mut self) {
-		if self.selected_item_idx + 1 < self.items.len() {
-			self.selected_item_idx += 1;
+		self.step_selection(true);
+	}
+
+	fn step_selection(&mut self, forward: bool) {
+		let order = self.display_order();
+		let Some(pos) = order.iter().position(|&i| i == self.selected_item_idx)
+		else {
+			return;
+		};
+		let next = if forward {
+			pos.checked_add(1)
+		} else {
+			pos.checked_sub(1)
+		};
+		if let Some(&ix) = next.and_then(|n| order.get(n)) {
+			self.selected_item_idx = ix;
 		}
+	}
+
+	/// Item indices in change-tree order: by destination root, then
+	/// directory (a root's own files first), then name. `items` itself keeps
+	/// the plan's order.
+	pub fn display_order(&self) -> Vec<usize> {
+		// Case-insensitive like IntelliJ's tree; the raw path breaks ties.
+		let mut order: Vec<usize> = (0..self.items.len()).collect();
+		order.sort_by_cached_key(|&i| {
+			let it = &self.items[i];
+			let (dir, name) = split_dir(&it.path);
+			(
+				it.dest_root_name.clone(),
+				dir.to_lowercase(),
+				name.to_lowercase(),
+				it.path.clone(),
+			)
+		});
+		order
+	}
+
+	/// The change tree IntelliJ's Apply Patch dialog shows: one root node per
+	/// destination repository, one node per directory, then its files.
+	pub fn tree_rows(&self) -> Vec<PasteNode> {
+		let mut rows = Vec::new();
+		let (mut root, mut dir): (Option<&str>, Option<&str>) = (None, None);
+		// Rows of the open root / directory node, counted as files arrive.
+		let (mut root_row, mut dir_row) = (0, None);
+		for ix in self.display_order() {
+			let it = &self.items[ix];
+			if root != Some(it.dest_root_name.as_str()) {
+				root = Some(&it.dest_root_name);
+				dir = None;
+				root_row = rows.len();
+				rows.push(PasteNode::Root(it.dest_root_name.clone(), 0));
+			}
+			let (d, _) = split_dir(&it.path);
+			if dir != Some(d) {
+				dir = Some(d);
+				dir_row = (!d.is_empty()).then_some(rows.len());
+				if !d.is_empty() {
+					rows.push(PasteNode::Dir(d.to_string(), 0));
+				}
+			}
+			for row in [Some(root_row), dir_row].into_iter().flatten() {
+				if let PasteNode::Root(_, n) | PasteNode::Dir(_, n) =
+					&mut rows[row]
+				{
+					*n += 1;
+				}
+			}
+			rows.push(PasteNode::File(ix, if d.is_empty() { 1 } else { 2 }));
+		}
+		rows
 	}
 
 	pub fn set_all_overwrite(&mut self, allowed: bool) {
@@ -1312,6 +1395,58 @@ impl PastePreviewPlan {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn change_tree_groups_by_root_and_directory_in_display_order() {
+		let dir = tempfile::tempdir().unwrap();
+		let raw = "// clipcode-root: r\n// FILE: r/b/z.txt\n1\n// FILE: r/a.txt\n2\n// FILE: r/b/y.txt\n3\n// FILE: r/c/d/e.txt\n4\n";
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			raw,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		let paths: Vec<String> =
+			plan.items.iter().map(|i| i.path.clone()).collect();
+		let path = |ix: usize| paths[ix].clone();
+		let rows = plan.tree_rows();
+		let root = plan.items[0].dest_root_name.clone();
+		let shown: Vec<String> = rows
+			.iter()
+			.map(|r| match r {
+				PasteNode::Root(n, c) => format!("R {n} {c}"),
+				PasteNode::Dir(d, c) => format!("D {d} {c}"),
+				PasteNode::File(ix, depth) => {
+					format!("F {} {depth}", path(*ix))
+				}
+			})
+			.collect();
+		assert_eq!(
+			shown,
+			[
+				format!("R {root} 4"),
+				"D r 1".into(),
+				"F r/a.txt 2".into(),
+				"D r/b 2".into(),
+				"F r/b/y.txt 2".into(),
+				"F r/b/z.txt 2".into(),
+				"D r/c/d 1".into(),
+				"F r/c/d/e.txt 2".into(),
+			]
+		);
+		// Up / Down walk the tree's order, not the plan's.
+		plan.selected_item_idx =
+			plan.items.iter().position(|i| i.path == "r/a.txt").unwrap();
+		plan.select_next();
+		assert_eq!(path(plan.selected_item_idx), "r/b/y.txt");
+		plan.select_next();
+		plan.select_next();
+		plan.select_next();
+		assert_eq!(path(plan.selected_item_idx), "r/c/d/e.txt");
+		plan.select_prev();
+		assert_eq!(path(plan.selected_item_idx), "r/b/z.txt");
+	}
 	use std::fs;
 
 	fn captured(text: String, dest: &Path) -> PasteRequest {

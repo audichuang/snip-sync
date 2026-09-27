@@ -23,7 +23,7 @@
 - 所有 render 程式碼只經由 `pal()` 取色,原始碼中不得再出現 `rgb(0x…)` 常值。切換 palette 後重繪即可整窗換色。
 - 選擇:預設跟隨作業系統外觀(`window.appearance()`,並以 `observe_window_appearance` 監聽即時切換);環境變數 `SNIP_THEME=dark|light` 可強制指定。原生 app 目前沒有持久化設定存放區(`snip_core::settings::Settings` 是剪貼簿格式契約,不放 UI 偏好),所以沒有設定頁選項。
 - 版面:frame(`main-window-bg`)墊在最底,左側工具視窗、editor、下方 Git Log 為各自的圓角 island(半徑 8px),彼此以 4px 的 frame 間隙分隔(splitter 即間隙,不再畫 1px 分隔線)。header、左側 stripe、狀態列直接畫在 frame 上;開啟中的 stripe 按鈕為實心 accent 圓角,editor 的作用中 tab 為實心圓角 pill。
-- 字型:內嵌 Inter(UI,13px)與 JetBrains Mono(程式碼,13px),於啟動時 `add_fonts` 註冊,不依賴系統字型;中日韓字元由 GPUI 字型 fallback 取系統字型(CI 安裝 `fonts-noto-cjk`)。授權見 README「第三方授權」。內嵌字型使執行檔增加約 1.05 MiB。
+- 字型:內嵌 Inter(UI,13px)與 JetBrains Mono(程式碼,13px),於啟動時 `add_fonts` 註冊,不依賴系統字型;中日韓字元由 GPUI 字型 fallback 取系統字型(CI 安裝 `fonts-noto-cjk`)。授權見 README「第三方授權」。內嵌字型使執行檔增加約 1.45 MiB(含預覽分頁用的 Inter Italic)。
 - 測試:像素檢查(smoke 的錯誤橫幅、focus ring、警告字色,IME 的近白候選框偵測,bench／collaboration 截圖)一律以 `SNIP_THEME=dark` 啟動並對 `DARK` 數值校正;`native_light_theme_renders` 以 `SNIP_THEME=light` 輸出 `light_theme.png` artifact 並只檢查整窗偏亮。`theme.rs` 單元測試確保 `DARK`／`LIGHT` 除品牌藍系 token 外逐欄不同。
 
 ## 驗收門檻
