@@ -2163,6 +2163,7 @@ def drive_product(report: dict[str, Any], out_dir: str) -> None:
             reason=str(exc),
             root=_root_dict(session) if session is not None else None,
         )
+        raise
     finally:
         binary = report.get("binary") if isinstance(report.get("binary"), dict) else None
         if binary is not None:

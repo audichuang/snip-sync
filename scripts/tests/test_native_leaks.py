@@ -38,6 +38,7 @@ from check_native_leaks import (  # noqa: E402
 )
 from bench_tauri_memory import sha256_file  # noqa: E402
 import memory_harness  # noqa: E402
+import check_native_leaks as gate  # noqa: E402
 from memory_harness import ProcessTreeSampler, read_process_identity, sample_app_resources  # noqa: E402
 
 MIB = 1024 * 1024
@@ -1607,6 +1608,31 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
         self.assertIn("forced-quit-claimed", result["reasons"])
         self.assertIn("quit-cleanup", result["coverageGaps"])
         self.assertEqual(result["verdict"], "NOT_ACCEPTED")
+
+
+class TestDriverFailure(unittest.TestCase):
+    def test_wait_failure_reaches_report_owner_after_owned_cleanup(self):
+        session = mock.MagicMock()
+        session.app = {"pid": 1, "starttime": 2, "exe": "/missing", "comm": "snip"}
+        session.proc.poll.return_value = 0
+        session.owned = []
+        session.stop.return_value = []
+        session.wait_line.side_effect = gate.NativeBenchError("deleted source preview timed out")
+        report = {
+            "workload": {"path": "/workspace", "repos": ["repo"]},
+            "runId": "driver-failure-test", "counts": {"settleSeconds": 3},
+            "binary": {"path": "/missing"}, "interactions": [],
+        }
+        with tempfile.TemporaryDirectory() as output, \
+             mock.patch.object(gate, "workspace_repos", return_value=["/workspace/repo"]), \
+             mock.patch.object(gate, "NativeSession", return_value=session), \
+             mock.patch.object(gate, "_publish_gate_and_wait", return_value=session.app):
+            with self.assertRaisesRegex(gate.NativeBenchError, "deleted source preview timed out"):
+                gate.drive_product(report, output)
+        session.stop.assert_called_once_with()
+        self.assertTrue(report["cleanup"]["harnessForced"])
+        self.assertFalse(report["cleanup"]["productQuit"])
+        self.assertIn("deleted source preview timed out", report["interactions"][-1]["reason"])
 
 
 if __name__ == "__main__":
