@@ -78,6 +78,7 @@ pub mod lifecycle;
 mod menu;
 pub mod paste;
 mod reader;
+mod recent;
 mod selector;
 pub mod syntax;
 mod text_input;
@@ -87,7 +88,7 @@ mod ui;
 
 use gpui::{
 	actions, prelude::*, px, size, App, Application, Bounds, Context, Entity,
-	FocusHandle, KeyBinding, WindowBounds, WindowOptions,
+	FocusHandle, KeyBinding, PathPromptOptions, WindowBounds, WindowOptions,
 };
 use snip_core::browser::{self, CommitSummary, GitReference};
 use snip_core::clip;
@@ -806,6 +807,8 @@ pub struct WorkbenchModel {
 	pub workspace_menu: bool,
 	pub workspace_picker: bool,
 	pub workspace_path_input: Entity<TextInput>,
+	/// Remembered workspaces, newest first.
+	pub recent_workspaces: Vec<PathBuf>,
 	pub lifecycle: lifecycle::Lifecycle,
 	pub watch_running: bool,
 	pub last_life_log: String,
@@ -822,7 +825,7 @@ pub enum Splitter {
 
 impl WorkbenchModel {
 	pub fn new(
-		workspace_root: PathBuf,
+		workspace: Option<PathBuf>,
 		restore_dir: Option<PathBuf>,
 		mode: String,
 		cx: &mut Context<Self>,
@@ -978,7 +981,7 @@ impl WorkbenchModel {
 		.detach();
 
 		let mut model = Self {
-			workspace_root,
+			workspace_root: workspace.clone().unwrap_or_default(),
 			restore_dir,
 			repos: Vec::new(),
 			selected_repo_idx: None,
@@ -1111,16 +1114,20 @@ impl WorkbenchModel {
 			e2e_read_delay: ui::e2e_read_delay(),
 			e2e_tree_hold: ui::e2e_tree_hold(),
 			e2e_export_hold: ui::e2e_export_hold(),
-			workspace_open: true,
+			workspace_open: workspace.is_some(),
 			workspace_menu: false,
 			workspace_picker: false,
 			workspace_path_input,
+			recent_workspaces: recent::load(),
 			lifecycle: lifecycle::Lifecycle::new(1),
 			watch_running: false,
 			last_life_log: String::new(),
 			chrome: menu::Chrome::new(cx),
 		};
-		model.reload_repos(cx);
+		if let Some(path) = workspace {
+			recent::remember(&mut model.recent_workspaces, &path);
+			model.reload_repos(cx);
+		}
 		model
 	}
 
@@ -1876,6 +1883,7 @@ impl WorkbenchModel {
 	fn finish_open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
+		recent::remember(&mut self.recent_workspaces, &path);
 		self.workspace_open = true;
 		self.workspace_menu = false;
 		self.workspace_picker = false;
@@ -1898,6 +1906,33 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// The OS folder dialog. Without one (Linux with no portal) the typed
+	/// path field opens instead.
+	pub fn open_folder_dialog(&mut self, cx: &mut Context<Self>) {
+		self.workspace_menu = false;
+		self.workspace_picker = false;
+		cx.notify();
+		let picked = cx.prompt_for_paths(PathPromptOptions {
+			files: false,
+			directories: true,
+			multiple: false,
+			prompt: Some(i18n::t("workspace_open_confirm", self.locale).into()),
+		});
+		cx.spawn(async move |this, cx| {
+			let picked = picked.await;
+			let _ = this.update(cx, |this, cx| match picked {
+				Ok(Ok(Some(paths))) => {
+					if let Some(path) = paths.into_iter().next() {
+						this.open_workspace_path(path, cx);
+					}
+				}
+				Ok(Ok(None)) => {}
+				_ => this.show_workspace_picker(cx),
+			});
+		})
+		.detach();
+	}
+
 	pub fn show_workspace_picker(&mut self, cx: &mut Context<Self>) {
 		self.workspace_menu = true;
 		self.workspace_picker = true;
@@ -1914,7 +1949,15 @@ impl WorkbenchModel {
 		if text.is_empty() {
 			return;
 		}
-		let path = PathBuf::from(text);
+		self.open_workspace_path(PathBuf::from(text), cx);
+	}
+
+	/// Opens `path` as the workspace after the usual close checks.
+	pub fn open_workspace_path(
+		&mut self,
+		path: PathBuf,
+		cx: &mut Context<Self>,
+	) {
 		if !path.is_dir() {
 			self.set_status("workspace_bad_path", [path.display().to_string()]);
 			cx.notify();
@@ -4686,9 +4729,23 @@ fn read_preview(
 	}
 }
 
-fn parse_cli_args() -> (PathBuf, String, Option<PathBuf>) {
-	let mut workspace =
-		std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+/// `--workspace`, else the last remembered workspace (IntelliJ reopens the
+/// last project), else the launch folder. A Finder or Explorer launch starts
+/// in `/` or the home folder: that opens nothing rather than scanning it.
+fn startup_workspace(arg: Option<PathBuf>) -> Option<PathBuf> {
+	if arg.is_some() {
+		return arg;
+	}
+	if let Some(last) = recent::load().into_iter().next() {
+		return Some(last);
+	}
+	let cwd = std::env::current_dir().ok()?;
+	(cwd.parent().is_some() && Some(&cwd) != recent::home().as_ref())
+		.then_some(cwd)
+}
+
+fn parse_cli_args() -> (Option<PathBuf>, String, Option<PathBuf>) {
+	let mut workspace = None;
 	let mut mode = "normal".to_string();
 	let mut restore_dir = None;
 
@@ -4724,7 +4781,7 @@ fn parse_cli_args() -> (PathBuf, String, Option<PathBuf>) {
 			}
 			"--workspace" => {
 				if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-					workspace = PathBuf::from(&args[i + 1]);
+					workspace = Some(PathBuf::from(&args[i + 1]));
 					i += 1;
 				} else {
 					eprintln!(
@@ -4867,6 +4924,7 @@ fn key_bindings() -> Vec<KeyBinding> {
 
 fn main() {
 	let (workspace, mode, restore_dir) = parse_cli_args();
+	let workspace = startup_workspace(workspace);
 	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
