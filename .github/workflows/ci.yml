@@ -511,12 +511,14 @@ jobs:
                   name: native-acceptance-linux
                   path: ${{ runner.temp }}/native-acceptance
                   if-no-files-found: error
+                  overwrite: true
             - name: Upload Linux release package (the accepted binary)
               uses: actions/upload-artifact@v4
               with:
                   name: native-candidate-x86_64-unknown-linux-gnu
                   path: ${{ runner.temp }}/native-candidate-x86_64-unknown-linux-gnu
                   if-no-files-found: error
+                  overwrite: true
             - name: Checkout left clean
               if: always()
               shell: bash
@@ -636,16 +638,17 @@ jobs:
                   $ErrorActionPreference = 'Stop'
                   $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
                   $dir = Join-Path $env:RUNNER_TEMP 'snip-sync-install'
-                  $setup = Join-Path $env:PKG_OUT 'snip-sync-windows-setup.exe'
+                  $pkg = (Resolve-Path $env:PKG_OUT).Path
+                  $setup = Join-Path $pkg 'snip-sync-windows-setup.exe'
                   $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"" -Wait -PassThru
                   if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
                   $zipDir = Join-Path $env:RUNNER_TEMP 'snip-sync-zip'
-                  Expand-Archive -Path (Join-Path $env:PKG_OUT 'snip-sync-windows-x64.zip') -DestinationPath $zipDir
+                  Expand-Archive -Path (Join-Path $pkg 'snip-sync-windows-x64.zip') -DestinationPath $zipDir
                   $installed = Join-Path $dir 'snip-desktop-native.exe'
                   $hashes = @(
                       (Get-FileHash $installed -Algorithm SHA256).Hash,
                       (Get-FileHash (Join-Path $zipDir 'snip-sync\snip-desktop-native.exe') -Algorithm SHA256).Hash,
-                      (Get-FileHash 'target/${{ matrix.target }}/release/snip-desktop-native.exe' -Algorithm SHA256).Hash
+                      (Get-FileHash (Join-Path $env:GITHUB_WORKSPACE 'target/${{ matrix.target }}/release/snip-desktop-native.exe') -Algorithm SHA256).Hash
                   )
                   if (($hashes | Select-Object -Unique).Count -ne 1) { throw "installed/zipped/built exe differ: $hashes" }
                   python scripts/smoke_native.py --bin $installed --expected-version $version
@@ -657,6 +660,7 @@ jobs:
                   name: native-candidate-${{ matrix.target }}
                   path: ${{ env.PKG_OUT }}
                   if-no-files-found: error
+                  overwrite: true
             - name: Checkout left clean
               shell: bash
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
