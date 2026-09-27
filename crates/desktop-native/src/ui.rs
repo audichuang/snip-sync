@@ -4121,6 +4121,7 @@ impl WorkbenchModel {
 									log.is_some() && !self.preview_loading
 								})
 								.and_then(|sha| {
+									let sha = crate::multi_log::split_id(sha).0;
 									probe(log, format!("btn-browse-tree:{sha}"))
 								}),
 						),
@@ -5994,14 +5995,6 @@ impl WorkbenchModel {
 					.flex_1()
 					.min_w_0()
 					.overflow_hidden()
-					.when(self.repos.len() > 1, |d| {
-						d.child(self.log_chip(
-							LogMenu::Repo,
-							t("log_chip_repo", loc),
-							repo_value,
-							cx,
-						))
-					})
 					.child(self.log_chip(
 						LogMenu::Branch,
 						t("log_chip_branch", loc),
@@ -6025,7 +6018,15 @@ impl WorkbenchModel {
 						t("log_chip_paths", loc),
 						paths_value,
 						cx,
-					)),
+					))
+					.when(self.repos.len() > 1, |d| {
+						d.child(self.log_chip(
+							LogMenu::Repo,
+							t("log_chip_repo", loc),
+							repo_value,
+							cx,
+						))
+					}),
 			)
 			.child(
 				log_icon_button(

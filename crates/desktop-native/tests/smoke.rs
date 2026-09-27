@@ -820,6 +820,25 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	wait_for_pattern("[APP:GRAPH_LOADED:", Duration::from_secs(5))
 		.expect("graph layout should load");
 
+	// The log merges both repositories; its Repository chip narrows it to
+	// repo-a, the single-repository log the checks below were written for.
+	// At this width the last chip needs the details pane out of the way.
+	let toggle_details = || {
+		click("btn-log-more");
+		click("log-more:details");
+		wait_for_pattern("[APP:LOG_VIEW: details]", Duration::from_secs(3))
+			.expect("the More menu must toggle the details pane");
+	};
+	toggle_details();
+	click("log-filter-repo");
+	click("log-repo:repo-b");
+	wait_for_pattern("[APP:LOG_REPOS: n=1]", Duration::from_secs(3))
+		.expect("the Repository chip must narrow the log");
+	wait_for_pattern("[APP:GRAPH_LOADED: commits=5]", Duration::from_secs(5))
+		.expect("repo-a's log must load");
+	click("log-filter-repo");
+	toggle_details();
+
 	// Ref selector: test HEAD and all filter
 	println!("[TEST DRIVER] Filtering refs via ref selector...");
 	click("btn-ref-selector");

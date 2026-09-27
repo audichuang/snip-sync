@@ -2315,6 +2315,10 @@ impl WorkbenchModel {
 		release_vec(&mut self.changed_dirs_collapsed);
 		self.log_date_error = false;
 		release_vec(&mut self.log_paths_expanded);
+		release_vec(&mut self.log_feeds);
+		release_vec(&mut self.log_scope_key);
+		release_vec(&mut self.log_repo_filter);
+		self.log_commit_root = None;
 		self.commit_details = None;
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.git_user_email = None;
