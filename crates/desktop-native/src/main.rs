@@ -671,6 +671,8 @@ pub struct WorkbenchModel {
 	pub log_details_visible: bool,
 	pub log_show_hash: bool,
 	pub log_details_w: f32,
+	/// The log panel's width at the last layout.
+	pub log_width: std::rc::Rc<std::cell::Cell<f32>>,
 	/// Collapsed directories of the changed-files tree.
 	pub changed_dirs_collapsed: Vec<String>,
 	pub commit_details: Option<crate::history::CommitDetails>,
@@ -994,6 +996,7 @@ impl WorkbenchModel {
 			log_details_visible: true,
 			log_show_hash: false,
 			log_details_w: theme::LOG_DETAILS_W_DEFAULT,
+			log_width: Default::default(),
 			changed_dirs_collapsed: Vec::new(),
 			commit_details: None,
 			details_generation: 0,

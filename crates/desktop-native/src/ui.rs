@@ -4787,7 +4787,7 @@ impl WorkbenchModel {
 			.flex()
 			.flex_col()
 			.flex_shrink_0()
-			.w(px(LOG_BRANCHES_W))
+			.w(px(self.log_branches_w()))
 			.h_full()
 			.border_r_1()
 			.border_color(rgb(pal().divider))
@@ -5219,6 +5219,16 @@ impl WorkbenchModel {
 		div()
 			.id("log-panel")
 			.relative()
+			.child({
+				// Remembers the panel's width so the side panes can give way.
+				let width = self.log_width.clone();
+				canvas(
+					move |b, _, _| width.set(f32::from(b.size.width)),
+					|_, _, _, _| {},
+				)
+				.absolute()
+				.size_full()
+			})
 			.flex()
 			.flex_col()
 			.flex_shrink_0()
@@ -5344,6 +5354,26 @@ impl WorkbenchModel {
 					}),
 			)
 			.into_any_element()
+	}
+
+	/// Branches pane width: narrower when the log itself is narrow.
+	fn log_branches_w(&self) -> f32 {
+		let w = self.log_width.get();
+		if w > 0. && w < 1200. {
+			LOG_BRANCHES_W * 0.75
+		} else {
+			LOG_BRANCHES_W
+		}
+	}
+
+	/// Details pane width, at most 28% of the log so the list keeps room.
+	fn log_details_width(&self) -> f32 {
+		let w = self.log_width.get();
+		if w > 0. {
+			self.log_details_w.min((w * 0.28).max(LOG_DETAILS_W_MIN))
+		} else {
+			self.log_details_w
+		}
 	}
 
 	fn log_loading_row(&self) -> AnyElement {
@@ -5704,7 +5734,7 @@ impl WorkbenchModel {
 			.flex()
 			.flex_col()
 			.flex_shrink_0()
-			.w(px(self.log_details_w))
+			.w(px(self.log_details_width()))
 			.h_full()
 			.child(
 				div()

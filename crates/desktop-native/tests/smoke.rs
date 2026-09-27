@@ -1884,7 +1884,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	let second = &commits[50][..7];
 	// A row near the end of the full ten-page window: on screen when the
 	// failed eleventh page is attempted and again after the retry.
-	let probe_row = format!("commit-row:{}", &commits[496][..7]);
+	let probe_row = format!("commit-row:{}", &commits[494][..7]);
 	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
 	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
 	let mut app = spawn_app(
@@ -1921,7 +1921,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		}
 	};
 	// There is no pager: scrolling the list to its end reads the next page.
-	let wheel_down = || {
+	let wheel_down = |clicks: &str| {
 		let [x, y, w, h] = control("log-list");
 		assert!(Command::new("xdotool")
 			.args([
@@ -1932,21 +1932,27 @@ fn native_graph_failed_next_page_is_transactional() {
 				&(y + h / 2).to_string(),
 				"click",
 				"--repeat",
-				"4",
+				clicks,
 				"--delay",
 				"15",
 				"5",
+				// Off the list again, so no row is drawn hovered.
+				"mousemove",
+				"--window",
+				&wid,
+				"0",
+				"0",
 			])
 			.status()
 			.unwrap()
 			.success());
 	};
 	// Scrolls until `pattern` is logged (a page read, or its failure).
-	let scroll_until = |pattern: &str| -> Vec<String> {
+	let scroll_until = |pattern: &str, clicks: &str| -> Vec<String> {
 		let deadline = Instant::now() + Duration::from_secs(40);
 		let mut seen = Vec::new();
 		loop {
-			wheel_down();
+			wheel_down(clicks);
 			match lines_until(&app.rx, pattern, Duration::from_millis(250)) {
 				Ok(lines) => {
 					seen.extend(lines);
@@ -2097,7 +2103,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	};
 	park(true);
 	for page in 2..=10 {
-		let loaded = scroll_until(&format!("page={page}]"));
+		let loaded = scroll_until(&format!("page={page}]"), "4");
 		let line = loaded
 			.iter()
 			.find(|l| l.contains("[APP:E2E_LOG:"))
@@ -2112,7 +2118,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		);
 	}
 	// Page 11 is the first read that needs Git, and it fails.
-	let rejected = scroll_until("[APP:HISTORY_ERROR]");
+	let rejected = scroll_until("[APP:HISTORY_ERROR]", "1");
 	assert!(!rejected.iter().any(|line| line.contains("[APP:E2E_LOG:")));
 	control("log-error");
 	let refused = crop_row("refused", true);
@@ -2123,7 +2129,9 @@ fn native_graph_failed_next_page_is_transactional() {
 		"a failed page must not be retried until the user scrolls again"
 	);
 	park(false);
-	let retried = scroll_until("[APP:E2E_LOG:");
+	// One notch: it re-arms loading, and no further notch moves the rows
+	// the comparison is taken from.
+	let retried = scroll_until("[APP:E2E_LOG:", "1");
 	assert!(
 		retried
 			.last()
@@ -2131,7 +2139,7 @@ fn native_graph_failed_next_page_is_transactional() {
 			.contains(&format!("mode=graph n=500 first={second} page=11]")),
 		"retry must load the real eleventh page and evict the first: {retried:?}"
 	);
-	control(&format!("commit-row:{}", &commits[500][..7]));
+	control(&probe_row);
 	let deadline = Instant::now() + Duration::from_secs(5);
 	while bounds.lock().unwrap().contains_key("log-error") {
 		assert!(

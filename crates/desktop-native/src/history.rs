@@ -1481,6 +1481,12 @@ impl WorkbenchModel {
 						(new as f32 - old as f32) * graph_view::ROW_HEIGHT,
 					);
 					handle.set_offset(offset);
+					app_log!(
+						"[APP:LOG_ANCHOR: row={} was={} offset={:.0}]",
+						new,
+						old,
+						f32::from(offset.y)
+					);
 				}
 				None => self.log_scroll.scroll_to_item(
 					if load == PageLoad::Prev {
