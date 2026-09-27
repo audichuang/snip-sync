@@ -410,7 +410,7 @@ pub struct DiffRows {
 	pub trailing: bool,
 }
 
-/// "@@ -a[,b] +c[,d] @@" as the first old and new line the hunk covers
+/// `@@ -a[,b] +c[,d] @@` as the first old and new line the hunk covers
 /// (an empty range names the line *before* it).
 fn parse_hunk(line: &str) -> Option<(u32, u32)> {
 	let rest = line.strip_prefix("@@ -")?;
@@ -622,7 +622,7 @@ pub fn diff_goto_row(p: &Preview, n: u32, old: bool) -> Option<usize> {
 	after
 }
 
-/// The raw `a` and `c` of "@@ -a[,b] +c[,d] @@".
+/// The raw `a` and `c` of `@@ -a[,b] +c[,d] @@`.
 fn raw_starts(line: &str) -> Option<(u32, u32)> {
 	let rest = line.strip_prefix("@@ -")?;
 	let (old, rest) = rest.split_once(' ')?;
@@ -987,7 +987,7 @@ pub fn selected_text(p: &Preview, sel: (Pos, Pos)) -> String {
 	selected_text_on(p, sel, None)
 }
 
-/// [`selected_text`] for one pane of the side-by-side viewer: `Some(true)`
+/// `selected_text` for one pane of the side-by-side viewer: `Some(true)`
 /// copies what the left (old) pane shows, `Some(false)` the right (new).
 pub fn selected_text_on(
 	p: &Preview,
