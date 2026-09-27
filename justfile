@@ -51,10 +51,10 @@ desktop-e2e:
 # Native real-app smoke test (Linux X11): needs xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts, software graphics.
 native-smoke out="target/native-e2e-artifacts":
 	mkdir -p "{{out}}"
-	rm -f "{{out}}/graph.png" "{{out}}/file_tree.png" "{{out}}/paste_preview.png"
+	rm -f "{{out}}/graph.png" "{{out}}/file_tree.png" "{{out}}/paste_preview.png" "{{out}}/light_theme.png"
 	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$1/smoke.log"' _ "{{out}}"
 	test -s "{{out}}/smoke.log"
-	python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "{{out}}"
+	python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png', 'light_theme.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "{{out}}"
 
 # Real X11 close/reopen/quit drain and copy/paste cancel checks (tests/lifecycle.rs).
 native-lifecycle out="target/native-e2e-artifacts":

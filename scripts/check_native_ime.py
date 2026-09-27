@@ -498,6 +498,8 @@ class Session:
                 "XMODIFIERS": "@im=fcitx",
                 "SNIP_IME_MARKER": MARKER,
                 "SNIP_NATIVE_E2E": "1",
+                # bright_popups() finds the near-white candidate bar on the dark palette.
+                "SNIP_THEME": "dark",
                 "SNIP_IME_TRACE": "1",
                 "VK_DRIVER_FILES": lavapipe_icd(),
                 "LIBGL_ALWAYS_SOFTWARE": "1",

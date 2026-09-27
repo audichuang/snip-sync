@@ -596,10 +596,15 @@ fn line_highlights(
 			.map(|(_, c)| (*c).into());
 		let find = finds.iter().find(|&&(fs, fe, _)| fs <= s && e <= fe);
 		let bg = if sel.as_ref().is_some_and(|r| r.start <= s && e <= r.end) {
-			Some(rgb(SELECTION_BG).into())
+			Some(rgb(pal().selection_bg).into())
 		} else {
 			find.map(|&(_, _, cur)| {
-				rgb(if cur { FIND_CURRENT_BG } else { FIND_BG }).into()
+				rgb(if cur {
+					pal().find_current_bg
+				} else {
+					pal().find_bg
+				})
+				.into()
 			})
 		};
 		out.push((
@@ -758,7 +763,7 @@ impl WorkbenchModel {
 		let run = TextRun {
 			len: text.len(),
 			font: font(EDITOR_FONT),
-			color: rgb(TEXT).into(),
+			color: rgb(pal().text).into(),
 			background_color: None,
 			underline: None,
 			strikethrough: None,
@@ -1021,11 +1026,11 @@ impl WorkbenchModel {
 			_ => {}
 		}
 		let row_bg = match kind {
-			Some(RowKind::Added) => Some(DIFF_ADD_BG),
-			Some(RowKind::Removed) => Some(DIFF_DEL_BG),
-			Some(RowKind::Hunk) => Some(DIFF_HUNK_BG),
+			Some(RowKind::Added) => Some(pal().diff_add_bg),
+			Some(RowKind::Removed) => Some(pal().diff_del_bg),
+			Some(RowKind::Hunk) => Some(pal().diff_hunk_bg),
 			_ if interactive && ix == self.reader.cursor_line => {
-				Some(CURRENT_LINE_BG)
+				Some(pal().current_line_bg)
 			}
 			_ => None,
 		};
@@ -1060,7 +1065,7 @@ impl WorkbenchModel {
 					&& self.reader_active
 					&& ix == self.reader.cursor_line
 				{
-					rgb(FOCUS_RING).into()
+					rgb(pal().focus_ring).into()
 				} else {
 					gpui::transparent_black()
 				},
@@ -1110,7 +1115,9 @@ impl WorkbenchModel {
 				.pl(px(8.))
 				.whitespace_nowrap()
 				.overflow_hidden()
-				.when(r.kind == RowKind::Hunk, |d| d.bg(rgb(DIFF_HUNK_BG)))
+				.when(r.kind == RowKind::Hunk, |d| {
+					d.bg(rgb(pal().diff_hunk_bg))
+				})
 				.child(
 					StyledText::new(SharedString::from(text.to_string()))
 						.with_highlights(line_highlights(
@@ -1134,9 +1141,9 @@ impl WorkbenchModel {
 					let changed = raw.starts_with(if add { '+' } else { '-' });
 					(
 						changed.then_some(if add {
-							DIFF_ADD_BG
+							pal().diff_add_bg
 						} else {
-							DIFF_DEL_BG
+							pal().diff_del_bg
 						}),
 						div()
 							.flex()
@@ -1157,7 +1164,7 @@ impl WorkbenchModel {
 							),
 					)
 				}
-				None => (Some(DIFF_EMPTY_BG), div()),
+				None => (Some(pal().diff_empty_bg), div()),
 			};
 			div()
 				.relative()
@@ -1176,7 +1183,7 @@ impl WorkbenchModel {
 			.w_full()
 			.h(px(LINE_H))
 			.child(half(r.left, false, format!("side-left:{ix}")))
-			.child(div().w(px(1.)).h_full().bg(rgb(DIVIDER)))
+			.child(div().w(px(1.)).h_full().bg(rgb(pal().divider)))
 			.child(half(r.right, true, format!("side-right:{ix}")))
 			.into_any_element()
 	}
@@ -1199,7 +1206,7 @@ fn gutter_num(w: f32, n: Option<u32>) -> gpui::Div {
 		.pr(px(4.))
 		.flex()
 		.justify_end()
-		.text_color(rgb(LINE_NUMBER))
+		.text_color(rgb(pal().line_number))
 		.child(n.map(|n| n.to_string()).unwrap_or_default())
 }
 

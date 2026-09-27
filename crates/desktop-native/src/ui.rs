@@ -212,11 +212,12 @@ impl Render for Tip {
 			.py_1()
 			.max_w(px(420.))
 			.rounded(px(4.))
-			.bg(rgb(TOOLTIP_BG))
+			.font_family(UI_FONT)
+			.bg(rgb(pal().tooltip_bg))
 			.border_1()
-			.border_color(rgb(DIVIDER))
+			.border_color(rgb(pal().divider))
 			.text_size(px(SMALL_TEXT))
-			.text_color(rgb(TEXT))
+			.text_color(rgb(pal().text))
 			.child(self.0.clone())
 	}
 }
@@ -245,16 +246,20 @@ fn button(
 	tab: isize,
 ) -> Stateful<Div> {
 	let fg = match (kind, enabled) {
-		(_, false) => TEXT_DISABLED,
-		(Btn::Primary, true) => ACCENT_TEXT,
-		_ => TEXT,
+		(_, false) => pal().text_disabled,
+		(Btn::Primary, true) => pal().accent_text,
+		_ => pal().text,
 	};
 	let (bg, border) = match kind {
-		Btn::Primary if enabled => (Some(ACCENT), Some(ACCENT)),
+		Btn::Primary if enabled => (Some(pal().accent), Some(pal().accent)),
 		Btn::Ghost => (None, None),
 		_ => (
-			Some(BUTTON_BG),
-			Some(if enabled { BUTTON_BORDER } else { DIVIDER }),
+			Some(pal().button_bg),
+			Some(if enabled {
+				pal().button_border
+			} else {
+				pal().divider
+			}),
 		),
 	};
 	div()
@@ -278,9 +283,9 @@ fn button(
 		.when_some(bg, |d, b| d.bg(rgb(b)))
 		.when(enabled, |d| d.cursor_pointer().tab_index(tab))
 		.when(enabled && kind != Btn::Primary, |d| {
-			d.hover(|s| s.bg(rgb(HOVER_BG)))
+			d.hover(|s| s.bg(rgb(pal().hover_bg)))
 		})
-		.focus(|s| s.border_color(rgb(FOCUS_RING)))
+		.focus(|s| s.border_color(rgb(pal().focus_ring)))
 		.child(label.into())
 }
 
@@ -314,9 +319,17 @@ fn checkbox(checked: bool) -> Div {
 		.flex()
 		.items_center()
 		.justify_center()
-		.border_color(rgb(if checked { ACCENT } else { CHECK_BORDER }))
+		.border_color(rgb(if checked {
+			pal().accent
+		} else {
+			pal().check_border
+		}))
 		.when(checked, |d| {
-			d.bg(rgb(ACCENT)).child(icon(Icon::Check, 10., ACCENT_TEXT))
+			d.bg(rgb(pal().accent)).child(icon(
+				Icon::Check,
+				10.,
+				pal().accent_text,
+			))
 		})
 }
 
@@ -344,18 +357,26 @@ fn icon_button(
 		.when(enabled, |d| {
 			d.cursor_pointer()
 				.tab_index(tab)
-				.hover(|s| s.bg(rgb(HOVER_BG)))
+				.hover(|s| s.bg(rgb(pal().hover_bg)))
 		})
-		.focus(|s| s.border_color(rgb(FOCUS_RING)))
+		.focus(|s| s.border_color(rgb(pal().focus_ring)))
 		.child(icon(
 			ic,
 			14.,
-			if enabled { TEXT_MUTED } else { TEXT_DISABLED },
+			if enabled {
+				pal().text_muted
+			} else {
+				pal().text_disabled
+			},
 		))
 }
 
 fn status_sep() -> Div {
-	div().flex_shrink_0().w(px(1.)).h(px(12.)).bg(rgb(DIVIDER))
+	div()
+		.flex_shrink_0()
+		.w(px(1.))
+		.h(px(12.))
+		.bg(rgb(pal().divider))
 }
 
 fn toolbar_divider() -> Div {
@@ -364,35 +385,35 @@ fn toolbar_divider() -> Div {
 		.w(px(1.))
 		.h(px(16.))
 		.mx(px(4.))
-		.bg(rgb(DIVIDER))
+		.bg(rgb(pal().divider))
 }
 
 fn change_style(ct: Option<ChangeType>) -> (&'static str, u32) {
 	match ct {
-		Some(ChangeType::New) => ("A", GIT_ADDED),
-		Some(ChangeType::Modified) => ("M", GIT_MODIFIED),
-		Some(ChangeType::Deleted) => ("D", GIT_DELETED),
-		Some(ChangeType::Moved) => ("R", GIT_MODIFIED),
-		None => ("?", GIT_UNTRACKED),
+		Some(ChangeType::New) => ("A", pal().git_added),
+		Some(ChangeType::Modified) => ("M", pal().git_modified),
+		Some(ChangeType::Deleted) => ("D", pal().git_deleted),
+		Some(ChangeType::Moved) => ("R", pal().git_modified),
+		None => ("?", pal().git_untracked),
 	}
 }
 
 /// Operation label, color and reason key for a paste row.
 fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 	if !item.selected {
-		("op_excluded", TEXT_MUTED, "reason_excluded")
+		("op_excluded", pal().text_muted, "reason_excluded")
 	} else if item.is_delete {
 		if item.dest_exists {
-			("op_delete", ERROR, "reason_delete")
+			("op_delete", pal().error, "reason_delete")
 		} else {
-			("op_skip", TEXT_MUTED, "reason_delete_missing")
+			("op_skip", pal().text_muted, "reason_delete_missing")
 		}
 	} else if !item.dest_exists {
-		("op_create", GIT_ADDED, "reason_create")
+		("op_create", pal().git_added, "reason_create")
 	} else if item.overwrite_allowed {
-		("op_overwrite", WARNING, "reason_overwrite")
+		("op_overwrite", pal().warning, "reason_overwrite")
 	} else {
-		("op_skip", TEXT_MUTED, "reason_exists")
+		("op_skip", pal().text_muted, "reason_exists")
 	}
 }
 
@@ -787,8 +808,8 @@ impl WorkbenchModel {
 			.id(id)
 			.relative()
 			.flex_shrink_0()
-			.bg(rgb(BORDER))
-			.hover(|s| s.bg(rgb(ACCENT)))
+			// Transparent: the splitter is the frame gap between islands.
+			.hover(|s| s.bg(rgb(pal().divider)))
 			.on_mouse_down(
 				MouseButton::Left,
 				cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -832,9 +853,9 @@ impl WorkbenchModel {
 			.flex_col()
 			.gap(px(6.))
 			.p(px(6.))
-			.bg(rgb(PANEL_BG))
+			.bg(rgb(pal().panel_bg))
 			.border_1()
-			.border_color(rgb(BUTTON_BORDER))
+			.border_color(rgb(pal().button_border))
 			.rounded(px(6.))
 			.shadow_lg()
 			.on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -916,8 +937,8 @@ impl WorkbenchModel {
 					.px(px(8.))
 					.rounded(px(4.))
 					.cursor_pointer()
-					.hover(|s| s.bg(rgb(HOVER_BG)))
-					.when(self.workspace_menu, |d| d.bg(rgb(HOVER_BG)))
+					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.when(self.workspace_menu, |d| d.bg(rgb(pal().hover_bg)))
 					.tooltip(tip(format!(
 						"{tip_text} · {}",
 						t("tip_workspace_menu", loc)
@@ -949,12 +970,13 @@ impl WorkbenchModel {
 			.flex()
 			.items_center()
 			.justify_center()
-			.bg(rgb(EDITOR_BG))
+			.bg(rgb(pal().editor_bg))
+			.rounded(px(ISLAND_RADIUS))
 			.child(
 				div()
 					.max_w(px(420.))
 					.px(px(16.))
-					.text_color(rgb(TEXT_MUTED))
+					.text_color(rgb(pal().text_muted))
 					.child(t("workspace_closed", loc)),
 			)
 			.children(probe(&self.probes, "workspace-closed"))
@@ -1009,13 +1031,13 @@ impl WorkbenchModel {
 				.border_color(transparent_black())
 				.cursor_pointer()
 				.tab_index(tab)
-				.hover(|s| s.bg(rgb(HOVER_BG)))
-				.when(open, |d| d.bg(rgb(HOVER_BG)))
-				.focus(|s| s.border_color(rgb(FOCUS_RING)))
+				.hover(|s| s.bg(rgb(pal().hover_bg)))
+				.when(open, |d| d.bg(rgb(pal().hover_bg)))
+				.focus(|s| s.border_color(rgb(pal().focus_ring)))
 				.tooltip(tip(tooltip))
-				.child(icon(ic, 14., TEXT_MUTED))
+				.child(icon(ic, 14., pal().text_muted))
 				.child(clip_text(label).font_weight(FontWeight::SEMIBOLD))
-				.child(icon(Icon::ChevronDown, 10., TEXT_MUTED))
+				.child(icon(Icon::ChevronDown, 10., pal().text_muted))
 				.children(probe(log, id))
 		};
 
@@ -1027,21 +1049,19 @@ impl WorkbenchModel {
 			.h(px(HEADER_H))
 			.px(px(8.))
 			.gap(px(4.))
-			.bg(rgb(HEADER_BG))
-			.border_b_1()
-			.border_color(rgb(BORDER))
+			.bg(rgb(pal().header_bg))
 			.child(
 				div()
 					.flex_shrink_0()
 					.size(px(18.))
 					.rounded(px(4.))
-					.bg(rgb(ACCENT))
+					.bg(rgb(pal().accent))
 					.flex()
 					.items_center()
 					.justify_center()
 					.text_size(px(10.))
 					.font_weight(FontWeight::BOLD)
-					.text_color(rgb(ACCENT_TEXT))
+					.text_color(rgb(pal().accent_text))
 					.child("S"),
 			)
 			.child(self.render_workspace_chip(cx))
@@ -1184,7 +1204,7 @@ impl WorkbenchModel {
 						)
 						.px(px(6.))
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(TEXT_MUTED))
+						.text_color(rgb(pal().text_muted))
 						.on_click(
 							cx.listener(|this, _, _, cx| {
 								this.toggle_locale(cx)
@@ -1213,15 +1233,15 @@ impl WorkbenchModel {
 			.w(px(340.))
 			.flex()
 			.flex_col()
-			.bg(rgb(PANEL_BG))
+			.bg(rgb(pal().panel_bg))
 			.border_1()
-			.border_color(rgb(BUTTON_BORDER))
+			.border_color(rgb(pal().button_border))
 			.rounded(px(6.))
 			.shadow_lg()
 			.p(px(6.))
 			.gap(px(6.))
 			.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popover(cx)))
-			.child(div().text_size(px(SMALL_TEXT)).text_color(rgb(TEXT_MUTED)).child(title))
+			.child(div().text_size(px(SMALL_TEXT)).text_color(rgb(pal().text_muted)).child(title))
 			.child(
 				div()
 					.id("selector-input")
@@ -1233,7 +1253,7 @@ impl WorkbenchModel {
 				div()
 					.h(px(list_h))
 					.when(n == 0, |d| {
-						d.child(div().p(px(6.)).text_color(rgb(TEXT_MUTED)).child(t("selector_empty", loc)))
+						d.child(div().p(px(6.)).text_color(rgb(pal().text_muted)).child(t("selector_empty", loc)))
 					})
 					.when(n > 0, |d| {
 						d.child(
@@ -1259,8 +1279,8 @@ impl WorkbenchModel {
 												.px(px(6.))
 												.rounded(px(4.))
 												.cursor_pointer()
-												.when(ix == cursor, |d| d.bg(rgb(SELECTION_BG)))
-												.when(ix != cursor, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
+												.when(ix == cursor, |d| d.bg(rgb(pal().selection_bg)))
+												.when(ix != cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 												.on_click(cx.listener(move |this, _, _, cx| this.choose(pick.clone(), cx)))
 												.child(icon(
 													if it.error {
@@ -1272,17 +1292,17 @@ impl WorkbenchModel {
 														}
 													},
 													14.,
-													if it.error { ERROR } else { TEXT_MUTED },
+													if it.error { pal().error } else { pal().text_muted },
 												))
 												.child(fill_text(it.label.clone()).when(active, |d| d.font_weight(FontWeight::SEMIBOLD)))
 												.when_some(it.group, |d, g| {
-													d.child(div().flex_shrink_0().text_size(px(11.)).text_color(rgb(TEXT_DISABLED)).child(t(g, this.locale)))
+													d.child(div().flex_shrink_0().text_size(px(11.)).text_color(rgb(pal().text_disabled)).child(t(g, this.locale)))
 												})
 												.child(
 													div()
 														.flex_shrink_0()
 														.text_size(px(11.))
-														.text_color(rgb(if it.error { ERROR } else { TEXT_MUTED }))
+														.text_color(rgb(if it.error { pal().error } else { pal().text_muted }))
 														.child(it.detail.clone()),
 												)
 												.children(probe(&this.probes, it.id.clone()))
@@ -1331,23 +1351,20 @@ impl WorkbenchModel {
 				.border_1()
 				.border_color(transparent_black())
 				.tab_index(tab)
-				.when(on, |d| {
-					d.bg(rgb(RAIL_ACTIVE_BG)).child(
-						// Accent marker on the rail edge for the open tool.
-						div()
-							.absolute()
-							.left(px(-4.))
-							.top(px(6.))
-							.w(px(2.))
-							.h(px(14.))
-							.rounded(px(1.))
-							.bg(rgb(ACCENT)),
-					)
-				})
-				.when(!on, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
-				.focus(|s| s.border_color(rgb(FOCUS_RING)))
+				// Islands: the open tool is a filled accent pill on the frame.
+				.when(on, |d| d.bg(rgb(pal().rail_active_bg)))
+				.when(!on, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+				.focus(|s| s.border_color(rgb(pal().focus_ring)))
 				.tooltip(tip(label))
-				.child(icon(ic, 16., if on { ACCENT_TEXT } else { TEXT_MUTED }))
+				.child(icon(
+					ic,
+					16.,
+					if on {
+						pal().accent_text
+					} else {
+						pal().text_muted
+					},
+				))
 				.children(probe(log, id))
 		};
 		div()
@@ -1359,9 +1376,6 @@ impl WorkbenchModel {
 			.h_full()
 			.py(px(6.))
 			.gap(px(4.))
-			.bg(rgb(PANEL_BG))
-			.border_r_1()
-			.border_color(rgb(BORDER))
 			.child(
 				rail_button(
 					"rail-project",
@@ -1446,7 +1460,9 @@ impl WorkbenchModel {
 						true,
 						12,
 					)
-					.when(self.is_adding_repo, |b| b.bg(rgb(RAIL_ACTIVE_BG)))
+					.when(self.is_adding_repo, |b| {
+						b.bg(rgb(pal().rail_active_bg))
+					})
 					.on_click(cx.listener(|this, _, _, cx| {
 						this.is_adding_repo = !this.is_adding_repo;
 						cx.notify();
@@ -1580,7 +1596,8 @@ impl WorkbenchModel {
 			.flex_shrink_0()
 			.w(px(width))
 			.h_full()
-			.bg(rgb(PANEL_BG))
+			.bg(rgb(pal().panel_bg))
+			.rounded(px(ISLAND_RADIUS))
 			.child(header)
 			.when(is_project && self.is_adding_repo, |d| {
 				d.child(
@@ -1615,7 +1632,7 @@ impl WorkbenchModel {
 						.px(px(10.))
 						.py(px(2.))
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(ERROR))
+						.text_color(rgb(pal().error))
 						.child(clip_text(err_msg))
 						.children(probe(&self.probes, "discovery-error")),
 				)
@@ -1648,13 +1665,14 @@ impl WorkbenchModel {
 					.min_h_0()
 					.when(n == 0, |d| {
 						d.child(
-							div().p(px(10.)).text_color(rgb(TEXT_MUTED)).child(
-								if is_project {
+							div()
+								.p(px(10.))
+								.text_color(rgb(pal().text_muted))
+								.child(if is_project {
 									t("empty_project", loc)
 								} else {
 									t("clean_working_copy", loc)
-								},
-							),
+								}),
 						)
 					})
 					.child(list)
@@ -1666,9 +1684,9 @@ impl WorkbenchModel {
 	/// Bright while the left list has focus, grey otherwise, like IntelliJ.
 	fn left_selection_bg(&self) -> u32 {
 		if self.left_active {
-			SELECTION_BG
+			pal().selection_bg
 		} else {
-			SELECTION_INACTIVE_BG
+			pal().selection_inactive_bg
 		}
 	}
 
@@ -1695,10 +1713,10 @@ impl WorkbenchModel {
 				match &repo.summary {
 					Ok(s) => {
 						let parts = [
-							("+", s.changes.staged, GIT_ADDED),
-							("~", s.changes.unstaged, GIT_MODIFIED),
-							("?", s.changes.untracked, GIT_UNTRACKED),
-							("!", s.changes.conflicted, GIT_CONFLICT),
+							("+", s.changes.staged, pal().git_added),
+							("~", s.changes.unstaged, pal().git_modified),
+							("?", s.changes.untracked, pal().git_untracked),
+							("!", s.changes.conflicted, pal().git_conflict),
 						];
 						let mut any = false;
 						for (sym, n, color) in parts {
@@ -1714,7 +1732,7 @@ impl WorkbenchModel {
 						if !any {
 							counts = counts.child(
 								div()
-									.text_color(rgb(TEXT_MUTED))
+									.text_color(rgb(pal().text_muted))
 									.child(t("clean", self.locale)),
 							);
 						}
@@ -1727,7 +1745,7 @@ impl WorkbenchModel {
 					Err(e) => {
 						counts = counts.child(
 							div()
-								.text_color(rgb(ERROR))
+								.text_color(rgb(pal().error))
 								.child(t("repo_error_short", self.locale)),
 						);
 						tooltip = format!("{}\n{}", repo.root.display(), e);
@@ -1771,9 +1789,9 @@ impl WorkbenchModel {
 					.gap(px(5.))
 					.cursor_pointer()
 					.when(selected, |d| d.bg(rgb(self.left_selection_bg())))
-					.when(!selected, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
+					.when(!selected, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 					.when(cursor && self.left_active, |d| {
-						d.border_1().border_color(rgb(FOCUS_RING))
+						d.border_1().border_color(rgb(pal().focus_ring))
 					})
 					.tooltip(tip(tooltip))
 					.on_click(cx.listener(move |this, _, _, cx| {
@@ -1787,12 +1805,12 @@ impl WorkbenchModel {
 							Icon::ChevronRight
 						},
 						10.,
-						TEXT_MUTED,
+						pal().text_muted,
 					))
 					.child(icon(
 						if is_err { Icon::Warning } else { Icon::Repo },
 						14.,
-						if is_err { ERROR } else { FOLDER },
+						if is_err { pal().error } else { pal().folder },
 					))
 					.child(
 						clip_text(repo.name.clone())
@@ -1805,16 +1823,16 @@ impl WorkbenchModel {
 								.px(px(4.))
 								.rounded(px(3.))
 								.border_1()
-								.border_color(rgb(DIVIDER))
+								.border_color(rgb(pal().divider))
 								.text_size(px(10.))
-								.text_color(rgb(TEXT_MUTED))
+								.text_color(rgb(pal().text_muted))
 								.child(badge),
 						)
 					})
 					.child(
 						fill_text(branch)
 							.text_size(px(SMALL_TEXT))
-							.text_color(rgb(TEXT_MUTED)),
+							.text_color(rgb(pal().text_muted)),
 					)
 					.child(counts)
 					.children(probe(log, id))
@@ -1863,9 +1881,13 @@ impl WorkbenchModel {
 				.flex()
 				.items_center()
 				.text_size(px(SMALL_TEXT))
-				.text_color(rgb(if row.is_error { ERROR } else { TEXT_MUTED }))
+				.text_color(rgb(if row.is_error {
+					pal().error
+				} else {
+					pal().text_muted
+				}))
 				.when(is_actionable, |d| {
-					d.cursor_pointer().hover(|s| s.bg(rgb(HOVER_BG)))
+					d.cursor_pointer().hover(|s| s.bg(rgb(pal().hover_bg)))
 				})
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.dispatch_tree(
@@ -1897,9 +1919,9 @@ impl WorkbenchModel {
 		// Git status as filename colour, like IntelliJ's Project view.
 		let name_color = self.files.iter().find(|f| f.path == rel).map(|f| {
 			if f.is_conflict {
-				GIT_CONFLICT
+				pal().git_conflict
 			} else if f.source == SourceKind::Working {
-				GIT_UNTRACKED
+				pal().git_untracked
 			} else {
 				change_style(f.change_type).1
 			}
@@ -1917,9 +1939,9 @@ impl WorkbenchModel {
 			.gap(px(5.))
 			.when(is_valid_utf8, |d| d.cursor_pointer())
 			.when(selected_file, |d| d.bg(rgb(self.left_selection_bg())))
-			.when(!selected_file, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
+			.when(!selected_file, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 			.when(cursor && self.left_active, |d| {
-				d.border_1().border_color(rgb(FOCUS_RING))
+				d.border_1().border_color(rgb(pal().focus_ring))
 			})
 			.when(is_valid_utf8, |d| {
 				d.on_click(cx.listener(move |this, _, _, cx| {
@@ -1938,7 +1960,7 @@ impl WorkbenchModel {
 						Icon::ChevronRight
 					},
 					10.,
-					TEXT_MUTED,
+					pal().text_muted,
 				)
 				.into_any_element()
 			} else {
@@ -1972,7 +1994,7 @@ impl WorkbenchModel {
 					} else {
 						div()
 							.text_size(px(9.))
-							.text_color(rgb(TEXT_MUTED))
+							.text_color(rgb(pal().text_muted))
 							.child("×")
 							.into_any_element()
 					})
@@ -1989,7 +2011,7 @@ impl WorkbenchModel {
 					Icon::File
 				},
 				14.,
-				if is_dir { FOLDER } else { FILE },
+				if is_dir { pal().folder } else { pal().file },
 			))
 			.child(
 				fill_text(row.name.clone())
@@ -2002,9 +2024,9 @@ impl WorkbenchModel {
 						.px(px(4.))
 						.rounded(px(3.))
 						.border_1()
-						.border_color(rgb(DIVIDER))
+						.border_color(rgb(pal().divider))
 						.text_size(px(10.))
-						.text_color(rgb(TEXT_MUTED))
+						.text_color(rgb(pal().text_muted))
 						.child("repo"),
 				)
 			})
@@ -2014,9 +2036,9 @@ impl WorkbenchModel {
 						.flex_shrink_0()
 						.px(px(4.))
 						.rounded(px(3.))
-						.bg(rgb(HOVER_BG))
+						.bg(rgb(pal().hover_bg))
 						.text_size(px(10.))
-						.text_color(rgb(TEXT_MUTED))
+						.text_color(rgb(pal().text_muted))
 						.child("invalid UTF-8"),
 				)
 			})
@@ -2041,7 +2063,7 @@ impl WorkbenchModel {
 				.flex()
 				.items_center()
 				.text_size(px(SMALL_TEXT))
-				.text_color(rgb(TEXT_MUTED))
+				.text_color(rgb(pal().text_muted))
 				.child(clip_text(m.render(self.locale)))
 				.into_any_element();
 		}
@@ -2073,9 +2095,9 @@ impl WorkbenchModel {
 			.gap(px(5.))
 			.cursor_pointer()
 			.when(selected, |d| d.bg(rgb(self.left_selection_bg())))
-			.when(!selected, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
+			.when(!selected, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 			.when(cursor && self.left_active, |d| {
-				d.border_1().border_color(rgb(FOCUS_RING))
+				d.border_1().border_color(rgb(pal().focus_ring))
 			})
 			.when(!submodule, |d| {
 				let row_path = path.clone();
@@ -2092,7 +2114,7 @@ impl WorkbenchModel {
 						Icon::ChevronRight
 					},
 					10.,
-					TEXT_MUTED,
+					pal().text_muted,
 				)
 				.into_any_element()
 			} else {
@@ -2135,7 +2157,7 @@ impl WorkbenchModel {
 					Icon::File
 				},
 				14.,
-				if is_dir { FOLDER } else { FILE },
+				if is_dir { pal().folder } else { pal().file },
 			))
 			.child(fill_text(row.name.clone()))
 			.when(submodule, |d| {
@@ -2143,7 +2165,7 @@ impl WorkbenchModel {
 					div()
 						.flex_shrink_0()
 						.text_size(px(10.))
-						.text_color(rgb(TEXT_MUTED))
+						.text_color(rgb(pal().text_muted))
 						.child(t("submodule", self.locale)),
 				)
 			})
@@ -2174,7 +2196,7 @@ impl WorkbenchModel {
 			.gap(px(6.))
 			.text_size(px(11.))
 			.font_weight(FontWeight::SEMIBOLD)
-			.text_color(rgb(TEXT_MUTED))
+			.text_color(rgb(pal().text_muted))
 			.child(text)
 			.children(probe(log, id))
 			.into_any_element()
@@ -2194,9 +2216,9 @@ impl WorkbenchModel {
 		// IntelliJ conveys status by filename colour; the group header above
 		// already says staged / unstaged / untracked / conflicted.
 		let color = if item.is_conflict {
-			GIT_CONFLICT
+			pal().git_conflict
 		} else if item.source == SourceKind::Working {
-			GIT_UNTRACKED
+			pal().git_untracked
 		} else {
 			change_color
 		};
@@ -2260,9 +2282,9 @@ impl WorkbenchModel {
 			.gap(px(6.))
 			.cursor_pointer()
 			.when(selected, |d| d.bg(rgb(self.left_selection_bg())))
-			.when(!selected, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
+			.when(!selected, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 			.when(cursor && !selected && self.left_active, |d| {
-				d.border_1().border_color(rgb(FOCUS_RING))
+				d.border_1().border_color(rgb(pal().focus_ring))
 			})
 			.tooltip(tip(tooltip))
 			.on_click(cx.listener(move |this, _, _, cx| {
@@ -2293,7 +2315,7 @@ impl WorkbenchModel {
 					} else {
 						div()
 							.text_size(px(9.))
-							.text_color(rgb(TEXT_MUTED))
+							.text_color(rgb(pal().text_muted))
 							.child("×")
 							.into_any_element()
 					})
@@ -2303,7 +2325,7 @@ impl WorkbenchModel {
 			.child(icon(
 				if is_dir { Icon::Folder } else { Icon::File },
 				14.,
-				if is_dir { FOLDER } else { FILE },
+				if is_dir { pal().folder } else { pal().file },
 			))
 			.child(
 				clip_text(name)
@@ -2315,7 +2337,7 @@ impl WorkbenchModel {
 			.child(
 				fill_text(dir)
 					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(TEXT_MUTED)),
+					.text_color(rgb(pal().text_muted)),
 			)
 			.children(probe(log, row_id))
 			.children(probe(log, src_row_id))
@@ -2332,9 +2354,10 @@ impl WorkbenchModel {
 			.flex_row()
 			.flex_shrink_0()
 			.h(px(32.))
-			.bg(rgb(PANEL_BG))
+			.px(px(4.))
+			.items_center()
 			.border_b_1()
-			.border_color(rgb(DIVIDER))
+			.border_color(rgb(pal().divider))
 			.when(!label.is_empty(), |d| {
 				d.child(
 					div()
@@ -2344,14 +2367,14 @@ impl WorkbenchModel {
 						.gap(px(6.))
 						.min_w_0()
 						.max_w(px(360.))
-						.px(px(12.))
-						.pt(px(2.))
-						.bg(rgb(EDITOR_BG))
-						.border_b_2()
-						.border_color(rgb(ACCENT))
+						.h(px(24.))
+						.px(px(10.))
+						// Islands selected tab: filled rounded pill.
+						.rounded(px(6.))
+						.bg(rgb(pal().range_bg))
 						.text_size(px(UI_TEXT))
-						.text_color(rgb(TEXT))
-						.child(icon(ic, 14., FILE))
+						.text_color(rgb(pal().text))
+						.child(icon(ic, 14., pal().file))
 						.child(clip_text(label)),
 				)
 			})
@@ -2398,13 +2421,11 @@ impl WorkbenchModel {
 									.w(px(140.))
 									.flex()
 									.justify_end()
-									.text_color(rgb(TEXT_MUTED))
+									.text_color(rgb(pal().text_muted))
 									.child(label.to_string()),
 							)
 							.child(
-								div()
-									.text_color(rgb(HINT_SHORTCUT))
-									.child(keys),
+								div().text_color(rgb(pal().link)).child(keys),
 							)
 					})),
 			)
@@ -2526,9 +2547,9 @@ impl WorkbenchModel {
 			.px(px(8.))
 			.gap(px(6.))
 			.border_b_1()
-			.border_color(rgb(DIVIDER))
+			.border_color(rgb(pal().divider))
 			.text_size(px(SMALL_TEXT))
-			.child(icon(Icon::Search, 13., TEXT_MUTED))
+			.child(icon(Icon::Search, 13., pal().text_muted))
 			.child(
 				div()
 					.id("find-input")
@@ -2544,9 +2565,9 @@ impl WorkbenchModel {
 					.flex_shrink_0()
 					.min_w(px(36.))
 					.text_color(rgb(if n_matches == 0 {
-						TEXT_DISABLED
+						pal().text_disabled
 					} else {
-						TEXT_MUTED
+						pal().text_muted
 					}))
 					.child(find_label),
 			)
@@ -2593,7 +2614,7 @@ impl WorkbenchModel {
 					)
 					.px(px(6.))
 					.text_size(px(SMALL_TEXT))
-					.child(icon(Icon::Diff, 12., TEXT_MUTED))
+					.child(icon(Icon::Diff, 12., pal().text_muted))
 					.on_click(cx.listener(|this, _, _, cx| {
 						this.reader.diff_mode = match this.reader.diff_mode {
 							DiffMode::Inline => DiffMode::SideBySide,
@@ -2663,7 +2684,7 @@ impl WorkbenchModel {
 		{
 			div()
 				.p(px(12.))
-				.text_color(rgb(TEXT_MUTED))
+				.text_color(rgb(pal().text_muted))
 				.child(t("status_loading", loc))
 				.into_any_element()
 		} else if let Some(err) = &self.preview_error {
@@ -2673,8 +2694,8 @@ impl WorkbenchModel {
 				.flex()
 				.gap(px(6.))
 				.p(px(12.))
-				.text_color(rgb(ERROR))
-				.child(icon(Icon::Warning, 14., ERROR))
+				.text_color(rgb(pal().error))
+				.child(icon(Icon::Warning, 14., pal().error))
 				.child(div().flex_1().child(err.render(loc)))
 				.children(probe(log, "editor-error"))
 				.into_any_element()
@@ -2723,9 +2744,9 @@ impl WorkbenchModel {
 							.flex_shrink_0()
 							.px(px(12.))
 							.py(px(2.))
-							.bg(rgb(PANEL_BG))
+							.bg(rgb(pal().panel_bg))
 							.text_size(px(SMALL_TEXT))
-							.text_color(rgb(WARNING))
+							.text_color(rgb(pal().warning))
 							.child(notice),
 					)
 				})
@@ -2742,7 +2763,8 @@ impl WorkbenchModel {
 			.flex_1()
 			.min_w_0()
 			.h_full()
-			.bg(rgb(EDITOR_BG))
+			.bg(rgb(pal().editor_bg))
+			.rounded(px(ISLAND_RADIUS))
 			.child(self.tab_strip(
 				if self.preview.is_some()
 					|| self.selected_commit.is_some()
@@ -2764,7 +2786,7 @@ impl WorkbenchModel {
 					.px(px(12.))
 					.gap(px(8.))
 					.border_b_1()
-					.border_color(rgb(DIVIDER))
+					.border_color(rgb(pal().divider))
 					.text_size(px(SMALL_TEXT))
 					.child(
 						div()
@@ -2775,7 +2797,7 @@ impl WorkbenchModel {
 							.overflow_hidden()
 							.line_clamp(1)
 							.text_ellipsis()
-							.text_color(rgb(TEXT_MUTED))
+							.text_color(rgb(pal().text_muted))
 							.tooltip(tip(crumbs.clone()))
 							.child(crumbs)
 							.children(probe(log, "breadcrumb")),
@@ -2789,8 +2811,8 @@ impl WorkbenchModel {
 								.max_w(px(300.))
 								.px(px(6.))
 								.rounded(px(3.))
-								.bg(rgb(REF_BG))
-								.text_color(rgb(TEXT))
+								.bg(rgb(pal().ref_bg))
+								.text_color(rgb(pal().text))
 								.overflow_hidden()
 								.line_clamp(1)
 								.text_ellipsis()
@@ -2824,7 +2846,7 @@ impl WorkbenchModel {
 		let log = &self.probes;
 		let header: AnyElement = if let Some((from, to)) = &self.compare {
 			div()
-				.text_color(rgb(TEXT))
+				.text_color(rgb(pal().text))
 				.child(tf("compare_header", loc, &[&short(from), &short(to)]))
 				.into_any_element()
 		} else if let Some(c) = self
@@ -2852,7 +2874,7 @@ impl WorkbenchModel {
 							div()
 								.flex_shrink_0()
 								.font_family(EDITOR_FONT)
-								.text_color(rgb(TEXT_MUTED))
+								.text_color(rgb(pal().text_muted))
 								.child(short(&c.sha).to_string()),
 						)
 						.child(
@@ -2863,7 +2885,7 @@ impl WorkbenchModel {
 				.child(
 					div()
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(TEXT_MUTED))
+						.text_color(rgb(pal().text_muted))
 						.child(tf(
 							"commit_meta",
 							loc,
@@ -2888,14 +2910,14 @@ impl WorkbenchModel {
 			.px(px(12.))
 			.py(px(6.))
 			.gap(px(4.))
-			.bg(rgb(PANEL_BG))
+			.bg(rgb(pal().panel_bg))
 			.border_b_1()
-			.border_color(rgb(DIVIDER))
+			.border_color(rgb(pal().divider))
 			.child(header)
 			.child(
 				div()
 					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(TEXT_MUTED))
+					.text_color(rgb(pal().text_muted))
 					.child(tf("changed_files", loc, &[&n])),
 			)
 			.child(
@@ -2927,10 +2949,12 @@ impl WorkbenchModel {
 											.px(px(4.))
 											.cursor_pointer()
 											.when(sel, |d| {
-												d.bg(rgb(SELECTION_BG))
+												d.bg(rgb(pal().selection_bg))
 											})
 											.when(!sel, |d| {
-												d.hover(|s| s.bg(rgb(HOVER_BG)))
+												d.hover(|s| {
+													s.bg(rgb(pal().hover_bg))
+												})
 											})
 											.on_click(cx.listener(
 												move |this, _, _, cx| {
@@ -3036,9 +3060,9 @@ impl WorkbenchModel {
 			.h(px(38.))
 			.px(px(12.))
 			.gap(px(8.))
-			.bg(rgb(PANEL_BG))
+			.bg(rgb(pal().panel_bg))
 			.border_b_1()
-			.border_color(rgb(BORDER))
+			.border_color(rgb(pal().border))
 			.child(
 				div()
 					.id("paste-dest")
@@ -3052,7 +3076,7 @@ impl WorkbenchModel {
 					.child(
 						div()
 							.flex_shrink_0()
-							.text_color(rgb(TEXT_MUTED))
+							.text_color(rgb(pal().text_muted))
 							.child(format!("{}:", t("destination_label", loc))),
 					)
 					.child(fill_text(dest)),
@@ -3112,7 +3136,7 @@ impl WorkbenchModel {
 			.px(px(12.))
 			.py(px(6.))
 			.text_size(px(SMALL_TEXT))
-			.text_color(rgb(TEXT_MUTED))
+			.text_color(rgb(pal().text_muted))
 			.child(t("paste_loading", self.locale))
 			.children(probe(&self.probes, "paste-loading"))
 	}
@@ -3131,7 +3155,8 @@ impl WorkbenchModel {
 			.min_h_0()
 			.h_full()
 			.overflow_hidden()
-			.bg(rgb(EDITOR_BG))
+			.bg(rgb(pal().editor_bg))
+			.rounded(px(ISLAND_RADIUS))
 			.child(self.tab_strip(
 				t("paste_tab", self.locale).to_string(),
 				Icon::Changes,
@@ -3186,30 +3211,31 @@ impl WorkbenchModel {
 			.gap(px(12.))
 			.text_size(px(SMALL_TEXT))
 			.border_b_1()
-			.border_color(rgb(DIVIDER))
+			.border_color(rgb(pal().divider))
 			.child(
 				div()
 					.flex_shrink_0()
-					.text_color(rgb(GIT_ADDED))
+					.text_color(rgb(pal().git_added))
 					.child(format!("{} {creates}", t("op_create", loc))),
 			)
-			.child(div().flex_shrink_0().text_color(rgb(WARNING)).child(
+			.child(div().flex_shrink_0().text_color(rgb(pal().warning)).child(
 				format!("{} {overwrites}/{existing}", t("op_overwrite", loc)),
 			))
 			.child(
 				div()
 					.flex_shrink_0()
-					.text_color(rgb(ERROR))
+					.text_color(rgb(pal().error))
 					.child(format!("{} {deletes}", t("op_delete", loc))),
 			)
 			.child(
 				div()
 					.flex_shrink_0()
-					.text_color(rgb(TEXT_MUTED))
+					.text_color(rgb(pal().text_muted))
 					.child(format!("{} {skips}", t("op_skip", loc))),
 			)
 			.child(
-				fill_text(t("paste_keys", loc)).text_color(rgb(TEXT_DISABLED)),
+				fill_text(t("paste_keys", loc))
+					.text_color(rgb(pal().text_disabled)),
 			);
 
 		let rows = plan.items.iter().enumerate().map(|(ix, item)| {
@@ -3238,8 +3264,8 @@ impl WorkbenchModel {
 				.pr(px(8.))
 				.gap(px(8.))
 				.cursor_pointer()
-				.when(is_sel, |d| d.bg(rgb(SELECTION_BG)))
-				.when(!is_sel, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
+				.when(is_sel, |d| d.bg(rgb(pal().selection_bg)))
+				.when(!is_sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 				.tooltip(tip(format!("{path}\n→ {}", item.dest_path.display())))
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.select_paste_item(ix, cx)
@@ -3289,13 +3315,13 @@ impl WorkbenchModel {
 								.flex_shrink_0()
 								.max_w(gpui::relative(0.7))
 								.when(!item.selected, |d| {
-									d.text_color(rgb(TEXT_MUTED))
+									d.text_color(rgb(pal().text_muted))
 								}),
 						)
 						.child(
 							fill_text(parent)
 								.text_size(px(SMALL_TEXT))
-								.text_color(rgb(TEXT_MUTED)),
+								.text_color(rgb(pal().text_muted)),
 						),
 				)
 				.child(
@@ -3305,8 +3331,8 @@ impl WorkbenchModel {
 						.text_size(px(10.))
 						.px(px(5.))
 						.rounded(px(3.))
-						.bg(rgb(REF_BG))
-						.text_color(rgb(TEXT_MUTED)),
+						.bg(rgb(pal().ref_bg))
+						.text_color(rgb(pal().text_muted)),
 				)
 				.child(
 					div()
@@ -3315,7 +3341,7 @@ impl WorkbenchModel {
 						.flex_shrink_0()
 						.min_w(px(44.))
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(TEXT_MUTED))
+						.text_color(rgb(pal().text_muted))
 						.child(if item.is_delete {
 							String::new()
 						} else {
@@ -3340,13 +3366,13 @@ impl WorkbenchModel {
 								.rounded(px(3.))
 								.text_size(px(SMALL_TEXT))
 								.text_color(rgb(if ow_on {
-									WARNING
+									pal().warning
 								} else {
-									TEXT_MUTED
+									pal().text_muted
 								}))
 								.when(!applying, |d| {
 									d.cursor_pointer()
-										.hover(|s| s.bg(rgb(HOVER_BG)))
+										.hover(|s| s.bg(rgb(pal().hover_bg)))
 								})
 								.when(applying, |d| {
 									d.opacity(0.4).tooltip(tip(t(
@@ -3386,8 +3412,8 @@ impl WorkbenchModel {
 				.my(px(6.))
 				.rounded(px(4.))
 				.border_1()
-				.border_color(rgb(DIVIDER))
-				.bg(rgb(PANEL_BG))
+				.border_color(rgb(pal().divider))
+				.bg(rgb(pal().panel_bg))
 				.children(plan.prefix_choices.iter().enumerate().map(
 					|(n, choice)| {
 						let prefix = choice.prefix.clone();
@@ -3486,7 +3512,7 @@ impl WorkbenchModel {
 							.py(px(5.))
 							.text_size(px(SMALL_TEXT))
 							.when(n > 0, |d| {
-								d.border_t_1().border_color(rgb(DIVIDER))
+								d.border_t_1().border_color(rgb(pal().divider))
 							})
 							.child(
 								clip_text(tf(
@@ -3510,9 +3536,9 @@ impl WorkbenchModel {
 									.line_clamp(1)
 									.text_ellipsis()
 									.text_color(rgb(if resolved {
-										TEXT_MUTED
+										pal().text_muted
 									} else {
-										WARNING
+										pal().warning
 									}))
 									.tooltip(tip(target.clone()))
 									.child(format!("→ {target}"))
@@ -3536,7 +3562,8 @@ impl WorkbenchModel {
 			.h_full()
 			// Never paint over the bottom tool window when space runs out.
 			.overflow_hidden()
-			.bg(rgb(EDITOR_BG))
+			.bg(rgb(pal().editor_bg))
+			.rounded(px(ISLAND_RADIUS))
 			.child(self.tab_strip(
 				format!("{} ({})", t("paste_tab", loc), plan.items.len()),
 				Icon::Changes,
@@ -3553,7 +3580,7 @@ impl WorkbenchModel {
 						.px(px(12.))
 						.py(px(4.))
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(TEXT_MUTED))
+						.text_color(rgb(pal().text_muted))
 						.child(t("commit_whole_note", loc))
 						.children(probe(log, "paste-commit-whole")),
 				)
@@ -3564,9 +3591,9 @@ impl WorkbenchModel {
 						.flex_shrink_0()
 						.px(px(12.))
 						.py(px(4.))
-						.bg(rgb(ERROR_BG))
+						.bg(rgb(pal().error_bg))
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(ERROR))
+						.text_color(rgb(pal().error))
 						.child(err.render(loc)),
 				)
 			})
@@ -3583,7 +3610,7 @@ impl WorkbenchModel {
 					.max_h(gpui::relative(0.6))
 					.overflow_y_scroll()
 					.border_b_1()
-					.border_color(rgb(DIVIDER))
+					.border_color(rgb(pal().divider))
 					.children(mappings)
 					.children(rows)
 					.children(probe(log, "paste-items")),
@@ -3598,13 +3625,13 @@ impl WorkbenchModel {
 						.h(px(24.))
 						.px(px(12.))
 						.gap(px(8.))
-						.bg(rgb(PANEL_BG))
+						.bg(rgb(pal().panel_bg))
 						.text_size(px(SMALL_TEXT))
 						.child(fill_text(detail_title))
 						.child(
 							div()
 								.flex_shrink_0()
-								.text_color(rgb(TEXT_MUTED))
+								.text_color(rgb(pal().text_muted))
 								.child(reason),
 						),
 				)
@@ -3613,7 +3640,7 @@ impl WorkbenchModel {
 				d.child(
 					div()
 						.p(px(12.))
-						.text_color(rgb(ERROR))
+						.text_color(rgb(pal().error))
 						.child(t("reason_delete", loc)),
 				)
 			})
@@ -3652,7 +3679,7 @@ impl WorkbenchModel {
 			.px(px(8.))
 			.gap(px(6.))
 			.border_b_1()
-			.border_color(rgb(BORDER))
+			.border_color(rgb(pal().border))
 			.child(
 				div()
 					.flex_shrink_0()
@@ -3666,10 +3693,10 @@ impl WorkbenchModel {
 					.flex()
 					.items_center()
 					.border_b_2()
-					.border_color(rgb(ACCENT))
+					.border_color(rgb(pal().accent))
 					.child(t("log_tab", loc)),
 			)
-			.child(icon(Icon::Search, 13., TEXT_MUTED))
+			.child(icon(Icon::Search, 13., pal().text_muted))
 			.child(
 				div()
 					.id("log-search-input")
@@ -3714,7 +3741,7 @@ impl WorkbenchModel {
 			.child(
 				fill_text(format!("{repo_name} · {scope}"))
 					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(TEXT_MUTED)),
+					.text_color(rgb(pal().text_muted)),
 			)
 			.child(
 				button(
@@ -3797,7 +3824,7 @@ impl WorkbenchModel {
 					.id("page-indicator")
 					.flex_shrink_0()
 					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(TEXT_MUTED))
+					.text_color(rgb(pal().text_muted))
 					.child(format!("{}", self.commit_page + 1)),
 			)
 			.child(
@@ -3849,14 +3876,14 @@ impl WorkbenchModel {
 				.items_center()
 				.gap(px(5.))
 				.cursor_pointer()
-				.when(active, |d| d.bg(rgb(SELECTION_BG)))
-				.when(!active, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
+				.when(active, |d| d.bg(rgb(pal().selection_bg)))
+				.when(!active, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 				.tooltip(tip(label.clone()))
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.filter_by_ref(target.clone(), cx)
 				}))
 				.when_some(glyph, |d, (g, c)| d.child(icon(g, 12., c)))
-				.child(clip_text(label).text_color(rgb(TEXT)))
+				.child(clip_text(label).text_color(rgb(pal().text)))
 				.children(probe(log, id))
 				.into_any_element()
 		};
@@ -3873,7 +3900,7 @@ impl WorkbenchModel {
 			ref_rows.push(ref_entry(
 				"ref:HEAD".into(),
 				"HEAD".into(),
-				Some((Icon::Commit, REF_HEAD)),
+				Some((Icon::Commit, pal().ref_head)),
 				10.,
 				Some("HEAD".into()),
 				self.active_ref_filter.as_deref() == Some("HEAD"),
@@ -3881,9 +3908,14 @@ impl WorkbenchModel {
 			));
 		}
 		for (key, prefix, color, glyph) in [
-			("refs_local", "refs/heads/", REF_LOCAL, Icon::Branch),
-			("refs_remote", "refs/remotes/", REF_REMOTE, Icon::Branch),
-			("refs_tags", "refs/tags/", REF_TAG, Icon::Commit),
+			("refs_local", "refs/heads/", pal().ref_local, Icon::Branch),
+			(
+				"refs_remote",
+				"refs/remotes/",
+				pal().ref_remote,
+				Icon::Branch,
+			),
+			("refs_tags", "refs/tags/", pal().ref_tag, Icon::Commit),
 		] {
 			let members: Vec<_> = self
 				.refs
@@ -3904,8 +3936,8 @@ impl WorkbenchModel {
 					.gap(px(3.))
 					.text_size(px(11.))
 					.font_weight(FontWeight::SEMIBOLD)
-					.text_color(rgb(TEXT_MUTED))
-					.child(icon(Icon::ChevronDown, 10., TEXT_MUTED))
+					.text_color(rgb(pal().text_muted))
+					.child(icon(Icon::ChevronDown, 10., pal().text_muted))
 					.child(clip_text(format!(
 						"{} ({})",
 						t(key, loc),
@@ -3947,9 +3979,9 @@ impl WorkbenchModel {
 			.pr(px(6.))
 			.gap(px(6.))
 			.border_b_1()
-			.border_color(rgb(DIVIDER))
+			.border_color(rgb(pal().divider))
 			.text_size(px(SMALL_TEXT))
-			.text_color(rgb(TEXT_MUTED))
+			.text_color(rgb(pal().text_muted))
 			.child(fill_text(t("col_message", loc)).pl(px(gutter_w)))
 			.child(
 				div()
@@ -3980,7 +4012,8 @@ impl WorkbenchModel {
 			.flex_col()
 			.flex_shrink_0()
 			.h(px(height))
-			.bg(rgb(PANEL_BG))
+			.bg(rgb(pal().panel_bg))
+			.rounded(px(ISLAND_RADIUS))
 			.child(header)
 			.when_some(self.history_error.clone(), |d, err| {
 				d.child(
@@ -3990,9 +4023,9 @@ impl WorkbenchModel {
 						.flex_shrink_0()
 						.px(px(10.))
 						.py(px(2.))
-						.bg(rgb(ERROR_BG))
+						.bg(rgb(pal().error_bg))
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(ERROR))
+						.text_color(rgb(pal().error))
 						.child(tf("error_history", loc, &[&err]))
 						.children(probe(log, "log-error")),
 				)
@@ -4004,7 +4037,7 @@ impl WorkbenchModel {
 						.px(px(10.))
 						.py(px(2.))
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(WARNING))
+						.text_color(rgb(pal().warning))
 						.child(tf("search_note", loc, &[&n])),
 				)
 			})
@@ -4024,7 +4057,7 @@ impl WorkbenchModel {
 							.h_full()
 							.overflow_y_scroll()
 							.border_r_1()
-							.border_color(rgb(BORDER))
+							.border_color(rgb(pal().border))
 							.text_size(px(SMALL_TEXT))
 							.py(px(2.))
 							.children(ref_rows),
@@ -4035,7 +4068,7 @@ impl WorkbenchModel {
 							.flex_col()
 							.flex_1()
 							.min_w_0()
-							.bg(rgb(EDITOR_BG))
+							.bg(rgb(pal().editor_bg))
 							.child(col_header)
 							.child(
 								div()
@@ -4095,7 +4128,9 @@ impl WorkbenchModel {
 											d.child(
 												div()
 													.p(px(10.))
-													.text_color(rgb(TEXT_MUTED))
+													.text_color(rgb(
+														pal().text_muted
+													))
 													.child(t("empty_log", loc)),
 											)
 										},
@@ -4204,7 +4239,7 @@ impl WorkbenchModel {
 								div()
 									.flex_shrink_0()
 									.text_size(px(10.))
-									.text_color(rgb(crate::theme::REF_REMOTE))
+									.text_color(rgb(pal().ref_remote))
 									.child("⇅"),
 							)
 						})
@@ -4221,7 +4256,7 @@ impl WorkbenchModel {
 					out.push(
 						badge(
 							format!("ref-more:{}", short(&sha)),
-							rgb(TEXT_MUTED),
+							rgb(pal().text_muted),
 							false,
 						)
 						.flex_shrink_0()
@@ -4250,13 +4285,15 @@ impl WorkbenchModel {
 			.cursor_pointer()
 			.when(selected, |d| {
 				d.bg(rgb(if self.log_active {
-					SELECTION_BG
+					pal().selection_bg
 				} else {
-					SELECTION_INACTIVE_BG
+					pal().selection_inactive_bg
 				}))
 			})
-			.when(in_range && !selected, |d| d.bg(rgb(RANGE_BG)))
-			.when(!selected && !in_range, |d| d.hover(|s| s.bg(rgb(HOVER_BG))))
+			.when(in_range && !selected, |d| d.bg(rgb(pal().range_bg)))
+			.when(!selected && !in_range, |d| {
+				d.hover(|s| s.bg(rgb(pal().hover_bg)))
+			})
 			.on_click(cx.listener(
 				move |this, ev: &gpui::ClickEvent, window, cx| {
 					window.focus(&this.log_focus);
@@ -4306,7 +4343,7 @@ impl WorkbenchModel {
 								.gap(px(2.))
 								.px(px(2.))
 								.rounded(px(3.))
-								.hover(|s| s.bg(rgb(HOVER_BG)))
+								.hover(|s| s.bg(rgb(pal().hover_bg)))
 								.tooltip(tip(t(
 									if collapsed {
 										"tip_expand_merge"
@@ -4326,13 +4363,13 @@ impl WorkbenchModel {
 										Icon::ChevronDown
 									},
 									10.,
-									TEXT_MUTED,
+									pal().text_muted,
 								))
 								.when(collapsed, |d| {
 									d.child(
 										div()
 											.text_size(px(11.))
-											.text_color(rgb(WARNING))
+											.text_color(rgb(pal().warning))
 											.child(tf(
 												"collapsed_n",
 												self.locale,
@@ -4378,7 +4415,7 @@ impl WorkbenchModel {
 					.tooltip(tip(c.author_name.clone()))
 					.child(
 						clip_text(c.author_name.clone())
-							.text_color(rgb(TEXT_MUTED)),
+							.text_color(rgb(pal().text_muted)),
 					),
 			)
 			.child(
@@ -4390,7 +4427,7 @@ impl WorkbenchModel {
 					.tooltip(tip(short_date(&c.author_date)))
 					.child(
 						clip_text(short_date(&c.author_date))
-							.text_color(rgb(TEXT_MUTED)),
+							.text_color(rgb(pal().text_muted)),
 					),
 			)
 			.child(
@@ -4400,7 +4437,7 @@ impl WorkbenchModel {
 					.w(px(60.))
 					.font_family(CODE_FONT)
 					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(TEXT_MUTED))
+					.text_color(rgb(pal().text_muted))
 					.tooltip(tip(c.sha.clone()))
 					.child(short(&c.sha).to_string()),
 			)
@@ -4433,11 +4470,9 @@ impl WorkbenchModel {
 			.h(px(STATUS_H))
 			.px(px(10.))
 			.gap(px(8.))
-			.bg(rgb(PANEL_BG))
-			.border_t_1()
-			.border_color(rgb(BORDER))
+			.bg(rgb(pal().frame_bg))
 			.text_size(px(SMALL_TEXT))
-			.text_color(rgb(TEXT_MUTED))
+			.text_color(rgb(pal().text_muted))
 			.child(fill_text(self.status.render(loc)))
 			.child(status_sep())
 			.child(div().flex_shrink_0().child(tf(
@@ -4464,9 +4499,9 @@ impl WorkbenchModel {
 				div()
 					.flex_shrink_0()
 					.text_color(rgb(if errors > 0 {
-						ERROR
+						pal().error
 					} else {
-						TEXT_MUTED
+						pal().text_muted
 					}))
 					.child(tf(
 						"status_repo_count",
@@ -4668,8 +4703,10 @@ impl Render for WorkbenchModel {
 			.flex()
 			.flex_col()
 			.size_full()
-			.bg(rgb(EDITOR_BG))
-			.text_color(rgb(TEXT))
+			// Islands: the frame shows through the gaps between panels.
+			.bg(rgb(pal().frame_bg))
+			.font_family(UI_FONT)
+			.text_color(rgb(pal().text))
 			.text_size(px(UI_TEXT))
 			.child(self.render_header(cx))
 			.child(
@@ -4678,6 +4715,8 @@ impl Render for WorkbenchModel {
 					.flex_row()
 					.flex_1()
 					.min_h_0()
+					.pr(px(SPLITTER))
+					.pb(px(SPLITTER))
 					.child(self.render_rail(cx))
 					.child(
 						div()

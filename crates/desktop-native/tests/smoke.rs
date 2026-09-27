@@ -120,6 +120,15 @@ fn spawn_app(
 	dest: &Path,
 	probes: Option<(Bounds, Viewport)>,
 ) -> App {
+	spawn_app_themed(ws, dest, probes, "dark")
+}
+
+fn spawn_app_themed(
+	ws: &Path,
+	dest: &Path,
+	probes: Option<(Bounds, Viewport)>,
+	theme: &str,
+) -> App {
 	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"));
 	cmd.args([
 		"--workspace",
@@ -130,6 +139,8 @@ fn spawn_app(
 	.stdout(Stdio::piped())
 	.stderr(Stdio::piped())
 	.env("XMODIFIERS", "@im=none")
+	// Pixel checks below assume the DARK palette.
+	.env("SNIP_THEME", theme)
 	.env_remove("SNIP_NATIVE_E2E")
 	.env_remove("SNIP_NATIVE_E2E_APPLY_DELAY_MS");
 	if probes.is_some() {
@@ -879,9 +890,9 @@ fn native_desktop_smoke_and_clipboard_verification() {
 					"-alpha",
 					"off",
 					"-fx",
-					// The visible keyboard ring is #3574f0; allow one level
+					// The visible keyboard ring is DARK.focus_ring #3871e1; allow one level
 					// of raster rounding in the captured sRGB channels.
-					"abs(r-53/255)<0.006 && abs(g-116/255)<0.006 && abs(b-240/255)<0.006 ? 1 : 0",
+					"abs(r-56/255)<0.006 && abs(g-113/255)<0.006 && abs(b-225/255)<0.006 ? 1 : 0",
 					"-format",
 					"%[fx:mean]",
 					"info:",
@@ -2014,12 +2025,12 @@ fn native_graph_failed_next_page_is_transactional() {
 				assert!(pixels.status.success(), "error banner crop failed");
 				assert_eq!(pixels.stdout.len(), (w * h * 3) as usize);
 				let pixels = pixels.stdout.as_chunks::<3>().0;
-				// Existing theme ERROR_BG and antialiased ERROR text.
-				pixels.contains(&[64, 41, 41])
+				// DARK.error_bg #56272b and antialiased DARK.error #f57e84 text.
+				pixels.contains(&[86, 39, 43])
 					&& pixels.iter().any(|p| {
-						p[0].abs_diff(247) <= 16
-							&& p[1].abs_diff(84) <= 16
-							&& p[2].abs_diff(100) <= 16
+						p[0].abs_diff(245) <= 16
+							&& p[1].abs_diff(126) <= 16
+							&& p[2].abs_diff(132) <= 16
 					})
 			});
 			if stable && presented && settled {
@@ -3938,9 +3949,10 @@ fn native_reader_degradation_and_copy_integrity() {
 	// Text antialiasing blends warning ink with its dark background.
 	let has_warning_ink = |pixels: &[u8]| {
 		pixels.as_chunks::<3>().0.iter().any(|p| {
-			p[0].abs_diff(242) <= 16
-				&& p[1].abs_diff(197) <= 16
-				&& p[2].abs_diff(92) <= 16
+			// DARK.warning #d59637.
+			p[0].abs_diff(213) <= 16
+				&& p[1].abs_diff(150) <= 16
+				&& p[2].abs_diff(55) <= 16
 		})
 	};
 	let deadline = Instant::now() + Duration::from_secs(5);
@@ -4042,4 +4054,90 @@ fn native_reader_degradation_and_copy_integrity() {
 	quit_cleanly(&mut app, &wid);
 	// Preserve both actual clipboard mismatches in an old-product run.
 	assert!(selection_mismatches.is_empty(), "{selection_mismatches:?}");
+}
+
+/// `SNIP_THEME=light` renders the Islands Light palette. Saves
+/// `light_theme.png` as an artifact; the only pixel check is that the
+/// window is predominantly light (the dark palette averages well below).
+#[test]
+fn native_light_theme_renders() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("light");
+	fs::create_dir(&repo).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.name", "Light Test"]);
+	git_ok(&repo, &["config", "user.email", "light@example.com"]);
+	fs::write(repo.join("README.md"), "light 淺色\n").unwrap();
+	git_ok(&repo, &["add", "."]);
+	git_ok(&repo, &["commit", "-q", "-m", "initial"]);
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app_themed(ws.path(), dest.path(), None, "light");
+	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(8))
+		.unwrap();
+	let wid = find_wid(app.pid);
+	// Map and focus the window so it presents a frame (as the graph test does).
+	key(&wid, "Escape");
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let png = out.join("light_theme.png");
+	// Vulkan presents to the root surface under Xvfb; crop the window from it.
+	let geometry = Command::new("xdotool")
+		.args(["getwindowgeometry", "--shell", &wid])
+		.output()
+		.unwrap();
+	assert!(geometry.status.success());
+	let text = String::from_utf8(geometry.stdout).unwrap();
+	let geometry: HashMap<_, _> = text
+		.lines()
+		.filter_map(|line| line.split_once('='))
+		.collect();
+	let crop = format!(
+		"{}x{}+{}+{}",
+		geometry["WIDTH"], geometry["HEIGHT"], geometry["X"], geometry["Y"]
+	);
+	let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
+	let deadline = Instant::now() + Duration::from_secs(10);
+	let mean = loop {
+		assert!(Command::new("xwd")
+			.args(["-root", "-silent", "-out"])
+			.arg(xwd.path())
+			.status()
+			.unwrap()
+			.success());
+		assert!(Command::new("convert")
+			.arg(xwd.path())
+			.args(["-crop", &crop, "+repage"])
+			.arg(&png)
+			.status()
+			.unwrap()
+			.success());
+		let stat = Command::new("convert")
+			.arg(&png)
+			.args(["-colorspace", "Gray", "-format", "%[fx:mean]", "info:"])
+			.output()
+			.unwrap();
+		assert!(stat.status.success());
+		let mean: f64 = String::from_utf8(stat.stdout)
+			.unwrap()
+			.trim()
+			.parse()
+			.unwrap();
+		if mean > 0.6 || Instant::now() >= deadline {
+			break mean;
+		}
+		std::thread::sleep(Duration::from_millis(100));
+	};
+	println!("[TEST DRIVER] light theme mean luminance {mean:.3} -> {png:?}");
+	assert!(mean > 0.6, "light palette must render light, mean={mean}");
+	quit_cleanly(&mut app, &wid);
 }

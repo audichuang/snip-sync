@@ -64,3 +64,16 @@ brew install audichuang/tap/snip-cli           # CLI（snip）
 - 只給自己用:不做簽章公證、自動更新。正式版發到 Homebrew tap(`brew install --cask audichuang/tap/snip-sync`、`brew install audichuang/tap/snip-cli`)。
 
 其他疑問或反對意見,直接開 issue 或在文件上註記即可。
+
+## 第三方授權
+
+原生工作台(`crates/desktop-native`)以 `include_bytes!` 內嵌下列字型,兩者皆為
+[SIL Open Font License 1.1](https://openfontlicense.org);授權全文與字型檔放在
+`crates/desktop-native/assets/fonts/`,字型檔本身的 name table 也帶有版權與授權資訊。
+
+| 字型 | 版本 | 用途 | 授權檔 |
+|---|---|---|---|
+| [Inter](https://github.com/rsms/inter)(Regular、SemiBold) | 4.1 | UI 文字 | `Inter-OFL.txt` |
+| [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono)(Regular) | 2.304 | 程式碼／editor | `JetBrainsMono-OFL.txt` |
+
+字型未經修改,也不單獨販售。其餘專案程式碼仍為 MIT。

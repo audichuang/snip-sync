@@ -4662,6 +4662,7 @@ fn main() {
 
 	app.run(move |cx: &mut App| {
 		cx.bind_keys(key_bindings());
+		theme::register_fonts(cx);
 
 		let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
 		let ws = workspace.clone();
@@ -4679,6 +4680,15 @@ fn main() {
 				..Default::default()
 			},
 			|window, cx| {
+				// Follow the OS light/dark appearance (unless SNIP_THEME pins it).
+				theme::sync_appearance(window.appearance());
+				window
+					.observe_window_appearance(|window, _| {
+						if theme::sync_appearance(window.appearance()) {
+							window.refresh();
+						}
+					})
+					.detach();
 				if app_mode == "idle" {
 					ready_marker("IDLE");
 				}

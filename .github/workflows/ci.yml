@@ -417,11 +417,11 @@ jobs:
                   SNIP_E2E_OUT: ${{ runner.temp }}/native-e2e-artifacts
               run: |
                   mkdir -p "$SNIP_E2E_OUT"
-                  rm -f "$SNIP_E2E_OUT/graph.png" "$SNIP_E2E_OUT/file_tree.png" "$SNIP_E2E_OUT/paste_preview.png"
+                  rm -f "$SNIP_E2E_OUT/graph.png" "$SNIP_E2E_OUT/file_tree.png" "$SNIP_E2E_OUT/paste_preview.png" "$SNIP_E2E_OUT/light_theme.png"
                   set -o pipefail
                   ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$SNIP_E2E_OUT/smoke.log"
                   test -s "$SNIP_E2E_OUT/smoke.log" || { echo "Missing or empty smoke.log" >&2; exit 1; }
-                  python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "$SNIP_E2E_OUT"
+                  python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png', 'light_theme.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "$SNIP_E2E_OUT"
             - name: Run native lifecycle tests (close/reopen/quit drain, copy and paste cancel)
               shell: bash
               env:

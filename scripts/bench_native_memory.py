@@ -894,6 +894,8 @@ class NativeSession:
         env["DISPLAY"] = f":{display}"
         env.pop("WAYLAND_DISPLAY", None)
         env["VK_DRIVER_FILES"] = self.icd
+        # Screenshot checks are calibrated on the dark palette.
+        env["SNIP_THEME"] = "dark"
         env.pop("SNIP_NATIVE_E2E", None)
         if e2e:
             env["SNIP_NATIVE_E2E"] = "1"
