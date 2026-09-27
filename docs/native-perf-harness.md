@@ -1,7 +1,7 @@
 # Native Workbench Performance Harness (bench_native_memory.py)
 
 **Status**: Verified Test Driver Specification  
-**Date**: 2026-09-26 (explicit source-aware copy; standard-dataset discovery blocker recorded, no D4 claim)
+**Date**: 2026-09-27 (optional matched diff profile passed native/Tauri functional pilots; no D4 claim)
 **Protocol Reference**: [`docs/memory-measurement-protocol.md`](memory-measurement-protocol.md)  
 **Product Delivery Spec**: [`docs/native-workbench-delivery-spec.md`](native-workbench-delivery-spec.md) (Read-only)
 
@@ -49,6 +49,7 @@
 | :--- | :--- | :--- | :--- |
 | **`idle`** | Empty workspace dir | `--mode idle` | Measures clean startup baseline with 0 repositories. Verifies empty title bar, zero git workers, and window mapping. Latency: `–`. |
 | **`1repo`** | Single Git repository | `--mode normal` | Single repository with working changes and one history page. The basket starts empty. The driver clicks one source-aware row and its checkbox, then `btn-copy`. Verifies that entry's bytes (index for staged, worktree for unstaged/untracked). |
+| **`1repo-diff`** | One standard repository | `--mode normal` (`SNIP_NATIVE_E2E=1`) | Opt-in: selected two-commit feature branch on a standard repository. Both native and Tauri select `refs/heads/feat/divergent`, its current tip, and the same Git-oracle text file through real UI controls. Final client size is 1080×720, graph/refs remain active, diff is displayed, no files enter the basket, and no Copy action occurs. |
 | **`15overview`** | Standard 15-repo workspace | `--mode overview` | **Important Prototype Finding**: Upon launch with 15 repositories, the current native workbench prototype automatically selects repository 0, loads its history graph, and displays its working tree preview. Therefore, `15overview` measures the combined footprint of 15 discovered repositories plus 1 active loaded repository. **It does not certify a summary-only overview memory** until a future revision implements deferred graph/preview retention. |
 | **`15active`** | Standard 15-repo workspace | `--mode normal` (`SNIP_NATIVE_E2E=1`) | Launches into the 15-repo workspace (repository 0 loads), then switches to repository 1 by clicking `repo-row:<name>`. This checkpoint's keymap has no `Alt+2` binding. Measures `clickToRepoLoadedMs` and `clickToGraphLoadedMs`. |
 | **`soak`** | Standard 15-repo workspace | `--mode normal` (`SNIP_NATIVE_E2E=1`) | Executes 100 sequential repository switches by clicking `repo-row` controls, scrolling inside `left-list`. Each switch must reach `REPO_LOADED` and `GRAPH_LOADED`, and must not add a basket entry. The reported switch count is the number of completed clicks. The final copy is one explicit source row, after `rail-changes`. |
@@ -90,6 +91,45 @@ The copy is a click on `btn-copy` after the checkbox is on. `Ctrl+C` is not the 
 
 ### History page
 The workbench loads 50 commits per page. That length is the application's built-in value, checked against `[APP:GRAPH_LOADED]` and `[APP:E2E_LOG]` (`mode=graph`, `first=` equals the first commit of `git log --topo-order -n 51 --all HEAD`). There is no `--history-page-size` flag and no screen flag. Observed window geometry stays on each run. A different row count fails the run.
+
+### Optional matched `1repo-diff`
+
+This profile is **selected two-commit feature branch on standard repository**, not a comparison of the default native 50-row and Tauri 300-row pages, and not a 15-repository comparison. Existing defaults and old `1repo` Copy/content workflows are preserved; request `--profile 1repo-diff` explicitly in either driver.
+
+The oracle reads `git log --topo-order --format=%H refs/heads/feat/divergent --` and refuses a missing ref or any count other than two. It chooses the tip's first small added/modified text file using the existing commit oracle. OIDs and paths are computed for each run, not hardcoded to the current standard fixture. The standard manifest must name the participating repository.
+
+Native first uses its real locale toggle to switch the frozen app's initial Traditional Chinese UI to English, matching Tauri. It requires the observed `LOCALE: En` event and the English empty-basket screenshot label. It clicks stable current ref bounds (or searches the existing ref picker by its short branch label), commit row and commit file. Fresh `REF_FILTER`, `GRAPH_LOADED` and `E2E_LOG` establish ref, count, graph mode and first row. The two live commit-row bounds must contain the unique expected short OIDs in vertical order. The full preview OID/path/source and retained patch line count/FNV must match the independent Git patch. This hash proves the retained patch, not that every patch byte was painted. A nonblank root-cropped screenshot additionally checks the path, history and changed text. Tauri records the language toggle's rendered label and rejects a non-English UI.
+
+Tauri uses WebDriver ref/commit/file clicks. Its selected ref, full displayed OID sequence, commit-details OID, preview path and diff mode must match. For this small diff, all changed rows must fit inside the visible preview: shadow-DOM `data-line` rows supply their addition/deletion kind, text, sequence and count. One renderer terminal LF/CRLF is removed per row; other whitespace and blank changed lines are preserved. Missing, extra, reordered, clipped or different rows fail. This is normalized rendered-row equality, not byte-exact patch rendering. Neither driver visits a full-file content view in this profile or claims to have displayed the complete source file.
+
+The final view matches, but startup traces differ: native initially loads its 50-row history and working preview; Tauri initially loads the commits tab's 300-row page. These prior actions are recorded. Native retains a bounded patch reader; Tauri's preview component also holds its backend content result. This profile does not establish identical internal retention, identical startup allocation peaks, or a release acceptance gate. Compare settled process-tree measurements under this narrow scenario, with these differences stated.
+
+Native verifies actual X11 client geometry. Tauri adjusts the WebDriver window rectangle until the observed inner size is 1080×720 and verifies a device-pixel ratio of 1. Both validate geometry, selection and clipboard again after steady sampling. The same fixed clipboard sentinel is owned by a separate foreground `xclip` process on the owned private X11 display, outside application RAM accounting; its exact bytes must remain unchanged. Native rejects nonempty basket/toggle/Copy events. Tauri checks that no file-selection checkbox is checked; it has no native-style basket, and the previewed commit remains selected.
+
+Each run hashes the binary, standard manifest, participating repo refs/index and tracked/nonignored untracked worktree bytes before and after. This fingerprint does not certify every other repository or ignored file in the 15-repository dataset. Changes fail the run. At least 30 steady seconds and valid RSS/PSS median, p95 and maximum are required; missing PSS is a failure for this profile. Raw sampler output, process identity, private XDG/D-Bus, process-cold/uncontrolled filesystem-cache semantics and teardown remain the existing harness behavior. The native launch peak and Tauri late-attach pre-ready peak remain different measurement boundaries.
+
+After the coordinator approves a GUI slot, run a single functional pilot with the frozen release binary and matching receipt (substitute concrete paths). No build is performed:
+
+```bash
+rtk proxy env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+  -u DISPLAY -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
+  python3 scripts/bench_native_memory.py \
+  --bin /path/to/frozen/snip-desktop-native --build-profile release \
+  --label "Matched functional pilot" --source-note "frozen binary; see receipt" \
+  --workspace /tmp/snip-workload-standard-20260925 \
+  --profile 1repo-diff --runs 1 --steady-seconds 30 --sample-interval 0.05 \
+  --out-dir /tmp/native-matched-pilot-NEW
+
+rtk proxy env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+  -u DISPLAY -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
+  python3 scripts/bench_tauri_memory.py \
+  --bin /path/to/frozen/snip-sync --build-profile release \
+  --workspace /tmp/snip-workload-standard-20260925 \
+  --profile 1repo-diff --runs 1 --steady-seconds 30 --sample-interval 0.05 \
+  --out-dir /tmp/tauri-matched-pilot-NEW
+```
+
+The adjacent `.receipt.json` is discovered automatically; pass `--build-receipt` if it is elsewhere. The 2026-09-27 functional pair passed with native binary `b11e6724` and Tauri `a4664824`, English UIs, 600 steady samples each and clean teardown. Evidence and source snapshots are listed in `/tmp/snip-session4-matched-performance-report.md`. Earlier native picker/OCR failures and a Chinese-locale functional run remain separate artifacts. Formal ten-run measurements are pending stable final binaries and coordinator approval; a functional pilot does not pass D4. `--compare-baseline` remains unsupported; the coordinator compares concrete matched artifacts.
 
 ### Standard-dataset discovery
 On the first D3 checkpoint, startup calls discovery for one page of 10,000 directory visits and depth 8, and that page walks into the working tree before it records `.git`. Against `/tmp/snip-workload-standard-20260925` and against `repo-01-core` alone, the only readiness line is `[APP:READY_REPOS: 0]`; it does not update if the process is left running. The driver fails that run. It does not point the app at a smaller tree, and it does not treat 0 as the 15-repo workload. Repo switches, the explicit copy, and the 100-switch soak therefore do not start.

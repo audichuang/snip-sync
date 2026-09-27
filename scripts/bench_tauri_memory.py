@@ -31,6 +31,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -63,6 +64,10 @@ ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
 XVFB_SCREEN = "1280x800x24"
 # Frontend preview cap is 1 MiB; stay well under it so a refusal is never the oracle.
 ORACLE_MAX_BLOB_BYTES = 256 * 1024
+MATCHED_REF = "refs/heads/feat/divergent"
+MATCHED_SIZE = (1080, 720)
+MATCHED_SENTINEL = b"snip-sync matched 1repo-diff: clipboard must stay unchanged\n"
+MATCHED_SCENARIO = "selected two-commit feature branch on standard repository"
 UNSUPPORTED_15REPO = (
     "The Tauri app has one active repository (App.tsx `const [repo, setRepo] = useState(\"\")`, "
     "commands take a single `repo: String`). 15 repositories cannot be shown simultaneously, "
@@ -264,6 +269,82 @@ def missing_diff_lines(pane_text: Any, lines: list[str]) -> list[str]:
     if not isinstance(pane_text, str):
         return list(lines)
     return [l for l in lines if l not in pane_text]
+
+
+def matched_oracle(repo: str) -> dict[str, Any]:
+    """Fixed ref, dynamic OIDs/path: never fall back to the default history page."""
+    history = git(repo, "log", "--topo-order", "--format=%H", MATCHED_REF, "--").splitlines()
+    if len(history) != 2 or any(not re.fullmatch(r"[0-9a-f]{40}", oid) for oid in history):
+        raise BenchError(f"{MATCHED_REF} must have exactly two full commit OIDs, got {history}")
+    oracle = commit_oracle(repo, history[0])
+    if oracle is None:
+        raise BenchError(f"{MATCHED_REF} tip has no small text diff to verify")
+    patch = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-color",
+                history[1], history[0], "--", f":(literal){oracle['path']}")
+    if not patch or not changed_lines(patch):
+        raise BenchError("matched tip diff is empty")
+    in_hunk = False
+    diff_rows = []
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line[:1] in ("+", "-"):
+            diff_rows.append({"kind": "change-addition" if line[0] == "+" else "change-deletion", "text": line[1:]})
+    return {**oracle, "ref": MATCHED_REF, "historyOids": history, "patch": patch, "diffRows": diff_rows,
+            "patchSha256": hashlib.sha256(patch.encode()).hexdigest(), "changedLines": changed_lines(patch)}
+
+
+def check_matched_state(observed: dict[str, Any], oracle: dict[str, Any]) -> None:
+    expected = {"ref": MATCHED_REF, "historyOids": oracle["historyOids"],
+                "sha": oracle["sha"], "path": oracle["path"], "previewMode": "diff",
+                "observedLocale": "en",
+                "width": MATCHED_SIZE[0], "height": MATCHED_SIZE[1], "basketEmpty": True,
+                "clipboardSha256": hashlib.sha256(MATCHED_SENTINEL).hexdigest()}
+    for key, wanted in expected.items():
+        if observed.get(key) != wanted:
+            raise BenchError(f"matched {key}: observed {observed.get(key)!r}, expected {wanted!r}")
+
+
+def check_matched_measurement(measurement: dict[str, Any]) -> None:
+    if measurement.get("status") != "COMPLETED" or measurement.get("timestamps", {}).get("steadyDurationSec", 0) < 30:
+        raise BenchError("matched measurement needs a completed 30-second steady window")
+    metrics = measurement.get("steadyMetrics", {})
+    for key in ("rssMedianMib", "rssP95Mib", "rssMaxMib", "pssMedianMib", "pssP95Mib", "pssMaxMib"):
+        value = metrics.get(key)
+        if not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+            raise BenchError(f"matched measurement lacks valid {key}: {value!r}")
+
+
+def matched_identity(bin_path: str, repo: str) -> dict[str, Any]:
+    """Hash the participating repository's refs/index/worktree and the dataset manifest."""
+    manifest_path = os.path.join(os.path.dirname(repo), "workload_manifest.json")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    if manifest.get("preset") != "standard":
+        raise BenchError("1repo-diff requires a standard workload manifest")
+    if os.path.basename(repo) not in {entry["name"] for entry in manifest.get("repos", [])}:
+        raise BenchError("participating repository is not listed in the standard manifest")
+    digest = hashlib.sha256()
+    for args in (("show-ref", "--head"), ("ls-files", "--stage", "-z"),
+                 ("status", "--porcelain=v2", "-z", "--untracked-files=all")):
+        digest.update(git(repo, *args, text=False))
+        digest.update(b"\0")
+    paths = set(git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard", text=False).split(b"\0"))
+    for raw in sorted(paths - {b""}):
+        path = os.path.join(os.fsencode(repo), raw)
+        digest.update(raw + b"\0")
+        if os.path.islink(path):
+            value = b"link:" + os.readlink(path)
+        elif os.path.isfile(path):
+            value = sha256_file(path).encode()
+        elif not os.path.exists(path):
+            value = b"deleted"
+        else:
+            raise BenchError(f"unsupported workload entry {os.fsdecode(path)}")
+        digest.update(value + b"\0")
+    return {"binarySha256": sha256_file(bin_path), "manifestSha256": sha256_file(manifest_path),
+            "repoPath": os.path.realpath(repo), "repoSha256": digest.hexdigest(),
+            "scope": "participating repo refs, index, tracked/nonignored untracked worktree bytes; dataset manifest"}
 
 
 # ---------------------------------------------------------------- WebDriver
@@ -491,7 +572,7 @@ def wait_idle(d: Driver) -> dict[str, Any]:
     return {"appliedRepo": applied, "renderedCommitRows": rows}
 
 
-def load_repo_preview(d: Driver, repo: str, shots: str) -> dict[str, Any]:
+def load_repo_preview(d: Driver, repo: str, shots: str, matched: dict[str, Any] | None = None) -> dict[str, Any]:
     wait_idle(d)
     # Same input path as lib.mjs setRepo (WebKitWebDriver under Xvfb mangles typed capitals).
     el = d.wd("POST", "/element", {"using": "css selector", "value": '[data-testid="repo-path"]'})[ELEMENT_KEY]
@@ -506,26 +587,35 @@ def load_repo_preview(d: Driver, repo: str, shots: str) -> dict[str, Any]:
     d.click('[role="tab"][data-key="commits"]')
     rendered = d.until("commit rows", lambda: d.js("return [...document.querySelectorAll('[data-commit]')].map(e => e.dataset.commit)"), 120.0)
 
+    if matched is not None:
+        d.click(f'[data-testid="ref-{MATCHED_REF}"]')
+        d.until("two matching branch rows in Git order", lambda: d.js(
+            "return [...document.querySelectorAll('[data-commit]')].map(e => e.dataset.commit)") == matched["historyOids"])
+        rendered = d.js("return [...document.querySelectorAll('[data-commit]')].map(e => e.dataset.commit)")
+
     # Pick the first rendered commit that has a checkable text change; nothing is fabricated.
-    oracle = None
-    for sha in rendered[:50]:
-        oracle = commit_oracle(repo, sha)
-        if oracle:
-            break
+    oracle = matched
+    if oracle is None:
+        for sha in rendered[:50]:
+            oracle = commit_oracle(repo, sha)
+            if oracle:
+                break
     if oracle is None:
         raise BenchError(f"none of the first {min(50, len(rendered))} rendered commits has an A/M text file to verify")
 
     d.click(f'[data-commit="{oracle["sha"]}"] span')
     d.click(f'[data-testid="preview-file-{oracle["path"]}"]')
     d.until("preview of the oracle file", lambda: d.attr("source-preview", "data-path") == oracle["path"])
-    d.click('[data-testid="preview-content"]')
-    try:
-        d.until("exact source content", lambda: d.js(
-            "return document.querySelector('[data-testid=\"source-content\"]')?.textContent") == oracle["content"])
-    except BenchError:
-        check_source_content(d.js("return document.querySelector('[data-testid=\"source-content\"]')?.textContent ?? null"), oracle)
-        raise
-    content_shot = d.screenshot(os.path.join(shots, "ready-1repo-content.png"))
+    content_shot = None
+    if matched is None:
+        d.click('[data-testid="preview-content"]')
+        try:
+            d.until("exact source content", lambda: d.js(
+                "return document.querySelector('[data-testid=\"source-content\"]')?.textContent") == oracle["content"])
+        except BenchError:
+            check_source_content(d.js("return document.querySelector('[data-testid=\"source-content\"]')?.textContent ?? null"), oracle)
+            raise
+        content_shot = d.screenshot(os.path.join(shots, "ready-1repo-content.png"))
 
     d.click('[data-testid="preview-diff"]')
     deep_text = (
@@ -533,21 +623,118 @@ def load_repo_preview(d: Driver, repo: str, shots: str) -> dict[str, Any]:
         " if (c.nodeType === 3) t += c.data; else if (c.nodeType === 1) { if (c.shadowRoot) t += walk(c.shadowRoot) + '\\n'; t += walk(c); } }"
         " return t; }; const root = document.querySelector('[data-testid=\"source-preview\"]'); return root ? walk(root) : null;"
     )
-    try:
-        d.until("diff pane with every changed line", lambda: not missing_diff_lines(d.js(deep_text), oracle["changedLines"]))
-    except BenchError as e:
-        raise BenchError(f"diff pane misses {missing_diff_lines(d.js(deep_text), oracle['changedLines'])[:3]}") from e
+    if matched is not None:
+        d.until("complete visible diff row sequence", lambda: rendered_matched_diff(d) == oracle["diffRows"])
+        check_matched_diff(rendered_matched_diff(d), oracle)
+    else:
+        try:
+            d.until("diff pane with every changed line", lambda: not missing_diff_lines(d.js(deep_text), oracle["changedLines"]))
+        except BenchError as e:
+            raise BenchError(f"diff pane misses {missing_diff_lines(d.js(deep_text), oracle['changedLines'])[:3]}") from e
     diff_shot = d.screenshot(os.path.join(shots, "ready-1repo-diff.png"))
 
     return {
         "appliedRepo": repo,
         "renderedCommitRows": len(rendered),
-        "oracle": {k: v for k, v in oracle.items() if k != "content"},
-        "sourceContentMatchedGitShow": True,
-        "diffLinesChecked": len(oracle["changedLines"]),
-        "diffAssertion": "every +/- line of `git show --unified=0 <sha> -- <path>` (max 20) is contained in the rendered diff pane text; containment, not byte-exact (the diff renderer adds line numbers and markup)",
-        "screenshots": [content_shot, diff_shot],
+        "oracle": {k: v for k, v in oracle.items() if k not in ("content", "patch")},
+        "sourceContentMatchedGitShow": matched is None,
+        "diffLinesChecked": len(oracle["diffRows"] if matched is not None else oracle["changedLines"]),
+        "diffAssertion": ("complete visible +/- row sequence, kind, text and count match Git; one renderer terminal CRLF/LF removed per row; not byte-exact patch rendering"
+                          if matched is not None else "every +/- line (max 20) is contained in the rendered diff pane text; containment, not byte-exact"),
+        "screenshots": ([content_shot] if content_shot else []) + [diff_shot],
     }
+
+
+def rendered_matched_diff(d: Driver) -> list[dict[str, str]]:
+    return d.js(r"""
+        const pane = document.querySelector('[data-testid="source-preview"]');
+        if (!pane) return null;
+        const bounds = pane.getBoundingClientRect(), rows = [];
+        const walk = node => {
+          if (node.nodeType === 1 && node.matches('[data-code] [data-line][data-line-type^="change-"]')) {
+            const r = node.getBoundingClientRect();
+            rows.push({kind: node.getAttribute('data-line-type'),
+              text: r.width > 0 && r.height > 0 && r.top >= bounds.top && r.bottom <= Math.min(bounds.bottom, innerHeight)
+                ? node.textContent.replace(/\r?\n$/, '') : null});
+            return;
+          }
+          if (node.shadowRoot) walk(node.shadowRoot);
+          for (const child of node.childNodes) walk(child);
+        };
+        walk(pane); return rows;
+    """)
+
+
+def check_matched_diff(rows: Any, oracle: dict[str, Any]) -> None:
+    if rows != oracle["diffRows"]:
+        raise BenchError(f"matched diff row sequence/count/text differs: {rows!r}, expected {oracle['diffRows']!r}")
+
+
+def matched_tauri_state(d: Driver, clipboard: bytes) -> dict[str, Any]:
+    observed = d.js("""
+        const q = s => document.querySelector(s);
+        return {ref: q('[data-testid^="ref-"][aria-pressed="true"]')?.title,
+          historyOids: [...document.querySelectorAll('[data-commit]')].map(e => e.dataset.commit),
+          sha: q('[data-testid="commit-details"]')?.dataset.commitSha,
+          path: q('[data-testid="source-preview"]')?.dataset.path,
+          previewMode: q('[data-testid="preview-diff"]')?.getAttribute('aria-pressed') === 'true' ? 'diff' : null,
+          width: innerWidth, height: innerHeight, devicePixelRatio,
+          basketEmpty: document.querySelectorAll('input[data-testid^="git-change-"]:checked, input[data-testid^="git-folder-"]:checked').length === 0,
+          graphPresent: !!q('[data-testid="history-graph"]'),
+          languageButton: [...document.querySelectorAll('header button')].map(e => e.textContent.trim()).find(t => t === '中文' || t === 'English'),
+          navigatorLanguage: navigator.language,
+          search: q('[data-testid="history-search"]')?.value};
+    """)
+    if observed.get("devicePixelRatio") != 1 or not observed.get("graphPresent") or observed.get("search") != "":
+        raise BenchError(f"matched graph/scale/search mismatch: {observed}")
+    observed["clipboardSha256"] = hashlib.sha256(clipboard).hexdigest()
+    observed["observedLocale"] = {"中文": "en", "English": "zh-Hant"}.get(observed.get("languageButton"))
+    observed["basketEvidence"] = "no checked file-selection controls; Tauri has no native basket; focused commit is selected"
+    return observed
+
+
+def matched_tauri_geometry(d: Driver) -> None:
+    d.wd("POST", "/window/rect", {"width": MATCHED_SIZE[0], "height": MATCHED_SIZE[1]})
+    for _ in range(3):
+        size = d.js("return [innerWidth, innerHeight]")
+        if size == list(MATCHED_SIZE):
+            return
+        rect = d.wd("GET", "/window/rect")
+        d.wd("POST", "/window/rect", {"width": rect["width"] + MATCHED_SIZE[0] - size[0],
+                                      "height": rect["height"] + MATCHED_SIZE[1] - size[1]})
+    raise BenchError(f"could not match actual client geometry: {d.js('return [innerWidth, innerHeight]')}")
+
+
+def start_matched_clipboard(d: Driver) -> tuple[subprocess.Popen, dict[str, str]]:
+    """Use only the owned app's private X11 connection; keep this owner outside its tree."""
+    d.assert_app_alive()
+    with open(f"/proc/{d.app['pid']}/environ", "rb") as f:
+        app_env = dict(entry.split(b"=", 1) for entry in f.read().split(b"\0") if b"=" in entry)
+    if not app_env.get(b"DISPLAY"):
+        raise BenchError("owned Tauri app has no private DISPLAY")
+    env = {"PATH": os.environ["PATH"], "DISPLAY": os.fsdecode(app_env[b"DISPLAY"])}
+    if b"XAUTHORITY" in app_env:
+        env["XAUTHORITY"] = os.fsdecode(app_env[b"XAUTHORITY"])
+    proc = subprocess.Popen(["xclip", "-selection", "clipboard", "-i", "-quiet"], env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        proc.stdin.write(MATCHED_SENTINEL)
+        proc.stdin.close()
+        def seeded() -> bool:
+            try:
+                return read_matched_clipboard(env) == MATCHED_SENTINEL
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                return False
+        d.until("unchanged clipboard sentinel", seeded, 5)
+        return proc, env
+    except BaseException:
+        proc.kill()
+        proc.wait(timeout=5)
+        raise
+
+
+def read_matched_clipboard(env: dict[str, str]) -> bytes:
+    return subprocess.check_output(["xclip", "-selection", "clipboard", "-o"], env=env, timeout=5)
 
 
 def ui_environment(d: Driver) -> dict[str, Any]:
@@ -590,10 +777,19 @@ def run_profile(profile: str, bin_path: str, repo: str, run_dir: str, steady: fl
     error: str | None = None
     d: Driver | None = None
     try:
+        if profile == "1repo-diff":
+            if steady < 30:
+                raise BenchError("1repo-diff requires at least 30 steady seconds")
+            result["scenario"] = MATCHED_SCENARIO
+            result["identityBefore"] = matched_identity(bin_path, repo)
         d = Driver(bin_path, os.path.join(run_dir, "driver.log"))
         result["driverCommand"] = d.cmd
         result["isolation"] = d.isolation
         drive(d, profile, repo, run_dir, steady, interval, result)
+        if profile == "1repo-diff":
+            result["identityAfter"] = matched_identity(bin_path, repo)
+            if result["identityAfter"] != result["identityBefore"]:
+                raise BenchError("binary or participating dataset changed during the matched run")
     except Exception as e:  # noqa: BLE001 - recorded; the run fails after teardown
         error = f"{type(e).__name__}: {e}"
     finally:
@@ -612,6 +808,7 @@ def drive(d: Driver, profile: str, repo: str, run_dir: str, steady: float, inter
     ready_file = os.path.join(run_dir, f"ready-{uuid.uuid4().hex}.signal")
     marker = f"[READY:{profile.upper()}:{uuid.uuid4().hex}]"
     harness: subprocess.Popen | None = None
+    clip_owner: subprocess.Popen | None = None
     harness_log = open(os.path.join(run_dir, "harness.log"), "wb")
     try:
         d.wait_driver()
@@ -627,6 +824,15 @@ def drive(d: Driver, profile: str, repo: str, run_dir: str, steady: float, inter
         if profile == "idle":
             result["ui"] = wait_idle(d)
             result["ui"]["screenshots"] = [d.screenshot(os.path.join(run_dir, "ready-idle.png"))]
+        elif profile == "1repo-diff":
+            oracle = matched_oracle(repo)
+            matched_tauri_geometry(d)
+            clip_owner, clip_env = start_matched_clipboard(d)
+            result["ui"] = load_repo_preview(d, repo, run_dir, matched=oracle)
+            result["ui"]["matched"] = matched_tauri_state(d, read_matched_clipboard(clip_env))
+            check_matched_state(result["ui"]["matched"], oracle)
+            result["ui"]["priorActions"] = ["apply repo", "commits tab", "select ref", "select tip", "select file", "diff"]
+            result["ui"]["copyPerformed"] = False
         else:
             result["ui"] = load_repo_preview(d, repo, run_dir)
         d.assert_app_alive()
@@ -642,8 +848,15 @@ def drive(d: Driver, profile: str, repo: str, run_dir: str, steady: float, inter
         if code != 0:
             raise BenchError(f"memory_harness exited {code}; see {run_dir}/harness.log")
         d.assert_app_alive()
+        if profile == "1repo-diff":
+            result["ui"]["matchedAtEnd"] = matched_tauri_state(d, read_matched_clipboard(clip_env))
+            check_matched_state(result["ui"]["matchedAtEnd"], oracle)
+            result["ui"]["renderedDiffAtEnd"] = rendered_matched_diff(d)
+            check_matched_diff(result["ui"]["renderedDiffAtEnd"], oracle)
         with open(os.path.join(run_dir, "benchmark_report.json")) as f:
             result["measurement"] = json.load(f)["results"][0]
+        if profile == "1repo-diff":
+            check_matched_measurement(result["measurement"])
         # CLOCK_MONOTONIC is shared across processes, so this is the app's age at the first sample.
         result["processAgeAtSamplerStartSec"] = round(
             d.app["ageAtDiscoverySec"] + result["measurement"]["timestamps"]["startMonotonic"] - d.app["discoveryMonotonic"], 3
@@ -661,6 +874,10 @@ def drive(d: Driver, profile: str, repo: str, run_dir: str, steady: float, inter
         for leftover in (ready_file, ready_file + ".tmp"):
             if os.path.exists(leftover):
                 os.remove(leftover)
+        if clip_owner is not None:
+            if clip_owner.poll() is None:
+                clip_owner.kill()
+            clip_owner.wait(timeout=5)
 
 
 # ---------------------------------------------------------------- metadata and report
@@ -864,6 +1081,7 @@ def markdown(report: dict[str, Any]) -> str:
         "",
         "Peaks are maxima of 50 ms samples within the named phase only. This driver attaches late: there is no launch phase and no filesystem-cold peak.",
         "Observed viewport is per run (`uiEnvironment` innerWidth/innerHeight and windowRect), not a screen flag.",
+        "Optional 1repo-diff: selected two-commit feature branch on a standard repository; 1080x720 client, diff only, no Copy and unchanged clipboard. Default 50/300-row history and 15-repo workloads are not matched.",
         "",
         "| Profile | Runs OK | Steady RSS median | Steady PSS median | Pre-ready sampled peak RSS | Steady sampled peak RSS | App root VmHWM | Attach→ready s |",
         "| --- | :-: | --- | --- | --- | --- | --- | --- |",
@@ -891,7 +1109,9 @@ def markdown(report: dict[str, Any]) -> str:
                 lines.append(f"- {name} `{r['runDir']}`: FAILED {r.get('error')}; cleanup problems {r.get('cleanupProblems') or 'none'}")
                 continue
             m, ui = r["measurement"], r["ui"]
-            detail = f"oracle {ui['oracle']['sha'][:12]}:{ui['oracle']['path']} content==git show, {ui['diffLinesChecked']} diff lines" if "oracle" in ui else "idle, no repo applied"
+            detail = (f"oracle {ui['oracle']['sha'][:12]}:{ui['oracle']['path']} "
+                      + ("content==git show, " if ui.get("sourceContentMatchedGitShow") else "diff-only (full content not displayed), ")
+                      + f"{ui['diffLinesChecked']} diff lines") if "oracle" in ui else "idle, no repo applied"
             env = r["uiEnvironment"]
             libs = sorted({os.path.basename(p) for v in env["graphicsLibsMapped"].values() for p in v})
             lines.append(
@@ -957,7 +1177,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", help="Standard workload dir (with workload_manifest.json).")
     ap.add_argument("--repo", default="repo-01-core", help="Repo under --workspace for the 1repo profile.")
     ap.add_argument("--out-dir")
-    ap.add_argument("--profile", choices=["all", "idle", "1repo"], default="all")
+    ap.add_argument("--profile", choices=["all", "idle", "1repo", "1repo-diff"], default="all")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--steady-seconds", type=float, default=30.0)
     ap.add_argument("--sample-interval", type=float, default=0.05)

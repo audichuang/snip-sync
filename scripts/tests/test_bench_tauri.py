@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -28,11 +29,19 @@ from unittest import mock  # noqa: E402
 import bench_tauri_memory  # noqa: E402
 from bench_tauri_memory import (  # noqa: E402
     BenchError,
+    MATCHED_REF,
+    MATCHED_SENTINEL,
+    check_matched_measurement,
+    check_matched_diff,
+    check_matched_state,
     check_source_content,
     commit_oracle,
     find_owned_app_pid,
     identity,
     missing_diff_lines,
+    matched_identity,
+    matched_oracle,
+    matched_tauri_state,
     reap_owned,
     summarize,
 )
@@ -151,6 +160,26 @@ class TestGitOracle(unittest.TestCase):
         self.assertEqual(o["content"], "one\ntwo\n")
         self.assertEqual(o["changedLines"], ["two"])
 
+    def test_matched_ref_uses_dynamic_tip_and_exactly_two_commits(self) -> None:
+        self.git("init", "-q", "-b", "feat/divergent")
+        self.write("a.txt", b"one\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "root")
+        with self.assertRaisesRegex(BenchError, "exactly two"):
+            matched_oracle(self.repo)
+        self.write("a.txt", b"one\ntwo\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "tip")
+        oracle = matched_oracle(self.repo)
+        self.assertEqual(oracle["historyOids"], self.git("log", "--topo-order", "--format=%H", MATCHED_REF).splitlines())
+        self.assertEqual(oracle["sha"], self.git("rev-parse", "HEAD"))
+        self.assertEqual(oracle["path"], "a.txt")
+        self.assertEqual(oracle["content"], "one\ntwo\n")
+        self.assertIn("+two\n", oracle["patch"])
+        self.git("branch", "-m", "different")
+        with self.assertRaises(subprocess.CalledProcessError):
+            matched_oracle(self.repo)
+
     def test_merge_commit_is_skipped(self) -> None:
         self.git("init", "-q", "-b", "main")
         self.write("a.txt", b"a\n")
@@ -166,6 +195,108 @@ class TestGitOracle(unittest.TestCase):
         self.git("commit", "-qm", "main")
         self.git("merge", "-q", "--no-ff", "-m", "merge", "side")
         self.assertIsNone(commit_oracle(self.repo, self.git("rev-parse", "HEAD")))
+
+
+class TestMatchedContracts(unittest.TestCase):
+    def test_observed_locale_uses_the_language_toggle_not_repo_chooser(self) -> None:
+        oracle = {"sha": "a" * 40, "path": "a.txt", "historyOids": ["a" * 40, "b" * 40]}
+        d = mock.MagicMock()
+        for label, locale in (("中文", "en"), ("English", "zh-Hant"), ("Choose repo / folder", None)):
+            d.js.return_value = {**oracle, "ref": MATCHED_REF, "width": 1080, "height": 720,
+                                 "previewMode": "diff", "basketEmpty": True, "devicePixelRatio": 1,
+                                 "graphPresent": True, "search": "", "languageButton": label}
+            observed = matched_tauri_state(d, MATCHED_SENTINEL)
+            self.assertEqual(observed["observedLocale"], locale)
+            if locale == "en":
+                check_matched_state(observed, oracle)
+            else:
+                with self.assertRaisesRegex(BenchError, "observedLocale"):
+                    check_matched_state(observed, oracle)
+
+    def test_oid_order_path_count_geometry_clipboard_and_basket_fail_closed(self) -> None:
+        oracle = {"sha": "a" * 40, "path": "a.txt", "historyOids": ["a" * 40, "b" * 40]}
+        observed = {**oracle, "ref": MATCHED_REF, "width": 1080, "height": 720,
+                    "observedLocale": "en",
+                    "previewMode": "diff", "basketEmpty": True,
+                    "clipboardSha256": hashlib.sha256(MATCHED_SENTINEL).hexdigest()}
+        check_matched_state(observed, oracle)
+        for field, invalid in (("sha", "b" * 40), ("path", "other.txt"),
+                               ("historyOids", list(reversed(oracle["historyOids"]))),
+                               ("historyOids", oracle["historyOids"][:1]), ("width", 1000),
+                               ("height", 700), ("ref", "HEAD"), ("previewMode", "content"), ("observedLocale", "zh-Hant"),
+                               ("basketEmpty", False), ("clipboardSha256", "changed")):
+            with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(BenchError, field):
+                check_matched_state({**observed, field: invalid}, oracle)
+
+    def test_missing_pss_or_short_steady_is_not_a_completed_match(self) -> None:
+        measurement = {"status": "COMPLETED", "timestamps": {"steadyDurationSec": 30},
+                       "steadyMetrics": {f"{kind}{stat}Mib": 1 for kind in ("rss", "pss") for stat in ("Median", "P95", "Max")}}
+        check_matched_measurement(measurement)
+        for invalid in (None, 0, float("nan"), float("inf")):
+            with self.subTest(value=invalid), self.assertRaisesRegex(BenchError, "pssMedianMib"):
+                check_matched_measurement({**measurement, "steadyMetrics": {**measurement["steadyMetrics"], "pssMedianMib": invalid}})
+        with self.assertRaisesRegex(BenchError, "30-second"):
+            check_matched_measurement({**measurement, "timestamps": {"steadyDurationSec": 29.9}})
+
+    def test_matched_flow_never_visits_content_or_copy(self) -> None:
+        oracle = {"sha": "a" * 40, "path": "a.txt", "content": "source", "historyOids": ["a" * 40, "b" * 40],
+                  "changedLines": ["added"], "diffRows": [{"kind": "change-addition", "text": "added"}]}
+        d = mock.MagicMock()
+        d.until.side_effect = lambda what, fn, *args: oracle["historyOids"] if what == "commit rows" else True
+        d.js.return_value = oracle["historyOids"]
+        with mock.patch("bench_tauri_memory.wait_idle"), mock.patch("bench_tauri_memory.rendered_matched_diff", return_value=oracle["diffRows"]):
+            result = bench_tauri_memory.load_repo_preview(d, "/repo", "/shots", matched=oracle)
+        clicks = [call.args[0] for call in d.click.call_args_list]
+        self.assertIn(f'[data-testid="ref-{MATCHED_REF}"]', clicks)
+        self.assertIn(f'[data-commit="{oracle["sha"]}"] span', clicks)
+        self.assertFalse(any("content" in css or "copy" in css for css in clicks))
+        self.assertFalse(result["sourceContentMatchedGitShow"])
+
+    def test_complete_diff_rejects_missing_extra_reordered_or_changed_rows(self) -> None:
+        rows = [{"kind": "change-deletion", "text": "before"}, {"kind": "change-addition", "text": "after"}]
+        oracle = {"diffRows": rows}
+        check_matched_diff(rows, oracle)
+        for bad in (rows[:1], rows + [rows[0]], list(reversed(rows)),
+                    [rows[0], {"kind": "change-addition", "text": "wrong"}],
+                    [rows[0], {"kind": "change-addition", "text": None}]):
+            with self.subTest(rows=bad), self.assertRaisesRegex(BenchError, "diff row"):
+                check_matched_diff(bad, oracle)
+
+    def test_legacy_flow_still_verifies_content_then_diff(self) -> None:
+        oracle = {"sha": "a" * 40, "path": "a.txt", "content": "source", "changedLines": ["added"]}
+        d = mock.MagicMock()
+        d.until.side_effect = lambda what, fn, *args: [oracle["sha"]] if what == "commit rows" else True
+        with mock.patch("bench_tauri_memory.wait_idle"), mock.patch("bench_tauri_memory.commit_oracle", return_value=oracle):
+            result = bench_tauri_memory.load_repo_preview(d, "/repo", "/shots")
+        clicks = [call.args[0] for call in d.click.call_args_list]
+        self.assertIn('[data-testid="preview-content"]', clicks)
+        self.assertLess(clicks.index('[data-testid="preview-content"]'), clicks.index('[data-testid="preview-diff"]'))
+        self.assertTrue(result["sourceContentMatchedGitShow"])
+
+    def test_identity_detects_worktree_and_binary_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            repo = os.path.join(root, "repo")
+            os.mkdir(repo)
+            subprocess.run(["git", "init", "-q", repo], check=True)
+            path = os.path.join(repo, "file.txt")
+            with open(path, "w") as f:
+                f.write("before")
+            subprocess.run(["git", "-C", repo, "add", "."], check=True)
+            subprocess.run(["git", "-C", repo, "-c", "user.name=T", "-c", "user.email=t@x", "commit", "-qm", "init"], check=True)
+            manifest = os.path.join(root, "workload_manifest.json")
+            with open(manifest, "w") as f:
+                json.dump({"preset": "standard", "repos": [{"name": "repo"}]}, f)
+            binary = os.path.join(root, "binary")
+            with open(binary, "w") as f:
+                f.write("binary")
+            before = matched_identity(binary, repo)
+            self.assertEqual(before, matched_identity(binary, repo))
+            with open(path, "w") as f:
+                f.write("after")
+            self.assertNotEqual(before["repoSha256"], matched_identity(binary, repo)["repoSha256"])
+            with open(binary, "a") as f:
+                f.write("changed")
+            self.assertNotEqual(before["binarySha256"], matched_identity(binary, repo)["binarySha256"])
 
 
 class TestAttachGuards(unittest.TestCase):

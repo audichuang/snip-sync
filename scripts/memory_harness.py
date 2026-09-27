@@ -157,40 +157,61 @@ class ProcessTreeSampler:
         except Exception:
             self.page_size = 4096
 
-    def get_tree_pids(self) -> tuple[list[int], list[int]]:
+    def get_tree_pids(self, strict_children: bool = False) -> tuple[list[int], list[int]]:
         """
         Discovers all live PIDs in the process tree.
         Returns: (live_pids, unreadable_or_missing_child_pids)
+
+        strict_children records a missing or unreadable task/children file instead of
+        treating that process as childless. The legacy default keeps the historical swallow.
         """
         pids: list[int] = [self.root_pid]
         visited: set[int] = {self.root_pid}
         queue: list[int] = [self.root_pid]
         unreadable_children: list[int] = []
 
+        def note(pid: int) -> None:
+            if pid not in unreadable_children:
+                unreadable_children.append(pid)
+
         # 1. Breadth-first traversal through /proc/<pid>/task/<tid>/children
         while queue:
             curr = queue.pop(0)
             task_dir = os.path.join(self.proc_root, str(curr), "task")
             try:
-                if os.path.isdir(task_dir):
-                    tids = os.listdir(task_dir)
-                    for tid in tids:
-                        children_path = os.path.join(task_dir, tid, "children")
-                        try:
-                            with open(children_path, "r") as f:
-                                for child_str in f.read().split():
-                                    c_pid = int(child_str)
-                                    if c_pid not in visited:
-                                        visited.add(c_pid)
-                                        if os.path.exists(os.path.join(self.proc_root, str(c_pid))):
-                                            queue.append(c_pid)
-                                            pids.append(c_pid)
-                                        else:
-                                            unreadable_children.append(c_pid)
-                        except (FileNotFoundError, ProcessLookupError, PermissionError):
-                            pass
+                if not os.path.isdir(task_dir):
+                    if strict_children:
+                        note(curr)
+                    continue
+                tids = os.listdir(task_dir)
+                if strict_children and not tids:
+                    note(curr)
+                for tid in tids:
+                    children_path = os.path.join(task_dir, tid, "children")
+                    if strict_children and not os.path.isfile(children_path):
+                        if os.path.exists(os.path.join(task_dir, tid)):
+                            note(curr)
+                        continue
+                    try:
+                        with open(children_path, "r") as f:
+                            for child_str in f.read().split():
+                                c_pid = int(child_str)
+                                if c_pid not in visited:
+                                    visited.add(c_pid)
+                                    if os.path.exists(os.path.join(self.proc_root, str(c_pid))):
+                                        queue.append(c_pid)
+                                        pids.append(c_pid)
+                                    else:
+                                        note(c_pid)
+                    except (FileNotFoundError, ProcessLookupError):
+                        if strict_children and os.path.exists(os.path.join(task_dir, tid)):
+                            note(curr)
+                    except PermissionError:
+                        if strict_children:
+                            note(curr)
             except (FileNotFoundError, ProcessLookupError, PermissionError):
-                pass
+                if strict_children:
+                    note(curr)
 
         # 2. Safety scan for any other processes belonging to the same process group
         if self.pgrp is not None:
@@ -334,6 +355,293 @@ class ProcessTreeSampler:
         return (None, "none")
 
 
+# Controller and Xvfb are not the app. Their /proc RSS/PSS must not enter the app total.
+CONTROLLER_PROCESS_NAMES = frozenset({"Xvfb", "Xvfb-run", "dbus-run-session", "dbus-daemon"})
+GPU_NOT_MEASURED = (
+    "Linux /proc RSS/PSS do not include GPU VRAM, DMA-BUF, or X11/Wayland compositor surfaces. "
+    "This sampler does not estimate them and never adds them to RSS or PSS."
+)
+
+
+def read_proc_comm(pid: int, proc_root: str = "/proc") -> str | None:
+    try:
+        with open(os.path.join(proc_root, str(pid), "comm"), "r") as f:
+            return f.read().strip()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def count_open_fds(pid: int, proc_root: str = "/proc") -> int | None:
+    """Number of entries in /proc/<pid>/fd. None if the directory cannot be read."""
+    fd_dir = os.path.join(proc_root, str(pid), "fd")
+    try:
+        return len(os.listdir(fd_dir))
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+
+
+def count_inotify_watches(pid: int, proc_root: str = "/proc") -> int | None:
+    """Inotify watches from /proc/<pid>/fdinfo. None if fd or fdinfo cannot be read.
+
+    A readable tree with no `inotify ` lines is 0. An unreadable fdinfo is not reported as 0.
+    """
+    fd_dir = os.path.join(proc_root, str(pid), "fd")
+    try:
+        fds = [name for name in os.listdir(fd_dir) if name.isdigit()]
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    total = 0
+    for fd in fds:
+        info_path = os.path.join(proc_root, str(pid), "fdinfo", fd)
+        try:
+            with open(info_path, "r") as handle:
+                text = handle.read()
+        except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+            return None
+        total += sum(1 for line in text.splitlines() if line.startswith("inotify "))
+    return total
+
+
+def count_threads(pid: int, proc_root: str = "/proc") -> int | None:
+    """Kernel thread count from /proc/<pid>/status, else the task directory. None if unread."""
+    status_path = os.path.join(proc_root, str(pid), "status")
+    try:
+        with open(status_path, "r") as f:
+            for line in f:
+                if line.startswith("Threads:"):
+                    return int(line.split()[1])
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError, IndexError, ValueError):
+        pass
+    task_dir = os.path.join(proc_root, str(pid), "task")
+    try:
+        names = [name for name in os.listdir(task_dir) if name.isdigit()]
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    return len(names) if names else None
+
+
+def _controller_reason(ident: dict[str, Any], exclude_pids: set[int]) -> str | None:
+    if ident.get("pid") in exclude_pids:
+        return "exclude-pid"
+    comm = ident.get("comm") or ""
+    exe = ident.get("exe") or ""
+    base = os.path.basename(exe) if exe else ""
+    if comm in CONTROLLER_PROCESS_NAMES or base in CONTROLLER_PROCESS_NAMES:
+        return "controller-or-xvfb"
+    return None
+
+
+def _is_git_process(ident: dict[str, Any]) -> bool:
+    comm = ident.get("comm") or ""
+    exe = ident.get("exe") or ""
+    base = os.path.basename(exe) if exe else ""
+    return comm == "git" or comm.startswith("git-") or base == "git"
+
+
+def _finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def sample_app_resources(
+    root_pid: int,
+    *,
+    expected_exe: str,
+    expected_starttime: int,
+    exclude_pids: set[int] | None = None,
+    proc_root: str = "/proc",
+) -> dict[str, Any]:
+    """One app-tree RSS/PSS/fd/thread sample rooted at an exact (exe, starttime).
+
+    Controller and Xvfb processes are listed under `excluded` and are not summed.
+    GPU memory is not estimated. A missing RSS or PSS stays null; it is never replaced with 0.
+    """
+    excluded_ids = set(exclude_pids or ())
+    gpu = {
+        "vramBytes": None,
+        "sharedEstimateBytes": None,
+        "combinedIntoRss": False,
+        "reason": GPU_NOT_MEASURED,
+    }
+    root = read_process_identity(root_pid, proc_root)
+    if root is None:
+        return {
+            "valid": False,
+            "resourcesComplete": False,
+            "memoryComplete": False,
+            "rootIdentityMatches": False,
+            "reasons": ["root process is not alive"],
+            "root": None,
+            "included": [],
+            "excluded": [],
+            "unreadablePids": [root_pid],
+            "totals": {
+                "rssBytes": None,
+                "pssBytes": None,
+                "fdCount": None,
+                "threadCount": None,
+                "watchCount": None,
+                "processCount": 0,
+                "gitChildren": 0,
+            },
+            "activity": "unreadable",
+            "gpu": gpu,
+        }
+    root["comm"] = read_proc_comm(root_pid, proc_root)
+    try:
+        expected_real = os.path.realpath(expected_exe)
+    except OSError:
+        expected_real = expected_exe
+    identity_ok = root.get("exe") == expected_real and root.get("starttime") == expected_starttime
+    reasons: list[str] = []
+    root_link = read_exe_link(root_pid, proc_root)
+    if isinstance(root_link, str) and root_link.endswith(" (deleted)"):
+        identity_ok = False
+        reasons.append("root executable deleted during sample")
+    elif not identity_ok:
+        reasons.append("root identity mismatch")
+    if _controller_reason(root, excluded_ids):
+        reasons.append("root is controller or Xvfb")
+
+    sampler = ProcessTreeSampler(root_pid, None, proc_root)
+    pids, unreadable = sampler.get_tree_pids(strict_children=True)
+    included: list[dict[str, Any]] = []
+    excluded_rows: list[dict[str, Any]] = []
+    incomplete = False
+    if unreadable:
+        incomplete = True
+        reasons.append("unreadable process-tree evidence")
+    for pid in pids:
+        ident = read_process_identity(pid, proc_root)
+        if ident is None:
+            unreadable.append(pid)
+            incomplete = True
+            continue
+        ident["comm"] = read_proc_comm(pid, proc_root)
+        rss, pss, rss_prov, pss_prov = sampler.sample_process_memory(pid)
+        fd_count = count_open_fds(pid, proc_root)
+        thread_count = count_threads(pid, proc_root)
+        watches = count_inotify_watches(pid, proc_root)
+        after = read_process_identity(pid, proc_root)
+        link = read_exe_link(pid, proc_root)
+        deleted = isinstance(link, str) and link.endswith(" (deleted)")
+        if (
+            after is None
+            or link is None
+            or deleted
+            or after.get("starttime") != ident.get("starttime")
+            or after.get("exe") != ident.get("exe")
+        ):
+            unreadable.append(pid)
+            incomplete = True
+            reasons.append("executable deleted during sample" if deleted else "pid identity changed during sample")
+            continue
+        row: dict[str, Any] = {
+            **after,
+            "comm": ident["comm"],
+            "rssBytes": rss,
+            "pssBytes": pss,
+            "fdCount": fd_count,
+            "threadCount": thread_count,
+            "watchCount": watches,
+            "rssProvenance": rss_prov,
+            "pssProvenance": pss_prov,
+        }
+        why = _controller_reason(ident, excluded_ids)
+        if why:
+            row["excludeReason"] = why
+            excluded_rows.append(row)
+            continue
+        if not (isinstance(rss, int) and not isinstance(rss, bool) and rss > 0):
+            incomplete = True
+        if pss is None or not _finite_number(pss) or pss < 0:
+            incomplete = True
+        if row["fdCount"] is None or row["threadCount"] is None or watches is None:
+            incomplete = True
+        elif row["threadCount"] < 1 or row["fdCount"] < 0 or watches < 0:
+            incomplete = True
+        included.append(row)
+    end_root = read_process_identity(root_pid, proc_root)
+    end_link = read_exe_link(root_pid, proc_root)
+    end_deleted = isinstance(end_link, str) and end_link.endswith(" (deleted)")
+    if (
+        end_root is None
+        or end_link is None
+        or end_deleted
+        or end_root.get("starttime") != root.get("starttime")
+        or end_root.get("exe") != root.get("exe")
+        or end_root.get("pid") != root_pid
+    ):
+        incomplete = True
+        reasons.append("root executable deleted during sample" if end_deleted else "root identity changed during sample")
+
+    def _sum(key: str) -> int | None:
+        values = [row[key] for row in included]
+        if not values or any(not _finite_number(value) or value < 0 for value in values):
+            return None
+        return int(sum(values))
+
+    enumeration_failed = bool(unreadable) or any(
+        "unreadable" in reason or "changed during sample" in reason or "deleted" in reason for reason in reasons
+    )
+    git_children = None if enumeration_failed else sum(1 for row in included if row["pid"] != root_pid and _is_git_process(row))
+    if git_children is None:
+        activity = "unreadable"
+    elif git_children:
+        activity = "busy"
+    else:
+        activity = "quiescent"
+    provenance_rows = included
+    rss_provenance = provenance_rows[0].get("rssProvenance") if len({row.get("rssProvenance") for row in provenance_rows}) == 1 else None
+    pss_provenance = provenance_rows[0].get("pssProvenance") if len({row.get("pssProvenance") for row in provenance_rows}) == 1 else None
+    rss_total = _sum("rssBytes")
+    pss_total = _sum("pssBytes")
+    fd_total = _sum("fdCount")
+    thread_total = _sum("threadCount")
+    watch_values = [row.get("watchCount") for row in included]
+    watch_total = int(sum(watch_values)) if watch_values and all(_finite_number(value) and value >= 0 for value in watch_values) else None
+    memory_complete = (
+        not incomplete
+        and not reasons
+        and rss_total is not None
+        and rss_total > 0
+        and pss_total is not None
+        and pss_total > 0
+        and bool(included)
+    )
+    resources_complete = (
+        memory_complete
+        and fd_total is not None
+        and thread_total is not None
+        and thread_total >= 1
+        and watch_total is not None
+        and git_children is not None
+    )
+    return {
+        "valid": resources_complete,
+        "resourcesComplete": resources_complete,
+        "memoryComplete": memory_complete,
+        "rootIdentityMatches": identity_ok,
+        "reasons": reasons,
+        "root": {"pid": root["pid"], "starttime": root["starttime"], "exe": root.get("exe"), "comm": root.get("comm")},
+        "included": included,
+        "excluded": excluded_rows,
+        "unreadablePids": unreadable,
+        "totals": {
+            "rssBytes": rss_total if memory_complete else None,
+            "pssBytes": pss_total if memory_complete else None,
+            "fdCount": fd_total if resources_complete else None,
+            "threadCount": thread_total if resources_complete else None,
+            "watchCount": watch_total if resources_complete else None,
+            "processCount": len(included),
+            "gitChildren": git_children,
+        },
+        "activity": activity,
+        "rssProvenance": rss_provenance,
+        "pssProvenance": pss_provenance,
+        "gpu": gpu,
+    }
+
+
 def cleanup_process_group(pgrp: int, proc: subprocess.Popen | None = None) -> None:
     """
     Strictly terminates all processes in the process group via SIGTERM followed by SIGKILL.
@@ -447,6 +755,14 @@ def get_proc_exe(pid: int, proc_root: str = "/proc") -> str | None:
         if target.endswith(" (deleted)"):
             target = target[:-10]
         return os.path.realpath(target)
+    except OSError:
+        return None
+
+
+def read_exe_link(pid: int, proc_root: str = "/proc") -> str | None:
+    """Raw /proc/<pid>/exe link, including a trailing ' (deleted)' marker."""
+    try:
+        return os.readlink(os.path.join(proc_root, str(pid), "exe"))
     except OSError:
         return None
 

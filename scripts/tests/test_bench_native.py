@@ -40,12 +40,14 @@ if SCRIPTS_DIR not in sys.path:
 
 from bench_native_memory import (  # noqa: E402
     APPLICATION_HISTORY_PAGE_LENGTH,
+    DEFAULT_PROFILES,
     NativeBenchError,
     NativeSession,
     assert_basket_empty,
     assert_copied_payload,
     assert_current_basket_empty,
     check_repo_state,
+    check_native_matched,
     click_repo,
     choose_copy_target,
     copy_explicit_selection,
@@ -62,13 +64,14 @@ from bench_native_memory import (  # noqa: E402
     repo_oracle,
     require_control,
     run_profile,
+    select_native_matched,
     scroll_into_view,
     source_file_bytes,
     source_rows,
     visible_in,
     write_preexec_launcher,
 )
-from bench_tauri_memory import load_build_receipt  # noqa: E402
+from bench_tauri_memory import BenchError, MATCHED_REF, MATCHED_SENTINEL, load_build_receipt  # noqa: E402
 from memory_harness import measure_single_profile  # noqa: E402
 
 
@@ -842,6 +845,72 @@ class TestDriverEndToEndRegression(unittest.TestCase):
                 # 3. Teardown must be cleanly invoked
                 mock_session.stop.assert_called_once()
                 self.assertEqual(res["cleanupProblems"], [])
+
+
+class TestMatchedNative(unittest.TestCase):
+    def setUp(self) -> None:
+        self.oracle = {"sha": "a" * 40, "path": "a.txt", "historyOids": ["a" * 40, "b" * 40],
+                       "patch": "hello", "patchSha256": hashlib.sha256(b"hello").hexdigest()}
+        self.window = {"width": 1080, "height": 720}
+        self.lines = ["[APP:LOCALE: En]", f"[APP:REF_FILTER: {MATCHED_REF}]", "[APP:GRAPH_LOADED: commits=2]",
+                      "[APP:E2E_LOG: mode=graph n=2 first=aaaaaaa page=1]",
+                      "[APP:CTRL_BOUNDS: id=commit-row:aaaaaaa x=10 y=600 w=600 h=20]",
+                      "[APP:CTRL_BOUNDS: id=commit-row:bbbbbbb x=10 y=620 w=600 h=20]",
+                      f"[APP:E2E_PREVIEW: source=commit_diff rev={'a' * 40} path=a.txt lines=1 fnv=a430d84680aabd0b]"]
+
+    def test_matches_retained_patch_and_displayed_history(self) -> None:
+        observed = check_native_matched(self.lines, self.window, self.oracle, MATCHED_SENTINEL)
+        self.assertTrue(observed["retainedPatchMatchedGit"])
+        self.assertEqual(observed["displayedHistoryShortOids"], ["aaaaaaa", "bbbbbbb"])
+
+    def test_rejects_oid_path_count_order_patch_basket_and_copy_mismatch(self) -> None:
+        for old, new in (("rev=" + "a" * 40, "rev=" + "b" * 40), ("path=a.txt", "path=other.txt"),
+                         ("commits=2", "commits=50"), ("y=600", "y=640"),
+                         ("lines=1", "lines=2"), ("fnv=a430d84680aabd0b", "fnv=0"),
+                         ("source=commit_diff", "source=working_changes"), ("mode=graph", "mode=search"),
+                         ("LOCALE: En", "LOCALE: ZhTw")):
+            with self.subTest(change=new), self.assertRaises((NativeBenchError, BenchError)):
+                check_native_matched([line.replace(old, new) for line in self.lines], self.window, self.oracle, MATCHED_SENTINEL)
+        for extra in ("[APP:BASKET: n=1 summary=repo staged a.txt]", "[APP:COPY_DONE: copied=1]"):
+            with self.subTest(extra=extra), self.assertRaises(NativeBenchError):
+                check_native_matched(self.lines + [extra], self.window, self.oracle, MATCHED_SENTINEL)
+
+    def test_rejects_geometry_and_clipboard_mismatch(self) -> None:
+        with self.assertRaisesRegex(BenchError, "width"):
+            check_native_matched(self.lines, {**self.window, "width": 1000}, self.oracle, MATCHED_SENTINEL)
+        with self.assertRaisesRegex(BenchError, "clipboard"):
+            check_native_matched(self.lines, self.window, self.oracle, b"changed")
+
+    def test_new_profile_is_opt_in_and_short_run_fails_before_launch(self) -> None:
+        from unittest.mock import patch
+        self.assertEqual(DEFAULT_PROFILES, ("idle", "1repo", "15overview", "15active", "soak"))
+        with tempfile.TemporaryDirectory() as root, patch("bench_native_memory.NativeSession") as session:
+            result = run_profile("1repo-diff", "/bin/true", root, root, root, 29.9, 0.05, 100)
+        session.assert_not_called()
+        self.assertEqual(result["status"], "FAILED")
+        self.assertIn("at least 30", result["error"])
+
+    def test_ref_picker_types_short_label_and_ignores_retired_bounds(self) -> None:
+        from unittest.mock import MagicMock
+        session = MagicMock()
+        lines = ["[APP:CTRL_BOUNDS: id=btn-locale x=1000 y=10 w=40 h=20]",
+                 "[APP:CTRL_BOUNDS: id=btn-ref-selector x=10 y=10 w=100 h=20]",
+                 "[APP:CTRL_BOUNDS: id=selector-input x=10 y=40 w=100 h=20]",
+                 f"[APP:CTRL_BOUNDS: id=pick-ref:{MATCHED_REF} x=10 y=80 w=100 h=20]",
+                 f"[APP:CTRL_GONE: id=pick-ref:{MATCHED_REF}]"]
+        session.texts.side_effect = lambda: lines
+        session.lines = lines
+        def typed(*args: str) -> None:
+            self.assertEqual(args, ("xdotool", "type", "--clearmodifiers", "feat/divergent"))
+            lines.extend([f"[APP:CTRL_BOUNDS: id=pick-ref:{MATCHED_REF} x=10 y=100 w=100 h=20]",
+                          "[APP:CTRL_BOUNDS: id=commit-row:aaaaaaa x=10 y=600 w=600 h=20]",
+                          "[APP:CTRL_BOUNDS: id=commit-file:a.txt x=10 y=200 w=100 h=20]"])
+        session.x.side_effect = typed
+        select_native_matched(session, {**self.window, "wid": "1"}, self.oracle)
+        session.set_clipboard.assert_called_once_with(MATCHED_SENTINEL)
+        self.assertEqual(session.click.call_args_list[0].args[1], (1000, 10, 40, 20))
+        self.assertIn((10, 100, 100, 20), [call.args[1] for call in session.click.call_args_list])
+        self.assertNotIn((10, 80, 100, 20), [call.args[1] for call in session.click.call_args_list])
 
 
 class TestReceiptAndCompareFlag(unittest.TestCase):

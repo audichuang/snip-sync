@@ -47,7 +47,13 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from bench_tauri_memory import (  # noqa: E402
+    MATCHED_REF,
+    MATCHED_SCENARIO,
+    MATCHED_SENTINEL,
+    MATCHED_SIZE,
     changed_lines,
+    check_matched_measurement,
+    check_matched_state,
     descendants,
     finalize_run,
     find_owned_app_pid,
@@ -57,6 +63,8 @@ from bench_tauri_memory import (  # noqa: E402
     load_build_receipt,
     loaded_graphics_libs,
     mib,
+    matched_identity,
+    matched_oracle,
     process_age_sec,
     reap_owned,
     run_text,
@@ -99,7 +107,8 @@ os.execv(bin_path, [bin_path] + app_args)
 def write_preexec_launcher(path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write(PREEXEC_LAUNCHER)
-PROFILES = ("idle", "1repo", "15overview", "15active", "soak")
+PROFILES = ("idle", "1repo", "1repo-diff", "15overview", "15active", "soak")
+DEFAULT_PROFILES = tuple(profile for profile in PROFILES if profile != "1repo-diff")
 # Built into WorkbenchModel::new of the D3 workbench (mov immediate 0x32). Not a CLI flag.
 APPLICATION_HISTORY_PAGE_LENGTH = 50
 DELETED_FILE_MARKER = b"// This file has been deleted in this change"
@@ -1236,6 +1245,94 @@ def image_stats(s: NativeSession, png: str) -> dict[str, Any]:
 # ---------------------------------------------------------------- profiles
 
 
+def check_native_matched(lines: list[str], win: dict[str, Any], oracle: dict[str, Any],
+                         clipboard: bytes) -> dict[str, Any]:
+    """Actual live row bounds give display order; full preview OID and hash bind the diff."""
+    refs = [line for line in lines if "[APP:REF_FILTER: " in line]
+    locales = [line for line in lines if "[APP:LOCALE: " in line]
+    if not locales or locales[-1] != "[APP:LOCALE: En]":
+        raise NativeBenchError("matched native locale must be observed English")
+    graphs = [line for line in lines if "[APP:GRAPH_LOADED: " in line]
+    logs = [line for line in lines if "[APP:E2E_LOG: " in line]
+    if not graphs or graphs[-1] != "[APP:GRAPH_LOADED: commits=2]":
+        raise NativeBenchError("matched graph must report exactly two commits")
+    expected_log = f"[APP:E2E_LOG: mode=graph n=2 first={oracle['sha'][:7]} page=1]"
+    if not logs or logs[-1] != expected_log:
+        raise NativeBenchError(f"matched history log mismatch: {logs[-1:]}")
+    rows = sorted(((key.removeprefix("commit-row:"), box) for key, box in parse_bounds(lines).items()
+                   if key.startswith("commit-row:")), key=lambda item: item[1][1])
+    short_oids = [oid[:7] for oid in oracle["historyOids"]]
+    if len(set(short_oids)) != 2 or [short for short, _ in rows] != short_oids:
+        raise NativeBenchError(f"matched visible history OID order differs: {[short for short, _ in rows]}")
+    for short, box in rows:
+        assert_on_window(box, win, f"commit-row:{short}")
+    previews = [line for line in lines if "[APP:E2E_PREVIEW: " in line]
+    preview = re.fullmatch(r"\[APP:E2E_PREVIEW: source=(\S+) rev=(\S+) path=(.+) lines=(\d+) fnv=([0-9a-f]+)\]",
+                           previews[-1] if previews else "")
+    if preview is None:
+        raise NativeBenchError("missing matched E2E_PREVIEW")
+    fingerprint = 0xcbf29ce484222325
+    for byte in oracle["patch"].encode():
+        fingerprint = ((fingerprint ^ byte) * 0x100000001b3) & ((1 << 64) - 1)
+    if preview[1] != "commit_diff" or int(preview[4]) != len(oracle["patch"].splitlines()) or int(preview[5], 16) != fingerprint:
+        raise NativeBenchError("matched retained diff source/line count/fingerprint differs from Git patch")
+    if any("COPY_DONE:" in line or "SELECTION_COPIED:" in line for line in lines):
+        raise NativeBenchError("matched profile unexpectedly copied content")
+    basket = assert_basket_empty(lines, "matched diff")
+    observed = {"ref": refs[-1].removeprefix("[APP:REF_FILTER: ").removesuffix("]") if refs else None,
+                "historyOids": oracle["historyOids"], "displayedHistoryShortOids": [short for short, _ in rows],
+                "historyEvidence": "two unique Git short OIDs, in live row y-order; full OID on E2E_PREVIEW",
+                "sha": preview[2], "path": preview[3], "previewMode": "diff", "width": win["width"],
+                "observedLocale": "en",
+                "height": win["height"], "basketEmpty": basket["empty"], "basket": basket,
+                "clipboardSha256": hashlib.sha256(clipboard).hexdigest(),
+                "retainedPatchMatchedGit": True, "patchSha256": oracle["patchSha256"]}
+    check_matched_state(observed, oracle)
+    return observed
+
+
+def select_native_matched(s: NativeSession, win: dict[str, Any], oracle: dict[str, Any]) -> None:
+    def click(control: str) -> None:
+        deadline = time.monotonic() + 20
+        previous = None
+        stable_at = time.monotonic()
+        while time.monotonic() < deadline:
+            bounds = parse_bounds(s.texts()).get(control)
+            if bounds != previous:
+                previous, stable_at = bounds, time.monotonic()
+            if bounds and time.monotonic() - stable_at >= 0.2:
+                assert_on_window(bounds, win, control)
+                s.click(win, bounds)
+                return
+            time.sleep(0.04)
+        raise NativeBenchError(f"matched control {control} has no stable live bounds")
+
+    if (win["width"], win["height"]) != MATCHED_SIZE:
+        raise NativeBenchError(f"matched client geometry is {win['width']}x{win['height']}, expected {MATCHED_SIZE}")
+    s.set_clipboard(MATCHED_SENTINEL)
+    start = len(s.lines)
+    # The frozen native app starts in zh-Hant; use its real toggle to match Tauri's English UI.
+    click("btn-locale")
+    s.wait_line(lambda line: line == "[APP:LOCALE: En]", start=start)
+    ref_control = f"ref:{MATCHED_REF}"
+    bounds = parse_bounds(s.texts()).get(ref_control)
+    if bounds and visible_in(bounds, (0, 0, win["width"], win["height"])) == 0:
+        click(ref_control)
+    else:
+        click("btn-ref-selector")
+        click("selector-input")
+        s.key(win["wid"], "ctrl+a")
+        s.x("xdotool", "type", "--clearmodifiers", MATCHED_REF.removeprefix("refs/heads/"))
+        click(f"pick-ref:{MATCHED_REF}")
+    s.wait_line(lambda line: line == f"[APP:REF_FILTER: {MATCHED_REF}]", start=start)
+    s.wait_line(lambda line: line == "[APP:GRAPH_LOADED: commits=2]", start=start)
+    s.wait_line(lambda line: line == f"[APP:E2E_LOG: mode=graph n=2 first={oracle['sha'][:7]} page=1]", start=start)
+    click(f"commit-row:{oracle['sha'][:7]}")
+    s.wait_line(lambda line: "[APP:E2E_PREVIEW: source=commit_diff " in line and f"rev={oracle['sha']} " in line, start=start)
+    click(f"commit-file:{oracle['path']}")
+    s.wait_line(lambda line: "[APP:E2E_PREVIEW: source=commit_diff " in line and f"rev={oracle['sha']} path={oracle['path']} " in line, start=start)
+
+
 def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: float, interval: float,
           soak_switches: int, result: dict[str, Any], build_profile: str = "unknown") -> None:
     ready_file = os.path.join(run_dir, f"ready-{uuid.uuid4().hex}.signal")
@@ -1301,7 +1398,28 @@ def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: 
         # The header clips a long workspace leaf; the must-token is the painted prefix.
         must = [painted_title_token(os.path.basename(workspace.rstrip("/")))]
         any_of: dict[str, list[str]] = {}
-        if selected_repo:
+        if profile == "1repo-diff":
+            if selected_repo is None or len(repos) != 1:
+                raise NativeBenchError("1repo-diff requires exactly one selected repository")
+            oracle = matched_oracle(selected_repo)
+            select_native_matched(s, win, oracle)
+            # Wait for the two-row layout to retire the old page's probes.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                live = parse_bounds(s.texts())
+                if len([key for key in live if key.startswith("commit-row:")]) == 2:
+                    break
+                time.sleep(0.05)
+            state["matched"] = check_native_matched(s.texts(), s.window(), oracle, s.read_clipboard())
+            state["startupSelected"] = state.pop("selected")
+            state["oracle"] = {key: value for key, value in oracle.items() if key not in ("content", "patch")}
+            state["copyPerformed"] = False
+            state["priorActions"] = ["startup auto-load and working preview", "toggle locale to English", "select ref", "select tip", "select file", "diff"]
+            state["sourceContentMatchedGitShow"] = False
+            must.extend([os.path.basename(selected_repo), oracle["path"], "Basket is empty"])
+            any_of["history"] = [oid[:7] for oid in oracle["historyOids"]]
+            any_of["preview"] = oracle["changedLines"]
+        elif selected_repo:
             oracle = repo_oracle(selected_repo)
             if not oracle["sourceRows"]:
                 raise NativeBenchError(f"{oracle['name']} has no source rows to copy")
@@ -1341,9 +1459,13 @@ def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: 
         if code != 0:
             raise NativeBenchError(f"memory_harness exited {code}; see {run_dir}/harness.log")
         s.assert_app_alive()
+        if profile == "1repo-diff":
+            state["matchedAtEnd"] = check_native_matched(s.texts(), s.window(), oracle, s.read_clipboard())
         result["steadyCpuPercent"] = round(100 * (ticks1 - ticks0) / os.sysconf("SC_CLK_TCK") / (t1 - t0), 2)
         with open(os.path.join(run_dir, "benchmark_report.json")) as f:
             result["measurement"] = json.load(f)["results"][0]
+        if profile == "1repo-diff":
+            check_matched_measurement(result["measurement"])
         app = s.app
         assert app is not None
         result["processAgeAtSamplerStartSec"] = round(
@@ -1574,6 +1696,7 @@ PROFILE_SETUP = {
     # Bounds exist only when SNIP_NATIVE_E2E=1, so every profile that clicks a control opts in.
     "idle": ("empty", "idle", False),
     "1repo": ("repo", "normal", True),
+    "1repo-diff": ("repo", "normal", True),
     "15overview": ("dataset", "overview", True),
     "15active": ("dataset", "normal", True),
     "soak": ("dataset", "normal", True),
@@ -1594,10 +1717,19 @@ def run_profile(profile: str, bin_path: str, dataset: str, repo: str, run_dir: s
     error = None
     s: NativeSession | None = None
     try:
+        if profile == "1repo-diff":
+            if steady < 30:
+                raise NativeBenchError("1repo-diff requires at least 30 steady seconds")
+            result["scenario"] = MATCHED_SCENARIO
+            result["identityBefore"] = matched_identity(bin_path, repo)
         s = NativeSession(bin_path, workspace, mode, run_dir, e2e)
         result["command"] = s.cmd
         result["isolation"] = s.isolation
         drive(s, profile, workspace, run_dir, steady, interval, soak_switches, result, build_profile=build_profile)
+        if profile == "1repo-diff":
+            result["identityAfter"] = matched_identity(bin_path, repo)
+            if result["identityAfter"] != result["identityBefore"]:
+                raise NativeBenchError("binary or participating dataset changed during the matched run")
     except Exception as e:  # noqa: BLE001 - recorded; the run fails after teardown
         error = f"{type(e).__name__}: {e}"
     finally:
@@ -1652,7 +1784,8 @@ def markdown(report: dict[str, Any]) -> str:
         "- **Release comparison**: this driver does not emit one. `--compare-baseline` exits UNSUPPORTED. The supervisor compares matched run artifacts.",
         "- **Cache**: process-cold (fresh process, private XDG and D-Bus). Filesystem cache is uncontrolled. Filesystem-cold is UNSUPPORTED. This driver does not drop caches.",
         "- **15overview Semantics**: In current prototype, repository 0 is automatically selected upon launch, loading its graph and preview into memory. 15overview reflects 15 discovered repos + 1 loaded active repo; it does not certify summary-only overview memory until app mode defers graph/preview retention. Auto-preview does not fill the basket.",
-        "- **Explicit copy**: one source-aware checkbox, then `btn-copy`. Staged bytes are the index. Unstaged and untracked bytes are the worktree. `files=` is source rows, not distinct paths. A non-empty basket before that click fails the run.",
+        "- **1repo-diff**: selected two-commit feature branch on the standard repository; 1080x720 client, fixed tip/file diff, empty basket, unchanged clipboard, no Copy. This optional scenario does not match the default 50/300-row histories or 15 repositories.",
+        "- **Explicit copy (other repository profiles)**: one source-aware checkbox, then `btn-copy`. Staged bytes are the index. Unstaged and untracked bytes are the worktree. `files=` is source rows, not distinct paths. A non-empty basket before that click fails the run.",
         "- **History page**: the application built-in length is "
         f"{APPLICATION_HISTORY_PAGE_LENGTH}. There is no history-page CLI. Observed row counts stay on each run.",
         "- **Steady CPU %**: Reflects Mesa lavapipe (llvmpipe) software rasterization overhead on CPU under headless Xvfb.",
@@ -1696,7 +1829,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", required=True, help="Standard dataset dir with workload_manifest.json.")
     ap.add_argument("--repo", default="repo-01-core")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--profile", action="append", choices=PROFILES, help="Repeatable; default all.")
+    ap.add_argument("--profile", action="append", choices=PROFILES, help="Repeatable; default legacy profiles (1repo-diff is opt-in).")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--steady-seconds", type=float, default=30.0)
     ap.add_argument("--sample-interval", type=float, default=0.05)
@@ -1762,7 +1895,7 @@ def main(argv: list[str] | None = None) -> int:
         "profiles": {},
     }
     failed = False
-    for profile in args.profile or list(PROFILES):
+    for profile in args.profile or list(DEFAULT_PROFILES):
         runs = []
         for i in range(1, args.runs + 1):
             run_dir = os.path.join(out_dir, profile, f"run-{i:02d}")
