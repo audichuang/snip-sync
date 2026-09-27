@@ -797,6 +797,7 @@ impl WorkbenchModel {
 		});
 		let selector_input = cx.new(|cx| {
 			TextInput::new(i18n::t("selector_filter_placeholder", loc), 0, cx)
+				.borderless()
 		});
 		cx.subscribe(&find_input, |this, input, ev: &InputEvent, cx| {
 			let q = input.read(cx).text().to_string();

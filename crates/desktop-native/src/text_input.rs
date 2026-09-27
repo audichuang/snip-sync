@@ -104,6 +104,8 @@ pub struct TextInput {
 	/// Extra publishes after the caret moves. XIM may not be connected on the
 	/// first frame, and `invalidate_character_coordinates` runs on a later frame.
 	ime_anchor_retries: u8,
+	/// Popup search field: no box of its own (IntelliJ popups).
+	borderless: bool,
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -128,7 +130,15 @@ impl TextInput {
 			is_selecting: false,
 			last_ime_anchor: None,
 			ime_anchor_retries: 0,
+			borderless: false,
 		}
+	}
+
+	/// Drops the field border and background, for a search field that sits
+	/// inside a popup which already frames it.
+	pub fn borderless(mut self) -> Self {
+		self.borderless = true;
+		self
 	}
 
 	#[cfg(test)]
@@ -148,6 +158,7 @@ impl TextInput {
 			is_selecting: false,
 			last_ime_anchor: None,
 			ime_anchor_retries: 0,
+			borderless: false,
 		}
 	}
 
@@ -949,6 +960,8 @@ impl Render for TextInput {
 		let at_capacity = self.is_at_capacity();
 		let border_color = if at_capacity {
 			rgb(pal().warning)
+		} else if self.borderless {
+			rgb(pal().popup_bg)
 		} else if focused {
 			rgb(pal().accent)
 		} else {
@@ -998,7 +1011,7 @@ impl Render for TextInput {
 			.rounded(px(3.))
 			.border_1()
 			.border_color(border_color)
-			.bg(rgb(pal().editor_bg))
+			.when(!self.borderless, |d| d.bg(rgb(pal().editor_bg)))
 			.text_size(px(SMALL_TEXT))
 			.line_height(px(16.))
 			.overflow_hidden()

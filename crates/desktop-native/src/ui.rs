@@ -1482,6 +1482,7 @@ impl WorkbenchModel {
 			.map(|d| match map(d) {
 				Err(g) => div()
 					.id(SharedString::from(format!("selector-group:{g}")))
+					.w_full()
 					.flex()
 					.items_center()
 					.h(px(24.))
@@ -1523,6 +1524,7 @@ impl WorkbenchModel {
 					div()
 						.id(SharedString::from(it.id.clone()))
 						.relative()
+						.w_full()
 						.flex()
 						.items_center()
 						.gap(px(6.))
