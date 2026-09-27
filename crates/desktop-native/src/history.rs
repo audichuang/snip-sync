@@ -1100,7 +1100,7 @@ impl PreparedHistory {
 				"Commit ID exceeds graph limit".into(),
 			));
 		}
-		if candidate.log_search.is_none() {
+		{
 			// Every graph page leaves a checkpoint; none means the previous
 			// page fell back to a plain list, so this one continues as one.
 			let checkpoint = checkpoints.get(first).and_then(Option::as_ref);
@@ -1133,7 +1133,25 @@ impl PreparedHistory {
 				)
 				.map_err(GraphAdmissionError::Layout)
 			};
-			let full = layout(&candidate.commits, HashSet::new())?;
+			// Filtered results keep their graph, like IntelliJ: a parent the
+			// filter left out ends in a dashed "skipped" stub. (Path filters
+			// get rewritten parents from git, so their matches connect.) A
+			// parent on a later page reconnects when that page joins the
+			// window, since the whole window is laid out again.
+			let skipped: HashSet<String> = if candidate.log_search.is_some() {
+				let loaded: HashSet<&str> =
+					candidate.commits.iter().map(|c| c.sha.as_str()).collect();
+				candidate
+					.commits
+					.iter()
+					.flat_map(|c| &c.parents)
+					.filter(|p| !loaded.contains(p.as_str()))
+					.cloned()
+					.collect()
+			} else {
+				HashSet::new()
+			};
+			let full = layout(&candidate.commits, skipped.clone())?;
 			if full.checkpoint.is_none()
 				&& candidate.page_checkpoints.len() > page + 1
 			{
@@ -1167,7 +1185,10 @@ impl PreparedHistory {
 					.filter(|commit| !hidden.contains(&commit.sha))
 					.cloned()
 					.collect();
-				layout(&shown, hidden.clone())?
+				layout(
+					&shown,
+					hidden.iter().chain(&skipped).cloned().collect(),
+				)?
 			});
 			candidate.hidden_commits = hidden.into_iter().collect();
 			candidate.hidden_commits.sort();
@@ -3099,6 +3120,32 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(nodes(&tail), single[size..].to_vec());
+	}
+
+	#[test]
+	fn filtered_results_keep_a_graph_with_skipped_stubs() {
+		// Matches: m3 (parent m2, a match) and m2 (parent x, filtered out).
+		let page = PreparedHistory::prepare(
+			history(vec![c("m3", &["m2"]), c("m2", &["x"]), c("m1", &[])]),
+			0,
+			&[],
+			Vec::new(),
+			None,
+			Some(LogQuery {
+				author: Some("me".into()),
+				..Default::default()
+			}),
+		)
+		.unwrap();
+		let rows = &page.graph_layout.as_ref().expect("a graph").rows;
+		assert_eq!(rows.len(), 3);
+		let edge = |row: usize| rows[row].parent_edges[0].clone();
+		assert_eq!(edge(0).to_row, Some(1), "adjacent matches connect");
+		assert_eq!(
+			edge(1).continuation,
+			snip_core::graph::ContinuationKind::FilteredGap
+		);
+		assert!(edge(1).to_row.is_none());
 	}
 
 	#[test]

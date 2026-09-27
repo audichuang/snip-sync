@@ -5164,15 +5164,11 @@ impl WorkbenchModel {
 				.children(probe(log, "btn-copy-commits")),
 			);
 
-		let searching = self.log_search.is_some();
-		let gutter_w = if searching {
-			8.0
-		} else {
-			self.graph_layout
-				.as_ref()
-				.map(graph_view::gutter_width)
-				.unwrap_or(40.0)
-		};
+		let gutter_w = self
+			.graph_layout
+			.as_ref()
+			.map(graph_view::gutter_width)
+			.unwrap_or(40.0);
 		let rows = self.display_commits();
 		let n = rows.len();
 		// Tint rows on the current branch only when others are shown too.
