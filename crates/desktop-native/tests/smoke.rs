@@ -4179,6 +4179,8 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	fs::write(repo.join("alpha.txt"), "alpha two\n").unwrap();
 	git_ok(&repo, &["commit", "-qam", "second"]);
 	let second = git_rev(&repo);
+	fs::write(repo.join("gamma.txt"), "untracked\n").unwrap();
+	fs::write(repo.join("delta.txt"), "untracked\n").unwrap();
 
 	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
 	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
@@ -4338,6 +4340,28 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	control("pick-ref:refs/heads/main");
 	key(&wid, "Escape");
 	wait("[APP:SELECTOR_CLOSED]");
+
+	// 7. Changes groups are tree nodes: the group checkbox selects the
+	// whole group, the chevron collapses it.
+	key(&wid, "alt+0");
+	wait("[APP:TAB_SWITCHED: GitChanges visible=true");
+	click("change-group-chk:untracked");
+	let toggled = wait("[APP:GROUP_TOGGLED: untracked selected=true]");
+	let basket = toggled
+		.iter()
+		.find(|l| l.contains("[APP:BASKET: n=3"))
+		.unwrap_or_else(|| {
+			panic!("group toggle must fill the basket: {toggled:?}")
+		});
+	assert!(
+		basket.contains("gamma.txt") && basket.contains("delta.txt"),
+		"{basket}"
+	);
+	control("change-row:untracked:gamma.txt");
+	click("change-group-toggle:untracked");
+	wait("[APP:GROUP_COLLAPSED: untracked collapsed=true]");
+	absent("change-row:untracked:gamma.txt");
+	control("change-header:untracked");
 
 	quit_cleanly(&mut app, &wid);
 }

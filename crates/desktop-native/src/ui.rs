@@ -2286,6 +2286,7 @@ impl WorkbenchModel {
 						d.cursor_pointer().on_click(cx.listener(
 							move |this, _, _, cx| {
 								cx.stop_propagation();
+								this.tree_cursor = ix;
 								this.dispatch_tree(
 									command_for_row(
 										&check_row,
@@ -2444,6 +2445,7 @@ impl WorkbenchModel {
 						let sha = tree_sha.clone();
 						move |this, _, _, cx| {
 							cx.stop_propagation();
+							this.tree_cursor = ix;
 							this.toggle_rev_file_selection(&sha, &chk_path, cx);
 						}
 					}))
@@ -2691,6 +2693,7 @@ impl WorkbenchModel {
 					.when(checkable, |d| {
 						d.on_click(cx.listener(move |this, _, _, cx| {
 							cx.stop_propagation();
+							this.selected_list_row = row_idx;
 							this.toggle_file(ix, cx);
 						}))
 					})
