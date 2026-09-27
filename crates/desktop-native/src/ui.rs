@@ -3156,6 +3156,11 @@ impl WorkbenchModel {
 		let tab_icon = file_icon(&tab_label);
 		let is_diff = self.preview.as_ref().is_some_and(|p| p.is_diff);
 		let side = self.reader.diff_mode == DiffMode::SideBySide;
+		let has_folds = self.preview.as_ref().is_some_and(|p| {
+			p.diff
+				.as_ref()
+				.is_some_and(|d| d.shown.iter().any(|&l| d.inline[l].fold > 0))
+		});
 		let has_preview = self.can_copy_preview();
 		let preview_notice = self.preview.as_ref().and_then(|p| {
 			if p.notice.is_some() {
@@ -3207,6 +3212,23 @@ impl WorkbenchModel {
 					.on_click(cx.listener(|this, _, _, cx| this.next_diff(cx)))
 					.children(probe(log, "btn-next-diff")),
 				)
+				.when(has_folds, |d| {
+					d.child(
+						icon_button(
+							"btn-expand-folds",
+							Icon::ExpandAll,
+							t("tip_expand_folds", loc),
+							!self.reader.expanding,
+							35,
+						)
+						.when(!self.reader.expanding, |b| {
+							b.on_click(cx.listener(|this, _, _, cx| {
+								this.expand_folds(None, cx)
+							}))
+						})
+						.children(probe(log, "btn-expand-folds")),
+					)
+				})
 				.child(
 					// Shows the current viewer; clicking switches to the other.
 					icon_button(

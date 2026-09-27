@@ -370,6 +370,10 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"tip_goto" => "跳至行號 (Ctrl+G)",
 			"tip_close_tab" => "關閉分頁",
 			"tip_preview_tab" => "預覽分頁：開啟下一個檔案時會取代它，按兩下分頁可固定",
+			"tip_expand_folds" => "展開所有未變更的行",
+			"status_fold_failed" => "無法展開未變更的行：{}",
+			"status_fold_stale" => "檔案在差異產生後已變更，請重新整理後再展開",
+			"status_fold_too_large" => "展開後超過預覽上限，保留摺疊",
 			_ => "",
 		},
 		Locale::En => match key {
@@ -651,6 +655,10 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"tip_goto" => "Go to line (Ctrl+G)",
 			"tip_close_tab" => "Close tab",
 			"tip_preview_tab" => "Preview tab: the next file you open replaces it; double-click the tab to keep it",
+			"tip_expand_folds" => "Expand all unchanged lines",
+			"status_fold_failed" => "Could not expand unchanged lines: {}",
+			"status_fold_stale" => "The file changed since this diff was made; refresh to expand",
+			"status_fold_too_large" => "Expanding would exceed the preview limit; kept folded",
 			_ => "",
 		},
 	}
@@ -752,6 +760,10 @@ mod tests {
 			"tip_goto",
 			"tip_close_tab",
 			"tip_preview_tab",
+			"tip_expand_folds",
+			"status_fold_failed",
+			"status_fold_stale",
+			"status_fold_too_large",
 		];
 		for key in test_keys {
 			assert!(

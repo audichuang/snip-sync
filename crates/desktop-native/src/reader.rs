@@ -2,7 +2,7 @@
 //! virtualized rows, find, go-to-line, character selection with copy, and
 //! inline / side-by-side diff. No per-line `String` is retained.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,6 +13,9 @@ use gpui::{
 	MouseMoveEvent, Pixels, Point, ScrollStrategy, SharedString, StyledText,
 	TextRun, UniformListScrollHandle, Window,
 };
+
+use snip_core::gitrun::{CancelToken, Overflow, RunOptions};
+use snip_core::gitsrc::{Git, GitSource};
 
 use crate::i18n::tf;
 use crate::syntax::{highlight_line, Language, SyntaxTheme};
@@ -221,6 +224,37 @@ impl Preview {
 			})
 	}
 
+	/// A patch with at least one hunk (not a binary or mode-only header).
+	pub fn has_hunks(&self) -> bool {
+		self.diff
+			.as_ref()
+			.is_some_and(|d| d.inline.iter().any(|r| r.kind == RowKind::Hunk))
+	}
+
+	/// Changed words of diff line `line` against its paired line, relative
+	/// to the text after the marker.
+	pub fn word_ranges(&self, line: usize) -> Vec<Range<usize>> {
+		let Some(r) = self.diff.as_ref().and_then(|d| d.inline.get(line))
+		else {
+			return Vec::new();
+		};
+		let Some(other) = r.pair.map(|o| o as usize) else {
+			return Vec::new();
+		};
+		let text = |l: usize| self.line(l).get(1..).unwrap_or("");
+		let (a, b) = if r.kind == RowKind::Removed {
+			(line, other)
+		} else {
+			(other, line)
+		};
+		let (old, new) = word_diff(text(a), text(b));
+		if r.kind == RowKind::Removed {
+			old
+		} else {
+			new
+		}
+	}
+
 	/// Language used to colour code: a diff body is coloured as its file.
 	pub fn code_lang(&self) -> Language {
 		match (&self.path, self.is_diff) {
@@ -274,6 +308,9 @@ pub struct InlineRow {
 	/// Hunk rows: unchanged lines left out of the patch before this hunk,
 	/// drawn as a collapsed "⋯ N unchanged lines" row instead of the `@@`.
 	pub fold: u32,
+	/// Modified-block lines: the line it is paired with on the other side,
+	/// compared word by word.
+	pub pair: Option<u32>,
 }
 
 impl InlineRow {
@@ -284,6 +321,7 @@ impl InlineRow {
 			new,
 			modified: false,
 			fold: 0,
+			pair: None,
 		}
 	}
 
@@ -368,16 +406,201 @@ pub struct DiffRows {
 	pub max_num: u32,
 }
 
-/// "@@ -a[,b] +c[,d] @@" as (a, b, c).
-fn parse_hunk(line: &str) -> Option<(u32, u32, u32)> {
+/// "@@ -a[,b] +c[,d] @@" as the first old and new line the hunk covers
+/// (an empty range names the line *before* it).
+fn parse_hunk(line: &str) -> Option<(u32, u32)> {
 	let rest = line.strip_prefix("@@ -")?;
 	let (old, rest) = rest.split_once(' ')?;
 	let new = rest.strip_prefix('+')?.split(' ').next()?;
-	let (start, len) = match old.split_once(',') {
-		Some((s, l)) => (s.parse().ok()?, l.parse().ok()?),
-		None => (old.parse().ok()?, 1),
+	let first = |r: &str| -> Option<u32> {
+		let (start, len) = match r.split_once(',') {
+			Some((s, l)) => (s.parse::<u32>().ok()?, l.parse::<u32>().ok()?),
+			None => (r.parse().ok()?, 1),
+		};
+		Some(if len == 0 { start + 1 } else { start })
 	};
-	Some((start, len, new.split(',').next()?.parse().ok()?))
+	Some((first(old)?, first(new)?))
+}
+
+/// The unchanged gap folded before hunk header `line`, as
+/// (first old line, first new line, count).
+pub fn fold_gap(p: &Preview, line: usize) -> Option<(u32, u32, u32)> {
+	let r = p.diff.as_ref()?.inline.get(line)?;
+	if r.kind != RowKind::Hunk || r.fold == 0 {
+		return None;
+	}
+	let (old, new) = parse_hunk(p.line(line))?;
+	Some((old.checked_sub(r.fold)?, new.checked_sub(r.fold)?, r.fold))
+}
+
+/// Why a fold could not be expanded (an i18n status key).
+pub type ExpandError = &'static str;
+
+/// The patch with the folds before the hunk headers `only` (every fold
+/// when None) spliced back in as context, taken from `content`, the
+/// new-side file. The result is still a patch: a synthetic `@@` header per
+/// gap keeps the numbering, and `DiffRows` hides it (nothing left to fold).
+pub fn expand_folds(
+	p: &Preview,
+	content: &str,
+	only: Option<usize>,
+) -> Result<String, ExpandError> {
+	let d = p.diff.as_ref().ok_or("status_fold_failed")?;
+	if p.notice.is_some() {
+		return Err("status_fold_too_large");
+	}
+	let file: Vec<&str> = content.split_inclusive('\n').collect();
+	fn bare(l: &str) -> &str {
+		l.trim_end_matches('\n').trim_end_matches('\r')
+	}
+	// The file must still be the one the patch was made from.
+	for (i, r) in d.inline.iter().enumerate() {
+		if let (true, Some(n)) = (r.is_code(), r.new) {
+			let body = p.line(i).get(1..).unwrap_or("");
+			if file.get(n as usize - 1).map(|l| bare(l)) != Some(body) {
+				return Err("status_fold_stale");
+			}
+		}
+	}
+	let mut out = String::with_capacity(p.text.len());
+	let mut at = 0usize;
+	for &line in &d.shown {
+		if only.is_some_and(|o| o != line) {
+			continue;
+		}
+		let Some((old, new, count)) = fold_gap(p, line) else {
+			continue;
+		};
+		let start = p.lines[line].start as usize;
+		out.push_str(&p.text[at..start]);
+		out.push_str(&format!("@@ -{old},{count} +{new},{count} @@\n"));
+		for n in new..new + count {
+			let l = file.get(n as usize - 1).ok_or("status_fold_stale")?;
+			out.push(' ');
+			out.push_str(l);
+			if !l.ends_with('\n') {
+				out.push('\n');
+			}
+		}
+		at = start;
+		if out.len() > MAX_PREVIEW_BYTES {
+			return Err("status_fold_too_large");
+		}
+	}
+	out.push_str(&p.text[at..]);
+	if out.len() > MAX_PREVIEW_BYTES
+		|| out.bytes().filter(|&b| b == b'\n').count() >= MAX_PREVIEW_LINES
+	{
+		return Err("status_fold_too_large");
+	}
+	Ok(out)
+}
+
+/// Longest line pair compared word by word; longer pairs get no inner
+/// highlight (IntelliJ also gives up on huge lines).
+const MAX_WORD_TOKENS: usize = 200;
+
+/// Words (letters, digits, `_`), whitespace runs and single punctuation.
+fn tokens(s: &str) -> Vec<Range<usize>> {
+	let class = |c: char| {
+		if c.is_alphanumeric() || c == '_' {
+			0
+		} else if c.is_whitespace() {
+			1
+		} else {
+			2
+		}
+	};
+	let mut out: Vec<Range<usize>> = Vec::new();
+	let mut prev = None;
+	for (i, c) in s.char_indices() {
+		let k = class(c);
+		match out.last_mut() {
+			Some(r) if prev == Some(k) && k != 2 => r.end = i + c.len_utf8(),
+			_ => out.push(i..i + c.len_utf8()),
+		}
+		prev = Some(k);
+	}
+	out
+}
+
+/// Changed byte ranges of `a` (old) and `b` (new): tokens outside their
+/// longest common subsequence, adjacent ones merged.
+pub fn word_diff(a: &str, b: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+	let (ta, tb) = (tokens(a), tokens(b));
+	if ta.len() > MAX_WORD_TOKENS || tb.len() > MAX_WORD_TOKENS {
+		return (Vec::new(), Vec::new());
+	}
+	let (n, m) = (ta.len(), tb.len());
+	let w = m + 1;
+	let mut lcs = vec![0u16; (n + 1) * w];
+	for i in (0..n).rev() {
+		for j in (0..m).rev() {
+			lcs[i * w + j] = if a[ta[i].clone()] == b[tb[j].clone()] {
+				lcs[(i + 1) * w + j + 1] + 1
+			} else {
+				lcs[(i + 1) * w + j].max(lcs[i * w + j + 1])
+			};
+		}
+	}
+	let (mut ca, mut cb) = (Vec::new(), Vec::new());
+	let push = |v: &mut Vec<Range<usize>>, r: Range<usize>| match v.last_mut() {
+		Some(last) if last.end == r.start => last.end = r.end,
+		_ => v.push(r),
+	};
+	let (mut i, mut j) = (0, 0);
+	while i < n && j < m {
+		if a[ta[i].clone()] == b[tb[j].clone()] {
+			i += 1;
+			j += 1;
+		} else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
+			push(&mut ca, ta[i].clone());
+			i += 1;
+		} else {
+			push(&mut cb, tb[j].clone());
+			j += 1;
+		}
+	}
+	for r in &ta[i..] {
+		push(&mut ca, r.clone());
+	}
+	for r in &tb[j..] {
+		push(&mut cb, r.clone());
+	}
+	(ca, cb)
+}
+
+/// Target of "go to line `n`" in a diff: the drawn row numbered `n` on the
+/// old or new side, the fold hiding it, or else the next row after it.
+pub fn diff_goto_row(p: &Preview, n: u32, old: bool) -> Option<usize> {
+	let d = p.diff.as_ref()?;
+	let mut after = None;
+	for &line in &d.shown {
+		let r = d.inline[line];
+		let (start, count) = match fold_gap(p, line) {
+			Some((o, nw, c)) => (if old { o } else { nw }, c),
+			None => match if old { r.old } else { r.new } {
+				Some(k) => (k, 1),
+				None => continue,
+			},
+		};
+		if (start..start + count).contains(&n) {
+			return Some(line);
+		}
+		if start > n && after.is_none() {
+			after = Some(line);
+		}
+	}
+	after
+}
+
+/// The raw `a` and `c` of "@@ -a[,b] +c[,d] @@".
+fn raw_starts(line: &str) -> Option<(u32, u32)> {
+	let rest = line.strip_prefix("@@ -")?;
+	let (old, rest) = rest.split_once(' ')?;
+	let new = rest.strip_prefix('+')?.split(' ').next()?;
+	let start = |r: &str| r.split(',').next()?.parse().ok();
+	Some((start(old)?, start(new)?))
 }
 
 impl DiffRows {
@@ -401,6 +624,10 @@ impl DiffRows {
 			if nl > 0 && nr > 0 {
 				for &(_, i) in dels.iter().chain(adds.iter()) {
 					inline[i].modified = true;
+				}
+				for (&(_, l), &(_, r)) in dels.iter().zip(adds.iter()) {
+					inline[l].pair = Some(r as u32);
+					inline[r].pair = Some(l as u32);
 				}
 			}
 			for k in 0..nl.max(nr) {
@@ -427,13 +654,13 @@ impl DiffRows {
 		};
 		for i in 0..lines.len() {
 			let l = get(i);
-			if let Some((o, olen, n)) =
+			if let Some((first, first_new)) =
 				l.starts_with("@@").then(|| parse_hunk(l)).flatten()
 			{
 				flush(&mut inline, &mut side, &mut dels, &mut adds);
-				// An empty old range names the line *before* it.
-				let first = if olen == 0 { o + 1 } else { o };
 				let fold = first.saturating_sub(next_old);
+				// Counters restart from the header's raw starts.
+				let (o, n) = raw_starts(l).unwrap_or((first, first_new));
 				old = o;
 				new = n;
 				in_hunk = true;
@@ -627,6 +854,14 @@ pub struct Reader {
 	/// The tab was pinned (double-clicked); otherwise it is IntelliJ's
 	/// italic preview tab that the next opened file replaces.
 	pub pinned: bool,
+	/// A fold expansion is reading the new-side file.
+	pub expanding: bool,
+	pub fold_cancel: Option<CancelToken>,
+	/// Side by side: the old (left) pane was clicked last, so go-to-line
+	/// counts old line numbers.
+	pub left_pane: bool,
+	/// Code view bounds of the last frame (pane hit-testing).
+	pub view_bounds: Rc<Cell<Bounds<Pixels>>>,
 }
 
 impl Default for Reader {
@@ -646,6 +881,10 @@ impl Default for Reader {
 			find_opts: FindOptions::default(),
 			find_invalid: false,
 			pinned: false,
+			expanding: false,
+			fold_cancel: None,
+			left_pane: false,
+			view_bounds: Rc::default(),
 		}
 	}
 }
@@ -660,6 +899,11 @@ impl Reader {
 		self.selecting = false;
 		self.cursor_line = 0;
 		self.pinned = false;
+		self.left_pane = false;
+		self.expanding = false;
+		if let Some(c) = self.fold_cancel.take() {
+			c.cancel();
+		}
 		self.scroll.scroll_to_item(0, ScrollStrategy::Top);
 	}
 
@@ -698,11 +942,7 @@ impl Reader {
 /// markers, patch chrome and fold rows left out.
 pub fn selected_text(p: &Preview, (a, b): (Pos, Pos)) -> String {
 	let (a, b) = if a <= b { (a, b) } else { (b, a) };
-	if let Some(d) = p
-		.diff
-		.as_ref()
-		.filter(|d| d.inline.iter().any(|r| r.kind == RowKind::Hunk))
-	{
+	if let Some(d) = p.diff.as_ref().filter(|_| p.has_hunks()) {
 		let raw = |line: usize| {
 			let r = &p.lines[line];
 			(r.start as usize, r.end as usize)
@@ -759,6 +999,7 @@ fn line_highlights(
 	theme: &SyntaxTheme,
 	finds: &[(usize, usize, bool)],
 	sel: Option<Range<usize>>,
+	words: &[Range<usize>],
 ) -> Vec<(Range<usize>, HighlightStyle)> {
 	let mut cuts = vec![0, line.len()];
 	let tokens = highlight_line(line, lang, theme);
@@ -775,6 +1016,9 @@ fn line_highlights(
 		cuts.extend([s, e]);
 	}
 	if let Some(r) = &sel {
+		cuts.extend([r.start, r.end]);
+	}
+	for r in words {
 		cuts.extend([r.start, r.end]);
 	}
 	cuts.retain(|&c| c <= line.len() && line.is_char_boundary(c));
@@ -801,6 +1045,12 @@ fn line_highlights(
 					pal().find_bg
 				})
 				.into()
+			})
+			.or_else(|| {
+				words
+					.iter()
+					.any(|r| r.start <= s && e <= r.end)
+					.then(|| rgb(pal().diff_word_bg).into())
 			})
 		};
 		out.push((
@@ -980,6 +1230,130 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// Click on a "⋯ N unchanged lines" fold (`only`) or Expand All (None):
+	/// reads the new-side file in the background and splices the missing
+	/// lines in. Only the expanded lines stay retained, under the same
+	/// budget as any preview; on failure the fold stays and the status says
+	/// why.
+	pub fn expand_folds(
+		&mut self,
+		only: Option<usize>,
+		cx: &mut Context<Self>,
+	) {
+		if self.reader.expanding || !self.accepting_work() {
+			return;
+		}
+		let Some(p) = &self.preview else {
+			return;
+		};
+		let source = match &p.source {
+			PreviewSource::WorkingChanges | PreviewSource::UnstagedChanges => {
+				GitSource::Working
+			}
+			PreviewSource::StagedChanges => GitSource::Staged,
+			PreviewSource::CommitDiff { sha } => GitSource::Commit(sha.clone()),
+			PreviewSource::Compare { from, to } => {
+				GitSource::Range(from.clone(), to.clone())
+			}
+			_ => return,
+		};
+		let (Some(path), Some(root)) = (p.path.clone(), self.repo_root())
+		else {
+			return;
+		};
+		let shown = Arc::as_ptr(&p.text) as *const u8 as usize;
+		self.reader.expanding = true;
+		let cancel = crate::arm_cancel(&mut self.reader.fold_cancel);
+		app_log!("[APP:FOLD_EXPANDING: all={}]", only.is_none());
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		let job_cancel = cancel.clone();
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(job_cancel),
+			async move {
+				let result = bg
+					.spawn(async move {
+						read_new_side(&root, &source, &path, cancel)
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					model.finish_expand(shown, only, result, cx)
+				});
+			},
+		);
+		cx.notify();
+	}
+
+	fn finish_expand(
+		&mut self,
+		shown: usize,
+		only: Option<usize>,
+		result: Result<String, String>,
+		cx: &mut Context<Self>,
+	) {
+		self.reader.expanding = false;
+		self.reader.fold_cancel = None;
+		let Some(p) = self
+			.preview
+			.as_ref()
+			.filter(|p| Arc::as_ptr(&p.text) as *const u8 as usize == shown)
+		else {
+			// Another file (or version) replaced the preview meanwhile.
+			return;
+		};
+		let expanded = match result {
+			Ok(content) => expand_folds(p, &content, only)
+				.map_err(|key| crate::i18n::Msg::new(key, [])),
+			Err(e) => Err(crate::i18n::Msg::new("status_fold_failed", [e])),
+		};
+		let next = expanded.map(|text| {
+			Preview::new(p.source.clone(), p.path.clone(), text, true, p.lang)
+		});
+		let next = next.and_then(|n| {
+			crate::paste::lock_pending(&self.paste_pending.clone())
+				.admit_ui(
+					Some(&n),
+					self.paste_preview.as_ref(),
+					self.paste_detail.as_ref(),
+				)
+				.map(|()| n)
+		});
+		match next {
+			Ok(next) => {
+				// Rows above each spliced gap keep their index; the cursor
+				// moves down by what was inserted above it.
+				let before = p.lines.len();
+				let cursor = self.reader.cursor_line;
+				let d = p.diff.as_ref();
+				let shift: usize = d.map_or(0, |d| {
+					d.shown
+						.iter()
+						.filter(|&&l| {
+							l <= cursor && only.is_none_or(|o| o == l)
+						})
+						.filter_map(|&l| fold_gap(p, l))
+						.map(|(_, _, c)| c as usize + 1)
+						.sum()
+				});
+				let added = next.lines.len() - before;
+				self.preview = Some(next);
+				self.reader.cursor_line = cursor + shift;
+				self.reader.anchor = None;
+				self.reader.head = None;
+				self.refind();
+				app_log!("[APP:FOLD_EXPANDED: lines={added}]");
+			}
+			Err(msg) => {
+				app_log!("[APP:FOLD_REFUSED: {}]", msg.key);
+				self.status = msg;
+			}
+		}
+		cx.notify();
+	}
+
 	pub fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
 		self.reader.diff_mode = match self.reader.diff_mode {
 			DiffMode::Inline => DiffMode::SideBySide,
@@ -1010,11 +1384,45 @@ impl WorkbenchModel {
 	}
 
 	pub fn goto_line(&mut self, text: &str, cx: &mut Context<Self>) {
-		let total = if let Some(p) = &self.preview {
-			p.lines.len()
-		} else {
+		let Some(p) = &self.preview else {
 			return;
 		};
+		// A diff counts file lines: new side, or old side when the left
+		// pane of the side-by-side viewer was clicked last.
+		if let Some(d) = p.diff.as_ref().filter(|_| p.has_hunks()) {
+			let old = self.reader.diff_mode == DiffMode::SideBySide
+				&& self.reader.left_pane;
+			let side = |r: &InlineRow| if old { r.old } else { r.new };
+			let max = d.inline.iter().filter_map(side).max().unwrap_or(0);
+			let target = text
+				.trim()
+				.parse::<u32>()
+				.ok()
+				.filter(|n| (1..=max).contains(n))
+				.and_then(|n| Some((n, diff_goto_row(p, n, old)?)));
+			match target {
+				Some((n, line)) => {
+					let text_row = p.is_text_row(line);
+					let (start, len) = (p.text_start(line), p.line(line).len());
+					self.reader_scroll_to(line);
+					self.reader.anchor = text_row.then_some((line, start));
+					self.reader.head = text_row.then_some((line, len));
+					app_log!(
+						"[APP:GOTO: line={} side={}]",
+						n,
+						if old { "old" } else { "new" }
+					);
+					self.set_status("status_goto", [n.to_string()]);
+				}
+				None => {
+					self.set_status("status_goto_invalid", [max.to_string()]);
+					app_log!("[APP:GOTO_INVALID]");
+				}
+			}
+			cx.notify();
+			return;
+		}
+		let total = p.lines.len();
 		match text.trim().parse::<usize>() {
 			Ok(n) if n >= 1 && n <= total => {
 				// A hidden patch header line resolves to the next drawn line.
@@ -1084,6 +1492,11 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		window.focus(&self.reader_focus);
+		if self.reader.diff_mode == DiffMode::SideBySide {
+			let b = self.reader.view_bounds.get();
+			self.reader.left_pane =
+				ev.position.x < b.left() + b.size.width / 2.;
+		}
 		let Some(pos) = self.hit_test(ev.position, window) else {
 			return;
 		};
@@ -1232,7 +1645,7 @@ impl WorkbenchModel {
 		let list = uniform_list(
 			if paste { "paste-rows" } else { "code-rows" },
 			rows,
-			cx.processor(move |this, range: Range<usize>, _window, _cx| {
+			cx.processor(move |this, range: Range<usize>, _window, cx| {
 				if !paste {
 					this.reader.row_geom.borrow_mut().clear();
 				}
@@ -1245,11 +1658,11 @@ impl WorkbenchModel {
 					return Vec::new();
 				};
 				if side {
-					range.map(|ix| this.side_row(p, ix)).collect::<Vec<_>>()
+					range.map(|ix| this.side_row(p, ix, cx)).collect::<Vec<_>>()
 				} else {
 					range
 						.map(|row| {
-							this.inline_row(p, p.inline_line(row), !paste)
+							this.inline_row(p, p.inline_line(row), !paste, cx)
 						})
 						.collect::<Vec<_>>()
 				}
@@ -1262,6 +1675,11 @@ impl WorkbenchModel {
 			ListHorizontalSizingBehavior::Unconstrained
 		})
 		.with_width_from_item(Some(widest))
+		.when(side, |l| {
+			l.with_decoration(Ribbons {
+				model: cx.weak_entity(),
+			})
+		})
 		.size_full();
 		let view = div()
 			.id(if paste {
@@ -1269,6 +1687,7 @@ impl WorkbenchModel {
 			} else {
 				"code-view"
 			})
+			.relative()
 			.flex_1()
 			.min_h_0()
 			.font_family(EDITOR_FONT)
@@ -1276,6 +1695,7 @@ impl WorkbenchModel {
 		if paste {
 			return view.child(list).into_any_element();
 		}
+		let bounds = self.reader.view_bounds.clone();
 		view.on_mouse_down(
 			MouseButton::Left,
 			cx.listener(Self::reader_mouse_down),
@@ -1286,6 +1706,13 @@ impl WorkbenchModel {
 			cx.listener(|this, _, _, cx| this.reader_mouse_up(cx)),
 		)
 		.child(list)
+		.child(
+			gpui::canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {})
+				.absolute()
+				.top_0()
+				.left_0()
+				.size_full(),
+		)
 		.into_any_element()
 	}
 
@@ -1294,6 +1721,7 @@ impl WorkbenchModel {
 		p: &Preview,
 		ix: usize,
 		interactive: bool,
+		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let theme = SyntaxTheme::default();
 		let diff_row = p.diff.as_ref().and_then(|d| d.inline.get(ix)).copied();
@@ -1314,7 +1742,13 @@ impl WorkbenchModel {
 		};
 		if let Some(r) = diff_row.filter(|r| r.kind == RowKind::Hunk) {
 			return self
-				.fold_row(("code-line", ix), r.fold, num_w * 2.0 + GUTTER_GAP)
+				.fold_row(
+					("code-line", ix),
+					ix,
+					r.fold,
+					num_w * 2.0 + GUTTER_GAP,
+					cx,
+				)
 				.min_w_full()
 				.child(geom_probe(div().absolute().size_full()))
 				.into_any_element();
@@ -1347,7 +1781,9 @@ impl WorkbenchModel {
 			Some(RowKind::Header) => Language::Diff,
 			_ => p.code_lang(),
 		};
-		let hl = line_highlights(render_text, lang, &theme, &finds, sel);
+		let words = p.word_ranges(ix);
+		let hl =
+			line_highlights(render_text, lang, &theme, &finds, sel, &words);
 		let row_bg = match diff_row.and_then(|r| r.change()) {
 			Some(c) => Some(c.bg()),
 			None if interactive && ix == self.reader.cursor_line => {
@@ -1412,20 +1848,25 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
-	/// IntelliJ's collapsed unchanged fragment: a muted band in place of
-	/// the `@@` header, saying how many lines the patch left out.
+	/// IntelliJ's collapsed unchanged fragment: a muted band between dashed
+	/// separators in place of the `@@` header, saying how many lines the
+	/// patch left out. Clicking it reads them in.
 	fn fold_row(
 		&self,
 		id: (&'static str, usize),
+		line: usize,
 		count: u32,
 		indent: f32,
+		cx: &mut Context<Self>,
 	) -> gpui::Stateful<gpui::Div> {
+		let probe_id = format!("diff-fold:{}", line + 1);
 		div()
 			.id(id)
 			.relative()
 			.flex()
 			.flex_row()
 			.items_center()
+			.gap(px(4.))
 			.h(px(LINE_H))
 			.pl(px(indent))
 			.whitespace_nowrap()
@@ -1433,10 +1874,43 @@ impl WorkbenchModel {
 			.font_family(UI_FONT)
 			.text_size(px(SMALL_TEXT))
 			.text_color(rgb(pal().text_muted))
+			.cursor_pointer()
+			.hover(|s| s.text_color(rgb(pal().link)))
+			.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+			.on_click(cx.listener(move |this, _, _, cx| {
+				this.expand_folds(Some(line), cx)
+			}))
+			.child(
+				gpui::canvas(
+					|_, _, _| {},
+					|b, _, window, _| {
+						for y in [b.top() + px(0.5), b.bottom() - px(0.5)] {
+							let mut path = gpui::PathBuilder::stroke(px(1.))
+								.dash_array(&[px(3.), px(3.)]);
+							path.move_to(gpui::point(b.left(), y));
+							path.line_to(gpui::point(b.right(), y));
+							if let Ok(path) = path.build() {
+								window.paint_path(path, rgb(pal().divider));
+							}
+						}
+					},
+				)
+				.absolute()
+				.top_0()
+				.left_0()
+				.size_full(),
+			)
+			.child(crate::icons::icon(crate::icons::Icon::ExpandAll, 12.))
 			.child(tf("diff_fold", self.locale, &[count]))
+			.children(crate::ui::probe(&self.probes, probe_id))
 	}
 
-	fn side_row(&self, p: &Preview, ix: usize) -> AnyElement {
+	fn side_row(
+		&self,
+		p: &Preview,
+		ix: usize,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
 		let theme = SyntaxTheme::default();
 		let Some(r) = p.diff.as_ref().and_then(|d| d.side.get(ix)).copied()
 		else {
@@ -1451,7 +1925,13 @@ impl WorkbenchModel {
 					.and_then(|d| d.inline.get(line))
 					.map_or(0, |r| r.fold);
 				return self
-					.fold_row(("side-line", ix), fold, num_w + GUTTER_GAP)
+					.fold_row(
+						("side-line", ix),
+						line,
+						fold,
+						num_w + GUTTER_GAP,
+						cx,
+					)
 					.w_full()
 					.into_any_element();
 			}
@@ -1472,6 +1952,7 @@ impl WorkbenchModel {
 							&theme,
 							&[],
 							None,
+							&[],
 						)),
 				)
 				.into_any_element();
@@ -1494,6 +1975,7 @@ impl WorkbenchModel {
 						(m.1 - off, m.2 - off, Some(i) == self.reader.current)
 					})
 					.collect();
+				let words = p.word_ranges(line);
 				let code = div()
 					.flex_1()
 					.min_w_0()
@@ -1502,7 +1984,7 @@ impl WorkbenchModel {
 					.child(
 						StyledText::new(SharedString::from(text.to_string()))
 							.with_highlights(line_highlights(
-								text, lang, &theme, &finds, None,
+								text, lang, &theme, &finds, None, &words,
 							)),
 					);
 				let num = gutter_num(num_w, Some(n))
@@ -1539,12 +2021,37 @@ impl WorkbenchModel {
 					.h_full()
 					.border_l_1()
 					.border_r_1()
-					.border_color(rgb(pal().divider))
-					.children(r.block.map(|b| ribbon(b, b.change().bg()))),
+					.border_color(rgb(pal().divider)),
 			)
 			.child(half(r.right, false, format!("side-right:{ix}")))
 			.into_any_element()
 	}
+}
+
+/// The new-side file a diff was made from (bounded by the preview cap).
+fn read_new_side(
+	root: &std::path::Path,
+	source: &GitSource,
+	path: &str,
+	cancel: CancelToken,
+) -> Result<String, String> {
+	let opts = RunOptions {
+		cancel: Some(cancel),
+		max_stdout: MAX_PREVIEW_BYTES,
+		overflow: Overflow::Error,
+		..RunOptions::interactive(None)
+	};
+	let git = Git::open_with(root, &opts).map_err(|e| e.to_string())?;
+	snip_core::gitsrc::read_changed_file_with(
+		&git,
+		source,
+		path,
+		MAX_PREVIEW_BYTES as u64,
+		&opts,
+	)
+	.map_err(|e| e.to_string())?
+	.and_then(|f| f.content)
+	.ok_or_else(|| "no new-side text".to_string())
 }
 
 /// Space between the line-number gutter and the code.
@@ -1552,49 +2059,82 @@ const GUTTER_GAP: f32 = 8.0;
 /// Width of the divider between side-by-side panes that holds the ribbons.
 const RIBBON_W: f32 = 28.0;
 
-/// This row's slice of the polygon joining a change block on the left to
-/// its counterpart on the right. Both sides start on the block's first row;
-/// the bottom edge runs from the left block's end to the right block's end.
-fn ribbon(block: Block, color: u32) -> impl IntoElement {
-	gpui::canvas(
-		|_, _, _| {},
-		move |b, _, window, _| {
-			let at = block.at as f32;
-			let (l, r) = (block.left as f32 - at, block.right as f32 - at);
-			// Bottom edge at x (0 = left pane, 1 = right pane), clipped to this row.
-			let y = |x: f32| (l + (r - l) * x).clamp(0., 1.);
-			let mut xs = vec![0., 1.];
-			if r != l {
-				for edge in [0., 1.] {
-					let x = (edge - l) / (r - l);
-					if x > 0. && x < 1. {
-						xs.push(x);
-					}
-				}
-			}
-			xs.sort_by(f32::total_cmp);
-			if xs.iter().all(|&x| y(x) <= 0.) {
-				return;
-			}
-			let pt = |x: f32, yy: f32| {
-				gpui::point(
-					b.left() + b.size.width * x,
-					b.top() + b.size.height * yy,
-				)
-			};
-			let mut path = gpui::PathBuilder::fill();
-			path.move_to(pt(0., 0.));
-			path.line_to(pt(1., 0.));
-			for &x in xs.iter().rev() {
-				path.line_to(pt(x, y(x)));
-			}
-			path.close();
-			if let Ok(path) = path.build() {
-				window.paint_path(path, rgb(color));
-			}
-		},
-	)
-	.size_full()
+/// The side-by-side viewer's connectors: for every change block on screen,
+/// a band from the left block to the right one whose bottom edge is a
+/// cubic Bézier, like IntelliJ's diff divider.
+struct Ribbons {
+	model: gpui::WeakEntity<WorkbenchModel>,
+}
+
+impl gpui::UniformListDecoration for Ribbons {
+	fn compute(
+		&self,
+		visible: Range<usize>,
+		bounds: Bounds<Pixels>,
+		scroll: Point<Pixels>,
+		row_h: Pixels,
+		_count: usize,
+		_window: &mut Window,
+		cx: &mut gpui::App,
+	) -> AnyElement {
+		// (first row, left rows, right rows, colour) of blocks on screen.
+		let mut blocks: Vec<(usize, u32, u32, u32)> = Vec::new();
+		if let Some(d) = self.model.upgrade().and_then(|m| {
+			m.read(cx).preview.as_ref().and_then(|p| {
+				p.diff.as_ref().map(|d| {
+					visible
+						.clone()
+						.filter_map(|ix| Some((ix, d.side.get(ix)?.block?)))
+						.map(|(ix, b)| {
+							(
+								ix - b.at as usize,
+								b.left,
+								b.right,
+								b.change().bg(),
+							)
+						})
+						.collect::<Vec<_>>()
+				})
+			})
+		}) {
+			blocks = d;
+			blocks.dedup_by_key(|b| b.0);
+		}
+		gpui::canvas(
+			|_, _, _| {},
+			move |b, _, window, _| {
+				let x0 = b.left() + (b.size.width - px(RIBBON_W)) / 2. + px(1.);
+				let x1 = x0 + px(RIBBON_W - 2.);
+				let xm = (x0 + x1) / 2.;
+				window.with_content_mask(
+					Some(gpui::ContentMask { bounds: b }),
+					|window| {
+						for &(row, left, right, color) in &blocks {
+							let top = b.top() + scroll.y + row_h * row as f32;
+							let lb = top + row_h * left as f32;
+							let rb = top + row_h * right as f32;
+							let mut path = gpui::PathBuilder::fill();
+							path.move_to(gpui::point(x0, top));
+							path.line_to(gpui::point(x1, top));
+							path.line_to(gpui::point(x1, rb));
+							path.cubic_bezier_to(
+								gpui::point(x0, lb),
+								gpui::point(xm, rb),
+								gpui::point(xm, lb),
+							);
+							path.close();
+							if let Ok(path) = path.build() {
+								window.paint_path(path, rgb(color));
+							}
+						}
+					},
+				);
+			},
+		)
+		.w(bounds.size.width)
+		.h(bounds.size.height)
+		.into_any_element()
+	}
 }
 
 /// Width of one line-number column, sized for the largest number shown.
@@ -1744,7 +2284,8 @@ mod tests {
 				old: Some(3),
 				new: Some(3),
 				modified: false,
-				fold: 0
+				fold: 0,
+				pair: None
 			}
 		);
 		assert_eq!(
@@ -1754,7 +2295,8 @@ mod tests {
 				old: Some(4),
 				new: None,
 				modified: true,
-				fold: 0
+				fold: 0,
+				pair: Some(6)
 			}
 		);
 		assert_eq!(
@@ -1764,7 +2306,8 @@ mod tests {
 				old: None,
 				new: Some(4),
 				modified: true,
-				fold: 0
+				fold: 0,
+				pair: Some(5)
 			}
 		);
 		assert_eq!(
@@ -1774,7 +2317,8 @@ mod tests {
 				old: Some(5),
 				new: Some(6),
 				modified: false,
-				fold: 0
+				fold: 0,
+				pair: None
 			}
 		);
 		// Side by side: old/new paired on one row, extra addition alone.
@@ -1825,6 +2369,106 @@ mod tests {
 				d.side.iter().filter(|r| r.kind == RowKind::Hunk).count();
 			assert_eq!(side_folds, folds.len());
 		}
+	}
+
+	#[test]
+	fn word_diff_marks_changed_tokens_only() {
+		let (old, new) =
+			word_diff("let x = foo(a, b);", "let y = foo(a, c, b);");
+		let pick = |s: &'static str, r: &[Range<usize>]| -> Vec<&'static str> {
+			r.iter().map(|r| &s[r.clone()]).collect()
+		};
+		assert_eq!(pick("let x = foo(a, b);", &old), ["x"]);
+		assert_eq!(pick("let y = foo(a, c, b);", &new), ["y", "c, "]);
+		// Multibyte words stay whole and on char boundaries.
+		let (o, n) = word_diff("名稱 = 舊值", "名稱 = 新值");
+		assert_eq!(&"名稱 = 舊值"[o[0].clone()], "舊值");
+		assert_eq!(&"名稱 = 新值"[n[0].clone()], "新值");
+		// Identical lines: nothing; overlong lines: nothing (work is capped).
+		assert_eq!(word_diff("same", "same"), (vec![], vec![]));
+		let long = "a ".repeat(MAX_WORD_TOKENS);
+		assert_eq!(word_diff(&long, "b"), (vec![], vec![]));
+		// A modified block pairs its lines; words are relative to the text
+		// after the marker.
+		let p = preview("@@ -1,1 +1,1 @@\n-let x = 1;\n+let y = 1;\n", true);
+		assert_eq!(p.word_ranges(1), vec![4..5]);
+		assert_eq!(p.word_ranges(2), vec![4..5]);
+		assert!(p.word_ranges(0).is_empty());
+	}
+
+	#[test]
+	fn fold_expansion_splices_the_new_side_and_is_charged() {
+		let file: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+		let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -4,2 +4,2 @@\n line 4\n-old 5\n+line 5\n@@ -10,1 +10,1 @@\n-old 10\n+line 10\n";
+		let p = preview(diff, true);
+		let d = p.diff.as_ref().unwrap();
+		let folds: Vec<usize> = d
+			.shown
+			.iter()
+			.copied()
+			.filter(|&l| d.inline[l].fold > 0)
+			.collect();
+		assert_eq!(folds, vec![3, 7]);
+		assert_eq!(fold_gap(&p, 3), Some((1, 1, 3)));
+		assert_eq!(fold_gap(&p, 7), Some((6, 6, 4)));
+		// One fold: the gap is spliced in as context, still a valid patch.
+		let one = expand_folds(&p, &file, Some(7)).unwrap();
+		let q = preview(&one, true);
+		let qd = q.diff.as_ref().unwrap();
+		let folded: Vec<u32> = qd
+			.shown
+			.iter()
+			.map(|&l| qd.inline[l].fold)
+			.filter(|&f| f > 0)
+			.collect();
+		assert_eq!(folded, vec![3], "only the first fold is left");
+		let news: Vec<u32> =
+			qd.shown.iter().filter_map(|&l| qd.inline[l].new).collect();
+		assert_eq!(news, (4..=10).collect::<Vec<u32>>());
+		assert_eq!(q.line(qd.shown[4]), " line 6");
+		// Every fold, and the budget sees every spliced byte.
+		let all = expand_folds(&p, &file, None).unwrap();
+		let r = preview(&all, true);
+		let rd = r.diff.as_ref().unwrap();
+		assert!(rd.shown.iter().all(|&l| rd.inline[l].kind != RowKind::Hunk));
+		assert_eq!(
+			rd.shown.iter().filter(|&&l| rd.inline[l].is_code()).count(),
+			12
+		);
+		assert!(
+			r.retained_bytes() >= p.retained_bytes() + (all.len() - diff.len())
+		);
+		assert!(crate::paste::admit_preview_state(Some(&r), None, None).is_ok());
+		// A file that changed since the patch is refused, the fold stays.
+		let edited = file.replace("line 4", "edited");
+		assert_eq!(expand_folds(&p, &edited, None), Err("status_fold_stale"));
+		// So is a spliced result beyond the preview line cap.
+		let n = MAX_PREVIEW_LINES + 1;
+		let far = preview(&format!("@@ -{n},1 +{n},1 @@\n-old\n+new\n"), true);
+		let big = format!("{}new\n", "x\n".repeat(MAX_PREVIEW_LINES));
+		assert_eq!(
+			expand_folds(&far, &big, None),
+			Err("status_fold_too_large")
+		);
+	}
+
+	#[test]
+	fn goto_line_in_a_diff_counts_file_lines() {
+		let diff =
+			"@@ -4,3 +4,4 @@\n a\n-b\n+B\n+B2\n c\n@@ -20,1 +21,1 @@\n-x\n+y\n";
+		let p = preview(diff, true);
+		// New side: line 5 is "B" (preview line 3), 6 is "B2".
+		assert_eq!(diff_goto_row(&p, 5, false), Some(3));
+		assert_eq!(diff_goto_row(&p, 6, false), Some(4));
+		// Old side: line 5 is "b" (preview line 2).
+		assert_eq!(diff_goto_row(&p, 5, true), Some(2));
+		// Hidden by a fold: the fold row; before any: the first fold.
+		assert_eq!(diff_goto_row(&p, 10, false), Some(6));
+		assert_eq!(diff_goto_row(&p, 2, false), Some(0));
+		assert_eq!(diff_goto_row(&p, 21, false), Some(8));
+		assert_eq!(diff_goto_row(&p, 20, true), Some(7));
+		// Past the last hunk: nothing.
+		assert_eq!(diff_goto_row(&p, 30, false), None);
 	}
 
 	#[test]
@@ -1935,6 +2579,7 @@ mod tests {
 			&theme,
 			&[(4, 5, true)],
 			Some(2..6),
+			&[0..3, 8..10],
 		);
 		let mut at = 0;
 		for (r, _) in &h {
@@ -1981,8 +2626,14 @@ mod tests {
 		// Shape & highlight the clipped render text
 		let finds = vec![(10, 20, false), (4080, 4095, true)];
 		let sel = Some(4000..4092);
-		let hl =
-			line_highlights(render_text, Language::Rust, &theme, &finds, sel);
+		let hl = line_highlights(
+			render_text,
+			Language::Rust,
+			&theme,
+			&finds,
+			sel,
+			&[],
+		);
 
 		let elapsed = start.elapsed();
 		assert!(

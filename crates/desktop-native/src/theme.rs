@@ -109,6 +109,8 @@ pub struct Palette {
 	pub diff_add_bg: u32,
 	pub diff_del_bg: u32,
 	pub diff_mod_bg: u32,
+	/// Changed words inside a modified block (inner fragments).
+	pub diff_word_bg: u32,
 	pub diff_hunk_bg: u32,
 	pub diff_empty_bg: u32,
 	// Syntax.
@@ -176,6 +178,7 @@ pub static DARK: Palette = Palette {
 	diff_add_bg: 0x294436,     // Darcula DIFF_INSERTED
 	diff_del_bg: 0x484a4a,     // Darcula DIFF_DELETED
 	diff_mod_bg: 0x385570,     // Darcula DIFF_MODIFIED
+	diff_word_bg: 0x4c6f9c,    // DIFF_MODIFIED, stronger for inner fragments
 	diff_hunk_bg: 0x2b2d30,    // DIFF_SEPARATORS_BACKGROUND
 	diff_empty_bg: 0x212326,   // editor-bg-inline
 	code_text: 0xbcbec4,       // TEXT
@@ -241,6 +244,7 @@ pub static LIGHT: Palette = Palette {
 	diff_add_bg: 0xbaeeba,     // Default DIFF_INSERTED
 	diff_del_bg: 0xd6d6d6,     // Default DIFF_DELETED
 	diff_mod_bg: 0xc2d8f2,     // DIFF_MODIFIED
+	diff_word_bg: 0x9dbfec,    // DIFF_MODIFIED, stronger for inner fragments
 	diff_hunk_bg: 0xe4e6eb,    // DIFF_SEPARATORS_BACKGROUND
 	diff_empty_bg: 0xf7f8f9,   // editor-bg-inline
 	code_text: 0x080808,       // TEXT
@@ -377,6 +381,7 @@ mod tests {
 			("diff_add_bg", d.diff_add_bg, l.diff_add_bg),
 			("diff_del_bg", d.diff_del_bg, l.diff_del_bg),
 			("diff_mod_bg", d.diff_mod_bg, l.diff_mod_bg),
+			("diff_word_bg", d.diff_word_bg, l.diff_word_bg),
 			("diff_hunk_bg", d.diff_hunk_bg, l.diff_hunk_bg),
 			("diff_empty_bg", d.diff_empty_bg, l.diff_empty_bg),
 			("code_text", d.code_text, l.code_text),
