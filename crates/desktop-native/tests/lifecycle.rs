@@ -252,6 +252,7 @@ fn spawn_app(opts: SpawnOpts) -> App {
 	.stdout(Stdio::piped())
 	.stderr(Stdio::piped())
 	.env("XMODIFIERS", "@im=none")
+	.env("SNIP_THEME", "dark")
 	.env("SNIP_NATIVE_E2E", "1")
 	.env_remove("SNIP_E2E_GIT_HOLD_FILE")
 	.env_remove("SNIP_NATIVE_E2E_READ_DELAY_MS")

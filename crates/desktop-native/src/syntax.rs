@@ -58,19 +58,20 @@ pub struct SyntaxTheme {
 }
 
 impl Default for SyntaxTheme {
+	/// The active palette's editor scheme.
 	fn default() -> Self {
+		let p = crate::theme::pal();
 		Self {
-			// IntelliJ dark editor scheme.
-			text: rgb(0xbcbec4),
-			keyword: rgb(0xcf8e6d),
-			string: rgb(0x6aab73),
-			number: rgb(0x2aacb8),
-			comment: rgb(0x7a7e85),
-			type_name: rgb(0x16baac),
-			punctuation: rgb(0xbcbec4),
-			diff_add: rgb(crate::theme::GIT_ADDED),
-			diff_remove: rgb(crate::theme::ERROR),
-			diff_hunk: rgb(0x6f737a),
+			text: rgb(p.code_text),
+			keyword: rgb(p.syntax_keyword),
+			string: rgb(p.syntax_string),
+			number: rgb(p.syntax_number),
+			comment: rgb(p.syntax_comment),
+			type_name: rgb(p.syntax_type),
+			punctuation: rgb(p.code_text),
+			diff_add: rgb(p.git_added),
+			diff_remove: rgb(p.error),
+			diff_hunk: rgb(p.diff_hunk_text),
 		}
 	}
 }

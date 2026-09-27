@@ -14,8 +14,10 @@ use snip_core::browser::{CommitSummary, GitReference};
 use snip_core::graph::{
 	compute_graph_layout, fallback_linear_layout, ContinuationKind,
 	GraphCheckpoint, GraphConfig, GraphError, GraphLayout, GraphRow, NodeType,
-	RefInfo, RefKind, COLOR_PALETTE,
+	RefInfo, RefKind,
 };
+
+use crate::theme::pal;
 
 pub const ROW_HEIGHT: f32 = crate::theme::ROW_H;
 pub const LANE_WIDTH: f32 = 16.0;
@@ -91,12 +93,8 @@ pub(crate) fn layout_heap_bytes(layout: &GraphLayout) -> usize {
 }
 
 pub fn palette_rgb(index: usize) -> Rgba {
-	let hex = COLOR_PALETTE[index % COLOR_PALETTE.len()];
-	let hex = hex.trim_start_matches('#');
-	let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(137);
-	let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(180);
-	let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(250);
-	rgb(u32::from_be_bytes([0, r, g, b]))
+	let lanes = &pal().graph_lanes;
+	rgb(lanes[index % lanes.len()])
 }
 
 pub fn lane_x(lane: usize) -> f32 {
@@ -111,17 +109,18 @@ pub fn gutter_width(layout: &GraphLayout) -> f32 {
 	((max_lane + 1).min(MAX_GUTTER_LANES) as f32) * LANE_WIDTH + 24.0
 }
 
-/// Label text and text color for a ref; the background is the shared `REF_BG`.
+/// Label text and text color for a ref; the background is the shared `ref_bg`.
 pub fn format_ref_badge(info: &RefInfo) -> (String, Rgba) {
-	use crate::theme::{REF_HEAD, REF_LOCAL, REF_REMOTE, REF_TAG, TEXT_MUTED};
 	match &info.kind {
-		RefKind::Head => ("HEAD".to_string(), rgb(REF_HEAD)),
-		RefKind::Branch => (info.display_name.clone(), rgb(REF_LOCAL)),
+		RefKind::Head => ("HEAD".to_string(), rgb(pal().ref_head)),
+		RefKind::Branch => (info.display_name.clone(), rgb(pal().ref_local)),
 		RefKind::RemoteBranch { remote, name } => {
-			(format!("{remote}/{name}"), rgb(REF_REMOTE))
+			(format!("{remote}/{name}"), rgb(pal().ref_remote))
 		}
-		RefKind::Tag => (format!("tag: {}", info.display_name), rgb(REF_TAG)),
-		RefKind::Other => (info.display_name.clone(), rgb(TEXT_MUTED)),
+		RefKind::Tag => {
+			(format!("tag: {}", info.display_name), rgb(pal().ref_tag))
+		}
+		RefKind::Other => (info.display_name.clone(), rgb(pal().text_muted)),
 	}
 }
 
@@ -504,7 +503,7 @@ fn paint_strokes(
 			window.paint_quad(quad(
 				in_bounds,
 				r_in,
-				gpui::white(),
+				rgb(pal().editor_bg),
 				px(0.0),
 				gpui::transparent_black(),
 				Default::default(),
