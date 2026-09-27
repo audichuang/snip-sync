@@ -137,7 +137,7 @@ python3 scripts/check_native_collaboration.py \
 3. **歷史檔案固定 OID（Fixed-OID Selection）**：依循 current `smoke.rs` 規範歷史瀏覽流程：
    - 點選 commit 列（`commit-row:<short>`），驗證當前 active root 與預期 canonical root 嚴格相符。
    - 讀取 Git oracle（`git rev-parse {commit}:{path}`）驗證 blob OID 與 manifest 預期完全一致。
-   - 點選 `btn-browse-tree` 進入歷史樹瀏覽，等待 `[APP:REV_TREE: <short>]` 與 `[APP:E2E_TREE: rev=<short> dir=/` 根目錄準備完成。
+   - 等待所選 commit 完成載入後的 bounds probe `btn-browse-tree:<full SHA>`，點選進入歷史樹瀏覽，等待 `[APP:REV_TREE: <short>]` 與 `[APP:E2E_TREE: rev=<short> dir=/` 根目錄準備完成。
    - 逐層點選目錄列（`rev-row:<parent>`）展開父目錄，等待 `[APP:TREE_EXPANDED:`（禁止壓制 `MissingControl`）。
    - 點選檔案列（`rev-row:<path>`），等待 `[APP:PREVIEW_LOADED:` 與 `[APP:E2E_PREVIEW: source=commit_file` 完成載入。
    - 勾選歷史核取方塊（`rev-chk:<full-commit-oid>:<relative-path>`），等待 `[APP:BASKET: n=` 更新。

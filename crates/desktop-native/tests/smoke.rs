@@ -1049,7 +1049,12 @@ fn native_desktop_smoke_and_clipboard_verification() {
 
 	// Click 'Browse Tree' button to inspect historical tree without checking out
 	println!("[TEST DRIVER] Browsing historical commit tree...");
-	click("btn-browse-tree");
+	wait_for_pattern(
+		&format!("[APP:E2E_PREVIEW: source=commit_diff rev={base_commit_sha} "),
+		Duration::from_secs(3),
+	)
+	.expect("selected commit preview must finish before targeting its toolbar");
+	click(&format!("btn-browse-tree:{base_commit_sha}"));
 	wait_for_pattern(
 		&format!("[APP:REV_TREE: {base_short}]"),
 		Duration::from_secs(3),
@@ -3270,7 +3275,11 @@ fn native_historical_file_basket_and_collision() {
 	);
 
 	// Browse tree of historical commit
-	click("btn-browse-tree");
+	wait_for(
+		&format!("[APP:E2E_PREVIEW: source=commit_diff rev={feat_sha} "),
+		Duration::from_secs(6),
+	);
+	click(&format!("btn-browse-tree:{feat_sha}"));
 	wait_for(
 		&format!("[APP:REV_TREE: {feat_short}]"),
 		Duration::from_secs(6),
@@ -3376,7 +3385,11 @@ fn native_historical_file_basket_and_collision() {
 		&format!("[APP:COMMIT_SELECTED: {feat2_short}]"),
 		Duration::from_secs(6),
 	);
-	click("btn-browse-tree");
+	wait_for(
+		&format!("[APP:E2E_PREVIEW: source=commit_diff rev={feat2_sha} "),
+		Duration::from_secs(6),
+	);
+	click(&format!("btn-browse-tree:{feat2_sha}"));
 	wait_for(
 		&format!("[APP:REV_TREE: {feat2_short}]"),
 		Duration::from_secs(6),
@@ -3506,7 +3519,11 @@ fn native_historical_file_basket_and_collision() {
 		&format!("[APP:COMMIT_SELECTED: {feat_short}]"),
 		Duration::from_secs(6),
 	);
-	click("btn-browse-tree");
+	wait_for(
+		&format!("[APP:E2E_PREVIEW: source=commit_diff rev={feat_sha} "),
+		Duration::from_secs(6),
+	);
+	click(&format!("btn-browse-tree:{feat_sha}"));
 	wait_for(
 		&format!("[APP:REV_TREE: {feat_short}]"),
 		Duration::from_secs(6),
@@ -3772,8 +3789,8 @@ fn native_reader_degradation_and_copy_integrity() {
 
 	click(&format!("commit-row:{}", &head[..7]));
 	wait(&format!("[APP:COMMIT_SELECTED: {}]", &head[..7]));
-	wait("[APP:E2E_PREVIEW: source=commit_diff");
-	click("btn-browse-tree");
+	wait(&format!("[APP:E2E_PREVIEW: source=commit_diff rev={head} "));
+	click(&format!("btn-browse-tree:{head}"));
 	wait(&format!("[APP:REV_TREE: {}]", &head[..7]));
 	for path in ["binary.bin", "not-utf8.txt", "large.txt"] {
 		open("rev-row", "good.txt");

@@ -2579,7 +2579,18 @@ impl WorkbenchModel {
 						.on_click(cx.listener(|this, _, _, cx| {
 							this.browse_commit_tree(cx)
 						}))
-						.children(probe(log, "btn-browse-tree")),
+						// The loading commit header changes height when files arrive.
+						// Only expose bounds for the completed revision's layout.
+						.children(
+							self.selected_commit
+								.as_ref()
+								.filter(|_| {
+									log.is_some() && !self.preview_loading
+								})
+								.and_then(|sha| {
+									probe(log, format!("btn-browse-tree:{sha}"))
+								}),
+						),
 					)
 				},
 			)

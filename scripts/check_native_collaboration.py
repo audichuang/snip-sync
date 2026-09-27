@@ -1445,12 +1445,13 @@ def select_fixed_oid(
     1. Select commit row by full/short OID.
     2. Assert active root matches expected canonical repo root.
     3. Assert Git blob OID from manifest matches Git oracle.
-    4. Click 'btn-browse-tree' -> wait REV_TREE matching selected commit and E2E_TREE root.
+    4. Click 'btn-browse-tree:<full SHA>' after its completed-layout probe -> wait REV_TREE matching selected commit and E2E_TREE root.
     5. Expand parent directories via rev-row:<parent> (do not suppress MissingControl).
     6. Navigate to file row: rev-row:<path> -> wait PREVIEW_LOADED and E2E_PREVIEW.
     7. Click historical checkbox: rev-chk:<commit>:<path> -> wait BASKET.
     """
     commit = git_read(repo, ["rev-parse", "--verify", f"{rev}^{{commit}}"], timeout).strip()
+    selection_start = len(session.lines)
     click_commit_row(native, session, win, repo, commit, timeout, trace)
     active_root = _current_root(session)
     expected_root = str(os.path.realpath(repo))
@@ -1464,10 +1465,11 @@ def select_fixed_oid(
     if oracle_blob_oid != oid:
         raise DriverError(f"manifest blob OID {oid} does not match git oracle {oracle_blob_oid} for {commit}:{path}")
 
-    # Click btn-browse-tree to enter historical tree browsing
+    # The revision-qualified probe appears only after the commit header finishes loading.
+    wait_substr(session, f"[APP:E2E_PREVIEW: source=commit_diff rev={commit} ", selection_start, timeout)
     short_sha = commit[:7]
     before = len(session.lines)
-    click_control(native, session, win, "btn-browse-tree", timeout)
+    click_control(native, session, win, f"btn-browse-tree:{commit}", timeout)
     wait_substr(session, f"[APP:REV_TREE: {short_sha}]", before, timeout)
     wait_substr(session, f"[APP:E2E_TREE: rev={short_sha} dir=/", before, timeout)
     trace.append({"action": "browse-tree", "commit": commit, "short": short_sha})

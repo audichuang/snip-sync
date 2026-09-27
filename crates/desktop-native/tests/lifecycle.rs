@@ -1410,9 +1410,9 @@ fn quit_waits_for_a_held_tree_read() {
 	);
 }
 
-fn head_short(git_bin: &Path, repo: &Path) -> String {
+fn head_oid(git_bin: &Path, repo: &Path) -> String {
 	let out = Command::new(git_bin)
-		.args(["rev-parse", "--short=7", "HEAD"])
+		.args(["rev-parse", "HEAD"])
 		.current_dir(repo)
 		.output()
 		.expect("git rev-parse");
@@ -1593,7 +1593,7 @@ fn copy_cancel_button_stops_file_and_commit_copy() {
 
 	let sentinel = "CLIP-SENTINEL-copy-button-commit";
 	clip_set(sentinel);
-	let sha = head_short(&fx.git_bin, &fx.repo);
+	let sha = head_oid(&fx.git_bin, &fx.repo)[..7].to_string();
 	click(&wid, &format!("commit-row:{sha}"));
 	lines_until(&app.rx, "[APP:COMMIT_SELECTED:", Duration::from_secs(4));
 	lines_until(
@@ -1651,7 +1651,7 @@ fn quit_cancels_in_flight_commit_copy_without_writing_clipboard() {
 
 	let sentinel = "CLIP-SENTINEL-quit-commit-copy";
 	clip_set(sentinel);
-	let sha = head_short(&fx.git_bin, &fx.repo);
+	let sha = head_oid(&fx.git_bin, &fx.repo)[..7].to_string();
 	click(&wid, &format!("commit-row:{sha}"));
 	lines_until(&app.rx, "[APP:COMMIT_SELECTED:", Duration::from_secs(4));
 	lines_until(
@@ -2220,7 +2220,7 @@ fn commit_preview_cancel_and_close_leave_the_destination_untouched() {
 	fs::write(fx.repo.join("extra.txt"), "extra\n").unwrap();
 	let (mut app, wid) = spawn_copy_app(&fx);
 
-	let sha = head_short(&fx.git_bin, &fx.repo);
+	let sha = head_oid(&fx.git_bin, &fx.repo)[..7].to_string();
 	click(&wid, &format!("commit-row:{sha}"));
 	lines_until(&app.rx, "[APP:COMMIT_SELECTED:", Duration::from_secs(4));
 	lines_until(
@@ -2380,10 +2380,15 @@ fn project_tree_finishes_while_historical_tree_loads() {
 	click(&wid, "tree-row:sub2");
 
 	// Select commit and browse historical tree (triggers load_rev_dir)
-	let sha = head_short(&git_bin, &repo);
-	click(&wid, &format!("commit-row:{sha}"));
+	let sha = head_oid(&git_bin, &repo);
+	click(&wid, &format!("commit-row:{}", &sha[..7]));
 	lines_until(&app.rx, "[APP:COMMIT_SELECTED:", Duration::from_secs(6));
-	click(&wid, "btn-browse-tree");
+	lines_until(
+		&app.rx,
+		&format!("[APP:E2E_PREVIEW: source=commit_diff rev={sha} "),
+		Duration::from_secs(6),
+	);
+	click(&wid, &format!("btn-browse-tree:{sha}"));
 	lines_until(&app.rx, "[APP:REV_TREE:", Duration::from_secs(6));
 
 	// Release the project tree hold

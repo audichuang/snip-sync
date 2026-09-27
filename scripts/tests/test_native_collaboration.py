@@ -645,8 +645,8 @@ class OrchestratorHistoricalTreeTests(unittest.TestCase):
                     sess.clicked.append(control)
                     if control == f"commit-row:{short_commit}":
                         sess.lines.append((0.0, f"[APP:COMMIT_SELECTED: {short_commit}]"))
-                        sess.lines.append((0.0, f"[APP:COMMIT_FOCUS: {full_commit}]"))
-                    elif control == "btn-browse-tree":
+                        sess.lines.append((0.0, f"[APP:E2E_PREVIEW: source=commit_diff rev={full_commit} path=notes/guide/spec.txt lines=5 fnv=abc]"))
+                    elif control == f"btn-browse-tree:{full_commit}":
                         self.assertIsNone(viewport, "browse-tree toolbar is outside the scrollable log list")
                         sess.lines.append((0.0, f"[APP:REV_TREE: {short_commit}]"))
                         sess.lines.append((0.0, f"[APP:E2E_TREE: rev={short_commit} dir=/ entries=2 fnv=123]"))
@@ -677,7 +677,7 @@ class OrchestratorHistoricalTreeTests(unittest.TestCase):
                 )
 
                 self.assertIn(f"commit-row:{short_commit}", sess.clicked)
-                self.assertIn("btn-browse-tree", sess.clicked)
+                self.assertEqual(sess.clicked.count(f"btn-browse-tree:{full_commit}"), 1)
                 self.assertIn("rev-row:notes", sess.clicked)
                 self.assertIn("rev-row:notes/guide", sess.clicked)
                 self.assertIn(f"rev-row:{file_path}", sess.clicked)
