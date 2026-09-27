@@ -463,10 +463,11 @@ class Session:
         for path in (config, data, cache):
             path.mkdir()
         bus = self.iso / "session-bus.xml"
+        # D-Bus owns a unique short socket; evidence paths can exceed AF_UNIX limits.
         bus.write_text(
             "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" "
             "\"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n"
-            f"<busconfig><type>session</type><listen>unix:tmpdir={self.iso}</listen>"
+            "<busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen>"
             "<auth>EXTERNAL</auth><policy context=\"default\">"
             "<allow send_destination=\"*\" eavesdrop=\"true\"/>"
             "<allow eavesdrop=\"true\"/><allow receive_sender=\"*\"/>"

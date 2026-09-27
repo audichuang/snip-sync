@@ -358,6 +358,10 @@ jobs:
               uses: actions/setup-python@v5
               with:
                   python-version: "3.12"
+            - name: Install private D-Bus regression tools
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y dbus
             - name: Run harness contract tests (stdlib unittest)
               env:
                   PYTHONDONTWRITEBYTECODE: "1"

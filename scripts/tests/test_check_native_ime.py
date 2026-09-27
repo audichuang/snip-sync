@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the native IME check's pure decisions.
+"""Tests for native IME decisions and private session startup.
 
 These do not open a display. The X11 script is the OS proof.
 """
@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -45,6 +47,46 @@ class Bitmap:
 
 
 class TestImeGate(unittest.TestCase):
+    def test_private_bus_starts_with_long_evidence_path_and_cleans_its_socket(self):
+        missing = ime.missing_tools(("dbus-daemon", "dbus-send"))
+        if sys.platform != "linux" or missing:
+            reason = f"private D-Bus regression requires Linux and D-Bus tools: {missing}"
+            self.assertNotIn("SNIP_REQUIRE_ALL_TESTS", os.environ, reason)
+            self.skipTest(reason)
+        with tempfile.TemporaryDirectory(prefix="snip-ime-dbus-", dir="/tmp") as directory:
+            sessions, addresses, sockets, ids = [], [], [], []
+            try:
+                for name in ("short", "long-" + "x" * 120):
+                    run = Path(directory) / name
+                    run.mkdir()
+                    with mock.patch.object(ime, "RUN", run), \
+                            mock.patch.object(ime, "lavapipe_icd", return_value="/test/lvp.json"):
+                        session = ime.Session()
+                        sessions.append(session)
+                        session.prepare_env()
+                    self.assertEqual(session.env["HOME"], str(run / "iso" / "home"))
+                    self.assertEqual(Path(session._bus_config).parent, run / "iso")
+                    session.start_dbus()
+                    address = session.env["DBUS_SESSION_BUS_ADDRESS"]
+                    addresses.append(address)
+                    if address.startswith("unix:path="):
+                        sockets.append(Path(address.split(",", 1)[0].removeprefix("unix:path=")))
+                    reply = subprocess.run(
+                        ["dbus-send", f"--bus={address}", "--type=method_call", "--print-reply",
+                         "--dest=org.freedesktop.DBus", "/", "org.freedesktop.DBus.GetId"],
+                        env=session.env, capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(reply.returncode, 0, reply.stderr)
+                    ids.append(reply.stdout.split('string "', 1)[1].split('"', 1)[0])
+                self.assertEqual(len(set(addresses)), 2)
+                self.assertEqual(len(set(ids)), 2)
+            finally:
+                cleanup = [(session, session.stop()) for session in sessions]
+                for session, steps in cleanup:
+                    self.assertTrue(ime.shutdown_graceful(steps), steps)
+                    self.assertFalse(any(ime.same_process(pid, start) for pid, start, _ in session.owned))
+                self.assertTrue(all(not path.exists() for path in sockets))
+
     def test_private_session_preserves_only_caller_library_paths(self):
         for supplied in ({}, {"LIBRARY_PATH": "/caller/build", "LD_LIBRARY_PATH": "/caller/runtime"}):
             with self.subTest(supplied=supplied), tempfile.TemporaryDirectory() as directory:
