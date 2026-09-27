@@ -113,8 +113,11 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 - 路徑安全規則與檔案模式相同。
 - 預設值(規格階段未逐題確認,實作時照此,有意見再改):
   - 某個 commit 在本機寫入後沒有任何差異 → 仍然建立(空 commit),讓兩邊的 commit 數量與 message 一致。
-  - 建立 commit 時**不執行** git hooks(`--no-verify`):內容在來源端已經 commit 過,
-    避免本機的 pre-commit 修改或擋下重播的內容。
+  - 建立 commit 時**不執行** git hooks:重播的每個 git 呼叫都帶 `-c core.hooksPath=<空目錄>`
+    (`--no-verify` 只跳過 pre-commit / commit-msg,擋不住 prepare-commit-msg、post-commit 等)。
+    內容在來源端已經 commit 過,避免本機的 hook 修改、擋下或改寫重播的內容。
+  - 重播前先檢查整個 commit 的目標:寫入或刪除的位置是目錄、父目錄被一般檔案佔住時,
+    整個 commit 拒絕且不動任何檔案(預覽標為 `UNSAFE_PATH`)。來源 message 為空也照樣建立。
 
 ### 4.4 剪貼簿格式
 
