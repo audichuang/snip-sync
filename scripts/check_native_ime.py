@@ -949,6 +949,16 @@ def _wait(pred, timeout: float) -> bool:
     return False
 
 
+def _settle(take, ok, timeout: float = 5.0):
+    """Retry take() until ok(value) or timeout; return the last value."""
+    end = time.monotonic() + timeout
+    while True:
+        value = take()
+        if ok(value) or time.monotonic() >= end:
+            return value
+        time.sleep(0.1)
+
+
 def _exercise(session: Session, result: dict) -> int:
     failures: list[str] = []
     win = session.window()
@@ -995,12 +1005,16 @@ def _exercise(session: Session, result: dict) -> int:
         time.sleep(0.35)
         err_at = len(session.stderr_lines)
         session.key(win["wid"], "n", "i", "h", "a", "o", delay=120)
-        time.sleep(0.8)
-        current = session.refresh(win)
-        bounds = parse_bounds(session.texts()).get(target)
+        time.sleep(0.3)
+
+        def take():
+            current = session.refresh(win)
+            bounds = parse_bounds(session.texts()).get(target)
+            shot = session.screenshot(current, label)
+            return current, bounds, shot, _popup_at(shot["root"])
+
+        current, bounds, shot, popup = _settle(take, lambda v: v[3] is not None)
         field = abs_bounds(current, bounds)
-        shot = session.screenshot(current, label)
-        popup = _popup_at(shot["root"])
         association = (
             associated_candidate(popup, field, _window_rect(current))
             if popup and field
@@ -1037,9 +1051,11 @@ def _exercise(session: Session, result: dict) -> int:
     )
 
     session.key(win["wid"], "Escape")
-    time.sleep(0.45)
-    esc = session.screenshot(session.refresh(win), "03-escape")
-    esc_popup = _popup_at(esc["root"])
+    time.sleep(0.2)
+    esc, esc_popup = _settle(
+        lambda: _shoot(session, win, "03-escape"),
+        lambda v: v[1] is None,
+    )
     esc_copy = _copy_input(session, win)
     logs = session.texts()
     escape_ok = esc_popup is None and esc_copy.get("kind") == "sentinel_unchanged" and not any(
@@ -1065,21 +1081,28 @@ def _exercise(session: Session, result: dict) -> int:
         session.wait_line(lambda line: "[APP:VIEWPORT: 900x600]" in line, timeout=8)
     except ImeCheckError as exc:
         failures.append(str(exc))
-    time.sleep(0.7)
-    resized = session.refresh(win)
-    bounds = parse_bounds(session.texts()).get(target)
-    field = abs_bounds(resized, bounds)
-    shot = session.screenshot(resized, "05-resize")
-    popup = _popup_at(shot["root"])
-    association = (
-        associated_candidate(popup, field, _window_rect(resized))
-        if popup and field
-        else None
-    )
-    moved = (
-        before_popup is not None
-        and popup is not None
-        and abs(popup["y"] - before_popup["y"]) >= 40
+    time.sleep(0.3)
+
+    def take_resize():
+        resized = session.refresh(win)
+        bounds = parse_bounds(session.texts()).get(target)
+        field = abs_bounds(resized, bounds)
+        shot = session.screenshot(resized, "05-resize")
+        popup = _popup_at(shot["root"])
+        association = (
+            associated_candidate(popup, field, _window_rect(resized))
+            if popup and field
+            else None
+        )
+        moved = (
+            before_popup is not None
+            and popup is not None
+            and abs(popup["y"] - before_popup["y"]) >= 40
+        )
+        return resized, field, shot, popup, association, moved
+
+    resized, field, shot, popup, association, moved = _settle(
+        take_resize, lambda v: bool(v[4] and v[4]["anchored"] and v[5])
     )
     resize_ok = bool(association and association["anchored"] and moved)
     result["resizeWhileComposing"] = {
@@ -1141,16 +1164,20 @@ def _exercise(session: Session, result: dict) -> int:
         session.wait_line(lambda line: "[APP:GRAPH_LOADED:" in line, start=before, timeout=8)
     except ImeCheckError as exc:
         failures.append(str(exc))
-    time.sleep(0.4)
-    rows = [
-        key.split(":", 1)[1]
-        for key in parse_bounds(session.texts(before))
-        if key.startswith("commit-row:")
-    ]
     oracle = _git_grep(session.repo, observed or "")
     known = _git_grep(session.repo, KNOWN_PHRASE)
-    ui = sorted(set(rows))
     git_shorts = sorted(row["short"] for row in oracle)
+    # Full history: unmoved rows are not re-logged; CTRL_GONE drops stale ones.
+    # GRAPH_LOADED precedes the repaint, so wait for the painted rows to match.
+    rows = _settle(
+        lambda: sorted(
+            key.split(":", 1)[1]
+            for key in parse_bounds(session.texts())
+            if key.startswith("commit-row:")
+        ),
+        lambda v: v == git_shorts,
+    )
+    ui = sorted(set(rows))
     match = ui == git_shorts and KNOWN_PHRASE in (observed or "")
     result["search"] = {
         "observed": observed,
@@ -1201,9 +1228,11 @@ def _exercise(session: Session, result: dict) -> int:
         focus_limit = True
     else:
         session.click_bounds(session.refresh(resized), head)
-        time.sleep(0.45)
-        away = session.screenshot(session.refresh(resized), "11-focus-away")
-        away_popup = _popup_at(away["root"])
+        time.sleep(0.2)
+        away, away_popup = _settle(
+            lambda: _shoot(session, resized, "11-focus-away"),
+            lambda v: v[1] is None,
+        )
         result["screenshots"].append({"name": "11-focus-away", **away})
         back_bounds = parse_bounds(session.texts()).get(target)
         if back_bounds is not None:
@@ -1253,6 +1282,11 @@ def _largest_popup(image) -> dict[str, int] | None:
     return found[0] if found else None
 
 
+def _shoot(session: Session, win: dict, label: str) -> tuple[dict, dict | None]:
+    shot = session.screenshot(session.refresh(win), label)
+    return shot, _popup_at(shot["root"])
+
+
 def _popup_at(path: str) -> dict[str, int] | None:
     from PIL import Image
 
@@ -1289,6 +1323,7 @@ def _activate_pinyin(session: Session) -> None:
 
 
 def _clip_set(session: Session, data: bytes) -> None:
+    # `xclip -i` forks and returns before the selection is owned; read it back.
     subprocess.run(
         ["xclip", "-selection", "clipboard", "-i"],
         input=data,
@@ -1296,6 +1331,8 @@ def _clip_set(session: Session, data: bytes) -> None:
         check=True,
         timeout=5,
     )
+    if not _wait(lambda: _clip_get(session)[0] == data, 3):
+        raise ImeCheckError("clipboard did not hold the written data within 3s")
 
 
 def _clip_get(session: Session) -> tuple[bytes | None, str | None]:
@@ -1316,8 +1353,8 @@ def _copy_input(session: Session, win: dict, select_all: bool = True) -> dict:
     if select_all:
         session.key(win["wid"], "ctrl+a")
     session.key(win["wid"], "ctrl+c")
-    time.sleep(0.15)
-    data, err = _clip_get(session)
+    # Escape expects the sentinel to survive, so that phase spends the deadline.
+    data, err = _settle(lambda: _clip_get(session), lambda v: v[0] != SENTINEL, 3)
     logs = [
         line
         for line in session.texts(before)

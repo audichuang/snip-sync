@@ -1658,7 +1658,13 @@ def _try_tree(session: NativeSession, win: dict[str, Any], interactions: list[di
     try:
         open_project_list(session, win)
         used = {row.get("control") for row in interactions if isinstance(row, dict) and row.get("item") == "tree"}
-        tree_ids = [control for control in sorted(parse_bounds(session.texts())) if control.startswith("tree-row:") and control not in used]
+        # The tab switch is logged before the frame that paints its rows.
+        deadline = time.monotonic() + 10
+        while True:
+            tree_ids = [control for control in sorted(parse_bounds(session.texts())) if control.startswith("tree-row:") and control not in used]
+            if tree_ids or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
         if not tree_ids:
             note(item="tree", ok=False, input="click", log="", reason="no tree-row probe")
             return
@@ -1705,18 +1711,13 @@ def _try_copy_paste(session: NativeSession, win: dict[str, Any], repo: str, note
     except (NativeBenchError, LeakError) as exc:
         note(item="paste", ok=False, input="key", log="", reason=str(exc), applied=False)
     try:
-        bounds = parse_bounds(session.texts())
+        # Escape cancels only with the paste panel focused, so wait for the button instead.
         before = len(session.lines)
-        if "btn-cancel" in bounds:
-            session.click(win, bounds["btn-cancel"])
-            kind, control = "click", "btn-cancel"
-        else:
-            session.key(win["wid"], "Escape")
-            kind, control = "key", "Escape"
+        _click_control_when_ready(session, win, "btn-cancel", 6.0)
         _index, _when, line = session.wait_line(lambda text: "PASTE_CANCELLED" in text, start=before, timeout=8)
-        note(item="cancel", ok=True, input=kind, control=control, log=line, root=_root_dict(session))
+        note(item="cancel", ok=True, input="click", control="btn-cancel", log=line, root=_root_dict(session))
     except (NativeBenchError, LeakError) as exc:
-        note(item="cancel", ok=False, input="key", log="", reason=str(exc))
+        note(item="cancel", ok=False, input="click", log="", reason=str(exc))
     return checkbox
 
 

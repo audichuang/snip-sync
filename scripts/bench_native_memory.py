@@ -642,8 +642,6 @@ def copy_explicit_selection(
             f"basket after {chk_id} is n={event['n']} {event['entries']}, expected {wanted}"
         )
 
-    # The copy button enables on the frame after the basket update.
-    time.sleep(0.4)
     copy_bounds = require_control(s.texts(), "btn-copy")
     assert_on_window(copy_bounds, win, "btn-copy")
     sentinel = f"SNIP-DRIVER-SENTINEL-{uuid.uuid4().hex}\n".encode()
@@ -653,7 +651,16 @@ def copy_explicit_selection(
         raise NativeBenchError("clipboard sentinel did not stick before copy")
 
     before = len(s.lines)
-    s.click(win, copy_bounds)
+    # The copy button enables on the frame after the basket update and drops
+    # clicks until then. Re-click only while no copy log has appeared at all.
+    copy_logs = ("[APP:COPY_PREP:", "[APP:COPY_REFUSED:", "[APP:COPY_BUSY]", "[APP:COPY_DONE:")
+    for _ in range(5):
+        s.click(win, copy_bounds)
+        try:
+            s.wait_line(lambda line: any(tag in line for tag in copy_logs), start=before, timeout=1.5)
+            break
+        except NativeBenchError:
+            continue
     try:
         _, _, copy_line = s.wait_line(lambda line: "[APP:COPY_DONE:" in line, start=before, timeout=8)
     except NativeBenchError as e:
@@ -664,7 +671,7 @@ def copy_explicit_selection(
         raise NativeBenchError(f"COPY_DONE line has no copied count: {copy_line}")
     copied_n = int(copied_m[1])
 
-    deadline = time.monotonic() + 2.0
+    deadline = time.monotonic() + 10.0
     clip_bytes = b""
     while True:
         try:
@@ -1577,10 +1584,21 @@ def scroll_into_view(
     last: tuple[int, int, int, int] | None = None
     stable_at: float | None = None
     deadline = time.monotonic() + 20
+    waited = False
     while time.monotonic() < deadline and steps <= max_steps:
+        # Taken before the read, so a line landing after it still counts as news.
+        before = len(s.lines)
         lines = s.texts()
         viewport = left_viewport(lines)
         box = parse_bounds(lines).get(control)
+        if box is None and not waited:
+            # The row may just not be painted yet; give it a frame before scrolling away.
+            waited = True
+            try:
+                s.wait_line(lambda line: f"id={control} " in line, start=before, timeout=0.5)
+                continue
+            except NativeBenchError:
+                pass
         if box is not None and visible_in(box, viewport) == 0:
             if box == last and stable_at is not None and time.monotonic() - stable_at >= settle_seconds:
                 return box
@@ -1600,7 +1618,6 @@ def scroll_into_view(
             direction = -1  # the row left upward; wheel down would stay at the bottom
         else:
             direction = 1
-        before = len(s.lines)
         s.focus(win["wid"])
         cx = win["x"] + viewport[0] + viewport[2] // 2
         cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
@@ -1647,7 +1664,12 @@ def show_changes(s: NativeSession, win: dict[str, Any]) -> None:
 
 def open_project_list(s: NativeSession, win: dict[str, Any]) -> None:
     show_tab(s, win, "FileExplorer", "rail-project")
-    s.wait_line(lambda line: "id=repo-row:" in line, timeout=10)
+    # TAB_SWITCHED precedes the painted frame, and old repo-row lines are already in the log.
+    deadline = time.monotonic() + 10
+    while not any(control.startswith("repo-row:") for control in parse_bounds(s.texts())):
+        if time.monotonic() >= deadline:
+            raise NativeBenchError("no repo-row bounds within 10s of opening the project list")
+        time.sleep(0.05)
 
 
 def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[float, float, float, int]:

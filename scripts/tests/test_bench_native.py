@@ -1168,6 +1168,7 @@ class TestScrollSettlesAfterReflow(unittest.TestCase):
         class Moving:
             def __init__(self) -> None:
                 self.n = 0
+                self.lines: list[str] = []
 
             def texts(self, start: int = 0) -> list[str]:
                 self.n += 1

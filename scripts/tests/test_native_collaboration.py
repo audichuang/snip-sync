@@ -1355,6 +1355,24 @@ class _FlowSession(_Session):
         return self.clipboard
 
 
+class ClickUntilLoggedTests(unittest.TestCase):
+    def test_reclicks_a_dropped_click_and_never_repeats_an_accepted_one(self):
+        session = _FlowSession()
+        results = iter([None, "[APP:COPY_PREP: files=1]"])
+        clicks = []
+
+        def click(win, box):
+            clicks.append(box)
+            line = next(results, None)
+            if line:
+                session.add(line)
+
+        session.click = click
+        before = driver.click_until_logged(session, {"wid": "1"}, (0, 0, 10, 10), ("[APP:COPY_PREP:",), .001)
+        self.assertEqual((before, len(clicks)), (0, 2))
+        self.assertEqual(session.texts(), ["[APP:COPY_PREP: files=1]"])
+
+
 class ApplyRefusalTests(unittest.TestCase):
     def native(self):
         return SimpleNamespace(
@@ -1740,7 +1758,7 @@ class ReportOutcomeTests(unittest.TestCase):
         session = _FlowSession()
         manifest = {"repos": [{"repoId": "a", "basename": "source", "relativePath": "machine-a/source"}, {"repoId": "b", "basename": "dest", "relativePath": "machine-b/dest"}]}
         step = {"operation": {"sourceRepoId": "a", "destRepoId": "b", "sourcePath": "src/app.txt"}}
-        native = SimpleNamespace(parse_bounds=lambda lines: {"paste-overwrite:src/app.txt": (0, 0, 10, 10)})
+        native = SimpleNamespace(parse_bounds=lambda lines: {"paste-overwrite:src/app.txt": (0, 0, 10, 10)}, require_control=lambda lines, control: (0, 0, 10, 10))
         with tempfile.TemporaryDirectory() as tmp, patch.object(driver, "select_repo"), patch.object(driver, "select_tree_file") as tree, patch.object(driver, "preview_change", side_effect=AssertionError("unchanged file is absent from Changes")), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "copy_from_button", return_value=b"payload"), patch.object(driver, "transfer_os_clipboard"), patch.object(driver, "paste_preview", return_value="preview"), patch.object(driver, "apply_or_cancel", return_value="[APP:PASTE_DONE: created=0 overwritten=0 skipped=1]"):
             record = driver.blank_step("neg-overwrite-unauthorized")
             driver.run_unauthorized(native, {"a": session, "b": session}, manifest, step, {}, Path(tmp), Path(tmp), 1, [], record, Path(tmp))

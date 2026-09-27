@@ -1049,17 +1049,36 @@ def discover(session: Any, expected: Sequence[str], timeout: float) -> list[str]
 
 
 def scroll_in_view(native: Any, session: Any, win: dict[str, Any], control: str, viewport_id: str, timeout: float) -> tuple[int, int, int, int]:
+    """Bounds of a control once it has stopped moving inside a scroll viewport."""
+    try:
+        wait_control(native, session, control, min(2, timeout))
+    except Exception:
+        pass  # not painted yet or scrolled out of view; the wheel loop below looks for it
     deadline = time.monotonic() + timeout
     steps = 0
+    last: tuple[int, int, int, int] | None = None
+    stable_at = 0.0
     while time.monotonic() < deadline and steps <= 40:
+        before = len(session.lines)
         bounds = native.parse_bounds(session.texts())
         viewport = bounds.get(viewport_id)
         box = bounds.get(control)
         if viewport and box and native.visible_in(box, viewport) == 0:
-            native.assert_on_window(box, win, control)
-            return box
+            # A reflow can still move the row; only a box unchanged for a while is safe to click.
+            if box != last:
+                last, stable_at = box, time.monotonic()
+            elif time.monotonic() - stable_at >= 0.2:
+                native.assert_on_window(box, win, control)
+                return box
+            time.sleep(0.04)
+            continue
+        last = None
         if viewport is None:
-            raise MissingControl(viewport_id, "viewport has no bounds")
+            try:
+                wait_control(native, session, viewport_id, min(2, max(0.0, deadline - time.monotonic())))
+            except Exception as exc:
+                raise MissingControl(viewport_id, "viewport has no bounds") from exc
+            continue
         direction = native.visible_in(box, viewport) if box is not None else 1
         if direction == 0:
             direction = 1
@@ -1067,7 +1086,15 @@ def scroll_in_view(native: Any, session: Any, win: dict[str, Any], control: str,
         cx = win["x"] + viewport[0] + max(1, viewport[2] // 2)
         cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
         session.x("xdotool", "mousemove", str(cx), str(cy), "click", "5" if direction > 0 else "4")
-        time.sleep(0.05)
+        try:
+            session.wait_line(
+                lambda item: f"id={control} " in item or f"id={viewport_id} " in item,
+                start=before,
+                timeout=min(2, max(0.0, deadline - time.monotonic())),
+            )
+        except Exception as exc:
+            if "timed out" not in str(exc):
+                raise DriverError(str(exc)) from exc
         steps += 1
     raise MissingControl(control, f"not inside {viewport_id} after {steps} wheel steps")
 
@@ -1223,6 +1250,24 @@ def preview_change(native: Any, session: Any, win: dict[str, Any], kind: str, pa
     trace.append({"action": "check", "control": chk_id, "path": path})
 
 
+def click_until_logged(session: Any, win: dict[str, Any], box: tuple[int, int, int, int], needles: Sequence[str], timeout: float, tries: int = 4) -> int:
+    """Click until the app logs one of `needles`; a button that is not enabled yet drops the click.
+
+    Every wait starts at the first click, so an accepted click is never sent again.
+    Returns that start index; after the last try the caller's own wait reports the failure.
+    """
+    before = len(session.lines)
+    for _ in range(tries):
+        session.click(win, box)
+        try:
+            session.wait_line(lambda item: any(needle in item for needle in needles), start=before, timeout=min(1.5, timeout))
+            break
+        except Exception as exc:
+            if "timed out" not in str(exc):
+                raise DriverError(str(exc)) from exc
+    return before
+
+
 def copy_from_button(native: Any, session: Any, win: dict[str, Any], timeout: float, trace: list[dict[str, Any]]) -> bytes:
     sentinel = f"SNIP-COLLAB-SENTINEL-{uuid.uuid4().hex}\n".encode()
     session.set_clipboard(sentinel)
@@ -1230,8 +1275,7 @@ def copy_from_button(native: Any, session: Any, win: dict[str, Any], timeout: fl
         raise ClipboardMismatch("sentinel did not stick on the source clipboard")
     box = wait_control(native, session, "btn-copy", timeout)
     native.assert_on_window(box, win, "btn-copy")
-    before = len(session.lines)
-    session.click(win, box)
+    before = click_until_logged(session, win, box, ("[APP:COPY_PREP:", "[APP:COPY_BUSY]", "[APP:COPY_DONE:", "[APP:COPY_REFUSED:"), timeout)
     line = wait_any(session, ("[APP:COPY_DONE:", "[APP:COPY_REFUSED:"), before, timeout)
     if "COPY_REFUSED" in line:
         raise UiRefusal(line)
@@ -1262,6 +1306,8 @@ def paste_preview(native: Any, session: Any, win: dict[str, Any], timeout: float
 
 def click_overwrites(native: Any, session: Any, win: dict[str, Any], paths: Sequence[str] | None, timeout: float, trace: list[dict[str, Any]]) -> list[str]:
     clicked: list[str] = []
+    # PASTE_PREVIEW is logged before the frame that paints the panel.
+    wait_control(native, session, "paste-items", timeout)
     idle = 0
     while idle < 4:
         bounds = native.parse_bounds(session.texts())
@@ -1419,8 +1465,11 @@ def resolve_paste_mappings(
 def apply_or_cancel(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, trace: list[dict[str, Any]]) -> str:
     box = wait_control(native, session, control, timeout)
     native.assert_on_window(box, win, control)
-    before = len(session.lines)
-    session.click(win, box)
+    if control == "btn-cancel":
+        accepted = ("[APP:PASTE_CANCELLED]", "[APP:PASTE_BUSY:")
+    else:
+        accepted = ("[APP:PASTE_APPLYING]", "[APP:PASTE_DONE:", "[APP:PASTE_STALE_DETECTED:", "[APP:PASTE_ERR:", "[APP:APPLY_IGNORED:", "[APP:PASTE_BUSY:")
+    before = click_until_logged(session, win, box, accepted, timeout)
     if control == "btn-cancel":
         line = wait_any(session, ("[APP:PASTE_CANCELLED]", "[APP:PASTE_BUSY:"), before, timeout)
     else:
@@ -1616,8 +1665,11 @@ def copy_commits(native: Any, session: Any, win: dict[str, Any], timeout: float,
         raise ClipboardMismatch("commit sentinel did not stick on the source clipboard")
     box = wait_control(native, session, "btn-copy-commits", timeout)
     native.assert_on_window(box, win, "btn-copy-commits")
-    before = len(session.lines)
-    session.click(win, box)
+    before = click_until_logged(
+        session, win, box,
+        ("[APP:COPY_COMMITS_PREP:", "[APP:COPY_COMMITS_DONE:", "[APP:COPY_COMMITS_ERR:", "[APP:COPY_COMMITS_REFUSED:"),
+        timeout,
+    )
     line = wait_any(session, ("[APP:COPY_COMMITS_DONE:", "[APP:COPY_COMMITS_ERR:", "[APP:COPY_COMMITS_REFUSED:"), before, timeout)
     trace.append({"action": "copy-commits", "line": line})
     if "COPY_COMMITS_DONE" not in line:
@@ -2892,9 +2944,10 @@ def run_unauthorized(native: Any, sessions: Mapping[str, Any], manifest: Mapping
     transfer_os_clipboard(source_session, dest_session)
     preview = paste_preview(native, dest_session, window_of(dest_session, timeout), timeout, trace)
     record["screenshots"]["preview"] = relative_shot(output, capture_checked(native, dest_session, window_of(dest_session, timeout), "preview", timeout))
-    bounds = native.parse_bounds(dest_session.texts())
-    if f"paste-overwrite:{path}" not in bounds:
-        raise MissingControl(f"paste-overwrite:{path}", "unauthorized overwrite row was not rendered, so the refusal cannot be distinguished from a missing plan")
+    try:
+        wait_control(native, dest_session, f"paste-overwrite:{path}", timeout)
+    except Exception as exc:
+        raise MissingControl(f"paste-overwrite:{path}", "unauthorized overwrite row was not rendered, so the refusal cannot be distinguished from a missing plan") from exc
     line = apply_or_cancel(native, dest_session, window_of(dest_session, timeout), "btn-apply", timeout, trace)
     record["clipboard"] = {"sourceSha256": sha256_bytes(payload), "preview": preview, "apply": line}
     record["screenshots"]["result"] = relative_shot(output, capture_checked(native, dest_session, window_of(dest_session, timeout), "result", timeout))

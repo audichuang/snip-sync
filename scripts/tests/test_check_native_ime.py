@@ -139,6 +139,11 @@ class TestImeGate(unittest.TestCase):
         self.assertEqual(found[0]["y"], 60)
         self.assertGreaterEqual(found[0]["w"], 80)
 
+    def test_settle_returns_first_value_meeting_the_condition(self) -> None:
+        values = iter([None, None, {"y": 1}, {"y": 2}])
+        with mock.patch.object(ime.time, "sleep"):
+            self.assertEqual(ime._settle(lambda: next(values), lambda v: v is not None), {"y": 1})
+
     def test_sigkill_is_not_called_graceful(self) -> None:
         self.assertFalse(
             shutdown_graceful(
