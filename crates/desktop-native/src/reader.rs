@@ -490,6 +490,7 @@ impl Default for Reader {
 
 impl Reader {
 	pub fn reset_for_new_preview(&mut self) {
+		self.row_geom.borrow_mut().clear();
 		self.matches.clear();
 		self.current = None;
 		self.anchor = None;
@@ -500,6 +501,7 @@ impl Reader {
 	}
 
 	pub fn release_retained(&mut self) {
+		*self.row_geom.borrow_mut() = Vec::new();
 		self.matches = Vec::new();
 		self.anchor = None;
 		self.head = None;
@@ -1486,6 +1488,13 @@ mod tests {
 	#[test]
 	fn release_retained_drops_match_capacity() {
 		let mut reader = Reader::default();
+		let geometry = reader.row_geom.clone();
+		geometry.borrow_mut().reserve(32);
+		geometry.borrow_mut().push((0, Bounds::default()));
+		reader.reset_for_new_preview();
+		assert!(geometry.borrow().is_empty());
+		assert!(geometry.borrow().capacity() >= 32);
+		geometry.borrow_mut().push((1, Bounds::default()));
 		reader.matches.reserve(32);
 		reader.matches.push((0, 1, 2));
 		reader.anchor = Some((3, 4));
@@ -1494,6 +1503,8 @@ mod tests {
 		reader.release_retained();
 		assert!(reader.matches.is_empty());
 		assert_eq!(reader.matches.capacity(), 0);
+		assert!(geometry.borrow().is_empty());
+		assert_eq!(geometry.borrow().capacity(), 0);
 		assert!(reader.anchor.is_none());
 		assert!(reader.head.is_none());
 		assert!(reader.current.is_none());
