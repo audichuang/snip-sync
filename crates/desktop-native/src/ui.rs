@@ -426,22 +426,24 @@ fn change_style(ct: Option<ChangeType>) -> (&'static str, u32) {
 	}
 }
 
-/// Operation label, color and reason key for a paste row.
+/// Operation label, file-name colour and reason key for a paste row. The
+/// colour follows IntelliJ's file status: created green, modified blue
+/// (whether or not overwriting is allowed yet), deleted grey.
 fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 	if !item.selected {
-		("op_excluded", pal().text_muted, "reason_excluded")
+		("op_excluded", pal().text_disabled, "reason_excluded")
 	} else if item.is_delete {
 		if item.dest_exists {
-			("op_delete", pal().error, "reason_delete")
+			("op_delete", pal().git_deleted, "reason_delete")
 		} else {
-			("op_skip", pal().text_muted, "reason_delete_missing")
+			("op_skip", pal().text_disabled, "reason_delete_missing")
 		}
 	} else if !item.dest_exists {
 		("op_create", pal().git_added, "reason_create")
 	} else if item.overwrite_allowed {
-		("op_overwrite", pal().warning, "reason_overwrite")
+		("op_overwrite", pal().git_modified, "reason_overwrite")
 	} else {
-		("op_skip", pal().text_muted, "reason_exists")
+		("op_skip", pal().git_modified, "reason_exists")
 	}
 }
 
@@ -3707,49 +3709,51 @@ impl WorkbenchModel {
 					.child(fill_text(dest)),
 			)
 			.child(
-				button(
-					"btn-apply",
-					if applying {
+				button("btn-apply", "", Btn::Primary, can_apply, 50)
+					.pl(px(6.))
+					.child(icon_tinted(
+						Icon::Apply,
+						14.,
+						if can_apply {
+							pal().accent_text
+						} else {
+							pal().text_disabled
+						},
+					))
+					.child(if applying {
 						t("applying", loc)
 					} else {
 						t("apply", loc)
-					},
-					Btn::Primary,
-					can_apply,
-					50,
-				)
-				.when(loading, |b| {
-					b.tooltip(tip(t("paste_loading_refused", loc)))
-				})
-				.when(!loading && !mapping_ready, |b| {
-					b.tooltip(tip(t("mapping_required", loc)))
-				})
-				.when(can_apply, |b| {
-					b.on_click(cx.listener(|this, _, _, cx| {
-						this.apply_paste_restore(cx)
-					}))
-				})
-				.children(probe(log, "btn-apply")),
+					})
+					.when(loading, |b| {
+						b.tooltip(tip(t("paste_loading_refused", loc)))
+					})
+					.when(!loading && !mapping_ready, |b| {
+						b.tooltip(tip(t("mapping_required", loc)))
+					})
+					.when(can_apply, |b| {
+						b.on_click(cx.listener(|this, _, _, cx| {
+							this.apply_paste_restore(cx)
+						}))
+					})
+					.children(probe(log, "btn-apply")),
 			)
 			.child(
 				// The write cannot be interrupted, so Cancel is locked until it
 				// finishes rather than pretending to cancel it.
-				button(
-					"btn-cancel",
-					t("cancel", loc),
-					Btn::Default,
-					!applying,
-					51,
-				)
-				.when(!applying, |b| {
-					b.on_click(cx.listener(|this, _, _, cx| {
-						this.cancel_paste_preview(cx)
-					}))
-				})
-				.when(applying, |b| {
-					b.tooltip(tip(t("paste_busy_refused", loc)))
-				})
-				.children(probe(log, "btn-cancel")),
+				button("btn-cancel", "", Btn::Default, !applying, 51)
+					.pl(px(6.))
+					.child(icon(Icon::Cancel, 14.))
+					.child(t("cancel", loc))
+					.when(!applying, |b| {
+						b.on_click(cx.listener(|this, _, _, cx| {
+							this.cancel_paste_preview(cx)
+						}))
+					})
+					.when(applying, |b| {
+						b.tooltip(tip(t("paste_busy_refused", loc)))
+					})
+					.children(probe(log, "btn-cancel")),
 			)
 	}
 
@@ -3855,13 +3859,19 @@ impl WorkbenchModel {
 					.text_color(rgb(pal().git_added))
 					.child(format!("{} {creates}", t("op_create", loc))),
 			)
-			.child(div().flex_shrink_0().text_color(rgb(pal().warning)).child(
-				format!("{} {overwrites}/{existing}", t("op_overwrite", loc)),
-			))
 			.child(
 				div()
 					.flex_shrink_0()
-					.text_color(rgb(pal().error))
+					.text_color(rgb(pal().git_modified))
+					.child(format!(
+						"{} {overwrites}/{existing}",
+						t("op_overwrite", loc)
+					)),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.text_color(rgb(pal().git_deleted))
 					.child(format!("{} {deletes}", t("op_delete", loc))),
 			)
 			.child(
@@ -3875,8 +3885,42 @@ impl WorkbenchModel {
 					.text_color(rgb(pal().text_disabled)),
 			);
 
-		let rows = plan.items.iter().enumerate().map(|(ix, item)| {
-			let (op, op_color, _) = paste_op(item);
+		// IntelliJ "Apply Patch": a change tree grouped by destination root
+		// and directory; the file name's colour says what happens to it.
+		let node_row = |depth: usize| {
+			div()
+				.flex()
+				.flex_row()
+				.items_center()
+				.flex_shrink_0()
+				.h(px(24.))
+				.pl(px(8. + 18. * depth as f32))
+				.pr(px(8.))
+				.gap(px(6.))
+		};
+		let rows = plan.tree_rows().into_iter().map(|node| {
+			let (ix, depth) = match node {
+				PasteNode::Root(ref name, n) | PasteNode::Dir(ref name, n) => {
+					let root = matches!(node, PasteNode::Root(..));
+					let name = name.clone();
+					return node_row(usize::from(!root))
+						.child(icon(Icon::Folder, 14.))
+						.child(clip_text(name).flex_shrink().when(root, |d| {
+							d.font_weight(FontWeight::SEMIBOLD)
+						}))
+						.child(
+							div()
+								.flex_shrink_0()
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(n.to_string()),
+						)
+						.into_any_element();
+				}
+				PasteNode::File(ix, depth) => (ix, depth),
+			};
+			let item = &plan.items[ix];
+			let (_, name_color, _) = paste_op(item);
 			let is_sel = ix == plan.selected_item_idx;
 			let path = item.path.clone();
 			let row_id = format!("paste-row:{path}");
@@ -3884,22 +3928,10 @@ impl WorkbenchModel {
 			let ow_id = format!("paste-overwrite:{path}");
 			let can_overwrite = item.dest_exists && !item.is_delete;
 			let ow_on = item.overwrite_allowed;
-			// IntelliJ-style: file name first, muted parent directory after it.
-			let (parent, name) = match path.rsplit_once('/') {
-				Some((p, n)) => (p.to_string(), n.to_string()),
-				None => (String::new(), path.clone()),
-			};
-			div()
+			let (_, name) = split_dir(&path);
+			node_row(depth)
 				.id(SharedString::from(row_id.clone()))
 				.relative()
-				.flex()
-				.flex_row()
-				.items_center()
-				.flex_shrink_0()
-				.h(px(26.))
-				.pl(px(12.))
-				.pr(px(8.))
-				.gap(px(8.))
 				.cursor_pointer()
 				.when(is_sel, |d| d.bg(rgb(pal().selection_bg)))
 				.when(!is_sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
@@ -3912,7 +3944,7 @@ impl WorkbenchModel {
 						.id(SharedString::from(inc_id.clone()))
 						.relative()
 						.flex_shrink_0()
-						.size(px(18.))
+						.size(px(16.))
 						.flex()
 						.items_center()
 						.justify_center()
@@ -3929,54 +3961,15 @@ impl WorkbenchModel {
 						.child(checkbox(item.selected))
 						.children(probe(log, inc_id)),
 				)
+				.child(icon(file_icon(name), 14.))
 				.child(
-					div()
-						.flex_shrink_0()
-						.w(px(60.))
-						.text_size(px(SMALL_TEXT))
-						.font_weight(FontWeight::SEMIBOLD)
-						.text_color(rgb(op_color))
-						.child(t(op, loc)),
-				)
-				.child(
-					div()
-						.flex()
-						.flex_row()
-						.items_center()
-						.gap(px(8.))
+					clip_text(name.to_string())
 						.flex_1()
-						.min_w_0()
-						.overflow_hidden()
-						.child(
-							clip_text(name)
-								.flex_shrink_0()
-								.max_w(gpui::relative(0.7))
-								.when(!item.selected, |d| {
-									d.text_color(rgb(pal().text_muted))
-								}),
-						)
-						.child(
-							fill_text(parent)
-								.text_size(px(SMALL_TEXT))
-								.text_color(rgb(pal().text_muted)),
-						),
-				)
-				.child(
-					clip_text(item.dest_root_name.clone())
-						.flex_shrink_0()
-						.max_w(px(110.))
-						.text_size(px(10.))
-						.px(px(5.))
-						.rounded(px(3.))
-						.bg(rgb(pal().ref_bg))
-						.text_color(rgb(pal().text_muted)),
+						.text_color(rgb(name_color)),
 				)
 				.child(
 					div()
-						.flex()
-						.justify_end()
 						.flex_shrink_0()
-						.min_w(px(44.))
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
 						.child(if item.is_delete {
@@ -4003,7 +3996,7 @@ impl WorkbenchModel {
 								.rounded(px(3.))
 								.text_size(px(SMALL_TEXT))
 								.text_color(rgb(if ow_on {
-									pal().warning
+									pal().text
 								} else {
 									pal().text_muted
 								}))
@@ -4028,6 +4021,7 @@ impl WorkbenchModel {
 					},
 				))
 				.children(probe(log, row_id))
+				.into_any_element()
 		});
 
 		let (detail_title, reason) = match selected {
