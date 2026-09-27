@@ -4232,6 +4232,7 @@ impl WorkbenchModel {
 		self.preview_generation += 1;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		self.clear_preview();
+		self.reader.release_retained();
 		self.preview_loading = false;
 		self.preview_error = None;
 		self.selected_file = None;

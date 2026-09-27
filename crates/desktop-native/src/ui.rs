@@ -3193,11 +3193,7 @@ impl WorkbenchModel {
 						true,
 						35,
 					)
-					.on_click(
-						cx.listener(|this, _, _, cx| {
-							this.step_change(false, cx)
-						}),
-					)
+					.on_click(cx.listener(|this, _, _, cx| this.prev_diff(cx)))
 					.children(probe(log, "btn-prev-diff")),
 				)
 				.child(
@@ -3208,11 +3204,7 @@ impl WorkbenchModel {
 						true,
 						35,
 					)
-					.on_click(
-						cx.listener(|this, _, _, cx| {
-							this.step_change(true, cx)
-						}),
-					)
+					.on_click(cx.listener(|this, _, _, cx| this.next_diff(cx)))
 					.children(probe(log, "btn-next-diff")),
 				)
 				.child(
@@ -3380,10 +3372,9 @@ impl WorkbenchModel {
 		let showing = self.preview.is_some()
 			|| self.selected_commit.is_some()
 			|| self.compare.is_some();
-		// Only a file view closes; a commit or compare is left from the log.
-		let closable = (self.preview.is_some() || self.preview_error.is_some())
-			&& self.selected_commit.is_none()
-			&& self.compare.is_none();
+		// Same model method as the tab menu's Close.
+		let closable =
+			self.open_tab_count() > 0 || self.preview_error.is_some();
 		div()
 			.flex()
 			.flex_col()
@@ -3397,7 +3388,8 @@ impl WorkbenchModel {
 				tab_icon,
 				self.preview.is_some() && !self.reader.pinned,
 				closable.then_some(
-					Self::close_editor_tab as fn(&mut Self, &mut Context<Self>),
+					(|this, cx| this.close_tab(0, cx))
+						as fn(&mut Self, &mut Context<Self>),
 				),
 				cx,
 			))
@@ -3790,7 +3782,7 @@ impl WorkbenchModel {
 				t("paste_tab", self.locale).to_string(),
 				Icon::Paste,
 				false,
-				Some(Self::cancel_paste_preview),
+				Some(|this, cx| this.close_tab(0, cx)),
 				cx,
 			))
 			.child(self.paste_action_bar(dest, false, false, false, cx))
@@ -3837,7 +3829,8 @@ impl WorkbenchModel {
 			Icon::Paste,
 			false,
 			(!applying).then_some(
-				Self::cancel_paste_preview as fn(&mut Self, &mut Context<Self>),
+				(|this, cx| this.close_tab(0, cx))
+					as fn(&mut Self, &mut Context<Self>),
 			),
 			cx,
 		);
@@ -5382,12 +5375,12 @@ impl Render for WorkbenchModel {
 			.on_action(cx.listener(|this, _: &GotoLine, window, cx| {
 				this.open_find(true, window, cx)
 			}))
-			.on_action(cx.listener(|this, _: &NextDiff, _, cx| {
-				this.step_change(true, cx)
-			}))
-			.on_action(cx.listener(|this, _: &PrevDiff, _, cx| {
-				this.step_change(false, cx)
-			}))
+			.on_action(
+				cx.listener(|this, _: &NextDiff, _, cx| this.next_diff(cx)),
+			)
+			.on_action(
+				cx.listener(|this, _: &PrevDiff, _, cx| this.prev_diff(cx)),
+			)
 			.on_action(
 				cx.listener(|this, _: &FindNext, _, cx| {
 					this.find_step(true, cx)

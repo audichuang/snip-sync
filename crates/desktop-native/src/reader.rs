@@ -947,8 +947,17 @@ impl WorkbenchModel {
 		self.run_find(&q, cx);
 	}
 
-	/// F7 / Shift+F7: the next or previous change block, wrapping around.
-	pub fn step_change(&mut self, forward: bool, cx: &mut Context<Self>) {
+	/// F7: the next change block (unified or side-by-side), wrapping around.
+	pub fn next_diff(&mut self, cx: &mut Context<Self>) {
+		self.step_change(true, cx)
+	}
+
+	/// Shift+F7: the previous change block, wrapping around.
+	pub fn prev_diff(&mut self, cx: &mut Context<Self>) {
+		self.step_change(false, cx)
+	}
+
+	fn step_change(&mut self, forward: bool, cx: &mut Context<Self>) {
 		let Some(d) = self.preview.as_ref().and_then(|p| p.diff.as_ref())
 		else {
 			return;
@@ -979,15 +988,6 @@ impl WorkbenchModel {
 		self.reader.anchor = None;
 		self.reader.head = None;
 		app_log!("[APP:DIFF_MODE: {:?}]", self.reader.diff_mode);
-		cx.notify();
-	}
-
-	/// The editor tab's ✕: drop the shown file (the tree keeps its row).
-	pub fn close_editor_tab(&mut self, cx: &mut Context<Self>) {
-		self.clear_preview();
-		self.preview_error = None;
-		self.reader.release_retained();
-		app_log!("[APP:TAB_CLOSED]");
 		cx.notify();
 	}
 
