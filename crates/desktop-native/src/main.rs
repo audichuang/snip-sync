@@ -75,6 +75,7 @@ mod history;
 pub mod i18n;
 mod icons;
 pub mod lifecycle;
+mod menu;
 pub mod paste;
 mod reader;
 mod selector;
@@ -167,6 +168,21 @@ actions!(
 		LogOpen,
 		LogSearchFocus,
 		LogHead,
+		// IntelliJ chrome (IJ-2c).
+		NextDiff,
+		PrevDiff,
+		MenuUp,
+		MenuDown,
+		MenuConfirm,
+		MenuCancel,
+		LogParent,
+		LogChild,
+		LogPageUp,
+		LogPageDown,
+		ToolPageUp,
+		ToolPageDown,
+		HideToolWindow,
+		FocusEditor,
 	]
 );
 
@@ -754,6 +770,8 @@ pub struct WorkbenchModel {
 	pub lifecycle: lifecycle::Lifecycle,
 	pub watch_running: bool,
 	pub last_life_log: String,
+	/// Context menus, speed search and Changes group state.
+	pub chrome: menu::Chrome,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1007,6 +1025,7 @@ impl WorkbenchModel {
 			lifecycle: lifecycle::Lifecycle::new(1),
 			watch_running: false,
 			last_life_log: String::new(),
+			chrome: menu::Chrome::new(cx),
 		};
 		model.reload_repos(cx);
 		model
@@ -4606,8 +4625,15 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("alt-1", ShowProject, None),
 		KeyBinding::new("alt-0", ShowChanges, None),
 		KeyBinding::new("alt-9", ToggleLog, None),
+		// Repo selector has no IntelliJ counterpart; the branches popup is
+		// IntelliJ's Ctrl+Shift+` (X11 may report the shifted key as `~`).
 		KeyBinding::new("alt-shift-r", OpenRepoSelector, None),
-		KeyBinding::new("alt-shift-b", OpenRefSelector, None),
+		KeyBinding::new("secondary-shift-`", OpenRefSelector, None),
+		KeyBinding::new("secondary-shift-~", OpenRefSelector, None),
+		KeyBinding::new("secondary-~", OpenRefSelector, None),
+		KeyBinding::new("shift-escape", HideToolWindow, None),
+		KeyBinding::new("f7", NextDiff, None),
+		KeyBinding::new("shift-f7", PrevDiff, None),
 		KeyBinding::new("ctrl-shift-w", CloseWorkspace, None),
 		KeyBinding::new("cmd-shift-w", CloseWorkspace, None),
 		KeyBinding::new("ctrl-shift-o", OpenWorkspace, None),
@@ -4641,6 +4667,15 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("left", TreeCollapse, Some("ToolList")),
 		KeyBinding::new("enter", TreeOpen, Some("ToolList")),
 		KeyBinding::new("space", TreeToggle, Some("ToolList")),
+		KeyBinding::new("secondary-d", TreeOpen, Some("ToolList")),
+		KeyBinding::new("pageup", ToolPageUp, Some("ToolList")),
+		KeyBinding::new("pagedown", ToolPageDown, Some("ToolList")),
+		KeyBinding::new("escape", FocusEditor, Some("ToolList")),
+		// Context menu.
+		KeyBinding::new("up", MenuUp, Some("ContextMenu")),
+		KeyBinding::new("down", MenuDown, Some("ContextMenu")),
+		KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
+		KeyBinding::new("escape", MenuCancel, Some("ContextMenu")),
 		// Git log.
 		KeyBinding::new("up", LogUp, Some("GitLog")),
 		KeyBinding::new("down", LogDown, Some("GitLog")),
@@ -4648,8 +4683,13 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("shift-down", LogExtendDown, Some("GitLog")),
 		KeyBinding::new("enter", LogOpen, Some("GitLog")),
 		KeyBinding::new("ctrl-f", LogSearchFocus, Some("GitLog")),
-		KeyBinding::new("pagedown", HistoryNextPage, Some("GitLog")),
-		KeyBinding::new("pageup", HistoryPrevPage, Some("GitLog")),
+		KeyBinding::new("secondary-d", LogOpen, Some("GitLog")),
+		KeyBinding::new("left", LogParent, Some("GitLog")),
+		KeyBinding::new("right", LogChild, Some("GitLog")),
+		KeyBinding::new("pagedown", LogPageDown, Some("GitLog")),
+		KeyBinding::new("pageup", LogPageUp, Some("GitLog")),
+		KeyBinding::new("escape", FocusEditor, Some("GitLog")),
+		// No IntelliJ key for "go to HEAD" in the Log; kept.
 		KeyBinding::new("h", LogHead, Some("GitLog")),
 	];
 	b.extend(text_input::bindings());

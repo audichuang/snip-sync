@@ -85,12 +85,7 @@ pub fn tf<T: std::fmt::Display>(key: &str, loc: Locale, args: &[T]) -> String {
 			res.push(c);
 		}
 	}
-	let remaining: Vec<String> = arg_iter.map(|a| a.to_string()).collect();
-	if !remaining.is_empty() {
-		res.push_str(" [");
-		res.push_str(&remaining.join(", "));
-		res.push(']');
-	}
+	// Extra args are ignored: a message may pass data its wording omits.
 	res
 }
 
@@ -339,6 +334,23 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"workspace_bad_path" => "找不到工作區資料夾：{}",
 			"lifecycle_jobs" => "工作 {}",
 			"tip_workspace_menu" => "關閉 Ctrl+Shift+W，開啟 Ctrl+Shift+O",
+			// chrome (IJ-2c)
+			"menu_add_basket" => "加入選取籃",
+			"menu_remove_basket" => "從選取籃移除",
+			"menu_copy_path" => "複製路徑",
+			"menu_copy_relative_path" => "複製相對路徑",
+			"menu_show_diff" => "顯示差異",
+			"menu_copy_revision" => "複製修訂版號",
+			"menu_go_parent" => "前往父 commit",
+			"menu_go_child" => "前往子 commit",
+			"menu_browse_tree" => "瀏覽此修訂版的檔案",
+			"status_text_copied" => "已複製: {}",
+			"status_repo_count_ok" => "{} 個儲存庫",
+			"tip_basket_copy" => "複製選取籃 ({})",
+			"tip_language" => "切換語言",
+			"tip_vcs_branch" => "目前分支",
+			"speed_search_none" => "沒有符合項目",
+			"n_files" => "{} 個檔案",
 			_ => "",
 		},
 		Locale::En => match key {
@@ -584,6 +596,23 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"workspace_bad_path" => "Workspace folder was not found: {}",
 			"lifecycle_jobs" => "jobs {}",
 			"tip_workspace_menu" => "Close Ctrl+Shift+W, open Ctrl+Shift+O",
+			// chrome (IJ-2c)
+			"menu_add_basket" => "Add to Basket",
+			"menu_remove_basket" => "Remove from Basket",
+			"menu_copy_path" => "Copy Path",
+			"menu_copy_relative_path" => "Copy Relative Path",
+			"menu_show_diff" => "Show Diff",
+			"menu_copy_revision" => "Copy Revision Number",
+			"menu_go_parent" => "Go to Parent Commit",
+			"menu_go_child" => "Go to Child Commit",
+			"menu_browse_tree" => "Browse Files at Revision",
+			"status_text_copied" => "Copied: {}",
+			"status_repo_count_ok" => "{} repositories",
+			"tip_basket_copy" => "Copy basket ({})",
+			"tip_language" => "Switch language",
+			"tip_vcs_branch" => "Current branch",
+			"speed_search_none" => "No matches",
+			"n_files" => "{} files",
 			_ => "",
 		},
 	}
@@ -603,6 +632,13 @@ mod tests {
 		assert_eq!(zh, "已載入 4 筆 commit (第 1 頁)");
 		let en = msg.render(Locale::En);
 		assert_eq!(en, "Loaded 4 commits (page 1)");
+	}
+
+	#[test]
+	fn unused_args_are_not_printed() {
+		let msg =
+			Msg::new("status_repos_loaded", ["1".to_string(), "0".to_string()]);
+		assert_eq!(msg.render(Locale::ZhTw), "已載入 1 個儲存庫");
 	}
 
 	#[test]

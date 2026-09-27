@@ -52,6 +52,14 @@ impl SelectorCandidate<'_> {
 		}
 	}
 
+	/// Section of the ref popup (`refs_local` / `refs_remote` / `refs_tags`).
+	pub(crate) fn group(&self) -> Option<&'static str> {
+		match self {
+			Self::Repo { .. } => None,
+			Self::Ref { group, .. } => *group,
+		}
+	}
+
 	fn pick(self) -> Pick {
 		match self {
 			Self::Repo { index, .. } => Pick::Repo(index),
