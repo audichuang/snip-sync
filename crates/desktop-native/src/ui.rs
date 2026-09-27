@@ -5756,9 +5756,9 @@ impl WorkbenchModel {
 			return div().into_any_element();
 		};
 		let loc = self.locale;
-		// Every tooltip of the row is registered only when this is true (a
-		// context menu over the log will turn it off).
-		let show_tips = true;
+		// Row tooltips are off while a context menu is open (they would
+		// draw over it).
+		let show_tips = self.chrome.menu.is_none();
 		let selected = self.selected_commit.as_deref() == Some(&c.sha);
 		let in_range =
 			self.range_rows().is_some_and(|(a, b)| ix >= a && ix <= b);
