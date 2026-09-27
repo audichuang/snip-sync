@@ -867,7 +867,7 @@ fn parse_status(
 			branch = (name != "(detached)").then(|| name.to_string());
 		} else if text.starts_with('#') || text.starts_with('!') {
 		} else if text.starts_with("? ") {
-			c.untracked += 1;
+			c.untracked += usize::from(!text.ends_with('/'));
 		} else if text.starts_with("u ") {
 			c.conflicted += 1;
 		} else if let Some(rest) =
@@ -889,7 +889,10 @@ fn parse_status(
 	Ok((head, branch, c))
 }
 
-/// `git status --porcelain=v2 -z` plus `extra`. `--no-optional-locks`: a
+/// `git status --porcelain=v2 -z` plus `extra`. Untracked files are listed
+/// one by one (`=all`), as IntelliJ shows them: a collapsed `dir/` entry is
+/// not a file that preview, copy or the basket can use. A `?` entry ending
+/// in `/` is then a nested repository. `--no-optional-locks`: a
 /// background read must not refresh and rewrite the index (that looks like
 /// an index change to staleness checks and can take `index.lock` from a
 /// replay). An oversized status is an error, never a partial list.
@@ -903,7 +906,7 @@ fn read_status(
 		"status",
 		"--porcelain=v2",
 		"-z",
-		"--untracked-files=normal",
+		"--untracked-files=all",
 		"--no-renames",
 	];
 	args.extend_from_slice(extra);
@@ -987,7 +990,9 @@ fn parse_status_details(out: &[u8]) -> Result<StatusDetails, GitError> {
 			continue;
 		}
 		if let Some(path) = text.strip_prefix("? ") {
-			details.untracked.push(path.to_string());
+			if !path.ends_with('/') {
+				details.untracked.push(path.to_string());
+			}
 		} else if let Some(rest) = text.strip_prefix("u ") {
 			let parts: Vec<&str> = rest.splitn(10, ' ').collect();
 			let path = parts.get(9).ok_or_else(bad)?;
@@ -1885,6 +1890,10 @@ mod tests {
 		git(&repo, &["add", "staged.txt"]);
 		// Untracked file
 		std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+		// An untracked folder lists its files, never `reports/` itself.
+		std::fs::create_dir_all(repo.join("reports/q1")).unwrap();
+		std::fs::write(repo.join("reports/q1/a.txt"), "a\n").unwrap();
+		std::fs::write(repo.join("reports/b.txt"), "b\n").unwrap();
 
 		let git = Git::open(&repo).unwrap();
 		let details =
@@ -1893,8 +1902,10 @@ mod tests {
 		assert_eq!(details.staged[0].0, "staged.txt");
 		assert_eq!(details.unstaged.len(), 1);
 		assert_eq!(details.unstaged[0].0, "tracked.txt");
-		assert_eq!(details.untracked.len(), 1);
-		assert_eq!(details.untracked[0], "untracked.txt");
+		assert_eq!(
+			details.untracked,
+			["reports/b.txt", "reports/q1/a.txt", "untracked.txt"]
+		);
 		assert_eq!(details.conflicted.len(), 0);
 	}
 }

@@ -812,6 +812,8 @@ pub struct WorkbenchModel {
 	pub lifecycle: lifecycle::Lifecycle,
 	pub watch_running: bool,
 	pub last_life_log: String,
+	/// The selected repo's Project row is collapsed (its tree stays loaded).
+	pub repo_collapsed: bool,
 	/// Context menus, speed search and Changes group state.
 	pub chrome: menu::Chrome,
 }
@@ -1123,6 +1125,7 @@ impl WorkbenchModel {
 			watch_running: false,
 			last_life_log: String::new(),
 			chrome: menu::Chrome::new(cx),
+			repo_collapsed: false,
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
@@ -2399,6 +2402,28 @@ impl WorkbenchModel {
 			self.select_repo_internal(pos, false, cx);
 		}
 		cx.notify();
+	}
+
+	/// A repo row click, as in IntelliJ's Project view: expands a collapsed
+	/// root, collapses an expanded one. Another repo is selected expanded.
+	pub fn toggle_repo_row(&mut self, idx: usize, cx: &mut Context<Self>) {
+		let expanded =
+			self.selected_repo_idx == Some(idx) && !self.repo_collapsed;
+		self.set_repo_row_expanded(idx, !expanded, cx);
+	}
+
+	pub fn set_repo_row_expanded(
+		&mut self,
+		idx: usize,
+		expanded: bool,
+		cx: &mut Context<Self>,
+	) {
+		self.repo_collapsed = !expanded;
+		if self.selected_repo_idx == Some(idx) {
+			cx.notify();
+		} else if expanded {
+			self.select_repo(idx, cx);
+		}
 	}
 
 	pub fn select_repo(&mut self, idx: usize, cx: &mut Context<Self>) {

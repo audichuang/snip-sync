@@ -317,6 +317,15 @@ fn button(
 		.child(label.into())
 }
 
+/// `Ctrl+Shift+X` as macOS prints it (`⇧⌘X`); unchanged elsewhere.
+fn mac_keys(text: &str) -> String {
+	if cfg!(target_os = "macos") {
+		text.replace("Ctrl+Shift+", "⇧⌘")
+	} else {
+		text.to_string()
+	}
+}
+
 /// A popup row styled like the context menu's items: no frame, hover fill.
 fn menu_row(id: impl Into<ElementId>, tab: isize) -> Stateful<Div> {
 	div()
@@ -985,7 +994,7 @@ impl WorkbenchModel {
 		let mut out = Vec::new();
 		for idx in 0..self.repos.len() {
 			out.push(ProjRow::Repo(idx));
-			if self.selected_repo_idx == Some(idx) {
+			if self.selected_repo_idx == Some(idx) && !self.repo_collapsed {
 				if let Some(t) = &self.file_tree {
 					out.extend(
 						t.flatten_visible(t.visible_limit())
@@ -1260,8 +1269,11 @@ impl WorkbenchModel {
 		let collapse = action == "collapse";
 		match &rows[self.tree_cursor] {
 			ProjRow::Repo(i) => {
-				if action == "open" || expand {
-					self.select_repo(*i, cx);
+				let i = *i;
+				if action == "open" || action == "toggle" {
+					self.toggle_repo_row(i, cx);
+				} else if expand || collapse {
+					self.set_repo_row_expanded(i, expand, cx);
 				}
 			}
 			ProjRow::Work(r) => {
@@ -1555,7 +1567,7 @@ impl WorkbenchModel {
 					.when(self.workspace_menu, |d| d.bg(rgb(pal().hover_bg)))
 					.tooltip(tip(format!(
 						"{tip_text} · {}",
-						t("tip_workspace_menu", loc)
+						mac_keys(t("tip_workspace_menu", loc))
 					)))
 					.on_click(cx.listener(|this, _, _, cx| {
 						this.toggle_workspace_menu(cx);
@@ -2550,7 +2562,8 @@ impl WorkbenchModel {
 		match row {
 			ProjRow::Repo(idx) => {
 				let repo = &self.repos[idx];
-				let selected = self.selected_repo_idx == Some(idx);
+				let expanded =
+					self.selected_repo_idx == Some(idx) && !self.repo_collapsed;
 				let id = format!("repo-row:{}", repo.name);
 				let mut counts = div()
 					.flex()
@@ -2645,7 +2658,7 @@ impl WorkbenchModel {
 					})
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.tree_cursor = ix;
-						this.select_repo(idx, cx);
+						this.toggle_repo_row(idx, cx);
 					}))
 					.on_mouse_down(
 						MouseButton::Right,
@@ -2656,7 +2669,7 @@ impl WorkbenchModel {
 						}),
 					)
 					.child(icon(
-						if selected {
+						if expanded {
 							Icon::ChevronDown
 						} else {
 							Icon::ChevronRight
