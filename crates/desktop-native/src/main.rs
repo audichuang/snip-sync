@@ -179,6 +179,17 @@ pub struct FileChangeItem {
 	pub selected: bool,
 }
 
+impl FileChangeItem {
+	/// False when Git's path bytes were not UTF-8: the lossy name here does
+	/// not exist on disk, so selecting it would make the whole Copy fail.
+	// ponytail: core's status listing is already lossy, so U+FFFD is the only
+	// signal (a real U+FFFD name is refused too); carry raw bytes from core to
+	// tell them apart.
+	pub fn is_valid_utf8(&self) -> bool {
+		!self.path.contains(char::REPLACEMENT_CHARACTER)
+	}
+}
+
 type WorkingChangeTuple = (String, Option<ChangeType>, SourceKind, bool);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -649,6 +660,10 @@ pub struct WorkbenchModel {
 	pub popover_cursor: usize,
 
 	pub basket: Vec<(CanonicalRootId, Vec<ExportItem>)>,
+	/// Status-bar basket text (localized summary, collision), rebuilt by
+	/// `refresh_basket_view` when the basket, repo names or locale change
+	/// instead of on every frame.
+	pub basket_view: (String, Option<String>),
 	pub history_cancel: Option<CancelToken>,
 	pub preview_cancel: Option<CancelToken>,
 	pub tree_cancel: Option<CancelToken>,
@@ -665,6 +680,11 @@ pub struct WorkbenchModel {
 	pub discovery_depth_overflow: usize,
 	discovery_generation: u64,
 	pinned_repo: Option<(PathBuf, PathBuf)>,
+	/// The open repo kept across a rescan's wipe until the walk finds it
+	/// again; still set when a complete walk ends means it is gone.
+	carried_repo: Option<(PathBuf, PathBuf)>,
+	/// A user Refresh also reloads the open repo once the rescan ends.
+	refresh_reload: bool,
 	manual_repos: Vec<RepoEntry>,
 	tree_queue: VecDeque<TreeIo>,
 	tree_worker: u64,
@@ -914,6 +934,7 @@ impl WorkbenchModel {
 			popover: None,
 			popover_cursor: 0,
 			basket: Vec::new(),
+			basket_view: (String::new(), None),
 			history_cancel: None,
 			preview_cancel: None,
 			tree_cancel: None,
@@ -930,6 +951,8 @@ impl WorkbenchModel {
 			discovery_depth_overflow: 0,
 			discovery_generation: 0,
 			pinned_repo: None,
+			carried_repo: None,
+			refresh_reload: false,
 			manual_repos: Vec::new(),
 			tree_queue: VecDeque::new(),
 			tree_worker: 0,
@@ -994,8 +1017,14 @@ impl WorkbenchModel {
 		self.status = Msg::new(key, args);
 	}
 
+	/// The open repo. An index that no longer names the pinned identity (the
+	/// list changed under it) is not trusted, so nothing acts on another repo.
 	pub fn repo(&self) -> Option<&RepoEntry> {
-		self.selected_repo_idx.and_then(|i| self.repos.get(i))
+		let entry = self.repos.get(self.selected_repo_idx?)?;
+		match &self.pinned_repo {
+			Some(key) if !repo_key_matches(entry, key) => None,
+			_ => Some(entry),
+		}
 	}
 
 	pub fn repo_root(&self) -> Option<PathBuf> {
@@ -1061,7 +1090,7 @@ impl WorkbenchModel {
 		self.preview_error = None;
 		self.reader.reset_for_new_preview();
 		// Re-run an active find against the new text.
-		self.reader.matches.clear();
+		self.refind();
 		true
 	}
 
@@ -1121,7 +1150,7 @@ impl WorkbenchModel {
 	pub fn select_all_files(&mut self, cx: &mut Context<Self>) {
 		let mut candidate = self.selection_candidate();
 		for file in &mut candidate.files {
-			file.selected = true;
+			file.selected = file.is_valid_utf8();
 		}
 		if let Some(tree) = &self.file_tree {
 			candidate.paths = tree.selection_for_all(true);
@@ -1137,6 +1166,12 @@ impl WorkbenchModel {
 	}
 
 	pub fn toggle_file(&mut self, idx: usize, cx: &mut Context<Self>) {
+		if self.files.get(idx).is_some_and(|f| !f.is_valid_utf8()) {
+			self.set_status("change_not_utf8", []);
+			app_log!("[APP:FILE_TOGGLE_REFUSED: not_utf8]");
+			cx.notify();
+			return;
+		}
 		let mut candidate = self.selection_candidate();
 		let Some(file) = candidate.files.get_mut(idx) else {
 			return;
@@ -1176,6 +1211,7 @@ impl WorkbenchModel {
 		] {
 			input.update(cx, |i, _| i.set_placeholder(i18n::t(key, loc)));
 		}
+		self.refresh_basket_view();
 		app_log!("[APP:LOCALE: {:?}]", self.locale);
 		cx.notify();
 	}
@@ -1530,6 +1566,20 @@ impl WorkbenchModel {
 				if let Some(tree) = self.file_tree.as_mut() {
 					tree.clear_loading();
 				}
+				// The drain cancelled and outdated the open repo's reads, and
+				// the workspace stays open: fetch what never landed.
+				if let (Some(idx), Some(_)) =
+					(self.selected_repo_idx, self.repo())
+				{
+					if !self.changes_loaded {
+						self.select_repo_internal(idx, true, cx);
+						self.set_status(key, []);
+					} else if self.commits.is_empty()
+						&& self.history_error.is_none()
+					{
+						self.load_history(cx);
+					}
+				}
 				cx.notify();
 			}
 		}
@@ -1568,6 +1618,54 @@ impl WorkbenchModel {
 	fn release_workspace_state(&mut self, cx: &mut Context<Self>) {
 		release_vec(&mut self.repos);
 		self.selected_repo_idx = None;
+		self.release_repo_state();
+		release_vec(&mut self.basket);
+		self.basket_view = (String::new(), None);
+		self.invalidate_paste_job();
+		if !self.paste_busy() {
+			self.clear_paste_state();
+		}
+		self.discovery = None;
+		self.discovery_status = None;
+		release_vec(&mut self.discovery_errors);
+		release_vec(&mut self.discovery_depth_limited);
+		self.discovery_error_overflow = 0;
+		self.discovery_depth_overflow = 0;
+		self.pinned_repo = None;
+		self.carried_repo = None;
+		self.refresh_reload = false;
+		release_vec(&mut self.manual_repos);
+		self.add_cancel = None;
+		self.is_loading = false;
+		self.is_copying = false;
+		self.is_adding_repo = false;
+		self.popover = None;
+		self.popover_cursor = 0;
+		self.scan_cancel = None;
+		self.copy_cancel = None;
+		release_path(&mut self.workspace_root);
+		self.clear_workspace_inputs(cx);
+	}
+
+	/// Drops everything that belongs to the open repo and stops its reads, so
+	/// a late result cannot repopulate it.
+	fn release_repo_state(&mut self) {
+		self.generation = self.generation.wrapping_add(1);
+		self.preview_generation = self.preview_generation.wrapping_add(1);
+		self.history_generation = self.history_generation.wrapping_add(1);
+		self.tree_generation = self.tree_generation.wrapping_add(1);
+		self.tree_worker = self.tree_worker.wrapping_add(1);
+		for slot in [
+			&mut self.history_cancel,
+			&mut self.preview_cancel,
+			&mut self.tree_cancel,
+			&mut self.rev_tree_cancel,
+			&mut self.repo_cancel,
+		] {
+			if let Some(token) = slot.take() {
+				token.cancel();
+			}
+		}
 		release_vec(&mut self.commits);
 		release_vec(&mut self.refs);
 		self.head_sha = None;
@@ -1598,42 +1696,15 @@ impl WorkbenchModel {
 		self.preview_loading = false;
 		self.preview_error = None;
 		self.reader.release_retained();
-		release_vec(&mut self.basket);
-		self.invalidate_paste_job();
-		if !self.paste_busy() {
-			self.clear_paste_state();
-		}
-		self.discovery = None;
-		self.discovery_status = None;
-		release_vec(&mut self.discovery_errors);
-		release_vec(&mut self.discovery_depth_limited);
-		self.discovery_error_overflow = 0;
-		self.discovery_depth_overflow = 0;
-		self.pinned_repo = None;
-		release_vec(&mut self.manual_repos);
 		self.tree_queue = VecDeque::new();
 		self.tree_worker_alive = false;
 		release_vec(&mut self.restore_expanded);
-		self.add_cancel = None;
-		self.is_loading = false;
-		self.is_copying = false;
-		self.is_adding_repo = false;
-		self.popover = None;
-		self.popover_cursor = 0;
-		self.history_cancel = None;
-		self.preview_cancel = None;
-		self.tree_cancel = None;
-		self.rev_tree_cancel = None;
-		self.repo_cancel = None;
-		self.scan_cancel = None;
-		self.copy_cancel = None;
-		release_path(&mut self.workspace_root);
-		self.clear_workspace_inputs(cx);
 	}
 
 	/// Drops workspace text without `InputEvent::Changed`, which would start
 	/// a find or a log search.
 	fn clear_workspace_inputs(&mut self, cx: &mut Context<Self>) {
+		self.reader.find_query = String::new();
 		for input in [
 			self.find_input.clone(),
 			self.goto_input.clone(),
@@ -1751,6 +1822,9 @@ impl WorkbenchModel {
 		self.discovery_depth_limited.clear();
 		self.discovery_error_overflow = 0;
 		self.discovery_depth_overflow = 0;
+		// The first load selects a repo itself; a Refresh must also re-read
+		// the open one, whose summary alone would otherwise update.
+		self.refresh_reload = self.file_tree.is_some();
 		let ws = self.workspace_root.clone();
 		self.launch_fresh_discovery(ws, true, cx);
 	}
@@ -1897,17 +1971,44 @@ impl WorkbenchModel {
 		);
 	}
 
+	/// Replaces the list with the manual repos plus the open one, so the
+	/// selection keeps naming the same repo while later pages arrive.
+	fn begin_rescan(&mut self) {
+		let open = self.pinned_repo.as_ref().and_then(|key| {
+			let pos =
+				self.repos.iter().position(|e| repo_key_matches(e, key))?;
+			Some(self.repos.swap_remove(pos))
+		});
+		self.repos.clear();
+		let mut keep = self.manual_repos.clone();
+		keep.extend(open);
+		self.merge_repo_entries(keep);
+		// A manual repo is kept regardless of the walk.
+		self.carried_repo = self.pinned_repo.clone().filter(|key| {
+			!self.manual_repos.iter().any(|m| repo_key_matches(m, key))
+		});
+	}
+
+	/// Adds or refreshes entries; a newer read of a known repo replaces it.
 	fn merge_repo_entries(&mut self, extra: Vec<RepoEntry>) {
 		for entry in extra {
 			let key = repo_key(&entry);
-			if self.repos.iter().any(|have| repo_key(have) == key) {
-				continue;
+			if self.carried_repo.as_ref() == Some(&key) {
+				self.carried_repo = None;
 			}
-			self.repos.push(entry);
+			match self
+				.repos
+				.iter()
+				.position(|have| repo_key_matches(have, &key))
+			{
+				Some(pos) => self.repos[pos] = entry,
+				None => self.repos.push(entry),
+			}
 		}
 		Self::disambiguate_repo_names(&mut self.repos, &self.workspace_root);
 		self.repos
 			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
+		self.refresh_basket_view();
 	}
 
 	fn push_discovery_error(&mut self, item: (PathBuf, String)) {
@@ -1936,15 +2037,13 @@ impl WorkbenchModel {
 			}
 			return;
 		};
-		let Some(pos) =
-			self.repos.iter().position(|entry| repo_key(entry) == key)
+		let Some(pos) = self
+			.repos
+			.iter()
+			.position(|entry| repo_key_matches(entry, &key))
 		else {
-			if self
-				.selected_repo_idx
-				.is_some_and(|idx| idx >= self.repos.len())
-			{
-				self.selected_repo_idx = None;
-			}
+			// Any index left here would name a different repo.
+			self.selected_repo_idx = None;
 			return;
 		};
 		let root = self.repos[pos].root.clone();
@@ -1955,6 +2054,27 @@ impl WorkbenchModel {
 		} else {
 			self.selected_repo_idx = Some(pos);
 		}
+	}
+
+	/// Removes a kept repo the rescan did not find. Returns its name when it
+	/// was the open one, whose view is then released.
+	fn drop_vanished_repo(
+		&mut self,
+		key: &(PathBuf, PathBuf),
+	) -> Option<String> {
+		let pos = self.repos.iter().position(|e| repo_key_matches(e, key))?;
+		let gone = self.repos.remove(pos);
+		self.refresh_basket_view();
+		if self.pinned_repo.as_ref() == Some(key) {
+			self.pinned_repo = None;
+			self.selected_repo_idx = None;
+			self.release_repo_state();
+			return Some(gone.name);
+		}
+		self.selected_repo_idx = self.pinned_repo.as_ref().and_then(|pinned| {
+			self.repos.iter().position(|e| repo_key_matches(e, pinned))
+		});
+		None
 	}
 
 	fn finish_discovery(&mut self, cx: &mut Context<Self>) {
@@ -1980,11 +2100,28 @@ impl WorkbenchModel {
 			self.discovery_depth_overflow = 0;
 		}
 		self.place_selection(cx);
+		// Only a complete walk proves the kept repo is gone; a capped or
+		// partial one may simply not have reached it yet.
+		let vanished =
+			matches!(self.discovery_status, Some(ScanStatus::Complete))
+				.then(|| self.carried_repo.take())
+				.flatten()
+				.and_then(|key| self.drop_vanished_repo(&key));
 		let errors = self.repos.iter().filter(|r| r.summary.is_err()).count();
 		self.set_status(
 			"status_repos_loaded",
 			[self.repos.len().to_string(), errors.to_string()],
 		);
+		if let Some(name) = vanished {
+			app_log!("[APP:REPO_VANISHED: {name}]");
+			self.set_status("status_repo_vanished", [name]);
+			self.refresh_reload = false;
+		} else if std::mem::take(&mut self.refresh_reload) {
+			if let (Some(idx), Some(_)) = (self.selected_repo_idx, self.repo())
+			{
+				self.select_repo_internal(idx, true, cx);
+			}
+		}
 		app_log!("[APP:READY_REPOS: {}]", self.repos.len());
 		if e2e_on() {
 			for r in &self.repos {
@@ -2026,22 +2163,31 @@ impl WorkbenchModel {
 			}
 		};
 		let key = repo_key(&entry);
-		if let Some(pos) =
-			self.repos.iter().position(|have| repo_key(have) == key)
+		if let Some(pos) = self
+			.repos
+			.iter()
+			.position(|have| repo_key_matches(have, &key))
 		{
 			self.pinned_repo = Some(key);
 			self.select_repo_internal(pos, false, cx);
 			return;
 		}
-		if !self.manual_repos.iter().any(|have| repo_key(have) == key) {
+		if !self
+			.manual_repos
+			.iter()
+			.any(|have| repo_key_matches(have, &key))
+		{
 			self.manual_repos.push(entry.clone());
 		}
 		self.repos.push(entry);
 		Self::disambiguate_repo_names(&mut self.repos, &self.workspace_root);
 		self.repos
 			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
-		if let Some(pos) =
-			self.repos.iter().position(|have| repo_key(have) == key)
+		self.refresh_basket_view();
+		if let Some(pos) = self
+			.repos
+			.iter()
+			.position(|have| repo_key_matches(have, &key))
 		{
 			self.pinned_repo = Some(key);
 			self.select_repo_internal(pos, false, cx);
@@ -2298,6 +2444,11 @@ impl WorkbenchModel {
 		} else {
 			None
 		};
+		let anchor_source = if preserve_anchors {
+			self.selected_file_source.clone()
+		} else {
+			None
+		};
 		let anchor_commit = if preserve_anchors {
 			self.selected_commit.clone()
 		} else {
@@ -2472,8 +2623,25 @@ impl WorkbenchModel {
 									model.files.len().to_string(),
 								],
 							);
-							if let Some(ref anchor) = anchor_file {
-								if model.files.iter().any(|f| &f.path == anchor)
+							if anchor_commit.is_some() {
+								// The history reload re-selects the commit.
+							} else if let Some(ref anchor) = anchor_file {
+								let kept = anchor_source.as_ref().filter(|s| {
+									**s == SourceKind::File
+										|| model.files.iter().any(|f| {
+											&f.path == anchor && &f.source == *s
+										})
+								});
+								if let Some(source) = kept {
+									model.select_file_with_source(
+										anchor,
+										source.clone(),
+										cx,
+									);
+								} else if model
+									.files
+									.iter()
+									.any(|f| &f.path == anchor)
 								{
 									model.select_file(anchor, cx);
 								} else if let Some(first) = model.files.first()
@@ -2493,6 +2661,7 @@ impl WorkbenchModel {
 							} else if model.mode == "preview" {
 								ready_marker("PREVIEW");
 							}
+							model.sync_list_row();
 						}
 						Err(err) => {
 							app_log!("[APP:REPO_ERROR: {}]", repo_name);
@@ -2545,9 +2714,12 @@ impl WorkbenchModel {
 		}
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
-		self.selected_file = Some(path.to_string());
-		self.selected_file_source = Some(source.clone());
-		self.selected_commit = None;
+		// Restored if the budget refuses the new text and the old one stays.
+		let shown_selection = (
+			self.selected_file.replace(path.to_string()),
+			self.selected_file_source.replace(source.clone()),
+			self.selected_commit.take(),
+		);
 		self.range_head = None;
 		self.compare = None;
 		self.commit_files.clear();
@@ -2602,6 +2774,16 @@ impl WorkbenchModel {
 					if model.mode == "preview" {
 						ready_marker("PREVIEW");
 					}
+				} else if model.preview.is_some()
+					&& model.preview_error.is_none()
+				{
+					// Refused by the retained budget: the previous text is
+					// still shown, so the selection must name it again.
+					(
+						model.selected_file,
+						model.selected_file_source,
+						model.selected_commit,
+					) = shown_selection;
 				}
 				cx.notify();
 			});
@@ -2843,6 +3025,7 @@ impl WorkbenchModel {
 		}
 		self.files = candidate.files;
 		self.basket = candidate.basket;
+		self.refresh_basket_view();
 		if let Some(tree) = &mut self.file_tree {
 			tree.install_selection(candidate.paths);
 		}
@@ -2907,7 +3090,7 @@ impl WorkbenchModel {
 			self.basket_count(),
 			self.basket_summary()
 		);
-		if let Some(collision) = self.basket_collision_text() {
+		if let Some(collision) = &self.basket_view.1 {
 			app_log!("[APP:BASKET_COLLISION: {}]", collision);
 		}
 	}
@@ -2932,8 +3115,8 @@ impl WorkbenchModel {
 				.unwrap_or_else(|| root.path().display().to_string());
 			let mut ordered: Vec<_> = items.iter().collect();
 			ordered.sort_by(|a, b| {
-				(&a.relative_path, Self::source_summary(&a.source))
-					.cmp(&(&b.relative_path, Self::source_summary(&b.source)))
+				(&a.relative_path, source_order(&a.source))
+					.cmp(&(&b.relative_path, source_order(&b.source)))
 			});
 			for item in ordered {
 				if !out.is_empty() && !append_basket_display(&mut out, "; ") {
@@ -2975,6 +3158,13 @@ impl WorkbenchModel {
 				}
 			}
 		})
+	}
+
+	pub(crate) fn refresh_basket_view(&mut self) {
+		self.basket_view = (
+			self.basket_summary_localized(self.locale),
+			self.basket_collision_text(),
+		);
 	}
 
 	/// Two selections of one path cannot share a wire header. File rows count;
@@ -3067,6 +3257,7 @@ impl WorkbenchModel {
 
 	pub fn clear_basket(&mut self, cx: &mut Context<Self>) {
 		self.basket = Vec::new();
+		self.refresh_basket_view();
 		for file in &mut self.files {
 			file.selected = false;
 		}
@@ -3923,9 +4114,9 @@ impl WorkbenchModel {
 							model.restore_log_after_paste();
 							model.pending_focus =
 								Some(model.focus_handle.clone());
-							if let Some(idx) = model.selected_repo_idx {
-								model.select_repo(idx, cx);
-							}
+							// A rescan refreshes the destination's summary too,
+							// then reloads the open repo keeping its anchors.
+							model.reload_repos(cx);
 						}
 						Err(err) => {
 							app_log!("[APP:PASTE_STALE_DETECTED: {}]", err.key);
@@ -4032,6 +4223,28 @@ fn repo_key(entry: &RepoEntry) -> (PathBuf, PathBuf) {
 	}
 }
 
+/// Orders like `WorkbenchModel::source_summary` text without allocating: no
+/// tag is a prefix of another, so comparing (tag, rev) equals comparing tag+rev.
+fn source_order(source: &SourceKind) -> (&'static str, &str) {
+	match source {
+		SourceKind::Staged => ("staged", ""),
+		SourceKind::Unstaged => ("unstaged", ""),
+		SourceKind::Working => ("untracked", ""),
+		SourceKind::File => ("file", ""),
+		SourceKind::Commit { rev } => {
+			("commit@", rev.get(..7).unwrap_or(rev.as_str()))
+		}
+	}
+}
+
+/// `repo_key(entry) == *key` without allocating.
+fn repo_key_matches(entry: &RepoEntry, key: &(PathBuf, PathBuf)) -> bool {
+	match &entry.identity {
+		Some(id) => id.toplevel == key.0 && id.git_dir == key.1,
+		None => entry.root == key.0 && key.1.as_os_str().is_empty(),
+	}
+}
+
 async fn drive_discovery(
 	this: gpui::WeakEntity<WorkbenchModel>,
 	cx: &mut gpui::AsyncApp,
@@ -4101,9 +4314,7 @@ async fn drive_discovery(
 				return true;
 			}
 			if wipe {
-				model.repos.clear();
-				let manual = model.manual_repos.clone();
-				model.merge_repo_entries(manual);
+				model.begin_rescan();
 				wipe = false;
 			}
 			model.merge_repo_entries(processed.0);
@@ -4621,6 +4832,47 @@ mod tests {
 			old_bytes,
 			MAX_RETAINED_TREE_BYTES
 		));
+	}
+
+	#[test]
+	fn lossy_change_names_are_not_checkable() {
+		let item = |path: String| FileChangeItem {
+			path,
+			change_type: None,
+			source: SourceKind::Working,
+			is_conflict: false,
+			selected: false,
+		};
+		let lossy = String::from_utf8_lossy(b"bad\xff.txt").into_owned();
+		assert!(!item(lossy).is_valid_utf8());
+		assert!(item("長路徑/good.txt".into()).is_valid_utf8());
+	}
+
+	#[test]
+	fn basket_order_key_matches_the_source_summary_text() {
+		let sources = [
+			SourceKind::Staged,
+			SourceKind::Unstaged,
+			SourceKind::Working,
+			SourceKind::File,
+			SourceKind::Commit {
+				rev: "b".repeat(40),
+			},
+			SourceKind::Commit {
+				rev: "a".repeat(40),
+			},
+			SourceKind::Commit { rev: "abc".into() },
+		];
+		for a in &sources {
+			for b in &sources {
+				assert_eq!(
+					source_order(a).cmp(&source_order(b)),
+					WorkbenchModel::source_summary(a)
+						.cmp(&WorkbenchModel::source_summary(b)),
+					"{a:?} vs {b:?}"
+				);
+			}
+		}
 	}
 
 	#[test]

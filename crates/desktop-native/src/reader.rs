@@ -471,6 +471,8 @@ pub struct Reader {
 	pub diff_mode: DiffMode,
 	pub scroll: UniformListScrollHandle,
 	pub row_geom: RowGeometry,
+	/// Last find query, re-applied when a new preview replaces the text.
+	pub find_query: String,
 }
 
 impl Default for Reader {
@@ -485,6 +487,7 @@ impl Default for Reader {
 			diff_mode: DiffMode::Inline,
 			scroll: UniformListScrollHandle::new(),
 			row_geom: Rc::default(),
+			find_query: String::new(),
 		}
 	}
 }
@@ -658,13 +661,11 @@ impl WorkbenchModel {
 	}
 
 	pub fn run_find(&mut self, query: &str, cx: &mut Context<Self>) {
-		let Some(p) = &self.preview else {
+		query.clone_into(&mut self.reader.find_query);
+		if self.preview.is_none() {
 			return;
-		};
-		self.reader.matches = find_matches(p, query);
-		// Matches inside hidden patch headers cannot be shown.
-		self.reader.matches.retain(|m| p.is_shown(m.0));
-		self.reader.current = (!self.reader.matches.is_empty()).then_some(0);
+		}
+		self.refind();
 		if let Some(&(line, _, _)) = self.reader.matches.first() {
 			self.reader_scroll_to(line);
 		}
@@ -674,6 +675,17 @@ impl WorkbenchModel {
 			self.reader.matches.first().map(|m| m.0 + 1).unwrap_or(0)
 		);
 		cx.notify();
+	}
+
+	/// Recomputes the matches of the last query against the current preview.
+	pub(crate) fn refind(&mut self) {
+		let Some(p) = &self.preview else {
+			return;
+		};
+		self.reader.matches = find_matches(p, &self.reader.find_query);
+		// Matches inside hidden patch headers cannot be shown.
+		self.reader.matches.retain(|m| p.is_shown(m.0));
+		self.reader.current = (!self.reader.matches.is_empty()).then_some(0);
 	}
 
 	pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
