@@ -1921,7 +1921,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		}
 	};
 	// There is no pager: scrolling the list to its end reads the next page.
-	let wheel_down = |clicks: &str| {
+	let wheel = |clicks: &str, button: &str| {
 		let [x, y, w, h] = control("log-list");
 		assert!(Command::new("xdotool")
 			.args([
@@ -1935,7 +1935,7 @@ fn native_graph_failed_next_page_is_transactional() {
 				clicks,
 				"--delay",
 				"15",
-				"5",
+				button,
 				// Off the list again, so no row is drawn hovered.
 				"mousemove",
 				"--window",
@@ -1948,23 +1948,25 @@ fn native_graph_failed_next_page_is_transactional() {
 			.success());
 	};
 	// Scrolls until `pattern` is logged (a page read, or its failure).
-	let scroll_until = |pattern: &str, clicks: &str| -> Vec<String> {
-		let deadline = Instant::now() + Duration::from_secs(40);
-		let mut seen = Vec::new();
-		loop {
-			wheel_down(clicks);
-			match lines_until(&app.rx, pattern, Duration::from_millis(250)) {
-				Ok(lines) => {
-					seen.extend(lines);
-					return seen;
+	let scroll_until =
+		|pattern: &str, clicks: &str, button: &str| -> Vec<String> {
+			let deadline = Instant::now() + Duration::from_secs(40);
+			let mut seen = Vec::new();
+			loop {
+				wheel(clicks, button);
+				match lines_until(&app.rx, pattern, Duration::from_millis(250))
+				{
+					Ok(lines) => {
+						seen.extend(lines);
+						return seen;
+					}
+					Err(_) => assert!(
+						Instant::now() < deadline,
+						"scrolling never produced {pattern}"
+					),
 				}
-				Err(_) => assert!(
-					Instant::now() < deadline,
-					"scrolling never produced {pattern}"
-				),
 			}
-		}
-	};
+		};
 	let out = std::env::var_os("SNIP_E2E_OUT")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
@@ -2103,7 +2105,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	};
 	park(true);
 	for page in 2..=10 {
-		let loaded = scroll_until(&format!("page={page}]"), "4");
+		let loaded = scroll_until(&format!("page={page}]"), "4", "5");
 		let line = loaded
 			.iter()
 			.find(|l| l.contains("[APP:E2E_LOG:"))
@@ -2118,7 +2120,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		);
 	}
 	// Page 11 is the first read that needs Git, and it fails.
-	let rejected = scroll_until("[APP:HISTORY_ERROR]", "1");
+	let rejected = scroll_until("[APP:HISTORY_ERROR]", "1", "5");
 	assert!(!rejected.iter().any(|line| line.contains("[APP:E2E_LOG:")));
 	control("log-error");
 	let refused = crop_row("refused", true);
@@ -2131,7 +2133,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	park(false);
 	// One notch: it re-arms loading, and no further notch moves the rows
 	// the comparison is taken from.
-	let retried = scroll_until("[APP:E2E_LOG:", "1");
+	let retried = scroll_until("[APP:E2E_LOG:", "1", "5");
 	assert!(
 		retried
 			.last()
@@ -2163,6 +2165,40 @@ fn native_graph_failed_next_page_is_transactional() {
 		"prior rendered row text and graph rails must remain identical: {}",
 		String::from_utf8_lossy(&comparison.stderr)
 	);
+	// Scrolling back to the top reads the evicted first page again and
+	// drops the last one; the rows on screen stay where they were.
+	let back = scroll_until("[APP:E2E_LOG:", "8", "4");
+	assert!(
+		back.last()
+			.unwrap()
+			.contains(&format!("mode=graph n=500 first={first} page=10]")),
+		"scrolling up must read page 1 back and evict page 11: {back:?}"
+	);
+	lines_until(
+		&app.rx,
+		"[APP:LOG_WINDOW: first_page=1 last_page=10 rows=500]",
+		Duration::from_secs(2),
+	)
+	.unwrap();
+	let anchor = back
+		.iter()
+		.find_map(|l| {
+			l.split_once("[APP:LOG_ANCHOR: row=")?
+				.1
+				.split_once(" was=")
+				.map(|(r, w)| {
+					(
+						r.parse::<usize>().unwrap(),
+						w.split_whitespace()
+							.next()
+							.unwrap()
+							.parse::<usize>()
+							.unwrap(),
+					)
+				})
+		})
+		.expect("prepending must re-anchor the rows on screen");
+	assert_eq!(anchor.0, anchor.1 + 50, "the top row keeps its place");
 	quit_cleanly(&mut app, &wid);
 }
 

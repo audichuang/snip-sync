@@ -618,6 +618,7 @@ fn ref_label_elements(
 	refs: &[snip_core::graph::RefInfo],
 	current_branch: Option<&str>,
 	row: &str,
+	show_tips: bool,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
 	let mut width = 0.;
@@ -637,7 +638,7 @@ fn ref_label_elements(
 				.items_center()
 				.gap(px(3.))
 				.max_w(px(160.))
-				.tooltip(tip(tooltip))
+				.when(show_tips, |d| d.tooltip(tip(tooltip)))
 				.child(label_icon(&l))
 				.child(
 					clip_text(l.text.clone())
@@ -660,7 +661,7 @@ fn ref_label_elements(
 				.flex_shrink_0()
 				.text_size(px(SMALL_TEXT))
 				.text_color(rgb(pal().log_ref_text))
-				.tooltip(tip(all))
+				.when(show_tips, |d| d.tooltip(tip(all)))
 				.child(format!("+{hidden}"))
 				.into_any_element(),
 		);
@@ -5405,6 +5406,9 @@ impl WorkbenchModel {
 			return div().into_any_element();
 		};
 		let loc = self.locale;
+		// Every tooltip of the row is registered only when this is true (a
+		// context menu over the log will turn it off).
+		let show_tips = true;
 		let selected = self.selected_commit.as_deref() == Some(&c.sha);
 		let in_range =
 			self.range_rows().is_some_and(|(a, b)| ix >= a && ix <= b);
@@ -5439,6 +5443,7 @@ impl WorkbenchModel {
 					&r.refs,
 					current_branch.as_deref(),
 					short(&sha),
+					show_tips,
 				)
 			})
 			.unwrap_or_default();
@@ -5532,14 +5537,16 @@ impl WorkbenchModel {
 								.size(px(14.))
 								.rounded(px(7.))
 								.hover(|s| s.bg(rgb(pal().hover_bg)))
-								.tooltip(tip(t(
-									if collapsed {
-										"tip_expand_merge"
-									} else {
-										"tip_collapse_merge"
-									},
-									loc,
-								)))
+								.when(show_tips, |d| {
+									d.tooltip(tip(t(
+										if collapsed {
+											"tip_expand_merge"
+										} else {
+											"tip_collapse_merge"
+										},
+										loc,
+									)))
+								})
 								.on_click(cx.listener(move |this, _, _, cx| {
 									cx.stop_propagation();
 									this.toggle_collapse(merge_sha.clone(), cx);
@@ -5568,7 +5575,7 @@ impl WorkbenchModel {
 							.overflow_hidden()
 							.line_clamp(1)
 							.text_ellipsis()
-							.when(truncated, |d| {
+							.when(show_tips && truncated, |d| {
 								d.tooltip(tip(c.subject.clone()))
 							})
 							.child(c.subject.clone()),
@@ -5598,10 +5605,12 @@ impl WorkbenchModel {
 					.id(SharedString::from(format!("author:{}", short(&sha))))
 					.flex_shrink_0()
 					.w(px(AUTHOR_W))
-					.tooltip(tip(format!(
-						"{} <{}>",
-						c.author_name, c.author_email
-					)))
+					.when(show_tips, |d| {
+						d.tooltip(tip(format!(
+							"{} <{}>",
+							c.author_name, c.author_email
+						)))
+					})
 					.child(
 						clip_text(c.author_name.clone()).when(mine, |d| {
 							d.font_weight(FontWeight::SEMIBOLD)
@@ -5613,7 +5622,9 @@ impl WorkbenchModel {
 					.id(SharedString::from(format!("date:{}", short(&sha))))
 					.flex_shrink_0()
 					.w(px(DATE_W))
-					.tooltip(tip(short_date(&c.author_date)))
+					.when(show_tips, |d| {
+						d.tooltip(tip(short_date(&c.author_date)))
+					})
 					.child(clip_text(date)),
 			)
 			.when(self.log_show_hash, |d| {
@@ -5625,7 +5636,7 @@ impl WorkbenchModel {
 						.font_family(CODE_FONT)
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
-						.tooltip(tip(c.sha.clone()))
+						.when(show_tips, |d| d.tooltip(tip(c.sha.clone())))
 						.child(short(&c.sha).to_string()),
 				)
 			})
