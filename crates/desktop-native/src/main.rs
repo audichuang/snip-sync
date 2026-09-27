@@ -1684,7 +1684,7 @@ impl WorkbenchModel {
 			TreeCommand::OpenFile(rel) => {
 				let rel = rel.clone();
 				app_log!("[APP:TREE_FILE_SELECTED: {}]", rel);
-				self.select_file(&rel, cx);
+				self.select_file_with_source(&rel, SourceKind::File, cx);
 				return;
 			}
 			TreeCommand::ToggleSelect(key) => {
@@ -1704,7 +1704,7 @@ impl WorkbenchModel {
 		match effect {
 			Some(TreeEffect::Io(io)) => self.submit_tree_io(io, cx),
 			Some(TreeEffect::OpenFile(rel)) => {
-				self.select_file(&rel, cx);
+				self.select_file_with_source(&rel, SourceKind::File, cx);
 				app_log!("[APP:TREE_FILE_SELECTED: {}]", rel);
 			}
 			Some(TreeEffect::Idle) => {
@@ -2125,10 +2125,9 @@ impl WorkbenchModel {
 		let file_path = path.to_string();
 		self.preview_loading = true;
 		self.preview_error = None;
-		let is_tree = self.active_tab == WorkbenchTab::FileExplorer;
 
 		let cancel = arm_cancel(&mut self.preview_cancel);
-		let fs_only = is_tree || matches!(source, SourceKind::File);
+		let fs_only = matches!(source, SourceKind::File);
 		let kind = if fs_only {
 			lifecycle::JobKind::UncancellableRead
 		} else {
@@ -2148,9 +2147,8 @@ impl WorkbenchModel {
 			let for_bg = file_path.clone();
 			let result = bg
 				.spawn(async move {
-					let result = read_preview(
-						&repo_root, &for_bg, &source, is_tree, cancel,
-					);
+					let result =
+						read_preview(&repo_root, &for_bg, &source, cancel);
 					if let Some(delay) = delay {
 						std::thread::sleep(delay);
 					}
@@ -3601,10 +3599,9 @@ fn read_preview(
 	repo_root: &std::path::Path,
 	path: &str,
 	source: &SourceKind,
-	is_tree: bool,
 	cancel: CancelToken,
 ) -> Result<(browser::SourcePreview, PreviewSource), String> {
-	if is_tree || matches!(source, SourceKind::File) {
+	if matches!(source, SourceKind::File) {
 		return browser::file_preview(repo_root, path)
 			.map(|p| (p, PreviewSource::WorkingFile))
 			.map_err(|e| e.to_string());
@@ -3879,7 +3876,7 @@ fn restore_log_after_paste(
 #[cfg(test)]
 mod tests {
 	#[test]
-	fn read_preview_missing_revision_never_falls_back_to_working_bytes() {
+	fn read_preview_honors_explicit_source_and_missing_revision() {
 		let dir = tempfile::tempdir().unwrap();
 		let git = |args: &[&str]| {
 			let out = std::process::Command::new("git")
@@ -3908,7 +3905,6 @@ mod tests {
 			&super::SourceKind::Commit {
 				rev: "refs/heads/missing-preview-revision".into(),
 			},
-			false,
 			super::CancelToken::new(),
 		);
 		assert!(
@@ -3919,19 +3915,26 @@ mod tests {
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::Staged,
-			false,
 			super::CancelToken::new(),
 		)
 		.unwrap();
 		assert_eq!(source, super::PreviewSource::StagedChanges);
 		assert_eq!(staged.content.as_deref(), Some("staged A\n"));
 		assert!(!staged.patch.contains("working B"));
+		let (working, source) = super::read_preview(
+			dir.path(),
+			"a.txt",
+			&super::SourceKind::File,
+			super::CancelToken::new(),
+		)
+		.unwrap();
+		assert_eq!(source, super::PreviewSource::WorkingFile);
+		assert_eq!(working.content.as_deref(), Some("working B\n"));
 		git(&["rm", "-q", "-f", "a.txt"]);
 		let (deleted, source) = super::read_preview(
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::Staged,
-			false,
 			super::CancelToken::new(),
 		)
 		.unwrap();
