@@ -527,6 +527,10 @@ impl Discovery {
 	}
 }
 
+// DirEntry is large on macOS and Windows, but each step is consumed within a
+// synchronous loop iteration, never retained or stacked recursively. Keeping
+// it inline avoids a heap allocation for every directory entry.
+#[allow(clippy::large_enum_variant)]
 enum DiscoveryStep {
 	Entry(io::Result<fs::DirEntry>),
 	Pending(PathBuf),

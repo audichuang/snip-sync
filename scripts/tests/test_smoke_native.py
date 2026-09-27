@@ -10,6 +10,7 @@ Verifies:
 
 from __future__ import annotations
 
+import io
 import os
 import stat
 import subprocess
@@ -55,13 +56,15 @@ if '--unrecognized-smoke-test-flag' in sys.argv:
     sys.exit(2)
 sys.exit(1)
 """)
-        # Must pass without error
-        verify_cli_smoke(
-            bin_path=mock,
-            expected_version="0.1.4",
-            app_name="snip-desktop-native",
-            timeout_sec=2.0,
-        )
+        # Redirected Windows stdout may use cp1252 instead of UTF-8.
+        with io.TextIOWrapper(io.BytesIO(), encoding="cp1252") as output:
+            with patch("sys.stdout", output):
+                verify_cli_smoke(
+                    bin_path=mock,
+                    expected_version="0.1.4",
+                    app_name="snip-desktop-native",
+                    timeout_sec=2.0,
+                )
 
     def test_missing_binary_fails(self) -> None:
         """Verifies that a non-existent binary raises SmokeFailure."""

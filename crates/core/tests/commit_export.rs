@@ -86,6 +86,20 @@ impl Repo {
 		cmd
 	}
 
+	fn git_with_input(&self, args: &[&str], input: &[u8]) -> String {
+		let mut child = self
+			.cmd(args)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.unwrap();
+		child.stdin.take().unwrap().write_all(input).unwrap();
+		let out = child.wait_with_output().unwrap();
+		assert!(out.status.success(), "{:?}", out.stderr);
+		String::from_utf8(out.stdout).unwrap().trim().to_string()
+	}
+
 	fn write(&self, name: &str, bytes: &[u8]) {
 		let path = self.path().join(name);
 		fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -106,15 +120,12 @@ impl Repo {
 		name: &str,
 		email: &str,
 	) -> String {
+		// Keep large messages off Windows' command line and outside the index.
+		let message_path = self.dir.path().join("commit-message");
+		fs::write(&message_path, msg).unwrap();
 		let out = self
-			.cmd([
-				"commit",
-				"-q",
-				"--allow-empty",
-				"--cleanup=verbatim",
-				"-m",
-				msg,
-			])
+			.cmd(["commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F"])
+			.arg(&message_path)
 			.env("GIT_AUTHOR_NAME", name)
 			.env("GIT_AUTHOR_EMAIL", email)
 			.env("GIT_AUTHOR_DATE", date)
@@ -398,9 +409,15 @@ fn legacy_bytes_metadata_and_replay_tree_match() {
 			&& f.content.as_deref() == Some(note)
 	}));
 	assert_eq!(export.payload.commits[0].author_name, "Alice \"A\" Z");
+	// Keep Git's exact ISO representation (UTC may be Z or +00:00), while
+	// independently pinning the source's actual author instant and offset.
 	assert_eq!(
 		export.payload.commits[0].author_date,
-		"2020-01-01T00:00:00+00:00"
+		src.git(["log", "-1", "--format=%aI", &root])
+	);
+	assert_eq!(
+		src.git(["log", "-1", "--date=raw", "--format=%ad", &root]),
+		"1577836800 +0000"
 	);
 	let merge_files = &export.payload.commits[2].files;
 	assert_eq!(merge_files.len(), 1);
@@ -519,17 +536,25 @@ fn empty_document_over_the_cap_does_not_need_a_blob() {
 	assert_idle();
 }
 
-#[cfg(unix)]
 #[test]
 fn non_utf8_path_matches_legacy_not_copied() {
 	let _lock = serial();
 	assert_idle();
-	use std::os::unix::ffi::OsStringExt;
 	let repo = Repo::new();
-	let name = OsString::from_vec(b"weird-\xff.txt".to_vec());
-	fs::write(repo.path().join(&name), b"hello\n").unwrap();
-	repo.git([OsStr::new("add"), OsStr::new("--"), name.as_os_str()]);
-	let sha = repo.commit("odd", "2024-01-01T00:00:00Z", "Ada", "ada@ex.com");
+	// A Git tree can contain arbitrary path bytes even on filesystems that
+	// reject them (macOS), or platforms without non-UTF-8 OsString (Windows).
+	let blob =
+		repo.git_with_input(&["hash-object", "-w", "--stdin"], b"hello\n");
+	let mut entry = format!("100644 blob {blob}\t").into_bytes();
+	entry.extend_from_slice(b"weird-\xff.txt\0");
+	let tree = repo.git_with_input(&["mktree", "-z"], &entry);
+	let sha = repo.git(["commit-tree", &tree, "-m", "odd"]);
+	let paths = repo
+		.cmd(["ls-tree", "-rz", "--name-only", &sha])
+		.output()
+		.unwrap();
+	assert!(paths.status.success());
+	assert_eq!(paths.stdout, b"weird-\xff.txt\0");
 	let git = repo.open();
 	let shas = vec![sha];
 	let (payload, text) = legacy_text(&git, &shas);
@@ -940,6 +965,7 @@ fn large_commit_message_metadata_over_budget_rejects_with_correct_classification
 	repo.write("f.txt", b"content\n");
 	let sha =
 		repo.commit(&big_msg, "2024-01-01T00:00:00Z", "Ada", "ada@example.com");
+	assert_eq!(repo.git(["log", "-1", "--format=%B", &sha]), big_msg);
 	let git = repo.open();
 
 	// Case 1: Within runner max_stdout (default 256 MiB), but clipboard byte budget is small (500 bytes).

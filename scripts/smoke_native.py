@@ -162,7 +162,7 @@ def verify_cli_smoke(
         raise SmokeFailure(
             f"'--help' output does not document '--version' or '-V'.\nOutput:\n{combined_help}"
         )
-    print("  ✓ --help returned status 0 with valid application banner and --version documentation.")
+    print("  [OK] --help returned status 0 with valid application banner and --version documentation.")
 
     # 3. Version invocation
     print(f"[2/3] Checking --version (expected: {clean_ver})...")
@@ -178,7 +178,7 @@ def verify_cli_smoke(
         raise SmokeFailure(
             f"'--version' output exact match failed: expected line '{expected_line}', got:\n{(out + err).strip()}"
         )
-    print(f"  ✓ --version returned status 0 with exact matching output: '{expected_line}'")
+    print(f"  [OK] --version returned status 0 with exact matching output: '{expected_line}'")
 
     # 4. Unknown argument rejection (MUST exit with code 2)
     print("[3/3] Checking unknown flag rejection (must exit 2)...")
@@ -190,7 +190,7 @@ def verify_cli_smoke(
         raise SmokeFailure(
             f"Unknown flag rejection failed: expected exit code 2 (syntax error), got {code}.\nStdout: {out}\nStderr: {err}"
         )
-    print("  ✓ Unknown flag rejected with exit code 2.")
+    print("  [OK] Unknown flag rejected with exit code 2.")
 
     print("=== Native CLI Smoke PASSED ===")
 

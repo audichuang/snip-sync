@@ -750,14 +750,32 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	resize(1080, 720);
 
 	// 3. Repo and Ref selector filter + choose with real OS input (no stale preview)
+	let filter_repo = |query: &str, excluded_row: &str| {
+		// Require a drawn-to-gone transition, not an old filter event or cached row.
+		control(excluded_row);
+		xdo(&["type", "--window", &wid, query]);
+		wait_for_pattern(
+			"[APP:SELECTOR_FILTER: items=1]",
+			Duration::from_secs(3),
+		)
+		.expect("repo filter must finish with one candidate");
+		// CTRL_GONE ends the frame, after moved row bounds; the stdout reader
+		// commits both to this map before discarding those high-volume events.
+		let deadline = Instant::now() + Duration::from_secs(3);
+		while bounds.lock().unwrap().contains_key(excluded_row) {
+			assert!(
+				Instant::now() < deadline,
+				"filtered-out row {excluded_row} is still drawn"
+			);
+			std::thread::sleep(Duration::from_millis(20));
+		}
+	};
 	println!("[TEST DRIVER] Opening repo selector and choosing repo-b...");
 	click("btn-repo-selector");
 	wait_for_pattern("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3))
 		.expect("repo selector popover must open");
 	click("selector-input");
-	xdo(&["type", "--window", &wid, "repo-b"]);
-	wait_for_pattern("[APP:SELECTOR_FILTER:", Duration::from_secs(3))
-		.expect("repo filter should update");
+	filter_repo("repo-b", "pick-repo:repo-a");
 	click("pick-repo:repo-b");
 	wait_for_pattern(
 		"[APP:SELECTOR_CHOSE: repo=repo-b]",
@@ -775,7 +793,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	wait_for_pattern("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3))
 		.expect("repo selector popover must open");
 	click("selector-input");
-	xdo(&["type", "--window", &wid, "repo-a"]);
+	filter_repo("repo-a", "pick-repo:repo-b");
 	click("pick-repo:repo-a");
 	wait_for_pattern(
 		"[APP:SELECTOR_CHOSE: repo=repo-a]",
@@ -1909,22 +1927,65 @@ fn native_graph_failed_next_page_is_transactional() {
 			std::thread::sleep(Duration::from_millis(20));
 		}
 	};
-	let crop_row = |name: &str| {
+	let crop_row = |name: &str, require_error: bool| {
 		let image = out.join(format!("graph-admission-{name}.png"));
-		capture(&image);
-		let [x, y, w, h] = control(&first_row);
 		let crop = out.join(format!("graph-admission-{name}-row.png"));
-		assert!(Command::new("convert")
-			.arg(&image)
-			.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
-			.arg(&crop)
-			.status()
-			.unwrap()
-			.success());
-		crop
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			let row = control(&first_row);
+			let error = require_error.then(|| control("log-error"));
+			capture(&image);
+			let stable = control(&first_row) == row
+				&& error.is_none_or(|rect| control("log-error") == rect);
+			// Probes run during prepaint, before Vulkan presents this frame.
+			// Wait for the actual error banner, never for a matching row.
+			let presented = error.is_none_or(|[x, y, w, h]| {
+				let pixels = Command::new("convert")
+					.arg(&image)
+					.args([
+						"-crop",
+						&format!("{w}x{h}+{x}+{y}"),
+						"+repage",
+						"-depth",
+						"8",
+						"RGB:-",
+					])
+					.output()
+					.unwrap();
+				assert!(pixels.status.success(), "error banner crop failed");
+				assert_eq!(pixels.stdout.len(), (w * h * 3) as usize);
+				let pixels = pixels.stdout.as_chunks::<3>().0;
+				// Existing theme ERROR_BG and antialiased ERROR text.
+				pixels.iter().any(|p| *p == [64, 41, 41])
+					&& pixels.iter().any(|p| {
+						p[0].abs_diff(247) <= 16
+							&& p[1].abs_diff(84) <= 16
+							&& p[2].abs_diff(100) <= 16
+					})
+			});
+			if stable && presented {
+				let [x, y, w, h] = row;
+				assert!(Command::new("convert")
+					.arg(&image)
+					.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
+					.arg(&crop)
+					.status()
+					.unwrap()
+					.success());
+				println!(
+					"[TEST DRIVER] graph {name} row={row:?} error={error:?}"
+				);
+				return crop;
+			}
+			assert!(
+				Instant::now() < deadline,
+				"graph {name} frame did not present: row={row:?} error={error:?}"
+			);
+			std::thread::sleep(Duration::from_millis(20));
+		}
 	};
 	let before_y = control(&first_row)[1];
-	let before = crop_row("before");
+	let before = crop_row("before", false);
 	// Only this test's disposable repository is mutated, never the standard
 	// workload. All refs target the same tip, so commit order stays identical.
 	let update_refs = |create: bool| {
@@ -1966,7 +2027,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		);
 		std::thread::sleep(Duration::from_millis(20));
 	}
-	let after = crop_row("refused");
+	let after = crop_row("refused", true);
 	let comparison = Command::new("compare")
 		.args(["-metric", "AE"])
 		.arg(&before)

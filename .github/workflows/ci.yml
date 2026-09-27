@@ -346,8 +346,8 @@ jobs:
               shell: bash
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
-    # Python stdlib memory harness contracts and workload generator tests.
-    # Safe tests running with isolated temporary repositories; produces no committed files.
+    # Python stdlib harness contracts, workload generators, and real private X11/D-Bus
+    # cleanup regressions. Uses isolated displays and temporary repositories.
     harness:
         name: Memory Harness Contracts
         runs-on: ubuntu-24.04
@@ -358,10 +358,10 @@ jobs:
               uses: actions/setup-python@v5
               with:
                   python-version: "3.12"
-            - name: Install private D-Bus regression tools
+            - name: Install private X11/D-Bus cleanup regression tools
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y dbus
+                  sudo apt-get install -y dbus xvfb xclip mesa-vulkan-drivers
             - name: Run harness contract tests (stdlib unittest)
               env:
                   PYTHONDONTWRITEBYTECODE: "1"
