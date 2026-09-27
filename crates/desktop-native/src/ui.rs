@@ -3751,11 +3751,10 @@ impl WorkbenchModel {
 	/// Breadcrumb text and source badge: says exactly which version is shown.
 	fn source_labels(&self) -> (String, String, String) {
 		let loc = self.locale;
-		// A Changes row of another repo previews from that repo.
+		// A commit from the log names its own repository.
 		let repo = self
 			.preview_root()
-			.and_then(|root| self.repos.iter().find(|r| r.root == root))
-			.map(|r| r.name.clone())
+			.map(|root| self.log_repo_name(&root))
 			.unwrap_or_default();
 		let Some(p) = &self.preview else {
 			let tab = match (&self.selected_commit, &self.compare) {

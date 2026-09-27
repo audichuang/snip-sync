@@ -4685,3 +4685,296 @@ fn lines_until_all_smoke(
 	}
 	seen
 }
+
+/// A workspace of several repositories has one log, like IntelliJ with
+/// several VCS roots: every repository's commits interleaved by date, a
+/// root stripe per row, a Repository chip that narrows the log, and the
+/// details and diff of a commit read from its own repository.
+#[test]
+fn native_multi_repo_log_merges_and_filters_repositories() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	// Commit dates interleave the repositories; the offsets differ, so an
+	// order by date string would be wrong.
+	let plan: [(&str, [&str; 3]); 3] = [
+		(
+			"alpha",
+			[
+				"2026-01-01T01:00:00+00:00",
+				"2026-01-04T01:00:00+00:00",
+				"2026-01-07T01:00:00+00:00",
+			],
+		),
+		(
+			"beta",
+			[
+				"2026-01-02T09:00:00+08:00",
+				"2026-01-05T09:00:00+08:00",
+				"2026-01-08T09:00:00+08:00",
+			],
+		),
+		(
+			"gamma",
+			[
+				"2026-01-02T20:00:00-05:00",
+				"2026-01-05T20:00:00-05:00",
+				"2026-01-08T20:00:00-05:00",
+			],
+		),
+	];
+	let mut shas: HashMap<String, String> = HashMap::new();
+	for (name, dates) in plan {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "t@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Multi Test"]);
+		for (n, date) in dates.iter().enumerate() {
+			let n = n + 1;
+			fs::write(repo.join(format!("{name}{n}.txt")), format!("{n}\n"))
+				.unwrap();
+			git_ok(&repo, &["add", "."]);
+			let out = Command::new("git")
+				.current_dir(&repo)
+				.args(["commit", "-qm", &format!("{name} change {n}")])
+				.env("GIT_AUTHOR_DATE", date)
+				.env("GIT_COMMITTER_DATE", date)
+				.output()
+				.unwrap();
+			assert!(out.status.success());
+			shas.insert(format!("{name}{n}"), git_rev(&repo));
+		}
+	}
+	git_ok(&ws.path().join("beta"), &["branch", "feature"]);
+	let row = |c: &str| {
+		let name = c.trim_end_matches(char::is_numeric);
+		format!("commit-row:{name}:{}", &shas[c][..7])
+	};
+	// Newest first across the three repositories.
+	let order = [
+		"gamma3", "beta3", "alpha3", "gamma2", "beta2", "alpha2", "gamma1",
+		"beta1", "alpha1",
+	];
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 3]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		"[APP:MULTI_LOG_LOADED: repos=3 rows=9]",
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	let st = Command::new("xdotool")
+		.args(["windowmove", "--sync", &wid, "0", "0"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let st = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1280", "860"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let rx = &app.rx;
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(8))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, modifier: Option<&str>| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		if let Some(m) = modifier {
+			Command::new("xdotool")
+				.args(["keydown", m])
+				.status()
+				.unwrap();
+		}
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		if let Some(m) = modifier {
+			Command::new("xdotool").args(["keyup", m]).status().unwrap();
+		}
+		assert!(st.success());
+	};
+	let click = |id: &str| press(id, None);
+
+	// A taller log: every row on screen (and in the picture).
+	{
+		let v = control("splitter-bottom");
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+		]);
+		xdo(&["mousedown", "1"]);
+		for step in 1..=4 {
+			let y = (y - 60 * step).to_string();
+			xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+			std::thread::sleep(Duration::from_millis(30));
+		}
+		xdo(&["mouseup", "1"]);
+		wait("[APP:SPLIT_RESIZED: Bottom");
+	}
+	// 1. One log, newest first, each row with its repository's stripe.
+	let ys: Vec<i32> = order.iter().map(|c| control(&row(c))[1]).collect();
+	assert!(
+		ys.windows(2).all(|w| w[0] < w[1]),
+		"rows must be ordered newest first across repositories: {:?}",
+		order.iter().zip(&ys).collect::<Vec<_>>()
+	);
+	for c in order {
+		let stripe = control(&format!("root-stripe:{}", &row(c)[11..]));
+		let r = control(&row(c));
+		assert_eq!((stripe[0], stripe[1]), (r[0], r[1]), "{c} stripe");
+		assert!(stripe[2] < 12, "the stripe is a thin column: {stripe:?}");
+	}
+	// The selected repository's rows keep their plain-SHA ids for drivers.
+	control(&format!("commit-row:{}", &shas["alpha3"][..7]));
+	absent(&format!("commit-row:{}", &shas["beta3"][..7]));
+	control("log-filter-repo");
+
+	// 2. A commit's details and changes come from its own repository.
+	click(&row("beta2"));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &shas["beta2"][..7]));
+	control("commit-details-repo:beta");
+	control("commit-file:beta2.txt");
+	// A range across repositories is refused, not merged.
+	press(&row("gamma2"), Some("shift"));
+	wait("[APP:RANGE_REFUSED: cross_repo]");
+
+	// 3. The merged log as a picture (dark theme).
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join("multi-repo-log.png");
+	{
+		let geometry = Command::new("xdotool")
+			.args(["getwindowgeometry", "--shell", &wid])
+			.output()
+			.unwrap();
+		let text = String::from_utf8(geometry.stdout).unwrap();
+		let g: HashMap<_, _> =
+			text.lines().filter_map(|l| l.split_once('=')).collect();
+		let crop =
+			format!("{}x{}+{}+{}", g["WIDTH"], g["HEIGHT"], g["X"], g["Y"]);
+		settled();
+		std::thread::sleep(Duration::from_millis(300));
+		let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
+		assert!(Command::new("xwd")
+			.args(["-root", "-silent", "-out"])
+			.arg(xwd.path())
+			.status()
+			.unwrap()
+			.success());
+		assert!(Command::new("convert")
+			.arg(xwd.path())
+			.args(["-crop", &crop, "+repage"])
+			.arg(&shot)
+			.status()
+			.unwrap()
+			.success());
+		assert!(fs::metadata(&shot).unwrap().len() > 1024);
+	}
+	println!("[TEST DRIVER] merged log screenshot: {}", shot.display());
+
+	// 4. The Repository chip narrows the log to one repository: then it is
+	// the single-repository log with plain row ids.
+	click("log-filter-repo");
+	click("log-repo:alpha");
+	wait("[APP:LOG_REPOS: n=2]");
+	wait("[APP:MULTI_LOG_LOADED: repos=2 rows=6]");
+	absent(&row("alpha3"));
+	click("log-repo:gamma");
+	wait("[APP:LOG_REPOS: n=1]");
+	let loaded = wait("[APP:E2E_LOG:");
+	assert!(
+		loaded
+			.last()
+			.unwrap()
+			.contains(&format!("mode=graph n=3 first={}", &shas["beta3"][..7])),
+		"{loaded:?}"
+	);
+	key(&wid, "Escape");
+	control(&format!("commit-row:{}", &shas["beta1"][..7]));
+	absent(&row("gamma3"));
+	absent(&format!("root-stripe:{}", &row("beta3")[11..]));
+	// Back to every repository.
+	click("log-filter-repo-clear");
+	wait("[APP:MULTI_LOG_LOADED: repos=3 rows=9]");
+	control(&row("alpha1"));
+
+	quit_cleanly(&mut app, &wid);
+}
