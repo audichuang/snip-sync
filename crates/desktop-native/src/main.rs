@@ -664,6 +664,12 @@ pub struct WorkbenchModel {
 	/// The menu a mouse-down outside it just closed, and when.
 	pub log_menu_dismissed: Option<(ui::LogMenu, std::time::Instant)>,
 	pub log_path_input: Entity<TextInput>,
+	pub log_since_input: Entity<TextInput>,
+	pub log_until_input: Entity<TextInput>,
+	/// The Date chip's custom range was refused as malformed.
+	pub log_date_error: bool,
+	/// Folders opened in the Paths chip's picker.
+	pub log_paths_expanded: Vec<String>,
 	pub branch_filter_input: Entity<TextInput>,
 	/// Collapsed groups of the branches pane ("refs_local", …).
 	pub branch_groups_collapsed: Vec<String>,
@@ -840,13 +846,25 @@ impl WorkbenchModel {
 			match ev {
 				InputEvent::Submit => {
 					let p = input.read(cx).text().trim().to_string();
-					this.set_log_paths(p, cx);
+					this.add_log_path(p, cx);
 				}
 				InputEvent::Dismiss => this.close_log_menu(cx),
 				_ => {}
 			}
 		})
 		.detach();
+		let date_input = |key: &'static str, cx: &mut Context<Self>| {
+			let input = cx.new(|cx| TextInput::new(i18n::t(key, loc), 0, cx));
+			cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => this.apply_log_date_range(cx),
+				InputEvent::Dismiss => this.close_log_menu(cx),
+				_ => {}
+			})
+			.detach();
+			input
+		};
+		let log_since_input = date_input("log_date_from", cx);
+		let log_until_input = date_input("log_date_to", cx);
 		let branch_filter_input = cx.new(|cx| {
 			TextInput::new(i18n::t("log_branch_placeholder", loc), 39, cx)
 		});
@@ -990,6 +1008,10 @@ impl WorkbenchModel {
 			log_menu: None,
 			log_menu_dismissed: None,
 			log_path_input,
+			log_since_input,
+			log_until_input,
+			log_date_error: false,
+			log_paths_expanded: Vec::new(),
 			branch_filter_input,
 			branch_groups_collapsed: Vec::new(),
 			log_branches_visible: true,
@@ -1302,6 +1324,8 @@ impl WorkbenchModel {
 			(self.log_search_input.clone(), "log_search_placeholder"),
 			(self.selector_input.clone(), "selector_filter_placeholder"),
 			(self.log_path_input.clone(), "log_paths_placeholder"),
+			(self.log_since_input.clone(), "log_date_from"),
+			(self.log_until_input.clone(), "log_date_to"),
 			(self.branch_filter_input.clone(), "log_branch_placeholder"),
 		] {
 			input.update(cx, |i, _| i.set_placeholder(i18n::t(key, loc)));
@@ -1790,6 +1814,8 @@ impl WorkbenchModel {
 		self.log_filter = LogQuery::default();
 		self.log_menu = None;
 		release_vec(&mut self.changed_dirs_collapsed);
+		self.log_date_error = false;
+		release_vec(&mut self.log_paths_expanded);
 		self.commit_details = None;
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.git_user_email = None;
@@ -1824,6 +1850,8 @@ impl WorkbenchModel {
 			self.add_repo_input.clone(),
 			self.workspace_path_input.clone(),
 			self.log_path_input.clone(),
+			self.log_since_input.clone(),
+			self.log_until_input.clone(),
 			self.branch_filter_input.clone(),
 		] {
 			input.update(cx, |field, _| field.clear_retained());

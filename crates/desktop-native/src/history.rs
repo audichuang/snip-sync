@@ -137,6 +137,42 @@ pub fn mark_on_head(
 		.collect()
 }
 
+/// Paths the Paths chip combines at most.
+pub const MAX_LOG_PATHS: usize = 32;
+
+/// A typed path as a repository-relative pathspec: trimmed, `/`-separated.
+pub fn clean_log_path(path: &str) -> String {
+	path.trim().replace('\\', "/").trim_matches('/').to_string()
+}
+
+/// The Date chip's custom range as `--since` / `--until` values covering
+/// both whole days; `None` when a non-empty field is not `YYYY-MM-DD` or
+/// the range ends before it starts.
+pub fn date_range(
+	since: &str,
+	until: &str,
+) -> Option<(Option<String>, Option<String>)> {
+	let day = |s: &str| -> Option<Option<chrono::NaiveDate>> {
+		if s.is_empty() {
+			Some(None)
+		} else {
+			chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+				.ok()
+				.map(Some)
+		}
+	};
+	let (from, to) = (day(since)?, day(until)?);
+	if let (Some(a), Some(b)) = (from, to) {
+		if b < a {
+			return None;
+		}
+	}
+	Some((
+		from.map(|d| format!("{d} 00:00:00")),
+		to.map(|d| format!("{d} 23:59:59")),
+	))
+}
+
 /// What the details pane shows beyond the log row.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommitDetails {
@@ -1230,6 +1266,7 @@ impl PreparedHistory {
 					.into_iter()
 					.chain(&q.author)
 					.chain(&q.since)
+					.chain(&q.until)
 					.chain(&q.paths)
 			}))
 			.chain(self.collapsed_merges.iter())
@@ -1777,26 +1814,68 @@ impl WorkbenchModel {
 		self.apply_log_filter(cx);
 	}
 
-	/// Date chip: a `git log --since` value, `None` for any date.
+	/// Date chip preset: a `git log --since` value, `None` for any date.
 	pub fn set_log_since(
 		&mut self,
 		since: Option<&'static str>,
 		cx: &mut Context<Self>,
 	) {
 		self.log_menu = None;
+		self.log_date_error = false;
 		self.log_filter.since = since.map(str::to_string);
+		self.log_filter.until = None;
 		self.apply_log_filter(cx);
 	}
 
-	/// Paths chip: one repository-relative path; empty clears it.
-	pub fn set_log_paths(&mut self, path: String, cx: &mut Context<Self>) {
+	/// Date chip custom range from its two fields (`YYYY-MM-DD`, either may
+	/// be empty); both days are included. A malformed date is refused.
+	pub fn apply_log_date_range(&mut self, cx: &mut Context<Self>) {
+		let since = self.log_since_input.read(cx).text().trim().to_string();
+		let until = self.log_until_input.read(cx).text().trim().to_string();
+		match date_range(&since, &until) {
+			Some((since, until)) => {
+				self.log_menu = None;
+				self.log_date_error = false;
+				self.log_filter.since = since;
+				self.log_filter.until = until;
+				self.apply_log_filter(cx);
+			}
+			None => {
+				self.log_date_error = true;
+				app_log!("[APP:LOG_DATE_INVALID]");
+				cx.notify();
+			}
+		}
+	}
+
+	/// Paths chip: adds a typed repository-relative path to the filter.
+	pub fn add_log_path(&mut self, path: String, cx: &mut Context<Self>) {
+		let path = clean_log_path(&path);
+		if path.is_empty() || self.log_filter.paths.contains(&path) {
+			return;
+		}
+		self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
+		self.toggle_log_path(path, cx);
+	}
+
+	/// Paths chip: checks or unchecks one path; the menu stays open.
+	pub fn toggle_log_path(&mut self, path: String, cx: &mut Context<Self>) {
+		let paths = &mut self.log_filter.paths;
+		match paths.iter().position(|p| *p == path) {
+			Some(i) => {
+				paths.remove(i);
+			}
+			None if paths.len() < MAX_LOG_PATHS => paths.push(path),
+			None => return,
+		}
+		app_log!("[APP:LOG_PATHS: n={}]", self.log_filter.paths.len());
+		self.apply_log_filter(cx);
+	}
+
+	/// Paths chip ✕: every path.
+	pub fn clear_log_paths(&mut self, cx: &mut Context<Self>) {
 		self.log_menu = None;
-		let path = path.trim().trim_matches('/').replace('\\', "/");
-		self.log_filter.paths = if path.is_empty() {
-			Vec::new()
-		} else {
-			vec![path]
-		};
+		self.log_filter.paths.clear();
 		self.apply_log_filter(cx);
 	}
 
@@ -3212,6 +3291,26 @@ mod tests {
 			[true, true]
 		);
 		assert!(mark_on_head(&commits, []).iter().all(|on| !on));
+	}
+
+	#[test]
+	fn date_range_covers_whole_days_and_refuses_bad_input() {
+		assert_eq!(
+			date_range("2026-01-02", "2026-01-31"),
+			Some((
+				Some("2026-01-02 00:00:00".into()),
+				Some("2026-01-31 23:59:59".into())
+			))
+		);
+		assert_eq!(
+			date_range("", "2026-01-31"),
+			Some((None, Some("2026-01-31 23:59:59".into())))
+		);
+		assert_eq!(date_range("", ""), Some((None, None)));
+		assert_eq!(date_range("2026-02-30", ""), None);
+		assert_eq!(date_range("yesterday", ""), None);
+		assert_eq!(date_range("2026-02-01", "2026-01-01"), None);
+		assert_eq!(clean_log_path(" /src\\app/ "), "src/app");
 	}
 
 	#[test]

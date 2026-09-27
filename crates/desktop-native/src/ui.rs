@@ -602,6 +602,66 @@ fn branch_rows(
 	out
 }
 
+/// Rows the Paths chip's picker lists at most.
+const MAX_PATH_PICKS: usize = 300;
+
+/// One row of the Paths chip's picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PathPick {
+	/// Repository-relative path (the pathspec).
+	rel: String,
+	name: String,
+	/// `None` for a chosen path the tree has not loaded.
+	is_dir: Option<bool>,
+	depth: usize,
+	/// A loaded folder with children to show.
+	expandable: bool,
+	expanded: bool,
+}
+
+/// The Paths picker's rows: the project tree's loaded folders and files
+/// (nested repositories and non-UTF-8 names left out), folders in
+/// `expanded` opened, at most `max` rows.
+fn path_picker_rows(
+	root: &crate::tree::FileTreeNode,
+	expanded: &[String],
+	max: usize,
+) -> Vec<PathPick> {
+	fn walk(
+		node: &crate::tree::FileTreeNode,
+		depth: usize,
+		expanded: &[String],
+		max: usize,
+		out: &mut Vec<PathPick>,
+	) {
+		for child in &node.children {
+			if out.len() >= max {
+				return;
+			}
+			if !child.is_valid_utf8 || child.is_nested_repo {
+				continue;
+			}
+			let expandable =
+				child.is_dir && child.is_loaded && !child.children.is_empty();
+			let open = expandable && expanded.contains(&child.rel_path);
+			out.push(PathPick {
+				rel: child.rel_path.clone(),
+				name: child.name.clone(),
+				is_dir: Some(child.is_dir),
+				depth,
+				expandable,
+				expanded: open,
+			});
+			if open {
+				walk(child, depth + 1, expanded, max, out);
+			}
+		}
+	}
+	let mut out = Vec::new();
+	walk(root, 0, expanded, max, &mut out);
+	out
+}
+
 /// Rows per branches-pane group.
 const MAX_BRANCH_ROWS: usize = 200;
 const AUTHOR_W: f32 = 120.;
@@ -4536,7 +4596,7 @@ impl WorkbenchModel {
 			LogMenu::Date => self.set_log_since(None, cx),
 			LogMenu::Paths => {
 				self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
-				self.set_log_paths(String::new(), cx)
+				self.clear_log_paths(cx)
 			}
 			LogMenu::More => cx.notify(),
 		}
@@ -4647,25 +4707,131 @@ impl WorkbenchModel {
 						cx,
 					));
 				}
+				// IntelliJ's "Select…": a custom range, both days included.
+				let field =
+					|id: &'static str,
+					 input: &gpui::Entity<crate::text_input::TextInput>| {
+						div()
+							.id(id)
+							.relative()
+							.w(px(118.))
+							.px(px(4.))
+							.rounded(px(4.))
+							.border_1()
+							.border_color(rgb(pal().button_border))
+							.child(input.clone())
+							.children(probe(log, id))
+					};
+				items.push(
+					div()
+						.mt(px(4.))
+						.px(px(8.))
+						.pt(px(4.))
+						.border_t_1()
+						.border_color(rgb(pal().divider))
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text_muted))
+						.child(t("log_date_custom", loc))
+						.into_any_element(),
+				);
+				items.push(
+					div()
+						.px(px(8.))
+						.py(px(4.))
+						.flex()
+						.items_center()
+						.gap(px(4.))
+						.child(field("log-date-since", &self.log_since_input))
+						.child("–")
+						.child(field("log-date-until", &self.log_until_input))
+						.child(
+							button(
+								"log-date-apply",
+								t("log_date_apply", loc),
+								Btn::Default,
+								true,
+								0,
+							)
+							.h(px(22.))
+							.px(px(8.))
+							.on_click(cx.listener(|this, _, _, cx| {
+								cx.stop_propagation();
+								this.apply_log_date_range(cx)
+							}))
+							.children(probe(log, "log-date-apply")),
+						)
+						.into_any_element(),
+				);
+				if self.log_date_error {
+					items.push(
+						div()
+							.px(px(8.))
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().error))
+							.child(t("log_date_invalid", loc))
+							.into_any_element(),
+					);
+				}
 			}
 			LogMenu::Paths => {
 				items.push(
 					div()
 						.id("log-path-input")
 						.relative()
-						.w(px(240.))
+						.mx(px(4.))
+						.px(px(4.))
+						.rounded(px(4.))
+						.border_1()
+						.border_color(rgb(pal().button_border))
 						.child(self.log_path_input.clone())
 						.children(probe(log, "log-path-input"))
 						.into_any_element(),
 				);
 				items.push(
 					div()
-						.px(px(2.))
+						.px(px(8.))
+						.py(px(2.))
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
 						.child(t("log_paths_hint", loc))
 						.into_any_element(),
 				);
+				// Chosen paths first (typed ones may not be in the tree),
+				// then the project's folders and files as far as loaded.
+				let chosen = &self.log_filter.paths;
+				let mut picks: Vec<PathPick> = chosen
+					.iter()
+					.map(|p| PathPick {
+						rel: p.clone(),
+						name: p.clone(),
+						is_dir: None,
+						depth: 0,
+						expandable: false,
+						expanded: false,
+					})
+					.collect();
+				match self.file_tree.as_ref() {
+					Some(tree) if tree.is_loaded => picks.extend(
+						path_picker_rows(
+							tree,
+							&self.log_paths_expanded,
+							MAX_PATH_PICKS,
+						)
+						.into_iter()
+						.filter(|p| !chosen.contains(&p.rel)),
+					),
+					_ => items.push(
+						div()
+							.px(px(8.))
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().text_muted))
+							.child(t("log_paths_tree_empty", loc))
+							.into_any_element(),
+					),
+				}
+				for pick in picks {
+					items.push(self.path_pick_row(pick, cx));
+				}
 			}
 			LogMenu::More => {
 				for (key, label, checked) in [
@@ -4731,6 +4897,82 @@ impl WorkbenchModel {
 				deferred(anchored().snap_to_window().child(panel))
 					.with_priority(1),
 			)
+			.into_any_element()
+	}
+
+	/// One row of the Paths picker: chevron (a loaded folder), checkbox,
+	/// icon and name; clicking the row checks or unchecks the path.
+	fn path_pick_row(
+		&self,
+		pick: PathPick,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let log = &self.probes;
+		let checked = self.log_filter.paths.contains(&pick.rel);
+		let id = format!("log-path-pick:{}", pick.rel);
+		let exp_id = format!("log-path-expand:{}", pick.rel);
+		let rel = pick.rel.clone();
+		let exp_rel = pick.rel.clone();
+		div()
+			.id(SharedString::from(id.clone()))
+			.relative()
+			.h(px(24.))
+			.pl(px(4. + pick.depth as f32 * 16.))
+			.pr(px(8.))
+			.flex()
+			.items_center()
+			.gap(px(5.))
+			.rounded(px(4.))
+			.cursor_pointer()
+			.hover(|s| s.bg(rgb(pal().hover_bg)))
+			.on_click(cx.listener(move |this, _, _, cx| {
+				cx.stop_propagation();
+				this.toggle_log_path(rel.clone(), cx)
+			}))
+			.child(if pick.expandable {
+				div()
+					.id(SharedString::from(exp_id.clone()))
+					.relative()
+					.flex()
+					.rounded(px(3.))
+					.hover(|s| s.bg(rgb(pal().divider)))
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						let open = &mut this.log_paths_expanded;
+						match open.iter().position(|p| *p == exp_rel) {
+							Some(i) => {
+								open.remove(i);
+							}
+							None => open.push(exp_rel.clone()),
+						}
+						cx.notify();
+					}))
+					.child(icon(
+						if pick.expanded {
+							Icon::ChevronDown
+						} else {
+							Icon::ChevronRight
+						},
+						12.,
+					))
+					.children(probe(log, exp_id))
+					.into_any_element()
+			} else {
+				div().w(px(12.)).flex_shrink_0().into_any_element()
+			})
+			.child(checkbox(checked))
+			.when_some(pick.is_dir, |d, dir| {
+				d.child(icon(
+					if dir {
+						Icon::Folder
+					} else {
+						file_icon(&pick.rel)
+					},
+					14.,
+				))
+			})
+			.child(fill_text(pick.name))
+			.children(probe(log, id))
 			.into_any_element()
 	}
 
@@ -5103,14 +5345,30 @@ impl WorkbenchModel {
 				a
 			}
 		});
-		let date_value = self.log_filter.since.as_deref().map(|s| {
-			DATE_PRESETS
-				.iter()
-				.find(|(_, since, _)| *since == s)
-				.map(|(_, _, label)| t(label, loc).to_string())
-				.unwrap_or_else(|| s.to_string())
+		let day = |s: &Option<String>| {
+			s.as_deref()
+				.map(|s| s.split(' ').next().unwrap_or(s).to_string())
+				.unwrap_or_else(|| "…".into())
+		};
+		let date_value = match (&self.log_filter.since, &self.log_filter.until)
+		{
+			(None, None) => None,
+			(Some(s), None)
+				if DATE_PRESETS.iter().any(|(_, since, _)| since == s) =>
+			{
+				DATE_PRESETS
+					.iter()
+					.find(|(_, since, _)| since == s)
+					.map(|(_, _, label)| t(label, loc).to_string())
+			}
+			(since, until) => Some(format!("{} – {}", day(since), day(until))),
+		};
+		let paths_value = self.log_filter.paths.first().map(|p| {
+			match self.log_filter.paths.len() {
+				1 => p.clone(),
+				n => format!("{p} +{}", n - 1),
+			}
 		});
-		let paths_value = self.log_filter.paths.first().cloned();
 		let filter_bar = div()
 			.flex()
 			.flex_row()
@@ -6525,6 +6783,33 @@ mod tests {
 		f.end_frame();
 		assert_eq!(f.end_frame(), vec!["btn-apply".to_string()]);
 		assert!(f.report("btn-apply", [5, 2, 3, 4]), "reappearing is new");
+	}
+
+	#[test]
+	fn path_picker_lists_loaded_folders_and_opens_expanded_ones() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		std::fs::create_dir_all(root.join("src/app")).unwrap();
+		std::fs::write(root.join("src/lib.rs"), "").unwrap();
+		std::fs::write(root.join("README.md"), "").unwrap();
+		let mut tree = crate::tree::FileTreeNode::new_root(root);
+		let names = |rows: Vec<PathPick>| -> Vec<String> {
+			rows.into_iter()
+				.map(|p| format!("{}{}", " ".repeat(p.depth), p.rel))
+				.collect()
+		};
+		// `src` is not loaded yet: listed, but nothing to open.
+		let rows = path_picker_rows(&tree, &["src".into()], 10);
+		assert!(!rows.iter().any(|p| p.expandable));
+		assert_eq!(rows.len(), 2);
+		tree.toggle_expand("src", root);
+		let closed = path_picker_rows(&tree, &[], 10);
+		assert!(closed.iter().any(|p| p.rel == "src" && p.expandable));
+		assert_eq!(closed.len(), 2);
+		let open = names(path_picker_rows(&tree, &["src".into()], 10));
+		assert!(open.contains(&" src/app".to_string()), "{open:?}");
+		assert!(open.contains(&" src/lib.rs".to_string()), "{open:?}");
+		assert_eq!(path_picker_rows(&tree, &["src".into()], 3).len(), 3);
 	}
 
 	#[test]
