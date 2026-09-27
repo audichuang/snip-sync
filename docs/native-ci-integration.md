@@ -17,7 +17,7 @@ product pass: current run evidence must come from the generated reports.
 | `just native-resources-long` | Standard workload and unchanged long resource gate; currently fails for missing real hide/tray coverage |
 | `just native-acceptance-build` | Build/freeze only; no GUI acceptance claim |
 
-All entries accept `--output FRESH_DIRECTORY` and `--build-receipt RECEIPT`.
+All entries accept `--output FRESH_DIRECTORY_OUTSIDE_CHECKOUT` and `--build-receipt RECEIPT`.
 Without a receipt, the runner invokes a locked release Cargo build and freezes
 the emitted executable. With a receipt, it verifies that build and uses its
 frozen executable without rebuilding. The combined entry builds only once.
@@ -40,9 +40,11 @@ inputs fail closed; every driver gets `SNIP_REQUIRE_ALL_TESTS=1`. Local native
 linker configuration, when needed, remains caller-provided; the IME helper no
 longer inserts a particular developer's library directory.
 
-Evidence defaults to a unique directory under ignored
-`target/native-acceptance/`. An explicit output must not exist, and output
-inside the checkout must be gitignored. No historical run is deleted or reused.
+Evidence defaults to a unique `/tmp/snip-native-acceptance-*` directory.
+An explicit output must not exist and must be outside the checkout, including
+outside ignored `target/`: the fixture generator rejects worktree paths.
+This is checked before any build. Fixtures and all evidence stay together in
+that directory; no historical run is deleted or reused.
 The runner clears inherited display/bus and Git-routing variables; existing
 drivers create their own private Xvfb, HOME and D-Bus. These entries do not wrap
 the drivers in the less-isolated smoke-test display helper.

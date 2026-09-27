@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build once, pin current inputs, and run the existing Linux acceptance drivers.
 
-All outputs are fresh and retained. --build-receipt reuses a build made by this
-entrypoint only when the checkout and frozen executable still match it.
+All outputs are fresh, outside the checkout, and retained. --build-receipt reuses
+a build made by this entrypoint only when the checkout and executable still match.
 """
 
 from __future__ import annotations
@@ -88,17 +88,12 @@ def run(command: list[str], output: Path, name: str, commands: list[dict]) -> No
 
 def fresh_output(requested: Path | None) -> Path:
     if requested is None:
-        parent = ROOT / "target" / "native-acceptance"
-        parent.mkdir(parents=True, exist_ok=True)
-        return Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+        return Path(tempfile.mkdtemp(prefix="snip-native-acceptance-", dir="/tmp"))
     if requested.exists() or requested.is_symlink():
         raise ValueError("--output must not exist; historical evidence is never replaced")
     output = requested.resolve()
     if output.is_relative_to(ROOT):
-        ignored = subprocess.run(["git", "-C", str(ROOT), "check-ignore", "-q", str(output)],
-                                 env=environment()).returncode
-        if ignored != 0:
-            raise ValueError("output inside the checkout must be gitignored (use target/)")
+        raise ValueError("--output must be outside the checkout; fixture generation refuses worktree paths")
     output.mkdir(parents=True)
     return output
 
@@ -213,7 +208,7 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gate", choices=("build", "all", *GATES, "resource-long"), default="all")
-    parser.add_argument("--output", type=Path, help="Fresh directory (default: unique target/native-acceptance run)")
+    parser.add_argument("--output", type=Path, help="Fresh directory outside checkout (default: unique /tmp run)")
     parser.add_argument("--build-receipt", type=Path, help="Reuse this entrypoint's frozen build, verifying all inputs")
     args = parser.parse_args(argv)
     output = None

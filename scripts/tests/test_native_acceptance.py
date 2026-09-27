@@ -10,6 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import run_native_acceptance as acceptance
+from collaboration_fixture import validate_target
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -99,6 +100,27 @@ class AcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not exist"):
             acceptance.fresh_output(evidence)
         self.assertEqual(marker.read_text(), "preserve")
+
+    def test_output_contract_rejects_checkout_before_build_and_matches_fixture_guard(self):
+        inside = acceptance.ROOT / "target" / "native-acceptance" / self.root.name
+        self.assertFalse(inside.exists())
+        def remove_test_output():
+            if inside.exists():
+                (inside / "acceptance.json").unlink(missing_ok=True)
+                inside.rmdir()
+        self.addCleanup(remove_test_output)
+        with mock.patch.object(acceptance, "prerequisites"), \
+                mock.patch.object(acceptance, "build", return_value=self.receipt) as build, \
+                mock.patch.object(acceptance, "verify_build", return_value=self.data):
+            self.assertNotEqual(acceptance.main(["--gate", "build", "--output", str(inside)]), 0)
+        build.assert_not_called()
+        self.assertFalse(inside.exists())
+        output = acceptance.fresh_output(None)
+        self.addCleanup(output.rmdir)
+        self.assertFalse(output.is_relative_to(acceptance.ROOT))
+        fixture, status = validate_target(str(output / "collaboration-fixture"))
+        self.assertEqual(fixture.parent, output)
+        self.assertEqual(status, "missing")
 
     def test_gate_commands_preserve_full_oracles_and_isolated_interpreter(self):
         commands = []
