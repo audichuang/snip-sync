@@ -1603,6 +1603,53 @@ def _settle(session: NativeSession, exclude: set[int], seconds: float, meta: dic
     return rows
 
 
+def _capture_proc_snapshot(app: dict[str, Any], sample: dict[str, Any], out_dir: str, proc_root: str = "/proc") -> None:
+    """Read diagnostic sidecars after an endpoint is emitted, outside its settle window."""
+    keys = ("pid", "starttime", "exe")
+    expected = {key: app.get(key) for key in keys}
+    if any(value is None for value in expected.values()):
+        raise LeakError("proc snapshot requires a complete owned app identity")
+    pid = expected["pid"]
+    started = time.monotonic()
+    try:
+        before = identity(pid, proc_root)
+        if any(before.get(key) != expected[key] for key in keys):
+            raise LeakError("proc snapshot app identity changed before read")
+        contents = {}
+        for name in ("smaps", "status"):
+            with open(os.path.join(proc_root, str(pid), name), "rb") as handle:
+                contents[name] = handle.read()
+            if not contents[name]:
+                raise LeakError(f"proc snapshot {name} was empty")
+        uname = os.uname()
+        runtime = {
+            "cpuCount": os.cpu_count(),
+            "appCpuAffinity": sorted(os.sched_getaffinity(pid)),
+            "uname": {key: getattr(uname, key) for key in ("sysname", "release", "version", "machine")},
+        }
+        after = identity(pid, proc_root)
+        if any(after.get(key) != expected[key] for key in keys):
+            raise LeakError("proc snapshot app identity changed during read")
+        finished = time.monotonic()
+        directory = os.path.join(out_dir, "proc-snapshots")
+        os.makedirs(directory, exist_ok=True)
+        files = {}
+        for name, data in contents.items():
+            relative = os.path.join("proc-snapshots", f"{sample['seq']:05d}-{sample['kind']}.{name}")
+            with open(os.path.join(out_dir, relative), "xb") as handle:
+                handle.write(data)
+            files[name] = relative
+        _append_jsonl(os.path.join(directory, "index.jsonl"), {
+            "sampleId": sample["sampleId"], "seq": sample["seq"], "kind": sample["kind"],
+            "measuredSwitchesCompleted": sample["measuredSwitchesCompleted"],
+            "sampleTMono": sample["tMono"], "captureStartMono": started, "captureEndMono": finished,
+            "sampleEmitLagSeconds": started - sample["tMono"],
+            "identity": expected, "runtime": runtime, "files": files,
+        })
+    except OSError as exc:
+        raise LeakError(f"proc snapshot failed for owned app {pid}: {exc}") from exc
+
+
 def _resource_settled(row: dict[str, Any]) -> bool:
     return row.get("resourcesComplete") is True and row.get("gitChildren") == 0
 
@@ -1916,6 +1963,8 @@ def drive_product(report: dict[str, Any], out_dir: str) -> None:
         payload = emit({"kind": kind, **row})
         report["samples"].append(payload)
         report["sampleOrder"].append(payload["sampleId"])
+        if kind in ("endpoint", "terminal") and session is not None:
+            _capture_proc_snapshot(session.app, payload, out_dir)
         return payload
 
     try:

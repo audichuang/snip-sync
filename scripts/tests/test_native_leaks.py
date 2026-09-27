@@ -619,6 +619,67 @@ class TestLiveHelpers(unittest.TestCase):
             self.assertIsNone(snap["totals"]["gitChildren"])
             self.assertTrue(any("changed during sample" in reason for reason in snap["reasons"]))
 
+    def test_proc_snapshot_requires_same_owned_identity_and_complete_reads(self) -> None:
+        cases = ("valid", "before-starttime", "before-exe", "after-starttime", "after-exe", "missing-smaps", "missing-status")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as root:
+                exe = os.path.join(root, "app")
+                _write_proc(root, 10, "app", 50, 20000, 15000, 4, 3, [], exe, watches=0)
+                smaps = b"1000-2000 rw-p 00000000 00:00 0 [heap]\nRss: 20 kB\n"
+                with open(os.path.join(root, "10", "smaps"), "wb") as handle:
+                    handle.write(smaps)
+                with open(os.path.join(root, "10", "status"), "rb") as handle:
+                    status = handle.read()
+                if case.startswith("missing-"):
+                    os.remove(os.path.join(root, "10", case.removeprefix("missing-")))
+                app = {"pid": 10, "starttime": 50, "exe": exe}
+                sample = {"seq": 3, "sampleId": "endpoint-10", "tMono": 1000.0, "kind": "endpoint", "measuredSwitchesCompleted": 10}
+                original_sample = dict(sample)
+                original_identity, original_open = gate.identity, open
+                seen_reads, identity_calls = [], []
+
+                def current_identity(pid, proc_root="/proc"):
+                    value = original_identity(pid, proc_root)
+                    identity_calls.append(value)
+                    if (case.startswith("before-") and len(identity_calls) == 1) or (case.startswith("after-") and len(identity_calls) == 2):
+                        key = case.split("-", 1)[1]
+                        value[key] = 51 if key == "starttime" else exe + "-unrelated"
+                    return value
+
+                def read_file(path, *args, **kwargs):
+                    if os.fspath(path) in (os.path.join(root, "10", "smaps"), os.path.join(root, "10", "status")):
+                        seen_reads.append(os.path.basename(path))
+                    return original_open(path, *args, **kwargs)
+
+                out = os.path.join(root, "output")
+                with mock.patch.object(gate, "identity", side_effect=current_identity), mock.patch("builtins.open", side_effect=read_file), mock.patch.object(gate.os, "sched_getaffinity", return_value={2, 3}), mock.patch.object(gate.time, "monotonic", side_effect=[1001.0, 1001.25]):
+                    if case == "valid":
+                        gate._capture_proc_snapshot(app, sample, out, proc_root=root)
+                    else:
+                        with self.assertRaises(gate.LeakError):
+                            gate._capture_proc_snapshot(app, sample, out, proc_root=root)
+                self.assertEqual(sample, original_sample)
+                if case.startswith("before-"):
+                    self.assertEqual(seen_reads, [], "unrelated process data must not be read")
+                if case != "valid":
+                    self.assertFalse(os.path.exists(out), "failed capture must not publish valid-looking artifacts")
+                    continue
+                with open(os.path.join(out, "proc-snapshots", "index.jsonl"), encoding="utf-8") as handle:
+                    entries = [json.loads(line) for line in handle]
+                self.assertEqual(len(entries), 1)
+                entry = entries[0]
+                self.assertEqual(entry["identity"], app)
+                self.assertEqual(entry["sampleId"], sample["sampleId"])
+                self.assertEqual(entry["sampleTMono"], sample["tMono"])
+                self.assertEqual(entry["captureStartMono"], 1001.0)
+                self.assertEqual(entry["captureEndMono"], 1001.25)
+                self.assertEqual(entry["sampleEmitLagSeconds"], 1.0)
+                self.assertEqual(entry["runtime"]["appCpuAffinity"], [2, 3])
+                self.assertEqual(set(entry["runtime"]), {"cpuCount", "appCpuAffinity", "uname"})
+                for name, expected in (("smaps", smaps), ("status", status)):
+                    with open(os.path.join(out, entry["files"][name]), "rb") as handle:
+                        self.assertEqual(handle.read(), expected)
+
     def test_deleted_executable_is_not_a_complete_sample(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             exe = os.path.join(root, "bin", "app")
