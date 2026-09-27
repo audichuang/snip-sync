@@ -1178,12 +1178,11 @@ impl WorkbenchModel {
 		let loc = self.locale;
 		let log = &self.probes;
 		let q = self.selector_input.read(cx).text().to_string();
-		let items = self.selector_items(&q);
+		let n = self.selector_candidates(&q).count();
 		let title = match self.popover {
 			Some(Popover::Repo) => t("selector_repo_title", loc),
 			_ => t("selector_ref_title", loc),
 		};
-		let n = items.len();
 		let list_h = (n.max(1) as f32 * 26.0).min(300.0);
 		let cursor = self.popover_cursor;
 		let panel = div()
@@ -1221,9 +1220,7 @@ impl WorkbenchModel {
 								n,
 								cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
 									let q = this.selector_input.read(cx).text().to_string();
-									let items = this.selector_items(&q);
-									range
-										.filter_map(|ix| items.get(ix).cloned().map(|it| (ix, it)))
+									this.selector_items(&q, range)
 										.map(|(ix, it)| {
 											let pick = it.pick.clone();
 											let active = match &it.pick {
