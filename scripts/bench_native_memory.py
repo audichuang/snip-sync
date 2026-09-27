@@ -1677,6 +1677,16 @@ def open_project_list(s: NativeSession, win: dict[str, Any]) -> None:
         time.sleep(0.05)
 
 
+def open_repo_name(lines: list[str]) -> str | None:
+    """Basename of the repo the app last selected, or None after a workspace change."""
+    for line in reversed(lines):
+        if "[APP:WORKSPACE: state=" in line:
+            return None
+        if "[APP:REPO_SELECTING:" in line:
+            return parse_repo_select(line)[1]
+    return None
+
+
 def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[float, float, float, int]:
     """Click one repo row. Returns click time, load times, and the log index of the click."""
     open_project_list(s, win)
@@ -1684,6 +1694,12 @@ def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[f
     assert_current_basket_empty(s.texts(), f"before opening {name}")
     bounds = scroll_into_view(s, win, f"repo-row:{name}")
     assert_on_window(bounds, win, f"repo-row:{name}")
+    if open_repo_name(s.texts()) == name:
+        # A click on the open, expanded repo collapses it; the second click
+        # expands it again, which re-reads it (a fresh select and load).
+        s.click(win, bounds)
+        time.sleep(0.3)
+        bounds = scroll_into_view(s, win, f"repo-row:{name}")
     before = len(s.lines)
     sent = s.click(win, bounds)
     _, _, sel = s.wait_line(lambda line: "[APP:REPO_SELECTING:" in line, start=before, timeout=30)

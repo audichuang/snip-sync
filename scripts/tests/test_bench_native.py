@@ -49,6 +49,7 @@ from bench_native_memory import (  # noqa: E402
     check_repo_state,
     check_native_matched,
     click_repo,
+    open_repo_name,
     choose_copy_target,
     copy_explicit_selection,
     extract_clipcode_file_bytes,
@@ -111,6 +112,15 @@ class TestLavapipeIcdDiscovery(unittest.TestCase):
         with self.assertRaises(NativeBenchError) as cm:
             lavapipe_icd(self.tmp.name)
         self.assertIn("no lavapipe ICD", str(cm.exception))
+
+
+class TestOpenRepoName(unittest.TestCase):
+    def test_last_selection_until_a_workspace_change(self) -> None:
+        a = "[APP:REPO_SELECTING: 0 (repo-01) root=/w/repo-01]"
+        b = "[APP:REPO_SELECTING: 1 (repo-02) root=/w/repo-02]"
+        self.assertEqual(open_repo_name([a, b]), "repo-02")
+        self.assertEqual(open_repo_name([a, b, "[APP:WORKSPACE: state=closed generation=2]"]), None)
+        self.assertIsNone(open_repo_name([]))
 
 
 class TestBoundsAndGone(unittest.TestCase):

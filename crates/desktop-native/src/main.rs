@@ -2406,6 +2406,8 @@ impl WorkbenchModel {
 
 	/// A repo row click, as in IntelliJ's Project view: expands a collapsed
 	/// root, collapses an expanded one. Another repo is selected expanded.
+	/// Scripted drivers that re-click the open repo to reload it must click
+	/// twice (collapse, then expand).
 	pub fn toggle_repo_row(&mut self, idx: usize, cx: &mut Context<Self>) {
 		let expanded =
 			self.selected_repo_idx == Some(idx) && !self.repo_collapsed;
@@ -2419,10 +2421,12 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		self.repo_collapsed = !expanded;
-		if self.selected_repo_idx == Some(idx) {
-			cx.notify();
-		} else if expanded {
+		if expanded {
+			// Re-expanding the open repo re-reads it, so the rows shown are
+			// current (one status and one log page).
 			self.select_repo(idx, cx);
+		} else {
+			cx.notify();
 		}
 	}
 
