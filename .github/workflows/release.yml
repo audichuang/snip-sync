@@ -148,7 +148,7 @@ jobs:
                   expect() {
                       local t="$1"; shift
                       local got want
-                      got=$(cd "ci/$t" && ls | sort | tr '\n' ' ')
+                      got=$(cd "ci/$t" && find . -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')
                       want=$(printf '%s\n' "$@" "SHA256SUMS-$t.txt" | sort | tr '\n' ' ')
                       [ "$got" = "$want" ] || { echo "ci/$t has [$got], want [$want]" >&2; exit 1; }
                       (cd "ci/$t" && sha256sum --check --strict "SHA256SUMS-$t.txt")
