@@ -40,8 +40,8 @@ pub const MAX_RETAINED_GRAPH_BYTES: usize = 16 * 1024 * 1024;
 // Both history_error and the status Msg retain the bounded error. Two Msg
 // argument slots also cover the success status's count/page strings.
 // Framework glyph/layout caches, allocator overhead and temporary candidate
-// copies are outside this application-data accounting. Ref-selector copies
-// belong to the separate selector/tree tier, not this history model.
+// copies are outside this application-data accounting. The ref selector
+// borrows this model; its visible GPUI elements belong to the renderer scope.
 const GRAPH_METADATA_RESERVE: usize = 4
 	* (MAX_SHA_LEN + std::mem::size_of::<Option<String>>())
 	+ 4 * crate::text_input::TextInput::MAX_TOTAL_CHARS
@@ -61,13 +61,13 @@ pub struct LogSearch {
 /// Lazily listed tree of one commit (no checkout).
 pub struct RevTree {
 	pub sha: String,
-	pub dirs: HashMap<String, (Vec<TreeEntry>, bool)>,
+	dirs: Vec<(String, (Vec<TreeEntry>, bool))>,
 	/// Oldest directory key at the front. This is the eviction order.
 	order: VecDeque<String>,
-	pub expanded: HashSet<String>,
+	expanded: Vec<String>,
 	/// Oldest expanded key at the front. Not hash-map iteration order.
 	expanded_order: VecDeque<String>,
-	pub errors: HashMap<String, String>,
+	errors: Vec<(String, String)>,
 	/// Oldest error key at the front.
 	error_order: VecDeque<String>,
 }
@@ -113,51 +113,47 @@ fn listing_cost(dir: &str, entries: &[TreeEntry]) -> usize {
 
 impl RevTree {
 	pub fn new(sha: String) -> Self {
-		let mut expanded = HashSet::new();
-		expanded.insert(String::new());
+		let expanded = vec![String::new()];
 		Self {
 			sha,
-			dirs: HashMap::new(),
+			dirs: Vec::new(),
 			order: VecDeque::new(),
 			expanded,
 			expanded_order: VecDeque::new(),
-			errors: HashMap::new(),
+			errors: Vec::new(),
 			error_order: VecDeque::new(),
 		}
 	}
 
 	pub fn retained_bytes(&self) -> usize {
-		const SLOT: usize = 64;
-		let mut total = std::mem::size_of::<Self>();
-		total = total.saturating_add(stored_string_cost(&self.sha));
-		total = total.saturating_add(self.dirs.capacity().saturating_mul(
-			std::mem::size_of::<String>()
-				+ std::mem::size_of::<(Vec<TreeEntry>, bool)>()
-				+ SLOT,
-		));
-		total = total.saturating_add(deque_slot_cost(&self.order));
-		total = total.saturating_add(deque_slot_cost(&self.expanded_order));
-		total = total.saturating_add(deque_slot_cost(&self.error_order));
-		total = total.saturating_add(
-			self.expanded
-				.capacity()
-				.saturating_mul(std::mem::size_of::<String>() + SLOT),
-		);
-		total = total.saturating_add(
-			self.errors
-				.capacity()
-				.saturating_mul(std::mem::size_of::<String>() * 2 + SLOT),
-		);
+		let mut total = std::mem::size_of::<Self>()
+			.saturating_add(self.sha.capacity())
+			.saturating_add(self.dirs.capacity().saturating_mul(
+				std::mem::size_of::<(String, (Vec<TreeEntry>, bool))>(),
+			))
+			.saturating_add(
+				self.errors
+					.capacity()
+					.saturating_mul(std::mem::size_of::<(String, String)>()),
+			)
+			.saturating_add(
+				self.expanded
+					.capacity()
+					.saturating_mul(std::mem::size_of::<String>()),
+			)
+			.saturating_add(deque_slot_cost(&self.order))
+			.saturating_add(deque_slot_cost(&self.expanded_order))
+			.saturating_add(deque_slot_cost(&self.error_order));
 		for (key, (entries, _)) in &self.dirs {
-			total = total.saturating_add(stored_string_cost(key));
-			total = total.saturating_add(
+			total = total.saturating_add(key.capacity()).saturating_add(
 				entries
 					.capacity()
 					.saturating_mul(std::mem::size_of::<TreeEntry>()),
 			);
 			for entry in entries {
-				total = total.saturating_add(stored_string_cost(&entry.path));
-				total = total.saturating_add(stored_string_cost(&entry.name));
+				total = total
+					.saturating_add(entry.path.capacity())
+					.saturating_add(entry.name.capacity());
 			}
 		}
 		for key in self
@@ -165,21 +161,50 @@ impl RevTree {
 			.iter()
 			.chain(&self.expanded_order)
 			.chain(&self.error_order)
+			.chain(&self.expanded)
 		{
-			total = total.saturating_add(stored_string_cost(key));
-		}
-		for key in &self.expanded {
-			total = total.saturating_add(stored_string_cost(key));
+			total = total.saturating_add(key.capacity());
 		}
 		for (key, err) in &self.errors {
-			total = total.saturating_add(stored_string_cost(key));
-			total = total.saturating_add(stored_string_cost(err));
+			total = total
+				.saturating_add(key.capacity())
+				.saturating_add(err.capacity());
 		}
 		total
 	}
 
+	fn dir(&self, path: &str) -> Option<&(Vec<TreeEntry>, bool)> {
+		self.dirs
+			.binary_search_by(|(key, _)| key.as_str().cmp(path))
+			.ok()
+			.map(|index| &self.dirs[index].1)
+	}
+
+	fn dir_mut(&mut self, path: &str) -> Option<&mut (Vec<TreeEntry>, bool)> {
+		self.dirs
+			.binary_search_by(|(key, _)| key.as_str().cmp(path))
+			.ok()
+			.map(|index| &mut self.dirs[index].1)
+	}
+
+	fn put_dir(&mut self, path: String, value: (Vec<TreeEntry>, bool)) {
+		match self.dirs.binary_search_by(|(key, _)| key.cmp(&path)) {
+			Ok(index) => self.dirs[index] = (path, value),
+			Err(index) => self.dirs.insert(index, (path, value)),
+		}
+	}
+
+	fn is_expanded(&self, path: &str) -> bool {
+		self.expanded
+			.binary_search_by(|key| key.as_str().cmp(path))
+			.is_ok()
+	}
+
 	fn entry_count(&self) -> usize {
-		self.dirs.values().map(|(entries, _)| entries.len()).sum()
+		self.dirs
+			.iter()
+			.map(|(_, (entries, _))| entries.len())
+			.sum()
 	}
 
 	fn touch(&mut self, dir: &str) {
@@ -202,10 +227,10 @@ impl RevTree {
 		let Some(key) = self.order.remove(pos) else {
 			return false;
 		};
-		self.dirs.remove(&key);
-		self.expanded.remove(&key);
+		self.dirs.retain(|(have, _)| have != &key);
+		self.expanded.retain(|have| have != &key);
 		self.expanded_order.retain(|item| item != &key);
-		self.errors.remove(&key);
+		self.errors.retain(|(have, _)| have != &key);
 		self.error_order.retain(|item| item != &key);
 		true
 	}
@@ -217,7 +242,7 @@ impl RevTree {
 		self.expanded_order.shrink_to_fit();
 		self.errors.shrink_to_fit();
 		self.error_order.shrink_to_fit();
-		for (entries, _) in self.dirs.values_mut() {
+		for (_, (entries, _)) in &mut self.dirs {
 			entries.shrink_to_fit();
 		}
 	}
@@ -240,7 +265,9 @@ impl RevTree {
 		let Some(key) = self.error_order.pop_front() else {
 			return false;
 		};
-		self.errors.remove(&key).is_some()
+		let before = self.errors.len();
+		self.errors.retain(|(have, _)| have != &key);
+		self.errors.len() != before
 	}
 
 	fn within_budget(&self) -> bool {
@@ -253,10 +280,11 @@ impl RevTree {
 	/// hard cap holds. Root listings go only after every non-root listing.
 	pub fn enforce_budget(&mut self) {
 		loop {
-			let dir_keys: Vec<String> = self.dirs.keys().cloned().collect();
-			let expanded_keys: Vec<String> =
-				self.expanded.iter().cloned().collect();
-			let error_keys: Vec<String> = self.errors.keys().cloned().collect();
+			let dir_keys: Vec<String> =
+				self.dirs.iter().map(|(key, _)| key.clone()).collect();
+			let expanded_keys = self.expanded.to_vec();
+			let error_keys: Vec<String> =
+				self.errors.iter().map(|(key, _)| key.clone()).collect();
 			Self::sync_order(&mut self.order, &dir_keys);
 			Self::sync_order(&mut self.expanded_order, &expanded_keys);
 			Self::sync_order(&mut self.error_order, &error_keys);
@@ -274,12 +302,12 @@ impl RevTree {
 				self.expanded_order.iter().position(|key| !key.is_empty())
 			{
 				let key = self.expanded_order.remove(pos).unwrap();
-				self.expanded.remove(&key);
+				self.expanded.retain(|have| have != &key);
 				continue;
 			}
 			let oldest = self.order.front().cloned();
 			if let Some(key) = oldest {
-				if let Some((entries, truncated)) = self.dirs.get_mut(&key) {
+				if let Some((entries, truncated)) = self.dir_mut(&key) {
 					if !entries.is_empty() {
 						let to_pop = (entries.len() / 20).max(1);
 						for _ in 0..to_pop {
@@ -294,8 +322,8 @@ impl RevTree {
 			if self.dirs.len() > 1 && self.evict_oldest(None, false) {
 				continue;
 			}
-			if self.dirs.contains_key("") {
-				if let Some((entries, _)) = self.dirs.get("") {
+			if self.dir("").is_some() {
+				if let Some((entries, _)) = self.dir("") {
 					if entries.is_empty() {
 						self.dirs.clear();
 						self.order.clear();
@@ -331,14 +359,21 @@ impl RevTree {
 		};
 		self.error_order.retain(|key| key != &dir);
 		self.error_order.push_back(dir.clone());
-		self.errors.insert(dir, err);
+		match self.errors.binary_search_by(|(key, _)| key.cmp(&dir)) {
+			Ok(index) => self.errors[index] = (dir, err),
+			Err(index) => self.errors.insert(index, (dir, err)),
+		}
 		self.enforce_budget();
 	}
 
 	/// Records an expanded directory. The key joins the back of the eviction
 	/// order; collapsing or the byte cap drops the oldest keys first.
 	pub fn note_expanded(&mut self, path: &str) {
-		self.expanded.insert(path.to_string());
+		if let Err(index) =
+			self.expanded.binary_search_by(|key| key.as_str().cmp(path))
+		{
+			self.expanded.insert(index, path.to_string());
+		}
 		self.expanded_order.retain(|key| key != path);
 		self.expanded_order.push_back(path.to_string());
 		self.enforce_budget();
@@ -350,12 +385,12 @@ impl RevTree {
 		let drop_dir = |key: &str| {
 			key == path || (!path.is_empty() && key.starts_with(&nested))
 		};
-		self.dirs.retain(|key, _| !drop_dir(key));
+		self.dirs.retain(|(key, _)| !drop_dir(key));
 		self.order.retain(|key| !drop_dir(key));
-		self.errors.retain(|key, _| !drop_dir(key));
+		self.errors.retain(|(key, _)| !drop_dir(key));
 		self.error_order.retain(|key| !drop_dir(key));
 		if path.is_empty() {
-			self.expanded.remove("");
+			self.expanded.retain(|have| !have.is_empty());
 		} else {
 			self.expanded
 				.retain(|key| key != path && !key.starts_with(&nested));
@@ -403,7 +438,7 @@ impl RevTree {
 			truncated = true;
 			entries.shrink_to_fit();
 		}
-		self.dirs.remove(&dir);
+		self.dirs.retain(|(have, _)| have != &dir);
 		self.order.retain(|key| key != &dir);
 		self.enforce_budget();
 		while self
@@ -451,7 +486,7 @@ impl RevTree {
 			self.note_error(dir, "listing exceeds the tree budget".into());
 			return;
 		}
-		self.dirs.insert(dir.clone(), (entries, truncated));
+		self.put_dir(dir.clone(), (entries, truncated));
 		self.touch(&dir);
 		self.enforce_budget();
 	}
@@ -466,11 +501,15 @@ impl RevTree {
 		if out.len() >= MAX_REV_ROWS {
 			return;
 		}
-		if let Some(err) = self.errors.get(dir) {
+		if let Some(err) = self
+			.errors
+			.iter()
+			.find_map(|(key, error)| (key == dir).then_some(error))
+		{
 			out.push(marker(depth, Msg::new("error_tree", [err.clone()])));
 			return;
 		}
-		let Some((entries, truncated)) = self.dirs.get(dir) else {
+		let Some((entries, truncated)) = self.dir(dir) else {
 			out.push(marker(depth, Msg::new("status_loading", [])));
 			return;
 		};
@@ -483,7 +522,7 @@ impl RevTree {
 				return;
 			}
 			let expanded =
-				e.kind == TreeKind::Tree && self.expanded.contains(&e.path);
+				e.kind == TreeKind::Tree && self.is_expanded(&e.path);
 			out.push(RevRow {
 				path: e.path.clone(),
 				name: e.name.clone(),
@@ -1464,12 +1503,12 @@ impl WorkbenchModel {
 			return;
 		};
 		if is_dir {
-			if tree.expanded.contains(path) {
+			if tree.is_expanded(path) {
 				tree.release_dir(path);
 			} else {
 				tree.note_expanded(path);
 				app_log!("[APP:TREE_EXPANDED: {}]", path);
-				if !tree.dirs.contains_key(path) {
+				if tree.dir(path).is_none() {
 					self.load_rev_dir(path.to_string(), cx);
 				}
 			}
@@ -1612,6 +1651,41 @@ mod tests {
 		let mut value = String::with_capacity(MAX_RETAINED_GRAPH_BYTES);
 		value.push('x');
 		value
+	}
+
+	#[test]
+	fn rev_tree_vec_tables_count_capacity_after_churn() {
+		let mut tree = RevTree::new("tip".into());
+		let before = tree.retained_bytes();
+		let (dirs, expanded, errors) = (
+			tree.dirs.capacity(),
+			tree.expanded.capacity(),
+			tree.errors.capacity(),
+		);
+		tree.dirs.reserve_exact(13);
+		tree.expanded.reserve_exact(17);
+		tree.errors.reserve_exact(19);
+		assert_eq!(
+			tree.retained_bytes() - before,
+			(tree.dirs.capacity() - dirs)
+				* std::mem::size_of::<(String, (Vec<TreeEntry>, bool))>()
+				+ (tree.expanded.capacity() - expanded)
+					* std::mem::size_of::<String>()
+				+ (tree.errors.capacity() - errors)
+					* std::mem::size_of::<(String, String)>()
+		);
+		for i in 0..100 {
+			tree.insert_dir(format!("dir-{i}"), Vec::new(), false);
+		}
+		let retained: Vec<_> =
+			tree.dirs.iter().map(|(key, _)| key.clone()).collect();
+		for path in retained {
+			tree.release_dir(&path);
+		}
+		assert!(tree.dirs.is_empty() && tree.errors.is_empty());
+		assert_eq!(tree.dirs.capacity(), 0);
+		assert_eq!(tree.errors.capacity(), 0);
+		assert!(tree.retained_bytes() <= MAX_RETAINED_TREE_BYTES);
 	}
 
 	#[test]
@@ -1925,7 +1999,7 @@ mod tests {
 				kind: TreeKind::Blob,
 			})
 			.collect();
-		t.dirs.insert(String::new(), (entries, false));
+		t.put_dir(String::new(), (entries, false));
 		let rows = t.rows();
 		assert!(rows.len() <= MAX_REV_ROWS + 1);
 		assert!(rows.last().unwrap().marker.is_some());
@@ -1943,21 +2017,23 @@ mod tests {
 		assert!(tree.retained_bytes() <= MAX_RETAINED_TREE_BYTES);
 		assert!(tree
 			.dirs
-			.values()
-			.flat_map(|(entries, _)| entries)
+			.iter()
+			.flat_map(|(_, (entries, _))| entries)
 			.all(|entry| entry.path.len() < MAX_RETAINED_TREE_BYTES));
 		let child = "c".repeat(MAX_RETAINED_TREE_BYTES + 100);
 		tree.insert_dir(child, vec![huge], false);
 		assert!(tree.retained_bytes() <= MAX_RETAINED_TREE_BYTES);
 		assert!(tree
 			.dirs
-			.keys()
+			.iter()
+			.map(|(key, _)| key)
 			.all(|key| key.len() <= MAX_RETAINED_TREE_BYTES));
 		tree.note_error("err".into(), "e".repeat(MAX_RETAINED_TREE_BYTES * 4));
 		assert!(tree.retained_bytes() <= MAX_RETAINED_TREE_BYTES);
 		assert!(tree
 			.errors
-			.values()
+			.iter()
+			.map(|(_, err)| err)
 			.all(|err| err.len() <= MAX_STORED_ERROR_BYTES));
 		for i in 0..80 {
 			tree.insert_dir(
@@ -1969,8 +2045,7 @@ mod tests {
 				}],
 				false,
 			);
-			tree.expanded
-				.insert(format!("exp-{i}-{}", "k".repeat(2_000)));
+			tree.note_expanded(&format!("exp-{i}-{}", "k".repeat(2_000)));
 			tree.enforce_budget();
 			assert!(
 				tree.retained_bytes() <= MAX_RETAINED_TREE_BYTES,
@@ -2000,15 +2075,15 @@ mod tests {
 			MAX_CACHED_DIRS
 		);
 		assert!(
-			t.dirs.contains_key(""),
+			t.dir("").is_some(),
 			"small root stays while non-root listings fit"
 		);
 		assert!(
-			!t.dirs.contains_key("dir_0"),
+			t.dir("dir_0").is_none(),
 			"oldest non-root listing is evicted first"
 		);
 		assert!(
-			t.dirs.contains_key(&format!("dir_{}", MAX_CACHED_DIRS + 9)),
+			t.dir(&format!("dir_{}", MAX_CACHED_DIRS + 9)).is_some(),
 			"newest listing stays"
 		);
 		assert!(t.retained_bytes() <= MAX_RETAINED_TREE_BYTES);
@@ -2032,7 +2107,7 @@ mod tests {
 				let mut tree = RevTree::new("a".repeat(40));
 				tree.insert_dir("".into(), entries, false);
 				assert!(
-					tree.dirs.contains_key(""),
+					tree.dir("").is_some(),
 					"root must be retained, not evicted (n={n}, len={len})"
 				);
 				assert!(

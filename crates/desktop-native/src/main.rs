@@ -47,6 +47,7 @@ fn release_vec<T>(slot: &mut Vec<T>) {
 	*slot = Vec::new();
 }
 
+#[cfg(test)]
 fn release_map<K, V, S: Default>(slot: &mut HashMap<K, V, S>) {
 	*slot = HashMap::default();
 }
@@ -205,6 +206,375 @@ pub struct RepoEntry {
 	pub summary: Result<RepoSummary, String>,
 }
 
+const MAX_RETAINED_TREE_BYTES: usize = 8 * 1024 * 1024;
+
+fn source_heap_bytes(source: &SourceKind) -> usize {
+	match source {
+		SourceKind::Commit { rev } => rev.capacity(),
+		_ => 0,
+	}
+}
+
+fn repo_identity_heap_bytes(identity: &RepoIdentity) -> usize {
+	identity
+		.toplevel
+		.capacity()
+		.saturating_add(identity.git_dir.capacity())
+		.saturating_add(identity.common_dir.capacity())
+}
+
+fn repo_entries_bytes(repos: &Vec<RepoEntry>) -> usize {
+	let mut bytes = std::mem::size_of_val(repos).saturating_add(
+		repos
+			.capacity()
+			.saturating_mul(std::mem::size_of::<RepoEntry>()),
+	);
+	for repo in repos {
+		bytes = bytes
+			.saturating_add(repo.root.capacity())
+			.saturating_add(repo.name.capacity())
+			.saturating_add(
+				repo.identity.as_ref().map_or(0, repo_identity_heap_bytes),
+			);
+		bytes = bytes.saturating_add(match &repo.summary {
+			Ok(summary) => repo_identity_heap_bytes(&summary.identity)
+				.saturating_add(
+					summary.head.as_ref().map_or(0, String::capacity),
+				)
+				.saturating_add(
+					summary.branch.as_ref().map_or(0, String::capacity),
+				),
+			Err(error) => error.capacity(),
+		});
+	}
+	bytes
+}
+
+fn basket_bytes(basket: &Vec<(CanonicalRootId, Vec<ExportItem>)>) -> usize {
+	let mut bytes = std::mem::size_of_val(basket).saturating_add(
+		basket.capacity().saturating_mul(std::mem::size_of::<(
+			CanonicalRootId,
+			Vec<ExportItem>,
+		)>()),
+	);
+	for (root, items) in basket {
+		bytes = bytes
+			.saturating_add(root.retained_heap_bytes())
+			.saturating_add(
+				items
+					.capacity()
+					.saturating_mul(std::mem::size_of::<ExportItem>()),
+			);
+		for item in items {
+			bytes = bytes.saturating_add(export_item_heap_bytes(item));
+		}
+	}
+	bytes
+}
+
+fn admitted_selection_root(
+	repo: &RepoEntry,
+	basket: &[(CanonicalRootId, Vec<ExportItem>)],
+) -> Option<CanonicalRootId> {
+	let canonical = repo
+		.identity
+		.as_ref()
+		.or_else(|| repo.summary.as_ref().ok().map(|summary| &summary.identity))
+		.map(|identity| identity.toplevel.as_path());
+	basket
+		.iter()
+		.find(|(root, _)| {
+			root.path() == repo.root.as_path() || Some(root.path()) == canonical
+		})
+		.map(|(root, _)| root.clone())
+}
+
+fn files_bytes(files: &Vec<FileChangeItem>) -> usize {
+	files.iter().fold(
+		std::mem::size_of_val(files).saturating_add(
+			files
+				.capacity()
+				.saturating_mul(std::mem::size_of::<FileChangeItem>()),
+		),
+		|bytes, file| {
+			bytes
+				.saturating_add(file.path.capacity())
+				.saturating_add(source_heap_bytes(&file.source))
+		},
+	)
+}
+
+fn message_bytes(message: &Msg) -> usize {
+	message.args.iter().fold(
+		std::mem::size_of::<Msg>().saturating_add(
+			message
+				.args
+				.capacity()
+				.saturating_mul(std::mem::size_of::<String>()),
+		),
+		|bytes, arg| bytes.saturating_add(arg.capacity()),
+	)
+}
+
+fn export_item_heap_bytes(item: &ExportItem) -> usize {
+	item.root
+		.retained_heap_bytes()
+		.saturating_add(item.relative_path.capacity())
+		.saturating_add(source_heap_bytes(&item.source))
+}
+
+const MAX_BASKET_DISPLAY_BYTES: usize = 1024;
+
+fn append_basket_display(out: &mut String, text: &str) -> bool {
+	if out.len().saturating_add(text.len()) <= MAX_BASKET_DISPLAY_BYTES {
+		out.push_str(text);
+		return true;
+	}
+	let room = MAX_BASKET_DISPLAY_BYTES
+		.saturating_sub(out.len())
+		.saturating_sub('…'.len_utf8());
+	let mut end = text.len().min(room);
+	while !text.is_char_boundary(end) {
+		end -= 1;
+	}
+	// Make space for the marker even when previous pieces exactly filled it.
+	while out.len() + '…'.len_utf8() > MAX_BASKET_DISPLAY_BYTES {
+		out.pop();
+	}
+	if end > 0 {
+		out.push_str(&text[..end]);
+	}
+	out.push('…');
+	false
+}
+
+/// One complete checkbox/basket replacement. Preparation leaves the current
+/// view unchanged; refusal cannot apply a prefix of Select All or relabel sources.
+/// The owned clones are synchronous construction scratch and overlap the old
+/// view until installation or rejection; they are not queued or published.
+/// This replacement check bounds the installed candidate, not that transient
+/// overlap. Complete source admission and pending-worker charges are later stages.
+struct PreparedSelection {
+	replace_file_group: bool,
+	replace_git_group: bool,
+	remove_only: bool,
+	status: Option<Msg>,
+	files: Vec<FileChangeItem>,
+	paths: Vec<String>,
+	basket: Vec<(CanonicalRootId, Vec<ExportItem>)>,
+}
+
+impl PreparedSelection {
+	fn new(
+		files: &[FileChangeItem],
+		paths: &[String],
+		basket: &[(CanonicalRootId, Vec<ExportItem>)],
+	) -> Self {
+		Self {
+			replace_file_group: false,
+			replace_git_group: false,
+			remove_only: false,
+			status: None,
+			files: files.to_vec(),
+			paths: paths.to_vec(),
+			basket: basket.to_vec(),
+		}
+	}
+
+	fn retained_bytes(&self) -> usize {
+		files_bytes(&self.files)
+			.saturating_add(crate::tree::selection_bytes(&self.paths))
+			.saturating_add(basket_bytes(&self.basket))
+			.saturating_add(self.status.as_ref().map_or(0, message_bytes))
+	}
+
+	/// Preserve every other root and historical source while replacing the
+	/// current root's File/working-change groups from the proposed checkboxes.
+	fn sync_root(&mut self, root: CanonicalRootId) -> bool {
+		if !self.replace_file_group && !self.replace_git_group {
+			return true;
+		}
+		self.paths.retain(|path| !path.is_empty());
+		self.paths.sort();
+		self.paths.dedup();
+		let index = self
+			.basket
+			.binary_search_by(|(have, _)| have.path().cmp(root.path()));
+		if self.remove_only {
+			// Deselecting must not need the filesystem, clone roots per item, or
+			// rebuild spare vector capacity while the old allocation is near its cap.
+			if let Ok(index) = index {
+				let files = &self.files;
+				let paths = &self.paths;
+				let (replace_file, replace_git) =
+					(self.replace_file_group, self.replace_git_group);
+				self.basket[index].1.retain(|item| match &item.source {
+					SourceKind::File if replace_file => {
+						paths.binary_search(&item.relative_path).is_ok()
+					}
+					SourceKind::Working
+					| SourceKind::Unstaged
+					| SourceKind::Staged
+						if replace_git =>
+					{
+						files.iter().any(|file| {
+							file.selected
+								&& file.path == item.relative_path
+								&& file.source == item.source
+						})
+					}
+					_ => true,
+				});
+				if self.basket[index].1.is_empty() {
+					self.basket.remove(index);
+				}
+			}
+			return true;
+		}
+		// Source/list admission is a later stage. Until then an already-large
+		// input may be reduced, while this builder never amplifies beyond it.
+		let allocation_limit =
+			MAX_RETAINED_TREE_BYTES.max(self.retained_bytes());
+		let mut items = match index {
+			Ok(index) => self.basket.remove(index).1,
+			Err(_) => Vec::new(),
+		};
+		items.retain(|item| match item.source {
+			SourceKind::File => !self.replace_file_group,
+			SourceKind::Working | SourceKind::Unstaged | SourceKind::Staged => {
+				!self.replace_git_group
+			}
+			SourceKind::Commit { .. } => true,
+		});
+		let other = self
+			.retained_bytes()
+			.saturating_add(root.retained_heap_bytes());
+		let mut heap = items.iter().fold(0usize, |bytes, item| {
+			bytes.saturating_add(export_item_heap_bytes(item))
+		});
+		let file_count = if self.replace_file_group {
+			self.paths.len()
+		} else {
+			0
+		};
+		let git_count = if self.replace_git_group {
+			self.files.iter().filter(|file| file.selected).count()
+		} else {
+			0
+		};
+		let add_count = file_count.saturating_add(git_count);
+		let needed = items.len().saturating_add(add_count);
+		if other
+			.saturating_add(
+				needed.saturating_mul(std::mem::size_of::<ExportItem>()),
+			)
+			.saturating_add(heap)
+			> allocation_limit
+		{
+			return false;
+		}
+		items.reserve_exact(add_count);
+		let slots = items
+			.capacity()
+			.saturating_mul(std::mem::size_of::<ExportItem>());
+		if other.saturating_add(slots).saturating_add(heap) > allocation_limit {
+			return false;
+		}
+		let added = self
+			.paths
+			.iter()
+			.filter(|_| self.replace_file_group)
+			.map(|path| ExportItem {
+				root: root.clone(),
+				relative_path: path.clone(),
+				source: SourceKind::File,
+				change_type: None,
+			})
+			.chain(
+				self.files
+					.iter()
+					.filter(|file| self.replace_git_group && file.selected)
+					.map(|file| ExportItem {
+						root: root.clone(),
+						relative_path: file.path.clone(),
+						source: file.source.clone(),
+						change_type: file.change_type,
+					}),
+			);
+		for item in added {
+			let proposed_heap =
+				heap.saturating_add(export_item_heap_bytes(&item));
+			if other.saturating_add(slots).saturating_add(proposed_heap)
+				> allocation_limit
+			{
+				return false;
+			}
+			heap = proposed_heap;
+			items.push(item);
+		}
+		if !items.is_empty() {
+			let index = self
+				.basket
+				.binary_search_by(|(have, _)| have.path().cmp(root.path()))
+				.unwrap_err();
+			self.basket.insert(index, (root, items));
+		}
+		self.retained_bytes() <= allocation_limit
+	}
+
+	fn toggle_revision(
+		&mut self,
+		root: CanonicalRootId,
+		sha: &str,
+		path: &str,
+	) -> bool {
+		let index = match self
+			.basket
+			.binary_search_by(|(have, _)| have.path().cmp(root.path()))
+		{
+			Ok(index) => index,
+			Err(index) => {
+				self.basket.insert(index, (root.clone(), Vec::new()));
+				index
+			}
+		};
+		let items = &mut self.basket[index].1;
+		if let Some(position) = items.iter().position(|item| {
+			item.relative_path == path
+				&& matches!(&item.source, SourceKind::Commit { rev } if rev == sha)
+		}) {
+			items.remove(position);
+			if items.is_empty() {
+				self.basket.remove(index);
+			}
+			false
+		} else {
+			items.push(ExportItem {
+				root,
+				relative_path: path.to_owned(),
+				source: SourceKind::Commit {
+					rev: sha.to_owned(),
+				},
+				change_type: None,
+			});
+			true
+		}
+	}
+
+	fn fits_replacing(
+		&self,
+		current_bytes: usize,
+		old_bytes: usize,
+		limit: usize,
+	) -> bool {
+		let candidate = self.retained_bytes();
+		current_bytes
+			.checked_sub(old_bytes)
+			.and_then(|other| other.checked_add(candidate))
+			.is_some_and(|total| total <= limit || candidate <= old_bytes)
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Popover {
 	Repo,
@@ -267,7 +637,7 @@ pub struct WorkbenchModel {
 	pub popover: Option<Popover>,
 	pub popover_cursor: usize,
 
-	pub basket: HashMap<CanonicalRootId, Vec<ExportItem>>,
+	pub basket: Vec<(CanonicalRootId, Vec<ExportItem>)>,
 	pub history_cancel: Option<CancelToken>,
 	pub preview_cancel: Option<CancelToken>,
 	pub tree_cancel: Option<CancelToken>,
@@ -357,14 +727,6 @@ pub struct WorkbenchModel {
 pub enum Splitter {
 	Left,
 	Bottom,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BasketGroup {
-	/// Workspace working file mode (SourceKind::File).
-	File,
-	/// Working changes from Git changes view (Working, Unstaged, Staged).
-	GitChanges,
 }
 
 impl WorkbenchModel {
@@ -539,7 +901,7 @@ impl WorkbenchModel {
 			add_repo_input,
 			popover: None,
 			popover_cursor: 0,
-			basket: HashMap::new(),
+			basket: Vec::new(),
 			history_cancel: None,
 			preview_cancel: None,
 			tree_cancel: None,
@@ -728,52 +1090,64 @@ impl WorkbenchModel {
 	}
 
 	pub fn deselect_all_files(&mut self, cx: &mut Context<Self>) {
-		for f in &mut self.files {
-			f.selected = false;
+		let mut candidate = self.selection_candidate();
+		for file in &mut candidate.files {
+			file.selected = false;
 		}
-		if let Some(ref mut tree) = self.file_tree {
-			tree.set_all_selected(false);
+		candidate.paths = Vec::new();
+		candidate.replace_file_group = true;
+		candidate.replace_git_group = true;
+		candidate.remove_only = true;
+		candidate.status = Some(Msg::new("status_deselected_all", []));
+		if self.install_selection_candidate(candidate) {
+			self.log_basket();
+			app_log!("[APP:FILES_DESELECTED]");
 		}
-		if let Some(repo) = self.repo() {
-			if let Ok(c) = CanonicalRootId::new(&repo.root) {
-				self.set_basket_group(c, BasketGroup::GitChanges, Vec::new());
-			}
-		}
-		self.remember_tree_selection();
-		app_log!("[APP:FILES_DESELECTED]");
-		self.set_status("status_deselected_all", []);
 		cx.notify();
 	}
 
 	pub fn select_all_files(&mut self, cx: &mut Context<Self>) {
-		for f in &mut self.files {
-			f.selected = true;
+		let mut candidate = self.selection_candidate();
+		for file in &mut candidate.files {
+			file.selected = true;
 		}
-		if let Some(ref mut tree) = self.file_tree {
-			tree.set_all_selected(true);
+		if let Some(tree) = &self.file_tree {
+			candidate.paths = tree.selection_for_all(true);
 		}
-		self.sync_git_selection_to_basket();
-		self.remember_tree_selection();
-		app_log!("[APP:FILES_SELECTED_ALL]");
-		self.set_status("status_selected_all", []);
+		candidate.replace_file_group = true;
+		candidate.replace_git_group = true;
+		candidate.status = Some(Msg::new("status_selected_all", []));
+		if self.install_selection_candidate(candidate) {
+			self.log_basket();
+			app_log!("[APP:FILES_SELECTED_ALL]");
+		}
 		cx.notify();
 	}
 
 	pub fn toggle_file(&mut self, idx: usize, cx: &mut Context<Self>) {
-		if let Some(f) = self.files.get_mut(idx) {
-			f.selected = !f.selected;
-			let path = f.path.clone();
-			let selected = f.selected;
-			self.sync_git_selection_to_basket();
+		let mut candidate = self.selection_candidate();
+		let Some(file) = candidate.files.get_mut(idx) else {
+			return;
+		};
+		file.selected = !file.selected;
+		let (path, selected) = (file.path.clone(), file.selected);
+		candidate.replace_git_group = true;
+		candidate.remove_only = !selected;
+		candidate.status = Some(if selected {
+			Msg::new("status_toggled_file", [path.clone()])
+		} else {
+			Msg::new("status_selection_removed", [])
+		});
+		if self.install_selection_candidate(candidate) {
+			self.log_basket();
 			app_log!(
 				"[APP:FILE_TOGGLED: {}: {}: selected={}]",
 				idx,
 				path,
 				selected
 			);
-			self.set_status("status_toggled_file", [path]);
-			cx.notify();
 		}
+		cx.notify();
 	}
 
 	pub fn toggle_locale(&mut self, cx: &mut Context<Self>) {
@@ -1211,7 +1585,7 @@ impl WorkbenchModel {
 		self.preview_loading = false;
 		self.preview_error = None;
 		self.reader.release_retained();
-		release_map(&mut self.basket);
+		release_vec(&mut self.basket);
 		self.invalidate_paste_job();
 		if !self.paste_busy() {
 			self.clear_paste_state();
@@ -1688,9 +2062,31 @@ impl WorkbenchModel {
 				return;
 			}
 			TreeCommand::ToggleSelect(key) => {
-				if let Some(rel) = key.utf8_rel() {
-					app_log!("[APP:TREE_TOGGLED: {}]", rel);
+				let Some(paths) = self
+					.file_tree
+					.as_ref()
+					.and_then(|tree| tree.selection_for_toggle(key))
+				else {
+					return;
+				};
+				let mut candidate = self.selection_candidate();
+				candidate.remove_only = paths
+					.iter()
+					.all(|path| candidate.paths.binary_search(path).is_ok());
+				candidate.paths = paths;
+				candidate.replace_file_group = true;
+				if candidate.remove_only {
+					candidate.status =
+						Some(Msg::new("status_selection_removed", []));
 				}
+				if self.install_selection_candidate(candidate) {
+					if let Some(rel) = key.utf8_rel() {
+						app_log!("[APP:TREE_TOGGLED: {}]", rel);
+					}
+					self.log_basket();
+				}
+				cx.notify();
+				return;
 			}
 			TreeCommand::Collapse(key) => {
 				if let Some(rel) = key.utf8_rel().filter(|rel| !rel.is_empty())
@@ -1708,7 +2104,10 @@ impl WorkbenchModel {
 				app_log!("[APP:TREE_FILE_SELECTED: {}]", rel);
 			}
 			Some(TreeEffect::Idle) => {
-				self.remember_tree_selection();
+				if !self.remember_tree_selection() {
+					cx.notify();
+					return;
+				}
 				cx.notify();
 			}
 			None => {}
@@ -1797,6 +2196,10 @@ impl WorkbenchModel {
 	}
 
 	fn apply_tree_result(&mut self, result: crate::tree::TreeIoResult) {
+		let previous_selection = self
+			.file_tree
+			.as_ref()
+			.map(|tree| tree.selected_paths().to_vec());
 		let Some(tree) = self.file_tree.as_mut() else {
 			return;
 		};
@@ -1806,6 +2209,16 @@ impl WorkbenchModel {
 		let Some(applied) = tree.apply_io_result(result) else {
 			return;
 		};
+		if !self.remember_tree_selection() {
+			// Incoming page/cache admission is stage4; even before that lands,
+			// a refused inherited selection cannot change the existing basket or checks.
+			if let (Some(tree), Some(paths)) =
+				(&mut self.file_tree, previous_selection)
+			{
+				tree.install_selection(paths);
+			}
+			return;
+		}
 		if applied.kind == crate::tree::TreeIoKind::Expand
 			&& !applied.rel.is_empty()
 		{
@@ -1819,7 +2232,6 @@ impl WorkbenchModel {
 			applied.has_more,
 			applied.selected_count
 		);
-		self.remember_tree_selection();
 	}
 
 	fn next_tree_io(&mut self) -> Option<TreeIo> {
@@ -1852,7 +2264,10 @@ impl WorkbenchModel {
 		if idx >= self.repos.len() {
 			return;
 		}
-		self.remember_tree_selection();
+		if !self.remember_tree_selection() {
+			cx.notify();
+			return;
+		}
 		self.generation += 1;
 		self.preview_generation += 1;
 		self.history_generation += 1;
@@ -2001,7 +2416,7 @@ impl WorkbenchModel {
 									.ok();
 							let basket_items = canonical
 								.as_ref()
-								.and_then(|c| model.basket.get(c));
+								.and_then(|c| model.basket_items(c));
 							model.files = changes
 								.into_iter()
 								.map(
@@ -2226,35 +2641,204 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn set_basket_group(
-		&mut self,
-		root: CanonicalRootId,
-		group: BasketGroup,
-		new_items: Vec<ExportItem>,
-	) {
-		let mut kept = self.basket.remove(&root).unwrap_or_default();
-		kept.retain(|item| match group {
-			BasketGroup::File => !matches!(item.source, SourceKind::File),
-			BasketGroup::GitChanges => !matches!(
-				item.source,
-				SourceKind::Working | SourceKind::Unstaged | SourceKind::Staged
-			),
-		});
-		kept.extend(new_items);
-		if !kept.is_empty() {
-			self.basket.insert(root, kept);
+	/// Current model and queued tree storage. Background input/publication
+	/// ownership is added in the worker-admission stage before tree8 acceptance.
+	fn tree_retained_bytes(&self) -> usize {
+		let mut bytes = message_bytes(&self.status)
+			.saturating_add(repo_entries_bytes(&self.repos))
+			.saturating_add(repo_entries_bytes(&self.manual_repos))
+			.saturating_add(basket_bytes(&self.basket));
+		bytes = bytes.saturating_add(files_bytes(&self.files));
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.commit_files))
+			.saturating_add(self.commit_files.capacity().saturating_mul(
+				std::mem::size_of::<(String, Option<ChangeType>)>(),
+			));
+		for (path, _) in &self.commit_files {
+			bytes = bytes.saturating_add(path.capacity());
 		}
-		self.log_basket();
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.file_tree))
+			.saturating_add(self.file_tree.as_ref().map_or(0, |tree| {
+				tree.retained_bytes() - std::mem::size_of::<FileTreeNode>()
+			}));
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.rev_tree))
+			.saturating_add(self.rev_tree.as_ref().map_or(0, |tree| {
+				tree.retained_bytes() - std::mem::size_of::<RevTree>()
+			}));
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.workspace_root))
+			.saturating_add(self.workspace_root.capacity())
+			.saturating_add(std::mem::size_of_val(&self.restore_dir))
+			.saturating_add(
+				self.restore_dir.as_ref().map_or(0, PathBuf::capacity),
+			)
+			.saturating_add(std::mem::size_of_val(&self.pinned_repo));
+		if let Some((root, git_dir)) = &self.pinned_repo {
+			bytes = bytes
+				.saturating_add(root.capacity())
+				.saturating_add(git_dir.capacity());
+		}
+		for path in [&self.selected_file, &self.selected_commit_file] {
+			bytes = bytes
+				.saturating_add(std::mem::size_of_val(path))
+				.saturating_add(path.as_ref().map_or(0, String::capacity));
+		}
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.selected_file_source))
+			.saturating_add(
+				self.selected_file_source
+					.as_ref()
+					.map_or(0, source_heap_bytes),
+			);
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.restore_expanded))
+			.saturating_add(
+				self.restore_expanded
+					.capacity()
+					.saturating_mul(std::mem::size_of::<String>()),
+			);
+		for path in &self.restore_expanded {
+			bytes = bytes.saturating_add(path.capacity());
+		}
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.discovery))
+			.saturating_add(self.discovery.as_ref().map_or(0, |discovery| {
+				discovery.retained_bytes() - std::mem::size_of::<Discovery>()
+			}));
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.discovery_errors))
+			.saturating_add(
+				self.discovery_errors
+					.capacity()
+					.saturating_mul(std::mem::size_of::<(PathBuf, String)>()),
+			);
+		for (path, error) in &self.discovery_errors {
+			bytes = bytes
+				.saturating_add(path.capacity())
+				.saturating_add(error.capacity());
+		}
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(
+				&self.discovery_depth_limited,
+			))
+			.saturating_add(
+				self.discovery_depth_limited
+					.capacity()
+					.saturating_mul(std::mem::size_of::<PathBuf>()),
+			);
+		for path in &self.discovery_depth_limited {
+			bytes = bytes.saturating_add(path.capacity());
+		}
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(&self.tree_queue))
+			.saturating_add(
+				self.tree_queue
+					.capacity()
+					.saturating_mul(std::mem::size_of::<TreeIo>()),
+			);
+		for io in &self.tree_queue {
+			bytes = bytes.saturating_add(
+				io.retained_bytes() - std::mem::size_of::<TreeIo>(),
+			);
+		}
+		bytes
+	}
+
+	fn basket_items(&self, root: &CanonicalRootId) -> Option<&Vec<ExportItem>> {
+		self.basket
+			.binary_search_by(|(have, _)| have.path().cmp(root.path()))
+			.ok()
+			.map(|index| &self.basket[index].1)
+	}
+
+	fn selection_candidate(&self) -> PreparedSelection {
+		PreparedSelection::new(
+			&self.files,
+			self.file_tree
+				.as_ref()
+				.map_or(&[], FileTreeNode::selected_paths),
+			&self.basket,
+		)
+	}
+
+	fn selection_bytes(&self) -> usize {
+		files_bytes(&self.files)
+			.saturating_add(basket_bytes(&self.basket))
+			.saturating_add(
+				self.file_tree
+					.as_ref()
+					.map_or(0, FileTreeNode::selection_bytes),
+			)
+	}
+
+	fn install_selection_candidate(
+		&mut self,
+		mut candidate: PreparedSelection,
+	) -> bool {
+		if candidate.replace_file_group || candidate.replace_git_group {
+			let admitted = self
+				.repo()
+				.and_then(|repo| admitted_selection_root(repo, &self.basket));
+			let root = match admitted {
+				Some(root) => Some(root),
+				None if candidate.remove_only => None,
+				None => match self.repo_root() {
+					Some(path) => match CanonicalRootId::new(path) {
+						Ok(root) => Some(root),
+						Err(_) => {
+							self.set_status("error_selection_root", []);
+							return false;
+						}
+					},
+					None => None,
+				},
+			};
+			if root.is_some_and(|root| !candidate.sync_root(root)) {
+				self.set_status("error_tree_budget", []);
+				app_log!(
+					"[APP:TREE_ADMISSION_REFUSED: selection_amplification]"
+				);
+				return false;
+			}
+		}
+		if !candidate.fits_replacing(
+			self.tree_retained_bytes(),
+			self.selection_bytes().saturating_add(
+				if candidate.status.is_some() {
+					message_bytes(&self.status)
+				} else {
+					0
+				},
+			),
+			MAX_RETAINED_TREE_BYTES,
+		) {
+			self.set_status("error_tree_budget", []);
+			app_log!("[APP:TREE_ADMISSION_REFUSED: selection]");
+			return false;
+		}
+		if let Some(status) = candidate.status {
+			self.status = status;
+		}
+		self.files = candidate.files;
+		self.basket = candidate.basket;
+		if let Some(tree) = &mut self.file_tree {
+			tree.install_selection(candidate.paths);
+		}
+		// Callers emit their established action/basket event order only after
+		// this complete intent has been admitted and installed.
+		true
 	}
 
 	pub fn is_rev_file_selected(&self, sha: &str, path: &str) -> bool {
 		let Some(repo) = self.repo() else {
 			return false;
 		};
-		let Ok(root) = CanonicalRootId::new(&repo.root) else {
+		let Some(root) = admitted_selection_root(repo, &self.basket) else {
 			return false;
 		};
-		let Some(items) = self.basket.get(&root) else {
+		let Some(items) = self.basket_items(&root) else {
 			return false;
 		};
 		items.iter().any(|item| {
@@ -2272,39 +2856,28 @@ impl WorkbenchModel {
 		let Some(repo) = self.repo() else {
 			return;
 		};
-		let Ok(root) = CanonicalRootId::new(&repo.root) else {
+		let Some(root) = admitted_selection_root(repo, &self.basket)
+			.or_else(|| CanonicalRootId::new(&repo.root).ok())
+		else {
+			self.set_status("error_selection_root", []);
+			cx.notify();
 			return;
 		};
-		let target_source = SourceKind::Commit {
-			rev: sha.to_string(),
-		};
-		let items = self.basket.entry(root.clone()).or_default();
-		if let Some(pos) = items.iter().position(|item| {
-			item.relative_path == path && item.source == target_source
-		}) {
-			items.remove(pos);
-			if items.is_empty() {
-				self.basket.remove(&root);
-			}
-			app_log!(
-				"[APP:REV_FILE_TOGGLED: sha={} path={} selected=false]",
-				&sha[..7.min(sha.len())],
-				path
-			);
-		} else {
-			items.push(ExportItem {
-				root: root.clone(),
-				relative_path: path.to_string(),
-				source: target_source,
-				change_type: None,
-			});
-			app_log!(
-				"[APP:REV_FILE_TOGGLED: sha={} path={} selected=true]",
-				&sha[..7.min(sha.len())],
-				path
-			);
+		let mut candidate = self.selection_candidate();
+		let selected = candidate.toggle_revision(root, sha, path);
+		candidate.remove_only = !selected;
+		if !selected {
+			candidate.status = Some(Msg::new("status_selection_removed", []));
 		}
-		self.log_basket();
+		if self.install_selection_candidate(candidate) {
+			app_log!(
+				"[APP:REV_FILE_TOGGLED: sha={} path={} selected={}]",
+				&sha[..7.min(sha.len())],
+				path,
+				selected
+			);
+			self.log_basket();
+		}
 		cx.notify();
 	}
 
@@ -2320,19 +2893,15 @@ impl WorkbenchModel {
 	}
 
 	pub fn basket_count(&self) -> usize {
-		self.basket.values().map(|items| items.len()).sum()
+		self.basket.iter().map(|(_, items)| items.len()).sum()
 	}
 
 	fn basket_summary_with<F>(&self, format_source: F) -> String
 	where
 		F: Fn(&SourceKind) -> String,
 	{
-		let mut parts = Vec::new();
-		let mut rows: Vec<_> = self.basket.iter().collect();
-		rows.sort_by_key(|(root, _)| {
-			root.path().to_string_lossy().into_owned()
-		});
-		for (root, items) in rows {
+		let mut out = String::new();
+		for (root, items) in &self.basket {
 			let name = self
 				.repos
 				.iter()
@@ -2341,20 +2910,29 @@ impl WorkbenchModel {
 				})
 				.map(|repo| repo.name.clone())
 				.unwrap_or_else(|| root.path().display().to_string());
-			let mut items = items.clone();
-			items.sort_by(|a, b| {
+			let mut ordered: Vec<_> = items.iter().collect();
+			ordered.sort_by(|a, b| {
 				(&a.relative_path, Self::source_summary(&a.source))
 					.cmp(&(&b.relative_path, Self::source_summary(&b.source)))
 			});
-			for item in items {
-				parts.push(format!(
-					"{name} {} {}",
-					format_source(&item.source),
-					item.relative_path
-				));
+			for item in ordered {
+				if !out.is_empty() && !append_basket_display(&mut out, "; ") {
+					return out;
+				}
+				for part in [
+					&name,
+					" ",
+					&format_source(&item.source),
+					" ",
+					&item.relative_path,
+				] {
+					if !append_basket_display(&mut out, part) {
+						return out;
+					}
+				}
 			}
 		}
-		parts.join("; ")
+		out
 	}
 
 	pub fn basket_summary(&self) -> String {
@@ -2382,37 +2960,50 @@ impl WorkbenchModel {
 	/// Two selections of one path cannot share a wire header. File rows count;
 	/// a matching basename is not a reason to drop one of them.
 	pub fn basket_collision_text(&self) -> Option<String> {
-		let mut seen: HashMap<(String, String), usize> = HashMap::new();
+		let mut out = String::new();
 		for (root, items) in &self.basket {
-			for item in items {
-				*seen
-					.entry((
-						root.path().display().to_string(),
-						item.relative_path.clone(),
-					))
-					.or_default() += 1;
+			let mut paths: Vec<_> = items
+				.iter()
+				.map(|item| item.relative_path.as_str())
+				.collect();
+			paths.sort_unstable();
+			let mut previous_hit = None;
+			for pair in paths.windows(2) {
+				if pair[0] != pair[1] || previous_hit == Some(pair[0]) {
+					continue;
+				}
+				previous_hit = Some(pair[0]);
+				if !out.is_empty() && !append_basket_display(&mut out, ", ") {
+					return Some(out);
+				}
+				for part in
+					[root.path().to_string_lossy().as_ref(), ":", pair[0]]
+				{
+					if !append_basket_display(&mut out, part) {
+						return Some(out);
+					}
+				}
 			}
 		}
-		let mut hits = Vec::new();
-		for ((root, path), count) in seen {
-			if count > 1 {
-				hits.push(format!("{root}:{path}"));
-			}
-		}
-		hits.sort();
-		if hits.is_empty() {
-			None
-		} else {
-			Some(hits.join(", "))
-		}
+		(!out.is_empty()).then_some(out)
 	}
 
-	fn file_paths_in_basket(&self, root: &std::path::Path) -> HashSet<String> {
-		let Ok(id) = CanonicalRootId::new(root) else {
-			return HashSet::new();
+	fn file_paths_in_basket(&self, root: &std::path::Path) -> Vec<String> {
+		let id = self
+			.repos
+			.iter()
+			.find(|repo| repo.root == root)
+			.and_then(|repo| admitted_selection_root(repo, &self.basket))
+			.or_else(|| {
+				self.basket
+					.iter()
+					.find(|(id, _)| id.path() == root)
+					.map(|(id, _)| id.clone())
+			});
+		let Some(id) = id else {
+			return Vec::new();
 		};
-		self.basket
-			.get(&id)
+		self.basket_items(&id)
 			.map(|items| {
 				items
 					.iter()
@@ -2423,70 +3014,44 @@ impl WorkbenchModel {
 			.unwrap_or_default()
 	}
 
-	/// Keeps Project checkboxes without replacing Git change entries.
-	pub fn remember_tree_selection(&mut self) {
-		let Some(repo) = self.repo() else {
-			return;
-		};
-		let Ok(id) = CanonicalRootId::new(&repo.root) else {
-			return;
-		};
-		let mut paths = Vec::new();
-		if let Some(tree) = &self.file_tree {
-			tree.collect_selected_paths(&mut paths);
+	/// Synchronization also goes through whole-selection admission; callers
+	/// must not publish Copy or success after a refusal.
+	pub fn remember_tree_selection(&mut self) -> bool {
+		let mut candidate = self.selection_candidate();
+		candidate.replace_file_group = true;
+		let accepted = self.install_selection_candidate(candidate);
+		if accepted {
+			self.log_basket();
 		}
-		paths.sort();
-		paths.dedup();
-		let items = paths
-			.into_iter()
-			.map(|path| ExportItem {
-				root: id.clone(),
-				relative_path: path,
-				source: SourceKind::File,
-				change_type: None,
-			})
-			.collect();
-		self.set_basket_group(id, BasketGroup::File, items);
+		accepted
 	}
 
-	pub fn reapply_tree_selection(&mut self) {
+	pub fn reapply_tree_selection(&mut self) -> bool {
 		let Some(root) = self.repo_root() else {
-			return;
+			return true;
 		};
-		let saved = self.file_paths_in_basket(&root);
-		if let Some(tree) = self.file_tree.as_mut() {
-			tree.apply_selection(&saved);
-		}
+		let mut candidate = self.selection_candidate();
+		candidate.paths = self.file_paths_in_basket(&root);
+		self.install_selection_candidate(candidate)
 	}
 
-	pub fn sync_git_selection_to_basket(&mut self) {
-		let Some(repo) = self.repo() else {
-			return;
-		};
-		let Ok(id) = CanonicalRootId::new(&repo.root) else {
-			return;
-		};
-		let items = self
-			.files
-			.iter()
-			.filter(|file| file.selected)
-			.map(|file| ExportItem {
-				root: id.clone(),
-				relative_path: file.path.clone(),
-				source: file.source.clone(),
-				change_type: file.change_type,
-			})
-			.collect();
-		self.set_basket_group(id, BasketGroup::GitChanges, items);
+	pub fn sync_git_selection_to_basket(&mut self) -> bool {
+		let mut candidate = self.selection_candidate();
+		candidate.replace_git_group = true;
+		let accepted = self.install_selection_candidate(candidate);
+		if accepted {
+			self.log_basket();
+		}
+		accepted
 	}
 
 	pub fn clear_basket(&mut self, cx: &mut Context<Self>) {
-		self.basket.clear();
+		self.basket = Vec::new();
 		for file in &mut self.files {
 			file.selected = false;
 		}
-		if let Some(tree) = self.file_tree.as_mut() {
-			tree.set_all_selected(false);
+		if let Some(tree) = &mut self.file_tree {
+			tree.install_selection(Vec::new());
 		}
 		self.log_basket();
 		app_log!("[APP:BASKET_CLEARED]");
@@ -2494,7 +3059,7 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
-	pub fn sync_current_selection_to_basket(&mut self) {
+	pub fn sync_current_selection_to_basket(&mut self) -> bool {
 		match self.active_tab {
 			WorkbenchTab::FileExplorer => self.remember_tree_selection(),
 			WorkbenchTab::GitChanges => self.sync_git_selection_to_basket(),
@@ -2509,8 +3074,14 @@ impl WorkbenchModel {
 			app_log!("[APP:COPY_BUSY]");
 			return;
 		}
-		self.remember_tree_selection();
-		self.sync_git_selection_to_basket();
+		let mut candidate = self.selection_candidate();
+		candidate.replace_file_group = true;
+		candidate.replace_git_group = true;
+		if !self.install_selection_candidate(candidate) {
+			cx.notify();
+			return;
+		}
+		self.log_basket();
 		if self.basket_count() == 0
 			&& self.selected_commit.is_some()
 			&& self.selected_file.is_none()
@@ -2522,7 +3093,9 @@ impl WorkbenchModel {
 		}
 		if let Some(collision) = self.basket_collision_text() {
 			app_log!("[APP:COPY_REFUSED: collision]");
-			self.set_status("basket_collision", [collision]);
+			let mut candidate = self.selection_candidate();
+			candidate.status = Some(Msg::new("basket_collision", [collision]));
+			self.install_selection_candidate(candidate);
 			cx.notify();
 			return;
 		}
@@ -2532,7 +3105,7 @@ impl WorkbenchModel {
 			.unwrap_or_else(|| "basket".into());
 		let mut items = Vec::new();
 		let mut roots = Vec::new();
-		for repo_items in self.basket.values() {
+		for (_, repo_items) in &self.basket {
 			for item in repo_items {
 				let path = item.root.path().to_path_buf();
 				if !roots.iter().any(|root| root == &path) {
@@ -3875,6 +4448,368 @@ fn restore_log_after_paste(
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn prepared_removal_uses_admitted_identity_after_root_deletion() {
+		let temp = tempfile::tempdir().unwrap();
+		let path = temp.path().join("selected");
+		std::fs::create_dir(&path).unwrap();
+		let other_dir = tempfile::tempdir().unwrap();
+		let root = CanonicalRootId::new(&path).unwrap();
+		#[cfg(unix)]
+		let presented = {
+			let alias = temp.path().join("presented");
+			std::os::unix::fs::symlink(&path, &alias).unwrap();
+			alias
+		};
+		#[cfg(not(unix))]
+		let presented = {
+			let alias = temp.path().join("parent");
+			std::fs::create_dir(&alias).unwrap();
+			alias.join("..").join("selected")
+		};
+		assert_eq!(CanonicalRootId::new(&presented).unwrap(), root);
+		let other_root = CanonicalRootId::new(other_dir.path()).unwrap();
+		let repo = RepoEntry {
+			root: presented,
+			name: "selected".into(),
+			kind: RepoEntryKind::Main,
+			identity: Some(RepoIdentity {
+				toplevel: root.path().to_path_buf(),
+				git_dir: path.join(".git"),
+				common_dir: path.join(".git"),
+				kind: RepoKind::Main,
+			}),
+			summary: Err("offline".into()),
+		};
+		let files: Vec<_> = ["same.txt", "kept.txt"]
+			.into_iter()
+			.map(|path| FileChangeItem {
+				path: path.into(),
+				source: SourceKind::Staged,
+				change_type: None,
+				is_conflict: false,
+				selected: true,
+			})
+			.collect();
+		let sha_a = "a".repeat(40);
+		let sha_b = "b".repeat(40);
+		let mut old = PreparedSelection::new(
+			&files,
+			&["same.txt".into(), "kept.txt".into()],
+			&[],
+		);
+		old.replace_file_group = true;
+		old.replace_git_group = true;
+		assert!(old.sync_root(root.clone()));
+		assert!(old.toggle_revision(root.clone(), &sha_a, "same.txt"));
+		assert!(old.toggle_revision(root.clone(), &sha_b, "same.txt"));
+		assert!(old.toggle_revision(other_root.clone(), &sha_a, "same.txt"));
+		old.basket.reserve_exact(7);
+		for (_, items) in &mut old.basket {
+			items.reserve_exact(19);
+		}
+		let reserve = MAX_RETAINED_TREE_BYTES - old.retained_bytes() - 2048;
+		old.files[0].path.reserve_exact(reserve);
+		let old_bytes = old.retained_bytes();
+		assert!(
+			old_bytes < MAX_RETAINED_TREE_BYTES
+				&& old_bytes > MAX_RETAINED_TREE_BYTES - 4096
+		);
+		let before = old.basket.clone();
+		std::fs::remove_dir(&path).unwrap();
+		assert!(
+			CanonicalRootId::new(&repo.root).is_err(),
+			"the real root has disappeared"
+		);
+		let admitted = admitted_selection_root(&repo, &old.basket)
+			.expect("stored canonical identity survives deletion");
+		assert_eq!(admitted, root);
+		let mut removal =
+			PreparedSelection::new(&old.files, &old.paths, &old.basket);
+		removal.replace_file_group = true;
+		removal.replace_git_group = true;
+		removal.remove_only = true;
+		removal.files[0].selected = false;
+		removal.paths.retain(|path| path != "same.txt");
+		let kept_item = removal
+			.basket
+			.iter_mut()
+			.find(|(id, _)| id == &root)
+			.unwrap()
+			.1
+			.iter_mut()
+			.find(|item| {
+				item.relative_path == "kept.txt"
+					&& item.source == SourceKind::Staged
+			})
+			.unwrap();
+		kept_item.relative_path.reserve_exact(4096);
+		let retained_path = (
+			kept_item.relative_path.as_ptr(),
+			kept_item.relative_path.capacity(),
+		);
+		removal.status = Some(Msg::new("status_selection_removed", []));
+		assert!(removal.sync_root(admitted));
+		assert!(removal.retained_bytes() < old_bytes);
+		assert!(removal.fits_replacing(
+			MAX_RETAINED_TREE_BYTES,
+			old_bytes,
+			MAX_RETAINED_TREE_BYTES
+		));
+		let kept =
+			&removal.basket.iter().find(|(id, _)| id == &root).unwrap().1;
+		assert_eq!(kept.len(), 4);
+		let still_selected = kept
+			.iter()
+			.find(|item| {
+				item.relative_path == "kept.txt"
+					&& item.source == SourceKind::Staged
+			})
+			.unwrap();
+		assert_eq!((still_selected.relative_path.as_ptr(), still_selected.relative_path.capacity()), retained_path,
+			"toggle-off filters in place instead of rebuilding the remaining group");
+		assert!(kept.iter().all(|item| item.relative_path == "kept.txt" || matches!(&item.source, SourceKind::Commit { rev } if rev == &sha_a || rev == &sha_b)));
+		assert_eq!(
+			removal
+				.basket
+				.iter()
+				.find(|(id, _)| id == &other_root)
+				.unwrap()
+				.1,
+			before.iter().find(|(id, _)| id == &other_root).unwrap().1
+		);
+		assert_eq!(old.basket, before);
+		for file in &mut removal.files {
+			file.selected = false;
+		}
+		removal.paths = Vec::new();
+		assert!(removal.sync_root(root.clone()));
+		let kept =
+			&removal.basket.iter().find(|(id, _)| id == &root).unwrap().1;
+		assert_eq!(
+			kept.len(),
+			2,
+			"Deselect All keeps both explicit historical selections"
+		);
+		assert!(kept
+			.iter()
+			.all(|item| matches!(item.source, SourceKind::Commit { .. })));
+		assert!(!removal.toggle_revision(root.clone(), &sha_a, "same.txt"));
+		assert!(removal.fits_replacing(
+			MAX_RETAINED_TREE_BYTES,
+			old_bytes,
+			MAX_RETAINED_TREE_BYTES
+		));
+	}
+
+	#[test]
+	fn project_intent_preserves_git_group_while_change_list_is_unloaded() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = CanonicalRootId::new(dir.path()).unwrap();
+		let staged = ExportItem {
+			root: root.clone(),
+			relative_path: "same.txt".into(),
+			source: SourceKind::Staged,
+			change_type: None,
+		};
+		let historical = ExportItem {
+			root: root.clone(),
+			relative_path: "same.txt".into(),
+			source: SourceKind::Commit {
+				rev: "a".repeat(40),
+			},
+			change_type: None,
+		};
+		let mut candidate = PreparedSelection::new(
+			&[],
+			&["new.txt".into()],
+			&[(root.clone(), vec![staged.clone(), historical.clone()])],
+		);
+		candidate.replace_file_group = true;
+		assert!(candidate.sync_root(root));
+		assert!(candidate.basket[0].1.contains(&staged));
+		assert!(candidate.basket[0].1.contains(&historical));
+		assert_eq!(candidate.basket[0].1.len(), 3);
+	}
+
+	#[test]
+	fn prepared_selection_is_whole_and_keeps_root_source_and_full_oid() {
+		let one = tempfile::tempdir().unwrap();
+		let two = tempfile::tempdir().unwrap();
+		let root = CanonicalRootId::new(one.path()).unwrap();
+		let other_root = CanonicalRootId::new(two.path()).unwrap();
+		let sha_a = "a".repeat(40);
+		let sha_b = "b".repeat(40);
+		let files: Vec<_> = [
+			SourceKind::Staged,
+			SourceKind::Unstaged,
+			SourceKind::Working,
+		]
+		.into_iter()
+		.map(|source| FileChangeItem {
+			path: "same.txt".into(),
+			change_type: None,
+			source,
+			is_conflict: false,
+			selected: false,
+		})
+		.collect();
+		let mut old = PreparedSelection::new(&files, &["same.txt".into()], &[]);
+		old.replace_file_group = true;
+		old.replace_git_group = true;
+		assert!(old.sync_root(root.clone()));
+		assert!(old.toggle_revision(other_root.clone(), &sha_b, "same.txt"));
+		let before = old.basket.clone();
+		let old_bytes = old.retained_bytes();
+		let mut candidate =
+			PreparedSelection::new(&old.files, &old.paths, &old.basket);
+		for file in &mut candidate.files {
+			file.selected = true;
+		}
+		assert!(candidate.toggle_revision(root.clone(), &sha_a, "same.txt"));
+		assert!(candidate.toggle_revision(root.clone(), &sha_b, "same.txt"));
+		candidate.replace_file_group = true;
+		candidate.replace_git_group = true;
+		assert!(candidate.sync_root(root.clone()));
+		let bytes = candidate.retained_bytes();
+		assert!(bytes > old_bytes);
+		let other_owners = 173;
+		assert!(candidate.fits_replacing(
+			other_owners + old_bytes,
+			old_bytes,
+			other_owners + bytes
+		));
+		assert!(!candidate.fits_replacing(
+			other_owners + old_bytes,
+			old_bytes,
+			other_owners + bytes - 1
+		));
+		assert!(!candidate.fits_replacing(
+			old_bytes - 1,
+			old_bytes,
+			usize::MAX
+		));
+		assert_eq!(
+			old.basket, before,
+			"refusing the intent cannot install a prefix"
+		);
+		assert!(old.files.iter().all(|file| !file.selected));
+		let items = &candidate
+			.basket
+			.iter()
+			.find(|(id, _)| id == &root)
+			.unwrap()
+			.1;
+		assert_eq!(
+			items.len(),
+			6,
+			"File, index, working changes and both commits stay distinct"
+		);
+		for source in [
+			SourceKind::File,
+			SourceKind::Staged,
+			SourceKind::Unstaged,
+			SourceKind::Working,
+			SourceKind::Commit { rev: sha_a.clone() },
+			SourceKind::Commit { rev: sha_b.clone() },
+		] {
+			assert!(items.iter().any(|item| item.source == source
+				&& item.relative_path == "same.txt"));
+		}
+		assert_eq!(
+			candidate
+				.basket
+				.iter()
+				.find(|(id, _)| id == &other_root)
+				.unwrap()
+				.1,
+			before.iter().find(|(id, _)| id == &other_root).unwrap().1
+		);
+	}
+
+	#[test]
+	fn prepared_selection_counts_spare_storage_and_new_status_before_install() {
+		let temp = tempfile::tempdir().unwrap();
+		let root = CanonicalRootId::new(temp.path()).unwrap();
+		let mut candidate =
+			PreparedSelection::new(&[], &["same.txt".into()], &[]);
+		assert!(candidate.toggle_revision(
+			root.clone(),
+			&"a".repeat(40),
+			"same.txt"
+		));
+		candidate.replace_file_group = true;
+		assert!(candidate.sync_root(root));
+		let before = candidate.retained_bytes();
+		let slots = candidate.paths.capacity();
+		candidate.paths.reserve_exact(31);
+		let path_cap = candidate.paths[0].capacity();
+		candidate.paths[0].reserve_exact(4096);
+		let (root_slots, item_slots) = (
+			candidate.basket.capacity(),
+			candidate.basket[0].1.capacity(),
+		);
+		candidate.basket.reserve_exact(5);
+		candidate.basket[0].1.reserve_exact(17);
+		let after = candidate.retained_bytes();
+		assert_eq!(
+			after - before,
+			(candidate.paths.capacity() - slots)
+				* std::mem::size_of::<String>()
+				+ candidate.paths[0].capacity()
+				- path_cap + (candidate.basket.capacity() - root_slots)
+				* std::mem::size_of::<(CanonicalRootId, Vec<ExportItem>)>()
+				+ (candidate.basket[0].1.capacity() - item_slots)
+					* std::mem::size_of::<ExportItem>()
+		);
+		let mut status_path = String::with_capacity(8192);
+		status_path.push_str("same.txt");
+		candidate.status = Some(Msg::new("status_toggled_file", [status_path]));
+		assert_eq!(
+			candidate.retained_bytes() - after,
+			message_bytes(candidate.status.as_ref().unwrap())
+		);
+		assert!(!candidate.fits_replacing(before, before, after));
+	}
+
+	#[test]
+	fn prepared_selection_stops_repeated_root_amplification() {
+		let temp = tempfile::tempdir().unwrap();
+		let root_path = temp.path().join("r".repeat(200));
+		std::fs::create_dir(&root_path).unwrap();
+		let root = CanonicalRootId::new(root_path).unwrap();
+		let paths: Vec<_> = (0..40_000).map(|i| format!("p{i:06}")).collect();
+		let mut candidate = PreparedSelection::new(&[], &paths, &[]);
+		candidate.replace_file_group = true;
+		assert!(
+			candidate.retained_bytes()
+				+ root.retained_heap_bytes()
+				+ paths.len() * std::mem::size_of::<ExportItem>()
+				< MAX_RETAINED_TREE_BYTES,
+			"the whole slot allocation fits; repeated root/path heaps must reject"
+		);
+		assert!(!candidate.sync_root(root), "per-item root/path copies must be checked while building the whole basket");
+		assert!(
+			candidate.basket.is_empty(),
+			"a rejected partial group is never installed"
+		);
+		assert_eq!(paths.len(), 40_000);
+	}
+
+	#[test]
+	fn basket_display_clips_on_utf8_boundaries_without_growing_past_limit() {
+		let mut text = String::new();
+		assert!(append_basket_display(&mut text, "prefix "));
+		assert!(!append_basket_display(
+			&mut text,
+			&"漢".repeat(MAX_BASKET_DISPLAY_BYTES)
+		));
+		assert!(text.len() <= MAX_BASKET_DISPLAY_BYTES && text.ends_with('…'));
+		let mut exact = "a".repeat(MAX_BASKET_DISPLAY_BYTES);
+		assert!(!append_basket_display(&mut exact, "next"));
+		assert_eq!(exact.len(), MAX_BASKET_DISPLAY_BYTES);
+	}
+
 	#[test]
 	fn read_preview_honors_explicit_source_and_missing_revision() {
 		let dir = tempfile::tempdir().unwrap();

@@ -6,7 +6,6 @@
 //! admits only what still fits. Selection is a path set on the root, not a
 //! flag that disappears when a page is evicted.
 
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -35,7 +34,7 @@ pub struct FileTreeNode {
 	held: Option<ScanEntry>,
 	loading: bool,
 	load_epoch: u64,
-	selected_paths: HashSet<String>,
+	selected_paths: Vec<String>,
 	budget_blocked: bool,
 	extra_rows: usize,
 	/// How many direct children are shown before a continuation row.
@@ -151,6 +150,22 @@ pub struct TreeIo {
 	pub kind: TreeIoKind,
 }
 
+impl TreeIo {
+	/// Complete queued-input storage. Cursor/entry headers are inline in Self.
+	pub fn retained_bytes(&self) -> usize {
+		std::mem::size_of::<Self>()
+			.saturating_add(self.key.relative.capacity())
+			.saturating_add(self.dir.capacity())
+			.saturating_add(self.base.capacity())
+			.saturating_add(self.scan.as_ref().map_or(0, |scan| {
+				scan.retained_bytes() - std::mem::size_of::<DirectoryScan>()
+			}))
+			.saturating_add(
+				self.held.as_ref().map_or(0, |entry| entry.name.capacity()),
+			)
+	}
+}
+
 pub struct TreeIoResult {
 	pub key: NodeKey,
 	pub epoch: u64,
@@ -233,19 +248,20 @@ fn shrink_path(path: PathBuf) -> PathBuf {
 	PathBuf::from(os)
 }
 
-fn entry_bytes(entry: &ScanEntry) -> usize {
-	std::mem::size_of::<ScanEntry>().saturating_add(entry.name.capacity())
+/// Heap bytes of a sorted path selection, including unused vector slots.
+pub(crate) fn selection_bytes(paths: &Vec<String>) -> usize {
+	paths.iter().fold(
+		paths
+			.capacity()
+			.saturating_mul(std::mem::size_of::<String>()),
+		|bytes, path| bytes.saturating_add(path.capacity()),
+	)
 }
 
-fn hashset_bytes(set: &HashSet<String>) -> usize {
-	let mut total = std::mem::size_of_val(set);
-	total = total.saturating_add(
-		set.capacity().saturating_mul(std::mem::size_of::<String>()),
-	);
-	for value in set {
-		total = total.saturating_add(value.capacity());
-	}
-	total
+fn normalize_selection(paths: &mut Vec<String>) {
+	paths.retain(|path| !path.is_empty());
+	paths.sort();
+	paths.dedup();
 }
 
 fn nested_git(dir: &Path) -> bool {
@@ -503,7 +519,7 @@ fn build_node(
 		held: None,
 		loading: false,
 		load_epoch: 0,
-		selected_paths: HashSet::new(),
+		selected_paths: Vec::new(),
 		budget_blocked: false,
 		extra_rows: 0,
 		row_window: DIR_PAGE_ROWS,
@@ -537,7 +553,7 @@ impl FileTreeNode {
 			held: None,
 			loading: true,
 			load_epoch: 0,
-			selected_paths: HashSet::new(),
+			selected_paths: Vec::new(),
 			budget_blocked: false,
 			extra_rows: 0,
 			row_window: DIR_PAGE_ROWS,
@@ -573,7 +589,9 @@ impl FileTreeNode {
 		}
 	}
 
-	pub fn retained_bytes(&self) -> usize {
+	/// Node/cursor cache only. Persistent paths survive cache eviction and
+	/// belong to the aggregate tree/selection budget instead of the256KiB cache.
+	pub fn cache_bytes(&self) -> usize {
 		let mut total = std::mem::size_of::<Self>();
 		total = total.saturating_add(self.name.capacity());
 		total = total.saturating_add(self.rel_path.capacity());
@@ -583,20 +601,33 @@ impl FileTreeNode {
 			total = total.saturating_add(err.capacity());
 		}
 		if let Some(scan) = &self.scan {
-			total = total.saturating_add(scan.retained_bytes());
+			// The Option's inline cursor storage is already in Self.
+			total = total.saturating_add(
+				scan.retained_bytes() - std::mem::size_of::<DirectoryScan>(),
+			);
 		}
 		if let Some(held) = &self.held {
-			total = total.saturating_add(entry_bytes(held));
+			total = total.saturating_add(held.name.capacity());
 		}
-		total = total.saturating_add(hashset_bytes(&self.selected_paths));
-		let spare =
-			self.children.capacity().saturating_sub(self.children.len());
+		let spare = self.children.capacity() - self.children.len();
 		total = total
 			.saturating_add(spare.saturating_mul(std::mem::size_of::<Self>()));
 		for child in &self.children {
-			total = total.saturating_add(child.retained_bytes());
+			total = total.saturating_add(child.cache_bytes());
 		}
 		total
+	}
+
+	pub fn selection_bytes(&self) -> usize {
+		self.children
+			.iter()
+			.fold(selection_bytes(&self.selected_paths), |bytes, child| {
+				bytes.saturating_add(child.selection_bytes())
+			})
+	}
+
+	pub fn retained_bytes(&self) -> usize {
+		self.cache_bytes().saturating_add(self.selection_bytes())
 	}
 
 	pub fn start(&mut self, cmd: TreeCommand) -> TreeEffect {
@@ -720,30 +751,57 @@ impl FileTreeNode {
 		self.drive(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(rel)));
 	}
 
-	pub fn apply_selection(&mut self, selected: &HashSet<String>) {
-		self.selected_paths.clear();
-		for path in selected {
-			if !path.is_empty() {
-				self.selected_paths.insert(path.clone());
-			}
+	pub fn selected_paths(&self) -> &[String] {
+		&self.selected_paths
+	}
+
+	/// Prepares the whole path intent without changing visible checkboxes.
+	pub fn selection_for_all(&self, selected: bool) -> Vec<String> {
+		if !selected {
+			return Vec::new();
 		}
+		let mut paths = self.selected_paths.clone();
+		for child in &self.children {
+			child.collect_selectable(&mut paths);
+		}
+		paths
+	}
+
+	pub fn selection_for_toggle(&self, key: &NodeKey) -> Option<Vec<String>> {
+		if key.is_root() {
+			return None;
+		}
+		let rel = key.utf8_rel().filter(|rel| !rel.is_empty())?;
+		let node = self.find(key)?;
+		if !node.is_valid_utf8 {
+			return None;
+		}
+		let mut paths = self.selected_paths.clone();
+		match paths.binary_search(&rel) {
+			Ok(_) => {
+				paths.retain(|path| !is_component_child_or_exact(path, &rel));
+			}
+			Err(_) if node.is_dir && !node.is_nested_repo => {
+				node.collect_selectable(&mut paths);
+			}
+			Err(index) => paths.insert(index, rel),
+		}
+		Some(paths)
+	}
+
+	/// The caller admits this complete allocation before transferring it here.
+	pub fn install_selection(&mut self, mut selected: Vec<String>) {
+		normalize_selection(&mut selected);
+		self.selected_paths = selected;
 		self.sync_flags();
 	}
 
+	pub fn apply_selection(&mut self, selected: &[String]) {
+		self.install_selection(selected.to_vec());
+	}
+
 	pub fn set_all_selected(&mut self, selected: bool) {
-		if selected {
-			let mut add = Vec::new();
-			for child in &self.children {
-				child.collect_selectable(&mut add);
-			}
-			for path in add {
-				self.selected_paths.insert(path);
-			}
-		} else {
-			self.selected_paths.clear();
-			self.selected_paths.shrink_to_fit();
-		}
-		self.sync_flags();
+		self.install_selection(self.selection_for_all(selected));
 	}
 
 	pub fn collect_selected_paths(&self, out: &mut Vec<String>) {
@@ -851,8 +909,8 @@ impl FileTreeNode {
 			(epoch, depth, scan, held)
 		};
 		let (epoch, depth, scan, held) = prepared;
-		let byte_budget = MAX_RETAINED_WORKING_TREE_BYTES
-			.saturating_sub(self.retained_bytes());
+		let byte_budget =
+			MAX_RETAINED_WORKING_TREE_BYTES.saturating_sub(self.cache_bytes());
 		TreeEffect::Io(TreeIo {
 			key: key.clone(),
 			epoch,
@@ -910,39 +968,9 @@ impl FileTreeNode {
 	}
 
 	fn toggle_key(&mut self, key: &NodeKey) {
-		if key.is_root() {
-			return;
+		if let Some(paths) = self.selection_for_toggle(key) {
+			self.install_selection(paths);
 		}
-		let Some(rel) = key.utf8_rel() else {
-			return;
-		};
-		if rel.is_empty() {
-			return;
-		}
-		let Some(node) = self.find(key) else {
-			return;
-		};
-		if !node.is_valid_utf8 {
-			return;
-		}
-		let (is_dir, nested) = (node.is_dir, node.is_nested_repo);
-		if self.selected_paths.contains(&rel) {
-			self.selected_paths.retain(|path| {
-				path != &rel && !is_component_child_or_exact(path, &rel)
-			});
-		} else {
-			self.selected_paths.insert(rel);
-			if is_dir && !nested {
-				let mut add = Vec::new();
-				if let Some(node) = self.find(key) {
-					node.collect_selectable(&mut add);
-				}
-				for path in add {
-					self.selected_paths.insert(path);
-				}
-			}
-		}
-		self.sync_flags();
 	}
 
 	fn collect_selectable(&self, out: &mut Vec<String>) {
@@ -950,7 +978,9 @@ impl FileTreeNode {
 			return;
 		}
 		if self.is_valid_utf8 && !self.rel_path.is_empty() {
-			out.push(self.rel_path.clone());
+			if let Err(index) = out.binary_search(&self.rel_path) {
+				out.insert(index, self.rel_path.clone());
+			}
 		}
 		for child in &self.children {
 			child.collect_selectable(out);
@@ -977,24 +1007,29 @@ impl FileTreeNode {
 		};
 		if nested
 			|| parent_rel.is_empty()
-			|| !self.selected_paths.contains(&parent_rel)
+			|| !self.selected_paths.binary_search(&parent_rel).is_ok()
 		{
 			return;
 		}
 		for rel in child_rels {
-			self.selected_paths.insert(rel);
+			self.selected_paths.push(rel);
 		}
 	}
 
 	fn sync_flags(&mut self) {
-		let paths = self.selected_paths.clone();
-		self.sync_flags_with(&paths);
-	}
-
-	fn sync_flags_with(&mut self, paths: &HashSet<String>) {
+		normalize_selection(&mut self.selected_paths);
 		self.selected = self.is_valid_utf8
 			&& !self.rel_path.is_empty()
-			&& paths.contains(&self.rel_path);
+			&& self.selected_paths.binary_search(&self.rel_path).is_ok();
+		for child in &mut self.children {
+			child.sync_flags_with(&self.selected_paths);
+		}
+	}
+
+	fn sync_flags_with(&mut self, paths: &[String]) {
+		self.selected = self.is_valid_utf8
+			&& !self.rel_path.is_empty()
+			&& paths.binary_search(&self.rel_path).is_ok();
 		for child in &mut self.children {
 			child.sync_flags_with(paths);
 		}
@@ -1002,8 +1037,7 @@ impl FileTreeNode {
 
 	fn reclaim_until_fit(&mut self) {
 		let mut guard = 0;
-		while self.retained_bytes() > MAX_RETAINED_WORKING_TREE_BYTES
-			&& guard < 64
+		while self.cache_bytes() > MAX_RETAINED_WORKING_TREE_BYTES && guard < 64
 		{
 			guard += 1;
 			if !self.collapse_deepest() {
@@ -1173,6 +1207,7 @@ enum MarkerKind {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashSet;
 	use std::ffi::OsString;
 	use std::fs;
 	#[cfg(unix)]
@@ -1192,6 +1227,70 @@ mod tests {
 		tree.collect_selected_paths(&mut paths);
 		paths.sort();
 		paths
+	}
+
+	#[test]
+	fn persistent_selection_capacity_is_separate_from_the_node_cache() {
+		let dir = tempfile::tempdir().unwrap();
+		let mut tree = FileTreeNode::unloaded_root(dir.path());
+		let cache = tree.cache_bytes();
+		let mut paths: Vec<_> = (0..2000)
+			.map(|i| format!("{i:04}-{}", "p".repeat(200)))
+			.collect();
+		paths.reserve_exact(23);
+		paths[0].reserve_exact(8192);
+		let selected_bytes = selection_bytes(&paths);
+		assert!(selected_bytes > MAX_RETAINED_WORKING_TREE_BYTES);
+		tree.install_selection(paths);
+		assert_eq!(tree.selection_bytes(), selected_bytes);
+		assert_eq!(tree.cache_bytes(), cache);
+		assert_eq!(tree.retained_bytes(), cache + selected_bytes);
+		tree.reclaim_until_fit();
+		assert_eq!(
+			tree.selected_paths().len(),
+			2000,
+			"cache pressure never drops checked paths"
+		);
+		tree.set_all_selected(false);
+		assert_eq!(tree.selection_bytes(), 0);
+		assert_eq!(tree.retained_bytes(), cache);
+	}
+
+	#[test]
+	fn whole_folder_selection_prepares_without_changing_visible_checks() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::create_dir(dir.path().join("folder")).unwrap();
+		fs::write(dir.path().join("folder/a.txt"), "a").unwrap();
+		fs::write(dir.path().join("folder/b.txt"), "b").unwrap();
+		let mut tree = FileTreeNode::new_root(dir.path());
+		let key = NodeKey::from_utf8_rel("folder");
+		drive(&mut tree, TreeCommand::Expand(key.clone()));
+		let proposed = tree.selection_for_toggle(&key).unwrap();
+		assert_eq!(proposed, ["folder", "folder/a.txt", "folder/b.txt"]);
+		assert!(tree.selected_paths().is_empty());
+		assert!(tree
+			.flatten_visible(MAX_VISIBLE_ROWS)
+			.iter()
+			.all(|row| !row.selected));
+		tree.install_selection(proposed);
+		assert_eq!(tree.selected_paths().len(), 3);
+		let old_bytes = tree.selection_bytes();
+		let old_capacity = tree.selected_paths.capacity();
+		let all_again = tree.selection_for_all(true);
+		assert_eq!(all_again, tree.selected_paths());
+		assert!(
+			all_again.capacity() <= old_capacity,
+			"no-op Select All must not grow storage for duplicate paths"
+		);
+		assert!(selection_bytes(&all_again) <= old_bytes);
+		assert_eq!(tree.selection_bytes(), old_bytes);
+		let removed = tree.selection_for_toggle(&key).unwrap();
+		assert!(removed.is_empty());
+		assert_eq!(
+			tree.selected_paths().len(),
+			3,
+			"preparing removal is also read-only"
+		);
 	}
 
 	#[test]

@@ -72,6 +72,12 @@ impl CanonicalRootId {
 	pub fn path(&self) -> &Path {
 		&self.0
 	}
+
+	/// Heap storage owned by this canonical path; the enclosing owner counts
+	/// the inline `CanonicalRootId` once. Uses capacity, including spare bytes.
+	pub fn retained_heap_bytes(&self) -> usize {
+		self.0.capacity()
+	}
 }
 
 impl std::fmt::Display for CanonicalRootId {
@@ -3102,5 +3108,21 @@ replacement-two
 			}
 		}
 		assert_same(&before, &disk(&repo, "file.txt", "file.txt"));
+	}
+}
+
+#[cfg(test)]
+mod root_retained_tests {
+	use super::*;
+
+	#[test]
+	fn canonical_root_heap_accessor_includes_spare_path_storage() {
+		let temp = tempfile::tempdir().unwrap();
+		let mut root = CanonicalRootId::new(temp.path()).unwrap();
+		let before = root.retained_heap_bytes();
+		root.0.reserve(8192);
+		assert!(root.retained_heap_bytes() > before);
+		assert_eq!(root.retained_heap_bytes(), root.0.capacity());
+		assert!(root.retained_heap_bytes() > root.path().as_os_str().len());
 	}
 }

@@ -322,6 +322,33 @@ impl Discovery {
 		self.stack.len()
 	}
 
+	/// Rust storage retained between pages: this value, stack allocation,
+	/// each frame path and pending-path allocation, and the unopened root.
+	/// `ReadDir`'s opaque OS/libc buffers are not visible to safe Rust and are
+	/// excluded, as in [`DirectoryScan::retained_bytes`].
+	pub fn retained_bytes(&self) -> usize {
+		let mut bytes = std::mem::size_of::<Self>()
+			.saturating_add(self.root.as_ref().map_or(0, PathBuf::capacity))
+			.saturating_add(
+				self.stack
+					.capacity()
+					.saturating_mul(std::mem::size_of::<DiscoveryFrame>()),
+			);
+		for frame in &self.stack {
+			bytes = bytes.saturating_add(frame.path.capacity());
+			bytes = bytes.saturating_add(
+				frame
+					.pending
+					.capacity()
+					.saturating_mul(std::mem::size_of::<PathBuf>()),
+			);
+			for path in &frame.pending {
+				bytes = bytes.saturating_add(path.capacity());
+			}
+		}
+		bytes
+	}
+
 	/// Repositories recorded so far. This is not the number of open handles.
 	pub fn found_repos(&self) -> usize {
 		self.found
@@ -1014,6 +1041,45 @@ mod tests {
 		fs::write(dir.join(name), body).unwrap();
 		git(dir, &["add", name]);
 		git(dir, &["commit", "-qm", name]);
+	}
+
+	#[test]
+	fn discovery_retained_bytes_counts_cursor_paths_and_spare_stack_slots() {
+		let temp = tempfile::tempdir().unwrap();
+		let mut discovery = Discovery::new(temp.path(), 3, 10).unwrap();
+		let before = discovery.retained_bytes();
+		let old_root = discovery.root.as_ref().unwrap().capacity();
+		discovery.root.as_mut().unwrap().reserve(8192);
+		assert_eq!(
+			discovery.retained_bytes() - before,
+			discovery.root.as_ref().unwrap().capacity() - old_root
+		);
+		let mut path = PathBuf::with_capacity(2048);
+		path.push(temp.path());
+		let mut pending = Vec::with_capacity(7);
+		let mut child = PathBuf::with_capacity(4096);
+		child.push(temp.path().join("not-yet-opened"));
+		pending.push(child);
+		discovery.stack = Vec::with_capacity(3);
+		discovery.stack.push(DiscoveryFrame {
+			path,
+			iter: fs::read_dir(temp.path()).unwrap(),
+			pending,
+		});
+		let frame = &discovery.stack[0];
+		let frame_heap = frame.path.capacity()
+			+ frame.pending.capacity() * std::mem::size_of::<PathBuf>()
+			+ frame.pending.iter().map(PathBuf::capacity).sum::<usize>();
+		let after = discovery.retained_bytes();
+		discovery.stack.clear();
+		assert_eq!(after - discovery.retained_bytes(), frame_heap);
+		assert_eq!(
+			discovery.retained_bytes(),
+			std::mem::size_of::<Discovery>()
+				+ discovery.root.as_ref().unwrap().capacity()
+				+ discovery.stack.capacity()
+					* std::mem::size_of::<DiscoveryFrame>()
+		);
 	}
 
 	#[test]
