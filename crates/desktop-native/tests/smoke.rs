@@ -817,15 +817,160 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	wait_for_pattern("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3))
 		.expect("Alt+1 must switch to FileExplorer");
 
-	println!(
-		"[TEST DRIVER] Testing Tab / Shift+Tab visible focus traversal..."
+	// Observe the painted focus ring inside each control's own settled bounds,
+	// rather than accepting FOCUS next/prev handler logs as proof of focus.
+	let capture_focus = |filename: &str, expected: &[(&str, bool)]| {
+		let deadline = Instant::now() + Duration::from_secs(3);
+		let boxes = loop {
+			let boxes: Vec<_> =
+				expected.iter().map(|(id, _)| control(id)).collect();
+			std::thread::sleep(Duration::from_millis(150));
+			if expected
+				.iter()
+				.zip(&boxes)
+				.all(|((id, _), v)| control(id) == *v)
+			{
+				break boxes;
+			}
+			assert!(
+				Instant::now() < deadline,
+				"focus target bounds did not settle"
+			);
+		};
+		capture_artifact(filename);
+		for ((id, focused), v) in expected.iter().zip(boxes) {
+			assert_eq!(control(id), v, "focus target moved during capture");
+			// The absolute child probe covers the padding box, inside the
+			// declared border_1. Include that border at this 1x X11 scale.
+			let [x, y, w, h] = [v[0] - 1, v[1] - 1, v[2] + 2, v[3] + 2];
+			let (vw, vh) = *viewport.lock().unwrap();
+			assert!(x >= 0 && y >= 0 && x + w <= vw && y + h <= vh);
+			let crop = format!("{w}x{h}+{x}+{y}");
+			let out = Command::new("convert")
+				.arg(out_dir.join(filename))
+				.args([
+					"-crop",
+					&crop,
+					"+repage",
+					"-alpha",
+					"off",
+					"-fx",
+					// The visible keyboard ring is #3574f0; allow one level
+					// of raster rounding in the captured sRGB channels.
+					"abs(r-53/255)<0.006 && abs(g-116/255)<0.006 && abs(b-240/255)<0.006 ? 1 : 0",
+					"-format",
+					"%[fx:mean]",
+					"info:",
+				])
+				.output()
+				.expect("convert focus crop must run");
+			assert!(
+				out.status.success(),
+				"focus crop failed: {:?}",
+				out.stderr
+			);
+			let fraction: f64 = String::from_utf8(out.stdout)
+				.unwrap()
+				.trim()
+				.parse()
+				.unwrap();
+			let pixels = fraction * f64::from(w * h);
+			println!("[TEST DRIVER] focus {id} bounds={v:?} crop={crop} pixels={pixels} expected={focused}");
+			assert!(
+				if *focused { pixels >= 8.0 } else { pixels < 1.0 },
+				"{id} focused={focused}, but its own crop contains {pixels} focus-ring pixels; {filename}"
+			);
+		}
+	};
+
+	click("btn-locale");
+	wait_for_pattern("[APP:LOCALE: En]", Duration::from_secs(3))
+		.expect("harmless locale focus anchor must switch to English");
+	capture_focus("keyboard-anchor-locale.png", &[("btn-locale", true)]);
+	println!("[TEST DRIVER] Disabled Copy must neither focus nor activate...");
+	// The basket is still empty. Clicking the disabled button must not focus it;
+	// Enter/Space may retain the harmless locale focus, but cannot invoke Copy.
+	let _: Vec<_> = rx.try_iter().collect();
+	click("btn-copy");
+	send_key("Return");
+	send_key("space");
+	capture_focus("keyboard-disabled-copy.png", &[("btn-copy", false)]);
+	assert_eq!(clip_get(), sentinel, "disabled Copy changed the clipboard");
+	let disabled_events: Vec<_> = rx.try_iter().collect();
+	assert!(
+		!disabled_events
+			.iter()
+			.any(|line| line.contains("[APP:COPY")),
+		"disabled Copy dispatched an action: {disabled_events:?}"
+	);
+
+	// A real click gives us a known focus anchor. From locale, traverse back
+	// through Refresh and Paste to Ref: disabled Copy (tab index 3) is skipped.
+	click("btn-locale");
+	wait_for_pattern("[APP:LOCALE: ZhTw]", Duration::from_secs(3))
+		.expect("locale anchor click must restore Chinese");
+	send_key("Shift+Tab");
+	capture_focus(
+		"keyboard-refresh-focus.png",
+		&[("btn-refresh", true), ("btn-locale", false)],
+	);
+	send_key("Shift+Tab");
+	capture_focus(
+		"keyboard-paste-focus.png",
+		&[("btn-paste", true), ("btn-copy", false)],
+	);
+	send_key("Shift+Tab");
+	capture_focus(
+		"keyboard-ref-focus.png",
+		&[("btn-ref-selector", true), ("btn-copy", false)],
 	);
 	send_key("Tab");
-	wait_for_pattern("[APP:FOCUS: next]", Duration::from_secs(3))
-		.expect("Tab must focus next");
-	send_key("Shift+Tab");
-	wait_for_pattern("[APP:FOCUS: prev]", Duration::from_secs(3))
-		.expect("Shift+Tab must focus prev");
+	capture_focus(
+		"keyboard-forward-skip-copy.png",
+		&[
+			("btn-paste", true),
+			("btn-ref-selector", false),
+			("btn-copy", false),
+		],
+	);
+	send_key("Tab");
+	send_key("Tab");
+	capture_focus("keyboard-locale-focus.png", &[("btn-locale", true)]);
+	let _: Vec<_> = rx.try_iter().collect();
+	send_key("Return");
+	wait_for_pattern("[APP:LOCALE: En]", Duration::from_secs(3))
+		.expect("Enter on the focused locale button must change the language");
+	let _: Vec<_> = rx.try_iter().collect();
+	send_key("space");
+	wait_for_pattern("[APP:LOCALE: ZhTw]", Duration::from_secs(3))
+		.expect("Space on the focused locale button must change the language");
+
+	// Tab reaches another real control. Keyboard activation must collapse and
+	// reopen the Project panel, leaving the existing tree smoke ready to run.
+	send_key("Tab");
+	capture_focus(
+		"keyboard-project-focus.png",
+		&[("rail-project", true), ("btn-locale", false)],
+	);
+	let _: Vec<_> = rx.try_iter().collect();
+	send_key("space");
+	wait_for_pattern(
+		"[APP:TAB_SWITCHED: FileExplorer visible=false",
+		Duration::from_secs(3),
+	)
+	.expect("Space on focused Project must collapse the panel");
+	let _: Vec<_> = rx.try_iter().collect();
+	send_key("Return");
+	wait_for_pattern(
+		"[APP:TAB_SWITCHED: FileExplorer visible=true",
+		Duration::from_secs(3),
+	)
+	.expect("Enter on focused Project must reopen the panel");
+	assert_eq!(
+		clip_get(),
+		sentinel,
+		"keyboard navigation changed the clipboard"
+	);
 
 	// 5. Expand 'subfolder' by clicking its real tree row
 	println!("[TEST DRIVER] Expanding 'subfolder' directory...");
