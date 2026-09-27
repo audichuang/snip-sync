@@ -33,7 +33,7 @@ jobs:
     # Release gate: the tagged commit must already have a green push-to-main
     # ci.yml run (its `CI gate` fails on any non-success job). The run must be
     # for the tagged SHA on main, not a pull_request merge ref.
-    # Its run id is also where publish-native takes the desktop packages from.
+    # Its run id is also where verify-native takes the desktop packages from.
     verify-ci:
         name: Verify CI is green for this commit
         runs-on: ubuntu-latest
@@ -61,12 +61,14 @@ jobs:
                   echo "ci.yml is green (push to main) for $SHA: run $RUN_ID."
                   echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
+    # Nothing below is public until publish-release: every job only produces
+    # workflow artifacts, so a failed check leaves no GitHub Release at all.
     changelog:
         name: Generate Changelog
         needs: verify-ci
         runs-on: ubuntu-latest
         permissions:
-            contents: write
+            contents: read
             # git-cliff reads merged PRs for the changelog; a private repo
             # needs the token to be allowed to list them.
             pull-requests: read
@@ -82,14 +84,13 @@ jobs:
               env:
                   OUTPUT: CHANGES.md
                   GITHUB_REPO: ${{ github.repository }}
-            - name: Create GitHub Release
-              uses: softprops/action-gh-release@v3
+            - name: Keep the changelog for publish-release
+              uses: actions/upload-artifact@v4
               with:
-                  tag_name: ${{ env.RELEASE_TAG }}
-                  name: "snip-sync ${{ env.RELEASE_TAG }}"
-                  body_path: CHANGES.md
-                  draft: false
-                  prerelease: ${{ env.PRERELEASE }}
+                  name: release-notes
+                  path: CHANGES.md
+                  if-no-files-found: error
+                  overwrite: true
 
     # The native desktop app is never rebuilt here. The delivery spec requires
     # the published binaries to be exactly the ones the gates accepted, and a
@@ -98,16 +99,17 @@ jobs:
     # (Linux from native-acceptance, macOS/Windows from
     # native-candidate-artifacts), re-checks every file against the
     # SHA256SUMS written in the job that tested it, binds the Linux binary to
-    # the acceptance build receipt, and uploads the files unchanged.
+    # the acceptance build receipt, and hands the files on unchanged to
+    # publish-release.
     # The Tauri app (crates/desktop) is still built and tested by ci.yml for
     # rollback, but no longer released.
-    publish-native:
-        name: Publish Desktop (accepted CI artifacts)
-        needs: [verify-ci, changelog]
+    verify-native:
+        name: Verify Desktop (accepted CI artifacts)
+        needs: verify-ci
         runs-on: ubuntu-latest
         permissions:
             actions: read
-            contents: write
+            contents: read
         env:
             GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
             REPO: ${{ github.repository }}
@@ -134,7 +136,9 @@ jobs:
                   for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc x86_64-unknown-linux-gnu; do
                       gh run download "$RUN_ID" -R "$REPO" -n "native-candidate-$t" -D "ci/$t"
                   done
-                  gh run download "$RUN_ID" -R "$REPO" -n native-acceptance-linux -D ci/acceptance
+                  # Only acceptance.json + build-receipt.json; the full evidence
+                  # bundle (native-acceptance-linux) stays in CI for debugging.
+                  gh run download "$RUN_ID" -R "$REPO" -n native-acceptance-receipt -D ci/acceptance
 
             - name: Verify hashes, versions and the Linux acceptance receipt
               shell: bash
@@ -172,43 +176,48 @@ jobs:
                   [ "$GOT" = "$WANT" ] || { echo "Linux package binary $GOT is not the accepted binary $WANT" >&2; exit 1; }
                   echo "LINUX_ACCEPTED_SHA=$WANT" >> "$GITHUB_ENV"
 
-            - name: Upload desktop assets and record provenance
+            - name: Stage desktop assets and provenance
               shell: bash
               run: |
                   set -euo pipefail
-                  mkdir dist
+                  mkdir -p release/assets
                   for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc x86_64-unknown-linux-gnu; do
-                      find "ci/$t" -type f ! -name 'SHA256SUMS-*' -exec cp {} dist/ \;
+                      find "ci/$t" -type f ! -name 'SHA256SUMS-*' -exec cp {} release/assets/ \;
                   done
-                  (cd dist && sha256sum -- * > ../snip-sync-desktop-SHA256SUMS.txt)
-                  mv snip-sync-desktop-SHA256SUMS.txt dist/
-                  gh release upload "$RELEASE_TAG" -R "$REPO" --clobber dist/*
+                  (cd release/assets && sha256sum -- * > ../snip-sync-desktop-SHA256SUMS.txt)
+                  mv release/snip-sync-desktop-SHA256SUMS.txt release/assets/
 
                   RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
-                  gh release view "$RELEASE_TAG" -R "$REPO" --json body --jq .body > notes.md
                   {
                       echo
                       echo "## Desktop app (native)"
                       echo
                       echo "These files are byte-for-byte the packages that passed CI run [$RUN_ID]($RUN_URL) for \`$SHA\`; they were not rebuilt for the release. The Linux executable is the one the acceptance gates ran (sha256 \`$LINUX_ACCEPTED_SHA\`)."
                       echo
-                      echo "The app is not notarized or code-signed with a certificate (macOS is ad-hoc signed). On macOS, if it will not open: System Settings → Privacy & Security → Open Anyway, or run \`xattr -cr /Applications/snip-sync.app\`. On Windows, SmartScreen may warn: More info → Run anyway."
+                      echo "The app is not notarized or code-signed with a certificate (macOS is ad-hoc signed). On macOS, if it will not open: System Settings → Privacy & Security → Open Anyway, or run \`xattr -cr /Applications/snip-sync.app\`. On Windows, SmartScreen may warn: More info → Run anyway. The Windows installer offers to remove an older Tauri-based snip-sync."
                       echo
                       echo '```'
-                      cat dist/snip-sync-desktop-SHA256SUMS.txt
+                      cat release/assets/snip-sync-desktop-SHA256SUMS.txt
                       echo '```'
-                  } >> notes.md
-                  gh release edit "$RELEASE_TAG" -R "$REPO" --notes-file notes.md
+                  } > release/provenance.md
+
+            - name: Hand the verified assets to publish-release
+              uses: actions/upload-artifact@v4
+              with:
+                  name: desktop-assets
+                  path: release
+                  if-no-files-found: error
+                  overwrite: true
 
     build-cli:
-        needs: [verify-ci, changelog]
+        needs: verify-ci
         name: Build CLI (${{ matrix.target }})
         runs-on: ${{ matrix.os }}
         env:
             SCCACHE_GHA_ENABLED: "true"
             RUSTC_WRAPPER: "sccache"
         permissions:
-            contents: write
+            contents: read
         strategy:
             fail-fast: false
             matrix:
@@ -288,18 +297,86 @@ jobs:
               shell: pwsh
               run: Compress-Archive -Path target/${{ matrix.target }}/release/snip.exe -DestinationPath snip-${{ matrix.target }}.zip
 
-            - name: Upload CLI to Release
-              uses: softprops/action-gh-release@v3
+            - name: Hand the CLI archive to publish-release
+              uses: actions/upload-artifact@v4
               with:
-                  tag_name: ${{ env.RELEASE_TAG }}
-                  prerelease: ${{ env.PRERELEASE }}
-                  files: snip-${{ matrix.target }}.*
+                  name: cli-${{ matrix.target }}
+                  path: snip-${{ matrix.target }}.*
+                  if-no-files-found: error
+                  overwrite: true
+
+    # The only job that makes anything public, and only after every build and
+    # verification job succeeded. The release is created as a draft with all
+    # assets attached, checked, then published in one API call.
+    publish-release:
+        name: Publish GitHub Release
+        needs: [changelog, verify-native, build-cli]
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        env:
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            REPO: ${{ github.repository }}
+            SHA: ${{ github.sha }}
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  name: release-notes
+                  path: notes
+            - uses: actions/download-artifact@v4
+              with:
+                  name: desktop-assets
+                  path: desktop
+            - uses: actions/download-artifact@v4
+              with:
+                  pattern: cli-*
+                  path: cli
+                  merge-multiple: true
+
+            - name: Check the full asset set
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir final
+                  cp desktop/assets/* cli/* final/
+                  # Re-check the desktop bytes after the artifact hop.
+                  (cd final && sha256sum --check --strict snip-sync-desktop-SHA256SUMS.txt)
+                  for must in snip-sync_mac_arm.dmg snip-sync_mac_arm.app.tar.gz snip-sync_mac_intel.dmg snip-sync_mac_intel.app.tar.gz \
+                      snip-sync-windows-setup.exe snip-sync-windows-x64.zip snip-sync-linux-x86_64.tar.gz snip-sync-desktop-SHA256SUMS.txt \
+                      snip-aarch64-apple-darwin.tar.gz snip-x86_64-apple-darwin.tar.gz snip-x86_64-unknown-linux-gnu.tar.gz snip-x86_64-pc-windows-msvc.zip; do
+                      [ -s "final/$must" ] || { echo "missing asset $must" >&2; exit 1; }
+                  done
+                  [ "$(find final -type f | wc -l)" -eq 12 ] || { ls final >&2; echo "unexpected extra assets" >&2; exit 1; }
+                  cat notes/CHANGES.md desktop/provenance.md > body.md
+
+            - name: Create draft, then publish
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  # A published release for this tag is never touched; a draft
+                  # left by an earlier failed attempt is replaced.
+                  if gh api "repos/$REPO/releases/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+                      echo "::error::Release $RELEASE_TAG is already published." >&2
+                      exit 1
+                  fi
+                  for id in $(gh api --paginate "repos/$REPO/releases" --jq '.[] | select(.draft and .tag_name == env.RELEASE_TAG) | .id'); do
+                      gh api -X DELETE "repos/$REPO/releases/$id"
+                  done
+                  ARGS=(--draft --title "snip-sync $RELEASE_TAG" --notes-file body.md --target "$SHA")
+                  if [ "$PRERELEASE" = "true" ]; then ARGS+=(--prerelease); fi
+                  gh release create "$RELEASE_TAG" -R "$REPO" "${ARGS[@]}" final/*
+                  ID=$(gh api --paginate "repos/$REPO/releases" --jq '.[] | select(.draft and .tag_name == env.RELEASE_TAG) | .id')
+                  [ "$(printf '%s\n' "$ID" | grep -c .)" -eq 1 ] || { echo "expected one draft for $RELEASE_TAG, got: $ID" >&2; exit 1; }
+                  N=$(gh api "repos/$REPO/releases/$ID" --jq '.assets | length')
+                  [ "$N" -eq 12 ] || { echo "draft has $N assets, want 12" >&2; exit 1; }
+                  gh api -X PATCH "repos/$REPO/releases/$ID" -F draft=false >/dev/null
+                  echo "Published $RELEASE_TAG."
 
     # Stable tags only: `brew install` must keep pointing at the last stable
     # version, RC testers download the prerelease assets directly.
     publish-homebrew:
         name: Update Homebrew Tap
-        needs: [publish-native, build-cli]
+        needs: publish-release
         if: ${{ !contains(github.event.inputs.version || github.ref_name, '-') }}
         runs-on: ubuntu-latest
         steps:

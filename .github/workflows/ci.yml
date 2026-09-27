@@ -519,6 +519,17 @@ jobs:
                   path: ${{ runner.temp }}/native-candidate-x86_64-unknown-linux-gnu
                   if-no-files-found: error
                   overwrite: true
+            # Just the two receipts release.yml checks, so a release does not
+            # download the whole evidence bundle above.
+            - name: Upload acceptance receipts for release
+              uses: actions/upload-artifact@v4
+              with:
+                  name: native-acceptance-receipt
+                  path: |
+                      ${{ runner.temp }}/native-acceptance/acceptance.json
+                      ${{ runner.temp }}/native-acceptance/build-receipt.json
+                  if-no-files-found: error
+                  overwrite: true
             - name: Checkout left clean
               if: always()
               shell: bash
