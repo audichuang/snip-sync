@@ -1543,10 +1543,14 @@ def left_viewport(lines: list[str]) -> tuple[int, int, int, int]:
 
 
 def _last_reported_bounds(lines: list[str], control: str) -> tuple[int, int, int, int] | None:
-    """Last bounds in this repo/view, retained after a same-view CTRL_GONE."""
+    """Last bounds in this repo/view, retained after a same-view CTRL_GONE.
+
+    Repo rows belong to the workspace; selecting another repo does not retire
+    their scroll hints. Path-only tree rows still belong to the selected repo.
+    """
     found: tuple[int, int, int, int] | None = None
     for line in lines:
-        if "[APP:REPO_SELECTING:" in line or (
+        if ("[APP:REPO_SELECTING:" in line and not control.startswith("repo-row:")) or (
             control.startswith(("rev-row:", "rev-chk:")) and "[APP:REV_TREE:" in line
         ):
             found = None

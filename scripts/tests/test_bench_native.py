@@ -1133,6 +1133,18 @@ class TestScrollHintScope(unittest.TestCase):
                     "[APP:CTRL_BOUNDS: id=tree-row:assets x=36 y=426 w=280 h=24]",
                 ], "tree-row:src"), "5")
 
+    def test_repo_selection_keeps_workspace_repo_row_upward_hint(self) -> None:
+        # Captured resource warmup: repo01 leaves above the viewport, then
+        # repo12..15 load. Its workspace identity survives those selections.
+        self.assertEqual(self.first_wheel([
+            self.VIEWPORT,
+            "[APP:CTRL_BOUNDS: id=repo-row:repo-01-core x=36 y=66 w=280 h=24]",
+            "[APP:CTRL_GONE: id=repo-row:repo-01-core]",
+            "[APP:REPO_SELECTING: 11 (repo-12-cli) root=/fixture/repo-12-cli]",
+            "[APP:REPO_SELECTING: 14 (repo-15-admin) root=/fixture/repo-15-admin]",
+            "[APP:CTRL_BOUNDS: id=repo-row:repo-15-admin x=36 y=368 w=280 h=24]",
+        ], "repo-row:repo-01-core"), "4")
+
     def test_same_view_retains_gone_row_upward_hint(self) -> None:
         for control in ("tree-row:src", "rev-row:src", "rev-chk:bbbbbbb:src/app.txt"):
             with self.subTest(control=control):
