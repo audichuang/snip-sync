@@ -6,7 +6,11 @@
 
 ## 0.1 第四段已完成增量
 
-`09c9927` 修復第三段找到的 XIM 啟動竞態，新增可強制重現的驗收腳本。修補 release 的原驗收及主 agent 獨立回歸均九階段通過；證據在 `session4/ime/`，完整說明見監督紀錄。此後的 graph 容量、協作與效能工作仍在進行，下列第三段數字屬歷史 checkpoint，不能當目前全部變更的驗收結果。
+XIM 啟動競態 `09c9927`、Graph 16 MiB／失敗換頁一致性 `708cd08`、共享 core 讀取取消與錯誤分類 `c77a516`、已接納 UI 預覽 32 MiB `bceffed`、真鍵盤焦點與操作 `76bcdd2`、Reader 行座標清理 `c020391` 已提交。各有對應單元或真 UI 回歸及主 agent 獨立驗證；詳見 [最新監督紀錄](native-workbench-supervision.md)。
+
+協作 runner `4724e92` 的歷史凍結 binary run4 已通過雙端各 15 repo 的 18 案、36 次乾淨退出；可比效能／資源 drivers `6b5f50b` 已整合，Python harness 340 tests 通過。這些不代替最終 binary 的全組驗收。證據在 `session4/`，原始失敗輪次保留。
+
+目前仍在完成 pending paste/read 工作的容量與數量界線、tree/basket/selector 8 MiB、D3 剩餘可見退化／平台案例、正式十輪效能、完整資源長測及 just/CI 入口。highlight/input source audit 的當前 toolchain 保守 retained 上界低於 1.77 MiB，未宣稱 renderer/RSS 或全域 64 MiB。最後完整 preflight 仍是 `fbec418`，不是目前所有變更的綠燈；未推送／PR／CI／發版。
 
 ## 0. 最新接續結果（2026-09-27，第三段）
 

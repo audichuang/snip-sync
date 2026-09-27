@@ -1,5 +1,16 @@
 # Native workbench — supervisor checkpoint
 
+## 2026-09-27 Checkpoint: 預覽容量、共享讀取、協作與鍵盤回歸
+
+- **已提交**：`c77a516` 將 native preview/change-list 的取消與輸出限制傳到底層 Git 讀取，並保留 cat-file 的非零退出錯誤；`bceffed` 限制已接納的 ordinary preview、paste plan/detail 合計 32 MiB，拒絕超限的新貼上時撤銷旧 Apply，移除 Git 讀取失敗後偷換成 working-file 的 fallback。Apply 仍不可取消，contract、DTO 與相依版本未改。
+- **獨立驗證**：主 agent 重跑 12 個 core read/runner 測試、81 個 native unit；native all-targets clippy 通過於這批產品來源。原始貼上文字超過 32 MiB，以及 12 MiB payload 解析後膨脹超限，兩種真 UI 回歸均由 worker 與主 agent 分別通過：錯誤可見、舊計畫撤銷、Enter 不寫入、檔案與剪貼簿保持不變，退出乾淨。證據在 `session4/core-read/`、`session4/preview/`。
+- **協作與 drivers**：`4724e92` 整合雙端各 15 repo 的 18 案真 UI runner；歷史凍結 binary `b11e6724…` 的 run4 為 18/18，36 次 app 均正常退出。主 agent 核對 148 份 artifact hash、144 個已保存 PID/starttime 均無存活；不存在目的地案例是 whitelist prevention，未從 UI 送出非法 ID。`6b5f50b` 整合可比 diff 與資源 drivers；整合後 Python harness 340 tests 通過。最終 binary 重跑仍待完成，不宣稱正式十轮效能或完整 D4。
+- **鍵盤與清理**：`76bcdd2` 用實際控制項範圍內的焦點框 pixel 驗證 Tab／Shift+Tab，並用真 Enter／Space 驗證語言及 Project 開合、disabled Copy 不執行。既有完整主 smoke 由 worker／主 agent 分別 exit 0（46.43／46.40 秒），主 agent 檢查截圖；只涵蓋 Linux X11 1x。`c020391` 以兩行清除 Reader reset/close 殘留行座標；既有測試擴充在舊碼 exit 101、修正後 exit 0，主 agent 另重跑通過。證據在 `session4/keyboard/`、`session4/highlight/`。
+- **容量界線**：highlight/input 在當前 64-bit Rust toolchain 的所有權與容量成長政策下有保守上界 1,851,488 bytes；此為 source-derived bound，不是 RSS 或 renderer 上界。preview 的 pending worker、mailbox、Apply clone 尚未納入本批 32 MiB；tree/basket/changed-list/selector 的 8 MiB 也仍在補齊。不得宣稱完整 retained 64 MiB。
+- **接續**：Codex 子 agent 分別實作單一共享預覽預算與驗收入口，另一位審查 tree8；主 agent 指揮、獨立驗證、整合。Cursor `grok-4.7-high` 提供唯讀快照審查，其 shell 工具被拒，未當成實作或執行證據。最終 source 凍結後才重跑完整 preflight，再推送 feature→develop PR 與真正 macOS arm64／Intel CI；目前尚未推送、開 PR、跑 CI 或發版。最後完整 preflight 仍是歷史 `fbec418`。
+
+本節證據根目錄：`/home/audichuang/research/snip-sync-handoff-20260927/`。下列舊 checkpoint 的「尚未」與測試數字只代表當時狀態。
+
 ## 2026-09-27 Checkpoint: Graph 容量與換頁失敗一致性
 
 - **變更**：Graph 的 commits／refs／layout／checkpoint／collapse／搜尋 metadata 以實際 String／Vec capacity 累加，整頁候選通過 16 MiB admission 後才一次安裝。Next／Prev 失敗不提前改頁碼，不會把新 commits 掛到舊 rails；切換查詢會清除不屬於新查詢的舊圖。未改 core graph 演算法、依賴、contract 或 Apply。
