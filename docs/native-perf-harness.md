@@ -90,7 +90,7 @@ The copy is a click on `btn-copy` after the checkbox is on. `Ctrl+C` is not the 
 7. **Source bytes**: staged content is `git show :<path>` (the index). Unstaged and untracked content is the worktree file. A deletion is the core deleted-file marker. CRLF, a trailing blank line, a UTF-8 BOM, and non-ASCII bytes are kept. A mismatch fails the run through `finalize_run`. Staged and deleted copies omit empty text wrappers (one delimiter newline after the file). Unstaged and untracked copies include them: a blank line after the root header, and one extra newline after the delimiter. The extractor removes that framing. It does not drop the file's own trailing newline.
 
 ### History page
-The workbench loads 50 commits per page. That length is the application's built-in value, checked against `[APP:GRAPH_LOADED]` and `[APP:E2E_LOG]` (`mode=graph`, `first=` equals the first commit of `git log --topo-order -n 51 --all HEAD`). There is no `--history-page-size` flag and no screen flag. Observed window geometry stays on each run. A different row count fails the run.
+The workbench loads 50 commits per page. That length is the application's built-in value, checked against `[APP:GRAPH_LOADED]` and `[APP:E2E_LOG]` (`mode=graph`, `first=` equals the first commit of `git log --topo-order -n 51 --branches --remotes --tags HEAD`). There is no `--history-page-size` flag and no screen flag. Observed window geometry stays on each run. A different row count fails the run.
 
 ### Optional matched `1repo-diff`
 

@@ -261,7 +261,7 @@ def history_page(repo: str, page_len: int = APPLICATION_HISTORY_PAGE_LENGTH) -> 
     """First history page the way `browser::history_with` asks git for it."""
     raw = git(
         repo, "log", "--topo-order", "--ignore-missing", f"-n{page_len + 1}",
-        "--format=%H%x00%s", "--all", "HEAD", "--",
+        "--format=%H%x00%s", "--branches", "--remotes", "--tags", "HEAD", "--",
     )
     lines = [line for line in raw.splitlines() if line]
     if len(lines) > page_len:
