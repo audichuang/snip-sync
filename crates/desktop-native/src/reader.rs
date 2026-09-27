@@ -17,7 +17,7 @@ use gpui::{
 use snip_core::gitrun::{CancelToken, Overflow, RunOptions};
 use snip_core::gitsrc::{Git, GitSource};
 
-use crate::i18n::tf;
+use crate::i18n::{t, tf};
 use crate::syntax::{highlight_line, Language, SyntaxTheme};
 use crate::theme::*;
 use crate::WorkbenchModel;
@@ -404,6 +404,10 @@ pub struct DiffRows {
 	pub shown: Vec<usize>,
 	/// Largest old/new line number, sizes the gutter.
 	pub max_num: u32,
+	/// The file may go on after the last hunk: its trailing context is full
+	/// (git's 3 lines) and the patch does not end at "\ No newline".
+	/// Drawn as one more fold row whose size is known only once expanded.
+	pub trailing: bool,
 }
 
 /// "@@ -a[,b] +c[,d] @@" as the first old and new line the hunk covers
@@ -432,6 +436,9 @@ pub fn fold_gap(p: &Preview, line: usize) -> Option<(u32, u32, u32)> {
 	let (old, new) = parse_hunk(p.line(line))?;
 	Some((old.checked_sub(r.fold)?, new.checked_sub(r.fold)?, r.fold))
 }
+
+/// `expand_folds` target for the trailing fold after the last hunk.
+pub const TRAILING_FOLD: usize = usize::MAX;
 
 /// Why a fold could not be expanded (an i18n status key).
 pub type ExpandError = &'static str;
@@ -488,6 +495,27 @@ pub fn expand_folds(
 		}
 	}
 	out.push_str(&p.text[at..]);
+	if d.trailing && only.is_none_or(|o| o == TRAILING_FOLD) {
+		// Everything after the last line the patch shows, on both sides.
+		let last = |f: fn(&InlineRow) -> Option<u32>| {
+			d.inline.iter().filter_map(f).max().unwrap_or(0)
+		};
+		let (old, new) = (last(|r| r.old) + 1, last(|r| r.new) + 1);
+		let count = (file.len() as u32 + 1).saturating_sub(new);
+		if count > 0 {
+			if !out.ends_with('\n') {
+				out.push('\n');
+			}
+			out.push_str(&format!("@@ -{old},{count} +{new},{count} @@\n"));
+			for l in &file[new as usize - 1..] {
+				out.push(' ');
+				out.push_str(l);
+				if !l.ends_with('\n') {
+					out.push_str("\n\\ No newline at end of file\n");
+				}
+			}
+		}
+	}
 	if out.len() > MAX_PREVIEW_BYTES
 		|| out.bytes().filter(|&b| b == b'\n').count() >= MAX_PREVIEW_LINES
 	{
@@ -749,11 +777,22 @@ impl DiffRows {
 			.flatten()
 			.max()
 			.unwrap_or(0);
+		let tail_context = inline
+			.iter()
+			.rev()
+			.take_while(|r| r.kind == RowKind::Context)
+			.count();
+		let trailing = has_hunk
+			&& tail_context >= 3
+			&& !lines.last().is_some_and(|r| {
+				text[r.start as usize..r.end as usize].starts_with('\\')
+			});
 		Self {
 			inline,
 			side,
 			shown,
 			max_num,
+			trailing,
 		}
 	}
 }
@@ -860,6 +899,8 @@ pub struct Reader {
 	/// Side by side: the old (left) pane was clicked last, so go-to-line
 	/// counts old line numbers.
 	pub left_pane: bool,
+	/// Side by side: the pane a selection belongs to (true = left).
+	pub sel_side: Option<bool>,
 	/// Code view bounds of the last frame (pane hit-testing).
 	pub view_bounds: Rc<Cell<Bounds<Pixels>>>,
 }
@@ -884,6 +925,7 @@ impl Default for Reader {
 			expanding: false,
 			fold_cancel: None,
 			left_pane: false,
+			sel_side: None,
 			view_bounds: Rc::default(),
 		}
 	}
@@ -940,7 +982,18 @@ impl Reader {
 /// Copy the original byte span, preserving line endings and unindexed text.
 /// A diff copies what is on screen instead: body lines without their
 /// markers, patch chrome and fold rows left out.
-pub fn selected_text(p: &Preview, (a, b): (Pos, Pos)) -> String {
+#[cfg(test)]
+pub fn selected_text(p: &Preview, sel: (Pos, Pos)) -> String {
+	selected_text_on(p, sel, None)
+}
+
+/// [`selected_text`] for one pane of the side-by-side viewer: `Some(true)`
+/// copies what the left (old) pane shows, `Some(false)` the right (new).
+pub fn selected_text_on(
+	p: &Preview,
+	(a, b): (Pos, Pos),
+	side: Option<bool>,
+) -> String {
 	let (a, b) = if a <= b { (a, b) } else { (b, a) };
 	if let Some(d) = p.diff.as_ref().filter(|_| p.has_hunks()) {
 		let raw = |line: usize| {
@@ -951,7 +1004,10 @@ pub fn selected_text(p: &Preview, (a, b): (Pos, Pos)) -> String {
 		let last = b.0.min(p.lines.len().saturating_sub(1));
 		let mut first = true;
 		for line in a.0..=last {
-			if line >= p.lines.len() || !d.inline[line].is_code() {
+			if line >= p.lines.len()
+				|| !d.inline[line].is_code()
+				|| !on_side(d.inline[line].kind, side)
+			{
 				continue;
 			}
 			let (start, end) = raw(line);
@@ -989,6 +1045,15 @@ pub fn selected_text(p: &Preview, (a, b): (Pos, Pos)) -> String {
 		byte
 	};
 	p.text[offset(a, false)..offset(b, true)].to_string()
+}
+
+/// Whether a diff line of `kind` is drawn in pane `side` (None: unified).
+pub fn on_side(kind: RowKind, side: Option<bool>) -> bool {
+	match side {
+		Some(true) => kind != RowKind::Added,
+		Some(false) => kind != RowKind::Removed,
+		None => true,
+	}
 }
 
 /// Splits `line` into disjoint styled runs: syntax color, find match and
@@ -1309,8 +1374,20 @@ impl WorkbenchModel {
 				.map_err(|key| crate::i18n::Msg::new(key, [])),
 			Err(e) => Err(crate::i18n::Msg::new("status_fold_failed", [e])),
 		};
+		let tail_done = only.is_none_or(|o| o == TRAILING_FOLD)
+			|| p.diff.as_ref().is_some_and(|d| !d.trailing);
 		let next = expanded.map(|text| {
-			Preview::new(p.source.clone(), p.path.clone(), text, true, p.lang)
+			let mut n = Preview::new(
+				p.source.clone(),
+				p.path.clone(),
+				text,
+				true,
+				p.lang,
+			);
+			if let Some(d) = n.diff.as_mut().filter(|_| tail_done) {
+				d.trailing = false;
+			}
+			n
 		});
 		let next = next.and_then(|n| {
 			crate::paste::lock_pending(&self.paste_pending.clone())
@@ -1361,6 +1438,7 @@ impl WorkbenchModel {
 		};
 		self.reader.anchor = None;
 		self.reader.head = None;
+		self.reader.sel_side = None;
 		app_log!("[APP:DIFF_MODE: {:?}]", self.reader.diff_mode);
 		cx.notify();
 	}
@@ -1405,6 +1483,9 @@ impl WorkbenchModel {
 					let text_row = p.is_text_row(line);
 					let (start, len) = (p.text_start(line), p.line(line).len());
 					self.reader_scroll_to(line);
+					self.reader.sel_side = (self.reader.diff_mode
+						== DiffMode::SideBySide)
+						.then_some(old);
 					self.reader.anchor = text_row.then_some((line, start));
 					self.reader.head = text_row.then_some((line, len));
 					app_log!(
@@ -1451,15 +1532,35 @@ impl WorkbenchModel {
 	fn hit_test(&self, pos: Point<Pixels>, window: &mut Window) -> Option<Pos> {
 		let p = self.preview.as_ref()?;
 		let geom = self.reader.row_geom.borrow();
-		let (line, b) = geom
+		// Side by side, only the selection's pane counts.
+		let center = {
+			let v = self.reader.view_bounds.get();
+			v.left() + v.size.width / 2.
+		};
+		let rows: Vec<(usize, Bounds<Pixels>)> = geom
+			.iter()
+			.copied()
+			.filter(|(_, b)| match self.reader.sel_side {
+				Some(left) => (b.left() < center) == left,
+				None => true,
+			})
+			.collect();
+		let (line, b) = rows
 			.iter()
 			.find(|(_, b)| pos.y >= b.top() && pos.y < b.bottom())
 			.copied()
 			.or_else(|| {
-				// Dragging past the visible rows clamps to the first/last.
-				let first = geom.iter().min_by_key(|(l, _)| *l).copied()?;
-				let last = geom.iter().max_by_key(|(l, _)| *l).copied()?;
-				Some(if pos.y < first.1.top() { first } else { last })
+				// Past the rows (or on a blank filler row): the nearest row
+				// above, or the first one when above them all.
+				rows.iter()
+					.filter(|(_, b)| b.top() <= pos.y)
+					.max_by(|x, y| {
+						x.1.top()
+							.partial_cmp(&y.1.top())
+							.unwrap_or(std::cmp::Ordering::Equal)
+					})
+					.or_else(|| rows.iter().min_by_key(|(l, _)| *l))
+					.copied()
 			})?;
 		// Pointer coordinates belong to the clipped text rendered in this row
 		// (after a hidden diff marker).
@@ -1492,10 +1593,15 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		window.focus(&self.reader_focus);
-		if self.reader.diff_mode == DiffMode::SideBySide {
+		let side = self.reader.diff_mode == DiffMode::SideBySide;
+		if side {
 			let b = self.reader.view_bounds.get();
 			self.reader.left_pane =
 				ev.position.x < b.left() + b.size.width / 2.;
+		}
+		let pane = side.then_some(self.reader.left_pane);
+		if !(ev.modifiers.shift && self.reader.sel_side == pane) {
+			self.reader.sel_side = pane;
 		}
 		let Some(pos) = self.hit_test(ev.position, window) else {
 			return;
@@ -1547,7 +1653,9 @@ impl WorkbenchModel {
 		}
 		self.reader.selecting = false;
 		if let (Some(p), Some(sel)) = (&self.preview, self.reader.selection()) {
-			let chars = selected_text(p, sel).chars().count();
+			let chars = selected_text_on(p, sel, self.reader.sel_side)
+				.chars()
+				.count();
 			app_log!(
 				"[APP:SELECTION: from={}:{} to={}:{} chars={}]",
 				sel.0 .0 + 1,
@@ -1569,7 +1677,7 @@ impl WorkbenchModel {
 		else {
 			return false;
 		};
-		let text = selected_text(p, sel);
+		let text = selected_text_on(p, sel, self.reader.sel_side);
 		let chars = text.chars().count();
 		match snip_core::clip::write_text(&text) {
 			Ok(()) => {
@@ -1590,6 +1698,9 @@ impl WorkbenchModel {
 
 	pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
 		if let Some(p) = &self.preview {
+			self.reader.sel_side = (self.reader.diff_mode
+				== DiffMode::SideBySide)
+				.then_some(self.reader.left_pane);
 			self.reader.anchor = Some((0, 0));
 			self.reader.head = Some((p.lines.len(), 0));
 			cx.notify();
@@ -1630,11 +1741,13 @@ impl WorkbenchModel {
 		let side = !paste
 			&& p.is_diff
 			&& self.reader.diff_mode == DiffMode::SideBySide;
-		let rows = if side {
+		let body_rows = if side {
 			p.diff.as_ref().map(|d| d.side.len()).unwrap_or(0)
 		} else {
 			p.inline_rows()
 		};
+		let tail = !paste && p.diff.as_ref().is_some_and(|d| d.trailing);
+		let rows = body_rows + usize::from(tail);
 		// Row (not line) index of the widest drawn line.
 		let widest = if side { 0 } else { p.inline_row_of(p.widest) };
 		let scroll = if paste {
@@ -1657,15 +1770,27 @@ impl WorkbenchModel {
 				let Some(p) = p else {
 					return Vec::new();
 				};
-				if side {
-					range.map(|ix| this.side_row(p, ix, cx)).collect::<Vec<_>>()
-				} else {
-					range
-						.map(|row| {
+				let num_w = gutter_num_w(p);
+				range
+					.map(|row| {
+						if row >= body_rows {
+							let indent = if side { 1. } else { 2. } * num_w;
+							this.fold_row(
+								("code-line-end", row),
+								TRAILING_FOLD,
+								t("diff_fold_end", this.locale).to_string(),
+								indent + GUTTER_GAP,
+								cx,
+							)
+							.w_full()
+							.into_any_element()
+						} else if side {
+							this.side_row(p, row, cx)
+						} else {
 							this.inline_row(p, p.inline_line(row), !paste, cx)
-						})
-						.collect::<Vec<_>>()
-				}
+						}
+					})
+					.collect::<Vec<_>>()
 			}),
 		)
 		.track_scroll(scroll)
@@ -1745,7 +1870,7 @@ impl WorkbenchModel {
 				.fold_row(
 					("code-line", ix),
 					ix,
-					r.fold,
+					tf("diff_fold", self.locale, &[r.fold]),
 					num_w * 2.0 + GUTTER_GAP,
 					cx,
 				)
@@ -1855,11 +1980,15 @@ impl WorkbenchModel {
 		&self,
 		id: (&'static str, usize),
 		line: usize,
-		count: u32,
+		label: String,
 		indent: f32,
 		cx: &mut Context<Self>,
 	) -> gpui::Stateful<gpui::Div> {
-		let probe_id = format!("diff-fold:{}", line + 1);
+		let probe_id = if line == TRAILING_FOLD {
+			"diff-fold:end".to_string()
+		} else {
+			format!("diff-fold:{}", line + 1)
+		};
 		div()
 			.id(id)
 			.relative()
@@ -1901,7 +2030,7 @@ impl WorkbenchModel {
 				.size_full(),
 			)
 			.child(crate::icons::icon(crate::icons::Icon::ExpandAll, 12.))
-			.child(tf("diff_fold", self.locale, &[count]))
+			.child(label)
 			.children(crate::ui::probe(&self.probes, probe_id))
 	}
 
@@ -1928,7 +2057,7 @@ impl WorkbenchModel {
 					.fold_row(
 						("side-line", ix),
 						line,
-						fold,
+						tf("diff_fold", self.locale, &[fold]),
 						num_w + GUTTER_GAP,
 						cx,
 					)
@@ -1976,16 +2105,43 @@ impl WorkbenchModel {
 					})
 					.collect();
 				let words = p.word_ranges(line);
+				let sel = (self.reader.sel_side == Some(left))
+					.then(|| {
+						self.reader.selected_in_line(line, off + text.len())
+					})
+					.flatten()
+					.map(|r| {
+						r.start.saturating_sub(off)..r.end.saturating_sub(off)
+					});
+				let geom = self.reader.row_geom.clone();
 				let code = div()
 					.flex_1()
 					.min_w_0()
 					.overflow_hidden()
 					.pl(px(if left { 8. } else { GUTTER_GAP }))
 					.child(
-						StyledText::new(SharedString::from(text.to_string()))
-							.with_highlights(line_highlights(
-								text, lang, &theme, &finds, None, &words,
-							)),
+						div()
+							.relative()
+							.child(
+								StyledText::new(SharedString::from(
+									text.to_string(),
+								))
+								.with_highlights(line_highlights(
+									text, lang, &theme, &finds, sel, &words,
+								)),
+							)
+							.child(
+								gpui::canvas(
+									move |b, _, _| {
+										geom.borrow_mut().push((line, b))
+									},
+									|_, _, _, _| {},
+								)
+								.absolute()
+								.top_0()
+								.left_0()
+								.size_full(),
+							),
 					);
 				let num = gutter_num(num_w, Some(n))
 					.when(tint.is_some(), |d| {
@@ -2450,6 +2606,64 @@ mod tests {
 			expand_folds(&far, &big, None),
 			Err("status_fold_too_large")
 		);
+	}
+
+	#[test]
+	fn trailing_fold_follows_full_context_and_expands_to_eof() {
+		// Full trailing context: the file may go on.
+		let diff = "@@ -2,4 +2,4 @@\n-a\n+A\n c\n d\n e\n";
+		let p = preview(diff, true);
+		assert!(p.diff.as_ref().unwrap().trailing);
+		// Short context, a "\\ No newline" end, a new file: it ends there.
+		for done in [
+			"@@ -2,2 +2,2 @@\n-a\n+A\n c\n",
+			"@@ -2,4 +2,4 @@\n-a\n+A\n c\n d\n e\n\\ No newline at end of file\n",
+			"@@ -0,0 +1,3 @@\n+a\n+b\n+c\n",
+		] {
+			assert!(!preview(done, true).diff.as_ref().unwrap().trailing, "{done}");
+		}
+		let file = "x\nA\nc\nd\ne\nf\ng";
+		// Expanding the tail only appends the rest, keeping the missing
+		// final newline as git would.
+		let out = expand_folds(&p, file, Some(TRAILING_FOLD)).unwrap();
+		assert_eq!(
+			out,
+			format!(
+				"{diff}@@ -6,2 +6,2 @@\n f\n g\n\\ No newline at end of file\n"
+			)
+		);
+		let q = preview(&out, true);
+		let qd = q.diff.as_ref().unwrap();
+		assert!(!qd.trailing);
+		let news: Vec<u32> =
+			qd.shown.iter().filter_map(|&l| qd.inline[l].new).collect();
+		assert_eq!(news, (2..=7).collect::<Vec<u32>>());
+		// Expanding one middle fold leaves the tail alone.
+		assert_eq!(
+			expand_folds(&p, file, Some(0))
+				.unwrap()
+				.matches("@@")
+				.count(),
+			4
+		);
+	}
+
+	#[test]
+	fn side_by_side_selection_copies_one_pane() {
+		let diff = "@@ -1,3 +1,3 @@\n ctx\n-old\n+new\n tail\n";
+		let p = preview(diff, true);
+		let all = ((0, 0), (p.lines.len(), 0));
+		assert_eq!(selected_text_on(&p, all, Some(true)), "ctx\nold\ntail");
+		assert_eq!(selected_text_on(&p, all, Some(false)), "ctx\nnew\ntail");
+		assert_eq!(selected_text_on(&p, all, None), "ctx\nold\nnew\ntail");
+		// A drag inside the right pane from "new" col 1 to "tail" col 3.
+		assert_eq!(
+			selected_text_on(&p, ((3, 2), (4, 3)), Some(false)),
+			"ew\nta"
+		);
+		assert!(on_side(RowKind::Context, Some(true)));
+		assert!(!on_side(RowKind::Added, Some(true)));
+		assert!(!on_side(RowKind::Removed, Some(false)));
 	}
 
 	#[test]

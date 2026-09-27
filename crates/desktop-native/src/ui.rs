@@ -3157,9 +3157,9 @@ impl WorkbenchModel {
 		let is_diff = self.preview.as_ref().is_some_and(|p| p.is_diff);
 		let side = self.reader.diff_mode == DiffMode::SideBySide;
 		let has_folds = self.preview.as_ref().is_some_and(|p| {
-			p.diff
-				.as_ref()
-				.is_some_and(|d| d.shown.iter().any(|&l| d.inline[l].fold > 0))
+			p.diff.as_ref().is_some_and(|d| {
+				d.trailing || d.shown.iter().any(|&l| d.inline[l].fold > 0)
+			})
 		});
 		let has_preview = self.can_copy_preview();
 		let preview_notice = self.preview.as_ref().and_then(|p| {
