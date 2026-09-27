@@ -1,5 +1,17 @@
 # Native workbench — supervisor checkpoint
 
+## 2026-09-27 Checkpoint: 歷史檔案選取與排乾失敗恢復（Linux checkpoint，非完整驗收）
+
+- **來源與分工**：基於 `4c38d79` 的本節隨附變更由 AGY 實作，Codex 審查並獨立跑完整驗證。凍結的程式碼 patch SHA256 為 `f52b3e9fa085b3cd656c4115652b356c97de8d6e94697a2037159e4ac02219e1`；完整 preflight 前後相同，之後只更新本批進度文件。未修改 vendor/gpui、contract fixture、DTO 或依賴。未推送、未開 PR、未發版。
+- **功能**：歷史檔案可用 checkbox／Space 加入共用選取籃，保存完整固定 OID；只瀏覽不選取，切面板／repo 保留歷史選取。同路徑不同來源保留身份，Copy 碰撞明確拒絕並保留原剪貼簿。
+- **修正**：歷史樹與專案樹使用不同取消 token；排乾失敗後清除載入狀態並作廢舊 worker，使新展開可重試。補上已關閉工作區貼上／排乾期間操作的提示，以及選取籃來源的雙語文字。新增的匯出同步點與碰撞原因 probe 僅在 E2E 開啟時生效；確認後的 Apply 仍不可取消。
+- **獨立驗證**：完整 `just preflight` exit 0，耗時約 4 分 38 秒，全部 GUI 使用 private X11。core 347 個執行期測試與 1 個 doctest、CLI 15、native 67 unit／6 smoke／15 lifecycle、Tauri 22/22 真 App 情境、harness 172，以及前端 format／typecheck／lint／test／build 通過。core 的標準 workload 測試另用 `--exact --ignored` 明確執行，1 passed；正常 preflight 仍忽略它、說明用 doctest 與 DTO 產生測試，未宣稱零忽略。
+- **回歸能力**：AGY 刻意移除排乾失敗的 worker 作廢步驟，恢復測試失敗；移除匯出最後的 freshness 驗證，stale-source 測試觀察到不應發生的 Copy 成功並失敗。還原後通過，Codex 核對 mutation 已完整還原。歷史選取 smoke 透過另一個 X11 行程讀真剪貼簿，避免測試行程自身 Arboard 的舊值，exact-byte oracle 保留。
+- **release 短測**：凍結 release binary SHA256 `c9afd75d9b80559a86182db8f58a9f22210af7fd9e27243aaede50793f5a2b77`。資源候選 runner 的 132 個單元測試與真 App 100 次切換短測通過，fd 19→19、threads 70→70、退出無 owned survivors；watch 數為 0，代表本次未建立 watcher，不能當 watcher 功能通過。該 runner 尚未整合，結果只有 `SUBGATE_ACCEPTED`，hide／tray 未覆蓋，D4 未評估。
+- **IME 新缺口**：目前 debug binary 的原腳本全部通過；上述 release binary 的原腳本連續兩次在拼音啟用前失敗（current IM 為空），失敗後再等 5 秒仍失敗。診斷用 wrapper 延後首次操作 5 秒可通過全部檢查，支持啟動時序問題，但尚未確認協定根因／修復。不得用延遲版結果替代原始 release IME 驗收，也不得把舊 debug 通過套用到 release。
+- **證據**：`/home/audichuang/research/snip-sync-handoff-20260927/session3/` 保存 `full-preflight/receipt.json`／log、`native-reviewed-pilot/` source／binary 收據、`resource-live-pilot/` raw samples 與 `ime-diagnostics/` 成敗對照；900×600 IME 縮放截圖已人工檢查。
+- **剩餘門檻**：D3 全項逐條收斂；雙機 × 各 15 repo 的 18 個真 UI cases（目前 driver 的 57 unit 通過不能替代，仍有 oracle／負向判定缺口）；64 MiB retained-data 與背景工作上限；同條件 native／Tauri release 的正式 10 次效能量測；完整資源／hide／tray／Wayland／accessibility；新增驗收入口與 CI。依使用者指示先完成 Linux，再跑真正 macOS runners 的 CI 建置／測試／候選封裝，最後由使用者安裝驗證 Mac runtime／IME；Windows runtime 也尚未驗證。
+
 ## 2026-09-27 Checkpoint: 第一批缺口補齊並併入 develop（未完工宣告）
 
 - **當前基準**：工作目錄 `/home/audichuang/research/snip-sync`，分支 `feature/lightweight-git-workbench-plan`，程式碼提交到 `c92598f`，`origin/develop`（`c05658e`）已是祖先。未修改 vendor/gpui、clipboard contract fixture、DTO 或依賴版本。未推送、未開 PR、未發版。

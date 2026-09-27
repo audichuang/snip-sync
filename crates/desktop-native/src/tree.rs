@@ -560,6 +560,19 @@ impl FileTreeNode {
 		self.find(key).is_some_and(|node| node.is_dir)
 	}
 
+	pub fn clear_loading(&mut self) {
+		if self.loading {
+			self.loading = false;
+			self.load_epoch = self.load_epoch.wrapping_add(1);
+		}
+		if !self.is_loaded {
+			self.is_expanded = false;
+		}
+		for child in &mut self.children {
+			child.clear_loading();
+		}
+	}
+
 	pub fn retained_bytes(&self) -> usize {
 		let mut total = std::mem::size_of::<Self>();
 		total = total.saturating_add(self.name.capacity());
@@ -635,6 +648,9 @@ impl FileTreeNode {
 			}
 			node.loading = false;
 			if result.cancelled {
+				if !node.is_loaded {
+					node.is_expanded = false;
+				}
 				node.scan = result.scan.take();
 				node.held = result.held.take();
 				node.has_more = node.scan.is_some() || node.held.is_some();

@@ -2,6 +2,12 @@
 
 # 原生 Git 工作台驗證進度
 
+## 2026-09-27 進度檢查點：歷史檔案選取與排乾失敗恢復
+
+AGY 的固定 OID 歷史選取、樹狀工作取消隔離與排乾失敗恢復已由 Codex 審查；完整 `just preflight` 獨立通過（native 67 unit／6 smoke／15 lifecycle，Tauri 22/22）。標準 workload discovery 另明確執行通過。詳見 [最新監督 checkpoint](native-workbench-supervision.md)。
+
+100 次切換資源短測通過，但完整 D4、hide／tray、正式效能與雙機 18 cases 尚未通過。原 IME 腳本在 debug 通過，在 release 啟動時失敗；只有診斷用延後首次操作的 release 跑法通過，尚不能宣稱 release IME 修好。尚未推送或跑 CI；先完成 Linux，再由 macOS CI 產生候選包供使用者安裝實測。
+
 ## 2026-09-27 進度檢查點：第一批缺口補齊並併入 develop（產品尚未完工）
 
 - **當前基準**：`feature/lightweight-git-workbench-plan`，程式碼提交到 `c92598f`。`origin/develop`（`c05658e`）已是祖先；合併後的檔案樹與合併前相同。未推送、未開 PR、未發版。

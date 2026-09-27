@@ -1133,6 +1133,7 @@ impl WorkbenchModel {
 			return;
 		};
 		self.tree_generation += 1;
+		let _ = arm_cancel(&mut self.rev_tree_cancel);
 		self.rev_tree = Some(RevTree::new(sha.clone()));
 		self.tree_cursor = 0;
 		self.active_tab = WorkbenchTab::FileExplorer;
@@ -1144,6 +1145,7 @@ impl WorkbenchModel {
 
 	pub fn leave_rev_tree(&mut self, cx: &mut Context<Self>) {
 		self.tree_generation += 1;
+		let _ = arm_cancel(&mut self.rev_tree_cancel);
 		self.rev_tree = None;
 		self.tree_cursor = 0;
 		app_log!("[APP:REV_TREE: off]");
@@ -1161,7 +1163,7 @@ impl WorkbenchModel {
 		};
 		let sha = tree.sha.clone();
 		let gen = self.tree_generation;
-		let cancel = arm_cancel(&mut self.tree_cancel);
+		let cancel = arm_cancel(&mut self.rev_tree_cancel);
 		let cancel_bg = cancel.clone();
 
 		let mut async_app = cx.to_async();

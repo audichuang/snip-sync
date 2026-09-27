@@ -403,6 +403,13 @@ impl PastePreviewPlan {
 		) {
 			Ok(plan) => plan,
 			Err(e) => {
+				if crate::e2e_on() {
+					if let TransferError::TargetCollision { .. } = &e {
+						app_log!(
+							"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
+						);
+					}
+				}
 				self.error = Some(Msg::new("paste_err_plan", [e.to_string()]));
 				return Ok(());
 			}

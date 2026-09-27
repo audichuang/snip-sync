@@ -1,10 +1,17 @@
 # Native workbench 接手待辦清單 — 2026-09-27
 
-目前由使用者接手執行；Codex 停止新增派工。本輪四個 AGY 工作均已結束，沒有本輪仍在執行的 AGY 任務。以下將已驗證結果、已找到的缺口、以及仍需驗收的既定產品範圍分開；「待驗收」不表示該功能完全沒有實作。
+目前由 Codex 指揮與獨立驗證、AGY 實作。最新進度見第 0 節與監督紀錄；下方保留原接手基準以供追溯，「待驗收」不表示該功能完全沒有實作。
 
 > 🧠 **From Hindsight memory (Initiatives and enhancements)** — 既定交付範圍仍包含 D0–D5、15 repo、多機雙向剪貼簿同步、記憶體與真實 UI 驗收；UI 或局部測試通過不等於可以發版。以下當前狀態以 2026-09-27 的工作樹、程式碼與測試紀錄為準。
 
-## 0. 接手結果（2026-09-27，第一批）
+## 0. 最新接續結果（2026-09-27，第三段）
+
+第 6 項已完成本批功能與真 UI 驗證；另補樹狀取消隔離、排乾失敗恢復與過期匯出的回歸驗收。Codex 獨立完整 `just preflight` 通過：native 67 unit／6 smoke／15 lifecycle、Tauri 22/22、harness 172；標準 workload discovery 另明確執行通過。證據位於 `/home/audichuang/research/snip-sync-handoff-20260927/session3/`，細節見 [監督紀錄](native-workbench-supervision.md)。
+
+第 7–12 項及第 13 項其餘門檻仍未完成。資源 runner 的 100 次切換短測通過但尚未整合，不等於完整 D4；協作 runner 尚有判定缺口，未跑完 18 cases；正式可比效能量測尚未完成。新增 release IME 啟動時序問題：debug 原驗收通過，release 原驗收失敗，診斷用延遲啟動通過不構成修復。依使用者指示先完成 Linux，再跑 macOS CI，候選包由使用者安裝實測。未推送、未開 PR、未發版。
+
+### 第一批歷史結果
+
 
 第 1–5 項與第 13 項的 lifecycle 部分已完成並提交；其餘項目未動。程式碼提交到 `c92598f`，完整 `just preflight` 在該提交 exit 0。未推送、未開 PR。
 
@@ -22,7 +29,7 @@
 
 測試數字與尚未驗證的部分見 [監督紀錄](native-workbench-supervision.md) 最上方的 checkpoint。測試記錄在 `/home/audichuang/research/snip-sync-handoff-20260927/logs/`。
 
-## 1. 接手基準與已完成事項
+## 1. 原接手基準與已完成事項（歷史快照）
 
 - 主工作目錄：`/home/audichuang/research/snip-sync`
 - 分支：`feature/lightweight-git-workbench-plan`
@@ -111,9 +118,9 @@ Patch 已包含 review 發現的最後取消檢查：payload clone 後、revalid
 
 ## 3. 第二批：完整功能與雙機驗收
 
-### [ ] 6. 補 fixed-OID 歷史檔案加入共用 selection basket
+### [x] 6. 補 fixed-OID 歷史檔案加入共用 selection basket
 
-目前欠缺歷史檔案加入 basket 的完整 UI 操作與驗收。Basket 保存 root／source／revision／path，revision 固定 OID，不預存所有內容。操作不 checkout；同檔 staged／working／歷史來源不得混淆。
+本批已加入 checkbox／Space 操作並通過真 UI exact-byte 驗證。Basket 保存 root／source／revision／path，revision 固定 OID，不預存所有內容。操作不 checkout；同檔 staged／working／歷史來源不得混淆。
 
 驗收 non-HEAD／unmerged branch 檔案 exact bytes、多 repo、同路徑不同來源的明確處理、切面板保留選取。Commit replay 仍只接受同 repo、連續 first-parent 範圍；歷史 file 選取與可 replay commit 範圍分開。
 
@@ -192,14 +199,14 @@ Patch 已包含 review 發現的最後取消檢查：payload clone 後、revalid
 - 檢查 Linux／Windows tray／hide 是否真正實作；驗證 hidden idle 與 reopen，不能只存在按鈕。
 - 真正的 accessibility labels／keyboard navigation／scaling 驗收。
 - Linux Wayland、macOS、Windows 分別實測 IME、clipboard、rendering、focus、lifecycle、package 安裝／啟動。
-- Linux X11 IME 已通過；保留 GPUI patch 與 `vendor/gpui/SNIP_PATCH.md`，cross-compile 通過不代表其他平台 runtime 通過。
+- Linux X11 IME 的 debug 原驗收已通過；本批 release 原驗收啟動失敗，待釐清／修復。保留 GPUI patch 與 `vendor/gpui/SNIP_PATCH.md`，延遲操作的診斷跑法或 cross-compile 通過都不能代替所需 runtime 驗收。
 - 本輪 IME 截圖仍可人工確認；重跑腳本需使用新的輸出目錄，預設固定 `/tmp/snip-native-ime-fix-20260926` 會刪除舊證據。
 
 ## 5. 第四批：把驗收變成 gate，整理與交付
 
 ### [ ] 13. 修正 preflight／CI 漏跑 lifecycle tests（lifecycle 部分已完成，其餘未動）
 
-**目前已確認：** `just preflight` 依賴 `preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke`；Rust recipe 對 native 只跑 `--bin`，native-smoke 只跑 `--test smoke`。`.github/workflows/ci.yml` 也如此。因此新增的 `tests/lifecycle.rs` 目前不會被這些 required gates 自動跑到。
+**已完成部分：** `just preflight` 與 `.github/workflows/ci.yml` 已包含 `native-lifecycle`。本批完整 preflight 實際執行 15 個 lifecycle tests；以下 IME／協作／資源與標準 workload gate 仍待完成。
 
 - 把 Linux lifecycle tests 納入 preflight 與 CI required gate，沿用 headless X11 的既有環境。
 - 為已要求的 IME／collaboration／resource acceptance 配置明確可執行入口與適當平台 gate，保存 artifacts。

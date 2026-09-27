@@ -82,6 +82,16 @@ pub fn e2e_tree_hold() -> Option<std::path::PathBuf> {
 		.map(std::path::PathBuf::from)
 }
 
+/// E2E only: holds copy export between plan_export_with and revalidate_with.
+pub fn e2e_export_hold() -> Option<std::path::PathBuf> {
+	if !crate::e2e_on() {
+		return None;
+	}
+	std::env::var_os("SNIP_NATIVE_E2E_EXPORT_HOLD_FILE")
+		.filter(|v| !v.is_empty())
+		.map(std::path::PathBuf::from)
+}
+
 /// Control bounds of the last two frames only, so the bookkeeping is
 /// bounded by what is on screen, never by what was ever shown.
 #[derive(Default)]
@@ -721,7 +731,16 @@ impl WorkbenchModel {
 					ProjRow::Rev(r) if r.marker.is_none() => {
 						let dir = r.kind == snip_core::browser::TreeKind::Tree;
 						let path = r.path.clone();
-						if (dir
+						if action == "toggle" {
+							if r.kind == snip_core::browser::TreeKind::Blob {
+								if let Some(tree) = &self.rev_tree {
+									let sha = tree.sha.clone();
+									self.toggle_rev_file_selection(
+										&sha, &path, cx,
+									);
+								}
+							}
+						} else if (dir
 							&& ((expand && !r.expanded)
 								|| (collapse && r.expanded)))
 							|| action == "open"
@@ -2009,10 +2028,19 @@ impl WorkbenchModel {
 		}
 		let is_dir = row.kind == snip_core::browser::TreeKind::Tree;
 		let submodule = row.kind == snip_core::browser::TreeKind::Submodule;
+		let is_file = row.kind == snip_core::browser::TreeKind::Blob;
 		let path = row.path.clone();
 		let selected = self.selected_commit_file.as_deref() == Some(&path)
 			&& self.rev_tree.is_some();
+		let tree_sha = self
+			.rev_tree
+			.as_ref()
+			.map(|t| t.sha.clone())
+			.unwrap_or_default();
+		let is_basket_selected =
+			is_file && self.is_rev_file_selected(&tree_sha, &path);
 		let id = format!("rev-row:{path}");
+		let chk_id = format!("rev-chk:{}:{}", tree_sha, path);
 		div()
 			.id(SharedString::from(id.clone()))
 			.relative()
@@ -2031,9 +2059,10 @@ impl WorkbenchModel {
 				d.border_1().border_color(rgb(FOCUS_RING))
 			})
 			.when(!submodule, |d| {
+				let row_path = path.clone();
 				d.on_click(cx.listener(move |this, _, _, cx| {
 					this.tree_cursor = ix;
-					this.rev_tree_click(&path, is_dir, cx);
+					this.rev_tree_click(&row_path, is_dir, cx);
 				}))
 			})
 			.child(if is_dir {
@@ -2049,6 +2078,30 @@ impl WorkbenchModel {
 				.into_any_element()
 			} else {
 				div().flex_shrink_0().w(px(10.)).into_any_element()
+			})
+			.child(if is_file {
+				div()
+					.id(SharedString::from(chk_id.clone()))
+					.relative()
+					.flex_shrink_0()
+					.size(px(18.))
+					.flex()
+					.items_center()
+					.justify_center()
+					.cursor_pointer()
+					.on_click(cx.listener({
+						let chk_path = path.clone();
+						let sha = tree_sha.clone();
+						move |this, _, _, cx| {
+							cx.stop_propagation();
+							this.toggle_rev_file_selection(&sha, &chk_path, cx);
+						}
+					}))
+					.child(checkbox(is_basket_selected))
+					.children(probe(log, chk_id))
+					.into_any_element()
+			} else {
+				div().flex_shrink_0().size(px(18.)).into_any_element()
 			})
 			.child(icon(
 				if is_dir {
@@ -3450,7 +3503,8 @@ impl WorkbenchModel {
 					.border_b_1()
 					.border_color(rgb(DIVIDER))
 					.children(mappings)
-					.children(rows),
+					.children(rows)
+					.children(probe(log, "paste-items")),
 			)
 			.when(selected.is_some(), |d| {
 				d.child(
@@ -4277,7 +4331,7 @@ impl WorkbenchModel {
 		let errors = self.repos.iter().filter(|r| r.summary.is_err()).count();
 		let count_s = self.basket_count().to_string();
 		let basket_n = count_s.clone();
-		let basket_detail = self.basket_summary();
+		let basket_detail = self.basket_summary_localized(loc);
 		let basket_label = if let Some(collision) = self.basket_collision_text()
 		{
 			tf("basket_collision", loc, &[&collision])

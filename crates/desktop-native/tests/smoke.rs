@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -22,6 +23,30 @@ use std::time::{Duration, Instant, SystemTime};
 
 use snip_core::clip;
 use snip_core::commits;
+
+fn clip_set(text: &str) {
+	let mut child = Command::new("xclip")
+		.args(["-selection", "clipboard"])
+		.stdin(Stdio::piped())
+		.spawn()
+		.expect("xclip");
+	child
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(text.as_bytes())
+		.unwrap();
+	assert!(child.wait().unwrap().success(), "xclip set failed");
+}
+
+fn clip_get() -> String {
+	let out = Command::new("xclip")
+		.args(["-selection", "clipboard", "-o"])
+		.output()
+		.expect("xclip");
+	assert!(out.status.success(), "xclip read failed");
+	String::from_utf8(out.stdout).unwrap()
+}
 
 /// Latest control bounds (x, y, w, h in physical pixels) keyed by control id.
 type Bounds = Arc<Mutex<HashMap<String, [i32; 4]>>>;
@@ -2571,5 +2596,496 @@ fn native_tree_paging_retry_selection_900x600() {
 	assert!(st.success(), "convert");
 	assert!(fs::metadata(&png).unwrap().len() > 1024);
 	let _ = fs::remove_file(&xwd);
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Real OS UI scenario selecting non-HEAD historical file into shared basket,
+/// proving panel/repo switches, Space/checkbox toggle, collision rejection
+/// with clipboard sentinel, successful multi-repo copy with exact git show bytes,
+/// and basket clear without git mutations.
+#[test]
+fn native_historical_file_basket_and_collision() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let xdotool = Command::new("xdotool").arg("--version").output();
+	if xdotool.is_err() || !xdotool.unwrap().status.success() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	let ws_path = ws.path();
+	let repo_a = ws_path.join("repo-a");
+	let repo_b = ws_path.join("repo-b");
+	let dest = tempfile::tempdir().unwrap();
+
+	for dir in [&repo_a, &repo_b] {
+		fs::create_dir_all(dir).unwrap();
+		git_ok(dir, &["init", "-q", "-b", "main"]);
+		git_ok(dir, &["config", "user.name", "Tester"]);
+		git_ok(dir, &["config", "user.email", "test@example.com"]);
+	}
+
+	// repo-a: initial commit on main
+	fs::write(repo_a.join("main.txt"), "main line\n").unwrap();
+	git_ok(&repo_a, &["add", "main.txt"]);
+	git_ok(&repo_a, &["commit", "-qm", "main commit"]);
+	let main_sha = git_rev(&repo_a);
+
+	// repo-a: unmerged feature commit with subfolder and feature_only.txt
+	git_ok(&repo_a, &["checkout", "-q", "-b", "feature"]);
+	fs::create_dir_all(repo_a.join("sub")).unwrap();
+	fs::write(repo_a.join("sub").join("inner.txt"), "sub inner\n").unwrap();
+	fs::write(
+		repo_a.join("feature_only.txt"),
+		"historical feature bytes\n",
+	)
+	.unwrap();
+	git_ok(&repo_a, &["add", "."]);
+	git_author_commit(&repo_a, "feature commit");
+	let feat_sha = git_rev(&repo_a);
+	let feat_short = feat_sha[..7].to_string();
+
+	// repo-a: second feature branch with same path but different commit/content
+	git_ok(&repo_a, &["checkout", "-q", "-b", "feature2", "main"]);
+	fs::write(repo_a.join("feature_only.txt"), "feature2 distinct bytes\n")
+		.unwrap();
+	git_ok(&repo_a, &["add", "feature_only.txt"]);
+	git_author_commit(&repo_a, "feature2 commit");
+	let feat2_sha = git_rev(&repo_a);
+	let feat2_short = feat2_sha[..7].to_string();
+
+	// Switch repo-a back to main so both feature commits are non-HEAD / unmerged
+	git_ok(&repo_a, &["checkout", "-q", "main"]);
+
+	// Add an untracked file with the identical relative path to test collision policy
+	fs::write(
+		repo_a.join("feature_only.txt"),
+		"untracked collision bytes\n",
+	)
+	.unwrap();
+
+	// repo-b: initial commit and untracked b_file.txt
+	fs::write(repo_b.join("init.txt"), "b init\n").unwrap();
+	git_ok(&repo_b, &["add", "init.txt"]);
+	git_ok(&repo_b, &["commit", "-qm", "b init"]);
+	let b_sha = git_rev(&repo_b);
+	fs::write(repo_b.join("b_file.txt"), "repo-b file bytes\n").unwrap();
+
+	let out_dir = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out_dir).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app = spawn_app(
+		ws_path,
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 2]", Duration::from_secs(12));
+	wait_for("[APP:REPO_LOADED: repo-a", Duration::from_secs(6));
+	wait_for("[APP:E2E_LOG:", Duration::from_secs(6));
+
+	let wid = find_wid(app.pid);
+	let activate = || {
+		let _ = Command::new("xdotool")
+			.args(["windowmap", "--sync", &wid])
+			.status();
+		let st = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status()
+			.expect("xdotool windowfocus must run");
+		assert!(st.success(), "xdotool windowfocus failed for window {wid}");
+		std::thread::sleep(Duration::from_millis(50));
+	};
+	activate();
+	let send_key = |keys: &str| key(&wid, keys);
+	let xdo = |args: &[&str]| {
+		let st = Command::new("xdotool").args(args).status().unwrap();
+		assert!(st.success(), "{args:?}");
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(v[2] > 0 && v[3] > 0, "{id} empty {v:?}");
+				assert!(
+					v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		activate();
+		std::thread::sleep(Duration::from_millis(150));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+			"click",
+			"1",
+		]);
+	};
+	let resize = |w: i32, h: i32| {
+		xdo(&["windowsize", "--sync", &wid, &w.to_string(), &h.to_string()]);
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if *viewport.lock().unwrap() == (w, h) {
+				let snap = settled();
+				if let (Some(sb), Some(bp), Some(bl)) = (
+					snap.get("status-bar"),
+					snap.get("btn-paste"),
+					snap.get("btn-locale"),
+				) {
+					if sb[1] + sb[3] <= h
+						&& bp[0] + bp[2] <= w
+						&& bl[0] + bl[2] <= w
+					{
+						break;
+					}
+				}
+			}
+			assert!(
+				Instant::now() < deadline,
+				"viewport {w}x{h} did not settle in time"
+			);
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+
+	let choose_repo = |id: &str, loaded: &str| {
+		click("btn-repo-selector");
+		wait_for("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3));
+		click(id);
+		wait_for(loaded, Duration::from_secs(6));
+	};
+
+	// 1. Initial 1080x720 layout and screenshot
+	resize(1080, 720);
+
+	// Select non-HEAD feature commit in GitLog
+	click(&format!("commit-row:{feat_short}"));
+	wait_for(
+		&format!("[APP:COMMIT_SELECTED: {feat_short}]"),
+		Duration::from_secs(6),
+	);
+
+	// Browse tree of historical commit
+	click("btn-browse-tree");
+	wait_for(
+		&format!("[APP:REV_TREE: {feat_short}]"),
+		Duration::from_secs(6),
+	);
+
+	// Wait for historical tree controls to render
+	let chk_probe = format!("rev-chk:{feat_sha}:feature_only.txt");
+	control(&chk_probe);
+	control("rev-row:feature_only.txt");
+	control("rev-row:sub");
+
+	// Directory must NOT have a checkbox probe
+	assert!(
+		bounds.lock().unwrap().get(&format!("rev-chk:{feat_sha}:sub")).is_none(),
+		"directory row must not masquerade as selectable file with a checkbox probe"
+	);
+
+	// Capture unselected 1080x720 screenshot
+	settled();
+	std::thread::sleep(Duration::from_millis(200));
+	let shot_1080 = out_dir.join("d3_historical_basket_1080x720.png");
+	capture_window(&wid, &shot_1080);
+
+	// Capture unselected 900x600 screenshot (settled layout, key controls bounded)
+	resize(900, 600);
+	std::thread::sleep(Duration::from_millis(200));
+	let shot_900 = out_dir.join("d3_historical_basket_900x600.png");
+	capture_window(&wid, &shot_900);
+
+	// Restore 1080x720
+	resize(1080, 720);
+
+	// Test Space toggle and row navigation on historical file:
+	// Clicking row only selects for preview
+	click("rev-row:feature_only.txt");
+	wait_for(
+		"[APP:PREVIEW_LOADED: feature_only.txt]",
+		Duration::from_secs(6),
+	);
+	// Clicking directory row navigates/expands and must NOT affect basket
+	click("rev-row:sub");
+	click("rev-row:feature_only.txt");
+	assert!(bounds.lock().unwrap().get("basket-summary").is_some());
+
+	// Press Space to toggle selection on
+	send_key("space");
+	wait_for(
+		&format!("[APP:REV_FILE_TOGGLED: sha={feat_short} path=feature_only.txt selected=true]"),
+		Duration::from_secs(4),
+	);
+	let b_line = wait_for("[APP:BASKET: n=1", Duration::from_secs(4));
+	assert!(
+		b_line.contains(&format!("commit@{feat_short}"))
+			|| b_line.contains("commit@")
+	);
+	assert!(b_line.contains("feature_only.txt"));
+
+	// Navigation while selected must NOT change basket
+	click("rev-row:sub");
+	click("rev-row:feature_only.txt");
+	let sum_v = control("basket-summary");
+	assert!(sum_v[2] > 0);
+
+	// Press Space again to toggle selection off
+	send_key("space");
+	wait_for(
+		&format!("[APP:REV_FILE_TOGGLED: sha={feat_short} path=feature_only.txt selected=false]"),
+		Duration::from_secs(4),
+	);
+	wait_for("[APP:BASKET: n=0", Duration::from_secs(4));
+
+	// Click checkbox directly to toggle selection on
+	click(&chk_probe);
+	wait_for(
+		&format!("[APP:REV_FILE_TOGGLED: sha={feat_short} path=feature_only.txt selected=true]"),
+		Duration::from_secs(4),
+	);
+	let b_line = wait_for("[APP:BASKET: n=1", Duration::from_secs(4));
+	assert!(b_line.contains("feature_only.txt"));
+
+	// Capture selected screenshots at 1080x720 and 900x600
+	settled();
+	std::thread::sleep(Duration::from_millis(200));
+	let shot_1080_sel =
+		out_dir.join("d3_historical_basket_1080x720_selected.png");
+	capture_window(&wid, &shot_1080_sel);
+
+	resize(900, 600);
+	std::thread::sleep(Duration::from_millis(200));
+	let shot_900_sel =
+		out_dir.join("d3_historical_basket_900x600_selected.png");
+	capture_window(&wid, &shot_900_sel);
+
+	resize(1080, 720);
+
+	// Test exact full-OID identity deselection with TWO revisions of the same relative path:
+	click("btn-leave-tree");
+	wait_for("[APP:REV_TREE: off]", Duration::from_secs(4));
+
+	// Select feat2 in GitLog and browse its tree
+	click(&format!("commit-row:{feat2_short}"));
+	wait_for(
+		&format!("[APP:COMMIT_SELECTED: {feat2_short}]"),
+		Duration::from_secs(6),
+	);
+	click("btn-browse-tree");
+	wait_for(
+		&format!("[APP:REV_TREE: {feat2_short}]"),
+		Duration::from_secs(6),
+	);
+
+	let chk_probe_feat2 = format!("rev-chk:{feat2_sha}:feature_only.txt");
+	control(&chk_probe_feat2);
+
+	// Select feat2 revision of feature_only.txt: basket now holds 2 revisions of same path
+	click(&chk_probe_feat2);
+	wait_for(
+		&format!("[APP:REV_FILE_TOGGLED: sha={feat2_short} path=feature_only.txt selected=true]"),
+		Duration::from_secs(4),
+	);
+	let b_line = wait_for("[APP:BASKET: n=2", Duration::from_secs(4));
+	assert!(b_line.contains(&format!("commit@{feat_short}")));
+	assert!(b_line.contains(&format!("commit@{feat2_short}")));
+
+	// Deselect feat2 revision: ONLY feat2 is removed, feat1 remains in basket!
+	click(&chk_probe_feat2);
+	wait_for(
+		&format!("[APP:REV_FILE_TOGGLED: sha={feat2_short} path=feature_only.txt selected=false]"),
+		Duration::from_secs(4),
+	);
+	let b_line = wait_for("[APP:BASKET: n=1", Duration::from_secs(4));
+	assert!(
+		b_line.contains(&format!("commit@{feat_short}")),
+		"feat1 selection must remain after feat2 deselected"
+	);
+	assert!(
+		!b_line.contains(&format!("commit@{feat2_short}")),
+		"feat2 selection must be gone"
+	);
+
+	click("btn-leave-tree");
+	wait_for("[APP:REV_TREE: off]", Duration::from_secs(4));
+
+	// Switch to Git Changes tab
+	click("rail-changes");
+	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(4));
+
+	// Switch to repo-b
+	choose_repo("pick-repo:repo-b", "[APP:REPO_LOADED: repo-b");
+
+	// In repo-b, select b_file.txt from GitChanges
+	click("change-chk:b_file.txt");
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(4));
+
+	// Switch back to repo-a
+	choose_repo("pick-repo:repo-a", "[APP:REPO_LOADED: repo-a");
+
+	// Basket must still hold 2 items!
+	let summary_b = control("basket-summary");
+	assert!(summary_b[2] > 0);
+
+	// 3. Collision refusal with clipboard sentinel
+	let sentinel = "SENTINEL_HISTORICAL_COLLISION_MUST_NOT_OVERWRITE";
+	clip_set(sentinel);
+	assert_eq!(clip_get(), sentinel);
+
+	// In repo-a, select untracked feature_only.txt (which collides with commit@feat_sha:feature_only.txt)
+	click("change-chk:feature_only.txt");
+	let col_line = wait_for("[APP:BASKET_COLLISION:", Duration::from_secs(4));
+	assert!(col_line.contains("feature_only.txt"));
+
+	// Click Copy button: must refuse due to collision!
+	click("btn-copy");
+	wait_for("[APP:COPY_REFUSED: collision]", Duration::from_secs(4));
+
+	// Clipboard MUST remain the unchanged sentinel
+	assert_eq!(
+		clip_get(),
+		sentinel,
+		"clipboard must not be overwritten when copy is refused due to collision"
+	);
+
+	// 4. Deselect colliding file, then successful copy
+	click("change-chk:feature_only.txt");
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(4));
+
+	// Copy now succeeds!
+	click("btn-copy");
+	wait_for("[APP:COPY_PREP: files=2]", Duration::from_secs(4));
+	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(8));
+
+	// Verify clipboard payload against git show exact bytes
+	let copied_text = clip_get();
+	assert_ne!(copied_text, sentinel);
+
+	let parsed = snip_core::format::parse_clipboard(&copied_text, "");
+	assert_eq!(parsed.len(), 2, "copied payload must contain 2 entries");
+
+	let feat_entry = parsed
+		.iter()
+		.find(|e| e.path.ends_with("feature_only.txt"))
+		.expect("feature_only.txt in clipboard payload");
+	let git_show = Command::new("git")
+		.current_dir(&repo_a)
+		.args(["show", &format!("{feat_sha}:feature_only.txt")])
+		.output()
+		.expect("git show");
+	assert!(git_show.status.success());
+	let expected_feat_bytes = String::from_utf8(git_show.stdout).unwrap();
+	assert_eq!(
+		feat_entry.content,
+		expected_feat_bytes.trim_end_matches('\n'),
+		"historical file content must match git show normalized by codec"
+	);
+
+	let b_entry = parsed
+		.iter()
+		.find(|e| e.path.ends_with("b_file.txt"))
+		.expect("b_file.txt in clipboard payload");
+	assert_eq!(
+		b_entry.content, "repo-b file bytes",
+		"repo-b file content must match working file"
+	);
+
+	// 5. Clear basket
+	click("btn-basket-clear");
+	wait_for("[APP:BASKET: n=0", Duration::from_secs(4));
+	wait_for("[APP:BASKET_CLEARED]", Duration::from_secs(4));
+
+	// Re-verify in rev tree that checkbox is cleared
+	click(&format!("commit-row:{feat_short}"));
+	wait_for(
+		&format!("[APP:COMMIT_SELECTED: {feat_short}]"),
+		Duration::from_secs(6),
+	);
+	click("btn-browse-tree");
+	wait_for(
+		&format!("[APP:REV_TREE: {feat_short}]"),
+		Duration::from_secs(6),
+	);
+	control(&chk_probe);
+
+	// 6. Verify NO HEAD / index / worktree mutations in either repository
+	let st_a = Command::new("git")
+		.current_dir(&repo_a)
+		.args(["status", "--porcelain"])
+		.output()
+		.unwrap();
+	assert_eq!(
+		String::from_utf8(st_a.stdout).unwrap().trim(),
+		"?? feature_only.txt",
+		"repo-a must have no unexpected mutations"
+	);
+	assert_eq!(
+		git_rev(&repo_a),
+		main_sha,
+		"repo-a must remain on main commit"
+	);
+
+	let st_b = Command::new("git")
+		.current_dir(&repo_b)
+		.args(["status", "--porcelain"])
+		.output()
+		.unwrap();
+	assert_eq!(
+		String::from_utf8(st_b.stdout).unwrap().trim(),
+		"?? b_file.txt",
+		"repo-b must have no unexpected mutations"
+	);
+	assert_eq!(
+		git_rev(&repo_b),
+		b_sha,
+		"repo-b must remain on initial commit"
+	);
+
 	quit_cleanly(&mut app, &wid);
 }

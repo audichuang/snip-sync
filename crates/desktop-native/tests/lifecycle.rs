@@ -238,6 +238,7 @@ struct SpawnOpts<'a> {
 	hold_file: Option<&'a Path>,
 	path_prefix: Option<&'a Path>,
 	tree_hold: Option<&'a Path>,
+	export_hold: Option<&'a Path>,
 }
 
 fn spawn_app(opts: SpawnOpts) -> App {
@@ -255,7 +256,8 @@ fn spawn_app(opts: SpawnOpts) -> App {
 	.env_remove("SNIP_E2E_GIT_HOLD_FILE")
 	.env_remove("SNIP_NATIVE_E2E_READ_DELAY_MS")
 	.env_remove("SNIP_NATIVE_E2E_APPLY_DELAY_MS")
-	.env_remove("SNIP_NATIVE_E2E_TREE_HOLD_FILE");
+	.env_remove("SNIP_NATIVE_E2E_TREE_HOLD_FILE")
+	.env_remove("SNIP_NATIVE_E2E_EXPORT_HOLD_FILE");
 	if let Some(ms) = opts.read_delay_ms {
 		cmd.env("SNIP_NATIVE_E2E_READ_DELAY_MS", ms.to_string());
 	}
@@ -267,6 +269,9 @@ fn spawn_app(opts: SpawnOpts) -> App {
 	}
 	if let Some(hold) = opts.tree_hold {
 		cmd.env("SNIP_NATIVE_E2E_TREE_HOLD_FILE", hold);
+	}
+	if let Some(hold) = opts.export_hold {
+		cmd.env("SNIP_NATIVE_E2E_EXPORT_HOLD_FILE", hold);
 	}
 	if let Some(prefix) = opts.path_prefix {
 		let old = std::env::var_os("PATH").unwrap_or_default();
@@ -568,6 +573,7 @@ fn close_reopen_same_pid_discards_stale_preview_and_keeps_clipboard() {
 		hold_file: None,
 		path_prefix: None,
 		tree_hold: None,
+		export_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(12));
@@ -768,6 +774,7 @@ fn quit_drains_a_held_git_child_before_the_process_exits() {
 		hold_file: Some(&hold),
 		path_prefix: Some(&wrap_dir),
 		tree_hold: None,
+		export_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until(&app.rx, "[APP:READY_REPOS:", Duration::from_secs(12));
@@ -954,6 +961,7 @@ fn close_cancels_in_flight_copy_without_writing_clipboard() {
 		hold_file: Some(&hold),
 		path_prefix: Some(wrap.parent().unwrap()),
 		tree_hold: None,
+		export_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(12));
@@ -1230,6 +1238,7 @@ fn close_waits_for_a_held_tree_read_and_reopen_ignores_it() {
 		hold_file: None,
 		path_prefix: None,
 		tree_hold: Some(&hold),
+		export_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	let started = lines_until_all(
@@ -1352,6 +1361,7 @@ fn quit_waits_for_a_held_tree_read() {
 		hold_file: None,
 		path_prefix: None,
 		tree_hold: Some(&hold),
+		export_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until_all(
@@ -1463,6 +1473,7 @@ fn spawn_copy_app(fx: &CopyFixture) -> (App, String) {
 		hold_file: Some(&fx.hold),
 		path_prefix: Some(&fx.wrap_dir),
 		tree_hold: None,
+		export_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until_all(
@@ -1719,6 +1730,7 @@ fn open_workspace_is_refused_while_apply_writes() {
 		hold_file: None,
 		path_prefix: None,
 		tree_hold: None,
+		export_hold: None,
 	});
 	let wid = find_wid(app.pid);
 	lines_until_all(
@@ -2177,6 +2189,377 @@ fn commit_preview_cancel_and_close_leave_the_destination_untouched() {
 	absent("btn-apply");
 	assert_eq!(repo_state(&fx.git_bin, &dest_repo), before);
 	assert!(same_proc(app.pid, &app.starttime));
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Opening and loading a historical revision tree must not cancel an active or
+/// queued project-tree directory worker.
+#[test]
+fn project_tree_finishes_while_historical_tree_loads() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let ws = root.path().join("ws");
+	let repo = ws.join("repo");
+	init_repo(&git_bin, &repo);
+	fs::write(repo.join("file.txt"), "first commit\n").unwrap();
+	git(&git_bin, &repo, &["add", "file.txt"]);
+	git(&git_bin, &repo, &["commit", "-q", "-m", "init commit"]);
+
+	// Add subfolders and second commit
+	fs::create_dir_all(repo.join("sub")).unwrap();
+	fs::write(repo.join("sub").join("nested.txt"), "nested\n").unwrap();
+	fs::create_dir_all(repo.join("sub2")).unwrap();
+	fs::write(repo.join("sub2").join("nested2.txt"), "nested2\n").unwrap();
+	fs::write(repo.join("extra.txt"), "working extra\n").unwrap();
+	git(&git_bin, &repo, &["add", "sub", "sub2"]);
+	git(&git_bin, &repo, &["commit", "-q", "-m", "add sub"]);
+
+	let dest = root.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let hold = root.path().join("tree-hold");
+
+	let mut app = spawn_app(SpawnOpts {
+		workspace: &ws,
+		restore: &dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: None,
+		path_prefix: None,
+		tree_hold: Some(&hold),
+		export_hold: None,
+	});
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+
+	// Wait for app ready
+	lines_until_all(
+		&app.rx,
+		&[
+			"[APP:READY_REPOS: 1]",
+			"[APP:REPO_LOADED:",
+			"[APP:GRAPH_LOADED:",
+			"[APP:TREE_PAGE:",
+		],
+		Duration::from_secs(12),
+	);
+
+	// Switch to Project (FileExplorer) tab
+	click(&wid, "rail-project");
+	lines_until(
+		&app.rx,
+		"[APP:TAB_SWITCHED: FileExplorer",
+		Duration::from_secs(4),
+	);
+
+	// Start project tree expansion for "sub". Set hold file so read holds at hold_tree_read.
+	fs::write(&hold, b"hold").unwrap();
+	click(&wid, "tree-row:sub");
+	lines_until(&app.rx, "[APP:TREE_IO_HELD]", Duration::from_secs(6));
+
+	// While first read is held in background, queue second expansion for "sub2"
+	click(&wid, "tree-row:sub2");
+
+	// Select commit and browse historical tree (triggers load_rev_dir)
+	let sha = head_short(&git_bin, &repo);
+	click(&wid, &format!("commit-row:{sha}"));
+	lines_until(&app.rx, "[APP:COMMIT_SELECTED:", Duration::from_secs(6));
+	click(&wid, "btn-browse-tree");
+	lines_until(&app.rx, "[APP:REV_TREE:", Duration::from_secs(6));
+
+	// Release the project tree hold
+	fs::remove_file(&hold).unwrap();
+
+	// Under prior bug (history.rs using self.tree_cancel), load_rev_dir cancelled tree_cancel,
+	// so the project tree worker saw is_cancelled() after finishing "sub" and broke out,
+	// leaving queued "sub2" stranded!
+	// Under our fix (separate rev_tree_cancel), both "sub" and queued "sub2" complete successfully!
+	lines_until(&app.rx, "[APP:TREE_PAGE: rel=sub", Duration::from_secs(8));
+	lines_until(&app.rx, "[APP:TREE_PAGE: rel=sub2", Duration::from_secs(8));
+
+	// Leave rev tree and verify app clean exit
+	click(&wid, "btn-leave-tree");
+	lines_until(&app.rx, "[APP:REV_TREE: off]", Duration::from_secs(4));
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// When a drain times out after >8s deadline, the workspace remains open and recovers:
+/// stale late results are discarded, tree cancel token is rearmed, loading flags cleared,
+/// basket selection is preserved, new directory expansion and preview succeed, and
+/// subsequent close drains cleanly.
+#[test]
+fn failed_drain_recovers_and_allows_expand_preview_and_close() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let ws = root.path().join("ws");
+	let repo = ws.join("repo");
+	init_repo(&git_bin, &repo);
+
+	fs::write(repo.join("note.txt"), "important note\n").unwrap();
+	fs::create_dir_all(repo.join("sub")).unwrap();
+	fs::write(repo.join("sub").join("nested.txt"), "nested content\n").unwrap();
+	fs::create_dir_all(repo.join("sub2")).unwrap();
+	fs::write(repo.join("sub2").join("nested2.txt"), "nested2 content\n")
+		.unwrap();
+	git(&git_bin, &repo, &["add", "."]);
+	git(&git_bin, &repo, &["commit", "-q", "-m", "init"]);
+	// Keep one working change for preview ready
+	fs::write(repo.join("extra.txt"), "extra\n").unwrap();
+
+	let dest = root.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let hold = root.path().join("tree-hold");
+
+	let mut app = spawn_app(SpawnOpts {
+		workspace: &ws,
+		restore: &dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: None,
+		path_prefix: None,
+		tree_hold: Some(&hold),
+		export_hold: None,
+	});
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+
+	lines_until_all(
+		&app.rx,
+		&[
+			"[APP:READY_REPOS: 1]",
+			"[APP:REPO_LOADED:",
+			"[APP:TREE_PAGE:",
+			"[APP:PREVIEW_LOADED:",
+		],
+		Duration::from_secs(12),
+	);
+
+	// Switch to Project (FileExplorer) tab
+	click(&wid, "rail-project");
+	lines_until(
+		&app.rx,
+		"[APP:TAB_SWITCHED: FileExplorer",
+		Duration::from_secs(4),
+	);
+
+	// Select note.txt into basket so we can prove selection survives failed drain
+	click(&wid, "tree-chk:note.txt");
+	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+
+	// Hold the directory expansion of "sub"
+	fs::write(&hold, b"hold").unwrap();
+	click(&wid, "tree-row:sub");
+	lines_until(&app.rx, "[APP:TREE_IO_HELD]", Duration::from_secs(6));
+
+	// Pre-drain queued read on the alive worker: click "sub2"
+	click(&wid, "tree-row:sub2");
+
+	// User requests Close Workspace while directory read is held
+	click(&wid, "btn-workspace-menu");
+	click(&wid, "btn-close-workspace");
+	lines_until(
+		&app.rx,
+		"phase=draining intent=close-workspace",
+		Duration::from_secs(4),
+	);
+
+	// Keep hold on disk for >8s drain deadline: drain must timeout and fail
+	let failed_lines = lines_until(
+		&app.rx,
+		"phase=failed intent=close-workspace reason=timeout",
+		Duration::from_secs(14),
+	);
+	assert!(
+		failed_lines.iter().any(|l| l
+			.contains("phase=failed intent=close-workspace reason=timeout")),
+		"drain did not fail on >8s timeout: {failed_lines:?}"
+	);
+	assert!(
+		same_proc(app.pid, &app.starttime),
+		"app must stay alive on failed drain"
+	);
+
+	// Click fresh expansion AFTER phase=failed but BEFORE releasing old hold!
+	// Under prior bug, tree_worker_alive was left true so this would queue onto
+	// the canceled dead worker and be stranded when the hold released.
+	click(&wid, "tree-row:sub");
+
+	// Now release hold file so background thread unblocks
+	fs::remove_file(&hold).unwrap();
+
+	// The stale directory read must be discarded and the fresh directory
+	// expansion must arrive with NO second click (concurrent workers may finish in any order).
+	let tree_lines = lines_until_all(
+		&app.rx,
+		&["[APP:TREE_IO_DISCARDED: stale", "[APP:TREE_PAGE: rel=sub"],
+		Duration::from_secs(8),
+	);
+	assert!(
+		tree_lines
+			.iter()
+			.any(|l| l.contains("[APP:TREE_IO_DISCARDED: stale")),
+		"stale late tree result was not discarded: {tree_lines:?}"
+	);
+	assert!(
+		tree_lines
+			.iter()
+			.any(|l| l.contains("[APP:TREE_PAGE: rel=sub")),
+		"fresh directory expansion was not received: {tree_lines:?}"
+	);
+
+	// Basket summary must still report 1 item
+	let summary = control("basket-summary");
+	assert!(summary[2] > 0, "basket summary must be visible");
+
+	click(&wid, "tree-row:note.txt");
+	lines_until(
+		&app.rx,
+		"[APP:PREVIEW_LOADED: note.txt]",
+		Duration::from_secs(6),
+	);
+
+	// Second Close Workspace with no holds: drains cleanly and closes!
+	click(&wid, "btn-workspace-menu");
+	click(&wid, "btn-close-workspace");
+	let closed = lines_until(
+		&app.rx,
+		"[APP:WORKSPACE: state=closed",
+		Duration::from_secs(8),
+	);
+	assert!(
+		closed.iter().any(|l| is_drained(l, "close-workspace")),
+		"close did not report real drain after recovery: {closed:?}"
+	);
+	let _ = control("workspace-closed");
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// When a source file is mutated externally after ExportPlan planning
+/// but before final revalidation, the export fails with stale_source diagnostic,
+/// sentinel clipboard is preserved, and app drains normally.
+#[test]
+fn export_refuses_when_source_mutated_after_plan_ready() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let ws = root.path().join("ws");
+	let repo = ws.join("repo");
+	init_repo(&git_bin, &repo);
+
+	fs::write(repo.join("note.txt"), "initial content\n").unwrap();
+	git(&git_bin, &repo, &["add", "."]);
+	git(&git_bin, &repo, &["commit", "-q", "-m", "init"]);
+
+	let dest = root.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let sentinel = "SENTINEL_CLIPBOARD_DO_NOT_OVERWRITE";
+	clip_set(sentinel);
+	assert_eq!(clip_get(), sentinel);
+
+	let hold = root.path().join("export-hold");
+	fs::write(&hold, b"hold").unwrap();
+
+	let mut app = spawn_app(SpawnOpts {
+		workspace: &ws,
+		restore: &dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: None,
+		path_prefix: None,
+		tree_hold: None,
+		export_hold: Some(&hold),
+	});
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+
+	lines_until_all(
+		&app.rx,
+		&[
+			"[APP:READY_REPOS: 1]",
+			"[APP:REPO_LOADED:",
+			"[APP:TREE_PAGE:",
+		],
+		Duration::from_secs(12),
+	);
+
+	// Switch to Project (FileExplorer) tab
+	click(&wid, "rail-project");
+	lines_until(
+		&app.rx,
+		"[APP:TAB_SWITCHED: FileExplorer",
+		Duration::from_secs(4),
+	);
+
+	// Select note.txt into basket
+	click(&wid, "tree-chk:note.txt");
+	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+
+	// Trigger copy
+	click(&wid, "btn-copy");
+
+	// Wait for plan ready marker
+	lines_until(
+		&app.rx,
+		"[APP:EXPORT_PLAN_READY: files=1]",
+		Duration::from_secs(6),
+	);
+
+	// Mutate source file on disk while copy is held
+	fs::write(repo.join("note.txt"), "mutated content externally\n").unwrap();
+
+	// Release hold barrier
+	fs::remove_file(&hold).unwrap();
+
+	// App must emit stale_source diagnostic and transition back to idle
+	lines_until(
+		&app.rx,
+		"[APP:COPY_FAILED: stale_source]",
+		Duration::from_secs(6),
+	);
+	lines_until(&app.rx, "[APP:COPY_IDLE]", Duration::from_secs(4));
+
+	// Clipboard MUST remain untouched sentinel
+	assert_eq!(
+		clip_get(),
+		sentinel,
+		"sentinel clipboard must not be overwritten on stale source failure"
+	);
+
+	// Close cleanly
+	click(&wid, "btn-workspace-menu");
+	click(&wid, "btn-close-workspace");
+	let closed = lines_until(
+		&app.rx,
+		"[APP:WORKSPACE: state=closed",
+		Duration::from_secs(8),
+	);
+	assert!(
+		closed.iter().any(|l| is_drained(l, "close-workspace")),
+		"close did not report real drain: {closed:?}"
+	);
+	let _ = control("workspace-closed");
+
 	quit_cleanly(&mut app, &wid);
 }
 

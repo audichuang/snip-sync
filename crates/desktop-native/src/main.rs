@@ -275,6 +275,7 @@ pub struct WorkbenchModel {
 	pub history_cancel: Option<CancelToken>,
 	pub preview_cancel: Option<CancelToken>,
 	pub tree_cancel: Option<CancelToken>,
+	pub rev_tree_cancel: Option<CancelToken>,
 	pub repo_cancel: Option<CancelToken>,
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
@@ -343,6 +344,8 @@ pub struct WorkbenchModel {
 	pub e2e_read_delay: Option<std::time::Duration>,
 	/// Test-only hold file for project-tree reads, honoured only in E2E mode.
 	pub e2e_tree_hold: Option<PathBuf>,
+	/// Test-only hold file for copy export revalidation, honoured only in E2E mode.
+	pub e2e_export_hold: Option<PathBuf>,
 	pub workspace_open: bool,
 	pub workspace_menu: bool,
 	pub workspace_picker: bool,
@@ -356,6 +359,14 @@ pub struct WorkbenchModel {
 pub enum Splitter {
 	Left,
 	Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasketGroup {
+	/// Workspace working file mode (SourceKind::File).
+	File,
+	/// Working changes from Git changes view (Working, Unstaged, Staged).
+	GitChanges,
 }
 
 impl WorkbenchModel {
@@ -534,6 +545,7 @@ impl WorkbenchModel {
 			history_cancel: None,
 			preview_cancel: None,
 			tree_cancel: None,
+			rev_tree_cancel: None,
 			repo_cancel: None,
 			scan_cancel: None,
 			copy_cancel: None,
@@ -587,6 +599,7 @@ impl WorkbenchModel {
 			pending_focus: None,
 			e2e_read_delay: ui::e2e_read_delay(),
 			e2e_tree_hold: ui::e2e_tree_hold(),
+			e2e_export_hold: ui::e2e_export_hold(),
 			workspace_open: true,
 			workspace_menu: false,
 			workspace_picker: false,
@@ -673,7 +686,7 @@ impl WorkbenchModel {
 		}
 		if let Some(repo) = self.repo() {
 			if let Ok(c) = CanonicalRootId::new(&repo.root) {
-				self.set_basket_group(c, false, Vec::new());
+				self.set_basket_group(c, BasketGroup::GitChanges, Vec::new());
 			}
 		}
 		self.remember_tree_selection();
@@ -1006,6 +1019,7 @@ impl WorkbenchModel {
 			lifecycle::Request::Busy => {
 				let intent = self.lifecycle.intent_name();
 				self.emit_life("draining", intent, None);
+				self.set_status("workspace_draining", []);
 			}
 			lifecycle::Request::Accepted => {
 				self.generation = self.generation.wrapping_add(1);
@@ -1018,6 +1032,7 @@ impl WorkbenchModel {
 					&mut self.history_cancel,
 					&mut self.preview_cancel,
 					&mut self.tree_cancel,
+					&mut self.rev_tree_cancel,
 					&mut self.repo_cancel,
 					&mut self.scan_cancel,
 					&mut self.copy_cancel,
@@ -1065,6 +1080,15 @@ impl WorkbenchModel {
 				let name = intent.name();
 				self.emit_life("failed", name, Some(reason));
 				self.set_status(key, []);
+				self.preview_loading = false;
+				self.tree_cancel = None;
+				self.rev_tree_cancel = None;
+				self.tree_queue.clear();
+				self.tree_worker = self.tree_worker.wrapping_add(1);
+				self.tree_worker_alive = false;
+				if let Some(tree) = self.file_tree.as_mut() {
+					tree.clear_loading();
+				}
 				cx.notify();
 			}
 		}
@@ -1158,6 +1182,7 @@ impl WorkbenchModel {
 		self.history_cancel = None;
 		self.preview_cancel = None;
 		self.tree_cancel = None;
+		self.rev_tree_cancel = None;
 		self.repo_cancel = None;
 		self.scan_cancel = None;
 		self.copy_cancel = None;
@@ -1649,10 +1674,7 @@ impl WorkbenchModel {
 		self.tree_worker = self.tree_worker.wrapping_add(1);
 		let worker = self.tree_worker;
 		self.tree_worker_alive = true;
-		let cancel = self
-			.tree_cancel
-			.get_or_insert_with(CancelToken::new)
-			.clone();
+		let cancel = arm_cancel(&mut self.tree_cancel);
 		let ws_gen = self.lifecycle.generation();
 		let hold = self.e2e_tree_hold.clone();
 		let mut async_app = cx.to_async();
@@ -1700,6 +1722,7 @@ impl WorkbenchModel {
 							let next = model.next_tree_io();
 							if next.is_none() {
 								model.tree_worker_alive = false;
+								model.tree_cancel = None;
 							}
 							cx.notify();
 							next
@@ -1712,6 +1735,7 @@ impl WorkbenchModel {
 				let _ = this.update(&mut async_app, |model, _| {
 					if model.tree_worker == worker {
 						model.tree_worker_alive = false;
+						model.tree_cancel = None;
 					}
 				});
 			},
@@ -1783,6 +1807,7 @@ impl WorkbenchModel {
 		self.preview_loading = false;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		let _ = arm_cancel(&mut self.tree_cancel);
+		let _ = arm_cancel(&mut self.rev_tree_cancel);
 		let _ = arm_cancel(&mut self.history_cancel);
 		let cancel = arm_cancel(&mut self.repo_cancel);
 
@@ -1847,6 +1872,7 @@ impl WorkbenchModel {
 		self.tree_worker = self.tree_worker.wrapping_add(1);
 		self.tree_worker_alive = false;
 		let _ = arm_cancel(&mut self.tree_cancel);
+		let _ = arm_cancel(&mut self.rev_tree_cancel);
 		let mut tree = FileTreeNode::unloaded_root(&repo_root);
 		tree.apply_selection(&saved_files);
 		self.restore_expanded = if preserve_anchors {
@@ -2137,31 +2163,99 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn source_label(source: &SourceKind) -> &'static str {
+	fn source_summary(source: &SourceKind) -> String {
 		match source {
-			SourceKind::Staged => "staged",
-			SourceKind::Unstaged => "unstaged",
-			SourceKind::Working => "untracked",
-			SourceKind::File => "file",
-			SourceKind::Commit { .. } => "commit",
+			SourceKind::Staged => "staged".to_string(),
+			SourceKind::Unstaged => "unstaged".to_string(),
+			SourceKind::Working => "untracked".to_string(),
+			SourceKind::File => "file".to_string(),
+			SourceKind::Commit { rev } => {
+				let short = &rev[..7.min(rev.len())];
+				format!("commit@{short}")
+			}
 		}
 	}
 
 	fn set_basket_group(
 		&mut self,
 		root: CanonicalRootId,
-		file_group: bool,
+		group: BasketGroup,
 		new_items: Vec<ExportItem>,
 	) {
 		let mut kept = self.basket.remove(&root).unwrap_or_default();
-		kept.retain(|item| {
-			matches!(item.source, SourceKind::File) != file_group
+		kept.retain(|item| match group {
+			BasketGroup::File => !matches!(item.source, SourceKind::File),
+			BasketGroup::GitChanges => !matches!(
+				item.source,
+				SourceKind::Working | SourceKind::Unstaged | SourceKind::Staged
+			),
 		});
 		kept.extend(new_items);
 		if !kept.is_empty() {
 			self.basket.insert(root, kept);
 		}
 		self.log_basket();
+	}
+
+	pub fn is_rev_file_selected(&self, sha: &str, path: &str) -> bool {
+		let Some(repo) = self.repo() else {
+			return false;
+		};
+		let Ok(root) = CanonicalRootId::new(&repo.root) else {
+			return false;
+		};
+		let Some(items) = self.basket.get(&root) else {
+			return false;
+		};
+		items.iter().any(|item| {
+			item.relative_path == path
+				&& matches!(&item.source, SourceKind::Commit { rev } if rev == sha)
+		})
+	}
+
+	pub fn toggle_rev_file_selection(
+		&mut self,
+		sha: &str,
+		path: &str,
+		cx: &mut Context<Self>,
+	) {
+		let Some(repo) = self.repo() else {
+			return;
+		};
+		let Ok(root) = CanonicalRootId::new(&repo.root) else {
+			return;
+		};
+		let target_source = SourceKind::Commit {
+			rev: sha.to_string(),
+		};
+		let items = self.basket.entry(root.clone()).or_default();
+		if let Some(pos) = items.iter().position(|item| {
+			item.relative_path == path && item.source == target_source
+		}) {
+			items.remove(pos);
+			if items.is_empty() {
+				self.basket.remove(&root);
+			}
+			app_log!(
+				"[APP:REV_FILE_TOGGLED: sha={} path={} selected=false]",
+				&sha[..7.min(sha.len())],
+				path
+			);
+		} else {
+			items.push(ExportItem {
+				root: root.clone(),
+				relative_path: path.to_string(),
+				source: target_source,
+				change_type: None,
+			});
+			app_log!(
+				"[APP:REV_FILE_TOGGLED: sha={} path={} selected=true]",
+				&sha[..7.min(sha.len())],
+				path
+			);
+		}
+		self.log_basket();
+		cx.notify();
 	}
 
 	fn log_basket(&self) {
@@ -2179,7 +2273,10 @@ impl WorkbenchModel {
 		self.basket.values().map(|items| items.len()).sum()
 	}
 
-	pub fn basket_summary(&self) -> String {
+	fn basket_summary_with<F>(&self, format_source: F) -> String
+	where
+		F: Fn(&SourceKind) -> String,
+	{
 		let mut parts = Vec::new();
 		let mut rows: Vec<_> = self.basket.iter().collect();
 		rows.sort_by_key(|(root, _)| {
@@ -2196,18 +2293,40 @@ impl WorkbenchModel {
 				.unwrap_or_else(|| root.path().display().to_string());
 			let mut items = items.clone();
 			items.sort_by(|a, b| {
-				(&a.relative_path, Self::source_label(&a.source))
-					.cmp(&(&b.relative_path, Self::source_label(&b.source)))
+				(&a.relative_path, Self::source_summary(&a.source))
+					.cmp(&(&b.relative_path, Self::source_summary(&b.source)))
 			});
 			for item in items {
 				parts.push(format!(
 					"{name} {} {}",
-					Self::source_label(&item.source),
+					format_source(&item.source),
 					item.relative_path
 				));
 			}
 		}
 		parts.join("; ")
+	}
+
+	pub fn basket_summary(&self) -> String {
+		self.basket_summary_with(Self::source_summary)
+	}
+
+	pub fn basket_summary_localized(&self, loc: Locale) -> String {
+		self.basket_summary_with(|source| match source {
+			SourceKind::File => i18n::t("src_working_file", loc).to_string(),
+			SourceKind::Working => i18n::t("group_untracked", loc).to_string(),
+			SourceKind::Unstaged => i18n::t("tag_unstaged", loc).to_string(),
+			SourceKind::Staged => i18n::t("tag_staged", loc).to_string(),
+			SourceKind::Commit { rev } => {
+				let short = &rev[..7.min(rev.len())];
+				let tmpl = i18n::t("src_commit_short", loc);
+				if tmpl.contains("{}") {
+					tmpl.replace("{}", short)
+				} else {
+					format!("commit@{short}")
+				}
+			}
+		})
 	}
 
 	/// Two selections of one path cannot share a wire header. File rows count;
@@ -2277,7 +2396,7 @@ impl WorkbenchModel {
 				change_type: None,
 			})
 			.collect();
-		self.set_basket_group(id, true, items);
+		self.set_basket_group(id, BasketGroup::File, items);
 	}
 
 	pub fn reapply_tree_selection(&mut self) {
@@ -2308,7 +2427,7 @@ impl WorkbenchModel {
 				change_type: file.change_type,
 			})
 			.collect();
-		self.set_basket_group(id, false, items);
+		self.set_basket_group(id, BasketGroup::GitChanges, items);
 	}
 
 	pub fn clear_basket(&mut self, cx: &mut Context<Self>) {
@@ -2403,6 +2522,7 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.copy_cancel);
 		let job_token = cancel.clone();
 		let run_token = cancel.clone();
+		let export_hold = self.e2e_export_hold.clone();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2415,7 +2535,7 @@ impl WorkbenchModel {
 			async move {
 				let result: Result<(String, usize, Msg), Msg> = bg
 					.spawn(async move {
-						let opts = interactive_read_opts(run_token);
+						let opts = interactive_read_opts(run_token.clone());
 						let settings = Settings::default();
 						// Document cap is the retained UI output ceiling.
 						// It is not `RunOptions::max_stdout`.
@@ -2431,7 +2551,30 @@ impl WorkbenchModel {
 						if plan.files.is_empty() {
 							return Err(Msg::new("status_copy_nothing", []));
 						}
+						if let Some(ref hold) = export_hold {
+							if hold.exists() {
+								app_log!(
+									"[APP:EXPORT_PLAN_READY: files={}]",
+									plan.files.len()
+								);
+								while hold.exists() {
+									if run_token.is_cancelled() {
+										break;
+									}
+									std::thread::sleep(
+										std::time::Duration::from_millis(20),
+									);
+								}
+							}
+						}
 						plan.revalidate_with(&opts).map_err(|e| {
+							let reason = match &e {
+								snip_core::transfer::TransferError::StaleSource { .. } => "stale_source",
+								_ => "revalidate",
+							};
+							if e2e_on() {
+								app_log!("[APP:COPY_FAILED: {reason}]");
+							}
 							Msg::new("error_payload", [e.to_string()])
 						})?;
 						let skipped = plan.skipped_unreadable_count
@@ -2655,6 +2798,11 @@ impl WorkbenchModel {
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
 		if self.refuse_while_applying("preview", cx) {
+			return;
+		}
+		if !self.workspace_open {
+			self.set_status("workspace_not_open", []);
+			cx.notify();
 			return;
 		}
 		if !self.accepting_work() {
