@@ -614,7 +614,7 @@ struct PathPick {
 	/// `None` for a chosen path the tree has not loaded.
 	is_dir: Option<bool>,
 	depth: usize,
-	/// A loaded folder with children to show.
+	/// A folder (opening one the tree has not read loads it).
 	expandable: bool,
 	expanded: bool,
 }
@@ -641,8 +641,7 @@ fn path_picker_rows(
 			if !child.is_valid_utf8 || child.is_nested_repo {
 				continue;
 			}
-			let expandable =
-				child.is_dir && child.is_loaded && !child.children.is_empty();
+			let expandable = child.is_dir;
 			let open = expandable && expanded.contains(&child.rel_path);
 			out.push(PathPick {
 				rel: child.rel_path.clone(),
@@ -4796,11 +4795,31 @@ impl WorkbenchModel {
 						.child(t("log_paths_hint", loc))
 						.into_any_element(),
 				);
-				// Chosen paths first (typed ones may not be in the tree),
-				// then the project's folders and files as far as loaded.
+				// The project's folders and files as far as loaded; chosen
+				// paths the tree does not show (typed, or in a closed
+				// folder) are listed above it.
 				let chosen = &self.log_filter.paths;
-				let mut picks: Vec<PathPick> = chosen
+				let tree_rows = match self.file_tree.as_ref() {
+					Some(tree) if tree.is_loaded => path_picker_rows(
+						tree,
+						&self.log_paths_expanded,
+						MAX_PATH_PICKS,
+					),
+					_ => {
+						items.push(
+							div()
+								.px(px(8.))
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(t("log_paths_tree_empty", loc))
+								.into_any_element(),
+						);
+						Vec::new()
+					}
+				};
+				let extra: Vec<PathPick> = chosen
 					.iter()
+					.filter(|p| !tree_rows.iter().any(|r| &r.rel == *p))
 					.map(|p| PathPick {
 						rel: p.clone(),
 						name: p.clone(),
@@ -4810,26 +4829,7 @@ impl WorkbenchModel {
 						expanded: false,
 					})
 					.collect();
-				match self.file_tree.as_ref() {
-					Some(tree) if tree.is_loaded => picks.extend(
-						path_picker_rows(
-							tree,
-							&self.log_paths_expanded,
-							MAX_PATH_PICKS,
-						)
-						.into_iter()
-						.filter(|p| !chosen.contains(&p.rel)),
-					),
-					_ => items.push(
-						div()
-							.px(px(8.))
-							.text_size(px(SMALL_TEXT))
-							.text_color(rgb(pal().text_muted))
-							.child(t("log_paths_tree_empty", loc))
-							.into_any_element(),
-					),
-				}
-				for pick in picks {
+				for pick in extra.into_iter().chain(tree_rows) {
 					items.push(self.path_pick_row(pick, cx));
 				}
 			}
@@ -4943,7 +4943,10 @@ impl WorkbenchModel {
 							Some(i) => {
 								open.remove(i);
 							}
-							None => open.push(exp_rel.clone()),
+							None => {
+								open.push(exp_rel.clone());
+								this.load_picker_dir(&exp_rel, cx);
+							}
 						}
 						cx.notify();
 					}))
@@ -6798,9 +6801,9 @@ mod tests {
 				.map(|p| format!("{}{}", " ".repeat(p.depth), p.rel))
 				.collect()
 		};
-		// `src` is not loaded yet: listed, but nothing to open.
+		// `src` is not read yet: it can be opened, but shows nothing yet.
 		let rows = path_picker_rows(&tree, &["src".into()], 10);
-		assert!(!rows.iter().any(|p| p.expandable));
+		assert!(rows.iter().any(|p| p.rel == "src" && p.expandable));
 		assert_eq!(rows.len(), 2);
 		tree.toggle_expand("src", root);
 		let closed = path_picker_rows(&tree, &[], 10);

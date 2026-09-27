@@ -1872,6 +1872,29 @@ impl WorkbenchModel {
 		self.apply_log_filter(cx);
 	}
 
+	/// Paths picker: reads a folder (`""` is the root) the project tree has
+	/// not read yet, through the project tree's own loader.
+	pub fn load_picker_dir(&mut self, rel: &str, cx: &mut Context<Self>) {
+		let Some(tree) = self.file_tree.as_ref() else {
+			return;
+		};
+		let mut node = tree;
+		for part in rel.split('/').filter(|p| !p.is_empty()) {
+			match node.children.iter().find(|c| c.name == part && c.is_dir) {
+				Some(child) => node = child,
+				None => return,
+			}
+		}
+		if !node.is_loaded {
+			self.dispatch_tree(
+				Some(crate::tree::TreeCommand::Expand(
+					crate::tree::NodeKey::from_utf8_rel(rel),
+				)),
+				cx,
+			);
+		}
+	}
+
 	/// Paths chip ✕: every path.
 	pub fn clear_log_paths(&mut self, cx: &mut Context<Self>) {
 		self.log_menu = None;
@@ -1919,6 +1942,7 @@ impl WorkbenchModel {
 		if self.log_menu == Some(crate::ui::LogMenu::Paths) {
 			self.pending_focus =
 				Some(self.log_path_input.read(cx).handle().clone());
+			self.load_picker_dir("", cx);
 		}
 		app_log!("[APP:LOG_MENU: {:?}]", self.log_menu);
 		cx.notify();
