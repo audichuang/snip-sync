@@ -661,6 +661,8 @@ mod tests {
 			"workspace_drain_leaked",
 			"lifecycle_jobs",
 			"tip_workspace_menu",
+			"status_repo_vanished",
+			"change_not_utf8",
 		];
 		for key in test_keys {
 			assert!(

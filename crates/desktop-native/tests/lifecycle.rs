@@ -2860,6 +2860,10 @@ fn refresh_reloads_the_open_repo_and_releases_a_vanished_one() {
 	);
 	control("change-row:extra.txt");
 
+	// A selection in the repo about to vanish must not block a later Copy.
+	click(&wid, "change-chk:note.txt");
+	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+
 	fs::remove_dir_all(fx.ws.join("a")).unwrap();
 	key(&wid, "ctrl+r");
 	let lines = lines_until_all(
@@ -2871,8 +2875,27 @@ fn refresh_reloads_the_open_repo_and_releases_a_vanished_one() {
 		position(&lines, "[APP:REPO_SELECTING:").is_none(),
 		"the vanished repo's view was handed to another repo: {lines:?}"
 	);
+	assert!(
+		position(&lines, "[APP:BASKET: n=0").is_some(),
+		"the vanished repo's selections stayed in the basket: {lines:?}"
+	);
 	absent("change-row:note.txt");
 	absent("change-row:extra.txt");
+
+	switch_repo(&app, &wid, "b", 0);
+	lines_until(&app.rx, "[APP:REPO_LOADED: b", Duration::from_secs(8));
+	key(&wid, "alt+0");
+	click(&wid, "change-chk:note.txt");
+	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+	let sentinel = "CLIP-SENTINEL-vanished-repo";
+	clip_set(sentinel);
+	click(&wid, "btn-copy");
+	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(10));
+	let copied = clip_get();
+	assert!(
+		copied.contains("note from b") && !copied.contains("note from a"),
+		"copy after a repo vanished: {copied:?}"
+	);
 	quit_cleanly(&mut app, &wid);
 }
 

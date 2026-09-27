@@ -100,9 +100,9 @@ use snip_core::transfer::{
 	ExportItem, ExportSelection, SourceKind,
 };
 use snip_core::workspace::{
-	declared_submodules, status_details, summarize, DiscoveredRepo, Discovery,
-	RepoIdentity, RepoKind, RepoSummary, ScanBudget, ScanStatus,
-	SubmoduleState,
+	declared_submodules, status_details, summarize, summarize_with_details,
+	summarize_with_identity, DiscoveredRepo, Discovery, RepoIdentity, RepoKind,
+	RepoSummary, ScanBudget, ScanStatus, SubmoduleState,
 };
 
 use crate::history::{LogSearch, RevTree};
@@ -1282,8 +1282,12 @@ impl WorkbenchModel {
 						.file_name()
 						.map(|n| n.to_string_lossy().into_owned())
 						.unwrap_or(name);
-					let summary =
-						summarize(&git, opts).map_err(|e| e.to_string());
+					// The identity was just resolved; reuse it.
+					let summary = match &identity {
+						Some(id) => summarize_with_identity(&git, id, opts),
+						None => summarize(&git, opts),
+					}
+					.map_err(|e| e.to_string());
 
 					list.push(RepoEntry {
 						root: root.clone(),
@@ -2056,6 +2060,19 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// The open repo's summary read by the same status as its Changes list,
+	/// so the repo row's counts match the list.
+	fn update_open_summary(&mut self, summary: Option<RepoSummary>) {
+		let Some(summary) = summary else {
+			return;
+		};
+		if self.repo().is_some() {
+			if let Some(idx) = self.selected_repo_idx {
+				self.repos[idx].summary = Ok(summary);
+			}
+		}
+	}
+
 	/// Removes a kept repo the rescan did not find. Returns its name when it
 	/// was the open one, whose view is then released.
 	fn drop_vanished_repo(
@@ -2064,7 +2081,16 @@ impl WorkbenchModel {
 	) -> Option<String> {
 		let pos = self.repos.iter().position(|e| repo_key_matches(e, key))?;
 		let gone = self.repos.remove(pos);
+		// Its selections can no longer be read, and one unreadable root
+		// would make every later Copy fail.
+		let dropped = admitted_selection_root(&gone, &self.basket);
+		if let Some(root) = &dropped {
+			self.basket.retain(|(have, _)| have != root);
+		}
 		self.refresh_basket_view();
+		if dropped.is_some() {
+			self.log_basket();
+		}
 		if self.pinned_repo.as_ref() == Some(key) {
 			self.pinned_repo = None;
 			self.selected_repo_idx = None;
@@ -2532,52 +2558,71 @@ impl WorkbenchModel {
 		let cancel_bg = cancel.clone();
 
 		let repo_root_for_update = repo_root.clone();
+		let known = self.repos[idx].identity.clone();
 		self.spawn_owned(
 			cx,
 			lifecycle::JobKind::CancellableRead,
 			Some(cancel),
 			async move {
-				let working_res: Result<Vec<WorkingChangeTuple>, String> = bg
-					.spawn(async move {
-						let opts = interactive_read_opts(cancel_bg);
-						let git = Git::open_with(&repo_root, &opts)
-							.map_err(|e| e.to_string())?;
-						let details = status_details(&git, &opts)
-							.map_err(|e| e.to_string())?;
-						let mut items = Vec::new();
-						for (p, ct) in details.staged {
-							items.push((p, ct, SourceKind::Staged, false));
+				let working_res: Result<
+					(Option<RepoSummary>, Vec<WorkingChangeTuple>),
+					String,
+				> = bg.spawn(async move {
+					let opts = interactive_read_opts(cancel_bg);
+					// A known identity skips the open and the identity
+					// reads, and one status feeds both the list and the
+					// repo's summary.
+					let (summary, details) = match &known {
+						Some(id) => {
+							let git = Git::at_known_root(id.toplevel.clone());
+							let (summary, details) =
+								summarize_with_details(&git, id, &opts)
+									.map_err(|e| e.to_string())?;
+							(Some(summary), details)
 						}
-						for (p, ct) in details.unstaged {
-							items.push((p, ct, SourceKind::Unstaged, false));
+						None => {
+							let git = Git::open_with(&repo_root, &opts)
+								.map_err(|e| e.to_string())?;
+							let details = status_details(&git, &opts)
+								.map_err(|e| e.to_string())?;
+							(None, details)
 						}
-						for p in details.untracked {
-							items.push((
-								p,
-								Some(ChangeType::New),
-								SourceKind::Working,
-								false,
-							));
-						}
-						for p in details.conflicted {
-							items.push((
-								p,
-								Some(ChangeType::Modified),
-								SourceKind::Working,
-								true,
-							));
-						}
-						items.sort_by(|a, b| a.0.cmp(&b.0));
-						Ok(items)
-					})
-					.await;
+					};
+					let mut items = Vec::new();
+					for (p, ct) in details.staged {
+						items.push((p, ct, SourceKind::Staged, false));
+					}
+					for (p, ct) in details.unstaged {
+						items.push((p, ct, SourceKind::Unstaged, false));
+					}
+					for p in details.untracked {
+						items.push((
+							p,
+							Some(ChangeType::New),
+							SourceKind::Working,
+							false,
+						));
+					}
+					for p in details.conflicted {
+						items.push((
+							p,
+							Some(ChangeType::Modified),
+							SourceKind::Working,
+							true,
+						));
+					}
+					items.sort_by(|a, b| a.0.cmp(&b.0));
+					Ok((summary, items))
+				})
+				.await;
 
 				let _ = this.update(&mut async_app, |model, cx| {
 					if model.generation != task_generation {
 						return;
 					}
 					match working_res {
-						Ok(changes) => {
+						Ok((summary, changes)) => {
+							model.update_open_summary(summary);
 							let canonical =
 								CanonicalRootId::new(&repo_root_for_update)
 									.ok();
@@ -4375,8 +4420,8 @@ fn resolve_added_repo(
 						RepoKind::Submodule => RepoEntryKind::Submodule,
 						RepoKind::Main => RepoEntryKind::Main,
 					};
-					let summary =
-						summarize(&git, &opts).map_err(|err| err.to_string());
+					let summary = summarize_with_identity(&git, &id, &opts)
+						.map_err(|err| err.to_string());
 					(id.toplevel.clone(), kind, Some(id), summary)
 				}
 				Err(err) => (
