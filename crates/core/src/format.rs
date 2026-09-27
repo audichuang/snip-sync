@@ -123,69 +123,197 @@ pub fn build_git_payload(options: &BuildPayloadOptions) -> String {
 	build_payload_internal(options, false)
 }
 
+pub(crate) struct PayloadLineWriter<'a, W: std::fmt::Write> {
+	w: &'a mut W,
+	pub has_written_line: bool,
+}
+
+impl<'a, W: std::fmt::Write> PayloadLineWriter<'a, W> {
+	pub fn new(w: &'a mut W) -> Self {
+		Self {
+			w,
+			has_written_line: false,
+		}
+	}
+
+	pub fn new_with_written(w: &'a mut W, has_written_line: bool) -> Self {
+		Self {
+			w,
+			has_written_line,
+		}
+	}
+
+	pub fn write_line(&mut self, line: &str) -> std::fmt::Result {
+		if self.has_written_line {
+			self.w.write_char('\n')?;
+		}
+		self.has_written_line = true;
+		self.w.write_str(line)?;
+		Ok(())
+	}
+
+	pub fn write_escaped(
+		&mut self,
+		text: &str,
+		custom: Option<&HeaderPattern>,
+	) -> std::fmt::Result {
+		if self.has_written_line {
+			self.w.write_char('\n')?;
+		}
+		self.has_written_line = true;
+		write_escaped_content(self.w, text, custom)
+	}
+}
+
+/// Streams `text` line-by-line directly to `w`, prepending `ESCAPE_MARKER` to header-shaped lines
+/// without any heap allocation or String cloning.
+pub(crate) fn write_escaped_content<W: std::fmt::Write>(
+	w: &mut W,
+	text: &str,
+	custom: Option<&HeaderPattern>,
+) -> std::fmt::Result {
+	let mut lines = text.split('\n');
+	if let Some(first) = lines.next() {
+		if needs_escape(first, custom) {
+			w.write_str(ESCAPE_MARKER)?;
+		}
+		w.write_str(first)?;
+		for line in lines {
+			w.write_char('\n')?;
+			if needs_escape(line, custom) {
+				w.write_str(ESCAPE_MARKER)?;
+			}
+			w.write_str(line)?;
+		}
+	}
+	Ok(())
+}
+
+#[derive(Default)]
+pub(crate) struct CountingWriter {
+	pub count: usize,
+}
+
+impl std::fmt::Write for CountingWriter {
+	fn write_str(&mut self, s: &str) -> std::fmt::Result {
+		self.count += s.len();
+		Ok(())
+	}
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BorrowedPayloadOptions<'a, 'f> {
+	pub header_format: &'a str,
+	pub pre_text: &'a str,
+	pub post_text: &'a str,
+	pub add_extra_line_between_files: bool,
+	pub source_root: Option<&'a str>,
+	pub files: &'f [PayloadFile],
+	pub include_empty_wrappers: bool,
+}
+
+pub(crate) fn write_payload_envelope<W: std::fmt::Write>(
+	writer: &mut PayloadLineWriter<'_, W>,
+	opts: &BorrowedPayloadOptions<'_, '_>,
+	custom: Option<&HeaderPattern>,
+) -> std::fmt::Result {
+	if let Some(root) = opts.source_root.filter(|r| !r.is_empty()) {
+		let meta = format!("{SOURCE_ROOT_MARKER}{root}");
+		if find_header_path(&meta, custom).is_none() {
+			writer.write_line(&meta)?;
+		}
+	}
+	if opts.include_empty_wrappers || !opts.pre_text.is_empty() {
+		writer.write_escaped(opts.pre_text, custom)?;
+	}
+	Ok(())
+}
+
+pub(crate) fn write_payload_file<W: std::fmt::Write>(
+	writer: &mut PayloadLineWriter<'_, W>,
+	file: &PayloadFile,
+	header_format: &str,
+	add_extra_line_between_files: bool,
+	custom: Option<&HeaderPattern>,
+) -> std::fmt::Result {
+	writer.write_line(&format_header(
+		header_format,
+		&file.path,
+		file.change_type,
+	))?;
+	match file.skipped_reason.as_deref() {
+		Some(reason) if !reason.is_empty() => {
+			let body = format!("// File skipped: {reason}");
+			writer.write_escaped(&body, custom)?;
+		}
+		_ => {
+			let body = file.content.as_deref().unwrap_or_default();
+			writer.write_escaped(body, custom)?;
+		}
+	}
+	if add_extra_line_between_files {
+		writer.write_line("")?;
+	}
+	Ok(())
+}
+
+pub(crate) fn write_payload_footer<W: std::fmt::Write>(
+	writer: &mut PayloadLineWriter<'_, W>,
+	opts: &BorrowedPayloadOptions<'_, '_>,
+	custom: Option<&HeaderPattern>,
+) -> std::fmt::Result {
+	if opts.include_empty_wrappers || !opts.post_text.is_empty() {
+		if !opts.post_text.is_empty()
+			&& find_header_path(POST_TEXT_MARKER, custom).is_none()
+		{
+			writer.write_line(POST_TEXT_MARKER)?;
+		}
+		writer.write_escaped(opts.post_text, custom)?;
+	}
+	Ok(())
+}
+
+pub(crate) fn write_payload_borrowed<W: std::fmt::Write>(
+	w: &mut W,
+	opts: &BorrowedPayloadOptions<'_, '_>,
+) -> std::fmt::Result {
+	let mut writer = PayloadLineWriter::new(w);
+	let custom = HeaderPattern::new(opts.header_format);
+	let custom = custom.as_ref();
+
+	write_payload_envelope(&mut writer, opts, custom)?;
+
+	for file in opts.files {
+		write_payload_file(
+			&mut writer,
+			file,
+			opts.header_format,
+			opts.add_extra_line_between_files,
+			custom,
+		)?;
+	}
+
+	write_payload_footer(&mut writer, opts, custom)?;
+
+	Ok(())
+}
+
 fn build_payload_internal(
 	options: &BuildPayloadOptions,
 	include_empty_wrappers: bool,
 ) -> String {
-	let custom = HeaderPattern::new(&options.header_format);
-	let custom = custom.as_ref();
-	let mut lines: Vec<String> = Vec::new();
-	// Metadata line first, unless the configured header would parse it as a
-	// file (it would become a phantom entry).
-	if let Some(root) = options.source_root.as_deref().filter(|r| !r.is_empty())
-	{
-		let meta = format!("{SOURCE_ROOT_MARKER}{root}");
-		if find_header_path(&meta, custom).is_none() {
-			lines.push(meta);
-		}
-	}
-	if include_empty_wrappers || !options.pre_text.is_empty() {
-		lines.push(escape_content(&options.pre_text, custom));
-	}
-
-	for file in &options.files {
-		lines.push(format_header(
-			&options.header_format,
-			&file.path,
-			file.change_type,
-		));
-		let body = match file.skipped_reason.as_deref() {
-			Some(reason) if !reason.is_empty() => {
-				format!("// File skipped: {reason}")
-			}
-			_ => file.content.clone().unwrap_or_default(),
-		};
-		lines.push(escape_content(&body, custom));
-		if options.add_extra_line_between_files {
-			lines.push(String::new());
-		}
-	}
-
-	if include_empty_wrappers || !options.post_text.is_empty() {
-		// Terminate the last body only when there is a footer, and only if the
-		// configured header would not swallow the marker line.
-		if !options.post_text.is_empty()
-			&& find_header_path(POST_TEXT_MARKER, custom).is_none()
-		{
-			lines.push(POST_TEXT_MARKER.to_string());
-		}
-		lines.push(escape_content(&options.post_text, custom));
-	}
-	lines.join("\n")
-}
-
-// Scheme A escape: prefix header-shaped content lines with ESCAPE_MARKER.
-fn escape_content(text: &str, custom: Option<&HeaderPattern>) -> String {
-	text.split('\n')
-		.map(|line| {
-			if needs_escape(line, custom) {
-				format!("{ESCAPE_MARKER}{line}")
-			} else {
-				line.to_string()
-			}
-		})
-		.collect::<Vec<_>>()
-		.join("\n")
+	let mut out = String::new();
+	let opts = BorrowedPayloadOptions {
+		header_format: &options.header_format,
+		pre_text: &options.pre_text,
+		post_text: &options.post_text,
+		add_extra_line_between_files: options.add_extra_line_between_files,
+		source_root: options.source_root.as_deref(),
+		files: &options.files,
+		include_empty_wrappers,
+	};
+	write_payload_borrowed(&mut out, &opts).unwrap();
+	out
 }
 
 fn needs_escape(line: &str, custom: Option<&HeaderPattern>) -> bool {
@@ -323,12 +451,12 @@ fn is_likely_bare_file_header_path(raw_path: &str) -> bool {
 /// `^seg0(.+?)seg1(?:\1)...segN$`. Hand-rolled because the `regex` crate has
 /// no backreferences: every repeat must equal the first capture, so the
 /// capture length is fixed by the line length and the match is unique.
-struct HeaderPattern {
+pub(crate) struct HeaderPattern {
 	segments: Vec<String>,
 }
 
 impl HeaderPattern {
-	fn new(header_format: &str) -> Option<Self> {
+	pub(crate) fn new(header_format: &str) -> Option<Self> {
 		let segments: Vec<String> = header_format
 			.split(PLACEHOLDER)
 			.map(str::to_string)

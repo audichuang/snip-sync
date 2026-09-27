@@ -6,9 +6,9 @@
 //! files; `collect_payload` applies filters, limits and counts on top.
 
 use std::collections::HashSet;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::Command;
 
 use crate::copy::CopyResult;
 use crate::filter::file_matches_filters;
@@ -17,6 +17,7 @@ use crate::format::{
 	PayloadFile,
 };
 use crate::fsutil::{decode_utf8_or_skip, read_text_file};
+use crate::gitrun::{self, CancelToken, RunOptions, RunOutput};
 use crate::paths::{source_root_name, to_clipboard_path_from_roots};
 use crate::settings::Settings;
 
@@ -35,7 +36,34 @@ pub enum GitError {
 	)]
 	NotFound,
 	#[error("git {args} failed: {stderr}")]
-	Failed { args: String, stderr: String },
+	Failed {
+		args: String,
+		stderr: String,
+		/// Exit code; `None` when killed by a signal.
+		code: Option<i32>,
+	},
+	#[error("git {args} timed out after {secs}s")]
+	Timeout { args: String, secs: u64 },
+	#[error("git {args} was cancelled")]
+	Cancelled { args: String },
+	#[error("git {args} gave up waiting for a free Git process slot")]
+	QueueTimeout { args: String },
+	#[error("git {args} refused: too many callers already wait for Git")]
+	QueueFull { args: String },
+	#[error(
+		"git {args} refused: another heavy Git operation runs in this worktree"
+	)]
+	WorktreeBusy { args: String },
+	#[error("git {args} output exceeds {limit} bytes")]
+	OutputLimit { args: String, limit: usize },
+	#[error("git {args} exited but a detached process kept its output open")]
+	OutputHeldOpen { args: String },
+	#[error(
+		"git {args} was started while this thread already runs a Git process"
+	)]
+	NestedProcess { args: String },
+	#[error("cleaning up git {args} failed: {message}")]
+	Cleanup { args: String, message: String },
 	#[error(
 		"{} is not inside a git repository (commit mode and git sources need one)",
 		.0.display()
@@ -54,6 +82,8 @@ pub enum GitError {
 }
 
 /// Runs the system git CLI inside one repository, never through a shell.
+/// Every process goes through [`crate::gitrun`]: global budget, deadline,
+/// output cap and process-tree cleanup.
 #[derive(Debug, Clone)]
 pub struct Git {
 	root: PathBuf,
@@ -62,51 +92,111 @@ pub struct Git {
 fn git_command() -> Command {
 	let mut cmd = Command::new("git");
 	// Byte-stable output, and never block on a credential prompt.
+	// CREATE_NO_WINDOW is set by the runner (command-group owns the flags).
 	cmd.env("LC_ALL", "C").env("GIT_TERMINAL_PROMPT", "0");
-	#[cfg(windows)]
-	{
-		use std::os::windows::process::CommandExt;
-		// CREATE_NO_WINDOW: a GUI process must not flash a console.
-		cmd.creation_flags(0x0800_0000);
-	}
 	cmd
 }
 
-fn spawn_error(e: io::Error) -> GitError {
-	if e.kind() == io::ErrorKind::NotFound {
-		GitError::NotFound
-	} else {
-		GitError::Io(e)
+/// A path git printed, byte for byte: on Unix it need not be UTF-8, and
+/// elsewhere git prints UTF-8.
+pub(crate) fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, GitError> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::ffi::OsStrExt;
+		Ok(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
 	}
+	#[cfg(not(unix))]
+	{
+		std::str::from_utf8(bytes)
+			.map(PathBuf::from)
+			.map_err(|_| GitError::Malformed("path is not UTF-8".into()))
+	}
+}
+
+/// `rev-parse --verify --quiet` and `symbolic-ref --quiet` say "no such
+/// thing" with exit status 1 and no stderr; anything else is a failure.
+fn is_quiet_miss(e: &GitError) -> bool {
+	matches!(e, GitError::Failed { code: Some(1), stderr, .. } if stderr.is_empty())
+}
+
+pub(crate) fn already_cancelled(
+	opts: &RunOptions,
+	args: &str,
+) -> Result<(), GitError> {
+	if opts.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+		return Err(GitError::Cancelled {
+			args: args.to_string(),
+		});
+	}
+	Ok(())
+}
+
+/// Metadata cannot be interpreted from a truncated prefix, even when the
+/// same caller explicitly permits truncating a display-only patch.
+fn run_strict(
+	git: &Git,
+	args: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<u8>, GitError> {
+	let output = git.run_with(args, opts)?;
+	if output.truncated {
+		return Err(GitError::OutputLimit {
+			args: args.join(" "),
+			limit: opts.max_stdout,
+		});
+	}
+	Ok(output.stdout)
 }
 
 impl Git {
 	/// Checks that git is installed, then resolves the repository top level
 	/// containing `dir`.
 	pub fn open(dir: &Path) -> Result<Self, GitError> {
-		git_command()
-			.arg("--version")
-			.stdin(Stdio::null())
-			.output()
-			.map_err(spawn_error)?;
+		Self::open_with(dir, &RunOptions::default())
+	}
+
+	/// [`Git::open`] with explicit limits, deadline and cancellation.
+	///
+	/// Both `git --version` and `rev-parse --show-toplevel` use `opts`.
+	/// A truncated read is [`GitError::OutputLimit`], not a partial root.
+	/// A directory outside a repository is still [`GitError::NotARepository`].
+	pub fn open_with(dir: &Path, opts: &RunOptions) -> Result<Self, GitError> {
+		already_cancelled(opts, "--version")?;
+		let mut version = git_command();
+		version.arg("--version");
+		let version = gitrun::run(version, "--version", None, opts)?;
+		if version.truncated {
+			return Err(GitError::OutputLimit {
+				args: "--version".into(),
+				limit: opts.max_stdout,
+			});
+		}
 		let probe = Self {
 			root: dir.to_path_buf(),
 		};
-		let out = probe.run(&["rev-parse", "--show-toplevel"]).map_err(
-			|e| match e {
+		already_cancelled(opts, "rev-parse --show-toplevel")?;
+		let out = probe
+			.run_with(&["rev-parse", "--show-toplevel"], opts)
+			.map_err(|e| match e {
 				GitError::Failed { ref stderr, .. }
 					if stderr.contains("not a git repository") =>
 				{
 					GitError::NotARepository(dir.to_path_buf())
 				}
 				e => e,
-			},
-		)?;
-		let top = String::from_utf8(out).map_err(|_| {
-			GitError::Malformed("repository path is not UTF-8".into())
+			})?;
+		if out.truncated {
+			return Err(GitError::OutputLimit {
+				args: "rev-parse --show-toplevel".into(),
+				limit: opts.max_stdout,
+			});
+		}
+		// Exactly one terminating newline: a path may end in another.
+		let top = out.stdout.strip_suffix(b"\n").ok_or_else(|| {
+			GitError::Malformed("rev-parse --show-toplevel output".into())
 		})?;
 		Ok(Self {
-			root: PathBuf::from(top.trim_end_matches(['\n', '\r'])),
+			root: path_from_git_bytes(top)?,
 		})
 	}
 
@@ -115,7 +205,9 @@ impl Git {
 		&self.root
 	}
 
-	pub fn command(&self) -> Command {
+	/// A git command in this repository; run it with [`Git::exec`] so it
+	/// counts against the budget.
+	pub(crate) fn command(&self) -> Command {
 		let mut cmd = git_command();
 		cmd.current_dir(&self.root);
 		cmd
@@ -123,33 +215,163 @@ impl Git {
 
 	/// Runs `git <args>` and returns stdout; a non-zero exit is an error.
 	pub fn run(&self, args: &[&str]) -> Result<Vec<u8>, GitError> {
-		let out = self.command().args(args).stdin(Stdio::null()).output()?;
-		if !out.status.success() {
-			return Err(GitError::Failed {
-				args: args.join(" "),
-				stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-			});
+		Ok(self.run_with(args, &RunOptions::default())?.stdout)
+	}
+
+	/// [`Git::run`] with explicit limits, deadline and cancellation.
+	pub fn run_with(
+		&self,
+		args: &[&str],
+		opts: &RunOptions,
+	) -> Result<RunOutput, GitError> {
+		let mut cmd = self.command();
+		cmd.args(args);
+		self.exec(cmd, &args.join(" "), None, opts)
+	}
+
+	pub(crate) fn exec(
+		&self,
+		cmd: Command,
+		label: &str,
+		input: Option<&[u8]>,
+		opts: &RunOptions,
+	) -> Result<RunOutput, GitError> {
+		let done = gitrun::run(cmd, label, input, opts)?;
+		match done.status {
+			Some(s) if !s.success() => Err(GitError::Failed {
+				args: label.to_string(),
+				stderr: String::from_utf8_lossy(&done.stderr)
+					.trim()
+					.to_string(),
+				code: s.code(),
+			}),
+			// `None` only for an explicitly truncated run.
+			_ => Ok(RunOutput {
+				stdout: done.stdout,
+				truncated: done.truncated,
+			}),
 		}
-		Ok(out.stdout)
 	}
 
 	/// Resolves `rev` to a full commit OID. A leading `-` is refused so a
-	/// revision can never be read as an option by a later git call.
+	/// Resolves `rev` to a full commit OID. A leading `-` is refused so a
+	/// revision can never be read as an option by a later git call. Only a
+	/// revision git cannot resolve is `InvalidRevision`; a failing git is
+	/// reported as itself.
 	pub fn resolve_commit(&self, rev: &str) -> Result<String, GitError> {
+		self.resolve_commit_with(rev, &RunOptions::default())
+	}
+
+	/// Resolves `rev` to a full commit OID under explicit runner options.
+	pub fn resolve_commit_with(
+		&self,
+		rev: &str,
+		opts: &RunOptions,
+	) -> Result<String, GitError> {
 		if rev.is_empty() || rev.starts_with('-') {
 			return Err(GitError::InvalidRevision(rev.to_string()));
 		}
 		let spec = format!("{rev}^{{commit}}");
-		let out = self
-			.run(&["rev-parse", "--verify", "--quiet", &spec])
-			.map_err(|_| GitError::InvalidRevision(rev.to_string()))?;
-		Ok(String::from_utf8_lossy(&out).trim().to_string())
+		match self.run_with(&["rev-parse", "--verify", "--quiet", &spec], opts)
+		{
+			Ok(out) => {
+				if out.truncated {
+					return Err(GitError::OutputLimit {
+						args: format!("rev-parse --verify {spec}"),
+						limit: opts.max_stdout,
+					});
+				}
+				let text = std::str::from_utf8(&out.stdout)
+					.map_err(|_| {
+						GitError::Malformed("rev-parse output not utf-8".into())
+					})?
+					.trim();
+				// Full OID must be exactly 40 (SHA-1) or 64 (SHA-256) hex digits.
+				if (text.len() != 40 && text.len() != 64)
+					|| !text.bytes().all(|b| b.is_ascii_hexdigit())
+				{
+					return Err(GitError::Malformed(format!(
+						"rev-parse returned invalid commit OID: {text}"
+					)));
+				}
+				Ok(text.to_string())
+			}
+			Err(e) if is_quiet_miss(&e) => {
+				Err(GitError::InvalidRevision(rev.to_string()))
+			}
+			Err(e) => Err(e),
+		}
+	}
+
+	/// HEAD's commit under explicit runner options, `None` for an unborn branch.
+	pub fn head_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<Option<String>, GitError> {
+		match self.resolve_commit_with("HEAD", opts) {
+			Ok(sha) => Ok(Some(sha)),
+			Err(GitError::InvalidRevision(_)) => Ok(None),
+			Err(e) => Err(e),
+		}
+	}
+
+	/// HEAD's commit, `None` for an unborn branch.
+	pub fn head(&self) -> Result<Option<String>, GitError> {
+		self.head_with(&RunOptions::default())
+	}
+
+	/// The symbolic ref HEAD points at, `None` when detached.
+	/// An unborn branch still returns its symbolic name.
+	pub fn head_ref(&self) -> Result<Option<String>, GitError> {
+		self.head_ref_with(&RunOptions::default())
+	}
+
+	/// [`Git::head_ref`] under explicit runner options.
+	///
+	/// `symbolic-ref --quiet HEAD` uses `opts`. A quiet miss (detached HEAD)
+	/// is still `Ok(None)`. Any other failure, including a truncated name,
+	/// is returned as itself rather than a shortened ref.
+	pub fn head_ref_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<Option<String>, GitError> {
+		const ARGS: &str = "symbolic-ref --quiet HEAD";
+		already_cancelled(opts, ARGS)?;
+		match self.run_with(&["symbolic-ref", "--quiet", "HEAD"], opts) {
+			Ok(out) if out.truncated => Err(GitError::OutputLimit {
+				args: ARGS.into(),
+				limit: opts.max_stdout,
+			}),
+			Ok(out) => Ok(Some(
+				String::from_utf8_lossy(&out.stdout).trim().to_string(),
+			)),
+			Err(e) if is_quiet_miss(&e) => Ok(None),
+			Err(e) => Err(e),
+		}
 	}
 
 	/// The parents of `sha`, in order (empty for a root or grafted commit).
 	pub fn parents(&self, sha: &str) -> Result<Vec<String>, GitError> {
-		let out = self.run(&["rev-list", "--parents", "-n", "1", sha])?;
-		Ok(String::from_utf8_lossy(&out)
+		self.parents_with(sha, &RunOptions::default())
+	}
+
+	/// [`Git::parents`] under explicit runner options. A truncated listing is
+	/// [`GitError::OutputLimit`], not a shorter parent list.
+	pub fn parents_with(
+		&self,
+		sha: &str,
+		opts: &RunOptions,
+	) -> Result<Vec<String>, GitError> {
+		let label = format!("rev-list --parents -n 1 {sha}");
+		let out =
+			self.run_with(&["rev-list", "--parents", "-n", "1", sha], opts)?;
+		if out.truncated {
+			return Err(GitError::OutputLimit {
+				args: label,
+				limit: opts.max_stdout,
+			});
+		}
+		Ok(String::from_utf8_lossy(&out.stdout)
 			.split_ascii_whitespace()
 			.skip(1)
 			.map(str::to_string)
@@ -157,29 +379,36 @@ impl Git {
 	}
 
 	pub fn is_shallow(&self) -> Result<bool, GitError> {
-		let out = self.run(&["rev-parse", "--is-shallow-repository"])?;
-		Ok(out.trim_ascii() == b"true")
+		self.is_shallow_with(&RunOptions::default())
 	}
 
-	/// Starts a long-lived `git cat-file --batch`.
-	pub fn cat_file(&self) -> Result<CatFile, GitError> {
-		let mut child = self
-			.command()
-			.args(["cat-file", "--batch"])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::piped())
-			.stderr(Stdio::null())
-			.spawn()?;
-		let stdin = child.stdin.take();
-		let stdout = child.stdout.take().map(BufReader::new);
-		match (stdin, stdout) {
-			(Some(stdin), Some(stdout)) => Ok(CatFile {
-				child,
-				stdin: Some(stdin),
-				stdout,
-			}),
-			_ => Err(GitError::Malformed("cat-file pipes unavailable".into())),
+	/// [`Git::is_shallow`] under explicit runner options.
+	pub fn is_shallow_with(&self, opts: &RunOptions) -> Result<bool, GitError> {
+		let out =
+			self.run_with(&["rev-parse", "--is-shallow-repository"], opts)?;
+		if out.truncated {
+			return Err(GitError::OutputLimit {
+				args: "rev-parse --is-shallow-repository".into(),
+				limit: opts.max_stdout,
+			});
 		}
+		Ok(out.stdout.trim_ascii() == b"true")
+	}
+
+	/// Starts a long-lived `git cat-file --batch`. It holds one budget slot
+	/// until closed or dropped, so the same thread must not start another
+	/// Git process meanwhile ([`GitError::NestedProcess`]).
+	pub fn cat_file(&self) -> Result<CatFile, GitError> {
+		self.cat_file_with(RunOptions::default())
+	}
+
+	/// [`Git::cat_file`] with an explicit per-request deadline and cancel.
+	pub fn cat_file_with(&self, opts: RunOptions) -> Result<CatFile, GitError> {
+		let mut cmd = self.command();
+		cmd.args(["cat-file", "--batch"]);
+		Ok(CatFile {
+			session: gitrun::Session::spawn(cmd, "cat-file --batch", opts)?,
+		})
 	}
 }
 
@@ -197,17 +426,34 @@ pub struct RawEntry {
 	pub path: Vec<u8>,
 }
 
-/// Parses `--raw -z` output at the byte level (paths may not be UTF-8):
-/// `:<om> <nm> <ooid> <noid> <S>[score]\0<path>\0`, with two paths for
-/// renames and copies.
-pub fn parse_raw_z(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
-	let bad = || GitError::Malformed("raw diff record".into());
-	let mut fields = out.split(|&b| b == 0);
-	let mut entries = Vec::new();
-	while let Some(header) = fields.next() {
-		if header.is_empty() {
-			continue;
+fn is_nul(b: &u8) -> bool {
+	*b == 0
+}
+
+/// One-pass reader for [`parse_raw_z`]. Callers that must stop before the
+/// end of a diff (a budget, a cancel) use this instead of collecting every
+/// record first. Field splitting matches `split(0)`, including a trailing
+/// empty field.
+pub(crate) struct RawZ<'a> {
+	fields: std::slice::Split<'a, u8, fn(&u8) -> bool>,
+}
+
+impl<'a> RawZ<'a> {
+	pub(crate) fn new(out: &'a [u8]) -> Self {
+		Self {
+			fields: out.split(is_nul),
 		}
+	}
+
+	pub(crate) fn next_entry(&mut self) -> Result<Option<RawEntry>, GitError> {
+		let bad = || GitError::Malformed("raw diff record".into());
+		let header = loop {
+			match self.fields.next() {
+				None => return Ok(None),
+				Some([]) => continue,
+				Some(header) => break header,
+			}
+		};
 		let header =
 			std::str::from_utf8(header.strip_prefix(b":").ok_or_else(bad)?)
 				.map_err(|_| bad())?;
@@ -216,13 +462,13 @@ pub fn parse_raw_z(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
 			return Err(bad());
 		};
 		let status = *status.as_bytes().first().ok_or_else(bad)?;
-		let first = fields.next().ok_or_else(bad)?.to_vec();
+		let first = self.fields.next().ok_or_else(bad)?.to_vec();
 		let (old_path, path) = if matches!(status, b'R' | b'C') {
-			(Some(first), fields.next().ok_or_else(bad)?.to_vec())
+			(Some(first), self.fields.next().ok_or_else(bad)?.to_vec())
 		} else {
 			(None, first)
 		};
-		entries.push(RawEntry {
+		Ok(Some(RawEntry {
 			status,
 			old_mode: old_mode.to_string(),
 			new_mode: new_mode.to_string(),
@@ -230,7 +476,18 @@ pub fn parse_raw_z(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
 			new_oid: new_oid.to_string(),
 			old_path,
 			path,
-		});
+		}))
+	}
+}
+
+/// Parses `--raw -z` output at the byte level (paths may not be UTF-8):
+/// `:<om> <nm> <ooid> <noid> <S>[score]\0<path>\0`, with two paths for
+/// renames and copies.
+pub fn parse_raw_z(out: &[u8]) -> Result<Vec<RawEntry>, GitError> {
+	let mut records = RawZ::new(out);
+	let mut entries = Vec::new();
+	while let Some(entry) = records.next_entry()? {
+		entries.push(entry);
 	}
 	Ok(entries)
 }
@@ -246,41 +503,215 @@ pub fn change_type_for_status(status: u8) -> ChangeType {
 }
 
 /// A long-lived `git cat-file --batch`. Requests go one at a time (write,
-/// flush, read the answer), so neither pipe can fill up and deadlock.
+/// flush, read the answer), so neither pipe can fill up and deadlock. Each
+/// request has its own deadline.
 pub struct CatFile {
-	child: Child,
-	stdin: Option<ChildStdin>,
-	stdout: BufReader<ChildStdout>,
+	session: gitrun::Session,
+}
+
+/// One `cat-file --batch` answer read with a size cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatObject {
+	Missing,
+	/// The header fixed OID and size; the body was skipped unread.
+	TooLarge {
+		oid: String,
+		size: u64,
+	},
+	Found {
+		oid: String,
+		kind: String,
+		body: Vec<u8>,
+	},
 }
 
 impl CatFile {
+	fn request(&mut self, object: &str) -> Result<(), GitError> {
+		let Some(stdin) = self.session.begin() else {
+			return Err(GitError::Malformed("cat-file stdin closed".into()));
+		};
+		let sent = stdin
+			.write_all(format!("{object}\n").as_bytes())
+			.and_then(|()| stdin.flush());
+		sent.map_err(|e| self.session.error(e))
+	}
+
 	/// Reads an object (`<oid>` or `<rev>:<path>`). `None` = missing.
-	pub fn read(&mut self, object: &str) -> io::Result<Option<Vec<u8>>> {
+	pub fn read(&mut self, object: &str) -> Result<Option<Vec<u8>>, GitError> {
 		if object.contains(['\n', '\r']) {
 			// The protocol is line based; such a request would desync it.
 			return Ok(None);
 		}
-		let stdin = self.stdin.as_mut().ok_or(io::ErrorKind::BrokenPipe)?;
-		stdin.write_all(format!("{object}\n").as_bytes())?;
-		stdin.flush()?;
-		read_batch_response(&mut self.stdout)
+		self.request(object)?;
+		read_batch_response(&mut self.session)
+			.map_err(|e| self.session.error(e))
+	}
+
+	/// Reads `object` only if its size, taken from the header before any
+	/// body byte, is at most `max`. The returned OID is the object the body
+	/// belongs to, so a ref moving meanwhile cannot mix two versions.
+	pub fn read_object(
+		&mut self,
+		object: &str,
+		max: u64,
+	) -> Result<CatObject, GitError> {
+		if object.contains(['\n', '\r']) {
+			return Ok(CatObject::Missing);
+		}
+		self.request(object)?;
+		let s = &mut self.session;
+		let header = read_batch_header(s).map_err(|e| s.error(e))?;
+		let Some((oid, kind, size)) = header else {
+			return Ok(CatObject::Missing);
+		};
+		if size > max {
+			// Stay in protocol sync without holding the body.
+			let skipped = io::copy(&mut s.take(size + 1), &mut io::sink())
+				.map_err(|e| s.error(e))?;
+			if skipped != size + 1 {
+				return Err(GitError::Malformed(
+					"cat-file body truncated".into(),
+				));
+			}
+			return Ok(CatObject::TooLarge { oid, size });
+		}
+		let body = read_batch_body(s, size).map_err(|e| s.error(e))?;
+		Ok(CatObject::Found { oid, kind, body })
+	}
+
+	/// Reads a blob, retaining its body only when `size <= max_retain`.
+	///
+	/// A larger body is scanned and discarded: a NUL is [`SkippedBlob::Binary`],
+	/// invalid UTF-8 is [`SkippedBlob::NotUtf8`], and valid UTF-8 is
+	/// [`SkippedBlob::TextLargerThanCap`]. The batch stays in sync either way.
+	/// `max_retain` is a raw-byte cap, not a JSON cap; callers that need the
+	/// escaped size check that after a retained body comes back.
+	pub(crate) fn read_blob_capped(
+		&mut self,
+		object: &str,
+		max_retain: u64,
+	) -> Result<CappedBlob, GitError> {
+		if object.contains(['\n', '\r']) {
+			return Ok(CappedBlob::Missing);
+		}
+		self.request(object)?;
+		let s = &mut self.session;
+		let header = read_batch_header(s).map_err(|e| s.error(e))?;
+		let Some((_oid, _kind, size)) = header else {
+			return Ok(CappedBlob::Missing);
+		};
+		if size <= max_retain {
+			let body = read_batch_body(s, size).map_err(|e| s.error(e))?;
+			return Ok(CappedBlob::Retained(body));
+		}
+		let class = scan_discarded_body(s, size).map_err(|e| s.error(e))?;
+		Ok(CappedBlob::Skipped(class))
+	}
+
+	/// Ends the batch and reports any cleanup failure. Dropping a
+	/// `CatFile` kills the process instead.
+	pub fn close(self) -> Result<(), GitError> {
+		self.session.close()
 	}
 }
 
-impl Drop for CatFile {
-	fn drop(&mut self) {
-		// Closing stdin ends the batch; then reap the process.
-		self.stdin.take();
-		let _ = self.child.wait();
-	}
+/// A blob read by [`CatFile::read_blob_capped`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CappedBlob {
+	Missing,
+	/// `size <= max_retain`. The caller still applies NUL / UTF-8 rules.
+	Retained(Vec<u8>),
+	/// Body was not stored.
+	Skipped(SkippedBlob),
 }
 
-/// Reads one `git cat-file --batch` response: `<oid> <type> <size>\n`
-/// followed by exactly `size` bytes and a LF, or `<object> missing\n`.
-/// `None` means the object is missing (or ambiguous).
-pub fn read_batch_response<R: BufRead>(
+/// Why [`CappedBlob::Skipped`] did not keep the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkippedBlob {
+	/// A NUL byte. Same rule as `content.contains(&0)` on a retained body.
+	Binary,
+	NotUtf8,
+	/// Valid UTF-8 whose raw size is above the retain cap.
+	TextLargerThanCap {
+		size: u64,
+	},
+}
+
+/// Consumes a cat-file body of `size` bytes plus its trailing LF without
+/// storing it. NUL wins over invalid UTF-8, matching a full-buffer check.
+fn scan_discarded_body<R: BufRead>(
 	reader: &mut R,
-) -> io::Result<Option<Vec<u8>>> {
+	size: u64,
+) -> io::Result<SkippedBlob> {
+	let mut left = size;
+	let mut saw_nul = false;
+	let mut invalid = false;
+	let mut carry = Vec::new();
+	let mut buf = [0u8; 8192];
+	while left > 0 {
+		let n = usize::try_from(left.min(buf.len() as u64))
+			.map_err(io::Error::other)?;
+		reader.read_exact(&mut buf[..n])?;
+		left -= n as u64;
+		if !saw_nul && buf[..n].contains(&0) {
+			saw_nul = true;
+		}
+		if !saw_nul
+			&& !invalid
+			&& utf8_chunk_invalid(&mut carry, &buf[..n], left == 0)
+		{
+			invalid = true;
+		}
+	}
+	let mut lf = [0u8; 1];
+	reader.read_exact(&mut lf)?;
+	if saw_nul {
+		Ok(SkippedBlob::Binary)
+	} else if invalid {
+		Ok(SkippedBlob::NotUtf8)
+	} else {
+		Ok(SkippedBlob::TextLargerThanCap { size })
+	}
+}
+
+/// `true` when `carry` + `chunk` is not valid UTF-8. An incomplete sequence
+/// at the end is kept in `carry` (at most 3 bytes) unless this is the last
+/// chunk, in which case it is invalid. A chunk is at most 8 KiB; the object
+/// body is not assembled.
+fn utf8_chunk_invalid(carry: &mut Vec<u8>, chunk: &[u8], eof: bool) -> bool {
+	if carry.is_empty() {
+		return match std::str::from_utf8(chunk) {
+			Ok(_) => false,
+			Err(e) => match e.error_len() {
+				Some(_) => true,
+				None => {
+					carry.extend_from_slice(&chunk[e.valid_up_to()..]);
+					eof
+				}
+			},
+		};
+	}
+	let mut tmp = Vec::with_capacity(carry.len() + chunk.len());
+	tmp.extend_from_slice(carry);
+	tmp.extend_from_slice(chunk);
+	carry.clear();
+	match std::str::from_utf8(&tmp) {
+		Ok(_) => false,
+		Err(e) => match e.error_len() {
+			Some(_) => true,
+			None => {
+				carry.extend_from_slice(&tmp[e.valid_up_to()..]);
+				eof
+			}
+		},
+	}
+}
+
+/// Reads one `cat-file --batch` header: `<oid> <type> <size>\n`, or
+/// `<object> missing\n` / `ambiguous` (`None`).
+pub fn read_batch_header<R: BufRead>(
+	reader: &mut R,
+) -> io::Result<Option<(String, String, u64)>> {
 	let mut header = Vec::new();
 	reader.read_until(b'\n', &mut header)?;
 	if header.pop() != Some(b'\n') {
@@ -289,15 +720,40 @@ pub fn read_batch_response<R: BufRead>(
 	let header = String::from_utf8_lossy(&header);
 	// "<oid> <type> <size>": size is the last field. `missing` and
 	// `ambiguous` responses carry no body.
-	let Ok(size) = header.rsplit(' ').next().unwrap_or("").parse::<usize>()
+	let mut fields = header.rsplitn(3, ' ');
+	let (Some(size), Some(kind), Some(oid)) =
+		(fields.next(), fields.next(), fields.next())
 	else {
 		return Ok(None);
 	};
+	Ok(size
+		.parse::<u64>()
+		.ok()
+		.map(|size| (oid.to_string(), kind.to_string(), size)))
+}
+
+fn read_batch_body<R: BufRead>(
+	reader: &mut R,
+	size: u64,
+) -> io::Result<Vec<u8>> {
+	let size = usize::try_from(size).map_err(io::Error::other)?;
 	let mut body = vec![0; size];
 	reader.read_exact(&mut body)?;
 	let mut lf = [0u8; 1];
 	reader.read_exact(&mut lf)?;
-	Ok(Some(body))
+	Ok(body)
+}
+
+/// Reads one `git cat-file --batch` response: `<oid> <type> <size>\n`
+/// followed by exactly `size` bytes and a LF, or `<object> missing\n`.
+/// `None` means the object is missing (or ambiguous).
+pub fn read_batch_response<R: BufRead>(
+	reader: &mut R,
+) -> io::Result<Option<Vec<u8>>> {
+	match read_batch_header(reader)? {
+		Some((_, _, size)) => read_batch_body(reader, size).map(Some),
+		None => Ok(None),
+	}
 }
 
 /// Which changes to copy.
@@ -369,14 +825,41 @@ fn is_zero_oid(oid: &str) -> bool {
 	oid.bytes().all(|b| b == b'0')
 }
 
-fn read_text(cat: &mut CatFile, oid: &str) -> io::Result<Option<String>> {
-	Ok(cat.read(oid)?.and_then(decode_utf8_or_skip))
+/// A blob, capped at `max` bytes when given (checked from its header).
+fn read_blob(
+	cat: &mut CatFile,
+	object: &str,
+	max: Option<u64>,
+) -> Result<Option<Vec<u8>>, GitError> {
+	let Some(max) = max else {
+		return cat.read(object);
+	};
+	match cat.read_object(object, max)? {
+		CatObject::Missing => Ok(None),
+		CatObject::TooLarge { .. } => Err(GitError::OutputLimit {
+			args: format!("cat-file {object}"),
+			limit: usize::try_from(max).unwrap_or(usize::MAX),
+		}),
+		CatObject::Found { body, .. } => Ok(Some(body)),
+	}
+}
+
+fn read_text(
+	cat: &mut CatFile,
+	oid: &str,
+	max: Option<u64>,
+) -> Result<Option<String>, GitError> {
+	Ok(read_blob(cat, oid, max)?.and_then(decode_utf8_or_skip))
 }
 
 /// The pre-deletion content from the first OID that decodes, else the marker.
-fn deleted_content(cat: &mut CatFile, oids: &[String]) -> io::Result<String> {
+fn deleted_content(
+	cat: &mut CatFile,
+	oids: &[String],
+	max: Option<u64>,
+) -> Result<String, GitError> {
 	for oid in oids.iter().filter(|o| !is_zero_oid(o)) {
-		if let Some(text) = read_text(cat, oid)? {
+		if let Some(text) = read_text(cat, oid, max)? {
 			return Ok(text);
 		}
 	}
@@ -398,8 +881,8 @@ fn path_entry(status: u8, path: Vec<u8>) -> RawEntry {
 /// Unmerged paths from `git ls-files -u -z`, labelled like VS Code's merge
 /// changes: a conflict missing ours or theirs (UD, DU, DD) is `D`, every
 /// other kind (UU, AA, AU, UA) is `M`.
-fn unmerged(git: &Git) -> Result<Vec<RawEntry>, GitError> {
-	let out = git.run(&["ls-files", "-u", "-z"])?;
+fn unmerged(git: &Git, opts: &RunOptions) -> Result<Vec<RawEntry>, GitError> {
+	let out = run_strict(git, &["ls-files", "-u", "-z"], opts)?;
 	// Each record is `<mode> <oid> <stage>\t<path>`, one per stage.
 	let mut stages: Vec<(Vec<u8>, [bool; 3])> = Vec::new();
 	for rec in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
@@ -431,10 +914,14 @@ fn unmerged(git: &Git) -> Result<Vec<RawEntry>, GitError> {
 
 const RAW: [&str; 4] = ["-z", "--raw", "--no-abbrev", "-M"];
 
-fn diff(git: &Git, args: &[&str]) -> Result<Vec<RawEntry>, GitError> {
+fn diff(
+	git: &Git,
+	args: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<RawEntry>, GitError> {
 	let mut all = vec!["diff"];
 	all.extend_from_slice(args);
-	parse_raw_z(&git.run(&all)?)
+	parse_raw_z(&run_strict(git, &all, opts)?)
 }
 
 /// Collects the changed files of `source` as payload files.
@@ -460,11 +947,23 @@ pub fn list_changed_paths(
 	git: &Git,
 	source: &GitSource,
 ) -> Result<Vec<(String, Option<ChangeType>)>, GitError> {
-	Ok(collect_changes(git, source)?
+	list_changed_paths_with(git, source, &RunOptions::default())
+}
+
+/// [`list_changed_paths`] with cancellation, deadlines and strict metadata
+/// output limits propagated through every nested Git command.
+pub fn list_changed_paths_with(
+	git: &Git,
+	source: &GitSource,
+	opts: &RunOptions,
+) -> Result<Vec<(String, Option<ChangeType>)>, GitError> {
+	let paths = collect_changes(git, source, opts)?
 		.0
 		.into_iter()
 		.map(|c| (c.path, Some(change_type_for_status(c.status))))
-		.collect())
+		.collect();
+	already_cancelled(opts, "list changed paths")?;
+	Ok(paths)
 }
 
 /// Ordered change metadata without reading file contents, plus the number of
@@ -472,21 +971,28 @@ pub fn list_changed_paths(
 fn collect_changes(
 	git: &Git,
 	source: &GitSource,
+	opts: &RunOptions,
 ) -> Result<(Vec<Change>, usize), GitError> {
+	already_cancelled(opts, "collect changes")?;
 	let mut skipped = 0;
 	let mut changes = Vec::new();
 	match source {
 		GitSource::Working => {
 			// VS Code keeps conflicts out of the working and index lists and
 			// reports them as merge changes between untracked and index.
-			let conflicts = unmerged(git)?;
+			let conflicts = unmerged(git, opts)?;
 			let resolved =
 				|e: &RawEntry| !conflicts.iter().any(|c| c.path == e.path);
-			let worktree =
-				diff(git, &RAW)?.into_iter().filter(resolved).collect();
+			let worktree = diff(git, &RAW, opts)?
+				.into_iter()
+				.filter(resolved)
+				.collect();
 			union_into(&mut changes, worktree, &mut skipped);
-			let out =
-				git.run(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+			let out = run_strict(
+				git,
+				&["ls-files", "--others", "--exclude-standard", "-z"],
+				opts,
+			)?;
 			let untracked = out
 				.split(|&b| b == 0)
 				// A trailing `/` is a nested repository, not a file.
@@ -498,8 +1004,10 @@ fn collect_changes(
 			union_into(&mut changes, merge, &mut skipped);
 			let mut cached = vec!["--cached"];
 			cached.extend_from_slice(&RAW);
-			let index =
-				diff(git, &cached)?.into_iter().filter(resolved).collect();
+			let index = diff(git, &cached, opts)?
+				.into_iter()
+				.filter(resolved)
+				.collect();
 			union_into(&mut changes, index, &mut skipped);
 			// TS reads every deletion at `HEAD:<path>`; an unborn HEAD is
 			// simply missing there, so the marker follows.
@@ -511,48 +1019,53 @@ fn collect_changes(
 			let mut cached = vec!["--cached"];
 			cached.extend_from_slice(&RAW);
 			// A conflict is a merge change, not an index change.
-			let index = diff(git, &cached)?
+			let index = diff(git, &cached, opts)?
 				.into_iter()
 				.filter(|e| e.status != b'U')
 				.collect();
 			union_into(&mut changes, index, &mut skipped);
 		}
 		GitSource::Commit(rev) => {
-			let sha = git.resolve_commit(rev)?;
-			let mut parents = git.parents(&sha)?;
+			let sha = git.resolve_commit_with(rev, opts)?;
+			let mut parents = git.parents_with(&sha, opts)?;
 			if parents.is_empty() {
 				// A shallow clone grafts its boundary commits to look
 				// parentless; diffing one against the empty tree would copy
 				// the whole repository as "this commit's change".
-				if git.is_shallow()? {
+				if git.is_shallow_with(opts)? {
 					return Err(GitError::Shallow(sha));
 				}
 				parents.push(EMPTY_TREE.to_string());
 			}
 			for parent in &parents {
-				let out = git.run(&[
-					"diff-tree",
-					"-r",
-					"-z",
-					"--raw",
-					"--no-abbrev",
-					"--no-commit-id",
-					"-M",
-					parent,
-					&sha,
-				])?;
+				let out = run_strict(
+					git,
+					&[
+						"diff-tree",
+						"-r",
+						"-z",
+						"--raw",
+						"--no-abbrev",
+						"--no-commit-id",
+						"-M",
+						parent,
+						&sha,
+					],
+					opts,
+				)?;
 				union_into(&mut changes, parse_raw_z(&out)?, &mut skipped);
 			}
 		}
 		GitSource::Range(from, to) => {
-			let from = git.resolve_commit(from)?;
-			let to = git.resolve_commit(to)?;
+			let from = git.resolve_commit_with(from, opts)?;
+			let to = git.resolve_commit_with(to, opts)?;
 			let mut args = RAW.to_vec();
 			args.extend([from.as_str(), to.as_str()]);
-			union_into(&mut changes, diff(git, &args)?, &mut skipped);
+			union_into(&mut changes, diff(git, &args, opts)?, &mut skipped);
 		}
 	}
 
+	already_cancelled(opts, "collect changes")?;
 	Ok((changes, skipped))
 }
 
@@ -560,53 +1073,119 @@ fn collect_raw(
 	git: &Git,
 	source: &GitSource,
 ) -> Result<(Vec<PayloadFile>, usize), GitError> {
-	let (changes, skipped) = collect_changes(git, source)?;
-	Ok((read_changes(git, source, changes)?, skipped))
+	let opts = RunOptions::default();
+	let (changes, skipped) = collect_changes(git, source, &opts)?;
+	Ok((read_changes(git, source, changes, None, &opts)?, skipped))
 }
 
 /// Read only the clicked path; listing a large repository never reads blobs.
+/// `None` when `path` is not a change of `source`, so one listing both
+/// checks membership and finds the file. Content above `max` bytes is
+/// [`GitError::OutputLimit`], judged from the blob header or file size
+/// before it is read.
 pub fn read_changed_file(
 	git: &Git,
 	source: &GitSource,
 	path: &str,
+	max: u64,
 ) -> Result<Option<PayloadFile>, GitError> {
-	let (changes, _) = collect_changes(git, source)?;
+	read_changed_file_inner(git, source, path, max, &RunOptions::default())
+}
+
+/// [`read_changed_file`] with explicit runner options through membership,
+/// revision resolution, deleted-content lookup and blob reads. Both metadata
+/// and content are strict even with [`crate::gitrun::Overflow::Truncate`].
+/// Content is capped at the smaller of `max` and `opts.max_stdout`.
+pub fn read_changed_file_with(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+	max: u64,
+	opts: &RunOptions,
+) -> Result<Option<PayloadFile>, GitError> {
+	read_changed_file_inner(
+		git,
+		source,
+		path,
+		max.min(opts.max_stdout as u64),
+		opts,
+	)
+}
+
+fn read_changed_file_inner(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+	max: u64,
+	opts: &RunOptions,
+) -> Result<Option<PayloadFile>, GitError> {
+	let (changes, _) = collect_changes(git, source, opts)?;
 	Ok(read_changes(
 		git,
 		source,
 		changes.into_iter().filter(|c| c.path == path).collect(),
+		Some(max),
+		opts,
 	)?
 	.pop())
+}
+
+/// A working-tree file, at most `max` bytes when given. Unreadable is
+/// `None` like the SCM view (TS parity); too large is an error.
+fn read_working(
+	path: &Path,
+	max: Option<u64>,
+) -> Result<Option<String>, GitError> {
+	let Some(max) = max else {
+		return Ok(read_text_file(path).ok().flatten());
+	};
+	let Ok(file) = std::fs::File::open(path) else {
+		return Ok(None);
+	};
+	let mut bytes = Vec::new();
+	file.take(max + 1).read_to_end(&mut bytes)?;
+	if bytes.len() as u64 > max {
+		return Err(GitError::OutputLimit {
+			args: path.display().to_string(),
+			limit: usize::try_from(max).unwrap_or(usize::MAX),
+		});
+	}
+	Ok(decode_utf8_or_skip(bytes))
 }
 
 fn read_changes(
 	git: &Git,
 	source: &GitSource,
 	changes: Vec<Change>,
+	max: Option<u64>,
+	opts: &RunOptions,
 ) -> Result<Vec<PayloadFile>, GitError> {
-	let mut cat = git.cat_file()?;
+	already_cancelled(opts, "read changes")?;
+	let mut cat = git.cat_file_with(opts.clone())?;
 	let mut files = Vec::new();
 	for c in changes {
+		already_cancelled(opts, "read changed file")?;
 		let change_type = change_type_for_status(c.status);
 		let content = if change_type == ChangeType::Deleted {
-			Some(deleted_content(&mut cat, &c.deleted_from)?)
+			Some(deleted_content(&mut cat, &c.deleted_from, max)?)
 		} else {
 			match source {
 				GitSource::Working => {
-					read_text_file(&git.root.join(&c.path)).ok().flatten()
+					read_working(&git.root.join(&c.path), max)?
 				}
 				// Staged content was asked for: an index entry that cannot
 				// be read is a visible placeholder, never a silent gap.
 				// TS: `readRefContent(...) ?? UNREADABLE_FILE_MARKER`, so a
 				// non-UTF-8 blob is the marker too.
 				GitSource::Staged => Some(
-					cat.read(&c.new_oid)?
+					read_blob(&mut cat, &c.new_oid, max)?
 						.and_then(decode_utf8_or_skip)
 						.unwrap_or_else(|| UNREADABLE_FILE_MARKER.to_string()),
 				),
-				_ => read_text(&mut cat, &c.new_oid)?,
+				_ => read_text(&mut cat, &c.new_oid, max)?,
 			}
 		};
+		already_cancelled(opts, "read changed file")?;
 		files.push(PayloadFile {
 			path: c.path,
 			content,
@@ -614,6 +1193,8 @@ fn read_changes(
 			skipped_reason: None,
 		});
 	}
+	cat.close()?;
+	already_cancelled(opts, "read changes")?;
 	Ok(files)
 }
 
@@ -906,6 +1487,74 @@ mod tests {
 		);
 		assert_eq!(cat.read("HEAD:nope.txt").unwrap(), None);
 		assert_eq!(cat.read("HEAD:a.txt").unwrap().map(|b| b.len()), Some(11));
+	}
+
+	#[test]
+	fn discarded_body_scan_matches_full_buffer_classification() {
+		let mut split = vec![b'a'; 8191];
+		split.extend_from_slice("你".as_bytes());
+		assert_eq!(
+			classify_discarded(&split),
+			SkippedBlob::TextLargerThanCap {
+				size: split.len() as u64
+			}
+		);
+		let mut broken = vec![b'a'; 8191];
+		broken.push(0xE4);
+		broken.push(b' ');
+		assert_eq!(classify_discarded(&broken), SkippedBlob::NotUtf8);
+		let mut binary = vec![b'a'; 9000];
+		binary.push(0);
+		assert_eq!(classify_discarded(&binary), SkippedBlob::Binary);
+	}
+
+	fn classify_discarded(body: &[u8]) -> SkippedBlob {
+		let mut raw = body.to_vec();
+		raw.push(b'\n');
+		scan_discarded_body(&mut std::io::Cursor::new(raw), body.len() as u64)
+			.unwrap()
+	}
+
+	#[test]
+	fn capped_blob_does_not_keep_an_oversize_body_and_stays_in_sync() {
+		let r = Repo::new();
+		let big = "你".repeat(12_000);
+		r.write("big.txt", big.as_bytes());
+		r.write("late.bin", &{
+			let mut v = vec![b'B'; 20_000];
+			v.push(0);
+			v
+		});
+		r.write("bad.txt", &{
+			let v = vec![0xFF; 10_000];
+			v
+		});
+		r.write("small.txt", b"small\n");
+		r.commit("blobs");
+		let git = Git::open(&r.path()).unwrap();
+		let big_oid = git.run(&["rev-parse", "HEAD:big.txt"]).unwrap();
+		let big_oid = String::from_utf8(big_oid).unwrap();
+		let big_oid = big_oid.trim();
+		let mut cat = git.cat_file().unwrap();
+		match cat.read_blob_capped(big_oid, 64).unwrap() {
+			CappedBlob::Skipped(SkippedBlob::TextLargerThanCap { size }) => {
+				assert_eq!(size, big.len() as u64);
+			}
+			other => panic!("{other:?}"),
+		}
+		match cat.read_blob_capped("HEAD:late.bin", 32).unwrap() {
+			CappedBlob::Skipped(SkippedBlob::Binary) => {}
+			other => panic!("{other:?}"),
+		}
+		match cat.read_blob_capped("HEAD:bad.txt", 32).unwrap() {
+			CappedBlob::Skipped(SkippedBlob::NotUtf8) => {}
+			other => panic!("{other:?}"),
+		}
+		match cat.read_blob_capped("HEAD:small.txt", 64).unwrap() {
+			CappedBlob::Retained(body) => assert_eq!(body, b"small\n"),
+			other => panic!("{other:?}"),
+		}
+		cat.close().unwrap();
 	}
 
 	// ---- gitCopy.test.ts ----

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,41 @@ pub struct RestorePlan {
 	pub create_operations: Vec<CreateOperation>,
 	pub delete_operations: Vec<DeleteOperation>,
 	pub skipped_operations: Vec<SkippedOperation>,
+}
+
+impl RestorePlan {
+	/// Owned buffer capacities, excluding this inline struct and allocator
+	/// bookkeeping. This includes spare vector slots and spare string/path
+	/// capacity; content length alone is not a retained-memory estimate.
+	pub fn retained_heap_bytes(&self) -> usize {
+		let mut bytes = self.roots.capacity() * size_of::<PathBuf>()
+			+ self.create_operations.capacity() * size_of::<CreateOperation>()
+			+ self.delete_operations.capacity() * size_of::<DeleteOperation>()
+			+ self.skipped_operations.capacity()
+				* size_of::<SkippedOperation>();
+		for root in &self.roots {
+			bytes = bytes.saturating_add(root.capacity());
+		}
+		for op in &self.create_operations {
+			bytes = bytes
+				.saturating_add(op.relative_path.capacity())
+				.saturating_add(op.absolute_path.capacity())
+				.saturating_add(op.content.capacity())
+				.saturating_add(op.root_path.capacity());
+		}
+		for op in &self.delete_operations {
+			bytes = bytes
+				.saturating_add(op.relative_path.capacity())
+				.saturating_add(op.absolute_path.capacity());
+		}
+		for op in &self.skipped_operations {
+			bytes =
+				bytes.saturating_add(op.raw_path.capacity()).saturating_add(
+					op.relative_path.as_ref().map_or(0, String::capacity),
+				);
+		}
+		bytes
+	}
 }
 
 /// What the user confirmed. Unchecked operations are indices into the
