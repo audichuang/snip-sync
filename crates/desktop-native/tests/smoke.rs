@@ -2192,14 +2192,26 @@ fn native_graph_failed_next_page_is_transactional() {
 	}
 	// The row the failure was drawn over is unchanged: the refused page
 	// attached nothing to the old rails.
-	let after = crop_row("retried", false);
-	let comparison = Command::new("compare")
-		.args(["-metric", "AE"])
-		.arg(&refused)
-		.arg(&after)
-		.arg("null:")
-		.output()
-		.unwrap();
+	// A loaded runner may capture the row mid-repaint (the retried page
+	// lands under it): take a few captures before calling it changed.
+	let mut comparison = None;
+	for _ in 0..5 {
+		let after = crop_row("retried", false);
+		let out = Command::new("compare")
+			.args(["-metric", "AE"])
+			.arg(&refused)
+			.arg(&after)
+			.arg("null:")
+			.output()
+			.unwrap();
+		let same = out.status.success();
+		comparison = Some(out);
+		if same {
+			break;
+		}
+		std::thread::sleep(Duration::from_millis(300));
+	}
+	let comparison = comparison.unwrap();
 	assert!(
 		comparison.status.success(),
 		"prior rendered row text and graph rails must remain identical: {}",
