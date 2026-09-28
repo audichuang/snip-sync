@@ -2692,7 +2692,9 @@ def select_tree_file(native: Any, session: Any, repo: Mapping[str, Any], fixture
         if str(parent) == ".":
             continue
         before = len(session.lines)
-        click_control(native, session, win, f"tree-row:{parent}", timeout)
+        # The chevron opens a folder without selecting it (a row click would
+        # select the folder alone and drop the other repos' picks).
+        click_control(native, session, win, f"tree-chevron:{parent}", timeout)
         wait_substr(session, f"[APP:TREE_EXPANDED: {parent}]", before, timeout)
     before = len(session.lines)
     click_control(native, session, win, f"tree-row:{path}", timeout, modifier="ctrl")
@@ -2986,7 +2988,7 @@ def run_stale_target(native: Any, sessions: Mapping[str, Any], manifest: Mapping
     parent = path.rsplit("/", 1)[0]
     if parent:
         before = len(source_session.lines)
-        click_control(native, source_session, window_of(source_session, timeout), f"tree-row:{parent}", timeout)
+        click_control(native, source_session, window_of(source_session, timeout), f"tree-chevron:{parent}", timeout)
         wait_substr(source_session, f"[APP:TREE_EXPANDED: {parent}]", before, timeout)
     before = len(source_session.lines)
     click_control(native, source_session, window_of(source_session, timeout), f"tree-row:{path}", timeout, modifier="ctrl")

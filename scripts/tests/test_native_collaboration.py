@@ -1619,9 +1619,9 @@ class MappingFlowTests(unittest.TestCase):
     def click(self, native, session, win, control, timeout, viewport=None, modifier=None):
         self.controls.append(control)
         if control.startswith("tree-row:") and modifier == "ctrl":
-            self.assertEqual(self.controls[-2], "tree-row:src")
+            self.assertEqual(self.controls[-2], "tree-chevron:src")
             session.add("[APP:BASKET: n=1]")
-        elif control.startswith("tree-row:"):
+        elif control.startswith("tree-chevron:"):
             self.assertIsNone(modifier)
             session.add(f"[APP:TREE_EXPANDED: {control.split(':', 1)[1]}]")
         elif control.startswith(("paste-map-pick:", "paste-map-keep:")):
@@ -1689,7 +1689,7 @@ class MappingFlowTests(unittest.TestCase):
         driver.block_ambiguous(self.native, self.sessions, self.manifest, {}, self.root, self.root, .001, [], self.record, self.root)
         self.assertEqual(self.record["status"], "passed")
         self.assertEqual(self.record["clipboard"]["candidateCount"], 2)
-        self.assertEqual(self.controls.count("tree-row:src"), 2)
+        self.assertEqual(self.controls.count("tree-chevron:src"), 2)
 
     def test_ambiguous_missing_second_candidate_never_passes(self):
         self.ambiguous = self.only_one_candidate = True

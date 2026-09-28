@@ -4495,6 +4495,18 @@ impl WorkbenchModel {
 		if let Some(tree) = &mut self.ws_tree {
 			tree.install_selection(candidate.ws_paths);
 		}
+		if e2e_on() {
+			// The highlighted Project rows, exactly.
+			let rows = |tree: &Option<FileTreeNode>| {
+				tree.as_ref()
+					.map_or(String::new(), |t| t.selected_paths().join(","))
+			};
+			app_log!(
+				"[APP:TREE_SELECTION: file=[{}] ws=[{}]]",
+				rows(&self.file_tree),
+				rows(&self.ws_tree)
+			);
+		}
 		// Callers emit their established action/basket event order only after
 		// this complete intent has been admitted and installed.
 		true

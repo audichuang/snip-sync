@@ -764,6 +764,8 @@ impl WorkbenchModel {
 		}
 		let rel = row.rel_path.clone();
 		let click_row = row.clone();
+		let chevron_row = row.clone();
+		let chevron_id = format!("{pre}tree-chevron:{rel}");
 		let menu_row = row.clone();
 		let is_dir = row.is_dir;
 		let row_id = if row.is_valid_utf8 {
@@ -846,13 +848,10 @@ impl WorkbenchModel {
 							this.select_tree_range(ix, ws, cx);
 						} else {
 							this.tree_cursor = ix;
-							// IntelliJ: a plain click selects the file alone
-							// and previews it; a folder click only opens it
-							// (selecting its files is Ctrl/Shift).
-							if !click_row.is_dir {
-								let rel = [click_row.rel_path.clone()];
-								this.select_tree_rows_alone(ws, &rel, cx);
-							}
+							// IntelliJ: a plain click selects the row alone,
+							// then opens the folder or previews the file.
+							let rel = [click_row.rel_path.clone()];
+							this.select_tree_rows_alone(ws, &rel, cx);
 							dispatch(
 								this,
 								command_for_row(
@@ -865,16 +864,32 @@ impl WorkbenchModel {
 					},
 				))
 			})
+			// IntelliJ: the chevron opens or closes the folder without
+			// selecting it; the row click selects it alone and opens it.
 			.child(if is_dir {
-				icon(
-					if row.is_expanded {
-						Icon::ChevronDown
-					} else {
-						Icon::ChevronRight
-					},
-					10.,
-				)
-				.into_any_element()
+				div()
+					.id(SharedString::from(chevron_id.clone()))
+					.relative()
+					.flex_shrink_0()
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.tree_cursor = ix;
+						dispatch(
+							this,
+							command_for_row(&chevron_row, RowGesture::Primary),
+							cx,
+						);
+					}))
+					.child(icon(
+						if row.is_expanded {
+							Icon::ChevronDown
+						} else {
+							Icon::ChevronRight
+						},
+						10.,
+					))
+					.children(probe(log, chevron_id))
+					.into_any_element()
 			} else {
 				div().flex_shrink_0().w(px(10.)).into_any_element()
 			})

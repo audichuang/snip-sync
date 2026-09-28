@@ -6128,6 +6128,161 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 	quit_cleanly(&mut app, &wid);
 }
 
+/// IntelliJ: a plain click on any Project row, folder or file, selects that
+/// row alone, in the open repo's tree and in the workspace tree. A folder
+/// selection is only the folder: expanding it highlights no children
+/// (they used to be inherited, so each expansion grew an earlier folder
+/// selection the plain clicks never replaced). Ctrl/Cmd-click adds.
+#[test]
+fn native_project_view_plain_click_selects_one_row() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("INVI_SRC");
+	let inner = ws.join("inner");
+	for repo in [&ws, &inner] {
+		fs::create_dir_all(repo).unwrap();
+		git_ok(repo, &["init", "-q", "-b", "master"]);
+		git_ok(repo, &["config", "user.name", "Tester"]);
+		git_ok(repo, &["config", "user.email", "test@example.com"]);
+	}
+	let java = inner.join("src/main/java");
+	for dir in ["com/bi/base", "com/bi/cub", "com/cathay", "com/cathaybk"] {
+		fs::create_dir_all(java.join(dir)).unwrap();
+		fs::write(java.join(dir).join("A.java"), "class A {}\n").unwrap();
+	}
+	fs::write(java.join("TextResource.java"), "class T {}\n").unwrap();
+	git_ok(&inner, &["add", "."]);
+	git_ok(&inner, &["commit", "-qm", "inner"]);
+	fs::create_dir_all(ws.join("docs/sub")).unwrap();
+	fs::write(ws.join("docs/sub/s.txt"), "S\n").unwrap();
+	fs::write(ws.join("docs/a.txt"), "A\n").unwrap();
+	fs::write(ws.join("docs/b.txt"), "B\n").unwrap();
+	git_ok(&ws, &["add", "docs"]);
+	git_ok(&ws, &["commit", "-qm", "base"]);
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 2]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "900"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, pre: &[&str], button: &str, post: &[&str]| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let (x, y) = (x.to_string(), y.to_string());
+		let mut args = vec!["mousemove", "--window", &wid, &x, &y];
+		args.extend_from_slice(pre);
+		args.extend_from_slice(&["click", button]);
+		args.extend_from_slice(post);
+		let st = Command::new("xdotool").args(&args).status().unwrap();
+		assert!(st.success(), "click {id}");
+	};
+	let click = |id: &str| press(id, &[], "1", &[]);
+	// Exactly these rows are highlighted after the click.
+	let only = |file: &str, ws: &str| {
+		wait_for(
+			&format!("[APP:TREE_SELECTION: file=[{file}] ws=[{ws}]]"),
+			Duration::from_secs(4),
+		);
+	};
+
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	click("repo-row:inner");
+	wait_for("(inner) root=", Duration::from_secs(4));
+	// An earlier folder pick (right-click) must not grow as folders open.
+	press("tree-row:src", &[], "3", &[]);
+	wait_for("[APP:MENU_OPEN: Left", Duration::from_secs(3));
+	key(&wid, "Escape");
+	wait_for("[APP:MENU_CLOSED]", Duration::from_secs(3));
+
+	let j = "src/main/java";
+	for (row, file) in [
+		("src".to_string(), false),
+		("src/main".to_string(), false),
+		(j.to_string(), false),
+		(format!("{j}/com"), false),
+		(format!("{j}/com/bi"), false),
+		(format!("{j}/com/bi/base"), false),
+		(format!("{j}/com/cathaybk"), false),
+		(format!("{j}/TextResource.java"), true),
+		(format!("{j}/com/bi/base/A.java"), true),
+	] {
+		click(&format!("tree-row:{row}"));
+		only(&row, "");
+		if !file {
+			wait_for(
+				&format!("[APP:TREE_EXPANDED: {row}]"),
+				Duration::from_secs(4),
+			);
+		}
+	}
+
+	// The workspace tree, with the inner repo open.
+	click("ws-tree-row:docs");
+	only("", "docs");
+	wait_for("[APP:WS_TREE_PAGE: rel=docs", Duration::from_secs(4));
+	click("ws-tree-row:docs/sub");
+	only("", "docs/sub");
+	wait_for("[APP:WS_TREE_PAGE: rel=docs/sub", Duration::from_secs(4));
+	click("ws-tree-row:docs/a.txt");
+	only("", "docs/a.txt");
+	click("ws-tree-row:docs/b.txt");
+	only("", "docs/b.txt");
+	// Ctrl/Cmd-click still adds to the selection.
+	press(
+		"ws-tree-row:docs/a.txt",
+		&["keydown", "ctrl"],
+		"1",
+		&["keyup", "ctrl"],
+	);
+	only("", "docs/a.txt,docs/b.txt");
+	quit_cleanly(&mut app, &wid);
+}
+
 /// The Project view has no checkboxes (IntelliJ): Ctrl/Cmd-click gathers
 /// files from different folders, right-click > Copy Files copies them all;
 /// Shift-click selects a range; a plain click selects one file alone.
@@ -6240,9 +6395,10 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	click("tree-row:b");
 	wait_for("[APP:TREE_EXPANDED: b]", Duration::from_secs(4));
 
-	// Ctrl-click two files in different folders, then copy by right-click.
-	ctrl_click("tree-row:a/one.txt");
-	wait_for("[APP:TREE_TOGGLED: a/one.txt]", Duration::from_secs(3));
+	// Opening a folder selected it alone. Click one file, Ctrl-click a
+	// file in another folder, then copy by right-click.
+	click("tree-row:a/one.txt");
+	wait_for("[APP:TREE_SELECTED: a/one.txt]", Duration::from_secs(3));
 	ctrl_click("tree-row:b/two.txt");
 	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
 	let both = copy_by_menu("tree-row:b/two.txt");

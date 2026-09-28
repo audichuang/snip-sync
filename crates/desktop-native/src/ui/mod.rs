@@ -1606,18 +1606,15 @@ mod tests {
 			assert!(names.contains(&want), "{want} missing: {names:?}");
 		}
 		assert!(names.contains(&"top.txt"), "{names:?}");
-		// Checking a plain folder never takes a repo's files with it.
+		// Selecting a plain folder selects it alone (Copy walks it later,
+		// never into the repo inside); the repo folder is not selectable.
 		let picked = tree
 			.selection_for_toggle(&NodeKey::from_utf8_rel("group"))
 			.unwrap();
-		assert!(
-			picked.contains(&"group/plain.txt".to_string()),
-			"{picked:?}"
-		);
-		assert!(
-			picked.iter().all(|p| !p.starts_with("group/lib")),
-			"{picked:?}"
-		);
+		assert_eq!(picked, ["group"]);
+		assert!(tree
+			.selection_for_toggle(&NodeKey::from_utf8_rel("group/lib"))
+			.is_none());
 	}
 
 	#[test]
