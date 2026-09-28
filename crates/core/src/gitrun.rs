@@ -768,7 +768,7 @@ mod tree {
 		std::time::Duration::from_secs(10);
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
 	const HELPER_CLEANUP_GRACE: std::time::Duration =
-		std::time::Duration::from_millis(200);
+		std::time::Duration::from_secs(2);
 
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
 	struct HelperGuard {
