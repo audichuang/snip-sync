@@ -486,26 +486,37 @@ impl WorkbenchModel {
 		path: &str,
 		is_dir: bool,
 	) -> Vec<MenuEntry> {
-		// A right-click inside a multi-selection copies all of it.
-		let multi = !is_dir
-			&& self.commit_file_sel.len() > 1
-			&& self.commit_file_sel.iter().any(|p| p == path);
+		// A right-click inside a multi-selection copies all of it (folders
+		// are keyed "dir/"), each file once.
+		let key = if is_dir {
+			format!("{path}/")
+		} else {
+			path.to_string()
+		};
+		let multi = self.commit_file_sel.len() > 1
+			&& self.commit_file_sel.contains(&key);
 		let targets: Vec<&str> = if multi {
 			self.commit_file_sel.iter().map(String::as_str).collect()
 		} else {
-			vec![path]
+			vec![key.as_str()]
 		};
+		let mut seen = std::collections::HashSet::new();
 		let copy: Vec<(PathBuf, String, String, bool)> = targets
 			.into_iter()
 			.flat_map(|t| {
+				let (p, dir) = match t.strip_suffix('/') {
+					Some(d) => (d, true),
+					None => (t, false),
+				};
 				commit_copy_paths(
 					&self.commit_files,
 					&self.commit_file_gitlinks,
 					self.commit_files_truncated,
-					t,
-					is_dir,
+					p,
+					dir,
 				)
 			})
+			.filter(|(p, _)| seen.insert(*p))
 			.filter_map(|(p, deleted)| {
 				let (root, sha) = self.commit_file_rev(p)?;
 				Some((root, sha, p.to_string(), deleted))

@@ -6375,6 +6375,54 @@ mod tests {
 			});
 		}
 
+		/// Copy files on a selection of a folder and files copies each file
+		/// once, deletions included (they go out as `[DELETED]`).
+		#[gpui::test]
+		fn commit_files_copy_folder_and_files_together(
+			cx: &mut TestAppContext,
+		) {
+			use crate::menu::{MenuAct, MenuEntry};
+			use snip_core::format::ChangeType::{Deleted, Modified};
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let copied = model.update(cx, |m, cx| {
+				m.log_commit_root = Some(root.clone());
+				m.compare = Some(("old".into(), "new".into()));
+				m.commit_files = [
+					("src/a.rs", Modified),
+					("src/gone.rs", Deleted),
+					("pom.xml", Modified),
+					("README.md", Modified),
+				]
+				.map(|(p, c)| (p.to_string(), Some(c)))
+				.into();
+				m.selected_commit_file = Some("src/a.rs".into());
+				m.toggle_commit_file("src/", cx);
+				m.toggle_commit_file("pom.xml", cx);
+				let menu = m.commit_file_menu("src", true);
+				menu.into_iter()
+					.find_map(|e| match e {
+						MenuEntry::Item {
+							act: Some(MenuAct::CopyRevFiles(f)),
+							..
+						} => Some(f),
+						_ => None,
+					})
+					.unwrap()
+			});
+			let got: Vec<_> =
+				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			assert_eq!(
+				got,
+				[
+					("src/a.rs", false),
+					("src/gone.rs", true),
+					("pom.xml", false)
+				]
+			);
+		}
+
 		/// Puts `payload` on the OS clipboard and opens its paste preview.
 		fn paste(
 			model: &Entity<WorkbenchModel>,

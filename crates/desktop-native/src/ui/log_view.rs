@@ -842,6 +842,24 @@ impl WorkbenchModel {
 		rows
 	}
 
+	/// Shift-click on a changed-files row: selects the shown rows (folders
+	/// keyed "dir/") from the open file to `key`.
+	fn shift_click_commit_row(&mut self, key: &str, cx: &mut Context<Self>) {
+		let shown: Vec<String> = self
+			.commit_rows(self.log_details_by_dir)
+			.iter()
+			.filter_map(|r| match r {
+				ChangeItemRow::Dir { path, .. } => Some(format!("{path}/")),
+				ChangeItemRow::File { file_idx, .. } => {
+					self.commit_files.get(*file_idx).map(|(p, _)| p.clone())
+				}
+				_ => None,
+			})
+			.collect();
+		let shown: Vec<&str> = shown.iter().map(String::as_str).collect();
+		self.extend_commit_files(&shown, key, cx);
+	}
+
 	/// The log's right pane: the selected commit's changed files grouped by
 	/// directory, then its details (or the compare's range).
 	pub(super) fn render_commit_panel(
@@ -1011,6 +1029,10 @@ impl WorkbenchModel {
 					self.changed_dirs_collapsed.iter().any(|d| d == &path);
 				let id = format!("commit-dir:{path}");
 				let p2 = path.clone();
+				// A folder in the selection is keyed "dir/".
+				let key = format!("{path}/");
+				let sel = self.rev_tree.is_none()
+					&& self.commit_file_sel.contains(&key);
 				div()
 					.id(SharedString::from(id.clone()))
 					.relative()
@@ -1023,13 +1045,20 @@ impl WorkbenchModel {
 					.pl(px(change_pad(depth)))
 					.pr(px(8.))
 					.cursor_pointer()
-					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
+					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 					.when(self.chrome.menu.is_none(), |d| {
 						d.tooltip(tip(path.clone()))
 					})
 					.on_mouse_down(MouseButton::Right, {
 						let path = path.clone();
+						let key = key.clone();
 						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+							// IntelliJ: a menu outside the selection selects
+							// its row alone.
+							if !sel && !this.commit_file_sel.is_empty() {
+								this.commit_file_sel = vec![key.clone()];
+							}
 							let items = this.commit_file_menu(&path, true);
 							w.focus(&this.log_focus);
 							this.open_menu(
@@ -1041,16 +1070,26 @@ impl WorkbenchModel {
 							);
 						})
 					})
-					.on_click(cx.listener(move |this, _, _, cx| {
-						let dirs = &mut this.changed_dirs_collapsed;
-						match dirs.iter().position(|d| d == &p2) {
-							Some(i) => {
-								dirs.remove(i);
+					.on_click(cx.listener(
+						move |this, ev: &gpui::ClickEvent, _, cx| {
+							// Cmd/Ctrl and Shift select the folder with the
+							// files; a plain click opens or closes it.
+							if ev.modifiers().secondary() {
+								return this.toggle_commit_file(&key, cx);
 							}
-							None => dirs.push(p2.clone()),
-						}
-						cx.notify();
-					}))
+							if ev.modifiers().shift {
+								return this.shift_click_commit_row(&key, cx);
+							}
+							let dirs = &mut this.changed_dirs_collapsed;
+							match dirs.iter().position(|d| d == &p2) {
+								Some(i) => {
+									dirs.remove(i);
+								}
+								None => dirs.push(p2.clone()),
+							}
+							cx.notify();
+						},
+					))
 					.child(tree_chevron(
 						format!("commit-dir-toggle:{path}"),
 						collapsed,
@@ -1111,26 +1150,11 @@ impl WorkbenchModel {
 					.on_click(cx.listener(
 						move |this, ev: &gpui::ClickEvent, _, cx| {
 							// Cmd on macOS, Ctrl elsewhere toggles the file;
-							// Shift selects the range from the open one.
+							// Shift selects the rows from the open one.
 							if ev.modifiers().secondary() {
 								this.toggle_commit_file(&p2, cx);
 							} else if ev.modifiers().shift {
-								let rows =
-									this.commit_rows(this.log_details_by_dir);
-								let shown: Vec<String> = rows
-									.iter()
-									.filter_map(|r| match r {
-										ChangeItemRow::File {
-											file_idx,
-											..
-										} => this.commit_files.get(*file_idx),
-										_ => None,
-									})
-									.map(|(p, _)| p.clone())
-									.collect();
-								let shown: Vec<&str> =
-									shown.iter().map(String::as_str).collect();
-								this.extend_commit_files(&shown, &p2, cx);
+								this.shift_click_commit_row(&p2, cx);
 							} else {
 								this.select_commit_file(&p2, cx);
 							}
