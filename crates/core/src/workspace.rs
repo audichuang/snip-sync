@@ -1122,7 +1122,8 @@ mod tests {
 	#[test]
 	fn directory_scan_page_lists_directories_first_then_name_bytes() {
 		let dir = tempfile::tempdir().unwrap();
-		for f in ["b", "B", "a10", "a2"] {
+		// No two names differ only by case: APFS and NTFS would make them one.
+		for f in ["b", "C", "a10", "a2"] {
 			fs::write(dir.path().join(f), "").unwrap();
 		}
 		for d in ["zdir", "Adir"] {
@@ -1138,8 +1139,8 @@ mod tests {
 			.iter()
 			.filter_map(ScanEntry::utf8_name)
 			.collect();
-		// Byte order, not case-folded or natural: "B" < "a10" < "a2" < "b".
-		assert_eq!(names, ["Adir", "zdir", "B", "a10", "a2", "b"]);
+		// Byte order, not case-folded or natural: "C" < "a10" < "a2" < "b".
+		assert_eq!(names, ["Adir", "zdir", "C", "a10", "a2", "b"]);
 	}
 
 	#[test]

@@ -1920,9 +1920,13 @@ fn native_graph_failed_next_page_is_transactional() {
 		.collect();
 	let first = &commits[0][..7];
 	let second = &commits[50][..7];
-	// A row near the end of the full ten-page window: on screen when the
-	// failed eleventh page is attempted and again after the retry.
-	let probe_row = format!("commit-row:{}", &commits[494][..7]);
+	// The compared row is picked once the error banner is up (see below):
+	// how far a burst of wheel clicks scrolls depends on how fast the build
+	// handles them, so no fixed row is reliably clear of the banner.
+	let row_ids: Vec<String> = commits[400..500]
+		.iter()
+		.map(|sha| format!("commit-row:{}", &sha[..7]))
+		.collect();
 	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
 	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
 	let mut app = spawn_app(
@@ -2052,10 +2056,7 @@ fn native_graph_failed_next_page_is_transactional() {
 			std::thread::sleep(Duration::from_millis(20));
 		}
 	};
-	// `skip` rows at the top of the row are left out of the crop: the
-	// error banner may overlap the row while the failure is shown, so the
-	// retried capture compares the same uncovered part (see `refused`).
-	let crop_row = |name: &str, require_error: bool, skip: Option<i32>| {
+	let crop_row = |probe_row: &str, name: &str, require_error: bool| {
 		let image = out.join(format!("graph-admission-{name}.png"));
 		let crop = out.join(format!("graph-admission-{name}-row.png"));
 		let deadline = Instant::now() + scaled(Duration::from_secs(5));
@@ -2063,7 +2064,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		// frame still moving (scroll, banner) is never the evidence.
 		let mut previous: Option<([i32; 4], Vec<u8>)> = None;
 		loop {
-			let row = control(&probe_row);
+			let row = control(probe_row);
 			let error = require_error.then(|| control("log-error"));
 			capture(&image);
 			let [x, y, w, h] = row;
@@ -2084,7 +2085,7 @@ fn native_graph_failed_next_page_is_transactional() {
 				.as_ref()
 				.is_some_and(|(r, p)| *r == row && *p == pixels.stdout);
 			previous = Some((row, pixels.stdout));
-			let stable = control(&probe_row) == row
+			let stable = control(probe_row) == row
 				&& error.is_none_or(|rect| control("log-error") == rect);
 			// Probes run during prepaint, before Vulkan presents this frame.
 			// Wait for the actual error banner, never for a matching row.
@@ -2116,19 +2117,7 @@ fn native_graph_failed_next_page_is_transactional() {
 				// Inset 1px top and bottom: the edge pixel rows blend with the
 				// neighbouring row at a fractional scroll offset, while the
 				// text and every rail crossing the row stay inside.
-				let cut = skip.unwrap_or_else(|| {
-					// The banner sits above the rows; only its lower edge
-					// can reach into this one.
-					error.map_or(0, |[_, ey, _, eh]| {
-						if ey <= y && ey + eh > y {
-							(ey + eh - y).min(h)
-						} else {
-							0
-						}
-					})
-				});
-				let (y, h) = (y + cut.max(1), h - cut.max(1) - 1);
-				assert!(h >= 6, "the error banner hides row {row:?}");
+				let (y, h) = (y + 1, h - 2);
 				assert!(Command::new("convert")
 					.arg(&image)
 					.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
@@ -2139,7 +2128,7 @@ fn native_graph_failed_next_page_is_transactional() {
 				println!(
 					"[TEST DRIVER] graph {name} row={row:?} error={error:?}"
 				);
-				return (crop, cut);
+				return crop;
 			}
 			assert!(
 				Instant::now() < deadline,
@@ -2180,7 +2169,29 @@ fn native_graph_failed_next_page_is_transactional() {
 	let rejected = scroll_until("[APP:HISTORY_ERROR]", "1", "5");
 	assert!(!rejected.iter().any(|line| line.contains("[APP:E2E_LOG:")));
 	control("log-error");
-	let (refused, cut) = crop_row("refused", true, None);
+	// The last loaded row drawn fully inside the list and clear of the banner.
+	let banner = control("log-error");
+	let list = control("log-list");
+	let clear = |[x, y, w, h]: [i32; 4]| {
+		let [bx, by, bw, bh] = banner;
+		let [_, ly, _, lh] = list;
+		let apart = y + h <= by || by + bh <= y || x + w <= bx || bx + bw <= x;
+		apart && y >= ly && y + h <= ly + lh
+	};
+	let probe_row = row_ids
+		.iter()
+		.rev()
+		.find(|id| {
+			bounds
+				.lock()
+				.unwrap()
+				.get(id.as_str())
+				.copied()
+				.is_some_and(clear)
+		})
+		.expect("a loaded row must be on screen clear of the error banner")
+		.clone();
+	let refused = crop_row(&probe_row, "refused", true);
 	// A failed read stops the automatic loading: no retry loop.
 	assert!(
 		lines_until(&app.rx, "[APP:HISTORY_ERROR]", Duration::from_secs(1))
@@ -2213,7 +2224,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	// lands under it): take a few captures before calling it changed.
 	let mut comparison = None;
 	for _ in 0..5 {
-		let (after, _) = crop_row("retried", false, Some(cut));
+		let after = crop_row(&probe_row, "retried", false);
 		let out = Command::new("compare")
 			.args(["-metric", "AE"])
 			.arg(&refused)
