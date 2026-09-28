@@ -2290,18 +2290,16 @@ impl WorkbenchModel {
 					.spawn(async move {
 						let listing = crate::interactive_read_opts(cancel);
 						let git = Git::at_known_root(root);
-						let mut lists = Vec::with_capacity(shas.len());
-						for sha in shas {
-							lists.push(
-								gitsrc::list_changed_paths_with(
-									&git,
-									&GitSource::Commit(sha),
-									&listing,
-								)
-								.map_err(|e| e.to_string())?,
-							);
-						}
-						Ok::<_, String>(union_changed_files(lists))
+						// Lazy: each listing is folded in and dropped
+						// before the next one is read.
+						union_changed_files(shas.into_iter().map(|sha| {
+							gitsrc::list_changed_paths_with(
+								&git,
+								&GitSource::Commit(sha),
+								&listing,
+							)
+							.map_err(|e| e.to_string())
+						}))
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2678,10 +2676,9 @@ impl WorkbenchModel {
 			self.selected_commit.as_ref()
 		};
 		let cur = from.and_then(|s| rows.iter().position(|r| r == s));
+		let anchor = self.selected_commit.as_deref().filter(|_| extend);
 		let next = match cur {
-			Some(c) => {
-				(c as isize + delta).clamp(0, rows.len() as isize - 1) as usize
-			}
+			Some(c) => step_row(&rows, c, delta, anchor),
 			None => 0,
 		};
 		self.log_scroll.scroll_to_item(next, ScrollStrategy::Center);
@@ -2919,6 +2916,29 @@ impl WorkbenchModel {
 	}
 }
 
+/// The row `delta` away from `cur`, clamped to the log. With an anchor
+/// (a Shift move), rows of other repositories are stepped over: the merged
+/// log interleaves them and a range stays in the anchor's repository.
+pub fn step_row(
+	rows: &[String],
+	cur: usize,
+	delta: isize,
+	anchor: Option<&str>,
+) -> usize {
+	let last = rows.len() as isize - 1;
+	let mut at = cur as isize;
+	loop {
+		let next = (at + delta).clamp(0, last);
+		if next == at {
+			return cur.min(rows.len() - 1);
+		}
+		at = next;
+		if anchor.is_none_or(|a| same_repo(a, &rows[at as usize])) {
+			return at as usize;
+		}
+	}
+}
+
 /// Both ids name commits of one repository (plain SHAs always do).
 pub fn same_repo(a: &str, b: &str) -> bool {
 	multi_log::split_id(a).1 == multi_log::split_id(b).1
@@ -2967,13 +2987,13 @@ pub type ChangedFiles = Vec<(String, Option<snip_core::format::ChangeType>)>;
 /// IntelliJ's multi-commit selection: each path once, with the change of
 /// the newest commit touching it and that commit's index. At most
 /// `MAX_COMMIT_FILES` are kept; the count of distinct paths comes last.
-pub fn union_changed_files(
-	lists: Vec<ChangedFiles>,
-) -> (ChangedFiles, Vec<u32>, usize) {
+pub fn union_changed_files<E>(
+	lists: impl IntoIterator<Item = Result<ChangedFiles, E>>,
+) -> Result<(ChangedFiles, Vec<u32>, usize), E> {
 	let mut seen = HashSet::new();
 	let (mut files, mut origin, mut total) = (Vec::new(), Vec::new(), 0);
 	for (i, list) in lists.into_iter().enumerate() {
-		for (path, change) in list {
+		for (path, change) in list? {
 			if !seen.insert(path.clone()) {
 				continue;
 			}
@@ -2984,7 +3004,7 @@ pub fn union_changed_files(
 			}
 		}
 	}
-	(files, origin, total)
+	Ok((files, origin, total))
 }
 
 /// One read of a merged-log feed: its page (plain SHAs) and, on the
@@ -4329,6 +4349,17 @@ mod tests {
 			ids(&["a3@0", "a2@0", "a1@0"])
 		);
 		assert!(range_between(&rows, "a1@0", "gone@0").is_empty());
+		// Shift+Down/Up step over the other repository's rows.
+		let owned = ids(&rows);
+		assert_eq!(step_row(&owned, 0, 1, Some("a3@0")), 2);
+		assert_eq!(step_row(&owned, 2, 1, Some("a3@0")), 4);
+		assert_eq!(step_row(&owned, 4, 1, Some("a3@0")), 4);
+		assert_eq!(step_row(&owned, 4, -1, Some("a3@0")), 2);
+		assert_eq!(step_row(&owned, 1, 1, Some("b2@1")), 3);
+		assert_eq!(step_row(&owned, 3, 1, Some("b2@1")), 3);
+		// A plain move walks every row.
+		assert_eq!(step_row(&owned, 0, 1, None), 1);
+		assert_eq!(step_row(&owned, 0, -1, None), 0);
 		// Toggle in (display order, with a gap), toggle out.
 		let sel = toggle_selection(&rows, &ids(&["a1@0"]), "a3@0").unwrap();
 		assert_eq!(sel, ids(&["a3@0", "a1@0"]));
@@ -4354,11 +4385,15 @@ mod tests {
 				.collect::<Vec<_>>()
 		};
 		// Newest first: a.txt deleted in the newest, added in the oldest.
-		let (files, origin, total) = union_changed_files(vec![
-			list(&[("a.txt", Deleted), ("b.txt", Modified)]),
-			list(&[("c.txt", New)]),
-			list(&[("a.txt", New), ("c.txt", Modified)]),
-		]);
+		let (files, origin, total) = union_changed_files(
+			[
+				list(&[("a.txt", Deleted), ("b.txt", Modified)]),
+				list(&[("c.txt", New)]),
+				list(&[("a.txt", New), ("c.txt", Modified)]),
+			]
+			.map(Ok::<_, ()>),
+		)
+		.unwrap();
 		assert_eq!(
 			files,
 			list(&[("a.txt", Deleted), ("b.txt", Modified), ("c.txt", New)])
@@ -4370,7 +4405,7 @@ mod tests {
 			.map(|i| (format!("f{i}"), Some(Modified)))
 			.collect();
 		let (files, origin, total) =
-			union_changed_files(vec![many.clone(), many]);
+			union_changed_files([many.clone(), many].map(Ok::<_, ()>)).unwrap();
 		assert_eq!(files.len(), MAX_COMMIT_FILES);
 		assert_eq!(origin.len(), MAX_COMMIT_FILES);
 		assert_eq!(total, MAX_COMMIT_FILES + 2);

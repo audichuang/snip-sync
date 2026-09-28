@@ -902,6 +902,11 @@ pub struct WorkbenchModel {
 	pub changed_dirs_collapsed: Vec<String>,
 	/// The changed-files pane groups by directory (else a flat list).
 	pub log_details_by_dir: bool,
+	/// The changed-files rows, keyed on a hash of what builds them: the
+	/// tree sorts up to `MAX_COMMIT_FILES` paths, too slow for every frame.
+	pub commit_rows_cache: std::cell::RefCell<
+		Option<(u64, std::rc::Rc<Vec<crate::ui::ChangeItemRow>>)>,
+	>,
 	pub commit_details: Option<crate::history::CommitDetails>,
 	pub details_generation: u64,
 	pub details_cancel: Option<CancelToken>,
@@ -1273,6 +1278,7 @@ impl WorkbenchModel {
 			log_width: Default::default(),
 			changed_dirs_collapsed: Vec::new(),
 			log_details_by_dir: true,
+			commit_rows_cache: Default::default(),
 			commit_details: None,
 			details_generation: 0,
 			details_cancel: None,
@@ -2334,6 +2340,7 @@ impl WorkbenchModel {
 		self.select_head_after_load = false;
 		release_vec(&mut self.commit_files);
 		release_vec(&mut self.commit_file_origin);
+		self.commit_rows_cache.take();
 		self.log_first_page = 0;
 		self.history_extending = false;
 		self.history_autoload = true;
@@ -2345,7 +2352,6 @@ impl WorkbenchModel {
 		release_vec(&mut self.log_paths_expanded);
 		release_vec(&mut self.log_feeds);
 		release_vec(&mut self.log_scope_key);
-		release_vec(&mut self.log_repo_filter);
 		self.log_commit_root = None;
 		self.commit_details = None;
 		self.details_generation = self.details_generation.wrapping_add(1);
@@ -2850,6 +2856,11 @@ impl WorkbenchModel {
 			app_log!("[APP:REPO_VANISHED: {name}]");
 			self.set_status("status_repo_vanished", [name]);
 			self.refresh_reload = false;
+			// The log shows the workspace, not the dropped repository:
+			// reload it over the repositories left.
+			if !self.repos.is_empty() {
+				self.load_history(cx);
+			}
 		} else if std::mem::take(&mut self.refresh_reload) {
 			if let (Some(idx), Some(_)) = (self.selected_repo_idx, self.repo())
 			{

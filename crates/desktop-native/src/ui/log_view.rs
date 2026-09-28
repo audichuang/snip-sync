@@ -823,6 +823,25 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
+	/// The changed-files rows, rebuilt only when their inputs change.
+	fn commit_rows(&self, by_dir: bool) -> Rc<Vec<ChangeItemRow>> {
+		use std::hash::{Hash, Hasher};
+		let mut h = std::collections::hash_map::DefaultHasher::new();
+		(&self.commit_files, by_dir, &self.changed_dirs_collapsed).hash(&mut h);
+		let key = h.finish();
+		let mut cache = self.commit_rows_cache.borrow_mut();
+		if let Some((_, rows)) = cache.as_ref().filter(|(k, _)| *k == key) {
+			return rows.clone();
+		}
+		let rows = Rc::new(super::changes::commit_file_rows(
+			&self.commit_files,
+			by_dir,
+			&self.changed_dirs_collapsed,
+		));
+		*cache = Some((key, rows.clone()));
+		rows
+	}
+
 	/// The log's right pane: the selected commit's changed files grouped by
 	/// directory, then its details (or the compare's range).
 	pub(super) fn render_commit_panel(
@@ -832,11 +851,7 @@ impl WorkbenchModel {
 		let loc = self.locale;
 		let log = &self.probes;
 		let by_dir = self.log_details_by_dir;
-		let rows = Rc::new(super::changes::commit_file_rows(
-			&self.commit_files,
-			by_dir,
-			&self.changed_dirs_collapsed,
-		));
+		let rows = self.commit_rows(by_dir);
 		let n = self.commit_files.len();
 		let files_header = div()
 			.flex()
