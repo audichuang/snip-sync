@@ -479,19 +479,31 @@ impl WorkbenchModel {
 		path: &str,
 		is_dir: bool,
 	) -> Vec<MenuEntry> {
-		let copy: Vec<(PathBuf, String, String)> = commit_copy_paths(
-			&self.commit_files,
-			&self.commit_file_gitlinks,
-			self.commit_files_truncated,
-			path,
-			is_dir,
-		)
-		.into_iter()
-		.filter_map(|p| {
-			let (root, sha) = self.commit_file_rev(p)?;
-			Some((root, sha, p.to_string()))
-		})
-		.collect();
+		// A right-click inside a multi-selection copies all of it.
+		let multi = !is_dir
+			&& self.commit_file_sel.len() > 1
+			&& self.commit_file_sel.iter().any(|p| p == path);
+		let targets: Vec<&str> = if multi {
+			self.commit_file_sel.iter().map(String::as_str).collect()
+		} else {
+			vec![path]
+		};
+		let copy: Vec<(PathBuf, String, String)> = targets
+			.into_iter()
+			.flat_map(|t| {
+				commit_copy_paths(
+					&self.commit_files,
+					&self.commit_file_gitlinks,
+					self.commit_files_truncated,
+					t,
+					is_dir,
+				)
+			})
+			.filter_map(|p| {
+				let (root, sha) = self.commit_file_rev(p)?;
+				Some((root, sha, p.to_string()))
+			})
+			.collect();
 		let mut v = vec![item(
 			"copy-files",
 			"menu_copy_files",
@@ -508,9 +520,12 @@ impl WorkbenchModel {
 				Some(secondary("D")),
 				Some(MenuAct::CommitFileDiff(path.to_string())),
 			));
-			// The basket holds the selected repository's files only.
+			// The basket holds the selected repository's files only; its
+			// entry toggles one file, so a multi-selection leaves it out.
 			if let Some((_, sha)) = rev.as_ref().filter(|(root, sha)| {
-				!sha.is_empty() && self.repo_root().as_ref() == Some(root)
+				!multi
+					&& !sha.is_empty()
+					&& self.repo_root().as_ref() == Some(root)
 			}) {
 				v.push(basket_entry(
 					self.is_rev_file_selected(sha, path),

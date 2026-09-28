@@ -444,8 +444,8 @@ pub(super) fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
 	icon_tinted(if l.current { Icon::Head } else { Icon::Tag }, 14., l.color)
 }
 
-/// A row's ref labels, right-aligned at the end of the subject: label icon
-/// plus name, at most two, the rest folded into `+N`. Also returns their
+/// A row's ref labels, right-aligned at the end of the subject: one label
+/// icon plus the names of at most two badges, the rest folded into `+N`. Also returns their
 /// laid-out width (`measure` gives a name's text width).
 pub(super) fn ref_label_elements(
 	refs: &[snip_core::graph::RefInfo],
@@ -455,34 +455,42 @@ pub(super) fn ref_label_elements(
 	measure: &dyn Fn(&str) -> f32,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	// Labels are 8px apart; each is icon (14) + 3 + name, at most 160.
-	let mut width = shown.len().saturating_sub(1) as f32 * 8.;
-	let mut out: Vec<AnyElement> = shown
-		.iter()
-		.map(|b| {
-			let l = graph_view::ref_label(b, current_branch);
-			width += (17. + measure(&l.text)).min(160.);
-			let tooltip = std::iter::once(b.primary)
-				.chain(b.merged.iter().copied())
-				.map(|i| graph_view::format_ref_badge(i).0)
-				.collect::<Vec<_>>()
-				.join("\n");
-			div()
-				.id(SharedString::from(format!("ref-badge:{row}:{}", l.text)))
-				.flex()
-				.items_center()
-				.gap(px(3.))
-				.max_w(px(160.))
-				.when(show_tips, |d| d.tooltip(tip(tooltip)))
-				.child(label_icon(&l))
-				.child(
-					clip_text(l.text.clone())
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().log_ref_text)),
-				)
-				.into_any_element()
-		})
-		.collect();
+	// One label for the shown badges: icon (14) + 3 + names, at most 320
+	// (the room two separate labels had).
+	let mut width = 0.;
+	let mut out: Vec<AnyElement> =
+		graph_view::combined_label(&shown, current_branch)
+			.into_iter()
+			.map(|l| {
+				width += (17. + measure(&l.text)).min(320.);
+				let tooltip = shown
+					.iter()
+					.flat_map(|b| {
+						std::iter::once(b.primary)
+							.chain(b.merged.iter().copied())
+					})
+					.map(|i| graph_view::format_ref_badge(i).0)
+					.collect::<Vec<_>>()
+					.join("\n");
+				div()
+					.id(SharedString::from(format!(
+						"ref-badge:{row}:{}",
+						l.text
+					)))
+					.flex()
+					.items_center()
+					.gap(px(3.))
+					.max_w(px(320.))
+					.when(show_tips, |d| d.tooltip(tip(tooltip)))
+					.child(label_icon(&l))
+					.child(
+						clip_text(l.text.clone())
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().log_ref_text)),
+					)
+					.into_any_element()
+			})
+			.collect();
 	if hidden > 0 {
 		width += 8. + measure(&format!("+{hidden}"));
 		let all = refs

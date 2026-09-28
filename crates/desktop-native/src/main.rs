@@ -1139,6 +1139,9 @@ pub struct WorkbenchModel {
 	/// The listing was cut to `MAX_COMMIT_FILES`.
 	pub commit_files_truncated: bool,
 	pub selected_commit_file: Option<String>,
+	/// Cmd/Shift multi-selection in the changed files; empty means just
+	/// `selected_commit_file`. Cleared with every change of that one.
+	pub commit_file_sel: Vec<String>,
 	pub compare: Option<(String, String)>,
 
 	// Tool windows.
@@ -1544,6 +1547,7 @@ impl WorkbenchModel {
 			commit_file_gitlinks: Vec::new(),
 			commit_files_truncated: false,
 			selected_commit_file: None,
+			commit_file_sel: Vec::new(),
 			compare: None,
 			files: Vec::new(),
 			changes_loaded: false,
@@ -2655,6 +2659,7 @@ impl WorkbenchModel {
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.git_user_email = None;
 		self.selected_commit_file = None;
+		self.commit_file_sel.clear();
 		self.compare = None;
 		self.changes_loaded = false;
 		self.file_tree = None;
@@ -5663,6 +5668,7 @@ impl WorkbenchModel {
 		self.log_selected.clear();
 		self.compare = None;
 		self.selected_commit_file = None;
+		self.commit_file_sel.clear();
 		self.commit_files.clear();
 		app_log!("[APP:TAB_CLOSED: {idx}]");
 		cx.notify();
@@ -6348,6 +6354,25 @@ mod tests {
 				return None;
 			}
 			Some(CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner))
+		}
+
+		#[gpui::test]
+		fn commit_files_cmd_and_shift_select_several(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let files = ["a.txt", "b.txt", "c.txt", "d.txt"];
+			model.update(cx, |m, cx| {
+				m.commit_files =
+					files.iter().map(|f| (f.to_string(), None)).collect();
+				m.selected_commit_file = Some("b.txt".into());
+				m.toggle_commit_file("d.txt", cx);
+				assert_eq!(m.commit_file_sel, ["b.txt", "d.txt"]);
+				m.toggle_commit_file("b.txt", cx);
+				assert_eq!(m.commit_file_sel, ["d.txt"]);
+				m.extend_commit_files(&files, "d.txt", cx);
+				assert_eq!(m.commit_file_sel, ["b.txt", "c.txt", "d.txt"]);
+			});
 		}
 
 		/// Puts `payload` on the OS clipboard and opens its paste preview.

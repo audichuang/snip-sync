@@ -1078,8 +1078,12 @@ impl WorkbenchModel {
 				};
 				let (letter, color) = change_style(ct);
 				let deleted = ct == Some(ChangeType::Deleted);
-				let sel = self.selected_commit_file.as_deref() == Some(&path)
-					&& self.rev_tree.is_none();
+				let sel = self.rev_tree.is_none()
+					&& if self.commit_file_sel.is_empty() {
+						self.selected_commit_file.as_deref() == Some(&path)
+					} else {
+						self.commit_file_sel.contains(&path)
+					};
 				let id = format!("commit-file:{path}");
 				let (dir, name) = match path.rsplit_once('/') {
 					Some((d, n)) => (d.to_string(), n.to_string()),
@@ -1104,9 +1108,34 @@ impl WorkbenchModel {
 					.when(self.chrome.menu.is_none(), |d| {
 						d.tooltip(tip(format!("{path}  ({letter})")))
 					})
-					.on_click(cx.listener(move |this, _, _, cx| {
-						this.select_commit_file(&p2, cx)
-					}))
+					.on_click(cx.listener(
+						move |this, ev: &gpui::ClickEvent, _, cx| {
+							// Cmd on macOS, Ctrl elsewhere toggles the file;
+							// Shift selects the range from the open one.
+							if ev.modifiers().secondary() {
+								this.toggle_commit_file(&p2, cx);
+							} else if ev.modifiers().shift {
+								let rows =
+									this.commit_rows(this.log_details_by_dir);
+								let shown: Vec<String> = rows
+									.iter()
+									.filter_map(|r| match r {
+										ChangeItemRow::File {
+											file_idx,
+											..
+										} => this.commit_files.get(*file_idx),
+										_ => None,
+									})
+									.map(|(p, _)| p.clone())
+									.collect();
+								let shown: Vec<&str> =
+									shown.iter().map(String::as_str).collect();
+								this.extend_commit_files(&shown, &p2, cx);
+							} else {
+								this.select_commit_file(&p2, cx);
+							}
+						},
+					))
 					// IntelliJ selects the row a menu opens on.
 					.on_mouse_down(MouseButton::Right, {
 						let path = path.clone();
