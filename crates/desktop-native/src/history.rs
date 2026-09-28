@@ -1285,6 +1285,13 @@ impl WorkbenchModel {
 			return;
 		}
 		if let PageLoad::Replace(_) = load {
+			if self.log_filter_pending() {
+				// Reading every repo found so far would ignore the chip:
+				// wait for discovery to reach the picked repositories.
+				self.log_deferred = true;
+				return;
+			}
+			self.log_deferred = false;
 			let scope = self.log_scope();
 			self.log_scope_key = scope.iter().map(|(r, _)| r.clone()).collect();
 			self.log_feeds.clear();
@@ -3063,6 +3070,17 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// The Repository chip picked repositories that discovery has not
+	/// reached yet (a reopened workspace is still being scanned).
+	fn log_filter_pending(&self) -> bool {
+		self.is_loading
+			&& !self.log_repo_filter.is_empty()
+			&& !self
+				.repos
+				.iter()
+				.any(|r| self.log_repo_filter.contains(&r.root))
+	}
+
 	/// The loaded log merges several repositories.
 	pub fn log_is_merged(&self) -> bool {
 		self.log_scope_key.len() > 1
@@ -3138,6 +3156,15 @@ impl WorkbenchModel {
 	/// A discovery that changed the workspace's repositories reloads a
 	/// loaded log.
 	pub fn sync_log_scope(&mut self, cx: &mut Context<Self>) {
+		if self.log_deferred {
+			if self.reset_history_query(
+				self.active_ref_filter.clone(),
+				self.log_search.clone(),
+			) {
+				self.load_history(cx);
+			}
+			return;
+		}
 		if self.log_scope_key.is_empty()
 			|| self
 				.log_scope()

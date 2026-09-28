@@ -1055,6 +1055,8 @@ pub struct WorkbenchModel {
 	pub log_feeds: Vec<multi_log::Feed>,
 	/// Repository of the commit or compare the reader shows from the log.
 	pub log_commit_root: Option<PathBuf>,
+	/// A Replace load waited for discovery to reach the picked repositories.
+	pub log_deferred: bool,
 }
 
 /// Identity of a shown preview's text, as `reader.rs` compares it.
@@ -1382,6 +1384,7 @@ impl WorkbenchModel {
 			log_scope_key: Vec::new(),
 			log_feeds: Vec::new(),
 			log_commit_root: None,
+			log_deferred: false,
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
@@ -2401,6 +2404,11 @@ impl WorkbenchModel {
 	}
 
 	fn finish_open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+		// The Repository chip is remembered for the same workspace only (a
+		// close has released `workspace_root`; the recent list still has it).
+		if self.recent_workspaces.first() != Some(&path) {
+			self.log_repo_filter.clear();
+		}
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
 		recent::remember(&mut self.recent_workspaces, &path);
