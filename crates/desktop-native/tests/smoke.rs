@@ -5256,7 +5256,9 @@ fn log_multiselect(theme: &str) {
 
 	let ws = tempfile::tempdir().unwrap();
 	// alpha: four commits, beta: two, interleaved by date.
-	let plan: [(&str, &[(&str, &[&str])]); 2] = [
+	// Per repository: (commit date, files it writes) oldest first.
+	type Commits = &'static [(&'static str, &'static [&'static str])];
+	let plan: [(&str, Commits); 2] = [
 		(
 			"alpha",
 			&[
