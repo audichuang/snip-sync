@@ -74,6 +74,21 @@ time.sleep(60)
                         self.assertRaisesRegex(SmokeFailure, "READY_REPOS"):
                     verify_launch(mock, timeout_sec=2.0)
 
+    def test_launch_returns_when_a_detached_child_keeps_the_output(self) -> None:
+        """A child that outlives the app and holds its output (git, a helper) cannot hang the check."""
+        mock = self._create_mock_bin("""
+import subprocess, time
+subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                 stdout=sys.stdout, stderr=sys.stderr, start_new_session=True)
+print('[APP:WINDOW_READY]', flush=True)
+print('[APP:READY_REPOS: 1]', flush=True)
+time.sleep(60)
+""")
+        start = time.monotonic()
+        with patch("sys.stdout", io.StringIO()):
+            verify_launch(mock, timeout_sec=20.0)
+        self.assertLess(time.monotonic() - start, 15.0)
+
     def test_missing_markers_needs_exact_lines(self) -> None:
         self.assertEqual(missing_markers(["[APP:WINDOW_READY]", "[APP:READY_REPOS: 10]"]),
                          ["[APP:READY_REPOS: 1]"])

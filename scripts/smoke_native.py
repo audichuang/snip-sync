@@ -19,12 +19,10 @@ from __future__ import annotations
 
 import argparse
 import os
-import queue
 import shutil
 import signal
 import subprocess
 import tempfile
-import threading
 import sys
 import time
 from pathlib import Path
@@ -227,43 +225,34 @@ def verify_launch(bin_path: Path, timeout_sec: float = 60.0) -> None:
     """Opens the real window on a one-repo workspace and waits for its markers."""
     print("[launch] Opening the real window on a one-repo workspace...")
     work = Path(tempfile.mkdtemp(prefix="snip-launch-smoke-"))
-    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True,
-              "env": dict(os.environ, SNIP_NATIVE_E2E="1")}
+    # A file, not a pipe: a child the app spawns inherits the handle and can
+    # outlive the kill, and reading or closing a pipe it holds never returns.
+    log_path = work / "app.log"
+    kwargs = {"stderr": subprocess.STDOUT, "env": dict(os.environ, SNIP_NATIVE_E2E="1")}
     if os.name == "posix":
         kwargs["start_new_session"] = True
     proc = None
     try:
         ws = one_repo_workspace(work / "ws")
-        proc = subprocess.Popen([str(bin_path), "--workspace", str(ws)], **kwargs)
-        lines: List[str] = []
-        stream: "queue.Queue[Optional[str]]" = queue.Queue()
+        with open(log_path, "wb") as log:
+            proc = subprocess.Popen([str(bin_path), "--workspace", str(ws)], stdout=log, **kwargs)
 
-        def pump() -> None:
-            for line in proc.stdout:
-                stream.put(line.rstrip("\n"))
-            stream.put(None)
+        def lines() -> List[str]:
+            return log_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
-        threading.Thread(target=pump, daemon=True).start()
         deadline = time.monotonic() + timeout_sec
-        while missing_markers(lines):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise SmokeFailure(f"timed out after {timeout_sec}s waiting for {missing_markers(lines)}; "
-                                   f"output:\n" + "\n".join(lines[-40:]))
-            try:
-                line = stream.get(timeout=min(remaining, 0.5))
-            except queue.Empty:
-                continue
-            if line is None:
-                raise SmokeFailure(f"app exited ({proc.wait()}) before {missing_markers(lines)}; "
-                                   f"output:\n" + "\n".join(lines[-40:]))
-            lines.append(line)
+        while missing_markers(lines()):
+            if proc.poll() is not None and missing_markers(lines()):
+                raise SmokeFailure(f"app exited ({proc.returncode}) before {missing_markers(lines())}; "
+                                   f"output:\n" + "\n".join(lines()[-40:]))
+            if time.monotonic() >= deadline:
+                raise SmokeFailure(f"timed out after {timeout_sec}s waiting for {missing_markers(lines())}; "
+                                   f"output:\n" + "\n".join(lines()[-40:]))
+            time.sleep(0.2)
         print(f"  [OK] window opened and loaded the workspace: {', '.join(LAUNCH_MARKERS)}")
     finally:
         if proc is not None:
             kill_proc_group(proc)
-            if proc.stdout is not None:
-                proc.stdout.close()
         shutil.rmtree(work, ignore_errors=True)
 
 
