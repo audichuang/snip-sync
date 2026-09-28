@@ -4453,11 +4453,12 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	wait("[APP:SELECTOR_CLOSED]");
 
 	// 7. Changes groups are tree nodes: the group checkbox selects the
-	// whole group, the chevron collapses it.
+	// whole group, the chevron collapses it. Untracked files list under
+	// Unstaged and keep their own source in the row id.
 	key(&wid, "alt+0");
 	wait("[APP:TAB_SWITCHED: GitChanges visible=true");
-	click("change-group-chk:untracked");
-	let toggled = wait("[APP:GROUP_TOGGLED: untracked selected=true]");
+	click("change-group-chk:unstaged");
+	let toggled = wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
 	let basket = toggled
 		.iter()
 		.find(|l| l.contains("[APP:BASKET: n=3"))
@@ -4469,20 +4470,24 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 		"{basket}"
 	);
 	control("change-row:untracked:gamma.txt");
-	click("change-group-toggle:untracked");
-	wait("[APP:GROUP_COLLAPSED: untracked collapsed=true]");
+	click("change-group-toggle:unstaged");
+	wait("[APP:GROUP_COLLAPSED: unstaged collapsed=true]");
 	absent("change-row:untracked:gamma.txt");
-	control("change-header:untracked");
+	control("change-header:unstaged");
 
 	quit_cleanly(&mut app, &wid);
 }
 
 /// Changes of a multi-repo workspace are grouped by change kind first: a
-/// workspace-wide Staged / Unstaged / Untracked node over one row per repo
-/// with files in it, and the files under the repo rows. A clean repo is not
-/// listed, repo rows start collapsed and expand per group, a file of a repo
-/// that is not the open one previews from its own repo and checks into that
-/// repo's basket entry, and the group checkbox spans every repo.
+/// workspace-wide Staged / Unstaged node (untracked files list under
+/// Unstaged) over one row per repo with files in it, and under each repo
+/// row its files grouped by directory, like IntelliJ's "Group By >
+/// Directory". A clean repo is not listed; repo rows and directories start
+/// collapsed and expand per group; a chain of single-child directories is
+/// one row; a directory's checkbox covers every file beneath it; the
+/// header toggle switches to flat lists and back. A file of a repo that is
+/// not the open one previews from its own repo and checks into that repo's
+/// basket entry, and the group checkbox spans every repo.
 #[test]
 fn native_changes_group_all_repos() {
 	changes_group_all_repos("dark");
@@ -4513,24 +4518,34 @@ fn changes_group_all_repos(theme: &str) {
 	let _gui = gui_lock();
 
 	let ws = tempfile::tempdir().unwrap();
-	let init = |name: &str| {
+	let init = |name: &str, nested: &[&str]| {
 		let repo = ws.path().join(name);
 		fs::create_dir_all(&repo).unwrap();
 		git_ok(&repo, &["init", "-q", "-b", "main"]);
 		git_ok(&repo, &["config", "user.email", "t@example.com"]);
 		git_ok(&repo, &["config", "user.name", "Multi Repo"]);
 		fs::write(repo.join("shared.txt"), format!("{name}\n")).unwrap();
+		for path in nested {
+			let file = repo.join(path);
+			fs::create_dir_all(file.parent().unwrap()).unwrap();
+			fs::write(file, "v1\n").unwrap();
+		}
 		git_ok(&repo, &["add", "."]);
 		git_ok(&repo, &["commit", "-qm", "first"]);
 		repo
 	};
-	let alpha = init("alpha");
-	let beta = init("beta");
-	init("gamma");
-	// alpha: one staged, one unstaged change.
+	// `src` has two children; `main/java/pkg` is a single-child chain.
+	let nested = ["src/main/java/pkg/App.java", "src/test/AppTest.java"];
+	let alpha = init("alpha", &nested);
+	let beta = init("beta", &[]);
+	init("gamma", &[]);
+	// alpha: one staged file, and unstaged edits at the root and nested.
 	fs::write(alpha.join("staged.txt"), "staged\n").unwrap();
 	git_ok(&alpha, &["add", "staged.txt"]);
 	fs::write(alpha.join("shared.txt"), "alpha edited\n").unwrap();
+	for path in nested {
+		fs::write(alpha.join(path), "v2\n").unwrap();
+	}
 	// beta: a staged and an unstaged change and an untracked folder of two
 	// files, on a feature branch.
 	git_ok(&beta, &["checkout", "-qb", "feature/x"]);
@@ -4554,7 +4569,7 @@ fn changes_group_all_repos(theme: &str) {
 	let loaded = lines_until_all_smoke(
 		rx,
 		&[
-			"[APP:REPO_LOADED: alpha files=2]",
+			"[APP:REPO_LOADED: alpha files=4]",
 			"[APP:CHANGES_LOADED: beta files=4]",
 			"[APP:CHANGES_LOADED: gamma files=0]",
 		],
@@ -4629,8 +4644,8 @@ fn changes_group_all_repos(theme: &str) {
 	};
 
 	// Groups first, each over the repos with files in it, in name order;
-	// the clean repo and empty (group, repo) pairs are not listed. Repo
-	// rows start collapsed.
+	// the clean repo, empty (group, repo) pairs and an Untracked group are
+	// not listed. Repo rows start collapsed.
 	let order = [
 		"change-header:staged",
 		"change-repo:staged:alpha",
@@ -4638,13 +4653,16 @@ fn changes_group_all_repos(theme: &str) {
 		"change-header:unstaged",
 		"change-repo:unstaged:alpha",
 		"change-repo:unstaged:beta",
-		"change-header:untracked",
-		"change-repo:untracked:beta",
 	];
 	let ys: Vec<i32> = order.iter().map(|id| control(id)[1]).collect();
 	assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?} {ys:?}");
 	let snap = settled();
-	assert!(!snap.contains_key("change-repo:untracked:alpha"));
+	assert!(
+		!snap
+			.keys()
+			.any(|k| k.starts_with("change-") && k.contains("untracked")),
+		"{snap:?}"
+	);
 	assert!(
 		!snap
 			.keys()
@@ -4654,12 +4672,12 @@ fn changes_group_all_repos(theme: &str) {
 	absent("change-row@alpha:staged:staged.txt");
 	absent("change-row@beta:unstaged:shared.txt");
 
-	// Repo rows expand per group: alpha stays collapsed under Unstaged.
+	// Repo rows expand per group.
 	for (group, name) in [
 		("staged", "alpha"),
 		("staged", "beta"),
+		("unstaged", "alpha"),
 		("unstaged", "beta"),
-		("untracked", "beta"),
 	] {
 		click(&format!("change-repo:{group}:{name}"));
 		wait(&format!(
@@ -4669,9 +4687,18 @@ fn changes_group_all_repos(theme: &str) {
 	control("change-row@alpha:staged:staged.txt");
 	control("change-row@beta:staged:beta-staged.txt");
 	control("change-row@beta:unstaged:shared.txt");
-	control("change-row@beta:untracked:newdir/one.txt");
-	control("change-row@beta:untracked:newdir/two.txt");
-	absent("change-row@alpha:unstaged:shared.txt");
+	// Under an open repo: its top-level directories, collapsed, then its
+	// root files. The untracked folder sits in Unstaged.
+	let src = "change-dir:unstaged:alpha:src";
+	let newdir = "change-dir:unstaged:beta:newdir";
+	assert!(
+		control(src)[1] < control("change-row@alpha:unstaged:shared.txt")[1]
+	);
+	assert!(
+		control(newdir)[1] < control("change-row@beta:unstaged:shared.txt")[1]
+	);
+	absent("change-dir:unstaged:alpha:src/test");
+	absent("change-row@beta:untracked:newdir/one.txt");
 	// Unqualified ids keep naming the open repo's rows only.
 	assert_eq!(
 		control("change-row:staged:staged.txt"),
@@ -4682,6 +4709,46 @@ fn changes_group_all_repos(theme: &str) {
 	let file_chk = control("change-chk@beta:staged:beta-staged.txt");
 	assert!(file_chk[0] > repo_chk[0], "{file_chk:?} {repo_chk:?}");
 
+	// One click opens a directory; the log carries its file count. `src`
+	// shows the compacted chain and `test`, both collapsed.
+	click(src);
+	wait("[APP:CHANGE_DIR_COLLAPSED: unstaged alpha src files=2 collapsed=false]");
+	let chain = "change-dir:unstaged:alpha:src/main/java/pkg";
+	let test_dir = "change-dir:unstaged:alpha:src/test";
+	control(test_dir);
+	control(chain);
+	absent("change-dir:unstaged:alpha:src/main");
+	absent("change-row@alpha:unstaged:src/main/java/pkg/App.java");
+	click(chain);
+	wait(
+		"[APP:CHANGE_DIR_COLLAPSED: unstaged alpha src/main/java/pkg files=1 collapsed=false]",
+	);
+	let app_row = "change-row@alpha:unstaged:src/main/java/pkg/App.java";
+	control(app_row);
+	absent("change-row@alpha:unstaged:src/test/AppTest.java");
+	click(newdir);
+	wait("[APP:CHANGE_DIR_COLLAPSED: unstaged beta newdir files=2 collapsed=false]");
+	control("change-row@beta:untracked:newdir/one.txt");
+	control("change-row@beta:untracked:newdir/two.txt");
+	// Chevrons of one level share a column, a child's sits right of its
+	// parent's, and sibling files line up with sibling directories'
+	// checkboxes.
+	let x = |id: &str| control(id)[0];
+	let level2 = x("change-dir-toggle:unstaged:alpha:src");
+	let level3 = x("change-dir-toggle:unstaged:alpha:src/main/java/pkg");
+	assert_eq!(level3, x("change-dir-toggle:unstaged:alpha:src/test"));
+	assert_eq!(level2, x("change-dir-toggle:unstaged:beta:newdir"));
+	assert!(level3 > level2, "{level3} {level2}");
+	assert_eq!(
+		x("change-dir-chk:unstaged:alpha:src"),
+		x("change-chk@alpha:unstaged:shared.txt")
+	);
+	assert_eq!(
+		x("change-dir-chk:unstaged:alpha:src/test"),
+		x("change-chk@alpha:unstaged:src/main/java/pkg/App.java")
+			- (level3 - level2)
+	);
+
 	let out = std::env::var_os("SNIP_E2E_OUT")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
@@ -4691,7 +4758,10 @@ fn changes_group_all_repos(theme: &str) {
 	} else {
 		format!("multi-repo-changes-{theme}.png")
 	};
-	// Park the pointer over the editor so no row tooltip covers the tree.
+	// Hide the Git log so the whole tree fits, and park the pointer over
+	// the editor so no row tooltip covers the tree.
+	key(&wid, "alt+9");
+	wait("[APP:LOG_PANEL: visible=false]");
 	let st = Command::new("xdotool")
 		.args(["mousemove", "--window", &wid, "700", "300"])
 		.status()
@@ -4716,7 +4786,7 @@ fn changes_group_all_repos(theme: &str) {
 	);
 	wait("[APP:PREVIEW_LOADED: newdir/one.txt]");
 
-	// Its checkbox fills that repo's basket entry.
+	// Its checkbox fills that repo's basket entry, still as untracked.
 	click("change-chk@beta:untracked:newdir/one.txt");
 	let basket = wait("[APP:BASKET: n=1");
 	assert!(
@@ -4731,20 +4801,47 @@ fn changes_group_all_repos(theme: &str) {
 	let basket = wait("[APP:BASKET: n=2");
 	wait("[APP:REPO_CHANGES_TOGGLED: staged beta selected=true]");
 	assert!(!basket.last().unwrap().contains("alpha"), "{basket:?}");
-	// A group's checkbox spans every repo.
-	click("change-group-chk:unstaged");
+	// A directory's checkbox covers every file beneath it, collapsed
+	// `test` included, and nothing beside it.
+	click("change-dir-chk:unstaged:alpha:src");
 	let basket = wait("[APP:BASKET: n=4");
+	wait("[APP:DIR_CHANGES_TOGGLED: unstaged alpha src selected=true]");
+	let last = basket.last().unwrap();
+	assert!(
+		last.contains("alpha unstaged src/main/java/pkg/App.java")
+			&& last.contains("alpha unstaged src/test/AppTest.java")
+			&& !last.contains("alpha unstaged shared.txt"),
+		"{basket:?}"
+	);
+	// A group's checkbox spans every repo, untracked files included.
+	click("change-group-chk:unstaged");
+	let basket = wait("[APP:BASKET: n=7");
 	wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
 	let last = basket.last().unwrap();
 	assert!(
 		last.contains("alpha unstaged shared.txt")
-			&& last.contains("beta unstaged shared.txt"),
+			&& last.contains("beta unstaged shared.txt")
+			&& last.contains("beta untracked newdir/two.txt"),
 		"{basket:?}"
 	);
 
+	// The header toggle lists files flat under each repo, and back.
+	click("btn-changes-group-dir");
+	wait("[APP:CHANGES_GROUP_DIR: on=false]");
+	absent(src);
+	control("change-row@alpha:unstaged:src/test/AppTest.java");
+	control(app_row);
+	click("btn-changes-group-dir");
+	wait("[APP:CHANGES_GROUP_DIR: on=true]");
+	control(src);
+	// Directory expansion survives the round trip.
+	control(app_row);
+	absent("change-row@alpha:unstaged:src/test/AppTest.java");
+
 	// Collapsing a repo row hides its files in that group only.
-	click("change-repo:untracked:beta");
-	wait("[APP:REPO_CHANGES_COLLAPSED: untracked beta collapsed=true]");
+	click("change-repo:unstaged:beta");
+	wait("[APP:REPO_CHANGES_COLLAPSED: unstaged beta collapsed=true]");
+	absent(newdir);
 	absent("change-row@beta:untracked:newdir/one.txt");
 	control("change-row@beta:staged:beta-staged.txt");
 	// One click on a group row collapses it; the chevron reopens it.

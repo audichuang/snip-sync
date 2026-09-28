@@ -871,8 +871,8 @@ enum ProjRow {
 /// One row of the Git Changes tool window (section header or file change).
 #[derive(Clone, Debug)]
 pub enum ChangeItemRow {
-	/// Group node (Staged / Unstaged / Untracked / Conflicts); with more
-	/// than one repo it spans the whole workspace.
+	/// Group node (Staged / Unstaged / Conflicts); with more than one repo
+	/// it spans the whole workspace.
 	Header {
 		label: &'static str,
 		count: usize,
@@ -885,13 +885,62 @@ pub enum ChangeItemRow {
 		group_id: &'static str,
 		count: usize,
 	},
+	/// A directory of one repo's changes in one group ("Group By >
+	/// Directory"). `path` is the full path from the repo root; `name` is
+	/// what the row shows, a chain of single-child directories joined.
+	Dir {
+		slot: usize,
+		group_id: &'static str,
+		path: String,
+		name: String,
+		count: usize,
+		depth: usize,
+	},
 	/// A repo's read error or truncation notice.
 	Note {
 		slot: usize,
 	},
 	File {
 		file_idx: usize,
+		depth: usize,
 	},
+}
+
+impl ChangeItemRow {
+	/// Tree level: 0 for a group, `None` for a note (never a parent).
+	pub(crate) fn depth(&self) -> Option<usize> {
+		match self {
+			ChangeItemRow::Header { .. } => Some(0),
+			ChangeItemRow::Repo { .. } => Some(1),
+			ChangeItemRow::Dir { depth, .. }
+			| ChangeItemRow::File { depth, .. } => Some(*depth),
+			ChangeItemRow::Note { .. } => None,
+		}
+	}
+}
+
+/// Left padding of a Changes row at tree level `depth`: each level moves
+/// one chevron plus gap, so a child's chevron sits under its parent's
+/// checkbox and every level's chevrons share one column.
+fn change_pad(depth: usize) -> f32 {
+	4. + 18. * depth as f32
+}
+
+/// Fields of a [`ChangeItemRow::Dir`] handed to its renderer.
+struct ChangeDirRow {
+	slot: usize,
+	group_id: &'static str,
+	path: String,
+	name: String,
+	count: usize,
+	depth: usize,
+}
+
+/// How the Changes rows under a repo are laid out: a directory tree whose
+/// `expanded(slot, group, dir)` nodes are open, or a flat file list.
+pub(crate) struct ChangeLayout<F: Fn(usize, &str, &str) -> bool> {
+	pub by_dir: bool,
+	pub expanded: F,
 }
 
 /// Changes tool window rows. One repo shows its groups at the top level
@@ -899,12 +948,15 @@ pub enum ChangeItemRow {
 /// group is a workspace-wide node over one row per repo with files in it
 /// (in repo name order), and the files sit under the repo rows. Clean
 /// repos are not listed; a failed read with no rows gets a top-level note.
-pub(crate) fn change_rows(
+/// Under each (group, repo) the files are a directory tree or flat, per
+/// `layout`.
+pub(crate) fn change_rows<F: Fn(usize, &str, &str) -> bool>(
 	slots: &[crate::ChangeRepo],
 	files: &[crate::FileChangeItem],
 	group_collapsed: impl Fn(&str) -> bool,
 	repo_collapsed: impl Fn(usize, &str) -> bool,
 	repo_query: &str,
+	layout: &ChangeLayout<F>,
 ) -> Vec<ChangeItemRow> {
 	let query = repo_query.to_lowercase();
 	let note = |slot: usize| {
@@ -933,10 +985,8 @@ pub(crate) fn change_rows(
 					group_id,
 				});
 				if !group_collapsed(group_id) {
-					rows.extend(
-						members
-							.into_iter()
-							.map(|file_idx| ChangeItemRow::File { file_idx }),
+					push_change_files(
+						&mut rows, files, members, slot, group_id, 1, layout,
 					);
 				}
 			}
@@ -985,14 +1035,123 @@ pub(crate) fn change_rows(
 			if note(slot) {
 				rows.push(ChangeItemRow::Note { slot });
 			}
-			rows.extend(
-				members
-					.into_iter()
-					.map(|file_idx| ChangeItemRow::File { file_idx }),
+			push_change_files(
+				&mut rows, files, members, slot, group_id, 2, layout,
 			);
 		}
 	}
 	rows
+}
+
+/// Rows of one repo's changes in one group, at tree level `depth`.
+fn push_change_files<F: Fn(usize, &str, &str) -> bool>(
+	rows: &mut Vec<ChangeItemRow>,
+	files: &[crate::FileChangeItem],
+	mut members: Vec<usize>,
+	slot: usize,
+	group_id: &'static str,
+	depth: usize,
+	layout: &ChangeLayout<F>,
+) {
+	if !layout.by_dir {
+		rows.extend(
+			members
+				.into_iter()
+				.map(|file_idx| ChangeItemRow::File { file_idx, depth }),
+		);
+		return;
+	}
+	let tree = DirTree {
+		files,
+		slot,
+		group_id,
+		expanded: &layout.expanded,
+	};
+	tree.push(rows, &mut members, 0, depth);
+}
+
+/// Builds IntelliJ's "Group By > Directory" rows from the capped file rows
+/// alone: no Git reads, and only open directories' children get rows.
+struct DirTree<'a, F> {
+	files: &'a [crate::FileChangeItem],
+	slot: usize,
+	group_id: &'static str,
+	expanded: &'a F,
+}
+
+impl<F: Fn(usize, &str, &str) -> bool> DirTree<'_, F> {
+	/// Path of file `i`. An untracked directory comes as `dir/` and is a
+	/// leaf named by its last component.
+	fn path(&self, i: usize) -> &str {
+		self.files[i].path.trim_end_matches('/')
+	}
+
+	/// First directory of file `i` from byte `start` on, `None` for a leaf.
+	fn head(&self, i: usize, start: usize) -> Option<&str> {
+		self.path(i)[start..].split_once('/').map(|(d, _)| d)
+	}
+
+	/// Rows of `entries`, files whose paths share the same `start`-byte
+	/// prefix: directories first, then files, each by name ignoring case.
+	fn push(
+		&self,
+		rows: &mut Vec<ChangeItemRow>,
+		entries: &mut [usize],
+		start: usize,
+		depth: usize,
+	) {
+		let key = |i: usize| match self.head(i, start) {
+			Some(dir) => (false, dir),
+			None => (true, &self.path(i)[start..]),
+		};
+		entries.sort_by(|&a, &b| {
+			let ((la, na), (lb, nb)) = (key(a), key(b));
+			la.cmp(&lb).then_with(|| {
+				na.chars()
+					.flat_map(char::to_lowercase)
+					.cmp(nb.chars().flat_map(char::to_lowercase))
+					.then_with(|| na.cmp(nb))
+			})
+		});
+		let mut k = 0;
+		while let Some(dir) = entries.get(k).and_then(|&i| self.head(i, start))
+		{
+			let end = k + entries[k..]
+				.iter()
+				.take_while(|&&i| self.head(i, start) == Some(dir))
+				.count();
+			let first = entries[k];
+			// A directory whose only child is a directory shows as one row.
+			let mut name_end = start + dir.len();
+			while let Some(sub) = self.head(first, name_end + 1) {
+				if !entries[k..end]
+					.iter()
+					.all(|&i| self.head(i, name_end + 1) == Some(sub))
+				{
+					break;
+				}
+				name_end += 1 + sub.len();
+			}
+			let path = &self.path(first)[..name_end];
+			rows.push(ChangeItemRow::Dir {
+				slot: self.slot,
+				group_id: self.group_id,
+				path: path.to_string(),
+				name: path[start..].to_string(),
+				count: end - k,
+				depth,
+			});
+			if (self.expanded)(self.slot, self.group_id, path) {
+				self.push(rows, &mut entries[k..end], name_end + 1, depth + 1);
+			}
+			k = end;
+		}
+		rows.extend(
+			entries[k..]
+				.iter()
+				.map(|&file_idx| ChangeItemRow::File { file_idx, depth }),
+		);
+	}
 }
 
 impl WorkbenchModel {
@@ -1136,6 +1295,12 @@ impl WorkbenchModel {
 			|group| self.group_collapsed(group),
 			|slot, group| self.repo_changes_collapsed(slot, group),
 			&self.chrome.speed,
+			&ChangeLayout {
+				by_dir: self.chrome.changes_by_dir,
+				expanded: |slot, group, dir| {
+					self.change_dir_expanded(slot, group, dir)
+				},
+			},
 		)
 	}
 
@@ -1145,7 +1310,7 @@ impl WorkbenchModel {
 		let rows = self.change_item_rows();
 		let file_row = |pred: &dyn Fn(&crate::FileChangeItem) -> bool| {
 			rows.iter().position(|row| {
-				matches!(row, ChangeItemRow::File { file_idx }
+				matches!(row, ChangeItemRow::File { file_idx, .. }
 					if self.files.get(*file_idx).is_some_and(pred))
 			})
 		};
@@ -1192,7 +1357,7 @@ impl WorkbenchModel {
 			.scroll_to_item(row, gpui::ScrollStrategy::Top);
 		if self.active_tab == WorkbenchTab::GitChanges {
 			self.selected_list_row = row;
-			if let Some(ChangeItemRow::File { file_idx }) =
+			if let Some(ChangeItemRow::File { file_idx, .. }) =
 				self.change_item_rows().get(row)
 			{
 				self.select_change(*file_idx, cx);
@@ -1224,7 +1389,8 @@ impl WorkbenchModel {
 					ChangeItemRow::Header { label, .. } => {
 						t(label, self.locale).to_string()
 					}
-					ChangeItemRow::File { file_idx } => self
+					ChangeItemRow::Dir { name, .. } => name,
+					ChangeItemRow::File { file_idx, .. } => self
 						.files
 						.get(file_idx)
 						.map(|f| {
@@ -1334,6 +1500,12 @@ impl WorkbenchModel {
 				return;
 			};
 			let cur = self.selected_list_row.min(cur);
+			// IntelliJ: Left on a leaf or a collapsed node goes to its parent.
+			let parent = rows[cur].depth().and_then(|d| {
+				rows[..cur]
+					.iter()
+					.rposition(|r| r.depth().is_some_and(|p| p < d))
+			});
 			match (&rows[cur], action) {
 				(ChangeItemRow::Repo { slot, group_id, .. }, _) => {
 					let (slot, group) = (*slot, *group_id);
@@ -1348,12 +1520,41 @@ impl WorkbenchModel {
 							self.toggle_repo_collapsed(slot, group, cx)
 						}
 						"collapse" => {
-							// IntelliJ: Left on a collapsed node goes
-							// to its parent group.
-							if let Some(h) = rows[..cur].iter().rposition(|r| {
-								matches!(r, ChangeItemRow::Header { .. })
-							}) {
-								self.set_tool_cursor(h, cx);
+							if let Some(p) = parent {
+								self.set_tool_cursor(p, cx);
+							}
+						}
+						_ => {}
+					}
+				}
+				(
+					ChangeItemRow::Dir {
+						slot,
+						group_id,
+						path,
+						..
+					},
+					_,
+				) => {
+					let (slot, group) = (*slot, *group_id);
+					let collapsed =
+						!self.change_dir_expanded(slot, group, path);
+					match action {
+						"toggle" => {
+							self.toggle_change_dir(slot, group, path, cx)
+						}
+						"open" => {
+							self.toggle_dir_collapsed(slot, group, path, cx)
+						}
+						"expand" if collapsed => {
+							self.toggle_dir_collapsed(slot, group, path, cx)
+						}
+						"collapse" if !collapsed => {
+							self.toggle_dir_collapsed(slot, group, path, cx)
+						}
+						"collapse" => {
+							if let Some(p) = parent {
+								self.set_tool_cursor(p, cx);
 							}
 						}
 						_ => {}
@@ -1375,22 +1576,15 @@ impl WorkbenchModel {
 						_ => {}
 					}
 				}
-				(ChangeItemRow::File { file_idx }, "toggle") => {
+				(ChangeItemRow::File { file_idx, .. }, "toggle") => {
 					self.toggle_file(*file_idx, cx);
 				}
 				(ChangeItemRow::File { .. }, "open") => {
 					self.set_tool_cursor(cur, cx);
 				}
 				(ChangeItemRow::File { .. }, "collapse") => {
-					// IntelliJ: Left on a leaf goes to its parent node.
-					if let Some(h) = rows[..cur].iter().rposition(|r| {
-						matches!(
-							r,
-							ChangeItemRow::Header { .. }
-								| ChangeItemRow::Repo { .. }
-						)
-					}) {
-						self.set_tool_cursor(h, cx);
+					if let Some(p) = parent {
+						self.set_tool_cursor(p, cx);
 					}
 				}
 				_ => {}
@@ -2414,7 +2608,25 @@ impl WorkbenchModel {
 				})
 			})
 			.when(!is_project, |d| {
+				let on = self.chrome.changes_by_dir;
 				d.child(
+					icon_button(
+						"btn-changes-group-dir",
+						Icon::Folder,
+						t("tip_group_by_dir", loc),
+						true,
+						12,
+					)
+					.when(on, |d| {
+						d.bg(rgb(pal().range_bg))
+							.border_color(rgb(pal().accent))
+					})
+					.on_click(cx.listener(|this, _, _, cx| {
+						this.toggle_changes_by_dir(cx)
+					}))
+					.children(probe(&self.probes, "btn-changes-group-dir")),
+				)
+				.child(
 					icon_button(
 						"btn-select-all",
 						Icon::SelectAll,
@@ -2488,10 +2700,31 @@ impl WorkbenchModel {
 										label, count, group_id, row_idx, cx,
 									));
 								}
-								ChangeItemRow::File { file_idx } => {
-									out.push(
-										this.change_row(file_idx, row_idx, cx),
-									);
+								ChangeItemRow::Dir {
+									slot,
+									group_id,
+									path,
+									name,
+									count,
+									depth,
+								} => {
+									out.push(this.change_dir_row(
+										ChangeDirRow {
+											slot,
+											group_id,
+											path,
+											name,
+											count,
+											depth,
+										},
+										row_idx,
+										cx,
+									));
+								}
+								ChangeItemRow::File { file_idx, depth } => {
+									out.push(this.change_row(
+										file_idx, depth, row_idx, cx,
+									));
 								}
 							}
 						}
@@ -3313,16 +3546,6 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
-	/// One tree level of indent in a multi-repo workspace: repo rows sit one
-	/// level under their group, file and note rows two.
-	fn change_indent(&self) -> f32 {
-		if self.change_repos.len() > 1 {
-			16.
-		} else {
-			0.
-		}
-	}
-
 	/// Probe ids of a Changes slot: whether the unqualified legacy ids
 	/// (`change-row:<source>:<path>`) are emitted, which name only the open
 	/// repo's rows, and the repo name that qualifies every row's id
@@ -3381,7 +3604,7 @@ impl WorkbenchModel {
 			.items_center()
 			.w_full()
 			.h(px(ROW_H))
-			.pl(px(4. + self.change_indent()))
+			.pl(px(change_pad(1)))
 			.pr(px(6.))
 			.gap(px(2.))
 			.rounded(px(4.))
@@ -3516,10 +3739,14 @@ impl WorkbenchModel {
 			.gap(px(6.))
 			.w_full()
 			.h(px(ROW_H))
+			// Otherwise it lines up with the checkboxes of the rows it
+			// speaks for: a single repo's groups, or a repo row's children.
 			.pl(px(if top {
 				8.
+			} else if self.change_repos.len() > 1 {
+				change_pad(2) + 18.
 			} else {
-				24. + 2. * self.change_indent()
+				change_pad(0) + 18.
 			}))
 			.pr(px(6.))
 			.text_size(px(SMALL_TEXT))
@@ -3531,9 +3758,121 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
+	/// Directory node under a repo ("Group By > Directory"): chevron,
+	/// tri-state checkbox over every file beneath it, folder icon, the
+	/// (possibly compacted) name and the muted count of files beneath it.
+	fn change_dir_row(
+		&self,
+		row: ChangeDirRow,
+		row_idx: usize,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let log = &self.probes;
+		let ChangeDirRow {
+			slot,
+			group_id,
+			path,
+			name,
+			count,
+			depth,
+		} = row;
+		let repo = self
+			.change_repos
+			.get(slot)
+			.map_or(String::new(), |s| s.name.clone());
+		let collapsed = !self.change_dir_expanded(slot, group_id, &path);
+		let cursor = row_idx == self.selected_list_row;
+		let key = format!("{group_id}:{repo}:{path}");
+		let id = format!("change-dir:{key}");
+		let chk_id = format!("change-dir-chk:{key}");
+		let toggle_id = format!("change-dir-toggle:{key}");
+		let state = self.dir_state(slot, group_id, &path);
+		let tooltip = path.clone();
+		let (p1, p2) = (path.clone(), path);
+		div()
+			.id(SharedString::from(id.clone()))
+			.relative()
+			.flex()
+			.flex_row()
+			.items_center()
+			.w_full()
+			.h(px(ROW_H))
+			.pl(px(change_pad(depth)))
+			.pr(px(6.))
+			.gap(px(2.))
+			.rounded(px(4.))
+			.cursor_pointer()
+			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
+			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			.when(self.chrome.menu.is_none(), |d| d.tooltip(tip(tooltip)))
+			.on_click(cx.listener(move |this, _, _, cx| {
+				this.selected_list_row = row_idx;
+				this.toggle_dir_collapsed(slot, group_id, &p1, cx);
+			}))
+			.child(
+				div()
+					.id(SharedString::from(toggle_id.clone()))
+					.relative()
+					.flex_shrink_0()
+					.size(px(16.))
+					.flex()
+					.items_center()
+					.justify_center()
+					.child(icon(
+						if collapsed {
+							Icon::ChevronRight
+						} else {
+							Icon::ChevronDown
+						},
+						10.,
+					))
+					.children(probe(log, toggle_id)),
+			)
+			.child(
+				div()
+					.id(SharedString::from(chk_id.clone()))
+					.relative()
+					.flex_shrink_0()
+					.size(px(18.))
+					.flex()
+					.items_center()
+					.justify_center()
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.selected_list_row = row_idx;
+						this.toggle_change_dir(slot, group_id, &p2, cx);
+					}))
+					.child(tri_checkbox(state))
+					.children(probe(log, chk_id)),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.ml(px(4.))
+					.child(icon(Icon::Folder, 14.)),
+			)
+			.child(
+				self.speed_label(name)
+					.ml(px(4.))
+					.flex_shrink()
+					.text_color(rgb(pal().text)),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.ml(px(8.))
+					.text_size(px(SMALL_TEXT))
+					.text_color(rgb(pal().text_muted))
+					.child(count.to_string()),
+			)
+			.children(probe(log, id))
+			.into_any_element()
+	}
+
 	fn change_row(
 		&self,
 		ix: usize,
+		depth: usize,
 		row_idx: usize,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
@@ -3542,8 +3881,8 @@ impl WorkbenchModel {
 			return div().into_any_element();
 		};
 		let (letter, change_color) = change_style(item.change_type);
-		// IntelliJ conveys status by filename colour; the group header above
-		// already says staged / unstaged / untracked / conflicted.
+		// IntelliJ conveys status by filename colour: untracked files share
+		// the Unstaged group but keep their own colour.
 		let color = if item.is_conflict {
 			pal().git_conflict
 		} else if item.source == SourceKind::Working {
@@ -3612,7 +3951,9 @@ impl WorkbenchModel {
 			.items_center()
 			.w_full()
 			.h(px(ROW_H))
-			.pl(px(20. + 2. * self.change_indent()))
+			// Leaves keep their parent's chevron column empty, so a file's
+			// checkbox lines up with its sibling directories' checkboxes.
+			.pl(px(change_pad(depth) + 18.))
 			.pr(px(6.))
 			.gap(px(6.))
 			.cursor_pointer()
@@ -3676,11 +4017,15 @@ impl WorkbenchModel {
 					.text_color(rgb(color))
 					.when(deleted, |d| d.line_through()),
 			)
-			.child(
-				fill_text(dir)
-					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(pal().text_muted)),
-			)
+			// The directory tree already shows where the file lives; the
+			// flat list names its folder after it.
+			.when(!self.chrome.changes_by_dir, |d| {
+				d.child(
+					fill_text(dir)
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text_muted)),
+				)
+			})
 			.children(probe(log, repo_row_id))
 			.children(row_id.and_then(|id| probe(log, id)))
 			.children(src_row_id.and_then(|id| probe(log, id)))

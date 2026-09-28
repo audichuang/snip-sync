@@ -1355,6 +1355,46 @@ class _FlowSession(_Session):
         return self.clipboard
 
 
+class ExpandOpenRepoChangesTests(unittest.TestCase):
+    """Changes rows start collapsed: the repo row, then each folder above the file."""
+
+    WIN = {"wid": "0x1", "x": 0, "y": 0, "width": 800, "height": 700}
+
+    def test_untracked_row_opens_its_repo_under_unstaged_then_its_folders(self):
+        import bench_native_memory as native
+        from test_bench_native import ChangeTreeSession, _bounds
+
+        node = "change-repo:unstaged:api"
+        src = "change-dir:unstaged:api:src"
+        row = "change-row:untracked:src/new.txt"
+        session = ChangeTreeSession(
+            ["[APP:REPO_SELECTING: 1 (api) root=/w/api]", _bounds(node, 80)],
+            {
+                node: [["[APP:REPO_CHANGES_COLLAPSED: unstaged api collapsed=false]", _bounds(src, 104)]],
+                src: [["[APP:CHANGE_DIR_COLLAPSED: unstaged api src files=1 collapsed=false]", _bounds(row, 128)]],
+            },
+        )
+        trace = []
+        driver.expand_open_repo_changes(native, session, self.WIN, row, 1.0, trace)
+        self.assertEqual(session.clicked, [node, src])
+        self.assertEqual([t["action"] for t in trace], ["expand-repo-changes", "expand-change-dirs"])
+
+    def test_single_repo_opens_the_loaded_repo_folders(self):
+        import bench_native_memory as native
+        from test_bench_native import ChangeTreeSession, _bounds
+
+        src = "change-dir:staged:solo:notes"
+        row = "change-row:staged:notes/guide.txt"
+        session = ChangeTreeSession(
+            ["[APP:REPO_LOADED: solo files=1]", _bounds(src, 80)],
+            {src: [["[APP:CHANGE_DIR_COLLAPSED: staged solo notes files=1 collapsed=false]", _bounds(row, 104)]]},
+        )
+        trace = []
+        driver.expand_open_repo_changes(native, session, self.WIN, row, 1.0, trace)
+        self.assertEqual(session.clicked, [src])
+        self.assertEqual(trace, [{"action": "expand-change-dirs", "dirs": ["notes"]}])
+
+
 class ClickUntilLoggedTests(unittest.TestCase):
     def test_reclicks_a_dropped_click_and_never_repeats_an_accepted_one(self):
         session = _FlowSession()

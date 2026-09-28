@@ -3669,6 +3669,17 @@ impl WorkbenchModel {
 		for path in &self.restore_expanded {
 			bytes = bytes.saturating_add(path.capacity());
 		}
+		let dirs = &self.chrome.expanded_dirs;
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(dirs))
+			.saturating_add(dirs.capacity().saturating_mul(
+				std::mem::size_of::<(&'static str, PathBuf, String)>(),
+			));
+		for (_, root, dir) in dirs {
+			bytes = bytes
+				.saturating_add(root.capacity())
+				.saturating_add(dir.capacity());
+		}
 		bytes = bytes
 			.saturating_add(std::mem::size_of_val(&self.discovery))
 			.saturating_add(self.discovery.as_ref().map_or(0, |discovery| {
@@ -6322,7 +6333,8 @@ mod tests {
 	}
 
 	/// Compact form of Changes rows: `G:<group>:<count>`,
-	/// `R:<group>:<repo>:<count>`, `N:<repo>`, `F:<repo>:<path>`.
+	/// `R:<group>:<repo>:<count>`, `N:<repo>`, `D<depth>:<repo>:<name>:<count>`
+	/// and `F<depth>:<repo>:<path>`.
 	fn shape(
 		slots: &[ChangeRepo],
 		files: &[FileChangeItem],
@@ -6341,30 +6353,49 @@ mod tests {
 				ui::ChangeItemRow::Note { slot } => {
 					format!("N:{}", slots[*slot].name)
 				}
-				ui::ChangeItemRow::File { file_idx } => {
+				ui::ChangeItemRow::Dir {
+					slot,
+					name,
+					count,
+					depth,
+					..
+				} => format!("D{depth}:{}:{name}:{count}", slots[*slot].name),
+				ui::ChangeItemRow::File { file_idx, depth } => {
 					let f = &files[*file_idx];
-					format!("F:{}:{}", slots[f.repo as usize].name, f.path)
+					format!(
+						"F{depth}:{}:{}",
+						slots[f.repo as usize].name, f.path
+					)
 				}
 			})
 			.collect()
 	}
 
+	type Expanded = fn(usize, &str, &str) -> bool;
+
+	/// Flat file lists under each repo.
+	const FLAT: ui::ChangeLayout<Expanded> = ui::ChangeLayout {
+		by_dir: false,
+		expanded: |_, _, _| false,
+	};
+
 	#[test]
 	fn change_rows_put_groups_over_repos() {
 		let (mut slots, files) = three_repos();
-		// Groups first (staged, unstaged, untracked), each over its repos
-		// in name order; repo rows start collapsed; clean `c` is absent.
-		let rows = ui::change_rows(&slots, &files, |_| false, |_, _| true, "");
+		// Groups first (staged, unstaged), each over its repos in name
+		// order; repo rows start collapsed; clean `c` is absent. Untracked
+		// `w.txt` counts under Unstaged.
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| true, "", &FLAT);
 		assert_eq!(
 			shape(&slots, &files, &rows),
 			[
 				"G:staged:2",
 				"R:staged:a:1",
 				"R:staged:b:1",
-				"G:unstaged:1",
+				"G:unstaged:2",
 				"R:unstaged:a:1",
-				"G:untracked:1",
-				"R:untracked:b:1",
+				"R:unstaged:b:1",
 			]
 		);
 
@@ -6376,40 +6407,47 @@ mod tests {
 		let collapsed = |slot: usize, g: &str| {
 			!open.iter().any(|(og, r)| *og == g && *r == roots[slot])
 		};
-		let rows = ui::change_rows(&slots, &files, |_| false, collapsed, "");
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, collapsed, "", &FLAT);
 		assert_eq!(
 			shape(&slots, &files, &rows),
 			[
 				"G:staged:2",
 				"R:staged:a:1",
 				"R:staged:b:1",
-				"F:b:s.txt",
-				"G:unstaged:1",
+				"F2:b:s.txt",
+				"G:unstaged:2",
 				"R:unstaged:a:1",
-				"G:untracked:1",
-				"R:untracked:b:1",
-				"F:b:w.txt",
+				"R:unstaged:b:1",
+				"F2:b:w.txt",
 			]
 		);
 
 		// A collapsed group hides its repo rows; the others stay.
-		let rows =
-			ui::change_rows(&slots, &files, |g| g == "staged", |_, _| true, "");
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|g| g == "staged",
+			|_, _| true,
+			"",
+			&FLAT,
+		);
 		assert_eq!(
 			shape(&slots, &files, &rows)[..2],
-			["G:staged:2", "G:unstaged:1"]
+			["G:staged:2", "G:unstaged:2"]
 		);
 
 		// Speed search keeps repos whose name matches, ignoring case; a
-		// group with no match is hidden, and a group keeps its full count.
-		let rows = ui::change_rows(&slots, &files, |_| false, |_, _| true, "B");
+		// group keeps its full count.
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| true, "B", &FLAT);
 		assert_eq!(
 			shape(&slots, &files, &rows),
 			[
 				"G:staged:2",
 				"R:staged:b:1",
-				"G:untracked:1",
-				"R:untracked:b:1"
+				"G:unstaged:2",
+				"R:unstaged:b:1"
 			]
 		);
 
@@ -6417,10 +6455,11 @@ mod tests {
 		// list says so under each of its expanded repo rows.
 		slots[2].state = ChangeRepoState::Failed("boom".into());
 		slots[1].total = MAX_CHANGES_PER_REPO + 1;
-		let rows = ui::change_rows(&slots, &files, |_| false, collapsed, "");
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, collapsed, "", &FLAT);
 		let got = shape(&slots, &files, &rows);
 		assert_eq!(got[0], "N:c");
-		assert_eq!(got[3..6], ["R:staged:b:1", "N:b", "F:b:s.txt"]);
+		assert_eq!(got[3..6], ["R:staged:b:1", "N:b", "F2:b:s.txt"]);
 		assert_eq!(got.iter().filter(|r| *r == "N:b").count(), 2);
 	}
 
@@ -6429,10 +6468,211 @@ mod tests {
 		let (mut slots, mut files) = three_repos();
 		slot_remove(&mut slots, &mut files, 2);
 		slot_remove(&mut slots, &mut files, 1);
-		let rows = ui::change_rows(&slots, &files, |_| false, |_, _| true, "x");
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| true, "x", &FLAT);
 		assert_eq!(
 			shape(&slots, &files, &rows),
-			["G:staged:1", "F:a:s.txt", "G:unstaged:1", "F:a:u.txt"]
+			["G:staged:1", "F1:a:s.txt", "G:unstaged:1", "F1:a:u.txt"]
 		);
+	}
+
+	/// One repo `r` with a nested tree: `src/main/java/pkg` is a chain of
+	/// single-child directories, `src` has two children, and an untracked
+	/// folder `Notes/` arrives as a leaf.
+	fn nested_repo() -> (Vec<ChangeRepo>, Vec<FileChangeItem>) {
+		let mut slots = Vec::new();
+		let mut files = Vec::new();
+		slot_insert(&mut slots, &mut files, std::path::Path::new("/w/r"), "r");
+		slot_replace_rows(
+			&mut files,
+			0,
+			vec![
+				change("src/main/java/pkg/B.java", SourceKind::Unstaged, 0),
+				change("pom.xml", SourceKind::Unstaged, 0),
+				change("src/test/T.java", SourceKind::Working, 0),
+				change("src/main/java/pkg/a.java", SourceKind::Unstaged, 0),
+				change("AGENTS.md", SourceKind::Working, 0),
+				change("docs/x/y.md", SourceKind::Staged, 0),
+				change("Notes/", SourceKind::Working, 0),
+			],
+		);
+		(slots, files)
+	}
+
+	#[test]
+	fn change_rows_group_by_directory() {
+		let (slots, files) = nested_repo();
+		let open = |dirs: &'static [&'static str]| ui::ChangeLayout {
+			by_dir: true,
+			expanded: move |_: usize, g: &str, d: &str| {
+				g == "unstaged" && dirs.contains(&d)
+			},
+		};
+		// Directories start collapsed: the group shows its top-level
+		// directories (first, with the count of every file beneath) and
+		// then its root files, each by name ignoring case. Untracked files
+		// sit in Unstaged; the untracked folder `Notes/` is a leaf.
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|_| false,
+			|_, _| false,
+			"",
+			&open(&[]),
+		);
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:1",
+				"D1:r:docs/x:1",
+				"G:unstaged:6",
+				"D1:r:src:3",
+				"F1:r:AGENTS.md",
+				"F1:r:Notes/",
+				"F1:r:pom.xml",
+			]
+		);
+
+		// Expanding by (group, dir path): `src` shows its children, and the
+		// single-child chain under `main` is one row keyed by its full path.
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|_| false,
+			|_, _| false,
+			"",
+			&open(&["src", "src/main/java/pkg"]),
+		);
+		assert_eq!(
+			shape(&slots, &files, &rows)[2..],
+			[
+				"G:unstaged:6",
+				"D1:r:src:3",
+				"D2:r:main/java/pkg:2",
+				"F3:r:src/main/java/pkg/a.java",
+				"F3:r:src/main/java/pkg/B.java",
+				"D2:r:test:1",
+				"F1:r:AGENTS.md",
+				"F1:r:Notes/",
+				"F1:r:pom.xml",
+			]
+		);
+		let dir_path = rows.iter().find_map(|r| match r {
+			ui::ChangeItemRow::Dir { name, path, .. }
+				if name == "main/java/pkg" =>
+			{
+				Some(path.clone())
+			}
+			_ => None,
+		});
+		assert_eq!(dir_path.as_deref(), Some("src/main/java/pkg"));
+		// Expansion is per group: `docs/x` stays closed in Staged.
+		assert_eq!(
+			shape(&slots, &files, &rows)[..2],
+			["G:staged:1", "D1:r:docs/x:1"]
+		);
+		// An open child under a closed parent stays hidden.
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|_| false,
+			|_, _| false,
+			"",
+			&open(&["src/main/java/pkg"]),
+		);
+		assert!(!shape(&slots, &files, &rows)
+			.iter()
+			.any(|r| r.contains("pkg")));
+
+		// Flat mode lists the files in Git's order under the group.
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| false, "", &FLAT);
+		assert_eq!(
+			shape(&slots, &files, &rows)[2..],
+			[
+				"G:unstaged:6",
+				"F1:r:src/main/java/pkg/B.java",
+				"F1:r:pom.xml",
+				"F1:r:src/test/T.java",
+				"F1:r:src/main/java/pkg/a.java",
+				"F1:r:AGENTS.md",
+				"F1:r:Notes/",
+			]
+		);
+	}
+
+	#[test]
+	fn change_rows_nest_directories_under_repo_rows() {
+		let (mut slots, mut files) = nested_repo();
+		slot_insert(&mut slots, &mut files, std::path::Path::new("/w/s"), "s");
+		slot_replace_rows(
+			&mut files,
+			1,
+			vec![change("lib/z.rs", SourceKind::Unstaged, 1)],
+		);
+		let layout = ui::ChangeLayout {
+			by_dir: true,
+			expanded: |slot: usize, _: &str, d: &str| slot == 0 && d == "src",
+		};
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|_| false,
+			|slot, g| slot == 1 || g == "staged",
+			"",
+			&layout,
+		);
+		// Under a repo row the tree starts one level deeper, and a
+		// directory's expansion is per repo.
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:1",
+				"R:staged:r:1",
+				"G:unstaged:7",
+				"R:unstaged:r:6",
+				"D2:r:src:3",
+				"D3:r:main/java/pkg:2",
+				"D3:r:test:1",
+				"F2:r:AGENTS.md",
+				"F2:r:Notes/",
+				"F2:r:pom.xml",
+				"R:unstaged:s:1",
+			]
+		);
+	}
+
+	#[test]
+	fn change_dir_checkbox_is_tri_state() {
+		let (_, mut files) = nested_repo();
+		let under = |dir: &'static str| {
+			move |f: &FileChangeItem| {
+				menu::change_group(f) == Some("unstaged")
+					&& menu::path_under(&f.path, dir)
+			}
+		};
+		assert_eq!(menu::rows_tri_state(&files, under("src")), Some(false));
+		// A prefix that is not a whole directory name does not match.
+		assert!(!menu::path_under("src2/a", "src"));
+		assert!(!menu::path_under("src", "src"));
+		for f in &mut files {
+			if f.path.starts_with("src/main/") {
+				f.selected = true;
+			}
+		}
+		assert_eq!(menu::rows_tri_state(&files, under("src")), None);
+		assert_eq!(
+			menu::rows_tri_state(&files, under("src/main/java/pkg")),
+			Some(true)
+		);
+		for f in &mut files {
+			if f.path.starts_with("src/") {
+				f.selected = true;
+			}
+		}
+		assert_eq!(menu::rows_tri_state(&files, under("src")), Some(true));
+		// Only files of that group count: the staged `docs` file is not
+		// under an Unstaged directory.
+		assert_eq!(menu::rows_tri_state(&files, under("docs")), Some(false));
 	}
 }

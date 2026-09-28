@@ -48,6 +48,7 @@
 ```
 
 - 窄側邊工具視窗列；Project／Changes 切換不清除待複製選取。
+- Changes 每個 repo 下的檔案預設依目錄分組（同 IntelliJ Group By > Directory，單一子目錄的鏈合併成一列，目錄預設收合），標題列按鈕可切換為平面清單，選擇只維持於本次執行。
 - 左側樹寬、下方 Git Log 高可調整；工具視窗可收合，恢復時保留位置。
 - 中央檔案 tab 與 breadcrumb 清楚顯示來源（working/index/commit），預設僅保留一份重預覽資料。
 - Git Log 橫向跨主要工作區，有足夠欄寬讀 message、refs、作者、日期；不能塞在左側樹下的小格。
@@ -83,7 +84,7 @@
 
 ### Git 來源
 
-- Staged = HEAD→index，內容從 index；Unstaged = index→working tree；Untracked／Conflicts 獨立。
+- Staged = HEAD→index，內容從 index；Unstaged = index→working tree；Untracked 是獨立來源，但在 Changes 中列在 Unstaged 群組下、以檔名顏色區分；Conflicts 獨立成組。
 - 既有 Working 複製集合不可冒名為 Unstaged。相同檔 staged A／working B 預覽及複製必須與選取來源一致。
 - root commit 對空樹；merge 讀取顯示 parent，複製及 replay 按既有 pinned contract。
 - refs 包含 local／remote-tracking／tags／HEAD，upstream 缺失顯示未知；沒有自動 fetch。

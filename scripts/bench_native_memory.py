@@ -614,6 +614,7 @@ def copy_explicit_selection(
     chk_id = f"change-chk:{source}:{path}"
     show_changes(s, win)
 
+    expand_change_dirs(s, win, row_id, oracle["name"])
     row_bounds = scroll_into_view(s, win, row_id)
     assert_on_window(row_bounds, win, row_id)
     before = len(s.lines)
@@ -1631,6 +1632,63 @@ def scroll_into_view(
         steps += 1
         time.sleep(0.03)
     raise NativeBenchError(f"required control {control} not settled inside left-list after {steps} wheel steps")
+
+
+def change_row_group(control_id: str) -> str:
+    """Changes group of a `change-row:<source>:<path>` row: untracked files list under Unstaged."""
+    source = control_id.split(":", 2)[1]
+    return "unstaged" if source == "untracked" else source
+
+
+def expand_change_dirs(
+    s: NativeSession,
+    win: dict[str, Any],
+    control: str,
+    repo: str,
+    timeout: float = 10.0,
+) -> list[str]:
+    """Open the directories above a Changes file row; returns the ones opened.
+
+    Changes groups files by directory by default, and directories start collapsed.
+    Bounds carry no expansion state, so the deepest visible ancestor
+    `change-dir:<group>:<repo>:<dir>` is clicked and its CHANGE_DIR_COLLAPSED line read:
+    `collapsed=true` means it was already open with its children out of view, so it is
+    clicked once more. A compacted chain (`main/java/pkg`) is one directory row.
+    """
+    path = control.split(":", 2)[2]
+    group = change_row_group(control)
+    prefix = f"change-dir:{group}:{repo}:"
+    opened: list[str] = []
+    for _ in range(path.rstrip("/").count("/")):
+        # Rows under a node that just opened paint on a later frame.
+        deadline = time.monotonic() + 2.0
+        while True:
+            bounds = parse_bounds(s.texts())
+            if control in bounds:
+                return opened
+            dirs = [
+                key[len(prefix):] for key in bounds
+                if key.startswith(prefix) and path.startswith(key[len(prefix):] + "/")
+                and key[len(prefix):] not in opened
+            ]
+            if dirs or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        if not dirs:
+            break
+        folder = max(dirs, key=len)
+        needle = f"[APP:CHANGE_DIR_COLLAPSED: {group} {repo} {folder} files="
+        for _click in range(2):
+            box = scroll_into_view(s, win, prefix + folder)
+            before = len(s.lines)
+            s.click(win, box)
+            _, _, line = s.wait_line(lambda item: needle in item, start=before, timeout=timeout)
+            if "collapsed=false" in line:
+                break
+        else:
+            raise NativeBenchError(f"{prefix + folder} did not open: {line}")
+        opened.append(folder)
+    return opened
 
 
 def tab_state(lines: list[str]) -> tuple[str, bool]:

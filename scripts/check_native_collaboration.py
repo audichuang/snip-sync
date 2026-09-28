@@ -1255,28 +1255,41 @@ def capture_checked(native: Any, session: Any, win: dict[str, Any], name: str, t
 def expand_open_repo_changes(native: Any, session: Any, win: dict[str, Any], row_id: str, timeout: float, trace: list[dict[str, Any]]) -> None:
     """Changes repo rows (one per group) start collapsed; opening a repo from the
     selector expands it in every group, but the repo the app opened at startup stays
-    collapsed until clicked. `row_id` is `change-row:<group>:<path>`, so the row to
-    expand is that repo's row under the same group."""
-    selecting = [line for line in session.texts() if "REPO_SELECTING:" in line]
-    if not selecting:
+    collapsed until clicked. `row_id` is `change-row:<source>:<path>`; the row to
+    expand is that repo's row under the source's group (untracked files list under
+    Unstaged). Then the directories above the file, which also start collapsed."""
+    lines = session.texts()
+    selecting = [line for line in lines if "REPO_SELECTING:" in line]
+    loaded = [line for line in lines if "[APP:REPO_LOADED: " in line]
+    if selecting:
+        name, _root = selecting_fields(selecting[-1])
+    elif loaded:
+        name = loaded[-1].split("[APP:REPO_LOADED: ", 1)[1].split(" files=", 1)[0]
+    else:
         return
-    name, _root = selecting_fields(selecting[-1])
-    group = row_id.split(":", 2)[1]
+    group = native.change_row_group(row_id)
     node = f"change-repo:{group}:{name}"
+    folders = f"change-dir:{group}:{name}:"
     deadline = time.monotonic() + min(2.0, timeout)
+    repo_row = False
     while time.monotonic() < deadline:
         bounds = native.parse_bounds(session.texts())
         if row_id in bounds:
             return
         if node in bounds:
+            repo_row = True
+            break
+        if any(key.startswith(folders) for key in bounds):
             break
         time.sleep(0.1)
-    else:
-        return
-    before = len(session.lines)
-    click_control(native, session, win, node, timeout)
-    wait_substr(session, f"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed=false]", before, timeout)
-    trace.append({"action": "expand-repo-changes", "control": node})
+    if repo_row:
+        before = len(session.lines)
+        click_control(native, session, win, node, timeout)
+        wait_substr(session, f"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed=false]", before, timeout)
+        trace.append({"action": "expand-repo-changes", "control": node})
+    opened = native.expand_change_dirs(session, win, row_id, name, timeout)
+    if opened:
+        trace.append({"action": "expand-change-dirs", "dirs": opened})
 
 
 def preview_change(native: Any, session: Any, win: dict[str, Any], kind: str, path: str, timeout: float, trace: list[dict[str, Any]], check: bool) -> None:
