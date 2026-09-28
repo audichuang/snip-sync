@@ -1,5 +1,7 @@
 # Native workbench — supervisor checkpoint
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 ## 2026-09-28 v0.3.0：原生工作臺取代 Tauri 成為正式桌面版
 
 使用者要求 0.3.0 以 GPUI 原生版取代 Tauri，並「全部做完才發」：五項深度審查的所有發現、IntelliJ 對照的 26 項缺口，以及 P5 發布管線。以下 PR 均經 `just preflight`（含 native-acceptance：IME、協作 18 案、workload／resource 短測）與完整 CI 後 squash 進 `develop`。

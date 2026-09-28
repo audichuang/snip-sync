@@ -3,16 +3,11 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
-use ts_rs::TS;
-
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitrun::{Overflow, RunOptions};
 use crate::gitsrc::{self, Git, GitError, GitSource, EMPTY_TREE};
-use crate::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
 
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct CommitSummary {
 	pub sha: String,
 	pub parents: Vec<String>,
@@ -22,15 +17,13 @@ pub struct CommitSummary {
 	pub subject: String,
 }
 
-#[derive(Debug, Clone, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct GitReference {
 	pub name: String,
 	pub sha: String,
 }
 
-#[derive(Debug, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub struct RepositoryHistory {
 	pub root: String,
 	pub commits: Vec<CommitSummary>,
@@ -39,11 +32,7 @@ pub struct RepositoryHistory {
 	pub has_more: bool,
 }
 
-pub fn parse_log(out: &str) -> Vec<CommitSummary> {
-	parse_log_bytes(out.as_bytes())
-}
-
-/// [`parse_log`] over raw `git log` bytes. Each field is decoded on its own
+/// Parses raw `git log` bytes. Each field is decoded on its own
 /// and lossily, so one commit with a non-UTF-8 author or subject shows
 /// replacement characters instead of failing the whole page.
 pub fn parse_log_bytes(out: &[u8]) -> Vec<CommitSummary> {
@@ -499,15 +488,6 @@ pub fn history_query_with(
 	run_log(git, &args, None, limit, opts)
 }
 
-#[derive(Debug, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct DirectoryEntry {
-	pub path: String,
-	pub name: String,
-	pub directory: bool,
-	pub symlink: bool,
-}
-
 fn inside(root: &Path, relative: &str) -> io::Result<PathBuf> {
 	let rel = Path::new(relative);
 	if rel.is_absolute()
@@ -531,67 +511,19 @@ fn inside(root: &Path, relative: &str) -> io::Result<PathBuf> {
 	Ok(path)
 }
 
-/// Most entries [`directory`] returns; a bigger directory is an error.
-pub const DIRECTORY_LIMIT: usize = 10_000;
-
-/// One directory at a time: large monorepos and dependency trees stay lazy.
-/// Strict and bounded: it reads at most [`DIRECTORY_LIMIT`] + 2 entries
-/// (room for `.git`) and a bigger directory is an error, never a partial
-/// list; resumable pages are [`crate::workspace::DirectoryScan`]. A name
-/// that is not UTF-8 has no string path that names it, so it is left out
-/// rather than rendered lossily into a path of some other file.
-pub fn directory(
-	root: &Path,
-	relative: &str,
-) -> io::Result<Vec<DirectoryEntry>> {
-	let mut scan = DirectoryScan::open(&inside(root, relative)?)?;
-	let page = scan
-		.next_page(&ScanBudget::visits(DIRECTORY_LIMIT + 2))
-		.map_err(|e| match e {
-			ScanError::Io(e) => e,
-			e => io::Error::other(e.to_string()),
-		})?;
-	if page.status != ScanStatus::Complete
-		|| page.entries.len() > DIRECTORY_LIMIT
-	{
-		return Err(io::Error::other(format!(
-			"Directory has more than {DIRECTORY_LIMIT} entries"
-		)));
-	}
-	Ok(page
-		.entries
-		.into_iter()
-		.filter_map(|e| {
-			let name = e.utf8_name()?.to_string();
-			Some(DirectoryEntry {
-				path: if relative.is_empty() {
-					name.clone()
-				} else {
-					format!("{relative}/{name}")
-				},
-				name,
-				directory: e.directory,
-				symlink: e.symlink,
-			})
-		})
-		.collect())
-}
-
 /// Entries kept per listed commit directory.
 pub const MAX_TREE_ENTRIES: usize = 2000;
 /// Hard upper bound on stdout captured during commit directory listing (8 MiB).
 pub const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TreeKind {
 	Blob,
 	Tree,
 	Submodule,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeEntry {
 	/// Repo-relative path.
 	pub path: String,
@@ -789,8 +721,7 @@ pub fn commit_blob_with(
 	})
 }
 
-#[derive(Debug, Serialize, TS)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub struct SourcePreview {
 	pub content: Option<String>,
 	pub patch: String,
@@ -821,35 +752,6 @@ pub fn file_preview(root: &Path, path: &str) -> io::Result<SourcePreview> {
 	})
 }
 
-fn too_large() -> GitError {
-	io::Error::other("Preview exceeds 1 MiB").into()
-}
-
-/// The desktop preview: content and patch are both strict, so a view that
-/// cannot say "truncated" never shows a partial file or patch as whole.
-pub fn git_preview(
-	git: &Git,
-	source: &GitSource,
-	path: &str,
-) -> Result<SourcePreview, GitError> {
-	let opts = RunOptions {
-		max_stdout: PREVIEW_LIMIT,
-		overflow: Overflow::Error,
-		..RunOptions::default()
-	};
-	let p =
-		git_preview_with(git, source, path, &opts).map_err(
-			|error| match error {
-				GitError::OutputLimit { .. } => too_large(),
-				other => other,
-			},
-		)?;
-	Ok(SourcePreview {
-		content: p.content,
-		patch: p.patch,
-	})
-}
-
 /// Preview under explicit limits (e.g. [`RunOptions::preview`]). The content
 /// is always strict at `opts.max_stdout`. The patch follows
 /// `opts.overflow`: `Error` refuses an oversized patch, `Truncate` keeps
@@ -860,7 +762,7 @@ pub fn git_preview_with(
 	path: &str,
 	opts: &RunOptions,
 ) -> Result<GitPreview, GitError> {
-	// Verify membership before accepting a path from the WebView: the one
+	// Verify membership before accepting a path from the UI: the one
 	// pathspec-limited listing `read_changed_file_with` does answers both.
 	if matches!(source, GitSource::Working) && git.root().join(path).exists() {
 		inside(git.root(), path)?;
@@ -1116,8 +1018,13 @@ mod tests {
 			crate::commits::select_last_from(&git, &side, 2).unwrap(),
 			[base.clone(), side.clone()]
 		);
-		let preview =
-			git_preview(&git, &GitSource::Commit(side), "file.txt").unwrap();
+		let preview = git_preview_with(
+			&git,
+			&GitSource::Commit(side),
+			"file.txt",
+			&RunOptions::default(),
+		)
+		.unwrap();
 		assert_eq!(preview.content.as_deref(), Some("side snapshot\n"));
 		assert!(
 			preview.patch.contains("-base")
@@ -1128,22 +1035,20 @@ mod tests {
 			fs::read_to_string(root.join("file.txt")).unwrap(),
 			"base\n"
 		);
-		assert!(git_preview(&git, &GitSource::Working, "../secret").is_err());
+		assert!(git_preview_with(
+			&git,
+			&GitSource::Working,
+			"../secret",
+			&RunOptions::default()
+		)
+		.is_err());
 	}
 	#[test]
-	fn directory_is_lazy_and_previews_reject_escape_binary_and_large_files() {
+	fn previews_reject_escape_binary_and_large_files() {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path();
 		fs::create_dir_all(root.join("packages/api")).unwrap();
-		fs::create_dir(root.join(".git")).unwrap();
 		fs::write(root.join("packages/api/a.ts"), "source\n").unwrap();
-		let entries = directory(root, "").unwrap();
-		assert_eq!(entries.len(), 1);
-		assert_eq!(entries[0].path, "packages");
-		assert_eq!(
-			directory(root, "packages/api").unwrap()[0].path,
-			"packages/api/a.ts"
-		);
 		assert_eq!(
 			file_preview(root, "packages/api/a.ts")
 				.unwrap()
@@ -1151,7 +1056,7 @@ mod tests {
 				.as_deref(),
 			Some("source\n")
 		);
-		assert!(directory(root, "../").is_err());
+		assert!(file_preview(root, "../").is_err());
 		assert!(file_preview(root, "/etc/passwd").is_err());
 		fs::write(root.join("binary"), [0, 255]).unwrap();
 		assert!(file_preview(root, "binary").unwrap().content.is_none());
@@ -1160,45 +1065,6 @@ mod tests {
 			.set_len((PREVIEW_LIMIT + 1) as u64)
 			.unwrap();
 		assert!(file_preview(root, "big").is_err());
-	}
-	#[test]
-	fn full_listing_is_sorted_strict_and_bounded() {
-		let dir = tempfile::tempdir().unwrap();
-		let root = dir.path();
-		for i in 0..23 {
-			fs::write(root.join(format!("f{i:02}")), "").unwrap();
-		}
-		for d in ["zdir", "adir", "mdir"] {
-			fs::create_dir(root.join(d)).unwrap();
-		}
-		let full: Vec<String> = directory(root, "")
-			.unwrap()
-			.into_iter()
-			.map(|e| e.path)
-			.collect();
-		assert_eq!(full.len(), 26);
-		assert_eq!(&full[..4], ["adir", "mdir", "zdir", "f00"]);
-	}
-
-	#[cfg(target_os = "linux")]
-	#[test]
-	fn full_listing_never_turns_a_non_utf8_name_into_another_files_path() {
-		use std::os::unix::ffi::OsStrExt;
-		let dir = tempfile::tempdir().unwrap();
-		let root = dir.path();
-		fs::write(root.join(std::ffi::OsStr::from_bytes(b"a\xff")), "x")
-			.unwrap();
-		fs::write(root.join("a\u{FFFD}"), "real").unwrap();
-		let entries = directory(root, "").unwrap();
-		assert_eq!(entries.len(), 1);
-		assert_eq!(entries[0].path, "a\u{FFFD}");
-		assert_eq!(
-			file_preview(root, &entries[0].path)
-				.unwrap()
-				.content
-				.as_deref(),
-			Some("real")
-		);
 	}
 
 	/// Every hunk header counts exactly the lines that follow it.
@@ -1238,6 +1104,16 @@ mod tests {
 		assert!(hunks > 0, "no hunks");
 	}
 
+	/// The options the native app previews with (`history.rs`, `main.rs`):
+	/// it never reads `patch_truncated`, so a cut patch must be refused.
+	fn strict_preview() -> RunOptions {
+		RunOptions {
+			max_stdout: PREVIEW_LIMIT,
+			overflow: Overflow::Error,
+			..RunOptions::default()
+		}
+	}
+
 	#[test]
 	fn preview_patch_cut_keeps_whole_hunks_and_the_desktop_view_refuses() {
 		let dir = tempfile::tempdir().unwrap();
@@ -1275,13 +1151,16 @@ mod tests {
 		assert!(cut.patch.len() > PREVIEW_LIMIT / 2);
 		assert_hunks_consistent(&cut.patch);
 		assert_eq!(cut.content.as_deref(), Some(lines(8).as_str()));
-		// The desktop view cannot show "truncated": it refuses instead.
-		assert!(git_preview(&git, &source, "f.txt").is_err());
+		// Content fits, the patch does not: the strict view refuses.
+		assert!(git_preview_with(&git, &source, "f.txt", &strict_preview())
+			.is_err());
 
 		fs::write(root.join("f.txt"), "x".repeat(PREVIEW_LIMIT + 1)).unwrap();
 		let sha = commit(root, "huge");
 		let huge = GitSource::Commit(sha);
-		assert!(git_preview(&git, &huge, "f.txt").is_err());
+		assert!(
+			git_preview_with(&git, &huge, "f.txt", &strict_preview()).is_err()
+		);
 		assert!(git_preview_with(
 			&git,
 			&huge,
@@ -1313,11 +1192,23 @@ mod tests {
 		assert!(cut.patch_truncated);
 		assert!(cut.patch.len() <= PREVIEW_LIMIT);
 		assert_hunks_consistent(&cut.patch);
-		assert!(git_preview(&git, &GitSource::Working, "new.txt").is_err());
+		// The only check of a synthesized patch cut under Overflow::Error.
+		assert!(git_preview_with(
+			&git,
+			&GitSource::Working,
+			"new.txt",
+			&strict_preview()
+		)
+		.is_err());
 
 		fs::write(root.join("small.txt"), "x\ny").unwrap();
-		let small =
-			git_preview(&git, &GitSource::Working, "small.txt").unwrap();
+		let small = git_preview_with(
+			&git,
+			&GitSource::Working,
+			"small.txt",
+			&RunOptions::default(),
+		)
+		.unwrap();
 		assert_eq!(
 			small.patch,
 			"--- /dev/null\n+++ b/small.txt\n@@ -0,0 +1,2 @@\n+x\n+y\n\\ No newline at end of file\n"

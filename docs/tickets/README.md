@@ -2,6 +2,8 @@
 
 由 [spec.md](../spec.md)、[plan.md](../plan.md)、[porting-notes.md](../porting-notes.md) 拆出。每張 ticket 對一個新進的 agent 都要能獨立完成。
 
+> 註:T-11、T-12、T-14 的 Tauri 殼、前端與 WebDriver E2E 已隨 Tauri 版(`crates/desktop`)從 repo 移除,這些 ticket 只是歷史紀錄。
+
 ## 依賴層級
 
 | 層 | Ticket | 依賴 |

@@ -331,10 +331,6 @@ fn nested_preview_options_and_source_fidelity() {
 		Some("STAGED_A\n".repeat(200).as_str())
 	);
 	assert!(!staged.patch.contains("WORKING_B"));
-	let legacy =
-		browser::git_preview(&git_repo, &GitSource::Staged, "a.txt").unwrap();
-	assert_eq!(legacy.content, staged.content);
-	assert_eq!(legacy.patch, staged.patch);
 	assert_eq!(
 		gitsrc::read_changed_file(
 			&git_repo,
@@ -443,7 +439,12 @@ fn nested_preview_options_and_source_fidelity() {
 	.unwrap();
 	assert_eq!(preview.content.as_deref(), Some("BASE\n"));
 	assert!(!preview.patch.contains("WRONG_WORKING"));
-	let paths = gitsrc::list_changed_paths(&git_repo, &source).unwrap();
+	let paths = gitsrc::list_changed_paths_with(
+		&git_repo,
+		&source,
+		&RunOptions::default(),
+	)
+	.unwrap();
 	assert_eq!(paths, [("a.txt".into(), Some(ChangeType::Deleted))]);
 	assert_eq!(
 		gitsrc::collect(&git_repo, &source).unwrap().files[0].content,

@@ -14,31 +14,40 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use snip_native_e2e::{native_bin, scaled};
+
 type Bounds = Arc<Mutex<std::collections::HashMap<String, [i32; 4]>>>;
 type Viewport = Arc<Mutex<(i32, i32)>>;
 
-struct DisplayLock(PathBuf);
+/// Serializes the tests that drive the shared display, across threads and
+/// processes. An `flock` on an open file, not a lock directory: the kernel
+/// drops it when the holder exits, so a killed run cannot block later ones.
+struct DisplayLock(#[allow(dead_code)] fs::File);
 
 impl DisplayLock {
 	fn acquire() -> Self {
 		let path =
-			std::env::temp_dir().join("snip-native-lifecycle-display.lock");
+			std::env::temp_dir().join("snip-native-lifecycle-display.flock");
+		let file = fs::OpenOptions::new()
+			.create(true)
+			.truncate(false)
+			.write(true)
+			.open(&path)
+			.expect("lifecycle display lock file");
 		let start = Instant::now();
 		loop {
-			if fs::create_dir(&path).is_ok() {
-				return Self(path);
+			match file.try_lock() {
+				Ok(()) => return Self(file),
+				Err(fs::TryLockError::WouldBlock) => {}
+				Err(fs::TryLockError::Error(e)) => {
+					panic!("lifecycle display lock {path:?}: {e}")
+				}
 			}
-			if start.elapsed() > Duration::from_secs(120) {
+			if start.elapsed() > scaled(Duration::from_secs(120)) {
 				panic!("timed out waiting for the lifecycle display lock");
 			}
 			std::thread::sleep(Duration::from_millis(200));
 		}
-	}
-}
-
-impl Drop for DisplayLock {
-	fn drop(&mut self) {
-		let _ = fs::remove_dir(&self.0);
 	}
 }
 
@@ -242,7 +251,7 @@ struct SpawnOpts<'a> {
 }
 
 fn spawn_app(opts: SpawnOpts) -> App {
-	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"));
+	let mut cmd = Command::new(native_bin());
 	cmd.args([
 		"--workspace",
 		&opts.workspace.to_string_lossy(),
@@ -337,7 +346,7 @@ fn lines_until(
 	pattern: &str,
 	timeout: Duration,
 ) -> Vec<String> {
-	let deadline = Instant::now() + timeout;
+	let deadline = Instant::now() + scaled(timeout);
 	let mut seen = Vec::new();
 	while Instant::now() < deadline {
 		let remaining = deadline.saturating_duration_since(Instant::now());
@@ -358,7 +367,7 @@ fn lines_until(
 
 fn find_wid(pid: u32) -> String {
 	let start = Instant::now();
-	while start.elapsed() < Duration::from_secs(8) {
+	while start.elapsed() < scaled(Duration::from_secs(8)) {
 		let out = Command::new("xdotool")
 			.args(["search", "--pid", &pid.to_string()])
 			.output()
@@ -396,7 +405,7 @@ fn key(wid: &str, keys: &str) {
 }
 
 fn control(id: &str) -> [i32; 4] {
-	let deadline = Instant::now() + Duration::from_secs(4);
+	let deadline = Instant::now() + scaled(Duration::from_secs(4));
 	loop {
 		let found = BOUNDS.with(|slot| {
 			slot.borrow()
@@ -541,7 +550,7 @@ fn wait_exit(app: &mut App, timeout: Duration) -> std::process::ExitStatus {
 	let status = loop {
 		match child.try_wait().expect("try_wait") {
 			Some(status) => break status,
-			None if start.elapsed() < timeout => {
+			None if start.elapsed() < scaled(timeout) => {
 				std::thread::sleep(Duration::from_millis(30));
 			}
 			None => {
@@ -732,7 +741,7 @@ fn close_reopen_same_pid_discards_stale_preview_and_keeps_clipboard() {
 	);
 	lines_until(&app.rx, "[APP:READY_REPOS:", Duration::from_secs(12));
 	let mut after = Vec::new();
-	let deadline = Instant::now() + Duration::from_millis(800);
+	let deadline = Instant::now() + scaled(Duration::from_millis(800));
 	while Instant::now() < deadline {
 		match app.rx.recv_timeout(Duration::from_millis(50)) {
 			Ok(line) => after.push(line),
@@ -833,7 +842,7 @@ fn quit_drains_a_held_git_child_before_the_process_exits() {
 			}
 			match child.try_wait().unwrap() {
 				Some(st) => break st,
-				None if start.elapsed() < Duration::from_secs(10) => {
+				None if start.elapsed() < scaled(Duration::from_secs(10)) => {
 					std::thread::sleep(Duration::from_millis(15));
 				}
 				None => {
@@ -903,7 +912,7 @@ fn git_busy(pid: u32) -> bool {
 }
 
 fn wait_git_idle(app_pid: u32, app_start: &str) {
-	let deadline = Instant::now() + Duration::from_secs(8);
+	let deadline = Instant::now() + scaled(Duration::from_secs(8));
 	let mut since: Option<Instant> = None;
 	while Instant::now() < deadline {
 		assert!(
@@ -930,7 +939,7 @@ fn wait_git_idle(app_pid: u32, app_start: &str) {
 }
 
 fn wait_copy_git(app_pid: u32, app_start: &str) -> (u32, String) {
-	let deadline = Instant::now() + Duration::from_secs(6);
+	let deadline = Instant::now() + scaled(Duration::from_secs(6));
 	while Instant::now() < deadline {
 		assert!(
 			same_proc(app_pid, app_start),
@@ -1145,7 +1154,7 @@ fn lines_until_all(
 	patterns: &[&str],
 	timeout: Duration,
 ) -> Vec<String> {
-	let deadline = Instant::now() + timeout;
+	let deadline = Instant::now() + scaled(timeout);
 	let mut seen = Vec::new();
 	let mut missing: Vec<&str> = patterns.to_vec();
 	while Instant::now() < deadline {
@@ -1167,7 +1176,7 @@ fn lines_until_all(
 
 /// Every line the app prints during `window`.
 fn lines_for(rx: &Receiver<String>, window: Duration) -> Vec<String> {
-	let deadline = Instant::now() + window;
+	let deadline = Instant::now() + scaled(window);
 	let mut seen = Vec::new();
 	while Instant::now() < deadline {
 		let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1186,7 +1195,7 @@ fn position(lines: &[String], pattern: &str) -> Option<usize> {
 
 /// Waits until the app reports the control as no longer drawn.
 fn absent(id: &str) {
-	let deadline = Instant::now() + Duration::from_secs(4);
+	let deadline = Instant::now() + scaled(Duration::from_secs(4));
 	loop {
 		let shown = BOUNDS.with(|slot| {
 			slot.borrow()
@@ -1448,7 +1457,7 @@ fn head_oid(git_bin: &Path, repo: &Path) -> String {
 }
 
 fn wait_gone(pid: u32, start: &str, what: &str) {
-	let deadline = Instant::now() + Duration::from_secs(6);
+	let deadline = Instant::now() + scaled(Duration::from_secs(6));
 	while same_proc(pid, start) {
 		assert!(
 			Instant::now() < deadline,
@@ -2756,7 +2765,7 @@ int main(int argc, char **argv) {
 }
 
 fn wait_git_child(app_pid: u32, app_start: &str) -> (u32, String) {
-	let deadline = Instant::now() + Duration::from_secs(6);
+	let deadline = Instant::now() + scaled(Duration::from_secs(6));
 	while Instant::now() < deadline {
 		assert!(
 			same_proc(app_pid, app_start),
@@ -3119,7 +3128,7 @@ fn x_server_loss_exits_instead_of_spinning() {
 		.expect("Xvfb display number");
 	let display = format!(":{}", display.trim());
 	let root = tempfile::tempdir().unwrap();
-	let mut child = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"))
+	let mut child = Command::new(native_bin())
 		.args(["--workspace", &root.path().to_string_lossy()])
 		.args(["--restore-dir", &root.path().to_string_lossy()])
 		.env("DISPLAY", &display)

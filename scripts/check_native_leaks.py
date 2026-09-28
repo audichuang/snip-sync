@@ -35,15 +35,19 @@ from bench_native_memory import (  # noqa: E402
     check_repo_state,
     click_repo,
     copy_explicit_selection,
+    descendants,
+    identity,
+    is_same_process,
+    load_build_receipt,
     open_project_list,
     parse_bounds,
     parse_repo_select,
     repo_oracle,
     scroll_into_view,
+    sha256_file,
     show_changes,
     workspace_repos,
 )
-from bench_tauri_memory import descendants, identity, is_same_process, load_build_receipt, sha256_file  # noqa: E402
 from memory_harness import read_proc_starttime, sample_app_resources  # noqa: E402
 from workload_generator import PRESETS, REPO_NAMES  # noqa: E402
 

@@ -2,8 +2,8 @@
 """
 bench_native_memory.py - memory driver for the native GPUI workbench (Linux/X11 only).
 
-Reuses memory_harness.py (attach mode) and bench_tauri_memory.py (process identity,
-isolation, teardown, summaries); nothing here samples memory itself.
+Reuses memory_harness.py (attach mode); the shared helpers below own process identity,
+isolation, teardown and summaries. Nothing here samples memory itself.
 
 Per run it owns: a private Xvfb (display number from -displayfd, never guessed), a private
 D-Bus with no service activation, fresh XDG dirs, and the app started under that bus. The app
@@ -46,34 +46,432 @@ REPO_ROOT = os.path.dirname(SCRIPTS_DIR)
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
-from bench_tauri_memory import (  # noqa: E402
-    MATCHED_REF,
-    MATCHED_SCENARIO,
-    MATCHED_SENTINEL,
-    MATCHED_SIZE,
-    changed_lines,
-    check_matched_measurement,
-    check_matched_state,
-    descendants,
-    finalize_run,
-    find_owned_app_pid,
-    git,
-    identity,
-    isolated_env,
-    load_build_receipt,
-    loaded_graphics_libs,
-    mib,
-    matched_identity,
-    matched_oracle,
-    process_age_sec,
-    reap_owned,
-    run_text,
-    sample_processes,
-    sha256_file,
-    spawn_attached_harness,
-    summarize,
+from memory_harness import (  # noqa: E402
+    HARNESS_REVISION,
+    ProcessTreeSampler,
+    calculate_p95,
+    cleanup_process_group,
+    get_system_environment,
+    read_proc_starttime,
 )
-from memory_harness import HARNESS_REVISION, calculate_p95, cleanup_process_group, get_system_environment, read_proc_starttime  # noqa: E402
+
+
+# ---------------------------------------------------------------- shared helpers
+# Process identity, teardown, git oracle, attach-mode harness and run summaries,
+# also used by check_native_leaks.py and run_native_acceptance.py.
+
+ORACLE_MAX_BLOB_BYTES = 256 * 1024
+MATCHED_REF = "refs/heads/feat/divergent"
+MATCHED_SIZE = (1080, 720)
+MATCHED_SENTINEL = b"snip-sync matched 1repo-diff: clipboard must stay unchanged\n"
+MATCHED_SCENARIO = "selected two-commit feature branch on standard repository"
+
+
+class BenchError(Exception):
+    pass
+
+
+def proc_exe(pid: int, proc_root: str = "/proc") -> str | None:
+    try:
+        return os.path.realpath(os.readlink(os.path.join(proc_root, str(pid), "exe")))
+    except OSError:
+        return None
+
+
+def proc_comm(pid: int, proc_root: str = "/proc") -> str | None:
+    try:
+        with open(os.path.join(proc_root, str(pid), "comm")) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def identity(pid: int, proc_root: str = "/proc") -> dict[str, Any]:
+    return {
+        "pid": pid,
+        "starttime": read_proc_starttime(pid, proc_root),
+        "exe": proc_exe(pid, proc_root),
+        "comm": proc_comm(pid, proc_root),
+    }
+
+
+def is_same_process(ident: dict[str, Any], proc_root: str = "/proc") -> bool:
+    start = read_proc_starttime(ident["pid"], proc_root)
+    return start is not None and start == ident["starttime"]
+
+
+def reap_owned(idents: list[dict[str, Any]], grace: float = 5.0) -> list[str]:
+    """Waits for exactly these (pid, starttime) processes to disappear; anything left is a problem.
+
+    Survivors of the grace period get SIGKILL, and are still reported: a clean run leaves none.
+    Processes not in idents are never signalled, so unrelated sessions are safe.
+    """
+    def alive(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [i for i in group if i["starttime"] is not None and is_same_process(i)]
+
+    def wait(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        end = time.monotonic() + grace
+        group = alive(group)
+        while group and time.monotonic() < end:
+            time.sleep(0.05)
+            group = alive(group)
+        return group
+
+    problems = []
+    survivors = wait(idents)
+    for i in survivors:
+        problems.append(f"owned {i['comm']} pid {i['pid']} survived teardown for {grace}s; sent SIGKILL")
+        try:
+            os.kill(i["pid"], signal.SIGKILL)
+        except OSError:
+            pass
+    problems += [f"owned {i['comm']} pid {i['pid']} still alive after SIGKILL" for i in wait(survivors)]
+    return problems
+
+
+def descendants(owner_pid: int, proc_root: str = "/proc") -> list[int]:
+    pids, _ = ProcessTreeSampler(owner_pid, None, proc_root).get_tree_pids()
+    return [p for p in pids if p != owner_pid]
+
+
+def find_owned_app_pid(owner_pid: int, bin_path: str, proc_root: str = "/proc") -> int | None:
+    """The unique descendant of owner_pid running bin_path; None if not started yet.
+
+    Only processes we spawned are considered; an unrelated snip-sync elsewhere on
+    the machine can never be selected.
+    """
+    target = os.path.realpath(bin_path)
+    matches = [p for p in descendants(owner_pid, proc_root) if proc_exe(p, proc_root) == target]
+    if len(matches) > 1:
+        raise BenchError(f"More than one owned process runs {target}: {matches}")
+    return matches[0] if matches else None
+
+
+def process_age_sec(pid: int) -> float | None:
+    start = read_proc_starttime(pid)
+    if start is None:
+        return None
+    with open("/proc/uptime") as f:
+        uptime = float(f.read().split()[0])
+    return round(uptime - start / os.sysconf("SC_CLK_TCK"), 3)
+
+
+def sample_processes(pids: list[int]) -> dict[str, Any]:
+    """One-shot RSS/PSS of the given PIDs, each labelled with its identity."""
+    sampler = ProcessTreeSampler(os.getpid(), None)
+    procs = []
+    for pid in pids:
+        ident = identity(pid)
+        rss, pss, _, _ = sampler.sample_process_memory(pid)
+        if ident["starttime"] is None or not rss:
+            continue  # exited or zombie
+        procs.append({**ident, "rssBytes": rss, "pssBytes": pss})
+    total_rss = sum(p["rssBytes"] for p in procs)
+    pss_all = all(p["pssBytes"] is not None for p in procs)
+    total_pss = sum(p["pssBytes"] for p in procs) if pss_all else None
+    return {
+        "processes": procs,
+        "rssMib": round(total_rss / 1048576, 2),
+        "pssMib": round(total_pss / 1048576, 2) if total_pss is not None else None,
+    }
+
+
+GRAPHICS_LIB_HINTS = ("dri", "gallium", "libEGL", "libGLX", "libGL.so", "libvulkan", "libgbm", "llvmpipe", "swrast")
+
+
+def loaded_graphics_libs(pid: int) -> list[str]:
+    """GL/DRI libraries actually mapped by pid: evidence of the render backend, not a guess."""
+    try:
+        with open(f"/proc/{pid}/maps") as f:
+            paths = {line.split(None, 5)[5].strip() for line in f if len(line.split(None, 5)) == 6}
+    except OSError:
+        return []
+    return sorted(p for p in paths if p.startswith("/") and any(h in os.path.basename(p) for h in GRAPHICS_LIB_HINTS))
+
+
+def git(repo: str, *args: str, text: bool = True) -> Any:
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")}
+    return subprocess.check_output(["git", "-C", repo, *args], env=env, text=text)
+
+
+def changed_lines(patch: str) -> list[str]:
+    """Text of every added and removed line of a unified diff (headers excluded)."""
+    return [
+        l[1:] for l in patch.splitlines()
+        if l[:1] in ("+", "-") and not l.startswith(("+++", "---")) and l[1:].strip()
+    ]
+
+
+def commit_oracle(repo: str, sha: str) -> dict[str, Any] | None:
+    """Expected blob and diff for the first added/modified small text file of a non-merge commit."""
+    parents = git(repo, "rev-list", "--parents", "-n", "1", sha).split()[1:]
+    if len(parents) > 1:
+        return None
+    changes = git(repo, "diff-tree", "--root", "--no-commit-id", "-r", "--name-status", "-z", sha).split("\0")
+    for status, path in zip(changes[0::2], changes[1::2]):
+        if status not in ("A", "M"):
+            continue
+        if int(git(repo, "cat-file", "-s", f"{sha}:{path}")) > ORACLE_MAX_BLOB_BYTES:
+            continue
+        blob: bytes = git(repo, "show", f"{sha}:{path}", text=False)
+        if b"\0" in blob:
+            continue
+        try:
+            content = blob.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        lines = changed_lines(git(repo, "show", "--format=", "--unified=0", sha, "--", path))
+        if not lines:
+            continue
+        return {
+            "sha": sha,
+            "path": path,
+            "content": content,
+            "contentSha256": hashlib.sha256(blob).hexdigest(),
+            "changedLines": lines[:20],
+        }
+    return None
+
+
+def matched_oracle(repo: str) -> dict[str, Any]:
+    """Fixed ref, dynamic OIDs/path: never fall back to the default history page."""
+    history = git(repo, "log", "--topo-order", "--format=%H", MATCHED_REF, "--").splitlines()
+    if len(history) != 2 or any(not re.fullmatch(r"[0-9a-f]{40}", oid) for oid in history):
+        raise BenchError(f"{MATCHED_REF} must have exactly two full commit OIDs, got {history}")
+    oracle = commit_oracle(repo, history[0])
+    if oracle is None:
+        raise BenchError(f"{MATCHED_REF} tip has no small text diff to verify")
+    patch = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-color",
+                history[1], history[0], "--", f":(literal){oracle['path']}")
+    if not patch or not changed_lines(patch):
+        raise BenchError("matched tip diff is empty")
+    in_hunk = False
+    diff_rows = []
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and line[:1] in ("+", "-"):
+            diff_rows.append({"kind": "change-addition" if line[0] == "+" else "change-deletion", "text": line[1:]})
+    return {**oracle, "ref": MATCHED_REF, "historyOids": history, "patch": patch, "diffRows": diff_rows,
+            "patchSha256": hashlib.sha256(patch.encode()).hexdigest(), "changedLines": changed_lines(patch)}
+
+
+def check_matched_state(observed: dict[str, Any], oracle: dict[str, Any]) -> None:
+    expected = {"ref": MATCHED_REF, "historyOids": oracle["historyOids"],
+                "sha": oracle["sha"], "path": oracle["path"], "previewMode": "diff",
+                "observedLocale": "en",
+                "width": MATCHED_SIZE[0], "height": MATCHED_SIZE[1], "basketEmpty": True,
+                "clipboardSha256": hashlib.sha256(MATCHED_SENTINEL).hexdigest()}
+    for key, wanted in expected.items():
+        if observed.get(key) != wanted:
+            raise BenchError(f"matched {key}: observed {observed.get(key)!r}, expected {wanted!r}")
+
+
+def check_matched_measurement(measurement: dict[str, Any]) -> None:
+    if measurement.get("status") != "COMPLETED" or measurement.get("timestamps", {}).get("steadyDurationSec", 0) < 30:
+        raise BenchError("matched measurement needs a completed 30-second steady window")
+    metrics = measurement.get("steadyMetrics", {})
+    for key in ("rssMedianMib", "rssP95Mib", "rssMaxMib", "pssMedianMib", "pssP95Mib", "pssMaxMib"):
+        value = metrics.get(key)
+        if not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+            raise BenchError(f"matched measurement lacks valid {key}: {value!r}")
+
+
+def matched_identity(bin_path: str, repo: str) -> dict[str, Any]:
+    """Hash the participating repository's refs/index/worktree and the dataset manifest."""
+    manifest_path = os.path.join(os.path.dirname(repo), "workload_manifest.json")
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    if manifest.get("preset") != "standard":
+        raise BenchError("1repo-diff requires a standard workload manifest")
+    if os.path.basename(repo) not in {entry["name"] for entry in manifest.get("repos", [])}:
+        raise BenchError("participating repository is not listed in the standard manifest")
+    digest = hashlib.sha256()
+    for args in (("show-ref", "--head"), ("ls-files", "--stage", "-z"),
+                 ("status", "--porcelain=v2", "-z", "--untracked-files=all")):
+        digest.update(git(repo, *args, text=False))
+        digest.update(b"\0")
+    paths = set(git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard", text=False).split(b"\0"))
+    for raw in sorted(paths - {b""}):
+        path = os.path.join(os.fsencode(repo), raw)
+        digest.update(raw + b"\0")
+        if os.path.islink(path):
+            value = b"link:" + os.readlink(path)
+        elif os.path.isfile(path):
+            value = sha256_file(path).encode()
+        elif not os.path.exists(path):
+            value = b"deleted"
+        else:
+            raise BenchError(f"unsupported workload entry {os.fsdecode(path)}")
+        digest.update(value + b"\0")
+    return {"binarySha256": sha256_file(bin_path), "manifestSha256": sha256_file(manifest_path),
+            "repoPath": os.path.realpath(repo), "repoSha256": digest.hexdigest(),
+            "scope": "participating repo refs, index, tracked/nonignored untracked worktree bytes; dataset manifest"}
+
+
+def isolated_env(iso_root: str) -> tuple[dict[str, str], str]:
+    """Environment with fresh XDG dirs under iso_root, plus a private D-Bus config file.
+
+    The bus has no <servicedir>: nothing is auto-activated, so portal, keyring and a11y
+    lookups fail fast instead of starting desktop services (or blocking 25 s on them).
+    """
+    env = dict(os.environ)
+    for name in ("CONFIG", "DATA", "CACHE", "STATE"):
+        path = os.path.join(iso_root, name.lower())
+        os.makedirs(path)
+        env[f"XDG_{name}_HOME"] = path
+    bus_config = os.path.join(iso_root, "session-bus.xml")
+    with open(bus_config, "w") as f:
+        f.write(
+            "<!DOCTYPE busconfig PUBLIC \"-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN\" "
+            "\"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd\">\n"
+            f"<busconfig><type>session</type><listen>unix:tmpdir={iso_root}</listen>"
+            "<auth>EXTERNAL</auth><policy context=\"default\"><allow send_destination=\"*\" eavesdrop=\"true\"/>"
+            "<allow eavesdrop=\"true\"/><allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>\n"
+        )
+    return env, bus_config
+
+
+def spawn_attached_harness(app: dict[str, Any], run_dir: str, ready_file: str, marker: str, steady: float,
+                           interval: float, label: str, log: Any, readiness_timeout: float = 300.0,
+                           sampler_ready_file: str | None = None,
+                           expected_exe: str | None = None) -> subprocess.Popen:
+    """memory_harness.py attached to app's (pid, starttime), writing its report into run_dir.
+
+    Passing expected_exe does not by itself claim a launch phase. The harness claims launch
+    only after it publishes sampler_ready_file while the exe is still not expected_exe and
+    then observes that transition.
+    """
+    cmd = [
+        sys.executable, "-B", os.path.join(SCRIPTS_DIR, "memory_harness.py"),
+        "--attach-pid", str(app["pid"]), "--attach-starttime", str(app["starttime"]),
+        "--ready-file", ready_file, "--ready-marker", marker,
+        "--readiness-timeout", str(readiness_timeout), "--steady-seconds", str(steady),
+        "--sample-interval", str(interval), "--profile-label", label,
+        "--out-dir", run_dir,
+    ]
+    if sampler_ready_file:
+        cmd.extend(["--sampler-ready-file", sampler_ready_file])
+    if expected_exe:
+        cmd.extend(["--expected-exe", expected_exe])
+    return subprocess.Popen(cmd, stdout=log, stderr=log)
+
+
+def finalize_run(result: dict[str, Any], error: str | None) -> dict[str, Any]:
+    """COMPLETED only with a measurement, no error and a clean teardown; everything collected is kept."""
+    problems = result.get("cleanupProblems") or []
+    if error is None and not problems and "measurement" in result:
+        result["status"] = "COMPLETED"
+    else:
+        result["status"] = "FAILED"
+        reasons = [error] if error else []
+        if problems:
+            reasons.append("cleanup: " + "; ".join(problems))
+        result["error"] = " | ".join(reasons) or "no measurement collected"
+    return result
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_build_receipt(bin_path: str, receipt_arg: str | None) -> dict[str, Any] | None:
+    """Provenance for a build receipt, or None when the caller did not pass one and no sidecar exists.
+
+    origin is "user-supplied" only for --build-receipt. A sidecar next to the binary is "sidecar".
+    A sha256 field that is not the on-disk hash of bin_path is rejected before any benchmark work.
+    """
+    if receipt_arg:
+        path = receipt_arg
+        origin = "user-supplied"
+        if not os.path.isfile(path):
+            raise ValueError(f"user-supplied build receipt not found: {path}")
+    else:
+        path = bin_path + ".receipt.json"
+        if not os.path.isfile(path):
+            return None
+        origin = "sidecar"
+    try:
+        with open(path, encoding="utf-8") as f:
+            document = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"build receipt {path} is not readable JSON: {e}") from e
+    if not isinstance(document, dict):
+        raise ValueError(f"build receipt {path} must be a JSON object")
+    actual = sha256_file(bin_path)
+    claimed = document.get("sha256")
+    checked = None
+    if claimed is not None:
+        if not isinstance(claimed, str) or claimed.strip().lower() != actual:
+            raise ValueError(
+                f"build receipt sha256 {claimed!r} does not match {bin_path} ({actual})"
+            )
+        checked = True
+    return {
+        "origin": origin,
+        "path": os.path.abspath(path),
+        "sha256MatchesBinary": checked,
+        "binarySha256": actual,
+        "document": document,
+    }
+
+
+def run_text(*cmd: str) -> str | None:
+    try:
+        return subprocess.check_output(list(cmd), text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def mib(values: list[float]) -> dict[str, Any]:
+    return {
+        "n": len(values),
+        "median": round(statistics.median(values), 2),
+        "p95": round(calculate_p95(values), 2),
+        "worst": round(max(values), 2),
+    }
+
+
+def phase_peak_rss_mib(run_dir: str, phase: str) -> float | None:
+    """Max sampled tree RSS among raw samples of exactly this phase; None if there are none."""
+    with open(os.path.join(run_dir, "raw_samples.jsonl")) as f:
+        values = [s["totalRssMib"] for s in map(json.loads, f) if s["phase"] == phase]
+    return max(values) if values else None
+
+
+def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Cross-run statistics over COMPLETED runs only; each field names the sample phase it covers."""
+    done = [r for r in runs if r.get("status") == "COMPLETED"]
+    if not done:
+        return {"completedRuns": 0, "failedRuns": len(runs)}
+    ok = [r["measurement"] for r in done]
+    out = {
+        "completedRuns": len(done),
+        "failedRuns": len(runs) - len(done),
+        "steadyRssMedianMib": mib([m["steadyMetrics"]["rssMedianMib"] for m in ok]),
+        "steadySampledPeakRssMib": mib([m["steadyMetrics"]["rssMaxMib"] for m in ok]),
+        "attachToEndSampledPeakRssMib": mib([m["overallPeak"]["sampledPeakRssMib"] for m in ok]),
+        "appRootVmHwmMib": mib([m["mainProcessVmHwm"]["mib"] for m in ok if m["mainProcessVmHwm"]["mib"] is not None]),
+        "attachToReadySec": mib([m["timestamps"]["attachToReadySec"] for m in ok]),
+        "steadyProcessCount": sorted({m["processTree"]["steadyMedianProcessCount"] for m in ok}),
+        "processAgeAtSamplerStartSec": mib([r["processAgeAtSamplerStartSec"] for r in done]),
+    }
+    if all(m["steadyMetrics"]["pssMedianMib"] is not None for m in ok):
+        out["steadyPssMedianMib"] = mib([m["steadyMetrics"]["pssMedianMib"] for m in ok])
+    launch = [phase_peak_rss_mib(r["runDir"], "launch") for r in done]
+    if len(launch) == len(done) and all(p is not None for p in launch):
+        out["launchSampledPeakRssMib"] = mib([p for p in launch if p is not None])
+    pre = [phase_peak_rss_mib(r["runDir"], "pre-ready") for r in done]
+    if len(pre) == len(done) and all(p is not None for p in pre):
+        out["preReadySampledPeakRssMib"] = mib(pre)
+    return out
+
+
+# ---------------------------------------------------------------- native session
 
 SCREEN = "1280x900x24"
 ICD_DIR = "/usr/share/vulkan/icd.d"
@@ -1321,7 +1719,7 @@ def select_native_matched(s: NativeSession, win: dict[str, Any], oracle: dict[st
         raise NativeBenchError(f"matched client geometry is {win['width']}x{win['height']}, expected {MATCHED_SIZE}")
     s.set_clipboard(MATCHED_SENTINEL)
     start = len(s.lines)
-    # The frozen native app starts in zh-Hant; use its real toggle to match Tauri's English UI.
+    # The frozen native app starts in zh-Hant; the matched profile runs in English via the real toggle.
     click("btn-locale")
     s.wait_line(lambda line: line == "[APP:LOCALE: En]", start=start)
     ref_control = f"ref:{MATCHED_REF}"
@@ -2078,7 +2476,6 @@ def main(argv: list[str] | None = None) -> int:
                 "runRepeatability": "unpurged host page cache; cold process memory",
             },
             "coldStart": "UNSUPPORTED (process-cold only; filesystem cache uncontrolled; drop_caches not performed)",
-            "tauri15RepoComparison": "UNSUPPORTED (Tauri baseline only supports 1 active repo; comparison cannot be fabricated)",
         },
         "runsPerProfile": args.runs,
         "steadySeconds": args.steady_seconds,

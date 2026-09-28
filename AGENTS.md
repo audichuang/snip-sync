@@ -13,13 +13,15 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 - `main` only holds released code; `develop` is the integration branch; every change gets its own `feature/<name>` (or `fix/<name>`) branch cut from `develop`, and its PR targets `develop`.
 - To release, open a PR `develop` → `main`, merge it once green, then run `just release X.Y.Z` on `main` (it pushes the tag; `release.yml` builds, publishes and bumps the Homebrew tap). Release only when there is something worth shipping, not per merge.
+- A pre-release to try a build skips `main`: on `develop`, `just bump X.Y.Z-beta.N`, commit, push, then `just release X.Y.Z-beta.N`. `release.yml` accepts the green push-to-develop CI run for a tag with a `-`, marks it pre-release and skips Homebrew.
 
 ## Before you call a change done
 
-- Run `just preflight` before every push. It runs everything CI runs that Linux can run: Rust fmt/clippy/doc/test, frontend format/typecheck/oxlint/test/build, the Tauri E2E (`just desktop-e2e`), and the native smoke/lifecycle/acceptance gates (IME, 18 collaboration cases, resource runs). A Linux failure found by CI instead of locally is a process bug. CI adds audit, DTO drift, clean checkout and Windows/macOS; see `.github/workflows/ci.yml`.
+- Run `just preflight` before every push. It runs everything CI runs that Linux can run: actionlint, Rust fmt/clippy/doc/test, the Python harness tests, and the native smoke/lifecycle/acceptance gates (IME, 18 collaboration cases, resource runs). A Linux failure found by CI instead of locally is a process bug. CI adds audit, clean checkout, packaging and Windows/macOS; see `.github/workflows/ci.yml`.
 - `native-acceptance` needs a Python with Pillow in `SNIP_NATIVE_PYTHON`, and it fails if the checkout changes after its build. Commit first, then leave the tree alone until it finishes.
-- A new control that a test drives gets an id: a `data-testid` in Tauri, or a `probe(...)` id in native, which the drivers read from `[APP:CTRL_BOUNDS]`.
-- After changing any `#[derive(TS)]` type, run `bun run generate:dto && bun run format` in `crates/desktop` and commit `src/generated/`.
+- Which test a change gets: pure logic → a unit test in `crates/core` or the native crate; UI state and interaction → an in-process `#[gpui::test]` in `crates/desktop-native/src/main.rs` `tests::in_process` (no display, runs on all three OSes); real OS input, real clipboard or pixels → `crates/native-e2e/tests/smoke.rs` / `lifecycle.rs` under Xvfb (they drive the binary in `SNIP_NATIVE_BIN`; `just native-smoke` / `just native-lifecycle` build a debug one, acceptance uses its release build); cross-machine file/commit semantics → a collaboration manifest step. Windows and macOS have no real-input GUI test: CI only launches the packaged app there (`smoke_native.py --launch`).
+- A new control that a test drives gets a `probe(...)` id, which the drivers read from `[APP:CTRL_BOUNDS]`.
+- Real-app waits in the native-e2e drivers go through `snip_native_e2e::scaled(...)`; on a loaded machine set `SNIP_E2E_TIMEOUT_SCALE` (CI uses 2) instead of raising a deadline. Under a memory-capped sandbox, a release build OOM-killed in `rustc` needs `CARGO_BUILD_JOBS`, not a retry.
 
 ## Cross-platform
 

@@ -788,7 +788,15 @@ impl WorkbenchModel {
 			.bg(rgb(pal().frame_bg))
 			.text_size(px(SMALL_TEXT))
 			.text_color(rgb(pal().text_muted))
-			.child(fill_text(self.status.render(loc)).mr(px(8.)))
+			// The line clamps; a long status (per-file paste failures) shows
+			// in full on hover.
+			.child({
+				let status = self.status.render(loc);
+				fill_text(status.clone())
+					.id("status-text")
+					.tooltip(tip(status))
+					.mr(px(8.))
+			})
 			.child(
 				widget()
 					.id("basket-summary")

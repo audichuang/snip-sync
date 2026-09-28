@@ -1,0 +1,17 @@
+[package]
+name = "snip-native-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Real-app X11 drivers for snip-desktop-native (tests only)"
+
+# No dependency on snip-desktop-native: the drivers run the executable named by
+# SNIP_NATIVE_BIN (the accepted release build in CI), so running them never
+# compiles a second copy of the app.
+[dev-dependencies]
+snip-core = { path = "../core" }
+tempfile = "3"
+
+[lints]
+workspace = true

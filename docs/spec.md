@@ -153,7 +153,8 @@ CLI 與 App 呼叫同一組核心函式,行為完全相同。
 
 ## 6. 技術決策(摘要)
 
-- Rust + Tauri 2,前端 React 19 + TypeScript + HeroUI v3 + Tailwind v4,結構比照 aghub(見 plan.md)。
+- 桌面 App 自 v0.3.0 起是 GPUI 原生版(`crates/desktop-native`)。原本的 Rust + Tauri 2 + React 版已從 repo 移除,
+  下面提到前端元件與 WebView 的條目是當時的紀錄。
 - git 一律呼叫**系統的 git CLI**(假設兩台都有安裝 git;啟動時檢查,沒有就提示)。
   不用 git2 / gix,以確保 rename 偵測、`.gitattributes` 等行為與本機 git 一致。
 - 前端元件:時間軸 `@tomplum/react-git-log`(HTML Grid 模式)、diff `@pierre/diffs`、

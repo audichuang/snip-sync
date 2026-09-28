@@ -9,7 +9,7 @@
 - **Workspace Member**：`crates/desktop-native`
 - **套件 / 執行檔名稱**：`snip-desktop-native`
 - **精確相依鎖定**：`gpui = "=0.2.2"`（嚴格等號鎖定，不使用 `^` 語意相容範圍；此為原生工作台 feature 分支介面規範）
-- **真實 OS 輸入整合測試**：`crates/desktop-native/tests/smoke.rs`（Linux X11 環境下使用 `xdotool`、`x11-apps`、`imagemagick` 驅動真實輸入與可攜式截圖）
+- **真實 OS 輸入整合測試**：`crates/native-e2e/tests/smoke.rs`（Linux X11 環境下使用 `xdotool`、`x11-apps`、`imagemagick` 驅動真實輸入與可攜式截圖）
 
 ---
 
@@ -94,6 +94,6 @@ just native-lifecycle
 # 預覽 dry-run
 just --dry-run native-smoke
 
-# 執行完整本機預檢（含 preflight-rust、preflight-frontend、desktop-e2e、preflight-harness、native-smoke、native-lifecycle）
+# 執行完整本機預檢（preflight-workflows、preflight-rust、preflight-harness、native-smoke、native-lifecycle、native-acceptance）
 just preflight
 ```

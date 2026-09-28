@@ -1458,7 +1458,6 @@ def generate_markdown_report(report_data: dict[str, Any]) -> str:
         "   - **GPU 與顯示緩衝區**：Linux `/proc` RSS/PSS 僅記錄使用者空間虛擬記憶體常駐分頁，GPU 專屬配置、DMA 緩衝區與 X11/Wayland 合成器表面不計入此數字。",
         "5. **Profiles 狀態**：",
         "   - **100 次連續切換 (100-switch Soak)**：標記為 `PENDING`。目前 Native CLI 尚未提供原生 UI 驅動切換參數，不進行虛假插樁。",
-        "   - **Tauri Baseline 對照**：標記為 `UNAVAILABLE`。現階段 Tauri 版本無等價之無周邊 overview/preview 命令行量測入口，在未具備相同工作負載與建置條件前不宣稱節省比例。",
     ])
 
     return "\n".join(lines) + "\n"
@@ -1478,7 +1477,7 @@ def run_standard_suite(
     - GPUI Release (1 Repo Overview)
     - GPUI Release (15 Repos Overview)
     - GPUI Release (15 Repos Preview)
-    And appends pending/unavailable placeholders for soak and Tauri.
+    And appends a pending placeholder for soak.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1560,13 +1559,6 @@ def run_standard_suite(
             "profileLabel": "100-Switch Soak Test (Repo/Preview Churn)",
             "status": "PENDING",
             "reason": "CLI lacks automated 100-switch input driver; pending native UI test automation driver rather than faked metric.",
-        })
-
-        # Tauri comparable profile (Unavailable without equivalent CLI headless mode)
-        suite_results.append({
-            "profileLabel": "Tauri Baseline (Comparable Overview/Preview)",
-            "status": "UNAVAILABLE",
-            "reason": "No comparable headless/CLI overview-preview profile currently exists for Tauri desktop app; no claimed savings without identical workload.",
         })
 
     finally:

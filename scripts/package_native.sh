@@ -44,8 +44,7 @@ require_tool() {
 }
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-# The Tauri crate stays in the tree for rollback; its icons are the product icons.
-ICON_DIR="$ROOT_DIR/crates/desktop/src-tauri/icons"
+ICON_DIR="$ROOT_DIR/crates/desktop-native/packaging/icons"
 
 # Third-party licenses for what the binary embeds: the OFL covers every Inter
 # and JetBrains Mono face (Regular, SemiBold, Italic, ...), Apache-2.0 the
