@@ -2223,6 +2223,25 @@ mod tests {
 		assert_helper_dead(pid);
 	}
 
+	/// A `ps` slowed by a loaded machine (seconds on a busy Mac) still
+	/// answers: a clean exit must not turn into a failure and a leaked slot.
+	#[cfg(unix)]
+	#[test]
+	fn check_group_liveness_waits_for_a_slow_ps() {
+		let _s = serial();
+		let _inj = InjectionGuard;
+		test_override_ps_helper(Some(vec![
+			"sh".to_string(),
+			"-c".to_string(),
+			"sleep 1; printf 'Z 12345\\n'".to_string(),
+		]));
+		let res = tree::check_group_liveness(12345);
+		assert!(
+			!res.expect("a slow ps is not an error"),
+			"zombie-only group"
+		);
+	}
+
 	#[cfg(unix)]
 	#[test]
 	fn check_group_liveness_nonzero_exit_fails() {
