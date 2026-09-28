@@ -795,7 +795,7 @@ class TestChangeDirectoryExpansion(unittest.TestCase):
         self.assertEqual(opened, ["src"])
         self.assertEqual(session.clicked, [src, src])
 
-    def test_scrolls_below_the_repo_row_to_find_its_folders(self) -> None:
+    def test_sweeps_the_list_from_the_top_to_find_its_folders(self) -> None:
         node = "change-repo:unstaged:repo"
         src = "change-dir:unstaged:repo:src"
         session = ChangeTreeSession(
@@ -806,11 +806,12 @@ class TestChangeDirectoryExpansion(unittest.TestCase):
                     _bounds("change-row:unstaged:src/a.txt", 560),
                 ]],
             },
-            on_wheel=[[], [_bounds(node, 500), _bounds(src, 524)]],
+            # Two still wheel-ups find the top; the second wheel-down reveals `src`.
+            on_wheel=[[], [], [], [_bounds(node, 500), _bounds(src, 524)]],
         )
         opened = expand_change_dirs(session, self.WIN, "change-row:unstaged:src/a.txt", "repo", timeout=1)
         self.assertEqual(opened, ["src"])
-        self.assertEqual(session.wheels, 2)
+        self.assertEqual(session.wheels, 4)
         self.assertEqual(session.clicked, [src])
 
     def test_visible_row_and_root_files_need_no_click(self) -> None:

@@ -1640,39 +1640,52 @@ def change_row_group(control_id: str) -> str:
     return "unstaged" if source == "untracked" else source
 
 
+def _change_rows_snapshot(s: NativeSession) -> dict[str, tuple[int, int, int, int]]:
+    return {k: v for k, v in parse_bounds(s.texts()).items() if k.startswith("change-")}
+
+
+def _wheel_left_list(s: NativeSession, win: dict[str, Any], down: bool) -> bool:
+    """One wheel step over the left list; False when the rows did not move."""
+    snap = _change_rows_snapshot(s)
+    viewport = left_viewport(s.texts())
+    before = len(s.lines)
+    s.focus(win["wid"])
+    cx = win["x"] + viewport[0] + viewport[2] // 2
+    cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
+    s.x("xdotool", "mousemove", str(cx), str(cy), "click", "5" if down else "4")
+    try:
+        s.wait_line(lambda line: "id=change-" in line, start=before, timeout=1.5)
+    except NativeBenchError:
+        pass  # a wheel event can be dropped, or the list is already at its end
+    time.sleep(0.1)
+    return _change_rows_snapshot(s) != snap
+
+
 def scroll_to_change_dirs(
     s: NativeSession,
     win: dict[str, Any],
-    group: str,
-    repo: str,
     candidates: Callable[[], list[str] | None],
-    max_steps: int = 30,
+    max_steps: int = 60,
 ) -> list[str] | None:
-    """Scroll the rows under the repo's node (its repo row, or a single repo's group
-    header) into view until `candidates` finds something; a workspace of many dirty
-    repos puts them below the fold."""
-    anchor = f"change-repo:{group}:{repo}"
-    if not any(f"id={anchor} " in line for line in s.texts()):
-        anchor = f"change-header:{group}"
-    try:
-        scroll_into_view(s, win, anchor)
-    except NativeBenchError:
-        return []
-    for _ in range(max_steps):
-        found = candidates()
-        if found != []:
-            return found
-        viewport = left_viewport(s.texts())
-        before = len(s.lines)
-        s.focus(win["wid"])
-        cx = win["x"] + viewport[0] + viewport[2] // 2
-        cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
-        s.x("xdotool", "mousemove", str(cx), str(cy), "click", "5")
-        try:
-            s.wait_line(lambda line: "id=left-list " in line or "id=change-" in line, start=before, timeout=2)
-        except NativeBenchError:
-            pass  # a wheel event can be dropped, or the list is already at its end
-        time.sleep(0.1)
+    """Sweep the Changes list from its top down until `candidates` finds something.
+
+    A workspace of many dirty repos puts a repo's folders out of view, above or
+    below, and bounds of unpainted rows are unknown; a list that stops moving for
+    two wheel steps is at its end.
+    """
+    for down in (False, True):
+        still = 0
+        for _ in range(max_steps):
+            if down:
+                found = candidates()
+                if found != []:
+                    return found
+            if _wheel_left_list(s, win, down):
+                still = 0
+            else:
+                still += 1
+                if still >= 2:
+                    break
     return candidates()
 
 
@@ -1713,7 +1726,7 @@ def expand_change_dirs(
         while (dirs := candidates()) == [] and time.monotonic() < deadline:
             time.sleep(0.05)
         if dirs == []:
-            dirs = scroll_to_change_dirs(s, win, group, repo, candidates)
+            dirs = scroll_to_change_dirs(s, win, candidates)
         if dirs is None:
             return opened
         if not dirs:
