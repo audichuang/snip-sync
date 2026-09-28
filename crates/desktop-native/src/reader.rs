@@ -2108,7 +2108,18 @@ impl WorkbenchModel {
 				.into_any_element();
 		}
 		let lang = p.code_lang();
-		let tint = r.block.map(|b| b.change().bg());
+		// Old side reads red, new side green, so a modified pair is told
+		// apart at a glance; the ribbon keeps IntelliJ's block colour.
+		let changed = r.block.is_some();
+		let tint_of = |left: bool| {
+			changed.then(|| {
+				if left {
+					(pal().diff_removed_bg, pal().diff_removed_word_bg)
+				} else {
+					(pal().diff_add_bg, pal().diff_added_word_bg)
+				}
+			})
+		};
 		// IntelliJ mirrors the left gutter: both line-number columns sit
 		// against the divider, with the ribbons between them.
 		let half = |cell: Option<(u32, usize)>, left: bool, side_id: String| {
@@ -2154,7 +2165,8 @@ impl WorkbenchModel {
 									&finds,
 									sel,
 									&words,
-									pal().diff_word_bg,
+									tint_of(left)
+										.map_or(pal().diff_word_bg, |t| t.1),
 								)),
 							)
 							.child(
@@ -2171,9 +2183,7 @@ impl WorkbenchModel {
 							),
 					);
 				let num = gutter_num(num_w, Some(n))
-					.when(tint.is_some(), |d| {
-						d.text_color(rgb(pal().text_muted))
-					});
+					.when(changed, |d| d.text_color(rgb(pal().text_muted)));
 				if left {
 					div().flex().size_full().child(code).child(num)
 				} else {
@@ -2186,7 +2196,9 @@ impl WorkbenchModel {
 				.min_w_0()
 				.overflow_hidden()
 				.whitespace_nowrap()
-				.when_some(tint.filter(|_| cell.is_some()), |d, c| d.bg(rgb(c)))
+				.when_some(tint_of(left).filter(|_| cell.is_some()), |d, c| {
+					d.bg(rgb(c.0))
+				})
 				.children(body)
 				.children(crate::ui::probe(&self.probes, side_id))
 		};
