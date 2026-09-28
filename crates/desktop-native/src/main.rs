@@ -5589,29 +5589,10 @@ impl WorkbenchModel {
 								result.files.errors.len(),
 								result.created_commits.len()
 							);
-							if result.created_commits.is_empty() {
-								model.set_status(
-									"status_paste_done",
-									[
-										result.files.created_count.to_string(),
-										result
-											.files
-											.overwritten_count
-											.to_string(),
-										result
-											.files
-											.skipped_existing_count
-											.to_string(),
-										result.files.deleted_count.to_string(),
-										result.files.errors.len().to_string(),
-									],
-								);
-							} else {
-								model.set_status(
-									"commit_replay_done",
-									[result.created_commits.join(", ")],
-								);
+							for error in &result.files.errors {
+								app_log!("[APP:PASTE_FILE_ERROR: {error}]");
 							}
+							model.status = result.status();
 							model.clear_paste_state();
 							model.restore_log_after_paste();
 							model.pending_focus =
