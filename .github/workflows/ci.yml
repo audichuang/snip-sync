@@ -177,13 +177,13 @@ jobs:
               run: cargo test -p snip-core --locked --test git_runner fast_child_rapid_cleanup_releases_all_permits_without_leftover_error -- --exact
             - name: Workspace tests (Linux, under xvfb, excluding native binary crate)
               if: runner.os == 'Linux'
-              run: xvfb-run -a cargo test --workspace --exclude snip-desktop-native --locked --no-fail-fast
+              run: xvfb-run -a cargo test --workspace --exclude snip-desktop-native --exclude snip-native-e2e --locked --no-fail-fast
             - name: Native binary unit tests (Linux)
               if: runner.os == 'Linux'
               run: cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
             - name: Workspace tests (excluding native binary crate)
               if: runner.os != 'Linux'
-              run: cargo test --workspace --exclude snip-desktop-native --locked --no-fail-fast
+              run: cargo test --workspace --exclude snip-desktop-native --exclude snip-native-e2e --locked --no-fail-fast
             - name: Native binary unit tests
               if: runner.os != 'Linux'
               run: cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
@@ -221,78 +221,6 @@ jobs:
                   PYTHONDONTWRITEBYTECODE: "1"
                   SNIP_REQUIRE_ALL_TESTS: "1"
               run: python3 -B -m unittest discover -s scripts/tests -v
-            - name: Checkout left clean
-              shell: bash
-              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
-
-    # Native real OS input E2E test on Linux X11 (headless with Xvfb and xdotool).
-    # Tests crates/desktop-native/tests/smoke.rs and tests/lifecycle.rs with real
-    # input events, screenshots, and software graphics fallback (Mesa/Gallium
-    # llvmpipe). Runs in isolation to avoid display or system clipboard
-    # contention with other test suites.
-    native-smoke:
-        name: Native Smoke (Linux)
-        runs-on: ubuntu-24.04
-        timeout-minutes: 30
-        env:
-            RUSTFLAGS: "-D warnings"
-            SNIP_REQUIRE_ALL_TESTS: "1"
-            # lavapipe renders on the CPU; shared runners miss fixed deadlines.
-            SNIP_E2E_TIMEOUT_SCALE: "2"
-            LIBGL_ALWAYS_SOFTWARE: "1"
-            GALLIUM_DRIVER: llvmpipe
-        steps:
-            - uses: actions/checkout@v6
-            - name: Install Rust toolchain
-              uses: dtolnay/rust-toolchain@stable
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
-            - name: Rust Cache
-              uses: Swatinem/rust-cache@v2
-              with:
-                  shared-key: ${{ runner.os }}-native-smoke
-                  cache-on-failure: true
-            - name: Install Linux system dependencies (X11, Xvfb, xdotool, xclip, x11-apps, imagemagick, xkbcommon, fonts, software GL/Vulkan, Wayland)
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y \
-                      libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
-                      xvfb xdotool xclip x11-apps imagemagick \
-                      fonts-dejavu-core fonts-noto-cjk \
-                      libfontconfig1-dev libfreetype6-dev \
-                      libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
-                      libwayland-dev
-            - name: Configure git identity
-              run: |
-                  git config --global user.name "snip-ci"
-                  git config --global user.email "snip-ci@example.invalid"
-            - name: Run native OS input smoke test (Linux X11 under Xvfb with lavapipe)
-              shell: bash
-              env:
-                  SNIP_E2E_OUT: ${{ runner.temp }}/native-e2e-artifacts
-              run: |
-                  mkdir -p "$SNIP_E2E_OUT"
-                  rm -f "$SNIP_E2E_OUT/graph.png" "$SNIP_E2E_OUT/file_tree.png" "$SNIP_E2E_OUT/paste_preview.png" "$SNIP_E2E_OUT/light_theme.png"
-                  set -o pipefail
-                  ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$SNIP_E2E_OUT/smoke.log"
-                  test -s "$SNIP_E2E_OUT/smoke.log" || { echo "Missing or empty smoke.log" >&2; exit 1; }
-                  python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png', 'light_theme.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "$SNIP_E2E_OUT"
-            - name: Run native lifecycle tests (close/reopen/quit drain, copy and paste cancel)
-              shell: bash
-              env:
-                  SNIP_E2E_OUT: ${{ runner.temp }}/native-e2e-artifacts
-              run: |
-                  mkdir -p "$SNIP_E2E_OUT"
-                  set -o pipefail
-                  ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test lifecycle --locked -- --nocapture 2>&1 | tee "$SNIP_E2E_OUT/lifecycle.log"
-                  test -s "$SNIP_E2E_OUT/lifecycle.log" || { echo "Missing or empty lifecycle.log" >&2; exit 1; }
-            - name: Upload native smoke screenshots and logs
-              if: always()
-              uses: actions/upload-artifact@v4
-              with:
-                  name: native-smoke-linux
-                  path: ${{ runner.temp }}/native-e2e-artifacts
-                  if-no-files-found: error
             - name: Checkout left clean
               shell: bash
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
@@ -342,7 +270,7 @@ jobs:
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
     # The gates, sharded so the slowest (18 collaboration cases, ~10 min in
-    # one job) is split in two. The build is restored at its original
+    # one job) is split in two and smoke/lifecycle run on the release build. The build is restored at its original
     # absolute path, which the receipt records.
     native-acceptance-shard:
         name: Native Acceptance (${{ matrix.name }})
@@ -362,11 +290,34 @@ jobs:
                     - name: collaboration-2
                       gate: collaboration
                       shard: 2/2
+                    # crates/native-e2e: real OS input, screenshots, close/reopen/quit
+                    # drain and copy/paste cancel, driving the accepted binary.
+                    - name: smoke
+                      gate: smoke
+                      shard: ""
+                      drivers: true
+                    - name: lifecycle
+                      gate: lifecycle
+                      shard: ""
+                      drivers: true
         env:
             SNIP_REQUIRE_ALL_TESTS: "1"
             SNIP_NATIVE_PYTHON: /usr/bin/python3
+            # lavapipe renders on the CPU; shared runners miss fixed deadlines.
+            SNIP_E2E_TIMEOUT_SCALE: "2"
         steps:
             - uses: actions/checkout@v6
+            # Only the Rust drivers compile anything (snip-core and the tests,
+            # debug); the app itself comes from native-acceptance-build.
+            - name: Install Rust toolchain
+              if: matrix.drivers
+              uses: dtolnay/rust-toolchain@stable
+            - name: Rust Cache
+              if: matrix.drivers
+              uses: Swatinem/rust-cache@v2
+              with:
+                  shared-key: ${{ runner.os }}-native-e2e
+                  cache-on-failure: true
             - name: Install isolated acceptance dependencies
               run: |
                   sudo apt-get update
@@ -653,7 +604,7 @@ jobs:
     gate:
         name: CI gate
         if: always()
-        needs: [actionlint, format, lint-rust, test, harness, native-smoke, native-acceptance, native-candidate-artifacts]
+        needs: [actionlint, format, lint-rust, test, harness, native-acceptance, native-candidate-artifacts]
         runs-on: ubuntu-24.04
         timeout-minutes: 5
         steps:

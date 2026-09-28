@@ -24,19 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 use snip_core::clip;
 use snip_core::commits;
 
-/// Every wait deadline goes through here. `SNIP_E2E_TIMEOUT_SCALE` (e.g. 2 in
-/// CI) stretches them for a loaded machine: lavapipe renders on the CPU, so a
-/// busy host makes a healthy app miss fixed deadlines.
-fn scaled(d: Duration) -> Duration {
-	static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-	d.mul_f64(*SCALE.get_or_init(|| {
-		std::env::var("SNIP_E2E_TIMEOUT_SCALE")
-			.ok()
-			.and_then(|v| v.parse::<f64>().ok())
-			.filter(|v| v.is_finite() && *v >= 1.0)
-			.unwrap_or(1.0)
-	}))
-}
+use snip_native_e2e::{native_bin, scaled};
 
 fn clip_set(text: &str) {
 	let mut child = Command::new("xclip")
@@ -143,7 +131,7 @@ fn spawn_app_themed(
 	probes: Option<(Bounds, Viewport)>,
 	theme: &str,
 ) -> App {
-	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"));
+	let mut cmd = Command::new(native_bin());
 	cmd.args([
 		"--workspace",
 		&ws.to_string_lossy(),

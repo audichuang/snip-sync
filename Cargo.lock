@@ -5319,6 +5319,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "snip-native-e2e"
+version = "0.3.1"
+dependencies = [
+ "snip-core",
+ "tempfile",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

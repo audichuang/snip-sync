@@ -135,7 +135,7 @@ Pointer motion is `xdotool mousemove` without `--sync`. `--sync` waits for a mot
 If session startup fails after Xvfb is running (no display number, or the launcher `Popen` raises), the constructor reaps that Xvfb, its log, and the private directory before the exception leaves `NativeSession`. `stop` is safe to call again. The app-log reader is joined before its stdout and `app.log` are closed. A reader that does not finish is reported; cleanup does not claim success with an empty problem list.
 
 ### Historical UI probes
-The Python unit suite does not launch a historic debug binary and does not duplicate the product UI case. Same-path index `INDEX_A` versus worktree `WORK_B` through the native controls lives in `crates/desktop-native/tests/smoke.rs` (the block that writes `both.txt`, clicks `change-chk:staged:both.txt` / `change-chk:unstaged:both.txt`, and checks the clipboard). Driver unit tests keep the git byte oracle and the ClipCode extractor.
+The Python unit suite does not launch a historic debug binary and does not duplicate the product UI case. Same-path index `INDEX_A` versus worktree `WORK_B` through the native controls lives in `crates/native-e2e/tests/smoke.rs` (the block that writes `both.txt`, clicks `change-chk:staged:both.txt` / `change-chk:unstaged:both.txt`, and checks the clipboard). Driver unit tests keep the git byte oracle and the ClipCode extractor.
 
 A one-off probe against the immutable first-D3 binary is evidence under `/tmp`, not a CI test. Binary SHA-256 `a923e8332ef81a895ce3175462cc34a96595993d6ca47251500d9b97772ef2fb` at `/tmp/snip-d3-immutable-a923e833-20260926/snip-desktop-native-0.1.4/bin/snip-desktop-native` (the 2026-09-26 package member; the shared unpack path was later overwritten). Command:
 

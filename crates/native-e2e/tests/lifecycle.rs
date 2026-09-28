@@ -14,19 +14,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Every wait deadline goes through here. `SNIP_E2E_TIMEOUT_SCALE` (e.g. 2 in
-/// CI) stretches them for a loaded machine: lavapipe renders on the CPU, so a
-/// busy host makes a healthy app miss fixed deadlines.
-fn scaled(d: Duration) -> Duration {
-	static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-	d.mul_f64(*SCALE.get_or_init(|| {
-		std::env::var("SNIP_E2E_TIMEOUT_SCALE")
-			.ok()
-			.and_then(|v| v.parse::<f64>().ok())
-			.filter(|v| v.is_finite() && *v >= 1.0)
-			.unwrap_or(1.0)
-	}))
-}
+use snip_native_e2e::{native_bin, scaled};
 
 type Bounds = Arc<Mutex<std::collections::HashMap<String, [i32; 4]>>>;
 type Viewport = Arc<Mutex<(i32, i32)>>;
@@ -263,7 +251,7 @@ struct SpawnOpts<'a> {
 }
 
 fn spawn_app(opts: SpawnOpts) -> App {
-	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"));
+	let mut cmd = Command::new(native_bin());
 	cmd.args([
 		"--workspace",
 		&opts.workspace.to_string_lossy(),
@@ -3140,7 +3128,7 @@ fn x_server_loss_exits_instead_of_spinning() {
 		.expect("Xvfb display number");
 	let display = format!(":{}", display.trim());
 	let root = tempfile::tempdir().unwrap();
-	let mut child = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"))
+	let mut child = Command::new(native_bin())
 		.args(["--workspace", &root.path().to_string_lossy()])
 		.args(["--restore-dir", &root.path().to_string_lossy()])
 		.env("DISPLAY", &display)

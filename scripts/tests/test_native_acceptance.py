@@ -131,8 +131,14 @@ class AcceptanceTests(unittest.TestCase):
     def test_gate_commands_preserve_full_oracles_and_isolated_interpreter(self):
         commands = []
 
-        def collect(command, output, name, records, ok=(0,)):
+        driver_env = {}
+
+        def collect(command, output, name, records, ok=(0,), extra_env=None):
             commands.append(command)
+            if name in acceptance.DRIVER_TESTS:
+                driver_env[name] = extra_env
+                for shot in acceptance.SMOKE_SCREENSHOTS:
+                    (Path(extra_env["SNIP_E2E_OUT"]) / shot).write_bytes(b"\x89PNG\r\n\x1a\n")
             if name == "collaboration-fixture":
                 fixture = output / "collaboration-fixture"
                 fixture.mkdir()
@@ -145,7 +151,12 @@ class AcceptanceTests(unittest.TestCase):
         with mock.patch.object(acceptance, "run", side_effect=collect):
             for gate in (*acceptance.GATES, "resource-long"):
                 acceptance.run_gate(gate, self.root, self.receipt, self.data, [])
-        self.assertTrue(all(command[:2] == [sys.executable, "-B"] for command in commands))
+        drivers = [c for c in commands if "snip-native-e2e" in c]
+        self.assertEqual([c[c.index("--test") + 1] for c in drivers], ["smoke", "lifecycle"])
+        # The drivers run the frozen receipt binary, never a fresh debug build.
+        self.assertEqual({env["SNIP_NATIVE_BIN"] for env in driver_env.values()}, {str(self.binary)})
+        self.assertTrue(all(command[:2] == [sys.executable, "-B"]
+                            for command in commands if command not in drivers))
         ime = next(c for c in commands if "scripts/check_native_ime_startup.py" in c)
         self.assertIn("--output", ime)
         collaboration = next(c for c in commands if "scripts/check_native_collaboration.py" in c)
@@ -212,6 +223,19 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(report["status"], "FAILED")
         self.assertFalse(report["fullD4Claimed"])
 
+    def test_parallel_gates_each_run_once_and_keep_gate_order(self):
+        def gate(name, output, receipt, data, records, shard):
+            records.append({"command": [name]})
+
+        output = self.root / "parallel"
+        with mock.patch.object(acceptance, "prerequisites"), \
+                mock.patch.object(acceptance, "verify_build", return_value=self.data), \
+                mock.patch.object(acceptance, "run_gate", side_effect=gate):
+            self.assertEqual(acceptance.main(["--output", str(output), "--jobs", "3",
+                                              "--build-receipt", str(self.receipt)]), 0)
+        report = json.loads((output / "acceptance.json").read_text())
+        self.assertEqual([c["command"][0] for c in report["commands"]], list(acceptance.GATES))
+
     def test_real_child_exit_status_and_stderr_are_preserved_in_log(self):
         commands = []
         with self.assertRaisesRegex(RuntimeError, "exit 7"):
@@ -275,7 +299,7 @@ class AcceptanceTests(unittest.TestCase):
                 acceptance.parse_shard(bad)
 
     def test_merge_needs_every_gate_and_step_from_this_build(self):
-        good = [self.shard("ime-res", ("ime", "resource-short")),
+        good = [self.shard("ime-res", ("ime", "resource-short", "smoke", "lifecycle")),
                 self.shard("c1", ("collaboration",), steps=("a", "c")),
                 self.shard("c2", ("collaboration",), steps=("b",))]
         output = self.root / "merged"

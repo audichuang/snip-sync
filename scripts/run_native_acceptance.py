@@ -21,6 +21,8 @@ import subprocess
 import sys
 import tempfile
 
+from concurrent.futures import ThreadPoolExecutor
+
 from bench_native_memory import sha256_file
 import check_native_collaboration as collaboration
 from check_native_ime import REQUIRED_TOOLS as IME_TOOLS
@@ -28,7 +30,10 @@ from check_native_ime import REQUIRED_TOOLS as IME_TOOLS
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ["cargo", "build", "--release", "-p", "snip-desktop-native", "--locked",
          "--message-format=json-render-diagnostics"]
-GATES = ("ime", "collaboration", "resource-short")
+GATES = ("ime", "collaboration", "resource-short", "smoke", "lifecycle")
+# Real-app Rust drivers (crates/native-e2e); they run the receipt's binary.
+DRIVER_TESTS = ("smoke", "lifecycle")
+SMOKE_SCREENSHOTS = ("graph.png", "file_tree.png", "paste_preview.png", "light_theme.png")
 PRODUCER = "run_native_acceptance.py/v1"
 
 
@@ -77,13 +82,13 @@ def write_json(path: Path, data: dict) -> None:
 
 
 def run(command: list[str], output: Path, name: str, commands: list[dict],
-        ok: tuple[int, ...] = (0,)) -> None:
+        ok: tuple[int, ...] = (0,), extra_env: dict[str, str] | None = None) -> None:
     log = output / f"{name}.log"
     record = {"command": command, "log": str(log), "exitCode": None}
     commands.append(record)
     print(f"{name}: {log}", flush=True)
     with log.open("w") as stream:
-        result = subprocess.run(command, cwd=ROOT, env=environment(),
+        result = subprocess.run(command, cwd=ROOT, env={**environment(), **(extra_env or {})},
                                 stdout=stream, stderr=subprocess.STDOUT)
     record["exitCode"] = result.returncode
     if result.returncode not in ok:
@@ -106,7 +111,7 @@ def prerequisites(gates: tuple[str, ...], building: bool) -> None:
     if sys.platform != "linux" or sys.byteorder != "little":
         raise ValueError("native acceptance requires little-endian Linux; refusing to skip")
     tools = {"git"}
-    if building:
+    if building or set(gates) & set(DRIVER_TESTS):
         tools.update(("cargo", "rustc"))
     if gates:
         tools.update(("Xvfb", "xdotool", "xclip", "xwd", "convert", "dbus-daemon",
@@ -237,6 +242,18 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
             problems = collaboration.functional_problems(report, required_ids=steps)
             if problems:
                 raise RuntimeError("collaboration shard failed: " + "; ".join(problems))
+    elif gate in DRIVER_TESTS:
+        out = output / gate
+        out.mkdir()
+        # Debug build of the drivers only; the app is the frozen release binary.
+        run(["scripts/headless-x11.sh", "cargo", "test", "-p", "snip-native-e2e", "--test", gate,
+             "--locked", "--", "--nocapture"], output, gate, commands,
+            extra_env={"SNIP_NATIVE_BIN": binary, "SNIP_E2E_OUT": str(out)})
+        if gate == "smoke":
+            for name in SMOKE_SCREENSHOTS:
+                shot = out / name
+                if not shot.is_file() or shot.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+                    raise RuntimeError(f"smoke did not write a PNG {shot}")
     else:
         profile = gate.removeprefix("resource-")
         fixture = output / f"workload-{profile}"
@@ -303,6 +320,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--build-receipt", type=Path, help="Reuse this entrypoint's frozen build, verifying all inputs")
     parser.add_argument("--collaboration-shard", type=parse_shard, metavar="K/N",
                         help="Run only every N-th collaboration step starting at K")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="Gates run at once (each owns its display); 1 keeps them serial")
     parser.add_argument("--merge", type=Path, nargs="+", metavar="SHARD_DIR",
                         help="With --gate merge: shard outputs to fold into one gate-all receipt")
     args = parser.parse_args(argv)
@@ -331,12 +350,25 @@ def main(argv: list[str] | None = None) -> int:
             summary["commands"] = merge(args.merge, receipt, data)
             summary["gates"] = list(GATES)
             summary["shards"] = [str(path) for path in args.merge]
-        for gate in gates:
+        def one(gate: str) -> list[dict]:
+            # Each gate keeps its own command list; they are joined in gate order.
+            records: list[dict] = []
             data = verify_build(receipt)
             try:
-                run_gate(gate, output, receipt, data, summary["commands"], args.collaboration_shard)
+                run_gate(gate, output, receipt, data, records, args.collaboration_shard)
             finally:
                 verify_build(receipt)
+            return records
+
+        # Every gate has a private display, HOME and D-Bus, so they can overlap.
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            futures = [pool.submit(one, gate) for gate in gates]
+            try:
+                for future in futures:
+                    summary["commands"] += future.result()
+            finally:
+                for future in futures:
+                    future.cancel()
         verify_build(receipt)
         summary["status"] = "PASSED"
         return 0

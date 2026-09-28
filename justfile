@@ -15,7 +15,7 @@ fmt:
 	cargo fmt --all
 
 # Everything CI runs that Linux can run (see .github/workflows/ci.yml for the rest).
-preflight: preflight-workflows preflight-rust preflight-harness native-smoke native-lifecycle native-acceptance
+preflight: preflight-workflows preflight-rust preflight-harness native-acceptance
 
 # Same as CI's Lint Workflows job; needs actionlint and shellcheck on PATH.
 preflight-workflows:
@@ -25,7 +25,7 @@ preflight-rust:
 	cargo fmt --all --check
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-desktop-native --locked --no-fail-fast
+	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-desktop-native --exclude snip-native-e2e --locked --no-fail-fast
 	RUSTFLAGS="-D warnings" cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
 
 # Python stdlib memory harness contracts and workload generator tests.
@@ -36,25 +36,30 @@ preflight-harness:
 native *args:
 	cargo run -p snip-desktop-native -- {{args}}
 
-# Native real-app smoke test (Linux X11): needs xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts, software graphics.
+# Native real-app smoke test (Linux X11) against a debug build, for iterating on
+# one driver: needs xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts,
+# software graphics. `just native-acceptance` runs it on the release build.
 native-smoke out="target/native-e2e-artifacts":
+	cargo build -p snip-desktop-native --locked
 	mkdir -p "{{out}}"
 	rm -f "{{out}}/graph.png" "{{out}}/file_tree.png" "{{out}}/paste_preview.png" "{{out}}/light_theme.png"
-	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$1/smoke.log"' _ "{{out}}"
+	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_NATIVE_BIN="$(realpath target/debug/snip-desktop-native)" SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-native-e2e --test smoke --locked -- --nocapture 2>&1 | tee "$1/smoke.log"' _ "{{out}}"
 	test -s "{{out}}/smoke.log"
 	python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png', 'light_theme.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "{{out}}"
 
 # Real X11 close/reopen/quit drain and copy/paste cancel checks (tests/lifecycle.rs).
 native-lifecycle out="target/native-e2e-artifacts":
+	cargo build -p snip-desktop-native --locked
 	mkdir -p "{{out}}"
-	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test lifecycle --locked -- --nocapture 2>&1 | tee "$1/lifecycle.log"' _ "{{out}}"
+	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_NATIVE_BIN="$(realpath target/debug/snip-desktop-native)" SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-native-e2e --test lifecycle --locked -- --nocapture 2>&1 | tee "$1/lifecycle.log"' _ "{{out}}"
 	test -s "{{out}}/lifecycle.log"
 
-# Current release build once, then private IME9+startup, collaboration18 and
-# functional short resource gate (20 warmup +100 measured switches).
+# Current release build once, then private IME9+startup, collaboration18,
+# functional short resource gate (20 warmup +100 measured switches), and the
+# smoke/lifecycle drivers on that same binary, three gates at a time.
 # Optional args include --output FRESH_DIR and --build-receipt EXISTING_RECEIPT.
 native-acceptance *args:
-    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate all {{ args }}
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate all --jobs 3 {{ args }}
 
 native-acceptance-build *args:
     "{{ native_python }}" -B scripts/run_native_acceptance.py --gate build {{ args }}

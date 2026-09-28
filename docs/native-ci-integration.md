@@ -172,7 +172,7 @@ CI 以來源 workflow 為底，併入主線工作樹已有的 macOS fast gate。
 
 Linux job 沿用來源的 `ubuntu-24.04`。2026-09-26 的 GitHub 文件 [Choosing the runner for a job](https://docs.github.com/en/actions/using-jobs/choosing-the-runner-for-a-job) 把 `ubuntu-latest` 與 `ubuntu-24.04` 都連到同一份 Ubuntu 24.04 image readme。釘選對應 `docs/native-build-prerequisites.md` 的 noble 套件名（`libegl1`、`libegl-mesa0`）。
 
-`test` job 依來源把 `snip-desktop-native` 從 workspace test 拆出。其餘 crate 仍是 `cargo test --workspace --locked`。原生 crate 在三平台只跑 `--bin snip-desktop-native`。Linux integration test 只在 `native-smoke`：`SNIP_REQUIRE_ALL_TESTS=1`，經 `scripts/headless-x11.sh` 提供 X11 `DISPLAY` 與 lavapipe，再跑 `cargo test -p snip-desktop-native --test smoke`。`crates/desktop-native/tests/smoke.rs` 在沒有 `DISPLAY` 或 `xdotool` 時，若 `SNIP_REQUIRE_ALL_TESTS` 有設會 assert。這次沒有改產品或 native 測試碼，也沒有在這台機器執行 `native-smoke`。
+`test` job 把 `snip-desktop-native` 與 `snip-native-e2e` 從 workspace test 拆出；原生 crate 在三平台跑 `--bin snip-desktop-native`（含免顯示器的 `#[gpui::test]`）。0.3.2 起真實輸入的 `crates/native-e2e/tests/smoke.rs`、`lifecycle.rs` 不再有獨立的 `native-smoke` job，而是 `native-acceptance` 的兩個 shard：以 `SNIP_NATIVE_BIN` 驅動驗收過的 release 執行檔，經 `scripts/headless-x11.sh` 提供 X11 與 lavapipe，`SNIP_E2E_TIMEOUT_SCALE=2`。
 
 Intel candidate：來源把 `x86_64-apple-darwin` 放在 `macos-latest`（arm64）上交叉編譯，host 不是 `x86_64` 時該 step `exit 0`，binary 沒有執行。同一份 GitHub 文件的標準 runner 表（public 與 private）列出 Intel label `macos-15-intel` 與 `macos-26-intel`。`macos-latest` 連到 macOS 26 arm64 readme。`macos-13` 已於 2025-12-04 退役。此 leg 改為 `macos-26-intel`（與 `macos-latest` 同代的標準 Intel runner，不是 larger runner 的 `macos-26-large`）。`uname -m` 不是 `x86_64` 時 step `exit 1`。Mach-O header 不算執行通過。這個 job 還沒有在 GitHub 上跑過。
 

@@ -164,7 +164,7 @@ Tauri 版(本文件第 2、3 節的技術棧)已從 repo 移除,不再建置、�
 | 3 跨工具 | 同一 repo 與設定下,Rust 產生的 payload 等於 TS 產生的;Rust 能還原 TS 與 Kotlin 產生的 payload,反之亦然 | ✅ |
 | 4 真實剪貼簿 | 寫入系統剪貼簿再讀回:Unicode、大 payload、換行 | ✅ Windows / macOS runner 有桌面;Linux 用 xvfb |
 | 5 Python harness | `scripts/tests/`:記憶體 harness、workload 產生器、驗收 driver 的契約測試 | ✅ Linux |
-| 6 操作真實 App | 原生版在 Linux X11(Xvfb + xdotool)跑 `crates/desktop-native/tests/smoke.rs`、`lifecycle.rs`,以及 `native-acceptance`(IME、18 個協作情境、資源 gate)。舊的 Tauri WebDriver 情境已隨 Tauri 版移除 | ✅ Linux |
+| 6 操作真實 App | 原生版在 Linux X11(Xvfb + xdotool)以 `native-acceptance` 的同一份 release build 跑 `crates/native-e2e/tests/smoke.rs`、`lifecycle.rs`、IME、18 個協作情境與資源 gate;UI 邏輯另有三平台都跑的 `#[gpui::test]`,macOS／Windows 打包後會實際開窗(`smoke_native.py --launch`)。舊的 Tauri WebDriver 情境已隨 Tauri 版移除 | ✅ Linux |
 | | macOS / Windows 的原生 GUI 輸入 | ❌ 手動(CI 只 smoke 打包後的 binary) |
 
 - **CI 採最嚴格設定(`.github/workflows/ci.yml`):** 每個 PR 與 push 都跑全部 job,沒有路徑過濾;
