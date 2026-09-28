@@ -237,6 +237,8 @@ jobs:
         env:
             RUSTFLAGS: "-D warnings"
             SNIP_REQUIRE_ALL_TESTS: "1"
+            # lavapipe renders on the CPU; shared runners miss fixed deadlines.
+            SNIP_E2E_TIMEOUT_SCALE: "2"
             LIBGL_ALWAYS_SOFTWARE: "1"
             GALLIUM_DRIVER: llvmpipe
         steps:

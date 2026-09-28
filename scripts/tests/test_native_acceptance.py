@@ -48,6 +48,12 @@ class AcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "successful release build"):
             acceptance.verify_build(self.receipt)
 
+    def test_changed_checkout_names_the_files(self):
+        after = dict(self.source, files={"native-acceptance/lifecycle.log": {"sha256": "x"}})
+        with mock.patch.object(acceptance, "source_snapshot", return_value=after):
+            with self.assertRaisesRegex(ValueError, "added native-acceptance/lifecycle.log"):
+                acceptance.verify_build(self.receipt)
+
     def test_snapshot_hashes_actual_dirty_and_untracked_files(self):
         (self.root / "source.rs").write_text("before")
         (self.root / "new.rs").write_text("new input")

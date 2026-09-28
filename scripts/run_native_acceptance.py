@@ -159,6 +159,21 @@ def build(output: Path, commands: list[dict]) -> Path:
     return receipt
 
 
+def snapshot_changes(before: dict, after: dict) -> list[str]:
+    """Names what differs, so "checkout changed" says which file did it."""
+    if not isinstance(before, dict):
+        return ["receipt has no source snapshot"]
+    changes = [f"{key}: {before.get(key)} -> {after.get(key)}" for key in ("head", "tree")
+               if before.get(key) != after.get(key)]
+    old, new = before.get("files") or {}, after.get("files") or {}
+    changes += [f"added {name}" for name in sorted(set(new) - set(old))]
+    changes += [f"removed {name}" for name in sorted(set(old) - set(new))]
+    changes += [f"changed {name}" for name in sorted(set(old) & set(new)) if old[name] != new[name]]
+    if not changes and before.get("status") != after.get("status"):
+        changes.append("git status changed")
+    return changes
+
+
 def verify_build(receipt: Path) -> dict:
     data = json.loads(receipt.read_text())
     if (not isinstance(data, dict) or data.get("producer") != PRODUCER or data.get("buildCommand") != BUILD
@@ -169,8 +184,11 @@ def verify_build(receipt: Path) -> dict:
         raise ValueError("receipt executable is missing, relative, or not executable")
     if sha256_file(str(binary)) != data.get("sha256"):
         raise ValueError("frozen executable changed since the build")
-    if source_snapshot() != data.get("source") or data.get("sourceSha") != data["source"]["head"]:
-        raise ValueError("checkout head/tree/dirty state or source files changed since the build")
+    now = source_snapshot()
+    if now != data.get("source") or data.get("sourceSha") != data["source"]["head"]:
+        changes = snapshot_changes(data.get("source"), now)
+        raise ValueError("checkout head/tree/dirty state or source files changed since the build: "
+                         + "; ".join(changes[:10]) + (f" (+{len(changes) - 10} more)" if len(changes) > 10 else ""))
     return data
 
 

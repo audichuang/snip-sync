@@ -24,6 +24,20 @@ use std::time::{Duration, Instant, SystemTime};
 use snip_core::clip;
 use snip_core::commits;
 
+/// Every wait deadline goes through here. `SNIP_E2E_TIMEOUT_SCALE` (e.g. 2 in
+/// CI) stretches them for a loaded machine: lavapipe renders on the CPU, so a
+/// busy host makes a healthy app miss fixed deadlines.
+fn scaled(d: Duration) -> Duration {
+	static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+	d.mul_f64(*SCALE.get_or_init(|| {
+		std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+			.ok()
+			.and_then(|v| v.parse::<f64>().ok())
+			.filter(|v| v.is_finite() && *v >= 1.0)
+			.unwrap_or(1.0)
+	}))
+}
+
 fn clip_set(text: &str) {
 	let mut child = Command::new("xclip")
 		.args(["-selection", "clipboard"])
@@ -193,7 +207,7 @@ fn lines_until(
 	pattern: &str,
 	timeout: Duration,
 ) -> Result<Vec<String>, String> {
-	let deadline = Instant::now() + timeout;
+	let deadline = Instant::now() + scaled(timeout);
 	let mut seen = Vec::new();
 	while Instant::now() < deadline {
 		let remaining = deadline.saturating_duration_since(Instant::now());
@@ -220,7 +234,7 @@ fn lines_until(
 
 fn find_wid(pid: u32) -> String {
 	let start = Instant::now();
-	while start.elapsed() < Duration::from_secs(5) {
+	while start.elapsed() < scaled(Duration::from_secs(5)) {
 		let out = Command::new("xdotool")
 			.args(["search", "--pid", &pid.to_string()])
 			.output()
@@ -299,7 +313,7 @@ fn quit_cleanly(app: &mut App, wid: &str) {
 		.args(["keyup", "ctrl", "alt", "shift", "super", "q"])
 		.status();
 	let mut child = app.child.take().expect("app still owned");
-	let deadline = Instant::now() + Duration::from_secs(5);
+	let deadline = Instant::now() + scaled(Duration::from_secs(5));
 	loop {
 		match child.try_wait().expect("try_wait") {
 			Some(status) => {
@@ -600,7 +614,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	// Returns the latest reported bounds for `id`, asserting the control is
 	// currently drawn and fully inside the viewport (reachable, not clipped).
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(3);
+		let deadline = Instant::now() + scaled(Duration::from_secs(3));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				let (vw, vh) = *viewport.lock().unwrap();
@@ -627,7 +641,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	// Asserts a control is no longer drawn (the app reported it gone).
 	// Polls: the frame that drops the control can land well after the event.
 	let absent = |id: &str| {
-		let deadline = Instant::now() + Duration::from_secs(4);
+		let deadline = Instant::now() + scaled(Duration::from_secs(4));
 		while bounds.lock().unwrap().contains_key(id) {
 			assert!(
 				Instant::now() < deadline,
@@ -775,7 +789,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 
 	let resize = |w: i32, h: i32| {
 		xdo(&["windowsize", "--sync", &wid, &w.to_string(), &h.to_string()]);
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		while *viewport.lock().unwrap() != (w, h) {
 			assert!(
 				Instant::now() < deadline,
@@ -802,7 +816,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		.expect("repo filter must finish with one candidate");
 		// CTRL_GONE ends the frame, after moved row bounds; the stdout reader
 		// commits both to this map before discarding those high-volume events.
-		let deadline = Instant::now() + Duration::from_secs(3);
+		let deadline = Instant::now() + scaled(Duration::from_secs(3));
 		while bounds.lock().unwrap().contains_key(excluded_row) {
 			assert!(
 				Instant::now() < deadline,
@@ -888,7 +902,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	// Observe the painted focus ring inside each control's own settled bounds,
 	// rather than accepting FOCUS next/prev handler logs as proof of focus.
 	let capture_focus = |filename: &str, expected: &[(&str, bool)]| {
-		let deadline = Instant::now() + Duration::from_secs(3);
+		let deadline = Instant::now() + scaled(Duration::from_secs(3));
 		loop {
 			let boxes = loop {
 				let boxes: Vec<_> =
@@ -1939,7 +1953,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		.unwrap()
 		.contains(&format!("mode=graph n=50 first={first} page=1]")));
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				let (w, h) = *viewport.lock().unwrap();
@@ -1986,7 +2000,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	// Scrolls until `pattern` is logged (a page read, or its failure).
 	let scroll_until =
 		|pattern: &str, clicks: &str, button: &str| -> Vec<String> {
-			let deadline = Instant::now() + Duration::from_secs(40);
+			let deadline = Instant::now() + scaled(Duration::from_secs(40));
 			let mut seen = Vec::new();
 			loop {
 				wheel(clicks, button);
@@ -2025,7 +2039,7 @@ fn native_graph_failed_next_page_is_transactional() {
 			geometry["WIDTH"], geometry["HEIGHT"], geometry["X"], geometry["Y"]
 		);
 		let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		loop {
 			assert!(Command::new("xwd")
 				.args(["-root", "-silent", "-out"])
@@ -2056,7 +2070,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	let crop_row = |name: &str, require_error: bool, skip: Option<i32>| {
 		let image = out.join(format!("graph-admission-{name}.png"));
 		let crop = out.join(format!("graph-admission-{name}-row.png"));
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		// Only accept a row whose pixels match the capture before it, so a
 		// frame still moving (scroll, banner) is never the evidence.
 		let mut previous: Option<([i32; 4], Vec<u8>)> = None;
@@ -2197,7 +2211,7 @@ fn native_graph_failed_next_page_is_transactional() {
 		"retry must load the real eleventh page and evict the first: {retried:?}"
 	);
 	control(&probe_row);
-	let deadline = Instant::now() + Duration::from_secs(5);
+	let deadline = Instant::now() + scaled(Duration::from_secs(5));
 	while bounds.lock().unwrap().contains_key("log-error") {
 		assert!(
 			Instant::now() < deadline,
@@ -2364,7 +2378,7 @@ fn native_d3_basket_mapping_and_replay() {
 		assert!(st.success(), "{args:?}");
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(4);
+		let deadline = Instant::now() + scaled(Duration::from_secs(4));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				let (vw, vh) = *viewport.lock().unwrap();
@@ -2400,7 +2414,7 @@ fn native_d3_basket_mapping_and_replay() {
 	};
 	let resize = |w: i32, h: i32| {
 		xdo(&["windowsize", "--sync", &wid, &w.to_string(), &h.to_string()]);
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		while *viewport.lock().unwrap() != (w, h) {
 			assert!(Instant::now() < deadline, "viewport {w}x{h}");
 			std::thread::sleep(Duration::from_millis(40));
@@ -2834,7 +2848,7 @@ fn native_d3_files_and_replay_skip_oracles() {
 			.success());
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(4);
+		let deadline = Instant::now() + scaled(Duration::from_secs(4));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				let (vw, vh) = *viewport.lock().unwrap();
@@ -3072,7 +3086,7 @@ fn native_tree_paging_retry_selection_900x600() {
 			.status()
 			.unwrap();
 		assert!(st.success());
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		while *viewport.lock().unwrap() != (w, h) {
 			assert!(
 				Instant::now() < deadline,
@@ -3086,7 +3100,7 @@ fn native_tree_paging_retry_selection_900x600() {
 	// an earlier frame hits the wrong row. Wait until the layout has held
 	// still for a few frames.
 	let settled = || {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			let snap = bounds.lock().unwrap().clone();
 			std::thread::sleep(Duration::from_millis(150));
@@ -3097,7 +3111,7 @@ fn native_tree_paging_retry_selection_900x600() {
 		}
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			let snap = settled();
 			if let Some(v) = snap.get(id).copied() {
@@ -3144,7 +3158,7 @@ fn native_tree_paging_retry_selection_900x600() {
 		Duration::from_secs(5),
 	)
 	.expect("file explorer");
-	let drawn = Instant::now() + Duration::from_secs(10);
+	let drawn = Instant::now() + scaled(Duration::from_secs(10));
 	while has_id("tree-row:").is_none() && has_id("tree-continue:").is_none() {
 		assert!(
 			Instant::now() < drawn,
@@ -3154,7 +3168,7 @@ fn native_tree_paging_retry_selection_900x600() {
 		std::thread::sleep(Duration::from_millis(50));
 	}
 
-	let deadline = Instant::now() + Duration::from_secs(8);
+	let deadline = Instant::now() + scaled(Duration::from_secs(8));
 	while has_id("tree-row:nest").is_none()
 		|| has_id("tree-row:broken").is_none()
 	{
@@ -3217,7 +3231,7 @@ fn native_tree_paging_retry_selection_900x600() {
 
 	fs::remove_dir(&broken).unwrap();
 	click("tree-row:broken");
-	let deadline = Instant::now() + Duration::from_secs(8);
+	let deadline = Instant::now() + scaled(Duration::from_secs(8));
 	while has_id("tree-retry:broken").is_none() {
 		assert!(Instant::now() < deadline, "retry row for broken");
 		std::thread::sleep(Duration::from_millis(50));
@@ -3225,7 +3239,7 @@ fn native_tree_paging_retry_selection_900x600() {
 	fs::create_dir(&broken).unwrap();
 	fs::write(broken.join("repaired.txt"), b"ok").unwrap();
 	click("tree-retry:broken");
-	let deadline = Instant::now() + Duration::from_secs(8);
+	let deadline = Instant::now() + scaled(Duration::from_secs(8));
 	while has_id("tree-row:broken/repaired.txt").is_none() {
 		assert!(Instant::now() < deadline, "repaired file after retry");
 		std::thread::sleep(Duration::from_millis(50));
@@ -3376,7 +3390,7 @@ fn native_historical_file_basket_and_collision() {
 		assert!(st.success(), "{args:?}");
 	};
 	let settled = || {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			let snap = bounds.lock().unwrap().clone();
 			std::thread::sleep(Duration::from_millis(150));
@@ -3387,7 +3401,7 @@ fn native_historical_file_basket_and_collision() {
 		}
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				let (vw, vh) = *viewport.lock().unwrap();
@@ -3421,7 +3435,7 @@ fn native_historical_file_basket_and_collision() {
 	};
 	let resize = |w: i32, h: i32| {
 		xdo(&["windowsize", "--sync", &wid, &w.to_string(), &h.to_string()]);
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if *viewport.lock().unwrap() == (w, h) {
 				let snap = settled();
@@ -3848,7 +3862,7 @@ fn native_reader_degradation_and_copy_integrity() {
 			geometry["WIDTH"], geometry["HEIGHT"], geometry["X"], geometry["Y"]
 		);
 		let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		loop {
 			assert!(Command::new("xwd")
 				.args(["-root", "-silent", "-out"])
@@ -3874,7 +3888,7 @@ fn native_reader_degradation_and_copy_integrity() {
 		}
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		loop {
 			let v = bounds.lock().unwrap().get(id).copied();
 			if let Some(v) = v {
@@ -3904,7 +3918,7 @@ fn native_reader_degradation_and_copy_integrity() {
 		}
 	};
 	let click = |id: &str| {
-		let deadline = Instant::now() + Duration::from_secs(5);
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		let v = loop {
 			let before = control(id);
 			std::thread::sleep(Duration::from_millis(150));
@@ -3940,7 +3954,7 @@ fn native_reader_degradation_and_copy_integrity() {
 		control("reader");
 	};
 	let assert_no_copy = |sentinel: &str, evidence: &str| {
-		let deadline = Instant::now() + Duration::from_millis(400);
+		let deadline = Instant::now() + scaled(Duration::from_millis(400));
 		let mut events = Vec::new();
 		while Instant::now() < deadline {
 			match app.rx.recv_timeout(Duration::from_millis(40)) {
@@ -4098,7 +4112,7 @@ fn native_reader_degradation_and_copy_integrity() {
 				&& p[2].abs_diff(55) <= 16
 		})
 	};
-	let deadline = Instant::now() + Duration::from_secs(5);
+	let deadline = Instant::now() + scaled(Duration::from_secs(5));
 	let mut previous = Vec::new();
 	let chinese_pixels = loop {
 		capture(&out.join("reader-long-zh.png"));
@@ -4119,7 +4133,7 @@ fn native_reader_degradation_and_copy_integrity() {
 	click("btn-locale");
 	wait("[APP:LOCALE: En]");
 	assert_eq!(control("reader-truncated-notice"), notice);
-	let deadline = Instant::now() + Duration::from_secs(5);
+	let deadline = Instant::now() + scaled(Duration::from_secs(5));
 	let mut previous = Vec::new();
 	loop {
 		capture(&out.join("reader-long-en.png"));
@@ -4249,7 +4263,7 @@ fn native_light_theme_renders() {
 		geometry["WIDTH"], geometry["HEIGHT"], geometry["X"], geometry["Y"]
 	);
 	let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
-	let deadline = Instant::now() + Duration::from_secs(10);
+	let deadline = Instant::now() + scaled(Duration::from_secs(10));
 	let mean = loop {
 		assert!(Command::new("xwd")
 			.args(["-root", "-silent", "-out"])
@@ -4349,7 +4363,7 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
 	};
 	let settled = || {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			let snap = bounds.lock().unwrap().clone();
 			std::thread::sleep(Duration::from_millis(150));
@@ -4360,7 +4374,7 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 		}
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if let Some(v) = settled().get(id).copied() {
 				let (vw, vh) = *viewport.lock().unwrap();
@@ -4377,7 +4391,7 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 		}
 	};
 	let absent = |id: &str| {
-		let deadline = Instant::now() + Duration::from_secs(4);
+		let deadline = Instant::now() + scaled(Duration::from_secs(4));
 		while bounds.lock().unwrap().contains_key(id) {
 			assert!(Instant::now() < deadline, "{id} must not be drawn");
 			std::thread::sleep(Duration::from_millis(40));
@@ -4704,7 +4718,7 @@ fn changes_group_all_repos(theme: &str) {
 			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
 	};
 	let settled = || {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			let snap = bounds.lock().unwrap().clone();
 			std::thread::sleep(Duration::from_millis(150));
@@ -4715,7 +4729,7 @@ fn changes_group_all_repos(theme: &str) {
 		}
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if let Some(v) = settled().get(id).copied() {
 				let (vw, vh) = *viewport.lock().unwrap();
@@ -4732,7 +4746,7 @@ fn changes_group_all_repos(theme: &str) {
 		}
 	};
 	let absent = |id: &str| {
-		let deadline = Instant::now() + Duration::from_secs(4);
+		let deadline = Instant::now() + scaled(Duration::from_secs(4));
 		while bounds.lock().unwrap().contains_key(id) {
 			assert!(Instant::now() < deadline, "{id} must not be drawn");
 			std::thread::sleep(Duration::from_millis(40));
@@ -4976,7 +4990,7 @@ fn lines_until_all_smoke(
 	patterns: &[&str],
 	timeout: Duration,
 ) -> Vec<String> {
-	let deadline = Instant::now() + timeout;
+	let deadline = Instant::now() + scaled(timeout);
 	let mut seen: Vec<String> = Vec::new();
 	while !patterns.iter().all(|p| seen.iter().any(|l| l.contains(p))) {
 		let left = deadline.saturating_duration_since(Instant::now());
@@ -5104,7 +5118,7 @@ fn native_multi_repo_log_merges_and_filters_repositories() {
 			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
 	};
 	let settled = || {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			let snap = bounds.lock().unwrap().clone();
 			std::thread::sleep(Duration::from_millis(150));
@@ -5115,7 +5129,7 @@ fn native_multi_repo_log_merges_and_filters_repositories() {
 		}
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if let Some(v) = settled().get(id).copied() {
 				let (vw, vh) = *viewport.lock().unwrap();
@@ -5132,7 +5146,7 @@ fn native_multi_repo_log_merges_and_filters_repositories() {
 		}
 	};
 	let absent = |id: &str| {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		while bounds.lock().unwrap().contains_key(id) {
 			assert!(Instant::now() < deadline, "{id} must not be drawn");
 			std::thread::sleep(Duration::from_millis(40));
@@ -5464,7 +5478,7 @@ fn log_multiselect(theme: &str) {
 			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
 	};
 	let settled = || {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			let snap = bounds.lock().unwrap().clone();
 			std::thread::sleep(Duration::from_millis(150));
@@ -5475,7 +5489,7 @@ fn log_multiselect(theme: &str) {
 		}
 	};
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if let Some(v) = settled().get(id).copied() {
 				let (vw, vh) = *viewport.lock().unwrap();
@@ -5492,7 +5506,7 @@ fn log_multiselect(theme: &str) {
 		}
 	};
 	let absent = |id: &str| {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		while bounds.lock().unwrap().contains_key(id) {
 			assert!(Instant::now() < deadline, "{id} must not be drawn");
 			std::thread::sleep(Duration::from_millis(40));
@@ -5527,7 +5541,7 @@ fn log_multiselect(theme: &str) {
 	let click = |id: &str| press(id, None);
 	// Drawn, maybe scrolled past the details pane's edge.
 	let drawn = |id: &str| {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		while !bounds.lock().unwrap().contains_key(id) {
 			assert!(Instant::now() < deadline, "{id} was not drawn");
 			std::thread::sleep(Duration::from_millis(40));
@@ -5791,7 +5805,7 @@ fn native_merged_graph_over_four_repositories() {
 	}
 	let rx = &app.rx;
 	let settled = || {
-		let deadline = Instant::now() + Duration::from_secs(8);
+		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
 			let snap = bounds.lock().unwrap().clone();
 			std::thread::sleep(Duration::from_millis(150));
@@ -5922,7 +5936,7 @@ fn native_project_view_lists_and_copies_non_git_files() {
 		.args(["windowsize", "--sync", &wid, "1080", "720"])
 		.status();
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				if v[2] > 0 && v[3] > 0 {
@@ -6054,7 +6068,7 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 		.args(["windowsize", "--sync", &wid, "1080", "720"])
 		.status();
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				if v[2] > 0 && v[3] > 0 {
@@ -6215,7 +6229,7 @@ fn native_project_view_plain_click_selects_one_row() {
 		.args(["windowsize", "--sync", &wid, "1080", "900"])
 		.status();
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				if v[2] > 0 && v[3] > 0 {
@@ -6390,7 +6404,7 @@ fn native_project_view_multiselect_and_right_click_copy() {
 		.args(["windowsize", "--sync", &wid, "1080", "720"])
 		.status();
 	let control = |id: &str| -> [i32; 4] {
-		let deadline = Instant::now() + Duration::from_secs(6);
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		loop {
 			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
 				if v[2] > 0 && v[3] > 0 {
@@ -6534,7 +6548,7 @@ fn native_project_view_multiselect_and_right_click_copy() {
 
 /// Waits until `id` is gone from the probed bounds.
 fn absent_id(bounds: &Bounds, id: &str) {
-	let deadline = Instant::now() + Duration::from_secs(3);
+	let deadline = Instant::now() + scaled(Duration::from_secs(3));
 	while bounds.lock().unwrap().contains_key(id) {
 		assert!(Instant::now() < deadline, "{id} must not be drawn");
 		std::thread::sleep(Duration::from_millis(40));
