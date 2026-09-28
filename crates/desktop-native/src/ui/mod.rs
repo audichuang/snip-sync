@@ -510,8 +510,9 @@ enum ProjRow {
 }
 
 /// Repos shown where their folder sits in the workspace tree, keyed by that
-/// folder's path relative to `ws_root`. A repo inside another repo (or
-/// outside the workspace) is not reachable there and stays a top-level row.
+/// folder's path relative to `ws_root`. A repo inside another repo below
+/// `ws_root` (or outside the workspace) is not reachable there and stays a
+/// top-level row; a repo at `ws_root` itself is the tree's root row.
 fn placed_repos(
 	repos: &[crate::RepoEntry],
 	ws_root: &std::path::Path,
@@ -528,7 +529,10 @@ fn placed_repos(
 			continue;
 		};
 		let nested = repos.iter().any(|other| {
-			other.root != repo.root && repo.root.starts_with(&other.root)
+			other.root != repo.root
+				&& repo.root.starts_with(&other.root)
+				&& other.root != ws_root
+				&& other.root.starts_with(ws_root)
 		});
 		if !nested {
 			out.insert(rel.replace('\\', "/"), idx);
@@ -665,28 +669,65 @@ impl WorkbenchModel {
 		if let Some(tree) = &self.rev_tree {
 			return tree.rows().into_iter().map(ProjRow::Rev).collect();
 		}
-		let mut out = Vec::new();
-		// Until the workspace root is read every repo is a top-level row.
-		let ws = self.ws_tree.as_ref().filter(|t| t.is_loaded);
-		let placed = ws
-			.map(|t| placed_repos(&self.repos, &t.full_path))
-			.unwrap_or_default();
-		for idx in 0..self.repos.len() {
-			if !placed.values().any(|&p| p == idx) {
-				self.push_repo_rows(idx, 0, &mut out);
+		// The workspace folder's tree: its own, or the open workspace
+		// repo's. Until it is read every repo is a top-level row.
+		let home = self.ws_repo_idx();
+		let (tree, ws) = match (&self.ws_tree, home) {
+			(Some(t), _) => (Some(t), true),
+			(None, Some(idx)) if self.selected_repo_idx == Some(idx) => {
+				(self.file_tree.as_ref(), false)
 			}
-		}
-		if let Some(t) = ws {
-			for mut row in t.flatten_visible(t.visible_limit()) {
-				// The workspace's children are top-level rows.
-				row.depth = row.depth.saturating_sub(1);
+			_ => (None, true),
+		};
+		let mut body = Vec::new();
+		// Repos given a row inside the tree; the rest are top-level rows.
+		let mut shown = Vec::new();
+		if let Some(t) = tree.filter(|t| t.is_loaded) {
+			let placed = placed_repos(&self.repos, &t.full_path);
+			let open = match home {
+				Some(idx) => {
+					shown.push(idx);
+					body.push(ProjRow::Repo(idx, 0));
+					self.repo_row_open(idx)
+				}
+				None => true,
+			};
+			for mut row in t
+				.flatten_visible(t.visible_limit())
+				.into_iter()
+				.filter(|_| open)
+			{
+				// A plain workspace's children are top-level rows.
+				if home.is_none() {
+					row.depth = row.depth.saturating_sub(1);
+				}
 				match placed.get(&row.rel_path).filter(|_| row.is_dir) {
-					Some(&idx) => self.push_repo_rows(idx, row.depth, &mut out),
-					None => out.push(ProjRow::Ws(row)),
+					Some(&idx) => {
+						shown.push(idx);
+						self.push_repo_rows(idx, row.depth, &mut body);
+					}
+					None if ws => body.push(ProjRow::Ws(row)),
+					None => body.push(ProjRow::Work(row)),
 				}
 			}
 		}
+		let mut out = Vec::new();
+		for idx in 0..self.repos.len() {
+			if !shown.contains(&idx) {
+				self.push_repo_rows(idx, 0, &mut out);
+			}
+		}
+		out.append(&mut body);
 		out
+	}
+
+	/// Whether a repo row shows its files. The workspace repo's row stays
+	/// open while another repo is open: the repos inside sit in its tree.
+	pub(crate) fn repo_row_open(&self, idx: usize) -> bool {
+		if self.selected_repo_idx == Some(idx) {
+			return !self.repo_collapsed;
+		}
+		self.ws_tree.is_some() && self.ws_repo_idx() == Some(idx)
 	}
 
 	/// A repo row and, when it is the open expanded repo, its tree.
@@ -1504,6 +1545,21 @@ mod tests {
 		assert_eq!(placed.get("app"), Some(&0));
 		assert_eq!(placed.get("group/lib"), Some(&2));
 		assert!(!placed.values().any(|&i| i == 1), "nested repo stays top");
+		// The workspace folder itself a repo (INVI_SRC): it is the root row,
+		// and the repos inside it still sit at their folders.
+		let mut in_home = vec![repo("")];
+		in_home.extend(repos.iter().map(|r| crate::RepoEntry {
+			root: r.root.clone(),
+			name: r.name.clone(),
+			kind: crate::RepoEntryKind::Main,
+			identity: None,
+			summary: Err("mock".into()),
+		}));
+		in_home[0].root = root.path().to_path_buf();
+		let placed = placed_repos(&in_home, root.path());
+		assert_eq!(placed.get("app"), Some(&1));
+		assert_eq!(placed.get("group/lib"), Some(&3));
+		assert_eq!(placed.len(), 2, "{placed:?}");
 
 		let mut tree = FileTreeNode::new_root(root.path());
 		tree.toggle_expand("group", root.path());

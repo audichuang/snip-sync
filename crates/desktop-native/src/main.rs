@@ -955,9 +955,12 @@ pub struct WorkbenchModel {
 	/// its empty checkboxes say nothing about the basket's Git group.
 	pub changes_loaded: bool,
 	pub file_tree: Option<FileTreeNode>,
-	/// The workspace folder itself when it is not a repository: every file
-	/// and folder outside the discovered repos, rooted at its canonical path.
+	/// The workspace folder's tree, rooted at its canonical path: every
+	/// file and folder outside the placed repos. When the folder is itself
+	/// a repo that is open, `file_tree` is this tree and this is None.
 	pub ws_tree: Option<FileTreeNode>,
+	/// The workspace folder's canonical path, once repos are known.
+	pub ws_home: Option<PathBuf>,
 	pub rev_tree: Option<RevTree>,
 	pub active_tab: WorkbenchTab,
 	pub selected_file: Option<String>,
@@ -1350,6 +1353,7 @@ impl WorkbenchModel {
 			changes_loaded: false,
 			file_tree: None,
 			ws_tree: None,
+			ws_home: None,
 			rev_tree: None,
 			active_tab: WorkbenchTab::GitChanges,
 			selected_file: None,
@@ -2355,6 +2359,7 @@ impl WorkbenchModel {
 		self.selected_repo_idx = None;
 		self.release_repo_state();
 		self.ws_tree = None;
+		self.ws_home = None;
 		release_vec(&mut self.basket);
 		release_vec(&mut self.files);
 		release_vec(&mut self.change_repos);
@@ -3306,13 +3311,20 @@ impl WorkbenchModel {
 		);
 	}
 
-	/// The workspace tree's root, when the workspace is not a repository.
+	/// The workspace tree's root, while `ws_tree` holds it.
 	pub fn ws_root(&self) -> Option<PathBuf> {
 		self.ws_tree.as_ref().map(|tree| tree.full_path.clone())
 	}
 
-	/// Builds the workspace tree once repos are known. None when the
-	/// workspace is itself inside a repository: that repo's tree shows it.
+	/// The repo whose root is the workspace folder itself.
+	pub fn ws_repo_idx(&self) -> Option<usize> {
+		let home = self.ws_home.as_ref()?;
+		self.repos.iter().position(|repo| &repo.root == home)
+	}
+
+	/// Builds the workspace tree once repos are known. None while the
+	/// workspace repo is open (its `file_tree` is the tree), and when the
+	/// workspace sits strictly inside a repo: that repo's tree shows it.
 	fn ensure_ws_tree(&mut self, cx: &mut Context<Self>) {
 		if self.ws_tree.is_some() || !self.accepting_work() {
 			return;
@@ -3323,7 +3335,19 @@ impl WorkbenchModel {
 			return;
 		};
 		let root = root.path().to_path_buf();
-		if self.repos.iter().any(|repo| root.starts_with(&repo.root)) {
+		self.ws_home = Some(root.clone());
+		if self
+			.repos
+			.iter()
+			.any(|repo| repo.root != root && root.starts_with(&repo.root))
+		{
+			return;
+		}
+		if self
+			.file_tree
+			.as_ref()
+			.is_some_and(|tree| tree.full_path == root)
+		{
 			return;
 		}
 		let saved = self.file_paths_in_basket(&root);
@@ -3569,6 +3593,23 @@ impl WorkbenchModel {
 		} else {
 			Vec::new()
 		};
+		// One tree per root: the workspace repo's tree passes between
+		// `file_tree` (open) and `ws_tree` (another repo open), so the
+		// folders the user opened stay open around the repos inside it.
+		let home = self.ws_home.clone();
+		if home.as_ref() == Some(&repo_root) {
+			if let Some(ws) = self.ws_tree.take() {
+				if !preserve_anchors {
+					ws.collect_expanded_paths(&mut self.restore_expanded);
+				}
+			}
+		} else if self
+			.file_tree
+			.as_ref()
+			.is_some_and(|t| Some(&t.full_path) == home.as_ref())
+		{
+			self.ws_tree = self.file_tree.take();
+		}
 		self.file_tree = Some(tree);
 		let root_io = self.file_tree.as_mut().and_then(|tree| {
 			match tree.start(TreeCommand::Expand(NodeKey::root())) {
@@ -3580,6 +3621,10 @@ impl WorkbenchModel {
 			self.submit_tree_io(io, cx);
 		}
 		self.resume_ws_tree(cx);
+		// Leaving the workspace repo with no tree to hand over (released).
+		if self.ws_home.is_some() {
+			self.ensure_ws_tree(cx);
+		}
 
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();

@@ -530,8 +530,7 @@ impl WorkbenchModel {
 		match row {
 			ProjRow::Repo(idx, depth) => {
 				let repo = &self.repos[idx];
-				let expanded =
-					self.selected_repo_idx == Some(idx) && !self.repo_collapsed;
+				let expanded = self.repo_row_open(idx);
 				let id = format!("repo-row:{}", repo.name);
 				let mut counts = div()
 					.flex()

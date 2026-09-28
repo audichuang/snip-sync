@@ -5933,3 +5933,137 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	}
 	quit_cleanly(&mut app, &wid);
 }
+
+/// A workspace that is itself a repo (with a repo and a plain folder
+/// inside) is still one faithful tree: the root row is the workspace repo,
+/// the inner repo sits indented at its folder rather than as a top-level
+/// sibling, and the plain folder's file stays listed and copyable while
+/// the inner repo is the open one.
+#[test]
+fn native_project_view_nests_repos_inside_a_workspace_repo() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("INVI_SRC");
+	let inner = ws.join("inner");
+	for repo in [&ws, &inner] {
+		fs::create_dir_all(repo).unwrap();
+		git_ok(repo, &["init", "-q", "-b", "master"]);
+		git_ok(repo, &["config", "user.name", "Tester"]);
+		git_ok(repo, &["config", "user.email", "test@example.com"]);
+	}
+	fs::write(inner.join("lib.rs"), "pub fn inner() {}\n").unwrap();
+	git_ok(&inner, &["add", "."]);
+	git_ok(&inner, &["commit", "-qm", "inner"]);
+	fs::create_dir_all(ws.join("plain")).unwrap();
+	fs::write(ws.join("plain/x.txt"), "PLAIN_X_BYTES\n").unwrap();
+	fs::write(ws.join("root.txt"), "ROOT_BYTES\n").unwrap();
+	git_ok(&ws, &["add", "root.txt", "plain"]);
+	git_ok(&ws, &["commit", "-qm", "base"]);
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 2]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		assert!(st.success(), "click {id}");
+	};
+	let y = |id: &str| control(id)[1];
+
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	// The workspace repo opens as the root row; the inner repo sits at its
+	// folder among the tree's folders, not as a sibling after the tree.
+	let root = y("repo-row:INVI_SRC");
+	assert!(root < y("repo-row:inner"));
+	assert!(
+		y("repo-row:inner") < y("tree-row:plain"),
+		"inner must sit at its folder inside the workspace tree"
+	);
+	control("tree-row:root.txt");
+
+	// Opening the inner repo keeps the workspace tree around it.
+	click("repo-row:inner");
+	wait_for("(inner) root=", Duration::from_secs(4));
+	control("tree-row:lib.rs");
+	click("ws-tree-row:plain");
+	wait_for("[APP:WS_TREE_PAGE: rel=plain", Duration::from_secs(4));
+	assert!(y("repo-row:INVI_SRC") < y("repo-row:inner"));
+	assert!(y("tree-row:lib.rs") < y("ws-tree-row:plain/x.txt"));
+	click("ws-tree-chk:plain/x.txt");
+	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
+	let copied = clip::read_text().unwrap();
+	assert!(copied.contains("PLAIN_X_BYTES"), "{copied}");
+	assert!(copied.contains("plain/x.txt"), "{copied}");
+	assert!(!copied.contains("ROOT_BYTES"), "{copied}");
+
+	// Back on the workspace repo, the folder stays open and checked.
+	click("repo-row:INVI_SRC");
+	wait_for("(INVI_SRC) root=", Duration::from_secs(4));
+	wait_for("[APP:TREE_EXPANDED: plain]", Duration::from_secs(4));
+	control("tree-row:plain/x.txt");
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
+	assert!(clip::read_text().unwrap().contains("PLAIN_X_BYTES"));
+	quit_cleanly(&mut app, &wid);
+}
