@@ -524,7 +524,12 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let log = &self.probes;
-		let key = menu.key();
+		// A one-repo workspace's repo chip only holds paths; drivers read
+		// "log-filter-repo" as "the workspace has several repositories".
+		let key = match menu {
+			LogMenu::Repo if self.repos.len() <= 1 => "paths",
+			_ => menu.key(),
+		};
 		let id = format!("log-filter-{key}");
 		let clear_id = format!("log-filter-{key}-clear");
 		let open = self.log_menu == Some(menu);
