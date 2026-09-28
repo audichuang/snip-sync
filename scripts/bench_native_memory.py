@@ -1800,6 +1800,30 @@ def open_repo_name(lines: list[str]) -> str | None:
     return None
 
 
+def narrow_log(s: NativeSession, win: dict[str, Any], name: str, timeout: float = 30.0) -> float | None:
+    """The Log shows every repo of the workspace; switching repos keeps it.
+
+    The Repository chip narrows it to `name`, which reads that repo's first
+    history page (a fresh E2E_LOG), as a repo switch did before the merged
+    log. Returns that page's time, or None for a single-repo workspace.
+    """
+    if "log-filter-repo" not in parse_bounds(s.texts()):
+        return None
+    before = len(s.lines)
+    s.click(win, parse_bounds(s.texts())["log-filter-repo"])
+    s.wait_line(lambda l: "[APP:LOG_MENU: Some(Repo)]" in l, start=before, timeout=timeout)
+    row = f"log-repo:{name}"
+    deadline = time.monotonic() + timeout
+    while row not in parse_bounds(s.texts(before)):
+        if time.monotonic() >= deadline:
+            raise NativeBenchError(f"Repository chip menu has no {row}")
+        time.sleep(0.05)
+    s.click(win, parse_bounds(s.texts(before))[row])
+    i, _, _ = s.wait_line(lambda l: "[APP:LOG_REPOS: n=1]" in l, start=before, timeout=timeout)
+    _, t_page, _ = s.wait_line(lambda l: "[APP:E2E_LOG: mode=graph " in l, start=i, timeout=timeout)
+    return t_page
+
+
 def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[float, float, float, int]:
     """Click one repo row. Returns click time, load times, and the log index of the click."""
     open_project_list(s, win)
@@ -1820,6 +1844,9 @@ def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[f
     if got != name:
         raise NativeBenchError(f"clicked repo-row:{name} but app selected {got} at index {idx}")
     t_loaded, t_graph = wait_repo_loaded(s, repo_path, before)
+    narrowed = narrow_log(s, win, name)
+    if narrowed is not None:
+        t_graph = narrowed
     fresh = s.texts(before)
     bad = [event for event in basket_events(fresh) if event["n"] != 0]
     toggles = [line for line in fresh if "[APP:FILE_TOGGLED:" in line and "selected=true" in line]
