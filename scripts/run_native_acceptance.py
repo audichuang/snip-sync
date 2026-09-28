@@ -22,6 +22,7 @@ import sys
 import tempfile
 
 from bench_native_memory import sha256_file
+import check_native_collaboration as collaboration
 from check_native_ime import REQUIRED_TOOLS as IME_TOOLS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,7 +76,8 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def run(command: list[str], output: Path, name: str, commands: list[dict]) -> None:
+def run(command: list[str], output: Path, name: str, commands: list[dict],
+        ok: tuple[int, ...] = (0,)) -> None:
     log = output / f"{name}.log"
     record = {"command": command, "log": str(log), "exitCode": None}
     commands.append(record)
@@ -84,7 +86,7 @@ def run(command: list[str], output: Path, name: str, commands: list[dict]) -> No
         result = subprocess.run(command, cwd=ROOT, env=environment(),
                                 stdout=stream, stderr=subprocess.STDOUT)
     record["exitCode"] = result.returncode
-    if result.returncode:
+    if result.returncode not in ok:
         raise RuntimeError(f"{name} failed with exit {result.returncode}; see {log}")
 
 
@@ -203,12 +205,20 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
         helpers = output / "helper-receipt.json"
         write_json(helpers, {"files": {name: {"sha256": sha256_file(str(ROOT / "scripts" / name))}
                                      for name in ("bench_native_memory.py", "memory_harness.py")}})
-        select = ["--steps", ",".join(shard_steps(manifest, shard))] if shard else ["--phase", "all"]
+        steps = shard_steps(manifest, shard) if shard else None
+        select = ["--steps", ",".join(steps)] if steps else ["--phase", "all"]
+        # A shard's own report always fails the driver's 18-step rule (exit 1),
+        # so the shard is judged by the same checks narrowed to its steps.
         run(python + ["scripts/check_native_collaboration.py", "--binary", binary,
                       "--binary-sha", sha, "--fixture", str(fixture),
                       "--dataset-hash", manifest["datasetHash"], "--helper-receipt", str(helpers),
                       *select, "--timeout", "60", "--output", str(output / gate)],
-            output, gate, commands)
+            output, gate, commands, ok=(0, 1) if steps else (0,))
+        if steps:
+            report = json.loads((output / gate / "report.json").read_text())
+            problems = collaboration.functional_problems(report, required_ids=steps)
+            if problems:
+                raise RuntimeError("collaboration shard failed: " + "; ".join(problems))
     else:
         profile = gate.removeprefix("resource-")
         fixture = output / f"workload-{profile}"
@@ -231,7 +241,7 @@ def merge(shards: list[Path], receipt: Path, data: dict) -> list[dict]:
     cover every gate, and the collaboration shards must have passed every
     manifest step exactly once, so a lost or skipped shard cannot go green.
     """
-    commands, gates, passed, manifest_ids = [], set(), [], None
+    commands, gates, reports = [], set(), []
     for shard in shards:
         acc = json.loads((shard / "acceptance.json").read_text())
         if acc.get("status") != "PASSED":
@@ -241,23 +251,19 @@ def merge(shards: list[Path], receipt: Path, data: dict) -> list[dict]:
         commands += acc.get("commands", [])
         gates.update(acc.get("gates", []))
         if "collaboration" in acc.get("gates", []):
-            manifest = json.loads((shard / "collaboration-fixture" / "manifest.json").read_text())
-            ids = [str(step["id"]) for step in manifest["steps"]]
-            if manifest_ids not in (None, ids):
-                raise ValueError(f"{shard}: collaboration fixture differs between shards")
-            manifest_ids = ids
-            report = json.loads((shard / "collaboration" / "report.json").read_text())
-            if report.get("exitCode") != 0:
-                raise ValueError(f"{shard}: collaboration exit {report.get('exitCode')}")
-            for step in report.get("steps", []):
-                if step.get("status") != "passed":
-                    raise ValueError(f"{shard}: step {step.get('id')} is {step.get('status')}")
-                passed.append(str(step["id"]))
+            reports.append(json.loads((shard / "collaboration" / "report.json").read_text()))
     missing = sorted(set(GATES) - gates)
     if missing:
         raise ValueError("no shard ran gate(s): " + ", ".join(missing))
-    if sorted(passed) != sorted(manifest_ids or []):
-        raise ValueError(f"collaboration steps passed {sorted(passed)}, manifest has {manifest_ids}")
+    # One report as an unsharded run would have written it, judged by the
+    # driver's own full check: all 18 steps, once each, with their evidence.
+    for key in ("binarySha256", "datasetHash"):
+        if len({report.get(key) for report in reports}) != 1:
+            raise ValueError(f"collaboration shards disagree on {key}")
+    combined = dict(reports[0], steps=[step for report in reports for step in report.get("steps", [])])
+    problems = collaboration.functional_problems(combined)
+    if problems:
+        raise ValueError("merged collaboration report fails: " + "; ".join(problems))
     return commands
 
 

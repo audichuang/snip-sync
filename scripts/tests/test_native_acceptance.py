@@ -69,7 +69,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertTrue(after["files"]["deleted.rs"]["missing"])
 
     def test_build_freezes_observed_artifact_and_refuses_midbuild_mutation(self):
-        def fake_build(command, output, name, commands):
+        def fake_build(command, output, name, commands, ok=(0,)):
             self.assertEqual(command, acceptance.BUILD)
             (output / "build.log").write_text(json.dumps({"reason": "compiler-artifact",
                 "target": {"name": "snip-desktop-native"}, "executable": str(self.binary)}) + "\n")
@@ -125,7 +125,7 @@ class AcceptanceTests(unittest.TestCase):
     def test_gate_commands_preserve_full_oracles_and_isolated_interpreter(self):
         commands = []
 
-        def collect(command, output, name, records):
+        def collect(command, output, name, records, ok=(0,)):
             commands.append(command)
             if name == "collaboration-fixture":
                 fixture = output / "collaboration-fixture"
@@ -248,9 +248,16 @@ class AcceptanceTests(unittest.TestCase):
             acceptance.write_json(path / "collaboration-fixture" / "manifest.json",
                                   {"steps": [{"id": step_id} for step_id in ids]})
             (path / "collaboration").mkdir()
-            acceptance.write_json(path / "collaboration" / "report.json", {"exitCode": 0, "steps": [
-                {"id": step_id, "status": "passed"} for step_id in steps]})
+            acceptance.write_json(path / "collaboration" / "report.json", {
+                "binarySha256": "b" * 64, "datasetHash": "d" * 64,
+                "steps": [{"id": step_id, "status": "passed"} for step_id in steps]})
         return path
+
+    @staticmethod
+    def full_check(report, required_ids=("a", "b", "c")):
+        """Stands in for the driver's check: only the step set matters here."""
+        ids = [step["id"] for step in report["steps"]]
+        return [] if sorted(ids) == sorted(required_ids) else [f"steps {ids}"]
 
     def test_collaboration_shards_split_every_step_exactly_once(self):
         manifest = {"steps": [{"id": str(n)} for n in range(18)]}
@@ -266,7 +273,8 @@ class AcceptanceTests(unittest.TestCase):
                 self.shard("c1", ("collaboration",), steps=("a", "c")),
                 self.shard("c2", ("collaboration",), steps=("b",))]
         output = self.root / "merged"
-        with mock.patch.object(acceptance, "verify_build", return_value=self.data):
+        with mock.patch.object(acceptance, "verify_build", return_value=self.data), \
+                mock.patch.object(acceptance.collaboration, "functional_problems", side_effect=self.full_check):
             self.assertEqual(acceptance.main(["--gate", "merge", "--output", str(output),
                 "--build-receipt", str(self.receipt), "--merge", *map(str, good)]), 0)
         report = json.loads((output / "acceptance.json").read_text())
@@ -283,7 +291,9 @@ class AcceptanceTests(unittest.TestCase):
         for reason, shards in bad_sets.items():
             with self.subTest(reason=reason):
                 output = self.root / f"merged-{reason}"
-                with mock.patch.object(acceptance, "verify_build", return_value=self.data):
+                with mock.patch.object(acceptance, "verify_build", return_value=self.data), \
+                        mock.patch.object(acceptance.collaboration, "functional_problems",
+                                          side_effect=self.full_check):
                     code = acceptance.main(["--gate", "merge", "--output", str(output),
                         "--build-receipt", str(self.receipt), "--merge", *map(str, shards)])
                 self.assertEqual(code, 1)
