@@ -1065,6 +1065,7 @@ fn line_highlights(
 	finds: &[(usize, usize, bool)],
 	sel: Option<Range<usize>>,
 	words: &[Range<usize>],
+	word_bg: u32,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
 	let mut cuts = vec![0, line.len()];
 	let tokens = highlight_line(line, lang, theme);
@@ -1115,7 +1116,7 @@ fn line_highlights(
 				words
 					.iter()
 					.any(|r| r.start <= s && e <= r.end)
-					.then(|| rgb(pal().diff_word_bg).into())
+					.then(|| rgb(word_bg).into())
 			})
 		};
 		out.push((
@@ -1907,10 +1908,29 @@ impl WorkbenchModel {
 			_ => p.code_lang(),
 		};
 		let words = p.word_ranges(ix);
-		let hl =
-			line_highlights(render_text, lang, &theme, &finds, sel, &words);
-		let row_bg = match diff_row.and_then(|r| r.change()) {
-			Some(c) => Some(c.bg()),
+		// Unified rows read as removed (red) or added (green), whatever
+		// block they belong to: the old and new side of a modification
+		// must not look the same.
+		let (row_tint, word_bg) = match diff_row.map(|r| r.kind) {
+			Some(RowKind::Removed) => {
+				(Some(pal().diff_removed_bg), pal().diff_removed_word_bg)
+			}
+			Some(RowKind::Added) => {
+				(Some(pal().diff_add_bg), pal().diff_added_word_bg)
+			}
+			_ => (None, pal().diff_word_bg),
+		};
+		let hl = line_highlights(
+			render_text,
+			lang,
+			&theme,
+			&finds,
+			sel,
+			&words,
+			word_bg,
+		);
+		let row_bg = match row_tint {
+			Some(c) => Some(c),
 			None if interactive && ix == self.reader.cursor_line => {
 				Some(pal().current_line_bg)
 			}
@@ -2082,6 +2102,7 @@ impl WorkbenchModel {
 							&[],
 							None,
 							&[],
+							pal().diff_word_bg,
 						)),
 				)
 				.into_any_element();
@@ -2127,7 +2148,13 @@ impl WorkbenchModel {
 									text.to_string(),
 								))
 								.with_highlights(line_highlights(
-									text, lang, &theme, &finds, sel, &words,
+									text,
+									lang,
+									&theme,
+									&finds,
+									sel,
+									&words,
+									pal().diff_word_bg,
 								)),
 							)
 							.child(
@@ -2794,6 +2821,7 @@ mod tests {
 			&[(4, 5, true)],
 			Some(2..6),
 			&[0..3, 8..10],
+			pal().diff_word_bg,
 		);
 		let mut at = 0;
 		for (r, _) in &h {
@@ -2847,6 +2875,7 @@ mod tests {
 			&finds,
 			sel,
 			&[],
+			pal().diff_word_bg,
 		);
 
 		let elapsed = start.elapsed();
