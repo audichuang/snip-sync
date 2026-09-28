@@ -509,7 +509,10 @@ def unmet_release_requirements(report: Mapping[str, Any]) -> list[str]:
     return problems
 
 
-def functional_problems(report: Mapping[str, Any]) -> list[str]:
+def functional_problems(report: Mapping[str, Any],
+                        required_ids: Sequence[str] = REQUIRED_STEP_IDS) -> list[str]:
+    """`required_ids` narrows the step set for one shard of a sharded run;
+    the merged report is checked again against every manifest step."""
     problems: list[str] = []
     if report.get("synthetic") or report.get("syntheticCompleteness"):
         problems.append("synthetic result is not native acceptance")
@@ -528,11 +531,11 @@ def functional_problems(report: Mapping[str, Any]) -> list[str]:
 
     steps = list(report.get("steps") or [])
     step_ids = [str(step.get("id")) for step in steps if step.get("id")]
-    if set(step_ids) != set(REQUIRED_STEP_IDS) or len(step_ids) != len(REQUIRED_STEP_IDS):
-        missing = sorted(set(REQUIRED_STEP_IDS) - set(step_ids))
-        extra = sorted(set(step_ids) - set(REQUIRED_STEP_IDS))
+    if set(step_ids) != set(required_ids) or len(step_ids) != len(required_ids):
+        missing = sorted(set(required_ids) - set(step_ids))
+        extra = sorted(set(step_ids) - set(required_ids))
         problems.append(
-            f"step set does not match required 18 manifest step IDs (missing: {missing}, extra: {extra})"
+            f"step set does not match required {len(required_ids)} manifest step IDs (missing: {missing}, extra: {extra})"
         )
 
     for step in steps:
@@ -800,11 +803,10 @@ def helper_hashes(native: Any, receipt: Path | None) -> dict[str, Any]:
         "bench_native_memory.py": Path(native.__file__).resolve(),
     }
     scripts = files["bench_native_memory.py"].parent
-    for name in ("bench_tauri_memory.py", "memory_harness.py"):
-        path = scripts / name
-        if not path.is_file():
-            raise DriverError(f"helper sibling missing: {name}")
-        files[name] = path
+    path = scripts / "memory_harness.py"
+    if not path.is_file():
+        raise DriverError("helper sibling missing: memory_harness.py")
+    files["memory_harness.py"] = path
     hashed = {name: sha256_file(path) for name, path in files.items()}
     checked = None
     if receipt is not None:

@@ -44,7 +44,7 @@ GPUI 在 Linux 上同時支援 X11 及 Wayland，並透過 Mesa/Gallium llvmpipe
 
 ## 2. 發布管線（v0.3.0 起：原生版取代 Tauri 成為正式桌面 App）
 
-v0.3.0 起，release 的桌面資產改為原生 GPUI App（`crates/desktop-native`，執行檔 `snip-desktop-native`，使用者看到的產品名 `snip-sync`）。CLI（`snip`）照舊由 `release.yml` 的 `build-cli` 建置發布。Tauri 版（`crates/desktop`）仍由 `ci.yml` 的 lint／test／`desktop-e2e` 建置與測試以便回退，但 `release.yml` 不再建置或發布它；`just bump` 仍同步 `tauri.conf.json` 的版本，讓它保持可建置。
+v0.3.0 起，release 的桌面資產改為原生 GPUI App（`crates/desktop-native`，執行檔 `snip-desktop-native`，使用者看到的產品名 `snip-sync`）。CLI（`snip`）照舊由 `release.yml` 的 `build-cli` 建置發布。Tauri 版（`crates/desktop`）已在 0.3.2 從 repo 移除，連同它的 CI job 與 `just bump` 的 `tauri.conf.json` 同步；需要回退時從 git 歷史取回。
 
 ### 2.1 雜湊綁定：發布的就是驗收過的位元組
 
@@ -86,9 +86,9 @@ DMG 檔名沿用 Tauri 時代的 `snip-sync_mac_arm.dmg`／`snip-sync_mac_intel.
 ### 2.4 平台工具
 
 不引入第三方打包框架：
-1. **macOS**：自建 `.app` 與 `Info.plist`（`LSMinimumSystemVersion=11.0`、圖示取自 `crates/desktop/src-tauri/icons/icon.icns`），`codesign` ad-hoc 簽章，`hdiutil create -volname snip-sync -format UDZO` 製作 DMG。缺 `codesign` 或 `hdiutil` 時 `scripts/package_native.sh` 失敗。
+1. **macOS**：自建 `.app` 與 `Info.plist`（`LSMinimumSystemVersion=11.0`、圖示取自 `crates/desktop-native/packaging/icons/icon.icns`），`codesign` ad-hoc 簽章，`hdiutil create -volname snip-sync -format UDZO` 製作 DMG。缺 `codesign` 或 `hdiutil` 時 `scripts/package_native.sh` 失敗。
 2. **Linux**：POSIX tar，保留 `0755`。不做 AppImage：需要額外下載 appimagetool 與 FUSE，tarball 已足夠。執行檔在 `ubuntu-24.04` 建置（`native-acceptance` 的 runner），因此需要 glibc 2.39 以上；Tauri 版原本在 22.04 建置，這是已知的相容範圍縮小。
-3. **Windows**：Python `zipfile` 產生 zip；安裝檔用 Inno Setup（GitHub `windows-2025` 映像預裝 `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`，NSIS 沒有預裝），腳本在 `crates/desktop-native/packaging/windows/snip-sync.iss`，圖示取自 Tauri 的 `icon.ico`。Git Bash 會改寫 `/D`、`/O` 開頭的參數，所以呼叫時設 `MSYS_NO_PATHCONV=1` 並用 `cygpath -w` 轉路徑。找不到 `ISCC.exe` 時打包失敗，不會少產一個格式。exe 本身沒有內嵌圖示（需要改 `crates/desktop-native` 的建置腳本，不在本次範圍）。
+3. **Windows**：Python `zipfile` 產生 zip；安裝檔用 Inno Setup（GitHub `windows-2025` 映像預裝 `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`，NSIS 沒有預裝），腳本在 `crates/desktop-native/packaging/windows/snip-sync.iss`，圖示取自 `crates/desktop-native/packaging/icons/icon.ico`。Git Bash 會改寫 `/D`、`/O` 開頭的參數，所以呼叫時設 `MSYS_NO_PATHCONV=1` 並用 `cygpath -w` 轉路徑。找不到 `ISCC.exe` 時打包失敗，不會少產一個格式。exe 本身沒有內嵌圖示（需要改 `crates/desktop-native` 的建置腳本，不在本次範圍）。
 
 ### 2.5 平台獨立 Checksum
 
@@ -210,5 +210,5 @@ DMG 檔名沿用 Tauri 時代的 `snip-sync_mac_arm.dmg`／`snip-sync_mac_intel.
    - 現況：CI 驗證 PE 二進位、zip、Inno Setup 安裝檔的靜默安裝，以及安裝出的 exe 的 `--help`／`--version`。
    - **未驗證環境前置條件**：Windows runner 在無實體顯示器環境下的視窗焦點行為、Direct3D 11/12 WARP 軟體光柵化支援、以及 Win32 UI Automation / `SendInput` 事件注入能力未經實機探針量測前標記為 UNVERIFIED；真實視窗操作未在此 CI 階段被驗證。
 4. **安裝包與回退狀態**：
-   - 現況：v0.3.0 起 release 只發布原生桌面資產（第 2 節）；Tauri 版留在 `crates/desktop`，CI 照常建置與跑 E2E，需要回退時把 `release.yml` 的 `build-tauri` job 從 v0.2.0 版還原即可。
+   - 現況：v0.3.0 起 release 只發布原生桌面資產（第 2 節）；Tauri 版（`crates/desktop`）已從 repo 移除，CI 不再建置或測試；需要回退時從 git 歷史取回該目錄，並把 `release.yml` 的 `build-tauri` job 從 v0.2.0 版還原。
    - 未涵蓋：macOS／Windows 真視窗輸入、單一實例互斥鎖仍未在 CI 驗證；Linux 的 IME 與協作驗收由 `native-acceptance` 負責。

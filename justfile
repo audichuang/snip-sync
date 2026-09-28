@@ -14,59 +14,52 @@ lint:
 fmt:
 	cargo fmt --all
 
-# Mirrors CI's Rust checks (see .github/workflows/ci.yml for the rest).
-preflight: preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke native-lifecycle native-acceptance
+# Everything CI runs that Linux can run (see .github/workflows/ci.yml for the rest).
+preflight: preflight-workflows preflight-rust preflight-harness native-acceptance
+
+# Same as CI's Lint Workflows job; needs actionlint and shellcheck on PATH.
+preflight-workflows:
+	actionlint
 
 preflight-rust:
 	cargo fmt --all --check
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-desktop-native --locked --no-fail-fast
-	RUSTFLAGS="-D warnings" cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
+	# Same as CI's Linux Test job: one run, clipboard tests on a private display.
+	RUSTFLAGS="-D warnings" xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
 
 # Python stdlib memory harness contracts and workload generator tests.
 preflight-harness:
 	SNIP_REQUIRE_ALL_TESTS=1 "{{ native_python }}" -B -m unittest discover -s scripts/tests
 
-# Same frontend checks as CI's Frontend Lint and Format Check jobs.
-preflight-frontend:
-	cd crates/desktop && bun install --frozen-lockfile && bun run format:check && bun run typecheck && bun run lint:check -- --max-warnings 0 && bun run test && bun run build
-
-# Run the desktop app in dev mode.
-desktop:
-	cd crates/desktop && bun install --frozen-lockfile && bun run start
-
 # Run the native GPUI desktop prototype.
 native *args:
 	cargo run -p snip-desktop-native -- {{args}}
 
-# Build the desktop installers for this platform.
-desktop-bundle:
-	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build
-
-# Real-app E2E (Linux): needs webkit2gtk-driver, `cargo install tauri-driver`, xvfb.
-desktop-e2e:
-	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle && SNIP_REQUIRE_ALL_TESTS=1 xvfb-run -a node e2e/scenarios.mjs
-
-# Native real-app smoke test (Linux X11): needs xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts, software graphics.
+# Native real-app smoke test (Linux X11) against a debug build, for iterating on
+# one driver: needs xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts,
+# software graphics. `just native-acceptance` runs it on the release build.
 native-smoke out="target/native-e2e-artifacts":
+	cargo build -p snip-desktop-native --locked
 	mkdir -p "{{out}}"
 	rm -f "{{out}}/graph.png" "{{out}}/file_tree.png" "{{out}}/paste_preview.png" "{{out}}/light_theme.png"
-	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$1/smoke.log"' _ "{{out}}"
+	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_NATIVE_BIN="$(realpath target/debug/snip-desktop-native)" SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-native-e2e --test smoke --locked -- --nocapture 2>&1 | tee "$1/smoke.log"' _ "{{out}}"
 	test -s "{{out}}/smoke.log"
 	python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png', 'light_theme.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "{{out}}"
 
 # Real X11 close/reopen/quit drain and copy/paste cancel checks (tests/lifecycle.rs).
 native-lifecycle out="target/native-e2e-artifacts":
+	cargo build -p snip-desktop-native --locked
 	mkdir -p "{{out}}"
-	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test lifecycle --locked -- --nocapture 2>&1 | tee "$1/lifecycle.log"' _ "{{out}}"
+	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_NATIVE_BIN="$(realpath target/debug/snip-desktop-native)" SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-native-e2e --test lifecycle --locked -- --nocapture 2>&1 | tee "$1/lifecycle.log"' _ "{{out}}"
 	test -s "{{out}}/lifecycle.log"
 
-# Current release build once, then private IME9+startup, collaboration18 and
-# functional short resource gate (20 warmup +100 measured switches).
+# Current release build once, then private IME9+startup, collaboration18,
+# functional short resource gate (20 warmup +100 measured switches), and the
+# smoke/lifecycle drivers on that same binary, three gates at a time.
 # Optional args include --output FRESH_DIR and --build-receipt EXISTING_RECEIPT.
 native-acceptance *args:
-    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate all {{ args }}
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate all --jobs 3 {{ args }}
 
 native-acceptance-build *args:
     "{{ native_python }}" -B scripts/run_native_acceptance.py --gate build {{ args }}
@@ -102,10 +95,9 @@ verify-artifacts dir version="" target="":
 native-cli-smoke bin version:
 	python3 scripts/smoke_native.py --bin "{{bin}}" --expected-version "{{version}}"
 
-# Bump the version in every manifest (perl -pi is portable across GNU/BSD).
+# Bump the workspace version (perl -pi is portable across GNU/BSD).
 bump version:
 	perl -pi -e 's/^version = .*/version = "{{version}}"/' Cargo.toml
-	perl -pi -e 's/"version": "[^"]*"/"version": "{{version}}"/' crates/desktop/package.json crates/desktop/src-tauri/tauri.conf.json
 	# Keep Cargo.lock in step, or every --locked build fails.
 	cargo update -w
 
@@ -121,10 +113,13 @@ release version *flags:
 	err() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 	ok() { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 	info() { printf '\033[36m• %s\033[0m\n' "$*"; }
-	echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
-		|| err "version must be X.Y.Z with no leading zeros (got: $VERSION)"
+	echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.]+)?$' \
+		|| err "version must be X.Y.Z or X.Y.Z-pre (e.g. 0.4.0-beta.1) with no leading zeros (got: $VERSION)"
+	# A pre-release ships from develop without the develop -> main round trip;
+	# release.yml accepts its green push-to-develop CI run. Stable stays on main.
+	case "$VERSION" in *-*) BRANCH=develop ;; *) BRANCH=main ;; esac
 	git remote get-url "$REMOTE" | grep -q "$REPO" || err "remote '$REMOTE' is not $REPO"
-	[ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || err "not on main"
+	[ "$(git rev-parse --abbrev-ref HEAD)" = "$BRANCH" ] || err "$TAG releases from $BRANCH; not on $BRANCH"
 	{ git diff --quiet && git diff --cached --quiet; } || err "working tree is dirty"
 	if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git ls-remote --tags "$REMOTE" "$TAG" | grep -q "$TAG"; then
 		err "tag $TAG already exists"
@@ -141,14 +136,14 @@ release version *flags:
 	ok "version $TAG validated (latest was ${LATEST:-none})"
 
 	HEAD_SHA="$(git rev-parse HEAD)"
-	git push "$REMOTE" main
-	info "waiting for ci.yml (push to main) on $HEAD_SHA..."
+	git push "$REMOTE" "$BRANCH"
+	info "waiting for ci.yml (push to $BRANCH) on $HEAD_SHA..."
 	CI_OK=0
 	# 150 min budget: native-acceptance alone may take up to its 120 min timeout.
 	for _ in $(seq 1 450); do
 		RUN="$(gh run list --repo "$REPO" --workflow ci.yml --limit 30 \
 			--json headSha,headBranch,event,status,conclusion \
-			--jq "[.[] | select(.headSha==\"$HEAD_SHA\" and .headBranch==\"main\" and .event==\"push\")] | first" 2>/dev/null || echo "")"
+			--jq "[.[] | select(.headSha==\"$HEAD_SHA\" and .headBranch==\"$BRANCH\" and .event==\"push\")] | first" 2>/dev/null || echo "")"
 		if [ -n "$RUN" ] && [ "$RUN" != "null" ] && [ "$(echo "$RUN" | jq -r .status)" = "completed" ]; then
 			[ "$(echo "$RUN" | jq -r .conclusion)" = "success" ] || err "ci.yml for HEAD did not succeed"
 			CI_OK=1

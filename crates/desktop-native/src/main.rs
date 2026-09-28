@@ -1893,8 +1893,9 @@ impl WorkbenchModel {
 		self.status = Msg::new(key, args);
 	}
 
-	/// Shows `msg` in a card over the window for a few seconds (a later
-	/// toast replaces it and restarts the clock).
+	/// Shows `msg` in a card over the window for a few seconds, longer for a
+	/// failure, which may list paths to read (a later toast replaces it and
+	/// restarts the clock).
 	pub fn show_toast(&mut self, ok: bool, msg: Msg, cx: &mut Context<Self>) {
 		self.toast_seq = self.toast_seq.wrapping_add(1);
 		let id = self.toast_seq;
@@ -1902,7 +1903,7 @@ impl WorkbenchModel {
 		self.toast = Some((id, ok, msg));
 		cx.spawn(async move |this, cx| {
 			cx.background_executor()
-				.timer(std::time::Duration::from_secs(4))
+				.timer(std::time::Duration::from_secs(if ok { 4 } else { 12 }))
 				.await;
 			let _ = this.update(cx, |model, cx| {
 				if model.toast.as_ref().is_some_and(|t| t.0 == id) {
@@ -5589,28 +5590,8 @@ impl WorkbenchModel {
 								result.files.errors.len(),
 								result.created_commits.len()
 							);
-							if result.created_commits.is_empty() {
-								model.set_status(
-									"status_paste_done",
-									[
-										result.files.created_count.to_string(),
-										result
-											.files
-											.overwritten_count
-											.to_string(),
-										result
-											.files
-											.skipped_existing_count
-											.to_string(),
-										result.files.deleted_count.to_string(),
-										result.files.errors.len().to_string(),
-									],
-								);
-							} else {
-								model.set_status(
-									"commit_replay_done",
-									[result.created_commits.join(", ")],
-								);
+							for error in &result.files.errors {
+								app_log!("[APP:PASTE_FILE_ERROR: {error}]");
 							}
 							model.clear_paste_state();
 							model.restore_log_after_paste();
@@ -5619,6 +5600,11 @@ impl WorkbenchModel {
 							// A rescan refreshes the destination's summary too,
 							// then reloads the open repo keeping its anchors.
 							model.reload_repos(cx);
+							// A card, not the status line: the rescan above
+							// rewrites the status at once, and the failed paths
+							// must stay readable.
+							let ok = result.files.errors.is_empty();
+							model.show_toast(ok, result.status(), cx);
 						}
 						Err(err) => {
 							app_log!("[APP:PASTE_STALE_DETECTED: {}]", err.key);
@@ -6278,6 +6264,539 @@ fn restore_log_after_paste(
 
 #[cfg(test)]
 mod tests {
+	/// UI state driven in-process: no display, so these also run in the
+	/// Windows and macOS Test jobs, which have no real-app GUI test.
+	mod in_process {
+		use crate::{WorkbenchModel, WorkbenchTab};
+		use gpui::{Entity, TestAppContext, VisualTestContext};
+		use snip_core::clip;
+		use snip_core::format::parse_clipboard;
+		use std::fs;
+		use std::path::{Path, PathBuf};
+		use std::process::Command;
+		use std::sync::{Mutex, MutexGuard, PoisonError};
+		use std::time::Duration;
+
+		fn git(dir: &Path, args: &[&str]) {
+			let out = Command::new("git")
+				.current_dir(dir)
+				.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+				.args(args)
+				.output()
+				.expect("git must run");
+			assert!(out.status.success(), "git {args:?}: {out:?}");
+		}
+
+		/// A repo with `base.txt` committed and `untracked` written on top.
+		fn repo(ws: &Path, name: &str, untracked: &[(&str, &str)]) -> PathBuf {
+			let repo = ws.join(name);
+			fs::create_dir(&repo).unwrap();
+			git(&repo, &["init", "-q", "-b", "main"]);
+			fs::write(repo.join("base.txt"), "base").unwrap();
+			git(&repo, &["add", "."]);
+			git(&repo, &["commit", "-q", "-m", "base"]);
+			for (rel, body) in untracked {
+				fs::write(repo.join(rel), body).unwrap();
+			}
+			repo
+		}
+
+		/// Opens `ws` with the real keymap and the workbench focused: the
+		/// state a user's first keystroke finds.
+		fn open(
+			cx: &mut TestAppContext,
+			ws: PathBuf,
+			restore_dir: Option<PathBuf>,
+		) -> (Entity<WorkbenchModel>, &mut VisualTestContext) {
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(Some(ws), restore_dir, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			cx.update(|window, cx| {
+				window.focus(&model.read(cx).focus_handle.clone())
+			});
+			(model, cx)
+		}
+
+		/// Drains background work, then the 40 ms watch that moves a finished
+		/// paste plan into the model: the test clock only moves when told to.
+		fn settle(cx: &mut VisualTestContext) {
+			for _ in 0..5 {
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+			cx.run_until_parked();
+		}
+
+		/// arboard talks to the one OS clipboard, so tests that use it run one
+		/// at a time, and on Linux only under a display (CI uses xvfb-run).
+		static CLIPBOARD: Mutex<()> = Mutex::new(());
+
+		fn clipboard() -> Option<MutexGuard<'static, ()>> {
+			let unset =
+				|k: &str| std::env::var_os(k).is_none_or(|v| v.is_empty());
+			if cfg!(target_os = "linux")
+				&& unset("DISPLAY")
+				&& unset("WAYLAND_DISPLAY")
+			{
+				assert!(
+					std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+					"clipboard tests need DISPLAY or WAYLAND_DISPLAY"
+				);
+				eprintln!("skipping clipboard test: no display");
+				return None;
+			}
+			Some(CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner))
+		}
+
+		/// Puts `payload` on the OS clipboard and opens its paste preview.
+		fn paste(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			payload: &str,
+		) {
+			clip::write_text(payload).unwrap();
+			cx.simulate_keystrokes("ctrl-v");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste_preview.is_some(), "no preview: {}", m.status)
+			});
+		}
+
+		/// `dest_path` comes back canonical (macOS `/var` → `/private/var`,
+		/// Windows short names), so the destination is canonical from the start.
+		fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
+			let tmp = tempfile::tempdir().unwrap();
+			let root = dunce::canonicalize(tmp.path()).unwrap();
+			(tmp, root)
+		}
+
+		#[gpui::test]
+		fn opening_a_workspace_lists_each_repository_with_its_changes(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for (name, dirty) in [("alpha", 1), ("beta", 2)] {
+				let repo = ws.path().join(name);
+				std::fs::create_dir(&repo).unwrap();
+				git(&repo, &["init", "-q", "-b", "main"]);
+				std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+				git(&repo, &["add", "."]);
+				git(&repo, &["commit", "-q", "-m", "base"]);
+				for i in 0..dirty {
+					std::fs::write(repo.join(format!("new{i}.txt")), "x\n")
+						.unwrap();
+				}
+			}
+			let root = ws.path().to_path_buf();
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(Some(root), None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let mut seen: Vec<(String, usize)> = m
+					.repos
+					.iter()
+					.map(|r| {
+						let s = r.summary.as_ref().expect("repo summary");
+						(r.name.clone(), s.changes.untracked)
+					})
+					.collect();
+				seen.sort();
+				assert_eq!(
+					seen,
+					[("alpha".to_string(), 1), ("beta".to_string(), 2)]
+				);
+			});
+		}
+
+		/// A keystroke goes through the real keymap and focus dispatch, the
+		/// path a user's key takes, not a direct method call.
+		#[gpui::test]
+		fn alt_9_toggles_the_git_log_through_the_keymap(
+			cx: &mut TestAppContext,
+		) {
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let ws = tempfile::tempdir().unwrap();
+			let root = ws.path().to_path_buf();
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(Some(root), None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			cx.update(|window, cx| {
+				window.focus(&model.read(cx).focus_handle.clone())
+			});
+			let before = model.read_with(cx, |m, _| m.bottom_visible);
+			cx.simulate_keystrokes("alt-9");
+			cx.run_until_parked();
+			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), !before);
+			cx.simulate_keystrokes("alt-9");
+			cx.run_until_parked();
+			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
+		}
+
+		#[gpui::test]
+		fn alt_1_and_alt_0_switch_between_project_and_changes(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let tab = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| (m.active_tab, m.left_visible))
+			};
+			assert_eq!(tab(cx), (WorkbenchTab::GitChanges, true));
+			cx.simulate_keystrokes("alt-1");
+			assert_eq!(tab(cx), (WorkbenchTab::FileExplorer, true));
+			cx.simulate_keystrokes("alt-0");
+			assert_eq!(tab(cx), (WorkbenchTab::GitChanges, true));
+		}
+
+		#[gpui::test]
+		fn alt_s_selects_every_change_and_alt_d_empties_the_basket(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[("new0.txt", "x"), ("new1.txt", "y")]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_keystrokes("alt-s");
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.files.len(), 2);
+				assert!(m.files.iter().all(|f| f.selected));
+				assert!(m.basket_count() >= 2, "{}", m.basket_count());
+				assert_eq!(m.status.key, "status_selected_all");
+			});
+			cx.simulate_keystrokes("alt-d");
+			model.read_with(cx, |m, _| {
+				assert!(m.files.iter().all(|f| !f.selected));
+				assert_eq!(m.basket_count(), 0);
+				assert_eq!(m.status.key, "status_deselected_all");
+			});
+		}
+
+		#[gpui::test]
+		fn ctrl_r_lists_a_file_created_after_the_load(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let repo = repo(ws.path(), "alpha", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			assert!(model.read_with(cx, |m, _| m.files.is_empty()));
+			fs::write(repo.join("later.txt"), "late").unwrap();
+			cx.simulate_keystrokes("ctrl-r");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert!(m.changes_loaded);
+				let paths: Vec<&str> =
+					m.files.iter().map(|f| f.path.as_str()).collect();
+				assert_eq!(paths, ["later.txt"]);
+				let summary = m.repos[0].summary.as_ref().unwrap();
+				assert_eq!(summary.changes.untracked, 1);
+			});
+		}
+
+		#[gpui::test]
+		fn ctrl_r_releases_the_open_repository_once_its_directory_is_gone(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let gone = model.read_with(cx, |m, _| {
+				assert_eq!(m.repos.len(), 2);
+				m.repos[m.selected_repo_idx.unwrap()].root.clone()
+			});
+			fs::remove_dir_all(&gone).unwrap();
+			cx.simulate_keystrokes("ctrl-r");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos.len(), 1);
+				assert_ne!(m.repos[0].root, gone);
+				assert!(m.selected_repo_idx.is_none());
+				assert!(m.file_tree.is_none());
+			});
+		}
+
+		#[gpui::test]
+		fn ctrl_c_writes_the_selection_as_a_payload_that_parses_back(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[("new0.txt", "hello")]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_keystrokes("alt-s");
+			cx.simulate_keystrokes("ctrl-c");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "status_copied", "{}", m.status)
+			});
+			let mut got: Vec<(String, String)> =
+				parse_clipboard(&clip::read_text().unwrap(), "")
+					.into_iter()
+					.map(|e| (e.path, e.content))
+					.collect();
+			got.sort();
+			assert_eq!(
+				got,
+				[
+					("base.txt".to_string(), "base".to_string()),
+					("new0.txt".to_string(), "hello".to_string()),
+				]
+			);
+		}
+
+		#[gpui::test]
+		fn ctrl_v_previews_the_payload_with_overwrite_off(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			fs::write(dest.join("existing.txt"), "keep").unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(
+				&model,
+				cx,
+				"// FILE: existing.txt\nnew body\n// FILE: fresh.txt\nfresh body\n",
+			);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(plan.mapping_ready());
+				assert_eq!(plan.destination, dest);
+				let mut rows: Vec<(&str, &str, bool, bool)> = plan
+					.items
+					.iter()
+					.map(|i| {
+						(
+							i.path.as_str(),
+							i.action_label,
+							i.dest_exists,
+							i.overwrite_allowed,
+						)
+					})
+					.collect();
+				rows.sort();
+				assert_eq!(
+					rows,
+					[
+						("existing.txt", "OVERWRITE", true, false),
+						("fresh.txt", "CREATE", false, false),
+					]
+				);
+				assert_eq!(m.status.key, "status_paste_preview");
+			});
+			// A preview never writes.
+			assert_eq!(
+				fs::read_to_string(dest.join("existing.txt")).unwrap(),
+				"keep"
+			);
+			assert!(!dest.join("fresh.txt").exists());
+		}
+
+		#[gpui::test]
+		fn escape_cancels_the_preview_and_writes_nothing(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: fresh.txt\nfresh body\n");
+			cx.simulate_keystrokes("escape");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert!(m.paste_preview.is_none());
+				assert_eq!(m.status.key, "paste_cancelled");
+			});
+			assert!(!dest.join("fresh.txt").exists());
+		}
+
+		#[gpui::test]
+		fn enter_applies_the_preview_byte_for_byte(cx: &mut TestAppContext) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(
+				&model,
+				cx,
+				"// FILE: a.txt\nalpha\n// FILE: b.txt\nbeta\n  indented\n",
+			);
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert_eq!(
+				fs::read_to_string(dest.join("a.txt")).unwrap(),
+				"alpha"
+			);
+			assert_eq!(
+				fs::read_to_string(dest.join("b.txt")).unwrap(),
+				"beta\n  indented"
+			);
+		}
+
+		#[gpui::test]
+		fn enter_refuses_a_stale_destination_and_writes_nothing(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: a.txt\nfrom clipboard\n");
+			// The target appears behind the preview's back.
+			fs::write(dest.join("a.txt"), "external").unwrap();
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "stale_created", "{}", m.status);
+				let plan = m.paste_preview.as_ref().expect("plan stays open");
+				assert!(!plan.is_applying);
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("stale_created")
+				);
+			});
+			assert_eq!(
+				fs::read_to_string(dest.join("a.txt")).unwrap(),
+				"external"
+			);
+		}
+
+		/// A read-only directory makes one write fail; root ignores the mode,
+		/// so the test skips there.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn a_refused_write_does_not_stop_the_others_and_the_card_names_it(
+			cx: &mut TestAppContext,
+		) {
+			use std::os::unix::fs::PermissionsExt;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			let ro = dest.join("ro");
+			fs::create_dir(&ro).unwrap();
+			fs::set_permissions(&ro, fs::Permissions::from_mode(0o555))
+				.unwrap();
+			if fs::write(ro.join("probe"), "").is_ok() {
+				assert!(
+					std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+					"read-only directories need a non-root user"
+				);
+				return;
+			}
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			// The root marker keeps `ro/` under the destination without a
+			// mapping choice.
+			paste(
+				&model,
+				cx,
+				"// clipcode-root: src\n// FILE: ro/x.txt\nblocked\n// FILE: ok.txt\nfine\n",
+			);
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			fs::set_permissions(&ro, fs::Permissions::from_mode(0o755))
+				.unwrap();
+			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert_eq!(
+				fs::read_to_string(dest.join("ok.txt")).unwrap(),
+				"fine"
+			);
+			assert!(!ro.join("x.txt").exists());
+			// What the user sees after the rescan: a failure card naming
+			// the path, not a status line the rescan has already replaced.
+			model.read_with(cx, |m, _| {
+				let (_, ok, msg) = m.toast.as_ref().expect("result card");
+				assert!(!ok);
+				assert_eq!(msg.key, "status_paste_partial");
+				assert!(msg.render(m.locale).contains("ro/x.txt"), "{msg:?}");
+			});
+		}
+
+		/// APFS refuses such names, so Linux only.
+		#[cfg(target_os = "linux")]
+		#[gpui::test]
+		fn a_non_utf8_change_is_left_out_of_the_selection(
+			cx: &mut TestAppContext,
+		) {
+			use std::os::unix::ffi::OsStrExt;
+			let ws = tempfile::tempdir().unwrap();
+			let repo = repo(ws.path(), "alpha", &[("good.txt", "g")]);
+			let bad = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+			fs::write(repo.join(bad), "b").unwrap();
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_keystrokes("alt-s");
+			let bad_idx = model.read_with(cx, |m, _| {
+				let mut rows: Vec<(&str, bool)> = m
+					.files
+					.iter()
+					.map(|f| (f.path.as_str(), f.selected))
+					.collect();
+				rows.sort();
+				assert_eq!(
+					rows,
+					[("bad\u{FFFD}.txt", false), ("good.txt", true)]
+				);
+				m.files.iter().position(|f| !f.is_valid_utf8()).unwrap()
+			});
+			model.update(cx, |m, cx| m.toggle_file(bad_idx, cx));
+			model.read_with(cx, |m, _| {
+				assert!(!m.files[bad_idx].selected);
+				assert_eq!(m.status.key, "change_not_utf8");
+			});
+		}
+
+		#[gpui::test]
+		fn keeping_an_ambiguous_prefix_replans_under_the_destination(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: sub/x.txt\nnested\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				let prefixes: Vec<&str> = plan
+					.prefix_choices
+					.iter()
+					.map(|c| c.prefix.as_str())
+					.collect();
+				assert_eq!(prefixes, ["sub"]);
+				assert!(!plan.mapping_ready());
+				assert!(plan.items.is_empty());
+			});
+			model.update(cx, |m, cx| m.choose_paste_keep("sub", cx));
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(plan.mapping_ready());
+				let targets: Vec<&Path> =
+					plan.items.iter().map(|i| i.dest_path.as_path()).collect();
+				assert_eq!(targets, [dest.join("sub").join("x.txt").as_path()]);
+			});
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert_eq!(
+				fs::read_to_string(dest.join("sub").join("x.txt")).unwrap(),
+				"nested"
+			);
+		}
+	}
+
 	mod folder_copy {
 		use crate::{
 			expand_folder_items, native_export_settings,

@@ -3,6 +3,8 @@
 
 All outputs are fresh, outside the checkout, and retained. --build-receipt reuses
 a build made by this entrypoint only when the checkout and executable still match.
+CI runs the gates as parallel shards against one build, then --gate merge folds
+their receipts into the single gate "all" receipt a release checks.
 """
 
 from __future__ import annotations
@@ -19,13 +21,19 @@ import subprocess
 import sys
 import tempfile
 
-from bench_tauri_memory import sha256_file
+from concurrent.futures import ThreadPoolExecutor
+
+from bench_native_memory import sha256_file
+import check_native_collaboration as collaboration
 from check_native_ime import REQUIRED_TOOLS as IME_TOOLS
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ["cargo", "build", "--release", "-p", "snip-desktop-native", "--locked",
          "--message-format=json-render-diagnostics"]
-GATES = ("ime", "collaboration", "resource-short")
+GATES = ("ime", "collaboration", "resource-short", "smoke", "lifecycle")
+# Real-app Rust drivers (crates/native-e2e); they run the receipt's binary.
+DRIVER_TESTS = ("smoke", "lifecycle")
+SMOKE_SCREENSHOTS = ("graph.png", "file_tree.png", "paste_preview.png", "light_theme.png")
 PRODUCER = "run_native_acceptance.py/v1"
 
 
@@ -73,16 +81,17 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def run(command: list[str], output: Path, name: str, commands: list[dict]) -> None:
+def run(command: list[str], output: Path, name: str, commands: list[dict],
+        ok: tuple[int, ...] = (0,), extra_env: dict[str, str] | None = None) -> None:
     log = output / f"{name}.log"
     record = {"command": command, "log": str(log), "exitCode": None}
     commands.append(record)
     print(f"{name}: {log}", flush=True)
     with log.open("w") as stream:
-        result = subprocess.run(command, cwd=ROOT, env=environment(),
+        result = subprocess.run(command, cwd=ROOT, env={**environment(), **(extra_env or {})},
                                 stdout=stream, stderr=subprocess.STDOUT)
     record["exitCode"] = result.returncode
-    if result.returncode:
+    if result.returncode not in ok:
         raise RuntimeError(f"{name} failed with exit {result.returncode}; see {log}")
 
 
@@ -102,7 +111,7 @@ def prerequisites(gates: tuple[str, ...], building: bool) -> None:
     if sys.platform != "linux" or sys.byteorder != "little":
         raise ValueError("native acceptance requires little-endian Linux; refusing to skip")
     tools = {"git"}
-    if building:
+    if building or set(gates) & set(DRIVER_TESTS):
         tools.update(("cargo", "rustc"))
     if gates:
         tools.update(("Xvfb", "xdotool", "xclip", "xwd", "convert", "dbus-daemon",
@@ -155,6 +164,21 @@ def build(output: Path, commands: list[dict]) -> Path:
     return receipt
 
 
+def snapshot_changes(before: dict, after: dict) -> list[str]:
+    """Names what differs, so "checkout changed" says which file did it."""
+    if not isinstance(before, dict):
+        return ["receipt has no source snapshot"]
+    changes = [f"{key}: {before.get(key)} -> {after.get(key)}" for key in ("head", "tree")
+               if before.get(key) != after.get(key)]
+    old, new = before.get("files") or {}, after.get("files") or {}
+    changes += [f"added {name}" for name in sorted(set(new) - set(old))]
+    changes += [f"removed {name}" for name in sorted(set(old) - set(new))]
+    changes += [f"changed {name}" for name in sorted(set(old) & set(new)) if old[name] != new[name]]
+    if not changes and before.get("status") != after.get("status"):
+        changes.append("git status changed")
+    return changes
+
+
 def verify_build(receipt: Path) -> dict:
     data = json.loads(receipt.read_text())
     if (not isinstance(data, dict) or data.get("producer") != PRODUCER or data.get("buildCommand") != BUILD
@@ -165,12 +189,32 @@ def verify_build(receipt: Path) -> dict:
         raise ValueError("receipt executable is missing, relative, or not executable")
     if sha256_file(str(binary)) != data.get("sha256"):
         raise ValueError("frozen executable changed since the build")
-    if source_snapshot() != data.get("source") or data.get("sourceSha") != data["source"]["head"]:
-        raise ValueError("checkout head/tree/dirty state or source files changed since the build")
+    now = source_snapshot()
+    if now != data.get("source") or data.get("sourceSha") != data["source"]["head"]:
+        changes = snapshot_changes(data.get("source"), now)
+        raise ValueError("checkout head/tree/dirty state or source files changed since the build: "
+                         + "; ".join(changes[:10]) + (f" (+{len(changes) - 10} more)" if len(changes) > 10 else ""))
     return data
 
 
-def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[dict]) -> None:
+def parse_shard(text: str) -> tuple[int, int]:
+    """"K/N" with 1 <= K <= N."""
+    try:
+        k, n = (int(part) for part in text.split("/"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("shard must be K/N, e.g. 1/2") from None
+    if not 1 <= k <= n:
+        raise argparse.ArgumentTypeError("shard must satisfy 1 <= K <= N")
+    return k, n
+
+
+def shard_steps(manifest: dict, shard: tuple[int, int]) -> list[str]:
+    k, n = shard
+    return [str(step["id"]) for step in manifest["steps"]][k - 1::n]
+
+
+def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[dict],
+             shard: tuple[int, int] | None = None) -> None:
     python = [sys.executable, "-B"]
     binary, sha = data["binary"], data["sha256"]
     if gate == "ime":
@@ -183,13 +227,33 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
         manifest = json.loads((fixture / "manifest.json").read_text())
         helpers = output / "helper-receipt.json"
         write_json(helpers, {"files": {name: {"sha256": sha256_file(str(ROOT / "scripts" / name))}
-                                     for name in ("bench_native_memory.py", "bench_tauri_memory.py",
-                                                  "memory_harness.py")}})
+                                     for name in ("bench_native_memory.py", "memory_harness.py")}})
+        steps = shard_steps(manifest, shard) if shard else None
+        select = ["--steps", ",".join(steps)] if steps else ["--phase", "all"]
+        # A shard's own report always fails the driver's 18-step rule (exit 1),
+        # so the shard is judged by the same checks narrowed to its steps.
         run(python + ["scripts/check_native_collaboration.py", "--binary", binary,
                       "--binary-sha", sha, "--fixture", str(fixture),
                       "--dataset-hash", manifest["datasetHash"], "--helper-receipt", str(helpers),
-                      "--phase", "all", "--timeout", "60", "--output", str(output / gate)],
-            output, gate, commands)
+                      *select, "--timeout", "60", "--output", str(output / gate)],
+            output, gate, commands, ok=(0, 1) if steps else (0,))
+        if steps:
+            report = json.loads((output / gate / "report.json").read_text())
+            problems = collaboration.functional_problems(report, required_ids=steps)
+            if problems:
+                raise RuntimeError("collaboration shard failed: " + "; ".join(problems))
+    elif gate in DRIVER_TESTS:
+        out = output / gate
+        out.mkdir()
+        # Debug build of the drivers only; the app is the frozen release binary.
+        run(["scripts/headless-x11.sh", "cargo", "test", "-p", "snip-native-e2e", "--test", gate,
+             "--locked", "--", "--nocapture"], output, gate, commands,
+            extra_env={"SNIP_NATIVE_BIN": binary, "SNIP_E2E_OUT": str(out)})
+        if gate == "smoke":
+            for name in SMOKE_SCREENSHOTS:
+                shot = out / name
+                if not shot.is_file() or shot.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
+                    raise RuntimeError(f"smoke did not write a PNG {shot}")
     else:
         profile = gate.removeprefix("resource-")
         fixture = output / f"workload-{profile}"
@@ -205,38 +269,117 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
                       "--out-dir", str(output / gate)], output, gate, commands)
 
 
+def merge(shards: list[Path], receipt: Path, data: dict) -> list[dict]:
+    """Fold shard receipts into one "all" verdict, refusing any gap.
+
+    Every shard must have PASSED against this very build, together they must
+    cover every gate, and the collaboration shards must have passed every
+    manifest step exactly once, so a lost or skipped shard cannot go green.
+    """
+    commands, gates, reports = [], set(), []
+    for shard in shards:
+        acc = json.loads((shard / "acceptance.json").read_text())
+        if acc.get("status") != "PASSED":
+            raise ValueError(f"{shard}: shard status is {acc.get('status')}")
+        if acc.get("binarySha256") != data["sha256"] or acc.get("sourceSha") != data["sourceSha"]:
+            raise ValueError(f"{shard}: shard ran a different build than {receipt}")
+        commands += acc.get("commands", [])
+        gates.update(acc.get("gates", []))
+        if "collaboration" in acc.get("gates", []):
+            reports.append(json.loads((shard / "collaboration" / "report.json").read_text()))
+    missing = sorted(set(GATES) - gates)
+    if missing:
+        raise ValueError("no shard ran gate(s): " + ", ".join(missing))
+    # One report as an unsharded run would have written it, judged by the
+    # driver's own full check: all 18 steps, once each, with their evidence.
+    for key in ("binarySha256", "datasetHash"):
+        if len({report.get(key) for report in reports}) != 1:
+            raise ValueError(f"collaboration shards disagree on {key}")
+    combined = dict(reports[0], steps=[step for report in reports for step in report.get("steps", [])])
+    problems = collaboration.functional_problems(combined)
+    if problems:
+        raise ValueError("merged collaboration report fails: " + "; ".join(problems))
+    return commands
+
+
+def parse_gates(text: str) -> tuple[str, ...]:
+    if text in ("all", "build", "merge", "resource-long"):
+        return {"all": GATES, "build": (), "merge": (), "resource-long": ("resource-long",)}[text]
+    gates = tuple(part.strip() for part in text.split(","))
+    unknown = [gate for gate in gates if gate not in GATES]
+    if unknown or len(set(gates)) != len(gates):
+        raise argparse.ArgumentTypeError(f"unknown or repeated gate(s) in {text!r}")
+    return gates
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gate", choices=("build", "all", *GATES, "resource-long"), default="all")
+    parser.add_argument("--gate", default="all",
+                        help="all, build, merge, resource-long, or a comma list of: " + ", ".join(GATES))
     parser.add_argument("--output", type=Path, help="Fresh directory outside checkout (default: unique /tmp run)")
     parser.add_argument("--build-receipt", type=Path, help="Reuse this entrypoint's frozen build, verifying all inputs")
+    parser.add_argument("--collaboration-shard", type=parse_shard, metavar="K/N",
+                        help="Run only every N-th collaboration step starting at K")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="Gates run at once (each owns its display); 1 keeps them serial")
+    parser.add_argument("--merge", type=Path, nargs="+", metavar="SHARD_DIR",
+                        help="With --gate merge: shard outputs to fold into one gate-all receipt")
     args = parser.parse_args(argv)
     output = None
-    summary = {"gate": args.gate, "commands": [], "status": "FAILED", "fullD4Claimed": False}
+    # A merged receipt is the one a release checks; it claims the whole gate.
+    summary = {"gate": "all" if args.gate == "merge" else args.gate, "commands": [],
+               "status": "FAILED", "fullD4Claimed": False}
     try:
-        gates = GATES if args.gate == "all" else (() if args.gate == "build" else (args.gate,))
+        gates = parse_gates(args.gate)
+        if (args.gate == "merge") != bool(args.merge):
+            raise ValueError("--merge goes with --gate merge, and only with it")
+        if args.gate == "merge" and not args.build_receipt:
+            raise ValueError("--gate merge needs the shards' --build-receipt")
+        if args.collaboration_shard and "collaboration" not in gates:
+            raise ValueError("--collaboration-shard needs the collaboration gate")
         output = fresh_output(args.output)
         print(f"Acceptance evidence: {output}", flush=True)
         prerequisites(gates, building=args.build_receipt is None)
         receipt = args.build_receipt.resolve() if args.build_receipt else build(output, summary["commands"])
         summary["buildReceipt"] = str(receipt)
-        for gate in gates:
+        data = verify_build(receipt)
+        summary.update(gates=list(gates), binarySha256=data["sha256"], sourceSha=data["sourceSha"])
+        if args.collaboration_shard:
+            summary["collaborationShard"] = "%d/%d" % args.collaboration_shard
+        if args.merge:
+            summary["commands"] = merge(args.merge, receipt, data)
+            summary["gates"] = list(GATES)
+            summary["shards"] = [str(path) for path in args.merge]
+        def one(gate: str) -> list[dict]:
+            # Each gate keeps its own command list; they are joined in gate order.
+            records: list[dict] = []
             data = verify_build(receipt)
             try:
-                run_gate(gate, output, receipt, data, summary["commands"])
+                run_gate(gate, output, receipt, data, records, args.collaboration_shard)
             finally:
                 verify_build(receipt)
+            return records
+
+        # Every gate has a private display, HOME and D-Bus, so they can overlap.
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            futures = [pool.submit(one, gate) for gate in gates]
+            try:
+                for future in futures:
+                    summary["commands"] += future.result()
+            finally:
+                for future in futures:
+                    future.cancel()
         verify_build(receipt)
         summary["status"] = "PASSED"
         return 0
-    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError,
+            argparse.ArgumentTypeError, json.JSONDecodeError) as exc:
         summary["error"] = str(exc)
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
     finally:
         if output is not None:
             write_json(output / "acceptance.json", summary)
-
 
 if __name__ == "__main__":
     sys.exit(main())

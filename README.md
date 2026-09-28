@@ -64,7 +64,7 @@ xattr -cr /Applications/snip-sync.app
 | [docs/porting-notes.md](docs/porting-notes.md) | 從 TS 移植到 Rust 的陷阱與已知且接受的差異 |
 | [docs/native-workbench-supervision.md](docs/native-workbench-supervision.md) | 原生工作臺的交付狀態與已知限制 |
 
-各模組的說明：[core](crates/core/README.md) · [cli](crates/cli/README.md) · [desktop（Tauri，僅 CI 建置以便回退）](crates/desktop/README.md)。
+各模組的說明：[core](crates/core/README.md) · [cli](crates/cli/README.md)。
 
 ## 第三方授權
 

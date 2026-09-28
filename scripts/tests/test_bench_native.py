@@ -74,7 +74,7 @@ from bench_native_memory import (  # noqa: E402
     visible_in,
     write_preexec_launcher,
 )
-from bench_tauri_memory import BenchError, MATCHED_REF, MATCHED_SENTINEL, load_build_receipt  # noqa: E402
+from bench_native_memory import BenchError, MATCHED_REF, MATCHED_SENTINEL, load_build_receipt  # noqa: E402
 from memory_harness import measure_single_profile  # noqa: E402
 
 

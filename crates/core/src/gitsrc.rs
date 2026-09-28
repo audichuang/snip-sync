@@ -982,17 +982,10 @@ pub fn collect(git: &Git, source: &GitSource) -> Result<GitFiles, GitError> {
 	})
 }
 
-/// Changed paths for the desktop browser, including files whose content
-/// cannot be put on the clipboard (binary or unreadable).
-pub fn list_changed_paths(
-	git: &Git,
-	source: &GitSource,
-) -> Result<Vec<(String, Option<ChangeType>)>, GitError> {
-	list_changed_paths_with(git, source, &RunOptions::default())
-}
-
-/// [`list_changed_paths`] with cancellation, deadlines and strict metadata
-/// output limits propagated through every nested Git command.
+/// Changed paths for the browser, including files whose content cannot be
+/// put on the clipboard (binary or unreadable), with cancellation, deadlines
+/// and strict metadata output limits propagated through every nested Git
+/// command.
 pub fn list_changed_paths_with(
 	git: &Git,
 	source: &GitSource,
@@ -2027,7 +2020,9 @@ mod tests {
 		.unwrap();
 		assert_eq!(got, file("new.txt", "moved body\n", Moved));
 		// The listing agrees on the label.
-		let listed = list_changed_paths(&g, &rename).unwrap();
+		let listed =
+			list_changed_paths_with(&g, &rename, &RunOptions::default())
+				.unwrap();
 		assert_eq!(listed, [("new.txt".to_string(), Some(Moved))]);
 		// Staged content is the index entry, not the disk.
 		r.write("new.txt", b"staged\n");

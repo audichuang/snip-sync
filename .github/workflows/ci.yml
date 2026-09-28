@@ -2,7 +2,7 @@ name: CI
 
 # Strict by design: every job runs on every pull request and push (no path
 # filters, so nothing is "skipped" into a green run), warnings are errors in
-# Rust, rustdoc and the frontend, lockfiles are enforced, and each job fails
+# Rust and rustdoc, lockfiles are enforced, and each job fails
 # if it leaves the checkout dirty. `CI gate` is the single required check.
 
 on:
@@ -25,12 +25,9 @@ env:
     LANG: C.UTF-8
     LC_ALL: C.UTF-8
     TZ: UTC
-    # Pinned tool versions (keep BUN_VERSION in sync with release.yml)
-    BUN_VERSION: 1.3.14
+    # Pinned tool versions
     ACTIONLINT_VERSION: 1.7.12
     CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-    SCCACHE_GHA_ENABLED: "true"
-    RUSTC_WRAPPER: "sccache"
 
 jobs:
     actionlint:
@@ -58,18 +55,10 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: rustfmt
-            - name: Setup Bun
-              uses: oven-sh/setup-bun@v2
-              with:
-                  bun-version: ${{ env.BUN_VERSION }}
-            - name: Install desktop deps (frozen)
-              run: cd crates/desktop && bun install --frozen-lockfile
             - name: Rust format
               run: cargo fmt --all -- --check
-            - name: Frontend format
-              run: cd crates/desktop && bun run format:check
 
-    # clippy + rustdoc on all three OSes; audit and DTO drift once, on Linux.
+    # clippy + rustdoc on all three OSes; audit once, on Linux.
     lint-rust:
         name: Rust Lint (${{ matrix.os }})
         runs-on: ${{ matrix.os }}
@@ -87,29 +76,29 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-lint
                   cache-on-failure: true
-            - name: Install Linux system dependencies (GTK/webkit for Tauri, xkbcommon/fonts/Wayland/Vulkan for native)
+            - name: Install Linux system dependencies (X11/xkbcommon/fonts/Wayland/Vulkan for native)
               if: runner.os == 'Linux'
               run: |
                   sudo apt-get update
                   sudo apt-get install -y \
-                      libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
-                      libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
-                      libwayland-dev libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
-                      fonts-dejavu-core fonts-noto-cjk
+                      libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
+                      libfontconfig1-dev libfreetype6-dev \
+                      libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
+                      libwayland-dev fonts-dejavu-core fonts-noto-cjk
             - name: Clippy (all targets, warnings as errors, locked)
               run: cargo clippy --workspace --all-targets --locked -- -D warnings
             - name: Rustdoc (broken links and doc warnings are errors)
               run: cargo doc --workspace --no-deps --locked
-            # Blocks on vulnerabilities. The remaining informational warnings
-            # (unmaintained / unsound) all come from Tauri's gtk-rs stack on
-            # Linux and cannot be fixed here; they stay visible in the log.
+            # Blocks on vulnerabilities; informational warnings stay visible in the log.
             - name: Install cargo-audit
               if: runner.os == 'Linux'
               uses: taiki-e/install-action@v2
@@ -118,51 +107,8 @@ jobs:
             - name: Cargo audit (vulnerabilities fail the build)
               if: runner.os == 'Linux'
               run: cargo audit
-            # The TS types in crates/desktop/src/generated must match the Rust DTOs.
-            - name: Setup Bun
-              if: runner.os == 'Linux'
-              uses: oven-sh/setup-bun@v2
-              with:
-                  bun-version: ${{ env.BUN_VERSION }}
-            - name: Generated DTOs are up to date
-              if: runner.os == 'Linux'
-              run: |
-                  cd crates/desktop
-                  bun install --frozen-lockfile
-                  bun run generate:dto
-                  bun run format
-                  git diff --exit-code -- src/generated
-                  test -z "$(git status --porcelain -- src/generated)"
             - name: Checkout left clean
               shell: bash
-              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
-
-    # Frontend: types, lint, unit tests, production build.
-    lint-frontend:
-        name: Frontend Lint
-        runs-on: ubuntu-24.04
-        timeout-minutes: 15
-        steps:
-            - uses: actions/checkout@v6
-            - name: Setup Bun
-              uses: oven-sh/setup-bun@v2
-              with:
-                  bun-version: ${{ env.BUN_VERSION }}
-            - name: Setup Node (node:test runner)
-              uses: actions/setup-node@v4
-              with:
-                  node-version: 24
-            - name: Install desktop deps (frozen)
-              run: cd crates/desktop && bun install --frozen-lockfile
-            - name: Type check
-              run: cd crates/desktop && bun run typecheck
-            - name: Oxlint (warnings as errors)
-              run: cd crates/desktop && bun run lint:check -- --max-warnings 0
-            - name: Frontend unit tests
-              run: cd crates/desktop && bun run test
-            - name: Frontend build (Vite)
-              run: cd crates/desktop && bun run build
-            - name: Checkout left clean
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
     # Unit, integration, contract, CLI E2E and cross-tool tests on 3 OSes.
@@ -187,22 +133,24 @@ jobs:
                   git config --global core.longpaths true
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-test
                   cache-on-failure: true
-            - name: Install Linux system dependencies (GTK/webkit for Tauri, xvfb for clipboard, xkbcommon/fonts/Wayland/Vulkan for native)
+            - name: Install Linux system dependencies (xvfb for clipboard, X11/xkbcommon/fonts/Wayland/Vulkan for native)
               if: runner.os == 'Linux'
               run: |
                   sudo apt-get update
                   sudo apt-get install -y \
-                      libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb \
-                      libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
-                      libwayland-dev libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
-                      fonts-dejavu-core fonts-noto-cjk
+                      xvfb libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
+                      libfontconfig1-dev libfreetype6-dev \
+                      libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
+                      libwayland-dev fonts-dejavu-core fonts-noto-cjk
             # Tests commit into fixture repos, so git needs an identity.
             - name: Configure git identity
               run: |
@@ -229,18 +177,15 @@ jobs:
               if: runner.os == 'macOS'
               timeout-minutes: 5
               run: cargo test -p snip-core --locked --test git_runner fast_child_rapid_cleanup_releases_all_permits_without_leftover_error -- --exact
-            - name: Workspace tests (Linux, under xvfb, excluding native binary crate)
+            # One cargo invocation, so core, CLI and the native crate (its unit
+            # and in-process #[gpui::test]s) compile in parallel. The real-app
+            # drivers (snip-native-e2e) run in native-acceptance instead.
+            - name: Workspace tests (Linux, under xvfb for the clipboard)
               if: runner.os == 'Linux'
-              run: xvfb-run -a cargo test --workspace --exclude snip-desktop-native --locked --no-fail-fast
-            - name: Native binary unit tests (Linux)
-              if: runner.os == 'Linux'
-              run: cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
-            - name: Workspace tests (excluding native binary crate)
+              run: xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+            - name: Workspace tests
               if: runner.os != 'Linux'
-              run: cargo test --workspace --exclude snip-desktop-native --locked --no-fail-fast
-            - name: Native binary unit tests
-              if: runner.os != 'Linux'
-              run: cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
+              run: cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
             - name: Build native binary (debug)
               run: cargo build -p snip-desktop-native --locked
             - name: Native binary CLI smoke test
@@ -250,99 +195,6 @@ jobs:
                   [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
                   VERSION=$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)
                   python3 scripts/smoke_native.py --bin "$BIN" --expected-version "$VERSION"
-            - name: Checkout left clean
-              shell: bash
-              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
-
-    # Drives the real app (Rust backend + WebView) through tauri-driver and
-    # runs every scenario in crates/desktop/e2e/scenarios.mjs. Linux uses
-    # WebKitWebDriver, Windows msedgedriver; macOS WKWebView has no WebDriver
-    # (plan.md section 5).
-    desktop-e2e:
-        name: Desktop E2E (${{ matrix.os }})
-        env:
-            SNIP_REQUIRE_ALL_TESTS: "1"
-        runs-on: ${{ matrix.os }}
-        timeout-minutes: 60
-        strategy:
-            fail-fast: false
-            matrix:
-                # windows-2022, not windows-latest: on the windows-2025 image WebView2
-                # never opens its DevTools port for msedgedriver
-                # (actions/runner-images#14738).
-                os: [ubuntu-24.04, windows-2022]
-        steps:
-            - uses: actions/checkout@v6
-            - name: Install Rust toolchain
-              uses: dtolnay/rust-toolchain@stable
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
-            - name: Rust Cache
-              uses: Swatinem/rust-cache@v2
-              with:
-                  shared-key: ${{ runner.os }}-e2e
-                  cache-on-failure: true
-            - name: Install Linux system dependencies (Tauri, WebDriver, Xvfb)
-              if: runner.os == 'Linux'
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb webkit2gtk-driver
-            - name: Install tauri-driver
-              run: cargo install tauri-driver --locked
-            # msedgedriver must match the installed WebView2 runtime exactly.
-            - name: Install msedgedriver matching WebView2
-              if: runner.os == 'Windows'
-              shell: pwsh
-              run: |
-                  cargo install --git https://github.com/chippers/msedgedriver-tool
-                  # The tool downloads into the current directory; keep it out of the checkout.
-                  $dir = Join-Path $env:RUNNER_TEMP "msedgedriver"
-                  New-Item -ItemType Directory -Force -Path $dir | Out-Null
-                  Push-Location $dir
-                  & "$HOME/.cargo/bin/msedgedriver-tool.exe"
-                  Pop-Location
-                  $dir >> $env:GITHUB_PATH
-            # The replayed commits need a committer; runners have none.
-            - name: Configure git identity
-              run: |
-                  git config --global user.name "snip-ci"
-                  git config --global user.email "snip-ci@example.invalid"
-            - name: Setup Bun
-              uses: oven-sh/setup-bun@v2
-              with:
-                  bun-version: ${{ env.BUN_VERSION }}
-            - name: Setup Node
-              uses: actions/setup-node@v4
-              with:
-                  node-version: 24
-            - name: Install desktop deps (frozen)
-              run: cd crates/desktop && bun install --frozen-lockfile
-            - name: Build the app with the frontend embedded (warnings are errors)
-              env:
-                  RUSTFLAGS: "-D warnings"
-              run: cd crates/desktop && bun run tauri build --debug --no-bundle
-            - name: Real-app scenarios (Linux, under Xvfb)
-              if: runner.os == 'Linux'
-              env:
-                  SNIP_E2E_OUT: ${{ runner.temp }}/e2e-shots
-              run: |
-                  mkdir -p "$SNIP_E2E_OUT"
-                  cd crates/desktop && xvfb-run -a node e2e/scenarios.mjs
-            - name: Real-app scenarios
-              if: runner.os != 'Linux'
-              shell: bash
-              env:
-                  SNIP_E2E_OUT: ${{ runner.temp }}/e2e-shots
-              run: |
-                  mkdir -p "$SNIP_E2E_OUT"
-                  cd crates/desktop && node e2e/scenarios.mjs
-            - name: Upload screenshots and results
-              if: always()
-              uses: actions/upload-artifact@v4
-              with:
-                  name: desktop-e2e-${{ matrix.os }}
-                  path: ${{ runner.temp }}/e2e-shots
-                  if-no-files-found: error
             - name: Checkout left clean
               shell: bash
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
@@ -372,82 +224,14 @@ jobs:
               shell: bash
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
-    # Native real OS input E2E test on Linux X11 (headless with Xvfb and xdotool).
-    # Tests crates/desktop-native/tests/smoke.rs and tests/lifecycle.rs with real
-    # input events, screenshots, and software graphics fallback (Mesa/Gallium
-    # llvmpipe). Runs in isolation to avoid display or system clipboard
-    # contention with other test suites.
-    native-smoke:
-        name: Native Smoke (Linux)
-        runs-on: ubuntu-24.04
-        timeout-minutes: 30
-        env:
-            RUSTFLAGS: "-D warnings"
-            SNIP_REQUIRE_ALL_TESTS: "1"
-            LIBGL_ALWAYS_SOFTWARE: "1"
-            GALLIUM_DRIVER: llvmpipe
-        steps:
-            - uses: actions/checkout@v6
-            - name: Install Rust toolchain
-              uses: dtolnay/rust-toolchain@stable
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
-            - name: Rust Cache
-              uses: Swatinem/rust-cache@v2
-              with:
-                  shared-key: ${{ runner.os }}-native-smoke
-                  cache-on-failure: true
-            - name: Install Linux system dependencies (X11, Xvfb, xdotool, xclip, x11-apps, imagemagick, xkbcommon, fonts, software GL/Vulkan, Wayland)
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y \
-                      libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
-                      xvfb xdotool xclip x11-apps imagemagick \
-                      fonts-dejavu-core fonts-noto-cjk \
-                      libfontconfig1-dev libfreetype6-dev \
-                      libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
-                      libwayland-dev
-            - name: Configure git identity
-              run: |
-                  git config --global user.name "snip-ci"
-                  git config --global user.email "snip-ci@example.invalid"
-            - name: Run native OS input smoke test (Linux X11 under Xvfb with lavapipe)
-              shell: bash
-              env:
-                  SNIP_E2E_OUT: ${{ runner.temp }}/native-e2e-artifacts
-              run: |
-                  mkdir -p "$SNIP_E2E_OUT"
-                  rm -f "$SNIP_E2E_OUT/graph.png" "$SNIP_E2E_OUT/file_tree.png" "$SNIP_E2E_OUT/paste_preview.png" "$SNIP_E2E_OUT/light_theme.png"
-                  set -o pipefail
-                  ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$SNIP_E2E_OUT/smoke.log"
-                  test -s "$SNIP_E2E_OUT/smoke.log" || { echo "Missing or empty smoke.log" >&2; exit 1; }
-                  python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png', 'light_theme.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "$SNIP_E2E_OUT"
-            - name: Run native lifecycle tests (close/reopen/quit drain, copy and paste cancel)
-              shell: bash
-              env:
-                  SNIP_E2E_OUT: ${{ runner.temp }}/native-e2e-artifacts
-              run: |
-                  mkdir -p "$SNIP_E2E_OUT"
-                  set -o pipefail
-                  ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test lifecycle --locked -- --nocapture 2>&1 | tee "$SNIP_E2E_OUT/lifecycle.log"
-                  test -s "$SNIP_E2E_OUT/lifecycle.log" || { echo "Missing or empty lifecycle.log" >&2; exit 1; }
-            - name: Upload native smoke screenshots and logs
-              if: always()
-              uses: actions/upload-artifact@v4
-              with:
-                  name: native-smoke-linux
-                  path: ${{ runner.temp }}/native-e2e-artifacts
-                  if-no-files-found: error
-            - name: Checkout left clean
-              shell: bash
-              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
-
     # Independent release-profile real-app gates. Each driver owns private
     # Xvfb, HOME and D-Bus; no shared DISPLAY or guessed historical binary.
-    native-acceptance:
-        name: Native Acceptance (Linux)
+    # Build once; the gates below run in parallel against this exact binary
+    # (run_native_acceptance.py re-verifies the checkout and sha256 in each).
+    native-acceptance-build:
+        name: Native Acceptance Build (Linux)
         runs-on: ubuntu-24.04
-        timeout-minutes: 120
+        timeout-minutes: 60
         env:
             RUSTFLAGS: "-D warnings"
             SNIP_REQUIRE_ALL_TESTS: "1"
@@ -456,31 +240,169 @@ jobs:
             - uses: actions/checkout@v6
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-native-acceptance-release
                   cache-on-failure: true
-            - name: Install native build and isolated acceptance dependencies
+            - name: Install native build dependencies
               run: |
                   sudo apt-get update
                   sudo apt-get install -y \
                       build-essential libxcb1-dev libx11-dev \
                       libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
-                      libwayland-dev libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
+                      libwayland-dev
+            - name: Build the release executable and its receipt
+              run: '"$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate build --output "$RUNNER_TEMP/native-acceptance"'
+            - name: Upload the accepted build
+              uses: actions/upload-artifact@v4
+              with:
+                  name: native-acceptance-build
+                  path: ${{ runner.temp }}/native-acceptance
+                  if-no-files-found: error
+                  overwrite: true
+            - name: Checkout left clean
+              if: always()
+              shell: bash
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
+
+    # The gates, sharded so the slowest (18 collaboration cases, ~10 min in
+    # one job) is split in two and smoke/lifecycle run on the release build. The build is restored at its original
+    # absolute path, which the receipt records.
+    native-acceptance-shard:
+        name: Native Acceptance (${{ matrix.name }})
+        needs: native-acceptance-build
+        runs-on: ubuntu-24.04
+        timeout-minutes: 60
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: ime-resources
+                      gate: ime,resource-short
+                      shard: ""
+                    - name: collaboration-1
+                      gate: collaboration
+                      shard: 1/2
+                    - name: collaboration-2
+                      gate: collaboration
+                      shard: 2/2
+                    # crates/native-e2e: real OS input, screenshots, close/reopen/quit
+                    # drain and copy/paste cancel, driving the accepted binary.
+                    - name: smoke
+                      gate: smoke
+                      shard: ""
+                      drivers: true
+                    - name: lifecycle
+                      gate: lifecycle
+                      shard: ""
+                      drivers: true
+        env:
+            SNIP_REQUIRE_ALL_TESTS: "1"
+            SNIP_NATIVE_PYTHON: /usr/bin/python3
+            # lavapipe renders on the CPU; shared runners miss fixed deadlines.
+            SNIP_E2E_TIMEOUT_SCALE: "2"
+        steps:
+            - uses: actions/checkout@v6
+            # Only the Rust drivers compile anything (snip-core and the tests,
+            # debug); the app itself comes from native-acceptance-build.
+            - name: Install Rust toolchain
+              if: matrix.drivers
+              uses: dtolnay/rust-toolchain@stable
+            - name: Rust Cache
+              if: matrix.drivers
+              uses: Swatinem/rust-cache@v2
+              with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
+                  shared-key: ${{ runner.os }}-native-e2e
+                  cache-on-failure: true
+            - name: Install isolated acceptance dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                      build-essential libx11-dev libxcb1-dev libxkbcommon-x11-0 libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
                       xvfb xdotool xclip x11-apps x11-utils imagemagick dbus-x11 \
                       fcitx5 fcitx5-pinyin python3-pil fonts-dejavu-core fonts-noto-cjk
             - name: Configure git identity
               run: |
                   git config --global user.name "snip-ci"
                   git config --global user.email "snip-ci@example.invalid"
-            - name: Build once and run IME, all collaboration cases, and functional short resource gate
+            - name: Restore the accepted build
+              uses: actions/download-artifact@v4
+              with:
+                  name: native-acceptance-build
+                  path: ${{ runner.temp }}/native-acceptance
+            - name: Run ${{ matrix.gate }} ${{ matrix.shard }}
+              shell: bash
               env:
-                  ACCEPTANCE_OUT: ${{ runner.temp }}/native-acceptance
+                  GATE: ${{ matrix.gate }}
+                  SHARD: ${{ matrix.shard }}
+                  OUT: ${{ runner.temp }}/native-acceptance-${{ matrix.name }}
               run: |
-                  "$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate all --output "$ACCEPTANCE_OUT"
+                  set -euo pipefail
+                  # upload-artifact drops the exec bit; the sha256 is unchanged.
+                  chmod +x "$RUNNER_TEMP/native-acceptance/snip-desktop-native"
+                  "$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate "$GATE" \
+                      ${SHARD:+--collaboration-shard "$SHARD"} \
+                      --build-receipt "$RUNNER_TEMP/native-acceptance/build-receipt.json" --output "$OUT"
+            - name: Upload shard receipts, driver results and logs
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: native-acceptance-linux-${{ matrix.name }}
+                  path: ${{ runner.temp }}/native-acceptance-${{ matrix.name }}
+                  if-no-files-found: error
+                  overwrite: true
+            - name: Checkout left clean
+              if: always()
+              shell: bash
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
+
+    # Folds the shards into the single gate-all receipt release.yml checks
+    # (refusing any missing gate or collaboration step), then packages the
+    # accepted executable itself.
+    native-acceptance:
+        name: Native Acceptance (Linux)
+        needs: [native-acceptance-build, native-acceptance-shard]
+        runs-on: ubuntu-24.04
+        timeout-minutes: 30
+        env:
+            SNIP_REQUIRE_ALL_TESTS: "1"
+            SNIP_NATIVE_PYTHON: /usr/bin/python3
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install runtime libraries for the packaged smoke
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libxkbcommon-x11-0 libxcb1 libfontconfig1 libfreetype6
+            - name: Restore the accepted build
+              uses: actions/download-artifact@v4
+              with:
+                  name: native-acceptance-build
+                  path: ${{ runner.temp }}/native-acceptance
+            - name: Restore the shard results
+              uses: actions/download-artifact@v4
+              with:
+                  pattern: native-acceptance-linux-*
+                  path: ${{ runner.temp }}/shards
+            - name: Merge shard receipts into the gate-all receipt
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  chmod +x "$RUNNER_TEMP/native-acceptance/snip-desktop-native"
+                  "$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate merge \
+                      --build-receipt "$RUNNER_TEMP/native-acceptance/build-receipt.json" \
+                      --output "$RUNNER_TEMP/native-acceptance-merged" \
+                      --merge "$RUNNER_TEMP"/shards/native-acceptance-linux-*
+                  # release.yml reads both receipts from one artifact root.
+                  cp "$RUNNER_TEMP/native-acceptance/build-receipt.json" "$RUNNER_TEMP/native-acceptance-merged/"
             # The Linux release asset is packaged from the executable the gates
             # above ran (build-receipt.json), never from a second build: the
             # delivery spec requires published binaries to be the accepted ones
@@ -488,7 +410,7 @@ jobs:
             - name: Package, verify and smoke the accepted Linux executable
               shell: bash
               env:
-                  ACCEPTANCE_OUT: ${{ runner.temp }}/native-acceptance
+                  ACCEPTANCE_OUT: ${{ runner.temp }}/native-acceptance-merged
                   PKG_OUT: ${{ runner.temp }}/native-candidate-x86_64-unknown-linux-gnu
               run: |
                   set -euo pipefail
@@ -504,12 +426,12 @@ jobs:
                   tar -xzf "$PKG_OUT/snip-sync-linux-x86_64.tar.gz" -C "$SMOKE"
                   python3 scripts/smoke_native.py --bin "$SMOKE/snip-sync-$VERSION/bin/snip-desktop-native" --expected-version "$VERSION"
                   echo "accepted binary sha256 $WANT packaged for $VERSION"
-            - name: Upload acceptance receipts, driver results and logs
+            - name: Upload the merged receipt
               if: always()
               uses: actions/upload-artifact@v4
               with:
                   name: native-acceptance-linux
-                  path: ${{ runner.temp }}/native-acceptance
+                  path: ${{ runner.temp }}/native-acceptance-merged
                   if-no-files-found: error
                   overwrite: true
             - name: Upload Linux release package (the accepted binary)
@@ -520,14 +442,14 @@ jobs:
                   if-no-files-found: error
                   overwrite: true
             # Just the two receipts release.yml checks, so a release does not
-            # download the whole evidence bundle above.
+            # download the whole evidence bundle.
             - name: Upload acceptance receipts for release
               uses: actions/upload-artifact@v4
               with:
                   name: native-acceptance-receipt
                   path: |
-                      ${{ runner.temp }}/native-acceptance/acceptance.json
-                      ${{ runner.temp }}/native-acceptance/build-receipt.json
+                      ${{ runner.temp }}/native-acceptance-merged/acceptance.json
+                      ${{ runner.temp }}/native-acceptance-merged/build-receipt.json
                   if-no-files-found: error
                   overwrite: true
             - name: Checkout left clean
@@ -537,21 +459,21 @@ jobs:
 
     # Native desktop packaging for macOS arm/intel and Windows x64. The files
     # uploaded here are the release assets: release.yml downloads them from
-    # the green push-to-main run of the tagged SHA and publishes them byte for
+    # the green push run (main, or develop for a pre-release) of the tagged SHA and publishes them byte for
     # byte after checking SHA256SUMS. So every check below runs on the final
     # (signed, packaged) binary: the smoke test executes the copy inside the
     # published .dmg / the exe the installer actually installs. Linux is
     # packaged by native-acceptance from its gated executable instead.
-    # The Intel leg is macos-26-intel and must execute its binary. These jobs
-    # do not drive the GPUI UI, so macOS and Windows GUI input stays unverified.
+    # The Intel leg is macos-26-intel and must execute its binary. The arm64 and
+    # Windows jobs open the real window on a one-repo workspace (smoke_native.py --launch)
+    # but send no input: macOS and Windows GUI input stays unverified here;
+    # UI logic is covered on all three OSes by the in-process #[gpui::test]s.
     native-candidate-artifacts:
         name: Native Package (${{ matrix.target }})
         runs-on: ${{ matrix.os }}
         timeout-minutes: 45
         env:
             RUSTFLAGS: "-D warnings"
-            SCCACHE_GHA_ENABLED: "true"
-            RUSTC_WRAPPER: "sccache"
             MACOSX_DEPLOYMENT_TARGET: "11.0"
             PKG_OUT: target/native-candidate-${{ matrix.target }}
         strategy:
@@ -583,11 +505,13 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   targets: ${{ matrix.target }}
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-candidate-${{ matrix.target }}
                   cache-on-failure: true
             - name: Setup Python
@@ -638,7 +562,11 @@ jobs:
                   DMG_SHA=$(shasum -a 256 "$BIN" | cut -d ' ' -f 1)
                   TAR_SHA=$(tar -xOzf "$PKG_OUT/snip-sync_$LABEL.app.tar.gz" snip-sync.app/Contents/MacOS/snip-desktop-native | shasum -a 256 | cut -d ' ' -f 1)
                   [ "$DMG_SHA" = "$TAR_SHA" ] || { echo "dmg binary $DMG_SHA != tarball binary $TAR_SHA" >&2; exit 1; }
-                  python3 scripts/smoke_native.py --bin "$BIN" --expected-version "$VERSION"
+                  # The hosted Intel VM has no Metal device, so GPUI never opens a
+                  # window there; the arm64 leg carries the launch check.
+                  LAUNCH=--launch
+                  [ "$WANT_ARCH" = x86_64 ] && LAUNCH=
+                  python3 scripts/smoke_native.py --bin "$BIN" --expected-version "$VERSION" $LAUNCH
                   echo "accepted binary sha256 $DMG_SHA"
             # Install with the published installer, require the installed exe
             # to be byte-identical to the built and zipped one, then smoke it.
@@ -666,7 +594,7 @@ jobs:
                   $installedLic = (Get-ChildItem (Join-Path $dir 'licenses') -File | ForEach-Object Name | Sort-Object) -join ','
                   $zipLic = (Get-ChildItem (Join-Path $zipDir 'snip-sync\licenses') -File | ForEach-Object Name | Sort-Object) -join ','
                   if (-not $installedLic -or $installedLic -ne $zipLic) { throw "installed licenses '$installedLic' != zipped '$zipLic'" }
-                  python scripts/smoke_native.py --bin $installed --expected-version $version
+                  python scripts/smoke_native.py --bin $installed --expected-version $version --launch
                   if ($LASTEXITCODE -ne 0) { throw "smoke failed" }
                   Write-Output "accepted binary sha256 $($hashes[0])"
             - name: Upload release package artifacts
@@ -685,7 +613,7 @@ jobs:
     gate:
         name: CI gate
         if: always()
-        needs: [actionlint, format, lint-rust, lint-frontend, test, desktop-e2e, harness, native-smoke, native-acceptance, native-candidate-artifacts]
+        needs: [actionlint, format, lint-rust, test, harness, native-acceptance, native-candidate-artifacts]
         runs-on: ubuntu-24.04
         timeout-minutes: 5
         steps:

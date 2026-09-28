@@ -1,5 +1,7 @@
 # Native Workbench Performance Harness (bench_native_memory.py)
 
+> Note: the Tauri app (`crates/desktop`) and its drivers (`bench_tauri_memory.py`, `measure_tauri.sh`, the Tauri E2E) have been removed from the repo. Passages below that build, test or measure them are historical; use git history to roll back.
+
 **Status**: Verified Test Driver Specification  
 **Date**: 2026-09-27 (optional matched diff profile passed native/Tauri functional pilots; no D4 claim)
 **Protocol Reference**: [`docs/memory-measurement-protocol.md`](memory-measurement-protocol.md)  
@@ -13,7 +15,7 @@
 1. `scripts/memory_harness.py` for exact process-tree memory sampling (RSS, PSS via `/proc/<pid>/smaps_rollup`, VmHWM).
 2. Pre-exec launcher (`--sampler-ready-file`): inside `dbus-run-session` the launcher records `(pid, starttime)` and waits. The sampler publishes the gate only after handlers are installed and `/proc/<pid>/exe` is readable. The launcher then `os.execv`s the target. Launch samples exist only after that exe transition is observed. This is discrete ~50 ms sampling, not the first dynamic-linker instruction.
 3. Strict process boundary: External wrappers (`Xvfb`, `dbus-run-session`, `dbus-daemon`) are excluded from application process-tree RAM accounting. Samples taken while the launcher image is still running are `launcher-setup` and are excluded from target peaks.
-4. `scripts/bench_tauri_memory.py` for shared process identity, session isolation, reap/teardown mechanics, and metric summaries. That driver still attaches late and says so.
+4. The shared-helpers section of `scripts/bench_native_memory.py` for process identity, session isolation, reap/teardown mechanics, and metric summaries (moved there from the removed `bench_tauri_memory.py`).
 5. Private headless display management via Xvfb (`-displayfd`), Mesa lavapipe software Vulkan rasterization (`VK_DRIVER_FILES`), and isolated D-Bus sessions (`dbus-run-session`).
 6. Real OS-level user input injection via XTEST (`xdotool key`, `xdotool mousemove`, `xdotool click`) without mock handlers.
 7. Independent Git and filesystem oracles against standard benchmark workloads.
@@ -119,17 +121,9 @@ rtk proxy env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
   --workspace /tmp/snip-workload-standard-20260925 \
   --profile 1repo-diff --runs 1 --steady-seconds 30 --sample-interval 0.05 \
   --out-dir /tmp/native-matched-pilot-NEW
-
-rtk proxy env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
-  -u DISPLAY -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
-  python3 scripts/bench_tauri_memory.py \
-  --bin /path/to/frozen/snip-sync --build-profile release \
-  --workspace /tmp/snip-workload-standard-20260925 \
-  --profile 1repo-diff --runs 1 --steady-seconds 30 --sample-interval 0.05 \
-  --out-dir /tmp/tauri-matched-pilot-NEW
 ```
 
-The adjacent `.receipt.json` is discovered automatically; pass `--build-receipt` if it is elsewhere. The 2026-09-27 functional pair passed with native binary `b11e6724` and Tauri `a4664824`, English UIs, 600 steady samples each and clean teardown. Evidence and source snapshots are listed in `/tmp/snip-session4-matched-performance-report.md`. Earlier native picker/OCR failures and a Chinese-locale functional run remain separate artifacts. Formal ten-run measurements are pending stable final binaries and coordinator approval; a functional pilot does not pass D4. `--compare-baseline` remains unsupported; the coordinator compares concrete matched artifacts.
+The adjacent `.receipt.json` is discovered automatically; pass `--build-receipt` if it is elsewhere. The 2026-09-27 functional pair (before the Tauri app was removed) passed with native binary `b11e6724` and Tauri `a4664824`, English UIs, 600 steady samples each and clean teardown. Evidence and source snapshots are listed in `/tmp/snip-session4-matched-performance-report.md`. Earlier native picker/OCR failures and a Chinese-locale functional run remain separate artifacts. Formal ten-run measurements are pending stable final binaries and coordinator approval; a functional pilot does not pass D4. `--compare-baseline` remains unsupported; the coordinator compares concrete matched artifacts.
 
 ### Standard-dataset discovery
 On the first D3 checkpoint, startup calls discovery for one page of 10,000 directory visits and depth 8, and that page walks into the working tree before it records `.git`. Against `/tmp/snip-workload-standard-20260925` and against `repo-01-core` alone, the only readiness line is `[APP:READY_REPOS: 0]`; it does not update if the process is left running. The driver fails that run. It does not point the app at a smaller tree, and it does not treat 0 as the 15-repo workload. Repo switches, the explicit copy, and the 100-switch soak therefore do not start.
@@ -141,7 +135,7 @@ Pointer motion is `xdotool mousemove` without `--sync`. `--sync` waits for a mot
 If session startup fails after Xvfb is running (no display number, or the launcher `Popen` raises), the constructor reaps that Xvfb, its log, and the private directory before the exception leaves `NativeSession`. `stop` is safe to call again. The app-log reader is joined before its stdout and `app.log` are closed. A reader that does not finish is reported; cleanup does not claim success with an empty problem list.
 
 ### Historical UI probes
-The Python unit suite does not launch a historic debug binary and does not duplicate the product UI case. Same-path index `INDEX_A` versus worktree `WORK_B` through the native controls lives in `crates/desktop-native/tests/smoke.rs` (the block that writes `both.txt`, clicks `change-chk:staged:both.txt` / `change-chk:unstaged:both.txt`, and checks the clipboard). Driver unit tests keep the git byte oracle and the ClipCode extractor.
+The Python unit suite does not launch a historic debug binary and does not duplicate the product UI case. Same-path index `INDEX_A` versus worktree `WORK_B` through the native controls lives in `crates/native-e2e/tests/smoke.rs` (the block that writes `both.txt`, clicks `change-chk:staged:both.txt` / `change-chk:unstaged:both.txt`, and checks the clipboard). Driver unit tests keep the git byte oracle and the ClipCode extractor.
 
 A one-off probe against the immutable first-D3 binary is evidence under `/tmp`, not a CI test. Binary SHA-256 `a923e8332ef81a895ce3175462cc34a96595993d6ca47251500d9b97772ef2fb` at `/tmp/snip-d3-immutable-a923e833-20260926/snip-desktop-native-0.1.4/bin/snip-desktop-native` (the 2026-09-26 package member; the shared unpack path was later overwritten). Command:
 

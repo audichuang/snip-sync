@@ -77,16 +77,14 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   - 明確的 `finish` / `CatFile::close` 會回報清理失敗;`Drop` 無法回傳錯誤,會再試一次,仍失敗就保留名額。
   - 同一個 thread 在持有 git 名額時(例如開著 `cat-file --batch`)再啟動 git 會直接失敗(`NestedProcess`),避免兩個這樣的 thread 把名額卡死。
   - 修改 index / ref 的重操作(`commits::replay`)在同一個 worktree(以 git dir 區分)一次只跑一個,最多 4 個等待者(`workspace::lock_heavy`)。
-- `browser::directory` 最多讀 10,002 個項目,超過就回報錯誤,不回傳部分清單;非 UTF-8 的檔名沒有能指到它的字串路徑,所以不列出
-  (不會把它有損轉成另一個檔案的路徑)。可續讀、保留 OS 原始檔名的分頁是 `workspace::DirectoryScan`:每次呼叫的工作量有上限,
+- 可續讀、保留 OS 原始檔名的目錄分頁是 `workspace::DirectoryScan`:每次呼叫的工作量有上限,
   頁內依「目錄優先、名稱位元組」排序、跨頁是 OS 列舉順序;目錄在掃描中變動(時間戳只精確到檔案系統的解析度)就回報 `Changed`。
 - repo 探索(`workspace::Discovery`)只保留每層一個開著的目錄(最多 `max_depth + 1`,上限 32 層),不累積待走路徑;
   超過深度或無法讀取的目錄會逐頁列出,走完時狀態是 `Incomplete` 而非 `Complete`;repo 數到上限時 `LimitReached`,可 `raise_repo_limit` 後續走。
   沒有 checkout 的 submodule 沒有 `.git`,探索看不到,要用 `declared_submodules` 從 `.gitmodules` 列出。
-- 桌面預覽(`browser::git_preview`)的內容與 patch 都是嚴格的:超過 1 MiB 就報錯,因為現有 UI 無法表達「已截斷」。
-  可截斷的版本是 `git_preview_with` + `RunOptions::preview`:只保留完整的 hunk,每個 hunk header 的行數與內容一致;新檔案合成的 patch 同樣只保留完整的行。
+- Git 預覽是 `browser::git_preview_with`:內容永遠嚴格,patch 依 `opts.overflow`;搭配 `RunOptions::preview` 時可截斷,只保留完整的 hunk,每個 hunk header 的行數與內容一致;新檔案合成的 patch 同樣只保留完整的行。
   `list_changed_paths_with`／`read_changed_file_with` 把取消、逾時與 stdout 上限傳到內層 metadata、revision 與 cat-file；metadata 和完整檔案內容即使選用 Truncate 也拒絕殘缺結果。
-  明確 options API 保留 `Cancelled`／`Timeout`／`OutputLimit` 類別；舊 `git_preview` wrapper 保留原本的大檔提示。
+  明確 options API 保留 `Cancelled`／`Timeout`／`OutputLimit` 類別。原生 App 以 `max_stdout: PREVIEW_LIMIT` + `Overflow::Error` 呼叫，patch 超限就拒絕而非截斷，因為它不讀 `patch_truncated`。
   cat-file 的非零退出以 `Failed` 回報真實 exit code 與最多 64 KiB stderr；正常退出但 protocol 不完整仍為 I/O 錯誤，EOF 但程序未退出仍受逾時／取消限制。清理失敗優先回報，不能偽裝為取消成功。
 - 原生候選工作台額外限制已接納的 reader／paste plan／選取項目 detail 合計 32 MiB（含 buffer capacity、獨立 restore 副本和 metadata）。原始 clipboard 超限在解析前拒絕；解析放大超限拒絕整筆，不截斷 payload。新貼上或 remap 被拒絕會撤銷舊的可寫 plan；只切換唯讀 detail 被拒絕則保留原本 plan 與 detail，已確認的 Apply 不可取消。
   此限制只涵蓋已接納 UI 資料；待執行 worker 的 input／result／clone 尚待加入同一預算。OS clipboard 配置、暫時解析與 renderer／allocator 不在此計價範圍，不能據此宣稱全域 64 MiB 或 RSS 達標。CLI、Tauri、clipboard wire 與 contract fixture 不變。

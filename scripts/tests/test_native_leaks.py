@@ -36,7 +36,7 @@ from check_native_leaks import (  # noqa: E402
     planned_repo_sequence,
     source_sha_fact,
 )
-from bench_tauri_memory import sha256_file  # noqa: E402
+from bench_native_memory import sha256_file  # noqa: E402
 import memory_harness  # noqa: E402
 import check_native_leaks as gate  # noqa: E402
 from memory_harness import ProcessTreeSampler, read_process_identity, sample_app_resources  # noqa: E402

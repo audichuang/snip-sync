@@ -10,7 +10,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::fsutil::{must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, RunOptions};
@@ -63,7 +62,7 @@ pub struct CommitExport {
 	pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FileChange {
 	Added,
@@ -74,7 +73,7 @@ pub enum FileChange {
 }
 
 /// Why a file is listed without content. Replay neither writes nor deletes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NotCopiedReason {
 	Binary,
@@ -86,7 +85,7 @@ pub enum NotCopiedReason {
 	Unreadable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitFile {
 	pub path: String,
@@ -97,7 +96,7 @@ pub struct CommitFile {
 	pub not_copied: Option<NotCopiedReason>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitRecord {
 	/// Raw message (`%B`), replayed verbatim.
@@ -109,7 +108,7 @@ pub struct CommitRecord {
 	pub files: Vec<CommitFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitsPayload {
 	/// Oldest first, the order they are replayed in.
@@ -1042,7 +1041,7 @@ pub fn parse_commit_payload(text: &str) -> Result<CommitsPayload, CommitError> {
 }
 
 /// Copy notification numbers (spec 4.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitCopySummary {
 	pub commit_count: usize,
@@ -1062,7 +1061,7 @@ pub fn copy_summary(payload: &CommitsPayload, text: &str) -> CommitCopySummary {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReplayAction {
 	/// Write the content (a rename also deletes `old_path` first).
@@ -1071,7 +1070,7 @@ pub enum ReplayAction {
 	Skip,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReplaySkipReason {
 	/// See the file's `not_copied`.
@@ -1082,7 +1081,7 @@ pub enum ReplaySkipReason {
 	NonUtf8Target,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilePlan {
 	pub path: String,
@@ -1097,7 +1096,7 @@ pub struct FilePlan {
 	pub old_absolute_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitPlan {
 	pub message: String,
@@ -1108,7 +1107,7 @@ pub struct CommitPlan {
 	pub files: Vec<FilePlan>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitReplayPlan {
 	pub root: PathBuf,
@@ -1359,7 +1358,7 @@ pub fn plan_commit_replay_with(
 	Ok(CommitReplayPlan { commits, root })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplayFailure {
 	/// Index into the payload's commits.
@@ -1368,7 +1367,7 @@ pub struct ReplayFailure {
 	pub error: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplayResult {
 	/// New commit OIDs, in replay order. Never rolled back.

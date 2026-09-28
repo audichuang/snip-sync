@@ -511,6 +511,35 @@ pub struct PasteApplyResult {
 	pub created_commits: Vec<String>,
 }
 
+impl PasteApplyResult {
+	/// The result card after an apply. Per-file failures are listed, not
+	/// just counted: the writes before them are kept, so the user must see
+	/// which paths did not land.
+	pub fn status(&self) -> Msg {
+		if !self.created_commits.is_empty() {
+			return Msg::new(
+				"commit_replay_done",
+				[self.created_commits.join(", ")],
+			);
+		}
+		let f = &self.files;
+		let counts = [
+			f.created_count,
+			f.overwritten_count,
+			f.skipped_existing_count,
+			f.deleted_count,
+			f.errors.len(),
+		]
+		.map(|n| n.to_string());
+		if f.errors.is_empty() {
+			return Msg::new("status_paste_done", counts);
+		}
+		let mut args = counts.to_vec();
+		args.push(f.errors.join("; "));
+		Msg::new("status_paste_partial", args)
+	}
+}
+
 #[derive(Debug, Clone)]
 pub struct PastePreviewPlan {
 	pub destination: PathBuf,
@@ -1395,6 +1424,39 @@ impl PastePreviewPlan {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn apply_status_lists_each_failed_path_not_only_the_count() {
+		let result = |errors: Vec<String>| PasteApplyResult {
+			files: RestoreExecutionResult {
+				created_count: 2,
+				overwritten_count: 1,
+				skipped_existing_count: 0,
+				deleted_count: 0,
+				errors,
+			},
+			created_commits: Vec::new(),
+		};
+		let ok = result(Vec::new()).status();
+		assert_eq!(ok.key, "status_paste_done");
+
+		let partial = result(vec![
+			"a/x.txt: Permission denied".into(),
+			"b/y.txt: unsafe path".into(),
+		])
+		.status();
+		assert_eq!(partial.key, "status_paste_partial");
+		for loc in [crate::i18n::Locale::ZhTw, crate::i18n::Locale::En] {
+			let text = partial.render(loc);
+			assert!(
+				text.contains(
+					"a/x.txt: Permission denied; b/y.txt: unsafe path"
+				),
+				"{text}"
+			);
+			assert!(!text.contains("{}"), "{text}");
+		}
+	}
 
 	#[test]
 	fn change_tree_groups_by_root_and_directory_in_display_order() {

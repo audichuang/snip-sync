@@ -1,10 +1,14 @@
 # 原生 CI／harness 整合收據
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 ## Current Linux acceptance entrypoints (2026-09-27)
 
 `just preflight` now also requires `just native-acceptance`. The required Linux
-CI job `Native Acceptance (Linux)` runs the same Python entrypoint; the existing
-Rust/frontend/Tauri, native smoke/lifecycle and audit/DTO jobs remain in place.
+CI job `Native Acceptance (Linux)` runs the same Python entrypoint (since 0.3.2
+as one build, parallel shards and a merge); the Rust, native smoke/lifecycle and
+audit jobs remain in place. The frontend/Tauri and DTO jobs were removed with the
+Tauri app in 0.3.2.
 A wiring change is not a recorded CI or product pass: current run evidence must
 come from the generated reports.
 
@@ -164,11 +168,11 @@ CI 與 justfile 仍呼叫前三支腳本。沒有 placeholder，也沒有把缺�
 
 CI 以來源 workflow 為底，併入主線工作樹已有的 macOS fast gate。來源沒有這個 step。
 
-保留的主線門檻：Rust fmt、clippy、rustdoc、`cargo audit`、DTO drift、clean checkout、frontend、三平台 test，以及 desktop E2E（Linux 與 `windows-2022`，腳本仍是 `crates/desktop/e2e/scenarios.mjs`）。`CI gate` 的 `needs` 是 `actionlint`、`format`、`lint-rust`、`lint-frontend`、`test`、`desktop-e2e`、`harness`、`native-smoke`、`native-candidate-artifacts`。
+保留的主線門檻：Rust fmt、clippy、rustdoc、`cargo audit`、clean checkout、三平台 test。Tauri 桌面版移除後，DTO drift、frontend 與 desktop E2E 一併拿掉。`CI gate` 的 `needs` 是 `actionlint`、`format`、`lint-rust`、`test`、`harness`、`native-smoke`、`native-acceptance`、`native-candidate-artifacts`；`native-acceptance` 先 build 一次，平行跑 IME／資源與兩半協作 shard，再合併成單一收據。
 
 Linux job 沿用來源的 `ubuntu-24.04`。2026-09-26 的 GitHub 文件 [Choosing the runner for a job](https://docs.github.com/en/actions/using-jobs/choosing-the-runner-for-a-job) 把 `ubuntu-latest` 與 `ubuntu-24.04` 都連到同一份 Ubuntu 24.04 image readme。釘選對應 `docs/native-build-prerequisites.md` 的 noble 套件名（`libegl1`、`libegl-mesa0`）。
 
-`test` job 依來源把 `snip-desktop-native` 從 workspace test 拆出。其餘 crate 仍是 `cargo test --workspace --locked`。原生 crate 在三平台只跑 `--bin snip-desktop-native`。Linux integration test 只在 `native-smoke`：`SNIP_REQUIRE_ALL_TESTS=1`，經 `scripts/headless-x11.sh` 提供 X11 `DISPLAY` 與 lavapipe，再跑 `cargo test -p snip-desktop-native --test smoke`。`crates/desktop-native/tests/smoke.rs` 在沒有 `DISPLAY` 或 `xdotool` 時，若 `SNIP_REQUIRE_ALL_TESTS` 有設會 assert。這次沒有改產品或 native 測試碼，也沒有在這台機器執行 `native-smoke`。
+`test` job 把 `snip-desktop-native` 與 `snip-native-e2e` 從 workspace test 拆出；原生 crate 在三平台跑 `--bin snip-desktop-native`（含免顯示器的 `#[gpui::test]`）。0.3.2 起真實輸入的 `crates/native-e2e/tests/smoke.rs`、`lifecycle.rs` 不再有獨立的 `native-smoke` job，而是 `native-acceptance` 的兩個 shard：以 `SNIP_NATIVE_BIN` 驅動驗收過的 release 執行檔，經 `scripts/headless-x11.sh` 提供 X11 與 lavapipe，`SNIP_E2E_TIMEOUT_SCALE=2`。
 
 Intel candidate：來源把 `x86_64-apple-darwin` 放在 `macos-latest`（arm64）上交叉編譯，host 不是 `x86_64` 時該 step `exit 0`，binary 沒有執行。同一份 GitHub 文件的標準 runner 表（public 與 private）列出 Intel label `macos-15-intel` 與 `macos-26-intel`。`macos-latest` 連到 macOS 26 arm64 readme。`macos-13` 已於 2025-12-04 退役。此 leg 改為 `macos-26-intel`（與 `macos-latest` 同代的標準 Intel runner，不是 larger runner 的 `macos-26-large`）。`uname -m` 不是 `x86_64` 時 step `exit 1`。Mach-O header 不算執行通過。這個 job 還沒有在 GitHub 上跑過。
 

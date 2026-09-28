@@ -29,6 +29,7 @@ import plistlib
 import struct
 import subprocess
 import sys
+import time
 import tarfile
 import tempfile
 import zipfile
@@ -1207,14 +1208,21 @@ def verify_dmg(
 
     if platform.system() == "Darwin":
         mnt = Path(tempfile.mkdtemp(prefix="snip_dmg_mnt_"))
+        attached = False
         try:
-            attach_res = subprocess.run(
-                ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", str(mnt), str(dmg_path)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if attach_res.returncode != 0:
+            # hdiutil attach fails transiently on hosted macOS runners ("Resource busy").
+            for attempt in range(3):
+                attach_res = subprocess.run(
+                    ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", str(mnt), str(dmg_path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if attach_res.returncode == 0:
+                    attached = True
+                    break
+                time.sleep(2 * (attempt + 1))
+            if not attached:
                 raise VerificationError(f"hdiutil attach failed for {dmg_path}:\n{attach_res.stderr}")
 
             # Check .app inside DMG
@@ -1236,17 +1244,19 @@ def verify_dmg(
                 )
 
         finally:
-            detach_res = subprocess.run(
-                ["hdiutil", "detach", str(mnt)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            detach_res = None
+            if attached:
+                detach_res = subprocess.run(
+                    ["hdiutil", "detach", str(mnt)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
             try:
                 mnt.rmdir()
             except Exception:
                 pass
-            if detach_res.returncode != 0:
+            if detach_res is not None and detach_res.returncode != 0:
                 raise VerificationError(
                     f"hdiutil detach failed for mount {mnt} ({dmg_path}):\n{detach_res.stderr}"
                 )

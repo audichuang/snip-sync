@@ -1,5 +1,7 @@
 > v0.3.0 狀態見[監督紀錄最上方](native-workbench-supervision.md)。
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 > **歷史 worker 紀錄，非驗收報告。** 本文描述的舊 UI 與記憶體數據已被後續審查取代或拒絕；不得據此宣稱完成或通過效能門檻。請以 [交付規格](native-workbench-delivery-spec.md)、[監督紀錄](native-workbench-supervision.md) 和經獨立核實的 checkpoint 為準。
 
 ## 2026-09-27 最新增量：來源安全、預覽容量與協作驗收

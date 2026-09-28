@@ -1,6 +1,6 @@
 # snip-core
 
-CLI(`crates/cli`)與桌面 App(`crates/desktop/src-tauri`)共用的全部邏輯。
+CLI(`crates/cli`)與原生桌面 App(`crates/desktop-native`)共用的全部邏輯。
 兩個外殼只負責收參數、顯示結果;能被兩邊共用的行為一律寫在這裡。
 
 ## 模組
@@ -28,7 +28,6 @@ CLI(`crates/cli`)與桌面 App(`crates/desktop/src-tauri`)共用的全部邏輯�
 - 錯誤用 `thiserror` 定義的型別,或回傳給使用者看的 `String` 訊息;不 `panic`、不 `unwrap` 使用者輸入。
 - 檔案內容只接受嚴格 UTF-8(`fsutil::read_text_file`),不做有損解碼,否則還原時會寫回亂碼。
 - 路徑在剪貼簿內一律是斜線字串;只有解析出來的還原目標和越界檢查才碰原生路徑。
-- 給前端用的型別加 `#[derive(TS)]`,改完到 `crates/desktop` 執行 `bun run generate:dto && bun run format`。
 - 禁止 `unsafe`(workspace lint `unsafe_code = "forbid"`)。
 
 ## 測試
