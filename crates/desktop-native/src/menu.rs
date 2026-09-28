@@ -466,10 +466,9 @@ impl WorkbenchModel {
 				Some(MenuAct::CommitFileDiff(path.to_string())),
 			));
 			// The basket holds the selected repository's files only.
-			if let Some((_, sha)) = rev
-				.as_ref()
-				.filter(|(root, _)| self.repo_root().as_ref() == Some(root))
-			{
+			if let Some((_, sha)) = rev.as_ref().filter(|(root, sha)| {
+				!sha.is_empty() && self.repo_root().as_ref() == Some(root)
+			}) {
 				v.push(basket_entry(
 					self.is_rev_file_selected(sha, path),
 					Some(MenuAct::RevToggle {
