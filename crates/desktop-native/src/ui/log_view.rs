@@ -221,6 +221,21 @@ impl WorkbenchModel {
 					.flex_1()
 					.min_w_0()
 					.overflow_hidden()
+					// Repositories and paths share one chip, first; a one-repo
+					// workspace only has paths.
+					.child(self.log_chip(
+						LogMenu::Repo,
+						t(
+							if self.repos.len() > 1 {
+								"log_chip_repo"
+							} else {
+								"log_chip_paths"
+							},
+							loc,
+						),
+						scope_value,
+						cx,
+					))
 					.child(self.log_chip(
 						LogMenu::Branch,
 						t("log_chip_branch", loc),
@@ -237,21 +252,6 @@ impl WorkbenchModel {
 						LogMenu::Date,
 						t("log_chip_date", loc),
 						date_value,
-						cx,
-					))
-					// Repositories and paths share one chip; a one-repo
-					// workspace only has paths.
-					.child(self.log_chip(
-						LogMenu::Repo,
-						t(
-							if self.repos.len() > 1 {
-								"log_chip_repo"
-							} else {
-								"log_chip_paths"
-							},
-							loc,
-						),
-						scope_value,
 						cx,
 					)),
 			)
