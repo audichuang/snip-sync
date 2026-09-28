@@ -646,9 +646,40 @@ impl WorkbenchModel {
 		};
 		let mut items: Vec<AnyElement> = Vec::new();
 		match menu {
-			// One chip for both: the repositories on top (a row keeps only
-			// its repository, the checkbox adds or drops it), then the paths.
+			// One chip for both: the filter field, the repositories (a row
+			// keeps only its repository, the checkbox adds or drops it),
+			// then the paths.
 			LogMenu::Repo => {
+				items.push(
+					div()
+						.id("log-path-input")
+						.relative()
+						.mx(px(4.))
+						.px(px(4.))
+						.rounded(px(4.))
+						.border_1()
+						.border_color(rgb(pal().button_border))
+						.child(self.log_path_input.clone())
+						.children(probe(log, "log-path-input"))
+						.into_any_element(),
+				);
+				items.push(
+					div()
+						.px(px(8.))
+						.py(px(2.))
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text_muted))
+						.child(t("log_paths_hint", loc))
+						.into_any_element(),
+				);
+				// The project's folders and files as far as loaded; chosen
+				// paths the tree does not show (typed, or in a closed
+				// folder) are listed above it.
+				let chosen = &self.log_filter.paths;
+				// Typed text filters the repositories and the loaded tree
+				// (IntelliJ).
+				let needle =
+					self.log_path_input.read(cx).text().trim().to_lowercase();
 				if self.repos.len() > 1 {
 					let all = self.log_repo_filter.is_empty();
 					items.push(item(
@@ -659,8 +690,14 @@ impl WorkbenchModel {
 						cx,
 					));
 					let scope = self.log_scope();
-					for (ix, repo) in
-						self.repos.iter().enumerate().take(MAX_LOG_MENU_ITEMS)
+					for (ix, repo) in self
+						.repos
+						.iter()
+						.enumerate()
+						.filter(|(_, r)| {
+							r.name.to_lowercase().contains(&needle)
+						})
+						.take(MAX_LOG_MENU_ITEMS)
 					{
 						let checked =
 							!all && scope.iter().any(|(r, _)| *r == repo.root);
@@ -730,35 +767,6 @@ impl WorkbenchModel {
 							.into_any_element(),
 					);
 				}
-				items.push(
-					div()
-						.id("log-path-input")
-						.relative()
-						.mx(px(4.))
-						.px(px(4.))
-						.rounded(px(4.))
-						.border_1()
-						.border_color(rgb(pal().button_border))
-						.child(self.log_path_input.clone())
-						.children(probe(log, "log-path-input"))
-						.into_any_element(),
-				);
-				items.push(
-					div()
-						.px(px(8.))
-						.py(px(2.))
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().text_muted))
-						.child(t("log_paths_hint", loc))
-						.into_any_element(),
-				);
-				// The project's folders and files as far as loaded; chosen
-				// paths the tree does not show (typed, or in a closed
-				// folder) are listed above it.
-				let chosen = &self.log_filter.paths;
-				// Typed text filters the loaded tree (IntelliJ).
-				let needle =
-					self.log_path_input.read(cx).text().trim().to_lowercase();
 				// The loaded tree is the toolbar repository's; a log scoped
 				// to another one gets typed paths only.
 				let other_repo = !self.log_is_merged()
@@ -1119,7 +1127,8 @@ impl WorkbenchModel {
 						)
 					})
 					.unwrap_or_default();
-				if hits.is_empty() && !name.to_lowercase().contains(needle) {
+				// The repositories themselves are listed above the paths.
+				if hits.is_empty() {
 					continue;
 				}
 				out.push(PathPick {
