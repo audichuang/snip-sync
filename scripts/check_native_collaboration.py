@@ -1257,7 +1257,12 @@ def expand_open_repo_changes(native: Any, session: Any, win: dict[str, Any], row
     selector expands it in every group, but the repo the app opened at startup stays
     collapsed until clicked. `row_id` is `change-row:<source>:<path>`; the row to
     expand is that repo's row under the source's group (untracked files list under
-    Unstaged). Then the directories above the file, which also start collapsed."""
+    Unstaged). Then the directories above the file, which also start collapsed.
+
+    Bounds carry no expansion state, so the repo row is clicked and its
+    REPO_CHANGES_COLLAPSED line read: `collapsed=true` means it was open with the file
+    out of view (or inside a closed folder), so it is clicked once more. With many
+    repos the row may be out of view; the list is swept for it."""
     lines = session.texts()
     selecting = [line for line in lines if "REPO_SELECTING:" in line]
     loaded = [line for line in lines if "[APP:REPO_LOADED: " in line]
@@ -1269,23 +1274,29 @@ def expand_open_repo_changes(native: Any, session: Any, win: dict[str, Any], row
         return
     group = native.change_row_group(row_id)
     node = f"change-repo:{group}:{name}"
-    folders = f"change-dir:{group}:{name}:"
-    deadline = time.monotonic() + min(2.0, timeout)
-    repo_row = False
-    while time.monotonic() < deadline:
+
+    def find_node() -> list[str] | None:
         bounds = native.parse_bounds(session.texts())
         if row_id in bounds:
-            return
-        if node in bounds:
-            repo_row = True
-            break
-        if any(key.startswith(folders) for key in bounds):
-            break
+            return None
+        return [node] if node in bounds else []
+
+    deadline = time.monotonic() + min(2.0, timeout)
+    while (found := find_node()) == [] and time.monotonic() < deadline:
         time.sleep(0.1)
-    if repo_row:
-        before = len(session.lines)
-        click_control(native, session, win, node, timeout)
-        wait_substr(session, f"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed=false]", before, timeout)
+    # Only a multi-repo workspace has repo rows.
+    if found == [] and any("id=change-repo:" in line for line in session.texts()):
+        found = native.scroll_to_change_dirs(session, win, find_node)
+    if found is None:
+        return
+    if found:
+        needle = f"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed="
+        for _click in range(2):
+            before = len(session.lines)
+            click_control(native, session, win, node, timeout)
+            line = wait_substr(session, needle, before, timeout)
+            if "collapsed=false" in line:
+                break
         trace.append({"action": "expand-repo-changes", "control": node})
     opened = native.expand_change_dirs(session, win, row_id, name, timeout)
     if opened:

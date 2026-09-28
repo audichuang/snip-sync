@@ -1379,6 +1379,30 @@ class ExpandOpenRepoChangesTests(unittest.TestCase):
         self.assertEqual(session.clicked, [node, src])
         self.assertEqual([t["action"] for t in trace], ["expand-repo-changes", "expand-change-dirs"])
 
+    def test_an_open_repo_row_is_reopened_and_an_unseen_one_is_swept_for(self):
+        import bench_native_memory as native
+        from test_bench_native import ChangeTreeSession, _bounds
+
+        node = "change-repo:unstaged:accounts"
+        src = "change-dir:unstaged:accounts:transfer"
+        row = "change-row:unstaged:transfer/working.txt"
+        session = ChangeTreeSession(
+            # Repo rows exist, but this one is below the fold until the sweep.
+            ["[APP:REPO_LOADED: accounts files=2]", _bounds("change-repo:staged:accounts", 80)],
+            {
+                node: [
+                    ["[APP:REPO_CHANGES_COLLAPSED: unstaged accounts collapsed=true]"],
+                    ["[APP:REPO_CHANGES_COLLAPSED: unstaged accounts collapsed=false]", _bounds(src, 524)],
+                ],
+                src: [["[APP:CHANGE_DIR_COLLAPSED: unstaged accounts transfer files=1 collapsed=false]", _bounds(row, 548)]],
+            },
+            on_wheel=[[], [], [_bounds(node, 500)]],
+        )
+        trace = []
+        driver.expand_open_repo_changes(native, session, self.WIN, row, 1.0, trace)
+        self.assertEqual(session.clicked, [node, node, src])
+        self.assertEqual([t["action"] for t in trace], ["expand-repo-changes", "expand-change-dirs"])
+
     def test_single_repo_opens_the_loaded_repo_folders(self):
         import bench_native_memory as native
         from test_bench_native import ChangeTreeSession, _bounds
