@@ -2655,6 +2655,26 @@ impl WorkbenchModel {
 		))
 	}
 
+	/// The repository and commit a changed-files row's file is read from:
+	/// the commit that changed it last in a multi-selection, the newer end
+	/// of a compare, else the selected commit.
+	pub fn commit_file_rev(
+		&self,
+		path: &str,
+	) -> Option<(std::path::PathBuf, String)> {
+		if let Some((_, to)) = &self.compare {
+			return Some((self.log_commit_root.clone()?, to.clone()));
+		}
+		if self.log_selected.len() > 1 {
+			let idx = self.commit_files.iter().position(|(p, _)| p == path)?;
+			let id = self
+				.log_selected
+				.get(*self.commit_file_origin.get(idx)? as usize)?;
+			return self.log_root_for(id);
+		}
+		self.log_root_for(self.selected_commit.as_deref()?)
+	}
+
 	/// Keyboard move in the log; `extend` grows the range instead.
 	pub fn log_move(
 		&mut self,

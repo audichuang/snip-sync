@@ -104,14 +104,27 @@ pub struct ContextMenu {
 #[derive(Clone, Debug)]
 pub enum MenuAct {
 	Tree(TreeCommand),
-	RevToggle { sha: String, path: String },
-	ChangeToggle { idx: usize, path: String },
-	ChangeOpen { idx: usize, path: String },
+	RevToggle {
+		sha: String,
+		path: String,
+	},
+	ChangeToggle {
+		idx: usize,
+		path: String,
+	},
+	ChangeOpen {
+		idx: usize,
+		path: String,
+	},
 	GroupToggle(&'static str),
 	RepoToggle(usize, &'static str),
 	CopyText(String),
 	CommitDiff(String),
 	CopyCommits(String),
+	/// Snip-sync copy of files as they are in a commit: (repository root,
+	/// commit, path).
+	CopyRevFiles(Vec<(PathBuf, String, String)>),
+	CommitFileDiff(String),
 	Select(String),
 	BrowseTree(String),
 	Reveal(PathBuf),
@@ -413,6 +426,67 @@ impl WorkbenchModel {
 		]
 	}
 
+	/// A changed-files row of the Log (a file, or a directory for every
+	/// file under it): copy as snip-sync, diff, basket and paths.
+	pub(crate) fn commit_file_menu(
+		&self,
+		path: &str,
+		is_dir: bool,
+	) -> Vec<MenuEntry> {
+		// A deleted file has no content in its commit.
+		let copy: Vec<(PathBuf, String, String)> = self
+			.commit_files
+			.iter()
+			.filter(|(p, ct)| {
+				(if is_dir {
+					path_under(p, path)
+				} else {
+					p == path
+				}) && *ct != Some(snip_core::format::ChangeType::Deleted)
+			})
+			.filter_map(|(p, _)| {
+				let (root, sha) = self.commit_file_rev(p)?;
+				Some((root, sha, p.clone()))
+			})
+			.collect();
+		let mut v = vec![item(
+			"copy-files",
+			"menu_copy_files",
+			None,
+			(!copy.is_empty()).then_some(MenuAct::CopyRevFiles(copy)),
+		)];
+		let rev = self.commit_file_rev(path).or_else(|| {
+			self.log_commit_root.clone().map(|r| (r, String::new()))
+		});
+		if !is_dir {
+			v.push(item(
+				"show-diff",
+				"menu_show_diff",
+				Some(secondary("D")),
+				Some(MenuAct::CommitFileDiff(path.to_string())),
+			));
+			// The basket holds the selected repository's files only.
+			if let Some((_, sha)) = rev
+				.as_ref()
+				.filter(|(root, _)| self.repo_root().as_ref() == Some(root))
+			{
+				v.push(basket_entry(
+					self.is_rev_file_selected(sha, path),
+					Some(MenuAct::RevToggle {
+						sha: sha.clone(),
+						path: path.to_string(),
+					}),
+				));
+			}
+		}
+		v.push(MenuEntry::Sep);
+		v.extend(copy_entries(
+			rev.map(|(root, _)| root.join(path).display().to_string()),
+			path,
+		));
+		v
+	}
+
 	/// Right-click on a Log row: IntelliJ keeps a selection that already
 	/// contains the row, otherwise selects it first.
 	pub(crate) fn open_log_menu(
@@ -614,6 +688,36 @@ impl WorkbenchModel {
 				window.focus(&self.reader_focus);
 			}
 			MenuAct::CopyCommits(_) => self.copy_commits_to_clipboard(cx),
+			MenuAct::CopyRevFiles(files) => {
+				let name = files
+					.first()
+					.map(|(root, _, _)| self.log_repo_name(root))
+					.unwrap_or_default();
+				let items: Option<Vec<_>> = files
+					.into_iter()
+					.map(|(root, rev, path)| {
+						Some(snip_core::transfer::ExportItem {
+							root: snip_core::transfer::CanonicalRootId::new(
+								&root,
+							)
+							.ok()?,
+							relative_path: path,
+							source: SourceKind::Commit { rev },
+							change_type: None,
+						})
+					})
+					.collect();
+				match items {
+					Some(items) => {
+						self.export_items_to_clipboard(items, name, cx)
+					}
+					None => self.set_status("error_selection_root", []),
+				}
+			}
+			MenuAct::CommitFileDiff(path) => {
+				self.select_commit_file(&path, cx);
+				window.focus(&self.reader_focus);
+			}
 			MenuAct::Select(sha) => self.log_select_row(&sha, cx),
 			MenuAct::Reveal(path) => {
 				let result = reveal_command(TargetOs::current(), &path)

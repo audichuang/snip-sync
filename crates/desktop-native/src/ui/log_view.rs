@@ -1020,6 +1020,20 @@ impl WorkbenchModel {
 					.when(self.chrome.menu.is_none(), |d| {
 						d.tooltip(tip(path.clone()))
 					})
+					.on_mouse_down(MouseButton::Right, {
+						let path = path.clone();
+						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+							let items = this.commit_file_menu(&path, true);
+							w.focus(&this.log_focus);
+							this.open_menu(
+								crate::menu::MenuOrigin::Log,
+								items,
+								ev.position,
+								w,
+								cx,
+							);
+						})
+					})
 					.on_click(cx.listener(move |this, _, _, cx| {
 						let dirs = &mut this.changed_dirs_collapsed;
 						match dirs.iter().position(|d| d == &p2) {
@@ -1086,6 +1100,24 @@ impl WorkbenchModel {
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.select_commit_file(&p2, cx)
 					}))
+					// IntelliJ selects the row a menu opens on.
+					.on_mouse_down(MouseButton::Right, {
+						let path = path.clone();
+						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+							if !sel {
+								this.select_commit_file(&path, cx);
+							}
+							let items = this.commit_file_menu(&path, false);
+							w.focus(&this.log_focus);
+							this.open_menu(
+								crate::menu::MenuOrigin::Log,
+								items,
+								ev.position,
+								w,
+								cx,
+							);
+						})
+					})
 					.child(icon(file_icon(&path), 14.))
 					.child(
 						clip_text(name)

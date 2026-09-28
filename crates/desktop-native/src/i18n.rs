@@ -378,6 +378,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"menu_remove_basket" => "從選取籃移除",
 			"menu_copy_path" => "複製路徑",
 			"menu_copy_relative_path" => "複製相對路徑",
+			"menu_copy_files" => "複製檔案 (snip-sync)",
 			"menu_show_diff" => "顯示差異",
 			"menu_copy_revision" => "複製修訂版號",
 			"menu_go_parent" => "前往父 commit",
@@ -702,6 +703,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"menu_remove_basket" => "Remove from Basket",
 			"menu_copy_path" => "Copy Path",
 			"menu_copy_relative_path" => "Copy Relative Path",
+			"menu_copy_files" => "Copy Files (snip-sync)",
 			"menu_show_diff" => "Show Diff",
 			"menu_copy_revision" => "Copy Revision Number",
 			"menu_go_parent" => "Go to Parent Commit",
@@ -851,6 +853,7 @@ mod tests {
 			"status_log_merged_cap",
 			"log_selection_header",
 			"status_selection_truncated",
+			"menu_copy_files",
 		];
 		for key in test_keys {
 			assert!(

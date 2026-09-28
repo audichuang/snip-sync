@@ -4444,6 +4444,27 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	wait("[APP:MENU_ACTION: copy-revision]");
 	wait("[APP:TEXT_COPIED:");
 	assert_eq!(clip_get(), second);
+	// 5b. The changed-files pane: right-click a file of that commit and
+	// copy it (snip-sync payload) as it was in the commit.
+	clip_set("SENTINEL_LOG_FILE_MENU");
+	right_click("commit-file:alpha.txt");
+	wait("[APP:MENU_OPEN: Log items=copy-files,");
+	click("menu-item:copy-files");
+	wait("[APP:MENU_ACTION: copy-files]");
+	wait("[APP:COPY_DONE: copied=1]");
+	absent("context-menu");
+	let copied = clip_get();
+	assert!(
+		copied.contains("alpha.txt") && copied.contains("alpha two\n"),
+		"{copied}"
+	);
+	assert!(!copied.contains("nested"), "{copied}");
+	// Its relative path, too.
+	right_click("commit-file:alpha.txt");
+	wait("[APP:MENU_OPEN: Log items=copy-files,");
+	click("menu-item:copy-relative-path");
+	wait("[APP:TEXT_COPIED:");
+	assert_eq!(clip_get(), "alpha.txt");
 
 	// 6. Ctrl+Shift+` opens the branches popup.
 	key(&wid, "ctrl+shift+grave");

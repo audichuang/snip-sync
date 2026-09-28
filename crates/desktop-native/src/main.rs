@@ -4164,15 +4164,31 @@ impl WorkbenchModel {
 			.repo()
 			.map(|repo| repo.name.clone())
 			.unwrap_or_else(|| "basket".into());
-		let mut items = Vec::new();
+		let items: Vec<ExportItem> =
+			self.basket.iter().flat_map(|(_, i)| i.clone()).collect();
+		self.export_items_to_clipboard(items, repo_name, cx);
+	}
+
+	/// Exports `items` (any roots) as one snip-sync payload to the
+	/// clipboard: the basket's Copy, and a Log file's Copy.
+	pub fn export_items_to_clipboard(
+		&mut self,
+		items: Vec<ExportItem>,
+		repo_name: String,
+		cx: &mut Context<Self>,
+	) {
+		if !self.accepting_work() {
+			return;
+		}
+		if self.is_copying {
+			app_log!("[APP:COPY_BUSY]");
+			return;
+		}
 		let mut roots = Vec::new();
-		for (_, repo_items) in &self.basket {
-			for item in repo_items {
-				let path = item.root.path().to_path_buf();
-				if !roots.iter().any(|root| root == &path) {
-					roots.push(path);
-				}
-				items.push(item.clone());
+		for item in &items {
+			let path = item.root.path().to_path_buf();
+			if !roots.iter().any(|root| root == &path) {
+				roots.push(path);
 			}
 		}
 		if items.is_empty() {
