@@ -214,9 +214,6 @@ jobs:
         needs: verify-ci
         name: Build CLI (${{ matrix.target }})
         runs-on: ${{ matrix.os }}
-        env:
-            SCCACHE_GHA_ENABLED: "true"
-            RUSTC_WRAPPER: "sccache"
         permissions:
             contents: read
         strategy:
@@ -249,11 +246,11 @@ jobs:
               with:
                   targets: ${{ matrix.target }}
 
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
-
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
+              with:
+                  # A tag's cache is unreadable by later runs; restore only.
+                  save-if: false
 
             - name: Sync Version
               shell: bash

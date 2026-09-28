@@ -25,8 +25,8 @@ preflight-rust:
 	cargo fmt --all --check
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-desktop-native --exclude snip-native-e2e --locked --no-fail-fast
-	RUSTFLAGS="-D warnings" cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
+	# Same as CI's Linux Test job: one run, clipboard tests on a private display.
+	RUSTFLAGS="-D warnings" xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
 
 # Python stdlib memory harness contracts and workload generator tests.
 preflight-harness:

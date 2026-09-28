@@ -227,5 +227,5 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
 | 剪貼簿被通道無聲截斷(不在範圍內,不做雜湊) | 檔案模式可能還原出殘缺檔案;commit 模式的 JSON 會解析失敗而被擋下 | 使用者自行留意通知裡的字元數 |
 | commit 模式重播時覆蓋本機未 commit 的修改 | 本機修改遺失 | 設計如此(spec 4.3);預覽中列出會被覆蓋的路徑 |
 | Rust 移植產生語意差異(regex、trim、Unicode、路徑) | 與 IDE 套件不相容 | Phase 1,由 fixture 抓出 |
-| Rust 編譯時間與磁碟佔用 | 本機與 CI 變慢 | 沿用 aghub 的 sccache、rust-cache、Windows Defender 排除設定 |
+| Rust 編譯時間與磁碟佔用 | 本機與 CI 變慢 | CI 只用 rust-cache,且只有 push 到 main 時寫入(0.3.2 起拿掉 sccache:兩者加各分支快取超過 repo 10 GB 配額,互相淘汰到命中率約 0%) |
 | macOS GUI 無法自動化測試 | GUI 退化只能靠手動發現 | 以架構緩解:GUI 只當薄殼 |

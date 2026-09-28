@@ -28,8 +28,6 @@ env:
     # Pinned tool versions
     ACTIONLINT_VERSION: 1.7.12
     CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-    SCCACHE_GHA_ENABLED: "true"
-    RUSTC_WRAPPER: "sccache"
 
 jobs:
     actionlint:
@@ -78,11 +76,13 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-lint
                   cache-on-failure: true
             - name: Install Linux system dependencies (X11/xkbcommon/fonts/Wayland/Vulkan for native)
@@ -133,11 +133,13 @@ jobs:
                   git config --global core.longpaths true
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-test
                   cache-on-failure: true
             - name: Install Linux system dependencies (xvfb for clipboard, X11/xkbcommon/fonts/Wayland/Vulkan for native)
@@ -175,18 +177,15 @@ jobs:
               if: runner.os == 'macOS'
               timeout-minutes: 5
               run: cargo test -p snip-core --locked --test git_runner fast_child_rapid_cleanup_releases_all_permits_without_leftover_error -- --exact
-            - name: Workspace tests (Linux, under xvfb, excluding native binary crate)
+            # One cargo invocation, so core, CLI and the native crate (its unit
+            # and in-process #[gpui::test]s) compile in parallel. The real-app
+            # drivers (snip-native-e2e) run in native-acceptance instead.
+            - name: Workspace tests (Linux, under xvfb for the clipboard)
               if: runner.os == 'Linux'
-              run: xvfb-run -a cargo test --workspace --exclude snip-desktop-native --exclude snip-native-e2e --locked --no-fail-fast
-            - name: Native binary unit tests (Linux)
-              if: runner.os == 'Linux'
-              run: cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
-            - name: Workspace tests (excluding native binary crate)
+              run: xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+            - name: Workspace tests
               if: runner.os != 'Linux'
-              run: cargo test --workspace --exclude snip-desktop-native --exclude snip-native-e2e --locked --no-fail-fast
-            - name: Native binary unit tests
-              if: runner.os != 'Linux'
-              run: cargo test -p snip-desktop-native --bin snip-desktop-native --locked --no-fail-fast
+              run: cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
             - name: Build native binary (debug)
               run: cargo build -p snip-desktop-native --locked
             - name: Native binary CLI smoke test
@@ -241,11 +240,13 @@ jobs:
             - uses: actions/checkout@v6
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-native-acceptance-release
                   cache-on-failure: true
             - name: Install native build dependencies
@@ -316,6 +317,10 @@ jobs:
               if: matrix.drivers
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-native-e2e
                   cache-on-failure: true
             - name: Install isolated acceptance dependencies
@@ -469,8 +474,6 @@ jobs:
         timeout-minutes: 45
         env:
             RUSTFLAGS: "-D warnings"
-            SCCACHE_GHA_ENABLED: "true"
-            RUSTC_WRAPPER: "sccache"
             MACOSX_DEPLOYMENT_TARGET: "11.0"
             PKG_OUT: target/native-candidate-${{ matrix.target }}
         strategy:
@@ -502,11 +505,13 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
               with:
                   targets: ${{ matrix.target }}
-            - name: Setup sccache
-              uses: mozilla-actions/sccache-action@v0.0.10
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
               with:
+                  # Only main writes: its caches are readable from every branch and
+                  # PR, and one set fits the repo's 10 GB quota (per-branch sets
+                  # plus sccache evicted each other, leaving ~0% hits).
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-candidate-${{ matrix.target }}
                   cache-on-failure: true
             - name: Setup Python
