@@ -5656,10 +5656,10 @@ fn native_merged_graph_over_four_repositories() {
 			assert!(Instant::now() < deadline, "layout never settled");
 		}
 	};
-	// Every row on screen: the log takes most of the window.
+	// Every row on screen: the log takes most of the window. The resize
+	// above may not be laid out yet on a slow runner, so a drag that missed
+	// the splitter re-reads its bounds and tries again.
 	{
-		let v = *settled().get("splitter-bottom").expect("splitter");
-		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
 		let xdo = |args: &[&str]| {
 			assert!(Command::new("xdotool")
 				.args(args)
@@ -5667,22 +5667,35 @@ fn native_merged_graph_over_four_repositories() {
 				.unwrap()
 				.success())
 		};
-		xdo(&[
-			"mousemove",
-			"--window",
-			&wid,
-			&x.to_string(),
-			&y.to_string(),
-		]);
-		xdo(&["mousedown", "1"]);
-		for step in 1..=6 {
-			let y = (y - 60 * step).to_string();
-			xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
-			std::thread::sleep(Duration::from_millis(30));
+		let mut resized = Err(String::new());
+		for _ in 0..3 {
+			let v = *settled().get("splitter-bottom").expect("splitter");
+			let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+			xdo(&[
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+			]);
+			std::thread::sleep(Duration::from_millis(100));
+			xdo(&["mousedown", "1"]);
+			for step in 1..=6 {
+				let y = (y - 60 * step).to_string();
+				xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+				std::thread::sleep(Duration::from_millis(30));
+			}
+			xdo(&["mouseup", "1"]);
+			resized = lines_until(
+				rx,
+				"[APP:SPLIT_RESIZED: Bottom",
+				Duration::from_secs(5),
+			);
+			if resized.is_ok() {
+				break;
+			}
 		}
-		xdo(&["mouseup", "1"]);
-		lines_until(rx, "[APP:SPLIT_RESIZED: Bottom", Duration::from_secs(8))
-			.unwrap();
+		resized.unwrap();
 	}
 	let out = std::env::var_os("SNIP_E2E_OUT")
 		.map(PathBuf::from)
