@@ -604,6 +604,14 @@ impl WorkbenchModel {
 				let want = vw - SPLITTER - f32::from(ev.position.x);
 				self.log_details_w = want.min(vw * 0.5).max(LOG_DETAILS_W_MIN);
 			}
+			Splitter::LogFiles => {
+				// The log island ends at the status bar.
+				let want = vh - STATUS_H - f32::from(ev.position.y);
+				self.log_details_h = Some(
+					want.min(self.effective_bottom_h(vh) * 0.8)
+						.max(LOG_DETAILS_H_MIN),
+				);
+			}
 		}
 		cx.notify();
 	}
@@ -1020,6 +1028,7 @@ impl WorkbenchModel {
 			Splitter::Left => "splitter-left",
 			Splitter::Bottom => "splitter-bottom",
 			Splitter::LogDetails => "splitter-log-details",
+			Splitter::LogFiles => "splitter-log-files",
 		};
 		let d = div()
 			.id(id)
@@ -1045,6 +1054,12 @@ impl WorkbenchModel {
 				.border_l_1()
 				.border_color(rgb(pal().divider))
 				.cursor_ew_resize(),
+			Splitter::LogFiles => d
+				.h(px(SPLITTER))
+				.w_full()
+				.border_t_1()
+				.border_color(rgb(pal().divider))
+				.cursor_ns_resize(),
 		}
 		.into_any_element()
 	}
@@ -1451,6 +1466,29 @@ mod tests {
 		assert!(path_picker_matches(&tree, "query", "", 50)
 			.iter()
 			.all(|p| !p.expandable));
+	}
+
+	#[test]
+	fn details_list_a_few_branches_until_show_all() {
+		use super::log_view::branches_list;
+		let names: Vec<String> = (1..=7).map(|i| format!("b{i}")).collect();
+		assert_eq!(
+			branches_list(&names[..2], false, false),
+			("b1, b2".to_string(), false)
+		);
+		assert_eq!(
+			branches_list(&names, false, false),
+			("b1, b2, b3, b4, b5, …".to_string(), true)
+		);
+		assert_eq!(
+			branches_list(&names, false, true),
+			("b1, b2, b3, b4, b5, b6, b7".to_string(), false)
+		);
+		// The read itself was cut: more exist than Show all can list.
+		assert_eq!(
+			branches_list(&names[..2], true, true),
+			("b1, b2, …".to_string(), false)
+		);
 	}
 
 	#[test]

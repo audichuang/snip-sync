@@ -208,6 +208,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_details_on" => "於 {}",
 			"log_details_committed" => "由 {} 提交於 {}",
 			"log_details_in_branches" => "包含於 {} 個分支：{}",
+			"log_details_show_all" => "顯示全部",
 			"log_today" => "今天 {}",
 			"log_yesterday" => "昨天 {}",
 			// end log pane (IJ-2a)
@@ -533,6 +534,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_details_on" => "on {}",
 			"log_details_committed" => "committed by {} on {}",
 			"log_details_in_branches" => "In {} branches: {}",
+			"log_details_show_all" => "Show all",
 			"log_today" => "Today {}",
 			"log_yesterday" => "Yesterday {}",
 			// end log pane (IJ-2a)
@@ -841,6 +843,7 @@ mod tests {
 			"log_loading_more",
 			"log_dir_files",
 			"log_details_in_branches",
+			"log_details_show_all",
 			"log_today",
 			"log_yesterday",
 			"changes_repo_error",

@@ -22,6 +22,8 @@ use snip_core::graph::{GraphCheckpoint, GraphLayout, MAX_SHA_LEN};
 /// Most commits of one multi-selection whose changed files are listed
 /// (one listing each).
 pub const MAX_SELECTION_READS: usize = 100;
+/// Commits of an open multi-selection whose full details are read.
+pub const MAX_SELECTION_DETAILS: usize = 20;
 /// Files listed for one commit or compare; more are counted, not kept.
 pub const MAX_COMMIT_FILES: usize = 5_000;
 /// Rows shown in the commit tree at once.
@@ -2045,6 +2047,7 @@ impl WorkbenchModel {
 		self.selected_commit = Some(Box::<str>::from(sha).into_string());
 		self.range_head = None;
 		self.log_selected.clear();
+		self.reset_selection_details();
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_commit_file = None;
@@ -2117,9 +2120,85 @@ impl WorkbenchModel {
 					// A failed read leaves the row's own fields on screen.
 					// Details are keyed by the row id (merged log: with repo).
 					model.commit_details = res.ok().map(|mut d| {
+						app_log!(
+							"[APP:COMMIT_DETAILS: {} branches={}]",
+							&d.sha[..7.min(d.sha.len())],
+							d.branches.len()
+						);
 						d.sha = id;
 						d
 					});
+					cx.notify();
+				});
+			},
+		);
+	}
+
+	/// A new selection starts with its commit list collapsed.
+	fn reset_selection_details(&mut self) {
+		self.log_selection_expanded = false;
+		self.selection_details.clear();
+		self.log_branches_all.clear();
+	}
+
+	/// Opens or closes the multi-selection's commit list; opening reads
+	/// the first `MAX_SELECTION_DETAILS` commits' details in one job.
+	pub fn toggle_selection_expanded(&mut self, cx: &mut Context<Self>) {
+		self.log_selection_expanded = !self.log_selection_expanded;
+		app_log!(
+			"[APP:LOG_SELECTION_EXPANDED: {}]",
+			self.log_selection_expanded
+		);
+		cx.notify();
+		if !self.log_selection_expanded || !self.selection_details.is_empty() {
+			return;
+		}
+		let reads: Vec<(PathBuf, String, String)> = self
+			.log_selected
+			.iter()
+			.take(MAX_SELECTION_DETAILS)
+			.filter_map(|id| {
+				let (root, sha) = self.log_root_for(id)?;
+				Some((root, sha, id.clone()))
+			})
+			.collect();
+		self.details_generation = self.details_generation.wrapping_add(1);
+		let generation = self.details_generation;
+		if !self.accepting_work() {
+			return;
+		}
+		let cancel = arm_cancel(&mut self.details_cancel);
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
+				let res = bg
+					.spawn(async move {
+						let opts = crate::interactive_read_opts(cancel);
+						// A failed read keeps that commit's row fields.
+						reads
+							.into_iter()
+							.filter_map(|(root, sha, id)| {
+								let git = Git::at_known_root(root);
+								let mut d =
+									read_commit_details(&git, &sha, &opts)
+										.ok()?;
+								d.sha = id;
+								Some(d)
+							})
+							.collect::<Vec<_>>()
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.details_generation != generation {
+						return;
+					}
+					app_log!("[APP:SELECTION_DETAILS: {}]", res.len());
+					model.selection_details = res;
 					cx.notify();
 				});
 			},
@@ -2201,6 +2280,7 @@ impl WorkbenchModel {
 				self.range_head = None;
 				self.log_selected.clear();
 				self.commit_details = None;
+				self.reset_selection_details();
 				self.commit_files.clear();
 				self.selected_commit_file = None;
 				self.preview_loading = false;
@@ -2256,6 +2336,7 @@ impl WorkbenchModel {
 		let task_generation = self.preview_generation;
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.commit_details = None;
+		self.reset_selection_details();
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_commit_file = None;

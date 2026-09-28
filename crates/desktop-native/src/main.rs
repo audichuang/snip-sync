@@ -911,6 +911,15 @@ pub struct WorkbenchModel {
 		Option<(u64, std::rc::Rc<Vec<crate::ui::ChangeItemRow>>)>,
 	>,
 	pub commit_details: Option<crate::history::CommitDetails>,
+	/// Details pane height under the changed files once dragged; `None`
+	/// keeps the default share (the files get most of the pane).
+	pub log_details_h: Option<f32>,
+	/// The multi-selection's commit list is open (collapsed by default).
+	pub log_selection_expanded: bool,
+	/// Details of an open multi-selection's commits, newest first.
+	pub selection_details: Vec<crate::history::CommitDetails>,
+	/// Commits whose details list every containing branch read.
+	pub log_branches_all: Vec<String>,
 	pub details_generation: u64,
 	pub details_cancel: Option<CancelToken>,
 	pub git_user_email: Option<String>,
@@ -1081,6 +1090,8 @@ pub enum Splitter {
 	Left,
 	Bottom,
 	LogDetails,
+	/// Between the log's changed files and the commit details.
+	LogFiles,
 }
 
 impl WorkbenchModel {
@@ -1302,6 +1313,10 @@ impl WorkbenchModel {
 			log_details_by_dir: true,
 			commit_rows_cache: Default::default(),
 			commit_details: None,
+			log_details_h: None,
+			log_selection_expanded: false,
+			selection_details: Vec::new(),
+			log_branches_all: Vec::new(),
 			details_generation: 0,
 			details_cancel: None,
 			git_user_email: None,
@@ -2366,6 +2381,8 @@ impl WorkbenchModel {
 		release_vec(&mut self.commit_files);
 		release_vec(&mut self.commit_file_origin);
 		release_vec(&mut self.commit_file_gitlinks);
+		release_vec(&mut self.selection_details);
+		release_vec(&mut self.log_branches_all);
 		self.commit_rows_cache.take();
 		self.log_first_page = 0;
 		self.history_extending = false;

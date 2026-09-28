@@ -5463,6 +5463,15 @@ fn log_multiselect(theme: &str) {
 		assert!(st.success());
 	};
 	let click = |id: &str| press(id, None);
+	// Drawn, maybe scrolled past the details pane's edge.
+	let drawn = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		while !bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let (a2, a4) = (&shas["alpha2"][..7], &shas["alpha4"][..7]);
 
 	// A taller log: every row and the whole details tree on screen.
 	{
@@ -5511,6 +5520,25 @@ fn log_multiselect(theme: &str) {
 	control("commit-details-selection");
 	// The first file opens as the selection's diff.
 	wait("[APP:PREVIEW_LOADED:");
+	// The changed files get most of the right pane, the details less.
+	let (files, details) =
+		(control("commit-files-pane"), control("commit-details"));
+	assert!(files[3] > details[3], "files {files:?} details {details:?}");
+	// The selected commits stay one header row until it is clicked open;
+	// each then shows its author line and branches, not just a subject.
+	control("log-selection-toggle");
+	absent(&format!("selection-commit:{a4}"));
+	click("log-selection-toggle");
+	wait("[APP:LOG_SELECTION_EXPANDED: true]");
+	wait("[APP:SELECTION_DETAILS: 2]");
+	for sha in [a4, a2] {
+		drawn(&format!("selection-commit:{sha}"));
+		drawn(&format!("commit-details-author:{sha}"));
+		drawn(&format!("commit-details-branches:{sha}"));
+	}
+	click("log-selection-toggle");
+	wait("[APP:LOG_SELECTION_EXPANDED: false]");
+	absent(&format!("selection-commit:{a4}"));
 	// Flat and back.
 	click("details-group-dir");
 	wait("[APP:LOG_DETAILS_GROUP_DIR: false]");
@@ -5554,6 +5582,10 @@ fn log_multiselect(theme: &str) {
 	press(&row("alpha2"), Some("ctrl"));
 	wait(&format!("[APP:COMMIT_SELECTED: {}]", &shas["alpha4"][..7]));
 	absent("commit-details-selection");
+	// One commit: hash, author and email on one line, then its branches.
+	wait(&format!("[APP:COMMIT_DETAILS: {a4} branches=1]"));
+	drawn(&format!("commit-details-author:{a4}"));
+	drawn(&format!("commit-details-branches:{a4}"));
 
 	quit_cleanly(&mut app, &wid);
 }

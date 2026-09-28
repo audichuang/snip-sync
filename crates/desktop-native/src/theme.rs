@@ -44,6 +44,10 @@ pub const BOTTOM_H_MIN: f32 = 100.0;
 // Log tool window (IJ-2a).
 pub const LOG_DETAILS_W_DEFAULT: f32 = 280.0;
 pub const LOG_DETAILS_W_MIN: f32 = 180.0;
+/// Commit details under the log's changed files: their default share of
+/// the pane's height, and the least a drag leaves.
+pub const LOG_DETAILS_H_SHARE: f32 = 0.32;
+pub const LOG_DETAILS_H_MIN: f32 = 60.0;
 pub const LOG_BRANCHES_W: f32 = 200.0;
 
 /// UI font, embedded and registered at startup (see [`register_fonts`]).
