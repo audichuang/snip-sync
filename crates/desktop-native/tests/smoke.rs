@@ -5916,5 +5916,20 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	assert!(copied.contains("PLAIN_NOTE_BYTES"), "{copied}");
 	assert!(copied.contains("notes/readme.txt"), "{copied}");
 	assert!(!copied.contains("TOP_BYTES"), "{copied}");
+
+	// A repo file and a workspace file copy together as one payload.
+	click("tree-chk:main.rs");
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
+	let both = clip::read_text().unwrap();
+	assert!(both.contains("PLAIN_NOTE_BYTES"), "{both}");
+	assert!(both.contains("fn main() {}"), "{both}");
+	for line in both
+		.lines()
+		.filter(|l| l.contains("readme.txt") || l.contains("main.rs"))
+	{
+		println!("[MIXED HEADER] {line}");
+	}
 	quit_cleanly(&mut app, &wid);
 }
