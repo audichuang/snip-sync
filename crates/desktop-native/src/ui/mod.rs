@@ -1437,9 +1437,10 @@ impl WorkbenchModel {
 				.flex()
 				.justify_center()
 				.child(
+					// No occlude: the card only informs, clicks reach the
+					// rows under it.
 					div()
 						.id("copy-toast")
-						.occlude()
 						.flex()
 						.flex_row()
 						.items_center()
