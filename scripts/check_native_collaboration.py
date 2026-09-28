@@ -319,7 +319,7 @@ def fixed_oid_blocker(path: str, rev: str, oid: str) -> str:
         f"no rendered checkbox exports fixed OID {rev}:{path} blob {oid}. "
         "commit-file:{path} and rev-row:{path} only preview. "
         "btn-copy of a commit selection is COPY_REFUSED commit_readonly. "
-        "tree-chk would copy worktree bytes and is not a substitute"
+        "a Project tree selection would copy worktree bytes and is not a substitute"
     )
 
 
@@ -1110,7 +1110,8 @@ def wait_control(native: Any, session: Any, control: str, timeout: float) -> tup
         time.sleep(min(0.05, remaining))
 
 
-def click_control(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, viewport: str | None = None) -> None:
+def click_control(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, viewport: str | None = None, modifier: str | None = None) -> None:
+    """Click `control`; `modifier` (e.g. "ctrl") is held for the click, as the Project tree's multi-select toggle needs."""
     left_row = control.startswith(("change-", "tree-", "left-"))
     if viewport == "left-list" or (viewport is None and left_row):
         try:
@@ -1128,7 +1129,14 @@ def click_control(native: Any, session: Any, win: dict[str, Any], control: str, 
         except Exception as exc:
             raise MissingControl(control, str(exc)) from exc
     native.assert_on_window(box, win, control)
-    session.click(win, box)
+    if modifier is None:
+        session.click(win, box)
+        return
+    session.x("xdotool", "keydown", modifier)
+    try:
+        session.click(win, box)
+    finally:
+        session.x("xdotool", "keyup", modifier)
 
 
 def _current_root(session: Any) -> str | None:
@@ -2687,7 +2695,7 @@ def select_tree_file(native: Any, session: Any, repo: Mapping[str, Any], fixture
         click_control(native, session, win, f"tree-row:{parent}", timeout)
         wait_substr(session, f"[APP:TREE_EXPANDED: {parent}]", before, timeout)
     before = len(session.lines)
-    click_control(native, session, win, f"tree-chk:{path}", timeout)
+    click_control(native, session, win, f"tree-row:{path}", timeout, modifier="ctrl")
     wait_substr(session, "[APP:BASKET: n=", before, timeout)
     trace.append({"action": "tree-check", "repo": repo["repoId"], "path": path})
 
@@ -2981,7 +2989,7 @@ def run_stale_target(native: Any, sessions: Mapping[str, Any], manifest: Mapping
         click_control(native, source_session, window_of(source_session, timeout), f"tree-row:{parent}", timeout)
         wait_substr(source_session, f"[APP:TREE_EXPANDED: {parent}]", before, timeout)
     before = len(source_session.lines)
-    click_control(native, source_session, window_of(source_session, timeout), f"tree-chk:{path}", timeout)
+    click_control(native, source_session, window_of(source_session, timeout), f"tree-row:{path}", timeout, modifier="ctrl")
     wait_substr(source_session, "[APP:BASKET: n=", before, timeout)
     record["screenshots"]["source-selected"] = relative_shot(output, capture_checked(native, source_session, window_of(source_session, timeout), "source-selected", timeout))
     payload = copy_from_button(native, source_session, window_of(source_session, timeout), timeout, trace)

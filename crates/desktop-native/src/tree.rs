@@ -793,6 +793,27 @@ impl FileTreeNode {
 		Some(paths)
 	}
 
+	/// A fresh selection of exactly `rels` (a folder brings its loaded
+	/// files, never a nested repo's), as a click or range selects rows.
+	pub fn selection_for_rels(&self, rels: &[String]) -> Vec<String> {
+		let mut paths = Vec::new();
+		for rel in rels.iter().filter(|rel| !rel.is_empty()) {
+			match self.find(&NodeKey::from_utf8_rel(rel)) {
+				Some(node) if !node.is_valid_utf8 => {}
+				Some(node) if node.is_dir => {
+					node.collect_selectable(&mut paths)
+				}
+				Some(_) => {
+					if let Err(index) = paths.binary_search(rel) {
+						paths.insert(index, rel.clone());
+					}
+				}
+				None => {}
+			}
+		}
+		paths
+	}
+
 	/// The caller admits this complete allocation before transferring it here.
 	pub fn install_selection(&mut self, mut selected: Vec<String>) {
 		normalize_selection(&mut selected);

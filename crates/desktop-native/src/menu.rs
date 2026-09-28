@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::i18n::t;
 use crate::icons::{icon, Icon};
 use crate::theme::*;
-use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture, TreeCommand};
+use crate::tree::FlattenedTreeRow;
 use crate::ui::probe;
 use crate::WorkbenchModel;
 
@@ -131,8 +131,6 @@ pub struct ContextMenu {
 
 #[derive(Clone, Debug)]
 pub enum MenuAct {
-	Tree(TreeCommand),
-	WsTree(TreeCommand),
 	RevToggle {
 		sha: String,
 		path: String,
@@ -153,6 +151,8 @@ pub enum MenuAct {
 	/// Snip-sync copy of files as they are in a commit: (repository root,
 	/// commit, path).
 	CopyRevFiles(Vec<(PathBuf, String, String)>),
+	/// The Project view's selection, as one snip-sync payload.
+	CopyProjectSelection,
 	CommitFileDiff(String),
 	Select(String),
 	BrowseTree(String),
@@ -287,18 +287,22 @@ impl WorkbenchModel {
 		]
 	}
 
-	/// `ws`: a row of the workspace tree (outside every repo).
+	/// `ws`: a row of the workspace tree (outside every repo). Copy Files
+	/// copies the whole Project selection, which this row is part of.
 	pub(crate) fn work_row_menu(
 		&self,
 		row: &FlattenedTreeRow,
 		ws: bool,
 	) -> Vec<MenuEntry> {
-		let toggle = row
-			.is_valid_utf8
-			.then(|| command_for_row(row, RowGesture::Toggle))
-			.flatten()
-			.map(if ws { MenuAct::WsTree } else { MenuAct::Tree });
-		let mut v = vec![basket_entry(row.selected, toggle), MenuEntry::Sep];
+		let mut v = vec![
+			item(
+				"copy-files",
+				"menu_copy_files",
+				None,
+				row.selected.then_some(MenuAct::CopyProjectSelection),
+			),
+			MenuEntry::Sep,
+		];
 		if ws {
 			let abs = self
 				.ws_root()
@@ -699,8 +703,6 @@ impl WorkbenchModel {
 				.map(|f| f.source.clone())
 		};
 		match act {
-			MenuAct::Tree(cmd) => self.dispatch_tree(Some(cmd), cx),
-			MenuAct::WsTree(cmd) => self.dispatch_ws_tree(Some(cmd), cx),
 			MenuAct::RevToggle { sha, path } => {
 				self.toggle_rev_file_selection(&sha, &path, cx)
 			}
@@ -727,6 +729,7 @@ impl WorkbenchModel {
 				window.focus(&self.reader_focus);
 			}
 			MenuAct::CopyCommits(_) => self.copy_commits_to_clipboard(cx),
+			MenuAct::CopyProjectSelection => self.copy_project_selection(cx),
 			MenuAct::CopyRevFiles(files) => {
 				let name = files
 					.first()

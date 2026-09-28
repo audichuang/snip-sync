@@ -255,6 +255,32 @@ fn key(wid: &str, keys: &str) {
 	assert!(st.success(), "xdotool key failed for {keys}");
 }
 
+/// Ctrl-click (Cmd elsewhere) the centre of `v`: the Project view's
+/// multi-selection toggle, which replaced its checkboxes.
+fn ctrl_click_at(wid: &str, v: [i32; 4]) {
+	let _ = Command::new("xdotool")
+		.args(["windowfocus", "--sync", wid])
+		.status();
+	let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+	let st = Command::new("xdotool")
+		.args([
+			"mousemove",
+			"--window",
+			wid,
+			&x.to_string(),
+			&y.to_string(),
+			"keydown",
+			"ctrl",
+			"click",
+			"1",
+			"keyup",
+			"ctrl",
+		])
+		.status()
+		.unwrap();
+	assert!(st.success(), "ctrl-click at {v:?}");
+}
+
 /// Ctrl+Q must exit the app cleanly (status 0) within the deadline. A hang
 /// or crash fails the test after the process is killed and reaped.
 fn quit_cleanly(app: &mut App, wid: &str) {
@@ -1319,14 +1345,15 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	wait_for_pattern("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3))
 		.expect("Alt+1 must switch to FileExplorer");
 
-	// Tick the checkbox of unchanged tracked file 'unchanged.txt'
-	println!("[TEST DRIVER] Clicking checkbox for unchanged.txt...");
-	click("tree-chk:unchanged.txt");
+	// Click the unchanged tracked file 'unchanged.txt': it becomes the
+	// Project selection alone (nested.txt, clicked earlier, leaves it).
+	println!("[TEST DRIVER] Selecting unchanged.txt...");
+	click("tree-row:unchanged.txt");
 	wait_for_pattern(
-		"[APP:TREE_TOGGLED: unchanged.txt]",
+		"[APP:TREE_SELECTED: unchanged.txt]",
 		Duration::from_secs(3),
 	)
-	.expect("unchanged.txt checkbox must be toggled");
+	.expect("unchanged.txt must become the selection");
 
 	// Switching tool windows must not clear the pending copy selection
 	click("rail-changes");
@@ -2822,13 +2849,15 @@ fn native_d3_files_and_replay_skip_oracles() {
 	wait_for("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3));
 	click("pick-repo:repo-one");
 	wait_for("[APP:REPO_LOADED: repo-one", Duration::from_secs(6));
-	click("tree-chk:one.txt");
+	std::thread::sleep(Duration::from_millis(180));
+	ctrl_click_at(&wid, control("tree-row:one.txt"));
 	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
 	click("btn-repo-selector");
 	wait_for("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3));
 	click("pick-repo:repo-two");
 	wait_for("[APP:REPO_LOADED: repo-two", Duration::from_secs(6));
-	click("tree-chk:two.txt");
+	std::thread::sleep(Duration::from_millis(180));
+	ctrl_click_at(&wid, control("tree-row:two.txt"));
 	let basket = wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
 	assert!(basket.contains("one.txt"), "{basket}");
 	assert!(basket.contains("two.txt"), "{basket}");
@@ -3118,13 +3147,14 @@ fn native_tree_paging_retry_selection_900x600() {
 	assert!(has_id("tree-row:broken").is_some(), "broken directory row");
 
 	// Topmost, not HashMap order: the bottom row can be clipped by the list.
-	let chk = settled()
+	let row = settled()
 		.into_iter()
-		.filter(|(id, _)| id.starts_with("tree-chk:f-"))
+		.filter(|(id, _)| id.starts_with("tree-row:f-"))
 		.min_by_key(|(_, b)| b[1])
 		.map(|(id, _)| id)
-		.expect("a root file checkbox");
-	click(&chk);
+		.expect("a root file row");
+	std::thread::sleep(Duration::from_millis(180));
+	ctrl_click_at(&wid, control(&row));
 	let toggled =
 		lines_until(&app.rx, "[APP:TREE_TOGGLED:", Duration::from_secs(5))
 			.unwrap();
@@ -4367,17 +4397,19 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	absent("context-menu");
 	assert_eq!(clip_get(), "subfolder/nested.txt");
 
-	// 2. Keyboard: Down highlights the first item, Enter runs it.
+	// 2. Keyboard: Down highlights the first item, Enter runs it. The
+	// right-click selected the row alone, so Copy Files copies just it.
 	right_click("tree-row:alpha.txt");
-	wait("[APP:MENU_OPEN: Left items=add-basket");
+	wait("[APP:BASKET: n=1");
+	wait("[APP:MENU_OPEN: Left items=copy-files");
 	key(&wid, "Down");
 	key(&wid, "Return");
-	wait("[APP:MENU_ACTION: add-basket]");
-	wait("[APP:BASKET: n=1");
+	wait("[APP:MENU_ACTION: copy-files]");
+	wait("[APP:COPY_DONE: copied=1]");
 	absent("context-menu");
 	// Escape closes a menu without running anything.
 	right_click("tree-row:alpha.txt");
-	wait("[APP:MENU_OPEN: Left items=remove-basket");
+	wait("[APP:MENU_OPEN: Left items=copy-files");
 	key(&wid, "Escape");
 	let closed = wait("[APP:MENU_CLOSED]");
 	assert!(
@@ -5903,13 +5935,13 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	control("ws-tree-row:top.txt");
 	click("ws-tree-row:notes");
 	wait_for("[APP:WS_TREE_PAGE: rel=notes", Duration::from_secs(4));
+	// A plain click selects the file alone and previews it.
 	click("ws-tree-row:notes/readme.txt");
+	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
 	wait_for(
 		"[APP:PREVIEW_LOADED: notes/readme.txt]",
 		Duration::from_secs(4),
 	);
-	click("ws-tree-chk:notes/readme.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
 	let copied = clip::read_text().unwrap();
@@ -5918,7 +5950,8 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	assert!(!copied.contains("TOP_BYTES"), "{copied}");
 
 	// A repo file and a workspace file copy together as one payload.
-	click("tree-chk:main.rs");
+	std::thread::sleep(Duration::from_millis(200));
+	ctrl_click_at(&wid, control("tree-row:main.rs"));
 	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
@@ -6048,7 +6081,7 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 	wait_for("[APP:WS_TREE_PAGE: rel=plain", Duration::from_secs(4));
 	assert!(y("repo-row:INVI_SRC") < y("repo-row:inner"));
 	assert!(y("tree-row:lib.rs") < y("ws-tree-row:plain/x.txt"));
-	click("ws-tree-chk:plain/x.txt");
+	click("ws-tree-row:plain/x.txt");
 	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
@@ -6066,4 +6099,168 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
 	assert!(clip::read_text().unwrap().contains("PLAIN_X_BYTES"));
 	quit_cleanly(&mut app, &wid);
+}
+
+/// The Project view has no checkboxes (IntelliJ): Ctrl/Cmd-click gathers
+/// files from different folders, right-click > Copy Files copies them all;
+/// Shift-click selects a range; a plain click selects one file alone.
+#[test]
+fn native_project_view_multiselect_and_right_click_copy() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("pick");
+	fs::create_dir_all(ws.join("a")).unwrap();
+	fs::create_dir_all(ws.join("b")).unwrap();
+	git_ok(&ws, &["init", "-q", "-b", "main"]);
+	git_ok(&ws, &["config", "user.name", "Tester"]);
+	git_ok(&ws, &["config", "user.email", "test@example.com"]);
+	fs::write(ws.join("a/one.txt"), "ONE_BYTES\n").unwrap();
+	fs::write(ws.join("b/two.txt"), "TWO_BYTES\n").unwrap();
+	fs::write(ws.join("c.txt"), "C_BYTES\n").unwrap();
+	fs::create_dir_all(ws.join("d/inner")).unwrap();
+	fs::write(ws.join("d/deep.txt"), "DEEP_BYTES\n").unwrap();
+	fs::write(ws.join("d/inner/more.txt"), "MORE_BYTES\n").unwrap();
+	git_ok(&ws, &["add", "."]);
+	git_ok(&ws, &["commit", "-qm", "base"]);
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 1]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, pre: &[&str], button: &str, post: &[&str]| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let (x, y) = (x.to_string(), y.to_string());
+		let mut args = vec!["mousemove", "--window", &wid, &x, &y];
+		args.extend_from_slice(pre);
+		args.extend_from_slice(&["click", button]);
+		args.extend_from_slice(post);
+		let st = Command::new("xdotool").args(&args).status().unwrap();
+		assert!(st.success(), "click {id}");
+	};
+	let click = |id: &str| press(id, &[], "1", &[]);
+	let ctrl_click =
+		|id: &str| press(id, &["keydown", "ctrl"], "1", &["keyup", "ctrl"]);
+	let shift_click =
+		|id: &str| press(id, &["keydown", "shift"], "1", &["keyup", "shift"]);
+	let copy_by_menu = |row: &str| -> String {
+		press(row, &[], "3", &[]);
+		wait_for(
+			"[APP:MENU_OPEN: Left items=copy-files",
+			Duration::from_secs(3),
+		);
+		click("menu-item:copy-files");
+		wait_for("[APP:COPY_DONE:", Duration::from_secs(6));
+		clip::read_text().unwrap()
+	};
+
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	control("tree-row:c.txt");
+	absent_id(&bounds, "tree-chk:c.txt");
+	click("tree-row:a");
+	wait_for("[APP:TREE_EXPANDED: a]", Duration::from_secs(4));
+	click("tree-row:b");
+	wait_for("[APP:TREE_EXPANDED: b]", Duration::from_secs(4));
+
+	// Ctrl-click two files in different folders, then copy by right-click.
+	ctrl_click("tree-row:a/one.txt");
+	wait_for("[APP:TREE_TOGGLED: a/one.txt]", Duration::from_secs(3));
+	ctrl_click("tree-row:b/two.txt");
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	let both = copy_by_menu("tree-row:b/two.txt");
+	assert!(both.contains("ONE_BYTES"), "{both}");
+	assert!(both.contains("TWO_BYTES"), "{both}");
+	assert!(!both.contains("C_BYTES"), "{both}");
+
+	// A plain click selects that file alone.
+	click("tree-row:c.txt");
+	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	let alone = copy_by_menu("tree-row:c.txt");
+	assert!(alone.contains("C_BYTES"), "{alone}");
+	assert!(!alone.contains("ONE_BYTES"), "{alone}");
+
+	// Right-click outside the selection selects that row alone first.
+	let other = copy_by_menu("tree-row:a/one.txt");
+	assert!(other.contains("ONE_BYTES"), "{other}");
+	assert!(!other.contains("C_BYTES"), "{other}");
+
+	// Shift-click selects the rows between the cursor and the click.
+	click("tree-row:a/one.txt");
+	wait_for(
+		"[APP:TREE_FILE_SELECTED: a/one.txt]",
+		Duration::from_secs(3),
+	);
+	shift_click("tree-row:b/two.txt");
+	wait_for(
+		"[APP:TREE_SELECTED: a/one.txt,b,b/two.txt]",
+		Duration::from_secs(3),
+	);
+	let range = copy_by_menu("tree-row:b/two.txt");
+	assert!(range.contains("ONE_BYTES"), "{range}");
+	assert!(range.contains("TWO_BYTES"), "{range}");
+	assert!(!range.contains("C_BYTES"), "{range}");
+
+	// A folder never opened copies every file under it.
+	ctrl_click("tree-row:d");
+	wait_for("[APP:TREE_TOGGLED: d]", Duration::from_secs(3));
+	let folder = copy_by_menu("tree-row:d");
+	assert!(folder.contains("DEEP_BYTES"), "{folder}");
+	assert!(folder.contains("MORE_BYTES"), "{folder}");
+	assert!(folder.contains("TWO_BYTES"), "{folder}");
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Waits until `id` is gone from the probed bounds.
+fn absent_id(bounds: &Bounds, id: &str) {
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while bounds.lock().unwrap().contains_key(id) {
+		assert!(Instant::now() < deadline, "{id} must not be drawn");
+		std::thread::sleep(Duration::from_millis(40));
+	}
 }

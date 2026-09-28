@@ -35,6 +35,79 @@ pub(crate) fn arm_cancel(slot: &mut Option<CancelToken>) -> CancelToken {
 }
 
 /// Interactive read options that carry `cancel` into `Git::open_with`.
+/// A selected folder copies its files, walked in the copy job: a folder
+/// item itself cannot export. A nested repo's files (and `.git`) never
+/// come along; a path already selected is not added twice.
+// ponytail: one ExportItem per walked file; a huge folder is bounded only
+// by the payload cap that the plan applies afterwards.
+fn expand_folder_items(
+	sel: ExportSelection,
+	cancel: &CancelToken,
+) -> Result<ExportSelection, snip_core::transfer::TransferError> {
+	let is_folder = |item: &ExportItem| {
+		item.source == SourceKind::File
+			&& std::fs::symlink_metadata(
+				item.root.path().join(&item.relative_path),
+			)
+			.is_ok_and(|meta| meta.is_dir())
+	};
+	if !sel.items.iter().any(is_folder) {
+		return Ok(sel);
+	}
+	let mut seen: HashSet<(PathBuf, String)> = sel
+		.items
+		.iter()
+		.map(|item| {
+			(item.root.path().to_path_buf(), item.relative_path.clone())
+		})
+		.collect();
+	let mut items = Vec::with_capacity(sel.items.len());
+	for item in sel.items {
+		if !is_folder(&item) {
+			items.push(item);
+			continue;
+		}
+		let dir = item.root.path().join(&item.relative_path);
+		let walk = snip_core::fsutil::list_files_recursive(&dir, |d| {
+			d == dir.as_path()
+				|| !(d.file_name() == Some(".git".as_ref())
+					|| d.join(".git").exists())
+		});
+		for walked in walk {
+			if cancel.is_cancelled() {
+				break;
+			}
+			let snip_core::fsutil::WalkItem::File(path) = walked else {
+				continue;
+			};
+			if path.file_name() == Some(".git".as_ref()) {
+				continue;
+			}
+			let Some(rel) = path
+				.strip_prefix(item.root.path())
+				.ok()
+				.and_then(|rel| rel.to_str())
+				.map(|rel| rel.replace('\\', "/"))
+			else {
+				continue;
+			};
+			if seen.insert((item.root.path().to_path_buf(), rel.clone())) {
+				items.push(ExportItem {
+					root: item.root.clone(),
+					relative_path: rel,
+					source: SourceKind::File,
+					change_type: None,
+				});
+			}
+		}
+	}
+	ExportSelection::new(
+		sel.roots.iter().map(|r| r.path().to_path_buf()).collect(),
+		sel.primary_root.map(|r| r.path().to_path_buf()),
+		items,
+	)
+}
+
 pub(crate) fn interactive_read_opts(cancel: CancelToken) -> RunOptions {
 	RunOptions {
 		cancel: Some(cancel),
@@ -3431,6 +3504,60 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// The Project view's selection is the basket's File items, across
+	/// every root: selecting rows alone (click, range, right-click) drops
+	/// every other File item, never the Changes checks or Log picks.
+	pub fn select_tree_rows_alone(
+		&mut self,
+		ws: bool,
+		rels: &[String],
+		cx: &mut Context<Self>,
+	) {
+		if !self.accepting_work() {
+			return;
+		}
+		let tree = if ws { &self.ws_tree } else { &self.file_tree };
+		let Some(paths) = tree.as_ref().map(|t| t.selection_for_rels(rels))
+		else {
+			return;
+		};
+		let mut candidate = self.selection_candidate();
+		for (_, items) in &mut candidate.basket {
+			items.retain(|item| item.source != SourceKind::File);
+		}
+		candidate.basket.retain(|(_, items)| !items.is_empty());
+		if ws {
+			candidate.paths = Vec::new();
+			candidate.ws_paths = paths;
+		} else {
+			candidate.paths = paths;
+			candidate.ws_paths = Vec::new();
+		}
+		candidate.replace_file_group = true;
+		if self.install_selection_candidate(candidate) {
+			app_log!("[APP:TREE_SELECTED: {}]", rels.join(","));
+			self.log_basket();
+		}
+		cx.notify();
+	}
+
+	/// The Project view's "Copy Files": its selection (the basket's File
+	/// items) alone, without the Changes checks or Log picks.
+	pub fn copy_project_selection(&mut self, cx: &mut Context<Self>) {
+		let items: Vec<ExportItem> = self
+			.basket
+			.iter()
+			.flat_map(|(_, items)| items.iter())
+			.filter(|item| item.source == SourceKind::File)
+			.cloned()
+			.collect();
+		let name = self
+			.repo()
+			.map(|repo| repo.name.clone())
+			.unwrap_or_else(|| "basket".into());
+		self.export_items_to_clipboard(items, name, cx);
+	}
+
 	fn next_tree_io(&mut self) -> Option<TreeIo> {
 		if let Some(io) = self.tree_queue.pop_front() {
 			return Some(io);
@@ -4572,6 +4699,11 @@ impl WorkbenchModel {
 						let settings = Settings::default();
 						// Document cap is the retained UI output ceiling.
 						// It is not `RunOptions::max_stdout`.
+						let export_sel =
+							expand_folder_items(export_sel, &run_token)
+								.map_err(|e| {
+									Msg::new("error_payload", [e.to_string()])
+								})?;
 						let plan = plan_export_with(
 							&export_sel,
 							&settings,

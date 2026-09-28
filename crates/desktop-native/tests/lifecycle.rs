@@ -446,6 +446,31 @@ fn click(wid: &str, id: &str) {
 	assert!(st.success(), "click {id} failed");
 }
 
+/// Ctrl-click: the Project view's multi-selection toggle.
+fn ctrl_click(wid: &str, id: &str) {
+	std::thread::sleep(Duration::from_millis(180));
+	focus(wid);
+	let v = control(id);
+	let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+	let st = Command::new("xdotool")
+		.args([
+			"mousemove",
+			"--window",
+			wid,
+			&x.to_string(),
+			&y.to_string(),
+			"keydown",
+			"ctrl",
+			"click",
+			"1",
+			"keyup",
+			"ctrl",
+		])
+		.status()
+		.expect("xdotool ctrl-click");
+	assert!(st.success(), "ctrl-click {id} failed");
+}
+
 fn capture(wid: &str, path: &Path) {
 	if let Some(parent) = path.parent() {
 		let _ = fs::create_dir_all(parent);
@@ -2477,7 +2502,7 @@ fn failed_drain_recovers_and_allows_expand_preview_and_close() {
 	);
 
 	// Select note.txt into basket so we can prove selection survives failed drain
-	click(&wid, "tree-chk:note.txt");
+	ctrl_click(&wid, "tree-row:note.txt");
 	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
 
 	// Hold the directory expansion of "sub"
@@ -2632,7 +2657,7 @@ fn export_refuses_when_source_mutated_after_plan_ready() {
 	);
 
 	// Select note.txt into basket
-	click(&wid, "tree-chk:note.txt");
+	ctrl_click(&wid, "tree-row:note.txt");
 	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
 
 	// Trigger copy

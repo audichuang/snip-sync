@@ -1730,6 +1730,16 @@ def _try_tree(session: NativeSession, win: dict[str, Any], interactions: list[di
             lambda text: "TREE_FILE_SELECTED" in text or "TREE_EXPANDED" in text or "TREE_TOGGLED" in text,
             start=before, timeout=8,
         )
+        if "TREE_FILE_SELECTED" in line:
+            # A plain click on a file also selects it into the basket; Ctrl-click
+            # toggles it back out so the copy item starts from an empty basket.
+            again = len(session.lines)
+            session.x("xdotool", "keydown", "ctrl")
+            try:
+                session.click(win, bounds)
+            finally:
+                session.x("xdotool", "keyup", "ctrl")
+            session.wait_line(lambda text: "[APP:BASKET: n=0" in text, start=again, timeout=8)
         note(item="tree", ok=True, input="click", control=tree_ids[0], log=line, root=_root_dict(session))
     except (NativeBenchError, LeakError) as exc:
         note(item="tree", ok=False, input="click", log="", reason=str(exc))

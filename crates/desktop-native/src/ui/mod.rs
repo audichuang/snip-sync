@@ -721,6 +721,37 @@ impl WorkbenchModel {
 		out
 	}
 
+	/// Shift-click: the rows from the cursor to `ix` that belong to the
+	/// same tree become the Project selection. The cursor stays the anchor.
+	pub(crate) fn select_tree_range(
+		&mut self,
+		ix: usize,
+		ws: bool,
+		cx: &mut Context<Self>,
+	) {
+		let rows = self.project_rows();
+		let (from, to) = (self.tree_cursor.min(ix), self.tree_cursor.max(ix));
+		let rels: Vec<String> = rows
+			.into_iter()
+			.skip(from)
+			.take(to.saturating_sub(from) + 1)
+			.filter_map(|row| match row {
+				ProjRow::Ws(r) if ws => Some(r),
+				ProjRow::Work(r) if !ws => Some(r),
+				_ => None,
+			})
+			.filter(|r| {
+				r.is_valid_utf8
+					&& !(r.is_error
+						|| r.is_loading || r.is_more_marker
+						|| r.is_truncation_marker
+						|| r.is_view_limit)
+			})
+			.map(|r| r.rel_path)
+			.collect();
+		self.select_tree_rows_alone(ws, &rels, cx);
+	}
+
 	/// Whether a repo row shows its files. The workspace repo's row stays
 	/// open while another repo is open: the repos inside sit in its tree.
 	pub(crate) fn repo_row_open(&self, idx: usize) -> bool {
