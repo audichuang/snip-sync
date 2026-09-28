@@ -512,9 +512,9 @@ pub struct PasteApplyResult {
 }
 
 impl PasteApplyResult {
-	/// Status line after an apply. Per-file failures are listed, not just
-	/// counted: the writes before them are kept, so the user must see which
-	/// paths did not land.
+	/// The result card after an apply. Per-file failures are listed, not
+	/// just counted: the writes before them are kept, so the user must see
+	/// which paths did not land.
 	pub fn status(&self) -> Msg {
 		if !self.created_commits.is_empty() {
 			return Msg::new(
