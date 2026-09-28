@@ -846,9 +846,13 @@ impl WorkbenchModel {
 							this.select_tree_range(ix, ws, cx);
 						} else {
 							this.tree_cursor = ix;
-							// Browsing does not select: a plain click opens
-							// a folder or previews a file. Only Ctrl/Shift,
-							// Space and right-click change what Copy takes.
+							// IntelliJ: a plain click selects the file alone
+							// and previews it; a folder click only opens it
+							// (selecting its files is Ctrl/Shift).
+							if !click_row.is_dir {
+								let rel = [click_row.rel_path.clone()];
+								this.select_tree_rows_alone(ws, &rel, cx);
+							}
 							dispatch(
 								this,
 								command_for_row(

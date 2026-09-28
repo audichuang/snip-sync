@@ -235,6 +235,27 @@ fn copied_status(
 	Msg::new("status_copied_limit", args)
 }
 
+/// One root's basket items without a Project File item whose path is also
+/// a worktree Changes item (Working/Unstaged): both read the same bytes on
+/// disk, so Copy takes it once. Other same-path pairs (Staged vs Working,
+/// two commits) stay and are refused as collisions.
+fn without_worktree_twins(items: &[ExportItem]) -> Vec<&ExportItem> {
+	let worktree: HashSet<&str> = items
+		.iter()
+		.filter(|item| {
+			matches!(item.source, SourceKind::Working | SourceKind::Unstaged)
+		})
+		.map(|item| item.relative_path.as_str())
+		.collect();
+	items
+		.iter()
+		.filter(|item| {
+			item.source != SourceKind::File
+				|| !worktree.contains(item.relative_path.as_str())
+		})
+		.collect()
+}
+
 /// Measurement harness readiness marker (`--mode idle|overview|preview`).
 fn ready_marker(name: &str) {
 	println!("[READY:{name}]");
@@ -3629,9 +3650,8 @@ impl WorkbenchModel {
 	}
 
 	/// The Project view's selection is the basket's File items, across
-	/// every root: selecting rows alone (range, right-click) drops every
-	/// other File item, never the Changes checks or Log picks. A plain
-	/// click only previews ("browsing does not select").
+	/// every root: selecting rows alone (click, range, right-click) drops
+	/// every other File item, never the Changes checks or Log picks.
 	pub fn select_tree_rows_alone(
 		&mut self,
 		ws: bool,
@@ -4618,8 +4638,8 @@ impl WorkbenchModel {
 	pub fn basket_collision_text(&self) -> Option<String> {
 		let mut out = String::new();
 		for (root, items) in &self.basket {
-			let mut paths: Vec<_> = items
-				.iter()
+			let mut paths: Vec<_> = without_worktree_twins(items)
+				.into_iter()
 				.map(|item| item.relative_path.as_str())
 				.collect();
 			paths.sort_unstable();
@@ -4764,8 +4784,12 @@ impl WorkbenchModel {
 			.repo()
 			.map(|repo| repo.name.clone())
 			.unwrap_or_else(|| "basket".into());
-		let items: Vec<ExportItem> =
-			self.basket.iter().flat_map(|(_, i)| i.clone()).collect();
+		let items: Vec<ExportItem> = self
+			.basket
+			.iter()
+			.flat_map(|(_, items)| without_worktree_twins(items))
+			.cloned()
+			.collect();
 		self.export_items_to_clipboard(items, repo_name, cx);
 	}
 
@@ -6445,6 +6469,41 @@ mod tests {
 			assert_eq!(
 				crate::copied_status("r".into(), &plan, &whole).key,
 				"status_copied"
+			);
+		}
+
+		/// A Project file that is also a Working change copies once; a
+		/// Staged twin is still a real conflict.
+		#[test]
+		fn worktree_twin_of_a_project_file_is_dropped() {
+			let (_tmp, root) = canonical_tmp();
+			let id = CanonicalRootId::new(&root).unwrap();
+			let item = |path: &str, source: SourceKind| ExportItem {
+				root: id.clone(),
+				relative_path: path.into(),
+				source,
+				change_type: None,
+			};
+			let items = [
+				item("a.txt", SourceKind::File),
+				item("a.txt", SourceKind::Working),
+				item("b.txt", SourceKind::File),
+				item("b.txt", SourceKind::Staged),
+				item("c.txt", SourceKind::Unstaged),
+				item("c.txt", SourceKind::File),
+			];
+			let kept: Vec<_> = crate::without_worktree_twins(&items)
+				.into_iter()
+				.map(|i| (i.relative_path.as_str(), i.source.clone()))
+				.collect();
+			assert_eq!(
+				kept,
+				[
+					("a.txt", SourceKind::Working),
+					("b.txt", SourceKind::File),
+					("b.txt", SourceKind::Staged),
+					("c.txt", SourceKind::Unstaged),
+				]
 			);
 		}
 
