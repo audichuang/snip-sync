@@ -228,22 +228,35 @@ fn cancel_kills_process_group_including_descendants_without_leak() {
 fn fast_child_rapid_cleanup_releases_all_permits_without_leftover_error() {
 	let _s = serial();
 	let (_dir, git) = repo();
-	for _ in 0..10 {
-		let out = git.run(&["--version"]).unwrap();
+	for i in 0..10 {
+		let out = git
+			.run(&["--version"])
+			.unwrap_or_else(|e| panic!("round {i}: git --version: {e:?}"));
 		assert!(!out.is_empty());
-		let out_echo =
-			alias(&git, "echo fast", &RunOptions::default()).unwrap();
+		let out_echo = alias(&git, "echo fast", &RunOptions::default())
+			.unwrap_or_else(|e| panic!("round {i}: echo alias: {e:?}"));
 		assert_eq!(String::from_utf8_lossy(&out_echo).trim(), "fast");
-		let out_exit = alias(&git, "exit 0", &RunOptions::default()).unwrap();
+		let out_exit = alias(&git, "exit 0", &RunOptions::default())
+			.unwrap_or_else(|e| panic!("round {i}: exit alias: {e:?}"));
 		assert!(out_exit.is_empty());
-		assert_eq!(in_flight(), 0);
-		assert_eq!(leaked_slots(), 0);
+		assert_eq!(
+			(in_flight(), leaked_slots()),
+			(0, 0),
+			"round {i}: slots still taken (in flight, leaked)"
+		);
 	}
 }
 
 #[test]
 fn full_budget_queues_then_cancel_or_queue_timeout_never_spawn() {
 	let _s = serial();
+	// A slot leaked by an earlier test leaves a holder queued behind it;
+	// fail here instead of waiting for it.
+	assert_eq!(
+		(in_flight(), leaked_slots()),
+		(0, 0),
+		"slots taken before start"
+	);
 	let (_dir, git) = repo();
 	// Two long-lived cat-file sessions on other threads hold both slots.
 	let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -262,8 +275,12 @@ fn full_budget_queues_then_cancel_or_queue_timeout_never_spawn() {
 			})
 		})
 		.collect();
+	// Only the holders keep senders, so one that panics disconnects.
+	drop(ready_tx);
 	for _ in 0..MAX_CONCURRENT_GIT {
-		ready_rx.recv().unwrap();
+		ready_rx
+			.recv_timeout(Duration::from_secs(30))
+			.expect("a holder never got its slot");
 	}
 	assert_eq!(in_flight(), MAX_CONCURRENT_GIT);
 

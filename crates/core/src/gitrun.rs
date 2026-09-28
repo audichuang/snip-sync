@@ -761,9 +761,11 @@ mod tree {
 
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
 	const MAX_PS_OUTPUT: usize = 256 * 1024;
+	/// Starting `ps` on a loaded Mac took up to 3.4 s (efficiency cores under
+	/// load); 500 ms made clean exits fail and leak their slot for good.
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
-	const PS_TIMEOUT: std::time::Duration =
-		std::time::Duration::from_millis(500);
+	pub(super) const PS_TIMEOUT: std::time::Duration =
+		std::time::Duration::from_secs(10);
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
 	const HELPER_CLEANUP_GRACE: std::time::Duration =
 		std::time::Duration::from_millis(200);
@@ -2165,7 +2167,7 @@ mod tests {
 		let err = res.unwrap_err();
 		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 		assert!(
-			elapsed < Duration::from_secs(3),
+			elapsed < tree::PS_TIMEOUT + Duration::from_secs(2),
 			"helper must be timed out quickly, took {elapsed:?}"
 		);
 		let pid = test_last_helper_pid().expect("helper PID must be recorded");
@@ -2193,7 +2195,7 @@ mod tests {
 		let err = res.unwrap_err();
 		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 		assert!(
-			elapsed < Duration::from_secs(3),
+			elapsed < tree::PS_TIMEOUT + Duration::from_secs(2),
 			"helper must be timed out within deadline, took {elapsed:?}"
 		);
 		let pid = test_last_helper_pid().expect("helper PID must be recorded");

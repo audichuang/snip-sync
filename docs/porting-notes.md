@@ -63,7 +63,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
     當群組內所有程序皆已結束(或未 reap 的 root 是唯一程序且已退出)，可發送信號之程序數為 0，在 POSIX 模式下會回傳 `EPERM` (`os error 1`)
     而非 `ESRCH`。但 `EPERM` 亦可能因 MAC policy 或特權限制導致無法對存活後代發信號，因此 `gitrun` 不無條件忽略 `EPERM`，
     而是在遇上 `EPERM` 時以 `/bin/ps -ax -o stat=,pgid=` 檢查該 PGID。此檢查有嚴格的生命週期時限與空間邊界：
-    500 ms 總 deadline（涵蓋 stdout 管線讀取與 EOF 後的程序退出等待，防止 helper 關閉 stdout 後卡死）、256 KiB 輸出上限、
+    10 s 總 deadline（負載高的 Mac 上啟動 `ps` 實測可達 3.4 s，原本的 500 ms 讓正常結束的呼叫失敗並永久占住 budget slot；涵蓋 stdout 管線讀取與 EOF 後的程序退出等待，防止 helper 關閉 stdout 後卡死）、256 KiB 輸出上限、
     以及 200 ms 終止寬限（kill 後輪詢 try_wait 確保 reap，並將 kill/reap 失敗向外傳播，絕不在 Drop 內無窮等待或遺留 stray/zombie helper）。
     其代價為 $O(\text{processes})$ 的系統程序表掃描，且僅在 macOS / Darwin 遇上 `EPERM` 時才觸發。
     解析器採零記憶體分配驗證（非 UTF-8、欄位數量不符、無效 primary stat、非數字 PGID、缺少換行截斷皆回報錯誤），
