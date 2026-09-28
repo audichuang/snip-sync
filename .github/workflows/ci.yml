@@ -323,6 +323,8 @@ jobs:
                   save-if: ${{ github.ref == 'refs/heads/main' }}
                   shared-key: ${{ runner.os }}-native-e2e
                   cache-on-failure: true
+            # The drivers compile C helpers at run time (lifecycle's WM_DELETE sender,
+            # the IME XCB probe), so they need the X11/XCB -dev headers, not just runtime libs.
             - name: Install isolated acceptance dependencies
               run: |
                   sudo apt-get update

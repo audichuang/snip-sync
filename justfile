@@ -19,6 +19,8 @@ preflight: preflight-workflows preflight-rust preflight-harness native-acceptanc
 
 # Same as CI's Lint Workflows job; needs actionlint and shellcheck on PATH.
 preflight-workflows:
+	@# actionlint silently skips the run: scripts without shellcheck; CI has it preinstalled.
+	@command -v shellcheck >/dev/null || { echo "shellcheck not on PATH: actionlint would skip the run: scripts CI lints (pip install shellcheck-py)" >&2; exit 1; }
 	actionlint
 
 preflight-rust:
