@@ -3,6 +3,8 @@
 
 All outputs are fresh, outside the checkout, and retained. --build-receipt reuses
 a build made by this entrypoint only when the checkout and executable still match.
+CI runs the gates as parallel shards against one build, then --gate merge folds
+their receipts into the single gate "all" receipt a release checks.
 """
 
 from __future__ import annotations
@@ -170,7 +172,24 @@ def verify_build(receipt: Path) -> dict:
     return data
 
 
-def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[dict]) -> None:
+def parse_shard(text: str) -> tuple[int, int]:
+    """"K/N" with 1 <= K <= N."""
+    try:
+        k, n = (int(part) for part in text.split("/"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("shard must be K/N, e.g. 1/2") from None
+    if not 1 <= k <= n:
+        raise argparse.ArgumentTypeError("shard must satisfy 1 <= K <= N")
+    return k, n
+
+
+def shard_steps(manifest: dict, shard: tuple[int, int]) -> list[str]:
+    k, n = shard
+    return [str(step["id"]) for step in manifest["steps"]][k - 1::n]
+
+
+def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[dict],
+             shard: tuple[int, int] | None = None) -> None:
     python = [sys.executable, "-B"]
     binary, sha = data["binary"], data["sha256"]
     if gate == "ime":
@@ -184,10 +203,11 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
         helpers = output / "helper-receipt.json"
         write_json(helpers, {"files": {name: {"sha256": sha256_file(str(ROOT / "scripts" / name))}
                                      for name in ("bench_native_memory.py", "memory_harness.py")}})
+        select = ["--steps", ",".join(shard_steps(manifest, shard))] if shard else ["--phase", "all"]
         run(python + ["scripts/check_native_collaboration.py", "--binary", binary,
                       "--binary-sha", sha, "--fixture", str(fixture),
                       "--dataset-hash", manifest["datasetHash"], "--helper-receipt", str(helpers),
-                      "--phase", "all", "--timeout", "60", "--output", str(output / gate)],
+                      *select, "--timeout", "60", "--output", str(output / gate)],
             output, gate, commands)
     else:
         profile = gate.removeprefix("resource-")
@@ -204,38 +224,106 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
                       "--out-dir", str(output / gate)], output, gate, commands)
 
 
+def merge(shards: list[Path], receipt: Path, data: dict) -> list[dict]:
+    """Fold shard receipts into one "all" verdict, refusing any gap.
+
+    Every shard must have PASSED against this very build, together they must
+    cover every gate, and the collaboration shards must have passed every
+    manifest step exactly once, so a lost or skipped shard cannot go green.
+    """
+    commands, gates, passed, manifest_ids = [], set(), [], None
+    for shard in shards:
+        acc = json.loads((shard / "acceptance.json").read_text())
+        if acc.get("status") != "PASSED":
+            raise ValueError(f"{shard}: shard status is {acc.get('status')}")
+        if acc.get("binarySha256") != data["sha256"] or acc.get("sourceSha") != data["sourceSha"]:
+            raise ValueError(f"{shard}: shard ran a different build than {receipt}")
+        commands += acc.get("commands", [])
+        gates.update(acc.get("gates", []))
+        if "collaboration" in acc.get("gates", []):
+            manifest = json.loads((shard / "collaboration-fixture" / "manifest.json").read_text())
+            ids = [str(step["id"]) for step in manifest["steps"]]
+            if manifest_ids not in (None, ids):
+                raise ValueError(f"{shard}: collaboration fixture differs between shards")
+            manifest_ids = ids
+            report = json.loads((shard / "collaboration" / "report.json").read_text())
+            if report.get("exitCode") != 0:
+                raise ValueError(f"{shard}: collaboration exit {report.get('exitCode')}")
+            for step in report.get("steps", []):
+                if step.get("status") != "passed":
+                    raise ValueError(f"{shard}: step {step.get('id')} is {step.get('status')}")
+                passed.append(str(step["id"]))
+    missing = sorted(set(GATES) - gates)
+    if missing:
+        raise ValueError("no shard ran gate(s): " + ", ".join(missing))
+    if sorted(passed) != sorted(manifest_ids or []):
+        raise ValueError(f"collaboration steps passed {sorted(passed)}, manifest has {manifest_ids}")
+    return commands
+
+
+def parse_gates(text: str) -> tuple[str, ...]:
+    if text in ("all", "build", "merge", "resource-long"):
+        return {"all": GATES, "build": (), "merge": (), "resource-long": ("resource-long",)}[text]
+    gates = tuple(part.strip() for part in text.split(","))
+    unknown = [gate for gate in gates if gate not in GATES]
+    if unknown or len(set(gates)) != len(gates):
+        raise argparse.ArgumentTypeError(f"unknown or repeated gate(s) in {text!r}")
+    return gates
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gate", choices=("build", "all", *GATES, "resource-long"), default="all")
+    parser.add_argument("--gate", default="all",
+                        help="all, build, merge, resource-long, or a comma list of: " + ", ".join(GATES))
     parser.add_argument("--output", type=Path, help="Fresh directory outside checkout (default: unique /tmp run)")
     parser.add_argument("--build-receipt", type=Path, help="Reuse this entrypoint's frozen build, verifying all inputs")
+    parser.add_argument("--collaboration-shard", type=parse_shard, metavar="K/N",
+                        help="Run only every N-th collaboration step starting at K")
+    parser.add_argument("--merge", type=Path, nargs="+", metavar="SHARD_DIR",
+                        help="With --gate merge: shard outputs to fold into one gate-all receipt")
     args = parser.parse_args(argv)
     output = None
-    summary = {"gate": args.gate, "commands": [], "status": "FAILED", "fullD4Claimed": False}
+    # A merged receipt is the one a release checks; it claims the whole gate.
+    summary = {"gate": "all" if args.gate == "merge" else args.gate, "commands": [],
+               "status": "FAILED", "fullD4Claimed": False}
     try:
-        gates = GATES if args.gate == "all" else (() if args.gate == "build" else (args.gate,))
+        gates = parse_gates(args.gate)
+        if (args.gate == "merge") != bool(args.merge):
+            raise ValueError("--merge goes with --gate merge, and only with it")
+        if args.gate == "merge" and not args.build_receipt:
+            raise ValueError("--gate merge needs the shards' --build-receipt")
+        if args.collaboration_shard and "collaboration" not in gates:
+            raise ValueError("--collaboration-shard needs the collaboration gate")
         output = fresh_output(args.output)
         print(f"Acceptance evidence: {output}", flush=True)
         prerequisites(gates, building=args.build_receipt is None)
         receipt = args.build_receipt.resolve() if args.build_receipt else build(output, summary["commands"])
         summary["buildReceipt"] = str(receipt)
+        data = verify_build(receipt)
+        summary.update(gates=list(gates), binarySha256=data["sha256"], sourceSha=data["sourceSha"])
+        if args.collaboration_shard:
+            summary["collaborationShard"] = "%d/%d" % args.collaboration_shard
+        if args.merge:
+            summary["commands"] = merge(args.merge, receipt, data)
+            summary["gates"] = list(GATES)
+            summary["shards"] = [str(path) for path in args.merge]
         for gate in gates:
             data = verify_build(receipt)
             try:
-                run_gate(gate, output, receipt, data, summary["commands"])
+                run_gate(gate, output, receipt, data, summary["commands"], args.collaboration_shard)
             finally:
                 verify_build(receipt)
         verify_build(receipt)
         summary["status"] = "PASSED"
         return 0
-    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError,
+            argparse.ArgumentTypeError, json.JSONDecodeError) as exc:
         summary["error"] = str(exc)
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
     finally:
         if output is not None:
             write_json(output / "acceptance.json", summary)
-
 
 if __name__ == "__main__":
     sys.exit(main())

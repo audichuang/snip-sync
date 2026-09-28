@@ -194,14 +194,14 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual(acceptance.main(["--output", str(output)]), 0)
         build.assert_called_once()
         self.assertEqual([call.args[0] for call in gate.call_args_list], list(acceptance.GATES))
-        self.assertEqual(verify.call_count, 2 * len(acceptance.GATES) + 1)
+        self.assertEqual(verify.call_count, 2 * len(acceptance.GATES) + 2)
         failed = self.root / "failed"
         with mock.patch.object(acceptance, "prerequisites"), \
                 mock.patch.object(acceptance, "verify_build", return_value=self.data) as verify, \
                 mock.patch.object(acceptance, "run_gate", side_effect=RuntimeError("long missing-coverage")):
             self.assertEqual(acceptance.main(["--gate", "resource-long", "--output", str(failed),
                                               "--build-receipt", str(self.receipt)]), 1)
-        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(verify.call_count, 3)
         report = json.loads((failed / "acceptance.json").read_text())
         self.assertEqual(report["status"], "FAILED")
         self.assertFalse(report["fullD4Claimed"])
@@ -235,6 +235,59 @@ class AcceptanceTests(unittest.TestCase):
                 report = json.loads((output / "acceptance.json").read_text())
                 self.assertEqual(report["status"], "FAILED")
                 self.assertTrue(report["error"])
+
+    def shard(self, name, gates, steps=(), status="PASSED", sha=None, ids=("a", "b", "c")):
+        """A shard output as a CI job leaves it; only what merge reads."""
+        path = self.root / name
+        path.mkdir()
+        acceptance.write_json(path / "acceptance.json", {
+            "status": status, "gates": list(gates), "commands": [{"command": [name]}],
+            "binarySha256": sha or self.data["sha256"], "sourceSha": "abc"})
+        if "collaboration" in gates:
+            (path / "collaboration-fixture").mkdir()
+            acceptance.write_json(path / "collaboration-fixture" / "manifest.json",
+                                  {"steps": [{"id": step_id} for step_id in ids]})
+            (path / "collaboration").mkdir()
+            acceptance.write_json(path / "collaboration" / "report.json", {"exitCode": 0, "steps": [
+                {"id": step_id, "status": "passed"} for step_id in steps]})
+        return path
+
+    def test_collaboration_shards_split_every_step_exactly_once(self):
+        manifest = {"steps": [{"id": str(n)} for n in range(18)]}
+        shards = [acceptance.shard_steps(manifest, (k, 2)) for k in (1, 2)]
+        self.assertEqual(sorted(shards[0] + shards[1], key=int), [str(n) for n in range(18)])
+        self.assertFalse(set(shards[0]) & set(shards[1]))
+        for bad in ("0/2", "3/2", "x", "1/2/3"):
+            with self.subTest(bad=bad), self.assertRaises(Exception):
+                acceptance.parse_shard(bad)
+
+    def test_merge_needs_every_gate_and_step_from_this_build(self):
+        good = [self.shard("ime-res", ("ime", "resource-short")),
+                self.shard("c1", ("collaboration",), steps=("a", "c")),
+                self.shard("c2", ("collaboration",), steps=("b",))]
+        output = self.root / "merged"
+        with mock.patch.object(acceptance, "verify_build", return_value=self.data):
+            self.assertEqual(acceptance.main(["--gate", "merge", "--output", str(output),
+                "--build-receipt", str(self.receipt), "--merge", *map(str, good)]), 0)
+        report = json.loads((output / "acceptance.json").read_text())
+        # release.yml accepts exactly this shape.
+        self.assertEqual((report["status"], report["gate"]), ("PASSED", "all"))
+        self.assertEqual(len(report["commands"]), 3)
+        bad_sets = {
+            "lost step": [good[0], good[1]],
+            "lost gate": [good[1], good[2]],
+            "failed shard": [good[0], good[1], self.shard("c2f", ("collaboration",), ("b",), "FAILED")],
+            "other build": [good[0], good[1], self.shard("c2x", ("collaboration",), ("b",), sha="0" * 64)],
+            "step twice": [*good, self.shard("c3", ("collaboration",), steps=("b",))],
+        }
+        for reason, shards in bad_sets.items():
+            with self.subTest(reason=reason):
+                output = self.root / f"merged-{reason}"
+                with mock.patch.object(acceptance, "verify_build", return_value=self.data):
+                    code = acceptance.main(["--gate", "merge", "--output", str(output),
+                        "--build-receipt", str(self.receipt), "--merge", *map(str, shards)])
+                self.assertEqual(code, 1)
+                self.assertEqual(json.loads((output / "acceptance.json").read_text())["status"], "FAILED")
 
 
 if __name__ == "__main__":

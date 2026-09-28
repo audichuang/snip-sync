@@ -297,10 +297,12 @@ jobs:
 
     # Independent release-profile real-app gates. Each driver owns private
     # Xvfb, HOME and D-Bus; no shared DISPLAY or guessed historical binary.
-    native-acceptance:
-        name: Native Acceptance (Linux)
+    # Build once; the gates below run in parallel against this exact binary
+    # (run_native_acceptance.py re-verifies the checkout and sha256 in each).
+    native-acceptance-build:
+        name: Native Acceptance Build (Linux)
         runs-on: ubuntu-24.04
-        timeout-minutes: 120
+        timeout-minutes: 60
         env:
             RUSTFLAGS: "-D warnings"
             SNIP_REQUIRE_ALL_TESTS: "1"
@@ -316,24 +318,133 @@ jobs:
               with:
                   shared-key: ${{ runner.os }}-native-acceptance-release
                   cache-on-failure: true
-            - name: Install native build and isolated acceptance dependencies
+            - name: Install native build dependencies
               run: |
                   sudo apt-get update
                   sudo apt-get install -y \
                       build-essential libxcb1-dev libx11-dev \
                       libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev \
-                      libwayland-dev libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
+                      libwayland-dev
+            - name: Build the release executable and its receipt
+              run: '"$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate build --output "$RUNNER_TEMP/native-acceptance"'
+            - name: Upload the accepted build
+              uses: actions/upload-artifact@v4
+              with:
+                  name: native-acceptance-build
+                  path: ${{ runner.temp }}/native-acceptance
+                  if-no-files-found: error
+                  overwrite: true
+            - name: Checkout left clean
+              if: always()
+              shell: bash
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
+
+    # The gates, sharded so the slowest (18 collaboration cases, ~10 min in
+    # one job) is split in two. The build is restored at its original
+    # absolute path, which the receipt records.
+    native-acceptance-shard:
+        name: Native Acceptance (${{ matrix.name }})
+        needs: native-acceptance-build
+        runs-on: ubuntu-24.04
+        timeout-minutes: 60
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - name: ime-resources
+                      gate: ime,resource-short
+                      shard: ""
+                    - name: collaboration-1
+                      gate: collaboration
+                      shard: 1/2
+                    - name: collaboration-2
+                      gate: collaboration
+                      shard: 2/2
+        env:
+            SNIP_REQUIRE_ALL_TESTS: "1"
+            SNIP_NATIVE_PYTHON: /usr/bin/python3
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install isolated acceptance dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                      build-essential libxkbcommon-x11-0 libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
                       xvfb xdotool xclip x11-apps x11-utils imagemagick dbus-x11 \
                       fcitx5 fcitx5-pinyin python3-pil fonts-dejavu-core fonts-noto-cjk
             - name: Configure git identity
               run: |
                   git config --global user.name "snip-ci"
                   git config --global user.email "snip-ci@example.invalid"
-            - name: Build once and run IME, all collaboration cases, and functional short resource gate
+            - name: Restore the accepted build
+              uses: actions/download-artifact@v4
+              with:
+                  name: native-acceptance-build
+                  path: ${{ runner.temp }}/native-acceptance
+            - name: Run ${{ matrix.gate }} ${{ matrix.shard }}
+              shell: bash
               env:
-                  ACCEPTANCE_OUT: ${{ runner.temp }}/native-acceptance
+                  GATE: ${{ matrix.gate }}
+                  SHARD: ${{ matrix.shard }}
+                  OUT: ${{ runner.temp }}/native-acceptance-${{ matrix.name }}
               run: |
-                  "$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate all --output "$ACCEPTANCE_OUT"
+                  set -euo pipefail
+                  # upload-artifact drops the exec bit; the sha256 is unchanged.
+                  chmod +x "$RUNNER_TEMP/native-acceptance/snip-desktop-native"
+                  "$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate "$GATE" \
+                      ${SHARD:+--collaboration-shard "$SHARD"} \
+                      --build-receipt "$RUNNER_TEMP/native-acceptance/build-receipt.json" --output "$OUT"
+            - name: Upload shard receipts, driver results and logs
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: native-acceptance-linux-${{ matrix.name }}
+                  path: ${{ runner.temp }}/native-acceptance-${{ matrix.name }}
+                  if-no-files-found: error
+                  overwrite: true
+            - name: Checkout left clean
+              if: always()
+              shell: bash
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
+
+    # Folds the shards into the single gate-all receipt release.yml checks
+    # (refusing any missing gate or collaboration step), then packages the
+    # accepted executable itself.
+    native-acceptance:
+        name: Native Acceptance (Linux)
+        needs: [native-acceptance-build, native-acceptance-shard]
+        runs-on: ubuntu-24.04
+        timeout-minutes: 30
+        env:
+            SNIP_REQUIRE_ALL_TESTS: "1"
+            SNIP_NATIVE_PYTHON: /usr/bin/python3
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install runtime libraries for the packaged smoke
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libxkbcommon-x11-0 libxcb1 libfontconfig1 libfreetype6
+            - name: Restore the accepted build
+              uses: actions/download-artifact@v4
+              with:
+                  name: native-acceptance-build
+                  path: ${{ runner.temp }}/native-acceptance
+            - name: Restore the shard results
+              uses: actions/download-artifact@v4
+              with:
+                  pattern: native-acceptance-linux-*
+                  path: ${{ runner.temp }}/shards
+            - name: Merge shard receipts into the gate-all receipt
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  chmod +x "$RUNNER_TEMP/native-acceptance/snip-desktop-native"
+                  "$SNIP_NATIVE_PYTHON" -B scripts/run_native_acceptance.py --gate merge \
+                      --build-receipt "$RUNNER_TEMP/native-acceptance/build-receipt.json" \
+                      --output "$RUNNER_TEMP/native-acceptance-merged" \
+                      --merge "$RUNNER_TEMP"/shards/native-acceptance-linux-*
+                  # release.yml reads both receipts from one artifact root.
+                  cp "$RUNNER_TEMP/native-acceptance/build-receipt.json" "$RUNNER_TEMP/native-acceptance-merged/"
             # The Linux release asset is packaged from the executable the gates
             # above ran (build-receipt.json), never from a second build: the
             # delivery spec requires published binaries to be the accepted ones
@@ -341,7 +452,7 @@ jobs:
             - name: Package, verify and smoke the accepted Linux executable
               shell: bash
               env:
-                  ACCEPTANCE_OUT: ${{ runner.temp }}/native-acceptance
+                  ACCEPTANCE_OUT: ${{ runner.temp }}/native-acceptance-merged
                   PKG_OUT: ${{ runner.temp }}/native-candidate-x86_64-unknown-linux-gnu
               run: |
                   set -euo pipefail
@@ -357,12 +468,12 @@ jobs:
                   tar -xzf "$PKG_OUT/snip-sync-linux-x86_64.tar.gz" -C "$SMOKE"
                   python3 scripts/smoke_native.py --bin "$SMOKE/snip-sync-$VERSION/bin/snip-desktop-native" --expected-version "$VERSION"
                   echo "accepted binary sha256 $WANT packaged for $VERSION"
-            - name: Upload acceptance receipts, driver results and logs
+            - name: Upload the merged receipt
               if: always()
               uses: actions/upload-artifact@v4
               with:
                   name: native-acceptance-linux
-                  path: ${{ runner.temp }}/native-acceptance
+                  path: ${{ runner.temp }}/native-acceptance-merged
                   if-no-files-found: error
                   overwrite: true
             - name: Upload Linux release package (the accepted binary)
@@ -373,14 +484,14 @@ jobs:
                   if-no-files-found: error
                   overwrite: true
             # Just the two receipts release.yml checks, so a release does not
-            # download the whole evidence bundle above.
+            # download the whole evidence bundle.
             - name: Upload acceptance receipts for release
               uses: actions/upload-artifact@v4
               with:
                   name: native-acceptance-receipt
                   path: |
-                      ${{ runner.temp }}/native-acceptance/acceptance.json
-                      ${{ runner.temp }}/native-acceptance/build-receipt.json
+                      ${{ runner.temp }}/native-acceptance-merged/acceptance.json
+                      ${{ runner.temp }}/native-acceptance-merged/build-receipt.json
                   if-no-files-found: error
                   overwrite: true
             - name: Checkout left clean
