@@ -1719,7 +1719,7 @@ def select_native_matched(s: NativeSession, win: dict[str, Any], oracle: dict[st
         raise NativeBenchError(f"matched client geometry is {win['width']}x{win['height']}, expected {MATCHED_SIZE}")
     s.set_clipboard(MATCHED_SENTINEL)
     start = len(s.lines)
-    # The frozen native app starts in zh-Hant; use its real toggle to match Tauri's English UI.
+    # The frozen native app starts in zh-Hant; the matched profile runs in English via the real toggle.
     click("btn-locale")
     s.wait_line(lambda line: line == "[APP:LOCALE: En]", start=start)
     ref_control = f"ref:{MATCHED_REF}"
@@ -2476,7 +2476,6 @@ def main(argv: list[str] | None = None) -> int:
                 "runRepeatability": "unpurged host page cache; cold process memory",
             },
             "coldStart": "UNSUPPORTED (process-cold only; filesystem cache uncontrolled; drop_caches not performed)",
-            "tauri15RepoComparison": "UNSUPPORTED (Tauri baseline only supports 1 active repo; comparison cannot be fabricated)",
         },
         "runsPerProfile": args.runs,
         "steadySeconds": args.steady_seconds,

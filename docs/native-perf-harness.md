@@ -121,17 +121,9 @@ rtk proxy env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
   --workspace /tmp/snip-workload-standard-20260925 \
   --profile 1repo-diff --runs 1 --steady-seconds 30 --sample-interval 0.05 \
   --out-dir /tmp/native-matched-pilot-NEW
-
-rtk proxy env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
-  -u DISPLAY -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
-  python3 scripts/bench_tauri_memory.py \
-  --bin /path/to/frozen/snip-sync --build-profile release \
-  --workspace /tmp/snip-workload-standard-20260925 \
-  --profile 1repo-diff --runs 1 --steady-seconds 30 --sample-interval 0.05 \
-  --out-dir /tmp/tauri-matched-pilot-NEW
 ```
 
-The adjacent `.receipt.json` is discovered automatically; pass `--build-receipt` if it is elsewhere. The 2026-09-27 functional pair passed with native binary `b11e6724` and Tauri `a4664824`, English UIs, 600 steady samples each and clean teardown. Evidence and source snapshots are listed in `/tmp/snip-session4-matched-performance-report.md`. Earlier native picker/OCR failures and a Chinese-locale functional run remain separate artifacts. Formal ten-run measurements are pending stable final binaries and coordinator approval; a functional pilot does not pass D4. `--compare-baseline` remains unsupported; the coordinator compares concrete matched artifacts.
+The adjacent `.receipt.json` is discovered automatically; pass `--build-receipt` if it is elsewhere. The 2026-09-27 functional pair (before the Tauri app was removed) passed with native binary `b11e6724` and Tauri `a4664824`, English UIs, 600 steady samples each and clean teardown. Evidence and source snapshots are listed in `/tmp/snip-session4-matched-performance-report.md`. Earlier native picker/OCR failures and a Chinese-locale functional run remain separate artifacts. Formal ten-run measurements are pending stable final binaries and coordinator approval; a functional pilot does not pass D4. `--compare-baseline` remains unsupported; the coordinator compares concrete matched artifacts.
 
 ### Standard-dataset discovery
 On the first D3 checkpoint, startup calls discovery for one page of 10,000 directory visits and depth 8, and that page walks into the working tree before it records `.git`. Against `/tmp/snip-workload-standard-20260925` and against `repo-01-core` alone, the only readiness line is `[APP:READY_REPOS: 0]`; it does not update if the process is left running. The driver fails that run. It does not point the app at a smaller tree, and it does not treat 0 as the 15-repo workload. Repo switches, the explicit copy, and the 100-switch soak therefore do not start.

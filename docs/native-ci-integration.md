@@ -166,7 +166,7 @@ CI 與 justfile 仍呼叫前三支腳本。沒有 placeholder，也沒有把缺�
 
 CI 以來源 workflow 為底，併入主線工作樹已有的 macOS fast gate。來源沒有這個 step。
 
-保留的主線門檻：Rust fmt、clippy、rustdoc、`cargo audit`、DTO drift、clean checkout、frontend、三平台 test，以及 desktop E2E（Linux 與 `windows-2022`，腳本仍是 `crates/desktop/e2e/scenarios.mjs`）。`CI gate` 的 `needs` 是 `actionlint`、`format`、`lint-rust`、`lint-frontend`、`test`、`desktop-e2e`、`harness`、`native-smoke`、`native-candidate-artifacts`。
+保留的主線門檻：Rust fmt、clippy、rustdoc、`cargo audit`、clean checkout、三平台 test。Tauri 桌面版移除後，DTO drift、frontend 與 desktop E2E 一併拿掉。`CI gate` 的 `needs` 是 `actionlint`、`format`、`lint-rust`、`test`、`harness`、`native-smoke`、`native-acceptance`、`native-candidate-artifacts`；`native-acceptance` 先 build 一次，平行跑 IME／資源與兩半協作 shard，再合併成單一收據。
 
 Linux job 沿用來源的 `ubuntu-24.04`。2026-09-26 的 GitHub 文件 [Choosing the runner for a job](https://docs.github.com/en/actions/using-jobs/choosing-the-runner-for-a-job) 把 `ubuntu-latest` 與 `ubuntu-24.04` 都連到同一份 Ubuntu 24.04 image readme。釘選對應 `docs/native-build-prerequisites.md` 的 noble 套件名（`libegl1`、`libegl-mesa0`）。
 

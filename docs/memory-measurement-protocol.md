@@ -165,7 +165,6 @@ python3 scripts/bench_native_memory.py \
 ```
 
 - 原生 driver 的 launcher 會等取樣閘道再 `execv`。launch 樣本只存在於觀察到 exe 轉換之後；轉換前的 launcher 記憶體是 `launcher-setup`，不計入目標峰值。
-- Tauri driver 仍是 late-attach：app PID 出現後才接上，`pre-ready` 不是 launch。
 - `--compare-baseline` 會以狀態 2 結束並印出 `UNSUPPORTED`。
 
 ### 自動化合約測試

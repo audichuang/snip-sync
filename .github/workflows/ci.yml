@@ -501,7 +501,7 @@ jobs:
 
     # Native desktop packaging for macOS arm/intel and Windows x64. The files
     # uploaded here are the release assets: release.yml downloads them from
-    # the green push-to-main run of the tagged SHA and publishes them byte for
+    # the green push run (main, or develop for a pre-release) of the tagged SHA and publishes them byte for
     # byte after checking SHA256SUMS. So every check below runs on the final
     # (signed, packaged) binary: the smoke test executes the copy inside the
     # published .dmg / the exe the installer actually installs. Linux is

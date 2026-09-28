@@ -98,7 +98,7 @@ jobs:
     # The native desktop app is never rebuilt here. The delivery spec requires
     # the published binaries to be exactly the ones the gates accepted, and a
     # rebuild from the same SHA is not that. So this job downloads the
-    # packages from the green push-to-main ci.yml run found by verify-ci
+    # packages from the green push ci.yml run found by verify-ci (main, or develop for a pre-release)
     # (Linux from native-acceptance, macOS/Windows from
     # native-candidate-artifacts), re-checks every file against the
     # SHA256SUMS written in the job that tested it, binds the Linux binary to
