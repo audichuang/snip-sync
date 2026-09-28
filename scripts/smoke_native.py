@@ -9,14 +9,22 @@ Enforces:
 - Strict non-zero exit on wrong version, command failure, or timeout/hang.
 - Clean process group termination on timeout (zero leaked processes).
 - Explicit labeling as CLI-only smoke (real GUI remains unverified on macOS/Windows).
+
+--launch additionally opens the real window on a one-repo workspace and waits
+for the app's own markers: proof that the packaged GPUI backend starts, renders
+and reads Git on this OS. It sends no input.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import queue
+import shutil
 import signal
 import subprocess
+import tempfile
+import threading
 import sys
 import time
 from pathlib import Path
@@ -135,7 +143,7 @@ def verify_cli_smoke(
     print(f"Platform: {sys.platform} ({os.uname().machine if hasattr(os, 'uname') else 'unknown'})")
     print(
         "Note: Real GUI window / input E2E on Linux is gated by native-smoke (Xvfb+lavapipe).\n"
-        "      macOS and Windows real-window GUI runtime remains UNVERIFIED."
+        "      On macOS and Windows, --launch opens the real window (no input is sent)."
     )
 
     # 1. Existence and permissions
@@ -195,6 +203,70 @@ def verify_cli_smoke(
     print("=== Native CLI Smoke PASSED ===")
 
 
+LAUNCH_MARKERS = ("[APP:WINDOW_READY]", "[APP:READY_REPOS: 1]")
+
+
+def missing_markers(lines: List[str]) -> List[str]:
+    """The launch markers not yet printed, in order."""
+    return [m for m in LAUNCH_MARKERS if not any(line.strip() == m for line in lines)]
+
+
+def one_repo_workspace(root: Path) -> Path:
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    ident = ["-c", "user.name=snip-smoke", "-c", "user.email=smoke@example.invalid"]
+    for args in (["init", "-q", "-b", "main"], ["add", "."], ["commit", "-q", "-m", "base"]):
+        if args[0] == "add":
+            (repo / "README.md").write_text("smoke\n", encoding="utf-8")
+        subprocess.run(["git", *ident, *args], cwd=repo, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return root
+
+
+def verify_launch(bin_path: Path, timeout_sec: float = 60.0) -> None:
+    """Opens the real window on a one-repo workspace and waits for its markers."""
+    print("[launch] Opening the real window on a one-repo workspace...")
+    work = Path(tempfile.mkdtemp(prefix="snip-launch-smoke-"))
+    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True,
+              "env": dict(os.environ, SNIP_NATIVE_E2E="1")}
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    proc = None
+    try:
+        ws = one_repo_workspace(work / "ws")
+        proc = subprocess.Popen([str(bin_path), "--workspace", str(ws)], **kwargs)
+        lines: List[str] = []
+        stream: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def pump() -> None:
+            for line in proc.stdout:
+                stream.put(line.rstrip("\n"))
+            stream.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+        deadline = time.monotonic() + timeout_sec
+        while missing_markers(lines):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SmokeFailure(f"timed out after {timeout_sec}s waiting for {missing_markers(lines)}; "
+                                   f"output:\n" + "\n".join(lines[-40:]))
+            try:
+                line = stream.get(timeout=min(remaining, 0.5))
+            except queue.Empty:
+                continue
+            if line is None:
+                raise SmokeFailure(f"app exited ({proc.wait()}) before {missing_markers(lines)}; "
+                                   f"output:\n" + "\n".join(lines[-40:]))
+            lines.append(line)
+        print(f"  [OK] window opened and loaded the workspace: {', '.join(LAUNCH_MARKERS)}")
+    finally:
+        if proc is not None:
+            kill_proc_group(proc)
+            if proc.stdout is not None:
+                proc.stdout.close()
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Strict native CLI smoke test for snip-desktop-native."
@@ -221,6 +293,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         default=4.0,
         help="Timeout in seconds for CLI invocations.",
     )
+    parser.add_argument(
+        "--launch",
+        action="store_true",
+        help="Also open the real window on a one-repo workspace and wait for its ready markers.",
+    )
+    parser.add_argument(
+        "--launch-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for the launch markers.",
+    )
     return parser.parse_args(argv)
 
 
@@ -233,6 +316,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             app_name=args.app_name,
             timeout_sec=args.timeout,
         )
+        if args.launch:
+            verify_launch(args.bin, timeout_sec=args.launch_timeout)
         return 0
     except SmokeFailure as e:
         print(f"\n[FAIL] Native CLI Smoke FAILED: {e}", file=sys.stderr)

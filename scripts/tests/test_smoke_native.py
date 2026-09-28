@@ -21,7 +21,14 @@ import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 
-from scripts.smoke_native import SmokeFailure, kill_proc_group, run_bounded_cmd, verify_cli_smoke
+from scripts.smoke_native import (
+    SmokeFailure,
+    kill_proc_group,
+    missing_markers,
+    run_bounded_cmd,
+    verify_cli_smoke,
+    verify_launch,
+)
 
 
 class TestSmokeNative(unittest.TestCase):
@@ -41,6 +48,36 @@ class TestSmokeNative(unittest.TestCase):
         )
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IRUSR)
         return script
+
+    def test_launch_waits_for_both_markers_and_stops_the_app(self) -> None:
+        """A window that opens and loads its one repo passes; the app is stopped."""
+        mock = self._create_mock_bin("""
+import os, time
+assert os.environ.get('SNIP_NATIVE_E2E') == '1'
+ws = sys.argv[sys.argv.index('--workspace') + 1]
+assert os.path.isdir(os.path.join(ws, 'repo', '.git'))
+print('[APP:WINDOW_READY]', flush=True)
+print('[APP:READY_REPOS: 1]', flush=True)
+time.sleep(60)
+""")
+        start = time.monotonic()
+        with patch("sys.stdout", io.StringIO()):
+            verify_launch(mock, timeout_sec=20.0)
+        self.assertLess(time.monotonic() - start, 15.0)
+
+    def test_launch_fails_when_the_app_exits_or_never_loads(self) -> None:
+        for name, body in (("exits", "print('[APP:WINDOW_READY]'); sys.exit(3)"),
+                           ("hangs", "import time; print('[APP:WINDOW_READY]', flush=True); time.sleep(60)")):
+            with self.subTest(name=name):
+                mock = self._create_mock_bin(body)
+                with patch("sys.stdout", io.StringIO()), \
+                        self.assertRaisesRegex(SmokeFailure, "READY_REPOS"):
+                    verify_launch(mock, timeout_sec=2.0)
+
+    def test_missing_markers_needs_exact_lines(self) -> None:
+        self.assertEqual(missing_markers(["[APP:WINDOW_READY]", "[APP:READY_REPOS: 10]"]),
+                         ["[APP:READY_REPOS: 1]"])
+        self.assertEqual(missing_markers(["  [APP:WINDOW_READY]", "[APP:READY_REPOS: 1]"]), [])
 
     def test_mock_app_success(self) -> None:
         """Verifies that a well-behaved binary passes CLI smoke."""

@@ -509,7 +509,9 @@ jobs:
     # published .dmg / the exe the installer actually installs. Linux is
     # packaged by native-acceptance from its gated executable instead.
     # The Intel leg is macos-26-intel and must execute its binary. These jobs
-    # do not drive the GPUI UI, so macOS and Windows GUI input stays unverified.
+    # open the real window on a one-repo workspace (smoke_native.py --launch)
+    # but send no input: macOS and Windows GUI input stays unverified here;
+    # UI logic is covered on all three OSes by the in-process #[gpui::test]s.
     native-candidate-artifacts:
         name: Native Package (${{ matrix.target }})
         runs-on: ${{ matrix.os }}
@@ -604,7 +606,7 @@ jobs:
                   DMG_SHA=$(shasum -a 256 "$BIN" | cut -d ' ' -f 1)
                   TAR_SHA=$(tar -xOzf "$PKG_OUT/snip-sync_$LABEL.app.tar.gz" snip-sync.app/Contents/MacOS/snip-desktop-native | shasum -a 256 | cut -d ' ' -f 1)
                   [ "$DMG_SHA" = "$TAR_SHA" ] || { echo "dmg binary $DMG_SHA != tarball binary $TAR_SHA" >&2; exit 1; }
-                  python3 scripts/smoke_native.py --bin "$BIN" --expected-version "$VERSION"
+                  python3 scripts/smoke_native.py --bin "$BIN" --expected-version "$VERSION" --launch
                   echo "accepted binary sha256 $DMG_SHA"
             # Install with the published installer, require the installed exe
             # to be byte-identical to the built and zipped one, then smoke it.
@@ -632,7 +634,7 @@ jobs:
                   $installedLic = (Get-ChildItem (Join-Path $dir 'licenses') -File | ForEach-Object Name | Sort-Object) -join ','
                   $zipLic = (Get-ChildItem (Join-Path $zipDir 'snip-sync\licenses') -File | ForEach-Object Name | Sort-Object) -join ','
                   if (-not $installedLic -or $installedLic -ne $zipLic) { throw "installed licenses '$installedLic' != zipped '$zipLic'" }
-                  python scripts/smoke_native.py --bin $installed --expected-version $version
+                  python scripts/smoke_native.py --bin $installed --expected-version $version --launch
                   if ($LASTEXITCODE -ne 0) { throw "smoke failed" }
                   Write-Output "accepted binary sha256 $($hashes[0])"
             - name: Upload release package artifacts

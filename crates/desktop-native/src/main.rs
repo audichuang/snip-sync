@@ -6259,6 +6259,89 @@ fn restore_log_after_paste(
 
 #[cfg(test)]
 mod tests {
+	/// UI state driven in-process: no display, so these also run in the
+	/// Windows and macOS Test jobs, which have no real-app GUI test.
+	mod in_process {
+		use crate::WorkbenchModel;
+		use gpui::TestAppContext;
+		use std::path::Path;
+		use std::process::Command;
+
+		fn git(dir: &Path, args: &[&str]) {
+			let out = Command::new("git")
+				.current_dir(dir)
+				.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+				.args(args)
+				.output()
+				.expect("git must run");
+			assert!(out.status.success(), "git {args:?}: {out:?}");
+		}
+
+		#[gpui::test]
+		fn opening_a_workspace_lists_each_repository_with_its_changes(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for (name, dirty) in [("alpha", 1), ("beta", 2)] {
+				let repo = ws.path().join(name);
+				std::fs::create_dir(&repo).unwrap();
+				git(&repo, &["init", "-q", "-b", "main"]);
+				std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+				git(&repo, &["add", "."]);
+				git(&repo, &["commit", "-q", "-m", "base"]);
+				for i in 0..dirty {
+					std::fs::write(repo.join(format!("new{i}.txt")), "x\n")
+						.unwrap();
+				}
+			}
+			let root = ws.path().to_path_buf();
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(Some(root), None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let mut seen: Vec<(String, usize)> = m
+					.repos
+					.iter()
+					.map(|r| {
+						let s = r.summary.as_ref().expect("repo summary");
+						(r.name.clone(), s.changes.untracked)
+					})
+					.collect();
+				seen.sort();
+				assert_eq!(
+					seen,
+					[("alpha".to_string(), 1), ("beta".to_string(), 2)]
+				);
+			});
+		}
+
+		/// A keystroke goes through the real keymap and focus dispatch, the
+		/// path a user's key takes, not a direct method call.
+		#[gpui::test]
+		fn alt_9_toggles_the_git_log_through_the_keymap(
+			cx: &mut TestAppContext,
+		) {
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let ws = tempfile::tempdir().unwrap();
+			let root = ws.path().to_path_buf();
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(Some(root), None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			cx.update(|window, cx| {
+				window.focus(&model.read(cx).focus_handle.clone())
+			});
+			let before = model.read_with(cx, |m, _| m.bottom_visible);
+			cx.simulate_keystrokes("alt-9");
+			cx.run_until_parked();
+			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), !before);
+			cx.simulate_keystrokes("alt-9");
+			cx.run_until_parked();
+			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
+		}
+	}
+
 	mod folder_copy {
 		use crate::{
 			expand_folder_items, native_export_settings,
