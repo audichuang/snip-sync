@@ -4465,6 +4465,36 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	click("menu-item:copy-relative-path");
 	wait("[APP:TEXT_COPIED:");
 	assert_eq!(clip_get(), "alpha.txt");
+	let type_text = |text: &str| {
+		Command::new("xdotool")
+			.args(["type", "--window", &wid, text])
+			.status()
+			.unwrap();
+	};
+	// 5c. Branch chip: Local is a closed section; typing lists the
+	// matching branches flat.
+	click("log-filter-branch");
+	wait("[APP:LOG_MENU: Some(Branch)]");
+	control("log-branch-group:refs_local");
+	absent("log-branch:refs/heads/main");
+	click("log-branch-group:refs_local");
+	control("log-branch:refs/heads/main");
+	click("log-branch-group:refs_local");
+	absent("log-branch:refs/heads/main");
+	type_text("MAI");
+	control("log-branch:refs/heads/main");
+	absent("log-branch-group:refs_local");
+	key(&wid, "Escape");
+	absent("log-branch-input");
+	// 5d. Paths chip: typing filters the loaded tree.
+	click("log-filter-paths");
+	wait("[APP:LOG_MENU: Some(Paths)]");
+	control("log-path-pick:alpha.txt");
+	type_text("nest");
+	control("log-path-pick:subfolder/nested.txt");
+	absent("log-path-pick:alpha.txt");
+	key(&wid, "Escape");
+	absent("log-path-input");
 
 	// 6. Ctrl+Shift+` opens the branches popup.
 	key(&wid, "ctrl+shift+grave");

@@ -883,6 +883,9 @@ pub struct WorkbenchModel {
 	/// The menu a mouse-down outside it just closed, and when.
 	pub log_menu_dismissed: Option<(ui::LogMenu, std::time::Instant)>,
 	pub log_path_input: Entity<TextInput>,
+	/// The Branch chip's filter field, and its opened sections.
+	pub log_branch_menu_input: Entity<TextInput>,
+	pub log_branch_menu_open: Vec<String>,
 	pub log_since_input: Entity<TextInput>,
 	pub log_until_input: Entity<TextInput>,
 	/// The Date chip's custom range was refused as malformed.
@@ -1104,7 +1107,20 @@ impl WorkbenchModel {
 					let p = input.read(cx).text().trim().to_string();
 					this.add_log_path(p, cx);
 				}
-				InputEvent::Dismiss => this.close_log_menu(cx),
+				InputEvent::Dismiss => this.dismiss_log_menu(cx),
+				// The picker filters by the text as it is typed.
+				InputEvent::Changed => cx.notify(),
+				_ => {}
+			}
+		})
+		.detach();
+		let log_branch_menu_input = cx.new(|cx| {
+			TextInput::new(i18n::t("log_branch_placeholder", loc), 0, cx)
+		});
+		cx.subscribe(&log_branch_menu_input, |this, _, ev: &InputEvent, cx| {
+			match ev {
+				InputEvent::Dismiss => this.dismiss_log_menu(cx),
+				InputEvent::Changed => cx.notify(),
 				_ => {}
 			}
 		})
@@ -1265,6 +1281,8 @@ impl WorkbenchModel {
 			log_menu: None,
 			log_menu_dismissed: None,
 			log_path_input,
+			log_branch_menu_input,
+			log_branch_menu_open: Vec::new(),
 			log_since_input,
 			log_until_input,
 			log_date_error: false,
@@ -1842,6 +1860,7 @@ impl WorkbenchModel {
 			(self.log_search_input.clone(), "log_search_placeholder"),
 			(self.selector_input.clone(), "selector_filter_placeholder"),
 			(self.log_path_input.clone(), "log_paths_placeholder"),
+			(self.log_branch_menu_input.clone(), "log_branch_placeholder"),
 			(self.log_since_input.clone(), "log_date_from"),
 			(self.log_until_input.clone(), "log_date_to"),
 			(self.branch_filter_input.clone(), "log_branch_placeholder"),
@@ -2350,6 +2369,7 @@ impl WorkbenchModel {
 		release_vec(&mut self.changed_dirs_collapsed);
 		self.log_date_error = false;
 		release_vec(&mut self.log_paths_expanded);
+		release_vec(&mut self.log_branch_menu_open);
 		release_vec(&mut self.log_feeds);
 		release_vec(&mut self.log_scope_key);
 		self.log_commit_root = None;
@@ -2386,6 +2406,7 @@ impl WorkbenchModel {
 			self.add_repo_input.clone(),
 			self.workspace_path_input.clone(),
 			self.log_path_input.clone(),
+			self.log_branch_menu_input.clone(),
 			self.log_since_input.clone(),
 			self.log_until_input.clone(),
 			self.branch_filter_input.clone(),

@@ -1939,8 +1939,23 @@ impl WorkbenchModel {
 				Some(self.log_path_input.read(cx).handle().clone());
 			self.load_picker_dir("", cx);
 		}
+		// IntelliJ's Branch popup opens with an empty field, sections shut.
+		if self.log_menu == Some(crate::ui::LogMenu::Branch) {
+			self.log_branch_menu_input
+				.update(cx, |i, _| i.clear_retained());
+			self.log_branch_menu_open.clear();
+			self.pending_focus =
+				Some(self.log_branch_menu_input.read(cx).handle().clone());
+		}
 		app_log!("[APP:LOG_MENU: {:?}]", self.log_menu);
 		cx.notify();
+	}
+
+	/// Esc in a dropdown's field: the log keeps the keyboard, not the
+	/// field that is no longer drawn.
+	pub fn dismiss_log_menu(&mut self, cx: &mut Context<Self>) {
+		self.close_log_menu(cx);
+		self.pending_focus = Some(self.log_focus.clone());
 	}
 
 	pub fn close_log_menu(&mut self, cx: &mut Context<Self>) {

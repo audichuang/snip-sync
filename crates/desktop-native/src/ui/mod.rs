@@ -1397,6 +1397,118 @@ mod tests {
 	}
 
 	#[test]
+	fn path_picker_filters_the_loaded_tree_by_typed_text() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		std::fs::create_dir_all(root.join("src/Query")).unwrap();
+		std::fs::create_dir_all(root.join("docs")).unwrap();
+		std::fs::write(root.join("src/Query/run.rs"), "").unwrap();
+		std::fs::write(root.join("src/lib.rs"), "").unwrap();
+		std::fs::write(root.join("docs/query.md"), "").unwrap();
+		std::fs::write(root.join("README.md"), "").unwrap();
+		let mut tree = crate::tree::FileTreeNode::new_root(root);
+		for d in ["src", "src/Query", "docs"] {
+			tree.toggle_expand(d, root);
+		}
+		let shape = |rows: Vec<PathPick>| -> Vec<String> {
+			rows.into_iter()
+				.map(|p| {
+					format!(
+						"{}{}{}",
+						" ".repeat(p.depth),
+						p.rel,
+						if p.expanded { "/" } else { "" }
+					)
+				})
+				.collect()
+		};
+		// Case-insensitive, on the path; ancestors kept and shown open,
+		// the rest of the tree left out.
+		let hits = shape(path_picker_matches(&tree, "query", "", 50));
+		assert_eq!(
+			hits,
+			[
+				"docs/",
+				" docs/query.md",
+				"src/",
+				" src/Query/",
+				"  src/Query/run.rs"
+			],
+			"{hits:?}"
+		);
+		assert!(path_picker_matches(&tree, "nothing", "", 50).is_empty());
+		// Bounded by rows; the merged log names the repository first.
+		assert_eq!(path_picker_matches(&tree, "query", "", 2).len(), 2);
+		let merged = path_picker_matches(&tree, "readme", "repo/", 50);
+		assert_eq!(shape(merged), ["repo/README.md"]);
+	}
+
+	#[test]
+	fn branch_popup_splits_local_and_remotes_and_flattens_a_filter() {
+		let refs: Vec<_> = [
+			"refs/heads/main",
+			"refs/heads/feat/Login",
+			"refs/remotes/origin/HEAD",
+			"refs/remotes/origin/main",
+			"refs/remotes/origin/feat/login",
+			"refs/remotes/upstream/main",
+			// A second repository of the merged log has `main` too.
+			"refs/heads/main",
+		]
+		.iter()
+		.map(|n| snip_core::browser::GitReference {
+			name: n.to_string(),
+			sha: "a".into(),
+		})
+		.collect();
+		let shape = |rows: Vec<BranchRow>| -> Vec<String> {
+			rows.into_iter()
+				.map(|r| match r {
+					BranchRow::Group {
+						key,
+						depth,
+						collapsed,
+						..
+					} => format!(
+						"{depth}G {key}{}",
+						if collapsed { " ›" } else { "" }
+					),
+					BranchRow::Ref { label, depth, .. } => {
+						format!("{depth} {label}")
+					}
+				})
+				.collect()
+		};
+		// Closed sections: Local and one per remote, no Remote parent.
+		assert_eq!(
+			shape(branch_popup_rows(&refs, "", &[], Locale::En)),
+			[
+				"0G refs_local ›",
+				"0G remote:origin ›",
+				"0G remote:upstream ›"
+			]
+		);
+		let open = ["refs_local".to_string(), "remote:origin".to_string()];
+		assert_eq!(
+			shape(branch_popup_rows(&refs, "", &open, Locale::En)),
+			[
+				"0G refs_local",
+				"1 main",
+				"1 feat/Login",
+				"0G remote:origin",
+				"1 main",
+				"1 feat/login",
+				"0G remote:upstream ›",
+			]
+		);
+		// Typing: every match, local and remote, flat and case-insensitive.
+		assert_eq!(
+			shape(branch_popup_rows(&refs, "login", &[], Locale::En)),
+			["0 feat/Login", "0 origin/feat/login"]
+		);
+	}
+
+	#[test]
 	fn remote_branches_group_by_remote_name() {
 		let refs: Vec<_> = [
 			"refs/heads/main",
