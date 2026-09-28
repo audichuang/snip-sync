@@ -4987,3 +4987,59 @@ fn native_multi_repo_log_merges_and_filters_repositories() {
 
 	quit_cleanly(&mut app, &wid);
 }
+
+/// A long CJK name is cut with "…" and then measured again at another width
+/// (a window or panel resize). gpui used to truncate the shared text runs,
+/// so the next measure laid out the full text with the cut runs: on macOS
+/// that sliced inside a multi-byte char and aborted the app. The vendored
+/// gpui asserts in debug builds that runs cover the text, which fails here
+/// on Linux too.
+#[test]
+fn native_cjk_truncation_survives_resize() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("repo");
+	fs::create_dir(&repo).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.name", "CJK Test"]);
+	git_ok(&repo, &["config", "user.email", "cjk@example.com"]);
+	git_ok(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+	fs::create_dir(repo.join("報表資料夾")).unwrap();
+	fs::write(
+		repo.join("報表資料夾/第一季財務報告與分析結果彙整文件.md"),
+		"y\n",
+	)
+	.unwrap();
+	fs::write(
+		repo.join("這是一個非常非常長的中文檔案名稱用來測試截斷與省略號.txt"),
+		"x\n",
+	)
+	.unwrap();
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(ws.path(), dest.path(), None);
+	lines_until(&app.rx, "[APP:PREVIEW_LOADED:", Duration::from_secs(10))
+		.unwrap();
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for w in ["1200", "700", "1300", "600", "1440", "800", "500", "1100"] {
+		assert!(Command::new("xdotool")
+			.args(["windowsize", &wid, w, "800"])
+			.status()
+			.unwrap()
+			.success());
+		std::thread::sleep(Duration::from_millis(400));
+		let child = app.child.as_mut().expect("app still owned");
+		assert!(
+			child.try_wait().unwrap().is_none(),
+			"app died while laying out CJK text at width {w}"
+		);
+	}
+	quit_cleanly(&mut app, &wid);
+}
