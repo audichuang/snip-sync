@@ -157,6 +157,71 @@ pub(super) fn branch_rows(
 	out
 }
 
+/// The Branch chip's popup like IntelliJ's: Local, one section per
+/// remote and Tags, each opened only when its key is in `open`; with a
+/// `needle` (lowercase), the matching refs of every section as one flat
+/// list instead, named `origin/x` for a remote branch.
+pub(super) fn branch_popup_rows(
+	refs: &[snip_core::browser::GitReference],
+	needle: &str,
+	open: &[String],
+	loc: Locale,
+) -> Vec<BranchRow> {
+	if !needle.is_empty() {
+		return branch_rows(refs, needle, &[], loc)
+			.into_iter()
+			.filter_map(|r| match r {
+				BranchRow::Ref { name, .. } => Some(BranchRow::Ref {
+					label: short_ref(&name).to_string(),
+					name,
+					depth: 0,
+				}),
+				BranchRow::Group { .. } => None,
+			})
+			.collect();
+	}
+	// Every section starts closed; Remote itself is not a row, its
+	// remotes are.
+	let mut closed: Vec<String> = ["refs_local", "refs_tags"]
+		.into_iter()
+		.map(str::to_string)
+		.collect();
+	for r in refs {
+		if let Some((remote, _)) = r
+			.name
+			.strip_prefix("refs/remotes/")
+			.and_then(|s| s.split_once('/'))
+		{
+			let key = format!("remote:{remote}");
+			if !closed.contains(&key) {
+				closed.push(key);
+			}
+		}
+	}
+	closed.retain(|k| !open.contains(k));
+	branch_rows(refs, "", &closed, loc)
+		.into_iter()
+		.filter_map(|mut r| {
+			match &mut r {
+				BranchRow::Group { key, .. } if key == "refs_remote" => {
+					return None;
+				}
+				BranchRow::Group { key, depth, .. }
+				| BranchRow::Ref {
+					name: key, depth, ..
+				} => {
+					if key.starts_with("remote:")
+						|| key.starts_with("refs/remotes/")
+					{
+						*depth -= 1;
+					}
+				}
+			}
+			Some(r)
+		})
+		.collect()
+}
+
 /// Rows the Paths chip's picker lists at most.
 pub(super) const MAX_PATH_PICKS: usize = 300;
 
@@ -213,6 +278,66 @@ pub(super) fn path_picker_rows(
 	}
 	let mut out = Vec::new();
 	walk(root, 0, expanded, max, &mut out);
+	out
+}
+
+/// Loaded tree nodes the Paths picker reads at most per filter.
+pub(super) const MAX_PATH_SCAN: usize = 20_000;
+
+/// The Paths picker while its field has text: the loaded folders and
+/// files whose `prefix` + path contains `needle` (lowercase), each under
+/// its folders (shown open, not collapsible: the filter decides what
+/// shows), at most `max` rows and [`MAX_PATH_SCAN`] nodes read. Folders
+/// the tree has not read are not searched.
+pub(super) fn path_picker_matches(
+	root: &crate::tree::FileTreeNode,
+	needle: &str,
+	prefix: &str,
+	max: usize,
+) -> Vec<PathPick> {
+	fn walk(
+		node: &crate::tree::FileTreeNode,
+		depth: usize,
+		needle: &str,
+		prefix: &str,
+		max: usize,
+		budget: &mut usize,
+		out: &mut Vec<PathPick>,
+	) {
+		for child in &node.children {
+			if out.len() >= max || *budget == 0 {
+				return;
+			}
+			*budget -= 1;
+			if !child.is_valid_utf8 || child.is_nested_repo {
+				continue;
+			}
+			// Pushed first so it lands above its matches; dropped again if
+			// neither it nor anything under it matches.
+			let at = out.len();
+			let rel = format!("{prefix}{}", child.rel_path);
+			let hit = rel.to_lowercase().contains(needle);
+			out.push(PathPick {
+				rel,
+				name: child.name.clone(),
+				is_dir: Some(child.is_dir),
+				depth,
+				expandable: false,
+				expanded: false,
+			});
+			if child.is_dir {
+				walk(child, depth + 1, needle, prefix, max, budget, out);
+			}
+			if out.len() > at + 1 {
+				out[at].expanded = true;
+			} else if !hit {
+				out.pop();
+			}
+		}
+	}
+	let mut out = Vec::new();
+	let mut budget = MAX_PATH_SCAN;
+	walk(root, 0, needle, prefix, max, &mut budget, &mut out);
 	out
 }
 
@@ -581,27 +706,119 @@ impl WorkbenchModel {
 				}
 			}
 			LogMenu::Branch => {
-				let mut seen = HashSet::new();
-				let refs = std::iter::once("HEAD".to_string())
-					.filter(|_| self.head_sha.is_some() || self.log_is_merged())
-					.chain(self.refs.iter().map(|r| r.name.clone()))
-					.filter(|name| seen.insert(name.clone()))
+				items.push(
+					div()
+						.id("log-branch-input")
+						.relative()
+						.mx(px(4.))
+						.mb(px(2.))
+						.px(px(4.))
+						.rounded(px(4.))
+						.border_1()
+						.border_color(rgb(pal().button_border))
+						.child(self.log_branch_menu_input.clone())
+						.children(probe(log, "log-branch-input"))
+						.into_any_element(),
+				);
+				let needle = self
+					.log_branch_menu_input
+					.read(cx)
+					.text()
+					.trim()
+					.to_lowercase();
+				let head = (self.head_sha.is_some() || self.log_is_merged())
+					&& "head".contains(needle.as_str());
+				let rows = branch_popup_rows(
+					&self.refs,
+					&needle,
+					&self.log_branch_menu_open,
+					loc,
+				);
+				let refs = head
+					.then(|| BranchRow::Ref {
+						name: "HEAD".into(),
+						label: "HEAD".into(),
+						depth: 0,
+					})
+					.into_iter()
+					.chain(rows)
 					.take(MAX_LOG_MENU_ITEMS);
-				for name in refs {
-					let label = short_ref(&name).to_string();
-					let checked =
-						self.active_ref_filter.as_deref() == Some(&name);
-					let target = name.clone();
-					items.push(item(
-						format!("log-branch:{name}"),
-						label,
-						checked,
-						Box::new(move |this, cx| {
-							this.log_menu = None;
-							this.filter_by_ref(Some(target.clone()), cx)
-						}),
-						cx,
-					));
+				for row in refs {
+					match row {
+						BranchRow::Group {
+							key,
+							label,
+							collapsed,
+							..
+						} => {
+							let id = format!("log-branch-group:{key}");
+							items.push(
+								div()
+									.id(SharedString::from(id.clone()))
+									.relative()
+									.h(px(24.))
+									.px(px(8.))
+									.flex()
+									.items_center()
+									.gap(px(6.))
+									.rounded(px(4.))
+									.cursor_pointer()
+									.hover(|s| s.bg(rgb(pal().hover_bg)))
+									.on_click(cx.listener(
+										move |this, _, _, cx| {
+											cx.stop_propagation();
+											let open =
+												&mut this.log_branch_menu_open;
+											match open
+												.iter()
+												.position(|k| *k == key)
+											{
+												Some(i) => {
+													open.remove(i);
+												}
+												None => open.push(key.clone()),
+											}
+											cx.notify();
+										},
+									))
+									.child(div().flex_shrink_0().w(px(14.)))
+									.child(fill_text(label))
+									.child(icon(
+										if collapsed {
+											Icon::ChevronRight
+										} else {
+											Icon::ChevronDown
+										},
+										12.,
+									))
+									.children(probe(log, id))
+									.into_any_element(),
+							);
+						}
+						BranchRow::Ref { name, label, depth } => {
+							let checked = self.active_ref_filter.as_deref()
+								== Some(&name);
+							let target = name.clone();
+							items.push(
+								div()
+									.pl(px(depth as f32 * 14.))
+									.child(item(
+										format!("log-branch:{name}"),
+										label,
+										checked,
+										Box::new(move |this, cx| {
+											this.log_menu = None;
+											this.filter_by_ref(
+												Some(target.clone()),
+												cx,
+											)
+										}),
+										cx,
+									))
+									.into_any_element(),
+							);
+						}
+					}
 				}
 			}
 			LogMenu::User => {
@@ -740,8 +957,16 @@ impl WorkbenchModel {
 				// paths the tree does not show (typed, or in a closed
 				// folder) are listed above it.
 				let chosen = &self.log_filter.paths;
+				// Typed text filters the loaded tree (IntelliJ).
+				let needle =
+					self.log_path_input.read(cx).text().trim().to_lowercase();
 				let tree_rows = match self.file_tree.as_ref() {
-					_ if self.log_is_merged() => self.merged_path_picks(),
+					_ if self.log_is_merged() => {
+						self.merged_path_picks(&needle)
+					}
+					Some(tree) if tree.is_loaded && !needle.is_empty() => {
+						path_picker_matches(tree, &needle, "", MAX_PATH_PICKS)
+					}
 					Some(tree) if tree.is_loaded => path_picker_rows(
 						tree,
 						&self.log_paths_expanded,
@@ -762,6 +987,7 @@ impl WorkbenchModel {
 				let extra: Vec<PathPick> = chosen
 					.iter()
 					.filter(|p| !tree_rows.iter().any(|r| &r.rel == *p))
+					.filter(|p| p.to_lowercase().contains(&needle))
 					.map(|p| PathPick {
 						rel: p.clone(),
 						name: p.clone(),
@@ -845,12 +1071,45 @@ impl WorkbenchModel {
 	/// The merged log's Paths picker: its repositories on top; the selected
 	/// one opens into the project tree's loaded folders. A path is
 	/// `<repository>/<path>`, a repository alone keeps all its history.
-	pub(super) fn merged_path_picks(&self) -> Vec<PathPick> {
+	/// A `needle` (lowercase) keeps the matching paths only.
+	pub(super) fn merged_path_picks(&self, needle: &str) -> Vec<PathPick> {
 		let selected = self.repo().map(|r| r.name.clone());
 		let tree = self.file_tree.as_ref().filter(|t| t.is_loaded);
 		let mut out = Vec::new();
 		for (_, name) in self.log_scope() {
 			let mine = tree.filter(|_| selected.as_deref() == Some(&name));
+			if !needle.is_empty() {
+				let hits = mine
+					.map(|t| {
+						path_picker_matches(
+							t,
+							needle,
+							&format!("{name}/"),
+							MAX_PATH_PICKS,
+						)
+					})
+					.unwrap_or_default();
+				if hits.is_empty() && !name.to_lowercase().contains(needle) {
+					continue;
+				}
+				out.push(PathPick {
+					rel: name.clone(),
+					name: name.clone(),
+					is_dir: Some(true),
+					depth: 0,
+					expandable: false,
+					expanded: !hits.is_empty(),
+				});
+				out.extend(hits.into_iter().map(|mut pick| {
+					pick.depth += 1;
+					pick
+				}));
+				if out.len() >= MAX_PATH_PICKS {
+					out.truncate(MAX_PATH_PICKS);
+					break;
+				}
+				continue;
+			}
 			let expanded =
 				mine.is_some() && self.log_paths_expanded.contains(&name);
 			out.push(PathPick {

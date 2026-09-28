@@ -208,6 +208,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_details_on" => "於 {}",
 			"log_details_committed" => "由 {} 提交於 {}",
 			"log_details_in_branches" => "包含於 {} 個分支：{}",
+			"log_details_show_all" => "顯示全部",
 			"log_today" => "今天 {}",
 			"log_yesterday" => "昨天 {}",
 			// end log pane (IJ-2a)
@@ -288,6 +289,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_copy_cancelled" => "已取消複製，剪貼簿未變更。",
 			"status_copied" => "已從 {} 複製 {} 個檔案（{} 字元、{} 行，略過 {} 個）至剪貼簿",
 			"status_copy_nothing" => "沒有可複製的檔案內容",
+			"status_copied_limit" => "已從 {} 複製 {} 個檔案（{} 字元、{} 行，略過 {} 個）至剪貼簿；已達 {} 個檔案上限，其餘檔案未複製",
+			"status_copy_nothing_skipped" => "沒有可複製的檔案內容：所選資料夾內的檔案都無法複製，已略過",
 			"status_paste_preview" => "貼上預覽已就緒: {} 項變更",
 			"paste_err_not_payload" => "剪貼簿內容不是有效的 snip-sync payload",
 			"paste_err_nothing" => "剪貼簿 payload 不包含任何檔案",
@@ -378,6 +381,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"menu_remove_basket" => "從選取籃移除",
 			"menu_copy_path" => "複製路徑",
 			"menu_copy_relative_path" => "複製相對路徑",
+			"menu_copy_files" => "複製檔案 (snip-sync)",
 			"menu_show_diff" => "顯示差異",
 			"menu_copy_revision" => "複製修訂版號",
 			"menu_go_parent" => "前往父 commit",
@@ -532,6 +536,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_details_on" => "on {}",
 			"log_details_committed" => "committed by {} on {}",
 			"log_details_in_branches" => "In {} branches: {}",
+			"log_details_show_all" => "Show all",
 			"log_today" => "Today {}",
 			"log_yesterday" => "Yesterday {}",
 			// end log pane (IJ-2a)
@@ -612,6 +617,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_copy_cancelled" => "Copy cancelled. The clipboard was not changed.",
 			"status_copied" => "Copied from {}: {} files ({} chars, {} lines, {} skipped) to clipboard",
 			"status_copy_nothing" => "No file content to copy",
+			"status_copied_limit" => "Copied from {}: {} files ({} chars, {} lines, {} skipped) to clipboard; reached the {}-file limit, the rest were not copied",
+			"status_copy_nothing_skipped" => "No file content to copy: every file in the selected folders was skipped",
 			"status_paste_preview" => "Paste preview ready: {} items",
 			"paste_err_not_payload" => "Clipboard content is not a valid snip-sync payload",
 			"paste_err_nothing" => "Clipboard payload contains no files",
@@ -702,6 +709,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"menu_remove_basket" => "Remove from Basket",
 			"menu_copy_path" => "Copy Path",
 			"menu_copy_relative_path" => "Copy Relative Path",
+			"menu_copy_files" => "Copy Files (snip-sync)",
 			"menu_show_diff" => "Show Diff",
 			"menu_copy_revision" => "Copy Revision Number",
 			"menu_go_parent" => "Go to Parent Commit",
@@ -839,6 +847,7 @@ mod tests {
 			"log_loading_more",
 			"log_dir_files",
 			"log_details_in_branches",
+			"log_details_show_all",
 			"log_today",
 			"log_yesterday",
 			"changes_repo_error",
@@ -851,6 +860,9 @@ mod tests {
 			"status_log_merged_cap",
 			"log_selection_header",
 			"status_selection_truncated",
+			"menu_copy_files",
+			"status_copied_limit",
+			"status_copy_nothing_skipped",
 		];
 		for key in test_keys {
 			assert!(

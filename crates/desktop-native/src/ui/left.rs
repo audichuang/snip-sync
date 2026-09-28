@@ -528,11 +528,11 @@ impl WorkbenchModel {
 		let log = &self.probes;
 		let cursor = ix == self.tree_cursor;
 		match row {
-			ProjRow::Repo(idx) => {
+			ProjRow::Repo(idx, depth) => {
 				let repo = &self.repos[idx];
-				let expanded =
-					self.selected_repo_idx == Some(idx) && !self.repo_collapsed;
+				let expanded = self.repo_row_open(idx);
 				let id = format!("repo-row:{}", repo.name);
+				let chevron_id = format!("repo-chevron:{}", repo.name);
 				let mut counts = div()
 					.flex()
 					.flex_row()
@@ -615,7 +615,8 @@ impl WorkbenchModel {
 					.items_center()
 					.w_full()
 					.h(px(ROW_H))
-					.px(px(6.))
+					.pl(px(6. + depth as f32 * 14.))
+					.pr(px(6.))
 					.gap(px(5.))
 					.cursor_pointer()
 					.rounded(px(4.))
@@ -636,14 +637,26 @@ impl WorkbenchModel {
 							this.open_left_menu(items, ev, w, cx);
 						}),
 					)
-					.child(icon(
-						if expanded {
-							Icon::ChevronDown
-						} else {
-							Icon::ChevronRight
-						},
-						10.,
-					))
+					.child(
+						div()
+							.id(SharedString::from(chevron_id.clone()))
+							.relative()
+							.flex_shrink_0()
+							.on_click(cx.listener(move |this, _, _, cx| {
+								cx.stop_propagation();
+								this.tree_cursor = ix;
+								this.toggle_repo_chevron(idx, cx);
+							}))
+							.child(icon(
+								if expanded {
+									Icon::ChevronDown
+								} else {
+									Icon::ChevronRight
+								},
+								10.,
+							))
+							.children(probe(log, chevron_id)),
+					)
 					.child(icon(
 						if is_err { Icon::Warning } else { Icon::Project },
 						14.,
@@ -674,19 +687,32 @@ impl WorkbenchModel {
 					.children(probe(log, id))
 					.into_any_element()
 			}
-			ProjRow::Work(row) => self.work_tree_row(ix, row, cursor, cx),
+			ProjRow::Work(row) => {
+				self.work_tree_row(ix, row, cursor, false, cx)
+			}
+			ProjRow::Ws(row) => self.work_tree_row(ix, row, cursor, true, cx),
 			ProjRow::Rev(row) => self.rev_tree_row(ix, row, cursor, cx),
 		}
 	}
 
+	/// `ws`: a workspace-tree row (outside every repo), probed as `ws-*`.
 	pub(super) fn work_tree_row(
 		&self,
 		ix: usize,
 		row: FlattenedTreeRow,
 		cursor: bool,
+		ws: bool,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let log = &self.probes;
+		let pre = if ws { "ws-" } else { "" };
+		let dispatch = move |this: &mut Self, cmd, cx: &mut Context<Self>| {
+			if ws {
+				this.dispatch_ws_tree(cmd, cx);
+			} else {
+				this.dispatch_tree(cmd, cx);
+			}
+		};
 		let indent = 8.0 + row.depth as f32 * 14.0;
 		if row.is_error
 			|| row.is_truncation_marker
@@ -695,15 +721,15 @@ impl WorkbenchModel {
 			|| row.is_loading
 		{
 			let marker_id = if row.is_view_limit {
-				format!("tree-view-more:{}", row.rel_path)
+				format!("{pre}tree-view-more:{}", row.rel_path)
 			} else if row.is_more_marker {
-				format!("tree-continue:{}", row.rel_path)
+				format!("{pre}tree-continue:{}", row.rel_path)
 			} else if row.is_error {
-				format!("tree-retry:{}", row.rel_path)
+				format!("{pre}tree-retry:{}", row.rel_path)
 			} else if row.is_loading {
-				format!("tree-loading:{}", row.rel_path)
+				format!("{pre}tree-loading:{}", row.rel_path)
 			} else {
-				format!("tree-marker:{}", row.rel_path)
+				format!("{pre}tree-marker:{}", row.rel_path)
 			};
 			let action_row = row.clone();
 			let is_actionable =
@@ -726,7 +752,8 @@ impl WorkbenchModel {
 					d.cursor_pointer().hover(|s| s.bg(rgb(pal().hover_bg)))
 				})
 				.on_click(cx.listener(move |this, _, _, cx| {
-					this.dispatch_tree(
+					dispatch(
+						this,
 						command_for_row(&action_row, RowGesture::Primary),
 						cx,
 					);
@@ -737,24 +764,21 @@ impl WorkbenchModel {
 		}
 		let rel = row.rel_path.clone();
 		let click_row = row.clone();
-		let check_row = row.clone();
+		let chevron_row = row.clone();
+		let chevron_id = format!("{pre}tree-chevron:{rel}");
 		let menu_row = row.clone();
 		let is_dir = row.is_dir;
 		let row_id = if row.is_valid_utf8 {
-			format!("tree-row:{rel}")
+			format!("{pre}tree-row:{rel}")
 		} else {
-			format!("tree-invalid:{}", row.id_suffix)
-		};
-		let chk_id = if row.is_valid_utf8 {
-			format!("tree-chk:{rel}")
-		} else {
-			format!("tree-chk-invalid:{}", row.id_suffix)
+			format!("{pre}tree-invalid:{}", row.id_suffix)
 		};
 		let is_valid_utf8 = row.is_valid_utf8;
 
 		// Git status as filename colour, like IntelliJ's Project view.
 		let open_rows = self
 			.selected_change_slot()
+			.filter(|_| !ws)
 			.map_or(0..0, |slot| crate::slot_range(&self.files, slot));
 		let name_color = self.files[open_rows]
 			.iter()
@@ -781,73 +805,94 @@ impl WorkbenchModel {
 			.gap(px(5.))
 			.when(is_valid_utf8, |d| d.cursor_pointer())
 			.rounded(px(4.))
-			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
-			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			// Selected rows are the Project selection (IntelliJ: no checks).
+			.when(cursor || row.selected, |d| {
+				d.bg(rgb(self.left_selection_bg()))
+			})
+			.when(!cursor && !row.selected, |d| {
+				d.hover(|s| s.bg(rgb(pal().hover_bg)))
+			})
 			.on_mouse_down(
 				MouseButton::Right,
 				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
 					this.tree_cursor = ix;
-					let items = this.work_row_menu(&menu_row);
+					// IntelliJ: right-clicking outside the selection
+					// selects that row alone first.
+					let mut row = menu_row.clone();
+					if !row.selected && row.is_valid_utf8 {
+						let rel = [row.rel_path.clone()];
+						this.select_tree_rows_alone(ws, &rel, cx);
+						let tree =
+							if ws { &this.ws_tree } else { &this.file_tree };
+						row.selected = tree.as_ref().is_some_and(|t| {
+							t.selected_paths().binary_search(&rel[0]).is_ok()
+						});
+					}
+					let items = this.work_row_menu(&row, ws);
 					this.open_left_menu(items, ev, w, cx);
 				}),
 			)
 			.when(is_valid_utf8, |d| {
-				d.on_click(cx.listener(move |this, _, _, cx| {
-					this.tree_cursor = ix;
-					this.dispatch_tree(
-						command_for_row(&click_row, RowGesture::Primary),
-						cx,
-					);
-				}))
-			})
-			.child(if is_dir {
-				icon(
-					if row.is_expanded {
-						Icon::ChevronDown
-					} else {
-						Icon::ChevronRight
+				d.on_click(cx.listener(
+					move |this, ev: &gpui::ClickEvent, _, cx| {
+						// Cmd on macOS, Ctrl elsewhere toggles the row;
+						// Shift selects the range from the cursor.
+						if ev.modifiers().secondary() {
+							this.tree_cursor = ix;
+							dispatch(
+								this,
+								command_for_row(&click_row, RowGesture::Toggle),
+								cx,
+							);
+						} else if ev.modifiers().shift {
+							this.select_tree_range(ix, ws, cx);
+						} else {
+							this.tree_cursor = ix;
+							// IntelliJ: a plain click selects the row alone,
+							// then opens the folder or previews the file.
+							let rel = [click_row.rel_path.clone()];
+							this.select_tree_rows_alone(ws, &rel, cx);
+							dispatch(
+								this,
+								command_for_row(
+									&click_row,
+									RowGesture::Primary,
+								),
+								cx,
+							);
+						}
 					},
-					10.,
-				)
-				.into_any_element()
+				))
+			})
+			// IntelliJ: the chevron opens or closes the folder without
+			// selecting it; the row click selects it alone and opens it.
+			.child(if is_dir {
+				div()
+					.id(SharedString::from(chevron_id.clone()))
+					.relative()
+					.flex_shrink_0()
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.tree_cursor = ix;
+						dispatch(
+							this,
+							command_for_row(&chevron_row, RowGesture::Primary),
+							cx,
+						);
+					}))
+					.child(icon(
+						if row.is_expanded {
+							Icon::ChevronDown
+						} else {
+							Icon::ChevronRight
+						},
+						10.,
+					))
+					.children(probe(log, chevron_id))
+					.into_any_element()
 			} else {
 				div().flex_shrink_0().w(px(10.)).into_any_element()
 			})
-			.child(
-				div()
-					.id(SharedString::from(chk_id.clone()))
-					.relative()
-					.flex_shrink_0()
-					.size(px(18.))
-					.flex()
-					.items_center()
-					.justify_center()
-					.when(is_valid_utf8, |d| {
-						d.cursor_pointer().on_click(cx.listener(
-							move |this, _, _, cx| {
-								cx.stop_propagation();
-								this.tree_cursor = ix;
-								this.dispatch_tree(
-									command_for_row(
-										&check_row,
-										RowGesture::Toggle,
-									),
-									cx,
-								);
-							},
-						))
-					})
-					.child(if is_valid_utf8 {
-						checkbox(row.selected).into_any_element()
-					} else {
-						div()
-							.text_size(px(9.))
-							.text_color(rgb(pal().text_muted))
-							.child("×")
-							.into_any_element()
-					})
-					.children(probe(log, chk_id)),
-			)
 			.child(icon(
 				if is_dir {
 					if row.is_expanded {

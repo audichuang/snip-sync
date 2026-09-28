@@ -255,6 +255,32 @@ fn key(wid: &str, keys: &str) {
 	assert!(st.success(), "xdotool key failed for {keys}");
 }
 
+/// Ctrl-click (Cmd elsewhere) the centre of `v`: the Project view's
+/// multi-selection toggle, which replaced its checkboxes.
+fn ctrl_click_at(wid: &str, v: [i32; 4]) {
+	let _ = Command::new("xdotool")
+		.args(["windowfocus", "--sync", wid])
+		.status();
+	let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+	let st = Command::new("xdotool")
+		.args([
+			"mousemove",
+			"--window",
+			wid,
+			&x.to_string(),
+			&y.to_string(),
+			"keydown",
+			"ctrl",
+			"click",
+			"1",
+			"keyup",
+			"ctrl",
+		])
+		.status()
+		.unwrap();
+	assert!(st.success(), "ctrl-click at {v:?}");
+}
+
 /// Ctrl+Q must exit the app cleanly (status 0) within the deadline. A hang
 /// or crash fails the test after the process is killed and reaped.
 fn quit_cleanly(app: &mut App, wid: &str) {
@@ -1319,14 +1345,15 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	wait_for_pattern("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3))
 		.expect("Alt+1 must switch to FileExplorer");
 
-	// Tick the checkbox of unchanged tracked file 'unchanged.txt'
-	println!("[TEST DRIVER] Clicking checkbox for unchanged.txt...");
-	click("tree-chk:unchanged.txt");
+	// Click the unchanged tracked file 'unchanged.txt': it becomes the
+	// Project selection alone (nested.txt, clicked earlier, leaves it).
+	println!("[TEST DRIVER] Selecting unchanged.txt...");
+	click("tree-row:unchanged.txt");
 	wait_for_pattern(
-		"[APP:TREE_TOGGLED: unchanged.txt]",
+		"[APP:TREE_SELECTED: unchanged.txt]",
 		Duration::from_secs(3),
 	)
-	.expect("unchanged.txt checkbox must be toggled");
+	.expect("unchanged.txt must become the selection");
 
 	// Switching tool windows must not clear the pending copy selection
 	click("rail-changes");
@@ -2165,14 +2192,26 @@ fn native_graph_failed_next_page_is_transactional() {
 	}
 	// The row the failure was drawn over is unchanged: the refused page
 	// attached nothing to the old rails.
-	let after = crop_row("retried", false);
-	let comparison = Command::new("compare")
-		.args(["-metric", "AE"])
-		.arg(&refused)
-		.arg(&after)
-		.arg("null:")
-		.output()
-		.unwrap();
+	// A loaded runner may capture the row mid-repaint (the retried page
+	// lands under it): take a few captures before calling it changed.
+	let mut comparison = None;
+	for _ in 0..5 {
+		let after = crop_row("retried", false);
+		let out = Command::new("compare")
+			.args(["-metric", "AE"])
+			.arg(&refused)
+			.arg(&after)
+			.arg("null:")
+			.output()
+			.unwrap();
+		let same = out.status.success();
+		comparison = Some(out);
+		if same {
+			break;
+		}
+		std::thread::sleep(Duration::from_millis(300));
+	}
+	let comparison = comparison.unwrap();
 	assert!(
 		comparison.status.success(),
 		"prior rendered row text and graph rails must remain identical: {}",
@@ -2822,13 +2861,15 @@ fn native_d3_files_and_replay_skip_oracles() {
 	wait_for("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3));
 	click("pick-repo:repo-one");
 	wait_for("[APP:REPO_LOADED: repo-one", Duration::from_secs(6));
-	click("tree-chk:one.txt");
+	std::thread::sleep(Duration::from_millis(180));
+	ctrl_click_at(&wid, control("tree-row:one.txt"));
 	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
 	click("btn-repo-selector");
 	wait_for("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3));
 	click("pick-repo:repo-two");
 	wait_for("[APP:REPO_LOADED: repo-two", Duration::from_secs(6));
-	click("tree-chk:two.txt");
+	std::thread::sleep(Duration::from_millis(180));
+	ctrl_click_at(&wid, control("tree-row:two.txt"));
 	let basket = wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
 	assert!(basket.contains("one.txt"), "{basket}");
 	assert!(basket.contains("two.txt"), "{basket}");
@@ -3118,13 +3159,14 @@ fn native_tree_paging_retry_selection_900x600() {
 	assert!(has_id("tree-row:broken").is_some(), "broken directory row");
 
 	// Topmost, not HashMap order: the bottom row can be clipped by the list.
-	let chk = settled()
+	let row = settled()
 		.into_iter()
-		.filter(|(id, _)| id.starts_with("tree-chk:f-"))
+		.filter(|(id, _)| id.starts_with("tree-row:f-"))
 		.min_by_key(|(_, b)| b[1])
 		.map(|(id, _)| id)
-		.expect("a root file checkbox");
-	click(&chk);
+		.expect("a root file row");
+	std::thread::sleep(Duration::from_millis(180));
+	ctrl_click_at(&wid, control(&row));
 	let toggled =
 		lines_until(&app.rx, "[APP:TREE_TOGGLED:", Duration::from_secs(5))
 			.unwrap();
@@ -4367,17 +4409,19 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	absent("context-menu");
 	assert_eq!(clip_get(), "subfolder/nested.txt");
 
-	// 2. Keyboard: Down highlights the first item, Enter runs it.
+	// 2. Keyboard: Down highlights the first item, Enter runs it. The
+	// right-click selected the row alone, so Copy Files copies just it.
 	right_click("tree-row:alpha.txt");
-	wait("[APP:MENU_OPEN: Left items=add-basket");
+	wait("[APP:BASKET: n=1");
+	wait("[APP:MENU_OPEN: Left items=copy-files");
 	key(&wid, "Down");
 	key(&wid, "Return");
-	wait("[APP:MENU_ACTION: add-basket]");
-	wait("[APP:BASKET: n=1");
+	wait("[APP:MENU_ACTION: copy-files]");
+	wait("[APP:COPY_DONE: copied=1]");
 	absent("context-menu");
 	// Escape closes a menu without running anything.
 	right_click("tree-row:alpha.txt");
-	wait("[APP:MENU_OPEN: Left items=remove-basket");
+	wait("[APP:MENU_OPEN: Left items=copy-files");
 	key(&wid, "Escape");
 	let closed = wait("[APP:MENU_CLOSED]");
 	assert!(
@@ -4444,6 +4488,60 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	wait("[APP:MENU_ACTION: copy-revision]");
 	wait("[APP:TEXT_COPIED:");
 	assert_eq!(clip_get(), second);
+	// 5b. The changed-files pane: right-click a file of that commit and
+	// copy it (snip-sync payload) as it was in the commit.
+	clip_set("SENTINEL_LOG_FILE_MENU");
+	right_click("commit-file:alpha.txt");
+	wait("[APP:MENU_OPEN: Log items=copy-files,");
+	click("menu-item:copy-files");
+	wait("[APP:MENU_ACTION: copy-files]");
+	wait("[APP:COPY_DONE: copied=1]");
+	absent("context-menu");
+	// A card over the window says so, not only the status bar.
+	wait("[APP:TOAST: ok=true]");
+	control("copy-toast");
+	let copied = clip_get();
+	assert!(
+		copied.contains("alpha.txt") && copied.contains("alpha two\n"),
+		"{copied}"
+	);
+	assert!(!copied.contains("nested"), "{copied}");
+	// Its relative path, too.
+	right_click("commit-file:alpha.txt");
+	wait("[APP:MENU_OPEN: Log items=copy-files,");
+	click("menu-item:copy-relative-path");
+	wait("[APP:TEXT_COPIED:");
+	assert_eq!(clip_get(), "alpha.txt");
+	let type_text = |text: &str| {
+		Command::new("xdotool")
+			.args(["type", "--window", &wid, text])
+			.status()
+			.unwrap();
+	};
+	// 5c. Branch chip: Local is a closed section; typing lists the
+	// matching branches flat.
+	click("log-filter-branch");
+	wait("[APP:LOG_MENU: Some(Branch)]");
+	control("log-branch-group:refs_local");
+	absent("log-branch:refs/heads/main");
+	click("log-branch-group:refs_local");
+	control("log-branch:refs/heads/main");
+	click("log-branch-group:refs_local");
+	absent("log-branch:refs/heads/main");
+	type_text("MAI");
+	control("log-branch:refs/heads/main");
+	absent("log-branch-group:refs_local");
+	key(&wid, "Escape");
+	absent("log-branch-input");
+	// 5d. Paths chip: typing filters the loaded tree.
+	click("log-filter-paths");
+	wait("[APP:LOG_MENU: Some(Paths)]");
+	control("log-path-pick:alpha.txt");
+	type_text("nest");
+	control("log-path-pick:subfolder/nested.txt");
+	absent("log-path-pick:alpha.txt");
+	key(&wid, "Escape");
+	absent("log-path-input");
 
 	// 6. Ctrl+Shift+` opens the branches popup.
 	key(&wid, "ctrl+shift+grave");
@@ -5412,6 +5510,15 @@ fn log_multiselect(theme: &str) {
 		assert!(st.success());
 	};
 	let click = |id: &str| press(id, None);
+	// Drawn, maybe scrolled past the details pane's edge.
+	let drawn = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		while !bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let (a2, a4) = (&shas["alpha2"][..7], &shas["alpha4"][..7]);
 
 	// A taller log: every row and the whole details tree on screen.
 	{
@@ -5460,6 +5567,25 @@ fn log_multiselect(theme: &str) {
 	control("commit-details-selection");
 	// The first file opens as the selection's diff.
 	wait("[APP:PREVIEW_LOADED:");
+	// The changed files get most of the right pane, the details less.
+	let (files, details) =
+		(control("commit-files-pane"), control("commit-details"));
+	assert!(files[3] > details[3], "files {files:?} details {details:?}");
+	// The selected commits stay one header row until it is clicked open;
+	// each then shows its author line and branches, not just a subject.
+	control("log-selection-toggle");
+	absent(&format!("selection-commit:{a4}"));
+	click("log-selection-toggle");
+	wait("[APP:LOG_SELECTION_EXPANDED: true]");
+	wait("[APP:SELECTION_DETAILS: 2]");
+	for sha in [a4, a2] {
+		drawn(&format!("selection-commit:{sha}"));
+		drawn(&format!("commit-details-author:{sha}"));
+		drawn(&format!("commit-details-branches:{sha}"));
+	}
+	click("log-selection-toggle");
+	wait("[APP:LOG_SELECTION_EXPANDED: false]");
+	absent(&format!("selection-commit:{a4}"));
 	// Flat and back.
 	click("details-group-dir");
 	wait("[APP:LOG_DETAILS_GROUP_DIR: false]");
@@ -5503,6 +5629,10 @@ fn log_multiselect(theme: &str) {
 	press(&row("alpha2"), Some("ctrl"));
 	wait(&format!("[APP:COMMIT_SELECTED: {}]", &shas["alpha4"][..7]));
 	absent("commit-details-selection");
+	// One commit: hash, author and email on one line, then its branches.
+	wait(&format!("[APP:COMMIT_DETAILS: {a4} branches=1]"));
+	drawn(&format!("commit-details-author:{a4}"));
+	drawn(&format!("commit-details-branches:{a4}"));
 
 	quit_cleanly(&mut app, &wid);
 }
@@ -5721,4 +5851,677 @@ fn native_merged_graph_over_four_repositories() {
 	}
 
 	quit_cleanly(&mut app, &wid);
+}
+
+/// The Project view shows the whole workspace like IntelliJ: a plain
+/// folder beside a repo is listed, its file previews, checks into the
+/// basket and copies as a file-mode payload. The repo keeps its row.
+#[test]
+fn native_project_view_lists_and_copies_non_git_files() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let app_repo = ws.join("app");
+	fs::create_dir_all(&app_repo).unwrap();
+	git_ok(&app_repo, &["init", "-q", "-b", "main"]);
+	git_ok(&app_repo, &["config", "user.name", "Tester"]);
+	git_ok(&app_repo, &["config", "user.email", "test@example.com"]);
+	fs::write(app_repo.join("main.rs"), "fn main() {}\n").unwrap();
+	git_ok(&app_repo, &["add", "."]);
+	git_ok(&app_repo, &["commit", "-qm", "base"]);
+	fs::create_dir_all(ws.join("notes")).unwrap();
+	fs::write(ws.join("notes/readme.txt"), "PLAIN_NOTE_BYTES\n").unwrap();
+	fs::write(ws.join("top.txt"), "TOP_BYTES\n").unwrap();
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 1]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		assert!(st.success(), "click {id}");
+	};
+
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	// The repo keeps its row (and probe id) inside the workspace listing.
+	control("repo-row:app");
+	control("ws-tree-row:top.txt");
+	click("ws-tree-row:notes");
+	wait_for("[APP:WS_TREE_PAGE: rel=notes", Duration::from_secs(4));
+	// A plain click selects the file alone and previews it.
+	click("ws-tree-row:notes/readme.txt");
+	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	wait_for(
+		"[APP:PREVIEW_LOADED: notes/readme.txt]",
+		Duration::from_secs(4),
+	);
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
+	let copied = clip::read_text().unwrap();
+	assert!(copied.contains("PLAIN_NOTE_BYTES"), "{copied}");
+	assert!(copied.contains("notes/readme.txt"), "{copied}");
+	assert!(!copied.contains("TOP_BYTES"), "{copied}");
+
+	// A repo file and a workspace file copy together as one payload.
+	std::thread::sleep(Duration::from_millis(200));
+	ctrl_click_at(&wid, control("tree-row:main.rs"));
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
+	let both = clip::read_text().unwrap();
+	assert!(both.contains("PLAIN_NOTE_BYTES"), "{both}");
+	assert!(both.contains("fn main() {}"), "{both}");
+	for line in both
+		.lines()
+		.filter(|l| l.contains("readme.txt") || l.contains("main.rs"))
+	{
+		println!("[MIXED HEADER] {line}");
+	}
+	quit_cleanly(&mut app, &wid);
+}
+
+/// A workspace that is itself a repo (with a repo and a plain folder
+/// inside) is still one faithful tree: the root row is the workspace repo,
+/// the inner repo sits indented at its folder rather than as a top-level
+/// sibling, and the plain folder's file stays listed and copyable while
+/// the inner repo is the open one.
+#[test]
+fn native_project_view_nests_repos_inside_a_workspace_repo() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("INVI_SRC");
+	let inner = ws.join("inner");
+	for repo in [&ws, &inner] {
+		fs::create_dir_all(repo).unwrap();
+		git_ok(repo, &["init", "-q", "-b", "master"]);
+		git_ok(repo, &["config", "user.name", "Tester"]);
+		git_ok(repo, &["config", "user.email", "test@example.com"]);
+	}
+	fs::write(inner.join("lib.rs"), "pub fn inner() {}\n").unwrap();
+	git_ok(&inner, &["add", "."]);
+	git_ok(&inner, &["commit", "-qm", "inner"]);
+	fs::create_dir_all(ws.join("plain")).unwrap();
+	fs::write(ws.join("plain/x.txt"), "PLAIN_X_BYTES\n").unwrap();
+	fs::write(ws.join("root.txt"), "ROOT_BYTES\n").unwrap();
+	git_ok(&ws, &["add", "root.txt", "plain"]);
+	git_ok(&ws, &["commit", "-qm", "base"]);
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 2]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		assert!(st.success(), "click {id}");
+	};
+	let y = |id: &str| control(id)[1];
+
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	// The workspace repo opens as the root row; the inner repo sits at its
+	// folder among the tree's folders, not as a sibling after the tree.
+	let root = y("repo-row:INVI_SRC");
+	assert!(root < y("repo-row:inner"));
+	assert!(
+		y("repo-row:inner") < y("tree-row:plain"),
+		"inner must sit at its folder inside the workspace tree"
+	);
+	control("tree-row:root.txt");
+
+	// Opening the inner repo keeps the workspace tree around it.
+	click("repo-row:inner");
+	wait_for("(inner) root=", Duration::from_secs(4));
+	control("tree-row:lib.rs");
+	click("ws-tree-row:plain");
+	wait_for("[APP:WS_TREE_PAGE: rel=plain", Duration::from_secs(4));
+	assert!(y("repo-row:INVI_SRC") < y("repo-row:inner"));
+	assert!(y("tree-row:lib.rs") < y("ws-tree-row:plain/x.txt"));
+
+	// Refresh keeps the workspace folders the user opened.
+	click("btn-refresh");
+	wait_for("[APP:WS_TREE_PAGE: rel=plain", Duration::from_secs(8));
+	control("ws-tree-row:plain/x.txt");
+
+	// The root row's chevron folds the workspace tree without switching
+	// repos; the inner repo, placed inside it, folds away with it.
+	click("repo-chevron:INVI_SRC");
+	absent_id(&bounds, "ws-tree-row:plain");
+	absent_id(&bounds, "repo-row:inner");
+	click("repo-chevron:INVI_SRC");
+	control("ws-tree-row:plain/x.txt");
+	control("tree-row:lib.rs");
+
+	click("ws-tree-row:plain/x.txt");
+	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
+	let copied = clip::read_text().unwrap();
+	assert!(copied.contains("PLAIN_X_BYTES"), "{copied}");
+	assert!(copied.contains("plain/x.txt"), "{copied}");
+	assert!(!copied.contains("ROOT_BYTES"), "{copied}");
+
+	// Back on the workspace repo, the folder stays open and checked.
+	click("repo-row:INVI_SRC");
+	wait_for("(INVI_SRC) root=", Duration::from_secs(4));
+	wait_for("[APP:TREE_EXPANDED: plain]", Duration::from_secs(4));
+	control("tree-row:plain/x.txt");
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
+	assert!(clip::read_text().unwrap().contains("PLAIN_X_BYTES"));
+	quit_cleanly(&mut app, &wid);
+}
+
+/// IntelliJ: a plain click on any Project row, folder or file, selects that
+/// row alone, in the open repo's tree and in the workspace tree. A folder
+/// selection is only the folder: expanding it highlights no children
+/// (they used to be inherited, so each expansion grew an earlier folder
+/// selection the plain clicks never replaced). Ctrl/Cmd-click adds. After
+/// that a Changes staged row still previews, and Copy / paste work.
+#[test]
+fn native_project_view_plain_click_selects_one_row() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("INVI_SRC");
+	let inner = ws.join("inner");
+	for repo in [&ws, &inner] {
+		fs::create_dir_all(repo).unwrap();
+		git_ok(repo, &["init", "-q", "-b", "master"]);
+		git_ok(repo, &["config", "user.name", "Tester"]);
+		git_ok(repo, &["config", "user.email", "test@example.com"]);
+	}
+	let java = inner.join("src/main/java");
+	for dir in ["com/bi/base", "com/bi/cub", "com/cathay", "com/cathaybk"] {
+		fs::create_dir_all(java.join(dir)).unwrap();
+		fs::write(java.join(dir).join("A.java"), "class A {}\n").unwrap();
+	}
+	fs::write(java.join("TextResource.java"), "class T {}\n").unwrap();
+	fs::write(inner.join("staged.txt"), "BASE\n").unwrap();
+	git_ok(&inner, &["add", "."]);
+	git_ok(&inner, &["commit", "-qm", "inner"]);
+	// Staged and then changed again, like the acceptance driver's row.
+	fs::write(inner.join("staged.txt"), "STAGED_BYTES\n").unwrap();
+	git_ok(&inner, &["add", "staged.txt"]);
+	fs::write(inner.join("staged.txt"), "WORKING_BYTES\n").unwrap();
+	fs::create_dir_all(ws.join("docs/sub")).unwrap();
+	fs::write(ws.join("docs/sub/s.txt"), "S\n").unwrap();
+	fs::write(ws.join("docs/a.txt"), "A\n").unwrap();
+	fs::write(ws.join("docs/b.txt"), "B\n").unwrap();
+	git_ok(&ws, &["add", "docs"]);
+	git_ok(&ws, &["commit", "-qm", "base"]);
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 2]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "900"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, pre: &[&str], button: &str, post: &[&str]| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let (x, y) = (x.to_string(), y.to_string());
+		let mut args = vec!["mousemove", "--window", &wid, &x, &y];
+		args.extend_from_slice(pre);
+		args.extend_from_slice(&["click", button]);
+		args.extend_from_slice(post);
+		let st = Command::new("xdotool").args(&args).status().unwrap();
+		assert!(st.success(), "click {id}");
+	};
+	let click = |id: &str| press(id, &[], "1", &[]);
+	// Exactly these rows are highlighted after the click.
+	let only = |file: &str, ws: &str| {
+		wait_for(
+			&format!("[APP:TREE_SELECTION: file=[{file}] ws=[{ws}]]"),
+			Duration::from_secs(4),
+		);
+	};
+
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	click("repo-row:inner");
+	wait_for("(inner) root=", Duration::from_secs(4));
+	// An earlier folder pick (right-click) must not grow as folders open.
+	press("tree-row:src", &[], "3", &[]);
+	wait_for("[APP:MENU_OPEN: Left", Duration::from_secs(3));
+	key(&wid, "Escape");
+	wait_for("[APP:MENU_CLOSED]", Duration::from_secs(3));
+
+	let j = "src/main/java";
+	for (row, file) in [
+		("src".to_string(), false),
+		("src/main".to_string(), false),
+		(j.to_string(), false),
+		(format!("{j}/com"), false),
+		(format!("{j}/com/bi"), false),
+		(format!("{j}/com/bi/base"), false),
+		(format!("{j}/com/cathaybk"), false),
+		(format!("{j}/TextResource.java"), true),
+		(format!("{j}/com/bi/base/A.java"), true),
+	] {
+		click(&format!("tree-row:{row}"));
+		only(&row, "");
+		if !file {
+			wait_for(
+				&format!("[APP:TREE_EXPANDED: {row}]"),
+				Duration::from_secs(4),
+			);
+		}
+	}
+
+	// The workspace tree, with the inner repo open.
+	click("ws-tree-row:docs");
+	only("", "docs");
+	wait_for("[APP:WS_TREE_PAGE: rel=docs", Duration::from_secs(4));
+	click("ws-tree-row:docs/sub");
+	only("", "docs/sub");
+	wait_for("[APP:WS_TREE_PAGE: rel=docs/sub", Duration::from_secs(4));
+	click("ws-tree-row:docs/a.txt");
+	only("", "docs/a.txt");
+	click("ws-tree-row:docs/b.txt");
+	only("", "docs/b.txt");
+	// Ctrl/Cmd-click still adds to the selection.
+	press(
+		"ws-tree-row:docs/a.txt",
+		&["keydown", "ctrl"],
+		"1",
+		&["keyup", "ctrl"],
+	);
+	only("", "docs/a.txt,docs/b.txt");
+
+	// After plain clicks in Project, a Changes staged row still previews
+	// its index bytes, and Copy / paste preview work on the whole basket.
+	click("tree-row:src/main/java/TextResource.java");
+	only("src/main/java/TextResource.java", "");
+	click("rail-changes");
+	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
+	click("change-row:staged:staged.txt");
+	let preview = wait_for(
+		"[APP:E2E_PREVIEW: source=staged_changes",
+		Duration::from_secs(6),
+	);
+	assert!(preview.contains("path=staged.txt"), "{preview}");
+	click("change-chk:staged:staged.txt");
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	click("btn-copy");
+	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
+	let copied = clip::read_text().unwrap();
+	assert!(copied.contains("STAGED_BYTES"), "{copied}");
+	assert!(!copied.contains("WORKING_BYTES"), "{copied}");
+	assert!(copied.contains("class T {}"), "{copied}");
+	key(&wid, "ctrl+v");
+	wait_for("[APP:PASTE_PREVIEW: items=2", Duration::from_secs(6));
+	key(&wid, "Escape");
+	wait_for("[APP:PASTE_CANCELLED]", Duration::from_secs(3));
+	quit_cleanly(&mut app, &wid);
+}
+
+/// The Project view has no checkboxes (IntelliJ): Ctrl/Cmd-click gathers
+/// files from different folders, right-click > Copy Files copies them all;
+/// Shift-click selects a range; a plain click selects one file alone.
+#[test]
+fn native_project_view_multiselect_and_right_click_copy() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("pick");
+	fs::create_dir_all(ws.join("a")).unwrap();
+	fs::create_dir_all(ws.join("b")).unwrap();
+	git_ok(&ws, &["init", "-q", "-b", "main"]);
+	git_ok(&ws, &["config", "user.name", "Tester"]);
+	git_ok(&ws, &["config", "user.email", "test@example.com"]);
+	fs::write(ws.join("a/one.txt"), "ONE_BYTES\n").unwrap();
+	fs::write(ws.join("b/two.txt"), "TWO_BYTES\n").unwrap();
+	fs::write(ws.join("c.txt"), "C_BYTES\n").unwrap();
+	fs::create_dir_all(ws.join("d/inner")).unwrap();
+	fs::write(ws.join("d/deep.txt"), "DEEP_BYTES\n").unwrap();
+	fs::write(ws.join("d/inner/more.txt"), "MORE_BYTES\n").unwrap();
+	fs::write(ws.join("e.txt"), "E_BASE\n").unwrap();
+	git_ok(&ws, &["add", "."]);
+	git_ok(&ws, &["commit", "-qm", "base"]);
+	fs::write(ws.join("e.txt"), "E_DIRTY\n").unwrap();
+	// A `.git` that is no repo: a folder row the tree marks as a repo.
+	fs::create_dir_all(ws.join("fake/.git")).unwrap();
+	fs::write(ws.join("fake/f.txt"), "FAKE_BYTES\n").unwrap();
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 1]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, pre: &[&str], button: &str, post: &[&str]| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let (x, y) = (x.to_string(), y.to_string());
+		let mut args = vec!["mousemove", "--window", &wid, &x, &y];
+		args.extend_from_slice(pre);
+		args.extend_from_slice(&["click", button]);
+		args.extend_from_slice(post);
+		let st = Command::new("xdotool").args(&args).status().unwrap();
+		assert!(st.success(), "click {id}");
+	};
+	let click = |id: &str| press(id, &[], "1", &[]);
+	let ctrl_click =
+		|id: &str| press(id, &["keydown", "ctrl"], "1", &["keyup", "ctrl"]);
+	let shift_click =
+		|id: &str| press(id, &["keydown", "shift"], "1", &["keyup", "shift"]);
+	let copy_by_menu = |row: &str| -> String {
+		press(row, &[], "3", &[]);
+		wait_for(
+			"[APP:MENU_OPEN: Left items=copy-files",
+			Duration::from_secs(3),
+		);
+		click("menu-item:copy-files");
+		wait_for("[APP:COPY_DONE:", Duration::from_secs(6));
+		clip::read_text().unwrap()
+	};
+
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	control("tree-row:c.txt");
+	absent_id(&bounds, "tree-chk:c.txt");
+	click("tree-row:a");
+	wait_for("[APP:TREE_EXPANDED: a]", Duration::from_secs(4));
+	click("tree-row:b");
+	wait_for("[APP:TREE_EXPANDED: b]", Duration::from_secs(4));
+
+	// Opening a folder selected it alone. Click one file, Ctrl-click a
+	// file in another folder, then copy by right-click.
+	click("tree-row:a/one.txt");
+	wait_for("[APP:TREE_SELECTED: a/one.txt]", Duration::from_secs(3));
+	ctrl_click("tree-row:b/two.txt");
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	let both = copy_by_menu("tree-row:b/two.txt");
+	assert!(both.contains("ONE_BYTES"), "{both}");
+	assert!(both.contains("TWO_BYTES"), "{both}");
+	assert!(!both.contains("C_BYTES"), "{both}");
+
+	// Right-clicking a row that cannot be selected (a repo folder) keeps
+	// the selection; its menu has Copy Files disabled.
+	press("tree-row:fake", &[], "3", &[]);
+	wait_for(
+		"[APP:MENU_OPEN: Left items=copy-files",
+		Duration::from_secs(3),
+	);
+	key(&wid, "Escape");
+	wait_for("[APP:MENU_CLOSED]", Duration::from_secs(3));
+	let kept = copy_by_menu("tree-row:b/two.txt");
+	assert!(kept.contains("ONE_BYTES"), "{kept}");
+	assert!(kept.contains("TWO_BYTES"), "{kept}");
+
+	// A plain click selects that file alone.
+	click("tree-row:c.txt");
+	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	let alone = copy_by_menu("tree-row:c.txt");
+	assert!(alone.contains("C_BYTES"), "{alone}");
+	assert!(!alone.contains("ONE_BYTES"), "{alone}");
+
+	// IntelliJ: click one file, Ctrl-click another, right-click copies both.
+	click("tree-row:a/one.txt");
+	wait_for("[APP:TREE_SELECTED: a/one.txt]", Duration::from_secs(3));
+	ctrl_click("tree-row:b/two.txt");
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	let picked = copy_by_menu("tree-row:b/two.txt");
+	assert!(picked.contains("ONE_BYTES"), "{picked}");
+	assert!(picked.contains("TWO_BYTES"), "{picked}");
+	assert!(!picked.contains("C_BYTES"), "{picked}");
+
+	// Right-click outside the selection selects that row alone first.
+	let other = copy_by_menu("tree-row:a/one.txt");
+	assert!(other.contains("ONE_BYTES"), "{other}");
+	assert!(!other.contains("C_BYTES"), "{other}");
+
+	// Shift-click selects the rows between the cursor and the click.
+	click("tree-row:a/one.txt");
+	wait_for(
+		"[APP:TREE_FILE_SELECTED: a/one.txt]",
+		Duration::from_secs(3),
+	);
+	shift_click("tree-row:b/two.txt");
+	wait_for(
+		"[APP:TREE_SELECTED: a/one.txt,b,b/two.txt]",
+		Duration::from_secs(3),
+	);
+	let range = copy_by_menu("tree-row:b/two.txt");
+	assert!(range.contains("ONE_BYTES"), "{range}");
+	assert!(range.contains("TWO_BYTES"), "{range}");
+	assert!(!range.contains("C_BYTES"), "{range}");
+
+	// A folder never opened copies every file under it.
+	ctrl_click("tree-row:d");
+	wait_for("[APP:TREE_TOGGLED: d]", Duration::from_secs(3));
+	let folder = copy_by_menu("tree-row:d");
+	assert!(folder.contains("DEEP_BYTES"), "{folder}");
+	assert!(folder.contains("MORE_BYTES"), "{folder}");
+	assert!(folder.contains("TWO_BYTES"), "{folder}");
+
+	// A Project-selected file also checked in Changes (Working) is the
+	// same bytes on disk: the toolbar Copy takes it once, not a collision.
+	click("rail-changes");
+	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
+	click("change-chk:e.txt");
+	wait_for("[APP:BASKET: n=", Duration::from_secs(3));
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	click("tree-row:e.txt");
+	wait_for("[APP:TREE_FILE_SELECTED: e.txt]", Duration::from_secs(3));
+	click("btn-copy");
+	// A refusal logs COPY_REFUSED instead of COPY_PREP.
+	let first = wait_for("[APP:COPY_", Duration::from_secs(6));
+	assert!(first.contains("COPY_PREP"), "{first}");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
+	let mixed = clip::read_text().unwrap();
+	assert_eq!(mixed.matches("E_DIRTY").count(), 1, "{mixed}");
+	assert!(!mixed.contains("C_BYTES"), "{mixed}");
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Waits until `id` is gone from the probed bounds.
+fn absent_id(bounds: &Bounds, id: &str) {
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while bounds.lock().unwrap().contains_key(id) {
+		assert!(Instant::now() < deadline, "{id} must not be drawn");
+		std::thread::sleep(Duration::from_millis(40));
+	}
 }

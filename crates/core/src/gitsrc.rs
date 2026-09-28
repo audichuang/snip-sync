@@ -817,6 +817,8 @@ struct Change {
 	new_oid: String,
 	/// Pre-deletion OIDs, in parent order; tried until one decodes.
 	deleted_from: Vec<String>,
+	/// The new side is a submodule commit (mode 160000), not a file.
+	gitlink: bool,
 }
 
 /// Appends `entries` to `changes`, first entry per path wins (TS keys on
@@ -849,6 +851,7 @@ fn union_into(
 			path,
 			new_oid: e.new_oid,
 			deleted_from,
+			gitlink: e.new_mode == "160000",
 		});
 	}
 }
@@ -995,13 +998,31 @@ pub fn list_changed_paths_with(
 	source: &GitSource,
 	opts: &RunOptions,
 ) -> Result<Vec<(String, Option<ChangeType>)>, GitError> {
-	let paths = collect_changes(git, source, opts)?
-		.0
+	Ok(list_changed_paths_and_gitlinks_with(git, source, opts)?.0)
+}
+
+/// Changed paths and their change types, as the desktop browser lists them.
+pub type ChangedPaths = Vec<(String, Option<ChangeType>)>;
+
+/// [`list_changed_paths_with`], plus the listed paths whose new side is a
+/// submodule commit (gitlink): they have no content to read or copy.
+pub fn list_changed_paths_and_gitlinks_with(
+	git: &Git,
+	source: &GitSource,
+	opts: &RunOptions,
+) -> Result<(ChangedPaths, Vec<String>), GitError> {
+	let changes = collect_changes(git, source, opts)?.0;
+	let gitlinks = changes
+		.iter()
+		.filter(|c| c.gitlink)
+		.map(|c| c.path.clone())
+		.collect();
+	let paths = changes
 		.into_iter()
 		.map(|c| (c.path, Some(change_type_for_status(c.status))))
 		.collect();
 	already_cancelled(opts, "list changed paths")?;
-	Ok(paths)
+	Ok((paths, gitlinks))
 }
 
 /// Ordered change metadata without reading file contents, plus the number of
@@ -1240,6 +1261,7 @@ pub fn read_changed_file_for(
 		path: path.to_string(),
 		new_oid,
 		deleted_from,
+		gitlink: false,
 	};
 	let max = max.min(opts.max_stdout as u64);
 	read_changes(git, source, vec![change], Some(max), opts)?
@@ -1794,6 +1816,38 @@ mod tests {
 	}
 
 	use ChangeType::{Deleted, Modified, Moved, New};
+
+	#[test]
+	fn listing_marks_submodule_commits_as_gitlinks() {
+		let r = Repo::new();
+		r.write("a.txt", b"a\n");
+		let base = r.commit("base");
+		// A submodule bump is a gitlink entry, never a readable file.
+		r.git(&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{base},sub"),
+		]);
+		r.write("a.txt", b"b\n");
+		r.git(&["add", "a.txt"]);
+		r.git(&["commit", "-q", "-m", "bump"]);
+		let g = Git::open(&r.path()).unwrap();
+		let source = GitSource::Commit("HEAD".into());
+		let opts = RunOptions::default();
+		let (paths, gitlinks) =
+			list_changed_paths_and_gitlinks_with(&g, &source, &opts).unwrap();
+		assert_eq!(
+			paths,
+			[
+				("a.txt".to_string(), Some(Modified)),
+				("sub".to_string(), Some(New))
+			]
+		);
+		assert_eq!(gitlinks, ["sub"]);
+		// The plain listing is unchanged.
+		assert_eq!(list_changed_paths_with(&g, &source, &opts).unwrap(), paths);
+	}
 
 	#[test]
 	fn root_commit_is_diffed_against_the_empty_tree() {
