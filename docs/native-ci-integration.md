@@ -1,5 +1,7 @@
 # 原生 CI／harness 整合收據
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 ## Current Linux acceptance entrypoints (2026-09-27)
 
 `just preflight` now also requires `just native-acceptance`. The required Linux

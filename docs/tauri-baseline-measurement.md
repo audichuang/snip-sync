@@ -1,5 +1,7 @@
 # Tauri 記憶體基線量測：pilot（Linux，2026-09-25）
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 這是一次 **pilot 量測檢查點**：不是 P0 驗收，也不是與原生版的效能比較。舊報告 `/tmp/snip-tauri-baseline-20260925` 已被拒絕，其中的數字一律不引用。
 
 pilot 的環境條件：量測期間這台機器上還有其他 agent 同時在跑（CPU 有競爭）；Xvfb 使用軟體繪圖；D-Bus 是隔離的私有 bus，上面沒有 portal、keyring、a11y，也沒有 tray host。

@@ -1,5 +1,7 @@
 # Linux 記憶體量測協議與基準作業規範 (Memory Measurement Protocol)
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 日期：2026-09-26
 版本：`2026-09-26.2`（取樣身分失敗即關閉；launch 僅在驗證過的執行前閘道加上觀察到的 exe 轉換；不自動產出發布比對）
 依據：[`docs/native-git-workbench-plan.md`](native-git-workbench-plan.md) 第 9 節（記憶體預算與可量測指標）及第 10 節（更嚴格的 CI／E2E）。
@@ -93,7 +95,7 @@ Rust 具備編譯期記憶體安全，但無法阻止無界集合、快取未淘
 | **GPUI 15 Repos Overview** | `--workspace <15_repo_dir> --mode overview` | `[READY:OVERVIEW]` | 穩態 ≤ 256 MiB（較 1 repo 增量 ≤ 96 MiB） |
 | **GPUI 15 Repos Preview** | `--workspace <15_repo_dir> --mode preview` | `[READY:PREVIEW]` | 穩態 ≤ 384 MiB（瞬間峰值 ≤ 512 MiB） |
 | **100-Switch Soak** | *需原生 UI 驅動程式* | *UI Driver* | 標記為 `PENDING`，不虛構切換資料 |
-| **Tauri Baseline** | `scripts/measure_tauri.sh`（WebDriver 驅動真 app，attach 模式取樣） | 隨機 nonce 就緒檔 | idle／1 repo 已量測；15 repo `UNSUPPORTED`（Tauri 只有單一 repo）。見 [`tauri-baseline-measurement.md`](tauri-baseline-measurement.md)，不宣稱節省比例 |
+| **Tauri Baseline**（driver 已移除，僅存歷史紀錄） | `scripts/measure_tauri.sh`（WebDriver 驅動真 app，attach 模式取樣） | 隨機 nonce 就緒檔 | idle／1 repo 已量測；15 repo `UNSUPPORTED`（Tauri 只有單一 repo）。見 [`tauri-baseline-measurement.md`](tauri-baseline-measurement.md)，不宣稱節省比例 |
 
 ---
 

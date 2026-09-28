@@ -800,11 +800,10 @@ def helper_hashes(native: Any, receipt: Path | None) -> dict[str, Any]:
         "bench_native_memory.py": Path(native.__file__).resolve(),
     }
     scripts = files["bench_native_memory.py"].parent
-    for name in ("bench_tauri_memory.py", "memory_harness.py"):
-        path = scripts / name
-        if not path.is_file():
-            raise DriverError(f"helper sibling missing: {name}")
-        files[name] = path
+    path = scripts / "memory_harness.py"
+    if not path.is_file():
+        raise DriverError("helper sibling missing: memory_harness.py")
+    files["memory_harness.py"] = path
     hashed = {name: sha256_file(path) for name, path in files.items()}
     checked = None
     if receipt is not None:

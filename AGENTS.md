@@ -16,10 +16,9 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 ## Before you call a change done
 
-- Run `just preflight` before every push. It runs everything CI runs that Linux can run: Rust fmt/clippy/doc/test, frontend format/typecheck/oxlint/test/build, the Tauri E2E (`just desktop-e2e`), and the native smoke/lifecycle/acceptance gates (IME, 18 collaboration cases, resource runs). A Linux failure found by CI instead of locally is a process bug. CI adds audit, DTO drift, clean checkout and Windows/macOS; see `.github/workflows/ci.yml`.
+- Run `just preflight` before every push. It runs everything CI runs that Linux can run: actionlint, Rust fmt/clippy/doc/test, the Python harness tests, and the native smoke/lifecycle/acceptance gates (IME, 18 collaboration cases, resource runs). A Linux failure found by CI instead of locally is a process bug. CI adds audit, clean checkout, packaging and Windows/macOS; see `.github/workflows/ci.yml`.
 - `native-acceptance` needs a Python with Pillow in `SNIP_NATIVE_PYTHON`, and it fails if the checkout changes after its build. Commit first, then leave the tree alone until it finishes.
-- A new control that a test drives gets an id: a `data-testid` in Tauri, or a `probe(...)` id in native, which the drivers read from `[APP:CTRL_BOUNDS]`.
-- After changing any `#[derive(TS)]` type, run `bun run generate:dto && bun run format` in `crates/desktop` and commit `src/generated/`.
+- A new control that a test drives gets a `probe(...)` id, which the drivers read from `[APP:CTRL_BOUNDS]`.
 
 ## Cross-platform
 

@@ -9,7 +9,6 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
 use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
@@ -21,7 +20,7 @@ use crate::paths::{
 /// One file from the payload; `parse_clipboard` produces these.
 pub type RestoreEntry = ParsedEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateOperation {
 	pub relative_path: String,
@@ -32,14 +31,14 @@ pub struct CreateOperation {
 	pub root_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteOperation {
 	pub relative_path: String,
 	pub absolute_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SkipReason {
 	AlreadyAbsent,
@@ -64,7 +63,7 @@ impl SkipReason {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedOperation {
 	pub raw_path: String,
@@ -72,7 +71,7 @@ pub struct SkippedOperation {
 	pub reason: SkipReason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestorePlan {
 	/// Every root the plan was validated against; re-checked before writes.
@@ -120,7 +119,7 @@ impl RestorePlan {
 /// What the user confirmed. Unchecked operations are indices into the
 /// plan's `create_operations` / `delete_operations`; they are not run and
 /// not counted.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, TS)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RestoreSelection {
 	pub overwrite_existing: bool,
@@ -129,7 +128,7 @@ pub struct RestoreSelection {
 	pub unchecked_deletes: BTreeSet<usize>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreExecutionResult {
 	pub created_count: usize,
@@ -335,7 +334,7 @@ pub fn has_path_dependencies<P: AsRef<Path>>(paths: &[P]) -> bool {
 // ---- restoreBase: "off by one folder level" detection ----
 
 /// A one-level offset applied to every relative path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum RestoreBase {
 	/// Drop a redundant leading `segment/`.
@@ -344,7 +343,7 @@ pub enum RestoreBase {
 	Add { prefix: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreBaseSuggestion {
 	pub base: RestoreBase,

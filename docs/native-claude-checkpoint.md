@@ -1,5 +1,7 @@
 # Native workbench — Claude checkpoint D0+D1
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 日期：2026-09-25（Asia/Taipei）。實作者：Claude。狀態：**D1 修正已提交審查，監督者 findings 待複審（changes submitted, supervisor findings pending）。D1 尚未被接受；D2–D5 尚未開始，整體專案未完成。** 未 commit／push／PR。
 
 ## 第二輪：監督者 findings 1–6 的修正（最新，優先閱讀）

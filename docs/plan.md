@@ -21,6 +21,8 @@
 
 ## 2. 架構
 
+> Tauri 版(`crates/desktop`)已從 repo 移除,需要回退時從 git 歷史取回;本節描述的是 v0.2.x Tauri 版的原始架構,現行桌面 App 見第 4 節。
+
 技術棧與 [aghub](https://github.com/audichuang/aghub) 相同:**Rust + Tauri 2**,
 前端 **React 19 + TypeScript + HeroUI v3 + Tailwind CSS v4**(Vite、bun)。
 
@@ -112,6 +114,8 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
 
 ## 3. 功能
 
+> Tauri 版(`crates/desktop`)已從 repo 移除,需要回退時從 git 歷史取回;下表的系統匣、plugin、前端元件列是 v0.2.x Tauri 版的紀錄。
+
 完整規格見 [spec.md](spec.md)。這裡只記實作上的對應:
 
 | 功能 | 實作 |
@@ -130,7 +134,7 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
 
 v0.3.0 起發布的桌面 App 是 GPUI 原生版(`crates/desktop-native`),細節見
 [native-cross-platform-ci-and-packaging.md](native-cross-platform-ci-and-packaging.md) 第 2 節。
-Tauri 版(本文件第 3 節的技術棧)仍在 CI 建置與測試以便回退,但不再發布。
+Tauri 版(本文件第 2、3 節的技術棧)已從 repo 移除,不再建置、測試或發布;回退請取 git 歷史。
 
 | | Windows | macOS | Linux |
 |---|---|---|---|
@@ -145,11 +149,11 @@ Tauri 版(本文件第 3 節的技術棧)仍在 CI 建置與測試以便回退,�
   全部成功後 `publish-release` 以 draft 建立 Release、附上 12 個資產、確認後一次公開。
   任何檢查失敗都不會留下公開的 Release。正式版(tag 不含 `-`)再由 `publish-homebrew` 更新
   `audichuang/homebrew-tap` 的 `Formula/snip-cli.rb` 與 `Casks/snip-sync.rb`(需要 repo secret `HOMEBREW_TAP_TOKEN`)。
-  `just bump` 仍同步 `Cargo.toml`、`package.json`、`tauri.conf.json` 的版本號,讓 Tauri 版保持可建置。
+  `just bump` 同步 `Cargo.toml` 與 `Cargo.lock` 的版本號。
 - **桌面版不重新建置:** release 發布的就是 CI 驗收過的位元組(交付規格 §10),所以 release 不改版號、不重編。
 - **macOS 簽章:** ad-hoc(`codesign --sign -`),在 CI 以 `codesign --verify --deep --strict` 驗證。不做 Apple Developer 憑證與公證。
 - **不做:** 自動更新。
-- 本機打包:`just package-native <target> <out> <bin> <version>`;Tauri 版仍可用 `just desktop-bundle`。
+- 本機打包:`just package-native <target> <out> <bin> <version>`。
 
 ## 5. 測試策略
 
@@ -159,18 +163,17 @@ Tauri 版(本文件第 3 節的技術棧)仍在 CI 建置與測試以便回退,�
 | 2 CLI E2E | 檔案模式:建 fixture repo(一般 commit、刪除、rename、octopus merge)→ `snip copy` → `snip paste` 到空目錄 → 比對檔案樹。commit 模式:連續 3 個 commit(含 rename、刪除、merge、二進位檔)→ 貼到另一個 clone 的不同分支 → 比對 message、作者、作者時間與檔案內容;不連續選取要被拒絕 | ✅ 三平台 |
 | 3 跨工具 | 同一 repo 與設定下,Rust 產生的 payload 等於 TS 產生的;Rust 能還原 TS 與 Kotlin 產生的 payload,反之亦然 | ✅ |
 | 4 真實剪貼簿 | 寫入系統剪貼簿再讀回:Unicode、大 payload、換行 | ✅ Windows / macOS runner 有桌面;Linux 用 xvfb |
-| 5 前端 | 比照 aghub:`node --test` 跑 `src/**/*.test.ts`(純邏輯與 source-scan 守衛);`typecheck`、oxlint、prettier | ✅ |
-| 6 操作真實 App | `crates/desktop/e2e/scenarios.mjs`:`tauri-driver`(WebDriver)操作真的 App,22 個情境(commit 模式、檔案模式、Git 瀏覽器、monorepo 檔案樹與預覽、分支圖和歷史分頁;IDE 情境放在 `workspace-scenarios.mjs`)各建新的 git repo,完成後以 git 驗證。Windows 走 msedgedriver(`windows-2022`)、Linux 走 WebKitWebDriver | ✅ Windows / Linux |
-| | macOS 的 WKWebView 沒有 WebDriver | ❌ 手動 |
-| | 系統匣選單本身 | ❌ 各平台都難以自動化 |
+| 5 Python harness | `scripts/tests/`:記憶體 harness、workload 產生器、驗收 driver 的契約測試 | ✅ Linux |
+| 6 操作真實 App | 原生版在 Linux X11(Xvfb + xdotool)跑 `crates/desktop-native/tests/smoke.rs`、`lifecycle.rs`,以及 `native-acceptance`(IME、18 個協作情境、資源 gate)。舊的 Tauri WebDriver 情境已隨 Tauri 版移除 | ✅ Linux |
+| | macOS / Windows 的原生 GUI 輸入 | ❌ 手動(CI 只 smoke 打包後的 binary) |
 
 - **CI 採最嚴格設定(`.github/workflows/ci.yml`):** 每個 PR 與 push 都跑全部 job,沒有路徑過濾;
   Rust 與 rustdoc 的警告視為錯誤,`--locked`;三平台 clippy 與 `cargo test`;`cargo audit` 有漏洞即失敗;
-  DTO 必須與 Rust 型別同步;前端 typecheck / oxlint 零警告 / prettier / 測試 / build;
-  Linux 與 Windows 跑真實 App 情境;每個 job 結束時 checkout 必須乾淨。
+  Python harness 測試;Linux 跑原生真實 App 的 smoke / lifecycle / acceptance;
+  macOS / Windows 打包並 smoke 原生 binary;每個 job 結束時 checkout 必須乾淨。
   `CI gate` 彙整全部 job,任何一個不是 success(含 skipped)就失敗。
-- **E2E 驗收:** 歷史必須自動載入;以原生 Shift+click 選取並比對完整 commit 集合。貼上等待自己的預覽／錯誤,不把背景 toast 當結果。檢查精確路徑、勾選集合、來源切換、重新整理與 commit 快照;每個情境必須有斷言,未捕捉的前端錯誤會使測試失敗。CI 與 preflight 禁止以 `SNIP_E2E_ONLY` 略過情境。
-- **本機:** `just preflight` 跑一遍 CI 在 Linux 上會跑的全部東西(含前端與真實 App E2E),push 或打 tag 前必跑。
+- **E2E 驗收(Tauri 版情境的原則,已隨 Tauri 版移除,原生 driver 沿用同樣要求):** 歷史必須自動載入;以原生 Shift+click 選取並比對完整 commit 集合。貼上等待自己的預覽／錯誤,不把背景 toast 當結果。檢查精確路徑、勾選集合、來源切換、重新整理與 commit 快照;每個情境必須有斷言,未捕捉的前端錯誤會使測試失敗。CI 與 preflight 禁止以 `SNIP_E2E_ONLY` 略過情境。
+- **本機:** `just preflight` 跑一遍 CI 在 Linux 上會跑的全部東西(actionlint、Rust、Python harness、原生真實 App gate),push 或打 tag 前必跑。
   它只能跑本機平台,碰到路徑 / 檔案系統的程式碼要在 Linux 上**模擬**其他平台的情況
   (例如透過 symlink 的暫存目錄模擬 macOS 的 `/var` → `/private/var`)。
 
@@ -206,6 +209,7 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
 **驗收:** 第 2–4 層測試通過;在兩台實機之間實際雙向同步一段真實 repo 的 commit(檔案模式與 commit 模式各一次)。
 
 ### Phase 4 — Tauri App
+(歷史紀錄:Tauri 版已由 v0.3.0 的原生版取代,並已從 repo 移除。)
 系統匣、主視窗(時間軸選 commit、選檔案來源)、預覽(逐檔勾選、覆寫 diff、原因說明、commit 清單)、確認後執行。
 
 **驗收:** 第 5、6 層測試通過;macOS 手動檢查清單通過。

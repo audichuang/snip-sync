@@ -1,5 +1,7 @@
 # 原生 Git／檔案工作台：後續交付規格
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 日期：2026-09-25。狀態：**已授權實作，尚未完成驗收**。
 
 ## 0. 執行責任與規格優先序

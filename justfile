@@ -14,8 +14,12 @@ lint:
 fmt:
 	cargo fmt --all
 
-# Mirrors CI's Rust checks (see .github/workflows/ci.yml for the rest).
-preflight: preflight-rust preflight-frontend desktop-e2e preflight-harness native-smoke native-lifecycle native-acceptance
+# Everything CI runs that Linux can run (see .github/workflows/ci.yml for the rest).
+preflight: preflight-workflows preflight-rust preflight-harness native-smoke native-lifecycle native-acceptance
+
+# Same as CI's Lint Workflows job; needs actionlint and shellcheck on PATH.
+preflight-workflows:
+	actionlint
 
 preflight-rust:
 	cargo fmt --all --check
@@ -28,25 +32,9 @@ preflight-rust:
 preflight-harness:
 	SNIP_REQUIRE_ALL_TESTS=1 "{{ native_python }}" -B -m unittest discover -s scripts/tests
 
-# Same frontend checks as CI's Frontend Lint and Format Check jobs.
-preflight-frontend:
-	cd crates/desktop && bun install --frozen-lockfile && bun run format:check && bun run typecheck && bun run lint:check -- --max-warnings 0 && bun run test && bun run build
-
-# Run the desktop app in dev mode.
-desktop:
-	cd crates/desktop && bun install --frozen-lockfile && bun run start
-
 # Run the native GPUI desktop prototype.
 native *args:
 	cargo run -p snip-desktop-native -- {{args}}
-
-# Build the desktop installers for this platform.
-desktop-bundle:
-	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build
-
-# Real-app E2E (Linux): needs webkit2gtk-driver, `cargo install tauri-driver`, xvfb.
-desktop-e2e:
-	cd crates/desktop && bun install --frozen-lockfile && bun run tauri build --debug --no-bundle && SNIP_REQUIRE_ALL_TESTS=1 xvfb-run -a node e2e/scenarios.mjs
 
 # Native real-app smoke test (Linux X11): needs xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts, software graphics.
 native-smoke out="target/native-e2e-artifacts":
@@ -102,10 +90,9 @@ verify-artifacts dir version="" target="":
 native-cli-smoke bin version:
 	python3 scripts/smoke_native.py --bin "{{bin}}" --expected-version "{{version}}"
 
-# Bump the version in every manifest (perl -pi is portable across GNU/BSD).
+# Bump the workspace version (perl -pi is portable across GNU/BSD).
 bump version:
 	perl -pi -e 's/^version = .*/version = "{{version}}"/' Cargo.toml
-	perl -pi -e 's/"version": "[^"]*"/"version": "{{version}}"/' crates/desktop/package.json crates/desktop/src-tauri/tauri.conf.json
 	# Keep Cargo.lock in step, or every --locked build fails.
 	cargo update -w
 

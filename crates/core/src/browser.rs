@@ -4,14 +4,13 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
-use ts_rs::TS;
 
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitrun::{Overflow, RunOptions};
 use crate::gitsrc::{self, Git, GitError, GitSource, EMPTY_TREE};
 use crate::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
 
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitSummary {
 	pub sha: String,
@@ -22,14 +21,14 @@ pub struct CommitSummary {
 	pub subject: String,
 }
 
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitReference {
 	pub name: String,
 	pub sha: String,
 }
 
-#[derive(Debug, Serialize, TS)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepositoryHistory {
 	pub root: String,
@@ -499,7 +498,7 @@ pub fn history_query_with(
 	run_log(git, &args, None, limit, opts)
 }
 
-#[derive(Debug, Serialize, TS)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryEntry {
 	pub path: String,
@@ -582,7 +581,7 @@ pub const MAX_TREE_ENTRIES: usize = 2000;
 /// Hard upper bound on stdout captured during commit directory listing (8 MiB).
 pub const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TreeKind {
 	Blob,
@@ -590,7 +589,7 @@ pub enum TreeKind {
 	Submodule,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeEntry {
 	/// Repo-relative path.
@@ -789,7 +788,7 @@ pub fn commit_blob_with(
 	})
 }
 
-#[derive(Debug, Serialize, TS)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourcePreview {
 	pub content: Option<String>,

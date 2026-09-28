@@ -94,6 +94,6 @@ just native-lifecycle
 # 預覽 dry-run
 just --dry-run native-smoke
 
-# 執行完整本機預檢（含 preflight-rust、preflight-frontend、desktop-e2e、preflight-harness、native-smoke、native-lifecycle）
+# 執行完整本機預檢（preflight-workflows、preflight-rust、preflight-harness、native-smoke、native-lifecycle、native-acceptance）
 just preflight
 ```

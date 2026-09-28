@@ -1,5 +1,7 @@
 # Native Workbench Performance Harness (bench_native_memory.py)
 
+> Note: the Tauri app (`crates/desktop`) and its drivers (`bench_tauri_memory.py`, `measure_tauri.sh`, the Tauri E2E) have been removed from the repo. Passages below that build, test or measure them are historical; use git history to roll back.
+
 **Status**: Verified Test Driver Specification  
 **Date**: 2026-09-27 (optional matched diff profile passed native/Tauri functional pilots; no D4 claim)
 **Protocol Reference**: [`docs/memory-measurement-protocol.md`](memory-measurement-protocol.md)  
@@ -13,7 +15,7 @@
 1. `scripts/memory_harness.py` for exact process-tree memory sampling (RSS, PSS via `/proc/<pid>/smaps_rollup`, VmHWM).
 2. Pre-exec launcher (`--sampler-ready-file`): inside `dbus-run-session` the launcher records `(pid, starttime)` and waits. The sampler publishes the gate only after handlers are installed and `/proc/<pid>/exe` is readable. The launcher then `os.execv`s the target. Launch samples exist only after that exe transition is observed. This is discrete ~50 ms sampling, not the first dynamic-linker instruction.
 3. Strict process boundary: External wrappers (`Xvfb`, `dbus-run-session`, `dbus-daemon`) are excluded from application process-tree RAM accounting. Samples taken while the launcher image is still running are `launcher-setup` and are excluded from target peaks.
-4. `scripts/bench_tauri_memory.py` for shared process identity, session isolation, reap/teardown mechanics, and metric summaries. That driver still attaches late and says so.
+4. The shared-helpers section of `scripts/bench_native_memory.py` for process identity, session isolation, reap/teardown mechanics, and metric summaries (moved there from the removed `bench_tauri_memory.py`).
 5. Private headless display management via Xvfb (`-displayfd`), Mesa lavapipe software Vulkan rasterization (`VK_DRIVER_FILES`), and isolated D-Bus sessions (`dbus-run-session`).
 6. Real OS-level user input injection via XTEST (`xdotool key`, `xdotool mousemove`, `xdotool click`) without mock handlers.
 7. Independent Git and filesystem oracles against standard benchmark workloads.

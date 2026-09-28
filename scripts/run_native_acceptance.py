@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 
-from bench_tauri_memory import sha256_file
+from bench_native_memory import sha256_file
 from check_native_ime import REQUIRED_TOOLS as IME_TOOLS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -183,8 +183,7 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
         manifest = json.loads((fixture / "manifest.json").read_text())
         helpers = output / "helper-receipt.json"
         write_json(helpers, {"files": {name: {"sha256": sha256_file(str(ROOT / "scripts" / name))}
-                                     for name in ("bench_native_memory.py", "bench_tauri_memory.py",
-                                                  "memory_harness.py")}})
+                                     for name in ("bench_native_memory.py", "memory_harness.py")}})
         run(python + ["scripts/check_native_collaboration.py", "--binary", binary,
                       "--binary-sha", sha, "--fixture", str(fixture),
                       "--dataset-hash", manifest["datasetHash"], "--helper-receipt", str(helpers),

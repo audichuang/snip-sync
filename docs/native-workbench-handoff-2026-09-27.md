@@ -1,5 +1,7 @@
 # Native workbench 接手待辦清單 — 2026-09-27
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 > **已被 v0.3.0 取代。** 本清單為 0.2 前的歷史接手紀錄；0.3.0 的完成範圍與剩餘事項見[監督紀錄最上方](native-workbench-supervision.md)。
 
 目前由 Codex 主 agent 指揮與獨立驗證；AGY 額度耗盡後，使用者已授權改派 Codex 子 agent 實作。最新進度見第 0 節與監督紀錄；下方保留原接手基準以供追溯，「待驗收」不表示該功能完全沒有實作。

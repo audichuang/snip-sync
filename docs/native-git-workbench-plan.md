@@ -1,5 +1,7 @@
 # 輕量 Git／檔案檢視工作台：完整規劃
 
+> 註:Tauri 版(`crates/desktop`)與其 driver(`bench_tauri_memory.py`、`measure_tauri.sh`、Tauri E2E)已從 repo 移除;本文提到它們建置、測試或量測的段落是當時的紀錄,回退請取 git 歷史。
+
 日期：2026-09-25。狀態：**已授權分階段實作；目前有未驗收原型，尚未完成效能驗證或正式切換**。
 
 最新交付順序與驗收依 [native-workbench-delivery-spec.md](native-workbench-delivery-spec.md)，監督結果依 [native-workbench-supervision.md](native-workbench-supervision.md)。

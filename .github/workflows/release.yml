@@ -101,8 +101,6 @@ jobs:
     # SHA256SUMS written in the job that tested it, binds the Linux binary to
     # the acceptance build receipt, and hands the files on unchanged to
     # publish-release.
-    # The Tauri app (crates/desktop) is still built and tested by ci.yml for
-    # rollback, but no longer released.
     verify-native:
         name: Verify Desktop (accepted CI artifacts)
         needs: verify-ci
