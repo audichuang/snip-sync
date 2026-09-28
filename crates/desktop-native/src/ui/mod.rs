@@ -1350,8 +1350,54 @@ impl Render for WorkbenchModel {
 					),
 			)
 			.child(self.render_status(cx))
+			.children(self.render_toast())
 			.children(self.render_context_menu(cx))
 			.children(probe_frame_end(&self.probes))
+	}
+}
+
+impl WorkbenchModel {
+	/// The copy result card: bottom center, above the status bar.
+	fn render_toast(&self) -> Option<AnyElement> {
+		let (_, ok, msg) = self.toast.as_ref()?;
+		let (glyph, accent) = if *ok {
+			(Icon::Apply, pal().diff_add_bg)
+		} else {
+			(Icon::Error, pal().diff_removed_bg)
+		};
+		Some(
+			div()
+				.absolute()
+				.bottom(px(STATUS_H + 16.))
+				.left_0()
+				.right_0()
+				.flex()
+				.justify_center()
+				.child(
+					div()
+						.id("copy-toast")
+						.occlude()
+						.flex()
+						.flex_row()
+						.items_center()
+						.gap(px(10.))
+						.max_w(px(640.))
+						.px(px(16.))
+						.py(px(10.))
+						.bg(rgb(pal().popup_bg))
+						.border_1()
+						.border_color(rgb(accent))
+						.border_l_4()
+						.rounded(px(8.))
+						.shadow_lg()
+						.text_size(px(UI_TEXT))
+						.text_color(rgb(pal().text))
+						.child(icon(glyph, 18.))
+						.child(msg.render(self.locale))
+						.children(probe(&self.probes, "copy-toast")),
+				)
+				.into_any_element(),
+		)
 	}
 }
 

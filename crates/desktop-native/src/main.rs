@@ -1008,6 +1008,10 @@ pub struct WorkbenchModel {
 	pub paste_detail: Option<Preview>,
 	pub paste_scroll: gpui::UniformListScrollHandle,
 	pub status: Msg,
+	/// A finished copy's card over the window (id, succeeded, text): the
+	/// status bar alone is easy to miss.
+	pub toast: Option<(u64, bool, Msg)>,
+	toast_seq: u64,
 	pub is_loading: bool,
 	pub is_copying: bool,
 	pub locale: Locale,
@@ -1381,6 +1385,8 @@ impl WorkbenchModel {
 			paste_detail: None,
 			paste_scroll: gpui::UniformListScrollHandle::new(),
 			status: Msg::new("status_scanning", []),
+			toast: None,
+			toast_seq: 0,
 			is_loading: true,
 			is_copying: false,
 			locale: loc,
@@ -1666,6 +1672,27 @@ impl WorkbenchModel {
 		args: impl crate::i18n::IntoMsgArgs,
 	) {
 		self.status = Msg::new(key, args);
+	}
+
+	/// Shows `msg` in a card over the window for a few seconds (a later
+	/// toast replaces it and restarts the clock).
+	pub fn show_toast(&mut self, ok: bool, msg: Msg, cx: &mut Context<Self>) {
+		self.toast_seq = self.toast_seq.wrapping_add(1);
+		let id = self.toast_seq;
+		app_log!("[APP:TOAST: ok={ok}]");
+		self.toast = Some((id, ok, msg));
+		cx.spawn(async move |this, cx| {
+			cx.background_executor()
+				.timer(std::time::Duration::from_secs(4))
+				.await;
+			let _ = this.update(cx, |model, cx| {
+				if model.toast.as_ref().is_some_and(|t| t.0 == id) {
+					model.toast = None;
+					cx.notify();
+				}
+			});
+		})
+		.detach();
 	}
 
 	/// The open repo. An index that no longer names the pinned identity (the
@@ -4361,6 +4388,8 @@ impl WorkbenchModel {
 							model.status = err;
 						}
 					}
+					let ok = model.status.key == "status_copied";
+					model.show_toast(ok, model.status.clone(), cx);
 					app_log!("[APP:COPY_IDLE]");
 					cx.notify();
 				}) {
@@ -4468,6 +4497,8 @@ impl WorkbenchModel {
 							model.set_status("error_payload", [err]);
 						}
 					}
+					let ok = model.status.key == "status_commits_copied";
+					model.show_toast(ok, model.status.clone(), cx);
 					cx.notify();
 				});
 			},

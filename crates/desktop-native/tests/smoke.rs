@@ -4453,6 +4453,9 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	wait("[APP:MENU_ACTION: copy-files]");
 	wait("[APP:COPY_DONE: copied=1]");
 	absent("context-menu");
+	// A card over the window says so, not only the status bar.
+	wait("[APP:TOAST: ok=true]");
+	control("copy-toast");
 	let copied = clip_get();
 	assert!(
 		copied.contains("alpha.txt") && copied.contains("alpha two\n"),
