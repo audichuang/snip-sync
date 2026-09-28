@@ -1441,6 +1441,16 @@ mod tests {
 		assert_eq!(path_picker_matches(&tree, "query", "", 2).len(), 2);
 		let merged = path_picker_matches(&tree, "readme", "repo/", 50);
 		assert_eq!(shape(merged), ["repo/README.md"]);
+		// The merged log's needle can name the repository, as its picks do.
+		let merged = path_picker_matches(&tree, "repo/src/q", "repo/", 50);
+		assert_eq!(
+			shape(merged),
+			["repo/src/", " repo/src/Query/", "  repo/src/Query/run.rs"]
+		);
+		// The filter decides what shows: its folders cannot be collapsed.
+		assert!(path_picker_matches(&tree, "query", "", 50)
+			.iter()
+			.all(|p| !p.expandable));
 	}
 
 	#[test]

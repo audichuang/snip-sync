@@ -920,6 +920,10 @@ pub struct WorkbenchModel {
 	/// Per file of a multi-selection: index in `log_selected` of the newest
 	/// selected commit that touched it.
 	pub commit_file_origin: Vec<u32>,
+	/// Listed files that are submodule commits (no content to copy).
+	pub commit_file_gitlinks: Vec<String>,
+	/// The listing was cut to `MAX_COMMIT_FILES`.
+	pub commit_files_truncated: bool,
 	pub selected_commit_file: Option<String>,
 	pub compare: Option<(String, String)>,
 
@@ -1303,6 +1307,8 @@ impl WorkbenchModel {
 			git_user_email: None,
 			commit_files: Vec::new(),
 			commit_file_origin: Vec::new(),
+			commit_file_gitlinks: Vec::new(),
+			commit_files_truncated: false,
 			selected_commit_file: None,
 			compare: None,
 			files: Vec::new(),
@@ -2359,6 +2365,7 @@ impl WorkbenchModel {
 		self.select_head_after_load = false;
 		release_vec(&mut self.commit_files);
 		release_vec(&mut self.commit_file_origin);
+		release_vec(&mut self.commit_file_gitlinks);
 		self.commit_rows_cache.take();
 		self.log_first_page = 0;
 		self.history_extending = false;

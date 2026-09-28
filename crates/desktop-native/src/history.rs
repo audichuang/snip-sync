@@ -2308,7 +2308,7 @@ impl WorkbenchModel {
 						// Lazy: each listing is folded in and dropped
 						// before the next one is read.
 						union_changed_files(shas.into_iter().map(|sha| {
-							gitsrc::list_changed_paths_with(
+							gitsrc::list_changed_paths_and_gitlinks_with(
 								&git,
 								&GitSource::Commit(sha),
 								&listing,
@@ -2322,7 +2322,7 @@ impl WorkbenchModel {
 						return;
 					}
 					match res {
-						Ok((files, origin, total)) => {
+						Ok((files, origin, total, gitlinks)) => {
 							app_log!("[APP:E2E_CHANGES: files={}]", total);
 							if total > MAX_COMMIT_FILES {
 								model.set_status(
@@ -2336,6 +2336,9 @@ impl WorkbenchModel {
 							let first = files.first().map(|(p, _)| p.clone());
 							model.commit_files = files;
 							model.commit_file_origin = origin;
+							model.commit_file_gitlinks = gitlinks;
+							model.commit_files_truncated =
+								total > MAX_COMMIT_FILES;
 							match first {
 								Some(path) => {
 									model.select_commit_file(&path, cx)
@@ -2465,10 +2468,11 @@ impl WorkbenchModel {
 						};
 						// The repository's root is known: no probe processes.
 						let git = Git::at_known_root(root);
-						let files = gitsrc::list_changed_paths_with(
-							&git, &source, &listing,
-						)
-						.map_err(|e| e.to_string())?;
+						let (files, gitlinks) =
+							gitsrc::list_changed_paths_and_gitlinks_with(
+								&git, &source, &listing,
+							)
+							.map_err(|e| e.to_string())?;
 						let first = files.first().map(|(p, change)| {
 							(
 								p.clone(),
@@ -2482,7 +2486,7 @@ impl WorkbenchModel {
 								),
 							)
 						});
-						Ok::<_, String>((files, first))
+						Ok::<_, String>((files, gitlinks, first))
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2490,7 +2494,7 @@ impl WorkbenchModel {
 						return;
 					}
 					match res {
-						Ok((mut files, first)) => {
+						Ok((mut files, gitlinks, first)) => {
 							let total = files.len();
 							files.truncate(MAX_COMMIT_FILES);
 							files.shrink_to_fit();
@@ -2506,6 +2510,9 @@ impl WorkbenchModel {
 							}
 							model.commit_files = files;
 							model.commit_file_origin.clear();
+							model.commit_file_gitlinks = gitlinks;
+							model.commit_files_truncated =
+								total > MAX_COMMIT_FILES;
 							match first {
 								Some((path, p)) => {
 									model.selected_commit_file =
@@ -3021,25 +3028,32 @@ pub type ChangedFiles = Vec<(String, Option<snip_core::format::ChangeType>)>;
 /// Changed files of several commits (newest first) as one list, like
 /// IntelliJ's multi-commit selection: each path once, with the change of
 /// the newest commit touching it and that commit's index. At most
-/// `MAX_COMMIT_FILES` are kept; the count of distinct paths comes last.
+/// `MAX_COMMIT_FILES` are kept; the count of distinct paths comes next,
+/// then the kept paths that are a submodule commit in that newest commit.
+/// Each list comes with its gitlinks.
 pub fn union_changed_files<E>(
-	lists: impl IntoIterator<Item = Result<ChangedFiles, E>>,
-) -> Result<(ChangedFiles, Vec<u32>, usize), E> {
+	lists: impl IntoIterator<Item = Result<(ChangedFiles, Vec<String>), E>>,
+) -> Result<(ChangedFiles, Vec<u32>, usize, Vec<String>), E> {
 	let mut seen = HashSet::new();
 	let (mut files, mut origin, mut total) = (Vec::new(), Vec::new(), 0);
+	let mut gitlinks = Vec::new();
 	for (i, list) in lists.into_iter().enumerate() {
-		for (path, change) in list? {
+		let (list, links) = list?;
+		for (path, change) in list {
 			if !seen.insert(path.clone()) {
 				continue;
 			}
 			total += 1;
 			if files.len() < MAX_COMMIT_FILES {
+				if links.contains(&path) {
+					gitlinks.push(path.clone());
+				}
 				files.push((path, change));
 				origin.push(i as u32);
 			}
 		}
 	}
-	Ok((files, origin, total))
+	Ok((files, origin, total, gitlinks))
 }
 
 /// One read of a merged-log feed: its page (plain SHAs) and, on the
@@ -4420,11 +4434,19 @@ mod tests {
 				.collect::<Vec<_>>()
 		};
 		// Newest first: a.txt deleted in the newest, added in the oldest.
-		let (files, origin, total) = union_changed_files(
+		// A submodule path is a gitlink as its newest commit lists it.
+		let links = |v: &[&str]| v.iter().map(|p| p.to_string()).collect();
+		let (files, origin, total, gitlinks) = union_changed_files(
 			[
-				list(&[("a.txt", Deleted), ("b.txt", Modified)]),
-				list(&[("c.txt", New)]),
-				list(&[("a.txt", New), ("c.txt", Modified)]),
+				(
+					list(&[("a.txt", Deleted), ("b.txt", Modified)]),
+					links(&["b.txt"]),
+				),
+				(list(&[("c.txt", New)]), links(&[])),
+				(
+					list(&[("a.txt", New), ("c.txt", Modified)]),
+					links(&["a.txt", "c.txt"]),
+				),
 			]
 			.map(Ok::<_, ()>),
 		)
@@ -4435,12 +4457,15 @@ mod tests {
 		);
 		assert_eq!(origin, [0, 0, 1]);
 		assert_eq!(total, 3);
+		assert_eq!(gitlinks, ["b.txt"]);
 		// Distinct paths past the cap are counted, not kept.
 		let many: Vec<_> = (0..MAX_COMMIT_FILES + 2)
 			.map(|i| (format!("f{i}"), Some(Modified)))
 			.collect();
-		let (files, origin, total) =
-			union_changed_files([many.clone(), many].map(Ok::<_, ()>)).unwrap();
+		let (files, origin, total, _) = union_changed_files(
+			[many.clone(), many].map(|l| Ok::<_, ()>((l, Vec::new()))),
+		)
+		.unwrap();
 		assert_eq!(files.len(), MAX_COMMIT_FILES);
 		assert_eq!(origin.len(), MAX_COMMIT_FILES);
 		assert_eq!(total, MAX_COMMIT_FILES + 2);

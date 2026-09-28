@@ -285,10 +285,10 @@ pub(super) fn path_picker_rows(
 pub(super) const MAX_PATH_SCAN: usize = 20_000;
 
 /// The Paths picker while its field has text: the loaded folders and
-/// files whose path contains `needle` (lowercase), each under its folders
-/// (shown open), named `prefix` + path, at most `max` rows and
-/// [`MAX_PATH_SCAN`] nodes read. Folders the tree has not read are not
-/// searched.
+/// files whose `prefix` + path contains `needle` (lowercase), each under
+/// its folders (shown open, not collapsible: the filter decides what
+/// shows), at most `max` rows and [`MAX_PATH_SCAN`] nodes read. Folders
+/// the tree has not read are not searched.
 pub(super) fn path_picker_matches(
 	root: &crate::tree::FileTreeNode,
 	needle: &str,
@@ -315,12 +315,14 @@ pub(super) fn path_picker_matches(
 			// Pushed first so it lands above its matches; dropped again if
 			// neither it nor anything under it matches.
 			let at = out.len();
+			let rel = format!("{prefix}{}", child.rel_path);
+			let hit = rel.to_lowercase().contains(needle);
 			out.push(PathPick {
-				rel: format!("{prefix}{}", child.rel_path),
+				rel,
 				name: child.name.clone(),
 				is_dir: Some(child.is_dir),
 				depth,
-				expandable: child.is_dir,
+				expandable: false,
 				expanded: false,
 			});
 			if child.is_dir {
@@ -328,7 +330,7 @@ pub(super) fn path_picker_matches(
 			}
 			if out.len() > at + 1 {
 				out[at].expanded = true;
-			} else if !child.rel_path.to_lowercase().contains(needle) {
+			} else if !hit {
 				out.pop();
 			}
 		}
@@ -1095,7 +1097,7 @@ impl WorkbenchModel {
 					name: name.clone(),
 					is_dir: Some(true),
 					depth: 0,
-					expandable: mine.is_some(),
+					expandable: false,
 					expanded: !hits.is_empty(),
 				});
 				out.extend(hits.into_iter().map(|mut pick| {
