@@ -86,10 +86,10 @@ fn folder_file_rel(
 /// selected is not added twice. A file the export would refuse is skipped
 /// and counted, never failing the whole copy.
 ///
-/// Order is the selection's (basket roots sorted by path, then pick
-/// order). Picked files are never starved: the folders share the `limit`
-/// left after them, first come first served, and the walk stops one file
-/// past it so a huge folder is never held in full.
+/// Picked files (and Changes/Log items) are never starved: the folders
+/// share the `limit` left after them in basket order (root path, then the
+/// folder's relative path, as the Project selection is sorted), and the
+/// walk stops one file past it so a huge folder is never held in full.
 fn expand_folder_items(
 	sel: ExportSelection,
 	limit: usize,
@@ -206,6 +206,33 @@ macro_rules! app_log {
 		println!($($arg)*);
 		let _ = std::io::Write::flush(&mut std::io::stdout());
 	}};
+}
+
+/// The copy toast: a partial copy (file limit hit in the folder walk or
+/// in the plan) always says so, with the limit.
+fn copied_status(
+	repo_name: String,
+	plan: &snip_core::transfer::ExportPlan,
+	expanded: &FolderExpansion,
+) -> Msg {
+	let skipped = plan.skipped_unreadable_count
+		+ plan.skipped_file_size_count
+		+ expanded.skipped;
+	let mut args = vec![
+		repo_name,
+		plan.copied_file_count.to_string(),
+		plan.stats.chars.to_string(),
+		plan.stats.lines.to_string(),
+		skipped.to_string(),
+	];
+	if !(expanded.truncated || plan.file_limit_reached) {
+		return Msg::new("status_copied", args);
+	}
+	if e2e_on() {
+		app_log!("[APP:COPY_TRUNCATED: limit={NATIVE_FILE_COUNT_LIMIT}]");
+	}
+	args.push(NATIVE_FILE_COUNT_LIMIT.to_string());
+	Msg::new("status_copied_limit", args)
 }
 
 /// Measurement harness readiness marker (`--mode idle|overview|preview`).
@@ -4822,11 +4849,11 @@ impl WorkbenchModel {
 							}
 							e => Msg::new("error_payload", [e.to_string()]),
 						})?;
-						let export_sel = expanded.sel;
+						let export_sel = &expanded.sel;
 						// Document cap is the retained UI output ceiling.
 						// It is not `RunOptions::max_stdout`.
 						let plan = plan_export_with(
-							&export_sel,
+							export_sel,
 							&settings,
 							Some(RunOptions::INTERACTIVE_MAX_STDOUT),
 							&opts,
@@ -4863,30 +4890,7 @@ impl WorkbenchModel {
 							}
 							Msg::new("error_payload", [e.to_string()])
 						})?;
-						let skipped = plan.skipped_unreadable_count
-							+ plan.skipped_file_size_count
-							+ expanded.skipped;
-						let mut args = vec![
-							repo_name,
-							plan.copied_file_count.to_string(),
-							plan.stats.chars.to_string(),
-							plan.stats.lines.to_string(),
-							skipped.to_string(),
-						];
-						// A partial copy always says so.
-						let key = if expanded.truncated || plan.file_limit_reached
-						{
-							if e2e_on() {
-								app_log!(
-									"[APP:COPY_TRUNCATED: limit={NATIVE_FILE_COUNT_LIMIT}]"
-								);
-							}
-							args.push(NATIVE_FILE_COUNT_LIMIT.to_string());
-							"status_copied_limit"
-						} else {
-							"status_copied"
-						};
-						let msg = Msg::new(key, args);
+						let msg = copied_status(repo_name, &plan, &expanded);
 						Ok((plan.payload, plan.copied_file_count, msg))
 					})
 					.await;
@@ -6408,6 +6412,40 @@ mod tests {
 			.unwrap();
 			assert_eq!(exact.sel.items.len(), 12);
 			assert!(!exact.truncated);
+		}
+
+		/// A walk cut at the limit reaches the toast as a partial copy.
+		#[test]
+		fn truncated_copy_says_so_in_the_status() {
+			let (_tmp, root) = canonical_tmp();
+			fs::create_dir_all(root.join("big")).unwrap();
+			for i in 0..8 {
+				fs::write(root.join(format!("big/{i}.txt")), "B").unwrap();
+			}
+			let cut = expand_folder_items(
+				selection(&root, &["big"]),
+				3,
+				&CancelToken::new(),
+			)
+			.unwrap();
+			let plan =
+				plan_export(&cut.sel, &native_export_settings(), None).unwrap();
+			let msg = crate::copied_status("r".into(), &plan, &cut);
+			assert_eq!(msg.key, "status_copied_limit");
+			assert_eq!(msg.args[1], "3");
+			assert_eq!(msg.args[5], NATIVE_FILE_COUNT_LIMIT.to_string());
+			let whole = expand_folder_items(
+				selection(&root, &["big"]),
+				8,
+				&CancelToken::new(),
+			)
+			.unwrap();
+			let plan = plan_export(&whole.sel, &native_export_settings(), None)
+				.unwrap();
+			assert_eq!(
+				crate::copied_status("r".into(), &plan, &whole).key,
+				"status_copied"
+			);
 		}
 
 		/// ClipCode's 30-file default would silently cut a folder copy.
