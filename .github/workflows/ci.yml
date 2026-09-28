@@ -327,7 +327,7 @@ jobs:
               run: |
                   sudo apt-get update
                   sudo apt-get install -y \
-                      build-essential libxkbcommon-x11-0 libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
+                      build-essential libx11-dev libxcb1-dev libxkbcommon-x11-0 libgl1-mesa-dri libegl1 libegl-mesa0 mesa-vulkan-drivers \
                       xvfb xdotool xclip x11-apps x11-utils imagemagick dbus-x11 \
                       fcitx5 fcitx5-pinyin python3-pil fonts-dejavu-core fonts-noto-cjk
             - name: Configure git identity

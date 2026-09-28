@@ -6673,8 +6673,7 @@ mod tests {
 		}
 
 		/// A read-only directory makes one write fail; root ignores the mode,
-		/// so the test skips there. The `status_paste_partial` line itself is
-		/// not asserted: the rescan that follows an apply replaces it at once.
+		/// so the test skips there.
 		#[cfg(unix)]
 		#[gpui::test]
 		fn a_refused_write_does_not_stop_the_others_and_the_card_names_it(
