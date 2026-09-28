@@ -52,6 +52,14 @@ impl SelectorCandidate<'_> {
 		}
 	}
 
+	/// Section of the ref popup (`refs_local` / `refs_remote` / `refs_tags`).
+	pub(crate) fn group(&self) -> Option<&'static str> {
+		match self {
+			Self::Repo { .. } => None,
+			Self::Ref { group, .. } => *group,
+		}
+	}
+
 	fn pick(self) -> Pick {
 		match self {
 			Self::Repo { index, .. } => Pick::Repo(index),
@@ -218,7 +226,8 @@ impl WorkbenchModel {
 			self.popover,
 			&self.repos,
 			&self.refs,
-			self.head_sha.is_some(),
+			// The merged log's HEAD filter picks every repository's HEAD.
+			self.head_sha.is_some() || self.log_is_merged(),
 			self.locale,
 			q,
 		)

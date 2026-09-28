@@ -104,6 +104,8 @@ pub struct TextInput {
 	/// Extra publishes after the caret moves. XIM may not be connected on the
 	/// first frame, and `invalidate_character_coordinates` runs on a later frame.
 	ime_anchor_retries: u8,
+	/// Popup search field: no box of its own (IntelliJ popups).
+	borderless: bool,
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -128,7 +130,15 @@ impl TextInput {
 			is_selecting: false,
 			last_ime_anchor: None,
 			ime_anchor_retries: 0,
+			borderless: false,
 		}
+	}
+
+	/// Drops the field border and background, for a search field that sits
+	/// inside a popup which already frames it.
+	pub fn borderless(mut self) -> Self {
+		self.borderless = true;
+		self
 	}
 
 	#[cfg(test)]
@@ -148,6 +158,7 @@ impl TextInput {
 			is_selecting: false,
 			last_ime_anchor: None,
 			ime_anchor_retries: 0,
+			borderless: false,
 		}
 	}
 
@@ -777,7 +788,7 @@ impl Element for TextElement {
 		let cursor = input.cursor_offset();
 		let style = window.text_style();
 		let (display_text, text_color) = if content.is_empty() {
-			(input.placeholder.clone(), rgb(TEXT_DISABLED).into())
+			(input.placeholder.clone(), rgb(pal().text_disabled).into())
 		} else {
 			(content, style.color)
 		};
@@ -832,7 +843,7 @@ impl Element for TextElement {
 						point(bounds.left() + cursor_pos, bounds.top()),
 						size(px(1.5), bounds.bottom() - bounds.top()),
 					),
-					rgb(TEXT),
+					rgb(pal().text),
 				)),
 			)
 		} else {
@@ -850,7 +861,7 @@ impl Element for TextElement {
 							bounds.bottom(),
 						),
 					),
-					rgb(SELECTION_BG),
+					rgb(pal().selection_bg),
 				)),
 				None,
 			)
@@ -948,11 +959,13 @@ impl Render for TextInput {
 			.is_some_and(|f| f.is_focused(window));
 		let at_capacity = self.is_at_capacity();
 		let border_color = if at_capacity {
-			rgb(WARNING)
+			rgb(pal().warning)
+		} else if self.borderless {
+			rgb(pal().popup_bg)
 		} else if focused {
-			rgb(ACCENT)
+			rgb(pal().accent)
 		} else {
-			rgb(BUTTON_BORDER)
+			rgb(pal().button_border)
 		};
 		div()
 			.id("text-input-field")
@@ -998,7 +1011,7 @@ impl Render for TextInput {
 			.rounded(px(3.))
 			.border_1()
 			.border_color(border_color)
-			.bg(rgb(EDITOR_BG))
+			.when(!self.borderless, |d| d.bg(rgb(pal().editor_bg)))
 			.text_size(px(SMALL_TEXT))
 			.line_height(px(16.))
 			.overflow_hidden()
@@ -1014,7 +1027,7 @@ impl Render for TextInput {
 						.flex_shrink_0()
 						.px(px(4.))
 						.text_size(px(10.))
-						.text_color(rgb(WARNING))
+						.text_color(rgb(pal().warning))
 						.child(format!(
 							"{}/{}",
 							self.char_count(),

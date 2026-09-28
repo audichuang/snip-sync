@@ -40,20 +40,30 @@ pub struct RepositoryHistory {
 }
 
 pub fn parse_log(out: &str) -> Vec<CommitSummary> {
-	out.split('\x1e')
+	parse_log_bytes(out.as_bytes())
+}
+
+/// [`parse_log`] over raw `git log` bytes. Each field is decoded on its own
+/// and lossily, so one commit with a non-UTF-8 author or subject shows
+/// replacement characters instead of failing the whole page.
+pub fn parse_log_bytes(out: &[u8]) -> Vec<CommitSummary> {
+	out.split(|&b| b == 0x1e)
 		.filter_map(|record| {
-			let mut f = record.trim_start_matches('\n').split('\0');
+			let start = record.iter().position(|&b| b != b'\n')?;
+			let mut f = record[start..]
+				.split(|&b| b == 0)
+				.map(|field| String::from_utf8_lossy(field).into_owned());
 			Some(CommitSummary {
-				sha: f.next().filter(|s| !s.is_empty())?.into(),
+				sha: f.next().filter(|s| !s.is_empty())?,
 				parents: f
 					.next()?
 					.split_whitespace()
 					.map(str::to_string)
 					.collect(),
-				author_name: f.next()?.into(),
-				author_email: f.next()?.into(),
-				author_date: f.next()?.into(),
-				subject: f.next()?.into(),
+				author_name: f.next()?,
+				author_email: f.next()?,
+				author_date: f.next()?,
+				subject: f.next()?,
 			})
 		})
 		.collect()
@@ -63,6 +73,224 @@ pub fn parse_log(out: &str) -> Vec<CommitSummary> {
 pub const MAX_GRAPH_BYTES: usize = 16 * 1024 * 1024;
 /// Hard upper bound on commit records requested in a single history query.
 pub const MAX_HISTORY_LIMIT: usize = 10_000;
+
+const LOG_FORMAT: &str = "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x1e";
+/// `log.showSignature` would print gpg output into the record stream, and a
+/// commit's own `encoding` header would reach the parser un-transcoded.
+const LOG_FLAGS: [&str; 5] = [
+	"log",
+	"--topo-order",
+	"--ignore-missing",
+	"--no-show-signature",
+	"--encoding=UTF-8",
+];
+/// What the graph shows. `--all` would also walk stash, notes, `refs/prefetch`,
+/// `refs/original` and other internal refs as unlabeled history.
+const VISIBLE_TIPS: [&str; 4] = ["--branches", "--remotes", "--tags", "HEAD"];
+
+/// Refs, HEAD and shallow boundaries read once, so later pages of one
+/// history walk the same tips even if the repository changes meanwhile.
+#[derive(Debug, Clone, Default)]
+pub struct RefSnapshot {
+	/// Branches, remote-tracking branches and tags, each peeled to the
+	/// commit it names.
+	pub refs: Vec<GitReference>,
+	pub head: Option<String>,
+	/// HEAD is not a symbolic ref (a detached checkout).
+	pub detached: bool,
+	/// Commits whose parents a shallow clone does not have.
+	pub shallow: Vec<String>,
+}
+
+impl RefSnapshot {
+	/// Every ref target plus HEAD, deduplicated: the tips of the full graph.
+	pub fn tips(&self) -> Vec<String> {
+		let mut tips: Vec<String> = self
+			.refs
+			.iter()
+			.map(|r| r.sha.clone())
+			.chain(self.head.clone())
+			.collect();
+		tips.sort_unstable();
+		tips.dedup();
+		tips
+	}
+}
+
+/// Most bytes of `$GIT_DIR/shallow` read; one line per boundary commit.
+const MAX_SHALLOW_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Branches, remote-tracking branches and tags, fully peeled. An annotated
+/// tag of an annotated tag is peeled through `cat-file --batch-check`, so
+/// only tag-of-tag refs cost more than the one `for-each-ref`.
+fn read_refs(
+	git: &Git,
+	opts: &RunOptions,
+) -> Result<Vec<GitReference>, GitError> {
+	let mut run_opts = opts.clone();
+	run_opts.max_stdout = run_opts.max_stdout.min(MAX_GRAPH_BYTES);
+	let raw = git.run_with(
+		&[
+			"for-each-ref",
+			"--format=%(refname)%00%(objectname)%00%(*objectname)%00%(*objecttype)",
+			"refs/heads",
+			"refs/remotes",
+			"refs/tags",
+		],
+		&run_opts,
+	)?;
+	if raw.truncated {
+		return Err(GitError::OutputLimit {
+			args: "for-each-ref".into(),
+			limit: opts.max_stdout,
+		});
+	}
+	let Ok(text) = std::str::from_utf8(&raw.stdout) else {
+		return Err(GitError::Malformed(
+			"for-each-ref output not utf-8".into(),
+		));
+	};
+	let mut refs = Vec::new();
+	// Indexes into `refs` whose one-level peel is itself a tag object.
+	let mut nested = Vec::new();
+	for line in text.lines() {
+		let mut fields = line.split('\0');
+		let (Some(name), Some(object), Some(peeled), Some(kind)) =
+			(fields.next(), fields.next(), fields.next(), fields.next())
+		else {
+			continue;
+		};
+		if kind == "tag" {
+			nested.push(refs.len());
+		}
+		refs.push(GitReference {
+			name: name.to_string(),
+			sha: if peeled.is_empty() { object } else { peeled }.into(),
+		});
+	}
+	if !nested.is_empty() {
+		let input: String = nested
+			.iter()
+			.map(|&i| format!("{}^{{}}\n", refs[i].sha))
+			.collect();
+		let mut cmd = git.command();
+		cmd.args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]);
+		let out = git.exec(
+			cmd,
+			"cat-file --batch-check",
+			Some(input.as_bytes()),
+			&run_opts,
+		)?;
+		if out.truncated {
+			return Err(GitError::OutputLimit {
+				args: "cat-file --batch-check".into(),
+				limit: opts.max_stdout,
+			});
+		}
+		let text = String::from_utf8_lossy(&out.stdout);
+		for (&i, line) in nested.iter().zip(text.lines()) {
+			// `<input> missing` keeps the one-level peel.
+			if let Some((oid, _kind)) = line.split_once(' ') {
+				if oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+					refs[i].sha = oid.to_string();
+				}
+			}
+		}
+	}
+	Ok(refs)
+}
+
+/// Commits a shallow clone cut off, from `$GIT_DIR/shallow`; empty when the
+/// repository is complete.
+fn shallow_boundaries(
+	git: &Git,
+	opts: &RunOptions,
+) -> Result<Vec<String>, GitError> {
+	let out = git.run_with(&["rev-parse", "--git-path", "shallow"], opts)?;
+	let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+	let Ok(file) = fs::File::open(git.root().join(rel)) else {
+		return Ok(Vec::new());
+	};
+	let mut text = String::new();
+	file.take(MAX_SHALLOW_BYTES).read_to_string(&mut text)?;
+	Ok(text
+		.lines()
+		.map(str::trim)
+		.filter(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_hexdigit()))
+		.map(str::to_string)
+		.collect())
+}
+
+/// Refs, HEAD, detached state and shallow boundaries: no `git log`, so
+/// callers that only need refs do not pay for a topological walk.
+pub fn refs_with(
+	git: &Git,
+	opts: &RunOptions,
+) -> Result<RefSnapshot, GitError> {
+	let refs = read_refs(git, opts)?;
+	let head = git.head_with(opts)?;
+	let detached = head.is_some() && git.head_ref_with(opts)?.is_none();
+	Ok(RefSnapshot {
+		refs,
+		head,
+		detached,
+		shallow: shallow_boundaries(git, opts)?,
+	})
+}
+
+fn run_log(
+	git: &Git,
+	args: &[String],
+	stdin: Option<&[u8]>,
+	limit: usize,
+	opts: &RunOptions,
+) -> Result<(Vec<CommitSummary>, bool), GitError> {
+	let mut run_opts = opts.clone();
+	run_opts.max_stdout = run_opts.max_stdout.min(MAX_GRAPH_BYTES);
+	let mut cmd = git.command();
+	cmd.args(args);
+	let output = git.exec(cmd, &args.join(" "), stdin, &run_opts)?;
+	if output.truncated {
+		return Err(GitError::OutputLimit {
+			args: "log".into(),
+			limit: opts.max_stdout,
+		});
+	}
+	let mut commits = parse_log_bytes(&output.stdout);
+	let has_more = commits.len() > limit;
+	commits.truncate(limit);
+	Ok((commits, has_more))
+}
+
+fn log_args(skip: usize, limit: usize) -> Vec<String> {
+	let mut args: Vec<String> = LOG_FLAGS.map(String::from).to_vec();
+	args.extend([
+		format!("--skip={skip}"),
+		format!("-n{}", limit.saturating_add(1)),
+		LOG_FORMAT.into(),
+	]);
+	args
+}
+
+/// One topological page from explicit tip commits (e.g.
+/// [`RefSnapshot::tips`]), so paging never re-resolves moving refs. Tips go
+/// through stdin: thousands of refs would overflow a Windows command line.
+pub fn log_from_tips_with(
+	git: &Git,
+	tips: &[String],
+	skip: usize,
+	limit: usize,
+	opts: &RunOptions,
+) -> Result<(Vec<CommitSummary>, bool), GitError> {
+	let limit = limit.min(MAX_HISTORY_LIMIT);
+	if tips.is_empty() {
+		return Ok((Vec::new(), false));
+	}
+	let mut args = log_args(skip, limit);
+	args.extend(["--stdin".into(), "--".into()]);
+	let input: String = tips.iter().map(|t| format!("{t}\n")).collect();
+	run_log(git, &args, Some(input.as_bytes()), limit, opts)
+}
 
 /// Topological pages across every local ref, including remote-tracking branches
 /// and annotated tags. Browsing never checks out a branch or contacts a remote.
@@ -86,53 +314,8 @@ pub fn history_with(
 	opts: &RunOptions,
 ) -> Result<RepositoryHistory, GitError> {
 	let limit = limit.min(MAX_HISTORY_LIMIT);
-	let mut run_opts = opts.clone();
-	run_opts.max_stdout = run_opts.max_stdout.min(MAX_GRAPH_BYTES);
-	let raw = git.run_with(
-		&[
-			"for-each-ref",
-			"--format=%(refname)%00%(objectname)%00%(*objectname)",
-			"refs/heads",
-			"refs/remotes",
-			"refs/tags",
-		],
-		&run_opts,
-	)?;
-	if raw.truncated {
-		return Err(GitError::OutputLimit {
-			args: "for-each-ref".into(),
-			limit: opts.max_stdout,
-		});
-	}
-	let refs_str = match std::str::from_utf8(&raw.stdout) {
-		Ok(s) => s,
-		Err(_) => {
-			return Err(GitError::Malformed(
-				"for-each-ref output not utf-8".into(),
-			))
-		}
-	};
-	let refs = refs_str
-		.lines()
-		.filter_map(|line| {
-			let mut fields = line.split('\0');
-			let name = fields.next()?.to_string();
-			let object = fields.next()?;
-			let peeled = fields.next()?;
-			Some(GitReference {
-				name,
-				sha: if peeled.is_empty() { object } else { peeled }.into(),
-			})
-		})
-		.collect();
-	let mut args = vec![
-		"log".to_string(),
-		"--topo-order".into(),
-		"--ignore-missing".into(),
-		format!("--skip={skip}"),
-		format!("-n{}", limit.saturating_add(1)),
-		"--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x1e".into(),
-	];
+	let refs = read_refs(git, opts)?;
+	let mut args = log_args(skip, limit);
 	let query = query.trim();
 	let resolved_query =
 		if query.len() >= 4 && query.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -152,7 +335,7 @@ pub fn history_with(
 		if let Some(reference) = reference.filter(|s| !s.is_empty()) {
 			args.push(git.resolve_commit_with(reference, opts)?);
 		} else {
-			args.extend(["--all".into(), "HEAD".into()]);
+			args.extend(VISIBLE_TIPS.map(String::from));
 		}
 		if !query.is_empty() {
 			args.extend([
@@ -163,25 +346,7 @@ pub fn history_with(
 		}
 	}
 	args.push("--".into());
-	let output = git.run_with(
-		&args.iter().map(String::as_str).collect::<Vec<_>>(),
-		&run_opts,
-	)?;
-	if output.truncated {
-		return Err(GitError::OutputLimit {
-			args: "log".into(),
-			limit: opts.max_stdout,
-		});
-	}
-	let log_text = match String::from_utf8(output.stdout) {
-		Ok(s) => s,
-		Err(_) => {
-			return Err(GitError::Malformed("log output not utf-8".into()))
-		}
-	};
-	let mut commits = parse_log(&log_text);
-	let has_more = commits.len() > limit;
-	commits.truncate(limit);
+	let (commits, has_more) = run_log(git, &args, None, limit, opts)?;
 	Ok(RepositoryHistory {
 		root: git.root().to_string_lossy().into_owned(),
 		commits,
@@ -210,42 +375,128 @@ pub fn history_by_author_with(
 	opts: &RunOptions,
 ) -> Result<(Vec<CommitSummary>, bool), GitError> {
 	let limit = limit.min(MAX_HISTORY_LIMIT);
-	let skip_arg = format!("--skip={skip}");
-	let n_arg = format!("-n{}", limit.saturating_add(1));
-	let author_arg = format!("--author={author}");
-	let args = [
-		"log",
-		"--topo-order",
-		"--ignore-missing",
-		&skip_arg,
-		&n_arg,
-		"--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s%x1e",
-		"--fixed-strings",
-		"--regexp-ignore-case",
-		&author_arg,
-		"--all",
-		"HEAD",
-		"--",
-	];
-	let mut run_opts = opts.clone();
-	run_opts.max_stdout = run_opts.max_stdout.min(MAX_GRAPH_BYTES);
-	let out = git.run_with(&args, &run_opts)?;
-	if out.truncated {
-		return Err(GitError::OutputLimit {
-			args: format!("log --author={author}"),
-			limit: opts.max_stdout,
-		});
+	let mut args = log_args(skip, limit);
+	args.extend([
+		"--fixed-strings".into(),
+		"--regexp-ignore-case".into(),
+		format!("--author={author}"),
+	]);
+	args.extend(VISIBLE_TIPS.map(String::from));
+	args.push("--".into());
+	run_log(git, &args, None, limit, opts)
+}
+
+/// IntelliJ-style log filters, combined with AND. An empty query is the
+/// plain history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogQuery {
+	/// Message text, or a commit hash (4+ hex digits that resolve).
+	pub text: String,
+	/// `text` is an extended regular expression instead of a literal.
+	pub regex: bool,
+	/// Case-sensitive matching (text and author).
+	pub match_case: bool,
+	/// Literal author name or email fragment.
+	pub author: Option<String>,
+	/// Lower date bound in any form `git log --since` accepts.
+	pub since: Option<String>,
+	/// Upper date bound in any form `git log --until` accepts.
+	pub until: Option<String>,
+	/// Only commits touching one of these repository-relative paths.
+	pub paths: Vec<String>,
+}
+
+impl LogQuery {
+	pub fn is_empty(&self) -> bool {
+		self.text.trim().is_empty()
+			&& self.author.is_none()
+			&& self.since.is_none()
+			&& self.until.is_none()
+			&& self.paths.is_empty()
 	}
-	let text = match String::from_utf8(out.stdout) {
-		Ok(s) => s,
-		Err(_) => {
-			return Err(GitError::Malformed("log output not utf-8".into()))
+}
+
+/// Escapes POSIX ERE metacharacters so `s` matches literally under `-E`.
+fn ere_escape(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	for c in s.chars() {
+		if r"\.^$|?*+()[]{}".contains(c) {
+			out.push('\\');
 		}
+		out.push(c);
+	}
+	out
+}
+
+/// One page of history under `query` (see [`LogQuery`]), from `reference`
+/// or every visible tip. A text that resolves as a hash shows just that
+/// commit.
+pub fn history_query_with(
+	git: &Git,
+	reference: Option<&str>,
+	query: &LogQuery,
+	skip: usize,
+	limit: usize,
+	opts: &RunOptions,
+) -> Result<(Vec<CommitSummary>, bool), GitError> {
+	let limit = limit.min(MAX_HISTORY_LIMIT);
+	let mut args = log_args(skip, limit);
+	let text = query.text.trim();
+	let hash = if text.len() >= 4 && text.bytes().all(|b| b.is_ascii_hexdigit())
+	{
+		match git.resolve_commit_with(text, opts) {
+			Ok(sha) => Some(sha),
+			Err(GitError::InvalidRevision(_)) => None,
+			Err(e) => return Err(e),
+		}
+	} else {
+		None
 	};
-	let mut commits = parse_log(&text);
-	let more = commits.len() > limit;
-	commits.truncate(limit);
-	Ok((commits, more))
+	args.push(if query.regex {
+		"--extended-regexp".into()
+	} else {
+		"--fixed-strings".into()
+	});
+	if !query.match_case {
+		args.push("--regexp-ignore-case".into());
+	}
+	if hash.is_none() && !text.is_empty() {
+		args.push(format!("--grep={text}"));
+	}
+	if let Some(author) = query.author.as_deref().filter(|a| !a.is_empty()) {
+		// The author chip is always a literal, whatever the text mode.
+		let author = if query.regex {
+			ere_escape(author)
+		} else {
+			author.to_string()
+		};
+		args.push(format!("--author={author}"));
+	}
+	if let Some(since) = query.since.as_deref().filter(|s| !s.is_empty()) {
+		args.push(format!("--since={since}"));
+	}
+	if let Some(until) = query.until.as_deref().filter(|s| !s.is_empty()) {
+		args.push(format!("--until={until}"));
+	}
+	// With paths, git rewrites parents to the nearest commit that touches
+	// them too, so the graph of the matches stays connected.
+	if query.paths.iter().any(|p| !p.is_empty()) {
+		args.push("--parents".into());
+	}
+	match (hash, reference.filter(|s| !s.is_empty())) {
+		(Some(sha), _) => args.extend(["--no-walk".into(), sha]),
+		(None, Some(r)) => args.push(git.resolve_commit_with(r, opts)?),
+		(None, None) => args.extend(VISIBLE_TIPS.map(String::from)),
+	}
+	args.push("--".into());
+	args.extend(
+		query
+			.paths
+			.iter()
+			.filter(|p| !p.is_empty())
+			.map(|p| format!(":(literal){p}")),
+	);
+	run_log(git, &args, None, limit, opts)
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -609,44 +860,102 @@ pub fn git_preview_with(
 	path: &str,
 	opts: &RunOptions,
 ) -> Result<GitPreview, GitError> {
-	let max = opts.max_stdout;
 	// Verify membership before accepting a path from the WebView: the one
-	// listing `read_changed_file` does answers both.
+	// pathspec-limited listing `read_changed_file_with` does answers both.
 	if matches!(source, GitSource::Working) && git.root().join(path).exists() {
 		inside(git.root(), path)?;
 	}
 	// Content is strict: a partial file would read as the whole file.
-	let file =
-		gitsrc::read_changed_file_with(git, source, path, max as u64, opts)?
-			.ok_or_else(|| {
-				GitError::Malformed("Path is not in this Git source".into())
-			})?;
+	let file = gitsrc::read_changed_file_with(
+		git,
+		source,
+		path,
+		opts.max_stdout as u64,
+		opts,
+	)?
+	.ok_or_else(|| {
+		GitError::Malformed("Path is not in this Git source".into())
+	})?;
+	let revs = diff_revs(git, source, None, opts)?;
+	finish_preview(git, revs, path, file.content, file.change_type, opts)
+}
+
+/// [`git_preview_with`] for a change the caller listed itself (`path` and
+/// `change` from [`gitsrc::list_changed_paths_with`]): nothing is listed or,
+/// for a commit whose `parents` are known (a log row), resolved again; one
+/// `cat-file` and one `diff`. Only for paths from such a listing, never an
+/// untrusted path.
+pub fn git_preview_for(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+	change: crate::format::ChangeType,
+	parents: Option<&[String]>,
+	opts: &RunOptions,
+) -> Result<GitPreview, GitError> {
+	let file = gitsrc::read_changed_file_for(
+		git,
+		source,
+		path,
+		change,
+		parents,
+		opts.max_stdout as u64,
+		opts,
+	)?;
+	let revs = diff_revs(git, source, parents, opts)?;
+	finish_preview(git, revs, path, file.content, Some(change), opts)
+}
+
+/// What `git diff` compares for `source`. A commit's first parent comes from
+/// `parents` when the caller knows them.
+fn diff_revs(
+	git: &Git,
+	source: &GitSource,
+	parents: Option<&[String]>,
+	opts: &RunOptions,
+) -> Result<Vec<String>, GitError> {
+	Ok(match source {
+		GitSource::Working => {
+			vec![git.head_with(opts)?.unwrap_or_else(|| EMPTY_TREE.into())]
+		}
+		GitSource::Staged => vec!["--cached".into()],
+		GitSource::Commit(rev) => {
+			let (sha, first) = match parents {
+				Some(parents) => (rev.clone(), parents.first().cloned()),
+				None => {
+					let sha = git.resolve_commit_with(rev, opts)?;
+					let first =
+						git.parents_with(&sha, opts)?.into_iter().next();
+					(sha, first)
+				}
+			};
+			vec![first.unwrap_or_else(|| EMPTY_TREE.into()), sha]
+		}
+		GitSource::Range(base, tip) => vec![
+			git.resolve_commit_with(base, opts)?,
+			git.resolve_commit_with(tip, opts)?,
+		],
+	})
+}
+
+/// Runs the path's `diff` for `revs` and builds the preview around
+/// `content`; a new file with no diff text gets a synthesized patch.
+fn finish_preview(
+	git: &Git,
+	revs: Vec<String>,
+	path: &str,
+	content: Option<String>,
+	change: Option<crate::format::ChangeType>,
+	opts: &RunOptions,
+) -> Result<GitPreview, GitError> {
+	let max = opts.max_stdout;
 	let mut args = vec![
 		"diff".to_string(),
 		"--no-ext-diff".into(),
 		"--no-textconv".into(),
 		"--no-color".into(),
 	];
-	match source {
-		GitSource::Working => {
-			args.push(git.head_with(opts)?.unwrap_or_else(|| EMPTY_TREE.into()))
-		}
-		GitSource::Staged => args.push("--cached".into()),
-		GitSource::Commit(rev) => {
-			let sha = git.resolve_commit_with(rev, opts)?;
-			args.push(
-				git.parents_with(&sha, opts)?
-					.into_iter()
-					.next()
-					.unwrap_or_else(|| EMPTY_TREE.into()),
-			);
-			args.push(sha);
-		}
-		GitSource::Range(base, tip) => {
-			args.push(git.resolve_commit_with(base, opts)?);
-			args.push(git.resolve_commit_with(tip, opts)?);
-		}
-	}
+	args.extend(revs);
 	args.extend(["--".into(), format!(":(literal){path}")]);
 	let diff = git
 		.run_with(&args.iter().map(String::as_str).collect::<Vec<_>>(), opts)?;
@@ -655,10 +964,8 @@ pub fn git_preview_with(
 	} else {
 		(diff.stdout, false)
 	};
-	if patch.is_empty()
-		&& file.change_type == Some(crate::format::ChangeType::New)
-	{
-		if let Some(content) = &file.content {
+	if patch.is_empty() && change == Some(crate::format::ChangeType::New) {
+		if let Some(content) = &content {
 			let (synth, cut) = new_file_patch(path, content, max);
 			if cut && opts.overflow == Overflow::Error {
 				return Err(GitError::OutputLimit {
@@ -671,7 +978,7 @@ pub fn git_preview_with(
 	}
 	gitsrc::already_cancelled(opts, "Git preview")?;
 	Ok(GitPreview {
-		content: file.content,
+		content,
 		// Cut at a line start, so only an invalid byte in the file itself
 		// can be replaced here.
 		patch: String::from_utf8_lossy(&patch).into_owned(),
@@ -1106,6 +1413,114 @@ mod tests {
 
 		// Missing file in HEAD returns Err
 		assert!(commit_blob(&g, "HEAD", "sub/a.txt", 1024 * 1024).is_err());
+	}
+
+	#[test]
+	fn history_query_combines_text_author_since_and_paths() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		fs::create_dir(root.join("docs")).unwrap();
+		for (who, file, msg) in [
+			("Alice", "a.txt", "Fix login"),
+			("Bob", "docs/b.md", "fix docs (v2)"),
+			("Alice", "docs/c.md", "Add docs"),
+		] {
+			fs::write(root.join(file), msg).unwrap();
+			run(root, &["add", "."]);
+			run(
+				root,
+				&[
+					"-c",
+					&format!("user.name={who}"),
+					"-c",
+					"user.email=dev@example.com",
+					"commit",
+					"-qm",
+					msg,
+				],
+			);
+		}
+		let g = Git::open(root).unwrap();
+		let subjects = |q: &LogQuery| -> Vec<String> {
+			history_query_with(&g, None, q, 0, 10, &RunOptions::default())
+				.unwrap()
+				.0
+				.into_iter()
+				.map(|c| c.subject)
+				.collect()
+		};
+		let q = |text: &str| LogQuery {
+			text: text.into(),
+			..Default::default()
+		};
+		assert_eq!(subjects(&q("fix")), ["fix docs (v2)", "Fix login"]);
+		let case = LogQuery {
+			match_case: true,
+			..q("Fix")
+		};
+		assert_eq!(subjects(&case), ["Fix login"]);
+		let re = LogQuery {
+			regex: true,
+			..q(r"^fix .*\(v[0-9]\)$")
+		};
+		assert_eq!(subjects(&re), ["fix docs (v2)"]);
+		// Without regex, "(v2)" is literal text, not a group.
+		assert_eq!(subjects(&q("(v2)")), ["fix docs (v2)"]);
+		let author = LogQuery {
+			author: Some("alice".into()),
+			..q("docs")
+		};
+		assert_eq!(subjects(&author), ["Add docs"]);
+		let author_regex = LogQuery {
+			author: Some("Al.ce".into()),
+			regex: true,
+			..Default::default()
+		};
+		assert!(subjects(&author_regex).is_empty(), "author stays literal");
+		let paths = LogQuery {
+			paths: vec!["docs".into()],
+			..Default::default()
+		};
+		assert_eq!(subjects(&paths), ["Add docs", "fix docs (v2)"]);
+		let since = LogQuery {
+			since: Some("1 day ago".into()),
+			..Default::default()
+		};
+		assert_eq!(subjects(&since).len(), 3);
+		let future = LogQuery {
+			since: Some("2099-01-01".into()),
+			..Default::default()
+		};
+		assert!(subjects(&future).is_empty());
+		let until = |u: &str| LogQuery {
+			until: Some(u.into()),
+			..Default::default()
+		};
+		assert!(subjects(&until("2000-01-01")).is_empty());
+		assert_eq!(subjects(&until("2099-01-01")).len(), 3);
+		let range = LogQuery {
+			since: Some("2000-01-01".into()),
+			until: Some("2099-01-01 23:59:59".into()),
+			..Default::default()
+		};
+		assert_eq!(subjects(&range).len(), 3);
+		// Several paths combine; parents skip the commits between matches.
+		let two = LogQuery {
+			paths: vec!["a.txt".into(), "docs/c.md".into()],
+			..Default::default()
+		};
+		let (commits, _) =
+			history_query_with(&g, None, &two, 0, 10, &RunOptions::default())
+				.unwrap();
+		let names: Vec<_> =
+			commits.iter().map(|c| c.subject.as_str()).collect();
+		assert_eq!(names, ["Add docs", "Fix login"]);
+		assert_eq!(commits[0].parents, [commits[1].sha.clone()]);
+		// A hash shows just that commit, not its ancestors.
+		let top = run(root, &["rev-parse", "HEAD"]);
+		assert_eq!(subjects(&q(&top[..8])), ["Add docs"]);
+		assert!(LogQuery::default().is_empty());
 	}
 
 	#[test]
@@ -1628,5 +2043,171 @@ mod tests {
 			commit_directory_with(&g, &empty_commit, "", 10, &opts).unwrap();
 		assert!(!trunc);
 		assert_eq!(entries.len(), 0);
+	}
+
+	fn fast_import(root: &Path, stream: &[u8]) {
+		use std::io::Write;
+		let mut child = Command::new("git")
+			.current_dir(root)
+			.args(["fast-import", "--quiet"])
+			.stdin(std::process::Stdio::piped())
+			.spawn()
+			.unwrap();
+		child.stdin.take().unwrap().write_all(stream).unwrap();
+		assert!(child.wait().unwrap().success());
+	}
+
+	#[test]
+	fn non_utf8_author_and_subject_do_not_fail_the_page() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		// Latin-1 bytes with no encoding header: invalid UTF-8 as stored.
+		let mut stream = b"commit refs/heads/main\ncommitter Jos\xe9 <j@x> 1700000000 +0000\ndata 6\ncaf\xe9!\n\n".to_vec();
+		stream.extend_from_slice(b"commit refs/heads/main\ncommitter A <a@x> 1700000060 +0000\ndata 2\nok\n\n");
+		fast_import(root, &stream);
+		// A signature config must not leak gpg text into the records.
+		run(root, &["config", "log.showSignature", "true"]);
+		let git = Git::open(root).unwrap();
+		let h = history(&git, None, "", 0, 10).unwrap();
+		assert_eq!(h.commits.len(), 2);
+		assert_eq!(h.commits[0].subject, "ok");
+		assert_eq!(h.commits[1].author_name, "Jos\u{fffd}");
+		assert_eq!(h.commits[1].subject, "caf\u{fffd}!");
+	}
+
+	#[test]
+	fn refs_snapshot_peels_nested_tags_skips_internal_refs_and_reads_boundaries(
+	) {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		fs::write(root.join("f"), "1").unwrap();
+		let base = commit(root, "base");
+		let tag = |args: &[&str]| {
+			let mut all =
+				vec!["-c", "user.name=A", "-c", "user.email=a@x", "tag"];
+			all.extend_from_slice(args);
+			run(root, &all);
+		};
+		tag(&["-am", "inner", "inner", &base]);
+		tag(&["-am", "outer", "outer", "inner"]);
+		// Internal refs whose commit nothing visible reaches.
+		fs::write(root.join("f"), "2").unwrap();
+		run(root, &["add", "."]);
+		let tree = run(root, &["write-tree"]);
+		let hidden =
+			run(root, &["commit-tree", &tree, "-p", &base, "-m", "internal"]);
+		run(root, &["update-ref", "refs/stash", &hidden]);
+		run(root, &["update-ref", "refs/notes/commits", &hidden]);
+		run(root, &["reset", "-q", "--hard"]);
+
+		let git = Git::open(root).unwrap();
+		let opts = RunOptions::default();
+		let snap = refs_with(&git, &opts).unwrap();
+		let outer = snap.refs.iter().find(|r| r.name == "refs/tags/outer");
+		assert_eq!(outer.map(|r| r.sha.as_str()), Some(base.as_str()));
+		assert!(!snap.detached);
+		assert!(snap.shallow.is_empty());
+		assert_eq!(snap.tips(), vec![base.clone()]);
+		let (commits, more) =
+			log_from_tips_with(&git, &snap.tips(), 0, 10, &opts).unwrap();
+		assert!(!more);
+		assert_eq!(commits.len(), 1);
+		let h = history(&git, None, "", 0, 10).unwrap();
+		assert!(h.commits.iter().all(|c| c.sha != hidden), "stash walked");
+		let (by_author, _) = history_by_author(&git, "A", 0, 10).unwrap();
+		assert!(by_author.iter().all(|c| c.sha != hidden));
+
+		run(root, &["checkout", "-q", "--detach", &base]);
+		assert!(refs_with(&git, &opts).unwrap().detached);
+		run(root, &["checkout", "-q", "main"]);
+
+		// A shallow clone records its cut-off commits.
+		fs::write(root.join("f"), "3").unwrap();
+		commit(root, "tip");
+		let clone = tempfile::tempdir().unwrap();
+		let url = format!("file://{}", root.display());
+		run(clone.path(), &["clone", "-q", "--depth", "1", &url, "c"]);
+		let shallow = Git::open(&clone.path().join("c")).unwrap();
+		let snap = refs_with(&shallow, &opts).unwrap();
+		assert_eq!(snap.shallow, vec![snap.head.clone().unwrap()]);
+	}
+
+	#[test]
+	fn preview_for_a_listed_change_matches_the_listing_preview() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		fs::write(root.join("keep.txt"), "a\n").unwrap();
+		fs::write(root.join("gone.txt"), "old\n").unwrap();
+		let base = commit(root, "base");
+		fs::write(root.join("keep.txt"), "a\nb\n").unwrap();
+		fs::remove_file(root.join("gone.txt")).unwrap();
+		fs::write(root.join("new.txt"), "fresh\n").unwrap();
+		run(root, &["add", "-A"]);
+		let tip = commit(root, "change");
+		let git = Git::at_known_root(root.to_path_buf());
+		let opts = RunOptions::default();
+		for source in [
+			GitSource::Commit(tip.clone()),
+			GitSource::Range(base.clone(), tip.clone()),
+		] {
+			let parents = [base.clone()];
+			let parents =
+				matches!(source, GitSource::Commit(_)).then_some(&parents[..]);
+			let files =
+				gitsrc::list_changed_paths_with(&git, &source, &opts).unwrap();
+			assert_eq!(files.len(), 3);
+			for (path, change) in files {
+				let listed =
+					git_preview_with(&git, &source, &path, &opts).unwrap();
+				let known = git_preview_for(
+					&git,
+					&source,
+					&path,
+					change.unwrap(),
+					parents,
+					&opts,
+				)
+				.unwrap();
+				assert_eq!(listed, known, "{path}");
+			}
+		}
+	}
+
+	#[test]
+	fn log_from_tips_pages_a_frozen_snapshot() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		let mut shas = Vec::new();
+		for i in 0..4 {
+			fs::write(root.join("f"), i.to_string()).unwrap();
+			shas.push(commit(root, &format!("c{i}")));
+		}
+		let git = Git::open(root).unwrap();
+		let opts = RunOptions::default();
+		let tips = refs_with(&git, &opts).unwrap().tips();
+		let (first, more) =
+			log_from_tips_with(&git, &tips, 0, 2, &opts).unwrap();
+		assert!(more);
+		// New commits after page 0 do not shift later pages.
+		fs::write(root.join("f"), "new").unwrap();
+		commit(root, "moved on");
+		let (second, more) =
+			log_from_tips_with(&git, &tips, 2, 2, &opts).unwrap();
+		assert!(!more);
+		let got: Vec<&str> = first
+			.iter()
+			.chain(&second)
+			.map(|c| c.sha.as_str())
+			.collect();
+		let want: Vec<&str> = shas.iter().rev().map(String::as_str).collect();
+		assert_eq!(got, want);
+		assert!(log_from_tips_with(&git, &[], 0, 2, &opts)
+			.unwrap()
+			.0
+			.is_empty());
 	}
 }

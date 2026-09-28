@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # scripts/package_native.sh
-# Strict native installation candidate packager using platform tools.
-# Creates candidate packages with platform-unique checksums:
-#   - macOS: .app bundle with ad-hoc signature, standard DMG with /Applications link, and .tar.gz
-#   - Linux: .tar.gz with executable, .desktop entry, and README with explicit version
-#   - Windows: .zip with .exe and README with explicit version
+# Strict native desktop packager using platform tools. Its outputs are the
+# release assets: release.yml republishes them byte for byte (see
+# docs/native-cross-platform-ci-and-packaging.md). Per-target checksums:
+#   - macOS: snip-sync.app (ad-hoc signed) in snip-sync_mac_<arch>.dmg with an
+#     /Applications link, plus snip-sync_mac_<arch>.app.tar.gz
+#   - Linux: snip-sync-linux-x86_64.tar.gz with executable, .desktop entry, README
+#   Every package also carries licenses/ (third-party font and icon licenses).
+#   - Windows: snip-sync-windows-x64.zip and the Inno Setup installer
+#     snip-sync-windows-setup.exe (per-user, unsigned)
 #
 # Usage:
 #   scripts/package_native.sh <TARGET_TRIPLE> <OUTPUT_DIR> <BINARY_PATH> <VERSION>
@@ -39,12 +43,39 @@ require_tool() {
     fi
 }
 
-# Darwin candidates always include an ad-hoc signature and a DMG.
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# The Tauri crate stays in the tree for rollback; its icons are the product icons.
+ICON_DIR="$ROOT_DIR/crates/desktop/src-tauri/icons"
+
+# Third-party licenses for what the binary embeds: the OFL covers every Inter
+# and JetBrains Mono face (Regular, SemiBold, Italic, ...), Apache-2.0 the
+# IntelliJ expui icons. scripts/verify_artifacts.py requires exactly this set.
+stage_licenses() {
+    mkdir -p "$1"
+    cp "$ROOT_DIR/crates/desktop-native/assets/fonts/Inter-OFL.txt" "$1/Inter-OFL.txt"
+    cp "$ROOT_DIR/crates/desktop-native/assets/fonts/JetBrainsMono-OFL.txt" "$1/JetBrainsMono-OFL.txt"
+    cp "$ROOT_DIR/crates/desktop-native/assets/icons/LICENSE.txt" "$1/expui-icons-LICENSE.txt"
+    cp "$ROOT_DIR/crates/desktop-native/assets/icons/NOTICE.txt" "$1/expui-icons-NOTICE.txt"
+}
+
+# Darwin always gets an ad-hoc signature and a DMG, Windows always an installer.
 # Missing tools must fail the target instead of omitting that format.
 case "$TARGET" in
     aarch64-apple-darwin|x86_64-apple-darwin)
         require_tool codesign
         require_tool hdiutil
+        ;;
+    x86_64-pc-windows-msvc)
+        # Preinstalled on GitHub's Windows images, but not on PATH.
+        ISCC="$(command -v iscc || true)"
+        if [ -z "$ISCC" ] && [ -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
+            ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+        fi
+        if [ -z "$ISCC" ]; then
+            echo "Error: Inno Setup compiler (ISCC.exe) not found; cannot package target '$TARGET'." >&2
+            exit 1
+        fi
+        require_tool cygpath
         ;;
 esac
 
@@ -52,7 +83,7 @@ esac
 mkdir -p "$OUT_DIR_INPUT"
 OUT_DIR="$(cd "$OUT_DIR_INPUT" && pwd)"
 
-echo "=== Native Candidate Packager ==="
+echo "=== Native Desktop Packager ==="
 echo "Target:     $TARGET"
 echo "Version:    $VERSION"
 echo "Binary:     $BIN_PATH"
@@ -63,7 +94,7 @@ trap 'rm -rf "$STAGE_DIR"' EXIT
 
 case "$TARGET" in
     aarch64-apple-darwin|x86_64-apple-darwin)
-        APP_NAME="snip-desktop-native.app"
+        APP_NAME="snip-sync.app"
         APP_DIR="$STAGE_DIR/$APP_NAME"
         CONTENTS_DIR="$APP_DIR/Contents"
         MACOS_DIR="$CONTENTS_DIR/MacOS"
@@ -73,14 +104,17 @@ case "$TARGET" in
 
         cp "$BIN_PATH" "$MACOS_DIR/snip-desktop-native"
         chmod 755 "$MACOS_DIR/snip-desktop-native"
+        cp "$ICON_DIR/icon.icns" "$RESOURCES_DIR/icon.icns"
+        # Inside Resources so the code signature seals them.
+        stage_licenses "$RESOURCES_DIR/licenses"
 
         # Explicit macOS deployment target requirement (macOS 11.0 Big Sur)
         # Derived from Rust tier 1 Apple Silicon and GPUI Metal backend requirements.
         MIN_OS="11.0"
         if [ "$TARGET" = "aarch64-apple-darwin" ]; then
-            ARCH_LABEL="mac-arm"
+            ARCH_LABEL="mac_arm"
         else
-            ARCH_LABEL="mac-intel"
+            ARCH_LABEL="mac_intel"
         fi
 
         # Generate standard Info.plist
@@ -92,11 +126,13 @@ case "$TARGET" in
     <key>CFBundleExecutable</key>
     <string>snip-desktop-native</string>
     <key>CFBundleIdentifier</key>
-    <string>com.audichuang.snip-desktop-native</string>
+    <string>com.audichuang.snip-sync</string>
     <key>CFBundleName</key>
-    <string>snip-desktop-native</string>
+    <string>snip-sync</string>
     <key>CFBundleDisplayName</key>
-    <string>Snip Sync Native</string>
+    <string>snip-sync</string>
+    <key>CFBundleIconFile</key>
+    <string>icon.icns</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -117,7 +153,7 @@ PLIST
         codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 
         # 1. Tarball containing the .app bundle
-        TAR_OUT="$OUT_DIR/snip-desktop-native-${ARCH_LABEL}.tar.gz"
+        TAR_OUT="$OUT_DIR/snip-sync_${ARCH_LABEL}.app.tar.gz"
         tar -czf "$TAR_OUT" -C "$STAGE_DIR" "$APP_NAME"
         echo "Created archive: $TAR_OUT"
 
@@ -127,21 +163,22 @@ PLIST
         cp -R "$APP_DIR" "$DMG_STAGE/"
         ln -s /Applications "$DMG_STAGE/Applications"
 
-        DMG_OUT="$OUT_DIR/snip-desktop-native-${ARCH_LABEL}.dmg"
+        DMG_OUT="$OUT_DIR/snip-sync_${ARCH_LABEL}.dmg"
         echo "Creating DMG volume from stage directory..."
-        hdiutil create -volname "snip-desktop-native" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_OUT"
+        hdiutil create -volname "snip-sync" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_OUT"
         echo "Created DMG: $DMG_OUT"
         ;;
 
     x86_64-pc-windows-msvc)
-        ZIP_OUT="$OUT_DIR/snip-desktop-native-windows-x64.zip"
-        PKG_DIR="$STAGE_DIR/snip-desktop-native"
+        ZIP_OUT="$OUT_DIR/snip-sync-windows-x64.zip"
+        PKG_DIR="$STAGE_DIR/snip-sync"
         mkdir -p "$PKG_DIR"
 
         cp "$BIN_PATH" "$PKG_DIR/snip-desktop-native.exe"
+        stage_licenses "$PKG_DIR/licenses"
 
         cat > "$PKG_DIR/README.txt" <<README
-snip-desktop-native (Candidate Artifact)
+snip-sync ${VERSION} (native desktop app, unsigned)
 Version: ${VERSION}
 Target: ${TARGET}
 
@@ -160,20 +197,34 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.write(f, f.relative_to(src.parent))
 " "$ZIP_OUT" "$PKG_DIR"
         echo "Created package: $ZIP_OUT"
+
+        # Per-user installer. MSYS_NO_PATHCONV keeps Git Bash from rewriting
+        # the /D, /O and /F switches; paths are converted explicitly instead.
+        MSYS_NO_PATHCONV=1 "$ISCC" /Qp \
+            "/DAppVersion=${VERSION}" \
+            "/DSourceExe=$(cygpath -w "$PKG_DIR/snip-desktop-native.exe")" \
+            "/DIconFile=$(cygpath -w "$ICON_DIR/icon.ico")" \
+            "/DLicenseDir=$(cygpath -w "$PKG_DIR/licenses")" \
+            "/O$(cygpath -w "$OUT_DIR")" \
+            "/Fsnip-sync-windows-setup" \
+            "$(cygpath -w "$ROOT_DIR/crates/desktop-native/packaging/windows/snip-sync.iss")"
+        test -s "$OUT_DIR/snip-sync-windows-setup.exe"
+        echo "Created installer: $OUT_DIR/snip-sync-windows-setup.exe"
         ;;
 
     x86_64-unknown-linux-gnu)
-        TAR_OUT="$OUT_DIR/snip-desktop-native-linux-x86_64.tar.gz"
-        PKG_NAME="snip-desktop-native-${VERSION}"
+        TAR_OUT="$OUT_DIR/snip-sync-linux-x86_64.tar.gz"
+        PKG_NAME="snip-sync-${VERSION}"
         PKG_DIR="$STAGE_DIR/$PKG_NAME"
         mkdir -p "$PKG_DIR/bin" "$PKG_DIR/share/applications"
 
         cp "$BIN_PATH" "$PKG_DIR/bin/snip-desktop-native"
         chmod 755 "$PKG_DIR/bin/snip-desktop-native"
+        stage_licenses "$PKG_DIR/licenses"
 
-        cat > "$PKG_DIR/share/applications/snip-desktop-native.desktop" <<DESKTOP
+        cat > "$PKG_DIR/share/applications/snip-sync.desktop" <<DESKTOP
 [Desktop Entry]
-Name=Snip Sync Native
+Name=snip-sync
 Comment=Native Git Workbench & Snippet Synchronizer
 Exec=snip-desktop-native %u
 Terminal=false
@@ -183,7 +234,7 @@ Version=1.0
 DESKTOP
 
         cat > "$PKG_DIR/README.txt" <<README
-snip-desktop-native (Candidate Artifact)
+snip-sync ${VERSION} (native desktop app)
 Version: ${VERSION}
 Target: ${TARGET}
 

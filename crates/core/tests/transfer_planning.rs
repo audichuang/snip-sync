@@ -865,6 +865,64 @@ fn test_oldercommit_exactcontent_and_deletion_semantics() {
 	assert!(export_plan.payload.contains("historical deleted body"));
 }
 
+/// A deleted file reads like gitsrc: every parent in order, and the
+/// deleted marker when no parent has decodable text (binary included).
+#[test]
+fn test_commit_deletions_read_every_parent_and_mark_binary() {
+	let src = TestRepo::new("merge-deletions");
+	src.write("base.txt", "base\n");
+	src.commit("base");
+	src.git(&["checkout", "-q", "-b", "side"]);
+	src.write("side_only.txt", "only on side\n");
+	fs::write(src.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+	src.commit("side");
+	src.git(&["checkout", "-q", "-"]);
+	src.git(&["merge", "-q", "--no-ff", "--no-commit", "side"]);
+	src.git(&["rm", "-q", "-f", "side_only.txt", "blob.bin"]);
+	let merge = src.commit("merge drops side files");
+
+	let item = |path: &str, source: SourceKind| ExportItem {
+		root: src.canonical_id(),
+		relative_path: path.to_string(),
+		source,
+		change_type: Some(ChangeType::Deleted),
+	};
+	let commit = || SourceKind::Commit { rev: merge.clone() };
+	let selection = ExportSelection::new(
+		vec![src.path().to_path_buf()],
+		None,
+		vec![item("side_only.txt", commit()), item("blob.bin", commit())],
+	)
+	.unwrap();
+	let plan = plan_export(&selection, &Settings::default(), None).unwrap();
+	assert!(plan.payload.contains("only on side"), "{}", plan.payload);
+	assert_eq!(plan.files.len(), 2, "{}", plan.payload);
+	assert_eq!(plan.files[1].path, "blob.bin");
+	assert_eq!(
+		plan.files[1].content.as_deref(),
+		Some(gitsrc::DELETED_FILE_MARKER)
+	);
+
+	// A staged binary deletion is the marker too.
+	src.git(&["rm", "-q", "base.txt"]);
+	fs::write(src.path().join("b2.bin"), [0u8, 200]).unwrap();
+	src.git(&["add", "b2.bin"]);
+	src.commit("add b2");
+	src.git(&["rm", "-q", "-f", "b2.bin"]);
+	let selection = ExportSelection::new(
+		vec![src.path().to_path_buf()],
+		None,
+		vec![item("b2.bin", SourceKind::Staged)],
+	)
+	.unwrap();
+	let plan = plan_export(&selection, &Settings::default(), None).unwrap();
+	assert_eq!(plan.files.len(), 1, "{}", plan.payload);
+	assert_eq!(
+		plan.files[0].content.as_deref(),
+		Some(gitsrc::DELETED_FILE_MARKER)
+	);
+}
+
 // ---------------------------------------------------------------------------
 // 15. Outside path and traversal rejected before IO
 // ---------------------------------------------------------------------------
@@ -1905,7 +1963,8 @@ fn test_admitted_fifo_rejected_without_blocking() {
 	});
 
 	let res = rx
-		.recv_timeout(std::time::Duration::from_secs(2))
+		// A blocked FIFO read never returns; 30s only rules out a busy host.
+		.recv_timeout(std::time::Duration::from_secs(30))
 		.expect("plan_export blocked on FIFO!");
 	let _ = handle.join();
 	let _ = fs::remove_file(&fifo_path);
@@ -1975,7 +2034,8 @@ fn test_filtered_fifo_not_read_or_rejected() {
 	});
 
 	let res = rx
-		.recv_timeout(std::time::Duration::from_secs(2))
+		// A blocked FIFO read never returns; 30s only rules out a busy host.
+		.recv_timeout(std::time::Duration::from_secs(30))
 		.expect("plan_export blocked on filtered FIFO!");
 	let _ = handle.join();
 	let _ = fs::remove_file(&fifo_path);

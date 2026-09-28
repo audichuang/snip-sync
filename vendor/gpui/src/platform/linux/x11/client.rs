@@ -593,10 +593,17 @@ impl X11Client {
                     Ok(None) => {
                         break;
                     }
-                    Err(err) => {
-                        let err = handle_connection_error(err);
+                    // SNIP PATCH: a parse error is per event; anything else means
+                    // xcb's sticky connection error is set (e.g. the server went
+                    // away) and the fd stays readable forever. Returning the error
+                    // ends `event_loop.run`, so the app quits instead of spinning.
+                    Err(ConnectionError::ParseError(err)) => {
                         log::warn!("error while polling for X11 events: {err:?}");
                         break;
+                    }
+                    Err(err) => {
+                        log::error!("X11 connection lost, stopping the event loop: {err:?}");
+                        return Err(err.into());
                     }
                 }
             }

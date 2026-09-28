@@ -70,23 +70,33 @@ SUPPORTED_TARGETS: Dict[str, Dict[str, Any]] = {
 # Documented package_native outputs. A targeted audit must see this set and nothing else.
 CANDIDATE_FILES: Dict[str, Tuple[str, ...]] = {
     "aarch64-apple-darwin": (
-        "snip-desktop-native-mac-arm.tar.gz",
-        "snip-desktop-native-mac-arm.dmg",
+        "snip-sync_mac_arm.app.tar.gz",
+        "snip-sync_mac_arm.dmg",
     ),
     "x86_64-apple-darwin": (
-        "snip-desktop-native-mac-intel.tar.gz",
-        "snip-desktop-native-mac-intel.dmg",
+        "snip-sync_mac_intel.app.tar.gz",
+        "snip-sync_mac_intel.dmg",
     ),
-    "x86_64-unknown-linux-gnu": ("snip-desktop-native-linux-x86_64.tar.gz",),
-    "x86_64-pc-windows-msvc": ("snip-desktop-native-windows-x64.zip",),
+    "x86_64-unknown-linux-gnu": ("snip-sync-linux-x86_64.tar.gz",),
+    "x86_64-pc-windows-msvc": ("snip-sync-windows-x64.zip", "snip-sync-windows-setup.exe"),
 }
 
-MAC_BINARY = "snip-desktop-native.app/Contents/MacOS/snip-desktop-native"
-MAC_PLIST = "snip-desktop-native.app/Contents/Info.plist"
-WIN_BINARY = "snip-desktop-native/snip-desktop-native.exe"
-WIN_README = "snip-desktop-native/README.txt"
-LINUX_PKG_PREFIX = "snip-desktop-native-"
-DESKTOP_FILE_NAME = "snip-desktop-native.desktop"
+MAC_BINARY = "snip-sync.app/Contents/MacOS/snip-desktop-native"
+MAC_PLIST = "snip-sync.app/Contents/Info.plist"
+WIN_BINARY = "snip-sync/snip-desktop-native.exe"
+WIN_README = "snip-sync/README.txt"
+LINUX_PKG_PREFIX = "snip-sync-"
+DESKTOP_FILE_NAME = "snip-sync.desktop"
+# Third-party license texts staged by package_native.sh (stage_licenses).
+LICENSES_DIR_NAME = "licenses"
+LICENSE_FILES = (
+    "Inter-OFL.txt",
+    "JetBrainsMono-OFL.txt",
+    "expui-icons-LICENSE.txt",
+    "expui-icons-NOTICE.txt",
+)
+MAC_LICENSES_DIR = "snip-sync.app/Contents/Resources/licenses"
+WIN_LICENSES_DIR = "snip-sync/licenses"
 
 # Bounds for archive inspection. Large enough for a real universal binary's
 # slice headers, small enough that a hostile member cannot force an unbounded read.
@@ -1055,6 +1065,29 @@ def _bind_package_members(
     return bound
 
 
+def _licenses_dir(bound: Dict[str, str]) -> str:
+    if bound["os"] == "macos":
+        return MAC_LICENSES_DIR
+    if bound["os"] == "linux":
+        return f"{bound['package']}/{LICENSES_DIR_NAME}"
+    return WIN_LICENSES_DIR
+
+
+def _require_licenses(sizes: Dict[str, int], lic_dir: str, where: str) -> None:
+    """Require exactly LICENSE_FILES, non-empty, as the only files in any licenses/ folder."""
+    found = sorted(
+        name for name in sizes if LICENSES_DIR_NAME in name.split("/")[:-1]
+    )
+    wanted = sorted(f"{lic_dir}/{name}" for name in LICENSE_FILES)
+    if found != wanted:
+        raise VerificationError(
+            f"License files in {where} must be exactly {wanted}; found {found}"
+        )
+    empty = [name for name in found if sizes[name] <= 0]
+    if empty:
+        raise VerificationError(f"Empty license files in {where}: {empty}")
+
+
 def _read_exact(stream: BinaryIO, size: int, label: str) -> bytes:
     if size < 0 or size > MAX_METADATA_BYTES:
         raise VerificationError(f"{label} exceeds {MAX_METADATA_BYTES} byte metadata bound")
@@ -1106,6 +1139,15 @@ def verify_macos_bundle(
     bin_info = detect_binary_format_and_arch(exec_path)
     _require_format(bin_info, "macho", str(exec_path))
     _require_arch(bin_info, expected_arch, str(exec_path))
+    _require_licenses(
+        {
+            f"{MAC_LICENSES_DIR}/{f.name}": f.stat().st_size
+            for f in (contents / "Resources" / LICENSES_DIR_NAME).glob("*")
+            if not f.is_symlink() and f.is_file()
+        },
+        MAC_LICENSES_DIR,
+        str(bundle_path),
+    )
 
     # On macOS: verify ad-hoc code signature
     signature_info = {"verified": False, "adhoc": False}
@@ -1353,6 +1395,11 @@ def verify_tar_archive(
         bin_info = _inspect_tar_member(tf, target_member)
         _require_format(bin_info, expected_format, str(tar_path))
         _require_arch(bin_info, expected_arch, str(tar_path))
+        _require_licenses(
+            {name: m.size for name, m in by_name.items()},
+            _licenses_dir(bound),
+            f"archive {tar_path}",
+        )
 
     return {
         "archive": str(tar_path),
@@ -1485,6 +1532,11 @@ def verify_zip_archive(
                 bin_info = inspect_binary_stream(handle, target_info.file_size)
             _require_format(bin_info, expected_format, str(zip_path))
             _require_arch(bin_info, expected_arch, str(zip_path))
+            _require_licenses(
+                {name: i.file_size for name, i in by_name.items()},
+                _licenses_dir(bound),
+                f"zip {zip_path}",
+            )
 
     return {
         "archive": str(zip_path),
@@ -1579,7 +1631,25 @@ def _verify_candidate_file(
             target=target,
         )
         return {"type": "zip", **info}
+    if path.name.endswith("-setup.exe"):
+        return {"type": "windows_installer", **verify_windows_installer(path)}
     raise VerificationError(f"No verifier for candidate file {path.name}")
+
+
+def verify_windows_installer(path: Path) -> Dict[str, Any]:
+    """
+    Structural check of the Inno Setup installer: a well-formed PE of plausible size.
+    The setup stub is a 32-bit x86 PE regardless of the payload, so no arch check.
+    The payload is bound to the packaged exe by the CI install-and-hash step.
+    """
+    if path.is_symlink() or not path.is_file():
+        raise VerificationError(f"Installer not found: {path}")
+    size = path.stat().st_size
+    if size < 1024 * 1024:
+        raise VerificationError(f"Installer suspiciously small ({size} bytes): {path}")
+    bin_info = detect_binary_format_and_arch(path)
+    _require_format(bin_info, "pe", str(path))
+    return {"installer": str(path), "format": bin_info["format"], "stub_arch": bin_info["arch"]}
 
 
 def audit_artifact_directory(

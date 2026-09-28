@@ -3,11 +3,13 @@
 //! Reads go through `snip-core` (`browser::history`, `gitsrc`, `graph`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 use crate::arm_cancel;
 
 use crate::graph_view;
 use crate::i18n::Msg;
+use crate::multi_log;
 use crate::reader::{fnv1a, Preview, PreviewSource};
 use crate::syntax::Language;
 use crate::{e2e_on, WorkbenchModel, WorkbenchTab};
@@ -17,6 +19,9 @@ use snip_core::gitrun::RunOptions;
 use snip_core::gitsrc::{self, Git, GitSource};
 use snip_core::graph::{GraphCheckpoint, GraphLayout, MAX_SHA_LEN};
 
+/// Most commits of one multi-selection whose changed files are listed
+/// (one listing each).
+pub const MAX_SELECTION_READS: usize = 100;
 /// Files listed for one commit or compare; more are counted, not kept.
 pub const MAX_COMMIT_FILES: usize = 5_000;
 /// Rows shown in the commit tree at once.
@@ -52,10 +57,236 @@ const GRAPH_METADATA_RESERVE: usize = 4
 	+ std::mem::size_of::<Msg>()
 	+ 2 * std::mem::size_of::<String>();
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogSearch {
-	pub query: String,
-	pub author: bool,
+pub use browser::LogQuery;
+
+/// Pages the log keeps at once. Scrolling past either end loads the next
+/// page and evicts the farthest one; evicted pages are read back from their
+/// graph checkpoints.
+pub const MAX_WINDOW_PAGES: usize = 10;
+/// Commit message bytes kept for the details pane.
+pub const MAX_DETAILS_MESSAGE: usize = 16 * 1024;
+/// Branches listed as containing the selected commit; more are counted.
+pub const MAX_CONTAINING_BRANCHES: usize = 20;
+/// Longest `user.email` kept to mark the user's own commits.
+const MAX_USER_EMAIL: usize = 256;
+
+/// How a history read changes the loaded window of pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageLoad {
+	/// A fresh window holding only this page.
+	Replace(usize),
+	/// The page after the window, evicting the first page when full.
+	Next,
+	/// The page before the window, evicting the last page when full.
+	Prev,
+}
+
+/// The window after `load` brings in `page` (the fetched page's commits and
+/// whether more follow it): `(commits, first, last, has_more)`. Every page but
+/// the last is exactly `page_size` commits, so eviction is by whole pages.
+#[allow(clippy::too_many_arguments)]
+fn merge_window(
+	window: &[CommitSummary],
+	first: usize,
+	last: usize,
+	window_more: bool,
+	load: PageLoad,
+	page: Vec<CommitSummary>,
+	page_more: bool,
+	page_size: usize,
+) -> (Vec<CommitSummary>, usize, usize, bool) {
+	match load {
+		PageLoad::Replace(p) => (page, p, p, page_more),
+		PageLoad::Next => {
+			let mut out = window.to_vec();
+			out.extend(page);
+			let mut first = first;
+			let last = last + 1;
+			if last - first + 1 > MAX_WINDOW_PAGES {
+				out.drain(..page_size.min(out.len()));
+				first += 1;
+			}
+			(out, first, last, page_more)
+		}
+		PageLoad::Prev => {
+			let first = first.saturating_sub(1);
+			let mut out = page;
+			out.extend_from_slice(window);
+			let (mut last, mut more) = (last, window_more);
+			if last - first + 1 > MAX_WINDOW_PAGES {
+				last -= 1;
+				out.truncate(MAX_WINDOW_PAGES * page_size);
+				more = true;
+			}
+			(out, first, last, more)
+		}
+	}
+}
+
+/// Per commit: reachable from `seeds` (HEAD, or the previous window's
+/// marks). One pass, since topological order lists children first.
+pub fn mark_on_head(
+	commits: &[CommitSummary],
+	seeds: impl IntoIterator<Item = String>,
+) -> Vec<bool> {
+	let mut reach: HashSet<String> = seeds.into_iter().collect();
+	commits
+		.iter()
+		.map(|c| {
+			let on = reach.contains(&c.sha);
+			if on {
+				reach.extend(c.parents.iter().cloned());
+			}
+			on
+		})
+		.collect()
+}
+
+/// Paths the Paths chip combines at most.
+pub const MAX_LOG_PATHS: usize = 32;
+
+/// A typed path as a repository-relative pathspec: trimmed, `/`-separated.
+pub fn clean_log_path(path: &str) -> String {
+	path.trim().replace('\\', "/").trim_matches('/').to_string()
+}
+
+/// The Date chip's custom range as `--since` / `--until` values covering
+/// both whole days; `None` when a non-empty field is not `YYYY-MM-DD` or
+/// the range ends before it starts.
+pub fn date_range(
+	since: &str,
+	until: &str,
+) -> Option<(Option<String>, Option<String>)> {
+	let day = |s: &str| -> Option<Option<chrono::NaiveDate>> {
+		if s.is_empty() {
+			Some(None)
+		} else {
+			chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+				.ok()
+				.map(Some)
+		}
+	};
+	let (from, to) = (day(since)?, day(until)?);
+	if let (Some(a), Some(b)) = (from, to) {
+		if b < a {
+			return None;
+		}
+	}
+	Some((
+		from.map(|d| format!("{d} 00:00:00")),
+		to.map(|d| format!("{d} 23:59:59")),
+	))
+}
+
+/// What the details pane shows beyond the log row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitDetails {
+	pub sha: String,
+	pub parents: Vec<String>,
+	pub message: String,
+	pub author: String,
+	pub author_email: String,
+	pub author_date: String,
+	pub committer: String,
+	pub committer_email: String,
+	pub commit_date: String,
+	pub branches: Vec<String>,
+	/// More branches contain the commit than `branches` lists.
+	pub branches_more: bool,
+}
+
+fn clip_utf8(mut s: String, max: usize) -> String {
+	if s.len() > max {
+		let mut end = max;
+		while !s.is_char_boundary(end) {
+			end -= 1;
+		}
+		s.truncate(end);
+		s.push('…');
+	}
+	s.into_boxed_str().into_string()
+}
+
+fn read_commit_details(
+	git: &Git,
+	sha: &str,
+	opts: &RunOptions,
+) -> Result<CommitDetails, String> {
+	let out = git
+		.run_with(
+			&[
+				"show",
+				"-s",
+				"--no-show-signature",
+				"--encoding=UTF-8",
+				"--format=%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B",
+				sha,
+				"--",
+			],
+			opts,
+		)
+		.map_err(|e| e.to_string())?;
+	let text = String::from_utf8_lossy(&out.stdout);
+	let mut f = text.splitn(8, '\0');
+	let parents: Vec<String> = f
+		.next()
+		.unwrap_or_default()
+		.split_whitespace()
+		.take(64)
+		.map(str::to_string)
+		.collect();
+	let author = f.next().unwrap_or_default().to_string();
+	let author_email = f.next().unwrap_or_default().to_string();
+	let author_date = f.next().unwrap_or_default().to_string();
+	let committer = f.next().unwrap_or_default().to_string();
+	let committer_email = f.next().unwrap_or_default().to_string();
+	let commit_date = f.next().unwrap_or_default().to_string();
+	let message = f.next().unwrap_or_default().trim().to_string();
+	// Best effort: a failure here only hides the branch list.
+	let contains = git
+		.run_with(
+			&[
+				"for-each-ref",
+				&format!("--count={}", MAX_CONTAINING_BRANCHES + 1),
+				"--contains",
+				sha,
+				"--format=%(refname:short)",
+				"refs/heads",
+				"refs/remotes",
+			],
+			opts,
+		)
+		.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+		.unwrap_or_default();
+	let mut branches: Vec<String> = contains
+		.lines()
+		.filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+		.map(|l| clip_utf8(l.to_string(), 200))
+		.collect();
+	let branches_more = branches.len() > MAX_CONTAINING_BRANCHES;
+	branches.truncate(MAX_CONTAINING_BRANCHES);
+	Ok(CommitDetails {
+		sha: sha.to_string(),
+		parents,
+		message: clip_utf8(message, MAX_DETAILS_MESSAGE),
+		author: clip_utf8(author, 200),
+		author_email: clip_utf8(author_email, 200),
+		author_date: clip_utf8(author_date, 64),
+		committer: clip_utf8(committer, 200),
+		committer_email: clip_utf8(committer_email, 200),
+		commit_date: clip_utf8(commit_date, 64),
+		branches,
+		branches_more,
+	})
+}
+
+/// `user.email`, when set, to mark the user's own commits.
+fn read_user_email(git: &Git, opts: &RunOptions) -> Option<String> {
+	let out = git
+		.run_with(&["config", "--get", "user.email"], opts)
+		.ok()?;
+	let email = String::from_utf8_lossy(&out.stdout).trim().to_string();
+	(!email.is_empty() && email.len() <= MAX_USER_EMAIL).then_some(email)
 }
 
 /// Lazily listed tree of one commit (no checkout).
@@ -588,6 +819,185 @@ pub fn side_only(commits: &[CommitSummary], merge: &str) -> HashSet<String> {
 		.collect()
 }
 
+/// Commits one `git log` fetches; graph pages are sliced from this window,
+/// so paging does not re-run the topological sort per page.
+pub const HISTORY_WINDOW: usize = 500;
+
+/// One graph walk: the refs and HEAD read when page 0 loaded (kept in the
+/// model's `refs` / `head_sha`), what else that snapshot knew, and the
+/// window of commits pages are sliced from. Later pages walk the snapshot's
+/// tips, so refs moving meanwhile cannot duplicate or skip commits.
+#[derive(Clone, Debug, Default)]
+pub struct HistoryWalk {
+	ref_filter: Option<String>,
+	/// The ref filter's commit, resolved once for the whole walk.
+	filter_tip: Option<String>,
+	detached: bool,
+	shallow: Vec<String>,
+	start: usize,
+	window: Vec<CommitSummary>,
+	more: bool,
+}
+
+impl HistoryWalk {
+	/// The page at `skip`, when the window holds all of it.
+	fn page(
+		&self,
+		skip: usize,
+		size: usize,
+	) -> Option<(Vec<CommitSummary>, bool)> {
+		let from = skip.checked_sub(self.start)?;
+		let end = from.checked_add(size)?;
+		let len = self.window.len();
+		if end > len && self.more {
+			return None;
+		}
+		let rows = self.window.get(from.min(len)..end.min(len))?.to_vec();
+		Some((rows, end < len || self.more))
+	}
+
+	fn retained_bytes(&self) -> usize {
+		let mut bytes = graph_view::vec_bytes(&self.window)
+			.saturating_add(graph_view::vec_bytes(&self.shallow));
+		for value in self
+			.ref_filter
+			.iter()
+			.chain(self.filter_tip.iter())
+			.chain(self.shallow.iter())
+		{
+			bytes = bytes.saturating_add(value.capacity());
+		}
+		for commit in &self.window {
+			bytes = bytes.saturating_add(commit_bytes(commit));
+		}
+		bytes
+	}
+}
+
+pub(crate) fn commit_bytes(commit: &CommitSummary) -> usize {
+	let mut bytes = commit
+		.sha
+		.capacity()
+		.saturating_add(commit.author_name.capacity())
+		.saturating_add(commit.author_email.capacity())
+		.saturating_add(commit.author_date.capacity())
+		.saturating_add(commit.subject.capacity())
+		.saturating_add(graph_view::vec_bytes(&commit.parents));
+	for parent in &commit.parents {
+		bytes = bytes.saturating_add(parent.capacity());
+	}
+	bytes
+}
+
+/// Reads one graph page. Page 0 (no `walk`) snapshots refs, HEAD and the
+/// ref filter's commit; later pages reuse that snapshot, and need no Git at
+/// all while the window already holds them.
+fn read_graph_page(
+	repo_root: &std::path::Path,
+	walk: Option<(HistoryWalk, Vec<browser::GitReference>, Option<String>)>,
+	ref_filter: Option<String>,
+	skip: usize,
+	size: usize,
+	opts: &RunOptions,
+) -> Result<(browser::RepositoryHistory, HistoryWalk), String> {
+	let mut git = None;
+	let open = || -> Result<Git, String> {
+		Git::open_with(repo_root, opts).map_err(|e| e.to_string())
+	};
+	let (mut walk, refs, head) = match walk {
+		Some(reused) if reused.0.ref_filter == ref_filter => reused,
+		_ => {
+			let g = open()?;
+			let snap =
+				browser::refs_with(&g, opts).map_err(|e| e.to_string())?;
+			let filter_tip =
+				match ref_filter.as_deref().filter(|r| !r.is_empty()) {
+					Some(r) => Some(
+						g.resolve_commit_with(r, opts)
+							.map_err(|e| e.to_string())?,
+					),
+					None => None,
+				};
+			git = Some(g);
+			let walk = HistoryWalk {
+				ref_filter,
+				filter_tip,
+				detached: snap.detached,
+				shallow: snap.shallow,
+				more: true,
+				..Default::default()
+			};
+			(walk, snap.refs, snap.head)
+		}
+	};
+	if walk.page(skip, size).is_none() {
+		let git = match git {
+			Some(g) => g,
+			None => open()?,
+		};
+		let tips = match &walk.filter_tip {
+			Some(tip) => vec![tip.clone()],
+			None => browser::RefSnapshot {
+				refs: refs.clone(),
+				head: head.clone(),
+				..Default::default()
+			}
+			.tips(),
+		};
+		let mut start = skip / HISTORY_WINDOW * HISTORY_WINDOW;
+		if skip.saturating_add(size) > start.saturating_add(HISTORY_WINDOW) {
+			start = skip;
+		}
+		let (window, more) = browser::log_from_tips_with(
+			&git,
+			&tips,
+			start,
+			HISTORY_WINDOW.max(size),
+			opts,
+		)
+		.map_err(|e| e.to_string())?;
+		walk.start = start;
+		walk.window = window;
+		walk.more = more;
+	}
+	let (commits, has_more) = walk.page(skip, size).unwrap_or_default();
+	Ok((
+		browser::RepositoryHistory {
+			root: String::new(),
+			commits,
+			refs,
+			head,
+			has_more,
+		},
+		walk,
+	))
+}
+
+/// One path's preview. The change type comes from our own listing and a log
+/// row carries the commit's full SHA and parents, so the preview neither
+/// re-lists the source nor re-resolves the commit.
+fn read_preview(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+	change: Option<snip_core::format::ChangeType>,
+	parents: Option<&[String]>,
+	opts: &RunOptions,
+) -> Result<browser::SourcePreview, String> {
+	let preview = match change {
+		Some(change) => {
+			browser::git_preview_for(git, source, path, change, parents, opts)
+		}
+		None => browser::git_preview_with(git, source, path, opts),
+	};
+	preview
+		.map(|p| browser::SourcePreview {
+			content: p.content,
+			patch: p.patch,
+		})
+		.map_err(|e| e.to_string())
+}
+
 /// A complete replacement page. Construction only borrows the current cache;
 /// failure cannot attach old rails/checkpoints to new commits or move the page.
 struct PreparedHistory {
@@ -601,9 +1011,15 @@ struct PreparedHistory {
 	collapsed_merges: Vec<String>,
 	hidden_commits: Vec<String>,
 	active_ref_filter: Option<String>,
-	log_search: Option<LogSearch>,
+	log_search: Option<LogQuery>,
+	/// First and last page of the loaded window.
+	first_page: usize,
 	commit_page: usize,
 	history_has_more: bool,
+	/// Per commit: reachable from HEAD (IntelliJ tints those rows).
+	on_head: Vec<bool>,
+	/// The graph walk this page belongs to; `None` for search results.
+	walk: Option<HistoryWalk>,
 }
 
 #[derive(Debug)]
@@ -613,13 +1029,34 @@ enum GraphAdmissionError {
 }
 
 impl PreparedHistory {
+	#[cfg(test)]
 	fn prepare(
 		history: browser::RepositoryHistory,
 		page: usize,
 		checkpoints: &[Option<GraphCheckpoint>],
 		collapsed_merges: Vec<String>,
 		active_ref_filter: Option<String>,
-		log_search: Option<LogSearch>,
+		log_search: Option<LogQuery>,
+	) -> Result<Self, GraphAdmissionError> {
+		Self::prepare_with(
+			history,
+			None,
+			(page, page),
+			checkpoints,
+			collapsed_merges,
+			active_ref_filter,
+			log_search,
+		)
+	}
+
+	fn prepare_with(
+		history: browser::RepositoryHistory,
+		walk: Option<HistoryWalk>,
+		(first, page): (usize, usize),
+		checkpoints: &[Option<GraphCheckpoint>],
+		collapsed_merges: Vec<String>,
+		active_ref_filter: Option<String>,
+		log_search: Option<LogQuery>,
 	) -> Result<Self, GraphAdmissionError> {
 		let mut candidate = Self {
 			commits: history.commits,
@@ -631,8 +1068,11 @@ impl PreparedHistory {
 			hidden_commits: Vec::new(),
 			active_ref_filter,
 			log_search,
+			first_page: first,
 			commit_page: page,
 			history_has_more: history.has_more,
+			on_head: Vec::new(),
+			walk,
 		};
 		candidate.check_budget()?;
 		if candidate.commits.iter().any(|commit| {
@@ -651,20 +1091,63 @@ impl PreparedHistory {
 				"Commit ID exceeds graph limit".into(),
 			));
 		}
-		if candidate.log_search.is_none() {
-			let checkpoint = checkpoints.get(page).and_then(Option::as_ref);
-			if page > 0 && checkpoint.is_none() {
-				return Err(GraphAdmissionError::Layout(
-					"Missing graph page checkpoint".into(),
-				));
-			}
-			let full = graph_view::layout_commits_paged(
+		{
+			// Every graph page leaves a checkpoint; none means the previous
+			// page fell back to a plain list, so this one continues as one.
+			let checkpoint = checkpoints.get(first).and_then(Option::as_ref);
+			let (detached, shallow) = candidate
+				.walk
+				.as_ref()
+				.map(|w| {
+					(
+						w.detached,
+						w.shallow.iter().cloned().collect::<HashSet<String>>(),
+					)
+				})
+				.unwrap_or_default();
+			let layout_refs = graph_view::page_refs(
 				&candidate.commits,
 				&candidate.refs,
 				candidate.head_sha.as_deref(),
-				checkpoint,
-			)
-			.map_err(GraphAdmissionError::Layout)?;
+				detached,
+			);
+			let layout = |commits: &[CommitSummary],
+			              filtered: HashSet<String>| {
+				graph_view::layout_page(
+					commits,
+					&layout_refs,
+					candidate.head_sha.as_deref(),
+					checkpoint,
+					first > 0,
+					filtered,
+					shallow.clone(),
+				)
+				.map_err(GraphAdmissionError::Layout)
+			};
+			// Filtered results keep their graph, like IntelliJ: a parent the
+			// filter left out ends in a dashed "skipped" stub. (Path filters
+			// get rewritten parents from git, so their matches connect.) A
+			// parent on a later page reconnects when that page joins the
+			// window, since the whole window is laid out again.
+			let skipped: HashSet<String> = if candidate.log_search.is_some() {
+				let loaded: HashSet<&str> =
+					candidate.commits.iter().map(|c| c.sha.as_str()).collect();
+				candidate
+					.commits
+					.iter()
+					.flat_map(|c| &c.parents)
+					.filter(|p| !loaded.contains(p.as_str()))
+					.cloned()
+					.collect()
+			} else {
+				HashSet::new()
+			};
+			let full = layout(&candidate.commits, skipped.clone())?;
+			if full.checkpoint.is_none()
+				&& candidate.page_checkpoints.len() > page + 1
+			{
+				candidate.page_checkpoints[page + 1] = None;
+			}
 			if let Some(next) = &full.checkpoint {
 				let slots =
 					page.checked_add(2).ok_or(GraphAdmissionError::Budget)?;
@@ -693,14 +1176,10 @@ impl PreparedHistory {
 					.filter(|commit| !hidden.contains(&commit.sha))
 					.cloned()
 					.collect();
-				graph_view::layout_commits_filtered(
+				layout(
 					&shown,
-					&candidate.refs,
-					candidate.head_sha.as_deref(),
-					checkpoint,
-					hidden.clone(),
-				)
-				.map_err(GraphAdmissionError::Layout)?
+					hidden.iter().chain(&skipped).cloned().collect(),
+				)?
 			});
 			candidate.hidden_commits = hidden.into_iter().collect();
 			candidate.hidden_commits.sort();
@@ -717,18 +1196,16 @@ impl PreparedHistory {
 			.saturating_add(vec_bytes(&self.refs))
 			.saturating_add(vec_bytes(&self.page_checkpoints))
 			.saturating_add(vec_bytes(&self.collapsed_merges))
-			.saturating_add(vec_bytes(&self.hidden_commits));
+			.saturating_add(vec_bytes(&self.hidden_commits))
+			.saturating_add(vec_bytes(&self.on_head));
+		if let Some(q) = &self.log_search {
+			bytes = bytes.saturating_add(vec_bytes(&q.paths));
+		}
 		for commit in &self.commits {
-			bytes = bytes
-				.saturating_add(commit.sha.capacity())
-				.saturating_add(commit.author_name.capacity())
-				.saturating_add(commit.author_email.capacity())
-				.saturating_add(commit.author_date.capacity())
-				.saturating_add(commit.subject.capacity())
-				.saturating_add(vec_bytes(&commit.parents));
-			for parent in &commit.parents {
-				bytes = bytes.saturating_add(parent.capacity());
-			}
+			bytes = bytes.saturating_add(commit_bytes(commit));
+		}
+		if let Some(walk) = &self.walk {
+			bytes = bytes.saturating_add(walk.retained_bytes());
 		}
 		for reference in &self.refs {
 			bytes = bytes
@@ -739,7 +1216,14 @@ impl PreparedHistory {
 			.head_sha
 			.iter()
 			.chain(self.active_ref_filter.iter())
-			.chain(self.log_search.iter().map(|search| &search.query))
+			.chain(self.log_search.iter().flat_map(|q| {
+				[&q.text]
+					.into_iter()
+					.chain(&q.author)
+					.chain(&q.since)
+					.chain(&q.until)
+					.chain(&q.paths)
+			}))
 			.chain(self.collapsed_merges.iter())
 			.chain(self.hidden_commits.iter())
 		{
@@ -773,8 +1257,11 @@ impl PreparedHistory {
 		model.hidden_commits = self.hidden_commits;
 		model.active_ref_filter = self.active_ref_filter;
 		model.log_search = self.log_search;
+		model.log_first_page = self.first_page;
 		model.commit_page = self.commit_page;
+		model.log_on_head = self.on_head;
 		model.history_has_more = self.history_has_more;
+		model.history_walk = self.walk;
 		model.history_error = None;
 	}
 }
@@ -789,15 +1276,46 @@ impl WorkbenchModel {
 	}
 
 	pub fn load_history(&mut self, cx: &mut Context<Self>) {
-		self.load_history_page(self.commit_page, cx);
+		self.load_history_window(PageLoad::Replace(self.log_first_page), cx);
 	}
 
-	fn load_history_page(&mut self, page: usize, cx: &mut Context<Self>) {
+	/// Reads one page and merges it into the loaded window (see [`PageLoad`]).
+	fn load_history_window(&mut self, load: PageLoad, cx: &mut Context<Self>) {
 		if !self.accepting_work() {
 			return;
 		}
-		let Some(repo_root) = self.repo_root() else {
+		if let PageLoad::Replace(_) = load {
+			if self.log_filter_pending() {
+				// Reading every repo found so far would ignore the chip:
+				// wait for discovery to reach the picked repositories.
+				self.log_deferred = true;
+				return;
+			}
+			self.log_deferred = false;
+			let scope = self.log_scope();
+			self.log_scope_key = scope.iter().map(|(r, _)| r.clone()).collect();
+			self.log_feeds.clear();
+			if scope.len() > 1 {
+				self.start_merged_log(scope, cx);
+				return;
+			}
+		} else if self.log_is_merged() {
+			if load == PageLoad::Next {
+				let target = self.commits.len() + self.history_page_size;
+				self.merged_step(target, cx);
+			}
 			return;
+		}
+		let Some(repo_root) = self.log_root() else {
+			return;
+		};
+		let page = match load {
+			PageLoad::Replace(p) => p,
+			PageLoad::Next => self.commit_page.saturating_add(1),
+			PageLoad::Prev => match self.log_first_page.checked_sub(1) {
+				Some(p) => p,
+				None => return,
+			},
 		};
 		let ref_filter = self.active_ref_filter.clone();
 		let search = self.log_search.clone();
@@ -811,12 +1329,25 @@ impl WorkbenchModel {
 		self.history_generation += 1;
 		let task_generation = self.history_generation;
 		let cancel = arm_cancel(&mut self.history_cancel);
-		self.history_error = None;
+		self.history_extending = !matches!(load, PageLoad::Replace(_));
+		if !self.history_extending {
+			self.history_error = None;
+		}
 
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 		let cancel_bg = cancel.clone();
+		// A fresh page 0 takes a new snapshot; every other read continues
+		// the snapshot's walk, so the window never mixes two ref states.
+		let extending = !matches!(load, PageLoad::Replace(0));
+		let walk = self
+			.history_walk
+			.clone()
+			.filter(|_| extending && search.is_none())
+			.map(|w| (w, self.refs.clone(), self.head_sha.clone()));
+		let snapshot = (self.refs.clone(), self.head_sha.clone());
+		let want_email = matches!(load, PageLoad::Replace(0));
 
 		self.spawn_owned(
 			cx,
@@ -826,111 +1357,230 @@ impl WorkbenchModel {
 				let res = bg
 					.spawn(async move {
 						let opts = crate::interactive_read_opts(cancel_bg);
-						let git = Git::open_with(&repo_root, &opts)
-							.map_err(|e| e.to_string())?;
-						match &search {
-							Some(LogSearch {
-								query,
-								author: true,
-							}) => {
-								let refs = browser::history_with(
-									&git, None, "", 0, 0, &opts,
-								)
-								.map_err(|e| e.to_string())?;
-								let (commits, more) =
-									browser::history_by_author_with(
-										&git, query, skip, page_size, &opts,
-									)
-									.map_err(|e| e.to_string())?;
-								Ok(browser::RepositoryHistory {
-									root: refs.root,
-									commits,
-									refs: refs.refs,
-									head: refs.head,
-									has_more: more,
+						let Some(query) = &search else {
+							let email = want_email
+								.then(|| {
+									let git =
+										Git::at_known_root(repo_root.clone());
+									read_user_email(&git, &opts)
 								})
-							}
-							_ => browser::history_with(
-								&git,
-								ref_filter.as_deref(),
-								search
-									.as_ref()
-									.map(|s| s.query.as_str())
-									.unwrap_or(""),
-								skip,
-								page_size,
+								.flatten();
+							return read_graph_page(
+								&repo_root, walk, ref_filter, skip, page_size,
 								&opts,
 							)
-							.map_err(|e| e.to_string()),
-						}
+							.map(|(h, w)| (h, Some(w), email));
+						};
+						let git = Git::open_with(&repo_root, &opts)
+							.map_err(|e| e.to_string())?;
+						// Refs only for labels: no topological walk for them.
+						let (refs, head, email) = if extending {
+							(snapshot.0, snapshot.1, None)
+						} else {
+							let snap = browser::refs_with(&git, &opts)
+								.map_err(|e| e.to_string())?;
+							(snap.refs, snap.head, read_user_email(&git, &opts))
+						};
+						let (commits, has_more) = browser::history_query_with(
+							&git,
+							ref_filter.as_deref(),
+							query,
+							skip,
+							page_size,
+							&opts,
+						)
+						.map_err(|e| e.to_string())?;
+						Ok((
+							browser::RepositoryHistory {
+								root: String::new(),
+								commits,
+								refs,
+								head,
+								has_more,
+							},
+							None,
+							email,
+						))
 					})
 					.await;
 
-				let _ =
-					this.update(&mut async_app, |model, cx| {
-						if model.history_generation != task_generation {
-							return;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.history_generation != task_generation {
+						return;
+					}
+					model.history_extending = false;
+					match res {
+						Ok((hist, walk, email)) => {
+							model.install_history(load, hist, walk, cx);
+							if want_email {
+								model.git_user_email = email;
+							}
 						}
-						match res {
-							Ok(hist) => {
-								match PreparedHistory::prepare(hist, page, &model.page_checkpoints,
-                                    model.collapsed_merges.clone(), model.active_ref_filter.clone(), model.log_search.clone()) {
-                                    Ok(candidate) => {
-                                        app_log!("[APP:GRAPH_RETAINED: bytes={} limit={}]", candidate.retained_bytes(), MAX_RETAINED_GRAPH_BYTES);
-                                        candidate.install(model);
-                                    }
-                                    Err(error) => {
-                                        model.report_graph_error(error);
-                                        cx.notify();
-                                        return;
-                                    }
-                                }
-								model.set_status(
-									"status_history_loaded",
-									[
-										model.commits.len().to_string(),
-										(page + 1).to_string(),
-									],
-								);
-								app_log!(
-									"[APP:GRAPH_LOADED: commits={}]",
-									model.commits.len()
-								);
-								app_log!(
-								"[APP:E2E_LOG: mode={} n={} first={} page={}]",
-								if model.log_search.is_some() { "search" } else { "graph" },
-								model.commits.len(),
-								model.commits.first().map(|c| &c.sha[..7]).unwrap_or("-"),
-								page + 1
+						Err(e) => {
+							model.history_autoload = false;
+							model.report_graph_error(
+								GraphAdmissionError::Layout(e),
 							);
-								if let Some(anchor) =
-									model.selected_commit.clone()
-								{
-									if model
-										.commits
-										.iter()
-										.any(|c| c.sha == anchor)
-									{
-										model.select_commit(&anchor, cx);
-									} else if model.select_head_after_load {
-										model.select_head_after_load = false;
-										model.focus_head(cx);
-									} else {
-										model.selected_commit = None;
-									}
-								} else if model.select_head_after_load {
-									model.select_head_after_load = false;
-									model.focus_head(cx);
-								}
-							}
-							Err(e) => {
-								model.report_graph_error(GraphAdmissionError::Layout(e));
-							}
 						}
-						cx.notify();
-					});
+					}
+					cx.notify();
+				});
 			},
 		);
+	}
+
+	/// Merges a read page into the window, keeps the rows on screen where
+	/// they were, and re-selects only after a fresh window.
+	fn install_history(
+		&mut self,
+		load: PageLoad,
+		hist: browser::RepositoryHistory,
+		walk: Option<HistoryWalk>,
+		cx: &mut Context<Self>,
+	) {
+		let (commits, first, last, has_more) = merge_window(
+			&self.commits,
+			self.log_first_page,
+			self.commit_page,
+			self.history_has_more,
+			load,
+			hist.commits,
+			hist.has_more,
+			self.history_page_size,
+		);
+		let seeds: Vec<String> = match load {
+			PageLoad::Replace(_) => Vec::new(),
+			_ => self
+				.commits
+				.iter()
+				.zip(&self.log_on_head)
+				.filter(|(_, on)| **on)
+				.map(|(c, _)| c.sha.clone())
+				.collect(),
+		};
+		// Scroll anchor: the top visible row and where it is drawn.
+		let anchor = {
+			let rows = self.display_commits();
+			let offset = self.log_scroll.0.borrow().base_handle.offset();
+			let top = (-f32::from(offset.y) / graph_view::ROW_HEIGHT).max(0.)
+				as usize;
+			rows.get(top).map(|c| (c.sha.clone(), top))
+		};
+		let merged = browser::RepositoryHistory {
+			root: String::new(),
+			commits,
+			refs: hist.refs,
+			head: hist.head,
+			has_more,
+		};
+		let mut candidate = match PreparedHistory::prepare_with(
+			merged,
+			walk,
+			(first, last),
+			&self.page_checkpoints,
+			self.collapsed_merges.clone(),
+			self.active_ref_filter.clone(),
+			self.log_search.clone(),
+		) {
+			Ok(candidate) => candidate,
+			Err(error) => {
+				self.history_autoload = false;
+				self.report_graph_error(error);
+				return;
+			}
+		};
+		candidate.on_head = mark_on_head(
+			&candidate.commits,
+			candidate.head_sha.clone().into_iter().chain(seeds),
+		);
+		if let Err(error) = candidate.check_budget() {
+			self.history_autoload = false;
+			self.report_graph_error(error);
+			return;
+		}
+		app_log!(
+			"[APP:GRAPH_RETAINED: bytes={} limit={}]",
+			candidate.retained_bytes(),
+			MAX_RETAINED_GRAPH_BYTES
+		);
+		candidate.install(self);
+		self.history_autoload = true;
+		if let Some((sha, old)) =
+			anchor.filter(|_| !matches!(load, PageLoad::Replace(_)))
+		{
+			match self.display_commits().iter().position(|c| c.sha == sha) {
+				Some(new) => {
+					let handle = self.log_scroll.0.borrow().base_handle.clone();
+					let mut offset = handle.offset();
+					offset.y -= gpui::px(
+						(new as f32 - old as f32) * graph_view::ROW_HEIGHT,
+					);
+					handle.set_offset(offset);
+					app_log!(
+						"[APP:LOG_ANCHOR: row={} was={} offset={:.0}]",
+						new,
+						old,
+						f32::from(offset.y)
+					);
+				}
+				None => self.log_scroll.scroll_to_item(
+					if load == PageLoad::Prev {
+						0
+					} else {
+						self.display_commits().len().saturating_sub(1)
+					},
+					ScrollStrategy::Top,
+				),
+			}
+		}
+		let fallback =
+			self.graph_layout.as_ref().is_some_and(|l| l.is_fallback);
+		self.set_status(
+			if fallback {
+				app_log!("[APP:GRAPH_FALLBACK]");
+				"status_graph_fallback"
+			} else {
+				"status_history_loaded"
+			},
+			[self.commits.len().to_string()],
+		);
+		app_log!("[APP:GRAPH_LOADED: commits={}]", self.commits.len());
+		app_log!(
+			"[APP:E2E_LOG: mode={} n={} first={} page={}]",
+			if self.log_search.is_some() {
+				"search"
+			} else {
+				"graph"
+			},
+			self.commits.len(),
+			self.commits.first().map(|c| &c.sha[..7]).unwrap_or("-"),
+			self.commit_page + 1
+		);
+		app_log!(
+			"[APP:LOG_WINDOW: first_page={} last_page={} rows={}]",
+			self.log_first_page + 1,
+			self.commit_page + 1,
+			self.commits.len()
+		);
+		if !matches!(load, PageLoad::Replace(_)) {
+			return;
+		}
+		if let Some(anchor) = self.selected_commit.clone() {
+			if self.reselect_after_load(&anchor, cx) {
+				return;
+			}
+			if self.select_head_after_load {
+				self.select_head_after_load = false;
+				self.focus_head(cx);
+			} else {
+				self.selected_commit = None;
+				self.log_selected.clear();
+				self.commit_details = None;
+			}
+		} else if self.select_head_after_load {
+			self.select_head_after_load = false;
+			self.focus_head(cx);
+		}
 	}
 
 	fn report_graph_error(&mut self, error: GraphAdmissionError) {
@@ -970,15 +1620,17 @@ impl WorkbenchModel {
 			head: self.head_sha.clone(),
 			has_more: self.history_has_more,
 		};
-		match PreparedHistory::prepare(
+		match PreparedHistory::prepare_with(
 			history,
-			self.commit_page,
+			self.history_walk.clone(),
+			(self.log_first_page, self.commit_page),
 			&self.page_checkpoints,
 			collapsed_merges,
 			self.active_ref_filter.clone(),
 			self.log_search.clone(),
 		) {
-			Ok(candidate) => {
+			Ok(mut candidate) => {
+				candidate.on_head = self.log_on_head.clone();
 				candidate.install(self);
 				app_log!("[APP:MERGE_COLLAPSE: sha={} collapsed={} hidden={} shown={}]",
                     &merge[..7.min(merge.len())], collapsed, side_only(&self.commits, &merge).len(), self.display_commits().len());
@@ -988,16 +1640,70 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// Keymap alias of [`Self::history_next_page`] ("load more").
+	#[allow(dead_code)] // bound by the chrome keymap at merge
+	pub fn history_load_more(&mut self, cx: &mut Context<Self>) {
+		self.history_next_page(cx);
+	}
+
+	/// Loads the page after the window (scrolling near the end does this).
 	pub fn history_next_page(&mut self, cx: &mut Context<Self>) {
-		if self.history_has_more {
-			self.load_history_page(self.commit_page.saturating_add(1), cx);
+		if self.history_has_more && !self.history_extending {
+			self.load_history_window(PageLoad::Next, cx);
 		}
 	}
 
+	/// Loads the evicted page before the window (scrolling near the top).
 	pub fn history_prev_page(&mut self, cx: &mut Context<Self>) {
-		if self.commit_page > 0 {
-			self.load_history_page(self.commit_page - 1, cx);
+		if self.log_first_page > 0 && !self.history_extending {
+			self.load_history_window(PageLoad::Prev, cx);
 		}
+	}
+
+	/// Called with the rows the log list is drawing: reads the neighbouring
+	/// page once they come within a few rows of either end. After a failed
+	/// read it waits for the next scroll gesture ([`Self::rearm_autoload`]).
+	pub fn autoload_near(&mut self, rows: usize, cx: &mut Context<Self>) {
+		const NEAR: usize = 5;
+		if !self.history_autoload || self.history_extending || rows == 0 {
+			return;
+		}
+		// From the scroll state, not the processor's range: the list also
+		// renders row 0 alone to measure the row height.
+		let (offset, height) = {
+			let handle = &self.log_scroll.0.borrow().base_handle;
+			(
+				-f32::from(handle.offset().y),
+				f32::from(handle.bounds().size.height),
+			)
+		};
+		if height <= 0. {
+			return;
+		}
+		let row = graph_view::ROW_HEIGHT;
+		let start = (offset.max(0.) / row) as usize;
+		let visible = start..start + (height / row).ceil() as usize;
+		let load = if self.history_has_more && visible.end + NEAR >= rows {
+			PageLoad::Next
+		} else if self.log_first_page > 0 && visible.start <= NEAR {
+			PageLoad::Prev
+		} else {
+			return;
+		};
+		// The list is being laid out: read on the next turn of the loop.
+		self.history_extending = true;
+		let this = cx.weak_entity();
+		cx.defer(move |app| {
+			let _ = this.update(app, |this, cx| {
+				this.history_extending = false;
+				this.load_history_window(load, cx);
+			});
+		});
+	}
+
+	/// A user scroll or key move re-enables loading after a failed read.
+	pub fn rearm_autoload(&mut self) {
+		self.history_autoload = true;
 	}
 
 	/// Changing query identity clears the old graph before the async read.
@@ -1005,7 +1711,7 @@ impl WorkbenchModel {
 	fn reset_history_query(
 		&mut self,
 		reference: Option<String>,
-		search: Option<LogSearch>,
+		search: Option<LogQuery>,
 	) -> bool {
 		let empty = browser::RepositoryHistory {
 			root: String::new(),
@@ -1014,9 +1720,10 @@ impl WorkbenchModel {
 			head: None,
 			has_more: false,
 		};
-		match PreparedHistory::prepare(
+		match PreparedHistory::prepare_with(
 			empty,
-			0,
+			None,
+			(0, 0),
 			&[],
 			Vec::new(),
 			reference,
@@ -1038,7 +1745,8 @@ impl WorkbenchModel {
 		ref_name: Option<String>,
 		cx: &mut Context<Self>,
 	) {
-		if !self.reset_history_query(ref_name, None) {
+		// The branch filter combines with the other filters, like IntelliJ.
+		if !self.reset_history_query(ref_name, self.log_search.clone()) {
 			cx.notify();
 			return;
 		}
@@ -1049,11 +1757,17 @@ impl WorkbenchModel {
 		self.load_history(cx);
 	}
 
+	/// The search field's text (message or hash) changed.
 	pub fn start_log_search(&mut self, query: String, cx: &mut Context<Self>) {
-		let search = (!query.is_empty()).then_some(LogSearch {
-			query,
-			author: self.search_by_author,
-		});
+		self.log_filter.text = query;
+		self.apply_log_filter(cx);
+	}
+
+	/// Re-reads the log under `log_filter` (text, regex / case toggles,
+	/// User, Date and Paths chips); an empty filter is the plain graph.
+	pub fn apply_log_filter(&mut self, cx: &mut Context<Self>) {
+		let query = self.log_filter.clone();
+		let search = (!query.is_empty()).then_some(query);
 		if !self.reset_history_query(self.active_ref_filter.clone(), search) {
 			cx.notify();
 			return;
@@ -1061,13 +1775,202 @@ impl WorkbenchModel {
 		app_log!(
 			"[APP:LOG_SEARCH: active={} author={}]",
 			self.log_search.is_some(),
-			self.search_by_author
+			self.log_filter.author.is_some()
 		);
 		self.load_history(cx);
 	}
 
+	/// User chip: `None` shows every author.
+	pub fn set_log_author(
+		&mut self,
+		author: Option<String>,
+		cx: &mut Context<Self>,
+	) {
+		self.log_menu = None;
+		self.log_filter.author = author
+			.filter(|a| !a.is_empty())
+			.map(|a| clip_utf8(a, MAX_USER_EMAIL));
+		self.apply_log_filter(cx);
+	}
+
+	/// Date chip preset: a `git log --since` value, `None` for any date.
+	pub fn set_log_since(
+		&mut self,
+		since: Option<&'static str>,
+		cx: &mut Context<Self>,
+	) {
+		self.log_menu = None;
+		self.log_date_error = false;
+		self.log_filter.since = since.map(str::to_string);
+		self.log_filter.until = None;
+		self.apply_log_filter(cx);
+	}
+
+	/// Date chip custom range from its two fields (`YYYY-MM-DD`, either may
+	/// be empty); both days are included. A malformed date is refused.
+	pub fn apply_log_date_range(&mut self, cx: &mut Context<Self>) {
+		let since = self.log_since_input.read(cx).text().trim().to_string();
+		let until = self.log_until_input.read(cx).text().trim().to_string();
+		match date_range(&since, &until) {
+			Some((since, until)) => {
+				self.log_menu = None;
+				self.log_date_error = false;
+				self.log_filter.since = since;
+				self.log_filter.until = until;
+				self.apply_log_filter(cx);
+			}
+			None => {
+				self.log_date_error = true;
+				app_log!("[APP:LOG_DATE_INVALID]");
+				cx.notify();
+			}
+		}
+	}
+
+	/// Paths chip: adds a typed repository-relative path to the filter.
+	pub fn add_log_path(&mut self, path: String, cx: &mut Context<Self>) {
+		let path = clean_log_path(&path);
+		if path.is_empty() || self.log_filter.paths.contains(&path) {
+			return;
+		}
+		self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
+		self.toggle_log_path(path, cx);
+	}
+
+	/// Paths chip: checks or unchecks one path; the menu stays open.
+	pub fn toggle_log_path(&mut self, path: String, cx: &mut Context<Self>) {
+		let paths = &mut self.log_filter.paths;
+		match paths.iter().position(|p| *p == path) {
+			Some(i) => {
+				paths.remove(i);
+			}
+			None if paths.len() < MAX_LOG_PATHS => paths.push(path),
+			None => return,
+		}
+		app_log!("[APP:LOG_PATHS: n={}]", self.log_filter.paths.len());
+		self.apply_log_filter(cx);
+	}
+
+	/// Paths picker: reads a folder (`""` is the root) the project tree has
+	/// not read yet, through the project tree's own loader.
+	pub fn load_picker_dir(&mut self, rel: &str, cx: &mut Context<Self>) {
+		// The merged log names the (selected) repository first.
+		let rel = if self.log_is_merged() {
+			let Some(name) = self.repo().map(|r| r.name.clone()) else {
+				return;
+			};
+			match rel.strip_prefix(name.as_str()) {
+				Some("") => "",
+				Some(rest) => match rest.strip_prefix('/') {
+					Some(rest) => rest,
+					None => return,
+				},
+				None => return,
+			}
+		} else {
+			rel
+		};
+		let Some(tree) = self.file_tree.as_ref() else {
+			return;
+		};
+		let mut node = tree;
+		for part in rel.split('/').filter(|p| !p.is_empty()) {
+			match node.children.iter().find(|c| c.name == part && c.is_dir) {
+				Some(child) => node = child,
+				None => return,
+			}
+		}
+		if !node.is_loaded {
+			self.dispatch_tree(
+				Some(crate::tree::TreeCommand::Expand(
+					crate::tree::NodeKey::from_utf8_rel(rel),
+				)),
+				cx,
+			);
+		}
+	}
+
+	/// Paths chip ✕: every path.
+	pub fn clear_log_paths(&mut self, cx: &mut Context<Self>) {
+		self.log_menu = None;
+		self.log_filter.paths.clear();
+		self.apply_log_filter(cx);
+	}
+
+	pub fn toggle_log_regex(&mut self, cx: &mut Context<Self>) {
+		self.log_filter.regex = !self.log_filter.regex;
+		app_log!("[APP:LOG_REGEX: {}]", self.log_filter.regex);
+		self.reapply_text_toggle(cx);
+	}
+
+	pub fn toggle_log_match_case(&mut self, cx: &mut Context<Self>) {
+		self.log_filter.match_case = !self.log_filter.match_case;
+		app_log!("[APP:LOG_MATCH_CASE: {}]", self.log_filter.match_case);
+		self.reapply_text_toggle(cx);
+	}
+
+	/// A text toggle only changes results while there is text.
+	fn reapply_text_toggle(&mut self, cx: &mut Context<Self>) {
+		if self.log_filter.text.trim().is_empty() {
+			cx.notify();
+		} else {
+			self.apply_log_filter(cx);
+		}
+	}
+
+	pub fn toggle_log_menu(
+		&mut self,
+		menu: crate::ui::LogMenu,
+		cx: &mut Context<Self>,
+	) {
+		// The click that dismissed this menu (mouse down outside it) lands on
+		// its own chip: that click closes, it does not reopen.
+		// ponytail: time window, not hit testing; a >400ms press reopens.
+		if let Some((m, at)) = self.log_menu_dismissed.take() {
+			if m == menu && at.elapsed() < std::time::Duration::from_millis(400)
+			{
+				cx.notify();
+				return;
+			}
+		}
+		self.log_menu = (self.log_menu != Some(menu)).then_some(menu);
+		if self.log_menu == Some(crate::ui::LogMenu::Paths) {
+			self.pending_focus =
+				Some(self.log_path_input.read(cx).handle().clone());
+			self.load_picker_dir("", cx);
+		}
+		app_log!("[APP:LOG_MENU: {:?}]", self.log_menu);
+		cx.notify();
+	}
+
+	pub fn close_log_menu(&mut self, cx: &mut Context<Self>) {
+		if let Some(menu) = self.log_menu.take() {
+			self.log_menu_dismissed = Some((menu, std::time::Instant::now()));
+			cx.notify();
+		}
+	}
+
+	/// Authors offered by the User chip: the loaded commits' authors, in
+	/// order of appearance, bounded.
+	pub fn log_authors(&self, max: usize) -> Vec<String> {
+		let mut out: Vec<String> = Vec::new();
+		for c in &self.commits {
+			if out.len() >= max {
+				break;
+			}
+			if !c.author_name.is_empty() && !out.contains(&c.author_name) {
+				out.push(c.author_name.clone());
+			}
+		}
+		out
+	}
+
 	/// Shows HEAD: back to the full graph on page 1, then selects HEAD.
 	pub fn locate_head(&mut self, cx: &mut Context<Self>) {
+		if self.log_is_merged() {
+			self.locate_merged_head(cx);
+			return;
+		}
 		let on_page = self.log_search.is_none()
 			&& self.active_ref_filter.is_none()
 			&& self.head_sha.as_ref().is_some_and(|h| {
@@ -1081,6 +1984,8 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
+		self.log_filter = LogQuery::default();
+		self.log_search_input.update(cx, |i, cx| i.set_text("", cx));
 		self.select_head_after_load = true;
 		self.load_history(cx);
 	}
@@ -1104,6 +2009,16 @@ impl WorkbenchModel {
 		}
 	}
 
+	/// Parents (plain SHAs) of a loaded commit, keyed by its row id.
+	fn known_parents(&self, id: &str) -> Option<Vec<String>> {
+		self.commits.iter().find(|c| c.sha == id).map(|c| {
+			c.parents
+				.iter()
+				.map(|p| crate::multi_log::split_id(p).0.to_string())
+				.collect()
+		})
+	}
+
 	pub fn select_commit(&mut self, sha: &str, cx: &mut Context<Self>) {
 		if sha.len() > MAX_SHA_LEN {
 			self.report_graph_error(GraphAdmissionError::Budget);
@@ -1114,6 +2029,7 @@ impl WorkbenchModel {
 		let task_generation = self.preview_generation;
 		self.selected_commit = Some(Box::<str>::from(sha).into_string());
 		self.range_head = None;
+		self.log_selected.clear();
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_commit_file = None;
@@ -1121,17 +2037,77 @@ impl WorkbenchModel {
 		self.clear_preview();
 		self.preview_loading = true;
 		self.preview_error = None;
-		let Some(root) = self.repo_root() else {
+		let id = sha.to_string();
+		let Some((root, sha)) = self.log_root_for(&id) else {
 			return;
 		};
-		let sha = sha.to_string();
+		self.log_commit_root = Some(root.clone());
+		app_log!(
+			"[APP:LOG_SELECTION: n=1 repo={}]",
+			self.log_repo_name(&root)
+		);
 		app_log!("[APP:COMMIT_SELECTED: {}]", &sha[..7.min(sha.len())]);
+		let parents = self.known_parents(&id);
+		self.load_commit_details(root.clone(), sha.clone(), id, cx);
 		self.load_change_list(
 			root,
 			GitSource::Commit(sha.clone()),
 			PreviewSource::CommitDiff { sha },
+			parents,
 			task_generation,
 			cx,
+		);
+	}
+
+	/// Full message, committer and containing branches for the details
+	/// pane; its own generation, so opening a file does not drop it.
+	fn load_commit_details(
+		&mut self,
+		root: std::path::PathBuf,
+		sha: String,
+		id: String,
+		cx: &mut Context<Self>,
+	) {
+		self.details_generation = self.details_generation.wrapping_add(1);
+		let generation = self.details_generation;
+		if self.commit_details.as_ref().is_some_and(|d| d.sha != id) {
+			self.commit_details = None;
+		}
+		if !self.accepting_work() {
+			return;
+		}
+		let cancel = arm_cancel(&mut self.details_cancel);
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
+				let res = bg
+					.spawn(async move {
+						let opts = crate::interactive_read_opts(cancel);
+						read_commit_details(
+							&Git::at_known_root(root),
+							&sha,
+							&opts,
+						)
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.details_generation != generation {
+						return;
+					}
+					// A failed read leaves the row's own fields on screen.
+					// Details are keyed by the row id (merged log: with repo).
+					model.commit_details = res.ok().map(|mut d| {
+						d.sha = id;
+						d
+					});
+					cx.notify();
+				});
+			},
 		);
 	}
 
@@ -1142,15 +2118,226 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
-		if self.selected_commit.is_none() {
+		let Some(anchor) = self.selected_commit.as_deref() else {
 			self.select_commit(sha, cx);
+			return;
+		};
+		if !same_repo(anchor, sha) {
+			app_log!("[APP:RANGE_REFUSED: cross_repo]");
+			self.set_status("status_log_cross_repo", []);
+			cx.notify();
 			return;
 		}
 		self.range_head = (self.selected_commit.as_deref() != Some(sha))
 			.then(|| Box::<str>::from(sha).into_string());
-		let n = self.range_rows().map(|(a, b)| b - a + 1).unwrap_or(1);
-		app_log!("[APP:RANGE: commits={}]", n);
+		let ids = self.range_ids();
+		app_log!("[APP:RANGE: commits={}]", ids.len().max(1));
+		if ids.len() > 1 {
+			self.log_selected = ids;
+			self.load_selection(cx);
+		} else if let Some(anchor) = self.selected_commit.clone() {
+			// Back to the anchor alone.
+			if !self.log_selected.is_empty() {
+				self.select_commit(&anchor, cx);
+			}
+		}
 		cx.notify();
+	}
+
+	/// Cmd-click (macOS) / Ctrl-click: toggles one commit in or out of the
+	/// selection, which may then have gaps. Another repository's commit is
+	/// refused, like a shift range across repositories.
+	pub fn toggle_commit(&mut self, sha: &str, cx: &mut Context<Self>) {
+		if sha.len() > MAX_SHA_LEN {
+			self.report_graph_error(GraphAdmissionError::Budget);
+			cx.notify();
+			return;
+		}
+		let Some(anchor) = self.selected_commit.clone() else {
+			self.select_commit(sha, cx);
+			return;
+		};
+		let current = if self.log_selected.is_empty() {
+			vec![anchor.clone()]
+		} else {
+			self.log_selected.clone()
+		};
+		let toggled = {
+			let rows = self.display_commits();
+			let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
+			toggle_selection(&ids, &current, sha)
+		};
+		let next = match toggled {
+			Ok(next) => next,
+			Err(_) => {
+				app_log!("[APP:RANGE_REFUSED: cross_repo]");
+				self.set_status("status_log_cross_repo", []);
+				cx.notify();
+				return;
+			}
+		};
+		match next.len() {
+			0 => {
+				// The last selected commit toggled off: nothing selected.
+				self.preview_generation += 1;
+				self.details_generation =
+					self.details_generation.wrapping_add(1);
+				self.selected_commit = None;
+				self.range_head = None;
+				self.log_selected.clear();
+				self.commit_details = None;
+				self.commit_files.clear();
+				self.selected_commit_file = None;
+				self.preview_loading = false;
+				app_log!("[APP:LOG_SELECTION: n=0 repo=-]");
+			}
+			1 => self.select_commit(&next[0], cx),
+			_ => {
+				// The clicked commit leads when it joins; otherwise the
+				// anchor stays unless it just left.
+				let lead = if next.iter().any(|s| s == sha) {
+					sha.to_string()
+				} else if next.contains(&anchor) {
+					anchor
+				} else {
+					next[0].clone()
+				};
+				self.selected_commit = Some(lead);
+				self.range_head = None;
+				self.log_selected = next;
+				self.load_selection(cx);
+			}
+		}
+		cx.notify();
+	}
+
+	/// After the log was read again: a multi-selection whose commits are
+	/// all still loaded stays, else the anchor alone is selected again.
+	/// False when the anchor is gone too.
+	fn reselect_after_load(
+		&mut self,
+		anchor: &str,
+		cx: &mut Context<Self>,
+	) -> bool {
+		let loaded = |id: &str| self.commits.iter().any(|c| c.sha == id);
+		if self.log_selected.len() > 1
+			&& self.log_selected.iter().all(|id| loaded(id))
+		{
+			self.load_selection(cx);
+			true
+		} else if loaded(anchor) {
+			self.select_commit(anchor, cx);
+			true
+		} else {
+			false
+		}
+	}
+
+	/// The details of a multi-selection: the union of its commits' changed
+	/// files (the newest change per path), read in one cancellable job of
+	/// at most `MAX_SELECTION_READS` listings, then the first file's diff.
+	pub fn load_selection(&mut self, cx: &mut Context<Self>) {
+		self.preview_generation += 1;
+		let task_generation = self.preview_generation;
+		self.details_generation = self.details_generation.wrapping_add(1);
+		self.commit_details = None;
+		self.compare = None;
+		self.selected_file = None;
+		self.selected_commit_file = None;
+		self.commit_files.clear();
+		self.commit_file_origin.clear();
+		self.clear_preview();
+		self.preview_loading = true;
+		self.preview_error = None;
+		let Some((root, _)) = self
+			.log_selected
+			.first()
+			.and_then(|id| self.log_root_for(id))
+		else {
+			return;
+		};
+		self.log_commit_root = Some(root.clone());
+		let n = self.log_selected.len();
+		app_log!(
+			"[APP:LOG_SELECTION: n={n} repo={}]",
+			self.log_repo_name(&root)
+		);
+		if n > MAX_SELECTION_READS {
+			self.set_status(
+				"status_selection_truncated",
+				[n.to_string(), MAX_SELECTION_READS.to_string()],
+			);
+		}
+		let shas: Vec<String> = self
+			.log_selected
+			.iter()
+			.take(MAX_SELECTION_READS)
+			.map(|id| multi_log::split_id(id).0.to_string())
+			.collect();
+		if !self.accepting_work() {
+			return;
+		}
+		let cancel = arm_cancel(&mut self.preview_cancel);
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
+				let res = bg
+					.spawn(async move {
+						let listing = crate::interactive_read_opts(cancel);
+						let git = Git::at_known_root(root);
+						// Lazy: each listing is folded in and dropped
+						// before the next one is read.
+						union_changed_files(shas.into_iter().map(|sha| {
+							gitsrc::list_changed_paths_with(
+								&git,
+								&GitSource::Commit(sha),
+								&listing,
+							)
+							.map_err(|e| e.to_string())
+						}))
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.preview_generation != task_generation {
+						return;
+					}
+					match res {
+						Ok((files, origin, total)) => {
+							app_log!("[APP:E2E_CHANGES: files={}]", total);
+							if total > MAX_COMMIT_FILES {
+								model.set_status(
+									"status_commit_files_truncated",
+									[
+										total.to_string(),
+										MAX_COMMIT_FILES.to_string(),
+									],
+								);
+							}
+							let first = files.first().map(|(p, _)| p.clone());
+							model.commit_files = files;
+							model.commit_file_origin = origin;
+							match first {
+								Some(path) => {
+									model.select_commit_file(&path, cx)
+								}
+								None => model.show_preview_error(Msg::new(
+									"status_no_changes",
+									[],
+								)),
+							}
+						}
+						Err(e) => model
+							.show_preview_error(Msg::new("error_history", [e])),
+					}
+					cx.notify();
+				});
+			},
+		);
 	}
 
 	/// Display rows spanned by the selected range, (top, bottom).
@@ -1165,28 +2352,53 @@ impl WorkbenchModel {
 		Some((a.min(b), a.max(b)))
 	}
 
+	/// Row ids the range selects: the rows between its ends that belong to
+	/// the anchor's repository (the merged log interleaves others).
+	pub fn range_ids(&self) -> Vec<String> {
+		let (Some(anchor), Some(head)) =
+			(self.selected_commit.as_deref(), self.range_head.as_deref())
+		else {
+			return Vec::new();
+		};
+		let rows = self.display_commits();
+		let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
+		range_between(&ids, anchor, head)
+	}
+
+	/// The row is part of the log's selection.
+	pub fn log_is_selected(&self, id: &str) -> bool {
+		self.selected_commit.as_deref() == Some(id)
+			|| self.log_selected.iter().any(|s| s == id)
+	}
+
 	/// Endpoint diff between the two ends of the range (older → newer).
 	pub fn compare_range(&mut self, cx: &mut Context<Self>) {
 		let Some((top, bottom)) = self.range_rows() else {
 			return;
 		};
 		let rows = self.display_commits();
-		let (newer, older) = (
-			Box::<str>::from(rows[top].sha.as_str()).into_string(),
-			Box::<str>::from(rows[bottom].sha.as_str()).into_string(),
-		);
+		let ends = self
+			.log_root_for(&rows[top].sha)
+			.zip(self.log_root_for(&rows[bottom].sha));
 		drop(rows);
+		let Some(((root, newer), (_, older))) = ends else {
+			return;
+		};
+		let (newer, older) = (
+			Box::<str>::from(newer).into_string(),
+			Box::<str>::from(older).into_string(),
+		);
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
 		self.compare = Some((older.clone(), newer.clone()));
+		self.details_generation = self.details_generation.wrapping_add(1);
+		self.commit_details = None;
 		self.selected_commit_file = None;
 		self.commit_files.clear();
 		self.clear_preview();
 		self.preview_loading = true;
 		self.preview_error = None;
-		let Some(root) = self.repo_root() else {
-			return;
-		};
+		self.log_commit_root = Some(root.clone());
 		app_log!("[APP:COMPARE: from={} to={}]", &older[..7], &newer[..7]);
 		self.load_change_list(
 			root,
@@ -1195,6 +2407,7 @@ impl WorkbenchModel {
 				from: older,
 				to: newer,
 			},
+			None,
 			task_generation,
 			cx,
 		);
@@ -1206,6 +2419,7 @@ impl WorkbenchModel {
 		root: std::path::PathBuf,
 		source: GitSource,
 		preview_source: PreviewSource,
+		parents: Option<Vec<String>>,
 		task_generation: u64,
 		cx: &mut Context<Self>,
 	) {
@@ -1223,29 +2437,34 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
+						// The listing is metadata: a commit touching tens of
+						// thousands of files lists under the interactive limit
+						// and is cut to MAX_COMMIT_FILES afterwards.
+						let listing =
+							crate::interactive_read_opts(cancel.clone());
 						let opts = RunOptions {
 							cancel: Some(cancel),
 							max_stdout: browser::PREVIEW_LIMIT,
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						let git = Git::open_with(&root, &opts)
-							.map_err(|e| e.to_string())?;
+						// The repository's root is known: no probe processes.
+						let git = Git::at_known_root(root);
 						let files = gitsrc::list_changed_paths_with(
-							&git, &source, &opts,
+							&git, &source, &listing,
 						)
 						.map_err(|e| e.to_string())?;
-						let first = files.first().map(|(p, _)| {
+						let first = files.first().map(|(p, change)| {
 							(
 								p.clone(),
-								browser::git_preview_with(
-									&git, &source, p, &opts,
-								)
-								.map(|p| browser::SourcePreview {
-									content: p.content,
-									patch: p.patch,
-								})
-								.map_err(|e| e.to_string()),
+								read_preview(
+									&git,
+									&source,
+									p,
+									*change,
+									parents.as_deref(),
+									&opts,
+								),
 							)
 						});
 						Ok::<_, String>((files, first))
@@ -1259,8 +2478,19 @@ impl WorkbenchModel {
 						Ok((mut files, first)) => {
 							let total = files.len();
 							files.truncate(MAX_COMMIT_FILES);
+							files.shrink_to_fit();
 							app_log!("[APP:E2E_CHANGES: files={}]", total);
+							if total > MAX_COMMIT_FILES {
+								model.set_status(
+									"status_commit_files_truncated",
+									[
+										total.to_string(),
+										MAX_COMMIT_FILES.to_string(),
+									],
+								);
+							}
 							model.commit_files = files;
+							model.commit_file_origin.clear();
 							match first {
 								Some((path, p)) => {
 									model.selected_commit_file =
@@ -1296,21 +2526,42 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		let (source, psource) = match (&self.compare, &self.selected_commit) {
-			(Some((a, b)), _) => (
-				GitSource::Range(a.clone(), b.clone()),
-				PreviewSource::Compare {
-					from: a.clone(),
-					to: b.clone(),
-				},
-			),
-			(None, Some(sha)) => (
-				GitSource::Commit(sha.clone()),
-				PreviewSource::CommitDiff { sha: sha.clone() },
-			),
-			_ => return,
-		};
-		let Some(root) = self.repo_root() else {
+		let (source, psource, root, parents) =
+			match (&self.compare, &self.selected_commit) {
+				(Some((a, b)), _) => (
+					GitSource::Range(a.clone(), b.clone()),
+					PreviewSource::Compare {
+						from: a.clone(),
+						to: b.clone(),
+					},
+					self.log_commit_root.clone(),
+					None,
+				),
+				(None, _) if self.log_selected.len() > 1 => {
+					match self.selection_file_source(path) {
+						Some(s) => s,
+						None => return,
+					}
+				}
+				(None, Some(id)) => {
+					let Some((root, sha)) = self.log_root_for(id) else {
+						return;
+					};
+					(
+						GitSource::Commit(sha.clone()),
+						PreviewSource::CommitDiff { sha },
+						Some(root),
+						self.known_parents(id),
+					)
+				}
+				_ => return,
+			};
+		let change = self
+			.commit_files
+			.iter()
+			.find(|(p, _)| p == path)
+			.and_then(|(_, c)| *c);
+		let Some(root) = root else {
 			return;
 		};
 		self.preview_generation += 1;
@@ -1336,14 +2587,15 @@ impl WorkbenchModel {
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						let git = Git::open_with(&root, &opts)
-							.map_err(|e| e.to_string())?;
-						browser::git_preview_with(&git, &source, &for_bg, &opts)
-							.map(|p| browser::SourcePreview {
-								content: p.content,
-								patch: p.patch,
-							})
-							.map_err(|e| e.to_string())
+						let git = Git::at_known_root(root);
+						read_preview(
+							&git,
+							&source,
+							&for_bg,
+							change,
+							parents.as_deref(),
+							&opts,
+						)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -1360,6 +2612,47 @@ impl WorkbenchModel {
 				});
 			},
 		);
+	}
+
+	/// A multi-selection's diff of `path`: the oldest selected commit's
+	/// parent against the newest selected commit. A root commit has no
+	/// parent to diff from, so then it is the file's diff in the newest
+	/// selected commit that touched it.
+	#[allow(clippy::type_complexity)]
+	fn selection_file_source(
+		&self,
+		path: &str,
+	) -> Option<(
+		GitSource,
+		PreviewSource,
+		Option<std::path::PathBuf>,
+		Option<Vec<String>>,
+	)> {
+		let newest = self.log_selected.first()?;
+		let oldest = self.log_selected.last()?;
+		let (root, to) = self.log_root_for(newest)?;
+		if let Some(from) = self
+			.known_parents(oldest)
+			.and_then(|p| p.into_iter().next())
+		{
+			return Some((
+				GitSource::Range(from.clone(), to.clone()),
+				PreviewSource::Compare { from, to },
+				Some(root),
+				None,
+			));
+		}
+		let idx = self.commit_files.iter().position(|(p, _)| p == path)?;
+		let id = self
+			.log_selected
+			.get(*self.commit_file_origin.get(idx)? as usize)?;
+		let (_, sha) = self.log_root_for(id)?;
+		Some((
+			GitSource::Commit(sha.clone()),
+			PreviewSource::CommitDiff { sha },
+			Some(root),
+			self.known_parents(id),
+		))
 	}
 
 	/// Keyboard move in the log; `extend` grows the range instead.
@@ -1383,13 +2676,13 @@ impl WorkbenchModel {
 			self.selected_commit.as_ref()
 		};
 		let cur = from.and_then(|s| rows.iter().position(|r| r == s));
+		let anchor = self.selected_commit.as_deref().filter(|_| extend);
 		let next = match cur {
-			Some(c) => {
-				(c as isize + delta).clamp(0, rows.len() as isize - 1) as usize
-			}
+			Some(c) => step_row(&rows, c, delta, anchor),
 			None => 0,
 		};
 		self.log_scroll.scroll_to_item(next, ScrollStrategy::Center);
+		self.rearm_autoload();
 		if extend && self.selected_commit.is_some() {
 			self.extend_range(&rows[next], cx);
 		} else {
@@ -1398,9 +2691,22 @@ impl WorkbenchModel {
 	}
 
 	pub fn browse_commit_tree(&mut self, cx: &mut Context<Self>) {
-		let Some(sha) = self.selected_commit.clone() else {
+		let Some((root, sha)) = self
+			.selected_commit
+			.as_deref()
+			.and_then(|id| self.log_root_for(id))
+		else {
 			return;
 		};
+		// The commit tree lives in the Project tool window, which shows the
+		// selected repository.
+		if self.repo_root().as_ref() != Some(&root) {
+			let name = self.log_repo_name(&root);
+			app_log!("[APP:REV_TREE_REFUSED: other_repo]");
+			self.set_status("status_log_tree_other_repo", [name]);
+			cx.notify();
+			return;
+		}
 		self.tree_generation += 1;
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
 		self.rev_tree = Some(RevTree::new(sha.clone()));
@@ -1610,6 +2916,690 @@ impl WorkbenchModel {
 	}
 }
 
+/// The row `delta` away from `cur`, clamped to the log. With an anchor
+/// (a Shift move), rows of other repositories are stepped over: the merged
+/// log interleaves them and a range stays in the anchor's repository.
+pub fn step_row(
+	rows: &[String],
+	cur: usize,
+	delta: isize,
+	anchor: Option<&str>,
+) -> usize {
+	let last = rows.len() as isize - 1;
+	let mut at = cur as isize;
+	loop {
+		let next = (at + delta).clamp(0, last);
+		if next == at {
+			return cur.min(rows.len() - 1);
+		}
+		at = next;
+		if anchor.is_none_or(|a| same_repo(a, &rows[at as usize])) {
+			return at as usize;
+		}
+	}
+}
+
+/// Both ids name commits of one repository (plain SHAs always do).
+pub fn same_repo(a: &str, b: &str) -> bool {
+	multi_log::split_id(a).1 == multi_log::split_id(b).1
+}
+
+/// Shift range: the rows from `anchor` to `head` (display order, both
+/// included) that belong to the anchor's repository.
+pub fn range_between(rows: &[&str], anchor: &str, head: &str) -> Vec<String> {
+	let pos = |id: &str| rows.iter().position(|r| *r == id);
+	let (Some(a), Some(b)) = (pos(anchor), pos(head)) else {
+		return Vec::new();
+	};
+	rows[a.min(b)..=a.max(b)]
+		.iter()
+		.filter(|r| same_repo(r, anchor))
+		.map(|r| r.to_string())
+		.collect()
+}
+
+/// Cmd/Ctrl-click: `selection` with `id` toggled in or out, in display
+/// order. A selection stays in one repository, so an id of another one
+/// is refused.
+pub fn toggle_selection(
+	rows: &[&str],
+	selection: &[String],
+	id: &str,
+) -> Result<Vec<String>, &'static str> {
+	if selection.iter().any(|s| !same_repo(s, id)) {
+		return Err("cross_repo");
+	}
+	let mut out: Vec<String> =
+		selection.iter().filter(|s| *s != id).cloned().collect();
+	if out.len() == selection.len() {
+		out.push(id.to_string());
+	}
+	let order: HashMap<&str, usize> =
+		rows.iter().enumerate().map(|(i, r)| (*r, i)).collect();
+	out.sort_by_key(|s| order.get(s.as_str()).copied().unwrap_or(usize::MAX));
+	Ok(out)
+}
+
+/// A commit's changed paths and their change types.
+pub type ChangedFiles = Vec<(String, Option<snip_core::format::ChangeType>)>;
+
+/// Changed files of several commits (newest first) as one list, like
+/// IntelliJ's multi-commit selection: each path once, with the change of
+/// the newest commit touching it and that commit's index. At most
+/// `MAX_COMMIT_FILES` are kept; the count of distinct paths comes last.
+pub fn union_changed_files<E>(
+	lists: impl IntoIterator<Item = Result<ChangedFiles, E>>,
+) -> Result<(ChangedFiles, Vec<u32>, usize), E> {
+	let mut seen = HashSet::new();
+	let (mut files, mut origin, mut total) = (Vec::new(), Vec::new(), 0);
+	for (i, list) in lists.into_iter().enumerate() {
+		for (path, change) in list? {
+			if !seen.insert(path.clone()) {
+				continue;
+			}
+			total += 1;
+			if files.len() < MAX_COMMIT_FILES {
+				files.push((path, change));
+				origin.push(i as u32);
+			}
+		}
+	}
+	Ok((files, origin, total))
+}
+
+/// One read of a merged-log feed: its page (plain SHAs) and, on the
+/// feed's first read, its refs and the tips later pages walk.
+struct FeedRead {
+	commits: Vec<CommitSummary>,
+	more: bool,
+	snapshot: Option<browser::RefSnapshot>,
+	tips: Vec<String>,
+	email: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_feed_page(
+	root: &std::path::Path,
+	first: bool,
+	tips: Vec<String>,
+	ref_filter: Option<&str>,
+	search: Option<&LogQuery>,
+	skip: usize,
+	want_email: bool,
+	opts: &RunOptions,
+) -> Result<FeedRead, String> {
+	let git = Git::open_with(root, opts).map_err(|e| e.to_string())?;
+	let mut read = FeedRead {
+		commits: Vec::new(),
+		more: false,
+		snapshot: None,
+		tips,
+		email: want_email.then(|| read_user_email(&git, opts)).flatten(),
+	};
+	if first {
+		let snap = browser::refs_with(&git, opts).map_err(|e| e.to_string())?;
+		let tips = match ref_filter.filter(|r| !r.is_empty()) {
+			// A branch filter picks that branch in every repository that
+			// has it; the others show nothing.
+			Some(r) => git.resolve_commit_with(r, opts).ok().map(|t| vec![t]),
+			None => Some(snap.tips()),
+		};
+		read.snapshot = Some(snap);
+		match tips {
+			Some(tips) => read.tips = tips,
+			None => return Ok(read),
+		}
+	}
+	let (commits, more) = match search {
+		Some(q) => browser::history_query_with(
+			&git,
+			ref_filter,
+			q,
+			skip,
+			multi_log::FEED_PAGE,
+			opts,
+		),
+		None => browser::log_from_tips_with(
+			&git,
+			&read.tips,
+			skip,
+			multi_log::FEED_PAGE,
+			opts,
+		),
+	}
+	.map_err(|e| e.to_string())?;
+	read.commits = commits;
+	read.more = more;
+	Ok(read)
+}
+
+/// The log over the workspace's repositories (IntelliJ's multi-root log).
+impl WorkbenchModel {
+	/// The repositories the log shows: the Repository chip's picks, else
+	/// every repository of the workspace.
+	pub fn log_scope(&self) -> Vec<(PathBuf, String)> {
+		let all = self.repos.iter().map(|r| (r.root.clone(), r.name.clone()));
+		let picked: Vec<_> = all
+			.clone()
+			.filter(|(root, _)| self.log_repo_filter.contains(root))
+			.collect();
+		if picked.is_empty() {
+			all.collect()
+		} else {
+			picked
+		}
+	}
+
+	/// The Repository chip picked repositories that discovery has not
+	/// reached yet (a reopened workspace is still being scanned).
+	fn log_filter_pending(&self) -> bool {
+		self.is_loading
+			&& !self.log_repo_filter.is_empty()
+			&& !self
+				.repos
+				.iter()
+				.any(|r| self.log_repo_filter.contains(&r.root))
+	}
+
+	/// The loaded log merges several repositories.
+	pub fn log_is_merged(&self) -> bool {
+		self.log_scope_key.len() > 1
+	}
+
+	/// The single-repository log's root.
+	fn log_root(&self) -> Option<PathBuf> {
+		match self.log_scope_key.as_slice() {
+			[one] => Some(one.clone()),
+			_ => None,
+		}
+	}
+
+	/// The repository and plain SHA of a log row id.
+	pub fn log_root_for(&self, id: &str) -> Option<(PathBuf, String)> {
+		let (sha, feed) = multi_log::split_id(id);
+		let root = match feed {
+			Some(i) => self.log_feeds.get(i)?.root.clone(),
+			None => self.log_root()?,
+		};
+		Some((root, sha.to_string()))
+	}
+
+	pub fn log_repo_name(&self, root: &std::path::Path) -> String {
+		self.repos
+			.iter()
+			.find(|r| r.root == root)
+			.map(|r| r.name.clone())
+			.unwrap_or_else(|| root.display().to_string())
+	}
+
+	/// A repository's root-stripe color: its place in the workspace, so
+	/// it stays the same whatever the Repository chip shows.
+	pub fn log_repo_color(&self, root: &std::path::Path) -> usize {
+		self.repos.iter().position(|r| r.root == root).unwrap_or(0)
+	}
+
+	/// The merged log's repository of a row and its stripe color.
+	pub fn log_row_repo(&self, id: &str) -> Option<(&multi_log::Feed, usize)> {
+		let feed = self.log_feeds.get(multi_log::split_id(id).1?)?;
+		Some((feed, self.log_repo_color(&feed.root)))
+	}
+
+	/// The checked-out branch of the repository a log row belongs to.
+	pub fn log_current_branch(&self, id: &str) -> Option<String> {
+		let (root, _) = self.log_root_for(id)?;
+		self.repos
+			.iter()
+			.find(|r| r.root == root)?
+			.summary
+			.as_ref()
+			.ok()?
+			.branch
+			.clone()
+	}
+
+	/// Whether selecting a repository resets and reloads the log. The log
+	/// shows the workspace, not the selected repository: only a refresh or
+	/// a changed set of repositories reloads it.
+	pub fn log_reloads_on_repo_switch(&self, preserve_anchors: bool) -> bool {
+		preserve_anchors
+			|| self.log_scope_key.is_empty()
+			|| !self
+				.log_scope()
+				.iter()
+				.map(|(r, _)| r)
+				.eq(&self.log_scope_key)
+			|| (self.commits.is_empty()
+				&& self.history_error.is_none()
+				&& !self.history_extending)
+	}
+
+	/// A discovery that changed the workspace's repositories reloads a
+	/// loaded log.
+	pub fn sync_log_scope(&mut self, cx: &mut Context<Self>) {
+		if self.log_deferred {
+			if self.reset_history_query(
+				self.active_ref_filter.clone(),
+				self.log_search.clone(),
+			) {
+				self.load_history(cx);
+			}
+			return;
+		}
+		if self.log_scope_key.is_empty()
+			|| self
+				.log_scope()
+				.iter()
+				.map(|(r, _)| r)
+				.eq(&self.log_scope_key)
+		{
+			return;
+		}
+		app_log!("[APP:LOG_SCOPE_CHANGED]");
+		if self.reset_history_query(
+			self.active_ref_filter.clone(),
+			self.log_search.clone(),
+		) {
+			self.load_history(cx);
+		}
+	}
+
+	/// After a repository switch that kept the log: it is loaded as it was.
+	pub fn log_kept_on_repo_switch(&self) {
+		if !self.history_extending {
+			app_log!("[APP:GRAPH_LOADED: commits={}]", self.commits.len());
+		}
+	}
+
+	/// Repository chip: checks or unchecks one repository (the last one
+	/// stays). All checked is the whole workspace.
+	pub fn toggle_log_repo(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+		let mut picked: Vec<PathBuf> =
+			self.log_scope().into_iter().map(|(r, _)| r).collect();
+		match picked.iter().position(|r| *r == root) {
+			Some(_) if picked.len() == 1 => return,
+			Some(i) => {
+				picked.remove(i);
+			}
+			None => picked.push(root),
+		}
+		if picked.len() == self.repos.len() {
+			picked.clear();
+		}
+		self.log_repo_filter = picked;
+		self.apply_log_repo_filter(cx);
+	}
+
+	/// Repository chip: exactly these repositories (none: all of them).
+	pub fn set_log_repos(
+		&mut self,
+		roots: Vec<PathBuf>,
+		cx: &mut Context<Self>,
+	) {
+		self.log_menu = None;
+		self.log_repo_filter = roots;
+		self.apply_log_repo_filter(cx);
+	}
+
+	/// Paths are repository-relative in one repository and prefixed with
+	/// the repository in the merged log, so a new scope starts without.
+	fn apply_log_repo_filter(&mut self, cx: &mut Context<Self>) {
+		app_log!("[APP:LOG_REPOS: n={}]", self.log_scope().len());
+		self.log_filter.paths.clear();
+		self.log_paths_expanded.clear();
+		self.selected_commit = None;
+		self.range_head = None;
+		self.log_selected.clear();
+		self.commit_details = None;
+		self.apply_log_filter(cx);
+	}
+
+	/// What Copy Commits exports: the repository, its name, the tip and
+	/// the selected commits as plain SHAs. A first-parent chain is one
+	/// repository's, so a selection spanning two is refused.
+	pub fn commit_copy_target(
+		&self,
+	) -> Result<(PathBuf, String, String, Vec<String>), &'static str> {
+		let ids = match (self.range_rows(), &self.selected_commit) {
+			// A Cmd/Ctrl-click selection may have gaps: core refuses it
+			// as not contiguous.
+			_ if self.log_selected.len() > 1 => self.log_selected.clone(),
+			(Some(_), _) => self.range_ids(),
+			(None, Some(sel))
+				if self.display_commits().iter().any(|c| &c.sha == sel) =>
+			{
+				vec![sel.clone()]
+			}
+			_ => Vec::new(),
+		};
+		let tip = ids.first().ok_or("no_selection")?;
+		if ids.iter().any(|id| !same_repo(id, tip)) {
+			return Err("cross_repo");
+		}
+		let (root, tip_sha) = self.log_root_for(tip).ok_or("no_selection")?;
+		let selected = ids
+			.iter()
+			.map(|id| multi_log::split_id(id).0.to_string())
+			.collect();
+		let name = self.log_repo_name(&root);
+		Ok((root, name, tip_sha, selected))
+	}
+
+	fn start_merged_log(
+		&mut self,
+		scope: Vec<(PathBuf, String)>,
+		cx: &mut Context<Self>,
+	) {
+		if !self.reset_history_query(
+			self.active_ref_filter.clone(),
+			self.log_search.clone(),
+		) {
+			cx.notify();
+			return;
+		}
+		// Paths name their repository first; a repository with none of the
+		// picked paths is left out, one picked whole keeps all its history.
+		let paths = self
+			.log_search
+			.as_ref()
+			.map(|q| q.paths.clone())
+			.unwrap_or_default();
+		self.log_feeds = scope
+			.into_iter()
+			.filter_map(|(root, name)| {
+				let mut mine = Vec::new();
+				let mut whole = paths.is_empty();
+				for p in &paths {
+					if *p == name {
+						whole = true;
+					} else if let Some(rel) = p
+						.strip_prefix(name.as_str())
+						.and_then(|r| r.strip_prefix('/'))
+					{
+						mine.push(rel.to_string());
+					}
+				}
+				if whole {
+					mine.clear();
+				} else if mine.is_empty() {
+					return None;
+				}
+				Some(multi_log::Feed::new(root, name, mine))
+			})
+			.collect();
+		self.history_generation += 1;
+		let _ = arm_cancel(&mut self.history_cancel);
+		self.history_error = None;
+		app_log!("[APP:MULTI_LOG: repos={}]", self.log_feeds.len());
+		self.merged_step(self.history_page_size, cx);
+	}
+
+	/// Merges read commits up to `target` rows, reading the feed that gates
+	/// the merge first (one read at a time).
+	fn merged_step(&mut self, target: usize, cx: &mut Context<Self>) {
+		let want = target
+			.min(graph_view::MAX_LAYOUT_ROWS)
+			.saturating_sub(self.commits.len());
+		let order = multi_log::merge_order(&self.log_feeds, want);
+		if order.len() < want {
+			if let Some(i) = multi_log::next_read(&self.log_feeds) {
+				self.read_feed(i, target, cx);
+				return;
+			}
+		}
+		self.install_merged(&order, cx);
+		cx.notify();
+	}
+
+	fn read_feed(&mut self, i: usize, target: usize, cx: &mut Context<Self>) {
+		let Some(feed) = self.log_feeds.get(i) else {
+			return;
+		};
+		if !self.accepting_work() {
+			self.history_extending = false;
+			return;
+		}
+		let root = feed.root.clone();
+		let first = !feed.loaded;
+		let tips = feed.tips.clone();
+		let skip = feed.skip;
+		let search = self
+			.log_search
+			.clone()
+			.map(|mut q| {
+				q.paths = feed.paths.clone();
+				q
+			})
+			.filter(|q| !q.is_empty());
+		let ref_filter = self.active_ref_filter.clone();
+		let want_email = first && i == 0;
+		self.history_generation += 1;
+		let generation = self.history_generation;
+		let cancel = arm_cancel(&mut self.history_cancel);
+		self.history_extending = true;
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		let cancel_bg = cancel.clone();
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel),
+			async move {
+				let res = bg
+					.spawn(async move {
+						let opts = crate::interactive_read_opts(cancel_bg);
+						read_feed_page(
+							&root,
+							first,
+							tips,
+							ref_filter.as_deref(),
+							search.as_ref(),
+							skip,
+							want_email,
+							&opts,
+						)
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.history_generation != generation {
+						return;
+					}
+					model.history_extending = false;
+					let error = model.apply_feed_read(i, res);
+					match error {
+						Some(e) if model.log_feeds.iter().all(|f| f.failed) => {
+							model.history_autoload = false;
+							model.report_graph_error(
+								GraphAdmissionError::Layout(e),
+							);
+							cx.notify();
+						}
+						_ => model.merged_step(target, cx),
+					}
+				});
+			},
+		);
+	}
+
+	/// Takes a feed read in, namespacing its ids; a failed read ends that
+	/// feed only. Returns the error.
+	fn apply_feed_read(
+		&mut self,
+		i: usize,
+		res: Result<FeedRead, String>,
+	) -> Option<String> {
+		let feed = self.log_feeds.get_mut(i)?;
+		let read = match res {
+			Ok(read) => read,
+			Err(e) => {
+				app_log!("[APP:MULTI_LOG_FEED_ERROR: {}]", feed.name);
+				feed.failed = true;
+				return Some(e);
+			}
+		};
+		let ns = |sha: &str| multi_log::ns_id(sha, i);
+		if let Some(snap) = read.snapshot {
+			feed.head = snap.head.as_deref().map(ns);
+			if let Some(head) = feed.head.clone().filter(|_| snap.detached) {
+				self.refs.push(browser::GitReference {
+					name: "HEAD".into(),
+					sha: head,
+				});
+			}
+			self.refs.extend(snap.refs.into_iter().map(|r| {
+				browser::GitReference {
+					sha: ns(&r.sha),
+					name: r.name,
+				}
+			}));
+		}
+		feed.tips = read.tips;
+		let commits = read
+			.commits
+			.into_iter()
+			.map(|mut c| {
+				c.sha = ns(&c.sha);
+				for p in &mut c.parents {
+					*p = ns(p);
+				}
+				c
+			})
+			.collect();
+		feed.push_page(commits, read.more);
+		if read.email.is_some() {
+			self.git_user_email = read.email;
+		}
+		None
+	}
+
+	/// Appends the merged rows `order` names and lays the whole list out
+	/// again, under the same budget as a single repository's window.
+	fn install_merged(&mut self, order: &[usize], cx: &mut Context<Self>) {
+		let first = self.commits.is_empty();
+		let mut taken = vec![0usize; self.log_feeds.len()];
+		let mut commits = self.commits.clone();
+		for &i in order {
+			commits.push(self.log_feeds[i].pending[taken[i]].clone());
+			taken[i] += 1;
+		}
+		let more = self
+			.log_feeds
+			.iter()
+			.zip(&taken)
+			.any(|(f, n)| f.pending.len() > *n || f.can_read());
+		// ponytail: the merged log stops at one layout's rows (no page
+		// eviction across repositories); the Repository chip pages deeper.
+		let capped = more && commits.len() >= graph_view::MAX_LAYOUT_ROWS;
+		let heads: Vec<String> = self
+			.log_feeds
+			.iter()
+			.filter_map(|f| f.head.clone())
+			.collect();
+		let feeds_bytes: usize = self
+			.log_feeds
+			.iter()
+			.map(multi_log::Feed::retained_bytes)
+			.sum();
+		let history = browser::RepositoryHistory {
+			root: String::new(),
+			commits,
+			refs: self.refs.clone(),
+			head: None,
+			has_more: more && !capped,
+		};
+		let prepared = PreparedHistory::prepare_with(
+			history,
+			None,
+			(0, 0),
+			&[],
+			self.collapsed_merges.clone(),
+			self.active_ref_filter.clone(),
+			self.log_search.clone(),
+		)
+		.and_then(|mut c| {
+			c.on_head = mark_on_head(&c.commits, heads);
+			if c.retained_bytes().saturating_add(feeds_bytes)
+				> MAX_RETAINED_GRAPH_BYTES
+			{
+				Err(GraphAdmissionError::Budget)
+			} else {
+				Ok(c)
+			}
+		});
+		let candidate = match prepared {
+			Ok(candidate) => candidate,
+			Err(error) => {
+				self.history_autoload = false;
+				self.report_graph_error(error);
+				return;
+			}
+		};
+		app_log!(
+			"[APP:GRAPH_RETAINED: bytes={} limit={}]",
+			candidate.retained_bytes().saturating_add(feeds_bytes),
+			MAX_RETAINED_GRAPH_BYTES
+		);
+		candidate.install(self);
+		for (feed, n) in self.log_feeds.iter_mut().zip(taken) {
+			feed.pending.drain(..n);
+		}
+		self.history_autoload = true;
+		let n = self.commits.len();
+		if capped {
+			app_log!("[APP:MULTI_LOG_CAPPED: rows={n}]");
+			self.set_status("status_log_merged_cap", [n.to_string()]);
+		} else {
+			self.set_status("status_history_loaded", [n.to_string()]);
+		}
+		app_log!(
+			"[APP:MULTI_LOG_LOADED: repos={} rows={n}]",
+			self.log_feeds.len()
+		);
+		app_log!("[APP:GRAPH_LOADED: commits={n}]");
+		app_log!(
+			"[APP:E2E_LOG: mode={} n={n} first={} page=1]",
+			if self.log_search.is_some() {
+				"search"
+			} else {
+				"graph"
+			},
+			self.commits.first().map(|c| &c.sha[..7]).unwrap_or("-"),
+		);
+		if first {
+			self.select_head_after_load = false;
+			if let Some(anchor) = self.selected_commit.clone() {
+				if !self.reselect_after_load(&anchor, cx) {
+					self.selected_commit = None;
+					self.log_selected.clear();
+					self.commit_details = None;
+				}
+			}
+		}
+	}
+
+	/// Go to HEAD in the merged log: the selected repository's, else the
+	/// first one's.
+	fn locate_merged_head(&mut self, cx: &mut Context<Self>) {
+		let selected = self.repo_root();
+		let head = self
+			.log_feeds
+			.iter()
+			.find(|f| Some(&f.root) == selected.as_ref())
+			.or(self.log_feeds.first())
+			.and_then(|f| f.head.clone());
+		let Some(head) = head else {
+			return;
+		};
+		if let Some(ix) =
+			self.display_commits().iter().position(|c| c.sha == head)
+		{
+			self.log_scroll.scroll_to_item(ix, ScrollStrategy::Center);
+			app_log!("[APP:HEAD_LOCATED: row={}]", ix);
+			self.select_commit(&head, cx);
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1718,9 +3708,9 @@ mod tests {
 			&[],
 			Vec::new(),
 			None,
-			Some(LogSearch {
-				query: oversized_short_string(),
-				author: false,
+			Some(LogQuery {
+				text: oversized_short_string(),
+				..Default::default()
 			}),
 		);
 		assert!(matches!(rejected, Err(GraphAdmissionError::Budget)));
@@ -1752,26 +3742,173 @@ mod tests {
 	}
 
 	#[test]
-	fn graph_admission_propagates_layout_failure() {
+	fn thousands_of_refs_keep_the_page_and_the_selector_complete() {
 		let previous = first_page();
-		let mut bad = history(vec![c("c1", &["c0"])]);
-		bad.refs = (0..1001)
+		let mut many = history(vec![c("c1", &["c0"])]);
+		// 5000 refs elsewhere in the repository plus 1001 on this page.
+		many.refs = (0..6001)
 			.map(|n| browser::GitReference {
 				name: format!("refs/heads/b{n}"),
-				sha: "c1".into(),
+				sha: if n < 1001 {
+					"c1".into()
+				} else {
+					format!("{n:040x}")
+				},
 			})
 			.collect();
-		let rejected = PreparedHistory::prepare(
-			bad,
+		let page = PreparedHistory::prepare(
+			many,
 			1,
 			&previous.page_checkpoints,
 			Vec::new(),
 			None,
 			None,
+		)
+		.unwrap();
+		assert_eq!(page.refs.len(), 6001, "the ref selector keeps every ref");
+		let row = &page.graph_layout.as_ref().unwrap().rows[0];
+		assert_eq!(row.refs.len(), graph_view::MAX_LAYOUT_REFS);
+	}
+
+	#[test]
+	fn too_many_rails_fall_back_to_a_list_and_later_pages_still_load() {
+		// 300 branch tips whose parents are all on later pages.
+		let tips: Vec<CommitSummary> = (0..300)
+			.map(|n| c(&format!("t{n}"), &[&format!("p{n}")]))
+			.collect();
+		let page0 = PreparedHistory::prepare(
+			history(tips),
+			0,
+			&[],
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap();
+		assert!(page0.graph_layout.as_ref().unwrap().is_fallback);
+		assert_eq!(page0.page_checkpoints.get(1).cloned().flatten(), None);
+		let page1 = PreparedHistory::prepare(
+			history(vec![c("p0", &[])]),
+			1,
+			&page0.page_checkpoints,
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap();
+		assert!(page1.graph_layout.as_ref().unwrap().is_fallback);
+		assert_eq!(page1.commits.len(), 1);
+	}
+
+	#[test]
+	fn detached_head_gets_a_badge_and_shallow_cut_is_not_a_root() {
+		let mut page = history(vec![c("h", &["b"]), c("b", &[])]);
+		page.head = Some("h".into());
+		let walk = HistoryWalk {
+			detached: true,
+			shallow: vec!["b".into()],
+			..Default::default()
+		};
+		let prepared = PreparedHistory::prepare_with(
+			page,
+			Some(walk),
+			(0, 0),
+			&[],
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap();
+		let layout = prepared.graph_layout.as_ref().unwrap();
+		assert!(layout.rows[0]
+			.refs
+			.iter()
+			.any(|r| r.kind == snip_core::graph::RefKind::Head));
+		assert_eq!(
+			layout.rows[1].node.node_type,
+			snip_core::graph::NodeType::ShallowRoot
 		);
-		assert!(
-			matches!(rejected, Err(GraphAdmissionError::Layout(message)) if message.contains("refs limit"))
-		);
+		assert!(prepared.refs.is_empty(), "HEAD is a badge, not a ref");
+	}
+
+	#[test]
+	fn history_walk_slices_pages_and_knows_when_to_fetch() {
+		let walk = HistoryWalk {
+			start: 100,
+			window: (0..120).map(|n| c(&n.to_string(), &[])).collect(),
+			more: true,
+			..Default::default()
+		};
+		let (rows, more) = walk.page(150, 50).unwrap();
+		assert_eq!((rows[0].sha.as_str(), rows.len(), more), ("50", 50, true));
+		assert!(walk.page(200, 50).is_none(), "runs past the window");
+		assert!(walk.page(50, 50).is_none(), "before the window");
+		let last = HistoryWalk {
+			more: false,
+			..walk
+		};
+		let (rows, more) = last.page(200, 50).unwrap();
+		assert_eq!((rows.len(), more), (20, false));
+		assert_eq!(last.page(250, 50).unwrap().0.len(), 0);
+	}
+
+	#[test]
+	fn later_graph_pages_come_from_the_page_zero_window() {
+		use std::process::Command;
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		let git = |args: &[&str]| {
+			let out = Command::new("git")
+				.current_dir(root)
+				.args(args)
+				.output()
+				.unwrap();
+			assert!(out.status.success(), "{args:?}");
+			String::from_utf8(out.stdout).unwrap().trim().to_string()
+		};
+		git(&["init", "-q", "-b", "main"]);
+		for n in 0..6 {
+			git(&[
+				"-c",
+				"user.name=A",
+				"-c",
+				"user.email=a@x",
+				"commit",
+				"-q",
+				"--allow-empty",
+				"-m",
+				&format!("c{n}"),
+			]);
+		}
+		let opts = RunOptions::default();
+		let (first, walk) =
+			read_graph_page(root, None, None, 0, 2, &opts).unwrap();
+		assert!(first.has_more);
+		// The repository moves on; later pages are sliced from the window
+		// page 0 fetched (frozen tips on refetch are covered in browser.rs).
+		git(&[
+			"-c",
+			"user.name=A",
+			"-c",
+			"user.email=a@x",
+			"commit",
+			"-q",
+			"--allow-empty",
+			"-m",
+			"new",
+		]);
+		let reuse = Some((walk, first.refs.clone(), first.head.clone()));
+		let (second, walk) =
+			read_graph_page(root, reuse, None, 2, 2, &opts).unwrap();
+		let reuse = Some((walk, second.refs.clone(), second.head.clone()));
+		let (third, _) =
+			read_graph_page(root, reuse, None, 4, 2, &opts).unwrap();
+		assert!(!third.has_more);
+		let seen: Vec<String> = [first, second, third]
+			.into_iter()
+			.flat_map(|h| h.commits.into_iter().map(|c| c.subject))
+			.collect();
+		assert_eq!(seen, ["c5", "c4", "c3", "c2", "c1", "c0"]);
 	}
 
 	#[test]
@@ -1970,6 +4107,308 @@ mod tests {
 		println!(
 			"Standard Git fixture peak retained graph capacity: {peak} bytes"
 		);
+	}
+
+	/// 130 commits, a merge every 10 whose side parent is 5 back.
+	fn branchy(len: usize) -> Vec<CommitSummary> {
+		(0..len)
+			.rev()
+			.map(|n| {
+				let parents: Vec<String> = match n {
+					0 => vec![],
+					n if n % 10 == 0 && n >= 5 => vec![n - 1, n - 5],
+					n => vec![n - 1],
+				}
+				.into_iter()
+				.map(|p| format!("{p:040x}"))
+				.collect();
+				let mut commit = c(&format!("{n:040x}"), &[]);
+				commit.parents = parents;
+				commit
+			})
+			.collect()
+	}
+
+	/// (sha, lane, colour) of every row of a page's layout.
+	fn nodes(page: &PreparedHistory) -> Vec<(String, usize, usize)> {
+		page.graph_layout
+			.as_ref()
+			.unwrap()
+			.rows
+			.iter()
+			.map(|r| (r.sha.clone(), r.node.lane, r.node.color_index))
+			.collect()
+	}
+
+	#[test]
+	fn a_window_of_pages_lays_out_like_the_pages_one_by_one() {
+		let all = branchy(130);
+		let size = 50;
+		let page = |p: usize| {
+			let end = ((p + 1) * size).min(all.len());
+			browser::RepositoryHistory {
+				root: String::new(),
+				commits: all[p * size..end].to_vec(),
+				refs: Vec::new(),
+				head: None,
+				has_more: end < all.len(),
+			}
+		};
+		// Page by page, as the old pager did.
+		let mut single = Vec::new();
+		let mut checkpoints: Vec<Option<GraphCheckpoint>> = Vec::new();
+		for p in 0..3 {
+			let prepared = PreparedHistory::prepare(
+				page(p),
+				p,
+				&checkpoints,
+				Vec::new(),
+				None,
+				None,
+			)
+			.unwrap();
+			single.extend(nodes(&prepared));
+			checkpoints = prepared.page_checkpoints;
+		}
+		// Growing window, then evicting the first page and reading it back.
+		let mut window =
+			PreparedHistory::prepare(page(0), 0, &[], Vec::new(), None, None)
+				.unwrap();
+		for load in [PageLoad::Next, PageLoad::Next] {
+			let next = page(window.commit_page + 1);
+			let (commits, first, last, more) = merge_window(
+				&window.commits,
+				window.first_page,
+				window.commit_page,
+				window.history_has_more,
+				load,
+				next.commits,
+				next.has_more,
+				size,
+			);
+			window = PreparedHistory::prepare_with(
+				browser::RepositoryHistory {
+					commits,
+					has_more: more,
+					..page(0)
+				},
+				None,
+				(first, last),
+				&window.page_checkpoints,
+				Vec::new(),
+				None,
+				None,
+			)
+			.unwrap();
+		}
+		assert_eq!((window.first_page, window.commit_page), (0, 2));
+		assert_eq!(nodes(&window), single);
+		assert_eq!(window.page_checkpoints, checkpoints);
+		let tail = PreparedHistory::prepare_with(
+			browser::RepositoryHistory {
+				commits: all[size..].to_vec(),
+				has_more: false,
+				..page(0)
+			},
+			None,
+			(1, 2),
+			&window.page_checkpoints,
+			Vec::new(),
+			None,
+			None,
+		)
+		.unwrap();
+		assert_eq!(nodes(&tail), single[size..].to_vec());
+	}
+
+	#[test]
+	fn filtered_results_keep_a_graph_with_skipped_stubs() {
+		// Matches: m3 (parent m2, a match) and m2 (parent x, filtered out).
+		let page = PreparedHistory::prepare(
+			history(vec![c("m3", &["m2"]), c("m2", &["x"]), c("m1", &[])]),
+			0,
+			&[],
+			Vec::new(),
+			None,
+			Some(LogQuery {
+				author: Some("me".into()),
+				..Default::default()
+			}),
+		)
+		.unwrap();
+		let rows = &page.graph_layout.as_ref().expect("a graph").rows;
+		assert_eq!(rows.len(), 3);
+		let edge = |row: usize| rows[row].parent_edges[0].clone();
+		assert_eq!(edge(0).to_row, Some(1), "adjacent matches connect");
+		assert_eq!(
+			edge(1).continuation,
+			snip_core::graph::ContinuationKind::FilteredGap
+		);
+		assert!(edge(1).to_row.is_none());
+	}
+
+	#[test]
+	fn the_window_evicts_the_far_end_when_full() {
+		let size = 2;
+		let rows = |from: usize, n: usize| -> Vec<CommitSummary> {
+			(from..from + n).map(|i| c(&i.to_string(), &[])).collect()
+		};
+		let last = MAX_WINDOW_PAGES - 1;
+		let full = rows(0, MAX_WINDOW_PAGES * size);
+		let (out, first, l, more) = merge_window(
+			&full,
+			0,
+			last,
+			true,
+			PageLoad::Next,
+			rows(full.len(), 1),
+			false,
+			size,
+		);
+		assert_eq!((first, l, more), (1, last + 1, false));
+		assert_eq!(out.len(), full.len() - size + 1);
+		assert_eq!(out[0].sha, "2");
+		let (out, first, l, more) = merge_window(
+			&out,
+			1,
+			last + 1,
+			false,
+			PageLoad::Prev,
+			rows(0, size),
+			true,
+			size,
+		);
+		assert_eq!((first, l, more), (0, last, true));
+		assert_eq!(out.len(), MAX_WINDOW_PAGES * size);
+		assert_eq!(out[0].sha, "0");
+		let (out, first, l, _) = merge_window(
+			&out,
+			0,
+			last,
+			true,
+			PageLoad::Replace(4),
+			rows(8, size),
+			true,
+			size,
+		);
+		assert_eq!((out.len(), first, l), (size, 4, 4));
+	}
+
+	#[test]
+	fn head_marks_follow_parents_across_the_window() {
+		let commits = vec![
+			c("side", &["b"]),
+			c("head", &["b"]),
+			c("b", &["a"]),
+			c("a", &[]),
+		];
+		assert_eq!(
+			mark_on_head(&commits, ["head".to_string()]),
+			[false, true, true, true]
+		);
+		assert_eq!(
+			mark_on_head(&commits[2..], ["b".to_string()]),
+			[true, true]
+		);
+		assert!(mark_on_head(&commits, []).iter().all(|on| !on));
+	}
+
+	#[test]
+	fn date_range_covers_whole_days_and_refuses_bad_input() {
+		assert_eq!(
+			date_range("2026-01-02", "2026-01-31"),
+			Some((
+				Some("2026-01-02 00:00:00".into()),
+				Some("2026-01-31 23:59:59".into())
+			))
+		);
+		assert_eq!(
+			date_range("", "2026-01-31"),
+			Some((None, Some("2026-01-31 23:59:59".into())))
+		);
+		assert_eq!(date_range("", ""), Some((None, None)));
+		assert_eq!(date_range("2026-02-30", ""), None);
+		assert_eq!(date_range("yesterday", ""), None);
+		assert_eq!(date_range("2026-02-01", "2026-01-01"), None);
+		assert_eq!(clean_log_path(" /src\\app/ "), "src/app");
+	}
+
+	#[test]
+	fn log_selection_toggle_range_and_repos() {
+		// The merged log: repo 0 and repo 1 interleaved.
+		let rows = ["a3@0", "b2@1", "a2@0", "b1@1", "a1@0"];
+		let ids =
+			|v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+		// Shift range keeps the anchor's repository only, either direction.
+		assert_eq!(
+			range_between(&rows, "a3@0", "a1@0"),
+			ids(&["a3@0", "a2@0", "a1@0"])
+		);
+		assert_eq!(
+			range_between(&rows, "a1@0", "a3@0"),
+			ids(&["a3@0", "a2@0", "a1@0"])
+		);
+		assert!(range_between(&rows, "a1@0", "gone@0").is_empty());
+		// Shift+Down/Up step over the other repository's rows.
+		let owned = ids(&rows);
+		assert_eq!(step_row(&owned, 0, 1, Some("a3@0")), 2);
+		assert_eq!(step_row(&owned, 2, 1, Some("a3@0")), 4);
+		assert_eq!(step_row(&owned, 4, 1, Some("a3@0")), 4);
+		assert_eq!(step_row(&owned, 4, -1, Some("a3@0")), 2);
+		assert_eq!(step_row(&owned, 1, 1, Some("b2@1")), 3);
+		assert_eq!(step_row(&owned, 3, 1, Some("b2@1")), 3);
+		// A plain move walks every row.
+		assert_eq!(step_row(&owned, 0, 1, None), 1);
+		assert_eq!(step_row(&owned, 0, -1, None), 0);
+		// Toggle in (display order, with a gap), toggle out.
+		let sel = toggle_selection(&rows, &ids(&["a1@0"]), "a3@0").unwrap();
+		assert_eq!(sel, ids(&["a3@0", "a1@0"]));
+		let sel = toggle_selection(&rows, &sel, "a2@0").unwrap();
+		assert_eq!(sel, ids(&["a3@0", "a2@0", "a1@0"]));
+		let sel = toggle_selection(&rows, &sel, "a3@0").unwrap();
+		assert_eq!(sel, ids(&["a2@0", "a1@0"]));
+		assert!(toggle_selection(&rows, &ids(&["a1@0"]), "a1@0")
+			.unwrap()
+			.is_empty());
+		// Another repository's commit is refused, the selection unchanged.
+		assert_eq!(toggle_selection(&rows, &sel, "b2@1"), Err("cross_repo"));
+		// A single repository's plain SHAs are one repository.
+		assert!(toggle_selection(&["x", "y"], &ids(&["x"]), "y").is_ok());
+	}
+
+	#[test]
+	fn union_of_selected_commits_keeps_the_newest_change() {
+		use snip_core::format::ChangeType::{Deleted, Modified, New};
+		let list = |v: &[(&str, snip_core::format::ChangeType)]| {
+			v.iter()
+				.map(|(p, c)| (p.to_string(), Some(*c)))
+				.collect::<Vec<_>>()
+		};
+		// Newest first: a.txt deleted in the newest, added in the oldest.
+		let (files, origin, total) = union_changed_files(
+			[
+				list(&[("a.txt", Deleted), ("b.txt", Modified)]),
+				list(&[("c.txt", New)]),
+				list(&[("a.txt", New), ("c.txt", Modified)]),
+			]
+			.map(Ok::<_, ()>),
+		)
+		.unwrap();
+		assert_eq!(
+			files,
+			list(&[("a.txt", Deleted), ("b.txt", Modified), ("c.txt", New)])
+		);
+		assert_eq!(origin, [0, 0, 1]);
+		assert_eq!(total, 3);
+		// Distinct paths past the cap are counted, not kept.
+		let many: Vec<_> = (0..MAX_COMMIT_FILES + 2)
+			.map(|i| (format!("f{i}"), Some(Modified)))
+			.collect();
+		let (files, origin, total) =
+			union_changed_files([many.clone(), many].map(Ok::<_, ()>)).unwrap();
+		assert_eq!(files.len(), MAX_COMMIT_FILES);
+		assert_eq!(origin.len(), MAX_COMMIT_FILES);
+		assert_eq!(total, MAX_COMMIT_FILES + 2);
 	}
 
 	#[test]

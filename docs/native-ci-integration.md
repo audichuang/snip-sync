@@ -4,9 +4,19 @@
 
 `just preflight` now also requires `just native-acceptance`. The required Linux
 CI job `Native Acceptance (Linux)` runs the same Python entrypoint; the existing
-Rust/frontend/Tauri, native smoke/lifecycle, audit/DTO and four-target candidate
-jobs and package names remain in place. A wiring change is not a recorded CI or
-product pass: current run evidence must come from the generated reports.
+Rust/frontend/Tauri, native smoke/lifecycle and audit/DTO jobs remain in place.
+A wiring change is not a recorded CI or product pass: current run evidence must
+come from the generated reports.
+
+Since v0.3.0 this job also produces the Linux release package: after `--gate all`
+passes it packages the frozen executable named in `build-receipt.json`, checks
+that the tarball's executable has the receipt's sha256, smoke-tests it and
+uploads `native-candidate-x86_64-unknown-linux-gnu`. Next to the full evidence
+bundle (`native-acceptance-linux`, kept for debugging) it uploads
+`native-acceptance-receipt` with only `acceptance.json` and `build-receipt.json`,
+which is what `release.yml` downloads to bind the published Linux binary to this
+run. `native-candidate-artifacts` now covers macOS arm/intel and Windows only.
+See [the packaging doc](native-cross-platform-ci-and-packaging.md) section 2.
 
 | Entry | Checks |
 | --- | --- |
@@ -81,8 +91,9 @@ The short gate is **functional-short**, not standard-release, full D4, an
 absolute-memory acceptance result or cross-platform UI verification. The long
 entry generates the real standard workload and propagates the existing
 `missing-coverage` failure until hide/tray are supported and observed. It must
-pass separately for full native resource/release acceptance. This wiring does
-not change release publishing or candidate-artifact promotion policy.
+pass separately for full native resource/release acceptance. The release
+publishes the executable that passed this job's gates (functional-short
+included); that is not a claim that the long gate or D4 passed.
 
 The remainder of this document is the historical 2026-09-26 integration receipt.
 

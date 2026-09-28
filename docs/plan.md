@@ -126,25 +126,30 @@ Rust 版成為**第三個使用者**:`snip-core` 的整合測試讀同一份 fix
 | 時間軸 / 檔案樹 | `@tomplum/react-git-log`(HTML Grid)、`@rc-component/tree` |
 | 版面、i18n | 沿用 aghub(HeroUI、i18next,繁中 / 英文) |
 
-## 4. 原生打包(比照 aghub 的 release.yml)
+## 4. 原生打包與發布
+
+v0.3.0 起發布的桌面 App 是 GPUI 原生版(`crates/desktop-native`),細節見
+[native-cross-platform-ci-and-packaging.md](native-cross-platform-ci-and-packaging.md) 第 2 節。
+Tauri 版(本文件第 3 節的技術棧)仍在 CI 建置與測試以便回退,但不再發布。
 
 | | Windows | macOS | Linux |
 |---|---|---|---|
-| 產物 | NSIS `setup.exe` | `.dmg`,arm64 與 x64 各一份 | `.AppImage` |
-| WebView | WebView2(Win10/11 內建) | 系統 WKWebView | WebKitGTK(CI 需安裝) |
-| 在哪裡編譯 | `windows-latest` | `macos-latest`(兩個 target) | `ubuntu-22.04` |
-| 未簽章的後果 | SmartScreen 警告;公司政策可能直接禁止執行 | Gatekeeper 阻擋;自用可右鍵「打開」 | 無 |
+| 產物 | Inno Setup `snip-sync-windows-setup.exe`(per-user)+ zip | `snip-sync_mac_{arm,intel}.dmg` + `.app.tar.gz` | `snip-sync-linux-x86_64.tar.gz` |
+| 在哪裡編譯 | `ci.yml` 的 `windows-latest` | `ci.yml` 的 `macos-latest` / `macos-26-intel` | `ci.yml` 的 `native-acceptance`(`ubuntu-24.04`,glibc ≥ 2.39) |
+| 未簽章的後果 | SmartScreen 警告;公司政策可能直接禁止執行 | Gatekeeper 阻擋:系統設定「強制打開」或 `xattr -cr` | 無 |
 
-- **發布流程照 aghub:** 推 `vX.Y.Z` tag → `verify-ci` 確認該 commit 的 CI 是綠燈 →
-  git-cliff 產生 changelog 並建立 Release → `build-tauri` 四個 target 以 `tauri-action` 打包 →
-  `build-cli` 四個 target 編 `snip`、跑 smoke test、打包成 tar.gz / zip → 上傳到 Release。
-  正式版(tag 不含 `-`)再由 `publish-homebrew` 更新 `audichuang/homebrew-tap` 的
-  `Formula/snip-cli.rb` 與 `Casks/snip-sync.rb`(需要 repo secret `HOMEBREW_TAP_TOKEN`)。不含 updater 的 `latest.json`。
-  `just bump` 同步 `Cargo.toml`、`package.json`、`tauri.conf.json` 的版本號;`just release` 包辦 tag 與驗證。
-- **macOS 簽章:** 比照 aghub 用 ad-hoc(`APPLE_SIGNING_IDENTITY: "-"`),並在 CI 以
-  `codesign --verify --deep --strict` 驗證。只給自己用,不做 Apple Developer 憑證與公證。
-- **不做:** `tauri-plugin-updater`。
-- 本機快速測試用 `just desktop-bundle`,不必走完 tag → CI → 下載(aghub 的 `desktop-dmg` 尚未搬過來)。
+- **發布流程:** `just release X.Y.Z`(`Cargo.toml` 必須已 bump 並 commit)推 tag →
+  `verify-ci` 找出該 SHA 在 main 上的綠色 `ci.yml` run → `changelog`(git-cliff)、
+  `verify-native`(從該 run 下載已驗收的桌面產物,核對 SHA256SUMS、版本與 Linux build receipt)、
+  `build-cli`(四個 target 編 `snip`、smoke、打包)都只產生 workflow artifact →
+  全部成功後 `publish-release` 以 draft 建立 Release、附上 12 個資產、確認後一次公開。
+  任何檢查失敗都不會留下公開的 Release。正式版(tag 不含 `-`)再由 `publish-homebrew` 更新
+  `audichuang/homebrew-tap` 的 `Formula/snip-cli.rb` 與 `Casks/snip-sync.rb`(需要 repo secret `HOMEBREW_TAP_TOKEN`)。
+  `just bump` 仍同步 `Cargo.toml`、`package.json`、`tauri.conf.json` 的版本號,讓 Tauri 版保持可建置。
+- **桌面版不重新建置:** release 發布的就是 CI 驗收過的位元組(交付規格 §10),所以 release 不改版號、不重編。
+- **macOS 簽章:** ad-hoc(`codesign --sign -`),在 CI 以 `codesign --verify --deep --strict` 驗證。不做 Apple Developer 憑證與公證。
+- **不做:** 自動更新。
+- 本機打包:`just package-native <target> <out> <bin> <version>`;Tauri 版仍可用 `just desktop-bundle`。
 
 ## 5. 測試策略
 

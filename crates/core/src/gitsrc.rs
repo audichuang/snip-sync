@@ -89,6 +89,12 @@ pub struct Git {
 	root: PathBuf,
 }
 
+#[cfg(test)]
+thread_local! {
+	/// `git --version` runs started by this thread.
+	static VERSION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn git_command() -> Command {
 	let mut cmd = Command::new("git");
 	// Byte-stable output, and never block on a credential prompt.
@@ -162,14 +168,32 @@ impl Git {
 	/// A directory outside a repository is still [`GitError::NotARepository`].
 	pub fn open_with(dir: &Path, opts: &RunOptions) -> Result<Self, GitError> {
 		already_cancelled(opts, "--version")?;
-		let mut version = git_command();
-		version.arg("--version");
-		let version = gitrun::run(version, "--version", None, opts)?;
-		if version.truncated {
-			return Err(GitError::OutputLimit {
-				args: "--version".into(),
-				limit: opts.max_stdout,
-			});
+		// `git --version` runs once per `PATH`: a changed `PATH` may find
+		// another git, or none. Only success is remembered.
+		static CHECKED_PATH: std::sync::Mutex<Option<std::ffi::OsString>> =
+			std::sync::Mutex::new(None);
+		let path = std::env::var_os("PATH").unwrap_or_default();
+		let checked = CHECKED_PATH
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.as_ref() == Some(&path);
+		if !checked {
+			#[cfg(test)]
+			VERSION_RUNS.with(|n| n.set(n.get() + 1));
+			let mut version = git_command();
+			version.arg("--version");
+			let version = gitrun::run(version, "--version", None, opts)?;
+			if version.truncated {
+				return Err(GitError::OutputLimit {
+					args: "--version".into(),
+					limit: opts.max_stdout,
+				});
+			}
+			if version.status.is_some_and(|s| s.success()) {
+				*CHECKED_PATH
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+			}
 		}
 		let probe = Self {
 			root: dir.to_path_buf(),
@@ -198,6 +222,14 @@ impl Git {
 		Ok(Self {
 			root: path_from_git_bytes(top)?,
 		})
+	}
+
+	/// A repository whose top level is already known, without starting git.
+	/// `root` must be git's own spelling (a previous [`Git::root`] or
+	/// `rev-parse --show-toplevel`), not a user path: through a symlink
+	/// (macOS `/var` -> `/private/var`) it would not match what git reports.
+	pub fn at_known_root(root: PathBuf) -> Self {
+		Self { root }
 	}
 
 	/// The repository top level; every git path is relative to it.
@@ -881,8 +913,14 @@ fn path_entry(status: u8, path: Vec<u8>) -> RawEntry {
 /// Unmerged paths from `git ls-files -u -z`, labelled like VS Code's merge
 /// changes: a conflict missing ours or theirs (UD, DU, DD) is `D`, every
 /// other kind (UU, AA, AU, UA) is `M`.
-fn unmerged(git: &Git, opts: &RunOptions) -> Result<Vec<RawEntry>, GitError> {
-	let out = run_strict(git, &["ls-files", "-u", "-z"], opts)?;
+fn unmerged(
+	git: &Git,
+	only: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<RawEntry>, GitError> {
+	let mut args = vec!["ls-files", "-u", "-z"];
+	args.extend_from_slice(only);
+	let out = run_strict(git, &args, opts)?;
 	// Each record is `<mode> <oid> <stage>\t<path>`, one per stage.
 	let mut stages: Vec<(Vec<u8>, [bool; 3])> = Vec::new();
 	for rec in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
@@ -973,26 +1011,46 @@ fn collect_changes(
 	source: &GitSource,
 	opts: &RunOptions,
 ) -> Result<(Vec<Change>, usize), GitError> {
+	collect_changes_in(git, source, None, opts)
+}
+
+/// [`collect_changes`], limited to the one path `only` when given. Rename
+/// detection then sees only that side: a rename target is an addition.
+fn collect_changes_in(
+	git: &Git,
+	source: &GitSource,
+	only: Option<&str>,
+	opts: &RunOptions,
+) -> Result<(Vec<Change>, usize), GitError> {
 	already_cancelled(opts, "collect changes")?;
+	let spec = only.map(|p| format!(":(literal){p}"));
+	let only: Vec<&str> =
+		spec.as_deref().map_or_else(Vec::new, |s| vec!["--", s]);
+	let raw = |extra: &[&'static str]| {
+		let mut args = extra.to_vec();
+		args.extend_from_slice(&RAW);
+		args
+	};
 	let mut skipped = 0;
 	let mut changes = Vec::new();
 	match source {
 		GitSource::Working => {
 			// VS Code keeps conflicts out of the working and index lists and
 			// reports them as merge changes between untracked and index.
-			let conflicts = unmerged(git, opts)?;
+			let conflicts = unmerged(git, &only, opts)?;
 			let resolved =
 				|e: &RawEntry| !conflicts.iter().any(|c| c.path == e.path);
-			let worktree = diff(git, &RAW, opts)?
+			let mut args = raw(&[]);
+			args.extend_from_slice(&only);
+			let worktree = diff(git, &args, opts)?
 				.into_iter()
 				.filter(resolved)
 				.collect();
 			union_into(&mut changes, worktree, &mut skipped);
-			let out = run_strict(
-				git,
-				&["ls-files", "--others", "--exclude-standard", "-z"],
-				opts,
-			)?;
+			let mut args =
+				vec!["ls-files", "--others", "--exclude-standard", "-z"];
+			args.extend_from_slice(&only);
+			let out = run_strict(git, &args, opts)?;
 			let untracked = out
 				.split(|&b| b == 0)
 				// A trailing `/` is a nested repository, not a file.
@@ -1002,8 +1060,8 @@ fn collect_changes(
 			union_into(&mut changes, untracked, &mut skipped);
 			let merge = conflicts.clone();
 			union_into(&mut changes, merge, &mut skipped);
-			let mut cached = vec!["--cached"];
-			cached.extend_from_slice(&RAW);
+			let mut cached = raw(&["--cached"]);
+			cached.extend_from_slice(&only);
 			let index = diff(git, &cached, opts)?
 				.into_iter()
 				.filter(resolved)
@@ -1016,8 +1074,8 @@ fn collect_changes(
 			}
 		}
 		GitSource::Staged => {
-			let mut cached = vec!["--cached"];
-			cached.extend_from_slice(&RAW);
+			let mut cached = raw(&["--cached"]);
+			cached.extend_from_slice(&only);
 			// A conflict is a merge change, not an index change.
 			let index = diff(git, &cached, opts)?
 				.into_iter()
@@ -1038,21 +1096,19 @@ fn collect_changes(
 				parents.push(EMPTY_TREE.to_string());
 			}
 			for parent in &parents {
-				let out = run_strict(
-					git,
-					&[
-						"diff-tree",
-						"-r",
-						"-z",
-						"--raw",
-						"--no-abbrev",
-						"--no-commit-id",
-						"-M",
-						parent,
-						&sha,
-					],
-					opts,
-				)?;
+				let mut args = vec![
+					"diff-tree",
+					"-r",
+					"-z",
+					"--raw",
+					"--no-abbrev",
+					"--no-commit-id",
+					"-M",
+					parent,
+					&sha,
+				];
+				args.extend_from_slice(&only);
+				let out = run_strict(git, &args, opts)?;
 				union_into(&mut changes, parse_raw_z(&out)?, &mut skipped);
 			}
 		}
@@ -1061,6 +1117,7 @@ fn collect_changes(
 			let to = git.resolve_commit_with(to, opts)?;
 			let mut args = RAW.to_vec();
 			args.extend([from.as_str(), to.as_str()]);
+			args.extend_from_slice(&only);
 			union_into(&mut changes, diff(git, &args, opts)?, &mut skipped);
 		}
 	}
@@ -1079,8 +1136,11 @@ fn collect_raw(
 }
 
 /// Read only the clicked path; listing a large repository never reads blobs.
-/// `None` when `path` is not a change of `source`, so one listing both
-/// checks membership and finds the file. Content above `max` bytes is
+/// `None` when `path` is not a change of `source`: every listing is limited
+/// to `path`, so its output stays small however large the change set is.
+/// Rename detection then sees only this side, so a rename target is
+/// labelled `New`, not `Moved`; with the listed label at hand, use
+/// [`read_changed_file_for`], which also skips the listing. Content above `max` bytes is
 /// [`GitError::OutputLimit`], judged from the blob header or file size
 /// before it is read.
 pub fn read_changed_file(
@@ -1119,7 +1179,7 @@ fn read_changed_file_inner(
 	max: u64,
 	opts: &RunOptions,
 ) -> Result<Option<PayloadFile>, GitError> {
-	let (changes, _) = collect_changes(git, source, opts)?;
+	let (changes, _) = collect_changes_in(git, source, Some(path), opts)?;
 	Ok(read_changes(
 		git,
 		source,
@@ -1128,6 +1188,63 @@ fn read_changed_file_inner(
 		opts,
 	)?
 	.pop())
+}
+
+/// Reads one change the caller already listed (`path` and `change_type` as
+/// [`list_changed_paths_with`] returned them), without listing anything.
+/// Content comes by name: the disk (`Working`), `:<path>` (`Staged`),
+/// `<rev>:<path>` (`Commit`) or `<to>:<path>` (`Range`); a deletion reads
+/// `HEAD:<path>`, `<from>:<path>`, or each commit parent in order (the
+/// deleted marker when none decodes). For a commit, pass its `parents` when
+/// known and a resolved `rev`; `None` looks the parents up. Content above
+/// the smaller of `max` and `opts.max_stdout` is [`GitError::OutputLimit`].
+pub fn read_changed_file_for(
+	git: &Git,
+	source: &GitSource,
+	path: &str,
+	change_type: ChangeType,
+	parents: Option<&[String]>,
+	max: u64,
+	opts: &RunOptions,
+) -> Result<PayloadFile, GitError> {
+	already_cancelled(opts, "read changed file")?;
+	let at = |rev: &str| format!("{rev}:{path}");
+	let (new_oid, deleted_from) = match source {
+		GitSource::Working => (String::new(), vec![at("HEAD")]),
+		GitSource::Staged => (at(""), vec![at("HEAD")]),
+		GitSource::Range(from, to) => (at(to), vec![at(from)]),
+		GitSource::Commit(rev) => {
+			let deleted_from = if change_type != ChangeType::Deleted {
+				Vec::new()
+			} else if let Some(parents) = parents {
+				parents.iter().map(|p| at(p)).collect()
+			} else {
+				// Resolving first refuses an option-like `rev`.
+				let sha = git.resolve_commit_with(rev, opts)?;
+				git.parents_with(&sha, opts)?
+					.iter()
+					.map(|p| at(p))
+					.collect()
+			};
+			(at(rev), deleted_from)
+		}
+	};
+	let status = match change_type {
+		ChangeType::New => b'A',
+		ChangeType::Modified => b'M',
+		ChangeType::Deleted => b'D',
+		ChangeType::Moved => b'R',
+	};
+	let change = Change {
+		status,
+		path: path.to_string(),
+		new_oid,
+		deleted_from,
+	};
+	let max = max.min(opts.max_stdout as u64);
+	read_changes(git, source, vec![change], Some(max), opts)?
+		.pop()
+		.ok_or_else(|| GitError::Malformed("no file read".into()))
 }
 
 /// A working-tree file, at most `max` bytes when given. Unreadable is
@@ -1390,6 +1507,19 @@ mod tests {
 		let err = Git::open(dir.path()).err().unwrap();
 		assert!(matches!(err, GitError::NotARepository(_)), "{err}");
 		assert!(err.to_string().contains("is not inside a git repository"));
+	}
+
+	#[test]
+	fn open_checks_the_git_version_once_and_known_roots_start_nothing() {
+		let r = Repo::new();
+		let g = Git::open(&r.path()).unwrap();
+		let runs = VERSION_RUNS.with(std::cell::Cell::get);
+		let again = Git::open(&r.path()).unwrap();
+		assert_eq!(VERSION_RUNS.with(std::cell::Cell::get), runs);
+		assert_eq!(again.root(), g.root());
+		let known = Git::at_known_root(g.root().to_path_buf());
+		assert_eq!(known.root(), g.root());
+		assert_eq!(known.head().unwrap(), g.head().unwrap());
 	}
 
 	use super::*;
@@ -1761,6 +1891,114 @@ mod tests {
 				file("only.txt", "only on side\n", Deleted)
 			]
 		);
+	}
+
+	#[test]
+	fn single_path_read_does_not_list_the_whole_source() {
+		let r = Repo::new();
+		r.write("a.txt", b"a\n");
+		r.commit("base");
+		r.write("a.txt", b"a2\n");
+		for i in 0..100 {
+			r.write(&format!("untracked-{i:03}.txt"), b"u\n");
+		}
+		let g = Git::open(&r.path()).unwrap();
+		// The full untracked listing alone is far over this cap.
+		let opts = RunOptions {
+			max_stdout: 512,
+			..RunOptions::default()
+		};
+		let got =
+			read_changed_file_with(&g, &GitSource::Working, "a.txt", 64, &opts)
+				.unwrap()
+				.unwrap();
+		assert_eq!(got, file("a.txt", "a2\n", Modified));
+		let got = read_changed_file_with(
+			&g,
+			&GitSource::Working,
+			"untracked-042.txt",
+			64,
+			&opts,
+		)
+		.unwrap()
+		.unwrap();
+		assert_eq!(got, file("untracked-042.txt", "u\n", New));
+		let none =
+			read_changed_file_with(&g, &GitSource::Working, "nope", 64, &opts)
+				.unwrap();
+		assert_eq!(none, None);
+	}
+
+	#[test]
+	fn known_change_reads_without_listing() {
+		let r = Repo::new();
+		r.write("base.txt", b"base\n");
+		r.write("old.txt", b"moved body\n");
+		r.commit("base");
+		r.git(&["checkout", "-q", "-b", "side"]);
+		r.write("only.txt", b"only on side\n");
+		r.commit("side");
+		r.git(&["checkout", "-q", "main"]);
+		r.git(&["mv", "old.txt", "new.txt"]);
+		r.commit("rename");
+		r.git(&["merge", "-q", "--no-ff", "--no-commit", "side"]);
+		r.git(&["rm", "-q", "-f", "only.txt"]);
+		r.git(&["commit", "-q", "--no-edit"]);
+		let g = Git::open(&r.path()).unwrap();
+		let merge = g.head().unwrap().unwrap();
+		let parents = g.parents(&merge).unwrap();
+		let opts = RunOptions::default();
+		let source = GitSource::Commit(merge);
+		let got = read_changed_file_for(
+			&g,
+			&source,
+			"only.txt",
+			Deleted,
+			Some(&parents),
+			1024,
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(got, file("only.txt", "only on side\n", Deleted));
+		// Parents looked up when not given.
+		let got = read_changed_file_for(
+			&g, &source, "only.txt", Deleted, None, 1024, &opts,
+		)
+		.unwrap();
+		assert_eq!(got, file("only.txt", "only on side\n", Deleted));
+		let rename = GitSource::Commit("HEAD^1".into());
+		let got = read_changed_file_for(
+			&g, &rename, "new.txt", Moved, None, 1024, &opts,
+		)
+		.unwrap();
+		assert_eq!(got, file("new.txt", "moved body\n", Moved));
+		// The listing agrees on the label.
+		let listed = list_changed_paths(&g, &rename).unwrap();
+		assert_eq!(listed, [("new.txt".to_string(), Some(Moved))]);
+		// Staged content is the index entry, not the disk.
+		r.write("new.txt", b"staged\n");
+		r.git(&["add", "new.txt"]);
+		r.write("new.txt", b"disk\n");
+		let got = read_changed_file_for(
+			&g,
+			&GitSource::Staged,
+			"new.txt",
+			Modified,
+			None,
+			1024,
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(got, file("new.txt", "staged\n", Modified));
+		// Staged and working deletions read HEAD.
+		r.git(&["rm", "-q", "base.txt"]);
+		for source in [GitSource::Staged, GitSource::Working] {
+			let got = read_changed_file_for(
+				&g, &source, "base.txt", Deleted, None, 1024, &opts,
+			)
+			.unwrap();
+			assert_eq!(got, file("base.txt", "base\n", Deleted));
+		}
 	}
 
 	#[test]

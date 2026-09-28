@@ -120,6 +120,15 @@ fn spawn_app(
 	dest: &Path,
 	probes: Option<(Bounds, Viewport)>,
 ) -> App {
+	spawn_app_themed(ws, dest, probes, "dark")
+}
+
+fn spawn_app_themed(
+	ws: &Path,
+	dest: &Path,
+	probes: Option<(Bounds, Viewport)>,
+	theme: &str,
+) -> App {
 	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"));
 	cmd.args([
 		"--workspace",
@@ -130,6 +139,8 @@ fn spawn_app(
 	.stdout(Stdio::piped())
 	.stderr(Stdio::piped())
 	.env("XMODIFIERS", "@im=none")
+	// Pixel checks below assume the DARK palette.
+	.env("SNIP_THEME", theme)
 	.env_remove("SNIP_NATIVE_E2E")
 	.env_remove("SNIP_NATIVE_E2E_APPLY_DELAY_MS");
 	if probes.is_some() {
@@ -588,12 +599,16 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	};
 
 	// Asserts a control is no longer drawn (the app reported it gone).
+	// Polls: the frame that drops the control can land well after the event.
 	let absent = |id: &str| {
-		std::thread::sleep(Duration::from_millis(300));
-		assert!(
-			!bounds.lock().unwrap().contains_key(id),
-			"control {id} must not be drawn"
-		);
+		let deadline = Instant::now() + Duration::from_secs(4);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(
+				Instant::now() < deadline,
+				"control {id} must not be drawn"
+			);
+			std::thread::sleep(Duration::from_millis(40));
+		}
 	};
 
 	let click = |id: &str| {
@@ -805,6 +820,15 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	wait_for_pattern("[APP:GRAPH_LOADED:", Duration::from_secs(5))
 		.expect("graph layout should load");
 
+	// The log merges both repositories; its Repository chip narrows it to
+	// repo-a, the single-repository log the checks below were written for.
+	click("log-filter-repo");
+	click("log-repo:repo-a");
+	wait_for_pattern("[APP:LOG_REPOS: n=1]", Duration::from_secs(3))
+		.expect("the Repository chip must narrow the log");
+	wait_for_pattern("[APP:GRAPH_LOADED: commits=5]", Duration::from_secs(5))
+		.expect("repo-a's log must load");
+
 	// Ref selector: test HEAD and all filter
 	println!("[TEST DRIVER] Filtering refs via ref selector...");
 	click("btn-ref-selector");
@@ -875,9 +899,9 @@ fn native_desktop_smoke_and_clipboard_verification() {
 					"-alpha",
 					"off",
 					"-fx",
-					// The visible keyboard ring is #3574f0; allow one level
+					// The visible keyboard ring is DARK.focus_ring #3871e1; allow one level
 					// of raster rounding in the captured sRGB channels.
-					"abs(r-53/255)<0.006 && abs(g-116/255)<0.006 && abs(b-240/255)<0.006 ? 1 : 0",
+					"abs(r-56/255)<0.006 && abs(g-113/255)<0.006 && abs(b-225/255)<0.006 ? 1 : 0",
 					"-format",
 					"%[fx:mean]",
 					"info:",
@@ -918,7 +942,8 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	click("btn-locale");
 	wait_for_pattern("[APP:LOCALE: En]", Duration::from_secs(3))
 		.expect("harmless locale focus anchor must switch to English");
-	capture_focus("keyboard-anchor-locale.png", &[("btn-locale", true)]);
+	// IntelliJ draws no focus ring after a mouse click, only after keys.
+	capture_focus("keyboard-anchor-locale.png", &[("btn-locale", false)]);
 	println!("[TEST DRIVER] Disabled Copy must neither focus nor activate...");
 	// The basket is still empty. Clicking the disabled button must not focus it;
 	// Enter/Space may retain the harmless locale focus, but cannot invoke Copy.
@@ -1187,24 +1212,34 @@ fn native_desktop_smoke_and_clipboard_verification() {
 
 	// 10. Git Log: search by author, HEAD jump, merge collapse, range compare
 	println!("[TEST DRIVER] Testing Git Log author search...");
-	click("btn-search-author");
-	wait_for_pattern("[APP:SEARCH_AUTHOR: true]", Duration::from_secs(3))
-		.expect("search author toggle must be active");
-	click("log-search-input");
-	xdo(&["type", "--window", &wid, "Tester"]);
-	send_key("Return");
+	click("log-filter-user");
+	wait_for_pattern("[APP:LOG_MENU: Some(User)]", Duration::from_secs(3))
+		.expect("User chip must open its menu");
+	click("log-user:Tester");
 	wait_for_pattern(
 		"[APP:LOG_SEARCH: active=true author=true]",
 		Duration::from_secs(3),
 	)
 	.expect("log search for author must execute");
 
-	// Reset author search
-	click("btn-search-author");
-	wait_for_pattern("[APP:SEARCH_AUTHOR: false]", Duration::from_secs(3))
-		.expect("search author toggle must deactivate");
+	// Text search combines with the author filter.
 	click("log-search-input");
+	xdo(&["type", "--window", &wid, "commit"]);
+	send_key("Return");
+	wait_for_pattern(
+		"[APP:LOG_SEARCH: active=true author=true]",
+		Duration::from_secs(3),
+	)
+	.expect("text search must keep the author filter");
 	send_key("Escape");
+	wait_for_pattern(
+		"[APP:LOG_SEARCH: active=true author=true]",
+		Duration::from_secs(3),
+	)
+	.expect("clearing the text keeps the author filter");
+
+	// Reset author search from the chip's clear button.
+	click("log-filter-user-clear");
 	wait_for_pattern("[APP:LOG_SEARCH: active=false", Duration::from_secs(3))
 		.expect("clearing log search must restore full graph");
 
@@ -1800,8 +1835,11 @@ fn capture_window(wid: &str, out_png: &Path) {
 	assert!(fs::metadata(out_png).unwrap().len() > 1024);
 }
 
-/// A failed layout must leave the rendered page intact and retry page 2,
-/// rather than combining new commits with old rails or advancing to page 3.
+/// Scrolling to the end of the log reads the next page into the window. A
+/// failed read must leave the rendered rows intact and stop loading until the
+/// user scrolls again, then retry the same page rather than combining new
+/// commits with old rails or skipping ahead. Pages 2-10 are sliced from the window page 1 fetched, so page 11 is the
+/// first that reads Git again; a repository gone missing fails exactly it.
 #[test]
 fn native_graph_failed_next_page_is_transactional() {
 	if std::env::var_os("DISPLAY").is_none() {
@@ -1818,17 +1856,28 @@ fn native_graph_failed_next_page_is_transactional() {
 	git_ok(&repo, &["init", "-q", "-b", "main"]);
 	git_ok(&repo, &["config", "user.name", "Graph Test"]);
 	git_ok(&repo, &["config", "user.email", "graph@example.com"]);
-	for n in 0..120 {
-		git_ok(
-			&repo,
-			&[
-				"commit",
-				"--allow-empty",
-				"-qm",
-				&format!("page commit {n}"),
-			],
-		);
+	let mut stream = String::new();
+	for n in 0..560 {
+		let msg = format!("page commit {n}");
+		stream.push_str(&format!(
+			"commit refs/heads/main\ncommitter Graph Test <graph@example.com> {} +0000\ndata {}\n{msg}\n\n",
+			1_700_000_000 + n * 60,
+			msg.len()
+		));
 	}
+	let mut import = Command::new("git")
+		.current_dir(&repo)
+		.args(["fast-import", "--quiet"])
+		.stdin(Stdio::piped())
+		.spawn()
+		.unwrap();
+	import
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(stream.as_bytes())
+		.unwrap();
+	assert!(import.wait().unwrap().success());
 	let commits = Command::new("git")
 		.current_dir(&repo)
 		.args(["log", "--format=%H"])
@@ -1842,7 +1891,9 @@ fn native_graph_failed_next_page_is_transactional() {
 		.collect();
 	let first = &commits[0][..7];
 	let second = &commits[50][..7];
-	let first_row = format!("commit-row:{first}");
+	// A row near the end of the full ten-page window: on screen when the
+	// failed eleventh page is attempted and again after the retry.
+	let probe_row = format!("commit-row:{}", &commits[494][..7]);
 	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
 	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
 	let mut app = spawn_app(
@@ -1878,8 +1929,9 @@ fn native_graph_failed_next_page_is_transactional() {
 			std::thread::sleep(Duration::from_millis(20));
 		}
 	};
-	let next = || {
-		let [x, y, w, h] = control("btn-next-page");
+	// There is no pager: scrolling the list to its end reads the next page.
+	let wheel = |clicks: &str, button: &str| {
+		let [x, y, w, h] = control("log-list");
 		assert!(Command::new("xdotool")
 			.args([
 				"mousemove",
@@ -1888,7 +1940,12 @@ fn native_graph_failed_next_page_is_transactional() {
 				&(x + w / 2).to_string(),
 				&(y + h / 2).to_string(),
 				"click",
-				"1",
+				"--repeat",
+				clicks,
+				"--delay",
+				"15",
+				button,
+				// Off the list again, so no row is drawn hovered.
 				"mousemove",
 				"--window",
 				&wid,
@@ -1899,6 +1956,26 @@ fn native_graph_failed_next_page_is_transactional() {
 			.unwrap()
 			.success());
 	};
+	// Scrolls until `pattern` is logged (a page read, or its failure).
+	let scroll_until =
+		|pattern: &str, clicks: &str, button: &str| -> Vec<String> {
+			let deadline = Instant::now() + Duration::from_secs(40);
+			let mut seen = Vec::new();
+			loop {
+				wheel(clicks, button);
+				match lines_until(&app.rx, pattern, Duration::from_millis(250))
+				{
+					Ok(lines) => {
+						seen.extend(lines);
+						return seen;
+					}
+					Err(_) => assert!(
+						Instant::now() < deadline,
+						"scrolling never produced {pattern}"
+					),
+				}
+			}
+		};
 	let out = std::env::var_os("SNIP_E2E_OUT")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
@@ -1950,11 +2027,32 @@ fn native_graph_failed_next_page_is_transactional() {
 		let image = out.join(format!("graph-admission-{name}.png"));
 		let crop = out.join(format!("graph-admission-{name}-row.png"));
 		let deadline = Instant::now() + Duration::from_secs(5);
+		// Only accept a row whose pixels match the capture before it, so a
+		// frame still moving (scroll, banner) is never the evidence.
+		let mut previous: Option<([i32; 4], Vec<u8>)> = None;
 		loop {
-			let row = control(&first_row);
+			let row = control(&probe_row);
 			let error = require_error.then(|| control("log-error"));
 			capture(&image);
-			let stable = control(&first_row) == row
+			let [x, y, w, h] = row;
+			let pixels = Command::new("convert")
+				.arg(&image)
+				.args([
+					"-crop",
+					&format!("{w}x{h}+{x}+{y}"),
+					"+repage",
+					"-depth",
+					"8",
+					"RGB:-",
+				])
+				.output()
+				.unwrap();
+			assert!(pixels.status.success(), "row crop failed");
+			let settled = previous
+				.as_ref()
+				.is_some_and(|(r, p)| *r == row && *p == pixels.stdout);
+			previous = Some((row, pixels.stdout));
+			let stable = control(&probe_row) == row
 				&& error.is_none_or(|rect| control("log-error") == rect);
 			// Probes run during prepaint, before Vulkan presents this frame.
 			// Wait for the actual error banner, never for a matching row.
@@ -1974,16 +2072,19 @@ fn native_graph_failed_next_page_is_transactional() {
 				assert!(pixels.status.success(), "error banner crop failed");
 				assert_eq!(pixels.stdout.len(), (w * h * 3) as usize);
 				let pixels = pixels.stdout.as_chunks::<3>().0;
-				// Existing theme ERROR_BG and antialiased ERROR text.
-				pixels.contains(&[64, 41, 41])
+				// DARK.error_bg #56272b and antialiased DARK.error #f57e84 text.
+				pixels.contains(&[86, 39, 43])
 					&& pixels.iter().any(|p| {
-						p[0].abs_diff(247) <= 16
-							&& p[1].abs_diff(84) <= 16
-							&& p[2].abs_diff(100) <= 16
+						p[0].abs_diff(245) <= 16
+							&& p[1].abs_diff(126) <= 16
+							&& p[2].abs_diff(132) <= 16
 					})
 			});
-			if stable && presented {
-				let [x, y, w, h] = row;
+			if stable && presented && settled {
+				// Inset 1px top and bottom: the edge pixel rows blend with the
+				// neighbouring row at a fractional scroll offset, while the
+				// text and every rail crossing the row stay inside.
+				let (y, h) = (y + 1, h - 2);
 				assert!(Command::new("convert")
 					.arg(&image)
 					.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
@@ -2000,56 +2101,74 @@ fn native_graph_failed_next_page_is_transactional() {
 				Instant::now() < deadline,
 				"graph {name} frame did not present: row={row:?} error={error:?}"
 			);
-			std::thread::sleep(Duration::from_millis(20));
+			std::thread::sleep(Duration::from_millis(150));
 		}
 	};
-	let before_y = control(&first_row)[1];
-	let before = crop_row("before", false);
-	// Only this test's disposable repository is mutated, never the standard
-	// workload. All refs target the same tip, so commit order stays identical.
-	let update_refs = |create: bool| {
-		let mut child = Command::new("git")
-			.current_dir(&repo)
-			.args(["update-ref", "--stdin"])
-			.stdin(Stdio::piped())
-			.stdout(Stdio::null())
-			.spawn()
-			.unwrap();
-		let mut input = child.stdin.take().unwrap();
-		for n in 0..1001 {
-			if create {
-				writeln!(
-					input,
-					"create refs/heads/overflow-{n} {}",
-					commits[0]
-				)
-				.unwrap();
-			} else {
-				writeln!(input, "delete refs/heads/overflow-{n}").unwrap();
-			}
+	// Pages 2-10 are sliced from the window page 1 fetched: no Git at all.
+	// Only this test's disposable repository is touched, never the standard
+	// workload: without `.git` every Git call fails until it is put back.
+	let dot_git = repo.join(".git");
+	let parked = repo.join("git-parked");
+	let park = |away: bool| {
+		if away {
+			fs::rename(&dot_git, &parked).unwrap();
+		} else {
+			fs::rename(&parked, &dot_git).unwrap();
 		}
-		drop(input);
-		assert!(child.wait().unwrap().success());
 	};
-	update_refs(true);
-	next();
-	let rejected =
-		lines_until(&app.rx, "[APP:HISTORY_ERROR]", Duration::from_secs(8))
-			.expect("layout failure must be reported, not silently swallowed");
+	park(true);
+	for page in 2..=10 {
+		let loaded = scroll_until(&format!("page={page}]"), "4", "5");
+		let line = loaded
+			.iter()
+			.find(|l| l.contains("[APP:E2E_LOG:"))
+			.expect("page read must log E2E_LOG");
+		// The window grows page by page and keeps its first row.
+		assert!(
+			line.contains(&format!(
+				"mode=graph n={} first={first} page={page}]",
+				page * 50
+			)),
+			"{loaded:?}"
+		);
+	}
+	// Page 11 is the first read that needs Git, and it fails.
+	let rejected = scroll_until("[APP:HISTORY_ERROR]", "1", "5");
 	assert!(!rejected.iter().any(|line| line.contains("[APP:E2E_LOG:")));
 	control("log-error");
+	let refused = crop_row("refused", true);
+	// A failed read stops the automatic loading: no retry loop.
+	assert!(
+		lines_until(&app.rx, "[APP:HISTORY_ERROR]", Duration::from_secs(1))
+			.is_err(),
+		"a failed page must not be retried until the user scrolls again"
+	);
+	park(false);
+	// One notch: it re-arms loading, and no further notch moves the rows
+	// the comparison is taken from.
+	let retried = scroll_until("[APP:E2E_LOG:", "1", "5");
+	assert!(
+		retried
+			.last()
+			.unwrap()
+			.contains(&format!("mode=graph n=500 first={second} page=11]")),
+		"retry must load the real eleventh page and evict the first: {retried:?}"
+	);
+	control(&probe_row);
 	let deadline = Instant::now() + Duration::from_secs(5);
-	while control(&first_row)[1] == before_y {
+	while bounds.lock().unwrap().contains_key("log-error") {
 		assert!(
 			Instant::now() < deadline,
-			"prior first row must remain below the visible error"
+			"successful retry must clear the error"
 		);
 		std::thread::sleep(Duration::from_millis(20));
 	}
-	let after = crop_row("refused", true);
+	// The row the failure was drawn over is unchanged: the refused page
+	// attached nothing to the old rails.
+	let after = crop_row("retried", false);
 	let comparison = Command::new("compare")
 		.args(["-metric", "AE"])
-		.arg(&before)
+		.arg(&refused)
 		.arg(&after)
 		.arg("null:")
 		.output()
@@ -2059,27 +2178,40 @@ fn native_graph_failed_next_page_is_transactional() {
 		"prior rendered row text and graph rails must remain identical: {}",
 		String::from_utf8_lossy(&comparison.stderr)
 	);
-	update_refs(false);
-	next();
-	let retried =
-		lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8)).unwrap();
+	// Scrolling back to the top reads the evicted first page again and
+	// drops the last one; the rows on screen stay where they were.
+	let back = scroll_until("[APP:E2E_LOG:", "8", "4");
 	assert!(
-		retried
-			.last()
+		back.last()
 			.unwrap()
-			.contains(&format!("mode=graph n=50 first={second} page=2]")),
-		"retry must load the real second page: {retried:?}"
+			.contains(&format!("mode=graph n=500 first={first} page=10]")),
+		"scrolling up must read page 1 back and evict page 11: {back:?}"
 	);
-	control(&format!("commit-row:{second}"));
-	let deadline = Instant::now() + Duration::from_secs(5);
-	while bounds.lock().unwrap().contains_key("log-error") {
-		assert!(
-			Instant::now() < deadline,
-			"successful retry must clear the error"
-		);
-		std::thread::sleep(Duration::from_millis(20));
-	}
-	capture(&out.join("graph-admission-retried.png"));
+	lines_until(
+		&app.rx,
+		"[APP:LOG_WINDOW: first_page=1 last_page=10 rows=500]",
+		Duration::from_secs(2),
+	)
+	.unwrap();
+	let anchor = back
+		.iter()
+		.find_map(|l| {
+			l.split_once("[APP:LOG_ANCHOR: row=")?
+				.1
+				.split_once(" was=")
+				.map(|(r, w)| {
+					(
+						r.parse::<usize>().unwrap(),
+						w.split_whitespace()
+							.next()
+							.unwrap()
+							.parse::<usize>()
+							.unwrap(),
+					)
+				})
+		})
+		.expect("prepending must re-anchor the rows on screen");
+	assert_eq!(anchor.0, anchor.1 + 50, "the top row keeps its place");
 	quit_cleanly(&mut app, &wid);
 }
 
@@ -3903,9 +4035,10 @@ fn native_reader_degradation_and_copy_integrity() {
 	// Text antialiasing blends warning ink with its dark background.
 	let has_warning_ink = |pixels: &[u8]| {
 		pixels.as_chunks::<3>().0.iter().any(|p| {
-			p[0].abs_diff(242) <= 16
-				&& p[1].abs_diff(197) <= 16
-				&& p[2].abs_diff(92) <= 16
+			// DARK.warning #d59637.
+			p[0].abs_diff(213) <= 16
+				&& p[1].abs_diff(150) <= 16
+				&& p[2].abs_diff(55) <= 16
 		})
 	};
 	let deadline = Instant::now() + Duration::from_secs(5);
@@ -4007,4 +4140,1585 @@ fn native_reader_degradation_and_copy_integrity() {
 	quit_cleanly(&mut app, &wid);
 	// Preserve both actual clipboard mismatches in an old-product run.
 	assert!(selection_mismatches.is_empty(), "{selection_mismatches:?}");
+}
+
+/// `SNIP_THEME=light` renders the Islands Light palette. Saves
+/// `light_theme.png` as an artifact; the only pixel check is that the
+/// window is predominantly light (the dark palette averages well below).
+#[test]
+fn native_light_theme_renders() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("light");
+	fs::create_dir(&repo).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.name", "Light Test"]);
+	git_ok(&repo, &["config", "user.email", "light@example.com"]);
+	fs::write(repo.join("README.md"), "light 淺色\n").unwrap();
+	git_ok(&repo, &["add", "."]);
+	git_ok(&repo, &["commit", "-q", "-m", "initial"]);
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app_themed(ws.path(), dest.path(), None, "light");
+	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(8))
+		.unwrap();
+	let wid = find_wid(app.pid);
+	// Map and focus the window so it presents a frame (as the graph test does).
+	key(&wid, "Escape");
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let png = out.join("light_theme.png");
+	// Vulkan presents to the root surface under Xvfb; crop the window from it.
+	let geometry = Command::new("xdotool")
+		.args(["getwindowgeometry", "--shell", &wid])
+		.output()
+		.unwrap();
+	assert!(geometry.status.success());
+	let text = String::from_utf8(geometry.stdout).unwrap();
+	let geometry: HashMap<_, _> = text
+		.lines()
+		.filter_map(|line| line.split_once('='))
+		.collect();
+	let crop = format!(
+		"{}x{}+{}+{}",
+		geometry["WIDTH"], geometry["HEIGHT"], geometry["X"], geometry["Y"]
+	);
+	let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
+	let deadline = Instant::now() + Duration::from_secs(10);
+	let mean = loop {
+		assert!(Command::new("xwd")
+			.args(["-root", "-silent", "-out"])
+			.arg(xwd.path())
+			.status()
+			.unwrap()
+			.success());
+		assert!(Command::new("convert")
+			.arg(xwd.path())
+			.args(["-crop", &crop, "+repage"])
+			.arg(&png)
+			.status()
+			.unwrap()
+			.success());
+		let stat = Command::new("convert")
+			.arg(&png)
+			.args(["-colorspace", "Gray", "-format", "%[fx:mean]", "info:"])
+			.output()
+			.unwrap();
+		assert!(stat.status.success());
+		let mean: f64 = String::from_utf8(stat.stdout)
+			.unwrap()
+			.trim()
+			.parse()
+			.unwrap();
+		if mean > 0.6 || Instant::now() >= deadline {
+			break mean;
+		}
+		std::thread::sleep(Duration::from_millis(100));
+	};
+	println!("[TEST DRIVER] light theme mean luminance {mean:.3} -> {png:?}");
+	assert!(mean > 0.6, "light palette must render light, mean={mean}");
+	quit_cleanly(&mut app, &wid);
+}
+
+/// IntelliJ chrome through real input: a right-click context menu run by
+/// mouse and by keyboard, speed search in the Project tree, Esc / Shift+Esc,
+/// Log ← to the parent commit and Ctrl+Shift+` for the branches popup.
+#[test]
+fn native_intellij_menus_shortcuts_and_speed_search() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let xdotool = Command::new("xdotool").arg("--version").output();
+	if xdotool.is_err() || !xdotool.unwrap().status.success() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("chrome");
+	fs::create_dir_all(repo.join("subfolder")).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.email", "t@example.com"]);
+	git_ok(&repo, &["config", "user.name", "Chrome Test"]);
+	fs::write(repo.join("alpha.txt"), "alpha\n").unwrap();
+	fs::write(repo.join("subfolder/nested.txt"), "nested\n").unwrap();
+	git_ok(&repo, &["add", "."]);
+	git_ok(&repo, &["commit", "-qm", "first"]);
+	let first = git_rev(&repo);
+	fs::write(repo.join("alpha.txt"), "alpha two\n").unwrap();
+	git_ok(&repo, &["commit", "-qam", "second"]);
+	let second = git_rev(&repo);
+	fs::write(repo.join("gamma.txt"), "untracked\n").unwrap();
+	fs::write(repo.join("delta.txt"), "untracked\n").unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 1]", Duration::from_secs(12))
+		.expect("repo must load");
+	lines_until(&app.rx, "[APP:E2E_LOG:", Duration::from_secs(8))
+		.expect("log must load");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	let st = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let rx = &app.rx;
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(5))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(4);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, button: &str| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				button,
+			])
+			.status()
+			.unwrap();
+		assert!(st.success());
+	};
+	let click = |id: &str| press(id, "1");
+	let right_click = |id: &str| press(id, "3");
+
+	key(&wid, "alt+1");
+	wait("[APP:TAB_SWITCHED: FileExplorer visible=true");
+	click("tree-row:subfolder");
+	wait("[APP:TREE_EXPANDED: subfolder]");
+
+	// 1. Mouse: right-click a file, pick "Copy Relative Path".
+	clip_set("SENTINEL_CHROME_MENU");
+	right_click("tree-row:subfolder/nested.txt");
+	let open = wait("[APP:MENU_OPEN: Left");
+	assert!(
+		open.last().unwrap().contains("copy-relative-path")
+			&& open.last().unwrap().contains("reveal"),
+		"{open:?}"
+	);
+	control("context-menu");
+	click("menu-item:copy-relative-path");
+	wait("[APP:MENU_ACTION: copy-relative-path]");
+	wait("[APP:TEXT_COPIED:");
+	absent("context-menu");
+	assert_eq!(clip_get(), "subfolder/nested.txt");
+
+	// 2. Keyboard: Down highlights the first item, Enter runs it.
+	right_click("tree-row:alpha.txt");
+	wait("[APP:MENU_OPEN: Left items=add-basket");
+	key(&wid, "Down");
+	key(&wid, "Return");
+	wait("[APP:MENU_ACTION: add-basket]");
+	wait("[APP:BASKET: n=1");
+	absent("context-menu");
+	// Escape closes a menu without running anything.
+	right_click("tree-row:alpha.txt");
+	wait("[APP:MENU_OPEN: Left items=remove-basket");
+	key(&wid, "Escape");
+	let closed = wait("[APP:MENU_CLOSED]");
+	assert!(
+		!closed.iter().any(|l| l.contains("MENU_ACTION")),
+		"{closed:?}"
+	);
+
+	// 3. Speed search: typing in the tree jumps to the first match.
+	click("tree-row:alpha.txt");
+	Command::new("xdotool")
+		.args(["type", "--window", &wid, "nest"])
+		.status()
+		.unwrap();
+	let found = wait("[APP:SPEED_SEARCH: q=nest row=");
+	assert!(!found.last().unwrap().contains("row=none"), "{found:?}");
+	control("speed-search");
+	key(&wid, "Escape");
+	wait("[APP:SPEED_SEARCH: off]");
+	absent("speed-search");
+	// A second Esc leaves the tool window for the editor.
+	key(&wid, "Escape");
+	wait("[APP:FOCUS: editor]");
+
+	// 3b. Editor tab menu: right-click the tab strip (just above the
+	// breadcrumb bar) and Close the tab.
+	let crumb = control("breadcrumb");
+	let (x, y) = (crumb[0] + 30, crumb[1] - 16);
+	Command::new("xdotool")
+		.args([
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+			"click",
+			"3",
+		])
+		.status()
+		.unwrap();
+	let open = wait("[APP:MENU_OPEN: Editor");
+	assert!(
+		open.last().unwrap().contains("close-tab,close-other-tabs"),
+		"{open:?}"
+	);
+	click("menu-item:close-tab");
+	wait("[APP:TAB_CLOSED: 0]");
+	absent("context-menu");
+
+	// 4. Shift+Esc hides the focused tool window.
+	click("tree-row:alpha.txt");
+	key(&wid, "shift+Escape");
+	wait("[APP:TAB_SWITCHED: FileExplorer visible=false");
+	absent("left-list");
+
+	// 5. Log: Left goes to the parent commit.
+	click(&format!("commit-row:{}", &second[..7]));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &second[..7]));
+	key(&wid, "Left");
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &first[..7]));
+	// Right-click menu on a Log row offers the parent as well.
+	right_click(&format!("commit-row:{}", &second[..7]));
+	wait("[APP:MENU_OPEN: Log");
+	click("menu-item:copy-revision");
+	wait("[APP:MENU_ACTION: copy-revision]");
+	wait("[APP:TEXT_COPIED:");
+	assert_eq!(clip_get(), second);
+
+	// 6. Ctrl+Shift+` opens the branches popup.
+	key(&wid, "ctrl+shift+grave");
+	wait("[APP:SELECTOR_OPEN: Ref");
+	control("pick-ref:refs/heads/main");
+	key(&wid, "Escape");
+	wait("[APP:SELECTOR_CLOSED]");
+
+	// 7. Changes groups are tree nodes: the group checkbox selects the
+	// whole group, the chevron collapses it. Untracked files list under
+	// Unstaged and keep their own source in the row id.
+	key(&wid, "alt+0");
+	wait("[APP:TAB_SWITCHED: GitChanges visible=true");
+	click("change-group-chk:unstaged");
+	let toggled = wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
+	let basket = toggled
+		.iter()
+		.find(|l| l.contains("[APP:BASKET: n=3"))
+		.unwrap_or_else(|| {
+			panic!("group toggle must fill the basket: {toggled:?}")
+		});
+	assert!(
+		basket.contains("gamma.txt") && basket.contains("delta.txt"),
+		"{basket}"
+	);
+	control("change-row:untracked:gamma.txt");
+	click("change-group-toggle:unstaged");
+	wait("[APP:GROUP_COLLAPSED: unstaged collapsed=true]");
+	absent("change-row:untracked:gamma.txt");
+	control("change-header:unstaged");
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Changes of a multi-repo workspace are grouped by change kind first: a
+/// workspace-wide Staged / Unstaged node (untracked files list under
+/// Unstaged) over one row per repo with files in it, and under each repo
+/// row its files grouped by directory, like IntelliJ's "Group By >
+/// Directory". A clean repo is not listed; repo rows and directories start
+/// collapsed and expand per group; a chain of single-child directories is
+/// one row; a directory's checkbox covers every file beneath it; the
+/// header toggle switches to flat lists and back. A file of a repo that is
+/// not the open one previews from its own repo and checks into that repo's
+/// basket entry, and the group checkbox spans every repo.
+#[test]
+fn native_changes_group_all_repos() {
+	changes_group_all_repos("dark");
+}
+
+/// The same tree in the light palette, for the screenshot only.
+#[test]
+fn native_changes_group_all_repos_light() {
+	changes_group_all_repos("light");
+}
+
+fn changes_group_all_repos(theme: &str) {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let xdotool = Command::new("xdotool").arg("--version").output();
+	if xdotool.is_err() || !xdotool.unwrap().status.success() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	let init = |name: &str, nested: &[&str]| {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "t@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Multi Repo"]);
+		fs::write(repo.join("shared.txt"), format!("{name}\n")).unwrap();
+		for path in nested {
+			let file = repo.join(path);
+			fs::create_dir_all(file.parent().unwrap()).unwrap();
+			fs::write(file, "v1\n").unwrap();
+		}
+		git_ok(&repo, &["add", "."]);
+		git_ok(&repo, &["commit", "-qm", "first"]);
+		repo
+	};
+	// `src` has two children; `main/java/pkg` is a single-child chain.
+	let nested = ["src/main/java/pkg/App.java", "src/test/AppTest.java"];
+	let alpha = init("alpha", &nested);
+	let beta = init("beta", &[]);
+	init("gamma", &[]);
+	// alpha: one staged file, and unstaged edits at the root and nested.
+	fs::write(alpha.join("staged.txt"), "staged\n").unwrap();
+	git_ok(&alpha, &["add", "staged.txt"]);
+	fs::write(alpha.join("shared.txt"), "alpha edited\n").unwrap();
+	for path in nested {
+		fs::write(alpha.join(path), "v2\n").unwrap();
+	}
+	// beta: a staged and an unstaged change and an untracked folder of two
+	// files, on a feature branch.
+	git_ok(&beta, &["checkout", "-qb", "feature/x"]);
+	fs::write(beta.join("beta-staged.txt"), "beta staged\n").unwrap();
+	git_ok(&beta, &["add", "beta-staged.txt"]);
+	fs::write(beta.join("shared.txt"), "beta edited\n").unwrap();
+	fs::create_dir_all(beta.join("newdir")).unwrap();
+	fs::write(beta.join("newdir/one.txt"), "one\ntwo\nthree\n").unwrap();
+	fs::write(beta.join("newdir/two.txt"), "two\n").unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app_themed(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+		theme,
+	);
+	let rx = &app.rx;
+	let loaded = lines_until_all_smoke(
+		rx,
+		&[
+			"[APP:REPO_LOADED: alpha files=4]",
+			"[APP:CHANGES_LOADED: beta files=4]",
+			"[APP:CHANGES_LOADED: gamma files=0]",
+		],
+		Duration::from_secs(15),
+	);
+	assert!(
+		!loaded.iter().any(|l| l.contains("CHANGES_LOADED: alpha")),
+		"the open repo's rows are its own load's: {loaded:?}"
+	);
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	let st = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(6))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(4);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		assert!(st.success());
+	};
+
+	// Groups first, each over the repos with files in it, in name order;
+	// the clean repo, empty (group, repo) pairs and an Untracked group are
+	// not listed. Repo rows start collapsed.
+	let order = [
+		"change-header:staged",
+		"change-repo:staged:alpha",
+		"change-repo:staged:beta",
+		"change-header:unstaged",
+		"change-repo:unstaged:alpha",
+		"change-repo:unstaged:beta",
+	];
+	let ys: Vec<i32> = order.iter().map(|id| control(id)[1]).collect();
+	assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?} {ys:?}");
+	let snap = settled();
+	assert!(
+		!snap
+			.keys()
+			.any(|k| k.starts_with("change-") && k.contains("untracked")),
+		"{snap:?}"
+	);
+	assert!(
+		!snap
+			.keys()
+			.any(|k| k.starts_with("change-") && k.contains("gamma")),
+		"{snap:?}"
+	);
+	absent("change-row@alpha:staged:staged.txt");
+	absent("change-row@beta:unstaged:shared.txt");
+
+	// Repo rows expand per group.
+	for (group, name) in [
+		("staged", "alpha"),
+		("staged", "beta"),
+		("unstaged", "alpha"),
+		("unstaged", "beta"),
+	] {
+		click(&format!("change-repo:{group}:{name}"));
+		wait(&format!(
+			"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed=false]"
+		));
+	}
+	control("change-row@alpha:staged:staged.txt");
+	control("change-row@beta:staged:beta-staged.txt");
+	control("change-row@beta:unstaged:shared.txt");
+	// Under an open repo: its top-level directories, collapsed, then its
+	// root files. The untracked folder sits in Unstaged.
+	let src = "change-dir:unstaged:alpha:src";
+	let newdir = "change-dir:unstaged:beta:newdir";
+	assert!(
+		control(src)[1] < control("change-row@alpha:unstaged:shared.txt")[1]
+	);
+	assert!(
+		control(newdir)[1] < control("change-row@beta:unstaged:shared.txt")[1]
+	);
+	absent("change-dir:unstaged:alpha:src/test");
+	absent("change-row@beta:untracked:newdir/one.txt");
+	// Unqualified ids keep naming the open repo's rows only.
+	assert_eq!(
+		control("change-row:staged:staged.txt"),
+		control("change-row@alpha:staged:staged.txt")
+	);
+	// The file rows sit under their repo row, indented past its checkbox.
+	let repo_chk = control("change-repo-chk:staged:beta");
+	let file_chk = control("change-chk@beta:staged:beta-staged.txt");
+	assert!(file_chk[0] > repo_chk[0], "{file_chk:?} {repo_chk:?}");
+
+	// One click opens a directory; the log carries its file count. `src`
+	// shows the compacted chain and `test`, both collapsed.
+	click(src);
+	wait("[APP:CHANGE_DIR_COLLAPSED: unstaged alpha src files=2 collapsed=false]");
+	let chain = "change-dir:unstaged:alpha:src/main/java/pkg";
+	let test_dir = "change-dir:unstaged:alpha:src/test";
+	control(test_dir);
+	control(chain);
+	absent("change-dir:unstaged:alpha:src/main");
+	absent("change-row@alpha:unstaged:src/main/java/pkg/App.java");
+	click(chain);
+	wait(
+		"[APP:CHANGE_DIR_COLLAPSED: unstaged alpha src/main/java/pkg files=1 collapsed=false]",
+	);
+	let app_row = "change-row@alpha:unstaged:src/main/java/pkg/App.java";
+	control(app_row);
+	absent("change-row@alpha:unstaged:src/test/AppTest.java");
+	click(newdir);
+	wait("[APP:CHANGE_DIR_COLLAPSED: unstaged beta newdir files=2 collapsed=false]");
+	control("change-row@beta:untracked:newdir/one.txt");
+	control("change-row@beta:untracked:newdir/two.txt");
+	// Chevrons of one level share a column, a child's sits right of its
+	// parent's, and sibling files line up with sibling directories'
+	// checkboxes.
+	let x = |id: &str| control(id)[0];
+	let level2 = x("change-dir-toggle:unstaged:alpha:src");
+	let level3 = x("change-dir-toggle:unstaged:alpha:src/main/java/pkg");
+	assert_eq!(level3, x("change-dir-toggle:unstaged:alpha:src/test"));
+	assert_eq!(level2, x("change-dir-toggle:unstaged:beta:newdir"));
+	assert!(level3 > level2, "{level3} {level2}");
+	assert_eq!(
+		x("change-dir-chk:unstaged:alpha:src"),
+		x("change-chk@alpha:unstaged:shared.txt")
+	);
+	assert_eq!(
+		x("change-dir-chk:unstaged:alpha:src/test"),
+		x("change-chk@alpha:unstaged:src/main/java/pkg/App.java")
+			- (level3 - level2)
+	);
+
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = if theme == "dark" {
+		"multi-repo-changes.png".to_string()
+	} else {
+		format!("multi-repo-changes-{theme}.png")
+	};
+	// Hide the Git log so the whole tree fits, and park the pointer over
+	// the editor so no row tooltip covers the tree.
+	key(&wid, "alt+9");
+	wait("[APP:LOG_PANEL: visible=false]");
+	let st = Command::new("xdotool")
+		.args(["mousemove", "--window", &wid, "700", "300"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	std::thread::sleep(Duration::from_millis(800));
+	capture_window(&wid, &out.join(shot));
+	if theme != "dark" {
+		quit_cleanly(&mut app, &wid);
+		return;
+	}
+
+	// A file of the repo that is not open previews from its own repo (the
+	// new-file diff of its three lines; alpha has no such file to read).
+	click("change-row@beta:untracked:newdir/one.txt");
+	let shown = wait(
+		"[APP:E2E_PREVIEW: source=working_changes rev=- path=newdir/one.txt ",
+	);
+	assert!(
+		shown.last().unwrap().contains(" lines=6 "),
+		"beta's file must be read from beta: {shown:?}"
+	);
+	wait("[APP:PREVIEW_LOADED: newdir/one.txt]");
+
+	// Its checkbox fills that repo's basket entry, still as untracked.
+	click("change-chk@beta:untracked:newdir/one.txt");
+	let basket = wait("[APP:BASKET: n=1");
+	assert!(
+		basket
+			.last()
+			.unwrap()
+			.contains("beta untracked newdir/one.txt"),
+		"{basket:?}"
+	);
+	// A repo row's checkbox covers that repo's files of that group only.
+	click("change-repo-chk:staged:beta");
+	let basket = wait("[APP:BASKET: n=2");
+	wait("[APP:REPO_CHANGES_TOGGLED: staged beta selected=true]");
+	assert!(!basket.last().unwrap().contains("alpha"), "{basket:?}");
+	// A directory's checkbox covers every file beneath it, collapsed
+	// `test` included, and nothing beside it.
+	click("change-dir-chk:unstaged:alpha:src");
+	let basket = wait("[APP:BASKET: n=4");
+	wait("[APP:DIR_CHANGES_TOGGLED: unstaged alpha src selected=true]");
+	let last = basket.last().unwrap();
+	assert!(
+		last.contains("alpha unstaged src/main/java/pkg/App.java")
+			&& last.contains("alpha unstaged src/test/AppTest.java")
+			&& !last.contains("alpha unstaged shared.txt"),
+		"{basket:?}"
+	);
+	// A group's checkbox spans every repo, untracked files included.
+	click("change-group-chk:unstaged");
+	let basket = wait("[APP:BASKET: n=7");
+	wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
+	let last = basket.last().unwrap();
+	assert!(
+		last.contains("alpha unstaged shared.txt")
+			&& last.contains("beta unstaged shared.txt")
+			&& last.contains("beta untracked newdir/two.txt"),
+		"{basket:?}"
+	);
+
+	// The header toggle lists files flat under each repo, and back.
+	click("btn-changes-group-dir");
+	wait("[APP:CHANGES_GROUP_DIR: on=false]");
+	absent(src);
+	control("change-row@alpha:unstaged:src/test/AppTest.java");
+	control(app_row);
+	click("btn-changes-group-dir");
+	wait("[APP:CHANGES_GROUP_DIR: on=true]");
+	control(src);
+	// Directory expansion survives the round trip.
+	control(app_row);
+	absent("change-row@alpha:unstaged:src/test/AppTest.java");
+
+	// Collapsing a repo row hides its files in that group only.
+	click("change-repo:unstaged:beta");
+	wait("[APP:REPO_CHANGES_COLLAPSED: unstaged beta collapsed=true]");
+	absent(newdir);
+	absent("change-row@beta:untracked:newdir/one.txt");
+	control("change-row@beta:staged:beta-staged.txt");
+	// One click on a group row collapses it; the chevron reopens it.
+	click("change-header:staged");
+	wait("[APP:GROUP_COLLAPSED: staged collapsed=true]");
+	absent("change-repo:staged:alpha");
+	absent("change-row@beta:staged:beta-staged.txt");
+	control("change-repo:unstaged:alpha");
+	click("change-group-toggle:staged");
+	wait("[APP:GROUP_COLLAPSED: staged collapsed=false]");
+	control("change-row@beta:staged:beta-staged.txt");
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Every pattern must appear (in any order) before `timeout`.
+fn lines_until_all_smoke(
+	rx: &Receiver<String>,
+	patterns: &[&str],
+	timeout: Duration,
+) -> Vec<String> {
+	let deadline = Instant::now() + timeout;
+	let mut seen: Vec<String> = Vec::new();
+	while !patterns.iter().all(|p| seen.iter().any(|l| l.contains(p))) {
+		let left = deadline.saturating_duration_since(Instant::now());
+		assert!(!left.is_zero(), "missing {patterns:?}; saw {seen:?}");
+		match rx.recv_timeout(left.min(Duration::from_millis(50))) {
+			Ok(line) => seen.push(line),
+			Err(RecvTimeoutError::Timeout) => {}
+			Err(RecvTimeoutError::Disconnected) => {
+				panic!("app exited; saw {seen:?}")
+			}
+		}
+	}
+	seen
+}
+
+/// A workspace of several repositories has one log, like IntelliJ with
+/// several VCS roots: every repository's commits interleaved by date, a
+/// root stripe per row, a Repository chip that narrows the log, and the
+/// details and diff of a commit read from its own repository.
+#[test]
+fn native_multi_repo_log_merges_and_filters_repositories() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	// Commit dates interleave the repositories; the offsets differ, so an
+	// order by date string would be wrong.
+	let plan: [(&str, [&str; 3]); 3] = [
+		(
+			"alpha",
+			[
+				"2026-01-01T01:00:00+00:00",
+				"2026-01-04T01:00:00+00:00",
+				"2026-01-07T01:00:00+00:00",
+			],
+		),
+		(
+			"beta",
+			[
+				"2026-01-02T09:00:00+08:00",
+				"2026-01-05T09:00:00+08:00",
+				"2026-01-08T09:00:00+08:00",
+			],
+		),
+		(
+			"gamma",
+			[
+				"2026-01-02T20:00:00-05:00",
+				"2026-01-05T20:00:00-05:00",
+				"2026-01-08T20:00:00-05:00",
+			],
+		),
+	];
+	let mut shas: HashMap<String, String> = HashMap::new();
+	for (name, dates) in plan {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "t@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Multi Test"]);
+		for (n, date) in dates.iter().enumerate() {
+			let n = n + 1;
+			fs::write(repo.join(format!("{name}{n}.txt")), format!("{n}\n"))
+				.unwrap();
+			git_ok(&repo, &["add", "."]);
+			let out = Command::new("git")
+				.current_dir(&repo)
+				.args(["commit", "-qm", &format!("{name} change {n}")])
+				.env("GIT_AUTHOR_DATE", date)
+				.env("GIT_COMMITTER_DATE", date)
+				.output()
+				.unwrap();
+			assert!(out.status.success());
+			shas.insert(format!("{name}{n}"), git_rev(&repo));
+		}
+	}
+	git_ok(&ws.path().join("beta"), &["branch", "feature"]);
+	let row = |c: &str| {
+		let name = c.trim_end_matches(char::is_numeric);
+		format!("commit-row:{name}:{}", &shas[c][..7])
+	};
+	// Newest first across the three repositories.
+	let order = [
+		"gamma3", "beta3", "alpha3", "gamma2", "beta2", "alpha2", "gamma1",
+		"beta1", "alpha1",
+	];
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 3]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		"[APP:MULTI_LOG_LOADED: repos=3 rows=9]",
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	let st = Command::new("xdotool")
+		.args(["windowmove", "--sync", &wid, "0", "0"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let st = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1280", "860"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let rx = &app.rx;
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(8))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, modifier: Option<&str>| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		if let Some(m) = modifier {
+			Command::new("xdotool")
+				.args(["keydown", m])
+				.status()
+				.unwrap();
+		}
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		if let Some(m) = modifier {
+			Command::new("xdotool").args(["keyup", m]).status().unwrap();
+		}
+		assert!(st.success());
+	};
+	let click = |id: &str| press(id, None);
+
+	// A taller log: every row on screen (and in the picture).
+	{
+		let v = control("splitter-bottom");
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+		]);
+		xdo(&["mousedown", "1"]);
+		for step in 1..=4 {
+			let y = (y - 60 * step).to_string();
+			xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+			std::thread::sleep(Duration::from_millis(30));
+		}
+		xdo(&["mouseup", "1"]);
+		wait("[APP:SPLIT_RESIZED: Bottom");
+	}
+	// 1. One log, newest first, each row with its repository's stripe.
+	let ys: Vec<i32> = order.iter().map(|c| control(&row(c))[1]).collect();
+	assert!(
+		ys.windows(2).all(|w| w[0] < w[1]),
+		"rows must be ordered newest first across repositories: {:?}",
+		order.iter().zip(&ys).collect::<Vec<_>>()
+	);
+	for c in order {
+		let stripe = control(&format!("root-stripe:{}", &row(c)[11..]));
+		let r = control(&row(c));
+		assert_eq!((stripe[0], stripe[1]), (r[0], r[1]), "{c} stripe");
+		assert!(stripe[2] < 12, "the stripe is a thin column: {stripe:?}");
+	}
+	// The selected repository's rows keep their plain-SHA ids for drivers.
+	control(&format!("commit-row:{}", &shas["alpha3"][..7]));
+	absent(&format!("commit-row:{}", &shas["beta3"][..7]));
+	control("log-filter-repo");
+
+	// 2. A commit's details and changes come from its own repository.
+	click(&row("beta2"));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &shas["beta2"][..7]));
+	control("commit-details-repo:beta");
+	control("commit-file:beta2.txt");
+	// A range across repositories is refused, not merged.
+	press(&row("gamma2"), Some("shift"));
+	wait("[APP:RANGE_REFUSED: cross_repo]");
+
+	// 3. The merged log as a picture (dark theme).
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join("multi-repo-log.png");
+	{
+		let geometry = Command::new("xdotool")
+			.args(["getwindowgeometry", "--shell", &wid])
+			.output()
+			.unwrap();
+		let text = String::from_utf8(geometry.stdout).unwrap();
+		let g: HashMap<_, _> =
+			text.lines().filter_map(|l| l.split_once('=')).collect();
+		let crop =
+			format!("{}x{}+{}+{}", g["WIDTH"], g["HEIGHT"], g["X"], g["Y"]);
+		settled();
+		std::thread::sleep(Duration::from_millis(300));
+		let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
+		assert!(Command::new("xwd")
+			.args(["-root", "-silent", "-out"])
+			.arg(xwd.path())
+			.status()
+			.unwrap()
+			.success());
+		assert!(Command::new("convert")
+			.arg(xwd.path())
+			.args(["-crop", &crop, "+repage"])
+			.arg(&shot)
+			.status()
+			.unwrap()
+			.success());
+		assert!(fs::metadata(&shot).unwrap().len() > 1024);
+	}
+	println!("[TEST DRIVER] merged log screenshot: {}", shot.display());
+
+	// 4. The Repository chip narrows the log to one repository: then it is
+	// the single-repository log with plain row ids.
+	click("log-filter-repo");
+	click("log-repo-check:alpha");
+	wait("[APP:LOG_REPOS: n=2]");
+	wait("[APP:MULTI_LOG_LOADED: repos=2 rows=6]");
+	absent(&row("alpha3"));
+	// A row click keeps only its repository.
+	click("log-repo:beta");
+	wait("[APP:LOG_REPOS: n=1]");
+	let loaded = wait("[APP:E2E_LOG:");
+	assert!(
+		loaded
+			.last()
+			.unwrap()
+			.contains(&format!("mode=graph n=3 first={}", &shas["beta3"][..7])),
+		"{loaded:?}"
+	);
+	control(&format!("commit-row:{}", &shas["beta1"][..7]));
+	absent(&row("gamma3"));
+	absent(&format!("root-stripe:{}", &row("beta3")[11..]));
+	// Back to every repository.
+	click("log-filter-repo-clear");
+	wait("[APP:MULTI_LOG_LOADED: repos=3 rows=9]");
+	control(&row("alpha1"));
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// A long CJK name is cut with "…" and then measured again at another width
+/// (a window or panel resize). gpui used to truncate the shared text runs,
+/// so the next measure laid out the full text with the cut runs: on macOS
+/// that sliced inside a multi-byte char and aborted the app. The vendored
+/// gpui asserts in debug builds that runs cover the text, which fails here
+/// on Linux too.
+#[test]
+fn native_cjk_truncation_survives_resize() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("repo");
+	fs::create_dir(&repo).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.name", "CJK Test"]);
+	git_ok(&repo, &["config", "user.email", "cjk@example.com"]);
+	git_ok(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+	fs::create_dir(repo.join("報表資料夾")).unwrap();
+	fs::write(
+		repo.join("報表資料夾/第一季財務報告與分析結果彙整文件.md"),
+		"y\n",
+	)
+	.unwrap();
+	fs::write(
+		repo.join("這是一個非常非常長的中文檔案名稱用來測試截斷與省略號.txt"),
+		"x\n",
+	)
+	.unwrap();
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(ws.path(), dest.path(), None);
+	lines_until(&app.rx, "[APP:PREVIEW_LOADED:", Duration::from_secs(10))
+		.unwrap();
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for w in ["1200", "700", "1300", "600", "1440", "800", "500", "1100"] {
+		assert!(Command::new("xdotool")
+			.args(["windowsize", &wid, w, "800"])
+			.status()
+			.unwrap()
+			.success());
+		std::thread::sleep(Duration::from_millis(400));
+		let child = app.child.as_mut().expect("app still owned");
+		assert!(
+			child.try_wait().unwrap().is_none(),
+			"app died while laying out CJK text at width {w}"
+		);
+	}
+	quit_cleanly(&mut app, &wid);
+}
+
+/// IntelliJ's log selection: Cmd/Ctrl-click toggles commits in and out of a
+/// selection that may have gaps, the details pane lists the union of their
+/// changed files as the Changes tool window's tree, Copy Commits refuses a
+/// selection that is not one first-parent chain, and another repository's
+/// commit cannot join.
+#[test]
+fn native_log_multiselect() {
+	log_multiselect("dark");
+}
+
+/// The same selection in the light palette, for the screenshot only.
+#[test]
+fn native_log_multiselect_light() {
+	log_multiselect("light");
+}
+
+fn log_multiselect(theme: &str) {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	// alpha: four commits, beta: two, interleaved by date.
+	// Per repository: (commit date, files it writes) oldest first.
+	type Commits = &'static [(&'static str, &'static [&'static str])];
+	let plan: [(&str, Commits); 2] = [
+		(
+			"alpha",
+			&[
+				(
+					"2026-01-01T01:00:00+00:00",
+					&["README.md", "src/app/main.rs"],
+				),
+				(
+					"2026-01-03T01:00:00+00:00",
+					&["src/app/main.rs", "docs/guide.md"],
+				),
+				("2026-01-05T01:00:00+00:00", &["lib/util.rs"]),
+				(
+					"2026-01-07T01:00:00+00:00",
+					&["src/app/main.rs", "src/app/view/list.rs"],
+				),
+			],
+		),
+		(
+			"beta",
+			&[
+				("2026-01-02T01:00:00+00:00", &["b.txt"]),
+				("2026-01-06T01:00:00+00:00", &["b.txt"]),
+			],
+		),
+	];
+	let mut shas: HashMap<String, String> = HashMap::new();
+	for (name, commits) in plan {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "t@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Multi Select"]);
+		for (n, (date, files)) in commits.iter().enumerate() {
+			let n = n + 1;
+			for f in *files {
+				let p = repo.join(f);
+				fs::create_dir_all(p.parent().unwrap()).unwrap();
+				fs::write(&p, format!("{name} {n}\n")).unwrap();
+			}
+			git_ok(&repo, &["add", "."]);
+			let out = Command::new("git")
+				.current_dir(&repo)
+				.args(["commit", "-qm", &format!("{name} change {n}")])
+				.env("GIT_AUTHOR_DATE", date)
+				.env("GIT_COMMITTER_DATE", date)
+				.output()
+				.unwrap();
+			assert!(out.status.success());
+			shas.insert(format!("{name}{n}"), git_rev(&repo));
+		}
+	}
+	let row = |c: &str| {
+		let name = c.trim_end_matches(char::is_numeric);
+		format!("commit-row:{name}:{}", &shas[c][..7])
+	};
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app_themed(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+		theme,
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 2]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		"[APP:MULTI_LOG_LOADED: repos=2 rows=6]",
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for args in [
+		vec!["windowmove", "--sync", &wid, "0", "0"],
+		vec!["windowsize", "--sync", &wid, "1280", "860"],
+	] {
+		assert!(Command::new("xdotool")
+			.args(args)
+			.status()
+			.unwrap()
+			.success());
+	}
+	let rx = &app.rx;
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(8))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, modifier: Option<&str>| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		if let Some(m) = modifier {
+			Command::new("xdotool")
+				.args(["keydown", m])
+				.status()
+				.unwrap();
+		}
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		if let Some(m) = modifier {
+			Command::new("xdotool").args(["keyup", m]).status().unwrap();
+		}
+		assert!(st.success());
+	};
+	let click = |id: &str| press(id, None);
+
+	// A taller log: every row and the whole details tree on screen.
+	{
+		let v = control("splitter-bottom");
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+		]);
+		xdo(&["mousedown", "1"]);
+		for step in 1..=4 {
+			let y = (y - 60 * step).to_string();
+			xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+			std::thread::sleep(Duration::from_millis(30));
+		}
+		xdo(&["mouseup", "1"]);
+		wait("[APP:SPLIT_RESIZED: Bottom");
+	}
+
+	// 1. One commit, then Ctrl-click a second one with a gap between.
+	click(&row("alpha4"));
+	wait("[APP:LOG_SELECTION: n=1 repo=alpha]");
+	press(&row("alpha2"), Some("ctrl"));
+	wait("[APP:LOG_SELECTION: n=2 repo=alpha]");
+	// The union of both commits' files, newest change per path; alpha3's
+	// lib/util.rs sits in the gap and is not listed.
+	wait("[APP:E2E_CHANGES: files=3]");
+	for f in ["src/app/main.rs", "src/app/view/list.rs", "docs/guide.md"] {
+		control(&format!("commit-file:{f}"));
+	}
+	absent("commit-file:lib/util.rs");
+	absent("commit-file:README.md");
+	// The Changes tree: `src/app` is one row, directories start open.
+	control("commit-dir:src/app");
+	control("commit-dir:docs");
+	control("commit-details-selection");
+	// The first file opens as the selection's diff.
+	wait("[APP:PREVIEW_LOADED:");
+	// Flat and back.
+	click("details-group-dir");
+	wait("[APP:LOG_DETAILS_GROUP_DIR: false]");
+	absent("commit-dir:src/app");
+	control("commit-file:docs/guide.md");
+	click("details-group-dir");
+	wait("[APP:LOG_DETAILS_GROUP_DIR: true]");
+	control("commit-dir:src/app");
+	// A file opens over the selected range.
+	click("commit-file:docs/guide.md");
+	wait("[APP:PREVIEW_LOADED: docs/guide.md]");
+
+	// 2. Copy Commits keeps its rule: one first-parent chain.
+	click("btn-copy-commits");
+	wait("[APP:COPY_COMMITS_ERR: commits are not contiguous:");
+
+	// 3. Another repository's commit cannot join the selection.
+	press(&row("beta2"), Some("ctrl"));
+	wait("[APP:RANGE_REFUSED: cross_repo]");
+	control("commit-details-selection");
+
+	// 4. The picture: two selected rows, the union as a tree.
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join(if theme == "light" {
+		"log-multiselect-light.png"
+	} else {
+		"log-multiselect.png"
+	});
+	settled();
+	std::thread::sleep(Duration::from_millis(300));
+	capture_window(&wid, &shot);
+	println!(
+		"[TEST DRIVER] log multi-select screenshot: {}",
+		shot.display()
+	);
+
+	// 5. Ctrl-click toggles out: back to one commit.
+	press(&row("alpha2"), Some("ctrl"));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &shas["alpha4"][..7]));
+	absent("commit-details-selection");
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// The merged log's graph over four repositories with branches, merges,
+/// root commits and a clone sharing SHAs, interleaved by date. Every
+/// commit's row sits above its parents' rows in its own repository (the
+/// order `git log --graph --topo-order` draws), and the picture is kept
+/// as `merged-graph.png` for review.
+#[test]
+fn native_merged_graph_over_four_repositories() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	let at = |day: u32| format!("2026-02-{day:02}T10:00:00+00:00");
+	let run = |repo: &Path, day: u32, args: &[&str]| {
+		let out = Command::new("git")
+			.current_dir(repo)
+			.args(args)
+			.env("GIT_AUTHOR_DATE", at(day))
+			.env("GIT_COMMITTER_DATE", at(day))
+			.output()
+			.unwrap();
+		assert!(
+			out.status.success(),
+			"git {args:?}: {}",
+			String::from_utf8_lossy(&out.stderr)
+		);
+	};
+	let commit = |repo: &Path, day: u32, msg: &str| {
+		fs::write(repo.join(format!("{msg}.txt")), format!("{msg}\n")).unwrap();
+		run(repo, day, &["add", "."]);
+		run(repo, day, &["commit", "-qm", msg]);
+	};
+	let init = |name: &str| {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "g@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Graph"]);
+		repo
+	};
+	// alpha: a feature branch merged back with --no-ff.
+	let alpha = init("alpha");
+	commit(&alpha, 1, "a1");
+	commit(&alpha, 3, "a2");
+	git_ok(&alpha, &["checkout", "-q", "-b", "feat"]);
+	commit(&alpha, 8, "af2");
+	git_ok(&alpha, &["checkout", "-q", "main"]);
+	commit(&alpha, 6, "a3");
+	run(&alpha, 9, &["merge", "-q", "--no-ff", "-m", "am", "feat"]);
+	commit(&alpha, 11, "a4");
+	// delta: a clone of alpha's first two commits (same SHAs), then its own.
+	let delta = ws.path().join("delta");
+	let st = Command::new("git")
+		.args(["clone", "-q", "--no-local"])
+		.arg(&alpha)
+		.arg(&delta)
+		.status()
+		.unwrap();
+	assert!(st.success());
+	git_ok(&delta, &["config", "user.email", "g@example.com"]);
+	git_ok(&delta, &["config", "user.name", "Graph"]);
+	git_ok(&delta, &["reset", "-q", "--hard", "HEAD~3"]);
+	git_ok(&delta, &["remote", "remove", "origin"]);
+	commit(&delta, 10, "d2");
+	// beta: the newest commit of all, and a root in the middle: its lane
+	// ends while every other repository goes on below it.
+	let beta = init("beta");
+	commit(&beta, 2, "b1");
+	commit(&beta, 12, "b3");
+	// gamma: an unmerged topic branch and an orphan second root.
+	let gamma = init("gamma");
+	commit(&gamma, 2, "c1");
+	git_ok(&gamma, &["checkout", "-q", "-b", "topic"]);
+	commit(&gamma, 8, "ct1");
+	git_ok(&gamma, &["checkout", "-q", "main"]);
+	git_ok(&gamma, &["checkout", "-q", "--orphan", "pages"]);
+	git_ok(&gamma, &["rm", "-rfq", "."]);
+	commit(&gamma, 5, "cp1");
+	git_ok(&gamma, &["checkout", "-q", "main"]);
+	commit(&gamma, 10, "c3");
+
+	let rows = |repo: &Path| -> Vec<(String, Vec<String>)> {
+		let out = Command::new("git")
+			.current_dir(repo)
+			.args(["rev-list", "--parents", "--all"])
+			.output()
+			.unwrap();
+		String::from_utf8(out.stdout)
+			.unwrap()
+			.lines()
+			.map(|l| {
+				let mut it = l.split(' ').map(str::to_string);
+				(it.next().unwrap(), it.collect())
+			})
+			.collect()
+	};
+	let repos = [
+		("alpha", alpha.clone()),
+		("beta", beta.clone()),
+		("delta", delta.clone()),
+		("gamma", gamma.clone()),
+	];
+	let total: usize = repos.iter().map(|(_, r)| rows(r).len()).sum();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 4]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		&format!("[APP:MULTI_LOG_LOADED: repos=4 rows={total}]"),
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for args in [
+		vec!["windowmove", "--sync", &wid, "0", "0"],
+		vec!["windowsize", "--sync", &wid, "1280", "900"],
+	] {
+		assert!(Command::new("xdotool")
+			.args(args)
+			.status()
+			.unwrap()
+			.success());
+	}
+	let rx = &app.rx;
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	// Every row on screen: the log takes most of the window. The resize
+	// above may not be laid out yet on a slow runner, so a drag that missed
+	// the splitter re-reads its bounds and tries again.
+	{
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		let mut resized = Err(String::new());
+		for _ in 0..3 {
+			let v = *settled().get("splitter-bottom").expect("splitter");
+			let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+			xdo(&[
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+			]);
+			std::thread::sleep(Duration::from_millis(100));
+			xdo(&["mousedown", "1"]);
+			for step in 1..=6 {
+				let y = (y - 60 * step).to_string();
+				xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+				std::thread::sleep(Duration::from_millis(30));
+			}
+			xdo(&["mouseup", "1"]);
+			resized = lines_until(
+				rx,
+				"[APP:SPLIT_RESIZED: Bottom",
+				Duration::from_secs(5),
+			);
+			if resized.is_ok() {
+				break;
+			}
+		}
+		resized.unwrap();
+	}
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join("merged-graph.png");
+	std::thread::sleep(Duration::from_millis(300));
+	capture_window(&wid, &shot);
+	println!("[TEST DRIVER] merged graph screenshot: {}", shot.display());
+
+	// Each repository's commits sit above their parents.
+	let snap = settled();
+	for (name, repo) in &repos {
+		let y = |sha: &str| {
+			let id = format!("commit-row:{name}:{}", &sha[..7]);
+			snap.get(&id).unwrap_or_else(|| panic!("{id} not drawn"))[1]
+		};
+		for (sha, parents) in rows(repo) {
+			for p in parents {
+				assert!(y(&sha) < y(&p), "{name}: {sha} must sit above {p}");
+			}
+		}
+	}
+
+	quit_cleanly(&mut app, &wid);
 }

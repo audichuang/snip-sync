@@ -252,6 +252,7 @@ fn spawn_app(opts: SpawnOpts) -> App {
 	.stdout(Stdio::piped())
 	.stderr(Stdio::piped())
 	.env("XMODIFIERS", "@im=none")
+	.env("SNIP_THEME", "dark")
 	.env("SNIP_NATIVE_E2E", "1")
 	.env_remove("SNIP_E2E_GIT_HOLD_FILE")
 	.env_remove("SNIP_NATIVE_E2E_READ_DELAY_MS")
@@ -581,7 +582,8 @@ fn close_reopen_same_pid_discards_stale_preview_and_keeps_clipboard() {
 		.args(["windowsize", "--sync", &wid, "1080", "720"])
 		.status();
 	let _ = control("btn-workspace-menu");
-	let _ = control("lifecycle-jobs");
+	// Jobs show in the status bar only while some run (no "0" counter).
+	let _ = control("status-bar");
 	capture(&wid, &shots().join("01-workspace-open.png"));
 	snapshot(app.pid, &app.starttime);
 
@@ -2754,4 +2756,396 @@ fn wait_git_child(app_pid: u32, app_start: &str) -> (u32, String) {
 		.map(|pid| format!("{pid}:{}", cmdline(pid)))
 		.collect();
 	panic!("no held git child appeared; children={kids:?}");
+}
+
+/// Two repos `a` and `b`, each with an untracked `note.txt`, and a Git
+/// wrapper that blocks while `hold` exists.
+struct TwoRepos {
+	_root: tempfile::TempDir,
+	ws: PathBuf,
+	dest: PathBuf,
+	hold: PathBuf,
+	wrap_dir: PathBuf,
+}
+
+fn two_repos() -> TwoRepos {
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let ws = root.path().join("ws");
+	for name in ["a", "b"] {
+		let repo = ws.join(name);
+		init_repo(&git_bin, &repo);
+		fs::write(repo.join("note.txt"), format!("note from {name}\n"))
+			.unwrap();
+	}
+	let dest = root.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+	let wrap = root.path().join("bin").join("git");
+	hold_all_git_wrapper(&git_bin, &wrap);
+	TwoRepos {
+		ws,
+		dest,
+		hold: root.path().join("hold"),
+		wrap_dir: wrap.parent().unwrap().to_path_buf(),
+		_root: root,
+	}
+}
+
+fn spawn_two(fx: &TwoRepos, tree_hold: Option<&Path>) -> (App, String) {
+	let app = spawn_app(SpawnOpts {
+		workspace: &fx.ws,
+		restore: &fx.dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: Some(&fx.hold),
+		path_prefix: Some(&fx.wrap_dir),
+		tree_hold,
+		export_hold: None,
+	});
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	lines_until_all(
+		&app.rx,
+		&[
+			"[APP:READY_REPOS: 2]",
+			"[APP:REPO_LOADED: a files=1]",
+			"[APP:PREVIEW_LOADED: note.txt]",
+		],
+		Duration::from_secs(12),
+	);
+	wait_git_idle(app.pid, &app.starttime);
+	// Changes starts with every repo node collapsed; the tests work in `a`.
+	click(&wid, "change-repo:unstaged:a");
+	lines_until(
+		&app.rx,
+		"[APP:REPO_CHANGES_COLLAPSED: unstaged a collapsed=false]",
+		Duration::from_secs(4),
+	);
+	(app, wid)
+}
+
+/// Selects repo `name` (at list index `idx`) from the Project tool.
+fn switch_repo(app: &App, wid: &str, name: &str, idx: usize) {
+	// The rail button toggles; the shortcut only shows.
+	key(wid, "alt+1");
+	click(wid, &format!("repo-row:{name}"));
+	lines_until(
+		&app.rx,
+		&format!("[APP:REPO_SELECTING: {idx} ({name})"),
+		Duration::from_secs(4),
+	);
+}
+
+/// Refresh re-reads the open repo's Changes (keeping the opened file), and a
+/// repo deleted on disk is dropped instead of leaving its view under
+/// another repo's name.
+#[test]
+fn refresh_reloads_the_open_repo_and_releases_a_vanished_one() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = two_repos();
+	let (mut app, wid) = spawn_two(&fx, None);
+
+	// `extra.txt` sorts first; the reload must keep `note.txt` open.
+	fs::write(fx.ws.join("a").join("extra.txt"), "extra\n").unwrap();
+	key(&wid, "ctrl+r");
+	lines_until_all(
+		&app.rx,
+		&["[APP:READY_REPOS: 2]", "[APP:REPO_LOADED: a files=2]"],
+		Duration::from_secs(12),
+	);
+	let after =
+		lines_until(&app.rx, "[APP:PREVIEW_LOADED:", Duration::from_secs(6));
+	assert!(
+		after
+			.last()
+			.unwrap()
+			.contains("[APP:PREVIEW_LOADED: note.txt]"),
+		"refresh lost the opened file: {after:?}"
+	);
+	control("change-row:extra.txt");
+
+	// A selection in the repo about to vanish must not block a later Copy.
+	click(&wid, "change-chk:note.txt");
+	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+
+	fs::remove_dir_all(fx.ws.join("a")).unwrap();
+	key(&wid, "ctrl+r");
+	let lines = lines_until_all(
+		&app.rx,
+		&["[APP:REPO_VANISHED: a]", "[APP:READY_REPOS: 1]"],
+		Duration::from_secs(12),
+	);
+	assert!(
+		position(&lines, "[APP:REPO_SELECTING:").is_none(),
+		"the vanished repo's view was handed to another repo: {lines:?}"
+	);
+	assert!(
+		position(&lines, "[APP:BASKET: n=0").is_some(),
+		"the vanished repo's selections stayed in the basket: {lines:?}"
+	);
+	absent("change-row:note.txt");
+	absent("change-row:extra.txt");
+	// The log shows the workspace: it reloads over the repo left.
+	let graph =
+		lines_until(&app.rx, "[APP:GRAPH_LOADED:", Duration::from_secs(8));
+	assert!(
+		!graph.last().unwrap().contains("commits=0]"),
+		"the log stayed empty after a repo vanished: {graph:?}"
+	);
+
+	switch_repo(&app, &wid, "b", 0);
+	lines_until(&app.rx, "[APP:REPO_LOADED: b", Duration::from_secs(8));
+	key(&wid, "alt+0");
+	click(&wid, "change-chk:note.txt");
+	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+	let sentinel = "CLIP-SENTINEL-vanished-repo";
+	clip_set(sentinel);
+	click(&wid, "btn-copy");
+	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(10));
+	let copied = clip_get();
+	assert!(
+		copied.contains("note from b") && !copied.contains("note from a"),
+		"copy after a repo vanished: {copied:?}"
+	);
+	quit_cleanly(&mut app, &wid);
+}
+
+/// While the Changes list is still loading, Copy and Select All must not
+/// drop that repo's Git-source selections.
+#[test]
+fn unloaded_change_list_keeps_git_selections() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = two_repos();
+	let (mut app, wid) = spawn_two(&fx, None);
+	click(&wid, "change-chk:note.txt");
+	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+
+	switch_repo(&app, &wid, "b", 1);
+	lines_until(&app.rx, "[APP:REPO_LOADED: b", Duration::from_secs(8));
+	wait_git_idle(app.pid, &app.starttime);
+
+	// `a`'s status read blocks, so its Changes list stays unloaded.
+	fs::write(&fx.hold, b"hold").unwrap();
+	switch_repo(&app, &wid, "a", 0);
+	app.tracked.push(wait_git_child(app.pid, &app.starttime));
+
+	key(&wid, "alt+s");
+	let lines = lines_until(
+		&app.rx,
+		"[APP:FILES_SELECTED_ALL]",
+		Duration::from_secs(4),
+	);
+	let basket = lines.iter().rfind(|l| l.contains("[APP:BASKET:")).unwrap();
+	assert!(
+		basket.contains("a untracked note.txt"),
+		"Select All while loading dropped the Git selection: {basket}"
+	);
+	key(&wid, "alt+d");
+	lines_until(&app.rx, "[APP:FILES_DESELECTED]", Duration::from_secs(4));
+
+	let sentinel = "CLIP-SENTINEL-unloaded-changes";
+	clip_set(sentinel);
+	click(&wid, "btn-copy");
+	let lines = lines_until(&app.rx, "[APP:BASKET:", Duration::from_secs(4));
+	let basket = lines.last().unwrap();
+	assert!(
+		basket.contains("n=1") && basket.contains("a untracked note.txt"),
+		"Copy while loading dropped the Git selection: {lines:?}"
+	);
+	fs::remove_file(&fx.hold).unwrap();
+	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(10));
+	let copied = clip_get();
+	assert!(
+		copied.contains("note.txt") && copied.contains("note from a"),
+		"the copy lost the selected change: {copied:?}"
+	);
+	wait_git_idle(app.pid, &app.starttime);
+	quit_cleanly(&mut app, &wid);
+}
+
+/// A file name that is not UTF-8 is shown but cannot be checked, so the other
+/// selected changes still copy.
+#[test]
+fn non_utf8_change_is_not_checkable_and_does_not_block_copy() {
+	use std::os::unix::ffi::OsStrExt;
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let ws = root.path().join("ws");
+	let repo = ws.join("e");
+	init_repo(&git_bin, &repo);
+	let bad = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+	fs::write(repo.join(bad), "bad\n").unwrap();
+	fs::write(repo.join("good.txt"), "good bytes\n").unwrap();
+	let dest = root.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+	let mut app = spawn_app(SpawnOpts {
+		workspace: &ws,
+		restore: &dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: None,
+		path_prefix: None,
+		tree_hold: None,
+		export_hold: None,
+	});
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	lines_until_all(
+		&app.rx,
+		&["[APP:READY_REPOS: 1]", "[APP:REPO_LOADED: e files=2]"],
+		Duration::from_secs(12),
+	);
+
+	// Files are path-sorted; the lossy `bad\u{FFFD}.txt` is index 0.
+	click(&wid, "change-chk-invalid:0");
+	let lines = lines_for(&app.rx, Duration::from_millis(800));
+	assert!(
+		position(&lines, "[APP:FILE_TOGGLED:").is_none(),
+		"a non-UTF-8 change was selectable: {lines:?}"
+	);
+	click(&wid, "change-chk:good.txt");
+	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+
+	let sentinel = "CLIP-SENTINEL-non-utf8";
+	clip_set(sentinel);
+	click(&wid, "btn-copy");
+	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(10));
+	let copied = clip_get();
+	assert!(
+		copied.contains("good.txt") && copied.contains("good bytes"),
+		"copy did not publish the valid change: {copied:?}"
+	);
+	quit_cleanly(&mut app, &wid);
+}
+
+/// A drain that times out leaves the workspace open; the Changes read it
+/// cancelled must run again instead of leaving the list empty.
+#[test]
+fn failed_drain_reloads_the_changes_it_cancelled() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let fx = two_repos();
+	let tree_hold = fx.hold.with_file_name("tree-hold");
+	let (mut app, wid) = spawn_two(&fx, Some(&tree_hold));
+
+	// `b`'s tree read (no Git child) and status read both block.
+	fs::write(&tree_hold, b"hold").unwrap();
+	fs::write(&fx.hold, b"hold").unwrap();
+	switch_repo(&app, &wid, "b", 1);
+	lines_until(&app.rx, "[APP:TREE_IO_HELD]", Duration::from_secs(6));
+	app.tracked.push(wait_git_child(app.pid, &app.starttime));
+
+	click(&wid, "btn-workspace-menu");
+	click(&wid, "btn-close-workspace");
+	lines_until(
+		&app.rx,
+		"phase=draining intent=close-workspace",
+		Duration::from_secs(4),
+	);
+	// Close cancels the status read; only the tree read keeps the drain.
+	fs::remove_file(&fx.hold).unwrap();
+	lines_until(
+		&app.rx,
+		"phase=failed intent=close-workspace reason=timeout",
+		Duration::from_secs(14),
+	);
+	lines_until(&app.rx, "[APP:REPO_LOADED: b", Duration::from_secs(8));
+
+	fs::remove_file(&tree_hold).unwrap();
+	wait_git_idle(app.pid, &app.starttime);
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Losing the X server must end the process instead of spinning on the
+/// dead connection's always-readable fd (vendor/gpui/SNIP_PATCH.md).
+#[test]
+fn x_server_loss_exits_instead_of_spinning() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	// A private server, so killing it leaves the shared DISPLAY alone.
+	let mut xvfb = Command::new("Xvfb")
+		.args(["-displayfd", "1", "-screen", "0", "1280x900x24"])
+		.args(["-nolisten", "tcp"])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::null())
+		.spawn()
+		.expect("Xvfb should start");
+	let mut display = String::new();
+	BufReader::new(xvfb.stdout.take().unwrap())
+		.read_line(&mut display)
+		.expect("Xvfb display number");
+	let display = format!(":{}", display.trim());
+	let root = tempfile::tempdir().unwrap();
+	let mut child = Command::new(env!("CARGO_BIN_EXE_snip-desktop-native"))
+		.args(["--workspace", &root.path().to_string_lossy()])
+		.args(["--restore-dir", &root.path().to_string_lossy()])
+		.env("DISPLAY", &display)
+		.env("XMODIFIERS", "@im=none")
+		.env("SNIP_NATIVE_E2E", "1")
+		.stdout(Stdio::piped())
+		.stderr(Stdio::inherit())
+		.spawn()
+		.expect("native desktop should run");
+	let pid = child.id();
+	let (tx, rx) = std::sync::mpsc::channel::<String>();
+	let stdout = child.stdout.take().unwrap();
+	let reader = std::thread::spawn(move || {
+		for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+			let _ = tx.send(line);
+		}
+	});
+	lines_until(&rx, "[APP:WINDOW_READY]", Duration::from_secs(20));
+	std::thread::sleep(Duration::from_millis(500));
+
+	let _ = xvfb.kill();
+	let _ = xvfb.wait();
+	// utime + stime in clock ticks.
+	let ticks = |pid: u32| -> Option<u64> {
+		let rest = proc_rest(pid)?;
+		Some(rest[11].parse::<u64>().ok()? + rest[12].parse::<u64>().ok()?)
+	};
+	let before = ticks(pid).expect("app cpu ticks");
+	let start = Instant::now();
+	let mut last = before;
+	let status = loop {
+		if let Some(status) = child.try_wait().unwrap() {
+			break status;
+		}
+		last = ticks(pid).unwrap_or(last);
+		if start.elapsed() > Duration::from_secs(5) {
+			let _ = child.kill();
+			let _ = child.wait();
+			panic!(
+				"app still running 5s after its X server died; cpu ticks {before}->{last} (cleanup kill)"
+			);
+		}
+		std::thread::sleep(Duration::from_millis(50));
+	};
+	let _ = reader.join();
+	println!(
+		"[LIFECYCLE-TEST] X loss: exited in {:?} with {status}, cpu ticks {before}->{last}",
+		start.elapsed()
+	);
+	assert!(
+		status.success(),
+		"app exited uncleanly after X loss: {status}"
+	);
 }

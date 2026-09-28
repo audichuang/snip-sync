@@ -51,10 +51,10 @@ desktop-e2e:
 # Native real-app smoke test (Linux X11): needs xvfb, xdotool, x11-apps, imagemagick, xkbcommon, fonts, software graphics.
 native-smoke out="target/native-e2e-artifacts":
 	mkdir -p "{{out}}"
-	rm -f "{{out}}/graph.png" "{{out}}/file_tree.png" "{{out}}/paste_preview.png"
+	rm -f "{{out}}/graph.png" "{{out}}/file_tree.png" "{{out}}/paste_preview.png" "{{out}}/light_theme.png"
 	bash -o pipefail -c 'SNIP_REQUIRE_ALL_TESTS=1 SNIP_E2E_OUT="$(realpath "$1")" ./scripts/headless-x11.sh cargo test -p snip-desktop-native --test smoke --locked -- --nocapture 2>&1 | tee "$1/smoke.log"' _ "{{out}}"
 	test -s "{{out}}/smoke.log"
-	python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "{{out}}"
+	python3 -c "import sys, pathlib; out = pathlib.Path(sys.argv[1]); [sys.exit(f'Missing or invalid {name}') for name in ('graph.png', 'file_tree.png', 'paste_preview.png', 'light_theme.png') if not (p := out / name).is_file() or p.stat().st_size == 0 or p.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n']" "{{out}}"
 
 # Real X11 close/reopen/quit drain and copy/paste cancel checks (tests/lifecycle.rs).
 native-lifecycle out="target/native-e2e-artifacts":
@@ -85,7 +85,7 @@ native-resources-short *args:
 native-resources-long *args:
     "{{ native_python }}" -B scripts/run_native_acceptance.py --gate resource-long {{ args }}
 
-# Package native desktop candidate bundle (Linux, macOS, Windows).
+# Package the native desktop app (the release asset layout; see docs/native-cross-platform-ci-and-packaging.md).
 package-native target out bin version:
 	./scripts/package_native.sh "{{target}}" "{{out}}" "{{bin}}" "{{version}}"
 
@@ -129,7 +129,8 @@ release version *flags:
 	if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git ls-remote --tags "$REMOTE" "$TAG" | grep -q "$TAG"; then
 		err "tag $TAG already exists"
 	fi
-	# The build syncs the version from the tag, but a committed bump keeps local builds honest.
+	# The desktop assets are the CI-accepted packages of this SHA and carry its
+	# Cargo.toml version (release.yml never rebuilds them), so the bump must be committed.
 	grep -q "^version = \"$VERSION\"$" Cargo.toml || err "Cargo.toml is not at $VERSION; run 'just bump $VERSION' and commit"
 	# Must be newer than the latest stable tag (pre-release tags sort above their stable).
 	LATEST="$(git tag --list 'v*' --sort=-v:refname | sed '/-/d' | head -1)"
@@ -143,8 +144,8 @@ release version *flags:
 	git push "$REMOTE" main
 	info "waiting for ci.yml (push to main) on $HEAD_SHA..."
 	CI_OK=0
-	# 40 min budget: the cold 3-OS matrix routinely takes 25+ min.
-	for _ in $(seq 1 120); do
+	# 150 min budget: native-acceptance alone may take up to its 120 min timeout.
+	for _ in $(seq 1 450); do
 		RUN="$(gh run list --repo "$REPO" --workflow ci.yml --limit 30 \
 			--json headSha,headBranch,event,status,conclusion \
 			--jq "[.[] | select(.headSha==\"$HEAD_SHA\" and .headBranch==\"main\" and .event==\"push\")] | first" 2>/dev/null || echo "")"
@@ -189,7 +190,8 @@ release version *flags:
 
 	ASSETS="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')"
 	echo "$ASSETS" | sed 's/^/    /'
-	for must in snip-sync_mac_arm.dmg snip-sync_mac_intel.dmg snip-sync-linux.AppImage snip-sync-windows-setup.exe \
+	for must in snip-sync_mac_arm.dmg snip-sync_mac_arm.app.tar.gz snip-sync_mac_intel.dmg snip-sync_mac_intel.app.tar.gz \
+		snip-sync-windows-setup.exe snip-sync-windows-x64.zip snip-sync-linux-x86_64.tar.gz snip-sync-desktop-SHA256SUMS.txt \
 		snip-aarch64-apple-darwin.tar.gz snip-x86_64-apple-darwin.tar.gz snip-x86_64-unknown-linux-gnu.tar.gz snip-x86_64-pc-windows-msvc.zip; do
 		echo "$ASSETS" | grep -qx -- "$must" || err "missing asset $must"
 	done

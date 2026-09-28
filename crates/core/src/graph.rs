@@ -237,7 +237,9 @@ pub struct ParentEdge {
 	pub parent_index: usize,
 	/// Originating lane of the child commit.
 	pub from_lane: usize,
-	/// Target lane for this parent connection.
+	/// Lane this connection leaves the row in: the node's lane for the first
+	/// parent, the merge rail's lane otherwise. It is not the parent's lane;
+	/// rails bend on later rows, so renderers draw [`GraphLayout::paths`].
 	pub to_lane: usize,
 	/// Target row index if resolved within the current layout page.
 	pub to_row: Option<usize>,
@@ -379,6 +381,14 @@ pub struct GraphConfig {
 	/// revision filtering. Missing parents not in this set are treated as
 	/// [`ContinuationKind::UnresolvedPageBoundary`].
 	pub filtered_commits: HashSet<String>,
+	/// Keep the lane of a rail that ends on a root commit empty for one more
+	/// row before the rails to its right move left. Off (SourceGit) by
+	/// default. A log of several unrelated histories (one per repository)
+	/// turns it on: otherwise the next rail can bend into the lane and land
+	/// its commit directly under the other history's root, which reads as
+	/// a join. A held lane is not carried across a page's checkpoint.
+	#[serde(default)]
+	pub hold_root_lanes: bool,
 }
 
 impl Default for GraphConfig {
@@ -393,6 +403,7 @@ impl Default for GraphConfig {
 			offset_x: 10.0,
 			shallow_roots: HashSet::new(),
 			filtered_commits: HashSet::new(),
+			hold_root_lanes: false,
 		}
 	}
 }
@@ -498,9 +509,44 @@ pub fn parse_ref_name(name: &str) -> RefInfo {
 	}
 }
 
+impl GraphPath {
+	/// The part of this path with `top <= y <= bottom`, as one polyline
+	/// (points are ordered by strictly increasing `y`). Adjacent row ranges
+	/// share their boundary point exactly, so rows drawn one by one join up.
+	pub fn clip_y(&self, top: f64, bottom: f64) -> Vec<Point> {
+		let pts = &self.points;
+		let first = pts.partition_point(|p| p.y <= top).saturating_sub(1);
+		let mut out = Vec::new();
+		for w in pts[first.min(pts.len())..].windows(2) {
+			let (a, b) = (w[0], w[1]);
+			if a.y >= bottom {
+				break;
+			}
+			if b.y <= top {
+				continue;
+			}
+			let at = |y: f64| Point {
+				x: a.x + (b.x - a.x) * (y - a.y) / (b.y - a.y),
+				y,
+			};
+			let start = if a.y < top { at(top) } else { a };
+			let end = if b.y > bottom { at(bottom) } else { b };
+			if out.last() != Some(&start) {
+				out.push(start);
+			}
+			out.push(end);
+		}
+		out
+	}
+}
+
 // ── Internal PathHelper (SourceGit faithful) ──
 
 struct PathHelper {
+	/// A lane held empty for one row after its rail ended on a root
+	/// ([`GraphConfig::hold_root_lanes`]): it draws nothing and waits for
+	/// no commit.
+	held: bool,
 	next: String,
 	color: usize,
 	color_override: Option<String>,
@@ -520,6 +566,7 @@ impl PathHelper {
 		rail_id: usize,
 	) -> Self {
 		Self {
+			held: false,
 			next,
 			color,
 			color_override: None,
@@ -540,6 +587,7 @@ impl PathHelper {
 		rail_id: usize,
 	) -> Self {
 		Self {
+			held: false,
 			next,
 			color,
 			color_override: None,
@@ -552,21 +600,44 @@ impl PathHelper {
 		}
 	}
 
-	fn from_frontier(rail: &FrontierRail) -> Self {
-		let pt = Point {
-			x: rail.last_x,
-			y: rail.last_y,
-		};
-		Self {
+	/// Resumes a rail at the top of a new page. The previous page drew it
+	/// straight down to its bottom edge at `last_x`, so this page continues
+	/// from `(last_x, page_top)`: a bend on the first row then starts where
+	/// the previous page stopped instead of cutting across the boundary.
+	fn from_frontier(rail: &FrontierRail, page_top: f64) -> Self {
+		let mut helper = Self {
+			held: false,
 			next: rail.next_sha.clone(),
 			color: rail.color_index,
 			color_override: rail.color_override.clone(),
 			highlighted: rail.highlighted,
 			rail_id: rail.rail_id,
-			points: vec![pt],
+			points: vec![Point {
+				x: rail.last_x,
+				y: rail.last_y,
+			}],
 			last_x: rail.last_x,
 			last_y: rail.last_y,
 			end_y: rail.last_y,
+		};
+		helper.add_point(rail.last_x, page_top);
+		helper.last_y = helper.last_y.max(page_top);
+		helper
+	}
+
+	/// The lane `x` of a rail that just ended, held for the next row.
+	fn held_lane(x: f64, y: f64) -> Self {
+		Self {
+			held: true,
+			next: String::new(),
+			color: usize::MAX,
+			color_override: None,
+			highlighted: false,
+			rail_id: usize::MAX,
+			points: Vec::new(),
+			last_x: x,
+			last_y: y,
+			end_y: y,
 		}
 	}
 
@@ -887,8 +958,14 @@ pub fn compute_graph_layout(
 	let unit_h = config.unit_y;
 	let half_h = unit_h / 2.0;
 
+	let page_top = (global_row_offset as f64) * unit_h;
 	let mut unsolved: Vec<PathHelper> = checkpoint
-		.map(|cp| cp.frontier.iter().map(PathHelper::from_frontier).collect())
+		.map(|cp| {
+			cp.frontier
+				.iter()
+				.map(|rail| PathHelper::from_frontier(rail, page_top))
+				.collect()
+		})
 		.unwrap_or_default();
 
 	let mut completed_paths: Vec<GraphPath> = Vec::new();
@@ -901,7 +978,17 @@ pub fn compute_graph_layout(
 		let global_row = global_row_offset + row_idx;
 		let offset_y = (global_row as f64) * unit_h + half_h;
 		let mut offset_x = config.offset_x - unit_w;
+		// A hidden (collapsed) parent gets no rail: nothing below would
+		// ever consume it, so it would hang on as a ghost lane.
+		let first_parent = commit
+			.parents
+			.first()
+			.filter(|p| !config.filtered_commits.contains(*p));
 
+		let prev_last_x: Option<f64> = unsolved
+			.last()
+			.map(|r| r.last_x)
+			.filter(|_| config.hold_root_lanes);
 		let max_offset_old = if let Some(last_rail) = unsolved.last() {
 			last_rail.last_x
 		} else {
@@ -925,6 +1012,12 @@ pub fn compute_graph_layout(
 		);
 
 		for (i, rail) in unsolved.iter_mut().enumerate() {
+			if rail.held {
+				// Keeps its own lane (rails only ever move left), so the
+				// rails right of it do not move into it on this row either.
+				offset_x = (offset_x + unit_w).max(rail.last_x);
+				continue;
+			}
 			let is_target = rail.next == commit.sha;
 			if is_target {
 				if major_idx.is_none() {
@@ -937,8 +1030,8 @@ pub fn compute_graph_layout(
 						rail.highlighted = true;
 						incoming_highlighted = true;
 					}
-					if !commit.parents.is_empty() {
-						rail.next = commit.parents[0].clone();
+					if let Some(parent) = first_parent {
+						rail.next = parent.clone();
 						rail.goto(offset_x, offset_y, half_h);
 					} else {
 						rail.end(offset_x, offset_y, half_h);
@@ -962,14 +1055,23 @@ pub fn compute_graph_layout(
 			}
 		}
 
-		// Separate ended paths
-		if major_idx.is_some() {
+		// Separate ended paths; a held lane lasts one row.
+		if major_idx.is_some() || unsolved.iter().any(|r| r.held) {
 			let mut remaining = Vec::with_capacity(unsolved.len());
 			for (i, rail) in unsolved.into_iter().enumerate() {
+				if rail.held {
+					continue;
+				}
 				let was_major = major_idx == Some(i);
 				let matched_commit = rail.next == commit.sha;
 				if was_major {
-					if commit.parents.is_empty() {
+					if first_parent.is_none() {
+						if config.hold_root_lanes {
+							remaining.push(PathHelper::held_lane(
+								rail.last_x,
+								rail.last_y,
+							));
+						}
 						ended.push(rail);
 					} else {
 						remaining.push(rail);
@@ -994,9 +1096,16 @@ pub fn compute_graph_layout(
 
 		// New branch head if commit had no incoming rail
 		if major_idx.is_none() {
+			if config.hold_root_lanes {
+				// Right of every lane the previous row used: a rail that
+				// moves left on this row must not seem to run into it.
+				if let Some(last) = prev_last_x {
+					offset_x = offset_x.max(last);
+				}
+			}
 			offset_x += unit_w;
 			major_x = Some(offset_x);
-			if !commit.parents.is_empty() {
+			if let Some(parent) = first_parent {
 				if unsolved.len() >= config.max_frontier_size {
 					return Err(GraphError::FrontierLimitExceeded {
 						current: unsolved.len() + 1,
@@ -1013,7 +1122,7 @@ pub fn compute_graph_layout(
 				}
 				let color = pick_color(mask, preferred);
 				let mut rail = PathHelper::new_start(
-					commit.parents[0].clone(),
+					parent.clone(),
 					color,
 					Point {
 						x: offset_x,
@@ -1061,6 +1170,15 @@ pub fn compute_graph_layout(
 		let mut merge_parent_info: Vec<(usize, usize, usize)> = Vec::new();
 		if commit.parents.len() > 1 {
 			for parent_sha in commit.parents.iter().skip(1) {
+				if config.filtered_commits.contains(parent_sha) {
+					// Drawn as a gap stub from the row's edge instead.
+					merge_parent_info.push((
+						major_rail_id.unwrap_or(0),
+						node_lane,
+						dot_color,
+					));
+					continue;
+				}
 				if let Some(target_rail) =
 					unsolved.iter().find(|r| &r.next == parent_sha)
 				{
@@ -1219,23 +1337,14 @@ pub fn compute_graph_layout(
 		completed_paths.push(p.to_graph_path());
 	}
 
-	// Resolve target lanes for edges resolved within this page
-	let row_lanes: Vec<usize> = rows.iter().map(|r| r.node.lane).collect();
-	for row in &mut rows {
-		for edge in &mut row.parent_edges {
-			if let Some(target_row) = edge.to_row {
-				if let Some(&lane) = row_lanes.get(target_row) {
-					edge.to_lane = lane;
-				}
-			}
-		}
-	}
-
-	// Checkpoint creation or termination at page bottom
+	// Checkpoint at the page bottom. Emitted even with no open rail, so the
+	// next page always has one: a missing checkpoint then means the previous
+	// page had no graph at all, never "every rail happened to end here".
 	let end_y = ((global_row_offset + commits.len()) as f64 - 0.5) * unit_h;
-	let checkpoint_out = if !unsolved.is_empty() {
+	let checkpoint_out = {
 		let frontier = unsolved
 			.iter()
+			.filter(|r| !r.held)
 			.map(|r| {
 				let lane = ((r.last_x - config.offset_x) / unit_w)
 					.round()
@@ -1265,20 +1374,17 @@ pub fn compute_graph_layout(
 			next_global_row: global_row_offset + commits.len(),
 			next_rail_id,
 			used_colors_mask: mask,
-			last_seen_sha: commits.last().map(|c| c.sha.clone()),
+			last_seen_sha: commits
+				.last()
+				.map(|c| c.sha.clone())
+				.or_else(|| checkpoint.and_then(|c| c.last_seen_sha.clone())),
 		})
-	} else {
-		None
 	};
 
-	// Finalize remaining paths
-	for mut rail in unsolved {
-		if rail.points.len() > 1
-			|| (rail.points.len() == 1
-				&& (rail.points[0].y - end_y).abs() > 1e-4)
-		{
-			rail.end(rail.last_x, end_y + half_h, half_h);
-		}
+	// Open rails run to the page's bottom edge, including one that starts on
+	// the last row (a single point there would draw nothing below its node).
+	for mut rail in unsolved.into_iter().filter(|r| !r.held) {
+		rail.end(rail.last_x, end_y + half_h, half_h);
 		completed_paths.push(rail.to_graph_path());
 	}
 
@@ -2522,7 +2628,7 @@ mod tests {
 			ContinuationKind::ShallowBoundary
 		);
 		// Frontier must now be empty since c1 terminates the rail at the shallow boundary
-		assert!(p2.checkpoint.is_none());
+		assert!(p2.checkpoint.as_ref().unwrap().frontier.is_empty());
 	}
 
 	#[test]
@@ -2661,5 +2767,450 @@ mod tests {
 			ContinuationKind::ShallowBoundary
 		);
 		assert!(verify_graph_invariants(&layout, &history.commits).is_ok());
+	}
+
+	fn geometry_config() -> GraphConfig {
+		GraphConfig {
+			unit_x: 16.0,
+			unit_y: 24.0,
+			offset_x: 14.0,
+			..Default::default()
+		}
+	}
+
+	/// Lays `commits` out in pages of `page`, clips every path to each row
+	/// the way a per-row renderer does, adds each row's merge links, then
+	/// follows the strokes downward from every dot. The dots reached are
+	/// what a reader of the drawing takes as that commit's parents.
+	fn drawn_parents(
+		commits: &[CommitSummary],
+		page: usize,
+		config: &GraphConfig,
+	) -> Vec<Vec<usize>> {
+		let unit = config.unit_y;
+		let mut segments = Vec::new();
+		let mut dots = Vec::new();
+		let mut checkpoint = None;
+		for chunk in commits.chunks(page) {
+			let layout = compute_graph_layout(
+				chunk,
+				&[],
+				None,
+				config,
+				checkpoint.as_ref(),
+			)
+			.unwrap();
+			for row in &layout.rows {
+				let top = row.global_row as f64 * unit;
+				let bottom = top + unit;
+				dots.push(Point {
+					x: config.offset_x + row.node.lane as f64 * config.unit_x,
+					y: top + unit / 2.0,
+				});
+				for path in &layout.paths {
+					for w in path.clip_y(top, bottom).windows(2) {
+						segments.push((w[0], w[1]));
+					}
+				}
+				for link in &layout.links {
+					if link.start.y >= top && link.start.y < bottom {
+						segments.push((link.start, link.end));
+					}
+				}
+			}
+			checkpoint = layout.checkpoint;
+		}
+		let key = |p: Point| {
+			((p.x * 100.0).round() as i64, (p.y * 100.0).round() as i64)
+		};
+		let mut down: HashMap<(i64, i64), Vec<(i64, i64)>> = HashMap::new();
+		for (a, b) in segments {
+			assert!(a.y < b.y, "strokes run downward");
+			// A line through a dot reads as a join, so it is cut there.
+			let mut cuts = vec![a];
+			for d in &dots {
+				if d.y > a.y && d.y < b.y {
+					let x = a.x + (b.x - a.x) * (d.y - a.y) / (b.y - a.y);
+					if (x - d.x).abs() < 0.01 {
+						cuts.push(*d);
+					}
+				}
+			}
+			cuts.push(b);
+			for w in cuts.windows(2) {
+				down.entry(key(w[0])).or_default().push(key(w[1]));
+			}
+		}
+		let dot_at: HashMap<(i64, i64), usize> =
+			dots.iter().enumerate().map(|(i, d)| (key(*d), i)).collect();
+		dots.iter()
+			.map(|d| {
+				let mut reached = Vec::new();
+				let mut stack = vec![key(*d)];
+				let mut seen = HashSet::new();
+				while let Some(v) = stack.pop() {
+					if !seen.insert(v) {
+						continue;
+					}
+					for w in down.get(&v).into_iter().flatten() {
+						match dot_at.get(w) {
+							Some(&j) => reached.push(j),
+							None => stack.push(*w),
+						}
+					}
+				}
+				reached.sort_unstable();
+				reached.dedup();
+				reached
+			})
+			.collect()
+	}
+
+	fn true_parents(commits: &[CommitSummary]) -> Vec<Vec<usize>> {
+		commits
+			.iter()
+			.map(|c| {
+				let mut rows: Vec<usize> = c
+					.parents
+					.iter()
+					.filter_map(|p| commits.iter().position(|x| &x.sha == p))
+					.collect();
+				rows.sort_unstable();
+				rows
+			})
+			.collect()
+	}
+
+	#[test]
+	fn drawn_rails_reach_exactly_the_true_parents_at_every_page_split() {
+		// base; branch side; m1; m2; side: s1; main: m3; m4;
+		// merge --no-ff side; m5 (both topological orders git can print).
+		let side_first = vec![
+			make_commit("m5", &["mg"]),
+			make_commit("mg", &["m4", "s1"]),
+			make_commit("s1", &["base"]),
+			make_commit("m4", &["m3"]),
+			make_commit("m3", &["m2"]),
+			make_commit("m2", &["m1"]),
+			make_commit("m1", &["base"]),
+			make_commit("base", &[]),
+		];
+		let main_first = vec![
+			make_commit("m5", &["mg"]),
+			make_commit("mg", &["m4", "s1"]),
+			make_commit("m4", &["m3"]),
+			make_commit("m3", &["m2"]),
+			make_commit("m2", &["m1"]),
+			make_commit("m1", &["base"]),
+			make_commit("s1", &["base"]),
+			make_commit("base", &[]),
+		];
+		// A left rail ends (root) while rails to its right go on, and three
+		// branch tips converge on one parent.
+		let shifting = vec![
+			make_commit("a", &["x"]),
+			make_commit("b", &["y"]),
+			make_commit("c", &["y"]),
+			make_commit("d", &["y"]),
+			make_commit("x", &[]),
+			make_commit("e", &["y"]),
+			make_commit("y", &["z"]),
+			make_commit("z", &[]),
+		];
+		// Branch tips on what becomes the last row of a page.
+		let tips = vec![
+			make_commit("t1", &["p"]),
+			make_commit("t2", &["p"]),
+			make_commit("t3", &["q"]),
+			make_commit("p", &["q"]),
+			make_commit("o", &["q", "t9"]),
+			make_commit("t9", &["q"]),
+			make_commit("q", &[]),
+		];
+		// The left rail ends on a root, so the right rail bends left on the
+		// very row it reaches its commit (a page's first row at split 3).
+		let bend_on_arrival = vec![
+			make_commit("a", &["x"]),
+			make_commit("b", &["y"]),
+			make_commit("x", &[]),
+			make_commit("y", &["z"]),
+			make_commit("z", &[]),
+		];
+		let config = geometry_config();
+		for commits in
+			[&side_first, &main_first, &shifting, &tips, &bend_on_arrival]
+		{
+			let want = true_parents(commits);
+			for page in 1..=commits.len() {
+				assert_eq!(
+					drawn_parents(commits, page, &config),
+					want,
+					"page size {page}: {:?}",
+					commits.iter().map(|c| &c.sha).collect::<Vec<_>>()
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn clip_y_joins_adjacent_rows_exactly() {
+		let path = GraphPath {
+			points: vec![
+				Point { x: 30.0, y: 12.0 },
+				Point { x: 30.0, y: 48.0 },
+				Point { x: 14.0, y: 72.0 },
+			],
+			color: 0,
+			color_override: None,
+			highlighted: false,
+			rail_id: 0,
+		};
+		assert!(path.clip_y(0.0, 12.0).is_empty());
+		assert_eq!(
+			path.clip_y(24.0, 48.0),
+			vec![Point { x: 30.0, y: 24.0 }, Point { x: 30.0, y: 48.0 }]
+		);
+		assert_eq!(
+			path.clip_y(48.0, 60.0),
+			vec![Point { x: 30.0, y: 48.0 }, Point { x: 22.0, y: 60.0 }]
+		);
+		assert_eq!(
+			path.clip_y(60.0, 96.0),
+			vec![Point { x: 22.0, y: 60.0 }, Point { x: 14.0, y: 72.0 }]
+		);
+		assert!(path.clip_y(72.0, 96.0).is_empty());
+	}
+
+	#[test]
+	fn hidden_parents_get_no_rail_and_every_page_has_a_checkpoint() {
+		// m merges f; f is collapsed. g's first parent h is hidden too.
+		let shown = [
+			make_commit("m", &["a", "f"]),
+			make_commit("g", &["h"]),
+			make_commit("a", &["base"]),
+			make_commit("base", &[]),
+		];
+		let config = GraphConfig {
+			filtered_commits: ["f".to_string(), "h".to_string()].into(),
+			..geometry_config()
+		};
+		let layout =
+			compute_graph_layout(&shown[..2], &[], None, &config, None)
+				.unwrap();
+		let frontier = &layout.checkpoint.as_ref().unwrap().frontier;
+		assert_eq!(
+			frontier
+				.iter()
+				.map(|r| r.next_sha.as_str())
+				.collect::<Vec<_>>(),
+			["a"],
+			"a hidden parent must not keep a lane open"
+		);
+		assert!(layout.links.is_empty());
+		let gap = |row: &GraphRow, sha: &str| {
+			row.parent_edges
+				.iter()
+				.find(|e| e.parent_sha == sha)
+				.unwrap()
+				.continuation
+		};
+		assert_eq!(gap(&layout.rows[0], "f"), ContinuationKind::FilteredGap);
+		assert_eq!(gap(&layout.rows[1], "h"), ContinuationKind::FilteredGap);
+		// Every rail ends on `base`: the next page still gets a checkpoint.
+		let rest = compute_graph_layout(
+			&shown[2..],
+			&[],
+			None,
+			&config,
+			layout.checkpoint.as_ref(),
+		)
+		.unwrap();
+		let end = rest.checkpoint.unwrap();
+		assert!(end.frontier.is_empty());
+		assert_eq!(end.next_global_row, 4);
+		assert_eq!(end.last_seen_sha.as_deref(), Some("base"));
+	}
+
+	/// A multi-root log lays several repositories out as one list: commits
+	/// interleaved by date, ids namespaced per repository. The engine must
+	/// treat them as unrelated histories: the drawing reaches exactly each
+	/// commit's own parents (never a row of another repository), and every
+	/// repository's rows keep the node and edge kinds of its standalone
+	/// layout.
+	#[test]
+	fn interleaved_repositories_never_connect() {
+		let ns =
+			|repo: &str, commits: &[CommitSummary]| -> Vec<CommitSummary> {
+				commits
+					.iter()
+					.map(|c| CommitSummary {
+						sha: format!("{}@{repo}", c.sha),
+						parents: c
+							.parents
+							.iter()
+							.map(|p| format!("{p}@{repo}"))
+							.collect(),
+						..c.clone()
+					})
+					.collect()
+			};
+		// Same SHAs in both repositories (a clone), a merge in each.
+		let a = ns(
+			"0",
+			&[
+				make_commit("m", &["x", "s"]),
+				make_commit("s", &["x"]),
+				make_commit("x", &["r"]),
+				make_commit("r", &[]),
+			],
+		);
+		let b = ns(
+			"1",
+			&[
+				make_commit("t", &["m"]),
+				make_commit("m", &["x", "s"]),
+				make_commit("x", &["r"]),
+				make_commit("s", &["r"]),
+				make_commit("r", &[]),
+			],
+		);
+		// Interleaved, each repository keeping its own order.
+		let order = [0, 1, 1, 0, 1, 0, 1, 0, 1];
+		let (mut ia, mut ib) = (0, 0);
+		let merged: Vec<CommitSummary> = order
+			.iter()
+			.map(|&r| {
+				if r == 0 {
+					ia += 1;
+					a[ia - 1].clone()
+				} else {
+					ib += 1;
+					b[ib - 1].clone()
+				}
+			})
+			.collect();
+		let config = geometry_config();
+		let want = true_parents(&merged);
+		for page in 1..=merged.len() {
+			assert_eq!(
+				drawn_parents(&merged, page, &config),
+				want,
+				"page size {page}"
+			);
+		}
+		let kinds =
+			|rows: Vec<&GraphRow>| -> Vec<(NodeType, Vec<ContinuationKind>)> {
+				rows.into_iter()
+					.map(|r| {
+						(
+							r.node.node_type,
+							r.parent_edges
+								.iter()
+								.map(|e| e.continuation)
+								.collect(),
+						)
+					})
+					.collect()
+			};
+		let layout =
+			compute_graph_layout(&merged, &[], None, &config, None).unwrap();
+		for (repo, alone) in [("@0", &a), ("@1", &b)] {
+			let solo =
+				compute_graph_layout(alone, &[], None, &config, None).unwrap();
+			let rows: Vec<&GraphRow> = layout
+				.rows
+				.iter()
+				.filter(|r| r.sha.ends_with(repo))
+				.collect();
+			for row in &rows {
+				for edge in &row.parent_edges {
+					assert!(edge.parent_sha.ends_with(repo));
+				}
+			}
+			assert_eq!(kinds(rows), kinds(solo.rows.iter().collect()));
+		}
+		assert!(verify_graph_invariants(&layout, &merged).is_ok());
+	}
+
+	/// Several histories in one log: when one ends on a root, its lane stays
+	/// empty for the next row, so no rail bends in beside the root and no
+	/// commit lands directly under it. Rails still reach exactly their
+	/// parents at every page split, and a single history is unaffected.
+	#[test]
+	fn held_root_lane_keeps_rails_straight_for_a_row() {
+		// a1 (repo 0) is a root in the middle; repo 1 goes on below it.
+		let merged = vec![
+			make_commit("a2@0", &["a1@0"]),
+			make_commit("b3@1", &["b2@1"]),
+			make_commit("a1@0", &[]),
+			make_commit("b2@1", &["b1@1"]),
+			make_commit("c1@2", &[]),
+			make_commit("b1@1", &[]),
+		];
+		let held = GraphConfig {
+			hold_root_lanes: true,
+			..geometry_config()
+		};
+		let want = true_parents(&merged);
+		for page in 1..=merged.len() {
+			assert_eq!(drawn_parents(&merged, page, &held), want, "{page}");
+		}
+		let lanes = |config: &GraphConfig| -> Vec<usize> {
+			compute_graph_layout(&merged, &[], None, config, None)
+				.unwrap()
+				.rows
+				.iter()
+				.map(|r| r.node.lane)
+				.collect()
+		};
+		// SourceGit: b2 moves into a1's lane on the very next row.
+		assert_eq!(lanes(&geometry_config()), [0, 1, 0, 0, 1, 0]);
+		// Held: b2 keeps its lane; the lane frees a row later. The root c1
+		// with no rail above it lands right of the lane repo 1's rail
+		// leaves on that row, not in it.
+		assert_eq!(lanes(&held), [0, 1, 0, 1, 2, 0]);
+		// Repo 1's rail is straight from a1's row to b2's row.
+		let layout =
+			compute_graph_layout(&merged, &[], None, &held, None).unwrap();
+		let unit = held.unit_y;
+		let rail = layout.rows[3].node.rail_id.unwrap();
+		let path = layout.paths.iter().find(|p| p.rail_id == rail).unwrap();
+		let xs: Vec<f64> = path
+			.clip_y(2.5 * unit, 3.5 * unit)
+			.iter()
+			.map(|p| p.x)
+			.collect();
+		assert!(xs.len() >= 2 && xs.iter().all(|&x| x == xs[0]), "{xs:?}");
+		assert!(verify_graph_invariants(&layout, &merged).is_ok());
+		// Roots on two rows in a row: the second root's lane is held too,
+		// though the first hold ends there and frees a lane left of it.
+		let cascade = vec![
+			make_commit("a2@0", &["a1@0"]),
+			make_commit("b2@1", &["b1@1"]),
+			make_commit("c3@2", &["c2@2"]),
+			make_commit("a1@0", &[]),
+			make_commit("b1@1", &[]),
+			make_commit("c2@2", &["c1@2"]),
+			make_commit("c1@2", &[]),
+		];
+		let lanes = |config: &GraphConfig| -> Vec<usize> {
+			compute_graph_layout(&cascade, &[], None, config, None)
+				.unwrap()
+				.rows
+				.iter()
+				.map(|r| r.node.lane)
+				.collect()
+		};
+		assert_eq!(lanes(&held), [0, 1, 2, 0, 1, 2, 0]);
+		let want = true_parents(&cascade);
+		for page in 1..=cascade.len() {
+			assert_eq!(drawn_parents(&cascade, page, &held), want, "{page}");
+		}
+		// A held lane is not part of the checkpoint.
+		let top =
+			compute_graph_layout(&merged[..3], &[], None, &held, None).unwrap();
+		let frontier = top.checkpoint.unwrap().frontier;
+		assert_eq!(frontier.len(), 1);
+		assert_eq!(frontier[0].next_sha, "b2@1");
 	}
 }

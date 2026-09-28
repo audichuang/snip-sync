@@ -867,7 +867,7 @@ fn parse_status(
 			branch = (name != "(detached)").then(|| name.to_string());
 		} else if text.starts_with('#') || text.starts_with('!') {
 		} else if text.starts_with("? ") {
-			c.untracked += 1;
+			c.untracked += usize::from(!text.ends_with('/'));
 		} else if text.starts_with("u ") {
 			c.conflicted += 1;
 		} else if let Some(rest) =
@@ -889,35 +889,79 @@ fn parse_status(
 	Ok((head, branch, c))
 }
 
-/// One `git status` call. Bounded by `opts` (use
-/// [`RunOptions::interactive`]); an oversized status is an error, never a
-/// partial count.
+/// `git status --porcelain=v2 -z` plus `extra`. Untracked files are listed
+/// one by one (`=all`), as IntelliJ shows them: a collapsed `dir/` entry is
+/// not a file that preview, copy or the basket can use. A `?` entry ending
+/// in `/` is then a nested repository. `--no-optional-locks`: a
+/// background read must not refresh and rewrite the index (that looks like
+/// an index change to staleness checks and can take `index.lock` from a
+/// replay). An oversized status is an error, never a partial list.
+fn read_status(
+	git: &Git,
+	extra: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<u8>, GitError> {
+	let mut args = vec![
+		"--no-optional-locks",
+		"status",
+		"--porcelain=v2",
+		"-z",
+		"--untracked-files=all",
+		"--no-renames",
+	];
+	args.extend_from_slice(extra);
+	Ok(git
+		.run_with(
+			&args,
+			&RunOptions {
+				overflow: crate::gitrun::Overflow::Error,
+				..opts.clone()
+			},
+		)?
+		.stdout)
+}
+
+/// Resolves the identity, then [`summarize_with_identity`]. Bounded by
+/// `opts` (use [`RunOptions::interactive`]).
 pub fn summarize(
 	git: &Git,
 	opts: &RunOptions,
 ) -> Result<RepoSummary, GitError> {
 	let identity = RepoIdentity::resolve(git, opts)?;
-	let out = git.run_with(
-		&[
-			"status",
-			"--porcelain=v2",
-			"-z",
-			"--branch",
-			"--untracked-files=normal",
-			"--no-renames",
-		],
-		&RunOptions {
-			overflow: crate::gitrun::Overflow::Error,
-			..opts.clone()
-		},
-	)?;
-	let (head, branch, changes) = parse_status(&out.stdout)?;
+	summarize_with_identity(git, &identity, opts)
+}
+
+/// One `git status` call, for a caller that already resolved `identity`.
+pub fn summarize_with_identity(
+	git: &Git,
+	identity: &RepoIdentity,
+	opts: &RunOptions,
+) -> Result<RepoSummary, GitError> {
+	let out = read_status(git, &["--branch"], opts)?;
+	let (head, branch, changes) = parse_status(&out)?;
 	Ok(RepoSummary {
-		identity,
+		identity: identity.clone(),
 		head,
 		branch,
 		changes,
 	})
+}
+
+/// The summary and the categorized paths from one `git status` call.
+pub fn summarize_with_details(
+	git: &Git,
+	identity: &RepoIdentity,
+	opts: &RunOptions,
+) -> Result<(RepoSummary, StatusDetails), GitError> {
+	let out = read_status(git, &["--branch"], opts)?;
+	let (head, branch, changes) = parse_status(&out)?;
+	let summary = RepoSummary {
+		identity: identity.clone(),
+		head,
+		branch,
+		changes,
+	};
+	Ok((summary, parse_status_details(&out)?))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -933,20 +977,7 @@ pub fn status_details(
 	git: &Git,
 	opts: &RunOptions,
 ) -> Result<StatusDetails, GitError> {
-	let out = git.run_with(
-		&[
-			"status",
-			"--porcelain=v2",
-			"-z",
-			"--untracked-files=normal",
-			"--no-renames",
-		],
-		&RunOptions {
-			overflow: crate::gitrun::Overflow::Error,
-			..opts.clone()
-		},
-	)?;
-	parse_status_details(&out.stdout)
+	parse_status_details(&read_status(git, &[], opts)?)
 }
 
 fn parse_status_details(out: &[u8]) -> Result<StatusDetails, GitError> {
@@ -959,7 +990,9 @@ fn parse_status_details(out: &[u8]) -> Result<StatusDetails, GitError> {
 			continue;
 		}
 		if let Some(path) = text.strip_prefix("? ") {
-			details.untracked.push(path.to_string());
+			if !path.ends_with('/') {
+				details.untracked.push(path.to_string());
+			}
 		} else if let Some(rest) = text.strip_prefix("u ") {
 			let parts: Vec<&str> = rest.splitn(10, ' ').collect();
 			let path = parts.get(9).ok_or_else(bad)?;
@@ -1760,6 +1793,54 @@ mod tests {
 	}
 
 	#[test]
+	fn status_reads_never_rewrite_the_index() {
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("r");
+		init(&repo);
+		commit_file(&repo, "a.txt", "a\n");
+		let index = repo.join(".git/index");
+		let touch = |secs: u64| {
+			fs::File::options()
+				.write(true)
+				.open(repo.join("a.txt"))
+				.unwrap()
+				.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+				.unwrap();
+		};
+		let g = Git::open(&repo).unwrap();
+		let opts = RunOptions::interactive(None);
+		touch(1_000_000_000);
+		let before = fs::read(&index).unwrap();
+		summarize(&g, &opts).unwrap();
+		assert_eq!(fs::read(&index).unwrap(), before, "summarize");
+		touch(1_100_000_000);
+		status_details(&g, &opts).unwrap();
+		assert_eq!(fs::read(&index).unwrap(), before, "status_details");
+	}
+
+	#[test]
+	fn one_status_feeds_both_summary_and_details() {
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("r");
+		init(&repo);
+		commit_file(&repo, "a.txt", "a\n");
+		commit_file(&repo, "b.txt", "b\n");
+		fs::write(repo.join("a.txt"), "a2\n").unwrap();
+		fs::write(repo.join("b.txt"), "b2\n").unwrap();
+		git(&repo, &["add", "b.txt"]);
+		fs::write(repo.join("new.txt"), "n\n").unwrap();
+		let g = Git::open(&repo).unwrap();
+		let opts = RunOptions::interactive(None);
+		let id = RepoIdentity::resolve(&g, &opts).unwrap();
+		let (summary, details) =
+			summarize_with_details(&g, &id, &opts).unwrap();
+		assert_eq!(summary, summarize(&g, &opts).unwrap());
+		assert_eq!(summary, summarize_with_identity(&g, &id, &opts).unwrap());
+		assert_eq!(details, status_details(&g, &opts).unwrap());
+		assert_eq!(details.untracked, ["new.txt"]);
+	}
+
+	#[test]
 	fn summaries_count_conflicts_and_refuse_oversized_status() {
 		let dir = tempfile::tempdir().unwrap();
 		let repo = dir.path().join("r");
@@ -1809,6 +1890,10 @@ mod tests {
 		git(&repo, &["add", "staged.txt"]);
 		// Untracked file
 		std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
+		// An untracked folder lists its files, never `reports/` itself.
+		std::fs::create_dir_all(repo.join("reports/q1")).unwrap();
+		std::fs::write(repo.join("reports/q1/a.txt"), "a\n").unwrap();
+		std::fs::write(repo.join("reports/b.txt"), "b\n").unwrap();
 
 		let git = Git::open(&repo).unwrap();
 		let details =
@@ -1817,8 +1902,10 @@ mod tests {
 		assert_eq!(details.staged[0].0, "staged.txt");
 		assert_eq!(details.unstaged.len(), 1);
 		assert_eq!(details.unstaged[0].0, "tracked.txt");
-		assert_eq!(details.untracked.len(), 1);
-		assert_eq!(details.untracked[0], "untracked.txt");
+		assert_eq!(
+			details.untracked,
+			["reports/b.txt", "reports/q1/a.txt", "untracked.txt"]
+		);
 		assert_eq!(details.conflicted.len(), 0);
 	}
 }
