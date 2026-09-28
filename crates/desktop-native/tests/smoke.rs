@@ -2050,7 +2050,10 @@ fn native_graph_failed_next_page_is_transactional() {
 			std::thread::sleep(Duration::from_millis(20));
 		}
 	};
-	let crop_row = |name: &str, require_error: bool| {
+	// `skip` rows at the top of the row are left out of the crop: the
+	// error banner may overlap the row while the failure is shown, so the
+	// retried capture compares the same uncovered part (see `refused`).
+	let crop_row = |name: &str, require_error: bool, skip: Option<i32>| {
 		let image = out.join(format!("graph-admission-{name}.png"));
 		let crop = out.join(format!("graph-admission-{name}-row.png"));
 		let deadline = Instant::now() + Duration::from_secs(5);
@@ -2111,7 +2114,19 @@ fn native_graph_failed_next_page_is_transactional() {
 				// Inset 1px top and bottom: the edge pixel rows blend with the
 				// neighbouring row at a fractional scroll offset, while the
 				// text and every rail crossing the row stay inside.
-				let (y, h) = (y + 1, h - 2);
+				let cut = skip.unwrap_or_else(|| {
+					// The banner sits above the rows; only its lower edge
+					// can reach into this one.
+					error.map_or(0, |[_, ey, _, eh]| {
+						if ey <= y && ey + eh > y {
+							(ey + eh - y).min(h)
+						} else {
+							0
+						}
+					})
+				});
+				let (y, h) = (y + cut.max(1), h - cut.max(1) - 1);
+				assert!(h >= 6, "the error banner hides row {row:?}");
 				assert!(Command::new("convert")
 					.arg(&image)
 					.args(["-crop", &format!("{w}x{h}+{x}+{y}"), "+repage"])
@@ -2122,7 +2137,7 @@ fn native_graph_failed_next_page_is_transactional() {
 				println!(
 					"[TEST DRIVER] graph {name} row={row:?} error={error:?}"
 				);
-				return crop;
+				return (crop, cut);
 			}
 			assert!(
 				Instant::now() < deadline,
@@ -2163,7 +2178,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	let rejected = scroll_until("[APP:HISTORY_ERROR]", "1", "5");
 	assert!(!rejected.iter().any(|line| line.contains("[APP:E2E_LOG:")));
 	control("log-error");
-	let refused = crop_row("refused", true);
+	let (refused, cut) = crop_row("refused", true, None);
 	// A failed read stops the automatic loading: no retry loop.
 	assert!(
 		lines_until(&app.rx, "[APP:HISTORY_ERROR]", Duration::from_secs(1))
@@ -2196,7 +2211,7 @@ fn native_graph_failed_next_page_is_transactional() {
 	// lands under it): take a few captures before calling it changed.
 	let mut comparison = None;
 	for _ in 0..5 {
-		let after = crop_row("retried", false);
+		let (after, _) = crop_row("retried", false, Some(cut));
 		let out = Command::new("compare")
 			.args(["-metric", "AE"])
 			.arg(&refused)
