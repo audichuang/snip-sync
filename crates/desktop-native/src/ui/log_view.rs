@@ -938,9 +938,9 @@ impl WorkbenchModel {
 				.child(tf("compare_header", loc, &[&short(from), &short(to)]))
 				.into_any_element()
 		} else if self.log_selected.len() > 1 {
-			self.selection_details_view().into_any_element()
+			self.selection_details_view(cx).into_any_element()
 		} else if let Some(sha) = self.selected_commit.as_deref() {
-			self.commit_details_view(sha).into_any_element()
+			self.commit_details_view(sha, true, cx).into_any_element()
 		} else {
 			div()
 				.text_color(rgb(pal().text_muted))
@@ -955,24 +955,31 @@ impl WorkbenchModel {
 			.flex_shrink_0()
 			.w(px(self.log_details_width()))
 			.h_full()
+			// The changed files matter most (IntelliJ): they take what the
+			// details, below a splitter, leave.
 			.child(
 				div()
+					.id("commit-files-pane")
+					.relative()
 					.flex()
 					.flex_col()
 					.flex_1()
 					.min_h_0()
 					.child(files_header)
-					.child(div().flex_1().min_h_0().py(px(2.)).child(files)),
+					.child(div().flex_1().min_h_0().py(px(2.)).child(files))
+					.children(probe(log, "commit-files-pane")),
 			)
+			.child(self.splitter(Splitter::LogFiles, cx))
 			.child(
 				div()
 					.id("commit-details")
 					.relative()
-					.flex_1()
-					.min_h_0()
+					.flex_shrink_0()
+					.map(|d| match self.log_details_h {
+						Some(h) => d.h(px(h)),
+						None => d.h(gpui::relative(LOG_DETAILS_H_SHARE)),
+					})
 					.overflow_y_scroll()
-					.border_t_1()
-					.border_color(rgb(pal().divider))
 					.p(px(12.))
 					.child(details)
 					.children(probe(log, "commit-details")),
@@ -1019,6 +1026,20 @@ impl WorkbenchModel {
 					.hover(|s| s.bg(rgb(pal().hover_bg)))
 					.when(self.chrome.menu.is_none(), |d| {
 						d.tooltip(tip(path.clone()))
+					})
+					.on_mouse_down(MouseButton::Right, {
+						let path = path.clone();
+						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+							let items = this.commit_file_menu(&path, true);
+							w.focus(&this.log_focus);
+							this.open_menu(
+								crate::menu::MenuOrigin::Log,
+								items,
+								ev.position,
+								w,
+								cx,
+							);
+						})
 					})
 					.on_click(cx.listener(move |this, _, _, cx| {
 						let dirs = &mut this.changed_dirs_collapsed;
@@ -1086,6 +1107,24 @@ impl WorkbenchModel {
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.select_commit_file(&p2, cx)
 					}))
+					// IntelliJ selects the row a menu opens on.
+					.on_mouse_down(MouseButton::Right, {
+						let path = path.clone();
+						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+							if !sel {
+								this.select_commit_file(&path, cx);
+							}
+							let items = this.commit_file_menu(&path, false);
+							w.focus(&this.log_focus);
+							this.open_menu(
+								crate::menu::MenuOrigin::Log,
+								items,
+								ev.position,
+								w,
+								cx,
+							);
+						})
+					})
 					.child(icon(file_icon(&path), 14.))
 					.child(
 						clip_text(name)
@@ -1109,9 +1148,10 @@ impl WorkbenchModel {
 		}
 	}
 
-	/// A multi-selection's info: how many commits, then each one's short
-	/// hash and subject (newest first), like IntelliJ's details pane.
-	pub(super) fn selection_details_view(&self) -> Div {
+	/// A multi-selection's info: its repository, then a header row that
+	/// opens the list of its commits (newest first), each with its full
+	/// details, like IntelliJ's details pane.
+	pub(super) fn selection_details_view(&self, cx: &mut Context<Self>) -> Div {
 		let loc = self.locale;
 		let repo = self
 			.log_selected
@@ -1120,19 +1160,7 @@ impl WorkbenchModel {
 			.map(|(feed, color)| {
 				(feed.name.clone(), graph_view::palette_rgb(color))
 			});
-		let rows: Vec<(String, String)> = self
-			.log_selected
-			.iter()
-			.map(|id| {
-				let subject = self
-					.commits
-					.iter()
-					.find(|c| &c.sha == id)
-					.map(|c| c.subject.clone())
-					.unwrap_or_default();
-				(short(id).to_string(), subject)
-			})
-			.collect();
+		let open = self.log_selection_expanded;
 		div()
 			.relative()
 			.flex()
@@ -1160,35 +1188,72 @@ impl WorkbenchModel {
 						),
 				)
 			})
-			.child(div().font_weight(FontWeight::SEMIBOLD).child(tf(
-				"log_selection_header",
-				loc,
-				&[&self.log_selected.len()],
-			)))
-			.children(rows.into_iter().map(|(hash, subject)| {
+			.child(
 				div()
+					.id("log-selection-toggle")
+					.relative()
 					.flex()
-					.flex_row()
-					.gap(px(8.))
-					.child(
-						div()
-							.flex_shrink_0()
-							.font_family(CODE_FONT)
-							.text_size(px(SMALL_TEXT))
-							.text_color(rgb(pal().link))
-							.child(hash),
-					)
-					.child(clip_text(subject))
-			}))
+					.items_center()
+					.gap(px(4.))
+					.cursor_pointer()
+					.rounded(px(3.))
+					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.font_weight(FontWeight::SEMIBOLD)
+					.on_click(cx.listener(|this, _, _, cx| {
+						this.toggle_selection_expanded(cx)
+					}))
+					.child(tf(
+						"log_selection_header",
+						loc,
+						&[&self.log_selected.len()],
+					))
+					.child(icon(
+						if open {
+							Icon::ChevronDown
+						} else {
+							Icon::ChevronRight
+						},
+						12.,
+					))
+					.children(probe(&self.probes, "log-selection-toggle")),
+			)
+			.when(open, |d| {
+				// The commits whose details are read; each one scans the
+				// log for its refs, so the list stays bounded per frame.
+				let max = crate::history::MAX_SELECTION_DETAILS;
+				let more = self.log_selected.len() > max;
+				let ids = self.log_selected.iter().take(max);
+				d.children(ids.map(|id| {
+					let probe_id = format!("selection-commit:{}", short(id));
+					self.commit_details_view(id, false, cx)
+						.relative()
+						.pt(px(8.))
+						.border_t_1()
+						.border_color(rgb(pal().divider))
+						.children(probe(&self.probes, probe_id))
+				}))
+				.when(more, |d| {
+					d.child(div().text_color(rgb(pal().text_muted)).child("…"))
+				})
+			})
 			.children(probe(&self.probes, "commit-details-selection"))
 	}
 
 	/// Message, hash, author and date, the commit's refs and the branches
 	/// that contain it, like IntelliJ's commit details.
-	pub(super) fn commit_details_view(&self, sha: &str) -> Div {
+	pub(super) fn commit_details_view(
+		&self,
+		sha: &str,
+		show_repo: bool,
+		cx: &mut Context<Self>,
+	) -> Div {
 		let loc = self.locale;
 		let row = self.commits.iter().find(|c| c.sha == sha);
-		let details = self.commit_details.as_ref().filter(|d| d.sha == sha);
+		let details = self
+			.commit_details
+			.as_ref()
+			.filter(|d| d.sha == sha)
+			.or_else(|| self.selection_details.iter().find(|d| d.sha == sha));
 		let message = details
 			.map(|d| d.message.clone())
 			.or_else(|| row.map(|c| c.subject.clone()))
@@ -1211,9 +1276,9 @@ impl WorkbenchModel {
 			_ => Default::default(),
 		};
 		let current_branch = self.log_current_branch(sha);
-		let repo = self.log_row_repo(sha).map(|(feed, color)| {
-			(feed.name.clone(), graph_view::palette_rgb(color))
-		});
+		let repo = self.log_row_repo(sha).filter(|_| show_repo).map(
+			|(feed, color)| (feed.name.clone(), graph_view::palette_rgb(color)),
+		);
 		let refs = self
 			.display_commits()
 			.iter()
@@ -1257,10 +1322,13 @@ impl WorkbenchModel {
 			.when(!body.is_empty(), |d| {
 				d.child(div().whitespace_normal().child(body))
 			})
+			// `<hash> <author> <email> on <date>`, as IntelliJ writes it.
 			.child(
 				div()
+					.relative()
 					.flex()
 					.flex_wrap()
+					.items_center()
 					.gap(px(4.))
 					.child(
 						div()
@@ -1275,9 +1343,17 @@ impl WorkbenchModel {
 								.text_color(rgb(pal().link))
 								.child(format!("<{email}>")),
 						)
-					}),
+					})
+					.child(muted(tf(
+						"log_details_on",
+						loc,
+						&[&log_date(&date, loc)],
+					)))
+					.children(probe(
+						&self.probes,
+						format!("commit-details-author:{}", short(sha)),
+					)),
 			)
-			.child(muted(tf("log_details_on", loc, &[&log_date(&date, loc)])))
 			.when_some(
 				details.filter(|d| {
 					d.commit_date != d.author_date
@@ -1307,22 +1383,76 @@ impl WorkbenchModel {
 				))
 			})
 			.when_some(details.filter(|d| !d.branches.is_empty()), |el, d| {
-				let mut list = d.branches.join(", ");
-				if d.branches_more {
-					list.push_str(", …");
-				}
-				el.child(muted(tf(
-					"log_details_in_branches",
-					loc,
-					&[
-						&format!(
-							"{}{}",
-							d.branches.len(),
-							if d.branches_more { "+" } else { "" }
-						),
-						&list,
-					],
-				)))
+				let all = self.log_branches_all.iter().any(|s| s == sha);
+				let (list, cut) =
+					branches_list(&d.branches, d.branches_more, all);
+				let id = sha.to_string();
+				let probe_id =
+					format!("commit-details-branches:{}", short(sha));
+				let more_id = format!("details-branches-all:{}", short(sha));
+				el.child(
+					div()
+						.relative()
+						.flex()
+						.flex_wrap()
+						.gap(px(4.))
+						.child(muted(tf(
+							"log_details_in_branches",
+							loc,
+							&[
+								&format!(
+									"{}{}",
+									d.branches.len(),
+									if d.branches_more { "+" } else { "" }
+								),
+								&list,
+							],
+						)))
+						.when(cut, |row| {
+							row.child(
+								div()
+									.id(SharedString::from(more_id.clone()))
+									.relative()
+									.cursor_pointer()
+									.text_size(px(SMALL_TEXT))
+									.text_color(rgb(pal().link))
+									.on_click(cx.listener(
+										move |this, _, _, cx| {
+											this.log_branches_all
+												.push(id.clone());
+											cx.notify();
+										},
+									))
+									.child(t("log_details_show_all", loc))
+									.children(probe(&self.probes, more_id)),
+							)
+						})
+						.children(probe(&self.probes, probe_id)),
+				)
 			})
 	}
+}
+
+/// Branches a commit's details name before "Show all".
+const BRANCHES_SHOWN: usize = 5;
+
+/// The containing branches as the details line lists them: the first
+/// [`BRANCHES_SHOWN`] unless `all`, "…" when the read was cut; true when
+/// "Show all" would list more.
+pub(super) fn branches_list(
+	branches: &[String],
+	more: bool,
+	all: bool,
+) -> (String, bool) {
+	let cut = !all && branches.len() > BRANCHES_SHOWN;
+	let shown = if cut {
+		&branches[..BRANCHES_SHOWN]
+	} else {
+		branches
+	};
+	let mut list = shown.join(", ");
+	if cut || more {
+		list.push_str(", …");
+	}
+	(list, cut)
 }

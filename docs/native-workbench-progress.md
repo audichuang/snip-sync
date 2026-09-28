@@ -212,7 +212,7 @@ just preflight
 
 - `CommitReplayPreview::capture` 先做出計畫，再用 symlink-safe 的方式記下目的地 HEAD、分支 ref、index，以及每個已命名目標的位元組或「當時不存在」，然後立刻再計畫一次。兩次計畫不同就不儲存預覽。`revalidate` 比對這份新鮮度，並再跑一次 `plan_commit_replay`。非 UTF-8 的略過會記下那個檔案；它後來變成可寫的 UTF-8，或 unsafe symlink 父目錄被換成真實目錄，預覽都是 stale，`execute` 在呼叫 `commits::replay` 之前返回。symlink 只哈希連結自己的文字，不打開目標。`NotCopied` 仍因 payload 沒有位元組而略過，不進這份新鮮度。整段 commit、覆寫預設關閉、不連續 OID 拒絕，維持上一輪。
 - 沒有 `// clipcode-root:` 時，路徑的每一個第一段都要使用者明確選：對到某個完整目的目錄，或留在主要目錄下當成相對路徑。同名 basename 不會自動挑一個，也不可從「來源 repo 沒開」推成安全。有 root marker 的單根匯出不開對應列，路徑維持原樣。對應未完成時套用按鈕與 `execute` 都不寫入。
-- 工具列「複製選取籃 (n)」和狀態列的 n 是整個選取籃，複製匯出籃內所有 repo 的檔案與 Git 變更。只瀏覽不加選取；切換分頁或 repo 保留已選身份。清空選取籃不碰剪貼簿。同一路徑有兩筆選取（含檔案列與 Git 變更）會拒絕複製，不靜默丟掉其中一筆。
+- 工具列「複製選取籃 (n)」和狀態列的 n 是整個選取籃，複製匯出籃內所有 repo 的檔案與 Git 變更。專案視窗照 IntelliJ：單擊任一列（檔案或資料夾）即單獨選取（取代專案選取），檔案同時預覽、資料夾同時展開／收合；列前的箭頭只展開／收合、不改選取。Ctrl/Cmd 加選、Shift 範圍選取、右鍵未選的列先單獨選取。選資料夾只選它本身（展開後子列不會跟著反白），複製時才走訪其下檔案。Changes 與 Log 仍是只瀏覽不加選取。切換分頁或 repo 保留已選身份。清空選取籃不碰剪貼簿。專案選取的檔案若同時是同 repo 同路徑的工作目錄變更（Working／Unstaged），兩者是磁碟上同一份內容，複製只帶一次；其他同一路徑的兩筆選取（例如 Staged 與 Working、兩個不同 commit）仍拒絕複製，不靜默丟掉其中一筆。
 - Commit tree 的硬上限是 256KiB，比規格裡 8MiB 的 tree 預算更嚴，沒有例外。目錄清單、順序、鍵、錯誤、展開狀態，以及這些容器的 capacity，都算進 `retained_bytes`。單一目錄若放不下，會先截斷或直接拒絕，再談保留。淘汰順序是最舊的非根清單，然後才是根；展開與錯誤也依各自的舊到新順序，不用 HashMap 的迭代順序。
 
 仍未做，之後仍要補：取消貫穿匯出與 commit API（`plan_export` 的第三個參數是 payload 位元組上限，不是 `CancelToken`）、其餘保留預算、生命週期、15 個 repo、IME、平台與發布。D4 量測與 D5 preflight／CI／發布都還沒做。這一輪沒有改 clipboard contract fixture。

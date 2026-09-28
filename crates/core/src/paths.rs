@@ -686,6 +686,12 @@ fn collapse_slashes(s: &str) -> String {
 	out
 }
 
+/// True when `value` is already the exact relative path a payload header
+/// carries, so an export item named by it passes validation unchanged.
+pub fn is_exportable_relative_path(value: &str) -> bool {
+	sanitize_relative_path(value).as_deref() == Some(value)
+}
+
 pub(crate) fn sanitize_relative_path(value: &str) -> Option<String> {
 	let collapsed = collapse_slashes(ascii_trim(value));
 	let normalized = collapsed.trim_start_matches('/');

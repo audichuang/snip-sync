@@ -712,7 +712,6 @@ impl FileTreeNode {
 			});
 			node.children.shrink_to_fit();
 		}
-		self.inherit_loaded(&key);
 		self.sync_flags();
 		self.reclaim_until_fit();
 		let (child_count, has_more) = self
@@ -777,7 +776,8 @@ impl FileTreeNode {
 		}
 		let rel = key.utf8_rel().filter(|rel| !rel.is_empty())?;
 		let node = self.find(key)?;
-		if !node.is_valid_utf8 {
+		// A nested repo's files belong to its own repo row.
+		if !node.is_valid_utf8 || node.is_nested_repo {
 			return None;
 		}
 		let mut paths = self.selected_paths.clone();
@@ -785,12 +785,28 @@ impl FileTreeNode {
 			Ok(_) => {
 				paths.retain(|path| !is_component_child_or_exact(path, &rel));
 			}
-			Err(_) if node.is_dir && !node.is_nested_repo => {
-				node.collect_selectable(&mut paths);
-			}
+			// A folder is selected as itself; Copy walks it later.
 			Err(index) => paths.insert(index, rel),
 		}
 		Some(paths)
+	}
+
+	/// A fresh selection of exactly `rels` (a folder as itself, never a
+	/// nested repo), as a click or range selects rows.
+	pub fn selection_for_rels(&self, rels: &[String]) -> Vec<String> {
+		let mut paths = Vec::new();
+		for rel in rels.iter().filter(|rel| !rel.is_empty()) {
+			match self.find(&NodeKey::from_utf8_rel(rel)) {
+				Some(node) if !node.is_valid_utf8 || node.is_nested_repo => {}
+				Some(_) => {
+					if let Err(index) = paths.binary_search(rel) {
+						paths.insert(index, rel.clone());
+					}
+				}
+				None => {}
+			}
+		}
+		paths
 	}
 
 	/// The caller admits this complete allocation before transferring it here.
@@ -988,35 +1004,6 @@ impl FileTreeNode {
 		}
 		for child in &self.children {
 			child.collect_selectable(out);
-		}
-	}
-
-	fn inherit_loaded(&mut self, key: &NodeKey) {
-		let parent_rel = key.utf8_rel().unwrap_or_default();
-		let (nested, child_rels) = {
-			let Some(node) = self.find(key) else {
-				return;
-			};
-			let rels = node
-				.children
-				.iter()
-				.filter(|child| {
-					child.is_valid_utf8
-						&& !child.is_nested_repo
-						&& !child.rel_path.is_empty()
-				})
-				.map(|child| child.rel_path.clone())
-				.collect::<Vec<_>>();
-			(node.is_nested_repo, rels)
-		};
-		if nested
-			|| parent_rel.is_empty()
-			|| !self.selected_paths.binary_search(&parent_rel).is_ok()
-		{
-			return;
-		}
-		for rel in child_rels {
-			self.selected_paths.push(rel);
 		}
 	}
 
@@ -1285,7 +1272,7 @@ mod tests {
 		let mut tree = FileTreeNode::new_root(dir.path());
 		let key = NodeKey::from_utf8_rel("folder");
 		drive(&mut tree, TreeCommand::Expand(key.clone()));
-		let proposed = tree.selection_for_toggle(&key).unwrap();
+		let proposed = tree.selection_for_all(true);
 		assert_eq!(proposed, ["folder", "folder/a.txt", "folder/b.txt"]);
 		assert!(tree.selected_paths().is_empty());
 		assert!(tree
@@ -1390,11 +1377,14 @@ mod tests {
 		let mut tree = FileTreeNode::new_root(root);
 		tree.toggle_expand("folder", root);
 		tree.toggle_select("folder");
-		let paths = selected(&tree);
-		assert!(paths.contains(&"folder".to_string()));
-		assert!(paths.contains(&"folder/a.txt".to_string()));
-		assert!(paths.contains(&"folder/b.txt".to_string()));
-		assert!(!paths.contains(&"outside.txt".to_string()));
+		// The folder alone: its loaded files are not highlighted with it.
+		assert_eq!(selected(&tree), ["folder"]);
+		// Expanding it again inherits nothing either.
+		tree.toggle_expand("folder", root);
+		tree.toggle_expand("folder", root);
+		assert_eq!(selected(&tree), ["folder"]);
+		tree.toggle_select("folder/a.txt");
+		assert_eq!(selected(&tree), ["folder", "folder/a.txt"]);
 	}
 
 	#[test]
@@ -1410,11 +1400,23 @@ mod tests {
 		let mut tree = FileTreeNode::new_root(root);
 		tree.toggle_expand("parent", root);
 		tree.toggle_select("parent");
-		let paths = selected(&tree);
-		assert!(paths.contains(&"parent".to_string()));
-		assert!(paths.contains(&"parent/sub".to_string()));
-		assert!(!paths.contains(&"parent/nested_repo".to_string()));
-		assert!(!paths.contains(&"parent/nested_repo/file.txt".to_string()));
+		assert_eq!(selected(&tree), ["parent"]);
+		tree.toggle_select("parent/nested_repo");
+		assert_eq!(selected(&tree), ["parent"]);
+	}
+
+	/// A nested repo folder is not selectable on its own either: its files
+	/// belong to its own repo row.
+	#[test]
+	fn nested_repo_folder_toggle_selects_nothing() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		fs::create_dir_all(root.join("sub/.git")).unwrap();
+		fs::write(root.join("sub/file.txt"), "repo data").unwrap();
+		let mut tree = FileTreeNode::new_root(root);
+		tree.toggle_select("sub");
+		assert!(selected(&tree).is_empty());
+		assert!(tree.selection_for_rels(&["sub".into()]).is_empty());
 	}
 
 	#[test]

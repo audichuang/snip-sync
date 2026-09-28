@@ -22,6 +22,8 @@ use snip_core::graph::{GraphCheckpoint, GraphLayout, MAX_SHA_LEN};
 /// Most commits of one multi-selection whose changed files are listed
 /// (one listing each).
 pub const MAX_SELECTION_READS: usize = 100;
+/// Commits of an open multi-selection whose full details are read.
+pub const MAX_SELECTION_DETAILS: usize = 20;
 /// Files listed for one commit or compare; more are counted, not kept.
 pub const MAX_COMMIT_FILES: usize = 5_000;
 /// Rows shown in the commit tree at once.
@@ -1939,8 +1941,23 @@ impl WorkbenchModel {
 				Some(self.log_path_input.read(cx).handle().clone());
 			self.load_picker_dir("", cx);
 		}
+		// IntelliJ's Branch popup opens with an empty field, sections shut.
+		if self.log_menu == Some(crate::ui::LogMenu::Branch) {
+			self.log_branch_menu_input
+				.update(cx, |i, _| i.clear_retained());
+			self.log_branch_menu_open.clear();
+			self.pending_focus =
+				Some(self.log_branch_menu_input.read(cx).handle().clone());
+		}
 		app_log!("[APP:LOG_MENU: {:?}]", self.log_menu);
 		cx.notify();
+	}
+
+	/// Esc in a dropdown's field: the log keeps the keyboard, not the
+	/// field that is no longer drawn.
+	pub fn dismiss_log_menu(&mut self, cx: &mut Context<Self>) {
+		self.close_log_menu(cx);
+		self.pending_focus = Some(self.log_focus.clone());
 	}
 
 	pub fn close_log_menu(&mut self, cx: &mut Context<Self>) {
@@ -2030,6 +2047,7 @@ impl WorkbenchModel {
 		self.selected_commit = Some(Box::<str>::from(sha).into_string());
 		self.range_head = None;
 		self.log_selected.clear();
+		self.reset_selection_details();
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_commit_file = None;
@@ -2102,9 +2120,85 @@ impl WorkbenchModel {
 					// A failed read leaves the row's own fields on screen.
 					// Details are keyed by the row id (merged log: with repo).
 					model.commit_details = res.ok().map(|mut d| {
+						app_log!(
+							"[APP:COMMIT_DETAILS: {} branches={}]",
+							&d.sha[..7.min(d.sha.len())],
+							d.branches.len()
+						);
 						d.sha = id;
 						d
 					});
+					cx.notify();
+				});
+			},
+		);
+	}
+
+	/// A new selection starts with its commit list collapsed.
+	fn reset_selection_details(&mut self) {
+		self.log_selection_expanded = false;
+		self.selection_details.clear();
+		self.log_branches_all.clear();
+	}
+
+	/// Opens or closes the multi-selection's commit list; opening reads
+	/// the first `MAX_SELECTION_DETAILS` commits' details in one job.
+	pub fn toggle_selection_expanded(&mut self, cx: &mut Context<Self>) {
+		self.log_selection_expanded = !self.log_selection_expanded;
+		app_log!(
+			"[APP:LOG_SELECTION_EXPANDED: {}]",
+			self.log_selection_expanded
+		);
+		cx.notify();
+		if !self.log_selection_expanded || !self.selection_details.is_empty() {
+			return;
+		}
+		let reads: Vec<(PathBuf, String, String)> = self
+			.log_selected
+			.iter()
+			.take(MAX_SELECTION_DETAILS)
+			.filter_map(|id| {
+				let (root, sha) = self.log_root_for(id)?;
+				Some((root, sha, id.clone()))
+			})
+			.collect();
+		self.details_generation = self.details_generation.wrapping_add(1);
+		let generation = self.details_generation;
+		if !self.accepting_work() {
+			return;
+		}
+		let cancel = arm_cancel(&mut self.details_cancel);
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
+				let res = bg
+					.spawn(async move {
+						let opts = crate::interactive_read_opts(cancel);
+						// A failed read keeps that commit's row fields.
+						reads
+							.into_iter()
+							.filter_map(|(root, sha, id)| {
+								let git = Git::at_known_root(root);
+								let mut d =
+									read_commit_details(&git, &sha, &opts)
+										.ok()?;
+								d.sha = id;
+								Some(d)
+							})
+							.collect::<Vec<_>>()
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.details_generation != generation {
+						return;
+					}
+					app_log!("[APP:SELECTION_DETAILS: {}]", res.len());
+					model.selection_details = res;
 					cx.notify();
 				});
 			},
@@ -2186,6 +2280,7 @@ impl WorkbenchModel {
 				self.range_head = None;
 				self.log_selected.clear();
 				self.commit_details = None;
+				self.reset_selection_details();
 				self.commit_files.clear();
 				self.selected_commit_file = None;
 				self.preview_loading = false;
@@ -2241,6 +2336,7 @@ impl WorkbenchModel {
 		let task_generation = self.preview_generation;
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.commit_details = None;
+		self.reset_selection_details();
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_commit_file = None;
@@ -2293,7 +2389,7 @@ impl WorkbenchModel {
 						// Lazy: each listing is folded in and dropped
 						// before the next one is read.
 						union_changed_files(shas.into_iter().map(|sha| {
-							gitsrc::list_changed_paths_with(
+							gitsrc::list_changed_paths_and_gitlinks_with(
 								&git,
 								&GitSource::Commit(sha),
 								&listing,
@@ -2307,7 +2403,7 @@ impl WorkbenchModel {
 						return;
 					}
 					match res {
-						Ok((files, origin, total)) => {
+						Ok((files, origin, total, gitlinks)) => {
 							app_log!("[APP:E2E_CHANGES: files={}]", total);
 							if total > MAX_COMMIT_FILES {
 								model.set_status(
@@ -2321,6 +2417,9 @@ impl WorkbenchModel {
 							let first = files.first().map(|(p, _)| p.clone());
 							model.commit_files = files;
 							model.commit_file_origin = origin;
+							model.commit_file_gitlinks = gitlinks;
+							model.commit_files_truncated =
+								total > MAX_COMMIT_FILES;
 							match first {
 								Some(path) => {
 									model.select_commit_file(&path, cx)
@@ -2450,10 +2549,11 @@ impl WorkbenchModel {
 						};
 						// The repository's root is known: no probe processes.
 						let git = Git::at_known_root(root);
-						let files = gitsrc::list_changed_paths_with(
-							&git, &source, &listing,
-						)
-						.map_err(|e| e.to_string())?;
+						let (files, gitlinks) =
+							gitsrc::list_changed_paths_and_gitlinks_with(
+								&git, &source, &listing,
+							)
+							.map_err(|e| e.to_string())?;
 						let first = files.first().map(|(p, change)| {
 							(
 								p.clone(),
@@ -2467,7 +2567,7 @@ impl WorkbenchModel {
 								),
 							)
 						});
-						Ok::<_, String>((files, first))
+						Ok::<_, String>((files, gitlinks, first))
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2475,7 +2575,7 @@ impl WorkbenchModel {
 						return;
 					}
 					match res {
-						Ok((mut files, first)) => {
+						Ok((mut files, gitlinks, first)) => {
 							let total = files.len();
 							files.truncate(MAX_COMMIT_FILES);
 							files.shrink_to_fit();
@@ -2491,6 +2591,9 @@ impl WorkbenchModel {
 							}
 							model.commit_files = files;
 							model.commit_file_origin.clear();
+							model.commit_file_gitlinks = gitlinks;
+							model.commit_files_truncated =
+								total > MAX_COMMIT_FILES;
 							match first {
 								Some((path, p)) => {
 									model.selected_commit_file =
@@ -2653,6 +2756,26 @@ impl WorkbenchModel {
 			Some(root),
 			self.known_parents(id),
 		))
+	}
+
+	/// The repository and commit a changed-files row's file is read from:
+	/// the commit that changed it last in a multi-selection, the newer end
+	/// of a compare, else the selected commit.
+	pub fn commit_file_rev(
+		&self,
+		path: &str,
+	) -> Option<(std::path::PathBuf, String)> {
+		if let Some((_, to)) = &self.compare {
+			return Some((self.log_commit_root.clone()?, to.clone()));
+		}
+		if self.log_selected.len() > 1 {
+			let idx = self.commit_files.iter().position(|(p, _)| p == path)?;
+			let id = self
+				.log_selected
+				.get(*self.commit_file_origin.get(idx)? as usize)?;
+			return self.log_root_for(id);
+		}
+		self.log_root_for(self.selected_commit.as_deref()?)
 	}
 
 	/// Keyboard move in the log; `extend` grows the range instead.
@@ -2986,25 +3109,32 @@ pub type ChangedFiles = Vec<(String, Option<snip_core::format::ChangeType>)>;
 /// Changed files of several commits (newest first) as one list, like
 /// IntelliJ's multi-commit selection: each path once, with the change of
 /// the newest commit touching it and that commit's index. At most
-/// `MAX_COMMIT_FILES` are kept; the count of distinct paths comes last.
+/// `MAX_COMMIT_FILES` are kept; the count of distinct paths comes next,
+/// then the kept paths that are a submodule commit in that newest commit.
+/// Each list comes with its gitlinks.
 pub fn union_changed_files<E>(
-	lists: impl IntoIterator<Item = Result<ChangedFiles, E>>,
-) -> Result<(ChangedFiles, Vec<u32>, usize), E> {
+	lists: impl IntoIterator<Item = Result<(ChangedFiles, Vec<String>), E>>,
+) -> Result<(ChangedFiles, Vec<u32>, usize, Vec<String>), E> {
 	let mut seen = HashSet::new();
 	let (mut files, mut origin, mut total) = (Vec::new(), Vec::new(), 0);
+	let mut gitlinks = Vec::new();
 	for (i, list) in lists.into_iter().enumerate() {
-		for (path, change) in list? {
+		let (list, links) = list?;
+		for (path, change) in list {
 			if !seen.insert(path.clone()) {
 				continue;
 			}
 			total += 1;
 			if files.len() < MAX_COMMIT_FILES {
+				if links.contains(&path) {
+					gitlinks.push(path.clone());
+				}
 				files.push((path, change));
 				origin.push(i as u32);
 			}
 		}
 	}
-	Ok((files, origin, total))
+	Ok((files, origin, total, gitlinks))
 }
 
 /// One read of a merged-log feed: its page (plain SHAs) and, on the
@@ -4385,11 +4515,19 @@ mod tests {
 				.collect::<Vec<_>>()
 		};
 		// Newest first: a.txt deleted in the newest, added in the oldest.
-		let (files, origin, total) = union_changed_files(
+		// A submodule path is a gitlink as its newest commit lists it.
+		let links = |v: &[&str]| v.iter().map(|p| p.to_string()).collect();
+		let (files, origin, total, gitlinks) = union_changed_files(
 			[
-				list(&[("a.txt", Deleted), ("b.txt", Modified)]),
-				list(&[("c.txt", New)]),
-				list(&[("a.txt", New), ("c.txt", Modified)]),
+				(
+					list(&[("a.txt", Deleted), ("b.txt", Modified)]),
+					links(&["b.txt"]),
+				),
+				(list(&[("c.txt", New)]), links(&[])),
+				(
+					list(&[("a.txt", New), ("c.txt", Modified)]),
+					links(&["a.txt", "c.txt"]),
+				),
 			]
 			.map(Ok::<_, ()>),
 		)
@@ -4400,12 +4538,15 @@ mod tests {
 		);
 		assert_eq!(origin, [0, 0, 1]);
 		assert_eq!(total, 3);
+		assert_eq!(gitlinks, ["b.txt"]);
 		// Distinct paths past the cap are counted, not kept.
 		let many: Vec<_> = (0..MAX_COMMIT_FILES + 2)
 			.map(|i| (format!("f{i}"), Some(Modified)))
 			.collect();
-		let (files, origin, total) =
-			union_changed_files([many.clone(), many].map(Ok::<_, ()>)).unwrap();
+		let (files, origin, total, _) = union_changed_files(
+			[many.clone(), many].map(|l| Ok::<_, ()>((l, Vec::new()))),
+		)
+		.unwrap();
 		assert_eq!(files.len(), MAX_COMMIT_FILES);
 		assert_eq!(origin.len(), MAX_COMMIT_FILES);
 		assert_eq!(total, MAX_COMMIT_FILES + 2);

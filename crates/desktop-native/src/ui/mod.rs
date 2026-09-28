@@ -501,9 +501,44 @@ fn short(sha: &str) -> &str {
 
 /// One row of the Project tool window.
 enum ProjRow {
-	Repo(usize),
+	/// Repo index and its indent depth in the workspace tree.
+	Repo(usize, usize),
 	Work(FlattenedTreeRow),
+	/// A workspace-tree row outside every repo.
+	Ws(FlattenedTreeRow),
 	Rev(RevRow),
+}
+
+/// Repos shown where their folder sits in the workspace tree, keyed by that
+/// folder's path relative to `ws_root`. A repo inside another repo below
+/// `ws_root` (or outside the workspace) is not reachable there and stays a
+/// top-level row; a repo at `ws_root` itself is the tree's root row.
+fn placed_repos(
+	repos: &[crate::RepoEntry],
+	ws_root: &std::path::Path,
+) -> HashMap<String, usize> {
+	let mut out = HashMap::new();
+	for (idx, repo) in repos.iter().enumerate() {
+		let Some(rel) = repo
+			.root
+			.strip_prefix(ws_root)
+			.ok()
+			.and_then(|rel| rel.to_str())
+			.filter(|rel| !rel.is_empty())
+		else {
+			continue;
+		};
+		let nested = repos.iter().any(|other| {
+			other.root != repo.root
+				&& repo.root.starts_with(&other.root)
+				&& other.root != ws_root
+				&& other.root.starts_with(ws_root)
+		});
+		if !nested {
+			out.insert(rel.replace('\\', "/"), idx);
+		}
+	}
+	out
 }
 
 impl WorkbenchModel {
@@ -514,7 +549,9 @@ impl WorkbenchModel {
 			}
 			WorkbenchTab::FileExplorer => {
 				let mut paths = Vec::new();
-				if let Some(ref tree) = self.file_tree {
+				for tree in
+					[&self.file_tree, &self.ws_tree].into_iter().flatten()
+				{
 					tree.collect_selected_paths(&mut paths);
 				}
 				paths.len()
@@ -604,6 +641,14 @@ impl WorkbenchModel {
 				let want = vw - SPLITTER - f32::from(ev.position.x);
 				self.log_details_w = want.min(vw * 0.5).max(LOG_DETAILS_W_MIN);
 			}
+			Splitter::LogFiles => {
+				// The log island ends at the status bar.
+				let want = vh - STATUS_H - f32::from(ev.position.y);
+				self.log_details_h = Some(
+					want.min(self.effective_bottom_h(vh) * 0.8)
+						.max(LOG_DETAILS_H_MIN),
+				);
+			}
 		}
 		cx.notify();
 	}
@@ -624,20 +669,119 @@ impl WorkbenchModel {
 		if let Some(tree) = &self.rev_tree {
 			return tree.rows().into_iter().map(ProjRow::Rev).collect();
 		}
-		let mut out = Vec::new();
-		for idx in 0..self.repos.len() {
-			out.push(ProjRow::Repo(idx));
-			if self.selected_repo_idx == Some(idx) && !self.repo_collapsed {
-				if let Some(t) = &self.file_tree {
-					out.extend(
-						t.flatten_visible(t.visible_limit())
-							.into_iter()
-							.map(ProjRow::Work),
-					);
+		// The workspace folder's tree: its own, or the open workspace
+		// repo's. Until it is read every repo is a top-level row.
+		let home = self.ws_repo_idx();
+		let (tree, ws) = match (&self.ws_tree, home) {
+			(Some(t), _) => (Some(t), true),
+			(None, Some(idx)) if self.selected_repo_idx == Some(idx) => {
+				(self.file_tree.as_ref(), false)
+			}
+			_ => (None, true),
+		};
+		let mut body = Vec::new();
+		// Repos given a row inside the tree; the rest are top-level rows.
+		let mut shown = Vec::new();
+		if let Some(t) = tree.filter(|t| t.is_loaded) {
+			let placed = placed_repos(&self.repos, &t.full_path);
+			let open = match home {
+				Some(idx) => {
+					shown.push(idx);
+					body.push(ProjRow::Repo(idx, 0));
+					self.repo_row_open(idx)
+				}
+				None => true,
+			};
+			// A folded root hides the repos inside it too.
+			if !open {
+				shown.extend(placed.values().copied());
+			}
+			for mut row in t
+				.flatten_visible(t.visible_limit())
+				.into_iter()
+				.filter(|_| open)
+			{
+				// A plain workspace's children are top-level rows.
+				if home.is_none() {
+					row.depth = row.depth.saturating_sub(1);
+				}
+				match placed.get(&row.rel_path).filter(|_| row.is_dir) {
+					Some(&idx) => {
+						shown.push(idx);
+						self.push_repo_rows(idx, row.depth, &mut body);
+					}
+					None if ws => body.push(ProjRow::Ws(row)),
+					None => body.push(ProjRow::Work(row)),
 				}
 			}
 		}
+		let mut out = Vec::new();
+		for idx in 0..self.repos.len() {
+			if !shown.contains(&idx) {
+				self.push_repo_rows(idx, 0, &mut out);
+			}
+		}
+		out.append(&mut body);
 		out
+	}
+
+	/// Shift-click: the rows from the cursor to `ix` that belong to the
+	/// same tree become the Project selection. The cursor stays the anchor.
+	pub(crate) fn select_tree_range(
+		&mut self,
+		ix: usize,
+		ws: bool,
+		cx: &mut Context<Self>,
+	) {
+		let rows = self.project_rows();
+		let (from, to) = (self.tree_cursor.min(ix), self.tree_cursor.max(ix));
+		let rels: Vec<String> = rows
+			.into_iter()
+			.skip(from)
+			.take(to.saturating_sub(from) + 1)
+			.filter_map(|row| match row {
+				ProjRow::Ws(r) if ws => Some(r),
+				ProjRow::Work(r) if !ws => Some(r),
+				_ => None,
+			})
+			.filter(|r| {
+				r.is_valid_utf8
+					&& !(r.is_error
+						|| r.is_loading || r.is_more_marker
+						|| r.is_truncation_marker
+						|| r.is_view_limit)
+			})
+			.map(|r| r.rel_path)
+			.collect();
+		self.select_tree_rows_alone(ws, &rels, cx);
+	}
+
+	/// Whether a repo row shows its files. The workspace repo's row stays
+	/// open while another repo is open: the repos inside sit in its tree.
+	pub(crate) fn repo_row_open(&self, idx: usize) -> bool {
+		if self.selected_repo_idx == Some(idx) {
+			return !self.repo_collapsed;
+		}
+		self.ws_tree.is_some()
+			&& self.ws_repo_idx() == Some(idx)
+			&& !self.ws_collapsed
+	}
+
+	/// A repo row and, when it is the open expanded repo, its tree.
+	fn push_repo_rows(&self, idx: usize, depth: usize, out: &mut Vec<ProjRow>) {
+		out.push(ProjRow::Repo(idx, depth));
+		if self.selected_repo_idx == Some(idx) && !self.repo_collapsed {
+			if let Some(t) = &self.file_tree {
+				out.extend(
+					t.flatten_visible(t.visible_limit()).into_iter().map(
+						|mut row| {
+							row.depth += depth;
+							ProjRow::Work(row)
+						},
+					),
+				);
+			}
+		}
 	}
 
 	fn change_item_rows(&self) -> Vec<ChangeItemRow> {
@@ -756,8 +900,8 @@ impl WorkbenchModel {
 			self.project_rows()
 				.into_iter()
 				.map(|r| match r {
-					ProjRow::Repo(i) => self.repos[i].name.clone(),
-					ProjRow::Work(w) => w.name,
+					ProjRow::Repo(i, _) => self.repos[i].name.clone(),
+					ProjRow::Work(w) | ProjRow::Ws(w) => w.name,
 					ProjRow::Rev(r) => r.name,
 				})
 				.collect()
@@ -952,7 +1096,7 @@ impl WorkbenchModel {
 		let expand = action == "expand";
 		let collapse = action == "collapse";
 		match &rows[self.tree_cursor] {
-			ProjRow::Repo(i) => {
+			ProjRow::Repo(i, _) => {
 				let i = *i;
 				if action == "open" || action == "toggle" {
 					self.toggle_repo_row(i, cx);
@@ -960,7 +1104,8 @@ impl WorkbenchModel {
 					self.set_repo_row_expanded(i, expand, cx);
 				}
 			}
-			ProjRow::Work(r) => {
+			ProjRow::Work(r) | ProjRow::Ws(r) => {
+				let ws = matches!(&rows[self.tree_cursor], ProjRow::Ws(_));
 				let gesture = match action {
 					"toggle" => Some(RowGesture::Toggle),
 					"expand" => Some(RowGesture::Expand),
@@ -970,7 +1115,11 @@ impl WorkbenchModel {
 				};
 				if let Some(gesture) = gesture {
 					let cmd = command_for_row(r, gesture);
-					self.dispatch_tree(cmd, cx);
+					if ws {
+						self.dispatch_ws_tree(cmd, cx);
+					} else {
+						self.dispatch_tree(cmd, cx);
+					}
 				}
 			}
 			ProjRow::Rev(r) if r.marker.is_none() => {
@@ -1020,6 +1169,7 @@ impl WorkbenchModel {
 			Splitter::Left => "splitter-left",
 			Splitter::Bottom => "splitter-bottom",
 			Splitter::LogDetails => "splitter-log-details",
+			Splitter::LogFiles => "splitter-log-files",
 		};
 		let d = div()
 			.id(id)
@@ -1045,6 +1195,12 @@ impl WorkbenchModel {
 				.border_l_1()
 				.border_color(rgb(pal().divider))
 				.cursor_ew_resize(),
+			Splitter::LogFiles => d
+				.h(px(SPLITTER))
+				.w_full()
+				.border_t_1()
+				.border_color(rgb(pal().divider))
+				.cursor_ns_resize(),
 		}
 		.into_any_element()
 	}
@@ -1335,14 +1491,131 @@ impl Render for WorkbenchModel {
 					),
 			)
 			.child(self.render_status(cx))
+			.children(self.render_toast())
 			.children(self.render_context_menu(cx))
 			.children(probe_frame_end(&self.probes))
+	}
+}
+
+impl WorkbenchModel {
+	/// The copy result card: bottom center, above the status bar.
+	fn render_toast(&self) -> Option<AnyElement> {
+		let (_, ok, msg) = self.toast.as_ref()?;
+		let (glyph, accent) = if *ok {
+			(Icon::Apply, pal().diff_add_bg)
+		} else {
+			(Icon::Error, pal().diff_removed_bg)
+		};
+		Some(
+			div()
+				.absolute()
+				.bottom(px(STATUS_H + 16.))
+				.left_0()
+				.right_0()
+				.flex()
+				.justify_center()
+				.child(
+					// No occlude: the card only informs, clicks reach the
+					// rows under it.
+					div()
+						.id("copy-toast")
+						.flex()
+						.flex_row()
+						.items_center()
+						.gap(px(10.))
+						.max_w(px(640.))
+						.px(px(16.))
+						.py(px(10.))
+						.bg(rgb(pal().popup_bg))
+						.border_1()
+						.border_color(rgb(accent))
+						.border_l_4()
+						.rounded(px(8.))
+						.shadow_lg()
+						.text_size(px(UI_TEXT))
+						.text_color(rgb(pal().text))
+						.child(icon(glyph, 18.))
+						.child(msg.render(self.locale))
+						.children(probe(&self.probes, "copy-toast")),
+				)
+				.into_any_element(),
+		)
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The workspace tree lists plain folders and files; repo folders are
+	/// placed as repo rows, a repo inside a repo stays top-level, and a
+	/// workspace spelled through a symlink still matches Git's toplevels.
+	#[cfg(unix)]
+	#[test]
+	fn workspace_tree_mixes_plain_entries_and_placed_repos() {
+		use crate::tree::{FileTreeNode, NodeKey};
+		use std::fs;
+		let dir = tempfile::tempdir().unwrap();
+		let real = dunce::canonicalize(dir.path()).unwrap().join("ws");
+		for d in ["app/.git", "app/sub/.git", "group/lib/.git", "notes"] {
+			fs::create_dir_all(real.join(d)).unwrap();
+		}
+		fs::write(real.join("notes/readme.txt"), "n\n").unwrap();
+		fs::write(real.join("group/plain.txt"), "p\n").unwrap();
+		fs::write(real.join("group/lib/x.rs"), "x\n").unwrap();
+		fs::write(real.join("top.txt"), "t\n").unwrap();
+		let link = dir.path().join("ws-link");
+		std::os::unix::fs::symlink(&real, &link).unwrap();
+
+		let repo = |rel: &str| crate::RepoEntry {
+			root: real.join(rel),
+			name: rel.rsplit('/').next().unwrap().to_string(),
+			kind: crate::RepoEntryKind::Main,
+			identity: None,
+			summary: Err("mock".into()),
+		};
+		let repos = vec![repo("app"), repo("app/sub"), repo("group/lib")];
+		// The user-given spelling does not match Git's resolved roots.
+		assert!(placed_repos(&repos, &link).is_empty());
+		let root = snip_core::transfer::CanonicalRootId::new(&link).unwrap();
+		let placed = placed_repos(&repos, root.path());
+		assert_eq!(placed.get("app"), Some(&0));
+		assert_eq!(placed.get("group/lib"), Some(&2));
+		assert!(!placed.values().any(|&i| i == 1), "nested repo stays top");
+		// The workspace folder itself a repo (INVI_SRC): it is the root row,
+		// and the repos inside it still sit at their folders.
+		let mut in_home = vec![repo("")];
+		in_home.extend(repos.iter().map(|r| crate::RepoEntry {
+			root: r.root.clone(),
+			name: r.name.clone(),
+			kind: crate::RepoEntryKind::Main,
+			identity: None,
+			summary: Err("mock".into()),
+		}));
+		in_home[0].root = root.path().to_path_buf();
+		let placed = placed_repos(&in_home, root.path());
+		assert_eq!(placed.get("app"), Some(&1));
+		assert_eq!(placed.get("group/lib"), Some(&3));
+		assert_eq!(placed.len(), 2, "{placed:?}");
+
+		let mut tree = FileTreeNode::new_root(root.path());
+		tree.toggle_expand("group", root.path());
+		let rows = tree.flatten_visible(tree.visible_limit());
+		let names: Vec<_> = rows.iter().map(|r| r.rel_path.as_str()).collect();
+		for want in ["app", "group", "group/lib", "group/plain.txt", "notes"] {
+			assert!(names.contains(&want), "{want} missing: {names:?}");
+		}
+		assert!(names.contains(&"top.txt"), "{names:?}");
+		// Selecting a plain folder selects it alone (Copy walks it later,
+		// never into the repo inside); the repo folder is not selectable.
+		let picked = tree
+			.selection_for_toggle(&NodeKey::from_utf8_rel("group"))
+			.unwrap();
+		assert_eq!(picked, ["group"]);
+		assert!(tree
+			.selection_for_toggle(&NodeKey::from_utf8_rel("group/lib"))
+			.is_none());
+	}
 
 	#[test]
 	fn probe_bookkeeping_is_bounded_by_one_frame() {
@@ -1394,6 +1667,151 @@ mod tests {
 		assert!(open.contains(&" src/app".to_string()), "{open:?}");
 		assert!(open.contains(&" src/lib.rs".to_string()), "{open:?}");
 		assert_eq!(path_picker_rows(&tree, &["src".into()], 3).len(), 3);
+	}
+
+	#[test]
+	fn path_picker_filters_the_loaded_tree_by_typed_text() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		std::fs::create_dir_all(root.join("src/Query")).unwrap();
+		std::fs::create_dir_all(root.join("docs")).unwrap();
+		std::fs::write(root.join("src/Query/run.rs"), "").unwrap();
+		std::fs::write(root.join("src/lib.rs"), "").unwrap();
+		std::fs::write(root.join("docs/query.md"), "").unwrap();
+		std::fs::write(root.join("README.md"), "").unwrap();
+		let mut tree = crate::tree::FileTreeNode::new_root(root);
+		for d in ["src", "src/Query", "docs"] {
+			tree.toggle_expand(d, root);
+		}
+		let shape = |rows: Vec<PathPick>| -> Vec<String> {
+			rows.into_iter()
+				.map(|p| {
+					format!(
+						"{}{}{}",
+						" ".repeat(p.depth),
+						p.rel,
+						if p.expanded { "/" } else { "" }
+					)
+				})
+				.collect()
+		};
+		// Case-insensitive, on the path; ancestors kept and shown open,
+		// the rest of the tree left out.
+		let hits = shape(path_picker_matches(&tree, "query", "", 50));
+		assert_eq!(
+			hits,
+			[
+				"docs/",
+				" docs/query.md",
+				"src/",
+				" src/Query/",
+				"  src/Query/run.rs"
+			],
+			"{hits:?}"
+		);
+		assert!(path_picker_matches(&tree, "nothing", "", 50).is_empty());
+		// Bounded by rows; the merged log names the repository first.
+		assert_eq!(path_picker_matches(&tree, "query", "", 2).len(), 2);
+		let merged = path_picker_matches(&tree, "readme", "repo/", 50);
+		assert_eq!(shape(merged), ["repo/README.md"]);
+		// The merged log's needle can name the repository, as its picks do.
+		let merged = path_picker_matches(&tree, "repo/src/q", "repo/", 50);
+		assert_eq!(
+			shape(merged),
+			["repo/src/", " repo/src/Query/", "  repo/src/Query/run.rs"]
+		);
+		// The filter decides what shows: its folders cannot be collapsed.
+		assert!(path_picker_matches(&tree, "query", "", 50)
+			.iter()
+			.all(|p| !p.expandable));
+	}
+
+	#[test]
+	fn details_list_a_few_branches_until_show_all() {
+		use super::log_view::branches_list;
+		let names: Vec<String> = (1..=7).map(|i| format!("b{i}")).collect();
+		assert_eq!(
+			branches_list(&names[..2], false, false),
+			("b1, b2".to_string(), false)
+		);
+		assert_eq!(
+			branches_list(&names, false, false),
+			("b1, b2, b3, b4, b5, …".to_string(), true)
+		);
+		assert_eq!(
+			branches_list(&names, false, true),
+			("b1, b2, b3, b4, b5, b6, b7".to_string(), false)
+		);
+		// The read itself was cut: more exist than Show all can list.
+		assert_eq!(
+			branches_list(&names[..2], true, true),
+			("b1, b2, …".to_string(), false)
+		);
+	}
+
+	#[test]
+	fn branch_popup_splits_local_and_remotes_and_flattens_a_filter() {
+		let refs: Vec<_> = [
+			"refs/heads/main",
+			"refs/heads/feat/Login",
+			"refs/remotes/origin/HEAD",
+			"refs/remotes/origin/main",
+			"refs/remotes/origin/feat/login",
+			"refs/remotes/upstream/main",
+			// A second repository of the merged log has `main` too.
+			"refs/heads/main",
+		]
+		.iter()
+		.map(|n| snip_core::browser::GitReference {
+			name: n.to_string(),
+			sha: "a".into(),
+		})
+		.collect();
+		let shape = |rows: Vec<BranchRow>| -> Vec<String> {
+			rows.into_iter()
+				.map(|r| match r {
+					BranchRow::Group {
+						key,
+						depth,
+						collapsed,
+						..
+					} => format!(
+						"{depth}G {key}{}",
+						if collapsed { " ›" } else { "" }
+					),
+					BranchRow::Ref { label, depth, .. } => {
+						format!("{depth} {label}")
+					}
+				})
+				.collect()
+		};
+		// Closed sections: Local and one per remote, no Remote parent.
+		assert_eq!(
+			shape(branch_popup_rows(&refs, "", &[], Locale::En)),
+			[
+				"0G refs_local ›",
+				"0G remote:origin ›",
+				"0G remote:upstream ›"
+			]
+		);
+		let open = ["refs_local".to_string(), "remote:origin".to_string()];
+		assert_eq!(
+			shape(branch_popup_rows(&refs, "", &open, Locale::En)),
+			[
+				"0G refs_local",
+				"1 main",
+				"1 feat/Login",
+				"0G remote:origin",
+				"1 main",
+				"1 feat/login",
+				"0G remote:upstream ›",
+			]
+		);
+		// Typing: every match, local and remote, flat and case-insensitive.
+		assert_eq!(
+			shape(branch_popup_rows(&refs, "login", &[], Locale::En)),
+			["0 feat/Login", "0 origin/feat/login"]
+		);
 	}
 
 	#[test]

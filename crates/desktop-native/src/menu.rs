@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::i18n::t;
 use crate::icons::{icon, Icon};
 use crate::theme::*;
-use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture, TreeCommand};
+use crate::tree::FlattenedTreeRow;
 use crate::ui::probe;
 use crate::WorkbenchModel;
 
@@ -71,6 +71,34 @@ pub(crate) fn path_under(path: &str, dir: &str) -> bool {
 		&& path.as_bytes()[dir.len()] == b'/'
 }
 
+/// The changed files a Log row's "copy files" reads: the file, or every
+/// file under the directory. A deleted file has no content in its commit,
+/// a submodule commit is no file, and a directory of a truncated listing
+/// copies nothing rather than a silent subset.
+pub(crate) fn commit_copy_paths<'a>(
+	files: &'a [(String, Option<snip_core::format::ChangeType>)],
+	gitlinks: &[String],
+	truncated: bool,
+	path: &str,
+	is_dir: bool,
+) -> Vec<&'a str> {
+	if is_dir && truncated {
+		return Vec::new();
+	}
+	files
+		.iter()
+		.filter(|(p, ct)| {
+			(if is_dir {
+				path_under(p, path)
+			} else {
+				p == path
+			}) && *ct != Some(snip_core::format::ChangeType::Deleted)
+				&& !gitlinks.contains(p)
+		})
+		.map(|(p, _)| p.as_str())
+		.collect()
+}
+
 /// Tri-state of the checkable `files` matching `pred`: all / none
 /// selected, `None` if mixed. Non-UTF-8 names do not count.
 pub(crate) fn rows_tri_state(
@@ -103,15 +131,29 @@ pub struct ContextMenu {
 
 #[derive(Clone, Debug)]
 pub enum MenuAct {
-	Tree(TreeCommand),
-	RevToggle { sha: String, path: String },
-	ChangeToggle { idx: usize, path: String },
-	ChangeOpen { idx: usize, path: String },
+	RevToggle {
+		sha: String,
+		path: String,
+	},
+	ChangeToggle {
+		idx: usize,
+		path: String,
+	},
+	ChangeOpen {
+		idx: usize,
+		path: String,
+	},
 	GroupToggle(&'static str),
 	RepoToggle(usize, &'static str),
 	CopyText(String),
 	CommitDiff(String),
 	CopyCommits(String),
+	/// Snip-sync copy of files as they are in a commit: (repository root,
+	/// commit, path).
+	CopyRevFiles(Vec<(PathBuf, String, String)>),
+	/// The Project view's selection, as one snip-sync payload.
+	CopyProjectSelection,
+	CommitFileDiff(String),
 	Select(String),
 	BrowseTree(String),
 	Reveal(PathBuf),
@@ -245,18 +287,35 @@ impl WorkbenchModel {
 		]
 	}
 
+	/// `ws`: a row of the workspace tree (outside every repo). Copy Files
+	/// copies the whole Project selection, which this row is part of.
 	pub(crate) fn work_row_menu(
 		&self,
 		row: &FlattenedTreeRow,
+		ws: bool,
 	) -> Vec<MenuEntry> {
-		let toggle = row
-			.is_valid_utf8
-			.then(|| command_for_row(row, RowGesture::Toggle))
-			.flatten()
-			.map(MenuAct::Tree);
-		let mut v = vec![basket_entry(row.selected, toggle), MenuEntry::Sep];
-		v.extend(copy_entries(self.abs_path(&row.rel_path), &row.rel_path));
-		v.push(self.reveal_rel(&row.rel_path));
+		let mut v = vec![
+			item(
+				"copy-files",
+				"menu_copy_files",
+				None,
+				row.selected.then_some(MenuAct::CopyProjectSelection),
+			),
+			MenuEntry::Sep,
+		];
+		if ws {
+			let abs = self
+				.ws_root()
+				.map(|r| r.join(row.rel_path.trim_end_matches('/')));
+			v.extend(copy_entries(
+				abs.as_ref().map(|p| p.display().to_string()),
+				&row.rel_path,
+			));
+			v.push(reveal_entry(abs));
+		} else {
+			v.extend(copy_entries(self.abs_path(&row.rel_path), &row.rel_path));
+			v.push(self.reveal_rel(&row.rel_path));
+		}
 		v
 	}
 
@@ -411,6 +470,63 @@ impl WorkbenchModel {
 				Some(MenuAct::BrowseTree(sha.to_string())),
 			),
 		]
+	}
+
+	/// A changed-files row of the Log (a file, or a directory for every
+	/// file under it): copy as snip-sync, diff, basket and paths.
+	pub(crate) fn commit_file_menu(
+		&self,
+		path: &str,
+		is_dir: bool,
+	) -> Vec<MenuEntry> {
+		let copy: Vec<(PathBuf, String, String)> = commit_copy_paths(
+			&self.commit_files,
+			&self.commit_file_gitlinks,
+			self.commit_files_truncated,
+			path,
+			is_dir,
+		)
+		.into_iter()
+		.filter_map(|p| {
+			let (root, sha) = self.commit_file_rev(p)?;
+			Some((root, sha, p.to_string()))
+		})
+		.collect();
+		let mut v = vec![item(
+			"copy-files",
+			"menu_copy_files",
+			None,
+			(!copy.is_empty()).then_some(MenuAct::CopyRevFiles(copy)),
+		)];
+		let rev = self.commit_file_rev(path).or_else(|| {
+			self.log_commit_root.clone().map(|r| (r, String::new()))
+		});
+		if !is_dir {
+			v.push(item(
+				"show-diff",
+				"menu_show_diff",
+				Some(secondary("D")),
+				Some(MenuAct::CommitFileDiff(path.to_string())),
+			));
+			// The basket holds the selected repository's files only.
+			if let Some((_, sha)) = rev.as_ref().filter(|(root, sha)| {
+				!sha.is_empty() && self.repo_root().as_ref() == Some(root)
+			}) {
+				v.push(basket_entry(
+					self.is_rev_file_selected(sha, path),
+					Some(MenuAct::RevToggle {
+						sha: sha.clone(),
+						path: path.to_string(),
+					}),
+				));
+			}
+		}
+		v.push(MenuEntry::Sep);
+		v.extend(copy_entries(
+			rev.map(|(root, _)| root.join(path).display().to_string()),
+			path,
+		));
+		v
 	}
 
 	/// Right-click on a Log row: IntelliJ keeps a selection that already
@@ -587,7 +703,6 @@ impl WorkbenchModel {
 				.map(|f| f.source.clone())
 		};
 		match act {
-			MenuAct::Tree(cmd) => self.dispatch_tree(Some(cmd), cx),
 			MenuAct::RevToggle { sha, path } => {
 				self.toggle_rev_file_selection(&sha, &path, cx)
 			}
@@ -614,6 +729,37 @@ impl WorkbenchModel {
 				window.focus(&self.reader_focus);
 			}
 			MenuAct::CopyCommits(_) => self.copy_commits_to_clipboard(cx),
+			MenuAct::CopyProjectSelection => self.copy_project_selection(cx),
+			MenuAct::CopyRevFiles(files) => {
+				let name = files
+					.first()
+					.map(|(root, _, _)| self.log_repo_name(root))
+					.unwrap_or_default();
+				let items: Option<Vec<_>> = files
+					.into_iter()
+					.map(|(root, rev, path)| {
+						Some(snip_core::transfer::ExportItem {
+							root: snip_core::transfer::CanonicalRootId::new(
+								&root,
+							)
+							.ok()?,
+							relative_path: path,
+							source: SourceKind::Commit { rev },
+							change_type: None,
+						})
+					})
+					.collect();
+				match items {
+					Some(items) => {
+						self.export_items_to_clipboard(items, name, cx)
+					}
+					None => self.set_status("error_selection_root", []),
+				}
+			}
+			MenuAct::CommitFileDiff(path) => {
+				self.select_commit_file(&path, cx);
+				window.focus(&self.reader_focus);
+			}
 			MenuAct::Select(sha) => self.log_select_row(&sha, cx),
 			MenuAct::Reveal(path) => {
 				let result = reveal_command(TargetOs::current(), &path)
@@ -1282,6 +1428,36 @@ mod tests {
 		assert_eq!(prog, "xdg-open");
 		assert_eq!(args, vec![OsString::from("/w/repo/src")]);
 		assert!(reveal_command(TargetOs::Linux, Path::new("/")).is_err());
+	}
+
+	#[test]
+	fn commit_copy_skips_gitlinks_and_truncated_directories() {
+		use snip_core::format::ChangeType::{Deleted, Modified};
+		let files: Vec<_> = [
+			("lib/a.rs", Modified),
+			("lib/gone.rs", Deleted),
+			("lib/sub", Modified),
+			("other.rs", Modified),
+		]
+		.map(|(p, c)| (p.to_string(), Some(c)))
+		.into();
+		let links = ["lib/sub".to_string()];
+		assert_eq!(
+			commit_copy_paths(&files, &links, false, "lib", true),
+			["lib/a.rs"]
+		);
+		assert!(commit_copy_paths(&files, &links, false, "lib/sub", false)
+			.is_empty());
+		assert_eq!(
+			commit_copy_paths(&files, &links, false, "other.rs", false),
+			["other.rs"]
+		);
+		// A cut listing does not know every file under a directory.
+		assert!(commit_copy_paths(&files, &links, true, "lib", true).is_empty());
+		assert_eq!(
+			commit_copy_paths(&files, &links, true, "other.rs", false),
+			["other.rs"]
+		);
 	}
 
 	#[test]

@@ -24,6 +24,14 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 ### 已知且接受的差異
 
+- 原生工作台(`desktop-native`)的檔案模式上限是 10,000 個檔案(`NATIVE_FILE_COUNT_LIMIT`),不是 ClipCode 預設的 30:它沒有設定畫面,
+  而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 64 MiB payload 上限約束(超過是明確錯誤)。payload 格式不變。
+  碰到上限時狀態列與複製提示明說「已達 N 個檔案上限,其餘檔案未複製」,不會默默少檔。
+  截斷順序:單獨選的檔案與 Changes / Log 項目先保留名額;資料夾依選取籃順序(root 依路徑排序,
+  root 內的專案選取依相對路徑排序)分用剩下的名額,先到先用,走訪到上限多一個檔案就停,不把大資料夾整個列出。
+  資料夾內 payload 無法攜帶的檔案(名稱含 `< > : " | ? *`、控制字元、結尾空白、Unix 上的 `\`、非 UTF-8,
+  斷掉或指出 root 的 symlink、FIFO/socket、讀不到的檔案)逐檔略過並計入「略過」,不讓整次複製失敗;
+  含 `.git` 的目錄(包括選到的資料夾本身)一律不走訪。
 - 桌面 App 在 monorepo 子資料夾選 Git 來源時,變更清單與複製範圍限制在該資料夾,並可逐檔勾選;CLI 與原本的 `collect_payload` 仍複製整個 Git 來源。這是桌面選取範圍的行為,不改剪貼簿格式。commit / 區間的 payload 路徑仍依 TS graphCopy 使用 repo 相對路徑。
 - Git 圖(`graph::compute_graph_layout`)預設照 SourceGit / TS 壓縮車道。`GraphConfig::hold_root_lanes` 是 Rust 才有的選項,只有原生工作台的多儲存庫合併 log(列 id 帶 `@<feed>`)會開:
   一條 rail 停在 root commit 後,它的車道空一列才讓右邊的 rail 往左移(保留的車道不會被相鄰的保留解除帶著左移),沒有入線的新節點也放在上一列所有車道的右邊。
