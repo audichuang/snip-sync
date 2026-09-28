@@ -72,30 +72,36 @@ pub(crate) fn path_under(path: &str, dir: &str) -> bool {
 }
 
 /// The changed files a Log row's "copy files" reads: the file, or every
-/// file under the directory. A deleted file has no content in its commit,
-/// a submodule commit is no file, and a directory of a truncated listing
-/// copies nothing rather than a silent subset.
+/// file under the directory, each with whether the commit deletes it (it
+/// goes out as `[DELETED]` with its pre-deletion content, like the TS
+/// graphCopy, so the paste side deletes it too). A submodule commit is no
+/// file, and a directory of a truncated listing copies nothing rather than
+/// a silent subset.
 pub(crate) fn commit_copy_paths<'a>(
 	files: &'a [(String, Option<snip_core::format::ChangeType>)],
 	gitlinks: &[String],
 	truncated: bool,
 	path: &str,
 	is_dir: bool,
-) -> Vec<&'a str> {
+) -> Vec<(&'a str, bool)> {
 	if is_dir && truncated {
 		return Vec::new();
 	}
 	files
 		.iter()
-		.filter(|(p, ct)| {
+		.filter(|(p, _)| {
 			(if is_dir {
 				path_under(p, path)
 			} else {
 				p == path
-			}) && *ct != Some(snip_core::format::ChangeType::Deleted)
-				&& !gitlinks.contains(p)
+			}) && !gitlinks.contains(p)
 		})
-		.map(|(p, _)| p.as_str())
+		.map(|(p, ct)| {
+			(
+				p.as_str(),
+				*ct == Some(snip_core::format::ChangeType::Deleted),
+			)
+		})
 		.collect()
 }
 
@@ -150,7 +156,8 @@ pub enum MenuAct {
 	CopyCommits(String),
 	/// Snip-sync copy of files as they are in a commit: (repository root,
 	/// commit, path).
-	CopyRevFiles(Vec<(PathBuf, String, String)>),
+	/// (root, rev, path, deleted by that rev)
+	CopyRevFiles(Vec<(PathBuf, String, String, bool)>),
 	/// The Project view's selection, as one snip-sync payload.
 	CopyProjectSelection,
 	CommitFileDiff(String),
@@ -488,7 +495,7 @@ impl WorkbenchModel {
 		} else {
 			vec![path]
 		};
-		let copy: Vec<(PathBuf, String, String)> = targets
+		let copy: Vec<(PathBuf, String, String, bool)> = targets
 			.into_iter()
 			.flat_map(|t| {
 				commit_copy_paths(
@@ -499,9 +506,9 @@ impl WorkbenchModel {
 					is_dir,
 				)
 			})
-			.filter_map(|p| {
+			.filter_map(|(p, deleted)| {
 				let (root, sha) = self.commit_file_rev(p)?;
-				Some((root, sha, p.to_string()))
+				Some((root, sha, p.to_string(), deleted))
 			})
 			.collect();
 		let mut v = vec![item(
@@ -748,11 +755,11 @@ impl WorkbenchModel {
 			MenuAct::CopyRevFiles(files) => {
 				let name = files
 					.first()
-					.map(|(root, _, _)| self.log_repo_name(root))
+					.map(|(root, ..)| self.log_repo_name(root))
 					.unwrap_or_default();
 				let items: Option<Vec<_>> = files
 					.into_iter()
-					.map(|(root, rev, path)| {
+					.map(|(root, rev, path, deleted)| {
 						Some(snip_core::transfer::ExportItem {
 							root: snip_core::transfer::CanonicalRootId::new(
 								&root,
@@ -760,7 +767,9 @@ impl WorkbenchModel {
 							.ok()?,
 							relative_path: path,
 							source: SourceKind::Commit { rev },
-							change_type: None,
+							change_type: deleted.then_some(
+								snip_core::format::ChangeType::Deleted,
+							),
 						})
 					})
 					.collect();
@@ -1446,7 +1455,7 @@ mod tests {
 	}
 
 	#[test]
-	fn commit_copy_skips_gitlinks_and_truncated_directories() {
+	fn commit_copy_keeps_deletions_skips_gitlinks_and_truncated_dirs() {
 		use snip_core::format::ChangeType::{Deleted, Modified};
 		let files: Vec<_> = [
 			("lib/a.rs", Modified),
@@ -1457,21 +1466,22 @@ mod tests {
 		.map(|(p, c)| (p.to_string(), Some(c)))
 		.into();
 		let links = ["lib/sub".to_string()];
+		// A deletion is copied too, marked so the paste deletes it.
 		assert_eq!(
 			commit_copy_paths(&files, &links, false, "lib", true),
-			["lib/a.rs"]
+			[("lib/a.rs", false), ("lib/gone.rs", true)]
 		);
 		assert!(commit_copy_paths(&files, &links, false, "lib/sub", false)
 			.is_empty());
 		assert_eq!(
 			commit_copy_paths(&files, &links, false, "other.rs", false),
-			["other.rs"]
+			[("other.rs", false)]
 		);
 		// A cut listing does not know every file under a directory.
 		assert!(commit_copy_paths(&files, &links, true, "lib", true).is_empty());
 		assert_eq!(
 			commit_copy_paths(&files, &links, true, "other.rs", false),
-			["other.rs"]
+			[("other.rs", false)]
 		);
 	}
 
