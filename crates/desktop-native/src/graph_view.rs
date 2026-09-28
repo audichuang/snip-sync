@@ -335,7 +335,15 @@ pub fn layout_page(
 	filtered: HashSet<String>,
 	shallow: HashSet<String>,
 ) -> Result<GraphLayout, String> {
-	let config = graph_config(filtered, shallow);
+	let config = GraphConfig {
+		// Row ids namespaced per repository: several unrelated histories
+		// share the lanes, so a root's lane stays empty for a row before
+		// another repository's rail may bend into it.
+		hold_root_lanes: commits
+			.first()
+			.is_some_and(|c| crate::multi_log::split_id(&c.sha).1.is_some()),
+		..graph_config(filtered, shallow)
+	};
 	let fallback = |config: &GraphConfig| {
 		fallback_linear_layout(commits, refs, head_sha, config)
 			.map_err(|e| format!("Graph layout error: {e}"))

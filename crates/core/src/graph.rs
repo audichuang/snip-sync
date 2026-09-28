@@ -381,6 +381,14 @@ pub struct GraphConfig {
 	/// revision filtering. Missing parents not in this set are treated as
 	/// [`ContinuationKind::UnresolvedPageBoundary`].
 	pub filtered_commits: HashSet<String>,
+	/// Keep the lane of a rail that ends on a root commit empty for one more
+	/// row before the rails to its right move left. Off (SourceGit) by
+	/// default. A log of several unrelated histories (one per repository)
+	/// turns it on: otherwise the next rail can bend into the lane and land
+	/// its commit directly under the other history's root, which reads as
+	/// a join. A held lane is not carried across a page's checkpoint.
+	#[serde(default)]
+	pub hold_root_lanes: bool,
 }
 
 impl Default for GraphConfig {
@@ -395,6 +403,7 @@ impl Default for GraphConfig {
 			offset_x: 10.0,
 			shallow_roots: HashSet::new(),
 			filtered_commits: HashSet::new(),
+			hold_root_lanes: false,
 		}
 	}
 }
@@ -534,6 +543,10 @@ impl GraphPath {
 // ── Internal PathHelper (SourceGit faithful) ──
 
 struct PathHelper {
+	/// A lane held empty for one row after its rail ended on a root
+	/// ([`GraphConfig::hold_root_lanes`]): it draws nothing and waits for
+	/// no commit.
+	held: bool,
 	next: String,
 	color: usize,
 	color_override: Option<String>,
@@ -553,6 +566,7 @@ impl PathHelper {
 		rail_id: usize,
 	) -> Self {
 		Self {
+			held: false,
 			next,
 			color,
 			color_override: None,
@@ -573,6 +587,7 @@ impl PathHelper {
 		rail_id: usize,
 	) -> Self {
 		Self {
+			held: false,
 			next,
 			color,
 			color_override: None,
@@ -591,6 +606,7 @@ impl PathHelper {
 	/// the previous page stopped instead of cutting across the boundary.
 	fn from_frontier(rail: &FrontierRail, page_top: f64) -> Self {
 		let mut helper = Self {
+			held: false,
 			next: rail.next_sha.clone(),
 			color: rail.color_index,
 			color_override: rail.color_override.clone(),
@@ -607,6 +623,22 @@ impl PathHelper {
 		helper.add_point(rail.last_x, page_top);
 		helper.last_y = helper.last_y.max(page_top);
 		helper
+	}
+
+	/// The lane `x` of a rail that just ended, held for the next row.
+	fn held_lane(x: f64, y: f64) -> Self {
+		Self {
+			held: true,
+			next: String::new(),
+			color: usize::MAX,
+			color_override: None,
+			highlighted: false,
+			rail_id: usize::MAX,
+			points: Vec::new(),
+			last_x: x,
+			last_y: y,
+			end_y: y,
+		}
 	}
 
 	fn add_point(&mut self, x: f64, y: f64) {
@@ -953,6 +985,10 @@ pub fn compute_graph_layout(
 			.first()
 			.filter(|p| !config.filtered_commits.contains(*p));
 
+		let prev_last_x: Option<f64> = unsolved
+			.last()
+			.map(|r| r.last_x)
+			.filter(|_| config.hold_root_lanes);
 		let max_offset_old = if let Some(last_rail) = unsolved.last() {
 			last_rail.last_x
 		} else {
@@ -976,6 +1012,12 @@ pub fn compute_graph_layout(
 		);
 
 		for (i, rail) in unsolved.iter_mut().enumerate() {
+			if rail.held {
+				// Keeps its own lane (rails only ever move left), so the
+				// rails right of it do not move into it on this row either.
+				offset_x = (offset_x + unit_w).max(rail.last_x);
+				continue;
+			}
 			let is_target = rail.next == commit.sha;
 			if is_target {
 				if major_idx.is_none() {
@@ -1013,14 +1055,23 @@ pub fn compute_graph_layout(
 			}
 		}
 
-		// Separate ended paths
-		if major_idx.is_some() {
+		// Separate ended paths; a held lane lasts one row.
+		if major_idx.is_some() || unsolved.iter().any(|r| r.held) {
 			let mut remaining = Vec::with_capacity(unsolved.len());
 			for (i, rail) in unsolved.into_iter().enumerate() {
+				if rail.held {
+					continue;
+				}
 				let was_major = major_idx == Some(i);
 				let matched_commit = rail.next == commit.sha;
 				if was_major {
 					if first_parent.is_none() {
+						if config.hold_root_lanes {
+							remaining.push(PathHelper::held_lane(
+								rail.last_x,
+								rail.last_y,
+							));
+						}
 						ended.push(rail);
 					} else {
 						remaining.push(rail);
@@ -1045,6 +1096,13 @@ pub fn compute_graph_layout(
 
 		// New branch head if commit had no incoming rail
 		if major_idx.is_none() {
+			if config.hold_root_lanes {
+				// Right of every lane the previous row used: a rail that
+				// moves left on this row must not seem to run into it.
+				if let Some(last) = prev_last_x {
+					offset_x = offset_x.max(last);
+				}
+			}
 			offset_x += unit_w;
 			major_x = Some(offset_x);
 			if let Some(parent) = first_parent {
@@ -1286,6 +1344,7 @@ pub fn compute_graph_layout(
 	let checkpoint_out = {
 		let frontier = unsolved
 			.iter()
+			.filter(|r| !r.held)
 			.map(|r| {
 				let lane = ((r.last_x - config.offset_x) / unit_w)
 					.round()
@@ -1324,7 +1383,7 @@ pub fn compute_graph_layout(
 
 	// Open rails run to the page's bottom edge, including one that starts on
 	// the last row (a single point there would draw nothing below its node).
-	for mut rail in unsolved {
+	for mut rail in unsolved.into_iter().filter(|r| !r.held) {
 		rail.end(rail.last_x, end_y + half_h, half_h);
 		completed_paths.push(rail.to_graph_path());
 	}
@@ -3071,5 +3130,87 @@ mod tests {
 			assert_eq!(kinds(rows), kinds(solo.rows.iter().collect()));
 		}
 		assert!(verify_graph_invariants(&layout, &merged).is_ok());
+	}
+
+	/// Several histories in one log: when one ends on a root, its lane stays
+	/// empty for the next row, so no rail bends in beside the root and no
+	/// commit lands directly under it. Rails still reach exactly their
+	/// parents at every page split, and a single history is unaffected.
+	#[test]
+	fn held_root_lane_keeps_rails_straight_for_a_row() {
+		// a1 (repo 0) is a root in the middle; repo 1 goes on below it.
+		let merged = vec![
+			make_commit("a2@0", &["a1@0"]),
+			make_commit("b3@1", &["b2@1"]),
+			make_commit("a1@0", &[]),
+			make_commit("b2@1", &["b1@1"]),
+			make_commit("c1@2", &[]),
+			make_commit("b1@1", &[]),
+		];
+		let held = GraphConfig {
+			hold_root_lanes: true,
+			..geometry_config()
+		};
+		let want = true_parents(&merged);
+		for page in 1..=merged.len() {
+			assert_eq!(drawn_parents(&merged, page, &held), want, "{page}");
+		}
+		let lanes = |config: &GraphConfig| -> Vec<usize> {
+			compute_graph_layout(&merged, &[], None, config, None)
+				.unwrap()
+				.rows
+				.iter()
+				.map(|r| r.node.lane)
+				.collect()
+		};
+		// SourceGit: b2 moves into a1's lane on the very next row.
+		assert_eq!(lanes(&geometry_config()), [0, 1, 0, 0, 1, 0]);
+		// Held: b2 keeps its lane; the lane frees a row later. The root c1
+		// with no rail above it lands right of the lane repo 1's rail
+		// leaves on that row, not in it.
+		assert_eq!(lanes(&held), [0, 1, 0, 1, 2, 0]);
+		// Repo 1's rail is straight from a1's row to b2's row.
+		let layout =
+			compute_graph_layout(&merged, &[], None, &held, None).unwrap();
+		let unit = held.unit_y;
+		let rail = layout.rows[3].node.rail_id.unwrap();
+		let path = layout.paths.iter().find(|p| p.rail_id == rail).unwrap();
+		let xs: Vec<f64> = path
+			.clip_y(2.5 * unit, 3.5 * unit)
+			.iter()
+			.map(|p| p.x)
+			.collect();
+		assert!(xs.len() >= 2 && xs.iter().all(|&x| x == xs[0]), "{xs:?}");
+		assert!(verify_graph_invariants(&layout, &merged).is_ok());
+		// Roots on two rows in a row: the second root's lane is held too,
+		// though the first hold ends there and frees a lane left of it.
+		let cascade = vec![
+			make_commit("a2@0", &["a1@0"]),
+			make_commit("b2@1", &["b1@1"]),
+			make_commit("c3@2", &["c2@2"]),
+			make_commit("a1@0", &[]),
+			make_commit("b1@1", &[]),
+			make_commit("c2@2", &["c1@2"]),
+			make_commit("c1@2", &[]),
+		];
+		let lanes = |config: &GraphConfig| -> Vec<usize> {
+			compute_graph_layout(&cascade, &[], None, config, None)
+				.unwrap()
+				.rows
+				.iter()
+				.map(|r| r.node.lane)
+				.collect()
+		};
+		assert_eq!(lanes(&held), [0, 1, 2, 0, 1, 2, 0]);
+		let want = true_parents(&cascade);
+		for page in 1..=cascade.len() {
+			assert_eq!(drawn_parents(&cascade, page, &held), want, "{page}");
+		}
+		// A held lane is not part of the checkpoint.
+		let top =
+			compute_graph_layout(&merged[..3], &[], None, &held, None).unwrap();
+		let frontier = top.checkpoint.unwrap().frontier;
+		assert_eq!(frontier.len(), 1);
+		assert_eq!(frontier[0].next_sha, "b2@1");
 	}
 }

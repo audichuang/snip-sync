@@ -5504,3 +5504,206 @@ fn log_multiselect(theme: &str) {
 
 	quit_cleanly(&mut app, &wid);
 }
+
+/// The merged log's graph over four repositories with branches, merges,
+/// root commits and a clone sharing SHAs, interleaved by date. Every
+/// commit's row sits above its parents' rows in its own repository (the
+/// order `git log --graph --topo-order` draws), and the picture is kept
+/// as `merged-graph.png` for review.
+#[test]
+fn native_merged_graph_over_four_repositories() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	let at = |day: u32| format!("2026-02-{day:02}T10:00:00+00:00");
+	let run = |repo: &Path, day: u32, args: &[&str]| {
+		let out = Command::new("git")
+			.current_dir(repo)
+			.args(args)
+			.env("GIT_AUTHOR_DATE", at(day))
+			.env("GIT_COMMITTER_DATE", at(day))
+			.output()
+			.unwrap();
+		assert!(
+			out.status.success(),
+			"git {args:?}: {}",
+			String::from_utf8_lossy(&out.stderr)
+		);
+	};
+	let commit = |repo: &Path, day: u32, msg: &str| {
+		fs::write(repo.join(format!("{msg}.txt")), format!("{msg}\n")).unwrap();
+		run(repo, day, &["add", "."]);
+		run(repo, day, &["commit", "-qm", msg]);
+	};
+	let init = |name: &str| {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "g@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Graph"]);
+		repo
+	};
+	// alpha: a feature branch merged back with --no-ff.
+	let alpha = init("alpha");
+	commit(&alpha, 1, "a1");
+	commit(&alpha, 3, "a2");
+	git_ok(&alpha, &["checkout", "-q", "-b", "feat"]);
+	commit(&alpha, 8, "af2");
+	git_ok(&alpha, &["checkout", "-q", "main"]);
+	commit(&alpha, 6, "a3");
+	run(&alpha, 9, &["merge", "-q", "--no-ff", "-m", "am", "feat"]);
+	commit(&alpha, 11, "a4");
+	// delta: a clone of alpha's first two commits (same SHAs), then its own.
+	let delta = ws.path().join("delta");
+	let st = Command::new("git")
+		.args(["clone", "-q", "--no-local"])
+		.arg(&alpha)
+		.arg(&delta)
+		.status()
+		.unwrap();
+	assert!(st.success());
+	git_ok(&delta, &["config", "user.email", "g@example.com"]);
+	git_ok(&delta, &["config", "user.name", "Graph"]);
+	git_ok(&delta, &["reset", "-q", "--hard", "HEAD~3"]);
+	git_ok(&delta, &["remote", "remove", "origin"]);
+	commit(&delta, 10, "d2");
+	// beta: the newest commit of all, and a root in the middle: its lane
+	// ends while every other repository goes on below it.
+	let beta = init("beta");
+	commit(&beta, 2, "b1");
+	commit(&beta, 12, "b3");
+	// gamma: an unmerged topic branch and an orphan second root.
+	let gamma = init("gamma");
+	commit(&gamma, 2, "c1");
+	git_ok(&gamma, &["checkout", "-q", "-b", "topic"]);
+	commit(&gamma, 8, "ct1");
+	git_ok(&gamma, &["checkout", "-q", "main"]);
+	git_ok(&gamma, &["checkout", "-q", "--orphan", "pages"]);
+	git_ok(&gamma, &["rm", "-rfq", "."]);
+	commit(&gamma, 5, "cp1");
+	git_ok(&gamma, &["checkout", "-q", "main"]);
+	commit(&gamma, 10, "c3");
+
+	let rows = |repo: &Path| -> Vec<(String, Vec<String>)> {
+		let out = Command::new("git")
+			.current_dir(repo)
+			.args(["rev-list", "--parents", "--all"])
+			.output()
+			.unwrap();
+		String::from_utf8(out.stdout)
+			.unwrap()
+			.lines()
+			.map(|l| {
+				let mut it = l.split(' ').map(str::to_string);
+				(it.next().unwrap(), it.collect())
+			})
+			.collect()
+	};
+	let repos = [
+		("alpha", alpha.clone()),
+		("beta", beta.clone()),
+		("delta", delta.clone()),
+		("gamma", gamma.clone()),
+	];
+	let total: usize = repos.iter().map(|(_, r)| rows(r).len()).sum();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 4]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		&format!("[APP:MULTI_LOG_LOADED: repos=4 rows={total}]"),
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for args in [
+		vec!["windowmove", "--sync", &wid, "0", "0"],
+		vec!["windowsize", "--sync", &wid, "1280", "900"],
+	] {
+		assert!(Command::new("xdotool")
+			.args(args)
+			.status()
+			.unwrap()
+			.success());
+	}
+	let rx = &app.rx;
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	// Every row on screen: the log takes most of the window.
+	{
+		let v = *settled().get("splitter-bottom").expect("splitter");
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+		]);
+		xdo(&["mousedown", "1"]);
+		for step in 1..=6 {
+			let y = (y - 60 * step).to_string();
+			xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+			std::thread::sleep(Duration::from_millis(30));
+		}
+		xdo(&["mouseup", "1"]);
+		lines_until(rx, "[APP:SPLIT_RESIZED: Bottom", Duration::from_secs(8))
+			.unwrap();
+	}
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join("merged-graph.png");
+	std::thread::sleep(Duration::from_millis(300));
+	capture_window(&wid, &shot);
+	println!("[TEST DRIVER] merged graph screenshot: {}", shot.display());
+
+	// Each repository's commits sit above their parents.
+	let snap = settled();
+	for (name, repo) in &repos {
+		let y = |sha: &str| {
+			let id = format!("commit-row:{name}:{}", &sha[..7]);
+			snap.get(&id).unwrap_or_else(|| panic!("{id} not drawn"))[1]
+		};
+		for (sha, parents) in rows(repo) {
+			for p in parents {
+				assert!(y(&sha) < y(&p), "{name}: {sha} must sit above {p}");
+			}
+		}
+	}
+
+	quit_cleanly(&mut app, &wid);
+}
