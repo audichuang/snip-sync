@@ -30,8 +30,9 @@ pub struct Chrome {
 	pub speed: String,
 	/// Collapsed Changes groups (`change-header:<id>`) per repo root.
 	pub collapsed_groups: Vec<(PathBuf, &'static str)>,
-	/// Collapsed repository nodes of the Changes tool window.
-	pub collapsed_repos: Vec<PathBuf>,
+	/// Expanded repository nodes of the Changes tool window: all start
+	/// collapsed, and opening a repo expands its node.
+	pub expanded_repos: Vec<PathBuf>,
 	pub left_scroll: UniformListScrollHandle,
 }
 
@@ -42,7 +43,7 @@ impl Chrome {
 			menu_focus: cx.focus_handle(),
 			speed: String::new(),
 			collapsed_groups: Vec::new(),
-			collapsed_repos: Vec::new(),
+			expanded_repos: Vec::new(),
 			left_scroll: UniformListScrollHandle::new(),
 		}
 	}
@@ -700,7 +701,7 @@ impl WorkbenchModel {
 	pub(crate) fn repo_changes_collapsed(&self, slot: usize) -> bool {
 		self.change_repos
 			.get(slot)
-			.is_some_and(|s| self.chrome.collapsed_repos.contains(&s.root))
+			.is_some_and(|s| !self.chrome.expanded_repos.contains(&s.root))
 	}
 
 	pub(crate) fn toggle_group_collapsed(
@@ -736,13 +737,13 @@ impl WorkbenchModel {
 			return;
 		};
 		let (root, name) = (s.root.clone(), s.name.clone());
-		let c = &mut self.chrome.collapsed_repos;
+		let c = &mut self.chrome.expanded_repos;
 		let collapsed = if let Some(i) = c.iter().position(|r| *r == root) {
 			c.remove(i);
-			false
+			true
 		} else {
 			c.push(root);
-			true
+			false
 		};
 		app_log!("[APP:REPO_CHANGES_COLLAPSED: {name} collapsed={collapsed}]");
 		cx.notify();

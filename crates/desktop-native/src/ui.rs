@@ -900,10 +900,16 @@ pub(crate) fn change_rows(
 	files: &[crate::FileChangeItem],
 	repo_collapsed: impl Fn(usize) -> bool,
 	group_collapsed: impl Fn(usize, &str) -> bool,
+	repo_query: &str,
 ) -> Vec<ChangeItemRow> {
 	let grouped = slots.len() > 1;
+	let query = repo_query.to_lowercase();
 	let mut rows = Vec::new();
 	for (slot, repo) in slots.iter().enumerate() {
+		// Speed search over several repos filters the repo nodes by name.
+		if grouped && !repo.name.to_lowercase().contains(&query) {
+			continue;
+		}
 		let range = crate::slot_range(files, slot);
 		let failed = matches!(repo.state, crate::ChangeRepoState::Failed(_));
 		let note = failed || repo.truncated(range.len());
@@ -1090,6 +1096,7 @@ impl WorkbenchModel {
 			&self.files,
 			|slot| self.repo_changes_collapsed(slot),
 			|slot, group| self.group_collapsed(slot, group),
+			&self.chrome.speed,
 		)
 	}
 
@@ -2789,7 +2796,7 @@ impl WorkbenchModel {
 					.child(
 						fill_text(branch)
 							.text_size(px(SMALL_TEXT))
-							.text_color(rgb(pal().text_muted)),
+							.text_color(rgb(pal().ref_local)),
 					)
 					.child(counts)
 					.children(probe(log, id))
@@ -3258,7 +3265,7 @@ impl WorkbenchModel {
 					.ml(px(6.))
 					.text_size(px(SMALL_TEXT))
 					.text_color(rgb(pal().text_muted))
-					.child(tf("n_files", loc, &[count])),
+					.child(count.to_string()),
 			)
 			.children(probe(log, id))
 			.children(old_id.and_then(|id| probe(log, id)))
@@ -3297,7 +3304,6 @@ impl WorkbenchModel {
 		row_idx: usize,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
-		let loc = self.locale;
 		let log = &self.probes;
 		let Some(repo) = self.change_repos.get(slot) else {
 			return div().into_any_element();
@@ -3392,7 +3398,7 @@ impl WorkbenchModel {
 				14.,
 			)))
 			.child(
-				clip_text(name)
+				self.speed_label(name)
 					.ml(px(4.))
 					.flex_shrink_0()
 					.max_w(gpui::relative(0.6))
@@ -3404,16 +3410,17 @@ impl WorkbenchModel {
 						.ml(px(6.))
 						.flex_shrink()
 						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().text_muted)),
+						.text_color(rgb(pal().ref_local)),
 				)
 			})
 			.child(
 				div()
 					.flex_shrink_0()
-					.ml(px(6.))
+					.ml_auto()
+					.pl(px(6.))
 					.text_size(px(SMALL_TEXT))
 					.text_color(rgb(pal().text_muted))
-					.child(tf("n_files", loc, &[count])),
+					.child(count.to_string()),
 			)
 			.children(probe(log, id))
 			.into_any_element()

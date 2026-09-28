@@ -2928,6 +2928,10 @@ impl WorkbenchModel {
 	pub fn select_repo(&mut self, idx: usize, cx: &mut Context<Self>) {
 		if let Some(entry) = self.repos.get(idx) {
 			self.pinned_repo = Some(repo_key(entry));
+			// Opening a repo reveals its changes; the others stay collapsed.
+			if !self.chrome.expanded_repos.contains(&entry.root) {
+				self.chrome.expanded_repos.push(entry.root.clone());
+			}
 		}
 		self.select_repo_internal(idx, false, cx);
 	}
@@ -6270,7 +6274,7 @@ mod tests {
 		assert_eq!(files[1].path, "z");
 
 		// Clean `c` is not listed; each repo node counts only its rows.
-		let got = ui::change_rows(&slots, &files, |_| false, |_, _| false);
+		let got = ui::change_rows(&slots, &files, |_| false, |_, _| false, "");
 		assert!(matches!(
 			got[0],
 			ui::ChangeItemRow::Repo { slot: 0, count: 1 }
@@ -6299,11 +6303,22 @@ mod tests {
 		));
 		assert_eq!(got.len(), 6);
 
+		// Typing filters the repo nodes by name, ignoring case.
+		let q = slots[1].name.to_uppercase();
+		let got = ui::change_rows(&slots, &files, |_| false, |_, _| false, &q);
+		assert!(!got.is_empty());
+		assert!(got.iter().all(|r| match r {
+			ui::ChangeItemRow::Repo { slot, .. }
+			| ui::ChangeItemRow::Header { slot, .. }
+			| ui::ChangeItemRow::Note { slot } => *slot == 1,
+			ui::ChangeItemRow::File { file_idx } => files[*file_idx].repo == 1,
+		}));
+
 		// A failed read keeps its node with an error row; a collapsed node
 		// hides its rows; a truncated list says so.
 		slots[2].state = ChangeRepoState::Failed("boom".into());
 		slots[1].total = MAX_CHANGES_PER_REPO + 1;
-		let got = ui::change_rows(&slots, &files, |s| s == 0, |_, _| false);
+		let got = ui::change_rows(&slots, &files, |s| s == 0, |_, _| false, "");
 		assert!(matches!(got[0], ui::ChangeItemRow::Repo { slot: 0, .. }));
 		assert!(matches!(got[1], ui::ChangeItemRow::Repo { slot: 1, .. }));
 		assert!(matches!(got[2], ui::ChangeItemRow::Note { slot: 1 }));
@@ -6320,7 +6335,7 @@ mod tests {
 		slot_remove(&mut slots, &mut files, 1);
 		// One repo: its groups are the top level, as before.
 		slots[0].total = 1;
-		let got = ui::change_rows(&slots, &files, |_| false, |_, _| false);
+		let got = ui::change_rows(&slots, &files, |_| false, |_, _| false, "");
 		assert!(matches!(got[0], ui::ChangeItemRow::Header { slot: 0, .. }));
 		assert_eq!(got.len(), 2);
 	}

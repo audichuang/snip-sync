@@ -4612,9 +4612,15 @@ fn native_changes_group_all_repos() {
 		assert!(st.success());
 	};
 
-	// Both repos with changes are nodes; the clean one is not listed.
+	// Both repos with changes are nodes; the clean one is not listed. Repo
+	// nodes start collapsed (IntelliJ-style overview of many repos).
 	control("change-repo:alpha");
 	control("change-repo:beta");
+	absent("change-row@beta:unstaged:shared.txt");
+	click("change-repo:alpha");
+	wait("[APP:REPO_CHANGES_COLLAPSED: alpha collapsed=false]");
+	click("change-repo:beta");
+	wait("[APP:REPO_CHANGES_COLLAPSED: beta collapsed=false]");
 	control("change-row@alpha:staged:staged.txt");
 	control("change-row@beta:unstaged:shared.txt");
 	control("change-row@beta:untracked:newdir/one.txt");

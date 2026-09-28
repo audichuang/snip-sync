@@ -2816,6 +2816,13 @@ fn spawn_two(fx: &TwoRepos, tree_hold: Option<&Path>) -> (App, String) {
 		Duration::from_secs(12),
 	);
 	wait_git_idle(app.pid, &app.starttime);
+	// Changes starts with every repo node collapsed; the tests work in `a`.
+	click(&wid, "change-repo:a");
+	lines_until(
+		&app.rx,
+		"[APP:REPO_CHANGES_COLLAPSED: a collapsed=false]",
+		Duration::from_secs(4),
+	);
 	(app, wid)
 }
 
