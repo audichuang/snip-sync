@@ -203,6 +203,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_loading_more" => "正在載入更多 commit…",
 			"log_dir_files" => "{} 個檔案",
 			"log_details_empty" => "選取 commit 以檢視詳細資料",
+			"log_selection_header" => "已選取 {} 個 commit",
+			"status_selection_truncated" => "已選取 {} 個 commit，只列出前 {} 個的變更檔案",
 			"log_details_on" => "於 {}",
 			"log_details_committed" => "由 {} 提交於 {}",
 			"log_details_in_branches" => "包含於 {} 個分支：{}",
@@ -525,6 +527,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_loading_more" => "Loading more commits…",
 			"log_dir_files" => "{} files",
 			"log_details_empty" => "Select a commit to see its details",
+			"log_selection_header" => "{} commits selected",
+			"status_selection_truncated" => "{} commits selected; listing the changed files of the first {}",
 			"log_details_on" => "on {}",
 			"log_details_committed" => "committed by {} on {}",
 			"log_details_in_branches" => "In {} branches: {}",
@@ -845,6 +849,8 @@ mod tests {
 			"status_log_cross_repo",
 			"status_log_tree_other_repo",
 			"status_log_merged_cap",
+			"log_selection_header",
+			"status_selection_truncated",
 		];
 		for key in test_keys {
 			assert!(

@@ -19,6 +19,9 @@ use snip_core::gitrun::RunOptions;
 use snip_core::gitsrc::{self, Git, GitSource};
 use snip_core::graph::{GraphCheckpoint, GraphLayout, MAX_SHA_LEN};
 
+/// Most commits of one multi-selection whose changed files are listed
+/// (one listing each).
+pub const MAX_SELECTION_READS: usize = 100;
 /// Files listed for one commit or compare; more are counted, not kept.
 pub const MAX_COMMIT_FILES: usize = 5_000;
 /// Rows shown in the commit tree at once.
@@ -284,56 +287,6 @@ fn read_user_email(git: &Git, opts: &RunOptions) -> Option<String> {
 		.ok()?;
 	let email = String::from_utf8_lossy(&out.stdout).trim().to_string();
 	(!email.is_empty() && email.len() <= MAX_USER_EMAIL).then_some(email)
-}
-
-/// One row of the details pane's changed-files tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ChangedRow {
-	/// A directory (full repository-relative path) and its file count.
-	Dir {
-		path: String,
-		files: usize,
-		expanded: bool,
-	},
-	/// Index into the commit's file list; `nested` under a directory row.
-	File { idx: usize, nested: bool },
-}
-
-/// IntelliJ's "group by directory": one row per directory holding changed
-/// files, its files under it; files at the root come last.
-pub fn changed_file_rows(
-	files: &[(String, Option<snip_core::format::ChangeType>)],
-	collapsed: &[String],
-) -> Vec<ChangedRow> {
-	let mut dirs: std::collections::BTreeMap<&str, Vec<usize>> =
-		Default::default();
-	let mut root = Vec::new();
-	for (idx, (path, _)) in files.iter().enumerate() {
-		match path.rsplit_once('/') {
-			Some((dir, _)) => dirs.entry(dir).or_default().push(idx),
-			None => root.push(idx),
-		}
-	}
-	let mut out = Vec::with_capacity(files.len() + dirs.len());
-	for (dir, idxs) in dirs {
-		let expanded = !collapsed.iter().any(|c| c == dir);
-		out.push(ChangedRow::Dir {
-			path: dir.to_string(),
-			files: idxs.len(),
-			expanded,
-		});
-		if expanded {
-			out.extend(
-				idxs.into_iter()
-					.map(|idx| ChangedRow::File { idx, nested: true }),
-			);
-		}
-	}
-	out.extend(
-		root.into_iter()
-			.map(|idx| ChangedRow::File { idx, nested: false }),
-	);
-	out
 }
 
 /// Lazily listed tree of one commit (no checkout).
@@ -1606,13 +1559,15 @@ impl WorkbenchModel {
 			return;
 		}
 		if let Some(anchor) = self.selected_commit.clone() {
-			if self.commits.iter().any(|c| c.sha == anchor) {
-				self.select_commit(&anchor, cx);
-			} else if self.select_head_after_load {
+			if self.reselect_after_load(&anchor, cx) {
+				return;
+			}
+			if self.select_head_after_load {
 				self.select_head_after_load = false;
 				self.focus_head(cx);
 			} else {
 				self.selected_commit = None;
+				self.log_selected.clear();
 				self.commit_details = None;
 			}
 		} else if self.select_head_after_load {
@@ -2067,6 +2022,7 @@ impl WorkbenchModel {
 		let task_generation = self.preview_generation;
 		self.selected_commit = Some(Box::<str>::from(sha).into_string());
 		self.range_head = None;
+		self.log_selected.clear();
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_commit_file = None;
@@ -2079,6 +2035,10 @@ impl WorkbenchModel {
 			return;
 		};
 		self.log_commit_root = Some(root.clone());
+		app_log!(
+			"[APP:LOG_SELECTION: n=1 repo={}]",
+			self.log_repo_name(&root)
+		);
 		app_log!("[APP:COMMIT_SELECTED: {}]", &sha[..7.min(sha.len())]);
 		let parents = self.known_parents(&id);
 		self.load_commit_details(root.clone(), sha.clone(), id, cx);
@@ -2163,9 +2123,216 @@ impl WorkbenchModel {
 		}
 		self.range_head = (self.selected_commit.as_deref() != Some(sha))
 			.then(|| Box::<str>::from(sha).into_string());
-		let n = self.range_ids().len().max(1);
-		app_log!("[APP:RANGE: commits={}]", n);
+		let ids = self.range_ids();
+		app_log!("[APP:RANGE: commits={}]", ids.len().max(1));
+		if ids.len() > 1 {
+			self.log_selected = ids;
+			self.load_selection(cx);
+		} else if let Some(anchor) = self.selected_commit.clone() {
+			// Back to the anchor alone.
+			if !self.log_selected.is_empty() {
+				self.select_commit(&anchor, cx);
+			}
+		}
 		cx.notify();
+	}
+
+	/// Cmd-click (macOS) / Ctrl-click: toggles one commit in or out of the
+	/// selection, which may then have gaps. Another repository's commit is
+	/// refused, like a shift range across repositories.
+	pub fn toggle_commit(&mut self, sha: &str, cx: &mut Context<Self>) {
+		if sha.len() > MAX_SHA_LEN {
+			self.report_graph_error(GraphAdmissionError::Budget);
+			cx.notify();
+			return;
+		}
+		let Some(anchor) = self.selected_commit.clone() else {
+			self.select_commit(sha, cx);
+			return;
+		};
+		let current = if self.log_selected.is_empty() {
+			vec![anchor.clone()]
+		} else {
+			self.log_selected.clone()
+		};
+		let toggled = {
+			let rows = self.display_commits();
+			let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
+			toggle_selection(&ids, &current, sha)
+		};
+		let next = match toggled {
+			Ok(next) => next,
+			Err(_) => {
+				app_log!("[APP:RANGE_REFUSED: cross_repo]");
+				self.set_status("status_log_cross_repo", []);
+				cx.notify();
+				return;
+			}
+		};
+		match next.len() {
+			0 => {
+				// The last selected commit toggled off: nothing selected.
+				self.preview_generation += 1;
+				self.details_generation =
+					self.details_generation.wrapping_add(1);
+				self.selected_commit = None;
+				self.range_head = None;
+				self.log_selected.clear();
+				self.commit_details = None;
+				self.commit_files.clear();
+				self.selected_commit_file = None;
+				self.preview_loading = false;
+				app_log!("[APP:LOG_SELECTION: n=0 repo=-]");
+			}
+			1 => self.select_commit(&next[0], cx),
+			_ => {
+				// The clicked commit leads when it joins; otherwise the
+				// anchor stays unless it just left.
+				let lead = if next.iter().any(|s| s == sha) {
+					sha.to_string()
+				} else if next.contains(&anchor) {
+					anchor
+				} else {
+					next[0].clone()
+				};
+				self.selected_commit = Some(lead);
+				self.range_head = None;
+				self.log_selected = next;
+				self.load_selection(cx);
+			}
+		}
+		cx.notify();
+	}
+
+	/// After the log was read again: a multi-selection whose commits are
+	/// all still loaded stays, else the anchor alone is selected again.
+	/// False when the anchor is gone too.
+	fn reselect_after_load(
+		&mut self,
+		anchor: &str,
+		cx: &mut Context<Self>,
+	) -> bool {
+		let loaded = |id: &str| self.commits.iter().any(|c| c.sha == id);
+		if self.log_selected.len() > 1
+			&& self.log_selected.iter().all(|id| loaded(id))
+		{
+			self.load_selection(cx);
+			true
+		} else if loaded(anchor) {
+			self.select_commit(anchor, cx);
+			true
+		} else {
+			false
+		}
+	}
+
+	/// The details of a multi-selection: the union of its commits' changed
+	/// files (the newest change per path), read in one cancellable job of
+	/// at most `MAX_SELECTION_READS` listings, then the first file's diff.
+	pub fn load_selection(&mut self, cx: &mut Context<Self>) {
+		self.preview_generation += 1;
+		let task_generation = self.preview_generation;
+		self.details_generation = self.details_generation.wrapping_add(1);
+		self.commit_details = None;
+		self.compare = None;
+		self.selected_file = None;
+		self.selected_commit_file = None;
+		self.commit_files.clear();
+		self.commit_file_origin.clear();
+		self.clear_preview();
+		self.preview_loading = true;
+		self.preview_error = None;
+		let Some((root, _)) = self
+			.log_selected
+			.first()
+			.and_then(|id| self.log_root_for(id))
+		else {
+			return;
+		};
+		self.log_commit_root = Some(root.clone());
+		let n = self.log_selected.len();
+		app_log!(
+			"[APP:LOG_SELECTION: n={n} repo={}]",
+			self.log_repo_name(&root)
+		);
+		if n > MAX_SELECTION_READS {
+			self.set_status(
+				"status_selection_truncated",
+				[n.to_string(), MAX_SELECTION_READS.to_string()],
+			);
+		}
+		let shas: Vec<String> = self
+			.log_selected
+			.iter()
+			.take(MAX_SELECTION_READS)
+			.map(|id| multi_log::split_id(id).0.to_string())
+			.collect();
+		if !self.accepting_work() {
+			return;
+		}
+		let cancel = arm_cancel(&mut self.preview_cancel);
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel.clone()),
+			async move {
+				let res = bg
+					.spawn(async move {
+						let listing = crate::interactive_read_opts(cancel);
+						let git = Git::at_known_root(root);
+						let mut lists = Vec::with_capacity(shas.len());
+						for sha in shas {
+							lists.push(
+								gitsrc::list_changed_paths_with(
+									&git,
+									&GitSource::Commit(sha),
+									&listing,
+								)
+								.map_err(|e| e.to_string())?,
+							);
+						}
+						Ok::<_, String>(union_changed_files(lists))
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.preview_generation != task_generation {
+						return;
+					}
+					match res {
+						Ok((files, origin, total)) => {
+							app_log!("[APP:E2E_CHANGES: files={}]", total);
+							if total > MAX_COMMIT_FILES {
+								model.set_status(
+									"status_commit_files_truncated",
+									[
+										total.to_string(),
+										MAX_COMMIT_FILES.to_string(),
+									],
+								);
+							}
+							let first = files.first().map(|(p, _)| p.clone());
+							model.commit_files = files;
+							model.commit_file_origin = origin;
+							match first {
+								Some(path) => {
+									model.select_commit_file(&path, cx)
+								}
+								None => model.show_preview_error(Msg::new(
+									"status_no_changes",
+									[],
+								)),
+							}
+						}
+						Err(e) => model
+							.show_preview_error(Msg::new("error_history", [e])),
+					}
+					cx.notify();
+				});
+			},
+		);
 	}
 
 	/// Display rows spanned by the selected range, (top, bottom).
@@ -2183,16 +2350,20 @@ impl WorkbenchModel {
 	/// Row ids the range selects: the rows between its ends that belong to
 	/// the anchor's repository (the merged log interleaves others).
 	pub fn range_ids(&self) -> Vec<String> {
-		let (Some((a, b)), Some(anchor)) =
-			(self.range_rows(), self.selected_commit.as_deref())
+		let (Some(anchor), Some(head)) =
+			(self.selected_commit.as_deref(), self.range_head.as_deref())
 		else {
 			return Vec::new();
 		};
-		self.display_commits()[a..=b]
-			.iter()
-			.filter(|c| same_repo(&c.sha, anchor))
-			.map(|c| c.sha.clone())
-			.collect()
+		let rows = self.display_commits();
+		let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
+		range_between(&ids, anchor, head)
+	}
+
+	/// The row is part of the log's selection.
+	pub fn log_is_selected(&self, id: &str) -> bool {
+		self.selected_commit.as_deref() == Some(id)
+			|| self.log_selected.iter().any(|s| s == id)
 	}
 
 	/// Endpoint diff between the two ends of the range (older → newer).
@@ -2314,6 +2485,7 @@ impl WorkbenchModel {
 								);
 							}
 							model.commit_files = files;
+							model.commit_file_origin.clear();
 							match first {
 								Some((path, p)) => {
 									model.selected_commit_file =
@@ -2360,6 +2532,12 @@ impl WorkbenchModel {
 					self.log_commit_root.clone(),
 					None,
 				),
+				(None, _) if self.log_selected.len() > 1 => {
+					match self.selection_file_source(path) {
+						Some(s) => s,
+						None => return,
+					}
+				}
 				(None, Some(id)) => {
 					let Some((root, sha)) = self.log_root_for(id) else {
 						return;
@@ -2429,6 +2607,47 @@ impl WorkbenchModel {
 				});
 			},
 		);
+	}
+
+	/// A multi-selection's diff of `path`: the oldest selected commit's
+	/// parent against the newest selected commit. A root commit has no
+	/// parent to diff from, so then it is the file's diff in the newest
+	/// selected commit that touched it.
+	#[allow(clippy::type_complexity)]
+	fn selection_file_source(
+		&self,
+		path: &str,
+	) -> Option<(
+		GitSource,
+		PreviewSource,
+		Option<std::path::PathBuf>,
+		Option<Vec<String>>,
+	)> {
+		let newest = self.log_selected.first()?;
+		let oldest = self.log_selected.last()?;
+		let (root, to) = self.log_root_for(newest)?;
+		if let Some(from) = self
+			.known_parents(oldest)
+			.and_then(|p| p.into_iter().next())
+		{
+			return Some((
+				GitSource::Range(from.clone(), to.clone()),
+				PreviewSource::Compare { from, to },
+				Some(root),
+				None,
+			));
+		}
+		let idx = self.commit_files.iter().position(|(p, _)| p == path)?;
+		let id = self
+			.log_selected
+			.get(*self.commit_file_origin.get(idx)? as usize)?;
+		let (_, sha) = self.log_root_for(id)?;
+		Some((
+			GitSource::Commit(sha.clone()),
+			PreviewSource::CommitDiff { sha },
+			Some(root),
+			self.known_parents(id),
+		))
 	}
 
 	/// Keyboard move in the log; `extend` grows the range instead.
@@ -2698,6 +2917,69 @@ pub fn same_repo(a: &str, b: &str) -> bool {
 	multi_log::split_id(a).1 == multi_log::split_id(b).1
 }
 
+/// Shift range: the rows from `anchor` to `head` (display order, both
+/// included) that belong to the anchor's repository.
+pub fn range_between(rows: &[&str], anchor: &str, head: &str) -> Vec<String> {
+	let pos = |id: &str| rows.iter().position(|r| *r == id);
+	let (Some(a), Some(b)) = (pos(anchor), pos(head)) else {
+		return Vec::new();
+	};
+	rows[a.min(b)..=a.max(b)]
+		.iter()
+		.filter(|r| same_repo(r, anchor))
+		.map(|r| r.to_string())
+		.collect()
+}
+
+/// Cmd/Ctrl-click: `selection` with `id` toggled in or out, in display
+/// order. A selection stays in one repository, so an id of another one
+/// is refused.
+pub fn toggle_selection(
+	rows: &[&str],
+	selection: &[String],
+	id: &str,
+) -> Result<Vec<String>, &'static str> {
+	if selection.iter().any(|s| !same_repo(s, id)) {
+		return Err("cross_repo");
+	}
+	let mut out: Vec<String> =
+		selection.iter().filter(|s| *s != id).cloned().collect();
+	if out.len() == selection.len() {
+		out.push(id.to_string());
+	}
+	let order: HashMap<&str, usize> =
+		rows.iter().enumerate().map(|(i, r)| (*r, i)).collect();
+	out.sort_by_key(|s| order.get(s.as_str()).copied().unwrap_or(usize::MAX));
+	Ok(out)
+}
+
+/// A commit's changed paths and their change types.
+pub type ChangedFiles = Vec<(String, Option<snip_core::format::ChangeType>)>;
+
+/// Changed files of several commits (newest first) as one list, like
+/// IntelliJ's multi-commit selection: each path once, with the change of
+/// the newest commit touching it and that commit's index. At most
+/// `MAX_COMMIT_FILES` are kept; the count of distinct paths comes last.
+pub fn union_changed_files(
+	lists: Vec<ChangedFiles>,
+) -> (ChangedFiles, Vec<u32>, usize) {
+	let mut seen = HashSet::new();
+	let (mut files, mut origin, mut total) = (Vec::new(), Vec::new(), 0);
+	for (i, list) in lists.into_iter().enumerate() {
+		for (path, change) in list {
+			if !seen.insert(path.clone()) {
+				continue;
+			}
+			total += 1;
+			if files.len() < MAX_COMMIT_FILES {
+				files.push((path, change));
+				origin.push(i as u32);
+			}
+		}
+	}
+	(files, origin, total)
+}
+
 /// One read of a merged-log feed: its page (plain SHAs) and, on the
 /// feed's first read, its refs and the tips later pages walk.
 struct FeedRead {
@@ -2919,6 +3201,7 @@ impl WorkbenchModel {
 		self.log_paths_expanded.clear();
 		self.selected_commit = None;
 		self.range_head = None;
+		self.log_selected.clear();
 		self.commit_details = None;
 		self.apply_log_filter(cx);
 	}
@@ -2930,6 +3213,9 @@ impl WorkbenchModel {
 		&self,
 	) -> Result<(PathBuf, String, String, Vec<String>), &'static str> {
 		let ids = match (self.range_rows(), &self.selected_commit) {
+			// A Cmd/Ctrl-click selection may have gaps: core refuses it
+			// as not contiguous.
+			_ if self.log_selected.len() > 1 => self.log_selected.clone(),
 			(Some(_), _) => self.range_ids(),
 			(None, Some(sel))
 				if self.display_commits().iter().any(|c| &c.sha == sel) =>
@@ -3235,10 +3521,9 @@ impl WorkbenchModel {
 		if first {
 			self.select_head_after_load = false;
 			if let Some(anchor) = self.selected_commit.clone() {
-				if self.commits.iter().any(|c| c.sha == anchor) {
-					self.select_commit(&anchor, cx);
-				} else {
+				if !self.reselect_after_load(&anchor, cx) {
 					self.selected_commit = None;
+					self.log_selected.clear();
 					self.commit_details = None;
 				}
 			}
@@ -4002,37 +4287,66 @@ mod tests {
 	}
 
 	#[test]
-	fn changed_files_group_by_directory() {
-		use snip_core::format::ChangeType;
-		let files: Vec<(String, Option<ChangeType>)> =
-			["README.md", "src/a.rs", "docs/x.md", "src/b.rs"]
-				.iter()
-				.map(|p| (p.to_string(), Some(ChangeType::Modified)))
-				.collect();
-		let rows = changed_file_rows(&files, &["src".to_string()]);
+	fn log_selection_toggle_range_and_repos() {
+		// The merged log: repo 0 and repo 1 interleaved.
+		let rows = ["a3@0", "b2@1", "a2@0", "b1@1", "a1@0"];
+		let ids =
+			|v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+		// Shift range keeps the anchor's repository only, either direction.
 		assert_eq!(
-			rows,
-			[
-				ChangedRow::Dir {
-					path: "docs".into(),
-					files: 1,
-					expanded: true
-				},
-				ChangedRow::File {
-					idx: 2,
-					nested: true
-				},
-				ChangedRow::Dir {
-					path: "src".into(),
-					files: 2,
-					expanded: false
-				},
-				ChangedRow::File {
-					idx: 0,
-					nested: false
-				},
-			]
+			range_between(&rows, "a3@0", "a1@0"),
+			ids(&["a3@0", "a2@0", "a1@0"])
 		);
+		assert_eq!(
+			range_between(&rows, "a1@0", "a3@0"),
+			ids(&["a3@0", "a2@0", "a1@0"])
+		);
+		assert!(range_between(&rows, "a1@0", "gone@0").is_empty());
+		// Toggle in (display order, with a gap), toggle out.
+		let sel = toggle_selection(&rows, &ids(&["a1@0"]), "a3@0").unwrap();
+		assert_eq!(sel, ids(&["a3@0", "a1@0"]));
+		let sel = toggle_selection(&rows, &sel, "a2@0").unwrap();
+		assert_eq!(sel, ids(&["a3@0", "a2@0", "a1@0"]));
+		let sel = toggle_selection(&rows, &sel, "a3@0").unwrap();
+		assert_eq!(sel, ids(&["a2@0", "a1@0"]));
+		assert!(toggle_selection(&rows, &ids(&["a1@0"]), "a1@0")
+			.unwrap()
+			.is_empty());
+		// Another repository's commit is refused, the selection unchanged.
+		assert_eq!(toggle_selection(&rows, &sel, "b2@1"), Err("cross_repo"));
+		// A single repository's plain SHAs are one repository.
+		assert!(toggle_selection(&["x", "y"], &ids(&["x"]), "y").is_ok());
+	}
+
+	#[test]
+	fn union_of_selected_commits_keeps_the_newest_change() {
+		use snip_core::format::ChangeType::{Deleted, Modified, New};
+		let list = |v: &[(&str, snip_core::format::ChangeType)]| {
+			v.iter()
+				.map(|(p, c)| (p.to_string(), Some(*c)))
+				.collect::<Vec<_>>()
+		};
+		// Newest first: a.txt deleted in the newest, added in the oldest.
+		let (files, origin, total) = union_changed_files(vec![
+			list(&[("a.txt", Deleted), ("b.txt", Modified)]),
+			list(&[("c.txt", New)]),
+			list(&[("a.txt", New), ("c.txt", Modified)]),
+		]);
+		assert_eq!(
+			files,
+			list(&[("a.txt", Deleted), ("b.txt", Modified), ("c.txt", New)])
+		);
+		assert_eq!(origin, [0, 0, 1]);
+		assert_eq!(total, 3);
+		// Distinct paths past the cap are counted, not kept.
+		let many: Vec<_> = (0..MAX_COMMIT_FILES + 2)
+			.map(|i| (format!("f{i}"), Some(Modified)))
+			.collect();
+		let (files, origin, total) =
+			union_changed_files(vec![many.clone(), many]);
+		assert_eq!(files.len(), MAX_COMMIT_FILES);
+		assert_eq!(origin.len(), MAX_COMMIT_FILES);
+		assert_eq!(total, MAX_COMMIT_FILES + 2);
 	}
 
 	#[test]

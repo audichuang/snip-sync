@@ -556,14 +556,8 @@ impl WorkbenchModel {
 		// Row tooltips are off while a context menu is open (they would
 		// draw over it).
 		let show_tips = self.chrome.menu.is_none();
-		let selected = self.selected_commit.as_deref() == Some(&c.sha);
-		// A range selects its anchor's repository only.
-		let in_range =
-			self.range_rows().is_some_and(|(a, b)| ix >= a && ix <= b)
-				&& self
-					.selected_commit
-					.as_deref()
-					.is_some_and(|s| crate::history::same_repo(s, &c.sha));
+		// Every selected row (a range selects its anchor's repository only).
+		let selected = self.log_is_selected(&c.sha);
 		let sha = c.sha.clone();
 		// The merged log: the row's repository (root stripe, ids).
 		let repo = self.log_row_repo(&c.sha);
@@ -643,7 +637,7 @@ impl WorkbenchModel {
 			.pr(px(8.))
 			.gap(px(8.))
 			.cursor_pointer()
-			.when(on_head && !selected && !in_range, |d| {
+			.when(on_head && !selected, |d| {
 				d.bg(rgb(pal().log_current_branch_bg))
 			})
 			.when(selected, |d| {
@@ -653,14 +647,14 @@ impl WorkbenchModel {
 					pal().selection_inactive_bg
 				}))
 			})
-			.when(in_range && !selected, |d| d.bg(rgb(pal().range_bg)))
-			.when(!selected && !in_range, |d| {
-				d.hover(|s| s.bg(rgb(pal().hover_bg)))
-			})
+			.when(!selected, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 			.on_click(cx.listener(
 				move |this, ev: &gpui::ClickEvent, window, cx| {
 					window.focus(&this.log_focus);
-					if ev.modifiers().shift {
+					// Cmd on macOS, Ctrl elsewhere: IntelliJ's toggle.
+					if ev.modifiers().secondary() {
+						this.toggle_commit(&sha_click, cx);
+					} else if ev.modifiers().shift {
 						this.extend_range(&sha_click, cx);
 					} else {
 						this.select_commit(&sha_click, cx);
@@ -837,8 +831,10 @@ impl WorkbenchModel {
 	) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
-		let rows = Rc::new(crate::history::changed_file_rows(
+		let by_dir = self.log_details_by_dir;
+		let rows = Rc::new(super::changes::commit_file_rows(
 			&self.commit_files,
+			by_dir,
 			&self.changed_dirs_collapsed,
 		));
 		let n = self.commit_files.len();
@@ -863,10 +859,28 @@ impl WorkbenchModel {
 			)
 			.child(
 				log_icon_button(
+					"details-group-dir",
+					Icon::Folder,
+					t("tip_group_by_dir", loc),
+					true,
+					by_dir,
+				)
+				.on_click(cx.listener(|this, _, _, cx| {
+					this.log_details_by_dir = !this.log_details_by_dir;
+					app_log!(
+						"[APP:LOG_DETAILS_GROUP_DIR: {}]",
+						this.log_details_by_dir
+					);
+					cx.notify();
+				}))
+				.children(probe(log, "details-group-dir")),
+			)
+			.child(
+				log_icon_button(
 					"details-expand-all",
 					Icon::ExpandAll,
 					t("tip_expand_all", loc),
-					n > 0,
+					n > 0 && by_dir,
 					false,
 				)
 				.on_click(cx.listener(|this, _, _, cx| {
@@ -880,23 +894,12 @@ impl WorkbenchModel {
 					"details-collapse-all",
 					Icon::CollapseAll,
 					t("tip_collapse_all", loc),
-					n > 0,
+					n > 0 && by_dir,
 					false,
 				)
 				.on_click(cx.listener(|this, _, _, cx| {
 					this.changed_dirs_collapsed =
-						crate::history::changed_file_rows(
-							&this.commit_files,
-							&[],
-						)
-						.into_iter()
-						.filter_map(|r| match r {
-							crate::history::ChangedRow::Dir {
-								path, ..
-							} => Some(path),
-							_ => None,
-						})
-						.collect();
+						super::changes::commit_file_dirs(&this.commit_files);
 					cx.notify();
 				}))
 				.children(probe(log, "details-collapse-all")),
@@ -919,6 +922,8 @@ impl WorkbenchModel {
 				.font_weight(FontWeight::SEMIBOLD)
 				.child(tf("compare_header", loc, &[&short(from), &short(to)]))
 				.into_any_element()
+		} else if self.log_selected.len() > 1 {
+			self.selection_details_view().into_any_element()
 		} else if let Some(sha) = self.selected_commit.as_deref() {
 			self.commit_details_view(sha).into_any_element()
 		} else {
@@ -961,32 +966,45 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
+	/// One row of the changed-files pane, drawn like the Changes tool
+	/// window's tree (chevron, folder, compacted name, muted count; a file
+	/// by its name in its change colour) without the checkboxes: history
+	/// is read-only here.
 	pub(super) fn changed_file_row(
 		&self,
-		row: crate::history::ChangedRow,
+		row: super::changes::ChangeItemRow,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
-		use crate::history::ChangedRow;
-		let loc = self.locale;
+		use super::changes::ChangeItemRow;
+		use super::changes::{change_pad, tree_chevron, tree_count};
 		match row {
-			ChangedRow::Dir {
+			ChangeItemRow::Dir {
 				path,
-				files,
-				expanded,
+				name,
+				count,
+				depth,
+				..
 			} => {
+				let collapsed =
+					self.changed_dirs_collapsed.iter().any(|d| d == &path);
 				let id = format!("commit-dir:{path}");
 				let p2 = path.clone();
 				div()
 					.id(SharedString::from(id.clone()))
 					.relative()
 					.flex()
+					.flex_row()
 					.items_center()
-					.gap(px(5.))
+					.gap(px(2.))
 					.h(px(ROW_H))
 					.w_full()
-					.px(px(8.))
+					.pl(px(change_pad(depth)))
+					.pr(px(8.))
 					.cursor_pointer()
 					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.when(self.chrome.menu.is_none(), |d| {
+						d.tooltip(tip(path.clone()))
+					})
 					.on_click(cx.listener(move |this, _, _, cx| {
 						let dirs = &mut this.changed_dirs_collapsed;
 						match dirs.iter().position(|d| d == &p2) {
@@ -997,63 +1015,157 @@ impl WorkbenchModel {
 						}
 						cx.notify();
 					}))
-					.child(icon(
-						if expanded {
-							Icon::ChevronDown
-						} else {
-							Icon::ChevronRight
-						},
-						12.,
+					.child(tree_chevron(
+						format!("commit-dir-toggle:{path}"),
+						collapsed,
 					))
-					.child(icon(Icon::Folder, 14.))
-					.child(clip_text(path).text_color(rgb(pal().text)))
 					.child(
 						div()
 							.flex_shrink_0()
-							.text_color(rgb(pal().text_muted))
-							.child(tf("log_dir_files", loc, &[&files])),
+							.ml(px(4.))
+							.child(icon(Icon::Folder, 14.)),
 					)
+					.child(
+						clip_text(name)
+							.ml(px(4.))
+							.flex_shrink()
+							.text_color(rgb(pal().text)),
+					)
+					.child(tree_count(count))
 					.children(probe(&self.probes, id))
 					.into_any_element()
 			}
-			ChangedRow::File { idx, nested } => {
-				let Some((path, ct)) = self.commit_files.get(idx).cloned()
+			ChangeItemRow::File { file_idx, depth } => {
+				let Some((path, ct)) = self.commit_files.get(file_idx).cloned()
 				else {
 					return div().into_any_element();
 				};
-				let (_, color) = change_style(ct);
+				let (letter, color) = change_style(ct);
+				let deleted = ct == Some(ChangeType::Deleted);
 				let sel = self.selected_commit_file.as_deref() == Some(&path)
 					&& self.rev_tree.is_none();
 				let id = format!("commit-file:{path}");
-				let name = if nested {
-					path.rsplit('/').next().unwrap_or(&path).to_string()
-				} else {
-					path.clone()
+				let (dir, name) = match path.rsplit_once('/') {
+					Some((d, n)) => (d.to_string(), n.to_string()),
+					None => (String::new(), path.clone()),
 				};
 				let p2 = path.clone();
 				div()
 					.id(SharedString::from(id.clone()))
 					.relative()
 					.flex()
+					.flex_row()
 					.items_center()
-					.gap(px(5.))
+					.gap(px(6.))
 					.h(px(ROW_H))
 					.w_full()
-					.pl(px(if nested { 42. } else { 8. }))
+					// Under the sibling directories' folder icons.
+					.pl(px(change_pad(depth) + 22.))
 					.pr(px(8.))
 					.cursor_pointer()
 					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
 					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-					.tooltip(tip(path.clone()))
+					.when(self.chrome.menu.is_none(), |d| {
+						d.tooltip(tip(format!("{path}  ({letter})")))
+					})
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.select_commit_file(&p2, cx)
 					}))
 					.child(icon(file_icon(&path), 14.))
-					.child(fill_text(name).text_color(rgb(color)))
+					.child(
+						clip_text(name)
+							.flex_shrink_0()
+							.max_w(gpui::relative(0.7))
+							.text_color(rgb(color))
+							.when(deleted, |d| d.line_through()),
+					)
+					// The flat list names the file's folder after it.
+					.when(!self.log_details_by_dir, |d| {
+						d.child(
+							fill_text(dir)
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted)),
+						)
+					})
 					.children(probe(&self.probes, id))
 					.into_any_element()
 			}
+			_ => div().into_any_element(),
 		}
+	}
+
+	/// A multi-selection's info: how many commits, then each one's short
+	/// hash and subject (newest first), like IntelliJ's details pane.
+	pub(super) fn selection_details_view(&self) -> Div {
+		let loc = self.locale;
+		let repo = self
+			.log_selected
+			.first()
+			.and_then(|id| self.log_row_repo(id))
+			.map(|(feed, color)| {
+				(feed.name.clone(), graph_view::palette_rgb(color))
+			});
+		let rows: Vec<(String, String)> = self
+			.log_selected
+			.iter()
+			.map(|id| {
+				let subject = self
+					.commits
+					.iter()
+					.find(|c| &c.sha == id)
+					.map(|c| c.subject.clone())
+					.unwrap_or_default();
+				(short(id).to_string(), subject)
+			})
+			.collect();
+		div()
+			.relative()
+			.flex()
+			.flex_col()
+			.gap(px(4.))
+			.text_color(rgb(pal().text))
+			.when_some(repo, |d, (name, color)| {
+				d.child(
+					div()
+						.flex()
+						.items_center()
+						.gap(px(6.))
+						.child(
+							div()
+								.flex_shrink_0()
+								.size(px(8.))
+								.rounded(px(2.))
+								.bg(color),
+						)
+						.child(
+							div()
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(tf("log_details_repo", loc, &[&name])),
+						),
+				)
+			})
+			.child(div().font_weight(FontWeight::SEMIBOLD).child(tf(
+				"log_selection_header",
+				loc,
+				&[&self.log_selected.len()],
+			)))
+			.children(rows.into_iter().map(|(hash, subject)| {
+				div()
+					.flex()
+					.flex_row()
+					.gap(px(8.))
+					.child(
+						div()
+							.flex_shrink_0()
+							.font_family(CODE_FONT)
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().link))
+							.child(hash),
+					)
+					.child(clip_text(subject))
+			}))
+			.children(probe(&self.probes, "commit-details-selection"))
 	}
 
 	/// Message, hash, author and date, the commit's refs and the branches

@@ -861,6 +861,9 @@ pub struct WorkbenchModel {
 	pub selected_commit: Option<String>,
 	/// Range endpoint picked with shift (anchor is `selected_commit`).
 	pub range_head: Option<String>,
+	/// Every selected row id in display order, when more than one is
+	/// selected (shift range or Cmd/Ctrl-click); one repository only.
+	pub log_selected: Vec<String>,
 	pub log_scroll: gpui::UniformListScrollHandle,
 	pub select_head_after_load: bool,
 
@@ -897,6 +900,8 @@ pub struct WorkbenchModel {
 	pub log_width: std::rc::Rc<std::cell::Cell<f32>>,
 	/// Collapsed directories of the changed-files tree.
 	pub changed_dirs_collapsed: Vec<String>,
+	/// The changed-files pane groups by directory (else a flat list).
+	pub log_details_by_dir: bool,
 	pub commit_details: Option<crate::history::CommitDetails>,
 	pub details_generation: u64,
 	pub details_cancel: Option<CancelToken>,
@@ -904,6 +909,9 @@ pub struct WorkbenchModel {
 
 	// Files of the selected commit or compare.
 	pub commit_files: Vec<(String, Option<ChangeType>)>,
+	/// Per file of a multi-selection: index in `log_selected` of the newest
+	/// selected commit that touched it.
+	pub commit_file_origin: Vec<u32>,
 	pub selected_commit_file: Option<String>,
 	pub compare: Option<(String, String)>,
 
@@ -1239,6 +1247,7 @@ impl WorkbenchModel {
 			history_walk: None,
 			selected_commit: None,
 			range_head: None,
+			log_selected: Vec::new(),
 			log_scroll: gpui::UniformListScrollHandle::new(),
 			select_head_after_load: false,
 			log_first_page: 0,
@@ -1261,11 +1270,13 @@ impl WorkbenchModel {
 			log_details_w: theme::LOG_DETAILS_W_DEFAULT,
 			log_width: Default::default(),
 			changed_dirs_collapsed: Vec::new(),
+			log_details_by_dir: true,
 			commit_details: None,
 			details_generation: 0,
 			details_cancel: None,
 			git_user_email: None,
 			commit_files: Vec::new(),
+			commit_file_origin: Vec::new(),
 			selected_commit_file: None,
 			compare: None,
 			files: Vec::new(),
@@ -2316,8 +2327,10 @@ impl WorkbenchModel {
 		self.history_walk = None;
 		self.selected_commit = None;
 		self.range_head = None;
+		release_vec(&mut self.log_selected);
 		self.select_head_after_load = false;
 		release_vec(&mut self.commit_files);
+		release_vec(&mut self.commit_file_origin);
 		self.log_first_page = 0;
 		self.history_extending = false;
 		self.history_autoload = true;
@@ -3230,6 +3243,7 @@ impl WorkbenchModel {
 		self.selected_file = anchor_file.clone();
 		self.selected_commit = anchor_commit.clone();
 		self.range_head = None;
+		self.log_selected.clear();
 		self.compare = None;
 		self.commit_files.clear();
 		self.changes_loaded = false;
@@ -3484,6 +3498,7 @@ impl WorkbenchModel {
 			self.selected_commit.take(),
 		);
 		self.range_head = None;
+		self.log_selected.clear();
 		self.compare = None;
 		self.commit_files.clear();
 		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
@@ -3623,6 +3638,14 @@ impl WorkbenchModel {
 			));
 		for (path, _) in &self.commit_files {
 			bytes = bytes.saturating_add(path.capacity());
+		}
+		bytes = bytes
+			.saturating_add(self.commit_file_origin.capacity() * 4)
+			.saturating_add(
+				self.log_selected.capacity() * std::mem::size_of::<String>(),
+			);
+		for id in &self.log_selected {
+			bytes = bytes.saturating_add(id.capacity());
 		}
 		bytes = bytes
 			.saturating_add(std::mem::size_of_val(&self.file_tree))
@@ -4971,6 +4994,7 @@ impl WorkbenchModel {
 		self.selected_file_source = None;
 		self.selected_commit = None;
 		self.range_head = None;
+		self.log_selected.clear();
 		self.compare = None;
 		self.selected_commit_file = None;
 		self.commit_files.clear();
@@ -6638,6 +6662,73 @@ mod tests {
 				"F2:r:Notes/",
 				"F2:r:pom.xml",
 				"R:unstaged:s:1",
+			]
+		);
+	}
+
+	/// The Git Log's changed-files pane uses the Changes tree: dirs first,
+	/// single-child chains compacted, every directory open unless
+	/// collapsed; flat mode keeps Git's order at depth 0.
+	#[test]
+	fn commit_file_rows_tree_and_flat() {
+		let files: Vec<(String, Option<ChangeType>)> = [
+			"src/main/java/pkg/B.java",
+			"README.md",
+			"src/main/java/pkg/a.java",
+			"src/test/T.java",
+			"docs/guide.md",
+		]
+		.iter()
+		.map(|p| (p.to_string(), Some(ChangeType::Modified)))
+		.collect();
+		let shape = |rows: &[ui::ChangeItemRow]| -> Vec<String> {
+			rows.iter()
+				.map(|r| match r {
+					ui::ChangeItemRow::Dir {
+						name, count, depth, ..
+					} => format!("D{depth}:{name}:{count}"),
+					ui::ChangeItemRow::File { file_idx, depth } => {
+						format!("F{depth}:{}", files[*file_idx].0)
+					}
+					_ => "?".into(),
+				})
+				.collect()
+		};
+		assert_eq!(
+			shape(&ui::commit_file_rows(&files, true, &[])),
+			[
+				"D0:docs:1",
+				"F1:docs/guide.md",
+				"D0:src:3",
+				"D1:main/java/pkg:2",
+				"F2:src/main/java/pkg/a.java",
+				"F2:src/main/java/pkg/B.java",
+				"D1:test:1",
+				"F2:src/test/T.java",
+				"F0:README.md",
+			]
+		);
+		// A collapsed directory hides what is under it, keyed by full path.
+		let closed = ["src/main/java/pkg".to_string(), "docs".to_string()];
+		assert_eq!(
+			shape(&ui::commit_file_rows(&files, true, &closed)),
+			[
+				"D0:docs:1",
+				"D0:src:3",
+				"D1:main/java/pkg:2",
+				"D1:test:1",
+				"F2:src/test/T.java",
+				"F0:README.md",
+			]
+		);
+		assert_eq!(
+			shape(&ui::commit_file_rows(&files, false, &closed)),
+			[
+				"F0:src/main/java/pkg/B.java",
+				"F0:README.md",
+				"F0:src/main/java/pkg/a.java",
+				"F0:src/test/T.java",
+				"F0:docs/guide.md",
 			]
 		);
 	}

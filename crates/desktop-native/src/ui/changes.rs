@@ -61,6 +61,36 @@ pub(super) fn change_pad(depth: usize) -> f32 {
 	4. + 18. * depth as f32
 }
 
+/// A tree node's chevron cell (Changes tool window and Git Log details).
+pub(super) fn tree_chevron(id: String, collapsed: bool) -> Stateful<Div> {
+	div()
+		.id(SharedString::from(id))
+		.relative()
+		.flex_shrink_0()
+		.size(px(16.))
+		.flex()
+		.items_center()
+		.justify_center()
+		.child(icon(
+			if collapsed {
+				Icon::ChevronRight
+			} else {
+				Icon::ChevronDown
+			},
+			10.,
+		))
+}
+
+/// The muted count after a tree node's name.
+pub(super) fn tree_count(count: usize) -> Div {
+	div()
+		.flex_shrink_0()
+		.ml(px(8.))
+		.text_size(px(SMALL_TEXT))
+		.text_color(rgb(pal().text_muted))
+		.child(count.to_string())
+}
+
 /// Fields of a [`ChangeItemRow::Dir`] handed to its renderer.
 pub(super) struct ChangeDirRow {
 	pub(super) slot: usize,
@@ -179,9 +209,12 @@ pub(crate) fn change_rows<F: Fn(usize, &str, &str) -> bool>(
 }
 
 /// Rows of one repo's changes in one group, at tree level `depth`.
-pub(super) fn push_change_files<F: Fn(usize, &str, &str) -> bool>(
+pub(super) fn push_change_files<
+	T: TreePath,
+	F: Fn(usize, &str, &str) -> bool,
+>(
 	rows: &mut Vec<ChangeItemRow>,
-	files: &[crate::FileChangeItem],
+	files: &[T],
 	mut members: Vec<usize>,
 	slot: usize,
 	group_id: &'static str,
@@ -205,20 +238,82 @@ pub(super) fn push_change_files<F: Fn(usize, &str, &str) -> bool>(
 	tree.push(rows, &mut members, 0, depth);
 }
 
+/// A file row the directory tree can place: its repository-relative path.
+pub(crate) trait TreePath {
+	fn tree_path(&self) -> &str;
+}
+
+impl TreePath for crate::FileChangeItem {
+	fn tree_path(&self) -> &str {
+		&self.path
+	}
+}
+
+/// A file of a commit (or of a log multi-selection).
+impl TreePath for (String, Option<ChangeType>) {
+	fn tree_path(&self) -> &str {
+		&self.0
+	}
+}
+
+/// Group id of the Git Log's changed-files rows (one tree, no groups).
+pub(crate) const COMMIT_GROUP: &str = "commit";
+
+/// Rows of the Git Log's changed-files pane: the Changes tool window's
+/// directory tree (dirs first, single-child chains in one row) with no
+/// groups or repos above it, or its flat list. Directories named in
+/// `collapsed` are closed; every other one is open.
+pub(crate) fn commit_file_rows(
+	files: &[(String, Option<ChangeType>)],
+	by_dir: bool,
+	collapsed: &[String],
+) -> Vec<ChangeItemRow> {
+	let layout = ChangeLayout {
+		by_dir,
+		expanded: |_: usize, _: &str, dir: &str| {
+			!collapsed.iter().any(|c| c == dir)
+		},
+	};
+	let mut rows = Vec::with_capacity(files.len());
+	push_change_files(
+		&mut rows,
+		files,
+		(0..files.len()).collect(),
+		0,
+		COMMIT_GROUP,
+		0,
+		&layout,
+	);
+	rows
+}
+
+/// Every directory the changed-files tree of `files` has (Collapse All).
+pub(crate) fn commit_file_dirs(
+	files: &[(String, Option<ChangeType>)],
+) -> Vec<String> {
+	commit_file_rows(files, true, &[])
+		.into_iter()
+		.filter_map(|r| match r {
+			ChangeItemRow::Dir { path, .. } => Some(path),
+			_ => None,
+		})
+		.collect()
+}
+
 /// Builds IntelliJ's "Group By > Directory" rows from the capped file rows
 /// alone: no Git reads, and only open directories' children get rows.
-pub(super) struct DirTree<'a, F> {
-	files: &'a [crate::FileChangeItem],
+pub(super) struct DirTree<'a, T, F> {
+	files: &'a [T],
 	slot: usize,
 	group_id: &'static str,
 	expanded: &'a F,
 }
 
-impl<F: Fn(usize, &str, &str) -> bool> DirTree<'_, F> {
+impl<T: TreePath, F: Fn(usize, &str, &str) -> bool> DirTree<'_, T, F> {
 	/// Path of file `i`. An untracked directory comes as `dir/` and is a
 	/// leaf named by its last component.
 	pub(super) fn path(&self, i: usize) -> &str {
-		self.files[i].path.trim_end_matches('/')
+		self.files[i].tree_path().trim_end_matches('/')
 	}
 
 	/// First directory of file `i` from byte `start` on, `None` for a leaf.
@@ -476,22 +571,7 @@ impl WorkbenchModel {
 				}),
 			)
 			.child(
-				div()
-					.id(SharedString::from(toggle_id.clone()))
-					.relative()
-					.flex_shrink_0()
-					.size(px(16.))
-					.flex()
-					.items_center()
-					.justify_center()
-					.child(icon(
-						if collapsed {
-							Icon::ChevronRight
-						} else {
-							Icon::ChevronDown
-						},
-						10.,
-					))
+				tree_chevron(toggle_id.clone(), collapsed)
 					.children(probe(log, toggle_id)),
 			)
 			.child(
@@ -531,14 +611,7 @@ impl WorkbenchModel {
 					.flex_shrink()
 					.text_color(rgb(pal().text)),
 			)
-			.child(
-				div()
-					.flex_shrink_0()
-					.ml(px(8.))
-					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(pal().text_muted))
-					.child(count.to_string()),
-			)
+			.child(tree_count(count))
 			.when(!branch.is_empty(), |d| {
 				d.child(
 					clip_text(branch)
@@ -661,22 +734,7 @@ impl WorkbenchModel {
 				this.toggle_dir_collapsed(slot, group_id, &p1, cx);
 			}))
 			.child(
-				div()
-					.id(SharedString::from(toggle_id.clone()))
-					.relative()
-					.flex_shrink_0()
-					.size(px(16.))
-					.flex()
-					.items_center()
-					.justify_center()
-					.child(icon(
-						if collapsed {
-							Icon::ChevronRight
-						} else {
-							Icon::ChevronDown
-						},
-						10.,
-					))
+				tree_chevron(toggle_id.clone(), collapsed)
 					.children(probe(log, toggle_id)),
 			)
 			.child(
@@ -708,14 +766,7 @@ impl WorkbenchModel {
 					.flex_shrink()
 					.text_color(rgb(pal().text)),
 			)
-			.child(
-				div()
-					.flex_shrink_0()
-					.ml(px(8.))
-					.text_size(px(SMALL_TEXT))
-					.text_color(rgb(pal().text_muted))
-					.child(count.to_string()),
-			)
+			.child(tree_count(count))
 			.children(probe(log, id))
 			.into_any_element()
 	}
