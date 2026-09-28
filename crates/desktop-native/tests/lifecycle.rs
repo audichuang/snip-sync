@@ -2816,6 +2816,13 @@ fn spawn_two(fx: &TwoRepos, tree_hold: Option<&Path>) -> (App, String) {
 		Duration::from_secs(12),
 	);
 	wait_git_idle(app.pid, &app.starttime);
+	// Changes starts with every repo node collapsed; the tests work in `a`.
+	click(&wid, "change-repo:unstaged:a");
+	lines_until(
+		&app.rx,
+		"[APP:REPO_CHANGES_COLLAPSED: unstaged a collapsed=false]",
+		Duration::from_secs(4),
+	);
 	(app, wid)
 }
 
@@ -2883,6 +2890,13 @@ fn refresh_reloads_the_open_repo_and_releases_a_vanished_one() {
 	);
 	absent("change-row:note.txt");
 	absent("change-row:extra.txt");
+	// The log shows the workspace: it reloads over the repo left.
+	let graph =
+		lines_until(&app.rx, "[APP:GRAPH_LOADED:", Duration::from_secs(8));
+	assert!(
+		!graph.last().unwrap().contains("commits=0]"),
+		"the log stayed empty after a repo vanished: {graph:?}"
+	);
 
 	switch_repo(&app, &wid, "b", 0);
 	lines_until(&app.rx, "[APP:REPO_LOADED: b", Duration::from_secs(8));

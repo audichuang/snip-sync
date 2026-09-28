@@ -38,6 +38,19 @@ The lifecycle test `x_server_loss_exits_instead_of_spinning` kills a private
 Xvfb after `[APP:WINDOW_READY]`: without the patch the app burned 5 s of CPU in
 5 s and was still alive; with it, it exits 0 within about 50 ms.
 
+`src/elements/text.rs`, `TextElement::request_layout`: truncate a copy of the
+text runs on every measure. Upstream moved one `runs` vector into the measure
+closure and let `truncate_line` shorten it in place. Taffy calls that closure
+again when the available width changes (a window or panel resize), and the
+second call laid out the full text with runs cut for the first width. On
+macOS `layout_line` slices the text by those run lengths, so a long CJK label
+cut with "…" aborted the app (`str::slice_error_fail`). This was the user's
+crash on opening the Project view. `src/text_system.rs`, `shape_text`: a
+`debug_assert_eq!` that the runs cover the text exactly, which makes the same
+bug fail on Linux debug builds, where cosmic-text does not slice. The smoke
+test `native_cjk_truncation_survives_resize` resizes a window showing
+truncated CJK paths. It fails on the upstream code and passes with the patch.
+
 `src/gpui.rs`: `#![allow(warnings)]`. As a path dependency the crate is built
 without `--cap-lints`, so the workspace's `RUSTFLAGS="-D warnings"` would turn
 upstream warnings (e.g. `float_literal_f32_fallback` in `taffy.rs`) into
@@ -47,5 +60,5 @@ errors on every CI platform. The in-source allow restores registry behaviour.
 
 Re-copy the new version's crate, re-apply the patches above, and rerun
 `scripts/check_native_ime.py` and `just native-lifecycle`. Drop the vendor
-copy once upstream resets the IC without relying on `composing` and stops the
-event loop when the X connection dies.
+copy once upstream resets the IC without relying on `composing`, stops the
+event loop when the X connection dies, and truncates a copy of the text runs.

@@ -414,6 +414,13 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        // snip-sync: runs must cover the text exactly; a shorter run set
+        // slices a multi-byte char on macOS (see SNIP_PATCH.md).
+        debug_assert_eq!(
+            runs.iter().map(|r| r.len).sum::<usize>(),
+            text.len(),
+            "text runs do not cover {text:?}"
+        );
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 

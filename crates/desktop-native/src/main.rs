@@ -76,6 +76,7 @@ pub mod i18n;
 mod icons;
 pub mod lifecycle;
 mod menu;
+mod multi_log;
 pub mod paste;
 mod reader;
 mod recent;
@@ -196,6 +197,8 @@ pub struct FileChangeItem {
 	pub source: SourceKind,
 	pub is_conflict: bool,
 	pub selected: bool,
+	/// Index of the owning repo in `WorkbenchModel::change_repos`.
+	pub repo: u32,
 }
 
 impl FileChangeItem {
@@ -210,6 +213,204 @@ impl FileChangeItem {
 }
 
 type WorkingChangeTuple = (String, Option<ChangeType>, SourceKind, bool);
+
+/// Rows kept per repo in the Changes tool window. Every repo's rows count
+/// against `MAX_RETAINED_TREE_BYTES` and each checkbox click clones them, so
+/// 15 repos at this cap stay well inside that budget.
+pub const MAX_CHANGES_PER_REPO: usize = 2_000;
+
+/// Status reads the Changes queue runs at once (the Git runner's own limit).
+pub const MAX_CHANGES_READS: usize = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChangeRepoState {
+	Loading,
+	Loaded,
+	Failed(String),
+}
+
+/// One repository node of the Changes tool window. Its rows are the
+/// contiguous run of `WorkbenchModel::files` tagged with this slot's index.
+#[derive(Clone, Debug)]
+pub struct ChangeRepo {
+	pub root: PathBuf,
+	pub name: String,
+	pub state: ChangeRepoState,
+	/// Changes Git reported; more than the kept rows when truncated.
+	pub total: usize,
+}
+
+impl ChangeRepo {
+	pub fn truncated(&self, kept: usize) -> bool {
+		self.total > kept
+	}
+}
+
+/// FIFO of pending reads with at most `max` in flight.
+#[derive(Debug)]
+pub struct ReadQueue<T> {
+	pending: VecDeque<T>,
+	in_flight: usize,
+	max: usize,
+}
+
+impl<T: PartialEq> ReadQueue<T> {
+	pub fn new(max: usize) -> Self {
+		Self {
+			pending: VecDeque::new(),
+			in_flight: 0,
+			max,
+		}
+	}
+
+	pub fn push(&mut self, item: T) {
+		if !self.pending.contains(&item) {
+			self.pending.push_back(item);
+		}
+	}
+
+	/// The next read to start, if a slot is free.
+	pub fn take(&mut self) -> Option<T> {
+		if self.in_flight >= self.max {
+			return None;
+		}
+		let item = self.pending.pop_front()?;
+		self.in_flight += 1;
+		Some(item)
+	}
+
+	/// A started read ended (landed, failed, cancelled or went stale).
+	pub fn finish(&mut self) {
+		self.in_flight = self.in_flight.saturating_sub(1);
+	}
+
+	/// Drops the waiting reads; running ones still `finish`.
+	pub fn clear_pending(&mut self) {
+		self.pending = VecDeque::new();
+	}
+
+	pub fn in_flight(&self) -> usize {
+		self.in_flight
+	}
+}
+
+/// Marks `root`'s Changes repo rows expanded in every group.
+fn expand_repo_everywhere(
+	expanded: &mut Vec<(&'static str, PathBuf)>,
+	root: &std::path::Path,
+) {
+	for (group, _) in menu::CHANGE_GROUPS {
+		if !expanded.iter().any(|(g, r)| *g == group && r == root) {
+			expanded.push((group, root.to_path_buf()));
+		}
+	}
+}
+
+/// Rows of slot `slot` in `files`, which is sorted by slot.
+pub fn slot_range(
+	files: &[FileChangeItem],
+	slot: usize,
+) -> std::ops::Range<usize> {
+	let start = files.partition_point(|f| (f.repo as usize) < slot);
+	let end = files.partition_point(|f| (f.repo as usize) <= slot);
+	start..end
+}
+
+/// Index of `root`'s slot, inserting one in name order if it is new. Rows of
+/// later slots are renumbered so `files` stays sorted by slot.
+pub fn slot_insert(
+	slots: &mut Vec<ChangeRepo>,
+	files: &mut [FileChangeItem],
+	root: &std::path::Path,
+	name: &str,
+) -> usize {
+	if let Some(pos) = slots.iter().position(|s| s.root == root) {
+		slots[pos].name = name.to_string();
+		return pos;
+	}
+	let pos = slots.partition_point(|s| {
+		(s.name.as_str(), s.root.as_path()) < (name, root)
+	});
+	slots.insert(
+		pos,
+		ChangeRepo {
+			root: root.to_path_buf(),
+			name: name.to_string(),
+			state: ChangeRepoState::Loading,
+			total: 0,
+		},
+	);
+	for f in files.iter_mut().filter(|f| f.repo as usize >= pos) {
+		f.repo += 1;
+	}
+	pos
+}
+
+/// Removes slot `slot` and its rows.
+pub fn slot_remove(
+	slots: &mut Vec<ChangeRepo>,
+	files: &mut Vec<FileChangeItem>,
+	slot: usize,
+) {
+	let range = slot_range(files, slot);
+	files.drain(range);
+	for f in files.iter_mut().filter(|f| f.repo as usize > slot) {
+		f.repo -= 1;
+	}
+	slots.remove(slot);
+}
+
+/// Replaces slot `slot`'s rows with `rows` (already tagged with it).
+pub fn slot_replace_rows(
+	files: &mut Vec<FileChangeItem>,
+	slot: usize,
+	rows: Vec<FileChangeItem>,
+) {
+	let range = slot_range(files, slot);
+	files.splice(range, rows);
+}
+
+/// Reads one repo's Changes list: the staged, unstaged, untracked and
+/// conflicted rows sorted by path, plus the summary when `known` spares the
+/// identity reads.
+fn read_change_list(
+	root: &std::path::Path,
+	known: Option<&RepoIdentity>,
+	cancel: CancelToken,
+) -> Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>), String> {
+	let opts = interactive_read_opts(cancel);
+	// A known identity skips the open and the identity reads, and one
+	// status feeds both the list and the repo's summary.
+	let (summary, details) = match known {
+		Some(id) => {
+			let git = Git::at_known_root(id.toplevel.clone());
+			let (summary, details) = summarize_with_details(&git, id, &opts)
+				.map_err(|e| e.to_string())?;
+			(Some(summary), details)
+		}
+		None => {
+			let git = Git::open_with(root, &opts).map_err(|e| e.to_string())?;
+			let details =
+				status_details(&git, &opts).map_err(|e| e.to_string())?;
+			(None, details)
+		}
+	};
+	let mut items = Vec::new();
+	for (p, ct) in details.staged {
+		items.push((p, ct, SourceKind::Staged, false));
+	}
+	for (p, ct) in details.unstaged {
+		items.push((p, ct, SourceKind::Unstaged, false));
+	}
+	for p in details.untracked {
+		items.push((p, Some(ChangeType::New), SourceKind::Working, false));
+	}
+	for p in details.conflicted {
+		items.push((p, Some(ChangeType::Modified), SourceKind::Working, true));
+	}
+	items.sort_by(|a, b| a.0.cmp(&b.0));
+	Ok((summary, items))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkbenchTab {
@@ -418,10 +619,19 @@ impl PreparedSelection {
 			.saturating_add(self.status.as_ref().map_or(0, message_bytes))
 	}
 
-	/// Preserve every other root and historical source while replacing the
-	/// current root's File/working-change groups from the proposed checkboxes.
-	fn sync_root(&mut self, root: CanonicalRootId) -> bool {
-		if !self.replace_file_group && !self.replace_git_group {
+	/// Preserve every other root and historical source while replacing
+	/// `root`'s File group (when `file_group`) and its working-change group
+	/// from the checkboxes of Changes slot `git_slot`.
+	fn sync_root(
+		&mut self,
+		root: CanonicalRootId,
+		file_group: bool,
+		git_slot: Option<u32>,
+	) -> bool {
+		let replace_file_group = self.replace_file_group && file_group;
+		let replace_git_group = self.replace_git_group && git_slot.is_some();
+		let in_slot = |file: &FileChangeItem| Some(file.repo) == git_slot;
+		if !replace_file_group && !replace_git_group {
 			return true;
 		}
 		self.paths.retain(|path| !path.is_empty());
@@ -436,12 +646,12 @@ impl PreparedSelection {
 			if let Ok(index) = index {
 				let paths = &self.paths;
 				let (replace_file, replace_git) =
-					(self.replace_file_group, self.replace_git_group);
+					(replace_file_group, replace_git_group);
 				// One pass over the checkboxes, not one per basket item.
 				let kept: HashSet<(&str, &SourceKind)> = if replace_git {
 					self.files
 						.iter()
-						.filter(|file| file.selected)
+						.filter(|file| file.selected && in_slot(file))
 						.map(|file| (file.path.as_str(), &file.source))
 						.collect()
 				} else {
@@ -478,9 +688,9 @@ impl PreparedSelection {
 			Err(_) => Vec::new(),
 		};
 		items.retain(|item| match item.source {
-			SourceKind::File => !self.replace_file_group,
+			SourceKind::File => !replace_file_group,
 			SourceKind::Working | SourceKind::Unstaged | SourceKind::Staged => {
-				!self.replace_git_group
+				!replace_git_group
 			}
 			SourceKind::Commit { .. } => true,
 		});
@@ -490,13 +700,16 @@ impl PreparedSelection {
 		let mut heap = items.iter().fold(0usize, |bytes, item| {
 			bytes.saturating_add(export_item_heap_bytes(item))
 		});
-		let file_count = if self.replace_file_group {
+		let file_count = if replace_file_group {
 			self.paths.len()
 		} else {
 			0
 		};
-		let git_count = if self.replace_git_group {
-			self.files.iter().filter(|file| file.selected).count()
+		let git_count = if replace_git_group {
+			self.files
+				.iter()
+				.filter(|file| file.selected && in_slot(file))
+				.count()
 		} else {
 			0
 		};
@@ -521,7 +734,7 @@ impl PreparedSelection {
 		let added = self
 			.paths
 			.iter()
-			.filter(|_| self.replace_file_group)
+			.filter(|_| replace_file_group)
 			.map(|path| ExportItem {
 				root: root.clone(),
 				relative_path: path.clone(),
@@ -531,7 +744,9 @@ impl PreparedSelection {
 			.chain(
 				self.files
 					.iter()
-					.filter(|file| self.replace_git_group && file.selected)
+					.filter(|file| {
+						replace_git_group && file.selected && in_slot(file)
+					})
 					.map(|file| ExportItem {
 						root: root.clone(),
 						relative_path: file.path.clone(),
@@ -646,6 +861,9 @@ pub struct WorkbenchModel {
 	pub selected_commit: Option<String>,
 	/// Range endpoint picked with shift (anchor is `selected_commit`).
 	pub range_head: Option<String>,
+	/// Every selected row id in display order, when more than one is
+	/// selected (shift range or Cmd/Ctrl-click); one repository only.
+	pub log_selected: Vec<String>,
 	pub log_scroll: gpui::UniformListScrollHandle,
 	pub select_head_after_load: bool,
 
@@ -682,6 +900,13 @@ pub struct WorkbenchModel {
 	pub log_width: std::rc::Rc<std::cell::Cell<f32>>,
 	/// Collapsed directories of the changed-files tree.
 	pub changed_dirs_collapsed: Vec<String>,
+	/// The changed-files pane groups by directory (else a flat list).
+	pub log_details_by_dir: bool,
+	/// The changed-files rows, keyed on a hash of what builds them: the
+	/// tree sorts up to `MAX_COMMIT_FILES` paths, too slow for every frame.
+	pub commit_rows_cache: std::cell::RefCell<
+		Option<(u64, std::rc::Rc<Vec<crate::ui::ChangeItemRow>>)>,
+	>,
 	pub commit_details: Option<crate::history::CommitDetails>,
 	pub details_generation: u64,
 	pub details_cancel: Option<CancelToken>,
@@ -689,6 +914,9 @@ pub struct WorkbenchModel {
 
 	// Files of the selected commit or compare.
 	pub commit_files: Vec<(String, Option<ChangeType>)>,
+	/// Per file of a multi-selection: index in `log_selected` of the newest
+	/// selected commit that touched it.
+	pub commit_file_origin: Vec<u32>,
 	pub selected_commit_file: Option<String>,
 	pub compare: Option<(String, String)>,
 
@@ -812,8 +1040,33 @@ pub struct WorkbenchModel {
 	pub lifecycle: lifecycle::Lifecycle,
 	pub watch_running: bool,
 	pub last_life_log: String,
+	/// The selected repo's Project row is collapsed (its tree stays loaded).
+	pub repo_collapsed: bool,
 	/// Context menus, speed search and Changes group state.
 	pub chrome: menu::Chrome,
+	/// Changes tool window: one node per workspace repo, in name order.
+	pub change_repos: Vec<ChangeRepo>,
+	/// Status reads of the repos other than the open one.
+	pub changes_queue: ReadQueue<PathBuf>,
+	pub changes_cancel: Option<CancelToken>,
+	pub changes_generation: u64,
+	/// Repo the shown preview was read from, with `preview_identity`.
+	pub preview_root: Option<(PathBuf, usize)>,
+	/// Repositories the log's Repository chip picked; empty is all of them.
+	pub log_repo_filter: Vec<PathBuf>,
+	/// Repositories the loaded log covers (two or more: the merged log).
+	pub log_scope_key: Vec<PathBuf>,
+	/// The merged log's per-repository feeds.
+	pub log_feeds: Vec<multi_log::Feed>,
+	/// Repository of the commit or compare the reader shows from the log.
+	pub log_commit_root: Option<PathBuf>,
+	/// A Replace load waited for discovery to reach the picked repositories.
+	pub log_deferred: bool,
+}
+
+/// Identity of a shown preview's text, as `reader.rs` compares it.
+pub(crate) fn preview_identity(p: &Preview) -> usize {
+	Arc::as_ptr(&p.text) as *const u8 as usize
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1001,6 +1254,7 @@ impl WorkbenchModel {
 			history_walk: None,
 			selected_commit: None,
 			range_head: None,
+			log_selected: Vec::new(),
 			log_scroll: gpui::UniformListScrollHandle::new(),
 			select_head_after_load: false,
 			log_first_page: 0,
@@ -1023,11 +1277,14 @@ impl WorkbenchModel {
 			log_details_w: theme::LOG_DETAILS_W_DEFAULT,
 			log_width: Default::default(),
 			changed_dirs_collapsed: Vec::new(),
+			log_details_by_dir: true,
+			commit_rows_cache: Default::default(),
 			commit_details: None,
 			details_generation: 0,
 			details_cancel: None,
 			git_user_email: None,
 			commit_files: Vec::new(),
+			commit_file_origin: Vec::new(),
 			selected_commit_file: None,
 			compare: None,
 			files: Vec::new(),
@@ -1123,12 +1380,245 @@ impl WorkbenchModel {
 			watch_running: false,
 			last_life_log: String::new(),
 			chrome: menu::Chrome::new(cx),
+			repo_collapsed: false,
+			change_repos: Vec::new(),
+			changes_queue: ReadQueue::new(MAX_CHANGES_READS),
+			changes_cancel: None,
+			changes_generation: 0,
+			preview_root: None,
+			log_repo_filter: Vec::new(),
+			log_scope_key: Vec::new(),
+			log_feeds: Vec::new(),
+			log_commit_root: None,
+			log_deferred: false,
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
 			model.reload_repos(cx);
 		}
 		model
+	}
+
+	/// The repo the shown preview came from: a log commit's own repo, the
+	/// Changes row's repo, else the open repo.
+	pub fn preview_root(&self) -> Option<PathBuf> {
+		match (&self.preview_root, &self.preview) {
+			(_, Some(p))
+				if matches!(
+					p.source,
+					PreviewSource::CommitDiff { .. }
+						| PreviewSource::Compare { .. }
+				) =>
+			{
+				self.log_commit_root.clone().or_else(|| self.repo_root())
+			}
+			(Some((root, id)), Some(p)) if *id == preview_identity(p) => {
+				Some(root.clone())
+			}
+			_ => self.repo_root(),
+		}
+	}
+
+	/// The open repo's Changes slot.
+	pub fn selected_change_slot(&self) -> Option<usize> {
+		let root = self.repo_root()?;
+		self.change_repos.iter().position(|s| s.root == root)
+	}
+
+	fn ensure_change_slot(
+		&mut self,
+		root: &std::path::Path,
+		name: &str,
+	) -> usize {
+		slot_insert(&mut self.change_repos, &mut self.files, root, name)
+	}
+
+	/// Installs one repo's status read into its slot: checkboxes follow the
+	/// basket, rows past `MAX_CHANGES_PER_REPO` are dropped (the node says
+	/// so), and a failure leaves an error row instead of rows.
+	fn install_slot_changes(
+		&mut self,
+		slot: usize,
+		result: Result<Vec<WorkingChangeTuple>, String>,
+	) {
+		let root = self.change_repos[slot].root.clone();
+		let changes = match result {
+			Ok(changes) => changes,
+			Err(err) => {
+				slot_replace_rows(&mut self.files, slot, Vec::new());
+				let s = &mut self.change_repos[slot];
+				s.state = ChangeRepoState::Failed(err);
+				s.total = 0;
+				return;
+			}
+		};
+		let total = changes.len();
+		let canonical = self
+			.repos
+			.iter()
+			.find(|r| r.root == root)
+			.and_then(|r| admitted_selection_root(r, &self.basket))
+			.or_else(|| CanonicalRootId::new(&root).ok());
+		let saved: HashSet<(&str, &SourceKind)> = canonical
+			.as_ref()
+			.and_then(|c| self.basket_items(c))
+			.into_iter()
+			.flatten()
+			.map(|i| (i.relative_path.as_str(), &i.source))
+			.collect();
+		// ponytail: rows past the cap are not listed, so a Git-group sync of
+		// this repo drops a basket entry for one of them; preserve unlisted
+		// entries if a real repo ever needs more than the cap.
+		let rows: Vec<FileChangeItem> = changes
+			.into_iter()
+			.take(MAX_CHANGES_PER_REPO)
+			.map(|(path, change_type, source, is_conflict)| {
+				let selected = saved.contains(&(path.as_str(), &source));
+				FileChangeItem {
+					path,
+					change_type,
+					source,
+					is_conflict,
+					selected,
+					repo: slot as u32,
+				}
+			})
+			.collect();
+		drop(saved);
+		slot_replace_rows(&mut self.files, slot, rows);
+		let s = &mut self.change_repos[slot];
+		s.state = ChangeRepoState::Loaded;
+		s.total = total;
+	}
+
+	/// Mirrors the repo list into the Changes slots: vanished repos lose
+	/// their node, new ones get a loading node.
+	fn sync_change_slots(&mut self) {
+		let mut i = 0;
+		while i < self.change_repos.len() {
+			let root = &self.change_repos[i].root;
+			if self.repos.iter().any(|r| &r.root == root) {
+				i += 1;
+			} else {
+				slot_remove(&mut self.change_repos, &mut self.files, i);
+			}
+		}
+		for r in 0..self.repos.len() {
+			let (root, name) =
+				(self.repos[r].root.clone(), self.repos[r].name.clone());
+			slot_insert(&mut self.change_repos, &mut self.files, &root, &name);
+		}
+	}
+
+	/// Re-reads every repo's Changes except the open one, whose rows its
+	/// own load owns. `only_unloaded` keeps rows that already landed.
+	fn start_changes_queue(
+		&mut self,
+		only_unloaded: bool,
+		cx: &mut Context<Self>,
+	) {
+		if !self.accepting_work() {
+			return;
+		}
+		self.changes_generation = self.changes_generation.wrapping_add(1);
+		let _ = arm_cancel(&mut self.changes_cancel);
+		self.changes_queue.clear_pending();
+		let open = self.repo_root();
+		for slot in &self.change_repos {
+			if Some(&slot.root) == open.as_ref()
+				|| (only_unloaded && slot.state == ChangeRepoState::Loaded)
+			{
+				continue;
+			}
+			self.changes_queue.push(slot.root.clone());
+		}
+		self.pump_changes(cx);
+	}
+
+	/// Starts queued status reads while fewer than `MAX_CHANGES_READS` run.
+	fn pump_changes(&mut self, cx: &mut Context<Self>) {
+		if !self.accepting_work() {
+			self.changes_queue.clear_pending();
+			return;
+		}
+		let Some(cancel) = self.changes_cancel.clone() else {
+			return;
+		};
+		while let Some(root) = self.changes_queue.take() {
+			let generation = self.changes_generation;
+			let known = self
+				.repos
+				.iter()
+				.find(|r| r.root == root)
+				.and_then(|r| r.identity.clone());
+			let mut async_app = cx.to_async();
+			let this = cx.weak_entity();
+			let bg = cx.background_executor().clone();
+			let cancel_bg = cancel.clone();
+			self.spawn_owned(
+				cx,
+				lifecycle::JobKind::CancellableRead,
+				Some(cancel.clone()),
+				async move {
+					let read_root = root.clone();
+					let result = bg
+						.spawn(async move {
+							read_change_list(
+								&read_root,
+								known.as_ref(),
+								cancel_bg,
+							)
+						})
+						.await;
+					let _ = this.update(&mut async_app, |model, cx| {
+						model.changes_queue.finish();
+						if model.changes_generation == generation {
+							model.land_queued_changes(&root, result);
+						}
+						model.pump_changes(cx);
+						cx.notify();
+					});
+				},
+			);
+		}
+	}
+
+	fn land_queued_changes(
+		&mut self,
+		root: &std::path::Path,
+		result: Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>), String>,
+	) {
+		let Some(slot) = self.change_repos.iter().position(|s| s.root == root)
+		else {
+			return;
+		};
+		// The open repo's own load owns its rows.
+		if self.repo_root().as_deref() == Some(root) {
+			return;
+		}
+		let name = self.change_repos[slot].name.clone();
+		let result = result.map(|(summary, changes)| {
+			if let Some(summary) = summary {
+				if let Some(entry) =
+					self.repos.iter_mut().find(|r| r.root == root)
+				{
+					entry.summary = Ok(summary);
+				}
+			}
+			changes
+		});
+		match &result {
+			Ok(changes) => {
+				app_log!(
+					"[APP:CHANGES_LOADED: {} files={}]",
+					name,
+					changes.len()
+				)
+			}
+			Err(_) => app_log!("[APP:CHANGES_ERROR: {}]", name),
+		}
+		self.install_slot_changes(slot, result);
+		self.sync_list_row();
 	}
 
 	pub fn set_status(
@@ -1207,6 +1697,8 @@ impl WorkbenchModel {
 				p.fingerprint()
 			);
 		}
+		// The caller that read it names its repo again after installing.
+		self.preview_root = None;
 		self.preview = Some(p);
 		self.preview_loading = false;
 		self.preview_error = None;
@@ -1220,6 +1712,7 @@ impl WorkbenchModel {
 		let pool = self.paste_pending.clone();
 		let mut state = paste::lock_pending(&pool);
 		self.preview = None;
+		self.preview_root = None;
 		state
 			.admit_ui(
 				None,
@@ -1255,7 +1748,9 @@ impl WorkbenchModel {
 	pub fn deselect_all_files(&mut self, cx: &mut Context<Self>) {
 		let mut candidate = self.selection_candidate();
 		for file in &mut candidate.files {
-			file.selected = false;
+			if self.change_slot_loaded(file.repo) {
+				file.selected = false;
+			}
 		}
 		candidate.paths = Vec::new();
 		candidate.replace_file_group = true;
@@ -1272,7 +1767,9 @@ impl WorkbenchModel {
 	pub fn select_all_files(&mut self, cx: &mut Context<Self>) {
 		let mut candidate = self.selection_candidate();
 		for file in &mut candidate.files {
-			file.selected = file.is_valid_utf8();
+			if self.change_slot_loaded(file.repo) {
+				file.selected = file.is_valid_utf8();
+			}
 		}
 		if let Some(tree) = &self.file_tree {
 			candidate.paths = tree.selection_for_all(true);
@@ -1287,7 +1784,21 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// A slot whose status read has landed; a loading one's rows are inert.
+	pub fn change_slot_loaded(&self, slot: u32) -> bool {
+		self.change_repos
+			.get(slot as usize)
+			.is_some_and(|s| s.state == ChangeRepoState::Loaded)
+	}
+
 	pub fn toggle_file(&mut self, idx: usize, cx: &mut Context<Self>) {
+		if self
+			.files
+			.get(idx)
+			.is_some_and(|f| !self.change_slot_loaded(f.repo))
+		{
+			return;
+		}
 		if self.files.get(idx).is_some_and(|f| !f.is_valid_utf8()) {
 			self.set_status("change_not_utf8", []);
 			app_log!("[APP:FILE_TOGGLE_REFUSED: not_utf8]");
@@ -1644,11 +2155,15 @@ impl WorkbenchModel {
 					&mut self.scan_cancel,
 					&mut self.copy_cancel,
 					&mut self.add_cancel,
+					&mut self.changes_cancel,
 				] {
 					if let Some(token) = slot.as_ref() {
 						token.cancel();
 					}
 				}
+				self.changes_generation =
+					self.changes_generation.wrapping_add(1);
+				self.changes_queue.clear_pending();
 				self.invalidate_paste_job();
 				let name = intent.name();
 				self.emit_life("draining", name, None);
@@ -1710,6 +2225,7 @@ impl WorkbenchModel {
 						self.load_history(cx);
 					}
 				}
+				self.start_changes_queue(true, cx);
 				cx.notify();
 			}
 		}
@@ -1750,6 +2266,14 @@ impl WorkbenchModel {
 		self.selected_repo_idx = None;
 		self.release_repo_state();
 		release_vec(&mut self.basket);
+		release_vec(&mut self.files);
+		release_vec(&mut self.change_repos);
+		if let Some(token) = self.changes_cancel.take() {
+			token.cancel();
+		}
+		self.changes_generation = self.changes_generation.wrapping_add(1);
+		self.changes_queue.clear_pending();
+		self.preview_root = None;
 		self.basket_view = (String::new(), None);
 		self.invalidate_paste_job();
 		if !self.paste_busy() {
@@ -1812,8 +2336,11 @@ impl WorkbenchModel {
 		self.history_walk = None;
 		self.selected_commit = None;
 		self.range_head = None;
+		release_vec(&mut self.log_selected);
 		self.select_head_after_load = false;
 		release_vec(&mut self.commit_files);
+		release_vec(&mut self.commit_file_origin);
+		self.commit_rows_cache.take();
 		self.log_first_page = 0;
 		self.history_extending = false;
 		self.history_autoload = true;
@@ -1823,12 +2350,14 @@ impl WorkbenchModel {
 		release_vec(&mut self.changed_dirs_collapsed);
 		self.log_date_error = false;
 		release_vec(&mut self.log_paths_expanded);
+		release_vec(&mut self.log_feeds);
+		release_vec(&mut self.log_scope_key);
+		self.log_commit_root = None;
 		self.commit_details = None;
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.git_user_email = None;
 		self.selected_commit_file = None;
 		self.compare = None;
-		release_vec(&mut self.files);
 		self.changes_loaded = false;
 		self.file_tree = None;
 		self.rev_tree = None;
@@ -1881,6 +2410,11 @@ impl WorkbenchModel {
 	}
 
 	fn finish_open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+		// The Repository chip is remembered for the same workspace only (a
+		// close has released `workspace_root`; the recent list still has it).
+		if self.recent_workspaces.first() != Some(&path) {
+			self.log_repo_filter.clear();
+		}
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
 		recent::remember(&mut self.recent_workspaces, &path);
@@ -2322,12 +2856,20 @@ impl WorkbenchModel {
 			app_log!("[APP:REPO_VANISHED: {name}]");
 			self.set_status("status_repo_vanished", [name]);
 			self.refresh_reload = false;
+			// The log shows the workspace, not the dropped repository:
+			// reload it over the repositories left.
+			if !self.repos.is_empty() {
+				self.load_history(cx);
+			}
 		} else if std::mem::take(&mut self.refresh_reload) {
 			if let (Some(idx), Some(_)) = (self.selected_repo_idx, self.repo())
 			{
 				self.select_repo_internal(idx, true, cx);
 			}
 		}
+		self.sync_change_slots();
+		self.start_changes_queue(false, cx);
+		self.sync_log_scope(cx);
 		app_log!("[APP:READY_REPOS: {}]", self.repos.len());
 		if e2e_on() {
 			for r in &self.repos {
@@ -2401,9 +2943,41 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// A repo row click, as in IntelliJ's Project view: expands a collapsed
+	/// root, collapses an expanded one. Another repo is selected expanded.
+	/// Scripted drivers that re-click the open repo to reload it must click
+	/// twice (collapse, then expand).
+	pub fn toggle_repo_row(&mut self, idx: usize, cx: &mut Context<Self>) {
+		let expanded =
+			self.selected_repo_idx == Some(idx) && !self.repo_collapsed;
+		self.set_repo_row_expanded(idx, !expanded, cx);
+	}
+
+	pub fn set_repo_row_expanded(
+		&mut self,
+		idx: usize,
+		expanded: bool,
+		cx: &mut Context<Self>,
+	) {
+		self.repo_collapsed = !expanded;
+		if expanded {
+			// Re-expanding the open repo re-reads it, so the rows shown are
+			// current (one status and one log page).
+			self.select_repo(idx, cx);
+		} else {
+			cx.notify();
+		}
+	}
+
 	pub fn select_repo(&mut self, idx: usize, cx: &mut Context<Self>) {
 		if let Some(entry) = self.repos.get(idx) {
 			self.pinned_repo = Some(repo_key(entry));
+			// Opening a repo reveals its changes in every group; the others
+			// stay collapsed.
+			expand_repo_everywhere(
+				&mut self.chrome.expanded_repos,
+				&entry.root,
+			);
 		}
 		self.select_repo_internal(idx, false, cx);
 	}
@@ -2633,16 +3207,20 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
+		// The log shows the workspace: a plain switch keeps it.
+		let reload_log = self.log_reloads_on_repo_switch(preserve_anchors);
 		self.generation += 1;
 		self.preview_generation += 1;
-		self.history_generation += 1;
+		if reload_log {
+			self.history_generation += 1;
+			let _ = arm_cancel(&mut self.history_cancel);
+		}
 		self.tree_generation += 1;
 		let task_generation = self.generation;
 		self.preview_loading = false;
 		let _ = arm_cancel(&mut self.preview_cancel);
 		let _ = arm_cancel(&mut self.tree_cancel);
 		let _ = arm_cancel(&mut self.rev_tree_cancel);
-		let _ = arm_cancel(&mut self.history_cancel);
 		let cancel = arm_cancel(&mut self.repo_cancel);
 
 		let anchor_file = if preserve_anchors {
@@ -2667,35 +3245,64 @@ impl WorkbenchModel {
 			}
 		}
 
+		// A superseded read of the previously open repo is dropped when it
+		// lands; the queue reads that repo instead of leaving it loading.
+		let previous = self.repo_root();
+		if previous.as_ref() != Some(&self.repos[idx].root) {
+			if let Some(prev) = previous.filter(|prev| {
+				self.change_repos.iter().any(|s| {
+					&s.root == prev && s.state == ChangeRepoState::Loading
+				})
+			}) {
+				self.changes_queue.push(prev);
+				self.pump_changes(cx);
+			}
+		}
 		self.selected_repo_idx = Some(idx);
 		self.selected_file = anchor_file.clone();
 		self.selected_commit = anchor_commit.clone();
 		self.range_head = None;
+		self.log_selected.clear();
 		self.compare = None;
 		self.commit_files.clear();
-		self.commits.clear();
-		self.refs.clear();
-		self.head_sha = None;
-		self.graph_layout = None;
-		self.files.clear();
 		self.changes_loaded = false;
-		self.commit_page = 0;
-		self.log_first_page = 0;
-		self.log_on_head.clear();
-		self.history_extending = false;
-		self.page_checkpoints = vec![None];
-		self.collapsed_merges.clear();
-		self.hidden_commits.clear();
-		self.history_walk = None;
-		self.history_error = None;
+		// Its rows stay shown but inert until the re-read lands: their
+		// checkboxes must not replace the repo's Git group meanwhile.
+		let reloading = self.repos[idx].root.clone();
+		if let Some(slot) =
+			self.change_repos.iter_mut().find(|s| s.root == reloading)
+		{
+			if slot.state == ChangeRepoState::Loaded {
+				slot.state = ChangeRepoState::Loading;
+			}
+		}
+		if reload_log {
+			self.commits.clear();
+			self.refs.clear();
+			self.head_sha = None;
+			self.graph_layout = None;
+			self.commit_page = 0;
+			self.log_first_page = 0;
+			self.log_on_head.clear();
+			self.history_extending = false;
+			self.page_checkpoints = vec![None];
+			self.collapsed_merges.clear();
+			self.hidden_commits.clear();
+			self.history_walk = None;
+			self.history_error = None;
+		}
 		if !preserve_anchors {
-			self.log_filter = LogQuery::default();
 			self.commit_details = None;
+		}
+		if !preserve_anchors && reload_log {
+			self.log_filter = LogQuery::default();
 			self.git_user_email = None;
 			// A reload of the same repo keeps the log's branch filter and
 			// search, which the history reload applies again.
 			self.active_ref_filter = None;
 			self.log_search = None;
+		}
+		if !preserve_anchors {
 			self.clear_preview();
 			self.preview_error = None;
 			self.rev_tree = None;
@@ -2751,57 +3358,11 @@ impl WorkbenchModel {
 			lifecycle::JobKind::CancellableRead,
 			Some(cancel),
 			async move {
-				let working_res: Result<
-					(Option<RepoSummary>, Vec<WorkingChangeTuple>),
-					String,
-				> = bg.spawn(async move {
-					let opts = interactive_read_opts(cancel_bg);
-					// A known identity skips the open and the identity
-					// reads, and one status feeds both the list and the
-					// repo's summary.
-					let (summary, details) = match &known {
-						Some(id) => {
-							let git = Git::at_known_root(id.toplevel.clone());
-							let (summary, details) =
-								summarize_with_details(&git, id, &opts)
-									.map_err(|e| e.to_string())?;
-							(Some(summary), details)
-						}
-						None => {
-							let git = Git::open_with(&repo_root, &opts)
-								.map_err(|e| e.to_string())?;
-							let details = status_details(&git, &opts)
-								.map_err(|e| e.to_string())?;
-							(None, details)
-						}
-					};
-					let mut items = Vec::new();
-					for (p, ct) in details.staged {
-						items.push((p, ct, SourceKind::Staged, false));
-					}
-					for (p, ct) in details.unstaged {
-						items.push((p, ct, SourceKind::Unstaged, false));
-					}
-					for p in details.untracked {
-						items.push((
-							p,
-							Some(ChangeType::New),
-							SourceKind::Working,
-							false,
-						));
-					}
-					for p in details.conflicted {
-						items.push((
-							p,
-							Some(ChangeType::Modified),
-							SourceKind::Working,
-							true,
-						));
-					}
-					items.sort_by(|a, b| a.0.cmp(&b.0));
-					Ok((summary, items))
-				})
-				.await;
+				let working_res = bg
+					.spawn(async move {
+						read_change_list(&repo_root, known.as_ref(), cancel_bg)
+					})
+					.await;
 
 				let _ = this.update(&mut async_app, |model, cx| {
 					if model.generation != task_generation {
@@ -2810,61 +3371,33 @@ impl WorkbenchModel {
 					match working_res {
 						Ok((summary, changes)) => {
 							model.update_open_summary(summary);
-							let canonical =
-								CanonicalRootId::new(&repo_root_for_update)
-									.ok();
-							let saved: HashSet<(&str, &SourceKind)> = canonical
-								.as_ref()
-								.and_then(|c| model.basket_items(c))
-								.into_iter()
-								.flatten()
-								.map(|i| (i.relative_path.as_str(), &i.source))
-								.collect();
-							let files = changes
-								.into_iter()
-								.map(
-									|(
-										path,
-										change_type,
-										source,
-										is_conflict,
-									)| {
-										let selected = saved.contains(&(
-											path.as_str(),
-											&source,
-										));
-										FileChangeItem {
-											path,
-											change_type,
-											source,
-											is_conflict,
-											selected,
-										}
-									},
-								)
-								.collect();
-							model.files = files;
+							let slot = model.ensure_change_slot(
+								&repo_root_for_update,
+								&repo_name,
+							);
+							model.install_slot_changes(slot, Ok(changes));
+							let slot = slot_range(&model.files, slot);
 							model.changes_loaded = true;
 							app_log!(
 								"[APP:REPO_LOADED: {} files={}]",
 								repo_name,
-								model.files.len()
+								slot.len()
 							);
 							model.set_status(
 								"status_repo_loaded",
-								[
-									repo_name.clone(),
-									model.files.len().to_string(),
-								],
+								[repo_name.clone(), slot.len().to_string()],
 							);
 							if anchor_commit.is_some() {
 								// The history reload re-selects the commit.
 							} else if let Some(ref anchor) = anchor_file {
 								let kept = anchor_source.as_ref().filter(|s| {
 									**s == SourceKind::File
-										|| model.files.iter().any(|f| {
-											&f.path == anchor && &f.source == *s
-										})
+										|| model.files[slot.clone()].iter().any(
+											|f| {
+												&f.path == anchor
+													&& &f.source == *s
+											},
+										)
 								});
 								if let Some(source) = kept {
 									model.select_file_with_source(
@@ -2872,13 +3405,13 @@ impl WorkbenchModel {
 										source.clone(),
 										cx,
 									);
-								} else if model
-									.files
+								} else if model.files[slot.clone()]
 									.iter()
 									.any(|f| &f.path == anchor)
 								{
 									model.select_file(anchor, cx);
-								} else if let Some(first) = model.files.first()
+								} else if let Some(first) =
+									model.files[slot.clone()].first()
 								{
 									let first_path = first.path.clone();
 									model.select_file(&first_path, cx);
@@ -2889,7 +3422,9 @@ impl WorkbenchModel {
 										ready_marker("PREVIEW");
 									}
 								}
-							} else if let Some(first) = model.files.first() {
+							} else if let Some(first) =
+								model.files[slot.clone()].first()
+							{
 								let first_path = first.path.clone();
 								model.select_file(&first_path, cx);
 							} else if model.mode == "preview" {
@@ -2899,6 +3434,11 @@ impl WorkbenchModel {
 						}
 						Err(err) => {
 							app_log!("[APP:REPO_ERROR: {}]", repo_name);
+							let slot = model.ensure_change_slot(
+								&repo_root_for_update,
+								&repo_name,
+							);
+							model.install_slot_changes(slot, Err(err.clone()));
 							model.set_status(
 								"error_repo_changes",
 								[repo_name.clone(), err.clone()],
@@ -2909,17 +3449,24 @@ impl WorkbenchModel {
 							));
 						}
 					}
-					model.load_history(cx);
+					if reload_log {
+						model.load_history(cx);
+					} else {
+						model.log_kept_on_repo_switch();
+					}
 					cx.notify();
 				});
 			},
 		);
 	}
 
-	/// Selects a file, using its known source identity if in the changes list.
+	/// Selects a file of the open repo, using its known source identity if
+	/// it is in that repo's Changes rows.
 	pub fn select_file(&mut self, path: &str, cx: &mut Context<Self>) {
-		let source = self
-			.files
+		let rows = self
+			.selected_change_slot()
+			.map_or(0..0, |slot| slot_range(&self.files, slot));
+		let source = self.files[rows]
 			.iter()
 			.find(|f| f.path == path)
 			.map(|f| f.source.clone())
@@ -2927,18 +3474,33 @@ impl WorkbenchModel {
 		self.select_file_with_source(path, source, cx);
 	}
 
-	/// Selects a file item directly from the changes list.
-	pub fn select_file_item(
-		&mut self,
-		item: &FileChangeItem,
-		cx: &mut Context<Self>,
-	) {
-		self.select_file_with_source(&item.path, item.source.clone(), cx);
+	/// Opens Changes row `idx` from its own repo, whichever repo is open.
+	pub fn select_change(&mut self, idx: usize, cx: &mut Context<Self>) {
+		let Some(item) = self.files.get(idx) else {
+			return;
+		};
+		let root = self
+			.change_repos
+			.get(item.repo as usize)
+			.map(|slot| slot.root.clone());
+		let (path, source) = (item.path.clone(), item.source.clone());
+		self.select_file_in(root, &path, source, cx);
 	}
 
 	/// Opens a working-tree file (Project) or its staged/unstaged changes (Changes).
 	pub fn select_file_with_source(
 		&mut self,
+		path: &str,
+		source: SourceKind,
+		cx: &mut Context<Self>,
+	) {
+		self.select_file_in(None, path, source, cx);
+	}
+
+	/// Opens `path` of repo `root` (the open repo when `None`).
+	pub fn select_file_in(
+		&mut self,
+		root: Option<PathBuf>,
 		path: &str,
 		source: SourceKind,
 		cx: &mut Context<Self>,
@@ -2955,11 +3517,13 @@ impl WorkbenchModel {
 			self.selected_commit.take(),
 		);
 		self.range_head = None;
+		self.log_selected.clear();
 		self.compare = None;
 		self.commit_files.clear();
-		let Some(repo_root) = self.repo_root() else {
+		let Some(repo_root) = root.or_else(|| self.repo_root()) else {
 			return;
 		};
+		let shown_root = repo_root.clone();
 		let file_path = path.to_string();
 		self.preview_loading = true;
 		self.preview_error = None;
@@ -3004,6 +3568,10 @@ impl WorkbenchModel {
 					return;
 				}
 				if model.apply_source_preview(file_path.clone(), result) {
+					model.preview_root = model
+						.preview
+						.as_ref()
+						.map(|p| (shown_root, preview_identity(p)));
 					app_log!("[APP:PREVIEW_LOADED: {}]", file_path);
 					if model.mode == "preview" {
 						ready_marker("PREVIEW");
@@ -3091,6 +3659,14 @@ impl WorkbenchModel {
 			bytes = bytes.saturating_add(path.capacity());
 		}
 		bytes = bytes
+			.saturating_add(self.commit_file_origin.capacity() * 4)
+			.saturating_add(
+				self.log_selected.capacity() * std::mem::size_of::<String>(),
+			);
+		for id in &self.log_selected {
+			bytes = bytes.saturating_add(id.capacity());
+		}
+		bytes = bytes
 			.saturating_add(std::mem::size_of_val(&self.file_tree))
 			.saturating_add(self.file_tree.as_ref().map_or(0, |tree| {
 				tree.retained_bytes() - std::mem::size_of::<FileTreeNode>()
@@ -3134,6 +3710,17 @@ impl WorkbenchModel {
 			);
 		for path in &self.restore_expanded {
 			bytes = bytes.saturating_add(path.capacity());
+		}
+		let dirs = &self.chrome.expanded_dirs;
+		bytes = bytes
+			.saturating_add(std::mem::size_of_val(dirs))
+			.saturating_add(dirs.capacity().saturating_mul(
+				std::mem::size_of::<(&'static str, PathBuf, String)>(),
+			));
+		for (_, root, dir) in dirs {
+			bytes = bytes
+				.saturating_add(root.capacity())
+				.saturating_add(dir.capacity());
 		}
 		bytes = bytes
 			.saturating_add(std::mem::size_of_val(&self.discovery))
@@ -3210,33 +3797,61 @@ impl WorkbenchModel {
 		&mut self,
 		mut candidate: PreparedSelection,
 	) -> bool {
-		// An unloaded or failed Changes list has no checkboxes to replace the
-		// Git group with; doing so would silently drop the repo's selections.
-		candidate.replace_git_group &= self.changes_loaded;
+		// Each loaded repo's Changes rows replace that repo's Git group; an
+		// unloaded or failed list has no checkboxes to replace it with, and
+		// doing so would silently drop the repo's selections. The Project
+		// tree's File group belongs to the open repo.
 		if candidate.replace_file_group || candidate.replace_git_group {
-			let admitted = self
-				.repo()
-				.and_then(|repo| admitted_selection_root(repo, &self.basket));
-			let root = match admitted {
-				Some(root) => Some(root),
-				None if candidate.remove_only => None,
-				None => match self.repo_root() {
-					Some(path) => match CanonicalRootId::new(path) {
-						Ok(root) => Some(root),
+			let open = self.repo_root();
+			let mut jobs: Vec<(PathBuf, bool, Option<u32>)> = Vec::new();
+			if candidate.replace_git_group {
+				for (i, slot) in self.change_repos.iter().enumerate() {
+					if slot.state == ChangeRepoState::Loaded {
+						let file_group = candidate.replace_file_group
+							&& open.as_ref() == Some(&slot.root);
+						jobs.push((
+							slot.root.clone(),
+							file_group,
+							Some(i as u32),
+						));
+					}
+				}
+			}
+			if candidate.replace_file_group && !jobs.iter().any(|job| job.1) {
+				if let Some(root) = open {
+					jobs.push((root, true, None));
+				}
+			}
+			for (path, file_group, git_slot) in jobs {
+				let admitted =
+					self.repos.iter().find(|repo| repo.root == path).and_then(
+						|repo| admitted_selection_root(repo, &self.basket),
+					);
+				let adds = (file_group && !candidate.paths.is_empty())
+					|| git_slot.is_some_and(|slot| {
+						candidate
+							.files
+							.iter()
+							.any(|f| f.repo == slot && f.selected)
+					});
+				let root = match admitted {
+					Some(root) => root,
+					None if candidate.remove_only || !adds => continue,
+					None => match CanonicalRootId::new(&path) {
+						Ok(root) => root,
 						Err(_) => {
 							self.set_status("error_selection_root", []);
 							return false;
 						}
 					},
-					None => None,
-				},
-			};
-			if root.is_some_and(|root| !candidate.sync_root(root)) {
-				self.set_status("error_tree_budget", []);
-				app_log!(
-					"[APP:TREE_ADMISSION_REFUSED: selection_amplification]"
-				);
-				return false;
+				};
+				if !candidate.sync_root(root, file_group, git_slot) {
+					self.set_status("error_tree_budget", []);
+					app_log!(
+						"[APP:TREE_ADMISSION_REFUSED: selection_amplification]"
+					);
+					return false;
+				}
 			}
 		}
 		if !candidate.fits_replacing(
@@ -3379,7 +3994,7 @@ impl WorkbenchModel {
 	pub fn basket_summary_localized(&self, loc: Locale) -> String {
 		self.basket_summary_with(|source| match source {
 			SourceKind::File => i18n::t("src_working_file", loc).to_string(),
-			SourceKind::Working => i18n::t("group_untracked", loc).to_string(),
+			SourceKind::Working => i18n::t("tag_untracked", loc).to_string(),
 			SourceKind::Unstaged => i18n::t("tag_unstaged", loc).to_string(),
 			SourceKind::Staged => i18n::t("tag_staged", loc).to_string(),
 			SourceKind::Commit { rev } => {
@@ -3707,33 +4322,25 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
-		let Some(repo_root) = self.repo_root() else {
-			return;
-		};
-		let repo_name = self.repo().map(|r| r.name.clone()).unwrap_or_default();
-		let rows = self.display_commits();
-		let (tip_sha, selected) = if let Some((top, bottom)) = self.range_rows()
-		{
-			let slice = &rows[top..=bottom];
-			let tip = slice[0].sha.clone();
-			let selected = slice.iter().map(|c| c.sha.clone()).collect();
-			(tip, selected)
-		} else if let Some(ref sel) = self.selected_commit {
-			if rows.iter().any(|c| &c.sha == sel) {
-				(sel.clone(), vec![sel.clone()])
-			} else {
-				app_log!("[APP:COPY_COMMITS_REFUSED: no_selection]");
-				self.set_status("status_copy_empty", []);
-				cx.notify();
-				return;
-			}
-		} else {
-			app_log!("[APP:COPY_COMMITS_REFUSED: no_selection]");
-			self.set_status("status_copy_empty", []);
-			cx.notify();
-			return;
-		};
-		drop(rows);
+		// The commits' own repository, not the selected one: the log shows
+		// every repository of the workspace.
+		let (repo_root, repo_name, tip_sha, selected) =
+			match self.commit_copy_target() {
+				Ok(target) => target,
+				Err(reason) => {
+					app_log!("[APP:COPY_COMMITS_REFUSED: {reason}]");
+					self.set_status(
+						if reason == "cross_repo" {
+							"status_log_cross_repo"
+						} else {
+							"status_copy_empty"
+						},
+						[],
+					);
+					cx.notify();
+					return;
+				}
+			};
 
 		self.is_copying = true;
 		self.set_status("status_copying", [repo_name.clone()]);
@@ -4406,6 +5013,7 @@ impl WorkbenchModel {
 		self.selected_file_source = None;
 		self.selected_commit = None;
 		self.range_head = None;
+		self.log_selected.clear();
 		self.compare = None;
 		self.selected_commit_file = None;
 		self.commit_files.clear();
@@ -5050,6 +5658,7 @@ mod tests {
 				change_type: None,
 				is_conflict: false,
 				selected: true,
+				repo: 0,
 			})
 			.collect();
 		let sha_a = "a".repeat(40);
@@ -5061,7 +5670,7 @@ mod tests {
 		);
 		old.replace_file_group = true;
 		old.replace_git_group = true;
-		assert!(old.sync_root(root.clone()));
+		assert!(old.sync_root(root.clone(), true, Some(0)));
 		assert!(old.toggle_revision(root.clone(), &sha_a, "same.txt"));
 		assert!(old.toggle_revision(root.clone(), &sha_b, "same.txt"));
 		assert!(old.toggle_revision(other_root.clone(), &sha_a, "same.txt"));
@@ -5110,7 +5719,7 @@ mod tests {
 			kept_item.relative_path.capacity(),
 		);
 		removal.status = Some(Msg::new("status_selection_removed", []));
-		assert!(removal.sync_root(admitted));
+		assert!(removal.sync_root(admitted, true, Some(0)));
 		assert!(removal.retained_bytes() < old_bytes);
 		assert!(removal.fits_replacing(
 			MAX_RETAINED_TREE_BYTES,
@@ -5144,7 +5753,7 @@ mod tests {
 			file.selected = false;
 		}
 		removal.paths = Vec::new();
-		assert!(removal.sync_root(root.clone()));
+		assert!(removal.sync_root(root.clone(), true, Some(0)));
 		let kept =
 			&removal.basket.iter().find(|(id, _)| id == &root).unwrap().1;
 		assert_eq!(
@@ -5171,6 +5780,7 @@ mod tests {
 			source: SourceKind::Working,
 			is_conflict: false,
 			selected: false,
+			repo: 0,
 		};
 		let lossy = String::from_utf8_lossy(b"bad\xff.txt").into_owned();
 		assert!(!item(lossy).is_valid_utf8());
@@ -5228,7 +5838,7 @@ mod tests {
 			&[(root.clone(), vec![staged.clone(), historical.clone()])],
 		);
 		candidate.replace_file_group = true;
-		assert!(candidate.sync_root(root));
+		assert!(candidate.sync_root(root, true, Some(0)));
 		assert!(candidate.basket[0].1.contains(&staged));
 		assert!(candidate.basket[0].1.contains(&historical));
 		assert_eq!(candidate.basket[0].1.len(), 3);
@@ -5254,12 +5864,13 @@ mod tests {
 			source,
 			is_conflict: false,
 			selected: false,
+			repo: 0,
 		})
 		.collect();
 		let mut old = PreparedSelection::new(&files, &["same.txt".into()], &[]);
 		old.replace_file_group = true;
 		old.replace_git_group = true;
-		assert!(old.sync_root(root.clone()));
+		assert!(old.sync_root(root.clone(), true, Some(0)));
 		assert!(old.toggle_revision(other_root.clone(), &sha_b, "same.txt"));
 		let before = old.basket.clone();
 		let old_bytes = old.retained_bytes();
@@ -5272,7 +5883,7 @@ mod tests {
 		assert!(candidate.toggle_revision(root.clone(), &sha_b, "same.txt"));
 		candidate.replace_file_group = true;
 		candidate.replace_git_group = true;
-		assert!(candidate.sync_root(root.clone()));
+		assert!(candidate.sync_root(root.clone(), true, Some(0)));
 		let bytes = candidate.retained_bytes();
 		assert!(bytes > old_bytes);
 		let other_owners = 173;
@@ -5341,7 +5952,7 @@ mod tests {
 			"same.txt"
 		));
 		candidate.replace_file_group = true;
-		assert!(candidate.sync_root(root));
+		assert!(candidate.sync_root(root, true, Some(0)));
 		let before = candidate.retained_bytes();
 		let slots = candidate.paths.capacity();
 		candidate.paths.reserve_exact(31);
@@ -5390,7 +6001,7 @@ mod tests {
 				< MAX_RETAINED_TREE_BYTES,
 			"the whole slot allocation fits; repeated root/path heaps must reject"
 		);
-		assert!(!candidate.sync_root(root), "per-item root/path copies must be checked while building the whole basket");
+		assert!(!candidate.sync_root(root, true, Some(0)), "per-item root/path copies must be checked while building the whole basket");
 		assert!(
 			candidate.basket.is_empty(),
 			"a rejected partial group is never installed"
@@ -5646,5 +6257,532 @@ mod tests {
 		release_path(&mut path);
 		assert!(path.as_os_str().is_empty());
 		assert_eq!(path.capacity(), 0);
+	}
+
+	fn change(path: &str, source: SourceKind, repo: u32) -> FileChangeItem {
+		FileChangeItem {
+			path: path.into(),
+			change_type: None,
+			source,
+			is_conflict: false,
+			selected: false,
+			repo,
+		}
+	}
+
+	#[test]
+	fn change_queue_runs_at_most_two_reads() {
+		let mut q = ReadQueue::new(MAX_CHANGES_READS);
+		for n in 0..15 {
+			q.push(n);
+		}
+		q.push(3);
+		assert_eq!(q.take(), Some(0));
+		assert_eq!(q.take(), Some(1));
+		assert_eq!(q.take(), None, "a third read waits");
+		assert_eq!(q.in_flight(), 2);
+		q.finish();
+		assert_eq!(q.take(), Some(2));
+		assert_eq!(q.take(), None);
+		let mut started = 3;
+		while q.in_flight() > 0 {
+			q.finish();
+			while let Some(n) = q.take() {
+				assert_eq!(n, started, "reads start in order, once each");
+				started += 1;
+				assert!(q.in_flight() <= MAX_CHANGES_READS);
+			}
+		}
+		assert_eq!(started, 15);
+		q.push(1);
+		q.clear_pending();
+		assert_eq!(q.take(), None);
+	}
+
+	#[test]
+	fn change_slots_keep_rows_grouped_by_repo() {
+		use std::path::Path;
+		let mut slots = Vec::new();
+		let mut files = Vec::new();
+		let b = slot_insert(&mut slots, &mut files, Path::new("/w/b"), "b");
+		slot_replace_rows(
+			&mut files,
+			b,
+			vec![
+				change("x.txt", SourceKind::Unstaged, 0),
+				change("y.txt", SourceKind::Working, 0),
+			],
+		);
+		// A repo sorting first renumbers the rows after it.
+		let a = slot_insert(&mut slots, &mut files, Path::new("/w/a"), "a");
+		assert_eq!((a, slots[1].name.as_str()), (0, "b"));
+		assert!(files.iter().all(|f| f.repo == 1));
+		slot_replace_rows(
+			&mut files,
+			a,
+			vec![change("x.txt", SourceKind::Staged, 0)],
+		);
+		let c = slot_insert(&mut slots, &mut files, Path::new("/w/c"), "c");
+		assert_eq!(c, 2);
+		assert_eq!(slot_range(&files, 0), 0..1);
+		assert_eq!(slot_range(&files, 1), 1..3);
+		assert_eq!(slot_range(&files, 2), 3..3);
+		assert_eq!(
+			slot_insert(&mut slots, &mut files, Path::new("/w/b"), "b"),
+			1
+		);
+
+		// Replacing one repo's rows leaves the others alone.
+		slot_replace_rows(
+			&mut files,
+			1,
+			vec![change("z", SourceKind::Working, 1)],
+		);
+		assert_eq!(files.len(), 2);
+		assert_eq!(files[1].path, "z");
+
+		slot_remove(&mut slots, &mut files, 0);
+		assert_eq!(files.len(), 1);
+		assert_eq!(files[0].repo, 0);
+	}
+
+	/// Three repos: `a` staged + unstaged, `b` staged + untracked, `c`
+	/// clean.
+	fn three_repos() -> (Vec<ChangeRepo>, Vec<FileChangeItem>) {
+		use std::path::Path;
+		let mut slots = Vec::new();
+		let mut files = Vec::new();
+		for name in ["a", "b", "c"] {
+			let root = Path::new("/w").join(name);
+			slot_insert(&mut slots, &mut files, &root, name);
+		}
+		slot_replace_rows(
+			&mut files,
+			0,
+			vec![
+				change("s.txt", SourceKind::Staged, 0),
+				change("u.txt", SourceKind::Unstaged, 0),
+			],
+		);
+		slot_replace_rows(
+			&mut files,
+			1,
+			vec![
+				change("s.txt", SourceKind::Staged, 1),
+				change("w.txt", SourceKind::Working, 1),
+			],
+		);
+		(slots, files)
+	}
+
+	/// Compact form of Changes rows: `G:<group>:<count>`,
+	/// `R:<group>:<repo>:<count>`, `N:<repo>`, `D<depth>:<repo>:<name>:<count>`
+	/// and `F<depth>:<repo>:<path>`.
+	fn shape(
+		slots: &[ChangeRepo],
+		files: &[FileChangeItem],
+		rows: &[ui::ChangeItemRow],
+	) -> Vec<String> {
+		rows.iter()
+			.map(|r| match r {
+				ui::ChangeItemRow::Header {
+					group_id, count, ..
+				} => format!("G:{group_id}:{count}"),
+				ui::ChangeItemRow::Repo {
+					slot,
+					group_id,
+					count,
+				} => format!("R:{group_id}:{}:{count}", slots[*slot].name),
+				ui::ChangeItemRow::Note { slot } => {
+					format!("N:{}", slots[*slot].name)
+				}
+				ui::ChangeItemRow::Dir {
+					slot,
+					name,
+					count,
+					depth,
+					..
+				} => format!("D{depth}:{}:{name}:{count}", slots[*slot].name),
+				ui::ChangeItemRow::File { file_idx, depth } => {
+					let f = &files[*file_idx];
+					format!(
+						"F{depth}:{}:{}",
+						slots[f.repo as usize].name, f.path
+					)
+				}
+			})
+			.collect()
+	}
+
+	type Expanded = fn(usize, &str, &str) -> bool;
+
+	/// Flat file lists under each repo.
+	const FLAT: ui::ChangeLayout<Expanded> = ui::ChangeLayout {
+		by_dir: false,
+		expanded: |_, _, _| false,
+	};
+
+	#[test]
+	fn change_rows_put_groups_over_repos() {
+		let (mut slots, files) = three_repos();
+		// Groups first (staged, unstaged), each over its repos in name
+		// order; repo rows start collapsed; clean `c` is absent. Untracked
+		// `w.txt` counts under Unstaged.
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| true, "", &FLAT);
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:2",
+				"R:staged:a:1",
+				"R:staged:b:1",
+				"G:unstaged:2",
+				"R:unstaged:a:1",
+				"R:unstaged:b:1",
+			]
+		);
+
+		// Opening `b` expands it in every group, and only `b`.
+		let mut open = Vec::new();
+		expand_repo_everywhere(&mut open, &slots[1].root);
+		let roots: Vec<PathBuf> =
+			slots.iter().map(|s| s.root.clone()).collect();
+		let collapsed = |slot: usize, g: &str| {
+			!open.iter().any(|(og, r)| *og == g && *r == roots[slot])
+		};
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, collapsed, "", &FLAT);
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:2",
+				"R:staged:a:1",
+				"R:staged:b:1",
+				"F2:b:s.txt",
+				"G:unstaged:2",
+				"R:unstaged:a:1",
+				"R:unstaged:b:1",
+				"F2:b:w.txt",
+			]
+		);
+
+		// A collapsed group hides its repo rows; the others stay.
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|g| g == "staged",
+			|_, _| true,
+			"",
+			&FLAT,
+		);
+		assert_eq!(
+			shape(&slots, &files, &rows)[..2],
+			["G:staged:2", "G:unstaged:2"]
+		);
+
+		// Speed search keeps repos whose name matches, ignoring case; a
+		// group keeps its full count.
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| true, "B", &FLAT);
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:2",
+				"R:staged:b:1",
+				"G:unstaged:2",
+				"R:unstaged:b:1"
+			]
+		);
+
+		// A failed repo with no rows gets a top-level note; a truncated
+		// list says so under each of its expanded repo rows.
+		slots[2].state = ChangeRepoState::Failed("boom".into());
+		slots[1].total = MAX_CHANGES_PER_REPO + 1;
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, collapsed, "", &FLAT);
+		let got = shape(&slots, &files, &rows);
+		assert_eq!(got[0], "N:c");
+		assert_eq!(got[3..6], ["R:staged:b:1", "N:b", "F2:b:s.txt"]);
+		assert_eq!(got.iter().filter(|r| *r == "N:b").count(), 2);
+	}
+
+	#[test]
+	fn change_rows_keep_a_single_repo_flat() {
+		let (mut slots, mut files) = three_repos();
+		slot_remove(&mut slots, &mut files, 2);
+		slot_remove(&mut slots, &mut files, 1);
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| true, "x", &FLAT);
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			["G:staged:1", "F1:a:s.txt", "G:unstaged:1", "F1:a:u.txt"]
+		);
+	}
+
+	/// One repo `r` with a nested tree: `src/main/java/pkg` is a chain of
+	/// single-child directories, `src` has two children, and an untracked
+	/// folder `Notes/` arrives as a leaf.
+	fn nested_repo() -> (Vec<ChangeRepo>, Vec<FileChangeItem>) {
+		let mut slots = Vec::new();
+		let mut files = Vec::new();
+		slot_insert(&mut slots, &mut files, std::path::Path::new("/w/r"), "r");
+		slot_replace_rows(
+			&mut files,
+			0,
+			vec![
+				change("src/main/java/pkg/B.java", SourceKind::Unstaged, 0),
+				change("pom.xml", SourceKind::Unstaged, 0),
+				change("src/test/T.java", SourceKind::Working, 0),
+				change("src/main/java/pkg/a.java", SourceKind::Unstaged, 0),
+				change("AGENTS.md", SourceKind::Working, 0),
+				change("docs/x/y.md", SourceKind::Staged, 0),
+				change("Notes/", SourceKind::Working, 0),
+			],
+		);
+		(slots, files)
+	}
+
+	#[test]
+	fn change_rows_group_by_directory() {
+		let (slots, files) = nested_repo();
+		let open = |dirs: &'static [&'static str]| ui::ChangeLayout {
+			by_dir: true,
+			expanded: move |_: usize, g: &str, d: &str| {
+				g == "unstaged" && dirs.contains(&d)
+			},
+		};
+		// Directories start collapsed: the group shows its top-level
+		// directories (first, with the count of every file beneath) and
+		// then its root files, each by name ignoring case. Untracked files
+		// sit in Unstaged; the untracked folder `Notes/` is a leaf.
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|_| false,
+			|_, _| false,
+			"",
+			&open(&[]),
+		);
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:1",
+				"D1:r:docs/x:1",
+				"G:unstaged:6",
+				"D1:r:src:3",
+				"F1:r:AGENTS.md",
+				"F1:r:Notes/",
+				"F1:r:pom.xml",
+			]
+		);
+
+		// Expanding by (group, dir path): `src` shows its children, and the
+		// single-child chain under `main` is one row keyed by its full path.
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|_| false,
+			|_, _| false,
+			"",
+			&open(&["src", "src/main/java/pkg"]),
+		);
+		assert_eq!(
+			shape(&slots, &files, &rows)[2..],
+			[
+				"G:unstaged:6",
+				"D1:r:src:3",
+				"D2:r:main/java/pkg:2",
+				"F3:r:src/main/java/pkg/a.java",
+				"F3:r:src/main/java/pkg/B.java",
+				"D2:r:test:1",
+				"F1:r:AGENTS.md",
+				"F1:r:Notes/",
+				"F1:r:pom.xml",
+			]
+		);
+		let dir_path = rows.iter().find_map(|r| match r {
+			ui::ChangeItemRow::Dir { name, path, .. }
+				if name == "main/java/pkg" =>
+			{
+				Some(path.clone())
+			}
+			_ => None,
+		});
+		assert_eq!(dir_path.as_deref(), Some("src/main/java/pkg"));
+		// Expansion is per group: `docs/x` stays closed in Staged.
+		assert_eq!(
+			shape(&slots, &files, &rows)[..2],
+			["G:staged:1", "D1:r:docs/x:1"]
+		);
+		// An open child under a closed parent stays hidden.
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|_| false,
+			|_, _| false,
+			"",
+			&open(&["src/main/java/pkg"]),
+		);
+		assert!(!shape(&slots, &files, &rows)
+			.iter()
+			.any(|r| r.contains("pkg")));
+
+		// Flat mode lists the files in Git's order under the group.
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| false, "", &FLAT);
+		assert_eq!(
+			shape(&slots, &files, &rows)[2..],
+			[
+				"G:unstaged:6",
+				"F1:r:src/main/java/pkg/B.java",
+				"F1:r:pom.xml",
+				"F1:r:src/test/T.java",
+				"F1:r:src/main/java/pkg/a.java",
+				"F1:r:AGENTS.md",
+				"F1:r:Notes/",
+			]
+		);
+	}
+
+	#[test]
+	fn change_rows_nest_directories_under_repo_rows() {
+		let (mut slots, mut files) = nested_repo();
+		slot_insert(&mut slots, &mut files, std::path::Path::new("/w/s"), "s");
+		slot_replace_rows(
+			&mut files,
+			1,
+			vec![change("lib/z.rs", SourceKind::Unstaged, 1)],
+		);
+		let layout = ui::ChangeLayout {
+			by_dir: true,
+			expanded: |slot: usize, _: &str, d: &str| slot == 0 && d == "src",
+		};
+		let rows = ui::change_rows(
+			&slots,
+			&files,
+			|_| false,
+			|slot, g| slot == 1 || g == "staged",
+			"",
+			&layout,
+		);
+		// Under a repo row the tree starts one level deeper, and a
+		// directory's expansion is per repo.
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:1",
+				"R:staged:r:1",
+				"G:unstaged:7",
+				"R:unstaged:r:6",
+				"D2:r:src:3",
+				"D3:r:main/java/pkg:2",
+				"D3:r:test:1",
+				"F2:r:AGENTS.md",
+				"F2:r:Notes/",
+				"F2:r:pom.xml",
+				"R:unstaged:s:1",
+			]
+		);
+	}
+
+	/// The Git Log's changed-files pane uses the Changes tree: dirs first,
+	/// single-child chains compacted, every directory open unless
+	/// collapsed; flat mode keeps Git's order at depth 0.
+	#[test]
+	fn commit_file_rows_tree_and_flat() {
+		let files: Vec<(String, Option<ChangeType>)> = [
+			"src/main/java/pkg/B.java",
+			"README.md",
+			"src/main/java/pkg/a.java",
+			"src/test/T.java",
+			"docs/guide.md",
+		]
+		.iter()
+		.map(|p| (p.to_string(), Some(ChangeType::Modified)))
+		.collect();
+		let shape = |rows: &[ui::ChangeItemRow]| -> Vec<String> {
+			rows.iter()
+				.map(|r| match r {
+					ui::ChangeItemRow::Dir {
+						name, count, depth, ..
+					} => format!("D{depth}:{name}:{count}"),
+					ui::ChangeItemRow::File { file_idx, depth } => {
+						format!("F{depth}:{}", files[*file_idx].0)
+					}
+					_ => "?".into(),
+				})
+				.collect()
+		};
+		assert_eq!(
+			shape(&ui::commit_file_rows(&files, true, &[])),
+			[
+				"D0:docs:1",
+				"F1:docs/guide.md",
+				"D0:src:3",
+				"D1:main/java/pkg:2",
+				"F2:src/main/java/pkg/a.java",
+				"F2:src/main/java/pkg/B.java",
+				"D1:test:1",
+				"F2:src/test/T.java",
+				"F0:README.md",
+			]
+		);
+		// A collapsed directory hides what is under it, keyed by full path.
+		let closed = ["src/main/java/pkg".to_string(), "docs".to_string()];
+		assert_eq!(
+			shape(&ui::commit_file_rows(&files, true, &closed)),
+			[
+				"D0:docs:1",
+				"D0:src:3",
+				"D1:main/java/pkg:2",
+				"D1:test:1",
+				"F2:src/test/T.java",
+				"F0:README.md",
+			]
+		);
+		assert_eq!(
+			shape(&ui::commit_file_rows(&files, false, &closed)),
+			[
+				"F0:src/main/java/pkg/B.java",
+				"F0:README.md",
+				"F0:src/main/java/pkg/a.java",
+				"F0:src/test/T.java",
+				"F0:docs/guide.md",
+			]
+		);
+	}
+
+	#[test]
+	fn change_dir_checkbox_is_tri_state() {
+		let (_, mut files) = nested_repo();
+		let under = |dir: &'static str| {
+			move |f: &FileChangeItem| {
+				menu::change_group(f) == Some("unstaged")
+					&& menu::path_under(&f.path, dir)
+			}
+		};
+		assert_eq!(menu::rows_tri_state(&files, under("src")), Some(false));
+		// A prefix that is not a whole directory name does not match.
+		assert!(!menu::path_under("src2/a", "src"));
+		assert!(!menu::path_under("src", "src"));
+		for f in &mut files {
+			if f.path.starts_with("src/main/") {
+				f.selected = true;
+			}
+		}
+		assert_eq!(menu::rows_tri_state(&files, under("src")), None);
+		assert_eq!(
+			menu::rows_tri_state(&files, under("src/main/java/pkg")),
+			Some(true)
+		);
+		for f in &mut files {
+			if f.path.starts_with("src/") {
+				f.selected = true;
+			}
+		}
+		assert_eq!(menu::rows_tri_state(&files, under("src")), Some(true));
+		// Only files of that group count: the staged `docs` file is not
+		// under an Unstaged directory.
+		assert_eq!(menu::rows_tri_state(&files, under("docs")), Some(false));
 	}
 }

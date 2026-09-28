@@ -121,7 +121,7 @@ Git 寫入維持既有貼上與 commit 重播。一般 stage／unstage、commit�
 | --- | --- |
 | Staged | HEAD → index；內容從 index 讀取 |
 | Unstaged | index → working tree；包含已追蹤檔案的工作目錄變更 |
-| Untracked | 未追蹤檔案獨立分組，可選擇複製 |
+| Untracked | 未追蹤檔案為獨立來源，Changes 中列在 Unstaged 群組下並以檔名顏色區分，可選擇複製 |
 | Conflicts | unmerged stages／衝突狀態獨立顯示，不當作一般 staged |
 | 單一 commit | 明確標示所比較 parent；root commit 比空樹 |
 | Merge commit | parent 切換檢視與既有多 parent 複製語意分開呈現 |

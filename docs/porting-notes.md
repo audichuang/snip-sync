@@ -25,6 +25,9 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 ### 已知且接受的差異
 
 - 桌面 App 在 monorepo 子資料夾選 Git 來源時,變更清單與複製範圍限制在該資料夾,並可逐檔勾選;CLI 與原本的 `collect_payload` 仍複製整個 Git 來源。這是桌面選取範圍的行為,不改剪貼簿格式。commit / 區間的 payload 路徑仍依 TS graphCopy 使用 repo 相對路徑。
+- Git 圖(`graph::compute_graph_layout`)預設照 SourceGit / TS 壓縮車道。`GraphConfig::hold_root_lanes` 是 Rust 才有的選項,只有原生工作台的多儲存庫合併 log(列 id 帶 `@<feed>`)會開:
+  一條 rail 停在 root commit 後,它的車道空一列才讓右邊的 rail 往左移(保留的車道不會被相鄰的保留解除帶著左移),沒有入線的新節點也放在上一列所有車道的右邊。
+  否則另一個儲存庫的 rail 會在下一列彎進該車道、commit 正好落在別人的 root 正下方,看起來像接在一起。單一儲存庫與 checkpoint 的幾何不變(保留的車道不寫進 checkpoint)。
 - 過濾規則中「不含 `*` / `?` 的原始 regex pattern」直接交給 Rust `regex` 編譯:`.`、`\w`、`\d`、`\b` 是 Unicode 語意,
   少數 JS 視為字面字元的語法(如 `\pL`、巢狀字元類別)意義不同。glob 形式的 pattern 已經照 JS 語意轉換,不受影響。
   使用者寫原始 regex 時很少碰到;真的出現分歧再逐項轉譯。

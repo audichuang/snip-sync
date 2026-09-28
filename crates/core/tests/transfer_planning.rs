@@ -1963,7 +1963,8 @@ fn test_admitted_fifo_rejected_without_blocking() {
 	});
 
 	let res = rx
-		.recv_timeout(std::time::Duration::from_secs(2))
+		// A blocked FIFO read never returns; 30s only rules out a busy host.
+		.recv_timeout(std::time::Duration::from_secs(30))
 		.expect("plan_export blocked on FIFO!");
 	let _ = handle.join();
 	let _ = fs::remove_file(&fifo_path);
@@ -2033,7 +2034,8 @@ fn test_filtered_fifo_not_read_or_rejected() {
 	});
 
 	let res = rx
-		.recv_timeout(std::time::Duration::from_secs(2))
+		// A blocked FIFO read never returns; 30s only rules out a busy host.
+		.recv_timeout(std::time::Duration::from_secs(30))
 		.expect("plan_export blocked on filtered FIFO!");
 	let _ = handle.join();
 	let _ = fs::remove_file(&fifo_path);

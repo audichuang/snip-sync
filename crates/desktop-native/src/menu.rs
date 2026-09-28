@@ -28,8 +28,18 @@ pub struct Chrome {
 	pub menu_focus: FocusHandle,
 	/// Speed search text typed into the Project / Changes list.
 	pub speed: String,
-	/// Collapsed Changes groups (`change-header:<id>`).
+	/// Collapsed Changes groups (`change-header:<id>`): groups span the
+	/// whole workspace, so the key is the group alone.
 	pub collapsed_groups: Vec<&'static str>,
+	/// Expanded (group, repo root) nodes of the Changes tool window: repo
+	/// rows start collapsed, and opening a repo expands it in every group.
+	pub expanded_repos: Vec<(&'static str, PathBuf)>,
+	/// Expanded (group, repo root, directory path) nodes of the Changes
+	/// tree: directories start collapsed. At most `MAX_EXPANDED_DIRS`.
+	pub expanded_dirs: Vec<(&'static str, PathBuf, String)>,
+	/// Changes files grouped by directory (on) or listed flat, for the
+	/// session.
+	pub changes_by_dir: bool,
 	pub left_scroll: UniformListScrollHandle,
 }
 
@@ -40,9 +50,39 @@ impl Chrome {
 			menu_focus: cx.focus_handle(),
 			speed: String::new(),
 			collapsed_groups: Vec::new(),
+			expanded_repos: Vec::new(),
+			expanded_dirs: Vec::new(),
+			changes_by_dir: true,
 			left_scroll: UniformListScrollHandle::new(),
 		}
 	}
+}
+
+/// Open Changes directories kept per session; opening one more drops the
+/// oldest.
+// ponytail: oldest-first eviction, not LRU; a user with more open folders
+// than this sees the earliest ones fold back.
+pub const MAX_EXPANDED_DIRS: usize = 256;
+
+/// Whether `path` lies under directory `dir` (both from the repo root).
+pub(crate) fn path_under(path: &str, dir: &str) -> bool {
+	path.len() > dir.len()
+		&& path.starts_with(dir)
+		&& path.as_bytes()[dir.len()] == b'/'
+}
+
+/// Tri-state of the checkable `files` matching `pred`: all / none
+/// selected, `None` if mixed. Non-UTF-8 names do not count.
+pub(crate) fn rows_tri_state(
+	files: &[crate::FileChangeItem],
+	pred: impl Fn(&crate::FileChangeItem) -> bool,
+) -> Option<bool> {
+	let mut sel = files
+		.iter()
+		.filter(|f| pred(f) && f.is_valid_utf8())
+		.map(|f| f.selected);
+	let first = sel.next().unwrap_or(false);
+	sel.all(|s| s == first).then_some(first)
 }
 
 /// Where focus returns when the menu closes.
@@ -68,6 +108,7 @@ pub enum MenuAct {
 	ChangeToggle { idx: usize, path: String },
 	ChangeOpen { idx: usize, path: String },
 	GroupToggle(&'static str),
+	RepoToggle(usize, &'static str),
 	CopyText(String),
 	CommitDiff(String),
 	CopyCommits(String),
@@ -148,6 +189,14 @@ impl WorkbenchModel {
 	fn abs_path(&self, rel: &str) -> Option<String> {
 		self.repo_root()
 			.map(|r| r.join(rel.trim_end_matches('/')).display().to_string())
+	}
+
+	/// Root of the repo that Changes row `idx` belongs to.
+	fn change_root(&self, idx: usize) -> Option<PathBuf> {
+		let f = self.files.get(idx)?;
+		self.change_repos
+			.get(f.repo as usize)
+			.map(|slot| slot.root.clone())
 	}
 
 	pub(crate) fn repo_row_menu(&self, idx: usize) -> Vec<MenuEntry> {
@@ -260,8 +309,14 @@ impl WorkbenchModel {
 			),
 			MenuEntry::Sep,
 		];
-		v.extend(copy_entries(self.abs_path(&path), &path));
-		v.push(self.reveal_rel(&path));
+		let abs = self
+			.change_root(idx)
+			.map(|r| r.join(path.trim_end_matches('/')));
+		v.extend(copy_entries(
+			abs.as_ref().map(|p| p.display().to_string()),
+			&path,
+		));
+		v.push(reveal_entry(abs));
 		v
 	}
 
@@ -271,6 +326,29 @@ impl WorkbenchModel {
 	) -> Vec<MenuEntry> {
 		let all = self.group_state(group) == Some(true);
 		vec![basket_entry(all, Some(MenuAct::GroupToggle(group)))]
+	}
+
+	/// Repo row under a group: its basket entry covers that repo's files
+	/// of that group only, like the row's checkbox.
+	pub(crate) fn change_repo_menu(
+		&self,
+		slot: usize,
+		group: &'static str,
+	) -> Vec<MenuEntry> {
+		let all = self.repo_state(slot, group) == Some(true);
+		let root = self.change_repos.get(slot).map(|s| s.root.clone());
+		vec![
+			basket_entry(all, Some(MenuAct::RepoToggle(slot, group))),
+			MenuEntry::Sep,
+			item(
+				"copy-path",
+				"menu_copy_path",
+				None,
+				root.as_ref()
+					.map(|r| MenuAct::CopyText(r.display().to_string())),
+			),
+			reveal_entry(root),
+		]
 	}
 
 	fn log_neighbours(&self, sha: &str) -> (Option<String>, Option<String>) {
@@ -302,7 +380,9 @@ impl WorkbenchModel {
 				"copy-revision",
 				"menu_copy_revision",
 				None,
-				Some(MenuAct::CopyText(sha.to_string())),
+				Some(MenuAct::CopyText(
+					crate::multi_log::split_id(sha).0.to_string(),
+				)),
 			),
 			item(
 				"copy-commits",
@@ -517,12 +597,15 @@ impl WorkbenchModel {
 				}
 			}
 			MenuAct::ChangeOpen { idx, path } => {
-				if let Some(source) = file_at(self, idx, &path) {
-					self.select_file_with_source(&path, source, cx);
+				if file_at(self, idx, &path).is_some() {
+					self.select_change(idx, cx);
 					window.focus(&self.reader_focus);
 				}
 			}
 			MenuAct::GroupToggle(group) => self.toggle_change_group(group, cx),
+			MenuAct::RepoToggle(slot, group) => {
+				self.toggle_change_repo(slot, group, cx)
+			}
 			MenuAct::CopyText(text) => self.copy_text(&text),
 			MenuAct::CommitDiff(sha) => {
 				if self.selected_commit.as_deref() != Some(sha.as_str()) {
@@ -557,29 +640,45 @@ impl WorkbenchModel {
 
 	// ───────────────────────── Changes groups ─────────────────────────
 
-	/// Tri-state of a Changes group: all / none selected, `None` if mixed.
-	/// Unselectable (non-UTF-8) names do not count.
-	pub(crate) fn group_state(&self, group: &str) -> Option<bool> {
-		let mut sel = self
-			.files
-			.iter()
-			.filter(|f| change_group(f) == Some(group) && f.is_valid_utf8())
-			.map(|f| f.selected);
-		let first = sel.next().unwrap_or(false);
-		sel.all(|s| s == first).then_some(first)
+	/// Tri-state of the checkable Changes rows matching `pred`: all / none
+	/// selected, `None` if mixed. Non-UTF-8 names do not count.
+	fn rows_state(
+		&self,
+		pred: impl Fn(&crate::FileChangeItem) -> bool,
+	) -> Option<bool> {
+		rows_tri_state(&self.files, pred)
 	}
 
-	/// IntelliJ group checkbox: selects the whole group unless it already is
-	/// fully selected, in which case it clears it.
-	pub(crate) fn toggle_change_group(
+	/// Tri-state of a Changes group across every repo.
+	pub(crate) fn group_state(&self, group: &str) -> Option<bool> {
+		self.rows_state(|f| change_group(f) == Some(group))
+	}
+
+	/// Tri-state of repo `slot`'s changes in `group`.
+	pub(crate) fn repo_state(&self, slot: usize, group: &str) -> Option<bool> {
+		self.rows_state(|f| {
+			f.repo as usize == slot && change_group(f) == Some(group)
+		})
+	}
+
+	/// IntelliJ node checkbox: selects the matching rows unless they
+	/// already all are, in which case it clears them. Rows of a repo whose
+	/// status read has not landed are inert.
+	fn toggle_rows(
 		&mut self,
-		group: &str,
-		cx: &mut Context<Self>,
-	) {
-		let select = self.group_state(group) != Some(true);
+		pred: impl Fn(&crate::FileChangeItem) -> bool,
+	) -> Option<bool> {
+		let pred = |f: &crate::FileChangeItem| {
+			pred(f) && f.is_valid_utf8() && self.change_slot_loaded(f.repo)
+		};
+		if !self.files.iter().any(pred) {
+			return None;
+		}
+		let select = self.rows_state(pred) != Some(true);
+		let hit: Vec<bool> = self.files.iter().map(pred).collect();
 		let mut candidate = self.selection_candidate();
-		for f in &mut candidate.files {
-			if change_group(f) == Some(group) && f.is_valid_utf8() {
+		for (f, hit) in candidate.files.iter_mut().zip(hit) {
+			if hit {
 				f.selected = select;
 			}
 		}
@@ -595,9 +694,62 @@ impl WorkbenchModel {
 		));
 		if self.install_selection_candidate(candidate) {
 			self.log_basket();
+			Some(select)
+		} else {
+			None
+		}
+	}
+
+	/// IntelliJ group checkbox: selects the whole group (every repo)
+	/// unless it already is fully selected, in which case it clears it.
+	pub(crate) fn toggle_change_group(
+		&mut self,
+		group: &str,
+		cx: &mut Context<Self>,
+	) {
+		if let Some(select) =
+			self.toggle_rows(|f| change_group(f) == Some(group))
+		{
 			app_log!("[APP:GROUP_TOGGLED: {group} selected={select}]");
 		}
 		cx.notify();
+	}
+
+	/// Repository row checkbox: that repo's changes in `group`.
+	pub(crate) fn toggle_change_repo(
+		&mut self,
+		slot: usize,
+		group: &str,
+		cx: &mut Context<Self>,
+	) {
+		if let Some(select) = self.toggle_rows(|f| {
+			f.repo as usize == slot && change_group(f) == Some(group)
+		}) {
+			let name =
+				self.change_repos.get(slot).map_or("", |s| s.name.as_str());
+			app_log!(
+				"[APP:REPO_CHANGES_TOGGLED: {group} {name} selected={select}]"
+			);
+		}
+		cx.notify();
+	}
+
+	pub(crate) fn group_collapsed(&self, group: &str) -> bool {
+		self.chrome.collapsed_groups.contains(&group)
+	}
+
+	pub(crate) fn repo_changes_collapsed(
+		&self,
+		slot: usize,
+		group: &str,
+	) -> bool {
+		self.change_repos.get(slot).is_none_or(|s| {
+			!self
+				.chrome
+				.expanded_repos
+				.iter()
+				.any(|(g, r)| *g == group && *r == s.root)
+		})
 	}
 
 	pub(crate) fn toggle_group_collapsed(
@@ -614,6 +766,127 @@ impl WorkbenchModel {
 			true
 		};
 		app_log!("[APP:GROUP_COLLAPSED: {group} collapsed={collapsed}]");
+		cx.notify();
+	}
+
+	pub(crate) fn change_dir_expanded(
+		&self,
+		slot: usize,
+		group: &str,
+		dir: &str,
+	) -> bool {
+		self.change_repos.get(slot).is_some_and(|s| {
+			self.chrome
+				.expanded_dirs
+				.iter()
+				.any(|(g, r, d)| *g == group && *r == s.root && d == dir)
+		})
+	}
+
+	pub(crate) fn toggle_dir_collapsed(
+		&mut self,
+		slot: usize,
+		group: &'static str,
+		dir: &str,
+		cx: &mut Context<Self>,
+	) {
+		let Some(s) = self.change_repos.get(slot) else {
+			return;
+		};
+		let (root, name) = (s.root.clone(), s.name.clone());
+		let files = crate::slot_range(&self.files, slot)
+			.filter(|&i| {
+				let f = &self.files[i];
+				change_group(f) == Some(group) && path_under(&f.path, dir)
+			})
+			.count();
+		let c = &mut self.chrome.expanded_dirs;
+		let collapsed = if let Some(i) = c
+			.iter()
+			.position(|(g, r, d)| *g == group && *r == root && d == dir)
+		{
+			c.remove(i);
+			true
+		} else {
+			if c.len() >= MAX_EXPANDED_DIRS {
+				c.remove(0);
+			}
+			c.push((group, root, dir.to_string()));
+			false
+		};
+		app_log!(
+			"[APP:CHANGE_DIR_COLLAPSED: {group} {name} {dir} files={files} collapsed={collapsed}]"
+		);
+		cx.notify();
+	}
+
+	/// Tri-state of repo `slot`'s changes in `group` under directory `dir`.
+	pub(crate) fn dir_state(
+		&self,
+		slot: usize,
+		group: &str,
+		dir: &str,
+	) -> Option<bool> {
+		self.rows_state(|f| {
+			f.repo as usize == slot
+				&& change_group(f) == Some(group)
+				&& path_under(&f.path, dir)
+		})
+	}
+
+	/// Directory row checkbox: every file beneath it in that group.
+	pub(crate) fn toggle_change_dir(
+		&mut self,
+		slot: usize,
+		group: &str,
+		dir: &str,
+		cx: &mut Context<Self>,
+	) {
+		if let Some(select) = self.toggle_rows(|f| {
+			f.repo as usize == slot
+				&& change_group(f) == Some(group)
+				&& path_under(&f.path, dir)
+		}) {
+			let name =
+				self.change_repos.get(slot).map_or("", |s| s.name.as_str());
+			app_log!(
+				"[APP:DIR_CHANGES_TOGGLED: {group} {name} {dir} selected={select}]"
+			);
+		}
+		cx.notify();
+	}
+
+	/// Header toggle: Changes files grouped by directory or flat.
+	pub(crate) fn toggle_changes_by_dir(&mut self, cx: &mut Context<Self>) {
+		self.chrome.changes_by_dir = !self.chrome.changes_by_dir;
+		app_log!("[APP:CHANGES_GROUP_DIR: on={}]", self.chrome.changes_by_dir);
+		self.sync_list_row();
+		cx.notify();
+	}
+
+	pub(crate) fn toggle_repo_collapsed(
+		&mut self,
+		slot: usize,
+		group: &'static str,
+		cx: &mut Context<Self>,
+	) {
+		let Some(s) = self.change_repos.get(slot) else {
+			return;
+		};
+		let (root, name) = (s.root.clone(), s.name.clone());
+		let c = &mut self.chrome.expanded_repos;
+		let collapsed = if let Some(i) =
+			c.iter().position(|(g, r)| *g == group && *r == root)
+		{
+			c.remove(i);
+			true
+		} else {
+			c.push((group, root));
+			false
+		};
+		app_log!(
+			"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed={collapsed}]"
+		);
 		cx.notify();
 	}
 
@@ -849,18 +1122,26 @@ pub(crate) fn change_group(f: &crate::FileChangeItem) -> Option<&'static str> {
 	}
 	match f.source {
 		SourceKind::Staged => Some("staged"),
-		SourceKind::Unstaged => Some("unstaged"),
-		SourceKind::Working => Some("untracked"),
+		// Untracked files list under Unstaged, like IntelliJ's default
+		// changelist; the row keeps its own source and colour.
+		SourceKind::Unstaged | SourceKind::Working => Some("unstaged"),
 		_ => None,
 	}
 }
 
-/// Changes groups in display order: (id, label key).
-pub(crate) const CHANGE_GROUPS: [(&str, &str); 4] = [
+/// Changes groups of a single-repo workspace in display order:
+/// (id, label key).
+pub(crate) const CHANGE_GROUPS: [(&str, &str); 3] = [
 	("conflicted", "group_conflicted"),
 	("staged", "group_staged"),
 	("unstaged", "group_unstaged"),
-	("untracked", "group_untracked"),
+];
+
+/// Top-level groups of a multi-repo workspace, conflicts last.
+pub(crate) const WORKSPACE_GROUPS: [(&str, &str); 3] = [
+	("staged", "group_staged"),
+	("unstaged", "group_unstaged"),
+	("conflicted", "group_conflicted"),
 ];
 
 /// Approximate text width at `UI_TEXT`: CJK glyphs are full-width.

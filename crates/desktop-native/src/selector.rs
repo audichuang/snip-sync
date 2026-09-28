@@ -226,7 +226,8 @@ impl WorkbenchModel {
 			self.popover,
 			&self.repos,
 			&self.refs,
-			self.head_sha.is_some(),
+			// The merged log's HEAD filter picks every repository's HEAD.
+			self.head_sha.is_some() || self.log_is_merged(),
 			self.locale,
 			q,
 		)

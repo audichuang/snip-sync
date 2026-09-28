@@ -614,6 +614,7 @@ def copy_explicit_selection(
     chk_id = f"change-chk:{source}:{path}"
     show_changes(s, win)
 
+    expand_change_dirs(s, win, row_id, oracle["name"])
     row_bounds = scroll_into_view(s, win, row_id)
     assert_on_window(row_bounds, win, row_id)
     before = len(s.lines)
@@ -1633,6 +1634,118 @@ def scroll_into_view(
     raise NativeBenchError(f"required control {control} not settled inside left-list after {steps} wheel steps")
 
 
+def change_row_group(control_id: str) -> str:
+    """Changes group of a `change-row:<source>:<path>` row: untracked files list under Unstaged."""
+    source = control_id.split(":", 2)[1]
+    return "unstaged" if source == "untracked" else source
+
+
+def _change_rows_snapshot(s: NativeSession) -> dict[str, tuple[int, int, int, int]]:
+    return {k: v for k, v in parse_bounds(s.texts()).items() if k.startswith("change-")}
+
+
+def _wheel_left_list(s: NativeSession, win: dict[str, Any], down: bool) -> bool:
+    """One wheel step over the left list; False when the rows did not move."""
+    snap = _change_rows_snapshot(s)
+    viewport = left_viewport(s.texts())
+    before = len(s.lines)
+    s.focus(win["wid"])
+    cx = win["x"] + viewport[0] + viewport[2] // 2
+    cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
+    s.x("xdotool", "mousemove", str(cx), str(cy), "click", "5" if down else "4")
+    try:
+        s.wait_line(lambda line: "id=change-" in line, start=before, timeout=1.5)
+    except NativeBenchError:
+        pass  # a wheel event can be dropped, or the list is already at its end
+    time.sleep(0.1)
+    return _change_rows_snapshot(s) != snap
+
+
+def scroll_to_change_dirs(
+    s: NativeSession,
+    win: dict[str, Any],
+    candidates: Callable[[], list[str] | None],
+    max_steps: int = 60,
+) -> list[str] | None:
+    """Sweep the Changes list from its top down until `candidates` finds something.
+
+    A workspace of many dirty repos puts a repo's folders out of view, above or
+    below, and bounds of unpainted rows are unknown; a list that stops moving for
+    two wheel steps is at its end.
+    """
+    for down in (False, True):
+        still = 0
+        for _ in range(max_steps):
+            if down:
+                found = candidates()
+                if found != []:
+                    return found
+            if _wheel_left_list(s, win, down):
+                still = 0
+            else:
+                still += 1
+                if still >= 2:
+                    break
+    return candidates()
+
+
+def expand_change_dirs(
+    s: NativeSession,
+    win: dict[str, Any],
+    control: str,
+    repo: str,
+    timeout: float = 10.0,
+) -> list[str]:
+    """Open the directories above a Changes file row; returns the ones opened.
+
+    Changes groups files by directory by default, and directories start collapsed.
+    Bounds carry no expansion state, so the deepest visible ancestor
+    `change-dir:<group>:<repo>:<dir>` is clicked and its CHANGE_DIR_COLLAPSED line read:
+    `collapsed=true` means it was already open with its children out of view, so it is
+    clicked once more. A compacted chain (`main/java/pkg`) is one directory row.
+    """
+    path = control.split(":", 2)[2]
+    group = change_row_group(control)
+    prefix = f"change-dir:{group}:{repo}:"
+    opened: list[str] = []
+
+    def candidates() -> list[str] | None:
+        """Visible unopened ancestors, or None once the row itself is visible."""
+        bounds = parse_bounds(s.texts())
+        if control in bounds:
+            return None
+        return [
+            key[len(prefix):] for key in bounds
+            if key.startswith(prefix) and path.startswith(key[len(prefix):] + "/")
+            and key[len(prefix):] not in opened
+        ]
+
+    for _ in range(path.rstrip("/").count("/")):
+        # Rows under a node that just opened paint on a later frame.
+        deadline = time.monotonic() + 2.0
+        while (dirs := candidates()) == [] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if dirs == []:
+            dirs = scroll_to_change_dirs(s, win, candidates)
+        if dirs is None:
+            return opened
+        if not dirs:
+            break
+        folder = max(dirs, key=len)
+        needle = f"[APP:CHANGE_DIR_COLLAPSED: {group} {repo} {folder} files="
+        for _click in range(2):
+            box = scroll_into_view(s, win, prefix + folder)
+            before = len(s.lines)
+            s.click(win, box)
+            _, _, line = s.wait_line(lambda item: needle in item, start=before, timeout=timeout)
+            if "collapsed=false" in line:
+                break
+        else:
+            raise NativeBenchError(f"{prefix + folder} did not open: {line}")
+        opened.append(folder)
+    return opened
+
+
 def tab_state(lines: list[str]) -> tuple[str, bool]:
     """Last tool tab. The app starts on Git Changes with the panel open, and does not log that."""
     tabs = [line for line in lines if "[APP:TAB_SWITCHED:" in line]
@@ -1677,6 +1790,40 @@ def open_project_list(s: NativeSession, win: dict[str, Any]) -> None:
         time.sleep(0.05)
 
 
+def open_repo_name(lines: list[str]) -> str | None:
+    """Basename of the repo the app last selected, or None after a workspace change."""
+    for line in reversed(lines):
+        if "[APP:WORKSPACE: state=" in line:
+            return None
+        if "[APP:REPO_SELECTING:" in line:
+            return parse_repo_select(line)[1]
+    return None
+
+
+def narrow_log(s: NativeSession, win: dict[str, Any], name: str, timeout: float = 30.0) -> float | None:
+    """The Log shows every repo of the workspace; switching repos keeps it.
+
+    The Repository chip narrows it to `name`, which reads that repo's first
+    history page (a fresh E2E_LOG), as a repo switch did before the merged
+    log. Returns that page's time, or None for a single-repo workspace.
+    """
+    if "log-filter-repo" not in parse_bounds(s.texts()):
+        return None
+    before = len(s.lines)
+    s.click(win, parse_bounds(s.texts())["log-filter-repo"])
+    s.wait_line(lambda l: "[APP:LOG_MENU: Some(Repo)]" in l, start=before, timeout=timeout)
+    row = f"log-repo:{name}"
+    deadline = time.monotonic() + timeout
+    while row not in parse_bounds(s.texts(before)):
+        if time.monotonic() >= deadline:
+            raise NativeBenchError(f"Repository chip menu has no {row}")
+        time.sleep(0.05)
+    s.click(win, parse_bounds(s.texts(before))[row])
+    i, _, _ = s.wait_line(lambda l: "[APP:LOG_REPOS: n=1]" in l, start=before, timeout=timeout)
+    _, t_page, _ = s.wait_line(lambda l: "[APP:E2E_LOG: mode=graph " in l, start=i, timeout=timeout)
+    return t_page
+
+
 def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[float, float, float, int]:
     """Click one repo row. Returns click time, load times, and the log index of the click."""
     open_project_list(s, win)
@@ -1684,6 +1831,12 @@ def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[f
     assert_current_basket_empty(s.texts(), f"before opening {name}")
     bounds = scroll_into_view(s, win, f"repo-row:{name}")
     assert_on_window(bounds, win, f"repo-row:{name}")
+    if open_repo_name(s.texts()) == name:
+        # A click on the open, expanded repo collapses it; the second click
+        # expands it again, which re-reads it (a fresh select and load).
+        s.click(win, bounds)
+        time.sleep(0.3)
+        bounds = scroll_into_view(s, win, f"repo-row:{name}")
     before = len(s.lines)
     sent = s.click(win, bounds)
     _, _, sel = s.wait_line(lambda line: "[APP:REPO_SELECTING:" in line, start=before, timeout=30)
@@ -1691,6 +1844,9 @@ def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[f
     if got != name:
         raise NativeBenchError(f"clicked repo-row:{name} but app selected {got} at index {idx}")
     t_loaded, t_graph = wait_repo_loaded(s, repo_path, before)
+    narrowed = narrow_log(s, win, name)
+    if narrowed is not None:
+        t_graph = narrowed
     fresh = s.texts(before)
     bad = [event for event in basket_events(fresh) if event["n"] != 0]
     toggles = [line for line in fresh if "[APP:FILE_TOGGLED:" in line and "selected=true" in line]

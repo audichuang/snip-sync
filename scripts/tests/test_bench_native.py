@@ -49,8 +49,11 @@ from bench_native_memory import (  # noqa: E402
     check_repo_state,
     check_native_matched,
     click_repo,
+    open_repo_name,
+    change_row_group,
     choose_copy_target,
     copy_explicit_selection,
+    expand_change_dirs,
     extract_clipcode_file_bytes,
     extract_clipcode_file_content,
     lavapipe_icd,
@@ -111,6 +114,15 @@ class TestLavapipeIcdDiscovery(unittest.TestCase):
         with self.assertRaises(NativeBenchError) as cm:
             lavapipe_icd(self.tmp.name)
         self.assertIn("no lavapipe ICD", str(cm.exception))
+
+
+class TestOpenRepoName(unittest.TestCase):
+    def test_last_selection_until_a_workspace_change(self) -> None:
+        a = "[APP:REPO_SELECTING: 0 (repo-01) root=/w/repo-01]"
+        b = "[APP:REPO_SELECTING: 1 (repo-02) root=/w/repo-02]"
+        self.assertEqual(open_repo_name([a, b]), "repo-02")
+        self.assertEqual(open_repo_name([a, b, "[APP:WORKSPACE: state=closed generation=2]"]), None)
+        self.assertIsNone(open_repo_name([]))
 
 
 class TestBoundsAndGone(unittest.TestCase):
@@ -684,6 +696,130 @@ class TestCurrentBasketPrecondition(unittest.TestCase):
                 ["[APP:FILE_TOGGLED: README.md selected=true]"],
                 "opening repo-02",
             )
+
+
+class ChangeTreeSession:
+    """Enough of NativeSession to click Changes directory rows without X11.
+
+    `on_click` maps a clicked control id to the lines the app logs in reply.
+    """
+
+    def __init__(
+        self,
+        lines: list[str],
+        on_click: dict[str, list[list[str]]],
+        on_wheel: list[list[str]] | None = None,
+    ) -> None:
+        self.lines = ["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", *lines]
+        self.on_click = {key: list(replies) for key, replies in on_click.items()}
+        self.on_wheel = list(on_wheel or [])
+        self.clicked: list[str] = []
+        self.wheels = 0
+
+    def texts(self, start: int = 0) -> list[str]:
+        return self.lines[start:]
+
+    def click(self, win: dict[str, Any], bounds: tuple[int, int, int, int]) -> float:
+        control = next(key for key, box in parse_bounds(self.lines).items() if box == bounds)
+        self.clicked.append(control)
+        self.lines.extend(self.on_click[control].pop(0))
+        return 1.0
+
+    def wait_line(self, pred: Any, start: int = 0, timeout: float = 8.0) -> tuple[int, float, str]:
+        for i, line in enumerate(self.lines[start:], start=start):
+            if pred(line):
+                return i, 1.0, line
+        raise NativeBenchError(f"timed out after {timeout}s")
+
+    def focus(self, wid: str) -> None:
+        return None
+
+    def x(self, *args: str, timeout: float = 20.0) -> str:
+        if "click" in args:
+            self.wheels += 1
+            if self.on_wheel:
+                self.lines.extend(self.on_wheel.pop(0))
+        return ""
+
+
+def _bounds(control: str, y: int) -> str:
+    return f"[APP:CTRL_BOUNDS: id={control} x=8 y={y} w=280 h=22]"
+
+
+class TestChangeDirectoryExpansion(unittest.TestCase):
+    """Changes groups files by directory, and directories start collapsed."""
+
+    WIN = {"wid": "0x1", "x": 0, "y": 0, "width": 800, "height": 700}
+    ROW = "change-row:untracked:src/main/java/pkg/App.java"
+
+    def test_untracked_rows_sit_in_unstaged(self) -> None:
+        self.assertEqual(change_row_group("change-row:untracked:a/b.txt"), "unstaged")
+        self.assertEqual(change_row_group("change-chk:staged:a/b.txt"), "staged")
+
+    def test_opens_each_collapsed_ancestor_down_to_the_row(self) -> None:
+        src = "change-dir:unstaged:repo:src"
+        chain = "change-dir:unstaged:repo:src/main/java/pkg"
+        session = ChangeTreeSession(
+            [_bounds(src, 80), _bounds("change-dir:unstaged:repo:docs", 300)],
+            {
+                src: [[
+                    "[APP:CHANGE_DIR_COLLAPSED: unstaged repo src files=2 collapsed=false]",
+                    _bounds(chain, 104),
+                    _bounds("change-dir:unstaged:repo:src/test", 152),
+                ]],
+                chain: [[
+                    "[APP:CHANGE_DIR_COLLAPSED: unstaged repo src/main/java/pkg files=1 collapsed=false]",
+                    _bounds(self.ROW, 128),
+                ]],
+            },
+        )
+        opened = expand_change_dirs(session, self.WIN, self.ROW, "repo", timeout=1)
+        self.assertEqual(opened, ["src", "src/main/java/pkg"])
+        self.assertEqual(session.clicked, [src, chain])
+
+    def test_reopens_a_directory_whose_children_were_out_of_view(self) -> None:
+        src = "change-dir:unstaged:repo:src"
+        session = ChangeTreeSession(
+            [_bounds(src, 80)],
+            {
+                src: [
+                    ["[APP:CHANGE_DIR_COLLAPSED: unstaged repo src files=1 collapsed=true]"],
+                    [
+                        "[APP:CHANGE_DIR_COLLAPSED: unstaged repo src files=1 collapsed=false]",
+                        _bounds("change-row:untracked:src/a.txt", 104),
+                    ],
+                ],
+            },
+        )
+        opened = expand_change_dirs(session, self.WIN, "change-row:untracked:src/a.txt", "repo", timeout=1)
+        self.assertEqual(opened, ["src"])
+        self.assertEqual(session.clicked, [src, src])
+
+    def test_sweeps_the_list_from_the_top_to_find_its_folders(self) -> None:
+        node = "change-repo:unstaged:repo"
+        src = "change-dir:unstaged:repo:src"
+        session = ChangeTreeSession(
+            [_bounds(node, 560)],
+            {
+                src: [[
+                    "[APP:CHANGE_DIR_COLLAPSED: unstaged repo src files=1 collapsed=false]",
+                    _bounds("change-row:unstaged:src/a.txt", 560),
+                ]],
+            },
+            # Two still wheel-ups find the top; the second wheel-down reveals `src`.
+            on_wheel=[[], [], [], [_bounds(node, 500), _bounds(src, 524)]],
+        )
+        opened = expand_change_dirs(session, self.WIN, "change-row:unstaged:src/a.txt", "repo", timeout=1)
+        self.assertEqual(opened, ["src"])
+        self.assertEqual(session.wheels, 4)
+        self.assertEqual(session.clicked, [src])
+
+    def test_visible_row_and_root_files_need_no_click(self) -> None:
+        session = ChangeTreeSession([_bounds(self.ROW, 80)], {})
+        self.assertEqual(expand_change_dirs(session, self.WIN, self.ROW, "repo", timeout=1), [])
+        session = ChangeTreeSession([], {})
+        self.assertEqual(expand_change_dirs(session, self.WIN, "change-row:staged:a.txt", "repo", timeout=1), [])
+        self.assertEqual(session.clicked, [])
 
 
 class _ScriptedCopySession:

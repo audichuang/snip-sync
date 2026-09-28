@@ -820,6 +820,15 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	wait_for_pattern("[APP:GRAPH_LOADED:", Duration::from_secs(5))
 		.expect("graph layout should load");
 
+	// The log merges both repositories; its Repository chip narrows it to
+	// repo-a, the single-repository log the checks below were written for.
+	click("log-filter-repo");
+	click("log-repo:repo-a");
+	wait_for_pattern("[APP:LOG_REPOS: n=1]", Duration::from_secs(3))
+		.expect("the Repository chip must narrow the log");
+	wait_for_pattern("[APP:GRAPH_LOADED: commits=5]", Duration::from_secs(5))
+		.expect("repo-a's log must load");
+
 	// Ref selector: test HEAD and all filter
 	println!("[TEST DRIVER] Filtering refs via ref selector...");
 	click("btn-ref-selector");
@@ -4444,11 +4453,12 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	wait("[APP:SELECTOR_CLOSED]");
 
 	// 7. Changes groups are tree nodes: the group checkbox selects the
-	// whole group, the chevron collapses it.
+	// whole group, the chevron collapses it. Untracked files list under
+	// Unstaged and keep their own source in the row id.
 	key(&wid, "alt+0");
 	wait("[APP:TAB_SWITCHED: GitChanges visible=true");
-	click("change-group-chk:untracked");
-	let toggled = wait("[APP:GROUP_TOGGLED: untracked selected=true]");
+	click("change-group-chk:unstaged");
+	let toggled = wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
 	let basket = toggled
 		.iter()
 		.find(|l| l.contains("[APP:BASKET: n=3"))
@@ -4460,10 +4470,1255 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 		"{basket}"
 	);
 	control("change-row:untracked:gamma.txt");
-	click("change-group-toggle:untracked");
-	wait("[APP:GROUP_COLLAPSED: untracked collapsed=true]");
+	click("change-group-toggle:unstaged");
+	wait("[APP:GROUP_COLLAPSED: unstaged collapsed=true]");
 	absent("change-row:untracked:gamma.txt");
-	control("change-header:untracked");
+	control("change-header:unstaged");
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Changes of a multi-repo workspace are grouped by change kind first: a
+/// workspace-wide Staged / Unstaged node (untracked files list under
+/// Unstaged) over one row per repo with files in it, and under each repo
+/// row its files grouped by directory, like IntelliJ's "Group By >
+/// Directory". A clean repo is not listed; repo rows and directories start
+/// collapsed and expand per group; a chain of single-child directories is
+/// one row; a directory's checkbox covers every file beneath it; the
+/// header toggle switches to flat lists and back. A file of a repo that is
+/// not the open one previews from its own repo and checks into that repo's
+/// basket entry, and the group checkbox spans every repo.
+#[test]
+fn native_changes_group_all_repos() {
+	changes_group_all_repos("dark");
+}
+
+/// The same tree in the light palette, for the screenshot only.
+#[test]
+fn native_changes_group_all_repos_light() {
+	changes_group_all_repos("light");
+}
+
+fn changes_group_all_repos(theme: &str) {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let xdotool = Command::new("xdotool").arg("--version").output();
+	if xdotool.is_err() || !xdotool.unwrap().status.success() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	let init = |name: &str, nested: &[&str]| {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "t@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Multi Repo"]);
+		fs::write(repo.join("shared.txt"), format!("{name}\n")).unwrap();
+		for path in nested {
+			let file = repo.join(path);
+			fs::create_dir_all(file.parent().unwrap()).unwrap();
+			fs::write(file, "v1\n").unwrap();
+		}
+		git_ok(&repo, &["add", "."]);
+		git_ok(&repo, &["commit", "-qm", "first"]);
+		repo
+	};
+	// `src` has two children; `main/java/pkg` is a single-child chain.
+	let nested = ["src/main/java/pkg/App.java", "src/test/AppTest.java"];
+	let alpha = init("alpha", &nested);
+	let beta = init("beta", &[]);
+	init("gamma", &[]);
+	// alpha: one staged file, and unstaged edits at the root and nested.
+	fs::write(alpha.join("staged.txt"), "staged\n").unwrap();
+	git_ok(&alpha, &["add", "staged.txt"]);
+	fs::write(alpha.join("shared.txt"), "alpha edited\n").unwrap();
+	for path in nested {
+		fs::write(alpha.join(path), "v2\n").unwrap();
+	}
+	// beta: a staged and an unstaged change and an untracked folder of two
+	// files, on a feature branch.
+	git_ok(&beta, &["checkout", "-qb", "feature/x"]);
+	fs::write(beta.join("beta-staged.txt"), "beta staged\n").unwrap();
+	git_ok(&beta, &["add", "beta-staged.txt"]);
+	fs::write(beta.join("shared.txt"), "beta edited\n").unwrap();
+	fs::create_dir_all(beta.join("newdir")).unwrap();
+	fs::write(beta.join("newdir/one.txt"), "one\ntwo\nthree\n").unwrap();
+	fs::write(beta.join("newdir/two.txt"), "two\n").unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app_themed(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+		theme,
+	);
+	let rx = &app.rx;
+	let loaded = lines_until_all_smoke(
+		rx,
+		&[
+			"[APP:REPO_LOADED: alpha files=4]",
+			"[APP:CHANGES_LOADED: beta files=4]",
+			"[APP:CHANGES_LOADED: gamma files=0]",
+		],
+		Duration::from_secs(15),
+	);
+	assert!(
+		!loaded.iter().any(|l| l.contains("CHANGES_LOADED: alpha")),
+		"the open repo's rows are its own load's: {loaded:?}"
+	);
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	let st = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(6))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(4);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		assert!(st.success());
+	};
+
+	// Groups first, each over the repos with files in it, in name order;
+	// the clean repo, empty (group, repo) pairs and an Untracked group are
+	// not listed. Repo rows start collapsed.
+	let order = [
+		"change-header:staged",
+		"change-repo:staged:alpha",
+		"change-repo:staged:beta",
+		"change-header:unstaged",
+		"change-repo:unstaged:alpha",
+		"change-repo:unstaged:beta",
+	];
+	let ys: Vec<i32> = order.iter().map(|id| control(id)[1]).collect();
+	assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?} {ys:?}");
+	let snap = settled();
+	assert!(
+		!snap
+			.keys()
+			.any(|k| k.starts_with("change-") && k.contains("untracked")),
+		"{snap:?}"
+	);
+	assert!(
+		!snap
+			.keys()
+			.any(|k| k.starts_with("change-") && k.contains("gamma")),
+		"{snap:?}"
+	);
+	absent("change-row@alpha:staged:staged.txt");
+	absent("change-row@beta:unstaged:shared.txt");
+
+	// Repo rows expand per group.
+	for (group, name) in [
+		("staged", "alpha"),
+		("staged", "beta"),
+		("unstaged", "alpha"),
+		("unstaged", "beta"),
+	] {
+		click(&format!("change-repo:{group}:{name}"));
+		wait(&format!(
+			"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed=false]"
+		));
+	}
+	control("change-row@alpha:staged:staged.txt");
+	control("change-row@beta:staged:beta-staged.txt");
+	control("change-row@beta:unstaged:shared.txt");
+	// Under an open repo: its top-level directories, collapsed, then its
+	// root files. The untracked folder sits in Unstaged.
+	let src = "change-dir:unstaged:alpha:src";
+	let newdir = "change-dir:unstaged:beta:newdir";
+	assert!(
+		control(src)[1] < control("change-row@alpha:unstaged:shared.txt")[1]
+	);
+	assert!(
+		control(newdir)[1] < control("change-row@beta:unstaged:shared.txt")[1]
+	);
+	absent("change-dir:unstaged:alpha:src/test");
+	absent("change-row@beta:untracked:newdir/one.txt");
+	// Unqualified ids keep naming the open repo's rows only.
+	assert_eq!(
+		control("change-row:staged:staged.txt"),
+		control("change-row@alpha:staged:staged.txt")
+	);
+	// The file rows sit under their repo row, indented past its checkbox.
+	let repo_chk = control("change-repo-chk:staged:beta");
+	let file_chk = control("change-chk@beta:staged:beta-staged.txt");
+	assert!(file_chk[0] > repo_chk[0], "{file_chk:?} {repo_chk:?}");
+
+	// One click opens a directory; the log carries its file count. `src`
+	// shows the compacted chain and `test`, both collapsed.
+	click(src);
+	wait("[APP:CHANGE_DIR_COLLAPSED: unstaged alpha src files=2 collapsed=false]");
+	let chain = "change-dir:unstaged:alpha:src/main/java/pkg";
+	let test_dir = "change-dir:unstaged:alpha:src/test";
+	control(test_dir);
+	control(chain);
+	absent("change-dir:unstaged:alpha:src/main");
+	absent("change-row@alpha:unstaged:src/main/java/pkg/App.java");
+	click(chain);
+	wait(
+		"[APP:CHANGE_DIR_COLLAPSED: unstaged alpha src/main/java/pkg files=1 collapsed=false]",
+	);
+	let app_row = "change-row@alpha:unstaged:src/main/java/pkg/App.java";
+	control(app_row);
+	absent("change-row@alpha:unstaged:src/test/AppTest.java");
+	click(newdir);
+	wait("[APP:CHANGE_DIR_COLLAPSED: unstaged beta newdir files=2 collapsed=false]");
+	control("change-row@beta:untracked:newdir/one.txt");
+	control("change-row@beta:untracked:newdir/two.txt");
+	// Chevrons of one level share a column, a child's sits right of its
+	// parent's, and sibling files line up with sibling directories'
+	// checkboxes.
+	let x = |id: &str| control(id)[0];
+	let level2 = x("change-dir-toggle:unstaged:alpha:src");
+	let level3 = x("change-dir-toggle:unstaged:alpha:src/main/java/pkg");
+	assert_eq!(level3, x("change-dir-toggle:unstaged:alpha:src/test"));
+	assert_eq!(level2, x("change-dir-toggle:unstaged:beta:newdir"));
+	assert!(level3 > level2, "{level3} {level2}");
+	assert_eq!(
+		x("change-dir-chk:unstaged:alpha:src"),
+		x("change-chk@alpha:unstaged:shared.txt")
+	);
+	assert_eq!(
+		x("change-dir-chk:unstaged:alpha:src/test"),
+		x("change-chk@alpha:unstaged:src/main/java/pkg/App.java")
+			- (level3 - level2)
+	);
+
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = if theme == "dark" {
+		"multi-repo-changes.png".to_string()
+	} else {
+		format!("multi-repo-changes-{theme}.png")
+	};
+	// Hide the Git log so the whole tree fits, and park the pointer over
+	// the editor so no row tooltip covers the tree.
+	key(&wid, "alt+9");
+	wait("[APP:LOG_PANEL: visible=false]");
+	let st = Command::new("xdotool")
+		.args(["mousemove", "--window", &wid, "700", "300"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	std::thread::sleep(Duration::from_millis(800));
+	capture_window(&wid, &out.join(shot));
+	if theme != "dark" {
+		quit_cleanly(&mut app, &wid);
+		return;
+	}
+
+	// A file of the repo that is not open previews from its own repo (the
+	// new-file diff of its three lines; alpha has no such file to read).
+	click("change-row@beta:untracked:newdir/one.txt");
+	let shown = wait(
+		"[APP:E2E_PREVIEW: source=working_changes rev=- path=newdir/one.txt ",
+	);
+	assert!(
+		shown.last().unwrap().contains(" lines=6 "),
+		"beta's file must be read from beta: {shown:?}"
+	);
+	wait("[APP:PREVIEW_LOADED: newdir/one.txt]");
+
+	// Its checkbox fills that repo's basket entry, still as untracked.
+	click("change-chk@beta:untracked:newdir/one.txt");
+	let basket = wait("[APP:BASKET: n=1");
+	assert!(
+		basket
+			.last()
+			.unwrap()
+			.contains("beta untracked newdir/one.txt"),
+		"{basket:?}"
+	);
+	// A repo row's checkbox covers that repo's files of that group only.
+	click("change-repo-chk:staged:beta");
+	let basket = wait("[APP:BASKET: n=2");
+	wait("[APP:REPO_CHANGES_TOGGLED: staged beta selected=true]");
+	assert!(!basket.last().unwrap().contains("alpha"), "{basket:?}");
+	// A directory's checkbox covers every file beneath it, collapsed
+	// `test` included, and nothing beside it.
+	click("change-dir-chk:unstaged:alpha:src");
+	let basket = wait("[APP:BASKET: n=4");
+	wait("[APP:DIR_CHANGES_TOGGLED: unstaged alpha src selected=true]");
+	let last = basket.last().unwrap();
+	assert!(
+		last.contains("alpha unstaged src/main/java/pkg/App.java")
+			&& last.contains("alpha unstaged src/test/AppTest.java")
+			&& !last.contains("alpha unstaged shared.txt"),
+		"{basket:?}"
+	);
+	// A group's checkbox spans every repo, untracked files included.
+	click("change-group-chk:unstaged");
+	let basket = wait("[APP:BASKET: n=7");
+	wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
+	let last = basket.last().unwrap();
+	assert!(
+		last.contains("alpha unstaged shared.txt")
+			&& last.contains("beta unstaged shared.txt")
+			&& last.contains("beta untracked newdir/two.txt"),
+		"{basket:?}"
+	);
+
+	// The header toggle lists files flat under each repo, and back.
+	click("btn-changes-group-dir");
+	wait("[APP:CHANGES_GROUP_DIR: on=false]");
+	absent(src);
+	control("change-row@alpha:unstaged:src/test/AppTest.java");
+	control(app_row);
+	click("btn-changes-group-dir");
+	wait("[APP:CHANGES_GROUP_DIR: on=true]");
+	control(src);
+	// Directory expansion survives the round trip.
+	control(app_row);
+	absent("change-row@alpha:unstaged:src/test/AppTest.java");
+
+	// Collapsing a repo row hides its files in that group only.
+	click("change-repo:unstaged:beta");
+	wait("[APP:REPO_CHANGES_COLLAPSED: unstaged beta collapsed=true]");
+	absent(newdir);
+	absent("change-row@beta:untracked:newdir/one.txt");
+	control("change-row@beta:staged:beta-staged.txt");
+	// One click on a group row collapses it; the chevron reopens it.
+	click("change-header:staged");
+	wait("[APP:GROUP_COLLAPSED: staged collapsed=true]");
+	absent("change-repo:staged:alpha");
+	absent("change-row@beta:staged:beta-staged.txt");
+	control("change-repo:unstaged:alpha");
+	click("change-group-toggle:staged");
+	wait("[APP:GROUP_COLLAPSED: staged collapsed=false]");
+	control("change-row@beta:staged:beta-staged.txt");
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// Every pattern must appear (in any order) before `timeout`.
+fn lines_until_all_smoke(
+	rx: &Receiver<String>,
+	patterns: &[&str],
+	timeout: Duration,
+) -> Vec<String> {
+	let deadline = Instant::now() + timeout;
+	let mut seen: Vec<String> = Vec::new();
+	while !patterns.iter().all(|p| seen.iter().any(|l| l.contains(p))) {
+		let left = deadline.saturating_duration_since(Instant::now());
+		assert!(!left.is_zero(), "missing {patterns:?}; saw {seen:?}");
+		match rx.recv_timeout(left.min(Duration::from_millis(50))) {
+			Ok(line) => seen.push(line),
+			Err(RecvTimeoutError::Timeout) => {}
+			Err(RecvTimeoutError::Disconnected) => {
+				panic!("app exited; saw {seen:?}")
+			}
+		}
+	}
+	seen
+}
+
+/// A workspace of several repositories has one log, like IntelliJ with
+/// several VCS roots: every repository's commits interleaved by date, a
+/// root stripe per row, a Repository chip that narrows the log, and the
+/// details and diff of a commit read from its own repository.
+#[test]
+fn native_multi_repo_log_merges_and_filters_repositories() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	// Commit dates interleave the repositories; the offsets differ, so an
+	// order by date string would be wrong.
+	let plan: [(&str, [&str; 3]); 3] = [
+		(
+			"alpha",
+			[
+				"2026-01-01T01:00:00+00:00",
+				"2026-01-04T01:00:00+00:00",
+				"2026-01-07T01:00:00+00:00",
+			],
+		),
+		(
+			"beta",
+			[
+				"2026-01-02T09:00:00+08:00",
+				"2026-01-05T09:00:00+08:00",
+				"2026-01-08T09:00:00+08:00",
+			],
+		),
+		(
+			"gamma",
+			[
+				"2026-01-02T20:00:00-05:00",
+				"2026-01-05T20:00:00-05:00",
+				"2026-01-08T20:00:00-05:00",
+			],
+		),
+	];
+	let mut shas: HashMap<String, String> = HashMap::new();
+	for (name, dates) in plan {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "t@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Multi Test"]);
+		for (n, date) in dates.iter().enumerate() {
+			let n = n + 1;
+			fs::write(repo.join(format!("{name}{n}.txt")), format!("{n}\n"))
+				.unwrap();
+			git_ok(&repo, &["add", "."]);
+			let out = Command::new("git")
+				.current_dir(&repo)
+				.args(["commit", "-qm", &format!("{name} change {n}")])
+				.env("GIT_AUTHOR_DATE", date)
+				.env("GIT_COMMITTER_DATE", date)
+				.output()
+				.unwrap();
+			assert!(out.status.success());
+			shas.insert(format!("{name}{n}"), git_rev(&repo));
+		}
+	}
+	git_ok(&ws.path().join("beta"), &["branch", "feature"]);
+	let row = |c: &str| {
+		let name = c.trim_end_matches(char::is_numeric);
+		format!("commit-row:{name}:{}", &shas[c][..7])
+	};
+	// Newest first across the three repositories.
+	let order = [
+		"gamma3", "beta3", "alpha3", "gamma2", "beta2", "alpha2", "gamma1",
+		"beta1", "alpha1",
+	];
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 3]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		"[APP:MULTI_LOG_LOADED: repos=3 rows=9]",
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	let st = Command::new("xdotool")
+		.args(["windowmove", "--sync", &wid, "0", "0"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let st = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1280", "860"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	let rx = &app.rx;
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(8))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, modifier: Option<&str>| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		if let Some(m) = modifier {
+			Command::new("xdotool")
+				.args(["keydown", m])
+				.status()
+				.unwrap();
+		}
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		if let Some(m) = modifier {
+			Command::new("xdotool").args(["keyup", m]).status().unwrap();
+		}
+		assert!(st.success());
+	};
+	let click = |id: &str| press(id, None);
+
+	// A taller log: every row on screen (and in the picture).
+	{
+		let v = control("splitter-bottom");
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+		]);
+		xdo(&["mousedown", "1"]);
+		for step in 1..=4 {
+			let y = (y - 60 * step).to_string();
+			xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+			std::thread::sleep(Duration::from_millis(30));
+		}
+		xdo(&["mouseup", "1"]);
+		wait("[APP:SPLIT_RESIZED: Bottom");
+	}
+	// 1. One log, newest first, each row with its repository's stripe.
+	let ys: Vec<i32> = order.iter().map(|c| control(&row(c))[1]).collect();
+	assert!(
+		ys.windows(2).all(|w| w[0] < w[1]),
+		"rows must be ordered newest first across repositories: {:?}",
+		order.iter().zip(&ys).collect::<Vec<_>>()
+	);
+	for c in order {
+		let stripe = control(&format!("root-stripe:{}", &row(c)[11..]));
+		let r = control(&row(c));
+		assert_eq!((stripe[0], stripe[1]), (r[0], r[1]), "{c} stripe");
+		assert!(stripe[2] < 12, "the stripe is a thin column: {stripe:?}");
+	}
+	// The selected repository's rows keep their plain-SHA ids for drivers.
+	control(&format!("commit-row:{}", &shas["alpha3"][..7]));
+	absent(&format!("commit-row:{}", &shas["beta3"][..7]));
+	control("log-filter-repo");
+
+	// 2. A commit's details and changes come from its own repository.
+	click(&row("beta2"));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &shas["beta2"][..7]));
+	control("commit-details-repo:beta");
+	control("commit-file:beta2.txt");
+	// A range across repositories is refused, not merged.
+	press(&row("gamma2"), Some("shift"));
+	wait("[APP:RANGE_REFUSED: cross_repo]");
+
+	// 3. The merged log as a picture (dark theme).
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join("multi-repo-log.png");
+	{
+		let geometry = Command::new("xdotool")
+			.args(["getwindowgeometry", "--shell", &wid])
+			.output()
+			.unwrap();
+		let text = String::from_utf8(geometry.stdout).unwrap();
+		let g: HashMap<_, _> =
+			text.lines().filter_map(|l| l.split_once('=')).collect();
+		let crop =
+			format!("{}x{}+{}+{}", g["WIDTH"], g["HEIGHT"], g["X"], g["Y"]);
+		settled();
+		std::thread::sleep(Duration::from_millis(300));
+		let xwd = tempfile::Builder::new().suffix(".xwd").tempfile().unwrap();
+		assert!(Command::new("xwd")
+			.args(["-root", "-silent", "-out"])
+			.arg(xwd.path())
+			.status()
+			.unwrap()
+			.success());
+		assert!(Command::new("convert")
+			.arg(xwd.path())
+			.args(["-crop", &crop, "+repage"])
+			.arg(&shot)
+			.status()
+			.unwrap()
+			.success());
+		assert!(fs::metadata(&shot).unwrap().len() > 1024);
+	}
+	println!("[TEST DRIVER] merged log screenshot: {}", shot.display());
+
+	// 4. The Repository chip narrows the log to one repository: then it is
+	// the single-repository log with plain row ids.
+	click("log-filter-repo");
+	click("log-repo-check:alpha");
+	wait("[APP:LOG_REPOS: n=2]");
+	wait("[APP:MULTI_LOG_LOADED: repos=2 rows=6]");
+	absent(&row("alpha3"));
+	// A row click keeps only its repository.
+	click("log-repo:beta");
+	wait("[APP:LOG_REPOS: n=1]");
+	let loaded = wait("[APP:E2E_LOG:");
+	assert!(
+		loaded
+			.last()
+			.unwrap()
+			.contains(&format!("mode=graph n=3 first={}", &shas["beta3"][..7])),
+		"{loaded:?}"
+	);
+	control(&format!("commit-row:{}", &shas["beta1"][..7]));
+	absent(&row("gamma3"));
+	absent(&format!("root-stripe:{}", &row("beta3")[11..]));
+	// Back to every repository.
+	click("log-filter-repo-clear");
+	wait("[APP:MULTI_LOG_LOADED: repos=3 rows=9]");
+	control(&row("alpha1"));
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// A long CJK name is cut with "…" and then measured again at another width
+/// (a window or panel resize). gpui used to truncate the shared text runs,
+/// so the next measure laid out the full text with the cut runs: on macOS
+/// that sliced inside a multi-byte char and aborted the app. The vendored
+/// gpui asserts in debug builds that runs cover the text, which fails here
+/// on Linux too.
+#[test]
+fn native_cjk_truncation_survives_resize() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+	let ws = tempfile::tempdir().unwrap();
+	let repo = ws.path().join("repo");
+	fs::create_dir(&repo).unwrap();
+	git_ok(&repo, &["init", "-q", "-b", "main"]);
+	git_ok(&repo, &["config", "user.name", "CJK Test"]);
+	git_ok(&repo, &["config", "user.email", "cjk@example.com"]);
+	git_ok(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+	fs::create_dir(repo.join("報表資料夾")).unwrap();
+	fs::write(
+		repo.join("報表資料夾/第一季財務報告與分析結果彙整文件.md"),
+		"y\n",
+	)
+	.unwrap();
+	fs::write(
+		repo.join("這是一個非常非常長的中文檔案名稱用來測試截斷與省略號.txt"),
+		"x\n",
+	)
+	.unwrap();
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(ws.path(), dest.path(), None);
+	lines_until(&app.rx, "[APP:PREVIEW_LOADED:", Duration::from_secs(10))
+		.unwrap();
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for w in ["1200", "700", "1300", "600", "1440", "800", "500", "1100"] {
+		assert!(Command::new("xdotool")
+			.args(["windowsize", &wid, w, "800"])
+			.status()
+			.unwrap()
+			.success());
+		std::thread::sleep(Duration::from_millis(400));
+		let child = app.child.as_mut().expect("app still owned");
+		assert!(
+			child.try_wait().unwrap().is_none(),
+			"app died while laying out CJK text at width {w}"
+		);
+	}
+	quit_cleanly(&mut app, &wid);
+}
+
+/// IntelliJ's log selection: Cmd/Ctrl-click toggles commits in and out of a
+/// selection that may have gaps, the details pane lists the union of their
+/// changed files as the Changes tool window's tree, Copy Commits refuses a
+/// selection that is not one first-parent chain, and another repository's
+/// commit cannot join.
+#[test]
+fn native_log_multiselect() {
+	log_multiselect("dark");
+}
+
+/// The same selection in the light palette, for the screenshot only.
+#[test]
+fn native_log_multiselect_light() {
+	log_multiselect("light");
+}
+
+fn log_multiselect(theme: &str) {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	// alpha: four commits, beta: two, interleaved by date.
+	// Per repository: (commit date, files it writes) oldest first.
+	type Commits = &'static [(&'static str, &'static [&'static str])];
+	let plan: [(&str, Commits); 2] = [
+		(
+			"alpha",
+			&[
+				(
+					"2026-01-01T01:00:00+00:00",
+					&["README.md", "src/app/main.rs"],
+				),
+				(
+					"2026-01-03T01:00:00+00:00",
+					&["src/app/main.rs", "docs/guide.md"],
+				),
+				("2026-01-05T01:00:00+00:00", &["lib/util.rs"]),
+				(
+					"2026-01-07T01:00:00+00:00",
+					&["src/app/main.rs", "src/app/view/list.rs"],
+				),
+			],
+		),
+		(
+			"beta",
+			&[
+				("2026-01-02T01:00:00+00:00", &["b.txt"]),
+				("2026-01-06T01:00:00+00:00", &["b.txt"]),
+			],
+		),
+	];
+	let mut shas: HashMap<String, String> = HashMap::new();
+	for (name, commits) in plan {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "t@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Multi Select"]);
+		for (n, (date, files)) in commits.iter().enumerate() {
+			let n = n + 1;
+			for f in *files {
+				let p = repo.join(f);
+				fs::create_dir_all(p.parent().unwrap()).unwrap();
+				fs::write(&p, format!("{name} {n}\n")).unwrap();
+			}
+			git_ok(&repo, &["add", "."]);
+			let out = Command::new("git")
+				.current_dir(&repo)
+				.args(["commit", "-qm", &format!("{name} change {n}")])
+				.env("GIT_AUTHOR_DATE", date)
+				.env("GIT_COMMITTER_DATE", date)
+				.output()
+				.unwrap();
+			assert!(out.status.success());
+			shas.insert(format!("{name}{n}"), git_rev(&repo));
+		}
+	}
+	let row = |c: &str| {
+		let name = c.trim_end_matches(char::is_numeric);
+		format!("commit-row:{name}:{}", &shas[c][..7])
+	};
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app_themed(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+		theme,
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 2]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		"[APP:MULTI_LOG_LOADED: repos=2 rows=6]",
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for args in [
+		vec!["windowmove", "--sync", &wid, "0", "0"],
+		vec!["windowsize", "--sync", &wid, "1280", "860"],
+	] {
+		assert!(Command::new("xdotool")
+			.args(args)
+			.status()
+			.unwrap()
+			.success());
+	}
+	let rx = &app.rx;
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(8))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, modifier: Option<&str>| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		if let Some(m) = modifier {
+			Command::new("xdotool")
+				.args(["keydown", m])
+				.status()
+				.unwrap();
+		}
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		if let Some(m) = modifier {
+			Command::new("xdotool").args(["keyup", m]).status().unwrap();
+		}
+		assert!(st.success());
+	};
+	let click = |id: &str| press(id, None);
+
+	// A taller log: every row and the whole details tree on screen.
+	{
+		let v = control("splitter-bottom");
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+		]);
+		xdo(&["mousedown", "1"]);
+		for step in 1..=4 {
+			let y = (y - 60 * step).to_string();
+			xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+			std::thread::sleep(Duration::from_millis(30));
+		}
+		xdo(&["mouseup", "1"]);
+		wait("[APP:SPLIT_RESIZED: Bottom");
+	}
+
+	// 1. One commit, then Ctrl-click a second one with a gap between.
+	click(&row("alpha4"));
+	wait("[APP:LOG_SELECTION: n=1 repo=alpha]");
+	press(&row("alpha2"), Some("ctrl"));
+	wait("[APP:LOG_SELECTION: n=2 repo=alpha]");
+	// The union of both commits' files, newest change per path; alpha3's
+	// lib/util.rs sits in the gap and is not listed.
+	wait("[APP:E2E_CHANGES: files=3]");
+	for f in ["src/app/main.rs", "src/app/view/list.rs", "docs/guide.md"] {
+		control(&format!("commit-file:{f}"));
+	}
+	absent("commit-file:lib/util.rs");
+	absent("commit-file:README.md");
+	// The Changes tree: `src/app` is one row, directories start open.
+	control("commit-dir:src/app");
+	control("commit-dir:docs");
+	control("commit-details-selection");
+	// The first file opens as the selection's diff.
+	wait("[APP:PREVIEW_LOADED:");
+	// Flat and back.
+	click("details-group-dir");
+	wait("[APP:LOG_DETAILS_GROUP_DIR: false]");
+	absent("commit-dir:src/app");
+	control("commit-file:docs/guide.md");
+	click("details-group-dir");
+	wait("[APP:LOG_DETAILS_GROUP_DIR: true]");
+	control("commit-dir:src/app");
+	// A file opens over the selected range.
+	click("commit-file:docs/guide.md");
+	wait("[APP:PREVIEW_LOADED: docs/guide.md]");
+
+	// 2. Copy Commits keeps its rule: one first-parent chain.
+	click("btn-copy-commits");
+	wait("[APP:COPY_COMMITS_ERR: commits are not contiguous:");
+
+	// 3. Another repository's commit cannot join the selection.
+	press(&row("beta2"), Some("ctrl"));
+	wait("[APP:RANGE_REFUSED: cross_repo]");
+	control("commit-details-selection");
+
+	// 4. The picture: two selected rows, the union as a tree.
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join(if theme == "light" {
+		"log-multiselect-light.png"
+	} else {
+		"log-multiselect.png"
+	});
+	settled();
+	std::thread::sleep(Duration::from_millis(300));
+	capture_window(&wid, &shot);
+	println!(
+		"[TEST DRIVER] log multi-select screenshot: {}",
+		shot.display()
+	);
+
+	// 5. Ctrl-click toggles out: back to one commit.
+	press(&row("alpha2"), Some("ctrl"));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &shas["alpha4"][..7]));
+	absent("commit-details-selection");
+
+	quit_cleanly(&mut app, &wid);
+}
+
+/// The merged log's graph over four repositories with branches, merges,
+/// root commits and a clone sharing SHAs, interleaved by date. Every
+/// commit's row sits above its parents' rows in its own repository (the
+/// order `git log --graph --topo-order` draws), and the picture is kept
+/// as `merged-graph.png` for review.
+#[test]
+fn native_merged_graph_over_four_repositories() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	let at = |day: u32| format!("2026-02-{day:02}T10:00:00+00:00");
+	let run = |repo: &Path, day: u32, args: &[&str]| {
+		let out = Command::new("git")
+			.current_dir(repo)
+			.args(args)
+			.env("GIT_AUTHOR_DATE", at(day))
+			.env("GIT_COMMITTER_DATE", at(day))
+			.output()
+			.unwrap();
+		assert!(
+			out.status.success(),
+			"git {args:?}: {}",
+			String::from_utf8_lossy(&out.stderr)
+		);
+	};
+	let commit = |repo: &Path, day: u32, msg: &str| {
+		fs::write(repo.join(format!("{msg}.txt")), format!("{msg}\n")).unwrap();
+		run(repo, day, &["add", "."]);
+		run(repo, day, &["commit", "-qm", msg]);
+	};
+	let init = |name: &str| {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "g@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Graph"]);
+		repo
+	};
+	// alpha: a feature branch merged back with --no-ff.
+	let alpha = init("alpha");
+	commit(&alpha, 1, "a1");
+	commit(&alpha, 3, "a2");
+	git_ok(&alpha, &["checkout", "-q", "-b", "feat"]);
+	commit(&alpha, 8, "af2");
+	git_ok(&alpha, &["checkout", "-q", "main"]);
+	commit(&alpha, 6, "a3");
+	run(&alpha, 9, &["merge", "-q", "--no-ff", "-m", "am", "feat"]);
+	commit(&alpha, 11, "a4");
+	// delta: a clone of alpha's first two commits (same SHAs), then its own.
+	let delta = ws.path().join("delta");
+	let st = Command::new("git")
+		.args(["clone", "-q", "--no-local"])
+		.arg(&alpha)
+		.arg(&delta)
+		.status()
+		.unwrap();
+	assert!(st.success());
+	git_ok(&delta, &["config", "user.email", "g@example.com"]);
+	git_ok(&delta, &["config", "user.name", "Graph"]);
+	git_ok(&delta, &["reset", "-q", "--hard", "HEAD~3"]);
+	git_ok(&delta, &["remote", "remove", "origin"]);
+	commit(&delta, 10, "d2");
+	// beta: the newest commit of all, and a root in the middle: its lane
+	// ends while every other repository goes on below it.
+	let beta = init("beta");
+	commit(&beta, 2, "b1");
+	commit(&beta, 12, "b3");
+	// gamma: an unmerged topic branch and an orphan second root.
+	let gamma = init("gamma");
+	commit(&gamma, 2, "c1");
+	git_ok(&gamma, &["checkout", "-q", "-b", "topic"]);
+	commit(&gamma, 8, "ct1");
+	git_ok(&gamma, &["checkout", "-q", "main"]);
+	git_ok(&gamma, &["checkout", "-q", "--orphan", "pages"]);
+	git_ok(&gamma, &["rm", "-rfq", "."]);
+	commit(&gamma, 5, "cp1");
+	git_ok(&gamma, &["checkout", "-q", "main"]);
+	commit(&gamma, 10, "c3");
+
+	let rows = |repo: &Path| -> Vec<(String, Vec<String>)> {
+		let out = Command::new("git")
+			.current_dir(repo)
+			.args(["rev-list", "--parents", "--all"])
+			.output()
+			.unwrap();
+		String::from_utf8(out.stdout)
+			.unwrap()
+			.lines()
+			.map(|l| {
+				let mut it = l.split(' ').map(str::to_string);
+				(it.next().unwrap(), it.collect())
+			})
+			.collect()
+	};
+	let repos = [
+		("alpha", alpha.clone()),
+		("beta", beta.clone()),
+		("delta", delta.clone()),
+		("gamma", gamma.clone()),
+	];
+	let total: usize = repos.iter().map(|(_, r)| rows(r).len()).sum();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 4]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		&format!("[APP:MULTI_LOG_LOADED: repos=4 rows={total}]"),
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for args in [
+		vec!["windowmove", "--sync", &wid, "0", "0"],
+		vec!["windowsize", "--sync", &wid, "1280", "900"],
+	] {
+		assert!(Command::new("xdotool")
+			.args(args)
+			.status()
+			.unwrap()
+			.success());
+	}
+	let rx = &app.rx;
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	// Every row on screen: the log takes most of the window. The resize
+	// above may not be laid out yet on a slow runner, so a drag that missed
+	// the splitter re-reads its bounds and tries again.
+	{
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		let mut resized = Err(String::new());
+		for _ in 0..3 {
+			let v = *settled().get("splitter-bottom").expect("splitter");
+			let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+			xdo(&[
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+			]);
+			std::thread::sleep(Duration::from_millis(100));
+			xdo(&["mousedown", "1"]);
+			for step in 1..=6 {
+				let y = (y - 60 * step).to_string();
+				xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+				std::thread::sleep(Duration::from_millis(30));
+			}
+			xdo(&["mouseup", "1"]);
+			resized = lines_until(
+				rx,
+				"[APP:SPLIT_RESIZED: Bottom",
+				Duration::from_secs(5),
+			);
+			if resized.is_ok() {
+				break;
+			}
+		}
+		resized.unwrap();
+	}
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join("merged-graph.png");
+	std::thread::sleep(Duration::from_millis(300));
+	capture_window(&wid, &shot);
+	println!("[TEST DRIVER] merged graph screenshot: {}", shot.display());
+
+	// Each repository's commits sit above their parents.
+	let snap = settled();
+	for (name, repo) in &repos {
+		let y = |sha: &str| {
+			let id = format!("commit-row:{name}:{}", &sha[..7]);
+			snap.get(&id).unwrap_or_else(|| panic!("{id} not drawn"))[1]
+		};
+		for (sha, parents) in rows(repo) {
+			for p in parents {
+				assert!(y(&sha) < y(&p), "{name}: {sha} must sit above {p}");
+			}
+		}
+	}
 
 	quit_cleanly(&mut app, &wid);
 }
