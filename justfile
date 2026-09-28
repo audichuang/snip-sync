@@ -108,10 +108,13 @@ release version *flags:
 	err() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 	ok() { printf '\033[32m✓ %s\033[0m\n' "$*"; }
 	info() { printf '\033[36m• %s\033[0m\n' "$*"; }
-	echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
-		|| err "version must be X.Y.Z with no leading zeros (got: $VERSION)"
+	echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.]+)?$' \
+		|| err "version must be X.Y.Z or X.Y.Z-pre (e.g. 0.4.0-beta.1) with no leading zeros (got: $VERSION)"
+	# A pre-release ships from develop without the develop -> main round trip;
+	# release.yml accepts its green push-to-develop CI run. Stable stays on main.
+	case "$VERSION" in *-*) BRANCH=develop ;; *) BRANCH=main ;; esac
 	git remote get-url "$REMOTE" | grep -q "$REPO" || err "remote '$REMOTE' is not $REPO"
-	[ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] || err "not on main"
+	[ "$(git rev-parse --abbrev-ref HEAD)" = "$BRANCH" ] || err "$TAG releases from $BRANCH; not on $BRANCH"
 	{ git diff --quiet && git diff --cached --quiet; } || err "working tree is dirty"
 	if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git ls-remote --tags "$REMOTE" "$TAG" | grep -q "$TAG"; then
 		err "tag $TAG already exists"
@@ -128,14 +131,14 @@ release version *flags:
 	ok "version $TAG validated (latest was ${LATEST:-none})"
 
 	HEAD_SHA="$(git rev-parse HEAD)"
-	git push "$REMOTE" main
-	info "waiting for ci.yml (push to main) on $HEAD_SHA..."
+	git push "$REMOTE" "$BRANCH"
+	info "waiting for ci.yml (push to $BRANCH) on $HEAD_SHA..."
 	CI_OK=0
 	# 150 min budget: native-acceptance alone may take up to its 120 min timeout.
 	for _ in $(seq 1 450); do
 		RUN="$(gh run list --repo "$REPO" --workflow ci.yml --limit 30 \
 			--json headSha,headBranch,event,status,conclusion \
-			--jq "[.[] | select(.headSha==\"$HEAD_SHA\" and .headBranch==\"main\" and .event==\"push\")] | first" 2>/dev/null || echo "")"
+			--jq "[.[] | select(.headSha==\"$HEAD_SHA\" and .headBranch==\"$BRANCH\" and .event==\"push\")] | first" 2>/dev/null || echo "")"
 		if [ -n "$RUN" ] && [ "$RUN" != "null" ] && [ "$(echo "$RUN" | jq -r .status)" = "completed" ]; then
 			[ "$(echo "$RUN" | jq -r .conclusion)" = "success" ] || err "ci.yml for HEAD did not succeed"
 			CI_OK=1

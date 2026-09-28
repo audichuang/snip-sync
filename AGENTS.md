@@ -13,6 +13,7 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 - `main` only holds released code; `develop` is the integration branch; every change gets its own `feature/<name>` (or `fix/<name>`) branch cut from `develop`, and its PR targets `develop`.
 - To release, open a PR `develop` → `main`, merge it once green, then run `just release X.Y.Z` on `main` (it pushes the tag; `release.yml` builds, publishes and bumps the Homebrew tap). Release only when there is something worth shipping, not per merge.
+- A pre-release to try a build skips `main`: on `develop`, `just bump X.Y.Z-beta.N`, commit, push, then `just release X.Y.Z-beta.N`. `release.yml` accepts the green push-to-develop CI run for a tag with a `-`, marks it pre-release and skips Homebrew.
 
 ## Before you call a change done
 

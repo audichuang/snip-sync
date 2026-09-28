@@ -30,9 +30,10 @@ env:
     PRERELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || contains(github.ref_name, '-') }}
 
 jobs:
-    # Release gate: the tagged commit must already have a green push-to-main
-    # ci.yml run (its `CI gate` fails on any non-success job). The run must be
-    # for the tagged SHA on main, not a pull_request merge ref.
+    # Release gate: the tagged commit must already have a green push ci.yml
+    # run (its `CI gate` fails on any non-success job) for the tagged SHA, not
+    # a pull_request merge ref. A stable release needs that run on main; a
+    # pre-release (tag with a `-`, e.g. v0.4.0-beta.1) may come from develop.
     # Its run id is also where verify-native takes the desktop packages from.
     verify-ci:
         name: Verify CI is green for this commit
@@ -50,15 +51,17 @@ jobs:
                   REPO: ${{ github.repository }}
               run: |
                   set -euo pipefail
+                  if [ "$PRERELEASE" = "true" ]; then BRANCHES='["main","develop"]'; else BRANCHES='["main"]'; fi
+                  export BRANCHES
                   RUN_ID=$(gh api \
-                    "/repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=completed&event=push&branch=main" \
-                    --jq '[.workflow_runs[] | select(.conclusion == "success" and .head_branch == "main" and .head_sha == env.SHA)] | max_by(.id) | .id // empty')
+                    "/repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&status=completed&event=push" \
+                    --jq '(env.BRANCHES | fromjson) as $branches | [.workflow_runs[] | select(.conclusion == "success" and (.head_branch as $b | $branches | index($b)) and .head_sha == env.SHA)] | max_by(.id) | .id // empty')
                   if [ -z "$RUN_ID" ]; then
-                      echo "::error::No green push-to-main ci.yml run for $SHA." >&2
-                      echo "Push the commit to main, wait for CI to pass, then push the tag." >&2
+                      echo "::error::No green push ci.yml run on $BRANCHES for $SHA." >&2
+                      echo "Push the commit to main (develop is allowed for a pre-release), wait for CI to pass, then push the tag." >&2
                       exit 1
                   fi
-                  echo "ci.yml is green (push to main) for $SHA: run $RUN_ID."
+                  echo "ci.yml is green (push to $BRANCHES) for $SHA: run $RUN_ID."
                   echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
     # Nothing below is public until publish-release: every job only produces
