@@ -5227,3 +5227,280 @@ fn native_cjk_truncation_survives_resize() {
 	}
 	quit_cleanly(&mut app, &wid);
 }
+
+/// IntelliJ's log selection: Cmd/Ctrl-click toggles commits in and out of a
+/// selection that may have gaps, the details pane lists the union of their
+/// changed files as the Changes tool window's tree, Copy Commits refuses a
+/// selection that is not one first-parent chain, and another repository's
+/// commit cannot join.
+#[test]
+fn native_log_multiselect() {
+	log_multiselect("dark");
+}
+
+/// The same selection in the light palette, for the screenshot only.
+#[test]
+fn native_log_multiselect_light() {
+	log_multiselect("light");
+}
+
+fn log_multiselect(theme: &str) {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let ws = tempfile::tempdir().unwrap();
+	// alpha: four commits, beta: two, interleaved by date.
+	let plan: [(&str, &[(&str, &[&str])]); 2] = [
+		(
+			"alpha",
+			&[
+				(
+					"2026-01-01T01:00:00+00:00",
+					&["README.md", "src/app/main.rs"],
+				),
+				(
+					"2026-01-03T01:00:00+00:00",
+					&["src/app/main.rs", "docs/guide.md"],
+				),
+				("2026-01-05T01:00:00+00:00", &["lib/util.rs"]),
+				(
+					"2026-01-07T01:00:00+00:00",
+					&["src/app/main.rs", "src/app/view/list.rs"],
+				),
+			],
+		),
+		(
+			"beta",
+			&[
+				("2026-01-02T01:00:00+00:00", &["b.txt"]),
+				("2026-01-06T01:00:00+00:00", &["b.txt"]),
+			],
+		),
+	];
+	let mut shas: HashMap<String, String> = HashMap::new();
+	for (name, commits) in plan {
+		let repo = ws.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.email", "t@example.com"]);
+		git_ok(&repo, &["config", "user.name", "Multi Select"]);
+		for (n, (date, files)) in commits.iter().enumerate() {
+			let n = n + 1;
+			for f in *files {
+				let p = repo.join(f);
+				fs::create_dir_all(p.parent().unwrap()).unwrap();
+				fs::write(&p, format!("{name} {n}\n")).unwrap();
+			}
+			git_ok(&repo, &["add", "."]);
+			let out = Command::new("git")
+				.current_dir(&repo)
+				.args(["commit", "-qm", &format!("{name} change {n}")])
+				.env("GIT_AUTHOR_DATE", date)
+				.env("GIT_COMMITTER_DATE", date)
+				.output()
+				.unwrap();
+			assert!(out.status.success());
+			shas.insert(format!("{name}{n}"), git_rev(&repo));
+		}
+	}
+	let row = |c: &str| {
+		let name = c.trim_end_matches(char::is_numeric);
+		format!("commit-row:{name}:{}", &shas[c][..7])
+	};
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let dest = tempfile::tempdir().unwrap();
+	let mut app = spawn_app_themed(
+		ws.path(),
+		dest.path(),
+		Some((bounds.clone(), viewport.clone())),
+		theme,
+	);
+	lines_until(&app.rx, "[APP:READY_REPOS: 2]", Duration::from_secs(12))
+		.expect("repos must load");
+	lines_until(
+		&app.rx,
+		"[APP:MULTI_LOG_LOADED: repos=2 rows=6]",
+		Duration::from_secs(12),
+	)
+	.expect("the merged log must load every repository");
+	let wid = find_wid(app.pid);
+	key(&wid, "Escape");
+	for args in [
+		vec!["windowmove", "--sync", &wid, "0", "0"],
+		vec!["windowsize", "--sync", &wid, "1280", "860"],
+	] {
+		assert!(Command::new("xdotool")
+			.args(args)
+			.status()
+			.unwrap()
+			.success());
+	}
+	let rx = &app.rx;
+	let wait = |pattern: &str| {
+		lines_until(rx, pattern, Duration::from_secs(8))
+			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
+	};
+	let settled = || {
+		let deadline = Instant::now() + Duration::from_secs(8);
+		loop {
+			let snap = bounds.lock().unwrap().clone();
+			std::thread::sleep(Duration::from_millis(150));
+			if *bounds.lock().unwrap() == snap {
+				return snap;
+			}
+			assert!(Instant::now() < deadline, "layout never settled");
+		}
+	};
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = settled().get(id).copied() {
+				let (vw, vh) = *viewport.lock().unwrap();
+				assert!(
+					v[2] > 0
+						&& v[3] > 0 && v[0] >= 0
+						&& v[1] >= 0 && v[0] + v[2] <= vw
+						&& v[1] + v[3] <= vh,
+					"{id} {v:?} outside {vw}x{vh}"
+				);
+				return v;
+			}
+			assert!(Instant::now() < deadline, "{id} was not drawn");
+		}
+	};
+	let absent = |id: &str| {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		while bounds.lock().unwrap().contains_key(id) {
+			assert!(Instant::now() < deadline, "{id} must not be drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let press = |id: &str, modifier: Option<&str>| {
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		if let Some(m) = modifier {
+			Command::new("xdotool")
+				.args(["keydown", m])
+				.status()
+				.unwrap();
+		}
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		if let Some(m) = modifier {
+			Command::new("xdotool").args(["keyup", m]).status().unwrap();
+		}
+		assert!(st.success());
+	};
+	let click = |id: &str| press(id, None);
+
+	// A taller log: every row and the whole details tree on screen.
+	{
+		let v = control("splitter-bottom");
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let xdo = |args: &[&str]| {
+			assert!(Command::new("xdotool")
+				.args(args)
+				.status()
+				.unwrap()
+				.success())
+		};
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+		]);
+		xdo(&["mousedown", "1"]);
+		for step in 1..=4 {
+			let y = (y - 60 * step).to_string();
+			xdo(&["mousemove", "--window", &wid, &x.to_string(), &y]);
+			std::thread::sleep(Duration::from_millis(30));
+		}
+		xdo(&["mouseup", "1"]);
+		wait("[APP:SPLIT_RESIZED: Bottom");
+	}
+
+	// 1. One commit, then Ctrl-click a second one with a gap between.
+	click(&row("alpha4"));
+	wait("[APP:LOG_SELECTION: n=1 repo=alpha]");
+	press(&row("alpha2"), Some("ctrl"));
+	wait("[APP:LOG_SELECTION: n=2 repo=alpha]");
+	// The union of both commits' files, newest change per path; alpha3's
+	// lib/util.rs sits in the gap and is not listed.
+	wait("[APP:E2E_CHANGES: files=3]");
+	for f in ["src/app/main.rs", "src/app/view/list.rs", "docs/guide.md"] {
+		control(&format!("commit-file:{f}"));
+	}
+	absent("commit-file:lib/util.rs");
+	absent("commit-file:README.md");
+	// The Changes tree: `src/app` is one row, directories start open.
+	control("commit-dir:src/app");
+	control("commit-dir:docs");
+	control("commit-details-selection");
+	// The first file opens as the selection's diff.
+	wait("[APP:PREVIEW_LOADED:");
+	// Flat and back.
+	click("details-group-dir");
+	wait("[APP:LOG_DETAILS_GROUP_DIR: false]");
+	absent("commit-dir:src/app");
+	control("commit-file:docs/guide.md");
+	click("details-group-dir");
+	wait("[APP:LOG_DETAILS_GROUP_DIR: true]");
+	control("commit-dir:src/app");
+	// A file opens over the selected range.
+	click("commit-file:docs/guide.md");
+	wait("[APP:PREVIEW_LOADED: docs/guide.md]");
+
+	// 2. Copy Commits keeps its rule: one first-parent chain.
+	click("btn-copy-commits");
+	wait("[APP:COPY_COMMITS_ERR: commits are not contiguous:");
+
+	// 3. Another repository's commit cannot join the selection.
+	press(&row("beta2"), Some("ctrl"));
+	wait("[APP:RANGE_REFUSED: cross_repo]");
+	control("commit-details-selection");
+
+	// 4. The picture: two selected rows, the union as a tree.
+	let out = std::env::var_os("SNIP_E2E_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
+	fs::create_dir_all(&out).unwrap();
+	let shot = out.join(if theme == "light" {
+		"log-multiselect-light.png"
+	} else {
+		"log-multiselect.png"
+	});
+	settled();
+	std::thread::sleep(Duration::from_millis(300));
+	capture_window(&wid, &shot);
+	println!(
+		"[TEST DRIVER] log multi-select screenshot: {}",
+		shot.display()
+	);
+
+	// 5. Ctrl-click toggles out: back to one commit.
+	press(&row("alpha2"), Some("ctrl"));
+	wait(&format!("[APP:COMMIT_SELECTED: {}]", &shas["alpha4"][..7]));
+	absent("commit-details-selection");
+
+	quit_cleanly(&mut app, &wid);
+}
