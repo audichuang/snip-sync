@@ -6132,7 +6132,8 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 /// row alone, in the open repo's tree and in the workspace tree. A folder
 /// selection is only the folder: expanding it highlights no children
 /// (they used to be inherited, so each expansion grew an earlier folder
-/// selection the plain clicks never replaced). Ctrl/Cmd-click adds.
+/// selection the plain clicks never replaced). Ctrl/Cmd-click adds. After
+/// that a Changes staged row still previews, and Copy / paste work.
 #[test]
 fn native_project_view_plain_click_selects_one_row() {
 	if std::env::var_os("DISPLAY").is_none() {
@@ -6166,8 +6167,13 @@ fn native_project_view_plain_click_selects_one_row() {
 		fs::write(java.join(dir).join("A.java"), "class A {}\n").unwrap();
 	}
 	fs::write(java.join("TextResource.java"), "class T {}\n").unwrap();
+	fs::write(inner.join("staged.txt"), "BASE\n").unwrap();
 	git_ok(&inner, &["add", "."]);
 	git_ok(&inner, &["commit", "-qm", "inner"]);
+	// Staged and then changed again, like the acceptance driver's row.
+	fs::write(inner.join("staged.txt"), "STAGED_BYTES\n").unwrap();
+	git_ok(&inner, &["add", "staged.txt"]);
+	fs::write(inner.join("staged.txt"), "WORKING_BYTES\n").unwrap();
 	fs::create_dir_all(ws.join("docs/sub")).unwrap();
 	fs::write(ws.join("docs/sub/s.txt"), "S\n").unwrap();
 	fs::write(ws.join("docs/a.txt"), "A\n").unwrap();
@@ -6280,6 +6286,31 @@ fn native_project_view_plain_click_selects_one_row() {
 		&["keyup", "ctrl"],
 	);
 	only("", "docs/a.txt,docs/b.txt");
+
+	// After plain clicks in Project, a Changes staged row still previews
+	// its index bytes, and Copy / paste preview work on the whole basket.
+	click("tree-row:src/main/java/TextResource.java");
+	only("src/main/java/TextResource.java", "");
+	click("rail-changes");
+	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
+	click("change-row:staged:staged.txt");
+	let preview = wait_for(
+		"[APP:E2E_PREVIEW: source=staged_changes",
+		Duration::from_secs(6),
+	);
+	assert!(preview.contains("path=staged.txt"), "{preview}");
+	click("change-chk:staged:staged.txt");
+	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	click("btn-copy");
+	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
+	let copied = clip::read_text().unwrap();
+	assert!(copied.contains("STAGED_BYTES"), "{copied}");
+	assert!(!copied.contains("WORKING_BYTES"), "{copied}");
+	assert!(copied.contains("class T {}"), "{copied}");
+	key(&wid, "ctrl+v");
+	wait_for("[APP:PASTE_PREVIEW: items=2", Duration::from_secs(6));
+	key(&wid, "Escape");
+	wait_for("[APP:PASTE_CANCELLED]", Duration::from_secs(3));
 	quit_cleanly(&mut app, &wid);
 }
 
