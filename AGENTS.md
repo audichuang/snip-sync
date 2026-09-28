@@ -28,6 +28,8 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 - This machine is Linux, but CI runs Windows and macOS too. For path/fs code, reproduce the other platforms' conditions in a Linux test, e.g. a root spelled through a symlink to mimic macOS `/var` → `/private/var`. Both Windows and macOS broke on exactly this: git reports its resolved toplevel, and the user-given root did not match it.
 - A test that skips when something is missing (display, node, `.ts-ref`) must `assert!(std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(), …)` before skipping. CI sets that variable, so a skipped test cannot pass as green.
+- CI's macOS and Windows VMs are several times slower than this machine. A deadline on a helper process (spawning `ps`, reaping a child) must survive that: a 500 ms `ps` check in `gitrun` failed clean git calls on CI and leaked their budget slot for good.
+- A test that waits on another thread, channel or process needs a timeout that fails with a message. An unbounded `recv()` hung CI's macOS job for 45 minutes and hid the failure that caused it.
 
 ## GitHub Actions
 
