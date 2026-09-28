@@ -532,6 +532,7 @@ impl WorkbenchModel {
 				let repo = &self.repos[idx];
 				let expanded = self.repo_row_open(idx);
 				let id = format!("repo-row:{}", repo.name);
+				let chevron_id = format!("repo-chevron:{}", repo.name);
 				let mut counts = div()
 					.flex()
 					.flex_row()
@@ -636,14 +637,26 @@ impl WorkbenchModel {
 							this.open_left_menu(items, ev, w, cx);
 						}),
 					)
-					.child(icon(
-						if expanded {
-							Icon::ChevronDown
-						} else {
-							Icon::ChevronRight
-						},
-						10.,
-					))
+					.child(
+						div()
+							.id(SharedString::from(chevron_id.clone()))
+							.relative()
+							.flex_shrink_0()
+							.on_click(cx.listener(move |this, _, _, cx| {
+								cx.stop_propagation();
+								this.tree_cursor = ix;
+								this.toggle_repo_chevron(idx, cx);
+							}))
+							.child(icon(
+								if expanded {
+									Icon::ChevronDown
+								} else {
+									Icon::ChevronRight
+								},
+								10.,
+							))
+							.children(probe(log, chevron_id)),
+					)
 					.child(icon(
 						if is_err { Icon::Warning } else { Icon::Project },
 						14.,
@@ -833,12 +846,9 @@ impl WorkbenchModel {
 							this.select_tree_range(ix, ws, cx);
 						} else {
 							this.tree_cursor = ix;
-							// A folder click only opens it: selecting
-							// every loaded file under it is Ctrl/Shift.
-							if !click_row.is_dir {
-								let rel = [click_row.rel_path.clone()];
-								this.select_tree_rows_alone(ws, &rel, cx);
-							}
+							// Browsing does not select: a plain click opens
+							// a folder or previews a file. Only Ctrl/Shift,
+							// Space and right-click change what Copy takes.
 							dispatch(
 								this,
 								command_for_row(

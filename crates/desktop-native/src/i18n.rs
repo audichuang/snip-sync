@@ -289,6 +289,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_copy_cancelled" => "已取消複製，剪貼簿未變更。",
 			"status_copied" => "已從 {} 複製 {} 個檔案（{} 字元、{} 行，略過 {} 個）至剪貼簿",
 			"status_copy_nothing" => "沒有可複製的檔案內容",
+			"status_copied_limit" => "已從 {} 複製 {} 個檔案（{} 字元、{} 行，略過 {} 個）至剪貼簿；已達 {} 個檔案上限，其餘檔案未複製",
+			"status_copy_nothing_skipped" => "沒有可複製的檔案內容：所選資料夾內的檔案都無法複製，已略過",
 			"status_paste_preview" => "貼上預覽已就緒: {} 項變更",
 			"paste_err_not_payload" => "剪貼簿內容不是有效的 snip-sync payload",
 			"paste_err_nothing" => "剪貼簿 payload 不包含任何檔案",
@@ -615,6 +617,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_copy_cancelled" => "Copy cancelled. The clipboard was not changed.",
 			"status_copied" => "Copied from {}: {} files ({} chars, {} lines, {} skipped) to clipboard",
 			"status_copy_nothing" => "No file content to copy",
+			"status_copied_limit" => "Copied from {}: {} files ({} chars, {} lines, {} skipped) to clipboard; reached the {}-file limit, the rest were not copied",
+			"status_copy_nothing_skipped" => "No file content to copy: every file in the selected folders was skipped",
 			"status_paste_preview" => "Paste preview ready: {} items",
 			"paste_err_not_payload" => "Clipboard content is not a valid snip-sync payload",
 			"paste_err_nothing" => "Clipboard payload contains no files",
@@ -857,6 +861,8 @@ mod tests {
 			"log_selection_header",
 			"status_selection_truncated",
 			"menu_copy_files",
+			"status_copied_limit",
+			"status_copy_nothing_skipped",
 		];
 		for key in test_keys {
 			assert!(

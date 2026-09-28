@@ -692,6 +692,10 @@ impl WorkbenchModel {
 				}
 				None => true,
 			};
+			// A folded root hides the repos inside it too.
+			if !open {
+				shown.extend(placed.values().copied());
+			}
 			for mut row in t
 				.flatten_visible(t.visible_limit())
 				.into_iter()
@@ -758,7 +762,9 @@ impl WorkbenchModel {
 		if self.selected_repo_idx == Some(idx) {
 			return !self.repo_collapsed;
 		}
-		self.ws_tree.is_some() && self.ws_repo_idx() == Some(idx)
+		self.ws_tree.is_some()
+			&& self.ws_repo_idx() == Some(idx)
+			&& !self.ws_collapsed
 	}
 
 	/// A repo row and, when it is the open expanded repo, its tree.

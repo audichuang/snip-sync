@@ -34,16 +34,67 @@ pub(crate) fn arm_cancel(slot: &mut Option<CancelToken>) -> CancelToken {
 	token
 }
 
-/// Interactive read options that carry `cancel` into `Git::open_with`.
+/// The native file-mode file cap. ClipCode's 30 suits a handful of picked
+/// files; a Project folder brings every file under it, so the native app
+/// (which has no settings UI) caps at this and lets the 64 MiB payload cap
+/// bound the bytes. Hitting either is reported, never silent.
+const NATIVE_FILE_COUNT_LIMIT: usize = 10_000;
+
+fn native_export_settings() -> Settings {
+	Settings {
+		file_count_limit: NATIVE_FILE_COUNT_LIMIT as f64,
+		..Settings::default()
+	}
+}
+
+struct FolderExpansion {
+	sel: ExportSelection,
+	/// Walked files the payload cannot carry (see `folder_file_rel`).
+	skipped: usize,
+	/// The walk stopped at the file limit with files left.
+	truncated: bool,
+}
+
+/// The payload path of a walked file, or None when the export would refuse
+/// it: a name a header cannot carry (`< > : " | ? *`, control characters,
+/// a trailing space, `\` on Unix), non-UTF-8, a dangling or out-of-root
+/// symlink, a FIFO/socket/device, or a file this user cannot open.
+fn folder_file_rel(
+	root: &std::path::Path,
+	path: &std::path::Path,
+) -> Option<String> {
+	let rel = path
+		.strip_prefix(root)
+		.ok()?
+		.components()
+		.map(|c| c.as_os_str().to_str())
+		.collect::<Option<Vec<_>>>()?
+		.join("/");
+	if !snip_core::paths::is_exportable_relative_path(&rel)
+		|| !std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+		|| snip_core::paths::escapes_all_roots(&[root], path)
+		|| std::fs::File::open(path).is_err()
+	{
+		return None;
+	}
+	Some(rel)
+}
+
 /// A selected folder copies its files, walked in the copy job: a folder
-/// item itself cannot export. A nested repo's files (and `.git`) never
-/// come along; a path already selected is not added twice.
-// ponytail: one ExportItem per walked file; a huge folder is bounded only
-// by the payload cap that the plan applies afterwards.
+/// item itself cannot export. A repo's files (and `.git`) never come
+/// along, not even when the selected folder is one; a path already
+/// selected is not added twice. A file the export would refuse is skipped
+/// and counted, never failing the whole copy.
+///
+/// Order is the selection's (basket roots sorted by path, then pick
+/// order). Picked files are never starved: the folders share the `limit`
+/// left after them, first come first served, and the walk stops one file
+/// past it so a huge folder is never held in full.
 fn expand_folder_items(
 	sel: ExportSelection,
+	limit: usize,
 	cancel: &CancelToken,
-) -> Result<ExportSelection, snip_core::transfer::TransferError> {
+) -> Result<FolderExpansion, snip_core::transfer::TransferError> {
 	let is_folder = |item: &ExportItem| {
 		item.source == SourceKind::File
 			&& std::fs::symlink_metadata(
@@ -52,8 +103,16 @@ fn expand_folder_items(
 			.is_ok_and(|meta| meta.is_dir())
 	};
 	if !sel.items.iter().any(is_folder) {
-		return Ok(sel);
+		return Ok(FolderExpansion {
+			sel,
+			skipped: 0,
+			truncated: false,
+		});
 	}
+	let picked = sel.items.iter().filter(|item| !is_folder(item)).count();
+	let mut budget = limit.saturating_sub(picked);
+	let mut skipped = 0usize;
+	let mut truncated = false;
 	let mut seen: HashSet<(PathBuf, String)> = sel
 		.items
 		.iter()
@@ -67,47 +126,59 @@ fn expand_folder_items(
 			items.push(item);
 			continue;
 		}
-		let dir = item.root.path().join(&item.relative_path);
+		let root = item.root.path();
+		let dir = root.join(&item.relative_path);
 		let walk = snip_core::fsutil::list_files_recursive(&dir, |d| {
-			d == dir.as_path()
-				|| !(d.file_name() == Some(".git".as_ref())
-					|| d.join(".git").exists())
+			!(d.file_name() == Some(".git".as_ref()) || d.join(".git").exists())
 		});
 		for walked in walk {
-			if cancel.is_cancelled() {
+			if cancel.is_cancelled() || truncated {
 				break;
 			}
-			let snip_core::fsutil::WalkItem::File(path) = walked else {
-				continue;
+			let path = match walked {
+				snip_core::fsutil::WalkItem::File(path) => path,
+				snip_core::fsutil::WalkItem::UnreadableDir(_) => {
+					skipped += 1;
+					continue;
+				}
 			};
 			if path.file_name() == Some(".git".as_ref()) {
 				continue;
 			}
-			let Some(rel) = path
-				.strip_prefix(item.root.path())
-				.ok()
-				.and_then(|rel| rel.to_str())
-				.map(|rel| rel.replace('\\', "/"))
-			else {
+			let Some(rel) = folder_file_rel(root, &path) else {
+				skipped += 1;
 				continue;
 			};
-			if seen.insert((item.root.path().to_path_buf(), rel.clone())) {
-				items.push(ExportItem {
-					root: item.root.clone(),
-					relative_path: rel,
-					source: SourceKind::File,
-					change_type: None,
-				});
+			if seen.contains(&(root.to_path_buf(), rel.clone())) {
+				continue;
 			}
+			if budget == 0 {
+				truncated = true;
+				break;
+			}
+			budget -= 1;
+			seen.insert((root.to_path_buf(), rel.clone()));
+			items.push(ExportItem {
+				root: item.root.clone(),
+				relative_path: rel,
+				source: SourceKind::File,
+				change_type: None,
+			});
 		}
 	}
-	ExportSelection::new(
+	let sel = ExportSelection::new(
 		sel.roots.iter().map(|r| r.path().to_path_buf()).collect(),
 		sel.primary_root.map(|r| r.path().to_path_buf()),
 		items,
-	)
+	)?;
+	Ok(FolderExpansion {
+		sel,
+		skipped,
+		truncated,
+	})
 }
 
+/// Interactive read options that carry `cancel` into `Git::open_with`.
 pub(crate) fn interactive_read_opts(cancel: CancelToken) -> RunOptions {
 	RunOptions {
 		cancel: Some(cancel),
@@ -1084,6 +1155,8 @@ pub struct WorkbenchModel {
 	tree_worker: u64,
 	tree_worker_alive: bool,
 	restore_expanded: Vec<String>,
+	/// Workspace-tree folders to reopen once a Refresh rebuilds it.
+	restore_ws_expanded: Vec<String>,
 	add_cancel: Option<CancelToken>,
 	pub is_adding_repo: bool,
 	pub add_repo_input: Entity<TextInput>,
@@ -1154,6 +1227,8 @@ pub struct WorkbenchModel {
 	pub last_life_log: String,
 	/// The selected repo's Project row is collapsed (its tree stays loaded).
 	pub repo_collapsed: bool,
+	/// The workspace repo's row is folded while another repo is open.
+	pub ws_collapsed: bool,
 	/// Context menus, speed search and Changes group state.
 	pub chrome: menu::Chrome,
 	/// Changes tool window: one node per workspace repo, in name order.
@@ -1469,6 +1544,7 @@ impl WorkbenchModel {
 			tree_worker: 0,
 			tree_worker_alive: false,
 			restore_expanded: Vec::new(),
+			restore_ws_expanded: Vec::new(),
 			add_cancel: None,
 			is_adding_repo: false,
 			paste_preview: None,
@@ -1520,6 +1596,7 @@ impl WorkbenchModel {
 			last_life_log: String::new(),
 			chrome: menu::Chrome::new(cx),
 			repo_collapsed: false,
+			ws_collapsed: false,
 			change_repos: Vec::new(),
 			changes_queue: ReadQueue::new(MAX_CHANGES_READS),
 			changes_cancel: None,
@@ -2544,6 +2621,7 @@ impl WorkbenchModel {
 		self.tree_queue = VecDeque::new();
 		self.tree_worker_alive = false;
 		release_vec(&mut self.restore_expanded);
+		release_vec(&mut self.restore_ws_expanded);
 	}
 
 	/// Drops workspace text without `InputEvent::Changed`, which would start
@@ -2717,8 +2795,11 @@ impl WorkbenchModel {
 		// the open one, whose summary alone would otherwise update.
 		self.refresh_reload = self.file_tree.is_some();
 		// Rebuilt when the walk ends, so a Refresh re-reads plain folders;
-		// its checks come back from the basket.
-		self.ws_tree = None;
+		// its checks come back from the basket, its open folders from here.
+		if let Some(tree) = self.ws_tree.take() {
+			self.restore_ws_expanded.clear();
+			tree.collect_expanded_paths(&mut self.restore_ws_expanded);
+		}
 		let ws = self.workspace_root.clone();
 		self.launch_fresh_discovery(ws, true, cx);
 	}
@@ -3122,6 +3203,22 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// A repo row's chevron folds or unfolds it; only the row itself
+	/// opens another repo. The workspace repo's row, open around another
+	/// repo, folds its tree without switching.
+	pub fn toggle_repo_chevron(&mut self, idx: usize, cx: &mut Context<Self>) {
+		if self.selected_repo_idx != Some(idx)
+			&& self.ws_tree.is_some()
+			&& self.ws_repo_idx() == Some(idx)
+		{
+			self.ws_collapsed = !self.ws_collapsed;
+			app_log!("[APP:WS_COLLAPSED: {}]", self.ws_collapsed);
+			cx.notify();
+		} else {
+			self.toggle_repo_row(idx, cx);
+		}
+	}
+
 	/// A repo row click, as in IntelliJ's Project view: expands a collapsed
 	/// root, collapses an expanded one. Another repo is selected expanded.
 	/// Scripted drivers that re-click the open repo to reload it must click
@@ -3505,8 +3602,9 @@ impl WorkbenchModel {
 	}
 
 	/// The Project view's selection is the basket's File items, across
-	/// every root: selecting rows alone (click, range, right-click) drops
-	/// every other File item, never the Changes checks or Log picks.
+	/// every root: selecting rows alone (range, right-click) drops every
+	/// other File item, never the Changes checks or Log picks. A plain
+	/// click only previews ("browsing does not select").
 	pub fn select_tree_rows_alone(
 		&mut self,
 		ws: bool,
@@ -3521,6 +3619,11 @@ impl WorkbenchModel {
 		else {
 			return;
 		};
+		// Rows that cannot be selected (a nested repo folder) keep the
+		// selection the user built rather than wiping it.
+		if paths.is_empty() {
+			return;
+		}
 		let mut candidate = self.selection_candidate();
 		for (_, items) in &mut candidate.basket {
 			items.retain(|item| item.source != SourceKind::File);
@@ -3562,15 +3665,23 @@ impl WorkbenchModel {
 		if let Some(io) = self.tree_queue.pop_front() {
 			return Some(io);
 		}
-		while let Some(rel) = self.restore_expanded.first().cloned() {
-			self.restore_expanded.remove(0);
-			let key = NodeKey::from_utf8_rel(&rel);
-			let tree = self.file_tree.as_mut()?;
-			if !tree.contains_dir(&key) {
+		for (pending, tree) in [
+			(&mut self.restore_expanded, &mut self.file_tree),
+			(&mut self.restore_ws_expanded, &mut self.ws_tree),
+		] {
+			// Its root read is still queued: keep the list for it.
+			let Some(tree) = tree.as_mut().filter(|tree| tree.is_loaded) else {
 				continue;
-			}
-			if let TreeEffect::Io(io) = tree.start(TreeCommand::Expand(key)) {
-				return Some(io);
+			};
+			while !pending.is_empty() {
+				let key = NodeKey::from_utf8_rel(&pending.remove(0));
+				if !tree.contains_dir(&key) {
+					continue;
+				}
+				if let TreeEffect::Io(io) = tree.start(TreeCommand::Expand(key))
+				{
+					return Some(io);
+				}
 			}
 		}
 		None
@@ -4112,15 +4223,17 @@ impl WorkbenchModel {
 					.as_ref()
 					.map_or(0, source_heap_bytes),
 			);
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.restore_expanded))
-			.saturating_add(
-				self.restore_expanded
-					.capacity()
-					.saturating_mul(std::mem::size_of::<String>()),
-			);
-		for path in &self.restore_expanded {
-			bytes = bytes.saturating_add(path.capacity());
+		for restore in [&self.restore_expanded, &self.restore_ws_expanded] {
+			bytes = bytes
+				.saturating_add(std::mem::size_of_val(restore))
+				.saturating_add(
+					restore
+						.capacity()
+						.saturating_mul(std::mem::size_of::<String>()),
+				);
+			for path in restore {
+				bytes = bytes.saturating_add(path.capacity());
+			}
 		}
 		let dirs = &self.chrome.expanded_dirs;
 		bytes = bytes
@@ -4696,14 +4809,22 @@ impl WorkbenchModel {
 				let result: Result<(String, usize, Msg), Msg> = bg
 					.spawn(async move {
 						let opts = interactive_read_opts(run_token.clone());
-						let settings = Settings::default();
+						let settings = native_export_settings();
+						let expanded = expand_folder_items(
+							export_sel,
+							NATIVE_FILE_COUNT_LIMIT,
+							&run_token,
+						)
+						.map_err(|e| match e {
+							// Every file under the folders was skipped.
+							snip_core::transfer::TransferError::EmptySelection => {
+								Msg::new("status_copy_nothing_skipped", [])
+							}
+							e => Msg::new("error_payload", [e.to_string()]),
+						})?;
+						let export_sel = expanded.sel;
 						// Document cap is the retained UI output ceiling.
 						// It is not `RunOptions::max_stdout`.
-						let export_sel =
-							expand_folder_items(export_sel, &run_token)
-								.map_err(|e| {
-									Msg::new("error_payload", [e.to_string()])
-								})?;
 						let plan = plan_export_with(
 							&export_sel,
 							&settings,
@@ -4743,17 +4864,29 @@ impl WorkbenchModel {
 							Msg::new("error_payload", [e.to_string()])
 						})?;
 						let skipped = plan.skipped_unreadable_count
-							+ plan.skipped_file_size_count;
-						let msg = Msg::new(
-							"status_copied",
-							[
-								repo_name,
-								plan.copied_file_count.to_string(),
-								plan.stats.chars.to_string(),
-								plan.stats.lines.to_string(),
-								skipped.to_string(),
-							],
-						);
+							+ plan.skipped_file_size_count
+							+ expanded.skipped;
+						let mut args = vec![
+							repo_name,
+							plan.copied_file_count.to_string(),
+							plan.stats.chars.to_string(),
+							plan.stats.lines.to_string(),
+							skipped.to_string(),
+						];
+						// A partial copy always says so.
+						let key = if expanded.truncated || plan.file_limit_reached
+						{
+							if e2e_on() {
+								app_log!(
+									"[APP:COPY_TRUNCATED: limit={NATIVE_FILE_COUNT_LIMIT}]"
+								);
+							}
+							args.push(NATIVE_FILE_COUNT_LIMIT.to_string());
+							"status_copied_limit"
+						} else {
+							"status_copied"
+						};
+						let msg = Msg::new(key, args);
 						Ok((plan.payload, plan.copied_file_count, msg))
 					})
 					.await;
@@ -4781,7 +4914,10 @@ impl WorkbenchModel {
 							model.status = err;
 						}
 					}
-					let ok = model.status.key == "status_copied";
+					let ok = matches!(
+						model.status.key,
+						"status_copied" | "status_copied_limit"
+					);
 					model.show_toast(ok, model.status.clone(), cx);
 					app_log!("[APP:COPY_IDLE]");
 					cx.notify();
@@ -6102,6 +6238,200 @@ fn restore_log_after_paste(
 
 #[cfg(test)]
 mod tests {
+	mod folder_copy {
+		use crate::{
+			expand_folder_items, native_export_settings,
+			NATIVE_FILE_COUNT_LIMIT,
+		};
+		use snip_core::gitrun::CancelToken;
+		use snip_core::transfer::{
+			plan_export, CanonicalRootId, ExportItem, ExportSelection,
+			SourceKind,
+		};
+		use std::fs;
+		use std::path::{Path, PathBuf};
+
+		fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
+			let tmp = tempfile::tempdir().unwrap();
+			let root = CanonicalRootId::new(tmp.path())
+				.unwrap()
+				.path()
+				.to_path_buf();
+			(tmp, root)
+		}
+
+		fn selection(root: &Path, rels: &[&str]) -> ExportSelection {
+			let id = CanonicalRootId::new(root).unwrap();
+			let items = rels
+				.iter()
+				.map(|rel| ExportItem {
+					root: id.clone(),
+					relative_path: rel.to_string(),
+					source: SourceKind::File,
+					change_type: None,
+				})
+				.collect();
+			ExportSelection::new(
+				vec![root.to_path_buf()],
+				Some(root.to_path_buf()),
+				items,
+			)
+			.unwrap()
+		}
+
+		fn rels(sel: &ExportSelection) -> Vec<&str> {
+			sel.items
+				.iter()
+				.map(|item| item.relative_path.as_str())
+				.collect()
+		}
+
+		/// One file the payload cannot carry costs that file only.
+		#[test]
+		#[cfg(unix)]
+		fn folder_skips_files_the_payload_cannot_carry() {
+			let (_tmp, root) = canonical_tmp();
+			let outside = tempfile::tempdir().unwrap();
+			fs::write(outside.path().join("secret.txt"), "SECRET").unwrap();
+			let d = root.join("d");
+			fs::create_dir_all(&d).unwrap();
+			fs::write(d.join("good.txt"), "GOOD").unwrap();
+			fs::write(d.join("a\\b.txt"), "BACKSLASH").unwrap();
+			fs::write(d.join("bad>.txt"), "BAD").unwrap();
+			fs::write(d.join("trail.txt "), "TRAIL").unwrap();
+			std::os::unix::fs::symlink(d.join("gone.txt"), d.join("dangling"))
+				.unwrap();
+			std::os::unix::fs::symlink(
+				outside.path().join("secret.txt"),
+				d.join("escape.txt"),
+			)
+			.unwrap();
+			let fifo = std::process::Command::new("mkfifo")
+				.arg(d.join("pipe"))
+				.status()
+				.is_ok_and(|s| s.success());
+			let expanded = expand_folder_items(
+				selection(&root, &["d"]),
+				100,
+				&CancelToken::new(),
+			)
+			.unwrap();
+			assert_eq!(rels(&expanded.sel), ["d/good.txt"]);
+			assert_eq!(expanded.skipped, 5 + usize::from(fifo));
+			assert!(!expanded.truncated);
+			let plan =
+				plan_export(&expanded.sel, &native_export_settings(), None)
+					.unwrap();
+			assert!(plan.payload.contains("GOOD"));
+			assert!(!plan.payload.contains("SECRET"));
+		}
+
+		#[test]
+		#[cfg(unix)]
+		fn folder_skips_an_unreadable_file() {
+			use std::os::unix::fs::PermissionsExt;
+			let (_tmp, root) = canonical_tmp();
+			fs::create_dir_all(root.join("d")).unwrap();
+			fs::write(root.join("d/ok.txt"), "OK").unwrap();
+			let locked = root.join("d/locked.txt");
+			fs::write(&locked, "LOCKED").unwrap();
+			fs::set_permissions(&locked, fs::Permissions::from_mode(0o0))
+				.unwrap();
+			if fs::File::open(&locked).is_ok() {
+				// Running as root: nothing is unreadable.
+				return;
+			}
+			let expanded = expand_folder_items(
+				selection(&root, &["d"]),
+				100,
+				&CancelToken::new(),
+			)
+			.unwrap();
+			assert_eq!(rels(&expanded.sel), ["d/ok.txt"]);
+			assert_eq!(expanded.skipped, 1);
+			plan_export(&expanded.sel, &native_export_settings(), None)
+				.unwrap();
+		}
+
+		/// A selected folder that is itself a repo is never walked, and
+		/// neither is a repo below a selected folder.
+		#[test]
+		fn folder_walk_never_enters_a_repo() {
+			let (_tmp, root) = canonical_tmp();
+			fs::create_dir_all(root.join("sub/.git")).unwrap();
+			fs::write(root.join("sub/in_repo.txt"), "IN").unwrap();
+			fs::create_dir_all(root.join("app/inner/.git")).unwrap();
+			fs::write(root.join("app/inner/deep.txt"), "DEEP").unwrap();
+			fs::write(root.join("app/top.txt"), "TOP").unwrap();
+			fs::write(root.join("x.txt"), "X").unwrap();
+			let expanded = expand_folder_items(
+				selection(&root, &["sub", "app", "x.txt"]),
+				100,
+				&CancelToken::new(),
+			)
+			.unwrap();
+			assert_eq!(rels(&expanded.sel), ["app/top.txt", "x.txt"]);
+		}
+
+		/// The walk stops at the limit, says so, and never starves a file
+		/// picked on its own after the folder.
+		#[test]
+		fn folder_walk_stops_at_the_limit_and_keeps_explicit_files() {
+			let (_tmp, root) = canonical_tmp();
+			fs::create_dir_all(root.join("big")).unwrap();
+			for i in 0..12 {
+				fs::write(root.join(format!("big/f{i:02}.txt")), "B").unwrap();
+			}
+			fs::write(root.join("z.txt"), "Z").unwrap();
+			let expanded = expand_folder_items(
+				selection(&root, &["big", "z.txt"]),
+				5,
+				&CancelToken::new(),
+			)
+			.unwrap();
+			assert_eq!(
+				rels(&expanded.sel),
+				[
+					"big/f00.txt",
+					"big/f01.txt",
+					"big/f02.txt",
+					"big/f03.txt",
+					"z.txt"
+				]
+			);
+			assert!(expanded.truncated);
+			let exact = expand_folder_items(
+				selection(&root, &["big"]),
+				12,
+				&CancelToken::new(),
+			)
+			.unwrap();
+			assert_eq!(exact.sel.items.len(), 12);
+			assert!(!exact.truncated);
+		}
+
+		/// ClipCode's 30-file default would silently cut a folder copy.
+		#[test]
+		fn native_limit_copies_past_thirty_files() {
+			let (_tmp, root) = canonical_tmp();
+			fs::create_dir_all(root.join("many")).unwrap();
+			for i in 0..40 {
+				fs::write(root.join(format!("many/{i:02}.txt")), "M").unwrap();
+			}
+			let expanded = expand_folder_items(
+				selection(&root, &["many"]),
+				NATIVE_FILE_COUNT_LIMIT,
+				&CancelToken::new(),
+			)
+			.unwrap();
+			let plan =
+				plan_export(&expanded.sel, &native_export_settings(), None)
+					.unwrap();
+			assert_eq!(plan.copied_file_count, 40);
+			assert!(!plan.file_limit_reached);
+		}
+	}
+
 	#[test]
 	fn prepared_removal_uses_admitted_identity_after_root_deletion() {
 		let temp = tempfile::tempdir().unwrap();

@@ -1345,12 +1345,12 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	wait_for_pattern("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3))
 		.expect("Alt+1 must switch to FileExplorer");
 
-	// Click the unchanged tracked file 'unchanged.txt': it becomes the
-	// Project selection alone (nested.txt, clicked earlier, leaves it).
+	// Ctrl-click the unchanged tracked file 'unchanged.txt': it becomes the
+	// Project selection alone (nested.txt was only previewed).
 	println!("[TEST DRIVER] Selecting unchanged.txt...");
-	click("tree-row:unchanged.txt");
+	ctrl_click_at(&wid, control("tree-row:unchanged.txt"));
 	wait_for_pattern(
-		"[APP:TREE_SELECTED: unchanged.txt]",
+		"[APP:TREE_TOGGLED: unchanged.txt]",
 		Duration::from_secs(3),
 	)
 	.expect("unchanged.txt must become the selection");
@@ -5947,13 +5947,15 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	control("ws-tree-row:top.txt");
 	click("ws-tree-row:notes");
 	wait_for("[APP:WS_TREE_PAGE: rel=notes", Duration::from_secs(4));
-	// A plain click selects the file alone and previews it.
+	// A plain click previews the file; Ctrl-click selects it.
 	click("ws-tree-row:notes/readme.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
 	wait_for(
 		"[APP:PREVIEW_LOADED: notes/readme.txt]",
 		Duration::from_secs(4),
 	);
+	std::thread::sleep(Duration::from_millis(200));
+	ctrl_click_at(&wid, control("ws-tree-row:notes/readme.txt"));
+	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
 	let copied = clip::read_text().unwrap();
@@ -6071,6 +6073,32 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 			.unwrap();
 		assert!(st.success(), "click {id}");
 	};
+	let ctrl_click = |id: &str| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let (x, y) = (x.to_string(), y.to_string());
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x,
+				&y,
+				"keydown",
+				"ctrl",
+				"click",
+				"1",
+				"keyup",
+				"ctrl",
+			])
+			.status()
+			.unwrap();
+		assert!(st.success(), "ctrl-click {id}");
+	};
 	let y = |id: &str| control(id)[1];
 
 	click("rail-project");
@@ -6093,7 +6121,22 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 	wait_for("[APP:WS_TREE_PAGE: rel=plain", Duration::from_secs(4));
 	assert!(y("repo-row:INVI_SRC") < y("repo-row:inner"));
 	assert!(y("tree-row:lib.rs") < y("ws-tree-row:plain/x.txt"));
-	click("ws-tree-row:plain/x.txt");
+
+	// Refresh keeps the workspace folders the user opened.
+	click("btn-refresh");
+	wait_for("[APP:WS_TREE_PAGE: rel=plain", Duration::from_secs(8));
+	control("ws-tree-row:plain/x.txt");
+
+	// The root row's chevron folds the workspace tree without switching
+	// repos; the inner repo, placed inside it, folds away with it.
+	click("repo-chevron:INVI_SRC");
+	absent_id(&bounds, "ws-tree-row:plain");
+	absent_id(&bounds, "repo-row:inner");
+	click("repo-chevron:INVI_SRC");
+	control("ws-tree-row:plain/x.txt");
+	control("tree-row:lib.rs");
+
+	ctrl_click("ws-tree-row:plain/x.txt");
 	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
@@ -6115,7 +6158,7 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 
 /// The Project view has no checkboxes (IntelliJ): Ctrl/Cmd-click gathers
 /// files from different folders, right-click > Copy Files copies them all;
-/// Shift-click selects a range; a plain click selects one file alone.
+/// Shift-click selects a range; a plain click only previews.
 #[test]
 fn native_project_view_multiselect_and_right_click_copy() {
 	if std::env::var_os("DISPLAY").is_none() {
@@ -6147,8 +6190,13 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	fs::create_dir_all(ws.join("d/inner")).unwrap();
 	fs::write(ws.join("d/deep.txt"), "DEEP_BYTES\n").unwrap();
 	fs::write(ws.join("d/inner/more.txt"), "MORE_BYTES\n").unwrap();
+	fs::write(ws.join("e.txt"), "E_BASE\n").unwrap();
 	git_ok(&ws, &["add", "."]);
 	git_ok(&ws, &["commit", "-qm", "base"]);
+	fs::write(ws.join("e.txt"), "E_DIRTY\n").unwrap();
+	// A `.git` that is no repo: a folder row the tree marks as a repo.
+	fs::create_dir_all(ws.join("fake/.git")).unwrap();
+	fs::write(ws.join("fake/f.txt"), "FAKE_BYTES\n").unwrap();
 	let dest = tmp.path().join("dest");
 	fs::create_dir_all(&dest).unwrap();
 
@@ -6230,9 +6278,23 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	assert!(both.contains("TWO_BYTES"), "{both}");
 	assert!(!both.contains("C_BYTES"), "{both}");
 
-	// A plain click selects that file alone.
+	// Right-clicking a row that cannot be selected (a repo folder) keeps
+	// the selection; its menu has Copy Files disabled.
+	press("tree-row:fake", &[], "3", &[]);
+	wait_for(
+		"[APP:MENU_OPEN: Left items=copy-files",
+		Duration::from_secs(3),
+	);
+	key(&wid, "Escape");
+	wait_for("[APP:MENU_CLOSED]", Duration::from_secs(3));
+	let kept = copy_by_menu("tree-row:b/two.txt");
+	assert!(kept.contains("ONE_BYTES"), "{kept}");
+	assert!(kept.contains("TWO_BYTES"), "{kept}");
+
+	// A plain click only previews: the selection stays, and a right-click
+	// outside it selects that row alone.
 	click("tree-row:c.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	wait_for("[APP:TREE_FILE_SELECTED: c.txt]", Duration::from_secs(3));
 	let alone = copy_by_menu("tree-row:c.txt");
 	assert!(alone.contains("C_BYTES"), "{alone}");
 	assert!(!alone.contains("ONE_BYTES"), "{alone}");
@@ -6265,6 +6327,25 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	assert!(folder.contains("DEEP_BYTES"), "{folder}");
 	assert!(folder.contains("MORE_BYTES"), "{folder}");
 	assert!(folder.contains("TWO_BYTES"), "{folder}");
+
+	// Viewing a file checked in Changes neither joins nor breaks the
+	// toolbar Copy (it used to add a File twin: COPY_REFUSED collision).
+	click("rail-changes");
+	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
+	click("change-chk:e.txt");
+	wait_for("[APP:BASKET: n=", Duration::from_secs(3));
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	click("tree-row:e.txt");
+	wait_for("[APP:TREE_FILE_SELECTED: e.txt]", Duration::from_secs(3));
+	click("btn-copy");
+	// A refusal logs COPY_REFUSED instead of COPY_PREP.
+	let first = wait_for("[APP:COPY_", Duration::from_secs(6));
+	assert!(first.contains("COPY_PREP"), "{first}");
+	wait_for("[APP:COPY_DONE:", Duration::from_secs(6));
+	let mixed = clip::read_text().unwrap();
+	assert!(mixed.contains("E_DIRTY"), "{mixed}");
+	assert!(!mixed.contains("C_BYTES"), "{mixed}");
 	quit_cleanly(&mut app, &wid);
 }
 
