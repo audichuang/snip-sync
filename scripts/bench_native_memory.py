@@ -1640,6 +1640,42 @@ def change_row_group(control_id: str) -> str:
     return "unstaged" if source == "untracked" else source
 
 
+def scroll_to_change_dirs(
+    s: NativeSession,
+    win: dict[str, Any],
+    group: str,
+    repo: str,
+    candidates: Callable[[], list[str] | None],
+    max_steps: int = 30,
+) -> list[str] | None:
+    """Scroll the rows under the repo's node (its repo row, or a single repo's group
+    header) into view until `candidates` finds something; a workspace of many dirty
+    repos puts them below the fold."""
+    anchor = f"change-repo:{group}:{repo}"
+    if not any(f"id={anchor} " in line for line in s.texts()):
+        anchor = f"change-header:{group}"
+    try:
+        scroll_into_view(s, win, anchor)
+    except NativeBenchError:
+        return []
+    for _ in range(max_steps):
+        found = candidates()
+        if found != []:
+            return found
+        viewport = left_viewport(s.texts())
+        before = len(s.lines)
+        s.focus(win["wid"])
+        cx = win["x"] + viewport[0] + viewport[2] // 2
+        cy = win["y"] + viewport[1] + max(1, viewport[3] // 2)
+        s.x("xdotool", "mousemove", str(cx), str(cy), "click", "5")
+        try:
+            s.wait_line(lambda line: "id=left-list " in line or "id=change-" in line, start=before, timeout=2)
+        except NativeBenchError:
+            pass  # a wheel event can be dropped, or the list is already at its end
+        time.sleep(0.1)
+    return candidates()
+
+
 def expand_change_dirs(
     s: NativeSession,
     win: dict[str, Any],
@@ -1659,21 +1695,27 @@ def expand_change_dirs(
     group = change_row_group(control)
     prefix = f"change-dir:{group}:{repo}:"
     opened: list[str] = []
+
+    def candidates() -> list[str] | None:
+        """Visible unopened ancestors, or None once the row itself is visible."""
+        bounds = parse_bounds(s.texts())
+        if control in bounds:
+            return None
+        return [
+            key[len(prefix):] for key in bounds
+            if key.startswith(prefix) and path.startswith(key[len(prefix):] + "/")
+            and key[len(prefix):] not in opened
+        ]
+
     for _ in range(path.rstrip("/").count("/")):
         # Rows under a node that just opened paint on a later frame.
         deadline = time.monotonic() + 2.0
-        while True:
-            bounds = parse_bounds(s.texts())
-            if control in bounds:
-                return opened
-            dirs = [
-                key[len(prefix):] for key in bounds
-                if key.startswith(prefix) and path.startswith(key[len(prefix):] + "/")
-                and key[len(prefix):] not in opened
-            ]
-            if dirs or time.monotonic() >= deadline:
-                break
+        while (dirs := candidates()) == [] and time.monotonic() < deadline:
             time.sleep(0.05)
+        if dirs == []:
+            dirs = scroll_to_change_dirs(s, win, group, repo, candidates)
+        if dirs is None:
+            return opened
         if not dirs:
             break
         folder = max(dirs, key=len)

@@ -704,10 +704,17 @@ class ChangeTreeSession:
     `on_click` maps a clicked control id to the lines the app logs in reply.
     """
 
-    def __init__(self, lines: list[str], on_click: dict[str, list[list[str]]]) -> None:
+    def __init__(
+        self,
+        lines: list[str],
+        on_click: dict[str, list[list[str]]],
+        on_wheel: list[list[str]] | None = None,
+    ) -> None:
         self.lines = ["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", *lines]
         self.on_click = {key: list(replies) for key, replies in on_click.items()}
+        self.on_wheel = list(on_wheel or [])
         self.clicked: list[str] = []
+        self.wheels = 0
 
     def texts(self, start: int = 0) -> list[str]:
         return self.lines[start:]
@@ -728,6 +735,10 @@ class ChangeTreeSession:
         return None
 
     def x(self, *args: str, timeout: float = 20.0) -> str:
+        if "click" in args:
+            self.wheels += 1
+            if self.on_wheel:
+                self.lines.extend(self.on_wheel.pop(0))
         return ""
 
 
@@ -783,6 +794,24 @@ class TestChangeDirectoryExpansion(unittest.TestCase):
         opened = expand_change_dirs(session, self.WIN, "change-row:untracked:src/a.txt", "repo", timeout=1)
         self.assertEqual(opened, ["src"])
         self.assertEqual(session.clicked, [src, src])
+
+    def test_scrolls_below_the_repo_row_to_find_its_folders(self) -> None:
+        node = "change-repo:unstaged:repo"
+        src = "change-dir:unstaged:repo:src"
+        session = ChangeTreeSession(
+            [_bounds(node, 560)],
+            {
+                src: [[
+                    "[APP:CHANGE_DIR_COLLAPSED: unstaged repo src files=1 collapsed=false]",
+                    _bounds("change-row:unstaged:src/a.txt", 560),
+                ]],
+            },
+            on_wheel=[[], [_bounds(node, 500), _bounds(src, 524)]],
+        )
+        opened = expand_change_dirs(session, self.WIN, "change-row:unstaged:src/a.txt", "repo", timeout=1)
+        self.assertEqual(opened, ["src"])
+        self.assertEqual(session.wheels, 2)
+        self.assertEqual(session.clicked, [src])
 
     def test_visible_row_and_root_files_need_no_click(self) -> None:
         session = ChangeTreeSession([_bounds(self.ROW, 80)], {})
