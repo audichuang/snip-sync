@@ -28,11 +28,12 @@ pub struct Chrome {
 	pub menu_focus: FocusHandle,
 	/// Speed search text typed into the Project / Changes list.
 	pub speed: String,
-	/// Collapsed Changes groups (`change-header:<id>`) per repo root.
-	pub collapsed_groups: Vec<(PathBuf, &'static str)>,
-	/// Expanded repository nodes of the Changes tool window: all start
-	/// collapsed, and opening a repo expands its node.
-	pub expanded_repos: Vec<PathBuf>,
+	/// Collapsed Changes groups (`change-header:<id>`): groups span the
+	/// whole workspace, so the key is the group alone.
+	pub collapsed_groups: Vec<&'static str>,
+	/// Expanded (group, repo root) nodes of the Changes tool window: repo
+	/// rows start collapsed, and opening a repo expands it in every group.
+	pub expanded_repos: Vec<(&'static str, PathBuf)>,
 	pub left_scroll: UniformListScrollHandle,
 }
 
@@ -71,8 +72,8 @@ pub enum MenuAct {
 	RevToggle { sha: String, path: String },
 	ChangeToggle { idx: usize, path: String },
 	ChangeOpen { idx: usize, path: String },
-	GroupToggle(usize, &'static str),
-	RepoToggle(usize),
+	GroupToggle(&'static str),
+	RepoToggle(usize, &'static str),
 	CopyText(String),
 	CommitDiff(String),
 	CopyCommits(String),
@@ -286,18 +287,23 @@ impl WorkbenchModel {
 
 	pub(crate) fn change_group_menu(
 		&self,
+		group: &'static str,
+	) -> Vec<MenuEntry> {
+		let all = self.group_state(group) == Some(true);
+		vec![basket_entry(all, Some(MenuAct::GroupToggle(group)))]
+	}
+
+	/// Repo row under a group: its basket entry covers that repo's files
+	/// of that group only, like the row's checkbox.
+	pub(crate) fn change_repo_menu(
+		&self,
 		slot: usize,
 		group: &'static str,
 	) -> Vec<MenuEntry> {
-		let all = self.group_state(slot, group) == Some(true);
-		vec![basket_entry(all, Some(MenuAct::GroupToggle(slot, group)))]
-	}
-
-	pub(crate) fn change_repo_menu(&self, slot: usize) -> Vec<MenuEntry> {
-		let all = self.repo_state(slot) == Some(true);
+		let all = self.repo_state(slot, group) == Some(true);
 		let root = self.change_repos.get(slot).map(|s| s.root.clone());
 		vec![
-			basket_entry(all, Some(MenuAct::RepoToggle(slot))),
+			basket_entry(all, Some(MenuAct::RepoToggle(slot, group))),
 			MenuEntry::Sep,
 			item(
 				"copy-path",
@@ -561,10 +567,10 @@ impl WorkbenchModel {
 					window.focus(&self.reader_focus);
 				}
 			}
-			MenuAct::GroupToggle(slot, group) => {
-				self.toggle_change_group(slot, group, cx)
+			MenuAct::GroupToggle(group) => self.toggle_change_group(group, cx),
+			MenuAct::RepoToggle(slot, group) => {
+				self.toggle_change_repo(slot, group, cx)
 			}
-			MenuAct::RepoToggle(slot) => self.toggle_change_repo(slot, cx),
 			MenuAct::CopyText(text) => self.copy_text(&text),
 			MenuAct::CommitDiff(sha) => {
 				if self.selected_commit.as_deref() != Some(sha.as_str()) {
@@ -599,14 +605,14 @@ impl WorkbenchModel {
 
 	// ───────────────────────── Changes groups ─────────────────────────
 
-	/// Tri-state of the checkable Changes rows of `slot` matching `pred`:
-	/// all / none selected, `None` if mixed. Non-UTF-8 names do not count.
+	/// Tri-state of the checkable Changes rows matching `pred`: all / none
+	/// selected, `None` if mixed. Non-UTF-8 names do not count.
 	fn rows_state(
 		&self,
-		slot: usize,
 		pred: impl Fn(&crate::FileChangeItem) -> bool,
 	) -> Option<bool> {
-		let mut sel = self.files[crate::slot_range(&self.files, slot)]
+		let mut sel = self
+			.files
 			.iter()
 			.filter(|f| pred(f) && f.is_valid_utf8())
 			.map(|f| f.selected);
@@ -614,30 +620,36 @@ impl WorkbenchModel {
 		sel.all(|s| s == first).then_some(first)
 	}
 
-	/// Tri-state of a Changes group of repo `slot`.
-	pub(crate) fn group_state(&self, slot: usize, group: &str) -> Option<bool> {
-		self.rows_state(slot, |f| change_group(f) == Some(group))
+	/// Tri-state of a Changes group across every repo.
+	pub(crate) fn group_state(&self, group: &str) -> Option<bool> {
+		self.rows_state(|f| change_group(f) == Some(group))
 	}
 
-	/// Tri-state of all of repo `slot`'s changes.
-	pub(crate) fn repo_state(&self, slot: usize) -> Option<bool> {
-		self.rows_state(slot, |_| true)
+	/// Tri-state of repo `slot`'s changes in `group`.
+	pub(crate) fn repo_state(&self, slot: usize, group: &str) -> Option<bool> {
+		self.rows_state(|f| {
+			f.repo as usize == slot && change_group(f) == Some(group)
+		})
 	}
 
-	/// IntelliJ node checkbox: selects the matching rows of `slot` unless
-	/// they already all are, in which case it clears them.
+	/// IntelliJ node checkbox: selects the matching rows unless they
+	/// already all are, in which case it clears them. Rows of a repo whose
+	/// status read has not landed are inert.
 	fn toggle_rows(
 		&mut self,
-		slot: usize,
 		pred: impl Fn(&crate::FileChangeItem) -> bool,
 	) -> Option<bool> {
-		if !self.change_slot_loaded(slot as u32) {
+		let pred = |f: &crate::FileChangeItem| {
+			pred(f) && f.is_valid_utf8() && self.change_slot_loaded(f.repo)
+		};
+		if !self.files.iter().any(pred) {
 			return None;
 		}
-		let select = self.rows_state(slot, &pred) != Some(true);
+		let select = self.rows_state(pred) != Some(true);
+		let hit: Vec<bool> = self.files.iter().map(pred).collect();
 		let mut candidate = self.selection_candidate();
-		for f in &mut candidate.files {
-			if f.repo as usize == slot && pred(f) && f.is_valid_utf8() {
+		for (f, hit) in candidate.files.iter_mut().zip(hit) {
+			if hit {
 				f.selected = select;
 			}
 		}
@@ -659,69 +671,69 @@ impl WorkbenchModel {
 		}
 	}
 
-	/// IntelliJ group checkbox: selects the whole group unless it already is
-	/// fully selected, in which case it clears it.
+	/// IntelliJ group checkbox: selects the whole group (every repo)
+	/// unless it already is fully selected, in which case it clears it.
 	pub(crate) fn toggle_change_group(
 		&mut self,
-		slot: usize,
 		group: &str,
 		cx: &mut Context<Self>,
 	) {
 		if let Some(select) =
-			self.toggle_rows(slot, |f| change_group(f) == Some(group))
+			self.toggle_rows(|f| change_group(f) == Some(group))
 		{
 			app_log!("[APP:GROUP_TOGGLED: {group} selected={select}]");
 		}
 		cx.notify();
 	}
 
-	/// Repository node checkbox: all of that repo's changes.
+	/// Repository row checkbox: that repo's changes in `group`.
 	pub(crate) fn toggle_change_repo(
 		&mut self,
 		slot: usize,
+		group: &str,
 		cx: &mut Context<Self>,
 	) {
-		if let Some(select) = self.toggle_rows(slot, |_| true) {
+		if let Some(select) = self.toggle_rows(|f| {
+			f.repo as usize == slot && change_group(f) == Some(group)
+		}) {
 			let name =
 				self.change_repos.get(slot).map_or("", |s| s.name.as_str());
-			app_log!("[APP:REPO_CHANGES_TOGGLED: {name} selected={select}]");
+			app_log!(
+				"[APP:REPO_CHANGES_TOGGLED: {group} {name} selected={select}]"
+			);
 		}
 		cx.notify();
 	}
 
-	pub(crate) fn group_collapsed(&self, slot: usize, group: &str) -> bool {
-		self.change_repos.get(slot).is_some_and(|s| {
-			self.chrome
-				.collapsed_groups
-				.iter()
-				.any(|(root, g)| *g == group && *root == s.root)
-		})
+	pub(crate) fn group_collapsed(&self, group: &str) -> bool {
+		self.chrome.collapsed_groups.contains(&group)
 	}
 
-	pub(crate) fn repo_changes_collapsed(&self, slot: usize) -> bool {
-		self.change_repos
-			.get(slot)
-			.is_some_and(|s| !self.chrome.expanded_repos.contains(&s.root))
+	pub(crate) fn repo_changes_collapsed(
+		&self,
+		slot: usize,
+		group: &str,
+	) -> bool {
+		self.change_repos.get(slot).is_none_or(|s| {
+			!self
+				.chrome
+				.expanded_repos
+				.iter()
+				.any(|(g, r)| *g == group && *r == s.root)
+		})
 	}
 
 	pub(crate) fn toggle_group_collapsed(
 		&mut self,
-		slot: usize,
 		group: &'static str,
 		cx: &mut Context<Self>,
 	) {
-		let Some(root) = self.change_repos.get(slot).map(|s| s.root.clone())
-		else {
-			return;
-		};
 		let c = &mut self.chrome.collapsed_groups;
-		let collapsed = if let Some(i) =
-			c.iter().position(|(r, g)| *g == group && *r == root)
-		{
+		let collapsed = if let Some(i) = c.iter().position(|g| *g == group) {
 			c.remove(i);
 			false
 		} else {
-			c.push((root, group));
+			c.push(group);
 			true
 		};
 		app_log!("[APP:GROUP_COLLAPSED: {group} collapsed={collapsed}]");
@@ -731,6 +743,7 @@ impl WorkbenchModel {
 	pub(crate) fn toggle_repo_collapsed(
 		&mut self,
 		slot: usize,
+		group: &'static str,
 		cx: &mut Context<Self>,
 	) {
 		let Some(s) = self.change_repos.get(slot) else {
@@ -738,14 +751,18 @@ impl WorkbenchModel {
 		};
 		let (root, name) = (s.root.clone(), s.name.clone());
 		let c = &mut self.chrome.expanded_repos;
-		let collapsed = if let Some(i) = c.iter().position(|r| *r == root) {
+		let collapsed = if let Some(i) =
+			c.iter().position(|(g, r)| *g == group && *r == root)
+		{
 			c.remove(i);
 			true
 		} else {
-			c.push(root);
+			c.push((group, root));
 			false
 		};
-		app_log!("[APP:REPO_CHANGES_COLLAPSED: {name} collapsed={collapsed}]");
+		app_log!(
+			"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed={collapsed}]"
+		);
 		cx.notify();
 	}
 
@@ -987,12 +1004,21 @@ pub(crate) fn change_group(f: &crate::FileChangeItem) -> Option<&'static str> {
 	}
 }
 
-/// Changes groups in display order: (id, label key).
+/// Changes groups of a single-repo workspace in display order:
+/// (id, label key).
 pub(crate) const CHANGE_GROUPS: [(&str, &str); 4] = [
 	("conflicted", "group_conflicted"),
 	("staged", "group_staged"),
 	("unstaged", "group_unstaged"),
 	("untracked", "group_untracked"),
+];
+
+/// Top-level groups of a multi-repo workspace, conflicts last.
+pub(crate) const WORKSPACE_GROUPS: [(&str, &str); 4] = [
+	("staged", "group_staged"),
+	("unstaged", "group_unstaged"),
+	("untracked", "group_untracked"),
+	("conflicted", "group_conflicted"),
 ];
 
 /// Approximate text width at `UI_TEXT`: CJK glyphs are full-width.

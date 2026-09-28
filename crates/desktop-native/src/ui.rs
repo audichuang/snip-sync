@@ -871,86 +871,125 @@ enum ProjRow {
 /// One row of the Git Changes tool window (section header or file change).
 #[derive(Clone, Debug)]
 pub enum ChangeItemRow {
-	/// Repository node, shown when the workspace has more than one repo.
+	/// Group node (Staged / Unstaged / Untracked / Conflicts); with more
+	/// than one repo it spans the whole workspace.
+	Header {
+		label: &'static str,
+		count: usize,
+		group_id: &'static str,
+	},
+	/// A repo's node under a group, shown when the workspace has more than
+	/// one repo.
 	Repo {
 		slot: usize,
+		group_id: &'static str,
 		count: usize,
 	},
 	/// A repo's read error or truncation notice.
 	Note {
 		slot: usize,
 	},
-	Header {
-		slot: usize,
-		label: &'static str,
-		count: usize,
-		group_id: &'static str,
-	},
 	File {
 		file_idx: usize,
 	},
 }
 
-/// Changes tool window rows, like IntelliJ's "Group by Repository": with
-/// more than one repo each repo that has changes (or failed to read) gets a
-/// node over its Staged / Changes / Unversioned / Conflicts groups; clean
-/// repos are not listed. A single repo shows its groups at the top level.
+/// Changes tool window rows. One repo shows its groups at the top level
+/// with the files under them. Several repos invert that: each non-empty
+/// group is a workspace-wide node over one row per repo with files in it
+/// (in repo name order), and the files sit under the repo rows. Clean
+/// repos are not listed; a failed read with no rows gets a top-level note.
 pub(crate) fn change_rows(
 	slots: &[crate::ChangeRepo],
 	files: &[crate::FileChangeItem],
-	repo_collapsed: impl Fn(usize) -> bool,
-	group_collapsed: impl Fn(usize, &str) -> bool,
+	group_collapsed: impl Fn(&str) -> bool,
+	repo_collapsed: impl Fn(usize, &str) -> bool,
 	repo_query: &str,
 ) -> Vec<ChangeItemRow> {
-	let grouped = slots.len() > 1;
 	let query = repo_query.to_lowercase();
+	let note = |slot: usize| {
+		matches!(slots[slot].state, crate::ChangeRepoState::Failed(_))
+			|| slots[slot].truncated(crate::slot_range(files, slot).len())
+	};
+	let members = |slot: usize, group: &str| -> Vec<usize> {
+		crate::slot_range(files, slot)
+			.filter(|&i| crate::menu::change_group(&files[i]) == Some(group))
+			.collect()
+	};
 	let mut rows = Vec::new();
-	for (slot, repo) in slots.iter().enumerate() {
-		// Speed search over several repos filters the repo nodes by name.
-		if grouped && !repo.name.to_lowercase().contains(&query) {
-			continue;
-		}
-		let range = crate::slot_range(files, slot);
-		let failed = matches!(repo.state, crate::ChangeRepoState::Failed(_));
-		let note = failed || repo.truncated(range.len());
-		if grouped {
-			if range.is_empty() && !note {
-				continue;
+	if slots.len() <= 1 {
+		for slot in 0..slots.len() {
+			if note(slot) {
+				rows.push(ChangeItemRow::Note { slot });
 			}
-			rows.push(ChangeItemRow::Repo {
-				slot,
-				count: range.len(),
-			});
-			if repo_collapsed(slot) {
-				continue;
+			for (group_id, label) in crate::menu::CHANGE_GROUPS {
+				let members = members(slot, group_id);
+				if members.is_empty() {
+					continue;
+				}
+				rows.push(ChangeItemRow::Header {
+					label,
+					count: members.len(),
+					group_id,
+				});
+				if !group_collapsed(group_id) {
+					rows.extend(
+						members
+							.into_iter()
+							.map(|file_idx| ChangeItemRow::File { file_idx }),
+					);
+				}
 			}
 		}
-		if note {
+		return rows;
+	}
+	// Speed search over several repos filters the repo rows by name.
+	let shown: Vec<usize> = (0..slots.len())
+		.filter(|&s| slots[s].name.to_lowercase().contains(&query))
+		.collect();
+	for &slot in &shown {
+		if crate::slot_range(files, slot).is_empty() && note(slot) {
 			rows.push(ChangeItemRow::Note { slot });
 		}
-		for (group_id, label) in crate::menu::CHANGE_GROUPS {
-			let members: Vec<usize> = range
-				.clone()
-				.filter(|&i| {
-					crate::menu::change_group(&files[i]) == Some(group_id)
-				})
-				.collect();
-			if members.is_empty() {
+	}
+	for (group_id, label) in crate::menu::WORKSPACE_GROUPS {
+		let total = files
+			.iter()
+			.filter(|f| crate::menu::change_group(f) == Some(group_id))
+			.count();
+		let repos: Vec<(usize, Vec<usize>)> = shown
+			.iter()
+			.map(|&slot| (slot, members(slot, group_id)))
+			.filter(|(_, m)| !m.is_empty())
+			.collect();
+		if repos.is_empty() {
+			continue;
+		}
+		rows.push(ChangeItemRow::Header {
+			label,
+			count: total,
+			group_id,
+		});
+		if group_collapsed(group_id) {
+			continue;
+		}
+		for (slot, members) in repos {
+			rows.push(ChangeItemRow::Repo {
+				slot,
+				group_id,
+				count: members.len(),
+			});
+			if repo_collapsed(slot, group_id) {
 				continue;
 			}
-			rows.push(ChangeItemRow::Header {
-				slot,
-				label,
-				count: members.len(),
-				group_id,
-			});
-			if !group_collapsed(slot, group_id) {
-				rows.extend(
-					members
-						.into_iter()
-						.map(|file_idx| ChangeItemRow::File { file_idx }),
-				);
+			if note(slot) {
+				rows.push(ChangeItemRow::Note { slot });
 			}
+			rows.extend(
+				members
+					.into_iter()
+					.map(|file_idx| ChangeItemRow::File { file_idx }),
+			);
 		}
 	}
 	rows
@@ -1094,8 +1133,8 @@ impl WorkbenchModel {
 		change_rows(
 			&self.change_repos,
 			&self.files,
-			|slot| self.repo_changes_collapsed(slot),
-			|slot, group| self.group_collapsed(slot, group),
+			|group| self.group_collapsed(group),
+			|slot, group| self.repo_changes_collapsed(slot, group),
 			&self.chrome.speed,
 		)
 	}
@@ -1296,33 +1335,42 @@ impl WorkbenchModel {
 			};
 			let cur = self.selected_list_row.min(cur);
 			match (&rows[cur], action) {
-				(ChangeItemRow::Repo { slot, .. }, _) => {
-					let slot = *slot;
-					let collapsed = self.repo_changes_collapsed(slot);
+				(ChangeItemRow::Repo { slot, group_id, .. }, _) => {
+					let (slot, group) = (*slot, *group_id);
+					let collapsed = self.repo_changes_collapsed(slot, group);
 					match action {
-						"toggle" => self.toggle_change_repo(slot, cx),
-						"open" => self.toggle_repo_collapsed(slot, cx),
+						"toggle" => self.toggle_change_repo(slot, group, cx),
+						"open" => self.toggle_repo_collapsed(slot, group, cx),
 						"expand" if collapsed => {
-							self.toggle_repo_collapsed(slot, cx)
+							self.toggle_repo_collapsed(slot, group, cx)
 						}
 						"collapse" if !collapsed => {
-							self.toggle_repo_collapsed(slot, cx)
+							self.toggle_repo_collapsed(slot, group, cx)
+						}
+						"collapse" => {
+							// IntelliJ: Left on a collapsed node goes
+							// to its parent group.
+							if let Some(h) = rows[..cur].iter().rposition(|r| {
+								matches!(r, ChangeItemRow::Header { .. })
+							}) {
+								self.set_tool_cursor(h, cx);
+							}
 						}
 						_ => {}
 					}
 				}
 				(ChangeItemRow::Note { .. }, _) => {}
-				(ChangeItemRow::Header { slot, group_id, .. }, _) => {
-					let (slot, group) = (*slot, *group_id);
-					let collapsed = self.group_collapsed(slot, group);
+				(ChangeItemRow::Header { group_id, .. }, _) => {
+					let group = *group_id;
+					let collapsed = self.group_collapsed(group);
 					match action {
-						"toggle" => self.toggle_change_group(slot, group, cx),
-						"open" => self.toggle_group_collapsed(slot, group, cx),
+						"toggle" => self.toggle_change_group(group, cx),
+						"open" => self.toggle_group_collapsed(group, cx),
 						"expand" if collapsed => {
-							self.toggle_group_collapsed(slot, group, cx)
+							self.toggle_group_collapsed(group, cx)
 						}
 						"collapse" if !collapsed => {
-							self.toggle_group_collapsed(slot, group, cx)
+							self.toggle_group_collapsed(group, cx)
 						}
 						_ => {}
 					}
@@ -1336,7 +1384,11 @@ impl WorkbenchModel {
 				(ChangeItemRow::File { .. }, "collapse") => {
 					// IntelliJ: Left on a leaf goes to its parent node.
 					if let Some(h) = rows[..cur].iter().rposition(|r| {
-						matches!(r, ChangeItemRow::Header { .. })
+						matches!(
+							r,
+							ChangeItemRow::Header { .. }
+								| ChangeItemRow::Repo { .. }
+						)
 					}) {
 						self.set_tool_cursor(h, cx);
 					}
@@ -2415,23 +2467,25 @@ impl WorkbenchModel {
 					for (row_idx, item) in rows.into_iter().enumerate() {
 						if range.contains(&row_idx) {
 							match item {
-								ChangeItemRow::Repo { slot, count } => {
+								ChangeItemRow::Repo {
+									slot,
+									group_id,
+									count,
+								} => {
 									out.push(this.change_repo_row(
-										slot, count, row_idx, cx,
+										slot, group_id, count, row_idx, cx,
 									));
 								}
 								ChangeItemRow::Note { slot } => {
 									out.push(this.change_note_row(slot));
 								}
 								ChangeItemRow::Header {
-									slot,
 									label,
 									count,
 									group_id,
 								} => {
 									out.push(this.change_header_row(
-										slot, label, count, group_id, row_idx,
-										cx,
+										label, count, group_id, row_idx, cx,
 									));
 								}
 								ChangeItemRow::File { file_idx } => {
@@ -3156,7 +3210,6 @@ impl WorkbenchModel {
 	/// tri-state group checkbox, name and count.
 	fn change_header_row(
 		&self,
-		slot: usize,
 		label_key: &'static str,
 		count: usize,
 		group_id: &'static str,
@@ -3165,23 +3218,14 @@ impl WorkbenchModel {
 	) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
-		let collapsed = self.group_collapsed(slot, group_id);
+		let collapsed = self.group_collapsed(group_id);
 		let cursor = row_idx == self.selected_list_row;
-		let (legacy, repo) = self.change_probe_scope(slot);
-		let id = format!("change-header@{repo}:{group_id}");
-		let chk_id = format!("change-group-chk@{repo}:{group_id}");
-		let toggle_id = format!("change-group-toggle@{repo}:{group_id}");
-		let legacy_ids = legacy.then(|| {
-			(
-				format!("change-header:{group_id}"),
-				format!("change-group-chk:{group_id}"),
-				format!("change-group-toggle:{group_id}"),
-			)
-		});
-		let (old_id, old_chk, old_toggle) = match legacy_ids {
-			Some((a, b, c)) => (Some(a), Some(b), Some(c)),
-			None => (None, None, None),
-		};
+		// One click toggles a workspace group; a single repo's group keeps
+		// IntelliJ's double click.
+		let clicks = if self.change_repos.len() > 1 { 1 } else { 2 };
+		let id = format!("change-header:{group_id}");
+		let chk_id = format!("change-group-chk:{group_id}");
+		let toggle_id = format!("change-group-toggle:{group_id}");
 		div()
 			.id(SharedString::from(id.clone()))
 			.relative()
@@ -3190,7 +3234,7 @@ impl WorkbenchModel {
 			.items_center()
 			.w_full()
 			.h(px(ROW_H))
-			.pl(px(4. + self.change_indent()))
+			.pl(px(4.))
 			.pr(px(6.))
 			.gap(px(2.))
 			.rounded(px(4.))
@@ -3199,8 +3243,8 @@ impl WorkbenchModel {
 			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 			.on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
 				this.selected_list_row = row_idx;
-				if ev.click_count() >= 2 {
-					this.toggle_group_collapsed(slot, group_id, cx);
+				if ev.click_count() == clicks {
+					this.toggle_group_collapsed(group_id, cx);
 				}
 				cx.notify();
 			}))
@@ -3208,7 +3252,7 @@ impl WorkbenchModel {
 				MouseButton::Right,
 				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
 					this.selected_list_row = row_idx;
-					let items = this.change_group_menu(slot, group_id);
+					let items = this.change_group_menu(group_id);
 					this.open_left_menu(items, ev, w, cx);
 				}),
 			)
@@ -3224,7 +3268,7 @@ impl WorkbenchModel {
 					.on_click(cx.listener(move |this, _, _, cx| {
 						cx.stop_propagation();
 						this.selected_list_row = row_idx;
-						this.toggle_group_collapsed(slot, group_id, cx);
+						this.toggle_group_collapsed(group_id, cx);
 					}))
 					.child(icon(
 						if collapsed {
@@ -3234,8 +3278,7 @@ impl WorkbenchModel {
 						},
 						10.,
 					))
-					.children(probe(log, toggle_id))
-					.children(old_toggle.and_then(|id| probe(log, id))),
+					.children(probe(log, toggle_id)),
 			)
 			.child(
 				div()
@@ -3248,11 +3291,10 @@ impl WorkbenchModel {
 					.justify_center()
 					.on_click(cx.listener(move |this, _, _, cx| {
 						cx.stop_propagation();
-						this.toggle_change_group(slot, group_id, cx);
+						this.toggle_change_group(group_id, cx);
 					}))
-					.child(tri_checkbox(self.group_state(slot, group_id)))
-					.children(probe(log, chk_id))
-					.children(old_chk.and_then(|id| probe(log, id))),
+					.child(tri_checkbox(self.group_state(group_id)))
+					.children(probe(log, chk_id)),
 			)
 			.child(
 				clip_text(t(label_key, loc))
@@ -3268,11 +3310,11 @@ impl WorkbenchModel {
 					.child(count.to_string()),
 			)
 			.children(probe(log, id))
-			.children(old_id.and_then(|id| probe(log, id)))
 			.into_any_element()
 	}
 
-	/// Extra left indent of group and file rows under a repository node.
+	/// One tree level of indent in a multi-repo workspace: repo rows sit one
+	/// level under their group, file and note rows two.
 	fn change_indent(&self) -> f32 {
 		if self.change_repos.len() > 1 {
 			16.
@@ -3295,11 +3337,13 @@ impl WorkbenchModel {
 		(legacy, name)
 	}
 
-	/// Repository node (Group by Repository): chevron, tri-state checkbox
-	/// for all of the repo's changes, bold name, branch and count.
+	/// Repo row under a workspace group: chevron, tri-state checkbox for
+	/// the repo's changes in that group, a square in the repo's Git Log
+	/// root-stripe color, the name, its count and the branch as a pill.
 	fn change_repo_row(
 		&self,
 		slot: usize,
+		group_id: &'static str,
 		count: usize,
 		row_idx: usize,
 		cx: &mut Context<Self>,
@@ -3308,24 +3352,26 @@ impl WorkbenchModel {
 		let Some(repo) = self.change_repos.get(slot) else {
 			return div().into_any_element();
 		};
-		let collapsed = self.repo_changes_collapsed(slot);
+		let collapsed = self.repo_changes_collapsed(slot, group_id);
 		let cursor = row_idx == self.selected_list_row;
 		let name = repo.name.clone();
 		let failed = matches!(repo.state, crate::ChangeRepoState::Failed(_));
+		let color = graph_view::palette_rgb(self.log_repo_color(&repo.root));
+		// Detached HEAD shows its short sha.
 		let branch = self
 			.repos
 			.iter()
 			.find(|r| r.root == repo.root)
 			.and_then(|r| r.summary.as_ref().ok())
 			.and_then(|s| {
-				s.branch.clone().or_else(|| {
-					s.head.as_ref().map(|h| format!("({})", short(h)))
-				})
+				s.branch
+					.clone()
+					.or_else(|| s.head.as_ref().map(|h| short(h).to_string()))
 			})
 			.unwrap_or_default();
-		let id = format!("change-repo:{name}");
-		let chk_id = format!("change-repo-chk:{name}");
-		let toggle_id = format!("change-repo-toggle:{name}");
+		let id = format!("change-repo:{group_id}:{name}");
+		let chk_id = format!("change-repo-chk:{group_id}:{name}");
+		let toggle_id = format!("change-repo-toggle:{group_id}:{name}");
 		let tooltip = repo.root.display().to_string();
 		div()
 			.id(SharedString::from(id.clone()))
@@ -3335,7 +3381,7 @@ impl WorkbenchModel {
 			.items_center()
 			.w_full()
 			.h(px(ROW_H))
-			.pl(px(4.))
+			.pl(px(4. + self.change_indent()))
 			.pr(px(6.))
 			.gap(px(2.))
 			.rounded(px(4.))
@@ -3345,13 +3391,13 @@ impl WorkbenchModel {
 			.when(self.chrome.menu.is_none(), |d| d.tooltip(tip(tooltip)))
 			.on_click(cx.listener(move |this, _, _, cx| {
 				this.selected_list_row = row_idx;
-				this.toggle_repo_collapsed(slot, cx);
+				this.toggle_repo_collapsed(slot, group_id, cx);
 			}))
 			.on_mouse_down(
 				MouseButton::Right,
 				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
 					this.selected_list_row = row_idx;
-					let items = this.change_repo_menu(slot);
+					let items = this.change_repo_menu(slot, group_id);
 					this.open_left_menu(items, ev, w, cx);
 				}),
 			)
@@ -3383,45 +3429,55 @@ impl WorkbenchModel {
 					.flex()
 					.items_center()
 					.justify_center()
-					.when(count > 0, |d| {
-						d.on_click(cx.listener(move |this, _, _, cx| {
-							cx.stop_propagation();
-							this.selected_list_row = row_idx;
-							this.toggle_change_repo(slot, cx);
-						}))
-						.child(tri_checkbox(self.repo_state(slot)))
-					})
+					.on_click(cx.listener(move |this, _, _, cx| {
+						cx.stop_propagation();
+						this.selected_list_row = row_idx;
+						this.toggle_change_repo(slot, group_id, cx);
+					}))
+					.child(tri_checkbox(self.repo_state(slot, group_id)))
 					.children(probe(log, chk_id)),
 			)
-			.child(div().ml(px(2.)).child(icon(
-				if failed { Icon::Warning } else { Icon::Project },
-				14.,
-			)))
+			.child(if failed {
+				div()
+					.flex_shrink_0()
+					.ml(px(4.))
+					.child(icon(Icon::Warning, 12.))
+			} else {
+				div()
+					.flex_shrink_0()
+					.ml(px(5.))
+					.mr(px(1.))
+					.size(px(10.))
+					.rounded(px(3.))
+					.bg(color)
+			})
 			.child(
 				self.speed_label(name)
-					.ml(px(4.))
-					.flex_shrink_0()
-					.max_w(gpui::relative(0.6))
-					.font_weight(FontWeight::BOLD),
+					.ml(px(6.))
+					.flex_shrink()
+					.text_color(rgb(pal().text)),
 			)
-			.when(!branch.is_empty(), |d| {
-				d.child(
-					clip_text(branch)
-						.ml(px(6.))
-						.flex_shrink()
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().ref_local)),
-				)
-			})
 			.child(
 				div()
 					.flex_shrink_0()
-					.ml_auto()
-					.pl(px(6.))
+					.ml(px(8.))
 					.text_size(px(SMALL_TEXT))
 					.text_color(rgb(pal().text_muted))
 					.child(count.to_string()),
 			)
+			.when(!branch.is_empty(), |d| {
+				d.child(
+					clip_text(branch)
+						.flex_shrink_0()
+						.max_w(gpui::relative(0.45))
+						.ml(px(8.))
+						.px(px(6.))
+						.rounded(px(4.))
+						.bg(rgb(pal().ref_bg))
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text)),
+				)
+			})
 			.children(probe(log, id))
 			.into_any_element()
 	}
@@ -3442,6 +3498,14 @@ impl WorkbenchModel {
 				pal().text_muted,
 			),
 		};
+		// A multi-repo failure with no rows sits at the top level, under no
+		// repo row, so it names its repo.
+		let top = self.change_repos.len() > 1 && kept == 0;
+		let text = if top {
+			format!("{}: {text}", repo.name)
+		} else {
+			text
+		};
 		let id = format!("change-note:{}", repo.name);
 		div()
 			.id(SharedString::from(id.clone()))
@@ -3452,7 +3516,11 @@ impl WorkbenchModel {
 			.gap(px(6.))
 			.w_full()
 			.h(px(ROW_H))
-			.pl(px(24. + self.change_indent()))
+			.pl(px(if top {
+				8.
+			} else {
+				24. + 2. * self.change_indent()
+			}))
 			.pr(px(6.))
 			.text_size(px(SMALL_TEXT))
 			.text_color(rgb(color))
@@ -3544,7 +3612,7 @@ impl WorkbenchModel {
 			.items_center()
 			.w_full()
 			.h(px(ROW_H))
-			.pl(px(20. + self.change_indent()))
+			.pl(px(20. + 2. * self.change_indent()))
 			.pr(px(6.))
 			.gap(px(6.))
 			.cursor_pointer()

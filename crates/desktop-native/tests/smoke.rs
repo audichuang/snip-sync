@@ -4477,12 +4477,24 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	quit_cleanly(&mut app, &wid);
 }
 
-/// Changes lists every workspace repo's changes grouped by repository, like
-/// IntelliJ with several VCS roots: a clean repo is not listed, a file of a
-/// repo that is not the open one previews from its own repo and checks into
-/// that repo's basket entry, and a repo node collapses its rows.
+/// Changes of a multi-repo workspace are grouped by change kind first: a
+/// workspace-wide Staged / Unstaged / Untracked node over one row per repo
+/// with files in it, and the files under the repo rows. A clean repo is not
+/// listed, repo rows start collapsed and expand per group, a file of a repo
+/// that is not the open one previews from its own repo and checks into that
+/// repo's basket entry, and the group checkbox spans every repo.
 #[test]
 fn native_changes_group_all_repos() {
+	changes_group_all_repos("dark");
+}
+
+/// The same tree in the light palette, for the screenshot only.
+#[test]
+fn native_changes_group_all_repos_light() {
+	changes_group_all_repos("light");
+}
+
+fn changes_group_all_repos(theme: &str) {
 	if std::env::var_os("DISPLAY").is_none() {
 		assert!(
 			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
@@ -4519,8 +4531,11 @@ fn native_changes_group_all_repos() {
 	fs::write(alpha.join("staged.txt"), "staged\n").unwrap();
 	git_ok(&alpha, &["add", "staged.txt"]);
 	fs::write(alpha.join("shared.txt"), "alpha edited\n").unwrap();
-	// beta: an unstaged change and an untracked folder of two files.
+	// beta: a staged and an unstaged change and an untracked folder of two
+	// files, on a feature branch.
 	git_ok(&beta, &["checkout", "-qb", "feature/x"]);
+	fs::write(beta.join("beta-staged.txt"), "beta staged\n").unwrap();
+	git_ok(&beta, &["add", "beta-staged.txt"]);
 	fs::write(beta.join("shared.txt"), "beta edited\n").unwrap();
 	fs::create_dir_all(beta.join("newdir")).unwrap();
 	fs::write(beta.join("newdir/one.txt"), "one\ntwo\nthree\n").unwrap();
@@ -4529,17 +4544,18 @@ fn native_changes_group_all_repos() {
 	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
 	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
 	let dest = tempfile::tempdir().unwrap();
-	let mut app = spawn_app(
+	let mut app = spawn_app_themed(
 		ws.path(),
 		dest.path(),
 		Some((bounds.clone(), viewport.clone())),
+		theme,
 	);
 	let rx = &app.rx;
 	let loaded = lines_until_all_smoke(
 		rx,
 		&[
 			"[APP:REPO_LOADED: alpha files=2]",
-			"[APP:CHANGES_LOADED: beta files=3]",
+			"[APP:CHANGES_LOADED: beta files=4]",
 			"[APP:CHANGES_LOADED: gamma files=0]",
 		],
 		Duration::from_secs(15),
@@ -4612,32 +4628,81 @@ fn native_changes_group_all_repos() {
 		assert!(st.success());
 	};
 
-	// Both repos with changes are nodes; the clean one is not listed. Repo
-	// nodes start collapsed (IntelliJ-style overview of many repos).
-	control("change-repo:alpha");
-	control("change-repo:beta");
+	// Groups first, each over the repos with files in it, in name order;
+	// the clean repo and empty (group, repo) pairs are not listed. Repo
+	// rows start collapsed.
+	let order = [
+		"change-header:staged",
+		"change-repo:staged:alpha",
+		"change-repo:staged:beta",
+		"change-header:unstaged",
+		"change-repo:unstaged:alpha",
+		"change-repo:unstaged:beta",
+		"change-header:untracked",
+		"change-repo:untracked:beta",
+	];
+	let ys: Vec<i32> = order.iter().map(|id| control(id)[1]).collect();
+	assert!(ys.windows(2).all(|w| w[0] < w[1]), "{order:?} {ys:?}");
+	let snap = settled();
+	assert!(!snap.contains_key("change-repo:untracked:alpha"));
+	assert!(
+		!snap
+			.keys()
+			.any(|k| k.starts_with("change-") && k.contains("gamma")),
+		"{snap:?}"
+	);
+	absent("change-row@alpha:staged:staged.txt");
 	absent("change-row@beta:unstaged:shared.txt");
-	click("change-repo:alpha");
-	wait("[APP:REPO_CHANGES_COLLAPSED: alpha collapsed=false]");
-	click("change-repo:beta");
-	wait("[APP:REPO_CHANGES_COLLAPSED: beta collapsed=false]");
+
+	// Repo rows expand per group: alpha stays collapsed under Unstaged.
+	for (group, name) in [
+		("staged", "alpha"),
+		("staged", "beta"),
+		("unstaged", "beta"),
+		("untracked", "beta"),
+	] {
+		click(&format!("change-repo:{group}:{name}"));
+		wait(&format!(
+			"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed=false]"
+		));
+	}
 	control("change-row@alpha:staged:staged.txt");
+	control("change-row@beta:staged:beta-staged.txt");
 	control("change-row@beta:unstaged:shared.txt");
 	control("change-row@beta:untracked:newdir/one.txt");
 	control("change-row@beta:untracked:newdir/two.txt");
-	control("change-header@beta:untracked");
-	assert!(!settled().contains_key("change-repo:gamma"));
+	absent("change-row@alpha:unstaged:shared.txt");
 	// Unqualified ids keep naming the open repo's rows only.
-	let alpha_row = control("change-row@alpha:unstaged:shared.txt");
-	assert_eq!(control("change-row:unstaged:shared.txt"), alpha_row);
-	let beta_node = control("change-repo:beta");
-	assert!(beta_node[1] > alpha_row[1], "repos keep name order");
+	assert_eq!(
+		control("change-row:staged:staged.txt"),
+		control("change-row@alpha:staged:staged.txt")
+	);
+	// The file rows sit under their repo row, indented past its checkbox.
+	let repo_chk = control("change-repo-chk:staged:beta");
+	let file_chk = control("change-chk@beta:staged:beta-staged.txt");
+	assert!(file_chk[0] > repo_chk[0], "{file_chk:?} {repo_chk:?}");
 
 	let out = std::env::var_os("SNIP_E2E_OUT")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
 	fs::create_dir_all(&out).unwrap();
-	capture_window(&wid, &out.join("multi-repo-changes.png"));
+	let shot = if theme == "dark" {
+		"multi-repo-changes.png".to_string()
+	} else {
+		format!("multi-repo-changes-{theme}.png")
+	};
+	// Park the pointer over the editor so no row tooltip covers the tree.
+	let st = Command::new("xdotool")
+		.args(["mousemove", "--window", &wid, "700", "300"])
+		.status()
+		.unwrap();
+	assert!(st.success());
+	std::thread::sleep(Duration::from_millis(800));
+	capture_window(&wid, &out.join(shot));
+	if theme != "dark" {
+		quit_cleanly(&mut app, &wid);
+		return;
+	}
 
 	// A file of the repo that is not open previews from its own repo (the
 	// new-file diff of its three lines; alpha has no such file to read).
@@ -4661,20 +4726,36 @@ fn native_changes_group_all_repos() {
 			.contains("beta untracked newdir/one.txt"),
 		"{basket:?}"
 	);
-	// The repo node checkbox selects all of beta's changes, not alpha's.
-	click("change-repo-chk:beta");
-	let basket = wait("[APP:BASKET: n=3");
+	// A repo row's checkbox covers that repo's files of that group only.
+	click("change-repo-chk:staged:beta");
+	let basket = wait("[APP:BASKET: n=2");
+	wait("[APP:REPO_CHANGES_TOGGLED: staged beta selected=true]");
 	assert!(!basket.last().unwrap().contains("alpha"), "{basket:?}");
+	// A group's checkbox spans every repo.
+	click("change-group-chk:unstaged");
+	let basket = wait("[APP:BASKET: n=4");
+	wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
+	let last = basket.last().unwrap();
+	assert!(
+		last.contains("alpha unstaged shared.txt")
+			&& last.contains("beta unstaged shared.txt"),
+		"{basket:?}"
+	);
 
-	// Collapsing a repo node hides its rows and leaves the other repo's.
-	click("change-repo:beta");
-	wait("[APP:REPO_CHANGES_COLLAPSED: beta collapsed=true]");
+	// Collapsing a repo row hides its files in that group only.
+	click("change-repo:untracked:beta");
+	wait("[APP:REPO_CHANGES_COLLAPSED: untracked beta collapsed=true]");
 	absent("change-row@beta:untracked:newdir/one.txt");
-	absent("change-header@beta:untracked");
-	control("change-row@alpha:staged:staged.txt");
-	click("change-repo:beta");
-	wait("[APP:REPO_CHANGES_COLLAPSED: beta collapsed=false]");
-	control("change-row@beta:untracked:newdir/two.txt");
+	control("change-row@beta:staged:beta-staged.txt");
+	// One click on a group row collapses it; the chevron reopens it.
+	click("change-header:staged");
+	wait("[APP:GROUP_COLLAPSED: staged collapsed=true]");
+	absent("change-repo:staged:alpha");
+	absent("change-row@beta:staged:beta-staged.txt");
+	control("change-repo:unstaged:alpha");
+	click("change-group-toggle:staged");
+	wait("[APP:GROUP_COLLAPSED: staged collapsed=false]");
+	control("change-row@beta:staged:beta-staged.txt");
 
 	quit_cleanly(&mut app, &wid);
 }

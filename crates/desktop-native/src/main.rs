@@ -294,6 +294,18 @@ impl<T: PartialEq> ReadQueue<T> {
 	}
 }
 
+/// Marks `root`'s Changes repo rows expanded in every group.
+fn expand_repo_everywhere(
+	expanded: &mut Vec<(&'static str, PathBuf)>,
+	root: &std::path::Path,
+) {
+	for (group, _) in menu::CHANGE_GROUPS {
+		if !expanded.iter().any(|(g, r)| *g == group && r == root) {
+			expanded.push((group, root.to_path_buf()));
+		}
+	}
+}
+
 /// Rows of slot `slot` in `files`, which is sorted by slot.
 pub fn slot_range(
 	files: &[FileChangeItem],
@@ -2928,10 +2940,12 @@ impl WorkbenchModel {
 	pub fn select_repo(&mut self, idx: usize, cx: &mut Context<Self>) {
 		if let Some(entry) = self.repos.get(idx) {
 			self.pinned_repo = Some(repo_key(entry));
-			// Opening a repo reveals its changes; the others stay collapsed.
-			if !self.chrome.expanded_repos.contains(&entry.root) {
-				self.chrome.expanded_repos.push(entry.root.clone());
-			}
+			// Opening a repo reveals its changes in every group; the others
+			// stay collapsed.
+			expand_repo_everywhere(
+				&mut self.chrome.expanded_repos,
+				&entry.root,
+			);
 		}
 		self.select_repo_internal(idx, false, cx);
 	}
@@ -3927,7 +3941,7 @@ impl WorkbenchModel {
 	pub fn basket_summary_localized(&self, loc: Locale) -> String {
 		self.basket_summary_with(|source| match source {
 			SourceKind::File => i18n::t("src_working_file", loc).to_string(),
-			SourceKind::Working => i18n::t("group_untracked", loc).to_string(),
+			SourceKind::Working => i18n::t("tag_untracked", loc).to_string(),
 			SourceKind::Unstaged => i18n::t("tag_unstaged", loc).to_string(),
 			SourceKind::Staged => i18n::t("tag_staged", loc).to_string(),
 			SourceKind::Commit { rev } => {
@@ -6273,70 +6287,152 @@ mod tests {
 		assert_eq!(files.len(), 2);
 		assert_eq!(files[1].path, "z");
 
-		// Clean `c` is not listed; each repo node counts only its rows.
-		let got = ui::change_rows(&slots, &files, |_| false, |_, _| false, "");
-		assert!(matches!(
-			got[0],
-			ui::ChangeItemRow::Repo { slot: 0, count: 1 }
-		));
-		assert!(matches!(
-			got[1],
-			ui::ChangeItemRow::Header {
-				slot: 0,
-				group_id: "staged",
-				count: 1,
-				..
-			}
-		));
-		assert!(matches!(got[2], ui::ChangeItemRow::File { file_idx: 0 }));
-		assert!(matches!(
-			got[3],
-			ui::ChangeItemRow::Repo { slot: 1, count: 1 }
-		));
-		assert!(matches!(
-			got[4],
-			ui::ChangeItemRow::Header {
-				slot: 1,
-				group_id: "untracked",
-				..
-			}
-		));
-		assert_eq!(got.len(), 6);
-
-		// Typing filters the repo nodes by name, ignoring case.
-		let q = slots[1].name.to_uppercase();
-		let got = ui::change_rows(&slots, &files, |_| false, |_, _| false, &q);
-		assert!(!got.is_empty());
-		assert!(got.iter().all(|r| match r {
-			ui::ChangeItemRow::Repo { slot, .. }
-			| ui::ChangeItemRow::Header { slot, .. }
-			| ui::ChangeItemRow::Note { slot } => *slot == 1,
-			ui::ChangeItemRow::File { file_idx } => files[*file_idx].repo == 1,
-		}));
-
-		// A failed read keeps its node with an error row; a collapsed node
-		// hides its rows; a truncated list says so.
-		slots[2].state = ChangeRepoState::Failed("boom".into());
-		slots[1].total = MAX_CHANGES_PER_REPO + 1;
-		let got = ui::change_rows(&slots, &files, |s| s == 0, |_, _| false, "");
-		assert!(matches!(got[0], ui::ChangeItemRow::Repo { slot: 0, .. }));
-		assert!(matches!(got[1], ui::ChangeItemRow::Repo { slot: 1, .. }));
-		assert!(matches!(got[2], ui::ChangeItemRow::Note { slot: 1 }));
-		assert!(matches!(
-			got[5],
-			ui::ChangeItemRow::Repo { slot: 2, count: 0 }
-		));
-		assert!(matches!(got[6], ui::ChangeItemRow::Note { slot: 2 }));
-		assert_eq!(got.len(), 7);
-
 		slot_remove(&mut slots, &mut files, 0);
 		assert_eq!(files.len(), 1);
 		assert_eq!(files[0].repo, 0);
+	}
+
+	/// Three repos: `a` staged + unstaged, `b` staged + untracked, `c`
+	/// clean.
+	fn three_repos() -> (Vec<ChangeRepo>, Vec<FileChangeItem>) {
+		use std::path::Path;
+		let mut slots = Vec::new();
+		let mut files = Vec::new();
+		for name in ["a", "b", "c"] {
+			let root = Path::new("/w").join(name);
+			slot_insert(&mut slots, &mut files, &root, name);
+		}
+		slot_replace_rows(
+			&mut files,
+			0,
+			vec![
+				change("s.txt", SourceKind::Staged, 0),
+				change("u.txt", SourceKind::Unstaged, 0),
+			],
+		);
+		slot_replace_rows(
+			&mut files,
+			1,
+			vec![
+				change("s.txt", SourceKind::Staged, 1),
+				change("w.txt", SourceKind::Working, 1),
+			],
+		);
+		(slots, files)
+	}
+
+	/// Compact form of Changes rows: `G:<group>:<count>`,
+	/// `R:<group>:<repo>:<count>`, `N:<repo>`, `F:<repo>:<path>`.
+	fn shape(
+		slots: &[ChangeRepo],
+		files: &[FileChangeItem],
+		rows: &[ui::ChangeItemRow],
+	) -> Vec<String> {
+		rows.iter()
+			.map(|r| match r {
+				ui::ChangeItemRow::Header {
+					group_id, count, ..
+				} => format!("G:{group_id}:{count}"),
+				ui::ChangeItemRow::Repo {
+					slot,
+					group_id,
+					count,
+				} => format!("R:{group_id}:{}:{count}", slots[*slot].name),
+				ui::ChangeItemRow::Note { slot } => {
+					format!("N:{}", slots[*slot].name)
+				}
+				ui::ChangeItemRow::File { file_idx } => {
+					let f = &files[*file_idx];
+					format!("F:{}:{}", slots[f.repo as usize].name, f.path)
+				}
+			})
+			.collect()
+	}
+
+	#[test]
+	fn change_rows_put_groups_over_repos() {
+		let (mut slots, files) = three_repos();
+		// Groups first (staged, unstaged, untracked), each over its repos
+		// in name order; repo rows start collapsed; clean `c` is absent.
+		let rows = ui::change_rows(&slots, &files, |_| false, |_, _| true, "");
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:2",
+				"R:staged:a:1",
+				"R:staged:b:1",
+				"G:unstaged:1",
+				"R:unstaged:a:1",
+				"G:untracked:1",
+				"R:untracked:b:1",
+			]
+		);
+
+		// Opening `b` expands it in every group, and only `b`.
+		let mut open = Vec::new();
+		expand_repo_everywhere(&mut open, &slots[1].root);
+		let roots: Vec<PathBuf> =
+			slots.iter().map(|s| s.root.clone()).collect();
+		let collapsed = |slot: usize, g: &str| {
+			!open.iter().any(|(og, r)| *og == g && *r == roots[slot])
+		};
+		let rows = ui::change_rows(&slots, &files, |_| false, collapsed, "");
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:2",
+				"R:staged:a:1",
+				"R:staged:b:1",
+				"F:b:s.txt",
+				"G:unstaged:1",
+				"R:unstaged:a:1",
+				"G:untracked:1",
+				"R:untracked:b:1",
+				"F:b:w.txt",
+			]
+		);
+
+		// A collapsed group hides its repo rows; the others stay.
+		let rows =
+			ui::change_rows(&slots, &files, |g| g == "staged", |_, _| true, "");
+		assert_eq!(
+			shape(&slots, &files, &rows)[..2],
+			["G:staged:2", "G:unstaged:1"]
+		);
+
+		// Speed search keeps repos whose name matches, ignoring case; a
+		// group with no match is hidden, and a group keeps its full count.
+		let rows = ui::change_rows(&slots, &files, |_| false, |_, _| true, "B");
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			[
+				"G:staged:2",
+				"R:staged:b:1",
+				"G:untracked:1",
+				"R:untracked:b:1"
+			]
+		);
+
+		// A failed repo with no rows gets a top-level note; a truncated
+		// list says so under each of its expanded repo rows.
+		slots[2].state = ChangeRepoState::Failed("boom".into());
+		slots[1].total = MAX_CHANGES_PER_REPO + 1;
+		let rows = ui::change_rows(&slots, &files, |_| false, collapsed, "");
+		let got = shape(&slots, &files, &rows);
+		assert_eq!(got[0], "N:c");
+		assert_eq!(got[3..6], ["R:staged:b:1", "N:b", "F:b:s.txt"]);
+		assert_eq!(got.iter().filter(|r| *r == "N:b").count(), 2);
+	}
+
+	#[test]
+	fn change_rows_keep_a_single_repo_flat() {
+		let (mut slots, mut files) = three_repos();
+		slot_remove(&mut slots, &mut files, 2);
 		slot_remove(&mut slots, &mut files, 1);
-		// One repo: its groups are the top level, as before.
-		slots[0].total = 1;
-		let got = ui::change_rows(&slots, &files, |_| false, |_, _| false, "");
-		assert!(matches!(got[0], ui::ChangeItemRow::Header { slot: 0, .. }));
-		assert_eq!(got.len(), 2);
+		let rows = ui::change_rows(&slots, &files, |_| false, |_, _| true, "x");
+		assert_eq!(
+			shape(&slots, &files, &rows),
+			["G:staged:1", "F:a:s.txt", "G:unstaged:1", "F:a:u.txt"]
+		);
 	}
 }

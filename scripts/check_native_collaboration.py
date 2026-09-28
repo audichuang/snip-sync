@@ -1253,13 +1253,16 @@ def capture_checked(native: Any, session: Any, win: dict[str, Any], name: str, t
 
 
 def expand_open_repo_changes(native: Any, session: Any, win: dict[str, Any], row_id: str, timeout: float, trace: list[dict[str, Any]]) -> None:
-    """Changes repo nodes start collapsed; opening a repo from the selector expands it,
-    but the repo the app opened at startup stays collapsed until clicked."""
+    """Changes repo rows (one per group) start collapsed; opening a repo from the
+    selector expands it in every group, but the repo the app opened at startup stays
+    collapsed until clicked. `row_id` is `change-row:<group>:<path>`, so the row to
+    expand is that repo's row under the same group."""
     selecting = [line for line in session.texts() if "REPO_SELECTING:" in line]
     if not selecting:
         return
     name, _root = selecting_fields(selecting[-1])
-    node = f"change-repo:{name}"
+    group = row_id.split(":", 2)[1]
+    node = f"change-repo:{group}:{name}"
     deadline = time.monotonic() + min(2.0, timeout)
     while time.monotonic() < deadline:
         bounds = native.parse_bounds(session.texts())
@@ -1272,7 +1275,7 @@ def expand_open_repo_changes(native: Any, session: Any, win: dict[str, Any], row
         return
     before = len(session.lines)
     click_control(native, session, win, node, timeout)
-    wait_substr(session, f"[APP:REPO_CHANGES_COLLAPSED: {name} collapsed=false]", before, timeout)
+    wait_substr(session, f"[APP:REPO_CHANGES_COLLAPSED: {group} {name} collapsed=false]", before, timeout)
     trace.append({"action": "expand-repo-changes", "control": node})
 
 
