@@ -5,8 +5,10 @@
 ## Current Linux acceptance entrypoints (2026-09-27)
 
 `just preflight` now also requires `just native-acceptance`. The required Linux
-CI job `Native Acceptance (Linux)` runs the same Python entrypoint; the existing
-Rust/frontend/Tauri, native smoke/lifecycle and audit/DTO jobs remain in place.
+CI job `Native Acceptance (Linux)` runs the same Python entrypoint (since 0.3.2
+as one build, parallel shards and a merge); the Rust, native smoke/lifecycle and
+audit jobs remain in place. The frontend/Tauri and DTO jobs were removed with the
+Tauri app in 0.3.2.
 A wiring change is not a recorded CI or product pass: current run evidence must
 come from the generated reports.
 

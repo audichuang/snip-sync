@@ -1120,6 +1120,29 @@ mod tests {
 	}
 
 	#[test]
+	fn directory_scan_page_lists_directories_first_then_name_bytes() {
+		let dir = tempfile::tempdir().unwrap();
+		for f in ["b", "B", "a10", "a2"] {
+			fs::write(dir.path().join(f), "").unwrap();
+		}
+		for d in ["zdir", "Adir"] {
+			fs::create_dir(dir.path().join(d)).unwrap();
+		}
+		let page = DirectoryScan::open(dir.path())
+			.unwrap()
+			.next_page(&ScanBudget::visits(100))
+			.unwrap();
+		assert_eq!(page.status, ScanStatus::Complete);
+		let names: Vec<&str> = page
+			.entries
+			.iter()
+			.filter_map(ScanEntry::utf8_name)
+			.collect();
+		// Byte order, not case-folded or natural: "B" < "a10" < "a2" < "b".
+		assert_eq!(names, ["Adir", "zdir", "B", "a10", "a2", "b"]);
+	}
+
+	#[test]
 	fn directory_scan_does_bounded_work_per_call_and_resumes() {
 		let dir = tempfile::tempdir().unwrap();
 		for i in 0..3000 {

@@ -119,8 +119,7 @@ impl RestorePlan {
 /// What the user confirmed. Unchecked operations are indices into the
 /// plan's `create_operations` / `delete_operations`; they are not run and
 /// not counted.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreSelection {
 	pub overwrite_existing: bool,
 	pub skip_existing: bool,

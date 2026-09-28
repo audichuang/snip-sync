@@ -3,14 +3,11 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
-use serde::Serialize;
-
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitrun::{Overflow, RunOptions};
 use crate::gitsrc::{self, Git, GitError, GitSource, EMPTY_TREE};
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct CommitSummary {
 	pub sha: String,
 	pub parents: Vec<String>,
@@ -20,15 +17,13 @@ pub struct CommitSummary {
 	pub subject: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct GitReference {
 	pub name: String,
 	pub sha: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub struct RepositoryHistory {
 	pub root: String,
 	pub commits: Vec<CommitSummary>,
@@ -521,16 +516,14 @@ pub const MAX_TREE_ENTRIES: usize = 2000;
 /// Hard upper bound on stdout captured during commit directory listing (8 MiB).
 pub const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TreeKind {
 	Blob,
 	Tree,
 	Submodule,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeEntry {
 	/// Repo-relative path.
 	pub path: String,
@@ -728,8 +721,7 @@ pub fn commit_blob_with(
 	})
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub struct SourcePreview {
 	pub content: Option<String>,
 	pub patch: String,
@@ -1112,6 +1104,16 @@ mod tests {
 		assert!(hunks > 0, "no hunks");
 	}
 
+	/// The options the native app previews with (`history.rs`, `main.rs`):
+	/// it never reads `patch_truncated`, so a cut patch must be refused.
+	fn strict_preview() -> RunOptions {
+		RunOptions {
+			max_stdout: PREVIEW_LIMIT,
+			overflow: Overflow::Error,
+			..RunOptions::default()
+		}
+	}
+
 	#[test]
 	fn preview_patch_cut_keeps_whole_hunks_and_the_desktop_view_refuses() {
 		let dir = tempfile::tempdir().unwrap();
@@ -1149,10 +1151,16 @@ mod tests {
 		assert!(cut.patch.len() > PREVIEW_LIMIT / 2);
 		assert_hunks_consistent(&cut.patch);
 		assert_eq!(cut.content.as_deref(), Some(lines(8).as_str()));
+		// Content fits, the patch does not: the strict view refuses.
+		assert!(git_preview_with(&git, &source, "f.txt", &strict_preview())
+			.is_err());
 
 		fs::write(root.join("f.txt"), "x".repeat(PREVIEW_LIMIT + 1)).unwrap();
 		let sha = commit(root, "huge");
 		let huge = GitSource::Commit(sha);
+		assert!(
+			git_preview_with(&git, &huge, "f.txt", &strict_preview()).is_err()
+		);
 		assert!(git_preview_with(
 			&git,
 			&huge,
@@ -1184,6 +1192,14 @@ mod tests {
 		assert!(cut.patch_truncated);
 		assert!(cut.patch.len() <= PREVIEW_LIMIT);
 		assert_hunks_consistent(&cut.patch);
+		// The only check of a synthesized patch cut under Overflow::Error.
+		assert!(git_preview_with(
+			&git,
+			&GitSource::Working,
+			"new.txt",
+			&strict_preview()
+		)
+		.is_err());
 
 		fs::write(root.join("small.txt"), "x\ny").unwrap();
 		let small = git_preview_with(

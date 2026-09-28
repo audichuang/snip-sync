@@ -21,7 +21,7 @@
 
 ## 2. 架構
 
-> Tauri 版(`crates/desktop`)已從 repo 移除,需要回退時從 git 歷史取回;本節描述的是 v0.2.x Tauri 版的原始架構,現行桌面 App 見第 4 節。
+> Tauri 版(`crates/desktop`)已從 repo 移除,需要回退時從 git 歷史取回。本節的技術棧、Repo 結構與移植來源描述的是 v0.2.x Tauri 版的原始架構,現行桌面 App 見第 4 節;**「與 IDE 套件的相容性:共用 contract fixture」一小節仍是現行規範**(`.ts-ref` 抽取指令與 fixture SHA)。
 
 技術棧與 [aghub](https://github.com/audichuang/aghub) 相同:**Rust + Tauri 2**,
 前端 **React 19 + TypeScript + HeroUI v3 + Tailwind CSS v4**(Vite、bun)。
