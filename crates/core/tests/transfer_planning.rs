@@ -2659,3 +2659,41 @@ fn unsafe_symlink_replay_parent_is_not_followed_and_becomes_stale() {
 	);
 	assert_eq!(fs::read(&outside).unwrap(), before);
 }
+
+// ---------------------------------------------------------------------------
+// 26. A plain (non-Git) folder exports File items byte-identically to a repo
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_plain_folder_file_export_matches_a_repo() {
+	let repo = TestRepo::new("proj");
+	repo.write("notes/readme.txt", "PLAIN_BYTES\n");
+	let plain_dir = tempfile::tempdir().unwrap();
+	let plain = dunce::canonicalize(plain_dir.path()).unwrap().join("proj");
+	fs::create_dir_all(plain.join("notes")).unwrap();
+	fs::write(plain.join("notes/readme.txt"), "PLAIN_BYTES\n").unwrap();
+	assert!(
+		Git::open(&plain).is_err(),
+		"the plain folder must not be a repo"
+	);
+
+	let export = |root: &Path| {
+		let selection = ExportSelection::new(
+			vec![root.to_path_buf()],
+			Some(root.to_path_buf()),
+			vec![ExportItem {
+				root: CanonicalRootId::new(root).unwrap(),
+				relative_path: "notes/readme.txt".to_string(),
+				source: SourceKind::File,
+				change_type: None,
+			}],
+		)
+		.unwrap();
+		let plan = plan_export(&selection, &Settings::default(), None).unwrap();
+		plan.revalidate().unwrap();
+		plan.payload
+	};
+	let from_plain = export(&plain);
+	assert!(from_plain.contains("PLAIN_BYTES"), "{from_plain}");
+	assert_eq!(from_plain, export(repo.path()));
+}

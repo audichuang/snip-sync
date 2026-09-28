@@ -132,6 +132,7 @@ pub struct ContextMenu {
 #[derive(Clone, Debug)]
 pub enum MenuAct {
 	Tree(TreeCommand),
+	WsTree(TreeCommand),
 	RevToggle {
 		sha: String,
 		path: String,
@@ -286,18 +287,31 @@ impl WorkbenchModel {
 		]
 	}
 
+	/// `ws`: a row of the workspace tree (outside every repo).
 	pub(crate) fn work_row_menu(
 		&self,
 		row: &FlattenedTreeRow,
+		ws: bool,
 	) -> Vec<MenuEntry> {
 		let toggle = row
 			.is_valid_utf8
 			.then(|| command_for_row(row, RowGesture::Toggle))
 			.flatten()
-			.map(MenuAct::Tree);
+			.map(if ws { MenuAct::WsTree } else { MenuAct::Tree });
 		let mut v = vec![basket_entry(row.selected, toggle), MenuEntry::Sep];
-		v.extend(copy_entries(self.abs_path(&row.rel_path), &row.rel_path));
-		v.push(self.reveal_rel(&row.rel_path));
+		if ws {
+			let abs = self
+				.ws_root()
+				.map(|r| r.join(row.rel_path.trim_end_matches('/')));
+			v.extend(copy_entries(
+				abs.as_ref().map(|p| p.display().to_string()),
+				&row.rel_path,
+			));
+			v.push(reveal_entry(abs));
+		} else {
+			v.extend(copy_entries(self.abs_path(&row.rel_path), &row.rel_path));
+			v.push(self.reveal_rel(&row.rel_path));
+		}
 		v
 	}
 
@@ -686,6 +700,7 @@ impl WorkbenchModel {
 		};
 		match act {
 			MenuAct::Tree(cmd) => self.dispatch_tree(Some(cmd), cx),
+			MenuAct::WsTree(cmd) => self.dispatch_ws_tree(Some(cmd), cx),
 			MenuAct::RevToggle { sha, path } => {
 				self.toggle_rev_file_selection(&sha, &path, cx)
 			}

@@ -501,9 +501,40 @@ fn short(sha: &str) -> &str {
 
 /// One row of the Project tool window.
 enum ProjRow {
-	Repo(usize),
+	/// Repo index and its indent depth in the workspace tree.
+	Repo(usize, usize),
 	Work(FlattenedTreeRow),
+	/// A workspace-tree row outside every repo.
+	Ws(FlattenedTreeRow),
 	Rev(RevRow),
+}
+
+/// Repos shown where their folder sits in the workspace tree, keyed by that
+/// folder's path relative to `ws_root`. A repo inside another repo (or
+/// outside the workspace) is not reachable there and stays a top-level row.
+fn placed_repos(
+	repos: &[crate::RepoEntry],
+	ws_root: &std::path::Path,
+) -> HashMap<String, usize> {
+	let mut out = HashMap::new();
+	for (idx, repo) in repos.iter().enumerate() {
+		let Some(rel) = repo
+			.root
+			.strip_prefix(ws_root)
+			.ok()
+			.and_then(|rel| rel.to_str())
+			.filter(|rel| !rel.is_empty())
+		else {
+			continue;
+		};
+		let nested = repos.iter().any(|other| {
+			other.root != repo.root && repo.root.starts_with(&other.root)
+		});
+		if !nested {
+			out.insert(rel.replace('\\', "/"), idx);
+		}
+	}
+	out
 }
 
 impl WorkbenchModel {
@@ -514,7 +545,9 @@ impl WorkbenchModel {
 			}
 			WorkbenchTab::FileExplorer => {
 				let mut paths = Vec::new();
-				if let Some(ref tree) = self.file_tree {
+				for tree in
+					[&self.file_tree, &self.ws_tree].into_iter().flatten()
+				{
 					tree.collect_selected_paths(&mut paths);
 				}
 				paths.len()
@@ -633,19 +666,44 @@ impl WorkbenchModel {
 			return tree.rows().into_iter().map(ProjRow::Rev).collect();
 		}
 		let mut out = Vec::new();
+		// Until the workspace root is read every repo is a top-level row.
+		let ws = self.ws_tree.as_ref().filter(|t| t.is_loaded);
+		let placed = ws
+			.map(|t| placed_repos(&self.repos, &t.full_path))
+			.unwrap_or_default();
 		for idx in 0..self.repos.len() {
-			out.push(ProjRow::Repo(idx));
-			if self.selected_repo_idx == Some(idx) && !self.repo_collapsed {
-				if let Some(t) = &self.file_tree {
-					out.extend(
-						t.flatten_visible(t.visible_limit())
-							.into_iter()
-							.map(ProjRow::Work),
-					);
+			if !placed.values().any(|&p| p == idx) {
+				self.push_repo_rows(idx, 0, &mut out);
+			}
+		}
+		if let Some(t) = ws {
+			for mut row in t.flatten_visible(t.visible_limit()) {
+				// The workspace's children are top-level rows.
+				row.depth = row.depth.saturating_sub(1);
+				match placed.get(&row.rel_path).filter(|_| row.is_dir) {
+					Some(&idx) => self.push_repo_rows(idx, row.depth, &mut out),
+					None => out.push(ProjRow::Ws(row)),
 				}
 			}
 		}
 		out
+	}
+
+	/// A repo row and, when it is the open expanded repo, its tree.
+	fn push_repo_rows(&self, idx: usize, depth: usize, out: &mut Vec<ProjRow>) {
+		out.push(ProjRow::Repo(idx, depth));
+		if self.selected_repo_idx == Some(idx) && !self.repo_collapsed {
+			if let Some(t) = &self.file_tree {
+				out.extend(
+					t.flatten_visible(t.visible_limit()).into_iter().map(
+						|mut row| {
+							row.depth += depth;
+							ProjRow::Work(row)
+						},
+					),
+				);
+			}
+		}
 	}
 
 	fn change_item_rows(&self) -> Vec<ChangeItemRow> {
@@ -764,8 +822,8 @@ impl WorkbenchModel {
 			self.project_rows()
 				.into_iter()
 				.map(|r| match r {
-					ProjRow::Repo(i) => self.repos[i].name.clone(),
-					ProjRow::Work(w) => w.name,
+					ProjRow::Repo(i, _) => self.repos[i].name.clone(),
+					ProjRow::Work(w) | ProjRow::Ws(w) => w.name,
 					ProjRow::Rev(r) => r.name,
 				})
 				.collect()
@@ -960,7 +1018,7 @@ impl WorkbenchModel {
 		let expand = action == "expand";
 		let collapse = action == "collapse";
 		match &rows[self.tree_cursor] {
-			ProjRow::Repo(i) => {
+			ProjRow::Repo(i, _) => {
 				let i = *i;
 				if action == "open" || action == "toggle" {
 					self.toggle_repo_row(i, cx);
@@ -968,7 +1026,8 @@ impl WorkbenchModel {
 					self.set_repo_row_expanded(i, expand, cx);
 				}
 			}
-			ProjRow::Work(r) => {
+			ProjRow::Work(r) | ProjRow::Ws(r) => {
+				let ws = matches!(&rows[self.tree_cursor], ProjRow::Ws(_));
 				let gesture = match action {
 					"toggle" => Some(RowGesture::Toggle),
 					"expand" => Some(RowGesture::Expand),
@@ -978,7 +1037,11 @@ impl WorkbenchModel {
 				};
 				if let Some(gesture) = gesture {
 					let cmd = command_for_row(r, gesture);
-					self.dispatch_tree(cmd, cx);
+					if ws {
+						self.dispatch_ws_tree(cmd, cx);
+					} else {
+						self.dispatch_tree(cmd, cx);
+					}
 				}
 			}
 			ProjRow::Rev(r) if r.marker.is_none() => {
@@ -1404,6 +1467,64 @@ impl WorkbenchModel {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The workspace tree lists plain folders and files; repo folders are
+	/// placed as repo rows, a repo inside a repo stays top-level, and a
+	/// workspace spelled through a symlink still matches Git's toplevels.
+	#[cfg(unix)]
+	#[test]
+	fn workspace_tree_mixes_plain_entries_and_placed_repos() {
+		use crate::tree::{FileTreeNode, NodeKey};
+		use std::fs;
+		let dir = tempfile::tempdir().unwrap();
+		let real = dunce::canonicalize(dir.path()).unwrap().join("ws");
+		for d in ["app/.git", "app/sub/.git", "group/lib/.git", "notes"] {
+			fs::create_dir_all(real.join(d)).unwrap();
+		}
+		fs::write(real.join("notes/readme.txt"), "n\n").unwrap();
+		fs::write(real.join("group/plain.txt"), "p\n").unwrap();
+		fs::write(real.join("group/lib/x.rs"), "x\n").unwrap();
+		fs::write(real.join("top.txt"), "t\n").unwrap();
+		let link = dir.path().join("ws-link");
+		std::os::unix::fs::symlink(&real, &link).unwrap();
+
+		let repo = |rel: &str| crate::RepoEntry {
+			root: real.join(rel),
+			name: rel.rsplit('/').next().unwrap().to_string(),
+			kind: crate::RepoEntryKind::Main,
+			identity: None,
+			summary: Err("mock".into()),
+		};
+		let repos = vec![repo("app"), repo("app/sub"), repo("group/lib")];
+		// The user-given spelling does not match Git's resolved roots.
+		assert!(placed_repos(&repos, &link).is_empty());
+		let root = snip_core::transfer::CanonicalRootId::new(&link).unwrap();
+		let placed = placed_repos(&repos, root.path());
+		assert_eq!(placed.get("app"), Some(&0));
+		assert_eq!(placed.get("group/lib"), Some(&2));
+		assert!(!placed.values().any(|&i| i == 1), "nested repo stays top");
+
+		let mut tree = FileTreeNode::new_root(root.path());
+		tree.toggle_expand("group", root.path());
+		let rows = tree.flatten_visible(tree.visible_limit());
+		let names: Vec<_> = rows.iter().map(|r| r.rel_path.as_str()).collect();
+		for want in ["app", "group", "group/lib", "group/plain.txt", "notes"] {
+			assert!(names.contains(&want), "{want} missing: {names:?}");
+		}
+		assert!(names.contains(&"top.txt"), "{names:?}");
+		// Checking a plain folder never takes a repo's files with it.
+		let picked = tree
+			.selection_for_toggle(&NodeKey::from_utf8_rel("group"))
+			.unwrap();
+		assert!(
+			picked.contains(&"group/plain.txt".to_string()),
+			"{picked:?}"
+		);
+		assert!(
+			picked.iter().all(|p| !p.starts_with("group/lib")),
+			"{picked:?}"
+		);
+	}
 
 	#[test]
 	fn probe_bookkeeping_is_bounded_by_one_frame() {

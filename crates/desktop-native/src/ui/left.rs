@@ -528,7 +528,7 @@ impl WorkbenchModel {
 		let log = &self.probes;
 		let cursor = ix == self.tree_cursor;
 		match row {
-			ProjRow::Repo(idx) => {
+			ProjRow::Repo(idx, depth) => {
 				let repo = &self.repos[idx];
 				let expanded =
 					self.selected_repo_idx == Some(idx) && !self.repo_collapsed;
@@ -615,7 +615,8 @@ impl WorkbenchModel {
 					.items_center()
 					.w_full()
 					.h(px(ROW_H))
-					.px(px(6.))
+					.pl(px(6. + depth as f32 * 14.))
+					.pr(px(6.))
 					.gap(px(5.))
 					.cursor_pointer()
 					.rounded(px(4.))
@@ -674,19 +675,32 @@ impl WorkbenchModel {
 					.children(probe(log, id))
 					.into_any_element()
 			}
-			ProjRow::Work(row) => self.work_tree_row(ix, row, cursor, cx),
+			ProjRow::Work(row) => {
+				self.work_tree_row(ix, row, cursor, false, cx)
+			}
+			ProjRow::Ws(row) => self.work_tree_row(ix, row, cursor, true, cx),
 			ProjRow::Rev(row) => self.rev_tree_row(ix, row, cursor, cx),
 		}
 	}
 
+	/// `ws`: a workspace-tree row (outside every repo), probed as `ws-*`.
 	pub(super) fn work_tree_row(
 		&self,
 		ix: usize,
 		row: FlattenedTreeRow,
 		cursor: bool,
+		ws: bool,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let log = &self.probes;
+		let pre = if ws { "ws-" } else { "" };
+		let dispatch = move |this: &mut Self, cmd, cx: &mut Context<Self>| {
+			if ws {
+				this.dispatch_ws_tree(cmd, cx);
+			} else {
+				this.dispatch_tree(cmd, cx);
+			}
+		};
 		let indent = 8.0 + row.depth as f32 * 14.0;
 		if row.is_error
 			|| row.is_truncation_marker
@@ -695,15 +709,15 @@ impl WorkbenchModel {
 			|| row.is_loading
 		{
 			let marker_id = if row.is_view_limit {
-				format!("tree-view-more:{}", row.rel_path)
+				format!("{pre}tree-view-more:{}", row.rel_path)
 			} else if row.is_more_marker {
-				format!("tree-continue:{}", row.rel_path)
+				format!("{pre}tree-continue:{}", row.rel_path)
 			} else if row.is_error {
-				format!("tree-retry:{}", row.rel_path)
+				format!("{pre}tree-retry:{}", row.rel_path)
 			} else if row.is_loading {
-				format!("tree-loading:{}", row.rel_path)
+				format!("{pre}tree-loading:{}", row.rel_path)
 			} else {
-				format!("tree-marker:{}", row.rel_path)
+				format!("{pre}tree-marker:{}", row.rel_path)
 			};
 			let action_row = row.clone();
 			let is_actionable =
@@ -726,7 +740,8 @@ impl WorkbenchModel {
 					d.cursor_pointer().hover(|s| s.bg(rgb(pal().hover_bg)))
 				})
 				.on_click(cx.listener(move |this, _, _, cx| {
-					this.dispatch_tree(
+					dispatch(
+						this,
 						command_for_row(&action_row, RowGesture::Primary),
 						cx,
 					);
@@ -741,20 +756,21 @@ impl WorkbenchModel {
 		let menu_row = row.clone();
 		let is_dir = row.is_dir;
 		let row_id = if row.is_valid_utf8 {
-			format!("tree-row:{rel}")
+			format!("{pre}tree-row:{rel}")
 		} else {
-			format!("tree-invalid:{}", row.id_suffix)
+			format!("{pre}tree-invalid:{}", row.id_suffix)
 		};
 		let chk_id = if row.is_valid_utf8 {
-			format!("tree-chk:{rel}")
+			format!("{pre}tree-chk:{rel}")
 		} else {
-			format!("tree-chk-invalid:{}", row.id_suffix)
+			format!("{pre}tree-chk-invalid:{}", row.id_suffix)
 		};
 		let is_valid_utf8 = row.is_valid_utf8;
 
 		// Git status as filename colour, like IntelliJ's Project view.
 		let open_rows = self
 			.selected_change_slot()
+			.filter(|_| !ws)
 			.map_or(0..0, |slot| crate::slot_range(&self.files, slot));
 		let name_color = self.files[open_rows]
 			.iter()
@@ -787,14 +803,15 @@ impl WorkbenchModel {
 				MouseButton::Right,
 				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
 					this.tree_cursor = ix;
-					let items = this.work_row_menu(&menu_row);
+					let items = this.work_row_menu(&menu_row, ws);
 					this.open_left_menu(items, ev, w, cx);
 				}),
 			)
 			.when(is_valid_utf8, |d| {
 				d.on_click(cx.listener(move |this, _, _, cx| {
 					this.tree_cursor = ix;
-					this.dispatch_tree(
+					dispatch(
+						this,
 						command_for_row(&click_row, RowGesture::Primary),
 						cx,
 					);
@@ -827,7 +844,8 @@ impl WorkbenchModel {
 							move |this, _, _, cx| {
 								cx.stop_propagation();
 								this.tree_cursor = ix;
-								this.dispatch_tree(
+								dispatch(
+									this,
 									command_for_row(
 										&check_row,
 										RowGesture::Toggle,

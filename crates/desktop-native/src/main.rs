@@ -592,6 +592,8 @@ struct PreparedSelection {
 	status: Option<Msg>,
 	files: Vec<FileChangeItem>,
 	paths: Vec<String>,
+	/// The workspace tree's checked paths (its File group).
+	ws_paths: Vec<String>,
 	basket: Vec<(CanonicalRootId, Vec<ExportItem>)>,
 }
 
@@ -608,6 +610,7 @@ impl PreparedSelection {
 			status: None,
 			files: files.to_vec(),
 			paths: paths.to_vec(),
+			ws_paths: Vec::new(),
 			basket: basket.to_vec(),
 		}
 	}
@@ -615,8 +618,18 @@ impl PreparedSelection {
 	fn retained_bytes(&self) -> usize {
 		files_bytes(&self.files)
 			.saturating_add(crate::tree::selection_bytes(&self.paths))
+			.saturating_add(crate::tree::selection_bytes(&self.ws_paths))
 			.saturating_add(basket_bytes(&self.basket))
 			.saturating_add(self.status.as_ref().map_or(0, message_bytes))
+	}
+
+	/// [`Self::sync_root`] for the workspace tree's File group. Swapping keeps
+	/// `retained_bytes` exact, since it counts both path lists.
+	fn sync_ws_root(&mut self, root: CanonicalRootId) -> bool {
+		std::mem::swap(&mut self.paths, &mut self.ws_paths);
+		let ok = self.sync_root(root, true, None);
+		std::mem::swap(&mut self.paths, &mut self.ws_paths);
+		ok
 	}
 
 	/// Preserve every other root and historical source while replacing
@@ -942,6 +955,9 @@ pub struct WorkbenchModel {
 	/// its empty checkboxes say nothing about the basket's Git group.
 	pub changes_loaded: bool,
 	pub file_tree: Option<FileTreeNode>,
+	/// The workspace folder itself when it is not a repository: every file
+	/// and folder outside the discovered repos, rooted at its canonical path.
+	pub ws_tree: Option<FileTreeNode>,
 	pub rev_tree: Option<RevTree>,
 	pub active_tab: WorkbenchTab,
 	pub selected_file: Option<String>,
@@ -1333,6 +1349,7 @@ impl WorkbenchModel {
 			files: Vec::new(),
 			changes_loaded: false,
 			file_tree: None,
+			ws_tree: None,
 			rev_tree: None,
 			active_tab: WorkbenchTab::GitChanges,
 			selected_file: None,
@@ -1819,6 +1836,7 @@ impl WorkbenchModel {
 			}
 		}
 		candidate.paths = Vec::new();
+		candidate.ws_paths = Vec::new();
 		candidate.replace_file_group = true;
 		candidate.replace_git_group = true;
 		candidate.remove_only = true;
@@ -1839,6 +1857,9 @@ impl WorkbenchModel {
 		}
 		if let Some(tree) = &self.file_tree {
 			candidate.paths = tree.selection_for_all(true);
+		}
+		if let Some(tree) = &self.ws_tree {
+			candidate.ws_paths = tree.selection_for_all(true);
 		}
 		candidate.replace_file_group = true;
 		candidate.replace_git_group = true;
@@ -2278,6 +2299,7 @@ impl WorkbenchModel {
 				if let Some(tree) = self.file_tree.as_mut() {
 					tree.clear_loading();
 				}
+				self.resume_ws_tree(cx);
 				// The drain cancelled and outdated the open repo's reads, and
 				// the workspace stays open: fetch what never landed.
 				if let (Some(idx), Some(_)) =
@@ -2332,6 +2354,7 @@ impl WorkbenchModel {
 		release_vec(&mut self.repos);
 		self.selected_repo_idx = None;
 		self.release_repo_state();
+		self.ws_tree = None;
 		release_vec(&mut self.basket);
 		release_vec(&mut self.files);
 		release_vec(&mut self.change_repos);
@@ -2615,6 +2638,9 @@ impl WorkbenchModel {
 		// The first load selects a repo itself; a Refresh must also re-read
 		// the open one, whose summary alone would otherwise update.
 		self.refresh_reload = self.file_tree.is_some();
+		// Rebuilt when the walk ends, so a Refresh re-reads plain folders;
+		// its checks come back from the basket.
+		self.ws_tree = None;
 		let ws = self.workspace_root.clone();
 		self.launch_fresh_discovery(ws, true, cx);
 	}
@@ -2912,6 +2938,7 @@ impl WorkbenchModel {
 			self.discovery_depth_overflow = 0;
 		}
 		self.place_selection(cx);
+		self.ensure_ws_tree(cx);
 		// Only a complete walk proves the kept repo is gone; a capped or
 		// partial one may simply not have reached it yet.
 		let vanished =
@@ -2925,6 +2952,8 @@ impl WorkbenchModel {
 			[self.repos.len().to_string(), errors.to_string()],
 		);
 		if let Some(name) = vanished {
+			// Releasing the repo also dropped the tree worker.
+			self.resume_ws_tree(cx);
 			app_log!("[APP:REPO_VANISHED: {name}]");
 			self.set_status("status_repo_vanished", [name]);
 			self.refresh_reload = false;
@@ -3207,6 +3236,14 @@ impl WorkbenchModel {
 	}
 
 	fn apply_tree_result(&mut self, result: crate::tree::TreeIoResult) {
+		if self
+			.ws_tree
+			.as_ref()
+			.is_some_and(|tree| tree.full_path == result.base)
+		{
+			self.apply_ws_tree_result(result);
+			return;
+		}
 		let previous_selection = self
 			.file_tree
 			.as_ref()
@@ -3243,6 +3280,131 @@ impl WorkbenchModel {
 			applied.has_more,
 			applied.selected_count
 		);
+	}
+
+	fn apply_ws_tree_result(&mut self, result: crate::tree::TreeIoResult) {
+		let Some(tree) = self.ws_tree.as_mut() else {
+			return;
+		};
+		let previous = tree.selected_paths().to_vec();
+		let Some(applied) = tree.apply_io_result(result) else {
+			return;
+		};
+		if !self.remember_tree_selection() {
+			if let Some(tree) = &mut self.ws_tree {
+				tree.install_selection(previous);
+			}
+			return;
+		}
+		app_log!(
+			"[APP:WS_TREE_PAGE: rel={} kind={:?} children={} has_more={} selected={}]",
+			applied.rel,
+			applied.kind,
+			applied.child_count,
+			applied.has_more,
+			applied.selected_count
+		);
+	}
+
+	/// The workspace tree's root, when the workspace is not a repository.
+	pub fn ws_root(&self) -> Option<PathBuf> {
+		self.ws_tree.as_ref().map(|tree| tree.full_path.clone())
+	}
+
+	/// Builds the workspace tree once repos are known. None when the
+	/// workspace is itself inside a repository: that repo's tree shows it.
+	fn ensure_ws_tree(&mut self, cx: &mut Context<Self>) {
+		if self.ws_tree.is_some() || !self.accepting_work() {
+			return;
+		}
+		// Git reports resolved toplevels; root the tree the same way so a
+		// repo dir matches its entry (macOS /var -> /private/var).
+		let Ok(root) = CanonicalRootId::new(&self.workspace_root) else {
+			return;
+		};
+		let root = root.path().to_path_buf();
+		if self.repos.iter().any(|repo| root.starts_with(&repo.root)) {
+			return;
+		}
+		let saved = self.file_paths_in_basket(&root);
+		let mut tree = FileTreeNode::unloaded_root(&root);
+		tree.apply_selection(&saved);
+		self.ws_tree = Some(tree);
+		self.resume_ws_tree(cx);
+	}
+
+	/// A dropped tree queue or worker also dropped the workspace tree's
+	/// reads: unmark them and re-read its root if it never landed.
+	fn resume_ws_tree(&mut self, cx: &mut Context<Self>) {
+		let Some(tree) = self.ws_tree.as_mut() else {
+			return;
+		};
+		tree.clear_loading();
+		if tree.is_loaded {
+			return;
+		}
+		if let TreeEffect::Io(io) =
+			tree.start(TreeCommand::Expand(NodeKey::root()))
+		{
+			self.submit_tree_io(io, cx);
+		}
+	}
+
+	/// Project-tree commands on the workspace tree (non-repo files).
+	pub fn dispatch_ws_tree(
+		&mut self,
+		cmd: Option<TreeCommand>,
+		cx: &mut Context<Self>,
+	) {
+		let Some(cmd) = cmd else {
+			return;
+		};
+		if !self.accepting_work() {
+			return;
+		}
+		let Some(root) = self.ws_root() else {
+			return;
+		};
+		if let TreeCommand::ToggleSelect(key) = &cmd {
+			let Some(paths) = self
+				.ws_tree
+				.as_ref()
+				.and_then(|tree| tree.selection_for_toggle(key))
+			else {
+				return;
+			};
+			let mut candidate = self.selection_candidate();
+			candidate.remove_only = paths
+				.iter()
+				.all(|path| candidate.ws_paths.binary_search(path).is_ok());
+			candidate.ws_paths = paths;
+			candidate.replace_file_group = true;
+			if candidate.remove_only {
+				candidate.status =
+					Some(Msg::new("status_selection_removed", []));
+			}
+			if self.install_selection_candidate(candidate) {
+				if let Some(rel) = key.utf8_rel() {
+					app_log!("[APP:WS_TREE_TOGGLED: {}]", rel);
+				}
+				self.log_basket();
+			}
+			cx.notify();
+			return;
+		}
+		let effect = self.ws_tree.as_mut().map(|tree| tree.start(cmd));
+		match effect {
+			Some(TreeEffect::Io(io)) => self.submit_tree_io(io, cx),
+			Some(TreeEffect::OpenFile(rel)) => {
+				app_log!("[APP:WS_FILE_SELECTED: {}]", rel);
+				self.select_file_in(Some(root), &rel, SourceKind::File, cx);
+			}
+			Some(TreeEffect::Idle) => {
+				self.remember_tree_selection();
+				cx.notify();
+			}
+			None => {}
+		}
 	}
 
 	fn next_tree_io(&mut self) -> Option<TreeIo> {
@@ -3417,6 +3579,7 @@ impl WorkbenchModel {
 		if let Some(io) = root_io {
 			self.submit_tree_io(io, cx);
 		}
+		self.resume_ws_tree(cx);
 
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
@@ -3742,6 +3905,10 @@ impl WorkbenchModel {
 			.saturating_add(std::mem::size_of_val(&self.file_tree))
 			.saturating_add(self.file_tree.as_ref().map_or(0, |tree| {
 				tree.retained_bytes() - std::mem::size_of::<FileTreeNode>()
+			}))
+			.saturating_add(std::mem::size_of_val(&self.ws_tree))
+			.saturating_add(self.ws_tree.as_ref().map_or(0, |tree| {
+				tree.retained_bytes() - std::mem::size_of::<FileTreeNode>()
 			}));
 		bytes = bytes
 			.saturating_add(std::mem::size_of_val(&self.rev_tree))
@@ -3846,13 +4013,17 @@ impl WorkbenchModel {
 	}
 
 	fn selection_candidate(&self) -> PreparedSelection {
-		PreparedSelection::new(
+		let mut candidate = PreparedSelection::new(
 			&self.files,
 			self.file_tree
 				.as_ref()
 				.map_or(&[], FileTreeNode::selected_paths),
 			&self.basket,
-		)
+		);
+		if let Some(ws) = &self.ws_tree {
+			candidate.ws_paths = ws.selected_paths().to_vec();
+		}
+		candidate
 	}
 
 	fn selection_bytes(&self) -> usize {
@@ -3860,6 +4031,11 @@ impl WorkbenchModel {
 			.saturating_add(basket_bytes(&self.basket))
 			.saturating_add(
 				self.file_tree
+					.as_ref()
+					.map_or(0, FileTreeNode::selection_bytes),
+			)
+			.saturating_add(
+				self.ws_tree
 					.as_ref()
 					.map_or(0, FileTreeNode::selection_bytes),
 			)
@@ -3926,6 +4102,40 @@ impl WorkbenchModel {
 				}
 			}
 		}
+		// The workspace tree's File group: files outside every repo.
+		let ws = self
+			.ws_tree
+			.as_ref()
+			.filter(|_| candidate.replace_file_group)
+			.map(|tree| tree.full_path.clone());
+		if let Some(ws) = ws {
+			let admitted = self
+				.basket
+				.iter()
+				.find(|(root, _)| root.path() == ws)
+				.map(|(root, _)| root.clone());
+			let adds = !candidate.ws_paths.is_empty();
+			let root = match admitted {
+				Some(root) => Some(root),
+				None if candidate.remove_only || !adds => None,
+				None => match CanonicalRootId::new(&ws) {
+					Ok(root) => Some(root),
+					Err(_) => {
+						self.set_status("error_selection_root", []);
+						return false;
+					}
+				},
+			};
+			if let Some(root) = root {
+				if !candidate.sync_ws_root(root) {
+					self.set_status("error_tree_budget", []);
+					app_log!(
+						"[APP:TREE_ADMISSION_REFUSED: selection_amplification]"
+					);
+					return false;
+				}
+			}
+		}
 		if !candidate.fits_replacing(
 			self.tree_retained_bytes(),
 			self.selection_bytes().saturating_add(
@@ -3949,6 +4159,9 @@ impl WorkbenchModel {
 		self.refresh_basket_view();
 		if let Some(tree) = &mut self.file_tree {
 			tree.install_selection(candidate.paths);
+		}
+		if let Some(tree) = &mut self.ws_tree {
+			tree.install_selection(candidate.ws_paths);
 		}
 		// Callers emit their established action/basket event order only after
 		// this complete intent has been admitted and installed.
@@ -4183,6 +4396,9 @@ impl WorkbenchModel {
 			file.selected = false;
 		}
 		if let Some(tree) = &mut self.file_tree {
+			tree.install_selection(Vec::new());
+		}
+		if let Some(tree) = &mut self.ws_tree {
 			tree.install_selection(Vec::new());
 		}
 		self.log_basket();

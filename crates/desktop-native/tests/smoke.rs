@@ -5808,3 +5808,113 @@ fn native_merged_graph_over_four_repositories() {
 
 	quit_cleanly(&mut app, &wid);
 }
+
+/// The Project view shows the whole workspace like IntelliJ: a plain
+/// folder beside a repo is listed, its file previews, checks into the
+/// basket and copies as a file-mode payload. The repo keeps its row.
+#[test]
+fn native_project_view_lists_and_copies_non_git_files() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let app_repo = ws.join("app");
+	fs::create_dir_all(&app_repo).unwrap();
+	git_ok(&app_repo, &["init", "-q", "-b", "main"]);
+	git_ok(&app_repo, &["config", "user.name", "Tester"]);
+	git_ok(&app_repo, &["config", "user.email", "test@example.com"]);
+	fs::write(app_repo.join("main.rs"), "fn main() {}\n").unwrap();
+	git_ok(&app_repo, &["add", "."]);
+	git_ok(&app_repo, &["commit", "-qm", "base"]);
+	fs::create_dir_all(ws.join("notes")).unwrap();
+	fs::write(ws.join("notes/readme.txt"), "PLAIN_NOTE_BYTES\n").unwrap();
+	fs::write(ws.join("top.txt"), "TOP_BYTES\n").unwrap();
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> String {
+		lines_until(rx, pattern, timeout)
+			.unwrap_or_else(|e| panic!("{e}"))
+			.pop()
+			.unwrap()
+	};
+	wait_for("[APP:READY_REPOS: 1]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + Duration::from_secs(6);
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		assert!(st.success(), "click {id}");
+	};
+
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	// The repo keeps its row (and probe id) inside the workspace listing.
+	control("repo-row:app");
+	control("ws-tree-row:top.txt");
+	click("ws-tree-row:notes");
+	wait_for("[APP:WS_TREE_PAGE: rel=notes", Duration::from_secs(4));
+	click("ws-tree-row:notes/readme.txt");
+	wait_for(
+		"[APP:PREVIEW_LOADED: notes/readme.txt]",
+		Duration::from_secs(4),
+	);
+	click("ws-tree-chk:notes/readme.txt");
+	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
+	let copied = clip::read_text().unwrap();
+	assert!(copied.contains("PLAIN_NOTE_BYTES"), "{copied}");
+	assert!(copied.contains("notes/readme.txt"), "{copied}");
+	assert!(!copied.contains("TOP_BYTES"), "{copied}");
+	quit_cleanly(&mut app, &wid);
+}
