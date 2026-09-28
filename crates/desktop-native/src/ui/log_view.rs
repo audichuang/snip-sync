@@ -134,6 +134,7 @@ impl WorkbenchModel {
 			}
 			(since, until) => Some(format!("{} – {}", day(since), day(until))),
 		};
+		// The repo chip shows the repository scope, then the paths.
 		let repo_value = match self.log_repo_filter.as_slice() {
 			[] => None,
 			_ => {
@@ -150,6 +151,10 @@ impl WorkbenchModel {
 				n => format!("{p} +{}", n - 1),
 			}
 		});
+		let scope_value = match (repo_value, paths_value) {
+			(Some(r), Some(p)) => Some(format!("{r} · {p}")),
+			(r, p) => r.or(p),
+		};
 		let filter_bar = div()
 			.flex()
 			.flex_row()
@@ -216,14 +221,6 @@ impl WorkbenchModel {
 					.flex_1()
 					.min_w_0()
 					.overflow_hidden()
-					.when(self.repos.len() > 1, |d| {
-						d.child(self.log_chip(
-							LogMenu::Repo,
-							t("log_chip_repo", loc),
-							repo_value,
-							cx,
-						))
-					})
 					.child(self.log_chip(
 						LogMenu::Branch,
 						t("log_chip_branch", loc),
@@ -242,10 +239,19 @@ impl WorkbenchModel {
 						date_value,
 						cx,
 					))
+					// Repositories and paths share one chip; a one-repo
+					// workspace only has paths.
 					.child(self.log_chip(
-						LogMenu::Paths,
-						t("log_chip_paths", loc),
-						paths_value,
+						LogMenu::Repo,
+						t(
+							if self.repos.len() > 1 {
+								"log_chip_repo"
+							} else {
+								"log_chip_paths"
+							},
+							loc,
+						),
+						scope_value,
 						cx,
 					)),
 			)

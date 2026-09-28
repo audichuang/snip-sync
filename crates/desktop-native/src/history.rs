@@ -1892,7 +1892,7 @@ impl WorkbenchModel {
 		}
 	}
 
-	/// Paths chip ✕: every path.
+	/// Repo chip ✕ outside a repository scope: every path.
 	pub fn clear_log_paths(&mut self, cx: &mut Context<Self>) {
 		self.log_menu = None;
 		self.log_filter.paths.clear();
@@ -1936,7 +1936,7 @@ impl WorkbenchModel {
 			}
 		}
 		self.log_menu = (self.log_menu != Some(menu)).then_some(menu);
-		if self.log_menu == Some(crate::ui::LogMenu::Paths) {
+		if self.log_menu == Some(crate::ui::LogMenu::Repo) {
 			self.pending_focus =
 				Some(self.log_path_input.read(cx).handle().clone());
 			self.load_picker_dir("", cx);

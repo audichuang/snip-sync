@@ -4561,9 +4561,10 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	absent("log-branch-group:refs_local");
 	key(&wid, "Escape");
 	absent("log-branch-input");
-	// 5d. Paths chip: typing filters the loaded tree.
-	click("log-filter-paths");
-	wait("[APP:LOG_MENU: Some(Paths)]");
+	// 5d. Repo chip (paths only in a one-repo workspace): typing filters
+	// the loaded tree.
+	click("log-filter-repo");
+	wait("[APP:LOG_MENU: Some(Repo)]");
 	control("log-path-pick:alpha.txt");
 	type_text("nest");
 	control("log-path-pick:subfolder/nested.txt");
