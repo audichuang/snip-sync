@@ -409,9 +409,16 @@ pub(super) fn list_cols(
 	let mut lack =
 		(MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
 	// The gutter floor took back part of the label reserve; date and author
-	// give that room up so the labels still fit.
+	// give that room up so the labels still fit. When they cannot cover all
+	// of it the labels are dropped anyway, so they keep their width for the
+	// subject-only lack. The deficit already contains what the subject
+	// reserve needs, so it replaces the lack rather than adding to it.
 	if has_labels {
-		lack += (gutter - room).max(0.);
+		let deficit = (gutter - room).max(0.);
+		let give = (DATE_W - MIN_DATE_W) + (AUTHOR_W - MIN_AUTHOR_W);
+		if deficit <= give {
+			lack = lack.max(deficit);
+		}
 	}
 	let date = DATE_W - lack.min(DATE_W - MIN_DATE_W);
 	lack -= DATE_W - date;
@@ -1737,6 +1744,9 @@ mod row_width_tests {
 		assert_eq!(c.gutter, MIN_GUTTER_W);
 		assert!(c.date < DATE_W && c.date >= MIN_DATE_W);
 		assert!(c.author >= MIN_AUTHOR_W);
+		// The labels are dropped here anyway (the deficit is more than the
+		// date and author can give), so the author is not squeezed for them.
+		assert_eq!(c.author, 81.);
 		let w = row_widths(433., c, 337., false);
 		assert_eq!(w.labels, 0.);
 		assert!(w.subject >= MIN_SUBJECT_W, "{w:?}");
