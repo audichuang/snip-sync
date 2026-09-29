@@ -213,8 +213,27 @@ def shard_steps(manifest: dict, shard: tuple[int, int]) -> list[str]:
     return [str(step["id"]) for step in manifest["steps"]][k - 1::n]
 
 
+def shared_cpu_env() -> dict[str, str]:
+    """For apps that overlap. lavapipe renders on the CPU and starts one worker per core per app,
+    so a dozen apps at once starve each other into startup and clipboard timeouts."""
+    return {"LP_NUM_THREADS": os.environ.get("LP_NUM_THREADS", "2"),
+            "SNIP_E2E_TIMEOUT_SCALE": os.environ.get("SNIP_E2E_TIMEOUT_SCALE", "2")}
+
+
+def driver_shards(tests: list[str], count: int) -> list[list[str]]:
+    """Round-robin split; a shard with no test is dropped."""
+    return [group for group in (tests[i::count] for i in range(count)) if group]
+
+
+def list_driver_tests(gate: str) -> list[str]:
+    out = subprocess.run(["cargo", "test", "-p", "snip-native-e2e", "--test", gate, "--locked", "--", "--list"],
+                         cwd=ROOT, env=environment(), check=True, capture_output=True, text=True).stdout
+    return [line[:-len(": test")] for line in out.splitlines() if line.endswith(": test")]
+
+
 def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[dict],
-             shard: tuple[int, int] | None = None) -> None:
+             shard: tuple[int, int] | None = None, collaboration_jobs: int = 1,
+             shards: int = 1) -> None:
     python = [sys.executable, "-B"]
     binary, sha = data["binary"], data["sha256"]
     if gate == "ime":
@@ -235,8 +254,11 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
         run(python + ["scripts/check_native_collaboration.py", "--binary", binary,
                       "--binary-sha", sha, "--fixture", str(fixture),
                       "--dataset-hash", manifest["datasetHash"], "--helper-receipt", str(helpers),
-                      *select, "--timeout", "60", "--output", str(output / gate)],
-            output, gate, commands, ok=(0, 1) if steps else (0,))
+                      *select, "--timeout", "60" if collaboration_jobs == 1 else "120",
+                      "--jobs", str(collaboration_jobs),
+                      "--output", str(output / gate)],
+            output, gate, commands, ok=(0, 1) if steps else (0,),
+            extra_env=shared_cpu_env() if collaboration_jobs > 1 else None)
         if steps:
             report = json.loads((output / gate / "report.json").read_text())
             problems = collaboration.functional_problems(report, required_ids=steps)
@@ -246,9 +268,28 @@ def run_gate(gate: str, output: Path, receipt: Path, data: dict, commands: list[
         out = output / gate
         out.mkdir()
         # Debug build of the drivers only; the app is the frozen release binary.
-        run(["scripts/headless-x11.sh", "cargo", "test", "-p", "snip-native-e2e", "--test", gate,
-             "--locked", "--", "--nocapture"], output, gate, commands,
-            extra_env={"SNIP_NATIVE_BIN": binary, "SNIP_E2E_OUT": str(out)})
+        # The tests take one display each, so a shard is its own process on its own Xvfb.
+        tests = list_driver_tests(gate)
+        groups = driver_shards(tests, shards)
+        if not tests:
+            raise RuntimeError(f"{gate}: no tests listed")
+
+        def run_group(index: int, group: list[str]) -> list[dict]:
+            records: list[dict] = []
+            name = gate if len(groups) == 1 else f"{gate}-{index + 1}"
+            filters = [] if len(groups) == 1 else ["--exact", *group]
+            config = output / f"{name}-config"
+            config.mkdir()
+            run(["scripts/headless-x11.sh", "cargo", "test", "-p", "snip-native-e2e", "--test", gate,
+                 "--locked", "--", "--nocapture", *filters], output, name, records,
+                extra_env={"SNIP_NATIVE_BIN": binary, "SNIP_E2E_OUT": str(out),
+                           "SNIP_CONFIG_DIR": str(config),
+                           **(shared_cpu_env() if len(groups) > 1 else {})})
+            return records
+
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            for records in [f.result() for f in [pool.submit(run_group, i, g) for i, g in enumerate(groups)]]:
+                commands += records
         if gate == "smoke":
             for name in SMOKE_SCREENSHOTS:
                 shot = out / name
@@ -320,6 +361,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--build-receipt", type=Path, help="Reuse this entrypoint's frozen build, verifying all inputs")
     parser.add_argument("--collaboration-shard", type=parse_shard, metavar="K/N",
                         help="Run only every N-th collaboration step starting at K")
+    parser.add_argument("--collaboration-jobs", type=int, default=1,
+                        help="Collaboration steps run at once inside the gate")
+    parser.add_argument("--driver-shards", type=int, default=1,
+                        help="Processes (one Xvfb each) the smoke and lifecycle tests are split across")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Gates run at once (each owns its display); 1 keeps them serial")
     parser.add_argument("--merge", type=Path, nargs="+", metavar="SHARD_DIR",
@@ -355,7 +400,8 @@ def main(argv: list[str] | None = None) -> int:
             records: list[dict] = []
             data = verify_build(receipt)
             try:
-                run_gate(gate, output, receipt, data, records, args.collaboration_shard)
+                run_gate(gate, output, receipt, data, records, args.collaboration_shard,
+                         args.collaboration_jobs, args.driver_shards)
             finally:
                 verify_build(receipt)
             return records

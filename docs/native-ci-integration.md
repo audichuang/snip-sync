@@ -24,12 +24,35 @@ See [the packaging doc](native-cross-platform-ci-and-packaging.md) section 2.
 
 | Entry | Checks |
 | --- | --- |
-| `just native-acceptance` | Build one release binary, then all three gates below |
+| `just native-acceptance` | Build one release binary, then every gate below at once (see the speed knobs after this table) |
 | `just native-ime` | Deterministic startup ordering plus all nine IME phases |
 | `just native-collaboration` | Canonical fixture and all 18 real-app cases; no step filter |
 | `just native-resources-short` | Medium 15-repo functional subgate; existing 20 warmup/100 measured switches and thresholds |
 | `just native-resources-long` | Standard workload and unchanged long resource gate; currently fails for missing real hide/tray coverage |
 | `just native-acceptance-build` | Build/freeze only; no GUI acceptance claim |
+
+Speed knobs of `run_native_acceptance.py`, all defaulting to 1 (serial, what CI's small runners
+use). `just native-acceptance` sets `--jobs 5 --collaboration-jobs 3 --driver-shards 2`:
+
+- `--jobs N`: gates that run at once.
+- `--collaboration-jobs N`: collaboration steps at once. Every step owns its fixture copy, Xvfb and
+  apps, so they overlap safely.
+- `--driver-shards N`: processes the `smoke` and `lifecycle` tests are split across, each on its own
+  Xvfb with its own `SNIP_CONFIG_DIR`. The tests hold a global GUI lock inside one process, so this
+  is the only way to overlap them.
+
+Measured on a 20-thread box, `just preflight` went from about 13 min (629 s of it acceptance, 589 s
+of that the 18 collaboration steps run serially) to about 4.7 min, green in 4 runs in a row. The floor
+is the resource-short gate, whose 143 s observation window is a gate floor and must not shrink.
+
+Overlapping apps share the CPU, and lavapipe renders on it with one worker per core per app, so the
+parallel modes also set `LP_NUM_THREADS=2`, a 120 s (not 60 s) per-operation collaboration timeout and
+`SNIP_E2E_TIMEOUT_SCALE=2` for sharded drivers, and stagger the first collaboration steps by 6 s. Four
+collaboration steps at once still failed roughly one run in three (a click or key lost right after
+startup, then a 120 s wait), and six failed almost every run, so run the gate several times before
+raising the numbers. Sharded drivers get a private display from `scripts/headless-x11.sh`, which now
+uses Xvfb's `-displayfd` instead of `xvfb-run -a`: two `xvfb-run -a` started together can pick the same
+display number and share one server.
 
 All entries accept `--output FRESH_DIRECTORY_OUTSIDE_CHECKOUT` and `--build-receipt RECEIPT`.
 Without a receipt, the runner invokes a locked release Cargo build and freezes
