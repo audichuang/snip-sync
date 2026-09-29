@@ -617,10 +617,32 @@ fn admit_entry(
 		file.not_copied = Some(NotCopiedReason::UnsupportedType);
 		return push_file(commits, current_wire_len, file, limit, opts);
 	}
+	let cat = open_cat(git, opts, cat)?;
 	if change == FileChange::Deleted {
+		// A deletion carries no content, so the pre-deletion blob is only
+		// classified: retain nothing, scan it. Text of any size (or a blob
+		// that cannot be read) stays a plain deletion and never counts
+		// against the payload limit; NUL or invalid UTF-8 becomes
+		// not-copied so paste leaves the target file alone (spec 4.2).
+		refuse_if_cancelled(opts, "cat-file")?;
+		file.not_copied = match cat.read_blob_capped(&entry.old_oid, 0)? {
+			CappedBlob::Retained(body) if body.contains(&0) => {
+				Some(NotCopiedReason::Binary)
+			}
+			CappedBlob::Retained(body) => std::str::from_utf8(&body)
+				.is_err()
+				.then_some(NotCopiedReason::NonUtf8),
+			CappedBlob::Skipped(SkippedBlob::Binary) => {
+				Some(NotCopiedReason::Binary)
+			}
+			CappedBlob::Skipped(SkippedBlob::NotUtf8) => {
+				Some(NotCopiedReason::NonUtf8)
+			}
+			CappedBlob::Missing
+			| CappedBlob::Skipped(SkippedBlob::TextLargerThanCap { .. }) => None,
+		};
 		return push_file(commits, current_wire_len, file, limit, opts);
 	}
-	let cat = open_cat(git, opts, cat)?;
 	admit_blob(
 		commits,
 		current_wire_len,
@@ -2127,6 +2149,80 @@ mod tests {
 			"x\n"
 		);
 		assert!(dst.path().join("other/y.txt").exists());
+	}
+
+	#[test]
+	fn binary_delete_is_not_copied_and_replay_keeps_the_target_file() {
+		let src = Repo::new("main");
+		src.write("bin.dat", &[0x89, b'P', 0, 1, 2]);
+		src.write("big5.txt", &[0xa4, 0xe9, 0xa5, 0xbb]);
+		src.write("empty.txt", b"");
+		src.write("gone.txt", b"to be deleted\n");
+		src.write("big.txt", "x".repeat(100_000).as_bytes());
+		src.write("keep.txt", b"keep\n");
+		src.commit("base", "2020-01-01T00:00:00+00:00");
+		for f in ["bin.dat", "big5.txt", "empty.txt", "gone.txt", "big.txt"] {
+			src.git(&["rm", "-q", f]);
+		}
+		src.write("keep.txt", b"keep v2\n");
+		let sha = src.commit("delete", "2020-01-02T00:00:00+00:00");
+
+		let payload = copy_commits(&src.open(), &[sha]).unwrap();
+		let files = &payload.commits[0].files;
+		let find = |p: &str| files.iter().find(|f| f.path == p).unwrap();
+		for (path, reason) in [
+			("bin.dat", Some(NotCopiedReason::Binary)),
+			("big5.txt", Some(NotCopiedReason::NonUtf8)),
+			("empty.txt", None),
+			("gone.txt", None),
+			("big.txt", None),
+		] {
+			let f = find(path);
+			assert_eq!(f.change, FileChange::Deleted, "{path}");
+			assert_eq!(f.not_copied, reason, "{path}");
+			assert_eq!(f.content, None, "{path}");
+		}
+
+		// Through the clipboard text, as paste sees it.
+		let text = to_clipboard_text(&payload);
+		let parsed = parse_commit_payload(&text).unwrap();
+		let dst = Repo::new("feature");
+		for f in ["bin.dat", "big5.txt", "empty.txt", "gone.txt", "big.txt"] {
+			dst.write(f, b"target \0 copy\n");
+		}
+		dst.write("keep.txt", b"keep\n");
+		dst.commit("target root", "2019-01-01T00:00:00+00:00");
+		let tg = dst.open();
+
+		let plan = plan_commit_replay(&tg, &parsed);
+		let pf = |p: &str| {
+			plan.commits[0].files.iter().find(|f| f.path == p).unwrap()
+		};
+		for p in ["bin.dat", "big5.txt"] {
+			assert_eq!(pf(p).action, ReplayAction::Skip, "{p}");
+			assert_eq!(
+				pf(p).skip_reason,
+				Some(ReplaySkipReason::NotCopied),
+				"{p}"
+			);
+		}
+		for p in ["empty.txt", "gone.txt", "big.txt"] {
+			assert_eq!(pf(p).action, ReplayAction::Delete, "{p}");
+		}
+
+		let result = replay(&tg, &parsed);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 1);
+		assert!(dst.path().join("bin.dat").exists());
+		assert!(dst.path().join("big5.txt").exists());
+		for p in ["empty.txt", "gone.txt", "big.txt"] {
+			assert!(!dst.path().join(p).exists(), "{p}");
+		}
+		assert_eq!(
+			dst.git(&["ls-tree", "-r", "--name-only", "HEAD"]),
+			"big5.txt\nbin.dat\nkeep.txt"
+		);
+		assert_eq!(dst.git(&["show", "HEAD:keep.txt"]), "keep v2");
 	}
 
 	#[test]
