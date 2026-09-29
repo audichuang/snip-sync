@@ -1,0 +1,25 @@
+{
+  "sourceCommits": [
+    "fc017180b1ccd1f8bdae4d0892076955962ad319",
+    "e2e72a839adcbdb712d657e43c63aca44049475a",
+    "676c7ce55a3d86a46b93e7f0d322d4842874cdeb"
+  ],
+  "targetCommits": [
+    "cf549aace7d26b318a5b0e29d7e14c7b023ad3b9",
+    "e5c2d01723ab1840b262f8af68b2c6160d8f62a7",
+    "2f20cc3ff4ebf8539b1e5b1ab682a72e00fbd79b"
+  ],
+  "metadataAndTreeEqual": [
+    true,
+    true,
+    true
+  ],
+  "fileContents": {
+    "B/alpha/modify-me.txt": "alpha staged modification",
+    "B/alpha/shared.txt": "A shared source",
+    "B/alpha/nested/a.txt": "Alpha nested from A",
+    "B/beta/beta-one.txt": "A beta one",
+    "B/beta/beta-two.txt": "A beta two"
+  },
+  "deletedAbsent": true
+}

@@ -1,0 +1,24 @@
+// clipcode-root: repo02
+
+// file: batch/crlf.txt
+
+line 1
+line 2
+
+
+// file: batch/empty.txt
+
+
+// file: batch/large.txt
+// File skipped: size exceeds limit (1360000 bytes)
+
+// file: batch/new.txt
+NEW TEXT
+
+// file: batch/overwrite.txt
+WORKTREE VERSION
+
+// file: batch/中文 空間.txt
+你好世界
+第二行
+

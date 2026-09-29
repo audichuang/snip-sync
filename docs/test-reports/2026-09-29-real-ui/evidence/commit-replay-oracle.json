@@ -1,0 +1,35 @@
+{
+  "createdCount": 3,
+  "branch": "qa-replay",
+  "commits": [
+    {
+      "source": "4345e1f3e1d1be6ec13c511afa0f8f87c12ac1f4",
+      "created": "0facbf366bff29fa50446c72525a67f71672c308",
+      "metadataEqual": true,
+      "changes": "A\tcommon.txt\nA\t\"\\344\\270\\255\\346\\226\\207 \\347\\251\\272\\351\\226\\223/\\346\\226\\260\\345\\242\\236.txt\"\n",
+      "parentCount": 1
+    },
+    {
+      "source": "766d04d4a542a6f359f5e3830639ee77f3d9a844",
+      "created": "f547ad9a35e38954646b5936907575130349152e",
+      "metadataEqual": true,
+      "changes": "D\tbinary.dat\nM\tcommon.txt\nD\tdelete.txt\nD\told.txt\nA\trenamed.txt\n",
+      "parentCount": 1
+    },
+    {
+      "source": "460750944d12cda709e0c58878b293be9820099a",
+      "created": "fea37e31ee2108cde2ab3fe3ed04ff9bdbaefb96",
+      "metadataEqual": true,
+      "changes": "A\tside.txt\n",
+      "parentCount": 1
+    }
+  ],
+  "stagedBlobUnchanged": true,
+  "status": "M  unrelated.txt\n?? local-only.txt\n",
+  "hookExecuted": false,
+  "binaryPreserved": false,
+  "oldPathGone": true,
+  "textDeleteGone": true,
+  "unicodeExact": true,
+  "sideExact": true
+}

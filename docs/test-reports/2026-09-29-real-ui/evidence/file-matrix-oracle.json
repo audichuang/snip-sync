@@ -1,0 +1,12 @@
+{
+  "createdEmpty": true,
+  "crlfNormalized": true,
+  "unicodeExactNormalized": true,
+  "excludedNewAbsent": true,
+  "existingUnchanged": true,
+  "binaryUnchanged": true,
+  "utf16Unchanged": true,
+  "placeholderNotWritten": true,
+  "noImplicitDelete": true,
+  "status": "?? batch/crlf.txt\n?? batch/empty.txt\n?? \"batch/\\344\\270\\255\\346\\226\\207 \\347\\251\\272\\351\\226\\223.txt\"\n"
+}

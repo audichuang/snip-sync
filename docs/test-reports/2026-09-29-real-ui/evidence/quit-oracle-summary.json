@@ -1,0 +1,7 @@
+{
+  "quitVia": "native Cmd+Q",
+  "rootAbsent": true,
+  "observedDescendantCount": 384,
+  "lastSampleIsTermination": true,
+  "exitCode": "unavailable: attached process, not shell child"
+}

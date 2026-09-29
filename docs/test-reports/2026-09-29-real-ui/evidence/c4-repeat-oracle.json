@@ -1,0 +1,16 @@
+{
+  "newCommitIds": [
+    "fb61985f671c1fe06ceead5a0b909450006330f0",
+    "ada59fa1c2e3bc5f570a6b063d4a940d08878938"
+  ],
+  "twoDistinctCommits": true,
+  "secondIsEmpty": true,
+  "metadataMatches": true,
+  "binaryNotWritten": true,
+  "textExact": true,
+  "unrelatedStillStaged": "M  unrelated.txt\n?? local-only.txt",
+  "hooksNotRun": true,
+  "unsafeHeadUnchanged": true,
+  "unsafeStatus": "",
+  "blockingFileUnchanged": true
+}
