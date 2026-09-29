@@ -606,18 +606,6 @@ fn destination_error(dest: &Path, err: &dyn std::fmt::Display) -> Msg {
 	)
 }
 
-/// Like [`destination_error`] for a commit-replay capture, where a file
-/// standing in for a directory names that file instead of the repo root.
-fn replay_capture_error(dest: &Path, err: &TransferError) -> Msg {
-	match err {
-		TransferError::NotADirectory(blocker) => Msg::new(
-			"paste_err_destination_not_dir",
-			[blocker.display().to_string()],
-		),
-		other => destination_error(dest, other),
-	}
-}
-
 fn stale_msg(err: TransferError) -> Msg {
 	match err {
 		TransferError::StaleDestination { reason, .. } => {
@@ -907,7 +895,7 @@ impl PastePreviewPlan {
 		let payload = commits::parse_commit_payload(raw_text)
 			.map_err(|e| Msg::new("paste_err_plan", [e.to_string()]))?;
 		let preview = CommitReplayPreview::capture_with(dest, &payload, opts)
-			.map_err(|e| replay_capture_error(dest, &e))?;
+			.map_err(|e| destination_error(dest, &e))?;
 		let preview = Arc::new(preview);
 		let mut plan = Self {
 			destination: preview.destination.clone(),
@@ -2378,9 +2366,10 @@ mod tests {
 	}
 
 	#[test]
-	fn commit_paste_blocked_by_a_file_names_the_blocking_path() {
+	fn commit_paste_under_a_file_previews_it_as_a_skip() {
 		use snip_core::commits::{
 			CommitFile, CommitRecord, CommitsPayload, FileChange,
+			ReplaySkipReason,
 		};
 		let dir = tempfile::tempdir().unwrap();
 		let repo = dir.path().join("repo");
@@ -2396,32 +2385,29 @@ mod tests {
 				.unwrap();
 			assert!(out.status.success());
 		}
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("x\n".into()),
+			not_copied: None,
+		};
 		let text = commits::to_clipboard_text(&CommitsPayload {
 			commits: vec![CommitRecord {
 				message: "incoming\n".into(),
 				author_name: "Author".into(),
 				author_email: "author@example.invalid".into(),
 				author_date: "2026-09-25T12:00:00+00:00".into(),
-				files: vec![CommitFile {
-					path: "newdir/x.txt".into(),
-					old_path: None,
-					change: FileChange::Added,
-					content: Some("x\n".into()),
-					not_copied: None,
-				}],
+				files: vec![file("newdir/x.txt"), file("fresh.txt")],
 			}],
 		});
-		let err =
+		let plan =
 			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
-				.unwrap_err();
-		assert_eq!(err.key, "paste_err_destination_not_dir");
-		let blocker =
-			CanonicalRootId::new(&repo).unwrap().path().join("newdir");
-		for loc in [crate::i18n::Locale::En, crate::i18n::Locale::ZhTw] {
-			let text = err.render(loc);
-			assert!(!text.contains("paste_err_"), "raw key leaked: {text}");
-			assert!(text.contains(&*blocker.to_string_lossy()), "{text}");
-		}
+				.expect("the blocked file is skipped, not a refusal");
+		let files =
+			&plan.commit_preview.as_ref().unwrap().replay.commits[0].files;
+		assert_eq!(files[0].skip_reason, Some(ReplaySkipReason::UnsafePath));
+		assert_eq!(files[1].skip_reason, None);
 		assert_eq!(
 			fs::read_to_string(repo.join("newdir")).unwrap(),
 			"i am a file\n"

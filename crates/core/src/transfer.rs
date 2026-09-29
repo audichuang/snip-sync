@@ -158,8 +158,6 @@ pub enum TransferError {
 	UnsafePath(String),
 	#[error("special file '{0}' is not a regular file and cannot be exported")]
 	SpecialFile(String),
-	#[error("'{}' is a file, not a directory", .0.display())]
-	NotADirectory(PathBuf),
 	#[error("unknown root: '{}' was not declared in selection or destination roots", .0.display())]
 	UnknownRoot(PathBuf),
 	#[error(
@@ -2597,7 +2595,9 @@ fn capture_replay_freshness(
 		for file in &commit.files {
 			cancelled_err(opts, "replay-freshness")?;
 			// NotCopied never becomes a write; the payload has no bytes.
-			if file.skip_reason == Some(commits::ReplaySkipReason::NotCopied) {
+			if file.skip_reason
+				== Some(crate::commits::ReplaySkipReason::NotCopied)
+			{
 				continue;
 			}
 			for (abs, rel) in [
@@ -2638,21 +2638,18 @@ fn capture_replay_file_freshness(
 	opts: &RunOptions,
 ) -> Result<Option<FileFreshness>, TransferError> {
 	cancelled_err(opts, "replay-freshness")?;
+	// A file standing in for a parent directory (ENOTDIR on Unix, NotFound on
+	// Windows) is absent, like `commits::delete`; the planner already turns it
+	// into an unsafe-path skip.
 	let meta = match fs::symlink_metadata(path) {
 		Ok(meta) => meta,
-		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-		Err(e) if e.kind() == io::ErrorKind::NotADirectory => {
-			// The OS error names no path; report the ancestor that is a
-			// file so the caller can say what blocks the replay.
-			let blocker = path
-				.ancestors()
-				.skip(1)
-				.find(|a| {
-					fs::symlink_metadata(a)
-						.is_ok_and(|m| !m.file_type().is_dir())
-				})
-				.unwrap_or(path);
-			return Err(TransferError::NotADirectory(blocker.to_path_buf()));
+		Err(e)
+			if matches!(
+				e.kind(),
+				io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+			) =>
+		{
+			return Ok(None);
 		}
 		Err(e) => return Err(TransferError::Io(e)),
 	};
@@ -3015,6 +3012,55 @@ mod preview_target_hash_cancel {
 				.expect_err("preview must stop while hashing skip.bin");
 		assert_stopped_on_first_target(err, &skip, &other, [0xFF; 4]);
 		assert_same(&before, &disk(&repo, "skip.bin", "other.txt"));
+	}
+
+	#[test]
+	fn commit_preview_treats_a_file_in_the_way_as_an_unsafe_skip() {
+		let repo = Repo::new();
+		repo.write("newdir", b"i am a file\n");
+		repo.write("ok.txt", b"ok\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("x\n".into()),
+			not_copied: None,
+		};
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "incoming\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-26T00:00:00+00:00".into(),
+				files: vec![
+					file("newdir/x.txt"),
+					file("newdir/a/b.txt"),
+					file("fresh.txt"),
+				],
+			}],
+		};
+		let preview = CommitReplayPreview::capture_with(
+			&repo.path,
+			&payload,
+			&RunOptions::default(),
+		)
+		.expect("a file standing in for a directory must not refuse the paste");
+		let files = &preview.replay.commits[0].files;
+		assert_eq!(
+			files[0].skip_reason,
+			Some(crate::commits::ReplaySkipReason::UnsafePath)
+		);
+		assert_eq!(
+			files[1].skip_reason,
+			Some(crate::commits::ReplaySkipReason::UnsafePath)
+		);
+		assert_eq!(files[2].skip_reason, None);
+		assert_eq!(
+			fs::read(repo.path.join("newdir")).unwrap(),
+			b"i am a file\n"
+		);
 	}
 
 	#[test]
