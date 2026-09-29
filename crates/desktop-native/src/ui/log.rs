@@ -390,8 +390,10 @@ fn row_base(list_w: f32, show_hash: bool) -> f32 {
 /// [`MIN_GUTTER_W`]; below that the date and then the author cell shrink
 /// until the subject reaches [`MIN_SUBJECT_W`]. On a very narrow list the
 /// subject takes what is left. With `has_labels`, the room the gutter floor
-/// takes back from the label reserve is made up by the date and author, so
-/// the labels keep [`MIN_LABELS_W`]. [`MIN_SUBJECT_W`] is not guaranteed on
+/// takes back from the label reserve is made up by the date and author when
+/// they can cover all of it (so the labels keep [`MIN_LABELS_W`]); otherwise
+/// the labels are dropped and only the subject's lack is taken.
+/// [`MIN_SUBJECT_W`] is not guaranteed on
 /// lists under about 520px with the hash column on (a 900 window with the
 /// hash shown leaves the subject about 97px).
 pub(super) fn list_cols(
