@@ -2636,9 +2636,20 @@ fn capture_replay_file_freshness(
 	opts: &RunOptions,
 ) -> Result<Option<FileFreshness>, TransferError> {
 	cancelled_err(opts, "replay-freshness")?;
-	let meta = match not_found_as_none(fs::symlink_metadata(path))? {
-		Some(meta) => meta,
-		None => return Ok(None),
+	// A file standing in for a parent directory (ENOTDIR on Unix, NotFound on
+	// Windows) is absent, like `commits::delete`; the planner already turns it
+	// into an unsafe-path skip.
+	let meta = match fs::symlink_metadata(path) {
+		Ok(meta) => meta,
+		Err(e)
+			if matches!(
+				e.kind(),
+				io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+			) =>
+		{
+			return Ok(None);
+		}
+		Err(e) => return Err(TransferError::Io(e)),
 	};
 	if meta.file_type().is_symlink() {
 		// Link text only. `read_link` does not open the target.

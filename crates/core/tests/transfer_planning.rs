@@ -2616,6 +2616,48 @@ fn skipped_non_utf8_replay_target_becomes_stale_when_it_turns_writable() {
 	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head);
 }
 
+#[test]
+fn commit_replay_preview_treats_a_file_in_the_way_as_an_unsafe_skip() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange, ReplaySkipReason,
+	};
+
+	let repo = TestRepo::new("file-in-the-way");
+	repo.write("newdir", "i am a file\n");
+	repo.write("ok.txt", "ok\n");
+	repo.commit("base");
+	let file = |path: &str| CommitFile {
+		path: path.into(),
+		old_path: None,
+		change: FileChange::Added,
+		content: Some("x\n".into()),
+		not_copied: None,
+	};
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files: vec![
+				file("newdir/x.txt"),
+				file("newdir/a/b.txt"),
+				file("fresh.txt"),
+			],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload)
+		.expect("a file standing in for a directory must not refuse the paste");
+	let files = &preview.replay.commits[0].files;
+	assert_eq!(files[0].skip_reason, Some(ReplaySkipReason::UnsafePath));
+	assert_eq!(files[1].skip_reason, Some(ReplaySkipReason::UnsafePath));
+	assert_eq!(files[2].skip_reason, None);
+	assert_eq!(
+		fs::read(repo.path().join("newdir")).unwrap(),
+		b"i am a file\n"
+	);
+}
+
 #[cfg(unix)]
 #[test]
 fn unsafe_symlink_replay_parent_is_not_followed_and_becomes_stale() {
