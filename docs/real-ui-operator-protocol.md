@@ -23,7 +23,7 @@
 | `pass` | 控制項身分、點下去之後的新日誌、剪貼簿、Git／檔案四者都符合該格的通過線 |
 | `ui-defect` | Git／檔案符合通過線，預覽、顏色、計數或通知和實際動作不一致 |
 | `fail` | 寫錯、拒絕錯、點不到指定控制項、或日誌對不上。點不到時證據欄寫 `missing-control`；同路徑兩列共用一個 ID 時證據欄寫 `identity-fail`。這兩個詞不是判定 |
-| `blocked-contract` | 規格與實作衝突，還沒有人決定以哪邊為準。目前只有 T25 |
+| `blocked-contract` | 規格與實作衝突，還沒有人決定以哪邊為準。目前只用於 T25，而且只用在這份衝突還沒定案的時候 |
 | `not-run` | 這一格沒有做 |
 
 計分表只有這五個判定。
@@ -34,14 +34,16 @@
 - T01–T22、T24、T26–T37、T39、T40
 - T23。T18 是 `pass` 時它納入閘門；T18 是 `fail` 時它寫 `not-run`，證據欄寫「T18 未套用」，不另算一次失敗
 - B41–B44、B-notify
+- T25。判定是 `pass`、`fail` 或 `not-run` 時算進閘門。判定是 `blocked-contract` 時不決定閘門關不關
 
-下面三格要填，但不決定閘門關不關：
+T25 一定要做。重播結果符合規格 4.2（`binary.dat` 標成未複製，位元組仍是 `a`、NUL、`b`、換行）時，判 `pass` 或 `fail`，這一格算進閘門。結果仍把 `binary.dat` 刪掉時，用 `git log --oneline` 看受測 SHA 有沒有這筆主題：「刪除二進位／非 UTF-8 檔的 commit 標為未複製，貼上不再重播刪除」（分支 `fix/commit-binary-delete`）。還沒有就判定 `blocked-contract`；已經在歷史裡，同樣的刪除改判 `fail`，這一格留在閘門裡。沒做就記 `not-run`，閘門打開。
 
-- T25：做完，判定固定 `blocked-contract`
+下面兩格要填，但不決定閘門關不關：
+
 - T38：判定固定 `not-run`，證據欄寫「改走記憶體規程」
 - C preflight：判定固定 `not-run`，證據欄寫「這台 Mac 沒有 xvfb-run 與 /proc」
 
-閘門裡有 `ui-defect`、`fail` 或 `not-run`，第一句就寫「產品閘門打開」，並列出那些 ID。T25 的 `blocked-contract` 不把閘門撐開。第 8 節仍要寫二進位刪除的契約還沒決定，整個產品不在本規程宣告完成。
+閘門裡有 `ui-defect`、`fail` 或 `not-run`，第一句就寫「產品閘門打開」，並列出那些 ID。T25 的 `blocked-contract` 不把閘門撐開。T25 是 `blocked-contract` 時，第 8 節要寫二進位刪除的契約還沒決定。第 9 節的項目尚未測，整個產品不在本規程宣告完成。
 
 重現一個已知問題，代表這輪有觀察到它。只要該 ID 在閘門裡，產品閘門就打開。
 
@@ -50,8 +52,10 @@
 1. 向派工的人確認受測 SHA。沒有另外指定時，用 `origin/develop`。
 2. 在乾淨的 worktree 或 checkout 上建置。不要拿別的分支的 `target/` 混用。
 
+下面的賦值用 `export`。bash、zsh 與 fish 3 都能執行。這台機器的預設 shell 是 fish，`RUN=...` 這種暫時賦值不會把變數留下來。
+
 ```text
-RUN=~/snip-sync-ui-runs/$(date +%Y-%m-%d)-$(git rev-parse --short HEAD)
+export RUN="$HOME/snip-sync-ui-runs/$(date +%Y-%m-%d)-$(git rev-parse --short HEAD)"
 mkdir -p "$RUN"
 rm -f "$RUN/export-hold"
 git rev-parse HEAD
@@ -81,22 +85,39 @@ python3 scripts/collaboration_fixture.py verify --fixture "$RUN/gate-a"
 `verify` 的結束碼必須是 0。每個 A 步驟開始前再拍一張初始快照；不要把上一步改過的 repo 接著用。需要乾淨狀態時，重新 `generate` 到一個新目錄。
 
 4. 讀受測 SHA 的 `crates/desktop-native/src/ui/paste.rs`，把 `paste-row`、`paste-include`、`paste-overwrite` 的 ID 格式抄進 `environment.json`。寫這份規程時的 `bd09e95` 格式只有相對路徑。若受測 SHA 仍是這個格式，T03 與 T18 的身份檢查會失敗，這兩格不能是 `pass`。
-5. 啟動 App。探針只有在 `SNIP_NATIVE_E2E=1` 時才會印。`SNIP_NATIVE_E2E_EXPORT_HOLD_FILE` 在 `WorkbenchModel::new` 讀一次，所以必須寫在啟動命令裡。不要加 `--restore-dir`，貼上目的地由畫面決定。stdout 與 stderr 都要進 `app.log`，否則讀不到 `CTRL_BOUNDS`。
+5. 啟動 App。探針只有在 `SNIP_NATIVE_E2E=1` 時才會印。`SNIP_NATIVE_E2E_EXPORT_HOLD_FILE` 在 `WorkbenchModel::new` 讀一次，所以必須寫在啟動命令裡。不要加 `--restore-dir`，貼上目的地由畫面決定。每一次啟動的 stdout 與 stderr 寫進該次自己的日誌，否則讀不到 `CTRL_BOUNDS`。
+
+同一時間只開一個 App。閘門 A 與閘門 B 各啟動一次，各寫一份日誌。先做哪一個都可以。換下一個之前，對目前這個按 Cmd+Q，等到 exit code 0，再啟動。第二次若用 `>` 寫進第一次的檔，會把 `CTRL_BOUNDS` 與 `PASTE_DONE` 截掉。
+
+同一個 shell 裡，下面三個 export 做一次即可。新開 shell 要再 export。`VAR=value 命令` 這種暫時賦值在 fish 裡不會傳給程序。
 
 ```text
-SNIP_NATIVE_E2E=1 \
-SNIP_THEME=dark \
-SNIP_NATIVE_E2E_EXPORT_HOLD_FILE="$RUN/export-hold" \
-  ./target/debug/snip-desktop-native \
-  --workspace "$RUN/gate-b/fixtures/ws-src" \
-  > "$RUN/app.log" 2>&1
+export SNIP_NATIVE_E2E=1
+export SNIP_THEME=dark
+export SNIP_NATIVE_E2E_EXPORT_HOLD_FILE="$RUN/export-hold"
 ```
 
-閘門 A 把 `--workspace` 改成 `$RUN/gate-a/machine-a`，或該 fixture 實際的工作區路徑。這一輪只開這一個 App。自己啟動它，結束時才讀得到 exit code。換工作區用畫面上的開工作區，不要再開第二個程序。
+閘門 B：
 
-6. `environment.json` 至少包含：受測 SHA、執行檔 SHA-256、啟動命令、`app.log` 路徑、三個視窗尺寸實際量到的寬高、paste ID 格式、fixture 目錄。
+```text
+./target/debug/snip-desktop-native \
+  --workspace "$RUN/gate-b/fixtures/ws-src" \
+  > "$RUN/app-gate-b.log" 2>&1
+```
 
-視窗要跑三種邏輯尺寸：1080×752（對照 2026-09-29 報告的 BUG-04）、1080×720 與 900×600（驗收規格）。把視窗調到該尺寸後，從 `app.log` 抄下最新的 `[APP:VIEWPORT: WxH]`。這行是實體像素，Retina 上會比邏輯尺寸大。兩組數字都留下。功能 oracle 在三種尺寸相同；T36 每種尺寸各判一次。
+閘門 A：
+
+```text
+./target/debug/snip-desktop-native \
+  --workspace "$RUN/gate-a/machine-a" \
+  > "$RUN/app-gate-a.log" 2>&1
+```
+
+閘門 A 的工作區若不是 `machine-a`，改成該 fixture 實際的路徑。自己啟動它，結束時才讀得到 exit code。同一個 App 還開著時，換工作區用畫面上的開工作區，不要為了換目錄再疊一個程序。
+
+6. `environment.json` 至少包含：受測 SHA、執行檔 SHA-256、兩次啟動命令、`app-gate-a.log` 與 `app-gate-b.log` 的路徑、三個視窗尺寸實際量到的寬高、paste ID 格式、fixture 目錄。
+
+視窗要跑三種邏輯尺寸：1080×752（對照 2026-09-29 報告的 BUG-04）、1080×720 與 900×600（驗收規格）。把視窗調到該尺寸後，從這一次啟動的日誌抄下最新的 `[APP:VIEWPORT: WxH]`。這行是實體像素，Retina 上會比邏輯尺寸大。兩組數字都留下。功能 oracle 在三種尺寸相同；T36 每種尺寸各判一次。
 
 快捷鍵用 macOS 的 Cmd：Cmd+C 複製、Cmd+V 開預覽、Cmd+Q 結束、Cmd+Shift+O 開工作區、Cmd+Shift+W 關工作區。Option+1 專案、Option+0 變更、Option+9 Git log、Option+Shift+R 選 repo。預覽面板裡 Enter 套用、Escape 取消、Space 切換目前列。程式也綁了 Ctrl；操作仍按 Cmd，並用日誌確認送到的是複製。在這個 App 裡按 Cmd+C 是 App 自己的複製。
 
@@ -106,7 +127,7 @@ Shell 可以建立 fixture、用 argv 叫 Git、把 Git 輸出寫進檔再算雜
 
 每一次點擊都做完這七步。少一步，該格就是 `fail`。
 
-1. 從 `app.log` 取這個控制項最新的一行：
+1. 從這一次啟動的日誌取這個控制項最新的一行。閘門 A 讀 `$RUN/app-gate-a.log`，閘門 B 讀 `$RUN/app-gate-b.log`。
 
 ```text
 [APP:CTRL_BOUNDS: id=<完整 ID> x= y= w= h=]
@@ -119,7 +140,7 @@ ID 整段相等。`paste-overwrite:common.txt` 不能拿去點 `paste-overwrite:
 4. 把 bounds 換算成螢幕上的點，再點那個點。`x`、`y`、`w`、`h` 是實體像素，原點在視窗內容區的左上角，不是螢幕，也不是含標題列的視窗框。`physical()` 乘了 `scale_factor`。直接點 `(x + w/2, y + h/2)` 在 Retina 上會偏到大約兩倍遠。換算順序：
 
    - 讀最新的 `[APP:VIEWPORT: Wp x Hp]`。
-   - 讀 `snip-desktop-native` 視窗框的螢幕位置與邏輯尺寸，以及主螢幕的 `backingScaleFactor`。視窗框含標題列。
+   - 讀 `snip-desktop-native` 視窗框的螢幕位置與邏輯尺寸，以及視窗框中心所在那一塊螢幕的 `backingScaleFactor`。視窗框含標題列。外接螢幕的 scale 可以和主螢幕不同；用主螢幕的值會把點算錯。
    - `scale` 用 `backingScaleFactor`。`Wp` 應等於內容區邏輯寬乘 `scale`。對不上就判定 `fail`，證據欄寫算式與兩個寬度，不要點。
    - 標題列高度 = 視窗框邏輯高 − (`Hp / scale`)。內容區左上角 = 視窗框左上角的 x，以及視窗框的 y 加上標題列高度。
    - 螢幕點 = 內容區左上角 + `((x + w/2) / scale, (y + h/2) / scale)`。點擊工具若吃邏輯點，用這個螢幕點。若吃實體像素，再乘 `scale`。`action.json` 同時留下原始 bounds、`scale`、內容區左上角與實際點到的螢幕點。
@@ -148,6 +169,7 @@ ID 以受測 binary 印出的為準。下面是寫這份規程時 `bd09e95` 的�
 | 多 repo 篩選 | `log-filter-repo`、`log-repo:<名稱>`、`log-repo-check:<名稱>` |
 | 單一 repo 工作區的路徑篩選 | `log-filter-paths`。多 repo 工作區不要去點這個 ID |
 | 歷史檔案 | `btn-browse-tree:<完整 SHA>`、`rev-row:<path>`、`rev-chk:<完整 oid>:<path>`、`btn-leave-tree` |
+| Git log 變更檔案 | `commit-file:<path>`、`commit-dir:<path>`。資料夾列的選取 key 是 `<path>/`。左鍵資料夾是展開或收合；複製用右鍵 |
 | 貼上 | `btn-apply`、`btn-cancel`、`paste-row:<path>`、`paste-include:<path>`、`paste-overwrite:<path>` |
 | 多 repo 對應 | `paste-map-pick:<prefix>:<idx>`、`paste-map-keep:<prefix>` |
 
@@ -236,7 +258,7 @@ Commit 步驟把第 2–3 步換成：`rail-log`，點起點 `commit-row:<7 字�
 | `neg-mapping-collision` | 兩條路徑最後都映到同一個目的檔 | 第二次 replan 出現 `[APP:PASTE_PLAN_REFUSED: reason=target_collision]`；零寫入 |
 | `neg-mapping-ambiguous-basename` | 只給 `billing`，west 與 east 都有 | 候選 root 同時含這兩個 canonical path；`mapping_required`；取消後零寫入 |
 | `neg-mapping-missing-destination` | 不提交不存在的 repo id | `billing` 的候選正好是目的工作區那 15 個真實 root；Return 後 `[APP:PASTE_ERR: mapping_required]`；點 `btn-apply` 後 1 秒內沒有 `PASTE_APPLYING` 或 `PASTE_DONE` |
-| `neg-stale-source` | 啟動命令裡已經有 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選好變更後用 `pbcopy` 放入 sentinel，建立 `$RUN/export-hold`，再按一次 `btn-copy`。等到新的 `[APP:EXPORT_PLAN_READY: files=N]`（N 至少 1），改來源檔，拍快照，刪掉 hold 檔。同一次複製會接著跑。不要再按一次複製，也不要等選完才去設環境變數 | `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`；沒有 `COPY_DONE`；sentinel 不變；快照等於改完之後、刪掉 hold 之前那張 |
+| `neg-stale-source` | 啟動命令裡已經有 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選好變更後用 `pbcopy` 放入 sentinel，建立 `$RUN/export-hold`，再按一次 `btn-copy`。等到新的 `[APP:EXPORT_PLAN_READY: files=N]`（N 至少 1），改來源檔，拍快照，刪掉 hold 檔。同一次複製會接著跑。不要再按一次複製，也不要等選完才去設環境變數。這一步結束時 `$RUN/export-hold` 必須不存在。中途失敗而檔還在，先刪掉它，證據欄寫「hold 殘留，已刪」，然後才做後面的檔案模式複製。檔留著的話，之後每一次檔案模式複製都會停在 `EXPORT_PLAN_READY` | `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`；沒有 `COPY_DONE`；sentinel 不變；快照等於改完之後、刪掉 hold 之前那張；`$RUN/export-hold` 不存在 |
 | `neg-stale-target` | 預覽出現後改目的端，再 Apply | `[APP:PASTE_STALE_DETECTED:]`；快照等於改完之後、Apply 之前那張 |
 | `neg-overwrite-unauthorized` | 目的檔已存在，不勾覆寫就 Apply | `[APP:PASTE_DONE:]` 且 `overwritten=0`；該檔位元組不變 |
 | `neg-cancel` | 預覽後 Escape 或 `btn-cancel` | `[APP:PASTE_CANCELLED]`；快照等於生成時的 baseline |
@@ -258,10 +280,11 @@ Fixture 由 `docs/real-ui-operator-fixture.sh` 建立。目錄意義：
 | `fixtures/commits-dst-overwrite` | 已有 `common.txt`，分支 `qa-replay`，另有 staged 與 untracked |
 | `fixtures/commits-dst-clean` | 沒有 `common.txt`，分支 `qa-replay` |
 | `fixtures/commits-dst-hooks` | 四種 hook 都 `exit 1` 並寫 `fixtures/hook-marker.txt` |
-| `fixtures/commits-dst-present` | 已追蹤 `binary.dat`（`a`、NUL、`b`、換行）與 `gone.txt`（`gone`），分支 `qa-replay`。T25、T32、B42 各從這份初始樹開始 |
+| `fixtures/commits-dst-present` | 已追蹤 `binary.dat`（`a`、NUL、`b`、換行）、根目錄 `gone.txt`（`gone`）、`dir/gone.txt`（`folder-gone`），分支 `qa-replay`。T25、T32、B42 各從這份初始樹開始。T25 與 T32 留下 `dir/gone.txt` |
+| `fixtures/basket-src` | B42 的來源。`basket base` 有 `dir/keep.txt`（`keep`）與 `dir/gone.txt`（`folder-gone`）。下一筆 `basket folder and delete` 把 `dir/keep.txt` 改成 `keep-2`，並刪除 `dir/gone.txt`。沒有 `binary.dat` |
 | `$RUN/perf15` | Git log 版面、搜尋、100 次切換 |
 
-C1 的 message 是 `多行中文`、空行、`第二段`。C2 改 `common.txt`、把 `old.txt` 改名 `new.txt`、刪除 `gone.txt` 與含 NUL 的 `binary.dat`、新增 `emoji.txt`。C3 是 merge，first parent 是 C2，對 first parent 的 diff 是 `side.txt`。C4 新增 `newdir/content.txt` 與含 NUL 的 `new-binary.bin`。
+C1 的 message 是 `多行中文`、空行、`第二段`。C2 改 `common.txt`、把 `old.txt` 改名 `new.txt`、刪除 `gone.txt` 與含 NUL 的 `binary.dat`、新增 `emoji.txt`。這些路徑都在 `commits-src` 的根目錄。C3 是 merge，first parent 是 C2，對 first parent 的 diff 是 `side.txt`。C4 新增 `newdir/content.txt` 與含 NUL 的 `new-binary.bin`。
 
 預設單檔上限是 500 KiB（`Settings::max_file_size_kb`）。`large.txt` 是 1,360,000 byte，複製時應被略過。
 
@@ -275,7 +298,7 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T02 | 貼上時不選 `paste-map-pick`，再選一次 | 未選時 `[APP:PASTE_ERR: mapping_required]`，點 `btn-apply` 沒有 `PASTE_APPLYING`；選後 `[APP:PASTE_MAPPED]` 的絕對路徑正確 |
 | T03 | repo01 與 repo03 的 `unrelated.txt` 各點 `paste-overwrite` | 兩個不同 ID，兩次 `[APP:PASTE_TOGGLED]` 的 idx 不同；套用後覆寫 2、跳過 0，兩邊位元組分別是 `from-repo01` 與 `from-repo03` |
 | T04 | repo02／repo05 的 `only-src.txt` 與 repo06／repo07 的 `shared.txt` | 建立 2、覆寫 2；其餘 repo 的 HEAD 與 status 不變 |
-| T05 | `files-src` 的 staged 新增、修改、刪除、rename，複製後貼到新鮮的 `files-dst` | payload 含 `[NEW] staged-new.txt`、`[MODIFIED] both.txt`（內容 `index-body`）、`[DELETED] gone.txt`、`[MOVED] new-name.txt`。沒有舊路徑的刪除項。貼上後建立 `staged-new.txt` 與 `new-name.txt`、覆寫 `both.txt` 為 `index-body`、刪除 `gone.txt`。`old-name.txt` 仍是 `old-dest` |
+| T05 | `files-src` 的 staged 新增、修改、刪除、rename，複製後貼到新鮮的 `files-dst`。預覽裡勾選 `both.txt` 的 `paste-overwrite` | payload 含 `[NEW] staged-new.txt`、`[MODIFIED] both.txt`（內容 `index-body`）、`[DELETED] gone.txt`、`[MOVED] new-name.txt`。沒有舊路徑的刪除項。貼上後建立 2、覆寫 1、刪除 1、跳過 0：建立 `staged-new.txt` 與 `new-name.txt`、覆寫 `both.txt` 為 `index-body`、刪除 `gone.txt`。`old-name.txt` 仍是 `old-dest`。沒勾 `both.txt` 的覆寫時，結果是跳過 1，這一格不能算過 |
 | T06 | 同一路徑 `both.txt` 分別從變更列（index）與 Project（worktree）複製 | 兩次 payload 的位元組分別等於 index 的 `index-body` 與 worktree 的 `worktree-body` |
 | T07 | 複製 `folder/`。這個資料夾有 7 個檔：`a.txt`–`e.txt`、`bin.dat`、`utf16.txt`。`large.txt` 不在裡面 | 通知是已複製 5、略過 2。略過的是 `bin.dat` 與 `utf16.txt`。目的端建立 `a.txt`–`e.txt`；`folder/utf16.txt` 仍是 `keep-utf16`；不建立 `folder/bin.dat` |
 | T08 | 複製來源的 `binary.dat` 與 `folder/utf16.txt`，貼到新鮮的 `files-dst` | payload 沒有這兩個檔的可還原內容。`files-dst/binary.dat` 仍是 `keep-bin`，`files-dst/folder/utf16.txt` 仍是 `keep-utf16` |
@@ -295,14 +318,14 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T22 | 核對 T19 的 C2 | `old.txt` 消失、`new.txt` 為 `old`、`gone.txt` 消失、`emoji.txt` 為 `你好 ✨`。預覽同時把 `old.txt` 顯示為刪除 |
 | T23 | 看 `commits-dst-overwrite` 在一次成功重播之後 | `staged-keep.txt` 仍在 index；`local-only.txt` 仍是 untracked。T18 是 `pass` 之後才做。T18 是 `fail` 時，本格判定 `not-run`，證據欄寫「T18 未套用」 |
 | T24 | 把 C4 貼到 `commits-dst-hooks` | 重播成功；`fixtures/hook-marker.txt` 不存在 |
-| T25 | 只重播 C2 到新鮮的 `commits-dst-present` | 規格 4.2 要求含 NUL 的刪除標成未複製，不刪除目的端的 `binary.dat`。實作若把它套用成刪除，與規格衝突。記錄 `binary.dat` 是否仍在，以及位元組是否仍是 `a`、NUL、`b`、換行。判定寫 `blocked-contract`。同一次重播會刪掉文字檔 `gone.txt`，那不是這格的契約衝突 |
+| T25 | 只重播 C2 到新鮮的 `commits-dst-present`。預覽會列出這次對 `binary.dat` 的動作 | 規格 4.2：含 NUL 的刪除標成未複製，不寫入、不刪除目的端的 `binary.dat`，位元組仍是 `a`、NUL、`b`、換行。同一次重播刪掉根目錄的文字檔 `gone.txt`。`dir/gone.txt` 仍是 `folder-gone`。結果符合時判 `pass` 或 `fail`，這一格算進閘門。結果把 `binary.dat` 刪掉時，依第 1 節看受測 SHA 有沒有那筆「不再重播刪除」的變更：還沒有就寫 `blocked-contract`，已經有就寫 `fail` |
 | T26 | 貼 C4 到乾淨目的 | 預覽把 `new-binary.bin` 標成 SKIP，摘要的建立／跳過與每一列一致；實際只提交 `newdir/content.txt` |
 | T27 | 同一段 C4 再貼一次 | 第二個 SHA 不同，tree 與前一個相同 |
 | T28 | 只貼 `empty replay` | 預覽有 message、作者與時間；Apply 後 `before..HEAD` 是 1，tree 不變 |
 | T29 | 在 commit 預覽裡取消其中一個檔，再 Apply | 拒絕；HEAD 與檔案不變 |
 | T30 | 有覆寫列但少勾一個 | 拒絕；沒有部分 commit |
 | T31 | 把 C4 貼到 `ws-dst/repo04`（`newdir` 是一般檔） | 拒絕；HEAD、status、`newdir` 的位元組不變。訊息指出 `newdir` 與「不是目錄」 |
-| T32 | 在 C2 的變更檔案裡，對 `gone.txt` 右鍵複製，貼到新鮮的 `commits-dst-present` | `[APP:MENU_ACTION: copy-files]`；payload 含 `[DELETED]` 與刪除前內容 `gone`；`gone.txt` 消失；`binary.dat` 仍是初始位元組 |
+| T32 | 在 C2 的變更檔案裡，對 `gone.txt` 右鍵複製，貼到新鮮的 `commits-dst-present`。範圍只有這一個檔 | `[APP:MENU_ACTION: copy-files]`；payload 含 `[DELETED]` 與刪除前內容 `gone`；根目錄 `gone.txt` 消失；`binary.dat` 仍是初始位元組；`dir/gone.txt` 仍是 `folder-gone` |
 | T33 | `perf15` 上 `log-filter-repo` 選一個 repo，`btn-log-regex` 輸入能命中的字 | 列只剩該 repo、且 subject 符合的 commit |
 | T34 | 在 log 裡實際滾動 | 載入筆數增加（50 的倍數往上）。把前後的 `[APP:GRAPH_LOADED: commits=N]` 寫進 `action.json` |
 | T35 | 搜尋尚未載入的較早 commit | 找到該 SHA，預覽指出它 |
@@ -314,14 +337,15 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 
 T03 與 T18 的 `action.json` 要寫兩欄：畫面上同相對路徑的列數，以及 `paste-overwrite:` 的相異 ID 數。列數大於相異 ID 數時，判定寫 `fail`，證據欄寫 `identity-fail`。
 
-#46 之後多出來的四格，40 項矩陣沒有：
+#46 之後多出來的格子，40 項矩陣沒有：
 
 | ID | 點什麼 | 通過線 |
 |---|---|---|
 | B41 | 變更檔案上 Cmd 點兩列、Shift 點出範圍，右鍵複製 | 選取集合與畫面順序一致；資料夾展開後同一檔只出現一次 |
-| B42 | 範圍內含刪除檔，與一個資料夾一起複製，貼到新鮮的 `commits-dst-present` | payload 裡刪除檔是 `[DELETED]` 加舊內容；`gone.txt` 消失；`binary.dat` 仍是初始位元組 |
+| B42 | 開 `fixtures/basket-src`，選 message 為 `basket folder and delete` 的 commit。變更檔案裡對資料夾 `dir`（`commit-dir:dir`）右鍵，選複製檔案，貼到新鮮的 `commits-dst-present`。範圍就是這個資料夾：修改的 `dir/keep.txt` 與刪除的 `dir/gone.txt`。不要用 C2 | payload 有 `[DELETED] dir/gone.txt`，內容是刪除前的 `folder-gone`；另有 `dir/keep.txt`，內容 `keep-2`。貼上後 `dir/gone.txt` 消失，`dir/keep.txt` 是 `keep-2`（檔尾換行依檔案模式契約去掉）。根目錄 `gone.txt` 仍是 `gone`，`binary.dat` 仍是 `a`、NUL、`b`、換行。檔案模式若複製已刪除的二進位檔，內容是 `// This file has been deleted in this change`，貼上會刪掉目的端；規格 4.2 只管 commit 模式，那種選取不記成產品錯誤 |
 | B43 | 多 repo log 看分支標籤 | 一列一個合併標籤，寬度不超過 320px；tooltip 含全部 ref |
 | B44 | 多 repo 只點 `log-filter-repo`；另開一個單一 repo 工作區 | 單一 repo 工作區的 chip 是 `log-filter-paths`，篩選結果與所選 repo、路徑一致 |
+| B-notify | 複製 `commits-src` 的 C4（這筆含未複製的 `new-binary.bin`） | 通知寫出第幾個 commit 少了哪些檔。只複製 C4 時，就是第 1 個 commit 少了 `new-binary.bin`。同一則通知還要有規格 4.2 的四個數：commit 數 1、檔案數 2（未複製的檔也算）、未複製檔數 1、字元數等於剪貼簿全文的 UTF-16 code unit 數（`commits.rs` 的 `copy_summary`）。少任何一項，而 commit 已經複製成功時，判定 `ui-defect` |
 
 ## 7. 寫這份規程時，`bd09e95` 上已經對過的程式
 
@@ -331,10 +355,10 @@ T03 與 T18 的 `action.json` 要寫兩欄：畫面上同相對路徑的列數�
 |---|---|---|
 | `ui/paste.rs` 的 paste ID 只有 path | 同相對路徑的第二個覆寫控制項不會有自己的 ID | T03、T18 判定 `fail`，證據欄寫 `identity-fail` |
 | commit 預覽的動作標籤 | binary 新增會畫成建立；rename 的舊路徑不一定畫成刪除；空 commit 預覽沒有 message／作者／時間 | T22、T26、T28：Git 對則 `ui-defect`，Git 也錯則 `fail` |
-| 規格 4.2 與 commit 刪除含 NUL 的檔 | 規格要求不刪除；實作路徑仍可能套用刪除 | T25 維持 `blocked-contract`，不要選邊 |
+| 規格 4.2 與 commit 刪除含 NUL 的檔 | 規格要求不刪除；`bd09e95` 的重播仍可能套用刪除。預覽會列出 delete `binary.dat` | 依第 1 節。`bd09e95` 還沒有那筆「不再重播刪除」的變更，刪掉 `binary.dat` 時 T25 判定 `blocked-contract`。結果已符合規格 4.2 時改判 `pass` 或 `fail`，並把這一格算進閘門 |
 | Git log 的 subject 欄 | 窄寬度下訊息欄可能只剩空白 | T36 以這一輪的截圖與列文字為準 |
 | `paste_err_destination` | `bd09e95` 的 i18n 沒有這個 key，畫面會露出 key | T31：安全拒絕且檔案沒變，但訊息仍是 key 時為 `ui-defect` |
-| 複製 commit 的通知 | 文案是「已複製 N 個 commit」，沒有未複製檔數 | 複製 C4 後通知沒有未複製數，記一筆 `ui-defect`，ID 寫 `B-notify` |
+| 複製 commit 的通知 | `status_commits_copied` 只有「已複製 N 個 commit 至剪貼簿」，沒有未複製檔，也沒有第幾個 commit 少了哪些檔 | `bd09e95` 上複製 C4 後記 `ui-defect`，ID 寫 `B-notify`。通過線在第 6 節。通知寫出規格 4.2 要求的那幾項時改判 `pass` |
 | 歷史刪除檔的 Copy Files | #46 已讓刪除檔以 `[DELETED]` 複製 | T32 必須本輪重測。`167c10c` 的「選單停用」作廢 |
 
 2026-09-29 報告測的是 `main` 的 `167c10c`。那一輪的 PASS 不能抄進這份計分表。
@@ -349,7 +373,7 @@ T03 與 T18 的 `action.json` 要寫兩欄：畫面上同相對路徑的列數�
 產品閘門: 打開 | 關閉
 ```
 
-接著一張表：ID、判定、一句話證據（日誌行或 Git SHA）。產品閘門按第 1 節的名單關閉：18 步、T01–T22、T24、T26–T37、T39、T40、條件內的 T23、B41–B44、B-notify 全部是 `pass`。T25、T38、C preflight 不參與這個判斷。結論另寫「二進位刪除的契約尚未決定，第 9 節的項目尚未測，整個產品不在本規程宣告完成」。
+接著一張表：ID、判定、一句話證據（日誌行或 Git SHA）。產品閘門按第 1 節的名單關閉：18 步、T01–T22、T24、T26–T37、T39、T40、條件內的 T23、B41–B44、B-notify 全部是 `pass`。T25 的判定是 `pass`、`fail` 或 `not-run` 時也算進這個判斷；只有 `blocked-contract` 不參與。T38、C preflight 不參與。T25 是 `blocked-contract` 時，結論寫「二進位刪除的契約尚未決定」。第 9 節的項目尚未測，整個產品不在本規程宣告完成。
 
 ## 9. 這份規程不關閉的項目
 

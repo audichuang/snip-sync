@@ -184,8 +184,19 @@ init_repo "$FIX/commits-dst-present"
 printf 'readme\n' > "$FIX/commits-dst-present/README.md"
 printf 'a\0b\n' > "$FIX/commits-dst-present/binary.dat"
 printf 'gone\n' > "$FIX/commits-dst-present/gone.txt"
+mkdir -p "$FIX/commits-dst-present/dir"
+printf 'folder-gone\n' > "$FIX/commits-dst-present/dir/gone.txt"
 commit "$FIX/commits-dst-present" '2026-03-01T00:00:00+08:00' '2026-03-01T00:01:00+08:00' 'dst present'
 g "$FIX/commits-dst-present" checkout -b qa-replay >/dev/null
+
+init_repo "$FIX/basket-src"
+mkdir -p "$FIX/basket-src/dir"
+printf 'keep\n' > "$FIX/basket-src/dir/keep.txt"
+printf 'folder-gone\n' > "$FIX/basket-src/dir/gone.txt"
+commit "$FIX/basket-src" '2026-04-01T09:00:00+08:00' '2026-04-01T09:01:00+08:00' 'basket base'
+printf 'keep-2\n' > "$FIX/basket-src/dir/keep.txt"
+rm "$FIX/basket-src/dir/gone.txt"
+commit "$FIX/basket-src" '2026-04-02T09:00:00+08:00' '2026-04-02T09:01:00+08:00' 'basket folder and delete'
 
 init_repo "$FIX/commits-dst-hooks"
 printf 'readme\n' > "$FIX/commits-dst-hooks/README.md"
