@@ -8,11 +8,26 @@
 
 **核心傳輸與重播能完成，這一版仍有阻擋常見操作的 UI 問題，不能判定全部通過。**
 
-- 本輪從 App 實際建立 **6 個新 commit**：3 個連續重播、C4 首次重播、C4 重複重播的空 commit，以及反向傳送的一個空 commit。前輪另有 3 個，本輪再次以 Git 核對。fixture 建置時建立的 commits 不計入這個數量。
+- 本輪從 App 實際建立 **6 個新 commit**：3 個連續重播、C4 首次重播、C4 重複重播的空 commit，以及反向傳送的一個空 commit。明細見 §5 表格；前輪另有 3 個，本輪再次以 Git 核對。fixture 建置時建立的 commits 不計入這個數量。
 - 最優先是 **BUG-01：貼上清單中同相對路徑重複出現時，第二個控制項無效**。它同時影響「連續 commits 都修改同一檔」與「不同 repos 各有同名檔案」。前者會阻止整段 commit 重播。
 - Commit 預覽有多處與實際行為不一致：binary SKIP 顯示為建立、rename 未顯示舊路徑刪除、空 commit 沒有任何 message/作者/時間預覽。另有二進位刪除與規格不一致。
 - 15 repo、15,000 tracked paths、15,000 commits 的資料下，100 次真實切換完成，無崩潰。RSS 穩態中位數 **132.750→136.219 MiB（+3.469 MiB）**；切換區間程序樹取樣峰值 **141.438 MiB**。FD 沒有增加，閒置時 Git 子程序排空。這次沒有足夠證據判定持續洩漏，也不構成「沒有洩漏」的證明。
-- **本輪未修改產品程式碼、未 commit/push/release。** 測試結束時來源 checkout 為乾淨的 `main`；測試 App 已用 Cmd+Q 正常關閉。
+- **測試執行期間未修改產品程式碼，也未 commit/push/release。** 測試結束時來源 checkout 為乾淨的 `main`；測試 App 已用 Cmd+Q 正常關閉。本報告另以僅含文件的 docs-only 分支交付。
+
+### 1.1 develop 068c467 對照
+
+以下對照以 `git diff 167c10c origin/develop` 與 `git show origin/develop:<path>` 讀碼得出，**尚未在 develop 上重新做真實 UI 實測**；「仍存在」指相關程式碼未被 167c10c..068c467 改動。
+
+| 項目 | develop 068c467 現況 | 依據 |
+|---|---|---|
+| BUG-01 | 仍存在 | 該區間未改動 `crates/desktop-native/src/ui/paste.rs`；row／include／overwrite 的 ID（`paste-row:`／`paste-include:`／`paste-overwrite:`，約 L323-325）仍只由 path 組成 |
+| BUG-02 | 仍存在 | 該區間未改動 `crates/desktop-native/src/ui/mod.rs` 與 `crates/desktop-native/src/paste.rs`；`paste_op`（`ui/mod.rs` L476）仍不先處理 `action_label == "SKIP"`（`PasteItem` 沒有 `not_copied` 欄位；`not_copied` 經 `build_commit` 轉成 `ReplayAction::Skip`，再變成 `action_label = "SKIP"`），BINARY SKIP 落入 `op_create` |
+| BUG-03 | 仍存在 | 該區間未改動 `crates/core/src/commits.rs`；L620 對 Deleted 仍在任何 blob／編碼檢查前直接回傳 |
+| BUG-04 | 大概仍存在，需實機重驗 | `log_view.rs` 有變動（#46：repo 與 paths 篩選 chip 合併、changed files 支援 shift-click 多選），`subject_room` 公式（`log_view.rs` L621-625）未改，但輸入之一改了：#46 的「記錄的分支標籤合併」使 `ui/log.rs` 的 `ref_label_elements` 每列改為單一 `graph_view::combined_label`（上限 320px，原本每個標籤上限 160px），會改變從 `subject_room` 扣除的 `labels_w`；chip 合併也可能改變頂部版面，故仍須以真實 UI 在 1080 寬確認 |
+| BUG-05 | 仍存在 | `i18n.rs` 有變動，但仍沒有 `paste_err_destination` key（`paste.rs` L880 等處使用） |
+| BUG-06 | 仍存在 | `i18n.rs` 的 `status_commits_copied` 文案未變 |
+| LIMIT-01 | 已處理，待重驗 | `fa81aa9`（#46「feat(native): 記錄的分支標籤合併、變更檔案多選與刪除檔複製、repo 篩選合併」）移除 `crates/desktop-native/src/menu.rs` 對 Deleted 的排除；刪除檔現在以 `[DELETED]` 加刪除前內容複製，行為同 TS graphCopy |
+
 
 ## 2. 環境與證據口徑
 
@@ -22,16 +37,15 @@
 | 實體 RAM | 24 GiB |
 | App | snip-sync 0.3.2，本機測試 bundle |
 | Source SHA | `167c10cd647fdadc1c0711f94b74940d8490f528` |
-
-> 本報告描述測試當時 `main` 的 0.3.2 source SHA `167c10c`。此報告分支由較新的 `develop` SHA `068c467` 建立；後續程式變更可能已改變部分行為。本報告中的程式碼連結固定到實際測試的 source SHA，BUG 項目在修正前應先於目前 develop 重現。
 | Binary SHA-256 | `500531d90324c69f0bb4a2fb4d470955692c5644c932f14d6d3f903dd5efbb81` |
 | 程序 | 取樣開始前已運行約 44 分鐘，屬暖程序 |
-| Binary 路徑 | `local test bundle (path omitted)` |
 | 實際視窗 | 1080×752 screenshot；本輪未測 900×600 |
 | 正式 release 比較 | 未進行；此 bundle 的建置 profile 未在本輪重新核實，不拿它宣告 release RAM gate 通過 |
 | UI 操作 | 全部透過 Computer Use 的真實原生點擊、鍵盤、滾動、系統剪貼簿 |
 | Shell 用途 | 建立可丟棄 fixtures、唯讀核對 Git/檔案、量測程序；沒有用 CLI/API 代替 App 執行複製或貼上 |
 | UI 證據 | 本次對話中的 Computer Use 截圖；本報告另附重現步驟、payload、Git/file oracle 與原始量測。未另存獨立截圖檔 |
+
+> 本報告描述測試當時 `main` 的 0.3.2 source SHA `167c10c`。此報告分支由較新的 `develop` SHA `068c467` 建立；後續程式變更可能已改變部分行為。本報告中的程式碼連結固定到實際測試的 source SHA。各項目在 develop 068c467 的現況見 §1.1；除 LIMIT-01 已由 `fa81aa9` 處理外，其餘項目在修正前仍應先於 develop 以真實 UI 重現一次。
 
 完整環境資訊已保留於本機測試附件；為避免包含本機路徑與程序識別資訊，未納入 repo。原生 AX 只提供視窗級資訊，因此主要操作依實際截圖定位，100 次切換每次都重新取得 AX 狀態，並在第 10/30/50/70/90/100 次檢查畫面。操作時間包含工具觀察開銷，**不是 App 回應延遲 benchmark**。
 
@@ -48,7 +62,7 @@
 
 ## 3. 實測情境矩陣
 
-以下 40 列是明確定義的檢查項目，不是全產品測試覆蓋率。`PASS-WITH-UI-DEFECT` 表示磁碟／Git 結果正確但預覽有問題；`FAIL-CONTRACT` 表示實作與書面契約衝突；`OBSERVATION` 不代表驗收通過。
+以下 40 列是明確定義的檢查項目，不是全產品測試覆蓋率。`PASS-WITH-UI-DEFECT` 表示磁碟／Git 結果正確但預覽有問題；`FAIL-CONTRACT` 表示實作與書面契約衝突；`OBSERVATION` 不代表驗收通過；`LIMITATION-ADDRESSED-ON-DEVELOP` 表示 167c10c 當時的明確限制已由 develop 068c467 的變更處理，但尚未實機重驗，不算通過。
 
 | ID | 情境 | 判定 | 結果 |
 |---|---|---|---|
@@ -73,7 +87,7 @@
 | T19 | Commit：3 commits 貼入 common.txt 尚不存在的另一 repo | PASS | 真的建立 3 個新 SHA，git rev-list before..HEAD=3。（本輪） |
 | T20 | Commit：完整 message、作者、email、時間與時區 | PASS | 本輪 3 個逐一比對相等；多行中文訊息與空白行保留。（兩輪） |
 | T21 | Commit：merge 以 first-parent 差異重播 | PASS | 來源 C3 為 merge，目的 commit 一個 parent，僅寫入 side.txt，沒有額外 SIDE commit。（本輪） |
-| T22 | Commit：rename、文字刪除、Unicode/emoji 內容 | PASS | 舊檔消失、新檔及文字位元組正確；但 rename 預覽不完整，見 BUG-02。（兩輪） |
+| T22 | Commit：rename、文字刪除、Unicode/emoji 內容 | PASS-WITH-UI-DEFECT | 舊檔消失、新檔及文字位元組正確；但 rename 預覽不完整，見 BUG-02。（兩輪） |
 | T23 | Commit：目的地原有 staged／untracked 檔案保留 | PASS | unrelated.txt index blob 不變，沒有混入重播 commits；local-only.txt 保留。（本輪） |
 | T24 | Commit：略過四種 hooks | PASS | pre-commit、prepare-commit-msg、commit-msg、post-commit 均設成 marker+exit1；重播成功且 marker 未出現。（本輪） |
 | T25 | Commit：來源二進位刪除 | FAIL-CONTRACT | payload notCopied=null，實際刪除 binary.dat；與 spec 4.2 不一致。BUG-03。（本輪） |
@@ -83,17 +97,17 @@
 | T29 | Commit：取消部分檔案後拒絕整段重播 | PASS | 取消 side.txt 後拒絕 Apply，HEAD 與磁碟未變。（本輪） |
 | T30 | Commit：未確認覆寫時拒絕重播 | PASS | 缺任一覆寫確認即拒絕，沒有建立部分 commit。（本輪） |
 | T31 | Commit：目的父路徑被一般檔案擋住 | PASS-WITH-UI-DEFECT | 安全拒絕，HEAD/status/阻擋檔內容不變；錯誤露出翻譯 key。BUG-05。（本輪） |
-| T32 | 歷史檔案：Git 歷史刪除檔的單檔複製 | LIMITATION | Copy Files 停用；新增檔可複製。屬明確實作限制，見 LIMIT-01。（前輪 UI、本輪源碼確認） |
+| T32 | 歷史檔案：Git 歷史刪除檔的單檔複製 | LIMITATION-ADDRESSED-ON-DEVELOP | 167c10c 當時：Copy Files 停用；新增檔可複製，屬當時的明確實作限制。develop 068c467 的 #46（fa81aa9）已移除該排除，待實機重驗，見 LIMIT-01。（前輪 UI、本輪源碼確認） |
 | T33 | 歷史：repo filter 與 regex message filter | PASS | ^C[123] 正確留下 3 個 first-parent commits。（本輪） |
 | T34 | 歷史：大歷史清單分頁 | PASS | 實際滾動觸發 50→100→150 筆載入。（本輪） |
 | T35 | 歷史：搜尋未載入的第 500 個 commit | PASS | progressive enhancement 500 找到 d523d45，檔案預覽指出 commit 500。（本輪） |
 | T36 | 歷史：15 repo 全部顯示時的訊息欄 | FAIL | 1080×752 視窗下訊息欄消失；單 repo filter 後恢復。BUG-04。（本輪） |
 | T37 | 資源：100 次真實 repo 切換 | PASS | 涵蓋 15 repo，100 次完成，最後回 repo01；無 crash/hang。（本輪） |
 | T38 | 資源：連續 RSS／footprint／FD／thread 量測 | OBSERVATION | 100 次前後 RSS 中位數 +3.469 MiB；不是 release gate 或無洩漏證明。（本輪） |
-| T39 | 生命週期：關閉工作區、重新開啟、剪貼簿保留 | PASS | 關閉為 0 repo；重開單 repo成功；前後 clipboard SHA256 相同。（本輪） |
+| T39 | 生命週期：關閉工作區、重新開啟、剪貼簿保留 | PASS | 關閉為 0 repo；重開單 repo 成功；前後 clipboard SHA256 相同。（本輪） |
 | T40 | 生命週期：正常 Cmd+Q 退出 | PASS | App quit、PID 消失；384 個曾取樣到的子程序 PID 均不再存活。退出碼未取得。（本輪） |
 
-可供排序或後續追蹤：[test-cases.csv](evidence/test-cases.csv)、[test-cases.json](evidence/test-cases.json)。
+可供排序或後續追蹤的機器可讀版本：[test-cases.json](evidence/test-cases.json)。
 
 ## 4. 可重現問題與優化方向
 
@@ -101,24 +115,43 @@
 
 **重現 A（commit 模式）**：開 `source15/repo01`，Git log 篩 repo01，regex `^C[123]`，選 C1→C3，Copy Commits；到 `target15/repo01` 的 `qa-replay` 貼上。C1/C2 都修改 `common.txt`。第一筆覆寫可勾，第二筆點 checkbox 或文字都無效，點第二列也保留第一列詳細內容。重開乾淨預覽可再次重現；因缺第二筆確認，整段 Apply 被拒絕。
 
-**重現 B（多 repo 檔案模式）**：複製 target15 的 repo01/repo03 staged `unrelated.txt`，主要 repo=repo03；到 source15/repo03 貼上，把 repo01 前綴映射至 source15/repo01。清單有兩個 root、各一個 `unrelated.txt`；第二個覆寫同樣無效。只允許第一個並 Apply，結果覆寫1／跳過1，磁碟沒有寫錯 repo，但無法完成預期的兩檔覆寫。
+**重現 B（多 repo 檔案模式）**：複製 target15 的 repo01/repo03 staged `unrelated.txt`，主要 repo=repo03；到 source15/repo03 貼上，把 repo01 前綴映射至 source15/repo01。清單有兩個 root、各一個 `unrelated.txt`；第二個覆寫同樣無效。只允許第一個並 Apply，結果覆寫 1／跳過 1，磁碟沒有寫錯 repo，但無法完成預期的兩檔覆寫。
 
 高可信度原因：[crates/desktop-native/src/ui/paste.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/ui/paste.rs#L323) 的 row/include/overwrite UI ID 都只包含 `path`，沒有 destination root 或 commit/item 身分。報告未修改程式碼，根因需在修正時用回歸測試確認。
 
-建議：以目的 root + 穩定 operation/item ID 建立唯一控件 ID，commit 模式再包含 commit index；probe ID 也要同步。加入兩個不同 repo 同相對路徑、兩個 commits 同路徑的 `#[gpui::test]`，並以真實 UI 確認兩列都能選取與覆寫。
+建議：以目的 root + 穩定 operation/item ID 建立唯一控件 ID，commit 模式再包含 commit index；probe ID 也要同步。建議的 ID 形狀：`paste-overwrite:<root>:<commit idx>:<path>`（`paste-row:`／`paste-include:` 同理；檔案模式沒有 commit index 時該段省略或固定為 0，實作時需決定並保持一致）。commit 段不必另造編號：develop 上的 `PasteItem.op_index`（`crates/desktop-native/src/paste.rs` L449，`build_commit` 於 L945 以 `c_idx * 1000 + f_idx` 賦值）已同時編碼 commit 與檔案索引，可直接當作穩定 key（`paste-overwrite:<root>:<op_index>`）；但它只在單一計畫內唯一，不含目的 root，root 段仍需要。
+
+**必須同時修改的 driver 與測試**（develop 068c467 中寫死 path-only ID；以下依 `git grep -nE 'paste-(row|include|overwrite)' origin/develop -- crates scripts` 列出，實作時仍應在修改當下重跑一次 grep 確認沒有遺漏）：
+
+- `crates/native-e2e/tests/lifecycle.rs`：L1997、L2020、L2125-2126
+- `crates/native-e2e/tests/smoke.rs`：L1524-1527、L1538、L1626、L1713-1714、L1742、L1748、L1754、L2732、L2983
+- `scripts/check_native_collaboration.py`（collaboration harness）：L1402、L1407、L1443、L1446、L1457、L1459、L3054、L3056
+- `scripts/tests/test_native_collaboration.py`：L1826
+
+另有一處不含 `paste-overwrite:` 字面量、容易漏掉的依賴：`scripts/check_native_collaboration.py` L1404 `ids = [control for control in ids if control.split(":", 1)[1] in paths]` 假設 ID 的第一個 `:` 之後整段就是 path。改成 `paste-overwrite:<root>:<commit idx>:<path>` 後，切出來的是 `<root>:<commit idx>:<path>`，永遠不在 `paths` 內，篩選會靜默丟掉每一個 ID，主迴圈因此一個都不點。之後流程落到 L1442-1456 的逐 path 後備（以舊拼法 `paste-overwrite:{path}` 呼叫 `scroll_in_view`，查不到控制項，例外被吞掉），最後在 L1458-1459 拋出 `MissingControl`；若後備的拼法有同步更新，則會由後備的 `scroll_in_view` 點擊補救，測試照樣通過而掩蓋篩選已失效。這種寫法即使不致靜默通過，也具誤導性，且在後備 ID 未同步更新時是真正的失敗。必須改成解析出最後的 path 段（path 本身可含 `:` 時要用 root／index 的固定格式或另設分隔），L1443、L1446 與 L1457 的 `f"paste-overwrite:{path}"` 也要一併更新。L1407 的 `viewport = bounds.get("paste-items") or bounds.get("paste-row:" + (paths[0] if paths else ""))` 是死指派：`viewport` 在 `click_overwrites` 內從未被使用，實際的捲動目標是 `host`（取自 `bounds["paste-items"]`，缺少時退回 `bounds[ids[0]]`）。這一行仍沿用 path-only 的 `paste-row:` 拼法，不是會壞掉的有效後備，改版時更新或直接刪除即可。
+
+`smoke.rs` L87-90 是 `bounds_line_parsing` 單元測試，只驗證 `[APP:CTRL_BOUNDS]` 解析器能處理含空白與非 ASCII 的 ID，不是 driver 點擊；只有新 ID 格式（例如多出的 `:` 分段）會影響解析時才需要改，否則可保留。Python harness 中 L1402 以 `startswith("paste-overwrite:")` 篩選、L1443-1459 與 L3054 以 `f"paste-overwrite:{path}"` 組 ID，改成含 root 與 commit index 後，這些組 ID 與比對邏輯都要一起調整。
+
+這些位置若不與產品 ID 一起改，BUG-01 修正後 driver 會找不到控件；driver 從 `[APP:CTRL_BOUNDS]` 讀取 probe ID，改動後也要對應更新。
+
+測試配置（依 AGENTS.md）：在 `crates/desktop-native/src/main.rs` 的 `tests::in_process` 加 `#[gpui::test]`，計畫項目涵蓋 (a) 兩個 root 下相同相對路徑、(b) 兩個 commits 修改同一路徑，並斷言每一列都能各自選取與覆寫、Apply 的覆寫確認計數正確。真實 UI 只作補充確認，不取代 in-process 測試。
 
 證據：[commits-payload.txt](evidence/commits-payload.txt)、[reverse-multirepo-payload.txt](evidence/reverse-multirepo-payload.txt)、[reverse-multirepo-oracle.json](evidence/reverse-multirepo-oracle.json)。原始 target15/repo01 尚未成功重播該範圍，可直接作為重現目的地。
 
 ### BUG-02 — P2：commit 預覽未忠實呈現實際執行計畫
 
-1. **Binary SKIP 被算成 CREATE**：C4 新增 `new-binary.bin` 與 `newdir/content.txt`。payload 的 binary 帶 `notCopied=BINARY`，詳細文字顯示 `action: SKIP`，但清單是綠色、原因說將建立新檔、總計「建立2／跳過0」。實際只寫文字檔。
+1. **Binary SKIP 被算成 CREATE**：C4 新增 `new-binary.bin` 與 `newdir/content.txt`。payload 的 binary 帶 `notCopied=BINARY`，詳細文字顯示 `action: SKIP`，但清單是綠色、原因說將建立新檔、總計「建立 2／跳過 0」。實際只寫文字檔。
 2. **Rename 舊路徑未揭露**：顯示新路徑 CREATE，未顯示 old.txt 被刪除，刪除總數也沒有含這個動作；實際重播確實刪舊、寫新。
-3. **空 commit 沒有可審查資訊**：貼一個 `files=[]` 的 commit，預覽0項、建立0，畫面沒有 message／作者／時間，但 Apply 真的建立1個 commit。
+3. **空 commit 沒有可審查資訊**：貼一個 `files=[]` 的 commit，預覽 0 項、建立 0，畫面沒有 message／作者／時間，但 Apply 真的建立 1 個 commit。
 4. 多個 commits 被攤平成依路徑排序的檔案清單，沒有清楚的 N 個 commit 順序及每個 commit 的完整分組，不易理解同路徑反覆修改。
 
 程式線索：[paste_op](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/ui/mod.rs#L476) 依 selected/is_delete/dest_exists 決定顏色與原因，沒有優先處理 `action_label=SKIP`；[build_commit](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/paste.rs#L912) 建立以檔案為主的預覽。規格要求見 [docs/spec.md](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/docs/spec.md#L101)。
 
 建議：直接以 replay plan 呈現 commit 分組與順序，明示 skip reason、rename old→new、空 commit；將「commit 數」與「檔案動作數」分開。統計、每列原因與最終動作必須同源。
+
+程式碼層級的修正點：`paste_op` 必須先處理 `action_label == "SKIP"`（由 `not_copied` 經 `ReplayAction::Skip` 而來；`PasteItem` 本身沒有 `not_copied` 欄位，也可改讓它攜帶跳過原因），再判斷 delete／create／overwrite，使 BINARY 等已標記為未複製的項目得到 SKIP，而不是落入 `op_create`。摘要的建立／跳過計數與每列顏色必須由同一個函式產生，不能各自推導。
+
+測試配置：同樣在 `tests::in_process` 加 `#[gpui::test]`，用含 BINARY `not_copied` 項目、rename、空 commit 的計畫，斷言該列為 SKIP、摘要「建立／跳過」數與列表一致、rename 的舊路徑被列為刪除。
 
 證據：[c4-payload.txt](evidence/c4-payload.txt)、[c4-repeat-oracle.json](evidence/c4-repeat-oracle.json)、[empty-commit-payload.txt](evidence/empty-commit-payload.txt)、[reverse-empty-commit-oracle.json](evidence/reverse-empty-commit-oracle.json)。
 
@@ -130,58 +163,76 @@ C2 刪除含 NUL／非 UTF-8 的 `binary.dat`。產出的 commit payload 是 `DE
 
 這是**已確認的行為與規格衝突**；應先決定產品是否允許傳播 binary deletion。若維持規格，需檢查刪除前 blob 並產生 notCopied；若刻意允許，需明確修改契約與接受差異，並以測試鎖定。不要在未決定語意前只修改 UI 文案。
 
+補充（讀 develop 068c467 程式碼）：
+
+- commit 模式是 snip-sync 專有功能（`docs/spec.md` 表格約 L22 註明 IDE 套件不認得），TS 參考實作不約束它，因此這**純粹是規格決策**，不是與 ClipCode／ClipCodeVSCode 的位元組相容問題。
+- `crates/core/src/gitsrc.rs` 的 `RawEntry`（約 L449-458）已帶 `old_oid`，要檢查刪除前 blob 是否為二進位，資料上可行。
+- 兩條具體路徑：(a) 維持規格：讓 Deleted 也檢查 `old_oid` 指向的 blob，二進位時標為 `notCopied`；測試為 `crates/core` 的單元測試（Deleted 且為二進位的 entry）。(b) 允許傳播二進位刪除：修改 `docs/spec.md`，並把這項寫入 `docs/porting-notes.md` 的「已知且接受的差異」，否則之後的移植會把它「修回去」。
+
 證據：[commits-payload.txt](evidence/commits-payload.txt) 中 binary.dat、[commit-replay-oracle.json](evidence/commit-replay-oracle.json) 的 `binaryPreserved=false`。
 
 ### BUG-04 — P2：15 repo 的 Git log 訊息欄被擠掉
 
-在 1080×752 視窗、perf15、全部 repos、首50列時，graph、refs、作者與時間仍顯示，commit message 區卻無文字。點選列後右側 details 有真正的 message。篩成 repo-01-core 後訊息欄立即恢復，資料未遺失。
+在 1080×752 視窗、perf15、全部 repos、首 50 列時，graph、refs、作者與時間仍顯示，commit message 區卻無文字。點選列後右側 details 有真正的 message。篩成 repo-01-core 後訊息欄立即恢復，資料未遺失。
 
-疑似原因：[crates/desktop-native/src/ui/log_view.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/ui/log_view.rs#L615) 的 subject 可用寬度由固定欄與 gutter 相減，未保留 minimum subject width。建議限制多 repo 圖形／ref 寬度、讓作者日期或側面板有可折疊優先序，驗收 1080 與900寬下至少能看到可辨識的訊息。
+疑似原因：[crates/desktop-native/src/ui/log_view.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/ui/log_view.rs#L615) 的 subject 可用寬度由固定欄與 gutter 相減，未保留 minimum subject width。建議限制多 repo 圖形／ref 寬度、讓作者日期或側面板有可折疊優先序，驗收 1080 與 900 寬下至少能看到可辨識的訊息。
+
+develop 068c467 對照：`log_view.rs` 在 #46 有變動（repo 與 paths 篩選 chip 合併、changed files shift-click 多選），`subject_room` 的公式（`log_view.rs` L621-625）沒有改，但其輸入之一 `labels_w` 變了：#46 的「記錄的分支標籤合併」讓 `ui/log.rs` 的 `ref_label_elements` 每列改為渲染單一 `graph_view::combined_label`（上限 320px，先前每個標籤上限 160px）。公式不變、輸入改變，可能加重或減輕擠壓，無法由讀碼判定，因此大概仍存在，必須以真實 UI 在 1080 寬重驗。
+
+測試配置：這是版面計算，放 `tests::in_process`，以固定 1080 寬 render 多 repo 的 log，斷言 subject 欄寬不低於設定的最小值；不需要 e2e。
 
 ### BUG-05 — P3：不安全父路徑顯示翻譯 key
 
 target15/repo04 的 `newdir` 是一般檔案。貼 C4 時安全拒絕，但狀態顯示 `paste_err_destination (Not a directory (os error 20))`，沒有清楚指出阻擋路徑。HEAD、status、原檔內容都不變。
 
-建議補齊 i18n key，顯示具體目標路徑與可理解原因；見 [crates/desktop-native/src/paste.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/paste.rs#L886)。證據：[c4-repeat-oracle.json](evidence/c4-repeat-oracle.json)。
+建議補齊 i18n key，顯示具體目標路徑與可理解原因；見 [crates/desktop-native/src/paste.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/paste.rs#L880)。證據：[c4-repeat-oracle.json](evidence/c4-repeat-oracle.json)。
 
 ### BUG-06 — P3：commit 複製通知缺少略過資訊
 
-C4 包含一個 BINARY 未複製檔，通知只說「已複製1個 commit」。未顯示檔案數、字元數、未複製數與所屬 commit，與 [docs/spec.md](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/docs/spec.md#L94)、[docs/spec.md](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/docs/spec.md#L97) 不符。現有文案見 [crates/desktop-native/src/i18n.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/i18n.rs#L266)。
+C4 包含一個 BINARY 未複製檔，通知只說「已複製 1 個 commit」。未顯示檔案數、字元數、未複製數與所屬 commit，與 [docs/spec.md](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/docs/spec.md#L94)、[docs/spec.md](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/docs/spec.md#L97) 不符。現有文案見 [crates/desktop-native/src/i18n.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/i18n.rs#L266)。
 
 建議通知摘要至少含 commit 數、檔案數、未複製數，並能在預覽看到具體檔名與原因。
 
-### LIMIT-01 — 歷史刪除檔不能從 changed-files 選單單獨複製
+### LIMIT-01 — 歷史刪除檔不能從 changed-files 選單單獨複製（develop 已處理，待重驗）
 
-前輪實測：歷史新增檔的 Copy Files 可用；歷史刪除檔則停用。[crates/desktop-native/src/menu.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/menu.rs#L74) 明確將 deleted 檔排除，這是現有實作的選擇，不標成偶發故障。staged 刪除與整個 commit 刪除的流程可以使用。
+**develop 068c467 現況**：`fa81aa9`（#46）已移除 `menu.rs` 對 Deleted 的排除，刪除檔現在以 `[DELETED]` 加刪除前內容複製，行為同 TS graphCopy。以下 167c10c 當時的觀察保留作紀錄，需在 develop 實機重驗後才能結案。
 
-若產品希望「從 Git 歷史複製刪除動作、到另一處套用」，應提供帶 `[DELETED]` 的變更複製入口，並與「複製該版本的檔案快照」清楚區分。
+**167c10c 當時**：前輪實測：歷史新增檔的 Copy Files 可用；歷史刪除檔則停用。[crates/desktop-native/src/menu.rs](https://github.com/audichuang/snip-sync/blob/167c10cd647fdadc1c0711f94b74940d8490f528/crates/desktop-native/src/menu.rs#L74) 明確將 deleted 檔排除，這是現有實作的選擇，不標成偶發故障。staged 刪除與整個 commit 刪除的流程可以使用。
+
+當時的建議是若產品希望「從 Git 歷史複製刪除動作、到另一處套用」，應提供帶 `[DELETED]` 的變更複製入口，並與「複製該版本的檔案快照」清楚區分；#46 已朝此方向實作，重驗時一併確認 `[DELETED]` 與檔案快照兩種複製在選單上是否夠清楚。
 
 ## 5. 有沒有真的建立 commit：Git 證據
 
 本輪的 App 重播目標是獨立初始化的 repo，沒有依賴相同 commit hash 或共同祖先。重播疊在目的地目前分支。以下 commit 不是 fixture setup 建立的。
 
-| 來源／操作 | App 建立的 commit | 核對 |
-|---|---|---|
-| C1 多行中文訊息 | `0facbf366bff29fa50446c72525a67f71672c308` | message、author name/email、author date 完全相等 |
-| C2 rename/delete | `f547ad9a35e38954646b5936907575130349152e` | metadata 相等；common修改、文字與binary刪除、rename 實際存在 |
-| C3 merge | `fea37e31ee2108cde2ab3fe3ed04ff9bdbaefb96` | metadata 相等；一個 parent，side.txt 正確 |
-| C4 首次 | `ada59fa1c2e3bc5f570a6b063d4a940d08878938` | 文字提交；binary不寫入 |
-| C4 重複貼上 | `fb61985f671c1fe06ceead5a0b909450006330f0` | 新 SHA，tree 與上一個相同；確實是空 commit |
-| 反向貼空 commit 到 source15/repo05 | `465deadc5a2c49af46403f90861f8c6c99b7ccda` | before..HEAD=1，tree 不變、working tree clean |
+| 來源／操作 | 目的 repo／branch | before SHA | App 建立的 commit | 核對 |
+|---|---|---|---|---|
+| C1 多行中文訊息 | target15/repo03／`qa-replay` | `98975631ccfe7d5a82d6d4a5c76ec02ab8557a6c` | `0facbf366bff29fa50446c72525a67f71672c308` | message、author name/email、author date 完全相等 |
+| C2 rename/delete | target15/repo03／`qa-replay` | `0facbf3…`（C1 的結果；依同一分支連續重播推得，oracle 未單獨記錄） | `f547ad9a35e38954646b5936907575130349152e` | metadata 相等；common 修改、文字與 binary 刪除、rename 實際存在 |
+| C3 merge | target15/repo03／`qa-replay` | `f547ad9…`（C2 的結果；同上推得） | `fea37e31ee2108cde2ab3fe3ed04ff9bdbaefb96` | metadata 相等；一個 parent，side.txt 正確 |
+| C4 首次 | 未記錄 | 未記錄 | `ada59fa1c2e3bc5f570a6b063d4a940d08878938` | 文字提交；binary 不寫入 |
+| C4 重複貼上 | 未記錄（與 C4 首次同一目的地） | `ada59fa…`（C4 首次的結果；由重複貼上順序推得） | `fb61985f671c1fe06ceead5a0b909450006330f0` | 新 SHA，tree 與上一個相同；確實是空 commit |
+| 反向貼空 commit 到 source15/repo05 | source15/repo05／branch 未記錄 | `275f92a5984dbfa1f1e6c47013fafce731be1bc3` | `465deadc5a2c49af46403f90861f8c6c99b7ccda` | before..HEAD=1，tree 不變、working tree clean |
 
-本輪 target15/repo03 的 before=`98975631ccfe7d5a82d6d4a5c76ec02ab8557a6c`，分支 `qa-replay`。不拿整個 source tree 與 target tree 相等作為本輪判準，因兩邊獨立 baseline、README 與 unrelated 檔本來就不同；核對的是每個提交的 metadata、涉及的 paths／位元組、parent 順序，以及非涉及 staged blob 保留。
+上表共 6 列，即 §1 所說本輪從 App 建立的 6 個新 commit。「未記錄」表示報告與 evidence JSON 都沒有寫明；標「推得」者是依連續重播順序推論，並非 oracle 直接記錄的值。
 
-[commit-replay-oracle.json](evidence/commit-replay-oracle.json)；[c4-repeat-oracle.json](evidence/c4-repeat-oracle.json)；[reverse-empty-commit-oracle.json](evidence/reverse-empty-commit-oracle.json)。前輪另外3個重播 SHA=`cf549aa…`、`e5c2d01…`、`2f20cc3…`，本輪重核每筆 metadata **與 tree** 都相等：[previous-round-oracle.json](evidence/previous-round-oracle.json)。
+**C1 的 `common.txt` 為何在目的端顯示為 `A`**：來源 payload 標示 C1 對 `common.txt` 是 MODIFIED，但 [commit-replay-oracle.json](evidence/commit-replay-oracle.json) 的 C1 `changes` 是 `A\tcommon.txt`。原因是 target15/repo03 原本沒有 `common.txt`，MODIFIED 項目在目的端等同建立該檔，Git 因此記為新增；這是預期行為，不是計畫與結果不符。C1 建立該檔後，C2 對 `common.txt` 的變更才顯示為 `M`。
+
+不拿整個 source tree 與 target tree 相等作為本輪判準，因兩邊獨立 baseline、README 與 unrelated 檔本來就不同；核對的是每個提交的 metadata、涉及的 paths／位元組、parent 順序，以及非涉及 staged blob 保留。
+
+[commit-replay-oracle.json](evidence/commit-replay-oracle.json)；[c4-repeat-oracle.json](evidence/c4-repeat-oracle.json)；[reverse-empty-commit-oracle.json](evidence/reverse-empty-commit-oracle.json)。前輪另外 3 個重播 SHA=`cf549aa…`、`e5c2d01…`、`2f20cc3…`，本輪重核每筆 metadata **與 tree** 都相等：[previous-round-oracle.json](evidence/previous-round-oracle.json)。
 
 ## 6. 記憶體與資源結果
 
-### 量測方法
+本節是 macOS 上的觀察性量測，**T38 是觀察（OBSERVATION），不是 gate 結果**，不能當成 `native-resources-short/long` 或 D4 release gate 通過的證據。量測口徑與 [`docs/memory-measurement-protocol.md`](../../memory-measurement-protocol.md)（Linux、名義約 50 ms 取樣、process-cold、`smaps_rollup` RSS/PSS）的差異如下，兩者數字不可直接比較：
 
-- 以 macOS `ps -axo pid,ppid,rss,%cpu,comm` 每名義500ms取樣，按當時 PPID 遞迴加總 App 程序樹 RSS。實際間隔 median=0.5051秒、p95=0.5053秒、最大=0.5103秒。
-- 共 4060 筆，其中 4059 筆為活程序；最後一筆是正常退出事件。退出後的0值**不納入活程序記憶體統計**。
-- RSS 單位由 KiB /1024 轉為 MiB。`vmmap -summary` 的 physical footprint 另列，保留工具的 M 單位，不能把它與 RSS/PSS 混用。
-- idle 窗均超過30秒。操作 phase 含 UI操作、工具與思考間隔，duration 不能當工作完成時間或效率 benchmark。100 次 selection 第一至最後觀察約205秒，完整量測 phase 較長。
-- 這是暖程序順序測試；未清除 filesystem cache、未量 process-cold launch、未量 Linux PSS，也沒有分別量 GPU／WindowServer。500ms 取樣會漏掉更短的 Git 子程序或瞬時峰值。
+- 取樣間隔：本輪名義 500 ms（實際 median 0.5051 秒），協議為名義約 50 ms。
+- 程序狀態：本輪 attach 到取樣前已運行約 44 分鐘的暖程序，協議要求每輪全新的 process-cold 程序樹。
+- 指標來源：本輪為 macOS `ps` RSS，協議為 Linux `smaps_rollup` RSS／PSS；本輪沒有 PSS。
+- FD：本輪開始時沒有可靠的 FD 基線。
+- 隔離：本輪沒有私有 XDG 目錄與私有 D-Bus session。
+
+另請注意：`vmmap` 的 physical footprint（以 `M` 表示）與 RSS（MiB）是不同的指標，數值不可互相比較或混用。詳細取樣方式見[附錄 A](#附錄-a記憶體量測方法)。
 
 ### 程序樹 RSS
 
@@ -198,57 +249,105 @@ C4 包含一個 BINARY 未複製檔，通知只說「已複製1個 commit」。�
 | 重新開單 repo 暖程序穩態 | 54.55 / 109 | 138.047 | 138.250 | 138.297 | 1 |
 
 
-100次前後：中位數 **+3.469 MiB（約2.6%）**；結尾52秒窗固定在136.219 MiB。切換後樹列保留了較多展開狀態，雖回到同一 repo／Changes／預覽內容，畫面不是完全相同的展開狀態。觀察到 retained 增量，無法單靠此數值區分快取、allocator保留或洩漏。
+100 次前後：中位數 **+3.469 MiB（約 2.6%）**；結尾 52 秒窗固定在 136.219 MiB。切換後樹列保留了較多展開狀態，雖回到同一 repo／Changes／預覽內容，畫面不是完全相同的展開狀態。觀察到 retained 增量，無法單靠此數值區分快取、allocator 保留或洩漏。
 
-後續分頁／搜尋後 RSS 約138.3 MiB；關閉工作區78秒仍約138.3 MiB，重開單repo約138.0 MiB。**工作區關閉未立即讓 RSS 回到起點129.7 MiB**，適合列為後續 profiler 調查項目；目前增量規模約8.6 MiB，沒有取得 heap allocation stack，不能斷言是洩漏。
+後續分頁／搜尋後 RSS 約 138.3 MiB；關閉工作區 78 秒仍約 138.3 MiB，重開單 repo 約 138.0 MiB。**工作區關閉未立即讓 RSS 回到起點 129.7 MiB**，適合列為後續 profiler 調查項目；目前增量規模約 8.6 MiB，沒有取得 heap allocation stack，不能斷言是洩漏。
 
 ### Physical footprint 與其他資源
 
 | 時點 | footprint（vmmap 原值） | App 生命週期 footprint peak（原值） | 數字 FD | thread |
 |---|---:|---:|---:|---:|
-| 本輪開始 | 74.5M | 100.8M | 本輪初始未取可靠數字FD基線 | — |
+| 本輪開始 | 74.5M | 100.8M | 本輪初始未取可靠數字 FD 基線 | — |
 | perf15 切換前 | 76.4M | 104.0M | 5 | 7 |
-| 100次後及再閒置 | 79.8M | 106.9M | 5 | 5 |
+| 100 次後及再閒置 | 79.8M | 106.9M | 5 | 5 |
 | 關閉工作區 | 81.5M | 109.0M | 5 | 6 |
 | 重開單 repo | 81.5M | 109.0M | 5 | 5 |
 | 退出前 | 81.8M | 109.0M | 5 | 5 |
 
-footprint peak 是這個已運行很久的 App 的生命週期峰值，包含本輪開始前活動，不能說成某一操作的峰值。`ps %cpu` 取樣中位數在 idle約0.3%、切換約0.4%，僅為系統平滑估計，不是精準CPU工時。
+footprint peak 是這個已運行很久的 App 的生命週期峰值，包含本輪開始前活動，不能說成某一操作的峰值。`ps %cpu` 取樣中位數在 idle 約 0.3%、切換約 0.4%，僅為系統平滑估計，不是精準 CPU 工時。
 
-取樣到的閒置窗均只剩主程序；100次切換區間最多3個並行程序，commit操作區間最多5個。整輪曾捕捉384個子程序PID，正常Cmd+Q後皆不再存活。主PID也消失。因為是 attach，未取得 App exit code，**不宣稱 exit0**。
+取樣到的閒置窗均只剩主程序；100 次切換區間最多 3 個並行程序，commit 操作區間最多 5 個。整輪曾捕捉 384 個子程序 PID，正常 Cmd+Q 後皆不再存活。主 PID 也消失。因為是 attach，未取得 App exit code，**不宣稱 exit 0**。
 
 此結果不等同 `native-resources-short/long` 或 D4 release gate。現階段更應先修正 BUG-01／02，再用固定 release binary、固定 warmup、相同展開狀態、至少多輪及更長 soak 重測 retained heap。
 
-資料：[memory-summary.json](evidence/memory-summary.json)、原始 process sample 含程序與本機路徑資訊，留存在本機測試附件，未納入 repo；[memory-timeline.csv](evidence/memory-timeline.csv)、[quit-oracle-summary.json](evidence/quit-oracle-summary.json)。
+資料：[memory-summary.json](evidence/memory-summary.json)、原始 process sample 含程序與本機路徑資訊，留存在本機測試附件，未納入 repo；[memory-timeline.csv.gz](evidence/memory-timeline.csv.gz)（gzip 壓縮，共 4061 行含表頭，讀取：`gzip -dc evidence/memory-timeline.csv.gz`）、[quit-oracle-summary.json](evidence/quit-oracle-summary.json)。
 
 ## 7. 建議的修正與回歸順序
 
-1. **先修 BUG-01**：讓每個 row/include/overwrite/probe ID 唯一。回歸兩個repo同路徑、兩個commits同路徑、rename前後重用路徑；確認兩列詳細內容與各自覆寫都能操作。
-2. **重做 commit 預覽資料呈現**：直接以 commit/replay action 分組，顯示 commit 數、順序、rename舊路徑、binary skip reason、空 commit metadata；統計與執行一致。
-3. **決定 binary deletion 契約**，再修 core 或明文紀錄接受差異；同時補 binary新增／修改／刪除／rename 的整套情境。
-4. **修 multi-repo log 最小訊息寬度**，再補通知與翻譯。以1080與900寬、15repo多lane圖形驗收。
-5. **記憶體優化依 profiler 證據進行**：先量 workspace close 前後的 owned model/cache、preview/tab/graph retained bytes，再量 allocator resident retention；不要僅以 RSS 未下降就刪快取或調整上限。
+以下順序以 develop 068c467 為基準（見 §1.1），每項標註依 AGENTS.md 應採用的測試類型。
 
-依 repo 的 AGENTS.md，UI state 回歸放 in-process `#[gpui::test]`；OS剪貼簿／真實輸入放 native-e2e；跨repo提交語意放 collaboration case。這次是測試與報告，沒有程式碼變更，因此未代替修正執行 preflight／push。
+1. **先修 BUG-01**：讓每個 row/include/overwrite/probe ID 唯一（建議 `paste-overwrite:<root>:<commit idx>:<path>`），並在**同一個變更**更新所有寫死 path-only ID 的 driver 與測試：`lifecycle.rs`、`smoke.rs`、`scripts/check_native_collaboration.py`、`scripts/tests/test_native_collaboration.py`（完整位置見 BUG-01，動手前先重跑 grep；`smoke.rs` L87-90 的解析器單元測試通常不必改）。回歸兩個 repo 同路徑、兩個 commits 同路徑、rename 前後重用路徑。測試類型：`tests::in_process` 的 `#[gpui::test]`（UI 狀態與互動）；既有 native-e2e driver 與 Python collaboration harness 隨 ID 更新，並需跑 `just preflight`（含 harness 測試與 18 個 collaboration case）。
+2. **修 BUG-02 並重做 commit 預覽資料呈現**：`paste_op` 先處理 `action_label == "SKIP"`（或讓 `PasteItem` 攜帶跳過原因）；摘要計數與每列顏色同源；顯示 commit 數、順序、rename 舊路徑、binary skip reason、空 commit metadata。測試類型：`tests::in_process` 的 `#[gpui::test]`。
+3. **決定 binary deletion 契約（BUG-03）**，再修 core 或明文紀錄接受差異；同時補 binary 新增／修改／刪除／rename 的整套情境。維持規格：`crates/core` 單元測試；允許傳播：改 `docs/spec.md` 並寫入 `docs/porting-notes.md`「已知且接受的差異」。若要驗證跨機檔案／commit 語意，另加 collaboration manifest step。
+4. **修 multi-repo log 最小訊息寬度（BUG-04）**：先在 develop 以真實 UI 重驗，再修。測試類型：`tests::in_process` 固定 1080 寬 render，斷言最小 subject 寬度；900 寬作為人工驗收。
+5. **補通知與翻譯（BUG-05、BUG-06）**：補 `paste_err_destination` key 並顯示具體路徑；commit 複製通知含 commit 數、檔案數、未複製數。測試類型：純字串／格式邏輯用單元測試，狀態列顯示用 `tests::in_process`。
+6. **LIMIT-01 不需要再修改程式**：#46 已處理，只需在 develop 實機重驗 `[DELETED]` 複製與貼上流程，通過後把 T32 改為 PASS。
+7. **記憶體優化依 profiler 證據進行**：先量 workspace close 前後的 owned model/cache、preview/tab/graph retained bytes，再量 allocator resident retention；不要僅以 RSS 未下降就刪快取或調整上限。量測口徑以 `docs/memory-measurement-protocol.md` 為準（Linux、名義約 50 ms 取樣、process-cold、`smaps_rollup` RSS/PSS）；本輪是 macOS 500 ms `ps` RSS、attach 的 44 分鐘暖程序、無 PSS、開始時無 FD 基線，兩者不可直接比較。
+
+依 repo 的 AGENTS.md，UI state 回歸放 in-process `#[gpui::test]`；OS 剪貼簿／真實輸入放 native-e2e；跨 repo 提交語意放 collaboration case；純邏輯放 `crates/core` 單元測試。這次是測試與報告，沒有程式碼變更，因此未代替修正執行 preflight／push。
 
 ## 8. 尚未覆蓋，不能由本報告推論通過
 
-- Windows/Linux 真實輸入、IME、跨機剪貼簿/RDP傳輸。A/B 是同一台 Mac 的獨立資料夾。
+- Windows/Linux 真實輸入、IME、跨機剪貼簿/RDP 傳輸。A/B 是同一台 Mac 的獨立資料夾。
 - 與 ClipCode/ClipCodeVSCode 的實際 UI 互貼；本輪只有 snip-sync UI，未重新跑 byte contract suite。
-- standard 的15×10,000 paths×20,000 commits、500次切換／600秒long gate、多輪冷程序、受控 filesystem cold cache。
-- 真實 Git replay 第N個 commit 失敗後的部分成功保留、磁碟滿／权限變化／缺 user identity、預覽後 HEAD/index 被改的完整矩陣。
-- symlink traversal、惡意路徑字元、非UTF-8檔名、submodule/gitlink、sparse checkout、linked worktree、network filesystem 的完整安全矩陣。
-- 視窗900×600、light theme、tray/hide、長時背景待機、無障礙操作的完整驗收。
-- 長時間heap leak定位、GPU與WindowServer獨立量測、精確使用者操作延遲。
+- standard 的 15×10,000 paths×20,000 commits、500 次切換／600 秒 long gate、多輪冷程序、受控 filesystem cold cache。
+- 真實 Git replay 第 N 個 commit 失敗後的部分成功保留、磁碟滿／權限變化／缺 user identity、預覽後 HEAD/index 被改的完整矩陣。
+- symlink traversal、惡意路徑字元、非 UTF-8 檔名、submodule/gitlink、sparse checkout、linked worktree、network filesystem 的完整安全矩陣。
+- 視窗 900×600、light theme、tray/hide、長時背景待機、無障礙操作的完整驗收。
+- 長時間 heap leak 定位、GPU 與 WindowServer 獨立量測、精確使用者操作延遲。
 
 ## 9. 留存資料與重現方式
 
 完整原始產物與暫存 fixtures 保留在本機測試附件；repo 只保存去識別化報告、摘要與可分享的測試輸入／結果。
 
-- 功能輸出：[file-matrix-oracle.json](evidence/file-matrix-oracle.json)、[stale-file-oracle.json](evidence/stale-file-oracle.json)、[non-git-oracle.json](evidence/non-git-oracle.json)、各 commit／多repo oracle。
+- 功能輸出：[file-matrix-oracle.json](evidence/file-matrix-oracle.json)、[stale-file-oracle.json](evidence/stale-file-oracle.json)、[non-git-oracle.json](evidence/non-git-oracle.json)、各 commit／多 repo oracle。
 - 可檢視 payload：[commits-payload.txt](evidence/commits-payload.txt)、[c4-payload.txt](evidence/c4-payload.txt)、[file-matrix-payload.txt](evidence/file-matrix-payload.txt)、[reverse-multirepo-payload.txt](evidence/reverse-multirepo-payload.txt)。
 - 本次 UI 操作皆由 Computer Use 執行；Shell 僅用於建立可丟棄 fixtures、唯讀核對 Git／檔案結果及量測。
 - 記憶體資料包含每 500 ms 的去識別化時間序列與彙總；原始程序取樣留在本機測試附件。
 - perf fixture 原始命令：`python3 scripts/workload_generator.py <新的空目錄> --repos 15 --files 1000 --commits 1000 --refs 30 --quiet`。
 
+### 待補證據
+
+BUG-01、02、04、05 的 UI 截圖只存在於測試當時的對話，repo 內沒有對應截圖檔（見 §2 的 UI 證據列）。在 develop 重驗時，各項需補一張去識別化截圖（遮蔽本機路徑、使用者名稱與 email），畫面狀態如下：
+
+| 項目 | 需擷取的畫面狀態 |
+|---|---|
+| BUG-01 | 貼上預覽清單中同一相對路徑出現兩列（commit 模式的 `common.txt` 或多 repo 的 `unrelated.txt`），第二列覆寫 checkbox 未勾選、點擊無反應，且 Apply 被拒絕的狀態 |
+| BUG-02 | C4 commit 預覽：`new-binary.bin` 的詳細文字為 `action: SKIP`，但列表為綠色建立、摘要「建立 2／跳過 0」；另可補 rename 預覽與空 commit 預覽（0 項、無 message／作者／時間） |
+| BUG-04 | 1080×752 視窗、perf15、全部 repos 的 Git log 首 50 列，graph、refs、作者、時間有顯示但訊息欄空白；再附篩成單一 repo 後訊息欄恢復的對照圖 |
+| BUG-05 | 對 `newdir` 為一般檔案的目的 repo 貼 C4 後，狀態列顯示 `paste_err_destination (Not a directory (os error 20))` 的畫面 |
+
+BUG-03、BUG-06 主要由 payload、oracle 與通知文字佐證；BUG-06 若重驗仍存在，也建議附通知截圖。
+
+### 重驗清單（develop 068c467）
+
+給在 develop 重新實測的人。下列情境沿用 §3 的 ID；「修正後預期」是目標行為，不是已驗證的結果。
+
+| 情境 | 修正後預期 |
+|---|---|
+| T03 | 兩個 `unrelated.txt` 各自可勾選覆寫，兩份都套用，覆寫 2／跳過 0 |
+| T18 | C1、C2 兩列 `common.txt` 覆寫都可各自確認，Apply 成功，3 個 commits 全部重播，`git rev-list before..HEAD` = 3 |
+| T26 | C4 的 `new-binary.bin` 預覽為 SKIP（非 CREATE），摘要建立／跳過與每列一致，實際仍只提交文字檔 |
+| T28 | 空 commit 預覽顯示 message、作者與時間；Apply 仍建立 1 個空 commit（另可一併重驗 T22 的 rename 舊路徑顯示為刪除） |
+| T31 | 錯誤訊息為可讀文字並指出阻擋路徑，不再出現 `paste_err_destination`；HEAD／status／阻擋檔內容不變 |
+| T32 | 歷史刪除檔的 Copy Files 可用，複製結果為 `[DELETED]` 加刪除前內容；貼上流程正確。通過後 T32 改為 PASS、LIMIT-01 結案 |
+| T36 | 1080×752、perf15、全部 repos 下訊息欄仍有可辨識文字（900 寬人工確認） |
+| BUG-06 通知 | 複製含 BINARY 未複製檔的 C4 後，通知含 commit 數、檔案數、未複製數，而非只有「已複製 1 個 commit」 |
+
+T25（BUG-03）需先決定契約（見 BUG-03），決定前沒有預期結果可驗。
+
+### 本分支的驗證範圍
+
+此分支只有文件變更，未動產品程式碼。在 macOS 上執行 `just preflight` 會因環境失敗（沒有 `/proc`、沒有 `xvfb-run`；Python harness 17 fail／30 error），與本分支內容無關；以 Linux CI 為準。
+
+### 其他說明
+
 報告中的 source links 指向此次測試 checkout 的行號。修正程式後行號可能改變；原始判斷以本報告記錄的 source SHA 為準。測試用剪貼簿最後內容是 `QA invalid clipboard payload`；測試 App 已關閉，fixture 與報告未清除。
+
+## 附錄 A：記憶體量測方法
+
+- 以 macOS `ps -axo pid,ppid,rss,%cpu,comm` 每名義 500 ms 取樣，按當時 PPID 遞迴加總 App 程序樹 RSS。實際間隔 median=0.5051 秒、p95=0.5053 秒、最大=0.5103 秒。
+- 共 4060 筆，其中 4059 筆為活程序；最後一筆是正常退出事件。退出後的 0 值**不納入活程序記憶體統計**。
+- RSS 單位由 KiB /1024 轉為 MiB。`vmmap -summary` 的 physical footprint 另列，保留工具的 M 單位；如 §6 開頭所述，兩者不可比較。
+- idle 窗均超過 30 秒。操作 phase 含 UI 操作、工具與思考間隔，duration 不能當工作完成時間或效率 benchmark。100 次 selection 第一至最後觀察約 205 秒，完整量測 phase 較長。
+- 這是暖程序順序測試；未清除 filesystem cache、未量 process-cold launch、未量 Linux PSS，也沒有分別量 GPU／WindowServer。500 ms 取樣會漏掉更短的 Git 子程序或瞬時峰值。

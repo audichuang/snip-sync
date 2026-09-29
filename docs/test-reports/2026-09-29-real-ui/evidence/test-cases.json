@@ -171,7 +171,7 @@
     "id": "T22",
     "category": "Commit",
     "scenario": "rename、文字刪除、Unicode/emoji 內容",
-    "status": "PASS",
+    "status": "PASS-WITH-UI-DEFECT",
     "round": "兩輪",
     "result": "舊檔消失、新檔及文字位元組正確；但 rename 預覽不完整，見 BUG-02。"
   },
@@ -251,9 +251,9 @@
     "id": "T32",
     "category": "歷史檔案",
     "scenario": "Git 歷史刪除檔的單檔複製",
-    "status": "LIMITATION",
+    "status": "LIMITATION-ADDRESSED-ON-DEVELOP",
     "round": "前輪 UI、本輪源碼確認",
-    "result": "Copy Files 停用；新增檔可複製。屬明確實作限制，見 LIMIT-01。"
+    "result": "167c10c 當時：Copy Files 停用；新增檔可複製，屬當時的明確實作限制。develop 068c467 的 #46（fa81aa9）已移除該排除，待實機重驗，見 LIMIT-01。"
   },
   {
     "id": "T33",
@@ -309,7 +309,7 @@
     "scenario": "關閉工作區、重新開啟、剪貼簿保留",
     "status": "PASS",
     "round": "本輪",
-    "result": "關閉為 0 repo；重開單 repo成功；前後 clipboard SHA256 相同。"
+    "result": "關閉為 0 repo；重開單 repo 成功；前後 clipboard SHA256 相同。"
   },
   {
     "id": "T40",
