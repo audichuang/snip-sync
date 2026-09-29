@@ -1285,7 +1285,9 @@ class NativeSession:
         )
         self._close_fd(write_fd)
         self.owned.append(identity(self.xvfb.pid))
-        ready, _, _ = select.select([read_fd], [], [], 15.0)
+        # Under load Xvfb (xkbcomp, display-number probing) can take well over 15 s; giving up closes
+        # the pipe and Xvfb then dies with "Cannot write display number to fd N".
+        ready, _, _ = select.select([read_fd], [], [], 60.0)
         display = os.read(read_fd, 64).decode().strip() if ready else ""
         self._close_fd(read_fd)
         if not display.isdigit():
