@@ -1468,9 +1468,28 @@ impl PastePreviewPlan {
 	}
 
 	/// Folds or unfolds one commit's file rows.
+	/// When the fold hides the selected row, the selection moves to the next
+	/// visible row (the previous one at the end), so Space and the detail
+	/// pane never act on a row the user cannot see.
 	pub fn toggle_commit_collapsed(&mut self, c: usize) {
+		let before = self.display_order();
 		if !self.collapsed_commits.remove(&c) {
 			self.collapsed_commits.insert(c);
+		}
+		let after = self.display_order();
+		if after.contains(&self.selected_item_idx) {
+			return;
+		}
+		let Some(pos) =
+			before.iter().position(|&i| i == self.selected_item_idx)
+		else {
+			return;
+		};
+		let visible = |i: &&usize| after.contains(i);
+		let next = before[pos..].iter().find(visible);
+		let prev = before[..pos].iter().rev().find(visible);
+		if let Some(&ix) = next.or(prev) {
+			self.selected_item_idx = ix;
 		}
 	}
 

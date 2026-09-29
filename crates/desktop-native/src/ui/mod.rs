@@ -582,6 +582,22 @@ pub(crate) fn commit_counts(
 	})
 }
 
+/// The three strings a commit header draws: subject (first message line,
+/// or the placeholder), `name <email>` and the short date.
+pub(crate) fn commit_header_labels(
+	commit: &snip_core::commits::CommitPlan,
+	loc: Locale,
+) -> (String, String, String) {
+	let subject = commit.message.lines().next().unwrap_or("").trim();
+	let subject = if subject.is_empty() {
+		t("commit_no_message", loc).to_string()
+	} else {
+		subject.to_string()
+	};
+	let author = format!("{} <{}>", commit.author_name, commit.author_email);
+	(subject, author, short_date(&commit.author_date))
+}
+
 fn short_date(iso: &str) -> String {
 	iso.get(..16).unwrap_or(iso).replace('T', " ")
 }
@@ -1514,10 +1530,12 @@ impl Render for WorkbenchModel {
 			.on_action(cx.listener(|this, _: &NavToggle, _, cx| {
 				if let Some(ref p) = this.paste_preview {
 					let idx = p.selected_item_idx;
-					let overwrite = p
-						.items
-						.get(idx)
-						.is_some_and(|i| i.dest_exists && !i.is_delete);
+					if !p.display_order().contains(&idx) {
+						// Folded away: the row is not on screen.
+						return;
+					}
+					let overwrite =
+						p.items.get(idx).is_some_and(PasteItem::overwritable);
 					if overwrite {
 						this.toggle_paste_overwrite(idx, cx);
 					} else {

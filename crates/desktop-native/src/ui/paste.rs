@@ -212,12 +212,7 @@ impl WorkbenchModel {
 			return div().id("paste-commit:none");
 		};
 		let id = format!("paste-commit:{c}");
-		let subject = commit.message.lines().next().unwrap_or("").trim();
-		let subject = if subject.is_empty() {
-			t("commit_no_message", loc).to_string()
-		} else {
-			subject.to_string()
-		};
+		let (subject, author, date) = commit_header_labels(commit, loc);
 		let (files, skipped) = commit_counts(plan, c);
 		let folded = plan.collapsed_commits.contains(&c);
 		let counts = if commit.files.is_empty() {
@@ -229,8 +224,6 @@ impl WorkbenchModel {
 				&[&files.to_string(), &skipped.to_string()],
 			)
 		};
-		let author =
-			format!("{} <{}>", commit.author_name, commit.author_email);
 		div()
 			.id(SharedString::from(id.clone()))
 			.relative()
@@ -281,7 +274,7 @@ impl WorkbenchModel {
 				div()
 					.flex_shrink_0()
 					.text_color(rgb(pal().text_muted))
-					.child(short_date(&commit.author_date)),
+					.child(date),
 			)
 			.child(
 				div()

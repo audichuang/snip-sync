@@ -5537,8 +5537,15 @@ impl WorkbenchModel {
 
 	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
 		if let Some(p) = &mut self.paste_preview {
+			let was = p.selected_item_idx;
 			p.toggle_commit_collapsed(c);
+			let now = p.selected_item_idx;
 			app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
+			// The fold moved the selection off a hidden row: refresh the
+			// detail pane with it.
+			if now != was {
+				self.select_paste_item(now, cx);
+			}
 			cx.notify();
 		}
 	}
@@ -6887,14 +6894,24 @@ mod tests {
 			] {
 				assert!(ids.contains(&id.to_string()), "{id} in {ids:?}");
 			}
-			// The rendered text is what the header shows: message, author,
-			// date and the empty note come from the replay commit.
+			// The header strings come from `commit_header_labels`, the
+			// helper the header draws them with (the probes only prove the
+			// header exists): subject, author and date of the empty commit.
 			model.read_with(cx, |m, _| {
 				let plan = m.paste_preview.as_ref().unwrap();
-				let c1 =
-					&plan.commit_preview.as_ref().unwrap().replay.commits[1];
-				assert_eq!(c1.message.lines().next(), Some("empty one"));
-				assert_eq!(c1.author_name, "bob");
+				let commits =
+					&plan.commit_preview.as_ref().unwrap().replay.commits;
+				assert_eq!(
+					crate::ui::commit_header_labels(
+						&commits[1],
+						crate::i18n::Locale::En
+					),
+					(
+						"empty one".to_string(),
+						"bob <bob@example.invalid>".to_string(),
+						"2026-09-25 12:34".to_string()
+					)
+				);
 				assert!(plan.items.iter().all(|i| i.commit != Some(1)));
 				// Header counts agree with the rows under them.
 				assert_eq!(crate::ui::commit_counts(plan, 0), (4, 1));
@@ -6944,6 +6961,89 @@ mod tests {
 				plan.toggle_commit_collapsed(0);
 				plan.select_prev();
 				assert_eq!(plan.items[plan.selected_item_idx].path, "base.txt");
+			});
+		}
+
+		#[gpui::test]
+		fn folding_the_selected_commit_moves_selection_off_hidden_rows(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &mixed_commit_payload());
+			model.update(cx, |m, cx| {
+				m.select_paste_item(0, cx);
+				m.toggle_paste_commit(0, cx);
+			});
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert_eq!(plan.items[plan.selected_item_idx].path, "base.txt");
+				assert!(plan.display_order().contains(&plan.selected_item_idx));
+				// Space acted on the visible row only: the folded commit's
+				// files stay included and no subset error is raised.
+				assert!(plan
+					.items
+					.iter()
+					.filter(|i| i.commit == Some(0))
+					.all(|i| i.selected));
+				assert!(plan.error.is_none());
+			});
+		}
+
+		#[gpui::test]
+		fn space_on_a_skip_row_never_flips_the_hidden_overwrite(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			// A non-UTF-8 file is never overwritten: the replay plans a
+			// SKIP for it although it exists at the destination.
+			fs::write(dest.join("img.bin"), [0xff, 0xfe, 0x00]).unwrap();
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "bin".into(),
+						author_name: "ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-09-25T12:34:56+00:00".into(),
+						files: vec![CommitFile {
+							path: "img.bin".into(),
+							old_path: None,
+							change: FileChange::Modified,
+							content: Some("text".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			let before = model.update(cx, |m, cx| {
+				m.select_paste_item(0, cx);
+				let img = &m.paste_preview.as_ref().unwrap().items[0];
+				assert_eq!(img.path, "img.bin");
+				assert!(img.dest_exists && img.action_label == "SKIP");
+				assert!(!img.overwritable());
+				img.overwrite_allowed
+			});
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let img = &m.paste_preview.as_ref().unwrap().items[0];
+				assert_eq!(img.overwrite_allowed, before);
 			});
 		}
 
