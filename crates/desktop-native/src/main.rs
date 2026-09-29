@@ -6565,6 +6565,97 @@ mod tests {
 			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
 		}
 
+		/// The log list width and, per laid-out row, the widths of its graph
+		/// gutter and subject cell.
+		struct LogMeasure {
+			list_w: f32,
+			rows: Vec<(f32, f32)>,
+		}
+
+		/// Six repositories with three feature branches of long names each,
+		/// so the graph is wide and rows carry ref labels; shown in a
+		/// `w` x 752 window.
+		fn measure_wide_log(cx: &mut TestAppContext, w: f32) -> LogMeasure {
+			let ws = tempfile::tempdir().unwrap();
+			for i in 0..6 {
+				let r = repo(ws.path(), &format!("repo{i}"), &[]);
+				for b in 0..3 {
+					let name = format!("feature/a-rather-long-branch-{i}-{b}");
+					git(&r, &["checkout", "-q", "-b", &name, "main"]);
+					fs::write(r.join(format!("f{b}.txt")), "x").unwrap();
+					git(&r, &["add", "."]);
+					git(
+						&r,
+						&["commit", "-q", "-m", &format!("commit {i} {b}")],
+					);
+				}
+				git(&r, &["checkout", "-q", "main"]);
+			}
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
+			settle(cx);
+			// The list reads its own width from the previous frame.
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+			let (n, list_w) = model.read_with(cx, |m, _| {
+				let bounds = m.log_scroll.0.borrow().base_handle.bounds();
+				(m.display_commits().len(), f32::from(bounds.size.width))
+			});
+			assert!(n > 10, "log did not load: {n} commits");
+			let mut rows = Vec::new();
+			for ix in 0..n {
+				// `debug_bounds` wants a 'static selector; a test may leak.
+				let key = |what: &str| -> &'static str {
+					Box::leak(format!("log-{what}:{ix}").into_boxed_str())
+				};
+				if let (Some(g), Some(s)) = (
+					cx.debug_bounds(key("gutter")),
+					cx.debug_bounds(key("subject")),
+				) {
+					rows.push((
+						f32::from(g.size.width),
+						f32::from(s.size.width),
+					));
+				}
+			}
+			LogMeasure { list_w, rows }
+		}
+
+		/// Every row shares one gutter, and the subject of each row keeps at
+		/// least `min` wide.
+		fn assert_log_layout(m: &LogMeasure, min: f32) {
+			assert!(!m.rows.is_empty(), "no rows were laid out");
+			for (gutter, subject) in &m.rows {
+				assert_eq!(*gutter, m.rows[0].0, "{:?}", m.rows);
+				assert!(
+					*subject >= min,
+					"list {}: subject {subject} < {min}: {:?}",
+					m.list_w,
+					m.rows
+				);
+			}
+		}
+
+		#[gpui::test]
+		fn wide_multi_repo_log_keeps_a_subject_at_1080(
+			cx: &mut TestAppContext,
+		) {
+			let m = measure_wide_log(cx, 1080.);
+			// ui::log::MIN_SUBJECT_W
+			assert_log_layout(&m, 160.);
+		}
+
+		/// At 900 the list is ~430px: the gutter sits at its floor and the
+		/// date and author cells shrink, so the subject still gets its
+		/// minimum with the labels dropped.
+		#[gpui::test]
+		fn wide_multi_repo_log_keeps_a_subject_at_900(cx: &mut TestAppContext) {
+			let m = measure_wide_log(cx, 900.);
+			assert_log_layout(&m, 160.);
+		}
+
 		#[gpui::test]
 		fn alt_1_and_alt_0_switch_between_project_and_changes(
 			cx: &mut TestAppContext,

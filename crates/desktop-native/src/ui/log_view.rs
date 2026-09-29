@@ -346,6 +346,20 @@ impl WorkbenchModel {
 		let list_w = f32::from(
 			self.log_scroll.0.borrow().base_handle.bounds().size.width,
 		);
+		// One set of column widths for every row, so lanes line up.
+		let has_labels = self
+			.graph_layout
+			.as_ref()
+			.is_some_and(|l| l.rows.iter().any(|r| !r.refs.is_empty()));
+		let cols = if list_w > 0. {
+			list_cols(list_w, gutter_w, has_labels, self.log_show_hash)
+		} else {
+			ListCols {
+				gutter: gutter_w,
+				author: AUTHOR_W,
+				date: DATE_W,
+			}
+		};
 		let loading_row = self.history_extending && self.history_has_more;
 		let list = uniform_list(
 			"log-rows",
@@ -360,7 +374,7 @@ impl WorkbenchModel {
 							}
 							let tint =
 								on_head.get(ix).copied().unwrap_or(false);
-							this.log_row(ix, gutter_w, list_w, tint, window, cx)
+							this.log_row(ix, cols, list_w, tint, window, cx)
 						})
 						.collect::<Vec<_>>()
 				},
@@ -548,7 +562,7 @@ impl WorkbenchModel {
 	pub(super) fn log_row(
 		&self,
 		ix: usize,
-		gutter_w: f32,
+		cols: ListCols,
 		list_w: f32,
 		on_head: bool,
 		window: &Window,
@@ -615,14 +629,24 @@ impl WorkbenchModel {
 			.as_deref()
 			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email));
 		let hash_w = if self.log_show_hash { 64. } else { 0. };
-		// The subject cell is what the row's fixed parts leave (8px right
-		// padding, 8px gaps between the cells, 6px before the labels).
-		let gaps = if self.log_show_hash { 4. } else { 3. } * 8.;
-		let subject_room =
-			list_w
-				- 8. - gaps - gutter_w
-				- AUTHOR_W - DATE_W
-				- hash_w - if labels_w > 0. { labels_w + 6. } else { 0. };
+		// The subject cell is what the row's fixed parts leave; the graph
+		// gutter and the ref labels give way before it vanishes.
+		let widths = if list_w > 0. {
+			row_widths(list_w, cols, labels_w, self.log_show_hash)
+		} else {
+			// Not laid out yet: no width to divide.
+			RowWidths {
+				gutter: cols.gutter,
+				labels: labels_w,
+				subject: 0.,
+			}
+		};
+		let (gutter_w, subject_room) = (widths.gutter, widths.subject);
+		let labels = if widths.labels > 0. {
+			labels
+		} else {
+			Vec::new()
+		};
 		let truncated = text_width(window, &c.subject, UI_TEXT) > subject_room;
 		let row_id = format!("commit-row:{key}");
 		let col_id = format!("collapse:{key}");
@@ -680,6 +704,8 @@ impl WorkbenchModel {
 					.flex_shrink_0()
 					.w(px(gutter_w))
 					.h(px(graph_view::ROW_HEIGHT))
+					.overflow_hidden()
+					.debug_selector(|| format!("log-gutter:{ix}"))
 					.when_some(graph_row, |el, r| {
 						el.child(
 							canvas(
@@ -734,6 +760,7 @@ impl WorkbenchModel {
 					.child(
 						div()
 							.id(SharedString::from(format!("subject:{key}")))
+							.debug_selector(|| format!("log-subject:{ix}"))
 							.flex_1()
 							.min_w_0()
 							.overflow_hidden()
@@ -744,6 +771,10 @@ impl WorkbenchModel {
 							})
 							.child(c.subject.clone()),
 					)
+					// Out of scope: `row_widths` does not count this chip (and
+					// its 6px gap), so a collapsed merge row's subject is a
+					// little narrower than `subject_room` and the truncation
+					// check for its tooltip can be off.
 					.when(collapsed, |d| {
 						d.child(
 							div()
@@ -753,22 +784,29 @@ impl WorkbenchModel {
 								.child(tf("collapsed_n", loc, &[&hidden_n])),
 						)
 					})
-					.child(
-						div()
-							.flex_shrink_0()
-							.ml_auto()
-							.flex()
-							.flex_row()
-							.items_center()
-							.gap(px(8.))
-							.children(labels),
-					),
+					// Absent (not empty) when dropped: its 6px gap would
+					// otherwise take from the subject.
+					.when(!labels.is_empty(), |d| {
+						d.child(
+							div()
+								.flex_shrink_0()
+								.ml_auto()
+								.flex()
+								.flex_row()
+								.items_center()
+								.gap(px(8.))
+								.when(widths.labels < labels_w, |d| {
+									d.w(px(widths.labels)).overflow_hidden()
+								})
+								.children(labels),
+						)
+					}),
 			)
 			.child(
 				div()
 					.id(SharedString::from(format!("author:{key}")))
 					.flex_shrink_0()
-					.w(px(AUTHOR_W))
+					.w(px(cols.author))
 					.when(show_tips, |d| {
 						d.tooltip(tip(format!(
 							"{} <{}>",
@@ -785,7 +823,7 @@ impl WorkbenchModel {
 				div()
 					.id(SharedString::from(format!("date:{key}")))
 					.flex_shrink_0()
-					.w(px(DATE_W))
+					.w(px(cols.date))
 					.when(show_tips, |d| {
 						d.tooltip(tip(short_date(&c.author_date)))
 					})
