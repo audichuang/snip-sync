@@ -409,17 +409,17 @@ jobs:
 
                     on_macos do
                       if Hardware::CPU.arm?
-                        url "${BASE}/snip-aarch64-apple-darwin.tar.gz"
+                        url "https://github.com/${{ github.repository }}/releases/download/v#{version}/snip-aarch64-apple-darwin.tar.gz"
                         sha256 "${CLI_ARM}"
                       else
-                        url "${BASE}/snip-x86_64-apple-darwin.tar.gz"
+                        url "https://github.com/${{ github.repository }}/releases/download/v#{version}/snip-x86_64-apple-darwin.tar.gz"
                         sha256 "${CLI_INTEL}"
                       end
                     end
 
                     on_linux do
                       if Hardware::CPU.intel?
-                        url "${BASE}/snip-x86_64-unknown-linux-gnu.tar.gz"
+                        url "https://github.com/${{ github.repository }}/releases/download/v#{version}/snip-x86_64-unknown-linux-gnu.tar.gz"
                         sha256 "${CLI_LINUX}"
                       end
                     end
