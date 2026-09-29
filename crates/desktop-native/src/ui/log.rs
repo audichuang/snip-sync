@@ -11,7 +11,6 @@ pub enum LogMenu {
 	Branch,
 	User,
 	Date,
-	Paths,
 	More,
 }
 
@@ -22,7 +21,6 @@ impl LogMenu {
 			LogMenu::Branch => "branch",
 			LogMenu::User => "user",
 			LogMenu::Date => "date",
-			LogMenu::Paths => "paths",
 			LogMenu::More => "more",
 		}
 	}
@@ -444,8 +442,8 @@ pub(super) fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
 	icon_tinted(if l.current { Icon::Head } else { Icon::Tag }, 14., l.color)
 }
 
-/// A row's ref labels, right-aligned at the end of the subject: label icon
-/// plus name, at most two, the rest folded into `+N`. Also returns their
+/// A row's ref labels, right-aligned at the end of the subject: one label
+/// icon plus the names of at most two badges, the rest folded into `+N`. Also returns their
 /// laid-out width (`measure` gives a name's text width).
 pub(super) fn ref_label_elements(
 	refs: &[snip_core::graph::RefInfo],
@@ -455,34 +453,42 @@ pub(super) fn ref_label_elements(
 	measure: &dyn Fn(&str) -> f32,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	// Labels are 8px apart; each is icon (14) + 3 + name, at most 160.
-	let mut width = shown.len().saturating_sub(1) as f32 * 8.;
-	let mut out: Vec<AnyElement> = shown
-		.iter()
-		.map(|b| {
-			let l = graph_view::ref_label(b, current_branch);
-			width += (17. + measure(&l.text)).min(160.);
-			let tooltip = std::iter::once(b.primary)
-				.chain(b.merged.iter().copied())
-				.map(|i| graph_view::format_ref_badge(i).0)
-				.collect::<Vec<_>>()
-				.join("\n");
-			div()
-				.id(SharedString::from(format!("ref-badge:{row}:{}", l.text)))
-				.flex()
-				.items_center()
-				.gap(px(3.))
-				.max_w(px(160.))
-				.when(show_tips, |d| d.tooltip(tip(tooltip)))
-				.child(label_icon(&l))
-				.child(
-					clip_text(l.text.clone())
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().log_ref_text)),
-				)
-				.into_any_element()
-		})
-		.collect();
+	// One label for the shown badges: icon (14) + 3 + names, at most 320
+	// (the room two separate labels had).
+	let mut width = 0.;
+	let mut out: Vec<AnyElement> =
+		graph_view::combined_label(&shown, current_branch)
+			.into_iter()
+			.map(|l| {
+				width += (17. + measure(&l.text)).min(320.);
+				let tooltip = shown
+					.iter()
+					.flat_map(|b| {
+						std::iter::once(b.primary)
+							.chain(b.merged.iter().copied())
+					})
+					.map(|i| graph_view::format_ref_badge(i).0)
+					.collect::<Vec<_>>()
+					.join("\n");
+				div()
+					.id(SharedString::from(format!(
+						"ref-badge:{row}:{}",
+						l.text
+					)))
+					.flex()
+					.items_center()
+					.gap(px(3.))
+					.max_w(px(320.))
+					.when(show_tips, |d| d.tooltip(tip(tooltip)))
+					.child(label_icon(&l))
+					.child(
+						clip_text(l.text.clone())
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().log_ref_text)),
+					)
+					.into_any_element()
+			})
+			.collect();
 	if hidden > 0 {
 		width += 8. + measure(&format!("+{hidden}"));
 		let all = refs
@@ -518,7 +524,12 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let log = &self.probes;
-		let key = menu.key();
+		// A one-repo workspace's repo chip only holds paths; drivers read
+		// "log-filter-repo" as "the workspace has several repositories".
+		let key = match menu {
+			LogMenu::Repo if self.repos.len() <= 1 => "paths",
+			_ => menu.key(),
+		};
 		let id = format!("log-filter-{key}");
 		let clear_id = format!("log-filter-{key}-clear");
 		let open = self.log_menu == Some(menu);
@@ -584,14 +595,18 @@ impl WorkbenchModel {
 	) {
 		self.log_menu = None;
 		match menu {
-			LogMenu::Repo => self.set_log_repos(Vec::new(), cx),
+			LogMenu::Repo => {
+				self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
+				// Leaving a repository scope drops its paths too.
+				if self.log_repo_filter.is_empty() {
+					self.clear_log_paths(cx)
+				} else {
+					self.set_log_repos(Vec::new(), cx)
+				}
+			}
 			LogMenu::Branch => self.filter_by_ref(None, cx),
 			LogMenu::User => self.set_log_author(None, cx),
 			LogMenu::Date => self.set_log_since(None, cx),
-			LogMenu::Paths => {
-				self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
-				self.clear_log_paths(cx)
-			}
 			LogMenu::More => cx.notify(),
 		}
 	}
@@ -636,73 +651,172 @@ impl WorkbenchModel {
 		};
 		let mut items: Vec<AnyElement> = Vec::new();
 		match menu {
+			// One chip for both: the filter field, the repositories (a row
+			// keeps only its repository, the checkbox adds or drops it),
+			// then the paths.
 			LogMenu::Repo => {
-				let all = self.log_repo_filter.is_empty();
-				items.push(item(
-					"log-repo:all".into(),
-					t("log_repo_all", loc).to_string(),
-					all,
-					Box::new(|this, cx| this.set_log_repos(Vec::new(), cx)),
-					cx,
-				));
-				let scope = self.log_scope();
-				for (ix, repo) in
-					self.repos.iter().enumerate().take(MAX_LOG_MENU_ITEMS)
-				{
-					let checked =
-						!all && scope.iter().any(|(r, _)| *r == repo.root);
-					let root = repo.root.clone();
-					let id = format!("log-repo:{}", repo.name);
-					let check_id = format!("log-repo-check:{}", repo.name);
+				items.push(
+					div()
+						.id("log-path-input")
+						.relative()
+						.mx(px(4.))
+						.px(px(4.))
+						.rounded(px(4.))
+						.border_1()
+						.border_color(rgb(pal().button_border))
+						.child(self.log_path_input.clone())
+						.children(probe(log, "log-path-input"))
+						.into_any_element(),
+				);
+				items.push(
+					div()
+						.px(px(8.))
+						.py(px(2.))
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text_muted))
+						.child(t("log_paths_hint", loc))
+						.into_any_element(),
+				);
+				// The project's folders and files as far as loaded; chosen
+				// paths the tree does not show (typed, or in a closed
+				// folder) are listed above it.
+				let chosen = &self.log_filter.paths;
+				// Typed text filters the repositories and the loaded tree
+				// (IntelliJ).
+				let needle =
+					self.log_path_input.read(cx).text().trim().to_lowercase();
+				if self.repos.len() > 1 {
+					let all = self.log_repo_filter.is_empty();
+					items.push(item(
+						"log-repo:all".into(),
+						t("log_repo_all", loc).to_string(),
+						all,
+						Box::new(|this, cx| this.set_log_repos(Vec::new(), cx)),
+						cx,
+					));
+					let scope = self.log_scope();
+					for (ix, repo) in self
+						.repos
+						.iter()
+						.enumerate()
+						.filter(|(_, r)| {
+							r.name.to_lowercase().contains(&needle)
+						})
+						.take(MAX_LOG_MENU_ITEMS)
+					{
+						let checked =
+							!all && scope.iter().any(|(r, _)| *r == repo.root);
+						let root = repo.root.clone();
+						let id = format!("log-repo:{}", repo.name);
+						let check_id = format!("log-repo-check:{}", repo.name);
+						items.push(
+							div()
+								.id(SharedString::from(id.clone()))
+								.relative()
+								.h(px(24.))
+								.px(px(8.))
+								.flex()
+								.items_center()
+								.gap(px(6.))
+								.rounded(px(4.))
+								.cursor_pointer()
+								.hover(|s| s.bg(rgb(pal().hover_bg)))
+								// The row picks only this repository; its checkbox
+								// adds or removes it.
+								.on_click({
+									let root = root.clone();
+									cx.listener(move |this, _, _, cx| {
+										cx.stop_propagation();
+										this.set_log_repos(
+											vec![root.clone()],
+											cx,
+										)
+									})
+								})
+								.child(
+									div()
+										.id(SharedString::from(
+											check_id.clone(),
+										))
+										.relative()
+										.flex_shrink_0()
+										.on_click(cx.listener(
+											move |this, _, _, cx| {
+												cx.stop_propagation();
+												this.toggle_log_repo(
+													root.clone(),
+													cx,
+												)
+											},
+										))
+										.child(checkbox(checked))
+										.children(probe(log, check_id)),
+								)
+								.child(
+									div()
+										.flex_shrink_0()
+										.size(px(8.))
+										.rounded(px(2.))
+										.bg(graph_view::palette_rgb(ix)),
+								)
+								.child(fill_text(repo.name.clone()))
+								.children(probe(log, id))
+								.into_any_element(),
+						);
+					}
 					items.push(
 						div()
-							.id(SharedString::from(id.clone()))
-							.relative()
-							.h(px(24.))
-							.px(px(8.))
-							.flex()
-							.items_center()
-							.gap(px(6.))
-							.rounded(px(4.))
-							.cursor_pointer()
-							.hover(|s| s.bg(rgb(pal().hover_bg)))
-							// The row picks only this repository; its checkbox
-							// adds or removes it.
-							.on_click({
-								let root = root.clone();
-								cx.listener(move |this, _, _, cx| {
-									cx.stop_propagation();
-									this.set_log_repos(vec![root.clone()], cx)
-								})
-							})
-							.child(
-								div()
-									.id(SharedString::from(check_id.clone()))
-									.relative()
-									.flex_shrink_0()
-									.on_click(cx.listener(
-										move |this, _, _, cx| {
-											cx.stop_propagation();
-											this.toggle_log_repo(
-												root.clone(),
-												cx,
-											)
-										},
-									))
-									.child(checkbox(checked))
-									.children(probe(log, check_id)),
-							)
-							.child(
-								div()
-									.flex_shrink_0()
-									.size(px(8.))
-									.rounded(px(2.))
-									.bg(graph_view::palette_rgb(ix)),
-							)
-							.child(fill_text(repo.name.clone()))
-							.children(probe(log, id))
+							.my(px(4.))
+							.h(px(1.))
+							.bg(rgb(pal().divider))
 							.into_any_element(),
 					);
+				}
+				// The loaded tree is the toolbar repository's; a log scoped
+				// to another one gets typed paths only.
+				let other_repo = !self.log_is_merged()
+					&& self.log_scope().first().map(|(r, _)| r.clone())
+						!= self.repo_root();
+				let tree_rows = match self.file_tree.as_ref() {
+					_ if self.log_is_merged() => {
+						self.merged_path_picks(&needle)
+					}
+					_ if other_repo => Vec::new(),
+					Some(tree) if tree.is_loaded && !needle.is_empty() => {
+						path_picker_matches(tree, &needle, "", MAX_PATH_PICKS)
+					}
+					Some(tree) if tree.is_loaded => path_picker_rows(
+						tree,
+						&self.log_paths_expanded,
+						MAX_PATH_PICKS,
+					),
+					_ => {
+						items.push(
+							div()
+								.px(px(8.))
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(t("log_paths_tree_empty", loc))
+								.into_any_element(),
+						);
+						Vec::new()
+					}
+				};
+				let extra: Vec<PathPick> = chosen
+					.iter()
+					.filter(|p| !tree_rows.iter().any(|r| &r.rel == *p))
+					.filter(|p| p.to_lowercase().contains(&needle))
+					.map(|p| PathPick {
+						rel: p.clone(),
+						name: p.clone(),
+						is_dir: None,
+						depth: 0,
+						expandable: false,
+						expanded: false,
+					})
+					.collect();
+				for pick in extra.into_iter().chain(tree_rows) {
+					items.push(self.path_pick_row(pick, cx));
 				}
 			}
 			LogMenu::Branch => {
@@ -930,77 +1044,6 @@ impl WorkbenchModel {
 					);
 				}
 			}
-			LogMenu::Paths => {
-				items.push(
-					div()
-						.id("log-path-input")
-						.relative()
-						.mx(px(4.))
-						.px(px(4.))
-						.rounded(px(4.))
-						.border_1()
-						.border_color(rgb(pal().button_border))
-						.child(self.log_path_input.clone())
-						.children(probe(log, "log-path-input"))
-						.into_any_element(),
-				);
-				items.push(
-					div()
-						.px(px(8.))
-						.py(px(2.))
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().text_muted))
-						.child(t("log_paths_hint", loc))
-						.into_any_element(),
-				);
-				// The project's folders and files as far as loaded; chosen
-				// paths the tree does not show (typed, or in a closed
-				// folder) are listed above it.
-				let chosen = &self.log_filter.paths;
-				// Typed text filters the loaded tree (IntelliJ).
-				let needle =
-					self.log_path_input.read(cx).text().trim().to_lowercase();
-				let tree_rows = match self.file_tree.as_ref() {
-					_ if self.log_is_merged() => {
-						self.merged_path_picks(&needle)
-					}
-					Some(tree) if tree.is_loaded && !needle.is_empty() => {
-						path_picker_matches(tree, &needle, "", MAX_PATH_PICKS)
-					}
-					Some(tree) if tree.is_loaded => path_picker_rows(
-						tree,
-						&self.log_paths_expanded,
-						MAX_PATH_PICKS,
-					),
-					_ => {
-						items.push(
-							div()
-								.px(px(8.))
-								.text_size(px(SMALL_TEXT))
-								.text_color(rgb(pal().text_muted))
-								.child(t("log_paths_tree_empty", loc))
-								.into_any_element(),
-						);
-						Vec::new()
-					}
-				};
-				let extra: Vec<PathPick> = chosen
-					.iter()
-					.filter(|p| !tree_rows.iter().any(|r| &r.rel == *p))
-					.filter(|p| p.to_lowercase().contains(&needle))
-					.map(|p| PathPick {
-						rel: p.clone(),
-						name: p.clone(),
-						is_dir: None,
-						depth: 0,
-						expandable: false,
-						expanded: false,
-					})
-					.collect();
-				for pick in extra.into_iter().chain(tree_rows) {
-					items.push(self.path_pick_row(pick, cx));
-				}
-			}
 			LogMenu::More => {
 				for (key, label, checked) in [
 					("details", "log_more_details", self.log_details_visible),
@@ -1089,7 +1132,8 @@ impl WorkbenchModel {
 						)
 					})
 					.unwrap_or_default();
-				if hits.is_empty() && !name.to_lowercase().contains(needle) {
+				// The repositories themselves are listed above the paths.
+				if hits.is_empty() {
 					continue;
 				}
 				out.push(PathPick {
@@ -1108,6 +1152,11 @@ impl WorkbenchModel {
 					out.truncate(MAX_PATH_PICKS);
 					break;
 				}
+				continue;
+			}
+			// The repositories are listed above the paths; only the
+			// toolbar's one, whose tree is loaded, opens here.
+			if mine.is_none() {
 				continue;
 			}
 			let expanded =
@@ -1172,7 +1221,17 @@ impl WorkbenchModel {
 			.hover(|s| s.bg(rgb(pal().hover_bg)))
 			.on_click(cx.listener(move |this, _, _, cx| {
 				cx.stop_propagation();
-				this.toggle_log_path(rel.clone(), cx)
+				// A whole repository of the merged log is its scope, not
+				// a path: the single-repository log.
+				let root = this
+					.log_is_merged()
+					.then(|| this.repos.iter().find(|r| r.name == rel))
+					.flatten()
+					.map(|r| r.root.clone());
+				match root {
+					Some(root) => this.set_log_repos(vec![root], cx),
+					None => this.toggle_log_path(rel.clone(), cx),
+				}
 			}))
 			.child(if pick.expandable {
 				div()

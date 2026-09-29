@@ -1892,7 +1892,7 @@ impl WorkbenchModel {
 		}
 	}
 
-	/// Paths chip ✕: every path.
+	/// Repo chip ✕ outside a repository scope: every path.
 	pub fn clear_log_paths(&mut self, cx: &mut Context<Self>) {
 		self.log_menu = None;
 		self.log_filter.paths.clear();
@@ -1936,7 +1936,7 @@ impl WorkbenchModel {
 			}
 		}
 		self.log_menu = (self.log_menu != Some(menu)).then_some(menu);
-		if self.log_menu == Some(crate::ui::LogMenu::Paths) {
+		if self.log_menu == Some(crate::ui::LogMenu::Repo) {
 			self.pending_focus =
 				Some(self.log_path_input.read(cx).handle().clone());
 			self.load_picker_dir("", cx);
@@ -2051,6 +2051,7 @@ impl WorkbenchModel {
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_commit_file = None;
+		self.commit_file_sel.clear();
 		self.commit_files.clear();
 		self.clear_preview();
 		self.preview_loading = true;
@@ -2283,6 +2284,7 @@ impl WorkbenchModel {
 				self.reset_selection_details();
 				self.commit_files.clear();
 				self.selected_commit_file = None;
+				self.commit_file_sel.clear();
 				self.preview_loading = false;
 				app_log!("[APP:LOG_SELECTION: n=0 repo=-]");
 			}
@@ -2340,6 +2342,7 @@ impl WorkbenchModel {
 		self.compare = None;
 		self.selected_file = None;
 		self.selected_commit_file = None;
+		self.commit_file_sel.clear();
 		self.commit_files.clear();
 		self.commit_file_origin.clear();
 		self.clear_preview();
@@ -2493,6 +2496,7 @@ impl WorkbenchModel {
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.commit_details = None;
 		self.selected_commit_file = None;
+		self.commit_file_sel.clear();
 		self.commit_files.clear();
 		self.clear_preview();
 		self.preview_loading = true;
@@ -2598,6 +2602,7 @@ impl WorkbenchModel {
 								Some((path, p)) => {
 									model.selected_commit_file =
 										Some(path.clone());
+									model.commit_file_sel.clear();
 									model.apply_source_preview(
 										path,
 										p.map(|p| (p, preview_source)),
@@ -2622,6 +2627,35 @@ impl WorkbenchModel {
 				});
 			},
 		);
+	}
+
+	/// Cmd/Ctrl-click in the changed files: adds or drops `path` from the
+	/// selection; the open diff stays.
+	pub fn toggle_commit_file(&mut self, path: &str, cx: &mut Context<Self>) {
+		let sel = &mut self.commit_file_sel;
+		if sel.is_empty() {
+			sel.extend(self.selected_commit_file.clone());
+		}
+		match sel.iter().position(|p| p == path) {
+			Some(i) => {
+				sel.remove(i);
+			}
+			None => sel.push(path.to_string()),
+		}
+		cx.notify();
+	}
+
+	/// Shift-click in the changed files: selects the shown files from the
+	/// open one to `path`.
+	pub fn extend_commit_files(
+		&mut self,
+		shown: &[&str],
+		path: &str,
+		cx: &mut Context<Self>,
+	) {
+		let anchor = self.selected_commit_file.as_deref().unwrap_or(path);
+		self.commit_file_sel = file_range(shown, anchor, path);
+		cx.notify();
 	}
 
 	/// Opens one file of the selected commit or compare as a diff.
@@ -2670,6 +2704,7 @@ impl WorkbenchModel {
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
 		self.selected_commit_file = Some(path.to_string());
+		self.commit_file_sel.clear();
 		self.preview_loading = true;
 		let path = path.to_string();
 		let for_bg = path.clone();
@@ -2967,6 +3002,7 @@ impl WorkbenchModel {
 
 		self.selected_file = None;
 		self.selected_commit_file = Some(path.clone());
+		self.commit_file_sel.clear();
 		self.preview_loading = true;
 		self.preview_error = None;
 		app_log!("[APP:TREE_FILE_SELECTED: {}]", path);
@@ -3079,6 +3115,19 @@ pub fn range_between(rows: &[&str], anchor: &str, head: &str) -> Vec<String> {
 		.filter(|r| same_repo(r, anchor))
 		.map(|r| r.to_string())
 		.collect()
+}
+
+/// Shift range over the shown changed files, both ends included; just
+/// `head` when the anchor is not shown (e.g. in a collapsed folder).
+pub fn file_range(shown: &[&str], anchor: &str, head: &str) -> Vec<String> {
+	let pos = |p: &str| shown.iter().position(|s| *s == p);
+	match (pos(anchor), pos(head)) {
+		(Some(a), Some(b)) => shown[a.min(b)..=a.max(b)]
+			.iter()
+			.map(|s| s.to_string())
+			.collect(),
+		_ => vec![head.to_string()],
+	}
 }
 
 /// Cmd/Ctrl-click: `selection` with `id` toggled in or out, in display
@@ -4504,6 +4553,14 @@ mod tests {
 		assert_eq!(toggle_selection(&rows, &sel, "b2@1"), Err("cross_repo"));
 		// A single repository's plain SHAs are one repository.
 		assert!(toggle_selection(&["x", "y"], &ids(&["x"]), "y").is_ok());
+	}
+
+	#[test]
+	fn file_range_spans_shown_files_either_way() {
+		let shown = ["a@1/x", "b", "c", "d"];
+		assert_eq!(file_range(&shown, "c", "a@1/x"), ["a@1/x", "b", "c"]);
+		assert_eq!(file_range(&shown, "b", "d"), ["b", "c", "d"]);
+		assert_eq!(file_range(&shown, "hidden", "b"), ["b"]);
 	}
 
 	#[test]

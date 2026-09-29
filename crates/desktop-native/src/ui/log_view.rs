@@ -134,6 +134,7 @@ impl WorkbenchModel {
 			}
 			(since, until) => Some(format!("{} – {}", day(since), day(until))),
 		};
+		// The repo chip shows the repository scope, then the paths.
 		let repo_value = match self.log_repo_filter.as_slice() {
 			[] => None,
 			_ => {
@@ -150,6 +151,10 @@ impl WorkbenchModel {
 				n => format!("{p} +{}", n - 1),
 			}
 		});
+		let scope_value = match (repo_value, paths_value) {
+			(Some(r), Some(p)) => Some(format!("{r} · {p}")),
+			(r, p) => r.or(p),
+		};
 		let filter_bar = div()
 			.flex()
 			.flex_row()
@@ -216,14 +221,21 @@ impl WorkbenchModel {
 					.flex_1()
 					.min_w_0()
 					.overflow_hidden()
-					.when(self.repos.len() > 1, |d| {
-						d.child(self.log_chip(
-							LogMenu::Repo,
-							t("log_chip_repo", loc),
-							repo_value,
-							cx,
-						))
-					})
+					// Repositories and paths share one chip, first; a one-repo
+					// workspace only has paths.
+					.child(self.log_chip(
+						LogMenu::Repo,
+						t(
+							if self.repos.len() > 1 {
+								"log_chip_repo"
+							} else {
+								"log_chip_paths"
+							},
+							loc,
+						),
+						scope_value,
+						cx,
+					))
 					.child(self.log_chip(
 						LogMenu::Branch,
 						t("log_chip_branch", loc),
@@ -240,12 +252,6 @@ impl WorkbenchModel {
 						LogMenu::Date,
 						t("log_chip_date", loc),
 						date_value,
-						cx,
-					))
-					.child(self.log_chip(
-						LogMenu::Paths,
-						t("log_chip_paths", loc),
-						paths_value,
 						cx,
 					)),
 			)
@@ -842,6 +848,24 @@ impl WorkbenchModel {
 		rows
 	}
 
+	/// Shift-click on a changed-files row: selects the shown rows (folders
+	/// keyed "dir/") from the open file to `key`.
+	fn shift_click_commit_row(&mut self, key: &str, cx: &mut Context<Self>) {
+		let shown: Vec<String> = self
+			.commit_rows(self.log_details_by_dir)
+			.iter()
+			.filter_map(|r| match r {
+				ChangeItemRow::Dir { path, .. } => Some(format!("{path}/")),
+				ChangeItemRow::File { file_idx, .. } => {
+					self.commit_files.get(*file_idx).map(|(p, _)| p.clone())
+				}
+				_ => None,
+			})
+			.collect();
+		let shown: Vec<&str> = shown.iter().map(String::as_str).collect();
+		self.extend_commit_files(&shown, key, cx);
+	}
+
 	/// The log's right pane: the selected commit's changed files grouped by
 	/// directory, then its details (or the compare's range).
 	pub(super) fn render_commit_panel(
@@ -1011,6 +1035,10 @@ impl WorkbenchModel {
 					self.changed_dirs_collapsed.iter().any(|d| d == &path);
 				let id = format!("commit-dir:{path}");
 				let p2 = path.clone();
+				// A folder in the selection is keyed "dir/".
+				let key = format!("{path}/");
+				let sel = self.rev_tree.is_none()
+					&& self.commit_file_sel.contains(&key);
 				div()
 					.id(SharedString::from(id.clone()))
 					.relative()
@@ -1023,13 +1051,20 @@ impl WorkbenchModel {
 					.pl(px(change_pad(depth)))
 					.pr(px(8.))
 					.cursor_pointer()
-					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
+					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 					.when(self.chrome.menu.is_none(), |d| {
 						d.tooltip(tip(path.clone()))
 					})
 					.on_mouse_down(MouseButton::Right, {
 						let path = path.clone();
+						let key = key.clone();
 						cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+							// IntelliJ: a menu outside the selection selects
+							// its row alone.
+							if !sel && !this.commit_file_sel.is_empty() {
+								this.commit_file_sel = vec![key.clone()];
+							}
 							let items = this.commit_file_menu(&path, true);
 							w.focus(&this.log_focus);
 							this.open_menu(
@@ -1041,16 +1076,26 @@ impl WorkbenchModel {
 							);
 						})
 					})
-					.on_click(cx.listener(move |this, _, _, cx| {
-						let dirs = &mut this.changed_dirs_collapsed;
-						match dirs.iter().position(|d| d == &p2) {
-							Some(i) => {
-								dirs.remove(i);
+					.on_click(cx.listener(
+						move |this, ev: &gpui::ClickEvent, _, cx| {
+							// Cmd/Ctrl and Shift select the folder with the
+							// files; a plain click opens or closes it.
+							if ev.modifiers().secondary() {
+								return this.toggle_commit_file(&key, cx);
 							}
-							None => dirs.push(p2.clone()),
-						}
-						cx.notify();
-					}))
+							if ev.modifiers().shift {
+								return this.shift_click_commit_row(&key, cx);
+							}
+							let dirs = &mut this.changed_dirs_collapsed;
+							match dirs.iter().position(|d| d == &p2) {
+								Some(i) => {
+									dirs.remove(i);
+								}
+								None => dirs.push(p2.clone()),
+							}
+							cx.notify();
+						},
+					))
 					.child(tree_chevron(
 						format!("commit-dir-toggle:{path}"),
 						collapsed,
@@ -1078,8 +1123,12 @@ impl WorkbenchModel {
 				};
 				let (letter, color) = change_style(ct);
 				let deleted = ct == Some(ChangeType::Deleted);
-				let sel = self.selected_commit_file.as_deref() == Some(&path)
-					&& self.rev_tree.is_none();
+				let sel = self.rev_tree.is_none()
+					&& if self.commit_file_sel.is_empty() {
+						self.selected_commit_file.as_deref() == Some(&path)
+					} else {
+						self.commit_file_sel.contains(&path)
+					};
 				let id = format!("commit-file:{path}");
 				let (dir, name) = match path.rsplit_once('/') {
 					Some((d, n)) => (d.to_string(), n.to_string()),
@@ -1104,9 +1153,19 @@ impl WorkbenchModel {
 					.when(self.chrome.menu.is_none(), |d| {
 						d.tooltip(tip(format!("{path}  ({letter})")))
 					})
-					.on_click(cx.listener(move |this, _, _, cx| {
-						this.select_commit_file(&p2, cx)
-					}))
+					.on_click(cx.listener(
+						move |this, ev: &gpui::ClickEvent, _, cx| {
+							// Cmd on macOS, Ctrl elsewhere toggles the file;
+							// Shift selects the rows from the open one.
+							if ev.modifiers().secondary() {
+								this.toggle_commit_file(&p2, cx);
+							} else if ev.modifiers().shift {
+								this.shift_click_commit_row(&p2, cx);
+							} else {
+								this.select_commit_file(&p2, cx);
+							}
+						},
+					))
 					// IntelliJ selects the row a menu opens on.
 					.on_mouse_down(MouseButton::Right, {
 						let path = path.clone();
