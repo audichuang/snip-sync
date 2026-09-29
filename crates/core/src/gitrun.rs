@@ -766,9 +766,12 @@ mod tree {
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
 	pub(super) const PS_TIMEOUT: std::time::Duration =
 		std::time::Duration::from_secs(10);
+	/// Killing the helper is instant; reaping it is not on a starved Mac
+	/// (efficiency cores under load took over 2 s), and a failed reap turned a
+	/// clean timeout into `Other`.
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
-	const HELPER_CLEANUP_GRACE: std::time::Duration =
-		std::time::Duration::from_secs(2);
+	pub(super) const HELPER_CLEANUP_GRACE: std::time::Duration =
+		std::time::Duration::from_secs(10);
 
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
 	struct HelperGuard {
@@ -2150,6 +2153,10 @@ mod tests {
 		);
 	}
 
+	/// `elapsed` includes spawning the helper, which took seconds on a loaded Mac.
+	#[cfg(unix)]
+	const SPAWN_SLACK: Duration = Duration::from_secs(10);
+
 	#[cfg(unix)]
 	#[test]
 	fn check_group_liveness_timeout_kills_helper_and_fails() {
@@ -2165,9 +2172,10 @@ mod tests {
 		let elapsed = start.elapsed();
 		assert!(res.is_err(), "hanging helper must return Err");
 		let err = res.unwrap_err();
-		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
 		assert!(
-			elapsed < tree::PS_TIMEOUT + Duration::from_secs(2),
+			elapsed
+				< tree::PS_TIMEOUT + tree::HELPER_CLEANUP_GRACE + SPAWN_SLACK,
 			"helper must be timed out quickly, took {elapsed:?}"
 		);
 		let pid = test_last_helper_pid().expect("helper PID must be recorded");
@@ -2193,9 +2201,10 @@ mod tests {
 			"helper closing stdout then hanging must return Err"
 		);
 		let err = res.unwrap_err();
-		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
 		assert!(
-			elapsed < tree::PS_TIMEOUT + Duration::from_secs(2),
+			elapsed
+				< tree::PS_TIMEOUT + tree::HELPER_CLEANUP_GRACE + SPAWN_SLACK,
 			"helper must be timed out within deadline, took {elapsed:?}"
 		);
 		let pid = test_last_helper_pid().expect("helper PID must be recorded");
