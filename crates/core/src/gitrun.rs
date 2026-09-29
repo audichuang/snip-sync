@@ -2156,6 +2156,11 @@ mod tests {
 	/// `elapsed` includes spawning the helper, which took seconds on a loaded Mac.
 	#[cfg(unix)]
 	const SPAWN_SLACK: Duration = Duration::from_secs(10);
+	/// A hanging helper must outlive `PS_TIMEOUT` by a wide margin: at
+	/// `sleep 10` it exited on its own right at the deadline on a loaded Mac,
+	/// so the check saw a clean empty `ps` (`Other`) instead of `TimedOut`.
+	/// The helper is killed at the deadline, so the length costs nothing.
+	const HANG_HELPER: &str = "sleep 300";
 
 	#[cfg(unix)]
 	#[test]
@@ -2165,7 +2170,7 @@ mod tests {
 		test_override_ps_helper(Some(vec![
 			"sh".to_string(),
 			"-c".to_string(),
-			"exec sleep 10".to_string(),
+			format!("exec {HANG_HELPER}"),
 		]));
 		let start = Instant::now();
 		let res = tree::check_group_liveness(12345);
@@ -2191,7 +2196,7 @@ mod tests {
 		test_override_ps_helper(Some(vec![
 			"sh".to_string(),
 			"-c".to_string(),
-			"exec 1>&-; exec sleep 10".to_string(),
+			format!("exec 1>&-; exec {HANG_HELPER}"),
 		]));
 		let start = Instant::now();
 		let res = tree::check_group_liveness(12345);
