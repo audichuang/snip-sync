@@ -1,0 +1,2 @@
+// snip-sync commits v1
+{"commits":[{"message":"C4 binary addition and text\n","authorName":"Binary Author","authorEmail":"binary@example.test","authorDate":"2026-09-06T12:34:56+09:00","files":[{"path":"new-binary.bin","oldPath":null,"change":"ADDED","content":null,"notCopied":"BINARY"},{"path":"newdir/content.txt","oldPath":null,"change":"ADDED","content":"C4 normal text survives\n","notCopied":null}]}]}
