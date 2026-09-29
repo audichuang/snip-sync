@@ -5535,6 +5535,14 @@ impl WorkbenchModel {
 		}
 	}
 
+	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
+		if let Some(p) = &mut self.paste_preview {
+			p.toggle_commit_collapsed(c);
+			app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
+			cx.notify();
+		}
+	}
+
 	pub fn select_paste_item(&mut self, idx: usize, cx: &mut Context<Self>) {
 		let pool = self.paste_pending.clone();
 		let mut pending = paste::lock_pending(&pool);
@@ -6830,6 +6838,98 @@ mod tests {
 				);
 				// Nothing to write in c2 does not block Apply.
 				assert!(plan.executable());
+			});
+		}
+
+		#[gpui::test]
+		fn commit_preview_renders_every_commit_header_and_folds(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			model.update(cx, |m, _| {
+				m.probes = Some(crate::ui::Probes::for_test())
+			});
+			paste(&model, cx, &mixed_commit_payload());
+			settle(cx);
+			let drawn = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| m.probes.as_ref().unwrap().drawn())
+			};
+			let ids = drawn(cx);
+			// The empty commit still gets its header, and the summary
+			// counts commits apart from file actions.
+			for id in [
+				"paste-commit:0",
+				"paste-commit:1",
+				"paste-commit:2",
+				"paste-commit-count",
+				"paste-row:img.bin",
+				"paste-row:base.txt",
+			] {
+				assert!(ids.contains(&id.to_string()), "{id} in {ids:?}");
+			}
+			// The rendered text is what the header shows: message, author,
+			// date and the empty note come from the replay commit.
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				let c1 =
+					&plan.commit_preview.as_ref().unwrap().replay.commits[1];
+				assert_eq!(c1.message.lines().next(), Some("empty one"));
+				assert_eq!(c1.author_name, "bob");
+				assert!(plan.items.iter().all(|i| i.commit != Some(1)));
+				// Header counts agree with the rows under them.
+				assert_eq!(crate::ui::commit_counts(plan, 0), (4, 1));
+				assert_eq!(crate::ui::commit_counts(plan, 1), (0, 0));
+				assert_eq!(crate::ui::commit_counts(plan, 2), (1, 1));
+			});
+			// Folding commit #1 removes its rows but keeps every header.
+			model.update(cx, |m, cx| m.toggle_paste_commit(0, cx));
+			settle(cx);
+			let ids = drawn(cx);
+			assert!(ids.contains(&"paste-commit:0".to_string()));
+			assert!(!ids.contains(&"paste-row:img.bin".to_string()), "{ids:?}");
+			assert!(ids.contains(&"paste-row:base.txt".to_string()));
+		}
+
+		#[gpui::test]
+		fn up_down_walk_commit_rows_in_replay_order(cx: &mut TestAppContext) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &mixed_commit_payload());
+			model.update(cx, |m, _| {
+				let plan = m.paste_preview.as_mut().unwrap();
+				plan.selected_item_idx = 0;
+				let mut seen = vec![plan.items[0].path.clone()];
+				for _ in 0..plan.items.len() + 2 {
+					plan.select_next();
+					seen.push(plan.items[plan.selected_item_idx].path.clone());
+				}
+				seen.dedup();
+				assert_eq!(
+					seen,
+					[
+						"img.bin",
+						"fresh.txt",
+						"old.txt",
+						"dir/new.txt",
+						"base.txt"
+					]
+				);
+				// A folded commit's rows are skipped, and Up re-enters
+				// from a selection that is folded away.
+				plan.toggle_commit_collapsed(0);
+				plan.select_prev();
+				assert_eq!(plan.items[plan.selected_item_idx].path, "base.txt");
 			});
 		}
 

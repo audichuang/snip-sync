@@ -147,6 +147,23 @@ impl ProbeFrame {
 pub struct Probes(Rc<RefCell<ProbeFrame>>);
 
 impl Probes {
+	/// Test only: probes on without the E2E environment.
+	#[cfg(test)]
+	pub fn for_test() -> Self {
+		Self(Rc::default())
+	}
+
+	/// Test only: every control drawn in the last frames.
+	#[cfg(test)]
+	pub fn drawn(&self) -> Vec<String> {
+		let f = self.0.borrow();
+		let mut ids: Vec<String> =
+			f.shown.keys().chain(f.seen.keys()).cloned().collect();
+		ids.sort();
+		ids.dedup();
+		ids
+	}
+
 	pub fn from_env() -> Option<Self> {
 		crate::e2e_on().then(|| Self(Rc::default()))
 	}
@@ -527,6 +544,23 @@ pub(crate) fn paste_counts(plan: &PastePreviewPlan) -> PasteCounts {
 		}
 	}
 	c
+}
+
+/// A commit's file rows and how many of them are not written (skipped,
+/// excluded or a delete of a missing file), from the same [`paste_op`] that
+/// colours the rows.
+pub(crate) fn commit_counts(
+	plan: &PastePreviewPlan,
+	c: usize,
+) -> (usize, usize) {
+	let rows = plan.items.iter().filter(|i| i.commit == Some(c));
+	rows.fold((0, 0), |(n, off), it| {
+		let written = matches!(
+			paste_op(it).0,
+			"op_create" | "op_overwrite" | "op_delete"
+		);
+		(n + 1, off + usize::from(!written))
+	})
 }
 
 fn short_date(iso: &str) -> String {

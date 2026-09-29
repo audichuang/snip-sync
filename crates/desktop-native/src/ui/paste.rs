@@ -1,7 +1,5 @@
 //! Paste preview in the editor area.
 
-use snip_core::commits::ReplayAction;
-
 use super::*;
 
 impl WorkbenchModel {
@@ -204,6 +202,7 @@ impl WorkbenchModel {
 		c: usize,
 		loc: Locale,
 		log: &Option<Probes>,
+		cx: &Context<Self>,
 	) -> Stateful<Div> {
 		let Some(commit) = plan
 			.commit_preview
@@ -219,18 +218,15 @@ impl WorkbenchModel {
 		} else {
 			subject.to_string()
 		};
-		let skipped = commit
-			.files
-			.iter()
-			.filter(|f| f.action == ReplayAction::Skip)
-			.count();
+		let (files, skipped) = commit_counts(plan, c);
+		let folded = plan.collapsed_commits.contains(&c);
 		let counts = if commit.files.is_empty() {
 			t("commit_empty_note", loc).to_string()
 		} else {
 			tf(
 				"commit_header_counts",
 				loc,
-				&[&commit.files.len().to_string(), &skipped.to_string()],
+				&[&files.to_string(), &skipped.to_string()],
 			)
 		};
 		let author =
@@ -247,12 +243,24 @@ impl WorkbenchModel {
 			.gap(px(8.))
 			.bg(rgb(pal().panel_bg))
 			.text_size(px(SMALL_TEXT))
+			.cursor_pointer()
+			.on_click(cx.listener(move |this, _, _, cx| {
+				this.toggle_paste_commit(c, cx)
+			}))
 			.when(c > 0, |d| d.border_t_1().border_color(rgb(pal().divider)))
 			.tooltip(tip(format!(
 				"{}\n{author}\n{}",
 				commit.message.trim_end(),
 				commit.author_date
 			)))
+			.child(icon(
+				if folded {
+					Icon::ChevronRight
+				} else {
+					Icon::ChevronDown
+				},
+				10.,
+			))
 			.child(
 				div()
 					.flex_shrink_0()
@@ -400,7 +408,7 @@ impl WorkbenchModel {
 		let rows = nodes.into_iter().map(|node| {
 			let (ix, depth) = match node {
 				PasteNode::Commit(c) => {
-					return Self::commit_header(plan, c, loc, log)
+					return Self::commit_header(plan, c, loc, log, cx)
 						.into_any_element();
 				}
 				PasteNode::Root(ref name, n) | PasteNode::Dir(ref name, n) => {

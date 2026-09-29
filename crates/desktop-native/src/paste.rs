@@ -569,6 +569,8 @@ pub struct PastePreviewPlan {
 	/// Whole-commit replay. File checkboxes do not rewrite a subset.
 	pub commit_preview: Option<Arc<CommitReplayPreview>>,
 	pub whole_commit: bool,
+	/// Commits whose file rows are folded away (commit replay only).
+	pub collapsed_commits: BTreeSet<usize>,
 	pub prefix_choices: Vec<PrefixChoice>,
 	/// Shared so starting an apply does not copy every file body.
 	pub plan: Arc<RestorePlan>,
@@ -791,6 +793,9 @@ impl PastePreviewPlan {
 		for item in &self.items {
 			bytes = bytes
 				.saturating_add(item.path.capacity())
+				.saturating_add(
+					item.rename_note.as_ref().map_or(0, String::capacity),
+				)
 				.saturating_add(item.dest_root.capacity())
 				.saturating_add(item.dest_root_name.capacity())
 				.saturating_add(item.dest_path.capacity());
@@ -885,6 +890,7 @@ impl PastePreviewPlan {
 			import_plan: None,
 			commit_preview: None,
 			whole_commit: false,
+			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
 			plan: empty_plan(),
 			items: Vec::new(),
@@ -939,6 +945,7 @@ impl PastePreviewPlan {
 			import_plan: None,
 			commit_preview: Some(preview.clone()),
 			whole_commit: true,
+			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
 			plan: empty_plan(),
 			items: Vec::new(),
@@ -1356,6 +1363,11 @@ impl PastePreviewPlan {
 		let order = self.display_order();
 		let Some(pos) = order.iter().position(|&i| i == self.selected_item_idx)
 		else {
+			// The selected row is folded away: re-enter at the near end.
+			let edge = if forward { order.first() } else { order.last() };
+			if let Some(&ix) = edge {
+				self.selected_item_idx = ix;
+			}
 			return;
 		};
 		let next = if forward {
@@ -1370,8 +1382,19 @@ impl PastePreviewPlan {
 
 	/// Item indices in change-tree order: by destination root, then
 	/// directory (a root's own files first), then name. `items` itself keeps
-	/// the plan's order.
+	/// the plan's order. A commit replay lists its visible rows in replay
+	/// order instead, exactly as [`Self::commit_rows`] shows them.
 	pub fn display_order(&self) -> Vec<usize> {
+		if self.whole_commit {
+			return self
+				.commit_rows()
+				.into_iter()
+				.filter_map(|n| match n {
+					PasteNode::File(ix, _) => Some(ix),
+					_ => None,
+				})
+				.collect();
+		}
 		// Case-insensitive like IntelliJ's tree; the raw path breaks ties.
 		let mut order: Vec<usize> = (0..self.items.len()).collect();
 		order.sort_by_cached_key(|&i| {
@@ -1424,7 +1447,7 @@ impl PastePreviewPlan {
 
 	/// The commit replay as the user will see it: each commit's header, in
 	/// replay order, followed by its file rows. An empty commit is a header
-	/// with no rows.
+	/// with no rows; a collapsed commit keeps only its header.
 	pub fn commit_rows(&self) -> Vec<PasteNode> {
 		let Some(preview) = &self.commit_preview else {
 			return Vec::new();
@@ -1433,12 +1456,22 @@ impl PastePreviewPlan {
 		let mut ix = 0;
 		for c in 0..preview.replay.commits.len() {
 			rows.push(PasteNode::Commit(c));
+			let shown = !self.collapsed_commits.contains(&c);
 			while self.items.get(ix).is_some_and(|i| i.commit == Some(c)) {
-				rows.push(PasteNode::File(ix, 1));
+				if shown {
+					rows.push(PasteNode::File(ix, 1));
+				}
 				ix += 1;
 			}
 		}
 		rows
+	}
+
+	/// Folds or unfolds one commit's file rows.
+	pub fn toggle_commit_collapsed(&mut self, c: usize) {
+		if !self.collapsed_commits.remove(&c) {
+			self.collapsed_commits.insert(c);
+		}
 	}
 
 	pub fn set_all_overwrite(&mut self, allowed: bool) {
