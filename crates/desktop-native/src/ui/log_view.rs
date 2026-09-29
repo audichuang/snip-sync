@@ -346,6 +346,12 @@ impl WorkbenchModel {
 		let list_w = f32::from(
 			self.log_scroll.0.borrow().base_handle.bounds().size.width,
 		);
+		// One gutter for every row, so lanes line up.
+		let gutter_w = if list_w > 0. {
+			list_gutter(list_w, gutter_w, self.log_show_hash)
+		} else {
+			gutter_w
+		};
 		let loading_row = self.history_extending && self.history_has_more;
 		let list = uniform_list(
 			"log-rows",
@@ -691,6 +697,7 @@ impl WorkbenchModel {
 					.w(px(gutter_w))
 					.h(px(graph_view::ROW_HEIGHT))
 					.overflow_hidden()
+					.debug_selector(|| format!("log-gutter:{ix}"))
 					.when_some(graph_row, |el, r| {
 						el.child(
 							canvas(
@@ -745,6 +752,7 @@ impl WorkbenchModel {
 					.child(
 						div()
 							.id(SharedString::from(format!("subject:{key}")))
+							.debug_selector(|| format!("log-subject:{ix}"))
 							.flex_1()
 							.min_w_0()
 							.overflow_hidden()
