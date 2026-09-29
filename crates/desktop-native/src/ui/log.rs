@@ -343,6 +343,59 @@ pub(super) fn path_picker_matches(
 pub(super) const MAX_BRANCH_ROWS: usize = 200;
 pub(super) const AUTHOR_W: f32 = 120.;
 pub(super) const DATE_W: f32 = 118.;
+/// The subject width a log row keeps before its graph gutter and ref labels
+/// give way.
+pub(super) const MIN_SUBJECT_W: f32 = 160.;
+/// The narrowest a ref-label group or the graph gutter is squeezed to
+/// before the labels are dropped altogether.
+const MIN_LABELS_W: f32 = 80.;
+const MIN_GUTTER_W: f32 = 72.;
+
+/// How a log row divides its width: the graph gutter, the ref labels and
+/// what is left for the subject.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct RowWidths {
+	pub gutter: f32,
+	pub labels: f32,
+	pub subject: f32,
+}
+
+/// Divides a `list_w` wide row. Author, date and hash are fixed; the ref
+/// labels (`labels_w`, 0 for none) shrink first, then the graph gutter is
+/// clipped, then the labels go, so the subject keeps [`MIN_SUBJECT_W`] where
+/// the window allows. With room to spare nothing changes.
+pub(super) fn row_widths(
+	list_w: f32,
+	gutter_w: f32,
+	labels_w: f32,
+	show_hash: bool,
+) -> RowWidths {
+	// 8px right padding, 8px gaps between the cells.
+	let gaps = if show_hash { 4. } else { 3. } * 8.;
+	let hash_w = if show_hash { 64. } else { 0. };
+	let avail = list_w - 8. - gaps - AUTHOR_W - DATE_W - hash_w;
+	// The 6px before the labels only exists with labels.
+	let with_labels = |l: f32| if l > 0. { l + 6. } else { 0. };
+	let (mut gutter, mut labels) = (gutter_w, labels_w);
+	if avail - gutter - with_labels(labels) < MIN_SUBJECT_W {
+		labels = labels_w
+			.min(MIN_LABELS_W)
+			.max((avail - gutter - 6. - MIN_SUBJECT_W).min(labels_w));
+		if avail - gutter - with_labels(labels) < MIN_SUBJECT_W {
+			gutter = gutter_w.min(MIN_GUTTER_W).max(
+				(avail - with_labels(labels) - MIN_SUBJECT_W).min(gutter_w),
+			);
+		}
+		if avail - gutter - with_labels(labels) < MIN_SUBJECT_W {
+			labels = 0.;
+		}
+	}
+	RowWidths {
+		gutter,
+		labels,
+		subject: (avail - gutter - with_labels(labels)).max(0.),
+	}
+}
 
 /// `refs/heads/main` → `main`, `refs/remotes/origin/x` → `origin/x`.
 pub(super) fn short_ref(name: &str) -> &str {
@@ -1546,5 +1599,60 @@ impl WorkbenchModel {
 				.children(probe(log, "branches-collapse-all")),
 			)
 			.into_any_element()
+	}
+}
+
+#[cfg(test)]
+mod row_width_tests {
+	use super::*;
+
+	// A 24-lane gutter (the widest) and the widest combined label.
+	const WIDE_GUTTER: f32 = 24. * 16. + 8.;
+
+	#[test]
+	fn roomy_rows_are_unchanged() {
+		let w = row_widths(1200., 40., 100., false);
+		assert_eq!(w.gutter, 40.);
+		assert_eq!(w.labels, 100.);
+		assert_eq!(w.subject, 1200. - 8. - 24. - 40. - 238. - 106.);
+		let w = row_widths(1200., 40., 0., true);
+		assert_eq!(w.subject, 1200. - 8. - 32. - 40. - 238. - 64.);
+	}
+
+	#[test]
+	fn multi_repo_graph_keeps_a_subject() {
+		// Log list widths left by 1080 / 900 windows beside the details pane.
+		for list_w in [720., 620., 560.] {
+			for show_hash in [false, true] {
+				// The 64px hash column leaves 560 under the minimum even
+				// with the gutter and labels at their floors.
+				if show_hash && list_w < 600. {
+					continue;
+				}
+				for labels_w in [0., 60., 337.] {
+					let w =
+						row_widths(list_w, WIDE_GUTTER, labels_w, show_hash);
+					assert!(
+						w.subject >= MIN_SUBJECT_W,
+						"{list_w} {show_hash} {labels_w}: {w:?}"
+					);
+					assert!(w.gutter <= WIDE_GUTTER && w.labels <= labels_w);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn labels_shrink_before_the_gutter() {
+		let w = row_widths(800., 120., 337., false);
+		assert_eq!(w.gutter, 120.);
+		assert!(w.labels < 337. && w.labels >= 80.);
+		assert_eq!(w.subject, MIN_SUBJECT_W);
+	}
+
+	#[test]
+	fn tiny_windows_never_go_negative() {
+		let w = row_widths(100., WIDE_GUTTER, 337., true);
+		assert!(w.subject >= 0. && w.labels == 0.);
 	}
 }

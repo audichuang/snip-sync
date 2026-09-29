@@ -615,14 +615,24 @@ impl WorkbenchModel {
 			.as_deref()
 			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email));
 		let hash_w = if self.log_show_hash { 64. } else { 0. };
-		// The subject cell is what the row's fixed parts leave (8px right
-		// padding, 8px gaps between the cells, 6px before the labels).
-		let gaps = if self.log_show_hash { 4. } else { 3. } * 8.;
-		let subject_room =
-			list_w
-				- 8. - gaps - gutter_w
-				- AUTHOR_W - DATE_W
-				- hash_w - if labels_w > 0. { labels_w + 6. } else { 0. };
+		// The subject cell is what the row's fixed parts leave; the graph
+		// gutter and the ref labels give way before it vanishes.
+		let widths = if list_w > 0. {
+			row_widths(list_w, gutter_w, labels_w, self.log_show_hash)
+		} else {
+			// Not laid out yet: no width to divide.
+			RowWidths {
+				gutter: gutter_w,
+				labels: labels_w,
+				subject: 0.,
+			}
+		};
+		let (gutter_w, subject_room) = (widths.gutter, widths.subject);
+		let labels = if widths.labels > 0. {
+			labels
+		} else {
+			Vec::new()
+		};
 		let truncated = text_width(window, &c.subject, UI_TEXT) > subject_room;
 		let row_id = format!("commit-row:{key}");
 		let col_id = format!("collapse:{key}");
@@ -680,6 +690,7 @@ impl WorkbenchModel {
 					.flex_shrink_0()
 					.w(px(gutter_w))
 					.h(px(graph_view::ROW_HEIGHT))
+					.overflow_hidden()
 					.when_some(graph_row, |el, r| {
 						el.child(
 							canvas(
@@ -761,6 +772,9 @@ impl WorkbenchModel {
 							.flex_row()
 							.items_center()
 							.gap(px(8.))
+							.when(widths.labels < labels_w, |d| {
+								d.w(px(widths.labels)).overflow_hidden()
+							})
 							.children(labels),
 					),
 			)
