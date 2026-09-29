@@ -492,7 +492,13 @@ fn change_style(ct: Option<ChangeType>) -> (&'static str, u32) {
 /// (whether or not overwriting is allowed yet), deleted grey.
 pub(crate) fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 	if !item.selected {
-		("op_excluded", pal().text_disabled, "reason_excluded")
+		// A commit replay cannot drop one file: the whole replay is refused.
+		let reason = if item.commit.is_some() {
+			"reason_commit_excluded"
+		} else {
+			"reason_excluded"
+		};
+		("op_excluded", pal().text_disabled, reason)
 	} else if item.action_label == "SKIP" {
 		// Commit replay only: the file is listed but never written.
 		(
@@ -510,6 +516,14 @@ pub(crate) fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 		("op_create", pal().git_added, "reason_create")
 	} else if item.overwrite_allowed {
 		("op_overwrite", pal().git_modified, "reason_overwrite")
+	} else if item.commit.is_some() {
+		// The replay overwrites once allowed; until then Apply is refused
+		// (`commit_overwrite_required`), so nothing is skipped.
+		(
+			"op_overwrite_pending",
+			pal().git_modified,
+			"reason_commit_overwrite_pending",
+		)
 	} else {
 		("op_skip", pal().git_modified, "reason_exists")
 	}
@@ -540,26 +554,31 @@ pub(crate) fn paste_counts(plan: &PastePreviewPlan) -> PasteCounts {
 			"op_create" => c.creates += 1,
 			"op_overwrite" => c.overwrites += 1,
 			"op_delete" => c.deletes += 1,
+			// Blocks Apply rather than being skipped.
+			"op_overwrite_pending" => {}
+			"op_excluded" if it.commit.is_some() => {}
 			_ => c.skips += 1,
 		}
 	}
 	c
 }
 
-/// A commit's file rows and how many of them are not written (skipped,
-/// excluded or a delete of a missing file), from the same [`paste_op`] that
-/// colours the rows.
+/// A commit's file rows and how many of them the replay does not write (a
+/// skipped file or a delete of a missing file), from the same [`paste_op`]
+/// that labels the rows. Rows an allowed overwrite or a re-included file
+/// would unblock are not "not written". Items are grouped by commit, so this
+/// walks only that commit's run.
 pub(crate) fn commit_counts(
 	plan: &PastePreviewPlan,
 	c: usize,
 ) -> (usize, usize) {
-	let rows = plan.items.iter().filter(|i| i.commit == Some(c));
+	let start = plan.items.partition_point(|i| i.commit < Some(c));
+	let rows = plan.items[start..]
+		.iter()
+		.take_while(|i| i.commit == Some(c));
 	rows.fold((0, 0), |(n, off), it| {
-		let written = matches!(
-			paste_op(it).0,
-			"op_create" | "op_overwrite" | "op_delete"
-		);
-		(n + 1, off + usize::from(!written))
+		let not_written = paste_op(it).0 == "op_skip";
+		(n + 1, off + usize::from(not_written))
 	})
 }
 

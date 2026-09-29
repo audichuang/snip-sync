@@ -6804,7 +6804,7 @@ mod tests {
 						"op_create:dir/new.txt",
 						"C1",
 						"C2",
-						"op_skip:base.txt",
+						"op_overwrite_pending:base.txt",
 					]
 				);
 				let preview = plan.commit_preview.as_ref().unwrap();
@@ -6832,11 +6832,25 @@ mod tests {
 						overwrites: 0,
 						existing: 1,
 						deletes: 1,
-						// img.bin, and base.txt until overwrite is allowed
-						skips: 2,
+						// img.bin; base.txt waits for overwrite (blocks
+						// Apply) and is not a skip
+						skips: 1,
 					}
 				);
-				// Nothing to write in c2 does not block Apply.
+				// An excluded row rejects the whole replay: it is not a
+				// counted skip either.
+				let mut excluded = plan.items[0].clone();
+				excluded.selected = false;
+				assert_eq!(
+					crate::ui::paste_op(&excluded),
+					(
+						"op_excluded",
+						crate::theme::pal().text_disabled,
+						"reason_commit_excluded"
+					)
+				);
+				// The empty commit is applied too: see
+				// `commit_apply_creates_the_empty_commit_too` in paste.rs.
 				assert!(plan.executable());
 			});
 		}
@@ -6885,7 +6899,7 @@ mod tests {
 				// Header counts agree with the rows under them.
 				assert_eq!(crate::ui::commit_counts(plan, 0), (4, 1));
 				assert_eq!(crate::ui::commit_counts(plan, 1), (0, 0));
-				assert_eq!(crate::ui::commit_counts(plan, 2), (1, 1));
+				assert_eq!(crate::ui::commit_counts(plan, 2), (1, 0));
 			});
 			// Folding commit #1 removes its rows but keeps every header.
 			model.update(cx, |m, cx| m.toggle_paste_commit(0, cx));

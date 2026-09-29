@@ -2489,6 +2489,15 @@ mod tests {
 		git_init(&path);
 		fs::write(path.join("a.txt"), "base\n").unwrap();
 		fs::write(path.join("old.txt"), "old\n").unwrap();
+		for args in [&["add", "."][..], &["commit", "-qm", "base"][..]] {
+			let ok = std::process::Command::new("git")
+				.current_dir(&path)
+				.args(args)
+				.status()
+				.unwrap()
+				.success();
+			assert!(ok, "git {args:?}");
+		}
 		let plan = PastePreviewPlan::build_from_clipboard_text(
 			&commit_payload_mixed(),
 			&path,
@@ -2548,6 +2557,33 @@ mod tests {
 		// The empty commit has no rows but is still applied.
 		assert!(plan.items.iter().all(|i| i.commit != Some(1)));
 		assert!(plan.executable());
+	}
+
+	#[test]
+	fn commit_apply_creates_the_empty_commit_too() {
+		let (dir, mut plan) = mixed_plan();
+		let count = || {
+			let out = std::process::Command::new("git")
+				.current_dir(dir.path())
+				.args(["rev-list", "--count", "HEAD"])
+				.output()
+				.unwrap();
+			String::from_utf8(out.stdout)
+				.unwrap()
+				.trim()
+				.parse::<usize>()
+		};
+		let before = count().unwrap();
+		// The existing a.txt is not skipped: Apply waits for the overwrite.
+		assert_eq!(
+			plan.execute().unwrap_err().key,
+			"commit_overwrite_required"
+		);
+		assert_eq!(count().unwrap(), before);
+		plan.set_all_overwrite(true);
+		let applied = plan.execute().unwrap();
+		assert_eq!(applied.created_commits.len(), 3);
+		assert_eq!(count().unwrap(), before + 3);
 	}
 
 	#[test]
