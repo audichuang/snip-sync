@@ -6889,8 +6889,8 @@ mod tests {
 				"paste-commit:1",
 				"paste-commit:2",
 				"paste-commit-count",
-				"paste-row:img.bin",
-				"paste-row:base.txt",
+				"paste-row:0:img.bin",
+				"paste-row:4:base.txt",
 			] {
 				assert!(ids.contains(&id.to_string()), "{id} in {ids:?}");
 			}
@@ -6923,8 +6923,11 @@ mod tests {
 			settle(cx);
 			let ids = drawn(cx);
 			assert!(ids.contains(&"paste-commit:0".to_string()));
-			assert!(!ids.contains(&"paste-row:img.bin".to_string()), "{ids:?}");
-			assert!(ids.contains(&"paste-row:base.txt".to_string()));
+			assert!(
+				!ids.contains(&"paste-row:0:img.bin".to_string()),
+				"{ids:?}"
+			);
+			assert!(ids.contains(&"paste-row:4:base.txt".to_string()));
 		}
 
 		#[gpui::test]
