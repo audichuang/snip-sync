@@ -343,12 +343,13 @@ pub(super) fn path_picker_matches(
 pub(super) const MAX_BRANCH_ROWS: usize = 200;
 pub(super) const AUTHOR_W: f32 = 120.;
 pub(super) const DATE_W: f32 = 118.;
-/// The subject width a log row keeps before its graph gutter and ref labels
-/// give way.
+/// The subject width a log row keeps while the gutter, author, date and ref
+/// labels are squeezed, where the window allows.
 pub(super) const MIN_SUBJECT_W: f32 = 160.;
-/// The narrowest a ref-label group or the graph gutter is squeezed to
-/// before the labels are dropped altogether.
+/// The narrowest a ref-label group is squeezed to; below it the labels are
+/// dropped altogether.
 const MIN_LABELS_W: f32 = 80.;
+/// The narrowest the graph gutter is clipped to.
 const MIN_GUTTER_W: f32 = 72.;
 
 /// The narrowest the author and date cells are squeezed to (their text is
@@ -388,7 +389,11 @@ fn row_base(list_w: f32, show_hash: bool) -> f32 {
 /// `has_labels`, and the subject need), then no further than
 /// [`MIN_GUTTER_W`]; below that the date and then the author cell shrink
 /// until the subject reaches [`MIN_SUBJECT_W`]. On a very narrow list the
-/// subject takes what is left.
+/// subject takes what is left. With `has_labels`, the room the gutter floor
+/// takes back from the label reserve is made up by the date and author, so
+/// the labels keep [`MIN_LABELS_W`]. [`MIN_SUBJECT_W`] is not guaranteed on
+/// lists under about 520px with the hash column on (a 900 window with the
+/// hash shown leaves the subject about 97px).
 pub(super) fn list_cols(
 	list_w: f32,
 	gutter_w: f32,
@@ -403,6 +408,11 @@ pub(super) fn list_cols(
 	// What the subject still lacks with the gutter placed.
 	let mut lack =
 		(MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
+	// The gutter floor took back part of the label reserve; date and author
+	// give that room up so the labels still fit.
+	if has_labels {
+		lack += (gutter - room).max(0.);
+	}
 	let date = DATE_W - lack.min(DATE_W - MIN_DATE_W);
 	lack -= DATE_W - date;
 	let author = AUTHOR_W - lack.min(AUTHOR_W - MIN_AUTHOR_W);
@@ -1687,8 +1697,9 @@ mod row_width_tests {
 		// in the in-process tests `wide_multi_repo_log_keeps_a_subject_at_*`).
 		for list_w in [433., 480., 574., 720., 900.] {
 			for show_hash in [false, true] {
-				// The hash column costs 72px; a list this narrow with it is
-				// below what any squeeze can save.
+				// Known limit (see `list_cols`): the hash column costs 72px,
+				// and a list this narrow with it is below what any squeeze
+				// can save (433px with hash leaves a 97px subject).
 				if show_hash && list_w < 520. {
 					continue;
 				}
@@ -1707,6 +1718,15 @@ mod row_width_tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn a_1080_window_keeps_ref_labels_and_a_subject() {
+		// 574px is the list a 1080 window leaves, hash off, long labels.
+		let c = cols(574., WIDE_GUTTER, true, false);
+		let w = row_widths(574., c, 337., false);
+		assert!(w.labels >= MIN_LABELS_W, "{c:?} {w:?}");
+		assert!(w.subject >= MIN_SUBJECT_W, "{c:?} {w:?}");
 	}
 
 	#[test]

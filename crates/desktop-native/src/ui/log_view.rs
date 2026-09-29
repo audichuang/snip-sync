@@ -771,6 +771,10 @@ impl WorkbenchModel {
 							})
 							.child(c.subject.clone()),
 					)
+					// Out of scope: `row_widths` does not count this chip (and
+					// its 6px gap), so a collapsed merge row's subject is a
+					// little narrower than `subject_room` and the truncation
+					// check for its tooltip can be off.
 					.when(collapsed, |d| {
 						d.child(
 							div()
