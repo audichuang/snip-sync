@@ -294,6 +294,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_paste_preview" => "貼上預覽已就緒: {} 項變更",
 			"paste_err_not_payload" => "剪貼簿內容不是有效的 snip-sync payload",
 			"paste_err_nothing" => "剪貼簿 payload 不包含任何檔案",
+			"paste_err_plan" => "無法建立貼上計畫: {}",
+			"paste_err_destination" => "無法使用貼上目的地「{}」: {}",
+			"paste_err_destination_not_dir" => "貼上目的地「{}」不是資料夾",
 			"preview_memory_limit" => "預覽資料超過 32 MiB 上限，未載入這次變更。請縮小預覽範圍。",
 			"stale_created" => "目的地檔案已在外部建立: {}",
 			"stale_deleted" => "目的地檔案已在外部刪除: {}",
@@ -623,6 +626,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_paste_preview" => "Paste preview ready: {} items",
 			"paste_err_not_payload" => "Clipboard content is not a valid snip-sync payload",
 			"paste_err_nothing" => "Clipboard payload contains no files",
+			"paste_err_plan" => "Could not build the paste plan: {}",
+			"paste_err_destination" => "Cannot use paste destination \"{}\": {}",
+			"paste_err_destination_not_dir" => "Paste destination \"{}\" is not a directory",
 			"preview_memory_limit" => "Preview data exceeds the 32 MiB limit. This change was not loaded. Choose a smaller preview.",
 			"stale_created" => "Destination file was created externally: {}",
 			"stale_deleted" => "Destination file was deleted externally: {}",
@@ -773,6 +779,58 @@ mod tests {
 	}
 
 	#[test]
+	fn paste_err_destination_names_path_and_reason() {
+		let msg = Msg::new(
+			"paste_err_destination",
+			["/t/newdir/x".to_string(), "Not a directory".to_string()],
+		);
+		for loc in [Locale::ZhTw, Locale::En] {
+			let s = msg.render(loc);
+			assert!(!s.starts_with("paste_err_"), "raw key leaked: {s}");
+			assert!(s.contains("/t/newdir/x") && s.contains("Not a directory"));
+		}
+	}
+
+	/// Every `Msg::new("key", ..)` in this crate must have both translations,
+	/// or the status bar shows the raw key.
+	#[test]
+	fn every_msg_key_used_in_source_is_translated() {
+		let mut keys = std::collections::BTreeSet::new();
+		let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+		let mut stack = vec![dir];
+		while let Some(d) = stack.pop() {
+			for e in std::fs::read_dir(d).unwrap() {
+				let p = e.unwrap().path();
+				if p.is_dir() {
+					stack.push(p);
+				} else if p.extension().is_some_and(|x| x == "rs")
+					&& p.file_name().is_some_and(|n| n != "i18n.rs")
+				{
+					let src = std::fs::read_to_string(&p).unwrap();
+					let mut rest = src.as_str();
+					while let Some(at) = rest.find("Msg::new(") {
+						rest = rest[at + 9..].trim_start();
+						let key = rest
+							.strip_prefix('"')
+							.and_then(|r| r.split('"').next());
+						if let Some(key) = key {
+							keys.insert(key.to_string());
+						}
+					}
+				}
+			}
+		}
+		assert!(keys.len() > 20, "scan found too few keys: {keys:?}");
+		for key in keys {
+			assert!(
+				!t(&key, Locale::ZhTw).is_empty(),
+				"Missing ZhTw key: {key}"
+			);
+			assert!(!t(&key, Locale::En).is_empty(), "Missing En key: {key}");
+		}
+	}
+
+	#[test]
 	fn test_i18n_keys_parity() {
 		let test_keys = [
 			"btn_back_to_working",
@@ -866,6 +924,9 @@ mod tests {
 			"menu_copy_files",
 			"status_copied_limit",
 			"status_copy_nothing_skipped",
+			"paste_err_plan",
+			"paste_err_destination",
+			"paste_err_destination_not_dir",
 		];
 		for key in test_keys {
 			assert!(

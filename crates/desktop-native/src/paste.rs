@@ -597,6 +597,15 @@ fn root_name(path: &Path) -> String {
 		.unwrap_or_else(|| path.display().to_string())
 }
 
+/// A destination that could not be opened or captured, named by path so the
+/// status says which directory was refused (the OS error alone does not).
+fn destination_error(dest: &Path, err: &dyn std::fmt::Display) -> Msg {
+	Msg::new(
+		"paste_err_destination",
+		[dest.display().to_string(), err.to_string()],
+	)
+}
+
 fn stale_msg(err: TransferError) -> Msg {
 	match err {
 		TransferError::StaleDestination { reason, .. } => {
@@ -886,9 +895,7 @@ impl PastePreviewPlan {
 		let payload = commits::parse_commit_payload(raw_text)
 			.map_err(|e| Msg::new("paste_err_plan", [e.to_string()]))?;
 		let preview = CommitReplayPreview::capture_with(dest, &payload, opts)
-			.map_err(|e| {
-			Msg::new("paste_err_destination", [e.to_string()])
-		})?;
+			.map_err(|e| destination_error(dest, &e))?;
 		let preview = Arc::new(preview);
 		let mut plan = Self {
 			destination: preview.destination.clone(),
@@ -989,10 +996,10 @@ impl PastePreviewPlan {
 		dest: &Path,
 	) -> Result<(), Msg> {
 		let id = CanonicalRootId::new(dest)
-			.map_err(|e| Msg::new("paste_err_destination", [e.to_string()]))?;
+			.map_err(|e| destination_error(dest, &e))?;
 		if !id.path().is_dir() {
 			return Err(Msg::new(
-				"paste_err_destination",
+				"paste_err_destination_not_dir",
 				[id.path().display().to_string()],
 			));
 		}
@@ -1088,7 +1095,7 @@ impl PastePreviewPlan {
 			return Ok(());
 		}
 		let primary = CanonicalRootId::new(&self.destination)
-			.map_err(|e| Msg::new("paste_err_destination", [e.to_string()]))?;
+			.map_err(|e| destination_error(&self.destination, &e))?;
 		let mut dest_roots = vec![self.destination.clone()];
 		let mut mapping = ImportMapping::with_primary(primary);
 		for choice in &self.prefix_choices {
@@ -1101,9 +1108,8 @@ impl PastePreviewPlan {
 			if !dest_roots.iter().any(|r| r == &dest) {
 				dest_roots.push(dest.clone());
 			}
-			let id = CanonicalRootId::new(&dest).map_err(|e| {
-				Msg::new("paste_err_destination", [e.to_string()])
-			})?;
+			let id = CanonicalRootId::new(&dest)
+				.map_err(|e| destination_error(&dest, &e))?;
 			mapping.map_prefix(&choice.prefix, id);
 		}
 		let import_plan = match plan_import_with(
@@ -2333,6 +2339,30 @@ mod tests {
 		assert!(!primary.join("lib/a.txt").exists());
 		assert!(!primary.join("a.txt").exists());
 		assert!(!same.join("a.txt").exists());
+	}
+
+	#[test]
+	fn destination_blocked_by_a_file_is_reported_with_its_path() {
+		let tmp = tempfile::tempdir().unwrap();
+		let primary = tmp.path().join("dest");
+		let blocker = tmp.path().join("newdir");
+		fs::create_dir(&primary).unwrap();
+		fs::write(&blocker, "not a dir").unwrap();
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			"// FILE: lib/a.txt\nbody\n",
+			&primary,
+			std::slice::from_ref(&primary),
+			1,
+		)
+		.unwrap();
+		let below = blocker.join("lib");
+		let err = plan.set_prefix_destination("lib", &below).unwrap_err();
+		assert_eq!(err.key, "paste_err_destination");
+		let text = err.render(crate::i18n::Locale::En);
+		assert!(!text.starts_with("paste_err_"), "raw key leaked: {text}");
+		assert!(text.contains(&*below.to_string_lossy()), "{text}");
+		let not_dir = plan.set_prefix_destination("lib", &blocker).unwrap_err();
+		assert_eq!(not_dir.key, "paste_err_destination_not_dir");
 	}
 
 	#[test]
