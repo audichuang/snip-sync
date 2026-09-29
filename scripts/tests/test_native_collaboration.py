@@ -1823,12 +1823,38 @@ class ReportOutcomeTests(unittest.TestCase):
         session = _FlowSession()
         manifest = {"repos": [{"repoId": "a", "basename": "source", "relativePath": "machine-a/source"}, {"repoId": "b", "basename": "dest", "relativePath": "machine-b/dest"}]}
         step = {"operation": {"sourceRepoId": "a", "destRepoId": "b", "sourcePath": "src/app.txt"}}
-        native = SimpleNamespace(parse_bounds=lambda lines: {"paste-overwrite:src/app.txt": (0, 0, 10, 10)}, require_control=lambda lines, control: (0, 0, 10, 10))
+        native = SimpleNamespace(parse_bounds=lambda lines: {"paste-overwrite:0:src/app.txt": (0, 0, 10, 10)}, require_control=lambda lines, control: (0, 0, 10, 10))
         with tempfile.TemporaryDirectory() as tmp, patch.object(driver, "select_repo"), patch.object(driver, "select_tree_file") as tree, patch.object(driver, "preview_change", side_effect=AssertionError("unchanged file is absent from Changes")), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "copy_from_button", return_value=b"payload"), patch.object(driver, "transfer_os_clipboard"), patch.object(driver, "paste_preview", return_value="preview"), patch.object(driver, "apply_or_cancel", return_value="[APP:PASTE_DONE: created=0 overwritten=0 skipped=1]"):
             record = driver.blank_step("neg-overwrite-unauthorized")
             driver.run_unauthorized(native, {"a": session, "b": session}, manifest, step, {}, Path(tmp), Path(tmp), 1, [], record, Path(tmp))
             tree.assert_called_once()
             self.assertEqual(record["status"], "passed")
+
+
+class PasteOverwriteControlTests(unittest.TestCase):
+    def test_path_is_recovered_from_an_indexed_control_id(self):
+        self.assertEqual(driver.paste_overwrite_path("paste-overwrite:3:src/a:b.txt"), "src/a:b.txt")
+        self.assertIsNone(driver.paste_overwrite_path("paste-overwrite:src/a.txt"))
+        self.assertIsNone(driver.paste_overwrite_path("paste-include:3:src/a.txt"))
+
+    def test_duplicate_paths_yield_one_control_per_row_in_plan_order(self):
+        bounds = {"paste-overwrite:10:same.txt": 0, "paste-overwrite:2:same.txt": 0, "paste-overwrite:5:other.txt": 0}
+        self.assertEqual(driver.paste_overwrite_controls(bounds, "same.txt"), ["paste-overwrite:2:same.txt", "paste-overwrite:10:same.txt"])
+
+    def test_click_overwrites_clicks_every_row_of_a_duplicated_path(self):
+        session = _FlowSession()
+        state = {"toggled": []}
+        bounds = {"paste-items": (0, 0, 100, 100), "paste-overwrite:0:same.txt": (0, 0, 10, 10), "paste-overwrite:1:same.txt": (0, 20, 10, 10)}
+        native = SimpleNamespace(parse_bounds=lambda lines: bounds, assert_on_window=lambda *a: None)
+        session.click = lambda win, box: state["toggled"].append(box)
+        session.texts = lambda: []
+        session.focus = lambda wid: None
+        session.x = lambda *args: None
+        trace: list = []
+        with patch.object(driver, "wait_control"), patch.object(driver, "wait_substr", return_value="[APP:PASTE_TOGGLED: idx=0 state=true]"):
+            clicked = driver.click_overwrites(native, session, {"wid": "1", "x": 0, "y": 0}, ["same.txt"], 1, trace)
+        self.assertEqual(clicked, ["paste-overwrite:0:same.txt", "paste-overwrite:1:same.txt"])
+        self.assertEqual(len(state["toggled"]), 2)
 
 
 class StaleSourceFlowTests(unittest.TestCase):

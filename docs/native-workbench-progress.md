@@ -237,7 +237,7 @@ just preflight
 3. **多來源目的地映射與貼上預覽（Multi-Source Destination Mapping）**：
    - 貼上預覽採用 `snip_core::transfer::ImportMapping` 與多儲存庫前綴比對。
    - 貼上列呈現目標儲存庫徽章 `[item.dest_root_name]`。
-   - 支援個別項目覆寫切換（`paste-overwrite:{path}`），預設關閉覆寫。
+   - 支援個別項目覆寫切換（`paste-overwrite:{ix}:{path}`），預設關閉覆寫。
    - 目的地過期即時偵測拒絕寫入。
 
 4. **Commit Replay 匯出與套用（Commit Replay）**：

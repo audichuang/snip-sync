@@ -29,3 +29,89 @@ pub fn scaled(d: Duration) -> Duration {
 			.unwrap_or(1.0)
 	}))
 }
+
+/// Splits a paste row control id `paste-<kind>:<ix>:<path>` into its plan
+/// index and path (the path may itself contain `:`).
+pub fn parse_paste_id<'a>(id: &'a str, kind: &str) -> Option<(usize, &'a str)> {
+	let rest = id
+		.strip_prefix("paste-")?
+		.strip_prefix(kind)?
+		.strip_prefix(':')?;
+	let (ix, path) = rest.split_once(':')?;
+	Some((ix.parse().ok()?, path))
+}
+
+/// Every drawn `paste-<kind>` control for `path`, in plan order. One relative
+/// path can appear several times in a plan (two roots, or two commits).
+pub fn paste_ids<'a>(
+	ids: impl IntoIterator<Item = &'a str>,
+	kind: &str,
+	path: &str,
+) -> Vec<&'a str> {
+	let mut found: Vec<(usize, &str)> = ids
+		.into_iter()
+		.filter_map(|id| {
+			let (ix, p) = parse_paste_id(id, kind)?;
+			(p == path).then_some((ix, id))
+		})
+		.collect();
+	found.sort();
+	found.into_iter().map(|(_, id)| id).collect()
+}
+
+/// Bounds of control `id`. A paste id written without the plan index
+/// (`paste-overwrite:a.txt`) resolves to the first such row in plan order.
+pub fn lookup_bounds(
+	bounds: &std::collections::HashMap<String, [i32; 4]>,
+	id: &str,
+) -> Option<[i32; 4]> {
+	if let Some(v) = bounds.get(id) {
+		return Some(*v);
+	}
+	let rest = id.strip_prefix("paste-")?;
+	let (kind, path) = rest.split_once(':')?;
+	let first = paste_ids(bounds.keys().map(String::as_str), kind, path)
+		.into_iter()
+		.next()?;
+	bounds.get(first).copied()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::collections::HashMap;
+
+	#[test]
+	fn paste_ids_resolve_by_path_and_keep_plan_order() {
+		let ids = [
+			"paste-overwrite:10:a:b.txt",
+			"paste-overwrite:2:a:b.txt",
+			"paste-overwrite:3:other.txt",
+			"paste-include:1:a:b.txt",
+			"btn-apply",
+		];
+		assert_eq!(
+			paste_ids(ids, "overwrite", "a:b.txt"),
+			["paste-overwrite:2:a:b.txt", "paste-overwrite:10:a:b.txt"]
+		);
+		assert_eq!(
+			parse_paste_id("paste-row:7:長路徑/a b.txt", "row"),
+			Some((7, "長路徑/a b.txt"))
+		);
+		assert_eq!(parse_paste_id("paste-row:x:a.txt", "row"), None);
+		let bounds: HashMap<String, [i32; 4]> = [
+			("paste-overwrite:5:same.txt".to_string(), [5, 0, 1, 1]),
+			("paste-overwrite:1:same.txt".to_string(), [1, 0, 1, 1]),
+		]
+		.into();
+		assert_eq!(
+			lookup_bounds(&bounds, "paste-overwrite:same.txt"),
+			Some([1, 0, 1, 1])
+		);
+		assert_eq!(
+			lookup_bounds(&bounds, "paste-overwrite:5:same.txt"),
+			Some([5, 0, 1, 1])
+		);
+		assert_eq!(lookup_bounds(&bounds, "paste-overwrite:none.txt"), None);
+	}
+}

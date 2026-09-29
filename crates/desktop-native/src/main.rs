@@ -6830,6 +6830,169 @@ mod tests {
 			});
 		}
 
+		/// Click the centre of the rendered control `id`, the way a user
+		/// does. Fails when the UI renders no such element, so it also pins
+		/// the id shape the drivers rely on.
+		fn click(cx: &mut VisualTestContext, id: &'static str) {
+			cx.run_until_parked();
+			let bounds = cx
+				.debug_bounds(id)
+				.unwrap_or_else(|| panic!("no rendered control {id}"));
+			cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+			cx.run_until_parked();
+		}
+
+		#[gpui::test]
+		fn one_path_under_two_roots_toggles_and_applies_per_row(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let alpha =
+				repo(ws.path(), "alpha", &[("unrelated.txt", "alpha old")]);
+			let beta =
+				repo(ws.path(), "beta", &[("unrelated.txt", "beta old")]);
+			let (_dest, dest) = canonical_tmp();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(
+				&model,
+				cx,
+				"// FILE: alpha/unrelated.txt\nalpha new\n// FILE: beta/unrelated.txt\nbeta new\n",
+			);
+			for (prefix, root) in [("alpha", &alpha), ("beta", &beta)] {
+				let root = dunce::canonicalize(root).unwrap();
+				let idx = model.read_with(cx, |m, _| {
+					let plan = m.paste_preview.as_ref().unwrap();
+					let choice = plan
+						.prefix_choices
+						.iter()
+						.find(|c| c.prefix == prefix)
+						.unwrap();
+					choice.candidates.iter().position(|c| *c == root).unwrap()
+				});
+				model
+					.update(cx, |m, cx| m.choose_paste_prefix(prefix, idx, cx));
+				settle(cx);
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert_eq!(plan.items.len(), 2);
+				assert!(plan.items.iter().all(|i| i.path == "unrelated.txt"));
+				assert_ne!(
+					plan.items[0].dest_root_name,
+					plan.items[1].dest_root_name
+				);
+			});
+			// Clicks land on the rendered controls of the second row.
+			click(cx, "paste-row:1:unrelated.txt");
+			click(cx, "paste-overwrite:1:unrelated.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert_eq!(plan.selected_item_idx, 1);
+				assert!(!plan.items[0].overwrite_allowed);
+				assert!(plan.items[1].overwrite_allowed);
+			});
+			click(cx, "paste-include:1:unrelated.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(plan.items[0].selected);
+				assert!(!plan.items[1].selected);
+			});
+			click(cx, "paste-include:1:unrelated.txt");
+			click(cx, "paste-row:0:unrelated.txt");
+			click(cx, "paste-overwrite:0:unrelated.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert_eq!(plan.selected_item_idx, 0);
+				assert!(plan.items.iter().all(|i| i.selected));
+				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
+			});
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert_eq!(
+				fs::read_to_string(alpha.join("unrelated.txt")).unwrap(),
+				"alpha new"
+			);
+			assert_eq!(
+				fs::read_to_string(beta.join("unrelated.txt")).unwrap(),
+				"beta new"
+			);
+		}
+
+		#[gpui::test]
+		fn one_path_in_two_commits_confirms_each_overwrite(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			git(&dest, &["init", "-q", "-b", "main"]);
+			fs::write(dest.join("common.txt"), "base\n").unwrap();
+			git(&dest, &["add", "."]);
+			git(&dest, &["commit", "-q", "-m", "base"]);
+			let commit = |n: u8| CommitRecord {
+				message: format!("edit {n}\n"),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: format!("2026-09-2{n}T12:00:00+00:00"),
+				files: vec![CommitFile {
+					path: "common.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some(format!("edit {n}\n")),
+					not_copied: None,
+				}],
+			};
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![commit(1), commit(2)],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert_eq!(plan.items.len(), 2);
+				assert!(plan.items.iter().all(|i| {
+					i.path == "common.txt" && i.action_label == "OVERWRITE"
+				}));
+			});
+			// The second overwrite is what used to be unreachable.
+			click(cx, "paste-overwrite:1:common.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(!plan.items[0].overwrite_allowed);
+				assert!(plan.items[1].overwrite_allowed);
+			});
+			click(cx, "paste-overwrite:0:common.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
+			});
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert_eq!(
+				fs::read_to_string(dest.join("common.txt")).unwrap(),
+				"edit 2\n"
+			);
+			let log = Command::new("git")
+				.current_dir(&dest)
+				.args(["log", "--format=%s"])
+				.output()
+				.unwrap();
+			assert_eq!(
+				String::from_utf8_lossy(&log.stdout),
+				"edit 2\nedit 1\nbase\n"
+			);
+		}
+
 		#[gpui::test]
 		fn keeping_an_ambiguous_prefix_replans_under_the_destination(
 			cx: &mut TestAppContext,
