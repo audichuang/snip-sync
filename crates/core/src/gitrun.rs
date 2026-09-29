@@ -2160,6 +2160,7 @@ mod tests {
 	/// `sleep 10` it exited on its own right at the deadline on a loaded Mac,
 	/// so the check saw a clean empty `ps` (`Other`) instead of `TimedOut`.
 	/// The helper is killed at the deadline, so the length costs nothing.
+	#[cfg(unix)]
 	const HANG_HELPER: &str = "sleep 300";
 
 	#[cfg(unix)]
