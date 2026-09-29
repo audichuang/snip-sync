@@ -6830,6 +6830,168 @@ mod tests {
 			});
 		}
 
+		/// Distinct control ids, item by item: equal ids share GPUI state, so
+		/// the second row of a repeated path would ignore every click.
+		fn assert_row_ids_unique(plan: &crate::paste::PastePreviewPlan) {
+			let mut ids = std::collections::HashSet::new();
+			for (ix, item) in plan.items.iter().enumerate() {
+				for kind in ["row", "include", "overwrite"] {
+					let id = crate::paste::control_id(kind, ix, &item.path);
+					assert!(ids.insert(id.clone()), "duplicate id {id}");
+				}
+			}
+		}
+
+		#[gpui::test]
+		fn one_path_under_two_roots_toggles_and_applies_per_row(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let alpha =
+				repo(ws.path(), "alpha", &[("unrelated.txt", "alpha old")]);
+			let beta =
+				repo(ws.path(), "beta", &[("unrelated.txt", "beta old")]);
+			let (_dest, dest) = canonical_tmp();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(
+				&model,
+				cx,
+				"// FILE: alpha/unrelated.txt\nalpha new\n// FILE: beta/unrelated.txt\nbeta new\n",
+			);
+			for (prefix, root) in [("alpha", &alpha), ("beta", &beta)] {
+				let root = dunce::canonicalize(root).unwrap();
+				let idx = model.read_with(cx, |m, _| {
+					let plan = m.paste_preview.as_ref().unwrap();
+					let choice = plan
+						.prefix_choices
+						.iter()
+						.find(|c| c.prefix == prefix)
+						.unwrap();
+					choice.candidates.iter().position(|c| *c == root).unwrap()
+				});
+				model
+					.update(cx, |m, cx| m.choose_paste_prefix(prefix, idx, cx));
+				settle(cx);
+			}
+			// Item index of the row landing in `name`'s repository.
+			let row_in = |cx: &mut VisualTestContext, name: &str| {
+				model.read_with(cx, |m, _| {
+					let plan = m.paste_preview.as_ref().unwrap();
+					assert_eq!(plan.items.len(), 2);
+					assert!(plan
+						.items
+						.iter()
+						.all(|i| i.path == "unrelated.txt"));
+					assert_row_ids_unique(plan);
+					plan.items
+						.iter()
+						.position(|i| i.dest_root_name == name)
+						.unwrap()
+				})
+			};
+			let (a, b) = (row_in(cx, "alpha"), row_in(cx, "beta"));
+			assert_ne!(a, b);
+			// Each row's controls act on that row alone.
+			model.update(cx, |m, cx| m.select_paste_item(b, cx));
+			model.update(cx, |m, cx| m.toggle_paste_overwrite(b, cx));
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert_eq!(plan.selected_item_idx, b);
+				assert!(!plan.items[a].overwrite_allowed);
+				assert!(plan.items[b].overwrite_allowed);
+			});
+			model.update(cx, |m, cx| m.toggle_paste_selected(a, cx));
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(!plan.items[a].selected);
+				assert!(plan.items[b].selected);
+			});
+			model.update(cx, |m, cx| m.toggle_paste_selected(a, cx));
+			model.update(cx, |m, cx| m.toggle_paste_overwrite(a, cx));
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert_eq!(
+				fs::read_to_string(alpha.join("unrelated.txt")).unwrap(),
+				"alpha new"
+			);
+			assert_eq!(
+				fs::read_to_string(beta.join("unrelated.txt")).unwrap(),
+				"beta new"
+			);
+		}
+
+		#[gpui::test]
+		fn one_path_in_two_commits_confirms_each_overwrite(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			git(&dest, &["init", "-q", "-b", "main"]);
+			fs::write(dest.join("common.txt"), "base\n").unwrap();
+			git(&dest, &["add", "."]);
+			git(&dest, &["commit", "-q", "-m", "base"]);
+			let commit = |n: u8| CommitRecord {
+				message: format!("edit {n}\n"),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: format!("2026-09-2{n}T12:00:00+00:00"),
+				files: vec![CommitFile {
+					path: "common.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some(format!("edit {n}\n")),
+					not_copied: None,
+				}],
+			};
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![commit(1), commit(2)],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert_eq!(plan.items.len(), 2);
+				assert!(plan.items.iter().all(|i| {
+					i.path == "common.txt" && i.action_label == "OVERWRITE"
+				}));
+				assert_row_ids_unique(plan);
+			});
+			// The second overwrite is what used to be unreachable.
+			for ix in [1, 0] {
+				model.update(cx, |m, cx| m.toggle_paste_overwrite(ix, cx));
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
+			});
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert_eq!(
+				fs::read_to_string(dest.join("common.txt")).unwrap(),
+				"edit 2\n"
+			);
+			let log = Command::new("git")
+				.current_dir(&dest)
+				.args(["log", "--format=%s"])
+				.output()
+				.unwrap();
+			assert_eq!(
+				String::from_utf8_lossy(&log.stdout),
+				"edit 2\nedit 1\nbase\n"
+			);
+		}
+
 		#[gpui::test]
 		fn keeping_an_ambiguous_prefix_replans_under_the_destination(
 			cx: &mut TestAppContext,

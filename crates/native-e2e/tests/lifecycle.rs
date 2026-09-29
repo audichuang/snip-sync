@@ -408,9 +408,9 @@ fn control(id: &str) -> [i32; 4] {
 	let deadline = Instant::now() + scaled(Duration::from_secs(4));
 	loop {
 		let found = BOUNDS.with(|slot| {
-			slot.borrow()
-				.as_ref()
-				.and_then(|b| b.lock().unwrap().get(id).copied())
+			slot.borrow().as_ref().and_then(|b| {
+				snip_native_e2e::lookup_bounds(&b.lock().unwrap(), id)
+			})
 		});
 		if let Some(v) = found {
 			let (vw, vh) = VIEW.with(|slot| {
@@ -1198,9 +1198,9 @@ fn absent(id: &str) {
 	let deadline = Instant::now() + scaled(Duration::from_secs(4));
 	loop {
 		let shown = BOUNDS.with(|slot| {
-			slot.borrow()
-				.as_ref()
-				.is_some_and(|b| b.lock().unwrap().contains_key(id))
+			slot.borrow().as_ref().is_some_and(|b| {
+				snip_native_e2e::lookup_bounds(&b.lock().unwrap(), id).is_some()
+			})
 		});
 		if !shown {
 			return;

@@ -61,7 +61,7 @@ Guard 重驗：root `/home/audichuang/research/snip-sync`、branch `feature/ligh
 
 ### 實作選擇
 
-- **真實 bounds 取代假座標**：每個測試會點的控制項內放一個 absolute `canvas` probe，在 prepaint 取得實際 layout bounds（× `scale_factor` 轉實體像素），僅在變動時輸出 `[APP:CTRL_BOUNDS: id=… x y w h]`；另輸出 `[APP:VIEWPORT: WxH]`。id 用語意識別（`tree-row:<rel_path>`、`tree-chk:<rel_path>`、`paste-overwrite:<path>`、`btn-apply` 等），不用列 index。canvas 無 hitbox，不攔截點擊。
+- **真實 bounds 取代假座標**：每個測試會點的控制項內放一個 absolute `canvas` probe，在 prepaint 取得實際 layout bounds（× `scale_factor` 轉實體像素），僅在變動時輸出 `[APP:CTRL_BOUNDS: id=… x y w h]`；另輸出 `[APP:VIEWPORT: WxH]`。id 用語意識別（`tree-row:<rel_path>`、`tree-chk:<rel_path>`、`paste-overwrite:<ix>:<path>`（ix 為計畫內項目索引，同路徑重複時仍唯一）、`btn-apply` 等），不用列 index。canvas 無 hitbox，不攔截點擊。
 - **溢出修正**：所有含文字的 flex 列：文字 `flex_1 + min_w_0`，控制項 `flex_shrink_0`；覆寫開關固定寬度欄位放在路徑之前，不會被長路徑推出畫面。
 - **「…」截短**：GPUI 0.2.2 在 `whitespace_nowrap` 時以 wrap_width=None 快取第一次（未受限）的文字 layout，之後不再截短，只裁切。改用 `line_clamp(1) + text_ellipsis()`，寬度參與快取鍵，縮放視窗會重新截短。
 - **導覽不改選取**：舊 ↑/↓ 在變更清單會 toggle 勾選（違反 UI02「導航不偷改選取」）。改為只移動預覽；空白鍵才切換勾選。

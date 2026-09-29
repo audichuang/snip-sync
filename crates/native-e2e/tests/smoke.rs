@@ -84,10 +84,14 @@ fn parse_viewport(line: &str) -> Option<(i32, i32)> {
 #[test]
 fn bounds_line_parsing() {
 	let (id, v) = parse_bounds(
-		"[APP:CTRL_BOUNDS: id=paste-overwrite:長路徑/a b.txt x=12 y=-3 w=100 h=20]",
+		"[APP:CTRL_BOUNDS: id=paste-overwrite:3:長路徑/a b.txt x=12 y=-3 w=100 h=20]",
 	)
 	.unwrap();
-	assert_eq!(id, "paste-overwrite:長路徑/a b.txt");
+	assert_eq!(id, "paste-overwrite:3:長路徑/a b.txt");
+	assert_eq!(
+		snip_native_e2e::parse_paste_id(&id, "overwrite"),
+		Some((3, "長路徑/a b.txt"))
+	);
 	assert_eq!(v, [12, -3, 100, 20]);
 	assert_eq!(parse_viewport("[APP:VIEWPORT: 900x600]"), Some((900, 600)));
 	assert_eq!(
@@ -604,7 +608,9 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	let control = |id: &str| -> [i32; 4] {
 		let deadline = Instant::now() + scaled(Duration::from_secs(3));
 		loop {
-			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+			if let Some(v) =
+				snip_native_e2e::lookup_bounds(&bounds.lock().unwrap(), id)
+			{
 				let (vw, vh) = *viewport.lock().unwrap();
 				assert!(
 					v[2] > 0 && v[3] > 0,
@@ -630,7 +636,9 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	// Polls: the frame that drops the control can land well after the event.
 	let absent = |id: &str| {
 		let deadline = Instant::now() + scaled(Duration::from_secs(4));
-		while bounds.lock().unwrap().contains_key(id) {
+		while snip_native_e2e::lookup_bounds(&bounds.lock().unwrap(), id)
+			.is_some()
+		{
 			assert!(
 				Instant::now() < deadline,
 				"control {id} must not be drawn"
@@ -2379,7 +2387,9 @@ fn native_d3_basket_mapping_and_replay() {
 	let control = |id: &str| -> [i32; 4] {
 		let deadline = Instant::now() + scaled(Duration::from_secs(4));
 		loop {
-			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+			if let Some(v) =
+				snip_native_e2e::lookup_bounds(&bounds.lock().unwrap(), id)
+			{
 				let (vw, vh) = *viewport.lock().unwrap();
 				assert!(v[2] > 0 && v[3] > 0, "{id} empty {v:?}");
 				assert!(
@@ -2849,7 +2859,9 @@ fn native_d3_files_and_replay_skip_oracles() {
 	let control = |id: &str| -> [i32; 4] {
 		let deadline = Instant::now() + scaled(Duration::from_secs(4));
 		loop {
-			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+			if let Some(v) =
+				snip_native_e2e::lookup_bounds(&bounds.lock().unwrap(), id)
+			{
 				let (vw, vh) = *viewport.lock().unwrap();
 				assert!(
 					v[2] > 0

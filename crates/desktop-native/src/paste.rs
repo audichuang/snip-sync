@@ -581,6 +581,16 @@ fn canonical_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
 	out
 }
 
+/// Element and probe id of a paste row control: `paste-<kind>:<ix>:<path>`.
+/// `ix` is the item's index in the plan, which stays unique when several
+/// items share one relative path (the same file under two destination roots,
+/// or modified by two commits); GPUI merges the state of equal ids, so a
+/// path-only id left the second row's controls dead. The path stays last so
+/// drivers can recover it by splitting off `paste-<kind>:<ix>:`.
+pub fn control_id(kind: &str, ix: usize, path: &str) -> String {
+	format!("paste-{kind}:{ix}:{path}")
+}
+
 fn root_name(path: &Path) -> String {
 	path.file_name()
 		.map(|n| n.to_string_lossy().into_owned())

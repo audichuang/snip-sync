@@ -320,9 +320,9 @@ impl WorkbenchModel {
 			let (_, name_color, _) = paste_op(item);
 			let is_sel = ix == plan.selected_item_idx;
 			let path = item.path.clone();
-			let row_id = format!("paste-row:{path}");
-			let inc_id = format!("paste-include:{path}");
-			let ow_id = format!("paste-overwrite:{path}");
+			let row_id = crate::paste::control_id("row", ix, &path);
+			let inc_id = crate::paste::control_id("include", ix, &path);
+			let ow_id = crate::paste::control_id("overwrite", ix, &path);
 			let can_overwrite = item.dest_exists && !item.is_delete;
 			let ow_on = item.overwrite_allowed;
 			let (_, name) = split_dir(&path);
