@@ -36,7 +36,7 @@
 - B41–B44、B-notify
 - T25。判定是 `pass`、`fail` 或 `not-run` 時算進閘門。判定是 `blocked-contract` 時不決定閘門關不關
 
-T25 一定要做。重播結果符合規格 4.2（`binary.dat` 標成未複製，位元組仍是 `a`、NUL、`b`、換行）時，判 `pass` 或 `fail`，這一格算進閘門。結果仍把 `binary.dat` 刪掉時，用 `git log --oneline` 看受測 SHA 有沒有這筆主題：「刪除二進位／非 UTF-8 檔的 commit 標為未複製，貼上不再重播刪除」（分支 `fix/commit-binary-delete`）。還沒有就判定 `blocked-contract`；已經在歷史裡，同樣的刪除改判 `fail`，這一格留在閘門裡。沒做就記 `not-run`，閘門打開。
+T25 一定要做。`binary.dat` 仍在、位元組仍是 `a`、NUL、`b`、換行、並標成未複製時，這一格算進閘門，由下面兩項決定判定：根目錄 `gone.txt` 已刪除，而且 `dir/gone.txt` 仍是 `folder-gone`。兩項都成立是 `pass`，有一項不成立是 `fail`。`binary.dat` 被刪掉或位元組變了時，在受測 SHA 上執行 `git log --oneline --grep='不再重播刪除' -- crates/core`。沒有輸出就判定 `blocked-contract`；有輸出就判定 `fail`，這一格留在閘門裡。`-- crates/core` 不能省：只改文件的 commit 也可能在內文提到這幾個字，沒有路徑限制時會把還沒修的產品誤判成 `fail`。比對用這段 `--grep`，不要拿分支上 `d13e18f` 的整句主題做全字相等。feature PR 是 squash 合進 develop，主題會變成 PR 標題加 `(#NN)`。那筆出現在 develop 上之後，把實際主題或 PR 編號寫進本段，取代這段 `--grep`。沒做就記 `not-run`，閘門打開。
 
 下面兩格要填，但不決定閘門關不關：
 
@@ -52,7 +52,7 @@ T25 一定要做。重播結果符合規格 4.2（`binary.dat` 標成未複製�
 1. 向派工的人確認受測 SHA。沒有另外指定時，用 `origin/develop`。
 2. 在乾淨的 worktree 或 checkout 上建置。不要拿別的分支的 `target/` 混用。
 
-下面的賦值用 `export`。bash、zsh 與 fish 3 都能執行。這台機器的預設 shell 是 fish，`RUN=...` 這種暫時賦值不會把變數留下來。
+下面的賦值用 `export`。bash、zsh 與 fish 都能執行。這台機器的預設 shell 是 fish。fish 不接受沒有接命令的 `RUN=...`（會報 `Unsupported use of '='`）。fish 3.1 起，`VAR=value 命令` 會把值傳給那個命令。
 
 ```text
 export RUN="$HOME/snip-sync-ui-runs/$(date +%Y-%m-%d)-$(git rev-parse --short HEAD)"
@@ -89,7 +89,7 @@ python3 scripts/collaboration_fixture.py verify --fixture "$RUN/gate-a"
 
 同一時間只開一個 App。閘門 A 與閘門 B 各啟動一次，各寫一份日誌。先做哪一個都可以。換下一個之前，對目前這個按 Cmd+Q，等到 exit code 0，再啟動。第二次若用 `>` 寫進第一次的檔，會把 `CTRL_BOUNDS` 與 `PASTE_DONE` 截掉。
 
-同一個 shell 裡，下面三個 export 做一次即可。新開 shell 要再 export。`VAR=value 命令` 這種暫時賦值在 fish 裡不會傳給程序。
+同一個 shell 裡，下面三個 export 做一次即可。新開 shell 要再 export。
 
 ```text
 export SNIP_NATIVE_E2E=1
@@ -318,7 +318,7 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T22 | 核對 T19 的 C2 | `old.txt` 消失、`new.txt` 為 `old`、`gone.txt` 消失、`emoji.txt` 為 `你好 ✨`。預覽同時把 `old.txt` 顯示為刪除 |
 | T23 | 看 `commits-dst-overwrite` 在一次成功重播之後 | `staged-keep.txt` 仍在 index；`local-only.txt` 仍是 untracked。T18 是 `pass` 之後才做。T18 是 `fail` 時，本格判定 `not-run`，證據欄寫「T18 未套用」 |
 | T24 | 把 C4 貼到 `commits-dst-hooks` | 重播成功；`fixtures/hook-marker.txt` 不存在 |
-| T25 | 只重播 C2 到新鮮的 `commits-dst-present`。預覽會列出這次對 `binary.dat` 的動作 | 規格 4.2：含 NUL 的刪除標成未複製，不寫入、不刪除目的端的 `binary.dat`，位元組仍是 `a`、NUL、`b`、換行。同一次重播刪掉根目錄的文字檔 `gone.txt`。`dir/gone.txt` 仍是 `folder-gone`。結果符合時判 `pass` 或 `fail`，這一格算進閘門。結果把 `binary.dat` 刪掉時，依第 1 節看受測 SHA 有沒有那筆「不再重播刪除」的變更：還沒有就寫 `blocked-contract`，已經有就寫 `fail` |
+| T25 | 只重播 C2 到新鮮的 `commits-dst-present`。預覽會列出這次對 `binary.dat` 的動作 | 規格 4.2：含 NUL 的刪除標成未複製，不寫入、不刪除目的端的 `binary.dat`，位元組仍是 `a`、NUL、`b`、換行。`binary.dat` 維持這組位元組時，這一格算進閘門：根目錄 `gone.txt` 已刪除且 `dir/gone.txt` 仍是 `folder-gone` 才是 `pass`；兩項有一項不成立是 `fail`。`binary.dat` 被刪掉或位元組變了時，依第 1 節跑 `git log --oneline --grep='不再重播刪除' -- crates/core`：沒有輸出就寫 `blocked-contract`，有輸出就寫 `fail` |
 | T26 | 貼 C4 到乾淨目的 | 預覽把 `new-binary.bin` 標成 SKIP，摘要的建立／跳過與每一列一致；實際只提交 `newdir/content.txt` |
 | T27 | 同一段 C4 再貼一次 | 第二個 SHA 不同，tree 與前一個相同 |
 | T28 | 只貼 `empty replay` | 預覽有 message、作者與時間；Apply 後 `before..HEAD` 是 1，tree 不變 |
@@ -355,7 +355,7 @@ T03 與 T18 的 `action.json` 要寫兩欄：畫面上同相對路徑的列數�
 |---|---|---|
 | `ui/paste.rs` 的 paste ID 只有 path | 同相對路徑的第二個覆寫控制項不會有自己的 ID | T03、T18 判定 `fail`，證據欄寫 `identity-fail` |
 | commit 預覽的動作標籤 | binary 新增會畫成建立；rename 的舊路徑不一定畫成刪除；空 commit 預覽沒有 message／作者／時間 | T22、T26、T28：Git 對則 `ui-defect`，Git 也錯則 `fail` |
-| 規格 4.2 與 commit 刪除含 NUL 的檔 | 規格要求不刪除；`bd09e95` 的重播仍可能套用刪除。預覽會列出 delete `binary.dat` | 依第 1 節。`bd09e95` 還沒有那筆「不再重播刪除」的變更，刪掉 `binary.dat` 時 T25 判定 `blocked-contract`。結果已符合規格 4.2 時改判 `pass` 或 `fail`，並把這一格算進閘門 |
+| 規格 4.2 與 commit 刪除含 NUL 的檔 | 規格要求不刪除；`bd09e95` 的重播仍可能套用刪除。預覽會列出 delete `binary.dat` | 依第 1 節。`bd09e95` 上 `git log --oneline --grep='不再重播刪除' -- crates/core` 沒有輸出，刪掉 `binary.dat` 時 T25 判定 `blocked-contract`。`binary.dat` 沒被刪時，依第 6 節用根目錄 `gone.txt` 與 `dir/gone.txt` 判 `pass` 或 `fail`，並把這一格算進閘門 |
 | Git log 的 subject 欄 | 窄寬度下訊息欄可能只剩空白 | T36 以這一輪的截圖與列文字為準 |
 | `paste_err_destination` | `bd09e95` 的 i18n 沒有這個 key，畫面會露出 key | T31：安全拒絕且檔案沒變，但訊息仍是 key 時為 `ui-defect` |
 | 複製 commit 的通知 | `status_commits_copied` 只有「已複製 N 個 commit 至剪貼簿」，沒有未複製檔，也沒有第幾個 commit 少了哪些檔 | `bd09e95` 上複製 C4 後記 `ui-defect`，ID 寫 `B-notify`。通過線在第 6 節。通知寫出規格 4.2 要求的那幾項時改判 `pass` |
