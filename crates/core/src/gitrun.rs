@@ -2165,7 +2165,7 @@ mod tests {
 		let elapsed = start.elapsed();
 		assert!(res.is_err(), "hanging helper must return Err");
 		let err = res.unwrap_err();
-		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
 		assert!(
 			elapsed < tree::PS_TIMEOUT + Duration::from_secs(2),
 			"helper must be timed out quickly, took {elapsed:?}"
@@ -2193,7 +2193,7 @@ mod tests {
 			"helper closing stdout then hanging must return Err"
 		);
 		let err = res.unwrap_err();
-		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
 		assert!(
 			elapsed < tree::PS_TIMEOUT + Duration::from_secs(2),
 			"helper must be timed out within deadline, took {elapsed:?}"
