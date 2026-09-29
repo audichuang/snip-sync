@@ -147,6 +147,23 @@ impl ProbeFrame {
 pub struct Probes(Rc<RefCell<ProbeFrame>>);
 
 impl Probes {
+	/// Test only: probes on without the E2E environment.
+	#[cfg(test)]
+	pub fn for_test() -> Self {
+		Self(Rc::default())
+	}
+
+	/// Test only: every control drawn in the last frames.
+	#[cfg(test)]
+	pub fn drawn(&self) -> Vec<String> {
+		let f = self.0.borrow();
+		let mut ids: Vec<String> =
+			f.shown.keys().chain(f.seen.keys()).cloned().collect();
+		ids.sort();
+		ids.dedup();
+		ids
+	}
+
 	pub fn from_env() -> Option<Self> {
 		crate::e2e_on().then(|| Self(Rc::default()))
 	}
@@ -473,9 +490,22 @@ fn change_style(ct: Option<ChangeType>) -> (&'static str, u32) {
 /// Operation label, file-name colour and reason key for a paste row. The
 /// colour follows IntelliJ's file status: created green, modified blue
 /// (whether or not overwriting is allowed yet), deleted grey.
-fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
+pub(crate) fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 	if !item.selected {
-		("op_excluded", pal().text_disabled, "reason_excluded")
+		// A commit replay cannot drop one file: the whole replay is refused.
+		let reason = if item.commit.is_some() {
+			"reason_commit_excluded"
+		} else {
+			"reason_excluded"
+		};
+		("op_excluded", pal().text_disabled, reason)
+	} else if item.action_label == "SKIP" {
+		// Commit replay only: the file is listed but never written.
+		(
+			"op_skip",
+			pal().text_disabled,
+			item.skip_reason.unwrap_or("reason_skip_generic"),
+		)
 	} else if item.is_delete {
 		if item.dest_exists {
 			("op_delete", pal().git_deleted, "reason_delete")
@@ -486,9 +516,86 @@ fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 		("op_create", pal().git_added, "reason_create")
 	} else if item.overwrite_allowed {
 		("op_overwrite", pal().git_modified, "reason_overwrite")
+	} else if item.commit.is_some() {
+		// The replay overwrites once allowed; until then Apply is refused
+		// (`commit_overwrite_required`), so nothing is skipped.
+		(
+			"op_overwrite_pending",
+			pal().git_modified,
+			"reason_commit_overwrite_pending",
+		)
 	} else {
 		("op_skip", pal().git_modified, "reason_exists")
 	}
+}
+
+/// What the paste summary bar counts. Derived from [`paste_op`], so a row's
+/// colour and the totals cannot disagree.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PasteCounts {
+	pub creates: usize,
+	pub overwrites: usize,
+	/// Existing destination files that could be overwritten.
+	pub existing: usize,
+	pub deletes: usize,
+	pub skips: usize,
+}
+
+pub(crate) fn paste_counts(plan: &PastePreviewPlan) -> PasteCounts {
+	let mut c = PasteCounts {
+		skips: plan.plan.skipped_operations.len(),
+		..PasteCounts::default()
+	};
+	for it in &plan.items {
+		if it.overwritable() {
+			c.existing += 1;
+		}
+		match paste_op(it).0 {
+			"op_create" => c.creates += 1,
+			"op_overwrite" => c.overwrites += 1,
+			"op_delete" => c.deletes += 1,
+			// Blocks Apply rather than being skipped.
+			"op_overwrite_pending" => {}
+			"op_excluded" if it.commit.is_some() => {}
+			_ => c.skips += 1,
+		}
+	}
+	c
+}
+
+/// A commit's file rows and how many of them the replay does not write (a
+/// skipped file or a delete of a missing file), from the same [`paste_op`]
+/// that labels the rows. Rows an allowed overwrite or a re-included file
+/// would unblock are not "not written". Items are grouped by commit, so this
+/// walks only that commit's run.
+pub(crate) fn commit_counts(
+	plan: &PastePreviewPlan,
+	c: usize,
+) -> (usize, usize) {
+	let start = plan.items.partition_point(|i| i.commit < Some(c));
+	let rows = plan.items[start..]
+		.iter()
+		.take_while(|i| i.commit == Some(c));
+	rows.fold((0, 0), |(n, off), it| {
+		let not_written = paste_op(it).0 == "op_skip";
+		(n + 1, off + usize::from(not_written))
+	})
+}
+
+/// The three strings a commit header draws: subject (first message line,
+/// or the placeholder), `name <email>` and the short date.
+pub(crate) fn commit_header_labels(
+	commit: &snip_core::commits::CommitPlan,
+	loc: Locale,
+) -> (String, String, String) {
+	let subject = commit.message.lines().next().unwrap_or("").trim();
+	let subject = if subject.is_empty() {
+		t("commit_no_message", loc).to_string()
+	} else {
+		subject.to_string()
+	};
+	let author = format!("{} <{}>", commit.author_name, commit.author_email);
+	(subject, author, short_date(&commit.author_date))
 }
 
 fn short_date(iso: &str) -> String {
@@ -1423,10 +1530,12 @@ impl Render for WorkbenchModel {
 			.on_action(cx.listener(|this, _: &NavToggle, _, cx| {
 				if let Some(ref p) = this.paste_preview {
 					let idx = p.selected_item_idx;
-					let overwrite = p
-						.items
-						.get(idx)
-						.is_some_and(|i| i.dest_exists && !i.is_delete);
+					if !p.display_order().contains(&idx) {
+						// Folded away: the row is not on screen.
+						return;
+					}
+					let overwrite =
+						p.items.get(idx).is_some_and(PasteItem::overwritable);
 					if overwrite {
 						this.toggle_paste_overwrite(idx, cx);
 					} else {

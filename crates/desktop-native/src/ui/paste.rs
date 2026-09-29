@@ -194,6 +194,97 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
+	/// One commit of a replay: index, message, author and date, then how
+	/// many of its files are written. Shown for empty commits too, since
+	/// Apply creates them.
+	fn commit_header(
+		plan: &PastePreviewPlan,
+		c: usize,
+		loc: Locale,
+		log: &Option<Probes>,
+		cx: &Context<Self>,
+	) -> Stateful<Div> {
+		let Some(commit) = plan
+			.commit_preview
+			.as_ref()
+			.and_then(|p| p.replay.commits.get(c))
+		else {
+			return div().id("paste-commit:none");
+		};
+		let id = format!("paste-commit:{c}");
+		let (subject, author, date) = commit_header_labels(commit, loc);
+		let (files, skipped) = commit_counts(plan, c);
+		let folded = plan.collapsed_commits.contains(&c);
+		let counts = if commit.files.is_empty() {
+			t("commit_empty_note", loc).to_string()
+		} else {
+			tf(
+				"commit_header_counts",
+				loc,
+				&[&files.to_string(), &skipped.to_string()],
+			)
+		};
+		div()
+			.id(SharedString::from(id.clone()))
+			.relative()
+			.flex()
+			.flex_row()
+			.items_center()
+			.flex_shrink_0()
+			.h(px(26.))
+			.px(px(8.))
+			.gap(px(8.))
+			.bg(rgb(pal().panel_bg))
+			.text_size(px(SMALL_TEXT))
+			.cursor_pointer()
+			.on_click(cx.listener(move |this, _, _, cx| {
+				this.toggle_paste_commit(c, cx)
+			}))
+			.when(c > 0, |d| d.border_t_1().border_color(rgb(pal().divider)))
+			.tooltip(tip(format!(
+				"{}\n{author}\n{}",
+				commit.message.trim_end(),
+				commit.author_date
+			)))
+			.child(icon(
+				if folded {
+					Icon::ChevronRight
+				} else {
+					Icon::ChevronDown
+				},
+				10.,
+			))
+			.child(
+				div()
+					.flex_shrink_0()
+					.font_weight(FontWeight::SEMIBOLD)
+					.child(format!("#{}", c + 1)),
+			)
+			.child(
+				clip_text(subject)
+					.flex_1()
+					.font_weight(FontWeight::SEMIBOLD),
+			)
+			.child(
+				clip_text(author)
+					.flex_shrink()
+					.text_color(rgb(pal().text_muted)),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.text_color(rgb(pal().text_muted))
+					.child(date),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.text_color(rgb(pal().text_muted))
+					.child(counts),
+			)
+			.children(probe(log, id))
+	}
+
 	pub(super) fn render_paste(
 		&self,
 		plan: &PastePreviewPlan,
@@ -201,20 +292,18 @@ impl WorkbenchModel {
 	) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
-		let mut skips = plan.plan.skipped_operations.len();
-		let (mut creates, mut overwrites, mut existing, mut deletes) =
-			(0, 0, 0, 0);
-		for it in &plan.items {
-			if it.dest_exists && !it.is_delete {
-				existing += 1;
-			}
-			match paste_op(it).0 {
-				"op_create" => creates += 1,
-				"op_overwrite" => overwrites += 1,
-				"op_delete" => deletes += 1,
-				_ => skips += 1,
-			}
-		}
+		let PasteCounts {
+			creates,
+			overwrites,
+			existing,
+			deletes,
+			skips,
+		} = paste_counts(plan);
+		let commit_count = plan
+			.commit_preview
+			.as_ref()
+			.filter(|_| plan.whole_commit)
+			.map(|p| p.replay.commits.len());
 		let dest = plan.destination.display().to_string();
 		let applying = plan.is_applying;
 		let mapping_ready = plan.mapping_ready();
@@ -250,6 +339,15 @@ impl WorkbenchModel {
 			.text_size(px(SMALL_TEXT))
 			.border_b_1()
 			.border_color(rgb(pal().divider))
+			.children(commit_count.map(|n| {
+				div()
+					.id("paste-commit-count")
+					.relative()
+					.flex_shrink_0()
+					.font_weight(FontWeight::SEMIBOLD)
+					.child(tf("paste_commit_count", loc, &[&n.to_string()]))
+					.children(probe(log, "paste-commit-count"))
+			}))
 			.child(
 				div()
 					.flex_shrink_0()
@@ -295,8 +393,17 @@ impl WorkbenchModel {
 				.pr(px(8.))
 				.gap(px(6.))
 		};
-		let rows = plan.tree_rows().into_iter().map(|node| {
+		let nodes = if plan.whole_commit {
+			plan.commit_rows()
+		} else {
+			plan.tree_rows()
+		};
+		let rows = nodes.into_iter().map(|node| {
 			let (ix, depth) = match node {
+				PasteNode::Commit(c) => {
+					return Self::commit_header(plan, c, loc, log, cx)
+						.into_any_element();
+				}
 				PasteNode::Root(ref name, n) | PasteNode::Dir(ref name, n) => {
 					let root = matches!(node, PasteNode::Root(..));
 					let name = name.clone();
@@ -323,9 +430,12 @@ impl WorkbenchModel {
 			let row_id = crate::paste::control_id("row", ix, &path);
 			let inc_id = crate::paste::control_id("include", ix, &path);
 			let ow_id = crate::paste::control_id("overwrite", ix, &path);
-			let can_overwrite = item.dest_exists && !item.is_delete;
+			let can_overwrite = item.overwritable();
+			let by_commit = item.commit.is_some();
 			let ow_on = item.overwrite_allowed;
-			let (_, name) = split_dir(&path);
+			// A commit's rows are in replay order, so they keep the full path.
+			let (_, base) = split_dir(&path);
+			let name = if by_commit { path.as_str() } else { base };
 			node_row(depth)
 				.id(SharedString::from(row_id.clone()))
 				.debug_selector(|| row_id.clone())
@@ -360,22 +470,39 @@ impl WorkbenchModel {
 						.child(checkbox(item.selected))
 						.children(probe(log, inc_id)),
 				)
-				.child(icon(file_icon(name), 14.))
+				.child(icon(file_icon(base), 14.))
 				.child(
 					clip_text(name.to_string())
 						.flex_1()
 						.text_color(rgb(name_color)),
 				)
+				.children(item.rename_note.clone().map(|note| {
+					clip_text(note)
+						.flex_shrink()
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text_muted))
+				}))
+				.when(by_commit, |d| {
+					d.child(
+						div()
+							.flex_shrink_0()
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(name_color))
+							.child(t(paste_op(item).0, loc)),
+					)
+				})
 				.child(
 					div()
 						.flex_shrink_0()
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
-						.child(if item.is_delete {
-							String::new()
-						} else {
-							format!("{} B", item.bytes)
-						}),
+						.child(
+							if item.is_delete || item.action_label == "SKIP" {
+								String::new()
+							} else {
+								format!("{} B", item.bytes)
+							},
+						),
 				)
 				// Fixed column so the toggles line up whether or not a row
 				// can be overwritten.
