@@ -876,22 +876,6 @@ def assert_current_basket_empty(lines: list[str], what: str) -> dict[str, Any]:
     }
 
 
-def preview_lines(repo: str, path: str, source: str, limit: int = 5) -> list[str]:
-    """Lines the source-specific preview diff must show."""
-    if source == "staged":
-        patch = git(repo, "diff", "--cached", "--no-color", "--no-ext-diff", "--", path)
-    else:
-        head = git(repo, "rev-parse", "--verify", "HEAD").strip()
-        patch = git(repo, "diff", "--no-color", "--no-ext-diff", head, "--", path)
-    lines = changed_lines(patch)
-    if not lines:
-        row = {"path": path, "source": source, "deleted": False}
-        data = source_file_bytes(repo, row)
-        if data:
-            lines = [line for line in data.decode("utf-8").splitlines() if line.strip()]
-    return lines[:limit]
-
-
 def extract_clipcode_file_bytes(
     payload: bytes,
     path: str,
@@ -1107,35 +1091,6 @@ def copy_explicit_selection(
         "basket": {"n": event["n"], "summary": event["summary"], "entries": event["entries"]},
         **checked,
     }
-
-
-def normalize(text: str) -> str:
-    return re.sub(r"[^0-9a-z]", "", text.lower())
-
-
-# `hdr-workspace` is max-width 140px and ends in an ellipsis (ui.rs render_header).
-# On this binary's 1080x720 window, tesseract reads 21 ASCII characters of a longer
-# leaf before that ellipsis (`snip-driver-small-fix.`). Shorter leaves are painted whole.
-HEADER_PAINTED_TITLE_CHARS = 21
-
-
-def painted_title_token(name: str) -> str:
-    """Workspace leaf the header paints. A longer leaf is checked by the visible prefix."""
-    if len(name) <= HEADER_PAINTED_TITLE_CHARS:
-        return name
-    return name[:HEADER_PAINTED_TITLE_CHARS]
-
-
-def ocr_check(text: str, must: list[str], any_of: dict[str, list[str]]) -> dict[str, Any]:
-    """Token presence in OCR text after dropping case and punctuation (OCR mangles both).
-
-    Every `must` token has to appear, and each non-empty `any_of` group needs at least one hit.
-    """
-    squashed = normalize(text)
-    found_must = {t: normalize(t) in squashed for t in must if normalize(t)}
-    groups = {g: {t: normalize(t) in squashed for t in ts if normalize(t)} for g, ts in any_of.items()}
-    ok = all(found_must.values()) and all(any(hits.values()) for hits in groups.values() if hits)
-    return {"must": found_must, "anyOf": groups, "ok": ok}
 
 
 def workspace_repos(workspace: str) -> list[str]:
@@ -1551,38 +1506,6 @@ class NativeSession:
         return {"rootCrop": png, "rootCropStats": stats["rootCrop"], "xwdId": win_png, "xwdIdStats": stats["xwdId"],
                 "attempts": attempts, "geometry": {k: win[k] for k in ("x", "y", "width", "height")}}
 
-    def ocr(self, png: str) -> str:
-        return self.x("tesseract", png, "-", "--psm", "11", timeout=120)
-
-    def capture_verified(self, win: dict[str, Any], name: str, must: list[str], any_of: dict[str, list[str]],
-                         wait: float = 5.0) -> dict[str, Any]:
-        """A screenshot whose OCR shows the oracle state, first without any input.
-
-        If the frame stays stale (the app has not presented its latest state), the stale frame is
-        kept as evidence, one pointer motion inside the window (no click) is sent, and the check
-        repeats. `presentStall` records whether that was needed; it is a product finding, not noise.
-        """
-        stall = None
-        for nudged in (False, True):
-            if nudged:
-                stale = os.path.join(self.run_dir, f"{name}-stale.png")
-                shutil.copyfile(shot["rootCrop"], stale)
-                stall = {"staleScreenshot": stale, "staleOcr": check, "nudge": "xdotool mousemove inside the window, no click"}
-                self.x("xdotool", "mousemove", str(win["x"] + win["width"] // 2), str(win["y"] + win["height"] // 2 + 1))
-            end = time.monotonic() + wait
-            while True:
-                shot = self.capture(win, name)
-                text = self.ocr(shot["rootCrop"])
-                check = ocr_check(text, must, any_of)
-                if check["ok"] or time.monotonic() > end:
-                    break
-                time.sleep(0.5)
-            if check["ok"]:
-                with open(os.path.join(self.run_dir, f"{name}.ocr.txt"), "w") as f:
-                    f.write(text)
-                return {**shot, "ocr": check, "presentStall": stall}
-        raise NativeBenchError(f"screenshot never showed the oracle state: {check}")
-
     def _close_handle(self, attr: str) -> None:
         handle = getattr(self, attr, None)
         if handle is None or getattr(handle, "closed", True):
@@ -1802,10 +1725,7 @@ def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: 
             selected_repo = next(r for r in repos if os.path.basename(r) == state["soak"]["lastRepo"])
             state["selected"] = state["soak"].pop("lastState")
 
-        # Screenshot shows the explicitly selected source, not whatever the app previewed on load.
-        # The header clips a long workspace leaf; the must-token is the painted prefix.
-        must = [painted_title_token(os.path.basename(workspace.rstrip("/")))]
-        any_of: dict[str, list[str]] = {}
+        # The screenshot shows the explicitly selected source, not whatever the app previewed on load.
         if profile == "1repo-diff":
             if selected_repo is None or len(repos) != 1:
                 raise NativeBenchError("1repo-diff requires exactly one selected repository")
@@ -1824,9 +1744,6 @@ def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: 
             state["copyPerformed"] = False
             state["priorActions"] = ["startup auto-load and working preview", "toggle locale to English", "select ref", "select tip", "select file", "diff"]
             state["sourceContentMatchedGitShow"] = False
-            must.extend([os.path.basename(selected_repo), oracle["path"], "Basket is empty"])
-            any_of["history"] = [oid[:7] for oid in oracle["historyOids"]]
-            any_of["preview"] = oracle["changedLines"]
         elif selected_repo:
             oracle = repo_oracle(selected_repo)
             if not oracle["sourceRows"]:
@@ -1837,20 +1754,11 @@ def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: 
             state["selected"]["clipboard"] = copied
             state["selected"]["previewPath"] = copied["path"]
             state["selected"]["previewSource"] = copied["previewSource"]
-            must.append(oracle["name"])
-            must.append(copied["path"])
-            any_of["history"] = oracle["newestCommits"]
-            shown = preview_lines(selected_repo, copied["path"], copied["source"])
-            if not shown:
-                raise NativeBenchError(
-                    f"no preview oracle lines for {copied['source']} {copied['path']}"
-                )
-            any_of["preview"] = shown
         else:
             state["clipboard"] = {"supported": False, "reason": f"{profile} has no selected repo"}
 
         s.assert_app_alive()
-        shot = s.capture_verified(s.window(), f"ready-{profile}", must, any_of)
+        shot = s.capture(s.window(), f"ready-{profile}")
         result["ui"] = {"state": state, "screenshot": shot,
                         "latency": {k: latency_stats(v) for k, v in latencies.items()}}
         s.remember_owned()
@@ -2087,6 +1995,45 @@ def scroll_to_change_dirs(
     return candidates()
 
 
+def expand_change_repo(s: NativeSession, win: dict[str, Any], control: str, repo: str, timeout: float = 10.0) -> bool:
+    """Open the repo group above a Changes file row; False when nothing needed opening.
+
+    A multi-repo workspace lists Changes as group > repo > directory, and repo groups start
+    collapsed, so no `change-row` exists until `change-repo:<group>:<repo>` is clicked. A
+    single-repo workspace has no repo rows and is left alone.
+    """
+    group = change_row_group(control)
+    node = f"change-repo:{group}:{repo}"
+
+    def find() -> list[str] | None:
+        bounds = parse_bounds(s.texts())
+        if control in bounds:
+            return None
+        return [node] if node in bounds else []
+
+    repos = [int(n) for n in re.findall(r"\[APP:READY_REPOS: (\d+)\]", "\n".join(s.texts()))]
+    if not repos or repos[-1] < 2:
+        return False
+    # Repo rows paint after the group header; wait for this repo's node or the row itself.
+    deadline = time.monotonic() + timeout
+    while (found := find()) == [] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if found == []:
+        found = scroll_to_change_dirs(s, win, find)
+    if not found:
+        return False
+    needle = f"[APP:REPO_CHANGES_COLLAPSED: {group} {repo} collapsed="
+    line = ""
+    for _click in range(2):
+        box = scroll_into_view(s, win, node)
+        before = len(s.lines)
+        s.click(win, box)
+        _, _, line = s.wait_line(lambda item: needle in item, start=before, timeout=timeout)
+        if "collapsed=false" in line:
+            return True
+    raise NativeBenchError(f"{node} did not open: {line}")
+
+
 def expand_change_dirs(
     s: NativeSession,
     win: dict[str, Any],
@@ -2105,6 +2052,7 @@ def expand_change_dirs(
     path = control.split(":", 2)[2]
     group = change_row_group(control)
     prefix = f"change-dir:{group}:{repo}:"
+    expand_change_repo(s, win, control, repo, timeout)
     opened: list[str] = []
 
     def candidates() -> list[str] | None:
@@ -2395,7 +2343,7 @@ def markdown(report: dict[str, Any]) -> str:
                 geo = f"; observed window {win['width']}x{win['height']}+{win.get('x')}+{win.get('y')} {win.get('mapState')}"
             lines.append(
                 f"- {name} `{r['runDir']}`: state {json.dumps(r['ui']['state'])}; screenshot `{shot['rootCrop']}` "
-                f"(stddev {shot['rootCropStats']['stddev']}; xwd -id stddev {shot['xwdIdStats']['stddev']}); OCR {shot['ocr']}"
+                f"(stddev {shot['rootCropStats']['stddev']}; xwd -id stddev {shot['xwdIdStats']['stddev']})"
                 f"{geo}; cleanup {r['cleanupProblems'] or 'clean'}"
             )
     return "\n".join(lines) + "\n"

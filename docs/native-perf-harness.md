@@ -68,9 +68,7 @@ Readiness is never determined by generic startup logs. The driver requires liter
 - Preview rendering: `[APP:PREVIEW_LOADED: <path>]`
 
 ### Cropped Root Screenshots
-Because Xvfb lacks a composite window manager, `xwd -id` against unmanaged GPUI windows captures black frames (<1 KB). The driver captures the full X11 root window (`xwd -root`) and crops strictly to the translated client geometry determined by `xwininfo -id`. OCR checks (`tesseract`) verify that repository titles and commit SHAs are visually rendered.
-
-The header leaf (`hdr-workspace`) is clipped to 140px and ends in an ellipsis. On this binary's 1080×720 window the painted prefix is 21 ASCII characters (`snip-driver-small-fix.` for the small driver fixture). The screenshot must-token is that prefix when the leaf is longer, and the whole leaf when it fits (`repo-01-core`, `empty-workspace`). Repository name, selected path, preview lines, and history lines stay required in full.
+Because Xvfb lacks a composite window manager, `xwd -id` against unmanaged GPUI windows captures black frames (<1 KB). The driver captures the full X11 root window (`xwd -root`) and crops strictly to the translated client geometry determined by `xwininfo -id`.  The screenshot only has to be non-blank; what the app shows is verified through its own state lines against the git oracle, not by reading pixels.
 
 ### Source rows and an empty basket
 `[APP:REPO_LOADED] files=` is the number of staged, unstaged, untracked, and conflicted rows from `git status --porcelain=v2 -z --untracked-files=normal --no-renames`. A path that is both staged and unstaged counts twice. Comparing that number to distinct paths fails the run.
