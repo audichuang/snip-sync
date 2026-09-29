@@ -63,6 +63,7 @@ xattr -cr /Applications/snip-sync.app
 | [docs/plan.md](docs/plan.md) | 實作規劃：架構、打包、測試 |
 | [docs/porting-notes.md](docs/porting-notes.md) | 從 TS 移植到 Rust 的陷阱與已知且接受的差異 |
 | [docs/native-workbench-supervision.md](docs/native-workbench-supervision.md) | 原生工作臺的交付狀態與已知限制 |
+| [docs/real-ui-operator-protocol.md](docs/real-ui-operator-protocol.md) | 真實 macOS 視窗的操作驗收：怎麼點、每一格的通過線 |
 
 各模組的說明：[core](crates/core/README.md) · [cli](crates/cli/README.md)。
 
