@@ -118,6 +118,12 @@ printf 'line\r\n\r\n' > "$FIX/files-src/crlf.txt"
 
 printf 'dest-base\n' > "$FIX/files-dst/README.md"
 printf 'do-not-touch\n' > "$FIX/files-dst/overwrite.txt"
+printf 'dest-both\n' > "$FIX/files-dst/both.txt"
+printf 'gone-dest\n' > "$FIX/files-dst/gone.txt"
+printf 'old-dest\n' > "$FIX/files-dst/old-name.txt"
+printf 'keep-bin\n' > "$FIX/files-dst/binary.dat"
+mkdir -p "$FIX/files-dst/folder"
+printf 'keep-utf16\n' > "$FIX/files-dst/folder/utf16.txt"
 commit "$FIX/files-dst" '2026-02-01T00:00:00+08:00' '2026-02-01T00:01:00+08:00' 'dest base'
 printf 'will-overwrite\n' > "$FIX/files-src/overwrite.txt"
 
@@ -173,6 +179,13 @@ init_repo "$FIX/commits-dst-clean"
 printf 'readme\n' > "$FIX/commits-dst-clean/README.md"
 commit "$FIX/commits-dst-clean" '2026-03-01T00:00:00+08:00' '2026-03-01T00:01:00+08:00' 'dst clean'
 g "$FIX/commits-dst-clean" checkout -b qa-replay >/dev/null
+
+init_repo "$FIX/commits-dst-present"
+printf 'readme\n' > "$FIX/commits-dst-present/README.md"
+printf 'a\0b\n' > "$FIX/commits-dst-present/binary.dat"
+printf 'gone\n' > "$FIX/commits-dst-present/gone.txt"
+commit "$FIX/commits-dst-present" '2026-03-01T00:00:00+08:00' '2026-03-01T00:01:00+08:00' 'dst present'
+g "$FIX/commits-dst-present" checkout -b qa-replay >/dev/null
 
 init_repo "$FIX/commits-dst-hooks"
 printf 'readme\n' > "$FIX/commits-dst-hooks/README.md"

@@ -14,7 +14,7 @@
 ~/snip-sync-ui-runs/<日期>-<受測 SHA 前 7 碼>/
 ```
 
-目錄裡要有 `environment.json`、`scorecard.md`、每個測案一個子目錄。測案子目錄的內容見第 5 節。不要把這個目錄 commit 進 repo，也不要在這一輪裡改產品程式。
+目錄裡要有 `environment.json`、`scorecard.md`、每個測案一個子目錄。測案子目錄的內容見第 4 節。不要把這個目錄 commit 進 repo，也不要在這一輪裡改產品程式。
 
 `scorecard.md` 每一格只能是這五個字之一：
 
@@ -22,15 +22,28 @@
 |---|---|
 | `pass` | 控制項身分、點下去之後的新日誌、剪貼簿、Git／檔案四者都符合該格的通過線 |
 | `ui-defect` | Git／檔案符合通過線，預覽、顏色、計數或通知和實際動作不一致 |
-| `fail` | 寫錯、拒絕錯、點不到指定控制項、或日誌對不上 |
+| `fail` | 寫錯、拒絕錯、點不到指定控制項、或日誌對不上。點不到時證據欄寫 `missing-control`；同路徑兩列共用一個 ID 時證據欄寫 `identity-fail`。這兩個詞不是判定 |
 | `blocked-contract` | 規格與實作衝突，還沒有人決定以哪邊為準。目前只有 T25 |
 | `not-run` | 這一格沒有做 |
 
-產品閘門要全綠，閘門 A 的 18 步、閘門 B 的 T01–T40 與 B41–B44 每一格都得是 `pass`。出現 `ui-defect`、`fail`、`blocked-contract` 或 `not-run`，結論的第一句就寫「產品閘門打開」，並列出那些 ID。
+計分表只有這五個判定。
 
-重現一個已知問題，代表這輪有觀察到它。產品閘門仍然打開。
+產品閘門只看下面這些格，每一格都是 `pass` 才寫「關閉」：
 
-閘門 C（`just preflight` 與 Linux 的真實視窗 driver）不在這台 Mac 上關閉。`scorecard.md` 把 C 寫成 `not-run`，並註明這台機器沒有 `xvfb-run` 與 `/proc`。C 沒有綠，不能寫整個產品正確。
+- 閘門 A 的 18 步
+- T01–T22、T24、T26–T37、T39、T40
+- T23。T18 是 `pass` 時它納入閘門；T18 是 `fail` 時它寫 `not-run`，證據欄寫「T18 未套用」，不另算一次失敗
+- B41–B44、B-notify
+
+下面三格要填，但不決定閘門關不關：
+
+- T25：做完，判定固定 `blocked-contract`
+- T38：判定固定 `not-run`，證據欄寫「改走記憶體規程」
+- C preflight：判定固定 `not-run`，證據欄寫「這台 Mac 沒有 xvfb-run 與 /proc」
+
+閘門裡有 `ui-defect`、`fail` 或 `not-run`，第一句就寫「產品閘門打開」，並列出那些 ID。T25 的 `blocked-contract` 不把閘門撐開。第 8 節仍要寫二進位刪除的契約還沒決定，整個產品不在本規程宣告完成。
+
+重現一個已知問題，代表這輪有觀察到它。只要該 ID 在閘門裡，產品閘門就打開。
 
 ## 2. 開跑
 
@@ -38,12 +51,17 @@
 2. 在乾淨的 worktree 或 checkout 上建置。不要拿別的分支的 `target/` 混用。
 
 ```text
+RUN=~/snip-sync-ui-runs/$(date +%Y-%m-%d)-$(git rev-parse --short HEAD)
+mkdir -p "$RUN"
+rm -f "$RUN/export-hold"
 git rev-parse HEAD
 cargo build -p snip-desktop-native --locked
 shasum -a 256 target/debug/snip-desktop-native
 ```
 
-3. 建立本輪目錄，跑兩個 fixture。閘門 B：
+後面的命令都用這個 `$RUN`。`export-hold` 先不要建立；檔案不存在時，複製不會停住。
+
+3. 跑兩個 fixture。閘門 B：
 
 ```text
 sh docs/real-ui-operator-fixture.sh "$RUN/gate-b"
@@ -63,24 +81,26 @@ python3 scripts/collaboration_fixture.py verify --fixture "$RUN/gate-a"
 `verify` 的結束碼必須是 0。每個 A 步驟開始前再拍一張初始快照；不要把上一步改過的 repo 接著用。需要乾淨狀態時，重新 `generate` 到一個新目錄。
 
 4. 讀受測 SHA 的 `crates/desktop-native/src/ui/paste.rs`，把 `paste-row`、`paste-include`、`paste-overwrite` 的 ID 格式抄進 `environment.json`。寫這份規程時的 `bd09e95` 格式只有相對路徑。若受測 SHA 仍是這個格式，T03 與 T18 的身份檢查會失敗，這兩格不能是 `pass`。
-5. 啟動 App。探針只有在 `SNIP_NATIVE_E2E=1` 時才會印。不要加 `--restore-dir`，貼上目的地由畫面決定。
+5. 啟動 App。探針只有在 `SNIP_NATIVE_E2E=1` 時才會印。`SNIP_NATIVE_E2E_EXPORT_HOLD_FILE` 在 `WorkbenchModel::new` 讀一次，所以必須寫在啟動命令裡。不要加 `--restore-dir`，貼上目的地由畫面決定。stdout 與 stderr 都要進 `app.log`，否則讀不到 `CTRL_BOUNDS`。
 
 ```text
-SNIP_NATIVE_E2E=1 SNIP_THEME=dark \
+SNIP_NATIVE_E2E=1 \
+SNIP_THEME=dark \
+SNIP_NATIVE_E2E_EXPORT_HOLD_FILE="$RUN/export-hold" \
   ./target/debug/snip-desktop-native \
   --workspace "$RUN/gate-b/fixtures/ws-src" \
   > "$RUN/app.log" 2>&1
 ```
 
-閘門 A 改指 `$RUN/gate-a/machine-a` 或該 fixture 的實際工作區路徑。一次只留一個受測 App。自己啟動它，結束時才讀得到 exit code。
+閘門 A 把 `--workspace` 改成 `$RUN/gate-a/machine-a`，或該 fixture 實際的工作區路徑。這一輪只開這一個 App。自己啟動它，結束時才讀得到 exit code。換工作區用畫面上的開工作區，不要再開第二個程序。
 
 6. `environment.json` 至少包含：受測 SHA、執行檔 SHA-256、啟動命令、`app.log` 路徑、三個視窗尺寸實際量到的寬高、paste ID 格式、fixture 目錄。
 
 視窗要跑三種邏輯尺寸：1080×752（對照 2026-09-29 報告的 BUG-04）、1080×720 與 900×600（驗收規格）。把視窗調到該尺寸後，從 `app.log` 抄下最新的 `[APP:VIEWPORT: WxH]`。這行是實體像素，Retina 上會比邏輯尺寸大。兩組數字都留下。功能 oracle 在三種尺寸相同；T36 每種尺寸各判一次。
 
-快捷鍵用 macOS 的 Cmd：Cmd+C 複製、Cmd+V 開預覽、Cmd+Q 結束、Cmd+Shift+O 開工作區、Cmd+Shift+W 關工作區。Option+1 專案、Option+0 變更、Option+9 Git log、Option+Shift+R 選 repo。預覽面板裡 Enter 套用、Escape 取消、Space 切換目前列。程式也綁了 Ctrl；操作仍按 Cmd，並用日誌確認送到的是複製。
+快捷鍵用 macOS 的 Cmd：Cmd+C 複製、Cmd+V 開預覽、Cmd+Q 結束、Cmd+Shift+O 開工作區、Cmd+Shift+W 關工作區。Option+1 專案、Option+0 變更、Option+9 Git log、Option+Shift+R 選 repo。預覽面板裡 Enter 套用、Escape 取消、Space 切換目前列。程式也綁了 Ctrl；操作仍按 Cmd，並用日誌確認送到的是複製。在這個 App 裡按 Cmd+C 是 App 自己的複製。
 
-Shell 只建立 fixture、讀 Git、算雜湊。複製與貼上只按 App 的按鈕或快捷鍵。
+Shell 可以建立 fixture、用 argv 叫 Git、把 Git 輸出寫進檔再算雜湊、用 `pbcopy` 放入 sentinel 或 T15 的普通文字、用 `pbpaste` 讀剪貼簿。Shell 不執行 `snip copy` 或 `snip paste` 來代替畫面上的複製與貼上。
 
 ## 3. 怎麼點
 
@@ -94,11 +114,20 @@ Shell 只建立 fixture、讀 Git、算雜湊。複製與貼上只按 App 的按
 
 ID 整段相等。`paste-overwrite:common.txt` 不能拿去點 `paste-overwrite:common.txt.bak`。
 
-2. 沒有這一行，或 `w < 1`，或 `h < 1`：記 `missing-control`，停止。改點旁邊看起來像的列，不算測過。
-3. 同一個 ID 在這一幀畫了兩次時，程式用 ID 當 key，後畫的矩形蓋掉前一個（`ProbeFrame`，`crates/desktop-native/src/ui/mod.rs`）。畫面上兩列、日誌裡一個矩形：記 `identity-fail`。這種情況不能按 Apply，也不能把「有點到第二列」寫成 `pass`。
-4. 用真實游標點矩形中心 `(x + w/2, y + h/2)`。
+2. 沒有這一行，或 `w < 1`，或 `h < 1`：判定 `fail`，證據欄寫 `missing-control`，停止。改點旁邊看起來像的列，不算測過。
+3. 同一個 ID 畫了兩次時，`ProbeFrame::report` 用 ID 當 key（`crates/desktop-native/src/ui/mod.rs`）。第一幀兩個矩形都會印出來；之後每次重繪，只會再印第一列的矩形，因為上一幀留下的是後畫的那一個，只有第一列跟它不同。所以「取最新一行」拿到的通常是第一列，不是第二列。不要把「日誌裡只剩一個矩形」當成辨識規則。辨識用第 6 節的算法：畫面上同相對路徑的列數大於相異 ID 數。成立時判定 `fail`，證據欄寫 `identity-fail`，並寫下兩欄數字。這種情況不能按 Apply，也不能把「有點到第二列」寫成 `pass`。
+4. 把 bounds 換算成螢幕上的點，再點那個點。`x`、`y`、`w`、`h` 是實體像素，原點在視窗內容區的左上角，不是螢幕，也不是含標題列的視窗框。`physical()` 乘了 `scale_factor`。直接點 `(x + w/2, y + h/2)` 在 Retina 上會偏到大約兩倍遠。換算順序：
+
+   - 讀最新的 `[APP:VIEWPORT: Wp x Hp]`。
+   - 讀 `snip-desktop-native` 視窗框的螢幕位置與邏輯尺寸，以及主螢幕的 `backingScaleFactor`。視窗框含標題列。
+   - `scale` 用 `backingScaleFactor`。`Wp` 應等於內容區邏輯寬乘 `scale`。對不上就判定 `fail`，證據欄寫算式與兩個寬度，不要點。
+   - 標題列高度 = 視窗框邏輯高 − (`Hp / scale`)。內容區左上角 = 視窗框左上角的 x，以及視窗框的 y 加上標題列高度。
+   - 螢幕點 = 內容區左上角 + `((x + w/2) / scale, (y + h/2) / scale)`。點擊工具若吃邏輯點，用這個螢幕點。若吃實體像素，再乘 `scale`。`action.json` 同時留下原始 bounds、`scale`、內容區左上角與實際點到的螢幕點。
+
+   Linux 的 native-e2e 用 `xdotool mousemove --window`，座標就是內容區裡的實體像素，而且那時 `scale` 是 1。那套算法不要用在這台 Mac 的螢幕游標上。
+
 5. 點完之後必須有一行新日誌，而且裡頭的 idx、path、prefix 或 SHA 就是這一格。點下去之前就存在的日誌不算。
-6. 捲動之後矩形會變。捲完再讀一次 bounds，用新的中心點。
+6. 捲動之後矩形會變。捲完再讀一次 bounds，用新的中心點重算螢幕點。
 7. 然後才跑該格的剪貼簿與 Git／檔案 oracle。
 
 macOS 輔助使用在這個 App 上只到視窗。沒有 `CTRL_BOUNDS` 的點擊，不能記 `pass`。
@@ -129,12 +158,13 @@ ID 以受測 binary 印出的為準。下面是寫這份規程時 `bd09e95` 的�
 每格在動作前記下：
 
 ```text
-git rev-parse HEAD
-git status --porcelain=v1 -z | shasum -a 256
-git rev-parse --abbrev-ref HEAD
+git -C "$repo" rev-parse HEAD
+git -C "$repo" status --porcelain=v1 -z > "$CASE/status-before.bin"
+shasum -a 256 "$CASE/status-before.bin"
+git -C "$repo" rev-parse --abbrev-ref HEAD
 ```
 
-涉及的路徑另算 SHA-256。剪貼簿用 `pbpaste` 存成檔再算 SHA-256；複製之後再讀一次，兩次 SHA-256 必須相同。commit 模式的 payload 第一行是 `// snip-sync commits v1`。
+Git 的參數以 argv 傳給 `git`。雜湊對寫好的檔算，不把 Git 輸出用管線串走。涉及的路徑另算 SHA-256。剪貼簿用 `pbpaste` 存成檔再算 SHA-256；複製之後再讀一次，兩次 SHA-256 必須相同。commit 模式的 payload 第一行是 `// snip-sync commits v1`。sentinel 與 T15 的普通文字用 `pbcopy` 放入。
 
 動作後：
 
@@ -143,7 +173,7 @@ git rev-parse --abbrev-ref HEAD
 - 沒有點到的 repo：HEAD 與 status 雜湊不變。
 - 負向步驟：快照等於該步規定的那一張，剪貼簿 sentinel 的 SHA-256 不變，並且有一行對得上的新拒絕日誌。畫面沒反應、按鈕看起來是灰的、或只有一句通用錯誤，都是 `fail`。
 
-讀 Git 用 argv，不經過 shell。每筆 Git 自己有逾時。比對時設 `GIT_CONFIG_GLOBAL=/dev/null` 與 `GIT_CONFIG_NOSYSTEM=1`。
+每筆 Git 自己有逾時。比對時設 `GIT_CONFIG_GLOBAL=/dev/null` 與 `GIT_CONFIG_NOSYSTEM=1`。
 
 每格目錄：
 
@@ -206,12 +236,12 @@ Commit 步驟把第 2–3 步換成：`rail-log`，點起點 `commit-row:<7 字�
 | `neg-mapping-collision` | 兩條路徑最後都映到同一個目的檔 | 第二次 replan 出現 `[APP:PASTE_PLAN_REFUSED: reason=target_collision]`；零寫入 |
 | `neg-mapping-ambiguous-basename` | 只給 `billing`，west 與 east 都有 | 候選 root 同時含這兩個 canonical path；`mapping_required`；取消後零寫入 |
 | `neg-mapping-missing-destination` | 不提交不存在的 repo id | `billing` 的候選正好是目的工作區那 15 個真實 root；Return 後 `[APP:PASTE_ERR: mapping_required]`；點 `btn-apply` 後 1 秒內沒有 `PASTE_APPLYING` 或 `PASTE_DONE` |
-| `neg-stale-source` | 選取完成後設 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`，等到 `[APP:EXPORT_PLAN_READY]`，改來源檔，拍快照，拿掉 hold，再複製 | `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`；sentinel 不變；快照等於改完之後、複製之前那張 |
+| `neg-stale-source` | 啟動命令裡已經有 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選好變更後用 `pbcopy` 放入 sentinel，建立 `$RUN/export-hold`，再按一次 `btn-copy`。等到新的 `[APP:EXPORT_PLAN_READY: files=N]`（N 至少 1），改來源檔，拍快照，刪掉 hold 檔。同一次複製會接著跑。不要再按一次複製，也不要等選完才去設環境變數 | `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`；沒有 `COPY_DONE`；sentinel 不變；快照等於改完之後、刪掉 hold 之前那張 |
 | `neg-stale-target` | 預覽出現後改目的端，再 Apply | `[APP:PASTE_STALE_DETECTED:]`；快照等於改完之後、Apply 之前那張 |
 | `neg-overwrite-unauthorized` | 目的檔已存在，不勾覆寫就 Apply | `[APP:PASTE_DONE:]` 且 `overwritten=0`；該檔位元組不變 |
 | `neg-cancel` | 預覽後 Escape 或 `btn-cancel` | `[APP:PASTE_CANCELLED]`；快照等於生成時的 baseline |
 
-18 步都做完後，對每個受測 App 按 Cmd+Q。10 秒內程序結束，exit code 是 0，日誌有 `phase=drained intent=quit jobs=0`，沒有殘留的 git 子程序。
+18 步都做完後，對這一個 App 按 Cmd+Q。10 秒內程序結束，exit code 是 0，日誌有 `phase=drained intent=quit jobs=0`，沒有殘留的 git 子程序。
 
 ## 6. 閘門 B：這個視窗
 
@@ -223,11 +253,12 @@ Fixture 由 `docs/real-ui-operator-fixture.sh` 建立。目錄意義：
 | `fixtures/ws-dst` | 15 個目的 repo。repo01／repo03／repo06／repo07 已有不同內容；repo04 的 `newdir` 是一般檔 |
 | `fixtures/nongit-dst` | 空的非 Git 資料夾 |
 | `fixtures/files-src` | 檔案模式來源：staged 新增／修改／刪除／rename，以及 worktree 上另一份 `both.txt` |
-| `fixtures/files-dst` | 檔案模式目的，已有 `overwrite.txt` |
+| `fixtures/files-dst` | 檔案模式目的。已追蹤 `overwrite.txt`（`do-not-touch`）、`both.txt`（`dest-both`）、`gone.txt`（`gone-dest`）、`old-name.txt`（`old-dest`）、`binary.dat`（`keep-bin`）、`folder/utf16.txt`（`keep-utf16`） |
 | `fixtures/commits-src` | first-parent 為 base、C1「多行中文」、C2、C3 merge、C4、empty replay。`side` 上另有 `SIDE` |
 | `fixtures/commits-dst-overwrite` | 已有 `common.txt`，分支 `qa-replay`，另有 staged 與 untracked |
 | `fixtures/commits-dst-clean` | 沒有 `common.txt`，分支 `qa-replay` |
 | `fixtures/commits-dst-hooks` | 四種 hook 都 `exit 1` 並寫 `fixtures/hook-marker.txt` |
+| `fixtures/commits-dst-present` | 已追蹤 `binary.dat`（`a`、NUL、`b`、換行）與 `gone.txt`（`gone`），分支 `qa-replay`。T25、T32、B42 各從這份初始樹開始 |
 | `$RUN/perf15` | Git log 版面、搜尋、100 次切換 |
 
 C1 的 message 是 `多行中文`、空行、`第二段`。C2 改 `common.txt`、把 `old.txt` 改名 `new.txt`、刪除 `gone.txt` 與含 NUL 的 `binary.dat`、新增 `emoji.txt`。C3 是 merge，first parent 是 C2，對 first parent 的 diff 是 `side.txt`。C4 新增 `newdir/content.txt` 與含 NUL 的 `new-binary.bin`。
@@ -244,17 +275,17 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T02 | 貼上時不選 `paste-map-pick`，再選一次 | 未選時 `[APP:PASTE_ERR: mapping_required]`，點 `btn-apply` 沒有 `PASTE_APPLYING`；選後 `[APP:PASTE_MAPPED]` 的絕對路徑正確 |
 | T03 | repo01 與 repo03 的 `unrelated.txt` 各點 `paste-overwrite` | 兩個不同 ID，兩次 `[APP:PASTE_TOGGLED]` 的 idx 不同；套用後覆寫 2、跳過 0，兩邊位元組分別是 `from-repo01` 與 `from-repo03` |
 | T04 | repo02／repo05 的 `only-src.txt` 與 repo06／repo07 的 `shared.txt` | 建立 2、覆寫 2；其餘 repo 的 HEAD 與 status 不變 |
-| T05 | `files-src` 的 staged 新增、修改、刪除、rename，複製後貼到 `files-dst` | 建立 2、覆寫 1、刪除 2；`old-name.txt` 消失、`new-name.txt` 存在 |
+| T05 | `files-src` 的 staged 新增、修改、刪除、rename，複製後貼到新鮮的 `files-dst` | payload 含 `[NEW] staged-new.txt`、`[MODIFIED] both.txt`（內容 `index-body`）、`[DELETED] gone.txt`、`[MOVED] new-name.txt`。沒有舊路徑的刪除項。貼上後建立 `staged-new.txt` 與 `new-name.txt`、覆寫 `both.txt` 為 `index-body`、刪除 `gone.txt`。`old-name.txt` 仍是 `old-dest` |
 | T06 | 同一路徑 `both.txt` 分別從變更列（index）與 Project（worktree）複製 | 兩次 payload 的位元組分別等於 index 的 `index-body` 與 worktree 的 `worktree-body` |
-| T07 | 複製 `folder/` | 通知是已複製 5、略過 3；目的端只有 `a.txt`–`e.txt` |
-| T08 | 複製 `binary.dat` 與 `folder/utf16.txt` | payload 沒有可還原內容；目的端原檔位元組不變 |
+| T07 | 複製 `folder/`。這個資料夾有 7 個檔：`a.txt`–`e.txt`、`bin.dat`、`utf16.txt`。`large.txt` 不在裡面 | 通知是已複製 5、略過 2。略過的是 `bin.dat` 與 `utf16.txt`。目的端建立 `a.txt`–`e.txt`；`folder/utf16.txt` 仍是 `keep-utf16`；不建立 `folder/bin.dat` |
+| T08 | 複製來源的 `binary.dat` 與 `folder/utf16.txt`，貼到新鮮的 `files-dst` | payload 沒有這兩個檔的可還原內容。`files-dst/binary.dat` 仍是 `keep-bin`，`files-dst/folder/utf16.txt` 仍是 `keep-utf16` |
 | T09 | 複製 `large.txt` | payload 是超過大小的 placeholder；貼上不建立 `large.txt` |
 | T10 | 複製 `empty.txt` | 目的端檔案存在且長度 0 |
 | T11 | 複製 `路徑 有空白/檔案.txt` 與 `crlf.txt` | 路徑與 `中文` 正確；CRLF 變 LF，首尾空行與檔尾換行依檔案模式契約去掉 |
 | T12 | 預覽裡取消一個新檔，不勾 `overwrite.txt` 的覆寫 | 取消的檔不出現；`overwrite.txt` 仍是 `do-not-touch` |
 | T13 | 預覽出現後在外面改目的檔，再 Apply | `[APP:PASTE_STALE_DETECTED]`；外面寫入的內容保留；沒有部分寫入 |
 | T14 | 預覽後 Escape | `[APP:PASTE_CANCELLED]`；HEAD 不變 |
-| T15 | 先 Cmd+C 一段普通文字 `QA invalid clipboard payload`，再按貼上 | `[APP:PASTE_ERR: clipboard]`；目的端零寫入 |
+| T15 | 用 `pbcopy` 放入普通文字 `QA invalid clipboard payload`，再按貼上。不要在這個 App 裡按 Cmd+C | `[APP:PASTE_ERR: clipboard]`；目的端零寫入 |
 | T16 | 目的地改為 `fixtures/nongit-dst`，保留 repo 前綴 | 目錄裡沒有 `.git`；同時有保留前綴的路徑與去掉前綴的路徑，內容與來源一致 |
 | T17 | 在 `commits-src` 把 `SIDE` 和 main 上不能組成 first-parent 鏈的 commit 一起 Shift 選取，再複製 | `[APP:COPY_COMMITS_ERR: commits are not contiguous:]`；sentinel 不變 |
 | T18 | 選 C1、C2、C3，貼到 `commits-dst-overwrite` 的 `qa-replay` | 兩列 `common.txt` 各有自己的覆寫 ID 與 idx；Apply 後 `git rev-list <before>..HEAD` 是 3 |
@@ -262,16 +293,16 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T20 | 核對 T19 那 3 個 commit | `git log -1 -z --format=%an%x00%ae%x00%aI%x00%B` 與來源逐欄相等。C1 含多行中文與空行。作者時間是 fixture 寫入的 `+08:00` |
 | T21 | 核對 T19 的 merge 那一筆 | 目的 commit 只有一個 parent；只多出 `side.txt`，內容 `from-side` |
 | T22 | 核對 T19 的 C2 | `old.txt` 消失、`new.txt` 為 `old`、`gone.txt` 消失、`emoji.txt` 為 `你好 ✨`。預覽同時把 `old.txt` 顯示為刪除 |
-| T23 | 看 `commits-dst-overwrite` 在一次成功重播之後 | `staged-keep.txt` 仍在 index；`local-only.txt` 仍是 untracked。這一格在 T18 能 Apply 之後才做；T18 是 `identity-fail` 時，本格寫 `not-run`，原因寫「T18 未套用」 |
+| T23 | 看 `commits-dst-overwrite` 在一次成功重播之後 | `staged-keep.txt` 仍在 index；`local-only.txt` 仍是 untracked。T18 是 `pass` 之後才做。T18 是 `fail` 時，本格判定 `not-run`，證據欄寫「T18 未套用」 |
 | T24 | 把 C4 貼到 `commits-dst-hooks` | 重播成功；`fixtures/hook-marker.txt` 不存在 |
-| T25 | 重播 C2，看含 NUL 的 `binary.dat` 刪除 | 規格 4.2 要求標成未複製，不在目的端刪除。實作若把 Deleted 列成可套用的刪除，與規格衝突 |
+| T25 | 只重播 C2 到新鮮的 `commits-dst-present` | 規格 4.2 要求含 NUL 的刪除標成未複製，不刪除目的端的 `binary.dat`。實作若把它套用成刪除，與規格衝突。記錄 `binary.dat` 是否仍在，以及位元組是否仍是 `a`、NUL、`b`、換行。判定寫 `blocked-contract`。同一次重播會刪掉文字檔 `gone.txt`，那不是這格的契約衝突 |
 | T26 | 貼 C4 到乾淨目的 | 預覽把 `new-binary.bin` 標成 SKIP，摘要的建立／跳過與每一列一致；實際只提交 `newdir/content.txt` |
 | T27 | 同一段 C4 再貼一次 | 第二個 SHA 不同，tree 與前一個相同 |
 | T28 | 只貼 `empty replay` | 預覽有 message、作者與時間；Apply 後 `before..HEAD` 是 1，tree 不變 |
 | T29 | 在 commit 預覽裡取消其中一個檔，再 Apply | 拒絕；HEAD 與檔案不變 |
 | T30 | 有覆寫列但少勾一個 | 拒絕；沒有部分 commit |
 | T31 | 把 C4 貼到 `ws-dst/repo04`（`newdir` 是一般檔） | 拒絕；HEAD、status、`newdir` 的位元組不變。訊息指出 `newdir` 與「不是目錄」 |
-| T32 | 在 C2 的變更檔案裡，對 `gone.txt` 右鍵複製 | `[APP:MENU_ACTION: copy-files]`；payload 含 `[DELETED]` 與刪除前內容 `gone`；貼上後目的端該路徑消失 |
+| T32 | 在 C2 的變更檔案裡，對 `gone.txt` 右鍵複製，貼到新鮮的 `commits-dst-present` | `[APP:MENU_ACTION: copy-files]`；payload 含 `[DELETED]` 與刪除前內容 `gone`；`gone.txt` 消失；`binary.dat` 仍是初始位元組 |
 | T33 | `perf15` 上 `log-filter-repo` 選一個 repo，`btn-log-regex` 輸入能命中的字 | 列只剩該 repo、且 subject 符合的 commit |
 | T34 | 在 log 裡實際滾動 | 載入筆數增加（50 的倍數往上）。把前後的 `[APP:GRAPH_LOADED: commits=N]` 寫進 `action.json` |
 | T35 | 搜尋尚未載入的較早 commit | 找到該 SHA，預覽指出它 |
@@ -281,14 +312,14 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T39 | Cmd+Shift+W 關掉，再 Cmd+Shift+O 打開一個 repo | 關閉時 `[APP:READY_REPOS: 0]`；重開成功；前後剪貼簿 SHA-256 相同 |
 | T40 | Cmd+Q | 程序消失，exit code 0；這輪出現過的 git 子程序都不在 |
 
-T03 與 T18 的 `action.json` 要寫兩欄：畫面上同相對路徑的列數，以及 `paste-overwrite:` 的相異 ID 數。列數大於相異 ID 數就是 `identity-fail`。
+T03 與 T18 的 `action.json` 要寫兩欄：畫面上同相對路徑的列數，以及 `paste-overwrite:` 的相異 ID 數。列數大於相異 ID 數時，判定寫 `fail`，證據欄寫 `identity-fail`。
 
 #46 之後多出來的四格，40 項矩陣沒有：
 
 | ID | 點什麼 | 通過線 |
 |---|---|---|
 | B41 | 變更檔案上 Cmd 點兩列、Shift 點出範圍，右鍵複製 | 選取集合與畫面順序一致；資料夾展開後同一檔只出現一次 |
-| B42 | 範圍內含刪除檔，與一個資料夾一起複製 | payload 裡刪除檔是 `[DELETED]` 加舊內容；貼上後那些路徑消失 |
+| B42 | 範圍內含刪除檔，與一個資料夾一起複製，貼到新鮮的 `commits-dst-present` | payload 裡刪除檔是 `[DELETED]` 加舊內容；`gone.txt` 消失；`binary.dat` 仍是初始位元組 |
 | B43 | 多 repo log 看分支標籤 | 一列一個合併標籤，寬度不超過 320px；tooltip 含全部 ref |
 | B44 | 多 repo 只點 `log-filter-repo`；另開一個單一 repo 工作區 | 單一 repo 工作區的 chip 是 `log-filter-paths`，篩選結果與所選 repo、路徑一致 |
 
@@ -298,7 +329,7 @@ T03 與 T18 的 `action.json` 要寫兩欄：畫面上同相對路徑的列數�
 
 | 位置 | `bd09e95` 上的程式 | 操作者應有的判定 |
 |---|---|---|
-| `ui/paste.rs` 的 paste ID 只有 path | 同相對路徑的第二個覆寫控制項不會有自己的 ID | T03、T18 為 `fail`（`identity-fail`） |
+| `ui/paste.rs` 的 paste ID 只有 path | 同相對路徑的第二個覆寫控制項不會有自己的 ID | T03、T18 判定 `fail`，證據欄寫 `identity-fail` |
 | commit 預覽的動作標籤 | binary 新增會畫成建立；rename 的舊路徑不一定畫成刪除；空 commit 預覽沒有 message／作者／時間 | T22、T26、T28：Git 對則 `ui-defect`，Git 也錯則 `fail` |
 | 規格 4.2 與 commit 刪除含 NUL 的檔 | 規格要求不刪除；實作路徑仍可能套用刪除 | T25 維持 `blocked-contract`，不要選邊 |
 | Git log 的 subject 欄 | 窄寬度下訊息欄可能只剩空白 | T36 以這一輪的截圖與列文字為準 |
@@ -318,13 +349,13 @@ T03 與 T18 的 `action.json` 要寫兩欄：畫面上同相對路徑的列數�
 產品閘門: 打開 | 關閉
 ```
 
-接著一張表：ID、判定、一句話證據（日誌行或 Git SHA）。產品閘門只有在 A 的 18 步與 B 的 T01–T40、B41–B44 全部為 `pass` 時寫「關閉」。T38 與第 9 節的項目保持 `not-run`，並在結論寫「功能閘門之外仍有未測項目，整個產品不在本規程宣告完成」。
+接著一張表：ID、判定、一句話證據（日誌行或 Git SHA）。產品閘門按第 1 節的名單關閉：18 步、T01–T22、T24、T26–T37、T39、T40、條件內的 T23、B41–B44、B-notify 全部是 `pass`。T25、T38、C preflight 不參與這個判斷。結論另寫「二進位刪除的契約尚未決定，第 9 節的項目尚未測，整個產品不在本規程宣告完成」。
 
 ## 9. 這份規程不關閉的項目
 
 Windows 與 Linux 的真實輸入、IME、跨機剪貼簿、與 ClipCode 的實際互貼、standard 15×10,000×20,000 負載、重播到第 N 個 commit 失敗後保留前面幾個、磁碟滿、權限、缺 user identity、預覽後 HEAD 被改的完整矩陣、symlink、控制字元路徑、非 UTF-8 檔名、submodule、sparse checkout、linked worktree、light theme 的完整操作。
 
-規格 5.1 寫了系統匣。`crates/desktop-native` 沒有對應控制項。找不到選單列圖示時記成規格落差，不在本規程找圖示，也不算 `missing-control`。
+規格 5.1 寫了系統匣。`crates/desktop-native` 沒有對應控制項。找不到選單列圖示時記成規格落差，不在本規程找圖示，也不寫進計分表。
 
 檔案模式和 IDE 套件的逐位元組契約由 `fixtures/clipboard-contract.json` 與 core／CLI 測試負責。本規程不重跑那一套。
 
