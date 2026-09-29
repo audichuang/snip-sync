@@ -13,7 +13,9 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use snip_core::commits::{self, ReplayAction};
+use snip_core::commits::{
+	self, FilePlan, NotCopiedReason, ReplayAction, ReplaySkipReason,
+};
 use snip_core::format;
 use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::Git;
@@ -447,12 +449,29 @@ pub struct PasteItem {
 	pub bytes: usize,
 	pub lines: usize,
 	pub op_index: usize,
+	/// Commit replay only: the commit (index into the payload) this row
+	/// belongs to. `None` for file restores.
+	pub commit: Option<usize>,
+	/// i18n key saying why an `action_label == "SKIP"` row is not written.
+	pub skip_reason: Option<&'static str>,
+	/// Commit replay only: the other half of a rename ("→ new" on the
+	/// deleted old path, "← old" on the written new path).
+	pub rename_note: Option<String>,
 }
 
 impl PasteItem {
+	/// An existing destination file that the user may choose to overwrite.
+	/// A skipped row is never written, so it never asks.
+	pub fn overwritable(&self) -> bool {
+		self.dest_exists && !self.is_delete && self.action_label != "SKIP"
+	}
+
 	fn retained_heap_bytes(&self) -> usize {
 		self.path
 			.capacity()
+			.saturating_add(
+				self.rename_note.as_ref().map_or(0, String::capacity),
+			)
 			.saturating_add(self.dest_root.capacity())
 			.saturating_add(self.dest_root_name.capacity())
 			.saturating_add(self.dest_path.capacity())
@@ -470,6 +489,8 @@ pub enum PasteNode {
 	Dir(String, usize),
 	/// An item (index into `items`) at this tree depth.
 	File(usize, usize),
+	/// A commit header (index into the payload's commits).
+	Commit(usize),
 }
 
 /// "a/b/c.txt" as ("a/b", "c.txt"); a top-level file has an empty dir.
@@ -589,6 +610,22 @@ fn canonical_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// drivers can recover it by splitting off `paste-<kind>:<ix>:`.
 pub fn control_id(kind: &str, ix: usize, path: &str) -> String {
 	format!("paste-{kind}:{ix}:{path}")
+}
+
+/// The i18n key explaining why a commit file is not written.
+fn skip_reason_key(file: &FilePlan) -> &'static str {
+	match (file.not_copied, file.skip_reason) {
+		(Some(NotCopiedReason::Binary), _) => "reason_nc_binary",
+		(Some(NotCopiedReason::NonUtf8), _) => "reason_nc_non_utf8",
+		(Some(NotCopiedReason::NonUtf8Path), _) => "reason_nc_non_utf8_path",
+		(Some(NotCopiedReason::UnsupportedType), _) => "reason_nc_unsupported",
+		(Some(NotCopiedReason::Unreadable), _) => "reason_nc_unreadable",
+		(None, Some(ReplaySkipReason::UnsafePath)) => "reason_skip_unsafe_path",
+		(None, Some(ReplaySkipReason::NonUtf8Target)) => {
+			"reason_skip_non_utf8_target"
+		}
+		_ => "reason_skip_generic",
+	}
 }
 
 fn root_name(path: &Path) -> String {
@@ -933,43 +970,103 @@ impl PastePreviewPlan {
 					ReplayAction::Skip => "SKIP",
 				};
 				let body = src.content.as_deref().unwrap_or_default();
-				let text = format!(
-					"commit: {}\nauthor: {} <{}>\ndate: {}\naction: {action_label}\npath: {}\n\n{body}",
-					commit.message.trim_end(),
-					commit.author_name,
-					commit.author_email,
-					commit.author_date,
-					file.path,
-				);
-				let content: Arc<str> = Arc::from(text);
+				let head = |label: &str| {
+					format!(
+						"commit: {}\nauthor: {} <{}>\ndate: {}\naction: {label}\n",
+						commit.message.trim_end(),
+						commit.author_name,
+						commit.author_email,
+						commit.author_date,
+					)
+				};
 				let dest_path = file
 					.absolute_path
 					.clone()
 					.unwrap_or_else(|| dest.join(&file.path));
-				let item = PasteItem {
-					path: file.path.clone(),
-					dest_root: dest.to_path_buf(),
-					dest_root_name: dest_name.clone(),
-					dest_path,
-					dest_exists: file.existed,
-					is_delete: file.action == ReplayAction::Delete,
-					action_label,
-					overwrite_allowed: false,
-					selected: true,
-					content,
-					bytes: body.len(),
-					lines: body.lines().count(),
-					op_index: c_idx * 1000 + f_idx,
+				let row = |path: &str,
+				           dest_path: PathBuf,
+				           existed: bool,
+				           delete: bool,
+				           label: &'static str,
+				           text: String,
+				           body_len: usize,
+				           lines: usize,
+				           rename_note: Option<String>| {
+					PasteItem {
+						path: path.to_string(),
+						dest_root: dest.to_path_buf(),
+						dest_root_name: dest_name.clone(),
+						dest_path,
+						dest_exists: existed,
+						is_delete: delete,
+						action_label: label,
+						overwrite_allowed: false,
+						selected: true,
+						content: Arc::from(text),
+						bytes: body_len,
+						lines,
+						op_index: c_idx * 1000 + f_idx,
+						commit: Some(c_idx),
+						skip_reason: (label == "SKIP")
+							.then(|| skip_reason_key(file)),
+						rename_note,
+					}
 				};
-				items_heap =
-					items_heap.saturating_add(item.retained_heap_bytes());
-				items.push(item);
-				check_budget(
-					base.saturating_add(items_heap).saturating_add(
-						items.capacity() * size_of::<PasteItem>(),
+				let mut rows = Vec::with_capacity(2);
+				// A rename is a deletion of the old path plus a write of
+				// the new one; the preview shows both.
+				if let (ReplayAction::Write, Some(old)) =
+					(file.action, file.old_path.as_deref())
+				{
+					let old_abs = file
+						.old_absolute_path
+						.clone()
+						.unwrap_or_else(|| dest.join(old));
+					rows.push(row(
+						old,
+						old_abs.clone(),
+						old_abs.exists(),
+						true,
+						"DELETE",
+						format!(
+							"{}path: {old}\nrenamed to: {}\n",
+							head("DELETE"),
+							file.path
+						),
+						0,
+						0,
+						Some(format!("→ {}", file.path)),
+					));
+				}
+				rows.push(row(
+					&file.path,
+					dest_path,
+					file.existed,
+					file.action == ReplayAction::Delete,
+					action_label,
+					format!(
+						"{}path: {}\n\n{body}",
+						head(action_label),
+						file.path
 					),
-					limit,
-				)?;
+					body.len(),
+					body.lines().count(),
+					file.old_path
+						.as_deref()
+						.filter(|_| file.action == ReplayAction::Write)
+						.map(|old| format!("← {old}")),
+				));
+				for item in rows {
+					items_heap =
+						items_heap.saturating_add(item.retained_heap_bytes());
+					items.push(item);
+					check_budget(
+						base.saturating_add(items_heap).saturating_add(
+							items.capacity() * size_of::<PasteItem>(),
+						),
+						limit,
+					)?;
+				}
 			}
 		}
 		plan.items = items;
@@ -1184,6 +1281,9 @@ impl PastePreviewPlan {
 				lines,
 				op_index: op_idx,
 				dest_root,
+				commit: None,
+				skip_reason: None,
+				rename_note: None,
 			};
 			items_heap = items_heap.saturating_add(item.retained_heap_bytes());
 			items.push(item);
@@ -1213,6 +1313,9 @@ impl PastePreviewPlan {
 				lines: 0,
 				op_index: op_idx,
 				dest_root,
+				commit: None,
+				skip_reason: None,
+				rename_note: None,
 			};
 			items_heap = items_heap.saturating_add(item.retained_heap_bytes());
 			items.push(item);
@@ -1319,9 +1422,28 @@ impl PastePreviewPlan {
 		rows
 	}
 
+	/// The commit replay as the user will see it: each commit's header, in
+	/// replay order, followed by its file rows. An empty commit is a header
+	/// with no rows.
+	pub fn commit_rows(&self) -> Vec<PasteNode> {
+		let Some(preview) = &self.commit_preview else {
+			return Vec::new();
+		};
+		let mut rows = Vec::with_capacity(self.items.len());
+		let mut ix = 0;
+		for c in 0..preview.replay.commits.len() {
+			rows.push(PasteNode::Commit(c));
+			while self.items.get(ix).is_some_and(|i| i.commit == Some(c)) {
+				rows.push(PasteNode::File(ix, 1));
+				ix += 1;
+			}
+		}
+		rows
+	}
+
 	pub fn set_all_overwrite(&mut self, allowed: bool) {
 		for item in &mut self.items {
-			if item.dest_exists && !item.is_delete {
+			if item.overwritable() {
 				item.overwrite_allowed = allowed;
 			}
 		}
@@ -1498,6 +1620,7 @@ mod tests {
 				PasteNode::File(ix, depth) => {
 					format!("F {} {depth}", path(*ix))
 				}
+				PasteNode::Commit(c) => format!("C {c}"),
 			})
 			.collect();
 		assert_eq!(
@@ -2280,6 +2403,118 @@ mod tests {
 			}],
 		};
 		commits::to_clipboard_text(&payload)
+	}
+
+	/// c1: a binary (not copied) file, a new text file and a rename; c2: no
+	/// files at all; c3: a modification of an existing file.
+	fn commit_payload_mixed() -> String {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+			NotCopiedReason,
+		};
+		let file = |path: &str, change, content: Option<&str>| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change,
+			content: content.map(Into::into),
+			not_copied: None,
+		};
+		let record = |message: &str, files| CommitRecord {
+			message: message.into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files,
+		};
+		let mut binary = file("img.bin", FileChange::Added, None);
+		binary.not_copied = Some(NotCopiedReason::Binary);
+		let mut renamed =
+			file("dir/new.txt", FileChange::Renamed, Some("moved\n"));
+		renamed.old_path = Some("old.txt".into());
+		commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![
+				record(
+					"first\n\nbody",
+					vec![
+						binary,
+						file("fresh.txt", FileChange::Added, Some("fresh\n")),
+						renamed,
+					],
+				),
+				record("empty one", Vec::new()),
+				record(
+					"third",
+					vec![file("a.txt", FileChange::Modified, Some("new\n"))],
+				),
+			],
+		})
+	}
+
+	fn mixed_plan() -> (tempfile::TempDir, PastePreviewPlan) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		fs::write(path.join("old.txt"), "old\n").unwrap();
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&commit_payload_mixed(),
+			&path,
+			&[],
+			1,
+		)
+		.unwrap();
+		(dir, plan)
+	}
+
+	#[test]
+	fn commit_preview_lists_skips_renames_and_groups_in_replay_order() {
+		let (_dir, plan) = mixed_plan();
+		let shown: Vec<String> = plan
+			.commit_rows()
+			.iter()
+			.map(|r| match r {
+				PasteNode::Commit(c) => format!("C{c}"),
+				PasteNode::File(ix, _) => {
+					let i = &plan.items[*ix];
+					format!("{} {}", i.action_label, i.path)
+				}
+				_ => "?".into(),
+			})
+			.collect();
+		assert_eq!(
+			shown,
+			[
+				"C0",
+				"SKIP img.bin",
+				"CREATE fresh.txt",
+				"DELETE old.txt",
+				"CREATE dir/new.txt",
+				"C1",
+				"C2",
+				"OVERWRITE a.txt",
+			]
+		);
+		let by_path = |p: &str, label: &str| {
+			plan.items
+				.iter()
+				.find(|i| i.path == p && i.action_label == label)
+				.unwrap()
+		};
+		assert_eq!(
+			by_path("img.bin", "SKIP").skip_reason,
+			Some("reason_nc_binary")
+		);
+		let old = by_path("old.txt", "DELETE");
+		assert!(old.is_delete && old.dest_exists && old.commit == Some(0));
+		assert_eq!(old.rename_note.as_deref(), Some("→ dir/new.txt"));
+		assert_eq!(
+			by_path("dir/new.txt", "CREATE").rename_note.as_deref(),
+			Some("← old.txt")
+		);
+		assert_eq!(by_path("a.txt", "OVERWRITE").commit, Some(2));
+		// The empty commit has no rows but is still applied.
+		assert!(plan.items.iter().all(|i| i.commit != Some(1)));
+		assert!(plan.executable());
 	}
 
 	#[test]

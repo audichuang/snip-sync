@@ -208,6 +208,45 @@ macro_rules! app_log {
 	}};
 }
 
+/// Most not-copied paths the commit copy toast names; the rest are counted.
+const COMMIT_TOAST_PATHS: usize = 3;
+
+/// The commit copy toast (spec 4.2): commit, file and character counts, and
+/// when files were left out, which commit lost which files.
+fn commit_copied_status(export: &snip_core::commits::CommitExport) -> Msg {
+	let sum = snip_core::commits::copy_summary(&export.payload, &export.text);
+	let mut args = vec![
+		sum.commit_count.to_string(),
+		sum.file_count.to_string(),
+		sum.chars.to_string(),
+	];
+	if sum.not_copied_count == 0 {
+		return Msg::new("status_commits_copied", args);
+	}
+	let mut named = 0;
+	let mut parts = Vec::new();
+	for (n, commit) in export.payload.commits.iter().enumerate() {
+		let paths: Vec<&str> = commit
+			.files
+			.iter()
+			.filter(|f| f.not_copied.is_some())
+			.map(|f| f.path.as_str())
+			.take(COMMIT_TOAST_PATHS.saturating_sub(named))
+			.collect();
+		named += paths.len();
+		if !paths.is_empty() {
+			parts.push(format!("#{} {}", n + 1, paths.join(", ")));
+		}
+	}
+	let mut detail = parts.join("; ");
+	if named < sum.not_copied_count {
+		detail.push_str(" …");
+	}
+	args.push(sum.not_copied_count.to_string());
+	args.push(detail);
+	Msg::new("status_commits_copied_skipped", args)
+}
+
 /// The copy toast: a partial copy (file limit hit in the folder walk or
 /// in the plan) always says so, with the limit.
 fn copied_status(
@@ -5027,7 +5066,7 @@ impl WorkbenchModel {
 			lifecycle::JobKind::CancellableRead,
 			Some(job_token),
 			async move {
-				let result: Result<(String, usize), String> = bg
+				let result: Result<(String, usize, Msg), String> = bg
 					.spawn(async move {
 						let opts = interactive_read_opts(run_token);
 						let git = Git::open_with(&repo_root, &opts)
@@ -5041,7 +5080,8 @@ impl WorkbenchModel {
 						)
 						.map_err(|e| e.to_string())?;
 						let n_commits = exported.payload.commits.len();
-						Ok((exported.text, n_commits))
+						let status = commit_copied_status(&exported);
+						Ok((exported.text, n_commits, status))
 					})
 					.await;
 
@@ -5051,7 +5091,7 @@ impl WorkbenchModel {
 						return;
 					}
 					match result {
-						Ok((text, n_commits)) => {
+						Ok((text, n_commits, status)) => {
 							if let Err(e) = clip::write_text(&text) {
 								model.set_status(
 									"status_clipboard_failed",
@@ -5061,10 +5101,7 @@ impl WorkbenchModel {
 								app_log!(
 									"[APP:COPY_COMMITS_DONE: commits={n_commits}]"
 								);
-								model.set_status(
-									"status_commits_copied",
-									[n_commits.to_string()],
-								);
+								model.status = status;
 							}
 						}
 						Err(err) => {
@@ -5072,7 +5109,11 @@ impl WorkbenchModel {
 							model.set_status("error_payload", [err]);
 						}
 					}
-					let ok = model.status.key == "status_commits_copied";
+					let ok = matches!(
+						model.status.key,
+						"status_commits_copied"
+							| "status_commits_copied_skipped"
+					);
 					model.show_toast(ok, model.status.clone(), cx);
 					cx.notify();
 				});
@@ -6667,6 +6708,129 @@ mod tests {
 				"keep"
 			);
 			assert!(!dest.join("fresh.txt").exists());
+		}
+
+		/// Commit payload on the clipboard format: c1 has a binary (not
+		/// copied) file, a new file and a rename; c2 has no files; c3
+		/// modifies `base.txt`.
+		fn mixed_commit_payload() -> String {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+				NotCopiedReason,
+			};
+			let file = |path: &str, change, body: Option<&str>| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change,
+				content: body.map(Into::into),
+				not_copied: None,
+			};
+			let record = |message: &str, author: &str, files| CommitRecord {
+				message: message.into(),
+				author_name: author.into(),
+				author_email: format!("{author}@example.invalid"),
+				author_date: "2026-09-25T12:34:56+00:00".into(),
+				files,
+			};
+			let mut binary = file("img.bin", FileChange::Added, None);
+			binary.not_copied = Some(NotCopiedReason::Binary);
+			let mut renamed =
+				file("dir/new.txt", FileChange::Renamed, Some("moved"));
+			renamed.old_path = Some("old.txt".into());
+			snip_core::commits::to_clipboard_text(&CommitsPayload {
+				commits: vec![
+					record(
+						"first\n\nbody",
+						"ann",
+						vec![
+							binary,
+							file("fresh.txt", FileChange::Added, Some("x")),
+							renamed,
+						],
+					),
+					record("empty one", "bob", Vec::new()),
+					record(
+						"third",
+						"cy",
+						vec![file("base.txt", FileChange::Modified, Some("y"))],
+					),
+				],
+			})
+		}
+
+		#[gpui::test]
+		fn commit_preview_totals_and_rows_come_from_the_replay_plan(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &mixed_commit_payload());
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				// Commits are groups in replay order; the empty one keeps
+				// its header and has no file rows.
+				let shape: Vec<String> = plan
+					.commit_rows()
+					.iter()
+					.map(|r| match r {
+						crate::paste::PasteNode::Commit(c) => format!("C{c}"),
+						crate::paste::PasteNode::File(ix, _) => {
+							let i = &plan.items[*ix];
+							format!("{}:{}", crate::ui::paste_op(i).0, i.path)
+						}
+						_ => "?".into(),
+					})
+					.collect();
+				assert_eq!(
+					shape,
+					[
+						"C0",
+						"op_skip:img.bin",
+						"op_create:fresh.txt",
+						"op_delete:old.txt",
+						"op_create:dir/new.txt",
+						"C1",
+						"C2",
+						"op_skip:base.txt",
+					]
+				);
+				let preview = plan.commit_preview.as_ref().unwrap();
+				let c1 = &preview.replay.commits[1];
+				assert_eq!(
+					(&*c1.message, &*c1.author_name, &*c1.author_date),
+					("empty one", "bob", "2026-09-25T12:34:56+00:00")
+				);
+				assert!(c1.files.is_empty());
+				// The binary row is a skip with its reason, not a create,
+				// and the rename's old path counts as a delete.
+				let img = plan.items.iter().find(|i| i.path == "img.bin");
+				assert_eq!(
+					crate::ui::paste_op(img.unwrap()),
+					(
+						"op_skip",
+						crate::theme::pal().text_disabled,
+						"reason_nc_binary"
+					)
+				);
+				assert_eq!(
+					crate::ui::paste_counts(plan),
+					crate::ui::PasteCounts {
+						creates: 2,
+						overwrites: 0,
+						existing: 1,
+						deletes: 1,
+						// img.bin, and base.txt until overwrite is allowed
+						skips: 2,
+					}
+				);
+				// Nothing to write in c2 does not block Apply.
+				assert!(plan.executable());
+			});
 		}
 
 		#[gpui::test]
@@ -8361,6 +8525,57 @@ mod tests {
 				"F2:r:pom.xml",
 				"R:unstaged:s:1",
 			]
+		);
+	}
+
+	#[test]
+	fn commit_copy_toast_reports_counts_and_where_files_were_left_out() {
+		use snip_core::commits::{
+			CommitExport, CommitFile, CommitRecord, CommitsPayload, FileChange,
+			NotCopiedReason,
+		};
+		let file =
+			|path: &str, not_copied: Option<NotCopiedReason>| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: not_copied.is_none().then(|| "body".into()),
+				not_copied,
+			};
+		let record = |files| CommitRecord {
+			message: "m".into(),
+			author_name: "a".into(),
+			author_email: "a@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files,
+		};
+		let export = |payload: CommitsPayload| CommitExport {
+			text: snip_core::commits::to_clipboard_text(&payload),
+			payload,
+		};
+		let bin = Some(NotCopiedReason::Binary);
+		let clean = export(CommitsPayload {
+			commits: vec![record(vec![file("a.txt", None)]), record(vec![])],
+		});
+		let msg = commit_copied_status(&clean);
+		assert_eq!(msg.key, "status_commits_copied");
+		let chars = clean.text.encode_utf16().count().to_string();
+		assert_eq!(msg.args, ["2", "1", chars.as_str()]);
+
+		let lossy = export(CommitsPayload {
+			commits: vec![
+				record(vec![file("a.txt", None), file("x.bin", bin)]),
+				record(vec![file("y.bin", bin), file("z.bin", bin)]),
+				record(vec![file("w.bin", bin)]),
+			],
+		});
+		let msg = commit_copied_status(&lossy);
+		assert_eq!(msg.key, "status_commits_copied_skipped");
+		assert_eq!(&msg.args[..2], ["3", "5"]);
+		assert_eq!(&msg.args[3..], ["4", "#1 x.bin; #2 y.bin, z.bin …"]);
+		let text = msg.render(crate::i18n::Locale::ZhTw);
+		assert!(
+			text.contains("3 個 commit") && text.contains("4 個檔案未複製")
 		);
 	}
 

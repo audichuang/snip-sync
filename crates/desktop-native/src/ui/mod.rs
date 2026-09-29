@@ -473,9 +473,16 @@ fn change_style(ct: Option<ChangeType>) -> (&'static str, u32) {
 /// Operation label, file-name colour and reason key for a paste row. The
 /// colour follows IntelliJ's file status: created green, modified blue
 /// (whether or not overwriting is allowed yet), deleted grey.
-fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
+pub(crate) fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 	if !item.selected {
 		("op_excluded", pal().text_disabled, "reason_excluded")
+	} else if item.action_label == "SKIP" {
+		// Commit replay only: the file is listed but never written.
+		(
+			"op_skip",
+			pal().text_disabled,
+			item.skip_reason.unwrap_or("reason_skip_generic"),
+		)
 	} else if item.is_delete {
 		if item.dest_exists {
 			("op_delete", pal().git_deleted, "reason_delete")
@@ -489,6 +496,37 @@ fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
 	} else {
 		("op_skip", pal().git_modified, "reason_exists")
 	}
+}
+
+/// What the paste summary bar counts. Derived from [`paste_op`], so a row's
+/// colour and the totals cannot disagree.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PasteCounts {
+	pub creates: usize,
+	pub overwrites: usize,
+	/// Existing destination files that could be overwritten.
+	pub existing: usize,
+	pub deletes: usize,
+	pub skips: usize,
+}
+
+pub(crate) fn paste_counts(plan: &PastePreviewPlan) -> PasteCounts {
+	let mut c = PasteCounts {
+		skips: plan.plan.skipped_operations.len(),
+		..PasteCounts::default()
+	};
+	for it in &plan.items {
+		if it.overwritable() {
+			c.existing += 1;
+		}
+		match paste_op(it).0 {
+			"op_create" => c.creates += 1,
+			"op_overwrite" => c.overwrites += 1,
+			"op_delete" => c.deletes += 1,
+			_ => c.skips += 1,
+		}
+	}
+	c
 }
 
 fn short_date(iso: &str) -> String {
