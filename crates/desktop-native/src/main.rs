@@ -6647,13 +6647,13 @@ mod tests {
 			assert_log_layout(&m, 160.);
 		}
 
-		/// At 900 the list is ~430px: author and date (238px) and the 72px
-		/// gutter floor leave ~90px, so the minimum cannot hold; the subject
-		/// still gets everything that is left, labels dropped.
+		/// At 900 the list is ~430px: the gutter sits at its floor and the
+		/// date and author cells shrink, so the subject still gets its
+		/// minimum with the labels dropped.
 		#[gpui::test]
 		fn wide_multi_repo_log_keeps_a_subject_at_900(cx: &mut TestAppContext) {
 			let m = measure_wide_log(cx, 900.);
-			assert_log_layout(&m, 80.);
+			assert_log_layout(&m, 160.);
 		}
 
 		#[gpui::test]

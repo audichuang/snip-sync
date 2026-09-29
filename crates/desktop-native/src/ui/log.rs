@@ -351,6 +351,20 @@ pub(super) const MIN_SUBJECT_W: f32 = 160.;
 const MIN_LABELS_W: f32 = 80.;
 const MIN_GUTTER_W: f32 = 72.;
 
+/// The narrowest the author and date cells are squeezed to (their text is
+/// clipped) once the graph gutter is at its floor.
+const MIN_AUTHOR_W: f32 = 72.;
+const MIN_DATE_W: f32 = 88.;
+
+/// The widths one list decides for all its rows, so columns line up from row
+/// to row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ListCols {
+	pub gutter: f32,
+	pub author: f32,
+	pub date: f32,
+}
+
 /// How a log row divides its width: the graph gutter, the ref labels and
 /// what is left for the subject.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -360,34 +374,57 @@ pub(super) struct RowWidths {
 	pub subject: f32,
 }
 
-/// What a `list_w` wide row leaves after the fixed cells: 8px right padding,
-/// 8px gaps between the cells, author, date and the optional hash.
-fn row_avail(list_w: f32, show_hash: bool) -> f32 {
+/// What a `list_w` wide row leaves for the gutter, labels and subject after
+/// 8px right padding, the 8px gaps between the cells and the optional hash.
+fn row_base(list_w: f32, show_hash: bool) -> f32 {
 	let gaps = if show_hash { 4. } else { 3. } * 8.;
 	let hash_w = if show_hash { 64. } else { 0. };
-	list_w - 8. - gaps - AUTHOR_W - DATE_W - hash_w
+	list_w - 8. - gaps - hash_w
 }
 
-/// The graph gutter width of every row in a `list_w` wide list. It is decided
-/// once per list, so lanes line up from row to row: clipped only when the
-/// subject and a squeezed label group would not fit beside it, and never
-/// below [`MIN_GUTTER_W`] (on a very narrow list the subject gives way).
-pub(super) fn list_gutter(list_w: f32, gutter_w: f32, show_hash: bool) -> f32 {
-	let room = row_avail(list_w, show_hash) - MIN_SUBJECT_W - MIN_LABELS_W - 6.;
-	gutter_w.min(room.max(MIN_GUTTER_W))
+/// The graph gutter, author and date widths of every row in a `list_w` wide
+/// list, decided once per list. Pieces give way to the subject in this
+/// order: the gutter is clipped (only as far as a squeezed label group, when
+/// `has_labels`, and the subject need), then no further than
+/// [`MIN_GUTTER_W`]; below that the date and then the author cell shrink
+/// until the subject reaches [`MIN_SUBJECT_W`]. On a very narrow list the
+/// subject takes what is left.
+pub(super) fn list_cols(
+	list_w: f32,
+	gutter_w: f32,
+	has_labels: bool,
+	show_hash: bool,
+) -> ListCols {
+	let base = row_base(list_w, show_hash);
+	// The 6px before the labels only exists with labels.
+	let labels = if has_labels { MIN_LABELS_W + 6. } else { 0. };
+	let room = base - AUTHOR_W - DATE_W - MIN_SUBJECT_W - labels;
+	let gutter = gutter_w.min(room.max(MIN_GUTTER_W));
+	// What the subject still lacks with the gutter placed.
+	let mut lack =
+		(MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
+	let date = DATE_W - lack.min(DATE_W - MIN_DATE_W);
+	lack -= DATE_W - date;
+	let author = AUTHOR_W - lack.min(AUTHOR_W - MIN_AUTHOR_W);
+	ListCols {
+		gutter,
+		author,
+		date,
+	}
 }
 
-/// Divides a `list_w` wide row whose graph gutter is `gutter`. The ref
-/// labels (`labels_w`, 0 for none) shrink first, down to [`MIN_LABELS_W`],
-/// then go, so the subject keeps [`MIN_SUBJECT_W`] where the window allows.
-/// With room to spare nothing changes.
+/// Divides a `list_w` wide row laid out with `cols`. The ref labels
+/// (`labels_w`, 0 for none) shrink first, down to [`MIN_LABELS_W`], then go,
+/// so the subject keeps [`MIN_SUBJECT_W`] where the window allows. With room
+/// to spare nothing changes.
 pub(super) fn row_widths(
 	list_w: f32,
-	gutter: f32,
+	cols: ListCols,
 	labels_w: f32,
 	show_hash: bool,
 ) -> RowWidths {
-	let avail = row_avail(list_w, show_hash) - gutter;
+	let gutter = cols.gutter;
+	let avail = row_base(list_w, show_hash) - cols.author - cols.date - gutter;
 	let mut labels = labels_w;
 	// The 6px before the labels only exists with labels.
 	if labels > 0. && avail - labels - 6. < MIN_SUBJECT_W {
@@ -1620,71 +1657,107 @@ mod row_width_tests {
 	// A 24-lane gutter (the widest) and the widest combined label.
 	const WIDE_GUTTER: f32 = 24. * 16. + 8.;
 
+	fn cols(list_w: f32, gutter_w: f32, labels: bool, hash: bool) -> ListCols {
+		list_cols(list_w, gutter_w, labels, hash)
+	}
+
 	#[test]
 	fn roomy_rows_are_unchanged() {
-		assert_eq!(list_gutter(1200., 40., false), 40.);
-		let w = row_widths(1200., 40., 100., false);
+		let c = cols(1200., 40., true, false);
+		assert_eq!(
+			c,
+			ListCols {
+				gutter: 40.,
+				author: AUTHOR_W,
+				date: DATE_W
+			}
+		);
+		let w = row_widths(1200., c, 100., false);
 		assert_eq!(w.gutter, 40.);
 		assert_eq!(w.labels, 100.);
 		assert_eq!(w.subject, 1200. - 8. - 24. - 40. - 238. - 106.);
-		let w = row_widths(1200., 40., 0., true);
+		let c = cols(1200., 40., false, true);
+		let w = row_widths(1200., c, 0., true);
 		assert_eq!(w.subject, 1200. - 8. - 32. - 40. - 238. - 64.);
 	}
 
-	// Below this list width the 72px gutter floor plus the fixed cells leave
-	// less than MIN_SUBJECT_W: `row_avail(w) - MIN_GUTTER_W == MIN_SUBJECT_W`.
-	// The subject then takes what is left rather than the minimum.
+	#[test]
+	fn multi_repo_graph_keeps_a_subject() {
+		// 574 and 433 are the lists a 1080 and a 900 window leave (measured
+		// in the in-process tests `wide_multi_repo_log_keeps_a_subject_at_*`).
+		for list_w in [433., 480., 574., 720., 900.] {
+			for show_hash in [false, true] {
+				// The hash column costs 72px; a list this narrow with it is
+				// below what any squeeze can save.
+				if show_hash && list_w < 520. {
+					continue;
+				}
+				for has_labels in [false, true] {
+					let c = cols(list_w, WIDE_GUTTER, has_labels, show_hash);
+					for labels_w in [0., 60., 337.] {
+						let w = row_widths(list_w, c, labels_w, show_hash);
+						assert!(
+							w.subject >= MIN_SUBJECT_W,
+							"{list_w} {show_hash} {labels_w}: {c:?} {w:?}"
+						);
+						assert!(
+							c.gutter <= WIDE_GUTTER && w.labels <= labels_w
+						);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn a_narrow_list_squeezes_date_then_author_after_the_gutter() {
+		// 433px (a 900 window): the gutter is at its floor, the date and the
+		// author cells give the subject its minimum.
+		let c = cols(433., WIDE_GUTTER, true, false);
+		assert_eq!(c.gutter, MIN_GUTTER_W);
+		assert!(c.date < DATE_W && c.date >= MIN_DATE_W);
+		assert!(c.author >= MIN_AUTHOR_W);
+		let w = row_widths(433., c, 337., false);
+		assert_eq!(w.labels, 0.);
+		assert!(w.subject >= MIN_SUBJECT_W, "{w:?}");
+		// Only the date gives way while it alone is enough.
+		let c = cols(FLOOR_W - 10., WIDE_GUTTER, false, false);
+		assert_eq!(c.author, AUTHOR_W);
+		assert!(c.date < DATE_W);
+	}
+
+	// Below this list width the gutter floor plus full author and date
+	// leave less than MIN_SUBJECT_W.
 	const FLOOR_W: f32 =
 		8. + 24. + AUTHOR_W + DATE_W + MIN_GUTTER_W + MIN_SUBJECT_W;
 
 	#[test]
-	fn multi_repo_graph_keeps_a_subject() {
-		// 574 is the list a 1080 window leaves (measured in the in-process
-		// test `wide_multi_repo_log_keeps_a_subject_at_1080`).
-		for list_w in [FLOOR_W, 574., 720., 900.] {
-			for show_hash in [false, true] {
-				let hash = if show_hash { 72. } else { 0. };
-				if list_w < FLOOR_W + hash {
-					continue;
-				}
-				let gutter = list_gutter(list_w, WIDE_GUTTER, show_hash);
-				for labels_w in [0., 60., 337.] {
-					let w = row_widths(list_w, gutter, labels_w, show_hash);
-					assert!(
-						w.subject >= MIN_SUBJECT_W,
-						"{list_w} {show_hash} {labels_w}: {w:?}"
-					);
-					assert!(gutter <= WIDE_GUTTER && w.labels <= labels_w);
-				}
-			}
-		}
-	}
-
-	#[test]
-	fn below_the_floor_the_subject_takes_the_rest() {
-		// The list a 900 window leaves (measured in the in-process test):
-		// author, date and the 72px gutter leave 91px, all for the subject.
-		let gutter = list_gutter(433., WIDE_GUTTER, false);
-		assert_eq!(gutter, MIN_GUTTER_W);
-		let w = row_widths(433., gutter, 337., false);
+	fn below_the_squeeze_the_subject_takes_the_rest() {
+		let c = cols(300., WIDE_GUTTER, true, false);
+		assert_eq!(
+			(c.gutter, c.author, c.date),
+			(MIN_GUTTER_W, MIN_AUTHOR_W, MIN_DATE_W)
+		);
+		let w = row_widths(300., c, 337., false);
 		assert_eq!(w.labels, 0.);
-		assert_eq!(w.subject, 433. - 8. - 24. - 238. - MIN_GUTTER_W);
+		assert_eq!(w.subject, 300. - 8. - 24. - 72. - 72. - 88.);
 	}
 
 	#[test]
-	fn every_row_of_a_list_shares_one_gutter() {
-		for list_w in [433., FLOOR_W, 574., 720., 800., 1200.] {
-			let gutter = list_gutter(list_w, WIDE_GUTTER, false);
-			for labels_w in [0., 60., 100., 337.] {
-				let w = row_widths(list_w, gutter, labels_w, false);
-				assert_eq!(w.gutter, gutter, "{list_w} {labels_w}");
-			}
-		}
+	fn a_list_without_labels_keeps_more_gutter() {
+		let with = cols(574., WIDE_GUTTER, true, false);
+		let without = cols(574., WIDE_GUTTER, false, false);
+		assert!(without.gutter > with.gutter);
+		assert_eq!(without.gutter, 574. - 8. - 24. - 238. - MIN_SUBJECT_W);
+	}
+
+	#[test]
+	fn every_row_of_a_list_shares_one_set_of_columns() {
 		// Dropping the labels gives the subject the room, not the gutter.
-		let g = list_gutter(574., WIDE_GUTTER, false);
+		let c = cols(574., WIDE_GUTTER, true, false);
 		let (none, dropped) = (
-			row_widths(560., g, 0., false),
-			row_widths(560., g, 337., false),
+			row_widths(560., c, 0., false),
+			row_widths(560., c, 337., false),
 		);
 		assert_eq!(dropped.gutter, none.gutter);
 		assert_eq!(dropped.labels, 0.);
@@ -1693,16 +1766,17 @@ mod row_width_tests {
 
 	#[test]
 	fn labels_shrink_before_the_gutter() {
-		let g = list_gutter(800., 120., false);
-		assert_eq!(g, 120.);
-		let w = row_widths(800., g, 337., false);
+		let c = cols(800., 120., true, false);
+		assert_eq!(c.gutter, 120.);
+		let w = row_widths(800., c, 337., false);
 		assert!(w.labels < 337. && w.labels >= 80.);
 		assert_eq!(w.subject, MIN_SUBJECT_W);
 	}
 
 	#[test]
 	fn tiny_windows_never_go_negative() {
-		let w = row_widths(100., MIN_GUTTER_W, 337., true);
+		let c = cols(100., WIDE_GUTTER, true, true);
+		let w = row_widths(100., c, 337., true);
 		assert!(w.subject >= 0. && w.labels == 0.);
 	}
 }

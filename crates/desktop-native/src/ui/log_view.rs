@@ -346,11 +346,19 @@ impl WorkbenchModel {
 		let list_w = f32::from(
 			self.log_scroll.0.borrow().base_handle.bounds().size.width,
 		);
-		// One gutter for every row, so lanes line up.
-		let gutter_w = if list_w > 0. {
-			list_gutter(list_w, gutter_w, self.log_show_hash)
+		// One set of column widths for every row, so lanes line up.
+		let has_labels = self
+			.graph_layout
+			.as_ref()
+			.is_some_and(|l| l.rows.iter().any(|r| !r.refs.is_empty()));
+		let cols = if list_w > 0. {
+			list_cols(list_w, gutter_w, has_labels, self.log_show_hash)
 		} else {
-			gutter_w
+			ListCols {
+				gutter: gutter_w,
+				author: AUTHOR_W,
+				date: DATE_W,
+			}
 		};
 		let loading_row = self.history_extending && self.history_has_more;
 		let list = uniform_list(
@@ -366,7 +374,7 @@ impl WorkbenchModel {
 							}
 							let tint =
 								on_head.get(ix).copied().unwrap_or(false);
-							this.log_row(ix, gutter_w, list_w, tint, window, cx)
+							this.log_row(ix, cols, list_w, tint, window, cx)
 						})
 						.collect::<Vec<_>>()
 				},
@@ -554,7 +562,7 @@ impl WorkbenchModel {
 	pub(super) fn log_row(
 		&self,
 		ix: usize,
-		gutter_w: f32,
+		cols: ListCols,
 		list_w: f32,
 		on_head: bool,
 		window: &Window,
@@ -624,11 +632,11 @@ impl WorkbenchModel {
 		// The subject cell is what the row's fixed parts leave; the graph
 		// gutter and the ref labels give way before it vanishes.
 		let widths = if list_w > 0. {
-			row_widths(list_w, gutter_w, labels_w, self.log_show_hash)
+			row_widths(list_w, cols, labels_w, self.log_show_hash)
 		} else {
 			// Not laid out yet: no width to divide.
 			RowWidths {
-				gutter: gutter_w,
+				gutter: cols.gutter,
 				labels: labels_w,
 				subject: 0.,
 			}
@@ -772,25 +780,29 @@ impl WorkbenchModel {
 								.child(tf("collapsed_n", loc, &[&hidden_n])),
 						)
 					})
-					.child(
-						div()
-							.flex_shrink_0()
-							.ml_auto()
-							.flex()
-							.flex_row()
-							.items_center()
-							.gap(px(8.))
-							.when(widths.labels < labels_w, |d| {
-								d.w(px(widths.labels)).overflow_hidden()
-							})
-							.children(labels),
-					),
+					// Absent (not empty) when dropped: its 6px gap would
+					// otherwise take from the subject.
+					.when(!labels.is_empty(), |d| {
+						d.child(
+							div()
+								.flex_shrink_0()
+								.ml_auto()
+								.flex()
+								.flex_row()
+								.items_center()
+								.gap(px(8.))
+								.when(widths.labels < labels_w, |d| {
+									d.w(px(widths.labels)).overflow_hidden()
+								})
+								.children(labels),
+						)
+					}),
 			)
 			.child(
 				div()
 					.id(SharedString::from(format!("author:{key}")))
 					.flex_shrink_0()
-					.w(px(AUTHOR_W))
+					.w(px(cols.author))
 					.when(show_tips, |d| {
 						d.tooltip(tip(format!(
 							"{} <{}>",
@@ -807,7 +819,7 @@ impl WorkbenchModel {
 				div()
 					.id(SharedString::from(format!("date:{key}")))
 					.flex_shrink_0()
-					.w(px(DATE_W))
+					.w(px(cols.date))
 					.when(show_tips, |d| {
 						d.tooltip(tip(short_date(&c.author_date)))
 					})
