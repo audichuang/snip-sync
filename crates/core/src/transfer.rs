@@ -158,6 +158,8 @@ pub enum TransferError {
 	UnsafePath(String),
 	#[error("special file '{0}' is not a regular file and cannot be exported")]
 	SpecialFile(String),
+	#[error("'{}' is a file, not a directory", .0.display())]
+	NotADirectory(PathBuf),
 	#[error("unknown root: '{}' was not declared in selection or destination roots", .0.display())]
 	UnknownRoot(PathBuf),
 	#[error(
@@ -2636,9 +2638,23 @@ fn capture_replay_file_freshness(
 	opts: &RunOptions,
 ) -> Result<Option<FileFreshness>, TransferError> {
 	cancelled_err(opts, "replay-freshness")?;
-	let meta = match not_found_as_none(fs::symlink_metadata(path))? {
-		Some(meta) => meta,
-		None => return Ok(None),
+	let meta = match fs::symlink_metadata(path) {
+		Ok(meta) => meta,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+		Err(e) if e.kind() == io::ErrorKind::NotADirectory => {
+			// The OS error names no path; report the ancestor that is a
+			// file so the caller can say what blocks the replay.
+			let blocker = path
+				.ancestors()
+				.skip(1)
+				.find(|a| {
+					fs::symlink_metadata(a)
+						.is_ok_and(|m| !m.file_type().is_dir())
+				})
+				.unwrap_or(path);
+			return Err(TransferError::NotADirectory(blocker.to_path_buf()));
+		}
+		Err(e) => return Err(TransferError::Io(e)),
 	};
 	if meta.file_type().is_symlink() {
 		// Link text only. `read_link` does not open the target.
