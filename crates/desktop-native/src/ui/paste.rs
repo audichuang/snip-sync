@@ -328,6 +328,7 @@ impl WorkbenchModel {
 			let (_, name) = split_dir(&path);
 			node_row(depth)
 				.id(SharedString::from(row_id.clone()))
+				.debug_selector(|| row_id.clone())
 				.relative()
 				.cursor_pointer()
 				.when(is_sel, |d| d.bg(rgb(pal().selection_bg)))
@@ -339,6 +340,7 @@ impl WorkbenchModel {
 				.child(
 					div()
 						.id(SharedString::from(inc_id.clone()))
+						.debug_selector(|| inc_id.clone())
 						.relative()
 						.flex_shrink_0()
 						.size(px(16.))
@@ -383,6 +385,7 @@ impl WorkbenchModel {
 						d.child(
 							div()
 								.id(SharedString::from(ow_id.clone()))
+								.debug_selector(|| ow_id.clone())
 								.relative()
 								.flex()
 								.flex_row()

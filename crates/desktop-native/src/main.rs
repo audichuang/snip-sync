@@ -6830,16 +6830,16 @@ mod tests {
 			});
 		}
 
-		/// Distinct control ids, item by item: equal ids share GPUI state, so
-		/// the second row of a repeated path would ignore every click.
-		fn assert_row_ids_unique(plan: &crate::paste::PastePreviewPlan) {
-			let mut ids = std::collections::HashSet::new();
-			for (ix, item) in plan.items.iter().enumerate() {
-				for kind in ["row", "include", "overwrite"] {
-					let id = crate::paste::control_id(kind, ix, &item.path);
-					assert!(ids.insert(id.clone()), "duplicate id {id}");
-				}
-			}
+		/// Click the centre of the rendered control `id`, the way a user
+		/// does. Fails when the UI renders no such element, so it also pins
+		/// the id shape the drivers rely on.
+		fn click(cx: &mut VisualTestContext, id: &'static str) {
+			cx.run_until_parked();
+			let bounds = cx
+				.debug_bounds(id)
+				.unwrap_or_else(|| panic!("no rendered control {id}"));
+			cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+			cx.run_until_parked();
 		}
 
 		#[gpui::test]
@@ -6875,41 +6875,39 @@ mod tests {
 					.update(cx, |m, cx| m.choose_paste_prefix(prefix, idx, cx));
 				settle(cx);
 			}
-			// Item index of the row landing in `name`'s repository.
-			let row_in = |cx: &mut VisualTestContext, name: &str| {
-				model.read_with(cx, |m, _| {
-					let plan = m.paste_preview.as_ref().unwrap();
-					assert_eq!(plan.items.len(), 2);
-					assert!(plan
-						.items
-						.iter()
-						.all(|i| i.path == "unrelated.txt"));
-					assert_row_ids_unique(plan);
-					plan.items
-						.iter()
-						.position(|i| i.dest_root_name == name)
-						.unwrap()
-				})
-			};
-			let (a, b) = (row_in(cx, "alpha"), row_in(cx, "beta"));
-			assert_ne!(a, b);
-			// Each row's controls act on that row alone.
-			model.update(cx, |m, cx| m.select_paste_item(b, cx));
-			model.update(cx, |m, cx| m.toggle_paste_overwrite(b, cx));
 			model.read_with(cx, |m, _| {
 				let plan = m.paste_preview.as_ref().unwrap();
-				assert_eq!(plan.selected_item_idx, b);
-				assert!(!plan.items[a].overwrite_allowed);
-				assert!(plan.items[b].overwrite_allowed);
+				assert_eq!(plan.items.len(), 2);
+				assert!(plan.items.iter().all(|i| i.path == "unrelated.txt"));
+				assert_ne!(
+					plan.items[0].dest_root_name,
+					plan.items[1].dest_root_name
+				);
 			});
-			model.update(cx, |m, cx| m.toggle_paste_selected(a, cx));
+			// Clicks land on the rendered controls of the second row.
+			click(cx, "paste-row:1:unrelated.txt");
+			click(cx, "paste-overwrite:1:unrelated.txt");
 			model.read_with(cx, |m, _| {
 				let plan = m.paste_preview.as_ref().unwrap();
-				assert!(!plan.items[a].selected);
-				assert!(plan.items[b].selected);
+				assert_eq!(plan.selected_item_idx, 1);
+				assert!(!plan.items[0].overwrite_allowed);
+				assert!(plan.items[1].overwrite_allowed);
 			});
-			model.update(cx, |m, cx| m.toggle_paste_selected(a, cx));
-			model.update(cx, |m, cx| m.toggle_paste_overwrite(a, cx));
+			click(cx, "paste-include:1:unrelated.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(plan.items[0].selected);
+				assert!(!plan.items[1].selected);
+			});
+			click(cx, "paste-include:1:unrelated.txt");
+			click(cx, "paste-row:0:unrelated.txt");
+			click(cx, "paste-overwrite:0:unrelated.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert_eq!(plan.selected_item_idx, 0);
+				assert!(plan.items.iter().all(|i| i.selected));
+				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
+			});
 			cx.simulate_keystrokes("enter");
 			cx.run_until_parked();
 			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
@@ -6964,12 +6962,15 @@ mod tests {
 				assert!(plan.items.iter().all(|i| {
 					i.path == "common.txt" && i.action_label == "OVERWRITE"
 				}));
-				assert_row_ids_unique(plan);
 			});
 			// The second overwrite is what used to be unreachable.
-			for ix in [1, 0] {
-				model.update(cx, |m, cx| m.toggle_paste_overwrite(ix, cx));
-			}
+			click(cx, "paste-overwrite:1:common.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste_preview.as_ref().unwrap();
+				assert!(!plan.items[0].overwrite_allowed);
+				assert!(plan.items[1].overwrite_allowed);
+			});
+			click(cx, "paste-overwrite:0:common.txt");
 			model.read_with(cx, |m, _| {
 				let plan = m.paste_preview.as_ref().unwrap();
 				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
