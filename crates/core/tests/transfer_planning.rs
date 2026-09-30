@@ -2906,7 +2906,8 @@ fn commit_replay_apply_replays_the_previewed_payload() {
 	)
 	.trim()
 	.to_string();
-	assert_eq!(meta, expected_meta);
+	// 不同 git 版本把 UTC 印成 Z 或 +00:00，先正規化
+	assert_eq!(meta.replace("+00:00", "Z"), expected_meta);
 
 	// 事先 stage 的無關檔案仍在 `diff --cached --name-only` 裡
 	let staged = repo.git(&["diff", "--cached", "--name-only"]);
