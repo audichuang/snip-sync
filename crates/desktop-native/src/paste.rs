@@ -405,13 +405,6 @@ pub struct PasteApplyWorker {
 	plan: Option<PastePreviewPlan>,
 	pool: Arc<Mutex<PastePending>>,
 }
-impl std::fmt::Debug for PasteApplyWorker {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("PasteApplyWorker")
-			.field("plan", &self.plan)
-			.finish()
-	}
-}
 impl PasteApplyWorker {
 	pub fn new(
 		plan: &PastePreviewPlan,
@@ -1568,7 +1561,10 @@ impl PastePreviewPlan {
 				RowAction::Delete => c.deletes += 1,
 				RowAction::OverwritePending
 				| RowAction::Excluded { by_commit: true } => {}
-				_ => c.skips += 1,
+				RowAction::Skip(_)
+				| RowAction::DeleteMissing
+				| RowAction::KeepExisting
+				| RowAction::Excluded { by_commit: false } => c.skips += 1,
 			}
 		}
 		c
@@ -1644,7 +1640,7 @@ impl PastePreviewPlan {
 			}
 			if item.is_delete() {
 				// selected delete proceeds
-			} else if item.dest_exists && !item.overwrite_allowed {
+			} else if matches!(item.action(), RowAction::KeepExisting) {
 				unchecked_creates.insert(item.op_index);
 				skipped_existing += 1;
 			}
@@ -2478,37 +2474,38 @@ mod tests {
 		);
 	}
 
-	pub(crate) fn git_init(path: &Path) {
-		let git = |args: &[&str]| {
-			let mut child = std::process::Command::new("git")
-				.current_dir(path)
-				.args(args)
-				.stdout(std::process::Stdio::piped())
-				.stderr(std::process::Stdio::piped())
-				.spawn()
-				.expect("spawn git");
-			let start = std::time::Instant::now();
-			let timeout = std::time::Duration::from_secs(10);
-			let status = loop {
-				if let Some(status) = child.try_wait().expect("try_wait") {
-					break status;
-				}
-				if start.elapsed() > timeout {
-					let _ = child.kill();
-					panic!("git {args:?} timed out after {timeout:?}");
-				}
-				std::thread::sleep(std::time::Duration::from_millis(10));
-			};
-			let out = child.wait_with_output().expect("wait_with_output");
-			assert!(
-				status.success(),
-				"git {args:?}: {}",
-				String::from_utf8_lossy(&out.stderr)
-			);
+	pub(crate) fn git_run(path: &Path, args: &[&str]) {
+		let mut child = std::process::Command::new("git")
+			.current_dir(path)
+			.args(args)
+			.stdout(std::process::Stdio::piped())
+			.stderr(std::process::Stdio::piped())
+			.spawn()
+			.expect("spawn git");
+		let start = std::time::Instant::now();
+		let timeout = std::time::Duration::from_secs(10);
+		let status = loop {
+			if let Some(status) = child.try_wait().expect("try_wait") {
+				break status;
+			}
+			if start.elapsed() > timeout {
+				let _ = child.kill();
+				panic!("git {args:?} timed out after {timeout:?}");
+			}
+			std::thread::sleep(std::time::Duration::from_millis(10));
 		};
-		git(&["init", "-q", "-b", "main"]);
-		git(&["config", "user.name", "Probe"]);
-		git(&["config", "user.email", "probe@example.invalid"]);
+		let out = child.wait_with_output().expect("wait_with_output");
+		assert!(
+			status.success(),
+			"git {args:?}: {}",
+			String::from_utf8_lossy(&out.stderr)
+		);
+	}
+
+	pub(crate) fn git_init(path: &Path) {
+		git_run(path, &["init", "-q", "-b", "main"]);
+		git_run(path, &["config", "user.name", "Probe"]);
+		git_run(path, &["config", "user.email", "probe@example.invalid"]);
 	}
 
 	fn commit_payload_modifying_a() -> String {
@@ -2585,13 +2582,7 @@ mod tests {
 		fs::write(path.join("a.txt"), "base\n").unwrap();
 		fs::write(path.join("old.txt"), "old\n").unwrap();
 		for args in [&["add", "."][..], &["commit", "-qm", "base"][..]] {
-			let ok = std::process::Command::new("git")
-				.current_dir(&path)
-				.args(args)
-				.status()
-				.unwrap()
-				.success();
-			assert!(ok, "git {args:?}");
+			git_run(&path, args);
 		}
 		let plan = PastePreviewPlan::build_from_clipboard_text(
 			&commit_payload_mixed(),
@@ -2779,12 +2770,7 @@ mod tests {
 		fs::write(repo.join("a.txt"), "base\n").unwrap();
 		fs::write(repo.join("newdir"), "i am a file\n").unwrap();
 		for args in [&["add", "."][..], &["commit", "-qm", "base"][..]] {
-			let out = std::process::Command::new("git")
-				.current_dir(&repo)
-				.args(args)
-				.output()
-				.unwrap();
-			assert!(out.status.success());
+			git_run(&repo, args);
 		}
 		let file = |path: &str| CommitFile {
 			path: path.into(),
@@ -2876,16 +2862,8 @@ mod tests {
 		let path = dir.path().to_path_buf();
 		git_init(&path);
 		fs::write(path.join("a.txt"), "base\n").unwrap();
-		let git = |args: &[&str]| {
-			let out = std::process::Command::new("git")
-				.current_dir(&path)
-				.args(args)
-				.output()
-				.unwrap();
-			assert!(out.status.success());
-		};
-		git(&["add", "."]);
-		git(&["commit", "-qm", "base"]);
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
 		let text = commit_payload_modifying_a();
 
 		let mut unchecked =
@@ -2971,15 +2949,8 @@ mod tests {
 		let path = dir.path().to_path_buf();
 		git_init(&path);
 		fs::write(path.join("a.txt"), "base\n").unwrap();
-		let git = |args: &[&str]| {
-			std::process::Command::new("git")
-				.current_dir(&path)
-				.args(args)
-				.status()
-				.unwrap()
-				.success()
-		};
-		assert!(git(&["add", "."]) && git(&["commit", "-qm", "base"]));
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
 
 		let mut plan = PastePreviewPlan::build_from_clipboard_text(
 			&commit_payload_modifying_a(),

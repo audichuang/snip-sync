@@ -741,6 +741,8 @@ mod tests {
 				st.ui_raw.as_ref(),
 			)
 		};
+		// 以捏造（從未 admit）的狀態觸發防禦性 rollback 分支；
+		// `base_used + 500` 的餘裕確保 release() 維持在其不變量之內。
 		let o_bloated = Preview::new(
 			PreviewSource::CommitFile {
 				sha: String::with_capacity(
@@ -846,7 +848,7 @@ mod tests {
 	#[test]
 	fn begin_apply_refuses_until_the_plan_is_executable() {
 		let mut s = PastePreview::new(None);
-		assert_eq!(s.begin_apply().unwrap_err(), ApplyRefused::NoPlan);
+		assert_eq!(s.begin_apply().err(), Some(ApplyRefused::NoPlan));
 
 		let dir = tempfile::tempdir().unwrap();
 		s.enqueue(PasteRequest::Clipboard {
@@ -856,7 +858,7 @@ mod tests {
 			generation: 1,
 		})
 		.unwrap();
-		assert_eq!(s.begin_apply().unwrap_err(), ApplyRefused::Loading);
+		assert_eq!(s.begin_apply().err(), Some(ApplyRefused::Loading));
 
 		let ws = tempfile::tempdir().unwrap();
 		fs::create_dir(ws.path().join("repo-a")).unwrap();
@@ -864,14 +866,14 @@ mod tests {
 		let text = "// FILE: repo-a/x.txt\na\n// FILE: repo-b/y.txt\nb\n";
 		let mut s_multi = landed(text, ws.path(), None);
 		assert_eq!(
-			s_multi.begin_apply().unwrap_err(),
-			ApplyRefused::MappingRequired
+			s_multi.begin_apply().err(),
+			Some(ApplyRefused::MappingRequired)
 		);
 
 		let mut s_ok = landed("// FILE: a.txt\nbody\n", dir.path(), None);
 		let worker = s_ok.begin_apply();
 		assert!(worker.is_ok());
-		assert_eq!(s_ok.begin_apply().unwrap_err(), ApplyRefused::Busy);
+		assert_eq!(s_ok.begin_apply().err(), Some(ApplyRefused::Busy));
 		drop(worker);
 
 		s_ok.apply_failed(Msg::new("stale_created", ["x".into()]), None);
@@ -908,6 +910,7 @@ mod tests {
 		vis = false;
 		assert!(!s.restore_log(&mut vis));
 		assert!(!vis, "must not restore twice");
+		assert!(s.log_before.is_none());
 
 		// A log that was already hidden stays hidden.
 		let mut s = PastePreview::new(None);

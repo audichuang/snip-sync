@@ -2057,7 +2057,7 @@ mod tests {
 		);
 
 		fn all_skip_causes() -> Vec<SkipCause> {
-			let causes = vec![
+			let seed = [
 				SkipCause::Binary,
 				SkipCause::NonUtf8,
 				SkipCause::NonUtf8Path,
@@ -2067,50 +2067,64 @@ mod tests {
 				SkipCause::NonUtf8Target,
 				SkipCause::Other,
 			];
-			for &cause in &causes {
+			let mut out = Vec::new();
+			for cause in seed {
 				match cause {
-					SkipCause::Binary => {}
-					SkipCause::NonUtf8 => {}
-					SkipCause::NonUtf8Path => {}
-					SkipCause::UnsupportedType => {}
-					SkipCause::Unreadable => {}
-					SkipCause::UnsafePath => {}
-					SkipCause::NonUtf8Target => {}
-					SkipCause::Other => {}
+					SkipCause::Binary => out.push(SkipCause::Binary),
+					SkipCause::NonUtf8 => out.push(SkipCause::NonUtf8),
+					SkipCause::NonUtf8Path => out.push(SkipCause::NonUtf8Path),
+					SkipCause::UnsupportedType => {
+						out.push(SkipCause::UnsupportedType)
+					}
+					SkipCause::Unreadable => out.push(SkipCause::Unreadable),
+					SkipCause::UnsafePath => out.push(SkipCause::UnsafePath),
+					SkipCause::NonUtf8Target => {
+						out.push(SkipCause::NonUtf8Target)
+					}
+					SkipCause::Other => out.push(SkipCause::Other),
 				}
 			}
-			causes
+			out
 		}
 
 		fn all_actions() -> Vec<RowAction> {
-			let mut actions = Vec::new();
-			actions.push(RowAction::Excluded { by_commit: true });
-			actions.push(RowAction::Excluded { by_commit: false });
-			for cause in all_skip_causes() {
-				actions.push(RowAction::Skip(cause));
-			}
-			actions.push(RowAction::Delete);
-			actions.push(RowAction::DeleteMissing);
-			actions.push(RowAction::Create);
-			actions.push(RowAction::Overwrite);
-			actions.push(RowAction::OverwritePending);
-			actions.push(RowAction::KeepExisting);
-
-			for &action in &actions {
+			let seed = [
+				RowAction::Excluded { by_commit: false },
+				RowAction::Skip(SkipCause::Other),
+				RowAction::Delete,
+				RowAction::DeleteMissing,
+				RowAction::Create,
+				RowAction::Overwrite,
+				RowAction::OverwritePending,
+				RowAction::KeepExisting,
+			];
+			let mut out = Vec::new();
+			for action in seed {
 				match action {
-					RowAction::Excluded {
-						by_commit: true | false,
-					} => {}
-					RowAction::Skip(_) => {}
-					RowAction::Delete => {}
-					RowAction::DeleteMissing => {}
-					RowAction::Create => {}
-					RowAction::Overwrite => {}
-					RowAction::OverwritePending => {}
-					RowAction::KeepExisting => {}
+					RowAction::Excluded { .. } => {
+						out.push(RowAction::Excluded { by_commit: true });
+						out.push(RowAction::Excluded { by_commit: false });
+					}
+					RowAction::Skip(_) => {
+						for cause in all_skip_causes() {
+							out.push(RowAction::Skip(cause));
+						}
+					}
+					RowAction::Delete => out.push(RowAction::Delete),
+					RowAction::DeleteMissing => {
+						out.push(RowAction::DeleteMissing)
+					}
+					RowAction::Create => out.push(RowAction::Create),
+					RowAction::Overwrite => out.push(RowAction::Overwrite),
+					RowAction::OverwritePending => {
+						out.push(RowAction::OverwritePending)
+					}
+					RowAction::KeepExisting => {
+						out.push(RowAction::KeepExisting)
+					}
 				}
 			}
-			actions
+			out
 		}
 
 		for action in all_actions() {
