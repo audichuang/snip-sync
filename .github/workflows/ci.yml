@@ -239,7 +239,13 @@ jobs:
             - name: Build the image
               run: docker build -t snip-preflight scripts/linux-container
             - name: Harness tests in the image
-              run: docker run --rm --init --shm-size=2g -v "$PWD:$PWD:ro" -w "$PWD" snip-preflight just preflight-harness
+              # target/ is a volume, as on the Mac: a harness test lists the e2e tests through
+              # cargo. Its mount point is made first, since the checkout is mounted read-only.
+              run: |
+                  mkdir -p target
+                  docker run --rm --init --shm-size=2g \
+                      -v "$PWD:$PWD:ro" -v snip-target:"$PWD/target" -w "$PWD" \
+                      snip-preflight just preflight-harness
             - name: Checkout left clean
               shell: bash
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
