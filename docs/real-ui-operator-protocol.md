@@ -39,7 +39,7 @@
 
 T25 和其他格一樣，只判 `pass`、`fail`、`not-run`。它不再有例外。
 
-T31 與 C-blocked 在 `ed3d057` 上預期是 `ui-defect`（原因見各格）。這是已知還沒修的缺陷，不是回歸；它仍然讓閘門打開。
+T31、C-blocked、K-reinclude 在 `ed3d057` 上預期是 `ui-defect`（原因見各格）。T22 與 C-reason 的「刪除目的端不存在的檔案」列，紅色區塊「將刪除目的地檔案，不寫入內容」與詳情列互相矛盾，也預期是 `ui-defect`（見 C-reason）。這些是已知還沒修的缺陷，不是回歸；它們仍然讓閘門打開。
 
 下面兩格要填，但不決定閘門關不關：
 
@@ -87,7 +87,7 @@ python3 scripts/collaboration_fixture.py verify --fixture "$RUN/gate-a"
 
 `verify` 的結束碼必須是 0。每個 A 步驟開始前再拍一張初始快照；不要把上一步改過的 repo 接著用。需要乾淨狀態時，重新 `generate` 到一個新目錄。
 
-4. 讀受測 SHA 的 `crates/desktop-native/src/paste.rs` 的 `control_id`，把格式 `paste-<row|include|overwrite>:<ix>:<path>` 抄進 `environment.json`。`ix` 是計畫內的項目索引，從 `CTRL_BOUNDS` 讀，不要自己算。若受測 SHA 的格式仍是只有路徑（`paste-row:<path>`），代表缺 #56，第 1 節的檢查已經擋下。
+4. 讀受測 SHA 的 `crates/desktop-native/src/paste.rs` 的 `control_id`，把格式 `paste-<row|include|overwrite>:<ix>:<path>` 抄進 `environment.json`。`ix` 是計畫內的項目索引，從 `CTRL_BOUNDS` 讀，不要自己算。若受測 SHA 的格式仍是只有路徑（`paste-row:<path>`），代表缺 #56。第 1 節只擋缺 `f5247ab`，缺 #56 時不擋：T03、T18 不適用，證據欄寫「缺 #56」，閘門打開；其餘格子的 ID 改照該 SHA 印出的格式。
 5. 啟動 App。探針只有在 `SNIP_NATIVE_E2E=1` 時才會印。`SNIP_NATIVE_E2E_EXPORT_HOLD_FILE` 在 `WorkbenchModel::new` 讀一次，所以必須寫在啟動命令裡。不要加 `--restore-dir`，貼上目的地由畫面決定。每一次啟動的 stdout 與 stderr 寫進該次自己的日誌，否則讀不到 `CTRL_BOUNDS`。
 
 同一時間只開一個 App。閘門 A 與閘門 B 各啟動一次，各寫一份日誌。先做哪一個都可以。換下一個之前，對目前這個按 Cmd+Q，等到 exit code 0，再啟動。第二次若用 `>` 寫進第一次的檔，會把 `CTRL_BOUNDS` 與 `PASTE_DONE` 截掉。
@@ -138,8 +138,8 @@ Shell 可以建立 fixture、用 argv 叫 Git、把 Git 輸出寫進檔再算雜
 
 ID 整段相等。`paste-overwrite:0:common.txt` 不能拿去點 `paste-overwrite:2:common.txt`，也不能拿去點 `paste-overwrite:0:common.txt.bak`。不要照 native-e2e driver 的寬鬆查法（`lookup_bounds` 仍接受只給路徑的 `paste-overwrite:<path>`）；人工操作一律用完整 ID。
 
-2. 沒有這一行，或 `w < 1`，或 `h < 1`：判定 `fail`，證據欄寫 `missing-control`，停止。改點旁邊看起來像的列，不算測過。
-3. 同一 ID 出現兩列是回歸。此時日誌通常只留第一列的矩形（`ProbeFrame::report` 用 ID 當 key），所以不要用「日誌只剩一個矩形」辨識；改用 T03／T18 的規則：相異 ID 數要等於同路徑列數，並比對 `PASTE_TOGGLED` 的 idx。不成立時判定 `fail`，證據欄寫 `identity-fail` 與兩欄數字，不能按 Apply。
+2. 沒有這一行，或 `w < 1`，或 `h < 1`，或這一行之後又出現同一 ID 的 `[APP:CTRL_GONE: id=<ID>]`（控制項已收合或關閉，矩形是舊的）：判定 `fail`，證據欄寫 `missing-control`，停止。點擊前要確認沒有比最新 `CTRL_BOUNDS` 更晚的 `CTRL_GONE`。改點旁邊看起來像的列，不算測過。
+3. 同一 ID 出現兩列是回歸。此時兩列輪流以同一個 ID 回報矩形，日誌可能在兩個矩形之間來回跳，也可能只剩一個，所以不要用日誌矩形的數量辨識；改用 T03／T18 的規則：相異 ID 數要等於同路徑列數，並比對 `PASTE_TOGGLED` 的 idx。不成立時判定 `fail`，證據欄寫 `identity-fail` 與兩欄數字，不能按 Apply。
 4. 把 bounds 換算成螢幕上的點，再點那個點。`x`、`y`、`w`、`h` 是實體像素，原點在視窗內容區的左上角，不是螢幕，也不是含標題列的視窗框。`physical()` 乘了 `scale_factor`。直接點 `(x + w/2, y + h/2)` 在 Retina 上會偏到大約兩倍遠。換算順序：
 
    - 讀最新的 `[APP:VIEWPORT: Wp x Hp]`。
@@ -165,7 +165,7 @@ ID 以受測 binary 印出的為準。下面是 `ed3d057`（develop）的名字�
 | 左軌 | `rail-project`、`rail-changes`、`rail-log` |
 | 工作區 | `btn-workspace-menu`、`btn-open-workspace`、`btn-workspace-open-confirm`、`btn-close-workspace`、`btn-open-folder` |
 | 工具列 | `btn-repo-selector`、`btn-ref-selector`、`btn-copy`、`btn-paste`、`btn-refresh`、`btn-basket-clear` |
-| 選單列 | `pick-repo:<名稱>`；同名 repo 才用 `pick-repo:<序號>:<名稱>`（閘門 A 的 `billing`）。`pick-ref:<名稱>` |
+| 選單列 | `pick-repo:<名稱>`；只有同名的 repo 才用 `pick-repo:<序號>:<名稱>`（新產生的閘門 A 在 machine-a 只有 `billing` 與 `docs` 兩個同名，其他都是 `pick-repo:<名稱>`）。`pick-ref:<名稱>` |
 | 變更列 | `change-row@<repo>:<staged\|unstaged\|untracked\|conflicted>:<path>`，勾選是 `change-chk@...`。目前選取中的 repo 才同時有舊 ID `change-row:<source>:<path>` |
 | 變更群組 | `change-repo:<群組>:<repo>`、`change-repo-toggle:<群組>:<repo>` |
 | Git log | `commit-row:<repo>:<7 字元 SHA>`；目前選取 repo 的列另外有 `commit-row:<7 字元 SHA>`。`btn-copy-commits`、`btn-log-regex`、`btn-head`、`log-search-input` |
@@ -181,6 +181,8 @@ ID 以受測 binary 印出的為準。下面是 `ed3d057`（develop）的名字�
 Apply 被拒時，日誌一律是 `[APP:PASTE_STALE_DETECTED: <i18n key>]`，連不是 stale 的拒絕也用這個 tag。看 key 判斷是哪一種拒絕：`stale_modified`、`commit_subset_rejected`、`commit_overwrite_required`、`commit_replay_partial` 等。
 
 其他會用到的日誌 tag：`PASTE_SEL_TOGGLED: idx= state=`（勾選是否納入）、`PASTE_TOGGLED: idx= state=`（允許覆寫）、`PASTE_COMMIT_TOGGLED: idx=<c>`、`PASTE_NAV: idx=`、`PASTE_PLAN_CLEARED`、`COPY_COMMITS_DONE: commits=N`、`TOAST: ok=`、`LOG_VIEW: hash`、`WORKSPACE: state=`、`APPLY_IGNORED:`。
+
+`[APP:CTRL_GONE: id=<ID>]`：控制項這一幀沒有畫出來（收合、關閉、換頁）。`CTRL_BOUNDS` 只在控制項是新的或位置變了才印，所以「沒有新的 `CTRL_BOUNDS`」不能證明控制項消失，要看 `CTRL_GONE`。控制項再出現時會重新印 `CTRL_BOUNDS`。
 
 右鍵點列時，用該列的 bounds。選單出現後會有 `context-menu`，項目是 `menu-item:copy-files` 等，照第 3 節的點法點項目，通過線是新的一行 `[APP:MENU_ACTION: copy-files]`。
 
@@ -240,7 +242,7 @@ python3 scripts/collaboration_fixture.py compare-step \
 
 正向步驟的共同點法：
 
-1. `btn-repo-selector` → `pick-repo:<序號>:<basename>`（閘門 A 的 repo 有同名，所以帶序號；沒有同名時是 `pick-repo:<名稱>`）。等 `[APP:REPO_SELECTING]` 的 canonical root 與 manifest 的 `relativePath` 一致。basename 相同的 repo 不能只看名字。
+1. `btn-repo-selector` → `pick-repo:<名稱>`；只有同名的 `billing` 與 `docs` 用 `pick-repo:<序號>:<名稱>`，其他 repo 沒有序號。等 `[APP:REPO_SELECTING]` 的 canonical root 與 manifest 的 `relativePath` 一致。basename 相同的 repo 不能只看名字。
 2. 檔案步驟走 `rail-changes`，展開 `change-repo-toggle:<群組>:<repo>`，再點 `change-chk@<repo>:<source>:<path>`。
 3. `btn-copy`。等 `[APP:COPY_DONE]`。剪貼簿讀回 SHA-256 等於複製當下。
 4. 換到目的工作區，`btn-paste`。`[APP:PASTE_MAP_CANDIDATE]` 在 `[APP:PASTE_PREVIEW]` 之前出現，從按貼上之前的日誌位置開始讀。
@@ -286,7 +288,7 @@ Fixture 由 `docs/real-ui-operator-fixture.sh` 建立。目錄意義：
 | `fixtures/ws-src` | 15 個來源 repo。repo01 與 repo03 的 staged `unrelated.txt` 內容不同 |
 | `fixtures/ws-dst` | 15 個目的 repo。repo01／repo03／repo06／repo07 已有不同內容；repo04 的 `newdir` 是一般檔 |
 | `fixtures/nongit-dst` | 空的非 Git 資料夾 |
-| `fixtures/file-dst` | 一個一般檔（不是資料夾），只給 K05-key 當貼上目的地 |
+| `fixtures/file-dst` | 選用。一個一般檔（不是資料夾）；當工作區開會被 `workspace_bad_path` 擋下，到不了貼上。K05-key 的貼上目的地用 `nongit-dst` |
 | `fixtures/files-src` | 檔案模式來源：staged 新增／修改／刪除／rename，以及 worktree 上另一份 `both.txt` |
 | `fixtures/files-dst` | 檔案模式目的。已追蹤 `overwrite.txt`（`do-not-touch`）、`both.txt`（`dest-both`）、`gone.txt`（`gone-dest`）、`old-name.txt`（`old-dest`）、`binary.dat`（`keep-bin`）、`folder/utf16.txt`（`keep-utf16`） |
 | `fixtures/commits-src` | first-parent 為 base、C1「多行中文」、C2、C3 merge、C4、empty replay。`side` 上另有 `SIDE` |
@@ -330,14 +332,14 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T12 | 預覽裡取消一個新檔（`paste-include:<ix>:<path>`），不勾 `overwrite.txt` 的覆寫 | 取消的檔不出現（`[APP:PASTE_SEL_TOGGLED: idx=<ix> state=false]`）；`overwrite.txt` 仍是 `do-not-touch` |
 | T13 | 預覽出現後在外面改目的檔，再 Apply | `[APP:PASTE_STALE_DETECTED: stale_modified]`（`stale_created`、`stale_deleted` 看外部改法）；畫面文字是「目的地檔案已在外部修改: …」；外面寫入的內容保留；沒有部分寫入 |
 | T14 | 預覽後 Escape | `[APP:PASTE_CANCELLED]`；HEAD 不變 |
-| T15 | 用 `pbcopy` 放入普通文字 `QA invalid clipboard payload`，再按貼上。不要在這個 App 裡按 Cmd+C | 新的一行 `[APP:PASTE_ERR: paste_err_not_payload]`（`[APP:PASTE_ERR: clipboard]` 只在剪貼簿本身讀不出來時才有，這裡不會有），狀態列顯示「剪貼簿內容不是有效的 snip-sync payload」；之前若有預覽開著，先出現 `[APP:PASTE_PLAN_CLEARED]`；不出現 `btn-apply`；目的端零寫入 |
+| T15 | 用 `pbcopy` 放入普通文字 `QA invalid clipboard payload`，再按貼上。不要在這個 App 裡按 Cmd+C | 新的一行 `[APP:PASTE_ERR: paste_err_not_payload]`（`[APP:PASTE_ERR: clipboard]` 只在剪貼簿本身讀不出來時才有，這裡不會有），狀態列顯示「剪貼簿內容不是有效的 snip-sync payload」；之前若有預覽開著，先出現 `[APP:PASTE_PLAN_CLEARED]`；不出現 `btn-apply`（日誌有 `[APP:CTRL_GONE: id=btn-apply]`，或從未有過它的 `CTRL_BOUNDS`）；目的端零寫入 |
 | T16 | 目的地改為 `fixtures/nongit-dst`，保留 repo 前綴 | 目錄裡沒有 `.git`；同時有保留前綴的路徑與去掉前綴的路徑，內容與來源一致 |
 | T17 | 在 `commits-src` 把 `SIDE` 和 main 上不能組成 first-parent 鏈的 commit 一起 Shift 選取，再複製 | `[APP:COPY_COMMITS_ERR: commits are not contiguous:]`；sentinel 不變 |
 | T18 | 選 C1、C2、C3，貼到 `commits-dst-overwrite` 的 `qa-replay` | `PASTE_PREVIEW` 的 `items=8`。兩列 `common.txt` 的 ID 是 C1 `paste-overwrite:0:common.txt`、C2 `paste-overwrite:2:common.txt`。勾兩個覆寫之前摘要覆寫 0/2；C1 標頭是「1 個檔案，0 個不寫入」，C2 標頭是「6 個檔案，3 個不寫入」。各點一次得到 `PASTE_TOGGLED idx=0 state=true`、`idx=2 state=true`，Apply 得到 `PASTE_DONE created=3 … commits=3`，`git rev-list <before>..HEAD` 是 3。身份規則見本節末 |
 | T19 | 同一段貼到 `commits-dst-clean` | `PASTE_DONE created=3 … commits=3`；3 個新 commit；C1 的 `common.txt` 在 Git 裡是新增 |
 | T20 | 核對 T19 那 3 個 commit | `git log -1 -z --format=%an%x00%ae%x00%aI%x00%B` 與來源逐欄相等。C1 含多行中文與空行。作者時間是 fixture 寫入的 `+08:00` |
 | T21 | 核對 T19 的 merge 那一筆 | 目的 commit 只有一個 parent；只多出 `side.txt`，內容 `from-side` |
-| T22 | 看 T19 貼上前的 C2 預覽（`commits-dst-clean` 沒有 `old.txt` 與 `gone.txt`），再核對 T19 的結果 | 預覽：C2 的 `old.txt` 列帶 `→ new.txt`，動作是「跳過」，詳情是「目的地不存在，無需刪除」；`new.txt` 列帶 `← old.txt`，動作是「建立」；`gone.txt` 列也是「跳過」加同一句詳情。結果：`new.txt` 為 `old`、`emoji.txt` 為 `你好 ✨`、`old.txt` 與 `gone.txt` 不存在。刪掉目的端真有的舊路徑，由 T25 點過 |
+| T22 | 看 T19 貼上前的 C2 預覽（`commits-dst-clean` 沒有 `old.txt` 與 `gone.txt`），再核對 T19 的結果 | 預覽：C2 的 `old.txt` 列帶 `→ new.txt`，動作是「跳過」，詳情列（24px 那條）是「目的地不存在，無需刪除」，oracle 以詳情列為準；選取該列時下方另有紅色區塊「將刪除目的地檔案，不寫入內容」（`ui/paste.rs` 對所有 delete 列都畫，不看目的端是否存在），兩句互相矛盾，預期判 `ui-defect`，兩句都轉錄；`new.txt` 列帶 `← old.txt`，動作是「建立」；`gone.txt` 列也是「跳過」加同一句詳情，同樣有紅色區塊。結果：`new.txt` 為 `old`、`emoji.txt` 為 `你好 ✨`、`old.txt` 與 `gone.txt` 不存在。刪掉目的端真有的舊路徑，由 T25 點過 |
 | T23 | 看 `commits-dst-overwrite` 在一次成功重播之後 | `staged-keep.txt` 仍在 index；`local-only.txt` 仍是 untracked。T18 是 `pass` 之後才做。T18 是 `fail` 時，本格判定 `not-run`，證據欄寫「T18 未套用」 |
 | T24 | 把 C4 貼到 `commits-dst-hooks` | 重播成功（`PASTE_DONE created=1 … commits=1`）；`fixtures/hook-marker.txt` 不存在 |
 | T25 | 只複製 C2，貼到新鮮的 `commits-dst-present`（含 `old.txt`） | 預覽：`paste-row:0:binary.dat` 動作「跳過」，詳情「未複製：二進位檔，不寫入也不刪除」；`old.txt` 列動作「刪除」加 `→ new.txt`；`new.txt` 列「建立」加 `← old.txt`；`gone.txt` 列「刪除」；C2 標頭「6 個檔案，1 個不寫入」；摘要建立 3、刪除 2、跳過 1。複製 C2 的通知含「1 個檔案未複製：#1 binary.dat」（`已複製 1 個 commit（5 個檔案、N 字元）至剪貼簿…`；CLI 實測 5 個檔案、636 字元，rename 算一個檔；桌面端的字元數以 pbpaste 的 UTF-16 code unit 數為準）。Apply：`PASTE_DONE created=1 … commits=1`。Git：`binary.dat` 仍是 `a`、NUL、`b`、換行；根目錄 `gone.txt` 已刪；`old.txt` 已刪；`new.txt` 為 `old`；`dir/gone.txt` 仍是 `folder-gone`。任何一項不成立是 `fail` |
@@ -351,7 +353,7 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T33 | `perf15` 上 `log-filter-repo` 選一個 repo，`btn-log-regex` 輸入能命中的字 | 列只剩該 repo、且 subject 符合的 commit。多 repo 視圖的列 ID 是 `commit-row:<repo>:<7 字元 SHA>` |
 | T34 | 在 log 裡實際滾動 | 載入筆數增加（50 的倍數往上）。把前後的 `[APP:GRAPH_LOADED: commits=N]` 寫進 `action.json`。每頁 50 筆符合程式；規格 4.1 寫 300，記在第 9 節 |
 | T35 | 搜尋尚未載入的較早 commit | 找到該 SHA，預覽指出它 |
-| T36 | `perf15`、全部 repo。1080×752、1080×720、900×600 三種尺寸，各分 hash 欄關（預設）與開（`btn-log-more` → `log-more:hash`，日誌 `[APP:LOG_VIEW: hash]`）兩種，各看前 50 列。先從任一 `commit-row:` 的 `w÷scale` 抄下列表寬，1080 應約 574、900 應約 433；偏差超過 10px 時寫下實際值並說明側欄狀態 | 每列的 subject 至少有 1 個可辨識字元；被截斷時結尾是省略號，hover 可看到完整 subject。只有右側詳情有 message、列上是空白，就是 `fail`。各狀態的預期：1080、hash 關：ref 標籤至少 80px、subject 至少 160px，兩者同時可見；1080、hash 開：標籤依設計捨棄，subject 160px；900、hash 關：標籤依設計捨棄，subject 至少 160px；900、hash 開：subject 約 97px，是 #59 已記錄的下限，只要有可辨識前綴就算 `pass`，空白是 `fail`。文字 oracle 見第 4 節 |
+| T36 | `perf15`、全部 repo。1080×752、1080×720、900×600 三種尺寸，各分 hash 欄關（預設）與開（`btn-log-more` → `log-more:hash`，日誌 `[APP:LOG_VIEW: hash]`）兩種，各看前 50 列。先從任一 `commit-row:` 的 `w÷scale` 抄下列表寬，1080 應約 574、900 應約 433；偏差超過 10px 時寫下實際值並說明側欄狀態 | 每列的 subject 至少有 1 個可辨識字元；被截斷時結尾是省略號，hover 可看到完整 subject。只有右側詳情有 message、列上是空白，就是 `fail`。各狀態的預期：1080、hash 關：ref 標籤未被捨棄（寬度 ≥ min(自然寬度, 80)，短的 ref 如 `main` 會比 80px 窄）、subject 至少 160px，兩者同時可見；1080、hash 開：標籤依設計捨棄，subject 160px；900、hash 關：標籤依設計捨棄，subject 至少 160px；900、hash 開：subject 約 97px，是 #59 已記錄的下限，只要有可辨識前綴就算 `pass`，空白是 `fail`。文字 oracle 見第 4 節 |
 | T37 | `btn-repo-selector` 實際切換 100 次，涵蓋 15 個 repo（`pick-repo:<名稱>`，名稱從 `CTRL_BOUNDS` 讀） | 100 次都有新的選取日誌；最後停在指定的 repo；程序還在。耗時含觀察，不當回應時間 |
 | T38 | 沿用 [memory-measurement-protocol.md](memory-measurement-protocol.md) 的取樣時才記 RSS | 本規程不判記憶體。這格固定 `not-run`，原因寫「改走記憶體規程」 |
 | T39 | Cmd+Shift+W 關掉，再 Cmd+Shift+O 打開一個 repo | 關閉後出現 `[APP:WORKSPACE: state=closed generation=N]`；重開後出現 `[APP:WORKSPACE: state=open path=<該 repo> generation=N+1]`，接著 `[APP:READY_REPOS: 1]`；前後剪貼簿 SHA-256 相同 |
@@ -364,7 +366,7 @@ T03 與 T18 的身份規則：`action.json` 要寫兩欄，尾段路徑相同的
 - 預覽：`paste-commit:0` 標頭是「#1 C4 text and binary … 2 個檔案，2 個不寫入」；摘要建立 0、覆寫 0/0、刪除 0、跳過 2。點 `paste-row:1:newdir/content.txt` 得到 `[APP:PASTE_NAV: idx=1]`，詳情列是「路徑不安全，不寫入」。點 `paste-row:0:new-binary.bin`，詳情列是「未複製：二進位檔，不寫入也不刪除」。
 - Apply：按 `btn-apply` 得到新的一行 `[APP:PASTE_STALE_DETECTED: commit_replay_partial]`，沒有 `PASTE_DONE`，預覽仍開著，紅色橫幅點名 `newdir/content.txt`。
 - Git：HEAD、status 雜湊、`newdir` 位元組（`not-a-directory` 加換行）都不變。有任何寫入，或出現 `PASTE_DONE`，判 `fail`。
-- 為什麼是 `ui-defect`：core 的 `replay_commit` 在動任何檔案之前，先用 `layout_conflicts` 發現父目錄被一般檔佔住，整個 commit 拒絕。這符合規格 4.3（「父目錄被一般檔案佔住時，整個 commit 拒絕且不動任何檔案（預覽標為 UNSAFE_PATH）」），拒絕本身不是缺陷。缺陷在畫面：`UnsafePath` 列在桌面端只被算成「跳過」（`executable()` 是 true，`overwritable()` 是 false），沒有像待允許覆寫與已排除那樣（#58 的 `7152e6b`）標成「擋下 Apply」；預覽因此暗示其餘檔案照常貼上，而 Apply 拒絕整個 commit。橫幅也用 `commit_replay_partial` 的「重放中途失敗。已建立且不會丟棄的提交：(none)。錯誤：…」，但其實什麼都還沒開始，而且錯誤原因是 core 的英文 `a file is in the way of its parent directory`，夾在 zh 介面裡。
+- 為什麼是 `ui-defect`：core 的 `replay_commit` 在動任何檔案之前，先用 `layout_conflicts` 發現父目錄被一般檔佔住，整個 commit 拒絕。這符合規格 4.3（「父目錄被一般檔案佔住時，整個 commit 拒絕且不動任何檔案（預覽標為 UNSAFE_PATH）」），拒絕本身不是缺陷。缺陷在畫面：`UnsafePath` 列在桌面端只被算成「跳過」（`executable()` 是 true，`overwritable()` 是 false），沒有像待允許覆寫與已排除那樣（#58 的 `0a45ca1`）標成「擋下 Apply」；預覽因此暗示其餘檔案照常貼上，而 Apply 拒絕整個 commit。橫幅也用 `commit_replay_partial` 的「重放中途失敗。已建立且不會丟棄的提交：(none)。錯誤：…」，但其實什麼都還沒開始，而且錯誤原因是 core 的英文 `a file is in the way of its parent directory`，夾在 zh 介面裡。
 - 判定規則：Git 與日誌都對，但符合下列任一項，就判 `ui-defect`，並把三項各自的真假寫進證據欄：(a) 橫幅含英文 core 原因或 `(none)`；(b) 預覽（標頭、摘要、詳情或 `btn-apply` 狀態）沒有標出整個 commit 會被拒；(c) 橫幅說「重放中途失敗」而 `rev-list --count` 為 0。三項都不成立才是 `pass`。
 - 附註：#57 的 commit 說明寫「同一個 commit 的其他有效檔案照常貼上」，與實際行為不符，以規格為準。CLI 的 `--dry-run` 同樣印「1 commit(s) would be created」，是 core／CLI 層的同一個不一致，本規程只量得到桌面端。
 
@@ -382,16 +384,16 @@ commit 預覽與鍵盤的格子，對應 #58 與 #57。除非該格另有說明�
 
 | ID | 點什麼 | 通過線 |
 |---|---|---|
-| C-group | 開 T19 的預覽（`commits-dst-clean`） | `paste-commit-count` 是「3 個 commit」；`paste-commit:0`、`paste-commit:1`、`paste-commit:2` 依重播順序，文字依序是「#1 多行中文 QA Operator <qa@example.com> 2026-03-02 09:00 1 個檔案，0 個不寫入」、「#2 C2 rename delete emoji … 2026-03-03 09:00 6 個檔案，3 個不寫入」、「#3 C3 merge … 2026-03-05 09:00 1 個檔案，0 個不寫入」。標頭 tooltip 是完整 message 加作者加 ISO 時間。點 `paste-commit:1` 後出現 `[APP:PASTE_COMMIT_TOGGLED: idx=1]`，畫面上 C2 的 6 列消失，`paste-row:1`–`paste-row:6` 不再有新的 `CTRL_BOUNDS`；再點一次列回來。摘要是建立 5、覆寫 0/0、刪除 0、跳過 3。T18 在 `commits-dst-overwrite` 上的 C2 標頭同樣是「6 個檔案，3 個不寫入」 |
+| C-group | 開 T19 的預覽（`commits-dst-clean`） | `paste-commit-count` 是「3 個 commit」；`paste-commit:0`、`paste-commit:1`、`paste-commit:2` 依重播順序，文字依序是「#1 多行中文 QA Operator <qa@example.com> 2026-03-02 09:00 1 個檔案，0 個不寫入」、「#2 C2 rename delete emoji … 2026-03-03 09:00 6 個檔案，3 個不寫入」、「#3 C3 merge … 2026-03-05 09:00 1 個檔案，0 個不寫入」。標頭 tooltip 是完整 message 加作者加 ISO 時間。點 `paste-commit:1` 後出現 `[APP:PASTE_COMMIT_TOGGLED: idx=1]`，畫面上 C2 的 6 列消失，日誌有 6 行 `[APP:CTRL_GONE: id=paste-row:1:binary.dat]` … `[APP:CTRL_GONE: id=paste-row:6:new.txt]`，以及對應的 `paste-include:1:…`–`paste-include:6:…` 的 `CTRL_GONE`（`paste-row` 的完整 ID 抄自 `CTRL_BOUNDS`）；再點一次列回來，這 6 個 ID 各有新的 `CTRL_BOUNDS`。只有「沒有新的 `CTRL_BOUNDS`」不算證據。摘要是建立 5、覆寫 0/0、刪除 0、跳過 3。T18 在 `commits-dst-overwrite` 上的 C2 標頭同樣是「6 個檔案，3 個不寫入」 |
 | C-detail | T18 的預覽，點 `paste-row:0:common.txt` | `[APP:PASTE_NAV: idx=0]`；詳情標題是「common.txt → <目的端絕對路徑>」，內容以「commit: 多行中文」開頭。規格 4.3 寫「每個 commit 可展開看檔案清單與 diff」，規格 3.2 寫覆寫檔可看 diff（目前的目標檔 ↔ 剪貼簿內容）。畫面上有沒有 diff，照實寫進證據欄；沒有 diff 記成規格落差（第 9 節），不判這格 `fail` |
-| C-reason | 在 T26、T31、T25 的預覽裡，逐列點 `paste-row:<ix>:<path>` | 每次出現 `[APP:PASTE_NAV: idx=<ix>]`，詳情列依序是：二進位（T26 的 `new-binary.bin`、T25 的 `binary.dat`）「未複製：二進位檔，不寫入也不刪除」；不安全路徑（T31 的 `newdir/content.txt`）「路徑不安全，不寫入」；目的端不存在的刪除（T22 的 `old.txt`）「目的地不存在，無需刪除」。每一列的詳情都不是「此檔案不會寫入」（`reason_skip_generic`）這句泛用話 |
+| C-reason | 在 T19／T22（`commits-dst-clean`）、T26、T31、T25 的預覽裡，逐列點 `paste-row:<ix>:<path>` | 每次出現 `[APP:PASTE_NAV: idx=<ix>]`，詳情列依序是：二進位（T26 的 `new-binary.bin`、T25 的 `binary.dat`）「未複製：二進位檔，不寫入也不刪除」；不安全路徑（T31 的 `newdir/content.txt`）「路徑不安全，不寫入」；目的端不存在的刪除（只在 T19／T22 的預覽有，`commits-dst-clean` 的 `old.txt`、`gone.txt`；T25 在 `commits-dst-present` 上同一列是「刪除」）「目的地不存在，無需刪除」。每一列的詳情都不是「此檔案不會寫入」（`reason_skip_generic`）這句泛用話。已知缺陷：目的端不存在的刪除列被選取時，紅色區塊仍寫「將刪除目的地檔案，不寫入內容」（`reason_delete`），與詳情列矛盾。oracle 是詳情列；紅色區塊出現就判 `ui-defect`，這一格在 `ed3d057` 預期是 `ui-defect`，不算回歸 |
 | C-nonutf8 | 開 `nonutf8-src`，選 N1、N2 複製，貼到 `nonutf8-dst`（先做這段）。再用 `commits-src` 的 C1，貼到 `nonutf8-dst`，只看預覽，Escape 取消（後做這段） | 前段預覽：N1 標頭「2 個檔案，1 個不寫入」、N2 標頭「1 個檔案，1 個不寫入」；`latin1.txt` 兩列的詳情是「未複製：非 UTF-8 編碼，不寫入也不刪除」，`ok.txt` 是「建立」。複製通知含「2 個檔案未複製」，並列出「#1 latin1.txt」與「#2 latin1.txt」。Apply：`PASTE_DONE created=2 … commits=2`；`latin1.txt` 位元組仍是 `caf` `e9` 換行；`ok.txt` 已建立。後段預覽：`common.txt` 列是「跳過」，詳情「目的地現有檔案不是 UTF-8，不覆寫」；Escape 得到 `[APP:PASTE_CANCELLED]`，`common.txt` 位元組不變、HEAD 不變 |
 | C-blocked | 開 `blocked-src`，複製 `B1 blocked dir and fresh`，貼到 `ws-dst/repo04` | 預覽：標頭「2 個檔案，1 個不寫入」；`fresh.txt`「建立」，`newdir/x.txt`「跳過」，詳情「路徑不安全，不寫入」。Apply：`[APP:PASTE_STALE_DETECTED: commit_replay_partial]`，沒有 `PASTE_DONE`；`fresh.txt` 不存在；HEAD、status 不變。整筆拒絕是規格 4.3 的要求，也證明 #57 commit 說明的「其他檔照常貼上」不成立。判定規則同 T31 的 (a)(b)(c)；預期 develop `ed3d057` 上是 `ui-defect`。T31 與這格都不寫入，`repo04` 可連續做 |
 | K-space | T26 的預覽（C4 到 `commits-dst-clean`），點 `paste-row:0:new-binary.bin`，按 Space | 沒有 `PASTE_TOGGLED`（這一列不可覆寫，不能被切成允許覆寫）。有 `[APP:PASTE_SEL_TOGGLED: idx=0 state=false]`；該列變成「已排除」，詳情是「已排除；commit 重播不能只套用部分檔案，需重新勾選才能套用」；面板出現紅色橫幅。此時 `btn-apply` 得到 `[APP:PASTE_STALE_DETECTED: commit_subset_rejected]`，`rev-list --count` 為 0。預覽仍開著；若被關掉，重貼再做 K-reinclude，並在證據欄記下 |
-| K-reinclude | 接著 K-space，再按一次 Space | `[APP:PASTE_SEL_TOGGLED: idx=0 state=true]`，該列回到「跳過」，紅色橫幅消失。`btn-apply` 得到 `PASTE_DONE created=1 … commits=1`。橫幅仍在而 Apply 成功，判 `ui-defect`（`plan.error` 只設不清）；Apply 不成功判 `fail` |
-| K-fold | T19 的預覽。點 `paste-row:2:common.txt`（`PASTE_NAV idx=2`），再點 `paste-commit:1`。最後把三個標頭全收合，再按 Space | `[APP:PASTE_COMMIT_TOGGLED: idx=1]` 之後出現 `[APP:PASTE_NAV: idx=7]`（`side.txt`），選取移到可見列；按 Space 只出現 `PASTE_SEL_TOGGLED idx=7`，沒有作用在被藏起來的 ix 1–6。三個標頭全收合後按 Space，1 秒內沒有 `PASTE_SEL_TOGGLED` 或 `PASTE_TOGGLED`。展開後列都回來 |
+| K-reinclude | 接著 K-space，再按一次 Space | `[APP:PASTE_SEL_TOGGLED: idx=0 state=true]`，該列回到「跳過」，紅色橫幅消失。`btn-apply` 得到 `PASTE_DONE created=1 … commits=1`。橫幅預期仍在（`toggle_selected` 只設 `plan.error = commit_subset_rejected`，commit 模式沒有任何地方在 Apply 前清掉它），所以這一格在 `ed3d057` 預期是 `ui-defect`：橫幅仍在而 Apply 成功，判 `ui-defect`；橫幅消失而 Apply 成功才是 `pass`；Apply 不成功判 `fail` |
+| K-fold | T19 的預覽。點 `paste-row:2:common.txt`（`PASTE_NAV idx=2`），再點 `paste-commit:1`。最後把三個標頭全收合，再按 Space | `[APP:PASTE_COMMIT_TOGGLED: idx=1]` 之後日誌有 C2 各列（`paste-row:1:…`–`paste-row:6:…`）的 `[APP:CTRL_GONE: id=…]`，再出現 `[APP:PASTE_NAV: idx=7]`（`side.txt`），選取移到可見列；按 Space 只出現 `PASTE_SEL_TOGGLED idx=7`，沒有作用在被藏起來的 ix 1–6。三個標頭全收合後按 Space，1 秒內沒有 `PASTE_SEL_TOGGLED` 或 `PASTE_TOGGLED`。展開後這些 ID 各有新的 `CTRL_BOUNDS`，列都回來 |
 | K-nav | T19 的預覽，點 `paste-row:0:common.txt`，按 Down 7 次 | `PASTE_NAV` 的 idx 依序是 1、2、…、7，也就是重播順序（C1、C2 的 6 列、C3），不是全部路徑排序。每一次選取的列，就是畫面上的下一列 |
-| K05-key | 依第 4 節的拒絕文字檢查，轉錄 T02、T13、T15、T29、T30、T31、C-blocked、K-space 的每一次拒絕文字。再按 Option+L 切到英文，重做 T15、T30、T31，轉錄英文文字，最後切回。另外嘗試以 `fixtures/file-dst` 開工作區：能開並貼上時，狀態列應是「貼上目的地「…」不是資料夾」；開工作區階段就被拒時，轉錄那則訊息。兩種結果都要轉錄，都套用同一條 key 規則 | 所有畫面文字都沒有符合 `[a-z]+(_[a-z0-9]+)+` 的原始 key（例如 `paste_err_destination`、`paste_err_not_payload`、`commit_subset_rejected`），也沒有「key (args)」的形式。zh-TW 與 en 各查一次。任何一處露出 key，判 `ui-defect` |
+| K05-key | 依第 4 節的拒絕文字檢查，轉錄 T02、T13、T15、T29、T30、T31、C-blocked、K-space 的每一次拒絕文字。再按 Option+L 切到英文，重做 T15、T30、T31，轉錄英文文字，最後切回。另外複製 `commits-src` 的 C1，開 `fixtures/nongit-dst` 為工作區，按 Cmd+V：走 `build_commit` → `Git::open_with` 失敗 → `destination_error`，得到 `[APP:PASTE_ERR: paste_err_destination]`，狀態列是「無法使用貼上目的地「…/nongit-dst」: <core 的英文原因>」，英文原因形如「… is not inside a git repository (commit mode and git sources need one)」，轉錄整句。這句夾英文是已接受的限制（core 錯誤字串沒有翻譯），不屬於 T31 規則 (a)（(a) 只看 T31 與 C-blocked 的 `commit_replay_partial` 橫幅）；只要沒有原始 key 就不判 `ui-defect`。`fixtures/file-dst` 現在是選用：以它開工作區在 `open_workspace_path` 就被拒，只會出現 `workspace_bad_path`「找不到工作區資料夾：…」，到不了貼上，`paste_err_destination_not_dir` 從 UI 走不到。要做就轉錄那則訊息，也套用 key 規則 | 所有畫面文字都沒有符合 `[a-z]+(_[a-z0-9]+)+` 的原始 key（例如 `paste_err_destination`、`paste_err_not_payload`、`commit_subset_rejected`），也沒有「key (args)」的形式。zh-TW 與 en 各查一次。任何一處露出 key，判 `ui-defect` |
 
 ## 7. `ed3d057`（develop）上已對過的程式
 
@@ -405,7 +407,7 @@ commit 預覽與鍵盤的格子，對應 #58 與 #57。除非該格另有說明�
 | #58 `0a45ca1` | commit 預覽依重播計畫分組、標頭與收合、略過原因、rename 註記、空 commit 顯示、複製通知帶數量、鍵盤選取 | T22、T26、T28、B-notify、C-group、C-reason、K-space、K-fold、K-nav |
 | #59 `ed3d057` | 多 repo 記錄的訊息欄保留最小寬度，1080 視窗下 ref 標籤不再被擠掉 | T36、B43（1080） |
 
-T31 與 C-blocked 例外：預期是 `ui-defect`，原因見第 6 節 T31 說明。K-reinclude 的橫幅殘留也是可能的 `ui-defect`，由操作者看畫面判定。
+T31、C-blocked、K-reinclude 例外：預期是 `ui-defect`，原因見第 6 節。K-reinclude 的橫幅殘留是確定的（`plan.error` 只設不清）；T22 與 C-reason 的刪除列紅色區塊矛盾也是預期的 `ui-defect`。
 
 2026-09-29 報告測的是 `main` 的 `167c10c`。那一輪的 PASS 不能抄進這份計分表。
 
