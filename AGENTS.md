@@ -17,10 +17,10 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 ## Before you call a change done
 
-- Before pushing anything besides Markdown, run `just preflight`, which runs everything CI's Linux jobs run. A failure CI finds that preflight would have caught is a process bug. It needs Xvfb; on macOS or Windows run `cargo fmt --all --check`, clippy and rustdoc with `-D warnings`, and `cargo test --workspace --exclude snip-native-e2e --locked`, as CI's jobs for that OS do.
+- Before pushing anything besides Markdown, run `just preflight`. A failure CI finds that preflight would have caught is a process bug. On Linux it runs CI's Linux jobs. On macOS it runs CI's macOS checks, then the Linux jobs, native acceptance included, in an Apple `container` VM (`scripts/linux_container.sh`; `--clean` drops its volumes, images and kernel cache). Windows has no container path: run `just preflight-host`.
 - A push of only `.md` files skips preflight: nothing in it reads Markdown, and CI still runs every job. A script under `docs/` is not Markdown; run the script itself.
 - `native-acceptance` needs a Python with Pillow in `SNIP_NATIVE_PYTHON` and fails if the checkout changes after its build: commit first, then leave the tree alone.
-- Where a test goes: pure logic → a unit test in `crates/core` or the native crate; UI state and interaction → `#[gpui::test]` in `crates/desktop-native/src/main.rs` `tests::in_process` (no display, all OSes); real input, clipboard or pixels → `crates/native-e2e/tests/smoke.rs` / `lifecycle.rs` (Xvfb, Linux only); cross-machine file/commit semantics → a collaboration manifest step. macOS and Windows have no real-input GUI test.
+- Where a test goes: pure logic → a unit test in `crates/core` or the native crate; UI state and interaction → `#[gpui::test]` in `crates/desktop-native/src/main.rs` `tests::in_process` (no display, all OSes); real input, clipboard or pixels → `crates/native-e2e/tests/smoke.rs` / `lifecycle.rs` (Xvfb; on macOS inside the preflight container); cross-machine file/commit semantics → a collaboration manifest step. macOS and Windows have no real-input GUI test.
 - A control a test drives gets a `probe(...)` id; drivers read it from `[APP:CTRL_BOUNDS]`.
 - Real-app waits in native-e2e go through `snip_native_e2e::scaled(...)`. On a slow machine set `SNIP_E2E_TIMEOUT_SCALE` (CI uses 2) instead of raising a deadline.
 
