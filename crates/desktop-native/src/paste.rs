@@ -100,7 +100,7 @@ pub enum PasteRequest {
 }
 
 impl PasteRequest {
-	pub(crate) fn bytes(&self) -> usize {
+	fn bytes(&self) -> usize {
 		size_of::<Self>().saturating_add(match self {
 			Self::Clipboard {
 				text, dest, roots, ..
@@ -308,7 +308,7 @@ impl PastePending {
 	}
 }
 
-pub(crate) enum PasteInput {
+enum PasteInput {
 	Clipboard(PasteRequest),
 	Remap {
 		plan: PastePreviewPlan,
@@ -317,7 +317,7 @@ pub(crate) enum PasteInput {
 	},
 }
 impl PasteInput {
-	pub(crate) fn bytes(&self) -> usize {
+	fn bytes(&self) -> usize {
 		size_of::<Self>().saturating_add(match self {
 			Self::Clipboard(request) => request.bytes(),
 			Self::Remap { plan, prefix, .. } => {
@@ -480,10 +480,14 @@ pub enum RowAction {
 impl RowAction {
 	/// Not written by Apply: a commit header's "skipped" count.
 	pub fn is_not_written(self) -> bool {
-		matches!(
-			self,
-			Self::Skip(_) | Self::DeleteMissing | Self::KeepExisting
-		)
+		match self {
+			Self::Skip(_) | Self::DeleteMissing | Self::KeepExisting => true,
+			Self::Excluded { .. }
+			| Self::Delete
+			| Self::Create
+			| Self::Overwrite
+			| Self::OverwritePending => false,
+		}
 	}
 }
 
@@ -2292,11 +2296,7 @@ mod tests {
 		assert!(
 			(0..12).all(|i| !dir.path().join(format!("f-{i}.txt")).exists())
 		);
-		let head = std::process::Command::new("git")
-			.current_dir(dir.path())
-			.args(["rev-parse", "--verify", "HEAD"])
-			.output()
-			.unwrap();
+		let head = git_output(dir.path(), &["rev-parse", "--verify", "HEAD"]);
 		assert!(
 			!head.status.success(),
 			"overflow must not create even one commit"
@@ -2474,7 +2474,11 @@ mod tests {
 		);
 	}
 
-	pub(crate) fn git_run(path: &Path, args: &[&str]) {
+	/// Runs git with a bounded wait; the one process wait of the tests.
+	pub(crate) fn git_output(
+		path: &Path,
+		args: &[&str],
+	) -> std::process::Output {
 		let mut child = std::process::Command::new("git")
 			.current_dir(path)
 			.args(args)
@@ -2484,22 +2488,27 @@ mod tests {
 			.expect("spawn git");
 		let start = std::time::Instant::now();
 		let timeout = std::time::Duration::from_secs(10);
-		let status = loop {
-			if let Some(status) = child.try_wait().expect("try_wait") {
-				break status;
+		loop {
+			if child.try_wait().expect("try_wait").is_some() {
+				break;
 			}
 			if start.elapsed() > timeout {
 				let _ = child.kill();
 				panic!("git {args:?} timed out after {timeout:?}");
 			}
 			std::thread::sleep(std::time::Duration::from_millis(10));
-		};
-		let out = child.wait_with_output().expect("wait_with_output");
+		}
+		child.wait_with_output().expect("wait_with_output")
+	}
+
+	pub(crate) fn git_run(path: &Path, args: &[&str]) -> String {
+		let out = git_output(path, args);
 		assert!(
-			status.success(),
+			out.status.success(),
 			"git {args:?}: {}",
 			String::from_utf8_lossy(&out.stderr)
 		);
+		String::from_utf8(out.stdout).expect("git stdout is utf-8")
 	}
 
 	pub(crate) fn git_init(path: &Path) {
@@ -2651,13 +2660,7 @@ mod tests {
 	fn commit_apply_creates_the_empty_commit_too() {
 		let (dir, mut plan) = mixed_plan();
 		let count = || {
-			let out = std::process::Command::new("git")
-				.current_dir(dir.path())
-				.args(["rev-list", "--count", "HEAD"])
-				.output()
-				.unwrap();
-			String::from_utf8(out.stdout)
-				.unwrap()
+			git_run(dir.path(), &["rev-list", "--count", "HEAD"])
 				.trim()
 				.parse::<usize>()
 		};
@@ -2903,15 +2906,7 @@ mod tests {
 		let path = dir.path().to_path_buf();
 		git_init(&path);
 		fs::write(path.join("a.txt"), "base\n").unwrap();
-		let git = |args: &[&str]| {
-			let out = std::process::Command::new("git")
-				.current_dir(&path)
-				.args(args)
-				.output()
-				.unwrap();
-			assert!(out.status.success(), "{args:?}");
-			String::from_utf8(out.stdout).unwrap()
-		};
+		let git = |args: &[&str]| git_run(&path, args);
 		git(&["add", "."]);
 		git(&["commit", "-qm", "base"]);
 		let head = git(&["rev-parse", "HEAD"]);
@@ -2967,18 +2962,9 @@ mod tests {
 		plan.items[0].overwrite_allowed = true;
 		let applied = plan.execute().unwrap();
 		assert_eq!(applied.created_commits.len(), 1);
-		let meta = std::process::Command::new("git")
-			.current_dir(&path)
-			.args(["log", "-1", "--format=%an|%ae|%B"])
-			.output()
-			.unwrap();
-		let meta = String::from_utf8(meta.stdout).unwrap();
+		let meta = git_run(&path, &["log", "-1", "--format=%an|%ae|%B"]);
 		assert!(meta.contains("Author|author@example.invalid|incoming"));
-		let body = std::process::Command::new("git")
-			.current_dir(&path)
-			.args(["show", "HEAD:a.txt"])
-			.output()
-			.unwrap();
+		let body = git_output(&path, &["show", "HEAD:a.txt"]);
 		assert_eq!(body.stdout, b"incoming\n");
 
 		let nested = CommitsPayload {

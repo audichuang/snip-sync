@@ -2057,6 +2057,7 @@ mod tests {
 		);
 
 		fn all_skip_causes() -> Vec<SkipCause> {
+			// 每個變體各放一個代表值；新增變體時一併加入 seed，否則下方分支不會執行
 			let seed = [
 				SkipCause::Binary,
 				SkipCause::NonUtf8,
@@ -2088,6 +2089,7 @@ mod tests {
 		}
 
 		fn all_actions() -> Vec<RowAction> {
+			// 每個變體各放一個代表值；新增變體時一併加入 seed，否則下方分支不會執行
 			let seed = [
 				RowAction::Excluded { by_commit: false },
 				RowAction::Skip(SkipCause::Other),
