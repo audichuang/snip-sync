@@ -2,6 +2,7 @@
 /crates/*/target
 /.ts-ref
 .claude/
+.omp/
 /.ts-ref-src
 __pycache__/
 *.pyc
