@@ -2672,16 +2672,16 @@ fn skipped_non_utf8_replay_target_becomes_stale_when_it_turns_writable() {
 	};
 	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
 	assert_eq!(
-		preview.replay.commits[0].files[0].action,
+		preview.plan().commits[0].files[0].action,
 		ReplayAction::Skip
 	);
 	assert_eq!(
-		preview.replay.commits[0].files[0].skip_reason,
+		preview.plan().commits[0].files[0].skip_reason,
 		Some(ReplaySkipReason::NonUtf8Target)
 	);
 	assert!(
 		preview
-			.freshness
+			.freshness()
 			.target_files
 			.keys()
 			.any(|path| path.ends_with("a.txt")),
@@ -2721,7 +2721,7 @@ fn skipped_non_utf8_replay_target_becomes_stale_when_it_turns_writable() {
 	let skipped =
 		CommitReplayPreview::capture(repo.path(), &not_copied).unwrap();
 	assert_eq!(
-		skipped.replay.commits[0].files[0].skip_reason,
+		skipped.plan().commits[0].files[0].skip_reason,
 		Some(ReplaySkipReason::NotCopied)
 	);
 	fs::write(repo.path().join("a.txt"), "still external\n").unwrap();
@@ -2761,7 +2761,7 @@ fn commit_replay_preview_treats_a_file_in_the_way_as_an_unsafe_skip() {
 	};
 	let preview = CommitReplayPreview::capture(repo.path(), &payload)
 		.expect("a file standing in for a directory must not refuse the paste");
-	let files = &preview.replay.commits[0].files;
+	let files = &preview.plan().commits[0].files;
 	assert_eq!(files[0].skip_reason, Some(ReplaySkipReason::UnsafePath));
 	assert_eq!(files[1].skip_reason, Some(ReplaySkipReason::UnsafePath));
 	assert_eq!(files[2].skip_reason, None);
@@ -2799,11 +2799,11 @@ fn unsafe_symlink_replay_parent_is_not_followed_and_becomes_stale() {
 	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
 	assert_eq!(fs::read(&outside).unwrap(), before);
 	assert_eq!(
-		preview.replay.commits[0].files[0].skip_reason,
+		preview.plan().commits[0].files[0].skip_reason,
 		Some(snip_core::commits::ReplaySkipReason::UnsafePath)
 	);
-	assert!(preview.replay.commits[0].files[0].absolute_path.is_none());
-	assert!(preview.freshness.target_files.is_empty());
+	assert!(preview.plan().commits[0].files[0].absolute_path.is_none());
+	assert!(preview.freshness().target_files.is_empty());
 	fs::remove_file(repo.path().join("link")).unwrap();
 	fs::create_dir(repo.path().join("link")).unwrap();
 	fs::write(repo.path().join("link/a.txt"), "external\n").unwrap();
@@ -2851,4 +2851,403 @@ fn test_plain_folder_file_export_matches_a_repo() {
 	let from_plain = export(&plain);
 	assert!(from_plain.contains("PLAIN_BYTES"), "{from_plain}");
 	assert_eq!(from_plain, export(repo.path()));
+}
+
+#[test]
+fn commit_replay_apply_replays_the_previewed_payload() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+
+	let repo = TestRepo::new("replay-apply");
+	repo.write("base.txt", "base\n");
+	repo.commit("base");
+
+	// 事先 stage 的無關檔案
+	repo.write("staged.txt", "staged by user\n");
+	repo.git(&["add", "staged.txt"]);
+
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "applied commit message\n".into(),
+			author_name: "Apply Author".into(),
+			author_email: "apply@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00Z".into(),
+			files: vec![CommitFile {
+				path: "a.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("payload bytes\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+	let result = preview.apply().unwrap();
+	assert_eq!(result.failure, None);
+	assert_eq!(result.created.len(), 1);
+
+	// `git show HEAD:a.txt` 的 bytes 等於 payload
+	assert_eq!(repo.git(&["show", "HEAD:a.txt"]), "payload bytes");
+	assert_eq!(
+		fs::read(repo.path().join("a.txt")).unwrap(),
+		b"payload bytes\n"
+	);
+
+	// `log -1 --format=%an|%ae|%aI|%B` 等於 payload
+	let meta = repo.git(&["log", "-1", "--format=%an|%ae|%aI|%B"]);
+	let expected_meta = format!(
+		"{}|{}|{}|{}",
+		payload.commits[0].author_name,
+		payload.commits[0].author_email,
+		payload.commits[0].author_date,
+		payload.commits[0].message
+	)
+	.trim()
+	.to_string();
+	// 不同 git 版本把 UTC 印成 Z 或 +00:00，先正規化
+	assert_eq!(meta.replace("+00:00", "Z"), expected_meta);
+
+	// 事先 stage 的無關檔案仍在 `diff --cached --name-only` 裡
+	let staged = repo.git(&["diff", "--cached", "--name-only"]);
+	assert!(staged.lines().any(|l| l == "staged.txt"));
+}
+
+#[test]
+fn commit_replay_apply_refuses_a_destination_changed_after_preview() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+
+	let repo = TestRepo::new("replay-stale-destination");
+	repo.write("a.txt", "base a\n");
+	repo.commit("base");
+
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "mod a\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "a.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("incoming a\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+
+	// 段落 1：外部改寫 a.txt
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+	let head_before = repo.git(&["rev-parse", "HEAD"]);
+	let index_before = repo.git(&["rev-parse", ":a.txt"]);
+	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
+	repo.write("a.txt", "external change a\n");
+	let bytes_before = fs::read(repo.path().join("a.txt")).unwrap();
+	let err = preview.apply().unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"{err:?}"
+	);
+	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+	assert_eq!(repo.git(&["rev-parse", ":a.txt"]), index_before);
+	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
+	assert_eq!(fs::read(repo.path().join("a.txt")).unwrap(), bytes_before);
+
+	// 段落 2：外部 git add
+	repo.write("a.txt", "base a\n");
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+	repo.write("a.txt", "staged a\n");
+	repo.git(&["add", "a.txt"]);
+	let head_before = repo.git(&["rev-parse", "HEAD"]);
+	let index_before = repo.git(&["rev-parse", ":a.txt"]);
+	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
+	let bytes_before = fs::read(repo.path().join("a.txt")).unwrap();
+	let err = preview.apply().unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"{err:?}"
+	);
+	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+	assert_eq!(repo.git(&["rev-parse", ":a.txt"]), index_before);
+	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
+	assert_eq!(fs::read(repo.path().join("a.txt")).unwrap(), bytes_before);
+
+	// 段落 3：原本不存在的 b.txt 出現
+	repo.git(&["checkout", "--", "a.txt"]);
+	let payload_b = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "add b\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "b.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("incoming b\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview =
+		CommitReplayPreview::capture(repo.path(), &payload_b).unwrap();
+	let head_before = repo.git(&["rev-parse", "HEAD"]);
+	let index_before = repo.git(&["rev-parse", ":a.txt"]);
+	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
+	let bytes_a_before = fs::read(repo.path().join("a.txt")).unwrap();
+	repo.write("b.txt", "external b appeared\n");
+	let bytes_b_before = fs::read(repo.path().join("b.txt")).unwrap();
+	let err = preview.apply().unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"{err:?}"
+	);
+	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+	assert_eq!(repo.git(&["rev-parse", ":a.txt"]), index_before);
+	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
+	assert_eq!(fs::read(repo.path().join("a.txt")).unwrap(), bytes_a_before);
+	assert_eq!(fs::read(repo.path().join("b.txt")).unwrap(), bytes_b_before);
+}
+
+#[test]
+fn commit_replay_apply_refuses_after_head_moved() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+
+	let repo = TestRepo::new("replay-head-moved");
+	repo.write("base.txt", "base\n");
+	repo.commit("base");
+
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "incoming.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("incoming\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+
+	repo.write("other.txt", "other\n");
+	let external_head = repo.commit("external commit");
+	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
+	let index_before = repo.git(&["ls-files", "-s"]);
+
+	let err = preview.apply().unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"{err:?}"
+	);
+	assert_eq!(repo.git(&["rev-parse", "HEAD"]), external_head);
+	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
+	assert_eq!(repo.git(&["ls-files", "-s"]), index_before);
+	assert!(!repo.exists("incoming.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn commit_replay_apply_through_a_symlinked_root() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+
+	let repo = TestRepo::new("symlink-root");
+	repo.write("base.txt", "base\n");
+	let base_head = repo.commit("base");
+
+	let link_dir = tempfile::tempdir().unwrap();
+	let link_path = link_dir.path().join("link");
+	std::os::unix::fs::symlink(repo.path(), &link_path).unwrap();
+
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "symlink commit\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "a.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("content in a\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+
+	// 用 link 路徑 capture 後 apply 成功，實際 repo 的 HEAD 前進
+	let preview = CommitReplayPreview::capture(&link_path, &payload).unwrap();
+	let result = preview.apply().unwrap();
+	assert_eq!(result.failure, None);
+	assert_eq!(result.created.len(), 1);
+	let new_head = repo.git(&["rev-parse", "HEAD"]);
+	assert_ne!(new_head, base_head);
+	assert_eq!(result.created[0], new_head);
+
+	// 再用 link capture 一次，從實際路徑改寫目標檔，apply 回 StaleDestination
+	let payload2 = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "second commit\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "a.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("content v2\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview2 = CommitReplayPreview::capture(&link_path, &payload2).unwrap();
+	fs::write(repo.path().join("a.txt"), "external change\n").unwrap();
+	let err = preview2.apply().unwrap_err();
+	assert!(
+		matches!(err, TransferError::StaleDestination { .. }),
+		"{err:?}"
+	);
+}
+
+#[test]
+fn commit_replay_apply_leaves_a_not_copied_target_alone() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange, NotCopiedReason,
+	};
+
+	let repo = TestRepo::new("not-copied-target");
+	repo.write("bin.dat", "original binary content\n");
+	repo.commit("base");
+
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "skip binary and add text\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![
+				CommitFile {
+					path: "bin.dat".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: None,
+					not_copied: Some(NotCopiedReason::Binary),
+				},
+				CommitFile {
+					path: "added.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("added\n".into()),
+					not_copied: None,
+				},
+			],
+		}],
+	};
+
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+	// capture 後外部改寫 not-copied 的目標
+	fs::write(repo.path().join("bin.dat"), "externally modified binary\n")
+		.unwrap();
+
+	let result = preview.apply().unwrap();
+	assert_eq!(result.failure, None);
+	assert_eq!(result.created.len(), 1);
+	assert_eq!(
+		fs::read(repo.path().join("bin.dat")).unwrap(),
+		b"externally modified binary\n"
+	);
+	assert_eq!(fs::read(repo.path().join("added.txt")).unwrap(), b"added\n");
+}
+
+#[test]
+fn commit_replay_apply_waits_for_the_worktree_lock() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+	use snip_core::gitrun::RunOptions;
+	use snip_core::gitsrc::Git;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+	use std::sync::mpsc;
+	use std::time::Duration;
+
+	let repo = TestRepo::new("worktree-lock");
+	repo.write("base.txt", "base\n");
+	let head_before = repo.commit("base");
+	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
+	let index_before = repo.git(&["ls-files", "-s"]);
+
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "new commit\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![
+				CommitFile {
+					path: "base.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some("incoming base\n".into()),
+					not_copied: None,
+				},
+				CommitFile {
+					path: "new.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("new content\n".into()),
+					not_copied: None,
+				},
+			],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
+
+	let git = Git::open(repo.path()).unwrap();
+	let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
+	let guard = lock_heavy(&id, &RunOptions::default()).unwrap();
+
+	let opts = RunOptions {
+		queue_timeout: Duration::from_secs(30),
+		..RunOptions::default()
+	};
+
+	let (tx, rx) = mpsc::channel();
+	let res = std::thread::scope(|s| {
+		s.spawn(|| {
+			let res = preview.apply_with(&opts);
+			let _ = tx.send(res);
+		});
+
+		std::thread::sleep(Duration::from_millis(300));
+		assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+		repo.write("base.txt", "modified base\n");
+
+		drop(guard);
+
+		rx.recv_timeout(Duration::from_secs(30))
+			.expect("apply_with did not return after worktree lock released")
+	});
+
+	assert!(
+		matches!(res, Err(TransferError::StaleDestination { .. })),
+		"expected StaleDestination, got {res:?}"
+	);
+	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
+	assert_eq!(repo.git(&["ls-files", "-s"]), index_before);
+	assert_eq!(repo.read("base.txt"), "modified base\n");
+	assert!(!repo.exists("new.txt"));
 }

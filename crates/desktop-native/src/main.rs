@@ -6949,7 +6949,7 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				let plan = m.paste.plan().unwrap();
 				let commits =
-					&plan.commit_preview.as_ref().unwrap().replay.commits;
+					&plan.commit_preview.as_ref().unwrap().plan().commits;
 				assert_eq!(
 					crate::ui::commit_header_labels(
 						&commits[1],

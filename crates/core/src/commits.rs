@@ -1098,6 +1098,30 @@ pub struct FilePlan {
 	pub old_absolute_path: Option<PathBuf>,
 }
 
+impl FilePlan {
+	/// Destination paths whose on-disk state decides this file's replay: the target and a
+	/// rename's old path, with their repo-relative spelling. Nothing for a NotCopied skip:
+	/// the payload has no bytes, so no destination change can turn it into a write.
+	pub(crate) fn freshness_targets(
+		&self,
+	) -> impl Iterator<Item = (&PathBuf, &str)> + '_ {
+		let not_copied = self.skip_reason == Some(ReplaySkipReason::NotCopied);
+		let target = (!not_copied)
+			.then(|| {
+				self.absolute_path.as_ref().map(|p| (p, self.path.as_str()))
+			})
+			.flatten();
+		let old = (!not_copied)
+			.then(|| {
+				self.old_absolute_path
+					.as_ref()
+					.zip(self.old_path.as_deref())
+			})
+			.flatten();
+		[target, old].into_iter().flatten()
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitPlan {
@@ -1318,7 +1342,8 @@ fn skip_layout_conflicts(root: &Path, files: &mut [FilePlan]) {
 	}
 }
 
-/// Preview: what replaying `payload` onto the current disk state would do.
+/// Preview: what replaying `payload` onto the current disk state would do via
+/// [`crate::transfer::CommitReplayPreview::apply`].
 pub fn plan_commit_replay(
 	git: &Git,
 	payload: &CommitsPayload,
@@ -1378,51 +1403,81 @@ pub struct ReplayResult {
 	pub failure: Option<ReplayFailure>,
 }
 
-/// Replays every commit onto the current HEAD, stopping at the first
-/// failure. Each commit is re-planned right before it runs, so the path and
-/// encoding checks see the disk as earlier commits left it.
-pub fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
-	let mut result = ReplayResult::default();
-	// Index- and ref-changing work runs one at a time per worktree.
-	let opts = RunOptions::default();
-	let guard =
-		RepoIdentity::resolve(git, &opts).and_then(|id| lock_heavy(&id, &opts));
-	let _guard = match guard {
-		Ok(g) => g,
-		Err(e) => {
-			result.failure = payload.commits.first().map(|c| ReplayFailure {
-				index: 0,
-				message: c.message.clone(),
-				error: e.to_string(),
-			});
-			return result;
-		}
-	};
-	let no_hooks = match NoHooks::create() {
-		Ok(h) => h,
-		Err(e) => {
-			result.failure = payload.commits.first().map(|c| ReplayFailure {
-				index: 0,
-				message: c.message.clone(),
-				error: format!("cannot create an empty hooks directory: {e}"),
-			});
-			return result;
-		}
-	};
-	for (index, commit) in payload.commits.iter().enumerate() {
-		match replay_commit(git, commit, &no_hooks.config) {
-			Ok(sha) => result.created.push(sha),
-			Err(error) => {
-				result.failure = Some(ReplayFailure {
-					index,
-					message: commit.message.clone(),
-					error,
-				});
-				break;
+pub(crate) struct ReplaySession {
+	no_hooks: NoHooks,
+	_guard: crate::workspace::HeavyGuard,
+}
+
+impl ReplaySession {
+	/// Heavy lock + empty hooks dir, taken before any write. Err is the ReplayResult
+	/// the old replay returned for that failure (failure at index 0, or none for an empty payload).
+	pub(crate) fn begin(
+		git: &Git,
+		payload: &CommitsPayload,
+		opts: &RunOptions,
+	) -> Result<Self, ReplayResult> {
+		let mut result = ReplayResult::default();
+		let guard = RepoIdentity::resolve(git, opts)
+			.and_then(|id| lock_heavy(&id, opts));
+		let _guard = match guard {
+			Ok(g) => g,
+			Err(e) => {
+				result.failure =
+					payload.commits.first().map(|c| ReplayFailure {
+						index: 0,
+						message: c.message.clone(),
+						error: e.to_string(),
+					});
+				return Err(result);
+			}
+		};
+		let no_hooks = match NoHooks::create() {
+			Ok(h) => h,
+			Err(e) => {
+				result.failure =
+					payload.commits.first().map(|c| ReplayFailure {
+						index: 0,
+						message: c.message.clone(),
+						error: format!(
+							"cannot create an empty hooks directory: {e}"
+						),
+					});
+				return Err(result);
+			}
+		};
+		Ok(Self { no_hooks, _guard })
+	}
+
+	/// Replays every commit; never polls cancellation.
+	pub(crate) fn run(
+		&self,
+		git: &Git,
+		payload: &CommitsPayload,
+	) -> ReplayResult {
+		let mut result = ReplayResult::default();
+		for (index, commit) in payload.commits.iter().enumerate() {
+			match replay_commit(git, commit, &self.no_hooks.config) {
+				Ok(sha) => result.created.push(sha),
+				Err(error) => {
+					result.failure = Some(ReplayFailure {
+						index,
+						message: commit.message.clone(),
+						error,
+					});
+					break;
+				}
 			}
 		}
+		result
 	}
-	result
+}
+
+#[cfg(test)]
+pub(crate) fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
+	match ReplaySession::begin(git, payload, &RunOptions::default()) {
+		Ok(session) => session.run(git, payload),
+		Err(refused) => refused,
+	}
 }
 
 /// A fresh empty directory for `core.hooksPath`, so replay runs none of the
@@ -2749,5 +2804,144 @@ mod tests {
 		assert_eq!(result.failure, None);
 		assert_eq!(dst.git(&["log", "-1", "--format=%B"]), "");
 		assert_eq!(dst.git(&["show", "HEAD:b.txt"]), "b");
+	}
+
+	#[test]
+	fn freshness_targets_follow_the_planner_rules() {
+		let repo = Repo::new("main");
+		repo.write("old.txt", b"old content\n");
+		repo.write("bad_utf8.txt", &[0xff, 0xfe, 0xfd]);
+		repo.commit("init", "2020-01-01T00:00:00+00:00");
+
+		#[cfg(unix)]
+		{
+			repo.write("other/x.txt", b"x\n");
+			std::os::unix::fs::symlink("other", repo.path().join("symdir"))
+				.unwrap();
+		}
+
+		#[allow(unused_mut)]
+		let mut files = vec![
+			// NotCopied
+			CommitFile {
+				path: "bin.dat".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: None,
+				not_copied: Some(NotCopiedReason::Binary),
+			},
+			// 一般 Write
+			CommitFile {
+				path: "write.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("write\n".into()),
+				not_copied: None,
+			},
+			// rename
+			CommitFile {
+				path: "renamed.txt".into(),
+				old_path: Some("old.txt".into()),
+				change: FileChange::Renamed,
+				content: Some("renamed\n".into()),
+				not_copied: None,
+			},
+			// 非 UTF-8 目標 (NonUtf8Target)
+			CommitFile {
+				path: "bad_utf8.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("utf8 payload\n".into()),
+				not_copied: None,
+			},
+		];
+
+		#[cfg(unix)]
+		files.push(CommitFile {
+			path: "symdir/x.txt".into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("sub\n".into()),
+			not_copied: None,
+		});
+
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "test targets\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files,
+			}],
+		};
+
+		let plan = plan_commit_replay(&repo.open(), &payload);
+		let planned_files = &plan.commits[0].files;
+
+		// 1. NotCopied 產出 0 個
+		assert_eq!(
+			planned_files[0].skip_reason,
+			Some(ReplaySkipReason::NotCopied)
+		);
+		assert_eq!(planned_files[0].freshness_targets().count(), 0);
+
+		// 2. 一般 Write 產出 (abs, path)
+		assert_eq!(planned_files[1].action, ReplayAction::Write);
+		let write_targets =
+			planned_files[1].freshness_targets().collect::<Vec<_>>();
+		assert_eq!(write_targets.len(), 1);
+		assert_eq!(
+			write_targets[0],
+			(
+				planned_files[1].absolute_path.as_ref().unwrap(),
+				"write.txt"
+			)
+		);
+
+		// 3. rename 另外產出 (old_abs, old_path)
+		assert_eq!(planned_files[2].action, ReplayAction::Write);
+		let rename_targets =
+			planned_files[2].freshness_targets().collect::<Vec<_>>();
+		assert_eq!(rename_targets.len(), 2);
+		assert_eq!(
+			rename_targets[0],
+			(
+				planned_files[2].absolute_path.as_ref().unwrap(),
+				"renamed.txt"
+			)
+		);
+		assert_eq!(
+			rename_targets[1],
+			(
+				planned_files[2].old_absolute_path.as_ref().unwrap(),
+				"old.txt"
+			)
+		);
+
+		// 4. 非 UTF-8 目標（NonUtf8Target）只產出目標
+		assert_eq!(
+			planned_files[3].skip_reason,
+			Some(ReplaySkipReason::NonUtf8Target)
+		);
+		let non_utf8_targets =
+			planned_files[3].freshness_targets().collect::<Vec<_>>();
+		assert_eq!(non_utf8_targets.len(), 1);
+		assert_eq!(
+			non_utf8_targets[0],
+			(
+				planned_files[3].absolute_path.as_ref().unwrap(),
+				"bad_utf8.txt"
+			)
+		);
+
+		// 5. 經過 symlink 父目錄的 UnsafePath 產出 0 個（unix）
+		#[cfg(unix)]
+		{
+			assert_eq!(
+				planned_files[4].skip_reason,
+				Some(ReplaySkipReason::UnsafePath)
+			);
+			assert_eq!(planned_files[4].freshness_targets().count(), 0);
+		}
 	}
 }

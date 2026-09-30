@@ -76,7 +76,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
     reader thread 最多等 5 秒,之後回報錯誤,該 thread 留著(無法強制結束 thread)。
   - 明確的 `finish` / `CatFile::close` 會回報清理失敗;`Drop` 無法回傳錯誤,會再試一次,仍失敗就保留名額。
   - 同一個 thread 在持有 git 名額時(例如開著 `cat-file --batch`)再啟動 git 會直接失敗(`NestedProcess`),避免兩個這樣的 thread 把名額卡死。
-  - 修改 index / ref 的重操作(`commits::replay`)在同一個 worktree(以 git dir 區分)一次只跑一個,最多 4 個等待者(`workspace::lock_heavy`)。
+  - 修改 index / ref 的重操作(`CommitReplayPreview::apply`,在 lock 內先重新驗證預覽再重播)在同一個 worktree(以 git dir 區分)一次只跑一個,最多 4 個等待者(`workspace::lock_heavy`)。
 - 可續讀、保留 OS 原始檔名的目錄分頁是 `workspace::DirectoryScan`:每次呼叫的工作量有上限,
   頁內依「目錄優先、名稱位元組」排序、跨頁是 OS 列舉順序;目錄在掃描中變動(時間戳只精確到檔案系統的解析度)就回報 `Changed`。
 - repo 探索(`workspace::Discovery`)只保留每層一個開著的目錄(最多 `max_depth + 1`,上限 32 層),不累積待走路徑;

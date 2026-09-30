@@ -18,7 +18,6 @@ use snip_core::commits::{
 };
 use snip_core::format;
 use snip_core::gitrun::{CancelToken, RunOptions};
-use snip_core::gitsrc::Git;
 use snip_core::restore::{
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
 };
@@ -1011,7 +1010,7 @@ impl PastePreviewPlan {
 			.map_err(|e| destination_error(dest, &e))?;
 		let preview = Arc::new(preview);
 		let mut plan = Self {
-			destination: preview.destination.clone(),
+			destination: preview.destination().to_path_buf(),
 			import_plan: None,
 			commit_preview: Some(preview.clone()),
 			whole_commit: true,
@@ -1031,10 +1030,10 @@ impl PastePreviewPlan {
 		let mut items_heap = 0usize;
 		let mut items = Vec::new();
 		for (c_idx, (commit, record)) in preview
-			.replay
+			.plan()
 			.commits
 			.iter()
-			.zip(&preview.payload.commits)
+			.zip(&preview.payload().commits)
 			.enumerate()
 		{
 			for (f_idx, (file, src)) in
@@ -1514,7 +1513,7 @@ impl PastePreviewPlan {
 		};
 		let mut rows = Vec::with_capacity(self.items.len());
 		let mut ix = 0;
-		for c in 0..preview.replay.commits.len() {
+		for c in 0..preview.plan().commits.len() {
 			rows.push(PasteNode::Commit(c));
 			let shown = !self.collapsed_commits.contains(&c);
 			while self.items.get(ix).is_some_and(|i| i.commit == Some(c)) {
@@ -1673,13 +1672,17 @@ impl PastePreviewPlan {
 		if self.items.iter().any(|item| !item.selected) {
 			return Err(Msg::new("commit_subset_rejected", []));
 		}
-		preview.revalidate().map_err(stale_msg)?;
+		// Core overwrites (spec 4.3); asking first is this session's rule. Stale still wins over the prompt, as before.
 		if self.overwrite_missing() {
+			preview.revalidate().map_err(stale_msg)?;
 			return Err(Msg::new("commit_overwrite_required", []));
 		}
-		let git = Git::open(&self.destination)
-			.map_err(|e| Msg::new("error_open_repo", [e.to_string()]))?;
-		let replay_res = commits::replay(&git, &preview.payload);
+		let replay_res = preview.apply().map_err(|e| match e {
+			TransferError::Git(e) => {
+				Msg::new("error_open_repo", [e.to_string()])
+			}
+			other => stale_msg(other),
+		})?;
 		if let Some(fail) = replay_res.failure {
 			let created = if replay_res.created.is_empty() {
 				"(none)".to_string()
@@ -2795,7 +2798,7 @@ pub(crate) mod tests {
 			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
 				.expect("the blocked file is skipped, not a refusal");
 		let files =
-			&plan.commit_preview.as_ref().unwrap().replay.commits[0].files;
+			&plan.commit_preview.as_ref().unwrap().plan().commits[0].files;
 		assert_eq!(files[0].skip_reason, Some(ReplaySkipReason::UnsafePath));
 		assert_eq!(files[1].skip_reason, None);
 		assert_eq!(
@@ -3012,6 +3015,29 @@ pub(crate) mod tests {
 			"file-not-dir\n"
 		);
 		assert!(!path.join("leaf/child.txt").exists());
+	}
+
+	#[test]
+	fn commit_apply_reports_stale_before_the_overwrite_prompt() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
+
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&commit_payload_modifying_a(),
+			&path,
+			&[],
+			1,
+		)
+		.unwrap();
+
+		fs::write(path.join("a.txt"), "external\n").unwrap();
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.key, "stale_modified");
+		assert_eq!(fs::read(path.join("a.txt")).unwrap(), b"external\n");
 	}
 
 	fn make_item(
