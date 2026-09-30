@@ -6,13 +6,7 @@
 //!
 //! `plan_export_with`, `plan_import_with`, `CommitReplayPreview::capture_with`
 //! and `CommitReplayPreview::apply_with` thread one `RunOptions` through Git
-//! and freshness reads. `apply_with` checks options only before the first write
-//! (open, the worktree lock wait, and the re-validation under that lock);
-//! confirmed replay is not cancellable. Cancel at any point before the first write
-//! is `Err(TransferError::Git(GitError::Cancelled))` and does not produce a plan
-//! or write; but a `QueueTimeout` (or other non-cancel failure) while waiting for
-//! the worktree lock is reported as `Ok(ReplayResult)` with failure at index 0 and
-//! nothing written (only `Git::open_with`'s `QueueTimeout` is an `Err`).
+//! and freshness reads; see `apply_with` for its cancel boundary and error shape.
 //! A regular-file `read` cannot be stopped mid-syscall; the token is polled before
 //! open, between chunks and after the read. A FIFO or other non-regular file is
 //! rejected before `open`. Confirmed `TransferImportPlan::apply` and
@@ -2523,9 +2517,10 @@ impl CommitReplayPreview {
 	/// Replays this preview's own payload onto its destination, or refuses as stale. `opts` reaches
 	/// Git open, the worktree lock wait and the re-validation under that lock; once the first
 	/// commit starts nothing is cancelled. Cancel at any point before the first write is
-	/// `Err(TransferError::Git(GitError::Cancelled))`; but a `QueueTimeout` (or other non-cancel
-	/// failure) while waiting for the worktree lock is reported as `Ok(ReplayResult)` with failure
-	/// at index 0 and nothing written (only `Git::open_with`'s `QueueTimeout` is an `Err`).
+	/// `Err(TransferError::Git(GitError::Cancelled))`. A non-cancel failure inside
+	/// `ReplaySession::begin` (the worktree lock wait or `RepoIdentity::resolve`) is
+	/// `Ok(ReplayResult)` with failure at index 0 and nothing written; `Git::open_with` and
+	/// re-validation errors, `QueueTimeout` included, are `Err`.
 	/// Overwrites follow spec 4.3 (直接覆蓋): the desktop's "allow overwrite first" gate is that
 	/// session's rule and is checked before calling this.
 	pub fn apply_with(

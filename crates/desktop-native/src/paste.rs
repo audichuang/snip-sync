@@ -1677,7 +1677,12 @@ impl PastePreviewPlan {
 			preview.revalidate().map_err(stale_msg)?;
 			return Err(Msg::new("commit_overwrite_required", []));
 		}
-		let replay_res = preview.apply().map_err(stale_msg)?;
+		let replay_res = preview.apply().map_err(|e| match e {
+			TransferError::Git(e) => {
+				Msg::new("error_open_repo", [e.to_string()])
+			}
+			other => stale_msg(other),
+		})?;
 		if let Some(fail) = replay_res.failure {
 			let created = if replay_res.created.is_empty() {
 				"(none)".to_string()
