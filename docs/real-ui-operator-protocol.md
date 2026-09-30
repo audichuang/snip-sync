@@ -205,7 +205,7 @@ Git 的參數以 argv 傳給 `git`。雜湊對寫好的檔算，不把 Git 輸�
 - commit 模式：`[APP:PASTE_DONE: created=N overwritten=0 skipped=0 deleted=0 errors=0 commits=N]`，`N` 是 commit 數，不是檔案數；`overwritten`、`skipped`、`deleted` 固定是 0。各格預期：T18、T19 是 `created=3 commits=3`；T24、T25、T26、T27、T28 是 `created=1 commits=1`。`git rev-list --count <before>..HEAD` 等於通過線的筆數。新 commit 的 SHA 不必等於來源 SHA。要比作者名稱、email、作者時間與時區、完整 message（含換行）、parent 數為 1，以及通過線點名的路徑位元組。
 - 沒有點到的 repo：HEAD 與 status 雜湊不變。
 - 負向步驟：快照等於該步規定的那一張，剪貼簿 sentinel 的 SHA-256 不變，並且有一行對得上的新拒絕日誌。畫面沒反應、按鈕看起來是灰的、或只有一句通用錯誤，都是 `fail`。
-- 例外：通知、紅色橫幅、詳情列、commit 標頭、ref 標籤的文字不寫進日誌（`show_toast` 只印 `[APP:TOAST: ok=]`，ref 標籤沒有 probe）。下列格子的文字 oracle 就是截圖加畫面文字轉錄，寫進 `action.json` 的 `screen_text`：B-notify、B43、T36、T22、T25、T26、T28、T31，以及 C-group、C-detail、C-reason、C-nonutf8、C-blocked、K-space、K-reinclude、K05-key。其餘格子的截圖仍不計分。
+- 例外：通知、紅色橫幅、詳情列、commit 標頭、ref 標籤的文字不寫進日誌（`show_toast` 只印 `[APP:TOAST: ok=]`，ref 標籤沒有 probe）。下列格子的文字 oracle 就是截圖加畫面文字轉錄，寫進 `action.json` 的 `screen_text`：B-notify、B43、T36、T22、T25、T26、T28、T31，以及 C-group、C-detail、C-reason、C-nonutf8、C-blocked、K-space、K-reinclude、K05-key。另外，這些格有通過線依賴畫面上不進日誌的文字，也把該文字轉錄進 `screen_text`：T02（`btn-apply` 的提示「請先為每個來源前綴選擇目的地…」）、T13 與 neg-stale-target（「目的地檔案已在外部修改: …」）、T15（狀態列「剪貼簿內容不是有效的 snip-sync payload」）、T29（`commit_subset_rejected` 橫幅）。其餘格子的截圖仍不計分。
 - 拒絕文字檢查：T02、T13、T15、T29、T30、T31、C-blocked、K-space、所有 `neg-*` 的每一次拒絕，都要轉錄狀態列、預覽紅色橫幅與通知的文字。任何一處出現符合 `[a-z]+(_[a-z0-9]+)+` 的原始 key（例如 `paste_err_destination`、`commit_subset_rejected`），判 `ui-defect`（K05-key）。
 
 每筆 Git 自己有逾時。比對時設 `GIT_CONFIG_GLOBAL=/dev/null` 與 `GIT_CONFIG_NOSYSTEM=1`。
@@ -353,7 +353,7 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T33 | `perf15` 上 `log-filter-repo` 選一個 repo，`btn-log-regex` 輸入能命中的字 | 列只剩該 repo、且 subject 符合的 commit。多 repo 視圖的列 ID 是 `commit-row:<repo>:<7 字元 SHA>` |
 | T34 | 在 log 裡實際滾動 | 載入筆數增加（50 的倍數往上）。把前後的 `[APP:GRAPH_LOADED: commits=N]` 寫進 `action.json`。每頁 50 筆符合程式；規格 4.1 寫 300，記在第 9 節 |
 | T35 | 搜尋尚未載入的較早 commit | 找到該 SHA，預覽指出它 |
-| T36 | `perf15`、全部 repo。1080×752、1080×720、900×600 三種尺寸，各分 hash 欄關（預設）與開（`btn-log-more` → `log-more:hash`，日誌 `[APP:LOG_VIEW: hash]`）兩種，各看前 50 列。先從任一 `commit-row:` 的 `w÷scale` 抄下列表寬，1080 應約 574、900 應約 433；偏差超過 10px 時寫下實際值並說明側欄狀態 | 每列的 subject 至少有 1 個可辨識字元；被截斷時結尾是省略號，hover 可看到完整 subject。只有右側詳情有 message、列上是空白，就是 `fail`。各狀態的預期：1080、hash 關：ref 標籤未被捨棄（寬度 ≥ min(自然寬度, 80)，短的 ref 如 `main` 會比 80px 窄）、subject 至少 160px，兩者同時可見；1080、hash 開：標籤可能被捨棄（graph 欄寬約 100px 以上才會捨棄；欄較窄時標籤仍保留 80px、subject 約 160px），兩種都算對，subject 至少 160px；900、hash 關：標籤可能被捨棄（同上，視 graph 欄寬），subject 至少 160px；900、hash 開：graph 欄寬時 subject 約 97px（#59 已記錄的下限），欄較窄時會更寬（例如 40px 欄約 129px），數值不當作判準，只要有可辨識前綴就算 `pass`，空白是 `fail`。從 `CTRL_BOUNDS` 抄下實際 graph 欄寬與 subject 寬度即可。文字 oracle 見第 4 節 |
+| T36 | `perf15`、全部 repo。1080×752、1080×720、900×600 三種尺寸，各分 hash 欄關（預設）與開（`btn-log-more` → `log-more:hash`，日誌 `[APP:LOG_VIEW: hash]`）兩種，各看前 50 列。先從任一 `commit-row:` 的 `w÷scale` 抄下列表寬，1080 應約 574、900 應約 433；偏差超過 10px 時寫下實際值並說明側欄狀態 | 每列的 subject 至少有 1 個可辨識字元；被截斷時結尾是省略號，hover 可看到完整 subject。只有右側詳情有 message、列上是空白，就是 `fail`。各狀態的預期：1080、hash 關：ref 標籤未被捨棄（寬度 ≥ min(自然寬度, 80)，短的 ref 如 `main` 會比 80px 窄）、subject 至少 160px，兩者同時可見；1080、hash 開：graph 欄寬約 68px 以上時標籤被捨棄；欄寬 64px 以下時標籤仍保留 80px、subject 160px（欄寬本身上限 72px），兩種都算對，subject 至少 160px；900、hash 關：標籤依設計一律捨棄（與 graph 欄寬無關，#59 的 `a_narrow_list_squeezes_date_then_author_after_the_gutter` 也是 `labels == 0`），subject 至少 160px；900、hash 開：graph 欄寬時 subject 約 97px（#59 已記錄的下限），欄較窄時會更寬（例如 40px 欄約 129px），數值不當作判準，只要有可辨識前綴就算 `pass`，空白是 `fail`。graph 欄與 subject 儲存格、ref 標籤都沒有 probe（`log-gutter:` 只是 debug selector，不進 `CTRL_BOUNDS`），所以寬度從截圖量：graph 欄寬也可用合併列的 `collapse:<key>` 的 x 減去同列 `commit-row:` 的 x 估算；subject 寬度與標籤有無量測後寫進 `screen_text`。文字 oracle 見第 4 節 |
 | T37 | `btn-repo-selector` 實際切換 100 次，涵蓋 15 個 repo（`pick-repo:<名稱>`，名稱從 `CTRL_BOUNDS` 讀） | 100 次都有新的選取日誌；最後停在指定的 repo；程序還在。耗時含觀察，不當回應時間 |
 | T38 | 沿用 [memory-measurement-protocol.md](memory-measurement-protocol.md) 的取樣時才記 RSS | 本規程不判記憶體。這格固定 `not-run`，原因寫「改走記憶體規程」 |
 | T39 | Cmd+Shift+W 關掉，再 Cmd+Shift+O 打開一個 repo | 關閉後出現 `[APP:WORKSPACE: state=closed generation=N]`；重開後出現 `[APP:WORKSPACE: state=open path=<該 repo> generation=N+1]`，接著 `[APP:READY_REPOS: 1]`；前後剪貼簿 SHA-256 相同 |
@@ -399,15 +399,15 @@ commit 預覽與鍵盤的格子，對應 #58 與 #57。除非該格另有說明�
 
 下面是程式閱讀的結果，不是操作者可以抄去充數的結果。這些格在受測 SHA 上若不是 `pass`，就是回歸，判 `fail`（Git 對而畫面錯判 `ui-defect`），不再有 `blocked-contract`。
 
-| PR 與 commit | 修了什麼 | 必須是 `pass` 的格 |
-|---|---|---|
-| #56 `bc81086` | paste ID 改成 `paste-<kind>:<ix>:<path>`，同路徑的兩列各有自己的 ID | T03、T18 |
-| #55 `f5247ab` | 刪除二進位／非 UTF-8 檔的 commit 標為未複製，貼上不再重播刪除 | T25、C-nonutf8 |
-| #57 `dcbc079` | 補上 `paste_err_*` 翻譯；檔案擋在貼上路徑時，預覽顯示「路徑不安全，不寫入」 | K05-key；C-reason 的不安全路徑列。任何拒絕訊息都不能露出 `paste_err_*` 等原始 key |
-| #58 `0a45ca1` | commit 預覽依重播計畫分組、標頭與收合、略過原因、rename 註記、空 commit 顯示、複製通知帶數量、鍵盤選取 | T22、T26、T28、B-notify、C-group、C-reason、K-space、K-fold、K-nav |
-| #59 `ed3d057` | 多 repo 記錄的訊息欄保留最小寬度，1080 視窗下 ref 標籤不再被擠掉 | T36、B43（1080） |
+| PR 與 commit | 修了什麼 | 必須是 `pass` 的格 | 預期 `ui-defect` 的格 |
+|---|---|---|---|
+| #56 `bc81086` | paste ID 改成 `paste-<kind>:<ix>:<path>`，同路徑的兩列各有自己的 ID | T03、T18 | 無 |
+| #55 `f5247ab` | 刪除二進位／非 UTF-8 檔的 commit 標為未複製，貼上不再重播刪除 | T25、C-nonutf8 | 無 |
+| #57 `dcbc079` | 補上 `paste_err_*` 翻譯；檔案擋在貼上路徑時，預覽顯示「路徑不安全，不寫入」 | K05-key；C-reason 的不安全路徑列。任何拒絕訊息都不能露出 `paste_err_*` 等原始 key | T31、C-blocked（畫面沒標出整筆拒絕，見第 6 節） |
+| #58 `0a45ca1` | commit 預覽依重播計畫分組、標頭與收合、略過原因、rename 註記、空 commit 顯示、複製通知帶數量、鍵盤選取 | T26、T28、B-notify、C-group、K-space、K-fold、K-nav；T22 與 C-reason 除去下欄所列的刪除列 | T22、C-reason 的刪除目的端不存在的檔案列（紅色區塊與詳情列矛盾）；K-reinclude（橫幅殘留） |
+| #59 `ed3d057` | 多 repo 記錄的訊息欄保留最小寬度，1080 視窗下 ref 標籤不再被擠掉 | T36、B43（1080） | 無 |
 
-T31、C-blocked、K-reinclude 例外：預期是 `ui-defect`，原因見第 6 節。K-reinclude 的橫幅殘留是確定的（`plan.error` 只設不清）；T22 與 C-reason 的刪除列紅色區塊矛盾也是預期的 `ui-defect`。
+「預期 `ui-defect`」欄的格不算回歸，原因見第 6 節；但若那一欄的格變成 `pass`，也要照實記錄，表示缺陷已被修掉。這些格仍讓閘門打開。
 
 2026-09-29 報告測的是 `main` 的 `167c10c`。那一輪的 PASS 不能抄進這份計分表。
 
