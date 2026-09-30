@@ -96,6 +96,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   - 嚴格預算傳遞:所有 `_with` 變體將取消權杖(`CancelToken`)、逾時與輸出上限傳遞至包含 `resolve_commit_with`、`head_with`、`cat-file -s` 在內的每個子程序。
   - 有界輸出捕捉與大小限制:目錄列表(`ls-tree`)stdout 上限 8 MiB、項目數上限 2,000;歷史紀錄(`log`)stdout 上限 16 MiB、筆數上限 10,000;blob 預覽上限 1 MiB。
   - 誠實截斷與防範假成功:嚴格 blob 與歷史查詢在輸出遭截斷時回傳 `GitError::OutputLimit`，絕不截斷後回傳殘缺成功(`Text`)或假完結(`has_more: false`)。`resolve_commit_with` 嚴格要求完整 OID (40/64 hex)，截斷時拒絕輸出。
+  - 二進位判斷與複製共用 `blob::classify`，內容任何位置有 NUL 即為二進位（不再只看前 8000 bytes）。
 
 
 ## 2. 線上格式的不變量(摘要)
@@ -133,7 +134,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 - 嚴格 UTF-8 解碼**保留**開頭的 BOM。
 - merge commit 的檔案集是**與每一個 parent 的 diff 的聯集**(依路徑去重)。
 - 刪除的檔案帶**刪除前的內容**;只有當沒有任何 parent 有這個檔案時,才輸出
-  `// This file has been deleted in this change`。
+  `// This file has been deleted in this change`。刪除前的版本若是二進位或非 UTF-8，不論大小都視為沒有可用內容，繼續找下一個 parent（找不到才輸出刪除標記）；只有超過上限的文字才依上限處理。
 - **git 來源**讀不到的檔案放 placeholder(`// Unable to read file content`)進 payload,但**不算已複製**,也**不佔檔案數上限**。
   **磁碟來源**(檔案模式)讀不到或非 UTF-8 的檔案不放 placeholder,只計數;超過大小上限的放 skipped marker。
 - 目錄 symlink 只在它本身就是被選取的輸入時才跟進,遞迴過程中不跟進(避免 pnpm / Bazel 的交叉連結爆量)。

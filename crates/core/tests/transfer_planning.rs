@@ -923,6 +923,81 @@ fn test_commit_deletions_read_every_parent_and_mark_binary() {
 	);
 }
 
+#[test]
+fn test_deleted_binary_over_cap_is_the_marker_like_gitsrc() {
+	let repo = TestRepo::new("deleted-binary-over-cap");
+	let mut big_bytes = vec![b'x'; 200_000];
+	big_bytes[100] = 0;
+	fs::write(repo.path().join("big.bin"), &big_bytes).unwrap();
+	repo.commit("add big binary");
+	repo.git(&["rm", "-q", "-f", "big.bin"]);
+	let del_rev = repo.commit("delete big binary");
+
+	let item1 = ExportItem {
+		root: repo.canonical_id(),
+		relative_path: "big.bin".to_string(),
+		source: SourceKind::Commit {
+			rev: del_rev.clone(),
+		},
+		change_type: Some(ChangeType::Deleted),
+	};
+	let sel1 = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		None,
+		vec![item1],
+	)
+	.unwrap();
+	let plan1 = plan_export(&sel1, &Settings::default(), Some(4096)).unwrap();
+	assert_eq!(
+		plan1.files[0].content.as_deref(),
+		Some(gitsrc::DELETED_FILE_MARKER)
+	);
+
+	let git_payload = gitsrc::collect_payload(
+		&repo.open(),
+		&GitSource::Commit(del_rev),
+		&[repo.path().to_path_buf()],
+		&Settings::default(),
+	)
+	.unwrap();
+	let gitsrc_big = git_payload
+		.files
+		.iter()
+		.find(|f| f.path == "big.bin")
+		.expect("big.bin in gitsrc files");
+	assert_eq!(plan1.files[0].content, gitsrc_big.content);
+
+	let mut b2_bytes = vec![b'y'; 2048];
+	b2_bytes[50] = 0;
+	fs::write(repo.path().join("b2.bin"), &b2_bytes).unwrap();
+	repo.git(&["add", "b2.bin"]);
+	repo.commit("add b2");
+	repo.git(&["rm", "-q", "-f", "b2.bin"]);
+
+	let item2 = ExportItem {
+		root: repo.canonical_id(),
+		relative_path: "b2.bin".to_string(),
+		source: SourceKind::Staged,
+		change_type: Some(ChangeType::Deleted),
+	};
+	let sel2 = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		None,
+		vec![item2],
+	)
+	.unwrap();
+	let tiny_settings = Settings {
+		max_file_size_kb: 1.0,
+		..Settings::default()
+	};
+	let plan2 = plan_export(&sel2, &tiny_settings, None).unwrap();
+	assert_eq!(
+		plan2.files[0].content.as_deref(),
+		Some(gitsrc::DELETED_FILE_MARKER)
+	);
+	assert_eq!(plan2.skipped_file_size_count, 0);
+}
+
 // ---------------------------------------------------------------------------
 // 15. Outside path and traversal rejected before IO
 // ---------------------------------------------------------------------------
@@ -2377,6 +2452,44 @@ fn test_deleted_sources_read_distinct_bases_and_match_legacy_working() {
 	src.git(&["rm", "-q", "g.txt"]);
 	let staged = payload_for(SourceKind::Staged, "g.txt");
 	assert!(staged.contains("g head body"), "{staged}");
+}
+
+#[test]
+fn test_deleted_gitlink_pre_deletion_spec_is_not_a_blob_is_malformed() {
+	let src = TestRepo::new("deleted-gitlink");
+	src.write("a.txt", "base\n");
+	let base = src.commit("base");
+
+	// Add gitlink pointing to an existing commit in the superproject's object store.
+	src.git(&[
+		"update-index",
+		"--add",
+		"--cacheinfo",
+		&format!("160000,{base},sub"),
+	]);
+	src.write("a.txt", "bump\n");
+	src.git(&["add", "a.txt"]);
+	src.git(&["commit", "-q", "-m", "add submodule"]);
+
+	// Delete gitlink from index: now it is deleted in Working view (HEAD has it, index/worktree does not)
+	src.git(&["update-index", "--force-remove", "sub"]);
+
+	let selection = ExportSelection::new(
+		vec![src.path().to_path_buf()],
+		None,
+		vec![deleted_item(&src, "sub", SourceKind::Working)],
+	)
+	.unwrap();
+
+	let err = plan_export(&selection, &Settings::default(), None).unwrap_err();
+	match err {
+		TransferError::Git(gitsrc::GitError::Malformed(msg)) => {
+			assert!(msg.contains("not a file"), "unexpected message: {msg}");
+		}
+		other => panic!(
+			"expected TransferError::Git(GitError::Malformed), got {other:?}"
+		),
+	}
 }
 
 #[test]
