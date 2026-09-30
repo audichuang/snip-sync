@@ -25,6 +25,7 @@ use crate::fsutil::{decode_utf8_or_skip, read_text_file};
 use crate::gitrun::{self, CancelToken, RunOptions, RunOutput};
 use crate::paths::{source_root_name, to_clipboard_path_from_roots};
 use crate::settings::Settings;
+use crate::workspace::RepoIdentity;
 
 /// The well-known OID of git's empty tree: the "parent" of a root commit.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -226,12 +227,12 @@ impl Git {
 		})
 	}
 
-	/// A repository whose top level is already known, without starting git.
-	/// `root` must be git's own spelling (a previous [`Git::root`] or
-	/// `rev-parse --show-toplevel`), not a user path: through a symlink
-	/// (macOS `/var` -> `/private/var`) it would not match what git reports.
-	pub fn at_known_root(root: PathBuf) -> Self {
-		Self { root }
+	/// 已知 identity 的 repository，不啟動 git；toplevel 應來自
+	/// `RepoIdentity::resolve`（git 自身拼法）；收 `&RepoIdentity` 讓呼叫端無法直接傳入使用者路徑（例如 macOS 的 `/var` 對 `/private/var`）。
+	pub fn at_known_root(known: &RepoIdentity) -> Self {
+		Self {
+			root: known.toplevel.clone(),
+		}
 	}
 
 	/// The repository top level; every git path is relative to it.
@@ -1268,7 +1269,10 @@ mod tests {
 		let again = Git::open(&r.path()).unwrap();
 		assert_eq!(VERSION_RUNS.with(std::cell::Cell::get), runs);
 		assert_eq!(again.root(), g.root());
-		let known = Git::at_known_root(g.root().to_path_buf());
+		let id =
+			crate::workspace::RepoIdentity::resolve(&g, &RunOptions::default())
+				.unwrap();
+		let known = Git::at_known_root(&id);
 		assert_eq!(known.root(), g.root());
 		assert_eq!(known.head().unwrap(), g.head().unwrap());
 	}
@@ -2214,24 +2218,31 @@ mod tests {
 		);
 	}
 
-	// macOS temp dirs live under the `/var` -> `/private/var` symlink, and git
-	// reports the resolved toplevel; a root spelled through the link must
-	// still relativize.
-	#[cfg(unix)]
+	// macOS temp dirs live under the `/var` -> `/private/var` symlink, and
+	// Windows can spell paths with `..` or 8.3 short names; git reports the
+	// resolved toplevel. A root spelled differently from git's own spelling
+	// must still relativize (the bug type fixed in 224971b).
 	#[test]
 	fn payload_relativizes_against_a_root_spelled_through_a_symlink() {
 		let r = Repo::new();
 		r.write("sub/a.txt", b"one");
 		r.commit("init");
 		r.write("sub/a.txt", b"two");
+		#[cfg(unix)]
 		let outer = tempfile::tempdir().unwrap();
-		let link = outer.path().join("link");
-		std::os::unix::fs::symlink(r.path(), &link).unwrap();
-		let git = Git::open(&link.join("sub")).unwrap();
+		#[cfg(unix)]
+		let spelled = {
+			let link = outer.path().join("link");
+			std::os::unix::fs::symlink(r.path(), &link).unwrap();
+			link
+		};
+		#[cfg(not(unix))]
+		let spelled = r.path().join("sub").join("..");
+		let git = Git::open(&spelled.join("sub")).unwrap();
 		let got = collect_payload(
 			&git,
 			&GitSource::Working,
-			&[link.join("sub")],
+			&[spelled.join("sub")],
 			&Settings::default(),
 		)
 		.unwrap();

@@ -18,6 +18,7 @@ use snip_core::browser::{self, BlobText, CommitSummary, TreeEntry, TreeKind};
 use snip_core::gitrun::RunOptions;
 use snip_core::gitsrc::{self, Git, GitSource};
 use snip_core::graph::{GraphCheckpoint, GraphLayout, MAX_SHA_LEN};
+use snip_core::workspace::RepoIdentity;
 
 /// Most commits of one multi-selection whose changed files are listed
 /// (one listing each).
@@ -207,6 +208,19 @@ fn clip_utf8(mut s: String, max: usize) -> String {
 		s.push('…');
 	}
 	s.into_boxed_str().into_string()
+}
+
+/// A listed repository's Git: a resolved identity starts no process; an
+/// entry discovery could not identify is opened from its listed root.
+fn known_or_open(
+	known: Option<&RepoIdentity>,
+	root: &std::path::Path,
+	opts: &RunOptions,
+) -> Result<Git, String> {
+	match known {
+		Some(id) => Ok(Git::at_known_root(id)),
+		None => Git::open_with(root, opts).map_err(|e| e.to_string()),
+	}
 }
 
 fn read_commit_details(
@@ -1350,6 +1364,7 @@ impl WorkbenchModel {
 			.map(|w| (w, self.refs.clone(), self.head_sha.clone()));
 		let snapshot = (self.refs.clone(), self.head_sha.clone());
 		let want_email = matches!(load, PageLoad::Replace(0));
+		let repo_identity = self.identity_for(&repo_root);
 
 		self.spawn_owned(
 			cx,
@@ -1362,8 +1377,12 @@ impl WorkbenchModel {
 						let Some(query) = &search else {
 							let email = want_email
 								.then(|| {
-									let git =
-										Git::at_known_root(repo_root.clone());
+									let git = known_or_open(
+										repo_identity.as_ref(),
+										&repo_root,
+										&opts,
+									)
+									.ok()?;
 									read_user_email(&git, &opts)
 								})
 								.flatten();
@@ -2096,6 +2115,7 @@ impl WorkbenchModel {
 			return;
 		}
 		let cancel = arm_cancel(&mut self.details_cancel);
+		let identity = self.identity_for(&root);
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2107,11 +2127,9 @@ impl WorkbenchModel {
 				let res = bg
 					.spawn(async move {
 						let opts = crate::interactive_read_opts(cancel);
-						read_commit_details(
-							&Git::at_known_root(root),
-							&sha,
-							&opts,
-						)
+						let git =
+							known_or_open(identity.as_ref(), &root, &opts)?;
+						read_commit_details(&git, &sha, &opts)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2154,13 +2172,14 @@ impl WorkbenchModel {
 		if !self.log_selection_expanded || !self.selection_details.is_empty() {
 			return;
 		}
-		let reads: Vec<(PathBuf, String, String)> = self
+		let reads: Vec<(PathBuf, Option<RepoIdentity>, String, String)> = self
 			.log_selected
 			.iter()
 			.take(MAX_SELECTION_DETAILS)
 			.filter_map(|id| {
 				let (root, sha) = self.log_root_for(id)?;
-				Some((root, sha, id.clone()))
+				let identity = self.identity_for(&root);
+				Some((root, identity, sha, id.clone()))
 			})
 			.collect();
 		self.details_generation = self.details_generation.wrapping_add(1);
@@ -2183,8 +2202,13 @@ impl WorkbenchModel {
 						// A failed read keeps that commit's row fields.
 						reads
 							.into_iter()
-							.filter_map(|(root, sha, id)| {
-								let git = Git::at_known_root(root);
+							.filter_map(|(root, identity, sha, id)| {
+								let git = known_or_open(
+									identity.as_ref(),
+									&root,
+									&opts,
+								)
+								.ok()?;
 								let mut d =
 									read_commit_details(&git, &sha, &opts)
 										.ok()?;
@@ -2377,6 +2401,7 @@ impl WorkbenchModel {
 			return;
 		}
 		let cancel = arm_cancel(&mut self.preview_cancel);
+		let identity = self.identity_for(&root);
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2388,7 +2413,8 @@ impl WorkbenchModel {
 				let res = bg
 					.spawn(async move {
 						let listing = crate::interactive_read_opts(cancel);
-						let git = Git::at_known_root(root);
+						let git =
+							known_or_open(identity.as_ref(), &root, &listing)?;
 						// Lazy: each listing is folded in and dropped
 						// before the next one is read.
 						union_changed_files(shas.into_iter().map(|sha| {
@@ -2530,6 +2556,7 @@ impl WorkbenchModel {
 			return;
 		}
 		let cancel = arm_cancel(&mut self.preview_cancel);
+		let identity = self.identity_for(&root);
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2551,8 +2578,9 @@ impl WorkbenchModel {
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						// The repository's root is known: no probe processes.
-						let git = Git::at_known_root(root);
+						// 有 identity 時不起 probe 程序；沒有則從列出的 root 開啟。
+						let git =
+							known_or_open(identity.as_ref(), &root, &listing)?;
 						let (files, gitlinks) =
 							gitsrc::list_changed_paths_and_gitlinks_with(
 								&git, &source, &listing,
@@ -2709,6 +2737,7 @@ impl WorkbenchModel {
 		let path = path.to_string();
 		let for_bg = path.clone();
 		let cancel = arm_cancel(&mut self.preview_cancel);
+		let identity = self.identity_for(&root);
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2725,14 +2754,17 @@ impl WorkbenchModel {
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						let git = Git::at_known_root(root);
-						read_preview(
-							&git,
-							&source,
-							&for_bg,
-							change,
-							parents.as_deref(),
-							&opts,
+						known_or_open(identity.as_ref(), &root, &opts).and_then(
+							|git| {
+								read_preview(
+									&git,
+									&source,
+									&for_bg,
+									change,
+									parents.as_deref(),
+									&opts,
+								)
+							},
 						)
 					})
 					.await;
@@ -3301,6 +3333,14 @@ impl WorkbenchModel {
 			None => self.log_root()?,
 		};
 		Some((root, sha.to_string()))
+	}
+
+	/// The identity discovery resolved for a listed root.
+	fn identity_for(&self, root: &std::path::Path) -> Option<RepoIdentity> {
+		self.repos
+			.iter()
+			.find(|r| r.root.as_path() == root)
+			.and_then(|r| r.identity.clone())
 	}
 
 	pub fn log_repo_name(&self, root: &std::path::Path) -> String {
@@ -4768,5 +4808,45 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	#[test]
+	fn known_or_open_uses_the_identity_and_opens_an_unknown_root() {
+		let t = tempfile::tempdir().unwrap();
+		let r = t.path().join("r");
+		std::fs::create_dir(&r).unwrap();
+		crate::paste::tests::git_init(&r);
+		let id = RepoIdentity::resolve(
+			&Git::open(&r).unwrap(),
+			&RunOptions::default(),
+		)
+		.unwrap();
+		#[cfg(unix)]
+		let alias = {
+			let link = t.path().join("link");
+			std::os::unix::fs::symlink(&r, &link).unwrap();
+			link
+		};
+		#[cfg(not(unix))]
+		let alias = {
+			std::fs::create_dir(r.join("x")).unwrap();
+			r.join("x").join("..")
+		};
+		assert_eq!(
+			known_or_open(None, &alias, &RunOptions::default())
+				.unwrap()
+				.root(),
+			id.toplevel
+		);
+		assert_eq!(
+			known_or_open(
+				Some(&id),
+				std::path::Path::new("/nonexistent"),
+				&RunOptions::default(),
+			)
+			.unwrap()
+			.root(),
+			id.toplevel
+		);
 	}
 }

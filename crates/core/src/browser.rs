@@ -2036,7 +2036,7 @@ mod tests {
 		fs::write(root.join("new.txt"), "fresh\n").unwrap();
 		run(root, &["add", "-A"]);
 		let tip = commit(root, "change");
-		let git = Git::at_known_root(root.to_path_buf());
+		let git = Git::open(root).unwrap();
 		let opts = RunOptions::default();
 		for source in [
 			GitSource::Commit(tip.clone()),
