@@ -27,6 +27,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -529,6 +530,17 @@ class NativeBenchError(Exception):
 
 
 # ---------------------------------------------------------------- pure helpers (tested)
+
+
+def e2e_scaled(seconds: float) -> float:
+    """A deadline stretched by SNIP_E2E_TIMEOUT_SCALE, as snip_native_e2e::scaled does:
+    lavapipe renders on the CPU, so a loaded machine makes a healthy run miss fixed waits.
+    A missing, unparsable, non-finite or below-1 scale is 1."""
+    try:
+        scale = float(os.environ.get("SNIP_E2E_TIMEOUT_SCALE", "1"))
+    except ValueError:
+        scale = 1.0
+    return seconds * (scale if math.isfinite(scale) and scale >= 1.0 else 1.0)
 
 
 def lavapipe_icd(icd_dir: str = ICD_DIR, machine: str | None = None) -> str:
@@ -1242,7 +1254,7 @@ class NativeSession:
         self.owned.append(identity(self.xvfb.pid))
         # Under load Xvfb (xkbcomp, display-number probing) can take well over 15 s; giving up closes
         # the pipe and Xvfb then dies with "Cannot write display number to fd N".
-        ready, _, _ = select.select([read_fd], [], [], 60.0)
+        ready, _, _ = select.select([read_fd], [], [], e2e_scaled(60.0))
         display = os.read(read_fd, 64).decode().strip() if ready else ""
         self._close_fd(read_fd)
         if not display.isdigit():

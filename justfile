@@ -14,10 +14,22 @@ lint:
 fmt:
 	cargo fmt --all
 
-# Everything CI runs that Linux can run (see .github/workflows/ci.yml for the rest).
-# The Python harness tests are light, so they overlap the Rust checks; their output is
-# held back and printed after, so a failure is not buried in cargo's.
-preflight: preflight-workflows
+# On Linux this is preflight-linux. Elsewhere this OS's checks run on the host, then the
+# Linux jobs run in a container (scripts/linux_container.sh), native acceptance included.
+# Everything CI runs that a machine can run (see .github/workflows/ci.yml for the rest).
+preflight:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	if [ "$(uname -s)" = Linux ]; then
+		exec {{just_executable()}} native_python="{{native_python}}" preflight-linux
+	fi
+	{{just_executable()}} preflight-host
+	scripts/linux_container.sh just preflight-linux
+
+# The Python harness tests are light, so they overlap the Rust checks; their output
+# is held back and printed after, so a failure is not buried in cargo's.
+# CI's Linux jobs, run directly (Linux) or through scripts/linux_container.sh.
+preflight-linux: preflight-workflows
 	#!/usr/bin/env bash
 	set -uo pipefail
 	log="$(mktemp)"
@@ -28,7 +40,8 @@ preflight: preflight-workflows
 	{{just_executable()}} preflight-rust || rc=$?
 	wait "$harness" || { rc=$?; cat "$log"; }
 	[ "$rc" -eq 0 ] || exit "$rc"
-	{{just_executable()}} native_python="{{native_python}}" native-acceptance
+	# Extra acceptance flags, e.g. less parallelism where the machine is small.
+	{{just_executable()}} native_python="{{native_python}}" native-acceptance ${SNIP_ACCEPTANCE_ARGS:-}
 
 # Same as CI's Lint Workflows job; needs actionlint and shellcheck on PATH.
 preflight-workflows:
@@ -42,6 +55,13 @@ preflight-rust:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	# Same as CI's Linux Test job: one run, clipboard tests on a private display.
 	RUSTFLAGS="-D warnings" xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+
+# CI's Lint and Test jobs on macOS and Windows: no Xvfb, the host's own clipboard.
+preflight-host:
+	cargo fmt --all --check
+	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
 
 # Python stdlib memory harness contracts and workload generator tests.
 preflight-harness:

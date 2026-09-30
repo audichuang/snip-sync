@@ -224,6 +224,32 @@ jobs:
               shell: bash
               run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
 
+    # The image `just preflight` runs CI's Linux jobs in on macOS (scripts/linux_container.sh).
+    # Apple's container cannot run in a hosted macOS VM, so the same Dockerfile is built
+    # here (x86_64; the Mac builds arm64) and the harness runs in it as it does there:
+    # unprivileged, with the checkout read-only.
+    linux-container:
+        name: Linux Container Image
+        runs-on: ubuntu-24.04
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v6
+            - name: Lint the container scripts
+              run: shellcheck scripts/linux_container.sh scripts/linux-container/entrypoint.sh
+            - name: Build the image
+              run: docker build -t snip-preflight scripts/linux-container
+            - name: Harness tests in the image
+              # target/ is a volume, as on the Mac: a harness test lists the e2e tests through
+              # cargo. Its mount point is made first, since the checkout is mounted read-only.
+              run: |
+                  mkdir -p target
+                  docker run --rm --init --shm-size=2g \
+                      -v "$PWD:$PWD:ro" -v snip-target:"$PWD/target" -w "$PWD" \
+                      snip-preflight just preflight-harness
+            - name: Checkout left clean
+              shell: bash
+              run: git status --porcelain && git diff --exit-code && test -z "$(git status --porcelain)"
+
     # Independent release-profile real-app gates. Each driver owns private
     # Xvfb, HOME and D-Bus; no shared DISPLAY or guessed historical binary.
     # Build once; the gates below run in parallel against this exact binary
@@ -615,7 +641,7 @@ jobs:
     gate:
         name: CI gate
         if: always()
-        needs: [actionlint, format, lint-rust, test, harness, native-acceptance, native-candidate-artifacts]
+        needs: [actionlint, format, lint-rust, test, harness, linux-container, native-acceptance, native-candidate-artifacts]
         runs-on: ubuntu-24.04
         timeout-minutes: 5
         steps:
