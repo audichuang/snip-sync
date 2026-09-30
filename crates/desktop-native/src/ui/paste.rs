@@ -1,6 +1,7 @@
 //! Paste preview in the editor area.
 
 use super::*;
+use crate::paste::{commit_header_id, PasteCounts, PlannedOp, RowControl};
 
 impl WorkbenchModel {
 	// ───────────────────────── paste ─────────────────────────
@@ -70,7 +71,7 @@ impl WorkbenchModel {
 	) -> Div {
 		let loc = self.locale;
 		let log = &self.probes;
-		let loading = self.paste_loading;
+		let loading = self.paste.is_loading();
 		let can_apply = !applying && executable && !loading;
 		div()
 			.flex()
@@ -211,9 +212,9 @@ impl WorkbenchModel {
 		else {
 			return div().id("paste-commit:none");
 		};
-		let id = format!("paste-commit:{c}");
+		let id = commit_header_id(c);
 		let (subject, author, date) = commit_header_labels(commit, loc);
-		let (files, skipped) = commit_counts(plan, c);
+		let (files, skipped) = plan.commit_counts(c);
 		let folded = plan.collapsed_commits.contains(&c);
 		let counts = if commit.files.is_empty() {
 			t("commit_empty_note", loc).to_string()
@@ -298,7 +299,7 @@ impl WorkbenchModel {
 			existing,
 			deletes,
 			skips,
-		} = paste_counts(plan);
+		} = plan.counts();
 		let commit_count = plan
 			.commit_preview
 			.as_ref()
@@ -309,7 +310,7 @@ impl WorkbenchModel {
 		let mapping_ready = plan.mapping_ready();
 		let selected = plan.items.get(plan.selected_item_idx);
 
-		let loading = self.paste_loading;
+		let loading = self.paste.is_loading();
 		let action_bar = self.paste_action_bar(
 			dest,
 			applying,
@@ -427,9 +428,9 @@ impl WorkbenchModel {
 			let (_, name_color, _) = paste_op(item);
 			let is_sel = ix == plan.selected_item_idx;
 			let path = item.path.clone();
-			let row_id = crate::paste::control_id("row", ix, &path);
-			let inc_id = crate::paste::control_id("include", ix, &path);
-			let ow_id = crate::paste::control_id("overwrite", ix, &path);
+			let row_id = RowControl::Row.id(ix, &path);
+			let inc_id = RowControl::Include.id(ix, &path);
+			let ow_id = RowControl::Overwrite.id(ix, &path);
 			let can_overwrite = item.overwritable();
 			let by_commit = item.commit.is_some();
 			let ow_on = item.overwrite_allowed;
@@ -497,7 +498,10 @@ impl WorkbenchModel {
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
 						.child(
-							if item.is_delete || item.action_label == "SKIP" {
+							if matches!(
+								item.op,
+								PlannedOp::Delete | PlannedOp::Skip(_)
+							) {
 								String::new()
 							} else {
 								format!("{} B", item.bytes)
@@ -791,7 +795,7 @@ impl WorkbenchModel {
 						),
 				)
 			})
-			.when(selected.is_some_and(|i| i.is_delete), |d| {
+			.when(selected.is_some_and(|i| i.is_delete()), |d| {
 				d.child(
 					div()
 						.p(px(12.))
@@ -799,7 +803,7 @@ impl WorkbenchModel {
 						.child(t("reason_delete", loc)),
 				)
 			})
-			.when(selected.is_some_and(|i| !i.is_delete), |d| {
+			.when(selected.is_some_and(|i| !i.is_delete()), |d| {
 				d.child(self.render_code_view(true, cx))
 			})
 			.into_any_element()

@@ -31,6 +31,8 @@ use crate::i18n::Msg;
 use crate::reader::{Preview, PreviewSource};
 use crate::syntax::Language;
 
+pub mod preview;
+
 /// Shared retained preview tier: UI, one active paste input, one latest
 /// captured request, and one result mailbox. Builder scratch is temporary.
 pub const MAX_RETAINED_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
@@ -403,6 +405,13 @@ pub struct PasteApplyWorker {
 	plan: Option<PastePreviewPlan>,
 	pool: Arc<Mutex<PastePending>>,
 }
+impl std::fmt::Debug for PasteApplyWorker {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PasteApplyWorker")
+			.field("plan", &self.plan)
+			.finish()
+	}
+}
 impl PasteApplyWorker {
 	pub fn new(
 		plan: &PastePreviewPlan,
@@ -433,6 +442,58 @@ impl Drop for PasteApplyWorker {
 	}
 }
 
+/// What the plan does to one row (spec 3.2: 新增 / 覆寫 / 刪除 / 跳過).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlannedOp {
+	Create,
+	Overwrite,
+	Delete,
+	Skip(SkipCause),
+}
+
+/// Why a commit file is listed but never written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipCause {
+	Binary,
+	NonUtf8,
+	NonUtf8Path,
+	UnsupportedType,
+	Unreadable,
+	UnsafePath,
+	NonUtf8Target,
+	Other,
+}
+
+/// What Apply would do to a row under the user's current choices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowAction {
+	/// Unticked. A commit replay refuses the whole Apply instead of dropping it.
+	Excluded {
+		by_commit: bool,
+	},
+	/// Commit replay only: listed, never written.
+	Skip(SkipCause),
+	Delete,
+	/// Delete of a destination file that is already gone.
+	DeleteMissing,
+	Create,
+	Overwrite,
+	/// Commit replay: an existing file whose overwrite is not allowed yet; blocks Apply.
+	OverwritePending,
+	/// File restore: an existing file kept because overwrite is off.
+	KeepExisting,
+}
+
+impl RowAction {
+	/// Not written by Apply: a commit header's "skipped" count.
+	pub fn is_not_written(self) -> bool {
+		matches!(
+			self,
+			Self::Skip(_) | Self::DeleteMissing | Self::KeepExisting
+		)
+	}
+}
+
 #[derive(Debug, Clone)]
 pub struct PasteItem {
 	pub path: String,
@@ -440,8 +501,7 @@ pub struct PasteItem {
 	pub dest_root_name: String,
 	pub dest_path: PathBuf,
 	pub dest_exists: bool,
-	pub is_delete: bool,
-	pub action_label: &'static str,
+	pub op: PlannedOp,
 	pub overwrite_allowed: bool, // CRITICAL: OFF by default!
 	pub selected: bool,          // CRITICAL: whether this item is opted-in
 	/// Shared with the plan's detail view; never copied per render.
@@ -452,18 +512,50 @@ pub struct PasteItem {
 	/// Commit replay only: the commit (index into the payload) this row
 	/// belongs to. `None` for file restores.
 	pub commit: Option<usize>,
-	/// i18n key saying why an `action_label == "SKIP"` row is not written.
-	pub skip_reason: Option<&'static str>,
 	/// Commit replay only: the other half of a rename ("→ new" on the
 	/// deleted old path, "← old" on the written new path).
 	pub rename_note: Option<String>,
 }
 
 impl PasteItem {
+	pub fn is_delete(&self) -> bool {
+		matches!(self.op, PlannedOp::Delete)
+	}
+
 	/// An existing destination file that the user may choose to overwrite.
 	/// A skipped row is never written, so it never asks.
 	pub fn overwritable(&self) -> bool {
-		self.dest_exists && !self.is_delete && self.action_label != "SKIP"
+		self.dest_exists
+			&& matches!(self.op, PlannedOp::Create | PlannedOp::Overwrite)
+	}
+
+	pub fn action(&self) -> RowAction {
+		if !self.selected {
+			return RowAction::Excluded {
+				by_commit: self.commit.is_some(),
+			};
+		}
+		match self.op {
+			PlannedOp::Skip(c) => RowAction::Skip(c),
+			PlannedOp::Delete => {
+				if self.dest_exists {
+					RowAction::Delete
+				} else {
+					RowAction::DeleteMissing
+				}
+			}
+			PlannedOp::Create | PlannedOp::Overwrite => {
+				if !self.dest_exists {
+					RowAction::Create
+				} else if self.overwrite_allowed {
+					RowAction::Overwrite
+				} else if self.commit.is_some() {
+					RowAction::OverwritePending
+				} else {
+					RowAction::KeepExisting
+				}
+			}
+		}
 	}
 
 	fn retained_heap_bytes(&self) -> usize {
@@ -604,29 +696,59 @@ fn canonical_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
 	out
 }
 
-/// Element and probe id of a paste row control: `paste-<kind>:<ix>:<path>`.
-/// `ix` is the item's index in the plan, which stays unique when several
-/// items share one relative path (the same file under two destination roots,
-/// or modified by two commits); GPUI merges the state of equal ids, so a
-/// path-only id left the second row's controls dead. The path stays last so
-/// drivers can recover it by splitting off `paste-<kind>:<ix>:`.
-pub fn control_id(kind: &str, ix: usize, path: &str) -> String {
-	format!("paste-{kind}:{ix}:{path}")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowControl {
+	Row,
+	Include,
+	Overwrite,
 }
 
-/// The i18n key explaining why a commit file is not written.
-fn skip_reason_key(file: &FilePlan) -> &'static str {
+impl RowControl {
+	/// Element and probe id of a paste row control: `paste-<kind>:<ix>:<path>`.
+	/// `ix` is the item's index in the plan, which stays unique when several
+	/// items share one relative path (the same file under two destination roots,
+	/// or modified by two commits); GPUI merges the state of equal ids, so a
+	/// path-only id left the second row's controls dead. The path stays last so
+	/// drivers can recover it by splitting off `paste-<kind>:<ix>:`.
+	pub fn id(self, ix: usize, path: &str) -> String {
+		let kind = match self {
+			Self::Row => "row",
+			Self::Include => "include",
+			Self::Overwrite => "overwrite",
+		};
+		format!("paste-{kind}:{ix}:{path}")
+	}
+}
+
+/// Element and probe id of a commit header.
+pub fn commit_header_id(c: usize) -> String {
+	format!("paste-commit:{c}")
+}
+
+/// The cause explaining why a commit file is not written.
+fn skip_cause(file: &FilePlan) -> SkipCause {
 	match (file.not_copied, file.skip_reason) {
-		(Some(NotCopiedReason::Binary), _) => "reason_nc_binary",
-		(Some(NotCopiedReason::NonUtf8), _) => "reason_nc_non_utf8",
-		(Some(NotCopiedReason::NonUtf8Path), _) => "reason_nc_non_utf8_path",
-		(Some(NotCopiedReason::UnsupportedType), _) => "reason_nc_unsupported",
-		(Some(NotCopiedReason::Unreadable), _) => "reason_nc_unreadable",
-		(None, Some(ReplaySkipReason::UnsafePath)) => "reason_skip_unsafe_path",
-		(None, Some(ReplaySkipReason::NonUtf8Target)) => {
-			"reason_skip_non_utf8_target"
+		(Some(NotCopiedReason::Binary), _) => SkipCause::Binary,
+		(Some(NotCopiedReason::NonUtf8), _) => SkipCause::NonUtf8,
+		(Some(NotCopiedReason::NonUtf8Path), _) => SkipCause::NonUtf8Path,
+		(Some(NotCopiedReason::UnsupportedType), _) => {
+			SkipCause::UnsupportedType
 		}
-		_ => "reason_skip_generic",
+		(Some(NotCopiedReason::Unreadable), _) => SkipCause::Unreadable,
+		(None, Some(ReplaySkipReason::UnsafePath)) => SkipCause::UnsafePath,
+		(None, Some(ReplaySkipReason::NonUtf8Target)) => {
+			SkipCause::NonUtf8Target
+		}
+		_ => SkipCause::Other,
+	}
+}
+
+fn header_label(op: PlannedOp) -> &'static str {
+	match op {
+		PlannedOp::Create => "CREATE",
+		PlannedOp::Overwrite => "OVERWRITE",
+		PlannedOp::Delete => "DELETE",
+		PlannedOp::Skip(_) => "SKIP",
 	}
 }
 
@@ -660,13 +782,22 @@ fn stale_msg(err: TransferError) -> Msg {
 	}
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PasteCounts {
+	pub creates: usize,
+	pub overwrites: usize,
+	pub existing: usize,
+	pub deletes: usize,
+	pub skips: usize,
+}
+
 impl PastePreviewPlan {
 	pub fn detail_preview(&self) -> Option<Preview> {
 		self.detail_at(self.selected_item_idx)
 	}
 
 	pub(crate) fn detail_at(&self, idx: usize) -> Option<Preview> {
-		self.items.get(idx).filter(|i| !i.is_delete).map(|i| {
+		self.items.get(idx).filter(|i| !i.is_delete()).map(|i| {
 			Preview::new(
 				PreviewSource::PasteItem,
 				Some(i.path.clone()),
@@ -675,68 +806,6 @@ impl PastePreviewPlan {
 				Language::from_path_or_ext(&i.path, false),
 			)
 		})
-	}
-
-	/// Read-only navigation cannot revoke an admitted plan or change its
-	/// selection/busy state on refusal. Keep the previous matching detail.
-	pub fn select_detail(
-		&mut self,
-		idx: usize,
-		ordinary: Option<&Preview>,
-		detail: &mut Option<Preview>,
-	) -> Result<(), Msg> {
-		self.select_detail_with_limit(
-			idx,
-			ordinary,
-			detail,
-			MAX_RETAINED_PREVIEW_BYTES,
-		)
-	}
-
-	fn select_detail_with_limit(
-		&mut self,
-		idx: usize,
-		ordinary: Option<&Preview>,
-		detail: &mut Option<Preview>,
-		limit: usize,
-	) -> Result<(), Msg> {
-		if idx >= self.items.len() {
-			return Err(Msg::new("paste_err_nothing", []));
-		}
-		let candidate = self.detail_at(idx);
-		admit_preview_state_with_limit(
-			ordinary,
-			Some(self),
-			candidate.as_ref(),
-			limit,
-		)?;
-		self.selected_item_idx = idx;
-		*detail = candidate;
-		Ok(())
-	}
-
-	/// Consume a candidate so rejection cannot return an armed partial plan.
-	/// Ordinary reader and selected detail coexist and share the same cap.
-	pub fn admit_with_preview(
-		self,
-		ordinary: Option<&Preview>,
-	) -> Result<(Self, Option<Preview>), Msg> {
-		self.admit_with_preview_limit(ordinary, MAX_RETAINED_PREVIEW_BYTES)
-	}
-
-	fn admit_with_preview_limit(
-		self,
-		ordinary: Option<&Preview>,
-		limit: usize,
-	) -> Result<(Self, Option<Preview>), Msg> {
-		let detail = self.detail_preview();
-		admit_preview_state_with_limit(
-			ordinary,
-			Some(&self),
-			detail.as_ref(),
-			limit,
-		)?;
-		Ok((self, detail))
 	}
 
 	/// Conservative retained UI bytes. Arc referents are charged in full,
@@ -970,14 +1039,15 @@ impl PastePreviewPlan {
 			for (f_idx, (file, src)) in
 				commit.files.iter().zip(&record.files).enumerate()
 			{
-				let action_label = match file.action {
-					ReplayAction::Delete => "DELETE",
-					ReplayAction::Write if file.existed => "OVERWRITE",
-					ReplayAction::Write => "CREATE",
-					ReplayAction::Skip => "SKIP",
+				let op = match file.action {
+					ReplayAction::Delete => PlannedOp::Delete,
+					ReplayAction::Write if file.existed => PlannedOp::Overwrite,
+					ReplayAction::Write => PlannedOp::Create,
+					ReplayAction::Skip => PlannedOp::Skip(skip_cause(file)),
 				};
 				let body = src.content.as_deref().unwrap_or_default();
-				let head = |label: &str| {
+				let head = |op: PlannedOp| {
+					let label = header_label(op);
 					format!(
 						"commit: {}\nauthor: {} <{}>\ndate: {}\naction: {label}\n",
 						commit.message.trim_end(),
@@ -993,8 +1063,7 @@ impl PastePreviewPlan {
 				let row = |path: &str,
 				           dest_path: PathBuf,
 				           existed: bool,
-				           delete: bool,
-				           label: &'static str,
+				           op: PlannedOp,
 				           text: String,
 				           body_len: usize,
 				           lines: usize,
@@ -1005,8 +1074,7 @@ impl PastePreviewPlan {
 						dest_root_name: dest_name.clone(),
 						dest_path,
 						dest_exists: existed,
-						is_delete: delete,
-						action_label: label,
+						op,
 						overwrite_allowed: false,
 						selected: true,
 						content: Arc::from(text),
@@ -1014,8 +1082,6 @@ impl PastePreviewPlan {
 						lines,
 						op_index: c_idx * 1000 + f_idx,
 						commit: Some(c_idx),
-						skip_reason: (label == "SKIP")
-							.then(|| skip_reason_key(file)),
 						rename_note,
 					}
 				};
@@ -1033,11 +1099,10 @@ impl PastePreviewPlan {
 						old,
 						old_abs.clone(),
 						old_abs.exists(),
-						true,
-						"DELETE",
+						PlannedOp::Delete,
 						format!(
 							"{}path: {old}\nrenamed to: {}\n",
-							head("DELETE"),
+							head(PlannedOp::Delete),
 							file.path
 						),
 						0,
@@ -1049,13 +1114,8 @@ impl PastePreviewPlan {
 					&file.path,
 					dest_path,
 					file.existed,
-					file.action == ReplayAction::Delete,
-					action_label,
-					format!(
-						"{}path: {}\n\n{body}",
-						head(action_label),
-						file.path
-					),
+					op,
+					format!("{}path: {}\n\n{body}", head(op), file.path),
 					body.len(),
 					body.lines().count(),
 					file.old_path
@@ -1279,8 +1339,11 @@ impl PastePreviewPlan {
 				dest_root_name: root_name(&dest_root),
 				dest_path: op.absolute_path.clone(),
 				dest_exists: op.existed,
-				is_delete: false,
-				action_label: if op.existed { "OVERWRITE" } else { "CREATE" },
+				op: if op.existed {
+					PlannedOp::Overwrite
+				} else {
+					PlannedOp::Create
+				},
 				overwrite_allowed: false,
 				selected: true,
 				content,
@@ -1289,7 +1352,6 @@ impl PastePreviewPlan {
 				op_index: op_idx,
 				dest_root,
 				commit: None,
-				skip_reason: None,
 				rename_note: None,
 			};
 			items_heap = items_heap.saturating_add(item.retained_heap_bytes());
@@ -1311,8 +1373,7 @@ impl PastePreviewPlan {
 				dest_root_name: root_name(&dest_root),
 				dest_path: op.absolute_path.clone(),
 				dest_exists: op.absolute_path.exists(),
-				is_delete: true,
-				action_label: "DELETE",
+				op: PlannedOp::Delete,
 				overwrite_allowed: true,
 				selected: true,
 				content: Arc::from(""),
@@ -1321,7 +1382,6 @@ impl PastePreviewPlan {
 				op_index: op_idx,
 				dest_root,
 				commit: None,
-				skip_reason: None,
 				rename_note: None,
 			};
 			items_heap = items_heap.saturating_add(item.retained_heap_bytes());
@@ -1352,32 +1412,29 @@ impl PastePreviewPlan {
 
 	/// Up / Down follow the rows on screen (the change tree's order).
 	pub fn select_prev(&mut self) {
-		self.step_selection(false);
+		self.selected_item_idx = self.step_target(false);
 	}
 
 	pub fn select_next(&mut self) {
-		self.step_selection(true);
+		self.selected_item_idx = self.step_target(true);
 	}
 
-	fn step_selection(&mut self, forward: bool) {
+	pub fn step_target(&self, forward: bool) -> usize {
 		let order = self.display_order();
 		let Some(pos) = order.iter().position(|&i| i == self.selected_item_idx)
 		else {
 			// The selected row is folded away: re-enter at the near end.
 			let edge = if forward { order.first() } else { order.last() };
-			if let Some(&ix) = edge {
-				self.selected_item_idx = ix;
-			}
-			return;
+			return edge.copied().unwrap_or(self.selected_item_idx);
 		};
 		let next = if forward {
 			pos.checked_add(1)
 		} else {
 			pos.checked_sub(1)
 		};
-		if let Some(&ix) = next.and_then(|n| order.get(n)) {
-			self.selected_item_idx = ix;
-		}
+		next.and_then(|n| order.get(n))
+			.copied()
+			.unwrap_or(self.selected_item_idx)
 	}
 
 	/// Item indices in change-tree order: by destination root, then
@@ -1468,29 +1525,65 @@ impl PastePreviewPlan {
 	}
 
 	/// Folds or unfolds one commit's file rows.
-	/// When the fold hides the selected row, the selection moves to the next
-	/// visible row (the previous one at the end), so Space and the detail
-	/// pane never act on a row the user cannot see.
-	pub fn toggle_commit_collapsed(&mut self, c: usize) {
+	///
+	/// Does not mutate the selection: the caller (session) is responsible for
+	/// moving the selection if this returns `Some(ix)`. When the fold hides
+	/// the selected row, returns `Some(ix)` of the next visible row (or the
+	/// previous one at the end), so Space and the detail pane never act on a
+	/// row the user cannot see.
+	pub fn toggle_commit_collapsed(&mut self, c: usize) -> Option<usize> {
 		let before = self.display_order();
 		if !self.collapsed_commits.remove(&c) {
 			self.collapsed_commits.insert(c);
 		}
 		let after = self.display_order();
 		if after.contains(&self.selected_item_idx) {
-			return;
+			return None;
 		}
-		let Some(pos) =
-			before.iter().position(|&i| i == self.selected_item_idx)
-		else {
-			return;
-		};
+		let pos = before.iter().position(|&i| i == self.selected_item_idx)?;
 		let visible = |i: &&usize| after.contains(i);
 		let next = before[pos..].iter().find(visible);
 		let prev = before[..pos].iter().rev().find(visible);
-		if let Some(&ix) = next.or(prev) {
-			self.selected_item_idx = ix;
+		next.or(prev).copied()
+	}
+
+	pub fn counts(&self) -> PasteCounts {
+		let mut c = PasteCounts {
+			skips: self.plan.skipped_operations.len(),
+			..PasteCounts::default()
+		};
+		for it in &self.items {
+			if it.overwritable() {
+				c.existing += 1;
+			}
+			match it.action() {
+				RowAction::Create => c.creates += 1,
+				RowAction::Overwrite => c.overwrites += 1,
+				RowAction::Delete => c.deletes += 1,
+				RowAction::OverwritePending
+				| RowAction::Excluded { by_commit: true } => {}
+				_ => c.skips += 1,
+			}
 		}
+		c
+	}
+
+	/// (rows, not written) of commit `c`; items are grouped by commit.
+	pub fn commit_counts(&self, c: usize) -> (usize, usize) {
+		let start = self.items.partition_point(|i| i.commit < Some(c));
+		let rows = self.items[start..]
+			.iter()
+			.take_while(|i| i.commit == Some(c));
+		rows.fold((0, 0), |(n, off), it| {
+			let not_written = it.action().is_not_written();
+			(n + 1, off + usize::from(not_written))
+		})
+	}
+
+	pub fn overwrite_missing(&self) -> bool {
+		self.items
+			.iter()
+			.any(|i| i.overwritable() && !i.overwrite_allowed)
 	}
 
 	pub fn set_all_overwrite(&mut self, allowed: bool) {
@@ -1536,14 +1629,14 @@ impl PastePreviewPlan {
 
 		for item in &self.items {
 			if !item.selected {
-				if item.is_delete {
+				if item.is_delete() {
 					unchecked_deletes.insert(item.op_index);
 				} else {
 					unchecked_creates.insert(item.op_index);
 				}
 				continue;
 			}
-			if item.is_delete {
+			if item.is_delete() {
 				// selected delete proceeds
 			} else if item.dest_exists && !item.overwrite_allowed {
 				unchecked_creates.insert(item.op_index);
@@ -1575,13 +1668,7 @@ impl PastePreviewPlan {
 			return Err(Msg::new("commit_subset_rejected", []));
 		}
 		preview.revalidate().map_err(stale_msg)?;
-		let overwrite_missing = self.items.iter().any(|item| {
-			item.dest_exists
-				&& !item.is_delete
-				&& item.action_label != "SKIP"
-				&& !item.overwrite_allowed
-		});
-		if overwrite_missing {
+		if self.overwrite_missing() {
 			return Err(Msg::new("commit_overwrite_required", []));
 		}
 		let git = Git::open(&self.destination)
@@ -2136,48 +2223,14 @@ mod tests {
 			exact
 		)
 		.is_ok());
-		let rejected = plan.clone();
-		let reject_limit = ordinary.retained_bytes()
-			+ rejected.retained_bytes()
-			+ detail_bytes
-			- 1;
-		assert!(rejected
-			.admit_with_preview_limit(Some(&ordinary), reject_limit)
-			.is_err());
-		let (mut plan, mut detail) = plan
-			.admit_with_preview_limit(Some(&ordinary), exact)
-			.unwrap();
-		let prior = detail.as_ref().unwrap().fingerprint();
-		let selections: Vec<_> = plan
-			.items
-			.iter()
-			.map(|i| (i.selected, i.overwrite_allowed))
-			.collect();
-		plan.is_applying = true;
-		assert_eq!(
-			plan.select_detail_with_limit(
-				1,
-				Some(&ordinary),
-				&mut detail,
-				exact
-			)
-			.unwrap_err()
-			.key,
-			"preview_memory_limit"
-		);
-		assert_eq!(plan.selected_item_idx, 0);
-		assert!(plan.is_applying);
-		assert!(plan.import_plan.is_some());
-		assert_eq!(detail.as_ref().unwrap().fingerprint(), prior);
-		assert_eq!(detail.as_ref().unwrap().path.as_deref(), Some("small.txt"));
-		assert_eq!(
-			plan.items
-				.iter()
-				.map(|i| (i.selected, i.overwrite_allowed))
-				.collect::<Vec<_>>(),
-			selections
-		);
-		plan.is_applying = false;
+		let reject_limit = exact - 1;
+		assert!(admit_preview_state_with_limit(
+			Some(&ordinary),
+			Some(&plan),
+			plan.detail_preview().as_ref(),
+			reject_limit
+		)
+		.is_err());
 		assert_eq!(plan.execute().unwrap().files.created_count, 2);
 		assert_eq!(
 			fs::read_to_string(dir.path().join("large.txt")).unwrap(),
@@ -2262,7 +2315,7 @@ mod tests {
 		let existing =
 			plan.items.iter().find(|i| i.path == "hello.txt").unwrap();
 		assert!(existing.dest_exists);
-		assert_eq!(existing.action_label, "OVERWRITE");
+		assert_eq!(existing.op, PlannedOp::Overwrite);
 		assert!(
 			!existing.overwrite_allowed,
 			"overwrite must be off by default"
@@ -2270,7 +2323,7 @@ mod tests {
 
 		let new_item = plan.items.iter().find(|i| i.path == "new.txt").unwrap();
 		assert!(!new_item.dest_exists);
-		assert_eq!(new_item.action_label, "CREATE");
+		assert_eq!(new_item.op, PlannedOp::Create);
 
 		// Execute without enabling overwrite: existing file remains unchanged!
 		let res = plan.execute().unwrap().files;
@@ -2329,8 +2382,8 @@ mod tests {
 
 		assert_eq!(plan.items.len(), 2);
 		let del_item = plan.items.iter().find(|i| i.path == "old.txt").unwrap();
-		assert!(del_item.is_delete);
-		assert_eq!(del_item.action_label, "DELETE");
+		assert!(del_item.is_delete());
+		assert_eq!(del_item.op, PlannedOp::Delete);
 
 		// Toggle delete off
 		let del_idx =
@@ -2537,7 +2590,7 @@ mod tests {
 				PasteNode::Commit(c) => format!("C{c}"),
 				PasteNode::File(ix, _) => {
 					let i = &plan.items[*ix];
-					format!("{} {}", i.action_label, i.path)
+					format!("{} {}", header_label(i.op), i.path)
 				}
 				_ => "?".into(),
 			})
@@ -2555,24 +2608,26 @@ mod tests {
 				"OVERWRITE a.txt",
 			]
 		);
-		let by_path = |p: &str, label: &str| {
+		let by_path = |p: &str, op: PlannedOp| {
 			plan.items
 				.iter()
-				.find(|i| i.path == p && i.action_label == label)
+				.find(|i| i.path == p && i.op == op)
 				.unwrap()
 		};
 		assert_eq!(
-			by_path("img.bin", "SKIP").skip_reason,
-			Some("reason_nc_binary")
+			by_path("img.bin", PlannedOp::Skip(SkipCause::Binary)).op,
+			PlannedOp::Skip(SkipCause::Binary)
 		);
-		let old = by_path("old.txt", "DELETE");
-		assert!(old.is_delete && old.dest_exists && old.commit == Some(0));
+		let old = by_path("old.txt", PlannedOp::Delete);
+		assert!(old.is_delete() && old.dest_exists && old.commit == Some(0));
 		assert_eq!(old.rename_note.as_deref(), Some("→ dir/new.txt"));
 		assert_eq!(
-			by_path("dir/new.txt", "CREATE").rename_note.as_deref(),
+			by_path("dir/new.txt", PlannedOp::Create)
+				.rename_note
+				.as_deref(),
 			Some("← old.txt")
 		);
-		assert_eq!(by_path("a.txt", "OVERWRITE").commit, Some(2));
+		assert_eq!(by_path("a.txt", PlannedOp::Overwrite).commit, Some(2));
 		// The empty commit has no rows but is still applied.
 		assert!(plan.items.iter().all(|i| i.commit != Some(1)));
 		assert!(plan.executable());
@@ -2868,7 +2923,7 @@ mod tests {
 			1,
 		)
 		.unwrap();
-		assert_eq!(plan.items[0].action_label, "SKIP");
+		assert_eq!(plan.items[0].op, PlannedOp::Skip(SkipCause::NonUtf8Target));
 		assert!(!plan.items[0].overwrite_allowed);
 		fs::write(path.join("a.txt"), "external change\n").unwrap();
 		assert_eq!(
@@ -2977,5 +3032,256 @@ mod tests {
 			"file-not-dir\n"
 		);
 		assert!(!path.join("leaf/child.txt").exists());
+	}
+
+	fn make_item(
+		selected: bool,
+		commit: Option<usize>,
+		op: PlannedOp,
+		dest_exists: bool,
+		overwrite_allowed: bool,
+	) -> PasteItem {
+		PasteItem {
+			path: "test.txt".into(),
+			dest_root: PathBuf::from("."),
+			dest_root_name: "root".into(),
+			dest_path: "test.txt".into(),
+			dest_exists,
+			op,
+			overwrite_allowed,
+			selected,
+			content: Arc::from(""),
+			bytes: 10,
+			lines: 1,
+			op_index: 0,
+			commit,
+			rename_note: None,
+		}
+	}
+
+	#[test]
+	fn row_action_covers_every_row_state() {
+		assert_eq!(
+			make_item(false, Some(0), PlannedOp::Create, false, false).action(),
+			RowAction::Excluded { by_commit: true }
+		);
+		assert_eq!(
+			make_item(false, None, PlannedOp::Create, false, false).action(),
+			RowAction::Excluded { by_commit: false }
+		);
+		assert_eq!(
+			make_item(
+				true,
+				Some(0),
+				PlannedOp::Skip(SkipCause::Binary),
+				false,
+				false
+			)
+			.action(),
+			RowAction::Skip(SkipCause::Binary)
+		);
+		assert_eq!(
+			make_item(true, None, PlannedOp::Delete, true, true).action(),
+			RowAction::Delete
+		);
+		assert_eq!(
+			make_item(true, None, PlannedOp::Delete, false, true).action(),
+			RowAction::DeleteMissing
+		);
+		assert_eq!(
+			make_item(true, None, PlannedOp::Create, false, false).action(),
+			RowAction::Create
+		);
+		assert_eq!(
+			make_item(true, None, PlannedOp::Overwrite, true, true).action(),
+			RowAction::Overwrite
+		);
+		assert_eq!(
+			make_item(true, Some(0), PlannedOp::Overwrite, true, false)
+				.action(),
+			RowAction::OverwritePending
+		);
+		assert_eq!(
+			make_item(true, None, PlannedOp::Overwrite, true, false).action(),
+			RowAction::KeepExisting
+		);
+	}
+
+	#[test]
+	fn commit_rows_classify_and_count_from_the_replay_plan() {
+		let (_dir, plan) = mixed_plan();
+		let shape: Vec<String> = plan
+			.commit_rows()
+			.iter()
+			.map(|r| match r {
+				PasteNode::Commit(c) => format!("C{c}"),
+				PasteNode::File(ix, _) => {
+					let i = &plan.items[*ix];
+					format!("{:?}:{}", i.action(), i.path)
+				}
+				_ => "?".into(),
+			})
+			.collect();
+		assert_eq!(
+			shape,
+			[
+				"C0",
+				"Skip(Binary):img.bin",
+				"Create:fresh.txt",
+				"Delete:old.txt",
+				"Create:dir/new.txt",
+				"C1",
+				"C2",
+				"OverwritePending:a.txt",
+			]
+		);
+		assert_eq!(
+			plan.counts(),
+			PasteCounts {
+				creates: 2,
+				overwrites: 0,
+				existing: 1,
+				deletes: 1,
+				skips: 1,
+			}
+		);
+		assert_eq!(plan.commit_counts(0), (4, 1));
+		assert_eq!(plan.commit_counts(1), (0, 0));
+		assert_eq!(plan.commit_counts(2), (1, 0));
+		let mut excluded = plan.items[0].clone();
+		excluded.selected = false;
+		assert_eq!(excluded.action(), RowAction::Excluded { by_commit: true });
+		assert!(plan.executable());
+	}
+
+	#[test]
+	fn up_down_walk_commit_rows_in_replay_order() {
+		let (_dir, mut plan) = mixed_plan();
+		plan.selected_item_idx = 0;
+		let mut seen = vec![plan.items[0].path.clone()];
+		for _ in 0..plan.items.len() + 2 {
+			plan.select_next();
+			seen.push(plan.items[plan.selected_item_idx].path.clone());
+		}
+		seen.dedup();
+		assert_eq!(
+			seen,
+			["img.bin", "fresh.txt", "old.txt", "dir/new.txt", "a.txt"]
+		);
+		// A folded commit's rows are skipped, and Up re-enters
+		// from a selection that is folded away.
+		plan.toggle_commit_collapsed(0);
+		plan.select_prev();
+		assert_eq!(plan.items[plan.selected_item_idx].path, "a.txt");
+	}
+
+	#[test]
+	fn counts_follow_row_actions_in_file_mode() {
+		let dir = tempfile::tempdir().unwrap();
+		fs::write(dir.path().join("existing.txt"), "old\n").unwrap();
+		let payload = "// FILE: existing.txt\nnew\n// FILE: fresh.txt\nfresh\n";
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		assert_eq!(
+			plan.counts(),
+			PasteCounts {
+				creates: 1,
+				overwrites: 0,
+				existing: 1,
+				deletes: 0,
+				skips: 1,
+			}
+		);
+		let exist_ix = plan
+			.items
+			.iter()
+			.position(|i| i.path == "existing.txt")
+			.unwrap();
+		plan.toggle_overwrite(exist_ix);
+		assert_eq!(
+			plan.counts(),
+			PasteCounts {
+				creates: 1,
+				overwrites: 1,
+				existing: 1,
+				deletes: 0,
+				skips: 0,
+			}
+		);
+		let fresh_ix = plan
+			.items
+			.iter()
+			.position(|i| i.path == "fresh.txt")
+			.unwrap();
+		plan.toggle_selected(fresh_ix);
+		assert_eq!(
+			plan.counts(),
+			PasteCounts {
+				creates: 0,
+				overwrites: 1,
+				existing: 1,
+				deletes: 0,
+				skips: 1,
+			}
+		);
+	}
+
+	#[test]
+	fn step_target_and_fold_do_not_move_the_selection() {
+		let (_dir, mut plan) = mixed_plan();
+		plan.selected_item_idx = 0;
+		let target = plan.step_target(true);
+		assert_eq!(
+			plan.selected_item_idx, 0,
+			"step_target must not mutate selection"
+		);
+		assert_eq!(target, 1);
+		let target_back = plan.step_target(false);
+		assert_eq!(
+			plan.selected_item_idx, 0,
+			"step_target must not mutate selection"
+		);
+		assert_eq!(target_back, 0);
+
+		let folded_target = plan.toggle_commit_collapsed(0);
+		assert_eq!(
+			plan.selected_item_idx, 0,
+			"toggle_commit_collapsed must not mutate selection"
+		);
+		assert_eq!(folded_target, Some(4));
+
+		let unfolded_target = plan.toggle_commit_collapsed(0);
+		assert_eq!(plan.selected_item_idx, 0);
+		assert_eq!(unfolded_target, None);
+	}
+
+	#[test]
+	fn overwrite_missing_is_the_overwritable_rows_without_permission() {
+		let (_dir, mut plan) = mixed_plan();
+		assert!(plan.overwrite_missing());
+		plan.set_all_overwrite(true);
+		assert!(!plan.overwrite_missing());
+	}
+
+	#[test]
+	fn row_control_ids_keep_the_driver_shape() {
+		assert_eq!(
+			RowControl::Row.id(3, "長路徑/a b.txt"),
+			"paste-row:3:長路徑/a b.txt"
+		);
+		assert_eq!(
+			RowControl::Include.id(3, "長路徑/a b.txt"),
+			"paste-include:3:長路徑/a b.txt"
+		);
+		assert_eq!(
+			RowControl::Overwrite.id(3, "長路徑/a b.txt"),
+			"paste-overwrite:3:長路徑/a b.txt"
+		);
+		assert_eq!(commit_header_id(2), "paste-commit:2");
 	}
 }

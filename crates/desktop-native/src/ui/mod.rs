@@ -24,7 +24,9 @@ use crate::graph_view;
 use crate::history::RevRow;
 use crate::i18n::{t, tf, Locale};
 use crate::icons::{file_icon, icon, icon_tinted, Icon};
-use crate::paste::{split_dir, PasteItem, PasteNode, PastePreviewPlan};
+use crate::paste::{
+	split_dir, PasteItem, PasteNode, PastePreviewPlan, RowAction, SkipCause,
+};
 use crate::reader::{DiffMode, PreviewSource};
 use crate::selector::Pick;
 use crate::theme::*;
@@ -491,95 +493,48 @@ fn change_style(ct: Option<ChangeType>) -> (&'static str, u32) {
 /// colour follows IntelliJ's file status: created green, modified blue
 /// (whether or not overwriting is allowed yet), deleted grey.
 pub(crate) fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
-	if !item.selected {
-		// A commit replay cannot drop one file: the whole replay is refused.
-		let reason = if item.commit.is_some() {
-			"reason_commit_excluded"
-		} else {
-			"reason_excluded"
-		};
-		("op_excluded", pal().text_disabled, reason)
-	} else if item.action_label == "SKIP" {
-		// Commit replay only: the file is listed but never written.
-		(
-			"op_skip",
-			pal().text_disabled,
-			item.skip_reason.unwrap_or("reason_skip_generic"),
-		)
-	} else if item.is_delete {
-		if item.dest_exists {
-			("op_delete", pal().git_deleted, "reason_delete")
-		} else {
+	paste_style(item.action())
+}
+
+pub(crate) fn paste_style(
+	action: RowAction,
+) -> (&'static str, u32, &'static str) {
+	use RowAction::*;
+	match action {
+		Excluded { by_commit: true } => {
+			("op_excluded", pal().text_disabled, "reason_commit_excluded")
+		}
+		Excluded { by_commit: false } => {
+			("op_excluded", pal().text_disabled, "reason_excluded")
+		}
+		Skip(cause) => ("op_skip", pal().text_disabled, skip_reason_key(cause)),
+		Delete => ("op_delete", pal().git_deleted, "reason_delete"),
+		DeleteMissing => {
 			("op_skip", pal().text_disabled, "reason_delete_missing")
 		}
-	} else if !item.dest_exists {
-		("op_create", pal().git_added, "reason_create")
-	} else if item.overwrite_allowed {
-		("op_overwrite", pal().git_modified, "reason_overwrite")
-	} else if item.commit.is_some() {
-		// The replay overwrites once allowed; until then Apply is refused
-		// (`commit_overwrite_required`), so nothing is skipped.
-		(
+		Create => ("op_create", pal().git_added, "reason_create"),
+		Overwrite => ("op_overwrite", pal().git_modified, "reason_overwrite"),
+		OverwritePending => (
 			"op_overwrite_pending",
 			pal().git_modified,
 			"reason_commit_overwrite_pending",
-		)
-	} else {
-		("op_skip", pal().git_modified, "reason_exists")
+		),
+		KeepExisting => ("op_skip", pal().git_modified, "reason_exists"),
 	}
 }
 
-/// What the paste summary bar counts. Derived from [`paste_op`], so a row's
-/// colour and the totals cannot disagree.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct PasteCounts {
-	pub creates: usize,
-	pub overwrites: usize,
-	/// Existing destination files that could be overwritten.
-	pub existing: usize,
-	pub deletes: usize,
-	pub skips: usize,
-}
-
-pub(crate) fn paste_counts(plan: &PastePreviewPlan) -> PasteCounts {
-	let mut c = PasteCounts {
-		skips: plan.plan.skipped_operations.len(),
-		..PasteCounts::default()
-	};
-	for it in &plan.items {
-		if it.overwritable() {
-			c.existing += 1;
-		}
-		match paste_op(it).0 {
-			"op_create" => c.creates += 1,
-			"op_overwrite" => c.overwrites += 1,
-			"op_delete" => c.deletes += 1,
-			// Blocks Apply rather than being skipped.
-			"op_overwrite_pending" => {}
-			"op_excluded" if it.commit.is_some() => {}
-			_ => c.skips += 1,
-		}
+fn skip_reason_key(cause: SkipCause) -> &'static str {
+	use SkipCause::*;
+	match cause {
+		Binary => "reason_nc_binary",
+		NonUtf8 => "reason_nc_non_utf8",
+		NonUtf8Path => "reason_nc_non_utf8_path",
+		UnsupportedType => "reason_nc_unsupported",
+		Unreadable => "reason_nc_unreadable",
+		UnsafePath => "reason_skip_unsafe_path",
+		NonUtf8Target => "reason_skip_non_utf8_target",
+		Other => "reason_skip_generic",
 	}
-	c
-}
-
-/// A commit's file rows and how many of them the replay does not write (a
-/// skipped file or a delete of a missing file), from the same [`paste_op`]
-/// that labels the rows. Rows an allowed overwrite or a re-included file
-/// would unblock are not "not written". Items are grouped by commit, so this
-/// walks only that commit's run.
-pub(crate) fn commit_counts(
-	plan: &PastePreviewPlan,
-	c: usize,
-) -> (usize, usize) {
-	let start = plan.items.partition_point(|i| i.commit < Some(c));
-	let rows = plan.items[start..]
-		.iter()
-		.take_while(|i| i.commit == Some(c));
-	rows.fold((0, 0), |(n, off), it| {
-		let not_written = paste_op(it).0 == "op_skip";
-		(n + 1, off + usize::from(not_written))
-	})
 }
 
 /// The three strings a commit header draws: subject (first message line,
@@ -705,7 +660,7 @@ impl WorkbenchModel {
 	fn toggle_log(&mut self, cx: &mut Context<Self>) {
 		self.bottom_visible = !self.bottom_visible;
 		// A manual toggle wins over the paste preview's auto-restore.
-		self.log_before_paste = None;
+		self.paste.forget_log_restore();
 		app_log!("[APP:LOG_PANEL: visible={}]", self.bottom_visible);
 		cx.notify();
 	}
@@ -1344,12 +1299,14 @@ impl Render for WorkbenchModel {
 		let left_w = self.effective_left_w(vw);
 		let bottom_h = self.effective_bottom_h(vh);
 
-		let center = if !self.workspace_open && self.paste_preview.is_none() {
+		let center = if !self.workspace_open && self.paste.plan().is_none() {
 			self.render_workspace_closed(cx)
 		} else {
-			match self.paste_preview {
-				Some(ref plan) => self.render_paste(plan, cx),
-				None if self.paste_loading => self.render_paste_loading(cx),
+			match self.paste.plan() {
+				Some(plan) => self.render_paste(plan, cx),
+				None if self.paste.is_loading() => {
+					self.render_paste_loading(cx)
+				}
 				None => self.render_editor(cx),
 			}
 		};
@@ -1514,21 +1471,13 @@ impl Render for WorkbenchModel {
 				this.find_step(false, cx)
 			}))
 			.on_action(cx.listener(|this, _: &NavUp, _, cx| {
-				if let Some(ref mut p) = this.paste_preview {
-					p.select_prev();
-					let ix = p.selected_item_idx;
-					this.select_paste_item(ix, cx);
-				}
+				this.step_paste_selection(false, cx);
 			}))
 			.on_action(cx.listener(|this, _: &NavDown, _, cx| {
-				if let Some(ref mut p) = this.paste_preview {
-					p.select_next();
-					let ix = p.selected_item_idx;
-					this.select_paste_item(ix, cx);
-				}
+				this.step_paste_selection(true, cx);
 			}))
 			.on_action(cx.listener(|this, _: &NavToggle, _, cx| {
-				if let Some(ref p) = this.paste_preview {
+				if let Some(p) = this.paste.plan() {
 					let idx = p.selected_item_idx;
 					if !p.display_order().contains(&idx) {
 						// Folded away: the row is not on screen.
@@ -2031,5 +1980,105 @@ mod tests {
 			WorkbenchModel::disambiguate_candidate_labels(&dups),
 			vec!["projA/lib", "projB/lib", "standalone"]
 		);
+	}
+
+	#[test]
+	fn paste_style_maps_each_action_to_its_key_and_colour() {
+		use super::paste_style;
+		use crate::paste::{RowAction, SkipCause};
+		let pal = crate::theme::pal();
+		assert_eq!(
+			paste_style(RowAction::Excluded { by_commit: true }),
+			("op_excluded", pal.text_disabled, "reason_commit_excluded")
+		);
+		assert_eq!(
+			paste_style(RowAction::Excluded { by_commit: false }),
+			("op_excluded", pal.text_disabled, "reason_excluded")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::Binary)),
+			("op_skip", pal.text_disabled, "reason_nc_binary")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::NonUtf8)),
+			("op_skip", pal.text_disabled, "reason_nc_non_utf8")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::NonUtf8Path)),
+			("op_skip", pal.text_disabled, "reason_nc_non_utf8_path")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::UnsupportedType)),
+			("op_skip", pal.text_disabled, "reason_nc_unsupported")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::Unreadable)),
+			("op_skip", pal.text_disabled, "reason_nc_unreadable")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::UnsafePath)),
+			("op_skip", pal.text_disabled, "reason_skip_unsafe_path")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::NonUtf8Target)),
+			("op_skip", pal.text_disabled, "reason_skip_non_utf8_target")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::Other)),
+			("op_skip", pal.text_disabled, "reason_skip_generic")
+		);
+		assert_eq!(
+			paste_style(RowAction::Delete),
+			("op_delete", pal.git_deleted, "reason_delete")
+		);
+		assert_eq!(
+			paste_style(RowAction::DeleteMissing),
+			("op_skip", pal.text_disabled, "reason_delete_missing")
+		);
+		assert_eq!(
+			paste_style(RowAction::Create),
+			("op_create", pal.git_added, "reason_create")
+		);
+		assert_eq!(
+			paste_style(RowAction::Overwrite),
+			("op_overwrite", pal.git_modified, "reason_overwrite")
+		);
+		assert_eq!(
+			paste_style(RowAction::OverwritePending),
+			(
+				"op_overwrite_pending",
+				pal.git_modified,
+				"reason_commit_overwrite_pending"
+			)
+		);
+		assert_eq!(
+			paste_style(RowAction::KeepExisting),
+			("op_skip", pal.git_modified, "reason_exists")
+		);
+
+		for action in [
+			RowAction::Excluded { by_commit: true },
+			RowAction::Excluded { by_commit: false },
+			RowAction::Skip(SkipCause::Binary),
+			RowAction::Skip(SkipCause::NonUtf8),
+			RowAction::Skip(SkipCause::NonUtf8Path),
+			RowAction::Skip(SkipCause::UnsupportedType),
+			RowAction::Skip(SkipCause::Unreadable),
+			RowAction::Skip(SkipCause::UnsafePath),
+			RowAction::Skip(SkipCause::NonUtf8Target),
+			RowAction::Skip(SkipCause::Other),
+			RowAction::Delete,
+			RowAction::DeleteMissing,
+			RowAction::Create,
+			RowAction::Overwrite,
+			RowAction::OverwritePending,
+			RowAction::KeepExisting,
+		] {
+			let (op_key, _, reason_key) = paste_style(action);
+			assert!(!crate::i18n::t(op_key, Locale::ZhTw).is_empty());
+			assert!(!crate::i18n::t(op_key, Locale::En).is_empty());
+			assert!(!crate::i18n::t(reason_key, Locale::ZhTw).is_empty());
+			assert!(!crate::i18n::t(reason_key, Locale::En).is_empty());
+		}
 	}
 }
