@@ -97,12 +97,6 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   - 有界輸出捕捉與大小限制:目錄列表(`ls-tree`)stdout 上限 8 MiB、項目數上限 2,000;歷史紀錄(`log`)stdout 上限 16 MiB、筆數上限 10,000;blob 預覽上限 1 MiB。
   - 誠實截斷與防範假成功:嚴格 blob 與歷史查詢在輸出遭截斷時回傳 `GitError::OutputLimit`，絕不截斷後回傳殘缺成功(`Text`)或假完結(`has_more: false`)。`resolve_commit_with` 嚴格要求完整 OID (40/64 hex)，截斷時拒絕輸出。
   - 二進位判斷與複製共用 `blob::classify`，內容任何位置有 NUL 即為二進位（不再只看前 8000 bytes）。
-- 非 blob 物件（例如 superproject 物件庫裡剛好有 submodule commit 的 gitlink）的處理：
-  - 經由 TS 0aa24c8 `src/catFile.ts` 的 `parseCatFileBatch` 驗證，TS 在 cat-file 層級從不讀取 `<type>` 欄位，因此在該層級會直接將任何物件（包含 commit 物件）的位元組當成檔案內容複製；但 gitlink 是否會在前端就被 graph 檔案清單排除則未比對。
-  - 在 gitsrc 中，非 blob 物件當作讀不到：graph 複製計入未讀（`skipped_unreadable_count`），staged 填入 `// Unable to read file content`。
-  - 在刪除檔處理中（gitsrc 與 transfer）：非 blob 物件一律略過並接續嘗試下一個 parent，找不到時填入刪除標記（develop 上 transfer 原先會回報 `GitError::Malformed` 錯誤，現改為略過並回傳刪除標記）。
-  - transfer 的非刪除路徑（`blob_content`）：容量限制內（within cap）的非 blob 維持回報 `GitError::Malformed("'<spec>' is a <kind>, not a file")`。
-  - 大小檢查先於型別檢查：超出容量上限（over-cap）的非 blob 在非刪除路徑回傳 `TooLarge`（gitsrc 回報 `OutputLimit`，transfer 依預算略過或回報 `PayloadLimitExceeded`）；而在刪除路徑中，超限非 blob 則比照一般非 blob 直接略過（接續下一個 parent 或回傳標記）。
 
 
 ## 2. 線上格式的不變量(摘要)

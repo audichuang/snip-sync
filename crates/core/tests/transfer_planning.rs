@@ -2455,7 +2455,7 @@ fn test_deleted_sources_read_distinct_bases_and_match_legacy_working() {
 }
 
 #[test]
-fn test_deleted_gitlink_pre_deletion_spec_is_not_a_blob_yields_marker() {
+fn test_deleted_gitlink_pre_deletion_spec_is_not_a_blob_is_malformed() {
 	let src = TestRepo::new("deleted-gitlink");
 	src.write("a.txt", "base\n");
 	let base = src.commit("base");
@@ -2481,16 +2481,15 @@ fn test_deleted_gitlink_pre_deletion_spec_is_not_a_blob_yields_marker() {
 	)
 	.unwrap();
 
-	let plan = plan_export(&selection, &Settings::default(), None).unwrap();
-	assert_eq!(plan.files.len(), 1);
-	assert_eq!(plan.files[0].path, "sub");
-	assert_eq!(
-		plan.files[0].content.as_deref(),
-		Some(gitsrc::DELETED_FILE_MARKER)
-	);
-	assert!(plan.payload.contains(gitsrc::DELETED_FILE_MARKER));
-	assert!(!plan.payload.contains("\nparent "));
-	assert!(!plan.payload.contains("tree "));
+	let err = plan_export(&selection, &Settings::default(), None).unwrap_err();
+	match err {
+		TransferError::Git(gitsrc::GitError::Malformed(msg)) => {
+			assert!(msg.contains("not a file"), "unexpected message: {msg}");
+		}
+		other => panic!(
+			"expected TransferError::Git(GitError::Malformed), got {other:?}"
+		),
+	}
 }
 
 #[test]

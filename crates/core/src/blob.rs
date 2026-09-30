@@ -98,18 +98,26 @@ impl CatFile {
 	/// 讀取物件並分類為 [`BlobRead`]。
 	///
 	/// `cap` 為原始位元組上限（raw-byte cap），而非 JSON 序列化後的上限；需要檢查逸出後大小的呼叫端應在取得文字後自行計算。
-	/// 非刪除政策維持：超限非 blob 仍回傳 `TooLarge`（大小判定先於型別判定）。
+	/// 大小判定先於型別判定；超限內容一律回傳 `TooLarge`。
 	pub(crate) fn read_classified(
 		&mut self,
 		object: &str,
 		cap: u64,
+		require_blob: bool,
 	) -> Result<BlobRead, GitError> {
 		if object.contains(['\n', '\r']) {
 			return Ok(BlobRead::Missing);
 		}
 		self.request(object)?;
-		read_classified_response(&mut self.session, cap)
-			.map_err(|e| self.session.error(e))
+		read_classified_response(&mut self.session, cap, require_blob).map_err(
+			|e| {
+				if is_truncated_body(&e) {
+					GitError::Malformed("cat-file body truncated".into())
+				} else {
+					self.session.error(e)
+				}
+			},
+		)
 	}
 
 	/// Ends the batch and reports any cleanup failure. Dropping a
@@ -168,6 +176,31 @@ pub fn read_batch_response<R: BufRead>(
 	}
 }
 
+#[derive(Debug)]
+struct TruncatedBody;
+
+impl std::fmt::Display for TruncatedBody {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "cat-file body truncated")
+	}
+}
+
+impl std::error::Error for TruncatedBody {}
+
+fn is_truncated_body(e: &io::Error) -> bool {
+	e.get_ref().is_some_and(|i| i.is::<TruncatedBody>())
+}
+
+fn mark_truncated(e: io::Error) -> io::Error {
+	if e.kind() == io::ErrorKind::UnexpectedEof {
+		io::Error::new(io::ErrorKind::UnexpectedEof, TruncatedBody)
+	} else {
+		e
+	}
+}
+
+/// Consumes `size` bytes plus the trailing LF without storing it; a short
+/// read is UnexpectedEof. Stay in protocol sync without holding the body.
 fn skip_body<R: BufRead>(r: &mut R, size: u64) -> io::Result<()> {
 	let skipped = io::copy(&mut r.take(size + 1), &mut io::sink())?;
 	if skipped != size + 1 {
@@ -176,6 +209,8 @@ fn skip_body<R: BufRead>(r: &mut R, size: u64) -> io::Result<()> {
 	Ok(())
 }
 
+/// Consumes `size` bytes plus the trailing LF without storing it; NUL wins
+/// over invalid UTF-8, matching a full-buffer check.
 fn scan_discarded_body<R: BufRead>(
 	reader: &mut R,
 	size: u64,
@@ -211,6 +246,8 @@ fn scan_discarded_body<R: BufRead>(
 	}
 }
 
+/// An incomplete trailing sequence is kept in carry (at most 3 bytes) unless
+/// this is the last chunk, where it is invalid; chunk is at most 8 KiB.
 fn utf8_chunk_invalid(carry: &mut Vec<u8>, chunk: &[u8], eof: bool) -> bool {
 	if carry.is_empty() {
 		return match std::str::from_utf8(chunk) {
@@ -258,7 +295,7 @@ pub(crate) fn classify(bytes: Vec<u8>) -> Result<String, NotText> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlobRead {
 	Missing,
-	/// size <= cap 且 kind != "blob"；body 以 skip_body 略過，不保留。
+	/// size <= cap 且 require_blob 為真時 kind != "blob"；body 以 skip_body 略過，不保留。
 	NotABlob {
 		kind: String,
 	},
@@ -269,7 +306,6 @@ pub(crate) enum BlobRead {
 	/// 超出容量的內容一律經由 [`scan_discarded_body`] 進行分塊掃描：此掃描僅耗費 CPU，記憶體用量嚴格維持有界（bounded），
 	/// 保留此行為是為了讓刪除檔分類政策（`deleted_not_text`、`first_deleted_text`）能區分二進位與超限純文字。
 	TooLarge {
-		kind: String,
 		size: u64,
 		not_text: Option<NotText>,
 	},
@@ -283,6 +319,7 @@ pub(crate) enum BlobRead {
 pub(crate) fn read_classified_response<R: BufRead>(
 	r: &mut R,
 	cap: u64,
+	require_blob: bool,
 ) -> io::Result<BlobRead> {
 	let header = match read_batch_header(r)? {
 		None => return Ok(BlobRead::Missing),
@@ -290,15 +327,11 @@ pub(crate) fn read_classified_response<R: BufRead>(
 	};
 	let (_oid, kind, size) = header;
 	if size > cap {
-		let not_text = scan_discarded_body(r, size)?;
-		return Ok(BlobRead::TooLarge {
-			kind,
-			size,
-			not_text,
-		});
+		let not_text = scan_discarded_body(r, size).map_err(mark_truncated)?;
+		return Ok(BlobRead::TooLarge { size, not_text });
 	}
-	if kind != "blob" {
-		skip_body(r, size)?;
+	if require_blob && kind != "blob" {
+		skip_body(r, size).map_err(mark_truncated)?;
 		return Ok(BlobRead::NotABlob { kind });
 	}
 	let body = read_batch_body(r, size)?;
@@ -314,6 +347,7 @@ pub(crate) fn read_classified_response<R: BufRead>(
 pub(crate) struct BlobReader {
 	open: Option<(PathBuf, CatFile)>,
 	opts: RunOptions,
+	require_blob: bool,
 }
 
 impl BlobReader {
@@ -326,6 +360,15 @@ impl BlobReader {
 		Self {
 			open: None,
 			opts: opts.clone(),
+			require_blob: false,
+		}
+	}
+
+	pub(crate) fn blobs_only(opts: &RunOptions) -> Self {
+		Self {
+			open: None,
+			opts: opts.clone(),
+			require_blob: true,
 		}
 	}
 
@@ -353,7 +396,7 @@ impl BlobReader {
 			self.open = Some((git.root().to_path_buf(), cat));
 		}
 		match self.open.as_mut() {
-			Some((_, cat)) => cat.read_classified(spec, cap),
+			Some((_, cat)) => cat.read_classified(spec, cap, self.require_blob),
 			None => Err(GitError::Malformed("cat-file unavailable".into())),
 		}
 	}
@@ -410,17 +453,14 @@ where
 		}
 		match read(s)? {
 			BlobRead::Text(t) => return Ok(DeletedContent::Text(t)),
-			BlobRead::Missing
-			| BlobRead::NotText(_)
-			| BlobRead::NotABlob { .. } => {}
-			BlobRead::TooLarge { ref kind, .. } if kind != "blob" => {}
+			BlobRead::Missing | BlobRead::NotText(_) => {}
+			BlobRead::NotABlob { kind } => return Err(not_a_file(s, &kind)),
 			BlobRead::TooLarge {
 				not_text: Some(_), ..
 			} => {}
 			BlobRead::TooLarge {
 				size,
 				not_text: None,
-				..
 			} => {
 				return Ok(DeletedContent::TooLarge {
 					spec: s.to_string(),
@@ -432,6 +472,7 @@ where
 	Ok(DeletedContent::Marker)
 }
 
+// kind 在此刻意被忽略（比照 TS），不論物件型別，超限且非文字一律回傳其原因。
 pub(crate) fn not_text_of(read: BlobRead) -> Option<NotText> {
 	match read {
 		BlobRead::NotText(r)
@@ -440,6 +481,10 @@ pub(crate) fn not_text_of(read: BlobRead) -> Option<NotText> {
 		} => Some(r),
 		_ => None,
 	}
+}
+
+pub(crate) fn not_a_file(spec: &str, kind: &str) -> GitError {
+	GitError::Malformed(format!("'{spec}' is a {kind}, not a file"))
 }
 
 #[cfg(test)]
@@ -595,40 +640,62 @@ mod tests {
 		// 1. missing 之後仍對齊
 		let mut r = Cursor::new(batch(&[("missing", b""), ("1111", b"ok\n")]));
 		assert_eq!(
-			read_classified_response(&mut r, 1024).unwrap(),
+			read_classified_response(&mut r, 1024, false).unwrap(),
 			BlobRead::Missing
 		);
 		assert_eq!(
-			read_classified_response(&mut r, 1024).unwrap(),
+			read_classified_response(&mut r, 1024, false).unwrap(),
 			BlobRead::Text("ok\n".into())
 		);
 
 		// 2. Text
 		let mut r = Cursor::new(batch(&[("1111", b"hello")]));
 		assert_eq!(
-			read_classified_response(&mut r, 1024).unwrap(),
+			read_classified_response(&mut r, 1024, false).unwrap(),
 			BlobRead::Text("hello".into())
 		);
 
 		// 3. NotText(Binary)
 		let mut r = Cursor::new(batch(&[("1111", b"a\0b")]));
 		assert_eq!(
-			read_classified_response(&mut r, 1024).unwrap(),
+			read_classified_response(&mut r, 1024, false).unwrap(),
 			BlobRead::NotText(NotText::Binary)
 		);
 
-		// 4. cap 以下的 abc tree 5 header 回 NotABlob 且之後仍對齊
+		// 4. cap 以下的非 blob：require_blob=true 回 NotABlob 且之後仍對齊；require_blob=false 解碼為 Text（忽略 kind）
 		let mut r =
 			Cursor::new(b"abc tree 5\n12345\nnext blob 3\nxyz\n".to_vec());
 		assert_eq!(
-			read_classified_response(&mut r, 1024).unwrap(),
+			read_classified_response(&mut r, 1024, true).unwrap(),
 			BlobRead::NotABlob {
 				kind: "tree".into()
 			}
 		);
 		assert_eq!(
-			read_classified_response(&mut r, 1024).unwrap(),
+			read_classified_response(&mut r, 1024, true).unwrap(),
 			BlobRead::Text("xyz".into())
+		);
+
+		let mut r =
+			Cursor::new(b"abc tree 5\n12345\nnext blob 3\nxyz\n".to_vec());
+		assert_eq!(
+			read_classified_response(&mut r, 1024, false).unwrap(),
+			BlobRead::Text("12345".into())
+		);
+		assert_eq!(
+			read_classified_response(&mut r, 1024, false).unwrap(),
+			BlobRead::Text("xyz".into())
+		);
+
+		let commit_body = b"tree abc\nauthor Me <m@e>\n\ncommit msg\n";
+		let raw = format!("c0ffee commit {}\n", commit_body.len()).into_bytes();
+		let mut payload = raw;
+		payload.extend_from_slice(commit_body);
+		payload.push(b'\n');
+		let mut r = Cursor::new(payload);
+		assert_eq!(
+			read_classified_response(&mut r, 1024, false).unwrap(),
+			BlobRead::Text(String::from_utf8(commit_body.to_vec()).unwrap())
 		);
 
 		// 5. 文字、二進位、非 UTF-8 各一筆大於 cap 的，回 TooLarge 並帶正確的 not_text 且之後仍對齊
@@ -639,41 +706,37 @@ mod tests {
 			("4", b"aligned"),
 		]));
 		assert_eq!(
-			read_classified_response(&mut r, 4).unwrap(),
+			read_classified_response(&mut r, 4, false).unwrap(),
 			BlobRead::TooLarge {
-				kind: "blob".into(),
 				size: 17,
 				not_text: None
 			}
 		);
 		assert_eq!(
-			read_classified_response(&mut r, 4).unwrap(),
+			read_classified_response(&mut r, 4, false).unwrap(),
 			BlobRead::TooLarge {
-				kind: "blob".into(),
 				size: 16,
 				not_text: Some(NotText::Binary)
 			}
 		);
 		assert_eq!(
-			read_classified_response(&mut r, 2).unwrap(),
+			read_classified_response(&mut r, 2, false).unwrap(),
 			BlobRead::TooLarge {
-				kind: "blob".into(),
 				size: 4,
 				not_text: Some(NotText::NotUtf8)
 			}
 		);
 		assert_eq!(
-			read_classified_response(&mut r, 10).unwrap(),
+			read_classified_response(&mut r, 10, false).unwrap(),
 			BlobRead::Text("aligned".into())
 		);
 
-		// 6. 大於 cap 的 tree 回 TooLarge（先比 size）
+		// 6. 大於 cap 的 tree 回 TooLarge（先比 size，kind 忽略）
 		let mut r =
 			Cursor::new(b"abc tree 20\n12345678901234567890\n".to_vec());
 		assert_eq!(
-			read_classified_response(&mut r, 5).unwrap(),
+			read_classified_response(&mut r, 5, true).unwrap(),
 			BlobRead::TooLarge {
-				kind: "tree".into(),
 				size: 20,
 				not_text: None
 			}
@@ -682,13 +745,44 @@ mod tests {
 		// 7. cap 0 的空 blob 回 Text("")
 		let mut r = Cursor::new(batch(&[("empty", b"")]));
 		assert_eq!(
-			read_classified_response(&mut r, 0).unwrap(),
+			read_classified_response(&mut r, 0, false).unwrap(),
 			BlobRead::Text("".into())
 		);
 
 		// 8. body 被截斷回 Err
 		let mut r = Cursor::new(b"abc blob 20\nshort".to_vec());
-		assert!(read_classified_response(&mut r, 1024).is_err());
+		assert!(read_classified_response(&mut r, 1024, false).is_err());
+	}
+
+	#[test]
+	fn cat_file_body_truncated_maps_to_malformed() {
+		// 1. over-cap short body => marker true
+		let mut r_overcap = Cursor::new(b"abc blob 20\nshort".to_vec());
+		let err_overcap =
+			read_classified_response(&mut r_overcap, 5, false).unwrap_err();
+		assert_eq!(err_overcap.kind(), io::ErrorKind::UnexpectedEof);
+		assert!(is_truncated_body(&err_overcap));
+
+		// 2. under-cap-nonblob (require_blob=true) short body => marker true
+		let mut r_nonblob = Cursor::new(b"abc tree 20\nshort".to_vec());
+		let err_nonblob =
+			read_classified_response(&mut r_nonblob, 1024, true).unwrap_err();
+		assert_eq!(err_nonblob.kind(), io::ErrorKind::UnexpectedEof);
+		assert!(is_truncated_body(&err_nonblob));
+
+		// 3. under-cap blob short body => marker false
+		let mut r_blob = Cursor::new(b"abc blob 20\nshort".to_vec());
+		let err_blob =
+			read_classified_response(&mut r_blob, 1024, false).unwrap_err();
+		assert_eq!(err_blob.kind(), io::ErrorKind::UnexpectedEof);
+		assert!(!is_truncated_body(&err_blob));
+
+		// 4. header-only EOF => marker false
+		let mut r_header = Cursor::new(b"abc".to_vec());
+		let err_header =
+			read_classified_response(&mut r_header, 1024, false).unwrap_err();
+		assert_eq!(err_header.kind(), io::ErrorKind::UnexpectedEof);
+		assert!(!is_truncated_body(&err_header));
 	}
 
 	#[test]
@@ -705,27 +799,35 @@ mod tests {
 
 	#[test]
 	fn deleted_policy_all_uncopyable_is_marker() {
-		let specs = ["missing", "bin", "tree", "huge_bin", "huge_commit"];
+		let specs = ["missing", "bin", "huge_bin"];
 		let res = first_deleted_text(specs, |s| match s {
 			"missing" => Ok(BlobRead::Missing),
 			"bin" => Ok(BlobRead::NotText(NotText::Binary)),
-			"tree" => Ok(BlobRead::NotABlob {
-				kind: "tree".into(),
-			}),
 			"huge_bin" => Ok(BlobRead::TooLarge {
-				kind: "blob".into(),
 				size: 100_000,
 				not_text: Some(NotText::Binary),
-			}),
-			"huge_commit" => Ok(BlobRead::TooLarge {
-				kind: "commit".into(),
-				size: 100_000,
-				not_text: None,
 			}),
 			_ => unreachable!(),
 		})
 		.unwrap();
 		assert_eq!(res, DeletedContent::Marker);
+	}
+
+	#[test]
+	fn deleted_policy_not_a_blob_returns_malformed() {
+		let specs = ["tree"];
+		let err = first_deleted_text(specs, |_| {
+			Ok(BlobRead::NotABlob {
+				kind: "tree".into(),
+			})
+		})
+		.unwrap_err();
+		match err {
+			GitError::Malformed(msg) => {
+				assert_eq!(msg, "'tree' is a tree, not a file");
+			}
+			other => panic!("expected GitError::Malformed, got {other:?}"),
+		}
 	}
 
 	#[test]
@@ -749,7 +851,6 @@ mod tests {
 			visited.push(s.to_string());
 			match s {
 				"huge_txt" => Ok(BlobRead::TooLarge {
-					kind: "blob".into(),
 					size: 50_000,
 					not_text: None,
 				}),
@@ -768,26 +869,12 @@ mod tests {
 	}
 
 	#[test]
-	fn deleted_policy_skips_over_cap_non_blob_and_stops_on_over_cap_text_blob()
-	{
-		// 1. 超過容量的非 blob（即使 not_text 為 None）被略過，最終落回 Marker
+	fn deleted_policy_over_cap_non_blob_text_is_too_large_like_blob() {
+		// 超過容量的非 blob 若為純文字（not_text: None），比照 blob 立即中止並回傳 TooLarge
 		let specs = ["huge_commit"];
 		let res = first_deleted_text(specs, |_| {
 			Ok(BlobRead::TooLarge {
-				kind: "commit".into(),
 				size: 100_000,
-				not_text: None,
-			})
-		})
-		.unwrap();
-		assert_eq!(res, DeletedContent::Marker);
-
-		// 2. 超過容量的文字 blob 則立即中止並回傳 TooLarge
-		let specs = ["huge_txt"];
-		let res = first_deleted_text(specs, |_| {
-			Ok(BlobRead::TooLarge {
-				kind: "blob".into(),
-				size: 50_000,
 				not_text: None,
 			})
 		})
@@ -795,8 +882,8 @@ mod tests {
 		assert_eq!(
 			res,
 			DeletedContent::TooLarge {
-				spec: "huge_txt".into(),
-				size: 50_000,
+				spec: "huge_commit".into(),
+				size: 100_000,
 			}
 		);
 	}
@@ -813,7 +900,6 @@ mod tests {
 		);
 		assert_eq!(
 			not_text_of(BlobRead::TooLarge {
-				kind: "blob".into(),
 				size: 10,
 				not_text: Some(NotText::Binary),
 			}),
@@ -821,7 +907,6 @@ mod tests {
 		);
 		assert_eq!(
 			not_text_of(BlobRead::TooLarge {
-				kind: "blob".into(),
 				size: 10,
 				not_text: Some(NotText::NotUtf8),
 			}),
@@ -837,7 +922,6 @@ mod tests {
 		);
 		assert_eq!(
 			not_text_of(BlobRead::TooLarge {
-				kind: "blob".into(),
 				size: 10,
 				not_text: None,
 			}),

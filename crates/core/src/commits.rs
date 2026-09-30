@@ -691,6 +691,7 @@ fn admit_blob(
 			file.not_copied = Some(r.into());
 		}
 		BlobRead::NotABlob { .. } => {
+			// lenient reader 絕不產出 NotABlob（可達情況不應宣稱 UnsupportedType），保留此分支僅為維持窮舉編譯。
 			file.not_copied = Some(NotCopiedReason::UnsupportedType);
 		}
 		BlobRead::TooLarge {

@@ -1334,6 +1334,8 @@ impl BlobBudget {
 	}
 }
 
+/// The header fixes OID and size before any body byte; a tree or commit is
+/// an error, not a missing file (blobs_only reader).
 fn blob_content(
 	read: BlobRead,
 	spec: &str,
@@ -1343,9 +1345,9 @@ fn blob_content(
 ) -> Result<Option<ReadContent>, TransferError> {
 	match read {
 		BlobRead::Missing => Ok(None),
-		BlobRead::NotABlob { kind } => Err(TransferError::Git(
-			GitError::Malformed(format!("'{spec}' is a {kind}, not a file")),
-		)),
+		BlobRead::NotABlob { kind } => {
+			Err(TransferError::Git(crate::blob::not_a_file(spec, &kind)))
+		}
 		BlobRead::Text(s) => Ok(Some((Some(s), None))),
 		BlobRead::NotText(_) => Ok(Some((None, None))),
 		BlobRead::TooLarge { size, .. } => {
@@ -1513,7 +1515,7 @@ pub fn plan_export_with(
 			}
 		}
 	}
-	let mut blobs = BlobReader::new(opts);
+	let mut blobs = BlobReader::blobs_only(opts);
 	let outcome = (|| -> Result<ExportPlan, TransferError> {
 		let mut working_files = HashMap::new();
 

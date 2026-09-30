@@ -1000,9 +1000,9 @@ fn copyable(
 ) -> Result<Option<String>, GitError> {
 	match read {
 		BlobRead::Text(s) => Ok(Some(s)),
-		BlobRead::Missing
-		| BlobRead::NotText(_)
-		| BlobRead::NotABlob { .. } => Ok(None),
+		BlobRead::Missing | BlobRead::NotText(_) => Ok(None),
+		// lenient reader 絕不產出 NotABlob，保留此分支僅為維持窮舉編譯。
+		BlobRead::NotABlob { .. } => Ok(None),
 		BlobRead::TooLarge { .. } => Err(blob_output_limit(spec, cap)),
 	}
 }
@@ -1311,21 +1311,20 @@ mod tests {
 		let big_oid = big_oid.trim();
 		let mut cat = git.cat_file().unwrap();
 		assert_eq!(
-			cat.read_classified(big_oid, 64).unwrap(),
+			cat.read_classified(big_oid, 64, false).unwrap(),
 			BlobRead::TooLarge {
-				kind: "blob".into(),
 				size: big.len() as u64,
 				not_text: None,
 			}
 		);
-		match cat.read_classified("HEAD:late.bin", 32).unwrap() {
+		match cat.read_classified("HEAD:late.bin", 32, false).unwrap() {
 			BlobRead::TooLarge {
 				not_text: Some(crate::blob::NotText::Binary),
 				..
 			} => {}
 			other => panic!("{other:?}"),
 		}
-		match cat.read_classified("HEAD:bad.txt", 32).unwrap() {
+		match cat.read_classified("HEAD:bad.txt", 32, false).unwrap() {
 			BlobRead::TooLarge {
 				not_text: Some(crate::blob::NotText::NotUtf8),
 				..
@@ -1333,7 +1332,7 @@ mod tests {
 			other => panic!("{other:?}"),
 		}
 		assert_eq!(
-			cat.read_classified("HEAD:small.txt", 64).unwrap(),
+			cat.read_classified("HEAD:small.txt", 64, false).unwrap(),
 			BlobRead::Text("small\n".into())
 		);
 		cat.close().unwrap();
@@ -1377,7 +1376,7 @@ mod tests {
 		r.commit("init");
 		let g = Git::open(&r.path()).unwrap();
 
-		// (a) 開啟 session 成功讀取一次，接著取消 token，確認第二次讀取在到達 session 之前即回傳 Cancelled。
+		// (a) 開啟 session 成功讀取一次，接著取消 token，確認在已開啟的 session 上仍會遵守取消（回傳 Cancelled）。
 		let token = CancelToken::new();
 		let opts = RunOptions {
 			cancel: Some(token.clone()),
@@ -1417,7 +1416,7 @@ mod tests {
 	}
 
 	#[test]
-	fn payload_gitlink_commit_object_is_not_file_content() {
+	fn payload_gitlink_commit_object_copies_commit_text_as_content() {
 		let r = Repo::new();
 		r.write("a.txt", b"a\n");
 		let base = r.commit("base");
@@ -1438,6 +1437,27 @@ mod tests {
 		]);
 		r.write("a.txt", b"b\n");
 		r.git(&["add", "a.txt"]);
+
+		// 1. Staged: gitlink whose commit object is in odb copies the commit object text as content
+		let g_staged = Git::open(&r.path()).unwrap();
+		let res_staged = collect_payload(
+			&g_staged,
+			&GitSource::Staged,
+			&[r.path()],
+			&Settings::default(),
+		)
+		.unwrap();
+		assert!(res_staged.files.iter().any(|f| f.path == "sub"));
+		let sub_staged =
+			res_staged.files.iter().find(|f| f.path == "sub").unwrap();
+		assert!(sub_staged.content.as_deref().unwrap().contains("tree "));
+		assert_ne!(sub_staged.content.as_deref(), Some(UNREADABLE_FILE_MARKER));
+		assert_eq!(
+			res_staged.skipped_unreadable_count,
+			base_res.skipped_unreadable_count
+		);
+
+		// 2. Commit: gitlink whose commit object is in odb copies the commit object text as content
 		r.git(&["commit", "-q", "-m", "bump"]);
 		let g = Git::open(&r.path()).unwrap();
 		let res = collect_payload(
@@ -1448,12 +1468,13 @@ mod tests {
 		)
 		.unwrap();
 
-		assert!(!res.files.iter().any(|f| f.path == "sub"));
-		assert!(!res.payload.contains("\nparent "));
-		assert!(!res.payload.contains("tree "));
+		assert!(res.files.iter().any(|f| f.path == "sub"));
+		let sub_commit = res.files.iter().find(|f| f.path == "sub").unwrap();
+		assert!(sub_commit.content.as_deref().unwrap().contains("tree "));
+		assert_ne!(sub_commit.content.as_deref(), Some(UNREADABLE_FILE_MARKER));
 		assert_eq!(
 			res.skipped_unreadable_count,
-			base_res.skipped_unreadable_count + 1
+			base_res.skipped_unreadable_count
 		);
 	}
 
