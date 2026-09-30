@@ -2518,7 +2518,7 @@ impl CommitReplayPreview {
 	/// Git open, the worktree lock wait and the re-validation under that lock; once the first
 	/// commit starts nothing is cancelled. Cancel at any point before the first write is
 	/// `Err(TransferError::Git(GitError::Cancelled))`. A non-cancel failure inside
-	/// `ReplaySession::begin` (the worktree lock wait or `RepoIdentity::resolve`) is
+	/// `ReplaySession::begin` (the worktree lock, `RepoIdentity::resolve`, or creating the empty hooks directory) is
 	/// `Ok(ReplayResult)` with failure at index 0 and nothing written; `Git::open_with` and
 	/// re-validation errors, `QueueTimeout` included, are `Err`.
 	/// Overwrites follow spec 4.3 (直接覆蓋): the desktop's "allow overwrite first" gate is that
