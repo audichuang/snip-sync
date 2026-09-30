@@ -13,10 +13,7 @@ use std::path::{Path, PathBuf};
 /// replacements would be written back as mojibake on restore. A leading BOM
 /// is kept, as TS does with `ignoreBOM: true`.
 pub fn decode_utf8_or_skip(bytes: Vec<u8>) -> Option<String> {
-	if bytes.contains(&0) {
-		return None;
-	}
-	String::from_utf8(bytes).ok()
+	crate::blob::classify(bytes).ok()
 }
 
 pub fn read_text_file(path: &Path) -> io::Result<Option<String>> {

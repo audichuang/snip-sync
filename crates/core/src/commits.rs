@@ -11,11 +11,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::blob::{BlobRead, BlobReader, NotText};
 use crate::fsutil::{must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, RunOptions};
-use crate::gitsrc::{
-	CappedBlob, CatFile, Git, GitError, RawZ, SkippedBlob, EMPTY_TREE,
-};
+use crate::gitsrc::{Git, GitError, RawZ, EMPTY_TREE};
 use crate::paths::{escapes_all_roots, resolve_write_target};
 use crate::workspace::{lock_heavy, RepoIdentity};
 
@@ -83,6 +82,15 @@ pub enum NotCopiedReason {
 	/// A symlink or submodule: not a regular text file.
 	UnsupportedType,
 	Unreadable,
+}
+
+impl From<NotText> for NotCopiedReason {
+	fn from(r: NotText) -> Self {
+		match r {
+			NotText::Binary => Self::Binary,
+			NotText::NotUtf8 => Self::NonUtf8,
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,7 +436,7 @@ fn export_one(
 	trigger_post_diff_cancel_hook_if_active();
 
 	let mut records = RawZ::new(&raw);
-	let mut cat: Option<CatFile> = None;
+	let mut blobs = BlobReader::new(opts);
 	let mut failed: Option<CommitError> = None;
 	while let Some(entry) = records.next_entry().transpose() {
 		refuse_if_cancelled(opts, "diff-tree scan")?;
@@ -440,7 +448,7 @@ fn export_one(
 					limit,
 					commits,
 					current_wire_len,
-					&mut cat,
+					&mut blobs,
 					entry,
 				) {
 					failed = Some(err);
@@ -455,14 +463,12 @@ fn export_one(
 	}
 	// Success closes the session (cleanup errors surface). Failure drops
 	// it, which kills and reaps the tree before the slot is released.
-	match (cat.take(), failed) {
-		(Some(cat), None) => cat.close()?,
-		(Some(cat), Some(err)) => {
-			drop(cat);
+	match failed {
+		None => blobs.close()?,
+		Some(err) => {
+			drop(blobs);
 			return Err(err);
 		}
-		(None, Some(err)) => return Err(err),
-		(None, None) => {}
 	}
 	refuse_if_cancelled(opts, "export commit")?;
 	Ok(())
@@ -581,7 +587,7 @@ fn admit_entry(
 	limit: Option<usize>,
 	commits: &mut [CommitRecord],
 	current_wire_len: &mut usize,
-	cat: &mut Option<CatFile>,
+	blobs: &mut BlobReader,
 	entry: crate::gitsrc::RawEntry,
 ) -> Result<(), CommitError> {
 	let change = match entry.status {
@@ -617,60 +623,36 @@ fn admit_entry(
 		file.not_copied = Some(NotCopiedReason::UnsupportedType);
 		return push_file(commits, current_wire_len, file, limit, opts);
 	}
-	let cat = open_cat(git, opts, cat)?;
 	if change == FileChange::Deleted {
 		// A deletion carries no content, so the pre-deletion blob is only
 		// classified: retain nothing, scan it. Text of any size (or a blob
 		// that cannot be read) stays a plain deletion and never counts
 		// against the payload limit; NUL or invalid UTF-8 becomes
 		// not-copied so paste leaves the target file alone (spec 4.2).
-		refuse_if_cancelled(opts, "cat-file")?;
-		file.not_copied = match cat.read_blob_capped(&entry.old_oid, 0)? {
-			CappedBlob::Retained(body) if body.contains(&0) => {
-				Some(NotCopiedReason::Binary)
-			}
-			CappedBlob::Retained(body) => std::str::from_utf8(&body)
-				.is_err()
-				.then_some(NotCopiedReason::NonUtf8),
-			CappedBlob::Skipped(SkippedBlob::Binary) => {
-				Some(NotCopiedReason::Binary)
-			}
-			CappedBlob::Skipped(SkippedBlob::NotUtf8) => {
-				Some(NotCopiedReason::NonUtf8)
-			}
-			CappedBlob::Missing
-			| CappedBlob::Skipped(SkippedBlob::TextLargerThanCap { .. }) => None,
-		};
+		file.not_copied = blobs
+			.deleted_not_text(git, &entry.old_oid)?
+			.map(NotCopiedReason::from);
 		return push_file(commits, current_wire_len, file, limit, opts);
 	}
 	admit_blob(
 		commits,
 		current_wire_len,
 		file,
-		cat,
+		git,
+		blobs,
 		&entry.new_oid,
 		opts,
 		limit,
 	)
 }
 
-fn open_cat<'a>(
-	git: &Git,
-	opts: &RunOptions,
-	slot: &'a mut Option<CatFile>,
-) -> Result<&'a mut CatFile, CommitError> {
-	if slot.is_none() {
-		refuse_if_cancelled(opts, "cat-file --batch")?;
-		*slot = Some(git.cat_file_with(opts.clone())?);
-	}
-	Ok(slot.as_mut().expect("cat-file open"))
-}
-
+#[allow(clippy::too_many_arguments)]
 fn admit_blob(
 	commits: &mut [CommitRecord],
 	current_wire_len: &mut usize,
 	mut file: CommitFile,
-	cat: &mut CatFile,
+	git: &Git,
+	blobs: &mut BlobReader,
 	oid: &str,
 	opts: &RunOptions,
 	limit: Option<usize>,
@@ -695,30 +677,26 @@ fn admit_blob(
 	};
 	file.content = None;
 	file.not_copied = None;
-	refuse_if_cancelled(opts, "cat-file")?;
-	match cat.read_blob_capped(oid, max_retain)? {
-		CappedBlob::Missing => {
+	match blobs.read(git, oid, max_retain)? {
+		BlobRead::Missing => {
 			file.not_copied = Some(NotCopiedReason::Unreadable);
 		}
-		CappedBlob::Retained(body) => {
-			if body.contains(&0) {
-				file.not_copied = Some(NotCopiedReason::Binary);
-			} else {
-				match String::from_utf8(body) {
-					Ok(text) => file.content = Some(text),
-					Err(_) => {
-						file.not_copied = Some(NotCopiedReason::NonUtf8);
-					}
-				}
-			}
+		BlobRead::Text(t) => {
+			file.content = Some(t);
 		}
-		CappedBlob::Skipped(SkippedBlob::Binary) => {
-			file.not_copied = Some(NotCopiedReason::Binary);
+		BlobRead::NotText(r)
+		| BlobRead::TooLarge {
+			not_text: Some(r), ..
+		} => {
+			file.not_copied = Some(r.into());
 		}
-		CappedBlob::Skipped(SkippedBlob::NotUtf8) => {
-			file.not_copied = Some(NotCopiedReason::NonUtf8);
+		BlobRead::NotABlob { .. } => {
+			file.not_copied = Some(NotCopiedReason::UnsupportedType);
 		}
-		CappedBlob::Skipped(SkippedBlob::TextLargerThanCap { size }) => {
+		BlobRead::TooLarge {
+			size,
+			not_text: None,
+		} => {
 			let max = limit.expect("oversize text is only skipped under a cap");
 			let base = len_empty.expect("empty-content length");
 			let extra = usize::try_from(size).unwrap_or(usize::MAX);

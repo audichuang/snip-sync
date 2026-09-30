@@ -6,10 +6,15 @@
 //! files; `collect_payload` applies filters, limits and counts on top.
 
 use std::collections::HashSet;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub use crate::blob::{
+	read_batch_header, read_batch_response, CatFile, CatObject,
+	DELETED_FILE_MARKER,
+};
+use crate::blob::{BlobRead, BlobReader, DeletedContent};
 use crate::copy::CopyResult;
 use crate::filter::file_matches_filters;
 use crate::format::{
@@ -23,9 +28,6 @@ use crate::settings::Settings;
 
 /// The well-known OID of git's empty tree: the "parent" of a root commit.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-/// Content of a deleted file whose pre-deletion content no parent can supply.
-pub const DELETED_FILE_MARKER: &str =
-	"// This file has been deleted in this change";
 /// Stands in for content the requested revision could not supply.
 pub const UNREADABLE_FILE_MARKER: &str = "// Unable to read file content";
 
@@ -438,9 +440,7 @@ impl Git {
 	pub fn cat_file_with(&self, opts: RunOptions) -> Result<CatFile, GitError> {
 		let mut cmd = self.command();
 		cmd.args(["cat-file", "--batch"]);
-		Ok(CatFile {
-			session: gitrun::Session::spawn(cmd, "cat-file --batch", opts)?,
-		})
+		CatFile::spawn(cmd, opts)
 	}
 }
 
@@ -534,260 +534,6 @@ pub fn change_type_for_status(status: u8) -> ChangeType {
 	}
 }
 
-/// A long-lived `git cat-file --batch`. Requests go one at a time (write,
-/// flush, read the answer), so neither pipe can fill up and deadlock. Each
-/// request has its own deadline.
-pub struct CatFile {
-	session: gitrun::Session,
-}
-
-/// One `cat-file --batch` answer read with a size cap.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CatObject {
-	Missing,
-	/// The header fixed OID and size; the body was skipped unread.
-	TooLarge {
-		oid: String,
-		size: u64,
-	},
-	Found {
-		oid: String,
-		kind: String,
-		body: Vec<u8>,
-	},
-}
-
-impl CatFile {
-	fn request(&mut self, object: &str) -> Result<(), GitError> {
-		let Some(stdin) = self.session.begin() else {
-			return Err(GitError::Malformed("cat-file stdin closed".into()));
-		};
-		let sent = stdin
-			.write_all(format!("{object}\n").as_bytes())
-			.and_then(|()| stdin.flush());
-		sent.map_err(|e| self.session.error(e))
-	}
-
-	/// Reads an object (`<oid>` or `<rev>:<path>`). `None` = missing.
-	pub fn read(&mut self, object: &str) -> Result<Option<Vec<u8>>, GitError> {
-		if object.contains(['\n', '\r']) {
-			// The protocol is line based; such a request would desync it.
-			return Ok(None);
-		}
-		self.request(object)?;
-		read_batch_response(&mut self.session)
-			.map_err(|e| self.session.error(e))
-	}
-
-	/// Reads `object` only if its size, taken from the header before any
-	/// body byte, is at most `max`. The returned OID is the object the body
-	/// belongs to, so a ref moving meanwhile cannot mix two versions.
-	pub fn read_object(
-		&mut self,
-		object: &str,
-		max: u64,
-	) -> Result<CatObject, GitError> {
-		if object.contains(['\n', '\r']) {
-			return Ok(CatObject::Missing);
-		}
-		self.request(object)?;
-		let s = &mut self.session;
-		let header = read_batch_header(s).map_err(|e| s.error(e))?;
-		let Some((oid, kind, size)) = header else {
-			return Ok(CatObject::Missing);
-		};
-		if size > max {
-			// Stay in protocol sync without holding the body.
-			let skipped = io::copy(&mut s.take(size + 1), &mut io::sink())
-				.map_err(|e| s.error(e))?;
-			if skipped != size + 1 {
-				return Err(GitError::Malformed(
-					"cat-file body truncated".into(),
-				));
-			}
-			return Ok(CatObject::TooLarge { oid, size });
-		}
-		let body = read_batch_body(s, size).map_err(|e| s.error(e))?;
-		Ok(CatObject::Found { oid, kind, body })
-	}
-
-	/// Reads a blob, retaining its body only when `size <= max_retain`.
-	///
-	/// A larger body is scanned and discarded: a NUL is [`SkippedBlob::Binary`],
-	/// invalid UTF-8 is [`SkippedBlob::NotUtf8`], and valid UTF-8 is
-	/// [`SkippedBlob::TextLargerThanCap`]. The batch stays in sync either way.
-	/// `max_retain` is a raw-byte cap, not a JSON cap; callers that need the
-	/// escaped size check that after a retained body comes back.
-	pub(crate) fn read_blob_capped(
-		&mut self,
-		object: &str,
-		max_retain: u64,
-	) -> Result<CappedBlob, GitError> {
-		if object.contains(['\n', '\r']) {
-			return Ok(CappedBlob::Missing);
-		}
-		self.request(object)?;
-		let s = &mut self.session;
-		let header = read_batch_header(s).map_err(|e| s.error(e))?;
-		let Some((_oid, _kind, size)) = header else {
-			return Ok(CappedBlob::Missing);
-		};
-		if size <= max_retain {
-			let body = read_batch_body(s, size).map_err(|e| s.error(e))?;
-			return Ok(CappedBlob::Retained(body));
-		}
-		let class = scan_discarded_body(s, size).map_err(|e| s.error(e))?;
-		Ok(CappedBlob::Skipped(class))
-	}
-
-	/// Ends the batch and reports any cleanup failure. Dropping a
-	/// `CatFile` kills the process instead.
-	pub fn close(self) -> Result<(), GitError> {
-		self.session.close()
-	}
-}
-
-/// A blob read by [`CatFile::read_blob_capped`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CappedBlob {
-	Missing,
-	/// `size <= max_retain`. The caller still applies NUL / UTF-8 rules.
-	Retained(Vec<u8>),
-	/// Body was not stored.
-	Skipped(SkippedBlob),
-}
-
-/// Why [`CappedBlob::Skipped`] did not keep the body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SkippedBlob {
-	/// A NUL byte. Same rule as `content.contains(&0)` on a retained body.
-	Binary,
-	NotUtf8,
-	/// Valid UTF-8 whose raw size is above the retain cap.
-	TextLargerThanCap {
-		size: u64,
-	},
-}
-
-/// Consumes a cat-file body of `size` bytes plus its trailing LF without
-/// storing it. NUL wins over invalid UTF-8, matching a full-buffer check.
-fn scan_discarded_body<R: BufRead>(
-	reader: &mut R,
-	size: u64,
-) -> io::Result<SkippedBlob> {
-	let mut left = size;
-	let mut saw_nul = false;
-	let mut invalid = false;
-	let mut carry = Vec::new();
-	let mut buf = [0u8; 8192];
-	while left > 0 {
-		let n = usize::try_from(left.min(buf.len() as u64))
-			.map_err(io::Error::other)?;
-		reader.read_exact(&mut buf[..n])?;
-		left -= n as u64;
-		if !saw_nul && buf[..n].contains(&0) {
-			saw_nul = true;
-		}
-		if !saw_nul
-			&& !invalid
-			&& utf8_chunk_invalid(&mut carry, &buf[..n], left == 0)
-		{
-			invalid = true;
-		}
-	}
-	let mut lf = [0u8; 1];
-	reader.read_exact(&mut lf)?;
-	if saw_nul {
-		Ok(SkippedBlob::Binary)
-	} else if invalid {
-		Ok(SkippedBlob::NotUtf8)
-	} else {
-		Ok(SkippedBlob::TextLargerThanCap { size })
-	}
-}
-
-/// `true` when `carry` + `chunk` is not valid UTF-8. An incomplete sequence
-/// at the end is kept in `carry` (at most 3 bytes) unless this is the last
-/// chunk, in which case it is invalid. A chunk is at most 8 KiB; the object
-/// body is not assembled.
-fn utf8_chunk_invalid(carry: &mut Vec<u8>, chunk: &[u8], eof: bool) -> bool {
-	if carry.is_empty() {
-		return match std::str::from_utf8(chunk) {
-			Ok(_) => false,
-			Err(e) => match e.error_len() {
-				Some(_) => true,
-				None => {
-					carry.extend_from_slice(&chunk[e.valid_up_to()..]);
-					eof
-				}
-			},
-		};
-	}
-	let mut tmp = Vec::with_capacity(carry.len() + chunk.len());
-	tmp.extend_from_slice(carry);
-	tmp.extend_from_slice(chunk);
-	carry.clear();
-	match std::str::from_utf8(&tmp) {
-		Ok(_) => false,
-		Err(e) => match e.error_len() {
-			Some(_) => true,
-			None => {
-				carry.extend_from_slice(&tmp[e.valid_up_to()..]);
-				eof
-			}
-		},
-	}
-}
-
-/// Reads one `cat-file --batch` header: `<oid> <type> <size>\n`, or
-/// `<object> missing\n` / `ambiguous` (`None`).
-pub fn read_batch_header<R: BufRead>(
-	reader: &mut R,
-) -> io::Result<Option<(String, String, u64)>> {
-	let mut header = Vec::new();
-	reader.read_until(b'\n', &mut header)?;
-	if header.pop() != Some(b'\n') {
-		return Err(io::ErrorKind::UnexpectedEof.into());
-	}
-	let header = String::from_utf8_lossy(&header);
-	// "<oid> <type> <size>": size is the last field. `missing` and
-	// `ambiguous` responses carry no body.
-	let mut fields = header.rsplitn(3, ' ');
-	let (Some(size), Some(kind), Some(oid)) =
-		(fields.next(), fields.next(), fields.next())
-	else {
-		return Ok(None);
-	};
-	Ok(size
-		.parse::<u64>()
-		.ok()
-		.map(|size| (oid.to_string(), kind.to_string(), size)))
-}
-
-fn read_batch_body<R: BufRead>(
-	reader: &mut R,
-	size: u64,
-) -> io::Result<Vec<u8>> {
-	let size = usize::try_from(size).map_err(io::Error::other)?;
-	let mut body = vec![0; size];
-	reader.read_exact(&mut body)?;
-	let mut lf = [0u8; 1];
-	reader.read_exact(&mut lf)?;
-	Ok(body)
-}
-
-/// Reads one `git cat-file --batch` response: `<oid> <type> <size>\n`
-/// followed by exactly `size` bytes and a LF, or `<object> missing\n`.
-/// `None` means the object is missing (or ambiguous).
-pub fn read_batch_response<R: BufRead>(
-	reader: &mut R,
-) -> io::Result<Option<Vec<u8>>> {
-	match read_batch_header(reader)? {
-		Some((_, _, size)) => read_batch_body(reader, size).map(Some),
-		None => Ok(None),
-	}
-}
-
 /// Which changes to copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitSource {
@@ -854,51 +600,6 @@ fn union_into(
 			gitlink: e.new_mode == "160000",
 		});
 	}
-}
-
-fn is_zero_oid(oid: &str) -> bool {
-	oid.bytes().all(|b| b == b'0')
-}
-
-/// A blob, capped at `max` bytes when given (checked from its header).
-fn read_blob(
-	cat: &mut CatFile,
-	object: &str,
-	max: Option<u64>,
-) -> Result<Option<Vec<u8>>, GitError> {
-	let Some(max) = max else {
-		return cat.read(object);
-	};
-	match cat.read_object(object, max)? {
-		CatObject::Missing => Ok(None),
-		CatObject::TooLarge { .. } => Err(GitError::OutputLimit {
-			args: format!("cat-file {object}"),
-			limit: usize::try_from(max).unwrap_or(usize::MAX),
-		}),
-		CatObject::Found { body, .. } => Ok(Some(body)),
-	}
-}
-
-fn read_text(
-	cat: &mut CatFile,
-	oid: &str,
-	max: Option<u64>,
-) -> Result<Option<String>, GitError> {
-	Ok(read_blob(cat, oid, max)?.and_then(decode_utf8_or_skip))
-}
-
-/// The pre-deletion content from the first OID that decodes, else the marker.
-fn deleted_content(
-	cat: &mut CatFile,
-	oids: &[String],
-	max: Option<u64>,
-) -> Result<String, GitError> {
-	for oid in oids.iter().filter(|o| !is_zero_oid(o)) {
-		if let Some(text) = read_text(cat, oid, max)? {
-			return Ok(text);
-		}
-	}
-	Ok(DELETED_FILE_MARKER.to_string())
 }
 
 fn path_entry(status: u8, path: Vec<u8>) -> RawEntry {
@@ -1285,6 +986,23 @@ fn read_working(
 	Ok(decode_utf8_or_skip(bytes))
 }
 
+fn copyable(
+	read: BlobRead,
+	spec: &str,
+	cap: u64,
+) -> Result<Option<String>, GitError> {
+	match read {
+		BlobRead::Text(s) => Ok(Some(s)),
+		BlobRead::Missing
+		| BlobRead::NotText(_)
+		| BlobRead::NotABlob { .. } => Ok(None),
+		BlobRead::TooLarge { .. } => Err(GitError::OutputLimit {
+			args: format!("cat-file {spec}"),
+			limit: usize::try_from(cap).unwrap_or(usize::MAX),
+		}),
+	}
+}
+
 fn read_changes(
 	git: &Git,
 	source: &GitSource,
@@ -1293,13 +1011,23 @@ fn read_changes(
 	opts: &RunOptions,
 ) -> Result<Vec<PayloadFile>, GitError> {
 	already_cancelled(opts, "read changes")?;
-	let mut cat = git.cat_file_with(opts.clone())?;
+	let mut blobs = BlobReader::new(opts);
+	let cap = max.unwrap_or(u64::MAX);
 	let mut files = Vec::new();
 	for c in changes {
 		already_cancelled(opts, "read changed file")?;
 		let change_type = change_type_for_status(c.status);
 		let content = if change_type == ChangeType::Deleted {
-			Some(deleted_content(&mut cat, &c.deleted_from, max)?)
+			match blobs.deleted_file_content(git, &c.deleted_from, cap)? {
+				DeletedContent::Text(t) => Some(t),
+				DeletedContent::Marker => Some(DELETED_FILE_MARKER.to_string()),
+				DeletedContent::TooLarge { spec, .. } => {
+					return Err(GitError::OutputLimit {
+						args: format!("cat-file {spec}"),
+						limit: usize::try_from(cap).unwrap_or(usize::MAX),
+					});
+				}
+			}
 		} else {
 			match source {
 				GitSource::Working => {
@@ -1310,11 +1038,18 @@ fn read_changes(
 				// TS: `readRefContent(...) ?? UNREADABLE_FILE_MARKER`, so a
 				// non-UTF-8 blob is the marker too.
 				GitSource::Staged => Some(
-					read_blob(&mut cat, &c.new_oid, max)?
-						.and_then(decode_utf8_or_skip)
-						.unwrap_or_else(|| UNREADABLE_FILE_MARKER.to_string()),
+					copyable(
+						blobs.read(git, &c.new_oid, cap)?,
+						&c.new_oid,
+						cap,
+					)?
+					.unwrap_or_else(|| UNREADABLE_FILE_MARKER.to_string()),
 				),
-				_ => read_text(&mut cat, &c.new_oid, max)?,
+				_ => copyable(
+					blobs.read(git, &c.new_oid, cap)?,
+					&c.new_oid,
+					cap,
+				)?,
 			}
 		};
 		already_cancelled(opts, "read changed file")?;
@@ -1325,7 +1060,7 @@ fn read_changes(
 			skipped_reason: None,
 		});
 	}
-	cat.close()?;
+	blobs.close()?;
 	already_cancelled(opts, "read changes")?;
 	Ok(files)
 }
@@ -1539,87 +1274,6 @@ mod tests {
 
 	use super::*;
 	use std::fs;
-	use std::io::Cursor;
-
-	// ---- catFile.test.ts ----
-
-	fn batch(entries: &[(&str, &[u8])]) -> Vec<u8> {
-		let mut out = Vec::new();
-		for (oid, body) in entries {
-			if *oid == "missing" {
-				out.extend_from_slice(b"abc:gone.ts missing\n");
-			} else {
-				out.extend_from_slice(
-					format!("{oid} blob {}\n", body.len()).as_bytes(),
-				);
-				out.extend_from_slice(body);
-				out.push(b'\n');
-			}
-		}
-		out
-	}
-
-	fn text(r: &mut Cursor<Vec<u8>>) -> Option<String> {
-		read_batch_response(r)
-			.unwrap()
-			.and_then(decode_utf8_or_skip)
-	}
-
-	#[test]
-	fn cat_file_parses_blobs_in_request_order() {
-		let mut r = Cursor::new(batch(&[
-			("1111", b"const a = 1;\n"),
-			("2222", b"export const b = 2;"),
-		]));
-		assert_eq!(text(&mut r).as_deref(), Some("const a = 1;\n"));
-		assert_eq!(text(&mut r).as_deref(), Some("export const b = 2;"));
-	}
-
-	#[test]
-	fn cat_file_reads_by_byte_count_not_lines() {
-		let tricky = "line1\n0000 blob 5\nline2";
-		let mut r = Cursor::new(batch(&[
-			("aaaa", tricky.as_bytes()),
-			("bbbb", b"next"),
-		]));
-		assert_eq!(text(&mut r).as_deref(), Some(tricky));
-		assert_eq!(text(&mut r).as_deref(), Some("next"));
-	}
-
-	#[test]
-	fn cat_file_missing_is_distinct_and_keeps_alignment() {
-		let mut r =
-			Cursor::new(batch(&[("missing", b""), ("3333", b"still here")]));
-		assert_eq!(read_batch_response(&mut r).unwrap(), None);
-		assert_eq!(text(&mut r).as_deref(), Some("still here"));
-	}
-
-	#[test]
-	fn cat_file_binary_and_non_utf8_are_skipped() {
-		let mut r = Cursor::new(batch(&[
-			("4444", &[0x50, 0x4e, 0x47, 0x00, 0x44]),
-			("aaa", &[0xa4, 0xe9, 0xa5, 0xbb]), // Big5
-			("bbb", b"ok"),
-		]));
-		assert_eq!(text(&mut r), None);
-		assert_eq!(text(&mut r), None);
-		assert_eq!(text(&mut r).as_deref(), Some("ok"));
-	}
-
-	#[test]
-	fn cat_file_empty_blob_is_empty_not_missing() {
-		let mut r = Cursor::new(batch(&[("5555", b"")]));
-		assert_eq!(read_batch_response(&mut r).unwrap(), Some(Vec::new()));
-	}
-
-	#[test]
-	fn cat_file_truncated_output_is_an_error_after_good_entries() {
-		let mut r =
-			Cursor::new(b"6666 blob 4\nabcd\n7777 blob 100\nshort".to_vec());
-		assert_eq!(text(&mut r).as_deref(), Some("abcd"));
-		assert!(read_batch_response(&mut r).is_err());
-	}
-
 	#[test]
 	fn cat_file_process_round_trip() {
 		let r = Repo::new();
@@ -1635,33 +1289,7 @@ mod tests {
 	}
 
 	#[test]
-	fn discarded_body_scan_matches_full_buffer_classification() {
-		let mut split = vec![b'a'; 8191];
-		split.extend_from_slice("你".as_bytes());
-		assert_eq!(
-			classify_discarded(&split),
-			SkippedBlob::TextLargerThanCap {
-				size: split.len() as u64
-			}
-		);
-		let mut broken = vec![b'a'; 8191];
-		broken.push(0xE4);
-		broken.push(b' ');
-		assert_eq!(classify_discarded(&broken), SkippedBlob::NotUtf8);
-		let mut binary = vec![b'a'; 9000];
-		binary.push(0);
-		assert_eq!(classify_discarded(&binary), SkippedBlob::Binary);
-	}
-
-	fn classify_discarded(body: &[u8]) -> SkippedBlob {
-		let mut raw = body.to_vec();
-		raw.push(b'\n');
-		scan_discarded_body(&mut std::io::Cursor::new(raw), body.len() as u64)
-			.unwrap()
-	}
-
-	#[test]
-	fn capped_blob_does_not_keep_an_oversize_body_and_stays_in_sync() {
+	fn read_classified_does_not_keep_an_oversize_body_and_stays_in_sync() {
 		let r = Repo::new();
 		let big = "你".repeat(12_000);
 		r.write("big.txt", big.as_bytes());
@@ -1681,25 +1309,170 @@ mod tests {
 		let big_oid = String::from_utf8(big_oid).unwrap();
 		let big_oid = big_oid.trim();
 		let mut cat = git.cat_file().unwrap();
-		match cat.read_blob_capped(big_oid, 64).unwrap() {
-			CappedBlob::Skipped(SkippedBlob::TextLargerThanCap { size }) => {
-				assert_eq!(size, big.len() as u64);
+		assert_eq!(
+			cat.read_classified(big_oid, 64).unwrap(),
+			BlobRead::TooLarge {
+				size: big.len() as u64,
+				not_text: None,
 			}
+		);
+		match cat.read_classified("HEAD:late.bin", 32).unwrap() {
+			BlobRead::TooLarge {
+				not_text: Some(crate::blob::NotText::Binary),
+				..
+			} => {}
 			other => panic!("{other:?}"),
 		}
-		match cat.read_blob_capped("HEAD:late.bin", 32).unwrap() {
-			CappedBlob::Skipped(SkippedBlob::Binary) => {}
+		match cat.read_classified("HEAD:bad.txt", 32).unwrap() {
+			BlobRead::TooLarge {
+				not_text: Some(crate::blob::NotText::NotUtf8),
+				..
+			} => {}
 			other => panic!("{other:?}"),
 		}
-		match cat.read_blob_capped("HEAD:bad.txt", 32).unwrap() {
-			CappedBlob::Skipped(SkippedBlob::NotUtf8) => {}
-			other => panic!("{other:?}"),
-		}
-		match cat.read_blob_capped("HEAD:small.txt", 64).unwrap() {
-			CappedBlob::Retained(body) => assert_eq!(body, b"small\n"),
-			other => panic!("{other:?}"),
-		}
+		assert_eq!(
+			cat.read_classified("HEAD:small.txt", 64).unwrap(),
+			BlobRead::Text("small\n".into())
+		);
 		cat.close().unwrap();
+	}
+
+	#[test]
+	fn blob_reader_reopens_on_another_repository_and_close_is_ok_when_unused() {
+		let mut unused = BlobReader::new(&RunOptions::default());
+		assert!(unused.close().is_ok());
+
+		let r_a = Repo::new();
+		r_a.write("f.txt", b"repo A\n");
+		r_a.commit("init A");
+		let g_a = Git::open(&r_a.path()).unwrap();
+
+		let r_b = Repo::new();
+		r_b.write("f.txt", b"repo B\n");
+		r_b.commit("init B");
+		let g_b = Git::open(&r_b.path()).unwrap();
+
+		let mut reader = BlobReader::new(&RunOptions::default());
+		assert_eq!(
+			reader.read(&g_a, "HEAD:f.txt", 1024).unwrap(),
+			BlobRead::Text("repo A\n".into())
+		);
+		assert_eq!(
+			reader.read(&g_b, "HEAD:f.txt", 1024).unwrap(),
+			BlobRead::Text("repo B\n".into())
+		);
+		assert_eq!(
+			reader.read(&g_a, "HEAD:f.txt", 1024).unwrap(),
+			BlobRead::Text("repo A\n".into())
+		);
+		reader.close().unwrap();
+	}
+
+	#[test]
+	fn blob_reader_polls_cancel_before_each_read() {
+		let r = Repo::new();
+		r.write("a.txt", b"ok\n");
+		r.commit("init");
+		let g = Git::open(&r.path()).unwrap();
+
+		let token = CancelToken::new();
+		token.cancel();
+		let opts = RunOptions {
+			cancel: Some(token),
+			..RunOptions::default()
+		};
+		let mut reader = BlobReader::new(&opts);
+		let err = reader.read(&g, "HEAD:a.txt", 1024).unwrap_err();
+		match err {
+			GitError::Cancelled { args } => {
+				assert!(args.contains("cat-file"), "args was {args}");
+			}
+			other => panic!("expected Cancelled, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn payload_gitlink_commit_object_is_not_file_content() {
+		let r = Repo::new();
+		r.write("a.txt", b"a\n");
+		let base = r.commit("base");
+		let g_base = Git::open(&r.path()).unwrap();
+		let base_res = collect_payload(
+			&g_base,
+			&GitSource::Commit("HEAD".into()),
+			&[r.path()],
+			&Settings::default(),
+		)
+		.unwrap();
+
+		r.git(&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{base},sub"),
+		]);
+		r.write("a.txt", b"b\n");
+		r.git(&["add", "a.txt"]);
+		r.git(&["commit", "-q", "-m", "bump"]);
+		let g = Git::open(&r.path()).unwrap();
+		let res = collect_payload(
+			&g,
+			&GitSource::Commit("HEAD".into()),
+			&[r.path()],
+			&Settings::default(),
+		)
+		.unwrap();
+
+		assert!(!res.files.iter().any(|f| f.path == "sub"));
+		assert!(!res.payload.contains("\nparent "));
+		assert!(!res.payload.contains("tree "));
+		assert_eq!(
+			res.skipped_unreadable_count,
+			base_res.skipped_unreadable_count + 1
+		);
+	}
+
+	#[test]
+	fn read_changed_file_for_deleted_oversize_binary_is_the_marker() {
+		let r = Repo::new();
+		let mut bin = vec![b'a'; 20_000];
+		bin[10] = 0;
+		r.write("x.bin", &bin);
+		let text = "a\n".repeat(10_000);
+		r.write("x.txt", text.as_bytes());
+		r.commit("add files");
+
+		r.git(&["rm", "x.bin", "x.txt"]);
+		let sha = r.commit("del files");
+		let g = Git::open(&r.path()).unwrap();
+		let opts = RunOptions::default();
+
+		let bin_file = read_changed_file_for(
+			&g,
+			&GitSource::Commit(sha.clone()),
+			"x.bin",
+			ChangeType::Deleted,
+			None,
+			64,
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(bin_file.content.as_deref(), Some(DELETED_FILE_MARKER));
+
+		let text_err = read_changed_file_for(
+			&g,
+			&GitSource::Commit(sha),
+			"x.txt",
+			ChangeType::Deleted,
+			None,
+			64,
+			&opts,
+		)
+		.unwrap_err();
+		assert!(
+			matches!(text_err, GitError::OutputLimit { .. }),
+			"expected OutputLimit, got {text_err:?}"
+		);
 	}
 
 	// ---- gitCopy.test.ts ----
