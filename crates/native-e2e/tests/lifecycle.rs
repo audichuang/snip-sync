@@ -381,7 +381,7 @@ fn find_wid(pid: u32) -> String {
 		// The child is not reaped yet, so an app that died stays a zombie.
 		if proc_rest(pid).is_none_or(|rest| rest[0] == "Z") {
 			panic!(
-				"app pid {pid} exited before mapping a window (DISPLAY={:?}); see its [APP STDERR] above",
+				"app pid {pid} exited before mapping a window (DISPLAY={:?}); see its [APP STDERR] lines",
 				std::env::var_os("DISPLAY")
 			);
 		}
