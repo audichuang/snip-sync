@@ -614,7 +614,7 @@ fn read_change_list(
 	// status feeds both the list and the repo's summary.
 	let (summary, details) = match known {
 		Some(id) => {
-			let git = Git::at_known_root(id.toplevel.clone());
+			let git = Git::at_known_root(id);
 			let (summary, details) = summarize_with_details(&git, id, &opts)
 				.map_err(|e| e.to_string())?;
 			(Some(summary), details)
