@@ -101,8 +101,7 @@ impl CatFile {
 	/// 大小判定先於型別判定；超限內容一律回傳 `TooLarge`。
 	///
 	/// body 被截斷（略過超限或非 blob 的 body 時 EOF）一律回傳 `GitError::Malformed`，
-	/// 與 develop 的 gitsrc／transfer 相同；commits 的超限掃描以前走 `Session::error`
-	/// （依 exit 回 Failed/Io/Timeout），現在也回 `Malformed`，此為刻意接受的變更。
+	/// 所有呼叫端（gitsrc、transfer、commits）相同。
 	pub(crate) fn read_classified(
 		&mut self,
 		object: &str,
