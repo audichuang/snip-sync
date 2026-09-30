@@ -184,6 +184,7 @@ init_repo "$FIX/commits-dst-present"
 printf 'readme\n' > "$FIX/commits-dst-present/README.md"
 printf 'a\0b\n' > "$FIX/commits-dst-present/binary.dat"
 printf 'gone\n' > "$FIX/commits-dst-present/gone.txt"
+printf 'old\n' > "$FIX/commits-dst-present/old.txt"
 mkdir -p "$FIX/commits-dst-present/dir"
 printf 'folder-gone\n' > "$FIX/commits-dst-present/dir/gone.txt"
 commit "$FIX/commits-dst-present" '2026-03-01T00:00:00+08:00' '2026-03-01T00:01:00+08:00' 'dst present'
@@ -197,6 +198,34 @@ commit "$FIX/basket-src" '2026-04-01T09:00:00+08:00' '2026-04-01T09:01:00+08:00'
 printf 'keep-2\n' > "$FIX/basket-src/dir/keep.txt"
 rm "$FIX/basket-src/dir/gone.txt"
 commit "$FIX/basket-src" '2026-04-02T09:00:00+08:00' '2026-04-02T09:01:00+08:00' 'basket folder and delete'
+
+init_repo "$FIX/nonutf8-src"
+printf 'readme\n' > "$FIX/nonutf8-src/README.md"
+printf 'caf\351\n' > "$FIX/nonutf8-src/latin1.txt"
+commit "$FIX/nonutf8-src" '2026-05-01T09:00:00+08:00' '2026-05-01T09:01:00+08:00' 'nonutf8 base'
+printf 'caf\351!\n' > "$FIX/nonutf8-src/latin1.txt"
+printf 'ok\n' > "$FIX/nonutf8-src/ok.txt"
+commit "$FIX/nonutf8-src" '2026-05-02T09:00:00+08:00' '2026-05-02T09:01:00+08:00' 'N1 modify latin1 add ok'
+g "$FIX/nonutf8-src" rm latin1.txt >/dev/null
+commit "$FIX/nonutf8-src" '2026-05-03T09:00:00+08:00' '2026-05-03T09:01:00+08:00' 'N2 delete latin1'
+
+init_repo "$FIX/nonutf8-dst"
+printf 'readme\n' > "$FIX/nonutf8-dst/README.md"
+printf 'caf\351\n' > "$FIX/nonutf8-dst/latin1.txt"
+printf 'caf\351\n' > "$FIX/nonutf8-dst/common.txt"
+commit "$FIX/nonutf8-dst" '2026-05-01T00:00:00+08:00' '2026-05-01T00:01:00+08:00' 'nonutf8 dst'
+g "$FIX/nonutf8-dst" checkout -b qa-replay >/dev/null
+
+init_repo "$FIX/blocked-src"
+printf 'readme\n' > "$FIX/blocked-src/README.md"
+commit "$FIX/blocked-src" '2026-06-01T09:00:00+08:00' '2026-06-01T09:01:00+08:00' 'blocked base'
+mkdir -p "$FIX/blocked-src/newdir"
+printf 'x\n' > "$FIX/blocked-src/newdir/x.txt"
+printf 'fresh\n' > "$FIX/blocked-src/fresh.txt"
+commit "$FIX/blocked-src" '2026-06-02T09:00:00+08:00' '2026-06-02T09:01:00+08:00' 'B1 blocked dir and fresh'
+
+# A regular file used as a paste destination (K05-key).
+printf 'i am a file\n' > "$FIX/file-dst"
 
 init_repo "$FIX/commits-dst-hooks"
 printf 'readme\n' > "$FIX/commits-dst-hooks/README.md"
