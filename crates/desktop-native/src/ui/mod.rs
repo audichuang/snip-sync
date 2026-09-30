@@ -2056,24 +2056,64 @@ mod tests {
 			("op_skip", pal.git_modified, "reason_exists")
 		);
 
-		for action in [
-			RowAction::Excluded { by_commit: true },
-			RowAction::Excluded { by_commit: false },
-			RowAction::Skip(SkipCause::Binary),
-			RowAction::Skip(SkipCause::NonUtf8),
-			RowAction::Skip(SkipCause::NonUtf8Path),
-			RowAction::Skip(SkipCause::UnsupportedType),
-			RowAction::Skip(SkipCause::Unreadable),
-			RowAction::Skip(SkipCause::UnsafePath),
-			RowAction::Skip(SkipCause::NonUtf8Target),
-			RowAction::Skip(SkipCause::Other),
-			RowAction::Delete,
-			RowAction::DeleteMissing,
-			RowAction::Create,
-			RowAction::Overwrite,
-			RowAction::OverwritePending,
-			RowAction::KeepExisting,
-		] {
+		fn all_skip_causes() -> Vec<SkipCause> {
+			let causes = vec![
+				SkipCause::Binary,
+				SkipCause::NonUtf8,
+				SkipCause::NonUtf8Path,
+				SkipCause::UnsupportedType,
+				SkipCause::Unreadable,
+				SkipCause::UnsafePath,
+				SkipCause::NonUtf8Target,
+				SkipCause::Other,
+			];
+			for &cause in &causes {
+				match cause {
+					SkipCause::Binary => {}
+					SkipCause::NonUtf8 => {}
+					SkipCause::NonUtf8Path => {}
+					SkipCause::UnsupportedType => {}
+					SkipCause::Unreadable => {}
+					SkipCause::UnsafePath => {}
+					SkipCause::NonUtf8Target => {}
+					SkipCause::Other => {}
+				}
+			}
+			causes
+		}
+
+		fn all_actions() -> Vec<RowAction> {
+			let mut actions = Vec::new();
+			actions.push(RowAction::Excluded { by_commit: true });
+			actions.push(RowAction::Excluded { by_commit: false });
+			for cause in all_skip_causes() {
+				actions.push(RowAction::Skip(cause));
+			}
+			actions.push(RowAction::Delete);
+			actions.push(RowAction::DeleteMissing);
+			actions.push(RowAction::Create);
+			actions.push(RowAction::Overwrite);
+			actions.push(RowAction::OverwritePending);
+			actions.push(RowAction::KeepExisting);
+
+			for &action in &actions {
+				match action {
+					RowAction::Excluded {
+						by_commit: true | false,
+					} => {}
+					RowAction::Skip(_) => {}
+					RowAction::Delete => {}
+					RowAction::DeleteMissing => {}
+					RowAction::Create => {}
+					RowAction::Overwrite => {}
+					RowAction::OverwritePending => {}
+					RowAction::KeepExisting => {}
+				}
+			}
+			actions
+		}
+
+		for action in all_actions() {
 			let (op_key, _, reason_key) = paste_style(action);
 			assert!(!crate::i18n::t(op_key, Locale::ZhTw).is_empty());
 			assert!(!crate::i18n::t(op_key, Locale::En).is_empty());

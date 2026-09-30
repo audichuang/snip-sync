@@ -5178,7 +5178,9 @@ impl WorkbenchModel {
 	}
 
 	fn show_landed_plan(&mut self, remap: Option<(String, bool)>) {
+		// `Landed::Shown` guarantees an installed plan (see its doc).
 		let plan = self.paste.plan().expect("Shown installs a plan");
+		let items_count = plan.items.len();
 		if let Some((prefix, keep)) = remap {
 			let dest = prefix_target(plan, &prefix, keep);
 			let keep_note = if keep { " keep=primary" } else { "" };
@@ -5187,7 +5189,7 @@ impl WorkbenchModel {
 				prefix,
 				keep_note,
 				dest,
-				plan.items.len()
+				items_count
 			);
 		} else {
 			for choice in &plan.prefix_choices {
@@ -5202,12 +5204,12 @@ impl WorkbenchModel {
 			}
 			app_log!(
 				"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
-				plan.items.len(),
+				items_count,
 				plan.destination.display(),
 				plan.mapping_ready()
 			);
 		}
-		self.set_status("status_paste_preview", [plan.items.len().to_string()]);
+		self.set_status("status_paste_preview", [items_count.to_string()]);
 		if self.paste.collapse_log(&mut self.bottom_visible) {
 			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
 		}
@@ -6767,6 +6769,57 @@ mod tests {
 					.filter(|i| i.commit == Some(0))
 					.all(|i| i.selected));
 				assert!(plan.error.is_none());
+			});
+		}
+
+		#[gpui::test]
+		fn nav_up_and_down_move_paste_selection_and_detail(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &mixed_commit_payload());
+
+			let (initial_idx, initial_path, order) =
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					let order = plan.display_order();
+					(
+						plan.selected_item_idx,
+						m.paste.detail().and_then(|d| d.path.clone()),
+						order,
+					)
+				});
+			assert_eq!(initial_idx, order[0]);
+			assert_eq!(initial_path.as_deref(), Some("img.bin"));
+
+			cx.simulate_keystrokes("down");
+			cx.run_until_parked();
+
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, order[1]);
+				assert_eq!(
+					m.paste.detail().and_then(|d| d.path.as_deref()),
+					Some("fresh.txt")
+				);
+			});
+
+			cx.simulate_keystrokes("up");
+			cx.run_until_parked();
+
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, order[0]);
+				assert_eq!(
+					m.paste.detail().and_then(|d| d.path.as_deref()),
+					Some("img.bin")
+				);
 			});
 		}
 

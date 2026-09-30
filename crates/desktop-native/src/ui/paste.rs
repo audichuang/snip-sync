@@ -1,7 +1,7 @@
 //! Paste preview in the editor area.
 
 use super::*;
-use crate::paste::{commit_header_id, PasteCounts, PlannedOp, RowControl};
+use crate::paste::{commit_header_id, PasteCounts, RowControl};
 
 impl WorkbenchModel {
 	// ───────────────────────── paste ─────────────────────────
@@ -497,16 +497,11 @@ impl WorkbenchModel {
 						.flex_shrink_0()
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
-						.child(
-							if matches!(
-								item.op,
-								PlannedOp::Delete | PlannedOp::Skip(_)
-							) {
-								String::new()
-							} else {
-								format!("{} B", item.bytes)
-							},
-						),
+						.child(if item.writes_content() {
+							format!("{} B", item.bytes)
+						} else {
+							String::new()
+						}),
 				)
 				// Fixed column so the toggles line up whether or not a row
 				// can be overwritten.

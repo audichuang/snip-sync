@@ -100,7 +100,7 @@ pub enum PasteRequest {
 }
 
 impl PasteRequest {
-	fn bytes(&self) -> usize {
+	pub(crate) fn bytes(&self) -> usize {
 		size_of::<Self>().saturating_add(match self {
 			Self::Clipboard {
 				text, dest, roots, ..
@@ -308,7 +308,7 @@ impl PastePending {
 	}
 }
 
-enum PasteInput {
+pub(crate) enum PasteInput {
 	Clipboard(PasteRequest),
 	Remap {
 		plan: PastePreviewPlan,
@@ -317,7 +317,7 @@ enum PasteInput {
 	},
 }
 impl PasteInput {
-	fn bytes(&self) -> usize {
+	pub(crate) fn bytes(&self) -> usize {
 		size_of::<Self>().saturating_add(match self {
 			Self::Clipboard(request) => request.bytes(),
 			Self::Remap { plan, prefix, .. } => {
@@ -520,6 +520,10 @@ pub struct PasteItem {
 impl PasteItem {
 	pub fn is_delete(&self) -> bool {
 		matches!(self.op, PlannedOp::Delete)
+	}
+
+	pub fn writes_content(&self) -> bool {
+		matches!(self.op, PlannedOp::Create | PlannedOp::Overwrite)
 	}
 
 	/// An existing destination file that the user may choose to overwrite.
@@ -1411,10 +1415,12 @@ impl PastePreviewPlan {
 	}
 
 	/// Up / Down follow the rows on screen (the change tree's order).
+	#[cfg(test)]
 	pub fn select_prev(&mut self) {
 		self.selected_item_idx = self.step_target(false);
 	}
 
+	#[cfg(test)]
 	pub fn select_next(&mut self) {
 		self.selected_item_idx = self.step_target(true);
 	}
@@ -2191,6 +2197,8 @@ mod tests {
 		.is_err());
 	}
 
+	// 導覽被拒的那一半已搬到
+	// paste::preview::tests::refused_navigation_keeps_plan_selection_detail_and_busy_state。
 	#[test]
 	fn retained_budget_admits_aggregate_only_and_preserves_read_only_navigation(
 	) {
@@ -2470,15 +2478,30 @@ mod tests {
 		);
 	}
 
-	fn git_init(path: &Path) {
+	pub(crate) fn git_init(path: &Path) {
 		let git = |args: &[&str]| {
-			let out = std::process::Command::new("git")
+			let mut child = std::process::Command::new("git")
 				.current_dir(path)
 				.args(args)
-				.output()
-				.unwrap();
+				.stdout(std::process::Stdio::piped())
+				.stderr(std::process::Stdio::piped())
+				.spawn()
+				.expect("spawn git");
+			let start = std::time::Instant::now();
+			let timeout = std::time::Duration::from_secs(10);
+			let status = loop {
+				if let Some(status) = child.try_wait().expect("try_wait") {
+					break status;
+				}
+				if start.elapsed() > timeout {
+					let _ = child.kill();
+					panic!("git {args:?} timed out after {timeout:?}");
+				}
+				std::thread::sleep(std::time::Duration::from_millis(10));
+			};
+			let out = child.wait_with_output().expect("wait_with_output");
 			assert!(
-				out.status.success(),
+				status.success(),
 				"git {args:?}: {}",
 				String::from_utf8_lossy(&out.stderr)
 			);
@@ -3283,5 +3306,30 @@ mod tests {
 			"paste-overwrite:3:長路徑/a b.txt"
 		);
 		assert_eq!(commit_header_id(2), "paste-commit:2");
+	}
+
+	#[test]
+	fn writes_content_matches_only_create_and_overwrite() {
+		let make = |op| PasteItem {
+			path: "a.txt".into(),
+			dest_root: PathBuf::new(),
+			dest_root_name: String::new(),
+			dest_path: PathBuf::new(),
+			dest_exists: false,
+			op,
+			overwrite_allowed: false,
+			selected: true,
+			content: Arc::from(""),
+			bytes: 42,
+			lines: 1,
+			op_index: 0,
+			commit: None,
+			rename_note: None,
+		};
+		assert!(make(PlannedOp::Create).writes_content());
+		assert!(make(PlannedOp::Overwrite).writes_content());
+		assert!(!make(PlannedOp::Delete).writes_content());
+		assert!(!make(PlannedOp::Skip(SkipCause::Binary)).writes_content());
+		assert!(!make(PlannedOp::Skip(SkipCause::Other)).writes_content());
 	}
 }

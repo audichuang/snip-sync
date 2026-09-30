@@ -41,8 +41,16 @@ pub enum Polled {
 
 #[derive(Debug)]
 pub enum Landed {
-	Shown { remap: Option<(String, bool)> },
-	Refused { err: Msg, closed: bool },
+	/// A candidate plan was admitted into the session and installed as `self.plan`.
+	///
+	/// Invariant: whenever `Landed::Shown` is produced, `self.plan` is guaranteed to be `Some`.
+	Shown {
+		remap: Option<(String, bool)>,
+	},
+	Refused {
+		err: Msg,
+		closed: bool,
+	},
 	WorkerLost,
 }
 
@@ -78,6 +86,8 @@ pub enum ApplyRefused {
 
 /// Re-admits a state that only shrank since its last admission. Dropping or
 /// shrinking retained UI data never needs more budget than was admitted.
+/// The argument-free budget error adds no retained heap, so replacing any
+/// admitted error with it cannot grow the state.
 fn release(
 	pending: &mut PastePending,
 	ordinary: Option<&Preview>,
@@ -443,6 +453,7 @@ impl PastePreview {
 
 #[cfg(test)]
 mod tests {
+	use super::super::tests::git_init;
 	use super::*;
 	use crate::reader::PreviewSource;
 	use crate::syntax::Language;
@@ -500,16 +511,6 @@ mod tests {
 			sha: String::with_capacity(MAX_RETAINED_PREVIEW_BYTES - used),
 		};
 		s.admit_ordinary(Some(ordinary)).unwrap();
-	}
-
-	fn git_init(dir: &Path) {
-		let out = std::process::Command::new("git")
-			.arg("init")
-			.arg("-q")
-			.arg(dir)
-			.status()
-			.expect("git init");
-		assert!(out.success());
 	}
 
 	#[test]
@@ -651,47 +652,121 @@ mod tests {
 				st.ui_raw.as_ref(),
 			)
 		};
-		o.source = PreviewSource::CommitFile {
-			sha: String::with_capacity(
-				MAX_RETAINED_PREVIEW_BYTES.saturating_sub(used + 1024),
-			),
-		};
-		s.admit_ordinary(Some(&o)).unwrap();
 
 		let dir = tempfile::tempdir().unwrap();
 		let text = "// FILE: small.txt\ncontent\n";
-		// Enqueue may succeed or fail depending on request bytes vs remaining 1024 bytes.
-		match s.enqueue(PasteRequest::Clipboard {
+		let req = PasteRequest::Clipboard {
 			text: text.into(),
 			dest: dir.path().into(),
 			roots: Vec::new(),
 			generation: 1,
-		}) {
-			Ok(()) => {
-				let job = s.start_job().unwrap();
-				if let Some((work, cancel)) = job {
-					work.run(&RunOptions::default());
-					s.bind_job(1, cancel);
-					let polled = s.poll(false, Some(&o));
-					assert!(matches!(
-						polled,
-						Polled::Settled {
-							landed: Some(Landed::Refused {
-								ref err,
-								closed: true,
-							}),
-							..
-						} if err.key == "preview_memory_limit"
-					));
-					assert!(s.plan().is_none());
-					assert!(s.detail().is_none());
-				}
+		};
+		let req_bytes = req.bytes();
+		let headroom =
+			req_bytes + std::mem::size_of::<crate::paste::PasteInput>() + 64;
+		o.source = PreviewSource::CommitFile {
+			sha: String::with_capacity(
+				MAX_RETAINED_PREVIEW_BYTES.saturating_sub(used + headroom),
+			),
+		};
+		s.admit_ordinary(Some(&o)).unwrap();
+
+		s.enqueue(req).unwrap();
+		let (work, cancel) = s.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		s.bind_job(1, cancel);
+		let polled = s.poll(false, Some(&o));
+		assert!(matches!(
+			polled,
+			Polled::Settled {
+				landed: Some(Landed::Refused {
+					ref err,
+					closed: true,
+				}),
+				..
+			} if err.key == "preview_memory_limit"
+		));
+		assert!(s.plan().is_none());
+		assert!(s.detail().is_none());
+	}
+
+	#[test]
+	fn refused_landing_with_existing_plan_rolls_back_and_closes_when_readmission_fails(
+	) {
+		let dir = tempfile::tempdir().unwrap();
+		let mut s = PastePreview::new(None);
+		let o = small_ordinary();
+		s.admit_ordinary(Some(&o)).unwrap();
+
+		let text1 = "// FILE: initial.txt\nhello world\n";
+		s.enqueue(PasteRequest::Clipboard {
+			text: text1.into(),
+			dest: dir.path().into(),
+			roots: Vec::new(),
+			generation: 1,
+		})
+		.unwrap();
+		let (work1, cancel1) = s.start_job().unwrap().expect("job 1");
+		work1.run(&RunOptions::default());
+		s.bind_job(1, cancel1);
+		let polled1 = s.poll(false, Some(&o));
+		assert!(matches!(
+			polled1,
+			Polled::Settled {
+				landed: Some(Landed::Shown { .. }),
+				..
 			}
-			Err(err) => {
-				assert_eq!(err.key, "preview_memory_limit");
-				assert!(s.plan().is_none());
-			}
-		}
+		));
+		assert!(s.plan().is_some());
+		assert!(s.detail().is_some());
+
+		let text2 = "// FILE: next.txt\nmore content\n";
+		let req2 = PasteRequest::Clipboard {
+			text: text2.into(),
+			dest: dir.path().into(),
+			roots: Vec::new(),
+			generation: 2,
+		};
+		s.enqueue(req2).unwrap();
+		let (work2, cancel2) = s.start_job().unwrap().expect("job 2");
+		work2.run(&RunOptions::default());
+		s.bind_job(2, cancel2);
+
+		let empty_s = PastePreview::new(None);
+		let base_used = {
+			let st = lock_pending(&empty_s.pending);
+			st.total_with_ui(
+				st.ui_bytes,
+				st.apply_allowance,
+				st.ui_raw.as_ref(),
+			)
+		};
+		let o_bloated = Preview::new(
+			PreviewSource::CommitFile {
+				sha: String::with_capacity(
+					MAX_RETAINED_PREVIEW_BYTES.saturating_sub(base_used + 500),
+				),
+			},
+			Some("bloated.txt".into()),
+			String::new(),
+			false,
+			Language::Plain,
+		);
+
+		let polled2 = s.poll(false, Some(&o_bloated));
+		assert!(matches!(
+			polled2,
+			Polled::Settled {
+				landed: Some(Landed::Refused {
+					ref err,
+					closed: true,
+				}),
+				..
+			} if err.key == "preview_memory_limit"
+		));
+		assert!(s.plan().is_none());
+		assert!(s.detail().is_none());
+		assert!(s.admit_ordinary(Some(&o_bloated)).is_ok());
 	}
 
 	#[test]
@@ -856,5 +931,6 @@ mod tests {
 		vis = true;
 		assert!(!s.restore_log(&mut vis));
 		assert!(vis);
+		assert!(s.log_before.is_none());
 	}
 }
