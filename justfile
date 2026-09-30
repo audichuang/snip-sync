@@ -40,7 +40,8 @@ preflight-linux: preflight-workflows
 	{{just_executable()}} preflight-rust || rc=$?
 	wait "$harness" || { rc=$?; cat "$log"; }
 	[ "$rc" -eq 0 ] || exit "$rc"
-	{{just_executable()}} native_python="{{native_python}}" native-acceptance
+	# Extra acceptance flags, e.g. less parallelism where the machine is small.
+	{{just_executable()}} native_python="{{native_python}}" native-acceptance ${SNIP_ACCEPTANCE_ARGS:-}
 
 # Same as CI's Lint Workflows job; needs actionlint and shellcheck on PATH.
 preflight-workflows:

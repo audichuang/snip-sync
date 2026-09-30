@@ -117,9 +117,15 @@ for name in "$target_volume" snip-preflight-cargo-registry snip-preflight-cargo-
 	container volume inspect "$name" >/dev/null 2>&1 || container volume create "$name" >/dev/null
 done
 
+# native-acceptance runs five gates at once by default, each with its own Xvfb and
+# CPU-rendered apps. CI gives every gate its own runner and runs one collaboration step
+# at a time. In one VM, whose CPU quota throttles all of them together, five gates and
+# even two missed fixed waits (Xvfb startup, app log lines); one of each, as in CI, holds.
+export SNIP_ACCEPTANCE_ARGS="${SNIP_ACCEPTANCE_ARGS---jobs 1 --collaboration-jobs 1}"
+
 # Only settings that mean the same inside; host paths (SNIP_NATIVE_PYTHON, SNIP_NATIVE_BIN) do not.
 envs=()
-for name in SNIP_E2E_TIMEOUT_SCALE SNIP_REQUIRE_ALL_TESTS CARGO_BUILD_JOBS; do
+for name in SNIP_E2E_TIMEOUT_SCALE SNIP_REQUIRE_ALL_TESTS SNIP_ACCEPTANCE_ARGS CARGO_BUILD_JOBS; do
 	if [ -n "${!name+x}" ]; then envs+=(-e "$name"); fi
 done
 

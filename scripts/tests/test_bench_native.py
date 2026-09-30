@@ -33,6 +33,7 @@ import warnings
 from contextlib import redirect_stderr
 from typing import Any
 import unittest
+from unittest import mock
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SCRIPTS_DIR not in sys.path:
@@ -48,6 +49,7 @@ from bench_native_memory import (  # noqa: E402
     assert_current_basket_empty,
     check_repo_state,
     check_native_matched,
+    e2e_scaled,
     click_repo,
     open_repo_name,
     change_row_group,
@@ -81,6 +83,27 @@ def require_or_skip(cond: bool, reason: str) -> None:
         return
     assert os.environ.get("SNIP_REQUIRE_ALL_TESTS") is None, reason
     raise unittest.SkipTest(reason)
+
+
+class TestE2eScaled(unittest.TestCase):
+    """The Xvfb display-number wait gave up at a fixed 60 s while a loaded machine was
+    still probing displays; Xvfb then died with "Cannot write display number"."""
+
+    def scaled(self, value: str | None) -> float:
+        env = {} if value is None else {"SNIP_E2E_TIMEOUT_SCALE": value}
+        with mock.patch.dict(os.environ, env, clear=False):
+            if value is None:
+                os.environ.pop("SNIP_E2E_TIMEOUT_SCALE", None)
+            return e2e_scaled(60.0)
+
+    def test_scale_stretches_the_wait(self) -> None:
+        self.assertEqual(self.scaled("2"), 120.0)
+        self.assertEqual(self.scaled("2.5"), 150.0)
+
+    def test_unusable_scale_keeps_the_wait(self) -> None:
+        for value in (None, "", "fast", "0.5", "0", "-3", "inf", "nan"):
+            with self.subTest(value=value):
+                self.assertEqual(self.scaled(value), 60.0)
 
 
 class TestLavapipeIcdDiscovery(unittest.TestCase):
