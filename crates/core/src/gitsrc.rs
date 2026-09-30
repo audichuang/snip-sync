@@ -227,8 +227,8 @@ impl Git {
 		})
 	}
 
-	/// 已知 identity 的 repository，不啟動 git；toplevel 是
-	/// `RepoIdentity::resolve` 取得的 git 自身拼法，型別保證不會混進使用者路徑（例如 macOS 的 `/var` 對 `/private/var`）。
+	/// 已知 identity 的 repository，不啟動 git；toplevel 應來自
+	/// `RepoIdentity::resolve`（git 自身拼法）；收 `&RepoIdentity` 讓呼叫端無法直接傳入使用者路徑（例如 macOS 的 `/var` 對 `/private/var`）。
 	pub fn at_known_root(known: &RepoIdentity) -> Self {
 		Self {
 			root: known.toplevel.clone(),

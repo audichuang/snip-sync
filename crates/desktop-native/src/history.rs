@@ -2578,7 +2578,7 @@ impl WorkbenchModel {
 							overflow: snip_core::gitrun::Overflow::Error,
 							..RunOptions::preview(None)
 						};
-						// 已知 identity：不起 probe 程序。
+						// 有 identity 時不起 probe 程序；沒有則從列出的 root 開啟。
 						let git =
 							known_or_open(identity.as_ref(), &root, &listing)?;
 						let (files, gitlinks) =
@@ -4815,13 +4815,7 @@ mod tests {
 		let t = tempfile::tempdir().unwrap();
 		let r = t.path().join("r");
 		std::fs::create_dir(&r).unwrap();
-		let status = std::process::Command::new("git")
-			.arg("init")
-			.arg("-q")
-			.current_dir(&r)
-			.status()
-			.unwrap();
-		assert!(status.success());
+		crate::paste::tests::git_init(&r);
 		let id = RepoIdentity::resolve(
 			&Git::open(&r).unwrap(),
 			&RunOptions::default(),
