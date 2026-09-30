@@ -2355,16 +2355,6 @@ impl WorkbenchModel {
 				repos[i].name = root_tail(&repos[i].root, k);
 			}
 		}
-
-		let mut final_counts: HashMap<String, usize> = HashMap::new();
-		for r in repos.iter() {
-			*final_counts.entry(r.name.clone()).or_insert(0) += 1;
-		}
-		for r in repos.iter_mut() {
-			if final_counts.get(&r.name).copied().unwrap_or(0) > 1 {
-				r.name = r.root.display().to_string();
-			}
-		}
 	}
 
 	pub(crate) fn accepting_work(&self) -> bool {
@@ -6534,11 +6524,12 @@ mod tests {
 			);
 			std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
 
-			let out = std::process::Command::new("git")
+			let out = Command::new("git")
 				.current_dir(&x)
 				.args(["rev-parse", "HEAD"])
 				.output()
 				.expect("git rev-parse HEAD");
+			assert!(out.status.success(), "git rev-parse HEAD: {out:?}");
 			let head = String::from_utf8(out.stdout).expect("utf8");
 			let sha7 = head.trim()[..7].to_string();
 
