@@ -3041,6 +3041,8 @@ fn commit_replay_apply_refuses_after_head_moved() {
 
 	repo.write("other.txt", "other\n");
 	let external_head = repo.commit("external commit");
+	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
+	let index_before = repo.git(&["ls-files", "-s"]);
 
 	let err = preview.apply().unwrap_err();
 	assert!(
@@ -3048,6 +3050,9 @@ fn commit_replay_apply_refuses_after_head_moved() {
 		"{err:?}"
 	);
 	assert_eq!(repo.git(&["rev-parse", "HEAD"]), external_head);
+	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
+	assert_eq!(repo.git(&["ls-files", "-s"]), index_before);
+	assert!(!repo.exists("incoming.txt"));
 }
 
 #[cfg(unix)]
@@ -3173,11 +3178,14 @@ fn commit_replay_apply_waits_for_the_worktree_lock() {
 	use snip_core::gitrun::RunOptions;
 	use snip_core::gitsrc::Git;
 	use snip_core::workspace::{lock_heavy, RepoIdentity};
+	use std::sync::mpsc;
 	use std::time::Duration;
 
 	let repo = TestRepo::new("worktree-lock");
 	repo.write("base.txt", "base\n");
 	let head_before = repo.commit("base");
+	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
+	let index_before = repo.git(&["ls-files", "-s"]);
 
 	let payload = CommitsPayload {
 		commits: vec![CommitRecord {
@@ -3185,13 +3193,22 @@ fn commit_replay_apply_waits_for_the_worktree_lock() {
 			author_name: "Author".into(),
 			author_email: "author@example.invalid".into(),
 			author_date: "2026-09-25T12:00:00+00:00".into(),
-			files: vec![CommitFile {
-				path: "new.txt".into(),
-				old_path: None,
-				change: FileChange::Added,
-				content: Some("new content\n".into()),
-				not_copied: None,
-			}],
+			files: vec![
+				CommitFile {
+					path: "base.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some("incoming base\n".into()),
+					not_copied: None,
+				},
+				CommitFile {
+					path: "new.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("new content\n".into()),
+					not_copied: None,
+				},
+			],
 		}],
 	};
 	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
@@ -3200,32 +3217,36 @@ fn commit_replay_apply_waits_for_the_worktree_lock() {
 	let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
 	let guard = lock_heavy(&id, &RunOptions::default()).unwrap();
 
-	let deadline = std::time::Instant::now() + Duration::from_secs(10);
-	let res = loop {
-		match preview.apply_with(&RunOptions {
-			queue_timeout: Duration::from_millis(50),
-			..RunOptions::default()
-		}) {
-			Ok(r) => break r,
-			Err(TransferError::Git(
-				snip_core::gitsrc::GitError::QueueTimeout { .. },
-			)) if std::time::Instant::now() < deadline => {
-				std::thread::sleep(Duration::from_millis(10));
-			}
-			Err(other) => {
-				panic!("unexpected error waiting for lock: {other:?}")
-			}
-		}
+	let opts = RunOptions {
+		queue_timeout: Duration::from_secs(30),
+		..RunOptions::default()
 	};
-	assert!(res.created.is_empty());
-	let fail = res.failure.as_ref().expect("failure must be Some");
-	assert_eq!(fail.index, 0);
-	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
-	assert!(!repo.exists("new.txt"));
 
-	drop(guard);
-	let res2 = preview.apply().unwrap();
-	assert_eq!(res2.failure, None);
-	assert_eq!(res2.created.len(), 1);
-	assert_eq!(repo.read("new.txt"), "new content\n");
+	let (tx, rx) = mpsc::channel();
+	let res = std::thread::scope(|s| {
+		s.spawn(|| {
+			let res = preview.apply_with(&opts);
+			let _ = tx.send(res);
+		});
+
+		std::thread::sleep(Duration::from_millis(300));
+		assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+		repo.write("base.txt", "modified base\n");
+
+		drop(guard);
+
+		rx.recv_timeout(Duration::from_secs(30))
+			.expect("apply_with did not return after worktree lock released")
+	});
+
+	assert!(
+		matches!(res, Err(TransferError::StaleDestination { .. })),
+		"expected StaleDestination, got {res:?}"
+	);
+	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
+	assert_eq!(repo.git(&["ls-files", "-s"]), index_before);
+	assert_eq!(repo.read("base.txt"), "modified base\n");
+	assert!(!repo.exists("new.txt"));
 }
