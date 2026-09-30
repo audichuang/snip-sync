@@ -17,8 +17,8 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 ## Before you call a change done
 
-- Before pushing anything besides Markdown, run `just preflight`. A failure CI finds that preflight would have caught is a process bug. On Linux it runs CI's Linux jobs. On macOS it runs CI's macOS checks, then the Linux jobs, native acceptance included, in an Apple `container` VM (`scripts/linux_container.sh`; `--clean` drops its volumes, images and kernel cache). Windows has no container path: run `just preflight-host`.
-- A push of only `.md` files skips preflight: nothing in it reads Markdown, and CI still runs every job. A script under `docs/` is not Markdown; run the script itself.
+- Before pushing a change that can alter a gate's result (code, scripts, CI config, Cargo files, fixtures), run `just preflight`. A failure CI finds that preflight would have caught is a process bug. On Linux it runs CI's Linux jobs. On macOS it runs CI's macOS checks, then the Linux jobs, native acceptance included, in an Apple `container` VM (`scripts/linux_container.sh`; `--clean` drops its volumes, images and kernel cache). Windows has no container path: run `just preflight-host`.
+- A push that cannot change any gate's result skips preflight: only `.md` files, or a `.gitignore` entry. CI still runs every job. A script under `docs/` is not Markdown; run the script itself.
 - `native-acceptance` needs a Python with Pillow in `SNIP_NATIVE_PYTHON` and fails if the checkout changes after its build: commit first, then leave the tree alone.
 - Where a test goes: pure logic → a unit test in `crates/core` or the native crate; UI state and interaction → `#[gpui::test]` in `crates/desktop-native/src/main.rs` `tests::in_process` (no display, all OSes); real input, clipboard or pixels → `crates/native-e2e/tests/smoke.rs` / `lifecycle.rs` (Xvfb; on macOS inside the preflight container); cross-machine file/commit semantics → a collaboration manifest step. macOS and Windows have no real-input GUI test.
 - A control a test drives gets a `probe(...)` id; drivers read it from `[APP:CTRL_BOUNDS]`.
