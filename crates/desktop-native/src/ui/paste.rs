@@ -208,7 +208,7 @@ impl WorkbenchModel {
 		let Some(commit) = plan
 			.commit_preview
 			.as_ref()
-			.and_then(|p| p.replay.commits.get(c))
+			.and_then(|p| p.plan().commits.get(c))
 		else {
 			return div().id("paste-commit:none");
 		};
@@ -304,7 +304,7 @@ impl WorkbenchModel {
 			.commit_preview
 			.as_ref()
 			.filter(|_| plan.whole_commit)
-			.map(|p| p.replay.commits.len());
+			.map(|p| p.plan().commits.len());
 		let dest = plan.destination.display().to_string();
 		let applying = plan.is_applying;
 		let mapping_ready = plan.mapping_ready();

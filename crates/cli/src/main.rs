@@ -670,8 +670,8 @@ fn confirmation_summary(plan: &RestorePlan) -> String {
 fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 	let payload =
 		commits::parse_commit_payload(text).map_err(|e| e.to_string())?;
-	let git = Git::open(repo).map_err(|e| e.to_string())?;
 	if !opts.apply {
+		let git = Git::open(repo).map_err(|e| e.to_string())?;
 		let plan = commits::plan_commit_replay(&git, &payload);
 		let total = plan.commits.len();
 		for (i, c) in plan.commits.iter().enumerate() {
@@ -704,7 +704,10 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 		eprintln!("{total} commit(s) would be created.");
 		return Ok(());
 	}
-	let result = commits::replay(&git, &payload);
+	let preview =
+		snip_core::transfer::CommitReplayPreview::capture(repo, &payload)
+			.map_err(|e| e.to_string())?;
+	let result = preview.apply().map_err(|e| e.to_string())?;
 	println!("Created {} commit(s).", result.created.len());
 	for sha in &result.created {
 		println!("  {sha}");

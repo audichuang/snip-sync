@@ -4,13 +4,16 @@
 //! and workspace roots, preserving v1 wire format compatibility while enforcing
 //! explicit root mapping, conflict detection, cumulative bounded reads, and freshness validation.
 //!
-//! `plan_export_with`, `plan_import_with` and `CommitReplayPreview::capture_with`
-//! thread one `RunOptions` through read-only Git and freshness reads. Cancellation
-//! is `TransferError::Git(GitError::Cancelled)` and does not produce a plan.
+//! `plan_export_with`, `plan_import_with`, `CommitReplayPreview::capture_with`
+//! and `CommitReplayPreview::apply_with` thread one `RunOptions` through Git
+//! and freshness reads. `apply_with` checks options only before the first write
+//! (open, the worktree lock wait, and the re-validation under that lock);
+//! confirmed replay is not cancellable. Cancellation is
+//! `TransferError::Git(GitError::Cancelled)` and does not produce a plan or write.
 //! A regular-file `read` cannot be stopped mid-syscall; the token is polled before
 //! open, between chunks and after the read. A FIFO or other non-regular file is
 //! rejected before `open`. Confirmed `TransferImportPlan::apply` and
-//! `commits::replay` do not poll a cancel token.
+//! `CommitReplayPreview::apply_with` do not poll a cancel token during replay.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -2429,13 +2432,29 @@ fn select_exact_chain(
 /// HEAD, ref, index, content, and absence captured before any write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitReplayPreview {
-	pub destination: PathBuf,
-	pub payload: CommitsPayload,
-	pub replay: commits::CommitReplayPlan,
-	pub freshness: DestinationFreshnessSnapshot,
+	destination: PathBuf,
+	payload: CommitsPayload,
+	replay: commits::CommitReplayPlan,
+	freshness: DestinationFreshnessSnapshot,
 }
 
 impl CommitReplayPreview {
+	pub fn destination(&self) -> &Path {
+		&self.destination
+	}
+
+	pub fn payload(&self) -> &CommitsPayload {
+		&self.payload
+	}
+
+	pub fn plan(&self) -> &commits::CommitReplayPlan {
+		&self.replay
+	}
+
+	pub fn freshness(&self) -> &DestinationFreshnessSnapshot {
+		&self.freshness
+	}
+
 	/// Owned buffer capacities, excluding this inline struct and allocator
 	/// bookkeeping. Call only on a fresh capture whose public freshness maps
 	/// have not been mutated: its conservative table estimate assumes the
@@ -2495,13 +2514,37 @@ impl CommitReplayPreview {
 		Ok(preview)
 	}
 
+	pub fn apply(&self) -> Result<commits::ReplayResult, TransferError> {
+		self.apply_with(&RunOptions::default())
+	}
+
+	/// Replays this preview's own payload onto its destination, or refuses as stale. `opts` reaches
+	/// Git open, the worktree lock wait and the re-validation under that lock; once the first
+	/// commit starts nothing is cancelled. Overwrites follow spec 4.3 (直接覆蓋): the desktop's
+	/// "allow overwrite first" gate is that session's rule and is checked before calling this.
+	pub fn apply_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<commits::ReplayResult, TransferError> {
+		cancelled_err(opts, "replay-apply")?;
+		let git = Git::open_with(&self.destination, opts)?;
+		let session =
+			match commits::ReplaySession::begin(&git, &self.payload, opts) {
+				Ok(s) => s,
+				Err(refused) => return Ok(refused),
+			};
+		self.revalidate_with(opts)?; // under the heavy lock, right before the first write
+		cancelled_err(opts, "replay-apply")?;
+		Ok(session.run(&git, &self.payload))
+	}
+
 	/// Refuses when HEAD, the branch ref, the index, recorded bytes, absence,
 	/// or replay eligibility changed since [`Self::capture`]. A skipped
 	/// non-UTF-8 or unsafe path that becomes writable is stale. `NotCopied`
 	/// stays skipped because the payload itself has no bytes to write.
 	///
-	/// Checking freshness does not write. Confirmed replay stays in
-	/// [`commits::replay`] and is not cancelled here.
+	/// Checking freshness does not write. Confirmed replay is performed by
+	/// [`Self::apply`] or [`Self::apply_with`] and is not cancelled here.
 	pub fn revalidate(&self) -> Result<(), TransferError> {
 		self.revalidate_with(&RunOptions::default())
 	}
@@ -2561,19 +2604,7 @@ fn capture_replay_freshness(
 		cancelled_err(opts, "replay-freshness")?;
 		for file in &commit.files {
 			cancelled_err(opts, "replay-freshness")?;
-			// NotCopied never becomes a write; the payload has no bytes.
-			if file.skip_reason == Some(commits::ReplaySkipReason::NotCopied) {
-				continue;
-			}
-			for (abs, rel) in [
-				file.absolute_path.as_ref().map(|p| (p, file.path.as_str())),
-				file.old_absolute_path
-					.as_ref()
-					.zip(file.old_path.as_deref()),
-			]
-			.into_iter()
-			.flatten()
-			{
+			for (abs, rel) in file.freshness_targets() {
 				if target_files.contains_key(abs) {
 					continue;
 				}

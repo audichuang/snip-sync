@@ -1120,3 +1120,38 @@ fn precancel_replay_revalidate_writes_nothing() {
 	assert_eq!(repo_fingerprint(&repo), before);
 	assert_runner_idle();
 }
+
+#[test]
+fn precancel_replay_apply_writes_nothing() {
+	let _s = serial();
+	let repo = TestRepo::new("replay-apply-precancel");
+	repo.write("keep.txt", "keep\n");
+	repo.commit("base");
+	let before = repo_fingerprint(&repo);
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "keep.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("new\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload)
+		.expect("setup capture must succeed");
+	let token = CancelToken::new();
+	token.cancel();
+	let opts = cancelled_opts(token);
+	let err = preview
+		.apply_with(&opts)
+		.expect_err("precancel must not apply");
+	assert_cancelled(err);
+	assert_eq!(repo_fingerprint(&repo), before);
+	assert_runner_idle();
+}
