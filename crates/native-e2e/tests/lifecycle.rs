@@ -378,6 +378,13 @@ fn find_wid(pid: u32) -> String {
 		{
 			return w.trim().to_string();
 		}
+		// The child is not reaped yet, so an app that died stays a zombie.
+		if proc_rest(pid).is_none_or(|rest| rest[0] == "Z") {
+			panic!(
+				"app pid {pid} exited before mapping a window (DISPLAY={:?}); see its [APP STDERR] above",
+				std::env::var_os("DISPLAY")
+			);
+		}
 		std::thread::sleep(Duration::from_millis(50));
 	}
 	panic!("xdotool did not find a window for pid {pid}");
