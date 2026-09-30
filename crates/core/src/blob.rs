@@ -100,8 +100,7 @@ impl CatFile {
 	/// `cap` 為原始位元組上限（raw-byte cap），而非 JSON 序列化後的上限；需要檢查逸出後大小的呼叫端應在取得文字後自行計算。
 	/// 大小判定先於型別判定；超限內容一律回傳 `TooLarge`。
 	///
-	/// body 被截斷（略過超限或非 blob 的 body 時 EOF）一律回傳 `GitError::Malformed`，
-	/// 所有呼叫端（gitsrc、transfer、commits）相同。
+	/// 讀取錯誤（含 body 被截斷）經 `Session::error` 依子行程結束狀態回報 Failed / Io / Timeout。
 	pub(crate) fn read_classified(
 		&mut self,
 		object: &str,
@@ -112,15 +111,8 @@ impl CatFile {
 			return Ok(BlobRead::Missing);
 		}
 		self.request(object)?;
-		read_classified_response(&mut self.session, cap, require_blob).map_err(
-			|e| {
-				if is_truncated_body(&e) {
-					GitError::Malformed("cat-file body truncated".into())
-				} else {
-					self.session.error(e)
-				}
-			},
-		)
+		read_classified_response(&mut self.session, cap, require_blob)
+			.map_err(|e| self.session.error(e))
 	}
 
 	/// Ends the batch and reports any cleanup failure. Dropping a
@@ -176,29 +168,6 @@ pub fn read_batch_response<R: BufRead>(
 	match read_batch_header(reader)? {
 		Some((_, _, size)) => read_batch_body(reader, size).map(Some),
 		None => Ok(None),
-	}
-}
-
-#[derive(Debug)]
-struct TruncatedBody;
-
-impl std::fmt::Display for TruncatedBody {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "cat-file body truncated")
-	}
-}
-
-impl std::error::Error for TruncatedBody {}
-
-fn is_truncated_body(e: &io::Error) -> bool {
-	e.get_ref().is_some_and(|i| i.is::<TruncatedBody>())
-}
-
-fn mark_truncated(e: io::Error) -> io::Error {
-	if e.kind() == io::ErrorKind::UnexpectedEof {
-		io::Error::new(io::ErrorKind::UnexpectedEof, TruncatedBody)
-	} else {
-		e
 	}
 }
 
@@ -317,8 +286,6 @@ pub(crate) enum BlobRead {
 /// 純函式，可用 Cursor 測試。
 ///
 /// `cap` 為原始位元組上限（raw-byte cap），而非 JSON 序列化後的上限。
-/// 超出容量的內容一律經由 [`scan_discarded_body`] 進行分塊掃描：此掃描僅耗費 CPU，記憶體用量嚴格維持有界（bounded），
-/// 保留此行為是為了讓刪除檔分類政策（`deleted_not_text`、`first_deleted_text`）能區分二進位與超限純文字。
 pub(crate) fn read_classified_response<R: BufRead>(
 	r: &mut R,
 	cap: u64,
@@ -330,11 +297,11 @@ pub(crate) fn read_classified_response<R: BufRead>(
 	};
 	let (_oid, kind, size) = header;
 	if size > cap {
-		let not_text = scan_discarded_body(r, size).map_err(mark_truncated)?;
+		let not_text = scan_discarded_body(r, size)?;
 		return Ok(BlobRead::TooLarge { size, not_text });
 	}
 	if require_blob && kind != "blob" {
-		skip_body(r, size).map_err(mark_truncated)?;
+		skip_body(r, size)?;
 		return Ok(BlobRead::NotABlob { kind });
 	}
 	let body = read_batch_body(r, size)?;
@@ -760,34 +727,12 @@ mod tests {
 	}
 
 	#[test]
-	fn cat_file_short_skipped_body_is_marked_truncated() {
-		// 1. over-cap short body => marker true
+	fn cat_file_short_skipped_body_is_err() {
 		let mut r_overcap = Cursor::new(b"abc blob 20\nshort".to_vec());
-		let err_overcap =
-			read_classified_response(&mut r_overcap, 5, false).unwrap_err();
-		assert_eq!(err_overcap.kind(), io::ErrorKind::UnexpectedEof);
-		assert!(is_truncated_body(&err_overcap));
+		assert!(read_classified_response(&mut r_overcap, 5, false).is_err());
 
-		// 2. under-cap-nonblob (require_blob=true) short body => marker true
 		let mut r_nonblob = Cursor::new(b"abc tree 20\nshort".to_vec());
-		let err_nonblob =
-			read_classified_response(&mut r_nonblob, 1024, true).unwrap_err();
-		assert_eq!(err_nonblob.kind(), io::ErrorKind::UnexpectedEof);
-		assert!(is_truncated_body(&err_nonblob));
-
-		// 3. under-cap blob short body => marker false
-		let mut r_blob = Cursor::new(b"abc blob 20\nshort".to_vec());
-		let err_blob =
-			read_classified_response(&mut r_blob, 1024, false).unwrap_err();
-		assert_eq!(err_blob.kind(), io::ErrorKind::UnexpectedEof);
-		assert!(!is_truncated_body(&err_blob));
-
-		// 4. header-only EOF => marker false
-		let mut r_header = Cursor::new(b"abc".to_vec());
-		let err_header =
-			read_classified_response(&mut r_header, 1024, false).unwrap_err();
-		assert_eq!(err_header.kind(), io::ErrorKind::UnexpectedEof);
-		assert!(!is_truncated_body(&err_header));
+		assert!(read_classified_response(&mut r_nonblob, 1024, true).is_err());
 	}
 
 	#[test]
