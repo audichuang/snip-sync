@@ -3,8 +3,9 @@
 # `--clean` removes this checkout's containers, volumes, images and kernel cache instead.
 # Uses Apple's `container` (macOS 26+, Apple silicon): brew install container,
 # then container system start --enable-kernel-install.
-# The checkout is mounted at its host path, so receipts and fixture paths read the
-# same inside and out. The container's target/ is a volume per checkout: Linux
+# The checkout is mounted read-only at its host path, so receipts and fixture paths
+# read the same inside and out, and nothing inside writes the host's repository: a git
+# refreshing .git/index through the shared mount made the next read see an empty index. The container's target/ is a volume per checkout: Linux
 # artifacts never land in the host's target/, and incremental builds survive runs.
 # SNIP_CONTAINER_CPUS / SNIP_CONTAINER_MEMORY size the VM (container's default is 4 CPUs, 1 GB).
 set -euo pipefail
@@ -122,8 +123,23 @@ for name in SNIP_E2E_TIMEOUT_SCALE SNIP_REQUIRE_ALL_TESTS CARGO_BUILD_JOBS; do
 	if [ -n "${!name+x}" ]; then envs+=(-e "$name"); fi
 done
 
+# The entrypoint copies acceptance evidence here, since the container's /tmp goes with it.
+evidence_root="$(mkdir -p "${TMPDIR:-/tmp}/snip-preflight-evidence" && cd "${TMPDIR:-/tmp}/snip-preflight-evidence" && pwd -P)"
+evidence="$evidence_root/$(date +%Y%m%d-%H%M%S)-$$"
+mkdir "$evidence"
+report_evidence() {
+	if [ -n "$(ls -A "$evidence")" ]; then
+		echo "linux_container: acceptance evidence in $evidence" >&2
+	else
+		rmdir "$evidence"
+	fi
+	# Keep the last five runs.
+	find "$evidence_root" -mindepth 1 -maxdepth 1 -type d | sort | sed -e :a -e '$d;N;2,5ba' -e 'P;D' | xargs rm -rf
+}
+trap 'report_evidence; cleanup' EXIT
+
 run --init --shm-size=2g -c "$cpus" -m "$memory" -k "$kernel" \
-	-v "$ROOT:$ROOT" -w "$ROOT" \
+	-v "$ROOT:$ROOT:ro" -w "$ROOT" -v "$evidence:/evidence" \
 	-v "$target_volume:$ROOT/target" \
 	-v snip-preflight-cargo-registry:/opt/cargo/registry \
 	-v snip-preflight-cargo-git:/opt/cargo/git \
