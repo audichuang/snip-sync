@@ -1390,15 +1390,8 @@ impl WorkbenchModel {
 			}
 			n
 		});
-		let next = next.and_then(|n| {
-			crate::paste::lock_pending(&self.paste_pending.clone())
-				.admit_ui(
-					Some(&n),
-					self.paste_preview.as_ref(),
-					self.paste_detail.as_ref(),
-				)
-				.map(|()| n)
-		});
+		let next =
+			next.and_then(|n| self.paste.admit_ordinary(Some(&n)).map(|()| n));
 		match next {
 			Ok(next) => {
 				// Rows above each spliced gap keep their index; the cursor
@@ -1732,7 +1725,7 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let p = if paste {
-			self.paste_detail.as_ref()
+			self.paste.detail()
 		} else {
 			self.preview.as_ref()
 		};
@@ -1752,7 +1745,7 @@ impl WorkbenchModel {
 		// Row (not line) index of the widest drawn line.
 		let widest = if side { 0 } else { p.inline_row_of(p.widest) };
 		let scroll = if paste {
-			self.paste_scroll.clone()
+			self.paste.scroll().clone()
 		} else {
 			self.reader.scroll.clone()
 		};
@@ -1764,7 +1757,7 @@ impl WorkbenchModel {
 					this.reader.row_geom.borrow_mut().clear();
 				}
 				let p = if paste {
-					this.paste_detail.as_ref()
+					this.paste.detail()
 				} else {
 					this.preview.as_ref()
 				};

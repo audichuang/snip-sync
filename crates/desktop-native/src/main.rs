@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 static E2E: OnceLock<bool> = OnceLock::new();
 
@@ -1226,7 +1226,6 @@ pub struct WorkbenchModel {
 	pub repo_cancel: Option<CancelToken>,
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
-	pub paste_cancel: Option<CancelToken>,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, String)>,
@@ -1250,18 +1249,7 @@ pub struct WorkbenchModel {
 	add_cancel: Option<CancelToken>,
 	pub is_adding_repo: bool,
 	pub add_repo_input: Entity<TextInput>,
-	pub paste_preview: Option<PastePreviewPlan>,
-	/// A read-only preview or mapping rebuild is running in the background.
-	/// Nothing can be applied until it lands.
-	pub paste_loading: bool,
-	/// Bumped for every paste request, remap and cancel; a background
-	/// result from an older value is dropped.
-	pub paste_generation: u64,
-	paste_pending: Arc<Mutex<paste::PastePending>>,
-	paste_worker: Option<(u64, CancelToken)>,
-	/// Text of the selected paste item (one at a time).
-	pub paste_detail: Option<Preview>,
-	pub paste_scroll: gpui::UniformListScrollHandle,
+	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
 	/// A finished copy's card over the window (id, succeeded, text): the
 	/// status bar alone is easy to miss.
@@ -1290,15 +1278,10 @@ pub struct WorkbenchModel {
 	pub bottom_h: f32,
 	pub left_visible: bool,
 	pub bottom_visible: bool,
-	/// Log visibility saved when the paste preview auto-collapsed it;
-	/// cleared once restored or when the user toggles the log themselves.
-	pub log_before_paste: Option<bool>,
 	pub dragging: Option<Splitter>,
 	pub last_viewport: (i32, i32),
 	/// E2E control-bounds reporting; `None` unless `SNIP_NATIVE_E2E=1`.
 	pub probes: Option<ui::Probes>,
-	/// Test-only delay before a confirmed write, honoured only in E2E mode.
-	pub e2e_apply_delay: Option<std::time::Duration>,
 	/// Focus requested from a context without a `Window`; applied on render.
 	pub pending_focus: Option<FocusHandle>,
 	pub e2e_read_delay: Option<std::time::Duration>,
@@ -1619,7 +1602,6 @@ impl WorkbenchModel {
 			repo_cancel: None,
 			scan_cancel: None,
 			copy_cancel: None,
-			paste_cancel: None,
 			discovery: None,
 			discovery_status: None,
 			discovery_errors: Vec::new(),
@@ -1638,13 +1620,7 @@ impl WorkbenchModel {
 			restore_ws_expanded: Vec::new(),
 			add_cancel: None,
 			is_adding_repo: false,
-			paste_preview: None,
-			paste_loading: false,
-			paste_generation: 0,
-			paste_pending: Arc::new(Mutex::new(paste::PastePending::default())),
-			paste_worker: None,
-			paste_detail: None,
-			paste_scroll: gpui::UniformListScrollHandle::new(),
+			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
 			status: Msg::new("status_scanning", []),
 			toast: None,
 			toast_seq: 0,
@@ -1668,11 +1644,9 @@ impl WorkbenchModel {
 			bottom_h: theme::BOTTOM_H_DEFAULT,
 			left_visible: true,
 			bottom_visible: true,
-			log_before_paste: None,
 			dragging: None,
 			last_viewport: (0, 0),
 			probes: ui::Probes::from_env(),
-			e2e_apply_delay: ui::e2e_apply_delay(),
 			pending_focus: None,
 			e2e_read_delay: ui::e2e_read_delay(),
 			e2e_tree_hold: ui::e2e_tree_hold(),
@@ -1983,13 +1957,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn set_preview(&mut self, p: Preview) -> bool {
-		let pool = self.paste_pending.clone();
-		let mut pending = paste::lock_pending(&pool);
-		if let Err(err) = pending.admit_ui(
-			Some(&p),
-			self.paste_preview.as_ref(),
-			self.paste_detail.as_ref(),
-		) {
+		if let Err(err) = self.paste.admit_ordinary(Some(&p)) {
 			self.preview_loading = false;
 			self.preview_error = None;
 			self.status = err;
@@ -2038,17 +2006,9 @@ impl WorkbenchModel {
 	}
 
 	pub(crate) fn clear_preview(&mut self) {
-		let pool = self.paste_pending.clone();
-		let mut state = paste::lock_pending(&pool);
 		self.preview = None;
 		self.preview_root = None;
-		state
-			.admit_ui(
-				None,
-				self.paste_preview.as_ref(),
-				self.paste_detail.as_ref(),
-			)
-			.expect("dropping ordinary preview cannot grow retained data");
+		self.paste.release_ordinary();
 	}
 
 	/// Replace a failed read with its error body, releasing the hidden source.
@@ -2062,16 +2022,6 @@ impl WorkbenchModel {
 
 	pub(crate) fn can_copy_preview(&self) -> bool {
 		self.preview.is_some() && self.preview_error.is_none()
-	}
-
-	fn clear_paste_state(&mut self) {
-		let pool = self.paste_pending.clone();
-		let mut state = paste::lock_pending(&pool);
-		self.paste_preview = None;
-		self.paste_detail = None;
-		state.admit_ui(self.preview.as_ref(), None, None).expect(
-			"dropping paste transfers any shared raw charge to its worker",
-		);
 	}
 
 	pub fn deselect_all_files(&mut self, cx: &mut Context<Self>) {
@@ -2359,8 +2309,7 @@ impl WorkbenchModel {
 	fn needs_watch(&mut self) -> bool {
 		self.lifecycle.unfinished() > 0
 			|| self.lifecycle.is_draining()
-			|| paste::lock_pending(&self.paste_pending).has_pending()
-			|| self.paste_worker.is_some()
+			|| self.paste.has_background_work()
 	}
 
 	/// Reaps owned jobs only while one is live or a drain is in progress.
@@ -2498,7 +2447,7 @@ impl WorkbenchModel {
 				self.changes_generation =
 					self.changes_generation.wrapping_add(1);
 				self.changes_queue.clear_pending();
-				self.invalidate_paste_job();
+				self.paste.invalidate_job();
 				let name = intent.name();
 				self.emit_life("draining", name, None);
 				self.set_status("workspace_draining", []);
@@ -2612,9 +2561,9 @@ impl WorkbenchModel {
 		self.changes_queue.clear_pending();
 		self.preview_root = None;
 		self.basket_view = (String::new(), None);
-		self.invalidate_paste_job();
+		self.paste.invalidate_job();
 		if !self.paste_busy() {
-			self.clear_paste_state();
+			self.paste.clear(self.preview.as_ref());
 		}
 		self.discovery = None;
 		self.discovery_status = None;
@@ -5125,7 +5074,7 @@ impl WorkbenchModel {
 	/// cancellable, so every control that would change or discard the plan
 	/// is refused until it finishes.
 	pub fn paste_busy(&self) -> bool {
-		self.paste_preview.as_ref().is_some_and(|p| p.is_applying)
+		self.paste.is_applying()
 	}
 
 	fn refuse_while_applying(
@@ -5142,33 +5091,18 @@ impl WorkbenchModel {
 		true
 	}
 
-	/// Cancels the read-only paste job in flight, if any, and makes its
-	/// result stale. Does not touch a confirmed write.
-	fn invalidate_paste_job(&mut self) {
-		if let Some(token) = self.paste_cancel.take() {
-			token.cancel();
-		}
-		self.paste_generation = self.paste_generation.wrapping_add(1);
-		paste::lock_pending(&self.paste_pending)
-			.invalidate(self.paste_generation);
-		self.paste_loading = false;
-	}
-
 	fn queue_paste(
 		&mut self,
 		request: paste::PasteRequest,
 		cx: &mut Context<Self>,
 	) {
-		let result = paste::lock_pending(&self.paste_pending).enqueue(request);
-		if let Err(err) = result {
-			self.paste_loading = false;
+		if let Err(err) = self.paste.enqueue(request) {
 			self.status = err;
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 			self.restore_log_after_paste();
 			cx.notify();
 			return;
 		}
-		self.paste_loading = true;
 		self.set_status("paste_loading", []);
 		app_log!("[APP:PASTE_LOADING]");
 		self.poll_paste(cx);
@@ -5179,50 +5113,46 @@ impl WorkbenchModel {
 	/// Runs before the existing watch decides it can exit. A cancelled job
 	/// still occupies this slot until its actual FinishFlag has dropped.
 	fn poll_paste(&mut self, cx: &mut Context<Self>) {
-		if self
-			.paste_worker
-			.as_ref()
-			.is_some_and(|(id, _)| self.lifecycle.is_live(*id))
-		{
+		let live = self
+			.paste
+			.worker_id()
+			.is_some_and(|id| self.lifecycle.is_live(id));
+		let polled = self.paste.poll(live, self.preview.as_ref());
+		let paste::preview::Polled::Settled { discarded, landed } = polled
+		else {
 			return;
+		};
+		if discarded {
+			app_log!("[APP:PASTE_DISCARDED: cancelled]");
 		}
-		let finished = self.paste_worker.take();
-		if let Some((_, token)) = &finished {
-			if token.is_cancelled() {
-				app_log!("[APP:PASTE_DISCARDED: cancelled]");
-			}
-		}
-		let pool = self.paste_pending.clone();
-		{
-			let mut pending = paste::lock_pending(&pool);
-			if let Some(outcome) = pending.ready.take() {
-				self.paste_loading = false;
-				self.show_paste_plan(outcome, &mut pending);
+		match landed {
+			Some(paste::preview::Landed::Shown { remap }) => {
+				self.show_landed_plan(remap);
 				cx.notify();
-			} else if finished
-				.as_ref()
-				.is_some_and(|(_, token)| !token.is_cancelled())
-				&& !pending.has_pending()
-				&& self.paste_loading
-			{
-				self.paste_loading = false;
+			}
+			Some(paste::preview::Landed::Refused { err, closed }) => {
+				app_log!("[APP:PASTE_ERR: {}]", err.key);
+				self.status = err;
+				if closed {
+					self.restore_log_after_paste();
+					self.pending_focus = Some(self.focus_handle.clone());
+				}
+				cx.notify();
+			}
+			Some(paste::preview::Landed::WorkerLost) => {
 				self.status = Msg::new(
 					"paste_err_plan",
 					["Preview worker ended before producing a result".into()],
 				);
 				cx.notify();
 			}
+			None => {}
 		}
 		if !self.accepting_work() {
 			return;
 		}
-		let cancel = CancelToken::new();
-		match paste::PastePending::start(
-			&pool,
-			self.paste_preview.as_ref(),
-			cancel.clone(),
-		) {
-			Ok(Some(work)) => {
+		match self.paste.start_job() {
+			Ok(Some((work, cancel))) => {
 				let bg = cx.background_executor().clone();
 				let token = cancel.clone();
 				let id = self.spawn_owned(
@@ -5236,17 +5166,61 @@ impl WorkbenchModel {
 						.await;
 					},
 				);
-				self.paste_cancel = Some(cancel.clone());
-				self.paste_worker = Some((id, cancel));
+				self.paste.bind_job(id, cancel);
 			}
 			Ok(None) => {}
 			Err(err) => {
-				self.paste_loading = false;
 				self.set_paste_error(err);
 				app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 				cx.notify();
 			}
 		}
+	}
+
+	fn show_landed_plan(&mut self, remap: Option<(String, bool)>) {
+		// `Landed::Shown` guarantees an installed plan (see its doc).
+		let plan = self.paste.plan().expect("Shown installs a plan");
+		let items_count = plan.items.len();
+		if let Some((prefix, keep)) = remap {
+			let dest = prefix_target(plan, &prefix, keep);
+			let keep_note = if keep { " keep=primary" } else { "" };
+			app_log!(
+				"[APP:PASTE_MAPPED: prefix={}{} dest={} items={}]",
+				prefix,
+				keep_note,
+				dest,
+				items_count
+			);
+		} else {
+			for choice in &plan.prefix_choices {
+				for (idx, path) in choice.candidates.iter().enumerate() {
+					app_log!(
+						"[APP:PASTE_MAP_CANDIDATE: prefix={} idx={} path={}]",
+						choice.prefix,
+						idx,
+						path.display()
+					);
+				}
+			}
+			app_log!(
+				"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
+				items_count,
+				plan.destination.display(),
+				plan.mapping_ready()
+			);
+		}
+		self.set_status("status_paste_preview", [items_count.to_string()]);
+		if self.paste.collapse_log(&mut self.bottom_visible) {
+			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
+		}
+		self.pending_focus = Some(self.paste_focus.clone());
+	}
+
+	/// Keep full write/read diagnostics in status, but do not let a newly
+	/// allocated diagnostic grow an already admitted plan past its tier.
+	fn set_paste_error(&mut self, err: Msg) {
+		self.status = err.clone();
+		self.paste.record_error(err, self.preview.as_ref());
 	}
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
@@ -5263,11 +5237,11 @@ impl WorkbenchModel {
 		}
 		// A new paste always invalidates the previous plan first, so a failed
 		// read/parse can never leave an older plan armed for Apply.
-		self.invalidate_paste_job();
-		if self.paste_preview.is_some() {
+		self.paste.invalidate_job();
+		if self.paste.plan().is_some() {
 			app_log!("[APP:PASTE_PLAN_CLEARED]");
 		}
-		self.clear_paste_state();
+		self.paste.clear(self.preview.as_ref());
 		let text = match clip::read_text() {
 			Ok(t) => t,
 			Err(e) => {
@@ -5306,121 +5280,6 @@ impl WorkbenchModel {
 		);
 	}
 
-	fn show_paste_plan(
-		&mut self,
-		outcome: paste::PasteOutcome,
-		pending: &mut paste::PastePending,
-	) {
-		let remap = outcome.remap;
-		let built = outcome.result.and_then(|plan| {
-			let detail = plan.detail_preview();
-			pending.admit_ui(
-				self.preview.as_ref(),
-				Some(&plan),
-				detail.as_ref(),
-			)?;
-			Ok((plan, detail))
-		});
-		match built {
-			Ok((plan, detail)) => {
-				if let Some((prefix, keep)) = remap {
-					let dest = prefix_target(&plan, &prefix, keep);
-					let keep_note = if keep { " keep=primary" } else { "" };
-					app_log!(
-						"[APP:PASTE_MAPPED: prefix={}{} dest={} items={}]",
-						prefix,
-						keep_note,
-						dest,
-						plan.items.len()
-					);
-				} else {
-					for choice in &plan.prefix_choices {
-						for (idx, path) in choice.candidates.iter().enumerate()
-						{
-							app_log!("[APP:PASTE_MAP_CANDIDATE: prefix={} idx={} path={}]", choice.prefix, idx, path.display());
-						}
-					}
-					app_log!(
-						"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
-						plan.items.len(),
-						plan.destination.display(),
-						plan.mapping_ready()
-					);
-				}
-				self.set_status(
-					"status_paste_preview",
-					[plan.items.len().to_string()],
-				);
-				self.paste_preview = Some(plan);
-				self.paste_detail = detail;
-				if collapse_log_for_paste(
-					&mut self.log_before_paste,
-					&mut self.bottom_visible,
-				) {
-					app_log!(
-						"[APP:LOG_PANEL: visible=false reason=paste_open]"
-					);
-				}
-				self.paste_scroll
-					.scroll_to_item(0, gpui::ScrollStrategy::Top);
-				self.pending_focus = Some(self.paste_focus.clone());
-			}
-			Err(err) => {
-				app_log!("[APP:PASTE_ERR: {}]", err.key);
-				self.status = err;
-				// A disarmed remap shell may remain; it cannot authorize writes.
-				if pending
-					.admit_ui(
-						self.preview.as_ref(),
-						self.paste_preview.as_ref(),
-						self.paste_detail.as_ref(),
-					)
-					.is_err()
-				{
-					self.paste_preview = None;
-					self.paste_detail = None;
-					pending
-						.admit_ui(self.preview.as_ref(), None, None)
-						.expect("drop failed paste candidate");
-				}
-				if self.paste_preview.is_none() {
-					self.restore_log_after_paste();
-					self.pending_focus = Some(self.focus_handle.clone());
-				}
-			}
-		}
-	}
-
-	/// Keep full write/read diagnostics in status, but do not let a newly
-	/// allocated diagnostic grow an already admitted plan past its tier.
-	fn set_paste_error(&mut self, err: Msg) {
-		let pool = self.paste_pending.clone();
-		let mut pending = paste::lock_pending(&pool);
-		self.status = err.clone();
-		if let Some(plan) = &mut self.paste_preview {
-			plan.error = Some(err);
-		}
-		if pending
-			.admit_ui(
-				self.preview.as_ref(),
-				self.paste_preview.as_ref(),
-				self.paste_detail.as_ref(),
-			)
-			.is_err()
-		{
-			if let Some(plan) = &mut self.paste_preview {
-				plan.error = Some(paste::preview_budget_error());
-			}
-			pending
-				.admit_ui(
-					self.preview.as_ref(),
-					self.paste_preview.as_ref(),
-					self.paste_detail.as_ref(),
-				)
-				.expect("fixed error fits admitted plan");
-		}
-	}
-
 	pub fn choose_paste_keep(&mut self, prefix: &str, cx: &mut Context<Self>) {
 		if self.refuse_while_applying("mapping", cx) {
 			return;
@@ -5437,7 +5296,7 @@ impl WorkbenchModel {
 		if self.refuse_while_applying("mapping", cx) {
 			return;
 		}
-		let Some(dest) = self.paste_preview.as_ref().and_then(|plan| {
+		let Some(dest) = self.paste.plan().and_then(|plan| {
 			plan.prefix_choices
 				.iter()
 				.find(|c| c.prefix == prefix)
@@ -5460,43 +5319,19 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		let keep = destination.is_none();
-		self.invalidate_paste_job();
-		let pool = self.paste_pending.clone();
-		{
-			let mut pending = paste::lock_pending(&pool);
-			let Some(plan) = self.paste_preview.as_mut() else {
-				return;
-			};
-			plan.clear_file_plan();
-			plan.error = None;
-			self.paste_detail = None;
-			let chosen = match destination {
-				Some(dest) => plan.choose_prefix_destination(&prefix, &dest),
-				None => plan.choose_keep_relative(&prefix),
-			};
-			if let Err(err) = chosen {
-				pending
-					.admit_ui(self.preview.as_ref(), Some(plan), None)
-					.expect("invalid choice cannot grow disarmed shell");
+		match self.paste.remap(prefix, destination, self.preview.as_ref()) {
+			paste::preview::Remapped::NoPlan => {}
+			paste::preview::Remapped::Invalid(err) => {
 				self.status = err;
 				cx.notify();
-				return;
 			}
-			if let Err(err) =
-				pending.admit_ui(self.preview.as_ref(), Some(plan), None)
-			{
-				self.paste_preview = None;
-				pending
-					.admit_ui(self.preview.as_ref(), None, None)
-					.expect("drop over-budget mapping shell");
+			paste::preview::Remapped::Dropped(err) => {
 				self.status = err;
 				self.restore_log_after_paste();
 				cx.notify();
-				return;
 			}
+			paste::preview::Remapped::Ready(req) => self.queue_paste(req, cx),
 		}
-		self.queue_paste(paste::PasteRequest::Remap { prefix, keep }, cx);
 	}
 
 	pub fn toggle_paste_overwrite(
@@ -5504,16 +5339,12 @@ impl WorkbenchModel {
 		idx: usize,
 		cx: &mut Context<Self>,
 	) {
-		if self.refuse_while_applying("overwrite", cx) || self.paste_loading {
+		if self.refuse_while_applying("overwrite", cx)
+			|| self.paste.is_loading()
+		{
 			return;
 		}
-		if let Some(ref mut p) = self.paste_preview {
-			p.toggle_overwrite(idx);
-			let st = p
-				.items
-				.get(idx)
-				.map(|i| i.overwrite_allowed)
-				.unwrap_or(false);
+		if let Some(st) = self.paste.toggle_overwrite(idx) {
 			app_log!("[APP:PASTE_TOGGLED: idx={} state={}]", idx, st);
 			cx.notify();
 		}
@@ -5524,100 +5355,96 @@ impl WorkbenchModel {
 		idx: usize,
 		cx: &mut Context<Self>,
 	) {
-		if self.refuse_while_applying("include", cx) || self.paste_loading {
+		if self.refuse_while_applying("include", cx) || self.paste.is_loading()
+		{
 			return;
 		}
-		if let Some(ref mut p) = self.paste_preview {
-			p.toggle_selected(idx);
-			let st = p.items.get(idx).map(|i| i.selected).unwrap_or(false);
+		if let Some(st) = self.paste.toggle_selected(idx) {
 			app_log!("[APP:PASTE_SEL_TOGGLED: idx={} state={}]", idx, st);
 			cx.notify();
 		}
 	}
 
-	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
-		if let Some(p) = &mut self.paste_preview {
-			let was = p.selected_item_idx;
-			p.toggle_commit_collapsed(c);
-			let now = p.selected_item_idx;
-			app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
-			// The fold moved the selection off a hidden row: refresh the
-			// detail pane with it.
-			if now != was {
-				self.select_paste_item(now, cx);
+	fn report_paste_nav(
+		&mut self,
+		nav: paste::preview::Nav,
+		cx: &mut Context<Self>,
+	) {
+		match nav {
+			paste::preview::Nav::Ignored => {}
+			paste::preview::Nav::Moved(idx) => {
+				app_log!("[APP:PASTE_NAV: idx={}]", idx);
+				cx.notify();
 			}
-			cx.notify();
+			paste::preview::Nav::Refused(err) => {
+				self.status = err;
+				app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
+				cx.notify();
+			}
 		}
 	}
 
 	pub fn select_paste_item(&mut self, idx: usize, cx: &mut Context<Self>) {
-		let pool = self.paste_pending.clone();
-		let mut pending = paste::lock_pending(&pool);
-		if let Some(plan) = &mut self.paste_preview {
-			if idx >= plan.items.len() {
-				return;
+		let nav = self.paste.select(idx, self.preview.as_ref());
+		self.report_paste_nav(nav, cx);
+	}
+
+	pub fn step_paste_selection(
+		&mut self,
+		forward: bool,
+		cx: &mut Context<Self>,
+	) {
+		let nav = self.paste.step(forward, self.preview.as_ref());
+		self.report_paste_nav(nav, cx);
+	}
+
+	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
+		match self.paste.toggle_fold(c, self.preview.as_ref()) {
+			paste::preview::Folded::NoPlan => {}
+			paste::preview::Folded::Kept => {
+				app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
+				cx.notify();
 			}
-			let detail = plan.detail_at(idx);
-			match pending.admit_ui(
-				self.preview.as_ref(),
-				Some(plan),
-				detail.as_ref(),
-			) {
-				Ok(()) => {
-					plan.selected_item_idx = idx;
-					self.paste_detail = detail;
-					app_log!("[APP:PASTE_NAV: idx={}]", idx);
-					self.paste_scroll
-						.scroll_to_item(0, gpui::ScrollStrategy::Top);
-				}
-				Err(err) => {
-					self.status = err;
-					app_log!(
-						"[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]"
-					);
-				}
+			paste::preview::Folded::Reselected(nav) => {
+				app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
+				self.report_paste_nav(nav, cx);
+				cx.notify();
 			}
-			cx.notify();
 		}
 	}
 
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
-		if self.paste_loading {
-			app_log!("[APP:APPLY_IGNORED: loading]");
-			self.set_status("paste_loading_refused", []);
-			cx.notify();
-			return;
-		}
-		let Some(ref mut plan) = self.paste_preview else {
-			app_log!("[APP:APPLY_IGNORED: no_plan]");
-			return;
+		let apply = match self.paste.begin_apply() {
+			Ok(w) => w,
+			Err(paste::preview::ApplyRefused::Loading) => {
+				app_log!("[APP:APPLY_IGNORED: loading]");
+				self.set_status("paste_loading_refused", []);
+				cx.notify();
+				return;
+			}
+			Err(paste::preview::ApplyRefused::NoPlan)
+			| Err(paste::preview::ApplyRefused::NotExecutable) => {
+				app_log!("[APP:APPLY_IGNORED: no_plan]");
+				return;
+			}
+			Err(paste::preview::ApplyRefused::Busy) => {
+				app_log!("[APP:PASTE_BUSY: refused=apply]");
+				return;
+			}
+			Err(paste::preview::ApplyRefused::MappingRequired) => {
+				app_log!("[APP:PASTE_ERR: mapping_required]");
+				self.set_paste_error(Msg::new("mapping_required", []));
+				cx.notify();
+				return;
+			}
 		};
-		if plan.is_applying {
-			app_log!("[APP:PASTE_BUSY: refused=apply]");
-			return;
-		}
-		if !plan.mapping_ready() {
-			app_log!("[APP:PASTE_ERR: mapping_required]");
-			self.set_paste_error(Msg::new("mapping_required", []));
-			cx.notify();
-			return;
-		}
 
-		if !plan.executable() {
-			app_log!("[APP:APPLY_IGNORED: no_plan]");
-			return;
-		}
-
-		plan.is_applying = true;
 		self.pending_focus = Some(self.paste_focus.clone());
-		// The worker gets a cheap handle: the plan's contents are shared.
-		let plan_clone =
-			paste::PasteApplyWorker::new(plan, &self.paste_pending);
 		self.set_status("paste_apply_busy", []);
 		app_log!("[APP:PASTE_APPLYING]");
 		cx.notify();
 
-		let delay = self.e2e_apply_delay;
+		let delay = self.paste.apply_delay();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -5632,7 +5459,7 @@ impl WorkbenchModel {
 						if let Some(d) = delay {
 							std::thread::sleep(d);
 						}
-						plan_clone.execute()
+						apply.execute()
 					})
 					.await;
 
@@ -5654,7 +5481,7 @@ impl WorkbenchModel {
 							for error in &result.files.errors {
 								app_log!("[APP:PASTE_FILE_ERROR: {error}]");
 							}
-							model.clear_paste_state();
+							model.paste.clear(model.preview.as_ref());
 							model.restore_log_after_paste();
 							model.pending_focus =
 								Some(model.focus_handle.clone());
@@ -5669,8 +5496,8 @@ impl WorkbenchModel {
 						}
 						Err(err) => {
 							app_log!("[APP:PASTE_STALE_DETECTED: {}]", err.key);
-							if let Some(p) = &mut model.paste_preview { p.is_applying = false; }
-							model.set_paste_error(err);
+							model.status = err.clone();
+							model.paste.apply_failed(err, model.preview.as_ref());
 						}
 					}
 					cx.notify();
@@ -5681,17 +5508,14 @@ impl WorkbenchModel {
 
 	/// Called on every path that closes the paste preview.
 	fn restore_log_after_paste(&mut self) {
-		if restore_log_after_paste(
-			&mut self.log_before_paste,
-			&mut self.bottom_visible,
-		) {
+		if self.paste.restore_log(&mut self.bottom_visible) {
 			app_log!("[APP:LOG_PANEL: visible=true reason=paste_close]");
 		}
 	}
 
 	/// Editor tabs open: the paste preview, or the one reader tab.
 	pub fn open_tab_count(&self) -> usize {
-		let paste = self.paste_preview.is_some() || self.paste_loading;
+		let paste = self.paste.is_open();
 		let reader = self.preview.is_some()
 			|| self.preview_loading
 			|| self.selected_commit.is_some()
@@ -5706,7 +5530,7 @@ impl WorkbenchModel {
 		if idx != 0 || self.open_tab_count() == 0 {
 			return;
 		}
-		if self.paste_preview.is_some() || self.paste_loading {
+		if self.paste.is_open() {
 			self.cancel_paste_preview(cx);
 			return;
 		}
@@ -5744,12 +5568,12 @@ impl WorkbenchModel {
 		if self.refuse_while_applying("cancel", cx) {
 			return;
 		}
-		let was_loading = self.paste_loading;
-		self.invalidate_paste_job();
-		if self.paste_preview.is_none() && !was_loading {
+		let was_loading = self.paste.is_loading();
+		self.paste.invalidate_job();
+		if self.paste.plan().is_none() && !was_loading {
 			return;
 		}
-		self.clear_paste_state();
+		self.paste.clear(self.preview.as_ref());
 		self.restore_log_after_paste();
 		self.pending_focus = Some(self.focus_handle.clone());
 		self.set_status("paste_cancelled", []);
@@ -6297,33 +6121,6 @@ fn main() {
 	});
 }
 
-/// Hides the Git Log for the paste preview, remembering the prior state once
-/// (a re-paste over an open preview keeps the first saved value). Returns
-/// whether visibility changed.
-fn collapse_log_for_paste(
-	saved: &mut Option<bool>,
-	visible: &mut bool,
-) -> bool {
-	saved.get_or_insert(*visible);
-	std::mem::replace(visible, false)
-}
-
-/// Restores the saved visibility when the preview closes. No-op if nothing
-/// was saved (already restored, or the user toggled the log) or if the log
-/// is already shown again. Returns whether visibility changed.
-fn restore_log_after_paste(
-	saved: &mut Option<bool>,
-	visible: &mut bool,
-) -> bool {
-	match saved.take() {
-		Some(true) if !*visible => {
-			*visible = true;
-			true
-		}
-		_ => false,
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	/// UI state driven in-process: no display, so these also run in the
@@ -6489,7 +6286,7 @@ mod tests {
 			cx.simulate_keystrokes("ctrl-v");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(m.paste_preview.is_some(), "no preview: {}", m.status)
+				assert!(m.paste.plan().is_some(), "no preview: {}", m.status)
 			});
 		}
 
@@ -6783,27 +6580,37 @@ mod tests {
 				"// FILE: existing.txt\nnew body\n// FILE: fresh.txt\nfresh body\n",
 			);
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert!(plan.mapping_ready());
 				assert_eq!(plan.destination, dest);
-				let mut rows: Vec<(&str, &str, bool, bool)> = plan
-					.items
-					.iter()
-					.map(|i| {
-						(
-							i.path.as_str(),
-							i.action_label,
-							i.dest_exists,
-							i.overwrite_allowed,
-						)
-					})
-					.collect();
-				rows.sort();
+				let mut rows: Vec<(&str, crate::paste::PlannedOp, bool, bool)> =
+					plan.items
+						.iter()
+						.map(|i| {
+							(
+								i.path.as_str(),
+								i.op,
+								i.dest_exists,
+								i.overwrite_allowed,
+							)
+						})
+						.collect();
+				rows.sort_by_key(|r| r.0);
 				assert_eq!(
 					rows,
 					[
-						("existing.txt", "OVERWRITE", true, false),
-						("fresh.txt", "CREATE", false, false),
+						(
+							"existing.txt",
+							crate::paste::PlannedOp::Overwrite,
+							true,
+							false
+						),
+						(
+							"fresh.txt",
+							crate::paste::PlannedOp::Create,
+							false,
+							false
+						),
 					]
 				);
 				assert_eq!(m.status.key, "status_paste_preview");
@@ -6865,95 +6672,6 @@ mod tests {
 		}
 
 		#[gpui::test]
-		fn commit_preview_totals_and_rows_come_from_the_replay_plan(
-			cx: &mut TestAppContext,
-		) {
-			let Some(_clip) = clipboard() else { return };
-			let ws = tempfile::tempdir().unwrap();
-			repo(ws.path(), "alpha", &[]);
-			let (_tmp, root) = canonical_tmp();
-			let dest = repo(&root, "dest", &[("old.txt", "old")]);
-			let (model, cx) =
-				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
-			paste(&model, cx, &mixed_commit_payload());
-			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
-				// Commits are groups in replay order; the empty one keeps
-				// its header and has no file rows.
-				let shape: Vec<String> = plan
-					.commit_rows()
-					.iter()
-					.map(|r| match r {
-						crate::paste::PasteNode::Commit(c) => format!("C{c}"),
-						crate::paste::PasteNode::File(ix, _) => {
-							let i = &plan.items[*ix];
-							format!("{}:{}", crate::ui::paste_op(i).0, i.path)
-						}
-						_ => "?".into(),
-					})
-					.collect();
-				assert_eq!(
-					shape,
-					[
-						"C0",
-						"op_skip:img.bin",
-						"op_create:fresh.txt",
-						"op_delete:old.txt",
-						"op_create:dir/new.txt",
-						"C1",
-						"C2",
-						"op_overwrite_pending:base.txt",
-					]
-				);
-				let preview = plan.commit_preview.as_ref().unwrap();
-				let c1 = &preview.replay.commits[1];
-				assert_eq!(
-					(&*c1.message, &*c1.author_name, &*c1.author_date),
-					("empty one", "bob", "2026-09-25T12:34:56+00:00")
-				);
-				assert!(c1.files.is_empty());
-				// The binary row is a skip with its reason, not a create,
-				// and the rename's old path counts as a delete.
-				let img = plan.items.iter().find(|i| i.path == "img.bin");
-				assert_eq!(
-					crate::ui::paste_op(img.unwrap()),
-					(
-						"op_skip",
-						crate::theme::pal().text_disabled,
-						"reason_nc_binary"
-					)
-				);
-				assert_eq!(
-					crate::ui::paste_counts(plan),
-					crate::ui::PasteCounts {
-						creates: 2,
-						overwrites: 0,
-						existing: 1,
-						deletes: 1,
-						// img.bin; base.txt waits for overwrite (blocks
-						// Apply) and is not a skip
-						skips: 1,
-					}
-				);
-				// An excluded row rejects the whole replay: it is not a
-				// counted skip either.
-				let mut excluded = plan.items[0].clone();
-				excluded.selected = false;
-				assert_eq!(
-					crate::ui::paste_op(&excluded),
-					(
-						"op_excluded",
-						crate::theme::pal().text_disabled,
-						"reason_commit_excluded"
-					)
-				);
-				// The empty commit is applied too: see
-				// `commit_apply_creates_the_empty_commit_too` in paste.rs.
-				assert!(plan.executable());
-			});
-		}
-
-		#[gpui::test]
 		fn commit_preview_renders_every_commit_header_and_folds(
 			cx: &mut TestAppContext,
 		) {
@@ -6989,7 +6707,7 @@ mod tests {
 			// helper the header draws them with (the probes only prove the
 			// header exists): subject, author and date of the empty commit.
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				let commits =
 					&plan.commit_preview.as_ref().unwrap().replay.commits;
 				assert_eq!(
@@ -7005,9 +6723,9 @@ mod tests {
 				);
 				assert!(plan.items.iter().all(|i| i.commit != Some(1)));
 				// Header counts agree with the rows under them.
-				assert_eq!(crate::ui::commit_counts(plan, 0), (4, 1));
-				assert_eq!(crate::ui::commit_counts(plan, 1), (0, 0));
-				assert_eq!(crate::ui::commit_counts(plan, 2), (1, 0));
+				assert_eq!(plan.commit_counts(0), (4, 1));
+				assert_eq!(plan.commit_counts(1), (0, 0));
+				assert_eq!(plan.commit_counts(2), (1, 0));
 			});
 			// Folding commit #1 removes its rows but keeps every header.
 			model.update(cx, |m, cx| m.toggle_paste_commit(0, cx));
@@ -7019,43 +6737,6 @@ mod tests {
 				"{ids:?}"
 			);
 			assert!(ids.contains(&"paste-row:4:base.txt".to_string()));
-		}
-
-		#[gpui::test]
-		fn up_down_walk_commit_rows_in_replay_order(cx: &mut TestAppContext) {
-			let Some(_clip) = clipboard() else { return };
-			let ws = tempfile::tempdir().unwrap();
-			repo(ws.path(), "alpha", &[]);
-			let (_tmp, root) = canonical_tmp();
-			let dest = repo(&root, "dest", &[("old.txt", "old")]);
-			let (model, cx) =
-				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
-			paste(&model, cx, &mixed_commit_payload());
-			model.update(cx, |m, _| {
-				let plan = m.paste_preview.as_mut().unwrap();
-				plan.selected_item_idx = 0;
-				let mut seen = vec![plan.items[0].path.clone()];
-				for _ in 0..plan.items.len() + 2 {
-					plan.select_next();
-					seen.push(plan.items[plan.selected_item_idx].path.clone());
-				}
-				seen.dedup();
-				assert_eq!(
-					seen,
-					[
-						"img.bin",
-						"fresh.txt",
-						"old.txt",
-						"dir/new.txt",
-						"base.txt"
-					]
-				);
-				// A folded commit's rows are skipped, and Up re-enters
-				// from a selection that is folded away.
-				plan.toggle_commit_collapsed(0);
-				plan.select_prev();
-				assert_eq!(plan.items[plan.selected_item_idx].path, "base.txt");
-			});
 		}
 
 		#[gpui::test]
@@ -7077,7 +6758,7 @@ mod tests {
 			cx.simulate_keystrokes("space");
 			cx.run_until_parked();
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert_eq!(plan.items[plan.selected_item_idx].path, "base.txt");
 				assert!(plan.display_order().contains(&plan.selected_item_idx));
 				// Space acted on the visible row only: the folded commit's
@@ -7088,6 +6769,57 @@ mod tests {
 					.filter(|i| i.commit == Some(0))
 					.all(|i| i.selected));
 				assert!(plan.error.is_none());
+			});
+		}
+
+		#[gpui::test]
+		fn nav_up_and_down_move_paste_selection_and_detail(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &mixed_commit_payload());
+
+			let (initial_idx, initial_path, order) =
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					let order = plan.display_order();
+					(
+						plan.selected_item_idx,
+						m.paste.detail().and_then(|d| d.path.clone()),
+						order,
+					)
+				});
+			assert_eq!(initial_idx, order[0]);
+			assert_eq!(initial_path.as_deref(), Some("img.bin"));
+
+			cx.simulate_keystrokes("down");
+			cx.run_until_parked();
+
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, order[1]);
+				assert_eq!(
+					m.paste.detail().and_then(|d| d.path.as_deref()),
+					Some("fresh.txt")
+				);
+			});
+
+			cx.simulate_keystrokes("up");
+			cx.run_until_parked();
+
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, order[0]);
+				assert_eq!(
+					m.paste.detail().and_then(|d| d.path.as_deref()),
+					Some("img.bin")
+				);
 			});
 		}
 
@@ -7127,16 +6859,19 @@ mod tests {
 			paste(&model, cx, &payload);
 			let before = model.update(cx, |m, cx| {
 				m.select_paste_item(0, cx);
-				let img = &m.paste_preview.as_ref().unwrap().items[0];
+				let img = &m.paste.plan().unwrap().items[0];
 				assert_eq!(img.path, "img.bin");
-				assert!(img.dest_exists && img.action_label == "SKIP");
+				assert!(
+					img.dest_exists
+						&& matches!(img.op, crate::paste::PlannedOp::Skip(_))
+				);
 				assert!(!img.overwritable());
 				img.overwrite_allowed
 			});
 			cx.simulate_keystrokes("space");
 			cx.run_until_parked();
 			model.read_with(cx, |m, _| {
-				let img = &m.paste_preview.as_ref().unwrap().items[0];
+				let img = &m.paste.plan().unwrap().items[0];
 				assert_eq!(img.overwrite_allowed, before);
 			});
 		}
@@ -7155,7 +6890,7 @@ mod tests {
 			cx.simulate_keystrokes("escape");
 			cx.run_until_parked();
 			model.read_with(cx, |m, _| {
-				assert!(m.paste_preview.is_none());
+				assert!(m.paste.plan().is_none());
 				assert_eq!(m.status.key, "paste_cancelled");
 			});
 			assert!(!dest.join("fresh.txt").exists());
@@ -7176,7 +6911,7 @@ mod tests {
 			);
 			cx.simulate_keystrokes("enter");
 			cx.run_until_parked();
-			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
 			assert_eq!(
 				fs::read_to_string(dest.join("a.txt")).unwrap(),
 				"alpha"
@@ -7204,7 +6939,7 @@ mod tests {
 			cx.run_until_parked();
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.status.key, "stale_created", "{}", m.status);
-				let plan = m.paste_preview.as_ref().expect("plan stays open");
+				let plan = m.paste.plan().expect("plan stays open");
 				assert!(!plan.is_applying);
 				assert_eq!(
 					plan.error.as_ref().map(|e| e.key),
@@ -7253,7 +6988,7 @@ mod tests {
 			cx.run_until_parked();
 			fs::set_permissions(&ro, fs::Permissions::from_mode(0o755))
 				.unwrap();
-			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
 			assert_eq!(
 				fs::read_to_string(dest.join("ok.txt")).unwrap(),
 				"fine"
@@ -7335,7 +7070,7 @@ mod tests {
 			for (prefix, root) in [("alpha", &alpha), ("beta", &beta)] {
 				let root = dunce::canonicalize(root).unwrap();
 				let idx = model.read_with(cx, |m, _| {
-					let plan = m.paste_preview.as_ref().unwrap();
+					let plan = m.paste.plan().unwrap();
 					let choice = plan
 						.prefix_choices
 						.iter()
@@ -7348,7 +7083,7 @@ mod tests {
 				settle(cx);
 			}
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert_eq!(plan.items.len(), 2);
 				assert!(plan.items.iter().all(|i| i.path == "unrelated.txt"));
 				assert_ne!(
@@ -7360,14 +7095,14 @@ mod tests {
 			click(cx, "paste-row:1:unrelated.txt");
 			click(cx, "paste-overwrite:1:unrelated.txt");
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert_eq!(plan.selected_item_idx, 1);
 				assert!(!plan.items[0].overwrite_allowed);
 				assert!(plan.items[1].overwrite_allowed);
 			});
 			click(cx, "paste-include:1:unrelated.txt");
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert!(plan.items[0].selected);
 				assert!(!plan.items[1].selected);
 			});
@@ -7375,14 +7110,14 @@ mod tests {
 			click(cx, "paste-row:0:unrelated.txt");
 			click(cx, "paste-overwrite:0:unrelated.txt");
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert_eq!(plan.selected_item_idx, 0);
 				assert!(plan.items.iter().all(|i| i.selected));
 				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
 			});
 			cx.simulate_keystrokes("enter");
 			cx.run_until_parked();
-			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
 			assert_eq!(
 				fs::read_to_string(alpha.join("unrelated.txt")).unwrap(),
 				"alpha new"
@@ -7429,27 +7164,28 @@ mod tests {
 				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
 			paste(&model, cx, &payload);
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert_eq!(plan.items.len(), 2);
 				assert!(plan.items.iter().all(|i| {
-					i.path == "common.txt" && i.action_label == "OVERWRITE"
+					i.path == "common.txt"
+						&& i.op == crate::paste::PlannedOp::Overwrite
 				}));
 			});
 			// The second overwrite is what used to be unreachable.
 			click(cx, "paste-overwrite:1:common.txt");
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert!(!plan.items[0].overwrite_allowed);
 				assert!(plan.items[1].overwrite_allowed);
 			});
 			click(cx, "paste-overwrite:0:common.txt");
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
 			});
 			cx.simulate_keystrokes("enter");
 			cx.run_until_parked();
-			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
 			assert_eq!(
 				fs::read_to_string(dest.join("common.txt")).unwrap(),
 				"edit 2\n"
@@ -7477,7 +7213,7 @@ mod tests {
 				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
 			paste(&model, cx, "// FILE: sub/x.txt\nnested\n");
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				let prefixes: Vec<&str> = plan
 					.prefix_choices
 					.iter()
@@ -7490,7 +7226,7 @@ mod tests {
 			model.update(cx, |m, cx| m.choose_paste_keep("sub", cx));
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert!(plan.mapping_ready());
 				let targets: Vec<&Path> =
 					plan.items.iter().map(|i| i.dest_path.as_path()).collect();
@@ -8244,41 +7980,6 @@ mod tests {
 			.as_deref()
 			.is_some_and(|body| body.contains("committed A")
 				&& !body.contains("working B")));
-	}
-
-	#[test]
-	fn test_paste_log_collapse_and_restore() {
-		// Open then close restores the visible log, exactly once.
-		let (mut saved, mut vis) = (None, true);
-		assert!(super::collapse_log_for_paste(&mut saved, &mut vis));
-		assert!(!vis);
-		// A re-paste over the open preview keeps the first saved state.
-		assert!(!super::collapse_log_for_paste(&mut saved, &mut vis));
-		assert!(super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(vis);
-		vis = false;
-		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(!vis, "must not restore twice");
-
-		// A log that was already hidden stays hidden.
-		let (mut saved, mut vis) = (None, false);
-		assert!(!super::collapse_log_for_paste(&mut saved, &mut vis));
-		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(!vis);
-
-		// A manual toggle (toggle_log clears the saved state) wins.
-		let (mut saved, mut vis) = (None, true);
-		super::collapse_log_for_paste(&mut saved, &mut vis);
-		saved = None;
-		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(!vis);
-
-		// Reopened by a path that does not clear the saved state: no flip.
-		let (mut saved, mut vis) = (None, true);
-		super::collapse_log_for_paste(&mut saved, &mut vis);
-		vis = true;
-		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(vis && saved.is_none());
 	}
 
 	use super::*;
