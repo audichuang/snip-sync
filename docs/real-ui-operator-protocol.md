@@ -44,7 +44,7 @@ T31、C-blocked、K-reinclude 在 `ed3d057` 上預期是 `ui-defect`（原因見
 下面兩格要填，但不決定閘門關不關：
 
 - T38：判定固定 `not-run`，證據欄寫「改走記憶體規程」
-- C preflight：判定固定 `not-run`，證據欄寫「這台 Mac 沒有 xvfb-run 與 /proc」
+- C preflight：在受測 SHA 的乾淨 checkout 上跑 `just preflight`。macOS 會先跑 CI 的 macOS 檢查，再在 Apple `container` VM 裡跑 Linux 關卡（見 AGENTS.md）。結束碼 0 判 `pass`，非 0 判 `fail`，證據欄寫失敗的關卡；沒有跑就判 `not-run` 並寫原因
 
 閘門裡有 `ui-defect`、`fail` 或 `not-run`，第一句就寫「產品閘門打開」，並列出那些 ID。第 9 節的項目尚未測，整個產品不在本規程宣告完成。
 
