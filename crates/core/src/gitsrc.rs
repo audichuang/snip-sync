@@ -986,6 +986,13 @@ fn read_working(
 	Ok(decode_utf8_or_skip(bytes))
 }
 
+fn blob_output_limit(spec: &str, cap: u64) -> GitError {
+	GitError::OutputLimit {
+		args: format!("cat-file {spec}"),
+		limit: usize::try_from(cap).unwrap_or(usize::MAX),
+	}
+}
+
 fn copyable(
 	read: BlobRead,
 	spec: &str,
@@ -996,10 +1003,7 @@ fn copyable(
 		BlobRead::Missing
 		| BlobRead::NotText(_)
 		| BlobRead::NotABlob { .. } => Ok(None),
-		BlobRead::TooLarge { .. } => Err(GitError::OutputLimit {
-			args: format!("cat-file {spec}"),
-			limit: usize::try_from(cap).unwrap_or(usize::MAX),
-		}),
+		BlobRead::TooLarge { .. } => Err(blob_output_limit(spec, cap)),
 	}
 }
 
@@ -1022,10 +1026,7 @@ fn read_changes(
 				DeletedContent::Text(t) => Some(t),
 				DeletedContent::Marker => Some(DELETED_FILE_MARKER.to_string()),
 				DeletedContent::TooLarge { spec, .. } => {
-					return Err(GitError::OutputLimit {
-						args: format!("cat-file {spec}"),
-						limit: usize::try_from(cap).unwrap_or(usize::MAX),
-					});
+					return Err(blob_output_limit(&spec, cap));
 				}
 			}
 		} else {
@@ -1312,6 +1313,7 @@ mod tests {
 		assert_eq!(
 			cat.read_classified(big_oid, 64).unwrap(),
 			BlobRead::TooLarge {
+				kind: "blob".into(),
 				size: big.len() as u64,
 				not_text: None,
 			}
@@ -1375,13 +1377,19 @@ mod tests {
 		r.commit("init");
 		let g = Git::open(&r.path()).unwrap();
 
+		// (a) 開啟 session 成功讀取一次，接著取消 token，確認第二次讀取在到達 session 之前即回傳 Cancelled。
 		let token = CancelToken::new();
-		token.cancel();
 		let opts = RunOptions {
-			cancel: Some(token),
+			cancel: Some(token.clone()),
 			..RunOptions::default()
 		};
 		let mut reader = BlobReader::new(&opts);
+		assert_eq!(
+			reader.read(&g, "HEAD:a.txt", 1024).unwrap(),
+			BlobRead::Text("ok\n".into())
+		);
+		assert!(reader.is_open());
+		token.cancel();
 		let err = reader.read(&g, "HEAD:a.txt", 1024).unwrap_err();
 		match err {
 			GitError::Cancelled { args } => {
@@ -1389,6 +1397,23 @@ mod tests {
 			}
 			other => panic!("expected Cancelled, got {other:?}"),
 		}
+
+		// (b) 首次讀取前即已取消：驗證立即回傳 Cancelled 且絕不 spawn 任何 cat-file session。
+		let token_b = CancelToken::new();
+		token_b.cancel();
+		let opts_b = RunOptions {
+			cancel: Some(token_b),
+			..RunOptions::default()
+		};
+		let mut reader_b = BlobReader::new(&opts_b);
+		let err_b = reader_b.read(&g, "HEAD:a.txt", 1024).unwrap_err();
+		match err_b {
+			GitError::Cancelled { args } => {
+				assert!(args.contains("cat-file"), "args was {args}");
+			}
+			other => panic!("expected Cancelled, got {other:?}"),
+		}
+		assert!(!reader_b.is_open());
 	}
 
 	#[test]

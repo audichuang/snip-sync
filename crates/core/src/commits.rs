@@ -696,6 +696,7 @@ fn admit_blob(
 		BlobRead::TooLarge {
 			size,
 			not_text: None,
+			..
 		} => {
 			let max = limit.expect("oversize text is only skipped under a cap");
 			let base = len_empty.expect("empty-content length");

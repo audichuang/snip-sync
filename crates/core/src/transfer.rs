@@ -1298,6 +1298,9 @@ struct BlobBudget {
 }
 
 impl BlobBudget {
+	/// 計算目前的讀取上限。
+	///
+	/// 整數大小判定：`size > floor(limit)` 等價於 `size > limit`。
 	fn cap(&self) -> u64 {
 		let per_file = (self.max_file_size_kb * 1024.0) as u64;
 		let mut cap = self.remaining_budget.map_or(u64::MAX, |b| b as u64);

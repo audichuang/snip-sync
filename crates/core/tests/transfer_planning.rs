@@ -2455,6 +2455,45 @@ fn test_deleted_sources_read_distinct_bases_and_match_legacy_working() {
 }
 
 #[test]
+fn test_deleted_gitlink_pre_deletion_spec_is_not_a_blob_yields_marker() {
+	let src = TestRepo::new("deleted-gitlink");
+	src.write("a.txt", "base\n");
+	let base = src.commit("base");
+
+	// Add gitlink pointing to an existing commit in the superproject's object store.
+	src.git(&[
+		"update-index",
+		"--add",
+		"--cacheinfo",
+		&format!("160000,{base},sub"),
+	]);
+	src.write("a.txt", "bump\n");
+	src.git(&["add", "a.txt"]);
+	src.git(&["commit", "-q", "-m", "add submodule"]);
+
+	// Delete gitlink from index: now it is deleted in Working view (HEAD has it, index/worktree does not)
+	src.git(&["update-index", "--force-remove", "sub"]);
+
+	let selection = ExportSelection::new(
+		vec![src.path().to_path_buf()],
+		None,
+		vec![deleted_item(&src, "sub", SourceKind::Working)],
+	)
+	.unwrap();
+
+	let plan = plan_export(&selection, &Settings::default(), None).unwrap();
+	assert_eq!(plan.files.len(), 1);
+	assert_eq!(plan.files[0].path, "sub");
+	assert_eq!(
+		plan.files[0].content.as_deref(),
+		Some(gitsrc::DELETED_FILE_MARKER)
+	);
+	assert!(plan.payload.contains(gitsrc::DELETED_FILE_MARKER));
+	assert!(!plan.payload.contains("\nparent "));
+	assert!(!plan.payload.contains("tree "));
+}
+
+#[test]
 fn exact_commit_set_keeps_selected_tip_and_rejects_side_commits() {
 	let repo = TestRepo::new("exact-commits");
 	repo.write("root.txt", "root\n");

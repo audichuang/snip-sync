@@ -95,6 +95,10 @@ impl CatFile {
 		Ok(CatObject::Found { oid, kind, body })
 	}
 
+	/// 讀取物件並分類為 [`BlobRead`]。
+	///
+	/// `cap` 為原始位元組上限（raw-byte cap），而非 JSON 序列化後的上限；需要檢查逸出後大小的呼叫端應在取得文字後自行計算。
+	/// 非刪除政策維持：超限非 blob 仍回傳 `TooLarge`（大小判定先於型別判定）。
 	pub(crate) fn read_classified(
 		&mut self,
 		object: &str,
@@ -261,13 +265,21 @@ pub(crate) enum BlobRead {
 	Text(String),
 	NotText(NotText),
 	/// size > cap（不論 kind）；body 以 8 KiB 分塊掃描後丟棄，not_text 是 classify 對完整 body 會給的結論。
+	///
+	/// 超出容量的內容一律經由 [`scan_discarded_body`] 進行分塊掃描：此掃描僅耗費 CPU，記憶體用量嚴格維持有界（bounded），
+	/// 保留此行為是為了讓刪除檔分類政策（`deleted_not_text`、`first_deleted_text`）能區分二進位與超限純文字。
 	TooLarge {
+		kind: String,
 		size: u64,
 		not_text: Option<NotText>,
 	},
 }
 
 /// 純函式，可用 Cursor 測試。
+///
+/// `cap` 為原始位元組上限（raw-byte cap），而非 JSON 序列化後的上限。
+/// 超出容量的內容一律經由 [`scan_discarded_body`] 進行分塊掃描：此掃描僅耗費 CPU，記憶體用量嚴格維持有界（bounded），
+/// 保留此行為是為了讓刪除檔分類政策（`deleted_not_text`、`first_deleted_text`）能區分二進位與超限純文字。
 pub(crate) fn read_classified_response<R: BufRead>(
 	r: &mut R,
 	cap: u64,
@@ -279,7 +291,11 @@ pub(crate) fn read_classified_response<R: BufRead>(
 	let (_oid, kind, size) = header;
 	if size > cap {
 		let not_text = scan_discarded_body(r, size)?;
-		return Ok(BlobRead::TooLarge { size, not_text });
+		return Ok(BlobRead::TooLarge {
+			kind,
+			size,
+			not_text,
+		});
 	}
 	if kind != "blob" {
 		skip_body(r, size)?;
@@ -292,12 +308,20 @@ pub(crate) fn read_classified_response<R: BufRead>(
 	}
 }
 
+/// 每次只維持一個開啟的 `cat-file --batch` session，當 root 變更時重新開啟。
+///
+/// 不變量（runner-slot invariant）：持有 cat-file runner slot 的執行緒絕不能啟動第二個 Git 程序（以免同一執行緒同時佔用兩個全域 Git 程序預算 slot）。
 pub(crate) struct BlobReader {
 	open: Option<(PathBuf, CatFile)>,
 	opts: RunOptions,
 }
 
 impl BlobReader {
+	#[cfg(test)]
+	pub(crate) fn is_open(&self) -> bool {
+		self.open.is_some()
+	}
+
 	pub(crate) fn new(opts: &RunOptions) -> Self {
 		Self {
 			open: None,
@@ -388,13 +412,15 @@ where
 			BlobRead::Text(t) => return Ok(DeletedContent::Text(t)),
 			BlobRead::Missing
 			| BlobRead::NotText(_)
-			| BlobRead::NotABlob { .. }
-			| BlobRead::TooLarge {
+			| BlobRead::NotABlob { .. } => {}
+			BlobRead::TooLarge { ref kind, .. } if kind != "blob" => {}
+			BlobRead::TooLarge {
 				not_text: Some(_), ..
 			} => {}
 			BlobRead::TooLarge {
 				size,
 				not_text: None,
+				..
 			} => {
 				return Ok(DeletedContent::TooLarge {
 					spec: s.to_string(),
@@ -615,6 +641,7 @@ mod tests {
 		assert_eq!(
 			read_classified_response(&mut r, 4).unwrap(),
 			BlobRead::TooLarge {
+				kind: "blob".into(),
 				size: 17,
 				not_text: None
 			}
@@ -622,6 +649,7 @@ mod tests {
 		assert_eq!(
 			read_classified_response(&mut r, 4).unwrap(),
 			BlobRead::TooLarge {
+				kind: "blob".into(),
 				size: 16,
 				not_text: Some(NotText::Binary)
 			}
@@ -629,6 +657,7 @@ mod tests {
 		assert_eq!(
 			read_classified_response(&mut r, 2).unwrap(),
 			BlobRead::TooLarge {
+				kind: "blob".into(),
 				size: 4,
 				not_text: Some(NotText::NotUtf8)
 			}
@@ -644,6 +673,7 @@ mod tests {
 		assert_eq!(
 			read_classified_response(&mut r, 5).unwrap(),
 			BlobRead::TooLarge {
+				kind: "tree".into(),
 				size: 20,
 				not_text: None
 			}
@@ -675,7 +705,7 @@ mod tests {
 
 	#[test]
 	fn deleted_policy_all_uncopyable_is_marker() {
-		let specs = ["missing", "bin", "tree", "huge_bin"];
+		let specs = ["missing", "bin", "tree", "huge_bin", "huge_commit"];
 		let res = first_deleted_text(specs, |s| match s {
 			"missing" => Ok(BlobRead::Missing),
 			"bin" => Ok(BlobRead::NotText(NotText::Binary)),
@@ -683,8 +713,14 @@ mod tests {
 				kind: "tree".into(),
 			}),
 			"huge_bin" => Ok(BlobRead::TooLarge {
+				kind: "blob".into(),
 				size: 100_000,
 				not_text: Some(NotText::Binary),
+			}),
+			"huge_commit" => Ok(BlobRead::TooLarge {
+				kind: "commit".into(),
+				size: 100_000,
+				not_text: None,
 			}),
 			_ => unreachable!(),
 		})
@@ -713,6 +749,7 @@ mod tests {
 			visited.push(s.to_string());
 			match s {
 				"huge_txt" => Ok(BlobRead::TooLarge {
+					kind: "blob".into(),
 					size: 50_000,
 					not_text: None,
 				}),
@@ -721,6 +758,40 @@ mod tests {
 		})
 		.unwrap();
 		assert_eq!(visited, vec!["huge_txt"]);
+		assert_eq!(
+			res,
+			DeletedContent::TooLarge {
+				spec: "huge_txt".into(),
+				size: 50_000,
+			}
+		);
+	}
+
+	#[test]
+	fn deleted_policy_skips_over_cap_non_blob_and_stops_on_over_cap_text_blob()
+	{
+		// 1. 超過容量的非 blob（即使 not_text 為 None）被略過，最終落回 Marker
+		let specs = ["huge_commit"];
+		let res = first_deleted_text(specs, |_| {
+			Ok(BlobRead::TooLarge {
+				kind: "commit".into(),
+				size: 100_000,
+				not_text: None,
+			})
+		})
+		.unwrap();
+		assert_eq!(res, DeletedContent::Marker);
+
+		// 2. 超過容量的文字 blob 則立即中止並回傳 TooLarge
+		let specs = ["huge_txt"];
+		let res = first_deleted_text(specs, |_| {
+			Ok(BlobRead::TooLarge {
+				kind: "blob".into(),
+				size: 50_000,
+				not_text: None,
+			})
+		})
+		.unwrap();
 		assert_eq!(
 			res,
 			DeletedContent::TooLarge {
@@ -742,6 +813,7 @@ mod tests {
 		);
 		assert_eq!(
 			not_text_of(BlobRead::TooLarge {
+				kind: "blob".into(),
 				size: 10,
 				not_text: Some(NotText::Binary),
 			}),
@@ -749,6 +821,7 @@ mod tests {
 		);
 		assert_eq!(
 			not_text_of(BlobRead::TooLarge {
+				kind: "blob".into(),
 				size: 10,
 				not_text: Some(NotText::NotUtf8),
 			}),
@@ -764,6 +837,7 @@ mod tests {
 		);
 		assert_eq!(
 			not_text_of(BlobRead::TooLarge {
+				kind: "blob".into(),
 				size: 10,
 				not_text: None,
 			}),
