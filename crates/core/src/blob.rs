@@ -99,6 +99,10 @@ impl CatFile {
 	///
 	/// `cap` 為原始位元組上限（raw-byte cap），而非 JSON 序列化後的上限；需要檢查逸出後大小的呼叫端應在取得文字後自行計算。
 	/// 大小判定先於型別判定；超限內容一律回傳 `TooLarge`。
+	///
+	/// body 被截斷（略過超限或非 blob 的 body 時 EOF）一律回傳 `GitError::Malformed`，
+	/// 與 develop 的 gitsrc／transfer 相同；commits 的超限掃描以前走 `Session::error`
+	/// （依 exit 回 Failed/Io/Timeout），現在也回 `Malformed`，此為刻意接受的變更。
 	pub(crate) fn read_classified(
 		&mut self,
 		object: &str,
@@ -472,7 +476,9 @@ where
 	Ok(DeletedContent::Marker)
 }
 
-// kind 在此刻意被忽略（比照 TS），不論物件型別，超限且非文字一律回傳其原因。
+// kind 在此刻意被忽略：commits 的 admit_entry 以 is_special_mode 守門（commits.rs），
+// gitlink 與 tree 不會走到這裡，所以呼叫端只會拿到 blob。
+// NotText 與超限且非文字的 TooLarge{not_text: Some} 都對應到同一個原因。
 pub(crate) fn not_text_of(read: BlobRead) -> Option<NotText> {
 	match read {
 		BlobRead::NotText(r)
@@ -755,7 +761,7 @@ mod tests {
 	}
 
 	#[test]
-	fn cat_file_body_truncated_maps_to_malformed() {
+	fn cat_file_short_skipped_body_is_marked_truncated() {
 		// 1. over-cap short body => marker true
 		let mut r_overcap = Cursor::new(b"abc blob 20\nshort".to_vec());
 		let err_overcap =
@@ -869,27 +875,7 @@ mod tests {
 	}
 
 	#[test]
-	fn deleted_policy_over_cap_non_blob_text_is_too_large_like_blob() {
-		// 超過容量的非 blob 若為純文字（not_text: None），比照 blob 立即中止並回傳 TooLarge
-		let specs = ["huge_commit"];
-		let res = first_deleted_text(specs, |_| {
-			Ok(BlobRead::TooLarge {
-				size: 100_000,
-				not_text: None,
-			})
-		})
-		.unwrap();
-		assert_eq!(
-			res,
-			DeletedContent::TooLarge {
-				spec: "huge_commit".into(),
-				size: 100_000,
-			}
-		);
-	}
-
-	#[test]
-	fn deleted_not_text_maps_every_variant() {
+	fn not_text_of_maps_every_variant() {
 		assert_eq!(
 			not_text_of(BlobRead::NotText(NotText::Binary)),
 			Some(NotText::Binary)

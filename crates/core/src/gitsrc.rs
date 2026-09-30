@@ -1290,6 +1290,7 @@ mod tests {
 	}
 
 	#[test]
+	// 放在 gitsrc::tests 是為了重用這裡的 Repo helper。
 	fn read_classified_does_not_keep_an_oversize_body_and_stays_in_sync() {
 		let r = Repo::new();
 		let big = "你".repeat(12_000);
@@ -1339,6 +1340,7 @@ mod tests {
 	}
 
 	#[test]
+	// 放在 gitsrc::tests 是為了重用這裡的 Repo helper。
 	fn blob_reader_reopens_on_another_repository_and_close_is_ok_when_unused() {
 		let mut unused = BlobReader::new(&RunOptions::default());
 		assert!(unused.close().is_ok());
@@ -1370,6 +1372,7 @@ mod tests {
 	}
 
 	#[test]
+	// 放在 gitsrc::tests 是為了重用這裡的 Repo helper。
 	fn blob_reader_polls_cancel_before_each_read() {
 		let r = Repo::new();
 		r.write("a.txt", b"ok\n");
