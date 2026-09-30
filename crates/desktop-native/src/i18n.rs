@@ -167,7 +167,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_chip_user" => "使用者",
 			"log_chip_date" => "日期",
 			"log_chip_paths" => "路徑",
-			"log_chip_repo" => "儲存庫",
+			"log_chip_repo" => "repo",
 			"log_repo_all" => "全部儲存庫",
 			"log_details_repo" => "儲存庫：{}",
 			"status_log_cross_repo" => "所選提交分屬不同儲存庫；複製與比較只能在同一個儲存庫內進行",
@@ -179,7 +179,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_date_30d" => "過去 30 天",
 			"log_date_1y" => "過去 1 年",
 			"log_paths_placeholder" => "路徑，例如 src/app",
-			"log_paths_hint" => "輸入路徑後按 Enter 加入，或勾選下方的資料夾與檔案",
+			"log_paths_hint" => "輸入文字過濾 repo 與路徑；按 Enter 加入輸入的路徑",
 			"log_paths_tree_empty" => "開啟專案工具視窗後即可在此勾選資料夾",
 			"log_date_custom" => "自訂範圍",
 			"log_date_from" => "起 YYYY-MM-DD",
@@ -227,6 +227,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"op_delete" => "刪除",
 			"op_skip" => "跳過",
 			"op_excluded" => "已排除",
+			"op_overwrite_pending" => "待允許覆寫",
 			"overwrite_toggle" => "覆寫",
 			"reason_create" => "目的地不存在，將建立新檔",
 			"reason_overwrite" => "將覆寫目的地既有檔案",
@@ -234,6 +235,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"reason_delete" => "將刪除目的地檔案，不寫入內容",
 			"reason_delete_missing" => "目的地不存在，無需刪除",
 			"reason_excluded" => "已排除，不會寫入",
+			"reason_commit_excluded" => "已排除；commit 重播不能只套用部分檔案，需重新勾選才能套用",
+			"reason_commit_overwrite_pending" => "目的地已有此檔；覆寫預設關閉，允許覆寫前無法套用",
 			"paste_keys" => "Enter 套用 · Esc 取消 · ↑↓ 切換項目 · 空白鍵切換",
 			"copy_from" => "複製來源",
 			"selected" => "已選",
@@ -263,7 +266,20 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"src_unstaged_diff" => "未暫存變更",
 			"btn_copy_commits" => "複製 Commits",
 			"tip_copy_commits" => "複製選取的 commits 範圍至剪貼簿",
-			"status_commits_copied" => "已複製 {} 個 commit 至剪貼簿",
+			"paste_commit_count" => "{} 個 commit",
+			"commit_no_message" => "（無訊息）",
+			"commit_empty_note" => "無檔案異動，仍會建立空 commit",
+			"commit_header_counts" => "{} 個檔案，{} 個不寫入",
+			"reason_skip_generic" => "此檔案不會寫入",
+			"reason_nc_binary" => "未複製：二進位檔，不寫入也不刪除",
+			"reason_nc_non_utf8" => "未複製：非 UTF-8 編碼，不寫入也不刪除",
+			"reason_nc_non_utf8_path" => "未複製：路徑不是 UTF-8，不寫入也不刪除",
+			"reason_nc_unsupported" => "未複製：符號連結或子模組，不寫入也不刪除",
+			"reason_nc_unreadable" => "未複製：來源端讀不到內容，不寫入也不刪除",
+			"reason_skip_unsafe_path" => "路徑不安全，不寫入",
+			"reason_skip_non_utf8_target" => "目的地現有檔案不是 UTF-8，不覆寫",
+			"status_commits_copied" => "已複製 {} 個 commit（{} 個檔案、{} 字元）至剪貼簿",
+			"status_commits_copied_skipped" => "已複製 {} 個 commit（{} 個檔案、{} 字元）至剪貼簿；{} 個檔案未複製：{}",
 			"status_replay_done" => "Replay 完成：建立 {} 個 commit",
 			"collapsed_n" => "+{} 個已收合節點",
 			"status_copy_source" => "選取籃 {} 項",
@@ -294,6 +310,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_paste_preview" => "貼上預覽已就緒: {} 項變更",
 			"paste_err_not_payload" => "剪貼簿內容不是有效的 snip-sync payload",
 			"paste_err_nothing" => "剪貼簿 payload 不包含任何檔案",
+			"paste_err_plan" => "無法建立貼上計畫: {}",
+			"paste_err_destination" => "無法使用貼上目的地「{}」: {}",
+			"paste_err_destination_not_dir" => "貼上目的地「{}」不是資料夾",
 			"preview_memory_limit" => "預覽資料超過 32 MiB 上限，未載入這次變更。請縮小預覽範圍。",
 			"stale_created" => "目的地檔案已在外部建立: {}",
 			"stale_deleted" => "目的地檔案已在外部刪除: {}",
@@ -496,7 +515,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_chip_user" => "User",
 			"log_chip_date" => "Date",
 			"log_chip_paths" => "Paths",
-			"log_chip_repo" => "Repository",
+			"log_chip_repo" => "Repo",
 			"log_repo_all" => "All repositories",
 			"log_details_repo" => "Repository: {}",
 			"status_log_cross_repo" => "The selected commits belong to different repositories; copy and compare work within one repository",
@@ -508,7 +527,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_date_30d" => "Last 30 days",
 			"log_date_1y" => "Last year",
 			"log_paths_placeholder" => "Path, e.g. src/app",
-			"log_paths_hint" => "Type a path and press Enter to add it, or check folders and files below",
+			"log_paths_hint" => "Type to filter repos and paths; Enter adds the typed path",
 			"log_paths_tree_empty" => "Open the Project tool window to pick folders here",
 			"log_date_custom" => "Custom range",
 			"log_date_from" => "From YYYY-MM-DD",
@@ -556,6 +575,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"op_delete" => "Delete",
 			"op_skip" => "Skip",
 			"op_excluded" => "Excluded",
+			"op_overwrite_pending" => "Overwrite pending",
 			"overwrite_toggle" => "Overwrite",
 			"reason_create" => "Not present at destination; will be created",
 			"reason_overwrite" => "Will overwrite the existing destination file",
@@ -563,6 +583,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"reason_delete" => "Will delete the destination file",
 			"reason_delete_missing" => "Not present at destination; nothing to delete",
 			"reason_excluded" => "Excluded; nothing will be written",
+			"reason_commit_excluded" => "Excluded; a commit replay cannot apply a subset of files, so re-select it to apply",
+			"reason_commit_overwrite_pending" => "The file exists at the destination and overwrite is off; Apply is blocked until overwrite is allowed",
 			"paste_keys" => "Enter apply · Esc cancel · ↑↓ item · Space toggle",
 			"copy_from" => "Copy from",
 			"selected" => "selected",
@@ -592,7 +614,20 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"src_unstaged_diff" => "Unstaged changes",
 			"btn_copy_commits" => "Copy Commits",
 			"tip_copy_commits" => "Copy selected commit range to clipboard",
-			"status_commits_copied" => "Copied {} commit(s) to clipboard",
+			"paste_commit_count" => "{} commit(s)",
+			"commit_no_message" => "(no message)",
+			"commit_empty_note" => "No file changes; an empty commit will still be created",
+			"commit_header_counts" => "{} file(s), {} not written",
+			"reason_skip_generic" => "This file will not be written",
+			"reason_nc_binary" => "Not copied: binary file, neither written nor deleted",
+			"reason_nc_non_utf8" => "Not copied: not UTF-8, neither written nor deleted",
+			"reason_nc_non_utf8_path" => "Not copied: path is not UTF-8, neither written nor deleted",
+			"reason_nc_unsupported" => "Not copied: symlink or submodule, neither written nor deleted",
+			"reason_nc_unreadable" => "Not copied: source content could not be read, neither written nor deleted",
+			"reason_skip_unsafe_path" => "Unsafe path; not written",
+			"reason_skip_non_utf8_target" => "The existing file at the destination is not UTF-8; not overwritten",
+			"status_commits_copied" => "Copied {} commit(s) ({} files, {} chars) to clipboard",
+			"status_commits_copied_skipped" => "Copied {} commit(s) ({} files, {} chars) to clipboard; {} file(s) not copied: {}",
 			"status_replay_done" => "Replay complete: {} commit(s) created",
 			"collapsed_n" => "+{} collapsed nodes",
 			"status_copy_source" => "Basket {}",
@@ -623,6 +658,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_paste_preview" => "Paste preview ready: {} items",
 			"paste_err_not_payload" => "Clipboard content is not a valid snip-sync payload",
 			"paste_err_nothing" => "Clipboard payload contains no files",
+			"paste_err_plan" => "Could not build the paste plan: {}",
+			"paste_err_destination" => "Cannot use paste destination \"{}\": {}",
+			"paste_err_destination_not_dir" => "Paste destination \"{}\" is not a directory",
 			"preview_memory_limit" => "Preview data exceeds the 32 MiB limit. This change was not loaded. Choose a smaller preview.",
 			"stale_created" => "Destination file was created externally: {}",
 			"stale_deleted" => "Destination file was deleted externally: {}",
@@ -773,6 +811,58 @@ mod tests {
 	}
 
 	#[test]
+	fn paste_err_destination_names_path_and_reason() {
+		let msg = Msg::new(
+			"paste_err_destination",
+			["/t/newdir/x".to_string(), "Not a directory".to_string()],
+		);
+		for loc in [Locale::ZhTw, Locale::En] {
+			let s = msg.render(loc);
+			assert!(!s.starts_with("paste_err_"), "raw key leaked: {s}");
+			assert!(s.contains("/t/newdir/x") && s.contains("Not a directory"));
+		}
+	}
+
+	/// Every `Msg::new("key", ..)` in this crate must have both translations,
+	/// or the status bar shows the raw key.
+	#[test]
+	fn every_msg_key_used_in_source_is_translated() {
+		let mut keys = std::collections::BTreeSet::new();
+		let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+		let mut stack = vec![dir];
+		while let Some(d) = stack.pop() {
+			for e in std::fs::read_dir(d).unwrap() {
+				let p = e.unwrap().path();
+				if p.is_dir() {
+					stack.push(p);
+				} else if p.extension().is_some_and(|x| x == "rs")
+					&& p.file_name().is_some_and(|n| n != "i18n.rs")
+				{
+					let src = std::fs::read_to_string(&p).unwrap();
+					let mut rest = src.as_str();
+					while let Some(at) = rest.find("Msg::new(") {
+						rest = rest[at + 9..].trim_start();
+						let key = rest
+							.strip_prefix('"')
+							.and_then(|r| r.split('"').next());
+						if let Some(key) = key {
+							keys.insert(key.to_string());
+						}
+					}
+				}
+			}
+		}
+		assert!(keys.len() > 20, "scan found too few keys: {keys:?}");
+		for key in keys {
+			assert!(
+				!t(&key, Locale::ZhTw).is_empty(),
+				"Missing ZhTw key: {key}"
+			);
+			assert!(!t(&key, Locale::En).is_empty(), "Missing En key: {key}");
+		}
+	}
+
+	#[test]
 	fn test_i18n_keys_parity() {
 		let test_keys = [
 			"btn_back_to_working",
@@ -866,6 +956,26 @@ mod tests {
 			"menu_copy_files",
 			"status_copied_limit",
 			"status_copy_nothing_skipped",
+			"paste_err_plan",
+			"paste_err_destination",
+			"paste_err_destination_not_dir",
+			"paste_commit_count",
+			"commit_no_message",
+			"commit_empty_note",
+			"commit_header_counts",
+			"reason_skip_generic",
+			"op_overwrite_pending",
+			"reason_commit_excluded",
+			"reason_commit_overwrite_pending",
+			"reason_nc_binary",
+			"reason_nc_non_utf8",
+			"reason_nc_non_utf8_path",
+			"reason_nc_unsupported",
+			"reason_nc_unreadable",
+			"reason_skip_unsafe_path",
+			"reason_skip_non_utf8_target",
+			"status_commits_copied",
+			"status_commits_copied_skipped",
 		];
 		for key in test_keys {
 			assert!(

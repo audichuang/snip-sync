@@ -170,6 +170,21 @@ pub fn ref_label(badge: &RefBadge, current_branch: Option<&str>) -> RefLabel {
 	}
 }
 
+/// One label for all of a row's shown badges, like IntelliJ's
+/// "origin & main, dev": icon and colour of the first (best-ranked) badge.
+pub fn combined_label(
+	badges: &[RefBadge],
+	current_branch: Option<&str>,
+) -> Option<RefLabel> {
+	let mut labels = badges.iter().map(|b| ref_label(b, current_branch));
+	let first = labels.next()?;
+	let text = std::iter::once(first.text.clone())
+		.chain(labels.map(|l| l.text))
+		.collect::<Vec<_>>()
+		.join(", ");
+	Some(RefLabel { text, ..first })
+}
+
 /// Display priority: current branch, HEAD, local, tag, remote, other.
 fn ref_rank(info: &RefInfo, current_branch: Option<&str>) -> u8 {
 	match &info.kind {
@@ -674,6 +689,21 @@ mod tests {
 		// 4 refs merging to 2 badges fit without `+N`.
 		let (shown, hidden) = visible_refs(&refs[..4], None);
 		assert_eq!((shown.len(), hidden), (2, 0));
+	}
+
+	#[test]
+	fn shown_badges_join_into_one_label() {
+		let refs = vec![
+			local("fix"),
+			remote("origin", "fix"),
+			local("release"),
+			remote("origin", "release"),
+		];
+		let (shown, _) = visible_refs(&refs, Some("release"));
+		let l = combined_label(&shown, Some("release")).unwrap();
+		assert_eq!(l.text, "origin & release, origin & fix");
+		assert!(l.current);
+		assert!(combined_label(&[], None).is_none());
 	}
 
 	/// x of every rail end on the row's top (`at_top`) or bottom edge.

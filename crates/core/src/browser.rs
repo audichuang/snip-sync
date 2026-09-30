@@ -711,13 +711,11 @@ pub fn commit_blob_with(
 			limit: opts.max_stdout,
 		});
 	}
-	let bytes = out.stdout;
-	if bytes.iter().take(8000).any(|&b| b == 0) {
-		return Ok(BlobText::Binary);
-	}
-	Ok(match String::from_utf8(bytes) {
+	// 不改走 --batch 的原因：batch 是一行一個請求的協定，檔名含換行時會變成 Missing；而且預覽要吃 max_stdout 的 OutputLimit。
+	Ok(match crate::blob::classify(out.stdout) {
 		Ok(s) => BlobText::Text(s),
-		Err(_) => BlobText::NotUtf8,
+		Err(crate::blob::NotText::Binary) => BlobText::Binary,
+		Err(crate::blob::NotText::NotUtf8) => BlobText::NotUtf8,
 	})
 }
 
@@ -2038,7 +2036,7 @@ mod tests {
 		fs::write(root.join("new.txt"), "fresh\n").unwrap();
 		run(root, &["add", "-A"]);
 		let tip = commit(root, "change");
-		let git = Git::at_known_root(root.to_path_buf());
+		let git = Git::open(root).unwrap();
 		let opts = RunOptions::default();
 		for source in [
 			GitSource::Commit(tip.clone()),
@@ -2100,5 +2098,19 @@ mod tests {
 			.unwrap()
 			.0
 			.is_empty());
+	}
+
+	#[test]
+	fn commit_blob_nul_after_8000_bytes_is_binary() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		let mut bytes = vec![b'a'; 9000];
+		bytes.push(0);
+		fs::write(root.join("nul_past_8k.bin"), &bytes).unwrap();
+		let sha = commit(root, "large binary");
+		let git = Git::open(root).unwrap();
+		let res = commit_blob(&git, &sha, "nul_past_8k.bin", 65536).unwrap();
+		assert_eq!(res, BlobText::Binary);
 	}
 }

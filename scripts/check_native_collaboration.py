@@ -31,7 +31,7 @@ import warnings
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 SCRIPTS_DIR = os.path.abspath(os.path.dirname(__file__))
 if SCRIPTS_DIR not in sys.path:
@@ -734,6 +734,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--helper-receipt")
     parser.add_argument("--phase", choices=("pilot", "all"), default="pilot")
     parser.add_argument("--steps", help="Comma-separated manifest step ids. Overrides --phase")
+    parser.add_argument("--jobs", type=int, default=1, help="Steps run at once (each owns its displays and apps)")
     return parser
 
 
@@ -1391,6 +1392,33 @@ def paste_preview(native: Any, session: Any, win: dict[str, Any], timeout: float
     return line
 
 
+PASTE_OVERWRITE_RE = re.compile(r"^paste-overwrite:(\d+):(.*)$", re.S)
+
+
+def paste_overwrite_path(control: str) -> str | None:
+    """Path of a `paste-overwrite:<ix>:<path>` control; the plan index keeps duplicate paths apart, the path may contain ':'."""
+    match = PASTE_OVERWRITE_RE.match(control)
+    return match.group(2) if match else None
+
+
+def paste_overwrite_controls(bounds: Iterable[str], path: str) -> list[str]:
+    """Every drawn overwrite control for `path`, in plan order (one path can occur under several roots or commits)."""
+    found = [(int(m.group(1)), control) for control in bounds if (m := PASTE_OVERWRITE_RE.match(control)) and m.group(2) == path]
+    return [control for _, control in sorted(found)]
+
+
+def wait_paste_overwrite(native: Any, session: Any, path: str, timeout: float) -> tuple[int, int, int, int]:
+    """Bounds of the first overwrite control for `path` once the app reports it."""
+    deadline = time.monotonic() + timeout
+    while True:
+        lines = session.texts()
+        controls = paste_overwrite_controls(native.parse_bounds(lines), path)
+        remaining = deadline - time.monotonic()
+        if controls or remaining <= 0:
+            return native.require_control(lines, controls[0] if controls else f"paste-overwrite:{path}")
+        time.sleep(min(0.05, remaining))
+
+
 def click_overwrites(native: Any, session: Any, win: dict[str, Any], paths: Sequence[str] | None, timeout: float, trace: list[dict[str, Any]]) -> list[str]:
     clicked: list[str] = []
     # PASTE_PREVIEW is logged before the frame that paints the panel.
@@ -1398,12 +1426,11 @@ def click_overwrites(native: Any, session: Any, win: dict[str, Any], paths: Sequ
     idle = 0
     while idle < 4:
         bounds = native.parse_bounds(session.texts())
-        ids = [control for control in bounds if control.startswith("paste-overwrite:")]
+        ids = [control for control in bounds if paste_overwrite_path(control) is not None]
         if paths is not None:
-            ids = [control for control in ids if control.split(":", 1)[1] in paths]
+            ids = [control for control in ids if paste_overwrite_path(control) in paths]
         pending = [control for control in ids if control not in clicked]
         if not pending:
-            viewport = bounds.get("paste-items") or bounds.get("paste-row:" + (paths[0] if paths else ""))
             if "paste-items" not in bounds and not ids:
                 break
             host = bounds.get("paste-items")
@@ -1439,21 +1466,23 @@ def click_overwrites(native: Any, session: Any, win: dict[str, Any], paths: Sequ
         clicked.append(control)
         trace.append({"action": "overwrite-on", "control": control, "line": line})
     if paths is not None:
-        missing = [path for path in paths if f"paste-overwrite:{path}" not in clicked]
+        missing = [path for path in paths if path not in {paste_overwrite_path(control) for control in clicked}]
         if missing and "paste-items" in native.parse_bounds(session.texts()):
             for path in list(missing):
-                ctrl = f"paste-overwrite:{path}"
-                try:
-                    box = scroll_in_view(native, session, win, ctrl, "paste-items", timeout)
-                    before = len(session.lines)
-                    session.click(win, box)
-                    line = wait_substr(session, "[APP:PASTE_TOGGLED:", before, timeout)
-                    if "state=true" in line:
-                        clicked.append(ctrl)
-                        trace.append({"action": "overwrite-on", "control": ctrl, "line": line})
-                except Exception:
-                    pass
-        missing = [path for path in paths if f"paste-overwrite:{path}" not in clicked]
+                for ctrl in paste_overwrite_controls(native.parse_bounds(session.texts()), path):
+                    if ctrl in clicked:
+                        continue
+                    try:
+                        box = scroll_in_view(native, session, win, ctrl, "paste-items", timeout)
+                        before = len(session.lines)
+                        session.click(win, box)
+                        line = wait_substr(session, "[APP:PASTE_TOGGLED:", before, timeout)
+                        if "state=true" in line:
+                            clicked.append(ctrl)
+                            trace.append({"action": "overwrite-on", "control": ctrl, "line": line})
+                    except Exception:
+                        pass
+        missing = [path for path in paths if path not in {paste_overwrite_path(control) for control in clicked}]
         if missing:
             raise MissingControl("paste-overwrite:" + ",".join(missing), "authorized overwrite control was not clicked")
     return clicked
@@ -1988,24 +2017,40 @@ def run_steps(config: Mapping[str, Any]) -> dict[str, Any]:
         "blockers": [],
     }
     graph_lines: list[str] = []
-    stop_widening = False
-    for step_id in config["step_ids"]:
-        if stop_widening:
-            skipped = blank_step(step_id)
-            skipped["status"] = "blocked"
-            skipped["failures"] = ["not started after an environment blocker"]
-            report["steps"].append(skipped)
-            continue
-        step = next(item for item in manifest["steps"] if item["id"] == step_id)
-        record, fatal = run_one(native, manifest, step, names, output, timeout, config)
-        report["steps"].append(record)
-        report["ownedFixtures"].extend(record.get("ownedFixtures") or [])
-        graph_lines.extend(record.get("probeGenerations") or [])
-        write_json(output / "report.json", report)
-        print(f"step {step_id}: {record['status']}", flush=True)
-        if fatal:
-            stop_widening = True
-            report["blockers"].append(record["failures"][-1] if record["failures"] else "environment failure")
+    # Steps own their fixture copy, displays and apps, so they can overlap. After an
+    # environment blocker no further step is started; ones already running finish.
+    jobs = max(1, int(config.get("jobs") or 1))
+    lock = threading.Lock()
+    blocked = threading.Event()
+    finished: dict[str, dict[str, Any]] = {}
+
+    def do_step(step_id: str, position: int) -> None:
+        # Two apps per step compile shaders on the CPU as they start; the first steps staggered
+        # keeps those bursts (and the input they would drop) from landing together.
+        if position < jobs:
+            time.sleep(position * 6.0)
+        if blocked.is_set():
+            record = blank_step(step_id)
+            record["status"] = "blocked"
+            record["failures"] = ["not started after an environment blocker"]
+            fatal = False
+        else:
+            step = next(item for item in manifest["steps"] if item["id"] == step_id)
+            record, fatal = run_one(native, manifest, step, names, output, timeout, config)
+        with lock:
+            finished[step_id] = record
+            report["steps"] = [finished[i] for i in config["step_ids"] if i in finished]
+            report["ownedFixtures"].extend(record.get("ownedFixtures") or [])
+            graph_lines.extend(record.get("probeGenerations") or [])
+            write_json(output / "report.json", report)
+            print(f"step {step_id}: {record['status']}", flush=True)
+            if fatal:
+                blocked.set()
+                report["blockers"].append(record["failures"][-1] if record["failures"] else "environment failure")
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        for future in [pool.submit(do_step, step_id, i) for i, step_id in enumerate(config["step_ids"])]:
+            future.result()
     report["graph"] = graph_from_lines(graph_lines)
     report["graph"]["screenshots"] = [
         step["screenshots"].get("graph")
@@ -3034,7 +3079,7 @@ def run_unauthorized(native: Any, sessions: Mapping[str, Any], manifest: Mapping
     preview = paste_preview(native, dest_session, window_of(dest_session, timeout), timeout, trace)
     record["screenshots"]["preview"] = relative_shot(output, capture_checked(native, dest_session, window_of(dest_session, timeout), "preview", timeout))
     try:
-        wait_control(native, dest_session, f"paste-overwrite:{path}", timeout)
+        wait_paste_overwrite(native, dest_session, path, timeout)
     except Exception as exc:
         raise MissingControl(f"paste-overwrite:{path}", "unauthorized overwrite row was not rendered, so the refusal cannot be distinguished from a missing plan") from exc
     line = apply_or_cancel(native, dest_session, window_of(dest_session, timeout), "btn-apply", timeout, trace)
@@ -3158,6 +3203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "phase": "all" if args.steps else args.phase,
             "step_ids": selected_ids(manifest, args.phase, args.steps),
             "driverHead": driver_head(),
+            "jobs": args.jobs,
         }
         report = run_steps(config)
         assert_parent_display_unchanged(display_before, parent_display())

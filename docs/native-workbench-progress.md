@@ -147,40 +147,36 @@ just native --workspace /path/to/repos
 # 2. 執行原生 GPUI 原生切片自動化 Smoke 測試（真實 X11 視窗、剪貼簿與還原驗證）
 just native-smoke
 
-# 3. 執行連續取樣之記憶體量測基準套件
-just bench-memory
+# 3. 執行連續取樣之記憶體量測基準套件（參數見 --help）
+python3 scripts/bench_native_memory.py --help
 
-# 4. 執行既有 Tauri 應用的端到端 E2E 測試（確認未破壞既有功能）
-just desktop-e2e
-
-# 5. 執行完整 Rust 與前端 preflight 檢查
+# 4. 執行完整 preflight（actionlint、Rust、Python harness、原生 smoke／lifecycle／acceptance）
 just preflight
 ```
 
 ---
 
-## 3. 實測記憶體數據（15 Repos Workload，連續 50ms 取樣）
+## 3. 實測記憶體數據：0.3.2 原生版與 Tauri 0.3.1 同條件對比
 
-量測環境：
-- 作業系統：Ubuntu 24.04.5 LTS (Linux 7.0.0-31-generic)
-- CPU：12th Gen Intel(R) Core(TM) i7-12700 (20 cores)
-- 實體記憶體：31,831 MiB
-- 顯示環境：X11 (DISPLAY=:1)
-- 工作負載：15 個真實 Git 儲存庫（多分支、staged、dirty、untracked、clean）
+2026-09-29 在同一台機器上量測，兩邊條件相同：
+- 兩個版本都用 release build：原生版是 `v0.3.2` 的 `snip-desktop-native`，Tauri 版是 `v0.3.1` 以 `tauri build --no-bundle` 建出的 `snip-sync`。
+- 每一次都用全新的環境：私有的 Xvfb（`-displayfd`、1280x900x24）、全新的 XDG／HOME、私有的 D-Bus。原生版以 lavapipe 算繪，WebKitGTK 使用 Xvfb 的軟體算繪。
+- 兩個情境：
+  - **空閒**：不開 repo。
+  - **開 1 個 repo**：同一個 118 個 commit 的 repo，含 1 個修改檔和 1 個 untracked 檔。原生版用 `--workspace` 開啟，Tauri 版照它原本 e2e 的 `setRepo` 做法，經 tauri-driver 在 `repo-path` 欄位輸入路徑。Tauri 版一次只能開一個 repo，所以沒有多 repo 情境可以對比。
+- 取樣：載入完成後先靜置 30 秒，接著每 0.5 秒讀整棵 app 程序樹的 `/proc/<pid>/smaps_rollup`，連續 30 秒，取中位數。每組跑 3 次，表中是 3 次的中位數；3 次之間，RSS 相差不到 1%，PSS 相差不到 6%。
+- 機器：Ubuntu 24.04.5（Linux 7.0.0-31）、i7-12700（20 執行緒）、32 GB。
 
-| 方案與測試階段 | 程序數 | 穩態 RSS (MiB) | 穩態 PSS (MiB) | 取樣並行峰值 RSS (MiB) | 主程序 VmHWM (MiB) |
-| --- | :---: | :---: | :---: | :---: | :---: |
-| **GPUI Release (Idle/Empty)** | 1 | 107.48 | 61.90 | 107.48 | 107.48 |
-| **GPUI Release (15 Repos Overview)** | 1 | 113.67 | 67.17 | 113.67 | 113.67 |
-| **GPUI Release (Repo + Preview Active)** | 1 | 114.04 | 67.47 | 114.04 | 114.04 |
-| GPUI Debug (Idle/Empty) | 1 | 129.99 | 84.46 | 129.99 | 129.99 |
-| GPUI Debug (15 Repos Overview) | 1 | 138.08 | 91.58 | 138.08 | 138.08 |
-| GPUI Debug (Repo + Preview Active) | 1 | 138.08 | 91.56 | 138.08 | 138.08 |
-| **Tauri Debug (Idle/Startup)** | 3 | 430.16 | 221.45 | 433.45 | 163.80 |
+| 情境 | 版本 | 程序數 | RSS (MiB) | PSS (MiB) |
+| --- | --- | :---: | ---: | ---: |
+| 空閒 | 原生 0.3.2 | 1 | 109.6 | 81.0 |
+| 空閒 | Tauri 0.3.1 | 3 | 467.5 | 269.7 |
+| 開 1 個 repo | 原生 0.3.2 | 1 | 109.0 | 78.8 |
+| 開 1 個 repo | Tauri 0.3.1 | 3 | 483.0 | 283.7 |
 
-*備註：以上數據為 Linux 本機實測讀數，不包含推估或假定之百分比節省宣稱。*
-
----
+- 空閒時，原生版的 RSS 少 77%、PSS 少 70%。開 1 個 repo 時，RSS 少 77%、PSS 少 72%。交接文件訂的「比 Tauri 至少下降 30%」已經達成。
+- Tauri 版的 3 個程序是 app 本身、`WebKitWebProcess` 與 `WebKitNetworkProcess`。原生版只有 1 個程序。
+- 這裡只有 Linux 的數據。macOS（Metal）與 Windows（DirectX）還沒有實測，不可假定比例相同。GPU 記憶體沒有算進去。
 
 ## 4. 平台實況、已知限制與阻礙（Blockers & Gaps）
 
@@ -241,7 +237,7 @@ just preflight
 3. **多來源目的地映射與貼上預覽（Multi-Source Destination Mapping）**：
    - 貼上預覽採用 `snip_core::transfer::ImportMapping` 與多儲存庫前綴比對。
    - 貼上列呈現目標儲存庫徽章 `[item.dest_root_name]`。
-   - 支援個別項目覆寫切換（`paste-overwrite:{path}`），預設關閉覆寫。
+   - 支援個別項目覆寫切換（`paste-overwrite:{ix}:{path}`），預設關閉覆寫。
    - 目的地過期即時偵測拒絕寫入。
 
 4. **Commit Replay 匯出與套用（Commit Replay）**：

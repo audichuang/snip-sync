@@ -4,13 +4,13 @@
 //! and workspace roots, preserving v1 wire format compatibility while enforcing
 //! explicit root mapping, conflict detection, cumulative bounded reads, and freshness validation.
 //!
-//! `plan_export_with`, `plan_import_with` and `CommitReplayPreview::capture_with`
-//! thread one `RunOptions` through read-only Git and freshness reads. Cancellation
-//! is `TransferError::Git(GitError::Cancelled)` and does not produce a plan.
+//! `plan_export_with`, `plan_import_with`, `CommitReplayPreview::capture_with`
+//! and `CommitReplayPreview::apply_with` thread one `RunOptions` through Git
+//! and freshness reads; see `apply_with` for its cancel boundary and error shape.
 //! A regular-file `read` cannot be stopped mid-syscall; the token is polled before
 //! open, between chunks and after the read. A FIFO or other non-regular file is
 //! rejected before `open`. Confirmed `TransferImportPlan::apply` and
-//! `commits::replay` do not poll a cancel token.
+//! `CommitReplayPreview::apply_with` do not poll a cancel token during replay.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,6 +21,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::blob::{BlobRead, BlobReader, DeletedContent};
 use crate::commits::{self, CommitError, CommitExport, CommitsPayload};
 use crate::filter;
 use crate::format::{
@@ -29,8 +30,7 @@ use crate::format::{
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitrun::{CancelToken, RunOptions, RunOutput};
 use crate::gitsrc::{
-	CatFile, CatObject, Git, GitError, DELETED_FILE_MARKER,
-	UNREADABLE_FILE_MARKER,
+	Git, GitError, DELETED_FILE_MARKER, UNREADABLE_FILE_MARKER,
 };
 use crate::paths::{self, escapes_all_roots, sanitize_relative_path};
 use crate::restore::{
@@ -1297,121 +1297,80 @@ struct BlobBudget {
 	bypass_per_file_size: bool,
 }
 
-/// Reads the blob `spec` names through one `cat-file --batch`. Its header
-/// fixes OID and size before any body byte, so an oversized blob is judged
-/// (skipped by the per-file limit, or refused by the payload budget) without
-/// being read. `Ok(None)`: `spec` names nothing. A name that resolves to a
-/// tree or commit is an error, not a missing file.
-fn read_blob_bounded(
-	cat: &mut CatFile,
+impl BlobBudget {
+	/// 計算目前的讀取上限。
+	///
+	/// 整數大小判定：`size > floor(limit)` 等價於 `size > limit`。
+	fn cap(&self) -> u64 {
+		let per_file = (self.max_file_size_kb * 1024.0) as u64;
+		let mut cap = self.remaining_budget.map_or(u64::MAX, |b| b as u64);
+		if !self.bypass_per_file_size {
+			cap = cap.min(per_file);
+		}
+		cap
+	}
+
+	fn over_cap(
+		&self,
+		size: u64,
+		cap: u64,
+		wire_path: &str,
+	) -> Result<ReadContent, TransferError> {
+		if !self.bypass_per_file_size
+			&& size as f64 > self.max_file_size_kb * 1024.0
+		{
+			return Ok((
+				None,
+				Some(format!("size exceeds limit ({size} bytes)")),
+			));
+		}
+		Err(TransferError::PayloadLimitExceeded {
+			limit: self.max_payload_bytes.unwrap_or(cap as usize),
+			actual: self.current_total_bytes.saturating_add(size as usize),
+			reason: format!(
+				"file '{wire_path}' exceeds remaining payload budget"
+			),
+		})
+	}
+}
+
+/// The header fixes OID and size before any body byte; a tree or commit is
+/// an error, not a missing file (blobs_only reader).
+fn blob_content(
+	read: BlobRead,
 	spec: &str,
+	cap: u64,
 	wire_path: &str,
 	budget: &BlobBudget,
-	opts: &RunOptions,
 ) -> Result<Option<ReadContent>, TransferError> {
-	// A cancelled blob read is not a skip and not an unreadable marker.
-	cancelled_err(opts, "cat-file --batch")?;
-	// Integer sizes: `size > floor(limit)` is exactly `size > limit`.
-	let per_file = (budget.max_file_size_kb * 1024.0) as u64;
-	let mut cap = budget.remaining_budget.map_or(u64::MAX, |b| b as u64);
-	if !budget.bypass_per_file_size {
-		cap = cap.min(per_file);
-	}
-	match cat.read_object(spec, cap)? {
-		CatObject::Missing => Ok(None),
-		CatObject::TooLarge { size, .. } => {
-			if !budget.bypass_per_file_size
-				&& size as f64 > budget.max_file_size_kb * 1024.0
-			{
-				return Ok(Some((
-					None,
-					Some(format!("size exceeds limit ({size} bytes)")),
-				)));
-			}
-			Err(TransferError::PayloadLimitExceeded {
-				limit: budget.max_payload_bytes.unwrap_or(cap as usize),
-				actual: budget
-					.current_total_bytes
-					.saturating_add(size as usize),
-				reason: format!(
-					"file '{wire_path}' exceeds remaining payload budget"
-				),
-			})
+	match read {
+		BlobRead::Missing => Ok(None),
+		BlobRead::NotABlob { kind } => {
+			Err(TransferError::Git(crate::blob::not_a_file(spec, &kind)))
 		}
-		CatObject::Found { kind, body, .. } if kind == "blob" => {
-			Ok(Some((decode_utf8_or_skip(body), None)))
+		BlobRead::Text(s) => Ok(Some((Some(s), None))),
+		BlobRead::NotText(_) => Ok(Some((None, None))),
+		BlobRead::TooLarge { size, .. } => {
+			budget.over_cap(size, cap, wire_path).map(Some)
 		}
-		CatObject::Found { kind, .. } => Err(TransferError::Git(
-			GitError::Malformed(format!("'{spec}' is a {kind}, not a file")),
-		)),
 	}
 }
 
-/// One `cat-file --batch` at a time, reopened when the root changes: a
-/// thread holding the cat-file slot must not start a second Git process.
-#[derive(Default)]
-struct BlobReader {
-	open: Option<(CanonicalRootId, CatFile)>,
-}
-
-impl BlobReader {
-	fn get(
-		&mut self,
-		root: &CanonicalRootId,
-		gits: &HashMap<CanonicalRootId, Git>,
-		opts: &RunOptions,
-	) -> Result<&mut CatFile, TransferError> {
-		if self.open.as_ref().is_some_and(|(r, _)| r != root) {
-			self.close()?;
-		}
-		if self.open.is_none() {
-			cancelled_err(opts, "cat-file --batch")?;
-			let git = gits.get(root).ok_or_else(|| {
-				TransferError::UnknownRoot(root.path().to_path_buf())
-			})?;
-			// Other Git calls must already have finished: this session holds
-			// the thread's only runner slot until [`BlobReader::close`].
-			self.open = Some((root.clone(), git.cat_file_with(opts.clone())?));
-		}
-		match self.open.as_mut() {
-			Some((_, cat)) => Ok(cat),
-			None => Err(TransferError::Git(GitError::Malformed(
-				"cat-file unavailable".into(),
-			))),
-		}
-	}
-
-	fn close(&mut self) -> Result<(), TransferError> {
-		if let Some((_, cat)) = self.open.take() {
-			cat.close()?;
-		}
-		Ok(())
-	}
-}
-
-fn deleted_marker() -> ReadContent {
-	(Some(DELETED_FILE_MARKER.to_string()), None)
-}
-
-/// Pre-deletion content like gitsrc `deleted_content`: the first of `specs`
-/// that decodes, else the deleted marker (a binary or non-UTF-8 deletion
-/// included). A size skip is passed through.
-fn read_deleted(
-	cat: &mut CatFile,
-	specs: impl IntoIterator<Item = String>,
+fn deleted_read(
+	content: DeletedContent,
+	cap: u64,
 	wire_path: &str,
 	budget: &BlobBudget,
-	opts: &RunOptions,
 ) -> Result<ReadContent, TransferError> {
-	for spec in specs {
-		match read_blob_bounded(cat, &spec, wire_path, budget, opts)? {
-			Some(read @ (Some(_), _)) | Some(read @ (None, Some(_))) => {
-				return Ok(read)
-			}
-			Some((None, None)) | None => {}
+	match content {
+		DeletedContent::Text(t) => Ok((Some(t), None)),
+		DeletedContent::Marker => {
+			Ok((Some(DELETED_FILE_MARKER.to_string()), None))
+		}
+		DeletedContent::TooLarge { size, .. } => {
+			budget.over_cap(size, cap, wire_path)
 		}
 	}
-	Ok(deleted_marker())
 }
 
 fn make_payload_opts<'a, 'f>(
@@ -1468,7 +1427,8 @@ fn finish_reader<T>(
 ) -> Result<T, TransferError> {
 	match blobs.close() {
 		Ok(()) => outcome,
-		Err(close_err) => {
+		Err(err) => {
+			let close_err = TransferError::from(err);
 			let cleanup = matches!(
 				close_err,
 				TransferError::Git(GitError::Cleanup { .. })
@@ -1555,7 +1515,7 @@ pub fn plan_export_with(
 			}
 		}
 	}
-	let mut blobs = BlobReader::default();
+	let mut blobs = BlobReader::blobs_only(opts);
 	let outcome = (|| -> Result<ExportPlan, TransferError> {
 		let mut working_files = HashMap::new();
 
@@ -1708,6 +1668,11 @@ pub fn plan_export_with(
 								rev.clone(),
 							))
 						})?;
+					let git = gits.get(&item.root).ok_or_else(|| {
+						TransferError::UnknownRoot(
+							item.root.path().to_path_buf(),
+						)
+					})?;
 					let (text, reason) = if deleted {
 						// Every parent in order, like gitsrc: a merge may
 						// delete a file only one side had. Deleted graph old
@@ -1717,50 +1682,48 @@ pub fn plan_export_with(
 							.into_iter()
 							.flatten()
 							.map(|p| format!("{p}:{rel}"));
-						read_deleted(
-							blobs.get(&item.root, &gits, opts)?,
-							specs,
-							&wire_path,
-							&blob_budget(true),
-							opts,
-						)?
+						let b = blob_budget(true);
+						let cap = b.cap();
+						let content =
+							blobs.deleted_file_content(git, specs, cap)?;
+						deleted_read(content, cap, &wire_path, &b)?
 					} else {
 						let spec = format!("{frozen_oid}:{rel}");
-						read_blob_bounded(
-							blobs.get(&item.root, &gits, opts)?,
-							&spec,
-							&wire_path,
-							&blob_budget(false),
-							opts,
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read(git, &spec, cap)?;
+						blob_content(read, &spec, cap, &wire_path, &b)?.ok_or(
+							TransferError::Git(GitError::InvalidRevision(spec)),
 						)?
-						.ok_or(TransferError::Git(
-							GitError::InvalidRevision(spec),
-						))?
 					};
 					(text, reason, None)
 				}
 				SourceKind::Staged => {
+					let git = gits.get(&item.root).ok_or_else(|| {
+						TransferError::UnknownRoot(
+							item.root.path().to_path_buf(),
+						)
+					})?;
 					let (text, reason) = if deleted {
 						// A staged deletion is gone from the index; HEAD has it.
-						read_deleted(
-							blobs.get(&item.root, &gits, opts)?,
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let content = blobs.deleted_file_content(
+							git,
 							[format!("HEAD:{rel}")],
-							&wire_path,
-							&blob_budget(false),
-							opts,
-						)?
+							cap,
+						)?;
+						deleted_read(content, cap, &wire_path, &b)?
 					} else {
 						let spec = format!(":{rel}");
-						let (text, reason) = read_blob_bounded(
-							blobs.get(&item.root, &gits, opts)?,
-							&spec,
-							&wire_path,
-							&blob_budget(false),
-							opts,
-						)?
-						.ok_or(TransferError::Git(
-							GitError::InvalidRevision(spec),
-						))?;
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read(git, &spec, cap)?;
+						let (text, reason) =
+							blob_content(read, &spec, cap, &wire_path, &b)?
+								.ok_or(TransferError::Git(
+									GitError::InvalidRevision(spec),
+								))?;
 						if reason.is_none() && text.is_none() {
 							(Some(UNREADABLE_FILE_MARKER.to_string()), None)
 						} else {
@@ -1782,16 +1745,20 @@ pub fn plan_export_with(
 					} else {
 						format!("HEAD:{rel}")
 					};
-					let (text, reason) = if gits.contains_key(&item.root) {
-						read_deleted(
-							blobs.get(&item.root, &gits, opts)?,
-							[spec],
-							&wire_path,
-							&blob_budget(false),
-							opts,
-						)?
+					let b = blob_budget(false);
+					let cap = b.cap();
+					let (text, reason) = if let Some(git) = gits.get(&item.root)
+					{
+						let content =
+							blobs.deleted_file_content(git, [spec], cap)?;
+						deleted_read(content, cap, &wire_path, &b)?
 					} else {
-						deleted_marker()
+						deleted_read(
+							DeletedContent::Marker,
+							cap,
+							&wire_path,
+							&b,
+						)?
 					};
 					// The absence is part of the snapshot: recreating the path
 					// before the clipboard write invalidates the export.
@@ -2462,17 +2429,32 @@ fn select_exact_chain(
 /// HEAD, ref, index, content, and absence captured before any write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitReplayPreview {
-	pub destination: PathBuf,
-	pub payload: CommitsPayload,
-	pub replay: commits::CommitReplayPlan,
-	pub freshness: DestinationFreshnessSnapshot,
+	destination: PathBuf,
+	payload: CommitsPayload,
+	replay: commits::CommitReplayPlan,
+	freshness: DestinationFreshnessSnapshot,
 }
 
 impl CommitReplayPreview {
+	pub fn destination(&self) -> &Path {
+		&self.destination
+	}
+
+	pub fn payload(&self) -> &CommitsPayload {
+		&self.payload
+	}
+
+	pub fn plan(&self) -> &commits::CommitReplayPlan {
+		&self.replay
+	}
+
+	pub fn freshness(&self) -> &DestinationFreshnessSnapshot {
+		&self.freshness
+	}
+
 	/// Owned buffer capacities, excluding this inline struct and allocator
-	/// bookkeeping. Call only on a fresh capture whose public freshness maps
-	/// have not been mutated: its conservative table estimate assumes the
-	/// insertion-only construction in capture_replay_freshness.
+	/// bookkeeping. The conservative table estimate assumes the insertion-only
+	/// construction in capture_replay_freshness, which the private fields guarantee.
 	pub fn retained_heap_bytes(&self) -> usize {
 		self.destination
 			.capacity()
@@ -2528,13 +2510,45 @@ impl CommitReplayPreview {
 		Ok(preview)
 	}
 
+	pub fn apply(&self) -> Result<commits::ReplayResult, TransferError> {
+		self.apply_with(&RunOptions::default())
+	}
+
+	/// Replays this preview's own payload onto its destination, or refuses as stale. `opts` reaches
+	/// Git open, the worktree lock wait and the re-validation under that lock; once the first
+	/// commit starts nothing is cancelled. Cancel at any point before the first write is
+	/// `Err(TransferError::Git(GitError::Cancelled))`. A non-cancel failure inside
+	/// `ReplaySession::begin` (the worktree lock, `RepoIdentity::resolve`, or creating the empty hooks directory) is
+	/// `Ok(ReplayResult)` with failure at index 0 and nothing written; `Git::open_with` and
+	/// re-validation errors, `QueueTimeout` included, are `Err`.
+	/// Overwrites follow spec 4.3 (直接覆蓋): the desktop's "allow overwrite first" gate is that
+	/// session's rule and is checked before calling this.
+	pub fn apply_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<commits::ReplayResult, TransferError> {
+		cancelled_err(opts, "replay-apply")?;
+		let git = Git::open_with(&self.destination, opts)?;
+		let session =
+			match commits::ReplaySession::begin(&git, &self.payload, opts) {
+				Ok(s) => s,
+				Err(refused) => {
+					cancelled_err(opts, "replay-apply")?;
+					return Ok(refused);
+				}
+			};
+		self.revalidate_with(opts)?; // under the heavy lock, right before the first write
+		cancelled_err(opts, "replay-apply")?;
+		Ok(session.run(&git, &self.payload))
+	}
+
 	/// Refuses when HEAD, the branch ref, the index, recorded bytes, absence,
 	/// or replay eligibility changed since [`Self::capture`]. A skipped
 	/// non-UTF-8 or unsafe path that becomes writable is stale. `NotCopied`
 	/// stays skipped because the payload itself has no bytes to write.
 	///
-	/// Checking freshness does not write. Confirmed replay stays in
-	/// [`commits::replay`] and is not cancelled here.
+	/// Checking freshness does not write. Confirmed replay is performed by
+	/// [`Self::apply`] or [`Self::apply_with`] and is not cancelled here.
 	pub fn revalidate(&self) -> Result<(), TransferError> {
 		self.revalidate_with(&RunOptions::default())
 	}
@@ -2594,19 +2608,7 @@ fn capture_replay_freshness(
 		cancelled_err(opts, "replay-freshness")?;
 		for file in &commit.files {
 			cancelled_err(opts, "replay-freshness")?;
-			// NotCopied never becomes a write; the payload has no bytes.
-			if file.skip_reason == Some(commits::ReplaySkipReason::NotCopied) {
-				continue;
-			}
-			for (abs, rel) in [
-				file.absolute_path.as_ref().map(|p| (p, file.path.as_str())),
-				file.old_absolute_path
-					.as_ref()
-					.zip(file.old_path.as_deref()),
-			]
-			.into_iter()
-			.flatten()
-			{
+			for (abs, rel) in file.freshness_targets() {
 				if target_files.contains_key(abs) {
 					continue;
 				}
@@ -2636,9 +2638,20 @@ fn capture_replay_file_freshness(
 	opts: &RunOptions,
 ) -> Result<Option<FileFreshness>, TransferError> {
 	cancelled_err(opts, "replay-freshness")?;
-	let meta = match not_found_as_none(fs::symlink_metadata(path))? {
-		Some(meta) => meta,
-		None => return Ok(None),
+	// A file standing in for a parent directory (ENOTDIR on Unix, NotFound on
+	// Windows) is absent, like `commits::delete`; the planner already turns it
+	// into an unsafe-path skip.
+	let meta = match fs::symlink_metadata(path) {
+		Ok(meta) => meta,
+		Err(e)
+			if matches!(
+				e.kind(),
+				io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+			) =>
+		{
+			return Ok(None);
+		}
+		Err(e) => return Err(TransferError::Io(e)),
 	};
 	if meta.file_type().is_symlink() {
 		// Link text only. `read_link` does not open the target.

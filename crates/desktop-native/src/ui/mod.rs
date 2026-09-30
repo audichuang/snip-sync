@@ -24,7 +24,9 @@ use crate::graph_view;
 use crate::history::RevRow;
 use crate::i18n::{t, tf, Locale};
 use crate::icons::{file_icon, icon, icon_tinted, Icon};
-use crate::paste::{split_dir, PasteItem, PasteNode, PastePreviewPlan};
+use crate::paste::{
+	split_dir, PasteItem, PasteNode, PastePreviewPlan, RowAction, SkipCause,
+};
 use crate::reader::{DiffMode, PreviewSource};
 use crate::selector::Pick;
 use crate::theme::*;
@@ -147,6 +149,23 @@ impl ProbeFrame {
 pub struct Probes(Rc<RefCell<ProbeFrame>>);
 
 impl Probes {
+	/// Test only: probes on without the E2E environment.
+	#[cfg(test)]
+	pub fn for_test() -> Self {
+		Self(Rc::default())
+	}
+
+	/// Test only: every control drawn in the last frames.
+	#[cfg(test)]
+	pub fn drawn(&self) -> Vec<String> {
+		let f = self.0.borrow();
+		let mut ids: Vec<String> =
+			f.shown.keys().chain(f.seen.keys()).cloned().collect();
+		ids.sort();
+		ids.dedup();
+		ids
+	}
+
 	pub fn from_env() -> Option<Self> {
 		crate::e2e_on().then(|| Self(Rc::default()))
 	}
@@ -473,22 +492,65 @@ fn change_style(ct: Option<ChangeType>) -> (&'static str, u32) {
 /// Operation label, file-name colour and reason key for a paste row. The
 /// colour follows IntelliJ's file status: created green, modified blue
 /// (whether or not overwriting is allowed yet), deleted grey.
-fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
-	if !item.selected {
-		("op_excluded", pal().text_disabled, "reason_excluded")
-	} else if item.is_delete {
-		if item.dest_exists {
-			("op_delete", pal().git_deleted, "reason_delete")
-		} else {
+pub(crate) fn paste_op(item: &PasteItem) -> (&'static str, u32, &'static str) {
+	paste_style(item.action())
+}
+
+pub(crate) fn paste_style(
+	action: RowAction,
+) -> (&'static str, u32, &'static str) {
+	use RowAction::*;
+	match action {
+		Excluded { by_commit: true } => {
+			("op_excluded", pal().text_disabled, "reason_commit_excluded")
+		}
+		Excluded { by_commit: false } => {
+			("op_excluded", pal().text_disabled, "reason_excluded")
+		}
+		Skip(cause) => ("op_skip", pal().text_disabled, skip_reason_key(cause)),
+		Delete => ("op_delete", pal().git_deleted, "reason_delete"),
+		DeleteMissing => {
 			("op_skip", pal().text_disabled, "reason_delete_missing")
 		}
-	} else if !item.dest_exists {
-		("op_create", pal().git_added, "reason_create")
-	} else if item.overwrite_allowed {
-		("op_overwrite", pal().git_modified, "reason_overwrite")
-	} else {
-		("op_skip", pal().git_modified, "reason_exists")
+		Create => ("op_create", pal().git_added, "reason_create"),
+		Overwrite => ("op_overwrite", pal().git_modified, "reason_overwrite"),
+		OverwritePending => (
+			"op_overwrite_pending",
+			pal().git_modified,
+			"reason_commit_overwrite_pending",
+		),
+		KeepExisting => ("op_skip", pal().git_modified, "reason_exists"),
 	}
+}
+
+fn skip_reason_key(cause: SkipCause) -> &'static str {
+	use SkipCause::*;
+	match cause {
+		Binary => "reason_nc_binary",
+		NonUtf8 => "reason_nc_non_utf8",
+		NonUtf8Path => "reason_nc_non_utf8_path",
+		UnsupportedType => "reason_nc_unsupported",
+		Unreadable => "reason_nc_unreadable",
+		UnsafePath => "reason_skip_unsafe_path",
+		NonUtf8Target => "reason_skip_non_utf8_target",
+		Other => "reason_skip_generic",
+	}
+}
+
+/// The three strings a commit header draws: subject (first message line,
+/// or the placeholder), `name <email>` and the short date.
+pub(crate) fn commit_header_labels(
+	commit: &snip_core::commits::CommitPlan,
+	loc: Locale,
+) -> (String, String, String) {
+	let subject = commit.message.lines().next().unwrap_or("").trim();
+	let subject = if subject.is_empty() {
+		t("commit_no_message", loc).to_string()
+	} else {
+		subject.to_string()
+	};
+	let author = format!("{} <{}>", commit.author_name, commit.author_email);
+	(subject, author, short_date(&commit.author_date))
 }
 
 fn short_date(iso: &str) -> String {
@@ -598,7 +660,7 @@ impl WorkbenchModel {
 	fn toggle_log(&mut self, cx: &mut Context<Self>) {
 		self.bottom_visible = !self.bottom_visible;
 		// A manual toggle wins over the paste preview's auto-restore.
-		self.log_before_paste = None;
+		self.paste.forget_log_restore();
 		app_log!("[APP:LOG_PANEL: visible={}]", self.bottom_visible);
 		cx.notify();
 	}
@@ -1237,12 +1299,14 @@ impl Render for WorkbenchModel {
 		let left_w = self.effective_left_w(vw);
 		let bottom_h = self.effective_bottom_h(vh);
 
-		let center = if !self.workspace_open && self.paste_preview.is_none() {
+		let center = if !self.workspace_open && self.paste.plan().is_none() {
 			self.render_workspace_closed(cx)
 		} else {
-			match self.paste_preview {
-				Some(ref plan) => self.render_paste(plan, cx),
-				None if self.paste_loading => self.render_paste_loading(cx),
+			match self.paste.plan() {
+				Some(plan) => self.render_paste(plan, cx),
+				None if self.paste.is_loading() => {
+					self.render_paste_loading(cx)
+				}
 				None => self.render_editor(cx),
 			}
 		};
@@ -1407,26 +1471,20 @@ impl Render for WorkbenchModel {
 				this.find_step(false, cx)
 			}))
 			.on_action(cx.listener(|this, _: &NavUp, _, cx| {
-				if let Some(ref mut p) = this.paste_preview {
-					p.select_prev();
-					let ix = p.selected_item_idx;
-					this.select_paste_item(ix, cx);
-				}
+				this.step_paste_selection(false, cx);
 			}))
 			.on_action(cx.listener(|this, _: &NavDown, _, cx| {
-				if let Some(ref mut p) = this.paste_preview {
-					p.select_next();
-					let ix = p.selected_item_idx;
-					this.select_paste_item(ix, cx);
-				}
+				this.step_paste_selection(true, cx);
 			}))
 			.on_action(cx.listener(|this, _: &NavToggle, _, cx| {
-				if let Some(ref p) = this.paste_preview {
+				if let Some(p) = this.paste.plan() {
 					let idx = p.selected_item_idx;
-					let overwrite = p
-						.items
-						.get(idx)
-						.is_some_and(|i| i.dest_exists && !i.is_delete);
+					if !p.display_order().contains(&idx) {
+						// Folded away: the row is not on screen.
+						return;
+					}
+					let overwrite =
+						p.items.get(idx).is_some_and(PasteItem::overwritable);
 					if overwrite {
 						this.toggle_paste_overwrite(idx, cx);
 					} else {
@@ -1922,5 +1980,161 @@ mod tests {
 			WorkbenchModel::disambiguate_candidate_labels(&dups),
 			vec!["projA/lib", "projB/lib", "standalone"]
 		);
+	}
+
+	#[test]
+	fn paste_style_maps_each_action_to_its_key_and_colour() {
+		use super::paste_style;
+		use crate::paste::{RowAction, SkipCause};
+		let pal = crate::theme::pal();
+		assert_eq!(
+			paste_style(RowAction::Excluded { by_commit: true }),
+			("op_excluded", pal.text_disabled, "reason_commit_excluded")
+		);
+		assert_eq!(
+			paste_style(RowAction::Excluded { by_commit: false }),
+			("op_excluded", pal.text_disabled, "reason_excluded")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::Binary)),
+			("op_skip", pal.text_disabled, "reason_nc_binary")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::NonUtf8)),
+			("op_skip", pal.text_disabled, "reason_nc_non_utf8")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::NonUtf8Path)),
+			("op_skip", pal.text_disabled, "reason_nc_non_utf8_path")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::UnsupportedType)),
+			("op_skip", pal.text_disabled, "reason_nc_unsupported")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::Unreadable)),
+			("op_skip", pal.text_disabled, "reason_nc_unreadable")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::UnsafePath)),
+			("op_skip", pal.text_disabled, "reason_skip_unsafe_path")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::NonUtf8Target)),
+			("op_skip", pal.text_disabled, "reason_skip_non_utf8_target")
+		);
+		assert_eq!(
+			paste_style(RowAction::Skip(SkipCause::Other)),
+			("op_skip", pal.text_disabled, "reason_skip_generic")
+		);
+		assert_eq!(
+			paste_style(RowAction::Delete),
+			("op_delete", pal.git_deleted, "reason_delete")
+		);
+		assert_eq!(
+			paste_style(RowAction::DeleteMissing),
+			("op_skip", pal.text_disabled, "reason_delete_missing")
+		);
+		assert_eq!(
+			paste_style(RowAction::Create),
+			("op_create", pal.git_added, "reason_create")
+		);
+		assert_eq!(
+			paste_style(RowAction::Overwrite),
+			("op_overwrite", pal.git_modified, "reason_overwrite")
+		);
+		assert_eq!(
+			paste_style(RowAction::OverwritePending),
+			(
+				"op_overwrite_pending",
+				pal.git_modified,
+				"reason_commit_overwrite_pending"
+			)
+		);
+		assert_eq!(
+			paste_style(RowAction::KeepExisting),
+			("op_skip", pal.git_modified, "reason_exists")
+		);
+
+		fn all_skip_causes() -> Vec<SkipCause> {
+			// 每個變體各放一個代表值；新增變體時一併加入 seed，否則下方分支不會執行
+			let seed = [
+				SkipCause::Binary,
+				SkipCause::NonUtf8,
+				SkipCause::NonUtf8Path,
+				SkipCause::UnsupportedType,
+				SkipCause::Unreadable,
+				SkipCause::UnsafePath,
+				SkipCause::NonUtf8Target,
+				SkipCause::Other,
+			];
+			let mut out = Vec::new();
+			for cause in seed {
+				match cause {
+					SkipCause::Binary => out.push(SkipCause::Binary),
+					SkipCause::NonUtf8 => out.push(SkipCause::NonUtf8),
+					SkipCause::NonUtf8Path => out.push(SkipCause::NonUtf8Path),
+					SkipCause::UnsupportedType => {
+						out.push(SkipCause::UnsupportedType)
+					}
+					SkipCause::Unreadable => out.push(SkipCause::Unreadable),
+					SkipCause::UnsafePath => out.push(SkipCause::UnsafePath),
+					SkipCause::NonUtf8Target => {
+						out.push(SkipCause::NonUtf8Target)
+					}
+					SkipCause::Other => out.push(SkipCause::Other),
+				}
+			}
+			out
+		}
+
+		fn all_actions() -> Vec<RowAction> {
+			// 每個變體各放一個代表值；新增變體時一併加入 seed，否則下方分支不會執行
+			let seed = [
+				RowAction::Excluded { by_commit: false },
+				RowAction::Skip(SkipCause::Other),
+				RowAction::Delete,
+				RowAction::DeleteMissing,
+				RowAction::Create,
+				RowAction::Overwrite,
+				RowAction::OverwritePending,
+				RowAction::KeepExisting,
+			];
+			let mut out = Vec::new();
+			for action in seed {
+				match action {
+					RowAction::Excluded { .. } => {
+						out.push(RowAction::Excluded { by_commit: true });
+						out.push(RowAction::Excluded { by_commit: false });
+					}
+					RowAction::Skip(_) => {
+						for cause in all_skip_causes() {
+							out.push(RowAction::Skip(cause));
+						}
+					}
+					RowAction::Delete => out.push(RowAction::Delete),
+					RowAction::DeleteMissing => {
+						out.push(RowAction::DeleteMissing)
+					}
+					RowAction::Create => out.push(RowAction::Create),
+					RowAction::Overwrite => out.push(RowAction::Overwrite),
+					RowAction::OverwritePending => {
+						out.push(RowAction::OverwritePending)
+					}
+					RowAction::KeepExisting => {
+						out.push(RowAction::KeepExisting)
+					}
+				}
+			}
+			out
+		}
+
+		for action in all_actions() {
+			let (op_key, _, reason_key) = paste_style(action);
+			assert!(!crate::i18n::t(op_key, Locale::ZhTw).is_empty());
+			assert!(!crate::i18n::t(op_key, Locale::En).is_empty());
+			assert!(!crate::i18n::t(reason_key, Locale::ZhTw).is_empty());
+			assert!(!crate::i18n::t(reason_key, Locale::En).is_empty());
+		}
 	}
 }

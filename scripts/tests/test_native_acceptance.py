@@ -224,7 +224,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertFalse(report["fullD4Claimed"])
 
     def test_parallel_gates_each_run_once_and_keep_gate_order(self):
-        def gate(name, output, receipt, data, records, shard):
+        def gate(name, output, receipt, data, records, shard, *_):
             records.append({"command": [name]})
 
         output = self.root / "parallel"
@@ -288,6 +288,14 @@ class AcceptanceTests(unittest.TestCase):
         """Stands in for the driver's check: only the step set matters here."""
         ids = [step["id"] for step in report["steps"]]
         return [] if sorted(ids) == sorted(required_ids) else [f"steps {ids}"]
+
+    def test_driver_shards_run_every_test_exactly_once(self):
+        tests = [f"t{i}" for i in range(7)]
+        for count in (1, 2, 3, 9):
+            groups = acceptance.driver_shards(tests, count)
+            self.assertEqual(sorted(t for group in groups for t in group), tests)
+            self.assertTrue(all(groups))
+            self.assertLessEqual(len(groups), count)
 
     def test_collaboration_shards_split_every_step_exactly_once(self):
         manifest = {"steps": [{"id": str(n)} for n in range(18)]}

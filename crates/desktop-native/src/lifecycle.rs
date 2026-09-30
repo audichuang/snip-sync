@@ -31,8 +31,9 @@
 //!
 //! Writes are the opposite:
 //! - Confirmed paste/replay (`PastePreviewPlan::execute`, including
-//!   `Git::open` in `paste.rs` `execute_commit`) must not be cancelled
-//!   mid-write. Close, open, and quit are refused until that job finishes.
+//!   `CommitReplayPreview::apply`, using default `RunOptions`; confirmed
+//!   writes cannot be cancelled) must not be cancelled mid-write. Close,
+//!   open, and quit are refused until that job finishes.
 //!
 //! `DirectoryScan` / `ScanBudget::cancel` already accepts a token; discovery
 //! passes it. Project-tree reads have no Git child, so the Git counters never

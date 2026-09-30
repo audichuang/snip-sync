@@ -11,7 +11,6 @@ pub enum LogMenu {
 	Branch,
 	User,
 	Date,
-	Paths,
 	More,
 }
 
@@ -22,7 +21,6 @@ impl LogMenu {
 			LogMenu::Branch => "branch",
 			LogMenu::User => "user",
 			LogMenu::Date => "date",
-			LogMenu::Paths => "paths",
 			LogMenu::More => "more",
 		}
 	}
@@ -345,6 +343,124 @@ pub(super) fn path_picker_matches(
 pub(super) const MAX_BRANCH_ROWS: usize = 200;
 pub(super) const AUTHOR_W: f32 = 120.;
 pub(super) const DATE_W: f32 = 118.;
+/// The subject width a log row keeps while the gutter, author, date and ref
+/// labels are squeezed, where the window allows.
+pub(super) const MIN_SUBJECT_W: f32 = 160.;
+/// The narrowest a ref-label group is squeezed to; below it the labels are
+/// dropped altogether.
+const MIN_LABELS_W: f32 = 80.;
+/// The narrowest the graph gutter is clipped to.
+const MIN_GUTTER_W: f32 = 72.;
+
+/// The narrowest the author and date cells are squeezed to (their text is
+/// clipped) once the graph gutter is at its floor.
+const MIN_AUTHOR_W: f32 = 72.;
+const MIN_DATE_W: f32 = 88.;
+
+/// The widths one list decides for all its rows, so columns line up from row
+/// to row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ListCols {
+	pub gutter: f32,
+	pub author: f32,
+	pub date: f32,
+}
+
+/// How a log row divides its width: the graph gutter, the ref labels and
+/// what is left for the subject.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct RowWidths {
+	pub gutter: f32,
+	pub labels: f32,
+	pub subject: f32,
+}
+
+/// What a `list_w` wide row leaves for the gutter, labels and subject after
+/// 8px right padding, the 8px gaps between the cells and the optional hash.
+fn row_base(list_w: f32, show_hash: bool) -> f32 {
+	let gaps = if show_hash { 4. } else { 3. } * 8.;
+	let hash_w = if show_hash { 64. } else { 0. };
+	list_w - 8. - gaps - hash_w
+}
+
+/// The graph gutter, author and date widths of every row in a `list_w` wide
+/// list, decided once per list. Pieces give way to the subject in this
+/// order: the gutter is clipped (only as far as a squeezed label group, when
+/// `has_labels`, and the subject need), then no further than
+/// [`MIN_GUTTER_W`]; below that the date and then the author cell shrink
+/// until the subject reaches [`MIN_SUBJECT_W`]. On a very narrow list the
+/// subject takes what is left. With `has_labels`, the room the gutter floor
+/// takes back from the label reserve is made up by the date and author when
+/// they can cover all of it (so the labels keep [`MIN_LABELS_W`]); otherwise
+/// the labels are dropped and only the subject's lack is taken.
+/// [`MIN_SUBJECT_W`] is not guaranteed on
+/// lists under about 520px with the hash column on (a 900 window with the
+/// hash shown leaves the subject about 97px).
+pub(super) fn list_cols(
+	list_w: f32,
+	gutter_w: f32,
+	has_labels: bool,
+	show_hash: bool,
+) -> ListCols {
+	let base = row_base(list_w, show_hash);
+	// The 6px before the labels only exists with labels.
+	let labels = if has_labels { MIN_LABELS_W + 6. } else { 0. };
+	let room = base - AUTHOR_W - DATE_W - MIN_SUBJECT_W - labels;
+	let gutter = gutter_w.min(room.max(MIN_GUTTER_W));
+	// What the subject still lacks with the gutter placed.
+	let mut lack =
+		(MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
+	// The gutter floor took back part of the label reserve; date and author
+	// give that room up so the labels still fit. When they cannot cover all
+	// of it the labels are dropped anyway, so they keep their width for the
+	// subject-only lack. The deficit already contains what the subject
+	// reserve needs, so it replaces the lack rather than adding to it.
+	if has_labels {
+		let deficit = (gutter - room).max(0.);
+		let give = (DATE_W - MIN_DATE_W) + (AUTHOR_W - MIN_AUTHOR_W);
+		if deficit <= give {
+			lack = lack.max(deficit);
+		}
+	}
+	let date = DATE_W - lack.min(DATE_W - MIN_DATE_W);
+	lack -= DATE_W - date;
+	let author = AUTHOR_W - lack.min(AUTHOR_W - MIN_AUTHOR_W);
+	ListCols {
+		gutter,
+		author,
+		date,
+	}
+}
+
+/// Divides a `list_w` wide row laid out with `cols`. The ref labels
+/// (`labels_w`, 0 for none) shrink first, down to [`MIN_LABELS_W`], then go,
+/// so the subject keeps [`MIN_SUBJECT_W`] where the window allows. With room
+/// to spare nothing changes.
+pub(super) fn row_widths(
+	list_w: f32,
+	cols: ListCols,
+	labels_w: f32,
+	show_hash: bool,
+) -> RowWidths {
+	let gutter = cols.gutter;
+	let avail = row_base(list_w, show_hash) - cols.author - cols.date - gutter;
+	let mut labels = labels_w;
+	// The 6px before the labels only exists with labels.
+	if labels > 0. && avail - labels - 6. < MIN_SUBJECT_W {
+		let room = avail - 6. - MIN_SUBJECT_W;
+		labels = if room >= labels_w.min(MIN_LABELS_W) {
+			room.min(labels_w)
+		} else {
+			0.
+		};
+	}
+	let with_labels = if labels > 0. { labels + 6. } else { 0. };
+	RowWidths {
+		gutter,
+		labels,
+		subject: (avail - with_labels).max(0.),
+	}
+}
 
 /// `refs/heads/main` → `main`, `refs/remotes/origin/x` → `origin/x`.
 pub(super) fn short_ref(name: &str) -> &str {
@@ -444,8 +560,8 @@ pub(super) fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
 	icon_tinted(if l.current { Icon::Head } else { Icon::Tag }, 14., l.color)
 }
 
-/// A row's ref labels, right-aligned at the end of the subject: label icon
-/// plus name, at most two, the rest folded into `+N`. Also returns their
+/// A row's ref labels, right-aligned at the end of the subject: one label
+/// icon plus the names of at most two badges, the rest folded into `+N`. Also returns their
 /// laid-out width (`measure` gives a name's text width).
 pub(super) fn ref_label_elements(
 	refs: &[snip_core::graph::RefInfo],
@@ -455,34 +571,44 @@ pub(super) fn ref_label_elements(
 	measure: &dyn Fn(&str) -> f32,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	// Labels are 8px apart; each is icon (14) + 3 + name, at most 160.
-	let mut width = shown.len().saturating_sub(1) as f32 * 8.;
-	let mut out: Vec<AnyElement> = shown
-		.iter()
-		.map(|b| {
-			let l = graph_view::ref_label(b, current_branch);
-			width += (17. + measure(&l.text)).min(160.);
-			let tooltip = std::iter::once(b.primary)
-				.chain(b.merged.iter().copied())
-				.map(|i| graph_view::format_ref_badge(i).0)
-				.collect::<Vec<_>>()
-				.join("\n");
-			div()
-				.id(SharedString::from(format!("ref-badge:{row}:{}", l.text)))
-				.flex()
-				.items_center()
-				.gap(px(3.))
-				.max_w(px(160.))
-				.when(show_tips, |d| d.tooltip(tip(tooltip)))
-				.child(label_icon(&l))
-				.child(
-					clip_text(l.text.clone())
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().log_ref_text)),
-				)
-				.into_any_element()
-		})
-		.collect();
+	// One label for the shown badges: icon (14) + 3 + names, at most 320
+	// (the room two separate labels had).
+	let mut width = 0.;
+	let mut out: Vec<AnyElement> =
+		graph_view::combined_label(&shown, current_branch)
+			.into_iter()
+			.map(|l| {
+				width += (17. + measure(&l.text)).min(320.);
+				let tooltip = shown
+					.iter()
+					.flat_map(|b| {
+						std::iter::once(b.primary)
+							.chain(b.merged.iter().copied())
+					})
+					.map(|i| graph_view::format_ref_badge(i).0)
+					.collect::<Vec<_>>()
+					.join("\n");
+				div()
+					.id(SharedString::from(format!(
+						"ref-badge:{row}:{}",
+						l.text
+					)))
+					.flex()
+					.items_center()
+					.gap(px(3.))
+					.max_w(px(320.))
+					// Squeezed by the labels container, the text ellipsizes.
+					.min_w_0()
+					.when(show_tips, |d| d.tooltip(tip(tooltip)))
+					.child(label_icon(&l))
+					.child(
+						clip_text(l.text.clone())
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().log_ref_text)),
+					)
+					.into_any_element()
+			})
+			.collect();
 	if hidden > 0 {
 		width += 8. + measure(&format!("+{hidden}"));
 		let all = refs
@@ -518,7 +644,12 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let log = &self.probes;
-		let key = menu.key();
+		// A one-repo workspace's repo chip only holds paths; drivers read
+		// "log-filter-repo" as "the workspace has several repositories".
+		let key = match menu {
+			LogMenu::Repo if self.repos.len() <= 1 => "paths",
+			_ => menu.key(),
+		};
 		let id = format!("log-filter-{key}");
 		let clear_id = format!("log-filter-{key}-clear");
 		let open = self.log_menu == Some(menu);
@@ -584,14 +715,18 @@ impl WorkbenchModel {
 	) {
 		self.log_menu = None;
 		match menu {
-			LogMenu::Repo => self.set_log_repos(Vec::new(), cx),
+			LogMenu::Repo => {
+				self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
+				// Leaving a repository scope drops its paths too.
+				if self.log_repo_filter.is_empty() {
+					self.clear_log_paths(cx)
+				} else {
+					self.set_log_repos(Vec::new(), cx)
+				}
+			}
 			LogMenu::Branch => self.filter_by_ref(None, cx),
 			LogMenu::User => self.set_log_author(None, cx),
 			LogMenu::Date => self.set_log_since(None, cx),
-			LogMenu::Paths => {
-				self.log_path_input.update(cx, |i, cx| i.set_text("", cx));
-				self.clear_log_paths(cx)
-			}
 			LogMenu::More => cx.notify(),
 		}
 	}
@@ -636,73 +771,172 @@ impl WorkbenchModel {
 		};
 		let mut items: Vec<AnyElement> = Vec::new();
 		match menu {
+			// One chip for both: the filter field, the repositories (a row
+			// keeps only its repository, the checkbox adds or drops it),
+			// then the paths.
 			LogMenu::Repo => {
-				let all = self.log_repo_filter.is_empty();
-				items.push(item(
-					"log-repo:all".into(),
-					t("log_repo_all", loc).to_string(),
-					all,
-					Box::new(|this, cx| this.set_log_repos(Vec::new(), cx)),
-					cx,
-				));
-				let scope = self.log_scope();
-				for (ix, repo) in
-					self.repos.iter().enumerate().take(MAX_LOG_MENU_ITEMS)
-				{
-					let checked =
-						!all && scope.iter().any(|(r, _)| *r == repo.root);
-					let root = repo.root.clone();
-					let id = format!("log-repo:{}", repo.name);
-					let check_id = format!("log-repo-check:{}", repo.name);
+				items.push(
+					div()
+						.id("log-path-input")
+						.relative()
+						.mx(px(4.))
+						.px(px(4.))
+						.rounded(px(4.))
+						.border_1()
+						.border_color(rgb(pal().button_border))
+						.child(self.log_path_input.clone())
+						.children(probe(log, "log-path-input"))
+						.into_any_element(),
+				);
+				items.push(
+					div()
+						.px(px(8.))
+						.py(px(2.))
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text_muted))
+						.child(t("log_paths_hint", loc))
+						.into_any_element(),
+				);
+				// The project's folders and files as far as loaded; chosen
+				// paths the tree does not show (typed, or in a closed
+				// folder) are listed above it.
+				let chosen = &self.log_filter.paths;
+				// Typed text filters the repositories and the loaded tree
+				// (IntelliJ).
+				let needle =
+					self.log_path_input.read(cx).text().trim().to_lowercase();
+				if self.repos.len() > 1 {
+					let all = self.log_repo_filter.is_empty();
+					items.push(item(
+						"log-repo:all".into(),
+						t("log_repo_all", loc).to_string(),
+						all,
+						Box::new(|this, cx| this.set_log_repos(Vec::new(), cx)),
+						cx,
+					));
+					let scope = self.log_scope();
+					for (ix, repo) in self
+						.repos
+						.iter()
+						.enumerate()
+						.filter(|(_, r)| {
+							r.name.to_lowercase().contains(&needle)
+						})
+						.take(MAX_LOG_MENU_ITEMS)
+					{
+						let checked =
+							!all && scope.iter().any(|(r, _)| *r == repo.root);
+						let root = repo.root.clone();
+						let id = format!("log-repo:{}", repo.name);
+						let check_id = format!("log-repo-check:{}", repo.name);
+						items.push(
+							div()
+								.id(SharedString::from(id.clone()))
+								.relative()
+								.h(px(24.))
+								.px(px(8.))
+								.flex()
+								.items_center()
+								.gap(px(6.))
+								.rounded(px(4.))
+								.cursor_pointer()
+								.hover(|s| s.bg(rgb(pal().hover_bg)))
+								// The row picks only this repository; its checkbox
+								// adds or removes it.
+								.on_click({
+									let root = root.clone();
+									cx.listener(move |this, _, _, cx| {
+										cx.stop_propagation();
+										this.set_log_repos(
+											vec![root.clone()],
+											cx,
+										)
+									})
+								})
+								.child(
+									div()
+										.id(SharedString::from(
+											check_id.clone(),
+										))
+										.relative()
+										.flex_shrink_0()
+										.on_click(cx.listener(
+											move |this, _, _, cx| {
+												cx.stop_propagation();
+												this.toggle_log_repo(
+													root.clone(),
+													cx,
+												)
+											},
+										))
+										.child(checkbox(checked))
+										.children(probe(log, check_id)),
+								)
+								.child(
+									div()
+										.flex_shrink_0()
+										.size(px(8.))
+										.rounded(px(2.))
+										.bg(graph_view::palette_rgb(ix)),
+								)
+								.child(fill_text(repo.name.clone()))
+								.children(probe(log, id))
+								.into_any_element(),
+						);
+					}
 					items.push(
 						div()
-							.id(SharedString::from(id.clone()))
-							.relative()
-							.h(px(24.))
-							.px(px(8.))
-							.flex()
-							.items_center()
-							.gap(px(6.))
-							.rounded(px(4.))
-							.cursor_pointer()
-							.hover(|s| s.bg(rgb(pal().hover_bg)))
-							// The row picks only this repository; its checkbox
-							// adds or removes it.
-							.on_click({
-								let root = root.clone();
-								cx.listener(move |this, _, _, cx| {
-									cx.stop_propagation();
-									this.set_log_repos(vec![root.clone()], cx)
-								})
-							})
-							.child(
-								div()
-									.id(SharedString::from(check_id.clone()))
-									.relative()
-									.flex_shrink_0()
-									.on_click(cx.listener(
-										move |this, _, _, cx| {
-											cx.stop_propagation();
-											this.toggle_log_repo(
-												root.clone(),
-												cx,
-											)
-										},
-									))
-									.child(checkbox(checked))
-									.children(probe(log, check_id)),
-							)
-							.child(
-								div()
-									.flex_shrink_0()
-									.size(px(8.))
-									.rounded(px(2.))
-									.bg(graph_view::palette_rgb(ix)),
-							)
-							.child(fill_text(repo.name.clone()))
-							.children(probe(log, id))
+							.my(px(4.))
+							.h(px(1.))
+							.bg(rgb(pal().divider))
 							.into_any_element(),
 					);
+				}
+				// The loaded tree is the toolbar repository's; a log scoped
+				// to another one gets typed paths only.
+				let other_repo = !self.log_is_merged()
+					&& self.log_scope().first().map(|(r, _)| r.clone())
+						!= self.repo_root();
+				let tree_rows = match self.file_tree.as_ref() {
+					_ if self.log_is_merged() => {
+						self.merged_path_picks(&needle)
+					}
+					_ if other_repo => Vec::new(),
+					Some(tree) if tree.is_loaded && !needle.is_empty() => {
+						path_picker_matches(tree, &needle, "", MAX_PATH_PICKS)
+					}
+					Some(tree) if tree.is_loaded => path_picker_rows(
+						tree,
+						&self.log_paths_expanded,
+						MAX_PATH_PICKS,
+					),
+					_ => {
+						items.push(
+							div()
+								.px(px(8.))
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(t("log_paths_tree_empty", loc))
+								.into_any_element(),
+						);
+						Vec::new()
+					}
+				};
+				let extra: Vec<PathPick> = chosen
+					.iter()
+					.filter(|p| !tree_rows.iter().any(|r| &r.rel == *p))
+					.filter(|p| p.to_lowercase().contains(&needle))
+					.map(|p| PathPick {
+						rel: p.clone(),
+						name: p.clone(),
+						is_dir: None,
+						depth: 0,
+						expandable: false,
+						expanded: false,
+					})
+					.collect();
+				for pick in extra.into_iter().chain(tree_rows) {
+					items.push(self.path_pick_row(pick, cx));
 				}
 			}
 			LogMenu::Branch => {
@@ -930,77 +1164,6 @@ impl WorkbenchModel {
 					);
 				}
 			}
-			LogMenu::Paths => {
-				items.push(
-					div()
-						.id("log-path-input")
-						.relative()
-						.mx(px(4.))
-						.px(px(4.))
-						.rounded(px(4.))
-						.border_1()
-						.border_color(rgb(pal().button_border))
-						.child(self.log_path_input.clone())
-						.children(probe(log, "log-path-input"))
-						.into_any_element(),
-				);
-				items.push(
-					div()
-						.px(px(8.))
-						.py(px(2.))
-						.text_size(px(SMALL_TEXT))
-						.text_color(rgb(pal().text_muted))
-						.child(t("log_paths_hint", loc))
-						.into_any_element(),
-				);
-				// The project's folders and files as far as loaded; chosen
-				// paths the tree does not show (typed, or in a closed
-				// folder) are listed above it.
-				let chosen = &self.log_filter.paths;
-				// Typed text filters the loaded tree (IntelliJ).
-				let needle =
-					self.log_path_input.read(cx).text().trim().to_lowercase();
-				let tree_rows = match self.file_tree.as_ref() {
-					_ if self.log_is_merged() => {
-						self.merged_path_picks(&needle)
-					}
-					Some(tree) if tree.is_loaded && !needle.is_empty() => {
-						path_picker_matches(tree, &needle, "", MAX_PATH_PICKS)
-					}
-					Some(tree) if tree.is_loaded => path_picker_rows(
-						tree,
-						&self.log_paths_expanded,
-						MAX_PATH_PICKS,
-					),
-					_ => {
-						items.push(
-							div()
-								.px(px(8.))
-								.text_size(px(SMALL_TEXT))
-								.text_color(rgb(pal().text_muted))
-								.child(t("log_paths_tree_empty", loc))
-								.into_any_element(),
-						);
-						Vec::new()
-					}
-				};
-				let extra: Vec<PathPick> = chosen
-					.iter()
-					.filter(|p| !tree_rows.iter().any(|r| &r.rel == *p))
-					.filter(|p| p.to_lowercase().contains(&needle))
-					.map(|p| PathPick {
-						rel: p.clone(),
-						name: p.clone(),
-						is_dir: None,
-						depth: 0,
-						expandable: false,
-						expanded: false,
-					})
-					.collect();
-				for pick in extra.into_iter().chain(tree_rows) {
-					items.push(self.path_pick_row(pick, cx));
-				}
-			}
 			LogMenu::More => {
 				for (key, label, checked) in [
 					("details", "log_more_details", self.log_details_visible),
@@ -1089,7 +1252,8 @@ impl WorkbenchModel {
 						)
 					})
 					.unwrap_or_default();
-				if hits.is_empty() && !name.to_lowercase().contains(needle) {
+				// The repositories themselves are listed above the paths.
+				if hits.is_empty() {
 					continue;
 				}
 				out.push(PathPick {
@@ -1108,6 +1272,11 @@ impl WorkbenchModel {
 					out.truncate(MAX_PATH_PICKS);
 					break;
 				}
+				continue;
+			}
+			// The repositories are listed above the paths; only the
+			// toolbar's one, whose tree is loaded, opens here.
+			if mine.is_none() {
 				continue;
 			}
 			let expanded =
@@ -1172,7 +1341,17 @@ impl WorkbenchModel {
 			.hover(|s| s.bg(rgb(pal().hover_bg)))
 			.on_click(cx.listener(move |this, _, _, cx| {
 				cx.stop_propagation();
-				this.toggle_log_path(rel.clone(), cx)
+				// A whole repository of the merged log is its scope, not
+				// a path: the single-repository log.
+				let root = this
+					.log_is_merged()
+					.then(|| this.repos.iter().find(|r| r.name == rel))
+					.flatten()
+					.map(|r| r.root.clone());
+				match root {
+					Some(root) => this.set_log_repos(vec![root], cx),
+					None => this.toggle_log_path(rel.clone(), cx),
+				}
 			}))
 			.child(if pick.expandable {
 				div()
@@ -1487,5 +1666,149 @@ impl WorkbenchModel {
 				.children(probe(log, "branches-collapse-all")),
 			)
 			.into_any_element()
+	}
+}
+
+#[cfg(test)]
+mod row_width_tests {
+	use super::*;
+
+	// A 24-lane gutter (the widest) and the widest combined label.
+	const WIDE_GUTTER: f32 = 24. * 16. + 8.;
+
+	fn cols(list_w: f32, gutter_w: f32, labels: bool, hash: bool) -> ListCols {
+		list_cols(list_w, gutter_w, labels, hash)
+	}
+
+	#[test]
+	fn roomy_rows_are_unchanged() {
+		let c = cols(1200., 40., true, false);
+		assert_eq!(
+			c,
+			ListCols {
+				gutter: 40.,
+				author: AUTHOR_W,
+				date: DATE_W
+			}
+		);
+		let w = row_widths(1200., c, 100., false);
+		assert_eq!(w.gutter, 40.);
+		assert_eq!(w.labels, 100.);
+		assert_eq!(w.subject, 1200. - 8. - 24. - 40. - 238. - 106.);
+		let c = cols(1200., 40., false, true);
+		let w = row_widths(1200., c, 0., true);
+		assert_eq!(w.subject, 1200. - 8. - 32. - 40. - 238. - 64.);
+	}
+
+	#[test]
+	fn multi_repo_graph_keeps_a_subject() {
+		// 574 and 433 are the lists a 1080 and a 900 window leave (measured
+		// in the in-process tests `wide_multi_repo_log_keeps_a_subject_at_*`).
+		for list_w in [433., 480., 574., 720., 900.] {
+			for show_hash in [false, true] {
+				// Known limit (see `list_cols`): the hash column costs 72px,
+				// and a list this narrow with it is below what any squeeze
+				// can save (433px with hash leaves a 97px subject).
+				if show_hash && list_w < 520. {
+					continue;
+				}
+				for has_labels in [false, true] {
+					let c = cols(list_w, WIDE_GUTTER, has_labels, show_hash);
+					for labels_w in [0., 60., 337.] {
+						let w = row_widths(list_w, c, labels_w, show_hash);
+						assert!(
+							w.subject >= MIN_SUBJECT_W,
+							"{list_w} {show_hash} {labels_w}: {c:?} {w:?}"
+						);
+						assert!(
+							c.gutter <= WIDE_GUTTER && w.labels <= labels_w
+						);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn a_1080_window_keeps_ref_labels_and_a_subject() {
+		// 574px is the list a 1080 window leaves, hash off, long labels.
+		let c = cols(574., WIDE_GUTTER, true, false);
+		let w = row_widths(574., c, 337., false);
+		assert!(w.labels >= MIN_LABELS_W, "{c:?} {w:?}");
+		assert!(w.subject >= MIN_SUBJECT_W, "{c:?} {w:?}");
+	}
+
+	#[test]
+	fn a_narrow_list_squeezes_date_then_author_after_the_gutter() {
+		// 433px (a 900 window): the gutter is at its floor, the date and the
+		// author cells give the subject its minimum.
+		let c = cols(433., WIDE_GUTTER, true, false);
+		assert_eq!(c.gutter, MIN_GUTTER_W);
+		assert!(c.date < DATE_W && c.date >= MIN_DATE_W);
+		assert!(c.author >= MIN_AUTHOR_W);
+		// The labels are dropped here anyway (the deficit is more than the
+		// date and author can give), so the author is not squeezed for them.
+		assert_eq!(c.author, 81.);
+		let w = row_widths(433., c, 337., false);
+		assert_eq!(w.labels, 0.);
+		assert!(w.subject >= MIN_SUBJECT_W, "{w:?}");
+		// Only the date gives way while it alone is enough.
+		let c = cols(FLOOR_W - 10., WIDE_GUTTER, false, false);
+		assert_eq!(c.author, AUTHOR_W);
+		assert!(c.date < DATE_W);
+	}
+
+	// Below this list width the gutter floor plus full author and date
+	// leave less than MIN_SUBJECT_W.
+	const FLOOR_W: f32 =
+		8. + 24. + AUTHOR_W + DATE_W + MIN_GUTTER_W + MIN_SUBJECT_W;
+
+	#[test]
+	fn below_the_squeeze_the_subject_takes_the_rest() {
+		let c = cols(300., WIDE_GUTTER, true, false);
+		assert_eq!(
+			(c.gutter, c.author, c.date),
+			(MIN_GUTTER_W, MIN_AUTHOR_W, MIN_DATE_W)
+		);
+		let w = row_widths(300., c, 337., false);
+		assert_eq!(w.labels, 0.);
+		assert_eq!(w.subject, 300. - 8. - 24. - 72. - 72. - 88.);
+	}
+
+	#[test]
+	fn a_list_without_labels_keeps_more_gutter() {
+		let with = cols(574., WIDE_GUTTER, true, false);
+		let without = cols(574., WIDE_GUTTER, false, false);
+		assert!(without.gutter > with.gutter);
+		assert_eq!(without.gutter, 574. - 8. - 24. - 238. - MIN_SUBJECT_W);
+	}
+
+	#[test]
+	fn every_row_of_a_list_shares_one_set_of_columns() {
+		// Dropping the labels gives the subject the room, not the gutter.
+		let c = cols(574., WIDE_GUTTER, true, false);
+		let (none, dropped) = (
+			row_widths(560., c, 0., false),
+			row_widths(560., c, 337., false),
+		);
+		assert_eq!(dropped.gutter, none.gutter);
+		assert_eq!(dropped.labels, 0.);
+		assert_eq!(dropped.subject, none.subject);
+	}
+
+	#[test]
+	fn labels_shrink_before_the_gutter() {
+		let c = cols(800., 120., true, false);
+		assert_eq!(c.gutter, 120.);
+		let w = row_widths(800., c, 337., false);
+		assert!(w.labels < 337. && w.labels >= 80.);
+		assert_eq!(w.subject, MIN_SUBJECT_W);
+	}
+
+	#[test]
+	fn tiny_windows_never_go_negative() {
+		let c = cols(100., WIDE_GUTTER, true, true);
+		let w = row_widths(100., c, 337., true);
+		assert!(w.subject >= 0. && w.labels == 0.);
 	}
 }

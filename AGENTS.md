@@ -4,30 +4,33 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 ## Parity with the IDE plugins
 
-- File mode must stay byte-compatible with ClipCode / ClipCodeVSCode. The reference is the TS source at ClipCodeVSCode `0aa24c8`, extracted into the gitignored `.ts-ref/` (command in `docs/plan.md` section 2). Read the TS there, not the sibling checkout, which may be stale.
-- When the TS source and a doc disagree, follow the TS and the contract fixture, then fix the doc.
-- `fixtures/clipboard-contract.json` is a byte-exact copy owned by ClipCodeVSCode, and its SHA is pinned in `crates/core/tests/contract.rs`. Never edit or regenerate it here. To update it, copy it from ClipCodeVSCode and update the SHA in all three repos.
-- A deliberate divergence from the TS goes into the "已知且接受的差異" list in `docs/porting-notes.md`. Without that entry, a later port "fixes" it back.
+- File mode stays byte-compatible with ClipCode / ClipCodeVSCode. The reference is the TS at ClipCodeVSCode `0aa24c8`, extracted into the gitignored `.ts-ref/` (`docs/plan.md` section 2); the sibling checkout may be stale.
+- When the TS and a doc disagree, follow the TS and the contract fixture, then fix the doc.
+- `fixtures/clipboard-contract.json` is owned by ClipCodeVSCode, and its SHA is pinned in `crates/core/tests/contract.rs`. Never edit or regenerate it here: copy it over and update the SHA in all three repos.
+- A deliberate divergence from the TS goes into "已知且接受的差異" in `docs/porting-notes.md`, or a later port "fixes" it back.
 
 ## Branches and releases
 
-- `main` only holds released code; `develop` is the integration branch; every change gets its own `feature/<name>` (or `fix/<name>`) branch cut from `develop`, and its PR targets `develop`.
-- To release, open a PR `develop` → `main`, merge it once green, then run `just release X.Y.Z` on `main` (it pushes the tag; `release.yml` builds, publishes and bumps the Homebrew tap). Release only when there is something worth shipping, not per merge.
-- A pre-release to try a build skips `main`: on `develop`, `just bump X.Y.Z-beta.N`, commit, push, then `just release X.Y.Z-beta.N`. `release.yml` accepts the green push-to-develop CI run for a tag with a `-`, marks it pre-release and skips Homebrew.
+- `main` holds released code only. Every change gets a `feature/<name>` or `fix/<name>` branch cut from `develop`, with its PR targeting `develop`, and is squash-merged.
+- `develop` → `main` is a merge commit, never a squash: a squash leaves `main` with a commit `develop` lacks, and the next release PR conflicts.
+- Release from `main` with `just release X.Y.Z` after the `develop` → `main` PR is green, and only when something is worth shipping. A pre-release skips `main`: on `develop`, `just bump X.Y.Z-beta.N`, commit, push, `just release X.Y.Z-beta.N`.
 
 ## Before you call a change done
 
-- Run `just preflight` before every push. It runs everything CI runs that Linux can run: actionlint, Rust fmt/clippy/doc/test, the Python harness tests, and the native smoke/lifecycle/acceptance gates (IME, 18 collaboration cases, resource runs). A Linux failure found by CI instead of locally is a process bug. CI adds audit, clean checkout, packaging and Windows/macOS; see `.github/workflows/ci.yml`.
-- `native-acceptance` needs a Python with Pillow in `SNIP_NATIVE_PYTHON`, and it fails if the checkout changes after its build. Commit first, then leave the tree alone until it finishes.
-- Which test a change gets: pure logic → a unit test in `crates/core` or the native crate; UI state and interaction → an in-process `#[gpui::test]` in `crates/desktop-native/src/main.rs` `tests::in_process` (no display, runs on all three OSes); real OS input, real clipboard or pixels → `crates/native-e2e/tests/smoke.rs` / `lifecycle.rs` under Xvfb (they drive the binary in `SNIP_NATIVE_BIN`; `just native-smoke` / `just native-lifecycle` build a debug one, acceptance uses its release build); cross-machine file/commit semantics → a collaboration manifest step. Windows and macOS have no real-input GUI test: CI only launches the packaged app there (`smoke_native.py --launch`).
-- A new control that a test drives gets a `probe(...)` id, which the drivers read from `[APP:CTRL_BOUNDS]`.
-- Real-app waits in the native-e2e drivers go through `snip_native_e2e::scaled(...)`; on a loaded machine set `SNIP_E2E_TIMEOUT_SCALE` (CI uses 2) instead of raising a deadline. Under a memory-capped sandbox, a release build OOM-killed in `rustc` needs `CARGO_BUILD_JOBS`, not a retry.
+- Before pushing a change that can alter a gate's result (code, scripts, CI config, Cargo files, fixtures), run `just preflight`. A failure CI finds that preflight would have caught is a process bug. On Linux it runs CI's Linux jobs. On macOS it runs CI's macOS checks, then the Linux jobs, native acceptance included, in an Apple `container` VM (`scripts/linux_container.sh`; `--clean` drops its volumes, images and kernel cache). Windows has no container path: run `just preflight-host`.
+- A push that cannot change any gate's result skips preflight: only `.md` files, or a `.gitignore` entry. CI still runs every job. A script under `docs/` is not Markdown; run the script itself.
+- `native-acceptance` needs a Python with Pillow in `SNIP_NATIVE_PYTHON` and fails if the checkout changes after its build: commit first, then leave the tree alone.
+- Where a test goes: pure logic → a unit test in `crates/core` or the native crate; UI state and interaction → `#[gpui::test]` in `crates/desktop-native/src/main.rs` `tests::in_process` (no display, all OSes); real input, clipboard or pixels → `crates/native-e2e/tests/smoke.rs` / `lifecycle.rs` (Xvfb; on macOS inside the preflight container); cross-machine file/commit semantics → a collaboration manifest step. macOS and Windows have no real-input GUI test.
+- A control a test drives gets a `probe(...)` id; drivers read it from `[APP:CTRL_BOUNDS]`.
+- Real-app waits go through `snip_native_e2e::scaled(...)`, or `bench_native_memory.e2e_scaled(...)` in the Python harness. On a slow machine set `SNIP_E2E_TIMEOUT_SCALE` (CI uses 2) instead of raising a deadline or rerunning; when the gates share one machine, as in the macOS container, lower their parallelism with `SNIP_ACCEPTANCE_ARGS`.
 
 ## Cross-platform
 
-- This machine is Linux, but CI runs Windows and macOS too. For path/fs code, reproduce the other platforms' conditions in a Linux test, e.g. a root spelled through a symlink to mimic macOS `/var` → `/private/var`. Both Windows and macOS broke on exactly this: git reports its resolved toplevel, and the user-given root did not match it.
-- A test that skips when something is missing (display, node, `.ts-ref`) must `assert!(std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(), …)` before skipping. CI sets that variable, so a skipped test cannot pass as green.
+- Path/fs code has broken on both macOS and Windows because git reports its resolved toplevel, which did not match the root the user gave. Test with the root spelled through a symlink (as macOS `/var` → `/private/var` is).
+- A test that skips when something is missing (display, node, `.ts-ref`) must `assert!(std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(), …)` first. CI sets it, so a skip cannot pass as green.
+- CI's macOS and Windows VMs are several times slower than a dev machine. Deadlines on helper processes (spawning `ps`, reaping a child) must survive that: a 500 ms `ps` check in `gitrun` failed clean git calls on CI and leaked their budget slot.
+- A test that waits on another thread, channel or process needs a timeout that fails with a message. An unbounded `recv()` hung CI's macOS job for 45 minutes.
 
 ## GitHub Actions
 
-The repo is private. Any action that reads the GitHub API (PR files, merged PRs) needs that permission granted explicitly in the job's `permissions:`, for example `pull-requests: read`. This has already failed CI twice. aghub's workflows are public and never hit it.
+The repo is private: an action that reads the GitHub API (PR files, merged PRs) needs the permission in the job's `permissions:`, e.g. `pull-requests: read`. This has failed CI twice.

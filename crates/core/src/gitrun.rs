@@ -761,12 +761,17 @@ mod tree {
 
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
 	const MAX_PS_OUTPUT: usize = 256 * 1024;
+	/// Starting `ps` on a loaded Mac took up to 3.4 s (efficiency cores under
+	/// load); 500 ms made clean exits fail and leak their slot for good.
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
-	const PS_TIMEOUT: std::time::Duration =
-		std::time::Duration::from_millis(500);
+	pub(super) const PS_TIMEOUT: std::time::Duration =
+		std::time::Duration::from_secs(10);
+	/// Killing the helper is instant; reaping it is not on a starved Mac
+	/// (efficiency cores under load took over 2 s), and a failed reap turned a
+	/// clean timeout into `Other`.
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
-	const HELPER_CLEANUP_GRACE: std::time::Duration =
-		std::time::Duration::from_millis(200);
+	pub(super) const HELPER_CLEANUP_GRACE: std::time::Duration =
+		std::time::Duration::from_secs(10);
 
 	#[cfg(any(target_os = "macos", target_os = "ios", test))]
 	struct HelperGuard {
@@ -2148,6 +2153,16 @@ mod tests {
 		);
 	}
 
+	/// `elapsed` includes spawning the helper, which took seconds on a loaded Mac.
+	#[cfg(unix)]
+	const SPAWN_SLACK: Duration = Duration::from_secs(10);
+	/// A hanging helper must outlive `PS_TIMEOUT` by a wide margin: at
+	/// `sleep 10` it exited on its own right at the deadline on a loaded Mac,
+	/// so the check saw a clean empty `ps` (`Other`) instead of `TimedOut`.
+	/// The helper is killed at the deadline, so the length costs nothing.
+	#[cfg(unix)]
+	const HANG_HELPER: &str = "sleep 300";
+
 	#[cfg(unix)]
 	#[test]
 	fn check_group_liveness_timeout_kills_helper_and_fails() {
@@ -2156,16 +2171,17 @@ mod tests {
 		test_override_ps_helper(Some(vec![
 			"sh".to_string(),
 			"-c".to_string(),
-			"exec sleep 10".to_string(),
+			format!("exec {HANG_HELPER}"),
 		]));
 		let start = Instant::now();
 		let res = tree::check_group_liveness(12345);
 		let elapsed = start.elapsed();
 		assert!(res.is_err(), "hanging helper must return Err");
 		let err = res.unwrap_err();
-		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
 		assert!(
-			elapsed < Duration::from_secs(3),
+			elapsed
+				< tree::PS_TIMEOUT + tree::HELPER_CLEANUP_GRACE + SPAWN_SLACK,
 			"helper must be timed out quickly, took {elapsed:?}"
 		);
 		let pid = test_last_helper_pid().expect("helper PID must be recorded");
@@ -2181,7 +2197,7 @@ mod tests {
 		test_override_ps_helper(Some(vec![
 			"sh".to_string(),
 			"-c".to_string(),
-			"exec 1>&-; exec sleep 10".to_string(),
+			format!("exec 1>&-; exec {HANG_HELPER}"),
 		]));
 		let start = Instant::now();
 		let res = tree::check_group_liveness(12345);
@@ -2191,9 +2207,10 @@ mod tests {
 			"helper closing stdout then hanging must return Err"
 		);
 		let err = res.unwrap_err();
-		assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+		assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
 		assert!(
-			elapsed < Duration::from_secs(3),
+			elapsed
+				< tree::PS_TIMEOUT + tree::HELPER_CLEANUP_GRACE + SPAWN_SLACK,
 			"helper must be timed out within deadline, took {elapsed:?}"
 		);
 		let pid = test_last_helper_pid().expect("helper PID must be recorded");
@@ -2219,6 +2236,25 @@ mod tests {
 		);
 		let pid = test_last_helper_pid().expect("helper PID must be recorded");
 		assert_helper_dead(pid);
+	}
+
+	/// A `ps` slowed by a loaded machine (seconds on a busy Mac) still
+	/// answers: a clean exit must not turn into a failure and a leaked slot.
+	#[cfg(unix)]
+	#[test]
+	fn check_group_liveness_waits_for_a_slow_ps() {
+		let _s = serial();
+		let _inj = InjectionGuard;
+		test_override_ps_helper(Some(vec![
+			"sh".to_string(),
+			"-c".to_string(),
+			"sleep 1; printf 'Z 12345\\n'".to_string(),
+		]));
+		let res = tree::check_group_liveness(12345);
+		assert!(
+			!res.expect("a slow ps is not an error"),
+			"zombie-only group"
+		);
 	}
 
 	#[cfg(unix)]

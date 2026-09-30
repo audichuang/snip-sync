@@ -26,6 +26,7 @@ use snip_core::transfer::{
 	plan_import_with, CanonicalRootId, CommitReplayPreview, ExportItem,
 	ExportSelection, ImportMapping, SourceKind, TransferError,
 };
+use snip_core::workspace::{lock_heavy, RepoIdentity};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -1117,6 +1118,102 @@ fn precancel_replay_revalidate_writes_nothing() {
 		.revalidate_with(&opts)
 		.expect_err("precancel must not revalidate");
 	assert_cancelled(err);
+	assert_eq!(repo_fingerprint(&repo), before);
+	assert_runner_idle();
+}
+
+#[test]
+fn precancel_replay_apply_writes_nothing() {
+	let _s = serial();
+	let repo = TestRepo::new("replay-apply-precancel");
+	repo.write("keep.txt", "keep\n");
+	repo.commit("base");
+	let before = repo_fingerprint(&repo);
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "keep.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("new\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload)
+		.expect("setup capture must succeed");
+	let token = CancelToken::new();
+	token.cancel();
+	let opts = cancelled_opts(token);
+	let err = preview
+		.apply_with(&opts)
+		.expect_err("precancel must not apply");
+	assert_cancelled(err);
+	assert_eq!(repo_fingerprint(&repo), before);
+	assert_runner_idle();
+}
+
+#[test]
+fn cancel_during_replay_apply_lock_wait_is_cancelled_and_writes_nothing() {
+	let _s = serial();
+	let repo = TestRepo::new("replay-apply-cancel-lock-wait");
+	repo.write("keep.txt", "keep\n");
+	repo.commit("base");
+	let before = repo_fingerprint(&repo);
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: "keep.txt".into(),
+				old_path: None,
+				change: FileChange::Modified,
+				content: Some("new\n".into()),
+				not_copied: None,
+			}],
+		}],
+	};
+	let preview = CommitReplayPreview::capture(repo.path(), &payload)
+		.expect("setup capture must succeed");
+
+	let git = Git::open(repo.path()).unwrap();
+	let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
+	let guard = lock_heavy(&id, &RunOptions::default()).unwrap();
+
+	let token = CancelToken::new();
+	let opts = RunOptions {
+		queue_timeout: Duration::from_secs(60),
+		timeout: Duration::from_secs(30),
+		..cancelled_opts(token.clone())
+	};
+
+	let (tx, rx) = mpsc::channel();
+	let result = thread::scope(|s| {
+		s.spawn(|| {
+			let res = preview.apply_with(&opts);
+			let _ = tx.send(res);
+		});
+
+		thread::sleep(Duration::from_millis(300));
+		assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+		token.cancel();
+
+		let res = rx
+			.recv_timeout(Duration::from_secs(30))
+			.expect("apply_with did not return after cancel while waiting for the worktree lock");
+
+		drop(guard);
+		res
+	});
+
+	assert_cancelled(result.expect_err("apply_with must fail when cancelled"));
 	assert_eq!(repo_fingerprint(&repo), before);
 	assert_runner_idle();
 }

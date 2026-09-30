@@ -9,7 +9,8 @@ CLI(`crates/cli`)與原生桌面 App(`crates/desktop-native`)共用的全部邏�
 |---|---|---|
 | `format` | 檔案模式的線上格式:建立與解析剪貼簿內容 | `clipboardFormat.ts` |
 | `copy` | 收集檔案、組出 payload | `copy.ts` |
-| `gitsrc` | 從 git 讀異動檔案與 diff(直接呼叫 git plumbing) | `gitCopy.ts`、`gitHistory.ts`、`graphCopy.ts`、`catFile.ts` |
+| `gitsrc` | 從 git 讀異動檔案與 diff(直接呼叫 git plumbing) | `gitCopy.ts`、`gitHistory.ts`、`graphCopy.ts` |
+| `blob` | cat-file session、blob 可否複製的判斷與刪除檔標記 | `catFile.ts` |
 | `filter` | 忽略規則、二進位與大小限制 | `filterMatcher.ts` |
 | `restore` | 把解析結果轉成檔案動作並執行 | `restore.ts`、`restoreBase.ts` |
 | `paths` | 路徑正規化、還原目標的根目錄解析與越界檢查 | `pathResolver.ts` |

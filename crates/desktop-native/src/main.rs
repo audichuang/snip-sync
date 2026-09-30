@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 static E2E: OnceLock<bool> = OnceLock::new();
 
@@ -206,6 +206,45 @@ macro_rules! app_log {
 		println!($($arg)*);
 		let _ = std::io::Write::flush(&mut std::io::stdout());
 	}};
+}
+
+/// Most not-copied paths the commit copy toast names; the rest are counted.
+const COMMIT_TOAST_PATHS: usize = 3;
+
+/// The commit copy toast (spec 4.2): commit, file and character counts, and
+/// when files were left out, which commit lost which files.
+fn commit_copied_status(export: &snip_core::commits::CommitExport) -> Msg {
+	let sum = snip_core::commits::copy_summary(&export.payload, &export.text);
+	let mut args = vec![
+		sum.commit_count.to_string(),
+		sum.file_count.to_string(),
+		sum.chars.to_string(),
+	];
+	if sum.not_copied_count == 0 {
+		return Msg::new("status_commits_copied", args);
+	}
+	let mut named = 0;
+	let mut parts = Vec::new();
+	for (n, commit) in export.payload.commits.iter().enumerate() {
+		let paths: Vec<&str> = commit
+			.files
+			.iter()
+			.filter(|f| f.not_copied.is_some())
+			.map(|f| f.path.as_str())
+			.take(COMMIT_TOAST_PATHS.saturating_sub(named))
+			.collect();
+		named += paths.len();
+		if !paths.is_empty() {
+			parts.push(format!("#{} {}", n + 1, paths.join(", ")));
+		}
+	}
+	let mut detail = parts.join("; ");
+	if named < sum.not_copied_count {
+		detail.push_str(" …");
+	}
+	args.push(sum.not_copied_count.to_string());
+	args.push(detail);
+	Msg::new("status_commits_copied_skipped", args)
 }
 
 /// The copy toast: a partial copy (file limit hit in the folder walk or
@@ -575,7 +614,7 @@ fn read_change_list(
 	// status feeds both the list and the repo's summary.
 	let (summary, details) = match known {
 		Some(id) => {
-			let git = Git::at_known_root(id.toplevel.clone());
+			let git = Git::at_known_root(id);
 			let (summary, details) = summarize_with_details(&git, id, &opts)
 				.map_err(|e| e.to_string())?;
 			(Some(summary), details)
@@ -1139,6 +1178,9 @@ pub struct WorkbenchModel {
 	/// The listing was cut to `MAX_COMMIT_FILES`.
 	pub commit_files_truncated: bool,
 	pub selected_commit_file: Option<String>,
+	/// Cmd/Shift multi-selection in the changed files; empty means just
+	/// `selected_commit_file`. Cleared with every change of that one.
+	pub commit_file_sel: Vec<String>,
 	pub compare: Option<(String, String)>,
 
 	// Tool windows.
@@ -1184,7 +1226,6 @@ pub struct WorkbenchModel {
 	pub repo_cancel: Option<CancelToken>,
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
-	pub paste_cancel: Option<CancelToken>,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, String)>,
@@ -1208,18 +1249,7 @@ pub struct WorkbenchModel {
 	add_cancel: Option<CancelToken>,
 	pub is_adding_repo: bool,
 	pub add_repo_input: Entity<TextInput>,
-	pub paste_preview: Option<PastePreviewPlan>,
-	/// A read-only preview or mapping rebuild is running in the background.
-	/// Nothing can be applied until it lands.
-	pub paste_loading: bool,
-	/// Bumped for every paste request, remap and cancel; a background
-	/// result from an older value is dropped.
-	pub paste_generation: u64,
-	paste_pending: Arc<Mutex<paste::PastePending>>,
-	paste_worker: Option<(u64, CancelToken)>,
-	/// Text of the selected paste item (one at a time).
-	pub paste_detail: Option<Preview>,
-	pub paste_scroll: gpui::UniformListScrollHandle,
+	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
 	/// A finished copy's card over the window (id, succeeded, text): the
 	/// status bar alone is easy to miss.
@@ -1248,15 +1278,10 @@ pub struct WorkbenchModel {
 	pub bottom_h: f32,
 	pub left_visible: bool,
 	pub bottom_visible: bool,
-	/// Log visibility saved when the paste preview auto-collapsed it;
-	/// cleared once restored or when the user toggles the log themselves.
-	pub log_before_paste: Option<bool>,
 	pub dragging: Option<Splitter>,
 	pub last_viewport: (i32, i32),
 	/// E2E control-bounds reporting; `None` unless `SNIP_NATIVE_E2E=1`.
 	pub probes: Option<ui::Probes>,
-	/// Test-only delay before a confirmed write, honoured only in E2E mode.
-	pub e2e_apply_delay: Option<std::time::Duration>,
 	/// Focus requested from a context without a `Window`; applied on render.
 	pub pending_focus: Option<FocusHandle>,
 	pub e2e_read_delay: Option<std::time::Duration>,
@@ -1544,6 +1569,7 @@ impl WorkbenchModel {
 			commit_file_gitlinks: Vec::new(),
 			commit_files_truncated: false,
 			selected_commit_file: None,
+			commit_file_sel: Vec::new(),
 			compare: None,
 			files: Vec::new(),
 			changes_loaded: false,
@@ -1576,7 +1602,6 @@ impl WorkbenchModel {
 			repo_cancel: None,
 			scan_cancel: None,
 			copy_cancel: None,
-			paste_cancel: None,
 			discovery: None,
 			discovery_status: None,
 			discovery_errors: Vec::new(),
@@ -1595,13 +1620,7 @@ impl WorkbenchModel {
 			restore_ws_expanded: Vec::new(),
 			add_cancel: None,
 			is_adding_repo: false,
-			paste_preview: None,
-			paste_loading: false,
-			paste_generation: 0,
-			paste_pending: Arc::new(Mutex::new(paste::PastePending::default())),
-			paste_worker: None,
-			paste_detail: None,
-			paste_scroll: gpui::UniformListScrollHandle::new(),
+			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
 			status: Msg::new("status_scanning", []),
 			toast: None,
 			toast_seq: 0,
@@ -1625,11 +1644,9 @@ impl WorkbenchModel {
 			bottom_h: theme::BOTTOM_H_DEFAULT,
 			left_visible: true,
 			bottom_visible: true,
-			log_before_paste: None,
 			dragging: None,
 			last_viewport: (0, 0),
 			probes: ui::Probes::from_env(),
-			e2e_apply_delay: ui::e2e_apply_delay(),
 			pending_focus: None,
 			e2e_read_delay: ui::e2e_read_delay(),
 			e2e_tree_hold: ui::e2e_tree_hold(),
@@ -1940,13 +1957,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn set_preview(&mut self, p: Preview) -> bool {
-		let pool = self.paste_pending.clone();
-		let mut pending = paste::lock_pending(&pool);
-		if let Err(err) = pending.admit_ui(
-			Some(&p),
-			self.paste_preview.as_ref(),
-			self.paste_detail.as_ref(),
-		) {
+		if let Err(err) = self.paste.admit_ordinary(Some(&p)) {
 			self.preview_loading = false;
 			self.preview_error = None;
 			self.status = err;
@@ -1995,17 +2006,9 @@ impl WorkbenchModel {
 	}
 
 	pub(crate) fn clear_preview(&mut self) {
-		let pool = self.paste_pending.clone();
-		let mut state = paste::lock_pending(&pool);
 		self.preview = None;
 		self.preview_root = None;
-		state
-			.admit_ui(
-				None,
-				self.paste_preview.as_ref(),
-				self.paste_detail.as_ref(),
-			)
-			.expect("dropping ordinary preview cannot grow retained data");
+		self.paste.release_ordinary();
 	}
 
 	/// Replace a failed read with its error body, releasing the hidden source.
@@ -2019,16 +2022,6 @@ impl WorkbenchModel {
 
 	pub(crate) fn can_copy_preview(&self) -> bool {
 		self.preview.is_some() && self.preview_error.is_none()
-	}
-
-	fn clear_paste_state(&mut self) {
-		let pool = self.paste_pending.clone();
-		let mut state = paste::lock_pending(&pool);
-		self.paste_preview = None;
-		self.paste_detail = None;
-		state.admit_ui(self.preview.as_ref(), None, None).expect(
-			"dropping paste transfers any shared raw charge to its worker",
-		);
 	}
 
 	pub fn deselect_all_files(&mut self, cx: &mut Context<Self>) {
@@ -2307,6 +2300,61 @@ impl WorkbenchModel {
 				}
 			}
 		}
+
+		// 第二輪：workspace root 的寫法不是 git 解析後的 toplevel（例如 symlink），或 repo 在 workspace 外，而且上一層資料夾同名。
+		fn root_tail(root: &std::path::Path, k: usize) -> String {
+			let normals: Vec<String> = root
+				.components()
+				.filter_map(|c| match c {
+					std::path::Component::Normal(p) => {
+						Some(p.to_string_lossy().into_owned())
+					}
+					_ => None,
+				})
+				.collect();
+			if k >= normals.len() {
+				root.display().to_string()
+			} else {
+				normals[normals.len() - k..].join("/")
+			}
+		}
+
+		for k in 3.. {
+			let mut round_counts: HashMap<String, usize> = HashMap::new();
+			for r in repos.iter() {
+				*round_counts.entry(r.name.clone()).or_insert(0) += 1;
+			}
+			let dup_indices: Vec<usize> = repos
+				.iter()
+				.enumerate()
+				.filter(|(_, r)| {
+					round_counts.get(&r.name).copied().unwrap_or(0) > 1
+				})
+				.map(|(i, _)| i)
+				.collect();
+			if dup_indices.is_empty() {
+				break;
+			}
+			let max_normals = dup_indices
+				.iter()
+				.map(|&i| {
+					repos[i]
+						.root
+						.components()
+						.filter(|c| {
+							matches!(c, std::path::Component::Normal(_))
+						})
+						.count()
+				})
+				.max()
+				.unwrap_or(0);
+			if max_normals < k {
+				break;
+			}
+			for &i in &dup_indices {
+				repos[i].name = root_tail(&repos[i].root, k);
+			}
+		}
 	}
 
 	pub(crate) fn accepting_work(&self) -> bool {
@@ -2316,8 +2364,7 @@ impl WorkbenchModel {
 	fn needs_watch(&mut self) -> bool {
 		self.lifecycle.unfinished() > 0
 			|| self.lifecycle.is_draining()
-			|| paste::lock_pending(&self.paste_pending).has_pending()
-			|| self.paste_worker.is_some()
+			|| self.paste.has_background_work()
 	}
 
 	/// Reaps owned jobs only while one is live or a drain is in progress.
@@ -2455,7 +2502,7 @@ impl WorkbenchModel {
 				self.changes_generation =
 					self.changes_generation.wrapping_add(1);
 				self.changes_queue.clear_pending();
-				self.invalidate_paste_job();
+				self.paste.invalidate_job();
 				let name = intent.name();
 				self.emit_life("draining", name, None);
 				self.set_status("workspace_draining", []);
@@ -2569,9 +2616,9 @@ impl WorkbenchModel {
 		self.changes_queue.clear_pending();
 		self.preview_root = None;
 		self.basket_view = (String::new(), None);
-		self.invalidate_paste_job();
+		self.paste.invalidate_job();
 		if !self.paste_busy() {
-			self.clear_paste_state();
+			self.paste.clear(self.preview.as_ref());
 		}
 		self.discovery = None;
 		self.discovery_status = None;
@@ -2655,6 +2702,7 @@ impl WorkbenchModel {
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.git_user_email = None;
 		self.selected_commit_file = None;
+		self.commit_file_sel.clear();
 		self.compare = None;
 		self.changes_loaded = false;
 		self.file_tree = None;
@@ -5022,7 +5070,7 @@ impl WorkbenchModel {
 			lifecycle::JobKind::CancellableRead,
 			Some(job_token),
 			async move {
-				let result: Result<(String, usize), String> = bg
+				let result: Result<(String, usize, Msg), String> = bg
 					.spawn(async move {
 						let opts = interactive_read_opts(run_token);
 						let git = Git::open_with(&repo_root, &opts)
@@ -5036,7 +5084,8 @@ impl WorkbenchModel {
 						)
 						.map_err(|e| e.to_string())?;
 						let n_commits = exported.payload.commits.len();
-						Ok((exported.text, n_commits))
+						let status = commit_copied_status(&exported);
+						Ok((exported.text, n_commits, status))
 					})
 					.await;
 
@@ -5046,7 +5095,7 @@ impl WorkbenchModel {
 						return;
 					}
 					match result {
-						Ok((text, n_commits)) => {
+						Ok((text, n_commits, status)) => {
 							if let Err(e) = clip::write_text(&text) {
 								model.set_status(
 									"status_clipboard_failed",
@@ -5056,10 +5105,7 @@ impl WorkbenchModel {
 								app_log!(
 									"[APP:COPY_COMMITS_DONE: commits={n_commits}]"
 								);
-								model.set_status(
-									"status_commits_copied",
-									[n_commits.to_string()],
-								);
+								model.status = status;
 							}
 						}
 						Err(err) => {
@@ -5067,7 +5113,11 @@ impl WorkbenchModel {
 							model.set_status("error_payload", [err]);
 						}
 					}
-					let ok = model.status.key == "status_commits_copied";
+					let ok = matches!(
+						model.status.key,
+						"status_commits_copied"
+							| "status_commits_copied_skipped"
+					);
 					model.show_toast(ok, model.status.clone(), cx);
 					cx.notify();
 				});
@@ -5079,7 +5129,7 @@ impl WorkbenchModel {
 	/// cancellable, so every control that would change or discard the plan
 	/// is refused until it finishes.
 	pub fn paste_busy(&self) -> bool {
-		self.paste_preview.as_ref().is_some_and(|p| p.is_applying)
+		self.paste.is_applying()
 	}
 
 	fn refuse_while_applying(
@@ -5096,33 +5146,18 @@ impl WorkbenchModel {
 		true
 	}
 
-	/// Cancels the read-only paste job in flight, if any, and makes its
-	/// result stale. Does not touch a confirmed write.
-	fn invalidate_paste_job(&mut self) {
-		if let Some(token) = self.paste_cancel.take() {
-			token.cancel();
-		}
-		self.paste_generation = self.paste_generation.wrapping_add(1);
-		paste::lock_pending(&self.paste_pending)
-			.invalidate(self.paste_generation);
-		self.paste_loading = false;
-	}
-
 	fn queue_paste(
 		&mut self,
 		request: paste::PasteRequest,
 		cx: &mut Context<Self>,
 	) {
-		let result = paste::lock_pending(&self.paste_pending).enqueue(request);
-		if let Err(err) = result {
-			self.paste_loading = false;
+		if let Err(err) = self.paste.enqueue(request) {
 			self.status = err;
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 			self.restore_log_after_paste();
 			cx.notify();
 			return;
 		}
-		self.paste_loading = true;
 		self.set_status("paste_loading", []);
 		app_log!("[APP:PASTE_LOADING]");
 		self.poll_paste(cx);
@@ -5133,50 +5168,46 @@ impl WorkbenchModel {
 	/// Runs before the existing watch decides it can exit. A cancelled job
 	/// still occupies this slot until its actual FinishFlag has dropped.
 	fn poll_paste(&mut self, cx: &mut Context<Self>) {
-		if self
-			.paste_worker
-			.as_ref()
-			.is_some_and(|(id, _)| self.lifecycle.is_live(*id))
-		{
+		let live = self
+			.paste
+			.worker_id()
+			.is_some_and(|id| self.lifecycle.is_live(id));
+		let polled = self.paste.poll(live, self.preview.as_ref());
+		let paste::preview::Polled::Settled { discarded, landed } = polled
+		else {
 			return;
+		};
+		if discarded {
+			app_log!("[APP:PASTE_DISCARDED: cancelled]");
 		}
-		let finished = self.paste_worker.take();
-		if let Some((_, token)) = &finished {
-			if token.is_cancelled() {
-				app_log!("[APP:PASTE_DISCARDED: cancelled]");
-			}
-		}
-		let pool = self.paste_pending.clone();
-		{
-			let mut pending = paste::lock_pending(&pool);
-			if let Some(outcome) = pending.ready.take() {
-				self.paste_loading = false;
-				self.show_paste_plan(outcome, &mut pending);
+		match landed {
+			Some(paste::preview::Landed::Shown { remap }) => {
+				self.show_landed_plan(remap);
 				cx.notify();
-			} else if finished
-				.as_ref()
-				.is_some_and(|(_, token)| !token.is_cancelled())
-				&& !pending.has_pending()
-				&& self.paste_loading
-			{
-				self.paste_loading = false;
+			}
+			Some(paste::preview::Landed::Refused { err, closed }) => {
+				app_log!("[APP:PASTE_ERR: {}]", err.key);
+				self.status = err;
+				if closed {
+					self.restore_log_after_paste();
+					self.pending_focus = Some(self.focus_handle.clone());
+				}
+				cx.notify();
+			}
+			Some(paste::preview::Landed::WorkerLost) => {
 				self.status = Msg::new(
 					"paste_err_plan",
 					["Preview worker ended before producing a result".into()],
 				);
 				cx.notify();
 			}
+			None => {}
 		}
 		if !self.accepting_work() {
 			return;
 		}
-		let cancel = CancelToken::new();
-		match paste::PastePending::start(
-			&pool,
-			self.paste_preview.as_ref(),
-			cancel.clone(),
-		) {
-			Ok(Some(work)) => {
+		match self.paste.start_job() {
+			Ok(Some((work, cancel))) => {
 				let bg = cx.background_executor().clone();
 				let token = cancel.clone();
 				let id = self.spawn_owned(
@@ -5190,17 +5221,61 @@ impl WorkbenchModel {
 						.await;
 					},
 				);
-				self.paste_cancel = Some(cancel.clone());
-				self.paste_worker = Some((id, cancel));
+				self.paste.bind_job(id, cancel);
 			}
 			Ok(None) => {}
 			Err(err) => {
-				self.paste_loading = false;
 				self.set_paste_error(err);
 				app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 				cx.notify();
 			}
 		}
+	}
+
+	fn show_landed_plan(&mut self, remap: Option<(String, bool)>) {
+		// `Landed::Shown` guarantees an installed plan (see its doc).
+		let plan = self.paste.plan().expect("Shown installs a plan");
+		let items_count = plan.items.len();
+		if let Some((prefix, keep)) = remap {
+			let dest = prefix_target(plan, &prefix, keep);
+			let keep_note = if keep { " keep=primary" } else { "" };
+			app_log!(
+				"[APP:PASTE_MAPPED: prefix={}{} dest={} items={}]",
+				prefix,
+				keep_note,
+				dest,
+				items_count
+			);
+		} else {
+			for choice in &plan.prefix_choices {
+				for (idx, path) in choice.candidates.iter().enumerate() {
+					app_log!(
+						"[APP:PASTE_MAP_CANDIDATE: prefix={} idx={} path={}]",
+						choice.prefix,
+						idx,
+						path.display()
+					);
+				}
+			}
+			app_log!(
+				"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
+				items_count,
+				plan.destination.display(),
+				plan.mapping_ready()
+			);
+		}
+		self.set_status("status_paste_preview", [items_count.to_string()]);
+		if self.paste.collapse_log(&mut self.bottom_visible) {
+			app_log!("[APP:LOG_PANEL: visible=false reason=paste_open]");
+		}
+		self.pending_focus = Some(self.paste_focus.clone());
+	}
+
+	/// Keep full write/read diagnostics in status, but do not let a newly
+	/// allocated diagnostic grow an already admitted plan past its tier.
+	fn set_paste_error(&mut self, err: Msg) {
+		self.status = err.clone();
+		self.paste.record_error(err, self.preview.as_ref());
 	}
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
@@ -5217,11 +5292,11 @@ impl WorkbenchModel {
 		}
 		// A new paste always invalidates the previous plan first, so a failed
 		// read/parse can never leave an older plan armed for Apply.
-		self.invalidate_paste_job();
-		if self.paste_preview.is_some() {
+		self.paste.invalidate_job();
+		if self.paste.plan().is_some() {
 			app_log!("[APP:PASTE_PLAN_CLEARED]");
 		}
-		self.clear_paste_state();
+		self.paste.clear(self.preview.as_ref());
 		let text = match clip::read_text() {
 			Ok(t) => t,
 			Err(e) => {
@@ -5260,121 +5335,6 @@ impl WorkbenchModel {
 		);
 	}
 
-	fn show_paste_plan(
-		&mut self,
-		outcome: paste::PasteOutcome,
-		pending: &mut paste::PastePending,
-	) {
-		let remap = outcome.remap;
-		let built = outcome.result.and_then(|plan| {
-			let detail = plan.detail_preview();
-			pending.admit_ui(
-				self.preview.as_ref(),
-				Some(&plan),
-				detail.as_ref(),
-			)?;
-			Ok((plan, detail))
-		});
-		match built {
-			Ok((plan, detail)) => {
-				if let Some((prefix, keep)) = remap {
-					let dest = prefix_target(&plan, &prefix, keep);
-					let keep_note = if keep { " keep=primary" } else { "" };
-					app_log!(
-						"[APP:PASTE_MAPPED: prefix={}{} dest={} items={}]",
-						prefix,
-						keep_note,
-						dest,
-						plan.items.len()
-					);
-				} else {
-					for choice in &plan.prefix_choices {
-						for (idx, path) in choice.candidates.iter().enumerate()
-						{
-							app_log!("[APP:PASTE_MAP_CANDIDATE: prefix={} idx={} path={}]", choice.prefix, idx, path.display());
-						}
-					}
-					app_log!(
-						"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
-						plan.items.len(),
-						plan.destination.display(),
-						plan.mapping_ready()
-					);
-				}
-				self.set_status(
-					"status_paste_preview",
-					[plan.items.len().to_string()],
-				);
-				self.paste_preview = Some(plan);
-				self.paste_detail = detail;
-				if collapse_log_for_paste(
-					&mut self.log_before_paste,
-					&mut self.bottom_visible,
-				) {
-					app_log!(
-						"[APP:LOG_PANEL: visible=false reason=paste_open]"
-					);
-				}
-				self.paste_scroll
-					.scroll_to_item(0, gpui::ScrollStrategy::Top);
-				self.pending_focus = Some(self.paste_focus.clone());
-			}
-			Err(err) => {
-				app_log!("[APP:PASTE_ERR: {}]", err.key);
-				self.status = err;
-				// A disarmed remap shell may remain; it cannot authorize writes.
-				if pending
-					.admit_ui(
-						self.preview.as_ref(),
-						self.paste_preview.as_ref(),
-						self.paste_detail.as_ref(),
-					)
-					.is_err()
-				{
-					self.paste_preview = None;
-					self.paste_detail = None;
-					pending
-						.admit_ui(self.preview.as_ref(), None, None)
-						.expect("drop failed paste candidate");
-				}
-				if self.paste_preview.is_none() {
-					self.restore_log_after_paste();
-					self.pending_focus = Some(self.focus_handle.clone());
-				}
-			}
-		}
-	}
-
-	/// Keep full write/read diagnostics in status, but do not let a newly
-	/// allocated diagnostic grow an already admitted plan past its tier.
-	fn set_paste_error(&mut self, err: Msg) {
-		let pool = self.paste_pending.clone();
-		let mut pending = paste::lock_pending(&pool);
-		self.status = err.clone();
-		if let Some(plan) = &mut self.paste_preview {
-			plan.error = Some(err);
-		}
-		if pending
-			.admit_ui(
-				self.preview.as_ref(),
-				self.paste_preview.as_ref(),
-				self.paste_detail.as_ref(),
-			)
-			.is_err()
-		{
-			if let Some(plan) = &mut self.paste_preview {
-				plan.error = Some(paste::preview_budget_error());
-			}
-			pending
-				.admit_ui(
-					self.preview.as_ref(),
-					self.paste_preview.as_ref(),
-					self.paste_detail.as_ref(),
-				)
-				.expect("fixed error fits admitted plan");
-		}
-	}
-
 	pub fn choose_paste_keep(&mut self, prefix: &str, cx: &mut Context<Self>) {
 		if self.refuse_while_applying("mapping", cx) {
 			return;
@@ -5391,7 +5351,7 @@ impl WorkbenchModel {
 		if self.refuse_while_applying("mapping", cx) {
 			return;
 		}
-		let Some(dest) = self.paste_preview.as_ref().and_then(|plan| {
+		let Some(dest) = self.paste.plan().and_then(|plan| {
 			plan.prefix_choices
 				.iter()
 				.find(|c| c.prefix == prefix)
@@ -5414,43 +5374,19 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		let keep = destination.is_none();
-		self.invalidate_paste_job();
-		let pool = self.paste_pending.clone();
-		{
-			let mut pending = paste::lock_pending(&pool);
-			let Some(plan) = self.paste_preview.as_mut() else {
-				return;
-			};
-			plan.clear_file_plan();
-			plan.error = None;
-			self.paste_detail = None;
-			let chosen = match destination {
-				Some(dest) => plan.choose_prefix_destination(&prefix, &dest),
-				None => plan.choose_keep_relative(&prefix),
-			};
-			if let Err(err) = chosen {
-				pending
-					.admit_ui(self.preview.as_ref(), Some(plan), None)
-					.expect("invalid choice cannot grow disarmed shell");
+		match self.paste.remap(prefix, destination, self.preview.as_ref()) {
+			paste::preview::Remapped::NoPlan => {}
+			paste::preview::Remapped::Invalid(err) => {
 				self.status = err;
 				cx.notify();
-				return;
 			}
-			if let Err(err) =
-				pending.admit_ui(self.preview.as_ref(), Some(plan), None)
-			{
-				self.paste_preview = None;
-				pending
-					.admit_ui(self.preview.as_ref(), None, None)
-					.expect("drop over-budget mapping shell");
+			paste::preview::Remapped::Dropped(err) => {
 				self.status = err;
 				self.restore_log_after_paste();
 				cx.notify();
-				return;
 			}
+			paste::preview::Remapped::Ready(req) => self.queue_paste(req, cx),
 		}
-		self.queue_paste(paste::PasteRequest::Remap { prefix, keep }, cx);
 	}
 
 	pub fn toggle_paste_overwrite(
@@ -5458,16 +5394,12 @@ impl WorkbenchModel {
 		idx: usize,
 		cx: &mut Context<Self>,
 	) {
-		if self.refuse_while_applying("overwrite", cx) || self.paste_loading {
+		if self.refuse_while_applying("overwrite", cx)
+			|| self.paste.is_loading()
+		{
 			return;
 		}
-		if let Some(ref mut p) = self.paste_preview {
-			p.toggle_overwrite(idx);
-			let st = p
-				.items
-				.get(idx)
-				.map(|i| i.overwrite_allowed)
-				.unwrap_or(false);
+		if let Some(st) = self.paste.toggle_overwrite(idx) {
 			app_log!("[APP:PASTE_TOGGLED: idx={} state={}]", idx, st);
 			cx.notify();
 		}
@@ -5478,85 +5410,96 @@ impl WorkbenchModel {
 		idx: usize,
 		cx: &mut Context<Self>,
 	) {
-		if self.refuse_while_applying("include", cx) || self.paste_loading {
+		if self.refuse_while_applying("include", cx) || self.paste.is_loading()
+		{
 			return;
 		}
-		if let Some(ref mut p) = self.paste_preview {
-			p.toggle_selected(idx);
-			let st = p.items.get(idx).map(|i| i.selected).unwrap_or(false);
+		if let Some(st) = self.paste.toggle_selected(idx) {
 			app_log!("[APP:PASTE_SEL_TOGGLED: idx={} state={}]", idx, st);
 			cx.notify();
 		}
 	}
 
+	fn report_paste_nav(
+		&mut self,
+		nav: paste::preview::Nav,
+		cx: &mut Context<Self>,
+	) {
+		match nav {
+			paste::preview::Nav::Ignored => {}
+			paste::preview::Nav::Moved(idx) => {
+				app_log!("[APP:PASTE_NAV: idx={}]", idx);
+				cx.notify();
+			}
+			paste::preview::Nav::Refused(err) => {
+				self.status = err;
+				app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
+				cx.notify();
+			}
+		}
+	}
+
 	pub fn select_paste_item(&mut self, idx: usize, cx: &mut Context<Self>) {
-		let pool = self.paste_pending.clone();
-		let mut pending = paste::lock_pending(&pool);
-		if let Some(plan) = &mut self.paste_preview {
-			if idx >= plan.items.len() {
-				return;
+		let nav = self.paste.select(idx, self.preview.as_ref());
+		self.report_paste_nav(nav, cx);
+	}
+
+	pub fn step_paste_selection(
+		&mut self,
+		forward: bool,
+		cx: &mut Context<Self>,
+	) {
+		let nav = self.paste.step(forward, self.preview.as_ref());
+		self.report_paste_nav(nav, cx);
+	}
+
+	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
+		match self.paste.toggle_fold(c, self.preview.as_ref()) {
+			paste::preview::Folded::NoPlan => {}
+			paste::preview::Folded::Kept => {
+				app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
+				cx.notify();
 			}
-			let detail = plan.detail_at(idx);
-			match pending.admit_ui(
-				self.preview.as_ref(),
-				Some(plan),
-				detail.as_ref(),
-			) {
-				Ok(()) => {
-					plan.selected_item_idx = idx;
-					self.paste_detail = detail;
-					app_log!("[APP:PASTE_NAV: idx={}]", idx);
-					self.paste_scroll
-						.scroll_to_item(0, gpui::ScrollStrategy::Top);
-				}
-				Err(err) => {
-					self.status = err;
-					app_log!(
-						"[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]"
-					);
-				}
+			paste::preview::Folded::Reselected(nav) => {
+				app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
+				self.report_paste_nav(nav, cx);
+				cx.notify();
 			}
-			cx.notify();
 		}
 	}
 
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
-		if self.paste_loading {
-			app_log!("[APP:APPLY_IGNORED: loading]");
-			self.set_status("paste_loading_refused", []);
-			cx.notify();
-			return;
-		}
-		let Some(ref mut plan) = self.paste_preview else {
-			app_log!("[APP:APPLY_IGNORED: no_plan]");
-			return;
+		let apply = match self.paste.begin_apply() {
+			Ok(w) => w,
+			Err(paste::preview::ApplyRefused::Loading) => {
+				app_log!("[APP:APPLY_IGNORED: loading]");
+				self.set_status("paste_loading_refused", []);
+				cx.notify();
+				return;
+			}
+			Err(paste::preview::ApplyRefused::NoPlan)
+			| Err(paste::preview::ApplyRefused::NotExecutable) => {
+				app_log!("[APP:APPLY_IGNORED: no_plan]");
+				return;
+			}
+			Err(paste::preview::ApplyRefused::Busy) => {
+				app_log!("[APP:PASTE_BUSY: refused=apply]");
+				return;
+			}
+			Err(paste::preview::ApplyRefused::MappingRequired) => {
+				app_log!("[APP:PASTE_ERR: mapping_required]");
+				self.set_paste_error(Msg::new("mapping_required", []));
+				cx.notify();
+				return;
+			}
 		};
-		if plan.is_applying {
-			app_log!("[APP:PASTE_BUSY: refused=apply]");
-			return;
-		}
-		if !plan.mapping_ready() {
-			app_log!("[APP:PASTE_ERR: mapping_required]");
-			self.set_paste_error(Msg::new("mapping_required", []));
-			cx.notify();
-			return;
-		}
 
-		if !plan.executable() {
-			app_log!("[APP:APPLY_IGNORED: no_plan]");
-			return;
-		}
-
-		plan.is_applying = true;
 		self.pending_focus = Some(self.paste_focus.clone());
-		// The worker gets a cheap handle: the plan's contents are shared.
-		let plan_clone =
-			paste::PasteApplyWorker::new(plan, &self.paste_pending);
 		self.set_status("paste_apply_busy", []);
 		app_log!("[APP:PASTE_APPLYING]");
 		cx.notify();
 
-		let delay = self.e2e_apply_delay;
+		let delay = self.paste.apply_delay();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -5571,7 +5514,7 @@ impl WorkbenchModel {
 						if let Some(d) = delay {
 							std::thread::sleep(d);
 						}
-						plan_clone.execute()
+						apply.execute()
 					})
 					.await;
 
@@ -5593,7 +5536,7 @@ impl WorkbenchModel {
 							for error in &result.files.errors {
 								app_log!("[APP:PASTE_FILE_ERROR: {error}]");
 							}
-							model.clear_paste_state();
+							model.paste.clear(model.preview.as_ref());
 							model.restore_log_after_paste();
 							model.pending_focus =
 								Some(model.focus_handle.clone());
@@ -5608,8 +5551,8 @@ impl WorkbenchModel {
 						}
 						Err(err) => {
 							app_log!("[APP:PASTE_STALE_DETECTED: {}]", err.key);
-							if let Some(p) = &mut model.paste_preview { p.is_applying = false; }
-							model.set_paste_error(err);
+							model.status = err.clone();
+							model.paste.apply_failed(err, model.preview.as_ref());
 						}
 					}
 					cx.notify();
@@ -5620,17 +5563,14 @@ impl WorkbenchModel {
 
 	/// Called on every path that closes the paste preview.
 	fn restore_log_after_paste(&mut self) {
-		if restore_log_after_paste(
-			&mut self.log_before_paste,
-			&mut self.bottom_visible,
-		) {
+		if self.paste.restore_log(&mut self.bottom_visible) {
 			app_log!("[APP:LOG_PANEL: visible=true reason=paste_close]");
 		}
 	}
 
 	/// Editor tabs open: the paste preview, or the one reader tab.
 	pub fn open_tab_count(&self) -> usize {
-		let paste = self.paste_preview.is_some() || self.paste_loading;
+		let paste = self.paste.is_open();
 		let reader = self.preview.is_some()
 			|| self.preview_loading
 			|| self.selected_commit.is_some()
@@ -5645,7 +5585,7 @@ impl WorkbenchModel {
 		if idx != 0 || self.open_tab_count() == 0 {
 			return;
 		}
-		if self.paste_preview.is_some() || self.paste_loading {
+		if self.paste.is_open() {
 			self.cancel_paste_preview(cx);
 			return;
 		}
@@ -5663,6 +5603,7 @@ impl WorkbenchModel {
 		self.log_selected.clear();
 		self.compare = None;
 		self.selected_commit_file = None;
+		self.commit_file_sel.clear();
 		self.commit_files.clear();
 		app_log!("[APP:TAB_CLOSED: {idx}]");
 		cx.notify();
@@ -5682,12 +5623,12 @@ impl WorkbenchModel {
 		if self.refuse_while_applying("cancel", cx) {
 			return;
 		}
-		let was_loading = self.paste_loading;
-		self.invalidate_paste_job();
-		if self.paste_preview.is_none() && !was_loading {
+		let was_loading = self.paste.is_loading();
+		self.paste.invalidate_job();
+		if self.paste.plan().is_none() && !was_loading {
 			return;
 		}
-		self.clear_paste_state();
+		self.paste.clear(self.preview.as_ref());
 		self.restore_log_after_paste();
 		self.pending_focus = Some(self.focus_handle.clone());
 		self.set_status("paste_cancelled", []);
@@ -6235,33 +6176,6 @@ fn main() {
 	});
 }
 
-/// Hides the Git Log for the paste preview, remembering the prior state once
-/// (a re-paste over an open preview keeps the first saved value). Returns
-/// whether visibility changed.
-fn collapse_log_for_paste(
-	saved: &mut Option<bool>,
-	visible: &mut bool,
-) -> bool {
-	saved.get_or_insert(*visible);
-	std::mem::replace(visible, false)
-}
-
-/// Restores the saved visibility when the preview closes. No-op if nothing
-/// was saved (already restored, or the user toggled the log) or if the log
-/// is already shown again. Returns whether visibility changed.
-fn restore_log_after_paste(
-	saved: &mut Option<bool>,
-	visible: &mut bool,
-) -> bool {
-	match saved.take() {
-		Some(true) if !*visible => {
-			*visible = true;
-			true
-		}
-		_ => false,
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	/// UI state driven in-process: no display, so these also run in the
@@ -6350,6 +6264,73 @@ mod tests {
 			Some(CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner))
 		}
 
+		#[gpui::test]
+		fn commit_files_cmd_and_shift_select_several(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let files = ["a.txt", "b.txt", "c.txt", "d.txt"];
+			model.update(cx, |m, cx| {
+				m.commit_files =
+					files.iter().map(|f| (f.to_string(), None)).collect();
+				m.selected_commit_file = Some("b.txt".into());
+				m.toggle_commit_file("d.txt", cx);
+				assert_eq!(m.commit_file_sel, ["b.txt", "d.txt"]);
+				m.toggle_commit_file("b.txt", cx);
+				assert_eq!(m.commit_file_sel, ["d.txt"]);
+				m.extend_commit_files(&files, "d.txt", cx);
+				assert_eq!(m.commit_file_sel, ["b.txt", "c.txt", "d.txt"]);
+			});
+		}
+
+		/// Copy files on a selection of a folder and files copies each file
+		/// once, deletions included (they go out as `[DELETED]`).
+		#[gpui::test]
+		fn commit_files_copy_folder_and_files_together(
+			cx: &mut TestAppContext,
+		) {
+			use crate::menu::{MenuAct, MenuEntry};
+			use snip_core::format::ChangeType::{Deleted, Modified};
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let copied = model.update(cx, |m, cx| {
+				m.log_commit_root = Some(root.clone());
+				m.compare = Some(("old".into(), "new".into()));
+				m.commit_files = [
+					("src/a.rs", Modified),
+					("src/gone.rs", Deleted),
+					("pom.xml", Modified),
+					("README.md", Modified),
+				]
+				.map(|(p, c)| (p.to_string(), Some(c)))
+				.into();
+				m.selected_commit_file = Some("src/a.rs".into());
+				m.toggle_commit_file("src/", cx);
+				m.toggle_commit_file("pom.xml", cx);
+				let menu = m.commit_file_menu("src", true);
+				menu.into_iter()
+					.find_map(|e| match e {
+						MenuEntry::Item {
+							act: Some(MenuAct::CopyRevFiles(f)),
+							..
+						} => Some(f),
+						_ => None,
+					})
+					.unwrap()
+			});
+			let got: Vec<_> =
+				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			assert_eq!(
+				got,
+				[
+					("src/a.rs", false),
+					("src/gone.rs", true),
+					("pom.xml", false)
+				]
+			);
+		}
+
 		/// Puts `payload` on the OS clipboard and opens its paste preview.
 		fn paste(
 			model: &Entity<WorkbenchModel>,
@@ -6360,7 +6341,7 @@ mod tests {
 			cx.simulate_keystrokes("ctrl-v");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(m.paste_preview.is_some(), "no preview: {}", m.status)
+				assert!(m.paste.plan().is_some(), "no preview: {}", m.status)
 			});
 		}
 
@@ -6434,6 +6415,282 @@ mod tests {
 			cx.simulate_keystrokes("alt-9");
 			cx.run_until_parked();
 			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
+		}
+
+		/// The log list width and, per laid-out row, the widths of its graph
+		/// gutter and subject cell.
+		struct LogMeasure {
+			list_w: f32,
+			rows: Vec<(f32, f32)>,
+		}
+
+		/// Six repositories with three feature branches of long names each,
+		/// so the graph is wide and rows carry ref labels; shown in a
+		/// `w` x 752 window.
+		fn measure_wide_log(cx: &mut TestAppContext, w: f32) -> LogMeasure {
+			let ws = tempfile::tempdir().unwrap();
+			for i in 0..6 {
+				let r = repo(ws.path(), &format!("repo{i}"), &[]);
+				for b in 0..3 {
+					let name = format!("feature/a-rather-long-branch-{i}-{b}");
+					git(&r, &["checkout", "-q", "-b", &name, "main"]);
+					fs::write(r.join(format!("f{b}.txt")), "x").unwrap();
+					git(&r, &["add", "."]);
+					git(
+						&r,
+						&["commit", "-q", "-m", &format!("commit {i} {b}")],
+					);
+				}
+				git(&r, &["checkout", "-q", "main"]);
+			}
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
+			settle(cx);
+			// The list reads its own width from the previous frame.
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+			let (n, list_w) = model.read_with(cx, |m, _| {
+				let bounds = m.log_scroll.0.borrow().base_handle.bounds();
+				(m.display_commits().len(), f32::from(bounds.size.width))
+			});
+			assert!(n > 10, "log did not load: {n} commits");
+			let mut rows = Vec::new();
+			for ix in 0..n {
+				// `debug_bounds` wants a 'static selector; a test may leak.
+				let key = |what: &str| -> &'static str {
+					Box::leak(format!("log-{what}:{ix}").into_boxed_str())
+				};
+				if let (Some(g), Some(s)) = (
+					cx.debug_bounds(key("gutter")),
+					cx.debug_bounds(key("subject")),
+				) {
+					rows.push((
+						f32::from(g.size.width),
+						f32::from(s.size.width),
+					));
+				}
+			}
+			LogMeasure { list_w, rows }
+		}
+
+		/// Every row shares one gutter, and the subject of each row keeps at
+		/// least `min` wide.
+		fn assert_log_layout(m: &LogMeasure, min: f32) {
+			assert!(!m.rows.is_empty(), "no rows were laid out");
+			for (gutter, subject) in &m.rows {
+				assert_eq!(*gutter, m.rows[0].0, "{:?}", m.rows);
+				assert!(
+					*subject >= min,
+					"list {}: subject {subject} < {min}: {:?}",
+					m.list_w,
+					m.rows
+				);
+			}
+		}
+
+		#[gpui::test]
+		fn wide_multi_repo_log_keeps_a_subject_at_1080(
+			cx: &mut TestAppContext,
+		) {
+			let m = measure_wide_log(cx, 1080.);
+			// ui::log::MIN_SUBJECT_W
+			assert_log_layout(&m, 160.);
+		}
+
+		/// At 900 the list is ~430px: the gutter sits at its floor and the
+		/// date and author cells shrink, so the subject still gets its
+		/// minimum with the labels dropped.
+		#[gpui::test]
+		fn wide_multi_repo_log_keeps_a_subject_at_900(cx: &mut TestAppContext) {
+			let m = measure_wide_log(cx, 900.);
+			assert_log_layout(&m, 160.);
+		}
+
+		#[cfg(unix)]
+		#[gpui::test]
+		fn merged_log_same_name_repos_get_distinct_ids_and_filters(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let real = tmp.path().join("real");
+			fs::create_dir_all(real.join("x/svc")).unwrap();
+			let x = repo(&real.join("x/svc"), "app", &[]);
+			fs::create_dir_all(real.join("y/svc")).unwrap();
+			git(
+				&real.join("y/svc"),
+				&["clone", "-q", x.to_str().unwrap(), "app"],
+			);
+			std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+
+			let out = Command::new("git")
+				.current_dir(&x)
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.expect("git rev-parse HEAD");
+			assert!(out.status.success(), "git rev-parse HEAD: {out:?}");
+			let head = String::from_utf8(out.stdout).expect("utf8");
+			let sha7 = head.trim()[..7].to_string();
+
+			let (model, cx) = open(cx, tmp.path().join("link"), None);
+			model.update(cx, |m, _| {
+				m.probes = Some(crate::ui::Probes::for_test());
+			});
+			for _ in 0..2 {
+				cx.update(|w, _| w.refresh());
+				settle(cx);
+			}
+
+			let mut fails: Vec<String> = Vec::new();
+
+			let (repo_names, feed_names, is_merged, feeds_len, ids) = model
+				.read_with(cx, |m, _| {
+					let repo_names: Vec<String> =
+						m.repos.iter().map(|r| r.name.clone()).collect();
+					let feed_names: Vec<String> =
+						m.log_feeds.iter().map(|f| f.name.clone()).collect();
+					let is_merged = m.log_is_merged();
+					let feeds_len = m.log_feeds.len();
+					let ids = m.probes.as_ref().unwrap().drawn();
+					(repo_names, feed_names, is_merged, feeds_len, ids)
+				});
+
+			let rel_drawn_ids: Vec<String> = ids
+				.iter()
+				.filter(|id| {
+					id.starts_with("root-stripe:")
+						|| id.starts_with("commit-row:")
+						|| id.starts_with("log-repo:")
+				})
+				.cloned()
+				.collect();
+
+			// (a) m.log_is_merged(), m.log_feeds.len() == 2, m.log_feeds[0].name != m.log_feeds[1].name,
+			// 而且 m.repos 的名稱兩兩不同。
+			if !is_merged {
+				fails.push(format!(
+					"(a) expected log_is_merged() == true; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}"
+				));
+			}
+			if feeds_len != 2 {
+				fails.push(format!(
+					"(a) expected 2 log_feeds, found {feeds_len}; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}"
+				));
+			}
+			if feeds_len >= 2 && feed_names[0] == feed_names[1] {
+				fails.push(format!(
+					"(a) expected distinct log_feed names, but both are '{}'; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}",
+					feed_names[0]
+				));
+			}
+			let mut unique_repos = repo_names.clone();
+			unique_repos.sort();
+			unique_repos.dedup();
+			if unique_repos.len() != repo_names.len() {
+				fails.push(format!(
+					"(a) expected pairwise distinct repo names, but found duplicates: {repo_names:?}; feeds={feed_names:?}, drawn={rel_drawn_ids:?}"
+				));
+			}
+
+			// (b) probe ids
+			let sha_suffix = format!(":{sha7}");
+			let root_stripes: Vec<_> = ids
+				.iter()
+				.filter(|id| {
+					id.starts_with("root-stripe:") && id.ends_with(&sha_suffix)
+				})
+				.cloned()
+				.collect();
+			if root_stripes.len() != 2 {
+				fails.push(format!(
+					"(b) expected 2 root-stripe IDs ending with '{sha_suffix}', found {}: {root_stripes:?}; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}",
+					root_stripes.len()
+				));
+			}
+
+			let commit_rows: Vec<_> = ids
+				.iter()
+				.filter(|id| {
+					if let Some(rest) = id.strip_prefix("commit-row:") {
+						rest.contains(':') && id.ends_with(&sha_suffix)
+					} else {
+						false
+					}
+				})
+				.cloned()
+				.collect();
+			if commit_rows.len() != 2 {
+				fails.push(format!(
+					"(b) expected 2 commit-row IDs with repo prefix ending with '{sha_suffix}', found {}: {commit_rows:?}; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}",
+					commit_rows.len()
+				));
+			}
+
+			// (c) 從 m.repos 找出 root.ends_with(x/svc/app)，toggle_log_path，settle，檢查 feeds
+			let repo_x = model.read_with(cx, |m, _| {
+				m.repos
+					.iter()
+					.find(|r| {
+						r.root.ends_with(std::path::Path::new("x/svc/app"))
+					})
+					.map(|r| (r.name.clone(), r.root.clone()))
+			});
+
+			if let Some((name_x, root_x)) = repo_x {
+				model.update(cx, |m, cx| {
+					m.toggle_log_path(format!("{name_x}/base.txt"), cx);
+				});
+				settle(cx);
+
+				model.read_with(cx, |m, _| {
+					let cur_feed_names: Vec<String> =
+						m.log_feeds.iter().map(|f| f.name.clone()).collect();
+					let cur_repo_names: Vec<String> =
+						m.repos.iter().map(|r| r.name.clone()).collect();
+					let cur_drawn = m
+						.probes
+						.as_ref()
+						.map(|p| p.drawn())
+						.unwrap_or_default();
+					let cur_rel_ids: Vec<String> = cur_drawn
+						.iter()
+						.filter(|id| {
+							id.starts_with("root-stripe:")
+								|| id.starts_with("commit-row:")
+								|| id.starts_with("log-repo:")
+						})
+						.cloned()
+						.collect();
+
+					if m.log_feeds.len() != 1 {
+						fails.push(format!(
+							"(c) expected log_feeds.len() == 1, found {}; repos={cur_repo_names:?}, feeds={cur_feed_names:?}, paths={:?}, drawn={cur_rel_ids:?}",
+							m.log_feeds.len(),
+							m.log_feeds.iter().map(|f| &f.paths).collect::<Vec<_>>(),
+						));
+					}
+					if m.log_feeds.first().map(|f| &f.root) != Some(&root_x) {
+						fails.push(format!(
+							"(c) expected log_feeds[0].root == {root_x:?}, found {:?}; repos={cur_repo_names:?}, feeds={cur_feed_names:?}, drawn={cur_rel_ids:?}",
+							m.log_feeds.first().map(|f| &f.root),
+						));
+					}
+					let expected_paths = vec!["base.txt".to_string()];
+					if m.log_feeds.first().map(|f| &f.paths) != Some(&expected_paths) {
+						fails.push(format!(
+							"(c) expected log_feeds[0].paths == [\"base.txt\"], found {:?}; repos={cur_repo_names:?}, feeds={cur_feed_names:?}, drawn={cur_rel_ids:?}",
+							m.log_feeds.first().map(|f| &f.paths),
+						));
+					}
+				});
+			} else {
+				fails.push(format!(
+					"(c) could not find repo ending with 'x/svc/app'; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}"
+				));
+			}
+
+			assert!(fails.is_empty(), "{fails:#?}");
 		}
 
 		#[gpui::test]
@@ -6563,27 +6820,37 @@ mod tests {
 				"// FILE: existing.txt\nnew body\n// FILE: fresh.txt\nfresh body\n",
 			);
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert!(plan.mapping_ready());
 				assert_eq!(plan.destination, dest);
-				let mut rows: Vec<(&str, &str, bool, bool)> = plan
-					.items
-					.iter()
-					.map(|i| {
-						(
-							i.path.as_str(),
-							i.action_label,
-							i.dest_exists,
-							i.overwrite_allowed,
-						)
-					})
-					.collect();
-				rows.sort();
+				let mut rows: Vec<(&str, crate::paste::PlannedOp, bool, bool)> =
+					plan.items
+						.iter()
+						.map(|i| {
+							(
+								i.path.as_str(),
+								i.op,
+								i.dest_exists,
+								i.overwrite_allowed,
+							)
+						})
+						.collect();
+				rows.sort_by_key(|r| r.0);
 				assert_eq!(
 					rows,
 					[
-						("existing.txt", "OVERWRITE", true, false),
-						("fresh.txt", "CREATE", false, false),
+						(
+							"existing.txt",
+							crate::paste::PlannedOp::Overwrite,
+							true,
+							false
+						),
+						(
+							"fresh.txt",
+							crate::paste::PlannedOp::Create,
+							false,
+							false
+						),
 					]
 				);
 				assert_eq!(m.status.key, "status_paste_preview");
@@ -6594,6 +6861,259 @@ mod tests {
 				"keep"
 			);
 			assert!(!dest.join("fresh.txt").exists());
+		}
+
+		/// Commit payload on the clipboard format: c1 has a binary (not
+		/// copied) file, a new file and a rename; c2 has no files; c3
+		/// modifies `base.txt`.
+		fn mixed_commit_payload() -> String {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+				NotCopiedReason,
+			};
+			let file = |path: &str, change, body: Option<&str>| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change,
+				content: body.map(Into::into),
+				not_copied: None,
+			};
+			let record = |message: &str, author: &str, files| CommitRecord {
+				message: message.into(),
+				author_name: author.into(),
+				author_email: format!("{author}@example.invalid"),
+				author_date: "2026-09-25T12:34:56+00:00".into(),
+				files,
+			};
+			let mut binary = file("img.bin", FileChange::Added, None);
+			binary.not_copied = Some(NotCopiedReason::Binary);
+			let mut renamed =
+				file("dir/new.txt", FileChange::Renamed, Some("moved"));
+			renamed.old_path = Some("old.txt".into());
+			snip_core::commits::to_clipboard_text(&CommitsPayload {
+				commits: vec![
+					record(
+						"first\n\nbody",
+						"ann",
+						vec![
+							binary,
+							file("fresh.txt", FileChange::Added, Some("x")),
+							renamed,
+						],
+					),
+					record("empty one", "bob", Vec::new()),
+					record(
+						"third",
+						"cy",
+						vec![file("base.txt", FileChange::Modified, Some("y"))],
+					),
+				],
+			})
+		}
+
+		#[gpui::test]
+		fn commit_preview_renders_every_commit_header_and_folds(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			model.update(cx, |m, _| {
+				m.probes = Some(crate::ui::Probes::for_test())
+			});
+			paste(&model, cx, &mixed_commit_payload());
+			settle(cx);
+			let drawn = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| m.probes.as_ref().unwrap().drawn())
+			};
+			let ids = drawn(cx);
+			// The empty commit still gets its header, and the summary
+			// counts commits apart from file actions.
+			for id in [
+				"paste-commit:0",
+				"paste-commit:1",
+				"paste-commit:2",
+				"paste-commit-count",
+				"paste-row:0:img.bin",
+				"paste-row:4:base.txt",
+			] {
+				assert!(ids.contains(&id.to_string()), "{id} in {ids:?}");
+			}
+			// The header strings come from `commit_header_labels`, the
+			// helper the header draws them with (the probes only prove the
+			// header exists): subject, author and date of the empty commit.
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				let commits =
+					&plan.commit_preview.as_ref().unwrap().plan().commits;
+				assert_eq!(
+					crate::ui::commit_header_labels(
+						&commits[1],
+						crate::i18n::Locale::En
+					),
+					(
+						"empty one".to_string(),
+						"bob <bob@example.invalid>".to_string(),
+						"2026-09-25 12:34".to_string()
+					)
+				);
+				assert!(plan.items.iter().all(|i| i.commit != Some(1)));
+				// Header counts agree with the rows under them.
+				assert_eq!(plan.commit_counts(0), (4, 1));
+				assert_eq!(plan.commit_counts(1), (0, 0));
+				assert_eq!(plan.commit_counts(2), (1, 0));
+			});
+			// Folding commit #1 removes its rows but keeps every header.
+			model.update(cx, |m, cx| m.toggle_paste_commit(0, cx));
+			settle(cx);
+			let ids = drawn(cx);
+			assert!(ids.contains(&"paste-commit:0".to_string()));
+			assert!(
+				!ids.contains(&"paste-row:0:img.bin".to_string()),
+				"{ids:?}"
+			);
+			assert!(ids.contains(&"paste-row:4:base.txt".to_string()));
+		}
+
+		#[gpui::test]
+		fn folding_the_selected_commit_moves_selection_off_hidden_rows(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &mixed_commit_payload());
+			model.update(cx, |m, cx| {
+				m.select_paste_item(0, cx);
+				m.toggle_paste_commit(0, cx);
+			});
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.items[plan.selected_item_idx].path, "base.txt");
+				assert!(plan.display_order().contains(&plan.selected_item_idx));
+				// Space acted on the visible row only: the folded commit's
+				// files stay included and no subset error is raised.
+				assert!(plan
+					.items
+					.iter()
+					.filter(|i| i.commit == Some(0))
+					.all(|i| i.selected));
+				assert!(plan.error.is_none());
+			});
+		}
+
+		#[gpui::test]
+		fn nav_up_and_down_move_paste_selection_and_detail(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &mixed_commit_payload());
+
+			let (initial_idx, initial_path, order) =
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					let order = plan.display_order();
+					(
+						plan.selected_item_idx,
+						m.paste.detail().and_then(|d| d.path.clone()),
+						order,
+					)
+				});
+			assert_eq!(initial_idx, order[0]);
+			assert_eq!(initial_path.as_deref(), Some("img.bin"));
+
+			cx.simulate_keystrokes("down");
+			cx.run_until_parked();
+
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, order[1]);
+				assert_eq!(
+					m.paste.detail().and_then(|d| d.path.as_deref()),
+					Some("fresh.txt")
+				);
+			});
+
+			cx.simulate_keystrokes("up");
+			cx.run_until_parked();
+
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, order[0]);
+				assert_eq!(
+					m.paste.detail().and_then(|d| d.path.as_deref()),
+					Some("img.bin")
+				);
+			});
+		}
+
+		#[gpui::test]
+		fn space_on_a_skip_row_never_flips_the_hidden_overwrite(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[("old.txt", "old")]);
+			// A non-UTF-8 file is never overwritten: the replay plans a
+			// SKIP for it although it exists at the destination.
+			fs::write(dest.join("img.bin"), [0xff, 0xfe, 0x00]).unwrap();
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "bin".into(),
+						author_name: "ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-09-25T12:34:56+00:00".into(),
+						files: vec![CommitFile {
+							path: "img.bin".into(),
+							old_path: None,
+							change: FileChange::Modified,
+							content: Some("text".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			let before = model.update(cx, |m, cx| {
+				m.select_paste_item(0, cx);
+				let img = &m.paste.plan().unwrap().items[0];
+				assert_eq!(img.path, "img.bin");
+				assert!(
+					img.dest_exists
+						&& matches!(img.op, crate::paste::PlannedOp::Skip(_))
+				);
+				assert!(!img.overwritable());
+				img.overwrite_allowed
+			});
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let img = &m.paste.plan().unwrap().items[0];
+				assert_eq!(img.overwrite_allowed, before);
+			});
 		}
 
 		#[gpui::test]
@@ -6610,7 +7130,7 @@ mod tests {
 			cx.simulate_keystrokes("escape");
 			cx.run_until_parked();
 			model.read_with(cx, |m, _| {
-				assert!(m.paste_preview.is_none());
+				assert!(m.paste.plan().is_none());
 				assert_eq!(m.status.key, "paste_cancelled");
 			});
 			assert!(!dest.join("fresh.txt").exists());
@@ -6631,7 +7151,7 @@ mod tests {
 			);
 			cx.simulate_keystrokes("enter");
 			cx.run_until_parked();
-			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
 			assert_eq!(
 				fs::read_to_string(dest.join("a.txt")).unwrap(),
 				"alpha"
@@ -6659,7 +7179,7 @@ mod tests {
 			cx.run_until_parked();
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.status.key, "stale_created", "{}", m.status);
-				let plan = m.paste_preview.as_ref().expect("plan stays open");
+				let plan = m.paste.plan().expect("plan stays open");
 				assert!(!plan.is_applying);
 				assert_eq!(
 					plan.error.as_ref().map(|e| e.key),
@@ -6708,7 +7228,7 @@ mod tests {
 			cx.run_until_parked();
 			fs::set_permissions(&ro, fs::Permissions::from_mode(0o755))
 				.unwrap();
-			assert!(model.read_with(cx, |m, _| m.paste_preview.is_none()));
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
 			assert_eq!(
 				fs::read_to_string(dest.join("ok.txt")).unwrap(),
 				"fine"
@@ -6757,6 +7277,170 @@ mod tests {
 			});
 		}
 
+		/// Click the centre of the rendered control `id`, the way a user
+		/// does. Fails when the UI renders no such element, so it also pins
+		/// the id shape the drivers rely on.
+		fn click(cx: &mut VisualTestContext, id: &'static str) {
+			cx.run_until_parked();
+			let bounds = cx
+				.debug_bounds(id)
+				.unwrap_or_else(|| panic!("no rendered control {id}"));
+			cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+			cx.run_until_parked();
+		}
+
+		#[gpui::test]
+		fn one_path_under_two_roots_toggles_and_applies_per_row(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let alpha =
+				repo(ws.path(), "alpha", &[("unrelated.txt", "alpha old")]);
+			let beta =
+				repo(ws.path(), "beta", &[("unrelated.txt", "beta old")]);
+			let (_dest, dest) = canonical_tmp();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(
+				&model,
+				cx,
+				"// FILE: alpha/unrelated.txt\nalpha new\n// FILE: beta/unrelated.txt\nbeta new\n",
+			);
+			for (prefix, root) in [("alpha", &alpha), ("beta", &beta)] {
+				let root = dunce::canonicalize(root).unwrap();
+				let idx = model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					let choice = plan
+						.prefix_choices
+						.iter()
+						.find(|c| c.prefix == prefix)
+						.unwrap();
+					choice.candidates.iter().position(|c| *c == root).unwrap()
+				});
+				model
+					.update(cx, |m, cx| m.choose_paste_prefix(prefix, idx, cx));
+				settle(cx);
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.items.len(), 2);
+				assert!(plan.items.iter().all(|i| i.path == "unrelated.txt"));
+				assert_ne!(
+					plan.items[0].dest_root_name,
+					plan.items[1].dest_root_name
+				);
+			});
+			// Clicks land on the rendered controls of the second row.
+			click(cx, "paste-row:1:unrelated.txt");
+			click(cx, "paste-overwrite:1:unrelated.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, 1);
+				assert!(!plan.items[0].overwrite_allowed);
+				assert!(plan.items[1].overwrite_allowed);
+			});
+			click(cx, "paste-include:1:unrelated.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.items[0].selected);
+				assert!(!plan.items[1].selected);
+			});
+			click(cx, "paste-include:1:unrelated.txt");
+			click(cx, "paste-row:0:unrelated.txt");
+			click(cx, "paste-overwrite:0:unrelated.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.selected_item_idx, 0);
+				assert!(plan.items.iter().all(|i| i.selected));
+				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
+			});
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
+			assert_eq!(
+				fs::read_to_string(alpha.join("unrelated.txt")).unwrap(),
+				"alpha new"
+			);
+			assert_eq!(
+				fs::read_to_string(beta.join("unrelated.txt")).unwrap(),
+				"beta new"
+			);
+		}
+
+		#[gpui::test]
+		fn one_path_in_two_commits_confirms_each_overwrite(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			git(&dest, &["init", "-q", "-b", "main"]);
+			fs::write(dest.join("common.txt"), "base\n").unwrap();
+			git(&dest, &["add", "."]);
+			git(&dest, &["commit", "-q", "-m", "base"]);
+			let commit = |n: u8| CommitRecord {
+				message: format!("edit {n}\n"),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: format!("2026-09-2{n}T12:00:00+00:00"),
+				files: vec![CommitFile {
+					path: "common.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some(format!("edit {n}\n")),
+					not_copied: None,
+				}],
+			};
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![commit(1), commit(2)],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.items.len(), 2);
+				assert!(plan.items.iter().all(|i| {
+					i.path == "common.txt"
+						&& i.op == crate::paste::PlannedOp::Overwrite
+				}));
+			});
+			// The second overwrite is what used to be unreachable.
+			click(cx, "paste-overwrite:1:common.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(!plan.items[0].overwrite_allowed);
+				assert!(plan.items[1].overwrite_allowed);
+			});
+			click(cx, "paste-overwrite:0:common.txt");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.items.iter().all(|i| i.overwrite_allowed));
+			});
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
+			assert_eq!(
+				fs::read_to_string(dest.join("common.txt")).unwrap(),
+				"edit 2\n"
+			);
+			let log = Command::new("git")
+				.current_dir(&dest)
+				.args(["log", "--format=%s"])
+				.output()
+				.unwrap();
+			assert_eq!(
+				String::from_utf8_lossy(&log.stdout),
+				"edit 2\nedit 1\nbase\n"
+			);
+		}
+
 		#[gpui::test]
 		fn keeping_an_ambiguous_prefix_replans_under_the_destination(
 			cx: &mut TestAppContext,
@@ -6769,7 +7453,7 @@ mod tests {
 				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
 			paste(&model, cx, "// FILE: sub/x.txt\nnested\n");
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				let prefixes: Vec<&str> = plan
 					.prefix_choices
 					.iter()
@@ -6782,7 +7466,7 @@ mod tests {
 			model.update(cx, |m, cx| m.choose_paste_keep("sub", cx));
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				let plan = m.paste_preview.as_ref().unwrap();
+				let plan = m.paste.plan().unwrap();
 				assert!(plan.mapping_ready());
 				let targets: Vec<&Path> =
 					plan.items.iter().map(|i| i.dest_path.as_path()).collect();
@@ -7538,41 +8222,6 @@ mod tests {
 				&& !body.contains("working B")));
 	}
 
-	#[test]
-	fn test_paste_log_collapse_and_restore() {
-		// Open then close restores the visible log, exactly once.
-		let (mut saved, mut vis) = (None, true);
-		assert!(super::collapse_log_for_paste(&mut saved, &mut vis));
-		assert!(!vis);
-		// A re-paste over the open preview keeps the first saved state.
-		assert!(!super::collapse_log_for_paste(&mut saved, &mut vis));
-		assert!(super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(vis);
-		vis = false;
-		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(!vis, "must not restore twice");
-
-		// A log that was already hidden stays hidden.
-		let (mut saved, mut vis) = (None, false);
-		assert!(!super::collapse_log_for_paste(&mut saved, &mut vis));
-		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(!vis);
-
-		// A manual toggle (toggle_log clears the saved state) wins.
-		let (mut saved, mut vis) = (None, true);
-		super::collapse_log_for_paste(&mut saved, &mut vis);
-		saved = None;
-		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(!vis);
-
-		// Reopened by a path that does not clear the saved state: no flip.
-		let (mut saved, mut vis) = (None, true);
-		super::collapse_log_for_paste(&mut saved, &mut vis);
-		vis = true;
-		assert!(!super::restore_log_after_paste(&mut saved, &mut vis));
-		assert!(vis && saved.is_none());
-	}
-
 	use super::*;
 	use snip_core::workspace::GitMarker;
 	use std::fs;
@@ -7617,6 +8266,58 @@ mod tests {
 		assert_eq!(repos[0].name, "a/core");
 		assert_eq!(repos[1].name, "b/core");
 		assert_eq!(repos[2].name, "other");
+	}
+
+	#[test]
+	fn test_disambiguate_repo_names_when_root_does_not_strip() {
+		let mut repos1 = vec![
+			RepoEntry {
+				root: PathBuf::from("/real/x/svc/app"),
+				name: "app".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+			RepoEntry {
+				root: PathBuf::from("/real/y/svc/app"),
+				name: "app".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+			RepoEntry {
+				root: PathBuf::from("/real/z/other"),
+				name: "other".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+		];
+		let ws = PathBuf::from("/link");
+		WorkbenchModel::disambiguate_repo_names(&mut repos1, &ws);
+		assert_eq!(repos1[0].name, "x/svc/app");
+		assert_eq!(repos1[1].name, "y/svc/app");
+		assert_eq!(repos1[2].name, "other");
+
+		let mut repos2 = vec![
+			RepoEntry {
+				root: PathBuf::from("/real/p/x/svc/app"),
+				name: "app".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+			RepoEntry {
+				root: PathBuf::from("/real/q/x/svc/app"),
+				name: "app".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+		];
+		WorkbenchModel::disambiguate_repo_names(&mut repos2, &ws);
+		assert_eq!(repos2[0].name, "p/x/svc/app");
+		assert_eq!(repos2[1].name, "q/x/svc/app");
 	}
 
 	#[test]
@@ -8125,6 +8826,57 @@ mod tests {
 				"F2:r:pom.xml",
 				"R:unstaged:s:1",
 			]
+		);
+	}
+
+	#[test]
+	fn commit_copy_toast_reports_counts_and_where_files_were_left_out() {
+		use snip_core::commits::{
+			CommitExport, CommitFile, CommitRecord, CommitsPayload, FileChange,
+			NotCopiedReason,
+		};
+		let file =
+			|path: &str, not_copied: Option<NotCopiedReason>| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: not_copied.is_none().then(|| "body".into()),
+				not_copied,
+			};
+		let record = |files| CommitRecord {
+			message: "m".into(),
+			author_name: "a".into(),
+			author_email: "a@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files,
+		};
+		let export = |payload: CommitsPayload| CommitExport {
+			text: snip_core::commits::to_clipboard_text(&payload),
+			payload,
+		};
+		let bin = Some(NotCopiedReason::Binary);
+		let clean = export(CommitsPayload {
+			commits: vec![record(vec![file("a.txt", None)]), record(vec![])],
+		});
+		let msg = commit_copied_status(&clean);
+		assert_eq!(msg.key, "status_commits_copied");
+		let chars = clean.text.encode_utf16().count().to_string();
+		assert_eq!(msg.args, ["2", "1", chars.as_str()]);
+
+		let lossy = export(CommitsPayload {
+			commits: vec![
+				record(vec![file("a.txt", None), file("x.bin", bin)]),
+				record(vec![file("y.bin", bin), file("z.bin", bin)]),
+				record(vec![file("w.bin", bin)]),
+			],
+		});
+		let msg = commit_copied_status(&lossy);
+		assert_eq!(msg.key, "status_commits_copied_skipped");
+		assert_eq!(&msg.args[..2], ["3", "5"]);
+		assert_eq!(&msg.args[3..], ["4", "#1 x.bin; #2 y.bin, z.bin …"]);
+		let text = msg.render(crate::i18n::Locale::ZhTw);
+		assert!(
+			text.contains("3 個 commit") && text.contains("4 個檔案未複製")
 		);
 	}
 

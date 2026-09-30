@@ -378,6 +378,13 @@ fn find_wid(pid: u32) -> String {
 		{
 			return w.trim().to_string();
 		}
+		// The child is not reaped yet, so an app that died stays a zombie.
+		if proc_rest(pid).is_none_or(|rest| rest[0] == "Z") {
+			panic!(
+				"app pid {pid} exited before mapping a window (DISPLAY={:?}); see its [APP STDERR] lines",
+				std::env::var_os("DISPLAY")
+			);
+		}
 		std::thread::sleep(Duration::from_millis(50));
 	}
 	panic!("xdotool did not find a window for pid {pid}");
@@ -408,9 +415,9 @@ fn control(id: &str) -> [i32; 4] {
 	let deadline = Instant::now() + scaled(Duration::from_secs(4));
 	loop {
 		let found = BOUNDS.with(|slot| {
-			slot.borrow()
-				.as_ref()
-				.and_then(|b| b.lock().unwrap().get(id).copied())
+			slot.borrow().as_ref().and_then(|b| {
+				snip_native_e2e::lookup_bounds(&b.lock().unwrap(), id)
+			})
 		});
 		if let Some(v) = found {
 			let (vw, vh) = VIEW.with(|slot| {
@@ -1198,9 +1205,9 @@ fn absent(id: &str) {
 	let deadline = Instant::now() + scaled(Duration::from_secs(4));
 	loop {
 		let shown = BOUNDS.with(|slot| {
-			slot.borrow()
-				.as_ref()
-				.is_some_and(|b| b.lock().unwrap().contains_key(id))
+			slot.borrow().as_ref().is_some_and(|b| {
+				snip_native_e2e::lookup_bounds(&b.lock().unwrap(), id).is_some()
+			})
 		});
 		if !shown {
 			return;
@@ -3104,6 +3111,58 @@ fn failed_drain_reloads_the_changes_it_cancelled() {
 	fs::remove_file(&tree_hold).unwrap();
 	wait_git_idle(app.pid, &app.starttime);
 	quit_cleanly(&mut app, &wid);
+}
+
+/// A client still in its connection handshake survives another client
+/// leaving. Without `-noreset` on the shared Xvfb (scripts/headless-x11.sh)
+/// the server resets once its last running client disconnects and drops
+/// every client that has not finished setup: an app starting while one
+/// `xdotool search` from `find_wid` exits then dies with "Unknown connection
+/// error" (CI run 36655200964).
+#[test]
+fn shared_display_keeps_a_client_mid_handshake() {
+	use std::io::Read;
+	use std::os::linux::net::SocketAddrExt;
+	use std::os::unix::net::{SocketAddr, UnixStream};
+
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let display = std::env::var("DISPLAY").unwrap();
+	let n = display
+		.trim_start_matches(':')
+		.split('.')
+		.next()
+		.filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+		.unwrap_or_else(|| panic!("DISPLAY {display:?} is not a local :N"));
+	let path = format!("/tmp/.X11-unix/X{n}");
+	// Xtrans listens on the abstract name first, then on the socket file.
+	let mut conn = SocketAddr::from_abstract_name(&path)
+		.and_then(|addr| UnixStream::connect_addr(&addr))
+		.or_else(|_| UnixStream::connect(&path))
+		.unwrap_or_else(|e| panic!("connect to {display}: {e}"));
+	// Accepted by the server, setup not sent yet.
+	std::thread::sleep(scaled(Duration::from_millis(200)));
+	let st = Command::new("xdotool")
+		.arg("getmouselocation")
+		.stdout(Stdio::null())
+		.status()
+		.expect("xdotool");
+	assert!(st.success(), "xdotool getmouselocation on {display}: {st}");
+	std::thread::sleep(scaled(Duration::from_millis(300)));
+	// Little-endian setup request, protocol 11.0, no authorization.
+	let setup = [b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+	conn.set_read_timeout(Some(scaled(Duration::from_secs(5))))
+		.unwrap();
+	let sent = conn.write_all(&setup);
+	let mut reply = [0u8; 8];
+	let read = sent.and_then(|()| conn.read_exact(&mut reply));
+	assert!(
+		read.is_ok() && reply[0] == 1,
+		"setup on {display} after another client left: {read:?}, reply {reply:?} \
+		 (1 = success; a dropped connection means Xvfb reset, run it with -noreset)"
+	);
 }
 
 /// Losing the X server must end the process instead of spinning on the

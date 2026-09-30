@@ -14,11 +14,39 @@ lint:
 fmt:
 	cargo fmt --all
 
-# Everything CI runs that Linux can run (see .github/workflows/ci.yml for the rest).
-preflight: preflight-workflows preflight-rust preflight-harness native-acceptance
+# On Linux this is preflight-linux. Elsewhere this OS's checks run on the host, then the
+# Linux jobs run in a container (scripts/linux_container.sh), native acceptance included.
+# Everything CI runs that a machine can run (see .github/workflows/ci.yml for the rest).
+preflight:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	if [ "$(uname -s)" = Linux ]; then
+		exec {{just_executable()}} native_python="{{native_python}}" preflight-linux
+	fi
+	{{just_executable()}} preflight-host
+	scripts/linux_container.sh just preflight-linux
+
+# The Python harness tests are light, so they overlap the Rust checks; their output
+# is held back and printed after, so a failure is not buried in cargo's.
+# CI's Linux jobs, run directly (Linux) or through scripts/linux_container.sh.
+preflight-linux: preflight-workflows
+	#!/usr/bin/env bash
+	set -uo pipefail
+	log="$(mktemp)"
+	trap 'rm -f "$log"' EXIT
+	{{just_executable()}} native_python="{{native_python}}" preflight-harness >"$log" 2>&1 &
+	harness=$!
+	rc=0
+	{{just_executable()}} preflight-rust || rc=$?
+	wait "$harness" || { rc=$?; cat "$log"; }
+	[ "$rc" -eq 0 ] || exit "$rc"
+	# Extra acceptance flags, e.g. less parallelism where the machine is small.
+	{{just_executable()}} native_python="{{native_python}}" native-acceptance ${SNIP_ACCEPTANCE_ARGS:-}
 
 # Same as CI's Lint Workflows job; needs actionlint and shellcheck on PATH.
 preflight-workflows:
+	@# actionlint silently skips the run: scripts without shellcheck; CI has it preinstalled.
+	@command -v shellcheck >/dev/null || { echo "shellcheck not on PATH: actionlint would skip the run: scripts CI lints (pip install shellcheck-py)" >&2; exit 1; }
 	actionlint
 
 preflight-rust:
@@ -27,6 +55,13 @@ preflight-rust:
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	# Same as CI's Linux Test job: one run, clipboard tests on a private display.
 	RUSTFLAGS="-D warnings" xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+
+# CI's Lint and Test jobs on macOS and Windows: no Xvfb, the host's own clipboard.
+preflight-host:
+	cargo fmt --all --check
+	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
 
 # Python stdlib memory harness contracts and workload generator tests.
 preflight-harness:
@@ -56,10 +91,12 @@ native-lifecycle out="target/native-e2e-artifacts":
 
 # Current release build once, then private IME9+startup, collaboration18,
 # functional short resource gate (20 warmup +100 measured switches), and the
-# smoke/lifecycle drivers on that same binary, three gates at a time.
+# smoke/lifecycle drivers on that same binary, all five gates at once. Collaboration
+# runs 3 steps at a time and each driver is split over 2 Xvfb processes; 6 at once
+# starved apps of CPU here (startup and log-line timeouts), so raise these with care.
 # Optional args include --output FRESH_DIR and --build-receipt EXISTING_RECEIPT.
 native-acceptance *args:
-    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate all --jobs 3 {{ args }}
+    "{{ native_python }}" -B scripts/run_native_acceptance.py --gate all --jobs 5 --collaboration-jobs 3 --driver-shards 2 {{ args }}
 
 native-acceptance-build *args:
     "{{ native_python }}" -B scripts/run_native_acceptance.py --gate build {{ args }}

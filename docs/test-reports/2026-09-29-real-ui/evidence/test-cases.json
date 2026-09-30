@@ -1,0 +1,322 @@
+[
+  {
+    "id": "T01",
+    "category": "工作區",
+    "scenario": "載入 15 repo，切換來源／目的工作區",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "source15、target15、perf15 都顯示 15 個儲存庫。"
+  },
+  {
+    "id": "T02",
+    "category": "多 repo",
+    "scenario": "來源前綴未對應時禁止套用",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "未選 repo01 對應時 Apply 停用；選定後目的絕對路徑正確。"
+  },
+  {
+    "id": "T03",
+    "category": "多 repo",
+    "scenario": "不同 repo 同相對路徑各自覆寫",
+    "status": "FAIL",
+    "round": "本輪",
+    "result": "兩個 unrelated.txt 的第二個覆寫無法勾選；只套用第一份，第二份保留。BUG-01。"
+  },
+  {
+    "id": "T04",
+    "category": "多 repo",
+    "scenario": "跨 repo 選 4 檔／資料夾展開後貼到另一工作區",
+    "status": "PASS",
+    "round": "前輪 UI、本輪重核磁碟",
+    "result": "建立 2、覆寫 2，alpha/beta 各自落在正確 repo；其餘 13 repo 未受影響。"
+  },
+  {
+    "id": "T05",
+    "category": "Git 檔案",
+    "scenario": "staged 新增、修改、刪除、rename 一起貼上",
+    "status": "PASS",
+    "round": "前輪 UI、本輪重核磁碟",
+    "result": "5 路徑：建立 2、覆寫 1、刪除 2；rename 舊路徑消失。"
+  },
+  {
+    "id": "T06",
+    "category": "Git 檔案",
+    "scenario": "同檔 staged 與 working 內容不同",
+    "status": "PASS",
+    "round": "兩輪",
+    "result": "staged 複製取 index；Project 資料夾複製取 WORKTREE VERSION。"
+  },
+  {
+    "id": "T07",
+    "category": "檔案",
+    "scenario": "資料夾遞迴複製及通知",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "batch 資料夾：已複製 5 檔、略過 3 檔。"
+  },
+  {
+    "id": "T08",
+    "category": "檔案",
+    "scenario": "二進位與 UTF-16 檔案略過",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "未進可還原內容；目的原有 binary/UTF-16 位元組不變。"
+  },
+  {
+    "id": "T09",
+    "category": "檔案",
+    "scenario": "1,360,000-byte 大檔與 placeholder",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "產生 size-exceeds-limit placeholder，貼上不建立 large.txt。"
+  },
+  {
+    "id": "T10",
+    "category": "檔案",
+    "scenario": "零位元組檔案",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "empty.txt 確實建立且 size=0。"
+  },
+  {
+    "id": "T11",
+    "category": "檔案",
+    "scenario": "中文、空白路徑、CRLF 正規化",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "中文路徑與內容正確；CRLF→LF、前後空行／尾端 LF 移除符合既有契約。"
+  },
+  {
+    "id": "T12",
+    "category": "檔案",
+    "scenario": "逐檔取消及預設不覆寫",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "取消 new.txt；overwrite.txt 保留 DESTINATION KEEP；其餘 3 檔建立。"
+  },
+  {
+    "id": "T13",
+    "category": "檔案",
+    "scenario": "預覽後目的內容被外部修改",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "拒絕 Apply，保留新內容，沒有任何部分建立。"
+  },
+  {
+    "id": "T14",
+    "category": "貼上",
+    "scenario": "取消預覽不寫入／不建立 commit",
+    "status": "PASS",
+    "round": "兩輪",
+    "result": "Escape 取消；前輪 Git HEAD 不變，本輪可重新建立計畫。"
+  },
+  {
+    "id": "T15",
+    "category": "剪貼簿",
+    "scenario": "一般文字／無效 payload",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "使用原生輸入框 Cmd+C 複製測試文字，Paste 顯示格式無效，沒有寫入。"
+  },
+  {
+    "id": "T16",
+    "category": "檔案",
+    "scenario": "非 Git 資料夾作為目的地",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "選擇保留 repo01 前綴，建立 unrelated.txt 與 repo01/unrelated.txt，未建立 .git。"
+  },
+  {
+    "id": "T17",
+    "category": "Commit",
+    "scenario": "包含 SIDE 分支的非 first-parent 連續選取",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "4 個 commit 選取被拒絕，顯示 commits are not contiguous。"
+  },
+  {
+    "id": "T18",
+    "category": "Commit",
+    "scenario": "3 commits 重複修改已存在的同一路徑",
+    "status": "FAIL",
+    "round": "本輪",
+    "result": "common.txt 的第二個覆寫控件無效，整段無法重播。BUG-01。"
+  },
+  {
+    "id": "T19",
+    "category": "Commit",
+    "scenario": "3 commits 貼入 common.txt 尚不存在的另一 repo",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "真的建立 3 個新 SHA，git rev-list before..HEAD=3。"
+  },
+  {
+    "id": "T20",
+    "category": "Commit",
+    "scenario": "完整 message、作者、email、時間與時區",
+    "status": "PASS",
+    "round": "兩輪",
+    "result": "本輪 3 個逐一比對相等；多行中文訊息與空白行保留。"
+  },
+  {
+    "id": "T21",
+    "category": "Commit",
+    "scenario": "merge 以 first-parent 差異重播",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "來源 C3 為 merge，目的 commit 一個 parent，僅寫入 side.txt，沒有額外 SIDE commit。"
+  },
+  {
+    "id": "T22",
+    "category": "Commit",
+    "scenario": "rename、文字刪除、Unicode/emoji 內容",
+    "status": "PASS-WITH-UI-DEFECT",
+    "round": "兩輪",
+    "result": "舊檔消失、新檔及文字位元組正確；但 rename 預覽不完整，見 BUG-02。"
+  },
+  {
+    "id": "T23",
+    "category": "Commit",
+    "scenario": "目的地原有 staged／untracked 檔案保留",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "unrelated.txt index blob 不變，沒有混入重播 commits；local-only.txt 保留。"
+  },
+  {
+    "id": "T24",
+    "category": "Commit",
+    "scenario": "略過四種 hooks",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "pre-commit、prepare-commit-msg、commit-msg、post-commit 均設成 marker+exit1；重播成功且 marker 未出現。"
+  },
+  {
+    "id": "T25",
+    "category": "Commit",
+    "scenario": "來源二進位刪除",
+    "status": "FAIL-CONTRACT",
+    "round": "本輪",
+    "result": "payload notCopied=null，實際刪除 binary.dat；與 spec 4.2 不一致。BUG-03。"
+  },
+  {
+    "id": "T26",
+    "category": "Commit",
+    "scenario": "來源二進位新增",
+    "status": "PASS-WITH-UI-DEFECT",
+    "round": "本輪",
+    "result": "payload BINARY、實際略過，文字正常提交；預覽卻算成 CREATE。BUG-02。"
+  },
+  {
+    "id": "T27",
+    "category": "Commit",
+    "scenario": "同一 C4 重複貼上",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "產生兩個不同 SHA；第二個 tree 與前一個相同，確實為空 commit。"
+  },
+  {
+    "id": "T28",
+    "category": "Commit",
+    "scenario": "反向複製空 commit 到來源工作區",
+    "status": "PASS-WITH-UI-DEFECT",
+    "round": "本輪",
+    "result": "source15/repo05 多出 1 個空 commit；預覽缺 message/author/date。BUG-02。"
+  },
+  {
+    "id": "T29",
+    "category": "Commit",
+    "scenario": "取消部分檔案後拒絕整段重播",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "取消 side.txt 後拒絕 Apply，HEAD 與磁碟未變。"
+  },
+  {
+    "id": "T30",
+    "category": "Commit",
+    "scenario": "未確認覆寫時拒絕重播",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "缺任一覆寫確認即拒絕，沒有建立部分 commit。"
+  },
+  {
+    "id": "T31",
+    "category": "Commit",
+    "scenario": "目的父路徑被一般檔案擋住",
+    "status": "PASS-WITH-UI-DEFECT",
+    "round": "本輪",
+    "result": "安全拒絕，HEAD/status/阻擋檔內容不變；錯誤露出翻譯 key。BUG-05。"
+  },
+  {
+    "id": "T32",
+    "category": "歷史檔案",
+    "scenario": "Git 歷史刪除檔的單檔複製",
+    "status": "LIMITATION-ADDRESSED-ON-DEVELOP",
+    "round": "前輪 UI、本輪源碼確認",
+    "result": "167c10c 當時：Copy Files 停用；新增檔可複製，屬當時的明確實作限制。develop 068c467 的 #46（fa81aa9）已移除該排除，待實機重驗，見 LIMIT-01。"
+  },
+  {
+    "id": "T33",
+    "category": "歷史",
+    "scenario": "repo filter 與 regex message filter",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "^C[123] 正確留下 3 個 first-parent commits。"
+  },
+  {
+    "id": "T34",
+    "category": "歷史",
+    "scenario": "大歷史清單分頁",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "實際滾動觸發 50→100→150 筆載入。"
+  },
+  {
+    "id": "T35",
+    "category": "歷史",
+    "scenario": "搜尋未載入的第 500 個 commit",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "progressive enhancement 500 找到 d523d45，檔案預覽指出 commit 500。"
+  },
+  {
+    "id": "T36",
+    "category": "歷史",
+    "scenario": "15 repo 全部顯示時的訊息欄",
+    "status": "FAIL",
+    "round": "本輪",
+    "result": "1080×752 視窗下訊息欄消失；單 repo filter 後恢復。BUG-04。"
+  },
+  {
+    "id": "T37",
+    "category": "資源",
+    "scenario": "100 次真實 repo 切換",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "涵蓋 15 repo，100 次完成，最後回 repo01；無 crash/hang。"
+  },
+  {
+    "id": "T38",
+    "category": "資源",
+    "scenario": "連續 RSS／footprint／FD／thread 量測",
+    "status": "OBSERVATION",
+    "round": "本輪",
+    "result": "100 次前後 RSS 中位數 +3.469 MiB；不是 release gate 或無洩漏證明。"
+  },
+  {
+    "id": "T39",
+    "category": "生命週期",
+    "scenario": "關閉工作區、重新開啟、剪貼簿保留",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "關閉為 0 repo；重開單 repo 成功；前後 clipboard SHA256 相同。"
+  },
+  {
+    "id": "T40",
+    "category": "生命週期",
+    "scenario": "正常 Cmd+Q 退出",
+    "status": "PASS",
+    "round": "本輪",
+    "result": "App quit、PID 消失；384 個曾取樣到的子程序 PID 均不再存活。退出碼未取得。"
+  }
+]

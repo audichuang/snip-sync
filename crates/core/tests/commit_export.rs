@@ -452,7 +452,13 @@ fn legacy_bytes_metadata_and_replay_tree_match() {
 	);
 	dst.write("foreign.txt", b"staged\n");
 	dst.git(["add", "foreign.txt"]);
-	let result = snip_core::commits::replay(&dst.open(), &export.payload);
+	let result = snip_core::transfer::CommitReplayPreview::capture(
+		&dst.path(),
+		&export.payload,
+	)
+	.unwrap()
+	.apply()
+	.unwrap();
 	assert_eq!(result.failure, None, "{:?}", result.failure);
 	assert_eq!(result.created.len(), 4);
 	for (created, source) in result.created.iter().zip(&shas) {

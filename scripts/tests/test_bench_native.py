@@ -5,7 +5,7 @@ Tests:
 1. lavapipe ICD detection (multiarch / portable discovery).
 2. Control bounds parsing and CTRL_GONE retirement.
 3. xwininfo geometry and map state extraction.
-4. OCR token matching (must-have + any-of groups).
+4. Repo group expansion in the Changes list.
 5. Visible-in scroll direction with edge tolerance.
 6. Left tool window viewport derivation.
 7. Repo state validation against independent git oracle.
@@ -33,6 +33,7 @@ import warnings
 from contextlib import redirect_stderr
 from typing import Any
 import unittest
+from unittest import mock
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if SCRIPTS_DIR not in sys.path:
@@ -48,6 +49,7 @@ from bench_native_memory import (  # noqa: E402
     assert_current_basket_empty,
     check_repo_state,
     check_native_matched,
+    e2e_scaled,
     click_repo,
     open_repo_name,
     change_row_group,
@@ -59,8 +61,6 @@ from bench_native_memory import (  # noqa: E402
     lavapipe_icd,
     left_viewport,
     main as native_main,
-    ocr_check,
-    painted_title_token,
     parse_bounds,
     parse_repo_select,
     parse_xwininfo,
@@ -83,6 +83,27 @@ def require_or_skip(cond: bool, reason: str) -> None:
         return
     assert os.environ.get("SNIP_REQUIRE_ALL_TESTS") is None, reason
     raise unittest.SkipTest(reason)
+
+
+class TestE2eScaled(unittest.TestCase):
+    """The Xvfb display-number wait gave up at a fixed 60 s while a loaded machine was
+    still probing displays; Xvfb then died with "Cannot write display number"."""
+
+    def scaled(self, value: str | None) -> float:
+        env = {} if value is None else {"SNIP_E2E_TIMEOUT_SCALE": value}
+        with mock.patch.dict(os.environ, env, clear=False):
+            if value is None:
+                os.environ.pop("SNIP_E2E_TIMEOUT_SCALE", None)
+            return e2e_scaled(60.0)
+
+    def test_scale_stretches_the_wait(self) -> None:
+        self.assertEqual(self.scaled("2"), 120.0)
+        self.assertEqual(self.scaled("2.5"), 150.0)
+
+    def test_unusable_scale_keeps_the_wait(self) -> None:
+        for value in (None, "", "fast", "0.5", "0", "-3", "inf", "nan"):
+            with self.subTest(value=value):
+                self.assertEqual(self.scaled(value), 60.0)
 
 
 class TestLavapipeIcdDiscovery(unittest.TestCase):
@@ -186,63 +207,6 @@ xwininfo: Window id: 0x200001 "snip-desktop-native"
         malformed = "Absolute upper-left X: 100\nWidth: 500\n"
         with self.assertRaises(NativeBenchError):
             parse_xwininfo(malformed)
-
-
-class TestOcrCheck(unittest.TestCase):
-    def test_must_and_anyof_matches(self) -> None:
-        ocr_text = "snip-workload-standard-20260925\nrepo-01-core\nREADME.md\nchore: init repo base 20000"
-        must = ["repo-01-core", "README.md"]
-        any_of = {"history": ["init repo", "unrelated commit"]}
-        res = ocr_check(ocr_text, must, any_of)
-        self.assertTrue(res["ok"])
-        self.assertTrue(res["must"]["repo-01-core"])
-        self.assertTrue(res["must"]["README.md"])
-        self.assertTrue(res["anyOf"]["history"]["init repo"])
-
-    def test_must_missing_fails(self) -> None:
-        ocr_text = "repo-01-core\nREADME.md"
-        res = ocr_check(ocr_text, ["missing-title"], {})
-        self.assertFalse(res["ok"])
-
-    def test_anyof_group_empty_hits_fails(self) -> None:
-        ocr_text = "repo-01-core\nREADME.md"
-        res = ocr_check(ocr_text, ["repo-01-core"], {"history": ["nonexistent-sha"]})
-        self.assertFalse(res["ok"])
-
-
-class TestPaintedTitleToken(unittest.TestCase):
-    """Header ellipsis. The full leaf is still required when the slot can paint it."""
-
-    def test_short_leaves_stay_whole(self) -> None:
-        self.assertEqual(painted_title_token("repo-01-core"), "repo-01-core")
-        self.assertEqual(painted_title_token("empty-workspace"), "empty-workspace")
-        self.assertEqual(len(painted_title_token("x" * 21)), 21)
-
-    def test_long_leaf_is_the_prefix_this_binary_paints(self) -> None:
-        leaf = "snip-driver-small-fixture-20260926"
-        token = painted_title_token(leaf)
-        self.assertEqual(token, "snip-driver-small-fix")
-        self.assertTrue(leaf.startswith(token))
-        self.assertLess(len(token), len(leaf))
-
-    def test_observed_ocr_matches_prefix_and_rejects_the_full_leaf(self) -> None:
-        # tesseract --psm 11 of ready-15overview.png on the immutable D3 binary.
-        ocr_text = "B® snip-driver-small-fix.\nEi repo-01-core ~\nsrc/staged_and_working.ts"
-        leaf = "snip-driver-small-fixture-20260926"
-        prefix = painted_title_token(leaf)
-        hit = ocr_check(ocr_text, [prefix, "repo-01-core", "src/staged_and_working.ts"], {})
-        self.assertTrue(hit["ok"])
-        self.assertTrue(hit["must"][prefix])
-        missed = ocr_check(ocr_text, [leaf], {})
-        self.assertFalse(missed["ok"])
-        self.assertFalse(missed["must"][leaf])
-
-    def test_different_long_leaf_does_not_match_this_frame(self) -> None:
-        ocr_text = "B® snip-driver-small-fix."
-        other = painted_title_token("snip-driver-other-fixture-20260926")
-        res = ocr_check(ocr_text, [other], {})
-        self.assertFalse(res["ok"])
-        self.assertFalse(res["must"][other])
 
 
 class TestVisibleIn(unittest.TestCase):
@@ -956,7 +920,6 @@ class TestDriverEndToEndRegression(unittest.TestCase):
                      "newestCommits": ["1234567", "commit msg"],
                  }), \
                  patch("bench_native_memory.wait_repo_loaded", return_value=(1.0, 1.1)), \
-                 patch("bench_native_memory.preview_lines", return_value=["# Original expected disk bytes"]), \
                  patch("bench_native_memory.copy_explicit_selection", side_effect=fake_copy), \
                  patch("bench_native_memory.check_repo_state", return_value={
                      "changedFiles": 1, "historyRows": 1, "previewPath": "README.md",
@@ -1507,7 +1470,7 @@ class TestForegroundClipboardOwner(unittest.TestCase):
         xvfb_log = open(os.path.join(log_dir, "xvfb.log"), "wb")
         read_fd, write_fd = os.pipe()
         xvfb = subprocess.Popen(
-            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "640x480x24", "-nolisten", "tcp"],
+            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "640x480x24", "-nolisten", "tcp", "-noreset"],
             pass_fds=(write_fd,), stdout=xvfb_log, stderr=xvfb_log, start_new_session=True,
         )
         os.close(write_fd)

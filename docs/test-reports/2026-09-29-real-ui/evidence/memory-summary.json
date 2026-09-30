@@ -1,0 +1,322 @@
+{
+  "samples": 4060,
+  "liveSamples": 4059,
+  "durationSec": 2049.0,
+  "rootAliveUntilFinalSample": true,
+  "terminationObserved": true,
+  "sampleIntervalSec": {
+    "median": 0.5051,
+    "p95": 0.5053,
+    "max": 0.5103
+  },
+  "overallSampledTreePeakMiB": 141.438,
+  "phases": {
+    "existing-warm-idle": {
+      "samples": 69,
+      "terminationEventsExcluded": 0,
+      "durationSec": 34.35,
+      "treeRssMiB": {
+        "median": 129.719,
+        "p95": 129.719,
+        "peak": 129.719,
+        "first": 129.719,
+        "last": 129.719
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": true,
+      "durationAtLeast30s": true
+    },
+    "expanded-commit-tests": {
+      "samples": 1202,
+      "terminationEventsExcluded": 0,
+      "durationSec": 606.25,
+      "treeRssMiB": {
+        "median": 131.203,
+        "p95": 132.109,
+        "peak": 137.047,
+        "first": 129.719,
+        "last": 131.375
+      },
+      "maxProcesses": 5,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": true
+    },
+    "file-matrix-tests": {
+      "samples": 953,
+      "terminationEventsExcluded": 0,
+      "durationSec": 480.47,
+      "treeRssMiB": {
+        "median": 132.062,
+        "p95": 134.25,
+        "peak": 137.906,
+        "first": 131.375,
+        "last": 132.172
+      },
+      "maxProcesses": 5,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": true
+    },
+    "perf15-load": {
+      "samples": 105,
+      "terminationEventsExcluded": 0,
+      "durationSec": 52.51,
+      "treeRssMiB": {
+        "median": 132.812,
+        "p95": 135.031,
+        "peak": 137.422,
+        "first": 132.172,
+        "last": 133.016
+      },
+      "maxProcesses": 3,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": true
+    },
+    "perf15-baseline-idle": {
+      "samples": 126,
+      "terminationEventsExcluded": 0,
+      "durationSec": 63.12,
+      "treeRssMiB": {
+        "median": 132.75,
+        "p95": 133.016,
+        "peak": 133.016,
+        "first": 133.016,
+        "last": 132.703
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": true,
+      "durationAtLeast30s": true
+    },
+    "perf15-switch-100": {
+      "samples": 609,
+      "terminationEventsExcluded": 0,
+      "durationSec": 306.8,
+      "treeRssMiB": {
+        "median": 136.219,
+        "p95": 137.484,
+        "peak": 141.438,
+        "first": 132.703,
+        "last": 136.219
+      },
+      "maxProcesses": 3,
+      "rootCpuPercentMedian": 0.4,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": true
+    },
+    "perf15-after100-idle": {
+      "samples": 104,
+      "terminationEventsExcluded": 0,
+      "durationSec": 52.02,
+      "treeRssMiB": {
+        "median": 136.219,
+        "p95": 136.219,
+        "peak": 136.219,
+        "first": 136.219,
+        "last": 136.219
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": true,
+      "durationAtLeast30s": true
+    },
+    "perf15-log-navigation": {
+      "samples": 241,
+      "terminationEventsExcluded": 0,
+      "durationSec": 121.19,
+      "treeRssMiB": {
+        "median": 138.328,
+        "p95": 138.391,
+        "peak": 139.672,
+        "first": 136.219,
+        "last": 138.328
+      },
+      "maxProcesses": 3,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": true
+    },
+    "workspace-close-transition": {
+      "samples": 96,
+      "terminationEventsExcluded": 0,
+      "durationSec": 47.98,
+      "treeRssMiB": {
+        "median": 138.328,
+        "p95": 138.391,
+        "peak": 138.391,
+        "first": 138.328,
+        "last": 138.297
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": true
+    },
+    "workspace-closed-idle": {
+      "samples": 156,
+      "terminationEventsExcluded": 0,
+      "durationSec": 78.27,
+      "treeRssMiB": {
+        "median": 138.297,
+        "p95": 138.359,
+        "peak": 138.359,
+        "first": 138.297,
+        "last": 138.297
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": true,
+      "durationAtLeast30s": true
+    },
+    "one-repo-load": {
+      "samples": 65,
+      "terminationEventsExcluded": 0,
+      "durationSec": 32.32,
+      "treeRssMiB": {
+        "median": 138.328,
+        "p95": 138.422,
+        "peak": 138.422,
+        "first": 138.297,
+        "last": 138.297
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": true
+    },
+    "one-repo-warm-idle": {
+      "samples": 109,
+      "terminationEventsExcluded": 0,
+      "durationSec": 54.55,
+      "treeRssMiB": {
+        "median": 138.047,
+        "p95": 138.25,
+        "peak": 138.297,
+        "first": 138.297,
+        "last": 138.047
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": true,
+      "durationAtLeast30s": true
+    },
+    "non-git-folder-tests": {
+      "samples": 197,
+      "terminationEventsExcluded": 0,
+      "durationSec": 98.98,
+      "treeRssMiB": {
+        "median": 138.516,
+        "p95": 138.578,
+        "peak": 138.594,
+        "first": 138.047,
+        "last": 138.484
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.3,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": true
+    },
+    "final-before-quit": {
+      "samples": 27,
+      "terminationEventsExcluded": 1,
+      "durationSec": 13.12,
+      "treeRssMiB": {
+        "median": 138.484,
+        "p95": 138.484,
+        "peak": 138.484,
+        "first": 138.484,
+        "last": 138.484
+      },
+      "maxProcesses": 1,
+      "rootCpuPercentMedian": 0.2,
+      "lastProcessCount": 1,
+      "phaseIsIdle": false,
+      "durationAtLeast30s": false
+    }
+  },
+  "physicalFootprintSnapshots": {
+    "vmmap-perf15-baseline": {
+      "Physical footprint": "76.4M",
+      "Physical footprint (peak)": "104.0M"
+    },
+    "vmmap-workspace-closed": {
+      "Physical footprint": "81.5M",
+      "Physical footprint (peak)": "109.0M"
+    },
+    "vmmap-perf15-afteridle": {
+      "Physical footprint": "79.8M",
+      "Physical footprint (peak)": "106.9M"
+    },
+    "vmmap-perf15-after100": {
+      "Physical footprint": "79.8M",
+      "Physical footprint (peak)": "106.9M"
+    },
+    "vmmap-initial": {
+      "Physical footprint": "74.5M",
+      "Physical footprint (peak)": "100.8M"
+    },
+    "vmmap-after-functional": {
+      "Physical footprint": "75.5M",
+      "Physical footprint (peak)": "104.0M"
+    },
+    "vmmap-one-repo": {
+      "Physical footprint": "81.5M",
+      "Physical footprint (peak)": "109.0M"
+    },
+    "vmmap-final": {
+      "Physical footprint": "81.8M",
+      "Physical footprint (peak)": "109.0M"
+    }
+  },
+  "resources": {
+    "perf15-baseline": {
+      "numericFileDescriptors": 5,
+      "threads": 7
+    },
+    "perf15-after100": {
+      "numericFileDescriptors": 5,
+      "threads": 5
+    },
+    "perf15-afteridle": {
+      "numericFileDescriptors": 5,
+      "threads": 5
+    },
+    "workspace-closed": {
+      "numericFileDescriptors": 5,
+      "threads": 6
+    },
+    "one-repo": {
+      "numericFileDescriptors": 5,
+      "threads": 5
+    },
+    "final": {
+      "numericFileDescriptors": 5,
+      "threads": 5
+    }
+  },
+  "caveats": [
+    "macOS ps RSS KiB, summed live sampled descendants; not Linux PSS",
+    "Warm attached PID, no launch measurement, filesystem cache uncontrolled",
+    "500ms discrete process snapshots may miss short-lived Git processes",
+    "vmmap footprint snapshots separate; lifetime peak includes earlier app usage",
+    "CPU ps %cpu is decayed estimate, not task CPU-seconds",
+    "Nominal 100 repo switches plus final return, expanded-tree state retained",
+    "These measurements do not certify Linux release memory budgets or absence of leaks"
+  ]
+}
