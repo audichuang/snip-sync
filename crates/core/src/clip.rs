@@ -95,6 +95,10 @@ mod tests {
 			&& unset("DISPLAY")
 			&& unset("WAYLAND_DISPLAY")
 		{
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"clipboard tests need DISPLAY or WAYLAND_DISPLAY"
+			);
 			eprintln!("skipping clipboard test: no DISPLAY or WAYLAND_DISPLAY");
 			return false;
 		}

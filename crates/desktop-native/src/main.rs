@@ -614,7 +614,7 @@ fn read_change_list(
 	// status feeds both the list and the repo's summary.
 	let (summary, details) = match known {
 		Some(id) => {
-			let git = Git::at_known_root(id.toplevel.clone());
+			let git = Git::at_known_root(id);
 			let (summary, details) = summarize_with_details(&git, id, &opts)
 				.map_err(|e| e.to_string())?;
 			(Some(summary), details)
@@ -2298,6 +2298,61 @@ impl WorkbenchModel {
 				{
 					r.name = format!("{}/{}", parent.to_string_lossy(), r.name);
 				}
+			}
+		}
+
+		// 第二輪：workspace root 的寫法不是 git 解析後的 toplevel（例如 symlink），或 repo 在 workspace 外，而且上一層資料夾同名。
+		fn root_tail(root: &std::path::Path, k: usize) -> String {
+			let normals: Vec<String> = root
+				.components()
+				.filter_map(|c| match c {
+					std::path::Component::Normal(p) => {
+						Some(p.to_string_lossy().into_owned())
+					}
+					_ => None,
+				})
+				.collect();
+			if k >= normals.len() {
+				root.display().to_string()
+			} else {
+				normals[normals.len() - k..].join("/")
+			}
+		}
+
+		for k in 3.. {
+			let mut round_counts: HashMap<String, usize> = HashMap::new();
+			for r in repos.iter() {
+				*round_counts.entry(r.name.clone()).or_insert(0) += 1;
+			}
+			let dup_indices: Vec<usize> = repos
+				.iter()
+				.enumerate()
+				.filter(|(_, r)| {
+					round_counts.get(&r.name).copied().unwrap_or(0) > 1
+				})
+				.map(|(i, _)| i)
+				.collect();
+			if dup_indices.is_empty() {
+				break;
+			}
+			let max_normals = dup_indices
+				.iter()
+				.map(|&i| {
+					repos[i]
+						.root
+						.components()
+						.filter(|c| {
+							matches!(c, std::path::Component::Normal(_))
+						})
+						.count()
+				})
+				.max()
+				.unwrap_or(0);
+			if max_normals < k {
+				break;
+			}
+			for &i in &dup_indices {
+				repos[i].name = root_tail(&repos[i].root, k);
 			}
 		}
 	}
@@ -6453,6 +6508,191 @@ mod tests {
 			assert_log_layout(&m, 160.);
 		}
 
+		#[cfg(unix)]
+		#[gpui::test]
+		fn merged_log_same_name_repos_get_distinct_ids_and_filters(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let real = tmp.path().join("real");
+			fs::create_dir_all(real.join("x/svc")).unwrap();
+			let x = repo(&real.join("x/svc"), "app", &[]);
+			fs::create_dir_all(real.join("y/svc")).unwrap();
+			git(
+				&real.join("y/svc"),
+				&["clone", "-q", x.to_str().unwrap(), "app"],
+			);
+			std::os::unix::fs::symlink(&real, tmp.path().join("link")).unwrap();
+
+			let out = Command::new("git")
+				.current_dir(&x)
+				.args(["rev-parse", "HEAD"])
+				.output()
+				.expect("git rev-parse HEAD");
+			assert!(out.status.success(), "git rev-parse HEAD: {out:?}");
+			let head = String::from_utf8(out.stdout).expect("utf8");
+			let sha7 = head.trim()[..7].to_string();
+
+			let (model, cx) = open(cx, tmp.path().join("link"), None);
+			model.update(cx, |m, _| {
+				m.probes = Some(crate::ui::Probes::for_test());
+			});
+			for _ in 0..2 {
+				cx.update(|w, _| w.refresh());
+				settle(cx);
+			}
+
+			let mut fails: Vec<String> = Vec::new();
+
+			let (repo_names, feed_names, is_merged, feeds_len, ids) = model
+				.read_with(cx, |m, _| {
+					let repo_names: Vec<String> =
+						m.repos.iter().map(|r| r.name.clone()).collect();
+					let feed_names: Vec<String> =
+						m.log_feeds.iter().map(|f| f.name.clone()).collect();
+					let is_merged = m.log_is_merged();
+					let feeds_len = m.log_feeds.len();
+					let ids = m.probes.as_ref().unwrap().drawn();
+					(repo_names, feed_names, is_merged, feeds_len, ids)
+				});
+
+			let rel_drawn_ids: Vec<String> = ids
+				.iter()
+				.filter(|id| {
+					id.starts_with("root-stripe:")
+						|| id.starts_with("commit-row:")
+						|| id.starts_with("log-repo:")
+				})
+				.cloned()
+				.collect();
+
+			// (a) m.log_is_merged(), m.log_feeds.len() == 2, m.log_feeds[0].name != m.log_feeds[1].name,
+			// 而且 m.repos 的名稱兩兩不同。
+			if !is_merged {
+				fails.push(format!(
+					"(a) expected log_is_merged() == true; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}"
+				));
+			}
+			if feeds_len != 2 {
+				fails.push(format!(
+					"(a) expected 2 log_feeds, found {feeds_len}; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}"
+				));
+			}
+			if feeds_len >= 2 && feed_names[0] == feed_names[1] {
+				fails.push(format!(
+					"(a) expected distinct log_feed names, but both are '{}'; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}",
+					feed_names[0]
+				));
+			}
+			let mut unique_repos = repo_names.clone();
+			unique_repos.sort();
+			unique_repos.dedup();
+			if unique_repos.len() != repo_names.len() {
+				fails.push(format!(
+					"(a) expected pairwise distinct repo names, but found duplicates: {repo_names:?}; feeds={feed_names:?}, drawn={rel_drawn_ids:?}"
+				));
+			}
+
+			// (b) probe ids
+			let sha_suffix = format!(":{sha7}");
+			let root_stripes: Vec<_> = ids
+				.iter()
+				.filter(|id| {
+					id.starts_with("root-stripe:") && id.ends_with(&sha_suffix)
+				})
+				.cloned()
+				.collect();
+			if root_stripes.len() != 2 {
+				fails.push(format!(
+					"(b) expected 2 root-stripe IDs ending with '{sha_suffix}', found {}: {root_stripes:?}; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}",
+					root_stripes.len()
+				));
+			}
+
+			let commit_rows: Vec<_> = ids
+				.iter()
+				.filter(|id| {
+					if let Some(rest) = id.strip_prefix("commit-row:") {
+						rest.contains(':') && id.ends_with(&sha_suffix)
+					} else {
+						false
+					}
+				})
+				.cloned()
+				.collect();
+			if commit_rows.len() != 2 {
+				fails.push(format!(
+					"(b) expected 2 commit-row IDs with repo prefix ending with '{sha_suffix}', found {}: {commit_rows:?}; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}",
+					commit_rows.len()
+				));
+			}
+
+			// (c) 從 m.repos 找出 root.ends_with(x/svc/app)，toggle_log_path，settle，檢查 feeds
+			let repo_x = model.read_with(cx, |m, _| {
+				m.repos
+					.iter()
+					.find(|r| {
+						r.root.ends_with(std::path::Path::new("x/svc/app"))
+					})
+					.map(|r| (r.name.clone(), r.root.clone()))
+			});
+
+			if let Some((name_x, root_x)) = repo_x {
+				model.update(cx, |m, cx| {
+					m.toggle_log_path(format!("{name_x}/base.txt"), cx);
+				});
+				settle(cx);
+
+				model.read_with(cx, |m, _| {
+					let cur_feed_names: Vec<String> =
+						m.log_feeds.iter().map(|f| f.name.clone()).collect();
+					let cur_repo_names: Vec<String> =
+						m.repos.iter().map(|r| r.name.clone()).collect();
+					let cur_drawn = m
+						.probes
+						.as_ref()
+						.map(|p| p.drawn())
+						.unwrap_or_default();
+					let cur_rel_ids: Vec<String> = cur_drawn
+						.iter()
+						.filter(|id| {
+							id.starts_with("root-stripe:")
+								|| id.starts_with("commit-row:")
+								|| id.starts_with("log-repo:")
+						})
+						.cloned()
+						.collect();
+
+					if m.log_feeds.len() != 1 {
+						fails.push(format!(
+							"(c) expected log_feeds.len() == 1, found {}; repos={cur_repo_names:?}, feeds={cur_feed_names:?}, paths={:?}, drawn={cur_rel_ids:?}",
+							m.log_feeds.len(),
+							m.log_feeds.iter().map(|f| &f.paths).collect::<Vec<_>>(),
+						));
+					}
+					if m.log_feeds.first().map(|f| &f.root) != Some(&root_x) {
+						fails.push(format!(
+							"(c) expected log_feeds[0].root == {root_x:?}, found {:?}; repos={cur_repo_names:?}, feeds={cur_feed_names:?}, drawn={cur_rel_ids:?}",
+							m.log_feeds.first().map(|f| &f.root),
+						));
+					}
+					let expected_paths = vec!["base.txt".to_string()];
+					if m.log_feeds.first().map(|f| &f.paths) != Some(&expected_paths) {
+						fails.push(format!(
+							"(c) expected log_feeds[0].paths == [\"base.txt\"], found {:?}; repos={cur_repo_names:?}, feeds={cur_feed_names:?}, drawn={cur_rel_ids:?}",
+							m.log_feeds.first().map(|f| &f.paths),
+						));
+					}
+				});
+			} else {
+				fails.push(format!(
+					"(c) could not find repo ending with 'x/svc/app'; repos={repo_names:?}, feeds={feed_names:?}, drawn={rel_drawn_ids:?}"
+				));
+			}
+
+			assert!(fails.is_empty(), "{fails:#?}");
+		}
+
 		#[gpui::test]
 		fn alt_1_and_alt_0_switch_between_project_and_changes(
 			cx: &mut TestAppContext,
@@ -8026,6 +8266,58 @@ mod tests {
 		assert_eq!(repos[0].name, "a/core");
 		assert_eq!(repos[1].name, "b/core");
 		assert_eq!(repos[2].name, "other");
+	}
+
+	#[test]
+	fn test_disambiguate_repo_names_when_root_does_not_strip() {
+		let mut repos1 = vec![
+			RepoEntry {
+				root: PathBuf::from("/real/x/svc/app"),
+				name: "app".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+			RepoEntry {
+				root: PathBuf::from("/real/y/svc/app"),
+				name: "app".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+			RepoEntry {
+				root: PathBuf::from("/real/z/other"),
+				name: "other".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+		];
+		let ws = PathBuf::from("/link");
+		WorkbenchModel::disambiguate_repo_names(&mut repos1, &ws);
+		assert_eq!(repos1[0].name, "x/svc/app");
+		assert_eq!(repos1[1].name, "y/svc/app");
+		assert_eq!(repos1[2].name, "other");
+
+		let mut repos2 = vec![
+			RepoEntry {
+				root: PathBuf::from("/real/p/x/svc/app"),
+				name: "app".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+			RepoEntry {
+				root: PathBuf::from("/real/q/x/svc/app"),
+				name: "app".to_string(),
+				kind: RepoEntryKind::Main,
+				identity: None,
+				summary: Err("mock".into()),
+			},
+		];
+		WorkbenchModel::disambiguate_repo_names(&mut repos2, &ws);
+		assert_eq!(repos2[0].name, "p/x/svc/app");
+		assert_eq!(repos2[1].name, "q/x/svc/app");
 	}
 
 	#[test]

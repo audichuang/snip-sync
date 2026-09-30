@@ -1708,7 +1708,7 @@ impl PastePreviewPlan {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use super::*;
 
 	#[test]
