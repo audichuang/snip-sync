@@ -1247,7 +1247,9 @@ class NativeSession:
         read_fd, write_fd = os.pipe()
         self._pipe_fds.extend((read_fd, write_fd))
         self.xvfb = subprocess.Popen(
-            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", SCREEN, "-nolisten", "tcp"],
+            # -noreset: a server reset when the last client leaves kills a client still in its
+            # handshake (see scripts/headless-x11.sh).
+            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", SCREEN, "-nolisten", "tcp", "-noreset"],
             pass_fds=(write_fd,), stdout=self.xvfb_log, stderr=self.xvfb_log, start_new_session=True,
         )
         self._close_fd(write_fd)

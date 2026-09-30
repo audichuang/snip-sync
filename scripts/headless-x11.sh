@@ -43,7 +43,12 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 143' TERM INT
-Xvfb -displayfd 3 -screen 0 1280x900x24 -nolisten tcp 3>"$tmp/display" 2>"$tmp/xvfb.log" &
+# -noreset: by default the server resets when its last running client leaves, and the reset
+# closes every client still in its connection handshake (dix KillAllClients). A test's app
+# connecting while one short `xdotool search` disconnects then dies in XCBConnection::connect
+# with "Unknown connection error" (lifecycle, CI run 36655200964). check_native_ime.py
+# passes it for the same reason.
+Xvfb -displayfd 3 -screen 0 1280x900x24 -nolisten tcp -noreset 3>"$tmp/display" 2>"$tmp/xvfb.log" &
 xvfb=$!
 for _ in $(seq 1 600); do
 	[ -s "$tmp/display" ] && break

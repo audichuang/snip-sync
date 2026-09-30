@@ -1470,7 +1470,7 @@ class TestForegroundClipboardOwner(unittest.TestCase):
         xvfb_log = open(os.path.join(log_dir, "xvfb.log"), "wb")
         read_fd, write_fd = os.pipe()
         xvfb = subprocess.Popen(
-            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "640x480x24", "-nolisten", "tcp"],
+            ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "640x480x24", "-nolisten", "tcp", "-noreset"],
             pass_fds=(write_fd,), stdout=xvfb_log, stderr=xvfb_log, start_new_session=True,
         )
         os.close(write_fd)
