@@ -1124,6 +1124,9 @@ pub struct FilePlan {
 	pub action: ReplayAction,
 	/// The target exists now: a write overwrites, a delete removes it.
 	pub existed: bool,
+	/// A rename's old path exists once the earlier commits of the batch are
+	/// replayed, so the preview can tell a real deletion from a no-op.
+	pub old_existed: bool,
 	pub not_copied: Option<NotCopiedReason>,
 	pub skip_reason: Option<ReplaySkipReason>,
 	pub layout_conflict: Option<LayoutConflict>,
@@ -1219,7 +1222,10 @@ impl CommitReplayPlan {
 /// A repo-relative path that passes the restore path rules. Anything the
 /// resolver would rewrite (absolute, root-labelled, `./`) is refused: git
 /// only ever produces plain relative paths.
-fn target(root: &Path, path: &str) -> Option<PathBuf> {
+///
+/// A parent the batch's earlier commits already replaced (`layout` holds an
+/// override for it) is no longer the symlink the disk may still show.
+fn target(root: &Path, path: &str, layout: &PlannedLayout) -> Option<PathBuf> {
 	// Like git ("beyond a symbolic link"), refuse paths whose parent
 	// directories go through a symlink: containment alone would let the
 	// write or delete land on another tracked path.
@@ -1227,7 +1233,7 @@ fn target(root: &Path, path: &str) -> Option<PathBuf> {
 	let parents = path.split('/').collect::<Vec<_>>();
 	for segment in &parents[..parents.len().saturating_sub(1)] {
 		dir.push(segment);
-		if is_symlink(&dir) {
+		if !layout.overrides.contains_key(&dir) && is_symlink(&dir) {
 			return None;
 		}
 	}
@@ -1244,6 +1250,7 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 		change: f.change,
 		action: ReplayAction::Skip,
 		existed: false,
+		old_existed: false,
 		not_copied: f.not_copied,
 		skip_reason: None,
 		layout_conflict: None,
@@ -1258,16 +1265,23 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 		plan.skip_reason = Some(ReplaySkipReason::NotCopied);
 		return plan;
 	}
-	let old = f.old_path.as_deref().map(|p| target(root, p));
-	let (Some(abs), None | Some(Some(_))) = (target(root, &f.path), &old)
+	let old = f.old_path.as_deref().map(|p| target(root, p, layout));
+	let (Some(abs), None | Some(Some(_))) =
+		(target(root, &f.path, layout), &old)
 	else {
 		plan.skip_reason = Some(ReplaySkipReason::UnsafePath);
 		return plan;
 	};
 	// A symlink is replaced, not written through: its target is irrelevant.
 	// Keep the path on a non-UTF-8 skip so freshness can see that exact file
-	// without inventing a second planner.
-	if !deleted && !is_symlink(&abs) && must_not_overwrite(&abs) {
+	// without inventing a second planner. An earlier commit of the batch may
+	// have deleted a symlink or non-UTF-8 file here (the layout holds an
+	// override for the path), so only an untouched path is checked on disk.
+	if !deleted
+		&& !layout.overrides.contains_key(&abs)
+		&& !is_symlink(&abs)
+		&& must_not_overwrite(&abs)
+	{
 		plan.skip_reason = Some(ReplaySkipReason::NonUtf8Target);
 		plan.existed = abs.exists();
 		plan.absolute_path = Some(abs);
@@ -1288,6 +1302,10 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 	};
 	plan.absolute_path = Some(abs);
 	plan.old_absolute_path = old.flatten();
+	plan.old_existed = plan
+		.old_absolute_path
+		.as_deref()
+		.is_some_and(|o| layout.exists(o));
 	plan
 }
 
@@ -1318,11 +1336,16 @@ enum Node {
 /// otherwise. Empty, it is the plain disk (what `replay_commit` plans against).
 ///
 /// Only the layout is simulated. Symlink checks in `target` and
-/// `must_not_overwrite` stay on the real disk: a payload carries neither
-/// symlinks nor non-UTF-8 files, so no earlier commit can change them.
+/// `must_not_overwrite` stay on the real disk, except for a path with an
+/// override: a payload creates neither symlinks nor non-UTF-8 files, but an
+/// earlier commit can delete one, and what is left there is then a regular
+/// file or nothing.
 #[derive(Debug, Default)]
 struct PlannedLayout {
 	overrides: std::collections::HashMap<PathBuf, Node>,
+	/// The non-absent overrides, by parent directory.
+	added:
+		std::collections::HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
 }
 
 impl PlannedLayout {
@@ -1349,13 +1372,36 @@ impl PlannedLayout {
 		}
 	}
 
+	fn set(&mut self, path: &Path, node: Node) {
+		self.overrides.insert(path.to_path_buf(), node);
+		let Some(parent) = path.parent() else {
+			return;
+		};
+		if node == Node::Absent {
+			if let Some(set) = self.added.get_mut(parent) {
+				set.remove(path);
+			}
+		} else {
+			self.added
+				.entry(parent.to_path_buf())
+				.or_default()
+				.insert(path.to_path_buf());
+		}
+	}
+
 	/// The entries of `dir`: disk entries minus those overridden as absent,
 	/// plus overridden entries directly inside it.
 	fn children(&self, dir: &Path) -> Vec<(PathBuf, Node)> {
 		let mut out: std::collections::HashMap<PathBuf, Node> =
 			std::collections::HashMap::new();
 		if let Ok(entries) = fs::read_dir(dir) {
-			for entry in entries.flatten() {
+			for entry in entries {
+				let Ok(entry) = entry else {
+					// An unreadable entry counts as a live file nobody deletes,
+					// so `dir` is never taken for empty.
+					out.insert(dir.join("<unreadable entry>"), Node::File);
+					continue;
+				};
 				let node = match entry.file_type() {
 					Ok(t) if t.is_dir() => Node::Dir,
 					_ => Node::File,
@@ -1363,13 +1409,27 @@ impl PlannedLayout {
 				out.insert(entry.path(), node);
 			}
 		}
-		for (path, &node) in &self.overrides {
-			if path.parent() == Some(dir) {
-				out.insert(path.clone(), node);
-			}
+		out.retain(|path, _| self.overrides.get(path) != Some(&Node::Absent));
+		for path in self.added.get(dir).into_iter().flatten() {
+			out.insert(path.clone(), self.overrides[path]);
 		}
-		out.retain(|_, n| *n != Node::Absent);
 		out.into_iter().collect()
+	}
+
+	/// Whether `dir` still holds an entry. Stops at the first live one.
+	fn has_children(&self, dir: &Path) -> bool {
+		if self.added.get(dir).is_some_and(|set| !set.is_empty()) {
+			return true;
+		}
+		let Ok(entries) = fs::read_dir(dir) else {
+			return false;
+		};
+		entries.into_iter().any(|entry| match entry {
+			Ok(entry) => {
+				self.overrides.get(&entry.path()) != Some(&Node::Absent)
+			}
+			Err(_) => true,
+		})
 	}
 
 	/// Records what replaying `files` leaves behind, in replay's order:
@@ -1377,41 +1437,49 @@ impl PlannedLayout {
 	/// they empty, then the writes with their parent directories.
 	fn apply(&mut self, root: &Path, files: &[FilePlan]) {
 		let live = files.iter().filter(|f| f.action != ReplayAction::Skip);
+		// All files go first and the emptied parents are walked afterwards:
+		// the final set does not depend on the order, and each directory is
+		// read once per walk instead of once per removed file.
+		let mut parents = Vec::new();
 		for f in live.clone() {
 			let del = (f.action == ReplayAction::Delete)
 				.then_some(f.absolute_path.as_deref())
 				.flatten();
 			for abs in f.old_absolute_path.as_deref().into_iter().chain(del) {
-				self.remove(root, abs);
+				if self.node(abs) == Node::File {
+					self.set(abs, Node::Absent);
+					parents.extend(abs.parent());
+				}
 			}
+		}
+		parents.sort_unstable();
+		parents.dedup();
+		for parent in parents {
+			self.prune_empty(root, parent);
 		}
 		for f in live.filter(|f| f.action == ReplayAction::Write) {
 			let Some(abs) = f.absolute_path.as_deref() else {
 				continue;
 			};
-			self.overrides.insert(abs.to_path_buf(), Node::File);
+			self.set(abs, Node::File);
 			for a in abs.ancestors().skip(1) {
 				if a == root || !a.starts_with(root) {
 					break;
 				}
-				self.overrides.insert(a.to_path_buf(), Node::Dir);
+				self.set(a, Node::Dir);
 			}
 		}
 	}
 
-	/// Mirrors `delete`: only a removed file walks up, dropping each parent it
+	/// Mirrors `delete`: a removed file walks up, dropping each parent it
 	/// leaves empty; the root stays.
-	fn remove(&mut self, root: &Path, abs: &Path) {
-		if self.node(abs) != Node::File {
-			return;
-		}
-		self.overrides.insert(abs.to_path_buf(), Node::Absent);
-		let mut dir = abs.parent();
+	fn prune_empty(&mut self, root: &Path, from: &Path) {
+		let mut dir = Some(from);
 		while let Some(d) = dir.filter(|d| *d != root && d.starts_with(root)) {
-			if !self.children(d).is_empty() {
+			if self.node(d) != Node::Dir || self.has_children(d) {
 				break;
 			}
-			self.overrides.insert(d.to_path_buf(), Node::Absent);
+			self.set(d, Node::Absent);
 			dir = d.parent();
 		}
 	}
@@ -2487,9 +2555,185 @@ mod tests {
 		let plan = plan_commit_replay(&g, &payload);
 		assert_eq!(plan.commits[1].refused_by(), None);
 		assert_eq!(plan.commits[1].files[0].layout_conflict, None);
-		let result = replay(&g, &payload);
+		// The real path captures a freshness snapshot first, which meets the
+		// directory still standing at `d`.
+		let preview = crate::transfer::CommitReplayPreview::capture(
+			&dst.path(),
+			&payload,
+		)
+		.expect("a directory at a replay target is not a special file");
+		let result = preview.apply().expect("preview stays fresh");
+		assert_eq!(result.failure, None);
 		assert_eq!(result.created.len(), 2);
 		assert!(dst.path().join("d").is_file());
+	}
+
+	#[test]
+	fn batch_plan_keeps_overwrite_consent_on_the_real_disk() {
+		let dst = Repo::new("main");
+		dst.write("a.txt", b"old\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = CommitsPayload {
+			commits: vec![
+				batch_commit(
+					"delete",
+					vec![batch_file("a.txt", FileChange::Deleted)],
+				),
+				batch_commit(
+					"re-add",
+					vec![batch_file("a.txt", FileChange::Added)],
+				),
+			],
+		};
+		let plan = plan_commit_replay(&dst.open(), &payload);
+		assert!(plan.commits[0].files[0].existed);
+		assert!(
+			plan.commits[1].files[0].existed,
+			"a file on disk before the replay still needs overwrite consent"
+		);
+	}
+
+	#[test]
+	fn batch_plan_rename_of_a_file_an_earlier_commit_adds_removes_it() {
+		let dst = Repo::new("main");
+		dst.write("keep.txt", b"keep\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let mut rename = batch_file("b.txt", FileChange::Renamed);
+		rename.old_path = Some("a.txt".into());
+		let payload = CommitsPayload {
+			commits: vec![
+				batch_commit(
+					"add",
+					vec![batch_file("a.txt", FileChange::Added)],
+				),
+				batch_commit("rename", vec![rename]),
+			],
+		};
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		assert!(
+			plan.commits[1].files[0].old_existed,
+			"the rename deletes what commit 1 writes"
+		);
+		assert!(!plan.commits[0].files[0].old_existed);
+		let result = replay(&g, &payload);
+		assert_eq!(result.created.len(), 2);
+		assert!(!dst.path().join("a.txt").exists());
+		assert!(dst.path().join("b.txt").is_file());
+	}
+
+	#[test]
+	fn batch_plan_sees_blocker_renamed_away_by_an_earlier_commit() {
+		let dst = Repo::new("main");
+		dst.write("newdir", b"regular file\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let mut rename = batch_file("moved.txt", FileChange::Renamed);
+		rename.old_path = Some("newdir".into());
+		let payload = CommitsPayload {
+			commits: vec![
+				batch_commit("move it away", vec![rename]),
+				batch_commit(
+					"write under it",
+					vec![batch_file("newdir/x.txt", FileChange::Added)],
+				),
+			],
+		};
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		assert_eq!(plan.commits[1].refused_by(), None);
+		let result = replay(&g, &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 2);
+		assert!(dst.path().join("newdir/x.txt").is_file());
+	}
+
+	#[test]
+	fn batch_plan_rewrites_a_non_utf8_file_an_earlier_commit_deleted() {
+		let dst = Repo::new("main");
+		dst.write("bad.txt", &[0xff, 0xfe, 0xfd]);
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = CommitsPayload {
+			commits: vec![
+				batch_commit(
+					"delete",
+					vec![batch_file("bad.txt", FileChange::Deleted)],
+				),
+				batch_commit(
+					"re-add",
+					vec![batch_file("bad.txt", FileChange::Added)],
+				),
+			],
+		};
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		assert_eq!(plan.commits[1].files[0].skip_reason, None);
+		assert_eq!(plan.commits[1].files[0].action, ReplayAction::Write);
+		let result = replay(&g, &payload);
+		assert_eq!(result.created.len(), 2);
+		assert_eq!(fs::read(dst.path().join("bad.txt")).unwrap(), b"x\n");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn batch_plan_writes_under_a_symlink_an_earlier_commit_deleted() {
+		let dst = Repo::new("main");
+		fs::create_dir(dst.path().join("other")).unwrap();
+		dst.write("other/keep.txt", b"keep\n");
+		std::os::unix::fs::symlink("other", dst.path().join("link")).unwrap();
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = CommitsPayload {
+			commits: vec![
+				batch_commit(
+					"delete the link",
+					vec![batch_file("link", FileChange::Deleted)],
+				),
+				batch_commit(
+					"write under it",
+					vec![batch_file("link/x.txt", FileChange::Added)],
+				),
+			],
+		};
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		assert_eq!(plan.commits[1].files[0].skip_reason, None);
+		assert_eq!(plan.commits[1].files[0].action, ReplayAction::Write);
+		let result = replay(&g, &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 2);
+		assert!(dst.path().join("link/x.txt").is_file());
+		assert!(!dst.path().join("other/x.txt").exists());
+	}
+
+	#[test]
+	fn batch_plan_walks_a_large_deletion_in_linear_time() {
+		let dst = Repo::new("main");
+		let n = 3000;
+		fs::create_dir(dst.path().join("big")).unwrap();
+		for i in 0..n {
+			dst.write(&format!("big/f{i}.txt"), b"x\n");
+		}
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let files = (0..n)
+			.map(|i| batch_file(&format!("big/f{i}.txt"), FileChange::Deleted))
+			.collect();
+		let payload = CommitsPayload {
+			commits: vec![
+				batch_commit("delete all", files),
+				batch_commit(
+					"then add",
+					vec![batch_file("big", FileChange::Added)],
+				),
+			],
+		};
+		let g = dst.open();
+		let started = std::time::Instant::now();
+		let plan = plan_commit_replay(&g, &payload);
+		assert_eq!(plan.commits[1].refused_by(), None, "big is emptied");
+		assert!(
+			started.elapsed() < std::time::Duration::from_secs(10),
+			"planning took {:?}",
+			started.elapsed()
+		);
 	}
 
 	#[test]

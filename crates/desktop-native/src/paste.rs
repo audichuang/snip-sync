@@ -1145,7 +1145,7 @@ impl PastePreviewPlan {
 					rows.push(row(
 						old,
 						old_abs.clone(),
-						old_abs.exists(),
+						file.old_existed,
 						PlannedOp::Delete,
 						format!(
 							"{}path: {old}\nrenamed to: {}\n",
@@ -3550,6 +3550,60 @@ pub(crate) mod tests {
 			fs::read_to_string(repo.join("newdir/x.txt")).unwrap(),
 			"x\n"
 		);
+	}
+
+	#[test]
+	fn commit_preview_rename_of_a_file_an_earlier_commit_adds_is_a_real_delete()
+	{
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("keep.txt"), "keep\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let record = |message: &str,
+		              path: &str,
+		              old_path: Option<&str>,
+		              change| CommitRecord {
+			message: format!("{message}\n"),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: path.into(),
+				old_path: old_path.map(Into::into),
+				change,
+				content: Some("x\n".into()),
+				not_copied: None,
+			}],
+		};
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![
+				record("add", "a.txt", None, FileChange::Added),
+				record("rename", "b.txt", Some("a.txt"), FileChange::Renamed),
+			],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
+				.unwrap();
+
+		let old = plan
+			.items
+			.iter()
+			.find(|i| i.path == "a.txt" && i.op == PlannedOp::Delete)
+			.expect("the rename shows its old path as a delete row");
+		assert_eq!(old.action(), RowAction::Delete);
+		assert!(old.shows_delete_notice());
+
+		plan.execute().expect("both commits replay");
+		assert!(!repo.join("a.txt").exists());
+		assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "x\n");
 	}
 
 	#[test]

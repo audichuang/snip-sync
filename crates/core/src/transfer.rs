@@ -2666,6 +2666,14 @@ fn capture_replay_file_freshness(
 			content_hash: hasher.finalize().into(),
 		}));
 	}
+	// A directory at a replay target is not a file to hash. The planner either
+	// refuses the commit for it or, when an earlier commit of the batch
+	// empties it, replays over it, so it counts as absent here: a file that
+	// appears in its place still changes the state, and the plan comparison
+	// notices any layout change.
+	if meta.file_type().is_dir() {
+		return Ok(None);
+	}
 	if !meta.file_type().is_file() {
 		return Err(TransferError::SpecialFile(
 			path.to_string_lossy().into_owned(),

@@ -512,3 +512,41 @@ fn paste_commits_dry_run_plans_each_commit_after_the_earlier_ones() {
 		"{all}"
 	);
 }
+
+#[test]
+fn paste_commits_apply_replays_over_a_directory_an_earlier_commit_empties() {
+	// Commit 1 deletes d/f.txt (leaving `d` empty and so removed), commit 2
+	// writes a file at `d`: dry-run and Apply both create 2 commits.
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(dst.join("d")).unwrap();
+	init_repo(&dst);
+	fs::write(dst.join("d/f.txt"), "f\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = commits_payload(&[
+		("empty the dir", &[("d/f.txt", "DELETED", None)]),
+		("file at its path", &[("d", "ADDED", Some("now a file\n"))]),
+	]);
+	let dry = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	assert!(
+		!text(&dry.stdout).contains("refused"),
+		"{}",
+		text(&dry.stdout)
+	);
+	let apply = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
+	assert!(
+		text(&apply.stdout).contains("Created 2 commit(s)."),
+		"{}",
+		text(&apply.stdout)
+	);
+	assert_eq!(fs::read_to_string(dst.join("d")).unwrap(), "now a file\n");
+}
