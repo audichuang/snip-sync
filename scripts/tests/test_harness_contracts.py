@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 def require_or_skip(cond: bool, reason: str) -> None:
@@ -50,6 +51,7 @@ from memory_harness import (
     ReadinessTimeoutError,
     ZeroSamplesError,
     measure_single_profile,
+    read_process_identity,
 )
 
 
@@ -283,6 +285,34 @@ sys.exit(42)
                 readiness_timeout=2.0,
             )
         self.assertIn("42", str(ctx.exception))
+
+    def test_process_exit_during_a_sample_keeps_exit_code(self) -> None:
+        """A child that exits between poll() and a sample is still a crash with its exit code.
+
+        The race failed test_process_crash_fails under load ("exited or was reused across
+        a sample", no 42); here every sample waits until the child is gone."""
+        require_or_skip(sys.platform.startswith("linux"), "the sampler reads /proc")
+        real_sample_tree = ProcessTreeSampler.sample_tree
+
+        def sample_then_wait_for_exit(sampler: ProcessTreeSampler) -> dict:
+            instant = real_sample_tree(sampler)
+            deadline = time.monotonic() + 10.0
+            while read_process_identity(sampler.root_pid, sampler.proc_root) is not None:
+                self.assertLess(time.monotonic(), deadline, "fixture never exited")
+                time.sleep(0.01)
+            return instant
+
+        fixture_code = "import sys, time\ntime.sleep(0.3)\nsys.exit(42)\n"
+        with patch.object(ProcessTreeSampler, "sample_tree", sample_then_wait_for_exit):
+            with self.assertRaises(ProcessCrashedError) as ctx:
+                measure_single_profile(
+                    argv=[sys.executable, "-c", fixture_code],
+                    ready_marker="[READY:IDLE]",
+                    profile_label="Test Crash Mid-Sample",
+                    steady_seconds=1.0,
+                    readiness_timeout=5.0,
+                )
+        self.assertIn("exit code 42", str(ctx.exception))
 
     def test_missing_binary_fails(self) -> None:
         """Verify that a non-existent binary raises BinaryNotFoundError."""
