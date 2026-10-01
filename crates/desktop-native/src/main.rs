@@ -6331,6 +6331,86 @@ mod tests {
 			);
 		}
 
+		/// Multi-selection copy follows screen order, not click order
+		/// (Scenario A: emoji.txt clicked before common.txt, but screen
+		/// order has common.txt before emoji.txt).
+		#[gpui::test]
+		fn commit_files_copy_files_screen_order(cx: &mut TestAppContext) {
+			use crate::menu::{MenuAct, MenuEntry};
+			use snip_core::format::ChangeType::{Deleted, Modified};
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let copied = model.update(cx, |m, cx| {
+				m.log_commit_root = Some(root.clone());
+				m.compare = Some(("old".into(), "new".into()));
+				m.commit_files = [
+					("common.txt", Modified),
+					("emoji.txt", Modified),
+					("dir/gone.txt", Deleted),
+					("dir/keep.txt", Modified),
+				]
+				.map(|(p, c)| (p.to_string(), Some(c)))
+				.into();
+				m.selected_commit_file = Some("emoji.txt".into());
+				m.toggle_commit_file("common.txt", cx);
+				let menu = m.commit_file_menu("common.txt", false);
+				menu.into_iter()
+					.find_map(|e| match e {
+						MenuEntry::Item {
+							act: Some(MenuAct::CopyRevFiles(f)),
+							..
+						} => Some(f),
+						_ => None,
+					})
+					.unwrap()
+			});
+			let got: Vec<_> =
+				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			assert_eq!(got, [("common.txt", false), ("emoji.txt", false)]);
+		}
+
+		/// Folder overlap copy follows screen order and deduplicates
+		/// (Scenario B: dir/keep.txt clicked before dir/, screen order has
+		/// dir/gone.txt before dir/keep.txt, each file copied once).
+		#[gpui::test]
+		fn commit_files_copy_folder_overlap_screen_order(
+			cx: &mut TestAppContext,
+		) {
+			use crate::menu::{MenuAct, MenuEntry};
+			use snip_core::format::ChangeType::{Deleted, Modified};
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let copied = model.update(cx, |m, cx| {
+				m.log_commit_root = Some(root.clone());
+				m.compare = Some(("old".into(), "new".into()));
+				m.commit_files = [
+					("common.txt", Modified),
+					("emoji.txt", Modified),
+					("dir/gone.txt", Deleted),
+					("dir/keep.txt", Modified),
+				]
+				.map(|(p, c)| (p.to_string(), Some(c)))
+				.into();
+				m.selected_commit_file = Some("dir/keep.txt".into());
+				m.toggle_commit_file("dir/", cx);
+				let menu = m.commit_file_menu("dir", true);
+				menu.into_iter()
+					.find_map(|e| match e {
+						MenuEntry::Item {
+							act: Some(MenuAct::CopyRevFiles(f)),
+							..
+						} => Some(f),
+						_ => None,
+					})
+					.unwrap()
+			});
+			let got: Vec<_> =
+				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			assert_eq!(got, [("dir/gone.txt", true), ("dir/keep.txt", false)]);
+		}
+
 		/// Puts `payload` on the OS clipboard and opens its paste preview.
 		fn paste(
 			model: &Entity<WorkbenchModel>,

@@ -53,10 +53,10 @@ mod log;
 mod log_view;
 mod paste;
 
-#[cfg(test)]
-pub(crate) use changes::commit_file_rows;
 use changes::*;
-pub(crate) use changes::{change_rows, ChangeItemRow, ChangeLayout};
+pub(crate) use changes::{
+	change_rows, commit_file_rows, ChangeItemRow, ChangeLayout,
+};
 pub use log::LogMenu;
 use log::*;
 
