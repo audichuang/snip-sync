@@ -7284,6 +7284,79 @@ mod tests {
 			);
 		}
 
+		/// A real Apply error must outlive an exclude / re-include cycle, and
+		/// a subset Apply is refused whichever banner is showing.
+		#[gpui::test]
+		fn space_cycle_keeps_a_real_apply_error_and_subset_apply_is_refused(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "msg\n".into(),
+						author_name: "ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-09-25T12:34:56+00:00".into(),
+						files: vec![CommitFile {
+							path: "fresh.txt".into(),
+							old_path: None,
+							change: FileChange::Added,
+							content: Some("body\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			model.update(cx, |m, cx| {
+				m.select_paste_item(0, cx);
+			});
+			// The target appears behind the preview's back: Apply goes stale.
+			fs::write(dest.join("fresh.txt"), "external").unwrap();
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			let keys = |cx: &mut gpui::VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					(
+						m.paste.plan().unwrap().error.as_ref().map(|e| e.key),
+						m.status.key,
+					)
+				})
+			};
+			assert_eq!(keys(cx), (Some("stale_created"), "stale_created"));
+
+			// Space twice, no Apply between: the stale error is never touched.
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			assert_eq!(keys(cx), (Some("stale_created"), "stale_created"));
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			assert_eq!(keys(cx), (Some("stale_created"), "stale_created"));
+
+			// Exclude, then Enter: the subset Apply is refused, nothing written.
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_some());
+				assert_eq!(m.status.key, "commit_subset_rejected");
+			});
+			assert_eq!(
+				fs::read_to_string(dest.join("fresh.txt")).unwrap(),
+				"external"
+			);
+		}
+
 		#[gpui::test]
 		fn escape_cancels_the_preview_and_writes_nothing(
 			cx: &mut TestAppContext,

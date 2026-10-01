@@ -1459,7 +1459,14 @@ impl PastePreviewPlan {
 		}
 		if self.whole_commit {
 			if !self.all_selected() {
-				self.error = Some(Msg::new("commit_subset_rejected", []));
+				// Only the informational banner (or none) gives way; a real error stays visible.
+				if self
+					.error
+					.as_ref()
+					.is_none_or(|e| e.key == "commit_will_be_refused")
+				{
+					self.error = Some(Msg::new("commit_subset_rejected", []));
+				}
 			} else if self
 				.error
 				.as_ref()
@@ -3834,6 +3841,26 @@ pub(crate) mod tests {
 		// Remaining row re-included -> all selected -> banner cleared
 		plan.toggle_selected(1);
 		assert!(plan.error.is_none());
+	}
+
+	#[test]
+	fn commit_replay_space_cycle_keeps_a_pre_existing_real_error() {
+		let (_dir, mut plan) = mixed_plan();
+		assert!(plan.items.len() >= 2);
+		// The informational refusal banner is not a real error: it gives way and returns.
+		plan.error = plan.refusal_banner();
+		let key = |p: &PastePreviewPlan| p.error.as_ref().map(|e| e.key);
+		plan.toggle_selected(0);
+		assert_eq!(key(&plan), Some("commit_subset_rejected"));
+		plan.toggle_selected(0);
+		assert_eq!(key(&plan), plan.refusal_banner().as_ref().map(|e| e.key));
+
+		// A real error (what Apply records) survives exclude and re-include.
+		plan.error = Some(Msg::new("stale_created", []));
+		plan.toggle_selected(0);
+		assert_eq!(key(&plan), Some("stale_created"));
+		plan.toggle_selected(0);
+		assert_eq!(key(&plan), Some("stale_created"));
 	}
 
 	#[test]
