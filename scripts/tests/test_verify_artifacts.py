@@ -546,6 +546,34 @@ class TestVerifyArtifacts(unittest.TestCase):
         if os.uname().sysname != "Darwin":
             self.assertIn("non-Darwin", str(cm.exception))
 
+    def test_macos_metadata_rejected_in_archives(self) -> None:
+        """AppleDouble ._ files and __MACOSX, as a Mac's tar or zip adds them, fail the audit."""
+        for extra in (
+            "snip-sync.app/._Contents",
+            "snip-sync.app/Contents/.__CodeSignature",
+            "snip-sync.app/Contents/Resources/licenses/._Inter-OFL.txt",
+        ):
+            with self.subTest(extra=extra):
+                tar_path = self.test_dir / "snip-sync_mac_arm.app.tar.gz"
+                with tarfile.open(tar_path, "w:gz") as tf:
+                    add_tar_bytes(tf, MAC_BINARY, make_macho(CPU_ARM64), 0o755)
+                    add_tar_licenses(tf, MAC_LICENSES)
+                    add_tar_bytes(tf, MAC_PLIST, app_plist("0.1.4"), 0o644)
+                    add_tar_bytes(tf, extra, b"\0\5\26\7", 0o644)
+                with self.assertRaises(VerificationError) as cm:
+                    verify_tar_archive(tar_path, expected_version="0.1.4", target="aarch64-apple-darwin")
+                self.assertIn("macOS metadata", str(cm.exception))
+
+        zip_path = self.test_dir / "snip-sync-windows-x64.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr(WIN_BINARY, make_pe())
+            add_zip_licenses(zf)
+            zf.writestr(WIN_README, "Version: 0.1.4\nTarget: x86_64-pc-windows-msvc\n")
+            zf.writestr("__MACOSX/snip-sync/._README.txt", b"\0\5\26\7")
+        with self.assertRaises(VerificationError) as cm:
+            verify_zip_archive(zip_path, target="x86_64-pc-windows-msvc", expected_version="0.1.4")
+        self.assertIn("macOS metadata", str(cm.exception))
+
     def test_symlinks_rejected_in_tar_archive(self) -> None:
         """Tests that candidate tarball containing symlinks is rejected outright."""
         tar_path = self.test_dir / "has_symlink.tar.gz"
@@ -1180,7 +1208,7 @@ class TestVerifyArtifacts(unittest.TestCase):
         self.assertEqual(sleeps, [])
 
     def _package_darwin_with_flaky_create(self, failures: int, error: str = "Resource busy") -> tuple:
-        """package_native.sh with stub codesign/hdiutil/sleep ahead of the real PATH."""
+        """package_native.sh with stub codesign/hdiutil/sleep/tar ahead of the real PATH."""
         run_dir = Path(tempfile.mkdtemp(prefix="flaky-create-", dir=self.test_dir))
         binary = run_dir / "payload"
         binary.write_bytes(b"stub binary")
@@ -1198,12 +1226,18 @@ class TestVerifyArtifacts(unittest.TestCase):
                 'for last; do :; done; echo dmg > "$last"\n'
             ),
             "sleep": 'echo "$1" >> "$STATE/sleeps"\n',
+            # Records what the real tar would see, then runs it.
+            "tar": 'echo "${COPYFILE_DISABLE-unset}" >> "$STATE/tar-copyfile"\nexec "$REAL_TAR" "$@"\n',
         }
         for name, body in stubs.items():
             stub = tools / name
             stub.write_text("#!/bin/sh\n" + body, encoding="utf-8")
             stub.chmod(0o755)
         env = os.environ.copy()
+        real_tar = shutil.which("tar")
+        self.assertIsNotNone(real_tar, "tar is missing")
+        env["REAL_TAR"] = str(real_tar)
+        env.pop("COPYFILE_DISABLE", None)
         env["PATH"] = f"{tools}{os.pathsep}{env['PATH']}"
         env["STATE"] = str(state)
         env["FAILS"] = str(failures)
@@ -1219,27 +1253,33 @@ class TestVerifyArtifacts(unittest.TestCase):
         )
         sleeps_file = state / "sleeps"
         sleeps = [int(x) for x in sleeps_file.read_text().split()] if sleeps_file.exists() else []
-        return res, out / "snip-sync_mac_arm.dmg", sleeps
+        return res, out / "snip-sync_mac_arm.dmg", sleeps, state
+
+    def test_package_native_tars_without_appledouble(self) -> None:
+        """A Mac's tar turns extended attributes into ._ entries unless COPYFILE_DISABLE is set."""
+        res, _dmg, _sleeps, state = self._package_darwin_with_flaky_create(failures=0)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual((state / "tar-copyfile").read_text().split(), ["1"])
 
     def test_package_native_retries_transient_dmg_create(self) -> None:
         # The shell loop retries the same errors on the same schedule as verify_dmg.
         failures = len(HDIUTIL_RETRY_DELAYS)
         for error in HDIUTIL_TRANSIENT_ERRORS:
             with self.subTest(error=error):
-                res, dmg, sleeps = self._package_darwin_with_flaky_create(failures, error)
+                res, dmg, sleeps, _ = self._package_darwin_with_flaky_create(failures, error)
                 self.assertEqual(res.returncode, 0, res.stderr)
                 self.assertTrue(dmg.is_file())
                 self.assertEqual(sleeps, list(HDIUTIL_RETRY_DELAYS))
 
     def test_package_native_does_not_retry_a_hard_dmg_create_failure(self) -> None:
-        res, dmg, sleeps = self._package_darwin_with_flaky_create(failures=1, error="No space left on device")
+        res, dmg, sleeps, _ = self._package_darwin_with_flaky_create(failures=1, error="No space left on device")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("No space left on device", res.stderr)
         self.assertIn("hdiutil create failed for", res.stderr)
         self.assertEqual(sleeps, [])
 
     def test_package_native_gives_up_after_every_dmg_create_retry(self) -> None:
-        res, dmg, sleeps = self._package_darwin_with_flaky_create(failures=len(HDIUTIL_RETRY_DELAYS) + 1)
+        res, dmg, sleeps, _ = self._package_darwin_with_flaky_create(failures=len(HDIUTIL_RETRY_DELAYS) + 1)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn(f"hdiutil create failed {len(HDIUTIL_RETRY_DELAYS) + 1} times", res.stderr)
         self.assertFalse(dmg.exists())
