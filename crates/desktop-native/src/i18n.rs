@@ -30,7 +30,7 @@ impl IntoMsgArgs for Vec<String> {
 pub struct Msg {
 	pub key: &'static str,
 	pub args: Vec<String>,
-	pub key_arg: Option<usize>,
+	pub key_args: Vec<usize>,
 }
 
 impl Msg {
@@ -38,7 +38,7 @@ impl Msg {
 		Self {
 			key,
 			args: args.into_args(),
-			key_arg: None,
+			key_args: Vec::new(),
 		}
 	}
 
@@ -50,7 +50,19 @@ impl Msg {
 		Self {
 			key,
 			args: args.into_args(),
-			key_arg: Some(index),
+			key_args: vec![index],
+		}
+	}
+
+	pub fn with_key_args(
+		key: &'static str,
+		args: impl IntoMsgArgs,
+		indices: impl IntoIterator<Item = usize>,
+	) -> Self {
+		Self {
+			key,
+			args: args.into_args(),
+			key_args: indices.into_iter().collect(),
 		}
 	}
 
@@ -60,21 +72,12 @@ impl Msg {
 			.iter()
 			.enumerate()
 			.map(|(i, s)| {
-				if self.key_arg == Some(i) {
-					if let Some((prefix, key)) = s.split_once(": ") {
-						let translated = t(key, loc);
-						if !translated.is_empty() {
-							format!("{prefix}: {translated}")
-						} else {
-							s.clone()
-						}
+				if self.key_args.contains(&i) {
+					let translated = t(s, loc);
+					if !translated.is_empty() {
+						translated.to_string()
 					} else {
-						let translated = t(s, loc);
-						if !translated.is_empty() {
-							translated.to_string()
-						} else {
-							s.clone()
-						}
+						s.clone()
 					}
 				} else {
 					s.clone()
@@ -423,6 +426,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"commit_will_be_refused" => "第 {} 個 commit「{}」會被拒絕，重播將在此停止",
 			"commit_replay_refused" => "沒有建立任何 commit；第 {} 個 commit「{}」被拒絕：{}",
 			"commit_replay_partial" => "重放中途失敗。已建立且不會丟棄的提交：{}。錯誤：{}",
+			"commit_replay_partial_refused" => "重放中途停止。已建立且不會丟棄的提交：{}。第 {} 個 commit 被拒絕：{}：{}",
 			"commit_replay_done" => "提交重放完成：{}",
 			"commit_whole_note" => "這是整段提交重放。取消任一檔會拒絕整段寫入；覆寫既有檔案必須另外確認",
 			"basket_summary" => "選取籃 {}：{}",
@@ -784,6 +788,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"commit_will_be_refused" => "Commit #{} \"{}\" will be refused; replay will stop there",
 			"commit_replay_refused" => "No commit was created; commit #{} \"{}\" was refused: {}",
 			"commit_replay_partial" => "Replay stopped midway. Commits already created are kept: {}. Error: {}",
+			"commit_replay_partial_refused" => "Replay stopped midway. Commits already created are kept: {}. Commit #{} was refused: {}: {}",
 			"commit_replay_done" => "Commit replay finished: {}",
 			"commit_whole_note" => "This replays the whole commit. Unchecking any file rejects the entire write. Overwriting existing files needs a separate confirmation",
 			"basket_summary" => "Basket {}: {}",
@@ -1045,6 +1050,8 @@ mod tests {
 			"paste_commit_count_refused",
 			"commit_will_be_refused",
 			"commit_replay_refused",
+			"commit_replay_partial",
+			"commit_replay_partial_refused",
 			"reason_nc_binary",
 			"reason_nc_non_utf8",
 			"reason_nc_non_utf8_path",
@@ -1095,24 +1102,48 @@ mod tests {
 		assert!(rendered.contains("「op_skip」"), "{rendered}");
 		assert!(rendered.ends_with("：父目錄被檔案佔住"), "{rendered}");
 
-		// When with_key_arg is used on a prefix: key argument, the cause is translated
+		// When with_key_args is explicitly used, multiple arg indices are translated
+		let multi_key_msg = Msg::with_key_args(
+			"commit_replay_refused",
+			[
+				"1".to_string(),
+				"commit_no_message".to_string(),
+				"reason_refusal_cause_file_in_way".to_string(),
+			],
+			[1, 2],
+		);
+		let rendered = multi_key_msg.render(Locale::ZhTw);
+		assert!(rendered.contains("「（無訊息）」"), "{rendered}");
+		assert!(rendered.ends_with("：父目錄被檔案佔住"), "{rendered}");
+		let rendered_en = multi_key_msg.render(Locale::En);
+		assert!(rendered_en.contains("\"(no message)\""), "{rendered_en}");
+		assert!(
+			rendered_en
+				.ends_with(": a file is in the way of its parent directory"),
+			"{rendered_en}"
+		);
+
+		// commit_replay_partial_refused translates the cause key at arg index 3
 		let partial_msg = Msg::with_key_arg(
-			"commit_replay_partial",
+			"commit_replay_partial_refused",
 			[
 				"sha1".to_string(),
-				"path.txt: reason_refusal_cause_file_in_way".to_string(),
+				"2".to_string(),
+				"path.txt".to_string(),
+				"reason_refusal_cause_file_in_way".to_string(),
 			],
-			1,
+			3,
 		);
 		let rendered = partial_msg.render(Locale::ZhTw);
 		assert!(
-			rendered.contains("path.txt: 父目錄被檔案佔住"),
+			rendered
+				.contains("第 2 個 commit 被拒絕：path.txt：父目錄被檔案佔住"),
 			"{rendered}"
 		);
 		let rendered_en = partial_msg.render(Locale::En);
 		assert!(
 			rendered_en.contains(
-				"path.txt: a file is in the way of its parent directory"
+				"Commit #2 was refused: path.txt: a file is in the way of its parent directory"
 			),
 			"{rendered_en}"
 		);

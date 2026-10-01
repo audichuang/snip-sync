@@ -2699,7 +2699,8 @@ fn native_d3_basket_mapping_and_replay() {
 		"keyup",
 		"Shift_L",
 	]);
-	wait_for("[APP:RANGE:", Duration::from_secs(3));
+	let range = wait_for("[APP:RANGE:", Duration::from_secs(3));
+	assert!(range.contains("chain=visual"), "{range}");
 	click("btn-copy-commits");
 	wait_for("[APP:COPY_COMMITS_ERR:", Duration::from_secs(6));
 	assert_eq!(clip::read_text().unwrap(), commit_clip);

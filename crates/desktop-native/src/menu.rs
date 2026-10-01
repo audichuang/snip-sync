@@ -106,7 +106,8 @@ pub(crate) fn commit_copy_paths<'a>(
 }
 
 /// Selected changed files in screen order: walks the rows of `files` in
-/// screen layout (directories open, dirs first) keeping files whose path
+/// screen layout (directories open, dirs first when `by_dir` is true; in
+/// flat commit_files order when `by_dir` is false) keeping files whose path
 /// is selected directly or lies under a selected folder key ("dir/").
 /// Gitlinks are excluded; a selected directory of a truncated listing
 /// copies nothing.
@@ -1640,6 +1641,34 @@ mod tests {
 				&["dir/nested/deep.rs"]
 			),
 			[("dir/nested/deep.rs", false)]
+		);
+	}
+
+	#[test]
+	fn commit_copy_selection_distinguishes_by_dir_from_commit_files_order() {
+		use snip_core::format::ChangeType::Modified;
+		// commit_files order: z.txt, a/x.txt, b.txt
+		let files: Vec<_> = [
+			("z.txt", Modified),
+			("a/x.txt", Modified),
+			("b.txt", Modified),
+		]
+		.map(|(p, c)| (p.to_string(), Some(c)))
+		.into();
+		let gitlinks = [];
+		let targets = ["z.txt", "a/x.txt", "b.txt"];
+
+		// With by_dir = true: dirs come first (a/x.txt), then top-level files sorted
+		// alphabetically (b.txt, then z.txt).
+		assert_eq!(
+			commit_copy_selection(&files, &gitlinks, false, true, &targets),
+			[("a/x.txt", false), ("b.txt", false), ("z.txt", false),]
+		);
+
+		// With by_dir = false: flat list retains the original commit_files order.
+		assert_eq!(
+			commit_copy_selection(&files, &gitlinks, false, false, &targets),
+			[("z.txt", false), ("a/x.txt", false), ("b.txt", false),]
 		);
 	}
 

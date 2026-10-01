@@ -2495,11 +2495,7 @@ impl WorkbenchModel {
 			return (Vec::new(), RangeChainKind::FirstParent);
 		};
 		let rows = self.display_commits();
-		if let Some(chain) = first_parent_range(&rows, anchor, head) {
-			return (chain, RangeChainKind::FirstParent);
-		}
-		let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
-		(range_between(&ids, anchor, head), RangeChainKind::Visual)
+		range_ids_with_kind(&rows, anchor, head)
 	}
 
 	/// Row ids the range selects: the first-parent chain between the endpoints
@@ -3213,6 +3209,22 @@ pub fn first_parent_range(
 		curr = next_commit;
 	}
 	Some(chain)
+}
+
+/// Row ids the range selects and whether it forms a first-parent chain.
+/// A valid first-parent chain between the endpoints is selected in
+/// top-down display order; otherwise falls back to the visual range
+/// between them in the anchor's repository.
+pub fn range_ids_with_kind(
+	rows: &[&CommitSummary],
+	anchor: &str,
+	head: &str,
+) -> (Vec<String>, RangeChainKind) {
+	if let Some(chain) = first_parent_range(rows, anchor, head) {
+		return (chain, RangeChainKind::FirstParent);
+	}
+	let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
+	(range_between(&ids, anchor, head), RangeChainKind::Visual)
 }
 
 /// Shift range: the rows from `anchor` to `head` (display order, both
@@ -4703,10 +4715,49 @@ mod tests {
 		// C3's first parent is C2, so C3 -> SIDE is not a first-parent chain.
 		assert_eq!(first_parent_range(&rows, "C3", "SIDE"), None);
 		assert_eq!(first_parent_range(&rows, "SIDE", "C3"), None);
+		assert_eq!(
+			range_ids_with_kind(&rows, "C3", "SIDE").1,
+			RangeChainKind::Visual
+		);
+		assert_eq!(
+			range_ids_with_kind(&rows, "SIDE", "C3").1,
+			RangeChainKind::Visual
+		);
 
 		// Visual fallback between C3 and SIDE contains the rows between them.
 		let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
 		assert_eq!(range_between(&ids, "C3", "SIDE"), vec!["C3", "SIDE"]);
+
+		// Mirror real fixture where `side` branches from `base` (docs/real-ui-operator-fixture.sh ~137):
+		// SIDE as upper endpoint with its first parent (base) below the lower endpoint -> visual.
+		let real_fixture_commits = [
+			c("C4", &["C3"]),
+			c("C3", &["C2", "SIDE"]),
+			c("SIDE", &["base"]),
+			c("C2", &["C1"]),
+			c("C1", &["base"]),
+			c("base", &[]),
+		];
+		let real_rows: Vec<&CommitSummary> =
+			real_fixture_commits.iter().collect();
+		assert_eq!(first_parent_range(&real_rows, "SIDE", "C2"), None);
+		assert_eq!(
+			range_ids_with_kind(&real_rows, "SIDE", "C2").1,
+			RangeChainKind::Visual
+		);
+		assert_eq!(
+			range_ids_with_kind(&real_rows, "C2", "SIDE").1,
+			RangeChainKind::Visual
+		);
+		assert_eq!(first_parent_range(&real_rows, "SIDE", "C1"), None);
+		assert_eq!(
+			range_ids_with_kind(&real_rows, "SIDE", "C1").1,
+			RangeChainKind::Visual
+		);
+		assert_eq!(
+			range_ids_with_kind(&real_rows, "C1", "SIDE").1,
+			RangeChainKind::Visual
+		);
 
 		// Multi-repo namespaced ids ("sha@0" style) interleaved with repo 1 rows
 		// work and stay in the anchor repo.

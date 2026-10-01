@@ -1435,6 +1435,7 @@ pub struct ReplayFailure {
 	pub message: String,
 	pub error: String,
 	pub layout_conflict: Option<LayoutConflict>,
+	pub conflict_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1471,6 +1472,7 @@ impl ReplaySession {
 						message: c.message.clone(),
 						error: e.to_string(),
 						layout_conflict: None,
+						conflict_path: None,
 					});
 				return Err(result);
 			}
@@ -1486,6 +1488,7 @@ impl ReplaySession {
 							"cannot create an empty hooks directory: {e}"
 						),
 						layout_conflict: None,
+						conflict_path: None,
 					});
 				return Err(result);
 			}
@@ -1509,6 +1512,7 @@ impl ReplaySession {
 						message: commit.message.clone(),
 						error: err.error,
 						layout_conflict: err.layout_conflict,
+						conflict_path: err.conflict_path,
 					});
 					break;
 				}
@@ -1563,6 +1567,7 @@ impl Drop for NoHooks {
 struct ReplayCommitError {
 	error: String,
 	layout_conflict: Option<LayoutConflict>,
+	conflict_path: Option<String>,
 }
 
 impl From<String> for ReplayCommitError {
@@ -1570,6 +1575,7 @@ impl From<String> for ReplayCommitError {
 		Self {
 			error,
 			layout_conflict: None,
+			conflict_path: None,
 		}
 	}
 }
@@ -1587,6 +1593,7 @@ fn replay_commit(
 		return Err(ReplayCommitError {
 			error: format!("{}: {}", plan.files[i].path, conflict.describe()),
 			layout_conflict: Some(conflict),
+			conflict_path: Some(plan.files[i].path.clone()),
 		});
 	}
 	// Paths whose change is on disk now; they alone go into the commit.
@@ -2100,6 +2107,7 @@ mod tests {
 		assert_eq!(failure.index, 1);
 		assert!(failure.error.contains("commit"), "{}", failure.error);
 		assert_eq!(failure.layout_conflict, None);
+		assert_eq!(failure.conflict_path, None);
 		assert_eq!(plan.commits[0].refused_by(), None);
 		assert_eq!(plan.commits[0].files[0].layout_conflict, None);
 		assert_eq!(plan.commits[0].files[1].layout_conflict, None);
@@ -2206,6 +2214,10 @@ mod tests {
 		assert_eq!(
 			failure.layout_conflict,
 			Some(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert_eq!(
+			failure.conflict_path.as_deref(),
+			Some("blocker_file/x.txt")
 		);
 		assert_eq!(
 			failure.error,

@@ -1477,10 +1477,23 @@ impl PastePreviewPlan {
 			if commit.refused_by().is_some() {
 				let subject =
 					commit.message.lines().next().unwrap_or("").trim();
-				return Some(Msg::new(
-					"commit_will_be_refused",
-					[(c_idx + 1).to_string(), subject.to_string()],
-				));
+				let (subject_arg, is_key) = if subject.is_empty() {
+					("commit_no_message", true)
+				} else {
+					(subject, false)
+				};
+				return Some(if is_key {
+					Msg::with_key_arg(
+						"commit_will_be_refused",
+						[(c_idx + 1).to_string(), subject_arg.to_string()],
+						1,
+					)
+				} else {
+					Msg::new(
+						"commit_will_be_refused",
+						[(c_idx + 1).to_string(), subject_arg.to_string()],
+					)
+				});
 			}
 		}
 		None
@@ -1781,43 +1794,62 @@ impl PastePreviewPlan {
 		if let Some(fail) = replay_res.failure {
 			if replay_res.created.is_empty() {
 				let subject = fail.message.lines().next().unwrap_or("").trim();
-				return Err(match fail.layout_conflict {
-					Some(conflict) => Msg::with_key_arg(
+				let (subject_arg, subject_is_key) = if subject.is_empty() {
+					("commit_no_message", true)
+				} else {
+					(subject, false)
+				};
+				let mut key_args = Vec::new();
+				if subject_is_key {
+					key_args.push(1);
+				}
+				let (cause_arg, cause_is_key) = match fail.layout_conflict {
+					Some(conflict) => {
+						(layout_conflict_cause_key(conflict), true)
+					}
+					None => (fail.error.as_str(), false),
+				};
+				if cause_is_key {
+					key_args.push(2);
+				}
+				let msg = if key_args.is_empty() {
+					Msg::new(
 						"commit_replay_refused",
 						[
 							(fail.index + 1).to_string(),
-							subject.to_string(),
-							layout_conflict_cause_key(conflict).to_string(),
+							subject_arg.to_string(),
+							cause_arg.to_string(),
 						],
-						2,
-					),
-					None => Msg::new(
+					)
+				} else {
+					Msg::with_key_args(
 						"commit_replay_refused",
 						[
 							(fail.index + 1).to_string(),
-							subject.to_string(),
-							fail.error,
+							subject_arg.to_string(),
+							cause_arg.to_string(),
 						],
-					),
-				});
+						key_args,
+					)
+				};
+				return Err(msg);
 			}
 			let created = replay_res.created.join(", ");
 			return Err(match fail.layout_conflict {
 				Some(conflict) => {
 					let path = fail
-						.error
-						.split_once(':')
-						.map_or(fail.error.as_str(), |(p, _)| p.trim());
+						.conflict_path
+						.as_deref()
+						.unwrap_or(fail.error.as_str());
 					Msg::with_key_arg(
-						"commit_replay_partial",
+						"commit_replay_partial_refused",
 						[
 							created,
-							format!(
-								"{path}: {}",
-								layout_conflict_cause_key(conflict)
-							),
+							(fail.index + 1).to_string(),
+							path.to_string(),
+							layout_conflict_cause_key(conflict).to_string(),
 						],
-						1,
+						3,
 					)
 				}
 				None => {
@@ -3060,16 +3092,167 @@ pub(crate) mod tests {
 	}
 
 	#[test]
+	fn commit_empty_subject_refusal_banner_and_apply_uses_commit_no_message() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("blocker"), "regular file\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("x\n".into()),
+			not_copied: None,
+		};
+		// Empty commit subject (only whitespace / newline)
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "   \n\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-25T12:00:00+00:00".into(),
+				files: vec![file("blocker/child.txt")],
+			}],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
+				.expect("preview plan builds");
+
+		// Refusal banner uses commit_no_message instead of empty brackets 「」
+		let banner = plan.error.as_ref().expect("refusal banner present");
+		assert_eq!(banner.key, "commit_will_be_refused");
+		let banner_zh = banner.render(crate::i18n::Locale::ZhTw);
+		assert!(
+			banner_zh.contains("第 1 個 commit「（無訊息）」會被拒絕"),
+			"{banner_zh}"
+		);
+		assert!(!banner_zh.contains("「」"), "{banner_zh}");
+		let banner_en = banner.render(crate::i18n::Locale::En);
+		assert!(
+			banner_en.contains("Commit #1 \"(no message)\" will be refused"),
+			"{banner_en}"
+		);
+		assert!(!banner_en.contains("\"\""), "{banner_en}");
+
+		// Apply refusal uses commit_no_message and translates cause
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.key, "commit_replay_refused");
+		let err_zh = err.render(crate::i18n::Locale::ZhTw);
+		assert!(
+			err_zh.contains(
+				"第 1 個 commit「（無訊息）」被拒絕：父目錄被檔案佔住"
+			),
+			"{err_zh}"
+		);
+		assert!(!err_zh.contains("「」"), "{err_zh}");
+		let err_en = err.render(crate::i18n::Locale::En);
+		assert!(
+			err_en.contains(
+				"commit #1 \"(no message)\" was refused: a file is in the way of its parent directory"
+			),
+			"{err_en}"
+		);
+		assert!(!err_en.contains("\"\""), "{err_en}");
+	}
+
+	struct HeavyLockBlocker {
+		held: snip_core::workspace::HeavyGuard,
+		cancel: snip_core::gitrun::CancelToken,
+		waiters: Vec<std::thread::JoinHandle<()>>,
+	}
+
+	impl HeavyLockBlocker {
+		fn fill(repo: &Path) -> Self {
+			use snip_core::gitrun::{CancelToken, RunOptions};
+			use snip_core::gitsrc::{Git, GitError};
+			use snip_core::workspace::{
+				lock_heavy, RepoIdentity, MAX_HEAVY_WAITERS,
+			};
+			use std::time::{Duration, Instant};
+
+			let git = Git::open(repo).unwrap();
+			let id =
+				RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
+			let held = lock_heavy(&id, &RunOptions::default()).unwrap();
+			let cancel = CancelToken::new();
+			let mut waiters = Vec::new();
+			for _ in 0..MAX_HEAVY_WAITERS {
+				let id = id.clone();
+				let cancel = cancel.clone();
+				waiters.push(std::thread::spawn(move || {
+					while !cancel.is_cancelled() {
+						let res = lock_heavy(
+							&id,
+							&RunOptions {
+								cancel: Some(cancel.clone()),
+								queue_timeout: Duration::from_secs(60),
+								..Default::default()
+							},
+						);
+						if matches!(res, Err(GitError::Cancelled { .. })) {
+							break;
+						}
+						std::thread::sleep(Duration::from_millis(5));
+					}
+				}));
+			}
+			let deadline = Instant::now() + Duration::from_secs(10);
+			loop {
+				let res = lock_heavy(
+					&id,
+					&RunOptions {
+						queue_timeout: Duration::from_millis(50),
+						..RunOptions::default()
+					},
+				);
+				if matches!(res, Err(GitError::WorktreeBusy { .. })) {
+					break;
+				}
+				assert!(
+					Instant::now() < deadline,
+					"timed out waiting for heavy lock waiting room to fill"
+				);
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			Self {
+				held,
+				cancel,
+				waiters,
+			}
+		}
+
+		fn release(self) {
+			use std::time::{Duration, Instant};
+
+			self.cancel.cancel();
+			drop(self.held);
+			let deadline = Instant::now() + Duration::from_secs(30);
+			for w in self.waiters {
+				while !w.is_finished() {
+					assert!(
+						Instant::now() < deadline,
+						"timed out waiting for heavy lock waiter thread to finish"
+					);
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				let _ = w.join();
+			}
+		}
+	}
+
+	#[test]
 	fn commit_apply_begin_failure_reports_refused_wording_without_none() {
 		use snip_core::commits::{
 			CommitFile, CommitRecord, CommitsPayload, FileChange,
 		};
-		use snip_core::gitrun::{CancelToken, RunOptions};
-		use snip_core::gitsrc::{Git, GitError};
-		use snip_core::workspace::{
-			lock_heavy, RepoIdentity, MAX_HEAVY_WAITERS,
-		};
-		use std::time::{Duration, Instant};
 
 		let dir = tempfile::tempdir().unwrap();
 		let repo = dir.path().join("repo");
@@ -3099,57 +3282,9 @@ pub(crate) mod tests {
 			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
 				.unwrap();
 
-		let git = Git::open(&repo).unwrap();
-		let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
-		let held = lock_heavy(&id, &RunOptions::default()).unwrap();
-		let cancel = CancelToken::new();
-		let mut waiters = Vec::new();
-		for _ in 0..MAX_HEAVY_WAITERS {
-			let id = id.clone();
-			let cancel = cancel.clone();
-			waiters.push(std::thread::spawn(move || {
-				while !cancel.is_cancelled() {
-					let res = lock_heavy(
-						&id,
-						&RunOptions {
-							cancel: Some(cancel.clone()),
-							queue_timeout: Duration::from_secs(60),
-							..Default::default()
-						},
-					);
-					if matches!(res, Err(GitError::Cancelled { .. })) {
-						break;
-					}
-					std::thread::sleep(Duration::from_millis(5));
-				}
-			}));
-		}
-		// Poll until the waiting room is full so execute() fails at once
-		// rather than becoming a queued waiter with the default timeout.
-		let deadline = Instant::now() + Duration::from_secs(10);
-		loop {
-			let res = lock_heavy(
-				&id,
-				&RunOptions {
-					queue_timeout: Duration::from_millis(50),
-					..RunOptions::default()
-				},
-			);
-			if matches!(res, Err(GitError::WorktreeBusy { .. })) {
-				break;
-			}
-			assert!(
-				Instant::now() < deadline,
-				"timed out waiting for heavy lock waiting room to fill"
-			);
-			std::thread::sleep(Duration::from_millis(10));
-		}
+		let blocker = HeavyLockBlocker::fill(&repo);
 		let err = plan.execute().unwrap_err();
-		cancel.cancel();
-		drop(held);
-		for w in waiters {
-			let _ = w.join();
-		}
+		blocker.release();
 
 		assert_eq!(err.key, "commit_replay_refused");
 		assert_eq!(err.args[0], "1");
@@ -3174,12 +3309,6 @@ pub(crate) mod tests {
 		use snip_core::commits::{
 			CommitFile, CommitRecord, CommitsPayload, FileChange,
 		};
-		use snip_core::gitrun::{CancelToken, RunOptions};
-		use snip_core::gitsrc::{Git, GitError};
-		use snip_core::workspace::{
-			lock_heavy, RepoIdentity, MAX_HEAVY_WAITERS,
-		};
-		use std::time::{Duration, Instant};
 
 		let dir = tempfile::tempdir().unwrap();
 		let repo = dir.path().join("repo");
@@ -3208,55 +3337,9 @@ pub(crate) mod tests {
 			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
 				.unwrap();
 
-		let git = Git::open(&repo).unwrap();
-		let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
-		let held = lock_heavy(&id, &RunOptions::default()).unwrap();
-		let cancel = CancelToken::new();
-		let mut waiters = Vec::new();
-		for _ in 0..MAX_HEAVY_WAITERS {
-			let id = id.clone();
-			let cancel = cancel.clone();
-			waiters.push(std::thread::spawn(move || {
-				while !cancel.is_cancelled() {
-					let res = lock_heavy(
-						&id,
-						&RunOptions {
-							cancel: Some(cancel.clone()),
-							queue_timeout: Duration::from_secs(60),
-							..Default::default()
-						},
-					);
-					if matches!(res, Err(GitError::Cancelled { .. })) {
-						break;
-					}
-					std::thread::sleep(Duration::from_millis(5));
-				}
-			}));
-		}
-		let deadline = Instant::now() + Duration::from_secs(10);
-		loop {
-			let res = lock_heavy(
-				&id,
-				&RunOptions {
-					queue_timeout: Duration::from_millis(50),
-					..RunOptions::default()
-				},
-			);
-			if matches!(res, Err(GitError::WorktreeBusy { .. })) {
-				break;
-			}
-			assert!(
-				Instant::now() < deadline,
-				"timed out waiting for heavy lock waiting room to fill"
-			);
-			std::thread::sleep(Duration::from_millis(10));
-		}
+		let blocker = HeavyLockBlocker::fill(&repo);
 		let err = plan.execute().unwrap_err();
-		cancel.cancel();
-		drop(held);
-		for w in waiters {
-			let _ = w.join();
-		}
+		blocker.release();
 
 		assert_eq!(err.key, "commit_replay_refused");
 		assert_eq!(err.args[0], "1");
@@ -3317,18 +3400,19 @@ pub(crate) mod tests {
 				.unwrap();
 
 		let err = plan.execute().unwrap_err();
-		assert_eq!(err.key, "commit_replay_partial");
-		assert_eq!(err.args.len(), 2);
-		assert_eq!(
-			err.args[1],
-			"newdir/x.txt: reason_refusal_cause_file_in_way"
-		);
+		assert_eq!(err.key, "commit_replay_partial_refused");
+		assert_eq!(err.args.len(), 4);
+		assert_eq!(err.args[1], "2");
+		assert_eq!(err.args[2], "newdir/x.txt");
+		assert_eq!(err.args[3], "reason_refusal_cause_file_in_way");
 
 		// In zh-TW, banner uses translated cause and contains no English layout reason
 		let rendered_zh = err.render(crate::i18n::Locale::ZhTw);
-		assert!(rendered_zh.contains("重放中途失敗"), "{rendered_zh}");
+		assert!(rendered_zh.contains("重放中途停止"), "{rendered_zh}");
 		assert!(
-			rendered_zh.contains("newdir/x.txt: 父目錄被檔案佔住"),
+			rendered_zh.contains(
+				"第 2 個 commit 被拒絕：newdir/x.txt：父目錄被檔案佔住"
+			),
 			"{rendered_zh}"
 		);
 		assert!(
@@ -3344,7 +3428,7 @@ pub(crate) mod tests {
 		);
 		assert!(
 			rendered_en.contains(
-				"newdir/x.txt: a file is in the way of its parent directory"
+				"Commit #2 was refused: newdir/x.txt: a file is in the way of its parent directory"
 			),
 			"{rendered_en}"
 		);
@@ -3562,8 +3646,11 @@ pub(crate) mod tests {
 		)
 		.unwrap();
 		let err = nested_plan.execute().unwrap_err();
-		assert_eq!(err.key, "commit_replay_partial");
+		assert_eq!(err.key, "commit_replay_partial_refused");
 		assert_ne!(err.args[0], "(none)");
+		assert_eq!(err.args[1], "2");
+		assert_eq!(err.args[2], "leaf/child.txt");
+		assert_eq!(err.args[3], "reason_refusal_cause_file_in_way");
 		assert_eq!(
 			fs::read_to_string(path.join("leaf")).unwrap(),
 			"file-not-dir\n"
