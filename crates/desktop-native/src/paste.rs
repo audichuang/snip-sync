@@ -3777,22 +3777,6 @@ pub(crate) mod tests {
 	}
 
 	#[test]
-	fn test_shows_delete_notice() {
-		// Delete (dest exists, selected) -> true
-		assert!(make_item(true, None, PlannedOp::Delete, true, false)
-			.shows_delete_notice());
-		// DeleteMissing (op Delete, dest absent) -> false
-		assert!(!make_item(true, None, PlannedOp::Delete, false, false)
-			.shows_delete_notice());
-		// excluded delete row -> false
-		assert!(!make_item(false, None, PlannedOp::Delete, true, false)
-			.shows_delete_notice());
-		// a non-delete row -> false
-		assert!(!make_item(true, None, PlannedOp::Create, true, false)
-			.shows_delete_notice());
-	}
-
-	#[test]
 	fn commit_replay_toggle_selected_error_lifecycle() {
 		let (_dir, mut plan) = mixed_plan();
 		assert!(plan.items.len() >= 2);

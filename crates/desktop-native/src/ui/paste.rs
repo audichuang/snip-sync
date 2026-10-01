@@ -789,9 +789,11 @@ impl WorkbenchModel {
 			.when(selected.is_some_and(|i| i.shows_delete_notice()), |d| {
 				d.child(
 					div()
+						.relative()
 						.p(px(12.))
 						.text_color(rgb(pal().error))
-						.child(t("reason_delete", loc)),
+						.child(t("reason_delete", loc))
+						.children(probe(log, "paste-delete-notice")),
 				)
 			})
 			.when(selected.is_some_and(|i| !i.is_delete()), |d| {

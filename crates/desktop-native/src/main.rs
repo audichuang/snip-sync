@@ -7071,6 +7071,80 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn delete_notice_renders_only_for_a_delete_that_will_happen(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			// `present.txt` exists at the destination, `missing.txt` does not.
+			let dest = repo(&root, "dest", &[("present.txt", "x")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			model.update(cx, |m, _| {
+				m.probes = Some(crate::ui::Probes::for_test())
+			});
+			let gone = |path: &str| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change: FileChange::Deleted,
+				content: None,
+				not_copied: None,
+			};
+			paste(
+				&model,
+				cx,
+				&snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "drop".into(),
+						author_name: "ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-09-25T12:34:56+00:00".into(),
+						files: vec![gone("missing.txt"), gone("present.txt")],
+					}],
+				}),
+			);
+			settle(cx);
+			let idx = |cx: &mut VisualTestContext, path: &str| {
+				model.read_with(cx, |m, _| {
+					m.paste
+						.plan()
+						.unwrap()
+						.items
+						.iter()
+						.position(|i| i.path == path)
+						.unwrap_or_else(|| panic!("no row for {path}"))
+				})
+			};
+			let notice = |cx: &mut VisualTestContext| {
+				model
+					.read_with(cx, |m, _| m.probes.as_ref().unwrap().drawn())
+					.contains(&"paste-delete-notice".to_string())
+			};
+			let missing = idx(cx, "missing.txt");
+			let present = idx(cx, "present.txt");
+
+			// Destination already lacks the file: nothing will be deleted,
+			// so no red notice.
+			model.update(cx, |m, cx| m.select_paste_item(missing, cx));
+			settle(cx);
+			assert!(!notice(cx), "notice on a delete of a missing file");
+
+			model.update(cx, |m, cx| m.select_paste_item(present, cx));
+			settle(cx);
+			assert!(notice(cx), "no notice on a real delete");
+
+			// Excluding the row means it will not be deleted either.
+			model.update(cx, |m, cx| m.toggle_paste_selected(present, cx));
+			settle(cx);
+			assert!(!notice(cx), "notice on an excluded delete");
+		}
+
+		#[gpui::test]
 		fn folding_the_selected_commit_moves_selection_off_hidden_rows(
 			cx: &mut TestAppContext,
 		) {
