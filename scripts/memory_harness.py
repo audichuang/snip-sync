@@ -36,6 +36,8 @@ from typing import Any
 HARNESS_REVISION = "2026-09-26.2"
 # The ready file only ever holds the marker; never read more than this.
 READY_FILE_MAX_BYTES = 4096
+# How long to wait for our own child's exit code once its identity is gone.
+PROCESS_EXIT_WAIT_SECONDS = 2.0
 
 
 class HarnessError(Exception):
@@ -960,6 +962,28 @@ def measure_single_profile(
             return f" Target never executed expected binary '{expected_exe}'."
         return ""
 
+    def raise_if_exited(wait: float) -> None:
+        """Our own child that exited is a crash with its exit code.
+
+        It can exit between poll() and a sample, which then sees its identity vanish;
+        waiting (the zombie keeps its PID until reaped) recovers the code."""
+        if proc is None:
+            return
+        try:
+            return_code = proc.wait(timeout=wait) if wait else proc.poll()
+        except subprocess.TimeoutExpired:
+            return
+        if return_code is None:
+            return
+        time.sleep(0.05)
+        diag = monitor.get_diagnostic_log()
+        cleanup_process_group(pgrp, proc)
+        raise ProcessCrashedError(
+            f"Process (PID {root_pid}, label '{profile_label}') terminated prematurely "
+            f"with exit code {return_code}.{never_exec_suffix()}\n"
+            f"Diagnostic log tail:\n{diag}"
+        )
+
     def marker_visible() -> bool:
         if ready_file_path and os.path.exists(ready_file_path):
             try:
@@ -1020,20 +1044,11 @@ def measure_single_profile(
                 msg = f"Overall deadline of {deadline_monotonic - start_monotonic:.1f}s exceeded for profile '{profile_label}'."
                 raise ReadinessTimeoutError(f"{msg}{never_exec_suffix()}\nDiagnostic log tail:\n{diag}")
 
-            if proc is not None:
-                return_code = proc.poll()
-                if return_code is not None:
-                    time.sleep(0.05)
-                    diag = monitor.get_diagnostic_log()
-                    cleanup_process_group(pgrp, proc)
-                    raise ProcessCrashedError(
-                        f"Process (PID {root_pid}, label '{profile_label}') terminated prematurely "
-                        f"with exit code {return_code}.{never_exec_suffix()}\n"
-                        f"Diagnostic log tail:\n{diag}"
-                    )
+            raise_if_exited(0)
 
             before = read_process_identity(root_pid, sampler.proc_root)
             if before is None or (tracked_starttime is not None and before["starttime"] != tracked_starttime):
+                raise_if_exited(PROCESS_EXIT_WAIT_SECONDS)
                 if proc is None:
                     msg = (
                         f"Attached process (PID {root_pid}, starttime {tracked_starttime}, "
@@ -1058,6 +1073,7 @@ def measure_single_profile(
             )
             if identity_broke:
                 if after is None or after["starttime"] != before["starttime"]:
+                    raise_if_exited(PROCESS_EXIT_WAIT_SECONDS)
                     raise ProcessCrashedError(
                         f"Process PID {root_pid} exited or was reused across a sample."
                         + never_exec_suffix()
