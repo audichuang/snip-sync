@@ -14,6 +14,7 @@ use gpui::{
 	TextRun, UniformListScrollHandle, Window,
 };
 
+use snip_core::format::ChangeType;
 use snip_core::gitrun::{CancelToken, Overflow, RunOptions};
 use snip_core::gitsrc::{Git, GitSource};
 
@@ -56,6 +57,7 @@ pub enum PreviewSource {
 pub struct Preview {
 	pub source: PreviewSource,
 	pub path: Option<String>,
+	pub change_type: Option<ChangeType>,
 	pub text: Arc<str>,
 	pub lines: Vec<Range<u32>>,
 	pub is_diff: bool,
@@ -157,6 +159,7 @@ impl Preview {
 		Self {
 			source,
 			path,
+			change_type: None,
 			text,
 			lines,
 			is_diff,
@@ -1327,6 +1330,7 @@ impl WorkbenchModel {
 		else {
 			return;
 		};
+		let change_type = p.change_type;
 		let shown = Arc::as_ptr(&p.text) as *const u8 as usize;
 		self.reader.expanding = true;
 		let cancel = crate::arm_cancel(&mut self.reader.fold_cancel);
@@ -1342,7 +1346,13 @@ impl WorkbenchModel {
 			async move {
 				let result = bg
 					.spawn(async move {
-						read_new_side(&root, &source, &path, cancel)
+						read_new_side(
+							&root,
+							&source,
+							&path,
+							change_type,
+							cancel,
+						)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -1385,6 +1395,7 @@ impl WorkbenchModel {
 				true,
 				p.lang,
 			);
+			n.change_type = p.change_type;
 			if let Some(d) = n.diff.as_mut().filter(|_| tail_done) {
 				d.trailing = false;
 			}
@@ -2221,6 +2232,7 @@ fn read_new_side(
 	root: &std::path::Path,
 	source: &GitSource,
 	path: &str,
+	change_type: Option<ChangeType>,
 	cancel: CancelToken,
 ) -> Result<String, String> {
 	let opts = RunOptions {
@@ -2230,16 +2242,28 @@ fn read_new_side(
 		..RunOptions::interactive(None)
 	};
 	let git = Git::open_with(root, &opts).map_err(|e| e.to_string())?;
-	snip_core::gitsrc::read_changed_file_with(
-		&git,
-		source,
-		path,
-		MAX_PREVIEW_BYTES as u64,
-		&opts,
-	)
-	.map_err(|e| e.to_string())?
-	.and_then(|f| f.content)
-	.ok_or_else(|| "no new-side text".to_string())
+	let file = match change_type {
+		Some(change) => snip_core::gitsrc::read_changed_file_for(
+			&git,
+			source,
+			path,
+			change,
+			None,
+			MAX_PREVIEW_BYTES as u64,
+			&opts,
+		)
+		.map(Some),
+		None => snip_core::gitsrc::read_changed_file_with(
+			&git,
+			source,
+			path,
+			MAX_PREVIEW_BYTES as u64,
+			&opts,
+		),
+	};
+	file.map_err(|e| e.to_string())?
+		.and_then(|f| f.content)
+		.ok_or_else(|| "no new-side text".to_string())
 }
 
 /// Space between the line-number gutter and the code.

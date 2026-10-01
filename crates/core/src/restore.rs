@@ -1170,4 +1170,23 @@ mod tests {
 		)
 		.is_none());
 	}
+
+	#[test]
+	fn restore_moved_entry_creates_new_path_and_leaves_old_path_untouched() {
+		let (_d, root) = tmp();
+		fs::write(root.join("old-name.txt"), "old content\n").unwrap();
+		let payload = "// file: [MOVED] new-name.txt\nnew content\n";
+		let entries = parse_clipboard(payload, HEADER);
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries[0].path, "new-name.txt");
+
+		let plan = plan_restore(&[&root], &entries);
+		assert_eq!(plan.create_operations.len(), 1);
+		assert_eq!(plan.create_operations[0].relative_path, "new-name.txt");
+		assert!(plan.delete_operations.is_empty());
+
+		execute_restore_plan(&plan, &overwrite());
+		assert_eq!(read(root.join("new-name.txt")), "new content");
+		assert_eq!(read(root.join("old-name.txt")), "old content\n");
+	}
 }
