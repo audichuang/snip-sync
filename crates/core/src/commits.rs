@@ -1083,6 +1083,38 @@ pub enum ReplaySkipReason {
 	NonUtf8Target,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LayoutConflict {
+	RenamedFromIsDirectory,
+	DeleteTargetIsDirectory,
+	DirectoryInTheWay,
+	FileInTheWayOfParent,
+}
+
+impl LayoutConflict {
+	pub fn describe(self) -> &'static str {
+		match self {
+			Self::RenamedFromIsDirectory => {
+				"the renamed-from path is a directory"
+			}
+			Self::DeleteTargetIsDirectory => {
+				"the path to delete is a directory"
+			}
+			Self::DirectoryInTheWay => "a directory is in the way of the file",
+			Self::FileInTheWayOfParent => {
+				"a file is in the way of its parent directory"
+			}
+		}
+	}
+}
+
+impl std::fmt::Display for LayoutConflict {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.describe())
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilePlan {
@@ -1094,6 +1126,7 @@ pub struct FilePlan {
 	pub existed: bool,
 	pub not_copied: Option<NotCopiedReason>,
 	pub skip_reason: Option<ReplaySkipReason>,
+	pub layout_conflict: Option<LayoutConflict>,
 	pub absolute_path: Option<PathBuf>,
 	pub old_absolute_path: Option<PathBuf>,
 }
@@ -1131,6 +1164,12 @@ pub struct CommitPlan {
 	pub author_date: String,
 	/// Index-aligned with the payload commit's `files`.
 	pub files: Vec<FilePlan>,
+}
+
+impl CommitPlan {
+	pub fn refused_by(&self) -> Option<LayoutConflict> {
+		self.files.iter().find_map(|f| f.layout_conflict)
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1207,6 +1246,7 @@ fn plan_file(root: &Path, f: &CommitFile) -> FilePlan {
 		existed: false,
 		not_copied: f.not_copied,
 		skip_reason: None,
+		layout_conflict: None,
 		absolute_path: None,
 		old_absolute_path: None,
 	};
@@ -1262,7 +1302,7 @@ fn plan_commit(root: &Path, c: &CommitRecord) -> CommitPlan {
 fn layout_conflicts(
 	root: &Path,
 	files: &[FilePlan],
-) -> Vec<(usize, &'static str)> {
+) -> Vec<(usize, LayoutConflict)> {
 	let mut deleted = std::collections::HashSet::new();
 	for f in files.iter().filter(|f| f.action != ReplayAction::Skip) {
 		deleted.extend(f.old_absolute_path.as_deref());
@@ -1301,12 +1341,12 @@ fn layout_conflicts(
 		let old = f.old_absolute_path.as_deref().filter(|o| is_dir(o));
 		let conflict = match f.action {
 			ReplayAction::Skip => None,
-			_ if old.is_some() => Some("the renamed-from path is a directory"),
+			_ if old.is_some() => Some(LayoutConflict::RenamedFromIsDirectory),
 			ReplayAction::Delete => {
-				is_dir(abs).then_some("the path to delete is a directory")
+				is_dir(abs).then_some(LayoutConflict::DeleteTargetIsDirectory)
 			}
 			ReplayAction::Write if is_dir(abs) => (!emptied(abs, &deleted))
-				.then_some("a directory is in the way of the file"),
+				.then_some(LayoutConflict::DirectoryInTheWay),
 			ReplayAction::Write => abs
 				.ancestors()
 				.skip(1)
@@ -1315,7 +1355,7 @@ fn layout_conflicts(
 					fs::symlink_metadata(a).is_ok_and(|m| !m.is_dir())
 						&& !deleted.contains(a)
 				})
-				.map(|_| "a file is in the way of its parent directory"),
+				.map(|_| LayoutConflict::FileInTheWayOfParent),
 		};
 		if let Some(reason) = conflict {
 			out.push((i, reason));
@@ -1326,18 +1366,20 @@ fn layout_conflicts(
 
 /// Marks [`layout_conflicts`] as unsafe skips, until skipping one (and so
 /// not deleting its paths) uncovers no new conflict.
+///
+/// Known limitation: each commit is planned against the current on-disk tree,
+/// so in a batch where an earlier commit removes the blocker, a later commit
+/// may be previewed as refused although replay would succeed.
 fn skip_layout_conflicts(root: &Path, files: &mut [FilePlan]) {
 	loop {
-		let conflicts = layout_conflicts(root, files)
-			.into_iter()
-			.map(|(i, _)| i)
-			.collect::<Vec<_>>();
+		let conflicts = layout_conflicts(root, files);
 		if conflicts.is_empty() {
 			return;
 		}
-		for i in conflicts {
+		for (i, conflict) in conflicts {
 			files[i].action = ReplayAction::Skip;
 			files[i].skip_reason = Some(ReplaySkipReason::UnsafePath);
+			files[i].layout_conflict = Some(conflict);
 		}
 	}
 }
@@ -1392,6 +1434,7 @@ pub struct ReplayFailure {
 	pub index: usize,
 	pub message: String,
 	pub error: String,
+	pub layout_conflict: Option<LayoutConflict>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1427,6 +1470,7 @@ impl ReplaySession {
 						index: 0,
 						message: c.message.clone(),
 						error: e.to_string(),
+						layout_conflict: None,
 					});
 				return Err(result);
 			}
@@ -1441,6 +1485,7 @@ impl ReplaySession {
 						error: format!(
 							"cannot create an empty hooks directory: {e}"
 						),
+						layout_conflict: None,
 					});
 				return Err(result);
 			}
@@ -1458,11 +1503,12 @@ impl ReplaySession {
 		for (index, commit) in payload.commits.iter().enumerate() {
 			match replay_commit(git, commit, &self.no_hooks.config) {
 				Ok(sha) => result.created.push(sha),
-				Err(error) => {
+				Err(err) => {
 					result.failure = Some(ReplayFailure {
 						index,
 						message: commit.message.clone(),
-						error,
+						error: err.error,
+						layout_conflict: err.layout_conflict,
 					});
 					break;
 				}
@@ -1514,17 +1560,34 @@ impl Drop for NoHooks {
 	}
 }
 
+struct ReplayCommitError {
+	error: String,
+	layout_conflict: Option<LayoutConflict>,
+}
+
+impl From<String> for ReplayCommitError {
+	fn from(error: String) -> Self {
+		Self {
+			error,
+			layout_conflict: None,
+		}
+	}
+}
+
 fn replay_commit(
 	git: &Git,
 	commit: &CommitRecord,
 	no_hooks: &str,
-) -> Result<String, String> {
+) -> Result<String, ReplayCommitError> {
 	let root = git.root();
 	let plan = plan_commit(root, commit);
 	// The preview skips these; replay refuses the commit before touching
 	// anything rather than stop halfway with a half-staged worktree.
-	if let Some(&(i, reason)) = layout_conflicts(root, &plan.files).first() {
-		return Err(format!("{}: {reason}", plan.files[i].path));
+	if let Some(&(i, conflict)) = layout_conflicts(root, &plan.files).first() {
+		return Err(ReplayCommitError {
+			error: format!("{}: {}", plan.files[i].path, conflict.describe()),
+			layout_conflict: Some(conflict),
+		});
 	}
 	// Paths whose change is on disk now; they alone go into the commit.
 	let mut paths: Vec<&str> = Vec::new();
@@ -1543,13 +1606,14 @@ fn replay_commit(
 			continue;
 		};
 		if escapes_all_roots(&[root], abs) {
-			return Err(format!("{}: unsafe path", f.path));
+			return Err(format!("{}: unsafe path", f.path).into());
 		}
 		if !is_symlink(abs) && must_not_overwrite(abs) {
 			return Err(format!(
 				"{}: target is not UTF-8 or cannot be verified",
 				f.path
-			));
+			)
+			.into());
 		}
 	}
 
@@ -1572,7 +1636,7 @@ fn replay_commit(
 			continue;
 		};
 		if escapes_all_roots(&[root], abs) {
-			return Err(format!("{}: unsafe path", f.path));
+			return Err(format!("{}: unsafe path", f.path).into());
 		}
 		if is_symlink(abs) {
 			// Replace the link itself; writing would follow it.
@@ -2035,10 +2099,123 @@ mod tests {
 		let failure = result.failure.unwrap();
 		assert_eq!(failure.index, 1);
 		assert!(failure.error.contains("commit"), "{}", failure.error);
+		assert_eq!(failure.layout_conflict, None);
+		assert_eq!(plan.commits[0].refused_by(), None);
+		assert_eq!(plan.commits[0].files[0].layout_conflict, None);
+		assert_eq!(plan.commits[0].files[1].layout_conflict, None);
 		assert!(!dst.dir.path().join("escape.txt").exists());
 		let tree =
 			dst.git(&["ls-tree", "-r", "--name-only", &result.created[0]]);
 		assert_eq!(tree, "a.txt\nb.txt");
+	}
+
+	#[test]
+	fn commit_plan_detects_layout_conflicts_and_distinguishes_path_unsafe() {
+		let dst = Repo::new("main");
+		dst.write("blocker_file", b"regular file\n");
+		fs::create_dir_all(dst.path().join("existing_dir")).unwrap();
+		dst.write("existing_dir/keep.txt", b"keep\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("x\n".into()),
+			not_copied: None,
+		};
+		let payload = CommitsPayload {
+			commits: vec![
+				CommitRecord {
+					message: "layout conflicts\n".into(),
+					author_name: "Author".into(),
+					author_email: "author@example.com".into(),
+					author_date: "2020-01-01T00:00:00+00:00".into(),
+					files: vec![
+						file("blocker_file/child.txt"),
+						file("existing_dir"),
+						file("normal.txt"),
+					],
+				},
+				CommitRecord {
+					message: "path rule unsafe\n".into(),
+					author_name: "Author".into(),
+					author_email: "author@example.com".into(),
+					author_date: "2020-01-01T00:00:00+00:00".into(),
+					files: vec![file("../escape.txt"), file("fine.txt")],
+				},
+			],
+		};
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+
+		// Layout conflict commit
+		let c0 = &plan.commits[0];
+		assert_eq!(
+			c0.files[0].layout_conflict,
+			Some(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert_eq!(c0.files[0].skip_reason, Some(ReplaySkipReason::UnsafePath));
+		assert_eq!(
+			c0.files[1].layout_conflict,
+			Some(LayoutConflict::DirectoryInTheWay)
+		);
+		assert_eq!(c0.files[1].skip_reason, Some(ReplaySkipReason::UnsafePath));
+		assert_eq!(c0.files[2].layout_conflict, None);
+		assert_eq!(c0.files[2].skip_reason, None);
+		assert_eq!(c0.refused_by(), Some(LayoutConflict::FileInTheWayOfParent));
+
+		// Path-rule unsafe commit
+		let c1 = &plan.commits[1];
+		assert_eq!(c1.files[0].skip_reason, Some(ReplaySkipReason::UnsafePath));
+		assert_eq!(c1.files[0].layout_conflict, None);
+		assert_eq!(c1.files[1].skip_reason, None);
+		assert_eq!(c1.files[1].layout_conflict, None);
+		assert_eq!(c1.refused_by(), None);
+	}
+
+	#[test]
+	fn commit_replay_layout_conflict_refuses_with_structured_kind() {
+		let dst = Repo::new("main");
+		dst.write("blocker_file", b"regular file\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("x\n".into()),
+			not_copied: None,
+		};
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "incoming\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.com".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files: vec![file("blocker_file/x.txt"), file("fresh.txt")],
+			}],
+		};
+		let g = dst.open();
+		let result = replay(&g, &payload);
+
+		assert!(result.created.is_empty());
+		let failure =
+			result.failure.expect("replay must fail on layout conflict");
+		assert_eq!(failure.index, 0);
+		assert_eq!(
+			failure.layout_conflict,
+			Some(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert_eq!(
+			failure.error,
+			"blocker_file/x.txt: a file is in the way of its parent directory"
+		);
+		assert_eq!(
+			fs::read_to_string(dst.path().join("blocker_file")).unwrap(),
+			"regular file\n"
+		);
+		assert!(!dst.path().join("fresh.txt").exists());
 	}
 
 	#[test]

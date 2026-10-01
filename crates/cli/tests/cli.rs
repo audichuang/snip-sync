@@ -296,3 +296,56 @@ fn git_sources_label_paths_against_repo_subdirectory() {
 	assert!(payload.contains("[MODIFIED] a.txt"), "{payload}");
 	assert!(!payload.contains("sub/a.txt"), "{payload}");
 }
+
+#[test]
+fn paste_commits_dry_run_reports_layout_refusal_and_accurate_count() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&src);
+	init_repo(&dst);
+	fs::write(src.join("base.txt"), "base\n").unwrap();
+	commit(&src, "initial", "2024-01-01T00:00:00+00:00");
+	fs::create_dir_all(src.join("blocker")).unwrap();
+	fs::write(src.join("blocker/file.txt"), "content\n").unwrap();
+	commit(&src, "first commit", "2024-01-02T00:00:00+00:00");
+	fs::write(src.join("fresh.txt"), "fresh\n").unwrap();
+	commit(&src, "second commit", "2024-01-03T00:00:00+00:00");
+
+	fs::write(dst.join("blocker"), "regular file\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+
+	let src_s = src.to_str().unwrap();
+	let dst_s = dst.to_str().unwrap();
+	let out = snip(
+		&["--repo", src_s, "copy", "--commits", "-n", "2", "--stdout"],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let payload = out.stdout;
+
+	let out = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(&payload),
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(
+		stdout.contains("[1/2] first commit (refused: a file is in the way of its parent directory)"),
+		"{stdout}"
+	);
+	assert!(stdout.contains("[2/2] second commit"), "{stdout}");
+	assert!(
+		!stdout.contains("[2/2] second commit (refused:"),
+		"{stdout}"
+	);
+	assert!(
+		stderr.contains(
+			"0 commit(s) would be created, 1 refused (replay stops at the first)."
+		),
+		"{stderr}"
+	);
+}

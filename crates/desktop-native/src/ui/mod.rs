@@ -520,6 +520,11 @@ pub(crate) fn paste_style(
 			"reason_commit_overwrite_pending",
 		),
 		KeepExisting => ("op_skip", pal().git_modified, "reason_exists"),
+		CommitRefused(conflict) => (
+			"op_refused",
+			pal().error,
+			crate::paste::layout_conflict_key(conflict),
+		),
 	}
 }
 
@@ -548,6 +553,11 @@ pub(crate) fn commit_header_labels(
 		t("commit_no_message", loc).to_string()
 	} else {
 		subject.to_string()
+	};
+	let subject = if commit.refused_by().is_some() {
+		format!("{subject} ({})", t("commit_header_refused_suffix", loc))
+	} else {
+		subject
 	};
 	let author = format!("{} <{}>", commit.author_name, commit.author_email);
 	(subject, author, short_date(&commit.author_date))
@@ -2055,6 +2065,31 @@ mod tests {
 			paste_style(RowAction::KeepExisting),
 			("op_skip", pal.git_modified, "reason_exists")
 		);
+		use snip_core::commits::LayoutConflict;
+		assert_eq!(
+			paste_style(RowAction::CommitRefused(
+				LayoutConflict::RenamedFromIsDirectory
+			)),
+			("op_refused", pal.error, "reason_refused_renamed_from_dir")
+		);
+		assert_eq!(
+			paste_style(RowAction::CommitRefused(
+				LayoutConflict::DeleteTargetIsDirectory
+			)),
+			("op_refused", pal.error, "reason_refused_delete_dir")
+		);
+		assert_eq!(
+			paste_style(RowAction::CommitRefused(
+				LayoutConflict::DirectoryInTheWay
+			)),
+			("op_refused", pal.error, "reason_refused_dir_in_way")
+		);
+		assert_eq!(
+			paste_style(RowAction::CommitRefused(
+				LayoutConflict::FileInTheWayOfParent
+			)),
+			("op_refused", pal.error, "reason_refused_file_in_way")
+		);
 
 		fn all_skip_causes() -> Vec<SkipCause> {
 			// 每個變體各放一個代表值；新增變體時一併加入 seed，否則下方分支不會執行
@@ -2099,6 +2134,9 @@ mod tests {
 				RowAction::Overwrite,
 				RowAction::OverwritePending,
 				RowAction::KeepExisting,
+				RowAction::CommitRefused(
+					LayoutConflict::RenamedFromIsDirectory,
+				),
 			];
 			let mut out = Vec::new();
 			for action in seed {
@@ -2123,6 +2161,20 @@ mod tests {
 					}
 					RowAction::KeepExisting => {
 						out.push(RowAction::KeepExisting)
+					}
+					RowAction::CommitRefused(_) => {
+						out.push(RowAction::CommitRefused(
+							LayoutConflict::RenamedFromIsDirectory,
+						));
+						out.push(RowAction::CommitRefused(
+							LayoutConflict::DeleteTargetIsDirectory,
+						));
+						out.push(RowAction::CommitRefused(
+							LayoutConflict::DirectoryInTheWay,
+						));
+						out.push(RowAction::CommitRefused(
+							LayoutConflict::FileInTheWayOfParent,
+						));
 					}
 				}
 			}

@@ -39,7 +39,7 @@
 
 T25 和其他格一樣，只判 `pass`、`fail`、`not-run`。它不再有例外。
 
-T31、C-blocked 在 `ed3d057` 上預期是 `ui-defect`（原因見各格）。這些是已知還沒修的缺陷，不是回歸；它們仍然讓閘門打開。
+T31、C-blocked 在 `ed3d057` 上是 `ui-defect`，已在 S5 修復（預覽標出整筆拒絕，Apply 用 `commit_replay_refused`）。在含修復的 SHA 上照下面的通過線判定。
 
 下面兩格要填，但不決定閘門關不關：
 
@@ -178,7 +178,7 @@ ID 以受測 binary 印出的為準。下面是 `ed3d057`（develop）的名字�
 | commit 預覽 | `paste-commit:<c>`（`c` 從 0 起算，是該 commit 的標頭，點擊收合或展開）、`paste-commit-count`、`paste-commit-whole` |
 | 多 repo 對應 | `paste-mappings`、`paste-map:<prefix>`、`paste-map-target:<prefix>`、`paste-map-pick:<prefix>:<idx>`、`paste-map-keep:<prefix>` |
 
-Apply 被拒時，日誌一律是 `[APP:PASTE_STALE_DETECTED: <i18n key>]`，連不是 stale 的拒絕也用這個 tag。看 key 判斷是哪一種拒絕：`stale_modified`、`commit_subset_rejected`、`commit_overwrite_required`、`commit_replay_partial` 等。
+Apply 被拒時，日誌一律是 `[APP:PASTE_STALE_DETECTED: <i18n key>]`，連不是 stale 的拒絕也用這個 tag。看 key 判斷是哪一種拒絕：`stale_modified`、`commit_subset_rejected`、`commit_overwrite_required`、`commit_replay_partial`（已建立部分 commit 後中途失敗）、`commit_replay_refused`（沒有建立任何 commit 就被拒）等。
 
 其他會用到的日誌 tag：`PASTE_SEL_TOGGLED: idx= state=`（勾選是否納入）、`PASTE_TOGGLED: idx= state=`（允許覆寫）、`PASTE_COMMIT_TOGGLED: idx=<c>`、`PASTE_NAV: idx=`、`PASTE_PLAN_CLEARED`、`COPY_COMMITS_DONE: commits=N`、`TOAST: ok=`、`LOG_VIEW: hash`、`WORKSPACE: state=`、`APPLY_IGNORED:`。
 
@@ -361,14 +361,15 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 
 T03 與 T18 的身份規則：`action.json` 要寫兩欄，尾段路徑相同的相異 ID 數，以及畫面上同路徑的列數。相異 ID 數要等於列數；而且每次點擊後 `PASTE_TOGGLED` 的 idx 等於所點 ID 的 `ix` 段。任一條不成立：`fail`，證據欄寫 `identity-fail`。
 
-**T31 說明。** 預期 develop `ed3d057` 上是 `ui-defect`。
+**T31 說明。** 含 S5 修復的 SHA 上預期是 `pass`；`ed3d057` 上是 `ui-defect`（見下方歷史說明）。
 
-- 預覽：`paste-commit:0` 標頭是「#1 C4 text and binary … 2 個檔案，2 個不寫入」；摘要建立 0、覆寫 0/0、刪除 0、跳過 2。點 `paste-row:1:newdir/content.txt` 得到 `[APP:PASTE_NAV: idx=1]`，詳情列是「路徑不安全，不寫入」。點 `paste-row:0:new-binary.bin`，詳情列是「未複製：二進位檔，不寫入也不刪除」。
-- Apply：按 `btn-apply` 得到新的一行 `[APP:PASTE_STALE_DETECTED: commit_replay_partial]`，沒有 `PASTE_DONE`，預覽仍開著，紅色橫幅點名 `newdir/content.txt`。
+- 預覽：`paste-commit:0` 標頭是「#1 C4 text and binary（整個 commit 會被拒絕） … 2 個檔案，1 個不寫入」（只有 `new-binary.bin` 算不寫入；`newdir/content.txt` 是「拒絕」列，不算「不寫入」）；摘要「1 個 commit（1 個被拒絕）」，建立 0、覆寫 0/0、刪除 0、跳過 1。預覽一開就有紅色橫幅「第 1 個 commit「C4 text and binary」會被拒絕，重播將在此停止」（`commit_will_be_refused`）。點 `paste-row:1:newdir/content.txt` 得到 `[APP:PASTE_NAV: idx=1]`，詳情列是「整個 commit 會被拒絕：父目錄被檔案佔住」。點 `paste-row:0:new-binary.bin`，詳情列是「未複製：二進位檔，不寫入也不刪除」。
+- Apply：按 `btn-apply` 得到新的一行 `[APP:PASTE_STALE_DETECTED: commit_replay_refused]`，沒有 `PASTE_DONE`，預覽仍開著，紅色橫幅是「沒有建立任何 commit；第 1 個 commit「C4 text and binary」被拒絕：父目錄被檔案佔住」。英文介面是「No commit was created; commit #1 "C4 text and binary" was refused: a file is in the way of its parent directory」。
 - Git：HEAD、status 雜湊、`newdir` 位元組（`not-a-directory` 加換行）都不變。有任何寫入，或出現 `PASTE_DONE`，判 `fail`。
-- 為什麼是 `ui-defect`：core 的 `replay_commit` 在動任何檔案之前，先用 `layout_conflicts` 發現父目錄被一般檔佔住，整個 commit 拒絕。這符合規格 4.3（「父目錄被一般檔案佔住時，整個 commit 拒絕且不動任何檔案（預覽標為 UNSAFE_PATH）」），拒絕本身不是缺陷。缺陷在畫面：`UnsafePath` 列在桌面端只被算成「跳過」（`executable()` 是 true，`overwritable()` 是 false），沒有像待允許覆寫與已排除那樣（#58 的 `0a45ca1`）標成「擋下 Apply」；預覽因此暗示其餘檔案照常貼上，而 Apply 拒絕整個 commit。橫幅也用 `commit_replay_partial` 的「重放中途失敗。已建立且不會丟棄的提交：(none)。錯誤：…」，但其實什麼都還沒開始，而且錯誤原因是 core 的英文 `a file is in the way of its parent directory`，夾在 zh 介面裡。
-- 判定規則：Git 與日誌都對，但符合下列任一項，就判 `ui-defect`，並把三項各自的真假寫進證據欄：(a) 橫幅含英文 core 原因或 `(none)`；(b) 預覽（標頭、摘要、詳情或 `btn-apply` 狀態）沒有標出整個 commit 會被拒；(c) 橫幅說「重放中途失敗」而 `rev-list --count` 為 0。三項都不成立才是 `pass`。
-- 附註：#57 的 commit 說明寫「同一個 commit 的其他有效檔案照常貼上」，與實際行為不符，以規格為準。CLI 的 `--dry-run` 同樣印「1 commit(s) would be created」，是 core／CLI 層的同一個不一致，本規程只量得到桌面端。
+- 設計：core 的 `replay_commit` 在動任何檔案之前，先用 `layout_conflicts` 發現父目錄被一般檔佔住，整個 commit 拒絕。這符合規格 4.3（「父目錄被一般檔案佔住時，整個 commit 拒絕且不動任何檔案（預覽標為 UNSAFE_PATH）」）。重播依序進行、停在失敗的 commit，之前已建立的 commit 保留，所以只有「沒建立任何 commit」時才用 `commit_replay_refused`，已建立過才用 `commit_replay_partial`。已知限制：預覽對每個 commit 都以目前的目的地樹規劃，批次裡較早的 commit 若會移除擋路的檔案，較晚的 commit 可能被預覽標成拒絕。
+- 判定規則：Git 與日誌都對，但符合下列任一項，就判 `ui-defect`，並把三項各自的真假寫進證據欄：(a) 橫幅含英文 core 原因（zh-TW 介面）或 `(none)`；(b) 預覽（標頭、摘要、詳情、紅色橫幅或 `btn-apply` 狀態）沒有標出整個 commit 會被拒；(c) 橫幅說「重放中途失敗」而 `rev-list --count` 為 0。三項都不成立才是 `pass`。
+- 歷史：`ed3d057` 上預覽把該列當一般「跳過」，標頭是「2 個檔案，2 個不寫入」，Apply 橫幅是 `commit_replay_partial` 的「重放中途失敗。已建立且不會丟棄的提交：(none)。錯誤：a file is in the way of its parent directory」，三項 (a)(b)(c) 都成立。
+- 附註：#57 的 commit 說明寫「同一個 commit 的其他有效檔案照常貼上」，與實際行為不符，以規格為準。CLI 的 `--dry-run` 現在在被拒的 commit 標題後印「(refused: …)」，結尾印「N commit(s) would be created, M refused (replay stops at the first).」。
 
 #46 之後多出來的格子，40 項矩陣沒有：
 
@@ -388,12 +389,12 @@ commit 預覽與鍵盤的格子，對應 #58 與 #57。除非該格另有說明�
 | C-detail | T18 的預覽，點 `paste-row:0:common.txt` | `[APP:PASTE_NAV: idx=0]`；詳情標題是「common.txt → <目的端絕對路徑>」，內容以「commit: 多行中文」開頭。規格 4.3 寫「每個 commit 可展開看檔案清單與 diff」，規格 3.2 寫覆寫檔可看 diff（目前的目標檔 ↔ 剪貼簿內容）。畫面上有沒有 diff，照實寫進證據欄；沒有 diff 記成規格落差（第 9 節），不判這格 `fail` |
 | C-reason | 在 T19／T22（`commits-dst-clean`）、T26、T31、T25 的預覽裡，逐列點 `paste-row:<ix>:<path>` | 每次出現 `[APP:PASTE_NAV: idx=<ix>]`，詳情列依序是：二進位（T26 的 `new-binary.bin`、T25 的 `binary.dat`）「未複製：二進位檔，不寫入也不刪除」；不安全路徑（T31 的 `newdir/content.txt`）「路徑不安全，不寫入」；目的端不存在的刪除（只在 T19／T22 的預覽有，`commits-dst-clean` 的 `old.txt`、`gone.txt`；T25 在 `commits-dst-present` 上同一列是「刪除」）「目的地不存在，無需刪除」。每一列的詳情都不是「此檔案不會寫入」（`reason_skip_generic`）這句泛用話。目的端不存在的刪除列被選取時，下方不顯示紅色區塊「將刪除目的地檔案，不寫入內容」（`reason_delete`）；若出現紅色區塊則視為回歸，判 `ui-defect` |
 | C-nonutf8 | 開 `nonutf8-src`，選 N1、N2 複製，貼到 `nonutf8-dst`（先做這段）。再用 `commits-src` 的 C1，貼到 `nonutf8-dst`，只看預覽，Escape 取消（後做這段） | 前段預覽：N1 標頭「2 個檔案，1 個不寫入」、N2 標頭「1 個檔案，1 個不寫入」；`latin1.txt` 兩列的詳情是「未複製：非 UTF-8 編碼，不寫入也不刪除」，`ok.txt` 是「建立」。複製通知含「2 個檔案未複製」，並列出「#1 latin1.txt」與「#2 latin1.txt」。Apply：`PASTE_DONE created=2 … commits=2`；`latin1.txt` 位元組仍是 `caf` `e9` 換行；`ok.txt` 已建立。後段預覽：`common.txt` 列是「跳過」，詳情「目的地現有檔案不是 UTF-8，不覆寫」；Escape 得到 `[APP:PASTE_CANCELLED]`，`common.txt` 位元組不變、HEAD 不變 |
-| C-blocked | 開 `blocked-src`，複製 `B1 blocked dir and fresh`，貼到 `ws-dst/repo04` | 預覽：標頭「2 個檔案，1 個不寫入」；`fresh.txt`「建立」，`newdir/x.txt`「跳過」，詳情「路徑不安全，不寫入」。Apply：`[APP:PASTE_STALE_DETECTED: commit_replay_partial]`，沒有 `PASTE_DONE`；`fresh.txt` 不存在；HEAD、status 不變。整筆拒絕是規格 4.3 的要求，也證明 #57 commit 說明的「其他檔照常貼上」不成立。判定規則同 T31 的 (a)(b)(c)；預期 develop `ed3d057` 上是 `ui-defect`。T31 與這格都不寫入，`repo04` 可連續做 |
+| C-blocked | 開 `blocked-src`，複製 `B1 blocked dir and fresh`，貼到 `ws-dst/repo04` | 預覽：標頭帶「（整個 commit 會被拒絕）」，「2 個檔案，0 個不寫入」；摘要「1 個 commit（1 個被拒絕）」；紅色橫幅「第 1 個 commit「B1 blocked dir and fresh」會被拒絕，重播將在此停止」；`fresh.txt`「建立」，`newdir/x.txt`「拒絕」，詳情「整個 commit 會被拒絕：父目錄被檔案佔住」。Apply：`[APP:PASTE_STALE_DETECTED: commit_replay_refused]`，沒有 `PASTE_DONE`，橫幅「沒有建立任何 commit；第 1 個 commit「B1 blocked dir and fresh」被拒絕：父目錄被檔案佔住」；`fresh.txt` 不存在；HEAD、status 不變。整筆拒絕是規格 4.3 的要求，也證明 #57 commit 說明的「其他檔照常貼上」不成立。判定規則同 T31 的 (a)(b)(c)；含 S5 修復的 SHA 上預期 `pass`，`ed3d057` 上是 `ui-defect`。T31 與這格都不寫入，`repo04` 可連續做 |
 | K-space | T26 的預覽（C4 到 `commits-dst-clean`），點 `paste-row:0:new-binary.bin`，按 Space | 沒有 `PASTE_TOGGLED`（這一列不可覆寫，不能被切成允許覆寫）。有 `[APP:PASTE_SEL_TOGGLED: idx=0 state=false]`；該列變成「已排除」，詳情是「已排除；commit 重播不能只套用部分檔案，需重新勾選才能套用」；面板出現紅色橫幅。此時 `btn-apply` 得到 `[APP:PASTE_STALE_DETECTED: commit_subset_rejected]`，`rev-list --count` 為 0。預覽仍開著；若被關掉，重貼再做 K-reinclude，並在證據欄記下 |
 | K-reinclude | 接著 K-space，再按一次 Space | `[APP:PASTE_SEL_TOGGLED: idx=0 state=true]`，該列回到「跳過」，紅色橫幅消失。`btn-apply` 得到 `PASTE_DONE created=1 … commits=1`。重新勾選後橫幅消失且 Apply 成功為 `pass`；橫幅仍在而 Apply 成功判 `ui-defect`；Apply 不成功判 `fail` |
 | K-fold | T19 的預覽。點 `paste-row:2:common.txt`（`PASTE_NAV idx=2`），再點 `paste-commit:1`。最後把三個標頭全收合，再按 Space | 日誌依序是 `[APP:PASTE_COMMIT_TOGGLED: idx=1]`、`[APP:PASTE_NAV: idx=7]`（`side.txt`，選取移到可見列），然後才是 `paste-row:1:…`–`paste-row:6:…` 與 `paste-include:1:…`–`paste-include:6:…` 的 `[APP:CTRL_GONE: id=…]`（`CTRL_GONE` 在下一幀繪製時才印，所以在 NAV 之後；三者都要出現，NAV 與 GONE 之間的順序以此為準）；按 Space 只出現 `PASTE_SEL_TOGGLED idx=7`，沒有作用在被藏起來的 ix 1–6。三個標頭全收合後按 Space，1 秒內沒有 `PASTE_SEL_TOGGLED` 或 `PASTE_TOGGLED`。展開後這些 ID 各有新的 `CTRL_BOUNDS`，列都回來 |
 | K-nav | T19 的預覽，點 `paste-row:0:common.txt`，按 Down 7 次 | `PASTE_NAV` 的 idx 依序是 1、2、…、7，也就是重播順序（C1、C2 的 6 列、C3），不是全部路徑排序。每一次選取的列，就是畫面上的下一列 |
-| K05-key | 依第 4 節的拒絕文字檢查，轉錄 T02、T13、T15、T29、T30、T31、C-blocked、K-space 的每一次拒絕文字。再按 Option+L 切到英文，重做 T15、T30、T31，轉錄英文文字，最後切回。另外複製 `commits-src` 的 C1，開 `fixtures/nongit-dst` 為工作區，按 Cmd+V：走 `build_commit` → `Git::open_with` 失敗 → `destination_error`，得到 `[APP:PASTE_ERR: paste_err_destination]`，狀態列是「無法使用貼上目的地「…/nongit-dst」: <core 的英文原因>」，英文原因形如「… is not inside a git repository (commit mode and git sources need one)」，轉錄整句。這句夾英文是已接受的限制（core 錯誤字串沒有翻譯），不屬於 T31 規則 (a)（(a) 只看 T31 與 C-blocked 的 `commit_replay_partial` 橫幅）；只要沒有原始 key 就不判 `ui-defect`。`fixtures/file-dst` 現在是選用：以它開工作區在 `open_workspace_path` 就被拒，只會出現 `workspace_bad_path`「找不到工作區資料夾：…」，到不了貼上，`paste_err_destination_not_dir` 從 UI 走不到。要做就轉錄那則訊息，也套用 key 規則 | 所有畫面文字都沒有符合 `[a-z]+(_[a-z0-9]+)+` 的原始 key（例如 `paste_err_destination`、`paste_err_not_payload`、`commit_subset_rejected`），也沒有「key (args)」的形式。zh-TW 與 en 各查一次。任何一處露出 key，判 `ui-defect` |
+| K05-key | 依第 4 節的拒絕文字檢查，轉錄 T02、T13、T15、T29、T30、T31、C-blocked、K-space 的每一次拒絕文字。再按 Option+L 切到英文，重做 T15、T30、T31，轉錄英文文字，最後切回。另外複製 `commits-src` 的 C1，開 `fixtures/nongit-dst` 為工作區，按 Cmd+V：走 `build_commit` → `Git::open_with` 失敗 → `destination_error`，得到 `[APP:PASTE_ERR: paste_err_destination]`，狀態列是「無法使用貼上目的地「…/nongit-dst」: <core 的英文原因>」，英文原因形如「… is not inside a git repository (commit mode and git sources need one)」，轉錄整句。這句夾英文是已接受的限制（core 錯誤字串沒有翻譯），不屬於 T31 規則 (a)（(a) 只看 T31 與 C-blocked 的 `commit_replay_refused` 橫幅）；只要沒有原始 key 就不判 `ui-defect`。`fixtures/file-dst` 現在是選用：以它開工作區在 `open_workspace_path` 就被拒，只會出現 `workspace_bad_path`「找不到工作區資料夾：…」，到不了貼上，`paste_err_destination_not_dir` 從 UI 走不到。要做就轉錄那則訊息，也套用 key 規則 | 所有畫面文字都沒有符合 `[a-z]+(_[a-z0-9]+)+` 的原始 key（例如 `paste_err_destination`、`paste_err_not_payload`、`commit_subset_rejected`），也沒有「key (args)」的形式。zh-TW 與 en 各查一次。任何一處露出 key，判 `ui-defect` |
 
 ## 7. `ed3d057`（develop）上已對過的程式
 
@@ -403,7 +404,7 @@ commit 預覽與鍵盤的格子，對應 #58 與 #57。除非該格另有說明�
 |---|---|---|---|
 | #56 `bc81086` | paste ID 改成 `paste-<kind>:<ix>:<path>`，同路徑的兩列各有自己的 ID | T03、T18 | 無 |
 | #55 `f5247ab` | 刪除二進位／非 UTF-8 檔的 commit 標為未複製，貼上不再重播刪除 | T25、C-nonutf8 | 無 |
-| #57 `dcbc079` | 補上 `paste_err_*` 翻譯；檔案擋在貼上路徑時，預覽顯示「路徑不安全，不寫入」 | K05-key；C-reason 的不安全路徑列。任何拒絕訊息都不能露出 `paste_err_*` 等原始 key | T31、C-blocked（畫面沒標出整筆拒絕，見第 6 節） |
+| #57 `dcbc079` | 補上 `paste_err_*` 翻譯；檔案擋在貼上路徑時，預覽顯示「路徑不安全，不寫入」 | K05-key；C-reason 的不安全路徑列。任何拒絕訊息都不能露出 `paste_err_*` 等原始 key | 無（T31、C-blocked 的畫面缺陷已在 S5 修復） |
 | #58 `0a45ca1` | commit 預覽依重播計畫分組、標頭與收合、略過原因、rename 註記、空 commit 顯示、複製通知帶數量、鍵盤選取 | T26、T28、B-notify、C-group、K-space、K-fold、K-nav、T22、C-reason、K-reinclude | 無（後續已修復 T22、C-reason 刪除列紅色區塊與 K-reinclude 橫幅殘留） |
 | #59 `ed3d057` | 多 repo 記錄的訊息欄保留最小寬度，1080 視窗下 ref 標籤不再被擠掉 | T36、B43（1080） | 無 |
 
@@ -433,7 +434,7 @@ Windows 與 Linux 的真實輸入、IME、跨機剪貼簿、與 ClipCode 的實�
 
 - 規格 4.1 寫 log 每頁 300 筆；程式是單一 repo `history_page_size` 50、多 repo feed `FEED_PAGE` 50。T34 依程式寫 50。
 - 規格 4.3 與 3.2 的 diff：C-detail 看到沒有 diff 時記在這裡。
-- 預覽的不安全路徑列沒有告訴使用者整個 commit 會被拒，CLI 的 `--dry-run` 也印「1 commit(s) would be created」。規格只要求預覽標為 UNSAFE_PATH，所以這是 core／CLI 層的不一致，桌面端的表現見 T31。
+- 預覽的版面衝突列（父目錄被檔案佔住等）現在標為「拒絕」並說整個 commit 會被拒；路徑規則不安全（如 `../x`）仍是一般「跳過」。CLI 的 `--dry-run` 對被拒的 commit 不計入「would be created」。
 
 檔案模式和 IDE 套件的逐位元組契約由 `fixtures/clipboard-contract.json` 與 core／CLI 測試負責。本規程不重跑那一套。
 
