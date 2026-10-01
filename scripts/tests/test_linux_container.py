@@ -25,6 +25,8 @@ OMITTED = {
 # The image installs these beyond CI's apt lists: what a hosted runner has preinstalled.
 PREINSTALLED_ON_RUNNERS = {
     "ca-certificates", "curl", "git", "pkg-config", "xz-utils", "python3", "shellcheck", "dbus",
+    # ssh-keygen: core's signed-commit test (commits.rs) needs it.
+    "openssh-client",
 }
 
 

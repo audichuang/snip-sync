@@ -30,6 +30,7 @@ impl IntoMsgArgs for Vec<String> {
 pub struct Msg {
 	pub key: &'static str,
 	pub args: Vec<String>,
+	pub key_args: Vec<usize>,
 }
 
 impl Msg {
@@ -37,13 +38,54 @@ impl Msg {
 		Self {
 			key,
 			args: args.into_args(),
+			key_args: Vec::new(),
+		}
+	}
+
+	pub fn with_key_arg(
+		key: &'static str,
+		args: impl IntoMsgArgs,
+		index: usize,
+	) -> Self {
+		Self {
+			key,
+			args: args.into_args(),
+			key_args: vec![index],
+		}
+	}
+
+	pub fn with_key_args(
+		key: &'static str,
+		args: impl IntoMsgArgs,
+		indices: impl IntoIterator<Item = usize>,
+	) -> Self {
+		Self {
+			key,
+			args: args.into_args(),
+			key_args: indices.into_iter().collect(),
 		}
 	}
 
 	pub fn render(&self, loc: Locale) -> String {
-		let arg_strs: Vec<&str> =
-			self.args.iter().map(|s| s.as_str()).collect();
-		tf(self.key, loc, &arg_strs)
+		let arg_strs: Vec<String> = self
+			.args
+			.iter()
+			.enumerate()
+			.map(|(i, s)| {
+				if self.key_args.contains(&i) {
+					let translated = t(s, loc);
+					if !translated.is_empty() {
+						translated.to_string()
+					} else {
+						s.clone()
+					}
+				} else {
+					s.clone()
+				}
+			})
+			.collect();
+		let arg_refs: Vec<&str> = arg_strs.iter().map(|s| s.as_str()).collect();
+		tf(self.key, loc, &arg_refs)
 	}
 }
 
@@ -228,6 +270,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"op_skip" => "跳過",
 			"op_excluded" => "已排除",
 			"op_overwrite_pending" => "待允許覆寫",
+			"op_refused" => "拒絕",
 			"overwrite_toggle" => "覆寫",
 			"reason_create" => "目的地不存在，將建立新檔",
 			"reason_overwrite" => "將覆寫目的地既有檔案",
@@ -237,6 +280,14 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"reason_excluded" => "已排除，不會寫入",
 			"reason_commit_excluded" => "已排除；commit 重播不能只套用部分檔案，需重新勾選才能套用",
 			"reason_commit_overwrite_pending" => "目的地已有此檔；覆寫預設關閉，允許覆寫前無法套用",
+			"reason_refused_renamed_from_dir" => "整個 commit 會被拒絕：重新命名的來源是目錄",
+			"reason_refused_delete_dir" => "整個 commit 會被拒絕：要刪除的路徑是目錄",
+			"reason_refused_dir_in_way" => "整個 commit 會被拒絕：目錄佔住了檔案位置",
+			"reason_refused_file_in_way" => "整個 commit 會被拒絕：父目錄被檔案佔住",
+			"reason_refusal_cause_renamed_from_dir" => "重新命名的來源是目錄",
+			"reason_refusal_cause_delete_dir" => "要刪除的路徑是目錄",
+			"reason_refusal_cause_dir_in_way" => "目錄佔住了檔案位置",
+			"reason_refusal_cause_file_in_way" => "父目錄被檔案佔住",
 			"paste_keys" => "Enter 套用 · Esc 取消 · ↑↓ 切換項目 · 空白鍵切換",
 			"copy_from" => "複製來源",
 			"selected" => "已選",
@@ -267,6 +318,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"btn_copy_commits" => "複製 Commits",
 			"tip_copy_commits" => "複製選取的 commits 範圍至剪貼簿",
 			"paste_commit_count" => "{} 個 commit",
+			"paste_commit_count_refused" => "{} 個 commit（{} 個被拒絕）",
+			"commit_header_refused_suffix" => "整個 commit 會被拒絕",
 			"commit_no_message" => "（無訊息）",
 			"commit_empty_note" => "無檔案異動，仍會建立空 commit",
 			"commit_header_counts" => "{} 個檔案，{} 個不寫入",
@@ -370,7 +423,10 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"mapping_unknown_dest" => "目的地不在可選清單：{}",
 			"commit_subset_rejected" => "提交重放必須套用整段內容與中繼資料。取消任一項會在寫入前拒絕，不會只寫其餘檔案",
 			"commit_overwrite_required" => "目的地已有檔案，覆寫預設關閉。請允許覆寫後再套用，否則不會寫入",
+			"commit_will_be_refused" => "第 {} 個 commit「{}」會被拒絕，重播將在此停止",
+			"commit_replay_refused" => "沒有建立任何 commit；第 {} 個 commit「{}」被拒絕：{}",
 			"commit_replay_partial" => "重放中途失敗。已建立且不會丟棄的提交：{}。錯誤：{}",
+			"commit_replay_partial_refused" => "重放中途停止。已建立且不會丟棄的提交：{}。第 {} 個 commit 被拒絕：{}：{}",
 			"commit_replay_done" => "提交重放完成：{}",
 			"commit_whole_note" => "這是整段提交重放。取消任一檔會拒絕整段寫入；覆寫既有檔案必須另外確認",
 			"basket_summary" => "選取籃 {}：{}",
@@ -576,6 +632,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"op_skip" => "Skip",
 			"op_excluded" => "Excluded",
 			"op_overwrite_pending" => "Overwrite pending",
+			"op_refused" => "Refused",
 			"overwrite_toggle" => "Overwrite",
 			"reason_create" => "Not present at destination; will be created",
 			"reason_overwrite" => "Will overwrite the existing destination file",
@@ -585,6 +642,14 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"reason_excluded" => "Excluded; nothing will be written",
 			"reason_commit_excluded" => "Excluded; a commit replay cannot apply a subset of files, so re-select it to apply",
 			"reason_commit_overwrite_pending" => "The file exists at the destination and overwrite is off; Apply is blocked until overwrite is allowed",
+			"reason_refused_renamed_from_dir" => "Whole commit will be refused: the renamed-from path is a directory",
+			"reason_refused_delete_dir" => "Whole commit will be refused: the path to delete is a directory",
+			"reason_refused_dir_in_way" => "Whole commit will be refused: a directory is in the way of the file",
+			"reason_refused_file_in_way" => "Whole commit will be refused: a file is in the way of its parent directory",
+			"reason_refusal_cause_renamed_from_dir" => "the renamed-from path is a directory",
+			"reason_refusal_cause_delete_dir" => "the path to delete is a directory",
+			"reason_refusal_cause_dir_in_way" => "a directory is in the way of the file",
+			"reason_refusal_cause_file_in_way" => "a file is in the way of its parent directory",
 			"paste_keys" => "Enter apply · Esc cancel · ↑↓ item · Space toggle",
 			"copy_from" => "Copy from",
 			"selected" => "selected",
@@ -615,6 +680,8 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"btn_copy_commits" => "Copy Commits",
 			"tip_copy_commits" => "Copy selected commit range to clipboard",
 			"paste_commit_count" => "{} commit(s)",
+			"paste_commit_count_refused" => "{} commit(s) ({} refused)",
+			"commit_header_refused_suffix" => "whole commit will be refused",
 			"commit_no_message" => "(no message)",
 			"commit_empty_note" => "No file changes; an empty commit will still be created",
 			"commit_header_counts" => "{} file(s), {} not written",
@@ -718,7 +785,10 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"mapping_unknown_dest" => "Destination is not a candidate: {}",
 			"commit_subset_rejected" => "Commit replay keeps the whole commit content and metadata. Unchecking any item rejects the replay before any write",
 			"commit_overwrite_required" => "A destination file already exists and overwrite starts off. Allow overwrite before applying; nothing is written until you do",
+			"commit_will_be_refused" => "Commit #{} \"{}\" will be refused; replay will stop there",
+			"commit_replay_refused" => "No commit was created; commit #{} \"{}\" was refused: {}",
 			"commit_replay_partial" => "Replay stopped midway. Commits already created are kept: {}. Error: {}",
+			"commit_replay_partial_refused" => "Replay stopped midway. Commits already created are kept: {}. Commit #{} was refused: {}: {}",
 			"commit_replay_done" => "Commit replay finished: {}",
 			"commit_whole_note" => "This replays the whole commit. Unchecking any file rejects the entire write. Overwriting existing files needs a separate confirmation",
 			"basket_summary" => "Basket {}: {}",
@@ -965,8 +1035,23 @@ mod tests {
 			"commit_header_counts",
 			"reason_skip_generic",
 			"op_overwrite_pending",
+			"op_refused",
 			"reason_commit_excluded",
 			"reason_commit_overwrite_pending",
+			"reason_refused_renamed_from_dir",
+			"reason_refused_delete_dir",
+			"reason_refused_dir_in_way",
+			"reason_refused_file_in_way",
+			"reason_refusal_cause_renamed_from_dir",
+			"reason_refusal_cause_delete_dir",
+			"reason_refusal_cause_dir_in_way",
+			"reason_refusal_cause_file_in_way",
+			"commit_header_refused_suffix",
+			"paste_commit_count_refused",
+			"commit_will_be_refused",
+			"commit_replay_refused",
+			"commit_replay_partial",
+			"commit_replay_partial_refused",
 			"reason_nc_binary",
 			"reason_nc_non_utf8",
 			"reason_nc_non_utf8_path",
@@ -984,5 +1069,83 @@ mod tests {
 			);
 			assert!(!t(key, Locale::En).is_empty(), "Missing En key: {key}");
 		}
+	}
+
+	#[test]
+	fn msg_render_does_not_translate_raw_args_matching_keys_unless_key_arg_set()
+	{
+		// A commit subject or raw error matching an i18n key must NOT be translated
+		let raw_msg = Msg::new(
+			"commit_replay_refused",
+			[
+				"1".to_string(),
+				"op_skip".to_string(),
+				"op_skip".to_string(),
+			],
+		);
+		let rendered = raw_msg.render(Locale::ZhTw);
+		assert!(rendered.contains("「op_skip」"), "{rendered}");
+		assert!(rendered.ends_with("：op_skip"), "{rendered}");
+		assert!(!rendered.contains("跳過"), "{rendered}");
+
+		// When with_key_arg is explicitly used, only that arg index is translated
+		let key_msg = Msg::with_key_arg(
+			"commit_replay_refused",
+			[
+				"1".to_string(),
+				"op_skip".to_string(),
+				"reason_refusal_cause_file_in_way".to_string(),
+			],
+			2,
+		);
+		let rendered = key_msg.render(Locale::ZhTw);
+		assert!(rendered.contains("「op_skip」"), "{rendered}");
+		assert!(rendered.ends_with("：父目錄被檔案佔住"), "{rendered}");
+
+		// When with_key_args is explicitly used, multiple arg indices are translated
+		let multi_key_msg = Msg::with_key_args(
+			"commit_replay_refused",
+			[
+				"1".to_string(),
+				"commit_no_message".to_string(),
+				"reason_refusal_cause_file_in_way".to_string(),
+			],
+			[1, 2],
+		);
+		let rendered = multi_key_msg.render(Locale::ZhTw);
+		assert!(rendered.contains("「（無訊息）」"), "{rendered}");
+		assert!(rendered.ends_with("：父目錄被檔案佔住"), "{rendered}");
+		let rendered_en = multi_key_msg.render(Locale::En);
+		assert!(rendered_en.contains("\"(no message)\""), "{rendered_en}");
+		assert!(
+			rendered_en
+				.ends_with(": a file is in the way of its parent directory"),
+			"{rendered_en}"
+		);
+
+		// commit_replay_partial_refused translates the cause key at arg index 3
+		let partial_msg = Msg::with_key_arg(
+			"commit_replay_partial_refused",
+			[
+				"sha1".to_string(),
+				"2".to_string(),
+				"path.txt".to_string(),
+				"reason_refusal_cause_file_in_way".to_string(),
+			],
+			3,
+		);
+		let rendered = partial_msg.render(Locale::ZhTw);
+		assert!(
+			rendered
+				.contains("第 2 個 commit 被拒絕：path.txt：父目錄被檔案佔住"),
+			"{rendered}"
+		);
+		let rendered_en = partial_msg.render(Locale::En);
+		assert!(
+			rendered_en.contains(
+				"Commit #2 was refused: path.txt: a file is in the way of its parent directory"
+			),
+			"{rendered_en}"
+		);
 	}
 }

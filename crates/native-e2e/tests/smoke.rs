@@ -1323,31 +1323,40 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		"keyup",
 		"Shift_L",
 	]);
-	wait_for_pattern("[APP:RANGE: commits=", Duration::from_secs(3))
-		.expect("shift-click must select commit range");
+	let range_line =
+		wait_for_pattern("[APP:RANGE: commits=", Duration::from_secs(3))
+			.expect("shift-click must select commit range");
+	assert!(
+		range_line.contains("commits=2 chain=first_parent"),
+		"range line must indicate first-parent chain with 2 commits, got: {range_line}"
+	);
 
 	// Compare button
 	click("btn-compare");
 	wait_for_pattern("[APP:COMPARE:", Duration::from_secs(3))
 		.expect("btn-compare must trigger compare view");
 
-	// 10b. The display range from the merge down to the root includes the
-	// side-branch commit. That is not a first-parent chain, so the copy must
-	// fail before it replaces the clipboard.
-	println!("[TEST DRIVER] Rejecting a non-contiguous commit selection...");
-	let before_invalid =
-		clip::read_text().expect("clipboard before commit copy");
+	// 10b. The first-parent chain from the merge down to the root excludes the
+	// side-branch commit. That is a contiguous first-parent chain, so the copy
+	// succeeds and places a commit payload on the clipboard.
+	println!("[TEST DRIVER] Copying first-parent commit selection...");
 	click("btn-copy-commits");
-	wait_for_pattern("[APP:COPY_COMMITS_ERR:", Duration::from_secs(5))
-		.expect("side-branch range must be rejected");
-	let after_invalid = clip::read_text().expect("clipboard after rejection");
-	assert_eq!(
-		before_invalid, after_invalid,
-		"rejected commit export must not overwrite the clipboard"
-	);
+	wait_for_pattern(
+		"[APP:COPY_COMMITS_DONE: commits=2]",
+		Duration::from_secs(5),
+	)
+	.expect("first-parent range must be copied");
+	let commit_clip = clip::read_text().expect("clipboard after commit copy");
 	assert!(
-		!commits::is_commit_payload(&after_invalid),
-		"rejected export must not become a commit payload"
+		commits::is_commit_payload(&commit_clip),
+		"copy must produce a commit payload"
+	);
+	let payload = commits::parse_commit_payload(&commit_clip)
+		.expect("payload must parse");
+	assert_eq!(
+		payload.commits.len(),
+		2,
+		"payload must contain the 2 first-parent commits"
 	);
 
 	// Switch back to Project for file copy workflow
@@ -2645,7 +2654,10 @@ fn native_d3_basket_mapping_and_replay() {
 		"keyup",
 		"Shift_L",
 	]);
-	wait_for("[APP:RANGE: commits=2]", Duration::from_secs(3));
+	wait_for(
+		"[APP:RANGE: commits=2 chain=first_parent]",
+		Duration::from_secs(3),
+	);
 	click("btn-copy-commits");
 	wait_for("[APP:COPY_COMMITS_DONE: commits=2]", Duration::from_secs(6));
 	let commit_clip = clip::read_text().unwrap();
@@ -2687,7 +2699,8 @@ fn native_d3_basket_mapping_and_replay() {
 		"keyup",
 		"Shift_L",
 	]);
-	wait_for("[APP:RANGE:", Duration::from_secs(3));
+	let range = wait_for("[APP:RANGE:", Duration::from_secs(3));
+	assert!(range.contains("chain=visual"), "{range}");
 	click("btn-copy-commits");
 	wait_for("[APP:COPY_COMMITS_ERR:", Duration::from_secs(6));
 	assert_eq!(clip::read_text().unwrap(), commit_clip);

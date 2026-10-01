@@ -300,11 +300,7 @@ impl WorkbenchModel {
 			deletes,
 			skips,
 		} = plan.counts();
-		let commit_count = plan
-			.commit_preview
-			.as_ref()
-			.filter(|_| plan.whole_commit)
-			.map(|p| p.plan().commits.len());
+		let commit_label = plan.commit_summary_label(loc);
 		let dest = plan.destination.display().to_string();
 		let applying = plan.is_applying;
 		let mapping_ready = plan.mapping_ready();
@@ -340,13 +336,13 @@ impl WorkbenchModel {
 			.text_size(px(SMALL_TEXT))
 			.border_b_1()
 			.border_color(rgb(pal().divider))
-			.children(commit_count.map(|n| {
+			.children(commit_label.map(|label| {
 				div()
 					.id("paste-commit-count")
 					.relative()
 					.flex_shrink_0()
 					.font_weight(FontWeight::SEMIBOLD)
-					.child(tf("paste_commit_count", loc, &[&n.to_string()]))
+					.child(label)
 					.children(probe(log, "paste-commit-count"))
 			}))
 			.child(
@@ -790,12 +786,14 @@ impl WorkbenchModel {
 						),
 				)
 			})
-			.when(selected.is_some_and(|i| i.is_delete()), |d| {
+			.when(selected.is_some_and(|i| i.shows_delete_notice()), |d| {
 				d.child(
 					div()
+						.relative()
 						.p(px(12.))
 						.text_color(rgb(pal().error))
-						.child(t("reason_delete", loc)),
+						.child(t("reason_delete", loc))
+						.children(probe(log, "paste-delete-notice")),
 				)
 			})
 			.when(selected.is_some_and(|i| !i.is_delete()), |d| {

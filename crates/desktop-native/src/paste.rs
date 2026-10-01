@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use snip_core::commits::{
-	self, FilePlan, NotCopiedReason, ReplayAction, ReplaySkipReason,
+	self, FilePlan, LayoutConflict, NotCopiedReason, ReplayAction,
+	ReplaySkipReason,
 };
 use snip_core::format;
 use snip_core::gitrun::{CancelToken, RunOptions};
@@ -26,7 +27,7 @@ use snip_core::transfer::{
 	CommitReplayPreview, ImportMapping, TransferError, TransferImportPlan,
 };
 
-use crate::i18n::Msg;
+use crate::i18n::{tf, Locale, Msg};
 use crate::reader::{Preview, PreviewSource};
 use crate::syntax::Language;
 
@@ -441,6 +442,7 @@ pub enum PlannedOp {
 	Overwrite,
 	Delete,
 	Skip(SkipCause),
+	CommitRefused(LayoutConflict),
 }
 
 /// Why a commit file is listed but never written.
@@ -474,6 +476,8 @@ pub enum RowAction {
 	OverwritePending,
 	/// File restore: an existing file kept because overwrite is off.
 	KeepExisting,
+	/// Commit replay: layout conflict refuses the whole commit.
+	CommitRefused(LayoutConflict),
 }
 
 impl RowAction {
@@ -481,7 +485,10 @@ impl RowAction {
 	pub fn is_not_written(self) -> bool {
 		match self {
 			Self::Skip(_) | Self::DeleteMissing | Self::KeepExisting => true,
-			Self::Excluded { .. }
+			// Per spec 4.3, layout conflicts refuse the whole commit instead of
+			// skipping individual files, so CommitRefused is not counted as a skip.
+			Self::CommitRefused(_)
+			| Self::Excluded { .. }
 			| Self::Delete
 			| Self::Create
 			| Self::Overwrite
@@ -536,6 +543,7 @@ impl PasteItem {
 			};
 		}
 		match self.op {
+			PlannedOp::CommitRefused(c) => RowAction::CommitRefused(c),
 			PlannedOp::Skip(c) => RowAction::Skip(c),
 			PlannedOp::Delete => {
 				if self.dest_exists {
@@ -556,6 +564,10 @@ impl PasteItem {
 				}
 			}
 		}
+	}
+
+	pub fn shows_delete_notice(&self) -> bool {
+		matches!(self.action(), RowAction::Delete)
 	}
 
 	fn retained_heap_bytes(&self) -> usize {
@@ -743,12 +755,41 @@ fn skip_cause(file: &FilePlan) -> SkipCause {
 	}
 }
 
+pub(crate) fn layout_conflict_key(conflict: LayoutConflict) -> &'static str {
+	match conflict {
+		LayoutConflict::RenamedFromIsDirectory => {
+			"reason_refused_renamed_from_dir"
+		}
+		LayoutConflict::DeleteTargetIsDirectory => "reason_refused_delete_dir",
+		LayoutConflict::DirectoryInTheWay => "reason_refused_dir_in_way",
+		LayoutConflict::FileInTheWayOfParent => "reason_refused_file_in_way",
+	}
+}
+
+pub(crate) fn layout_conflict_cause_key(
+	conflict: LayoutConflict,
+) -> &'static str {
+	match conflict {
+		LayoutConflict::RenamedFromIsDirectory => {
+			"reason_refusal_cause_renamed_from_dir"
+		}
+		LayoutConflict::DeleteTargetIsDirectory => {
+			"reason_refusal_cause_delete_dir"
+		}
+		LayoutConflict::DirectoryInTheWay => "reason_refusal_cause_dir_in_way",
+		LayoutConflict::FileInTheWayOfParent => {
+			"reason_refusal_cause_file_in_way"
+		}
+	}
+}
+
 fn header_label(op: PlannedOp) -> &'static str {
 	match op {
 		PlannedOp::Create => "CREATE",
 		PlannedOp::Overwrite => "OVERWRITE",
 		PlannedOp::Delete => "DELETE",
 		PlannedOp::Skip(_) => "SKIP",
+		PlannedOp::CommitRefused(_) => "REFUSED",
 	}
 }
 
@@ -1039,11 +1080,17 @@ impl PastePreviewPlan {
 			for (f_idx, (file, src)) in
 				commit.files.iter().zip(&record.files).enumerate()
 			{
-				let op = match file.action {
-					ReplayAction::Delete => PlannedOp::Delete,
-					ReplayAction::Write if file.existed => PlannedOp::Overwrite,
-					ReplayAction::Write => PlannedOp::Create,
-					ReplayAction::Skip => PlannedOp::Skip(skip_cause(file)),
+				let op = if let Some(conflict) = file.layout_conflict {
+					PlannedOp::CommitRefused(conflict)
+				} else {
+					match file.action {
+						ReplayAction::Delete => PlannedOp::Delete,
+						ReplayAction::Write if file.existed => {
+							PlannedOp::Overwrite
+						}
+						ReplayAction::Write => PlannedOp::Create,
+						ReplayAction::Skip => PlannedOp::Skip(skip_cause(file)),
+					}
 				};
 				let body = src.content.as_deref().unwrap_or_default();
 				let head = |op: PlannedOp| {
@@ -1098,7 +1145,7 @@ impl PastePreviewPlan {
 					rows.push(row(
 						old,
 						old_abs.clone(),
-						old_abs.exists(),
+						file.old_existed,
 						PlannedOp::Delete,
 						format!(
 							"{}path: {old}\nrenamed to: {}\n",
@@ -1137,6 +1184,7 @@ impl PastePreviewPlan {
 			}
 		}
 		plan.items = items;
+		plan.error = plan.refusal_banner();
 		check_budget(plan.retained_bytes(), limit)?;
 		Ok(plan)
 	}
@@ -1401,12 +1449,78 @@ impl PastePreviewPlan {
 		}
 	}
 
+	pub fn all_selected(&self) -> bool {
+		self.items.iter().all(|i| i.selected)
+	}
+
 	pub fn toggle_selected(&mut self, idx: usize) {
 		if let Some(item) = self.items.get_mut(idx) {
 			item.selected = !item.selected;
 		}
-		if self.whole_commit && self.items.iter().any(|i| !i.selected) {
-			self.error = Some(Msg::new("commit_subset_rejected", []));
+		if self.whole_commit {
+			if !self.all_selected() {
+				// Only the informational banner (or none) gives way; a real error stays visible.
+				if self
+					.error
+					.as_ref()
+					.is_none_or(|e| e.key == "commit_will_be_refused")
+				{
+					self.error = Some(Msg::new("commit_subset_rejected", []));
+				}
+			} else if self
+				.error
+				.as_ref()
+				.is_some_and(|e| e.key == "commit_subset_rejected")
+			{
+				self.error = self.refusal_banner();
+			}
+		}
+	}
+
+	pub fn refusal_banner(&self) -> Option<Msg> {
+		let preview =
+			self.commit_preview.as_ref().filter(|_| self.whole_commit)?;
+		for (c_idx, commit) in preview.plan().commits.iter().enumerate() {
+			if commit.refused_by().is_some() {
+				let subject =
+					commit.message.lines().next().unwrap_or("").trim();
+				let (subject_arg, is_key) = if subject.is_empty() {
+					("commit_no_message", true)
+				} else {
+					(subject, false)
+				};
+				return Some(if is_key {
+					Msg::with_key_arg(
+						"commit_will_be_refused",
+						[(c_idx + 1).to_string(), subject_arg.to_string()],
+						1,
+					)
+				} else {
+					Msg::new(
+						"commit_will_be_refused",
+						[(c_idx + 1).to_string(), subject_arg.to_string()],
+					)
+				});
+			}
+		}
+		None
+	}
+
+	pub fn commit_summary_label(&self, loc: Locale) -> Option<String> {
+		let preview =
+			self.commit_preview.as_ref().filter(|_| self.whole_commit)?;
+		let commits = &preview.plan().commits;
+		let total = commits.len();
+		let refused =
+			commits.iter().filter(|c| c.refused_by().is_some()).count();
+		if refused > 0 {
+			Some(tf(
+				"paste_commit_count_refused",
+				loc,
+				&[&total.to_string(), &refused.to_string()],
+			))
+		} else {
+			Some(tf("paste_commit_count", loc, &[&total.to_string()]))
 		}
 	}
 
@@ -1562,7 +1676,8 @@ impl PastePreviewPlan {
 				RowAction::Create => c.creates += 1,
 				RowAction::Overwrite => c.overwrites += 1,
 				RowAction::Delete => c.deletes += 1,
-				RowAction::OverwritePending
+				RowAction::CommitRefused(_)
+				| RowAction::OverwritePending
 				| RowAction::Excluded { by_commit: true } => {}
 				RowAction::Skip(_)
 				| RowAction::DeleteMissing
@@ -1684,15 +1799,70 @@ impl PastePreviewPlan {
 			other => stale_msg(other),
 		})?;
 		if let Some(fail) = replay_res.failure {
-			let created = if replay_res.created.is_empty() {
-				"(none)".to_string()
-			} else {
-				replay_res.created.join(", ")
-			};
-			return Err(Msg::new(
-				"commit_replay_partial",
-				[created, fail.error],
-			));
+			if replay_res.created.is_empty() {
+				let subject = fail.message.lines().next().unwrap_or("").trim();
+				let (subject_arg, subject_is_key) = if subject.is_empty() {
+					("commit_no_message", true)
+				} else {
+					(subject, false)
+				};
+				let mut key_args = Vec::new();
+				if subject_is_key {
+					key_args.push(1);
+				}
+				let (cause_arg, cause_is_key) = match fail.layout_conflict {
+					Some(conflict) => {
+						(layout_conflict_cause_key(conflict), true)
+					}
+					None => (fail.error.as_str(), false),
+				};
+				if cause_is_key {
+					key_args.push(2);
+				}
+				let msg = if key_args.is_empty() {
+					Msg::new(
+						"commit_replay_refused",
+						[
+							(fail.index + 1).to_string(),
+							subject_arg.to_string(),
+							cause_arg.to_string(),
+						],
+					)
+				} else {
+					Msg::with_key_args(
+						"commit_replay_refused",
+						[
+							(fail.index + 1).to_string(),
+							subject_arg.to_string(),
+							cause_arg.to_string(),
+						],
+						key_args,
+					)
+				};
+				return Err(msg);
+			}
+			let created = replay_res.created.join(", ");
+			return Err(match fail.layout_conflict {
+				Some(conflict) => {
+					let path = fail
+						.conflict_path
+						.as_deref()
+						.unwrap_or(fail.error.as_str());
+					Msg::with_key_arg(
+						"commit_replay_partial_refused",
+						[
+							created,
+							(fail.index + 1).to_string(),
+							path.to_string(),
+							layout_conflict_cause_key(conflict).to_string(),
+						],
+						3,
+					)
+				}
+				None => {
+					Msg::new("commit_replay_partial", [created, fail.error])
+				}
+			});
 		}
 		Ok(PasteApplyResult {
 			files: RestoreExecutionResult {
@@ -2764,10 +2934,10 @@ pub(crate) mod tests {
 	}
 
 	#[test]
-	fn commit_paste_under_a_file_previews_it_as_a_skip() {
+	fn commit_paste_under_a_file_previews_and_applies_as_refused() {
 		use snip_core::commits::{
 			CommitFile, CommitRecord, CommitsPayload, FileChange,
-			ReplaySkipReason,
+			LayoutConflict, ReplaySkipReason,
 		};
 		let dir = tempfile::tempdir().unwrap();
 		let repo = dir.path().join("repo");
@@ -2794,17 +2964,646 @@ pub(crate) mod tests {
 				files: vec![file("newdir/x.txt"), file("fresh.txt")],
 			}],
 		});
-		let plan =
+		let mut plan =
 			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
-				.expect("the blocked file is skipped, not a refusal");
-		let files =
-			&plan.commit_preview.as_ref().unwrap().plan().commits[0].files;
-		assert_eq!(files[0].skip_reason, Some(ReplaySkipReason::UnsafePath));
-		assert_eq!(files[1].skip_reason, None);
+				.expect("the blocked file is planned with layout refusal");
+
+		// Core commit plan records layout conflict and refusal
+		let commit_plan =
+			&plan.commit_preview.as_ref().unwrap().plan().commits[0];
+		assert_eq!(
+			commit_plan.files[0].skip_reason,
+			Some(ReplaySkipReason::UnsafePath)
+		);
+		assert_eq!(
+			commit_plan.files[0].layout_conflict,
+			Some(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert_eq!(
+			commit_plan.refused_by(),
+			Some(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert_eq!(commit_plan.files[1].skip_reason, None);
+		assert_eq!(commit_plan.files[1].layout_conflict, None);
+
+		// Item op and action are CommitRefused, and is_not_written() is false
+		assert_eq!(
+			plan.items[0].op,
+			PlannedOp::CommitRefused(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert_eq!(
+			plan.items[0].action(),
+			RowAction::CommitRefused(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert!(!plan.items[0].action().is_not_written());
+
+		// Header not-written count excludes the refused row
+		let (total_rows, not_written) = plan.commit_counts(0);
+		assert_eq!(total_rows, 2);
+		assert_eq!(not_written, 0);
+
+		// PasteCounts excludes the refused row from skips
+		let counts = plan.counts();
+		assert_eq!(counts.creates, 1);
+		assert_eq!(counts.skips, 0);
+
+		// Header labels include refused suffix
+		let (hdr_zh, _, _) = crate::ui::commit_header_labels(
+			commit_plan,
+			crate::i18n::Locale::ZhTw,
+		);
+		assert_eq!(hdr_zh, "incoming (整個 commit 會被拒絕)");
+		let (hdr_en, _, _) = crate::ui::commit_header_labels(
+			commit_plan,
+			crate::i18n::Locale::En,
+		);
+		assert_eq!(hdr_en, "incoming (whole commit will be refused)");
+
+		// Summary label counts refused commits
+		assert_eq!(
+			plan.commit_summary_label(crate::i18n::Locale::ZhTw),
+			Some("1 個 commit（1 個被拒絕）".to_string())
+		);
+		assert_eq!(
+			plan.commit_summary_label(crate::i18n::Locale::En),
+			Some("1 commit(s) (1 refused)".to_string())
+		);
+
+		// Red banner shows refusal on preview load
+		assert_eq!(
+			plan.error.as_ref().map(|m| m.key),
+			Some("commit_will_be_refused")
+		);
+		let banner_zh = plan
+			.error
+			.as_ref()
+			.unwrap()
+			.render(crate::i18n::Locale::ZhTw);
+		assert!(
+			banner_zh.contains("第 1 個 commit「incoming」會被拒絕"),
+			"{banner_zh}"
+		);
+		let banner_en =
+			plan.error.as_ref().unwrap().render(crate::i18n::Locale::En);
+		assert!(
+			banner_en.contains("Commit #1 \"incoming\" will be refused"),
+			"{banner_en}"
+		);
+
+		// S4 rule: unchecking a row sets commit_subset_rejected; re-including restores commit_will_be_refused
+		plan.toggle_selected(1);
+		assert_eq!(
+			plan.error.as_ref().map(|m| m.key),
+			Some("commit_subset_rejected")
+		);
+		plan.toggle_selected(1);
+		assert_eq!(
+			plan.error.as_ref().map(|m| m.key),
+			Some("commit_will_be_refused")
+		);
+
+		// Apply refuses the whole commit with commit_replay_refused
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.key, "commit_replay_refused");
+		assert_eq!(err.args[0], "1");
+		assert_eq!(err.args[1], "incoming");
+		assert_eq!(err.args[2], "reason_refusal_cause_file_in_way");
+
+		// No (none) and no midway failure wording in zh-TW or en
+		let rendered_zh = err.render(crate::i18n::Locale::ZhTw);
+		assert!(!rendered_zh.contains("(none)"), "{rendered_zh}");
+		assert!(!rendered_zh.contains("中途"), "{rendered_zh}");
+		assert!(
+			rendered_zh.contains("沒有建立任何 commit；第 1 個 commit「incoming」被拒絕：父目錄被檔案佔住"),
+			"{rendered_zh}"
+		);
+
+		let rendered_en = err.render(crate::i18n::Locale::En);
+		assert!(!rendered_en.contains("(none)"), "{rendered_en}");
+		assert!(!rendered_en.contains("midway"), "{rendered_en}");
+		assert!(
+			rendered_en.contains("No commit was created; commit #1 \"incoming\" was refused: a file is in the way of its parent directory"),
+			"{rendered_en}"
+		);
+
+		// Zero writes made to destination
 		assert_eq!(
 			fs::read_to_string(repo.join("newdir")).unwrap(),
 			"i am a file\n"
 		);
+		assert!(!repo.join("fresh.txt").exists());
+		assert_eq!(
+			git_run(&repo, &["rev-list", "--count", "HEAD"]).trim(),
+			"1"
+		);
+	}
+
+	#[test]
+	fn commit_empty_subject_refusal_banner_and_apply_uses_commit_no_message() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("blocker"), "regular file\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("x\n".into()),
+			not_copied: None,
+		};
+		// Empty commit subject (only whitespace / newline)
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "   \n\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-25T12:00:00+00:00".into(),
+				files: vec![file("blocker/child.txt")],
+			}],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
+				.expect("preview plan builds");
+
+		// Refusal banner uses commit_no_message instead of empty brackets 「」
+		let banner = plan.error.as_ref().expect("refusal banner present");
+		assert_eq!(banner.key, "commit_will_be_refused");
+		let banner_zh = banner.render(crate::i18n::Locale::ZhTw);
+		assert!(
+			banner_zh.contains("第 1 個 commit「（無訊息）」會被拒絕"),
+			"{banner_zh}"
+		);
+		assert!(!banner_zh.contains("「」"), "{banner_zh}");
+		let banner_en = banner.render(crate::i18n::Locale::En);
+		assert!(
+			banner_en.contains("Commit #1 \"(no message)\" will be refused"),
+			"{banner_en}"
+		);
+		assert!(!banner_en.contains("\"\""), "{banner_en}");
+
+		// Apply refusal uses commit_no_message and translates cause
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.key, "commit_replay_refused");
+		let err_zh = err.render(crate::i18n::Locale::ZhTw);
+		assert!(
+			err_zh.contains(
+				"第 1 個 commit「（無訊息）」被拒絕：父目錄被檔案佔住"
+			),
+			"{err_zh}"
+		);
+		assert!(!err_zh.contains("「」"), "{err_zh}");
+		let err_en = err.render(crate::i18n::Locale::En);
+		assert!(
+			err_en.contains(
+				"commit #1 \"(no message)\" was refused: a file is in the way of its parent directory"
+			),
+			"{err_en}"
+		);
+		assert!(!err_en.contains("\"\""), "{err_en}");
+	}
+
+	struct HeavyLockBlocker {
+		held: snip_core::workspace::HeavyGuard,
+		cancel: snip_core::gitrun::CancelToken,
+		waiters: Vec<std::thread::JoinHandle<()>>,
+	}
+
+	impl HeavyLockBlocker {
+		fn fill(repo: &Path) -> Self {
+			use snip_core::gitrun::{CancelToken, RunOptions};
+			use snip_core::gitsrc::{Git, GitError};
+			use snip_core::workspace::{
+				lock_heavy, RepoIdentity, MAX_HEAVY_WAITERS,
+			};
+			use std::time::{Duration, Instant};
+
+			let git = Git::open(repo).unwrap();
+			let id =
+				RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
+			let held = lock_heavy(&id, &RunOptions::default()).unwrap();
+			let cancel = CancelToken::new();
+			let mut waiters = Vec::new();
+			for _ in 0..MAX_HEAVY_WAITERS {
+				let id = id.clone();
+				let cancel = cancel.clone();
+				waiters.push(std::thread::spawn(move || {
+					while !cancel.is_cancelled() {
+						let res = lock_heavy(
+							&id,
+							&RunOptions {
+								cancel: Some(cancel.clone()),
+								queue_timeout: Duration::from_secs(60),
+								..Default::default()
+							},
+						);
+						if matches!(res, Err(GitError::Cancelled { .. })) {
+							break;
+						}
+						std::thread::sleep(Duration::from_millis(5));
+					}
+				}));
+			}
+			let deadline = Instant::now() + Duration::from_secs(10);
+			loop {
+				let res = lock_heavy(
+					&id,
+					&RunOptions {
+						queue_timeout: Duration::from_millis(50),
+						..RunOptions::default()
+					},
+				);
+				if matches!(res, Err(GitError::WorktreeBusy { .. })) {
+					break;
+				}
+				assert!(
+					Instant::now() < deadline,
+					"timed out waiting for heavy lock waiting room to fill"
+				);
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			Self {
+				held,
+				cancel,
+				waiters,
+			}
+		}
+
+		fn release(self) {
+			use std::time::{Duration, Instant};
+
+			self.cancel.cancel();
+			drop(self.held);
+			let deadline = Instant::now() + Duration::from_secs(30);
+			for w in self.waiters {
+				while !w.is_finished() {
+					assert!(
+						Instant::now() < deadline,
+						"timed out waiting for heavy lock waiter thread to finish"
+					);
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				let _ = w.join();
+			}
+		}
+	}
+
+	#[test]
+	fn commit_apply_begin_failure_reports_refused_wording_without_none() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("a.txt"), "base\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("x\n".into()),
+			not_copied: None,
+		};
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "first commit\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-25T12:00:00+00:00".into(),
+				files: vec![file("b.txt")],
+			}],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
+				.unwrap();
+
+		let blocker = HeavyLockBlocker::fill(&repo);
+		let err = plan.execute().unwrap_err();
+		blocker.release();
+
+		assert_eq!(err.key, "commit_replay_refused");
+		assert_eq!(err.args[0], "1");
+		assert_eq!(err.args[1], "first commit");
+		let rendered_zh = err.render(crate::i18n::Locale::ZhTw);
+		assert!(!rendered_zh.contains("(none)"), "{rendered_zh}");
+		assert!(!rendered_zh.contains("中途"), "{rendered_zh}");
+		assert!(
+			rendered_zh.contains(
+				"沒有建立任何 commit；第 1 個 commit「first commit」被拒絕："
+			),
+			"{rendered_zh}"
+		);
+	}
+
+	#[test]
+	fn commit_apply_raw_error_matching_i18n_key_is_not_translated() {
+		// When execute_commit encounters a non-layout failure where the error or subject
+		// matches a translation key (e.g. "op_skip"), it must not be translated.
+		// Drive this through execute() using a begin/lock failure on a commit with
+		// subject "op_skip".
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("a.txt"), "base\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "op_skip\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-25T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "b.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("x\n".into()),
+					not_copied: None,
+				}],
+			}],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
+				.unwrap();
+
+		let blocker = HeavyLockBlocker::fill(&repo);
+		let err = plan.execute().unwrap_err();
+		blocker.release();
+
+		assert_eq!(err.key, "commit_replay_refused");
+		assert_eq!(err.args[0], "1");
+		assert_eq!(err.args[1], "op_skip");
+		let rendered = err.render(crate::i18n::Locale::ZhTw);
+		assert!(
+			rendered.contains(
+				"沒有建立任何 commit；第 1 個 commit「op_skip」被拒絕："
+			),
+			"{rendered}"
+		);
+		assert!(!rendered.contains("「跳過」"), "{rendered}");
+	}
+
+	#[test]
+	fn commit_apply_partial_failure_with_layout_conflict_translates_cause() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+			LayoutConflict,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("a.txt"), "base\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let file = |path: &str, content: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some(content.into()),
+			not_copied: None,
+		};
+		// Commit 1 creates regular file "newdir".
+		// Commit 2 attempts to create "newdir/x.txt", hitting a layout conflict during replay.
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![
+				CommitRecord {
+					message: "commit one\n".into(),
+					author_name: "Author".into(),
+					author_email: "author@example.invalid".into(),
+					author_date: "2026-09-25T12:00:00+00:00".into(),
+					files: vec![file("newdir", "i am a file\n")],
+				},
+				CommitRecord {
+					message: "commit two\n".into(),
+					author_name: "Author".into(),
+					author_email: "author@example.invalid".into(),
+					author_date: "2026-09-25T12:01:00+00:00".into(),
+					files: vec![file("newdir/x.txt", "under file\n")],
+				},
+			],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
+				.unwrap();
+
+		// The preview already plans commit 2 after commit 1, so it shows the
+		// refusal Apply will hit: header, summary and banner.
+		let commit_plans = plan.commit_preview.as_ref().unwrap().plan();
+		assert_eq!(commit_plans.commits[0].refused_by(), None);
+		assert_eq!(
+			commit_plans.commits[1].refused_by(),
+			Some(LayoutConflict::FileInTheWayOfParent)
+		);
+		let (hdr, _, _) = crate::ui::commit_header_labels(
+			&commit_plans.commits[1],
+			crate::i18n::Locale::En,
+		);
+		assert_eq!(hdr, "commit two (whole commit will be refused)");
+		assert_eq!(
+			plan.commit_summary_label(crate::i18n::Locale::En),
+			Some("2 commit(s) (1 refused)".to_string())
+		);
+		assert_eq!(
+			plan.items[1].op,
+			PlannedOp::CommitRefused(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert_eq!(
+			plan.error.as_ref().map(|m| m.key),
+			Some("commit_will_be_refused")
+		);
+		let banner =
+			plan.error.as_ref().unwrap().render(crate::i18n::Locale::En);
+		assert!(
+			banner.contains("Commit #2 \"commit two\" will be refused"),
+			"{banner}"
+		);
+
+		let err = plan.execute().unwrap_err();
+		assert_eq!(err.key, "commit_replay_partial_refused");
+		assert_eq!(err.args.len(), 4);
+		assert_eq!(err.args[1], "2");
+		assert_eq!(err.args[2], "newdir/x.txt");
+		assert_eq!(err.args[3], "reason_refusal_cause_file_in_way");
+
+		// In zh-TW, banner uses translated cause and contains no English layout reason
+		let rendered_zh = err.render(crate::i18n::Locale::ZhTw);
+		assert!(rendered_zh.contains("重放中途停止"), "{rendered_zh}");
+		assert!(
+			rendered_zh.contains(
+				"第 2 個 commit 被拒絕：newdir/x.txt：父目錄被檔案佔住"
+			),
+			"{rendered_zh}"
+		);
+		assert!(
+			!rendered_zh.contains("a file is in the way"),
+			"{rendered_zh}"
+		);
+
+		// In en, banner uses English cause
+		let rendered_en = err.render(crate::i18n::Locale::En);
+		assert!(
+			rendered_en.contains("Replay stopped midway"),
+			"{rendered_en}"
+		);
+		assert!(
+			rendered_en.contains(
+				"Commit #2 was refused: newdir/x.txt: a file is in the way of its parent directory"
+			),
+			"{rendered_en}"
+		);
+
+		// First commit was created; second commit was not
+		assert_eq!(
+			git_run(&repo, &["rev-list", "--count", "HEAD"]).trim(),
+			"2"
+		);
+		assert_eq!(
+			fs::read_to_string(repo.join("newdir")).unwrap(),
+			"i am a file\n"
+		);
+		assert!(!repo.join("newdir/x.txt").exists());
+	}
+
+	#[test]
+	fn commit_preview_does_not_refuse_a_blocker_an_earlier_commit_removes() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("newdir"), "i am a file\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let record =
+			|message: &str, path: &str, change, content| CommitRecord {
+				message: format!("{message}\n"),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-25T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: path.into(),
+					old_path: None,
+					change,
+					content,
+					not_copied: None,
+				}],
+			};
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![
+				record("remove blocker", "newdir", FileChange::Deleted, None),
+				record(
+					"write under it",
+					"newdir/x.txt",
+					FileChange::Added,
+					Some("x\n".into()),
+				),
+			],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
+				.unwrap();
+
+		let commit_plans = plan.commit_preview.as_ref().unwrap().plan();
+		assert_eq!(commit_plans.commits[1].refused_by(), None);
+		assert_eq!(
+			plan.commit_summary_label(crate::i18n::Locale::En),
+			Some("2 commit(s)".to_string())
+		);
+		assert!(plan.error.is_none(), "{:?}", plan.error);
+		let (hdr, _, _) = crate::ui::commit_header_labels(
+			&commit_plans.commits[1],
+			crate::i18n::Locale::En,
+		);
+		assert_eq!(hdr, "write under it");
+
+		plan.execute().expect("both commits replay");
+		assert_eq!(
+			git_run(&repo, &["rev-list", "--count", "HEAD"]).trim(),
+			"3"
+		);
+		assert_eq!(
+			fs::read_to_string(repo.join("newdir/x.txt")).unwrap(),
+			"x\n"
+		);
+	}
+
+	#[test]
+	fn commit_preview_rename_of_a_file_an_earlier_commit_adds_is_a_real_delete()
+	{
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("keep.txt"), "keep\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let record = |message: &str,
+		              path: &str,
+		              old_path: Option<&str>,
+		              change| CommitRecord {
+			message: format!("{message}\n"),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![CommitFile {
+				path: path.into(),
+				old_path: old_path.map(Into::into),
+				change,
+				content: Some("x\n".into()),
+				not_copied: None,
+			}],
+		};
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![
+				record("add", "a.txt", None, FileChange::Added),
+				record("rename", "b.txt", Some("a.txt"), FileChange::Renamed),
+			],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
+				.unwrap();
+
+		let old = plan
+			.items
+			.iter()
+			.find(|i| i.path == "a.txt" && i.op == PlannedOp::Delete)
+			.expect("the rename shows its old path as a delete row");
+		assert_eq!(old.action(), RowAction::Delete);
+		assert!(old.shows_delete_notice());
+
+		plan.execute().expect("both commits replay");
+		assert!(!repo.join("a.txt").exists());
+		assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "x\n");
 	}
 
 	#[test]
@@ -3008,8 +3807,11 @@ pub(crate) mod tests {
 		)
 		.unwrap();
 		let err = nested_plan.execute().unwrap_err();
-		assert_eq!(err.key, "commit_replay_partial");
+		assert_eq!(err.key, "commit_replay_partial_refused");
 		assert_ne!(err.args[0], "(none)");
+		assert_eq!(err.args[1], "2");
+		assert_eq!(err.args[2], "leaf/child.txt");
+		assert_eq!(err.args[3], "reason_refusal_cause_file_in_way");
 		assert_eq!(
 			fs::read_to_string(path.join("leaf")).unwrap(),
 			"file-not-dir\n"
@@ -3111,6 +3913,120 @@ pub(crate) mod tests {
 			make_item(true, None, PlannedOp::Overwrite, true, false).action(),
 			RowAction::KeepExisting
 		);
+		assert_eq!(
+			make_item(
+				true,
+				Some(0),
+				PlannedOp::CommitRefused(LayoutConflict::FileInTheWayOfParent),
+				false,
+				false
+			)
+			.action(),
+			RowAction::CommitRefused(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert!(!RowAction::CommitRefused(
+			LayoutConflict::FileInTheWayOfParent
+		)
+		.is_not_written());
+	}
+
+	#[test]
+	fn commit_replay_toggle_selected_error_lifecycle() {
+		let (_dir, mut plan) = mixed_plan();
+		assert!(plan.items.len() >= 2);
+		assert!(plan.whole_commit);
+		assert!(plan.error.is_none());
+
+		// Exclude a row -> plan.error key == "commit_subset_rejected"
+		plan.toggle_selected(0);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+
+		// Re-include -> plan.error is None
+		plan.toggle_selected(0);
+		assert!(plan.error.is_none());
+
+		// Seed a DIFFERENT key manually after excluding
+		plan.toggle_selected(0);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+		plan.error = Some(Msg::new("stale_modified", []));
+		// Re-include and assert the different error survives
+		plan.toggle_selected(0);
+		assert_eq!(plan.error.as_ref().map(|e| e.key), Some("stale_modified"));
+
+		// Reset error for partial re-include test
+		plan.error = None;
+		// Two rows excluded
+		plan.toggle_selected(0);
+		plan.toggle_selected(1);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+
+		// Partial re-include: one re-included, one still excluded -> keeps banner
+		plan.toggle_selected(0);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+
+		// Remaining row re-included -> all selected -> banner cleared
+		plan.toggle_selected(1);
+		assert!(plan.error.is_none());
+	}
+
+	#[test]
+	fn commit_replay_space_cycle_keeps_a_pre_existing_real_error() {
+		let (_dir, mut plan) = mixed_plan();
+		assert!(plan.items.len() >= 2);
+		// The informational refusal banner is not a real error: it gives way and returns.
+		plan.error = plan.refusal_banner();
+		let key = |p: &PastePreviewPlan| p.error.as_ref().map(|e| e.key);
+		plan.toggle_selected(0);
+		assert_eq!(key(&plan), Some("commit_subset_rejected"));
+		plan.toggle_selected(0);
+		assert_eq!(key(&plan), plan.refusal_banner().as_ref().map(|e| e.key));
+
+		// A real error (what Apply records) survives exclude and re-include.
+		plan.error = Some(Msg::new("stale_created", []));
+		plan.toggle_selected(0);
+		assert_eq!(key(&plan), Some("stale_created"));
+		plan.toggle_selected(0);
+		assert_eq!(key(&plan), Some("stale_created"));
+	}
+
+	#[test]
+	fn commit_replay_reinclude_single_row_clears_banner() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			&commit_payload_modifying_a(),
+			&path,
+			&[],
+			1,
+		)
+		.unwrap();
+		assert!(plan.whole_commit);
+		assert!(plan.error.is_none());
+
+		plan.toggle_selected(0);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+
+		plan.toggle_selected(0);
+		assert!(plan.error.is_none());
 	}
 
 	#[test]

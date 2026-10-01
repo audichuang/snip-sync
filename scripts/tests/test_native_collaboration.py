@@ -2002,7 +2002,7 @@ class DiscontinuousFlowTests(unittest.TestCase):
         record = driver.blank_step("neg-noncontiguous-tips")
         def shift(*args):
             selected.append(args[4])
-            session.add("[APP:RANGE: commits=3]")
+            session.add("[APP:RANGE: commits=3 chain=first_parent]")
         with patch.object(driver, "select_repo"), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "click_commit_row", side_effect=lambda *a: selected.append(a[4])), patch.object(driver, "shift_click_commit", side_effect=shift):
             driver.refuse_discontinuous(native, {"a": session}, manifest, step, {}, Path("/tmp"), .001, [], record, Path("/tmp"))
         self.assertEqual(selected, ["base", "tip"])
@@ -2014,7 +2014,7 @@ class DiscontinuousFlowTests(unittest.TestCase):
         manifest = {"repos": [{"repoId": "a-west-billing", "basename": "billing", "relativePath": "machine-a/west/billing"}]}
         step = {"selection": {"baseOid": "base", "tipOid": "tip"}}
         def shift(*args):
-            session.add("[APP:RANGE: commits=2]")
+            session.add("[APP:RANGE: commits=2 chain=first_parent]")
         with patch.object(driver, "select_repo"), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "click_commit_row"), patch.object(driver, "shift_click_commit", side_effect=shift), patch.object(driver, "copy_commits", side_effect=driver.UiRefusal("[APP:COPY_COMMITS_REFUSED: no_selection]")):
             with self.assertRaisesRegex(driver.DriverError, "does not prove discontinuous"):
                 driver.refuse_discontinuous(None, {"a": session}, manifest, step, {}, Path("/tmp"), .001, [], driver.blank_step("neg-noncontiguous-tips"), Path("/tmp"))

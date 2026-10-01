@@ -105,6 +105,49 @@ pub(crate) fn commit_copy_paths<'a>(
 		.collect()
 }
 
+/// Selected changed files in screen order: walks the rows of `files` in
+/// screen layout (directories open, dirs first when `by_dir` is true; in
+/// flat commit_files order when `by_dir` is false) keeping files whose path
+/// is selected directly or lies under a selected folder key ("dir/").
+/// Gitlinks are excluded; a selected directory of a truncated listing
+/// copies nothing.
+pub(crate) fn commit_copy_selection<'a>(
+	files: &'a [(String, Option<snip_core::format::ChangeType>)],
+	gitlinks: &[String],
+	truncated: bool,
+	by_dir: bool,
+	targets: &[&str],
+) -> Vec<(&'a str, bool)> {
+	let dirs: Vec<&str> = if truncated {
+		Vec::new()
+	} else {
+		targets.iter().filter_map(|t| t.strip_suffix('/')).collect()
+	};
+	let rows = crate::ui::commit_file_rows(files, by_dir, &[]);
+	let mut seen = std::collections::HashSet::new();
+	let mut out = Vec::new();
+	for row in rows {
+		let crate::ui::ChangeItemRow::File { file_idx, .. } = row else {
+			continue;
+		};
+		let Some((path, change_type)) = files.get(file_idx) else {
+			continue;
+		};
+		if gitlinks.contains(path) {
+			continue;
+		}
+		let selected = targets.contains(&path.as_str())
+			|| dirs.iter().any(|&d| !d.is_empty() && path_under(path, d));
+		if selected && seen.insert(path.as_str()) {
+			out.push((
+				path.as_str(),
+				*change_type == Some(snip_core::format::ChangeType::Deleted),
+			));
+		}
+	}
+	out
+}
+
 /// Tri-state of the checkable `files` matching `pred`: all / none
 /// selected, `None` if mixed. Non-UTF-8 names do not count.
 pub(crate) fn rows_tri_state(
@@ -495,33 +538,31 @@ impl WorkbenchModel {
 		};
 		let multi = self.commit_file_sel.len() > 1
 			&& self.commit_file_sel.contains(&key);
-		let targets: Vec<&str> = if multi {
-			self.commit_file_sel.iter().map(String::as_str).collect()
+		let copy: Vec<(PathBuf, String, String, bool)> = if multi {
+			let targets: Vec<&str> =
+				self.commit_file_sel.iter().map(String::as_str).collect();
+			commit_copy_selection(
+				&self.commit_files,
+				&self.commit_file_gitlinks,
+				self.commit_files_truncated,
+				self.log_details_by_dir,
+				&targets,
+			)
 		} else {
-			vec![key.as_str()]
-		};
-		let mut seen = std::collections::HashSet::new();
-		let copy: Vec<(PathBuf, String, String, bool)> = targets
-			.into_iter()
-			.flat_map(|t| {
-				let (p, dir) = match t.strip_suffix('/') {
-					Some(d) => (d, true),
-					None => (t, false),
-				};
-				commit_copy_paths(
-					&self.commit_files,
-					&self.commit_file_gitlinks,
-					self.commit_files_truncated,
-					p,
-					dir,
-				)
-			})
-			.filter(|(p, _)| seen.insert(*p))
-			.filter_map(|(p, deleted)| {
-				let (root, sha) = self.commit_file_rev(p)?;
-				Some((root, sha, p.to_string(), deleted))
-			})
-			.collect();
+			commit_copy_paths(
+				&self.commit_files,
+				&self.commit_file_gitlinks,
+				self.commit_files_truncated,
+				path,
+				is_dir,
+			)
+		}
+		.into_iter()
+		.filter_map(|(p, deleted)| {
+			let (root, sha) = self.commit_file_rev(p)?;
+			Some((root, sha, p.to_string(), deleted))
+		})
+		.collect();
 		let mut v = vec![item(
 			"copy-files",
 			"menu_copy_files",
@@ -571,12 +612,7 @@ impl WorkbenchModel {
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		let in_selection = self.selected_commit.as_deref() == Some(sha)
-			|| self.range_rows().is_some_and(|(a, b)| {
-				self.display_commits()
-					.get(a..=b)
-					.is_some_and(|s| s.iter().any(|c| c.sha == sha))
-			});
+		let in_selection = self.log_is_selected(sha);
 		if !in_selection {
 			self.select_commit(sha, cx);
 		}
@@ -1493,6 +1529,159 @@ mod tests {
 		assert_eq!(
 			commit_copy_paths(&files, &links, true, "other.rs", false),
 			[("other.rs", false)]
+		);
+	}
+
+	#[test]
+	fn commit_copy_selection_follows_screen_order_and_rules() {
+		use snip_core::format::ChangeType::{Deleted, Modified};
+		let files: Vec<_> = [
+			("zebra.txt", Modified),
+			("apple.txt", Modified),
+			("dir/sub", Modified),
+			("dir/keep.rs", Modified),
+			("dir/gone.rs", Deleted),
+			("dir/nested/deep.rs", Modified),
+		]
+		.map(|(p, c)| (p.to_string(), Some(c)))
+		.into();
+		let gitlinks = ["dir/sub".to_string()];
+
+		// 1. Click order vs screen order: targets in reverse order return in screen
+		// order (dirs first, then alphabetical within dir and top level).
+		assert_eq!(
+			commit_copy_selection(
+				&files,
+				&gitlinks,
+				false,
+				true,
+				&["zebra.txt", "apple.txt"]
+			),
+			[("apple.txt", false), ("zebra.txt", false)]
+		);
+		assert_eq!(
+			commit_copy_selection(
+				&files,
+				&gitlinks,
+				false,
+				true,
+				&["apple.txt", "dir/"]
+			),
+			[
+				("dir/nested/deep.rs", false),
+				("dir/gone.rs", true),
+				("dir/keep.rs", false),
+				("apple.txt", false),
+			]
+		);
+
+		// 2. Folder + file overlap dedup: clicking a file then its parent folder
+		// returns files in screen order, each once.
+		assert_eq!(
+			commit_copy_selection(
+				&files,
+				&gitlinks,
+				false,
+				true,
+				&["dir/keep.rs", "dir/"]
+			),
+			[
+				("dir/nested/deep.rs", false),
+				("dir/gone.rs", true),
+				("dir/keep.rs", false),
+			]
+		);
+
+		// 3. Gitlink excluded: both direct selection and folder expansion skip gitlinks.
+		assert!(commit_copy_selection(
+			&files,
+			&gitlinks,
+			false,
+			true,
+			&["dir/sub"]
+		)
+		.is_empty());
+		assert!(commit_copy_selection(
+			&files,
+			&gitlinks,
+			false,
+			true,
+			&["dir/"]
+		)
+		.iter()
+		.all(|(p, _)| *p != "dir/sub"));
+
+		// 4. Truncated dir copies nothing, but directly selected files are preserved.
+		assert_eq!(
+			commit_copy_selection(
+				&files,
+				&gitlinks,
+				true,
+				true,
+				&["dir/", "apple.txt"]
+			),
+			[("apple.txt", false)]
+		);
+		assert!(commit_copy_selection(
+			&files,
+			&gitlinks,
+			true,
+			true,
+			&["dir/"]
+		)
+		.is_empty());
+
+		// 5. Files under nested folders get their positions (we pass no collapsed dirs).
+		assert_eq!(
+			commit_copy_selection(
+				&files,
+				&gitlinks,
+				false,
+				true,
+				&["dir/nested/deep.rs"]
+			),
+			[("dir/nested/deep.rs", false)]
+		);
+	}
+
+	#[test]
+	fn commit_copy_selection_distinguishes_by_dir_from_commit_files_order() {
+		use snip_core::format::ChangeType::Modified;
+		// commit_files order: z.txt, a/x.txt, b.txt
+		let files: Vec<_> = [
+			("z.txt", Modified),
+			("a/x.txt", Modified),
+			("b.txt", Modified),
+		]
+		.map(|(p, c)| (p.to_string(), Some(c)))
+		.into();
+		let gitlinks = [];
+		let targets = ["z.txt", "a/x.txt", "b.txt"];
+
+		// With by_dir = true: dirs come first (a/x.txt), then top-level files sorted
+		// alphabetically (b.txt, then z.txt).
+		assert_eq!(
+			commit_copy_selection(&files, &gitlinks, false, true, &targets),
+			[("a/x.txt", false), ("b.txt", false), ("z.txt", false),]
+		);
+
+		// With by_dir = false: flat list retains the original commit_files order.
+		assert_eq!(
+			commit_copy_selection(&files, &gitlinks, false, false, &targets),
+			[("z.txt", false), ("a/x.txt", false), ("b.txt", false),]
+		);
+
+		// Flat layout with targets in REVERSE click order still follows
+		// commit_files order (guards a click-order flat branch).
+		assert_eq!(
+			commit_copy_selection(
+				&files,
+				&gitlinks,
+				false,
+				false,
+				&["b.txt", "a/x.txt", "z.txt"]
+			),
+			[("z.txt", false), ("a/x.txt", false), ("b.txt", false),]
 		);
 	}
 

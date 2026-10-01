@@ -5416,6 +5416,17 @@ impl WorkbenchModel {
 		}
 		if let Some(st) = self.paste.toggle_selected(idx) {
 			app_log!("[APP:PASTE_SEL_TOGGLED: idx={} state={}]", idx, st);
+			if let Some(plan) = self.paste.plan() {
+				if plan.whole_commit
+					&& plan.all_selected()
+					&& self.status.key == "commit_subset_rejected"
+				{
+					self.set_status(
+						"status_paste_preview",
+						[plan.items.len().to_string()],
+					);
+				}
+			}
 			cx.notify();
 		}
 	}
@@ -6331,6 +6342,131 @@ mod tests {
 			);
 		}
 
+		/// Multi-selection copy follows screen order, not click order
+		/// (Scenario A: emoji.txt clicked before common.txt, but screen
+		/// order has common.txt before emoji.txt).
+		#[gpui::test]
+		fn commit_files_copy_files_screen_order(cx: &mut TestAppContext) {
+			use crate::menu::{MenuAct, MenuEntry};
+			use snip_core::format::ChangeType::{Deleted, Modified};
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let copied = model.update(cx, |m, cx| {
+				m.log_commit_root = Some(root.clone());
+				m.compare = Some(("old".into(), "new".into()));
+				m.commit_files = [
+					("common.txt", Modified),
+					("emoji.txt", Modified),
+					("dir/gone.txt", Deleted),
+					("dir/keep.txt", Modified),
+				]
+				.map(|(p, c)| (p.to_string(), Some(c)))
+				.into();
+				m.selected_commit_file = Some("emoji.txt".into());
+				m.toggle_commit_file("common.txt", cx);
+				let menu = m.commit_file_menu("common.txt", false);
+				menu.into_iter()
+					.find_map(|e| match e {
+						MenuEntry::Item {
+							act: Some(MenuAct::CopyRevFiles(f)),
+							..
+						} => Some(f),
+						_ => None,
+					})
+					.unwrap()
+			});
+			let got: Vec<_> =
+				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			assert_eq!(got, [("common.txt", false), ("emoji.txt", false)]);
+		}
+
+		/// Flat layout (`log_details_by_dir = false`) copies in `commit_files`
+		/// order, not click order: b.txt is clicked before z.txt, but the flat
+		/// screen shows z.txt first. (In-process tests default to the by-dir
+		/// layout, which sorts dirs and names and hides a click-order bug.)
+		#[gpui::test]
+		fn commit_files_copy_flat_layout_screen_order(cx: &mut TestAppContext) {
+			use crate::menu::{MenuAct, MenuEntry};
+			use snip_core::format::ChangeType::Modified;
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let copied = model.update(cx, |m, cx| {
+				m.log_commit_root = Some(root.clone());
+				m.compare = Some(("old".into(), "new".into()));
+				m.log_details_by_dir = false;
+				m.commit_files = [
+					("z.txt", Modified),
+					("a/x.txt", Modified),
+					("b.txt", Modified),
+				]
+				.map(|(p, c)| (p.to_string(), Some(c)))
+				.into();
+				// Click order: b.txt, a/x.txt, z.txt (reverse of flat order).
+				m.selected_commit_file = Some("b.txt".into());
+				m.toggle_commit_file("a/x.txt", cx);
+				m.toggle_commit_file("z.txt", cx);
+				let menu = m.commit_file_menu("z.txt", false);
+				menu.into_iter()
+					.find_map(|e| match e {
+						MenuEntry::Item {
+							act: Some(MenuAct::CopyRevFiles(f)),
+							..
+						} => Some(f),
+						_ => None,
+					})
+					.unwrap()
+			});
+			let got: Vec<_> =
+				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			assert_eq!(
+				got,
+				[("z.txt", false), ("a/x.txt", false), ("b.txt", false)]
+			);
+		}
+
+		/// Folder overlap copy follows screen order and deduplicates
+		/// (Scenario B: dir/keep.txt clicked before dir/, screen order has
+		/// dir/gone.txt before dir/keep.txt, each file copied once).
+		#[gpui::test]
+		fn commit_files_copy_folder_overlap_screen_order(
+			cx: &mut TestAppContext,
+		) {
+			use crate::menu::{MenuAct, MenuEntry};
+			use snip_core::format::ChangeType::{Deleted, Modified};
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let copied = model.update(cx, |m, cx| {
+				m.log_commit_root = Some(root.clone());
+				m.compare = Some(("old".into(), "new".into()));
+				m.commit_files = [
+					("common.txt", Modified),
+					("emoji.txt", Modified),
+					("dir/gone.txt", Deleted),
+					("dir/keep.txt", Modified),
+				]
+				.map(|(p, c)| (p.to_string(), Some(c)))
+				.into();
+				m.selected_commit_file = Some("dir/keep.txt".into());
+				m.toggle_commit_file("dir/", cx);
+				let menu = m.commit_file_menu("dir", true);
+				menu.into_iter()
+					.find_map(|e| match e {
+						MenuEntry::Item {
+							act: Some(MenuAct::CopyRevFiles(f)),
+							..
+						} => Some(f),
+						_ => None,
+					})
+					.unwrap()
+			});
+			let got: Vec<_> =
+				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			assert_eq!(got, [("dir/gone.txt", true), ("dir/keep.txt", false)]);
+		}
+
 		/// Puts `payload` on the OS clipboard and opens its paste preview.
 		fn paste(
 			model: &Entity<WorkbenchModel>,
@@ -6980,6 +7116,80 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn delete_notice_renders_only_for_a_delete_that_will_happen(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			// `present.txt` exists at the destination, `missing.txt` does not.
+			let dest = repo(&root, "dest", &[("present.txt", "x")]);
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			model.update(cx, |m, _| {
+				m.probes = Some(crate::ui::Probes::for_test())
+			});
+			let gone = |path: &str| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change: FileChange::Deleted,
+				content: None,
+				not_copied: None,
+			};
+			paste(
+				&model,
+				cx,
+				&snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "drop".into(),
+						author_name: "ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-09-25T12:34:56+00:00".into(),
+						files: vec![gone("missing.txt"), gone("present.txt")],
+					}],
+				}),
+			);
+			settle(cx);
+			let idx = |cx: &mut VisualTestContext, path: &str| {
+				model.read_with(cx, |m, _| {
+					m.paste
+						.plan()
+						.unwrap()
+						.items
+						.iter()
+						.position(|i| i.path == path)
+						.unwrap_or_else(|| panic!("no row for {path}"))
+				})
+			};
+			let notice = |cx: &mut VisualTestContext| {
+				model
+					.read_with(cx, |m, _| m.probes.as_ref().unwrap().drawn())
+					.contains(&"paste-delete-notice".to_string())
+			};
+			let missing = idx(cx, "missing.txt");
+			let present = idx(cx, "present.txt");
+
+			// Destination already lacks the file: nothing will be deleted,
+			// so no red notice.
+			model.update(cx, |m, cx| m.select_paste_item(missing, cx));
+			settle(cx);
+			assert!(!notice(cx), "notice on a delete of a missing file");
+
+			model.update(cx, |m, cx| m.select_paste_item(present, cx));
+			settle(cx);
+			assert!(notice(cx), "no notice on a real delete");
+
+			// Excluding the row means it will not be deleted either.
+			model.update(cx, |m, cx| m.toggle_paste_selected(present, cx));
+			settle(cx);
+			assert!(!notice(cx), "notice on an excluded delete");
+		}
+
+		#[gpui::test]
 		fn folding_the_selected_commit_moves_selection_off_hidden_rows(
 			cx: &mut TestAppContext,
 		) {
@@ -7114,6 +7324,156 @@ mod tests {
 				let img = &m.paste.plan().unwrap().items[0];
 				assert_eq!(img.overwrite_allowed, before);
 			});
+		}
+
+		#[gpui::test]
+		fn space_reinclude_clears_the_commit_subset_banner(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "msg\n".into(),
+						author_name: "ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-09-25T12:34:56+00:00".into(),
+						files: vec![CommitFile {
+							path: "fresh.txt".into(),
+							old_path: None,
+							change: FileChange::Added,
+							content: Some("body\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			model.update(cx, |m, cx| {
+				m.select_paste_item(0, cx);
+			});
+
+			// Space excludes the row -> plan.error key commit_subset_rejected
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(!plan.items[0].selected);
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("commit_subset_rejected")
+				);
+			});
+
+			// Enter triggers Apply refusal -> sets model.status to commit_subset_rejected
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "commit_subset_rejected");
+				assert!(m.paste.plan().is_some());
+			});
+
+			// Space again re-includes the row -> plan.error is None,
+			// and status key is reset to status_paste_preview.
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan stays open");
+				assert!(plan.items[0].selected);
+				assert!(plan.error.is_none());
+				assert_ne!(m.status.key, "commit_subset_rejected");
+				assert_eq!(m.status.key, "status_paste_preview");
+			});
+
+			// Enter now succeeds
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
+			assert_eq!(
+				fs::read_to_string(dest.join("fresh.txt")).unwrap(),
+				"body\n"
+			);
+		}
+
+		/// A real Apply error must outlive an exclude / re-include cycle, and
+		/// a subset Apply is refused whichever banner is showing.
+		#[gpui::test]
+		fn space_cycle_keeps_a_real_apply_error_and_subset_apply_is_refused(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "msg\n".into(),
+						author_name: "ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-09-25T12:34:56+00:00".into(),
+						files: vec![CommitFile {
+							path: "fresh.txt".into(),
+							old_path: None,
+							change: FileChange::Added,
+							content: Some("body\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			model.update(cx, |m, cx| {
+				m.select_paste_item(0, cx);
+			});
+			// The target appears behind the preview's back: Apply goes stale.
+			fs::write(dest.join("fresh.txt"), "external").unwrap();
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			let keys = |cx: &mut gpui::VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					(
+						m.paste.plan().unwrap().error.as_ref().map(|e| e.key),
+						m.status.key,
+					)
+				})
+			};
+			assert_eq!(keys(cx), (Some("stale_created"), "stale_created"));
+
+			// Space twice, no Apply between: the stale error is never touched.
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			assert_eq!(keys(cx), (Some("stale_created"), "stale_created"));
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			assert_eq!(keys(cx), (Some("stale_created"), "stale_created"));
+
+			// Exclude, then Enter: the subset Apply is refused, nothing written.
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_some());
+				assert_eq!(m.status.key, "commit_subset_rejected");
+			});
+			assert_eq!(
+				fs::read_to_string(dest.join("fresh.txt")).unwrap(),
+				"external"
+			);
 		}
 
 		#[gpui::test]
@@ -7478,6 +7838,156 @@ mod tests {
 				fs::read_to_string(dest.join("sub").join("x.txt")).unwrap(),
 				"nested"
 			);
+		}
+
+		#[gpui::test]
+		fn shift_range_selects_first_parent_chain_excluding_side(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = ws.path().join("repo");
+			fs::create_dir(&r).unwrap();
+			git(&r, &["init", "-q", "-b", "main"]);
+			let head = || -> String {
+				let out = Command::new("git")
+					.current_dir(&r)
+					.args(["rev-parse", "HEAD"])
+					.output()
+					.unwrap();
+				String::from_utf8(out.stdout).unwrap().trim().to_string()
+			};
+
+			fs::write(r.join("base.txt"), "base").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "base"]);
+			let base_sha = head();
+
+			fs::write(r.join("c1.txt"), "c1").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "c1"]);
+			let c1_sha = head();
+
+			fs::write(r.join("c2.txt"), "c2").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "c2"]);
+			let c2_sha = head();
+
+			git(&r, &["checkout", "-q", "-b", "side"]);
+			fs::write(r.join("side.txt"), "side").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "side"]);
+			let side_sha = head();
+
+			git(&r, &["checkout", "-q", "main"]);
+			git(&r, &["merge", "-q", "--no-ff", "-m", "c3", "side"]);
+			let c3_sha = head();
+
+			fs::write(r.join("c4.txt"), "c4").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "c4"]);
+			let c4_sha = head();
+
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+
+			// Verify display rows are in top-down topological order:
+			// C4 (0), C3 (1), SIDE (2), C2 (3), C1 (4), base (5).
+			model.read_with(cx, |m, _| {
+				let shas: Vec<&str> = m
+					.display_commits()
+					.iter()
+					.map(|c| c.sha.as_str())
+					.collect();
+				assert_eq!(
+					shas,
+					[
+						c4_sha.as_str(),
+						c3_sha.as_str(),
+						side_sha.as_str(),
+						c2_sha.as_str(),
+						c1_sha.as_str(),
+						base_sha.as_str()
+					]
+				);
+			});
+
+			// Select C1 (index 4)
+			model.update(cx, |m, cx| m.select_commit(&c1_sha, cx));
+			// Focus log element
+			cx.update(|window, cx| {
+				window.focus(&model.read(cx).log_focus.clone())
+			});
+
+			// Drive Shift+Up 3 times from C1 to C3:
+			// Step 1: to C2 (index 3)
+			cx.simulate_keystrokes("shift-up");
+			cx.run_until_parked();
+			// Step 2: to SIDE (index 2)
+			cx.simulate_keystrokes("shift-up");
+			cx.run_until_parked();
+			// Step 3: to C3 (index 1)
+			cx.simulate_keystrokes("shift-up");
+			cx.run_until_parked();
+
+			// Assert log_selected has [C3, C2, C1] (excluding SIDE!)
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_commit.as_deref(), Some(c1_sha.as_str()));
+				assert_eq!(m.range_head.as_deref(), Some(c3_sha.as_str()));
+				assert_eq!(
+					m.log_selected,
+					[c3_sha.clone(), c2_sha.clone(), c1_sha.clone()]
+				);
+				assert!(!m.log_is_selected(&side_sha));
+				assert!(m.log_is_selected(&c1_sha));
+				assert!(m.log_is_selected(&c2_sha));
+				assert!(m.log_is_selected(&c3_sha));
+			});
+
+			// Assert commit_copy_target returns tip C3 and the 3 SHAs
+			let (_, _, tip, selected) =
+				model.read_with(cx, |m, _| m.commit_copy_target().unwrap());
+			assert_eq!(tip, c3_sha);
+			assert_eq!(
+				selected,
+				[c3_sha.clone(), c2_sha.clone(), c1_sha.clone()]
+			);
+
+			// Assert open_log_menu on C2 (inside selection) preserves the multi-selection:
+			cx.update(|window, app| {
+				model.update(app, |m, cx| {
+					m.open_log_menu(
+						&c2_sha,
+						gpui::Point::default(),
+						window,
+						cx,
+					);
+					assert_eq!(
+						m.selected_commit.as_deref(),
+						Some(c1_sha.as_str())
+					);
+					assert_eq!(
+						m.log_selected,
+						[c3_sha.clone(), c2_sha.clone(), c1_sha.clone()]
+					);
+				});
+			});
+
+			// Assert open_log_menu on SIDE (not in selection) re-selects SIDE alone:
+			cx.update(|window, app| {
+				model.update(app, |m, cx| {
+					m.open_log_menu(
+						&side_sha,
+						gpui::Point::default(),
+						window,
+						cx,
+					);
+					assert_eq!(
+						m.selected_commit.as_deref(),
+						Some(side_sha.as_str())
+					);
+					assert!(m.log_selected.is_empty());
+				});
+			});
 		}
 	}
 
@@ -8220,6 +8730,142 @@ mod tests {
 			.as_deref()
 			.is_some_and(|body| body.contains("committed A")
 				&& !body.contains("working B")));
+	}
+
+	/// A staged rename yields exactly one Moved row in read_change_list,
+	/// and exporting it yields [MOVED] new-name with the index bytes and no [DELETED] old.
+	#[test]
+	fn staged_rename_read_change_list_and_export_moved() {
+		use snip_core::format::ChangeType;
+		let dir = tempfile::tempdir().unwrap();
+		let git = |args: &[&str]| {
+			let out = std::process::Command::new("git")
+				.current_dir(dir.path())
+				.args(args)
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"git {args:?}: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+		};
+		git(&["init", "-q", "-b", "main"]);
+		git(&["config", "user.name", "Test"]);
+		git(&["config", "user.email", "test@example.invalid"]);
+		std::fs::write(dir.path().join("old-name.txt"), "index bytes\n")
+			.unwrap();
+		git(&["add", "old-name.txt"]);
+		git(&["commit", "-qm", "initial"]);
+		git(&["mv", "old-name.txt", "new-name.txt"]);
+
+		let (_summary, items) = super::read_change_list(
+			dir.path(),
+			None,
+			super::CancelToken::new(),
+		)
+		.unwrap();
+		let staged_items: Vec<_> = items
+			.iter()
+			.filter(|(_, _, s, _)| *s == super::SourceKind::Staged)
+			.collect();
+		assert_eq!(staged_items.len(), 1);
+		assert_eq!(staged_items[0].0, "new-name.txt");
+		assert_eq!(staged_items[0].1, Some(ChangeType::Moved));
+
+		// Verify no old-name.txt row in any group
+		assert!(!items.iter().any(|(p, _, _, _)| p == "old-name.txt"));
+
+		let root = super::CanonicalRootId::new(dir.path()).unwrap();
+		let export_item = super::ExportItem {
+			root: root.clone(),
+			relative_path: staged_items[0].0.clone(),
+			source: super::SourceKind::Staged,
+			change_type: staged_items[0].1,
+		};
+		let sel = super::ExportSelection::new(
+			vec![dir.path().to_path_buf()],
+			Some(dir.path().to_path_buf()),
+			vec![export_item],
+		)
+		.unwrap();
+		let plan = snip_core::transfer::plan_export_with(
+			&sel,
+			&super::native_export_settings(),
+			None,
+			&snip_core::gitrun::RunOptions::default(),
+		)
+		.unwrap();
+		let payload = &plan.payload;
+		assert!(
+			payload.contains("[MOVED] new-name.txt"),
+			"payload: {payload}"
+		);
+		assert!(payload.contains("index bytes\n"), "payload: {payload}");
+		assert!(!payload.contains("[DELETED]"), "payload: {payload}");
+		assert!(!payload.contains("old-name.txt"), "payload: {payload}");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn read_preview_refuses_symlink_leaving_workspace() {
+		use std::os::unix::fs::symlink;
+
+		let outside_dir = tempfile::tempdir().unwrap();
+		let secret_file = outside_dir.path().join("secret.txt");
+		std::fs::write(&secret_file, "SECRET_OUTSIDE_REPO\n").unwrap();
+
+		let repo_dir = tempfile::tempdir().unwrap();
+		let git = |args: &[&str]| {
+			let out = std::process::Command::new("git")
+				.current_dir(repo_dir.path())
+				.args(args)
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"git {args:?}: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+		};
+		git(&["init", "-q", "-b", "main"]);
+		git(&["config", "user.name", "Test"]);
+		git(&["config", "user.email", "test@example.invalid"]);
+		let notes_path = repo_dir.path().join("notes.txt");
+		std::fs::write(&notes_path, "committed notes\n").unwrap();
+		git(&["add", "notes.txt"]);
+		git(&["commit", "-qm", "initial"]);
+
+		// Replace notes.txt in worktree with a symlink to secret.txt outside the repo
+		std::fs::remove_file(&notes_path).unwrap();
+		symlink(&secret_file, &notes_path).unwrap();
+
+		let result = super::read_preview(
+			repo_dir.path(),
+			"notes.txt",
+			&super::SourceKind::Unstaged,
+			super::CancelToken::new(),
+		);
+		match result {
+			Err(err_msg) => {
+				assert!(
+					err_msg.contains("Path leaves the workspace"),
+					"expected 'Path leaves the workspace', got: {err_msg}"
+				);
+			}
+			Ok((preview, _)) => {
+				let content = preview.content.unwrap_or_default();
+				assert!(
+					!content.contains("SECRET_OUTSIDE_REPO"),
+					"secret text leaked in preview content"
+				);
+				assert!(
+					!preview.patch.contains("SECRET_OUTSIDE_REPO"),
+					"secret text leaked in preview patch"
+				);
+				panic!("read_preview must return Err for symlink leaving workspace, got Ok");
+			}
+		}
 	}
 
 	use super::*;
