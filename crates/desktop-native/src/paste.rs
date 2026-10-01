@@ -3365,6 +3365,7 @@ pub(crate) mod tests {
 	fn commit_apply_partial_failure_with_layout_conflict_translates_cause() {
 		use snip_core::commits::{
 			CommitFile, CommitRecord, CommitsPayload, FileChange,
+			LayoutConflict,
 		};
 
 		let dir = tempfile::tempdir().unwrap();
@@ -3405,6 +3406,38 @@ pub(crate) mod tests {
 		let plan =
 			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
 				.unwrap();
+
+		// The preview already plans commit 2 after commit 1, so it shows the
+		// refusal Apply will hit: header, summary and banner.
+		let commit_plans = plan.commit_preview.as_ref().unwrap().plan();
+		assert_eq!(commit_plans.commits[0].refused_by(), None);
+		assert_eq!(
+			commit_plans.commits[1].refused_by(),
+			Some(LayoutConflict::FileInTheWayOfParent)
+		);
+		let (hdr, _, _) = crate::ui::commit_header_labels(
+			&commit_plans.commits[1],
+			crate::i18n::Locale::En,
+		);
+		assert_eq!(hdr, "commit two (whole commit will be refused)");
+		assert_eq!(
+			plan.commit_summary_label(crate::i18n::Locale::En),
+			Some("2 commit(s) (1 refused)".to_string())
+		);
+		assert_eq!(
+			plan.items[1].op,
+			PlannedOp::CommitRefused(LayoutConflict::FileInTheWayOfParent)
+		);
+		assert_eq!(
+			plan.error.as_ref().map(|m| m.key),
+			Some("commit_will_be_refused")
+		);
+		let banner =
+			plan.error.as_ref().unwrap().render(crate::i18n::Locale::En);
+		assert!(
+			banner.contains("Commit #2 \"commit two\" will be refused"),
+			"{banner}"
+		);
 
 		let err = plan.execute().unwrap_err();
 		assert_eq!(err.key, "commit_replay_partial_refused");
@@ -3450,6 +3483,73 @@ pub(crate) mod tests {
 			"i am a file\n"
 		);
 		assert!(!repo.join("newdir/x.txt").exists());
+	}
+
+	#[test]
+	fn commit_preview_does_not_refuse_a_blocker_an_earlier_commit_removes() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("newdir"), "i am a file\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+
+		let record =
+			|message: &str, path: &str, change, content| CommitRecord {
+				message: format!("{message}\n"),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-25T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: path.into(),
+					old_path: None,
+					change,
+					content,
+					not_copied: None,
+				}],
+			};
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![
+				record("remove blocker", "newdir", FileChange::Deleted, None),
+				record(
+					"write under it",
+					"newdir/x.txt",
+					FileChange::Added,
+					Some("x\n".into()),
+				),
+			],
+		});
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 2)
+				.unwrap();
+
+		let commit_plans = plan.commit_preview.as_ref().unwrap().plan();
+		assert_eq!(commit_plans.commits[1].refused_by(), None);
+		assert_eq!(
+			plan.commit_summary_label(crate::i18n::Locale::En),
+			Some("2 commit(s)".to_string())
+		);
+		assert!(plan.error.is_none(), "{:?}", plan.error);
+		let (hdr, _, _) = crate::ui::commit_header_labels(
+			&commit_plans.commits[1],
+			crate::i18n::Locale::En,
+		);
+		assert_eq!(hdr, "write under it");
+
+		plan.execute().expect("both commits replay");
+		assert_eq!(
+			git_run(&repo, &["rev-list", "--count", "HEAD"]).trim(),
+			"3"
+		);
+		assert_eq!(
+			fs::read_to_string(repo.join("newdir/x.txt")).unwrap(),
+			"x\n"
+		);
 	}
 
 	#[test]

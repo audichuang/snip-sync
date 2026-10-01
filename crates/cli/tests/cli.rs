@@ -402,3 +402,113 @@ fn paste_commits_dry_run_three_commits_reports_stop_point_and_not_reached() {
 		"{stderr}"
 	);
 }
+
+/// `(path, change, content)`.
+type PayloadFile<'a> = (&'a str, &'a str, Option<&'a str>);
+
+/// A commits payload from `(message, files)`.
+fn commits_payload(commits: &[(&str, &[PayloadFile])]) -> String {
+	let commits: Vec<String> = commits
+		.iter()
+		.map(|(message, files)| {
+			let files: Vec<String> = files
+				.iter()
+				.map(|(path, change, content)| {
+					let content = content
+						.map_or("null".to_string(), |c| format!("{c:?}"));
+					format!(
+						"{{\"path\":{path:?},\"oldPath\":null,\"change\":{change:?},\"content\":{content},\"notCopied\":null}}"
+					)
+				})
+				.collect();
+			format!(
+				"{{\"message\":\"{message}\\n\",\"authorName\":\"QA\",\"authorEmail\":\"qa@example.com\",\"authorDate\":\"2026-06-02T09:00:00+08:00\",\"files\":[{}]}}",
+				files.join(",")
+			)
+		})
+		.collect();
+	format!(
+		"// snip-sync commits v1\n{{\"commits\":[{}]}}",
+		commits.join(",")
+	)
+}
+
+#[test]
+fn paste_commits_dry_run_plans_each_commit_after_the_earlier_ones() {
+	// Commit 1 deletes the regular file `newdir`, commit 2 writes under it:
+	// the dry-run agrees with Apply that both are created.
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&dst);
+	fs::write(dst.join("newdir"), "regular file\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = commits_payload(&[
+		("remove blocker", &[("newdir", "DELETED", None)]),
+		("write under it", &[("newdir/x.txt", "ADDED", Some("x\n"))]),
+	]);
+	let dry = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	let stdout = text(&dry.stdout);
+	assert!(stdout.contains("[2/2] write under it\n"), "{stdout}");
+	assert!(!stdout.contains("refused"), "{stdout}");
+	assert!(
+		text(&dry.stderr).contains("2 commit(s) would be created."),
+		"{}",
+		text(&dry.stderr)
+	);
+	let apply = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
+	assert!(
+		text(&apply.stdout).contains("Created 2 commit(s)."),
+		"{}",
+		text(&apply.stdout)
+	);
+
+	// Commit 1 writes a file `newdir`, commit 2 writes under it: both stop
+	// at commit 2.
+	let dst = tmp.path().join("dst2");
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&dst);
+	fs::write(dst.join("keep.txt"), "keep\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = commits_payload(&[
+		("create blocker", &[("newdir", "ADDED", Some("f\n"))]),
+		("write under it", &[("newdir/x.txt", "ADDED", Some("x\n"))]),
+	]);
+	let dry = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	let stdout = text(&dry.stdout);
+	assert!(
+		stdout.contains("[2/2] write under it (refused: a file is in the way of its parent directory)"),
+		"{stdout}"
+	);
+	assert!(
+		text(&dry.stderr).contains(
+			"1 commit(s) would be created; replay stops at commit #2 (refused); 0 not reached."
+		),
+		"{}",
+		text(&dry.stderr)
+	);
+	let apply = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	let all = format!("{}{}", text(&apply.stdout), text(&apply.stderr));
+	assert!(all.contains("Created 1 commit(s)."), "{all}");
+	assert!(
+		all.contains("a file is in the way of its parent directory"),
+		"{all}"
+	);
+}
