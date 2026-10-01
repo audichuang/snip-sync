@@ -61,11 +61,20 @@ impl Msg {
 			.enumerate()
 			.map(|(i, s)| {
 				if self.key_arg == Some(i) {
-					let translated = t(s, loc);
-					if !translated.is_empty() {
-						translated.to_string()
+					if let Some((prefix, key)) = s.split_once(": ") {
+						let translated = t(key, loc);
+						if !translated.is_empty() {
+							format!("{prefix}: {translated}")
+						} else {
+							s.clone()
+						}
 					} else {
-						s.clone()
+						let translated = t(s, loc);
+						if !translated.is_empty() {
+							translated.to_string()
+						} else {
+							s.clone()
+						}
 					}
 				} else {
 					s.clone()
@@ -1085,5 +1094,27 @@ mod tests {
 		let rendered = key_msg.render(Locale::ZhTw);
 		assert!(rendered.contains("「op_skip」"), "{rendered}");
 		assert!(rendered.ends_with("：父目錄被檔案佔住"), "{rendered}");
+
+		// When with_key_arg is used on a prefix: key argument, the cause is translated
+		let partial_msg = Msg::with_key_arg(
+			"commit_replay_partial",
+			[
+				"sha1".to_string(),
+				"path.txt: reason_refusal_cause_file_in_way".to_string(),
+			],
+			1,
+		);
+		let rendered = partial_msg.render(Locale::ZhTw);
+		assert!(
+			rendered.contains("path.txt: 父目錄被檔案佔住"),
+			"{rendered}"
+		);
+		let rendered_en = partial_msg.render(Locale::En);
+		assert!(
+			rendered_en.contains(
+				"path.txt: a file is in the way of its parent directory"
+			),
+			"{rendered_en}"
+		);
 	}
 }

@@ -344,7 +344,60 @@ fn paste_commits_dry_run_reports_layout_refusal_and_accurate_count() {
 	);
 	assert!(
 		stderr.contains(
-			"0 commit(s) would be created, 1 refused (replay stops at the first)."
+			"0 commit(s) would be created; replay stops at commit #1 (refused); 1 not reached."
+		),
+		"{stderr}"
+	);
+}
+
+#[test]
+fn paste_commits_dry_run_three_commits_reports_stop_point_and_not_reached() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&src);
+	init_repo(&dst);
+	fs::write(src.join("base.txt"), "base\n").unwrap();
+	commit(&src, "initial", "2024-01-01T00:00:00+00:00");
+	fs::write(src.join("ok1.txt"), "ok1\n").unwrap();
+	commit(&src, "commit ok 1", "2024-01-02T00:00:00+00:00");
+	fs::create_dir_all(src.join("blocker")).unwrap();
+	fs::write(src.join("blocker/file.txt"), "content\n").unwrap();
+	commit(&src, "commit blocked", "2024-01-03T00:00:00+00:00");
+	fs::write(src.join("ok2.txt"), "ok2\n").unwrap();
+	commit(&src, "commit ok 2", "2024-01-04T00:00:00+00:00");
+
+	fs::write(dst.join("blocker"), "regular file\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+
+	let src_s = src.to_str().unwrap();
+	let dst_s = dst.to_str().unwrap();
+	let out = snip(
+		&["--repo", src_s, "copy", "--commits", "-n", "3", "--stdout"],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let payload = out.stdout;
+
+	let out = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(&payload),
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(stdout.contains("[1/3] commit ok 1"), "{stdout}");
+	assert!(
+		stdout.contains("[2/3] commit blocked (refused: a file is in the way of its parent directory)"),
+		"{stdout}"
+	);
+	assert!(stdout.contains("[3/3] commit ok 2"), "{stdout}");
+	assert!(!stdout.contains("[3/3] commit ok 2 (refused:"), "{stdout}");
+	assert!(
+		stderr.contains(
+			"1 commit(s) would be created; replay stops at commit #2 (refused); 1 not reached."
 		),
 		"{stderr}"
 	);

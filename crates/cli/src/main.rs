@@ -711,13 +711,10 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 			plan.commits.iter().position(|c| c.refused_by().is_some());
 		if let Some(first_idx) = first_refusal {
 			let would_create = first_idx;
-			let refused = plan
-				.commits
-				.iter()
-				.filter(|c| c.refused_by().is_some())
-				.count();
+			let not_reached = total.saturating_sub(first_idx + 1);
 			eprintln!(
-				"{would_create} commit(s) would be created, {refused} refused (replay stops at the first)."
+				"{would_create} commit(s) would be created; replay stops at commit #{} (refused); {not_reached} not reached.",
+				first_idx + 1
 			);
 		} else {
 			eprintln!("{total} commit(s) would be created.");
