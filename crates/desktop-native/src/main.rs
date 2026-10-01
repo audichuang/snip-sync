@@ -1199,7 +1199,6 @@ pub struct WorkbenchModel {
 	pub active_tab: WorkbenchTab,
 	pub selected_file: Option<String>,
 	pub selected_file_source: Option<SourceKind>,
-	pub selected_file_change_type: Option<ChangeType>,
 	pub tree_cursor: usize,
 	pub selected_list_row: usize,
 
@@ -1581,7 +1580,6 @@ impl WorkbenchModel {
 			active_tab: WorkbenchTab::GitChanges,
 			selected_file: None,
 			selected_file_source: None,
-			selected_file_change_type: None,
 			tree_cursor: 0,
 			selected_list_row: 0,
 			preview: None,
@@ -2010,7 +2008,6 @@ impl WorkbenchModel {
 	pub(crate) fn clear_preview(&mut self) {
 		self.preview = None;
 		self.preview_root = None;
-		self.selected_file_change_type = None;
 		self.paste.release_ordinary();
 	}
 
@@ -3691,13 +3688,7 @@ impl WorkbenchModel {
 			Some(TreeEffect::Io(io)) => self.submit_tree_io(io, cx),
 			Some(TreeEffect::OpenFile(rel)) => {
 				app_log!("[APP:WS_FILE_SELECTED: {}]", rel);
-				self.select_file_in(
-					Some(root),
-					&rel,
-					SourceKind::File,
-					None,
-					cx,
-				);
+				self.select_file_in(Some(root), &rel, SourceKind::File, cx);
 			}
 			Some(TreeEffect::Idle) => {
 				self.remember_tree_selection();
@@ -4106,9 +4097,8 @@ impl WorkbenchModel {
 			.change_repos
 			.get(item.repo as usize)
 			.map(|slot| slot.root.clone());
-		let (path, source, change_type) =
-			(item.path.clone(), item.source.clone(), item.change_type);
-		self.select_file_in(root, &path, source, change_type, cx);
+		let (path, source) = (item.path.clone(), item.source.clone());
+		self.select_file_in(root, &path, source, cx);
 	}
 
 	/// Opens a working-tree file (Project) or its staged/unstaged changes (Changes).
@@ -4118,16 +4108,7 @@ impl WorkbenchModel {
 		source: SourceKind,
 		cx: &mut Context<Self>,
 	) {
-		let change_type = self
-			.selected_change_slot()
-			.map(|slot| slot_range(&self.files, slot))
-			.and_then(|rows| {
-				self.files[rows]
-					.iter()
-					.find(|f| f.path == path && f.source == source)
-					.and_then(|f| f.change_type)
-			});
-		self.select_file_in(None, path, source, change_type, cx);
+		self.select_file_in(None, path, source, cx);
 	}
 
 	/// Opens `path` of repo `root` (the open repo when `None`).
@@ -4136,7 +4117,6 @@ impl WorkbenchModel {
 		root: Option<PathBuf>,
 		path: &str,
 		source: SourceKind,
-		change_type: Option<ChangeType>,
 		cx: &mut Context<Self>,
 	) {
 		if !self.accepting_work() {
@@ -4148,10 +4128,8 @@ impl WorkbenchModel {
 		let shown_selection = (
 			self.selected_file.replace(path.to_string()),
 			self.selected_file_source.replace(source.clone()),
-			self.selected_file_change_type.take(),
 			self.selected_commit.take(),
 		);
-		self.selected_file_change_type = change_type;
 		self.range_head = None;
 		self.log_selected.clear();
 		self.compare = None;
@@ -4185,13 +4163,8 @@ impl WorkbenchModel {
 			let for_bg = file_path.clone();
 			let result = bg
 				.spawn(async move {
-					let result = read_preview(
-						&repo_root,
-						&for_bg,
-						&source,
-						change_type,
-						cancel,
-					);
+					let result =
+						read_preview(&repo_root, &for_bg, &source, cancel);
 					if let Some(delay) = delay {
 						std::thread::sleep(delay);
 					}
@@ -4225,7 +4198,6 @@ impl WorkbenchModel {
 					(
 						model.selected_file,
 						model.selected_file_source,
-						model.selected_file_change_type,
 						model.selected_commit,
 					) = shown_selection;
 				}
@@ -4243,21 +4215,22 @@ impl WorkbenchModel {
 		match result {
 			Ok((p, source)) => {
 				if !p.patch.is_empty() {
-					let mut preview = Preview::new(
+					self.set_preview(Preview::new(
 						source,
 						Some(path),
 						p.patch,
 						true,
 						Language::Diff,
-					);
-					preview.change_type = self.selected_file_change_type;
-					self.set_preview(preview)
+					))
 				} else if let Some(content) = p.content {
 					let lang = Language::from_path_or_ext(&path, false);
-					let mut preview =
-						Preview::new(source, Some(path), content, false, lang);
-					preview.change_type = self.selected_file_change_type;
-					self.set_preview(preview)
+					self.set_preview(Preview::new(
+						source,
+						Some(path),
+						content,
+						false,
+						lang,
+					))
 				} else {
 					self.show_preview_error(Msg::new("error_binary", [path]));
 					false
@@ -5910,7 +5883,6 @@ fn read_preview(
 	repo_root: &std::path::Path,
 	path: &str,
 	source: &SourceKind,
-	change_type: Option<ChangeType>,
 	cancel: CancelToken,
 ) -> Result<(browser::SourcePreview, PreviewSource), String> {
 	if matches!(source, SourceKind::File) {
@@ -5939,18 +5911,7 @@ fn read_preview(
 		),
 		SourceKind::File => (GitSource::Working, PreviewSource::WorkingFile),
 	};
-	let preview = match change_type {
-		Some(change) => browser::git_preview_for(
-			&git,
-			&git_source,
-			path,
-			change,
-			None,
-			&opts,
-		),
-		None => browser::git_preview_with(&git, &git_source, path, &opts),
-	};
-	match preview {
+	match browser::git_preview_with(&git, &git_source, path, &opts) {
 		Ok(p) => Ok((
 			browser::SourcePreview {
 				content: p.content,
@@ -6368,32 +6329,6 @@ mod tests {
 					("pom.xml", false)
 				]
 			);
-		}
-
-		#[gpui::test]
-		fn staged_rename_changes_panel_preview_labels_moved(
-			cx: &mut TestAppContext,
-		) {
-			use snip_core::format::ChangeType;
-			let ws = tempfile::tempdir().unwrap();
-			let r = repo(ws.path(), "a", &[]);
-			git(&r, &["mv", "base.txt", "new.txt"]);
-			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
-			settle(cx);
-
-			model.update(cx, |m, cx| {
-				assert_eq!(m.files.len(), 1);
-				assert_eq!(m.files[0].path, "new.txt");
-				assert_eq!(m.files[0].change_type, Some(ChangeType::Moved));
-				m.select_change(0, cx);
-			});
-			settle(cx);
-
-			model.read_with(cx, |m, _| {
-				let preview = m.preview.as_ref().expect("preview loaded");
-				assert_eq!(preview.change_type, Some(ChangeType::Moved));
-				assert_ne!(preview.change_type, Some(ChangeType::New));
-			});
 		}
 
 		/// Puts `payload` on the OS clipboard and opens its paste preview.
@@ -8245,7 +8180,6 @@ mod tests {
 			&super::SourceKind::Commit {
 				rev: "refs/heads/missing-preview-revision".into(),
 			},
-			None,
 			super::CancelToken::new(),
 		);
 		assert!(
@@ -8256,7 +8190,6 @@ mod tests {
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::Staged,
-			None,
 			super::CancelToken::new(),
 		)
 		.unwrap();
@@ -8267,7 +8200,6 @@ mod tests {
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::File,
-			None,
 			super::CancelToken::new(),
 		)
 		.unwrap();
@@ -8278,7 +8210,6 @@ mod tests {
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::Staged,
-			None,
 			super::CancelToken::new(),
 		)
 		.unwrap();
@@ -8295,6 +8226,7 @@ mod tests {
 	/// and exporting it yields [MOVED] new-name with the index bytes and no [DELETED] old.
 	#[test]
 	fn staged_rename_read_change_list_and_export_moved() {
+		use snip_core::format::ChangeType;
 		let dir = tempfile::tempdir().unwrap();
 		let git = |args: &[&str]| {
 			let out = std::process::Command::new("git")
@@ -8364,13 +8296,19 @@ mod tests {
 		assert!(!payload.contains("old-name.txt"), "payload: {payload}");
 	}
 
-	/// read_preview with Some(ChangeType::Moved) uses browser::git_preview_for.
+	#[cfg(unix)]
 	#[test]
-	fn staged_rename_read_preview_uses_git_preview_for() {
-		let dir = tempfile::tempdir().unwrap();
+	fn read_preview_refuses_symlink_leaving_workspace() {
+		use std::os::unix::fs::symlink;
+
+		let outside_dir = tempfile::tempdir().unwrap();
+		let secret_file = outside_dir.path().join("secret.txt");
+		std::fs::write(&secret_file, "SECRET_OUTSIDE_REPO\n").unwrap();
+
+		let repo_dir = tempfile::tempdir().unwrap();
 		let git = |args: &[&str]| {
 			let out = std::process::Command::new("git")
-				.current_dir(dir.path())
+				.current_dir(repo_dir.path())
 				.args(args)
 				.output()
 				.unwrap();
@@ -8381,23 +8319,43 @@ mod tests {
 			);
 		};
 		git(&["init", "-q", "-b", "main"]);
-		git(&["config", "user.name", "Preview test"]);
-		git(&["config", "user.email", "preview@example.invalid"]);
-		std::fs::write(dir.path().join("old.txt"), "hello world\n").unwrap();
-		git(&["add", "old.txt"]);
+		git(&["config", "user.name", "Test"]);
+		git(&["config", "user.email", "test@example.invalid"]);
+		let notes_path = repo_dir.path().join("notes.txt");
+		std::fs::write(&notes_path, "committed notes\n").unwrap();
+		git(&["add", "notes.txt"]);
 		git(&["commit", "-qm", "initial"]);
-		git(&["mv", "old.txt", "new.txt"]);
 
-		let (preview, source) = super::read_preview(
-			dir.path(),
-			"new.txt",
-			&super::SourceKind::Staged,
-			Some(ChangeType::Moved),
+		// Replace notes.txt in worktree with a symlink to secret.txt outside the repo
+		std::fs::remove_file(&notes_path).unwrap();
+		symlink(&secret_file, &notes_path).unwrap();
+
+		let result = super::read_preview(
+			repo_dir.path(),
+			"notes.txt",
+			&super::SourceKind::Unstaged,
 			super::CancelToken::new(),
-		)
-		.unwrap();
-		assert_eq!(source, super::PreviewSource::StagedChanges);
-		assert_eq!(preview.content.as_deref(), Some("hello world\n"));
+		);
+		match result {
+			Err(err_msg) => {
+				assert!(
+					err_msg.contains("Path leaves the workspace"),
+					"expected 'Path leaves the workspace', got: {err_msg}"
+				);
+			}
+			Ok((preview, _)) => {
+				let content = preview.content.unwrap_or_default();
+				assert!(
+					!content.contains("SECRET_OUTSIDE_REPO"),
+					"secret text leaked in preview content"
+				);
+				assert!(
+					!preview.patch.contains("SECRET_OUTSIDE_REPO"),
+					"secret text leaked in preview patch"
+				);
+				panic!("read_preview must return Err for symlink leaving workspace, got Ok");
+			}
+		}
 	}
 
 	use super::*;

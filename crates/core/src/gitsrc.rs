@@ -1877,42 +1877,6 @@ mod tests {
 	}
 
 	#[test]
-	fn staged_rename_read_changed_file_for_labels_moved_not_new() {
-		let r = Repo::new();
-		r.write("old.txt", b"content\n");
-		r.commit("initial");
-		r.git(&["mv", "old.txt", "new.txt"]);
-		let g = Git::open(&r.path()).unwrap();
-		let opts = RunOptions::default();
-
-		// read_changed_file_with only sees new.txt, so it labels it New:
-		let single = read_changed_file_with(
-			&g,
-			&GitSource::Staged,
-			"new.txt",
-			1024,
-			&opts,
-		)
-		.unwrap()
-		.unwrap();
-		assert_eq!(single.change_type, Some(ChangeType::New));
-
-		// read_changed_file_for takes the row's change type and preserves Moved:
-		let for_row = read_changed_file_for(
-			&g,
-			&GitSource::Staged,
-			"new.txt",
-			ChangeType::Moved,
-			None,
-			1024,
-			&opts,
-		)
-		.unwrap();
-		assert_eq!(for_row.change_type, Some(ChangeType::Moved));
-		assert_eq!(for_row.content.as_deref(), Some("content\n"));
-	}
-
-	#[test]
 	fn range_compares_endpoints_only() {
 		let r = Repo::new();
 		r.write("a.txt", b"a1\n");

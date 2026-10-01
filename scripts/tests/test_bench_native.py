@@ -664,6 +664,17 @@ class TestIndexAndWorktreeOracle(unittest.TestCase):
         self.assertEqual(sp_new[0]["source"], "staged")
         self.assertEqual(source_file_bytes(self.repo, sp_new[0]), b"space content\n")
 
+    def test_source_rows_truncated_rename_missing_orig_path_raises(self) -> None:
+        truncated_raw = (
+            b"2 R. N... 100644 100644 100644 "
+            b"97fce6207b29351be348868f869fcd7c088b19c9 "
+            b"97fce6207b29351be348868f869fcd7c088b19c9 R100 new.txt\0"
+        )
+        with mock.patch("bench_native_memory.git", return_value=truncated_raw):
+            with self.assertRaises(NativeBenchError) as cm:
+                source_rows(self.repo)
+            self.assertIn("missing rename origPath", str(cm.exception))
+
 
 class TestCurrentBasketPrecondition(unittest.TestCase):
     """A cleared basket may switch. The historical full-log helper still rejects the old n=1."""

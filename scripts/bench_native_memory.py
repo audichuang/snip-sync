@@ -649,7 +649,7 @@ def source_rows(repo: str) -> list[dict[str, Any]]:
                 staged.append((path, x))
             if y != ".":
                 unstaged.append((path, y))
-            if i >= len(entries):
+            if i >= len(entries) or not entries[i]:
                 raise NativeBenchError(f"missing rename origPath: {text!r}")
             i += 1  # original path is the next NUL field
             continue
