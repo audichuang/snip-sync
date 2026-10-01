@@ -148,7 +148,8 @@ PE_MACHINES = {
 
 def check_safe_archive_path(path_str: str) -> None:
     """
-    Rejects absolute paths, Windows drive paths, and path traversal components.
+    Rejects absolute paths, Windows drive paths, path traversal components, and
+    macOS metadata (AppleDouble ._ files, __MACOSX) that a Mac's tar or zip adds.
     """
     if path_str.startswith("/") or path_str.startswith("\\"):
         raise VerificationError(f"Dangerous absolute path in archive: {path_str}")
@@ -158,6 +159,8 @@ def check_safe_archive_path(path_str: str) -> None:
     parts = normalized.split("/")
     if ".." in parts:
         raise VerificationError(f"Dangerous path traversal in archive: {path_str}")
+    if any(p.startswith("._") or p == "__MACOSX" for p in parts):
+        raise VerificationError(f"macOS metadata entry in archive (package with COPYFILE_DISABLE=1): {path_str}")
 
 
 def _unknown_binary() -> Dict[str, Any]:

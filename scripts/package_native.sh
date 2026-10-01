@@ -21,6 +21,10 @@ if [ "$#" -lt 4 ]; then
     exit 1
 fi
 
+# macOS tar stores extended attributes (every file made on a Mac carries
+# com.apple.provenance) as AppleDouble ._ entries; release packages must not.
+export COPYFILE_DISABLE=1
+
 TARGET="$1"
 OUT_DIR_INPUT="$2"
 BIN_PATH="$3"
