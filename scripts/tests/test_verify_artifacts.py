@@ -23,6 +23,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.verify_artifacts import (
+    HDIUTIL_RETRY_DELAYS,
+    HDIUTIL_TRANSIENT_ERRORS,
     VerificationError,
     audit_artifact_directory,
     compute_sha256,
@@ -543,6 +545,34 @@ class TestVerifyArtifacts(unittest.TestCase):
             verify_dmg(dmg)
         if os.uname().sysname != "Darwin":
             self.assertIn("non-Darwin", str(cm.exception))
+
+    def test_macos_metadata_rejected_in_archives(self) -> None:
+        """AppleDouble ._ files and __MACOSX, as a Mac's tar or zip adds them, fail the audit."""
+        for extra in (
+            "snip-sync.app/._Contents",
+            "snip-sync.app/Contents/.__CodeSignature",
+            "snip-sync.app/Contents/Resources/licenses/._Inter-OFL.txt",
+        ):
+            with self.subTest(extra=extra):
+                tar_path = self.test_dir / "snip-sync_mac_arm.app.tar.gz"
+                with tarfile.open(tar_path, "w:gz") as tf:
+                    add_tar_bytes(tf, MAC_BINARY, make_macho(CPU_ARM64), 0o755)
+                    add_tar_licenses(tf, MAC_LICENSES)
+                    add_tar_bytes(tf, MAC_PLIST, app_plist("0.1.4"), 0o644)
+                    add_tar_bytes(tf, extra, b"\0\5\26\7", 0o644)
+                with self.assertRaises(VerificationError) as cm:
+                    verify_tar_archive(tar_path, expected_version="0.1.4", target="aarch64-apple-darwin")
+                self.assertIn("macOS metadata", str(cm.exception))
+
+        zip_path = self.test_dir / "snip-sync-windows-x64.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr(WIN_BINARY, make_pe())
+            add_zip_licenses(zf)
+            zf.writestr(WIN_README, "Version: 0.1.4\nTarget: x86_64-pc-windows-msvc\n")
+            zf.writestr("__MACOSX/snip-sync/._README.txt", b"\0\5\26\7")
+        with self.assertRaises(VerificationError) as cm:
+            verify_zip_archive(zip_path, target="x86_64-pc-windows-msvc", expected_version="0.1.4")
+        self.assertIn("macOS metadata", str(cm.exception))
 
     def test_symlinks_rejected_in_tar_archive(self) -> None:
         """Tests that candidate tarball containing symlinks is rejected outright."""
@@ -1080,17 +1110,7 @@ class TestVerifyArtifacts(unittest.TestCase):
             if cmd[0] == "hdiutil" and cmd[1] == "attach":
                 self.assertIn("-readonly", cmd)
                 self.assertIn("-nobrowse", cmd)
-                mnt = Path(cmd[cmd.index("-mountpoint") + 1])
-                mounts.append(mnt)
-                bundle = mnt / "snip-sync.app" / "Contents"
-                macos = bundle / "MacOS"
-                macos.mkdir(parents=True)
-                write_bundle_licenses(macos.parent)
-                binary = macos / "snip-desktop-native"
-                binary.write_bytes(make_macho(CPU_ARM64))
-                binary.chmod(0o755)
-                (bundle / "Info.plist").write_bytes(app_plist())
-                return subprocess.CompletedProcess(cmd, 0, "", "")
+                return self._fake_dmg_attach(cmd, mounts)
             if cmd[0] == "codesign":
                 return subprocess.CompletedProcess(cmd, 0, "", "Signature=adhoc")
             if cmd[0] == "hdiutil" and cmd[1] == "detach":
@@ -1106,6 +1126,164 @@ class TestVerifyArtifacts(unittest.TestCase):
         finally:
             for mnt in mounts:
                 shutil.rmtree(mnt, ignore_errors=True)
+
+    def _fake_dmg_attach(self, cmd: list, mounts: list) -> subprocess.CompletedProcess:
+        """Stands in for a successful hdiutil attach: lays out a valid DMG volume at -mountpoint."""
+        mnt = Path(cmd[cmd.index("-mountpoint") + 1])
+        mounts.append(mnt)
+        bundle = mnt / "snip-sync.app" / "Contents"
+        macos = bundle / "MacOS"
+        macos.mkdir(parents=True)
+        write_bundle_licenses(macos.parent)
+        binary = macos / "snip-desktop-native"
+        binary.write_bytes(make_macho(CPU_ARM64))
+        binary.chmod(0o755)
+        (bundle / "Info.plist").write_bytes(app_plist())
+        (mnt / "Applications").symlink_to("/Applications")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def _run_dmg_with_flaky_attach(
+        self, failures: int, error: str = "hdiutil: attach failed - Resource temporarily unavailable"
+    ) -> tuple:
+        """verify_dmg where the first `failures` attaches fail with `error`; sleeps are recorded, not taken."""
+        dmg = self.test_dir / "flaky.dmg"
+        dmg.write_bytes(b"A" * 2048)
+        mounts: list = []
+        calls: list = []
+        sleeps: list = []
+
+        def side_effect(cmd, **_kwargs):
+            calls.append(cmd[:2])
+            if cmd[0] == "hdiutil" and cmd[1] == "attach":
+                if sum(c == ["hdiutil", "attach"] for c in calls) <= failures:
+                    return subprocess.CompletedProcess(cmd, 1, "", error)
+                return self._fake_dmg_attach(cmd, mounts)
+            if cmd[0] == "codesign":
+                return subprocess.CompletedProcess(cmd, 0, "", "Signature=adhoc")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        try:
+            with patch("scripts.verify_artifacts.platform.system", return_value="Darwin"), patch(
+                "scripts.verify_artifacts.subprocess.run", side_effect=side_effect
+            ), patch("scripts.verify_artifacts.time.sleep", side_effect=sleeps.append):
+                try:
+                    result = verify_dmg(dmg, expected_version="0.1.4", expected_arch="aarch64")
+                except VerificationError as e:
+                    result = e
+        finally:
+            for mnt in mounts:
+                shutil.rmtree(mnt, ignore_errors=True)
+        return result, calls, sleeps
+
+    def test_dmg_attach_retries_transient_failures(self) -> None:
+        """The CI failure of 2026-10-01: attach refused a few times, then worked."""
+        failures = len(HDIUTIL_RETRY_DELAYS)
+        result, calls, sleeps = self._run_dmg_with_flaky_attach(failures)
+        self.assertNotIsInstance(result, VerificationError, str(result))
+        self.assertTrue(result["verified_on_darwin"])
+        self.assertEqual(calls.count(["hdiutil", "attach"]), failures + 1)
+        self.assertEqual(calls.count(["hdiutil", "detach"]), 1)
+        self.assertEqual(sleeps, list(HDIUTIL_RETRY_DELAYS))
+        # Patient enough for a busy runner, still bounded.
+        self.assertGreaterEqual(sum(HDIUTIL_RETRY_DELAYS), 45)
+        self.assertLessEqual(sum(HDIUTIL_RETRY_DELAYS), 120)
+
+    def test_dmg_attach_gives_up_after_every_retry(self) -> None:
+        result, calls, sleeps = self._run_dmg_with_flaky_attach(failures=len(HDIUTIL_RETRY_DELAYS) + 1)
+        self.assertIsInstance(result, VerificationError)
+        self.assertIn(f"after {len(HDIUTIL_RETRY_DELAYS) + 1} attempt(s)", str(result))
+        self.assertIn("Resource temporarily unavailable", str(result))
+        self.assertEqual(sleeps, list(HDIUTIL_RETRY_DELAYS))
+        # Nothing was mounted, so nothing is detached.
+        self.assertNotIn(["hdiutil", "detach"], calls)
+
+    def test_dmg_attach_does_not_retry_a_corrupt_image(self) -> None:
+        """Only busy-runner errors are retried; a broken DMG fails at once."""
+        result, calls, sleeps = self._run_dmg_with_flaky_attach(
+            failures=1, error="hdiutil: attach failed - image not recognized"
+        )
+        self.assertIsInstance(result, VerificationError)
+        self.assertIn("image not recognized", str(result))
+        self.assertEqual(calls.count(["hdiutil", "attach"]), 1)
+        self.assertEqual(sleeps, [])
+
+    def _package_darwin_with_flaky_create(self, failures: int, error: str = "Resource busy") -> tuple:
+        """package_native.sh with stub codesign/hdiutil/sleep/tar ahead of the real PATH."""
+        run_dir = Path(tempfile.mkdtemp(prefix="flaky-create-", dir=self.test_dir))
+        binary = run_dir / "payload"
+        binary.write_bytes(b"stub binary")
+        out = run_dir / "out"
+        tools = run_dir / "tools"
+        tools.mkdir()
+        state = run_dir / "state"
+        state.mkdir()
+        stubs = {
+            "codesign": "exit 0\n",
+            # Fails its first $FAILS calls; on success writes the DMG path (the last argument).
+            "hdiutil": (
+                'n=$(($(cat "$STATE/count" 2>/dev/null || echo 0) + 1)); echo "$n" > "$STATE/count"\n'
+                'if [ "$n" -le "$FAILS" ]; then echo "hdiutil: create failed - $ERROR" >&2; exit 1; fi\n'
+                'for last; do :; done; echo dmg > "$last"\n'
+            ),
+            "sleep": 'echo "$1" >> "$STATE/sleeps"\n',
+            # Records what the real tar would see, then runs it.
+            "tar": 'echo "${COPYFILE_DISABLE-unset}" >> "$STATE/tar-copyfile"\nexec "$REAL_TAR" "$@"\n',
+        }
+        for name, body in stubs.items():
+            stub = tools / name
+            stub.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+            stub.chmod(0o755)
+        env = os.environ.copy()
+        real_tar = shutil.which("tar")
+        self.assertIsNotNone(real_tar, "tar is missing")
+        env["REAL_TAR"] = str(real_tar)
+        env.pop("COPYFILE_DISABLE", None)
+        env["PATH"] = f"{tools}{os.pathsep}{env['PATH']}"
+        env["STATE"] = str(state)
+        env["FAILS"] = str(failures)
+        env["ERROR"] = error
+        # BASH_ENV can rewrite PATH inside the script and bypass the stubs.
+        env.pop("BASH_ENV", None)
+        res = subprocess.run(
+            ["./scripts/package_native.sh", "aarch64-apple-darwin", str(out), str(binary), "0.4.0"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        sleeps_file = state / "sleeps"
+        sleeps = [int(x) for x in sleeps_file.read_text().split()] if sleeps_file.exists() else []
+        return res, out / "snip-sync_mac_arm.dmg", sleeps, state
+
+    def test_package_native_tars_without_appledouble(self) -> None:
+        """A Mac's tar turns extended attributes into ._ entries unless COPYFILE_DISABLE is set."""
+        res, _dmg, _sleeps, state = self._package_darwin_with_flaky_create(failures=0)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual((state / "tar-copyfile").read_text().split(), ["1"])
+
+    def test_package_native_retries_transient_dmg_create(self) -> None:
+        # The shell loop retries the same errors on the same schedule as verify_dmg.
+        failures = len(HDIUTIL_RETRY_DELAYS)
+        for error in HDIUTIL_TRANSIENT_ERRORS:
+            with self.subTest(error=error):
+                res, dmg, sleeps, _ = self._package_darwin_with_flaky_create(failures, error)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertTrue(dmg.is_file())
+                self.assertEqual(sleeps, list(HDIUTIL_RETRY_DELAYS))
+
+    def test_package_native_does_not_retry_a_hard_dmg_create_failure(self) -> None:
+        res, dmg, sleeps, _ = self._package_darwin_with_flaky_create(failures=1, error="No space left on device")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("No space left on device", res.stderr)
+        self.assertIn("hdiutil create failed for", res.stderr)
+        self.assertEqual(sleeps, [])
+
+    def test_package_native_gives_up_after_every_dmg_create_retry(self) -> None:
+        res, dmg, sleeps, _ = self._package_darwin_with_flaky_create(failures=len(HDIUTIL_RETRY_DELAYS) + 1)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn(f"hdiutil create failed {len(HDIUTIL_RETRY_DELAYS) + 1} times", res.stderr)
+        self.assertFalse(dmg.exists())
+        self.assertEqual(sleeps, list(HDIUTIL_RETRY_DELAYS))
 
     def _linux_candidate(self, directory: Path, elf: bytes) -> None:
         directory.mkdir()

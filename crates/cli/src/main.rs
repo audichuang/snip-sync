@@ -676,8 +676,14 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 		let total = plan.commits.len();
 		for (i, c) in plan.commits.iter().enumerate() {
 			let subject = c.message.lines().next().unwrap_or("");
+			let refused_suffix = match c.refused_by() {
+				Some(conflict) => {
+					format!(" (refused: {})", conflict.describe())
+				}
+				None => String::new(),
+			};
 			println!(
-				"[{}/{total}] {subject}\n      {} <{}> {}",
+				"[{}/{total}] {subject}{refused_suffix}\n      {} <{}> {}",
 				i + 1,
 				c.author_name,
 				c.author_email,
@@ -701,7 +707,18 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 				);
 			}
 		}
-		eprintln!("{total} commit(s) would be created.");
+		let first_refusal =
+			plan.commits.iter().position(|c| c.refused_by().is_some());
+		if let Some(first_idx) = first_refusal {
+			let would_create = first_idx;
+			let not_reached = total.saturating_sub(first_idx + 1);
+			eprintln!(
+				"{would_create} commit(s) would be created; replay stops at commit #{} (refused); {not_reached} not reached.",
+				first_idx + 1
+			);
+		} else {
+			eprintln!("{total} commit(s) would be created.");
+		}
 		return Ok(());
 	}
 	let preview =

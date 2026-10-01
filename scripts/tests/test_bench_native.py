@@ -621,6 +621,60 @@ class TestIndexAndWorktreeOracle(unittest.TestCase):
         self.assertEqual(len(session.clicks), 3)
         self.assertTrue(result["sentinelReplaced"])
 
+    def test_staged_rename_reports_moved_and_handles_worktree_edit(self) -> None:
+        old_path = os.path.join(self.repo, "old.txt")
+        with open(old_path, "wb") as f:
+            f.write(b"original\n")
+        _git(self.repo, "add", "old.txt")
+        _git(self.repo, "commit", "-qm", "add old")
+
+        _git(self.repo, "mv", "old.txt", "new.txt")
+        rows = source_rows(self.repo)
+        new_rows = [r for r in rows if r["path"] == "new.txt"]
+        old_rows = [r for r in rows if r["path"] == "old.txt"]
+        self.assertEqual(len(old_rows), 0, "old path must not appear in source rows")
+        self.assertEqual(len(new_rows), 1)
+        self.assertEqual(new_rows[0]["source"], "staged")
+        self.assertFalse(new_rows[0]["deleted"])
+        self.assertEqual(source_file_bytes(self.repo, new_rows[0]), b"original\n")
+
+        new_path = os.path.join(self.repo, "new.txt")
+        with open(new_path, "wb") as f:
+            f.write(b"modified worktree\n")
+        rows_rm = source_rows(self.repo)
+        new_rm = [r for r in rows_rm if r["path"] == "new.txt"]
+        self.assertEqual(len(new_rm), 2)
+        self.assertEqual({r["source"] for r in new_rm}, {"staged", "unstaged"})
+        staged_rm = next(r for r in new_rm if r["source"] == "staged")
+        unstaged_rm = next(r for r in new_rm if r["source"] == "unstaged")
+        self.assertEqual(source_file_bytes(self.repo, staged_rm), b"original\n")
+        self.assertEqual(source_file_bytes(self.repo, unstaged_rm), b"modified worktree\n")
+
+        sp_old = os.path.join(self.repo, "space old.txt")
+        with open(sp_old, "wb") as f:
+            f.write(b"space content\n")
+        _git(self.repo, "add", "space old.txt")
+        _git(self.repo, "commit", "-qm", "add space old")
+        _git(self.repo, "mv", "space old.txt", "space new.txt")
+        rows_sp = source_rows(self.repo)
+        sp_new = [r for r in rows_sp if r["path"] == "space new.txt"]
+        sp_old_rows = [r for r in rows_sp if r["path"] == "space old.txt"]
+        self.assertEqual(len(sp_old_rows), 0)
+        self.assertEqual(len(sp_new), 1)
+        self.assertEqual(sp_new[0]["source"], "staged")
+        self.assertEqual(source_file_bytes(self.repo, sp_new[0]), b"space content\n")
+
+    def test_source_rows_truncated_rename_missing_orig_path_raises(self) -> None:
+        truncated_raw = (
+            b"2 R. N... 100644 100644 100644 "
+            b"97fce6207b29351be348868f869fcd7c088b19c9 "
+            b"97fce6207b29351be348868f869fcd7c088b19c9 R100 new.txt\0"
+        )
+        with mock.patch("bench_native_memory.git", return_value=truncated_raw):
+            with self.assertRaises(NativeBenchError) as cm:
+                source_rows(self.repo)
+            self.assertIn("missing rename origPath", str(cm.exception))
+
 
 class TestCurrentBasketPrecondition(unittest.TestCase):
     """A cleared basket may switch. The historical full-log helper still rejects the old n=1."""

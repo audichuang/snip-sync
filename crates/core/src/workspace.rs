@@ -907,7 +907,7 @@ fn read_status(
 		"--porcelain=v2",
 		"-z",
 		"--untracked-files=all",
-		"--no-renames",
+		"--renames",
 	];
 	args.extend_from_slice(extra);
 	Ok(git
@@ -1033,7 +1033,7 @@ fn parse_status_details(out: &[u8]) -> Result<StatusDetails, GitError> {
 					Some(crate::gitsrc::change_type_for_status(y)),
 				));
 			}
-			records.next(); // skip origPath
+			records.next().ok_or_else(bad)?; // skip origPath
 		}
 	}
 	Ok(details)
@@ -1792,8 +1792,8 @@ mod tests {
 		assert_eq!(
 			s.changes,
 			ChangeCounts {
-				// b.txt, and the rename as its delete and add.
-				staged: 3,
+				// b.txt, and the staged rename.
+				staged: 2,
 				unstaged: 2,
 				untracked: 1,
 				conflicted: 0,
@@ -1931,5 +1931,51 @@ mod tests {
 			["reports/b.txt", "reports/q1/a.txt", "untracked.txt"]
 		);
 		assert_eq!(details.conflicted.len(), 0);
+	}
+
+	#[test]
+	fn status_details_staged_rename_reports_moved_and_skips_old_path() {
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("r");
+		init(&repo);
+		commit_file(&repo, "old.txt", "hello\n");
+		commit_file(&repo, "space old.txt", "space\n");
+
+		// Staged rename
+		git(&repo, &["mv", "old.txt", "new.txt"]);
+		// Staged rename with spaces
+		git(&repo, &["mv", "space old.txt", "space new.txt"]);
+
+		let git_repo = Git::open(&repo).unwrap();
+		let opts = RunOptions::interactive(None);
+		let details = status_details(&git_repo, &opts).unwrap();
+
+		assert_eq!(
+			details.staged,
+			[
+				("new.txt".to_string(), Some(ChangeType::Moved)),
+				("space new.txt".to_string(), Some(ChangeType::Moved)),
+			]
+		);
+		assert!(details.unstaged.is_empty());
+		assert!(details.untracked.is_empty());
+		assert!(details.conflicted.is_empty());
+
+		// RM case: staged rename + worktree edit on new.txt
+		std::fs::write(repo.join("new.txt"), "hello worktree edit\n").unwrap();
+		let details = status_details(&git_repo, &opts).unwrap();
+		assert_eq!(
+			details.staged,
+			[
+				("new.txt".to_string(), Some(ChangeType::Moved)),
+				("space new.txt".to_string(), Some(ChangeType::Moved)),
+			]
+		);
+		assert_eq!(
+			details.unstaged,
+			[("new.txt".to_string(), Some(ChangeType::Modified))]
+		);
+		assert!(details.untracked.is_empty());
+		assert!(details.conflicted.is_empty());
 	}
 }

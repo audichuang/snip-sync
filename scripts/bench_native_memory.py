@@ -599,13 +599,13 @@ def parse_repo_select(line: str) -> tuple[int, str]:
 def source_rows(repo: str) -> list[dict[str, Any]]:
     """Source-aware change rows, in the app's order.
 
-    Matches `status_details`: porcelain v2, `--untracked-files=normal`, `--no-renames`.
+    Matches `status_details`: porcelain v2, `--untracked-files=normal`, `--renames`.
     A path that is both staged and unstaged is two rows. The count is not the
     number of distinct paths.
     """
     raw = git(
         repo, "status", "--porcelain=v2", "-z",
-        "--untracked-files=normal", "--no-renames", text=False,
+        "--untracked-files=normal", "--renames", text=False,
     )
     staged: list[tuple[str, str]] = []
     unstaged: list[tuple[str, str]] = []
@@ -649,8 +649,9 @@ def source_rows(repo: str) -> list[dict[str, Any]]:
                 staged.append((path, x))
             if y != ".":
                 unstaged.append((path, y))
-            if i < len(entries):
-                i += 1  # original path is the next NUL field
+            if i >= len(entries) or not entries[i]:
+                raise NativeBenchError(f"missing rename origPath: {text!r}")
+            i += 1  # original path is the next NUL field
             continue
         raise NativeBenchError(f"unparsed status record: {text!r}")
 

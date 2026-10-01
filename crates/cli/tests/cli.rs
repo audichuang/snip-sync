@@ -296,3 +296,257 @@ fn git_sources_label_paths_against_repo_subdirectory() {
 	assert!(payload.contains("[MODIFIED] a.txt"), "{payload}");
 	assert!(!payload.contains("sub/a.txt"), "{payload}");
 }
+
+#[test]
+fn paste_commits_dry_run_reports_layout_refusal_and_accurate_count() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&src);
+	init_repo(&dst);
+	fs::write(src.join("base.txt"), "base\n").unwrap();
+	commit(&src, "initial", "2024-01-01T00:00:00+00:00");
+	fs::create_dir_all(src.join("blocker")).unwrap();
+	fs::write(src.join("blocker/file.txt"), "content\n").unwrap();
+	commit(&src, "first commit", "2024-01-02T00:00:00+00:00");
+	fs::write(src.join("fresh.txt"), "fresh\n").unwrap();
+	commit(&src, "second commit", "2024-01-03T00:00:00+00:00");
+
+	fs::write(dst.join("blocker"), "regular file\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+
+	let src_s = src.to_str().unwrap();
+	let dst_s = dst.to_str().unwrap();
+	let out = snip(
+		&["--repo", src_s, "copy", "--commits", "-n", "2", "--stdout"],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let payload = out.stdout;
+
+	let out = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(&payload),
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(
+		stdout.contains("[1/2] first commit (refused: a file is in the way of its parent directory)"),
+		"{stdout}"
+	);
+	assert!(stdout.contains("[2/2] second commit"), "{stdout}");
+	assert!(
+		!stdout.contains("[2/2] second commit (refused:"),
+		"{stdout}"
+	);
+	assert!(
+		stderr.contains(
+			"0 commit(s) would be created; replay stops at commit #1 (refused); 1 not reached."
+		),
+		"{stderr}"
+	);
+}
+
+#[test]
+fn paste_commits_dry_run_three_commits_reports_stop_point_and_not_reached() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&src);
+	init_repo(&dst);
+	fs::write(src.join("base.txt"), "base\n").unwrap();
+	commit(&src, "initial", "2024-01-01T00:00:00+00:00");
+	fs::write(src.join("ok1.txt"), "ok1\n").unwrap();
+	commit(&src, "commit ok 1", "2024-01-02T00:00:00+00:00");
+	fs::create_dir_all(src.join("blocker")).unwrap();
+	fs::write(src.join("blocker/file.txt"), "content\n").unwrap();
+	commit(&src, "commit blocked", "2024-01-03T00:00:00+00:00");
+	fs::write(src.join("ok2.txt"), "ok2\n").unwrap();
+	commit(&src, "commit ok 2", "2024-01-04T00:00:00+00:00");
+
+	fs::write(dst.join("blocker"), "regular file\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+
+	let src_s = src.to_str().unwrap();
+	let dst_s = dst.to_str().unwrap();
+	let out = snip(
+		&["--repo", src_s, "copy", "--commits", "-n", "3", "--stdout"],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let payload = out.stdout;
+
+	let out = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(&payload),
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(stdout.contains("[1/3] commit ok 1"), "{stdout}");
+	assert!(
+		stdout.contains("[2/3] commit blocked (refused: a file is in the way of its parent directory)"),
+		"{stdout}"
+	);
+	assert!(stdout.contains("[3/3] commit ok 2"), "{stdout}");
+	assert!(!stdout.contains("[3/3] commit ok 2 (refused:"), "{stdout}");
+	assert!(
+		stderr.contains(
+			"1 commit(s) would be created; replay stops at commit #2 (refused); 1 not reached."
+		),
+		"{stderr}"
+	);
+}
+
+/// `(path, change, content)`.
+type PayloadFile<'a> = (&'a str, &'a str, Option<&'a str>);
+
+/// A commits payload from `(message, files)`.
+fn commits_payload(commits: &[(&str, &[PayloadFile])]) -> String {
+	let commits: Vec<String> = commits
+		.iter()
+		.map(|(message, files)| {
+			let files: Vec<String> = files
+				.iter()
+				.map(|(path, change, content)| {
+					let content = content
+						.map_or("null".to_string(), |c| format!("{c:?}"));
+					format!(
+						"{{\"path\":{path:?},\"oldPath\":null,\"change\":{change:?},\"content\":{content},\"notCopied\":null}}"
+					)
+				})
+				.collect();
+			format!(
+				"{{\"message\":\"{message}\\n\",\"authorName\":\"QA\",\"authorEmail\":\"qa@example.com\",\"authorDate\":\"2026-06-02T09:00:00+08:00\",\"files\":[{}]}}",
+				files.join(",")
+			)
+		})
+		.collect();
+	format!(
+		"// snip-sync commits v1\n{{\"commits\":[{}]}}",
+		commits.join(",")
+	)
+}
+
+#[test]
+fn paste_commits_dry_run_plans_each_commit_after_the_earlier_ones() {
+	// Commit 1 deletes the regular file `newdir`, commit 2 writes under it:
+	// the dry-run agrees with Apply that both are created.
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&dst);
+	fs::write(dst.join("newdir"), "regular file\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = commits_payload(&[
+		("remove blocker", &[("newdir", "DELETED", None)]),
+		("write under it", &[("newdir/x.txt", "ADDED", Some("x\n"))]),
+	]);
+	let dry = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	let stdout = text(&dry.stdout);
+	assert!(stdout.contains("[2/2] write under it\n"), "{stdout}");
+	assert!(!stdout.contains("refused"), "{stdout}");
+	assert!(
+		text(&dry.stderr).contains("2 commit(s) would be created."),
+		"{}",
+		text(&dry.stderr)
+	);
+	let apply = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
+	assert!(
+		text(&apply.stdout).contains("Created 2 commit(s)."),
+		"{}",
+		text(&apply.stdout)
+	);
+
+	// Commit 1 writes a file `newdir`, commit 2 writes under it: both stop
+	// at commit 2.
+	let dst = tmp.path().join("dst2");
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&dst);
+	fs::write(dst.join("keep.txt"), "keep\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = commits_payload(&[
+		("create blocker", &[("newdir", "ADDED", Some("f\n"))]),
+		("write under it", &[("newdir/x.txt", "ADDED", Some("x\n"))]),
+	]);
+	let dry = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	let stdout = text(&dry.stdout);
+	assert!(
+		stdout.contains("[2/2] write under it (refused: a file is in the way of its parent directory)"),
+		"{stdout}"
+	);
+	assert!(
+		text(&dry.stderr).contains(
+			"1 commit(s) would be created; replay stops at commit #2 (refused); 0 not reached."
+		),
+		"{}",
+		text(&dry.stderr)
+	);
+	let apply = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	let all = format!("{}{}", text(&apply.stdout), text(&apply.stderr));
+	assert!(all.contains("Created 1 commit(s)."), "{all}");
+	assert!(
+		all.contains("a file is in the way of its parent directory"),
+		"{all}"
+	);
+}
+
+#[test]
+fn paste_commits_apply_replays_over_a_directory_an_earlier_commit_empties() {
+	// Commit 1 deletes d/f.txt (leaving `d` empty and so removed), commit 2
+	// writes a file at `d`: dry-run and Apply both create 2 commits.
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(dst.join("d")).unwrap();
+	init_repo(&dst);
+	fs::write(dst.join("d/f.txt"), "f\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = commits_payload(&[
+		("empty the dir", &[("d/f.txt", "DELETED", None)]),
+		("file at its path", &[("d", "ADDED", Some("now a file\n"))]),
+	]);
+	let dry = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	assert!(
+		!text(&dry.stdout).contains("refused"),
+		"{}",
+		text(&dry.stdout)
+	);
+	let apply = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
+	assert!(
+		text(&apply.stdout).contains("Created 2 commit(s)."),
+		"{}",
+		text(&apply.stdout)
+	);
+	assert_eq!(fs::read_to_string(dst.join("d")).unwrap(), "now a file\n");
+}

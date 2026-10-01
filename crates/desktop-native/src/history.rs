@@ -2249,8 +2249,12 @@ impl WorkbenchModel {
 		}
 		self.range_head = (self.selected_commit.as_deref() != Some(sha))
 			.then(|| Box::<str>::from(sha).into_string());
-		let ids = self.range_ids();
-		app_log!("[APP:RANGE: commits={}]", ids.len().max(1));
+		let (ids, chain_kind) = self.range_ids_with_kind();
+		app_log!(
+			"[APP:RANGE: commits={} chain={}]",
+			ids.len().max(1),
+			chain_kind.as_str()
+		);
 		if ids.len() > 1 {
 			self.log_selected = ids;
 			self.load_selection(cx);
@@ -2480,17 +2484,25 @@ impl WorkbenchModel {
 		Some((a.min(b), a.max(b)))
 	}
 
-	/// Row ids the range selects: the rows between its ends that belong to
-	/// the anchor's repository (the merged log interleaves others).
-	pub fn range_ids(&self) -> Vec<String> {
+	/// Row ids the range selects and whether it forms a first-parent chain.
+	/// A valid first-parent chain between the endpoints is selected in
+	/// top-down display order; otherwise falls back to the visual range
+	/// between them in the anchor's repository.
+	pub fn range_ids_with_kind(&self) -> (Vec<String>, RangeChainKind) {
 		let (Some(anchor), Some(head)) =
 			(self.selected_commit.as_deref(), self.range_head.as_deref())
 		else {
-			return Vec::new();
+			return (Vec::new(), RangeChainKind::FirstParent);
 		};
 		let rows = self.display_commits();
-		let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
-		range_between(&ids, anchor, head)
+		range_ids_with_kind(&rows, anchor, head)
+	}
+
+	/// Row ids the range selects: the first-parent chain between the endpoints
+	/// when one exists, or all display rows between them belonging to the
+	/// anchor's repository as a visual fallback.
+	pub fn range_ids(&self) -> Vec<String> {
+		self.range_ids_with_kind().0
 	}
 
 	/// The row is part of the log's selection.
@@ -3133,6 +3145,86 @@ pub fn step_row(
 /// Both ids name commits of one repository (plain SHAs always do).
 pub fn same_repo(a: &str, b: &str) -> bool {
 	multi_log::split_id(a).1 == multi_log::split_id(b).1
+}
+
+/// The selection mechanism used to resolve a commit range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeChainKind {
+	/// Endpoints are connected by a contiguous first-parent chain.
+	FirstParent,
+	/// Endpoints do not form a first-parent chain; fallback to all visible
+	/// rows between them belonging to the same repository.
+	Visual,
+}
+
+impl RangeChainKind {
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Self::FirstParent => "first_parent",
+			Self::Visual => "visual",
+		}
+	}
+}
+
+/// Shift range: the first-parent chain between `anchor` and `head` in
+/// top-down display order (`[upper, ..., lower]`). Returns `None` when the
+/// endpoints do not form a chain, so the caller falls back to visual.
+pub fn first_parent_range(
+	rows: &[&CommitSummary],
+	anchor: &str,
+	head: &str,
+) -> Option<Vec<String>> {
+	if !same_repo(anchor, head) {
+		return None;
+	}
+	let pos_anchor = rows.iter().position(|c| c.sha == anchor)?;
+	let pos_head = rows.iter().position(|c| c.sha == head)?;
+
+	let (upper_pos, lower_pos) = if pos_anchor <= pos_head {
+		(pos_anchor, pos_head)
+	} else {
+		(pos_head, pos_anchor)
+	};
+
+	let lower_sha = &rows[lower_pos].sha;
+	let by_sha: HashMap<&str, (usize, &CommitSummary)> = rows
+		.iter()
+		.enumerate()
+		.map(|(idx, &c)| (c.sha.as_str(), (idx, c)))
+		.collect();
+
+	let mut chain = Vec::new();
+	let mut curr_pos = upper_pos;
+	let mut curr = rows[upper_pos];
+	chain.push(curr.sha.clone());
+
+	while curr.sha != *lower_sha {
+		let parent_sha = curr.parents.first()?;
+		let &(p_pos, next_commit) = by_sha.get(parent_sha.as_str())?;
+		if p_pos <= curr_pos || p_pos > lower_pos {
+			return None;
+		}
+		chain.push(next_commit.sha.clone());
+		curr_pos = p_pos;
+		curr = next_commit;
+	}
+	Some(chain)
+}
+
+/// Row ids the range selects and whether it forms a first-parent chain.
+/// A valid first-parent chain between the endpoints is selected in
+/// top-down display order; otherwise falls back to the visual range
+/// between them in the anchor's repository.
+pub fn range_ids_with_kind(
+	rows: &[&CommitSummary],
+	anchor: &str,
+	head: &str,
+) -> (Vec<String>, RangeChainKind) {
+	if let Some(chain) = first_parent_range(rows, anchor, head) {
+		return (chain, RangeChainKind::FirstParent);
+	}
+	let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
+	(range_between(&ids, anchor, head), RangeChainKind::Visual)
 }
 
 /// Shift range: the rows from `anchor` to `head` (display order, both
@@ -4593,6 +4685,112 @@ mod tests {
 		assert_eq!(toggle_selection(&rows, &sel, "b2@1"), Err("cross_repo"));
 		// A single repository's plain SHAs are one repository.
 		assert!(toggle_selection(&["x", "y"], &ids(&["x"]), "y").is_ok());
+	}
+
+	#[test]
+	fn first_parent_range_and_fallback() {
+		// Display order (newest first): C4, C3, SIDE, C2, C1, base.
+		// C3 is a merge commit: first parent C2, second parent SIDE.
+		let commits = [
+			c("C4", &["C3"]),
+			c("C3", &["C2", "SIDE"]),
+			c("SIDE", &["C2"]),
+			c("C2", &["C1"]),
+			c("C1", &["base"]),
+			c("base", &[]),
+		];
+		let rows: Vec<&CommitSummary> = commits.iter().collect();
+
+		// C1 -> C3 and C3 -> C1 both give [C3, C2, C1] in top-down display order.
+		assert_eq!(
+			first_parent_range(&rows, "C1", "C3"),
+			Some(vec!["C3".into(), "C2".into(), "C1".into()])
+		);
+		assert_eq!(
+			first_parent_range(&rows, "C3", "C1"),
+			Some(vec!["C3".into(), "C2".into(), "C1".into()])
+		);
+
+		// Sibling pair: SIDE and C3.
+		// C3's first parent is C2, so C3 -> SIDE is not a first-parent chain.
+		assert_eq!(first_parent_range(&rows, "C3", "SIDE"), None);
+		assert_eq!(first_parent_range(&rows, "SIDE", "C3"), None);
+		assert_eq!(
+			range_ids_with_kind(&rows, "C3", "SIDE").1,
+			RangeChainKind::Visual
+		);
+		assert_eq!(
+			range_ids_with_kind(&rows, "SIDE", "C3").1,
+			RangeChainKind::Visual
+		);
+
+		// Visual fallback between C3 and SIDE contains the rows between them.
+		let ids: Vec<&str> = rows.iter().map(|c| c.sha.as_str()).collect();
+		assert_eq!(range_between(&ids, "C3", "SIDE"), vec!["C3", "SIDE"]);
+
+		// Mirror real fixture where `side` branches from `base` (docs/real-ui-operator-fixture.sh ~137):
+		// SIDE as upper endpoint with its first parent (base) below the lower endpoint -> visual.
+		let real_fixture_commits = [
+			c("C4", &["C3"]),
+			c("C3", &["C2", "SIDE"]),
+			c("SIDE", &["base"]),
+			c("C2", &["C1"]),
+			c("C1", &["base"]),
+			c("base", &[]),
+		];
+		let real_rows: Vec<&CommitSummary> =
+			real_fixture_commits.iter().collect();
+		assert_eq!(first_parent_range(&real_rows, "SIDE", "C2"), None);
+		assert_eq!(
+			range_ids_with_kind(&real_rows, "SIDE", "C2").1,
+			RangeChainKind::Visual
+		);
+		assert_eq!(
+			range_ids_with_kind(&real_rows, "C2", "SIDE").1,
+			RangeChainKind::Visual
+		);
+		assert_eq!(first_parent_range(&real_rows, "SIDE", "C1"), None);
+		assert_eq!(
+			range_ids_with_kind(&real_rows, "SIDE", "C1").1,
+			RangeChainKind::Visual
+		);
+		assert_eq!(
+			range_ids_with_kind(&real_rows, "C1", "SIDE").1,
+			RangeChainKind::Visual
+		);
+
+		// Multi-repo namespaced ids ("sha@0" style) interleaved with repo 1 rows
+		// work and stay in the anchor repo.
+		let multi_commits = vec![
+			c("C4@0", &["C3@0"]),
+			c("r1@1", &[]),
+			c("C3@0", &["C2@0", "SIDE@0"]),
+			c("r2@1", &["r1@1"]),
+			c("SIDE@0", &["C2@0"]),
+			c("C2@0", &["C1@0"]),
+			c("r3@1", &["r2@1"]),
+			c("C1@0", &["base@0"]),
+			c("base@0", &[]),
+		];
+		let multi_rows: Vec<&CommitSummary> = multi_commits.iter().collect();
+
+		assert_eq!(
+			first_parent_range(&multi_rows, "C1@0", "C3@0"),
+			Some(vec!["C3@0".into(), "C2@0".into(), "C1@0".into()])
+		);
+		assert_eq!(first_parent_range(&multi_rows, "C3@0", "SIDE@0"), None);
+
+		// Unloaded parent: parent id not in rows (e.g. C2 is missing).
+		let missing_parent_commits = [
+			c("C4", &["C3"]),
+			c("C3", &["C2", "SIDE"]),
+			c("SIDE", &["C2"]),
+			c("C1", &["base"]),
+			c("base", &[]),
+		];
+		let missing_rows: Vec<&CommitSummary> =
+			missing_parent_commits.iter().collect();
+		assert_eq!(first_parent_range(&missing_rows, "C1", "C3"), None);
 	}
 
 	#[test]

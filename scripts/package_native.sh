@@ -21,6 +21,10 @@ if [ "$#" -lt 4 ]; then
     exit 1
 fi
 
+# macOS tar stores extended attributes (every file made on a Mac carries
+# com.apple.provenance) as AppleDouble ._ entries; release packages must not.
+export COPYFILE_DISABLE=1
+
 TARGET="$1"
 OUT_DIR_INPUT="$2"
 BIN_PATH="$3"
@@ -164,7 +168,29 @@ PLIST
 
         DMG_OUT="$OUT_DIR/snip-sync_${ARCH_LABEL}.dmg"
         echo "Creating DMG volume from stage directory..."
-        hdiutil create -volname "snip-sync" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_OUT"
+        # hdiutil fails transiently on hosted macOS runners; only those errors are
+        # retried (-ov makes that safe). Errors and delays match HDIUTIL_TRANSIENT_ERRORS
+        # and HDIUTIL_RETRY_DELAYS in verify_artifacts.py.
+        HDIUTIL_ERR="$STAGE_DIR/hdiutil.err"
+        attempt=1
+        for delay in 2 4 8 16 30 ""; do
+            if hdiutil create -volname "snip-sync" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_OUT" 2>"$HDIUTIL_ERR"; then
+                cat "$HDIUTIL_ERR" >&2
+                break
+            fi
+            cat "$HDIUTIL_ERR" >&2
+            if ! grep -qE 'Resource (busy|temporarily unavailable)' "$HDIUTIL_ERR"; then
+                echo "Error: hdiutil create failed for $DMG_OUT" >&2
+                exit 1
+            fi
+            if [ -z "$delay" ]; then
+                echo "Error: hdiutil create failed $attempt times for $DMG_OUT" >&2
+                exit 1
+            fi
+            echo "hdiutil create failed (attempt $attempt); retrying in ${delay}s..." >&2
+            sleep "$delay"
+            attempt=$((attempt + 1))
+        done
         echo "Created DMG: $DMG_OUT"
         ;;
 

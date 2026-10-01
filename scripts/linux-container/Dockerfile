@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN printf 'path-exclude=/usr/share/%s/*\n' doc man info locale > /etc/dpkg/dpkg.cfg.d/01-slim \
     && apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl git pkg-config xz-utils \
-        python3 python3-pil shellcheck \
+        python3 python3-pil shellcheck openssh-client \
         xvfb xdotool xclip x11-apps x11-utils imagemagick dbus dbus-x11 \
         fcitx5 fcitx5-pinyin \
         libxcb1-dev libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libxkbcommon-x11-0 \

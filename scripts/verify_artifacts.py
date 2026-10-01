@@ -82,6 +82,11 @@ CANDIDATE_FILES: Dict[str, Tuple[str, ...]] = {
     "x86_64-pc-windows-msvc": ("snip-sync-windows-x64.zip", "snip-sync-windows-setup.exe"),
 }
 
+# hdiutil fails transiently on hosted macOS runners with these errors; anything else
+# (a corrupt image) fails at once. Seconds to wait before each retry, about a minute
+# in all. Keep both in step with the hdiutil create loop in package_native.sh.
+HDIUTIL_TRANSIENT_ERRORS = ("Resource busy", "Resource temporarily unavailable")
+HDIUTIL_RETRY_DELAYS = (2, 4, 8, 16, 30)
 MAC_BINARY = "snip-sync.app/Contents/MacOS/snip-desktop-native"
 MAC_PLIST = "snip-sync.app/Contents/Info.plist"
 WIN_BINARY = "snip-sync/snip-desktop-native.exe"
@@ -143,7 +148,8 @@ PE_MACHINES = {
 
 def check_safe_archive_path(path_str: str) -> None:
     """
-    Rejects absolute paths, Windows drive paths, and path traversal components.
+    Rejects absolute paths, Windows drive paths, path traversal components, and
+    macOS metadata (AppleDouble ._ files, __MACOSX) that a Mac's tar or zip adds.
     """
     if path_str.startswith("/") or path_str.startswith("\\"):
         raise VerificationError(f"Dangerous absolute path in archive: {path_str}")
@@ -153,6 +159,8 @@ def check_safe_archive_path(path_str: str) -> None:
     parts = normalized.split("/")
     if ".." in parts:
         raise VerificationError(f"Dangerous path traversal in archive: {path_str}")
+    if any(p.startswith("._") or p == "__MACOSX" for p in parts):
+        raise VerificationError(f"macOS metadata entry in archive (package with COPYFILE_DISABLE=1): {path_str}")
 
 
 def _unknown_binary() -> Dict[str, Any]:
@@ -1210,8 +1218,10 @@ def verify_dmg(
         mnt = Path(tempfile.mkdtemp(prefix="snip_dmg_mnt_"))
         attached = False
         try:
-            # hdiutil attach fails transiently on hosted macOS runners ("Resource busy").
-            for attempt in range(3):
+            # 3 tries over 6 s were not enough for a busy CI runner.
+            for attempt in range(len(HDIUTIL_RETRY_DELAYS) + 1):
+                if attempt:
+                    time.sleep(HDIUTIL_RETRY_DELAYS[attempt - 1])
                 attach_res = subprocess.run(
                     ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", str(mnt), str(dmg_path)],
                     capture_output=True,
@@ -1221,9 +1231,12 @@ def verify_dmg(
                 if attach_res.returncode == 0:
                     attached = True
                     break
-                time.sleep(2 * (attempt + 1))
+                if not any(e in attach_res.stderr for e in HDIUTIL_TRANSIENT_ERRORS):
+                    break
             if not attached:
-                raise VerificationError(f"hdiutil attach failed for {dmg_path}:\n{attach_res.stderr}")
+                raise VerificationError(
+                    f"hdiutil attach failed after {attempt + 1} attempt(s) for {dmg_path}:\n{attach_res.stderr}"
+                )
 
             # Check .app inside DMG
             apps = list(mnt.glob("*.app"))

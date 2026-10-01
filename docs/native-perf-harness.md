@@ -71,7 +71,7 @@ Readiness is never determined by generic startup logs. The driver requires liter
 Because Xvfb lacks a composite window manager, `xwd -id` against unmanaged GPUI windows captures black frames (<1 KB). The driver captures the full X11 root window (`xwd -root`) and crops strictly to the translated client geometry determined by `xwininfo -id`.  The screenshot only has to be non-blank; what the app shows is verified through its own state lines against the git oracle, not by reading pixels.
 
 ### Source rows and an empty basket
-`[APP:REPO_LOADED] files=` is the number of staged, unstaged, untracked, and conflicted rows from `git status --porcelain=v2 -z --untracked-files=normal --no-renames`. A path that is both staged and unstaged counts twice. Comparing that number to distinct paths fails the run.
+`[APP:REPO_LOADED] files=` is the number of staged, unstaged, untracked, and conflicted rows from `git status --porcelain=v2 -z --untracked-files=normal --renames`. A path that is both staged and unstaged counts twice. Comparing that number to distinct paths fails the run.
 
 Loading a repository and switching repositories must not check a row. Any `[APP:BASKET] n=` other than 0, or `[APP:FILE_TOGGLED] selected=true`, before the driver's own checkbox click fails the run. The driver does not clear a non-empty basket to make the copy succeed.
 
