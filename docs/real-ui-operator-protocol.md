@@ -249,7 +249,7 @@ python3 scripts/collaboration_fixture.py compare-step \
 5. 點 `paste-map-pick:<prefix>:<idx>`，等 `[APP:PASTE_MAPPED]` 的 `dest` 就是那個 canonical root。已存在且內容會變的檔才點覆寫。
 6. `btn-apply`。等 `[APP:PASTE_DONE: ...]`，再跑 `compare-step`。
 
-Commit 步驟把第 2–3 步換成：`rail-log`，點起點 `commit-row:<7 字元>`（多 repo 合併的 log 用 `commit-row:<repo>:<7 字元>`），Shift 點終點，等 `[APP:RANGE: commits=N]`，再點 `btn-copy-commits`。點完等 `[APP:COPY_COMMITS_DONE: commits=N]` 與 `[APP:TOAST: ok=true]`。
+Commit 步驟把第 2–3 步換成：`rail-log`，點起點 `commit-row:<7 字元>`（多 repo 合併的 log 用 `commit-row:<repo>:<7 字元>`），Shift 點終點，等 `[APP:RANGE: commits=N chain=first_parent]`（非 first-parent 鏈退回 `chain=visual`），再點 `btn-copy-commits`。點完等 `[APP:COPY_COMMITS_DONE: commits=N]` 與 `[APP:TOAST: ok=true]`。
 
 | 步驟 | 通過時還要看到 |
 |---|---|
@@ -334,8 +334,8 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T14 | 預覽後 Escape | `[APP:PASTE_CANCELLED]`；HEAD 不變 |
 | T15 | 用 `pbcopy` 放入普通文字 `QA invalid clipboard payload`，再按貼上。不要在這個 App 裡按 Cmd+C | 新的一行 `[APP:PASTE_ERR: paste_err_not_payload]`（`[APP:PASTE_ERR: clipboard]` 只在剪貼簿本身讀不出來時才有，這裡不會有），狀態列顯示「剪貼簿內容不是有效的 snip-sync payload」；之前若有預覽開著，先出現 `[APP:PASTE_PLAN_CLEARED]`；不出現 `btn-apply`（日誌有 `[APP:CTRL_GONE: id=btn-apply]`，或從未有過它的 `CTRL_BOUNDS`）；目的端零寫入 |
 | T16 | 目的地改為 `fixtures/nongit-dst`，保留 repo 前綴 | 目錄裡沒有 `.git`；同時有保留前綴的路徑與去掉前綴的路徑，內容與來源一致 |
-| T17 | 在 `commits-src` 把 `SIDE` 和 main 上不能組成 first-parent 鏈的 commit 一起 Shift 選取，再複製 | `[APP:COPY_COMMITS_ERR: commits are not contiguous:]`；sentinel 不變 |
-| T18 | 選 C1、C2、C3，貼到 `commits-dst-overwrite` 的 `qa-replay` | `PASTE_PREVIEW` 的 `items=8`。兩列 `common.txt` 的 ID 是 C1 `paste-overwrite:0:common.txt`、C2 `paste-overwrite:2:common.txt`。勾兩個覆寫之前摘要覆寫 0/2；C1 標頭是「1 個檔案，0 個不寫入」，C2 標頭是「6 個檔案，3 個不寫入」。各點一次得到 `PASTE_TOGGLED idx=0 state=true`、`idx=2 state=true`，Apply 得到 `PASTE_DONE created=3 … commits=3`，`git rev-list <before>..HEAD` 是 3。身份規則見本節末 |
+| T17 | 在 `commits-src` 把 `SIDE` 和 main 上不能組成 first-parent 鏈的 commit 一起 Shift 選取，再複製 | 出現 `[APP:RANGE: commits=N chain=visual]`；點複製出現 `[APP:COPY_COMMITS_ERR: commits are not contiguous:]`；sentinel 不變 |
+| T18 | Shift 選取 C1 到 C3（出現 `[APP:RANGE: commits=3 chain=first_parent]`，直接沿 first-parent 鏈選取，無需任何變通或篩選），貼到 `commits-dst-overwrite` 的 `qa-replay` | `PASTE_PREVIEW` 的 `items=8`。兩列 `common.txt` 的 ID 是 C1 `paste-overwrite:0:common.txt`、C2 `paste-overwrite:2:common.txt`。勾兩個覆寫之前摘要覆寫 0/2；C1 標頭是「1 個檔案，0 個不寫入」，C2 標頭是「6 個檔案，3 個不寫入」。各點一次得到 `PASTE_TOGGLED idx=0 state=true`、`idx=2 state=true`，Apply 得到 `PASTE_DONE created=3 … commits=3`，`git rev-list <before>..HEAD` 是 3。身份規則見本節末 |
 | T19 | 同一段貼到 `commits-dst-clean` | `PASTE_DONE created=3 … commits=3`；3 個新 commit；C1 的 `common.txt` 在 Git 裡是新增 |
 | T20 | 核對 T19 那 3 個 commit | `git log -1 -z --format=%an%x00%ae%x00%aI%x00%B` 與來源逐欄相等。C1 含多行中文與空行。作者時間是 fixture 寫入的 `+08:00` |
 | T21 | 核對 T19 的 merge 那一筆 | 目的 commit 只有一個 parent；只多出 `side.txt`，內容 `from-side` |

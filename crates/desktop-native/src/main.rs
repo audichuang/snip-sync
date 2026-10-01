@@ -7559,6 +7559,156 @@ mod tests {
 				"nested"
 			);
 		}
+
+		#[gpui::test]
+		fn shift_range_selects_first_parent_chain_excluding_side(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = ws.path().join("repo");
+			fs::create_dir(&r).unwrap();
+			git(&r, &["init", "-q", "-b", "main"]);
+			let head = || -> String {
+				let out = Command::new("git")
+					.current_dir(&r)
+					.args(["rev-parse", "HEAD"])
+					.output()
+					.unwrap();
+				String::from_utf8(out.stdout).unwrap().trim().to_string()
+			};
+
+			fs::write(r.join("base.txt"), "base").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "base"]);
+			let base_sha = head();
+
+			fs::write(r.join("c1.txt"), "c1").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "c1"]);
+			let c1_sha = head();
+
+			fs::write(r.join("c2.txt"), "c2").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "c2"]);
+			let c2_sha = head();
+
+			git(&r, &["checkout", "-q", "-b", "side"]);
+			fs::write(r.join("side.txt"), "side").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "side"]);
+			let side_sha = head();
+
+			git(&r, &["checkout", "-q", "main"]);
+			git(&r, &["merge", "-q", "--no-ff", "-m", "c3", "side"]);
+			let c3_sha = head();
+
+			fs::write(r.join("c4.txt"), "c4").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "c4"]);
+			let c4_sha = head();
+
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+
+			// Verify display rows are in top-down topological order:
+			// C4 (0), C3 (1), SIDE (2), C2 (3), C1 (4), base (5).
+			model.read_with(cx, |m, _| {
+				let shas: Vec<&str> = m
+					.display_commits()
+					.iter()
+					.map(|c| c.sha.as_str())
+					.collect();
+				assert_eq!(
+					shas,
+					[
+						c4_sha.as_str(),
+						c3_sha.as_str(),
+						side_sha.as_str(),
+						c2_sha.as_str(),
+						c1_sha.as_str(),
+						base_sha.as_str()
+					]
+				);
+			});
+
+			// Select C1 (index 4)
+			model.update(cx, |m, cx| m.select_commit(&c1_sha, cx));
+			// Focus log element
+			cx.update(|window, cx| {
+				window.focus(&model.read(cx).log_focus.clone())
+			});
+
+			// Drive Shift+Up 3 times from C1 to C3:
+			// Step 1: to C2 (index 3)
+			cx.simulate_keystrokes("shift-up");
+			cx.run_until_parked();
+			// Step 2: to SIDE (index 2)
+			cx.simulate_keystrokes("shift-up");
+			cx.run_until_parked();
+			// Step 3: to C3 (index 1)
+			cx.simulate_keystrokes("shift-up");
+			cx.run_until_parked();
+
+			// Assert log_selected has [C3, C2, C1] (excluding SIDE!)
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_commit.as_deref(), Some(c1_sha.as_str()));
+				assert_eq!(m.range_head.as_deref(), Some(c3_sha.as_str()));
+				assert_eq!(
+					m.log_selected,
+					[c3_sha.clone(), c2_sha.clone(), c1_sha.clone()]
+				);
+				assert!(!m.log_is_selected(&side_sha));
+				assert!(m.log_is_selected(&c1_sha));
+				assert!(m.log_is_selected(&c2_sha));
+				assert!(m.log_is_selected(&c3_sha));
+			});
+
+			// Assert commit_copy_target returns tip C3 and the 3 SHAs
+			let (_, _, tip, selected) =
+				model.read_with(cx, |m, _| m.commit_copy_target().unwrap());
+			assert_eq!(tip, c3_sha);
+			assert_eq!(
+				selected,
+				[c3_sha.clone(), c2_sha.clone(), c1_sha.clone()]
+			);
+
+			// Assert open_log_menu on C2 (inside selection) preserves the multi-selection:
+			cx.update(|window, app| {
+				model.update(app, |m, cx| {
+					m.open_log_menu(
+						&c2_sha,
+						gpui::Point::default(),
+						window,
+						cx,
+					);
+					assert_eq!(
+						m.selected_commit.as_deref(),
+						Some(c1_sha.as_str())
+					);
+					assert_eq!(
+						m.log_selected,
+						[c3_sha.clone(), c2_sha.clone(), c1_sha.clone()]
+					);
+				});
+			});
+
+			// Assert open_log_menu on SIDE (not in selection) re-selects SIDE alone:
+			cx.update(|window, app| {
+				model.update(app, |m, cx| {
+					m.open_log_menu(
+						&side_sha,
+						gpui::Point::default(),
+						window,
+						cx,
+					);
+					assert_eq!(
+						m.selected_commit.as_deref(),
+						Some(side_sha.as_str())
+					);
+					assert!(m.log_selected.is_empty());
+				});
+			});
+		}
 	}
 
 	mod folder_copy {

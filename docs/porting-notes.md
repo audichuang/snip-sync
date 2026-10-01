@@ -24,6 +24,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 ### 已知且接受的差異
 
+- 桌面 App 在歷史時間軸上以 Shift 選取範圍時，優先沿著 first-parent 鏈選取（略過中間交錯出現的分支 side commit），只有在端點間無法構成 first-parent 鏈時才退回選取中間的所有可見列（visual 範圍），由複製時檢驗拒絕。
 - 原生工作台(`desktop-native`)的檔案模式上限是 10,000 個檔案(`NATIVE_FILE_COUNT_LIMIT`),不是 ClipCode 預設的 30:它沒有設定畫面,
   而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 64 MiB payload 上限約束(超過是明確錯誤)。payload 格式不變。
   碰到上限時狀態列與複製提示明說「已達 N 個檔案上限,其餘檔案未複製」,不會默默少檔。

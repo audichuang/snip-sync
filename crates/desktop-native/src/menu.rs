@@ -611,12 +611,7 @@ impl WorkbenchModel {
 		window: &mut Window,
 		cx: &mut Context<Self>,
 	) {
-		let in_selection = self.selected_commit.as_deref() == Some(sha)
-			|| self.range_rows().is_some_and(|(a, b)| {
-				self.display_commits()
-					.get(a..=b)
-					.is_some_and(|s| s.iter().any(|c| c.sha == sha))
-			});
+		let in_selection = self.log_is_selected(sha);
 		if !in_selection {
 			self.select_commit(sha, cx);
 		}
