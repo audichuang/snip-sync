@@ -5416,6 +5416,17 @@ impl WorkbenchModel {
 		}
 		if let Some(st) = self.paste.toggle_selected(idx) {
 			app_log!("[APP:PASTE_SEL_TOGGLED: idx={} state={}]", idx, st);
+			if let Some(plan) = self.paste.plan() {
+				if plan.whole_commit
+					&& plan.all_selected()
+					&& self.status.key == "commit_subset_rejected"
+				{
+					self.set_status(
+						"status_paste_preview",
+						[plan.items.len().to_string()],
+					);
+				}
+			}
 			cx.notify();
 		}
 	}
@@ -7194,6 +7205,83 @@ mod tests {
 				let img = &m.paste.plan().unwrap().items[0];
 				assert_eq!(img.overwrite_allowed, before);
 			});
+		}
+
+		#[gpui::test]
+		fn space_reinclude_clears_the_commit_subset_banner(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_tmp, root) = canonical_tmp();
+			let dest = repo(&root, "dest", &[]);
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "msg\n".into(),
+						author_name: "ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-09-25T12:34:56+00:00".into(),
+						files: vec![CommitFile {
+							path: "fresh.txt".into(),
+							old_path: None,
+							change: FileChange::Added,
+							content: Some("body\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, &payload);
+			model.update(cx, |m, cx| {
+				m.select_paste_item(0, cx);
+			});
+
+			// Space excludes the row -> plan.error key commit_subset_rejected
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(!plan.items[0].selected);
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("commit_subset_rejected")
+				);
+			});
+
+			// Enter triggers Apply refusal -> sets model.status to commit_subset_rejected
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "commit_subset_rejected");
+				assert!(m.paste.plan().is_some());
+			});
+
+			// Space again re-includes the row -> plan.error is None,
+			// and status key is reset to status_paste_preview.
+			cx.simulate_keystrokes("space");
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan stays open");
+				assert!(plan.items[0].selected);
+				assert!(plan.error.is_none());
+				assert_ne!(m.status.key, "commit_subset_rejected");
+				assert_eq!(m.status.key, "status_paste_preview");
+			});
+
+			// Enter now succeeds
+			cx.simulate_keystrokes("enter");
+			cx.run_until_parked();
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
+			assert_eq!(
+				fs::read_to_string(dest.join("fresh.txt")).unwrap(),
+				"body\n"
+			);
 		}
 
 		#[gpui::test]

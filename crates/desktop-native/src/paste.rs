@@ -558,6 +558,10 @@ impl PasteItem {
 		}
 	}
 
+	pub fn shows_delete_notice(&self) -> bool {
+		matches!(self.action(), RowAction::Delete)
+	}
+
 	fn retained_heap_bytes(&self) -> usize {
 		self.path
 			.capacity()
@@ -1401,12 +1405,24 @@ impl PastePreviewPlan {
 		}
 	}
 
+	pub fn all_selected(&self) -> bool {
+		self.items.iter().all(|i| i.selected)
+	}
+
 	pub fn toggle_selected(&mut self, idx: usize) {
 		if let Some(item) = self.items.get_mut(idx) {
 			item.selected = !item.selected;
 		}
-		if self.whole_commit && self.items.iter().any(|i| !i.selected) {
-			self.error = Some(Msg::new("commit_subset_rejected", []));
+		if self.whole_commit {
+			if !self.all_selected() {
+				self.error = Some(Msg::new("commit_subset_rejected", []));
+			} else if self
+				.error
+				.as_ref()
+				.is_some_and(|e| e.key == "commit_subset_rejected")
+			{
+				self.error = None;
+			}
 		}
 	}
 
@@ -3111,6 +3127,101 @@ pub(crate) mod tests {
 			make_item(true, None, PlannedOp::Overwrite, true, false).action(),
 			RowAction::KeepExisting
 		);
+	}
+
+	#[test]
+	fn test_shows_delete_notice() {
+		// Delete (dest exists, selected) -> true
+		assert!(make_item(true, None, PlannedOp::Delete, true, false)
+			.shows_delete_notice());
+		// DeleteMissing (op Delete, dest absent) -> false
+		assert!(!make_item(true, None, PlannedOp::Delete, false, false)
+			.shows_delete_notice());
+		// excluded delete row -> false
+		assert!(!make_item(false, None, PlannedOp::Delete, true, false)
+			.shows_delete_notice());
+		// a non-delete row -> false
+		assert!(!make_item(true, None, PlannedOp::Create, true, false)
+			.shows_delete_notice());
+	}
+
+	#[test]
+	fn commit_replay_toggle_selected_error_lifecycle() {
+		let (_dir, mut plan) = mixed_plan();
+		assert!(plan.items.len() >= 2);
+		assert!(plan.whole_commit);
+		assert!(plan.error.is_none());
+
+		// Exclude a row -> plan.error key == "commit_subset_rejected"
+		plan.toggle_selected(0);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+
+		// Re-include -> plan.error is None
+		plan.toggle_selected(0);
+		assert!(plan.error.is_none());
+
+		// Seed a DIFFERENT key manually after excluding
+		plan.toggle_selected(0);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+		plan.error = Some(Msg::new("stale_modified", []));
+		// Re-include and assert the different error survives
+		plan.toggle_selected(0);
+		assert_eq!(plan.error.as_ref().map(|e| e.key), Some("stale_modified"));
+
+		// Reset error for partial re-include test
+		plan.error = None;
+		// Two rows excluded
+		plan.toggle_selected(0);
+		plan.toggle_selected(1);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+
+		// Partial re-include: one re-included, one still excluded -> keeps banner
+		plan.toggle_selected(0);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+
+		// Remaining row re-included -> all selected -> banner cleared
+		plan.toggle_selected(1);
+		assert!(plan.error.is_none());
+	}
+
+	#[test]
+	fn commit_replay_reinclude_single_row_clears_banner() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			&commit_payload_modifying_a(),
+			&path,
+			&[],
+			1,
+		)
+		.unwrap();
+		assert!(plan.whole_commit);
+		assert!(plan.error.is_none());
+
+		plan.toggle_selected(0);
+		assert_eq!(
+			plan.error.as_ref().map(|e| e.key),
+			Some("commit_subset_rejected")
+		);
+
+		plan.toggle_selected(0);
+		assert!(plan.error.is_none());
 	}
 
 	#[test]

@@ -790,7 +790,7 @@ impl WorkbenchModel {
 						),
 				)
 			})
-			.when(selected.is_some_and(|i| i.is_delete()), |d| {
+			.when(selected.is_some_and(|i| i.shows_delete_notice()), |d| {
 				d.child(
 					div()
 						.p(px(12.))
