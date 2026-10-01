@@ -6381,6 +6381,51 @@ mod tests {
 			assert_eq!(got, [("common.txt", false), ("emoji.txt", false)]);
 		}
 
+		/// Flat layout (`log_details_by_dir = false`) copies in `commit_files`
+		/// order, not click order: b.txt is clicked before z.txt, but the flat
+		/// screen shows z.txt first. (In-process tests default to the by-dir
+		/// layout, which sorts dirs and names and hides a click-order bug.)
+		#[gpui::test]
+		fn commit_files_copy_flat_layout_screen_order(cx: &mut TestAppContext) {
+			use crate::menu::{MenuAct, MenuEntry};
+			use snip_core::format::ChangeType::Modified;
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let copied = model.update(cx, |m, cx| {
+				m.log_commit_root = Some(root.clone());
+				m.compare = Some(("old".into(), "new".into()));
+				m.log_details_by_dir = false;
+				m.commit_files = [
+					("z.txt", Modified),
+					("a/x.txt", Modified),
+					("b.txt", Modified),
+				]
+				.map(|(p, c)| (p.to_string(), Some(c)))
+				.into();
+				// Click order: b.txt, a/x.txt, z.txt (reverse of flat order).
+				m.selected_commit_file = Some("b.txt".into());
+				m.toggle_commit_file("a/x.txt", cx);
+				m.toggle_commit_file("z.txt", cx);
+				let menu = m.commit_file_menu("z.txt", false);
+				menu.into_iter()
+					.find_map(|e| match e {
+						MenuEntry::Item {
+							act: Some(MenuAct::CopyRevFiles(f)),
+							..
+						} => Some(f),
+						_ => None,
+					})
+					.unwrap()
+			});
+			let got: Vec<_> =
+				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			assert_eq!(
+				got,
+				[("z.txt", false), ("a/x.txt", false), ("b.txt", false)]
+			);
+		}
+
 		/// Folder overlap copy follows screen order and deduplicates
 		/// (Scenario B: dir/keep.txt clicked before dir/, screen order has
 		/// dir/gone.txt before dir/keep.txt, each file copied once).

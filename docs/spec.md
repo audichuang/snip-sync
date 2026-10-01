@@ -72,7 +72,7 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 
 ### 4.1 選擇 commit
 
-- GUI:在**歷史時間軸**(commit graph)上選一段:點起點,Shift + 點終點（在兩端點間沿著 first-parent 鏈選取，自動略過分支上的 side commit；若無法構成 first-parent 鏈則退回可見列選取並在複製時拒絕）。
+- GUI:在**歷史時間軸**(commit graph)上選一段:點起點,Shift + 點終點（在兩端點間沿著 first-parent 鏈選取，自動略過分支上的 side commit；若無法構成 first-parent 鏈則退回可見列選取並在複製時拒絕；沿鏈只走目前顯示的 commit，若搜尋、ref 或路徑篩選隱藏了鏈中間的 commit（例如搜尋 `多行中文|C3 merge` 會隱藏 C2），選取就退回可見列範圍，複製時拒絕；清除篩選，或在隱藏的 commit 顯示時再選取，才能複製整條鏈）。
 - 顯示本機所有分支、遠端追蹤分支、標籤與 HEAD 的拓撲圖;可依 ref 篩選、搜尋 message / SHA,每頁 300 筆並能繼續載入。瀏覽不切換分支、不自動 fetch。
 - 點 commit 顯示它的檔案樹、內容與 diff;包含 root 的選取固定從所選 tip 回溯,也支援尚未合併的其他分支。
 - CLI:`snip copy --commits -n <N>`(從 HEAD 往回 N 個)、`snip copy --commits <a>..<b>`。

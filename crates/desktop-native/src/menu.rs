@@ -1670,6 +1670,19 @@ mod tests {
 			commit_copy_selection(&files, &gitlinks, false, false, &targets),
 			[("z.txt", false), ("a/x.txt", false), ("b.txt", false),]
 		);
+
+		// Flat layout with targets in REVERSE click order still follows
+		// commit_files order (guards a click-order flat branch).
+		assert_eq!(
+			commit_copy_selection(
+				&files,
+				&gitlinks,
+				false,
+				false,
+				&["b.txt", "a/x.txt", "z.txt"]
+			),
+			[("z.txt", false), ("a/x.txt", false), ("b.txt", false),]
+		);
 	}
 
 	#[test]

@@ -1275,8 +1275,12 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 	// A symlink is replaced, not written through: its target is irrelevant.
 	// Keep the path on a non-UTF-8 skip so freshness can see that exact file
 	// without inventing a second planner. An earlier commit of the batch may
-	// have deleted a symlink or non-UTF-8 file here (the layout holds an
-	// override for the path), so only an untouched path is checked on disk.
+	// have deleted a symlink or non-UTF-8 file at this exact path (the layout
+	// holds an override for it), so only an untouched path is checked on disk.
+	// Known limit (issue #76): overrides match the exact path only, so a
+	// deleted symlink ancestor, or a case-only alias on a case-insensitive
+	// filesystem, still reads the real disk and the preview may disagree
+	// with Apply.
 	if !deleted
 		&& !layout.overrides.contains_key(&abs)
 		&& !is_symlink(&abs)
@@ -1340,6 +1344,12 @@ enum Node {
 /// override: a payload creates neither symlinks nor non-UTF-8 files, but an
 /// earlier commit can delete one, and what is left there is then a regular
 /// file or nothing.
+///
+/// An override applies to the exact path only. Known limits (issue #76), where
+/// the preview and dry-run may disagree with Apply: a symlink ancestor deleted
+/// by an earlier commit is still looked through on the real disk, and on a
+/// case-insensitive filesystem a path differing only by case from an earlier
+/// commit's path is a different key.
 #[derive(Debug, Default)]
 struct PlannedLayout {
 	overrides: std::collections::HashMap<PathBuf, Node>,
