@@ -106,6 +106,7 @@ fn file_item(repo: &TestRepo, rel: &str, source: SourceKind) -> ExportItem {
 		relative_path: rel.to_string(),
 		source,
 		change_type: None,
+		gitlink: false,
 	}
 }
 
@@ -468,6 +469,7 @@ fn default_options_match_the_old_export_and_the_legacy_bytes() {
 			relative_path: "src/a.rs".to_string(),
 			source: SourceKind::Commit { rev: sha.clone() },
 			change_type: Some(ChangeType::Modified),
+			gitlink: false,
 		}],
 	);
 	let git = Git::open(repo.path()).unwrap();
@@ -550,6 +552,7 @@ fn deleted_absence_still_invalidates_before_clipboard_handoff() {
 			relative_path: "gone.txt".to_string(),
 			source: SourceKind::Working,
 			change_type: Some(ChangeType::Deleted),
+			gitlink: false,
 		}],
 	);
 	let plan = plan_export_with(
@@ -625,6 +628,7 @@ fn inflight_cancel_during_cat_file_is_not_a_plan() {
 			relative_path: "blob.txt".to_string(),
 			source: SourceKind::Commit { rev: sha },
 			change_type: Some(ChangeType::Modified),
+			gitlink: false,
 		}],
 	);
 	assert_inflight_git_cancel("--batch", selection);

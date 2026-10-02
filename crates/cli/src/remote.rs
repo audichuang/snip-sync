@@ -10,7 +10,7 @@ use clap::Subcommand;
 use snip_remote::proto::EntryKind;
 use snip_remote::{
 	default_config_dir, device_name, pair, Client, Fingerprint, Identity,
-	PairedWorker, RemoteWorkspace, WORKERS_FILE,
+	RemoteWorkspace, WorkerStore,
 };
 
 #[derive(Subcommand)]
@@ -63,44 +63,9 @@ fn identity() -> Result<Arc<Identity>, String> {
 		.map_err(|e| format!("device identity: {e}"))
 }
 
-fn workers_file() -> Result<PathBuf, String> {
-	Ok(config_dir()?.join(WORKERS_FILE))
-}
-
-fn load_workers() -> Result<Vec<PairedWorker>, String> {
-	Ok(snip_remote::load_json(&workers_file()?))
-}
-
-fn save_workers(workers: &[PairedWorker]) -> Outcome {
-	snip_remote::save_json(&workers_file()?, workers)
-		.map_err(|e| format!("cannot save pairings: {e}"))
-}
-
-/// By name, address, or position in `snip remote workers` (1-based).
-fn find_worker(workers: &[PairedWorker], key: &str) -> Result<usize, String> {
-	if let Ok(n) = key.parse::<usize>() {
-		if (1..=workers.len()).contains(&n) {
-			return Ok(n - 1);
-		}
-	}
-	let hits: Vec<usize> = workers
-		.iter()
-		.enumerate()
-		.filter(|(_, w)| w.name == key || w.addr == key)
-		.map(|(i, _)| i)
-		.collect();
-	match hits.as_slice() {
-		[one] => Ok(*one),
-		[] => Err(format!(
-			"no paired worker named {key}; see `snip remote workers`"
-		)),
-		_ => Err(format!("{key} names several workers; use its number")),
-	}
-}
-
 fn client(key: &str) -> Result<Client, String> {
-	let workers = load_workers()?;
-	let worker = workers[find_worker(&workers, key)?].clone();
+	let store = WorkerStore::in_config_dir(&config_dir()?);
+	let worker = store.find(key)?;
 	Client::new(worker, identity()?, device_name()).map_err(|e| e.to_string())
 }
 
@@ -134,10 +99,6 @@ pub fn run(cmd: RemoteCommand) -> Outcome {
 			let id = identity()?;
 			let worker = pair(&addr, &code, &id, &device_name())
 				.map_err(|e| format!("pairing failed: {e}"))?;
-			let mut workers = load_workers()?;
-			workers.retain(|w| {
-				w.fingerprint != worker.fingerprint && w.addr != worker.addr
-			});
 			println!(
 				"paired with {} at {} (fingerprint {}; compare it with the worker's)",
 				worker.name,
@@ -145,11 +106,14 @@ pub fn run(cmd: RemoteCommand) -> Outcome {
 				short(&worker.fingerprint)
 			);
 			println!("this device: {}", id.fingerprint().short());
-			workers.insert(0, worker);
-			save_workers(&workers)
+			let store = WorkerStore::in_config_dir(&config_dir()?);
+			store
+				.add(worker)
+				.map_err(|e| format!("cannot save pairings: {e}"))
 		}
 		RemoteCommand::Workers => {
-			for (i, w) in load_workers()?.iter().enumerate() {
+			let store = WorkerStore::in_config_dir(&config_dir()?);
+			for (i, w) in store.load().iter().enumerate() {
 				println!(
 					"{}\t{}\t{}\t{}",
 					i + 1,
@@ -161,10 +125,12 @@ pub fn run(cmd: RemoteCommand) -> Outcome {
 			Ok(())
 		}
 		RemoteCommand::Forget { worker } => {
-			let mut workers = load_workers()?;
-			let ix = find_worker(&workers, &worker)?;
-			let gone = workers.remove(ix);
-			save_workers(&workers)?;
+			let store = WorkerStore::in_config_dir(&config_dir()?);
+			let found = store.find(&worker)?;
+			let gone = store
+				.forget(&found.fingerprint)
+				.map_err(|e| format!("cannot save pairings: {e}"))?
+				.unwrap_or(found);
 			println!("forgot {} at {}", gone.name, gone.addr);
 			Ok(())
 		}
@@ -231,30 +197,5 @@ pub fn run(cmd: RemoteCommand) -> Outcome {
 				None => Err(format!("{path} is binary or not UTF-8")),
 			}
 		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	fn w(name: &str, addr: &str) -> PairedWorker {
-		PairedWorker {
-			name: name.into(),
-			addr: addr.into(),
-			fingerprint: String::new(),
-		}
-	}
-
-	#[test]
-	fn workers_are_found_by_number_name_or_address() {
-		let ws = [w("ubuntu", "100.1.1.1"), w("win", "100.2.2.2")];
-		assert_eq!(find_worker(&ws, "2"), Ok(1));
-		assert_eq!(find_worker(&ws, "ubuntu"), Ok(0));
-		assert_eq!(find_worker(&ws, "100.2.2.2"), Ok(1));
-		assert!(find_worker(&ws, "3").is_err());
-		assert!(find_worker(&ws, "mac").is_err());
-		let dup = [w("same", "a"), w("same", "b")];
-		assert!(find_worker(&dup, "same").is_err());
 	}
 }

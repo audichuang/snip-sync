@@ -110,6 +110,56 @@ pub fn resolve_delete_target<P: AsRef<Path>>(
 		.resolve_delete_target(clipboard_path)
 }
 
+pub(crate) fn resolve_absolute_import_candidate<P: AsRef<Path>>(
+	dest_roots: &[P],
+	primary_root: Option<&Path>,
+	raw_path: &str,
+) -> Option<(String, String)> {
+	let normalized = normalize_system_path(raw_path);
+	if !is_absolute_path(&normalized) {
+		return None;
+	}
+	let resolver = PathResolver::new(dest_roots, primary_root);
+	if let Some(c) = resolver.absolute_root_candidate(&normalized) {
+		let root_path = resolver.ordered_roots[c.root].path.clone();
+		return Some((root_path, c.root_relative_path));
+	}
+	if let Some(canonicalized) = canonicalize_existing_prefix(&normalized) {
+		if canonicalized != normalized {
+			if let Some(c) = resolver.absolute_root_candidate(&canonicalized) {
+				let root_path = resolver.ordered_roots[c.root].path.clone();
+				return Some((root_path, c.root_relative_path));
+			}
+		}
+	}
+	if let Some(c) = resolver.cross_machine_suffix_candidate(&normalized) {
+		let root_path = resolver.ordered_roots[c.root].path.clone();
+		return Some((root_path, c.root_relative_path));
+	}
+	None
+}
+
+fn canonicalize_existing_prefix(normalized: &str) -> Option<String> {
+	if normalized.split('/').any(|s| s == ".." || s == ".") {
+		return None;
+	}
+	let path = native(normalized);
+	let mut current = path.as_path();
+	let mut trail = Vec::new();
+	while !current.exists() {
+		if let Some(name) = current.file_name() {
+			trail.push(name);
+		}
+		current = current.parent()?;
+	}
+	let canonical_ancestor = dunce::canonicalize(current).ok()?;
+	let mut full = canonical_ancestor;
+	for segment in trail.into_iter().rev() {
+		full.push(segment);
+	}
+	Some(normalize_system_path(&lossy(&full)))
+}
+
 struct RootEntry {
 	/// Slash-normalized.
 	path: String,
@@ -722,7 +772,7 @@ pub(crate) fn sanitize_relative_path(value: &str) -> Option<String> {
 	Some(segments.join("/"))
 }
 
-fn normalize_system_path(value: &str) -> String {
+pub(crate) fn normalize_system_path(value: &str) -> String {
 	let mut s = collapse_slashes(ascii_trim(value));
 	if s != "/" && !is_drive_root(&s) {
 		while s.ends_with('/') {
@@ -747,7 +797,7 @@ fn is_drive_root(s: &str) -> bool {
 	has_drive_slash(s) && s.len() == 3
 }
 
-fn is_absolute_path(s: &str) -> bool {
+pub(crate) fn is_absolute_path(s: &str) -> bool {
 	s.starts_with('/') || has_drive_slash(s)
 }
 

@@ -20,7 +20,7 @@ use crate::proto::{
 	Request, Response, Stat, MAX_DIR_ENTRIES, PROTOCOL_VERSION,
 };
 use crate::tls::{normalize_code, pairing_proof, server_config, Fingerprint};
-use crate::{load_json, save_json, Identity, RemoteError};
+use crate::{Identity, RemoteError};
 
 /// How long a pairing code stays valid.
 pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
@@ -123,7 +123,9 @@ impl Worker {
 		let trusted = opts
 			.trust_file
 			.as_deref()
-			.map(load_json::<Vec<TrustedMaster>>)
+			.map(|f| {
+				crate::store::TrustedMasterStore::new(f.to_path_buf()).load()
+			})
 			.unwrap_or_default();
 		let state = Arc::new(State {
 			name: opts.name,
@@ -473,17 +475,24 @@ impl State {
 				"the pairing code does not match".into(),
 			);
 		}
+		let master = TrustedMaster {
+			name,
+			fingerprint: peer.to_hex(),
+		};
+		if let Some(file) = &self.trust_file {
+			let store = crate::store::TrustedMasterStore::new(file.clone());
+			if let Err(err) = store.add(master.clone()) {
+				return error(
+					ErrorCode::Io,
+					format!("cannot save the trusted master: {err}"),
+				);
+			}
+		}
 		// One code pairs one master.
 		*window = None;
 		drop(window);
 		let mut trusted = lock(&self.trusted);
-		trusted.push(TrustedMaster {
-			name,
-			fingerprint: peer.to_hex(),
-		});
-		if let Some(file) = &self.trust_file {
-			let _ = save_json(file, &*trusted);
-		}
+		trusted.push(master);
 		Response::Paired {
 			name: self.name.clone(),
 		}

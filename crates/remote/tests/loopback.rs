@@ -268,3 +268,55 @@ fn a_connection_over_the_limit_waits_for_a_slot_instead_of_being_reset() {
 		"waited {waited:?}"
 	);
 }
+
+#[test]
+fn unwritable_trust_file_refuses_pairing_and_leaves_code_open() {
+	let tmp = tempfile::tempdir().unwrap();
+	let blocking = tmp.path().join("blocking_file");
+	fs::write(&blocking, "not a directory").unwrap();
+	let trust_file = blocking.join("remote-trusted-masters.json");
+
+	let id = Identity::generate().unwrap();
+	let w = Worker::start(
+		"127.0.0.1:0".parse().unwrap(),
+		&id,
+		WorkerOptions {
+			name: "win-worker".into(),
+			trust_file: Some(trust_file.clone()),
+		},
+	)
+	.unwrap();
+	let code = w.open_pairing();
+	let master = Arc::new(Identity::generate().unwrap());
+
+	// First attempt: trust file cannot be written.
+	let err = pair(&addr(&w), &code, &master, "mac").unwrap_err();
+	match err {
+		RemoteError::Refused {
+			code: ErrorCode::Io,
+			message,
+		} => {
+			assert!(
+				message.contains("cannot save the trusted master"),
+				"unexpected message: {message}"
+			);
+		}
+		other => panic!("expected ErrorCode::Io refusal, got {other:?}"),
+	}
+	assert!(
+		w.pairing_open(),
+		"pairing window must remain open on save failure"
+	);
+	assert!(w.trusted().is_empty());
+
+	// Make the path writable by removing the blocking file and creating a directory.
+	fs::remove_file(&blocking).unwrap();
+	fs::create_dir(&blocking).unwrap();
+
+	// Second attempt with the same pairing code succeeds.
+	let paired = pair(&addr(&w), &code, &master, "mac").unwrap();
+	assert_eq!(paired.name, "win-worker");
+	assert!(!w.pairing_open(), "pairing window consumed after success");
+	assert_eq!(w.trusted().len(), 1);
+	assert!(trust_file.is_file());
+}

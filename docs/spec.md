@@ -50,6 +50,8 @@
 - 非 UTF-8 檔案(含二進位、UTF-16)**跳過**,不進剪貼簿,只計入通知。
 - 讀不到的檔案放 placeholder,不算已複製、不佔檔案數上限。
 - 過濾規則、大小與數量上限:與 IDE 套件相同。
+- 複製上限統一為 32 MiB(core 常數 `transfer::CLIPBOARD_PAYLOAD_MAX`,兩個介面共用,與貼上預覽預算一致;GUI 複製上限已為 32 MiB(階段 2),CLI 於階段 3/4 採用);超過是明確錯誤(CLI exit 1),不截斷。
+- `snip copy <路徑…>` 規則(CLI 於階段 4 採用):相對路徑以 cwd 解析;路徑不存在 exit 1;路徑在 `--repo` 外 exit 1;指向 root 外的 symlink、FIFO/裝置檔與 `.git`/巢狀 repo 略過修剪;結果為空時顯示「No files selected.」exit 1 且不改剪貼簿;`--repo` 含 `..` 時先以 cwd 詞法解析,標籤為 root 相對路徑、`clipcode-root` 為解析後 basename。
 
 複製完成的通知:**與 IDE 套件相同**,顯示檔案數、字元數、行數、字數、token 數,以及跳過了幾個檔案。
 
@@ -62,9 +64,14 @@
 3. 確認後執行。執行前**重新檢查**一次路徑與編碼(預覽期間檔案系統可能已經變了)。
 4. 結果:成功 / 跳過 / 失敗各幾個,失敗的列出原因。
 
-- **一律覆蓋**,不偵測目標是否被改過。
+- 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 與 CLI 於階段 6 皆已採用):
+  (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;偵測目的端是否不分大小寫,不分大小寫則新目標也摺疊大小寫(D10,階段 5b 已實作);以及 symlink 別名、同一路徑出現兩次)就整批拒絕;
+  (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
+  這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
 - 安全規則照 porting-notes 第 3 節:路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、
   placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8。
+- CLI 補充(現行行為/CLI 於階段 6 已切換):絕對路徑在 sanitize 前先解析(root 內部、跨機器後綴 → 相對路徑,同 TS);絕對 [DELETED] 解析不到 root → 拒絕(視為 unsafe/unresolved 跳過,同 TS);寫入對不到 root 的 POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`)→ 去首斜線放主 root 下(同 TS);帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因 `sanitize_relative_path` 的絕對路徑/磁碟機檢查(`is_absolute_path`/`has_drive_slash`)而跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`。CLI 只有單一 root。`paste` 的 `--repo` 必須已存在,否則 exit 1(見 porting-notes「已知且接受的差異」)。
+- 目的端路徑為目錄、FIFO 等非一般檔案時整批以 `SpecialFile` 拒絕(含 `--dry-run`,exit 1),見 porting-notes「已知且接受的差異」。父層片段為一般檔案或目的端為懸空 symlink 時亦以 `TransferError::Io` 整批拒絕(exit 1),同見該條目。
 
 CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --skip-existing]`。
 
@@ -108,7 +115,7 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 3. 疊在**目前分支的 HEAD** 上,不需要與來源有共同的起點,也不檢查是否 fast-forward。
 4. 結果:建立了幾個 commit。
 
-- 涉及的路徑如果本機有尚未 commit 的修改,**直接覆蓋**(符合「蓋上去」的原則)。
+- 此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,**預設不套用**,需明確允許覆寫(GUI:允許覆寫的開關,i18n `commit_overwrite_required`,paste.rs `execute_commit` 先 `preview.revalidate()` 再回此錯誤;CLI 判定與 GUI 相同[已決 D9],以 `FilePlan.existed` 判定,需 `--overwrite`,沒給則 exit 2)。CLI 貼 commit payload 時 `--skip-existing`、`--adjust-paths` 不支援,exit 2。這與 TS/原規格「直接覆蓋」不同,見 porting-notes「已知且接受的差異」。
 - 中途某個 commit 建立失敗:**停下來**,回報已建立的前幾個、失敗的是哪一個與 git 的錯誤訊息。已建立的不回滾。
 - 路徑安全規則與檔案模式相同。
 - 預設值(規格階段未逐題確認,實作時照此,有意見再改):
@@ -146,10 +153,26 @@ snip copy --working | --staged
 snip copy --commit <sha> | --range <a>..<b>
 snip copy --commits -n <N> | --commits <a>..<b>
 snip paste --dry-run
-snip paste --apply [--overwrite | --skip-existing]
+snip paste --apply [--overwrite | --skip-existing] [--adjust-paths]
 ```
 
-CLI 與 App 呼叫同一組核心函式,行為完全相同。
+- 貼上 commit payload 時,`--skip-existing` 與 `--adjust-paths` 不支援,指定時以 exit 2 退出(見 4.3)。
+- 貼上 commit payload 時,若目標檔案已存在需明確指定 `--overwrite`,未指定時以 exit 2 退出(見 4.3)。
+
+CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
+- 複製檔案／資料夾:兩邊都用 `transfer::expand_folder_items` 展開資料夾(過濾 `.git`、巢狀 repo、特殊檔、指出 root 的 symlink),再由 `transfer::plan_export_with` 產出 payload。CLI 另以 `selection_from_paths` 把命令列路徑轉成選取項目,並以 `plan_export_expanding` 分批展開(結果與一次展開相同,只是不必走完整棵樹);GUI 的選取來自檔案樹。
+- 複製 Git 變更:兩邊都以 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` 交給 `plan_export_with`。CLI 以 `transfer::changed_items` 列出變更,GUI 的項目來自 Changes 面板。
+- 複製 commits:兩邊都經 `commits::copy_commits_with`。CLI 以範圍或 `-n` 選取(`transfer::plan_commit_export_with`),GUI 以時間軸選取的精確 chain(`plan_commit_export_exact_with`)。
+- 貼上檔案:兩邊都以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。
+- 貼上 commits:兩邊都經 `transfer::CommitReplayPreview`(`capture` / `revalidate` / `apply`)。
+- 配對清單:兩邊都經 `snip_remote::WorkerStore`;worker 端的受信任 master 清單經 `TrustedMasterStore`。
+- 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
+
+兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是預覽、勾選與時間軸),以及下列例外:
+1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 套用全部檔案(經 `ImportMapping::from_restore_base`);GUI 維持逐 prefix 選擇(D4)。兩者最後都是同一個 `ImportMapping`。
+2. 沒有選到任何檔案:CLI 顯示 `No files selected.` 並以 exit 1 結束、不碰剪貼簿;GUI 顯示提示、同樣不寫剪貼簿。
+
+舊的整體引擎 `copy::collect_copy_files` 與 `gitsrc::collect_payload` 已降級為測試 oracle,產品程式碼不再呼叫。`restore::plan_restore` 仍是 `plan_import_with` 內部每筆 entry 的規劃器(contract fixture 測的就是它),`restore::execute_restore_plan` 仍是檔案貼上的執行器。
 
 ## 6. 技術決策(摘要)
 

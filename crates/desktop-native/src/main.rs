@@ -36,7 +36,7 @@ pub(crate) fn arm_cancel(slot: &mut Option<CancelToken>) -> CancelToken {
 
 /// The native file-mode file cap. ClipCode's 30 suits a handful of picked
 /// files; a Project folder brings every file under it, so the native app
-/// (which has no settings UI) caps at this and lets the 64 MiB payload cap
+/// (which has no settings UI) caps at this and lets the 32 MiB payload cap
 /// bound the bytes. Hitting either is reported, never silent.
 const NATIVE_FILE_COUNT_LIMIT: usize = 10_000;
 
@@ -45,137 +45,6 @@ fn native_export_settings() -> Settings {
 		file_count_limit: NATIVE_FILE_COUNT_LIMIT as f64,
 		..Settings::default()
 	}
-}
-
-struct FolderExpansion {
-	sel: ExportSelection,
-	/// Walked files the payload cannot carry (see `folder_file_rel`).
-	skipped: usize,
-	/// The walk stopped at the file limit with files left.
-	truncated: bool,
-}
-
-/// The payload path of a walked file, or None when the export would refuse
-/// it: a name a header cannot carry (`< > : " | ? *`, control characters,
-/// a trailing space, `\` on Unix), non-UTF-8, a dangling or out-of-root
-/// symlink, a FIFO/socket/device, or a file this user cannot open.
-fn folder_file_rel(
-	root: &std::path::Path,
-	path: &std::path::Path,
-) -> Option<String> {
-	let rel = path
-		.strip_prefix(root)
-		.ok()?
-		.components()
-		.map(|c| c.as_os_str().to_str())
-		.collect::<Option<Vec<_>>>()?
-		.join("/");
-	if !snip_core::paths::is_exportable_relative_path(&rel)
-		|| !std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
-		|| snip_core::paths::escapes_all_roots(&[root], path)
-		|| std::fs::File::open(path).is_err()
-	{
-		return None;
-	}
-	Some(rel)
-}
-
-/// A selected folder copies its files, walked in the copy job: a folder
-/// item itself cannot export. A repo's files (and `.git`) never come
-/// along, not even when the selected folder is one; a path already
-/// selected is not added twice. A file the export would refuse is skipped
-/// and counted, never failing the whole copy.
-///
-/// Picked files (and Changes/Log items) are never starved: the folders
-/// share the `limit` left after them in basket order (root path, then the
-/// folder's relative path, as the Project selection is sorted), and the
-/// walk stops one file past it so a huge folder is never held in full.
-fn expand_folder_items(
-	sel: ExportSelection,
-	limit: usize,
-	cancel: &CancelToken,
-) -> Result<FolderExpansion, snip_core::transfer::TransferError> {
-	let is_folder = |item: &ExportItem| {
-		item.source == SourceKind::File
-			&& std::fs::symlink_metadata(
-				item.root.path().join(&item.relative_path),
-			)
-			.is_ok_and(|meta| meta.is_dir())
-	};
-	if !sel.items.iter().any(is_folder) {
-		return Ok(FolderExpansion {
-			sel,
-			skipped: 0,
-			truncated: false,
-		});
-	}
-	let picked = sel.items.iter().filter(|item| !is_folder(item)).count();
-	let mut budget = limit.saturating_sub(picked);
-	let mut skipped = 0usize;
-	let mut truncated = false;
-	let mut seen: HashSet<(PathBuf, String)> = sel
-		.items
-		.iter()
-		.map(|item| {
-			(item.root.path().to_path_buf(), item.relative_path.clone())
-		})
-		.collect();
-	let mut items = Vec::with_capacity(sel.items.len());
-	for item in sel.items {
-		if !is_folder(&item) {
-			items.push(item);
-			continue;
-		}
-		let root = item.root.path();
-		let dir = root.join(&item.relative_path);
-		let walk = snip_core::fsutil::list_files_recursive(&dir, |d| {
-			!(d.file_name() == Some(".git".as_ref()) || d.join(".git").exists())
-		});
-		for walked in walk {
-			if cancel.is_cancelled() || truncated {
-				break;
-			}
-			let path = match walked {
-				snip_core::fsutil::WalkItem::File(path) => path,
-				snip_core::fsutil::WalkItem::UnreadableDir(_) => {
-					skipped += 1;
-					continue;
-				}
-			};
-			if path.file_name() == Some(".git".as_ref()) {
-				continue;
-			}
-			let Some(rel) = folder_file_rel(root, &path) else {
-				skipped += 1;
-				continue;
-			};
-			if seen.contains(&(root.to_path_buf(), rel.clone())) {
-				continue;
-			}
-			if budget == 0 {
-				truncated = true;
-				break;
-			}
-			budget -= 1;
-			seen.insert((root.to_path_buf(), rel.clone()));
-			items.push(ExportItem {
-				root: item.root.clone(),
-				relative_path: rel,
-				source: SourceKind::File,
-				change_type: None,
-			});
-		}
-	}
-	let sel = ExportSelection::new(
-		sel.roots.iter().map(|r| r.path().to_path_buf()).collect(),
-		sel.primary_root.map(|r| r.path().to_path_buf()),
-		items,
-	)?;
-	Ok(FolderExpansion {
-		sel,
-		skipped,
-		truncated,
-	})
 }
 
 /// Interactive read options that carry `cancel` into `Git::open_with`.
@@ -331,8 +200,8 @@ use snip_core::gitsrc::{Git, GitSource};
 use snip_core::graph::GraphLayout;
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	plan_commit_export_exact_with, plan_export_with, CanonicalRootId,
-	ExportItem, ExportSelection, SourceKind,
+	expand_folder_items, plan_commit_export_exact_with, plan_export_with,
+	CanonicalRootId, ExportItem, ExportSelection, FolderExpansion, SourceKind,
 };
 use snip_core::workspace::{
 	declared_submodules, status_details, summarize, summarize_with_details,
@@ -937,7 +806,7 @@ impl PreparedSelection {
 			SourceKind::Working | SourceKind::Unstaged | SourceKind::Staged => {
 				!replace_git_group
 			}
-			SourceKind::Commit { .. } => true,
+			SourceKind::Commit { .. } | SourceKind::Range { .. } => true,
 		});
 		let other = self
 			.retained_bytes()
@@ -985,6 +854,7 @@ impl PreparedSelection {
 				relative_path: path.clone(),
 				source: SourceKind::File,
 				change_type: None,
+				gitlink: false,
 			})
 			.chain(
 				self.files
@@ -997,6 +867,7 @@ impl PreparedSelection {
 						relative_path: file.path.clone(),
 						source: file.source.clone(),
 						change_type: file.change_type,
+						gitlink: false,
 					}),
 			);
 		for item in added {
@@ -1054,6 +925,7 @@ impl PreparedSelection {
 					rev: sha.to_owned(),
 				},
 				change_type: None,
+				gitlink: false,
 			});
 			true
 		}
@@ -4318,6 +4190,11 @@ impl WorkbenchModel {
 				let short = &rev[..7.min(rev.len())];
 				format!("commit@{short}")
 			}
+			SourceKind::Range { base, tip } => {
+				let b = &base[..7.min(base.len())];
+				let t = &tip[..7.min(tip.len())];
+				format!("range@{b}..{t}")
+			}
 		}
 	}
 
@@ -4749,6 +4626,11 @@ impl WorkbenchModel {
 					format!("commit@{short}")
 				}
 			}
+			SourceKind::Range { base, tip } => {
+				let b = &base[..7.min(base.len())];
+				let t = &tip[..7.min(tip.len())];
+				format!("range@{b}..{t}")
+			}
 		})
 	}
 
@@ -5010,7 +4892,7 @@ impl WorkbenchModel {
 						let plan = plan_export_with(
 							export_sel,
 							&settings,
-							Some(RunOptions::INTERACTIVE_MAX_STDOUT),
+							Some(snip_core::transfer::CLIPBOARD_PAYLOAD_MAX),
 							&opts,
 						)
 						.map_err(|e| {
@@ -5150,7 +5032,7 @@ impl WorkbenchModel {
 							&tip_sha,
 							&selected,
 							&opts,
-							RunOptions::INTERACTIVE_MAX_STDOUT,
+							snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 						)
 						.map_err(|e| e.to_string())?;
 						let n_commits = exported.payload.commits.len();
@@ -5799,6 +5681,9 @@ fn source_order(source: &SourceKind) -> (&'static str, &str) {
 		SourceKind::Commit { rev } => {
 			("commit@", rev.get(..7).unwrap_or(rev.as_str()))
 		}
+		SourceKind::Range { tip, .. } => {
+			("range@", tip.get(..7).unwrap_or(tip.as_str()))
+		}
 	}
 }
 
@@ -5994,6 +5879,10 @@ fn read_preview(
 		SourceKind::Commit { rev } => (
 			GitSource::Commit(rev.clone()),
 			PreviewSource::CommitFile { sha: rev.clone() },
+		),
+		SourceKind::Range { base, tip } => (
+			GitSource::Range(base.clone(), tip.clone()),
+			PreviewSource::CommitFile { sha: tip.clone() },
 		),
 		SourceKind::File => (GitSource::Working, PreviewSource::WorkingFile),
 	};
@@ -8282,6 +8171,7 @@ mod tests {
 					relative_path: rel.to_string(),
 					source: SourceKind::File,
 					change_type: None,
+					gitlink: false,
 				})
 				.collect();
 			ExportSelection::new(
@@ -8468,6 +8358,7 @@ mod tests {
 				relative_path: path.into(),
 				source,
 				change_type: None,
+				gitlink: false,
 			};
 			let items = [
 				item("a.txt", SourceKind::File),
@@ -8720,6 +8611,7 @@ mod tests {
 			relative_path: "same.txt".into(),
 			source: SourceKind::Staged,
 			change_type: None,
+			gitlink: false,
 		};
 		let historical = ExportItem {
 			root: root.clone(),
@@ -8728,6 +8620,7 @@ mod tests {
 				rev: "a".repeat(40),
 			},
 			change_type: None,
+			gitlink: false,
 		};
 		let mut candidate = PreparedSelection::new(
 			&[],
@@ -9042,6 +8935,7 @@ mod tests {
 			relative_path: staged_items[0].0.clone(),
 			source: super::SourceKind::Staged,
 			change_type: staged_items[0].1,
+			gitlink: false,
 		};
 		let sel = super::ExportSelection::new(
 			vec![dir.path().to_path_buf()],

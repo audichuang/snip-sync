@@ -24,15 +24,16 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 ### 已知且接受的差異
 
+- CLI `copy --working/--staged/--commit/--range` 改走 transfer 引擎 (階段 5); 讀取量受 32 MiB 上限與 read_cap 限制 (F12; 超限 exit 1 不截斷); `--repo` 為 git toplevel 的子目錄時: 範圍外的變更不再以絕對路徑 label 複製(舊引擎行為),改為略過並在 stderr 提示筆數; commit/range 維持使用 repo 相對路徑標籤與 toplevel 的 `clipcode-root` (過濾條件比對採用 `--repo` 相對拼寫,與 TS 一致)。差異清單如下: (1) working/staged: 指向儲存庫外部的 symlink、以及斷掉的 symlink / 在 git status 與讀取之間消失的檔案,現在改為逐檔略過並計入 unreadable(舊引擎對指向外部的 symlink 會複製外部目標內容造成 F3 外洩,斷掉的 symlink 則略過);GUI 的 Changes 檢視亦享有一致的核心行為; (2) working/staged 的複製通知改為也計入被略過的二進位/非 UTF-8 檔(舊引擎與 TS 的 SCM 路徑不計,只有 commit/range 計); payload 位元組不變; (3) 超過 maxFileSizeKB 或超過剩餘 payload 預算的二進位/非 UTF-8 檔一律捨棄,此規則僅適用於 working/staged/commit/range 等 Git 來源(與舊引擎、TS 一致),只有文字檔才會出現大小略過標記或觸發 PayloadLimitExceeded,檔案模式(`copy <paths>`、GUI 檔案複製)維持既有行為:超限檔案不讀取即保留大小標記,超出預算則報 PayloadLimitExceeded; (4) working/staged 變更項目若目標非一般檔案(如指向目錄的 symlink)或無法開啟/讀取(權限不足等),改為逐檔略過並計入 unreadable(與舊引擎、TS 一致),不作為致命錯誤;檔案模式仍維持 SpecialFile 等錯誤。payload 位元組在上述差異之外與舊引擎一致(經由 symlink 拼寫的儲存庫路徑亦同)。狀態:現況(CLI 於階段 5 已切換)。
 - 原生工作台(`desktop-native`)的檔案模式上限是 10,000 個檔案(`NATIVE_FILE_COUNT_LIMIT`),不是 ClipCode 預設的 30:它沒有設定畫面,
-  而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 64 MiB payload 上限約束(超過是明確錯誤)。payload 格式不變。
+  而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 payload 上限約束(GUI 複製上限現為 32 MiB(`CLIPBOARD_PAYLOAD_MAX`,階段 2 起),CLI 於階段 3/4 採用,超過是明確錯誤)。payload 格式不變。
   碰到上限時狀態列與複製提示明說「已達 N 個檔案上限,其餘檔案未複製」,不會默默少檔。
   截斷順序:單獨選的檔案與 Changes / Log 項目先保留名額;資料夾依選取籃順序(root 依路徑排序,
   root 內的專案選取依相對路徑排序)分用剩下的名額,先到先用,走訪到上限多一個檔案就停,不把大資料夾整個列出。
   資料夾內 payload 無法攜帶的檔案(名稱含 `< > : " | ? *`、控制字元、結尾空白、Unix 上的 `\`、非 UTF-8,
   斷掉或指出 root 的 symlink、FIFO/socket、讀不到的檔案)逐檔略過並計入「略過」,不讓整次複製失敗;
   含 `.git` 的目錄(包括選到的資料夾本身)一律不走訪。
-- 桌面 App 在 monorepo 子資料夾選 Git 來源時,變更清單與複製範圍限制在該資料夾,並可逐檔勾選;CLI 與原本的 `collect_payload` 仍複製整個 Git 來源。這是桌面選取範圍的行為,不改剪貼簿格式。commit / 區間的 payload 路徑仍依 TS graphCopy 使用 repo 相對路徑。
+- 桌面 App 在 monorepo 子資料夾選 Git 來源時,變更清單與複製範圍限制在該資料夾,並可逐檔勾選;CLI 與原本的 `collect_payload` 仍複製整個 Git 來源(對 CLI 而言,這適用於 commit/range,以及 `--repo` 位於 toplevel 時的 working/staged;working/staged 若 `--repo` 為子目錄則僅複製該子樹,見第一項差異)。這是桌面選取範圍的行為,不改剪貼簿格式。commit / 區間的 payload 路徑仍依 TS graphCopy 使用 repo 相對路徑。
 - Git 圖(`graph::compute_graph_layout`)預設照 SourceGit / TS 壓縮車道。`GraphConfig::hold_root_lanes` 是 Rust 才有的選項,只有原生工作台的多儲存庫合併 log(列 id 帶 `@<feed>`)會開:
   一條 rail 停在 root commit 後,它的車道空一列才讓右邊的 rail 往左移(保留的車道不會被相鄰的保留解除帶著左移),沒有入線的新節點也放在上一列所有車道的右邊。
   否則另一個儲存庫的 rail 會在下一列彎進該車道、commit 正好落在別人的 root 正下方,看起來像接在一起。單一儲存庫與 checkpoint 的幾何不變(保留的車道不寫進 checkpoint)。
@@ -97,6 +98,25 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   - 有界輸出捕捉與大小限制:目錄列表(`ls-tree`)stdout 上限 8 MiB、項目數上限 2,000;歷史紀錄(`log`)stdout 上限 16 MiB、筆數上限 10,000;blob 預覽上限 1 MiB。
   - 誠實截斷與防範假成功:嚴格 blob 與歷史查詢在輸出遭截斷時回傳 `GitError::OutputLimit`，絕不截斷後回傳殘缺成功(`Text`)或假完結(`has_more: false`)。`resolve_commit_with` 嚴格要求完整 OID (40/64 hex)，截斷時拒絕輸出。
   - 二進位判斷與複製共用 `blob::classify`，內容任何位置有 NUL 即為二進位（不再只看前 8000 bytes）。
+- 目的端衝突防護(`TransferError::TargetCollision`):還原計畫中若有兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;在不分大小寫的檔案系統上即使皆為新增亦會摺疊大小寫阻擋(D10 於階段 5b 已實作);symlink 別名、或是同一路徑出現兩次亦同),整批拒絕執行。TS 與原 spec §3.2 原本是逐筆照寫,在特定情境下會導致資料遺失(例如 F1 情境:在不區分大小寫的檔案系統上且檔案已存在時,`[NEW] A.txt` 與 `[DELETED] a.txt` 會先寫後刪,導致檔案消失且 exit 0)。狀態:現況/已實作(GUI 與 core 已生效,CLI 於階段 6 已切換對齊,遭遇 TargetCollision 時 exit 1)。
+  - 大小寫別名處理(D10):兩筆皆為新增且差異片段皆不存在的大小寫別名(例如 `[NEW] B.txt` 與 `[NEW] b.txt`,或目錄尚不存在時的 `D/x.txt` 與 `d/x.txt`),在 core 執行時期探測目的端(root)檔案系統是否不分大小寫;若是,`TargetCollision` 的身分檢查(`canonical_target_identity`)對目標路徑整條身分字串進行大小寫摺疊(lowercase),觸發 `TargetCollision` 阻擋,消除 macOS 等平台上的 gap(區分大小寫之檔案系統如 Linux 則維持原樣不摺疊並正常規劃建立)。探測機制優先讀取 root 目錄下現有含 ASCII 字母的項目以大小寫交換後檢查是否為同檔,若 root 無合適項目則在 root 建立暫態探測檔 `.snip-case-probe-<pid>-<nanos>` 檢查大小寫交換名稱後立即刪除;探測過程若遭遇錯誤則回退至平台預設值(`cfg!(any(windows, target_os = "macos"))`)。已記錄之限制:僅探測 root 本身,目錄層級個別大小寫敏感設定(如 macOS 在 root 內掛載區分大小寫之 volume 或 Windows per-directory flag)不在探測範圍內。狀態:現況/已實作(已於階段 5b 落地)。
+- 目標端新鮮度檢查(`TransferError::StaleDestination`):還原套用時若發現目標檔案內容或儲存庫 HEAD/index 在預覽產生後已變動,套用時拒絕並要求重新預覽,避免覆寫預覽期間外部發生的修改。TS 無此檢查。狀態:現況/已實作(GUI 與 CLI 於階段 6 皆已採用,遭遇 StaleDestination 時 exit 1 並提示重新執行)。
+- commit 模式貼上覆寫防護:此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,預設不套用,需明確允許覆寫。GUI 提供允許覆寫的開關(錯誤代碼 `commit_overwrite_required`,paste.rs `execute_commit` 先以 `preview.revalidate()` 檢查,未允許覆寫則阻擋);CLI 判定與 GUI 相同(已決 D9),以 `FilePlan.existed` 判定,需明確傳遞 `--overwrite`,缺少時 exit 2 退出。此外,CLI 貼上 commit payload 時不支援 `--skip-existing` 與 `--adjust-paths`,指定時 exit 2。這與 TS 與原 spec §4.3「直接覆蓋」不同。狀態:現況/已實作(GUI 已實作,CLI 於階段 6 已切換對齊;遭遇未授權覆寫或使用 --skip-existing / --adjust-paths 時 exit 2)。
+- contract fixture 三個 TS 行為的 CLI 已接受差異:共用 contract fixture(`fixtures/clipboard-contract.json`)與 `contract.rs::restore_cases` 保持不變且持續全綠(因其直接測試底層 `restore::plan_restore`);但 CLI 於統一引擎遷移(階段 6)改走 `plan_import_with` 後,實際命令列行為在以下三種情況與 TS 不同:
+  (1)「the same path twice is planned twice, in order」:TS 照順序規劃兩次;CLI 改走 `plan_import_with` 後因偵測到重複目標路徑,觸發 `TargetCollision` 整批拒絕(exit 1)。
+  (2)「a sibling root label targets that root」:TS 支援多 root 對應;CLI 目前僅支援單一儲存庫/工作區 root(`ImportMapping::with_primary`),不需多 root 標籤對應。
+  (3)「an absolute path matching no root is kept literally under the primary root」:與 TS 不同的只有帶磁碟機代號的路徑(寫入保持 `UNRESOLVED_PATH` 跳過,TS 寫為 `D/work/lib/b.ts`),原因是 `sanitize_relative_path` 內的 `is_absolute_path`/`has_drive_slash` 檢查(`D:\` 或 `D:/` 開頭視為絕對路徑故回傳 None),而不是冒號規則;此項為已知且接受的差異。POSIX 絕對路徑在所有 root 外部且無後綴符合時,去首斜線寫在主 root 下,同 TS;root 內部絕對路徑與跨機器後綴符合經 D8 在 core 修好後亦解析為相對路徑,與 TS 一致,故不是差異。且**絕對路徑的 [DELETED] 若解析不到任何 root → 拒絕(視為 unsafe/unresolved 跳過),與 TS 一致;先前 GUI 巢狀刪除 bug 已於階段 5b 修復**。狀態:現況/已實作(core 與 GUI 已於階段 5b 修復生效,帶磁碟機代號寫入保持 UNRESOLVED_PATH 為現況差異,CLI 於階段 6 已切換對齊)。
+- `snip paste` 的 `--repo` 必須已存在(含 `--dry-run`),不存在時 exit 1 並指出該路徑;舊引擎會在 `--apply` 時以 `create_dir_all` 建立整個目錄。狀態:現況/已實作。
+- 剪貼簿 payload 上限統一(`transfer::CLIPBOARD_PAYLOAD_MAX` = 32 MiB):核心定義單一常數,CLI 與 GUI 複製流程共用,與貼上預覽預算(32 MiB)一致,避免「GUI 複製成功但另一端貼上超限」。超過上限時為明確錯誤(CLI exit 1),不進行默默截斷。TS 原生無此統一常數約束(GUI 複製(`plan_export_with` 與 `plan_commit_export_exact_with`)於階段 2 起使用 32 MiB(原為 64 MiB)、CLI 無上限)。狀態: core 常數、GUI 與 CLI 複製(階段 3/4/5)已生效。
+- commit 區間複製與路徑重新定位機制:
+  (1) `--range a..b`:核心 `transfer` 已新增 `SourceKind::Range { base, tip }` 來源型別(刪除檔案讀取 `base:<path>`),供 CLI 與 GUI 共用(階段 2),CLI 於階段 5 已切換採用。
+  (2) 路徑重新定位:核心已新增 `ImportMapping::from_restore_base(&RestoreBaseSuggestion, primary)`(階段 2),供 CLI `--adjust-paths` 轉換為統一的 `ImportMapping`(CLI 於階段 6 切換採用),GUI 則維持現有逐 prefix 選擇的介面不變。
+  狀態:現況/已實作(core 已於階段 2 提供 `SourceKind::Range` 與 `ImportMapping::from_restore_base`,CLI 於階段 5 已切換採用 `--range`、階段 6 已切換採用路徑重新定位)。
+- CLI 路徑複製解析規則(`snip copy <paths>`):相對路徑以 shell 目前工作目錄(cwd)解析;指定路徑不存在時 exit 1;指定路徑超出 `--repo` 邊界時 exit 1(舊引擎原先會賦予絕對路徑 label,transfer 無法表達此種跨 root 邊界 entry,故嚴格阻擋);指向 root 外部的 symlink、FIFO/socket/裝置檔案與 `.git`/巢狀 repo 一律略過修剪不納入 payload(避免掛起或外洩);若解析結果為空,顯示「No files selected.」以 exit 1 退出且不修改剪貼簿內容(符合決策 T-11);套用 32 MiB payload 複製上限(`CLIPBOARD_PAYLOAD_MAX`),超限 exit 1 絕不截斷。狀態:現況(CLI 於階段 4 已切換至統一 transfer 引擎)。
+- CLI `--repo` 含 `..` 的路徑(相對或絕對)先以 cwd 詞法解析,標籤為 root 相對路徑、`clipcode-root` 為解析後的 basename;舊引擎(與 TS 收到未解析 root 時)以未解析的 root 做 strip,產出絕對路徑標籤與 `clipcode-root: ..`。此為 D7「相對路徑以 cwd 解析」的延伸。狀態:現況。
+- 目錄 symlink 的真實目標（canonical target）若為 `.git` 目錄或位於其內部，snip 在 GUI 與 CLI（`expand_folder_items` 與 `selection_from_paths`）皆一律拒絕跟進並視為略過（F5 意圖，避免外洩儲存庫內部資料或因特殊檔案失敗）；TS 版則會跟隨目錄 symlink 進入 `.git`。
+- 貼上目的端路徑若為目錄、FIFO 等非一般檔案,`plan_import_with` 於 freshness 快照階段(`DestinationFreshnessSnapshot::capture_with`)以 `TransferError::SpecialFile` 整批拒絕(含 `--dry-run`),CLI exit 1;舊引擎/TS 逐筆規劃為 overwrite(目錄於套用時逐筆失敗/略過,FIFO 於套用時掛起)。例:payload 含 `// file: build` 而目的端已有 `build/` 目錄。目的端路徑的父層片段是一般檔案(Unix ENOTDIR,例:`// file: a.txt/b.txt` 而目的端 `a.txt` 為檔案)、或目的端是指向不存在目標的 symlink 時,`DestinationFreshnessSnapshot::capture_with` 以 `TransferError::Io` 整批拒絕(含 `--dry-run`,exit 1,訊息不含路徑);舊引擎/TS 逐筆規劃,套用時該筆失敗或經 symlink 寫入,其餘照寫。Windows 上 ENOTDIR 情境回報為 NotFound 視為不存在,不受影響。GUI 共用 core,行為相同。狀態:現況/已實作(GUI 自 transfer 起、CLI 於階段 6)。
+
 
 
 ## 2. 線上格式的不變量(摘要)
@@ -116,10 +136,14 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 ## 3. 還原的安全規則(摘要)
 
+- 貼上流程(CLI 與 GUI)一律經由 `plan_import_with` 執行,在單項條目規則之外額外加入整批防護(見「已知且接受的差異」):
+  - 目標衝突防護(`TargetCollision`):兩筆 entry 指向同一個實體檔案(包含大小寫別名與 symlink 別名)時整批拒絕執行。
+  - 目的端新鮮度檢查(`StaleDestination`):套用前重新驗證目的端,若目標檔案內容或儲存庫 HEAD/index 在預覽產生後已變動,套用時拒絕並要求重新預覽。
+  - 特殊檔案防護(`SpecialFile`):目的端路徑若為目錄、FIFO 等非一般檔案,整批拒絕執行。
 - **路徑片段含控制字元(0x00–0x1F)或 `<>:"|?*` 時拒絕**,所有平台一致。
   U+0085 / U+2028 / U+2029 在 Windows 合法,允許。
 - 對不到任何 root 的絕對路徑:**寫入**時照原樣放在主 root 底下(拿掉磁碟機冒號、保留每一層目錄),
-  **刪除**時一律拒絕。絕不依路徑尾端去猜測目標。
+  **刪除**時一律拒絕。絕不依路徑尾端去猜測目標。(core 依 D8 在 sanitize 前先解析絕對路徑:root 內部與跨機器後綴符合解析為相對路徑,對不到 root 的絕對路徑 [DELETED] 拒絕跳過不刪任何檔,皆與 TS 一致;先前的 GUI 巢狀刪除已於階段 5b 修復;只有帶磁碟機代號的路徑因 `sanitize_relative_path` 的絕對路徑/磁碟機檢查跳過 `UNRESOLVED_PATH`,為已接受差異,見「已知且接受的差異」)。
 - containment 以**真實解析**(realpath)判斷:解析路徑或其最深的已存在祖先目錄。
   祖先的往上走不設上限,只限制 symlink 的跳轉次數。
 - placeholder(`// File skipped: …` / `// Unable to read file content` / `// Error reading file content`)
@@ -130,6 +154,12 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 ## 4. 複製的規則(摘要)
 
+- 檔案模式複製規則由 CLI 與 GUI 共用(`expand_folder_items` / `plan_export_expanding`):
+  - `.git` 與巢狀儲存庫一律修剪排除,不走訪也不納入複製。
+  - 指向 root 外部的 symlink 與斷掉的 symlink 逐檔略過。
+  - FIFO、socket 與裝置等非一般檔案逐檔略過。
+  - 統一受 32 MiB payload 複製上限(`CLIPBOARD_PAYLOAD_MAX`)限制,超出時明確報錯絕不默默截斷。
+  - 若選取或走訪結果為空,顯示「No files selected.」以 exit 1 退出且不修改剪貼簿內容。
 - 非 UTF-8 檔案**不複製**(嚴格解碼,失敗就跳過並計入通知),UTF-16 含 BOM 也一樣。
 - 嚴格 UTF-8 解碼**保留**開頭的 BOM。
 - merge commit 的檔案集是**與每一個 parent 的 diff 的聯集**(依路徑去重)。
@@ -137,7 +167,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   `// This file has been deleted in this change`。刪除前的版本若是二進位或非 UTF-8，不論大小都視為沒有可用內容，繼續找下一個 parent（找不到才輸出刪除標記）；只有超過上限的文字才依上限處理。
 - **git 來源**讀不到的檔案放 placeholder(`// Unable to read file content`)進 payload,但**不算已複製**,也**不佔檔案數上限**。
   **磁碟來源**(檔案模式)讀不到或非 UTF-8 的檔案不放 placeholder,只計數;超過大小上限的放 skipped marker。
-- 目錄 symlink 只在它本身就是被選取的輸入時才跟進,遞迴過程中不跟進(避免 pnpm / Bazel 的交叉連結爆量)。
+- 目錄 symlink 只在它本身就是被選取的輸入時才跟進,遞迴過程中不跟進(避免 pnpm / Bazel 的交叉連結爆量);被選取的 root 內目錄 symlink 一律展開為資料夾(CLI 與 GUI 共用 `expand_folder_items`;GUI 原本會以 `SpecialFile` 讓整批複製失敗;目標指向 `.git` 或位於其內部者則拒絕,見「已知且接受的差異」),其餘與 TS 一致。
 
 ## 5. Git plumbing 對照
 

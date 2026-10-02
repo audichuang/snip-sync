@@ -16,7 +16,7 @@ use std::time::Instant;
 use snip_core::browser::SourcePreview;
 use snip_remote::{
 	Client, Identity, PairedWorker, RemoteError, RemoteWorkspace, Worker,
-	WorkerOptions, TRUSTED_FILE, WORKERS_FILE,
+	WorkerOptions, WorkerStore, TRUSTED_FILE, WORKERS_FILE,
 };
 
 use gpui::Context;
@@ -66,6 +66,10 @@ fn config_dir() -> Option<PathBuf> {
 
 fn config_file(name: &str) -> Option<PathBuf> {
 	config_dir().map(|dir| dir.join(name))
+}
+
+fn worker_store() -> Option<WorkerStore> {
+	config_file(WORKERS_FILE).map(WorkerStore::new)
 }
 
 // ───────────────────────── worker ─────────────────────────
@@ -209,15 +213,7 @@ pub fn run_headless(cli: &WorkerCli) -> ! {
 // ───────────────────────── master ─────────────────────────
 
 pub fn load_workers() -> Vec<PairedWorker> {
-	config_file(WORKERS_FILE)
-		.map(|f| snip_remote::load_json(&f))
-		.unwrap_or_default()
-}
-
-pub fn save_workers(workers: &[PairedWorker]) {
-	if let Some(f) = config_file(WORKERS_FILE) {
-		let _ = snip_remote::save_json(&f, workers);
-	}
+	worker_store().map(|s| s.load()).unwrap_or_default()
 }
 
 /// The remote workspace open in place of a local one.
@@ -324,6 +320,34 @@ pub fn describe(err: RemoteError) -> String {
 	}
 }
 
+fn apply_pairing(
+	store: Option<&WorkerStore>,
+	workers: &mut Vec<PairedWorker>,
+	worker: PairedWorker,
+) -> Result<usize, String> {
+	match store {
+		Some(store) => {
+			if let Err(e) = store.add(worker.clone()) {
+				*workers = store.load();
+				return Err(format!("cannot save pairings: {e}"));
+			}
+			*workers = store.load();
+			let idx = workers
+				.iter()
+				.position(|w| w.fingerprint == worker.fingerprint)
+				.unwrap_or(0);
+			Ok(idx)
+		}
+		None => {
+			workers.retain(|w| {
+				w.fingerprint != worker.fingerprint && w.addr != worker.addr
+			});
+			workers.insert(0, worker);
+			Ok(0)
+		}
+	}
+}
+
 // ───────────────────────── model ─────────────────────────
 
 impl WorkbenchModel {
@@ -415,13 +439,18 @@ impl WorkbenchModel {
 							worker.name,
 							&worker.fingerprint[..16]
 						);
-						let workers = &mut this.remote.workers;
-						workers.retain(|w| {
-							w.fingerprint != worker.fingerprint
-								&& w.addr != worker.addr
-						});
-						workers.insert(0, worker);
-						save_workers(workers);
+						let store = worker_store();
+						let idx = match apply_pairing(
+							store.as_ref(),
+							&mut this.remote.workers,
+							worker,
+						) {
+							Ok(idx) => idx,
+							Err(msg) => {
+								this.remote_note(false, msg, cx);
+								return;
+							}
+						};
 						this.remote.pairing = false;
 						for input in [
 							this.remote_addr_input.clone(),
@@ -429,7 +458,7 @@ impl WorkbenchModel {
 						] {
 							input.update(cx, |i, _| i.clear_retained());
 						}
-						this.browse_remote_worker(0, cx);
+						this.browse_remote_worker(idx, cx);
 					}
 					Err(err) => {
 						let text = describe(err);
@@ -484,12 +513,24 @@ impl WorkbenchModel {
 	}
 
 	pub fn forget_remote_worker(&mut self, idx: usize, cx: &mut Context<Self>) {
-		if idx < self.remote.workers.len() {
+		let Some(worker) = self.remote.workers.get(idx) else {
+			return;
+		};
+		let fp = worker.fingerprint.clone();
+		if let Some(store) = worker_store() {
+			if let Err(err) = store.forget(&fp) {
+				self.remote_note(
+					false,
+					format!("cannot save pairings: {err}"),
+					cx,
+				);
+			}
+			self.remote.workers = load_workers();
+		} else {
 			self.remote.workers.remove(idx);
-			save_workers(&self.remote.workers);
-			self.remote.browse = None;
-			cx.notify();
 		}
+		self.remote.browse = None;
+		cx.notify();
 	}
 
 	/// Opens a listed remote workspace after the usual close checks.
@@ -581,4 +622,97 @@ impl WorkbenchModel {
 /// A master browsing another machine shares nothing of its own.
 fn remote_drop_local_share() {
 	worker_set_open(None);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn sample_worker(name: &str, addr: &str, fp: &str) -> PairedWorker {
+		PairedWorker {
+			name: name.into(),
+			addr: addr.into(),
+			fingerprint: fp.into(),
+		}
+	}
+
+	#[test]
+	fn apply_pairing_fails_on_unwritable_store() {
+		let tmp = tempfile::tempdir().unwrap();
+		let regular_file = tmp.path().join("a_file");
+		std::fs::write(&regular_file, "blocking").unwrap();
+		let bad_path = regular_file.join(WORKERS_FILE);
+		let store = WorkerStore::new(bad_path);
+
+		let existing = sample_worker("w1", "1.1.1.1:1", "fp1");
+		let mut workers = vec![existing.clone()];
+		let new_worker = sample_worker("w2", "2.2.2.2:2", "fp2");
+
+		let res = apply_pairing(Some(&store), &mut workers, new_worker.clone());
+		let err = res.expect_err("expected error for unwritable path");
+		assert!(
+			err.contains("cannot save pairings"),
+			"expected error containing 'cannot save pairings', got: {err}"
+		);
+		assert!(
+			!workers
+				.iter()
+				.any(|w| w.fingerprint == new_worker.fingerprint),
+			"new worker should not be in workers on save failure"
+		);
+	}
+
+	#[test]
+	fn apply_pairing_succeeds_and_locates_worker_with_concurrent_addition() {
+		let tmp = tempfile::tempdir().unwrap();
+		let store = WorkerStore::in_config_dir(tmp.path());
+		let w1 = sample_worker("w1", "1.1.1.1:1", "fp1");
+		store.add(w1.clone()).unwrap();
+
+		let mut workers = store.load();
+		let w_concurrent =
+			sample_worker("w_concurrent", "2.2.2.2:2", "fp_concurrent");
+		store.add(w_concurrent.clone()).unwrap();
+
+		let new_worker = sample_worker("w_new", "3.3.3.3:3", "fp_new");
+		let idx = apply_pairing(Some(&store), &mut workers, new_worker.clone())
+			.expect("apply_pairing should succeed");
+
+		assert_eq!(workers[idx].fingerprint, new_worker.fingerprint);
+		assert_eq!(workers.len(), 3);
+	}
+
+	#[test]
+	fn apply_pairing_none_store_in_memory_and_dedupes() {
+		let mut workers = vec![
+			sample_worker("w1", "1.1.1.1:1", "fp1"),
+			sample_worker("w2", "2.2.2.2:2", "fp2"),
+		];
+
+		let w3 = sample_worker("w3", "3.3.3.3:3", "fp3");
+		let idx = apply_pairing(None, &mut workers, w3.clone()).unwrap();
+		assert_eq!(idx, 0);
+		assert_eq!(workers[0], w3);
+		assert_eq!(workers.len(), 3);
+
+		let w1_updated = sample_worker("w1_renamed", "1.1.1.1:99", "fp1");
+		let idx =
+			apply_pairing(None, &mut workers, w1_updated.clone()).unwrap();
+		assert_eq!(idx, 0);
+		assert_eq!(workers[0], w1_updated);
+		assert_eq!(workers.len(), 3);
+		assert_eq!(
+			workers.iter().filter(|w| w.fingerprint == "fp1").count(),
+			1
+		);
+
+		let w_same_addr = sample_worker("w_new_addr", "2.2.2.2:2", "fp_diff");
+		let idx =
+			apply_pairing(None, &mut workers, w_same_addr.clone()).unwrap();
+		assert_eq!(idx, 0);
+		assert_eq!(workers[0], w_same_addr);
+		assert_eq!(workers.len(), 3);
+		assert_eq!(workers.iter().filter(|w| w.addr == "2.2.2.2:2").count(), 1);
+		assert!(!workers.iter().any(|w| w.fingerprint == "fp2"));
+	}
 }

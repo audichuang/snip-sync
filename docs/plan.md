@@ -43,6 +43,20 @@
 └─────────────────────────────────────────────────┘
 ```
 
+### 現行引擎(統一後)
+
+CLI 與桌面 App 均統一呼叫核心傳輸引擎與遠端模組,實作參考 `crates/core/src/transfer.rs`、`crates/core/src/transfer/select.rs` 與 `crates/core/src/transfer/changes.rs`:
+
+| 動作 | 共用入口 (core/remote) | CLI | App |
+|---|---|---|---|
+| 複製檔案／資料夾 | `transfer::plan_export_expanding` (`selection_from_paths`, `expand_folder_items`) / `transfer::plan_export_with` | `snip copy <路徑…>` | 專案樹勾選檔案／資料夾,展開走訪後匯出 |
+| 複製 Git 來源 | `transfer::changed_items` + `transfer::plan_export_with` 搭配 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` | `snip copy --working` / `--staged` / `--commit` / `--range` | Git 檢視勾選變更項目,依選取清單匯出 |
+| 複製 commits | `transfer::plan_commit_export_with` | `snip copy --commits -n <N>` / `<a>..<b>` | 時間軸選取連續 commit 複製 |
+| 貼上檔案 | `transfer::plan_import_with` + `TransferImportPlan::apply` 搭配 `ImportMapping` | `snip paste [--dry-run \| --apply]` | 貼上預覽視窗、衝突與新鮮度檢驗後確認套用 |
+| 貼上 commits | `transfer::CommitReplayPreview` (`capture` / `plan` / `revalidate` / `apply`) | `snip paste` (`--overwrite` 門禁) | commit 貼上預覽視窗、覆寫開關後確認重播 |
+| 路徑重定位 | `restore::suggest_restore_base`、`transfer::ImportMapping::from_restore_base` | 一組建議,由 `--adjust-paths` 全域套用 | 貼上預覽中逐 prefix 選擇(D4) |
+| 配對清單 | `snip_remote::WorkerStore` / `snip_remote::TrustedMasterStore` | `snip remote` / `snip worker` | 工作區選單「遠端節點」 |
+
 ### Repo 結構(比照 aghub)
 
 ```
@@ -167,6 +181,11 @@ Tauri 版(本文件第 2、3 節的技術棧)已從 repo 移除,不再建置、�
 | 6 操作真實 App | 原生版在 Linux X11(Xvfb + xdotool)以 `native-acceptance` 的同一份 release build 跑 `crates/native-e2e/tests/smoke.rs`、`lifecycle.rs`、IME、18 個協作情境與資源 gate;UI 邏輯另有三平台都跑的 `#[gpui::test]`,macOS／Windows 打包後會實際開窗(`smoke_native.py --launch`)。舊的 Tauri WebDriver 情境已隨 Tauri 版移除 | ✅ Linux |
 | | macOS / Windows 的原生 GUI 輸入 | ❌ 手動(CI 只 smoke 打包後的 binary) |
 
+- **測試歸屬劃分**:
+  - 核心傳輸規劃與安全防護 → `crates/core/tests/transfer_planning.rs`(涵蓋匯出／匯入規劃、目的地新鮮度快照、碰撞阻擋、取消權杖,以及驗證「舊引擎輸出 == 新引擎輸出」的 parity 比對測試)。
+  - CLI 行為與命令列輸出 → `crates/cli/tests/cli.rs`(涵蓋命令列參數解析、`--stdout`/`--stdin` 串接、錯誤退出代碼 exit 1/2,以及與舊引擎 `collect_payload` 的輸出位元組比對)。
+  - 位元組往返與 TS 相容性 → `crates/cli/tests/e2e.rs`(第 2 層 CLI E2E 往返與第 3 層比對 `.ts-ref` 抽取之 TS 參考實作)。
+
 - **CI 採最嚴格設定(`.github/workflows/ci.yml`):** 每個 PR 與 push 都跑全部 job,沒有路徑過濾;
   Rust 與 rustdoc 的警告視為錯誤,`--locked`;三平台 clippy 與 `cargo test`;`cargo audit` 有漏洞即失敗;
   Python harness 測試;Linux 跑原生真實 App 的 smoke / lifecycle / acceptance;
@@ -239,6 +258,7 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
   - 裝置身分:`remote-identity.der` 與 `remote-identity.key`(Unix 權限 0600)。
   - worker 端:`remote-trusted-masters.json`。
   - master 端:`remote-workers.json`。
+  - `remote-workers.json` 與 `remote-trusted-masters.json` 一律僅透過 `snip_remote::WorkerStore` 與 `TrustedMasterStore`(`crates/remote/src/store.rs`)存取:每次變更皆先取得旁車鎖檔 `<name>.lock` 的獨占建議鎖(exclusive advisory lock),在鎖內重新載入清單、套用變更,並透過獨立命名的暫存檔(`save_json`:寫入 `<name>.<pid>.<count>.tmp` 後 rename 覆蓋)原子寫入,因此 CLI 與桌面版絕不互相覆蓋彼此剛加入的配對;`add` 會移除相同指紋或位址的既有項目並將新項目置於首位;`forget` 若查無相符項目則不重新寫入檔案。
 - **桌面版接法**:`WorkbenchModel.remote.session` 有值時,工作區就是遠端的。
   - `submit_tree_io` 改走 `remote::tree_io`,它呼叫 `tree::listed_tree_result`,一次列完,沒有游標。
   - `select_file_in` 對 `SourceKind::File` 改走 `remote::read_preview`。
@@ -246,7 +266,8 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
   - 開啟遠端工作區是 `lifecycle::Intent::OpenRemoteWorkspace`,與開本機工作區走同一套關閉檢查。
   - worker 監聽器是程序層級的全域物件,先於視窗啟動,也不隨工作區切換而停止。這是之後做無螢幕常駐(Windows 登入項目或服務)的路徑。
 - **測試**:
-  - `scripts/remote_e2e.sh`:連線能力的端到端驗證,獨立於容器裡的 native acceptance。它只用 CLI:起真的 `snip worker` 程序,由真的 `snip remote` 經 TLS 配對、瀏覽、逐位元組比對、確認該拒絕的情況、平行讀取、重啟、換憑證。
+  - `crates/remote/src/store.rs`:單元測試(涵蓋 add / forget / find 基本操作、過期實例與兩個 process 交錯 add 不遺失項目、不可寫位置回報錯誤、暫存檔命名唯一且不留殘檔)。
+  - `scripts/remote_e2e.sh`:連線能力的端到端驗證,獨立於容器裡的 native acceptance。它只用 CLI:起真的 `snip worker` 程序,由真的 `snip remote` 經 TLS 配對、瀏覽、逐位元組比對、確認該拒絕的情況、平行讀取、重啟、換憑證,並包含配對後 forget 其他項目不影響現有配對的檢查。
     - `just remote-e2e`:worker 在本機 127.0.0.1。preflight 會跑;CI 的 `Remote E2E` job 在 Ubuntu、macOS、Windows 各跑一次,列入 CI gate。
     - `just remote-e2e-ssh <host>`:worker 在另一台機器,經 ssh 從 `git archive HEAD` 編出並啟動,走 Tailscale 連線。改到遠端節點的程式時必跑。
   - `crates/remote/tests/loopback.rs`:真實 TLS 走 127.0.0.1,涵蓋配對、拒絕、pin、containment、symlink root。
