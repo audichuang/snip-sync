@@ -40,6 +40,7 @@ preflight-linux: preflight-workflows
 	{{just_executable()}} preflight-rust || rc=$?
 	wait "$harness" || { rc=$?; cat "$log"; }
 	[ "$rc" -eq 0 ] || exit "$rc"
+	{{just_executable()}} remote-e2e
 	# Extra acceptance flags, e.g. less parallelism where the machine is small.
 	{{just_executable()}} native_python="{{native_python}}" native-acceptance ${SNIP_ACCEPTANCE_ARGS:-}
 
@@ -62,6 +63,28 @@ preflight-host:
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+	{{just_executable()}} remote-e2e
+
+# Remote-node connectivity end to end, apart from the GUI gates: a real `snip worker`
+# process and a real `snip remote` master over TLS on 127.0.0.1 (scripts/remote_e2e.sh).
+remote-e2e:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cargo build -p snip-cli --locked
+	snip=target/debug/snip
+	[ -x "$snip" ] || snip=$snip.exe
+	scripts/remote_e2e.sh --snip "$snip"
+
+# The same checks with the worker on another machine, over ssh and Tailscale: the
+# worker is built there from `git archive HEAD`. Extra args go to the script
+# (--listen ADDR:PORT, --remote-snip PATH).
+remote-e2e-ssh host *args:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cargo build --release -p snip-cli --locked
+	snip=target/release/snip
+	[ -x "$snip" ] || snip=$snip.exe
+	scripts/remote_e2e.sh --snip "$snip" --worker-ssh {{host}} {{args}}
 
 # Python stdlib memory harness contracts and workload generator tests.
 preflight-harness:

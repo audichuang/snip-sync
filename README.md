@@ -84,6 +84,15 @@ xattr -cr /Applications/snip-sync.app
    - 在 worker 的分享資料夾裡放一個指向外面的 symlink,在 master 點它。預期預覽顯示拒絕的錯誤。
    - 輸入錯的配對碼 5 次。預期這組碼作廢,要重新啟動 worker 取得新碼。
 
+### 自動化驗證
+
+上面的步驟已經寫成腳本 `scripts/remote_e2e.sh`,只用 CLI,失敗時退出碼非 0:
+
+```bash
+just remote-e2e                 # worker 在本機 127.0.0.1(preflight 與 CI 都會跑)
+just remote-e2e-ssh ubuntu      # worker 在另一台:經 ssh 編出並啟動,走它的 Tailscale IP
+```
+
 ### 用 CLI 當 master
 
 不開桌面版，也能從另一台裝了 `snip` 的機器操作 worker。配對紀錄與裝置身分和桌面版共用同一個設定資料夾。

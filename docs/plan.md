@@ -246,6 +246,9 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
   - 開啟遠端工作區是 `lifecycle::Intent::OpenRemoteWorkspace`,與開本機工作區走同一套關閉檢查。
   - worker 監聽器是程序層級的全域物件,先於視窗啟動,也不隨工作區切換而停止。這是之後做無螢幕常駐(Windows 登入項目或服務)的路徑。
 - **測試**:
+  - `scripts/remote_e2e.sh`:連線能力的端到端驗證,獨立於容器裡的 native acceptance。它只用 CLI:起真的 `snip worker` 程序,由真的 `snip remote` 經 TLS 配對、瀏覽、逐位元組比對、確認該拒絕的情況、平行讀取、重啟、換憑證。
+    - `just remote-e2e`:worker 在本機 127.0.0.1。preflight 會跑;CI 的 `Remote E2E` job 在 Ubuntu、macOS、Windows 各跑一次,列入 CI gate。
+    - `just remote-e2e-ssh <host>`:worker 在另一台機器,經 ssh 從 `git archive HEAD` 編出並啟動,走 Tailscale 連線。改到遠端節點的程式時必跑。
   - `crates/remote/tests/loopback.rs`:真實 TLS 走 127.0.0.1,涵蓋配對、拒絕、pin、containment、symlink root。
   - `crates/cli/tests/worker.rs`:真的啟動 `snip worker` 程序。
   - `main.rs` `tests::in_process::remote_workspace_pairs_lists_and_previews_through_a_worker`:配對表單、遠端樹、預覽。

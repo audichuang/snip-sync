@@ -228,6 +228,43 @@ jobs:
     # Apple's container cannot run in a hosted macOS VM, so the same Dockerfile is built
     # here (x86_64; the Mac builds arm64) and the harness runs in it as it does there:
     # unprivileged, with the checkout read-only.
+    # Remote-node connectivity end to end, apart from the GUI gates: a real
+    # `snip worker` process and a real `snip remote` master over TLS on 127.0.0.1
+    # (scripts/remote_e2e.sh). Windows matters most: it is the headless worker.
+    remote-e2e:
+        name: Remote E2E (${{ matrix.os }})
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-24.04, macos-latest, windows-latest]
+        env:
+            # A check that cannot run (no symlinks) fails instead of skipping.
+            SNIP_REQUIRE_ALL_TESTS: "1"
+            SNIP_E2E_TIMEOUT_SCALE: "2"
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+            - name: Rust Cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  # Reads the Test job's debug cache; never writes its own set.
+                  save-if: false
+                  shared-key: ${{ runner.os }}-test
+            - name: Lint the script
+              if: runner.os == 'Linux'
+              run: shellcheck scripts/remote_e2e.sh
+            - name: Build snip
+              run: cargo build -p snip-cli --locked
+            - name: Remote E2E
+              shell: bash
+              run: |
+                  snip=target/debug/snip
+                  [ -x "$snip" ] || snip=$snip.exe
+                  scripts/remote_e2e.sh --snip "$snip"
+
     linux-container:
         name: Linux Container Image
         runs-on: ubuntu-24.04
@@ -641,7 +678,7 @@ jobs:
     gate:
         name: CI gate
         if: always()
-        needs: [actionlint, format, lint-rust, test, harness, linux-container, native-acceptance, native-candidate-artifacts]
+        needs: [actionlint, format, lint-rust, test, harness, remote-e2e, linux-container, native-acceptance, native-candidate-artifacts]
         runs-on: ubuntu-24.04
         timeout-minutes: 5
         steps:
