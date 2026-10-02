@@ -88,6 +88,7 @@ impl WorkbenchModel {
 		// Paired workers and, for the one being browsed, its workspaces.
 		let browse = self.remote.browse.as_ref();
 		for (ix, worker) in self.remote.workers.iter().enumerate() {
+			let forget = format!("btn-remote-forget:{ix}");
 			out.push(
 				menu_row(SharedString::from(format!("remote-worker:{ix}")), 82)
 					.when(browse.is_some_and(|(i, _)| *i == ix), |d| {
@@ -125,9 +126,7 @@ impl WorkbenchModel {
 					)
 					.child(
 						button(
-							SharedString::from(format!(
-								"btn-remote-forget:{ix}"
-							)),
+							SharedString::from(forget.clone()),
 							t("remote_forget", loc),
 							Btn::Ghost,
 							true,
@@ -136,7 +135,8 @@ impl WorkbenchModel {
 						.on_click(cx.listener(move |this, _, _, cx| {
 							cx.stop_propagation();
 							this.forget_remote_worker(ix, cx);
-						})),
+						}))
+						.children(probe(log, forget)),
 					)
 					.children(probe(log, format!("remote-worker:{ix}")))
 					.into_any_element(),

@@ -716,6 +716,8 @@ impl FileTreeNode {
 					node.row_window =
 						node.row_window.saturating_add(DIR_PAGE_ROWS);
 				}
+				// The view's cap would hide the rows the folder just let in.
+				self.extra_rows = self.extra_rows.saturating_add(DIR_PAGE_ROWS);
 				TreeEffect::Idle
 			}
 			TreeCommand::LoadMore(key) => {
@@ -1840,6 +1842,68 @@ mod tests {
 		assert!(!sub.is_expanded);
 		assert!(sub.children.is_empty());
 		assert!(sub.scan.is_none());
+	}
+
+	/// The whole view is capped at `visible_limit()` rows, so revealing more
+	/// of a folder must raise that cap too, or the click changes nothing.
+	#[test]
+	fn reveal_more_rows_reaches_past_the_view_cap() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		fs::create_dir(root.join("many")).unwrap();
+		for n in 0..700 {
+			fs::write(root.join(format!("many/f{n:03}")), b"x").unwrap();
+		}
+		fs::write(root.join("z-last.txt"), b"z").unwrap();
+		let mut tree = FileTreeNode::new_root(root);
+		tree.toggle_expand("many", root);
+		while let Some(more) = tree
+			.flatten_visible(tree.visible_limit())
+			.into_iter()
+			.find(|row| row.is_more_marker)
+		{
+			drive(
+				&mut tree,
+				command_for_row(&more, RowGesture::Primary).unwrap(),
+			);
+		}
+		// A worker returns a folder in one listing, so its window stays at
+		// one page however many names arrived.
+		let many = tree.children.iter_mut().find(|c| c.name == "many").unwrap();
+		many.row_window = DIR_PAGE_ROWS;
+		let rows =
+			|tree: &FileTreeNode| tree.flatten_visible(tree.visible_limit());
+		assert_eq!(rows(&tree).len(), MAX_VISIBLE_ROWS);
+
+		// The folder's own marker, first under it.
+		let folder = rows(&tree)
+			.into_iter()
+			.find(|row| row.is_view_limit && row.rel_path == "many")
+			.unwrap();
+		drive(
+			&mut tree,
+			command_for_row(&folder, RowGesture::Primary).unwrap(),
+		);
+		let after = rows(&tree);
+		assert!(after.len() > MAX_VISIBLE_ROWS);
+		assert!(after.iter().any(|row| row.rel_path == "many/f400"));
+
+		// Any marker left, the folder's or the cap's, until every row shows.
+		for _ in 0..4 {
+			let Some(marker) =
+				rows(&tree).into_iter().find(|row| row.is_view_limit)
+			else {
+				break;
+			};
+			drive(
+				&mut tree,
+				command_for_row(&marker, RowGesture::Primary).unwrap(),
+			);
+		}
+		let all = rows(&tree);
+		assert!(all.iter().any(|row| row.rel_path == "many/f699"));
+		assert!(all.iter().any(|row| row.rel_path == "z-last.txt"));
+		assert!(!all.iter().any(|row| row.is_view_limit));
 	}
 
 	#[test]
