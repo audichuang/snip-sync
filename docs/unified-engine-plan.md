@@ -71,7 +71,7 @@ AGENTS.md 與既有慣例規定:與 TS 不同的行為**只有使用者能決定
 
 ### D1 — CLI 貼上要不要採用 transfer 的兩道防護?
 
-`transfer` 貼上比 TS 多兩道:(a) `TargetCollision`:兩筆 entry 指向同一個實體檔(大小寫別名僅在目標檔已存在時偵測(靠 realpath);兩個都不存在的大小寫別名目前不擋,以及 symlink 別名)就整批拒絕;(b) freshness:預覽後目標或 repo HEAD/index 有變就拒絕(`StaleDestination`)。兩者都違反 spec §3.2「一律覆蓋,不偵測目標是否被改過」,也與 TS 不同;GUI 已經這樣做,但沒登記。
+`transfer` 貼上比 TS 多兩道:(a) `TargetCollision`:兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分會由 realpath 偵測;Windows 上即使皆為新增亦會摺疊大小寫阻擋;僅在 macOS 等非 Windows 的不區分大小寫檔案系統上,差異片段皆不存在時目前未偵測,以及 symlink 別名)就整批拒絕;(b) freshness:預覽後目標或 repo HEAD/index 有變就拒絕(`StaleDestination`)。兩者都違反 spec §3.2「一律覆蓋,不偵測目標是否被改過」,也與 TS 不同;GUI 已經這樣做,但沒登記。
 
 - **建議:採用**,並把兩者登記為已接受的差異、改寫 spec §3.2。理由:F1 是實際資料遺失,而 CLI 的 dry-run → apply 中間本來就可能隔很久。CLI 單一指令 `--apply` 時 plan 與 apply 緊接著,freshness 幾乎不會誤擋。
 - 代價:contract fixture 有三個案例描述的是 TS 行為,CLI 改走 `plan_import_with` 後會**不一樣**(見 D2)。
@@ -82,14 +82,16 @@ AGENTS.md 與既有慣例規定:與 TS 不同的行為**只有使用者能決定
 
 1. 「the same path twice is planned twice, in order」→ transfer 會變成 `TargetCollision` 錯誤。
 2. 「a sibling root label targets that root」(`backup/` 落到 backup root,需要多 root)→ CLI 目前只給一個 root,transfer 需要有人建 `ImportMapping`。
-3. 「an absolute path matching no root is kept literally under the primary root」:經程式碼比對,POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`)經 `sanitize_relative_path` 去首斜線後仍寫入主 root 底下(`Users/bob/other/src/a.ts`),與 TS 一致,並非差異;只有帶磁碟機代號的路徑(`D:\work\lib\b.ts`)因路徑驗證拒絕冒號 `:`(非 root 解析原因)而成為 `UNRESOLVED_PATH` 跳過,這才是與 TS 的真實差異(TS 寫為 `D/work/lib/b.ts`)。
+3. 「an absolute path matching no root is kept literally under the primary root」:經程式碼比對,僅當 POSIX 絕對路徑位於所有 root 外部且不含任何 root basename 片段時(如 `/Users/bob/other/src/a.ts`),經 `sanitize_relative_path` 去首斜線後寫入主 root 底下(`Users/bob/other/src/a.ts`),此狹義情境才與 TS 一致;若為 root 內部絕對路徑或跨機器後綴符合,舊引擎會解析為相對路徑,但在 `plan_import_with` 下會被巢狀寫入,這兩者不屬於同 TS 行為,歸入下方待決事項;只有帶磁碟機代號的路徑(`D:\work\lib\b.ts`)因路徑驗證拒絕冒號 `:`(非 root 解析原因)而成為 `UNRESOLVED_PATH` 跳過,這才是與 TS 的真實差異(TS 寫為 `D/work/lib/b.ts`)。
 
 - **建議**:1 依 D1 接受為差異;2 CLI 目前本就只有單 root,不受影響,登記「CLI 單 root」即可;3 接受帶磁碟機代號路徑因驗證拒絕冒號 `:` 跳過為差異。三者都寫進 porting-notes,fixture 與 `contract.rs` 不動。
 - 若你要保留 TS 行為:替代方案是 `plan_import_with` 加一個「TS 相容模式」旗標,但那等於在 transfer 裡再長出第二套語意,不建議。
-- **新待決事項(明確未登記為已接受差異)**:root 內部的絕對路徑(例如 `<repo>/src/c.ts`)在舊引擎(`plan_restore`)中會被解析為 `src/c.ts`,但在 `plan_import_with` 中會被巢狀寫入為 `<repo>/<repo-abs-path-without-leading-slash>/src/c.ts`。這屬於階段 6 的 regression,需要使用者拍板決定處理方式:
-  - 選項 (1):如 `plan_restore` 解析 root 內部的絕對路徑(CLI 在呼叫前以 `map_entry` 預先對應,或 `plan_import_with` 在 sanitize 前先做 containment 檢查);
+- **新待決事項(明確未登記為已接受差異)**:以下兩種絕對路徑在舊引擎(`plan_restore`)與 `plan_import_with` 間存在行為差異,屬於階段 6 的 regression,且 GUI 現今亦為此巢狀行為(同樣未登記),明確未登記為已接受差異,需要使用者拍板決定處理方式:
+  1. root 內部的絕對路徑(例如 `<repo>/src/c.ts`):舊引擎(`plan_restore`)會解析為 `src/c.ts`,但在 `plan_import_with` 中會被巢狀寫入為 `<repo>/<repo-abs-path-without-leading-slash>/src/c.ts`。
+  2. 跨機器後綴符合路徑(例如 `/…/<root-basename>/src/a.ts`):舊引擎(`paths.rs` 的 `cross_machine_suffix_candidate`)會因 root basename 相符而解析為 `src/a.ts`,但在 `plan_import_with` 中同樣會被巢狀寫入為 `<repo>/<abs-path-without-leading-slash>`。
+  - 選項 (1):如 `plan_restore` 解析路徑(CLI 在呼叫前以 `map_entry` 預先對應,或 `plan_import_with` 在 sanitize 前先做 containment 與後綴檢查);
   - 選項 (2):直接跳過。
-  階段 6 需在 `crates/cli/tests/cli.rs` 為此情境新增測試。因此 D2 並非全部差異的完整集合。
+  兩選項皆適用於這兩種情況。階段 6 需在 `crates/cli/tests/cli.rs` 為這兩類情境新增測試。因此 D2 並非全部差異的完整集合(root 內部絕對路徑與跨機器後綴符合皆尚未拍板)。
 
 ### D3 — `--range a..b` 怎麼辦?
 
@@ -179,16 +181,18 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
   - **commit payload 覆寫判定條件(D5 待決阻擋項目)**:實作 commit-payload `--overwrite` 旗標前需先決定 CLI 判定規則:
     - 選項 (a):與 GUI 採用相同存在性判定(`dest_exists` / `FilePlan.existed`,只要目標檔在重播前已存在即需 `--overwrite`);
     - 選項 (b):僅在目標有未 commit 修改(dirty)時阻擋(需登記為 GUI/CLI 差異並在 core 新增 helper)。
-  - **root 內部絕對路徑處理(D2 新待決事項,明確未登記為已接受差異)**:舊引擎(`plan_restore`)將 `<repo>/src/c.ts` 規劃為 `src/c.ts`,但 `plan_import_with` 會寫入巢狀路徑 `<repo>/<repo-abs-path-without-leading-slash>/src/c.ts`。此為 regression,需決定:
-    - 選項 (1):如 `plan_restore` 解析 root 內部的絕對路徑(CLI 在呼叫前以 `map_entry` 預先對應,或 `plan_import_with` 在 sanitize 前先做 containment 檢查);
+  - **root 內部絕對路徑與跨機器後綴符合處理(D2 新待決事項,明確未登記為已接受差異)**:舊引擎(`plan_restore`)將 `<repo>/src/c.ts` 以及跨機器後綴符合路徑(例如 `/…/<root-basename>/src/a.ts`)規劃為 `src/a.ts`,但 `plan_import_with` 會將兩者寫入巢狀路徑(`<repo>/<abs-path-without-leading-slash>`,注意 GUI 現今亦為此巢狀行為且同樣未登記)。此為 regression,需決定:
+    - 選項 (1):如 `plan_restore` 解析路徑(CLI 在呼叫前以 `map_entry` 預先對應,或 `plan_import_with` 在 sanitize 前做 containment 與後綴檢查);
     - 選項 (2):直接跳過。
+    兩選項皆適用於這兩種情況。
 - 檔案 payload:`plan_import_with(text, header, &[repo], mapping, opts)`,mapping 為 `with_primary(repo)`,`--adjust-paths` 時由 `from_restore_base` 產生;`--dry-run` 印 `TransferImportPlan` 的 create/overwrite/delete/skip(輸出格式不變);`--apply` 呼叫 `TransferImportPlan::apply(&RestoreSelection{overwrite_existing / skip_existing})`。
 - `TargetCollision`、`StaleDestination` 對應到清楚的錯誤訊息與 exit 1(依 D1)。
 - commit payload:dry-run 也改走 `CommitReplayPreview::capture_with`(預覽與 apply 同一份 plan),旗標依 D5 拍板結果實作。
 - 測試(`cli.rs`):
-  - F1 大小寫別名(依賴目標檔已存在,靠 realpath 偵測)在 macOS 與 Windows 拒絕、Linux 照常;
-  - 兩筆皆為新增且目標檔皆不存在的大小寫別名(例如 `[NEW] B.txt` 與 `[NEW] b.txt`):在 macOS 與 Windows 補 `cli.rs` 測試(記錄現行覆蓋行為或予以修復——決策待決);
+  - F1 大小寫別名(大小寫差異片段位於已存在路徑部分):在 macOS 與 Windows 拒絕(`TargetCollision`)、Linux 照常執行;
+  - 兩筆皆為新增且大小寫差異片段皆不存在的大小寫別名(例如 `[NEW] B.txt` 與 `[NEW] b.txt`,或目錄尚未建立時的 `D/x.txt` 與 `d/x.txt`):在 macOS 補 `cli.rs` 測試(記錄現行覆蓋行為或予以修復——決策待決);在 Windows 補 regression 測試驗證兩筆新增仍會因大小寫摺疊觸發 `TargetCollision`;
   - root 內部絕對路徑(如 `<repo>/src/c.ts`):在 `cli.rs` 補測試(依拍板選項驗證解析或跳過);
+  - 跨機器後綴符合路徑(如 `/Users/bob/<repo-basename>/src/a.ts`):在 `cli.rs` 補測試(依拍板選項驗證解析或跳過);
   - F2 `--skip-existing` 貼 commit exit 2 且檔案不變;
   - `--adjust-paths` 目前**完全沒有測試**,這一階段要補(Strip 與 Add 各一);既有 `file_mode_round_trip`(:57–119)輸出不得變。
 - `contract.rs` 不動(依 D2)。

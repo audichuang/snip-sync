@@ -65,12 +65,12 @@
 4. 結果:成功 / 跳過 / 失敗各幾個,失敗的列出原因。
 
 - 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 現已如此,CLI 於統一引擎遷移[階段 6]後同樣):
-  (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫別名僅在目標檔已存在時偵測(靠 realpath);兩個都不存在的大小寫別名目前不擋,以及 symlink 別名、同一路徑出現兩次)就整批拒絕;
+  (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;Windows 上即使皆為新增亦會摺疊大小寫阻擋;僅在 macOS 等非 Windows 的不區分大小寫檔案系統上,差異片段皆不存在時目前未偵測,詳見 porting-notes;以及 symlink 別名、同一路徑出現兩次)就整批拒絕;
   (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
   這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
 - 安全規則照 porting-notes 第 3 節:路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、
   placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8。
-- CLI 補充(目標行為/CLI 於階段 6 遷移後):POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`)在去除開頭 `/` 後仍寫入主 root 底下(同 TS);帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因路徑驗證拒絕冒號 `:` 而跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`。CLI 只有單一 root。
+- CLI 補充(目標行為/CLI 於階段 6 遷移後):位於所有 root 外部且不含任何 root basename 片段的 POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`),在去除開頭 `/` 後寫入主 root 底下(此狹義情境同 TS;root 內部絕對路徑與跨機器後綴符合則屬 D2 待決事項,明確未登記為已接受差異);帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因路徑驗證拒絕冒號 `:` 而跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`。CLI 只有單一 root。
 
 CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --skip-existing]`。
 
