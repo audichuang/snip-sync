@@ -46,7 +46,9 @@ pub(crate) fn folder_file_rel(root: &Path, path: &Path) -> Option<String> {
 	Some(rel)
 }
 
-fn is_safe_dir_symlink(root: &Path, path: &Path) -> bool {
+/// A symlink at `path` that a browser or a copy may treat as a folder: it
+/// resolves to a directory inside `root`, and not to `.git` or inside one.
+pub fn is_safe_dir_symlink(root: &Path, path: &Path) -> bool {
 	if let Ok(meta) = std::fs::metadata(path) {
 		if meta.is_dir() {
 			if let Ok(canonical) = dunce::canonicalize(path) {

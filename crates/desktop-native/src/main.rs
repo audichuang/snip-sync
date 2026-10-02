@@ -6309,6 +6309,13 @@ mod tests {
 			fs::create_dir_all(shared.join("src")).unwrap();
 			fs::write(shared.join("src/main.rs"), "fn main() {}\n").unwrap();
 			fs::write(shared.join("README.md"), "# remote\n").unwrap();
+			// A folder symlink inside the share is a folder in the tree.
+			#[cfg(unix)]
+			std::os::unix::fs::symlink(
+				shared.join("src"),
+				shared.join("zz-link"),
+			)
+			.unwrap();
 			let id = snip_remote::Identity::generate().unwrap();
 			let worker = snip_remote::Worker::start(
 				"127.0.0.1:0".parse().unwrap(),
@@ -6384,8 +6391,35 @@ mod tests {
 				assert!(tree.is_loaded, "root listed: {tree:?}");
 				let names: Vec<_> =
 					tree.children.iter().map(|c| c.name.as_str()).collect();
+				#[cfg(unix)]
+				assert_eq!(names, ["src", "zz-link", "README.md"]);
+				#[cfg(not(unix))]
 				assert_eq!(names, ["src", "README.md"]);
 			});
+
+			#[cfg(unix)]
+			{
+				model.update(cx, |m, cx| {
+					m.dispatch_ws_tree(
+						Some(TreeCommand::Expand(NodeKey::from_utf8_rel(
+							"zz-link",
+						))),
+						cx,
+					);
+				});
+				settle(cx);
+				model.read_with(cx, |m, _| {
+					let tree = m.ws_tree.as_ref().unwrap();
+					let link = &tree.children[1];
+					assert!(link.is_dir && link.is_loaded, "link: {link:?}");
+					let names: Vec<_> = link
+						.children
+						.iter()
+						.map(|c| c.rel_path.as_str())
+						.collect();
+					assert_eq!(names, ["zz-link/main.rs"]);
+				});
+			}
 
 			model.update(cx, |m, cx| {
 				m.dispatch_ws_tree(
