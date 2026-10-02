@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use crate::fsutil;
 use crate::gitrun::CancelToken;
 use crate::paths;
-use crate::transfer::{ExportItem, ExportSelection, SourceKind, TransferError};
+use crate::transfer::{
+	CanonicalRootId, ExportItem, ExportSelection, SourceKind, TransferError,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderExpansion {
@@ -19,7 +21,7 @@ pub struct FolderExpansion {
 /// it: a name a header cannot carry (`< > : " | ? *`, control characters,
 /// a trailing space, `\` on Unix), non-UTF-8, a dangling or out-of-root
 /// symlink, a FIFO/socket/device, or a file this user cannot open.
-fn folder_file_rel(root: &Path, path: &Path) -> Option<String> {
+pub(crate) fn folder_file_rel(root: &Path, path: &Path) -> Option<String> {
 	let rel = path
 		.strip_prefix(root)
 		.ok()?
@@ -133,4 +135,209 @@ pub fn expand_folder_items(
 		skipped,
 		truncated,
 	})
+}
+
+/// Selection generated from user paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathSelection {
+	pub sel: ExportSelection,
+	/// Items dropped before planning (FIFO/socket/device, out-of-root or dangling symlink, header-unrepresentable or non-UTF-8 name, unopenable file).
+	pub skipped: usize,
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+	let mut out = PathBuf::new();
+	for c in path.components() {
+		match c {
+			std::path::Component::CurDir => {}
+			std::path::Component::ParentDir => {
+				out.pop();
+			}
+			other => out.push(other),
+		}
+	}
+	if out.as_os_str().is_empty() {
+		PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+	} else {
+		out
+	}
+}
+
+/// Creates an export selection from user-specified path arguments, resolving relative paths against `cwd`.
+pub fn selection_from_paths(
+	root: &Path,
+	cwd: &Path,
+	paths: &[PathBuf],
+) -> Result<PathSelection, TransferError> {
+	let canonical_root = CanonicalRootId::new(root)?;
+	canonical_root.validate()?;
+
+	let mut items = Vec::new();
+	let mut skipped = 0usize;
+	let mut seen: HashSet<String> = HashSet::new();
+
+	for path in paths {
+		let full_path = if path.is_absolute() {
+			path.to_path_buf()
+		} else {
+			cwd.join(path)
+		};
+		let normalized = lexical_normalize(&full_path);
+
+		let (parent, file_name) =
+			match (normalized.parent(), normalized.file_name()) {
+				(Some(p), Some(f)) => (p, f),
+				_ => {
+					if normalized != canonical_root.path() && normalized != root
+					{
+						return Err(TransferError::PathOutsideRoot(
+							path.clone(),
+						));
+					}
+					(normalized.as_path(), std::ffi::OsStr::new(""))
+				}
+			};
+
+		let canonical_parent = match dunce::canonicalize(parent) {
+			Ok(p) => p,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				if parent.strip_prefix(root).is_err()
+					&& parent.strip_prefix(canonical_root.path()).is_err()
+				{
+					return Err(TransferError::PathOutsideRoot(path.clone()));
+				}
+				return Err(TransferError::PathNotFound(path.clone()));
+			}
+			Err(e) => return Err(TransferError::Io(e)),
+		};
+
+		let target = if file_name.is_empty() {
+			canonical_parent
+		} else {
+			canonical_parent.join(file_name)
+		};
+
+		let rel = match target.strip_prefix(canonical_root.path()) {
+			Ok(r) => r,
+			Err(_) => return Err(TransferError::PathOutsideRoot(path.clone())),
+		};
+
+		if rel.as_os_str().is_empty() {
+			let read_dir = match std::fs::read_dir(canonical_root.path()) {
+				Ok(rd) => rd,
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+					return Err(TransferError::PathNotFound(path.clone()));
+				}
+				Err(e) => return Err(TransferError::Io(e)),
+			};
+			let mut child_names = Vec::new();
+			for entry in read_dir {
+				let entry = entry?;
+				let name = entry.file_name();
+				if name == ".git" {
+					continue;
+				}
+				child_names.push(name);
+			}
+			child_names
+				.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
+
+			for name in child_names {
+				let Some(name_str) = name.to_str() else {
+					skipped += 1;
+					continue;
+				};
+				let child_path = canonical_root.path().join(&name);
+				let child_sym_meta =
+					match std::fs::symlink_metadata(&child_path) {
+						Ok(m) => m,
+						Err(_) => {
+							skipped += 1;
+							continue;
+						}
+					};
+				if child_sym_meta.is_dir() {
+					if seen.insert(name_str.to_string()) {
+						items.push(ExportItem {
+							root: canonical_root.clone(),
+							relative_path: name_str.to_string(),
+							source: SourceKind::File,
+							change_type: None,
+						});
+					}
+				} else if let Some(valid_rel) =
+					folder_file_rel(canonical_root.path(), &child_path)
+				{
+					if seen.insert(valid_rel.clone()) {
+						items.push(ExportItem {
+							root: canonical_root.clone(),
+							relative_path: valid_rel,
+							source: SourceKind::File,
+							change_type: None,
+						});
+					}
+				} else {
+					skipped += 1;
+				}
+			}
+			continue;
+		}
+
+		let sym_meta = match std::fs::symlink_metadata(&target) {
+			Ok(m) => m,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				return Err(TransferError::PathNotFound(path.clone()));
+			}
+			Err(e) => return Err(TransferError::Io(e)),
+		};
+
+		let rel_str = match rel
+			.components()
+			.map(|c| c.as_os_str().to_str())
+			.collect::<Option<Vec<_>>>()
+			.map(|parts| parts.join("/"))
+		{
+			Some(s) => s,
+			None => {
+				skipped += 1;
+				continue;
+			}
+		};
+
+		if sym_meta.is_dir() {
+			if seen.insert(rel_str.clone()) {
+				items.push(ExportItem {
+					root: canonical_root.clone(),
+					relative_path: rel_str,
+					source: SourceKind::File,
+					change_type: None,
+				});
+			}
+		} else if let Some(valid_rel) =
+			folder_file_rel(canonical_root.path(), &target)
+		{
+			if seen.insert(valid_rel.clone()) {
+				items.push(ExportItem {
+					root: canonical_root.clone(),
+					relative_path: valid_rel,
+					source: SourceKind::File,
+					change_type: None,
+				});
+			}
+		} else {
+			skipped += 1;
+		}
+	}
+
+	if items.is_empty() {
+		return Err(TransferError::EmptySelection);
+	}
+
+	let sel = ExportSelection::new(
+		vec![root.to_path_buf()],
+		Some(root.to_path_buf()),
+		items,
+	)?;
+
+	Ok(PathSelection { sel, skipped })
 }

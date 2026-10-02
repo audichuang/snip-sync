@@ -684,6 +684,35 @@ pub fn collect(git: &Git, source: &GitSource) -> Result<GitFiles, GitError> {
 	})
 }
 
+/// Detailed listing of a changed path: relative path, change type, and whether
+/// the entry is a gitlink (submodule pointer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedPathEntry {
+	pub path: String,
+	pub change_type: ChangeType,
+	pub gitlink: bool,
+}
+
+/// Lists all changes for `source` with their change types and gitlink flags,
+/// plus the number of entries dropped because their path name was not UTF-8.
+pub fn list_changes_with(
+	git: &Git,
+	source: &GitSource,
+	opts: &RunOptions,
+) -> Result<(Vec<ChangedPathEntry>, usize), GitError> {
+	let (changes, skipped) = collect_changes(git, source, opts)?;
+	let entries = changes
+		.into_iter()
+		.map(|c| ChangedPathEntry {
+			path: c.path,
+			change_type: change_type_for_status(c.status),
+			gitlink: c.gitlink,
+		})
+		.collect();
+	already_cancelled(opts, "list changes")?;
+	Ok((entries, skipped))
+}
+
 /// Changed paths for the browser, including files whose content cannot be
 /// put on the clipboard (binary or unreadable), with cancellation, deadlines
 /// and strict metadata output limits propagated through every nested Git
@@ -706,7 +735,7 @@ pub fn list_changed_paths_and_gitlinks_with(
 	source: &GitSource,
 	opts: &RunOptions,
 ) -> Result<(ChangedPaths, Vec<String>), GitError> {
-	let changes = collect_changes(git, source, opts)?.0;
+	let (changes, _) = list_changes_with(git, source, opts)?;
 	let gitlinks = changes
 		.iter()
 		.filter(|c| c.gitlink)
@@ -714,7 +743,7 @@ pub fn list_changed_paths_and_gitlinks_with(
 		.collect();
 	let paths = changes
 		.into_iter()
-		.map(|c| (c.path, Some(change_type_for_status(c.status))))
+		.map(|c| (c.path, Some(c.change_type)))
 		.collect();
 	already_cancelled(opts, "list changed paths")?;
 	Ok((paths, gitlinks))

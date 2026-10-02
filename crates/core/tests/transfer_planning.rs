@@ -33,16 +33,19 @@ use std::process::Command;
 
 use snip_core::copy;
 use snip_core::format::{self, ChangeType};
-use snip_core::gitrun::CancelToken;
+use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::{self, Git, GitSource};
-use snip_core::restore::{self, RestoreSelection, SkipReason};
+use snip_core::restore::{
+	self, RestoreBase, RestoreBaseSuggestion, RestoreSelection, SkipReason,
+};
 use snip_core::settings::{FilterAction, FilterRule, FilterType, Settings};
 use snip_core::transfer::{
-	detect_clipboard_prefixes, expand_folder_items, plan_commit_export,
-	plan_commit_export_exact, plan_export, plan_import,
-	validate_commit_selection, CanonicalRootId, CommitReplayPreview,
-	DestinationFreshnessSnapshot, ExportItem, ExportSelection, ImportMapping,
-	SourceFreshnessSnapshot, SourceKind, TransferError,
+	changed_items, detect_clipboard_prefixes, expand_folder_items,
+	plan_commit_export, plan_commit_export_exact, plan_export, plan_import,
+	plan_import_with, selection_from_paths, validate_commit_selection,
+	CanonicalRootId, CommitReplayPreview, DestinationFreshnessSnapshot,
+	ExportItem, ExportSelection, ImportMapping, SourceFreshnessSnapshot,
+	SourceKind, TransferError, CLIPBOARD_PAYLOAD_MAX,
 };
 
 struct TestRepo {
@@ -3576,4 +3579,1008 @@ fn test_expand_folder_items_root_through_symlink() {
 	assert_eq!(expanded.sel.items[0].relative_path, "dir/sub/file.txt");
 	assert_eq!(expanded.skipped, 0);
 	assert!(!expanded.truncated);
+}
+
+// ---------------------------------------------------------------------------
+// 29. Phase 2: Range oracle byte equality, changes listing, and parity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_range_oracle_byte_equality() {
+	let repo = TestRepo::new("range-oracle");
+	repo.write("modified.txt", "initial text\n");
+	repo.write("deleted.txt", "content only at A\n");
+	repo.write("rename_src.txt", "content of renamed\n");
+	fs::write(repo.path().join("binary.bin"), [0u8, 1, 2, 3, 255, 0, 4])
+		.unwrap();
+	fs::write(repo.path().join("deleted_binary.bin"), [0u8, 9, 8, 7, 0])
+		.unwrap();
+	repo.write("twice.txt", "v1\n");
+	let large_content = "x".repeat(15 * 1024);
+	repo.write("large.txt", &large_content);
+	let sha_a = repo.commit("commit A");
+
+	// Intermediate commit to change twice.txt twice
+	repo.write("twice.txt", "v2\n");
+	repo.commit("commit intermediate");
+
+	// Tip commit B
+	repo.write("modified.txt", "updated text\n");
+	repo.write("added.txt", "new file in B\n");
+	repo.git(&["rm", "deleted.txt"]);
+	repo.git(&["mv", "rename_src.txt", "rename_dst.txt"]);
+	fs::write(repo.path().join("binary.bin"), [0u8, 1, 2, 3, 255, 0, 5])
+		.unwrap();
+	repo.git(&["rm", "deleted_binary.bin"]);
+	repo.write("twice.txt", "v3\n");
+	repo.write("large.txt", &format!("{large_content}extra\n"));
+	let sha_b = repo.commit("commit B");
+
+	let settings = Settings {
+		max_file_size_kb: 10.0,
+		..Settings::default()
+	};
+	let git = repo.open();
+	let range_source = GitSource::Range(sha_a.clone(), sha_b.clone());
+
+	let changed = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&range_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	// Check items order and change types match list_changed_paths_with exactly
+	let expected_paths = gitsrc::list_changed_paths_with(
+		&git,
+		&range_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let actual_paths: Vec<_> = changed
+		.items
+		.iter()
+		.map(|item| (item.relative_path.clone(), item.change_type))
+		.collect();
+	assert_eq!(actual_paths, expected_paths);
+
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed.items,
+	)
+	.unwrap();
+
+	let plan = plan_export(&sel, &settings, None).unwrap();
+	let legacy =
+		gitsrc::collect_payload(&git, &range_source, &[repo.path()], &settings)
+			.unwrap();
+
+	assert_eq!(plan.payload, legacy.payload);
+	assert_eq!(plan.copied_file_count, legacy.copied_file_count);
+	assert_eq!(plan.skipped_file_size_count, legacy.skipped_file_size_count);
+	assert_eq!(
+		plan.skipped_unreadable_count,
+		legacy.skipped_unreadable_count
+	);
+}
+
+#[test]
+fn test_range_deletion_only_reads_base() {
+	let repo = TestRepo::new("range-del-only");
+	repo.write("del.txt", "content at base A\n");
+	repo.write("other.txt", "other\n");
+	let sha_a = repo.commit("commit A");
+
+	repo.write("other.txt", "other intermediate\n");
+	let _ = repo.commit("commit intermediate");
+
+	repo.git(&["rm", "del.txt"]);
+	repo.write("other.txt", "other\n");
+	let sha_b = repo.commit("commit B");
+
+	let settings = Settings::default();
+	let git = repo.open();
+	let range_source = GitSource::Range(sha_a.clone(), sha_b.clone());
+
+	let changed = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&range_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	assert_eq!(changed.items.len(), 1);
+	assert_eq!(changed.items[0].relative_path, "del.txt");
+
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed.items,
+	)
+	.unwrap();
+
+	let plan = plan_export(&sel, &settings, None).unwrap();
+	assert_eq!(plan.files.len(), 1);
+	assert_eq!(
+		plan.files[0].content.as_deref(),
+		Some("content at base A\n")
+	);
+
+	let legacy =
+		gitsrc::collect_payload(&git, &range_source, &[repo.path()], &settings)
+			.unwrap();
+	assert_eq!(plan.payload, legacy.payload);
+}
+
+#[test]
+fn test_range_empty_diff() {
+	let repo = TestRepo::new("range-empty");
+	repo.write("a.txt", "hello\n");
+	let sha_a = repo.commit("commit A");
+
+	let settings = Settings::default();
+	let git = repo.open();
+	let range_source = GitSource::Range(sha_a.clone(), sha_a.clone());
+
+	let changed = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&range_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	assert!(changed.items.is_empty());
+
+	let legacy =
+		gitsrc::collect_payload(&git, &range_source, &[repo.path()], &settings)
+			.unwrap();
+	assert!(legacy.files.is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_range_oracle_root_through_symlink() {
+	let repo = TestRepo::new("range-symlink-root");
+	repo.write("mod.txt", "a\n");
+	repo.write("del.txt", "del\n");
+	let sha_a = repo.commit("A");
+
+	repo.write("mod.txt", "b\n");
+	repo.write("add.txt", "add\n");
+	repo.git(&["rm", "del.txt"]);
+	let sha_b = repo.commit("B");
+
+	let alias_dir = tempfile::tempdir().unwrap();
+	let alias_path = alias_dir.path().join("repo_alias");
+	std::os::unix::fs::symlink(repo.path(), &alias_path).unwrap();
+
+	let root_id = CanonicalRootId::new(&alias_path).unwrap();
+	let git = Git::open(&alias_path).unwrap();
+	let range_source = GitSource::Range(sha_a, sha_b);
+	let settings = Settings::default();
+
+	let changed =
+		changed_items(&root_id, &git, &range_source, &RunOptions::default())
+			.unwrap();
+	let sel = ExportSelection::new(
+		vec![alias_path.clone()],
+		Some(alias_path),
+		changed.items,
+	)
+	.unwrap();
+
+	let plan = plan_export(&sel, &settings, None).unwrap();
+	let legacy =
+		gitsrc::collect_payload(&git, &range_source, &[repo.path()], &settings)
+			.unwrap();
+	assert_eq!(plan.payload, legacy.payload);
+	assert_eq!(plan.copied_file_count, legacy.copied_file_count);
+}
+
+// ---------------------------------------------------------------------------
+// 30. Phase 2: Working, Staged, and Commit parity with gitsrc
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_working_oracle_parity_and_no_staged_working_conflict() {
+	let repo = TestRepo::new("working-parity");
+	repo.write("mod_unstaged.txt", "base mod unstaged\n");
+	repo.write("staged_mod.txt", "base staged mod\n");
+	repo.write("del_unstaged.txt", "base del unstaged\n");
+	repo.write("del_staged.txt", "base del staged\n");
+	repo.write("both_staged_and_mod.txt", "base both\n");
+	repo.commit("base");
+
+	// Working state:
+	// 1. modified unstaged
+	repo.write("mod_unstaged.txt", "worktree edit\n");
+	// 2. untracked
+	repo.write("untracked.txt", "untracked content\n");
+	// 3. staged new
+	repo.write("staged_new.txt", "staged new content\n");
+	repo.git(&["add", "staged_new.txt"]);
+	// 4. staged modified
+	repo.write("staged_mod.txt", "staged mod content\n");
+	repo.git(&["add", "staged_mod.txt"]);
+	// 5. deleted unstaged
+	fs::remove_file(repo.path().join("del_unstaged.txt")).unwrap();
+	// 6. deleted staged
+	repo.git(&["rm", "del_staged.txt"]);
+	// 7. both staged and modified on disk
+	repo.write("both_staged_and_mod.txt", "staged content\n");
+	repo.git(&["add", "both_staged_and_mod.txt"]);
+	repo.write("both_staged_and_mod.txt", "worktree further edit\n");
+
+	let settings = Settings::default();
+	let git = repo.open();
+	let source = GitSource::Working;
+
+	let changed = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	// All items must be SourceKind::Working, never mixed with Staged
+	for item in &changed.items {
+		assert_eq!(item.source, SourceKind::Working);
+	}
+
+	// Paths + change types match list_changed_paths_with order exactly
+	let expected_paths =
+		gitsrc::list_changed_paths_with(&git, &source, &RunOptions::default())
+			.unwrap();
+	let actual_paths: Vec<_> = changed
+		.items
+		.iter()
+		.map(|item| (item.relative_path.clone(), item.change_type))
+		.collect();
+	assert_eq!(actual_paths, expected_paths);
+
+	// ExportSelection succeeds without StagedWorkingConflict
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed.items,
+	)
+	.unwrap();
+
+	let plan = plan_export(&sel, &settings, None).unwrap();
+	let legacy =
+		gitsrc::collect_payload(&git, &source, &[repo.path()], &settings)
+			.unwrap();
+
+	assert_eq!(plan.payload, legacy.payload);
+	assert_eq!(plan.copied_file_count, legacy.copied_file_count);
+	assert_eq!(plan.skipped_file_size_count, legacy.skipped_file_size_count);
+	assert_eq!(
+		plan.skipped_unreadable_count,
+		legacy.skipped_unreadable_count
+	);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_working_oracle_root_through_symlink() {
+	let repo = TestRepo::new("working-symlink-root");
+	repo.write("f1.txt", "init\n");
+	repo.commit("base");
+
+	repo.write("f1.txt", "changed\n");
+	repo.write("untracked.txt", "new\n");
+
+	let alias_dir = tempfile::tempdir().unwrap();
+	let alias_path = alias_dir.path().join("repo_alias");
+	std::os::unix::fs::symlink(repo.path(), &alias_path).unwrap();
+
+	let root_id = CanonicalRootId::new(&alias_path).unwrap();
+	let git = Git::open(&alias_path).unwrap();
+	let source = GitSource::Working;
+	let settings = Settings::default();
+
+	let changed =
+		changed_items(&root_id, &git, &source, &RunOptions::default()).unwrap();
+	let sel = ExportSelection::new(
+		vec![alias_path.clone()],
+		Some(alias_path),
+		changed.items,
+	)
+	.unwrap();
+
+	let plan = plan_export(&sel, &settings, None).unwrap();
+	let legacy =
+		gitsrc::collect_payload(&git, &source, &[repo.path()], &settings)
+			.unwrap();
+	assert_eq!(plan.payload, legacy.payload);
+}
+
+#[test]
+fn test_staged_and_commit_oracle_parity() {
+	let repo = TestRepo::new("staged-commit-parity");
+	repo.write("f1.txt", "base f1\n");
+	repo.write("del.txt", "del content\n");
+	let c1 = repo.commit("base commit");
+
+	// Commit 2 with changes
+	repo.write("f1.txt", "c2 f1\n");
+	repo.write("added.txt", "added in c2\n");
+	repo.git(&["rm", "del.txt"]);
+	let c2 = repo.commit("c2 commit");
+
+	let settings = Settings::default();
+	let git = repo.open();
+
+	// Test Commit
+	let commit_source = GitSource::Commit(c2.clone());
+	let changed_commit = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&commit_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	let expected_commit_paths = gitsrc::list_changed_paths_with(
+		&git,
+		&commit_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let actual_commit_paths: Vec<_> = changed_commit
+		.items
+		.iter()
+		.map(|item| (item.relative_path.clone(), item.change_type))
+		.collect();
+	assert_eq!(actual_commit_paths, expected_commit_paths);
+
+	let sel_commit = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed_commit.items,
+	)
+	.unwrap();
+	let plan_commit = plan_export(&sel_commit, &settings, None).unwrap();
+	let legacy_commit = gitsrc::collect_payload(
+		&git,
+		&commit_source,
+		&[repo.path()],
+		&settings,
+	)
+	.unwrap();
+	assert_eq!(plan_commit.payload, legacy_commit.payload);
+
+	// Test Merge Commit
+	repo.git(&["checkout", "-b", "side", &c1]);
+	repo.write("side.txt", "side content\n");
+	let _ = repo.commit("side branch");
+
+	repo.git(&["checkout", "main"]);
+	repo.git(&["merge", "-m", "merge side", "side"]);
+	let c_merge = repo.git(&["rev-parse", "HEAD"]);
+
+	let merge_source = GitSource::Commit(c_merge);
+	let changed_merge = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&merge_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let sel_merge = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed_merge.items,
+	)
+	.unwrap();
+	let plan_merge = plan_export(&sel_merge, &settings, None).unwrap();
+	let legacy_merge =
+		gitsrc::collect_payload(&git, &merge_source, &[repo.path()], &settings)
+			.unwrap();
+	assert_eq!(plan_merge.payload, legacy_merge.payload);
+
+	// Test Staged
+	repo.write("staged_file.txt", "staged\n");
+	repo.git(&["add", "staged_file.txt"]);
+	let staged_source = GitSource::Staged;
+	let changed_staged = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&staged_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let expected_staged_paths = gitsrc::list_changed_paths_with(
+		&git,
+		&staged_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let actual_staged_paths: Vec<_> = changed_staged
+		.items
+		.iter()
+		.map(|item| (item.relative_path.clone(), item.change_type))
+		.collect();
+	assert_eq!(actual_staged_paths, expected_staged_paths);
+
+	let sel_staged = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed_staged.items,
+	)
+	.unwrap();
+	let plan_staged = plan_export(&sel_staged, &settings, None).unwrap();
+	let legacy_staged = gitsrc::collect_payload(
+		&git,
+		&staged_source,
+		&[repo.path()],
+		&settings,
+	)
+	.unwrap();
+	assert_eq!(plan_staged.payload, legacy_staged.payload);
+}
+
+// ---------------------------------------------------------------------------
+// 31. Phase 2: Range freshness and deleted content resolution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_range_freshness_revalidation_and_staleness() {
+	let repo = TestRepo::new("range-freshness");
+	repo.write("f1.txt", "a\n");
+	repo.write("del.txt", "del base\n");
+	let sha_a = repo.commit("A");
+
+	repo.write("f1.txt", "b\n");
+	repo.git(&["rm", "del.txt"]);
+	let sha_b = repo.commit("B");
+
+	let git = repo.open();
+	let range_source = GitSource::Range(sha_a, sha_b);
+	let settings = Settings::default();
+
+	let changed = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&range_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed.items,
+	)
+	.unwrap();
+
+	let plan = plan_export(&sel, &settings, None).unwrap();
+	assert!(plan.revalidate().is_ok());
+
+	// Moving HEAD makes the plan stale
+	repo.write("f2.txt", "c\n");
+	repo.commit("C");
+	assert!(matches!(
+		plan.revalidate(),
+		Err(TransferError::StaleSource { .. })
+	));
+}
+
+#[test]
+fn test_range_deletions_read_base_when_base_is_not_head() {
+	let repo = TestRepo::new("range-del-base-not-head");
+	repo.write("del.txt", "base content only in A\n");
+	let sha_a = repo.commit("A");
+
+	repo.git(&["rm", "del.txt"]);
+	let sha_b = repo.commit("B");
+
+	// Move HEAD to commit C, so HEAD != sha_a and HEAD != sha_b
+	repo.write("other.txt", "c content\n");
+	let _ = repo.commit("C");
+
+	let git = repo.open();
+	let range_source = GitSource::Range(sha_a, sha_b);
+	let settings = Settings::default();
+
+	let changed = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&range_source,
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed.items,
+	)
+	.unwrap();
+
+	let plan = plan_export(&sel, &settings, None).unwrap();
+	assert_eq!(plan.files.len(), 1);
+	assert_eq!(
+		plan.files[0].content.as_deref(),
+		Some("base content only in A\n")
+	);
+}
+
+// ---------------------------------------------------------------------------
+// 32. Phase 2: changed_items gitlinks and non-UTF-8 skip count
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_changed_items_gitlinks() {
+	let repo = TestRepo::new("changed-items-gitlink");
+	let fake_sha = "1234567890123456789012345678901234567890";
+	repo.git(&[
+		"update-index",
+		"--add",
+		"--cacheinfo",
+		"160000",
+		fake_sha,
+		"submodule_link",
+	]);
+
+	let git = repo.open();
+	let res = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&GitSource::Staged,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	assert_eq!(res.gitlinks, vec!["submodule_link"]);
+	assert!(res
+		.items
+		.iter()
+		.all(|item| item.relative_path != "submodule_link"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_changed_items_non_utf8_skipped() {
+	use std::io::Write;
+	use std::os::unix::ffi::OsStrExt;
+
+	let repo = TestRepo::new("changed-items-non-utf8");
+	repo.write("valid.txt", "valid\n");
+
+	let mut hash_cmd = Command::new("git");
+	hash_cmd
+		.args(["hash-object", "-w", "--stdin"])
+		.current_dir(repo.path())
+		.env("GIT_CONFIG_GLOBAL", &repo.cfg)
+		.stdin(std::process::Stdio::piped())
+		.stdout(std::process::Stdio::piped());
+	let mut child = hash_cmd.spawn().unwrap();
+	child
+		.stdin
+		.as_mut()
+		.unwrap()
+		.write_all(b"bad content\n")
+		.unwrap();
+	let out = child.wait_with_output().unwrap();
+	let blob_sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+	let bad_name = std::ffi::OsStr::from_bytes(b"bad_\xff.txt");
+	let mut update_cmd = Command::new("git");
+	update_cmd
+		.arg("update-index")
+		.arg("--add")
+		.arg("--cacheinfo")
+		.arg("100644")
+		.arg(&blob_sha)
+		.arg(bad_name)
+		.current_dir(repo.path())
+		.env("GIT_CONFIG_GLOBAL", &repo.cfg);
+	let update_out = update_cmd.output().unwrap();
+	assert!(update_out.status.success());
+
+	let git = repo.open();
+	let res = changed_items(
+		&repo.canonical_id(),
+		&git,
+		&GitSource::Working,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	assert!(res.skipped_non_utf8 >= 1);
+	assert!(res
+		.items
+		.iter()
+		.any(|item| item.relative_path == "valid.txt"));
+	assert!(res
+		.items
+		.iter()
+		.all(|item| !item.relative_path.starts_with("bad_")));
+}
+
+// ---------------------------------------------------------------------------
+// 33. Phase 2: selection_from_paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_selection_from_paths_comprehensive() {
+	let repo = TestRepo::new("sel-from-paths");
+	repo.write("sub/file.txt", "hello sub\n");
+	repo.write("root_file.txt", "hello root\n");
+
+	// 1. Relative path via cwd
+	let cwd = repo.path().join("sub");
+	let sel_cwd =
+		selection_from_paths(repo.path(), &cwd, &[PathBuf::from("file.txt")])
+			.unwrap();
+	assert_eq!(sel_cwd.sel.items.len(), 1);
+	assert_eq!(sel_cwd.sel.items[0].relative_path, "sub/file.txt");
+	assert_eq!(sel_cwd.skipped, 0);
+
+	// 2. Absolute path
+	let abs_path = repo.path().join("sub/file.txt");
+	let sel_abs =
+		selection_from_paths(repo.path(), repo.path(), &[abs_path]).unwrap();
+	assert_eq!(sel_abs.sel.items.len(), 1);
+	assert_eq!(sel_abs.sel.items[0].relative_path, "sub/file.txt");
+
+	// 3. Missing -> PathNotFound
+	let err_missing = selection_from_paths(
+		repo.path(),
+		repo.path(),
+		&[PathBuf::from("missing.txt")],
+	)
+	.unwrap_err();
+	assert!(matches!(err_missing, TransferError::PathNotFound(_)));
+
+	// 4. Outside root -> PathOutsideRoot
+	let err_outside_rel = selection_from_paths(
+		repo.path(),
+		repo.path(),
+		&[PathBuf::from("../outside.txt")],
+	)
+	.unwrap_err();
+	assert!(matches!(err_outside_rel, TransferError::PathOutsideRoot(_)));
+
+	let other_dir = tempfile::tempdir().unwrap();
+	let err_outside_abs = selection_from_paths(
+		repo.path(),
+		repo.path(),
+		&[other_dir.path().join("other.txt")],
+	)
+	.unwrap_err();
+	assert!(matches!(err_outside_abs, TransferError::PathOutsideRoot(_)));
+
+	// 5. Dir stays a folder item
+	let sel_dir =
+		selection_from_paths(repo.path(), repo.path(), &[PathBuf::from("sub")])
+			.unwrap();
+	assert_eq!(sel_dir.sel.items.len(), 1);
+	assert_eq!(sel_dir.sel.items[0].relative_path, "sub");
+
+	// 6. Duplicates collapse
+	let sel_dup = selection_from_paths(
+		repo.path(),
+		repo.path(),
+		&[
+			PathBuf::from("root_file.txt"),
+			PathBuf::from("root_file.txt"),
+		],
+	)
+	.unwrap();
+	assert_eq!(sel_dup.sel.items.len(), 1);
+
+	// 7. Empty result -> EmptySelection
+	let err_empty =
+		selection_from_paths(repo.path(), repo.path(), &[]).unwrap_err();
+	assert!(matches!(err_empty, TransferError::EmptySelection));
+}
+
+#[test]
+fn test_selection_from_paths_root_dot_and_nested_repo_pruning() {
+	let repo = TestRepo::new("sel-root-dot");
+	repo.write("f1.txt", "f1");
+	repo.write("dir/f2.txt", "f2");
+
+	// Nested repo
+	let nested = repo.path().join("nested");
+	fs::create_dir_all(&nested).unwrap();
+	let nested_git = nested.join(".git");
+	fs::create_dir_all(&nested_git).unwrap();
+	fs::write(nested.join("nested_file.txt"), "nested").unwrap();
+
+	// Test "."
+	let res_dot =
+		selection_from_paths(repo.path(), repo.path(), &[PathBuf::from(".")])
+			.unwrap();
+
+	let expanded_dot =
+		expand_folder_items(res_dot.sel, 100, &CancelToken::new()).unwrap();
+	let rels: Vec<_> = expanded_dot
+		.sel
+		.items
+		.iter()
+		.map(|item| item.relative_path.as_str())
+		.collect();
+
+	assert!(rels.contains(&"f1.txt"));
+	assert!(rels.contains(&"dir/f2.txt"));
+	assert!(rels.iter().all(|r| !r.starts_with(".git")));
+	assert!(rels.iter().all(|r| !r.starts_with("nested")));
+
+	// Test root path itself
+	let res_root = selection_from_paths(
+		repo.path(),
+		repo.path(),
+		&[repo.path().to_path_buf()],
+	)
+	.unwrap();
+
+	let expanded_root =
+		expand_folder_items(res_root.sel, 100, &CancelToken::new()).unwrap();
+	let rels_root: Vec<_> = expanded_root
+		.sel
+		.items
+		.iter()
+		.map(|item| item.relative_path.as_str())
+		.collect();
+
+	assert!(rels_root.contains(&"f1.txt"));
+	assert!(rels_root.contains(&"dir/f2.txt"));
+	assert!(rels_root.iter().all(|r| !r.starts_with(".git")));
+	assert!(rels_root.iter().all(|r| !r.starts_with("nested")));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_selection_from_paths_symlinks_and_fifo() {
+	let repo = TestRepo::new("sel-symlinks");
+	repo.write("target.txt", "target\n");
+
+	// In-root symlink to in-root file
+	std::os::unix::fs::symlink(
+		repo.path().join("target.txt"),
+		repo.path().join("in_root_link.txt"),
+	)
+	.unwrap();
+
+	// Out-of-root symlink
+	let outside = tempfile::tempdir().unwrap();
+	let outside_file = outside.path().join("outside.txt");
+	fs::write(&outside_file, "outside").unwrap();
+	std::os::unix::fs::symlink(
+		&outside_file,
+		repo.path().join("outside_link.txt"),
+	)
+	.unwrap();
+
+	let res = selection_from_paths(
+		repo.path(),
+		repo.path(),
+		&[
+			PathBuf::from("in_root_link.txt"),
+			PathBuf::from("outside_link.txt"),
+		],
+	)
+	.unwrap();
+
+	assert_eq!(res.sel.items.len(), 1);
+	assert_eq!(res.sel.items[0].relative_path, "in_root_link.txt");
+	assert_eq!(res.skipped, 1);
+
+	// FIFO skipped at root level with timeout pattern
+	let fifo_path = repo.path().join("fifo_pipe");
+	let status = Command::new("mkfifo").arg(&fifo_path).status();
+	match status {
+		Ok(s) if s.success() => {}
+		_ => {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"mkfifo command failed or unavailable"
+			);
+			return;
+		}
+	}
+
+	let (tx, rx) = std::sync::mpsc::channel();
+	let repo_path = repo.path().to_path_buf();
+	std::thread::spawn(move || {
+		let res =
+			selection_from_paths(&repo_path, &repo_path, &[PathBuf::from(".")]);
+		let _ = tx.send(res);
+	});
+
+	let path_sel = rx
+		.recv_timeout(std::time::Duration::from_secs(5))
+		.expect("selection_from_paths timed out on FIFO")
+		.expect("selection_from_paths failed");
+
+	assert!(path_sel
+		.sel
+		.items
+		.iter()
+		.all(|item| item.relative_path != "fifo_pipe"));
+	assert!(path_sel.skipped >= 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_selection_from_paths_root_through_symlink() {
+	let repo = TestRepo::new("sel-symlink-root");
+	repo.write("file.txt", "content\n");
+
+	let alias_dir = tempfile::tempdir().unwrap();
+	let alias_path = alias_dir.path().join("repo_alias");
+	std::os::unix::fs::symlink(repo.path(), &alias_path).unwrap();
+
+	let res = selection_from_paths(
+		&alias_path,
+		&alias_path,
+		&[PathBuf::from("file.txt")],
+	)
+	.unwrap();
+
+	assert_eq!(res.sel.roots.len(), 1);
+	assert_eq!(res.sel.roots[0], repo.canonical_id());
+	assert_eq!(res.sel.primary_root, Some(repo.canonical_id()));
+	assert_eq!(res.sel.items.len(), 1);
+	assert_eq!(res.sel.items[0].relative_path, "file.txt");
+}
+
+// ---------------------------------------------------------------------------
+// 34. Phase 2: from_restore_base equivalence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_from_restore_base_equivalence() {
+	let repo = TestRepo::new("from-restore-base");
+	let primary = repo.canonical_id();
+
+	// 1. Strip
+	let strip_suggestion = RestoreBaseSuggestion {
+		base: RestoreBase::Strip {
+			segment: "pkg".to_string(),
+		},
+		label: "strip pkg/".to_string(),
+		matched: 2,
+		total: 2,
+	};
+	let strip_mapping =
+		ImportMapping::from_restore_base(&strip_suggestion, primary.clone());
+
+	let entries_strip = [
+		("pkg/src/lib.rs", "fn lib() {}"),
+		("pkg/main.rs", "fn main() {}"),
+		("other/doc.md", "# Doc"),
+		("README.md", "# Readme"),
+	];
+	let mut payload_strip = String::new();
+	for (p, c) in entries_strip {
+		payload_strip.push_str(&format!("file: {p}\n{c}\n"));
+	}
+
+	let plan_strip = plan_import_with(
+		&payload_strip,
+		"file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&strip_mapping,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	for (p, c) in entries_strip {
+		let expected_rel =
+			restore::apply_restore_base(&strip_suggestion.base, p);
+		let parsed = format::ParsedEntry {
+			path: expected_rel.clone(),
+			content: c.to_string(),
+			change_types: std::collections::BTreeSet::from([ChangeType::New]),
+		};
+		let expected_plan = restore::plan_restore(&[repo.path()], &[parsed]);
+		let actual_op = plan_strip
+			.create_operations()
+			.iter()
+			.find(|op| op.relative_path == expected_rel)
+			.unwrap_or_else(|| panic!("op found for {expected_rel}"));
+		assert_eq!(
+			actual_op.relative_path,
+			expected_plan.create_operations[0].relative_path
+		);
+	}
+
+	// 2. Add
+	let add_suggestion = RestoreBaseSuggestion {
+		base: RestoreBase::Add {
+			prefix: "nested".to_string(),
+		},
+		label: "add nested/".to_string(),
+		matched: 2,
+		total: 2,
+	};
+	let add_mapping =
+		ImportMapping::from_restore_base(&add_suggestion, primary);
+
+	let entries_add =
+		[("src/lib.rs", "fn lib() {}"), ("README.md", "# Readme")];
+	let mut payload_add = String::new();
+	for (p, c) in entries_add {
+		payload_add.push_str(&format!("file: {p}\n{c}\n"));
+	}
+
+	let plan_add = plan_import_with(
+		&payload_add,
+		"file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&add_mapping,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	for (p, c) in entries_add {
+		let expected_rel = restore::apply_restore_base(&add_suggestion.base, p);
+		let parsed = format::ParsedEntry {
+			path: expected_rel.clone(),
+			content: c.to_string(),
+			change_types: std::collections::BTreeSet::from([ChangeType::New]),
+		};
+		let expected_plan = restore::plan_restore(&[repo.path()], &[parsed]);
+		let actual_op = plan_add
+			.create_operations()
+			.iter()
+			.find(|op| op.relative_path == expected_rel)
+			.unwrap_or_else(|| panic!("op found for {expected_rel}"));
+		assert_eq!(
+			actual_op.relative_path,
+			expected_plan.create_operations[0].relative_path
+		);
+	}
+}
+
+#[test]
+#[cfg(unix)]
+fn test_from_restore_base_root_through_symlink() {
+	let repo = TestRepo::new("restore-base-symlink");
+	let alias_dir = tempfile::tempdir().unwrap();
+	let alias_path = alias_dir.path().join("repo_alias");
+	std::os::unix::fs::symlink(repo.path(), &alias_path).unwrap();
+
+	let canonical_primary = CanonicalRootId::new(&alias_path).unwrap();
+	let suggestion = RestoreBaseSuggestion {
+		base: RestoreBase::Strip {
+			segment: "pkg".to_string(),
+		},
+		label: "strip pkg/".to_string(),
+		matched: 1,
+		total: 1,
+	};
+	let mapping =
+		ImportMapping::from_restore_base(&suggestion, canonical_primary);
+
+	let payload = "file: pkg/a.txt\nhello\n";
+	let plan = plan_import_with(
+		payload,
+		"file: $FILE_PATH",
+		&[alias_path],
+		&mapping,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	assert_eq!(plan.create_operations().len(), 1);
+	assert_eq!(plan.create_operations()[0].relative_path, "a.txt");
+	assert_eq!(
+		plan.create_operations()[0].root_path,
+		repo.canonical_id().path()
+	);
+}
+
+// ---------------------------------------------------------------------------
+// 35. Phase 2: CLIPBOARD_PAYLOAD_MAX constant is 32 MiB
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_clipboard_payload_max_is_32_mib() {
+	assert_eq!(CLIPBOARD_PAYLOAD_MAX, 32 * 1024 * 1024);
 }

@@ -35,7 +35,9 @@ pub mod preview;
 
 /// Shared retained preview tier: UI, one active paste input, one latest
 /// captured request, and one result mailbox. Builder scratch is temporary.
-pub const MAX_RETAINED_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
+/// The core copy cap must not exceed this budget, so it is the same number.
+pub const MAX_RETAINED_PREVIEW_BYTES: usize =
+	snip_core::transfer::CLIPBOARD_PAYLOAD_MAX;
 // Arc's two counters plus conservative alignment padding for these types.
 const ARC_ALLOWANCE: usize = 3 * size_of::<usize>();
 

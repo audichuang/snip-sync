@@ -155,6 +155,15 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 2 — core 補齊 CLI 需要的入口
 
+狀態:已完成(core API 與測試;CLI 尚未切換)
+
+最終 API 簽名與定義:
+- `selection_from_paths(root: &Path, cwd: &Path, paths: &[PathBuf]) -> Result<PathSelection, TransferError>`
+- `changed_items(root: &CanonicalRootId, git: &Git, source: &gitsrc::GitSource, opts: &RunOptions) -> Result<ChangedItems, TransferError>`
+- `SourceKind::Range { base: String, tip: String }`
+- `ImportMapping::from_restore_base(suggestion: &RestoreBaseSuggestion, primary: CanonicalRootId) -> Self` 與 `ImportMapping.primary_prefix: Option<String>`
+- `CLIPBOARD_PAYLOAD_MAX: usize = 32 * 1024 * 1024`
+
 - `transfer::selection_from_paths(root, paths: &[PathBuf]) -> Result<(ExportSelection, Skipped), TransferError>`:把 cwd 相對路徑轉成 root 相對 item。**必須處理 `snip copy .`**:root 本身不是可匯出 item,而 `.git` 修剪會把 repo root 整個丟掉,所以 root 要當成「展開 root 的資料夾 item」特判。
 - 依 D3:`SourceKind::Range { base, tip }`,刪除檔讀 base;在 `transfer_planning.rs` 用舊 `collect_payload(GitSource::Range)` 當 oracle 做位元組比對。
 - 依 D4:`ImportMapping::from_restore_base`。

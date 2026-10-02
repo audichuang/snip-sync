@@ -36,7 +36,7 @@ pub(crate) fn arm_cancel(slot: &mut Option<CancelToken>) -> CancelToken {
 
 /// The native file-mode file cap. ClipCode's 30 suits a handful of picked
 /// files; a Project folder brings every file under it, so the native app
-/// (which has no settings UI) caps at this and lets the 64 MiB payload cap
+/// (which has no settings UI) caps at this and lets the 32 MiB payload cap
 /// bound the bytes. Hitting either is reported, never silent.
 const NATIVE_FILE_COUNT_LIMIT: usize = 10_000;
 
@@ -806,7 +806,7 @@ impl PreparedSelection {
 			SourceKind::Working | SourceKind::Unstaged | SourceKind::Staged => {
 				!replace_git_group
 			}
-			SourceKind::Commit { .. } => true,
+			SourceKind::Commit { .. } | SourceKind::Range { .. } => true,
 		});
 		let other = self
 			.retained_bytes()
@@ -4187,6 +4187,11 @@ impl WorkbenchModel {
 				let short = &rev[..7.min(rev.len())];
 				format!("commit@{short}")
 			}
+			SourceKind::Range { base, tip } => {
+				let b = &base[..7.min(base.len())];
+				let t = &tip[..7.min(tip.len())];
+				format!("range@{b}..{t}")
+			}
 		}
 	}
 
@@ -4618,6 +4623,11 @@ impl WorkbenchModel {
 					format!("commit@{short}")
 				}
 			}
+			SourceKind::Range { base, tip } => {
+				let b = &base[..7.min(base.len())];
+				let t = &tip[..7.min(tip.len())];
+				format!("range@{b}..{t}")
+			}
 		})
 	}
 
@@ -4879,7 +4889,7 @@ impl WorkbenchModel {
 						let plan = plan_export_with(
 							export_sel,
 							&settings,
-							Some(RunOptions::INTERACTIVE_MAX_STDOUT),
+							Some(snip_core::transfer::CLIPBOARD_PAYLOAD_MAX),
 							&opts,
 						)
 						.map_err(|e| {
@@ -5019,7 +5029,7 @@ impl WorkbenchModel {
 							&tip_sha,
 							&selected,
 							&opts,
-							RunOptions::INTERACTIVE_MAX_STDOUT,
+							snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 						)
 						.map_err(|e| e.to_string())?;
 						let n_commits = exported.payload.commits.len();
@@ -5668,6 +5678,9 @@ fn source_order(source: &SourceKind) -> (&'static str, &str) {
 		SourceKind::Commit { rev } => {
 			("commit@", rev.get(..7).unwrap_or(rev.as_str()))
 		}
+		SourceKind::Range { tip, .. } => {
+			("range@", tip.get(..7).unwrap_or(tip.as_str()))
+		}
 	}
 }
 
@@ -5863,6 +5876,10 @@ fn read_preview(
 		SourceKind::Commit { rev } => (
 			GitSource::Commit(rev.clone()),
 			PreviewSource::CommitFile { sha: rev.clone() },
+		),
+		SourceKind::Range { base, tip } => (
+			GitSource::Range(base.clone(), tip.clone()),
+			PreviewSource::CommitFile { sha: tip.clone() },
 		),
 		SourceKind::File => (GitSource::Working, PreviewSource::WorkingFile),
 	};

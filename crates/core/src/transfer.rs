@@ -40,9 +40,13 @@ use crate::restore::{
 use crate::settings::Settings;
 use crate::stats::{payload_stats, PayloadStats};
 
+mod changes;
 mod select;
 
-pub use select::{expand_folder_items, FolderExpansion};
+pub use changes::{changed_items, ChangedItems};
+pub use select::{
+	expand_folder_items, selection_from_paths, FolderExpansion, PathSelection,
+};
 
 /// A stable canonical identifier for an existing, resolved workspace or repository root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -105,6 +109,8 @@ pub enum SourceKind {
 	Staged,
 	/// Git commit change.
 	Commit { rev: String },
+	/// Git revision range comparison (endpoint comparison of base and tip).
+	Range { base: String, tip: String },
 }
 
 /// An individual item in an export selection.
@@ -162,6 +168,10 @@ pub enum TransferError {
 	UnsafePath(String),
 	#[error("special file '{0}' is not a regular file and cannot be exported")]
 	SpecialFile(String),
+	#[error("path not found: '{}'", .0.display())]
+	PathNotFound(PathBuf),
+	#[error("path '{}' is outside root", .0.display())]
+	PathOutsideRoot(PathBuf),
 	#[error("unknown root: '{}' was not declared in selection or destination roots", .0.display())]
 	UnknownRoot(PathBuf),
 	#[error(
@@ -297,6 +307,18 @@ impl SourceFreshnessSnapshot {
 						e.insert(oid);
 					}
 				}
+				SourceKind::Range { base, tip } => {
+					for rev in [base, tip] {
+						let key = (item.root.clone(), rev.clone());
+						if let std::collections::hash_map::Entry::Vacant(e) =
+							frozen_commits.entry(key)
+						{
+							let git = Git::open_with(item.root.path(), &opts)?;
+							let oid = git.resolve_commit_with(rev, &opts)?;
+							e.insert(oid);
+						}
+					}
+				}
 				SourceKind::Staged => {}
 			}
 		}
@@ -370,6 +392,12 @@ impl ExportPlan {
 	}
 }
 
+/// Single copy cap for CLI and GUI (32 MiB).
+///
+/// Guaranteed to not exceed GUI paste preview budget; exceeding the cap
+/// is a strict error, never silent truncation.
+pub const CLIPBOARD_PAYLOAD_MAX: usize = 32 * 1024 * 1024;
+
 /// Explicit destination mapping for a specific entry path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryMapping {
@@ -381,6 +409,8 @@ pub struct EntryMapping {
 #[derive(Debug, Clone, Default)]
 pub struct ImportMapping {
 	pub primary_destination: Option<CanonicalRootId>,
+	/// Nest every entry that lands in the primary destination under this directory.
+	pub primary_prefix: Option<String>,
 	pub prefix_destinations: HashMap<String, CanonicalRootId>,
 	pub entry_destinations: HashMap<String, EntryMapping>,
 	pub blocked_prefixes: HashSet<String>,
@@ -395,6 +425,24 @@ impl ImportMapping {
 		Self {
 			primary_destination: Some(root),
 			..Default::default()
+		}
+	}
+
+	pub fn from_restore_base(
+		suggestion: &restore::RestoreBaseSuggestion,
+		primary: CanonicalRootId,
+	) -> Self {
+		match &suggestion.base {
+			restore::RestoreBase::Strip { segment } => {
+				let mut mapping = Self::with_primary(primary.clone());
+				mapping.map_prefix(segment, primary);
+				mapping
+			}
+			restore::RestoreBase::Add { prefix } => Self {
+				primary_destination: Some(primary),
+				primary_prefix: Some(prefix.clone()),
+				..Default::default()
+			},
 		}
 	}
 
@@ -1505,18 +1553,39 @@ pub fn plan_export_with(
 	// Resolved before any cat-file session so this thread does not nest Git.
 	let mut parents: HashMap<String, Vec<String>> = HashMap::new();
 	for item in &selection.items {
-		if let SourceKind::Commit { rev } = &item.source {
-			let key = (item.root.clone(), rev.clone());
-			if let std::collections::hash_map::Entry::Vacant(e) =
-				frozen_commits.entry(key)
-			{
-				let git = gits.get(&item.root).ok_or_else(|| {
-					TransferError::UnknownRoot(item.root.path().to_path_buf())
-				})?;
-				let oid = git.resolve_commit_with(rev, opts)?;
-				parents.insert(oid.clone(), git.parents_with(&oid, opts)?);
-				e.insert(oid);
+		match &item.source {
+			SourceKind::Commit { rev } => {
+				let key = (item.root.clone(), rev.clone());
+				if let std::collections::hash_map::Entry::Vacant(e) =
+					frozen_commits.entry(key)
+				{
+					let git = gits.get(&item.root).ok_or_else(|| {
+						TransferError::UnknownRoot(
+							item.root.path().to_path_buf(),
+						)
+					})?;
+					let oid = git.resolve_commit_with(rev, opts)?;
+					parents.insert(oid.clone(), git.parents_with(&oid, opts)?);
+					e.insert(oid);
+				}
 			}
+			SourceKind::Range { base, tip } => {
+				for rev in [base, tip] {
+					let key = (item.root.clone(), rev.clone());
+					if let std::collections::hash_map::Entry::Vacant(e) =
+						frozen_commits.entry(key)
+					{
+						let git = gits.get(&item.root).ok_or_else(|| {
+							TransferError::UnknownRoot(
+								item.root.path().to_path_buf(),
+							)
+						})?;
+						let oid = git.resolve_commit_with(rev, opts)?;
+						e.insert(oid);
+					}
+				}
+			}
+			_ => {}
 		}
 	}
 	let mut blobs = BlobReader::blobs_only(opts);
@@ -1528,13 +1597,15 @@ pub fn plan_export_with(
 			.clone()
 			.or_else(|| selection.roots.first().cloned());
 
-		// Commit selections begin with fallback = true (omitting empty wrappers);
+		// Commit and range selections begin with fallback = true (omitting empty wrappers);
 		// Staged and Deleted only trigger fallback once an included entry is admitted.
-		let is_commit = selection
-			.items
-			.iter()
-			.any(|item| matches!(item.source, SourceKind::Commit { .. }));
-		let mut fallback = is_commit;
+		let is_graph = selection.items.iter().any(|item| {
+			matches!(
+				item.source,
+				SourceKind::Commit { .. } | SourceKind::Range { .. }
+			)
+		});
+		let mut fallback = is_graph;
 
 		let default_source_root = if selection.roots.len() == 1 {
 			paths::source_root_name(&[selection.roots[0].path()])
@@ -1693,6 +1764,44 @@ pub fn plan_export_with(
 						deleted_read(content, cap, &wire_path, &b)?
 					} else {
 						let spec = format!("{frozen_oid}:{rel}");
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read(git, &spec, cap)?;
+						blob_content(read, &spec, cap, &wire_path, &b)?.ok_or(
+							TransferError::Git(GitError::InvalidRevision(spec)),
+						)?
+					};
+					(text, reason, None)
+				}
+				SourceKind::Range { base, tip } => {
+					let frozen_base = frozen_commits
+						.get(&(item.root.clone(), base.clone()))
+						.ok_or_else(|| {
+							TransferError::Git(GitError::InvalidRevision(
+								base.clone(),
+							))
+						})?;
+					let frozen_tip = frozen_commits
+						.get(&(item.root.clone(), tip.clone()))
+						.ok_or_else(|| {
+							TransferError::Git(GitError::InvalidRevision(
+								tip.clone(),
+							))
+						})?;
+					let git = gits.get(&item.root).ok_or_else(|| {
+						TransferError::UnknownRoot(
+							item.root.path().to_path_buf(),
+						)
+					})?;
+					let (text, reason) = if deleted {
+						let spec = format!("{frozen_base}:{rel}");
+						let b = blob_budget(true);
+						let cap = b.cap();
+						let content =
+							blobs.deleted_file_content(git, [spec], cap)?;
+						deleted_read(content, cap, &wire_path, &b)?
+					} else {
+						let spec = format!("{frozen_tip}:{rel}");
 						let b = blob_budget(false);
 						let cap = b.cap();
 						let read = blobs.read(git, &spec, cap)?;
@@ -1950,7 +2059,7 @@ pub fn plan_export_with(
 			files.push(payload_file);
 		}
 
-		let final_source_root = if is_commit && files.is_empty() {
+		let final_source_root = if is_graph && files.is_empty() {
 			None
 		} else {
 			default_source_root
@@ -2101,35 +2210,32 @@ pub fn plan_import_with(
 
 	for entry in entries {
 		cancelled_err(opts, "plan-import")?;
-		let (target_root, rel_path) =
-			if let Some(em) = mapping.entry_destinations.get(&entry.path) {
-				let rel =
-					em.relative_path.as_deref().unwrap_or(entry.path.as_str());
-				(&em.root, rel)
-			} else if let Some((prefix, rest)) = entry.path.split_once('/') {
-				if mapping.blocked_prefixes.contains(prefix) {
-					skipped_operations.push(SkippedOperation {
-						raw_path: entry.path.clone(),
-						relative_path: None,
-						reason: SkipReason::UnresolvedPath,
-					});
-					continue;
-				}
-				if let Some(dest) = mapping.prefix_destinations.get(prefix) {
-					// Prefix consumed EXACTLY ONCE
-					(dest, rest)
-				} else if let Some(ref primary) = mapping.primary_destination {
-					(primary, entry.path.as_str())
-				} else {
-					skipped_operations.push(SkippedOperation {
-						raw_path: entry.path.clone(),
-						relative_path: None,
-						reason: SkipReason::UnresolvedPath,
-					});
-					continue;
-				}
+		let (target_root, rel_path) = if let Some(em) =
+			mapping.entry_destinations.get(&entry.path)
+		{
+			let rel =
+				em.relative_path.as_deref().unwrap_or(entry.path.as_str());
+			(&em.root, std::borrow::Cow::Borrowed(rel))
+		} else if let Some((prefix, rest)) = entry.path.split_once('/') {
+			if mapping.blocked_prefixes.contains(prefix) {
+				skipped_operations.push(SkippedOperation {
+					raw_path: entry.path.clone(),
+					relative_path: None,
+					reason: SkipReason::UnresolvedPath,
+				});
+				continue;
+			}
+			if let Some(dest) = mapping.prefix_destinations.get(prefix) {
+				// Prefix consumed EXACTLY ONCE
+				(dest, std::borrow::Cow::Borrowed(rest))
 			} else if let Some(ref primary) = mapping.primary_destination {
-				(primary, entry.path.as_str())
+				let rel = match &mapping.primary_prefix {
+					Some(p) => {
+						std::borrow::Cow::Owned(format!("{p}/{}", entry.path))
+					}
+					None => std::borrow::Cow::Borrowed(entry.path.as_str()),
+				};
+				(primary, rel)
 			} else {
 				skipped_operations.push(SkippedOperation {
 					raw_path: entry.path.clone(),
@@ -2137,9 +2243,25 @@ pub fn plan_import_with(
 					reason: SkipReason::UnresolvedPath,
 				});
 				continue;
+			}
+		} else if let Some(ref primary) = mapping.primary_destination {
+			let rel = match &mapping.primary_prefix {
+				Some(p) => {
+					std::borrow::Cow::Owned(format!("{p}/{}", entry.path))
+				}
+				None => std::borrow::Cow::Borrowed(entry.path.as_str()),
 			};
+			(primary, rel)
+		} else {
+			skipped_operations.push(SkippedOperation {
+				raw_path: entry.path.clone(),
+				relative_path: None,
+				reason: SkipReason::UnresolvedPath,
+			});
+			continue;
+		};
 
-		let Some(sanitized) = sanitize_relative_path(rel_path) else {
+		let Some(sanitized) = sanitize_relative_path(&rel_path) else {
 			skipped_operations.push(SkippedOperation {
 				raw_path: entry.path.clone(),
 				relative_path: None,
