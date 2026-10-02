@@ -22,25 +22,18 @@ pub fn tilde(path: &Path) -> String {
 	}
 }
 
-/// Where the list lives. `SNIP_CONFIG_DIR` overrides it; an e2e run without
-/// the override never reads or writes the user's list.
-fn file() -> Option<PathBuf> {
-	let dir = if let Some(dir) = std::env::var_os("SNIP_CONFIG_DIR") {
-		PathBuf::from(dir)
-	} else if crate::e2e_on() {
+/// The app's config folder. `SNIP_CONFIG_DIR` overrides it; an e2e run
+/// without the override never reads or writes the user's files.
+pub fn config_dir() -> Option<PathBuf> {
+	if std::env::var_os("SNIP_CONFIG_DIR").is_none() && crate::e2e_on() {
 		return None;
-	} else if cfg!(target_os = "macos") {
-		// The Homebrew cask's `zap` removes this folder.
-		home()?.join("Library/Application Support/com.audichuang.snip-sync")
-	} else if cfg!(windows) {
-		PathBuf::from(std::env::var_os("APPDATA")?).join("snip-sync")
-	} else {
-		std::env::var_os("XDG_CONFIG_HOME")
-			.map(PathBuf::from)
-			.or_else(|| Some(home()?.join(".config")))?
-			.join("snip-sync")
-	};
-	Some(dir.join("recent-workspaces.json"))
+	}
+	snip_remote::default_config_dir()
+}
+
+/// Where the list lives.
+fn file() -> Option<PathBuf> {
+	Some(config_dir()?.join("recent-workspaces.json"))
 }
 
 /// Remembered workspaces, newest first.

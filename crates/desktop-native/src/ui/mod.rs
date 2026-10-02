@@ -52,6 +52,7 @@ mod left;
 mod log;
 mod log_view;
 mod paste;
+mod remote;
 
 use changes::*;
 pub(crate) use changes::{

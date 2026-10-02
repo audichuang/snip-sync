@@ -11,7 +11,10 @@ impl WorkbenchModel {
 	) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
-		let label = if self.workspace_open {
+		let remote = self.remote.session.as_ref();
+		let label = if let Some(session) = remote {
+			session.label()
+		} else if self.workspace_open {
 			self.workspace_root
 				.file_name()
 				.map(|n| n.to_string_lossy().to_string())
@@ -20,7 +23,9 @@ impl WorkbenchModel {
 		} else {
 			t("workspace_none", loc).to_string()
 		};
-		let tip_text = if self.workspace_open {
+		let tip_text = if let Some(session) = remote {
+			session.tip()
+		} else if self.workspace_open {
 			self.workspace_root.display().to_string()
 		} else {
 			t("workspace_none", loc).to_string()
@@ -171,6 +176,8 @@ impl WorkbenchModel {
 					)
 					.children(recent)
 			})
+			.child(sep())
+			.children(self.render_remote_section(cx))
 			.child(sep())
 			.child(
 				menu_row("btn-close-workspace", 61)

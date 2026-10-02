@@ -488,7 +488,10 @@ pub fn history_query_with(
 	run_log(git, &args, None, limit, opts)
 }
 
-fn inside(root: &Path, relative: &str) -> io::Result<PathBuf> {
+/// `relative` under `root`, resolved: a relative path made only of normal
+/// components whose real path (symlinks followed) stays inside the real
+/// `root`. An empty `relative` is `root` itself.
+pub fn inside(root: &Path, relative: &str) -> io::Result<PathBuf> {
 	let rel = Path::new(relative);
 	if rel.is_absolute()
 		|| rel

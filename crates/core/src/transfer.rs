@@ -40,6 +40,16 @@ use crate::restore::{
 use crate::settings::Settings;
 use crate::stats::{payload_stats, PayloadStats};
 
+mod changes;
+mod select;
+
+pub use changes::{changed_items, ChangedItems};
+pub use select::{
+	expand_folder_items, expand_folder_items_in_input_order,
+	plan_export_expanding, selection_from_paths, FolderExpansion,
+	PathSelection,
+};
+
 /// A stable canonical identifier for an existing, resolved workspace or repository root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CanonicalRootId(PathBuf);
@@ -101,6 +111,8 @@ pub enum SourceKind {
 	Staged,
 	/// Git commit change.
 	Commit { rev: String },
+	/// Git revision range comparison (endpoint comparison of base and tip).
+	Range { base: String, tip: String },
 }
 
 /// An individual item in an export selection.
@@ -110,6 +122,7 @@ pub struct ExportItem {
 	pub relative_path: String,
 	pub source: SourceKind,
 	pub change_type: Option<ChangeType>,
+	pub gitlink: bool,
 }
 
 /// An export selection spanning one or more verified canonical roots.
@@ -118,6 +131,11 @@ pub struct ExportSelection {
 	pub roots: Vec<CanonicalRootId>,
 	pub primary_root: Option<CanonicalRootId>,
 	pub items: Vec<ExportItem>,
+	pub source_root: Option<String>,
+	pub spelled_root: Option<PathBuf>,
+	/// Base used to spell the path that Commit/Range items are filter-matched against;
+	/// do not reuse spelled_root (that is the root's own spelling and feeds only the File branch).
+	pub filter_root: Option<PathBuf>,
 }
 
 impl ExportSelection {
@@ -144,9 +162,29 @@ impl ExportSelection {
 			roots: canonical_roots,
 			primary_root: primary,
 			items,
+			source_root: None,
+			spelled_root: None,
+			filter_root: None,
 		};
 		validate_export_selection(&sel)?;
 		Ok(sel)
+	}
+
+	pub fn with_source_root(mut self, source_root: Option<String>) -> Self {
+		self.source_root = source_root;
+		self
+	}
+
+	pub fn with_spelled_root(mut self, spelled_root: Option<PathBuf>) -> Self {
+		self.spelled_root = spelled_root;
+		self
+	}
+
+	/// Base used to spell the path that Commit/Range items are filter-matched against;
+	/// do not reuse spelled_root (that is the root's own spelling and feeds only the File branch).
+	pub fn with_filter_root(mut self, filter_root: Option<PathBuf>) -> Self {
+		self.filter_root = filter_root;
+		self
 	}
 }
 
@@ -158,6 +196,10 @@ pub enum TransferError {
 	UnsafePath(String),
 	#[error("special file '{0}' is not a regular file and cannot be exported")]
 	SpecialFile(String),
+	#[error("path not found: '{}'", .0.display())]
+	PathNotFound(PathBuf),
+	#[error("path '{}' is outside root", .0.display())]
+	PathOutsideRoot(PathBuf),
 	#[error("unknown root: '{}' was not declared in selection or destination roots", .0.display())]
 	UnknownRoot(PathBuf),
 	#[error(
@@ -272,6 +314,14 @@ impl SourceFreshnessSnapshot {
 		let mut working_files = HashMap::new();
 
 		for item in &selection.items {
+			if item.gitlink
+				&& item.change_type != Some(ChangeType::Deleted)
+				&& matches!(
+					item.source,
+					SourceKind::Working | SourceKind::Unstaged
+				) {
+				continue;
+			}
 			match &item.source {
 				SourceKind::Working
 				| SourceKind::Unstaged
@@ -291,6 +341,18 @@ impl SourceFreshnessSnapshot {
 						let git = Git::open_with(item.root.path(), &opts)?;
 						let oid = git.resolve_commit_with(rev, &opts)?;
 						e.insert(oid);
+					}
+				}
+				SourceKind::Range { base, tip } => {
+					for rev in [base, tip] {
+						let key = (item.root.clone(), rev.clone());
+						if let std::collections::hash_map::Entry::Vacant(e) =
+							frozen_commits.entry(key)
+						{
+							let git = Git::open_with(item.root.path(), &opts)?;
+							let oid = git.resolve_commit_with(rev, &opts)?;
+							e.insert(oid);
+						}
 					}
 				}
 				SourceKind::Staged => {}
@@ -366,6 +428,12 @@ impl ExportPlan {
 	}
 }
 
+/// Single copy cap for CLI and GUI (32 MiB).
+///
+/// Guaranteed to not exceed GUI paste preview budget; exceeding the cap
+/// is a strict error, never silent truncation.
+pub const CLIPBOARD_PAYLOAD_MAX: usize = 32 * 1024 * 1024;
+
 /// Explicit destination mapping for a specific entry path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryMapping {
@@ -377,6 +445,8 @@ pub struct EntryMapping {
 #[derive(Debug, Clone, Default)]
 pub struct ImportMapping {
 	pub primary_destination: Option<CanonicalRootId>,
+	/// Nest every entry that lands in the primary destination under this directory (applies to relative entries only).
+	pub primary_prefix: Option<String>,
 	pub prefix_destinations: HashMap<String, CanonicalRootId>,
 	pub entry_destinations: HashMap<String, EntryMapping>,
 	pub blocked_prefixes: HashSet<String>,
@@ -391,6 +461,24 @@ impl ImportMapping {
 		Self {
 			primary_destination: Some(root),
 			..Default::default()
+		}
+	}
+
+	pub fn from_restore_base(
+		suggestion: &restore::RestoreBaseSuggestion,
+		primary: CanonicalRootId,
+	) -> Self {
+		match &suggestion.base {
+			restore::RestoreBase::Strip { segment } => {
+				let mut mapping = Self::with_primary(primary.clone());
+				mapping.map_prefix(segment, primary);
+				mapping
+			}
+			restore::RestoreBase::Add { prefix } => Self {
+				primary_destination: Some(primary),
+				primary_prefix: Some(prefix.clone()),
+				..Default::default()
+			},
 		}
 	}
 
@@ -1165,6 +1253,148 @@ fn canonical_target_identity(path: &Path) -> String {
 	paths::path_key(&full.to_string_lossy())
 }
 
+pub(crate) fn fs_is_case_insensitive(root: &Path) -> bool {
+	probe_fs_case_insensitive(root)
+		.unwrap_or(cfg!(any(windows, target_os = "macos")))
+}
+
+fn swap_ascii_case(s: &str) -> Option<String> {
+	let mut swapped = String::with_capacity(s.len());
+	let mut has_ascii_alpha = false;
+	for c in s.chars() {
+		if c.is_ascii_alphabetic() {
+			has_ascii_alpha = true;
+			if c.is_ascii_lowercase() {
+				swapped.push(c.to_ascii_uppercase());
+			} else {
+				swapped.push(c.to_ascii_lowercase());
+			}
+		} else {
+			swapped.push(c);
+		}
+	}
+	if has_ascii_alpha {
+		Some(swapped)
+	} else {
+		None
+	}
+}
+
+#[cfg(unix)]
+fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
+	use std::os::unix::fs::MetadataExt;
+	let m1 = fs::symlink_metadata(p1)?;
+	let m2 = fs::symlink_metadata(p2)?;
+	Ok(m1.dev() == m2.dev() && m1.ino() == m2.ino())
+}
+
+#[cfg(not(unix))]
+fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
+	let c1 = dunce::canonicalize(p1)?;
+	let c2 = dunce::canonicalize(p2)?;
+	Ok(c1 == c2)
+}
+
+fn probe_fs_case_insensitive(root: &Path) -> io::Result<bool> {
+	if let Ok(entries) = fs::read_dir(root) {
+		for entry in entries.flatten() {
+			let name = entry.file_name();
+			let name_str = name.to_string_lossy();
+			if let Some(swapped) = swap_ascii_case(&name_str) {
+				let orig_path = root.join(&name);
+				let swapped_path = root.join(&swapped);
+				match fs::symlink_metadata(&swapped_path) {
+					Ok(_) => {
+						if let Ok(same) =
+							is_same_file(&orig_path, &swapped_path)
+						{
+							return Ok(same);
+						}
+					}
+					Err(e) if e.kind() == io::ErrorKind::NotFound => {
+						return Ok(false);
+					}
+					Err(_) => {}
+				}
+			}
+		}
+	}
+
+	let pid = std::process::id();
+	let nanos = SystemTime::now()
+		.duration_since(SystemTime::UNIX_EPOCH)
+		.map(|d| d.as_nanos())
+		.unwrap_or(0);
+	let probe_name = format!(".snip-case-probe-{pid}-{nanos}");
+	let probe_path = root.join(&probe_name);
+	let swapped_name = format!(".SNIP-CASE-PROBE-{pid}-{nanos}");
+	let swapped_path = root.join(&swapped_name);
+
+	let probe_file = fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&probe_path);
+
+	match probe_file {
+		Ok(f) => {
+			drop(f);
+			let is_ci = match fs::symlink_metadata(&swapped_path) {
+				Ok(_) => {
+					is_same_file(&probe_path, &swapped_path).unwrap_or(true)
+				}
+				Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+				Err(_) => cfg!(any(windows, target_os = "macos")),
+			};
+			let _ = fs::remove_file(&probe_path);
+			let _ = fs::remove_file(&swapped_path);
+			Ok(is_ci)
+		}
+		Err(e) => Err(e),
+	}
+}
+
+fn op_is_case_insensitive(
+	op_root: Option<&Path>,
+	op_absolute: &Path,
+	canonical_dest_roots: &[CanonicalRootId],
+	root_case_insensitive: &HashMap<PathBuf, bool>,
+	primary: Option<&CanonicalRootId>,
+) -> bool {
+	if let Some(r) = op_root {
+		if let Some(&ci) = root_case_insensitive.get(r) {
+			return ci;
+		}
+		for cr in canonical_dest_roots {
+			if cr.path() == r
+				|| paths::path_key(&cr.path().to_string_lossy())
+					== paths::path_key(&r.to_string_lossy())
+			{
+				if let Some(&ci) = root_case_insensitive.get(cr.path()) {
+					return ci;
+				}
+			}
+		}
+	}
+	for cr in canonical_dest_roots {
+		if op_absolute.starts_with(cr.path()) {
+			if let Some(&ci) = root_case_insensitive.get(cr.path()) {
+				return ci;
+			}
+		}
+	}
+	if let Some(p) = primary {
+		if let Some(&ci) = root_case_insensitive.get(p.path()) {
+			return ci;
+		}
+	}
+	if let Some(cr) = canonical_dest_roots.first() {
+		if let Some(&ci) = root_case_insensitive.get(cr.path()) {
+			return ci;
+		}
+	}
+	cfg!(any(windows, target_os = "macos"))
+}
+
 // ---------------------------------------------------------------------------
 // Core Public APIs
 // ---------------------------------------------------------------------------
@@ -1200,7 +1430,9 @@ pub fn validate_export_selection(
 			return Err(TransferError::UnsafePath(item.relative_path.clone()));
 		}
 		let full = item.root.path().join(&sanitized);
-		if escapes_all_roots(&[item.root.path()], &full) {
+		if !matches!(item.source, SourceKind::Working | SourceKind::Unstaged)
+			&& escapes_all_roots(&[item.root.path()], &full)
+		{
 			return Err(TransferError::UnsafePath(item.relative_path.clone()));
 		}
 	}
@@ -1350,8 +1582,38 @@ fn blob_content(
 		}
 		BlobRead::Text(s) => Ok(Some((Some(s), None))),
 		BlobRead::NotText(_) => Ok(Some((None, None))),
+		BlobRead::TooLarge {
+			not_text: Some(_), ..
+		} => Ok(Some((None, None))),
 		BlobRead::TooLarge { size, .. } => {
 			budget.over_cap(size, cap, wire_path).map(Some)
+		}
+	}
+}
+
+fn gitlink_read(
+	read: BlobRead,
+	cap: u64,
+	wire_path: &str,
+	budget: &BlobBudget,
+	is_staged: bool,
+) -> Result<ReadContent, TransferError> {
+	match read {
+		BlobRead::Text(s) => Ok((Some(s), None)),
+		BlobRead::Missing
+		| BlobRead::NotText(_)
+		| BlobRead::NotABlob { .. }
+		| BlobRead::TooLarge {
+			not_text: Some(_), ..
+		} => {
+			if is_staged {
+				Ok((Some(UNREADABLE_FILE_MARKER.to_string()), None))
+			} else {
+				Ok((None, None))
+			}
+		}
+		BlobRead::TooLarge { size, .. } => {
+			budget.over_cap(size, cap, wire_path)
 		}
 	}
 }
@@ -1496,23 +1758,59 @@ pub fn plan_export_with(
 			Err(e) => return Err(e.into()),
 		}
 	}
+	let mut root_offsets: HashMap<CanonicalRootId, Option<String>> =
+		HashMap::new();
+	for (root_id, git) in &gits {
+		let git_root = dunce::canonicalize(git.root())
+			.unwrap_or_else(|_| git.root().to_path_buf());
+		let root_path = dunce::canonicalize(root_id.path())
+			.unwrap_or_else(|_| root_id.path().to_path_buf());
+		let offset = match root_path.strip_prefix(&git_root) {
+			Ok(p) if !p.as_os_str().is_empty() => {
+				Some(p.to_string_lossy().replace('\\', "/"))
+			}
+			_ => None,
+		};
+		root_offsets.insert(root_id.clone(), offset);
+	}
 	let mut frozen_commits = HashMap::new();
 	// Frozen commit -> its parents, where deleted files are read.
 	// Resolved before any cat-file session so this thread does not nest Git.
 	let mut parents: HashMap<String, Vec<String>> = HashMap::new();
 	for item in &selection.items {
-		if let SourceKind::Commit { rev } = &item.source {
-			let key = (item.root.clone(), rev.clone());
-			if let std::collections::hash_map::Entry::Vacant(e) =
-				frozen_commits.entry(key)
-			{
-				let git = gits.get(&item.root).ok_or_else(|| {
-					TransferError::UnknownRoot(item.root.path().to_path_buf())
-				})?;
-				let oid = git.resolve_commit_with(rev, opts)?;
-				parents.insert(oid.clone(), git.parents_with(&oid, opts)?);
-				e.insert(oid);
+		match &item.source {
+			SourceKind::Commit { rev } => {
+				let key = (item.root.clone(), rev.clone());
+				if let std::collections::hash_map::Entry::Vacant(e) =
+					frozen_commits.entry(key)
+				{
+					let git = gits.get(&item.root).ok_or_else(|| {
+						TransferError::UnknownRoot(
+							item.root.path().to_path_buf(),
+						)
+					})?;
+					let oid = git.resolve_commit_with(rev, opts)?;
+					parents.insert(oid.clone(), git.parents_with(&oid, opts)?);
+					e.insert(oid);
+				}
 			}
+			SourceKind::Range { base, tip } => {
+				for rev in [base, tip] {
+					let key = (item.root.clone(), rev.clone());
+					if let std::collections::hash_map::Entry::Vacant(e) =
+						frozen_commits.entry(key)
+					{
+						let git = gits.get(&item.root).ok_or_else(|| {
+							TransferError::UnknownRoot(
+								item.root.path().to_path_buf(),
+							)
+						})?;
+						let oid = git.resolve_commit_with(rev, opts)?;
+						e.insert(oid);
+					}
+				}
+			}
+			_ => {}
 		}
 	}
 	let mut blobs = BlobReader::blobs_only(opts);
@@ -1524,16 +1822,20 @@ pub fn plan_export_with(
 			.clone()
 			.or_else(|| selection.roots.first().cloned());
 
-		// Commit selections begin with fallback = true (omitting empty wrappers);
+		// Commit and range selections begin with fallback = true (omitting empty wrappers);
 		// Staged and Deleted only trigger fallback once an included entry is admitted.
-		let is_commit = selection
-			.items
-			.iter()
-			.any(|item| matches!(item.source, SourceKind::Commit { .. }));
-		let mut fallback = is_commit;
+		let is_graph = selection.items.iter().any(|item| {
+			matches!(
+				item.source,
+				SourceKind::Commit { .. } | SourceKind::Range { .. }
+			)
+		});
+		let mut fallback = is_graph;
 
 		let default_source_root = if selection.roots.len() == 1 {
-			paths::source_root_name(&[selection.roots[0].path()])
+			selection.source_root.clone().or_else(|| {
+				paths::source_root_name(&[selection.roots[0].path()])
+			})
 		} else {
 			None
 		};
@@ -1611,20 +1913,53 @@ pub fn plan_export_with(
 					file_limit_reached = true;
 					break;
 				}
+				let filter_absolute =
+					if selection.roots.len() == 1 || is_primary {
+						selection
+							.spelled_root
+							.as_ref()
+							.map(|s| s.join(&item.relative_path))
+							.unwrap_or_else(|| absolute.clone())
+					} else {
+						absolute.clone()
+					};
 				if settings.use_filters
 					&& !filter::file_matches_filters(
 						&wire_path,
 						&settings.filter_rules,
 						settings.use_include_filters,
 						settings.use_exclude_filters,
-						Some(&absolute.to_string_lossy()),
+						Some(&filter_absolute.to_string_lossy()),
 					) {
 					continue;
 				}
 			} else {
+				let filter_wire_path;
+				let filter_path = match (&selection.filter_root, &item.source) {
+					(
+						Some(filter_root),
+						SourceKind::Commit { .. } | SourceKind::Range { .. },
+					) => {
+						let filter_root_canonical =
+							dunce::canonicalize(filter_root)
+								.unwrap_or_else(|_| filter_root.clone());
+						let p = paths::to_clipboard_path_from_roots(
+							&[filter_root_canonical],
+							&absolute,
+							None,
+						);
+						if p.is_empty() {
+							wire_path.as_str()
+						} else {
+							filter_wire_path = p;
+							filter_wire_path.as_str()
+						}
+					}
+					_ => wire_path.as_str(),
+				};
 				if settings.use_filters
 					&& !filter::file_matches_filters(
-						&wire_path,
+						filter_path,
 						&settings.filter_rules,
 						settings.use_include_filters,
 						settings.use_exclude_filters,
@@ -1652,7 +1987,19 @@ pub fn plan_export_with(
 			};
 
 			let deleted = item.change_type == Some(ChangeType::Deleted);
+			if item.gitlink
+				&& !deleted && matches!(
+				item.source,
+				SourceKind::Working | SourceKind::Unstaged
+			) {
+				continue;
+			}
 			let rel = &item.relative_path;
+			let toplevel_rel =
+				match root_offsets.get(&item.root).and_then(|o| o.as_deref()) {
+					Some(off) => format!("{off}/{rel}"),
+					None => rel.clone(),
+				};
 			// The outer `Option` says whether to record freshness; the inner
 			// one is the file's state (`None` = absent).
 			let (content, skipped_reason, freshness_info): (
@@ -1681,14 +2028,64 @@ pub fn plan_export_with(
 							.get(frozen_oid)
 							.into_iter()
 							.flatten()
-							.map(|p| format!("{p}:{rel}"));
+							.map(|p| format!("{p}:{toplevel_rel}"));
 						let b = blob_budget(true);
 						let cap = b.cap();
 						let content =
 							blobs.deleted_file_content(git, specs, cap)?;
 						deleted_read(content, cap, &wire_path, &b)?
+					} else if item.gitlink {
+						let spec = format!("{frozen_oid}:{toplevel_rel}");
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read_lenient(git, &spec, cap)?;
+						gitlink_read(read, cap, &wire_path, &b, false)?
 					} else {
-						let spec = format!("{frozen_oid}:{rel}");
+						let spec = format!("{frozen_oid}:{toplevel_rel}");
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read(git, &spec, cap)?;
+						blob_content(read, &spec, cap, &wire_path, &b)?.ok_or(
+							TransferError::Git(GitError::InvalidRevision(spec)),
+						)?
+					};
+					(text, reason, None)
+				}
+				SourceKind::Range { base, tip } => {
+					let frozen_base = frozen_commits
+						.get(&(item.root.clone(), base.clone()))
+						.ok_or_else(|| {
+							TransferError::Git(GitError::InvalidRevision(
+								base.clone(),
+							))
+						})?;
+					let frozen_tip = frozen_commits
+						.get(&(item.root.clone(), tip.clone()))
+						.ok_or_else(|| {
+							TransferError::Git(GitError::InvalidRevision(
+								tip.clone(),
+							))
+						})?;
+					let git = gits.get(&item.root).ok_or_else(|| {
+						TransferError::UnknownRoot(
+							item.root.path().to_path_buf(),
+						)
+					})?;
+					let (text, reason) = if deleted {
+						let spec = format!("{frozen_base}:{toplevel_rel}");
+						let b = blob_budget(true);
+						let cap = b.cap();
+						let content =
+							blobs.deleted_file_content(git, [spec], cap)?;
+						deleted_read(content, cap, &wire_path, &b)?
+					} else if item.gitlink {
+						let spec = format!("{frozen_tip}:{toplevel_rel}");
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read_lenient(git, &spec, cap)?;
+						gitlink_read(read, cap, &wire_path, &b, false)?
+					} else {
+						let spec = format!("{frozen_tip}:{toplevel_rel}");
 						let b = blob_budget(false);
 						let cap = b.cap();
 						let read = blobs.read(git, &spec, cap)?;
@@ -1710,12 +2107,18 @@ pub fn plan_export_with(
 						let cap = b.cap();
 						let content = blobs.deleted_file_content(
 							git,
-							[format!("HEAD:{rel}")],
+							[format!("HEAD:{toplevel_rel}")],
 							cap,
 						)?;
 						deleted_read(content, cap, &wire_path, &b)?
+					} else if item.gitlink {
+						let spec = format!(":{toplevel_rel}");
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read_lenient(git, &spec, cap)?;
+						gitlink_read(read, cap, &wire_path, &b, true)?
 					} else {
-						let spec = format!(":{rel}");
+						let spec = format!(":{toplevel_rel}");
 						let b = blob_budget(false);
 						let cap = b.cap();
 						let read = blobs.read(git, &spec, cap)?;
@@ -1741,9 +2144,9 @@ pub fn plan_export_with(
 					// the index, so the index has it; `Working` is the SCM view
 					// and reads HEAD like gitsrc (TS parity), as does `File`.
 					let spec = if item.source == SourceKind::Unstaged {
-						format!(":{rel}")
+						format!(":{toplevel_rel}")
 					} else {
-						format!("HEAD:{rel}")
+						format!("HEAD:{toplevel_rel}")
 					};
 					let b = blob_budget(false);
 					let cap = b.cap();
@@ -1766,28 +2169,67 @@ pub fn plan_export_with(
 				}
 				SourceKind::Working
 				| SourceKind::Unstaged
-				| SourceKind::File => {
+				| SourceKind::File => 'read_file: {
 					cancelled_err(opts, "read-file")?;
-					let sym_meta = fs::symlink_metadata(&absolute)?;
+					let is_changed_item = matches!(
+						item.source,
+						SourceKind::Working | SourceKind::Unstaged
+					);
+					let sym_meta = match fs::symlink_metadata(&absolute) {
+						Ok(m) => m,
+						Err(_) if is_changed_item => {
+							break 'read_file (None, None, None);
+						}
+						Err(e) => return Err(e.into()),
+					};
+					// The selection check no longer refuses changed items that
+					// escape (symlinked parent directory or link target), so
+					// they are skipped here before any read.
+					if is_changed_item
+						&& escapes_all_roots(&[item.root.path()], &absolute)
+					{
+						break 'read_file (None, None, None);
+					}
 					let target_meta = if sym_meta.file_type().is_symlink() {
 						let roots = [item.root.path()];
 						if escapes_all_roots(&roots, &absolute) {
+							if is_changed_item {
+								break 'read_file (None, None, None);
+							}
 							return Err(TransferError::UnsafePath(
 								absolute.to_string_lossy().into_owned(),
 							));
 						}
-						let canonical = dunce::canonicalize(&absolute)?;
+						let canonical = match dunce::canonicalize(&absolute) {
+							Ok(c) => c,
+							Err(_) if is_changed_item => {
+								break 'read_file (None, None, None);
+							}
+							Err(e) => return Err(e.into()),
+						};
 						if escapes_all_roots(&roots, &canonical) {
+							if is_changed_item {
+								break 'read_file (None, None, None);
+							}
 							return Err(TransferError::UnsafePath(
 								canonical.to_string_lossy().into_owned(),
 							));
 						}
-						fs::metadata(&canonical)?
+						match fs::metadata(&canonical) {
+							Ok(m) => m,
+							Err(_) if is_changed_item => {
+								break 'read_file (None, None, None);
+							}
+							Err(e) => return Err(e.into()),
+						}
 					} else {
 						sym_meta
 					};
 
 					if !target_meta.file_type().is_file() {
+						if is_changed_item {
+							break 'read_file (None, None, None);
+						}
 						return Err(TransferError::SpecialFile(
 							absolute.to_string_lossy().into_owned(),
 						));
@@ -1796,7 +2238,59 @@ pub fn plan_export_with(
 					let file_size = target_meta.len();
 					let per_file_limit =
 						(settings.max_file_size_kb * 1024.0) as u64;
-					if file_size as f64 > settings.max_file_size_kb * 1024.0 {
+					let over_per_file =
+						file_size as f64 > settings.max_file_size_kb * 1024.0;
+					let over_budget = remaining_budget
+						.is_some_and(|b| file_size as usize > b);
+					if is_changed_item && (over_per_file || over_budget) {
+						let mut scan = crate::blob::ChunkTextScan::new();
+						let scan_res = for_each_chunk(
+							&absolute,
+							None,
+							opts,
+							"read-file",
+							|chunk| scan.feed(chunk),
+						);
+						match scan_res {
+							Ok(_) => {}
+							Err(e)
+								if matches!(
+									e,
+									TransferError::Git(
+										GitError::Cancelled { .. }
+									)
+								) || opts
+									.cancel
+									.as_ref()
+									.is_some_and(CancelToken::is_cancelled) =>
+							{
+								return Err(e);
+							}
+							Err(_) => break 'read_file (None, None, None),
+						}
+						if scan.finish().is_some() {
+							break 'read_file (None, None, None);
+						}
+						if over_per_file {
+							(
+								None,
+								Some(format!(
+									"size exceeds limit ({file_size} bytes)"
+								)),
+								None,
+							)
+						} else {
+							let budget = remaining_budget.unwrap_or(usize::MAX);
+							return Err(TransferError::PayloadLimitExceeded {
+								limit: max_payload_bytes.unwrap_or(budget),
+								actual: current_total_bytes
+									+ file_size as usize,
+								reason: format!(
+									"file '{wire_path}' exceeds remaining payload budget"
+								),
+							});
+						}
+					} else if over_per_file {
 						(
 							None,
 							Some(format!(
@@ -1804,22 +2298,16 @@ pub fn plan_export_with(
 							)),
 							None,
 						)
+					} else if over_budget {
+						let budget = remaining_budget.unwrap_or(usize::MAX);
+						return Err(TransferError::PayloadLimitExceeded {
+							limit: max_payload_bytes.unwrap_or(budget),
+							actual: current_total_bytes + file_size as usize,
+							reason: format!(
+								"file '{wire_path}' exceeds remaining payload budget"
+							),
+						});
 					} else {
-						if let Some(budget) = remaining_budget {
-							if file_size as usize > budget {
-								return Err(
-									TransferError::PayloadLimitExceeded {
-										limit: max_payload_bytes
-											.unwrap_or(budget),
-										actual: current_total_bytes
-											+ file_size as usize,
-										reason: format!(
-									"file '{wire_path}' exceeds remaining payload budget"
-								),
-									},
-								);
-							}
-						}
 						let read_cap = match remaining_budget {
 							Some(b) => (b as u64).min(per_file_limit),
 							None => per_file_limit,
@@ -1828,7 +2316,7 @@ pub fn plan_export_with(
 						cancelled_err(opts, "read-file")?;
 						let mut bytes = Vec::with_capacity(file_size as usize);
 						let mut hasher = Sha256::new();
-						let read_len = for_each_chunk(
+						let read_res = for_each_chunk(
 							&absolute,
 							Some(read_cap.saturating_add(1)),
 							opts,
@@ -1837,7 +2325,27 @@ pub fn plan_export_with(
 								bytes.extend_from_slice(chunk);
 								hasher.update(chunk);
 							},
-						)?;
+						);
+						let read_len = match read_res {
+							Ok(len) => len,
+							Err(e)
+								if matches!(
+									e,
+									TransferError::Git(
+										GitError::Cancelled { .. }
+									)
+								) || opts
+									.cancel
+									.as_ref()
+									.is_some_and(CancelToken::is_cancelled) =>
+							{
+								return Err(e);
+							}
+							Err(_) if is_changed_item => {
+								break 'read_file (None, None, None);
+							}
+							Err(e) => return Err(e),
+						};
 						if read_len > read_cap {
 							if remaining_budget
 								.is_some_and(|b| read_len as usize > b)
@@ -1862,7 +2370,13 @@ pub fn plan_export_with(
 								None,
 							)
 						} else {
-							let mtime = target_meta.modified()?;
+							let mtime = match target_meta.modified() {
+								Ok(m) => m,
+								Err(_) if is_changed_item => {
+									break 'read_file (None, None, None);
+								}
+								Err(e) => return Err(e.into()),
+							};
 							let content_hash = hasher.finalize().into();
 							let freshness = FileFreshness {
 								size: read_len,
@@ -1946,7 +2460,7 @@ pub fn plan_export_with(
 			files.push(payload_file);
 		}
 
-		let final_source_root = if is_commit && files.is_empty() {
+		let final_source_root = if is_graph && files.is_empty() {
 			None
 		} else {
 			default_source_root
@@ -2041,7 +2555,14 @@ pub fn plan_import(
 /// [`plan_import`] with the caller's runner options.
 ///
 /// The clipboard parser and per-file restore planner are the ones
-/// [`plan_import`] uses. The token is polled before and after parsing, and
+/// [`plan_import`] uses. Absolute entry paths not present in explicit entry
+/// destinations are resolved against destination roots before sanitization;
+/// unresolvable absolute deleted entries are skipped as unresolved paths rather
+/// than deleting nested files, while unresolvable absolute writes keep their
+/// literal nested path under the primary destination (or skip if drive-letter
+/// paths). Case-insensitive destination filesystems are probed at runtime to
+/// fold identities in target collision checks.
+/// The token is polled before and after parsing, and
 /// between roots, routed entries, per-file planning, target-identity checks
 /// and freshness reads. Encoding classification may `read` up to 8 MiB in
 /// one call, and one freshness chunk is at most 8 KiB; neither `read` can
@@ -2087,21 +2608,91 @@ pub fn plan_import_with(
 		}
 	}
 
+	let mut root_case_insensitive: HashMap<PathBuf, bool> = HashMap::new();
+	for root in &canonical_dest_roots {
+		cancelled_err(opts, "plan-import")?;
+		root_case_insensitive
+			.entry(root.path().to_path_buf())
+			.or_insert_with(|| fs_is_case_insensitive(root.path()));
+	}
+
+	let dest_root_paths: Vec<&Path> =
+		canonical_dest_roots.iter().map(|id| id.path()).collect();
+	let primary_dest_path =
+		mapping.primary_destination.as_ref().map(|id| id.path());
+
 	cancelled_err(opts, "plan-import")?;
 	let entries = format::parse_clipboard(clipboard_text, header_format);
 	cancelled_err(opts, "plan-import")?;
 
-	let mut root_to_entries: HashMap<CanonicalRootId, Vec<ParsedEntry>> =
-		HashMap::new();
+	let mut planned_entries: Vec<(CanonicalRootId, ParsedEntry)> = Vec::new();
 	let mut skipped_operations = Vec::new();
 
 	for entry in entries {
 		cancelled_err(opts, "plan-import")?;
-		let (target_root, rel_path) =
-			if let Some(em) = mapping.entry_destinations.get(&entry.path) {
-				let rel =
-					em.relative_path.as_deref().unwrap_or(entry.path.as_str());
-				(&em.root, rel)
+		let (target_root, rel_path) = if let Some(em) =
+			mapping.entry_destinations.get(&entry.path)
+		{
+			let rel =
+				em.relative_path.as_deref().unwrap_or(entry.path.as_str());
+			(&em.root, std::borrow::Cow::Borrowed(rel))
+		} else {
+			let normalized = paths::normalize_system_path(&entry.path);
+			if paths::is_absolute_path(&normalized) {
+				if let Some((root_str, rel)) =
+					paths::resolve_absolute_import_candidate(
+						&dest_root_paths,
+						primary_dest_path,
+						&entry.path,
+					) {
+					if rel.is_empty() {
+						skipped_operations.push(SkippedOperation {
+							raw_path: entry.path.clone(),
+							relative_path: None,
+							reason: SkipReason::UnresolvedPath,
+						});
+						continue;
+					}
+					let matched_root = canonical_dest_roots.iter().find(|id| {
+						paths::path_key(&id.path().to_string_lossy())
+							== paths::path_key(&root_str)
+							|| dunce::canonicalize(Path::new(&root_str))
+								.map(|c| {
+									paths::path_key(&c.to_string_lossy())
+										== paths::path_key(
+											&id.path().to_string_lossy(),
+										)
+								})
+								.unwrap_or(false)
+					});
+					match matched_root {
+						Some(root) => (root, std::borrow::Cow::Owned(rel)),
+						None => {
+							skipped_operations.push(SkippedOperation {
+								raw_path: entry.path.clone(),
+								relative_path: None,
+								reason: SkipReason::UnresolvedPath,
+							});
+							continue;
+						}
+					}
+				} else if entry.change_types.contains(&ChangeType::Deleted) {
+					skipped_operations.push(SkippedOperation {
+						raw_path: entry.path.clone(),
+						relative_path: None,
+						reason: SkipReason::UnresolvedPath,
+					});
+					continue;
+				} else if let Some(ref primary) = mapping.primary_destination {
+					(primary, std::borrow::Cow::Borrowed(entry.path.as_str()))
+				} else {
+					skipped_operations.push(SkippedOperation {
+						raw_path: entry.path.clone(),
+						relative_path: None,
+						reason: SkipReason::UnresolvedPath,
+					});
+					continue;
+				}
 			} else if let Some((prefix, rest)) = entry.path.split_once('/') {
 				if mapping.blocked_prefixes.contains(prefix) {
 					skipped_operations.push(SkippedOperation {
@@ -2113,9 +2704,18 @@ pub fn plan_import_with(
 				}
 				if let Some(dest) = mapping.prefix_destinations.get(prefix) {
 					// Prefix consumed EXACTLY ONCE
-					(dest, rest)
+					(dest, std::borrow::Cow::Borrowed(rest))
 				} else if let Some(ref primary) = mapping.primary_destination {
-					(primary, entry.path.as_str())
+					let rel = match &mapping.primary_prefix {
+						Some(p) if restore::is_relative(&entry.path) => {
+							std::borrow::Cow::Owned(format!(
+								"{p}/{}",
+								entry.path
+							))
+						}
+						_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
+					};
+					(primary, rel)
 				} else {
 					skipped_operations.push(SkippedOperation {
 						raw_path: entry.path.clone(),
@@ -2125,7 +2725,13 @@ pub fn plan_import_with(
 					continue;
 				}
 			} else if let Some(ref primary) = mapping.primary_destination {
-				(primary, entry.path.as_str())
+				let rel = match &mapping.primary_prefix {
+					Some(p) if restore::is_relative(&entry.path) => {
+						std::borrow::Cow::Owned(format!("{p}/{}", entry.path))
+					}
+					_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
+				};
+				(primary, rel)
 			} else {
 				skipped_operations.push(SkippedOperation {
 					raw_path: entry.path.clone(),
@@ -2133,9 +2739,10 @@ pub fn plan_import_with(
 					reason: SkipReason::UnresolvedPath,
 				});
 				continue;
-			};
+			}
+		};
 
-		let Some(sanitized) = sanitize_relative_path(rel_path) else {
+		let Some(sanitized) = sanitize_relative_path(&rel_path) else {
 			skipped_operations.push(SkippedOperation {
 				raw_path: entry.path.clone(),
 				relative_path: None,
@@ -2144,14 +2751,14 @@ pub fn plan_import_with(
 			continue;
 		};
 
-		root_to_entries
-			.entry(target_root.clone())
-			.or_default()
-			.push(ParsedEntry {
+		planned_entries.push((
+			target_root.clone(),
+			ParsedEntry {
 				path: sanitized,
 				content: entry.content,
 				change_types: entry.change_types,
-			});
+			},
+		));
 	}
 
 	let mut combined_creates = Vec::new();
@@ -2160,25 +2767,32 @@ pub fn plan_import_with(
 
 	// Same `plan_restore` as before, one entry at a time so a cancel is
 	// observed before the next file's encoding read.
-	for (root_id, root_entries) in root_to_entries {
+	for (root_id, entry) in &planned_entries {
 		cancelled_err(opts, "plan-import")?;
-		for entry in &root_entries {
-			cancelled_err(opts, "plan-import")?;
-			let sub_plan = restore::plan_restore(
-				&[root_id.path()],
-				std::slice::from_ref(entry),
-			);
-			combined_creates.extend(sub_plan.create_operations);
-			combined_deletes.extend(sub_plan.delete_operations);
-			all_skipped.extend(sub_plan.skipped_operations);
-		}
+		let sub_plan = restore::plan_restore(
+			&[root_id.path()],
+			std::slice::from_ref(entry),
+		);
+		combined_creates.extend(sub_plan.create_operations);
+		combined_deletes.extend(sub_plan.delete_operations);
+		all_skipped.extend(sub_plan.skipped_operations);
 	}
 
 	// Reject if two entries map to the same target file (including symlinks and case aliases)
 	let mut target_identities: HashMap<String, String> = HashMap::new();
 	for op in &combined_creates {
 		cancelled_err(opts, "plan-import")?;
-		let identity = canonical_target_identity(&op.absolute_path);
+		let is_ci = op_is_case_insensitive(
+			Some(&op.root_path),
+			&op.absolute_path,
+			&canonical_dest_roots,
+			&root_case_insensitive,
+			mapping.primary_destination.as_ref(),
+		);
+		let mut identity = canonical_target_identity(&op.absolute_path);
+		if is_ci {
+			identity = identity.to_lowercase();
+		}
 		if let Some(prev) = target_identities
 			.insert(identity.clone(), format!("create {}", op.relative_path))
 		{
@@ -2196,7 +2810,17 @@ pub fn plan_import_with(
 	}
 	for op in &combined_deletes {
 		cancelled_err(opts, "plan-import")?;
-		let identity = canonical_target_identity(&op.absolute_path);
+		let is_ci = op_is_case_insensitive(
+			None,
+			&op.absolute_path,
+			&canonical_dest_roots,
+			&root_case_insensitive,
+			mapping.primary_destination.as_ref(),
+		);
+		let mut identity = canonical_target_identity(&op.absolute_path);
+		if is_ci {
+			identity = identity.to_lowercase();
+		}
 		if let Some(prev) = target_identities
 			.insert(identity.clone(), format!("delete {}", op.relative_path))
 		{
@@ -2245,13 +2869,12 @@ pub fn validate_commit_selection(repos: &[&Git]) -> Result<(), TransferError> {
 	Ok(())
 }
 
-/// Plans and extracts commits along a contiguous first-parent chain.
-pub fn plan_commit_export(
+fn select_commit_shas(
 	git: &Git,
 	range: Option<(&str, &str)>,
 	last: Option<usize>,
-) -> Result<CommitsPayload, TransferError> {
-	let shas = match (range, last) {
+) -> Result<Vec<String>, TransferError> {
+	match (range, last) {
 		(Some((base, tip)), None) => commits::select_range(git, base, tip)
 			.map_err(|e| match e {
 				CommitError::Discontinuous {
@@ -2266,14 +2889,38 @@ pub fn plan_commit_export(
 					first_parent,
 				},
 				other => TransferError::Commit(other),
-			})?,
+			}),
 		(None, Some(n)) => {
-			commits::select_last(git, n).map_err(TransferError::Commit)?
+			commits::select_last(git, n).map_err(TransferError::Commit)
 		}
-		_ => return Err(TransferError::EmptySelection),
-	};
+		_ => Err(TransferError::EmptySelection),
+	}
+}
 
+/// Plans and extracts commits along a contiguous first-parent chain.
+pub fn plan_commit_export(
+	git: &Git,
+	range: Option<(&str, &str)>,
+	last: Option<usize>,
+) -> Result<CommitsPayload, TransferError> {
+	let shas = select_commit_shas(git, range, last)?;
 	commits::copy_commits(git, &shas).map_err(TransferError::Commit)
+}
+
+/// [`plan_commit_export`] with the caller's runner options and a hard cap on
+/// the clipboard document.
+///
+/// Over cap => [`CommitError::PayloadLimit`] (never truncate).
+pub fn plan_commit_export_with(
+	git: &Git,
+	range: Option<(&str, &str)>,
+	last: Option<usize>,
+	opts: &RunOptions,
+	max_serialized_bytes: usize,
+) -> Result<CommitExport, TransferError> {
+	let shas = select_commit_shas(git, range, last)?;
+	commits::copy_commits_with(git, &shas, opts, max_serialized_bytes)
+		.map_err(TransferError::Commit)
 }
 
 /// Exports exactly the commits in `selected`, which must be the contiguous

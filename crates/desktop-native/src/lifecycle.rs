@@ -67,6 +67,10 @@ pub enum Intent {
 	Quit,
 	CloseWorkspace,
 	OpenWorkspace(std::path::PathBuf),
+	/// A worker's shared workspace (remote-node mode).
+	OpenRemoteWorkspace(
+		Box<(snip_remote::PairedWorker, snip_remote::RemoteWorkspace)>,
+	),
 }
 
 impl Intent {
@@ -75,6 +79,7 @@ impl Intent {
 			Self::Quit => "quit",
 			Self::CloseWorkspace => "close-workspace",
 			Self::OpenWorkspace(_) => "open-workspace",
+			Self::OpenRemoteWorkspace(_) => "open-remote-workspace",
 		}
 	}
 }

@@ -12,15 +12,26 @@ use std::process::ExitCode;
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use snip_core::clip::{self, Mode};
-use snip_core::commits::{self, CommitCopySummary, CommitsPayload};
-use snip_core::copy::{collect_copy_files, CopyResult};
+use snip_core::commits::{
+	self, CommitCopySummary, CommitsPayload, ReplayAction,
+};
+use snip_core::copy::CopyResult;
 use snip_core::format::{extract_source_root, parse_clipboard};
-use snip_core::gitsrc::{collect_payload, Git, GitSource};
+use snip_core::gitrun::{CancelToken, RunOptions};
+use snip_core::gitsrc::{Git, GitSource};
 use snip_core::restore::{
-	apply_restore_base, execute_restore_plan, plan_restore,
-	suggest_restore_base, DirProbe, RestorePlan, RestoreSelection,
+	apply_restore_base, is_relative, suggest_restore_base, FsProbe,
+	RestorePlan, RestoreSelection,
 };
 use snip_core::settings::Settings;
+use snip_core::transfer::{
+	changed_items, plan_commit_export_with, plan_export_expanding,
+	plan_export_with, plan_import_with, selection_from_paths, CanonicalRootId,
+	CommitReplayPreview, ExportSelection, ImportMapping, TransferError,
+	CLIPBOARD_PAYLOAD_MAX,
+};
+
+mod remote;
 
 /// Re-exec argument for the Linux clipboard daemon (arboard's
 /// `examples/daemonize.rs`).
@@ -101,6 +112,20 @@ enum Command {
 		#[arg(long)]
 		stdin: bool,
 	},
+	/// Serve folders to a paired snip-sync desktop app (remote-node
+	/// worker). Runs until stopped; prints a one-time pairing code.
+	Worker {
+		/// A folder the master may browse (repeatable). Nothing outside
+		/// these folders is served.
+		#[arg(long = "share", value_name = "DIR", required = true)]
+		shares: Vec<PathBuf>,
+		/// Address to listen on, e.g. the machine's Tailscale IP.
+		#[arg(long, value_name = "ADDR:PORT", default_value = snip_remote::DEFAULT_LISTEN)]
+		listen: std::net::SocketAddr,
+	},
+	/// Operate a paired worker's shared folders (remote-node master).
+	#[command(subcommand)]
+	Remote(remote::RemoteCommand),
 }
 
 /// A failure after argument parsing. Usage errors exit through clap (2).
@@ -175,6 +200,18 @@ fn main() -> ExitCode {
 			};
 			paste(&repo, &settings, &opts, stdin)
 		}
+		Command::Remote(cmd) => remote::run(cmd),
+		Command::Worker { shares, listen } => {
+			let config = snip_remote::default_config_dir();
+			match snip_remote::run_headless_worker(
+				listen,
+				&shares,
+				config.as_deref(),
+			) {
+				Ok(never) => match never {},
+				Err(err) => Err(format!("cannot start the worker: {err}")),
+			}
+		}
 	};
 	match result {
 		Ok(()) => ExitCode::SUCCESS,
@@ -214,13 +251,47 @@ fn split_range(range: &str) -> (String, String) {
 
 // ---- copy ----
 
+fn map_transfer_err(err: TransferError) -> String {
+	match err {
+		TransferError::EmptySelection => "No files selected.".to_string(),
+		other => other.to_string(),
+	}
+}
+
 fn copy_paths(
 	repo: &Path,
 	paths: &[PathBuf],
 	settings: &Settings,
 	stdout: bool,
 ) -> Outcome {
-	let result = collect_copy_files(&[repo], paths, settings);
+	let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+	let path_sel =
+		selection_from_paths(repo, &cwd, paths).map_err(map_transfer_err)?;
+	let cancel = CancelToken::new();
+	let (plan, expanded_skipped) = plan_export_expanding(
+		&path_sel.sel,
+		settings,
+		Some(CLIPBOARD_PAYLOAD_MAX),
+		&RunOptions::default(),
+		&cancel,
+	)
+	.map_err(map_transfer_err)?;
+
+	if plan.files.is_empty() {
+		return Err("No files selected.".to_string());
+	}
+
+	let result = CopyResult {
+		files: plan.files,
+		payload: plan.payload,
+		copied_file_count: plan.copied_file_count,
+		skipped_file_size_count: plan.skipped_file_size_count,
+		skipped_unreadable_count: plan.skipped_unreadable_count
+			+ path_sel.skipped
+			+ expanded_skipped,
+		file_limit_reached: plan.file_limit_reached,
+	};
+
 	emit(&result.payload, stdout)?;
 	let suffix = size_suffix(&result);
 	let message = format!(
@@ -240,11 +311,51 @@ fn copy_git(
 	stdout: bool,
 ) -> Outcome {
 	let git = Git::open(repo).map_err(|e| e.to_string())?;
-	// `--repo` is the workspace root, as for `snip copy <paths>` and the
-	// TS surfaces (which pass the workspace roots, not the git toplevel).
-	let result = collect_payload(&git, source, &[repo], settings)
-		.map_err(|e| e.to_string())?;
 	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
+	let effective_root = if graph { git.root() } else { repo };
+	let root_id =
+		CanonicalRootId::new(effective_root).map_err(|e| e.to_string())?;
+	let changed = changed_items(&root_id, &git, source, &RunOptions::default())
+		.map_err(map_transfer_err)?;
+
+	if changed.items.is_empty() {
+		return Err(if graph {
+			"No source copied.".into()
+		} else {
+			"No Git changes found to copy.".into()
+		});
+	}
+
+	let sel = ExportSelection::new(
+		vec![effective_root.to_path_buf()],
+		Some(effective_root.to_path_buf()),
+		changed.items,
+	)
+	.map_err(map_transfer_err)?;
+	let sel = if graph {
+		sel.with_filter_root(Some(repo.to_path_buf()))
+	} else {
+		sel
+	};
+
+	let plan = plan_export_with(
+		&sel,
+		settings,
+		Some(CLIPBOARD_PAYLOAD_MAX),
+		&RunOptions::default(),
+	)
+	.map_err(map_transfer_err)?;
+
+	let result = CopyResult {
+		files: plan.files,
+		payload: plan.payload,
+		copied_file_count: plan.copied_file_count,
+		skipped_file_size_count: plan.skipped_file_size_count,
+		skipped_unreadable_count: plan.skipped_unreadable_count
+			+ changed.skipped_non_utf8,
+		file_limit_reached: plan.file_limit_reached,
+	};
+
 	let message = if graph {
 		// copyFullSourceAtCommit
 		if result.copied_file_count == 0 && result.skipped_file_size_count == 0
@@ -288,6 +399,12 @@ fn copy_git(
 		)
 	};
 	emit(&result.payload, stdout)?;
+	if !changed.out_of_scope.is_empty() {
+		eprintln!(
+			"{} change(s) outside --repo not copied.",
+			changed.out_of_scope.len()
+		);
+	}
 	notify_copied(&message, &result, settings);
 	Ok(())
 }
@@ -375,21 +492,21 @@ fn copy_commits(
 		(range, _) => range.map(|r| split_range(&r)),
 	};
 	let git = Git::open(repo).map_err(|e| e.to_string())?;
-	let shas = match range {
-		Some((a, b)) => commits::select_range(&git, &a, &b),
-		None => commits::select_last(&git, count.unwrap_or_default()),
-	}
+	let export = plan_commit_export_with(
+		&git,
+		range.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+		count,
+		&RunOptions::default(),
+		CLIPBOARD_PAYLOAD_MAX,
+	)
 	.map_err(|e| e.to_string())?;
-	let payload =
-		commits::copy_commits(&git, &shas).map_err(|e| e.to_string())?;
-	let text = commits::to_clipboard_text(&payload);
-	emit(&text, stdout)?;
+	emit(&export.text, stdout)?;
 	let CommitCopySummary {
 		commit_count,
 		file_count,
 		chars,
 		not_copied_count,
-	} = commits::copy_summary(&payload, &text);
+	} = commits::copy_summary(&export.payload, &export.text);
 	let not_copied = if not_copied_count > 0 {
 		format!(", {not_copied_count} file(s) not copied")
 	} else {
@@ -399,7 +516,7 @@ fn copy_commits(
 		"{commit_count} commit(s) copied: {file_count} file(s), {} chars{not_copied}.",
 		grouped(chars)
 	);
-	print_not_copied(&payload);
+	print_not_copied(&export.payload);
 	Ok(())
 }
 
@@ -511,34 +628,16 @@ fn paste(
 	}
 }
 
-/// Real-filesystem probe for `suggest_restore_base`.
-struct FsProbe;
-
-impl DirProbe for FsProbe {
-	fn is_dir(&self, abs_path: &str) -> bool {
-		fs::metadata(abs_path).is_ok_and(|m| m.is_dir())
+fn format_transfer_error(err: TransferError) -> String {
+	match err {
+		TransferError::TargetCollision { .. } => {
+			format!("Snipcode refused to paste: {err}")
+		}
+		TransferError::StaleDestination { .. } => {
+			format!("Snipcode refused to paste: {err}; re-run to inspect updated destinations")
+		}
+		other => other.to_string(),
 	}
-
-	fn child_dirs(&self, root_abs_path: &str) -> Vec<String> {
-		let Ok(entries) = fs::read_dir(root_abs_path) else {
-			return Vec::new();
-		};
-		entries
-			.flatten()
-			.filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-			.map(|e| e.file_name().to_string_lossy().into_owned())
-			.collect()
-	}
-}
-
-/// `isRelativeEntryPath`: no POSIX absolute, drive or UNC path.
-fn is_relative_entry_path(p: &str) -> bool {
-	let b = p.as_bytes();
-	let drive = b.len() >= 3
-		&& b[0].is_ascii_alphabetic()
-		&& b[1] == b':'
-		&& (b[2] == b'/' || b[2] == b'\\');
-	!p.is_empty() && !p.starts_with('/') && !drive && !p.starts_with('\\')
 }
 
 fn paste_files(
@@ -547,7 +646,7 @@ fn paste_files(
 	settings: &Settings,
 	opts: &PasteOptions,
 ) -> Outcome {
-	let mut entries = parse_clipboard(text, &settings.header_format);
+	let entries = parse_clipboard(text, &settings.header_format);
 	if entries.is_empty() {
 		return Err("No Snipcode file headers found in clipboard.".into());
 	}
@@ -561,10 +660,10 @@ fn paste_files(
 		&FsProbe,
 		extract_source_root(text).as_deref(),
 	);
-	if let Some(s) = suggestion {
+	if let Some(ref s) = suggestion {
 		let example = paths
 			.iter()
-			.find(|p| is_relative_entry_path(p) && p.contains('/'))
+			.find(|p| is_relative(p) && p.contains('/'))
 			.map(|p| {
 				format!(" Example: {p} → {}", apply_restore_base(&s.base, p))
 			})
@@ -574,11 +673,6 @@ fn paste_files(
 				"Adjusting paths: {} for all {} file(s).{example}",
 				s.label, s.total
 			);
-			for e in &mut entries {
-				if is_relative_entry_path(&e.path) {
-					e.path = apply_restore_base(&s.base, &e.path);
-				}
-			}
 		} else {
 			eprintln!(
 				"These paths look like they belong elsewhere in this folder. \
@@ -588,9 +682,29 @@ fn paste_files(
 		}
 	}
 
-	let plan = plan_restore(&[repo], &entries);
+	let root_id = CanonicalRootId::new(repo).map_err(|e| {
+		format!(
+			"--repo {} does not exist or cannot be resolved: {e}",
+			repo.display()
+		)
+	})?;
+	let mapping = match (&suggestion, opts.adjust_paths) {
+		(Some(s), true) => ImportMapping::from_restore_base(s, root_id),
+		_ => ImportMapping::with_primary(root_id),
+	};
+
+	let import_plan = plan_import_with(
+		text,
+		&settings.header_format,
+		&[repo.to_path_buf()],
+		&mapping,
+		&RunOptions::default(),
+	)
+	.map_err(format_transfer_error)?;
+
+	let plan = import_plan.restore_plan();
 	if !opts.apply {
-		print_plan(&plan);
+		print_plan(plan);
 	}
 	if plan.create_operations.is_empty() && plan.delete_operations.is_empty() {
 		eprintln!(
@@ -599,7 +713,7 @@ fn paste_files(
 		);
 		return Ok(());
 	}
-	eprintln!("{}", confirmation_summary(&plan));
+	eprintln!("{}", confirmation_summary(plan));
 	if !opts.apply {
 		return Ok(());
 	}
@@ -610,14 +724,14 @@ fn paste_files(
 			"{existing} file(s) already exist; pass --overwrite or --skip-existing"
 		));
 	}
-	let result = execute_restore_plan(
-		&plan,
-		&RestoreSelection {
+	let result = import_plan
+		.apply(&RestoreSelection {
 			overwrite_existing: opts.overwrite,
 			skip_existing: opts.skip_existing,
 			..Default::default()
-		},
-	);
+		})
+		.map_err(format_transfer_error)?;
+
 	let parts: Vec<String> = [
 		("Created", result.created_count),
 		("Overwritten", result.overwritten_count),
@@ -668,11 +782,20 @@ fn confirmation_summary(plan: &RestorePlan) -> String {
 }
 
 fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
+	if opts.skip_existing {
+		usage("commit payloads do not support --skip-existing");
+	}
+	if opts.adjust_paths {
+		usage("commit payloads do not support --adjust-paths");
+	}
 	let payload =
 		commits::parse_commit_payload(text).map_err(|e| e.to_string())?;
+
+	let preview = CommitReplayPreview::capture(repo, &payload)
+		.map_err(format_transfer_error)?;
+
 	if !opts.apply {
-		let git = Git::open(repo).map_err(|e| e.to_string())?;
-		let plan = commits::plan_commit_replay(&git, &payload);
+		let plan = preview.plan();
 		let total = plan.commits.len();
 		for (i, c) in plan.commits.iter().enumerate() {
 			let subject = c.message.lines().next().unwrap_or("");
@@ -721,10 +844,26 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 		}
 		return Ok(());
 	}
-	let preview =
-		snip_core::transfer::CommitReplayPreview::capture(repo, &payload)
-			.map_err(|e| e.to_string())?;
-	let result = preview.apply().map_err(|e| e.to_string())?;
+
+	let existing = preview
+		.plan()
+		.commits
+		.iter()
+		.flat_map(|c| &c.files)
+		.filter(|f| {
+			f.layout_conflict.is_none()
+				&& f.action == ReplayAction::Write
+				&& f.existed
+		})
+		.count();
+	if existing > 0 && !opts.overwrite {
+		preview.revalidate().map_err(format_transfer_error)?;
+		usage(format!(
+			"{existing} destination file(s) already exist; commit payloads need --overwrite"
+		));
+	}
+
+	let result = preview.apply().map_err(format_transfer_error)?;
 	println!("Created {} commit(s).", result.created.len());
 	for sha in &result.created {
 		println!("  {sha}");
@@ -751,14 +890,5 @@ mod tests {
 		assert_eq!(grouped(999), "999");
 		assert_eq!(grouped(1000), "1,000");
 		assert_eq!(grouped(1234567), "1,234,567");
-	}
-
-	#[test]
-	fn relative_entry_paths() {
-		assert!(is_relative_entry_path("src/a.rs"));
-		assert!(!is_relative_entry_path(""));
-		assert!(!is_relative_entry_path("/abs"));
-		assert!(!is_relative_entry_path("C:/x"));
-		assert!(!is_relative_entry_path("\\\\server\\x"));
 	}
 }
