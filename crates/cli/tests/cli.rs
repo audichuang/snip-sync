@@ -1819,7 +1819,7 @@ fn paste_f1_case_alias_existing_path() {
 	let probe = dst.join("probe_x");
 	let probe_upper = dst.join("PROBE_X");
 	fs::write(&probe, "x").unwrap();
-	let is_ci = probe_upper.exists();
+	let case_insensitive = probe_upper.exists();
 	let _ = fs::remove_file(&probe);
 
 	fs::write(dst.join("a.txt"), "original a\n").unwrap();
@@ -1838,7 +1838,7 @@ fn paste_f1_case_alias_existing_path() {
 		Some(payload.as_bytes()),
 	);
 
-	if is_ci {
+	if case_insensitive {
 		assert_eq!(code(&out), 1, "{}", text(&out.stderr));
 		let err = text(&out.stderr);
 		assert!(
@@ -1853,7 +1853,7 @@ fn paste_f1_case_alias_existing_path() {
 		assert_eq!(code(&out), 0, "{}", text(&out.stderr));
 		assert_eq!(
 			fs::read_to_string(dst.join("A.txt")).unwrap(),
-			"new A content\n"
+			"new A content"
 		);
 		assert!(!dst.join("a.txt").exists());
 	}
@@ -1865,7 +1865,7 @@ fn paste_d10_case_alias_both_new() {
 	let probe = tmp.path().join("probe_x");
 	let probe_upper = tmp.path().join("PROBE_X");
 	fs::write(&probe, "x").unwrap();
-	let is_ci = probe_upper.exists();
+	let case_insensitive = probe_upper.exists();
 	let _ = fs::remove_file(&probe);
 
 	// Case A: [NEW] B.txt + [NEW] b.txt
@@ -1882,7 +1882,7 @@ fn paste_d10_case_alias_both_new() {
 		],
 		Some(payload1.as_bytes()),
 	);
-	if is_ci {
+	if case_insensitive {
 		assert_eq!(code(&out1), 1, "{}", text(&out1.stderr));
 		let err = text(&out1.stderr);
 		assert!(err.contains("target collision"), "{err}");
@@ -1892,11 +1892,11 @@ fn paste_d10_case_alias_both_new() {
 		assert_eq!(code(&out1), 0, "{}", text(&out1.stderr));
 		assert_eq!(
 			fs::read_to_string(dst1.join("B.txt")).unwrap(),
-			"content B\n"
+			"content B"
 		);
 		assert_eq!(
 			fs::read_to_string(dst1.join("b.txt")).unwrap(),
-			"content b\n"
+			"content b"
 		);
 	}
 
@@ -1914,7 +1914,7 @@ fn paste_d10_case_alias_both_new() {
 		],
 		Some(payload2.as_bytes()),
 	);
-	if is_ci {
+	if case_insensitive {
 		assert_eq!(code(&out2), 1, "{}", text(&out2.stderr));
 		let err = text(&out2.stderr);
 		assert!(err.contains("target collision"), "{err}");
@@ -1924,11 +1924,11 @@ fn paste_d10_case_alias_both_new() {
 		assert_eq!(code(&out2), 0, "{}", text(&out2.stderr));
 		assert_eq!(
 			fs::read_to_string(dst2.join("D/x.txt")).unwrap(),
-			"content 1\n"
+			"content 1"
 		);
 		assert_eq!(
 			fs::read_to_string(dst2.join("d/x.txt")).unwrap(),
-			"content 2\n"
+			"content 2"
 		);
 	}
 }
