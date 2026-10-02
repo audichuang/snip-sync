@@ -122,6 +122,7 @@ pub fn expand_folder_items(
 				relative_path: rel,
 				source: SourceKind::File,
 				change_type: None,
+				gitlink: false,
 			});
 		}
 	}
@@ -208,6 +209,7 @@ fn collect_root_children(
 					relative_path: name_str.to_string(),
 					source: SourceKind::File,
 					change_type: None,
+					gitlink: false,
 				});
 			}
 		} else if let Some(valid_rel) =
@@ -219,6 +221,7 @@ fn collect_root_children(
 					relative_path: valid_rel,
 					source: SourceKind::File,
 					change_type: None,
+					gitlink: false,
 				});
 			}
 		} else {
@@ -329,6 +332,7 @@ pub fn selection_from_paths(
 					relative_path: rel_str,
 					source: SourceKind::File,
 					change_type: None,
+					gitlink: false,
 				});
 			}
 		} else if let Some(valid_rel) =
@@ -340,6 +344,7 @@ pub fn selection_from_paths(
 					relative_path: valid_rel,
 					source: SourceKind::File,
 					change_type: None,
+					gitlink: false,
 				});
 			}
 		} else {

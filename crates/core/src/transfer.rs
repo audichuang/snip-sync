@@ -120,6 +120,7 @@ pub struct ExportItem {
 	pub relative_path: String,
 	pub source: SourceKind,
 	pub change_type: Option<ChangeType>,
+	pub gitlink: bool,
 }
 
 /// An export selection spanning one or more verified canonical roots.
@@ -286,6 +287,14 @@ impl SourceFreshnessSnapshot {
 		let mut working_files = HashMap::new();
 
 		for item in &selection.items {
+			if item.gitlink
+				&& item.change_type != Some(ChangeType::Deleted)
+				&& matches!(
+					item.source,
+					SourceKind::Working | SourceKind::Unstaged
+				) {
+				continue;
+			}
 			match &item.source {
 				SourceKind::Working
 				| SourceKind::Unstaged
@@ -1408,6 +1417,30 @@ fn blob_content(
 	}
 }
 
+fn gitlink_read(
+	read: BlobRead,
+	cap: u64,
+	wire_path: &str,
+	budget: &BlobBudget,
+	is_staged: bool,
+) -> Result<ReadContent, TransferError> {
+	match read {
+		BlobRead::Text(s) => Ok((Some(s), None)),
+		BlobRead::Missing
+		| BlobRead::NotText(_)
+		| BlobRead::NotABlob { .. } => {
+			if is_staged {
+				Ok((Some(UNREADABLE_FILE_MARKER.to_string()), None))
+			} else {
+				Ok((None, None))
+			}
+		}
+		BlobRead::TooLarge { size, .. } => {
+			budget.over_cap(size, cap, wire_path)
+		}
+	}
+}
+
 fn deleted_read(
 	content: DeletedContent,
 	cap: u64,
@@ -1547,6 +1580,21 @@ pub fn plan_export_with(
 				if matches!(item.source, SourceKind::File) => {}
 			Err(e) => return Err(e.into()),
 		}
+	}
+	let mut root_offsets: HashMap<CanonicalRootId, Option<String>> =
+		HashMap::new();
+	for (root_id, git) in &gits {
+		let git_root = dunce::canonicalize(git.root())
+			.unwrap_or_else(|_| git.root().to_path_buf());
+		let root_path = dunce::canonicalize(root_id.path())
+			.unwrap_or_else(|_| root_id.path().to_path_buf());
+		let offset = match root_path.strip_prefix(&git_root) {
+			Ok(p) if !p.as_os_str().is_empty() => {
+				Some(p.to_string_lossy().replace('\\', "/"))
+			}
+			_ => None,
+		};
+		root_offsets.insert(root_id.clone(), offset);
 	}
 	let mut frozen_commits = HashMap::new();
 	// Frozen commit -> its parents, where deleted files are read.
@@ -1727,7 +1775,19 @@ pub fn plan_export_with(
 			};
 
 			let deleted = item.change_type == Some(ChangeType::Deleted);
+			if item.gitlink
+				&& !deleted && matches!(
+				item.source,
+				SourceKind::Working | SourceKind::Unstaged
+			) {
+				continue;
+			}
 			let rel = &item.relative_path;
+			let toplevel_rel =
+				match root_offsets.get(&item.root).and_then(|o| o.as_deref()) {
+					Some(off) => format!("{off}/{rel}"),
+					None => rel.clone(),
+				};
 			// The outer `Option` says whether to record freshness; the inner
 			// one is the file's state (`None` = absent).
 			let (content, skipped_reason, freshness_info): (
@@ -1756,14 +1816,20 @@ pub fn plan_export_with(
 							.get(frozen_oid)
 							.into_iter()
 							.flatten()
-							.map(|p| format!("{p}:{rel}"));
+							.map(|p| format!("{p}:{toplevel_rel}"));
 						let b = blob_budget(true);
 						let cap = b.cap();
 						let content =
 							blobs.deleted_file_content(git, specs, cap)?;
 						deleted_read(content, cap, &wire_path, &b)?
+					} else if item.gitlink {
+						let spec = format!("{frozen_oid}:{toplevel_rel}");
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read_lenient(git, &spec, cap)?;
+						gitlink_read(read, cap, &wire_path, &b, false)?
 					} else {
-						let spec = format!("{frozen_oid}:{rel}");
+						let spec = format!("{frozen_oid}:{toplevel_rel}");
 						let b = blob_budget(false);
 						let cap = b.cap();
 						let read = blobs.read(git, &spec, cap)?;
@@ -1794,14 +1860,20 @@ pub fn plan_export_with(
 						)
 					})?;
 					let (text, reason) = if deleted {
-						let spec = format!("{frozen_base}:{rel}");
+						let spec = format!("{frozen_base}:{toplevel_rel}");
 						let b = blob_budget(true);
 						let cap = b.cap();
 						let content =
 							blobs.deleted_file_content(git, [spec], cap)?;
 						deleted_read(content, cap, &wire_path, &b)?
+					} else if item.gitlink {
+						let spec = format!("{frozen_tip}:{toplevel_rel}");
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read_lenient(git, &spec, cap)?;
+						gitlink_read(read, cap, &wire_path, &b, false)?
 					} else {
-						let spec = format!("{frozen_tip}:{rel}");
+						let spec = format!("{frozen_tip}:{toplevel_rel}");
 						let b = blob_budget(false);
 						let cap = b.cap();
 						let read = blobs.read(git, &spec, cap)?;
@@ -1823,12 +1895,18 @@ pub fn plan_export_with(
 						let cap = b.cap();
 						let content = blobs.deleted_file_content(
 							git,
-							[format!("HEAD:{rel}")],
+							[format!("HEAD:{toplevel_rel}")],
 							cap,
 						)?;
 						deleted_read(content, cap, &wire_path, &b)?
+					} else if item.gitlink {
+						let spec = format!(":{toplevel_rel}");
+						let b = blob_budget(false);
+						let cap = b.cap();
+						let read = blobs.read_lenient(git, &spec, cap)?;
+						gitlink_read(read, cap, &wire_path, &b, true)?
 					} else {
-						let spec = format!(":{rel}");
+						let spec = format!(":{toplevel_rel}");
 						let b = blob_budget(false);
 						let cap = b.cap();
 						let read = blobs.read(git, &spec, cap)?;
@@ -1854,9 +1932,9 @@ pub fn plan_export_with(
 					// the index, so the index has it; `Working` is the SCM view
 					// and reads HEAD like gitsrc (TS parity), as does `File`.
 					let spec = if item.source == SourceKind::Unstaged {
-						format!(":{rel}")
+						format!(":{toplevel_rel}")
 					} else {
-						format!("HEAD:{rel}")
+						format!("HEAD:{toplevel_rel}")
 					};
 					let b = blob_budget(false);
 					let cap = b.cap();

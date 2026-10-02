@@ -348,6 +348,25 @@ impl BlobReader {
 		spec: &str,
 		cap: u64,
 	) -> Result<BlobRead, GitError> {
+		self.read_internal(git, spec, cap, self.require_blob)
+	}
+
+	pub(crate) fn read_lenient(
+		&mut self,
+		git: &Git,
+		spec: &str,
+		cap: u64,
+	) -> Result<BlobRead, GitError> {
+		self.read_internal(git, spec, cap, false)
+	}
+
+	fn read_internal(
+		&mut self,
+		git: &Git,
+		spec: &str,
+		cap: u64,
+		require_blob: bool,
+	) -> Result<BlobRead, GitError> {
 		if self
 			.opts
 			.cancel
@@ -366,7 +385,7 @@ impl BlobReader {
 			self.open = Some((git.root().to_path_buf(), cat));
 		}
 		match self.open.as_mut() {
-			Some((_, cat)) => cat.read_classified(spec, cap, self.require_blob),
+			Some((_, cat)) => cat.read_classified(spec, cap, require_blob),
 			None => Err(GitError::Malformed("cat-file unavailable".into())),
 		}
 	}

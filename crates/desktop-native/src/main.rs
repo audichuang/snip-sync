@@ -854,6 +854,7 @@ impl PreparedSelection {
 				relative_path: path.clone(),
 				source: SourceKind::File,
 				change_type: None,
+				gitlink: false,
 			})
 			.chain(
 				self.files
@@ -866,6 +867,7 @@ impl PreparedSelection {
 						relative_path: file.path.clone(),
 						source: file.source.clone(),
 						change_type: file.change_type,
+						gitlink: false,
 					}),
 			);
 		for item in added {
@@ -923,6 +925,7 @@ impl PreparedSelection {
 					rev: sha.to_owned(),
 				},
 				change_type: None,
+				gitlink: false,
 			});
 			true
 		}
@@ -8168,6 +8171,7 @@ mod tests {
 					relative_path: rel.to_string(),
 					source: SourceKind::File,
 					change_type: None,
+					gitlink: false,
 				})
 				.collect();
 			ExportSelection::new(
@@ -8354,6 +8358,7 @@ mod tests {
 				relative_path: path.into(),
 				source,
 				change_type: None,
+				gitlink: false,
 			};
 			let items = [
 				item("a.txt", SourceKind::File),
@@ -8606,6 +8611,7 @@ mod tests {
 			relative_path: "same.txt".into(),
 			source: SourceKind::Staged,
 			change_type: None,
+			gitlink: false,
 		};
 		let historical = ExportItem {
 			root: root.clone(),
@@ -8614,6 +8620,7 @@ mod tests {
 				rev: "a".repeat(40),
 			},
 			change_type: None,
+			gitlink: false,
 		};
 		let mut candidate = PreparedSelection::new(
 			&[],
@@ -8928,6 +8935,7 @@ mod tests {
 			relative_path: staged_items[0].0.clone(),
 			source: super::SourceKind::Staged,
 			change_type: staged_items[0].1,
+			gitlink: false,
 		};
 		let sel = super::ExportSelection::new(
 			vec![dir.path().to_path_buf()],
