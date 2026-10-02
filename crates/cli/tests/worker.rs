@@ -18,17 +18,16 @@ impl Drop for Kill {
 	}
 }
 
-#[test]
-fn cli_worker_pairs_and_serves_its_shared_folder() {
-	let tmp = tempfile::tempdir().unwrap();
-	let shared = tmp.path().join("proj");
-	std::fs::create_dir(&shared).unwrap();
-	std::fs::write(shared.join("a.txt"), "hello from the worker\n").unwrap();
-	let config = tmp.path().join("cfg");
+/// Starts `snip worker` sharing `shared`; returns it with the address and
+/// pairing code it printed.
+fn start_worker(
+	shared: &std::path::Path,
+	config: &std::path::Path,
+) -> (Kill, String, String) {
 	let mut child = Command::new(env!("CARGO_BIN_EXE_snip"))
 		.args(["worker", "--listen", "127.0.0.1:0", "--share"])
-		.arg(&shared)
-		.env("SNIP_CONFIG_DIR", &config)
+		.arg(shared)
+		.env("SNIP_CONFIG_DIR", config)
 		.stdout(Stdio::piped())
 		.stderr(Stdio::inherit())
 		.spawn()
@@ -56,7 +55,17 @@ fn cli_worker_pairs_and_serves_its_shared_folder() {
 			code = rest.split_whitespace().next().map(str::to_string);
 		}
 	}
-	let (addr, code) = (addr.unwrap(), code.unwrap());
+	(_guard, addr.unwrap(), code.unwrap())
+}
+
+#[test]
+fn cli_worker_pairs_and_serves_its_shared_folder() {
+	let tmp = tempfile::tempdir().unwrap();
+	let shared = tmp.path().join("proj");
+	std::fs::create_dir(&shared).unwrap();
+	std::fs::write(shared.join("a.txt"), "hello from the worker\n").unwrap();
+	let config = tmp.path().join("cfg");
+	let (_worker, addr, code) = start_worker(&shared, &config);
 
 	let master = Arc::new(Identity::generate().unwrap());
 	let worker = pair(&addr, &code, &master, "mac").unwrap();
@@ -83,4 +92,68 @@ fn cli_worker_needs_a_shared_folder() {
 		.output()
 		.unwrap();
 	assert_eq!(out.status.code(), Some(2));
+}
+
+/// `snip remote …` as a master with its own config folder, against a
+/// `snip worker` process.
+#[test]
+fn cli_master_pairs_lists_stats_and_cats_through_the_worker() {
+	let tmp = tempfile::tempdir().unwrap();
+	let shared = tmp.path().join("proj");
+	std::fs::create_dir_all(shared.join("src")).unwrap();
+	std::fs::write(shared.join("src/main.rs"), "fn main() {}\n").unwrap();
+	std::fs::write(shared.join("bin.dat"), [0u8, 1, 2]).unwrap();
+	let (_worker, addr, code) = start_worker(&shared, &tmp.path().join("w"));
+	let master_cfg = tmp.path().join("m");
+	let snip = |args: &[&str]| {
+		let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+			.args(["remote"])
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &master_cfg)
+			.output()
+			.unwrap();
+		(
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout).into_owned(),
+			String::from_utf8_lossy(&out.stderr).into_owned(),
+		)
+	};
+	let ok = |args: &[&str]| {
+		let (status, stdout, stderr) = snip(args);
+		assert_eq!(status, Some(0), "snip remote {args:?}: {stderr}");
+		stdout
+	};
+
+	assert!(ok(&["pair", &addr, &code]).starts_with("paired with "));
+	let workers = ok(&["workers"]);
+	assert!(
+		workers.starts_with("1\t") && workers.contains(&addr),
+		"{workers}"
+	);
+	assert!(ok(&["workspaces", "1"]).contains("\tproj\t"));
+	assert_eq!(ok(&["ls", "1", "proj"]), "src/\nbin.dat\n");
+	assert_eq!(ok(&["ls", "1", "proj", "src"]), "main.rs\n");
+	assert!(ok(&["stat", "1", "proj", "src/main.rs"]).starts_with("file\t13\t"));
+	assert_eq!(ok(&["cat", "1", "proj", "src/main.rs"]), "fn main() {}\n");
+
+	let (status, _, stderr) = snip(&["cat", "1", "proj", "bin.dat"]);
+	assert_eq!(status, Some(1));
+	assert!(stderr.contains("binary"), "{stderr}");
+	let (status, _, stderr) = snip(&["cat", "1", "proj", "../secret"]);
+	assert_eq!(status, Some(1), "{stderr}");
+	// Pairing again from a trusted master is a no-op success; another
+	// master finds the code used up.
+	ok(&["pair", &addr, &code]);
+	let other = Command::new(env!("CARGO_BIN_EXE_snip"))
+		.args(["remote", "pair", &addr, &code])
+		.env("SNIP_CONFIG_DIR", tmp.path().join("other"))
+		.output()
+		.unwrap();
+	assert_eq!(other.status.code(), Some(1));
+	assert!(String::from_utf8_lossy(&other.stderr).contains("pairing failed"));
+
+	assert!(ok(&["forget", "1"]).starts_with("forgot "));
+	assert_eq!(ok(&["workers"]), "");
+	let (status, _, _) = snip(&["workspaces", "1"]);
+	assert_eq!(status, Some(1));
 }

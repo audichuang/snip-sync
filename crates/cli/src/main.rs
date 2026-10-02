@@ -22,6 +22,8 @@ use snip_core::restore::{
 };
 use snip_core::settings::Settings;
 
+mod remote;
+
 /// Re-exec argument for the Linux clipboard daemon (arboard's
 /// `examples/daemonize.rs`).
 #[cfg(target_os = "linux")]
@@ -112,6 +114,9 @@ enum Command {
 		#[arg(long, value_name = "ADDR:PORT", default_value = snip_remote::DEFAULT_LISTEN)]
 		listen: std::net::SocketAddr,
 	},
+	/// Operate a paired worker's shared folders (remote-node master).
+	#[command(subcommand)]
+	Remote(remote::RemoteCommand),
 }
 
 /// A failure after argument parsing. Usage errors exit through clap (2).
@@ -186,6 +191,7 @@ fn main() -> ExitCode {
 			};
 			paste(&repo, &settings, &opts, stdin)
 		}
+		Command::Remote(cmd) => remote::run(cmd),
 		Command::Worker { shares, listen } => {
 			let config = snip_remote::default_config_dir();
 			match snip_remote::run_headless_worker(
