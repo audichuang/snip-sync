@@ -151,7 +151,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   `// This file has been deleted in this change`。刪除前的版本若是二進位或非 UTF-8，不論大小都視為沒有可用內容，繼續找下一個 parent（找不到才輸出刪除標記）；只有超過上限的文字才依上限處理。
 - **git 來源**讀不到的檔案放 placeholder(`// Unable to read file content`)進 payload,但**不算已複製**,也**不佔檔案數上限**。
   **磁碟來源**(檔案模式)讀不到或非 UTF-8 的檔案不放 placeholder,只計數;超過大小上限的放 skipped marker。
-- 目錄 symlink 只在它本身就是被選取的輸入時才跟進,遞迴過程中不跟進(避免 pnpm / Bazel 的交叉連結爆量)。
+- 目錄 symlink 只在它本身就是被選取的輸入時才跟進,遞迴過程中不跟進(避免 pnpm / Bazel 的交叉連結爆量);被選取的 root 內目錄 symlink 一律展開為資料夾(CLI 與 GUI 共用 `expand_folder_items`;GUI 原本會以 `SpecialFile` 讓整批複製失敗),與 TS 一致,所以不放進「已知且接受的差異」。
 
 ## 5. Git plumbing 對照
 

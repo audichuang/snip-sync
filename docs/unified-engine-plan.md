@@ -59,7 +59,7 @@ Hindsight 記錄:2026-09-30 架構深化時「合併兩條 export pipeline」被
 
 **非目標**
 - 不改剪貼簿線上格式,不動 `fixtures/clipboard-contract.json`(它歸 ClipCodeVSCode 管)。
-- 不改 GUI 的互動與畫面,除非第 3 節 D4(GUI 採用 restore-base 建議,目前決定不改)、D8(絕對路徑匯入修正)與 D10(不分大小寫檔案系統的新目標碰撞)——後兩者經共用 core 函式 `plan_import_with` 改變 GUI 貼上行為,於階段 5b 落地。
+- 不改 GUI 的互動與畫面,除非第 3 節 D4(GUI 採用 restore-base 建議,目前決定不改)、D8(絕對路徑匯入修正)與 D10(不分大小寫檔案系統的新目標碰撞)——後兩者經共用 core 函式 `plan_import_with` 改變 GUI 貼上行為,於階段 5b 落地;階段 4 起 root 內的目錄 symlink 在共用的 `expand_folder_items` 展開為資料夾,GUI 也隨之改變(原本整批複製以 `SpecialFile` 失敗,現與 TS 一致)。
 - 不重寫 `restore::plan_restore`:它仍是 `plan_import_with` 每筆 entry 的規劃器,也是 contract 測試的對象。
 - 舊函式(`collect_copy_files`、`collect_payload`)不急著刪,先降級為測試 oracle;全部遷完、穩定一個版本後再評估移除。
 
@@ -181,7 +181,7 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 4 — CLI `copy <paths>` 改走 transfer(F3、F4、F5、F7)
 
-狀態:已完成(CLI copy_paths 切換至 transfer 引擎管線,套用 32 MiB 上限與 D7 規則)
+狀態:已完成(CLI copy_paths 切換至 transfer 引擎管線,套用 32 MiB 上限與 D7 規則;共用 `expand_folder_items` 的 `is_folder` 把 root 內目錄 symlink 視為資料夾,GUI 也隨之改變(原本整批複製以 `SpecialFile` 失敗,現與 TS 一致);核心測試 `test_selection_from_paths_labels_and_explicit_dir_symlink` 涵蓋)
 
 - `copy_paths` → `selection_from_paths` → `expand_folder_items`(**展開上限傳無上限**,讓 30 檔只算「真的複製的檔案」,與舊引擎一致)→ `plan_export_with(..., Some(CLIPBOARD_PAYLOAD_MAX))`。
 - 依 D7 處理不存在、root 外、空結果。
