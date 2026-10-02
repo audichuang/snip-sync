@@ -70,10 +70,36 @@ fn is_safe_dir_symlink(root: &Path, path: &Path) -> bool {
 /// share the `limit` left after them in basket order (root path, then the
 /// folder's relative path, as the Project selection is sorted), and the
 /// walk stops one file past it so a huge folder is never held in full.
+///
+/// Pre-seeds `seen` with all explicit items before walking so that explicit
+/// items retain their position (GUI basket-order semantics).
 pub fn expand_folder_items(
 	sel: ExportSelection,
 	limit: usize,
 	cancel: &CancelToken,
+) -> Result<FolderExpansion, TransferError> {
+	expand_folder_items_inner(sel, limit, cancel, false)
+}
+
+/// Expands folder items preserving first-occurrence deduplication in input order.
+///
+/// Unlike [`expand_folder_items`], `seen` starts empty and grows as items are
+/// emitted. If an explicit item was already traversed by an earlier folder walk
+/// or an earlier identical explicit item, it is dropped at its later position.
+/// Used by the CLI copy path to preserve argument-order file layout matching TS.
+pub fn expand_folder_items_in_input_order(
+	sel: ExportSelection,
+	limit: usize,
+	cancel: &CancelToken,
+) -> Result<FolderExpansion, TransferError> {
+	expand_folder_items_inner(sel, limit, cancel, true)
+}
+
+fn expand_folder_items_inner(
+	sel: ExportSelection,
+	limit: usize,
+	cancel: &CancelToken,
+	input_order_dedupe: bool,
 ) -> Result<FolderExpansion, TransferError> {
 	let is_folder = |item: &ExportItem| {
 		if item.source != SourceKind::File {
@@ -98,10 +124,11 @@ pub fn expand_folder_items(
 		let path = item.root.path().join(&item.relative_path);
 		std::fs::metadata(&path).is_ok_and(|m| m.is_dir())
 	};
-	if !sel
-		.items
-		.iter()
-		.any(|item| is_folder(item) || is_refused_dir(item))
+	if !input_order_dedupe
+		&& !sel
+			.items
+			.iter()
+			.any(|item| is_folder(item) || is_refused_dir(item))
 	{
 		return Ok(FolderExpansion {
 			sel,
@@ -119,19 +146,31 @@ pub fn expand_folder_items(
 	let mut skipped = 0usize;
 	let mut truncated = false;
 	let mut truncated_at = None;
-	let mut seen: HashSet<(PathBuf, String)> = sel
-		.items
-		.iter()
-		.map(|item| {
-			(item.root.path().to_path_buf(), item.relative_path.clone())
-		})
-		.collect();
+	let mut seen: HashSet<(PathBuf, String)> = if input_order_dedupe {
+		HashSet::new()
+	} else {
+		sel.items
+			.iter()
+			.map(|item| {
+				(item.root.path().to_path_buf(), item.relative_path.clone())
+			})
+			.collect()
+	};
 	let mut items = Vec::with_capacity(sel.items.len());
 	for item in sel.items {
 		if !is_folder(&item) {
 			if is_refused_dir(&item) {
 				skipped += 1;
 				continue;
+			}
+			if input_order_dedupe {
+				let key = (
+					item.root.path().to_path_buf(),
+					item.relative_path.clone(),
+				);
+				if !seen.insert(key) {
+					continue;
+				}
 			}
 			items.push(item);
 			continue;
@@ -159,7 +198,8 @@ pub fn expand_folder_items(
 				skipped += 1;
 				continue;
 			};
-			if seen.contains(&(root.to_path_buf(), rel.clone())) {
+			let key = (root.to_path_buf(), rel.clone());
+			if seen.contains(&key) {
 				continue;
 			}
 			if budget == 0 {
@@ -168,7 +208,7 @@ pub fn expand_folder_items(
 				break;
 			}
 			budget -= 1;
-			seen.insert((root.to_path_buf(), rel.clone()));
+			seen.insert(key);
 			items.push(ExportItem {
 				root: item.root.clone(),
 				relative_path: rel,
@@ -198,6 +238,9 @@ pub fn expand_folder_items(
 /// Plans an export by expanding folder items in progressively doubling batches,
 /// avoiding traversing the entire directory tree when a file count limit is active.
 ///
+/// Uses input-order folder expansion so that files keep their first occurrence
+/// in input order matching the CLI / TS copy contract.
+///
 /// When an expansion batch is truncated by budget, only the prefix of items up to
 /// the truncation point (`truncated_at`) is planned, ensuring that any subsequent
 /// picked items sorting after the truncated folder cannot trigger a premature
@@ -226,7 +269,8 @@ pub fn plan_export_expanding(
 	}
 
 	loop {
-		let expanded = expand_folder_items(sel.clone(), limit, cancel)?;
+		let expanded =
+			expand_folder_items_in_input_order(sel.clone(), limit, cancel)?;
 		if !expanded.truncated {
 			let plan = super::plan_export_with(
 				&expanded.sel,

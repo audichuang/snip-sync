@@ -543,6 +543,81 @@ fn cross_tool_file_payload_is_byte_identical_through_symlinked_root() {
 	}
 }
 
+fn order_dedupe_fixture(root: &Path) {
+	write(root, "top.txt", "top content\n");
+	write(root, "dir/a.txt", "a content\n");
+	write(root, "dir/b.txt", "b content\n");
+	write(root, "dir/c.txt", "c content\n");
+}
+
+#[test]
+fn cross_tool_file_payload_order_dedupe_is_byte_identical() {
+	let ts_ref = ts_ref_or_skip!();
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("ovl");
+	order_dedupe_fixture(&src);
+
+	let subsets: Vec<Vec<String>> = vec![
+		vec![
+			src.join("dir").to_str().unwrap().into(),
+			src.join("dir/b.txt").to_str().unwrap().into(),
+		],
+		vec![
+			src.join("dir/b.txt").to_str().unwrap().into(),
+			src.join("dir").to_str().unwrap().into(),
+		],
+		vec![
+			src.to_str().unwrap().into(),
+			src.join("dir/a.txt").to_str().unwrap().into(),
+		],
+	];
+	for paths in subsets {
+		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+		let rust = snip(&src, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &src, &paths, None);
+		assert_eq!(text(&rust), text(&node), "{paths:?}");
+		assert_eq!(rust, node);
+		assert!(text(&rust).contains("// file: "), "empty payload");
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_tool_file_payload_order_dedupe_through_symlinked_root() {
+	let ts_ref = ts_ref_or_skip!();
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("ovl_real");
+	order_dedupe_fixture(&real);
+
+	let link = tmp.path().join("ovl_link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	let subsets: Vec<Vec<String>> = vec![
+		vec![
+			link.join("dir").to_str().unwrap().into(),
+			link.join("dir/b.txt").to_str().unwrap().into(),
+		],
+		vec![
+			link.join("dir/b.txt").to_str().unwrap().into(),
+			link.join("dir").to_str().unwrap().into(),
+		],
+		vec![
+			link.to_str().unwrap().into(),
+			link.join("dir/a.txt").to_str().unwrap().into(),
+		],
+	];
+	for paths in subsets {
+		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+		let rust = snip(&link, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &link, &paths, None);
+		assert_eq!(text(&rust), text(&node), "{paths:?}");
+		assert_eq!(rust, node);
+		assert!(text(&rust).contains("// file: "), "empty payload");
+	}
+}
+
 #[test]
 fn cross_tool_commit_payload_is_byte_identical() {
 	let ts_ref = ts_ref_or_skip!();

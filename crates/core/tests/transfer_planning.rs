@@ -41,8 +41,9 @@ use snip_core::restore::{
 use snip_core::settings::{FilterAction, FilterRule, FilterType, Settings};
 use snip_core::transfer::{
 	changed_items, detect_clipboard_prefixes, expand_folder_items,
-	plan_commit_export, plan_commit_export_exact, plan_commit_export_with,
-	plan_export, plan_import, plan_import_with, selection_from_paths,
+	expand_folder_items_in_input_order, plan_commit_export,
+	plan_commit_export_exact, plan_commit_export_with, plan_export,
+	plan_import, plan_import_with, selection_from_paths,
 	validate_commit_selection, CanonicalRootId, CommitReplayPreview,
 	DestinationFreshnessSnapshot, ExportItem, ExportSelection, ImportMapping,
 	SourceFreshnessSnapshot, SourceKind, TransferError, CLIPBOARD_PAYLOAD_MAX,
@@ -3542,6 +3543,143 @@ fn test_expand_folder_items_budget_truncation_and_deduplication() {
 		.count();
 	assert_eq!(f1_count, 1);
 	assert!(!expanded3.truncated);
+}
+
+#[test]
+fn test_expand_folder_items_input_order_deduplication() {
+	let repo = TestRepo::new("folder-input-order");
+	for i in 1..=5 {
+		repo.write(&format!("dir/f{i}.txt"), &format!("content {i}"));
+	}
+
+	let item_f3 = ExportItem {
+		root: repo.canonical_id(),
+		relative_path: "dir/f3.txt".to_string(),
+		source: SourceKind::File,
+		change_type: None,
+		gitlink: false,
+	};
+	let item_dir = ExportItem {
+		root: repo.canonical_id(),
+		relative_path: "dir".to_string(),
+		source: SourceKind::File,
+		change_type: None,
+		gitlink: false,
+	};
+
+	// 1. expand_folder_items ordering is UNCHANGED: [dir/f3.txt, dir] gives f3 first, then f1,f2,f4,f5
+	let sel_gui = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![item_f3.clone(), item_dir.clone()],
+	)
+	.unwrap();
+	let expanded_gui =
+		expand_folder_items(sel_gui, 10, &CancelToken::new()).unwrap();
+	let paths_gui: Vec<&str> = expanded_gui
+		.sel
+		.items
+		.iter()
+		.map(|i| i.relative_path.as_str())
+		.collect();
+	assert_eq!(
+		paths_gui,
+		&[
+			"dir/f3.txt",
+			"dir/f1.txt",
+			"dir/f2.txt",
+			"dir/f4.txt",
+			"dir/f5.txt",
+		]
+	);
+
+	// 2. expand_folder_items_in_input_order on [dir, dir/f3.txt] gives f1..f5 in walk order once each
+	let sel_dir_first = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![item_dir.clone(), item_f3.clone()],
+	)
+	.unwrap();
+	let expanded_dir_first = expand_folder_items_in_input_order(
+		sel_dir_first,
+		10,
+		&CancelToken::new(),
+	)
+	.unwrap();
+	let paths_dir_first: Vec<&str> = expanded_dir_first
+		.sel
+		.items
+		.iter()
+		.map(|i| i.relative_path.as_str())
+		.collect();
+	assert_eq!(
+		paths_dir_first,
+		&[
+			"dir/f1.txt",
+			"dir/f2.txt",
+			"dir/f3.txt",
+			"dir/f4.txt",
+			"dir/f5.txt",
+		]
+	);
+
+	// 3. expand_folder_items_in_input_order on [dir/f3.txt, dir] gives f3 first then f1,f2,f4,f5
+	let sel_f3_first = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![item_f3.clone(), item_dir.clone()],
+	)
+	.unwrap();
+	let expanded_f3_first = expand_folder_items_in_input_order(
+		sel_f3_first,
+		10,
+		&CancelToken::new(),
+	)
+	.unwrap();
+	let paths_f3_first: Vec<&str> = expanded_f3_first
+		.sel
+		.items
+		.iter()
+		.map(|i| i.relative_path.as_str())
+		.collect();
+	assert_eq!(
+		paths_f3_first,
+		&[
+			"dir/f3.txt",
+			"dir/f1.txt",
+			"dir/f2.txt",
+			"dir/f4.txt",
+			"dir/f5.txt",
+		]
+	);
+
+	// 4. Truncated case: [dir, dir/f3.txt] limit small -> truncated_at is a valid index into items and items has no duplicates
+	let sel_trunc = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![item_dir, item_f3],
+	)
+	.unwrap();
+	let expanded_trunc =
+		expand_folder_items_in_input_order(sel_trunc, 2, &CancelToken::new())
+			.unwrap();
+	assert!(expanded_trunc.truncated);
+	let trunc_idx = expanded_trunc
+		.truncated_at
+		.expect("truncated_at must be Some when truncated");
+	assert!(
+		trunc_idx <= expanded_trunc.sel.items.len(),
+		"truncated_at {trunc_idx} must be a valid index into items of len {}",
+		expanded_trunc.sel.items.len()
+	);
+	let mut seen = std::collections::HashSet::new();
+	for item in &expanded_trunc.sel.items {
+		assert!(
+			seen.insert((item.root.clone(), item.relative_path.clone())),
+			"duplicate item found in truncated items: {}",
+			item.relative_path
+		);
+	}
 }
 
 #[test]
