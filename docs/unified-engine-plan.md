@@ -59,7 +59,7 @@ Hindsight 記錄:2026-09-30 架構深化時「合併兩條 export pipeline」被
 
 **非目標**
 - 不改剪貼簿線上格式,不動 `fixtures/clipboard-contract.json`(它歸 ClipCodeVSCode 管)。
-- 不改 GUI 的互動與畫面(除非第 3 節 D4 決定讓 GUI 也採用 restore-base 建議)。
+- 不改 GUI 的互動與畫面,除非第 3 節 D4(GUI 採用 restore-base 建議,目前決定不改)、D8(絕對路徑匯入修正)與 D10(不分大小寫檔案系統的新目標碰撞)——後兩者經共用 core 函式 `plan_import_with` 改變 GUI 貼上行為,於階段 5b 落地。
 - 不重寫 `restore::plan_restore`:它仍是 `plan_import_with` 每筆 entry 的規劃器,也是 contract 測試的對象。
 - 舊函式(`collect_copy_files`、`collect_payload`)不急著刪,先降級為測試 oracle;全部遷完、穩定一個版本後再評估移除。
 
@@ -71,7 +71,7 @@ AGENTS.md 與既有慣例規定:與 TS 不同的行為**只有使用者能決定
 
 ### D1 — CLI 貼上要不要採用 transfer 的兩道防護?
 
-`transfer` 貼上比 TS 多兩道:(a) `TargetCollision`:兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分會由 realpath 偵測;Windows 上即使皆為新增亦會摺疊大小寫阻擋;僅在 macOS 等非 Windows 的不區分大小寫檔案系統上,差異片段皆不存在時目前未偵測,以及 symlink 別名)就整批拒絕;(b) freshness:預覽後目標或 repo HEAD/index 有變就拒絕(`StaleDestination`)。兩者都違反 spec §3.2「一律覆蓋,不偵測目標是否被改過」,也與 TS 不同;GUI 已經這樣做,但沒登記。
+`transfer` 貼上比 TS 多兩道:(a) `TargetCollision`:兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分會由 realpath 偵測;Windows 上即使皆為新增亦會摺疊大小寫阻擋;僅在 macOS 等非 Windows 的不區分大小寫檔案系統上,差異片段皆不存在時目前未偵測(D10 於階段 5b 補上),以及 symlink 別名)就整批拒絕;(b) freshness:預覽後目標或 repo HEAD/index 有變就拒絕(`StaleDestination`)。兩者都違反 spec §3.2「一律覆蓋,不偵測目標是否被改過」,也與 TS 不同;GUI 已經這樣做,但沒登記。
 
 - **建議:採用**,並把兩者登記為已接受的差異、改寫 spec §3.2。理由:F1 是實際資料遺失,而 CLI 的 dry-run → apply 中間本來就可能隔很久。CLI 單一指令 `--apply` 時 plan 與 apply 緊接著,freshness 幾乎不會誤擋。
 - 代價:contract fixture 有三個案例描述的是 TS 行為,CLI 改走 `plan_import_with` 後會**不一樣**(見 D2)。
@@ -116,6 +116,22 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 ### D7 — `snip copy <paths>` 的路徑解析
 
 - **建議**:維持「相對路徑以 cwd 解析」(shell 慣例);路徑不存在 → exit 1;路徑在 `--repo` 外 → exit 1(目前舊引擎給絕對路徑 label,transfer 表達不了)。結果為空 → 「No files selected.」exit 1,不碰剪貼簿(T-11)。
+
+以下三項為階段 0 review 後(2026-10-02)使用者補決,優先於計畫中任何待決描述。
+
+### D8 — 貼上 payload 中的絕對路徑(review 後補決)
+
+- 決定:core `plan_import_with` 在 `sanitize_relative_path` 之前先解析絕對路徑,行為同 TS/`plan_restore`:root 內部絕對路徑解析成該 root 的相對路徑;`cross_machine_suffix_candidate` 命中則解析成符合的相對路徑;絕對 [DELETED] 路徑若解析不到任何 root,拒絕(以 unsafe/unresolved 跳過),絕不當巢狀路徑刪除。寫入對不到任何 root 的絕對路徑維持 TS 行為(照原樣放主 root 底下),但帶磁碟機代號者維持 `UNRESOLVED_PATH`(登記為 D2 已接受差異)。
+- 影響:GUI 一併改變——現行 GUI 對絕對路徑 payload 的巢狀寫入與巢狀刪除是 bug,經共用 core 函式於階段 5b 修好。
+
+### D9 — commit 貼上 `--overwrite` 的判定
+
+- 決定:以目標是否存在(`FilePlan.existed`)判定,與 GUI `commit_overwrite_required` 完全相同(即 D5 選項 a);不採「有未 commit 修改」的判定。
+
+### D10 — 兩筆都是新增的大小寫別名
+
+- 決定:在 core 探測目的端 root 的檔案系統是否不分大小寫,若是,`TargetCollision` 身分檢查也對新目標路徑摺疊大小寫(如 `[NEW] B.txt`+`[NEW] b.txt`,或 `D/x.txt`+`d/x.txt` 且 `D` 不存在)→ `TargetCollision`。
+- 影響:GUI 與 CLI 都受益;GUI 行為經共用 core 函式改變,於階段 5b 落地。
 
 ---
 
