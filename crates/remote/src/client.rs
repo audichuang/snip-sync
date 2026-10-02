@@ -19,8 +19,12 @@ use crate::{to_hex, Identity, RemoteError};
 
 /// The port a worker listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 47821;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+// Kept under the desktop app's 8 s drain deadline (lifecycle.rs): a call
+// cannot be cancelled mid-read, so a stalled worker must fail it in time.
+// The read timeout is idle time per read, so a slow but moving transfer
+// still completes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Idle connections a client keeps for reuse.
 const POOL: usize = 4;
 
@@ -239,8 +243,15 @@ impl Client {
 			None => (self.connect()?, false),
 		};
 		let result = match conn.call(request) {
-			// The worker closes idle connections; one fresh try.
-			Err(RemoteError::Io(_)) if reused => {
+			// The worker closes idle connections; one fresh try. A timeout
+			// is a stalled worker, not a stale connection: no retry.
+			Err(RemoteError::Io(err))
+				if reused
+					&& !matches!(
+						err.kind(),
+						io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+					) =>
+			{
 				conn = self.connect()?;
 				conn.call(request)
 			}

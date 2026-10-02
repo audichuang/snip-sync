@@ -112,7 +112,15 @@ impl WorkbenchModel {
 								div()
 									.text_size(px(SMALL_TEXT))
 									.text_color(rgb(pal().text_muted))
-									.child(clip_text(worker.addr.clone())),
+									.child(clip_text(format!(
+										"{} · {}",
+										worker.addr,
+										snip_remote::Fingerprint::from_hex(
+											&worker.fingerprint
+										)
+										.map(|f| f.short())
+										.unwrap_or_default()
+									))),
 							),
 					)
 					.child(

@@ -4205,6 +4205,7 @@ impl WorkbenchModel {
 		let job_cancel = (!fs_only).then(|| cancel.clone());
 		let delay = self.e2e_read_delay;
 		let remote = self.remote_target();
+		let locale = self.locale;
 		if e2e_on() {
 			app_log!("[APP:PREVIEW_LOADING: {file_path}]");
 		}
@@ -4222,7 +4223,7 @@ impl WorkbenchModel {
 							remote::read_preview(&client, &ws, &for_bg)
 						}
 						Some(_) => {
-							Err(i18n::t("remote_unsupported", Locale::En)
+							Err(i18n::t("remote_unsupported", locale)
 								.to_string())
 						}
 						None => {

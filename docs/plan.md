@@ -226,7 +226,7 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
   - `tls`:裝置身分、憑證驗證、配對證明。
   - `worker`:監聽與處理請求。
   - `client`:配對,以及 pin 住 worker 憑證後的呼叫。
-- **傳輸**:用 std 的阻塞 TCP 加 rustls(TLS 1.3,ring provider),不引入第二個 async runtime。rustls 與 ring 原本就經由 gpui 連進桌面版。每個 socket 都設讀寫逾時:連線 5 s、讀寫 30 s、閒置連線 5 min 由 worker 關閉。
+- **傳輸**:用 std 的阻塞 TCP 加 rustls(TLS 1.3,ring provider),不引入第二個 async runtime。rustls 與 ring 原本就經由 gpui 連進桌面版。每個 socket 都設逾時。master 端的連線逾時 2 s、讀寫的閒置逾時 5 s,讓卡住的 worker 在桌面版 8 s 的 drain 時限內失敗;慢但有在傳的資料不受影響。worker 端的讀寫逾時 30 s,閒置連線 5 min 後關閉。
 - **協定**:每一幀是 4 位元組 big-endian 長度,接一段 JSON。幀大小上限 8 MiB,超過就拒收,不會先配置記憶體。
   - 第一幀是 `hello`,帶協定版本(`PROTOCOL_VERSION`)。版本不同時回 `version_mismatch`。
   - 請求共有 `list_workspaces`、`list_dir`、`stat`、`read`、`write`、`rename`、`git` 幾種。其中 `write`、`rename`、`git` 目前回 `unsupported`。
