@@ -26,6 +26,7 @@
 //! 23. missing root rejected at boundaries
 //! 24. no silent freshness read error
 //! 25. alias target collision (inside-root symlink alias two headers collision Linux test)
+//! 26. phase 5b import fixes (D8 absolute path resolution and D10 new target case collision)
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1138,6 +1139,427 @@ content 2
 			other => panic!("expected TargetCollision, got {other:?}"),
 		}
 		assert!(!dst.canonical_id().path().join("target.txt").exists());
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 16b. Phase 5b import fixes (D8 absolute path resolution and D10 new target case collision)
+// ---------------------------------------------------------------------------
+
+fn test_dir_case_insensitive(dir: &Path) -> bool {
+	let probe = dir.join(".probe-case-a");
+	let probe_upper = dir.join(".PROBE-CASE-A");
+	let _ = fs::write(&probe, "probe");
+	let is_ci = fs::symlink_metadata(&probe_upper).is_ok();
+	let _ = fs::remove_file(&probe);
+	let _ = fs::remove_file(&probe_upper);
+	is_ci
+}
+
+#[test]
+fn test_d8_root_internal_absolute_write() {
+	let repo = TestRepo::new("d8-internal-write");
+	let abs_c = repo.canonical_id().path().join("src/c.ts");
+	let payload = format!("// file: {}\ncontent c\n", abs_c.display());
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+
+	let plan = plan_import(
+		&payload,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+
+	assert_eq!(plan.create_operations().len(), 1);
+	assert_eq!(plan.create_operations()[0].relative_path, "src/c.ts");
+	assert_eq!(plan.create_operations()[0].absolute_path, abs_c);
+	// Must NOT be nested under root like <root>/<root-abs-path-nested>
+	assert!(!plan.create_operations()[0]
+		.relative_path
+		.contains("d8-internal-write"));
+
+	let apply_res = plan
+		.apply(&RestoreSelection {
+			overwrite_existing: true,
+			..RestoreSelection::default()
+		})
+		.unwrap();
+	assert_eq!(apply_res.created_count, 1);
+	assert!(abs_c.exists());
+	assert_eq!(fs::read_to_string(&abs_c).unwrap(), "content c");
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_root = symlink_dir.path().join("symlink_internal_dst");
+		std::os::unix::fs::symlink(repo.path(), &symlink_root).unwrap();
+
+		// Destination root spelled through a symlink
+		// (a) payload spelled through canonical root
+		let canon_target = repo.canonical_id().path().join("src/c2.ts");
+		let payload_canon =
+			format!("// file: {}\ncontent c2\n", canon_target.display());
+		let plan_canon = plan_import(
+			&payload_canon,
+			"// file: $FILE_PATH",
+			std::slice::from_ref(&symlink_root),
+			&mapping,
+		)
+		.unwrap();
+		assert_eq!(plan_canon.create_operations().len(), 1);
+		assert_eq!(
+			plan_canon.create_operations()[0].relative_path,
+			"src/c2.ts"
+		);
+		assert_eq!(
+			plan_canon.create_operations()[0].absolute_path,
+			canon_target
+		);
+
+		// (b) payload spelled through symlink root
+		let sym_target = symlink_root.join("src/c3.ts");
+		let payload_sym =
+			format!("// file: {}\ncontent c3\n", sym_target.display());
+		let plan_sym = plan_import(
+			&payload_sym,
+			"// file: $FILE_PATH",
+			&[symlink_root],
+			&mapping,
+		)
+		.unwrap();
+		assert_eq!(plan_sym.create_operations().len(), 1);
+		assert_eq!(plan_sym.create_operations()[0].relative_path, "src/c3.ts");
+		assert_eq!(
+			plan_sym.create_operations()[0].absolute_path,
+			repo.canonical_id().path().join("src/c3.ts")
+		);
+	}
+}
+
+#[test]
+fn test_d8_cross_machine_suffix() {
+	let repo = TestRepo::new("suffix-target");
+	let payload = "// file: /Users/bob/suffix-target/src/a.ts\ncontent a\n";
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+
+	let plan = plan_import(
+		payload,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+
+	assert_eq!(plan.create_operations().len(), 1);
+	assert_eq!(plan.create_operations()[0].relative_path, "src/a.ts");
+	assert_eq!(
+		plan.create_operations()[0].absolute_path,
+		repo.canonical_id().path().join("src/a.ts")
+	);
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_root = symlink_dir.path().join("symlink_suffix_dst");
+		std::os::unix::fs::symlink(repo.path(), &symlink_root).unwrap();
+
+		let plan_sym = plan_import(
+			payload,
+			"// file: $FILE_PATH",
+			&[symlink_root],
+			&mapping,
+		)
+		.unwrap();
+		assert_eq!(plan_sym.create_operations().len(), 1);
+		assert_eq!(plan_sym.create_operations()[0].relative_path, "src/a.ts");
+		assert_eq!(
+			plan_sym.create_operations()[0].absolute_path,
+			repo.canonical_id().path().join("src/a.ts")
+		);
+	}
+}
+
+#[test]
+fn test_d8_unresolvable_absolute_deleted_nested_delete_regression() {
+	let repo = TestRepo::new("nested-del-target");
+	let nested_file = repo.path().join("opt/unrelated/gone.txt");
+	repo.write("opt/unrelated/gone.txt", "survivor body\n");
+	assert!(nested_file.exists());
+
+	let payload = "// file: [DELETED] /opt/unrelated/gone.txt\n";
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+
+	let plan = plan_import(
+		payload,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+
+	assert!(
+		plan.delete_operations().is_empty(),
+		"must have NO delete operation"
+	);
+	assert_eq!(plan.create_operations().len(), 0);
+	assert_eq!(plan.skipped_operations().len(), 1);
+	assert_eq!(
+		plan.skipped_operations()[0].raw_path,
+		"/opt/unrelated/gone.txt"
+	);
+	assert_eq!(plan.skipped_operations()[0].relative_path, None);
+	assert_eq!(
+		plan.skipped_operations()[0].reason,
+		SkipReason::UnresolvedPath
+	);
+
+	let apply_res = plan
+		.apply(&RestoreSelection {
+			overwrite_existing: true,
+			..RestoreSelection::default()
+		})
+		.unwrap();
+	assert_eq!(apply_res.deleted_count, 0);
+	assert!(
+		nested_file.exists(),
+		"nested file opt/unrelated/gone.txt must survive on disk"
+	);
+	assert_eq!(fs::read_to_string(&nested_file).unwrap(), "survivor body\n");
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_root = symlink_dir.path().join("symlink_nested_del_dst");
+		std::os::unix::fs::symlink(repo.path(), &symlink_root).unwrap();
+
+		let plan_sym = plan_import(
+			payload,
+			"// file: $FILE_PATH",
+			&[symlink_root],
+			&mapping,
+		)
+		.unwrap();
+		assert!(plan_sym.delete_operations().is_empty());
+		assert_eq!(plan_sym.skipped_operations().len(), 1);
+		assert_eq!(
+			plan_sym.skipped_operations()[0].reason,
+			SkipReason::UnresolvedPath
+		);
+		assert!(nested_file.exists());
+	}
+}
+
+#[test]
+fn test_d8_unresolvable_absolute_write_and_drive_letter() {
+	let repo = TestRepo::new("unres-write-target");
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+
+	// POSIX absolute write matching no root -> stripped leading slash, kept literally under primary
+	let payload_posix = "// file: /opt/unrelated/written.txt\nposix body\n";
+	let plan_posix = plan_import(
+		payload_posix,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+	assert_eq!(plan_posix.create_operations().len(), 1);
+	assert_eq!(
+		plan_posix.create_operations()[0].relative_path,
+		"opt/unrelated/written.txt"
+	);
+	assert_eq!(
+		plan_posix.create_operations()[0].absolute_path,
+		repo.canonical_id().path().join("opt/unrelated/written.txt")
+	);
+	let _ = plan_posix
+		.apply(&RestoreSelection {
+			overwrite_existing: true,
+			..RestoreSelection::default()
+		})
+		.unwrap();
+	assert!(repo.path().join("opt/unrelated/written.txt").exists());
+
+	// Drive-letter path D:/work/lib/b.ts -> skipped as UnresolvedPath
+	let payload_drive = "// file: D:/work/lib/b.ts\ndrive content\n";
+	let plan_drive = plan_import(
+		payload_drive,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+	assert!(plan_drive.create_operations().is_empty());
+	assert!(plan_drive.delete_operations().is_empty());
+	assert!(plan_drive
+		.skipped_operations()
+		.iter()
+		.any(|s| s.raw_path == "D:/work/lib/b.ts"
+			&& s.reason == SkipReason::UnresolvedPath));
+
+	// Drive-letter path D:\work\lib\b2.ts -> skipped as UnresolvedPath
+	let payload_drive_b = "// file: D:\\work\\lib\\b2.ts\ndrive content\n";
+	let plan_drive_b = plan_import(
+		payload_drive_b,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+	assert!(plan_drive_b.create_operations().is_empty());
+	assert!(plan_drive_b
+		.skipped_operations()
+		.iter()
+		.any(|s| s.raw_path == "D:\\work\\lib\\b2.ts"
+			&& s.reason == SkipReason::UnresolvedPath));
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_root = symlink_dir.path().join("symlink_unres_dst");
+		std::os::unix::fs::symlink(repo.path(), &symlink_root).unwrap();
+
+		let plan_sym_drive = plan_import(
+			payload_drive,
+			"// file: $FILE_PATH",
+			&[symlink_root],
+			&mapping,
+		)
+		.unwrap();
+		assert!(plan_sym_drive.create_operations().is_empty());
+		assert!(plan_sym_drive
+			.skipped_operations()
+			.iter()
+			.any(|s| s.raw_path == "D:/work/lib/b.ts"
+				&& s.reason == SkipReason::UnresolvedPath));
+	}
+}
+
+#[test]
+fn test_d10_case_collision_new_targets() {
+	let repo = TestRepo::new("d10-collision-target");
+	let is_ci = test_dir_case_insensitive(repo.path());
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+
+	// [NEW] B.txt + [NEW] b.txt
+	let payload_bb = "// file: B.txt\ncontent B\n// file: b.txt\ncontent b\n";
+	let res_bb = plan_import(
+		payload_bb,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	);
+	if is_ci {
+		assert!(
+			matches!(res_bb, Err(TransferError::TargetCollision { .. })),
+			"expected TargetCollision on case-insensitive FS, got {res_bb:?}"
+		);
+		assert!(!repo.path().join("B.txt").exists());
+		assert!(!repo.path().join("b.txt").exists());
+	} else {
+		let plan = res_bb.unwrap();
+		assert_eq!(plan.create_operations().len(), 2);
+		let _ = plan
+			.apply(&RestoreSelection {
+				overwrite_existing: true,
+				..RestoreSelection::default()
+			})
+			.unwrap();
+		assert!(repo.path().join("B.txt").exists());
+		assert!(repo.path().join("b.txt").exists());
+	}
+
+	// D/x.txt + d/x.txt with D absent
+	let repo2 = TestRepo::new("d10-collision-dir");
+	let mapping2 = ImportMapping::with_primary(repo2.canonical_id());
+	let payload_dx =
+		"// file: D/x.txt\ncontent 1\n// file: d/x.txt\ncontent 2\n";
+	let res_dx = plan_import(
+		payload_dx,
+		"// file: $FILE_PATH",
+		&[repo2.path().to_path_buf()],
+		&mapping2,
+	);
+	if is_ci {
+		assert!(
+			matches!(res_dx, Err(TransferError::TargetCollision { .. })),
+			"expected TargetCollision on case-insensitive FS, got {res_dx:?}"
+		);
+	} else {
+		let plan = res_dx.unwrap();
+		assert_eq!(plan.create_operations().len(), 2);
+	}
+
+	// [NEW] A.txt + [DELETED] a.txt (a.txt exists)
+	let repo3 = TestRepo::new("d10-collision-del");
+	repo3.write("a.txt", "existing a\n");
+	let mapping3 = ImportMapping::with_primary(repo3.canonical_id());
+	let payload_ad =
+		"// file: A.txt\nnew A content\n// file: [DELETED] a.txt\n";
+	let res_ad = plan_import(
+		payload_ad,
+		"// file: $FILE_PATH",
+		&[repo3.path().to_path_buf()],
+		&mapping3,
+	);
+	if is_ci {
+		assert!(
+			matches!(res_ad, Err(TransferError::TargetCollision { .. })),
+			"expected TargetCollision on case-insensitive FS, got {res_ad:?}"
+		);
+	} else {
+		let plan = res_ad.unwrap();
+		assert_eq!(plan.create_operations().len(), 1);
+		assert_eq!(plan.delete_operations().len(), 1);
+	}
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_root = symlink_dir.path().join("symlink_d10_dst");
+		std::os::unix::fs::symlink(repo.path(), &symlink_root).unwrap();
+
+		let res_sym = plan_import(
+			payload_bb,
+			"// file: $FILE_PATH",
+			&[symlink_root],
+			&mapping,
+		);
+		if is_ci {
+			assert!(matches!(
+				res_sym,
+				Err(TransferError::TargetCollision { .. })
+			));
+		} else {
+			assert_eq!(res_sym.unwrap().create_operations().len(), 2);
+		}
+	}
+}
+
+#[test]
+fn test_d10_probe_fs_case_insensitive_behavior() {
+	let repo = TestRepo::new("d10-probe-behavior");
+	let is_ci = test_dir_case_insensitive(repo.path());
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+
+	let payload = "// file: ProbeFile.txt\n1\n// file: probefile.txt\n2\n";
+	let res = plan_import(
+		payload,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	);
+	assert_eq!(
+		res.is_err(),
+		is_ci,
+		"target collision presence must match runtime case-insensitivity probe"
+	);
+	if is_ci {
+		assert!(matches!(
+			res.unwrap_err(),
+			TransferError::TargetCollision { .. }
+		));
 	}
 }
 

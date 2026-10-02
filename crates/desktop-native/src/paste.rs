@@ -2520,6 +2520,57 @@ pub(crate) mod tests {
 	}
 
 	#[test]
+	fn test_gui_root_internal_absolute_path_resolved() {
+		let dir = tempfile::tempdir().unwrap();
+		let dest = dunce::canonicalize(dir.path()).unwrap();
+		let target_file = dest.join("src").join("c.ts");
+		let payload =
+			format!("// FILE: {}\ncontent c\n", target_file.display());
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&payload,
+			&dest,
+			&[],
+			1,
+		)
+		.unwrap();
+
+		assert_eq!(plan.items.len(), 1);
+		assert_eq!(plan.items[0].path, "src/c.ts");
+		assert_eq!(plan.items[0].dest_path, target_file);
+		assert_eq!(plan.items[0].op, PlannedOp::Create);
+
+		let res = plan.execute().unwrap().files;
+		assert_eq!(res.created_count, 1);
+		assert!(target_file.exists());
+		assert_eq!(fs::read_to_string(&target_file).unwrap(), "content c");
+	}
+
+	#[test]
+	fn test_gui_unresolvable_absolute_deleted_leaves_nested_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let dest = dunce::canonicalize(dir.path()).unwrap();
+		let nested_file = dest.join("opt").join("unrelated").join("gone.txt");
+		fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
+		fs::write(&nested_file, "nested body").unwrap();
+		assert!(nested_file.exists());
+
+		let payload = "// FILE: [DELETED] /opt/unrelated/gone.txt\n";
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(payload, &dest, &[], 1)
+				.unwrap();
+
+		// The plan has no delete operation for the unresolvable absolute deleted entry
+		assert!(plan.items.iter().all(|i| i.op != PlannedOp::Delete));
+
+		let _ = plan.execute().unwrap();
+		assert!(
+			nested_file.exists(),
+			"pre-existing nested file must survive after apply"
+		);
+		assert_eq!(fs::read_to_string(&nested_file).unwrap(), "nested body");
+	}
+
+	#[test]
 	fn test_paste_stale_destination_detection() {
 		let dir = tempfile::tempdir().unwrap();
 		let dest = dir.path();

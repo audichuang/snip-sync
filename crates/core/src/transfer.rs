@@ -1253,6 +1253,148 @@ fn canonical_target_identity(path: &Path) -> String {
 	paths::path_key(&full.to_string_lossy())
 }
 
+pub(crate) fn fs_is_case_insensitive(root: &Path) -> bool {
+	probe_fs_case_insensitive(root)
+		.unwrap_or(cfg!(any(windows, target_os = "macos")))
+}
+
+fn swap_ascii_case(s: &str) -> Option<String> {
+	let mut swapped = String::with_capacity(s.len());
+	let mut has_ascii_alpha = false;
+	for c in s.chars() {
+		if c.is_ascii_alphabetic() {
+			has_ascii_alpha = true;
+			if c.is_ascii_lowercase() {
+				swapped.push(c.to_ascii_uppercase());
+			} else {
+				swapped.push(c.to_ascii_lowercase());
+			}
+		} else {
+			swapped.push(c);
+		}
+	}
+	if has_ascii_alpha {
+		Some(swapped)
+	} else {
+		None
+	}
+}
+
+#[cfg(unix)]
+fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
+	use std::os::unix::fs::MetadataExt;
+	let m1 = fs::symlink_metadata(p1)?;
+	let m2 = fs::symlink_metadata(p2)?;
+	Ok(m1.dev() == m2.dev() && m1.ino() == m2.ino())
+}
+
+#[cfg(not(unix))]
+fn is_same_file(p1: &Path, p2: &Path) -> io::Result<bool> {
+	let c1 = dunce::canonicalize(p1)?;
+	let c2 = dunce::canonicalize(p2)?;
+	Ok(c1 == c2)
+}
+
+fn probe_fs_case_insensitive(root: &Path) -> io::Result<bool> {
+	if let Ok(entries) = fs::read_dir(root) {
+		for entry in entries.flatten() {
+			let name = entry.file_name();
+			let name_str = name.to_string_lossy();
+			if let Some(swapped) = swap_ascii_case(&name_str) {
+				let orig_path = root.join(&name);
+				let swapped_path = root.join(&swapped);
+				match fs::symlink_metadata(&swapped_path) {
+					Ok(_) => {
+						if let Ok(same) =
+							is_same_file(&orig_path, &swapped_path)
+						{
+							return Ok(same);
+						}
+					}
+					Err(e) if e.kind() == io::ErrorKind::NotFound => {
+						return Ok(false);
+					}
+					Err(_) => {}
+				}
+			}
+		}
+	}
+
+	let pid = std::process::id();
+	let nanos = SystemTime::now()
+		.duration_since(SystemTime::UNIX_EPOCH)
+		.map(|d| d.as_nanos())
+		.unwrap_or(0);
+	let probe_name = format!(".snip-case-probe-{pid}-{nanos}");
+	let probe_path = root.join(&probe_name);
+	let swapped_name = format!(".SNIP-CASE-PROBE-{pid}-{nanos}");
+	let swapped_path = root.join(&swapped_name);
+
+	let probe_file = fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&probe_path);
+
+	match probe_file {
+		Ok(f) => {
+			drop(f);
+			let is_ci = match fs::symlink_metadata(&swapped_path) {
+				Ok(_) => {
+					is_same_file(&probe_path, &swapped_path).unwrap_or(true)
+				}
+				Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+				Err(_) => cfg!(any(windows, target_os = "macos")),
+			};
+			let _ = fs::remove_file(&probe_path);
+			let _ = fs::remove_file(&swapped_path);
+			Ok(is_ci)
+		}
+		Err(e) => Err(e),
+	}
+}
+
+fn op_is_case_insensitive(
+	op_root: Option<&Path>,
+	op_absolute: &Path,
+	canonical_dest_roots: &[CanonicalRootId],
+	root_case_insensitive: &HashMap<PathBuf, bool>,
+	primary: Option<&CanonicalRootId>,
+) -> bool {
+	if let Some(r) = op_root {
+		if let Some(&ci) = root_case_insensitive.get(r) {
+			return ci;
+		}
+		for cr in canonical_dest_roots {
+			if cr.path() == r
+				|| paths::path_key(&cr.path().to_string_lossy())
+					== paths::path_key(&r.to_string_lossy())
+			{
+				if let Some(&ci) = root_case_insensitive.get(cr.path()) {
+					return ci;
+				}
+			}
+		}
+	}
+	for cr in canonical_dest_roots {
+		if op_absolute.starts_with(cr.path()) {
+			if let Some(&ci) = root_case_insensitive.get(cr.path()) {
+				return ci;
+			}
+		}
+	}
+	if let Some(p) = primary {
+		if let Some(&ci) = root_case_insensitive.get(p.path()) {
+			return ci;
+		}
+	}
+	if let Some(cr) = canonical_dest_roots.first() {
+		if let Some(&ci) = root_case_insensitive.get(cr.path()) {
+			return ci;
+		}
+	}
+	cfg!(any(windows, target_os = "macos"))
+}
+
 // ---------------------------------------------------------------------------
 // Core Public APIs
 // ---------------------------------------------------------------------------
@@ -2413,7 +2555,14 @@ pub fn plan_import(
 /// [`plan_import`] with the caller's runner options.
 ///
 /// The clipboard parser and per-file restore planner are the ones
-/// [`plan_import`] uses. The token is polled before and after parsing, and
+/// [`plan_import`] uses. Absolute entry paths not present in explicit entry
+/// destinations are resolved against destination roots before sanitization;
+/// unresolvable absolute deleted entries are skipped as unresolved paths rather
+/// than deleting nested files, while unresolvable absolute writes keep their
+/// literal nested path under the primary destination (or skip if drive-letter
+/// paths). Case-insensitive destination filesystems are probed at runtime to
+/// fold identities in target collision checks.
+/// The token is polled before and after parsing, and
 /// between roots, routed entries, per-file planning, target-identity checks
 /// and freshness reads. Encoding classification may `read` up to 8 MiB in
 /// one call, and one freshness chunk is at most 8 KiB; neither `read` can
@@ -2459,12 +2608,29 @@ pub fn plan_import_with(
 		}
 	}
 
+	let mut root_case_insensitive: HashMap<PathBuf, bool> = HashMap::new();
+	for root in &canonical_dest_roots {
+		cancelled_err(opts, "plan-import")?;
+		root_case_insensitive
+			.entry(root.path().to_path_buf())
+			.or_insert_with(|| fs_is_case_insensitive(root.path()));
+	}
+
+	let mut dest_root_paths: Vec<&Path> =
+		canonical_dest_roots.iter().map(|id| id.path()).collect();
+	for r in destination_roots {
+		if !dest_root_paths.contains(&r.as_path()) {
+			dest_root_paths.push(r.as_path());
+		}
+	}
+	let primary_dest_path =
+		mapping.primary_destination.as_ref().map(|id| id.path());
+
 	cancelled_err(opts, "plan-import")?;
 	let entries = format::parse_clipboard(clipboard_text, header_format);
 	cancelled_err(opts, "plan-import")?;
 
-	let mut root_to_entries: HashMap<CanonicalRootId, Vec<ParsedEntry>> =
-		HashMap::new();
+	let mut planned_entries: Vec<(CanonicalRootId, ParsedEntry)> = Vec::new();
 	let mut skipped_operations = Vec::new();
 
 	for entry in entries {
@@ -2475,18 +2641,94 @@ pub fn plan_import_with(
 			let rel =
 				em.relative_path.as_deref().unwrap_or(entry.path.as_str());
 			(&em.root, std::borrow::Cow::Borrowed(rel))
-		} else if let Some((prefix, rest)) = entry.path.split_once('/') {
-			if mapping.blocked_prefixes.contains(prefix) {
-				skipped_operations.push(SkippedOperation {
-					raw_path: entry.path.clone(),
-					relative_path: None,
-					reason: SkipReason::UnresolvedPath,
-				});
-				continue;
-			}
-			if let Some(dest) = mapping.prefix_destinations.get(prefix) {
-				// Prefix consumed EXACTLY ONCE
-				(dest, std::borrow::Cow::Borrowed(rest))
+		} else {
+			let normalized = paths::normalize_system_path(&entry.path);
+			if paths::is_absolute_path(&normalized) {
+				if let Some((root_str, rel)) =
+					paths::resolve_absolute_import_candidate(
+						&dest_root_paths,
+						primary_dest_path,
+						&entry.path,
+					) {
+					if rel.is_empty() {
+						skipped_operations.push(SkippedOperation {
+							raw_path: entry.path.clone(),
+							relative_path: None,
+							reason: SkipReason::UnresolvedPath,
+						});
+						continue;
+					}
+					let matched_root = canonical_dest_roots.iter().find(|id| {
+						paths::path_key(&id.path().to_string_lossy())
+							== paths::path_key(&root_str)
+							|| dunce::canonicalize(Path::new(&root_str))
+								.map(|c| {
+									paths::path_key(&c.to_string_lossy())
+										== paths::path_key(
+											&id.path().to_string_lossy(),
+										)
+								})
+								.unwrap_or(false)
+					});
+					match matched_root {
+						Some(root) => (root, std::borrow::Cow::Owned(rel)),
+						None => {
+							skipped_operations.push(SkippedOperation {
+								raw_path: entry.path.clone(),
+								relative_path: None,
+								reason: SkipReason::UnresolvedPath,
+							});
+							continue;
+						}
+					}
+				} else if entry.change_types.contains(&ChangeType::Deleted) {
+					skipped_operations.push(SkippedOperation {
+						raw_path: entry.path.clone(),
+						relative_path: None,
+						reason: SkipReason::UnresolvedPath,
+					});
+					continue;
+				} else if let Some(ref primary) = mapping.primary_destination {
+					(primary, std::borrow::Cow::Borrowed(entry.path.as_str()))
+				} else {
+					skipped_operations.push(SkippedOperation {
+						raw_path: entry.path.clone(),
+						relative_path: None,
+						reason: SkipReason::UnresolvedPath,
+					});
+					continue;
+				}
+			} else if let Some((prefix, rest)) = entry.path.split_once('/') {
+				if mapping.blocked_prefixes.contains(prefix) {
+					skipped_operations.push(SkippedOperation {
+						raw_path: entry.path.clone(),
+						relative_path: None,
+						reason: SkipReason::UnresolvedPath,
+					});
+					continue;
+				}
+				if let Some(dest) = mapping.prefix_destinations.get(prefix) {
+					// Prefix consumed EXACTLY ONCE
+					(dest, std::borrow::Cow::Borrowed(rest))
+				} else if let Some(ref primary) = mapping.primary_destination {
+					let rel = match &mapping.primary_prefix {
+						Some(p) if restore::is_relative(&entry.path) => {
+							std::borrow::Cow::Owned(format!(
+								"{p}/{}",
+								entry.path
+							))
+						}
+						_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
+					};
+					(primary, rel)
+				} else {
+					skipped_operations.push(SkippedOperation {
+						raw_path: entry.path.clone(),
+						relative_path: None,
+						reason: SkipReason::UnresolvedPath,
+					});
+					continue;
+				}
 			} else if let Some(ref primary) = mapping.primary_destination {
 				let rel = match &mapping.primary_prefix {
 					Some(p) if restore::is_relative(&entry.path) => {
@@ -2503,21 +2745,6 @@ pub fn plan_import_with(
 				});
 				continue;
 			}
-		} else if let Some(ref primary) = mapping.primary_destination {
-			let rel = match &mapping.primary_prefix {
-				Some(p) if restore::is_relative(&entry.path) => {
-					std::borrow::Cow::Owned(format!("{p}/{}", entry.path))
-				}
-				_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
-			};
-			(primary, rel)
-		} else {
-			skipped_operations.push(SkippedOperation {
-				raw_path: entry.path.clone(),
-				relative_path: None,
-				reason: SkipReason::UnresolvedPath,
-			});
-			continue;
 		};
 
 		let Some(sanitized) = sanitize_relative_path(&rel_path) else {
@@ -2529,14 +2756,14 @@ pub fn plan_import_with(
 			continue;
 		};
 
-		root_to_entries
-			.entry(target_root.clone())
-			.or_default()
-			.push(ParsedEntry {
+		planned_entries.push((
+			target_root.clone(),
+			ParsedEntry {
 				path: sanitized,
 				content: entry.content,
 				change_types: entry.change_types,
-			});
+			},
+		));
 	}
 
 	let mut combined_creates = Vec::new();
@@ -2545,25 +2772,32 @@ pub fn plan_import_with(
 
 	// Same `plan_restore` as before, one entry at a time so a cancel is
 	// observed before the next file's encoding read.
-	for (root_id, root_entries) in root_to_entries {
+	for (root_id, entry) in &planned_entries {
 		cancelled_err(opts, "plan-import")?;
-		for entry in &root_entries {
-			cancelled_err(opts, "plan-import")?;
-			let sub_plan = restore::plan_restore(
-				&[root_id.path()],
-				std::slice::from_ref(entry),
-			);
-			combined_creates.extend(sub_plan.create_operations);
-			combined_deletes.extend(sub_plan.delete_operations);
-			all_skipped.extend(sub_plan.skipped_operations);
-		}
+		let sub_plan = restore::plan_restore(
+			&[root_id.path()],
+			std::slice::from_ref(entry),
+		);
+		combined_creates.extend(sub_plan.create_operations);
+		combined_deletes.extend(sub_plan.delete_operations);
+		all_skipped.extend(sub_plan.skipped_operations);
 	}
 
 	// Reject if two entries map to the same target file (including symlinks and case aliases)
 	let mut target_identities: HashMap<String, String> = HashMap::new();
 	for op in &combined_creates {
 		cancelled_err(opts, "plan-import")?;
-		let identity = canonical_target_identity(&op.absolute_path);
+		let is_ci = op_is_case_insensitive(
+			Some(&op.root_path),
+			&op.absolute_path,
+			&canonical_dest_roots,
+			&root_case_insensitive,
+			mapping.primary_destination.as_ref(),
+		);
+		let mut identity = canonical_target_identity(&op.absolute_path);
+		if is_ci {
+			identity = identity.to_lowercase();
+		}
 		if let Some(prev) = target_identities
 			.insert(identity.clone(), format!("create {}", op.relative_path))
 		{
@@ -2581,7 +2815,17 @@ pub fn plan_import_with(
 	}
 	for op in &combined_deletes {
 		cancelled_err(opts, "plan-import")?;
-		let identity = canonical_target_identity(&op.absolute_path);
+		let is_ci = op_is_case_insensitive(
+			None,
+			&op.absolute_path,
+			&canonical_dest_roots,
+			&root_case_insensitive,
+			mapping.primary_destination.as_ref(),
+		);
+		let mut identity = canonical_target_identity(&op.absolute_path);
+		if is_ci {
+			identity = identity.to_lowercase();
+		}
 		if let Some(prev) = target_identities
 			.insert(identity.clone(), format!("delete {}", op.relative_path))
 		{

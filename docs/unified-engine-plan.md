@@ -71,7 +71,7 @@ AGENTS.md 與既有慣例規定:與 TS 不同的行為**只有使用者能決定
 
 ### D1 — CLI 貼上要不要採用 transfer 的兩道防護?
 
-`transfer` 貼上比 TS 多兩道:(a) `TargetCollision`:兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分會由 realpath 偵測;Windows 上即使皆為新增亦會摺疊大小寫阻擋;僅在 macOS 等非 Windows 的不區分大小寫檔案系統上,差異片段皆不存在時目前未偵測(D10 於階段 5b 補上),以及 symlink 別名)就整批拒絕;(b) freshness:預覽後目標或 repo HEAD/index 有變就拒絕(`StaleDestination`)。兩者都違反 spec §3.2「一律覆蓋,不偵測目標是否被改過」,也與 TS 不同;GUI 已經這樣做,但沒登記。
+`transfer` 貼上比 TS 多兩道:(a) `TargetCollision`:兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分會由 realpath 偵測;Windows 上即使皆為新增亦會摺疊大小寫阻擋;僅在 macOS 等非 Windows 的不區分大小寫檔案系統上,差異片段皆不存在時原先未偵測(D10 已於階段 5b 補上),以及 symlink 別名)就整批拒絕;(b) freshness:預覽後目標或 repo HEAD/index 有變就拒絕(`StaleDestination`)。兩者都違反 spec §3.2「一律覆蓋,不偵測目標是否被改過」,也與 TS 不同;GUI 已經這樣做,但沒登記。
 
 - **建議:採用**,並把兩者登記為已接受的差異、改寫 spec §3.2。理由:F1 是實際資料遺失,而 CLI 的 dry-run → apply 中間本來就可能隔很久。CLI 單一指令 `--apply` 時 plan 與 apply 緊接著,freshness 幾乎不會誤擋。
 - 代價:contract fixture 有三個案例描述的是 TS 行為,CLI 改走 `plan_import_with` 後會**不一樣**(見 D2)。
@@ -85,7 +85,7 @@ AGENTS.md 與既有慣例規定:與 TS 不同的行為**只有使用者能決定
 3. 「an absolute path matching no root is kept literally under the primary root」:POSIX 絕對路徑 root 外且無後綴符合 → 寫在主 root 下,同 TS;root 內部/跨機器後綴 → D8 修好後同 TS;只有磁碟機代號是真差異。帶磁碟機代號路徑(如 `D:\work\lib\b.ts`)被跳過的原因是 `paths.rs` `sanitize_relative_path` 內的 `is_absolute_path`/`has_drive_slash` 檢查(`D:\` 或 `D:/` 開頭視為絕對,sanitize 回 None),而不是冒號規則;TS 則寫為 `D/work/lib/b.ts`。
 
 - **結論(已依建議與 D8 拍板)**:1 依 D1 接受為差異;2 CLI 目前本就只有單 root,不受影響,登記「CLI 單 root」即可;3 接受帶磁碟機代號路徑因 `sanitize_relative_path` 絕對路徑檢查跳過為差異。三者都寫進 porting-notes,fixture 與 `contract.rs` 不動。
-- **絕對路徑處理(已決 D8)**:root 內部絕對路徑與跨機器後綴由 core `plan_import_with` 在 sanitize 前解析,與 TS 一致,故不是差異;絕對路徑 [DELETED] 若解析不到任何 root 則拒絕(視為 unsafe/unresolved 跳過),同 TS;現行 GUI 巢狀刪除是 bug,階段 5b 修復。寫入對不到任何 root 的 POSIX 絕對路徑維持 TS 行為(照原樣放主 root 底下),只有帶磁碟機代號者維持 `UNRESOLVED_PATH`(登記為 D2 的已接受差異)。GUI 因共用 core 函式一併修好。
+- **絕對路徑處理(已決 D8)**:root 內部絕對路徑與跨機器後綴由 core `plan_import_with` 在 sanitize 前解析,與 TS 一致,故不是差異;絕對路徑 [DELETED] 若解析不到任何 root 則拒絕(視為 unsafe/unresolved 跳過),同 TS;先前 GUI 巢狀刪除是 bug,已於階段 5b 修復。寫入對不到任何 root 的 POSIX 絕對路徑維持 TS 行為(照原樣放主 root 底下),只有帶磁碟機代號者維持 `UNRESOLVED_PATH`(登記為 D2 的已接受差異)。GUI 因共用 core 函式一併修好。
 
 ### D3 — `--range a..b` 怎麼辦?
 
@@ -122,7 +122,7 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 ### D8 — 貼上 payload 中的絕對路徑(review 後補決)
 
 - 決定:core `plan_import_with` 在 `sanitize_relative_path` 之前先解析絕對路徑,行為同 TS/`plan_restore`:root 內部絕對路徑解析成該 root 的相對路徑;`cross_machine_suffix_candidate` 命中則解析成符合的相對路徑;絕對 [DELETED] 路徑若解析不到任何 root,拒絕(以 unsafe/unresolved 跳過),絕不當巢狀路徑刪除。寫入對不到任何 root 的絕對路徑維持 TS 行為(照原樣放主 root 底下),但帶磁碟機代號者維持 `UNRESOLVED_PATH`(登記為 D2 已接受差異)。
-- 影響:GUI 一併改變——現行 GUI 對絕對路徑 payload 的巢狀寫入與巢狀刪除是 bug,經共用 core 函式於階段 5b 修好。
+- 影響:GUI 一併改變——先前 GUI 對絕對路徑 payload 的巢狀寫入與巢狀刪除是 bug,經共用 core 函式已於階段 5b 修好。
 
 ### D9 — commit 貼上 `--overwrite` 的判定
 
@@ -131,7 +131,7 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 ### D10 — 兩筆都是新增的大小寫別名
 
 - 決定:在 core 探測目的端 root 的檔案系統是否不分大小寫,若是,`TargetCollision` 身分檢查也對新目標路徑摺疊大小寫(如 `[NEW] B.txt`+`[NEW] b.txt`,或 `D/x.txt`+`d/x.txt` 且 `D` 不存在)→ `TargetCollision`。
-- 影響:GUI 與 CLI 都受益;GUI 行為經共用 core 函式改變,於階段 5b 落地。
+- 影響:GUI 與 CLI 都受益;GUI 行為經共用 core 函式改變,已於階段 5b 落地。
 
 ---
 
@@ -199,6 +199,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 - 測試:`transfer_planning.rs` #26–28、#36–38 與 :2415 原本用舊引擎當 oracle,保留;`cli.rs` 新增大檔案／大量未追蹤檔不爆記憶體的測試(以 payload 上限錯誤收尾,而不是 OOM)。
 
 ### 階段 5b — core 匯入修正(D8、D10)
+
+狀態:已完成(core `plan_import_with` 實作 D8 絕對路徑於 sanitize 前優先解析與未解析 DELETED 跳過防護(避免巢狀刪除)、D10 執行時期探測目的端檔案系統大小寫敏感度並對新目標路徑進行 TargetCollision 大小寫摺疊;core `transfer_planning` 補齊 root 內部絕對寫入、跨機器後綴、未解析 DELETED 巢狀刪除回歸防護、帶磁碟機代號路徑與 symlink 拼寫 root 等測試,並於 desktop-native `paste` 補齊 GUI 回歸測試)
 
 - 範圍:`transfer::plan_import_with`(`crates/core/src/transfer.rs`)。
   - D8:每筆 entry 在 `sanitize_relative_path` 之前先解析絕對路徑(root 內部 → 相對;`cross_machine_suffix_candidate` → 相對;絕對 [DELETED] 對不到任何 root → 以 unsafe/unresolved 跳過、不刪任何檔;絕對寫入對不到 root → 維持照原樣放主 root,磁碟機代號 → `UNRESOLVED_PATH`),行為對齊 `restore::plan_restore`/TS。GUI 行為因共用 core 函式一併修正(修正先前絕對路徑 payload 巢狀寫入與巢狀刪除的 bug)。
