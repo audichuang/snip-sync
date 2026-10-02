@@ -381,6 +381,31 @@ fn git_sources_label_paths_against_repo_subdirectory() {
 		text(&out.stderr)
 	);
 	assert!(text(&out.stderr).contains("1 Git file(s) copied."));
+
+	// A commit source copies the entire commit relative to the repo toplevel,
+	// even when --repo points to a subdirectory.
+	fs::create_dir_all(repo.join("other")).unwrap();
+	fs::write(repo.join("sub/a.txt"), "three\n").unwrap();
+	fs::write(repo.join("other/b.txt"), "other b\n").unwrap();
+	commit(&repo, "touch both", "2020-01-02T00:00:00+00:00");
+	let out = snip(
+		&[
+			"--repo",
+			sub.to_str().unwrap(),
+			"copy",
+			"--commit",
+			"HEAD",
+			"--stdout",
+		],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let payload = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(payload.contains("// clipcode-root: r"), "{payload}");
+	assert!(payload.contains("sub/a.txt"), "{payload}");
+	assert!(payload.contains("other/b.txt"), "{payload}");
+	assert!(!stderr.contains("outside --repo not copied"), "{stderr}");
 }
 
 #[test]
@@ -1379,5 +1404,89 @@ fn git_copy_working_empty_changes_exits_1() {
 		text(&out.stderr).contains("No Git changes found to copy."),
 		"{}",
 		text(&out.stderr)
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_working_skips_dangling_symlink() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("r");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+
+	fs::write(repo.join("a.txt"), "committed\n").unwrap();
+	commit(&repo, "init", "2020-01-01T00:00:00+00:00");
+	fs::write(repo.join("a.txt"), "modified\n").unwrap();
+
+	std::os::unix::fs::symlink("does-not-exist", repo.join("dangling"))
+		.unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip(&["--repo", repo_s, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(stdout.contains("[MODIFIED] a.txt"), "{stdout}");
+	assert!(!stdout.contains("dangling"), "{stdout}");
+	assert!(
+		stderr.contains("1 skipped: not UTF-8 text or unreadable"),
+		"{stderr}"
+	);
+
+	// Also test a tracked symlink retargeted to a missing path
+	fs::remove_file(repo.join("dangling")).unwrap();
+	fs::write(repo.join("target.txt"), "target\n").unwrap();
+	std::os::unix::fs::symlink("target.txt", repo.join("tracked_symlink"))
+		.unwrap();
+	commit(&repo, "add tracked symlink", "2020-01-02T00:00:00+00:00");
+
+	fs::write(repo.join("a.txt"), "modified again\n").unwrap();
+	fs::remove_file(repo.join("tracked_symlink")).unwrap();
+	std::os::unix::fs::symlink("missing-target", repo.join("tracked_symlink"))
+		.unwrap();
+
+	let out = snip(&["--repo", repo_s, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(stdout.contains("[MODIFIED] a.txt"), "{stdout}");
+	assert!(!stdout.contains("tracked_symlink"), "{stdout}");
+	assert!(
+		stderr.contains("1 skipped: not UTF-8 text or unreadable"),
+		"{stderr}"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_working_skips_symlink_outside_repo() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("r");
+	let outside = tmp.path().join("outside");
+	fs::create_dir_all(&repo).unwrap();
+	fs::create_dir_all(&outside).unwrap();
+	init_repo(&repo);
+
+	fs::write(repo.join("a.txt"), "committed\n").unwrap();
+	commit(&repo, "init", "2020-01-01T00:00:00+00:00");
+	fs::write(repo.join("a.txt"), "modified\n").unwrap();
+
+	let outside_file = outside.join("secret.txt");
+	fs::write(&outside_file, "SECRET-OUTSIDE\n").unwrap();
+	std::os::unix::fs::symlink(&outside_file, repo.join("leak")).unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip(&["--repo", repo_s, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(stdout.contains("[MODIFIED] a.txt"), "{stdout}");
+	assert!(stdout.contains("modified"), "{stdout}");
+	assert!(!stdout.contains("SECRET-OUTSIDE"), "{stdout}");
+	assert!(!stdout.contains("leak"), "{stdout}");
+	assert!(
+		stderr.contains("1 skipped: not UTF-8 text or unreadable"),
+		"{stderr}"
 	);
 }

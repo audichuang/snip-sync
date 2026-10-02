@@ -1277,7 +1277,9 @@ pub fn validate_export_selection(
 			return Err(TransferError::UnsafePath(item.relative_path.clone()));
 		}
 		let full = item.root.path().join(&sanitized);
-		if escapes_all_roots(&[item.root.path()], &full) {
+		if !matches!(item.source, SourceKind::Working | SourceKind::Unstaged)
+			&& escapes_all_roots(&[item.root.path()], &full)
+		{
 			return Err(TransferError::UnsafePath(item.relative_path.clone()));
 		}
 	}
@@ -1985,23 +1987,68 @@ pub fn plan_export_with(
 				}
 				SourceKind::Working
 				| SourceKind::Unstaged
-				| SourceKind::File => {
+				| SourceKind::File => 'read_file: {
 					cancelled_err(opts, "read-file")?;
-					let sym_meta = fs::symlink_metadata(&absolute)?;
+					let is_changed_item = matches!(
+						item.source,
+						SourceKind::Working | SourceKind::Unstaged
+					);
+					let sym_meta = match fs::symlink_metadata(&absolute) {
+						Ok(m) => m,
+						Err(e)
+							if is_changed_item
+								&& e.kind() == io::ErrorKind::NotFound =>
+						{
+							break 'read_file (None, None, None);
+						}
+						Err(e) => return Err(e.into()),
+					};
+					// The selection check no longer refuses changed items that
+					// escape (symlinked parent directory or link target), so
+					// they are skipped here before any read.
+					if is_changed_item
+						&& escapes_all_roots(&[item.root.path()], &absolute)
+					{
+						break 'read_file (None, None, None);
+					}
 					let target_meta = if sym_meta.file_type().is_symlink() {
 						let roots = [item.root.path()];
 						if escapes_all_roots(&roots, &absolute) {
+							if is_changed_item {
+								break 'read_file (None, None, None);
+							}
 							return Err(TransferError::UnsafePath(
 								absolute.to_string_lossy().into_owned(),
 							));
 						}
-						let canonical = dunce::canonicalize(&absolute)?;
+						let canonical = match dunce::canonicalize(&absolute) {
+							Ok(c) => c,
+							Err(e)
+								if is_changed_item
+									&& e.kind() == io::ErrorKind::NotFound =>
+							{
+								break 'read_file (None, None, None);
+							}
+							Err(e) => return Err(e.into()),
+						};
 						if escapes_all_roots(&roots, &canonical) {
+							if is_changed_item {
+								break 'read_file (None, None, None);
+							}
 							return Err(TransferError::UnsafePath(
 								canonical.to_string_lossy().into_owned(),
 							));
 						}
-						fs::metadata(&canonical)?
+						match fs::metadata(&canonical) {
+							Ok(m) => m,
+							Err(e)
+								if is_changed_item
+									&& e.kind() == io::ErrorKind::NotFound =>
+							{
+								break 'read_file (None, None, None);
+							}
+							Err(e) => return Err(e.into()),
+						}
 					} else {
 						sym_meta
 					};

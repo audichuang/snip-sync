@@ -43,7 +43,7 @@ use snip_core::transfer::{
 	changed_items, detect_clipboard_prefixes, expand_folder_items,
 	expand_folder_items_in_input_order, plan_commit_export,
 	plan_commit_export_exact, plan_commit_export_with, plan_export,
-	plan_import, plan_import_with, selection_from_paths,
+	plan_export_with, plan_import, plan_import_with, selection_from_paths,
 	validate_commit_selection, CanonicalRootId, CommitReplayPreview,
 	DestinationFreshnessSnapshot, ExportItem, ExportSelection, ImportMapping,
 	SourceFreshnessSnapshot, SourceKind, TransferError, CLIPBOARD_PAYLOAD_MAX,
@@ -5081,6 +5081,37 @@ fn test_changed_items_and_plan_export_subdir_symlink() {
 	assert!(plan.payload.contains("real modified\n"));
 	assert!(!plan.payload.contains("DECOY"));
 	assert!(!plan.payload.contains("outside"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_plan_export_working_skips_dangling_symlink() {
+	let repo = TestRepo::new("dangling-symlink");
+	repo.write("a.txt", "initial content\n");
+	repo.commit("initial");
+
+	repo.write("a.txt", "modified content\n");
+	std::os::unix::fs::symlink("does-not-exist", repo.path().join("dangling"))
+		.unwrap();
+
+	let root = repo.canonical_id();
+	let git = repo.open();
+	let opts = RunOptions::default();
+	let changed =
+		changed_items(&root, &git, &GitSource::Working, &opts).unwrap();
+
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		changed.items,
+	)
+	.unwrap();
+	let settings = Settings::default();
+	let plan = plan_export_with(&sel, &settings, None, &opts).unwrap();
+
+	assert_eq!(plan.skipped_unreadable_count, 1);
+	assert!(plan.files.iter().any(|f| f.path == "a.txt"));
+	assert!(!plan.files.iter().any(|f| f.path == "dangling"));
 }
 
 #[test]

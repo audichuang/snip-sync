@@ -24,7 +24,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 ### 已知且接受的差異
 
-- CLI `copy --working/--staged/--commit/--range` 改走 transfer 引擎 (階段 5); 讀取量受 32 MiB 上限與 read_cap 限制 (F12; 超限 exit 1 不截斷); `--repo` 為 git toplevel 的子目錄時: 範圍外的變更不再以絕對路徑 label 複製(舊引擎行為),改為略過並在 stderr 提示筆數; commit/range 的 `clipcode-root` 由 git toplevel basename 改為 `--repo` 目錄 basename (working/staged 原本就是 --repo basename)。其餘輸出與舊引擎完全一致(經由 symlink 拼寫的儲存庫路徑亦同)。狀態:現況(CLI 於階段 5 已切換)。
+- CLI `copy --working/--staged/--commit/--range` 改走 transfer 引擎 (階段 5); 讀取量受 32 MiB 上限與 read_cap 限制 (F12; 超限 exit 1 不截斷); `--repo` 為 git toplevel 的子目錄時: 範圍外的變更不再以絕對路徑 label 複製(舊引擎行為),改為略過並在 stderr 提示筆數; commit/range 維持使用 repo 相對路徑標籤與 toplevel 的 `clipcode-root`。差異清單如下: (1) working/staged: 指向儲存庫外部的 symlink、以及斷掉的 symlink / 在 git status 與讀取之間消失的檔案,現在改為逐檔略過並計入 unreadable(舊引擎對指向外部的 symlink 會複製外部目標內容造成 F3 外洩,斷掉的 symlink 則略過);GUI 的 Changes 檢視亦享有一致的核心行為; (2) 在啟用過濾條件且 `--repo` 為子目錄時,commit/range 的過濾比對採用 repo 相對路徑而非工作區相對拼寫。除此之外,其餘輸出與舊引擎完全一致(經由 symlink 拼寫的儲存庫路徑亦同)。狀態:現況(CLI 於階段 5 已切換)。
 - 原生工作台(`desktop-native`)的檔案模式上限是 10,000 個檔案(`NATIVE_FILE_COUNT_LIMIT`),不是 ClipCode 預設的 30:它沒有設定畫面,
   而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 payload 上限約束(GUI 複製上限現為 32 MiB(`CLIPBOARD_PAYLOAD_MAX`,階段 2 起),CLI 於階段 3/4 採用,超過是明確錯誤)。payload 格式不變。
   碰到上限時狀態列與複製提示明說「已達 N 個檔案上限,其餘檔案未複製」,不會默默少檔。
@@ -33,7 +33,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   資料夾內 payload 無法攜帶的檔案(名稱含 `< > : " | ? *`、控制字元、結尾空白、Unix 上的 `\`、非 UTF-8,
   斷掉或指出 root 的 symlink、FIFO/socket、讀不到的檔案)逐檔略過並計入「略過」,不讓整次複製失敗;
   含 `.git` 的目錄(包括選到的資料夾本身)一律不走訪。
-- 桌面 App 在 monorepo 子資料夾選 Git 來源時,變更清單與複製範圍限制在該資料夾,並可逐檔勾選;CLI 與原本的 `collect_payload` 仍複製整個 Git 來源。這是桌面選取範圍的行為,不改剪貼簿格式。commit / 區間的 payload 路徑仍依 TS graphCopy 使用 repo 相對路徑。
+- 桌面 App 在 monorepo 子資料夾選 Git 來源時,變更清單與複製範圍限制在該資料夾,並可逐檔勾選;CLI 與原本的 `collect_payload` 仍複製整個 Git 來源(對 CLI 而言,這適用於 commit/range,以及 `--repo` 位於 toplevel 時的 working/staged;working/staged 若 `--repo` 為子目錄則僅複製該子樹,見第一項差異)。這是桌面選取範圍的行為,不改剪貼簿格式。commit / 區間的 payload 路徑仍依 TS graphCopy 使用 repo 相對路徑。
 - Git 圖(`graph::compute_graph_layout`)預設照 SourceGit / TS 壓縮車道。`GraphConfig::hold_root_lanes` 是 Rust 才有的選項,只有原生工作台的多儲存庫合併 log(列 id 帶 `@<feed>`)會開:
   一條 rail 停在 root commit 後,它的車道空一列才讓右邊的 rail 往左移(保留的車道不會被相鄰的保留解除帶著左移),沒有入線的新節點也放在上一列所有車道的右邊。
   否則另一個儲存庫的 rail 會在下一列彎進該車道、commit 正好落在別人的 root 正下方,看起來像接在一起。單一儲存庫與 checkpoint 的幾何不變(保留的車道不寫進 checkpoint)。

@@ -308,11 +308,13 @@ fn copy_git(
 	stdout: bool,
 ) -> Outcome {
 	let git = Git::open(repo).map_err(|e| e.to_string())?;
-	let root_id = CanonicalRootId::new(repo).map_err(|e| e.to_string())?;
+	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
+	let effective_root = if graph { git.root() } else { repo };
+	let root_id =
+		CanonicalRootId::new(effective_root).map_err(|e| e.to_string())?;
 	let changed = changed_items(&root_id, &git, source, &RunOptions::default())
 		.map_err(map_transfer_err)?;
 
-	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
 	if changed.items.is_empty() {
 		return Err(if graph {
 			"No source copied.".into()
@@ -322,8 +324,8 @@ fn copy_git(
 	}
 
 	let sel = ExportSelection::new(
-		vec![repo.to_path_buf()],
-		Some(repo.to_path_buf()),
+		vec![effective_root.to_path_buf()],
+		Some(effective_root.to_path_buf()),
 		changed.items,
 	)
 	.map_err(map_transfer_err)?;
