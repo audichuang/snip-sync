@@ -140,6 +140,9 @@ pub(crate) fn resolve_absolute_import_candidate<P: AsRef<Path>>(
 }
 
 fn canonicalize_existing_prefix(normalized: &str) -> Option<String> {
+	if normalized.split('/').any(|s| s == ".." || s == ".") {
+		return None;
+	}
 	let path = native(normalized);
 	let mut current = path.as_path();
 	let mut trail = Vec::new();

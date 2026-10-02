@@ -1281,6 +1281,266 @@ fn test_d8_cross_machine_suffix() {
 }
 
 #[test]
+fn test_d8_suffix_raw_root_spelling() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("suffix-target");
+	fs::create_dir_all(root.join("src")).unwrap();
+	fs::write(root.join("src/keep.txt"), "keep\n").unwrap();
+	let primary = CanonicalRootId::new(&root).unwrap();
+	let mapping = ImportMapping::with_primary(primary.clone());
+
+	let payload_suffix =
+		"// file: /Users/bob/suffix-target/src/a.ts\ncontent a\n\
+		 // file: [DELETED] /Users/bob/suffix-target/src/keep.txt\n";
+	let plan_suffix = plan_import(
+		payload_suffix,
+		"// file: $FILE_PATH",
+		std::slice::from_ref(&root),
+		&mapping,
+	)
+	.unwrap();
+	assert_eq!(plan_suffix.skipped_operations().len(), 0);
+	assert_eq!(plan_suffix.delete_operations().len(), 1);
+	assert_eq!(
+		plan_suffix.delete_operations()[0].relative_path,
+		"src/keep.txt"
+	);
+	assert_eq!(
+		plan_suffix.delete_operations()[0].absolute_path,
+		primary.path().join("src/keep.txt")
+	);
+	assert_eq!(plan_suffix.create_operations().len(), 1);
+	assert_eq!(plan_suffix.create_operations()[0].relative_path, "src/a.ts");
+	assert_eq!(
+		plan_suffix.create_operations()[0].absolute_path,
+		primary.path().join("src/a.ts")
+	);
+
+	let raw_b = root.join("src/b.ts");
+	let payload = format!(
+		"// file: /Users/bob/suffix-target/src/a.ts\ncontent a\n\
+		 // file: [DELETED] /Users/bob/suffix-target/src/keep.txt\n\
+		 // file: {}\ncontent b\n",
+		raw_b.display()
+	);
+	let plan = plan_import(
+		&payload,
+		"// file: $FILE_PATH",
+		std::slice::from_ref(&root),
+		&mapping,
+	)
+	.unwrap();
+
+	assert_eq!(plan.skipped_operations().len(), 0);
+	assert_eq!(plan.delete_operations().len(), 1);
+	assert_eq!(plan.delete_operations()[0].relative_path, "src/keep.txt");
+	assert_eq!(
+		plan.delete_operations()[0].absolute_path,
+		primary.path().join("src/keep.txt")
+	);
+	assert_eq!(plan.create_operations().len(), 2);
+	assert_eq!(plan.create_operations()[0].relative_path, "src/a.ts");
+	assert_eq!(
+		plan.create_operations()[0].absolute_path,
+		primary.path().join("src/a.ts")
+	);
+	assert_eq!(plan.create_operations()[1].relative_path, "src/b.ts");
+	assert_eq!(
+		plan.create_operations()[1].absolute_path,
+		primary.path().join("src/b.ts")
+	);
+
+	let apply_res = plan
+		.apply(&RestoreSelection {
+			overwrite_existing: true,
+			..RestoreSelection::default()
+		})
+		.unwrap();
+	assert_eq!(apply_res.created_count, 2);
+	assert_eq!(apply_res.deleted_count, 1);
+	assert!(primary.path().join("src/a.ts").exists());
+	assert!(primary.path().join("src/b.ts").exists());
+	assert!(!primary.path().join("src/keep.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_d8_suffix_symlink_same_basename() {
+	let repo = TestRepo::new("suffix-target");
+	repo.write("src/keep.txt", "keep\n");
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+
+	let tmp2 = tempfile::tempdir().unwrap();
+	let symlink = tmp2.path().join("suffix-target");
+	std::os::unix::fs::symlink(repo.path(), &symlink).unwrap();
+
+	let payload_suffix =
+		"// file: /Users/bob/suffix-target/src/a.ts\ncontent a\n\
+		 // file: [DELETED] /Users/bob/suffix-target/src/keep.txt\n";
+	let plan_suffix = plan_import(
+		payload_suffix,
+		"// file: $FILE_PATH",
+		std::slice::from_ref(&symlink),
+		&mapping,
+	)
+	.unwrap();
+	assert_eq!(plan_suffix.skipped_operations().len(), 0);
+	assert_eq!(plan_suffix.delete_operations().len(), 1);
+	assert_eq!(
+		plan_suffix.delete_operations()[0].relative_path,
+		"src/keep.txt"
+	);
+	assert_eq!(
+		plan_suffix.delete_operations()[0].absolute_path,
+		repo.canonical_id().path().join("src/keep.txt")
+	);
+	assert_eq!(plan_suffix.create_operations().len(), 1);
+	assert_eq!(plan_suffix.create_operations()[0].relative_path, "src/a.ts");
+	assert_eq!(
+		plan_suffix.create_operations()[0].absolute_path,
+		repo.canonical_id().path().join("src/a.ts")
+	);
+
+	let raw_b = symlink.join("src/b.ts");
+	let payload = format!(
+		"// file: /Users/bob/suffix-target/src/a.ts\ncontent a\n\
+		 // file: [DELETED] /Users/bob/suffix-target/src/keep.txt\n\
+		 // file: {}\ncontent b\n",
+		raw_b.display()
+	);
+	let plan = plan_import(
+		&payload,
+		"// file: $FILE_PATH",
+		std::slice::from_ref(&symlink),
+		&mapping,
+	)
+	.unwrap();
+
+	assert_eq!(plan.skipped_operations().len(), 0);
+	assert_eq!(plan.delete_operations().len(), 1);
+	assert_eq!(plan.delete_operations()[0].relative_path, "src/keep.txt");
+	assert_eq!(
+		plan.delete_operations()[0].absolute_path,
+		repo.canonical_id().path().join("src/keep.txt")
+	);
+	assert_eq!(plan.create_operations().len(), 2);
+	assert_eq!(plan.create_operations()[0].relative_path, "src/a.ts");
+	assert_eq!(
+		plan.create_operations()[0].absolute_path,
+		repo.canonical_id().path().join("src/a.ts")
+	);
+	assert_eq!(plan.create_operations()[1].relative_path, "src/b.ts");
+	assert_eq!(
+		plan.create_operations()[1].absolute_path,
+		repo.canonical_id().path().join("src/b.ts")
+	);
+
+	let apply_res = plan
+		.apply(&RestoreSelection {
+			overwrite_existing: true,
+			..RestoreSelection::default()
+		})
+		.unwrap();
+	assert_eq!(apply_res.created_count, 2);
+	assert_eq!(apply_res.deleted_count, 1);
+	assert!(repo.canonical_id().path().join("src/a.ts").exists());
+	assert!(repo.canonical_id().path().join("src/b.ts").exists());
+	assert!(!repo.canonical_id().path().join("src/keep.txt").exists());
+}
+
+#[test]
+fn test_d8_dotdot_components_refused() {
+	let repo = TestRepo::new("dotdot-refusal");
+	let canon_root = repo.canonical_id().path().to_path_buf();
+	fs::create_dir_all(canon_root.join("sub")).unwrap();
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+
+	let p1 = format!("{}/newdir/../x.txt", canon_root.display());
+	let p2 = format!("{}/sub/../x.txt", canon_root.display());
+	let payload =
+		format!("// file: {p1}\ncontent 1\n// file: {p2}\ncontent 2\n");
+
+	let plan = plan_import(
+		&payload,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+
+	assert_eq!(plan.create_operations().len(), 0);
+	assert_eq!(plan.delete_operations().len(), 0);
+	assert_eq!(plan.skipped_operations().len(), 2);
+	assert_eq!(plan.skipped_operations()[0].raw_path, p1);
+	assert_eq!(
+		plan.skipped_operations()[0].reason,
+		SkipReason::UnresolvedPath
+	);
+	assert_eq!(plan.skipped_operations()[1].raw_path, p2);
+	assert_eq!(
+		plan.skipped_operations()[1].reason,
+		SkipReason::UnresolvedPath
+	);
+
+	let res = plan
+		.apply(&RestoreSelection {
+			overwrite_existing: true,
+			..RestoreSelection::default()
+		})
+		.unwrap();
+	assert_eq!(res.created_count, 0);
+	assert_eq!(res.deleted_count, 0);
+	assert!(!canon_root.join("x.txt").exists());
+	assert!(!canon_root.join("newdir").exists());
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_root = symlink_dir.path().join("alias-root");
+		std::os::unix::fs::symlink(repo.path(), &symlink_root).unwrap();
+
+		let p_sym1 = format!("{}/newdir/../x.txt", symlink_root.display());
+		let p_sym2 = format!("{}/sub/../x.txt", symlink_root.display());
+		let payload_sym = format!(
+			"// file: {p_sym1}\ncontent 1\n// file: {p_sym2}\ncontent 2\n"
+		);
+
+		let plan_sym = plan_import(
+			&payload_sym,
+			"// file: $FILE_PATH",
+			std::slice::from_ref(&symlink_root),
+			&mapping,
+		)
+		.unwrap();
+
+		assert_eq!(plan_sym.create_operations().len(), 0);
+		assert_eq!(plan_sym.delete_operations().len(), 0);
+		assert_eq!(plan_sym.skipped_operations().len(), 2);
+		assert_eq!(plan_sym.skipped_operations()[0].raw_path, p_sym1);
+		assert_eq!(
+			plan_sym.skipped_operations()[0].reason,
+			SkipReason::UnresolvedPath
+		);
+		assert_eq!(plan_sym.skipped_operations()[1].raw_path, p_sym2);
+		assert_eq!(
+			plan_sym.skipped_operations()[1].reason,
+			SkipReason::UnresolvedPath
+		);
+
+		let res_sym = plan_sym
+			.apply(&RestoreSelection {
+				overwrite_existing: true,
+				..RestoreSelection::default()
+			})
+			.unwrap();
+		assert_eq!(res_sym.created_count, 0);
+		assert_eq!(res_sym.deleted_count, 0);
+		assert!(!canon_root.join("x.txt").exists());
+		assert!(!canon_root.join("newdir").exists());
+	}
+}
+
+#[test]
 fn test_d8_unresolvable_absolute_deleted_nested_delete_regression() {
 	let repo = TestRepo::new("nested-del-target");
 	let nested_file = repo.path().join("opt/unrelated/gone.txt");

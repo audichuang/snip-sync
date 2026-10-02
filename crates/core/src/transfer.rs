@@ -2616,13 +2616,8 @@ pub fn plan_import_with(
 			.or_insert_with(|| fs_is_case_insensitive(root.path()));
 	}
 
-	let mut dest_root_paths: Vec<&Path> =
+	let dest_root_paths: Vec<&Path> =
 		canonical_dest_roots.iter().map(|id| id.path()).collect();
-	for r in destination_roots {
-		if !dest_root_paths.contains(&r.as_path()) {
-			dest_root_paths.push(r.as_path());
-		}
-	}
 	let primary_dest_path =
 		mapping.primary_destination.as_ref().map(|id| id.path());
 
