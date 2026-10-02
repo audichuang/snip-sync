@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/cli", "crates/desktop-native", "crates/native-e2e"]
+members = ["crates/core", "crates/cli", "crates/remote", "crates/desktop-native", "crates/native-e2e"]
 resolver = "2"
 # Vendored GPUI with a local patch; see vendor/gpui/SNIP_PATCH.md.
 exclude = ["vendor"]

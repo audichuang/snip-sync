@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 snip-core = { path = "../core" }
+snip-remote = { path = "../remote" }
 clap = { version = "4", features = ["derive"] }
 serde = "1"
 serde_json = "1"

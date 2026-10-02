@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 snip-core = { path = "../core" }
+snip-remote = { path = "../remote" }
 gpui = "=0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

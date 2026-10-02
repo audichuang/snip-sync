@@ -353,7 +353,15 @@ impl WorkbenchModel {
 			),
 			MenuEntry::Sep,
 		];
-		if ws {
+		if let Some(session) = &self.remote.session {
+			// The worker's own path, never revealed on this machine.
+			let abs = format!(
+				"{}/{}",
+				session.workspace.path,
+				row.rel_path.trim_end_matches('/')
+			);
+			v.extend(copy_entries(Some(abs), &row.rel_path));
+		} else if ws {
 			let abs = self
 				.ws_root()
 				.map(|r| r.join(row.rel_path.trim_end_matches('/')));

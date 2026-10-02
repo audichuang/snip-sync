@@ -22,6 +22,8 @@ use snip_core::restore::{
 };
 use snip_core::settings::Settings;
 
+mod remote;
+
 /// Re-exec argument for the Linux clipboard daemon (arboard's
 /// `examples/daemonize.rs`).
 #[cfg(target_os = "linux")]
@@ -101,6 +103,20 @@ enum Command {
 		#[arg(long)]
 		stdin: bool,
 	},
+	/// Serve folders to a paired snip-sync desktop app (remote-node
+	/// worker). Runs until stopped; prints a one-time pairing code.
+	Worker {
+		/// A folder the master may browse (repeatable). Nothing outside
+		/// these folders is served.
+		#[arg(long = "share", value_name = "DIR", required = true)]
+		shares: Vec<PathBuf>,
+		/// Address to listen on, e.g. the machine's Tailscale IP.
+		#[arg(long, value_name = "ADDR:PORT", default_value = snip_remote::DEFAULT_LISTEN)]
+		listen: std::net::SocketAddr,
+	},
+	/// Operate a paired worker's shared folders (remote-node master).
+	#[command(subcommand)]
+	Remote(remote::RemoteCommand),
 }
 
 /// A failure after argument parsing. Usage errors exit through clap (2).
@@ -174,6 +190,18 @@ fn main() -> ExitCode {
 				adjust_paths,
 			};
 			paste(&repo, &settings, &opts, stdin)
+		}
+		Command::Remote(cmd) => remote::run(cmd),
+		Command::Worker { shares, listen } => {
+			let config = snip_remote::default_config_dir();
+			match snip_remote::run_headless_worker(
+				listen,
+				&shares,
+				config.as_deref(),
+			) {
+				Ok(never) => match never {},
+				Err(err) => Err(format!("cannot start the worker: {err}")),
+			}
 		}
 	};
 	match result {
