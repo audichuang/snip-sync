@@ -365,13 +365,25 @@ impl State {
 	fn take_slot(&self) -> bool {
 		let deadline = Instant::now() + SLOT_WAIT;
 		loop {
-			let taken = self.connections.fetch_update(
-				Ordering::SeqCst,
-				Ordering::SeqCst,
-				|n| (n < MAX_CONNECTIONS).then_some(n + 1),
-			);
-			if taken.is_ok() {
+			// compare_exchange rather than fetch_update: newer toolchains
+			// deprecate that name, and CI denies warnings.
+			let n = self.connections.load(Ordering::SeqCst);
+			if n < MAX_CONNECTIONS
+				&& self
+					.connections
+					.compare_exchange(
+						n,
+						n + 1,
+						Ordering::SeqCst,
+						Ordering::SeqCst,
+					)
+					.is_ok()
+			{
 				return true;
+			}
+			if n < MAX_CONNECTIONS {
+				// Lost a race for the slot: look again at once.
+				continue;
 			}
 			if Instant::now() >= deadline || self.stop.load(Ordering::SeqCst) {
 				return false;
