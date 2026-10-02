@@ -730,6 +730,48 @@ fn copy_paths_never_includes_git_entries() {
 	assert!(!stdout_dot.contains("nested.txt"), "{stdout_dot}");
 }
 
+#[cfg(unix)]
+#[test]
+fn copy_paths_refuses_git_dir_symlinks() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+	fs::write(repo.join("file.txt"), "hello").unwrap();
+	commit(&repo, "initial", "2024-01-01T00:00:00+00:00");
+
+	let link = repo.join("link_to_git");
+	let link2 = repo.join("link_to_refs");
+	std::os::unix::fs::symlink(".git", &link).unwrap();
+	std::os::unix::fs::symlink(".git/refs", &link2).unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let link_s = link.to_str().unwrap();
+	let link2_s = link2.to_str().unwrap();
+	let file_s = repo.join("file.txt");
+	let file_s = file_s.to_str().unwrap();
+
+	let out = snip(&["--repo", repo_s, "copy", link_s, "--stdout"], None);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	let stderr = text(&out.stderr);
+	assert!(stderr.contains("No files selected"), "{stderr}");
+
+	let out2 = snip(&["--repo", repo_s, "copy", link2_s, "--stdout"], None);
+	assert_eq!(code(&out2), 1, "{}", text(&out2.stderr));
+	let stderr2 = text(&out2.stderr);
+	assert!(stderr2.contains("No files selected"), "{stderr2}");
+
+	let out_sibling = snip(
+		&["--repo", repo_s, "copy", link_s, file_s, "--stdout"],
+		None,
+	);
+	assert_eq!(code(&out_sibling), 0, "{}", text(&out_sibling.stderr));
+	let stdout = text(&out_sibling.stdout);
+	assert!(stdout.contains("// file: file.txt"), "{stdout}");
+	assert!(!stdout.contains(".git"), "{stdout}");
+	assert!(!stdout.contains("link_to_git"), "{stdout}");
+}
+
 #[test]
 fn copy_paths_empty_result_exits_one_and_leaves_clipboard_untouched() {
 	let tmp = tempfile::tempdir().unwrap();

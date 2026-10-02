@@ -111,6 +111,8 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   (2) 路徑重新定位:核心已新增 `ImportMapping::from_restore_base(&RestoreBaseSuggestion, primary)`(階段 2),供 CLI `--adjust-paths` 轉換為統一的 `ImportMapping`(CLI 於階段 6 切換採用),GUI 則維持現有逐 prefix 選擇的介面不變。
   狀態: core 已於階段 2 提供(`SourceKind::Range` 與 `ImportMapping::from_restore_base`),CLI 於階段 5/6 切換採用。
 - CLI 路徑複製解析規則(`snip copy <paths>`):相對路徑以 shell 目前工作目錄(cwd)解析;指定路徑不存在時 exit 1;指定路徑超出 `--repo` 邊界時 exit 1(舊引擎原先會賦予絕對路徑 label,transfer 無法表達此種跨 root 邊界 entry,故嚴格阻擋);指向 root 外部的 symlink、FIFO/socket/裝置檔案與 `.git`/巢狀 repo 一律略過修剪不納入 payload(避免掛起或外洩);若解析結果為空,顯示「No files selected.」以 exit 1 退出且不修改剪貼簿內容(符合決策 T-11);套用 32 MiB payload 複製上限(`CLIPBOARD_PAYLOAD_MAX`),超限 exit 1 絕不截斷。狀態:現況(CLI 於階段 4 已切換至統一 transfer 引擎)。
+- 目錄 symlink 的真實目標（canonical target）若為 `.git` 目錄或位於其內部，snip 在 GUI 與 CLI（`expand_folder_items` 與 `selection_from_paths`）皆一律拒絕跟進並視為略過（F5 意圖，避免外洩儲存庫內部資料或因特殊檔案失敗）；TS 版則會跟隨目錄 symlink 進入 `.git`。
+
 
 
 ## 2. 線上格式的不變量(摘要)
@@ -151,7 +153,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   `// This file has been deleted in this change`。刪除前的版本若是二進位或非 UTF-8，不論大小都視為沒有可用內容，繼續找下一個 parent（找不到才輸出刪除標記）；只有超過上限的文字才依上限處理。
 - **git 來源**讀不到的檔案放 placeholder(`// Unable to read file content`)進 payload,但**不算已複製**,也**不佔檔案數上限**。
   **磁碟來源**(檔案模式)讀不到或非 UTF-8 的檔案不放 placeholder,只計數;超過大小上限的放 skipped marker。
-- 目錄 symlink 只在它本身就是被選取的輸入時才跟進,遞迴過程中不跟進(避免 pnpm / Bazel 的交叉連結爆量);被選取的 root 內目錄 symlink 一律展開為資料夾(CLI 與 GUI 共用 `expand_folder_items`;GUI 原本會以 `SpecialFile` 讓整批複製失敗),與 TS 一致,所以不放進「已知且接受的差異」。
+- 目錄 symlink 只在它本身就是被選取的輸入時才跟進,遞迴過程中不跟進(避免 pnpm / Bazel 的交叉連結爆量);被選取的 root 內目錄 symlink 一律展開為資料夾(CLI 與 GUI 共用 `expand_folder_items`;GUI 原本會以 `SpecialFile` 讓整批複製失敗;目標指向 `.git` 或位於其內部者則拒絕,見「已知且接受的差異」),其餘與 TS 一致。
 
 ## 5. Git plumbing 對照
 

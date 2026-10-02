@@ -641,3 +641,48 @@ fn cross_tool_restores_each_others_payloads() {
 		"TS restores Rust"
 	);
 }
+
+#[cfg(unix)]
+#[test]
+fn cross_tool_expanding_folder_prefix_batching_byte_identical() {
+	let ts_ref = ts_ref_or_skip!();
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("real");
+	fs::create_dir_all(&real).unwrap();
+
+	// Create a_bin/ with 100 binary files (each containing NUL byte) and zz.txt
+	let a_bin = real.join("a_bin");
+	fs::create_dir_all(&a_bin).unwrap();
+	for i in 0..100 {
+		fs::write(a_bin.join(format!("bin_{i:03}.bin")), [0u8, 1, 2]).unwrap();
+	}
+	fs::write(a_bin.join("zz.txt"), "valid text in a_bin\n").unwrap();
+
+	// Create b00.txt .. b30.txt (31 text files)
+	for i in 0..=30 {
+		fs::write(
+			real.join(format!("b{i:02}.txt")),
+			format!("content b{i:02}\n"),
+		)
+		.unwrap();
+	}
+
+	let link = tmp.path().join("link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	let link_str = link.to_str().unwrap();
+	let paths = [link_str];
+	let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+	let rust = snip(&link, &args, None).stdout;
+	let node = ts(&ts_ref, "files", &link, &paths, None);
+	assert_eq!(text(&rust), text(&node));
+	assert_eq!(rust, node);
+	assert!(
+		text(&rust).contains("// file: a_bin/zz.txt"),
+		"{}",
+		text(&rust)
+	);
+	assert!(text(&rust).contains("// file: b00.txt"), "{}", text(&rust));
+	assert!(text(&rust).contains("// file: b28.txt"), "{}", text(&rust));
+	assert!(!text(&rust).contains("// file: b29.txt"), "{}", text(&rust));
+}
