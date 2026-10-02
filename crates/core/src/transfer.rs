@@ -40,6 +40,10 @@ use crate::restore::{
 use crate::settings::Settings;
 use crate::stats::{payload_stats, PayloadStats};
 
+mod select;
+
+pub use select::{expand_folder_items, FolderExpansion};
+
 /// A stable canonical identifier for an existing, resolved workspace or repository root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CanonicalRootId(PathBuf);

@@ -17,8 +17,8 @@ use snip_core::copy::{collect_copy_files, CopyResult};
 use snip_core::format::{extract_source_root, parse_clipboard};
 use snip_core::gitsrc::{collect_payload, Git, GitSource};
 use snip_core::restore::{
-	apply_restore_base, execute_restore_plan, plan_restore,
-	suggest_restore_base, DirProbe, RestorePlan, RestoreSelection,
+	apply_restore_base, execute_restore_plan, is_relative, plan_restore,
+	suggest_restore_base, FsProbe, RestorePlan, RestoreSelection,
 };
 use snip_core::settings::Settings;
 
@@ -539,36 +539,6 @@ fn paste(
 	}
 }
 
-/// Real-filesystem probe for `suggest_restore_base`.
-struct FsProbe;
-
-impl DirProbe for FsProbe {
-	fn is_dir(&self, abs_path: &str) -> bool {
-		fs::metadata(abs_path).is_ok_and(|m| m.is_dir())
-	}
-
-	fn child_dirs(&self, root_abs_path: &str) -> Vec<String> {
-		let Ok(entries) = fs::read_dir(root_abs_path) else {
-			return Vec::new();
-		};
-		entries
-			.flatten()
-			.filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-			.map(|e| e.file_name().to_string_lossy().into_owned())
-			.collect()
-	}
-}
-
-/// `isRelativeEntryPath`: no POSIX absolute, drive or UNC path.
-fn is_relative_entry_path(p: &str) -> bool {
-	let b = p.as_bytes();
-	let drive = b.len() >= 3
-		&& b[0].is_ascii_alphabetic()
-		&& b[1] == b':'
-		&& (b[2] == b'/' || b[2] == b'\\');
-	!p.is_empty() && !p.starts_with('/') && !drive && !p.starts_with('\\')
-}
-
 fn paste_files(
 	repo: &Path,
 	text: &str,
@@ -592,7 +562,7 @@ fn paste_files(
 	if let Some(s) = suggestion {
 		let example = paths
 			.iter()
-			.find(|p| is_relative_entry_path(p) && p.contains('/'))
+			.find(|p| is_relative(p) && p.contains('/'))
 			.map(|p| {
 				format!(" Example: {p} → {}", apply_restore_base(&s.base, p))
 			})
@@ -603,7 +573,7 @@ fn paste_files(
 				s.label, s.total
 			);
 			for e in &mut entries {
-				if is_relative_entry_path(&e.path) {
+				if is_relative(&e.path) {
 					e.path = apply_restore_base(&s.base, &e.path);
 				}
 			}
@@ -779,14 +749,5 @@ mod tests {
 		assert_eq!(grouped(999), "999");
 		assert_eq!(grouped(1000), "1,000");
 		assert_eq!(grouped(1234567), "1,234,567");
-	}
-
-	#[test]
-	fn relative_entry_paths() {
-		assert!(is_relative_entry_path("src/a.rs"));
-		assert!(!is_relative_entry_path(""));
-		assert!(!is_relative_entry_path("/abs"));
-		assert!(!is_relative_entry_path("C:/x"));
-		assert!(!is_relative_entry_path("\\\\server\\x"));
 	}
 }

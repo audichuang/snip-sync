@@ -33,15 +33,16 @@ use std::process::Command;
 
 use snip_core::copy;
 use snip_core::format::{self, ChangeType};
+use snip_core::gitrun::CancelToken;
 use snip_core::gitsrc::{self, Git, GitSource};
 use snip_core::restore::{self, RestoreSelection, SkipReason};
 use snip_core::settings::{FilterAction, FilterRule, FilterType, Settings};
 use snip_core::transfer::{
-	detect_clipboard_prefixes, plan_commit_export, plan_commit_export_exact,
-	plan_export, plan_import, validate_commit_selection, CanonicalRootId,
-	CommitReplayPreview, DestinationFreshnessSnapshot, ExportItem,
-	ExportSelection, ImportMapping, SourceFreshnessSnapshot, SourceKind,
-	TransferError,
+	detect_clipboard_prefixes, expand_folder_items, plan_commit_export,
+	plan_commit_export_exact, plan_export, plan_import,
+	validate_commit_selection, CanonicalRootId, CommitReplayPreview,
+	DestinationFreshnessSnapshot, ExportItem, ExportSelection, ImportMapping,
+	SourceFreshnessSnapshot, SourceKind, TransferError,
 };
 
 struct TestRepo {
@@ -3250,4 +3251,329 @@ fn commit_replay_apply_waits_for_the_worktree_lock() {
 	assert_eq!(repo.git(&["ls-files", "-s"]), index_before);
 	assert_eq!(repo.read("base.txt"), "modified base\n");
 	assert!(!repo.exists("new.txt"));
+}
+
+// ---------------------------------------------------------------------------
+// expand_folder_items unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_expand_folder_items_git_and_nested_repo_pruning() {
+	let repo = TestRepo::new("folder-pruning");
+	repo.write("dir/normal.txt", "normal content");
+	repo.write("dir/sub/other.txt", "sub content");
+	repo.write("dir/nested/repo_file.txt", "nested content");
+	// Nested repository with .git directory
+	fs::create_dir_all(repo.path().join("dir/nested/.git")).unwrap();
+	// Submodule / gitlink with .git file
+	repo.write("dir/submodule/.git", "gitdir: ../../.git/modules/submodule");
+	repo.write("dir/submodule/sub_file.txt", "submodule file");
+
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![ExportItem {
+			root: repo.canonical_id(),
+			relative_path: "dir".to_string(),
+			source: SourceKind::File,
+			change_type: None,
+		}],
+	)
+	.unwrap();
+
+	let expanded = expand_folder_items(sel, 100, &CancelToken::new()).unwrap();
+	let mut rels: Vec<_> = expanded
+		.sel
+		.items
+		.iter()
+		.map(|item| item.relative_path.as_str())
+		.collect();
+	rels.sort();
+
+	assert_eq!(rels, ["dir/normal.txt", "dir/sub/other.txt"]);
+	assert!(!expanded.truncated);
+	assert_eq!(expanded.skipped, 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_expand_folder_items_fifo_skipped() {
+	let repo = TestRepo::new("folder-fifo");
+	repo.write("dir/normal.txt", "normal content");
+	let fifo_path = repo.path().join("dir/named_pipe");
+	let status = Command::new("mkfifo").arg(&fifo_path).status();
+	match status {
+		Ok(s) if s.success() => {}
+		_ => {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"mkfifo command failed or is unavailable with SNIP_REQUIRE_ALL_TESTS set"
+			);
+			return;
+		}
+	}
+
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![ExportItem {
+			root: repo.canonical_id(),
+			relative_path: "dir".to_string(),
+			source: SourceKind::File,
+			change_type: None,
+		}],
+	)
+	.unwrap();
+
+	let (tx, rx) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let res = expand_folder_items(sel, 100, &CancelToken::new());
+		let _ = tx.send(res);
+	});
+
+	let expanded = rx
+		.recv_timeout(std::time::Duration::from_secs(5))
+		.expect("expand_folder_items timed out or blocked on FIFO")
+		.expect("expand_folder_items returned error");
+
+	assert!(expanded.skipped >= 1);
+	assert!(expanded
+		.sel
+		.items
+		.iter()
+		.all(|item| item.relative_path != "dir/named_pipe"));
+	assert_eq!(expanded.sel.items.len(), 1);
+	assert_eq!(expanded.sel.items[0].relative_path, "dir/normal.txt");
+}
+
+#[test]
+#[cfg(unix)]
+fn test_expand_folder_items_symlink_boundaries() {
+	let repo = TestRepo::new("folder-symlinks");
+	repo.write("dir/normal.txt", "normal content");
+	repo.write("dir/target.txt", "target content");
+
+	// In-root symlink pointing to an existing file
+	std::os::unix::fs::symlink(
+		repo.path().join("dir/target.txt"),
+		repo.path().join("dir/in_root.txt"),
+	)
+	.unwrap();
+
+	// Out-of-root symlink pointing to a file outside the repository
+	let outside = tempfile::tempdir().unwrap();
+	let outside_file = outside.path().join("secret.txt");
+	fs::write(&outside_file, "secret").unwrap();
+	std::os::unix::fs::symlink(
+		&outside_file,
+		repo.path().join("dir/outside.txt"),
+	)
+	.unwrap();
+
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![ExportItem {
+			root: repo.canonical_id(),
+			relative_path: "dir".to_string(),
+			source: SourceKind::File,
+			change_type: None,
+		}],
+	)
+	.unwrap();
+
+	let expanded = expand_folder_items(sel, 100, &CancelToken::new()).unwrap();
+	let mut rels: Vec<_> = expanded
+		.sel
+		.items
+		.iter()
+		.map(|item| item.relative_path.as_str())
+		.collect();
+	rels.sort();
+
+	assert_eq!(
+		rels,
+		["dir/in_root.txt", "dir/normal.txt", "dir/target.txt"]
+	);
+	assert_eq!(expanded.skipped, 1);
+	assert!(!expanded.truncated);
+}
+
+#[test]
+fn test_expand_folder_items_budget_truncation_and_deduplication() {
+	let repo = TestRepo::new("folder-budget");
+	for i in 1..=5 {
+		repo.write(&format!("dir/f{i}.txt"), &format!("content {i}"));
+	}
+
+	// 1. limit = 2 with 5 files -> 2 file items, truncated == true
+	let sel1 = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![ExportItem {
+			root: repo.canonical_id(),
+			relative_path: "dir".to_string(),
+			source: SourceKind::File,
+			change_type: None,
+		}],
+	)
+	.unwrap();
+	let expanded1 = expand_folder_items(sel1, 2, &CancelToken::new()).unwrap();
+	assert_eq!(expanded1.sel.items.len(), 2);
+	assert!(expanded1.truncated);
+
+	// 2. Picked (non-folder) items reduce the budget
+	repo.write("picked.txt", "picked content");
+	let sel2 = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![
+			ExportItem {
+				root: repo.canonical_id(),
+				relative_path: "picked.txt".to_string(),
+				source: SourceKind::File,
+				change_type: None,
+			},
+			ExportItem {
+				root: repo.canonical_id(),
+				relative_path: "dir".to_string(),
+				source: SourceKind::File,
+				change_type: None,
+			},
+		],
+	)
+	.unwrap();
+	let expanded2 = expand_folder_items(sel2, 2, &CancelToken::new()).unwrap();
+	assert_eq!(expanded2.sel.items.len(), 2);
+	assert!(expanded2.truncated);
+	assert_eq!(expanded2.sel.items[0].relative_path, "picked.txt");
+	assert!(expanded2.sel.items[1].relative_path.starts_with("dir/"));
+
+	// 3. An already-selected file is not duplicated
+	let sel3 = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![
+			ExportItem {
+				root: repo.canonical_id(),
+				relative_path: "dir/f1.txt".to_string(),
+				source: SourceKind::File,
+				change_type: None,
+			},
+			ExportItem {
+				root: repo.canonical_id(),
+				relative_path: "dir".to_string(),
+				source: SourceKind::File,
+				change_type: None,
+			},
+		],
+	)
+	.unwrap();
+	let expanded3 = expand_folder_items(sel3, 10, &CancelToken::new()).unwrap();
+	assert_eq!(expanded3.sel.items.len(), 5);
+	let f1_count = expanded3
+		.sel
+		.items
+		.iter()
+		.filter(|item| item.relative_path == "dir/f1.txt")
+		.count();
+	assert_eq!(f1_count, 1);
+	assert!(!expanded3.truncated);
+}
+
+#[test]
+fn test_expand_folder_items_cancelled_token() {
+	let repo = TestRepo::new("folder-cancel");
+	repo.write("dir/a.txt", "a");
+	repo.write("dir/b.txt", "b");
+	repo.write("picked.txt", "picked");
+
+	let token = CancelToken::new();
+	token.cancel();
+
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![
+			ExportItem {
+				root: repo.canonical_id(),
+				relative_path: "picked.txt".to_string(),
+				source: SourceKind::File,
+				change_type: None,
+			},
+			ExportItem {
+				root: repo.canonical_id(),
+				relative_path: "dir".to_string(),
+				source: SourceKind::File,
+				change_type: None,
+			},
+		],
+	)
+	.unwrap();
+
+	let expanded = expand_folder_items(sel, 100, &token).unwrap();
+	assert_eq!(expanded.sel.items.len(), 1);
+	assert_eq!(expanded.sel.items[0].relative_path, "picked.txt");
+}
+
+#[test]
+#[cfg(unix)]
+fn test_expand_folder_items_unrepresentable_names_skipped() {
+	let repo = TestRepo::new("folder-unrepresentable");
+	repo.write("dir/good.txt", "good");
+	repo.write("dir/bad:name.txt", "bad colon");
+	repo.write("dir/trailing.txt ", "trailing space");
+
+	let sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		Some(repo.path().to_path_buf()),
+		vec![ExportItem {
+			root: repo.canonical_id(),
+			relative_path: "dir".to_string(),
+			source: SourceKind::File,
+			change_type: None,
+		}],
+	)
+	.unwrap();
+
+	let expanded = expand_folder_items(sel, 100, &CancelToken::new()).unwrap();
+	let rels: Vec<_> = expanded
+		.sel
+		.items
+		.iter()
+		.map(|item| item.relative_path.as_str())
+		.collect();
+	assert_eq!(rels, ["dir/good.txt"]);
+	assert_eq!(expanded.skipped, 2);
+	assert!(!expanded.truncated);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_expand_folder_items_root_through_symlink() {
+	let repo = TestRepo::new("folder-symlink-root");
+	repo.write("dir/sub/file.txt", "content");
+
+	let alias_dir = tempfile::tempdir().unwrap();
+	let alias_path = alias_dir.path().join("repo_alias");
+	std::os::unix::fs::symlink(repo.path(), &alias_path).unwrap();
+
+	let root_id = CanonicalRootId::new(&alias_path).unwrap();
+	let sel = ExportSelection::new(
+		vec![alias_path.clone()],
+		Some(alias_path),
+		vec![ExportItem {
+			root: root_id,
+			relative_path: "dir".to_string(),
+			source: SourceKind::File,
+			change_type: None,
+		}],
+	)
+	.unwrap();
+
+	let expanded = expand_folder_items(sel, 100, &CancelToken::new()).unwrap();
+	assert_eq!(expanded.sel.items.len(), 1);
+	assert_eq!(expanded.sel.items[0].relative_path, "dir/sub/file.txt");
+	assert_eq!(expanded.skipped, 0);
+	assert!(!expanded.truncated);
 }
