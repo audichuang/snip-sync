@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Runs a command in the Linux preflight container: `scripts/linux_container.sh just preflight-linux`.
-# `--clean` removes this checkout's containers, volumes, images and kernel cache instead.
+# `--clean` removes this checkout's containers, volumes, images and kernel cache instead;
+# `--prune` only removes the target/ volumes of checkouts that no longer exist.
 # Uses Apple's `container` (macOS 26+, Apple silicon): brew install container,
 # then container system start --enable-kernel-install.
 # The checkout is mounted read-only at its host path, so receipts and fixture paths
 # read the same inside and out, and nothing inside writes the host's repository: a git
 # refreshing .git/index through the shared mount made the next read see an empty index. The container's target/ is a volume per checkout: Linux
 # artifacts never land in the host's target/, and incremental builds survive runs.
+# Each volume is labelled with its checkout's path, and every run removes the volumes
+# whose checkout is gone: a clone or worktree used once otherwise left 12-18 GB behind.
 # SNIP_CONTAINER_CPUS / SNIP_CONTAINER_MEMORY size the VM (container's default is 4 CPUs, 1 GB).
 set -euo pipefail
 
@@ -62,6 +65,27 @@ while read -r id _; do
 	fi
 done < <(container ls --all 2>/dev/null | grep "^$prefix-" || true)
 
+# A volume is in use while a container of its checkout exists, and kept while its
+# checkout does; one without a label (made before labels) is kept only while in use.
+prune_volumes() {
+	local containers name root
+	containers="$(container ls --all 2>/dev/null | awk 'NR > 1 {print $1}')"
+	while read -r name _; do
+		case "$name" in snip-preflight-target-*) ;; *) continue ;; esac
+		[ "$name" != "$target_volume" ] || continue
+		if grep -q "^snip-preflight-${name#snip-preflight-target-}-" <<<"$containers"; then continue; fi
+		root="$(container volume inspect "$name" 2>/dev/null | plutil -extract 0.configuration.labels.snip-root raw - 2>/dev/null || true)"
+		if [ -n "$root" ] && [ -d "$root" ]; then continue; fi
+		if container volume rm "$name" >/dev/null 2>&1; then
+			echo "linux_container: removed $name (${root:-unlabelled}, checkout gone)" >&2
+		fi
+	done < <(container volume ls 2>/dev/null)
+}
+prune_volumes
+if [ "${1:-}" = --prune ]; then
+	exit 0
+fi
+
 if [ "${1:-}" = --clean ]; then
 	container volume rm "$target_volume" snip-preflight-cargo-registry snip-preflight-cargo-git >/dev/null 2>&1 || true
 	container image ls | awk '$1 == "snip-preflight" {print $1 ":" $2}' | xargs -n1 container image rm >/dev/null 2>&1 || true
@@ -113,7 +137,9 @@ if [ ! -f "$kernel" ]; then
 		cp arch/arm64/boot/Image "/out/$1.tmp" && mv "/out/$1.tmp" "/out/$1"' _ "$(basename "$kernel")" "$(basename "$base")" "${kernel_options[@]}"
 fi
 
-for name in "$target_volume" snip-preflight-cargo-registry snip-preflight-cargo-git; do
+container volume inspect "$target_volume" >/dev/null 2>&1 ||
+	container volume create --label "snip-root=$ROOT" "$target_volume" >/dev/null
+for name in snip-preflight-cargo-registry snip-preflight-cargo-git; do
 	container volume inspect "$name" >/dev/null 2>&1 || container volume create "$name" >/dev/null
 done
 
