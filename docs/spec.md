@@ -178,7 +178,7 @@ CLI 與 App 呼叫同一組核心函式,行為完全相同。
 這是**操作另一台電腦上檔案的控制通道**,不是剪貼簿的傳輸方式:第 1 節「不管傳輸」指的是複製／貼上之間的剪貼簿,照舊不變。
 
 - **角色**:
-  - **master**:桌面 App。在工作區選單的「遠端節點」配對 worker、列出它分享的工作區、開啟其中一個。
+  - **master**:桌面 App。在工作區選單的「遠端節點」配對 worker、列出它分享的工作區、開啟其中一個。CLI 也能當 master:`snip remote pair|workers|forget|workspaces|ls|stat|cat`,與桌面版共用配對紀錄。
   - **worker**:被操作的那台。用 CLI `snip worker --share <資料夾>` 就能跑,不需要桌面 App,也不需要螢幕。桌面 App 也能當 worker:從工作區選單啟用,或用 `--worker` 啟動。
 - **連線**:建議走 Tailscale 私網,不依賴公網。TCP 上跑 TLS 1.3,預設埠 47821。
 - **配對**:每台機器第一次使用時,各自產生一張自簽憑證。worker 顯示一次性配對碼,10 分鐘內有效,只能配對一台 master,連錯 5 次就作廢。master 輸入 worker 的位址與配對碼。配對成功後,worker 記住 master 憑證的指紋,master 固定(pin)worker 憑證的指紋。之後換了憑證的一方連不上,要重新配對。

@@ -84,6 +84,20 @@ xattr -cr /Applications/snip-sync.app
    - 在 worker 的分享資料夾裡放一個指向外面的 symlink,在 master 點它。預期預覽顯示拒絕的錯誤。
    - 輸入錯的配對碼 5 次。預期這組碼作廢,要重新啟動 worker 取得新碼。
 
+### 用 CLI 當 master
+
+不開桌面版，也能從另一台裝了 `snip` 的機器操作 worker。配對紀錄與裝置身分和桌面版共用同一個設定資料夾。
+
+```bash
+snip remote pair 100.x.y.z ABCD-EFGH        # 配對，印出雙方指紋以供比對
+snip remote workers                          # 已配對的 worker(編號、名稱、位址、指紋)
+snip remote workspaces 1                     # worker 用編號、名稱或位址指定
+snip remote ls   1 proj [src]                # 工作區用名稱或 id 指定
+snip remote stat 1 proj src/main.rs
+snip remote cat  1 proj src/main.rs          # 二進位、非 UTF-8、超過 1 MiB 都會拒絕
+snip remote forget 1
+```
+
 桌面版也能當 worker:在工作區選單選「啟用 Worker 模式」,或用 `snip-desktop-native --worker [--share DIR]` 啟動。它會分享目前開著的工作區。`--worker --headless --share DIR` 不開視窗，效果等同 `snip worker`。
 
 ## 文件
