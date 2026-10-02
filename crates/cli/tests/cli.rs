@@ -850,6 +850,49 @@ fn copy_paths_relative_path_resolves_against_cwd() {
 	assert!(stdout.contains("sub target content"), "{stdout}");
 }
 
+#[test]
+fn copy_paths_repo_with_dot_dot_normalizes_root_and_labels() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	let b = repo.join("b");
+	let sub = repo.join("sub");
+	fs::create_dir_all(&b).unwrap();
+	fs::create_dir_all(&sub).unwrap();
+	init_repo(&repo);
+	let file = b.join("b01.txt");
+	fs::write(&file, "content of b01\n").unwrap();
+
+	let repo_arg = sub.join("..");
+	let repo_s = repo_arg.to_str().unwrap();
+	let out = snip_in_dir(
+		&["--repo", repo_s, "copy", "b/b01.txt", "--stdout"],
+		None,
+		&repo,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	assert!(
+		stdout.contains("// clipcode-root: repo"),
+		"missing clipcode-root repo: {stdout}"
+	);
+	assert!(
+		stdout.contains("// file: b/b01.txt"),
+		"missing relative file label: {stdout}"
+	);
+	assert!(
+		!stdout.contains(&format!("// file: {}", file.display())),
+		"unexpected absolute path label: {stdout}"
+	);
+	for line in stdout.lines() {
+		if let Some(path) = line.strip_prefix("// file: ") {
+			assert!(
+				!Path::new(path).is_absolute(),
+				"label must not be absolute: {path}"
+			);
+		}
+	}
+}
+
 #[cfg(unix)]
 #[test]
 fn copy_paths_labels_follow_the_spelled_root_and_dir_symlinks() {

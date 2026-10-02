@@ -111,6 +111,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   (2) 路徑重新定位:核心已新增 `ImportMapping::from_restore_base(&RestoreBaseSuggestion, primary)`(階段 2),供 CLI `--adjust-paths` 轉換為統一的 `ImportMapping`(CLI 於階段 6 切換採用),GUI 則維持現有逐 prefix 選擇的介面不變。
   狀態: core 已於階段 2 提供(`SourceKind::Range` 與 `ImportMapping::from_restore_base`),CLI 於階段 5/6 切換採用。
 - CLI 路徑複製解析規則(`snip copy <paths>`):相對路徑以 shell 目前工作目錄(cwd)解析;指定路徑不存在時 exit 1;指定路徑超出 `--repo` 邊界時 exit 1(舊引擎原先會賦予絕對路徑 label,transfer 無法表達此種跨 root 邊界 entry,故嚴格阻擋);指向 root 外部的 symlink、FIFO/socket/裝置檔案與 `.git`/巢狀 repo 一律略過修剪不納入 payload(避免掛起或外洩);若解析結果為空,顯示「No files selected.」以 exit 1 退出且不修改剪貼簿內容(符合決策 T-11);套用 32 MiB payload 複製上限(`CLIPBOARD_PAYLOAD_MAX`),超限 exit 1 絕不截斷。狀態:現況(CLI 於階段 4 已切換至統一 transfer 引擎)。
+- CLI `--repo` 含 `..` 的路徑(相對或絕對)先以 cwd 詞法解析,標籤為 root 相對路徑、`clipcode-root` 為解析後的 basename;舊引擎(與 TS 收到未解析 root 時)以未解析的 root 做 strip,產出絕對路徑標籤與 `clipcode-root: ..`。此為 D7「相對路徑以 cwd 解析」的延伸。狀態:現況。
 - 目錄 symlink 的真實目標（canonical target）若為 `.git` 目錄或位於其內部，snip 在 GUI 與 CLI（`expand_folder_items` 與 `selection_from_paths`）皆一律拒絕跟進並視為略過（F5 意圖，避免外洩儲存庫內部資料或因特殊檔案失敗）；TS 版則會跟隨目錄 symlink 進入 `.git`。
 
 
