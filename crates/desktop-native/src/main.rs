@@ -6460,7 +6460,33 @@ mod tests {
 				assert_eq!(items[0].name, "shared");
 			});
 
-			model.update(cx, |m, cx| m.open_remote_workspace(0, 0, cx));
+			// The open goes through the shared close drain, which also waits
+			// for every git process in this test binary (GitLoad is process
+			// wide), so under parallel tests it may not end on its own here.
+			// Polled as if git were idle, the intent it queued lands.
+			model.update(cx, |m, cx| {
+				m.open_remote_workspace(0, 0, cx);
+				assert!(!m.workspace_menu);
+				if m.remote.session.is_none() {
+					assert_eq!(
+						m.lifecycle.intent_name(),
+						"open-remote-workspace"
+					);
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now(),
+						crate::lifecycle::GitLoad::idle(),
+					);
+					let crate::lifecycle::Step::Ready(
+						crate::lifecycle::Intent::OpenRemoteWorkspace(target),
+					) = step
+					else {
+						panic!("drain not ready: {step:?}");
+					};
+					// finish_intent would check the real GitLoad again.
+					let (worker, ws) = *target;
+					m.finish_open_remote(worker, ws, cx);
+				}
+			});
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.workspace_open && !m.workspace_menu);
