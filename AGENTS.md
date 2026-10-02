@@ -9,6 +9,11 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 - `fixtures/clipboard-contract.json` is owned by ClipCodeVSCode, and its SHA is pinned in `crates/core/tests/contract.rs`. Never edit or regenerate it here: copy it over and update the SHA in all three repos.
 - A deliberate divergence from the TS goes into "已知且接受的差異" in `docs/porting-notes.md`, or a later port "fixes" it back.
 
+## One engine, two front ends
+
+- The CLI and the desktop app are front ends over the same `snip-core` `transfer` functions and `snip_remote` stores (`docs/spec.md` §5.2 lists them). A copy, paste or pairing fix goes there, never into one surface: while the CLI ran its own engine, every safety fix reached only the GUI.
+- `copy::collect_copy_files` and `gitsrc::collect_payload` survive only as byte-parity test oracles. Product code must not call them, and a bug fix does not go there.
+
 ## Branches and releases
 
 - `main` holds released code only. Every change gets a `feature/<name>` or `fix/<name>` branch cut from `develop`, with its PR targeting `develop`, and is squash-merged.
@@ -17,7 +22,7 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 ## Before you call a change done
 
-- Before pushing a change that can alter a gate's result (code, scripts, CI config, Cargo files, fixtures), run `just preflight`. A failure CI finds that preflight would have caught is a process bug. On Linux it runs CI's Linux jobs. On macOS it runs CI's macOS checks, then the Linux jobs, native acceptance included, in an Apple `container` VM (`scripts/linux_container.sh`; each run drops the target/ volumes of checkouts that no longer exist, `--clean` drops its volumes, images and kernel cache). Windows has no container path: run `just preflight-host`.
+- Before pushing a change that can alter a gate's result (code, scripts, CI config, Cargo files, fixtures), run `just preflight`. A failure CI finds that preflight would have caught is a process bug. On Linux it runs CI's Linux jobs. On macOS it runs CI's macOS checks, then the Linux jobs, native acceptance included, in an Apple `container` VM (`scripts/linux_container.sh`; each run drops the target/ volumes of checkouts that no longer exist, `--clean` drops its volumes, images and kernel cache). Windows has no container path: run `just preflight-host`. Run it from a full clone (`git clone --no-local`), not a `git worktree`: the container mounts only the checkout, so native acceptance cannot reach a worktree's git dir.
 - A push that cannot change any gate's result skips preflight: only `.md` files, or a `.gitignore` entry. CI still runs every job. A script under `docs/` is not Markdown; run the script itself.
 - Remote-node connectivity is its own end-to-end gate, apart from the GUI gates: `scripts/remote_e2e.sh` runs a real `snip worker` process and a real `snip remote` master over TLS. Preflight and CI run it on 127.0.0.1 (`just remote-e2e`), on every OS. A change to `crates/remote`, to the CLI's `worker` or `remote` commands, or to anything they call is not done until `just remote-e2e-ssh <host>` also passed against a second machine over Tailscale.
 - `native-acceptance` needs a Python with Pillow in `SNIP_NATIVE_PYTHON` and fails if the checkout changes after its build: commit first, then leave the tree alone.
