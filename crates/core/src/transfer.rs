@@ -196,6 +196,10 @@ pub enum TransferError {
 	UnsafePath(String),
 	#[error("special file '{0}' is not a regular file and cannot be exported")]
 	SpecialFile(String),
+	#[error(
+		"'{0}' exists and is not a regular file; paste refuses to overwrite it"
+	)]
+	DestinationNotRegular(String),
 	#[error("path not found: '{}'", .0.display())]
 	PathNotFound(PathBuf),
 	#[error("path '{}' is outside root", .0.display())]
@@ -264,6 +268,19 @@ pub enum TransferError {
 	Commit(#[from] CommitError),
 	#[error(transparent)]
 	Io(#[from] io::Error),
+}
+
+impl TransferError {
+	pub fn paste_message(&self) -> String {
+		match self {
+			Self::SpecialFile(path) | Self::DestinationNotRegular(path) => {
+				format!(
+					"'{path}' exists and is not a regular file; paste refuses to overwrite it"
+				)
+			}
+			other => other.to_string(),
+		}
+	}
 }
 
 /// Cryptographic and timestamp identity of a file.
@@ -1085,7 +1102,7 @@ fn capture_file_freshness(
 		sym_meta
 	};
 	if !target_meta.file_type().is_file() {
-		return Err(TransferError::SpecialFile(
+		return Err(TransferError::DestinationNotRegular(
 			path.to_string_lossy().into_owned(),
 		));
 	}
@@ -2742,6 +2759,17 @@ pub fn plan_import_with(
 			}
 		};
 
+		if paths::has_git_segment(&entry.path)
+			|| paths::has_git_segment(&rel_path)
+		{
+			skipped_operations.push(SkippedOperation {
+				raw_path: entry.path.clone(),
+				relative_path: None,
+				reason: SkipReason::UnresolvedPath,
+			});
+			continue;
+		}
+
 		let Some(sanitized) = sanitize_relative_path(&rel_path) else {
 			skipped_operations.push(SkippedOperation {
 				raw_path: entry.path.clone(),
@@ -2750,6 +2778,15 @@ pub fn plan_import_with(
 			});
 			continue;
 		};
+
+		if paths::has_git_segment(&sanitized) {
+			skipped_operations.push(SkippedOperation {
+				raw_path: entry.path.clone(),
+				relative_path: None,
+				reason: SkipReason::UnresolvedPath,
+			});
+			continue;
+		}
 
 		planned_entries.push((
 			target_root.clone(),
@@ -2799,10 +2836,7 @@ pub fn plan_import_with(
 			return Err(TransferError::TargetCollision {
 				path: op.absolute_path.clone(),
 				msg: format!(
-					"multiple operations target '{}' (identity '{}'): previous was '{}', current is 'create {}'",
-					op.absolute_path.display(),
-					identity,
-					prev,
+					"previous was '{prev}', current is 'create {}'",
 					op.relative_path
 				),
 			});
@@ -2827,10 +2861,7 @@ pub fn plan_import_with(
 			return Err(TransferError::TargetCollision {
 				path: op.absolute_path.clone(),
 				msg: format!(
-					"multiple operations target '{}' (identity '{}'): previous was '{}', current is 'delete {}'",
-					op.absolute_path.display(),
-					identity,
-					prev,
+					"previous was '{prev}', current is 'delete {}'",
 					op.relative_path
 				),
 			});
@@ -3322,7 +3353,7 @@ fn capture_replay_file_freshness(
 		return Ok(None);
 	}
 	if !meta.file_type().is_file() {
-		return Err(TransferError::SpecialFile(
+		return Err(TransferError::DestinationNotRegular(
 			path.to_string_lossy().into_owned(),
 		));
 	}

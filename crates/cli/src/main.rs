@@ -636,6 +636,8 @@ fn format_transfer_error(err: TransferError) -> String {
 		TransferError::StaleDestination { .. } => {
 			format!("Snipcode refused to paste: {err}; re-run to inspect updated destinations")
 		}
+		TransferError::SpecialFile(_)
+		| TransferError::DestinationNotRegular(_) => err.paste_message(),
 		other => other.to_string(),
 	}
 }
@@ -842,20 +844,18 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 		} else {
 			eprintln!("{total} commit(s) would be created.");
 		}
+		if !opts.overwrite {
+			let existing = distinct_existing_paths(plan);
+			if existing > 0 {
+				eprintln!(
+					"{existing} destination file(s) already exist; --apply will need --overwrite."
+				);
+			}
+		}
 		return Ok(());
 	}
 
-	let existing = preview
-		.plan()
-		.commits
-		.iter()
-		.flat_map(|c| &c.files)
-		.filter(|f| {
-			f.layout_conflict.is_none()
-				&& f.action == ReplayAction::Write
-				&& f.existed
-		})
-		.count();
+	let existing = distinct_existing_paths(preview.plan());
 	if existing > 0 && !opts.overwrite {
 		preview.revalidate().map_err(format_transfer_error)?;
 		usage(format!(
@@ -878,6 +878,20 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 			f.error
 		)),
 	}
+}
+
+fn is_existing_write(f: &commits::FilePlan) -> bool {
+	f.layout_conflict.is_none() && f.action == ReplayAction::Write && f.existed
+}
+
+fn distinct_existing_paths(plan: &commits::CommitReplayPlan) -> usize {
+	plan.commits
+		.iter()
+		.flat_map(|c| &c.files)
+		.filter(|f| is_existing_write(f))
+		.map(|f| &f.path)
+		.collect::<std::collections::BTreeSet<_>>()
+		.len()
 }
 
 #[cfg(test)]

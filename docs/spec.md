@@ -65,13 +65,13 @@
 4. 結果:成功 / 跳過 / 失敗各幾個,失敗的列出原因。
 
 - 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 與 CLI 於階段 6 皆已採用):
-  (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;偵測目的端是否不分大小寫,不分大小寫則新目標也摺疊大小寫(D10,階段 5b 已實作);以及 symlink 別名、同一路徑出現兩次)就整批拒絕;
+  (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;偵測目的端是否不分大小寫,不分大小寫則新目標也摺疊大小寫(D10,階段 5b 已實作);以及 symlink 別名、同一路徑出現兩次)就整批拒絕;錯誤訊息格式呈現為單一目標路徑並列出衝突的操作名稱（如 `target collision: multiple operations target '<p>': previous was 'create a', current is 'create b'`，不重複輸出路徑亦不暴露內部大小寫摺疊字串）;
   (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
   這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
-- 安全規則照 porting-notes 第 3 節:路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、
+- 安全規則照 porting-notes 第 3 節:路徑片段等於 `.git`(ASCII 不區分大小寫)視為 unsafe/unresolved 拒絕(寫入與刪除皆阻擋)、路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、
   placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8。
 - CLI 補充(現行行為/CLI 於階段 6 已切換):絕對路徑在 sanitize 前先解析(root 內部、跨機器後綴 → 相對路徑,同 TS);絕對 [DELETED] 解析不到 root → 拒絕(視為 unsafe/unresolved 跳過,同 TS);寫入對不到 root 的 POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`)→ 去首斜線放主 root 下(同 TS);帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因 `sanitize_relative_path` 的絕對路徑/磁碟機檢查(`is_absolute_path`/`has_drive_slash`)而跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`。CLI 只有單一 root。`paste` 的 `--repo` 必須已存在,否則 exit 1(見 porting-notes「已知且接受的差異」)。
-- 目的端路徑為目錄、FIFO 等非一般檔案時整批以 `SpecialFile` 拒絕(含 `--dry-run`,exit 1),見 porting-notes「已知且接受的差異」。父層片段為一般檔案或目的端為懸空 symlink 時亦以 `TransferError::Io` 整批拒絕(exit 1),同見該條目。
+- 目的端路徑為目錄、FIFO 等非一般檔案時整批以 `DestinationNotRegular` / `SpecialFile` 拒絕(含 `--dry-run`,exit 1;錯誤訊息明確提示貼上拒絕覆寫非一般檔案),見 porting-notes「已知且接受的差異」。父層片段為一般檔案或目的端為懸空 symlink 時亦以 `TransferError::Io` 整批拒絕(exit 1),同見該條目。
 
 CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --skip-existing]`。
 
@@ -115,7 +115,7 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 3. 疊在**目前分支的 HEAD** 上,不需要與來源有共同的起點,也不檢查是否 fast-forward。
 4. 結果:建立了幾個 commit。
 
-- 此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,**預設不套用**,需明確允許覆寫(GUI:允許覆寫的開關,i18n `commit_overwrite_required`,paste.rs `execute_commit` 先 `preview.revalidate()` 再回此錯誤;CLI 判定與 GUI 相同[已決 D9],以 `FilePlan.existed` 判定,需 `--overwrite`,沒給則 exit 2)。CLI 貼 commit payload 時 `--skip-existing`、`--adjust-paths` 不支援,exit 2。這與 TS/原規格「直接覆蓋」不同,見 porting-notes「已知且接受的差異」。
+- 此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,**預設不套用**,需明確允許覆寫(GUI:允許覆寫的開關,i18n `commit_overwrite_required`,paste.rs `execute_commit` 先 `preview.revalidate()` 再回此錯誤;CLI 判定與 GUI 相同[已決 D9],以 `FilePlan.existed` 判定,需 `--overwrite`,沒給則 exit 2)。覆寫門禁與 dry-run 提示皆以相異目標路徑（distinct paths）計算（多個 commit 變更同一既有路徑僅計為 1 個）。CLI commit 貼上在 `--dry-run`（未指定 `--apply` 與 `--overwrite`）且目標已有檔案存在時，會在 stderr 提示「N destination file(s) already exist; --apply will need --overwrite.」（退出碼維持 0）。CLI 貼 commit payload 時 `--skip-existing`、`--adjust-paths` 不支援,exit 2。這與 TS/原規格「直接覆蓋」不同,見 porting-notes「已知且接受的差異」。
 - 中途某個 commit 建立失敗:**停下來**,回報已建立的前幾個、失敗的是哪一個與 git 的錯誤訊息。已建立的不回滾。
 - 路徑安全規則與檔案模式相同。
 - 預設值(規格階段未逐題確認,實作時照此,有意見再改):
@@ -157,7 +157,7 @@ snip paste --apply [--overwrite | --skip-existing] [--adjust-paths]
 ```
 
 - 貼上 commit payload 時,`--skip-existing` 與 `--adjust-paths` 不支援,指定時以 exit 2 退出(見 4.3)。
-- 貼上 commit payload 時,若目標檔案已存在需明確指定 `--overwrite`,未指定時以 exit 2 退出(見 4.3)。
+- 貼上 commit payload 時,若目標檔案已存在需明確指定 `--overwrite`,未指定時以 exit 2 退出;`--dry-run` 且有目標檔案存在時於 stderr 輸出警告提示,exit 0(見 4.3)。
 
 CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 複製檔案／資料夾:兩邊都用 `transfer::expand_folder_items` 展開資料夾(過濾 `.git`、巢狀 repo、特殊檔、指出 root 的 symlink),再由 `transfer::plan_export_with` 產出 payload。CLI 另以 `selection_from_paths` 把命令列路徑轉成選取項目,並以 `plan_export_expanding` 分批展開(結果與一次展開相同,只是不必走完整棵樹);GUI 的選取來自檔案樹。

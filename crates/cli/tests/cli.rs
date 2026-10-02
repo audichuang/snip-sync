@@ -1845,6 +1845,18 @@ fn paste_f1_case_alias_existing_path() {
 			err.contains("target collision"),
 			"expected error mentioning 'target collision', got: {err}"
 		);
+		let target_path = dst.join("a.txt").display().to_string();
+		assert_eq!(
+			err.matches(&target_path).count(),
+			1,
+			"path must occur once in stderr, got: {err}"
+		);
+		assert!(
+			!err.contains("identity"),
+			"identity must not occur in stderr, got: {err}"
+		);
+		assert!(err.contains("previous was 'create A.txt'"));
+		assert!(err.contains("current is 'delete a.txt'"));
 		assert_eq!(
 			fs::read_to_string(dst.join("a.txt")).unwrap(),
 			"original a\n"
@@ -1886,6 +1898,18 @@ fn paste_d10_case_alias_both_new() {
 		assert_eq!(code(&out1), 1, "{}", text(&out1.stderr));
 		let err = text(&out1.stderr);
 		assert!(err.contains("target collision"), "{err}");
+		let matches = err
+			.matches(&dst1.join("b.txt").display().to_string())
+			.count() + err
+			.matches(&dst1.join("B.txt").display().to_string())
+			.count();
+		assert_eq!(matches, 1, "path must occur once in stderr, got: {err}");
+		assert!(
+			!err.contains("identity"),
+			"identity must not occur in stderr, got: {err}"
+		);
+		assert!(err.contains("previous was 'create B.txt'"));
+		assert!(err.contains("current is 'create b.txt'"));
 		assert!(!dst1.join("B.txt").exists());
 		assert!(!dst1.join("b.txt").exists());
 	} else {
@@ -1918,6 +1942,18 @@ fn paste_d10_case_alias_both_new() {
 		assert_eq!(code(&out2), 1, "{}", text(&out2.stderr));
 		let err = text(&out2.stderr);
 		assert!(err.contains("target collision"), "{err}");
+		let matches = err
+			.matches(&dst2.join("d/x.txt").display().to_string())
+			.count() + err
+			.matches(&dst2.join("D/x.txt").display().to_string())
+			.count();
+		assert_eq!(matches, 1, "path must occur once in stderr, got: {err}");
+		assert!(
+			!err.contains("identity"),
+			"identity must not occur in stderr, got: {err}"
+		);
+		assert!(err.contains("previous was 'create D/x.txt'"));
+		assert!(err.contains("current is 'create d/x.txt'"));
 		assert!(!dst2.join("D").exists());
 		assert!(!dst2.join("d").exists());
 	} else {
@@ -2132,6 +2168,183 @@ fn paste_commits_overwrite_gate() {
 	assert_eq!(
 		fs::read_to_string(dst2.join("file.txt")).unwrap(),
 		"src v1\n"
+	);
+}
+
+#[test]
+fn paste_commits_dry_run_warns_about_overwrite_when_target_exists() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	let dst = tmp.path().join("dst");
+	let dst_absent = tmp.path().join("dst_absent");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+	fs::create_dir_all(&dst_absent).unwrap();
+	init_repo(&src);
+	init_repo(&dst);
+	init_repo(&dst_absent);
+
+	fs::write(src.join("file.txt"), "src v1\n").unwrap();
+	commit(&src, "add file", "2024-01-01T00:00:00+00:00");
+
+	fs::write(dst.join("file.txt"), "dst initial\n").unwrap();
+	commit(&dst, "initial dst", "2024-01-01T00:00:00+00:00");
+
+	let copy_out = snip(
+		&[
+			"--repo",
+			src.to_str().unwrap(),
+			"copy",
+			"--commits",
+			"-n",
+			"1",
+			"--stdout",
+		],
+		None,
+	);
+	assert_eq!(code(&copy_out), 0, "{}", text(&copy_out.stderr));
+	let payload = copy_out.stdout;
+
+	// Target absent: exit 0, no hint
+	let dry_absent = snip(
+		&[
+			"--repo",
+			dst_absent.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--stdin",
+		],
+		Some(&payload),
+	);
+	assert_eq!(code(&dry_absent), 0, "{}", text(&dry_absent.stderr));
+	assert!(
+		!text(&dry_absent.stderr).contains("destination file(s) already exist"),
+		"{}",
+		text(&dry_absent.stderr)
+	);
+
+	// Target exists: exit 0, prints hint
+	let dry_exists = snip(
+		&[
+			"--repo",
+			dst.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--stdin",
+		],
+		Some(&payload),
+	);
+	assert_eq!(code(&dry_exists), 0, "{}", text(&dry_exists.stderr));
+	assert!(
+		text(&dry_exists.stderr).contains(
+			"1 destination file(s) already exist; --apply will need --overwrite."
+		),
+		"{}",
+		text(&dry_exists.stderr)
+	);
+
+	// Target exists with --overwrite: exit 0, no hint
+	let dry_overwrite = snip(
+		&[
+			"--repo",
+			dst.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--overwrite",
+			"--stdin",
+		],
+		Some(&payload),
+	);
+	assert_eq!(code(&dry_overwrite), 0, "{}", text(&dry_overwrite.stderr));
+	assert!(
+		!text(&dry_overwrite.stderr)
+			.contains("destination file(s) already exist"),
+		"{}",
+		text(&dry_overwrite.stderr)
+	);
+}
+
+#[test]
+fn paste_commits_two_commits_same_path_dedupes_existing() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&src);
+	init_repo(&dst);
+
+	fs::write(src.join("file.txt"), "src v1\n").unwrap();
+	commit(&src, "commit 1", "2024-01-01T00:00:00+00:00");
+	fs::write(src.join("file.txt"), "src v2\n").unwrap();
+	commit(&src, "commit 2", "2024-01-01T00:00:01+00:00");
+
+	fs::write(dst.join("file.txt"), "dst initial\n").unwrap();
+	commit(&dst, "initial dst", "2024-01-01T00:00:00+00:00");
+
+	let copy_out = snip(
+		&[
+			"--repo",
+			src.to_str().unwrap(),
+			"copy",
+			"--commits",
+			"-n",
+			"2",
+			"--stdout",
+		],
+		None,
+	);
+	assert_eq!(code(&copy_out), 0, "{}", text(&copy_out.stderr));
+	let payload = copy_out.stdout;
+
+	// Dry run with two commits touching same existing file reports 1 destination file
+	let dry_out = snip(
+		&[
+			"--repo",
+			dst.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--stdin",
+		],
+		Some(&payload),
+	);
+	assert_eq!(code(&dry_out), 0, "{}", text(&dry_out.stderr));
+	assert!(
+		text(&dry_out.stderr).contains(
+			"1 destination file(s) already exist; --apply will need --overwrite."
+		),
+		"{}",
+		text(&dry_out.stderr)
+	);
+	assert!(
+		!text(&dry_out.stderr).contains("2 destination file(s)"),
+		"{}",
+		text(&dry_out.stderr)
+	);
+
+	// Apply refusal with two commits touching same existing file reports 1 destination file
+	let apply_out = snip(
+		&[
+			"--repo",
+			dst.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--stdin",
+		],
+		Some(&payload),
+	);
+	assert_eq!(code(&apply_out), 2, "{}", text(&apply_out.stderr));
+	assert!(
+		text(&apply_out.stderr).contains(
+			"1 destination file(s) already exist; commit payloads need --overwrite"
+		),
+		"{}",
+		text(&apply_out.stderr)
+	);
+	assert!(
+		!text(&apply_out.stderr).contains("2 destination file(s)"),
+		"{}",
+		text(&apply_out.stderr)
 	);
 }
 
@@ -2398,6 +2611,125 @@ fn paste_symlink_spelled_repo_round_trip() {
 	assert_eq!(
 		fs::read_to_string(dst.join("hello.txt")).unwrap(),
 		"hello from symlink"
+	);
+}
+
+#[test]
+fn paste_refuses_when_destination_is_directory() {
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(dst.join("build")).unwrap();
+
+	let payload = "// file: build\nhello\n";
+	let out = snip(
+		&[
+			"--repo",
+			dst.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	let err = text(&out.stderr);
+	assert!(
+		err.contains("refuses to overwrite"),
+		"expected stderr to contain 'refuses to overwrite', got: {err}"
+	);
+	assert!(
+		!err.contains("exported"),
+		"expected stderr not to contain 'exported', got: {err}"
+	);
+}
+
+#[test]
+fn paste_refuses_git_path_segment() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+
+	let git_config = repo.join(".git").join("config");
+	assert!(
+		git_config.exists(),
+		".git/config must exist after init_repo"
+	);
+	let original_config = fs::read_to_string(&git_config).unwrap();
+
+	// 1. Dry run with .git/config payload reports UNRESOLVED_PATH and skipped
+	let git_payload = "// file: .git/config\n[malicious]\nhacked = true\n";
+	let dry = snip(
+		&[
+			"--repo",
+			repo.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--stdin",
+		],
+		Some(git_payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	let dry_stdout = text(&dry.stdout);
+	assert!(
+		dry_stdout.contains("skip\t.git/config\tUNRESOLVED_PATH"),
+		"expected dry-run to report skip with UNRESOLVED_PATH, got: {dry_stdout}"
+	);
+	assert!(
+		text(&dry.stderr).contains("Skipped 1."),
+		"expected stderr summary to mention Skipped 1."
+	);
+
+	// 2. Apply with --overwrite refuses .git/config and leaves it untouched
+	let apply = snip(
+		&[
+			"--repo",
+			repo.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		],
+		Some(git_payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
+	assert!(
+		text(&apply.stderr).contains("Skipped 1."),
+		"expected apply stderr to report Skipped 1."
+	);
+	assert_eq!(
+		fs::read_to_string(&git_config).unwrap(),
+		original_config,
+		".git/config must not be modified"
+	);
+
+	// 3. Payload with both .git/config and .gitignore writes .gitignore while skipping .git/config
+	let mixed_payload = "// file: .git/config\n[malicious]\nhacked = true\n// file: .gitignore\n*.log\n";
+	let mixed = snip(
+		&[
+			"--repo",
+			repo.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		],
+		Some(mixed_payload.as_bytes()),
+	);
+	assert_eq!(code(&mixed), 0, "{}", text(&mixed.stderr));
+	assert!(
+		text(&mixed.stderr).contains("skip 1 operation(s)"),
+		"expected summary to mention skip 1 operation(s)"
+	);
+	assert_eq!(
+		fs::read_to_string(&git_config).unwrap(),
+		original_config,
+		".git/config must remain unmodified"
+	);
+	assert_eq!(
+		fs::read_to_string(repo.join(".gitignore")).unwrap(),
+		"*.log"
 	);
 }
 

@@ -340,6 +340,25 @@ fn apply_pairing(
 	}
 }
 
+fn apply_forget(
+	store: Option<&WorkerStore>,
+	workers: &mut Vec<PairedWorker>,
+	fingerprint: &str,
+) -> Result<(), String> {
+	match store {
+		Some(store) => {
+			let res = store.forget(fingerprint);
+			*workers = store.load();
+			res.map(|_| ())
+				.map_err(|e| format!("cannot save pairings: {e}"))
+		}
+		None => {
+			workers.retain(|w| w.fingerprint != fingerprint);
+			Ok(())
+		}
+	}
+}
+
 // ───────────────────────── model ─────────────────────────
 
 impl WorkbenchModel {
@@ -509,17 +528,11 @@ impl WorkbenchModel {
 			return;
 		};
 		let fp = worker.fingerprint.clone();
-		if let Some(store) = worker_store() {
-			if let Err(err) = store.forget(&fp) {
-				self.remote_note(
-					false,
-					format!("cannot save pairings: {err}"),
-					cx,
-				);
-			}
-			self.remote.workers = load_workers();
-		} else {
-			self.remote.workers.remove(idx);
+		let store = worker_store();
+		if let Err(err) =
+			apply_forget(store.as_ref(), &mut self.remote.workers, &fp)
+		{
+			self.remote_note(false, err, cx);
 		}
 		self.remote.browse = None;
 		cx.notify();
@@ -706,5 +719,100 @@ mod tests {
 		assert_eq!(workers.len(), 3);
 		assert_eq!(workers.iter().filter(|w| w.addr == "2.2.2.2:2").count(), 1);
 		assert!(!workers.iter().any(|w| w.fingerprint == "fp2"));
+	}
+
+	#[test]
+	fn apply_forget_store_removes_by_fingerprint_and_persists() {
+		let tmp = tempfile::tempdir().unwrap();
+		let store = WorkerStore::in_config_dir(tmp.path());
+		let w1 = sample_worker("w1", "1.1.1.1:1", "fp1");
+		let w2 = sample_worker("w2", "2.2.2.2:2", "fp2");
+		store.add(w1.clone()).unwrap();
+		store.add(w2.clone()).unwrap();
+
+		let mut workers = store.load();
+		apply_forget(Some(&store), &mut workers, "fp1")
+			.expect("apply_forget should succeed");
+
+		assert_eq!(workers.len(), 1);
+		assert_eq!(workers[0].fingerprint, "fp2");
+
+		let persisted = store.load();
+		assert_eq!(persisted.len(), 1);
+		assert_eq!(persisted[0].fingerprint, "fp2");
+	}
+
+	#[test]
+	fn apply_forget_stale_in_memory_list_preserves_concurrent_addition() {
+		let tmp = tempfile::tempdir().unwrap();
+		let store = WorkerStore::in_config_dir(tmp.path());
+		let w2 = sample_worker("w2", "2.2.2.2:2", "fp2");
+		let w1 = sample_worker("w1", "1.1.1.1:1", "fp1");
+		store.add(w2.clone()).unwrap();
+		store.add(w1.clone()).unwrap();
+
+		// GUI loads [w1, w2]
+		let mut workers = store.load();
+		assert_eq!(workers.len(), 2);
+		assert_eq!(workers[0].fingerprint, "fp1");
+		assert_eq!(workers[1].fingerprint, "fp2");
+
+		// Another process adds w3 at the front
+		let w3 = sample_worker("w3", "3.3.3.3:3", "fp3");
+		store.add(w3.clone()).unwrap();
+
+		// Forget w1 by fingerprint
+		apply_forget(Some(&store), &mut workers, "fp1")
+			.expect("apply_forget should succeed");
+
+		// Must leave exactly w2 and w3 both in memory and on disk
+		assert_eq!(workers.len(), 2);
+		assert!(workers.iter().any(|w| w.fingerprint == "fp2"));
+		assert!(workers.iter().any(|w| w.fingerprint == "fp3"));
+		assert!(!workers.iter().any(|w| w.fingerprint == "fp1"));
+
+		let on_disk = store.load();
+		assert_eq!(on_disk.len(), 2);
+		assert!(on_disk.iter().any(|w| w.fingerprint == "fp2"));
+		assert!(on_disk.iter().any(|w| w.fingerprint == "fp3"));
+		assert!(!on_disk.iter().any(|w| w.fingerprint == "fp1"));
+	}
+
+	#[test]
+	fn apply_forget_none_store_removes_by_fingerprint() {
+		let mut workers = vec![
+			sample_worker("w1", "1.1.1.1:1", "fp1"),
+			sample_worker("w2", "2.2.2.2:2", "fp2"),
+			sample_worker("w3", "3.3.3.3:3", "fp3"),
+		];
+
+		apply_forget(None, &mut workers, "fp2")
+			.expect("apply_forget should succeed");
+		assert_eq!(workers.len(), 2);
+		assert_eq!(workers[0].fingerprint, "fp1");
+		assert_eq!(workers[1].fingerprint, "fp3");
+
+		// Forgetting a non-existent fingerprint is a no-op
+		apply_forget(None, &mut workers, "fp_unknown")
+			.expect("apply_forget should succeed");
+		assert_eq!(workers.len(), 2);
+	}
+
+	#[test]
+	fn apply_forget_unwritable_store_returns_error() {
+		let tmp = tempfile::tempdir().unwrap();
+		let regular_file = tmp.path().join("a_file");
+		std::fs::write(&regular_file, "blocking").unwrap();
+		let bad_path = regular_file.join(WORKERS_FILE);
+		let store = WorkerStore::new(bad_path);
+
+		let mut workers = vec![sample_worker("w1", "1.1.1.1:1", "fp1")];
+
+		let err = apply_forget(Some(&store), &mut workers, "fp1")
+			.expect_err("expected error for unwritable path");
+		assert!(
+			err.contains("cannot save pairings"),
+			"expected error containing 'cannot save pairings', got: {err}"
+		);
 	}
 }

@@ -110,6 +110,21 @@ pub fn resolve_delete_target<P: AsRef<Path>>(
 		.resolve_delete_target(clipboard_path)
 }
 
+/// Returns true if any path segment equals `.git` (ASCII case-insensitive).
+pub fn has_git_segment(path: &str) -> bool {
+	path.split(['/', '\\'])
+		.any(|seg| seg.eq_ignore_ascii_case(".git"))
+}
+
+/// Returns true if any component of `path` equals `.git` (ASCII case-insensitive).
+pub fn path_has_git_segment(path: &Path) -> bool {
+	path.components().any(|c| {
+		c.as_os_str()
+			.to_str()
+			.is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+	})
+}
+
 pub(crate) fn resolve_absolute_import_candidate<P: AsRef<Path>>(
 	dest_roots: &[P],
 	primary_root: Option<&Path>,
@@ -344,6 +359,9 @@ impl PathResolver {
 	}
 
 	fn resolve_write_target(&self, raw_path: &str) -> RestoreTargetResolution {
+		if has_git_segment(raw_path) {
+			return Err(unsafe_path(None));
+		}
 		let absolute = self
 			.absolute_root_candidate(raw_path)
 			.or_else(|| self.cross_machine_suffix_candidate(raw_path))
@@ -421,7 +439,11 @@ impl PathResolver {
 		c: TargetCandidate,
 		relative_path: String,
 	) -> RestoreTargetResolution {
-		if self.escapes(&c.target) {
+		if self.escapes(&c.target)
+			|| has_git_segment(&relative_path)
+			|| has_git_segment(&c.root_relative_path)
+			|| path_has_git_segment(Path::new(&c.target))
+		{
 			return Err(unsafe_path(Some(relative_path)));
 		}
 		Ok(self.resolved_target(&c, relative_path, true))
@@ -430,6 +452,9 @@ impl PathResolver {
 	/// Delete an existing file, or report it missing.
 	fn delete_existing(&self, c: TargetCandidate) -> RestoreTargetResolution {
 		let rel = c.root_relative_path.clone();
+		if has_git_segment(&rel) || path_has_git_segment(Path::new(&c.target)) {
+			return Err(unsafe_path(Some(rel)));
+		}
 		if is_existing_file(&c.target) {
 			self.resolve_delete_candidate(c, rel)
 		} else {
@@ -438,6 +463,9 @@ impl PathResolver {
 	}
 
 	fn resolve_delete_target(&self, raw_path: &str) -> RestoreTargetResolution {
+		if has_git_segment(raw_path) {
+			return Err(unsafe_path(None));
+		}
 		if let Some(c) = self.absolute_root_candidate(raw_path) {
 			return self.delete_existing(c);
 		}
@@ -674,7 +702,11 @@ impl PathResolver {
 		relative_path: String,
 		existed: Option<bool>,
 	) -> RestoreTargetResolution {
-		if self.escapes(&c.target) {
+		if self.escapes(&c.target)
+			|| has_git_segment(&relative_path)
+			|| has_git_segment(&c.root_relative_path)
+			|| path_has_git_segment(Path::new(&c.target))
+		{
 			return Err(unsafe_path(Some(relative_path)));
 		}
 		let existed = existed.unwrap_or_else(|| is_existing_file(&c.target));
