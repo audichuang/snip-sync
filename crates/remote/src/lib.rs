@@ -19,17 +19,20 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Serialize};
 
 pub mod client;
 pub mod proto;
+pub mod store;
 pub mod tls;
 pub mod worker;
 
 pub use client::{pair, Client, Connection, PairedWorker, DEFAULT_PORT};
 pub use proto::{DirEntry, ErrorCode, RemoteWorkspace, Request, Response};
+pub use store::{TrustedMasterStore, WorkerStore};
 pub use tls::{Fingerprint, Identity};
 pub use worker::{SharedRoot, TrustedMaster, Worker, WorkerOptions};
 
@@ -171,13 +174,25 @@ pub fn save_json<T: Serialize + ?Sized>(
 	value: &T,
 ) -> io::Result<()> {
 	if let Some(dir) = path.parent() {
-		fs::create_dir_all(dir)?;
+		if !dir.as_os_str().is_empty() {
+			fs::create_dir_all(dir)?;
+		}
 	}
 	let bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
 	// Written aside and renamed, so a crash never leaves half a list.
-	let tmp = path.with_extension("json.tmp");
-	fs::write(&tmp, bytes)?;
-	fs::rename(&tmp, path)
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let pid = std::process::id();
+	let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+	let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+	let tmp = path.with_file_name(format!("{file_name}.{pid}.{count}.tmp"));
+	let res = (|| {
+		fs::write(&tmp, bytes)?;
+		fs::rename(&tmp, path)
+	})();
+	if res.is_err() {
+		let _ = fs::remove_file(&tmp);
+	}
+	res
 }
 
 pub(crate) fn to_hex(bytes: &[u8]) -> String {

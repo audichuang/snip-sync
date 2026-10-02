@@ -232,6 +232,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 7 — 共用配對存取(F9),可與階段 3–6 平行
 
+狀態:已完成(WorkerStore/TrustedMasterStore 於 crates/remote/src/store.rs,sidecar 獨佔鎖＋每次呼叫唯一的暫存檔名;worker 端存檔失敗回 Io 錯誤且不消耗配對碼;GUI 與 CLI 都經 store、以指紋刪除)
+
 - 新增 `crates/remote/src/store.rs`:`WorkerStore { path }`,`load()`、`add(worker)`、`forget(fingerprint)`(用指紋不用索引,避免 GUI 的舊索引刪錯人)、`find(query)`(從 CLI 搬來,含 1-based 編號)。每次 add/forget 在 sidecar `remote-workers.json.lock` 的獨佔鎖內 load→改→save;temp 檔名每個 process 唯一(目前固定 `json.tmp`,兩個 process 同時存會撞)。鎖用 `std::fs::File::lock`,不加依賴。
 - worker 端的 `remote-trusted-masters.json`(`worker.rs:124–126, 484–485`)同樣改用 store,不再吞錯。
 - GUI:每次變更後重新 load,存檔失敗顯示錯誤;CLI:改呼叫 store。

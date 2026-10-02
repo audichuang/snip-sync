@@ -177,9 +177,17 @@ code=$(sed -n 's/^pairing code \([^ ]*\).*/\1/p' <<<"$log")
 wfp=$(sed -n 's/^fingerprint //p' <<<"$log" | tr -d '\r')
 
 echo "== pairing"
+mkdir -p "$SNIP_CONFIG_DIR"
+decoy_fp=$(printf 'ab%.0s' {1..32})
+printf '[{"name":"decoy","addr":"192.0.2.1:47821","fingerprint":"%s"}]\n' "$decoy_fp" > "$SNIP_CONFIG_DIR/remote-workers.json"
 out=$("$SNIP" remote pair "$ADDR" "$code" 2>&1)
 check "pair with the printed code" grep -q "^paired with" <<<"$out"
 check "the master shows the worker's fingerprint ($wfp)" grep -q "$wfp" <<<"$out"
+w_out=$("$SNIP" remote workers)
+check "pairing keeps another worker's entry" test "$(grep -c . <<<"$w_out")" = 2 -a "$(grep -c decoy <<<"$w_out")" = 1 -a "$(head -1 <<<"$w_out" | grep -c "$ADDR")" = 1
+"$SNIP" remote forget decoy >/dev/null
+w_after=$("$SNIP" remote workers)
+check "forgetting another pairing leaves ours" test "$(grep -c . <<<"$w_after")" = 1 -a "$(head -1 <<<"$w_after" | grep -c "^1	")" = 1
 check "listed as worker 1" bash -c "'$SNIP' remote workers | grep -q '^1	'"
 spaces=$("$SNIP" remote workspaces 1)
 expect=2

@@ -16,7 +16,7 @@ use std::time::Instant;
 use snip_core::browser::SourcePreview;
 use snip_remote::{
 	Client, Identity, PairedWorker, RemoteError, RemoteWorkspace, Worker,
-	WorkerOptions, TRUSTED_FILE, WORKERS_FILE,
+	WorkerOptions, WorkerStore, TRUSTED_FILE, WORKERS_FILE,
 };
 
 use gpui::Context;
@@ -66,6 +66,10 @@ fn config_dir() -> Option<PathBuf> {
 
 fn config_file(name: &str) -> Option<PathBuf> {
 	config_dir().map(|dir| dir.join(name))
+}
+
+fn worker_store() -> Option<WorkerStore> {
+	config_file(WORKERS_FILE).map(WorkerStore::new)
 }
 
 // ───────────────────────── worker ─────────────────────────
@@ -209,15 +213,7 @@ pub fn run_headless(cli: &WorkerCli) -> ! {
 // ───────────────────────── master ─────────────────────────
 
 pub fn load_workers() -> Vec<PairedWorker> {
-	config_file(WORKERS_FILE)
-		.map(|f| snip_remote::load_json(&f))
-		.unwrap_or_default()
-}
-
-pub fn save_workers(workers: &[PairedWorker]) {
-	if let Some(f) = config_file(WORKERS_FILE) {
-		let _ = snip_remote::save_json(&f, workers);
-	}
+	worker_store().map(|s| s.load()).unwrap_or_default()
 }
 
 /// The remote workspace open in place of a local one.
@@ -415,13 +411,23 @@ impl WorkbenchModel {
 							worker.name,
 							&worker.fingerprint[..16]
 						);
-						let workers = &mut this.remote.workers;
-						workers.retain(|w| {
-							w.fingerprint != worker.fingerprint
-								&& w.addr != worker.addr
-						});
-						workers.insert(0, worker);
-						save_workers(workers);
+						if let Some(store) = worker_store() {
+							if let Err(err) = store.add(worker.clone()) {
+								this.remote_note(
+									false,
+									format!("cannot save pairings: {err}"),
+									cx,
+								);
+							}
+							this.remote.workers = load_workers();
+						} else {
+							let workers = &mut this.remote.workers;
+							workers.retain(|w| {
+								w.fingerprint != worker.fingerprint
+									&& w.addr != worker.addr
+							});
+							workers.insert(0, worker);
+						}
 						this.remote.pairing = false;
 						for input in [
 							this.remote_addr_input.clone(),
@@ -484,12 +490,24 @@ impl WorkbenchModel {
 	}
 
 	pub fn forget_remote_worker(&mut self, idx: usize, cx: &mut Context<Self>) {
-		if idx < self.remote.workers.len() {
+		let Some(worker) = self.remote.workers.get(idx) else {
+			return;
+		};
+		let fp = worker.fingerprint.clone();
+		if let Some(store) = worker_store() {
+			if let Err(err) = store.forget(&fp) {
+				self.remote_note(
+					false,
+					format!("cannot save pairings: {err}"),
+					cx,
+				);
+			}
+			self.remote.workers = load_workers();
+		} else {
 			self.remote.workers.remove(idx);
-			save_workers(&self.remote.workers);
-			self.remote.browse = None;
-			cx.notify();
 		}
+		self.remote.browse = None;
+		cx.notify();
 	}
 
 	/// Opens a listed remote workspace after the usual close checks.
