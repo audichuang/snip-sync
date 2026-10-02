@@ -4534,6 +4534,67 @@ fn test_selection_from_paths_root_through_symlink() {
 	assert_eq!(case_dotdot.sel.items, expected.sel.items);
 }
 
+#[cfg(unix)]
+#[test]
+fn test_selection_from_paths_labels_and_explicit_dir_symlink() {
+	let repo = TestRepo::new("sel-labels-dir-symlink");
+	repo.write("sub/s.txt", "content s\n");
+	std::os::unix::fs::symlink("sub", repo.path().join("linkdir")).unwrap();
+
+	let alias_dir = tempfile::tempdir().unwrap();
+	let alias_path = alias_dir.path().join("repo_alias");
+	std::os::unix::fs::symlink(repo.path(), &alias_path).unwrap();
+
+	// 1. Label of file reached through directory symlink with symlink-spelled root:
+	let res_file = selection_from_paths(
+		&alias_path,
+		&alias_path,
+		&[PathBuf::from("linkdir/s.txt")],
+	)
+	.unwrap();
+	assert_eq!(res_file.sel.source_root, Some("repo_alias".to_string()));
+	assert_eq!(res_file.sel.items.len(), 1);
+	assert_eq!(res_file.sel.items[0].relative_path, "linkdir/s.txt");
+
+	let cancel = CancelToken::new();
+	let expanded_file =
+		expand_folder_items(res_file.sel, 100, &cancel).unwrap();
+	assert_eq!(
+		expanded_file.sel.source_root,
+		Some("repo_alias".to_string())
+	);
+	let plan_file =
+		plan_export(&expanded_file.sel, &Settings::default(), None).unwrap();
+	assert!(plan_file.payload.contains("// clipcode-root: repo_alias"));
+	assert!(plan_file.payload.contains("// file: linkdir/s.txt"));
+
+	// 2. Explicitly passed directory symlink `linkdir`:
+	let res_dir = selection_from_paths(
+		&alias_path,
+		&alias_path,
+		&[PathBuf::from("linkdir")],
+	)
+	.unwrap();
+	assert_eq!(res_dir.sel.source_root, Some("repo_alias".to_string()));
+	assert_eq!(res_dir.sel.items.len(), 1);
+	assert_eq!(res_dir.sel.items[0].relative_path, "linkdir");
+
+	let expanded_dir = expand_folder_items(res_dir.sel, 100, &cancel).unwrap();
+	assert_eq!(expanded_dir.sel.source_root, Some("repo_alias".to_string()));
+	let dir_rels: Vec<_> = expanded_dir
+		.sel
+		.items
+		.iter()
+		.map(|it| it.relative_path.as_str())
+		.collect();
+	assert_eq!(dir_rels, vec!["linkdir/s.txt"]);
+
+	let plan_dir =
+		plan_export(&expanded_dir.sel, &Settings::default(), None).unwrap();
+	assert!(plan_dir.payload.contains("// clipcode-root: repo_alias"));
+	assert!(plan_dir.payload.contains("// file: linkdir/s.txt"));
+}
+
 // ---------------------------------------------------------------------------
 // 34. Phase 2: from_restore_base equivalence
 // ---------------------------------------------------------------------------

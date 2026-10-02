@@ -55,11 +55,29 @@ pub fn expand_folder_items(
 	cancel: &CancelToken,
 ) -> Result<FolderExpansion, TransferError> {
 	let is_folder = |item: &ExportItem| {
-		item.source == SourceKind::File
-			&& std::fs::symlink_metadata(
-				item.root.path().join(&item.relative_path),
-			)
-			.is_ok_and(|meta| meta.is_dir())
+		if item.source != SourceKind::File {
+			return false;
+		}
+		let path = item.root.path().join(&item.relative_path);
+		let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
+			return false;
+		};
+		if sym_meta.is_dir() {
+			return true;
+		}
+		if sym_meta.is_symlink() {
+			if let Ok(meta) = std::fs::metadata(&path) {
+				if meta.is_dir() {
+					if let Ok(canonical) = dunce::canonicalize(&path) {
+						return !paths::escapes_all_roots(
+							&[item.root.path()],
+							&canonical,
+						);
+					}
+				}
+			}
+		}
+		false
 	};
 	if !sel.items.iter().any(is_folder) {
 		return Ok(FolderExpansion {
@@ -126,11 +144,13 @@ pub fn expand_folder_items(
 			});
 		}
 	}
+	let source_root = sel.source_root.clone();
 	let sel = ExportSelection::new(
 		sel.roots.iter().map(|r| r.path().to_path_buf()).collect(),
 		sel.primary_root.map(|r| r.path().to_path_buf()),
 		items,
-	)?;
+	)?
+	.with_source_root(source_root);
 	Ok(FolderExpansion {
 		sel,
 		skipped,
@@ -240,6 +260,13 @@ pub fn selection_from_paths(
 	let canonical_root = CanonicalRootId::new(root)?;
 	canonical_root.validate()?;
 
+	let lexical_root = if root.is_absolute() {
+		lexical_normalize(root)
+	} else {
+		lexical_normalize(&cwd.join(root))
+	};
+	let source_root = paths::source_root_name(&[&lexical_root]);
+
 	let mut items = Vec::new();
 	let mut skipped = 0usize;
 	let mut seen: HashSet<String> = HashSet::new();
@@ -252,7 +279,7 @@ pub fn selection_from_paths(
 		};
 		let normalized = lexical_normalize(&full_path);
 
-		let is_root = normalized == lexical_normalize(root)
+		let is_root = normalized == lexical_root
 			|| normalized == canonical_root.path()
 			|| dunce::canonicalize(&normalized).ok().as_deref()
 				== Some(canonical_root.path());
@@ -277,6 +304,7 @@ pub fn selection_from_paths(
 			Ok(p) => p,
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 				if parent.strip_prefix(root).is_err()
+					&& parent.strip_prefix(&lexical_root).is_err()
 					&& parent.strip_prefix(canonical_root.path()).is_err()
 				{
 					return Err(TransferError::PathOutsideRoot(path.clone()));
@@ -286,11 +314,23 @@ pub fn selection_from_paths(
 			Err(e) => return Err(TransferError::Io(e)),
 		};
 
-		let target = canonical_parent.join(file_name);
+		let canonical_target = canonical_parent.join(file_name);
 
-		let rel = match target.strip_prefix(canonical_root.path()) {
+		let fallback_rel = match canonical_target
+			.strip_prefix(canonical_root.path())
+		{
 			Ok(r) => r,
 			Err(_) => return Err(TransferError::PathOutsideRoot(path.clone())),
+		};
+
+		let (rel, strip_root) = if let Ok(r) =
+			normalized.strip_prefix(&lexical_root)
+		{
+			(r, lexical_root.as_path())
+		} else if let Ok(r) = normalized.strip_prefix(canonical_root.path()) {
+			(r, canonical_root.path())
+		} else {
+			(fallback_rel, canonical_root.path())
 		};
 
 		if rel.as_os_str().is_empty() {
@@ -303,14 +343,6 @@ pub fn selection_from_paths(
 			)?;
 			continue;
 		}
-
-		let sym_meta = match std::fs::symlink_metadata(&target) {
-			Ok(m) => m,
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-				return Err(TransferError::PathNotFound(path.clone()));
-			}
-			Err(e) => return Err(TransferError::Io(e)),
-		};
 
 		let rel_str = match rel
 			.components()
@@ -325,7 +357,33 @@ pub fn selection_from_paths(
 			}
 		};
 
-		if sym_meta.is_dir() {
+		let entry_path = strip_root.join(rel);
+
+		let sym_meta = match std::fs::symlink_metadata(&entry_path) {
+			Ok(m) => m,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				return Err(TransferError::PathNotFound(path.clone()));
+			}
+			Err(e) => return Err(TransferError::Io(e)),
+		};
+
+		let is_dir_symlink = sym_meta.is_symlink()
+			&& (|| -> bool {
+				if let Ok(meta) = std::fs::metadata(&entry_path) {
+					if meta.is_dir() {
+						if let Ok(canonical) = dunce::canonicalize(&entry_path)
+						{
+							return !paths::escapes_all_roots(
+								&[canonical_root.path()],
+								&canonical,
+							);
+						}
+					}
+				}
+				false
+			})();
+
+		if sym_meta.is_dir() || is_dir_symlink {
 			if seen.insert(rel_str.clone()) {
 				items.push(ExportItem {
 					root: canonical_root.clone(),
@@ -335,8 +393,7 @@ pub fn selection_from_paths(
 					gitlink: false,
 				});
 			}
-		} else if let Some(valid_rel) =
-			folder_file_rel(canonical_root.path(), &target)
+		} else if let Some(valid_rel) = folder_file_rel(strip_root, &entry_path)
 		{
 			if seen.insert(valid_rel.clone()) {
 				items.push(ExportItem {
@@ -360,7 +417,8 @@ pub fn selection_from_paths(
 		vec![root.to_path_buf()],
 		Some(root.to_path_buf()),
 		items,
-	)?;
+	)?
+	.with_source_root(source_root);
 
 	Ok(PathSelection { sel, skipped })
 }

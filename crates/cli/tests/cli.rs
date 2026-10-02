@@ -1,7 +1,7 @@
 //! End-to-end runs of the `snip` binary through `--stdout` / `--stdin`.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -21,15 +21,30 @@ fn snip_with_timeout_in_dir(
 		cmd.current_dir(dir);
 	}
 	let mut child = cmd.spawn().unwrap();
+	let mut stdout_pipe = child.stdout.take().unwrap();
+	let mut stderr_pipe = child.stderr.take().unwrap();
+	let stdout_reader = std::thread::spawn(move || {
+		let mut buf = Vec::new();
+		let _ = stdout_pipe.read_to_end(&mut buf);
+		buf
+	});
+	let stderr_reader = std::thread::spawn(move || {
+		let mut buf = Vec::new();
+		let _ = stderr_pipe.read_to_end(&mut buf);
+		buf
+	});
 	if let Some(mut input) = child.stdin.take() {
 		if let Some(bytes) = stdin {
-			input.write_all(bytes).unwrap();
+			let bytes = bytes.to_vec();
+			std::thread::spawn(move || {
+				let _ = input.write_all(&bytes);
+			});
 		}
 	}
 	let start = std::time::Instant::now();
-	loop {
+	let status = loop {
 		match child.try_wait().unwrap() {
-			Some(_) => break,
+			Some(s) => break s,
 			None if start.elapsed() < timeout => {
 				std::thread::sleep(std::time::Duration::from_millis(50));
 			}
@@ -39,8 +54,14 @@ fn snip_with_timeout_in_dir(
 				panic!("{timeout_msg}");
 			}
 		}
+	};
+	let stdout = stdout_reader.join().unwrap();
+	let stderr = stderr_reader.join().unwrap();
+	Output {
+		status,
+		stdout,
+		stderr,
 	}
-	child.wait_with_output().unwrap()
 }
 
 fn snip(args: &[&str], stdin: Option<&[u8]>) -> Output {
@@ -785,4 +806,89 @@ fn copy_paths_relative_path_resolves_against_cwd() {
 	let stdout = text(&out.stdout);
 	assert!(stdout.contains("// file: subdir/target.txt"), "{stdout}");
 	assert!(stdout.contains("sub target content"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_paths_labels_follow_the_spelled_root_and_dir_symlinks() {
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("real");
+	fs::create_dir_all(real.join("sub")).unwrap();
+	fs::write(real.join("sub/s.txt"), "hello from sub\n").unwrap();
+	std::os::unix::fs::symlink("sub", real.join("linkdir")).unwrap();
+
+	let link = tmp.path().join("link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	let link_s = link.to_str().unwrap();
+	let file_arg = link.join("linkdir/s.txt");
+	let file_s = file_arg.to_str().unwrap();
+
+	let out1 = snip(&["--repo", link_s, "copy", file_s, "--stdout"], None);
+	assert_eq!(code(&out1), 0, "{}", text(&out1.stderr));
+	let stdout1 = text(&out1.stdout);
+	assert!(
+		stdout1.contains("// clipcode-root: link"),
+		"missing clipcode-root link: {stdout1}"
+	);
+	assert!(
+		stdout1.contains("// file: linkdir/s.txt"),
+		"missing file linkdir/s.txt: {stdout1}"
+	);
+	assert!(
+		stdout1.contains("hello from sub"),
+		"missing body: {stdout1}"
+	);
+
+	let dir_arg = link.join("linkdir");
+	let dir_s = dir_arg.to_str().unwrap();
+	let out2 = snip(&["--repo", link_s, "copy", dir_s, "--stdout"], None);
+	assert_eq!(code(&out2), 0, "{}", text(&out2.stderr));
+	let stdout2 = text(&out2.stdout);
+	assert!(
+		stdout2.contains("// clipcode-root: link"),
+		"missing clipcode-root link: {stdout2}"
+	);
+	assert!(
+		stdout2.contains("// file: linkdir/s.txt"),
+		"missing file linkdir/s.txt: {stdout2}"
+	);
+	assert!(
+		stdout2.contains("hello from sub"),
+		"missing body: {stdout2}"
+	);
+}
+
+#[test]
+fn copy_paths_large_stdout_payload_does_not_deadlock() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	let large_file = repo.join("large.txt");
+	let content = "a".repeat(1_500_000);
+	fs::write(&large_file, &content).unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let large_s = large_file.to_str().unwrap();
+	let out = snip_with_timeout_in_dir(
+		&[
+			"--settings",
+			r#"{"maxFileSizeKB": 2048}"#,
+			"--repo",
+			repo_s,
+			"copy",
+			large_s,
+			"--stdout",
+		],
+		None,
+		None,
+		std::time::Duration::from_secs(60),
+		"snip timed out (deadlock on large stdout)",
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	assert!(
+		out.stdout.len() >= 1_500_000,
+		"stdout was truncated or too small: {}",
+		out.stdout.len()
+	);
 }

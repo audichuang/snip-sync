@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -22,27 +22,48 @@ fn run(mut cmd: Command, stdin: Option<&[u8]>) -> Output {
 		.stderr(Stdio::piped())
 		.spawn()
 		.unwrap();
-	let mut input = child.stdin.take().unwrap();
-	if let Some(bytes) = stdin {
-		input.write_all(bytes).unwrap();
+	let mut stdout_pipe = child.stdout.take().unwrap();
+	let mut stderr_pipe = child.stderr.take().unwrap();
+	let stdout_reader = std::thread::spawn(move || {
+		let mut buf = Vec::new();
+		let _ = stdout_pipe.read_to_end(&mut buf);
+		buf
+	});
+	let stderr_reader = std::thread::spawn(move || {
+		let mut buf = Vec::new();
+		let _ = stderr_pipe.read_to_end(&mut buf);
+		buf
+	});
+	if let Some(mut input) = child.stdin.take() {
+		if let Some(bytes) = stdin {
+			let bytes = bytes.to_vec();
+			std::thread::spawn(move || {
+				let _ = input.write_all(&bytes);
+			});
+		}
 	}
-	drop(input);
 	let start = std::time::Instant::now();
 	let timeout = std::time::Duration::from_secs(60);
-	loop {
+	let status = loop {
 		match child.try_wait().unwrap() {
-			Some(_) => break,
+			Some(s) => break s,
 			None if start.elapsed() < timeout => {
 				std::thread::sleep(std::time::Duration::from_millis(50));
 			}
 			None => {
 				let _ = child.kill();
 				let _ = child.wait();
-				panic!("process timed out after 60s");
+				panic!("run process timed out");
 			}
 		}
+	};
+	let stdout = stdout_reader.join().unwrap();
+	let stderr = stderr_reader.join().unwrap();
+	Output {
+		status,
+		stdout,
+		stderr,
 	}
-	child.wait_with_output().unwrap()
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -481,28 +502,41 @@ fn cross_tool_file_payload_is_byte_identical_through_symlinked_root() {
 	let ts_ref = ts_ref_or_skip!();
 	let tmp = tempfile::tempdir().unwrap();
 	let real = tmp.path().join("real");
-	let real_src = real.join("src");
-	file_mode_fixture(&real_src);
-	add_edge_files(&real_src);
+	file_mode_fixture(&real);
+	add_edge_files(&real);
 
 	let link = tmp.path().join("link");
 	std::os::unix::fs::symlink(&real, &link).unwrap();
-	let link_src = link.join("src");
 
-	let entries = worktree_entries(&link_src);
+	let entries = worktree_entries(&link);
 	let subsets: Vec<Vec<String>> = vec![
 		entries.clone(),
-		vec![link_src.join("edge").to_str().unwrap().into()],
+		vec![link.join("edge").to_str().unwrap().into()],
 		vec![
-			link_src.join("dir/d.txt").to_str().unwrap().into(),
-			link_src.join("日本語").to_str().unwrap().into(),
+			link.join("dir/d.txt").to_str().unwrap().into(),
+			link.join("日本語").to_str().unwrap().into(),
 		],
 	];
 	for paths in subsets {
 		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
 		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
-		let rust = snip(&link_src, &args, None).stdout;
-		let node = ts(&ts_ref, "files", &link_src, &paths, None);
+		let rust = snip(&link, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &link, &paths, None);
+		assert_eq!(text(&rust), text(&node), "{paths:?}");
+		assert_eq!(rust, node);
+		assert!(text(&rust).contains("// file: "), "empty payload");
+	}
+
+	std::os::unix::fs::symlink("dir", real.join("linkdir")).unwrap();
+	let dir_symlink_subsets: Vec<Vec<String>> = vec![
+		vec![link.join("linkdir/d.txt").to_str().unwrap().into()],
+		vec![link.join("linkdir").to_str().unwrap().into()],
+	];
+	for paths in dir_symlink_subsets {
+		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+		let rust = snip(&link, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &link, &paths, None);
 		assert_eq!(text(&rust), text(&node), "{paths:?}");
 		assert_eq!(rust, node);
 		assert!(text(&rust).contains("// file: "), "empty payload");

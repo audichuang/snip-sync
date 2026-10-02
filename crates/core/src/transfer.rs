@@ -129,6 +129,7 @@ pub struct ExportSelection {
 	pub roots: Vec<CanonicalRootId>,
 	pub primary_root: Option<CanonicalRootId>,
 	pub items: Vec<ExportItem>,
+	pub source_root: Option<String>,
 }
 
 impl ExportSelection {
@@ -155,9 +156,15 @@ impl ExportSelection {
 			roots: canonical_roots,
 			primary_root: primary,
 			items,
+			source_root: None,
 		};
 		validate_export_selection(&sel)?;
 		Ok(sel)
+	}
+
+	pub fn with_source_root(mut self, source_root: Option<String>) -> Self {
+		self.source_root = source_root;
+		self
 	}
 }
 
@@ -1656,7 +1663,9 @@ pub fn plan_export_with(
 		let mut fallback = is_graph;
 
 		let default_source_root = if selection.roots.len() == 1 {
-			paths::source_root_name(&[selection.roots[0].path()])
+			selection.source_root.clone().or_else(|| {
+				paths::source_root_name(&[selection.roots[0].path()])
+			})
 		} else {
 			None
 		};
