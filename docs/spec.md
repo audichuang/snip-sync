@@ -159,18 +159,20 @@ snip paste --apply [--overwrite | --skip-existing] [--adjust-paths]
 - 貼上 commit payload 時,`--skip-existing` 與 `--adjust-paths` 不支援,指定時以 exit 2 退出(見 4.3)。
 - 貼上 commit payload 時,若目標檔案已存在需明確指定 `--overwrite`,未指定時以 exit 2 退出(見 4.3)。
 
-CLI 與 App 呼叫同一組核心入口函式:
-- 複製／匯出:檔案模式經由 `transfer::plan_export_expanding` 搭配 `selection_from_paths` 展開路徑;Git 來源(`--working`、`--staged`、`--commit`、`--range`)經由 `transfer::changed_items` 搭配 `SourceKind::{Working,Unstaged,Staged,Commit,Range}`,兩者皆交由 `transfer::plan_export_with` 產出 payload;`--commits` 則呼叫 `transfer::plan_commit_export_with`。
-- 貼上檔案:經由 `transfer::plan_import_with` 進行規劃與新鮮度檢查,並呼叫 `TransferImportPlan::apply` 套用(搭配 `ImportMapping`,CLI `--adjust-paths` 由 `ImportMapping::from_restore_base` 轉換)。
-- 貼上 commits:經由 `transfer::CommitReplayPreview`(流程包含 `capture` / `plan` / `revalidate` / `apply`)。
-- 配對清單:經由 `snip_remote::WorkerStore`(以及 `TrustedMasterStore`)。
-- 大小上限:統一由 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)限制。
+CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
+- 複製檔案／資料夾:兩邊都用 `transfer::expand_folder_items` 展開資料夾(過濾 `.git`、巢狀 repo、特殊檔、指出 root 的 symlink),再由 `transfer::plan_export_with` 產出 payload。CLI 另以 `selection_from_paths` 把命令列路徑轉成選取項目,並以 `plan_export_expanding` 分批展開(結果與一次展開相同,只是不必走完整棵樹);GUI 的選取來自檔案樹。
+- 複製 Git 變更:兩邊都以 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` 交給 `plan_export_with`。CLI 以 `transfer::changed_items` 列出變更,GUI 的項目來自 Changes 面板。
+- 複製 commits:兩邊都經 `commits::copy_commits_with`。CLI 以範圍或 `-n` 選取(`transfer::plan_commit_export_with`),GUI 以時間軸選取的精確 chain(`plan_commit_export_exact_with`)。
+- 貼上檔案:兩邊都以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。
+- 貼上 commits:兩邊都經 `transfer::CommitReplayPreview`(`capture` / `revalidate` / `apply`)。
+- 配對清單:兩邊都經 `snip_remote::WorkerStore`;worker 端的受信任 master 清單經 `TrustedMasterStore`。
+- 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 
-CLI 與 App 行為的差異僅在 UI(CLI 為旗標與文字輸出,App 為預覽視窗與核取方塊),以及兩項誠實的例外:
-1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 全域套用;GUI 則維持逐 prefix 的選擇(D4)。
-2. 各 UI 選擇呈現的內容(CLI 印出計畫與摘要文字,GUI 提供檔案清單、diff 與時間軸預覽);兩邊的規劃與驗證結果相同。
+兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是預覽、勾選與時間軸),以及下列例外:
+1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 套用全部檔案(經 `ImportMapping::from_restore_base`);GUI 維持逐 prefix 選擇(D4)。兩者最後都是同一個 `ImportMapping`。
+2. 沒有選到任何檔案:CLI 顯示 `No files selected.` 並以 exit 1 結束、不碰剪貼簿;GUI 顯示提示、同樣不寫剪貼簿。
 
-舊的獨立引擎(`copy::collect_copy_files`、`gitsrc::collect_payload`、`restore::plan_restore`/`execute_restore_plan`)已降級為測試 oracle 或單筆規劃器,CLI 不再將其作為整體引擎呼叫(其中 `plan_restore` 仍作為 `plan_import_with` 內部的單檔規劃器,`commits::*` 的解析與摘要輔助函式亦仍在使用)。
+舊的整體引擎 `copy::collect_copy_files` 與 `gitsrc::collect_payload` 已降級為測試 oracle,產品程式碼不再呼叫。`restore::plan_restore` 仍是 `plan_import_with` 內部每筆 entry 的規劃器(contract fixture 測的就是它),`restore::execute_restore_plan` 仍是檔案貼上的執行器。
 
 ## 6. 技術決策(摘要)
 
