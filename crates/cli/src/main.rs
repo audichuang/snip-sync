@@ -16,14 +16,15 @@ use snip_core::commits::{self, CommitCopySummary, CommitsPayload};
 use snip_core::copy::CopyResult;
 use snip_core::format::{extract_source_root, parse_clipboard};
 use snip_core::gitrun::{CancelToken, RunOptions};
-use snip_core::gitsrc::{collect_payload, Git, GitSource};
+use snip_core::gitsrc::{Git, GitSource};
 use snip_core::restore::{
 	apply_restore_base, execute_restore_plan, is_relative, plan_restore,
 	suggest_restore_base, FsProbe, RestorePlan, RestoreSelection,
 };
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	plan_commit_export_with, plan_export_expanding, selection_from_paths,
+	changed_items, plan_commit_export_with, plan_export_expanding,
+	plan_export_with, selection_from_paths, CanonicalRootId, ExportSelection,
 	TransferError, CLIPBOARD_PAYLOAD_MAX,
 };
 
@@ -307,11 +308,44 @@ fn copy_git(
 	stdout: bool,
 ) -> Outcome {
 	let git = Git::open(repo).map_err(|e| e.to_string())?;
-	// `--repo` is the workspace root, as for `snip copy <paths>` and the
-	// TS surfaces (which pass the workspace roots, not the git toplevel).
-	let result = collect_payload(&git, source, &[repo], settings)
-		.map_err(|e| e.to_string())?;
+	let root_id = CanonicalRootId::new(repo).map_err(|e| e.to_string())?;
+	let changed = changed_items(&root_id, &git, source, &RunOptions::default())
+		.map_err(map_transfer_err)?;
+
 	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
+	if changed.items.is_empty() {
+		return Err(if graph {
+			"No source copied.".into()
+		} else {
+			"No Git changes found to copy.".into()
+		});
+	}
+
+	let sel = ExportSelection::new(
+		vec![repo.to_path_buf()],
+		Some(repo.to_path_buf()),
+		changed.items,
+	)
+	.map_err(map_transfer_err)?;
+
+	let plan = plan_export_with(
+		&sel,
+		settings,
+		Some(CLIPBOARD_PAYLOAD_MAX),
+		&RunOptions::default(),
+	)
+	.map_err(map_transfer_err)?;
+
+	let result = CopyResult {
+		files: plan.files,
+		payload: plan.payload,
+		copied_file_count: plan.copied_file_count,
+		skipped_file_size_count: plan.skipped_file_size_count,
+		skipped_unreadable_count: plan.skipped_unreadable_count
+			+ changed.skipped_non_utf8,
+		file_limit_reached: plan.file_limit_reached,
+	};
+
 	let message = if graph {
 		// copyFullSourceAtCommit
 		if result.copied_file_count == 0 && result.skipped_file_size_count == 0
@@ -355,6 +389,12 @@ fn copy_git(
 		)
 	};
 	emit(&result.payload, stdout)?;
+	if !changed.out_of_scope.is_empty() {
+		eprintln!(
+			"{} change(s) outside --repo not copied.",
+			changed.out_of_scope.len()
+		);
+	}
 	notify_copied(&message, &result, settings);
 	Ok(())
 }

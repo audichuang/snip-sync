@@ -358,6 +358,29 @@ fn git_sources_label_paths_against_repo_subdirectory() {
 	// Same labelling as `snip copy <paths>` with the same --repo.
 	assert!(payload.contains("[MODIFIED] a.txt"), "{payload}");
 	assert!(!payload.contains("sub/a.txt"), "{payload}");
+
+	// A change outside the subdir is not copied; stderr reports it.
+	fs::write(repo.join("outside.txt"), "outside\n").unwrap();
+	let out = snip(
+		&[
+			"--repo",
+			sub.to_str().unwrap(),
+			"copy",
+			"--working",
+			"--stdout",
+		],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let payload = text(&out.stdout);
+	assert!(payload.contains("[MODIFIED] a.txt"), "{payload}");
+	assert!(!payload.contains("outside.txt"), "{payload}");
+	assert!(
+		text(&out.stderr).contains("1 change(s) outside --repo not copied."),
+		"{}",
+		text(&out.stderr)
+	);
+	assert!(text(&out.stderr).contains("1 Git file(s) copied."));
 }
 
 #[test]
@@ -1120,6 +1143,241 @@ fn copy_paths_batched_expansion_avoids_walking_large_tree() {
 	assert!(
 		text(&out.stderr).contains("30 file(s) copied"),
 		"expected '30 file(s) copied' in stderr: {}",
+		text(&out.stderr)
+	);
+}
+
+#[test]
+fn git_copy_byte_parity_old_vs_new_including_symlinks() {
+	use snip_core::gitsrc::{collect_payload, Git, GitSource};
+	use snip_core::settings::Settings;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+
+	// Setup history for commit and range
+	fs::write(repo.join("base.txt"), "base content\n").unwrap();
+	fs::write(repo.join("mod.txt"), "initial mod\n").unwrap();
+	fs::write(repo.join("del.txt"), "del content\n").unwrap();
+	commit(&repo, "commit A", "2020-01-01T00:00:00+00:00");
+	let sha_a = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+	fs::write(repo.join("mod.txt"), "modified in B\n").unwrap();
+	fs::write(repo.join("added.txt"), "added in B\n").unwrap();
+	git(&repo, &["rm", "del.txt"]);
+	commit(&repo, "commit B", "2020-01-01T00:01:00+00:00");
+	let sha_b = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+	let check_sources = |repo_path: &Path| {
+		let git_repo = Git::open(repo_path).unwrap();
+		let settings = Settings::default();
+		let repo_str = repo_path.to_str().unwrap();
+
+		// 1. --commit HEAD
+		let out = snip(
+			&["--repo", repo_str, "copy", "--commit", "HEAD", "--stdout"],
+			None,
+		);
+		assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+		let legacy_commit = collect_payload(
+			&git_repo,
+			&GitSource::Commit("HEAD".into()),
+			&[repo_path],
+			&settings,
+		)
+		.unwrap();
+		assert_eq!(text(&out.stdout), legacy_commit.payload);
+
+		// 2. --range sha_a..sha_b (includes deleted file del.txt reading its base content)
+		let range_arg = format!("{sha_a}..{sha_b}");
+		let out = snip(
+			&[
+				"--repo", repo_str, "copy", "--range", &range_arg, "--stdout",
+			],
+			None,
+		);
+		assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+		let legacy_range = collect_payload(
+			&git_repo,
+			&GitSource::Range(sha_a.clone(), sha_b.clone()),
+			&[repo_path],
+			&settings,
+		)
+		.unwrap();
+		assert_eq!(text(&out.stdout), legacy_range.payload);
+	};
+
+	check_sources(&repo);
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_repo = symlink_dir.path().join("link_repo");
+		std::os::unix::fs::symlink(&repo, &symlink_repo).unwrap();
+		check_sources(&symlink_repo);
+	}
+
+	// Now test --working: modified + untracked + deleted
+	fs::write(repo.join("mod.txt"), "working mod\n").unwrap();
+	fs::write(repo.join("untracked.txt"), "untracked content\n").unwrap();
+	fs::remove_file(repo.join("added.txt")).unwrap();
+
+	let check_working = |repo_path: &Path| {
+		let git_repo = Git::open(repo_path).unwrap();
+		let settings = Settings::default();
+		let repo_str = repo_path.to_str().unwrap();
+
+		let out =
+			snip(&["--repo", repo_str, "copy", "--working", "--stdout"], None);
+		assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+		let legacy_working = collect_payload(
+			&git_repo,
+			&GitSource::Working,
+			&[repo_path],
+			&settings,
+		)
+		.unwrap();
+		assert_eq!(text(&out.stdout), legacy_working.payload);
+	};
+
+	check_working(&repo);
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_repo = symlink_dir.path().join("link_repo_work");
+		std::os::unix::fs::symlink(&repo, &symlink_repo).unwrap();
+		check_working(&symlink_repo);
+	}
+
+	// Now test --staged: modified + added + deleted
+	git(&repo, &["checkout", "--", "added.txt"]);
+	fs::remove_file(repo.join("untracked.txt")).unwrap();
+	fs::write(repo.join("staged_new.txt"), "staged new content\n").unwrap();
+	git(&repo, &["add", "staged_new.txt"]);
+	git(&repo, &["add", "mod.txt"]);
+	git(&repo, &["rm", "base.txt"]);
+
+	let check_staged = |repo_path: &Path| {
+		let git_repo = Git::open(repo_path).unwrap();
+		let settings = Settings::default();
+		let repo_str = repo_path.to_str().unwrap();
+
+		let out =
+			snip(&["--repo", repo_str, "copy", "--staged", "--stdout"], None);
+		assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+		let legacy_staged = collect_payload(
+			&git_repo,
+			&GitSource::Staged,
+			&[repo_path],
+			&settings,
+		)
+		.unwrap();
+		assert_eq!(text(&out.stdout), legacy_staged.payload);
+	};
+
+	check_staged(&repo);
+
+	#[cfg(unix)]
+	{
+		let symlink_dir = tempfile::tempdir().unwrap();
+		let symlink_repo = symlink_dir.path().join("link_repo_stage");
+		std::os::unix::fs::symlink(&repo, &symlink_repo).unwrap();
+		check_staged(&symlink_repo);
+	}
+}
+
+#[test]
+fn git_copy_memory_bounded_huge_file_and_many_files() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("bounded_repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+	fs::write(repo.join("init.txt"), "init\n").unwrap();
+	commit(&repo, "init", "2020-01-01T00:00:00+00:00");
+	let repo_s = repo.to_str().unwrap();
+
+	// (1) Single huge changed file (> 33 MiB, untracked) with maxFileSizeKB raised
+	let chunk = "A".repeat(1024 * 1024);
+	let huge_path = repo.join("huge.txt");
+	{
+		let mut f = fs::File::create(&huge_path).unwrap();
+		for _ in 0..34 {
+			f.write_all(chunk.as_bytes()).unwrap();
+		}
+	}
+	let out = snip(
+		&[
+			"--repo",
+			repo_s,
+			"copy",
+			"--working",
+			"--stdout",
+			"--settings",
+			"{\"maxFileSizeKB\": 1000000}",
+		],
+		None,
+	);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	assert!(
+		out.stdout.is_empty(),
+		"stdout must be empty on limit failure"
+	);
+	assert!(
+		text(&out.stderr).contains("33554432"),
+		"stderr must mention limit: {}",
+		text(&out.stderr)
+	);
+
+	// Remove huge file before (2)
+	fs::remove_file(huge_path).unwrap();
+
+	// (2) Many untracked files (40 files of 1 MiB each = 40 MiB > 32 MiB)
+	for i in 0..40 {
+		fs::write(repo.join(format!("file_{i:02}.txt")), &chunk).unwrap();
+	}
+	let out = snip(
+		&[
+			"--repo",
+			repo_s,
+			"copy",
+			"--working",
+			"--stdout",
+			"--settings",
+			"{\"maxFileSizeKB\": 1000000, \"setMaxFileCount\": false}",
+		],
+		None,
+	);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	assert!(
+		out.stdout.is_empty(),
+		"stdout must be empty on limit failure"
+	);
+	assert!(
+		text(&out.stderr).contains("33554432"),
+		"stderr must mention limit: {}",
+		text(&out.stderr)
+	);
+}
+
+#[test]
+fn git_copy_working_empty_changes_exits_1() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("clean_repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+	fs::write(repo.join("file.txt"), "hello\n").unwrap();
+	commit(&repo, "init", "2020-01-01T00:00:00+00:00");
+	let repo_s = repo.to_str().unwrap();
+
+	let out = snip(&["--repo", repo_s, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	assert!(out.stdout.is_empty());
+	assert!(
+		text(&out.stderr).contains("No Git changes found to copy."),
+		"{}",
 		text(&out.stderr)
 	);
 }

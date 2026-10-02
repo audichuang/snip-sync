@@ -191,6 +191,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 5 — CLI `--working/--staged/--commit/--range` 改走 transfer(F12、F15)
 
+狀態:已完成(CLI copy_git 切換至 transfer 引擎管線,套用 32 MiB 上限與 read_cap 限制(F12);子目錄 out_of_scope 變更略過並於 stderr 提示;修正 collect_payload / collect_payload_with_selection 文件為測試 oracle(F15);產品程式碼已無舊引擎呼叫;cli.rs 補齊位元組一致性、symlink 拼寫 root、記憶體預算超限 exit 1、空變更等回歸測試)
+
 - `copy_git` → `changed_items` → `plan_export_with`,讀取量由 `remaining_budget`/`read_cap` 限住(F12)。
 - `--repo` 是 repo 子目錄時,label 規則會變(舊引擎:範圍外的變更給絕對 label;transfer:`UnsafePath`)。`cli.rs:274` 的子目錄測試要依新規則改,並在 porting-notes 登記。
 - 修正 `collect_payload_with_selection` 的文件為「測試 oracle」(F15)。

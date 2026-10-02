@@ -1107,6 +1107,8 @@ fn fs_path_key(path: &Path) -> String {
 	}
 }
 
+/// Test oracle: not called by product code.
+///
 /// Port of `collectGitPayloadFiles` (extension.ts) plus the payload build:
 /// the files of `source` with filters, limits and counts applied, labelled
 /// against `workspace_roots` (the repository root when there are none).
@@ -1126,7 +1128,9 @@ pub fn collect_payload<P: AsRef<Path>>(
 	)
 }
 
-/// Desktop selection: constrain a source to a monorepo folder and optional
+/// Test oracle: not called by product code.
+///
+/// Constrain a source to a monorepo folder and optional
 /// repository-relative paths without changing the CLI's all-files behavior.
 pub fn collect_payload_with_selection<P: AsRef<Path>>(
 	git: &Git,
