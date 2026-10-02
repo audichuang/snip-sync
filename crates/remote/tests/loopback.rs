@@ -214,3 +214,57 @@ fn five_wrong_codes_withdraw_the_open_one() {
 		ErrorCode::PairingRefused
 	);
 }
+
+/// Found by the two-machine test: 20 parallel `snip remote cat` calls had
+/// some connections reset. A connection over the limit now waits for a
+/// slot instead, and fails only after [`SLOT_WAIT`].
+#[test]
+fn a_connection_over_the_limit_waits_for_a_slot_instead_of_being_reset() {
+	use snip_remote::worker::{MAX_CONNECTIONS, SLOT_WAIT};
+	use std::sync::mpsc;
+	use std::time::{Duration, Instant};
+
+	let tmp = tempfile::tempdir().unwrap();
+	let (w, _) = worker(&[tmp.path()]);
+	let master = Arc::new(Identity::generate().unwrap());
+	let code = w.open_pairing();
+	let paired = pair(&addr(&w), &code, &master, "mac").unwrap();
+	// Every slot held by an idle connection, as pooled masters hold them.
+	let mut held: Vec<_> = (0..MAX_CONNECTIONS)
+		.map(|_| {
+			snip_remote::Connection::open(&addr(&w), &master, None, "m")
+				.unwrap()
+		})
+		.collect();
+	assert_eq!(w.active_connections(), MAX_CONNECTIONS);
+
+	let (tx, rx) = mpsc::channel();
+	let (p, m) = (paired.clone(), master.clone());
+	std::thread::spawn(move || {
+		let client = Client::new(p, m, "mac".into()).unwrap();
+		let _ = tx.send(client.list_workspaces().map(|items| items.len()));
+	});
+	assert!(
+		rx.recv_timeout(Duration::from_millis(500)).is_err(),
+		"the extra connection must wait, not be refused"
+	);
+	held.pop();
+	let served = rx
+		.recv_timeout(Duration::from_secs(10))
+		.expect("the waiting connection got no answer in 10 s");
+	assert_eq!(served.unwrap(), 1);
+
+	// With every slot kept, the wait ends in a failure, not a hang.
+	held.push(
+		snip_remote::Connection::open(&addr(&w), &master, None, "m").unwrap(),
+	);
+	let started = Instant::now();
+	let client = Client::new(paired, master, "mac".into()).unwrap();
+	assert!(client.list_workspaces().is_err());
+	let waited = started.elapsed();
+	assert!(
+		waited >= SLOT_WAIT - Duration::from_millis(500)
+			&& waited < Duration::from_secs(15),
+		"waited {waited:?}"
+	);
+}
