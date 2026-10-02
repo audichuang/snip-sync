@@ -1728,3 +1728,78 @@ fn copy_working_skips_unreadable_file() {
 
 	let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
 }
+
+#[test]
+fn copy_commit_with_subrepo_matches_workspace_relative_filter() {
+	use snip_core::gitsrc::{collect_payload, Git, GitSource};
+	use snip_core::settings::Settings;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+
+	let d_e = repo.join("d/e");
+	fs::create_dir_all(&d_e).unwrap();
+	fs::write(d_e.join("x.txt"), "initial d/e/x\n").unwrap();
+	fs::write(repo.join("outside.txt"), "initial outside\n").unwrap();
+	commit(&repo, "initial", "2020-01-01T00:00:00+00:00");
+
+	fs::write(d_e.join("x.txt"), "modified d/e/x\n").unwrap();
+	fs::write(repo.join("outside.txt"), "modified outside\n").unwrap();
+	commit(
+		&repo,
+		"change d/e/x and outside",
+		"2020-01-02T00:00:00+00:00",
+	);
+
+	let sub_d = repo.join("d");
+	let sub_d_s = sub_d.to_str().unwrap();
+	let settings_str = r#"{"useFilters":true,"useIncludeFilters":true,"filterRules":[{"type":"PATH","action":"INCLUDE","value":"e","enabled":true}]}"#;
+	let settings: Settings = serde_json::from_str(settings_str).unwrap();
+
+	let out = snip(
+		&[
+			"--repo",
+			sub_d_s,
+			"copy",
+			"--commit",
+			"HEAD",
+			"--stdout",
+			"--settings",
+			settings_str,
+		],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+
+	let git_repo = Git::open(&repo).unwrap();
+	let legacy = collect_payload(
+		&git_repo,
+		&GitSource::Commit("HEAD".into()),
+		&[repo.join("d")],
+		&settings,
+	)
+	.unwrap();
+
+	let stdout = text(&out.stdout);
+	assert_eq!(stdout, legacy.payload);
+	assert!(stdout.contains("d/e/x.txt"), "{stdout}");
+
+	let settings_repo_rel = r#"{"useFilters":true,"useIncludeFilters":true,"filterRules":[{"type":"PATH","action":"INCLUDE","value":"d/e","enabled":true}]}"#;
+	let out_repo_rel = snip(
+		&[
+			"--repo",
+			sub_d_s,
+			"copy",
+			"--commit",
+			"HEAD",
+			"--stdout",
+			"--settings",
+			settings_repo_rel,
+		],
+		None,
+	);
+	assert_eq!(code(&out_repo_rel), 1, "{}", text(&out_repo_rel.stderr));
+	assert!(text(&out_repo_rel.stderr).contains("No source copied."));
+}

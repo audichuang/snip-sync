@@ -329,6 +329,11 @@ fn copy_git(
 		changed.items,
 	)
 	.map_err(map_transfer_err)?;
+	let sel = if graph {
+		sel.with_filter_root(Some(repo.to_path_buf()))
+	} else {
+		sel
+	};
 
 	let plan = plan_export_with(
 		&sel,

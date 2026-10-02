@@ -133,6 +133,9 @@ pub struct ExportSelection {
 	pub items: Vec<ExportItem>,
 	pub source_root: Option<String>,
 	pub spelled_root: Option<PathBuf>,
+	/// Base used to spell the path that Commit/Range items are filter-matched against;
+	/// do not reuse spelled_root (that is the root's own spelling and feeds only the File branch).
+	pub filter_root: Option<PathBuf>,
 }
 
 impl ExportSelection {
@@ -161,6 +164,7 @@ impl ExportSelection {
 			items,
 			source_root: None,
 			spelled_root: None,
+			filter_root: None,
 		};
 		validate_export_selection(&sel)?;
 		Ok(sel)
@@ -173,6 +177,13 @@ impl ExportSelection {
 
 	pub fn with_spelled_root(mut self, spelled_root: Option<PathBuf>) -> Self {
 		self.spelled_root = spelled_root;
+		self
+	}
+
+	/// Base used to spell the path that Commit/Range items are filter-matched against;
+	/// do not reuse spelled_root (that is the root's own spelling and feeds only the File branch).
+	pub fn with_filter_root(mut self, filter_root: Option<PathBuf>) -> Self {
+		self.filter_root = filter_root;
 		self
 	}
 }
@@ -1781,9 +1792,32 @@ pub fn plan_export_with(
 					continue;
 				}
 			} else {
+				let filter_wire_path;
+				let filter_path = match (&selection.filter_root, &item.source) {
+					(
+						Some(filter_root),
+						SourceKind::Commit { .. } | SourceKind::Range { .. },
+					) => {
+						let filter_root_canonical =
+							dunce::canonicalize(filter_root)
+								.unwrap_or_else(|_| filter_root.clone());
+						let p = paths::to_clipboard_path_from_roots(
+							&[filter_root_canonical],
+							&absolute,
+							None,
+						);
+						if p.is_empty() {
+							wire_path.as_str()
+						} else {
+							filter_wire_path = p;
+							filter_wire_path.as_str()
+						}
+					}
+					_ => wire_path.as_str(),
+				};
 				if settings.use_filters
 					&& !filter::file_matches_filters(
-						&wire_path,
+						filter_path,
 						&settings.filter_rules,
 						settings.use_include_filters,
 						settings.use_exclude_filters,
