@@ -157,3 +157,68 @@ fn cli_master_pairs_lists_stats_and_cats_through_the_worker() {
 	let (status, _, _) = snip(&["workspaces", "1"]);
 	assert_eq!(status, Some(1));
 }
+
+#[test]
+fn cli_two_workers_paired_forget_and_stale_store_instance() {
+	let tmp = tempfile::tempdir().unwrap();
+	let shared1 = tmp.path().join("proj1");
+	let shared2 = tmp.path().join("proj2");
+	std::fs::create_dir_all(&shared1).unwrap();
+	std::fs::create_dir_all(&shared2).unwrap();
+	std::fs::write(shared1.join("a.txt"), "one\n").unwrap();
+	std::fs::write(shared2.join("b.txt"), "two\n").unwrap();
+
+	let (_w1, addr1, code1) = start_worker(&shared1, &tmp.path().join("w1"));
+	let (_w2, addr2, code2) = start_worker(&shared2, &tmp.path().join("w2"));
+	let master_cfg = tmp.path().join("master");
+
+	let snip = |args: &[&str]| {
+		let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+			.args(["remote"])
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &master_cfg)
+			.output()
+			.unwrap();
+		(
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout).into_owned(),
+			String::from_utf8_lossy(&out.stderr).into_owned(),
+		)
+	};
+	let ok = |args: &[&str]| {
+		let (status, stdout, stderr) = snip(args);
+		assert_eq!(status, Some(0), "snip remote {args:?}: {stderr}");
+		stdout
+	};
+
+	assert!(ok(&["pair", &addr1, &code1]).starts_with("paired with "));
+	assert!(ok(&["pair", &addr2, &code2]).starts_with("paired with "));
+
+	let workers = ok(&["workers"]);
+	assert_eq!(workers.lines().count(), 2);
+	assert!(workers.contains(&addr1));
+	assert!(workers.contains(&addr2));
+
+	// Stale-list scenario: a second process-less WorkerStore instance forgets a decoy
+	// fingerprint without dropping the CLI pairings.
+	let store = snip_remote::WorkerStore::in_config_dir(&master_cfg);
+	let forgotten = store
+		.forget(
+			"abababababababababababababababababababababababababababababababab",
+		)
+		.unwrap();
+	assert!(forgotten.is_none());
+
+	let workers_after_stale = ok(&["workers"]);
+	assert_eq!(workers_after_stale.lines().count(), 2);
+	assert!(workers_after_stale.contains(&addr1));
+	assert!(workers_after_stale.contains(&addr2));
+
+	// Forget worker 1 (the more recent one, addr2).
+	assert!(ok(&["forget", "1"]).starts_with("forgot "));
+	let remaining = ok(&["workers"]);
+	assert_eq!(remaining.lines().count(), 1);
+	assert!(remaining.starts_with("1\t"));
+	assert!(remaining.contains(&addr1));
+	assert!(!remaining.contains(&addr2));
+}

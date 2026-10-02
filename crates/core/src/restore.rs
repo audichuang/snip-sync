@@ -360,6 +360,26 @@ pub trait DirProbe {
 	fn child_dirs(&self, root_abs_path: &str) -> Vec<String>;
 }
 
+/// Real-filesystem `DirProbe`.
+pub struct FsProbe;
+
+impl DirProbe for FsProbe {
+	fn is_dir(&self, abs_path: &str) -> bool {
+		fs::metadata(abs_path).is_ok_and(|m| m.is_dir())
+	}
+
+	fn child_dirs(&self, root_abs_path: &str) -> Vec<String> {
+		let Ok(entries) = fs::read_dir(root_abs_path) else {
+			return Vec::new();
+		};
+		entries
+			.flatten()
+			.filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+			.map(|e| e.file_name().to_string_lossy().into_owned())
+			.collect()
+	}
+}
+
 pub fn apply_restore_base(base: &RestoreBase, relative_path: &str) -> String {
 	match base {
 		RestoreBase::Add { prefix } => format!("{prefix}/{relative_path}"),
@@ -371,7 +391,7 @@ pub fn apply_restore_base(base: &RestoreBase, relative_path: &str) -> String {
 }
 
 /// Rejects POSIX absolutes, Windows drive paths and UNC paths.
-fn is_relative(p: &str) -> bool {
+pub fn is_relative(p: &str) -> bool {
 	let b = p.as_bytes();
 	let drive = b.len() >= 3
 		&& b[0].is_ascii_alphabetic()
@@ -1188,5 +1208,14 @@ mod tests {
 		execute_restore_plan(&plan, &overwrite());
 		assert_eq!(read(root.join("new-name.txt")), "new content");
 		assert_eq!(read(root.join("old-name.txt")), "old content\n");
+	}
+
+	#[test]
+	fn relative_entry_paths() {
+		assert!(is_relative("src/a.rs"));
+		assert!(!is_relative(""));
+		assert!(!is_relative("/abs"));
+		assert!(!is_relative("C:/x"));
+		assert!(!is_relative("\\\\server\\x"));
 	}
 }

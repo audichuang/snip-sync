@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -22,12 +22,48 @@ fn run(mut cmd: Command, stdin: Option<&[u8]>) -> Output {
 		.stderr(Stdio::piped())
 		.spawn()
 		.unwrap();
-	let mut input = child.stdin.take().unwrap();
-	if let Some(bytes) = stdin {
-		input.write_all(bytes).unwrap();
+	let mut stdout_pipe = child.stdout.take().unwrap();
+	let mut stderr_pipe = child.stderr.take().unwrap();
+	let stdout_reader = std::thread::spawn(move || {
+		let mut buf = Vec::new();
+		let _ = stdout_pipe.read_to_end(&mut buf);
+		buf
+	});
+	let stderr_reader = std::thread::spawn(move || {
+		let mut buf = Vec::new();
+		let _ = stderr_pipe.read_to_end(&mut buf);
+		buf
+	});
+	if let Some(mut input) = child.stdin.take() {
+		if let Some(bytes) = stdin {
+			let bytes = bytes.to_vec();
+			std::thread::spawn(move || {
+				let _ = input.write_all(&bytes);
+			});
+		}
 	}
-	drop(input);
-	child.wait_with_output().unwrap()
+	let start = std::time::Instant::now();
+	let timeout = std::time::Duration::from_secs(60);
+	let status = loop {
+		match child.try_wait().unwrap() {
+			Some(s) => break s,
+			None if start.elapsed() < timeout => {
+				std::thread::sleep(std::time::Duration::from_millis(50));
+			}
+			None => {
+				let _ = child.kill();
+				let _ = child.wait();
+				panic!("run process timed out");
+			}
+		}
+	};
+	let stdout = stdout_reader.join().unwrap();
+	let stderr = stderr_reader.join().unwrap();
+	Output {
+		status,
+		stdout,
+		stderr,
+	}
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -286,7 +322,11 @@ fn commit_mode_replays_onto_another_clones_branch() {
 		note.contains("commit 3: bin.dat not copied (BINARY)"),
 		"{note}"
 	);
-	let out = snip(&b, &["paste", "--apply", "--stdin"], Some(&out.stdout));
+	let out = snip(
+		&b,
+		&["paste", "--apply", "--overwrite", "--stdin"],
+		Some(&out.stdout),
+	);
 	assert!(text(&out.stdout).contains("Created 3 commit(s)."));
 
 	assert_eq!(
@@ -460,6 +500,128 @@ fn cross_tool_file_payload_is_byte_identical() {
 	}
 }
 
+#[cfg(unix)]
+#[test]
+fn cross_tool_file_payload_is_byte_identical_through_symlinked_root() {
+	let ts_ref = ts_ref_or_skip!();
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("real");
+	file_mode_fixture(&real);
+	add_edge_files(&real);
+
+	let link = tmp.path().join("link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	let entries = worktree_entries(&link);
+	let subsets: Vec<Vec<String>> = vec![
+		entries.clone(),
+		vec![link.join("edge").to_str().unwrap().into()],
+		vec![
+			link.join("dir/d.txt").to_str().unwrap().into(),
+			link.join("日本語").to_str().unwrap().into(),
+		],
+	];
+	for paths in subsets {
+		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+		let rust = snip(&link, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &link, &paths, None);
+		assert_eq!(text(&rust), text(&node), "{paths:?}");
+		assert_eq!(rust, node);
+		assert!(text(&rust).contains("// file: "), "empty payload");
+	}
+
+	std::os::unix::fs::symlink("dir", real.join("linkdir")).unwrap();
+	let dir_symlink_subsets: Vec<Vec<String>> = vec![
+		vec![link.join("linkdir/d.txt").to_str().unwrap().into()],
+		vec![link.join("linkdir").to_str().unwrap().into()],
+	];
+	for paths in dir_symlink_subsets {
+		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+		let rust = snip(&link, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &link, &paths, None);
+		assert_eq!(text(&rust), text(&node), "{paths:?}");
+		assert_eq!(rust, node);
+		assert!(text(&rust).contains("// file: "), "empty payload");
+	}
+}
+
+fn order_dedupe_fixture(root: &Path) {
+	write(root, "top.txt", "top content\n");
+	write(root, "dir/a.txt", "a content\n");
+	write(root, "dir/b.txt", "b content\n");
+	write(root, "dir/c.txt", "c content\n");
+}
+
+#[test]
+fn cross_tool_file_payload_order_dedupe_is_byte_identical() {
+	let ts_ref = ts_ref_or_skip!();
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("ovl");
+	order_dedupe_fixture(&src);
+
+	let subsets: Vec<Vec<String>> = vec![
+		vec![
+			src.join("dir").to_str().unwrap().into(),
+			src.join("dir/b.txt").to_str().unwrap().into(),
+		],
+		vec![
+			src.join("dir/b.txt").to_str().unwrap().into(),
+			src.join("dir").to_str().unwrap().into(),
+		],
+		vec![
+			src.to_str().unwrap().into(),
+			src.join("dir/a.txt").to_str().unwrap().into(),
+		],
+	];
+	for paths in subsets {
+		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+		let rust = snip(&src, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &src, &paths, None);
+		assert_eq!(text(&rust), text(&node), "{paths:?}");
+		assert_eq!(rust, node);
+		assert!(text(&rust).contains("// file: "), "empty payload");
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_tool_file_payload_order_dedupe_through_symlinked_root() {
+	let ts_ref = ts_ref_or_skip!();
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("ovl_real");
+	order_dedupe_fixture(&real);
+
+	let link = tmp.path().join("ovl_link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	let subsets: Vec<Vec<String>> = vec![
+		vec![
+			link.join("dir").to_str().unwrap().into(),
+			link.join("dir/b.txt").to_str().unwrap().into(),
+		],
+		vec![
+			link.join("dir/b.txt").to_str().unwrap().into(),
+			link.join("dir").to_str().unwrap().into(),
+		],
+		vec![
+			link.to_str().unwrap().into(),
+			link.join("dir/a.txt").to_str().unwrap().into(),
+		],
+	];
+	for paths in subsets {
+		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+		let rust = snip(&link, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &link, &paths, None);
+		assert_eq!(text(&rust), text(&node), "{paths:?}");
+		assert_eq!(rust, node);
+		assert!(text(&rust).contains("// file: "), "empty payload");
+	}
+}
+
 #[test]
 fn cross_tool_commit_payload_is_byte_identical() {
 	let ts_ref = ts_ref_or_skip!();
@@ -557,4 +719,49 @@ fn cross_tool_restores_each_others_payloads() {
 		rust_by_rust,
 		"TS restores Rust"
 	);
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_tool_expanding_folder_prefix_batching_byte_identical() {
+	let ts_ref = ts_ref_or_skip!();
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("real");
+	fs::create_dir_all(&real).unwrap();
+
+	// Create a_bin/ with 100 binary files (each containing NUL byte) and zz.txt
+	let a_bin = real.join("a_bin");
+	fs::create_dir_all(&a_bin).unwrap();
+	for i in 0..100 {
+		fs::write(a_bin.join(format!("bin_{i:03}.bin")), [0u8, 1, 2]).unwrap();
+	}
+	fs::write(a_bin.join("zz.txt"), "valid text in a_bin\n").unwrap();
+
+	// Create b00.txt .. b30.txt (31 text files)
+	for i in 0..=30 {
+		fs::write(
+			real.join(format!("b{i:02}.txt")),
+			format!("content b{i:02}\n"),
+		)
+		.unwrap();
+	}
+
+	let link = tmp.path().join("link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	let link_str = link.to_str().unwrap();
+	let paths = [link_str];
+	let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+	let rust = snip(&link, &args, None).stdout;
+	let node = ts(&ts_ref, "files", &link, &paths, None);
+	assert_eq!(text(&rust), text(&node));
+	assert_eq!(rust, node);
+	assert!(
+		text(&rust).contains("// file: a_bin/zz.txt"),
+		"{}",
+		text(&rust)
+	);
+	assert!(text(&rust).contains("// file: b00.txt"), "{}", text(&rust));
+	assert!(text(&rust).contains("// file: b28.txt"), "{}", text(&rust));
+	assert!(!text(&rust).contains("// file: b29.txt"), "{}", text(&rust));
 }

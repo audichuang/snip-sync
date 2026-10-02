@@ -825,6 +825,7 @@ impl WorkbenchModel {
 							change_type: deleted.then_some(
 								snip_core::format::ChangeType::Deleted,
 							),
+							gitlink: false,
 						})
 					})
 					.collect();
