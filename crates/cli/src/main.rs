@@ -13,16 +13,19 @@ use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use snip_core::clip::{self, Mode};
 use snip_core::commits::{self, CommitCopySummary, CommitsPayload};
-use snip_core::copy::{collect_copy_files, CopyResult};
+use snip_core::copy::CopyResult;
 use snip_core::format::{extract_source_root, parse_clipboard};
-use snip_core::gitrun::RunOptions;
+use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::{collect_payload, Git, GitSource};
 use snip_core::restore::{
 	apply_restore_base, execute_restore_plan, is_relative, plan_restore,
 	suggest_restore_base, FsProbe, RestorePlan, RestoreSelection,
 };
 use snip_core::settings::Settings;
-use snip_core::transfer::{plan_commit_export_with, CLIPBOARD_PAYLOAD_MAX};
+use snip_core::transfer::{
+	expand_folder_items, plan_commit_export_with, plan_export_with,
+	selection_from_paths, TransferError, CLIPBOARD_PAYLOAD_MAX,
+};
 
 mod remote;
 
@@ -244,13 +247,48 @@ fn split_range(range: &str) -> (String, String) {
 
 // ---- copy ----
 
+fn map_transfer_err(err: TransferError) -> String {
+	match err {
+		TransferError::EmptySelection => "No files selected.".to_string(),
+		other => other.to_string(),
+	}
+}
+
 fn copy_paths(
 	repo: &Path,
 	paths: &[PathBuf],
 	settings: &Settings,
 	stdout: bool,
 ) -> Outcome {
-	let result = collect_copy_files(&[repo], paths, settings);
+	let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+	let path_sel =
+		selection_from_paths(repo, &cwd, paths).map_err(map_transfer_err)?;
+	let cancel = CancelToken::new();
+	let expanded = expand_folder_items(path_sel.sel, usize::MAX, &cancel)
+		.map_err(map_transfer_err)?;
+	let plan = plan_export_with(
+		&expanded.sel,
+		settings,
+		Some(CLIPBOARD_PAYLOAD_MAX),
+		&RunOptions::default(),
+	)
+	.map_err(map_transfer_err)?;
+
+	if plan.files.is_empty() {
+		return Err("No files selected.".to_string());
+	}
+
+	let result = CopyResult {
+		files: plan.files,
+		payload: plan.payload,
+		copied_file_count: plan.copied_file_count,
+		skipped_file_size_count: plan.skipped_file_size_count,
+		skipped_unreadable_count: plan.skipped_unreadable_count
+			+ path_sel.skipped
+			+ expanded.skipped,
+		file_limit_reached: plan.file_limit_reached,
+	};
+
 	emit(&result.payload, stdout)?;
 	let suffix = size_suffix(&result);
 	let message = format!(

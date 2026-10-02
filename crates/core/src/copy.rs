@@ -152,6 +152,7 @@ impl State {
 	}
 }
 
+/// Test oracle: not called by product code.
 pub fn collect_copy_files<P: AsRef<Path>, Q: AsRef<Path>>(
 	workspace_roots: &[P],
 	input_paths: &[Q],

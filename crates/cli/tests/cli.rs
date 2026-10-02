@@ -5,20 +5,62 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-fn snip(args: &[&str], stdin: Option<&[u8]>) -> Output {
-	let mut child = Command::new(env!("CARGO_BIN_EXE_snip"))
-		.args(args)
+fn snip_with_timeout_in_dir(
+	args: &[&str],
+	stdin: Option<&[u8]>,
+	cwd: Option<&Path>,
+	timeout: std::time::Duration,
+	timeout_msg: &str,
+) -> Output {
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args(args)
 		.stdin(Stdio::piped())
 		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.spawn()
-		.unwrap();
-	let mut input = child.stdin.take().unwrap();
-	if let Some(bytes) = stdin {
-		input.write_all(bytes).unwrap();
+		.stderr(Stdio::piped());
+	if let Some(dir) = cwd {
+		cmd.current_dir(dir);
 	}
-	drop(input);
+	let mut child = cmd.spawn().unwrap();
+	if let Some(mut input) = child.stdin.take() {
+		if let Some(bytes) = stdin {
+			input.write_all(bytes).unwrap();
+		}
+	}
+	let start = std::time::Instant::now();
+	loop {
+		match child.try_wait().unwrap() {
+			Some(_) => break,
+			None if start.elapsed() < timeout => {
+				std::thread::sleep(std::time::Duration::from_millis(50));
+			}
+			None => {
+				let _ = child.kill();
+				let _ = child.wait();
+				panic!("{timeout_msg}");
+			}
+		}
+	}
 	child.wait_with_output().unwrap()
+}
+
+fn snip(args: &[&str], stdin: Option<&[u8]>) -> Output {
+	snip_with_timeout_in_dir(
+		args,
+		stdin,
+		None,
+		std::time::Duration::from_secs(60),
+		"snip process timed out",
+	)
+}
+
+fn snip_in_dir(args: &[&str], stdin: Option<&[u8]>, cwd: &Path) -> Output {
+	snip_with_timeout_in_dir(
+		args,
+		stdin,
+		Some(cwd),
+		std::time::Duration::from_secs(60),
+		"snip process timed out",
+	)
 }
 
 fn code(out: &Output) -> i32 {
@@ -573,4 +615,174 @@ fn copy_commits_over_payload_cap_exits_one() {
 		err.contains("33554432"),
 		"expected limit (33554432) mentioned in error, got: {err}"
 	);
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_paths_skips_fifo_without_hanging() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	let fifo_path = repo.join("test_fifo");
+	let status = Command::new("mkfifo")
+		.arg(&fifo_path)
+		.status()
+		.expect("failed to execute mkfifo");
+	assert!(status.success(), "mkfifo failed");
+	let regular_file = repo.join("regular.txt");
+	fs::write(&regular_file, "regular content\n").unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip_with_timeout_in_dir(
+		&["--repo", repo_s, "copy", repo_s, "--stdout"],
+		None,
+		None,
+		std::time::Duration::from_secs(60),
+		"snip copy hung on a FIFO",
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(stdout.contains("// file: regular.txt"), "{stdout}");
+	assert!(stdout.contains("regular content"), "{stdout}");
+	assert!(!stdout.contains("test_fifo"), "{stdout}");
+	assert!(stderr.contains("1 file(s) copied"), "{stderr}");
+	assert!(stderr.contains("skipped"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_paths_skips_symlink_pointing_outside_root() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	let outside = tmp.path().join("outside");
+	fs::create_dir_all(&repo).unwrap();
+	fs::create_dir_all(&outside).unwrap();
+	let outside_file = outside.join("secret.txt");
+	fs::write(&outside_file, "outside secret content\n").unwrap();
+	let inside_file = repo.join("inside.txt");
+	fs::write(&inside_file, "inside content\n").unwrap();
+	let symlink = repo.join("symlink_outside.txt");
+	std::os::unix::fs::symlink(&outside_file, &symlink).unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip(&["--repo", repo_s, "copy", repo_s, "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	assert!(stdout.contains("// file: inside.txt"), "{stdout}");
+	assert!(stdout.contains("inside content"), "{stdout}");
+	assert!(!stdout.contains("outside secret content"), "{stdout}");
+	assert!(!stdout.contains("symlink_outside.txt"), "{stdout}");
+	assert!(!stdout.contains("secret.txt"), "{stdout}");
+}
+
+#[test]
+fn copy_paths_never_includes_git_entries() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+	fs::write(repo.join("file.txt"), "hello").unwrap();
+	commit(&repo, "initial", "2024-01-01T00:00:00+00:00");
+
+	// Add a nested git repository
+	let nested = repo.join("nested_repo");
+	fs::create_dir_all(&nested).unwrap();
+	init_repo(&nested);
+	fs::write(nested.join("nested.txt"), "nested hello").unwrap();
+	commit(&nested, "nested init", "2024-01-01T00:00:00+00:00");
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip(&["--repo", repo_s, "copy", repo_s, "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	assert!(stdout.contains("// file: file.txt"), "{stdout}");
+	assert!(!stdout.contains(".git"), "{stdout}");
+	assert!(!stdout.contains("nested.txt"), "{stdout}");
+
+	let out_dot =
+		snip_in_dir(&["--repo", repo_s, "copy", ".", "--stdout"], None, &repo);
+	assert_eq!(code(&out_dot), 0, "{}", text(&out_dot.stderr));
+	let stdout_dot = text(&out_dot.stdout);
+	assert!(stdout_dot.contains("// file: file.txt"), "{stdout_dot}");
+	assert!(!stdout_dot.contains(".git"), "{stdout_dot}");
+	assert!(!stdout_dot.contains("nested.txt"), "{stdout_dot}");
+}
+
+#[test]
+fn copy_paths_empty_result_exits_one_and_leaves_clipboard_untouched() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	let empty_sub = repo.join("empty_sub");
+	fs::create_dir_all(&empty_sub).unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let sub_s = empty_sub.to_str().unwrap();
+
+	let out = snip(&["--repo", repo_s, "copy", sub_s, "--stdout"], None);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	let stderr = text(&out.stderr);
+	assert!(stderr.contains("No files selected."), "{stderr}");
+	assert!(out.stdout.is_empty(), "stdout must be empty");
+}
+
+#[test]
+fn copy_paths_missing_path_exits_one() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let missing = repo.join("typo_nonexistent_file.txt");
+	let missing_s = missing.to_str().unwrap();
+
+	let out = snip(&["--repo", repo_s, "copy", missing_s, "--stdout"], None);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	let stderr = text(&out.stderr);
+	assert!(
+		stderr.contains("typo_nonexistent_file.txt"),
+		"stderr should mention missing path: {stderr}"
+	);
+}
+
+#[test]
+fn copy_paths_outside_repo_exits_one() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	let outside = tmp.path().join("outside");
+	fs::create_dir_all(&repo).unwrap();
+	fs::create_dir_all(&outside).unwrap();
+	let outside_file = outside.join("outside.txt");
+	fs::write(&outside_file, "content").unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let outside_s = outside_file.to_str().unwrap();
+
+	let out = snip(&["--repo", repo_s, "copy", outside_s, "--stdout"], None);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	let stderr = text(&out.stderr);
+	assert!(
+		stderr.contains("outside root"),
+		"stderr should mention outside root: {stderr}"
+	);
+}
+
+#[test]
+fn copy_paths_relative_path_resolves_against_cwd() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	let sub = repo.join("subdir");
+	fs::create_dir_all(&sub).unwrap();
+	fs::write(sub.join("target.txt"), "sub target content\n").unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip_in_dir(
+		&["--repo", repo_s, "copy", "target.txt", "--stdout"],
+		None,
+		&sub,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	assert!(stdout.contains("// file: subdir/target.txt"), "{stdout}");
+	assert!(stdout.contains("sub target content"), "{stdout}");
 }

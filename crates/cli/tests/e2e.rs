@@ -27,6 +27,21 @@ fn run(mut cmd: Command, stdin: Option<&[u8]>) -> Output {
 		input.write_all(bytes).unwrap();
 	}
 	drop(input);
+	let start = std::time::Instant::now();
+	let timeout = std::time::Duration::from_secs(60);
+	loop {
+		match child.try_wait().unwrap() {
+			Some(_) => break,
+			None if start.elapsed() < timeout => {
+				std::thread::sleep(std::time::Duration::from_millis(50));
+			}
+			None => {
+				let _ = child.kill();
+				let _ = child.wait();
+				panic!("process timed out after 60s");
+			}
+		}
+	}
 	child.wait_with_output().unwrap()
 }
 
@@ -454,6 +469,40 @@ fn cross_tool_file_payload_is_byte_identical() {
 		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
 		let rust = snip(&src, &args, None).stdout;
 		let node = ts(&ts_ref, "files", &src, &paths, None);
+		assert_eq!(text(&rust), text(&node), "{paths:?}");
+		assert_eq!(rust, node);
+		assert!(text(&rust).contains("// file: "), "empty payload");
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_tool_file_payload_is_byte_identical_through_symlinked_root() {
+	let ts_ref = ts_ref_or_skip!();
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("real");
+	let real_src = real.join("src");
+	file_mode_fixture(&real_src);
+	add_edge_files(&real_src);
+
+	let link = tmp.path().join("link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+	let link_src = link.join("src");
+
+	let entries = worktree_entries(&link_src);
+	let subsets: Vec<Vec<String>> = vec![
+		entries.clone(),
+		vec![link_src.join("edge").to_str().unwrap().into()],
+		vec![
+			link_src.join("dir/d.txt").to_str().unwrap().into(),
+			link_src.join("日本語").to_str().unwrap().into(),
+		],
+	];
+	for paths in subsets {
+		let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+		let args = [&["copy"], &paths[..], &["--stdout"]].concat();
+		let rust = snip(&link_src, &args, None).stdout;
+		let node = ts(&ts_ref, "files", &link_src, &paths, None);
 		assert_eq!(text(&rust), text(&node), "{paths:?}");
 		assert_eq!(rust, node);
 		assert!(text(&rust).contains("// file: "), "empty payload");

@@ -181,6 +181,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 4 — CLI `copy <paths>` 改走 transfer(F3、F4、F5、F7)
 
+狀態:已完成(CLI copy_paths 切換至 transfer 引擎管線,套用 32 MiB 上限與 D7 規則)
+
 - `copy_paths` → `selection_from_paths` → `expand_folder_items`(**展開上限傳無上限**,讓 30 檔只算「真的複製的檔案」,與舊引擎一致)→ `plan_export_with(..., Some(CLIPBOARD_PAYLOAD_MAX))`。
 - 依 D7 處理不存在、root 外、空結果。
 - 新增 `cli.rs` 回歸測試,一個發現一個:FIFO 不卡(帶逾時)、root 外 symlink 被跳過、`.git` 不出現、空結果 exit 1 且剪貼簿不變、typo 路徑 exit 1。
