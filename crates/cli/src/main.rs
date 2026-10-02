@@ -682,9 +682,12 @@ fn paste_files(
 		}
 	}
 
-	let root_id = CanonicalRootId::new(repo)
-		.map_err(TransferError::from)
-		.map_err(format_transfer_error)?;
+	let root_id = CanonicalRootId::new(repo).map_err(|e| {
+		format!(
+			"--repo {} does not exist or cannot be resolved: {e}",
+			repo.display()
+		)
+	})?;
 	let mapping = match (&suggestion, opts.adjust_paths) {
 		(Some(s), true) => ImportMapping::from_restore_base(s, root_id),
 		_ => ImportMapping::with_primary(root_id),

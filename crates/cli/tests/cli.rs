@@ -2400,3 +2400,29 @@ fn paste_symlink_spelled_repo_round_trip() {
 		"hello from symlink"
 	);
 }
+
+#[test]
+fn paste_into_missing_repo_exits_one_naming_the_path() {
+	let tmp = tempfile::tempdir().unwrap();
+	let nope = tmp.path().join("nope");
+	let nope_s = nope.to_str().unwrap();
+	let payload = "// file: a/b.txt\nhi\n";
+
+	let apply = snip(
+		&["--repo", nope_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 1);
+	let apply_err = text(&apply.stderr);
+	assert!(apply_err.contains("nope"), "stderr was: {apply_err}");
+	assert!(!nope.exists());
+
+	let dry = snip(
+		&["--repo", nope_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 1);
+	let dry_err = text(&dry.stderr);
+	assert!(dry_err.contains("nope"), "stderr was: {dry_err}");
+	assert!(!nope.exists());
+}

@@ -106,6 +106,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   (1)「the same path twice is planned twice, in order」:TS 照順序規劃兩次;CLI 改走 `plan_import_with` 後因偵測到重複目標路徑,觸發 `TargetCollision` 整批拒絕(exit 1)。
   (2)「a sibling root label targets that root」:TS 支援多 root 對應;CLI 目前僅支援單一儲存庫/工作區 root(`ImportMapping::with_primary`),不需多 root 標籤對應。
   (3)「an absolute path matching no root is kept literally under the primary root」:與 TS 不同的只有帶磁碟機代號的路徑(寫入保持 `UNRESOLVED_PATH` 跳過,TS 寫為 `D/work/lib/b.ts`),原因是 `sanitize_relative_path` 內的 `is_absolute_path`/`has_drive_slash` 檢查(`D:\` 或 `D:/` 開頭視為絕對路徑故回傳 None),而不是冒號規則;此項為已知且接受的差異。POSIX 絕對路徑在所有 root 外部且無後綴符合時,去首斜線寫在主 root 下,同 TS;root 內部絕對路徑與跨機器後綴符合經 D8 在 core 修好後亦解析為相對路徑,與 TS 一致,故不是差異。且**絕對路徑的 [DELETED] 若解析不到任何 root → 拒絕(視為 unsafe/unresolved 跳過),與 TS 一致;先前 GUI 巢狀刪除 bug 已於階段 5b 修復**。狀態:現況/已實作(core 與 GUI 已於階段 5b 修復生效,帶磁碟機代號寫入保持 UNRESOLVED_PATH 為現況差異,CLI 於階段 6 已切換對齊)。
+- `snip paste` 的 `--repo` 必須已存在(含 `--dry-run`),不存在時 exit 1 並指出該路徑;舊引擎會在 `--apply` 時以 `create_dir_all` 建立整個目錄。狀態:現況/已實作。
 - 剪貼簿 payload 上限統一(`transfer::CLIPBOARD_PAYLOAD_MAX` = 32 MiB):核心定義單一常數,CLI 與 GUI 複製流程共用,與貼上預覽預算(32 MiB)一致,避免「GUI 複製成功但另一端貼上超限」。超過上限時為明確錯誤(CLI exit 1),不進行默默截斷。TS 原生無此統一常數約束(GUI 複製(`plan_export_with` 與 `plan_commit_export_exact_with`)於階段 2 起使用 32 MiB(原為 64 MiB)、CLI 無上限)。狀態: core 常數、GUI 與 CLI 複製(階段 3/4/5)已生效。
 - commit 區間複製與路徑重新定位機制:
   (1) `--range a..b`:核心 `transfer` 已新增 `SourceKind::Range { base, tip }` 來源型別(刪除檔案讀取 `base:<path>`),供 CLI 與 GUI 共用(階段 2),CLI 於階段 5 已切換採用。
