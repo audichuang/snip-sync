@@ -2077,7 +2077,7 @@ fn test_admitted_fifo_rejected_without_blocking() {
 		vec![ExportItem {
 			root: repo.canonical_id(),
 			relative_path: "test_fifo.pipe".to_string(),
-			source: SourceKind::Working,
+			source: SourceKind::File,
 			change_type: None,
 			gitlink: false,
 		}],
@@ -2105,6 +2105,32 @@ fn test_admitted_fifo_rejected_without_blocking() {
 		}
 		other => panic!("expected SpecialFile error, got: {other:?}"),
 	}
+
+	// Working/Unstaged changed item target is not a regular file: skipped as unreadable
+	let working_fifo = repo.path().join("working_fifo.pipe");
+	let status2 = Command::new("mkfifo")
+		.arg(&working_fifo)
+		.status()
+		.expect("mkfifo failed");
+	assert!(status2.success());
+
+	let working_sel = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		None,
+		vec![ExportItem {
+			root: repo.canonical_id(),
+			relative_path: "working_fifo.pipe".to_string(),
+			source: SourceKind::Working,
+			change_type: None,
+			gitlink: false,
+		}],
+	)
+	.unwrap();
+	let working_plan =
+		plan_export(&working_sel, &Settings::default(), None).unwrap();
+	assert_eq!(working_plan.skipped_unreadable_count, 1);
+	assert!(working_plan.files.is_empty());
+	let _ = fs::remove_file(&working_fifo);
 }
 
 // ---------------------------------------------------------------------------
@@ -5871,6 +5897,64 @@ fn test_oversize_binary_and_budget_handling_in_working() {
 		plan_export(&text_budget_selection, &Settings::default(), Some(100))
 			.unwrap_err();
 	match text_err {
+		TransferError::PayloadLimitExceeded { limit, .. } => {
+			assert_eq!(limit, 100);
+		}
+		other => panic!("expected PayloadLimitExceeded, got: {other:?}"),
+	}
+}
+
+#[test]
+fn test_oversize_binary_and_budget_handling_in_file_mode() {
+	let repo = TestRepo::new("oversize-file-mode");
+	let id = repo.canonical_id();
+
+	// 1. Oversize binary (> 500 KB default max_file_size_kb) with NUL
+	let mut bin_data = vec![b'x'; 700_000];
+	bin_data[100] = 0; // NUL byte makes it binary
+	repo.write_bytes("big_binary.bin", &bin_data);
+
+	let selection = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		None,
+		vec![ExportItem {
+			root: id.clone(),
+			relative_path: "big_binary.bin".to_string(),
+			source: SourceKind::File,
+			change_type: None,
+			gitlink: false,
+		}],
+	)
+	.unwrap();
+
+	let plan = plan_export(&selection, &Settings::default(), None).unwrap();
+	assert_eq!(plan.skipped_file_size_count, 1);
+	assert_eq!(plan.files.len(), 1);
+	assert_eq!(plan.files[0].path, "big_binary.bin");
+	assert!(plan.payload.contains("// File skipped: size exceeds limit"));
+
+	// 2. Binary bigger than small max_payload_bytes budget returns PayloadLimitExceeded
+	let mut small_budget_bin = vec![b'x'; 200];
+	small_budget_bin[10] = 0;
+	repo.write_bytes("budget_bin.bin", &small_budget_bin);
+
+	let bin_budget_selection = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		None,
+		vec![ExportItem {
+			root: id,
+			relative_path: "budget_bin.bin".to_string(),
+			source: SourceKind::File,
+			change_type: None,
+			gitlink: false,
+		}],
+	)
+	.unwrap();
+
+	let err =
+		plan_export(&bin_budget_selection, &Settings::default(), Some(100))
+			.unwrap_err();
+	match err {
 		TransferError::PayloadLimitExceeded { limit, .. } => {
 			assert_eq!(limit, 100);
 		}

@@ -1615,3 +1615,116 @@ fn copy_working_skips_symlink_outside_repo() {
 		"{stderr}"
 	);
 }
+
+#[test]
+fn copy_paths_oversize_binary_keeps_size_skipped_marker() {
+	let tmp = tempfile::tempdir().unwrap();
+	let folder = tmp.path().join("folder");
+	fs::create_dir_all(&folder).unwrap();
+
+	let mut bin_data = vec![b'x'; 700_005];
+	bin_data[10] = 0; // contains NUL
+	fs::write(folder.join("big.bin"), &bin_data).unwrap();
+	fs::write(folder.join("small.txt"), "small content\n").unwrap();
+
+	let folder_s = folder.to_str().unwrap();
+	let out = snip(&["--repo", folder_s, "copy", folder_s, "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout = text(&out.stdout);
+	let stderr = text(&out.stderr);
+	assert!(stdout.contains("// file: big.bin"), "{stdout}");
+	assert!(stdout.contains("size exceeds limit"), "{stdout}");
+	assert!(stderr.contains("1 skipped: size exceeded"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_working_skips_symlink_to_directory() {
+	use snip_core::gitsrc::{collect_payload, Git, GitSource};
+	use snip_core::settings::Settings;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+
+	let v1_dir = repo.join("v1");
+	fs::create_dir_all(&v1_dir).unwrap();
+	fs::write(v1_dir.join("f.txt"), "v1 content\n").unwrap();
+	fs::write(repo.join("tracked.txt"), "tracked base\n").unwrap();
+	std::os::unix::fs::symlink("v1", repo.join("latest")).unwrap();
+	commit(&repo, "initial", "2020-01-01T00:00:00+00:00");
+
+	// Repoint latest -> v2 (create v2 dir) and modify a tracked text file
+	let v2_dir = repo.join("v2");
+	fs::create_dir_all(&v2_dir).unwrap();
+	let latest_path = repo.join("latest");
+	fs::remove_file(&latest_path).unwrap();
+	std::os::unix::fs::symlink("v2", &latest_path).unwrap();
+
+	fs::write(repo.join("tracked.txt"), "tracked modified\n").unwrap();
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip(&["--repo", repo_s, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+
+	let git_repo = Git::open(&repo).unwrap();
+	let settings = Settings::default();
+	let legacy_working =
+		collect_payload(&git_repo, &GitSource::Working, &[&repo], &settings)
+			.unwrap();
+
+	let stdout = text(&out.stdout);
+	assert_eq!(stdout, legacy_working.payload);
+	assert!(stdout.contains("tracked modified"), "{stdout}");
+	assert!(!stdout.contains("latest"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_working_skips_unreadable_file() {
+	use snip_core::gitsrc::{collect_payload, Git, GitSource};
+	use snip_core::settings::Settings;
+	use std::os::unix::fs::PermissionsExt;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+
+	fs::write(repo.join("tracked.txt"), "tracked base\n").unwrap();
+	commit(&repo, "initial", "2020-01-01T00:00:00+00:00");
+
+	fs::write(repo.join("tracked.txt"), "tracked modified\n").unwrap();
+	let unreadable = repo.join("unreadable.txt");
+	fs::write(&unreadable, "secret unreadable\n").unwrap();
+	fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+		.unwrap();
+
+	if fs::read(&unreadable).is_ok() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"running as root: cannot test unreadable file permissions"
+		);
+		let _ =
+			fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+		return;
+	}
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip(&["--repo", repo_s, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+
+	let git_repo = Git::open(&repo).unwrap();
+	let settings = Settings::default();
+	let legacy_working =
+		collect_payload(&git_repo, &GitSource::Working, &[&repo], &settings)
+			.unwrap();
+
+	let stdout = text(&out.stdout);
+	assert_eq!(stdout, legacy_working.payload);
+	assert!(stdout.contains("tracked modified"), "{stdout}");
+	assert!(!stdout.contains("secret unreadable"), "{stdout}");
+
+	let _ = fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644));
+}

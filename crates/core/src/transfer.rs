@@ -2001,10 +2001,7 @@ pub fn plan_export_with(
 					);
 					let sym_meta = match fs::symlink_metadata(&absolute) {
 						Ok(m) => m,
-						Err(e)
-							if is_changed_item
-								&& e.kind() == io::ErrorKind::NotFound =>
-						{
+						Err(_) if is_changed_item => {
 							break 'read_file (None, None, None);
 						}
 						Err(e) => return Err(e.into()),
@@ -2029,10 +2026,7 @@ pub fn plan_export_with(
 						}
 						let canonical = match dunce::canonicalize(&absolute) {
 							Ok(c) => c,
-							Err(e)
-								if is_changed_item
-									&& e.kind() == io::ErrorKind::NotFound =>
-							{
+							Err(_) if is_changed_item => {
 								break 'read_file (None, None, None);
 							}
 							Err(e) => return Err(e.into()),
@@ -2047,10 +2041,7 @@ pub fn plan_export_with(
 						}
 						match fs::metadata(&canonical) {
 							Ok(m) => m,
-							Err(e)
-								if is_changed_item
-									&& e.kind() == io::ErrorKind::NotFound =>
-							{
+							Err(_) if is_changed_item => {
 								break 'read_file (None, None, None);
 							}
 							Err(e) => return Err(e.into()),
@@ -2060,6 +2051,9 @@ pub fn plan_export_with(
 					};
 
 					if !target_meta.file_type().is_file() {
+						if is_changed_item {
+							break 'read_file (None, None, None);
+						}
 						return Err(TransferError::SpecialFile(
 							absolute.to_string_lossy().into_owned(),
 						));
@@ -2072,15 +2066,32 @@ pub fn plan_export_with(
 						file_size as f64 > settings.max_file_size_kb * 1024.0;
 					let over_budget = remaining_budget
 						.is_some_and(|b| file_size as usize > b);
-					if over_per_file || over_budget {
+					if is_changed_item && (over_per_file || over_budget) {
 						let mut scan = crate::blob::ChunkTextScan::new();
-						for_each_chunk(
+						let scan_res = for_each_chunk(
 							&absolute,
 							None,
 							opts,
 							"read-file",
 							|chunk| scan.feed(chunk),
-						)?;
+						);
+						match scan_res {
+							Ok(_) => {}
+							Err(e)
+								if matches!(
+									e,
+									TransferError::Git(
+										GitError::Cancelled { .. }
+									)
+								) || opts
+									.cancel
+									.as_ref()
+									.is_some_and(CancelToken::is_cancelled) =>
+							{
+								return Err(e);
+							}
+							Err(_) => break 'read_file (None, None, None),
+						}
 						if scan.finish().is_some() {
 							break 'read_file (None, None, None);
 						}
@@ -2103,6 +2114,23 @@ pub fn plan_export_with(
 								),
 							});
 						}
+					} else if over_per_file {
+						(
+							None,
+							Some(format!(
+								"size exceeds limit ({file_size} bytes)"
+							)),
+							None,
+						)
+					} else if over_budget {
+						let budget = remaining_budget.unwrap_or(usize::MAX);
+						return Err(TransferError::PayloadLimitExceeded {
+							limit: max_payload_bytes.unwrap_or(budget),
+							actual: current_total_bytes + file_size as usize,
+							reason: format!(
+								"file '{wire_path}' exceeds remaining payload budget"
+							),
+						});
 					} else {
 						let read_cap = match remaining_budget {
 							Some(b) => (b as u64).min(per_file_limit),
@@ -2112,7 +2140,7 @@ pub fn plan_export_with(
 						cancelled_err(opts, "read-file")?;
 						let mut bytes = Vec::with_capacity(file_size as usize);
 						let mut hasher = Sha256::new();
-						let read_len = for_each_chunk(
+						let read_res = for_each_chunk(
 							&absolute,
 							Some(read_cap.saturating_add(1)),
 							opts,
@@ -2121,7 +2149,27 @@ pub fn plan_export_with(
 								bytes.extend_from_slice(chunk);
 								hasher.update(chunk);
 							},
-						)?;
+						);
+						let read_len = match read_res {
+							Ok(len) => len,
+							Err(e)
+								if matches!(
+									e,
+									TransferError::Git(
+										GitError::Cancelled { .. }
+									)
+								) || opts
+									.cancel
+									.as_ref()
+									.is_some_and(CancelToken::is_cancelled) =>
+							{
+								return Err(e);
+							}
+							Err(_) if is_changed_item => {
+								break 'read_file (None, None, None);
+							}
+							Err(e) => return Err(e),
+						};
 						if read_len > read_cap {
 							if remaining_budget
 								.is_some_and(|b| read_len as usize > b)
@@ -2146,7 +2194,13 @@ pub fn plan_export_with(
 								None,
 							)
 						} else {
-							let mtime = target_meta.modified()?;
+							let mtime = match target_meta.modified() {
+								Ok(m) => m,
+								Err(_) if is_changed_item => {
+									break 'read_file (None, None, None);
+								}
+								Err(e) => return Err(e.into()),
+							};
 							let content_hash = hasher.finalize().into();
 							let freshness = FileFreshness {
 								size: read_len,
