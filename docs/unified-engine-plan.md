@@ -181,9 +181,9 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 4 — CLI `copy <paths>` 改走 transfer(F3、F4、F5、F7)
 
-狀態:已完成(CLI copy_paths 切換至 transfer 引擎管線,套用 32 MiB 上限與 D7 規則;共用 `expand_folder_items` 的 `is_folder` 把 root 內目錄 symlink 視為資料夾,GUI 也隨之改變(原本整批複製以 `SpecialFile` 失敗,現與 TS 一致);核心測試 `test_selection_from_paths_labels_and_explicit_dir_symlink` 涵蓋)
+狀態:已完成(CLI copy_paths 切換至 transfer 引擎管線,套用 32 MiB 上限與 D7 規則;共用 `expand_folder_items` 的 `is_folder` 把 root 內目錄 symlink 視為資料夾,GUI 也隨之改變(原本整批複製以 `SpecialFile` 失敗,現與 TS 一致);核心測試 `test_selection_from_paths_labels_and_explicit_dir_symlink` 涵蓋;copy 以批次擴展資料夾（起始 max(64,4*上限)，加倍）避免全樹走訪，結果與全量展開相同)
 
-- `copy_paths` → `selection_from_paths` → `expand_folder_items`(**展開上限傳無上限**,讓 30 檔只算「真的複製的檔案」,與舊引擎一致)→ `plan_export_with(..., Some(CLIPBOARD_PAYLOAD_MAX))`。
+- `copy_paths` → `selection_from_paths` → `expand_folder_items`(開啟檔數上限時以 `plan_export_expanding` 批次展開,直到計畫碰到上限或展開未截斷,結果等同無上限展開;關閉上限時傳無上限)→ `plan_export_with(..., Some(CLIPBOARD_PAYLOAD_MAX))`。
 - 依 D7 處理不存在、root 外、空結果。
 - 新增 `cli.rs` 回歸測試,一個發現一個:FIFO 不卡(帶逾時)、root 外 symlink 被跳過、`.git` 不出現、空結果 exit 1 且剪貼簿不變、typo 路徑 exit 1。
 - **位元組相容**:`crates/cli/tests/e2e.rs` 的 ts-ref 交叉測試(:436, :464, :492)必須維持全綠,而且要另外以「經 symlink 拼寫的 root」跑一次——transfer 會 canonicalize `--repo`,root 的最後一段名稱若不同,`// clipcode-root:` 就變了。本機要有 node,否則測試會跳過(CI 有 `SNIP_REQUIRE_ALL_TESTS`,跳不掉)。

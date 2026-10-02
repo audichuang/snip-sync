@@ -45,7 +45,8 @@ mod select;
 
 pub use changes::{changed_items, ChangedItems};
 pub use select::{
-	expand_folder_items, selection_from_paths, FolderExpansion, PathSelection,
+	expand_folder_items, plan_export_expanding, selection_from_paths,
+	FolderExpansion, PathSelection,
 };
 
 /// A stable canonical identifier for an existing, resolved workspace or repository root.
@@ -130,6 +131,7 @@ pub struct ExportSelection {
 	pub primary_root: Option<CanonicalRootId>,
 	pub items: Vec<ExportItem>,
 	pub source_root: Option<String>,
+	pub spelled_root: Option<PathBuf>,
 }
 
 impl ExportSelection {
@@ -157,6 +159,7 @@ impl ExportSelection {
 			primary_root: primary,
 			items,
 			source_root: None,
+			spelled_root: None,
 		};
 		validate_export_selection(&sel)?;
 		Ok(sel)
@@ -164,6 +167,11 @@ impl ExportSelection {
 
 	pub fn with_source_root(mut self, source_root: Option<String>) -> Self {
 		self.source_root = source_root;
+		self
+	}
+
+	pub fn with_spelled_root(mut self, spelled_root: Option<PathBuf>) -> Self {
+		self.spelled_root = spelled_root;
 		self
 	}
 }
@@ -1743,13 +1751,23 @@ pub fn plan_export_with(
 					file_limit_reached = true;
 					break;
 				}
+				let filter_absolute =
+					if selection.roots.len() == 1 || is_primary {
+						selection
+							.spelled_root
+							.as_ref()
+							.map(|s| s.join(&item.relative_path))
+							.unwrap_or_else(|| absolute.clone())
+					} else {
+						absolute.clone()
+					};
 				if settings.use_filters
 					&& !filter::file_matches_filters(
 						&wire_path,
 						&settings.filter_rules,
 						settings.use_include_filters,
 						settings.use_exclude_filters,
-						Some(&absolute.to_string_lossy()),
+						Some(&filter_absolute.to_string_lossy()),
 					) {
 					continue;
 				}

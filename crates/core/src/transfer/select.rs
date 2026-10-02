@@ -2,10 +2,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::fsutil;
-use crate::gitrun::CancelToken;
+use crate::gitrun::{CancelToken, RunOptions};
 use crate::paths;
+use crate::settings::Settings;
 use crate::transfer::{
-	CanonicalRootId, ExportItem, ExportSelection, SourceKind, TransferError,
+	CanonicalRootId, ExportItem, ExportPlan, ExportSelection, SourceKind,
+	TransferError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,17 +147,62 @@ pub fn expand_folder_items(
 		}
 	}
 	let source_root = sel.source_root.clone();
+	let spelled_root = sel.spelled_root.clone();
 	let sel = ExportSelection::new(
 		sel.roots.iter().map(|r| r.path().to_path_buf()).collect(),
 		sel.primary_root.map(|r| r.path().to_path_buf()),
 		items,
 	)?
-	.with_source_root(source_root);
+	.with_source_root(source_root)
+	.with_spelled_root(spelled_root);
 	Ok(FolderExpansion {
 		sel,
 		skipped,
 		truncated,
 	})
+}
+
+/// Plans an export by expanding folder items in progressively doubling batches,
+/// avoiding traversing the entire directory tree when a file count limit is active.
+pub fn plan_export_expanding(
+	sel: &ExportSelection,
+	settings: &Settings,
+	max_payload: Option<usize>,
+	opts: &RunOptions,
+	cancel: &CancelToken,
+) -> Result<(ExportPlan, usize), TransferError> {
+	let mut limit = if settings.set_max_file_count {
+		let count_limit = if settings.file_count_limit > 0.0 {
+			settings.file_count_limit as usize
+		} else {
+			0
+		};
+		64usize.max(4usize.saturating_mul(count_limit))
+	} else {
+		usize::MAX
+	};
+
+	let mut plan_opts = opts.clone();
+	if plan_opts.cancel.is_none() {
+		plan_opts.cancel = Some(cancel.clone());
+	}
+
+	loop {
+		let expanded = expand_folder_items(sel.clone(), limit, cancel)?;
+		let plan = super::plan_export_with(
+			&expanded.sel,
+			settings,
+			max_payload,
+			&plan_opts,
+		)?;
+		if plan.file_limit_reached || !expanded.truncated {
+			return Ok((plan, expanded.skipped));
+		}
+		if limit == usize::MAX {
+			return Ok((plan, expanded.skipped));
+		}
+		limit = limit.saturating_mul(2);
+	}
 }
 
 /// Selection generated from user paths.
@@ -418,7 +465,8 @@ pub fn selection_from_paths(
 		Some(root.to_path_buf()),
 		items,
 	)?
-	.with_source_root(source_root);
+	.with_source_root(source_root)
+	.with_spelled_root(Some(lexical_root));
 
 	Ok(PathSelection { sel, skipped })
 }
@@ -471,5 +519,128 @@ mod tests {
 			sel_names,
 			vec!["\u{1F600}.txt".to_string(), "\u{FF5E}.txt".to_string()]
 		);
+	}
+
+	#[test]
+	fn test_plan_export_expanding_matches_unbounded() {
+		use crate::settings::{FilterAction, FilterRule, FilterType};
+
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		// Create 30 small files in root: 15 keep, 15 skip
+		for i in 0..15 {
+			std::fs::write(
+				root.join(format!("root_keep_{i:02}.txt")),
+				format!("rk {i}"),
+			)
+			.unwrap();
+			std::fs::write(
+				root.join(format!("root_skip_{i:02}.txt")),
+				format!("rs {i}"),
+			)
+			.unwrap();
+		}
+		// Create a subdir with 100 files: 50 keep, 50 skip
+		let sub = root.join("sub");
+		std::fs::create_dir_all(&sub).unwrap();
+		for i in 0..50 {
+			std::fs::write(
+				sub.join(format!("sub_keep_{i:02}.txt")),
+				format!("sk {i}"),
+			)
+			.unwrap();
+			std::fs::write(
+				sub.join(format!("sub_skip_{i:02}.txt")),
+				format!("ss {i}"),
+			)
+			.unwrap();
+		}
+
+		let path_sel =
+			selection_from_paths(root, root, &[PathBuf::from(".")]).unwrap();
+		let cancel = CancelToken::new();
+
+		let filter = FilterRule {
+			kind: FilterType::Pattern,
+			action: FilterAction::Exclude,
+			value: "*skip*".to_string(),
+			enabled: true,
+		};
+		let settings = Settings {
+			use_filters: true,
+			filter_rules: vec![filter],
+			set_max_file_count: true,
+			file_count_limit: 30.0,
+			..Settings::default()
+		};
+
+		// 1. With file count limit active:
+		let (batched_plan, batched_skipped) = plan_export_expanding(
+			&path_sel.sel,
+			&settings,
+			None,
+			&RunOptions::default(),
+			&cancel,
+		)
+		.unwrap();
+
+		let unbounded_expansion =
+			expand_folder_items(path_sel.sel.clone(), usize::MAX, &cancel)
+				.unwrap();
+		let unbounded_plan = crate::transfer::plan_export_with(
+			&unbounded_expansion.sel,
+			&settings,
+			None,
+			&RunOptions::default(),
+		)
+		.unwrap();
+
+		assert_eq!(batched_plan.files, unbounded_plan.files);
+		assert_eq!(batched_plan.payload, unbounded_plan.payload);
+		assert_eq!(
+			batched_plan.copied_file_count,
+			unbounded_plan.copied_file_count
+		);
+		assert_eq!(
+			batched_plan.file_limit_reached,
+			unbounded_plan.file_limit_reached
+		);
+		assert!(batched_plan.file_limit_reached);
+		assert_eq!(batched_plan.copied_file_count, 30);
+		assert_eq!(batched_skipped, 0);
+
+		// 2. With limit off:
+		let mut settings_no_limit = settings.clone();
+		settings_no_limit.set_max_file_count = false;
+
+		let (batched_plan_nl, _) = plan_export_expanding(
+			&path_sel.sel,
+			&settings_no_limit,
+			None,
+			&RunOptions::default(),
+			&cancel,
+		)
+		.unwrap();
+
+		let unbounded_plan_nl = crate::transfer::plan_export_with(
+			&unbounded_expansion.sel,
+			&settings_no_limit,
+			None,
+			&RunOptions::default(),
+		)
+		.unwrap();
+
+		assert_eq!(batched_plan_nl.files, unbounded_plan_nl.files);
+		assert_eq!(batched_plan_nl.payload, unbounded_plan_nl.payload);
+		assert_eq!(
+			batched_plan_nl.copied_file_count,
+			unbounded_plan_nl.copied_file_count
+		);
+		assert_eq!(
+			batched_plan_nl.file_limit_reached,
+			unbounded_plan_nl.file_limit_reached
+		);
+		assert!(!batched_plan_nl.file_limit_reached);
+		assert_eq!(batched_plan_nl.copied_file_count, 65);
 	}
 }

@@ -23,8 +23,8 @@ use snip_core::restore::{
 };
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	expand_folder_items, plan_commit_export_with, plan_export_with,
-	selection_from_paths, TransferError, CLIPBOARD_PAYLOAD_MAX,
+	plan_commit_export_with, plan_export_expanding, selection_from_paths,
+	TransferError, CLIPBOARD_PAYLOAD_MAX,
 };
 
 mod remote;
@@ -264,13 +264,12 @@ fn copy_paths(
 	let path_sel =
 		selection_from_paths(repo, &cwd, paths).map_err(map_transfer_err)?;
 	let cancel = CancelToken::new();
-	let expanded = expand_folder_items(path_sel.sel, usize::MAX, &cancel)
-		.map_err(map_transfer_err)?;
-	let plan = plan_export_with(
-		&expanded.sel,
+	let (plan, expanded_skipped) = plan_export_expanding(
+		&path_sel.sel,
 		settings,
 		Some(CLIPBOARD_PAYLOAD_MAX),
 		&RunOptions::default(),
+		&cancel,
 	)
 	.map_err(map_transfer_err)?;
 
@@ -285,7 +284,7 @@ fn copy_paths(
 		skipped_file_size_count: plan.skipped_file_size_count,
 		skipped_unreadable_count: plan.skipped_unreadable_count
 			+ path_sel.skipped
-			+ expanded.skipped,
+			+ expanded_skipped,
 		file_limit_reached: plan.file_limit_reached,
 	};
 

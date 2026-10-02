@@ -892,3 +892,149 @@ fn copy_paths_large_stdout_payload_does_not_deadlock() {
 		out.stdout.len()
 	);
 }
+
+#[cfg(unix)]
+#[test]
+fn copy_paths_absolute_exclude_filter_rule_with_symlink_repo() {
+	let tmp = tempfile::tempdir().unwrap();
+	let probe = tmp.path();
+	let real = probe.join("real");
+	let sub = real.join("sub");
+	let inner = sub.join("inner");
+	fs::create_dir_all(&inner).unwrap();
+	fs::write(real.join("a.txt"), "hello a\n").unwrap();
+	fs::write(sub.join("s.txt"), "hello s\n").unwrap();
+	fs::write(inner.join("i.txt"), "hello i\n").unwrap();
+	let link = probe.join("link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	let rule_path = link.join("sub");
+	let settings_json = format!(
+		r#"{{"useFilters":true,"filterRules":[{{"type":"PATH","action":"EXCLUDE","value":"{}","enabled":true}}]}}"#,
+		rule_path.display()
+	);
+
+	let link_s = link.to_str().unwrap();
+	let a_s = link.join("a.txt");
+	let sub_s = link.join("sub");
+	let out = snip_with_timeout_in_dir(
+		&[
+			"--settings",
+			&settings_json,
+			"--repo",
+			link_s,
+			"copy",
+			a_s.to_str().unwrap(),
+			sub_s.to_str().unwrap(),
+			"--stdout",
+		],
+		None,
+		None,
+		std::time::Duration::from_secs(60),
+		"snip timed out (absolute exclude rule with symlinked repo)",
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout_s = text(&out.stdout);
+	assert!(
+		stdout_s.contains("a.txt"),
+		"expected a.txt in stdout: {stdout_s}"
+	);
+	assert!(
+		!stdout_s.contains("s.txt"),
+		"sub/s.txt leaked into stdout: {stdout_s}"
+	);
+	assert!(
+		!stdout_s.contains("i.txt"),
+		"sub/inner/i.txt leaked into stdout: {stdout_s}"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_paths_absolute_include_filter_rule_with_symlink_repo() {
+	let tmp = tempfile::tempdir().unwrap();
+	let probe = tmp.path();
+	let real = probe.join("real");
+	let sub = real.join("sub");
+	let inner = sub.join("inner");
+	fs::create_dir_all(&inner).unwrap();
+	fs::write(real.join("a.txt"), "hello a\n").unwrap();
+	fs::write(sub.join("s.txt"), "hello s\n").unwrap();
+	fs::write(inner.join("i.txt"), "hello i\n").unwrap();
+	let link = probe.join("link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+
+	let rule_path = link.join("sub");
+	let settings_json = format!(
+		r#"{{"useFilters":true,"filterRules":[{{"type":"PATH","action":"INCLUDE","value":"{}","enabled":true}}]}}"#,
+		rule_path.display()
+	);
+
+	let link_s = link.to_str().unwrap();
+	let a_s = link.join("a.txt");
+	let sub_s = link.join("sub");
+	let out = snip_with_timeout_in_dir(
+		&[
+			"--settings",
+			&settings_json,
+			"--repo",
+			link_s,
+			"copy",
+			a_s.to_str().unwrap(),
+			sub_s.to_str().unwrap(),
+			"--stdout",
+		],
+		None,
+		None,
+		std::time::Duration::from_secs(60),
+		"snip timed out (absolute include rule with symlinked repo)",
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let stdout_s = text(&out.stdout);
+	assert!(
+		!stdout_s.contains("a.txt"),
+		"a.txt should be excluded: {stdout_s}"
+	);
+	assert!(
+		stdout_s.contains("s.txt"),
+		"sub/s.txt missing from stdout: {stdout_s}"
+	);
+	assert!(
+		stdout_s.contains("i.txt"),
+		"sub/inner/i.txt missing from stdout: {stdout_s}"
+	);
+}
+
+#[test]
+fn copy_paths_batched_expansion_avoids_walking_large_tree() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+	for i in 0..30 {
+		fs::write(
+			repo.join(format!("root_{i:02}.txt")),
+			format!("root content {i}\n"),
+		)
+		.unwrap();
+	}
+	let big = repo.join("big");
+	fs::create_dir_all(&big).unwrap();
+	for i in 0..5000 {
+		fs::write(big.join(format!("sub_{i:04}.txt")), "b\n").unwrap();
+	}
+
+	let repo_s = repo.to_str().unwrap();
+	let out = snip_with_timeout_in_dir(
+		&["--repo", repo_s, "copy", repo_s, "--stdout"],
+		None,
+		None,
+		std::time::Duration::from_secs(60),
+		"snip timed out walking large tree",
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	assert!(
+		text(&out.stderr).contains("30 file(s) copied"),
+		"expected '30 file(s) copied' in stderr: {}",
+		text(&out.stderr)
+	);
+}
