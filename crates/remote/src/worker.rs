@@ -26,10 +26,17 @@ use crate::{load_json, save_json, Identity, RemoteError};
 pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// Wrong proofs before an open code is withdrawn.
 pub const PAIRING_ATTEMPTS: u32 = 5;
-/// Connections served at once; more are closed on accept.
-pub const MAX_CONNECTIONS: usize = 16;
-/// A master's idle pooled connection is closed after this.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Connections served at once, idle pooled ones included (each is one
+/// blocked thread). More wait for a slot.
+pub const MAX_CONNECTIONS: usize = 64;
+/// Connections waiting for a slot; beyond this they are closed on accept.
+pub const MAX_WAITING: usize = 64;
+/// How long a connection waits for a slot: under the master's 5 s read
+/// timeout, so a master gives up only after the worker did.
+pub const SLOT_WAIT: Duration = Duration::from_secs(4);
+/// A master's idle pooled connection is closed after this; the master
+/// reconnects on its next call.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -93,6 +100,7 @@ struct State {
 	pairing: Mutex<Option<PairingWindow>>,
 	roots: RwLock<Vec<SharedRoot>>,
 	connections: AtomicUsize,
+	waiting: AtomicUsize,
 	stop: AtomicBool,
 }
 
@@ -126,6 +134,7 @@ impl Worker {
 			pairing: Mutex::new(None),
 			roots: RwLock::new(Vec::new()),
 			connections: AtomicUsize::new(0),
+			waiting: AtomicUsize::new(0),
 			stop: AtomicBool::new(false),
 		});
 		let accept_state = state.clone();
@@ -241,21 +250,25 @@ fn accept_loop(listener: TcpListener, state: Arc<State>) {
 	while !state.stop.load(Ordering::SeqCst) {
 		match listener.accept() {
 			Ok((tcp, _)) => {
-				if state.connections.fetch_add(1, Ordering::SeqCst)
-					>= MAX_CONNECTIONS
-				{
-					state.connections.fetch_sub(1, Ordering::SeqCst);
+				if state.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING {
+					state.waiting.fetch_sub(1, Ordering::SeqCst);
 					continue;
 				}
 				let conn_state = state.clone();
 				let spawned = std::thread::Builder::new()
 					.name("snip-remote-conn".into())
 					.spawn(move || {
-						let _ = serve(tcp, &conn_state);
-						conn_state.connections.fetch_sub(1, Ordering::SeqCst);
+						let slot = conn_state.take_slot();
+						conn_state.waiting.fetch_sub(1, Ordering::SeqCst);
+						if slot {
+							let _ = serve(tcp, &conn_state);
+							conn_state
+								.connections
+								.fetch_sub(1, Ordering::SeqCst);
+						}
 					});
 				if spawned.is_err() {
-					state.connections.fetch_sub(1, Ordering::SeqCst);
+					state.waiting.fetch_sub(1, Ordering::SeqCst);
 				}
 			}
 			Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -348,6 +361,37 @@ fn io_error(err: io::Error) -> Response {
 }
 
 impl State {
+	/// Waits up to [`SLOT_WAIT`] for one of [`MAX_CONNECTIONS`] slots.
+	fn take_slot(&self) -> bool {
+		let deadline = Instant::now() + SLOT_WAIT;
+		loop {
+			// compare_exchange rather than fetch_update: newer toolchains
+			// deprecate that name, and CI denies warnings.
+			let n = self.connections.load(Ordering::SeqCst);
+			if n < MAX_CONNECTIONS
+				&& self
+					.connections
+					.compare_exchange(
+						n,
+						n + 1,
+						Ordering::SeqCst,
+						Ordering::SeqCst,
+					)
+					.is_ok()
+			{
+				return true;
+			}
+			if n < MAX_CONNECTIONS {
+				// Lost a race for the slot: look again at once.
+				continue;
+			}
+			if Instant::now() >= deadline || self.stop.load(Ordering::SeqCst) {
+				return false;
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
 	fn is_trusted(&self, peer: &Fingerprint) -> bool {
 		let hex = peer.to_hex();
 		lock(&self.trusted).iter().any(|m| m.fingerprint == hex)
