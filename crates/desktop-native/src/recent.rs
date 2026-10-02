@@ -23,8 +23,12 @@ pub fn tilde(path: &Path) -> String {
 }
 
 /// The app's config folder. `SNIP_CONFIG_DIR` overrides it; an e2e run
-/// without the override never reads or writes the user's files.
+/// without the override, and every in-process test, never reads or writes
+/// the user's files.
 pub fn config_dir() -> Option<PathBuf> {
+	if cfg!(test) {
+		return None;
+	}
 	if std::env::var_os("SNIP_CONFIG_DIR").is_none() && crate::e2e_on() {
 		return None;
 	}
@@ -77,6 +81,14 @@ fn save_to(f: &Path, list: &[PathBuf]) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A `#[gpui::test]` that opens a workspace calls `remember`; it must
+	/// not land in the user's recent list.
+	#[test]
+	fn in_process_tests_never_touch_the_users_config() {
+		assert_eq!(config_dir(), None);
+		assert_eq!(file(), None);
+	}
 
 	#[test]
 	fn newest_first_capped_and_missing_folders_dropped() {

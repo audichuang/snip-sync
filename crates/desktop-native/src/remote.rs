@@ -43,11 +43,11 @@ pub struct WorkerCli {
 pub use snip_remote::device_name;
 
 /// The device identity, kept in the config folder; in memory only when
-/// there is none (an e2e run without `SNIP_CONFIG_DIR`).
+/// there is none (a test, or an e2e run without `SNIP_CONFIG_DIR`).
 pub fn identity() -> Result<Arc<Identity>, String> {
 	static ID: OnceLock<Result<Arc<Identity>, String>> = OnceLock::new();
 	ID.get_or_init(|| {
-		let id = match config_dir() {
+		let id = match crate::recent::config_dir() {
 			Some(dir) => Identity::load_or_create(&dir),
 			None => Identity::generate(),
 		};
@@ -56,16 +56,8 @@ pub fn identity() -> Result<Arc<Identity>, String> {
 	.clone()
 }
 
-/// In-process tests never touch the user's pairings.
-fn config_dir() -> Option<PathBuf> {
-	if cfg!(test) {
-		return None;
-	}
-	crate::recent::config_dir()
-}
-
 fn config_file(name: &str) -> Option<PathBuf> {
-	config_dir().map(|dir| dir.join(name))
+	crate::recent::config_dir().map(|dir| dir.join(name))
 }
 
 fn worker_store() -> Option<WorkerStore> {
@@ -204,7 +196,7 @@ pub fn run_headless(cli: &WorkerCli) -> ! {
 	let Err(err) = snip_remote::run_headless_worker(
 		listen,
 		&cli.shares,
-		config_dir().as_deref(),
+		crate::recent::config_dir().as_deref(),
 	);
 	eprintln!("Error: cannot start the worker: {err}");
 	std::process::exit(1);
