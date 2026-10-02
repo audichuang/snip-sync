@@ -1,6 +1,6 @@
 # CLI 與 App 共用同一條複製／貼上引擎
 
-狀態:**實作中**。第 3 節 D1–D7 由使用者於 2026-10-02 全部照建議拍板。
+狀態:**實作中**。第 3 節 D1–D7 由使用者於 2026-10-02 全部照建議拍板;D8–D10 於階段 0 review 後(同日)另行拍板。
 
 目標一句話:`snip` CLI 與原生 App 的複製、貼上、遠端配對,底層都走 `snip-core`／`snip-remote` 的**同一組函式**。兩邊的差別只剩 UI(CLI 是旗標＋文字輸出,App 是預覽＋勾選),修一個 bug 兩邊同時好。這也是讓 `docs/spec.md` §5.2「CLI 與 App 呼叫同一組核心函式,行為完全相同」重新成立。
 
@@ -82,16 +82,10 @@ AGENTS.md 與既有慣例規定:與 TS 不同的行為**只有使用者能決定
 
 1. 「the same path twice is planned twice, in order」→ transfer 會變成 `TargetCollision` 錯誤。
 2. 「a sibling root label targets that root」(`backup/` 落到 backup root,需要多 root)→ CLI 目前只給一個 root,transfer 需要有人建 `ImportMapping`。
-3. 「an absolute path matching no root is kept literally under the primary root」:經程式碼比對,僅當 POSIX 絕對路徑位於所有 root 外部且不含任何 root basename 片段時(如 `/Users/bob/other/src/a.ts`),經 `sanitize_relative_path` 去首斜線後寫入主 root 底下(`Users/bob/other/src/a.ts`),此狹義情境才與 TS 一致;若為 root 內部絕對路徑或跨機器後綴符合,舊引擎會解析為相對路徑,但在 `plan_import_with` 下會被巢狀寫入,這兩者不屬於同 TS 行為,歸入下方待決事項;只有帶磁碟機代號的路徑(`D:\work\lib\b.ts`)因路徑驗證拒絕冒號 `:`(非 root 解析原因)而成為 `UNRESOLVED_PATH` 跳過,這才是與 TS 的真實差異(TS 寫為 `D/work/lib/b.ts`)。
+3. 「an absolute path matching no root is kept literally under the primary root」:POSIX 絕對路徑 root 外且無後綴符合 → 寫在主 root 下,同 TS;root 內部/跨機器後綴 → D8 修好後同 TS;只有磁碟機代號是真差異。帶磁碟機代號路徑(如 `D:\work\lib\b.ts`)被跳過的原因是 `paths.rs` `sanitize_relative_path` 內的 `is_absolute_path`/`has_drive_slash` 檢查(`D:\` 或 `D:/` 開頭視為絕對,sanitize 回 None),而不是冒號規則;TS 則寫為 `D/work/lib/b.ts`。
 
-- **建議**:1 依 D1 接受為差異;2 CLI 目前本就只有單 root,不受影響,登記「CLI 單 root」即可;3 接受帶磁碟機代號路徑因驗證拒絕冒號 `:` 跳過為差異。三者都寫進 porting-notes,fixture 與 `contract.rs` 不動。
-- 若你要保留 TS 行為:替代方案是 `plan_import_with` 加一個「TS 相容模式」旗標,但那等於在 transfer 裡再長出第二套語意,不建議。
-- **新待決事項(明確未登記為已接受差異)**:以下兩種絕對路徑在舊引擎(`plan_restore`)與 `plan_import_with` 間存在行為差異,屬於階段 6 的 regression,且 GUI 現今亦為此巢狀行為(同樣未登記),明確未登記為已接受差異,需要使用者拍板決定處理方式:
-  1. root 內部的絕對路徑(例如 `<repo>/src/c.ts`):舊引擎(`plan_restore`)會解析為 `src/c.ts`,但在 `plan_import_with` 中會被巢狀寫入為 `<repo>/<repo-abs-path-without-leading-slash>/src/c.ts`。
-  2. 跨機器後綴符合路徑(例如 `/…/<root-basename>/src/a.ts`):舊引擎(`paths.rs` 的 `cross_machine_suffix_candidate`)會因 root basename 相符而解析為 `src/a.ts`,但在 `plan_import_with` 中同樣會被巢狀寫入為 `<repo>/<abs-path-without-leading-slash>`。
-  - 選項 (1):如 `plan_restore` 解析路徑(CLI 在呼叫前以 `map_entry` 預先對應,或 `plan_import_with` 在 sanitize 前先做 containment 與後綴檢查);
-  - 選項 (2):直接跳過。
-  兩選項皆適用於這兩種情況。階段 6 需在 `crates/cli/tests/cli.rs` 為這兩類情境新增測試。因此 D2 並非全部差異的完整集合(root 內部絕對路徑與跨機器後綴符合皆尚未拍板)。
+- **結論(已依建議與 D8 拍板)**:1 依 D1 接受為差異;2 CLI 目前本就只有單 root,不受影響,登記「CLI 單 root」即可;3 接受帶磁碟機代號路徑因 `sanitize_relative_path` 絕對路徑檢查跳過為差異。三者都寫進 porting-notes,fixture 與 `contract.rs` 不動。
+- **絕對路徑處理(已決 D8)**:root 內部絕對路徑與跨機器後綴由 core `plan_import_with` 在 sanitize 前解析,與 TS 一致,故不是差異;絕對路徑 [DELETED] 若解析不到任何 root 則拒絕(視為 unsafe/unresolved 跳過),同 TS;現行 GUI 巢狀刪除是 bug,階段 5b 修復。寫入對不到任何 root 的 POSIX 絕對路徑維持 TS 行為(照原樣放主 root 底下),只有帶磁碟機代號者維持 `UNRESOLVED_PATH`(登記為 D2 的已接受差異)。GUI 因共用 core 函式一併修好。
 
 ### D3 — `--range a..b` 怎麼辦?
 
@@ -110,11 +104,9 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 ### D5 — 貼 commits 的旗標語意
 
 - GUI 現行真實判定:此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,未允許覆寫即擋(`commit_overwrite_required`)。先前文件所述「目標有未 commit 修改會被覆寫時 ... 對齊 GUI」為自相矛盾的錯誤描述。
-- **待決事項(CLI 判定條件)**:CLI 的覆寫判定規則尚未定案,有兩個選項待拍板:
-  - 選項 (a):與 GUI 採用相同存在性判定(true mirroring:只要寫入已存在的檔案即需 `--overwrite`,因此 commit 貼上幾乎強制需要 `--overwrite`);
-  - 選項 (b):僅在有未 commit 修改(dirty)時阻擋。此選項不鏡像 GUI 行為,必須登記為 GUI/CLI 差異,且核心需要新增 helper 來判定目標檔是否有 dirty 修改。
+- **CLI 判定條件(已決 D9)**:CLI 與 GUI 相同,以 `FilePlan.existed` 判定,只要寫入已存在的檔案就需 `--overwrite`,沒給 → exit 2;故 commit 貼上幾乎都需要 `--overwrite`。
 - **其他旗標語意(已確定)**:`--skip-existing` 對 commit payload → exit 2「commit 模式不支援 --skip-existing」;`--adjust-paths` 對 commit payload → exit 2。若判定需要覆寫但沒給 `--overwrite` → exit 2。
-- 這與 TS/原 spec §4.3「直接覆蓋」不同,待 CLI 判定拍板後一併於規格與 porting-notes 定稿。
+- 這與 TS/原 spec §4.3「直接覆蓋」不同,已於規格與 porting-notes 定稿。
 
 ### D6 — 上限統一成多少?
 
@@ -133,7 +125,7 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 0 — 決策落地(只改文件)
 
-狀態:已完成(見 spec §3.2、§4.3、porting-notes「已知且接受的差異」)。
+狀態:已完成(見 spec §3.2、§4.3、porting-notes「已知且接受的差異」;D8–D10 於 review 後補定稿)。
 
 - 依第 3 節的決定改 `docs/spec.md` §3.2、§4.3,並在 `docs/porting-notes.md`「已知且接受的差異」登記 GUI 現有的 freshness、`TargetCollision`、`commit_overwrite_required`、32 MiB(F13)。
 - 只改 `.md`,不需 preflight。
@@ -175,25 +167,31 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 - 修正 `collect_payload_with_selection` 的文件為「測試 oracle」(F15)。
 - 測試:`transfer_planning.rs` #26–28、#36–38 與 :2415 原本用舊引擎當 oracle,保留;`cli.rs` 新增大檔案／大量未追蹤檔不爆記憶體的測試(以 payload 上限錯誤收尾,而不是 OOM)。
 
+### 階段 5b — core 匯入修正(D8、D10)
+
+- 範圍:`transfer::plan_import_with`(`crates/core/src/transfer.rs`)。
+  - D8:每筆 entry 在 `sanitize_relative_path` 之前先解析絕對路徑(root 內部 → 相對;`cross_machine_suffix_candidate` → 相對;絕對 [DELETED] 對不到任何 root → 以 unsafe/unresolved 跳過、不刪任何檔;絕對寫入對不到 root → 維持照原樣放主 root,磁碟機代號 → `UNRESOLVED_PATH`),行為對齊 `restore::plan_restore`/TS。GUI 行為因共用 core 函式一併修正(修正先前絕對路徑 payload 巢狀寫入與巢狀刪除的 bug)。
+  - D10:探測目的端(root)檔案系統是否不分大小寫,若是,`TargetCollision` 的身分檢查(`canonical_target_identity`/`path_key`)對新目標路徑也摺疊大小寫,消除 macOS 等平台上的 gap。
+- 測試:
+  - `crates/core/tests/transfer_planning.rs`:root 內部絕對寫入、跨機器後綴、絕對 [DELETED] 對不到 root 被拒且不刪任何檔、磁碟機代號 `UNRESOLVED_PATH`、root 以 symlink 拼寫的版本;D10 的 `[NEW] B.txt`+`[NEW] b.txt` 與 `D/x.txt`+`d/x.txt` 在不分大小寫 FS 上觸發 `TargetCollision`,測試先探測 FS,Linux 等區分大小寫 FS 則斷言兩檔都建立。
+  - GUI regression:`crates/desktop-native/src/paste.rs` 單元測試或 `tests::in_process`(貼上含 root 內部絕對路徑 / 絕對 [DELETED] 的 payload)。
+- 關卡:`just preflight`(動 core 行為;動 GUI 行為所以 native 單元測試也要綠)。
+- 此階段須排在階段 6 之前;階段 6 的 CLI 直接享受結果。
+
 ### 階段 6 — CLI `paste` 改走 transfer(F1、F2、F10 的 CLI 端)
 
-- 阻擋項目／待決策事項(需使用者在實作前拍板):
-  - **commit payload 覆寫判定條件(D5 待決阻擋項目)**:實作 commit-payload `--overwrite` 旗標前需先決定 CLI 判定規則:
-    - 選項 (a):與 GUI 採用相同存在性判定(`dest_exists` / `FilePlan.existed`,只要目標檔在重播前已存在即需 `--overwrite`);
-    - 選項 (b):僅在目標有未 commit 修改(dirty)時阻擋(需登記為 GUI/CLI 差異並在 core 新增 helper)。
-  - **root 內部絕對路徑與跨機器後綴符合處理(D2 新待決事項,明確未登記為已接受差異)**:舊引擎(`plan_restore`)將 `<repo>/src/c.ts` 以及跨機器後綴符合路徑(例如 `/…/<root-basename>/src/a.ts`)規劃為 `src/a.ts`,但 `plan_import_with` 會將兩者寫入巢狀路徑(`<repo>/<abs-path-without-leading-slash>`,注意 GUI 現今亦為此巢狀行為且同樣未登記)。此為 regression,需決定:
-    - 選項 (1):如 `plan_restore` 解析路徑(CLI 在呼叫前以 `map_entry` 預先對應,或 `plan_import_with` 在 sanitize 前做 containment 與後綴檢查);
-    - 選項 (2):直接跳過。
-    兩選項皆適用於這兩種情況。
+- 前置決策已定案:commit payload 覆寫判定依 D9(以 `FilePlan.existed` 判定),絕對路徑與大小寫別名 core 匯入問題已於階段 5b(D8、D10)修復。
 - 檔案 payload:`plan_import_with(text, header, &[repo], mapping, opts)`,mapping 為 `with_primary(repo)`,`--adjust-paths` 時由 `from_restore_base` 產生;`--dry-run` 印 `TransferImportPlan` 的 create/overwrite/delete/skip(輸出格式不變);`--apply` 呼叫 `TransferImportPlan::apply(&RestoreSelection{overwrite_existing / skip_existing})`。
 - `TargetCollision`、`StaleDestination` 對應到清楚的錯誤訊息與 exit 1(依 D1)。
-- commit payload:dry-run 也改走 `CommitReplayPreview::capture_with`(預覽與 apply 同一份 plan),旗標依 D5 拍板結果實作。
+- commit payload:dry-run 也改走 `CommitReplayPreview::capture_with`(預覽與 apply 同一份 plan),旗標依 D9 拍板結果實作。
 - 測試(`cli.rs`):
   - F1 大小寫別名(大小寫差異片段位於已存在路徑部分):在 macOS 與 Windows 拒絕(`TargetCollision`)、Linux 照常執行;
-  - 兩筆皆為新增且大小寫差異片段皆不存在的大小寫別名(例如 `[NEW] B.txt` 與 `[NEW] b.txt`,或目錄尚未建立時的 `D/x.txt` 與 `d/x.txt`):在 macOS 補 `cli.rs` 測試(記錄現行覆蓋行為或予以修復——決策待決);在 Windows 補 regression 測試驗證兩筆新增仍會因大小寫摺疊觸發 `TargetCollision`;
-  - root 內部絕對路徑(如 `<repo>/src/c.ts`):在 `cli.rs` 補測試(依拍板選項驗證解析或跳過);
-  - 跨機器後綴符合路徑(如 `/Users/bob/<repo-basename>/src/a.ts`):在 `cli.rs` 補測試(依拍板選項驗證解析或跳過);
-  - F2 `--skip-existing` 貼 commit exit 2 且檔案不變;
+  - 兩筆皆為新增且大小寫差異片段皆不存在的大小寫別名(例如 `[NEW] B.txt` 與 `[NEW] b.txt`,或目錄尚未建立時的 `D/x.txt` 與 `d/x.txt`):依 D10 修好後的預期,在 macOS 與 Windows(不分大小寫 FS)皆觸發 `TargetCollision` 拒絕;Linux(區分大小寫 FS)則照常兩檔皆建立;
+  - root 內部絕對路徑(如 `<repo>/src/c.ts`):解析為相對路徑(同 TS);
+  - 跨機器後綴符合路徑(如 `/Users/bob/<repo-basename>/src/a.ts`):解析為相對路徑(同 TS);
+  - 絕對路徑 [DELETED] 解析不到 root → 跳過、不刪任何檔;
+  - commit paste `--overwrite` 測試:目標存在且無旗標 → exit 2;加上 `--overwrite` → 成功;
+  - F2 `--skip-existing` / `--adjust-paths` 貼 commit exit 2 且檔案不變;
   - `--adjust-paths` 目前**完全沒有測試**,這一階段要補(Strip 與 Add 各一);既有 `file_mode_round_trip`(:57–119)輸出不得變。
 - `contract.rs` 不動(依 D2)。
 
@@ -219,7 +217,7 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 | 發現 | 階段 |
 |---|---|
-| F1 大小寫別名 | 6(D1) |
+| F1 大小寫別名 | 6(D1) + 5b(D10) |
 | F2 commit 旗標被忽略 | 6(D5) |
 | F3 symlink 外洩 | 1 + 4 |
 | F4 FIFO 卡住 | 1 + 4 |
@@ -234,6 +232,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 | F13 未登記差異 | 0 |
 | F14 重複的 is_relative／FsProbe | 1 |
 | F15 誤導的文件 | 5 |
+| 絕對路徑 payload 巢狀寫入／巢狀刪除(review 發現) | 5b(D8) |
+| 新增大小寫別名 macOS gap | 5b(D10) |
 
 ---
 

@@ -97,15 +97,14 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   - 有界輸出捕捉與大小限制:目錄列表(`ls-tree`)stdout 上限 8 MiB、項目數上限 2,000;歷史紀錄(`log`)stdout 上限 16 MiB、筆數上限 10,000;blob 預覽上限 1 MiB。
   - 誠實截斷與防範假成功:嚴格 blob 與歷史查詢在輸出遭截斷時回傳 `GitError::OutputLimit`，絕不截斷後回傳殘缺成功(`Text`)或假完結(`has_more: false`)。`resolve_commit_with` 嚴格要求完整 OID (40/64 hex)，截斷時拒絕輸出。
   - 二進位判斷與複製共用 `blob::classify`，內容任何位置有 NUL 即為二進位（不再只看前 8000 bytes）。
-- 目的端衝突防護(`TransferError::TargetCollision`):還原計畫中若有兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;Windows 上即使皆為新增亦會摺疊大小寫阻擋;symlink 別名、或是同一路徑出現兩次亦同),整批拒絕執行。TS 與原 spec §3.2 原本是逐筆照寫,在特定情境下會導致資料遺失(例如 F1 情境:在不區分大小寫的檔案系統上且檔案已存在時,`[NEW] A.txt` 與 `[DELETED] a.txt` 會先寫後刪,導致檔案消失且 exit 0)。
-  - 已知 gap:大小寫別名防護依賴 `canonical_target_identity` 透過 realpath 解析最深層已存在祖先路徑;大小寫差異片段若落在已存在部分(例如目錄 `D`/`d` 已存在時 `D/x.txt` 與 `d/x.txt`),realpath 會解析為相同實體路徑而成功阻擋。然而,若差異片段落在尚不存在的部分(例如兩筆皆為新增且皆不存在的 `[NEW] B.txt` 與 `[NEW] b.txt`,或目錄 `D`/`d` 尚不存在時的 `D/x.txt` 與 `d/x.txt`):Windows 上 `path_key` 會在正規化後摺疊大小寫,因此仍會阻擋;但在 macOS 等非 Windows 的不區分大小寫檔案系統上,因 `path_key` 不摺疊且未存在部分無法由 realpath 解析,會被規劃為兩次新增,第二筆會靜默覆蓋第一筆而無法阻擋(Linux 為區分大小寫檔案系統,故此類路徑非別名)。狀態:現況(GUI `transfer` 已實作),CLI 於統一引擎遷移(階段 6)後同樣採用,macOS 等非 Windows 平台未覆蓋的 gap 見計畫階段 6。
+- 目的端衝突防護(`TransferError::TargetCollision`):還原計畫中若有兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;目前僅 Windows 上即使皆為新增亦會摺疊大小寫阻擋(其他不分大小寫 FS 由 D10 於階段 5b 補上);symlink 別名、或是同一路徑出現兩次亦同),整批拒絕執行。TS 與原 spec §3.2 原本是逐筆照寫,在特定情境下會導致資料遺失(例如 F1 情境:在不區分大小寫的檔案系統上且檔案已存在時,`[NEW] A.txt` 與 `[DELETED] a.txt` 會先寫後刪,導致檔案消失且 exit 0)。
+  - 大小寫別名處理(D10):兩筆皆為新增且差異片段皆不存在的大小寫別名(例如 `[NEW] B.txt` 與 `[NEW] b.txt`,或目錄尚不存在時的 `D/x.txt` 與 `d/x.txt`),在 core 探測目的端(root)檔案系統是否不分大小寫;若是,`TargetCollision` 的身分檢查(`canonical_target_identity`/`path_key`)對新目標路徑也進行大小寫摺疊,觸發 `TargetCollision` 阻擋,消除 macOS 等平台上的 gap。狀態:規劃(階段 5b)。
 - 目標端新鮮度檢查(`TransferError::StaleDestination`):還原套用時若發現目標檔案內容或儲存庫 HEAD/index 在預覽產生後已變動,套用時拒絕並要求重新預覽,避免覆寫預覽期間外部發生的修改。TS 無此檢查。狀態:現況(GUI `transfer` 已實作),CLI 於統一引擎遷移(階段 6)後同樣採用。
-- commit 模式貼上覆寫防護:此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,預設不套用,需明確允許覆寫。GUI 提供允許覆寫的開關(錯誤代碼 `commit_overwrite_required`,paste.rs `execute_commit` 先以 `preview.revalidate()` 檢查,未允許覆寫則阻擋);CLI 規則待決(見計畫 D5),預計需明確傳遞 `--overwrite`,缺少時 exit 2 退出。此外,CLI 貼上 commit payload 時不支援 `--skip-existing` 與 `--adjust-paths`,指定時 exit 2。這與 TS 與原 spec §4.3「直接覆蓋」不同。狀態:現況(GUI 已實作),CLI 於統一引擎遷移(階段 6)後對齊規則待決(見計畫 D5)。
+- commit 模式貼上覆寫防護:此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,預設不套用,需明確允許覆寫。GUI 提供允許覆寫的開關(錯誤代碼 `commit_overwrite_required`,paste.rs `execute_commit` 先以 `preview.revalidate()` 檢查,未允許覆寫則阻擋);CLI 判定與 GUI 相同(已決 D9),以 `FilePlan.existed` 判定,需明確傳遞 `--overwrite`,缺少時 exit 2 退出。此外,CLI 貼上 commit payload 時不支援 `--skip-existing` 與 `--adjust-paths`,指定時 exit 2。這與 TS 與原 spec §4.3「直接覆蓋」不同。狀態:現況(GUI 已實作),CLI 於統一引擎遷移(階段 6)後對齊。
 - contract fixture 三個 TS 行為的 CLI 已接受差異:共用 contract fixture(`fixtures/clipboard-contract.json`)與 `contract.rs::restore_cases` 保持不變且持續全綠(因其直接測試底層 `restore::plan_restore`);但 CLI 於統一引擎遷移(階段 6)改走 `plan_import_with` 後,實際命令列行為在以下三種情況與 TS 不同:
   (1)「the same path twice is planned twice, in order」:TS 照順序規劃兩次;CLI 改走 `plan_import_with` 後因偵測到重複目標路徑,觸發 `TargetCollision` 整批拒絕。
   (2)「a sibling root label targets that root」:TS 支援多 root 對應;CLI 目前僅支援單一儲存庫/工作區 root(`ImportMapping::with_primary`),不需多 root 標籤對應。
-  (3)「an absolute path matching no root is kept literally under the primary root」:僅在 POSIX 絕對路徑位於所有 root 外部且不含任何與 root basename 相同的路徑片段時(如 `/Users/bob/other/src/a.ts`,其中所有 root 皆無 `other`),在 `plan_import_with` 下經 `sanitize_relative_path` 去除開頭 `/` 後寫入主 root 底下(`Users/bob/other/src/a.ts`),才與 TS 行為一致;若為 root 內部絕對路徑或跨機器後綴符合(如 `/…/<root-basename>/src/a.ts`),舊引擎會解析為相對路徑 `src/a.ts`,但在 `plan_import_with` 下會被巢狀寫入,此兩種情境屬於 D2 新待決事項,明確未登記為已接受差異。只有帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因路徑驗證拒絕冒號 `:`(非 root 解析原因)而被判定為未解析路徑直接跳過(`UNRESOLVED_PATH`),這才是此項已接受的真實差異(TS 會寫入 `D/work/lib/b.ts`)。
-  狀態:規劃(CLI 於階段 6 遷移後生效)。
+  (3)「an absolute path matching no root is kept literally under the primary root」:與 TS 不同的只有帶磁碟機代號的路徑(`UNRESOLVED_PATH`,TS 寫為 `D/work/lib/b.ts`),原因是 `sanitize_relative_path` 內的 `is_absolute_path`/`has_drive_slash` 檢查(`D:\` 或 `D:/` 開頭視為絕對路徑故回傳 None),而不是冒號規則。POSIX 絕對路徑在所有 root 外部且無後綴符合時,去首斜線寫在主 root 下,同 TS;root 內部絕對路徑與跨機器後綴符合經 D8 在 core 修好後亦解析為相對路徑,與 TS 一致,故不是差異。且**絕對路徑的 [DELETED] 若解析不到任何 root → 拒絕(視為 unsafe/unresolved 跳過),與 TS 一致;目前 `plan_import_with`(GUI)巢狀刪除是 bug,階段 5b 修**。  狀態:規劃(CLI 於階段 6 遷移後生效)。
 - 剪貼簿 payload 上限統一(`transfer::CLIPBOARD_PAYLOAD_MAX` = 32 MiB):核心定義單一常數,CLI 與 GUI 複製流程共用,與貼上預覽預算(32 MiB)一致,避免「GUI 複製成功但另一端貼上超限」。超過上限時為明確錯誤(CLI exit 1),不進行默默截斷。TS 原生無此統一常數約束(現況為 GUI 複製上限 64 MiB、CLI 無上限)。狀態:規劃(核心於階段 2 定義常數,階段 3/4 CLI 採用,GUI 後續統一)。
 - commit 區間複製與路徑重新定位機制(規劃中,尚未實作):
   (1) `--range a..b`:核心 `transfer` 將新增 `SourceKind::Range { base, tip }` 來源型別(刪除檔案讀取 `base:<path>`),供 CLI 與 GUI 共用,取代舊有 gitsrc 獨立實作(階段 2 / 階段 5)。
@@ -134,7 +133,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 - **路徑片段含控制字元(0x00–0x1F)或 `<>:"|?*` 時拒絕**,所有平台一致。
   U+0085 / U+2028 / U+2029 在 Windows 合法,允許。
 - 對不到任何 root 的絕對路徑:**寫入**時照原樣放在主 root 底下(拿掉磁碟機冒號、保留每一層目錄),
-  **刪除**時一律拒絕。絕不依路徑尾端去猜測目標。(CLI 遷移至統一引擎[階段 6]後,位於所有 root 外部且不含任何 root basename 片段的 POSIX 絕對路徑,去除開頭 `/` 後寫入主 root 底下同 TS;root 內部絕對路徑與跨機器後綴符合則屬 D2 待決事項,明確未登記為已接受差異;帶磁碟機代號的路徑因路徑驗證拒絕冒號 `:` 而跳過 `UNRESOLVED_PATH`,見「已知且接受的差異」)。
+  **刪除**時一律拒絕。絕不依路徑尾端去猜測目標。(core 依 D8[階段 5b]在 sanitize 前先解析絕對路徑:root 內部與跨機器後綴符合解析為相對路徑,對不到 root 的絕對路徑 [DELETED] 拒絕跳過不刪任何檔,皆與 TS 一致;現行 GUI 巢狀刪除為 bug,階段 5b 修復;只有帶磁碟機代號的路徑因 `sanitize_relative_path` 的絕對路徑/磁碟機檢查跳過 `UNRESOLVED_PATH`,為已接受差異,見「已知且接受的差異」)。
 - containment 以**真實解析**(realpath)判斷:解析路徑或其最深的已存在祖先目錄。
   祖先的往上走不設上限,只限制 symlink 的跳轉次數。
 - placeholder(`// File skipped: …` / `// Unable to read file content` / `// Error reading file content`)
