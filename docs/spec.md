@@ -50,6 +50,8 @@
 - 非 UTF-8 檔案(含二進位、UTF-16)**跳過**,不進剪貼簿,只計入通知。
 - 讀不到的檔案放 placeholder,不算已複製、不佔檔案數上限。
 - 過濾規則、大小與數量上限:與 IDE 套件相同。
+- 複製上限統一為 32 MiB(core 常數 `transfer::CLIPBOARD_PAYLOAD_MAX`,兩個介面共用,與貼上預覽預算一致;現況為 GUI 複製上限 64 MiB、CLI 無上限,32 MiB 是統一後實作目標);超過是明確錯誤(CLI exit 1),不截斷。
+- `snip copy <路徑…>` 規則(目標行為/CLI 於階段 4 遷移後):相對路徑以 cwd 解析;路徑不存在 exit 1;路徑在 `--repo` 外 exit 1;結果為空時顯示「No files selected.」exit 1 且不改剪貼簿。
 
 複製完成的通知:**與 IDE 套件相同**,顯示檔案數、字元數、行數、字數、token 數,以及跳過了幾個檔案。
 
@@ -62,9 +64,13 @@
 3. 確認後執行。執行前**重新檢查**一次路徑與編碼(預覽期間檔案系統可能已經變了)。
 4. 結果:成功 / 跳過 / 失敗各幾個,失敗的列出原因。
 
-- **一律覆蓋**,不偵測目標是否被改過。
+- 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 現已如此,CLI 於統一引擎遷移[階段 6]後同樣):
+  (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(含大小寫別名、symlink 別名、同一路徑出現兩次)就整批拒絕;
+  (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
+  這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
 - 安全規則照 porting-notes 第 3 節:路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、
   placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8。
+- CLI 補充(目標行為/CLI 於階段 6 遷移後):對不到任何 root 的絕對路徑改為跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`;CLI 只有單一 root。
 
 CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --skip-existing]`。
 
@@ -108,7 +114,7 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 3. 疊在**目前分支的 HEAD** 上,不需要與來源有共同的起點,也不檢查是否 fast-forward。
 4. 結果:建立了幾個 commit。
 
-- 涉及的路徑如果本機有尚未 commit 的修改,**直接覆蓋**(符合「蓋上去」的原則)。
+- 目標路徑有未 commit 的修改且會被覆寫時,**預設不套用**,需明確允許覆寫(GUI:允許覆寫的開關,i18n `commit_overwrite_required`,paste.rs `execute_commit` 先 `preview.revalidate()` 再回此錯誤;CLI [目標行為/階段 6 遷移後]:`--overwrite`,沒給則 exit 2)。CLI 貼 commit payload 時 `--skip-existing`、`--adjust-paths` 不支援,exit 2。這與 TS/原規格「直接覆蓋」不同,見 porting-notes「已知且接受的差異」。
 - 中途某個 commit 建立失敗:**停下來**,回報已建立的前幾個、失敗的是哪一個與 git 的錯誤訊息。已建立的不回滾。
 - 路徑安全規則與檔案模式相同。
 - 預設值(規格階段未逐題確認,實作時照此,有意見再改):

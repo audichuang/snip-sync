@@ -123,6 +123,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 0 — 決策落地(只改文件)
 
+狀態:已完成(見 spec §3.2、§4.3、porting-notes「已知且接受的差異」)。
+
 - 依第 3 節的決定改 `docs/spec.md` §3.2、§4.3,並在 `docs/porting-notes.md`「已知且接受的差異」登記 GUI 現有的 freshness、`TargetCollision`、`commit_overwrite_required`、32 MiB(F13)。
 - 只改 `.md`,不需 preflight。
 

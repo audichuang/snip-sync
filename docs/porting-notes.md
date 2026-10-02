@@ -25,7 +25,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 ### 已知且接受的差異
 
 - 原生工作台(`desktop-native`)的檔案模式上限是 10,000 個檔案(`NATIVE_FILE_COUNT_LIMIT`),不是 ClipCode 預設的 30:它沒有設定畫面,
-  而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 64 MiB payload 上限約束(超過是明確錯誤)。payload 格式不變。
+  而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 payload 上限約束(現況 64 MiB;統一後為 32 MiB `CLIPBOARD_PAYLOAD_MAX`,超過是明確錯誤)。payload 格式不變。
   碰到上限時狀態列與複製提示明說「已達 N 個檔案上限,其餘檔案未複製」,不會默默少檔。
   截斷順序:單獨選的檔案與 Changes / Log 項目先保留名額;資料夾依選取籃順序(root 依路徑排序,
   root 內的專案選取依相對路徑排序)分用剩下的名額,先到先用,走訪到上限多一個檔案就停,不把大資料夾整個列出。
@@ -97,6 +97,20 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   - 有界輸出捕捉與大小限制:目錄列表(`ls-tree`)stdout 上限 8 MiB、項目數上限 2,000;歷史紀錄(`log`)stdout 上限 16 MiB、筆數上限 10,000;blob 預覽上限 1 MiB。
   - 誠實截斷與防範假成功:嚴格 blob 與歷史查詢在輸出遭截斷時回傳 `GitError::OutputLimit`，絕不截斷後回傳殘缺成功(`Text`)或假完結(`has_more: false`)。`resolve_commit_with` 嚴格要求完整 OID (40/64 hex)，截斷時拒絕輸出。
   - 二進位判斷與複製共用 `blob::classify`，內容任何位置有 NUL 即為二進位（不再只看前 8000 bytes）。
+- 目的端衝突防護(`TransferError::TargetCollision`):還原計畫中若有兩筆 entry 指向同一個實體檔(含大小寫別名、symlink 別名、或是同一路徑出現兩次),整批拒絕執行。TS 與原 spec §3.2 原本是逐筆照寫,在特定情境下會導致資料遺失(例如 F1 情境:在不區分大小寫的檔案系統上,`[NEW] A.txt` 與 `[DELETED] a.txt` 會先寫後刪,導致檔案消失且 exit 0)。狀態:現況(GUI `transfer` 已實作),CLI 於統一引擎遷移(階段 6)後同樣採用。
+- 目標端新鮮度檢查(`TransferError::StaleDestination`):還原套用時若發現目標檔案內容或儲存庫 HEAD/index 在預覽產生後已變動,套用時拒絕並要求重新預覽,避免覆寫預覽期間外部發生的修改。TS 無此檢查。狀態:現況(GUI `transfer` 已實作),CLI 於統一引擎遷移(階段 6)後同樣採用。
+- commit 模式貼上覆寫防護:目標路徑有未 commit 的修改且會被 commit 覆寫時,預設不套用,需明確允許覆寫。GUI 提供允許覆寫的開關(錯誤代碼 `commit_overwrite_required`,paste.rs `execute_commit` 先以 `preview.revalidate()` 檢查,未允許覆寫則阻擋);CLI 於統一引擎遷移(階段 6)後需明確傳遞 `--overwrite`,缺少時 exit 2 退出。此外,CLI 貼上 commit payload 時不支援 `--skip-existing` 與 `--adjust-paths`,指定時 exit 2。這與 TS 與原 spec §4.3「直接覆蓋」不同。狀態:現況(GUI 已實作),CLI 於統一引擎遷移(階段 6)後對齊。
+- contract fixture 三個 TS 行為的 CLI 已接受差異:共用 contract fixture(`fixtures/clipboard-contract.json`)與 `contract.rs::restore_cases` 保持不變且持續全綠(因其直接測試底層 `restore::plan_restore`);但 CLI 於統一引擎遷移(階段 6)改走 `plan_import_with` 後,實際命令列行為在以下三種情況與 TS 不同:
+  (1)「the same path twice is planned twice, in order」:TS 照順序規劃兩次;CLI 改走 `plan_import_with` 後因偵測到重複目標路徑,觸發 `TargetCollision` 整批拒絕。
+  (2)「a sibling root label targets that root」:TS 支援多 root 對應;CLI 目前僅支援單一儲存庫/工作區 root(`ImportMapping::with_primary`),不需多 root 標籤對應。
+  (3)「an absolute path matching no root is kept literally under the primary root」:TS 將無法對應任何 root 的絕對路徑(如 `D:\work\lib\b.ts`)剝除磁碟機代號後寫入主 root 底下(`D/work/lib/b.ts`);CLI 改走 `plan_import_with` 後判定為未解析路徑直接跳過(`UNRESOLVED_PATH`),避免在工作區寫入怪目錄。
+  狀態:規劃(CLI 於階段 6 遷移後生效)。
+- 剪貼簿 payload 上限統一(`transfer::CLIPBOARD_PAYLOAD_MAX` = 32 MiB):核心定義單一常數,CLI 與 GUI 複製流程共用,與貼上預覽預算(32 MiB)一致,避免「GUI 複製成功但另一端貼上超限」。超過上限時為明確錯誤(CLI exit 1),不進行默默截斷。TS 原生無此統一常數約束(現況為 GUI 複製上限 64 MiB、CLI 無上限)。狀態:規劃(核心於階段 2 定義常數,階段 3/4 CLI 採用,GUI 後續統一)。
+- commit 區間複製與路徑重新定位機制(規劃中,尚未實作):
+  (1) `--range a..b`:核心 `transfer` 將新增 `SourceKind::Range { base, tip }` 來源型別(刪除檔案讀取 `base:<path>`),供 CLI 與 GUI 共用,取代舊有 gitsrc 獨立實作(階段 2 / 階段 5)。
+  (2) 路徑重新定位:CLI `--adjust-paths` 將透過核心新增的 `ImportMapping::from_restore_base(&RestoreBaseSuggestion, primary)` 轉換為統一的 `ImportMapping`,GUI 則維持現有逐 prefix 選擇的介面不變(階段 2 / 階段 6)。
+  狀態:規劃中,尚未實作。
+- CLI 路徑複製解析規則(`snip copy <paths>`):相對路徑以 shell 目前工作目錄(cwd)解析;指定路徑不存在時 exit 1;指定路徑超出 `--repo` 邊界時 exit 1(舊引擎原先會賦予絕對路徑 label,transfer 無法表達此種跨 root 邊界 entry,故嚴格阻擋);若解析結果為空,顯示「No files selected.」以 exit 1 退出且不修改剪貼簿內容(符合決策 T-11)。狀態:規劃(CLI 於階段 4 遷移後生效)。
 
 
 ## 2. 線上格式的不變量(摘要)
@@ -119,7 +133,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 - **路徑片段含控制字元(0x00–0x1F)或 `<>:"|?*` 時拒絕**,所有平台一致。
   U+0085 / U+2028 / U+2029 在 Windows 合法,允許。
 - 對不到任何 root 的絕對路徑:**寫入**時照原樣放在主 root 底下(拿掉磁碟機冒號、保留每一層目錄),
-  **刪除**時一律拒絕。絕不依路徑尾端去猜測目標。
+  **刪除**時一律拒絕。絕不依路徑尾端去猜測目標。(CLI 遷移至統一引擎[階段 6]後改為跳過 `UNRESOLVED_PATH`,不寫入怪目錄,見「已知且接受的差異」)。
 - containment 以**真實解析**(realpath)判斷:解析路徑或其最深的已存在祖先目錄。
   祖先的往上走不設上限,只限制 symlink 的跳轉次數。
 - placeholder(`// File skipped: …` / `// Unable to read file content` / `// Error reading file content`)
