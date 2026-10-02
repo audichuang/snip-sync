@@ -173,6 +173,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 3 — CLI `--commits` 改走 transfer(最便宜,先上)
 
+狀態:已完成(CLI 呼叫 plan_commit_export_with 套用 32 MiB 上限)
+
 - `transfer::plan_commit_export(git, range, last)`(`transfer.rs:2249`)已與 CLI 現在做的一樣;改呼叫它,並套 D6 的上限。
 - 唯一差異:不連續範圍回 `TransferError::DiscontinuousCommits`,CLI 對應到原本的「not contiguous」訊息。
 - 測試:`crates/cli/tests/cli.rs` 的 commit 測試(:155–169, :301–552)不得變;新增超過上限 exit 1。

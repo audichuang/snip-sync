@@ -15,12 +15,14 @@ use snip_core::clip::{self, Mode};
 use snip_core::commits::{self, CommitCopySummary, CommitsPayload};
 use snip_core::copy::{collect_copy_files, CopyResult};
 use snip_core::format::{extract_source_root, parse_clipboard};
+use snip_core::gitrun::RunOptions;
 use snip_core::gitsrc::{collect_payload, Git, GitSource};
 use snip_core::restore::{
 	apply_restore_base, execute_restore_plan, is_relative, plan_restore,
 	suggest_restore_base, FsProbe, RestorePlan, RestoreSelection,
 };
 use snip_core::settings::Settings;
+use snip_core::transfer::{plan_commit_export_with, CLIPBOARD_PAYLOAD_MAX};
 
 mod remote;
 
@@ -403,21 +405,21 @@ fn copy_commits(
 		(range, _) => range.map(|r| split_range(&r)),
 	};
 	let git = Git::open(repo).map_err(|e| e.to_string())?;
-	let shas = match range {
-		Some((a, b)) => commits::select_range(&git, &a, &b),
-		None => commits::select_last(&git, count.unwrap_or_default()),
-	}
+	let export = plan_commit_export_with(
+		&git,
+		range.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+		count,
+		&RunOptions::default(),
+		CLIPBOARD_PAYLOAD_MAX,
+	)
 	.map_err(|e| e.to_string())?;
-	let payload =
-		commits::copy_commits(&git, &shas).map_err(|e| e.to_string())?;
-	let text = commits::to_clipboard_text(&payload);
-	emit(&text, stdout)?;
+	emit(&export.text, stdout)?;
 	let CommitCopySummary {
 		commit_count,
 		file_count,
 		chars,
 		not_copied_count,
-	} = commits::copy_summary(&payload, &text);
+	} = commits::copy_summary(&export.payload, &export.text);
 	let not_copied = if not_copied_count > 0 {
 		format!(", {not_copied_count} file(s) not copied")
 	} else {
@@ -427,7 +429,7 @@ fn copy_commits(
 		"{commit_count} commit(s) copied: {file_count} file(s), {} chars{not_copied}.",
 		grouped(chars)
 	);
-	print_not_copied(&payload);
+	print_not_copied(&export.payload);
 	Ok(())
 }
 

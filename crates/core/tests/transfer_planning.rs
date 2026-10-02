@@ -41,11 +41,11 @@ use snip_core::restore::{
 use snip_core::settings::{FilterAction, FilterRule, FilterType, Settings};
 use snip_core::transfer::{
 	changed_items, detect_clipboard_prefixes, expand_folder_items,
-	plan_commit_export, plan_commit_export_exact, plan_export, plan_import,
-	plan_import_with, selection_from_paths, validate_commit_selection,
-	CanonicalRootId, CommitReplayPreview, DestinationFreshnessSnapshot,
-	ExportItem, ExportSelection, ImportMapping, SourceFreshnessSnapshot,
-	SourceKind, TransferError, CLIPBOARD_PAYLOAD_MAX,
+	plan_commit_export, plan_commit_export_exact, plan_commit_export_with,
+	plan_export, plan_import, plan_import_with, selection_from_paths,
+	validate_commit_selection, CanonicalRootId, CommitReplayPreview,
+	DestinationFreshnessSnapshot, ExportItem, ExportSelection, ImportMapping,
+	SourceFreshnessSnapshot, SourceKind, TransferError, CLIPBOARD_PAYLOAD_MAX,
 };
 
 struct TestRepo {
@@ -5410,4 +5410,123 @@ fn test_parity_working_gitlink_absent_and_present_dir_and_subdir() {
 	let plan_unstaged = plan_export(&sel_unstaged, &settings, None).unwrap();
 	assert_eq!(plan_unstaged.copied_file_count, 1);
 	assert_eq!(plan_unstaged.files[0].path, "inner.txt");
+}
+
+#[test]
+fn test_plan_commit_export_with() {
+	let repo = TestRepo::new("commit-export-with");
+	repo.write("a.txt", "alpha\n");
+	let c1 = repo.commit("commit 1");
+	repo.write("b.txt", "beta\n");
+	let _c2 = repo.commit("commit 2");
+	repo.write("c.txt", "gamma\n");
+	let c3 = repo.commit("commit 3");
+	let git = repo.open();
+
+	// (a) under cap, export.text is byte-identical to commits::to_clipboard_text(&plan_commit_export(...).unwrap())
+	// for both range and last forms
+	let legacy_range =
+		plan_commit_export(&git, Some((&c1, &c3)), None).unwrap();
+	let expected_range_text =
+		snip_core::commits::to_clipboard_text(&legacy_range);
+	let export_range = plan_commit_export_with(
+		&git,
+		Some((&c1, &c3)),
+		None,
+		&RunOptions::default(),
+		CLIPBOARD_PAYLOAD_MAX,
+	)
+	.unwrap();
+	assert_eq!(export_range.text, expected_range_text);
+	assert_eq!(export_range.payload, legacy_range);
+
+	let legacy_last = plan_commit_export(&git, None, Some(2)).unwrap();
+	let expected_last_text =
+		snip_core::commits::to_clipboard_text(&legacy_last);
+	let export_last = plan_commit_export_with(
+		&git,
+		None,
+		Some(2),
+		&RunOptions::default(),
+		CLIPBOARD_PAYLOAD_MAX,
+	)
+	.unwrap();
+	assert_eq!(export_last.text, expected_last_text);
+	assert_eq!(export_last.payload, legacy_last);
+
+	// (b) discontinuous range -> TransferError::DiscontinuousCommits
+	repo.git(&["checkout", "-b", "side"]);
+	repo.write("side.txt", "side\n");
+	let side_tip = repo.commit("side commit");
+	repo.git(&["checkout", "main"]);
+	repo.write("d.txt", "delta\n");
+	let _ = repo.commit("commit 4");
+	repo.git(&["merge", "side", "-m", "merge side"]);
+	let main_tip = repo.git(&["rev-parse", "HEAD"]);
+
+	let err_discontinuous = plan_commit_export_with(
+		&git,
+		Some((&side_tip, &main_tip)),
+		None,
+		&RunOptions::default(),
+		CLIPBOARD_PAYLOAD_MAX,
+	)
+	.unwrap_err();
+	assert!(
+		matches!(
+			err_discontinuous,
+			TransferError::DiscontinuousCommits {
+				ref base,
+				ref tip,
+				..
+			} if base == &side_tip && tip == &main_tip
+		),
+		"expected DiscontinuousCommits, got: {err_discontinuous:?}"
+	);
+
+	// (c) tiny cap (e.g. 64) -> TransferError::Commit(CommitError::PayloadLimit{..})
+	let err_capped = plan_commit_export_with(
+		&git,
+		None,
+		Some(1),
+		&RunOptions::default(),
+		64,
+	)
+	.unwrap_err();
+	assert!(
+		matches!(
+			err_capped,
+			TransferError::Commit(
+				snip_core::commits::CommitError::PayloadLimit { limit: 64, .. }
+			)
+		),
+		"expected PayloadLimit with limit 64, got: {err_capped:?}"
+	);
+
+	// (d) neither/both of range and last -> EmptySelection
+	let err_neither = plan_commit_export_with(
+		&git,
+		None,
+		None,
+		&RunOptions::default(),
+		CLIPBOARD_PAYLOAD_MAX,
+	)
+	.unwrap_err();
+	assert!(
+		matches!(err_neither, TransferError::EmptySelection),
+		"expected EmptySelection, got: {err_neither:?}"
+	);
+
+	let err_both = plan_commit_export_with(
+		&git,
+		Some((&c1, &c3)),
+		Some(2),
+		&RunOptions::default(),
+		CLIPBOARD_PAYLOAD_MAX,
+	)
+	.unwrap_err();
+	assert!(
+		matches!(err_both, TransferError::EmptySelection),
+		"expected EmptySelection, got: {err_both:?}"
+	);
 }

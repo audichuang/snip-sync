@@ -2449,13 +2449,12 @@ pub fn validate_commit_selection(repos: &[&Git]) -> Result<(), TransferError> {
 	Ok(())
 }
 
-/// Plans and extracts commits along a contiguous first-parent chain.
-pub fn plan_commit_export(
+fn select_commit_shas(
 	git: &Git,
 	range: Option<(&str, &str)>,
 	last: Option<usize>,
-) -> Result<CommitsPayload, TransferError> {
-	let shas = match (range, last) {
+) -> Result<Vec<String>, TransferError> {
+	match (range, last) {
 		(Some((base, tip)), None) => commits::select_range(git, base, tip)
 			.map_err(|e| match e {
 				CommitError::Discontinuous {
@@ -2470,14 +2469,38 @@ pub fn plan_commit_export(
 					first_parent,
 				},
 				other => TransferError::Commit(other),
-			})?,
+			}),
 		(None, Some(n)) => {
-			commits::select_last(git, n).map_err(TransferError::Commit)?
+			commits::select_last(git, n).map_err(TransferError::Commit)
 		}
-		_ => return Err(TransferError::EmptySelection),
-	};
+		_ => Err(TransferError::EmptySelection),
+	}
+}
 
+/// Plans and extracts commits along a contiguous first-parent chain.
+pub fn plan_commit_export(
+	git: &Git,
+	range: Option<(&str, &str)>,
+	last: Option<usize>,
+) -> Result<CommitsPayload, TransferError> {
+	let shas = select_commit_shas(git, range, last)?;
 	commits::copy_commits(git, &shas).map_err(TransferError::Commit)
+}
+
+/// [`plan_commit_export`] with the caller's runner options and a hard cap on
+/// the clipboard document.
+///
+/// Over cap => [`CommitError::PayloadLimit`] (never truncate).
+pub fn plan_commit_export_with(
+	git: &Git,
+	range: Option<(&str, &str)>,
+	last: Option<usize>,
+	opts: &RunOptions,
+	max_serialized_bytes: usize,
+) -> Result<CommitExport, TransferError> {
+	let shas = select_commit_shas(git, range, last)?;
+	commits::copy_commits_with(git, &shas, opts, max_serialized_bytes)
+		.map_err(TransferError::Commit)
 }
 
 /// Exports exactly the commits in `selected`, which must be the contiguous

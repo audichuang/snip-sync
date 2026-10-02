@@ -550,3 +550,27 @@ fn paste_commits_apply_replays_over_a_directory_an_earlier_commit_empties() {
 	);
 	assert_eq!(fs::read_to_string(dst.join("d")).unwrap(), "now a file\n");
 }
+
+#[test]
+fn copy_commits_over_payload_cap_exits_one() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	fs::create_dir_all(&src).unwrap();
+	init_repo(&src);
+	let chunk = "0123456789abcdef\n";
+	let repeats = (33 * 1024 * 1024) / chunk.len() + 1;
+	fs::write(src.join("big.txt"), chunk.repeat(repeats)).unwrap();
+	commit(&src, "oversize commit", "2024-01-01T00:00:00+00:00");
+
+	let src_s = src.to_str().unwrap();
+	let out = snip(
+		&["--repo", src_s, "copy", "--commits", "-n", "1", "--stdout"],
+		None,
+	);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	let err = text(&out.stderr);
+	assert!(
+		err.contains("33554432"),
+		"expected limit (33554432) mentioned in error, got: {err}"
+	);
+}
