@@ -136,6 +136,10 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 ## 3. 還原的安全規則(摘要)
 
+- 貼上流程(CLI 與 GUI)一律經由 `plan_import_with` 執行,在單項條目規則之外額外加入整批防護(見「已知且接受的差異」):
+  - 目標衝突防護(`TargetCollision`):兩筆 entry 指向同一個實體檔案(包含大小寫別名與 symlink 別名)時整批拒絕執行。
+  - 目的端新鮮度檢查(`StaleDestination`):套用前重新驗證目的端,若目標檔案內容或儲存庫 HEAD/index 在預覽產生後已變動,套用時拒絕並要求重新預覽。
+  - 特殊檔案防護(`SpecialFile`):目的端路徑若為目錄、FIFO 等非一般檔案,整批拒絕執行。
 - **路徑片段含控制字元(0x00–0x1F)或 `<>:"|?*` 時拒絕**,所有平台一致。
   U+0085 / U+2028 / U+2029 在 Windows 合法,允許。
 - 對不到任何 root 的絕對路徑:**寫入**時照原樣放在主 root 底下(拿掉磁碟機冒號、保留每一層目錄),
@@ -150,6 +154,12 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 
 ## 4. 複製的規則(摘要)
 
+- 檔案模式複製規則由 CLI 與 GUI 共用(`expand_folder_items` / `plan_export_expanding`):
+  - `.git` 與巢狀儲存庫一律修剪排除,不走訪也不納入複製。
+  - 指向 root 外部的 symlink 與斷掉的 symlink 逐檔略過。
+  - FIFO、socket 與裝置等非一般檔案逐檔略過。
+  - 統一受 32 MiB payload 複製上限(`CLIPBOARD_PAYLOAD_MAX`)限制,超出時明確報錯絕不默默截斷。
+  - 若選取或走訪結果為空,顯示「No files selected.」以 exit 1 退出且不修改剪貼簿內容。
 - 非 UTF-8 檔案**不複製**(嚴格解碼,失敗就跳過並計入通知),UTF-16 含 BOM 也一樣。
 - 嚴格 UTF-8 解碼**保留**開頭的 BOM。
 - merge commit 的檔案集是**與每一個 parent 的 diff 的聯集**(依路徑去重)。

@@ -153,10 +153,24 @@ snip copy --working | --staged
 snip copy --commit <sha> | --range <a>..<b>
 snip copy --commits -n <N> | --commits <a>..<b>
 snip paste --dry-run
-snip paste --apply [--overwrite | --skip-existing]
+snip paste --apply [--overwrite | --skip-existing] [--adjust-paths]
 ```
 
-CLI 與 App 呼叫同一組核心函式,行為完全相同。
+- 貼上 commit payload 時,`--skip-existing` 與 `--adjust-paths` 不支援,指定時以 exit 2 退出(見 4.3)。
+- 貼上 commit payload 時,若目標檔案已存在需明確指定 `--overwrite`,未指定時以 exit 2 退出(見 4.3)。
+
+CLI 與 App 呼叫同一組核心入口函式:
+- 複製／匯出:檔案模式經由 `transfer::plan_export_expanding` 搭配 `selection_from_paths` 展開路徑;Git 來源(`--working`、`--staged`、`--commit`、`--range`)經由 `transfer::changed_items` 搭配 `SourceKind::{Working,Unstaged,Staged,Commit,Range}`,兩者皆交由 `transfer::plan_export_with` 產出 payload;`--commits` 則呼叫 `transfer::plan_commit_export_with`。
+- 貼上檔案:經由 `transfer::plan_import_with` 進行規劃與新鮮度檢查,並呼叫 `TransferImportPlan::apply` 套用(搭配 `ImportMapping`,CLI `--adjust-paths` 由 `ImportMapping::from_restore_base` 轉換)。
+- 貼上 commits:經由 `transfer::CommitReplayPreview`(流程包含 `capture` / `plan` / `revalidate` / `apply`)。
+- 配對清單:經由 `snip_remote::WorkerStore`(以及 `TrustedMasterStore`)。
+- 大小上限:統一由 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)限制。
+
+CLI 與 App 行為的差異僅在 UI(CLI 為旗標與文字輸出,App 為預覽視窗與核取方塊),以及兩項誠實的例外:
+1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 全域套用;GUI 則維持逐 prefix 的選擇(D4)。
+2. 各 UI 選擇呈現的內容(CLI 印出計畫與摘要文字,GUI 提供檔案清單、diff 與時間軸預覽);兩邊的規劃與驗證結果相同。
+
+舊的獨立引擎(`copy::collect_copy_files`、`gitsrc::collect_payload`、`restore::plan_restore`/`execute_restore_plan`)已降級為測試 oracle 或單筆規劃器,CLI 不再將其作為整體引擎呼叫(其中 `plan_restore` 仍作為 `plan_import_with` 內部的單檔規劃器,`commits::*` 的解析與摘要輔助函式亦仍在使用)。
 
 ## 6. 技術決策(摘要)
 

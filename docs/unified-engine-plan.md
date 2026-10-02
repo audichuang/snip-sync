@@ -1,6 +1,6 @@
 # CLI 與 App 共用同一條複製／貼上引擎
 
-狀態:**實作中**。第 3 節 D1–D7 由使用者於 2026-10-02 全部照建議拍板;D8–D10 於階段 0 review 後(同日)另行拍板。
+狀態:**階段 1–8 已實作(於 branch feature/unified-engine)**。第 3 節 D1–D7 由使用者於 2026-10-02 全部照建議拍板;D8–D10 於階段 0 review 後(同日)另行拍板。
 
 目標一句話:`snip` CLI 與原生 App 的複製、貼上、遠端配對,底層都走 `snip-core`／`snip-remote` 的**同一組函式**。兩邊的差別只剩 UI(CLI 是旗標＋文字輸出,App 是預覽＋勾選),修一個 bug 兩邊同時好。這也是讓 `docs/spec.md` §5.2「CLI 與 App 呼叫同一組核心函式,行為完全相同」重新成立。
 
@@ -8,7 +8,7 @@
 
 ## 1. 現況與證據
 
-### 1.1 兩套引擎
+### 1.1 兩套引擎(遷移前的現況)
 
 | 動作 | CLI 走的(舊引擎,TS 移植) | App 走的(`transfer`) |
 |---|---|---|
@@ -25,7 +25,7 @@
 
 Hindsight 記錄:2026-09-30 架構深化時「合併兩條 export pipeline」被明確列為**延後**項目。本計畫就是把它接回來。
 
-### 1.2 CLI 因此留下的問題(code review 2026-10-02,xhigh)
+### 1.2 CLI 因此留下的問題(code review 2026-10-02,xhigh,遷移前的現況)
 
 標 ✅ 的已用 `target/debug/snip` 實際重現;標 📖 的是讀程式碼推得。
 
@@ -247,6 +247,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 - `docs/porting-notes.md` §3(還原安全規則)、§4(複製規則)更新。
 - `AGENTS.md`「Where a test goes」補一行:CLI 行為與輸出 → `crates/cli/tests/cli.rs`;位元組往返與 TS 相容 → `crates/cli/tests/e2e.rs`。
 - 只改 `.md`,不需 preflight。
+
+狀態:已完成(只改 .md)。
 
 ---
 
