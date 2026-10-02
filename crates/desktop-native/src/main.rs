@@ -311,6 +311,7 @@ mod multi_log;
 pub mod paste;
 mod reader;
 mod recent;
+pub mod remote;
 mod selector;
 pub mod syntax;
 mod text_input;
@@ -1322,6 +1323,10 @@ pub struct WorkbenchModel {
 	pub log_commit_root: Option<PathBuf>,
 	/// A Replace load waited for discovery to reach the picked repositories.
 	pub log_deferred: bool,
+	/// Remote-node mode: paired workers and an open remote workspace.
+	pub remote: remote::MasterState,
+	pub remote_addr_input: Entity<TextInput>,
+	pub remote_code_input: Entity<TextInput>,
 }
 
 /// Identity of a shown preview's text, as `reader.rs` compares it.
@@ -1497,6 +1502,20 @@ impl WorkbenchModel {
 			},
 		)
 		.detach();
+		let remote_addr_input = cx.new(|cx| {
+			TextInput::new(i18n::t("remote_addr_placeholder", loc), 71, cx)
+		});
+		let remote_code_input = cx.new(|cx| {
+			TextInput::new(i18n::t("remote_code_placeholder", loc), 72, cx)
+		});
+		for input in [&remote_addr_input, &remote_code_input] {
+			cx.subscribe(input, |this, _, ev: &InputEvent, cx| {
+				if matches!(ev, InputEvent::Submit) {
+					this.pair_remote_worker(cx);
+				}
+			})
+			.detach();
+		}
 		cx.on_release(|this, _| {
 			this.lifecycle.cancel_cancellable();
 			if e2e_on() {
@@ -1672,6 +1691,12 @@ impl WorkbenchModel {
 			log_feeds: Vec::new(),
 			log_commit_root: None,
 			log_deferred: false,
+			remote: remote::MasterState {
+				workers: remote::load_workers(),
+				..Default::default()
+			},
+			remote_addr_input,
+			remote_code_input,
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
@@ -2597,6 +2622,10 @@ impl WorkbenchModel {
 			lifecycle::Intent::OpenWorkspace(path) => {
 				self.finish_open(path, cx)
 			}
+			lifecycle::Intent::OpenRemoteWorkspace(target) => {
+				let (worker, workspace) = *target;
+				self.finish_open_remote(worker, workspace, cx)
+			}
 		}
 	}
 
@@ -2639,6 +2668,7 @@ impl WorkbenchModel {
 		self.scan_cancel = None;
 		self.copy_cancel = None;
 		release_path(&mut self.workspace_root);
+		self.remote.session = None;
 		self.clear_workspace_inputs(cx);
 	}
 
@@ -2744,6 +2774,7 @@ impl WorkbenchModel {
 
 	fn finish_close(&mut self, cx: &mut Context<Self>) {
 		self.release_workspace_state(cx);
+		remote::worker_set_open(None);
 		self.workspace_open = false;
 		self.workspace_menu = true;
 		self.workspace_picker = false;
@@ -2765,6 +2796,7 @@ impl WorkbenchModel {
 		}
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
+		remote::worker_set_open(Some(&path));
 		recent::remember(&mut self.recent_workspaces, &path);
 		self.workspace_open = true;
 		self.workspace_menu = false;
@@ -2882,6 +2914,10 @@ impl WorkbenchModel {
 
 	pub fn reload_repos(&mut self, cx: &mut Context<Self>) {
 		if !self.accepting_work() {
+			return;
+		}
+		if self.remote.session.is_some() {
+			self.reload_remote_tree(cx);
 			return;
 		}
 		self.discovery_errors.clear();
@@ -3442,6 +3478,7 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.tree_cancel);
 		let ws_gen = self.lifecycle.generation();
 		let hold = self.e2e_tree_hold.clone();
+		let remote = self.remote_target();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -3457,10 +3494,17 @@ impl WorkbenchModel {
 					}
 					let cancel_bg = cancel.clone();
 					let hold_bg = hold.clone();
+					let remote_bg = remote.clone();
 					let result = bg
 						.spawn(async move {
-							let result =
-								crate::tree::execute_tree_io(io, &cancel_bg);
+							let result = match remote_bg {
+								Some((client, ws)) => {
+									remote::tree_io(&client, &ws, io)
+								}
+								None => {
+									crate::tree::execute_tree_io(io, &cancel_bg)
+								}
+							};
 							hold_tree_read(hold_bg.as_deref());
 							result
 						})
@@ -3593,7 +3637,10 @@ impl WorkbenchModel {
 	/// workspace repo is open (its `file_tree` is the tree), and when the
 	/// workspace sits strictly inside a repo: that repo's tree shows it.
 	fn ensure_ws_tree(&mut self, cx: &mut Context<Self>) {
-		if self.ws_tree.is_some() || !self.accepting_work() {
+		if self.ws_tree.is_some()
+			|| !self.accepting_work()
+			|| self.remote.session.is_some()
+		{
 			return;
 		}
 		// Git reports resolved toplevels; root the tree the same way so a
@@ -3656,6 +3703,12 @@ impl WorkbenchModel {
 		let Some(root) = self.ws_root() else {
 			return;
 		};
+		// A remote tree previews; selecting for copy is a later slice.
+		if self.remote.session.is_some()
+			&& matches!(cmd, TreeCommand::ToggleSelect(_))
+		{
+			return;
+		}
 		if let TreeCommand::ToggleSelect(key) = &cmd {
 			let Some(paths) = self
 				.ws_tree
@@ -3707,7 +3760,7 @@ impl WorkbenchModel {
 		rels: &[String],
 		cx: &mut Context<Self>,
 	) {
-		if !self.accepting_work() {
+		if !self.accepting_work() || self.remote.session.is_some() {
 			return;
 		}
 		let tree = if ws { &self.ws_tree } else { &self.file_tree };
@@ -4151,6 +4204,7 @@ impl WorkbenchModel {
 		};
 		let job_cancel = (!fs_only).then(|| cancel.clone());
 		let delay = self.e2e_read_delay;
+		let remote = self.remote_target();
 		if e2e_on() {
 			app_log!("[APP:PREVIEW_LOADING: {file_path}]");
 		}
@@ -4163,8 +4217,18 @@ impl WorkbenchModel {
 			let for_bg = file_path.clone();
 			let result = bg
 				.spawn(async move {
-					let result =
-						read_preview(&repo_root, &for_bg, &source, cancel);
+					let result = match remote {
+						Some((client, ws)) if fs_only => {
+							remote::read_preview(&client, &ws, &for_bg)
+						}
+						Some(_) => {
+							Err(i18n::t("remote_unsupported", Locale::En)
+								.to_string())
+						}
+						None => {
+							read_preview(&repo_root, &for_bg, &source, cancel)
+						}
+					};
 					if let Some(delay) = delay {
 						std::thread::sleep(delay);
 					}
@@ -4811,6 +4875,11 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
+		if self.remote.session.is_some() {
+			self.set_status("remote_unsupported", []);
+			cx.notify();
+			return;
+		}
 		if self.is_copying {
 			app_log!("[APP:COPY_BUSY]");
 			return;
@@ -5280,6 +5349,11 @@ impl WorkbenchModel {
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
 		if self.refuse_while_applying("preview", cx) {
+			return;
+		}
+		if self.remote.session.is_some() {
+			self.set_status("remote_unsupported", []);
+			cx.notify();
 			return;
 		}
 		if !self.workspace_open {
@@ -5951,10 +6025,13 @@ fn startup_workspace(arg: Option<PathBuf>) -> Option<PathBuf> {
 		.then_some(cwd)
 }
 
-fn parse_cli_args() -> (Option<PathBuf>, String, Option<PathBuf>) {
+type CliArgs = (Option<PathBuf>, String, Option<PathBuf>, remote::WorkerCli);
+
+fn parse_cli_args() -> CliArgs {
 	let mut workspace = None;
 	let mut mode = "normal".to_string();
 	let mut restore_dir = None;
+	let mut worker = remote::WorkerCli::default();
 
 	let args: Vec<String> = std::env::args().collect();
 
@@ -5982,6 +6059,10 @@ fn parse_cli_args() -> (Option<PathBuf>, String, Option<PathBuf>) {
 				println!("  --workspace <DIR>    Set workspace folder containing repos");
 				println!("  --mode <MODE>        Run mode: normal, idle, overview, preview");
 				println!("  --restore-dir <DIR>  Target folder for paste restore operations");
+				println!("  --worker             Serve shared workspaces to paired masters (remote-node mode)");
+				println!("  --listen <ADDR:PORT> Worker listen address [default: {}]", remote::DEFAULT_LISTEN);
+				println!("  --share <DIR>        Folder the worker shares (repeatable); the open workspace is shared too");
+				println!("  --headless           With --worker: no window; print the pairing code and serve until stopped");
 				println!("  -V, --version        Print version information");
 				println!("  -h, --help           Print help");
 				std::process::exit(0);
@@ -6027,6 +6108,29 @@ fn parse_cli_args() -> (Option<PathBuf>, String, Option<PathBuf>) {
 					std::process::exit(2);
 				}
 			}
+			"--worker" => worker.enabled = true,
+			"--headless" => worker.headless = true,
+			"--listen" => {
+				match args.get(i + 1).and_then(|a| a.parse().ok()) {
+					Some(addr) => worker.listen = Some(addr),
+					None => {
+						eprintln!(
+							"Error: --listen requires an address such as 100.64.0.1:47821"
+						);
+						std::process::exit(2);
+					}
+				}
+				i += 1;
+			}
+			"--share" => {
+				if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+					worker.shares.push(PathBuf::from(&args[i + 1]));
+					i += 1;
+				} else {
+					eprintln!("Error: --share requires a directory argument");
+					std::process::exit(2);
+				}
+			}
 			unknown => {
 				eprintln!("Error: unrecognized argument: {unknown}");
 				std::process::exit(2);
@@ -6034,8 +6138,16 @@ fn parse_cli_args() -> (Option<PathBuf>, String, Option<PathBuf>) {
 		}
 		i += 1;
 	}
+	if !worker.enabled
+		&& (worker.headless
+			|| worker.listen.is_some()
+			|| !worker.shares.is_empty())
+	{
+		eprintln!("Error: --headless, --listen and --share need --worker");
+		std::process::exit(2);
+	}
 
-	(workspace, mode, restore_dir)
+	(workspace, mode, restore_dir, worker)
 }
 
 fn key_bindings() -> Vec<KeyBinding> {
@@ -6130,8 +6242,25 @@ fn key_bindings() -> Vec<KeyBinding> {
 }
 
 fn main() {
-	let (workspace, mode, restore_dir) = parse_cli_args();
+	let (workspace, mode, restore_dir, worker) = parse_cli_args();
+	if worker.headless {
+		remote::run_headless(&worker);
+	}
 	let workspace = startup_workspace(workspace);
+	// Before the window and independent of it: the listener stays up across
+	// workspace switches and a closed window.
+	if worker.enabled {
+		let listen = worker.listen.unwrap_or_else(|| {
+			remote::DEFAULT_LISTEN.parse().expect("a socket address")
+		});
+		match remote::start_worker(listen, &worker.shares, workspace.as_deref())
+		{
+			Ok(addr) => {
+				app_log!("[APP:REMOTE_WORKER: state=listening addr={addr}]")
+			}
+			Err(err) => eprintln!("snip-sync worker: cannot listen: {err}"),
+		}
+	}
 	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
@@ -6273,6 +6402,110 @@ mod tests {
 				return None;
 			}
 			Some(CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner))
+		}
+
+		/// Remote-node mode end to end in one process: a real worker on
+		/// loopback, the pairing form, the workspace list, the Project tree
+		/// and a file preview, all read through the worker. Every socket has
+		/// a timeout (snip-remote), so a hang fails rather than blocks.
+		#[gpui::test]
+		fn remote_workspace_pairs_lists_and_previews_through_a_worker(
+			cx: &mut TestAppContext,
+		) {
+			use crate::tree::{NodeKey, TreeCommand};
+			use snip_core::transfer::SourceKind;
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(shared.join("src")).unwrap();
+			fs::write(shared.join("src/main.rs"), "fn main() {}\n").unwrap();
+			fs::write(shared.join("README.md"), "# remote\n").unwrap();
+			let id = snip_remote::Identity::generate().unwrap();
+			let worker = snip_remote::Worker::start(
+				"127.0.0.1:0".parse().unwrap(),
+				&id,
+				snip_remote::WorkerOptions {
+					name: "win-worker".into(),
+					trust_file: None,
+				},
+			)
+			.unwrap();
+			assert!(worker.set_roots(std::slice::from_ref(&shared)).is_empty());
+			let code = worker.open_pairing();
+			let addr = worker.local_addr().to_string();
+
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(None, None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			model.update(cx, |m, cx| {
+				m.workspace_menu = true;
+				m.show_remote_pairing(cx);
+				m.remote_addr_input
+					.update(cx, |i, cx| i.set_text(&addr, cx));
+				m.remote_code_input
+					.update(cx, |i, cx| i.set_text(&code, cx));
+				m.pair_remote_worker(cx);
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.remote.message, None);
+				assert_eq!(m.remote.workers.len(), 1);
+				assert_eq!(m.remote.workers[0].name, "win-worker");
+				let Some((0, Some(Ok(items)))) = &m.remote.browse else {
+					panic!("workspaces not listed: {:?}", m.remote.browse);
+				};
+				assert_eq!(items.len(), 1);
+				assert_eq!(items[0].name, "shared");
+			});
+
+			model.update(cx, |m, cx| m.open_remote_workspace(0, 0, cx));
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.workspace_open && !m.workspace_menu);
+				assert!(m.repos.is_empty(), "no local discovery");
+				let tree = m.ws_tree.as_ref().expect("remote tree");
+				assert!(tree.is_loaded, "root listed: {tree:?}");
+				let names: Vec<_> =
+					tree.children.iter().map(|c| c.name.as_str()).collect();
+				assert_eq!(names, ["src", "README.md"]);
+			});
+
+			model.update(cx, |m, cx| {
+				m.dispatch_ws_tree(
+					Some(TreeCommand::Expand(NodeKey::from_utf8_rel("src"))),
+					cx,
+				);
+			});
+			settle(cx);
+			model.update(cx, |m, cx| {
+				let tree = m.ws_tree.as_ref().unwrap();
+				let src = &tree.children[0];
+				assert!(src.is_loaded, "src listed: {src:?}");
+				assert_eq!(src.children[0].rel_path, "src/main.rs");
+				let root = m.ws_root();
+				m.select_file_in(root, "src/main.rs", SourceKind::File, cx);
+			});
+			settle(cx);
+			model.update(cx, |m, cx| {
+				let p = m.preview.as_ref().expect("remote preview");
+				assert_eq!(&*p.text, "fn main() {}\n");
+				assert_eq!(m.preview_error, None);
+				// Copy and paste stay local; a remote workspace refuses them.
+				m.trigger_paste_preview(cx);
+				assert_eq!(m.status.key, "remote_unsupported");
+			});
+
+			// The worker unshares the folder: the next read is refused.
+			worker.set_roots(&[]);
+			model.update(cx, |m, cx| {
+				let root = m.ws_root();
+				m.select_file_in(root, "README.md", SourceKind::File, cx);
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.preview_error.is_some(), "refused read shown");
+			});
 		}
 
 		#[gpui::test]

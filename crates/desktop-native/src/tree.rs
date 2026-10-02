@@ -430,7 +430,7 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 			result.has_more = true;
 			break;
 		}
-		let node = build_node(&entry, &io.dir, &io.key, io.depth);
+		let node = build_node(&entry, &io.dir, &io.key, io.depth, None);
 		let cost = node.retained_bytes();
 		if cost > MAX_RETAINED_WORKING_TREE_BYTES {
 			result.skipped_oversize += 1;
@@ -469,11 +469,85 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 	result
 }
 
+/// One child of a directory listed somewhere else (a remote worker).
+pub struct ListedChild {
+	pub name: String,
+	/// False when the worker's name was not UTF-8 and `name` is lossy: the
+	/// row is shown but cannot be addressed.
+	pub utf8: bool,
+	pub directory: bool,
+	pub nested_repo: bool,
+}
+
+/// [`execute_tree_io`] for a directory listed by someone else: the whole
+/// listing arrives at once, so there is no cursor to keep and no page to
+/// continue. Children are admitted under the same byte budget.
+pub fn listed_tree_result(
+	io: TreeIo,
+	listed: Result<(Vec<ListedChild>, bool), String>,
+) -> TreeIoResult {
+	let mut result = TreeIoResult {
+		key: io.key.clone(),
+		epoch: io.epoch,
+		base: io.base.clone(),
+		kind: io.kind,
+		children: Vec::new(),
+		scan: None,
+		held: None,
+		has_more: false,
+		error: None,
+		truncated: false,
+		skipped_oversize: 0,
+		budget_blocked: false,
+		cancelled: false,
+		replace_children: io.replace_children,
+	};
+	let (children, truncated) = match listed {
+		Ok(listed) => listed,
+		Err(err) => {
+			result.error = Some(err);
+			return result;
+		}
+	};
+	result.truncated = truncated;
+	let mut room = io.byte_budget;
+	for child in children {
+		let entry = ScanEntry {
+			name: child.name.into(),
+			directory: child.directory,
+			symlink: false,
+		};
+		let mut node = build_node(
+			&entry,
+			&io.dir,
+			&io.key,
+			io.depth,
+			Some(child.nested_repo),
+		);
+		if !child.utf8 {
+			node.is_valid_utf8 = false;
+			node.rel_path = String::new();
+			node.read_error = Some("non-UTF-8 filename: unselectable".into());
+		}
+		let cost = node.retained_bytes();
+		if cost > room {
+			result.truncated = true;
+			break;
+		}
+		room -= cost;
+		result.children.push(node);
+	}
+	result
+}
+
+/// `nested`: whether the entry is a repo of its own, when the caller knows
+/// (a remote listing); `None` looks on this machine's disk.
 fn build_node(
 	entry: &ScanEntry,
 	dir: &Path,
 	parent: &NodeKey,
 	depth: usize,
+	nested: Option<bool>,
 ) -> FileTreeNode {
 	let key = parent.child(&entry.name);
 	let utf8_name = entry.utf8_name().map(str::to_string);
@@ -506,7 +580,7 @@ fn build_node(
 		rel_path,
 		full_path: PathBuf::new(),
 		is_dir,
-		is_nested_repo: is_dir && nested_git(&full),
+		is_nested_repo: is_dir && nested.unwrap_or_else(|| nested_git(&full)),
 		is_expanded: false,
 		is_loaded: false,
 		is_truncated: false,
@@ -1232,7 +1306,7 @@ mod tests {
 			symlink: false,
 		};
 		tree.children
-			.push(build_node(&entry, root, &NodeKey::root(), 1));
+			.push(build_node(&entry, root, &NodeKey::root(), 1, None));
 		tree
 	}
 

@@ -55,6 +55,37 @@ xattr -cr /Applications/snip-sync.app
 - 完全雙向，支援 macOS、Windows、Linux。可以打開單一 repo，也可以打開內含多個 repo 的資料夾。
 - 不處理傳輸通道、不做分段與雜湊、不偵測衝突、不保留 commit hash、不做自動更新。
 
+## 遠端節點(master／worker,第一刀)
+
+讓 Mac 上的桌面 App(master)透過 Tailscale,瀏覽與預覽另一台機器(worker,例如沒接螢幕的 Windows)上的檔案。worker 只要裝 CLI `snip`。目前只能瀏覽與預覽，寫入、rename、stage、git 還沒做。規格見 [spec 第 8 節](docs/spec.md)。
+
+### 兩機 smoke test
+
+前提:兩台都登入同一個 Tailscale 網路,用 `tailscale ip -4` 查各自的 IP。Windows 防火牆要允許 `snip.exe` 在私人網路上接受連入連線。
+
+1. **worker(Windows)**:
+
+   ```powershell
+   snip worker --share D:\work\proj --listen 100.x.y.z:47821
+   ```
+
+   它會印出 `listening on …`、`fingerprint XXXX-XXXX-XXXX-XXXX` 與 `pairing code ABCD-EFGH`(10 分鐘內有效)。
+2. **master(Mac)**:打開 snip-sync,點左上角的工作區選單 →「配對新的 Worker…」。輸入 `100.x.y.z`(不輸入埠就用 47821)和配對碼,再按「配對」。
+   - 預期:選單列出 worker 的名稱,底下是它分享的 `proj`。
+3. 點 `proj`。
+   - 預期:左上角顯示 `<worker> ▸ proj`,專案樹列出 worker 上的檔案。展開資料夾、點檔案,右側出現預覽。
+   - 二進位檔顯示無法預覽;超過 1 MiB 的檔案顯示錯誤。
+4. 在遠端工作區按貼上或複製。
+   - 預期:狀態列顯示「遠端工作區目前只支援瀏覽與預覽」。
+5. 把 worker 停掉(Ctrl+C)後重新執行,印出的指紋應該不變。重開 master 的選單點 worker。
+   - 預期:不必重新配對,仍能列出工作區。
+6. 安全性檢查:
+   - 從另一台沒配對過的機器連這台 worker。預期 worker 拒絕。
+   - 在 worker 的分享資料夾裡放一個指向外面的 symlink,在 master 點它。預期預覽顯示拒絕的錯誤。
+   - 輸入錯的配對碼 5 次。預期這組碼作廢,要重新啟動 worker 取得新碼。
+
+桌面版也能當 worker:在工作區選單選「啟用 Worker 模式」,或用 `snip-desktop-native --worker [--share DIR]` 啟動。它會分享目前開著的工作區。`--worker --headless --share DIR` 不開視窗，效果等同 `snip worker`。
+
 ## 文件
 
 | 文件 | 內容 |
@@ -65,7 +96,7 @@ xattr -cr /Applications/snip-sync.app
 | [docs/native-workbench-supervision.md](docs/native-workbench-supervision.md) | 原生工作臺的交付狀態與已知限制 |
 | [docs/real-ui-operator-protocol.md](docs/real-ui-operator-protocol.md) | 真實 macOS 視窗的操作驗收：怎麼點、每一格的通過線 |
 
-各模組的說明：[core](crates/core/README.md) · [cli](crates/cli/README.md)。
+各模組的說明：[core](crates/core/README.md) · [cli](crates/cli/README.md) · [remote](crates/remote/README.md)。
 
 ## 第三方授權
 

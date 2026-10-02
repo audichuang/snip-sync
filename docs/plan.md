@@ -219,6 +219,37 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
 
 **驗收:** 從 Release 下載的安裝包能在兩台實機上安裝並完成一次完整同步。
 
+## 6.5 遠端節點模式(spec 第 8 節)
+
+- **crate**:`crates/remote`(`snip-remote`)。它不依賴 GPUI,所以 CLI(`snip worker`)與桌面 App 共用同一份 worker 程式。模組分工:
+  - `proto`:幀格式與請求／回應。
+  - `tls`:裝置身分、憑證驗證、配對證明。
+  - `worker`:監聽與處理請求。
+  - `client`:配對,以及 pin 住 worker 憑證後的呼叫。
+- **傳輸**:用 std 的阻塞 TCP 加 rustls(TLS 1.3,ring provider),不引入第二個 async runtime。rustls 與 ring 原本就經由 gpui 連進桌面版。每個 socket 都設讀寫逾時:連線 5 s、讀寫 30 s、閒置連線 5 min 由 worker 關閉。
+- **協定**:每一幀是 4 位元組 big-endian 長度,接一段 JSON。幀大小上限 8 MiB,超過就拒收,不會先配置記憶體。
+  - 第一幀是 `hello`,帶協定版本(`PROTOCOL_VERSION`)。版本不同時回 `version_mismatch`。
+  - 請求共有 `list_workspaces`、`list_dir`、`stat`、`read`、`write`、`rename`、`git` 幾種。其中 `write`、`rename`、`git` 目前回 `unsupported`。
+- **身分與配對**:
+  - 憑證由 rcgen 產生,ECDSA P-256,自簽,CN 固定為 `snip-sync`。對方的身分只看憑證 DER 的 SHA-256 指紋。兩邊都出示憑證(mTLS)。
+  - worker 的 TLS 層接受任何客戶端憑證,未配對的 master 只能送 `pair`。
+  - 配對證明的算法是 `HMAC-SHA256(key = 配對碼, "snip-sync pair v1\0" ‖ worker 指紋 ‖ master 指紋)`。中間人看到的是另一組憑證,算出的證明對不上。
+  - 配對碼由 32 個不易混淆的字元組成,8 碼,約 40 bits。
+- **存放位置**:都在設定資料夾(`SNIP_CONFIG_DIR`,或各平台的預設位置;CLI 與桌面版共用)。
+  - 裝置身分:`remote-identity.der` 與 `remote-identity.key`(Unix 權限 0600)。
+  - worker 端:`remote-trusted-masters.json`。
+  - master 端:`remote-workers.json`。
+- **桌面版接法**:`WorkbenchModel.remote.session` 有值時,工作區就是遠端的。
+  - `submit_tree_io` 改走 `remote::tree_io`,它呼叫 `tree::listed_tree_result`,一次列完,沒有游標。
+  - `select_file_in` 對 `SourceKind::File` 改走 `remote::read_preview`。
+  - 樹的根是虛擬路徑 `snip-remote://<指紋>/<id>`,不碰本機磁碟,也不跑 repo 探索。
+  - 開啟遠端工作區是 `lifecycle::Intent::OpenRemoteWorkspace`,與開本機工作區走同一套關閉檢查。
+  - worker 監聽器是程序層級的全域物件,先於視窗啟動,也不隨工作區切換而停止。這是之後做無螢幕常駐(Windows 登入項目或服務)的路徑。
+- **測試**:
+  - `crates/remote/tests/loopback.rs`:真實 TLS 走 127.0.0.1,涵蓋配對、拒絕、pin、containment、symlink root。
+  - `crates/cli/tests/worker.rs`:真的啟動 `snip worker` 程序。
+  - `main.rs` `tests::in_process::remote_workspace_pairs_lists_and_previews_through_a_worker`:配對表單、遠端樹、預覽。
+
 ## 7. 風險
 
 | 風險 | 影響 | 在哪一階段確認 |
