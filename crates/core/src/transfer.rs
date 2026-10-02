@@ -1429,6 +1429,9 @@ fn blob_content(
 		}
 		BlobRead::Text(s) => Ok(Some((Some(s), None))),
 		BlobRead::NotText(_) => Ok(Some((None, None))),
+		BlobRead::TooLarge {
+			not_text: Some(_), ..
+		} => Ok(Some((None, None))),
 		BlobRead::TooLarge { size, .. } => {
 			budget.over_cap(size, cap, wire_path).map(Some)
 		}
@@ -1446,7 +1449,10 @@ fn gitlink_read(
 		BlobRead::Text(s) => Ok((Some(s), None)),
 		BlobRead::Missing
 		| BlobRead::NotText(_)
-		| BlobRead::NotABlob { .. } => {
+		| BlobRead::NotABlob { .. }
+		| BlobRead::TooLarge {
+			not_text: Some(_), ..
+		} => {
 			if is_staged {
 				Ok((Some(UNREADABLE_FILE_MARKER.to_string()), None))
 			} else {
@@ -2062,30 +2068,42 @@ pub fn plan_export_with(
 					let file_size = target_meta.len();
 					let per_file_limit =
 						(settings.max_file_size_kb * 1024.0) as u64;
-					if file_size as f64 > settings.max_file_size_kb * 1024.0 {
-						(
+					let over_per_file =
+						file_size as f64 > settings.max_file_size_kb * 1024.0;
+					let over_budget = remaining_budget
+						.is_some_and(|b| file_size as usize > b);
+					if over_per_file || over_budget {
+						let mut scan = crate::blob::ChunkTextScan::new();
+						for_each_chunk(
+							&absolute,
 							None,
-							Some(format!(
-								"size exceeds limit ({file_size} bytes)"
-							)),
-							None,
-						)
-					} else {
-						if let Some(budget) = remaining_budget {
-							if file_size as usize > budget {
-								return Err(
-									TransferError::PayloadLimitExceeded {
-										limit: max_payload_bytes
-											.unwrap_or(budget),
-										actual: current_total_bytes
-											+ file_size as usize,
-										reason: format!(
+							opts,
+							"read-file",
+							|chunk| scan.feed(chunk),
+						)?;
+						if scan.finish().is_some() {
+							break 'read_file (None, None, None);
+						}
+						if over_per_file {
+							(
+								None,
+								Some(format!(
+									"size exceeds limit ({file_size} bytes)"
+								)),
+								None,
+							)
+						} else {
+							let budget = remaining_budget.unwrap_or(usize::MAX);
+							return Err(TransferError::PayloadLimitExceeded {
+								limit: max_payload_bytes.unwrap_or(budget),
+								actual: current_total_bytes
+									+ file_size as usize,
+								reason: format!(
 									"file '{wire_path}' exceeds remaining payload budget"
 								),
-									},
-								);
-							}
+							});
 						}
+					} else {
 						let read_cap = match remaining_budget {
 							Some(b) => (b as u64).min(per_file_limit),
 							None => per_file_limit,

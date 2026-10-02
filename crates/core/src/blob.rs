@@ -188,39 +188,66 @@ fn scan_discarded_body<R: BufRead>(
 	size: u64,
 ) -> io::Result<Option<NotText>> {
 	let mut left = size;
-	let mut saw_nul = false;
-	let mut invalid = false;
-	let mut carry = Vec::new();
+	let mut scan = ChunkTextScan::new();
 	let mut buf = [0u8; 8192];
 	while left > 0 {
 		let n = usize::try_from(left.min(buf.len() as u64))
 			.map_err(io::Error::other)?;
 		reader.read_exact(&mut buf[..n])?;
 		left -= n as u64;
-		if !saw_nul && buf[..n].contains(&0) {
-			saw_nul = true;
-		}
-		if !saw_nul
-			&& !invalid
-			&& utf8_chunk_invalid(&mut carry, &buf[..n], left == 0)
-		{
-			invalid = true;
-		}
+		scan.feed(&buf[..n]);
 	}
 	let mut lf = [0u8; 1];
 	reader.read_exact(&mut lf)?;
-	if saw_nul {
-		Ok(Some(NotText::Binary))
-	} else if invalid {
-		Ok(Some(NotText::NotUtf8))
-	} else {
-		Ok(None)
+	Ok(scan.finish())
+}
+
+/// Incremental NUL / UTF-8 scanner that retains no byte history beyond an
+/// incomplete trailing sequence in `carry` (at most 3 bytes).
+///
+/// NUL wins over invalid UTF-8; the last chunk's incomplete trailing sequence
+/// is invalid.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct ChunkTextScan {
+	saw_nul: bool,
+	invalid: bool,
+	carry: Vec<u8>,
+}
+
+impl ChunkTextScan {
+	pub(crate) fn new() -> Self {
+		Self::default()
+	}
+
+	pub(crate) fn feed(&mut self, chunk: &[u8]) {
+		if self.saw_nul {
+			return;
+		}
+		if chunk.contains(&0) {
+			self.saw_nul = true;
+			self.carry.clear();
+			return;
+		}
+		if !self.invalid && utf8_chunk_invalid(&mut self.carry, chunk) {
+			self.invalid = true;
+			self.carry.clear();
+		}
+	}
+
+	pub(crate) fn finish(self) -> Option<NotText> {
+		if self.saw_nul {
+			Some(NotText::Binary)
+		} else if self.invalid || !self.carry.is_empty() {
+			Some(NotText::NotUtf8)
+		} else {
+			None
+		}
 	}
 }
 
-/// An incomplete trailing sequence is kept in carry (at most 3 bytes) unless
-/// this is the last chunk, where it is invalid; chunk is at most 8 KiB.
-fn utf8_chunk_invalid(carry: &mut Vec<u8>, chunk: &[u8], eof: bool) -> bool {
+/// An incomplete trailing sequence is kept in carry (at most 3 bytes);
+/// chunk is at most 8 KiB. Returns true if an unrecoverable UTF-8 error was found.
+fn utf8_chunk_invalid(carry: &mut Vec<u8>, chunk: &[u8]) -> bool {
 	if carry.is_empty() {
 		return match std::str::from_utf8(chunk) {
 			Ok(_) => false,
@@ -228,7 +255,7 @@ fn utf8_chunk_invalid(carry: &mut Vec<u8>, chunk: &[u8], eof: bool) -> bool {
 				Some(_) => true,
 				None => {
 					carry.extend_from_slice(&chunk[e.valid_up_to()..]);
-					eof
+					false
 				}
 			},
 		};
@@ -243,7 +270,7 @@ fn utf8_chunk_invalid(carry: &mut Vec<u8>, chunk: &[u8], eof: bool) -> bool {
 			Some(_) => true,
 			None => {
 				carry.extend_from_slice(&tmp[e.valid_up_to()..]);
-				eof
+				false
 			}
 		},
 	}
@@ -876,5 +903,53 @@ mod tests {
 			}),
 			None
 		);
+	}
+
+	#[test]
+	fn chunk_scan_ascii_and_multibyte_utf8() {
+		let mut scan = ChunkTextScan::new();
+		scan.feed(b"hello ");
+		// € is [0xe2, 0x82, 0xac], split across chunks
+		scan.feed(&[0xe2, 0x82]);
+		scan.feed(&[0xac, b' ']);
+		scan.feed(b"world\n");
+		assert_eq!(scan.finish(), None);
+	}
+
+	#[test]
+	fn chunk_scan_detects_binary_nul() {
+		let mut scan = ChunkTextScan::new();
+		scan.feed(b"valid text here");
+		scan.feed(b"and then \0 a nul byte");
+		scan.feed(b"more data");
+		assert_eq!(scan.finish(), Some(NotText::Binary));
+	}
+
+	#[test]
+	fn chunk_scan_detects_invalid_utf8() {
+		let mut scan = ChunkTextScan::new();
+		scan.feed(b"valid prefix");
+		scan.feed(&[0xff, 0xfe]);
+		assert_eq!(scan.finish(), Some(NotText::NotUtf8));
+	}
+
+	#[test]
+	fn chunk_scan_incomplete_trailing_sequence_at_eof_is_invalid() {
+		let mut scan = ChunkTextScan::new();
+		scan.feed(b"valid ");
+		scan.feed(&[0xc3]); // incomplete 2-byte sequence
+		assert_eq!(scan.finish(), Some(NotText::NotUtf8));
+	}
+
+	#[test]
+	fn chunk_scan_nul_wins_over_invalid_utf8() {
+		let mut scan = ChunkTextScan::new();
+		scan.feed(&[0xff]); // invalid utf-8 first
+		scan.feed(&[0x00]); // nul afterwards
+		assert_eq!(scan.finish(), Some(NotText::Binary));
+
+		let mut scan2 = ChunkTextScan::new();
+		scan2.feed(&[0xff, 0x00]); // same chunk
+		assert_eq!(scan2.finish(), Some(NotText::Binary));
 	}
 }

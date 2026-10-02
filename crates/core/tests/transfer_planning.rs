@@ -113,6 +113,14 @@ impl TestRepo {
 		fs::write(&target, content).unwrap();
 	}
 
+	fn write_bytes(&self, rel: &str, content: &[u8]) {
+		let target = self.repo_path.join(rel);
+		if let Some(parent) = target.parent() {
+			fs::create_dir_all(parent).unwrap();
+		}
+		fs::write(&target, content).unwrap();
+	}
+
 	fn read(&self, rel: &str) -> String {
 		fs::read_to_string(self.repo_path.join(rel)).unwrap()
 	}
@@ -5759,4 +5767,113 @@ fn test_plan_commit_export_with() {
 		matches!(err_both, TransferError::EmptySelection),
 		"expected EmptySelection, got: {err_both:?}"
 	);
+}
+
+#[test]
+fn test_oversize_binary_and_budget_handling_in_working() {
+	let repo = TestRepo::new("oversize-working");
+	let id = repo.canonical_id();
+
+	// 1. Oversize binary (> 500 KB default max_file_size_kb) with NUL
+	let mut bin_data = vec![b'x'; 600_000];
+	bin_data[100] = 0; // NUL byte makes it binary
+	repo.write_bytes("big_binary.bin", &bin_data);
+
+	// 2. Oversize non-UTF-8 (> 500 KB) without NUL
+	let non_utf8_data = vec![0xff; 600_000];
+	repo.write_bytes("big_non_utf8.dat", &non_utf8_data);
+
+	// 3. Oversize text (> 500 KB) valid UTF-8
+	let text_data = "A".repeat(600_000);
+	repo.write("big_text.txt", &text_data);
+
+	let selection = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		None,
+		vec![
+			ExportItem {
+				root: id.clone(),
+				relative_path: "big_binary.bin".to_string(),
+				source: SourceKind::Working,
+				change_type: Some(ChangeType::Modified),
+				gitlink: false,
+			},
+			ExportItem {
+				root: id.clone(),
+				relative_path: "big_non_utf8.dat".to_string(),
+				source: SourceKind::Working,
+				change_type: Some(ChangeType::Modified),
+				gitlink: false,
+			},
+			ExportItem {
+				root: id.clone(),
+				relative_path: "big_text.txt".to_string(),
+				source: SourceKind::Working,
+				change_type: Some(ChangeType::Modified),
+				gitlink: false,
+			},
+		],
+	)
+	.unwrap();
+
+	let plan = plan_export(&selection, &Settings::default(), None).unwrap();
+	// big_binary.bin and big_non_utf8.dat should be dropped, counted as skipped_unreadable.
+	// big_text.txt should still get the "File skipped: size exceeds limit" marker entry.
+	assert_eq!(plan.skipped_unreadable_count, 2);
+	assert_eq!(plan.skipped_file_size_count, 1);
+	assert_eq!(plan.files.len(), 1);
+	assert_eq!(plan.files[0].path, "big_text.txt");
+	assert!(plan.payload.contains("// File skipped: size exceeds limit"));
+
+	// 4. Binary bigger than small max_payload_bytes budget is dropped
+	// 5. Text bigger than budget still errors with PayloadLimitExceeded
+	let mut small_budget_bin = vec![b'x'; 200];
+	small_budget_bin[10] = 0;
+	repo.write_bytes("budget_bin.bin", &small_budget_bin); // 200 bytes binary
+	repo.write("budget_text.txt", &"t".repeat(200)); // 200 bytes text
+
+	let bin_budget_selection = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		None,
+		vec![ExportItem {
+			root: id.clone(),
+			relative_path: "budget_bin.bin".to_string(),
+			source: SourceKind::Working,
+			change_type: Some(ChangeType::Modified),
+			gitlink: false,
+		}],
+	)
+	.unwrap();
+
+	// max_payload_bytes is 100 bytes (wrapper overhead ~36 bytes, remaining budget ~64 bytes).
+	// Binary is 200 bytes > remaining budget. Binary is dropped!
+	let bin_plan =
+		plan_export(&bin_budget_selection, &Settings::default(), Some(100))
+			.unwrap();
+	assert_eq!(bin_plan.skipped_unreadable_count, 1);
+	assert!(bin_plan.files.is_empty());
+
+	let text_budget_selection = ExportSelection::new(
+		vec![repo.path().to_path_buf()],
+		None,
+		vec![ExportItem {
+			root: id,
+			relative_path: "budget_text.txt".to_string(),
+			source: SourceKind::Working,
+			change_type: Some(ChangeType::Modified),
+			gitlink: false,
+		}],
+	)
+	.unwrap();
+
+	// Text is 200 bytes > remaining budget. Must return PayloadLimitExceeded!
+	let text_err =
+		plan_export(&text_budget_selection, &Settings::default(), Some(100))
+			.unwrap_err();
+	match text_err {
+		TransferError::PayloadLimitExceeded { limit, .. } => {
+			assert_eq!(limit, 100);
+		}
+		other => panic!("expected PayloadLimitExceeded, got: {other:?}"),
+	}
 }

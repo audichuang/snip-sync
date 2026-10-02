@@ -1186,11 +1186,13 @@ fn git_copy_byte_parity_old_vs_new_including_symlinks() {
 	fs::write(repo.join("base.txt"), "base content\n").unwrap();
 	fs::write(repo.join("mod.txt"), "initial mod\n").unwrap();
 	fs::write(repo.join("del.txt"), "del content\n").unwrap();
+	fs::write(repo.join("bin.dat"), b"commit A bin\0content\n").unwrap();
 	commit(&repo, "commit A", "2020-01-01T00:00:00+00:00");
 	let sha_a = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
 
 	fs::write(repo.join("mod.txt"), "modified in B\n").unwrap();
 	fs::write(repo.join("added.txt"), "added in B\n").unwrap();
+	fs::write(repo.join("bin.dat"), b"commit B bin\0content\n").unwrap();
 	git(&repo, &["rm", "del.txt"]);
 	commit(&repo, "commit B", "2020-01-01T00:01:00+00:00");
 	let sha_b = git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
@@ -1214,6 +1216,7 @@ fn git_copy_byte_parity_old_vs_new_including_symlinks() {
 		)
 		.unwrap();
 		assert_eq!(text(&out.stdout), legacy_commit.payload);
+		assert!(!text(&out.stdout).contains("bin.dat"));
 
 		// 2. --range sha_a..sha_b (includes deleted file del.txt reading its base content)
 		let range_arg = format!("{sha_a}..{sha_b}");
@@ -1232,6 +1235,7 @@ fn git_copy_byte_parity_old_vs_new_including_symlinks() {
 		)
 		.unwrap();
 		assert_eq!(text(&out.stdout), legacy_range.payload);
+		assert!(!text(&out.stdout).contains("bin.dat"));
 	};
 
 	check_sources(&repo);
@@ -1244,9 +1248,10 @@ fn git_copy_byte_parity_old_vs_new_including_symlinks() {
 		check_sources(&symlink_repo);
 	}
 
-	// Now test --working: modified + untracked + deleted
+	// Now test --working: modified + untracked + deleted + modified binary
 	fs::write(repo.join("mod.txt"), "working mod\n").unwrap();
 	fs::write(repo.join("untracked.txt"), "untracked content\n").unwrap();
+	fs::write(repo.join("bin.dat"), b"working bin\0content\n").unwrap();
 	fs::remove_file(repo.join("added.txt")).unwrap();
 
 	let check_working = |repo_path: &Path| {
@@ -1265,6 +1270,7 @@ fn git_copy_byte_parity_old_vs_new_including_symlinks() {
 		)
 		.unwrap();
 		assert_eq!(text(&out.stdout), legacy_working.payload);
+		assert!(!text(&out.stdout).contains("bin.dat"));
 	};
 
 	check_working(&repo);
@@ -1277,7 +1283,7 @@ fn git_copy_byte_parity_old_vs_new_including_symlinks() {
 		check_working(&symlink_repo);
 	}
 
-	// Now test --staged: modified + added + deleted
+	// Now test --staged: modified + added + deleted + unstaged binary
 	git(&repo, &["checkout", "--", "added.txt"]);
 	fs::remove_file(repo.join("untracked.txt")).unwrap();
 	fs::write(repo.join("staged_new.txt"), "staged new content\n").unwrap();
@@ -1301,6 +1307,7 @@ fn git_copy_byte_parity_old_vs_new_including_symlinks() {
 		)
 		.unwrap();
 		assert_eq!(text(&out.stdout), legacy_staged.payload);
+		assert!(!text(&out.stdout).contains("bin.dat"));
 	};
 
 	check_staged(&repo);
@@ -1312,6 +1319,124 @@ fn git_copy_byte_parity_old_vs_new_including_symlinks() {
 		std::os::unix::fs::symlink(&repo, &symlink_repo).unwrap();
 		check_staged(&symlink_repo);
 	}
+}
+
+#[test]
+fn git_copy_oversize_binary_dropped_like_old_engine() {
+	use snip_core::gitsrc::{collect_payload, Git, GitSource};
+	use snip_core::settings::Settings;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("oversize_repo");
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+
+	let repo_str = repo.to_str().unwrap();
+	let git_repo = Git::open(&repo).unwrap();
+	let settings = Settings::default();
+
+	// Initial commit so HEAD has a parent
+	fs::write(repo.join("base.txt"), "base\n").unwrap();
+	commit(&repo, "initial", "2020-01-01T00:00:00+00:00");
+
+	// Commit img.bin containing 700_005 bytes with NULs; also a commit with a changed small text file.
+	let mut img_data = vec![b'x'; 700_005];
+	img_data[10] = 0; // contains NUL
+	fs::write(repo.join("img.bin"), &img_data).unwrap();
+	fs::write(repo.join("text.txt"), "small text\n").unwrap();
+	commit(
+		&repo,
+		"commit oversize binary and text",
+		"2020-01-01T00:01:00+00:00",
+	);
+
+	// (a) copy --commit HEAD --stdout where the commit changes img.bin plus a small text file:
+	// stdout == collect_payload payload, and must not contain "img.bin" nor "File skipped".
+	let out = snip(
+		&["--repo", repo_str, "copy", "--commit", "HEAD", "--stdout"],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let legacy_commit = collect_payload(
+		&git_repo,
+		&GitSource::Commit("HEAD".into()),
+		&[&repo],
+		&settings,
+	)
+	.unwrap();
+	assert_eq!(text(&out.stdout), legacy_commit.payload);
+	assert!(!text(&out.stdout).contains("img.bin"));
+	assert!(!text(&out.stdout).contains("File skipped"));
+
+	// (b) working tree: modify img.bin (oversize binary) and ALSO a text file:
+	// copy --working --stdout payload == collect_payload and contains no "img.bin".
+	img_data[20] = 1;
+	fs::write(repo.join("img.bin"), &img_data).unwrap();
+	fs::write(repo.join("text.txt"), "modified small text in working\n")
+		.unwrap();
+
+	let out =
+		snip(&["--repo", repo_str, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	let legacy_working =
+		collect_payload(&git_repo, &GitSource::Working, &[&repo], &settings)
+			.unwrap();
+	assert_eq!(text(&out.stdout), legacy_working.payload);
+	assert!(!text(&out.stdout).contains("img.bin"));
+
+	// (c) a repo state where the oversize binary is the ONLY working change:
+	// copy --working exits 1 with "No Git changes found to copy." and the clipboard is untouched
+	// (use --stdout style like other tests; assert stdout empty).
+	git(&repo, &["checkout", "--", "text.txt"]);
+	let out =
+		snip(&["--repo", repo_str, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	assert!(out.stdout.is_empty());
+	assert!(
+		text(&out.stderr).contains("No Git changes found to copy."),
+		"expected 'No Git changes found to copy.' in stderr: {}",
+		text(&out.stderr)
+	);
+
+	// Also an oversize non-UTF-8 (e.g. 700_005 bytes of 0xFF... without NUL) variant for --working.
+	let non_utf8_data = vec![0xffu8; 700_005];
+	fs::write(repo.join("img.bin"), &non_utf8_data).unwrap();
+	let out =
+		snip(&["--repo", repo_str, "copy", "--working", "--stdout"], None);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	assert!(out.stdout.is_empty());
+	assert!(
+		text(&out.stderr).contains("No Git changes found to copy."),
+		"expected 'No Git changes found to copy.' in stderr: {}",
+		text(&out.stderr)
+	);
+
+	// (d) with --settings '{"maxFileSizeKB":100000}' a 33 MiB binary changed in --working
+	// is dropped and the text file is still copied, exit 0 (use a sparse-ish write of repeated bytes; keep it fast).
+	fs::write(repo.join("text.txt"), "text for 33 MiB test\n").unwrap();
+	{
+		use std::io::Write;
+		let bin_chunk = vec![0u8; 1024 * 1024];
+		let mut f = fs::File::create(repo.join("img.bin")).unwrap();
+		for _ in 0..33 {
+			f.write_all(&bin_chunk).unwrap();
+		}
+	}
+	let out = snip(
+		&[
+			"--repo",
+			repo_str,
+			"copy",
+			"--working",
+			"--stdout",
+			"--settings",
+			"{\"maxFileSizeKB\":100000}",
+		],
+		None,
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	assert!(!text(&out.stdout).contains("img.bin"));
+	assert!(text(&out.stdout).contains("text for 33 MiB test"));
 }
 
 #[test]
