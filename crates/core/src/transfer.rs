@@ -344,7 +344,11 @@ impl SourceFreshnessSnapshot {
 				| SourceKind::Unstaged
 				| SourceKind::File => {
 					let file_path = item.root.path().join(&item.relative_path);
-					let freshness = capture_file_freshness(&file_path, &opts)?;
+					let freshness = capture_file_freshness(
+						&file_path,
+						&opts,
+						TransferError::SpecialFile,
+					)?;
 					working_files.insert(
 						(item.root.clone(), item.relative_path.clone()),
 						freshness,
@@ -402,7 +406,11 @@ impl SourceFreshnessSnapshot {
 		for ((root, rel), prev_file) in &self.working_files {
 			cancelled_err(opts, "revalidate-source")?;
 			let file_path = root.path().join(rel);
-			let current = capture_file_freshness(&file_path, opts)?;
+			let current = capture_file_freshness(
+				&file_path,
+				opts,
+				TransferError::SpecialFile,
+			)?;
 			if current != *prev_file {
 				return Err(TransferError::StaleSource {
 					root: root.path().to_path_buf(),
@@ -609,7 +617,11 @@ impl DestinationFreshnessSnapshot {
 		let mut target_files = HashMap::new();
 		for op in &plan.create_operations {
 			cancelled_err(opts, "import-freshness")?;
-			let file_state = capture_file_freshness(&op.absolute_path, opts)?;
+			let file_state = capture_file_freshness(
+				&op.absolute_path,
+				opts,
+				TransferError::DestinationNotRegular,
+			)?;
 			target_files.insert(
 				op.absolute_path.clone(),
 				TargetFileFreshness {
@@ -623,7 +635,11 @@ impl DestinationFreshnessSnapshot {
 
 		for op in &plan.delete_operations {
 			cancelled_err(opts, "import-freshness")?;
-			let file_state = capture_file_freshness(&op.absolute_path, opts)?;
+			let file_state = capture_file_freshness(
+				&op.absolute_path,
+				opts,
+				TransferError::DestinationNotRegular,
+			)?;
 			let parent = op.absolute_path.parent().unwrap_or(&op.absolute_path);
 			target_files.insert(
 				op.absolute_path.clone(),
@@ -662,7 +678,11 @@ impl DestinationFreshnessSnapshot {
 
 		let mut target_files = HashMap::new();
 		for (abs, rel) in targets {
-			let file_state = capture_file_freshness(abs, &opts)?;
+			let file_state = capture_file_freshness(
+				abs,
+				&opts,
+				TransferError::DestinationNotRegular,
+			)?;
 			let existed = file_state.is_some();
 			let root_path = destination_roots
 				.iter()
@@ -717,7 +737,11 @@ impl DestinationFreshnessSnapshot {
 				});
 			}
 			if target.existed && current_exists {
-				let current_state = capture_file_freshness(path, &opts)?;
+				let current_state = capture_file_freshness(
+					path,
+					&opts,
+					TransferError::DestinationNotRegular,
+				)?;
 				if current_state != target.file_state {
 					return Err(TransferError::StaleDestination {
 						root: target.root.path().to_path_buf(),
@@ -1086,6 +1110,7 @@ fn final_boundary_cancel_hook(stage: &'static str) {
 fn capture_file_freshness(
 	path: &Path,
 	opts: &RunOptions,
+	non_regular_err: fn(String) -> TransferError,
 ) -> Result<Option<FileFreshness>, TransferError> {
 	cancelled_err(opts, "hash-file")?;
 	let sym_meta = match not_found_as_none(fs::symlink_metadata(path))? {
@@ -1102,9 +1127,7 @@ fn capture_file_freshness(
 		sym_meta
 	};
 	if !target_meta.file_type().is_file() {
-		return Err(TransferError::DestinationNotRegular(
-			path.to_string_lossy().into_owned(),
-		));
+		return Err(non_regular_err(path.to_string_lossy().into_owned()));
 	}
 	let size = target_meta.len();
 	let mtime = target_meta.modified()?;
@@ -3840,5 +3863,89 @@ mod root_retained_tests {
 		assert!(root.retained_heap_bytes() > before);
 		assert_eq!(root.retained_heap_bytes(), root.0.capacity());
 		assert!(root.retained_heap_bytes() > root.path().as_os_str().len());
+	}
+}
+
+#[cfg(test)]
+mod freshness_error_tests {
+	use super::*;
+
+	#[test]
+	fn non_regular_path_yields_special_file_on_export_and_destination_not_regular_on_import(
+	) {
+		let dir = tempfile::tempdir().unwrap();
+		let root_raw = dir.path().join("root");
+		fs::create_dir_all(root_raw.join("subdir")).unwrap();
+		let root_canon = dunce::canonicalize(&root_raw).unwrap();
+		let root_id = CanonicalRootId::new(&root_canon).unwrap();
+
+		// Export side: SourceFreshnessSnapshot::capture calls the source snapshot
+		// helper on a directory where a working file is expected, asserting SpecialFile.
+		let export_selection = ExportSelection {
+			roots: vec![root_id.clone()],
+			primary_root: Some(root_id.clone()),
+			items: vec![ExportItem {
+				root: root_id.clone(),
+				relative_path: "subdir".to_string(),
+				source: SourceKind::Working,
+				change_type: Some(ChangeType::Modified),
+				gitlink: false,
+			}],
+			source_root: None,
+			spelled_root: None,
+			filter_root: None,
+		};
+		let export_err = SourceFreshnessSnapshot::capture(&export_selection)
+			.expect_err("export capture must fail on non-regular file");
+		match export_err {
+			TransferError::SpecialFile(p) => {
+				assert!(
+					p.ends_with("subdir"),
+					"expected SpecialFile path to end with 'subdir', got {p}"
+				);
+			}
+			other => {
+				panic!("expected TransferError::SpecialFile, got {other:?}")
+			}
+		}
+
+		// Import side: DestinationFreshnessSnapshot::capture_paths asserts DestinationNotRegular.
+		let import_target = (root_canon.join("subdir"), "subdir".to_string());
+		let import_err = DestinationFreshnessSnapshot::capture_paths(
+			std::slice::from_ref(&root_canon),
+			&[import_target],
+		)
+		.expect_err("import capture_paths must fail on non-regular file");
+		match import_err {
+			TransferError::DestinationNotRegular(p) => {
+				assert!(
+					p.ends_with("subdir"),
+					"expected DestinationNotRegular path to end with 'subdir', got {p}"
+				);
+			}
+			other => {
+				panic!("expected TransferError::DestinationNotRegular, got {other:?}")
+			}
+		}
+
+		// Direct capture_file_freshness checks with respective error constructors.
+		let direct_export = capture_file_freshness(
+			&root_canon.join("subdir"),
+			&RunOptions::default(),
+			TransferError::SpecialFile,
+		)
+		.expect_err("capture_file_freshness must fail on directory");
+		assert!(matches!(direct_export, TransferError::SpecialFile(_)));
+
+		let direct_import = capture_file_freshness(
+			&root_canon.join("subdir"),
+			&RunOptions::default(),
+			TransferError::DestinationNotRegular,
+		)
+		.expect_err("capture_file_freshness must fail on directory");
+		assert!(matches!(
+			direct_import,
+			TransferError::DestinationNotRegular(_)
+		));
 	}
 }

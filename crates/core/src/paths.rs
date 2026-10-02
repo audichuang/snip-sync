@@ -111,17 +111,12 @@ pub fn resolve_delete_target<P: AsRef<Path>>(
 }
 
 /// Returns true if any path segment equals `.git` (ASCII case-insensitive).
+/// Trailing dots and spaces are stripped per segment so Win32 spellings like
+/// `.git.` and `.git ` are caught across all platforms.
 pub fn has_git_segment(path: &str) -> bool {
-	path.split(['/', '\\'])
-		.any(|seg| seg.eq_ignore_ascii_case(".git"))
-}
-
-/// Returns true if any component of `path` equals `.git` (ASCII case-insensitive).
-pub fn path_has_git_segment(path: &Path) -> bool {
-	path.components().any(|c| {
-		c.as_os_str()
-			.to_str()
-			.is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+	path.split(['/', '\\']).any(|seg| {
+		seg.trim_end_matches(['.', ' '])
+			.eq_ignore_ascii_case(".git")
 	})
 }
 
@@ -442,7 +437,6 @@ impl PathResolver {
 		if self.escapes(&c.target)
 			|| has_git_segment(&relative_path)
 			|| has_git_segment(&c.root_relative_path)
-			|| path_has_git_segment(Path::new(&c.target))
 		{
 			return Err(unsafe_path(Some(relative_path)));
 		}
@@ -452,7 +446,7 @@ impl PathResolver {
 	/// Delete an existing file, or report it missing.
 	fn delete_existing(&self, c: TargetCandidate) -> RestoreTargetResolution {
 		let rel = c.root_relative_path.clone();
-		if has_git_segment(&rel) || path_has_git_segment(Path::new(&c.target)) {
+		if has_git_segment(&rel) {
 			return Err(unsafe_path(Some(rel)));
 		}
 		if is_existing_file(&c.target) {
@@ -705,7 +699,6 @@ impl PathResolver {
 		if self.escapes(&c.target)
 			|| has_git_segment(&relative_path)
 			|| has_git_segment(&c.root_relative_path)
-			|| path_has_git_segment(Path::new(&c.target))
 		{
 			return Err(unsafe_path(Some(relative_path)));
 		}
@@ -1275,5 +1268,44 @@ mod tests {
 		fs::create_dir_all(&sibling).unwrap();
 		symlink(&sibling, &repo.join("backlink"));
 		assert!(resolve_write_target(&[&repo], "backlink/new.txt").is_err());
+	}
+
+	#[test]
+	fn has_git_segment_detects_trailing_dots_and_spaces() {
+		assert!(has_git_segment(".git."));
+		assert!(has_git_segment(".git "));
+		assert!(has_git_segment(".git. /x"));
+		assert!(has_git_segment("a/.GIT../b"));
+
+		assert!(!has_git_segment(".gitignore"));
+		assert!(!has_git_segment(".git.x"));
+		assert!(!has_git_segment("foo.git/x"));
+		assert!(!has_git_segment(".github/x"));
+	}
+
+	#[test]
+	fn resolves_targets_when_destination_root_ancestor_is_named_git() {
+		let (temp, _real) = tmp();
+		let root = temp.path().join(".git").join("work");
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::write(root.join("src/existing.txt"), "hello").unwrap();
+
+		let write_res = resolve_write_target(&[&root], "src/a.txt");
+		assert!(write_res.is_ok());
+		assert_eq!(ok(&write_res).relative_path, "src/a.txt");
+		assert_eq!(ok(&write_res).absolute_path, root.join("src/a.txt"));
+
+		let git_res = resolve_write_target(&[&root], ".git/config");
+		assert!(git_res.is_err());
+		assert_eq!(git_res.unwrap_err().reason, RejectReason::UnsafePath);
+
+		let del_res = resolve_delete_target(&[&root], "src/existing.txt");
+		assert!(del_res.is_ok());
+		assert_eq!(ok(&del_res).relative_path, "src/existing.txt");
+		assert_eq!(ok(&del_res).absolute_path, root.join("src/existing.txt"));
+
+		let del_git_res = resolve_delete_target(&[&root], ".git/config");
+		assert!(del_git_res.is_err());
+		assert_eq!(del_git_res.unwrap_err().reason, RejectReason::UnsafePath);
 	}
 }

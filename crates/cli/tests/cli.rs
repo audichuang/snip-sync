@@ -2731,6 +2731,47 @@ fn paste_refuses_git_path_segment() {
 		fs::read_to_string(repo.join(".gitignore")).unwrap(),
 		"*.log"
 	);
+
+	// 4. Payload with [DELETED] .git/config leaves .git/config intact
+	let del_payload = "// file: [DELETED] .git/config\n";
+	let dry_del = snip(
+		&[
+			"--repo",
+			repo.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--stdin",
+		],
+		Some(del_payload.as_bytes()),
+	);
+	assert_eq!(code(&dry_del), 0, "{}", text(&dry_del.stderr));
+	let dry_del_stdout = text(&dry_del.stdout);
+	assert!(
+		dry_del_stdout.contains("skip\t.git/config\tUNRESOLVED_PATH"),
+		"expected dry-run to report skip with UNRESOLVED_PATH, got: {dry_del_stdout}"
+	);
+
+	let apply_del = snip(
+		&[
+			"--repo",
+			repo.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		],
+		Some(del_payload.as_bytes()),
+	);
+	assert_eq!(code(&apply_del), 0, "{}", text(&apply_del.stderr));
+	assert!(
+		text(&apply_del.stderr).contains("Skipped 1."),
+		"expected apply stderr to report Skipped 1."
+	);
+	assert_eq!(
+		fs::read_to_string(&git_config).unwrap(),
+		original_config,
+		".git/config must remain intact after deleted paste"
+	);
 }
 
 #[test]

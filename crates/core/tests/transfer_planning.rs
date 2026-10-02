@@ -6801,3 +6801,103 @@ fn test_oversize_binary_and_budget_handling_in_file_mode() {
 		other => panic!("expected PayloadLimitExceeded, got: {other:?}"),
 	}
 }
+
+#[test]
+fn destination_root_under_git_ancestor_plans_and_pastes_normally() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join(".git").join("work");
+	fs::create_dir_all(root.join("src")).unwrap();
+	let root_canon = dunce::canonicalize(&root).unwrap_or(root.clone());
+	let root_id = CanonicalRootId::new(&root_canon).unwrap();
+
+	// resolve_write_target accepts normal file, rejects .git/config
+	let write_target = paths::resolve_write_target(&[&root_canon], "src/a.txt");
+	assert!(write_target.is_ok());
+
+	let git_target = paths::resolve_write_target(&[&root_canon], ".git/config");
+	assert!(git_target.is_err());
+
+	// resolve_delete_target accepts normal existing file under such a root
+	fs::write(root_canon.join("src/existing.txt"), "delete me\n").unwrap();
+	let del_target =
+		paths::resolve_delete_target(&[&root_canon], "src/existing.txt");
+	assert!(del_target.is_ok());
+
+	let clipboard_text = "\
+// file: src/a.txt
+normal content
+// file: .git/config
+evil git config
+";
+	let mapping = ImportMapping::with_primary(root_id);
+	let import_plan = plan_import_with(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		std::slice::from_ref(&root_canon),
+		&mapping,
+		&RunOptions::default(),
+	)
+	.expect("plan_import_with should succeed");
+
+	let restore_plan = import_plan.restore_plan();
+	assert_eq!(restore_plan.create_operations.len(), 1);
+	assert_eq!(restore_plan.create_operations[0].relative_path, "src/a.txt");
+
+	let skipped = &restore_plan.skipped_operations;
+	assert_eq!(skipped.len(), 1);
+	assert_eq!(skipped[0].raw_path, ".git/config");
+	assert_eq!(skipped[0].reason, SkipReason::UnresolvedPath);
+
+	let res = import_plan
+		.apply(&RestoreSelection::default())
+		.expect("apply should succeed");
+	assert_eq!(res.created_count, 1);
+	assert_eq!(
+		fs::read_to_string(root_canon.join("src/a.txt")).unwrap(),
+		"normal content"
+	);
+	assert!(!root_canon.join(".git/config").exists());
+}
+
+#[test]
+fn import_refuses_deleted_git_file_and_leaves_it_intact() {
+	let repo = TestRepo::new("dst");
+	let git_config = repo.path().join(".git").join("config");
+	let git_head = repo.path().join(".git").join("HEAD");
+	assert!(git_config.exists());
+	assert!(git_head.exists());
+	let original_config = fs::read(&git_config).unwrap();
+	let original_head = fs::read(&git_head).unwrap();
+
+	let clipboard_text = "\
+// file: [DELETED] .git/config
+// file: [DELETED] .git/HEAD
+";
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+	let import_plan = plan_import_with(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+		&RunOptions::default(),
+	)
+	.expect("plan_import_with should succeed");
+
+	let restore_plan = import_plan.restore_plan();
+	// Plan has no delete op for .git files
+	assert!(restore_plan.delete_operations.is_empty());
+	assert_eq!(restore_plan.skipped_operations.len(), 2);
+	for op in &restore_plan.skipped_operations {
+		assert_eq!(op.reason, SkipReason::UnresolvedPath);
+	}
+
+	// After executing nothing is removed
+	let res = import_plan
+		.apply(&RestoreSelection::default())
+		.expect("apply should succeed");
+	assert_eq!(res.deleted_count, 0);
+	assert!(git_config.exists());
+	assert!(git_head.exists());
+	assert_eq!(fs::read(&git_config).unwrap(), original_config);
+	assert_eq!(fs::read(&git_head).unwrap(), original_head);
+}

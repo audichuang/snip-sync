@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
 use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
 use crate::paths::{
-	escapes_all_roots, has_git_segment, path_has_git_segment,
-	resolve_delete_target, resolve_write_target, RejectReason,
+	escapes_all_roots, has_git_segment, resolve_delete_target,
+	resolve_write_target, RejectReason,
 };
 
 /// One file from the payload; `parse_clipboard` produces these.
@@ -207,9 +207,7 @@ pub fn plan_restore<P: AsRef<Path>>(
 			}
 		};
 
-		if has_git_segment(&t.relative_path)
-			|| path_has_git_segment(&t.absolute_path)
-		{
+		if has_git_segment(&t.relative_path) {
 			plan.skipped_operations
 				.push(skip(None, SkipReason::UnresolvedPath));
 			continue;
@@ -279,7 +277,6 @@ pub fn execute_restore_plan(
 		// contained target into one outside the workspace.
 		if escapes_all_roots(&plan.roots, &op.absolute_path)
 			|| has_git_segment(&op.relative_path)
-			|| path_has_git_segment(&op.absolute_path)
 		{
 			result
 				.errors
@@ -312,7 +309,6 @@ fn run_create(
 ) -> Result<CreateOutcome, String> {
 	if escapes_all_roots(roots, &op.absolute_path)
 		|| has_git_segment(&op.relative_path)
-		|| path_has_git_segment(&op.absolute_path)
 	{
 		return Err(format!("{}: unsafe path", op.relative_path));
 	}
