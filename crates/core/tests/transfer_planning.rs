@@ -43,7 +43,7 @@ use snip_core::transfer::{
 	changed_items, detect_clipboard_prefixes, expand_folder_items,
 	expand_folder_items_in_input_order, plan_commit_export,
 	plan_commit_export_exact, plan_commit_export_with, plan_export,
-	plan_export_with, plan_import, plan_import_with, selection_from_paths,
+	plan_import, plan_import_with, selection_from_paths,
 	validate_commit_selection, CanonicalRootId, CommitReplayPreview,
 	DestinationFreshnessSnapshot, ExportItem, ExportSelection, ImportMapping,
 	SourceFreshnessSnapshot, SourceKind, TransferError, CLIPBOARD_PAYLOAD_MAX,
@@ -5120,6 +5120,7 @@ fn test_changed_items_and_plan_export_subdir_symlink() {
 #[test]
 #[cfg(unix)]
 fn test_plan_export_working_skips_dangling_symlink() {
+	use snip_core::transfer::plan_export_with;
 	let repo = TestRepo::new("dangling-symlink");
 	repo.write("a.txt", "initial content\n");
 	repo.commit("initial");
