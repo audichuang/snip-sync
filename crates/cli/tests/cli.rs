@@ -650,7 +650,14 @@ fn paste_commits_apply_replays_over_a_directory_an_earlier_commit_empties() {
 		text(&dry.stdout)
 	);
 	let apply = snip(
-		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		&[
+			"--repo",
+			dst_s,
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		],
 		Some(payload.as_bytes()),
 	);
 	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
@@ -1802,4 +1809,594 @@ fn copy_commit_with_subrepo_matches_workspace_relative_filter() {
 	);
 	assert_eq!(code(&out_repo_rel), 1, "{}", text(&out_repo_rel.stderr));
 	assert!(text(&out_repo_rel.stderr).contains("No source copied."));
+}
+
+#[test]
+fn paste_f1_case_alias_existing_path() {
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	let probe = dst.join("probe_x");
+	let probe_upper = dst.join("PROBE_X");
+	fs::write(&probe, "x").unwrap();
+	let is_ci = probe_upper.exists();
+	let _ = fs::remove_file(&probe);
+
+	fs::write(dst.join("a.txt"), "original a\n").unwrap();
+	let payload = "// file: A.txt\nnew A content\n// file: [DELETED] a.txt\n";
+	let dst_s = dst.to_str().unwrap();
+
+	let out = snip(
+		&[
+			"--repo",
+			dst_s,
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		],
+		Some(payload.as_bytes()),
+	);
+
+	if is_ci {
+		assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+		let err = text(&out.stderr);
+		assert!(
+			err.contains("target collision"),
+			"expected error mentioning 'target collision', got: {err}"
+		);
+		assert_eq!(
+			fs::read_to_string(dst.join("a.txt")).unwrap(),
+			"original a\n"
+		);
+	} else {
+		assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+		assert_eq!(
+			fs::read_to_string(dst.join("A.txt")).unwrap(),
+			"new A content\n"
+		);
+		assert!(!dst.join("a.txt").exists());
+	}
+}
+
+#[test]
+fn paste_d10_case_alias_both_new() {
+	let tmp = tempfile::tempdir().unwrap();
+	let probe = tmp.path().join("probe_x");
+	let probe_upper = tmp.path().join("PROBE_X");
+	fs::write(&probe, "x").unwrap();
+	let is_ci = probe_upper.exists();
+	let _ = fs::remove_file(&probe);
+
+	// Case A: [NEW] B.txt + [NEW] b.txt
+	let dst1 = tmp.path().join("dst1");
+	fs::create_dir_all(&dst1).unwrap();
+	let payload1 = "// file: B.txt\ncontent B\n// file: b.txt\ncontent b\n";
+	let out1 = snip(
+		&[
+			"--repo",
+			dst1.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--stdin",
+		],
+		Some(payload1.as_bytes()),
+	);
+	if is_ci {
+		assert_eq!(code(&out1), 1, "{}", text(&out1.stderr));
+		let err = text(&out1.stderr);
+		assert!(err.contains("target collision"), "{err}");
+		assert!(!dst1.join("B.txt").exists());
+		assert!(!dst1.join("b.txt").exists());
+	} else {
+		assert_eq!(code(&out1), 0, "{}", text(&out1.stderr));
+		assert_eq!(
+			fs::read_to_string(dst1.join("B.txt")).unwrap(),
+			"content B\n"
+		);
+		assert_eq!(
+			fs::read_to_string(dst1.join("b.txt")).unwrap(),
+			"content b\n"
+		);
+	}
+
+	// Case B: D/x.txt + d/x.txt (D absent)
+	let dst2 = tmp.path().join("dst2");
+	fs::create_dir_all(&dst2).unwrap();
+	let payload2 = "// file: D/x.txt\ncontent 1\n// file: d/x.txt\ncontent 2\n";
+	let out2 = snip(
+		&[
+			"--repo",
+			dst2.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--stdin",
+		],
+		Some(payload2.as_bytes()),
+	);
+	if is_ci {
+		assert_eq!(code(&out2), 1, "{}", text(&out2.stderr));
+		let err = text(&out2.stderr);
+		assert!(err.contains("target collision"), "{err}");
+		assert!(!dst2.join("D").exists());
+		assert!(!dst2.join("d").exists());
+	} else {
+		assert_eq!(code(&out2), 0, "{}", text(&out2.stderr));
+		assert_eq!(
+			fs::read_to_string(dst2.join("D/x.txt")).unwrap(),
+			"content 1\n"
+		);
+		assert_eq!(
+			fs::read_to_string(dst2.join("d/x.txt")).unwrap(),
+			"content 2\n"
+		);
+	}
+}
+
+#[test]
+fn paste_root_internal_absolute_path() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	fs::create_dir_all(&repo).unwrap();
+
+	#[cfg(unix)]
+	let repo_target = {
+		let sym = tmp.path().join("sym_repo");
+		std::os::unix::fs::symlink(&repo, &sym).unwrap();
+		sym
+	};
+	#[cfg(not(unix))]
+	let repo_target = repo.clone();
+
+	let repo_target_s = repo_target.to_str().unwrap();
+	let header_path = repo_target.join("src/c.ts");
+	let header_path_s = header_path.to_str().unwrap();
+	let payload = format!("// file: {header_path_s}\nconsole.log(42);\n");
+
+	let dry = snip(
+		&["--repo", repo_target_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	assert!(
+		text(&dry.stdout).contains("create\tsrc/c.ts"),
+		"{}",
+		text(&dry.stdout)
+	);
+
+	let apply = snip(
+		&["--repo", repo_target_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
+	assert_eq!(
+		fs::read_to_string(repo.join("src/c.ts")).unwrap(),
+		"console.log(42);"
+	);
+}
+
+#[test]
+fn paste_cross_machine_suffix() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("proj_suffix");
+	fs::create_dir_all(&repo).unwrap();
+	let repo_s = repo.to_str().unwrap();
+
+	let payload =
+		"// file: /Users/bob/proj_suffix/src/a.ts\nexport const a = 1;\n";
+
+	let dry = snip(
+		&["--repo", repo_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	assert!(
+		text(&dry.stdout).contains("create\tsrc/a.ts"),
+		"{}",
+		text(&dry.stdout)
+	);
+
+	let apply = snip(
+		&["--repo", repo_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
+	assert_eq!(
+		fs::read_to_string(repo.join("src/a.ts")).unwrap(),
+		"export const a = 1;"
+	);
+}
+
+#[test]
+fn paste_absolute_deleted_unresolved_skipped() {
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("my_repo");
+	fs::create_dir_all(&repo).unwrap();
+	let repo_s = repo.to_str().unwrap();
+
+	let foreign_path = "/foreign_disk/other_proj/src/secret.txt";
+	let nested = repo.join("foreign_disk/other_proj/src/secret.txt");
+	fs::create_dir_all(nested.parent().unwrap()).unwrap();
+	fs::write(&nested, "preserved secret\n").unwrap();
+
+	let payload = format!("// file: [DELETED] {foreign_path}\n");
+
+	let dry = snip(
+		&["--repo", repo_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	let dry_out = text(&dry.stdout);
+	assert!(
+		dry_out.contains(
+			"skip\t/foreign_disk/other_proj/src/secret.txt\tUNRESOLVED_PATH"
+		),
+		"{dry_out}"
+	);
+
+	let apply = snip(
+		&["--repo", repo_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&apply), 0, "{}", text(&apply.stderr));
+	assert!(nested.exists(), "file at nested path must not be deleted");
+	assert_eq!(fs::read_to_string(&nested).unwrap(), "preserved secret\n");
+}
+
+#[test]
+fn paste_commits_overwrite_gate() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&src);
+	init_repo(&dst);
+
+	fs::write(src.join("file.txt"), "src v1\n").unwrap();
+	commit(&src, "add file", "2024-01-01T00:00:00+00:00");
+
+	fs::write(dst.join("file.txt"), "dst initial\n").unwrap();
+	commit(&dst, "initial dst", "2024-01-01T00:00:00+00:00");
+
+	let src_s = src.to_str().unwrap();
+	let dst_s = dst.to_str().unwrap();
+
+	let copy_out = snip(
+		&["--repo", src_s, "copy", "--commits", "-n", "1", "--stdout"],
+		None,
+	);
+	assert_eq!(code(&copy_out), 0, "{}", text(&copy_out.stderr));
+	let payload = copy_out.stdout;
+
+	let head_before = git(&dst, &["rev-parse", "HEAD"]);
+
+	// Apply without --overwrite -> exit 2, unchanged
+	let apply_no_flag = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(&payload),
+	);
+	assert_eq!(code(&apply_no_flag), 2, "{}", text(&apply_no_flag.stderr));
+	assert!(
+		text(&apply_no_flag.stderr).contains(
+			"destination file(s) already exist; commit payloads need --overwrite"
+		),
+		"{}",
+		text(&apply_no_flag.stderr)
+	);
+	assert_eq!(
+		fs::read_to_string(dst.join("file.txt")).unwrap(),
+		"dst initial\n"
+	);
+	assert_eq!(git(&dst, &["rev-parse", "HEAD"]), head_before);
+
+	// Apply with --overwrite -> exit 0, commit created
+	let apply_overwrite = snip(
+		&[
+			"--repo",
+			dst_s,
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		],
+		Some(&payload),
+	);
+	assert_eq!(
+		code(&apply_overwrite),
+		0,
+		"{}",
+		text(&apply_overwrite.stderr)
+	);
+	assert!(text(&apply_overwrite.stdout).contains("Created 1 commit(s)."));
+	assert_eq!(
+		fs::read_to_string(dst.join("file.txt")).unwrap(),
+		"src v1\n"
+	);
+	assert_ne!(git(&dst, &["rev-parse", "HEAD"]), head_before);
+
+	// A payload whose targets do not exist needs no flag
+	let dst2 = tmp.path().join("dst2");
+	fs::create_dir_all(&dst2).unwrap();
+	init_repo(&dst2);
+	fs::write(dst2.join("other.txt"), "other\n").unwrap();
+	commit(&dst2, "other commit", "2024-01-01T00:00:00+00:00");
+	let dst2_s = dst2.to_str().unwrap();
+
+	let apply_fresh = snip(
+		&["--repo", dst2_s, "paste", "--apply", "--stdin"],
+		Some(&payload),
+	);
+	assert_eq!(code(&apply_fresh), 0, "{}", text(&apply_fresh.stderr));
+	assert!(text(&apply_fresh.stdout).contains("Created 1 commit(s)."));
+	assert_eq!(
+		fs::read_to_string(dst2.join("file.txt")).unwrap(),
+		"src v1\n"
+	);
+}
+
+#[test]
+fn paste_commits_disallowed_flags_exit_two() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&src);
+	init_repo(&dst);
+
+	fs::write(src.join("foo.txt"), "foo\n").unwrap();
+	commit(&src, "add foo", "2024-01-01T00:00:00+00:00");
+
+	fs::write(dst.join("bar.txt"), "bar\n").unwrap();
+	commit(&dst, "initial dst", "2024-01-01T00:00:00+00:00");
+
+	let src_s = src.to_str().unwrap();
+	let dst_s = dst.to_str().unwrap();
+
+	let copy_out = snip(
+		&["--repo", src_s, "copy", "--commits", "-n", "1", "--stdout"],
+		None,
+	);
+	assert_eq!(code(&copy_out), 0, "{}", text(&copy_out.stderr));
+	let payload = copy_out.stdout;
+
+	let head_before = git(&dst, &["rev-parse", "HEAD"]);
+
+	let flag_combos = [
+		vec!["--apply", "--skip-existing"],
+		vec!["--apply", "--adjust-paths"],
+		vec!["--dry-run", "--skip-existing"],
+		vec!["--dry-run", "--adjust-paths"],
+	];
+
+	for flags in &flag_combos {
+		let mut args = vec!["--repo", dst_s, "paste"];
+		args.extend(flags);
+		args.push("--stdin");
+		let out = snip(&args, Some(&payload));
+		assert_eq!(
+			code(&out),
+			2,
+			"flags {flags:?} did not exit 2: {}",
+			text(&out.stderr)
+		);
+		assert_eq!(
+			git(&dst, &["rev-parse", "HEAD"]),
+			head_before,
+			"HEAD changed under flags {flags:?}"
+		);
+		assert!(
+			!dst.join("foo.txt").exists(),
+			"file written under flags {flags:?}"
+		);
+	}
+}
+
+#[test]
+fn paste_adjust_paths_strip_and_add() {
+	let tmp = tempfile::tempdir().unwrap();
+
+	// 1. Strip scenario:
+	// Repo folder named "proj", payload starts with "proj/..."
+	let proj = tmp.path().join("proj");
+	fs::create_dir_all(&proj).unwrap();
+	init_repo(&proj);
+	let proj_s = proj.to_str().unwrap();
+
+	let payload_strip =
+		"// clipcode-root: workspace\n// file: proj/sub/hello.txt\nhello content\n";
+
+	// Without --adjust-paths: hint on stderr, unadjusted path in dry-run
+	let dry_unadjusted = snip(
+		&["--repo", proj_s, "paste", "--dry-run", "--stdin"],
+		Some(payload_strip.as_bytes()),
+	);
+	assert_eq!(code(&dry_unadjusted), 0, "{}", text(&dry_unadjusted.stderr));
+	let dry_stderr = text(&dry_unadjusted.stderr);
+	assert!(
+		dry_stderr.contains("These paths look like they belong elsewhere in this folder. Pass --adjust-paths to remove the leading \"proj/\""),
+		"{dry_stderr}"
+	);
+	assert!(
+		text(&dry_unadjusted.stdout).contains("create\tproj/sub/hello.txt"),
+		"{}",
+		text(&dry_unadjusted.stdout)
+	);
+
+	// With --adjust-paths: adjusted dry-run
+	let dry_adjusted = snip(
+		&[
+			"--repo",
+			proj_s,
+			"paste",
+			"--dry-run",
+			"--adjust-paths",
+			"--stdin",
+		],
+		Some(payload_strip.as_bytes()),
+	);
+	assert_eq!(code(&dry_adjusted), 0, "{}", text(&dry_adjusted.stderr));
+	let dry_adj_stderr = text(&dry_adjusted.stderr);
+	assert!(
+		dry_adj_stderr
+			.contains("Adjusting paths: remove the leading \"proj/\""),
+		"{dry_adj_stderr}"
+	);
+	assert!(
+		text(&dry_adjusted.stdout).contains("create\tsub/hello.txt"),
+		"{}",
+		text(&dry_adjusted.stdout)
+	);
+
+	// With --adjust-paths: apply writes at adjusted location
+	let apply_strip = snip(
+		&[
+			"--repo",
+			proj_s,
+			"paste",
+			"--apply",
+			"--adjust-paths",
+			"--stdin",
+		],
+		Some(payload_strip.as_bytes()),
+	);
+	assert_eq!(code(&apply_strip), 0, "{}", text(&apply_strip.stderr));
+	assert_eq!(
+		fs::read_to_string(proj.join("sub/hello.txt")).unwrap(),
+		"hello content"
+	);
+	assert!(!proj.join("proj").exists());
+
+	// 2. Add scenario:
+	// Repo folder named "myrepo" with subfolder "backend", payload relative to backend
+	let myrepo = tmp.path().join("myrepo");
+	fs::create_dir_all(myrepo.join("backend")).unwrap();
+	init_repo(&myrepo);
+	let myrepo_s = myrepo.to_str().unwrap();
+
+	let payload_add =
+		"// clipcode-root: backend\n// file: src/app.rs\nfn run() {}\n";
+
+	// Without --adjust-paths: hint on stderr, unadjusted path in dry-run
+	let dry_unadjusted_add = snip(
+		&["--repo", myrepo_s, "paste", "--dry-run", "--stdin"],
+		Some(payload_add.as_bytes()),
+	);
+	assert_eq!(
+		code(&dry_unadjusted_add),
+		0,
+		"{}",
+		text(&dry_unadjusted_add.stderr)
+	);
+	let dry_add_stderr = text(&dry_unadjusted_add.stderr);
+	assert!(
+		dry_add_stderr.contains("These paths look like they belong elsewhere in this folder. Pass --adjust-paths to place everything under \"backend/\""),
+		"{dry_add_stderr}"
+	);
+	assert!(
+		text(&dry_unadjusted_add.stdout).contains("create\tsrc/app.rs"),
+		"{}",
+		text(&dry_unadjusted_add.stdout)
+	);
+
+	// With --adjust-paths: adjusted dry-run
+	let dry_adjusted_add = snip(
+		&[
+			"--repo",
+			myrepo_s,
+			"paste",
+			"--dry-run",
+			"--adjust-paths",
+			"--stdin",
+		],
+		Some(payload_add.as_bytes()),
+	);
+	assert_eq!(
+		code(&dry_adjusted_add),
+		0,
+		"{}",
+		text(&dry_adjusted_add.stderr)
+	);
+	let dry_adj_add_stderr = text(&dry_adjusted_add.stderr);
+	assert!(
+		dry_adj_add_stderr
+			.contains("Adjusting paths: place everything under \"backend/\""),
+		"{dry_adj_add_stderr}"
+	);
+	assert!(
+		text(&dry_adjusted_add.stdout).contains("create\tbackend/src/app.rs"),
+		"{}",
+		text(&dry_adjusted_add.stdout)
+	);
+
+	// With --adjust-paths: apply writes at adjusted location
+	let apply_add = snip(
+		&[
+			"--repo",
+			myrepo_s,
+			"paste",
+			"--apply",
+			"--adjust-paths",
+			"--stdin",
+		],
+		Some(payload_add.as_bytes()),
+	);
+	assert_eq!(code(&apply_add), 0, "{}", text(&apply_add.stderr));
+	assert_eq!(
+		fs::read_to_string(myrepo.join("backend/src/app.rs")).unwrap(),
+		"fn run() {}"
+	);
+	assert!(!myrepo.join("src").exists());
+}
+
+#[test]
+fn paste_symlink_spelled_repo_round_trip() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src_real");
+	let dst = tmp.path().join("dst_real");
+	fs::create_dir_all(&src).unwrap();
+	fs::create_dir_all(&dst).unwrap();
+
+	fs::write(src.join("hello.txt"), "hello from symlink\n").unwrap();
+
+	#[cfg(unix)]
+	let (src_run, dst_run) = {
+		let sym_src = tmp.path().join("sym_src");
+		let sym_dst = tmp.path().join("sym_dst");
+		std::os::unix::fs::symlink(&src, &sym_src).unwrap();
+		std::os::unix::fs::symlink(&dst, &sym_dst).unwrap();
+		(sym_src, sym_dst)
+	};
+	#[cfg(not(unix))]
+	let (src_run, dst_run) = (src.clone(), dst.clone());
+
+	let copy_out = snip_in_dir(
+		&[
+			"--repo",
+			src_run.to_str().unwrap(),
+			"copy",
+			"hello.txt",
+			"--stdout",
+		],
+		None,
+		&src_run,
+	);
+	assert_eq!(code(&copy_out), 0, "{}", text(&copy_out.stderr));
+
+	let paste_out = snip(
+		&[
+			"--repo",
+			dst_run.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--stdin",
+		],
+		Some(&copy_out.stdout),
+	);
+	assert_eq!(code(&paste_out), 0, "{}", text(&paste_out.stderr));
+	assert_eq!(
+		fs::read_to_string(dst.join("hello.txt")).unwrap(),
+		"hello from symlink"
+	);
 }

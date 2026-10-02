@@ -322,7 +322,11 @@ fn commit_mode_replays_onto_another_clones_branch() {
 		note.contains("commit 3: bin.dat not copied (BINARY)"),
 		"{note}"
 	);
-	let out = snip(&b, &["paste", "--apply", "--stdin"], Some(&out.stdout));
+	let out = snip(
+		&b,
+		&["paste", "--apply", "--overwrite", "--stdin"],
+		Some(&out.stdout),
+	);
 	assert!(text(&out.stdout).contains("Created 3 commit(s)."));
 
 	assert_eq!(

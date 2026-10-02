@@ -64,13 +64,13 @@
 3. 確認後執行。執行前**重新檢查**一次路徑與編碼(預覽期間檔案系統可能已經變了)。
 4. 結果:成功 / 跳過 / 失敗各幾個,失敗的列出原因。
 
-- 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 現已如此,CLI 於統一引擎遷移[階段 6]後同樣):
+- 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 與 CLI 於階段 6 皆已採用):
   (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;偵測目的端是否不分大小寫,不分大小寫則新目標也摺疊大小寫(D10,階段 5b 已實作);以及 symlink 別名、同一路徑出現兩次)就整批拒絕;
   (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
   這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
 - 安全規則照 porting-notes 第 3 節:路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、
   placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8。
-- CLI 補充(目標行為/CLI 於階段 6 遷移後):絕對路徑在 sanitize 前先解析(root 內部、跨機器後綴 → 相對路徑,同 TS);絕對 [DELETED] 解析不到 root → 拒絕(視為 unsafe/unresolved 跳過,同 TS);寫入對不到 root 的 POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`)→ 去首斜線放主 root 下(同 TS);帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因 `sanitize_relative_path` 的絕對路徑/磁碟機檢查(`is_absolute_path`/`has_drive_slash`)而跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`。CLI 只有單一 root。
+- CLI 補充(現行行為/CLI 於階段 6 已切換):絕對路徑在 sanitize 前先解析(root 內部、跨機器後綴 → 相對路徑,同 TS);絕對 [DELETED] 解析不到 root → 拒絕(視為 unsafe/unresolved 跳過,同 TS);寫入對不到 root 的 POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`)→ 去首斜線放主 root 下(同 TS);帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因 `sanitize_relative_path` 的絕對路徑/磁碟機檢查(`is_absolute_path`/`has_drive_slash`)而跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`。CLI 只有單一 root。
 
 CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --skip-existing]`。
 

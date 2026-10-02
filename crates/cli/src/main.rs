@@ -12,20 +12,23 @@ use std::process::ExitCode;
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use snip_core::clip::{self, Mode};
-use snip_core::commits::{self, CommitCopySummary, CommitsPayload};
+use snip_core::commits::{
+	self, CommitCopySummary, CommitsPayload, ReplayAction,
+};
 use snip_core::copy::CopyResult;
 use snip_core::format::{extract_source_root, parse_clipboard};
 use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::{Git, GitSource};
 use snip_core::restore::{
-	apply_restore_base, execute_restore_plan, is_relative, plan_restore,
-	suggest_restore_base, FsProbe, RestorePlan, RestoreSelection,
+	apply_restore_base, is_relative, suggest_restore_base, FsProbe,
+	RestorePlan, RestoreSelection,
 };
 use snip_core::settings::Settings;
 use snip_core::transfer::{
 	changed_items, plan_commit_export_with, plan_export_expanding,
-	plan_export_with, selection_from_paths, CanonicalRootId, ExportSelection,
-	TransferError, CLIPBOARD_PAYLOAD_MAX,
+	plan_export_with, plan_import_with, selection_from_paths, CanonicalRootId,
+	CommitReplayPreview, ExportSelection, ImportMapping, TransferError,
+	CLIPBOARD_PAYLOAD_MAX,
 };
 
 mod remote;
@@ -625,13 +628,25 @@ fn paste(
 	}
 }
 
+fn format_transfer_error(err: TransferError) -> String {
+	match err {
+		TransferError::TargetCollision { .. } => {
+			format!("Snipcode refused to paste: {err}")
+		}
+		TransferError::StaleDestination { .. } => {
+			format!("Snipcode refused to paste: {err}; re-run to inspect updated destinations")
+		}
+		other => other.to_string(),
+	}
+}
+
 fn paste_files(
 	repo: &Path,
 	text: &str,
 	settings: &Settings,
 	opts: &PasteOptions,
 ) -> Outcome {
-	let mut entries = parse_clipboard(text, &settings.header_format);
+	let entries = parse_clipboard(text, &settings.header_format);
 	if entries.is_empty() {
 		return Err("No Snipcode file headers found in clipboard.".into());
 	}
@@ -645,7 +660,7 @@ fn paste_files(
 		&FsProbe,
 		extract_source_root(text).as_deref(),
 	);
-	if let Some(s) = suggestion {
+	if let Some(ref s) = suggestion {
 		let example = paths
 			.iter()
 			.find(|p| is_relative(p) && p.contains('/'))
@@ -658,11 +673,6 @@ fn paste_files(
 				"Adjusting paths: {} for all {} file(s).{example}",
 				s.label, s.total
 			);
-			for e in &mut entries {
-				if is_relative(&e.path) {
-					e.path = apply_restore_base(&s.base, &e.path);
-				}
-			}
 		} else {
 			eprintln!(
 				"These paths look like they belong elsewhere in this folder. \
@@ -672,9 +682,26 @@ fn paste_files(
 		}
 	}
 
-	let plan = plan_restore(&[repo], &entries);
+	let root_id = CanonicalRootId::new(repo)
+		.map_err(TransferError::from)
+		.map_err(format_transfer_error)?;
+	let mapping = match (&suggestion, opts.adjust_paths) {
+		(Some(s), true) => ImportMapping::from_restore_base(s, root_id),
+		_ => ImportMapping::with_primary(root_id),
+	};
+
+	let import_plan = plan_import_with(
+		text,
+		&settings.header_format,
+		&[repo.to_path_buf()],
+		&mapping,
+		&RunOptions::default(),
+	)
+	.map_err(format_transfer_error)?;
+
+	let plan = import_plan.restore_plan();
 	if !opts.apply {
-		print_plan(&plan);
+		print_plan(plan);
 	}
 	if plan.create_operations.is_empty() && plan.delete_operations.is_empty() {
 		eprintln!(
@@ -683,7 +710,7 @@ fn paste_files(
 		);
 		return Ok(());
 	}
-	eprintln!("{}", confirmation_summary(&plan));
+	eprintln!("{}", confirmation_summary(plan));
 	if !opts.apply {
 		return Ok(());
 	}
@@ -694,14 +721,14 @@ fn paste_files(
 			"{existing} file(s) already exist; pass --overwrite or --skip-existing"
 		));
 	}
-	let result = execute_restore_plan(
-		&plan,
-		&RestoreSelection {
+	let result = import_plan
+		.apply(&RestoreSelection {
 			overwrite_existing: opts.overwrite,
 			skip_existing: opts.skip_existing,
 			..Default::default()
-		},
-	);
+		})
+		.map_err(format_transfer_error)?;
+
 	let parts: Vec<String> = [
 		("Created", result.created_count),
 		("Overwritten", result.overwritten_count),
@@ -752,11 +779,20 @@ fn confirmation_summary(plan: &RestorePlan) -> String {
 }
 
 fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
+	if opts.skip_existing {
+		usage("commit payloads do not support --skip-existing");
+	}
+	if opts.adjust_paths {
+		usage("commit payloads do not support --adjust-paths");
+	}
 	let payload =
 		commits::parse_commit_payload(text).map_err(|e| e.to_string())?;
+
+	let preview = CommitReplayPreview::capture(repo, &payload)
+		.map_err(format_transfer_error)?;
+
 	if !opts.apply {
-		let git = Git::open(repo).map_err(|e| e.to_string())?;
-		let plan = commits::plan_commit_replay(&git, &payload);
+		let plan = preview.plan();
 		let total = plan.commits.len();
 		for (i, c) in plan.commits.iter().enumerate() {
 			let subject = c.message.lines().next().unwrap_or("");
@@ -805,10 +841,26 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 		}
 		return Ok(());
 	}
-	let preview =
-		snip_core::transfer::CommitReplayPreview::capture(repo, &payload)
-			.map_err(|e| e.to_string())?;
-	let result = preview.apply().map_err(|e| e.to_string())?;
+
+	let existing = preview
+		.plan()
+		.commits
+		.iter()
+		.flat_map(|c| &c.files)
+		.filter(|f| {
+			f.layout_conflict.is_none()
+				&& f.action == ReplayAction::Write
+				&& f.existed
+		})
+		.count();
+	if existing > 0 && !opts.overwrite {
+		preview.revalidate().map_err(format_transfer_error)?;
+		usage(format!(
+			"{existing} destination file(s) already exist; commit payloads need --overwrite"
+		));
+	}
+
+	let result = preview.apply().map_err(format_transfer_error)?;
 	println!("Created {} commit(s).", result.created.len());
 	for sha in &result.created {
 		println!("  {sha}");

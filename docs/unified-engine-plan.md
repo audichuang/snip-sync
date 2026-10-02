@@ -213,6 +213,8 @@ CLI 用 restore-base(一個全體套用的 Strip/Add 建議,讀 `clipcode-root`)
 
 ### 階段 6 — CLI `paste` 改走 transfer(F1、F2、F10 的 CLI 端)
 
+狀態:已完成(CLI paste 檔案與 commit 模式切換至 transfer 引擎管線;檔案模式經 CanonicalRootId 與 ImportMapping 進行路徑與 --adjust-paths 重整,套用 plan_import_with 與 apply 檢驗 destination freshness,TargetCollision/StaleDestination exit 1;commit 模式統一由 CommitReplayPreview::capture 生成預覽,依 D9 判定以 FilePlan.existed 實作覆寫防護 gate(寫入存在檔案且未給 --overwrite 時 exit 2),對 commit payload 之 --skip-existing / --adjust-paths 嚴格 exit 2;cli.rs 補齊 F1 大小寫別名、D10 大小寫碰撞、root 內部絕對路徑、跨機器後綴、未解析 DELETED 跳過、commit --overwrite 門禁、commit 不支援旗標、--adjust-paths Strip/Add 與 symlink 拼寫儲存庫等回歸測試)
+
 - 前置決策已定案:commit payload 覆寫判定依 D9(以 `FilePlan.existed` 判定),絕對路徑與大小寫別名 core 匯入問題已於階段 5b(D8、D10)修復。
 - 檔案 payload:`plan_import_with(text, header, &[repo], mapping, opts)`,mapping 為 `with_primary(repo)`,`--adjust-paths` 時由 `from_restore_base` 產生;`--dry-run` 印 `TransferImportPlan` 的 create/overwrite/delete/skip(輸出格式不變);`--apply` 呼叫 `TransferImportPlan::apply(&RestoreSelection{overwrite_existing / skip_existing})`。
 - `TargetCollision`、`StaleDestination` 對應到清楚的錯誤訊息與 exit 1(依 D1)。
