@@ -50,7 +50,7 @@
 - 非 UTF-8 檔案(含二進位、UTF-16)**跳過**,不進剪貼簿,只計入通知。
 - 讀不到的檔案放 placeholder,不算已複製、不佔檔案數上限。
 - 過濾規則、大小與數量上限:與 IDE 套件相同。
-- 複製上限統一為 32 MiB(core 常數 `transfer::CLIPBOARD_PAYLOAD_MAX`,兩個介面共用,與貼上預覽預算一致;現況為 GUI 複製上限 64 MiB、CLI 無上限,32 MiB 是統一後實作目標);超過是明確錯誤(CLI exit 1),不截斷。
+- 複製上限統一為 32 MiB(core 常數 `transfer::CLIPBOARD_PAYLOAD_MAX`,兩個介面共用,與貼上預覽預算一致;GUI 複製上限已為 32 MiB(階段 2),CLI 於階段 3/4 採用(目前無上限));超過是明確錯誤(CLI exit 1),不截斷。
 - `snip copy <路徑…>` 規則(目標行為/CLI 於階段 4 遷移後):相對路徑以 cwd 解析;路徑不存在 exit 1;路徑在 `--repo` 外 exit 1;結果為空時顯示「No files selected.」exit 1 且不改剪貼簿。
 
 複製完成的通知:**與 IDE 套件相同**,顯示檔案數、字元數、行數、字數、token 數,以及跳過了幾個檔案。

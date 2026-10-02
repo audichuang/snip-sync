@@ -163,6 +163,71 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 	}
 }
 
+fn collect_root_children(
+	canonical_root: &CanonicalRootId,
+	source_path: &Path,
+	items: &mut Vec<ExportItem>,
+	seen: &mut HashSet<String>,
+	skipped: &mut usize,
+) -> Result<(), TransferError> {
+	let read_dir = match std::fs::read_dir(canonical_root.path()) {
+		Ok(rd) => rd,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			return Err(TransferError::PathNotFound(source_path.to_path_buf()));
+		}
+		Err(e) => return Err(TransferError::Io(e)),
+	};
+	let mut child_names = Vec::new();
+	for entry in read_dir {
+		let entry = entry?;
+		let name = entry.file_name();
+		if name == ".git" {
+			continue;
+		}
+		child_names.push(name);
+	}
+	fsutil::sort_names_js_order(&mut child_names);
+
+	for name in child_names {
+		let Some(name_str) = name.to_str() else {
+			*skipped += 1;
+			continue;
+		};
+		let child_path = canonical_root.path().join(&name);
+		let child_sym_meta = match std::fs::symlink_metadata(&child_path) {
+			Ok(m) => m,
+			Err(_) => {
+				*skipped += 1;
+				continue;
+			}
+		};
+		if child_sym_meta.is_dir() {
+			if seen.insert(name_str.to_string()) {
+				items.push(ExportItem {
+					root: canonical_root.clone(),
+					relative_path: name_str.to_string(),
+					source: SourceKind::File,
+					change_type: None,
+				});
+			}
+		} else if let Some(valid_rel) =
+			folder_file_rel(canonical_root.path(), &child_path)
+		{
+			if seen.insert(valid_rel.clone()) {
+				items.push(ExportItem {
+					root: canonical_root.clone(),
+					relative_path: valid_rel,
+					source: SourceKind::File,
+					change_type: None,
+				});
+			}
+		} else {
+			*skipped += 1;
+		}
+	}
+	Ok(())
+}
+
 /// Creates an export selection from user-specified path arguments, resolving relative paths against `cwd`.
 pub fn selection_from_paths(
 	root: &Path,
@@ -184,18 +249,25 @@ pub fn selection_from_paths(
 		};
 		let normalized = lexical_normalize(&full_path);
 
+		let is_root = normalized == lexical_normalize(root)
+			|| normalized == canonical_root.path()
+			|| dunce::canonicalize(&normalized).ok().as_deref()
+				== Some(canonical_root.path());
+		if is_root {
+			collect_root_children(
+				&canonical_root,
+				path,
+				&mut items,
+				&mut seen,
+				&mut skipped,
+			)?;
+			continue;
+		}
+
 		let (parent, file_name) =
 			match (normalized.parent(), normalized.file_name()) {
 				(Some(p), Some(f)) => (p, f),
-				_ => {
-					if normalized != canonical_root.path() && normalized != root
-					{
-						return Err(TransferError::PathOutsideRoot(
-							path.clone(),
-						));
-					}
-					(normalized.as_path(), std::ffi::OsStr::new(""))
-				}
+				_ => return Err(TransferError::PathOutsideRoot(path.clone())),
 			};
 
 		let canonical_parent = match dunce::canonicalize(parent) {
@@ -211,11 +283,7 @@ pub fn selection_from_paths(
 			Err(e) => return Err(TransferError::Io(e)),
 		};
 
-		let target = if file_name.is_empty() {
-			canonical_parent
-		} else {
-			canonical_parent.join(file_name)
-		};
+		let target = canonical_parent.join(file_name);
 
 		let rel = match target.strip_prefix(canonical_root.path()) {
 			Ok(r) => r,
@@ -223,63 +291,13 @@ pub fn selection_from_paths(
 		};
 
 		if rel.as_os_str().is_empty() {
-			let read_dir = match std::fs::read_dir(canonical_root.path()) {
-				Ok(rd) => rd,
-				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-					return Err(TransferError::PathNotFound(path.clone()));
-				}
-				Err(e) => return Err(TransferError::Io(e)),
-			};
-			let mut child_names = Vec::new();
-			for entry in read_dir {
-				let entry = entry?;
-				let name = entry.file_name();
-				if name == ".git" {
-					continue;
-				}
-				child_names.push(name);
-			}
-			child_names
-				.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
-
-			for name in child_names {
-				let Some(name_str) = name.to_str() else {
-					skipped += 1;
-					continue;
-				};
-				let child_path = canonical_root.path().join(&name);
-				let child_sym_meta =
-					match std::fs::symlink_metadata(&child_path) {
-						Ok(m) => m,
-						Err(_) => {
-							skipped += 1;
-							continue;
-						}
-					};
-				if child_sym_meta.is_dir() {
-					if seen.insert(name_str.to_string()) {
-						items.push(ExportItem {
-							root: canonical_root.clone(),
-							relative_path: name_str.to_string(),
-							source: SourceKind::File,
-							change_type: None,
-						});
-					}
-				} else if let Some(valid_rel) =
-					folder_file_rel(canonical_root.path(), &child_path)
-				{
-					if seen.insert(valid_rel.clone()) {
-						items.push(ExportItem {
-							root: canonical_root.clone(),
-							relative_path: valid_rel,
-							source: SourceKind::File,
-							change_type: None,
-						});
-					}
-				} else {
-					skipped += 1;
-				}
-			}
+			collect_root_children(
+				&canonical_root,
+				path,
+				&mut items,
+				&mut seen,
+				&mut skipped,
+			)?;
 			continue;
 		}
 
@@ -340,4 +358,55 @@ pub fn selection_from_paths(
 	)?;
 
 	Ok(PathSelection { sel, skipped })
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_selection_from_paths_child_sort_order_matches_list_files_recursive()
+	{
+		let dir = tempfile::tempdir().unwrap();
+		let f1 = "\u{FF5E}.txt";
+		let f2 = "\u{1F600}.txt";
+		let p1 = dir.path().join(f1);
+		let p2 = dir.path().join(f2);
+		if std::fs::write(&p1, "1").is_err()
+			|| std::fs::write(&p2, "2").is_err()
+		{
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"filesystem refused UTF-16/surrogate test filenames"
+			);
+			return;
+		}
+
+		let sel =
+			selection_from_paths(dir.path(), dir.path(), &[PathBuf::from(".")])
+				.unwrap();
+		let sel_names: Vec<String> = sel
+			.sel
+			.items
+			.into_iter()
+			.map(|item| item.relative_path)
+			.collect();
+
+		let walk_names: Vec<String> =
+			fsutil::list_files_recursive(dir.path(), |_| true)
+				.filter_map(|w| match w {
+					fsutil::WalkItem::File(p) => p
+						.file_name()
+						.and_then(|n| n.to_str())
+						.map(ToString::to_string),
+					_ => None,
+				})
+				.collect();
+
+		assert_eq!(sel_names, walk_names);
+		assert_eq!(
+			sel_names,
+			vec!["\u{1F600}.txt".to_string(), "\u{FF5E}.txt".to_string()]
+		);
+	}
 }

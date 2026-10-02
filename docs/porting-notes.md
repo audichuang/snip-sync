@@ -25,7 +25,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 ### 已知且接受的差異
 
 - 原生工作台(`desktop-native`)的檔案模式上限是 10,000 個檔案(`NATIVE_FILE_COUNT_LIMIT`),不是 ClipCode 預設的 30:它沒有設定畫面,
-  而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 payload 上限約束(現況 64 MiB;統一後為 32 MiB `CLIPBOARD_PAYLOAD_MAX`,超過是明確錯誤)。payload 格式不變。
+  而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 payload 上限約束(GUI 複製上限現為 32 MiB(`CLIPBOARD_PAYLOAD_MAX`,階段 2 起),CLI 於階段 3/4 採用,超過是明確錯誤)。payload 格式不變。
   碰到上限時狀態列與複製提示明說「已達 N 個檔案上限,其餘檔案未複製」,不會默默少檔。
   截斷順序:單獨選的檔案與 Changes / Log 項目先保留名額;資料夾依選取籃順序(root 依路徑排序,
   root 內的專案選取依相對路徑排序)分用剩下的名額,先到先用,走訪到上限多一個檔案就停,不把大資料夾整個列出。
@@ -105,11 +105,11 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   (1)「the same path twice is planned twice, in order」:TS 照順序規劃兩次;CLI 改走 `plan_import_with` 後因偵測到重複目標路徑,觸發 `TargetCollision` 整批拒絕。
   (2)「a sibling root label targets that root」:TS 支援多 root 對應;CLI 目前僅支援單一儲存庫/工作區 root(`ImportMapping::with_primary`),不需多 root 標籤對應。
   (3)「an absolute path matching no root is kept literally under the primary root」:與 TS 不同的只有帶磁碟機代號的路徑(`UNRESOLVED_PATH`,TS 寫為 `D/work/lib/b.ts`),原因是 `sanitize_relative_path` 內的 `is_absolute_path`/`has_drive_slash` 檢查(`D:\` 或 `D:/` 開頭視為絕對路徑故回傳 None),而不是冒號規則。POSIX 絕對路徑在所有 root 外部且無後綴符合時,去首斜線寫在主 root 下,同 TS;root 內部絕對路徑與跨機器後綴符合經 D8 在 core 修好後亦解析為相對路徑,與 TS 一致,故不是差異。且**絕對路徑的 [DELETED] 若解析不到任何 root → 拒絕(視為 unsafe/unresolved 跳過),與 TS 一致;目前 `plan_import_with`(GUI)巢狀刪除是 bug,階段 5b 修**。  狀態:規劃(CLI 於階段 6 遷移後生效)。
-- 剪貼簿 payload 上限統一(`transfer::CLIPBOARD_PAYLOAD_MAX` = 32 MiB):核心定義單一常數,CLI 與 GUI 複製流程共用,與貼上預覽預算(32 MiB)一致,避免「GUI 複製成功但另一端貼上超限」。超過上限時為明確錯誤(CLI exit 1),不進行默默截斷。TS 原生無此統一常數約束(現況為 GUI 複製上限 64 MiB、CLI 無上限)。狀態:規劃(核心於階段 2 定義常數,階段 3/4 CLI 採用,GUI 後續統一)。
-- commit 區間複製與路徑重新定位機制(規劃中,尚未實作):
-  (1) `--range a..b`:核心 `transfer` 將新增 `SourceKind::Range { base, tip }` 來源型別(刪除檔案讀取 `base:<path>`),供 CLI 與 GUI 共用,取代舊有 gitsrc 獨立實作(階段 2 / 階段 5)。
-  (2) 路徑重新定位:CLI `--adjust-paths` 將透過核心新增的 `ImportMapping::from_restore_base(&RestoreBaseSuggestion, primary)` 轉換為統一的 `ImportMapping`,GUI 則維持現有逐 prefix 選擇的介面不變(階段 2 / 階段 6)。
-  狀態:規劃中,尚未實作。
+- 剪貼簿 payload 上限統一(`transfer::CLIPBOARD_PAYLOAD_MAX` = 32 MiB):核心定義單一常數,CLI 與 GUI 複製流程共用,與貼上預覽預算(32 MiB)一致,避免「GUI 複製成功但另一端貼上超限」。超過上限時為明確錯誤(CLI exit 1),不進行默默截斷。TS 原生無此統一常數約束(GUI 複製(`plan_export_with` 與 `plan_commit_export_exact_with`)於階段 2 起使用 32 MiB(原為 64 MiB)、CLI 無上限)。狀態: core 常數與 GUI 已生效,CLI 於階段 3/4 採用。
+- commit 區間複製與路徑重新定位機制:
+  (1) `--range a..b`:核心 `transfer` 已新增 `SourceKind::Range { base, tip }` 來源型別(刪除檔案讀取 `base:<path>`),供 CLI 與 GUI 共用(階段 2),CLI 於階段 5 切換採用。
+  (2) 路徑重新定位:核心已新增 `ImportMapping::from_restore_base(&RestoreBaseSuggestion, primary)`(階段 2),供 CLI `--adjust-paths` 轉換為統一的 `ImportMapping`(CLI 於階段 6 切換採用),GUI 則維持現有逐 prefix 選擇的介面不變。
+  狀態: core 已於階段 2 提供(`SourceKind::Range` 與 `ImportMapping::from_restore_base`),CLI 於階段 5/6 切換採用。
 - CLI 路徑複製解析規則(`snip copy <paths>`):相對路徑以 shell 目前工作目錄(cwd)解析;指定路徑不存在時 exit 1;指定路徑超出 `--repo` 邊界時 exit 1(舊引擎原先會賦予絕對路徑 label,transfer 無法表達此種跨 root 邊界 entry,故嚴格阻擋);若解析結果為空,顯示「No files selected.」以 exit 1 退出且不修改剪貼簿內容(符合決策 T-11)。狀態:規劃(CLI 於階段 4 遷移後生效)。
 
 

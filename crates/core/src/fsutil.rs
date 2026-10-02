@@ -2,6 +2,7 @@
 //!
 //! Port of `fileSystem.ts`, synchronous.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -118,14 +119,19 @@ impl<F: FnMut(&Path) -> bool> Iterator for ListFiles<F> {
 				return Some(WalkItem::UnreadableDir(path));
 			};
 			// JS Array.prototype.sort compares UTF-16 code units.
-			names.sort_by_cached_key(|n| {
-				n.to_string_lossy().encode_utf16().collect::<Vec<u16>>()
-			});
+			sort_names_js_order(&mut names);
 			self.stack
 				.extend(names.into_iter().rev().map(|n| (path.join(n), false)));
 		}
 		None
 	}
+}
+
+/// Sorts filenames by UTF-16 code units, matching JavaScript's `Array.prototype.sort`.
+pub(crate) fn sort_names_js_order(names: &mut [OsString]) {
+	names.sort_by_cached_key(|n| {
+		n.to_string_lossy().encode_utf16().collect::<Vec<u16>>()
+	});
 }
 
 /// Writes UTF-8 `content`, creating parent directories as needed.

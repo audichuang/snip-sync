@@ -4427,6 +4427,36 @@ fn test_selection_from_paths_root_through_symlink() {
 	assert_eq!(res.sel.primary_root, Some(repo.canonical_id()));
 	assert_eq!(res.sel.items.len(), 1);
 	assert_eq!(res.sel.items[0].relative_path, "file.txt");
+
+	let sub = repo.path().join("sub");
+	fs::create_dir(&sub).unwrap();
+	let alias_sub = alias_path.join("sub");
+
+	let expected =
+		selection_from_paths(repo.path(), repo.path(), &[PathBuf::from(".")])
+			.unwrap();
+
+	// 1. "." with cwd = alias
+	let case_dot =
+		selection_from_paths(&alias_path, &alias_path, &[PathBuf::from(".")])
+			.unwrap();
+	assert_eq!(case_dot.sel.items, expected.sel.items);
+
+	// 2. The alias path itself as the argument (cwd elsewhere)
+	let elsewhere = alias_dir.path();
+	let case_alias = selection_from_paths(
+		&alias_path,
+		elsewhere,
+		std::slice::from_ref(&alias_path),
+	)
+	.unwrap();
+	assert_eq!(case_alias.sel.items, expected.sel.items);
+
+	// 3. ".." with cwd alias/sub
+	let case_dotdot =
+		selection_from_paths(&alias_path, &alias_sub, &[PathBuf::from("..")])
+			.unwrap();
+	assert_eq!(case_dotdot.sel.items, expected.sel.items);
 }
 
 // ---------------------------------------------------------------------------
@@ -4502,8 +4532,11 @@ fn test_from_restore_base_equivalence() {
 	let add_mapping =
 		ImportMapping::from_restore_base(&add_suggestion, primary);
 
-	let entries_add =
-		[("src/lib.rs", "fn lib() {}"), ("README.md", "# Readme")];
+	let entries_add = [
+		("src/lib.rs", "fn lib() {}"),
+		("README.md", "# Readme"),
+		("/elsewhere/x.txt", "fn x() {}"),
+	];
 	let mut payload_add = String::new();
 	for (p, c) in entries_add {
 		payload_add.push_str(&format!("file: {p}\n{c}\n"));
@@ -4519,22 +4552,30 @@ fn test_from_restore_base_equivalence() {
 	.unwrap();
 
 	for (p, c) in entries_add {
-		let expected_rel = restore::apply_restore_base(&add_suggestion.base, p);
+		let expected_path = if restore::is_relative(p) {
+			restore::apply_restore_base(&add_suggestion.base, p)
+		} else {
+			p.to_string()
+		};
 		let parsed = format::ParsedEntry {
-			path: expected_rel.clone(),
+			path: expected_path,
 			content: c.to_string(),
 			change_types: std::collections::BTreeSet::from([ChangeType::New]),
 		};
 		let expected_plan = restore::plan_restore(&[repo.path()], &[parsed]);
+		let expected_rel = &expected_plan.create_operations[0].relative_path;
 		let actual_op = plan_add
 			.create_operations()
 			.iter()
-			.find(|op| op.relative_path == expected_rel)
+			.find(|op| &op.relative_path == expected_rel)
 			.unwrap_or_else(|| panic!("op found for {expected_rel}"));
 		assert_eq!(
 			actual_op.relative_path,
 			expected_plan.create_operations[0].relative_path
 		);
+		if p == "/elsewhere/x.txt" {
+			assert_eq!(actual_op.relative_path, "elsewhere/x.txt");
+		}
 	}
 }
 

@@ -409,7 +409,7 @@ pub struct EntryMapping {
 #[derive(Debug, Clone, Default)]
 pub struct ImportMapping {
 	pub primary_destination: Option<CanonicalRootId>,
-	/// Nest every entry that lands in the primary destination under this directory.
+	/// Nest every entry that lands in the primary destination under this directory (applies to relative entries only).
 	pub primary_prefix: Option<String>,
 	pub prefix_destinations: HashMap<String, CanonicalRootId>,
 	pub entry_destinations: HashMap<String, EntryMapping>,
@@ -2230,10 +2230,10 @@ pub fn plan_import_with(
 				(dest, std::borrow::Cow::Borrowed(rest))
 			} else if let Some(ref primary) = mapping.primary_destination {
 				let rel = match &mapping.primary_prefix {
-					Some(p) => {
+					Some(p) if restore::is_relative(&entry.path) => {
 						std::borrow::Cow::Owned(format!("{p}/{}", entry.path))
 					}
-					None => std::borrow::Cow::Borrowed(entry.path.as_str()),
+					_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
 				};
 				(primary, rel)
 			} else {
@@ -2246,10 +2246,10 @@ pub fn plan_import_with(
 			}
 		} else if let Some(ref primary) = mapping.primary_destination {
 			let rel = match &mapping.primary_prefix {
-				Some(p) => {
+				Some(p) if restore::is_relative(&entry.path) => {
 					std::borrow::Cow::Owned(format!("{p}/{}", entry.path))
 				}
-				None => std::borrow::Cow::Borrowed(entry.path.as_str()),
+				_ => std::borrow::Cow::Borrowed(entry.path.as_str()),
 			};
 			(primary, rel)
 		} else {
