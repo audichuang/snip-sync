@@ -124,6 +124,7 @@ pub fn start_worker(
 			WorkerOptions {
 				name: device_name(),
 				trust_file: config_file(TRUSTED_FILE),
+				..Default::default()
 			},
 		)
 		.map_err(|e| format!("{listen}: {e}"))?;
@@ -198,6 +199,7 @@ pub fn run_headless(cli: &WorkerCli) -> ! {
 		listen,
 		&cli.shares,
 		crate::recent::config_dir().as_deref(),
+		None,
 	);
 	eprintln!("Error: cannot start the worker: {err}");
 	std::process::exit(1);

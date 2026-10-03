@@ -18,15 +18,17 @@ impl Drop for Kill {
 	}
 }
 
-/// Starts `snip worker` sharing `shared`; returns it with the address and
-/// pairing code it printed.
-fn start_worker(
+/// Starts `snip worker` sharing `shared` with extra arguments; returns it
+/// with the address and pairing code it printed.
+fn start_worker_with(
 	shared: &std::path::Path,
 	config: &std::path::Path,
+	extra_args: &[&str],
 ) -> (Kill, String, String) {
 	let mut child = Command::new(env!("CARGO_BIN_EXE_snip"))
 		.args(["worker", "--listen", "127.0.0.1:0", "--share"])
 		.arg(shared)
+		.args(extra_args)
 		.env("SNIP_CONFIG_DIR", config)
 		.stdout(Stdio::piped())
 		.stderr(Stdio::inherit())
@@ -56,6 +58,15 @@ fn start_worker(
 		}
 	}
 	(_guard, addr.unwrap(), code.unwrap())
+}
+
+/// Starts `snip worker` sharing `shared`; returns it with the address and
+/// pairing code it printed.
+fn start_worker(
+	shared: &std::path::Path,
+	config: &std::path::Path,
+) -> (Kill, String, String) {
+	start_worker_with(shared, config, &[])
 }
 
 #[test]
@@ -221,4 +232,72 @@ fn cli_two_workers_paired_forget_and_stale_store_instance() {
 	assert!(remaining.starts_with("1\t"));
 	assert!(remaining.contains(&addr1));
 	assert!(!remaining.contains(&addr2));
+}
+
+#[test]
+fn cli_worker_max_protocol_flag_limits_negotiation() {
+	use snip_core::gitview::ReadProfile;
+	use snip_remote::proto::GitQuery;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let shared = tmp.path().join("proj");
+	std::fs::create_dir_all(&shared).unwrap();
+	std::fs::write(shared.join("file.txt"), "hello").unwrap();
+
+	// 1. Worker with --max-protocol 1: Git requests fail with WorkerTooOld, list_workspaces works
+	let (_w1, addr1, code1) = start_worker_with(
+		&shared,
+		&tmp.path().join("w1"),
+		&["--max-protocol", "1"],
+	);
+	let master1 = Arc::new(Identity::generate().unwrap());
+	let paired1 = pair(&addr1, &code1, &master1, "mac").unwrap();
+	let client1 = Client::new(paired1, master1, "mac".into()).unwrap();
+
+	let spaces = client1.list_workspaces().unwrap();
+	assert_eq!(spaces.len(), 1);
+	let ws1 = spaces[0].id.clone();
+
+	let err = client1
+		.git(
+			&ws1,
+			"",
+			ReadProfile::Interactive,
+			GitQuery::ChangeList,
+			None,
+		)
+		.unwrap_err();
+	match err {
+		snip_remote::RemoteError::WorkerTooOld { have, need, .. } => {
+			assert_eq!(have, 1);
+			assert_eq!(need, 2);
+		}
+		other => panic!("expected WorkerTooOld, got {other:?}"),
+	}
+
+	// 2. Worker with no flag: Git request reaches the worker and gets Unsupported
+	let (_w2, addr2, code2) = start_worker(&shared, &tmp.path().join("w2"));
+	let master2 = Arc::new(Identity::generate().unwrap());
+	let paired2 = pair(&addr2, &code2, &master2, "mac").unwrap();
+	let client2 = Client::new(paired2, master2, "mac".into()).unwrap();
+
+	let spaces2 = client2.list_workspaces().unwrap();
+	assert_eq!(spaces2.len(), 1);
+	let ws2 = spaces2[0].id.clone();
+
+	let err2 = client2
+		.git(
+			&ws2,
+			"",
+			ReadProfile::Interactive,
+			GitQuery::ChangeList,
+			None,
+		)
+		.unwrap_err();
+	match err2 {
+		snip_remote::RemoteError::Refused { code, .. } => {
+			assert_eq!(code, snip_remote::proto::ErrorCode::Unsupported);
+		}
+		other => panic!("expected Refused(Unsupported), got {other:?}"),
+	}
 }

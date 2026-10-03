@@ -30,8 +30,13 @@ pub mod store;
 pub mod tls;
 pub mod worker;
 
-pub use client::{pair, Client, Connection, PairedWorker, DEFAULT_PORT};
-pub use proto::{DirEntry, ErrorCode, RemoteWorkspace, Request, Response};
+pub use client::{
+	pair, Client, Connection, PairedWorker, RemoteRepo, DEFAULT_PORT,
+};
+pub use proto::{
+	DirEntry, ErrorCode, GitQuery, GitReply, RemoteWorkspace, RepoScan,
+	Request, Response, ScannedRepo, PROTOCOL_MAX,
+};
 pub use store::{TrustedMasterStore, WorkerStore};
 pub use tls::{Fingerprint, Identity};
 pub use worker::{SharedRoot, TrustedMaster, Worker, WorkerOptions};
@@ -54,6 +59,18 @@ pub enum RemoteError {
 	Refused { code: ErrorCode, message: String },
 	#[error("protocol: {0}")]
 	Protocol(String),
+	#[error("cancelled")]
+	Cancelled,
+	#[error("the worker did not answer in time")]
+	TimedOut,
+	#[error(
+		"{worker} is too old for Git views (it speaks protocol {have}, this needs {need}); update it"
+	)]
+	WorkerTooOld {
+		worker: String,
+		have: u32,
+		need: u32,
+	},
 }
 
 impl RemoteError {
@@ -122,6 +139,7 @@ pub fn run_headless_worker(
 	listen: SocketAddr,
 	shares: &[PathBuf],
 	config_dir: Option<&Path>,
+	max_protocol: Option<u32>,
 ) -> Result<std::convert::Infallible, RemoteError> {
 	if shares.is_empty() {
 		return Err(RemoteError::Protocol(
@@ -138,6 +156,7 @@ pub fn run_headless_worker(
 		WorkerOptions {
 			name: device_name(),
 			trust_file: config_dir.map(|d| d.join(TRUSTED_FILE)),
+			max_protocol,
 		},
 	)?;
 	for (path, err) in worker.set_roots(shares) {

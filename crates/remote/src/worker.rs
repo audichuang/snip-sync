@@ -17,7 +17,7 @@ use snip_core::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
 
 use crate::proto::{
 	read_frame, write_frame, DirEntry, EntryKind, ErrorCode, RemoteWorkspace,
-	Request, Response, Stat, MAX_DIR_ENTRIES, PROTOCOL_VERSION,
+	Request, Response, Stat, MAX_DIR_ENTRIES, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::tls::{normalize_code, pairing_proof, server_config, Fingerprint};
 use crate::{Identity, RemoteError};
@@ -83,6 +83,8 @@ pub struct WorkerOptions {
 	pub name: String,
 	/// Where trusted masters are kept; `None` keeps them in memory only.
 	pub trust_file: Option<PathBuf>,
+	/// Highest protocol version this worker will negotiate.
+	pub max_protocol: Option<u32>,
 }
 
 struct PairingWindow {
@@ -96,6 +98,8 @@ struct State {
 	fingerprint: Fingerprint,
 	tls: Arc<ServerConfig>,
 	trust_file: Option<PathBuf>,
+	max_protocol: Option<u32>,
+	git_requests: AtomicUsize,
 	trusted: Mutex<Vec<TrustedMaster>>,
 	pairing: Mutex<Option<PairingWindow>>,
 	roots: RwLock<Vec<SharedRoot>>,
@@ -132,6 +136,8 @@ impl Worker {
 			fingerprint: identity.fingerprint(),
 			tls: server_config(identity)?,
 			trust_file: opts.trust_file,
+			max_protocol: opts.max_protocol,
+			git_requests: AtomicUsize::new(0),
 			trusted: Mutex::new(trusted),
 			pairing: Mutex::new(None),
 			roots: RwLock::new(Vec::new()),
@@ -156,6 +162,11 @@ impl Worker {
 
 	pub fn fingerprint(&self) -> Fingerprint {
 		self.state.fingerprint
+	}
+
+	/// Counts GitView/ScanRepos requests received, for tests and diagnostics.
+	pub fn git_requests_seen(&self) -> usize {
+		self.state.git_requests.load(Ordering::SeqCst)
 	}
 
 	/// Opens a one-time pairing code, replacing any open one.
@@ -298,8 +309,16 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 		.and_then(|certs| certs.first())
 		.map(|cert| Fingerprint::of(cert))
 		.ok_or_else(|| RemoteError::Protocol("no client certificate".into()))?;
-	match hello {
-		Request::Hello { version, .. } if version == PROTOCOL_VERSION => {}
+	let negotiated = match hello {
+		Request::Hello {
+			version,
+			max_version,
+			..
+		} if version == PROTOCOL_VERSION => {
+			let worker_max = state.max_protocol.unwrap_or(PROTOCOL_MAX).max(1);
+			let master_max = max_version.unwrap_or(1);
+			master_max.min(worker_max)
+		}
 		Request::Hello { version, .. } => {
 			write_frame(
 				&mut tls,
@@ -319,13 +338,14 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 			)?;
 			return Ok(());
 		}
-	}
+	};
 	write_frame(
 		&mut tls,
 		&Response::Hello {
 			version: PROTOCOL_VERSION,
 			name: state.name.clone(),
 			paired: state.is_trusted(&peer),
+			max_version: Some(negotiated),
 		},
 	)?;
 	tls.sock.set_read_timeout(Some(IDLE_TIMEOUT))?;
@@ -333,7 +353,7 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 		let Some(request) = read_frame::<Request>(&mut tls)? else {
 			return Ok(());
 		};
-		let response = state.handle(&peer, request);
+		let response = state.handle(&peer, request, negotiated);
 		match write_frame(&mut tls, &response) {
 			Err(err) if err.kind() == io::ErrorKind::InvalidData => {
 				write_frame(
@@ -399,7 +419,13 @@ impl State {
 		lock(&self.trusted).iter().any(|m| m.fingerprint == hex)
 	}
 
-	fn handle(&self, peer: &Fingerprint, request: Request) -> Response {
+	#[allow(clippy::result_large_err)]
+	fn handle(
+		&self,
+		peer: &Fingerprint,
+		request: Request,
+		_negotiated: u32,
+	) -> Response {
 		match request {
 			Request::Hello { .. } => {
 				error(ErrorCode::BadRequest, "hello was already sent".into())
@@ -439,9 +465,14 @@ impl State {
 				}
 				Err(e) => e,
 			},
-			Request::Write { .. }
-			| Request::Rename { .. }
-			| Request::Git { .. } => error(
+			Request::ScanRepos { .. } | Request::GitView { .. } => {
+				self.git_requests.fetch_add(1, Ordering::SeqCst);
+				error(
+					ErrorCode::Unsupported,
+					"Git views are not available on this worker yet".into(),
+				)
+			}
+			Request::Write { .. } | Request::Rename { .. } => error(
 				ErrorCode::Unsupported,
 				"not available on this worker yet".into(),
 			),
@@ -498,6 +529,7 @@ impl State {
 		}
 	}
 
+	#[allow(clippy::result_large_err)]
 	fn root(&self, workspace: &str) -> Result<PathBuf, Response> {
 		self.roots
 			.read()
@@ -513,6 +545,7 @@ impl State {
 			})
 	}
 
+	#[allow(clippy::result_large_err)]
 	fn resolve(
 		&self,
 		workspace: &str,
@@ -534,6 +567,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// share lists as a folder, as the copy engine treats it; one that leads
 /// out of the share (or into `.git`) stays a plain entry the master cannot
 /// open.
+#[allow(clippy::result_large_err)]
 fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
@@ -591,6 +625,7 @@ fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 	Ok(Response::Dir { entries, truncated })
 }
 
+#[allow(clippy::result_large_err)]
 fn stat(path: &Path) -> Result<Response, Response> {
 	let meta = fs::metadata(path).map_err(io_error)?;
 	let kind = if meta.is_dir() {

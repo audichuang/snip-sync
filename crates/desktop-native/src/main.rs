@@ -6226,6 +6226,7 @@ mod tests {
 				snip_remote::WorkerOptions {
 					name: "win-worker".into(),
 					trust_file: None,
+					..Default::default()
 				},
 			)
 			.unwrap();
