@@ -2088,6 +2088,7 @@ impl WorkbenchModel {
 	) -> (Vec<RepoEntry>, Vec<(PathBuf, String)>) {
 		let (found, errors) = snip_core::gitview::identify_repos(
 			discovered,
+			None,
 			&snip_core::workspace::ScanBudget::visits(usize::MAX),
 			opts,
 		);
@@ -5735,7 +5736,7 @@ fn resolve_added_repo(
 		..RunOptions::interactive(None)
 	};
 	Ok(RepoEntry::from(snip_core::gitview::identify_repo(
-		&path, &opts,
+		&path, None, &opts,
 	)))
 }
 

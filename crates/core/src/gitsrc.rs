@@ -82,6 +82,10 @@ pub enum GitError {
 	Shallow(String),
 	#[error("unexpected git output: {0}")]
 	Malformed(String),
+	#[error("outside the shared folder: {what}")]
+	OutsideBoundary { what: &'static str },
+	#[error("{0}")]
+	Host(String),
 	#[error(transparent)]
 	Io(#[from] io::Error),
 }
@@ -92,6 +96,7 @@ pub enum GitError {
 #[derive(Debug, Clone)]
 pub struct Git {
 	root: PathBuf,
+	boundary: Option<PathBuf>, /* canonical */
 }
 
 #[cfg(test)]
@@ -172,9 +177,27 @@ impl Git {
 	/// A truncated read is [`GitError::OutputLimit`], not a partial root.
 	/// A directory outside a repository is still [`GitError::NotARepository`].
 	pub fn open_with(dir: &Path, opts: &RunOptions) -> Result<Self, GitError> {
+		Self::open_shared(dir, None, opts)
+	}
+
+	/// Worker only: opens with boundary enforcement.
+	pub fn open_within(
+		dir: &Path,
+		boundary: &Path,
+		opts: &RunOptions,
+	) -> Result<Self, GitError> {
+		Self::open_shared(dir, Some(boundary), opts)
+	}
+
+	fn open_shared(
+		dir: &Path,
+		boundary: Option<&Path>,
+		opts: &RunOptions,
+	) -> Result<Self, GitError> {
 		already_cancelled(opts, "--version")?;
 		// `git --version` runs once per `PATH`: a changed `PATH` may find
 		// another git, or none. Only success is remembered.
+		// `git --version` touches no repository and stays as is without boundary.
 		static CHECKED_PATH: std::sync::Mutex<Option<std::ffi::OsString>> =
 			std::sync::Mutex::new(None);
 		let path = std::env::var_os("PATH").unwrap_or_default();
@@ -200,8 +223,13 @@ impl Git {
 					.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
 			}
 		}
+		let canonical_boundary = match boundary {
+			Some(b) => Some(dunce::canonicalize(b)?),
+			None => None,
+		};
 		let probe = Self {
 			root: dir.to_path_buf(),
+			boundary: canonical_boundary.clone(),
 		};
 		already_cancelled(opts, "rev-parse --show-toplevel")?;
 		let out = probe
@@ -224,8 +252,19 @@ impl Git {
 		let top = out.stdout.strip_suffix(b"\n").ok_or_else(|| {
 			GitError::Malformed("rev-parse --show-toplevel output".into())
 		})?;
+		let top_path = path_from_git_bytes(top)?;
+		if let Some(ref b) = canonical_boundary {
+			let canonical_top = dunce::canonicalize(&top_path)?;
+			let canonical_dir = dunce::canonicalize(dir)?;
+			if canonical_top != canonical_dir || !canonical_top.starts_with(b) {
+				return Err(GitError::OutsideBoundary {
+					what: "repository (it is not the folder itself)",
+				});
+			}
+		}
 		Ok(Self {
-			root: path_from_git_bytes(top)?,
+			root: top_path,
+			boundary: canonical_boundary,
 		})
 	}
 
@@ -234,7 +273,19 @@ impl Git {
 	pub fn at_known_root(known: &RepoIdentity) -> Self {
 		Self {
 			root: known.toplevel.clone(),
+			boundary: None,
 		}
+	}
+
+	/// Boundary of this repository, when bounded.
+	pub fn boundary(&self) -> Option<&Path> {
+		self.boundary.as_deref()
+	}
+
+	/// Sets or clears the boundary for this repository.
+	pub fn with_boundary(mut self, boundary: Option<PathBuf>) -> Self {
+		self.boundary = boundary;
+		self
 	}
 
 	/// The repository top level; every git path is relative to it.
@@ -247,6 +298,35 @@ impl Git {
 	pub(crate) fn command(&self) -> Command {
 		let mut cmd = git_command();
 		cmd.current_dir(&self.root);
+		if let Some(ref b) = self.boundary {
+			cmd.args([
+				"-c",
+				"core.fsmonitor=false",
+				"-c",
+				"protocol.allow=never",
+			]);
+			if let Some(parent) = b.parent() {
+				if !parent.as_os_str().is_empty() {
+					cmd.env("GIT_CEILING_DIRECTORIES", parent);
+				}
+			}
+			cmd.env("GIT_OPTIONAL_LOCKS", "0");
+			cmd.env("GIT_NO_LAZY_FETCH", "1");
+			for var in [
+				"GIT_DIR",
+				"GIT_WORK_TREE",
+				"GIT_INDEX_FILE",
+				"GIT_COMMON_DIR",
+				"GIT_OBJECT_DIRECTORY",
+				"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+				"GIT_NAMESPACE",
+				"GIT_EXTERNAL_DIFF",
+				"GIT_CONFIG_PARAMETERS",
+				"GIT_CONFIG_COUNT",
+			] {
+				cmd.env_remove(var);
+			}
+		}
 		cmd
 	}
 
@@ -1064,6 +1144,20 @@ fn read_changes(
 		} else {
 			match source {
 				GitSource::Working => {
+					if git.boundary.is_some() {
+						let file_path = git.root.join(&c.path);
+						if file_path.symlink_metadata().is_ok() {
+							let canonical_file =
+								dunce::canonicalize(&file_path)?;
+							let canonical_root =
+								dunce::canonicalize(&git.root)?;
+							if !canonical_file.starts_with(&canonical_root) {
+								return Err(GitError::OutsideBoundary {
+									what: "working file",
+								});
+							}
+						}
+					}
 					read_working(&git.root.join(&c.path), max)?
 				}
 				// Staged content was asked for: an index entry that cannot
@@ -2476,5 +2570,89 @@ mod tests {
 		.unwrap();
 		assert_eq!(got.files, vec![file("a.txt", "a\n", New)]);
 		assert!(got.payload.starts_with("// clipcode-root: r\n"));
+	}
+
+	#[test]
+	fn hardened_command_has_the_flags_and_env() {
+		use std::ffi::OsStr;
+		let dummy_root = PathBuf::from("/dummy/repo");
+		let dummy_boundary = PathBuf::from("/dummy/repo/sub");
+		let parent_of_boundary = dummy_boundary.parent().unwrap().to_path_buf();
+
+		let hardened_git = Git {
+			root: dummy_root.clone(),
+			boundary: Some(dummy_boundary),
+		};
+		let cmd = hardened_git.command();
+		let args: Vec<_> = cmd.get_args().collect();
+		assert!(args.len() >= 4);
+		assert_eq!(
+			&args[..4],
+			&[
+				OsStr::new("-c"),
+				OsStr::new("core.fsmonitor=false"),
+				OsStr::new("-c"),
+				OsStr::new("protocol.allow=never"),
+			]
+		);
+		let envs: std::collections::HashMap<&OsStr, Option<&OsStr>> =
+			cmd.get_envs().collect();
+		assert_eq!(
+			envs.get(OsStr::new("GIT_CEILING_DIRECTORIES")),
+			Some(&Some(parent_of_boundary.as_os_str()))
+		);
+		assert_eq!(
+			envs.get(OsStr::new("GIT_OPTIONAL_LOCKS")),
+			Some(&Some(OsStr::new("0")))
+		);
+		assert_eq!(
+			envs.get(OsStr::new("GIT_NO_LAZY_FETCH")),
+			Some(&Some(OsStr::new("1")))
+		);
+		for var in [
+			"GIT_DIR",
+			"GIT_WORK_TREE",
+			"GIT_INDEX_FILE",
+			"GIT_COMMON_DIR",
+			"GIT_OBJECT_DIRECTORY",
+			"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+			"GIT_NAMESPACE",
+			"GIT_EXTERNAL_DIFF",
+			"GIT_CONFIG_PARAMETERS",
+			"GIT_CONFIG_COUNT",
+		] {
+			assert_eq!(
+				envs.get(OsStr::new(var)),
+				Some(&None),
+				"expected {var} to be removed in env"
+			);
+		}
+
+		let plain_git = Git {
+			root: dummy_root,
+			boundary: None,
+		};
+		let plain_cmd = plain_git.command();
+		let plain_args: Vec<_> = plain_cmd.get_args().collect();
+		assert_eq!(plain_args.len(), 0);
+		let plain_envs: std::collections::HashMap<&OsStr, Option<&OsStr>> =
+			plain_cmd.get_envs().collect();
+		assert_eq!(plain_envs.get(OsStr::new("GIT_CEILING_DIRECTORIES")), None);
+		assert_eq!(plain_envs.get(OsStr::new("GIT_OPTIONAL_LOCKS")), None);
+		assert_eq!(plain_envs.get(OsStr::new("GIT_NO_LAZY_FETCH")), None);
+		for var in [
+			"GIT_DIR",
+			"GIT_WORK_TREE",
+			"GIT_INDEX_FILE",
+			"GIT_COMMON_DIR",
+			"GIT_OBJECT_DIRECTORY",
+			"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+			"GIT_NAMESPACE",
+			"GIT_EXTERNAL_DIFF",
+			"GIT_CONFIG_PARAMETERS",
+			"GIT_CONFIG_COUNT",
+		] {
+			assert_eq!(plain_envs.get(OsStr::new(var)), None);
+		}
 	}
 }

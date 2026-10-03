@@ -41,7 +41,9 @@ pub const MAX_CONCURRENT_GIT: usize = 2;
 /// Callers allowed to wait for a slot; one more is refused at once
 /// ([`GitError::QueueFull`]) instead of joining an unbounded queue.
 pub const MAX_QUEUED_GIT: usize = 64;
+/// Served budget: Git processes alive at once for served requests.
 pub const MAX_CONCURRENT_SERVED_GIT: usize = 1;
+/// Callers allowed to wait for a served Git process slot.
 pub const MAX_QUEUED_SERVED_GIT: usize = 4;
 const TICK: Duration = Duration::from_millis(20);
 /// How long cleanup waits for a killed tree to die and its pipes to close.

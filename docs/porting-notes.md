@@ -200,3 +200,13 @@ CLI 與 App 共用 `snip-core` 的 `clip` 模組,底層用 [`arboard`](https://c
 | Windows | Win32 API,`CF_UNICODETEXT` | 不要透過 `clip.exe` 或 PowerShell,編碼容易出錯;需驗證換行是否被轉換 |
 | macOS | `NSPasteboard` | |
 | Linux | X11 / Wayland(`wayland-data-control` feature) | CI 需要 xvfb;X11 上擁有剪貼簿的程序一結束內容就消失,CLI 的 `copy` 要用 arboard 的 `SetExtLinux::wait()` 留在背景直到內容被取走 |
+
+## 7. 遠端 worker 的 git 邊界強化（S3）
+
+遠端 worker 在共享目錄（boundary）下執行 Git 讀取操作時，增加安全邊界防護：
+- `-c core.fsmonitor=false`：支援此設定鍵的任何 Git 版本（不支援時 `-c` 亦不報錯忽略）。
+- `-c protocol.allow=never`：Git >= 1.8.3（阻擋所有 submodule 傳輸協議與 clone/fetch 網路傳輸）。
+- `GIT_NO_LAZY_FETCH=1`：Git >= 2.44（舊版 Git 主要仰賴 `protocol.allow=never` 阻擋 lazy fetch）。
+- `GIT_CEILING_DIRECTORIES`：需要正規化後的絕對路徑（canonical absolute path），設定為共享目錄的父目錄以阻擋向上遍歷至上層 repo。
+- Windows 環境下 `GIT_CEILING_DIRECTORIES` 搭配 dunce 標準化路徑的行為主要由 CI 驗證（即使 ceiling 被忽略，事後對 toplevel / git_dir 的邊界檢查依然提供安全防護）。
+
