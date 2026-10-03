@@ -129,6 +129,7 @@ head -c 1048577 /dev/zero | tr '\000' a > edge/over-1MiB.txt
 (cd edge/manydir && touch f{1..1200})
 ln -s "\$PWD/secret.txt" edge/escape.txt 2>/dev/null || true
 ln -s "\$PWD/edge/src" edge/inner-link 2>/dev/null || true
+ln -s "\$PWD" edge/escape-dir 2>/dev/null || true
 # Text the transport must carry byte for byte.
 for i in \$(seq 1 60); do
 	printf 'file %d\tTab 中文 ✓ 🦀 é\n%s\n' "\$i" "\$(head -c \$((i * 97)) /dev/zero | tr '\000' x)" > "text/plain_\$i.txt"
@@ -204,6 +205,7 @@ check "1200 entries are cut at 1000" test "$("$SNIP" remote ls 1 edge manydir 2>
 check "a nested repo is a folder" bash -c "'$SNIP' remote stat 1 edge nested | grep -q '^directory'"
 if w <<<"[ -L '$WD/edge/inner-link' ]"; then
 	check "a symlink inside the share is followed" bash -c "'$SNIP' remote ls 1 edge inner-link | grep -qx deep/"
+	check "a folder symlink inside the share lists as a folder" bash -c "'$SNIP' remote ls 1 edge | grep -qx inner-link/"
 else
 	skip "a symlink inside the share is followed" "no symlinks on the worker"
 fi
@@ -248,6 +250,8 @@ refused "an unknown workspace" "no workspace named" ls 1 nope
 refused "an unknown worker" "no paired worker" ls nobody edge
 if w <<<"[ -L '$WD/edge/escape.txt' ]"; then
 	refused "a symlink out of the share" "leaves the workspace" cat 1 edge escape.txt
+	check "a folder symlink out of the share lists as a plain entry" bash -c "'$SNIP' remote ls 1 edge | grep -qx escape-dir"
+	refused "a folder symlink out of the share" "leaves the workspace" ls 1 edge escape-dir
 else
 	skip "a symlink out of the share" "no symlinks on the worker"
 fi

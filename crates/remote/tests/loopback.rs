@@ -320,3 +320,64 @@ fn unwritable_trust_file_refuses_pairing_and_leaves_code_open() {
 	assert_eq!(w.trusted().len(), 1);
 	assert!(trust_file.is_file());
 }
+
+/// A symlink to a folder inside the share lists as a folder and opens; one
+/// that leads out of the share or into `.git` stays a plain entry the
+/// master cannot open. The share is spelled through a symlink, as macOS
+/// /var is.
+#[cfg(unix)]
+#[test]
+fn a_folder_symlink_inside_the_share_lists_as_a_folder() {
+	use std::os::unix::fs::symlink;
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("real-ws");
+	fs::create_dir_all(real.join("src/deep")).unwrap();
+	fs::create_dir_all(real.join(".git/objects")).unwrap();
+	fs::create_dir_all(tmp.path().join("outside")).unwrap();
+	fs::write(real.join("src/main.rs"), "fn main() {}\n").unwrap();
+	fs::write(tmp.path().join("outside/secret.txt"), "outside").unwrap();
+	symlink(real.join("src"), real.join("inner-link")).unwrap();
+	symlink("src/deep", real.join("relative-link")).unwrap();
+	symlink(tmp.path().join("outside"), real.join("escape-dir")).unwrap();
+	symlink(real.join(".git"), real.join("git-link")).unwrap();
+	symlink(real.join("src/main.rs"), real.join("file-link")).unwrap();
+	let shared = tmp.path().join("ws-link");
+	symlink(&real, &shared).unwrap();
+	let (w, _) = worker(&[&shared]);
+	let master = Arc::new(Identity::generate().unwrap());
+	let code = w.open_pairing();
+	let paired = pair(&addr(&w), &code, &master, "mac").unwrap();
+	let client = Client::new(paired, master, "mac".into()).unwrap();
+	let ws = client.list_workspaces().unwrap()[0].id.clone();
+
+	let (root, _) = client.list_dir(&ws, "").unwrap();
+	let entry = |name: &str| {
+		root.iter()
+			.find(|e| e.name == name)
+			.unwrap_or_else(|| panic!("{name} not listed: {root:?}"))
+	};
+	for name in ["inner-link", "relative-link"] {
+		assert!(entry(name).directory && entry(name).symlink, "{name}");
+	}
+	for name in ["escape-dir", "git-link", "file-link"] {
+		assert!(!entry(name).directory && entry(name).symlink, "{name}");
+	}
+	let folders: Vec<_> = root
+		.iter()
+		.take_while(|e| e.directory)
+		.map(|e| e.name.as_str())
+		.collect();
+	assert_eq!(folders, ["inner-link", "relative-link", "src"]);
+
+	let (inner, _) = client.list_dir(&ws, "inner-link").unwrap();
+	let names: Vec<_> = inner.iter().map(|e| e.name.as_str()).collect();
+	assert_eq!(names, ["deep", "main.rs"]);
+	assert_eq!(
+		client.read(&ws, "inner-link/main.rs").unwrap().as_deref(),
+		Some("fn main() {}\n")
+	);
+	assert_eq!(
+		refused(client.list_dir(&ws, "escape-dir")),
+		ErrorCode::Forbidden
+	);
+}

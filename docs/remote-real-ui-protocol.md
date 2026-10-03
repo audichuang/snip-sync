@@ -228,8 +228,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | R22 | 點 `latin.txt` | 失敗格：同 R21 |
 | R23 | 點 `manydir` 展開，再反覆點最新的 `ws-tree-view-more:manydir` 或 `ws-tree-view-more:`，直到沒有更多列 | `snip remote ls` 回 1000 項；`WS_TREE_PAGE: rel=manydir … children=N`，N ≤ 1000（GUI 的記憶體預算可能收得比 1000 少，記下實際值）；每點一次，畫面都出現新的 `ws-tree-row:manydir/…`；最後有 `ws-tree-marker:manydir`，顯示「[目錄未完整列出: 已截斷]」；捲到底不卡 |
 | R24 | 點 `escape.txt` | 失敗格：錯誤文字說路徑離開了工作區；`top-secret-c0ffee` 不出現在截圖，也不在 `app-*.log` 裡（`grep -c top-secret "$RUN"/app-*.log` 要是 0） |
-| R25 | 點 `escape-dir` | 拒絕。worker 清單把 symlink 回報成非資料夾，所以它可能顯示成檔案列：點下去是失敗格，錯誤是「Path leaves the workspace」；如果顯示成資料夾，展開時要出現錯誤列 `ws-tree-retry:escape-dir`。兩種情況都**不能**列出 `/etc` 的內容（截圖裡沒有 `passwd`、`hostname`） |
-| R26 | 點 `inner-link` | 預期：可以展開，列出 `deep`、`main.rs`，點 `inner-link/main.rs` 能預覽（CLI `snip remote ls 1 edge inner-link` 會列出 `deep/`）。試跑時 worker 把它回報成非資料夾（清單裡沒有尾端 `/`），GUI 可能顯示成檔案列、無法展開；這種情況判 `ui-defect`，並寫下實際畫面 |
+| R25 | 點 `escape-dir` | 拒絕。指向分享外的資料夾 symlink 列成檔案列（CLI `snip remote ls 1 edge` 印 `escape-dir`，沒有尾端 `/`）；點下去是失敗格，錯誤是「Path leaves the workspace」。**不能**列出 `/etc` 的內容（截圖裡沒有 `passwd`、`hostname`） |
+| R26 | 點 `inner-link` | 指向分享內的資料夾 symlink 列成資料夾（CLI `snip remote ls 1 edge` 印 `inner-link/`）：可以展開，列出 `deep`、`main.rs`；點 `inner-link/main.rs` 能預覽。顯示成檔案列或無法展開，判 `fail` |
 | R27 | 找到非 UTF-8 名稱那一列 | 它的 ID 是 `ws-tree-invalid:<suffix>`，名稱用替代字元顯示；點它不能讓 App 崩潰，也不能預覽到別的檔案的內容（錯誤或「無法預覽」都算對）。把實際行為寫進證據欄 |
 | R28 | 依序展開 `a/b/c/d/e`，點 `leaf.txt` | 每層各有一行 `WS_TREE_PAGE`；顯示 `deepest` |
 | R29 | 看 `nested` 和 `.hidden` | `nested` 是資料夾列，可以展開，裡面有 `.git`；`.hidden` 有列出，可以預覽 |
