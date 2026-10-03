@@ -1815,12 +1815,15 @@ impl WorkbenchModel {
 				return;
 			}
 		};
-		let canonical = self
-			.repos
-			.iter()
-			.find(|r| r.root == root)
-			.and_then(|r| admitted_selection_root(r, &self.basket))
-			.or_else(|| CanonicalRootId::new(&root).ok());
+		let canonical = if self.remote.session.is_some() {
+			None
+		} else {
+			self.repos
+				.iter()
+				.find(|r| r.root == root)
+				.and_then(|r| admitted_selection_root(r, &self.basket))
+				.or_else(|| CanonicalRootId::new(&root).ok())
+		};
 		let saved: HashSet<(&str, &SourceKind)> = canonical
 			.as_ref()
 			.and_then(|c| self.basket_items(c))
@@ -2139,6 +2142,10 @@ impl WorkbenchModel {
 	}
 
 	pub fn select_all_files(&mut self, cx: &mut Context<Self>) {
+		if self.remote_blocks() {
+			cx.notify();
+			return;
+		}
 		let mut candidate = self.selection_candidate();
 		for file in &mut candidate.files {
 			if self.change_slot_loaded(file.repo) {
@@ -2169,6 +2176,10 @@ impl WorkbenchModel {
 	}
 
 	pub fn toggle_file(&mut self, idx: usize, cx: &mut Context<Self>) {
+		if self.remote_blocks() {
+			cx.notify();
+			return;
+		}
 		if self
 			.files
 			.get(idx)
@@ -2864,10 +2875,6 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		if self.remote.session.is_some() {
-			self.reload_remote_tree(cx);
-			return;
-		}
 		self.discovery_errors.clear();
 		self.discovery_depth_limited.clear();
 		self.discovery_error_overflow = 0;
@@ -2881,12 +2888,34 @@ impl WorkbenchModel {
 			self.restore_ws_expanded.clear();
 			tree.collect_expanded_paths(&mut self.restore_ws_expanded);
 		}
+		if let Some(session) = &self.remote.session {
+			if self.selected_commit.is_none()
+				&& self.selected_file_source == Some(SourceKind::File)
+			{
+				if let Some(path) = self.selected_file.clone() {
+					let root = self
+						.preview_root()
+						.unwrap_or_else(|| session.root.clone());
+					self.select_file_in(
+						Some(root),
+						&path,
+						SourceKind::File,
+						cx,
+					);
+				}
+			}
+			self.launch_remote_scan(None, true, cx);
+			return;
+		}
 		let ws = self.workspace_root.clone();
 		self.launch_fresh_discovery(ws, true, cx);
 	}
 
 	pub fn continue_discovery(&mut self, cx: &mut Context<Self>) {
-		if !self.accepting_work() || self.is_loading {
+		if !self.accepting_work()
+			|| self.is_loading
+			|| self.remote.session.is_some()
+		{
 			return;
 		}
 		if matches!(self.discovery_status, Some(ScanStatus::LimitReached)) {
@@ -2909,6 +2938,10 @@ impl WorkbenchModel {
 	}
 
 	pub fn add_repo_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+		if self.remote_blocks() {
+			cx.notify();
+			return;
+		}
 		if !self.accepting_work() {
 			return;
 		}
@@ -3358,6 +3391,10 @@ impl WorkbenchModel {
 				return;
 			}
 			TreeCommand::ToggleSelect(key) => {
+				if self.remote_blocks() {
+					cx.notify();
+					return;
+				}
 				let Some(paths) = self
 					.file_tree
 					.as_ref()
@@ -3446,8 +3483,13 @@ impl WorkbenchModel {
 					let result = bg
 						.spawn(async move {
 							let result = match remote_bg {
-								Some((client, ws)) => {
-									remote::tree_io(&client, &ws, io)
+								Some((client, ws, session_root)) => {
+									remote::tree_io(
+										&client,
+										&ws,
+										&session_root,
+										io,
+									)
 								}
 								None => {
 									crate::tree::execute_tree_io(io, &cancel_bg)
@@ -3585,10 +3627,21 @@ impl WorkbenchModel {
 	/// workspace repo is open (its `file_tree` is the tree), and when the
 	/// workspace sits strictly inside a repo: that repo's tree shows it.
 	fn ensure_ws_tree(&mut self, cx: &mut Context<Self>) {
-		if self.ws_tree.is_some()
-			|| !self.accepting_work()
-			|| self.remote.session.is_some()
-		{
+		if self.ws_tree.is_some() || !self.accepting_work() {
+			return;
+		}
+		if let Some(session) = &self.remote.session {
+			let root = session.root.clone();
+			self.ws_home = Some(root.clone());
+			if self
+				.file_tree
+				.as_ref()
+				.is_some_and(|tree| tree.full_path == root)
+			{
+				return;
+			}
+			self.ws_tree = Some(FileTreeNode::unloaded_root(&root));
+			self.resume_ws_tree(cx);
 			return;
 		}
 		// Git reports resolved toplevels; root the tree the same way so a
@@ -3651,13 +3704,11 @@ impl WorkbenchModel {
 		let Some(root) = self.ws_root() else {
 			return;
 		};
-		// A remote tree previews; selecting for copy is a later slice.
-		if self.remote.session.is_some()
-			&& matches!(cmd, TreeCommand::ToggleSelect(_))
-		{
-			return;
-		}
 		if let TreeCommand::ToggleSelect(key) = &cmd {
+			if self.remote_blocks() {
+				cx.notify();
+				return;
+			}
 			let Some(paths) = self
 				.ws_tree
 				.as_ref()
@@ -4162,7 +4213,6 @@ impl WorkbenchModel {
 		let job_cancel = (!fs_only).then(|| cancel.clone());
 		let delay = self.e2e_read_delay;
 		let remote = self.remote_target();
-		let locale = self.locale;
 		let host = self.git_host();
 		if e2e_on() {
 			app_log!("[APP:PREVIEW_LOADING: {file_path}]");
@@ -4177,14 +4227,18 @@ impl WorkbenchModel {
 			let result = bg
 				.spawn(async move {
 					let result = match remote {
-						Some((client, ws)) if fs_only => {
-							remote::read_preview(&client, &ws, &for_bg)
+						Some((client, ws, session_root)) if fs_only => {
+							match remote::remote_rel(&session_root, &repo_root)
+							{
+								Some(prefix) => remote::read_preview(
+									&client, &ws, &prefix, &for_bg,
+								),
+								None => {
+									Err("not under the workspace".to_string())
+								}
+							}
 						}
-						Some(_) => {
-							Err(i18n::t("remote_unsupported", locale)
-								.to_string())
-						}
-						None => read_preview(
+						_ => read_preview(
 							&host, &repo_root, &for_bg, &source, cancel,
 						),
 					};
@@ -4611,6 +4665,10 @@ impl WorkbenchModel {
 		path: &str,
 		cx: &mut Context<Self>,
 	) {
+		if self.remote_blocks() {
+			cx.notify();
+			return;
+		}
 		let Some(repo) = self.repo() else {
 			return;
 		};
@@ -4844,8 +4902,7 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		if self.remote.session.is_some() {
-			self.set_status("remote_unsupported", []);
+		if self.remote_blocks() {
 			cx.notify();
 			return;
 		}
@@ -4901,6 +4958,10 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		if !self.accepting_work() {
+			return;
+		}
+		if self.remote_blocks() {
+			cx.notify();
 			return;
 		}
 		if self.is_copying {
@@ -5061,6 +5122,10 @@ impl WorkbenchModel {
 	/// Exports the selected commit or first-parent commit range to the clipboard.
 	pub fn copy_commits_to_clipboard(&mut self, cx: &mut Context<Self>) {
 		if !self.accepting_work() {
+			return;
+		}
+		if self.remote_blocks() {
+			cx.notify();
 			return;
 		}
 		if self.is_copying {
@@ -5320,8 +5385,7 @@ impl WorkbenchModel {
 		if self.refuse_while_applying("preview", cx) {
 			return;
 		}
-		if self.remote.session.is_some() {
-			self.set_status("remote_unsupported", []);
+		if self.remote_blocks() {
 			cx.notify();
 			return;
 		}
@@ -6345,40 +6409,31 @@ mod tests {
 			Some(CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner))
 		}
 
-		/// Remote-node mode end to end in one process: a real worker on
-		/// loopback, the pairing form, the workspace list, the Project tree
-		/// and a file preview, all read through the worker. Every socket has
-		/// a timeout (snip-remote), so a hang fails rather than blocks.
-		#[gpui::test]
-		fn remote_workspace_pairs_lists_and_previews_through_a_worker(
-			cx: &mut TestAppContext,
+		/// Serializes remote tests: the worker's Served git pool admits one process at a time and tests share the process.
+		static REMOTE_LOCK: Mutex<()> = Mutex::new(());
+
+		fn remote_lock() -> MutexGuard<'static, ()> {
+			REMOTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+		}
+
+		/// Pairs with a test worker, opens a remote workspace, and awaits background tree and status reads.
+		fn open_remote<'a>(
+			cx: &'a mut TestAppContext,
+			shared: &Path,
+			opts: snip_remote::WorkerOptions,
+		) -> (
+			Entity<WorkbenchModel>,
+			&'a mut VisualTestContext,
+			snip_remote::Worker,
 		) {
-			use crate::tree::{NodeKey, TreeCommand};
-			use snip_core::transfer::SourceKind;
-			let tmp = tempfile::tempdir().unwrap();
-			let shared = tmp.path().join("shared");
-			fs::create_dir_all(shared.join("src")).unwrap();
-			fs::write(shared.join("src/main.rs"), "fn main() {}\n").unwrap();
-			fs::write(shared.join("README.md"), "# remote\n").unwrap();
-			// A folder symlink inside the share is a folder in the tree.
-			#[cfg(unix)]
-			std::os::unix::fs::symlink(
-				shared.join("src"),
-				shared.join("zz-link"),
-			)
-			.unwrap();
 			let id = snip_remote::Identity::generate().unwrap();
 			let worker = snip_remote::Worker::start(
 				"127.0.0.1:0".parse().unwrap(),
 				&id,
-				snip_remote::WorkerOptions {
-					name: "win-worker".into(),
-					trust_file: None,
-					..Default::default()
-				},
+				opts,
 			)
 			.unwrap();
-			assert!(worker.set_roots(std::slice::from_ref(&shared)).is_empty());
+			assert!(worker.set_roots(&[shared.to_path_buf()]).is_empty());
 			let code = worker.open_pairing();
 			let addr = worker.local_addr().to_string();
 
@@ -6397,16 +6452,6 @@ mod tests {
 				m.pair_remote_worker(cx);
 			});
 			settle(cx);
-			model.read_with(cx, |m, _| {
-				assert_eq!(m.remote.message, None);
-				assert_eq!(m.remote.workers.len(), 1);
-				assert_eq!(m.remote.workers[0].name, "win-worker");
-				let Some((0, Some(Ok(items)))) = &m.remote.browse else {
-					panic!("workspaces not listed: {:?}", m.remote.browse);
-				};
-				assert_eq!(items.len(), 1);
-				assert_eq!(items[0].name, "shared");
-			});
 
 			// The open goes through the shared close drain, which also waits
 			// for every git process in this test binary (GitLoad is process
@@ -6435,10 +6480,76 @@ mod tests {
 					m.finish_open_remote(worker, ws, cx);
 				}
 			});
-			settle(cx);
+			for _ in 0..10 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					!m.is_loading
+						&& (m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
+							|| m.file_tree
+								.as_ref()
+								.is_some_and(|t| t.is_loaded)
+							|| m.remote.scan_error.is_some())
+						&& (m.repos.is_empty()
+							|| m.change_repos.is_empty()
+							|| m.change_repos[0].state
+								!= crate::ChangeRepoState::Loading)
+				});
+				if done {
+					break;
+				}
+			}
+			(model, cx, worker)
+		}
+
+		/// Remote-node mode end to end in one process: a real worker on
+		/// loopback, the pairing form, the workspace list, the Project tree
+		/// and a file preview, all read through the worker. Every socket has
+		/// a timeout (snip-remote), so a hang fails rather than blocks.
+		#[gpui::test]
+		fn remote_workspace_pairs_lists_and_previews_through_a_worker(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			use crate::tree::{NodeKey, TreeCommand};
+			use snip_core::transfer::SourceKind;
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(shared.join("src")).unwrap();
+			fs::write(shared.join("src/main.rs"), "fn main() {}\n").unwrap();
+			fs::write(shared.join("README.md"), "# remote\n").unwrap();
+			// A folder symlink inside the share is a folder in the tree.
+			#[cfg(unix)]
+			std::os::unix::fs::symlink(
+				shared.join("src"),
+				shared.join("zz-link"),
+			)
+			.unwrap();
+
+			let (model, cx, worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "win-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
 			model.read_with(cx, |m, _| {
+				assert_eq!(m.remote.message, None);
+				assert_eq!(m.remote.workers.len(), 1);
+				assert_eq!(m.remote.workers[0].name, "win-worker");
+				let Some((0, Some(Ok(items)))) = &m.remote.browse else {
+					panic!("workspaces not listed: {:?}", m.remote.browse);
+				};
+				assert_eq!(items.len(), 1);
+				assert_eq!(items[0].name, "shared");
+
 				assert!(m.workspace_open && !m.workspace_menu);
-				assert!(m.repos.is_empty(), "no local discovery");
+				assert_eq!(
+					m.changes_empty_state(),
+					Some(crate::ChangesEmpty::NoRepository)
+				);
 				let tree = m.ws_tree.as_ref().expect("remote tree");
 				assert!(tree.is_loaded, "root listed: {tree:?}");
 				let names: Vec<_> =
@@ -6574,6 +6685,798 @@ mod tests {
 				assert!(m.remote.session.is_none(), "session closed");
 				assert!(!m.workspace_open && m.ws_tree.is_none());
 			});
+		}
+
+		#[gpui::test]
+		fn remote_multi_repo_workspace_lists_every_repo_with_its_changes(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			use crate::syntax::Language;
+			use crate::tree::{NodeKey, TreeCommand};
+			use snip_core::transfer::SourceKind;
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			let beta = shared.join("beta");
+			let plain = shared.join("plain");
+			fs::create_dir_all(alpha.join("src")).unwrap();
+			fs::create_dir_all(&beta).unwrap();
+			fs::create_dir_all(&plain).unwrap();
+
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("src/a.txt"), "committed\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "src/a.txt"]);
+			crate::paste::tests::git_run(
+				&alpha,
+				&["commit", "-m", "init alpha"],
+			);
+			fs::write(alpha.join("src/a.txt"), "modified\n").unwrap();
+			fs::write(alpha.join("untracked.txt"), "untracked\n").unwrap();
+			fs::write(alpha.join("staged.txt"), "staged\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "staged.txt"]);
+
+			crate::paste::tests::git_init(&beta);
+			fs::write(beta.join("b.txt"), "clean\n").unwrap();
+			crate::paste::tests::git_run(&beta, &["add", "b.txt"]);
+			crate::paste::tests::git_run(&beta, &["commit", "-m", "init beta"]);
+
+			fs::write(plain.join("note.txt"), "plain\n").unwrap();
+
+			let status_out = crate::paste::tests::git_run(
+				&alpha,
+				&["status", "--porcelain=v2"],
+			);
+			let mut expected_alpha = Vec::new();
+			for line in status_out.lines() {
+				if line.starts_with("1 ") {
+					let parts: Vec<&str> = line.split_whitespace().collect();
+					let xy = parts[1];
+					let path = parts[8];
+					if xy.starts_with(|c| c != '.') {
+						expected_alpha
+							.push((path.to_string(), SourceKind::Staged));
+					}
+					if xy.chars().nth(1).is_some_and(|c| c != '.') {
+						expected_alpha
+							.push((path.to_string(), SourceKind::Unstaged));
+					}
+				} else if let Some(path) = line.strip_prefix("? ") {
+					expected_alpha
+						.push((path.trim().to_string(), SourceKind::Working));
+				}
+			}
+			expected_alpha.sort_by(|a, b| a.0.cmp(&b.0));
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 2
+						&& m.change_repos.len() == 2
+						&& m.change_repos
+							.iter()
+							.all(|r| r.state == crate::ChangeRepoState::Loaded)
+						&& !m.commits.is_empty()
+				});
+				if done {
+					break;
+				}
+			}
+
+			model.read_with(cx, |m, _| {
+				let names: Vec<_> =
+					m.repos.iter().map(|r| r.name.as_str()).collect();
+				assert_eq!(names, ["alpha", "beta"]);
+				assert_eq!(
+					m.change_repos[0].state,
+					crate::ChangeRepoState::Loaded
+				);
+				assert_eq!(
+					m.change_repos[1].state,
+					crate::ChangeRepoState::Loaded
+				);
+				assert_eq!(m.changes_empty_state(), None);
+
+				let mut alpha_rows: Vec<(String, SourceKind)> = m
+					.files
+					.iter()
+					.filter(|f| f.repo == 0)
+					.map(|f| (f.path.clone(), f.source.clone()))
+					.collect();
+				alpha_rows.sort_by(|a, b| a.0.cmp(&b.0));
+				assert_eq!(alpha_rows, expected_alpha);
+
+				assert_eq!(m.log_feeds.len(), 2);
+				assert!(!m.commits.is_empty());
+				assert!(m.refs.iter().any(|r| r.name == "refs/heads/main"));
+			});
+
+			let mod_idx = model.read_with(cx, |m, _| {
+				m.files
+					.iter()
+					.position(|f| {
+						f.repo == 0
+							&& f.path == "src/a.txt"
+							&& f.source == SourceKind::Unstaged
+					})
+					.expect("modified row")
+			});
+			model.update(cx, |m, cx| {
+				m.select_change(mod_idx, cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.preview.is_some() && !m.preview_loading
+				});
+				if done {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("modified preview");
+				assert!(p.is_diff);
+				assert_eq!(p.lang, Language::Diff);
+				assert!(!p.text.is_empty());
+			});
+
+			let commit_sha = model.read_with(cx, |m, _| {
+				m.commits.first().expect("commit exists").sha.clone()
+			});
+			model.update(cx, |m, cx| {
+				m.select_commit(&commit_sha, cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done =
+					model.read_with(cx, |m, _| !m.commit_files.is_empty());
+				if done {
+					break;
+				}
+			}
+			let commit_file = model.read_with(cx, |m, _| {
+				assert!(!m.commit_files.is_empty());
+				m.commit_files[0].0.clone()
+			});
+			model.update(cx, |m, cx| {
+				m.select_commit_file(&commit_file, cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.preview.is_some() && !m.preview_loading
+				});
+				if done {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("commit file preview");
+				assert!(p.is_diff);
+				assert_eq!(p.lang, Language::Diff);
+				assert!(!p.text.is_empty());
+			});
+
+			model.update(cx, |m, cx| {
+				m.select_repo(0, cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.file_tree.as_ref().is_some_and(|t| t.is_loaded)
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| {
+				m.dispatch_tree(
+					Some(TreeCommand::Expand(NodeKey::from_utf8_rel("src"))),
+					cx,
+				);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.file_tree.as_ref().is_some_and(|t| {
+						t.children
+							.iter()
+							.find(|c| c.name == "src")
+							.is_some_and(|s| s.is_loaded)
+					})
+				});
+				if done {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				let tree = m.file_tree.as_ref().unwrap();
+				let src = tree
+					.children
+					.iter()
+					.find(|c| c.name == "src")
+					.expect("src dir");
+				assert!(src.is_loaded);
+				let child_rels: Vec<_> =
+					src.children.iter().map(|c| c.rel_path.as_str()).collect();
+				assert_eq!(child_rels, ["src/a.txt"]);
+			});
+
+			model.update(cx, |m, cx| {
+				let root = m.repo().map(|r| r.root.clone());
+				m.select_file_in(root, "src/a.txt", SourceKind::File, cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.preview.is_some() && !m.preview_loading
+				});
+				if done {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("tree file preview");
+				assert_eq!(&*p.text, "modified\n");
+				assert_eq!(m.preview_error, None);
+			});
+		}
+
+		#[gpui::test]
+		fn remote_single_repo_workspace_is_the_repo(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("repo");
+			fs::create_dir_all(&shared).unwrap();
+			crate::paste::tests::git_init(&shared);
+			fs::write(shared.join("file.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&shared, &["add", "file.txt"]);
+			crate::paste::tests::git_run(&shared, &["commit", "-m", "init"]);
+			crate::paste::tests::git_run(&shared, &["tag", "v1"]);
+			fs::write(shared.join("dirty.txt"), "dirty\n").unwrap();
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.change_repos.first().is_some_and(|r| {
+						r.state == crate::ChangeRepoState::Loaded
+					}) && !m.files.is_empty()
+						&& !m.commits.is_empty()
+				});
+				if done {
+					break;
+				}
+			}
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos.len(), 1);
+				let session_root =
+					m.remote.session.as_ref().unwrap().root.clone();
+				assert_eq!(m.repos[0].root, session_root);
+				assert_eq!(m.ws_home.as_ref(), Some(&m.repo().unwrap().root));
+				assert!(m.ws_tree.is_none());
+				assert!(m.file_tree.is_some());
+				assert!(m.changes_empty_state().is_none());
+				assert!(!m.files.is_empty(), "Changes has rows");
+				assert!(!m.commits.is_empty(), "log has commits");
+				assert!(
+					m.refs.iter().any(|r| r.name == "refs/heads/main"),
+					"refs contain refs/heads/main: {:?}",
+					m.refs
+				);
+				assert!(
+					m.refs.iter().any(|r| r.name == "refs/tags/v1"),
+					"refs contain refs/tags/v1: {:?}",
+					m.refs
+				);
+			});
+		}
+
+		#[gpui::test]
+		fn remote_non_repo_folder_says_no_repository(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("empty");
+			fs::create_dir_all(&shared).unwrap();
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			model.update(cx, |m, _| {
+				m.probes = Some(crate::ui::Probes::for_test());
+			});
+			settle(cx);
+			for _ in 0..50 {
+				let done = model.read_with(cx, |m, _| {
+					!m.is_loading && m.discovery_status.is_some()
+				});
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+			for _ in 0..2 {
+				cx.update(|w, _| w.refresh());
+				settle(cx);
+			}
+
+			model.read_with(cx, |m, _| {
+				assert!(m.repos.is_empty());
+				assert_eq!(
+					m.discovery_status,
+					Some(snip_core::workspace::ScanStatus::Complete)
+				);
+				assert_eq!(
+					m.changes_empty_state(),
+					Some(crate::ChangesEmpty::NoRepository)
+				);
+				assert_eq!(
+					m.log_empty_state(),
+					Some(crate::LogEmpty::NoRepository)
+				);
+				let drawn = m.probes.as_ref().unwrap().drawn();
+				assert!(
+					drawn.contains(&"changes-empty".to_string()),
+					"drawn: {drawn:?}"
+				);
+				assert_eq!(m.last_changes_empty.get(), Some("no_repository"));
+			});
+		}
+
+		#[gpui::test]
+		fn remote_worker_too_old_records_scan_error(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&shared).unwrap();
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "ancient".into(),
+					trust_file: None,
+					max_protocol: Some(1),
+				},
+			);
+
+			model.read_with(cx, |m, _| {
+				let err = m.remote.scan_error.as_ref().expect("scan error");
+				assert_eq!(err.key, "remote_worker_too_old");
+				assert_eq!(err.args[0], "ancient");
+			});
+		}
+
+		#[gpui::test]
+		fn remote_refresh_shows_a_new_change_in_the_open_repo(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("repo");
+			fs::create_dir_all(&shared).unwrap();
+			crate::paste::tests::git_init(&shared);
+			fs::write(shared.join("file.txt"), "committed\n").unwrap();
+			crate::paste::tests::git_run(&shared, &["add", "file.txt"]);
+			crate::paste::tests::git_run(&shared, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos.len(), 1);
+				assert!(m.files.is_empty(), "clean worktree has no changes");
+				assert!(!m.files.iter().any(|f| f.path == "new_file.txt"));
+			});
+
+			fs::write(shared.join("new_file.txt"), "new content\n").unwrap();
+
+			model.update(cx, |m, cx| {
+				m.reload_repos(cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.change_repos.first().is_some_and(|r| {
+						r.state == crate::ChangeRepoState::Loaded
+					}) && m.files.iter().any(|f| f.path == "new_file.txt")
+				});
+				if done {
+					break;
+				}
+			}
+
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.files.iter().any(|f| f.path == "new_file.txt"),
+					"new file found after refresh: {:?}",
+					m.files
+				);
+			});
+		}
+
+		#[gpui::test]
+		fn remote_single_repo_refresh_keeps_one_tree_and_its_open_folders(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			use crate::tree::{NodeKey, TreeCommand};
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("repo");
+			let sub = shared.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			crate::paste::tests::git_init(&shared);
+			fs::write(sub.join("inner.txt"), "inner\n").unwrap();
+			crate::paste::tests::git_run(&shared, &["add", "sub/inner.txt"]);
+			crate::paste::tests::git_run(&shared, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			model.read_with(cx, |m, _| {
+				assert!(m.ws_tree.is_none());
+				assert!(m.file_tree.is_some());
+			});
+
+			model.update(cx, |m, cx| {
+				m.dispatch_tree(
+					Some(TreeCommand::Expand(NodeKey::from_utf8_rel("sub"))),
+					cx,
+				);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					let tree = m.file_tree.as_ref().unwrap();
+					tree.children
+						.iter()
+						.find(|c| c.name == "sub")
+						.is_some_and(|s| s.is_loaded)
+				});
+				if done {
+					break;
+				}
+			}
+
+			model.read_with(cx, |m, _| {
+				let tree = m.file_tree.as_ref().unwrap();
+				let sub_node =
+					tree.children.iter().find(|c| c.name == "sub").unwrap();
+				assert!(sub_node.is_expanded);
+				assert!(sub_node.is_loaded);
+			});
+
+			model.update(cx, |m, cx| {
+				m.reload_repos(cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.file_tree.as_ref().is_some_and(|t| {
+						t.is_loaded
+							&& t.children
+								.iter()
+								.find(|c| c.name == "sub")
+								.is_some_and(|s| s.is_loaded)
+					})
+				});
+				if done {
+					break;
+				}
+			}
+
+			model.read_with(cx, |m, _| {
+				assert!(m.ws_tree.is_none());
+				let tree = m.file_tree.as_ref().expect("file_tree preserved");
+				let sub_node =
+					tree.children.iter().find(|c| c.name == "sub").unwrap();
+				assert!(
+					sub_node.is_expanded,
+					"folder remains expanded after refresh"
+				);
+				assert!(
+					sub_node.is_loaded,
+					"folder remains loaded after refresh"
+				);
+				assert!(
+					sub_node.children.iter().any(|c| c.name == "inner.txt"
+						|| c.rel_path == "sub/inner.txt"),
+					"sub/inner.txt present after refresh: {:?}",
+					sub_node.children
+				);
+			});
+		}
+
+		#[gpui::test]
+		fn remote_change_list_over_cap_shows_truncated_note(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("repo");
+			fs::create_dir_all(&shared).unwrap();
+			crate::paste::tests::git_init(&shared);
+			for i in 0..2100 {
+				fs::write(shared.join(format!("u{i:04}.txt")), "").unwrap();
+			}
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			for _ in 0..100 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.change_repos.first().is_some_and(|r| {
+						r.state == crate::ChangeRepoState::Loaded
+							&& r.total == 2100
+					})
+				});
+				if done {
+					break;
+				}
+			}
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos.len(), 1);
+				assert_eq!(m.change_repos.len(), 1);
+				let slot = &m.change_repos[0];
+				assert_eq!(slot.total, 2100);
+				let kept = crate::slot_range(&m.files, 0).len();
+				assert_eq!(kept, crate::MAX_CHANGES_PER_REPO);
+				assert_eq!(m.files.len(), crate::MAX_CHANGES_PER_REPO);
+				assert!(
+					slot.truncated(kept),
+					"truncated condition must be true"
+				);
+				assert!(slot.total > kept);
+				let layout = crate::ui::ChangeLayout {
+					by_dir: false,
+					expanded: |_: usize, _: &str, _: &str| false,
+				};
+				let rows = crate::ui::change_rows(
+					&m.change_repos,
+					&m.files,
+					|_| false,
+					|_, _| true,
+					"",
+					&layout,
+				);
+				assert!(
+					rows.iter().any(|r| matches!(
+						r,
+						crate::ui::ChangeItemRow::Note { slot: 0 }
+					)),
+					"note row emitted"
+				);
+			});
+		}
+
+		#[gpui::test]
+		fn remote_copy_paths_are_refused(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			use crate::tree::{NodeKey, TreeCommand};
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			let beta = shared.join("beta");
+			fs::create_dir_all(&alpha).unwrap();
+			fs::create_dir_all(&beta).unwrap();
+
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+			fs::write(alpha.join("dirty.txt"), "dirty\n").unwrap();
+
+			crate::paste::tests::git_init(&beta);
+			fs::write(beta.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&beta, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&beta, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.change_repos.first().is_some_and(|r| {
+						r.state == crate::ChangeRepoState::Loaded
+					}) && !m.files.is_empty()
+						&& !m.commits.is_empty()
+						&& m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
+				});
+				if done {
+					break;
+				}
+			}
+
+			model.update(cx, |m, cx| {
+				m.select_repo(0, cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.file_tree.as_ref().is_some_and(|t| t.is_loaded)
+				});
+				if done {
+					break;
+				}
+			}
+
+			let check = |model: &Entity<WorkbenchModel>,
+			             cx: &mut VisualTestContext,
+			             act: &str| {
+				model.read_with(cx, |m, _| {
+					assert_eq!(
+						m.status.key, "remote_unsupported",
+						"{act} should set status to remote_unsupported"
+					);
+					assert!(!m.is_copying, "{act} should not set is_copying");
+					assert!(
+						m.basket.is_empty(),
+						"{act} should leave basket empty"
+					);
+				});
+			};
+
+			// 1. toggle_file(0)
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| m.toggle_file(0, cx));
+			check(&model, cx, "toggle_file(0)");
+
+			// 2. select_all_files
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| m.select_all_files(cx));
+			check(&model, cx, "select_all_files");
+
+			// 3. toggle_change_group
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| m.toggle_change_group("unstaged", cx));
+			check(&model, cx, "toggle_change_group");
+
+			// 4. toggle_change_repo
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| m.toggle_change_repo(0, "unstaged", cx));
+			check(&model, cx, "toggle_change_repo");
+
+			// 5. dispatch_tree(ToggleSelect(..)) on file_tree
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| {
+				m.dispatch_tree(
+					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
+						"dirty.txt",
+					))),
+					cx,
+				);
+			});
+			check(&model, cx, "dispatch_tree(ToggleSelect)");
+
+			// 6. dispatch_ws_tree(ToggleSelect(..)) on ws_tree
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| {
+				m.dispatch_ws_tree(
+					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
+						"alpha",
+					))),
+					cx,
+				);
+			});
+			check(&model, cx, "dispatch_ws_tree(ToggleSelect)");
+
+			// 7. toggle_rev_file_selection
+			let sha = model.read_with(cx, |m, _| {
+				m.commits.first().expect("commit exists").sha.clone()
+			});
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| {
+				m.toggle_rev_file_selection(&sha, "init.txt", cx)
+			});
+			check(&model, cx, "toggle_rev_file_selection");
+
+			// 8. run_menu_act(MenuAct::CopyRevFiles(..))
+			let repo_root =
+				model.read_with(cx, |m, _| m.repo().unwrap().root.clone());
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			cx.update(|window, cx| {
+				model.update(cx, |m, cx| {
+					m.run_menu_act(
+						crate::menu::MenuAct::CopyRevFiles(vec![(
+							repo_root,
+							"HEAD".into(),
+							"init.txt".into(),
+							false,
+						)]),
+						window,
+						cx,
+					);
+				});
+			});
+			check(&model, cx, "run_menu_act(CopyRevFiles)");
+
+			// 9. copy_project_selection
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| m.copy_project_selection(cx));
+			check(&model, cx, "copy_project_selection");
+
+			// 10. copy_commits_to_clipboard
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| m.copy_commits_to_clipboard(cx));
+			check(&model, cx, "copy_commits_to_clipboard");
+
+			// 11. copy_selection_to_clipboard
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			model.update(cx, |m, cx| m.copy_selection_to_clipboard(cx));
+			check(&model, cx, "copy_selection_to_clipboard");
+
+			// 12. cx.simulate_keystrokes("cmd-c") and "ctrl-c"
+			cx.update(|window, cx| {
+				window.focus(&model.read(cx).focus_handle.clone());
+			});
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			cx.simulate_keystrokes("cmd-c");
+			cx.run_until_parked();
+			check(&model, cx, "cmd-c");
+
+			model.update(cx, |m, _| m.set_status("status_idle", []));
+			cx.simulate_keystrokes("ctrl-c");
+			cx.run_until_parked();
+			check(&model, cx, "ctrl-c");
 		}
 
 		/// The workspace menu closes on Escape in the pairing form and on a

@@ -1,20 +1,28 @@
 //! Where the workbench's Git views read from.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use snip_core::gitview::{LocalRepo, Read, RepoView};
 use snip_core::workspace::RepoIdentity;
+use snip_remote::Client;
 
 use crate::WorkbenchModel;
 
 /// Where the workbench's Git views read from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) enum GitHost {
 	Local,
+	Remote {
+		client: Arc<Client>,
+		workspace: String,
+		root: PathBuf, /* session.root */
+	},
 }
 
 impl GitHost {
 	/// Local: `known` -> LocalRepo::known (no process), else LocalRepo::open (one probe).
+	/// Remote: no I/O at all (the first RepoView method call connects).
 	pub fn open(
 		&self,
 		root: &Path,
@@ -36,13 +44,50 @@ impl GitHost {
 						.map_err(|e| e.to_string()),
 				}
 			}
+			Self::Remote {
+				client,
+				workspace,
+				root: session_root,
+			} => {
+				let rel = self.remote_rel(root).ok_or_else(|| {
+					format!(
+						"repository '{}' is not under remote session root '{}'",
+						root.display(),
+						session_root.display()
+					)
+				})?;
+				Ok(Box::new(snip_remote::RemoteRepo::new(
+					client.clone(),
+					workspace.clone(),
+					rel,
+				)))
+			}
+		}
+	}
+
+	/// `root` as the worker's share-relative "/"-joined path ("" for the share root);
+	/// None when `root` is not under the session root, or has a non-Normal component.
+	pub fn remote_rel(&self, root: &Path) -> Option<String> {
+		match self {
+			Self::Local => None,
+			Self::Remote {
+				root: session_root, ..
+			} => crate::remote::remote_rel(session_root, root),
 		}
 	}
 }
 
 impl WorkbenchModel {
 	pub(crate) fn git_host(&self) -> GitHost {
-		GitHost::Local
+		if let Some(session) = &self.remote.session {
+			GitHost::Remote {
+				client: session.client.clone(),
+				workspace: session.workspace.id.clone(),
+				root: session.root.clone(),
+			}
+		} else {
+			GitHost::Local
+		}
 	}
 }
 
@@ -117,5 +162,59 @@ mod tests {
 			.open(Path::new("/nonexistent"), Some(&id), &read)
 			.unwrap();
 		assert!(from_known.change_list(10, &read).is_ok());
+	}
+
+	#[test]
+	fn remote_host_opens_without_io_and_maps_roots() {
+		let id = snip_remote::Identity::generate().unwrap();
+		let worker = snip_remote::PairedWorker {
+			name: "w".into(),
+			addr: "127.0.0.1:0".into(),
+			fingerprint: id.fingerprint().to_hex(),
+		};
+		let client = std::sync::Arc::new(
+			snip_remote::Client::new(
+				worker,
+				std::sync::Arc::new(id),
+				"master".into(),
+			)
+			.unwrap(),
+		);
+		let session_root = std::path::PathBuf::from("snip-remote://fp/ws1");
+		let host = GitHost::Remote {
+			client,
+			workspace: "ws1".into(),
+			root: session_root.clone(),
+		};
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let before_flight = snip_core::gitrun::in_flight();
+		let before_queued = snip_core::gitrun::queued();
+
+		// remote_rel cases
+		assert_eq!(host.remote_rel(&session_root), Some(String::new()));
+		assert_eq!(
+			host.remote_rel(&session_root.join("sub").join("repo")),
+			Some("sub/repo".to_string())
+		);
+		assert_eq!(host.remote_rel(Path::new("/outside")), None);
+		assert_eq!(GitHost::Local.remote_rel(&session_root), None);
+
+		// open returns Ok for a root under session.root and Err for a path outside
+		let under = host.open(&session_root, None, &read);
+		assert!(under.is_ok());
+
+		let sub = host.open(&session_root.join("sub"), None, &read);
+		assert!(sub.is_ok());
+
+		let outside = host.open(Path::new("/outside"), None, &read);
+		assert!(outside.is_err());
+
+		// GitLoad/gitrun::in_flight unchanged; no worker needed since no I/O happens
+		assert_eq!(snip_core::gitrun::in_flight(), before_flight);
+		assert_eq!(snip_core::gitrun::queued(), before_queued);
 	}
 }

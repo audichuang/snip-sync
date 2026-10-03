@@ -767,7 +767,7 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn run_menu_act(
+	pub(crate) fn run_menu_act(
 		&mut self,
 		act: MenuAct,
 		window: &mut Window,
@@ -808,6 +808,10 @@ impl WorkbenchModel {
 			MenuAct::CopyCommits(_) => self.copy_commits_to_clipboard(cx),
 			MenuAct::CopyProjectSelection => self.copy_project_selection(cx),
 			MenuAct::CopyRevFiles(files) => {
+				if self.remote_blocks() {
+					cx.notify();
+					return;
+				}
 				let name = files
 					.first()
 					.map(|(root, ..)| self.log_repo_name(root))
@@ -894,6 +898,9 @@ impl WorkbenchModel {
 		&mut self,
 		pred: impl Fn(&crate::FileChangeItem) -> bool,
 	) -> Option<bool> {
+		if self.remote_blocks() {
+			return None;
+		}
 		let pred = |f: &crate::FileChangeItem| {
 			pred(f) && f.is_valid_utf8() && self.change_slot_loaded(f.repo)
 		};

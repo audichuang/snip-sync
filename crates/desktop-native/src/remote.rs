@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use snip_core::browser::SourcePreview;
-use snip_core::transfer::SourceKind;
+use snip_core::workspace::{RepoIdentity, RepoKind, RepoSummary, ScanStatus};
 use snip_remote::{
 	Client, Identity, PairedWorker, RemoteError, RemoteWorkspace, Worker,
 	WorkerOptions, WorkerStore, TRUSTED_FILE, WORKERS_FILE,
@@ -28,7 +28,7 @@ use crate::tree::{
 	listed_tree_result, FileTreeNode, ListedChild, NodeKey, TreeCommand,
 	TreeEffect, TreeIo, TreeIoResult,
 };
-use crate::{lifecycle, WorkbenchModel};
+use crate::{arm_cancel, lifecycle, RepoEntry, WorkbenchModel};
 
 pub use snip_remote::DEFAULT_LISTEN;
 
@@ -263,24 +263,214 @@ pub struct MasterState {
 	pub scan_error: Option<Msg>,
 }
 
+/// Returns true when `s` is empty or a relative path consisting only of normal UTF-8 components.
+pub(crate) fn valid_rel(s: &str) -> bool {
+	if s.is_empty() {
+		return true;
+	}
+	if s.contains('\0') || s.contains('\\') {
+		return false;
+	}
+	for part in s.split('/') {
+		if part.is_empty() || part == "." || part == ".." {
+			return false;
+		}
+	}
+	let p = Path::new(s);
+	p.components()
+		.all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// Strips `session_root` from `path` and formats normal components with "/" for worker communication.
+pub(crate) fn remote_rel(session_root: &Path, path: &Path) -> Option<String> {
+	let rel = path.strip_prefix(session_root).ok()?;
+	let mut parts = Vec::new();
+	for comp in rel.components() {
+		match comp {
+			std::path::Component::Normal(c) => {
+				let s = c.to_str()?;
+				parts.push(s);
+			}
+			_ => return None,
+		}
+	}
+	Some(parts.join("/"))
+}
+
+/// Joins two relative path fragments with a single "/" separator, trimming existing slashes.
+pub(crate) fn join_rel(prefix: &str, rel: &str) -> String {
+	let p = prefix.trim_matches('/');
+	let r = rel.trim_matches('/');
+	if p.is_empty() && r.is_empty() {
+		String::new()
+	} else if p.is_empty() {
+		r.to_string()
+	} else if r.is_empty() {
+		p.to_string()
+	} else {
+		format!("{p}/{r}")
+	}
+}
+
+/// Only a key for `RepoSummary.identity`, must not be given to local git.
+pub(crate) fn key_identity(
+	root: &Path,
+	kind: snip_core::gitview::FoundKind,
+) -> RepoIdentity {
+	let repo_kind = match kind {
+		snip_core::gitview::FoundKind::Main => RepoKind::Main,
+		snip_core::gitview::FoundKind::LinkedWorktree => {
+			RepoKind::LinkedWorktree
+		}
+		snip_core::gitview::FoundKind::Submodule
+		| snip_core::gitview::FoundKind::UninitializedSubmodule => {
+			RepoKind::Submodule
+		}
+	};
+	let git_dir = root.join(".git");
+	RepoIdentity {
+		toplevel: root.to_path_buf(),
+		git_dir: git_dir.clone(),
+		common_dir: git_dir,
+		kind: repo_kind,
+	}
+}
+
+/// Repositories, notes, and pagination status produced by translating a worker RepoScan.
+pub(crate) struct RemoteScanEntries {
+	pub repos: Vec<RepoEntry>,
+	pub errors: Vec<(PathBuf, String)>,
+	pub depth_limited: Vec<PathBuf>,
+	pub error_overflow: usize,
+	pub depth_overflow: usize,
+	pub status: ScanStatus,
+}
+
+/// Translates and bounds a worker RepoScan onto the fake session root, dropping invalid paths.
+pub(crate) fn remote_scan_entries(
+	session_root: &Path,
+	scan: snip_remote::RepoScan,
+) -> RemoteScanEntries {
+	let mut repos = Vec::with_capacity(scan.repos.len());
+	let mut errors = Vec::with_capacity(scan.errors.len());
+	let mut depth_limited = Vec::with_capacity(scan.depth_limited.len());
+
+	for scanned in scan.repos {
+		if !scanned.utf8 || !valid_rel(&scanned.rel) {
+			errors.push((
+				session_root.to_path_buf(),
+				"worker returned an invalid path".to_string(),
+			));
+			continue;
+		}
+		let mut root = session_root.to_path_buf();
+		if !scanned.rel.is_empty() {
+			for part in scanned.rel.split('/') {
+				root.push(part);
+			}
+		}
+		let kind = scanned.kind;
+		let summary = scanned.summary.map(|s| RepoSummary {
+			identity: key_identity(&root, kind),
+			head: s.head,
+			branch: s.branch,
+			changes: s.changes,
+		});
+		repos.push(RepoEntry {
+			root,
+			name: scanned.name,
+			kind: kind.into(),
+			identity: None,
+			summary,
+		});
+	}
+
+	for (raw_rel, msg) in scan.errors {
+		let rel = if raw_rel == "." { "" } else { raw_rel.as_str() };
+		if !valid_rel(rel) {
+			errors.push((
+				session_root.to_path_buf(),
+				"worker returned an invalid path".to_string(),
+			));
+			continue;
+		}
+		let mut path = session_root.to_path_buf();
+		if !rel.is_empty() {
+			for part in rel.split('/') {
+				path.push(part);
+			}
+		}
+		errors.push((path, msg));
+	}
+
+	for raw_rel in scan.depth_limited {
+		let rel = if raw_rel == "." { "" } else { raw_rel.as_str() };
+		if !valid_rel(rel) {
+			errors.push((
+				session_root.to_path_buf(),
+				"worker returned an invalid path".to_string(),
+			));
+			continue;
+		}
+		let mut path = session_root.to_path_buf();
+		if !rel.is_empty() {
+			for part in rel.split('/') {
+				path.push(part);
+			}
+		}
+		depth_limited.push(path);
+	}
+
+	let status = match scan.status {
+		ScanStatus::More => ScanStatus::Incomplete,
+		other => other,
+	};
+
+	RemoteScanEntries {
+		repos,
+		errors,
+		depth_limited,
+		error_overflow: scan.error_overflow,
+		depth_overflow: scan.depth_overflow,
+		status,
+	}
+}
+
 /// Blocking: the remote counterpart of [`crate::tree::execute_tree_io`].
-pub fn tree_io(client: &Client, workspace: &str, io: TreeIo) -> TreeIoResult {
+pub fn tree_io(
+	client: &Client,
+	workspace: &str,
+	session_root: &Path,
+	io: TreeIo,
+) -> TreeIoResult {
+	let prefix = match remote_rel(session_root, &io.base) {
+		Some(p) => p,
+		None => {
+			return listed_tree_result(
+				io,
+				Err("not under the workspace".to_string()),
+			)
+		}
+	};
 	let listed = match io.key.utf8_rel() {
-		Some(rel) => client
-			.list_dir(workspace, &rel)
-			.map(|(entries, truncated)| {
-				let children = entries
-					.into_iter()
-					.map(|e| ListedChild {
-						name: e.name,
-						utf8: e.utf8,
-						directory: e.directory,
-						nested_repo: e.nested_repo,
-					})
-					.collect();
-				(children, truncated)
-			})
-			.map_err(describe),
+		Some(key_rel) => {
+			let req_path = join_rel(&prefix, &key_rel);
+			client
+				.list_dir(workspace, &req_path)
+				.map(|(entries, truncated)| {
+					let children = entries
+						.into_iter()
+						.map(|e| ListedChild {
+							name: e.name,
+							utf8: e.utf8,
+							directory: e.directory,
+							nested_repo: e.nested_repo,
+						})
+						.collect();
+					(children, truncated)
+				})
+				.map_err(describe)
+		}
 		None => Err("non-UTF-8 folder name".to_string()),
 	};
 	listed_tree_result(io, listed)
@@ -291,10 +481,12 @@ pub fn tree_io(client: &Client, workspace: &str, io: TreeIo) -> TreeIoResult {
 pub fn read_preview(
 	client: &Client,
 	workspace: &str,
+	prefix: &str,
 	path: &str,
 ) -> Result<(SourcePreview, PreviewSource), String> {
+	let full_path = join_rel(prefix, path);
 	client
-		.read(workspace, path)
+		.read(workspace, &full_path)
 		.map(|content| {
 			(
 				SourcePreview {
@@ -366,12 +558,24 @@ fn apply_forget(
 // ───────────────────────── model ─────────────────────────
 
 impl WorkbenchModel {
-	/// The worker client and workspace id while a remote workspace is open.
-	pub(crate) fn remote_target(&self) -> Option<(Arc<Client>, String)> {
+	/// The worker client, workspace id and session root while a remote workspace is open.
+	pub(crate) fn remote_target(
+		&self,
+	) -> Option<(Arc<Client>, String, PathBuf)> {
 		self.remote
 			.session
 			.as_ref()
-			.map(|s| (s.client.clone(), s.workspace.id.clone()))
+			.map(|s| (s.client.clone(), s.workspace.id.clone(), s.root.clone()))
+	}
+
+	/// Refuses local operations when a remote session is active, setting the unsupported status.
+	pub(crate) fn remote_blocks(&mut self) -> bool {
+		if self.remote.session.is_some() {
+			self.set_status("remote_unsupported", []);
+			true
+		} else {
+			false
+		}
 	}
 
 	fn remote_note(&mut self, ok: bool, text: String, cx: &mut Context<Self>) {
@@ -614,25 +818,144 @@ impl WorkbenchModel {
 		);
 		self.status = Msg::new("remote_opened", [label]);
 		self.resume_remote_tree(cx);
+		self.launch_remote_scan(None, true, cx);
 	}
 
-	/// Refresh: the remote tree is read again from its root.
-	pub(crate) fn reload_remote_tree(&mut self, cx: &mut Context<Self>) {
-		let Some(root) = self.remote.session.as_ref().map(|s| s.root.clone())
-		else {
+	/// Scans the worker workspace for Git repositories in the background, updating discovery state.
+	pub(crate) fn launch_remote_scan(
+		&mut self,
+		under: Option<PathBuf>,
+		wipe: bool,
+		cx: &mut Context<Self>,
+	) {
+		if !self.accepting_work() {
 			return;
-		};
-		self.ws_tree = Some(FileTreeNode::unloaded_root(&root));
-		self.resume_remote_tree(cx);
-		// Refresh re-reads the open file too: changed text shows, and a file
-		// deleted on the worker shows its error instead of the old text.
-		if self.selected_commit.is_none()
-			&& self.selected_file_source == Some(SourceKind::File)
-		{
-			if let Some(path) = self.selected_file.clone() {
-				self.select_file_in(Some(root), &path, SourceKind::File, cx);
-			}
 		}
+		let (client, ws, session_root) = match &self.remote.session {
+			Some(s) => {
+				(s.client.clone(), s.workspace.id.clone(), s.root.clone())
+			}
+			None => return,
+		};
+		let under_rel = match under {
+			Some(p) => match remote_rel(&session_root, &p) {
+				Some(rel) => Some(rel),
+				None => return,
+			},
+			None => None,
+		};
+		if wipe {
+			self.remote.scan_error = None;
+		}
+		self.discovery_generation = self.discovery_generation.wrapping_add(1);
+		let generation = self.discovery_generation;
+		let cancel = arm_cancel(&mut self.scan_cancel);
+		self.is_loading = true;
+		self.set_status("status_scanning", []);
+		let lifecycle_generation = self.lifecycle.generation();
+		let cancel_job = cancel.clone();
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel_job),
+			async move {
+				let bg = async_app.background_executor().clone();
+				let cancel_bg = cancel.clone();
+				let client_bg = client.clone();
+				let ws_bg = ws.clone();
+				let under_bg = under_rel.clone();
+				let result = bg
+					.spawn(async move {
+						client_bg.scan_repos(
+							&ws_bg,
+							under_bg.as_deref(),
+							Some(&cancel_bg),
+						)
+					})
+					.await;
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.discovery_generation != generation
+						|| model.lifecycle.generation() != lifecycle_generation
+					{
+						return;
+					}
+					match result {
+						Ok(scan) => {
+							let e = remote_scan_entries(&session_root, scan);
+							if wipe {
+								model.begin_rescan();
+							}
+							model.merge_repo_entries(e.repos);
+							for err in e.errors {
+								model.push_discovery_error(err);
+							}
+							for depth in e.depth_limited {
+								model.push_depth_limit(depth);
+							}
+							model.discovery_error_overflow = model
+								.discovery_error_overflow
+								.saturating_add(e.error_overflow);
+							model.discovery_depth_overflow = model
+								.discovery_depth_overflow
+								.saturating_add(e.depth_overflow);
+							model.discovery_status = Some(e.status);
+							app_log!(
+								"[APP:DISCOVERY_PROGRESS: repos={} status={:?} visited=0]",
+								model.repos.len(),
+								e.status
+							);
+							model.place_selection(cx);
+							model.finish_discovery(cx);
+						}
+						Err(RemoteError::Cancelled) => {}
+						Err(err) => {
+							let (msg, text) = match err {
+								RemoteError::WorkerTooOld {
+									worker,
+									have,
+									need,
+								} => {
+									let text = (RemoteError::WorkerTooOld {
+										worker: worker.clone(),
+										have,
+										need,
+									})
+									.to_string();
+									(
+										Msg::new(
+											"remote_worker_too_old",
+											[worker, have.to_string()],
+										),
+										text,
+									)
+								}
+								other => {
+									let text = describe(other);
+									(
+										Msg::new(
+											"remote_scan_failed",
+											[text.clone()],
+										),
+										text,
+									)
+								}
+							};
+							app_log!("[APP:REMOTE_SCAN_FAILED: {text}]");
+							model.remote.scan_error = Some(msg);
+							model.discovery_status =
+								Some(ScanStatus::Incomplete);
+							model.is_loading = false;
+							model.refresh_reload = false;
+							model.ensure_ws_tree(cx);
+							cx.notify();
+						}
+					}
+				});
+			},
+		);
 	}
 
 	fn resume_remote_tree(&mut self, cx: &mut Context<Self>) {
@@ -838,5 +1161,180 @@ mod tests {
 			err.contains("cannot save pairings"),
 			"expected error containing 'cannot save pairings', got: {err}"
 		);
+	}
+
+	#[test]
+	fn worker_supplied_absolute_or_dotdot_rel_is_dropped() {
+		// Table test for valid_rel
+		let valid_cases = [
+			("", true),
+			("a", true),
+			("a/b", true),
+			("a/b/c", true),
+			(".", false),
+			("..", false),
+			("/etc", false),
+			("../x", false),
+			("a/../../b", false),
+			("a//b", false),
+			("a/b/", false),
+			("a\\b", false),
+			("a\0b", false),
+			("a/./b", false),
+		];
+		#[cfg(windows)]
+		assert!(!valid_rel("C:/x"), "valid_rel(\"C:/x\")");
+		for (input, expected) in valid_cases {
+			assert_eq!(valid_rel(input), expected, "valid_rel({input:?})");
+		}
+
+		// Table test for remote_rel
+		let session_root = Path::new("snip-remote://fp123/ws456");
+		assert_eq!(remote_rel(session_root, session_root), Some(String::new()));
+		assert_eq!(
+			remote_rel(session_root, &session_root.join("alpha")),
+			Some("alpha".to_string())
+		);
+		assert_eq!(
+			remote_rel(session_root, &session_root.join("alpha").join("beta")),
+			Some("alpha/beta".to_string())
+		);
+		assert_eq!(remote_rel(session_root, Path::new("/etc")), None);
+		assert_eq!(
+			remote_rel(session_root, &session_root.join("..").join("outside")),
+			None
+		);
+
+		// Table test for join_rel
+		assert_eq!(join_rel("", ""), "");
+		assert_eq!(join_rel("a", ""), "a");
+		assert_eq!(join_rel("", "b"), "b");
+		assert_eq!(join_rel("a", "b"), "a/b");
+		assert_eq!(join_rel("/a/", "/b/"), "a/b");
+		assert_eq!(join_rel("a/b", "c/d"), "a/b/c/d");
+
+		// Test remote_scan_entries
+		let invalid_rels = vec![
+			"/etc".to_string(),
+			"../x".to_string(),
+			"a/../../b".to_string(),
+			"a//b".to_string(),
+			"nul\0byte".to_string(),
+		];
+		let mut repos = Vec::new();
+		let mut errors = Vec::new();
+		let mut depth_limited = Vec::new();
+
+		for inv in &invalid_rels {
+			repos.push(snip_remote::ScannedRepo {
+				rel: inv.clone(),
+				utf8: true,
+				name: "inv".into(),
+				kind: snip_core::gitview::FoundKind::Main,
+				summary: Ok(snip_core::gitview::StatusSummary {
+					head: Some("main".into()),
+					branch: Some("main".into()),
+					changes: snip_core::workspace::ChangeCounts::default(),
+				}),
+			});
+			errors.push((inv.clone(), "some error".into()));
+			depth_limited.push(inv.clone());
+		}
+
+		// Non-UTF8 repo
+		repos.push(snip_remote::ScannedRepo {
+			rel: "valid_name".into(),
+			utf8: false,
+			name: "lossy".into(),
+			kind: snip_core::gitview::FoundKind::Main,
+			summary: Ok(snip_core::gitview::StatusSummary {
+				head: None,
+				branch: None,
+				changes: snip_core::workspace::ChangeCounts::default(),
+			}),
+		});
+
+		// Valid items: "" in repo, "." in error, "." in depth_limited, "a/b" in repo
+		repos.push(snip_remote::ScannedRepo {
+			rel: "".into(),
+			utf8: true,
+			name: "root_repo".into(),
+			kind: snip_core::gitview::FoundKind::Main,
+			summary: Ok(snip_core::gitview::StatusSummary {
+				head: Some("main".into()),
+				branch: Some("main".into()),
+				changes: snip_core::workspace::ChangeCounts::default(),
+			}),
+		});
+		repos.push(snip_remote::ScannedRepo {
+			rel: "a/b".into(),
+			utf8: true,
+			name: "nested_repo".into(),
+			kind: snip_core::gitview::FoundKind::Main,
+			summary: Ok(snip_core::gitview::StatusSummary {
+				head: Some("main".into()),
+				branch: Some("main".into()),
+				changes: snip_core::workspace::ChangeCounts::default(),
+			}),
+		});
+		errors.push((".".into(), "error at root".into()));
+		depth_limited.push(".".into());
+
+		let scan = snip_remote::RepoScan {
+			repos,
+			errors,
+			error_overflow: 7,
+			depth_limited,
+			depth_overflow: 3,
+			status: ScanStatus::More,
+		};
+
+		let res = remote_scan_entries(session_root, scan);
+		assert_eq!(res.status, ScanStatus::Incomplete);
+		assert_eq!(res.error_overflow, 7);
+		assert_eq!(res.depth_overflow, 3);
+
+		// 2 valid repos
+		assert_eq!(res.repos.len(), 2);
+		assert_eq!(res.repos[0].root, session_root);
+		assert_eq!(
+			res.repos[0].summary.as_ref().unwrap().identity,
+			key_identity(session_root, snip_core::gitview::FoundKind::Main)
+		);
+		assert_eq!(res.repos[1].root, session_root.join("a").join("b"));
+		assert_eq!(
+			res.repos[1].summary.as_ref().unwrap().identity,
+			key_identity(
+				&session_root.join("a").join("b"),
+				snip_core::gitview::FoundKind::Main
+			)
+		);
+
+		// 1 valid depth limit (from ".")
+		assert_eq!(res.depth_limited.len(), 1);
+		assert_eq!(res.depth_limited[0], session_root);
+
+		// Errors should contain: 1 valid error (from ".") + 5 invalid repo errors + 1 non-utf8 repo error + 5 invalid error rels + 5 invalid depth rels = 17 errors
+		let invalid_msg = "worker returned an invalid path";
+		let invalid_count = res
+			.errors
+			.iter()
+			.filter(|(p, msg)| p == session_root && msg == invalid_msg)
+			.count();
+		assert_eq!(
+			invalid_count,
+			invalid_rels.len() + 1 + invalid_rels.len() + invalid_rels.len()
+		);
+
+		// Ensure no entry's path escapes session_root
+		for r in &res.repos {
+			assert!(r.root.starts_with(session_root));
+		}
+		for (p, _) in &res.errors {
+			assert!(p.starts_with(session_root));
+		}
+		for p in &res.depth_limited {
+			assert!(p.starts_with(session_root));
+		}
 	}
 }
