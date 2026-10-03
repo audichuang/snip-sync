@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use snip_core::gitsrc::GitError;
 use snip_core::gitview::{LocalRepo, Read, RepoView};
 use snip_core::workspace::RepoIdentity;
 use snip_remote::Client;
@@ -91,10 +92,78 @@ impl WorkbenchModel {
 	}
 }
 
+/// Translates Git errors encountered while querying refs into a displayable string.
+/// For remote hosts exceeding the worker's frame limit (`GitError::OutputLimit`),
+/// returns the localized message of `remote_refs_too_large`.
+pub(crate) fn refs_error(host: &GitHost, e: GitError) -> String {
+	if matches!(host, GitHost::Remote { .. })
+		&& matches!(e, GitError::OutputLimit { .. })
+	{
+		// Background threads querying history have no workbench model context,
+		// so the application's default locale (zh-TW) is used for the error text.
+		crate::i18n::t("remote_refs_too_large", crate::i18n::Locale::default())
+			.to_string()
+	} else {
+		e.to_string()
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use snip_core::gitview::ReadProfile;
+
+	#[test]
+	fn refs_error_mapping() {
+		let id = snip_remote::Identity::generate().unwrap();
+		let worker = snip_remote::PairedWorker {
+			name: "w".into(),
+			addr: "127.0.0.1:0".into(),
+			fingerprint: id.fingerprint().to_hex(),
+		};
+		let client = std::sync::Arc::new(
+			snip_remote::Client::new(
+				worker,
+				std::sync::Arc::new(id),
+				"master".into(),
+			)
+			.unwrap(),
+		);
+		let remote_host = GitHost::Remote {
+			client,
+			workspace: "ws1".into(),
+			root: PathBuf::from("snip-remote://fp/ws1"),
+		};
+		let local_host = GitHost::Local;
+
+		// Remote + OutputLimit -> localized text of remote_refs_too_large
+		assert_eq!(
+			refs_error(
+				&remote_host,
+				GitError::OutputLimit {
+					args: "remote view".into(),
+					limit: 0,
+				}
+			),
+			crate::i18n::t(
+				"remote_refs_too_large",
+				crate::i18n::Locale::default()
+			)
+		);
+
+		// Remote + other -> to_string()
+		let other_err = GitError::Host("server died".into());
+		let other_str = other_err.to_string();
+		assert_eq!(refs_error(&remote_host, other_err), other_str);
+
+		// Local + OutputLimit -> to_string()
+		let local_err = GitError::OutputLimit {
+			args: "remote view".into(),
+			limit: 0,
+		};
+		let local_str = local_err.to_string();
+		assert_eq!(refs_error(&local_host, local_err), local_str);
+	}
 
 	#[test]
 	fn local_host_refuses_a_remote_key() {

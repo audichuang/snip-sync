@@ -3,7 +3,7 @@
 //! Reads go through `snip-core` (`browser::history`, `gitsrc`, `graph`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::arm_cancel;
 
@@ -800,7 +800,9 @@ fn read_graph_page(
 		Some(reused) if reused.0.ref_filter == ref_filter => reused,
 		_ => {
 			let g = open()?;
-			let snap = g.refs(read).map_err(|e| e.to_string())?;
+			let snap = g
+				.refs(read)
+				.map_err(|e| crate::githost::refs_error(host, e))?;
 			let filter_tip =
 				match ref_filter.as_deref().filter(|r| !r.is_empty()) {
 					Some(r) => Some(
@@ -1279,8 +1281,9 @@ impl WorkbenchModel {
 						let (refs, head, email) = if extending {
 							(snapshot.0, snapshot.1, None)
 						} else {
-							let snap =
-								g.refs(&read).map_err(|e| e.to_string())?;
+							let snap = g.refs(&read).map_err(|e| {
+								crate::githost::refs_error(&host, e)
+							})?;
 							(snap.refs, snap.head, g.user_email(&read))
 						};
 						let (commits, has_more) = g
@@ -3258,7 +3261,9 @@ fn read_feed_page(
 		email: want_email.then(|| g.user_email(read)).flatten(),
 	};
 	if first {
-		let snap = g.refs(read).map_err(|e| e.to_string())?;
+		let snap = g
+			.refs(read)
+			.map_err(|e| crate::githost::refs_error(host, e))?;
 		let tips = match ref_filter.filter(|r| !r.is_empty()) {
 			// A branch filter picks that branch in every repository that
 			// has it; the others show nothing.
@@ -3283,12 +3288,30 @@ fn read_feed_page(
 	Ok(out)
 }
 
+/// The remote repository name shown in chips and log headers: `label` for the
+/// workspace root, and `label › rel` for nested repositories under the share.
+pub(crate) fn remote_repo_name(
+	label: &str,
+	session_root: &Path,
+	root: &Path,
+) -> Option<String> {
+	let rel = crate::remote::remote_rel(session_root, root)?;
+	if rel.is_empty() {
+		Some(label.to_string())
+	} else {
+		Some(format!("{label} › {rel}"))
+	}
+}
+
 /// The log over the workspace's repositories (IntelliJ's multi-root log).
 impl WorkbenchModel {
 	/// The repositories the log shows: the Repository chip's picks, else
 	/// every repository of the workspace.
 	pub fn log_scope(&self) -> Vec<(PathBuf, String)> {
-		let all = self.repos.iter().map(|r| (r.root.clone(), r.name.clone()));
+		let all = self
+			.repos
+			.iter()
+			.map(|r| (r.root.clone(), self.log_repo_name(&r.root)));
 		let picked: Vec<_> = all
 			.clone()
 			.filter(|(root, _)| self.log_repo_filter.contains(root))
@@ -3344,10 +3367,12 @@ impl WorkbenchModel {
 
 	pub fn log_repo_name(&self, root: &std::path::Path) -> String {
 		// A remote root is an internal key, not a path to show.
-		if let Some(session) =
-			self.remote.session.as_ref().filter(|s| s.root == root)
-		{
-			return session.label();
+		if let Some(session) = &self.remote.session {
+			if let Some(name) =
+				remote_repo_name(&session.label(), &session.root, root)
+			{
+				return name;
+			}
 		}
 		self.repos
 			.iter()
@@ -5020,5 +5045,35 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	#[test]
+	fn remote_repo_name_table() {
+		let session_root = Path::new("snip-remote://conn-1/ws-1");
+		let label = "worker ▸ ws";
+
+		// Root == session_root keeps session.label()
+		assert_eq!(
+			remote_repo_name(label, session_root, session_root),
+			Some("worker ▸ ws".to_string())
+		);
+
+		// Remote root under session_root at non-empty rel
+		let child = session_root.join("sub").join("repo");
+		assert_eq!(
+			remote_repo_name(label, session_root, &child),
+			Some("worker ▸ ws › sub/repo".to_string())
+		);
+
+		// Single level child
+		let single = session_root.join("alpha");
+		assert_eq!(
+			remote_repo_name(label, session_root, &single),
+			Some("worker ▸ ws › alpha".to_string())
+		);
+
+		// Not under session_root
+		let outside = Path::new("/var/local/repo");
+		assert_eq!(remote_repo_name(label, session_root, outside), None);
 	}
 }

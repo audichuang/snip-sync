@@ -888,6 +888,13 @@ impl From<RemoteError> for GitError {
 				message,
 			} => GitError::InvalidRevision(message),
 			RemoteError::Refused {
+				code: ErrorCode::TooLarge,
+				..
+			} => GitError::OutputLimit {
+				args: "remote view".into(),
+				limit: 0,
+			},
+			RemoteError::Refused {
 				code: ErrorCode::Cancelled,
 				..
 			}
@@ -1108,6 +1115,16 @@ mod tests {
 			message: "missing".into(),
 		};
 		assert!(matches!(GitError::from(err8), GitError::Host(_)));
+
+		let err_too_large = RemoteError::Refused {
+			code: ErrorCode::TooLarge,
+			message: "refs payload exceeded frame limit".into(),
+		};
+		assert!(matches!(
+			GitError::from(err_too_large),
+			GitError::OutputLimit { ref args, limit }
+				if args == "remote view" && limit == 0
+		));
 	}
 
 	#[test]

@@ -336,6 +336,18 @@ pub(crate) fn key_identity(
 	}
 }
 
+/// Status message when a remote scan ends with a non-Complete status.
+pub(crate) fn scan_incomplete_msg(
+	status: ScanStatus,
+	repos_len: usize,
+) -> Option<Msg> {
+	if status != ScanStatus::Complete {
+		Some(Msg::new("remote_scan_incomplete", [repos_len.to_string()]))
+	} else {
+		None
+	}
+}
+
 /// Repositories, notes, and pagination status produced by translating a worker RepoScan.
 pub(crate) struct RemoteScanEntries {
 	pub repos: Vec<RepoEntry>,
@@ -566,6 +578,21 @@ impl WorkbenchModel {
 			.session
 			.as_ref()
 			.map(|s| (s.client.clone(), s.workspace.id.clone(), s.root.clone()))
+	}
+
+	/// Worker workspace path for a path under session.root.
+	pub(crate) fn remote_worker_path(
+		&self,
+		root_or_path: &Path,
+	) -> Option<String> {
+		let session = self.remote.session.as_ref()?;
+		let rel = remote_rel(&session.root, root_or_path)?;
+		let base = session.workspace.path.trim_end_matches('/');
+		if rel.is_empty() {
+			Some(base.to_string())
+		} else {
+			Some(format!("{base}/{rel}"))
+		}
 	}
 
 	/// Refuses local operations when a remote session is active, setting the unsupported status.
@@ -909,6 +936,11 @@ impl WorkbenchModel {
 							);
 							model.place_selection(cx);
 							model.finish_discovery(cx);
+							if let Some(msg) =
+								scan_incomplete_msg(e.status, model.repos.len())
+							{
+								model.set_status(msg.key, msg.args);
+							}
 						}
 						Err(RemoteError::Cancelled) => {}
 						Err(err) => {
@@ -949,6 +981,13 @@ impl WorkbenchModel {
 								Some(ScanStatus::Incomplete);
 							model.is_loading = false;
 							model.refresh_reload = false;
+							if wipe {
+								model.repos.clear();
+								model.pinned_repo = None;
+								model.selected_repo_idx = None;
+								model.release_repo_state();
+								model.sync_change_slots();
+							}
 							model.ensure_ws_tree(cx);
 							cx.notify();
 						}
@@ -1336,5 +1375,31 @@ mod tests {
 		for p in &res.depth_limited {
 			assert!(p.starts_with(session_root));
 		}
+	}
+
+	#[test]
+	fn scan_incomplete_msg_for_various_statuses() {
+		// Complete -> None
+		assert_eq!(scan_incomplete_msg(ScanStatus::Complete, 3), None);
+
+		// TimedOut -> Some(remote_scan_incomplete)
+		let msg = scan_incomplete_msg(ScanStatus::TimedOut, 3).unwrap();
+		assert_eq!(msg.key, "remote_scan_incomplete");
+		assert_eq!(msg.args, vec!["3".to_string()]);
+
+		// LimitReached -> Some(remote_scan_incomplete)
+		let msg = scan_incomplete_msg(ScanStatus::LimitReached, 0).unwrap();
+		assert_eq!(msg.key, "remote_scan_incomplete");
+		assert_eq!(msg.args, vec!["0".to_string()]);
+
+		// Incomplete -> Some(remote_scan_incomplete)
+		let msg = scan_incomplete_msg(ScanStatus::Incomplete, 12).unwrap();
+		assert_eq!(msg.key, "remote_scan_incomplete");
+		assert_eq!(msg.args, vec!["12".to_string()]);
+
+		// More -> Some(remote_scan_incomplete)
+		let msg = scan_incomplete_msg(ScanStatus::More, 5).unwrap();
+		assert_eq!(msg.key, "remote_scan_incomplete");
+		assert_eq!(msg.args, vec!["5".to_string()]);
 	}
 }
