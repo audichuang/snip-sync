@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::arm_cancel;
 
+use crate::githost::GitHost;
 use crate::graph_view;
 use crate::i18n::Msg;
 use crate::multi_log;
@@ -15,8 +16,8 @@ use crate::syntax::Language;
 use crate::{e2e_on, WorkbenchModel, WorkbenchTab};
 use gpui::{Context, ScrollStrategy};
 use snip_core::browser::{self, BlobText, CommitSummary, TreeEntry, TreeKind};
-use snip_core::gitrun::RunOptions;
-use snip_core::gitsrc::{self, Git, GitSource};
+use snip_core::gitsrc::GitSource;
+use snip_core::gitview::{ChangedPathList, Read, ReadProfile, RepoView};
 use snip_core::graph::{GraphCheckpoint, GraphLayout, MAX_SHA_LEN};
 use snip_core::workspace::RepoIdentity;
 
@@ -69,9 +70,7 @@ pub const MAX_WINDOW_PAGES: usize = 10;
 /// Longest `user.email` kept to mark the user's own commits.
 pub const MAX_USER_EMAIL: usize = snip_core::gitview::MAX_USER_EMAIL;
 
-pub use snip_core::gitview::{
-	clip_utf8, commit_details_with, user_email_with, CommitDetails,
-};
+pub use snip_core::gitview::{clip_utf8, CommitDetails};
 
 /// How a history read changes the loaded window of pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,19 +178,6 @@ pub fn date_range(
 		from.map(|d| format!("{d} 00:00:00")),
 		to.map(|d| format!("{d} 23:59:59")),
 	))
-}
-
-/// A listed repository's Git: a resolved identity starts no process; an
-/// entry discovery could not identify is opened from its listed root.
-fn known_or_open(
-	known: Option<&RepoIdentity>,
-	root: &std::path::Path,
-	opts: &RunOptions,
-) -> Result<Git, String> {
-	match known {
-		Some(id) => Ok(Git::at_known_root(id)),
-		None => Git::open_with(root, opts).map_err(|e| e.to_string()),
-	}
 }
 
 /// Lazily listed tree of one commit (no checkout).
@@ -797,29 +783,28 @@ pub(crate) fn commit_bytes(commit: &CommitSummary) -> usize {
 /// Reads one graph page. Page 0 (no `walk`) snapshots refs, HEAD and the
 /// ref filter's commit; later pages reuse that snapshot, and need no Git at
 /// all while the window already holds them.
+#[allow(clippy::too_many_arguments)]
 fn read_graph_page(
+	host: &GitHost,
 	repo_root: &std::path::Path,
+	known: Option<&RepoIdentity>,
 	walk: Option<(HistoryWalk, Vec<browser::GitReference>, Option<String>)>,
 	ref_filter: Option<String>,
 	skip: usize,
 	size: usize,
-	opts: &RunOptions,
+	read: &Read,
 ) -> Result<(browser::RepositoryHistory, HistoryWalk), String> {
-	let mut git = None;
-	let open = || -> Result<Git, String> {
-		Git::open_with(repo_root, opts).map_err(|e| e.to_string())
-	};
+	let mut git: Option<Box<dyn RepoView>> = None;
+	let open = || host.open(repo_root, known, read);
 	let (mut walk, refs, head) = match walk {
 		Some(reused) if reused.0.ref_filter == ref_filter => reused,
 		_ => {
 			let g = open()?;
-			let snap =
-				browser::refs_with(&g, opts).map_err(|e| e.to_string())?;
+			let snap = g.refs(read).map_err(|e| e.to_string())?;
 			let filter_tip =
 				match ref_filter.as_deref().filter(|r| !r.is_empty()) {
 					Some(r) => Some(
-						g.resolve_commit_with(r, opts)
-							.map_err(|e| e.to_string())?,
+						g.resolve_commit(r, read).map_err(|e| e.to_string())?,
 					),
 					None => None,
 				};
@@ -836,7 +821,7 @@ fn read_graph_page(
 		}
 	};
 	if walk.page(skip, size).is_none() {
-		let git = match git {
+		let g = match git {
 			Some(g) => g,
 			None => open()?,
 		};
@@ -853,14 +838,9 @@ fn read_graph_page(
 		if skip.saturating_add(size) > start.saturating_add(HISTORY_WINDOW) {
 			start = skip;
 		}
-		let (window, more) = browser::log_from_tips_with(
-			&git,
-			&tips,
-			start,
-			HISTORY_WINDOW.max(size),
-			opts,
-		)
-		.map_err(|e| e.to_string())?;
+		let (window, more) = g
+			.log_from_tips(&tips, start, HISTORY_WINDOW.max(size), read)
+			.map_err(|e| e.to_string())?;
 		walk.start = start;
 		walk.window = window;
 		walk.more = more;
@@ -882,25 +862,20 @@ fn read_graph_page(
 /// row carries the commit's full SHA and parents, so the preview neither
 /// re-lists the source nor re-resolves the commit.
 fn read_preview(
-	git: &Git,
+	g: &dyn RepoView,
 	source: &GitSource,
 	path: &str,
 	change: Option<snip_core::format::ChangeType>,
 	parents: Option<&[String]>,
-	opts: &RunOptions,
+	read: &Read,
 ) -> Result<browser::SourcePreview, String> {
-	let preview = match change {
-		Some(change) => {
-			browser::git_preview_for(git, source, path, change, parents, opts)
-		}
-		None => browser::git_preview_with(git, source, path, opts),
-	};
-	preview
-		.map(|p| browser::SourcePreview {
-			content: p.content,
-			patch: p.patch,
-		})
-		.map_err(|e| e.to_string())
+	let preview = g
+		.preview(source, path, change.map(|c| (c, parents)), read)
+		.map_err(|e| e.to_string())?;
+	Ok(browser::SourcePreview {
+		content: preview.content,
+		patch: preview.patch,
+	})
 }
 
 /// A complete replacement page. Construction only borrows the current cache;
@@ -1254,6 +1229,7 @@ impl WorkbenchModel {
 		let snapshot = (self.refs.clone(), self.head_sha.clone());
 		let want_email = matches!(load, PageLoad::Replace(0));
 		let repo_identity = self.identity_for(&repo_root);
+		let host = self.git_host();
 
 		self.spawn_owned(
 			cx,
@@ -1262,44 +1238,57 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
-						let opts = crate::interactive_read_opts(cancel_bg);
+						let read = Read {
+							profile: ReadProfile::Interactive,
+							cancel: Some(cancel_bg),
+						};
 						let Some(query) = &search else {
 							let email = want_email
 								.then(|| {
-									let git = known_or_open(
-										repo_identity.as_ref(),
-										&repo_root,
-										&opts,
-									)
-									.ok()?;
-									user_email_with(&git, &opts)
+									let g = host
+										.open(
+											&repo_root,
+											repo_identity.as_ref(),
+											&read,
+										)
+										.ok()?;
+									g.user_email(&read)
 								})
 								.flatten();
 							return read_graph_page(
-								&repo_root, walk, ref_filter, skip, page_size,
-								&opts,
+								&host,
+								&repo_root,
+								repo_identity.as_ref(),
+								walk,
+								ref_filter,
+								skip,
+								page_size,
+								&read,
 							)
 							.map(|(h, w)| (h, Some(w), email));
 						};
-						let git = Git::open_with(&repo_root, &opts)
-							.map_err(|e| e.to_string())?;
+						let g = host.open(
+							&repo_root,
+							repo_identity.as_ref(),
+							&read,
+						)?;
 						// Refs only for labels: no topological walk for them.
 						let (refs, head, email) = if extending {
 							(snapshot.0, snapshot.1, None)
 						} else {
-							let snap = browser::refs_with(&git, &opts)
-								.map_err(|e| e.to_string())?;
-							(snap.refs, snap.head, user_email_with(&git, &opts))
+							let snap =
+								g.refs(&read).map_err(|e| e.to_string())?;
+							(snap.refs, snap.head, g.user_email(&read))
 						};
-						let (commits, has_more) = browser::history_query_with(
-							&git,
-							ref_filter.as_deref(),
-							query,
-							skip,
-							page_size,
-							&opts,
-						)
-						.map_err(|e| e.to_string())?;
+						let (commits, has_more) = g
+							.history_query(
+								ref_filter.as_deref(),
+								query,
+								skip,
+								page_size,
+								&read,
+							)
+							.map_err(|e| e.to_string())?;
 						Ok((
 							browser::RepositoryHistory {
 								root: String::new(),
@@ -2005,6 +1994,7 @@ impl WorkbenchModel {
 		}
 		let cancel = arm_cancel(&mut self.details_cancel);
 		let identity = self.identity_for(&root);
+		let host = self.git_host();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2015,11 +2005,12 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
-						let opts = crate::interactive_read_opts(cancel);
-						let git =
-							known_or_open(identity.as_ref(), &root, &opts)?;
-						commit_details_with(&git, &sha, &opts)
-							.map_err(|e| e.to_string())
+						let read = Read {
+							profile: ReadProfile::Interactive,
+							cancel: Some(cancel),
+						};
+						let g = host.open(&root, identity.as_ref(), &read)?;
+						g.commit_details(&sha, &read).map_err(|e| e.to_string())
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2078,6 +2069,7 @@ impl WorkbenchModel {
 			return;
 		}
 		let cancel = arm_cancel(&mut self.details_cancel);
+		let host = self.git_host();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2088,20 +2080,19 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
-						let opts = crate::interactive_read_opts(cancel);
+						let read = Read {
+							profile: ReadProfile::Interactive,
+							cancel: Some(cancel),
+						};
 						// A failed read keeps that commit's row fields.
 						reads
 							.into_iter()
 							.filter_map(|(root, identity, sha, id)| {
-								let git = known_or_open(
-									identity.as_ref(),
-									&root,
-									&opts,
-								)
-								.ok()?;
+								let g = host
+									.open(&root, identity.as_ref(), &read)
+									.ok()?;
 								let mut d =
-									commit_details_with(&git, &sha, &opts)
-										.ok()?;
+									g.commit_details(&sha, &read).ok()?;
 								d.sha = id;
 								Some(d)
 							})
@@ -2296,6 +2287,7 @@ impl WorkbenchModel {
 		}
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
+		let host = self.git_host();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2306,15 +2298,18 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
-						let listing = crate::interactive_read_opts(cancel);
-						let git =
-							known_or_open(identity.as_ref(), &root, &listing)?;
+						let listing = Read {
+							profile: ReadProfile::Interactive,
+							cancel: Some(cancel),
+						};
+						let g =
+							host.open(&root, identity.as_ref(), &listing)?;
 						// Lazy: each listing is folded in and dropped
 						// before the next one is read.
 						union_changed_files(shas.into_iter().map(|sha| {
-							gitsrc::list_changed_paths_and_gitlinks_with(
-								&git,
+							g.changed_paths(
 								&GitSource::Commit(sha),
+								MAX_COMMIT_FILES,
 								&listing,
 							)
 							.map_err(|e| e.to_string())
@@ -2326,11 +2321,22 @@ impl WorkbenchModel {
 						return;
 					}
 					match res {
-						Ok((files, origin, total, gitlinks)) => {
+						Ok((
+							files,
+							origin,
+							total,
+							gitlinks,
+							total_is_lower_bound,
+						)) => {
 							app_log!("[APP:E2E_CHANGES: files={}]", total);
 							if total > MAX_COMMIT_FILES {
+								let key = if total_is_lower_bound {
+									"status_commit_files_truncated_min"
+								} else {
+									"status_commit_files_truncated"
+								};
 								model.set_status(
-									"status_commit_files_truncated",
+									key,
 									[
 										total.to_string(),
 										MAX_COMMIT_FILES.to_string(),
@@ -2459,6 +2465,7 @@ impl WorkbenchModel {
 		}
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
+		let host = self.git_host();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2472,34 +2479,34 @@ impl WorkbenchModel {
 						// The listing is metadata: a commit touching tens of
 						// thousands of files lists under the interactive limit
 						// and is cut to MAX_COMMIT_FILES afterwards.
-						let listing =
-							crate::interactive_read_opts(cancel.clone());
-						let opts = RunOptions {
+						let listing_read = Read {
+							profile: ReadProfile::Interactive,
+							cancel: Some(cancel.clone()),
+						};
+						let preview_read = Read {
+							profile: ReadProfile::PreviewStrict,
 							cancel: Some(cancel),
-							max_stdout: browser::PREVIEW_LIMIT,
-							overflow: snip_core::gitrun::Overflow::Error,
-							..RunOptions::preview(None)
 						};
 						// 有 identity 時不起 probe 程序；沒有則從列出的 root 開啟。
-						let git =
-							known_or_open(identity.as_ref(), &root, &listing)?;
-						let list = snip_core::gitview::changed_paths_with(
-							&git,
-							&source,
-							MAX_COMMIT_FILES,
-							&listing,
-						)
-						.map_err(|e| e.to_string())?;
+						let g =
+							host.open(&root, identity.as_ref(), &listing_read)?;
+						let list = g
+							.changed_paths(
+								&source,
+								MAX_COMMIT_FILES,
+								&listing_read,
+							)
+							.map_err(|e| e.to_string())?;
 						let first = list.paths.first().map(|(p, change)| {
 							(
 								p.clone(),
 								read_preview(
-									&git,
+									g.as_ref(),
 									&source,
 									p,
 									*change,
 									parents.as_deref(),
-									&opts,
+									&preview_read,
 								),
 							)
 						});
@@ -2645,6 +2652,7 @@ impl WorkbenchModel {
 		let for_bg = path.clone();
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
+		let host = self.git_host();
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2655,23 +2663,18 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
-						let opts = RunOptions {
+						let read = Read {
+							profile: ReadProfile::PreviewStrict,
 							cancel: Some(cancel),
-							max_stdout: browser::PREVIEW_LIMIT,
-							overflow: snip_core::gitrun::Overflow::Error,
-							..RunOptions::preview(None)
 						};
-						known_or_open(identity.as_ref(), &root, &opts).and_then(
-							|git| {
-								read_preview(
-									&git,
-									&source,
-									&for_bg,
-									change,
-									parents.as_deref(),
-									&opts,
-								)
-							},
+						let g = host.open(&root, identity.as_ref(), &read)?;
+						read_preview(
+							g.as_ref(),
+							&source,
+							&for_bg,
+							change,
+							parents.as_deref(),
+							&read,
 						)
 					})
 					.await;
@@ -2837,6 +2840,8 @@ impl WorkbenchModel {
 		let gen = self.tree_generation;
 		let cancel = arm_cancel(&mut self.rev_tree_cancel);
 		let cancel_bg = cancel.clone();
+		let host = self.git_host();
+		let identity = self.identity_for(&root);
 
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
@@ -2849,15 +2854,16 @@ impl WorkbenchModel {
 				let (sha_bg, dir_bg) = (sha.clone(), dir.clone());
 				let res = bg
 					.spawn(async move {
-						let opts = crate::interactive_read_opts(cancel_bg);
-						let git = Git::open_with(&root, &opts)
-							.map_err(|e| e.to_string())?;
-						browser::commit_directory_with(
-							&git,
+						let read = Read {
+							profile: ReadProfile::Interactive,
+							cancel: Some(cancel_bg),
+						};
+						let g = host.open(&root, identity.as_ref(), &read)?;
+						g.commit_directory(
 							&sha_bg,
 							&dir_bg,
 							MAX_REV_ROWS,
-							&opts,
+							&read,
 						)
 						.map_err(|e| e.to_string())
 					})
@@ -2938,6 +2944,8 @@ impl WorkbenchModel {
 		let task_generation = self.preview_generation;
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let cancel_bg = cancel.clone();
+		let host = self.git_host();
+		let identity = self.identity_for(&root);
 
 		self.selected_file = None;
 		self.selected_commit_file = Some(path.clone());
@@ -2956,18 +2964,16 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
-						let opts = RunOptions {
+						let read = Read {
+							profile: ReadProfile::Preview,
 							cancel: Some(cancel_bg),
-							..RunOptions::preview(None)
 						};
-						let git = Git::open_with(&root, &opts)
-							.map_err(|e| e.to_string())?;
-						browser::commit_blob_with(
-							&git,
+						let g = host.open(&root, identity.as_ref(), &read)?;
+						g.commit_blob(
 							&sha_bg,
 							&path_bg,
 							browser::MAX_BLOB_BYTES,
-							&opts,
+							&read,
 						)
 						.map_err(|e| e.to_string())
 					})
@@ -3180,21 +3186,28 @@ pub type ChangedFiles = Vec<(String, Option<snip_core::format::ChangeType>)>;
 /// `MAX_COMMIT_FILES` are kept; the count of distinct paths comes next,
 /// then the kept paths that are a submodule commit in that newest commit.
 /// Each list comes with its gitlinks.
+#[allow(clippy::type_complexity)]
 pub fn union_changed_files<E>(
-	lists: impl IntoIterator<Item = Result<(ChangedFiles, Vec<String>), E>>,
-) -> Result<(ChangedFiles, Vec<u32>, usize, Vec<String>), E> {
+	lists: impl IntoIterator<Item = Result<ChangedPathList, E>>,
+) -> Result<(ChangedFiles, Vec<u32>, usize, Vec<String>, bool), E> {
 	let mut seen = HashSet::new();
-	let (mut files, mut origin, mut total) = (Vec::new(), Vec::new(), 0);
+	let mut files = Vec::new();
+	let mut origin = Vec::new();
 	let mut gitlinks = Vec::new();
+	let mut total_is_lower_bound = false;
+	let mut max_list_total: usize = 0;
 	for (i, list) in lists.into_iter().enumerate() {
-		let (list, links) = list?;
-		for (path, change) in list {
+		let list = list?;
+		if list.total > list.paths.len() {
+			total_is_lower_bound = true;
+		}
+		max_list_total = max_list_total.max(list.total);
+		for (path, change) in list.paths {
 			if !seen.insert(path.clone()) {
 				continue;
 			}
-			total += 1;
 			if files.len() < MAX_COMMIT_FILES {
-				if links.contains(&path) {
+				if list.gitlinks.contains(&path) {
 					gitlinks.push(path.clone());
 				}
 				files.push((path, change));
@@ -3202,7 +3215,9 @@ pub fn union_changed_files<E>(
 			}
 		}
 	}
-	Ok((files, origin, total, gitlinks))
+	let distinct_paths_seen = seen.len();
+	let total = distinct_paths_seen.max(max_list_total);
+	Ok((files, origin, total, gitlinks, total_is_lower_bound))
 }
 
 /// One read of a merged-log feed: its page (plain SHAs) and, on the
@@ -3217,58 +3232,49 @@ struct FeedRead {
 
 #[allow(clippy::too_many_arguments)]
 fn read_feed_page(
+	host: &GitHost,
 	root: &std::path::Path,
+	known: Option<&RepoIdentity>,
 	first: bool,
 	tips: Vec<String>,
 	ref_filter: Option<&str>,
 	search: Option<&LogQuery>,
 	skip: usize,
 	want_email: bool,
-	opts: &RunOptions,
+	read: &Read,
 ) -> Result<FeedRead, String> {
-	let git = Git::open_with(root, opts).map_err(|e| e.to_string())?;
-	let mut read = FeedRead {
+	let g = host.open(root, known, read)?;
+	let mut out = FeedRead {
 		commits: Vec::new(),
 		more: false,
 		snapshot: None,
 		tips,
-		email: want_email.then(|| user_email_with(&git, opts)).flatten(),
+		email: want_email.then(|| g.user_email(read)).flatten(),
 	};
 	if first {
-		let snap = browser::refs_with(&git, opts).map_err(|e| e.to_string())?;
+		let snap = g.refs(read).map_err(|e| e.to_string())?;
 		let tips = match ref_filter.filter(|r| !r.is_empty()) {
 			// A branch filter picks that branch in every repository that
 			// has it; the others show nothing.
-			Some(r) => git.resolve_commit_with(r, opts).ok().map(|t| vec![t]),
+			Some(r) => g.resolve_commit(r, read).ok().map(|t| vec![t]),
 			None => Some(snap.tips()),
 		};
-		read.snapshot = Some(snap);
+		out.snapshot = Some(snap);
 		match tips {
-			Some(tips) => read.tips = tips,
-			None => return Ok(read),
+			Some(tips) => out.tips = tips,
+			None => return Ok(out),
 		}
 	}
 	let (commits, more) = match search {
-		Some(q) => browser::history_query_with(
-			&git,
-			ref_filter,
-			q,
-			skip,
-			multi_log::FEED_PAGE,
-			opts,
-		),
-		None => browser::log_from_tips_with(
-			&git,
-			&read.tips,
-			skip,
-			multi_log::FEED_PAGE,
-			opts,
-		),
+		Some(q) => {
+			g.history_query(ref_filter, q, skip, multi_log::FEED_PAGE, read)
+		}
+		None => g.log_from_tips(&out.tips, skip, multi_log::FEED_PAGE, read),
 	}
 	.map_err(|e| e.to_string())?;
-	read.commits = commits;
-	read.more = more;
-	Ok(read)
+	out.commits = commits;
+	out.more = more;
+	Ok(out)
 }
 
 /// The log over the workspace's repositories (IntelliJ's multi-root log).
@@ -3592,6 +3598,8 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 		let cancel_bg = cancel.clone();
+		let host = self.git_host();
+		let identity = self.identity_for(&root);
 		self.spawn_owned(
 			cx,
 			crate::lifecycle::JobKind::CancellableRead,
@@ -3599,16 +3607,21 @@ impl WorkbenchModel {
 			async move {
 				let res = bg
 					.spawn(async move {
-						let opts = crate::interactive_read_opts(cancel_bg);
+						let read = Read {
+							profile: ReadProfile::Interactive,
+							cancel: Some(cancel_bg),
+						};
 						read_feed_page(
+							&host,
 							&root,
+							identity.as_ref(),
 							first,
 							tips,
 							ref_filter.as_deref(),
 							search.as_ref(),
 							skip,
 							want_email,
-							&opts,
+							&read,
 						)
 					})
 					.await;
@@ -3815,6 +3828,8 @@ impl WorkbenchModel {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use snip_core::gitsrc::Git;
+	use std::process::Command;
 
 	fn c(sha: &str, parents: &[&str]) -> CommitSummary {
 		CommitSummary {
@@ -4092,9 +4107,14 @@ mod tests {
 				&format!("c{n}"),
 			]);
 		}
-		let opts = RunOptions::default();
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let host = crate::githost::GitHost::Local;
 		let (first, walk) =
-			read_graph_page(root, None, None, 0, 2, &opts).unwrap();
+			read_graph_page(&host, root, None, None, None, 0, 2, &read)
+				.unwrap();
 		assert!(first.has_more);
 		// The repository moves on; later pages are sliced from the window
 		// page 0 fetched (frozen tips on refetch are covered in browser.rs).
@@ -4111,16 +4131,66 @@ mod tests {
 		]);
 		let reuse = Some((walk, first.refs.clone(), first.head.clone()));
 		let (second, walk) =
-			read_graph_page(root, reuse, None, 2, 2, &opts).unwrap();
+			read_graph_page(&host, root, None, reuse, None, 2, 2, &read)
+				.unwrap();
 		let reuse = Some((walk, second.refs.clone(), second.head.clone()));
 		let (third, _) =
-			read_graph_page(root, reuse, None, 4, 2, &opts).unwrap();
+			read_graph_page(&host, root, None, reuse, None, 4, 2, &read)
+				.unwrap();
 		assert!(!third.has_more);
 		let seen: Vec<String> = [first, second, third]
 			.into_iter()
 			.flat_map(|h| h.commits.into_iter().map(|c| c.subject))
 			.collect();
 		assert_eq!(seen, ["c5", "c4", "c3", "c2", "c1", "c0"]);
+	}
+
+	#[test]
+	fn a_later_graph_page_in_the_window_runs_no_git() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		let git = |args: &[&str]| {
+			let out = Command::new("git")
+				.current_dir(root)
+				.args(args)
+				.output()
+				.unwrap();
+			assert!(out.status.success(), "{args:?}");
+			String::from_utf8(out.stdout).unwrap().trim().to_string()
+		};
+		git(&["init", "-q", "-b", "main"]);
+		for n in 0..6 {
+			git(&[
+				"-c",
+				"user.name=A",
+				"-c",
+				"user.email=a@x",
+				"commit",
+				"-q",
+				"--allow-empty",
+				"-m",
+				&format!("c{n}"),
+			]);
+		}
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let host = crate::githost::GitHost::Local;
+		let (first, walk) =
+			read_graph_page(&host, root, None, None, None, 0, 2, &read)
+				.unwrap();
+		assert!(first.has_more);
+		let reuse = Some((walk, first.refs.clone(), first.head.clone()));
+		let nonexistent = std::path::Path::new("/nonexistent/graph/page/test");
+		let before_flight = snip_core::gitrun::in_flight();
+		let before_queued = snip_core::gitrun::queued();
+		let (second, _) =
+			read_graph_page(&host, nonexistent, None, reuse, None, 2, 2, &read)
+				.unwrap();
+		assert_eq!(second.commits.len(), 2);
+		assert_eq!(snip_core::gitrun::in_flight(), before_flight);
+		assert_eq!(snip_core::gitrun::queued(), before_queued);
 	}
 
 	#[test]
@@ -4713,21 +4783,28 @@ mod tests {
 		// Newest first: a.txt deleted in the newest, added in the oldest.
 		// A submodule path is a gitlink as its newest commit lists it.
 		let links = |v: &[&str]| v.iter().map(|p| p.to_string()).collect();
-		let (files, origin, total, gitlinks) = union_changed_files(
-			[
-				(
-					list(&[("a.txt", Deleted), ("b.txt", Modified)]),
-					links(&["b.txt"]),
-				),
-				(list(&[("c.txt", New)]), links(&[])),
-				(
-					list(&[("a.txt", New), ("c.txt", Modified)]),
-					links(&["a.txt", "c.txt"]),
-				),
-			]
-			.map(Ok::<_, ()>),
-		)
-		.unwrap();
+		let (files, origin, total, gitlinks, total_is_lower_bound) =
+			union_changed_files(
+				[
+					ChangedPathList {
+						paths: list(&[("a.txt", Deleted), ("b.txt", Modified)]),
+						gitlinks: links(&["b.txt"]),
+						total: 2,
+					},
+					ChangedPathList {
+						paths: list(&[("c.txt", New)]),
+						gitlinks: links(&[]),
+						total: 1,
+					},
+					ChangedPathList {
+						paths: list(&[("a.txt", New), ("c.txt", Modified)]),
+						gitlinks: links(&["a.txt", "c.txt"]),
+						total: 2,
+					},
+				]
+				.map(Ok::<_, ()>),
+			)
+			.unwrap();
 		assert_eq!(
 			files,
 			list(&[("a.txt", Deleted), ("b.txt", Modified), ("c.txt", New)])
@@ -4735,17 +4812,45 @@ mod tests {
 		assert_eq!(origin, [0, 0, 1]);
 		assert_eq!(total, 3);
 		assert_eq!(gitlinks, ["b.txt"]);
+		assert!(!total_is_lower_bound);
 		// Distinct paths past the cap are counted, not kept.
 		let many: Vec<_> = (0..MAX_COMMIT_FILES + 2)
 			.map(|i| (format!("f{i}"), Some(Modified)))
 			.collect();
-		let (files, origin, total, _) = union_changed_files(
-			[many.clone(), many].map(|l| Ok::<_, ()>((l, Vec::new()))),
-		)
-		.unwrap();
+		let (files, origin, total, _, bound) =
+			union_changed_files([many.clone(), many].map(|l| {
+				Ok::<_, ()>(ChangedPathList {
+					total: l.len(),
+					paths: l,
+					gitlinks: Vec::new(),
+				})
+			}))
+			.unwrap();
 		assert_eq!(files.len(), MAX_COMMIT_FILES);
 		assert_eq!(origin.len(), MAX_COMMIT_FILES);
 		assert_eq!(total, MAX_COMMIT_FILES + 2);
+		assert!(!bound);
+
+		// Truncated list (total > paths.len()) sets the lower-bound flag and total >= that list's total
+		let (files, _, total, _, bound) = union_changed_files(
+			[
+				ChangedPathList {
+					paths: list(&[("x.txt", New)]),
+					gitlinks: links(&[]),
+					total: 100,
+				},
+				ChangedPathList {
+					paths: list(&[("y.txt", New)]),
+					gitlinks: links(&[]),
+					total: 1,
+				},
+			]
+			.map(Ok::<_, ()>),
+		)
+		.unwrap();
+		assert_eq!(files.len(), 2);
+		assert!(bound);
+		assert!(total >= 100);
 	}
 
 	#[test]
@@ -4907,45 +5012,5 @@ mod tests {
 				);
 			}
 		}
-	}
-
-	#[test]
-	fn known_or_open_uses_the_identity_and_opens_an_unknown_root() {
-		let t = tempfile::tempdir().unwrap();
-		let r = t.path().join("r");
-		std::fs::create_dir(&r).unwrap();
-		crate::paste::tests::git_init(&r);
-		let id = RepoIdentity::resolve(
-			&Git::open(&r).unwrap(),
-			&RunOptions::default(),
-		)
-		.unwrap();
-		#[cfg(unix)]
-		let alias = {
-			let link = t.path().join("link");
-			std::os::unix::fs::symlink(&r, &link).unwrap();
-			link
-		};
-		#[cfg(not(unix))]
-		let alias = {
-			std::fs::create_dir(r.join("x")).unwrap();
-			r.join("x").join("..")
-		};
-		assert_eq!(
-			known_or_open(None, &alias, &RunOptions::default())
-				.unwrap()
-				.root(),
-			id.toplevel
-		);
-		assert_eq!(
-			known_or_open(
-				Some(&id),
-				std::path::Path::new("/nonexistent"),
-				&RunOptions::default(),
-			)
-			.unwrap()
-			.root(),
-			id.toplevel
-		);
 	}
 }

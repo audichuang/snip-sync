@@ -170,6 +170,7 @@ fn ready_marker(name: &str) {
 	let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
+mod githost;
 pub mod graph_view;
 mod history;
 pub mod i18n;
@@ -195,7 +196,7 @@ use gpui::{
 use snip_core::browser::{self, CommitSummary, GitReference};
 use snip_core::clip;
 use snip_core::format::ChangeType;
-use snip_core::gitrun::{CancelToken, Overflow, RunOptions};
+use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::{Git, GitSource};
 use snip_core::graph::GraphLayout;
 use snip_core::settings::Settings;
@@ -474,21 +475,19 @@ pub fn slot_replace_rows(
 /// conflicted rows sorted by path, plus the summary when `known` spares the
 /// identity reads.
 fn read_change_list(
+	host: &crate::githost::GitHost,
 	root: &std::path::Path,
 	known: Option<&RepoIdentity>,
 	cancel: CancelToken,
-) -> Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>), String> {
-	let opts = interactive_read_opts(cancel);
-	let (git, known_id) = match known {
-		Some(id) => (Git::at_known_root(id), Some(id)),
-		None => (
-			Git::open_with(root, &opts).map_err(|e| e.to_string())?,
-			None,
-		),
+) -> Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>, usize), String> {
+	let read = snip_core::gitview::Read {
+		profile: snip_core::gitview::ReadProfile::Interactive,
+		cancel: Some(cancel),
 	};
-	let list =
-		snip_core::gitview::change_list_with(&git, known_id, usize::MAX, &opts)
-			.map_err(|e| e.to_string())?;
+	let repo = host.open(root, known, &read)?;
+	let list = repo
+		.change_list(MAX_CHANGES_PER_REPO, &read)
+		.map_err(|e| e.to_string())?;
 	let summary = match (known, list.summary) {
 		(Some(id), Some(s)) => Some(RepoSummary {
 			identity: id.clone(),
@@ -498,6 +497,7 @@ fn read_change_list(
 		}),
 		_ => None,
 	};
+	let total = list.total;
 	let items = list
 		.rows
 		.into_iter()
@@ -514,7 +514,7 @@ fn read_change_list(
 			(r.path, r.change_type, source, r.conflict)
 		})
 		.collect();
-	Ok((summary, items))
+	Ok((summary, items, total))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1657,11 +1657,11 @@ impl WorkbenchModel {
 	fn install_slot_changes(
 		&mut self,
 		slot: usize,
-		result: Result<Vec<WorkingChangeTuple>, String>,
+		result: Result<(Vec<WorkingChangeTuple>, usize), String>,
 	) {
 		let root = self.change_repos[slot].root.clone();
-		let changes = match result {
-			Ok(changes) => changes,
+		let (changes, total) = match result {
+			Ok(pair) => pair,
 			Err(err) => {
 				slot_replace_rows(&mut self.files, slot, Vec::new());
 				let s = &mut self.change_repos[slot];
@@ -1670,7 +1670,6 @@ impl WorkbenchModel {
 				return;
 			}
 		};
-		let total = changes.len();
 		let canonical = self
 			.repos
 			.iter()
@@ -1769,6 +1768,7 @@ impl WorkbenchModel {
 				.iter()
 				.find(|r| r.root == root)
 				.and_then(|r| r.identity.clone());
+			let host = self.git_host();
 			let mut async_app = cx.to_async();
 			let this = cx.weak_entity();
 			let bg = cx.background_executor().clone();
@@ -1782,6 +1782,7 @@ impl WorkbenchModel {
 					let result = bg
 						.spawn(async move {
 							read_change_list(
+								&host,
 								&read_root,
 								known.as_ref(),
 								cancel_bg,
@@ -1804,7 +1805,10 @@ impl WorkbenchModel {
 	fn land_queued_changes(
 		&mut self,
 		root: &std::path::Path,
-		result: Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>), String>,
+		result: Result<
+			(Option<RepoSummary>, Vec<WorkingChangeTuple>, usize),
+			String,
+		>,
 	) {
 		let Some(slot) = self.change_repos.iter().position(|s| s.root == root)
 		else {
@@ -1815,7 +1819,7 @@ impl WorkbenchModel {
 			return;
 		}
 		let name = self.change_repos[slot].name.clone();
-		let result = result.map(|(summary, changes)| {
+		let result = result.map(|(summary, changes, total)| {
 			if let Some(summary) = summary {
 				if let Some(entry) =
 					self.repos.iter_mut().find(|r| r.root == root)
@@ -1823,10 +1827,10 @@ impl WorkbenchModel {
 					entry.summary = Ok(summary);
 				}
 			}
-			changes
+			(changes, total)
 		});
 		match &result {
-			Ok(changes) => {
+			Ok((changes, _total)) => {
 				app_log!(
 					"[APP:CHANGES_LOADED: {} files={}]",
 					name,
@@ -3816,6 +3820,7 @@ impl WorkbenchModel {
 
 		let repo_root_for_update = repo_root.clone();
 		let known = self.repos[idx].identity.clone();
+		let host = self.git_host();
 		self.spawn_owned(
 			cx,
 			lifecycle::JobKind::CancellableRead,
@@ -3823,7 +3828,12 @@ impl WorkbenchModel {
 			async move {
 				let working_res = bg
 					.spawn(async move {
-						read_change_list(&repo_root, known.as_ref(), cancel_bg)
+						read_change_list(
+							&host,
+							&repo_root,
+							known.as_ref(),
+							cancel_bg,
+						)
 					})
 					.await;
 
@@ -3832,13 +3842,16 @@ impl WorkbenchModel {
 						return;
 					}
 					match working_res {
-						Ok((summary, changes)) => {
+						Ok((summary, changes, total)) => {
 							model.update_open_summary(summary);
 							let slot = model.ensure_change_slot(
 								&repo_root_for_update,
 								&repo_name,
 							);
-							model.install_slot_changes(slot, Ok(changes));
+							model.install_slot_changes(
+								slot,
+								Ok((changes, total)),
+							);
 							let slot = slot_range(&model.files, slot);
 							model.changes_loaded = true;
 							app_log!(
@@ -4002,6 +4015,7 @@ impl WorkbenchModel {
 		let delay = self.e2e_read_delay;
 		let remote = self.remote_target();
 		let locale = self.locale;
+		let host = self.git_host();
 		if e2e_on() {
 			app_log!("[APP:PREVIEW_LOADING: {file_path}]");
 		}
@@ -4022,9 +4036,9 @@ impl WorkbenchModel {
 							Err(i18n::t("remote_unsupported", locale)
 								.to_string())
 						}
-						None => {
-							read_preview(&repo_root, &for_bg, &source, cancel)
-						}
+						None => read_preview(
+							&host, &repo_root, &for_bg, &source, cancel,
+						),
 					};
 					if let Some(delay) = delay {
 						std::thread::sleep(delay);
@@ -5741,6 +5755,7 @@ fn resolve_added_repo(
 }
 
 fn read_preview(
+	host: &crate::githost::GitHost,
 	repo_root: &std::path::Path,
 	path: &str,
 	source: &SourceKind,
@@ -5751,13 +5766,6 @@ fn read_preview(
 			.map(|p| (p, PreviewSource::WorkingFile))
 			.map_err(|e| e.to_string());
 	}
-	let opts = RunOptions {
-		cancel: Some(cancel),
-		max_stdout: browser::PREVIEW_LIMIT,
-		overflow: Overflow::Error,
-		..RunOptions::interactive(None)
-	};
-	let git = Git::open_with(repo_root, &opts).map_err(|e| e.to_string())?;
 	let (git_source, preview_source) = match source {
 		SourceKind::Staged => (GitSource::Staged, PreviewSource::StagedChanges),
 		SourceKind::Unstaged => {
@@ -5776,7 +5784,12 @@ fn read_preview(
 		),
 		SourceKind::File => (GitSource::Working, PreviewSource::WorkingFile),
 	};
-	match browser::git_preview_with(&git, &git_source, path, &opts) {
+	let read = snip_core::gitview::Read {
+		profile: snip_core::gitview::ReadProfile::InteractivePreview,
+		cancel: Some(cancel),
+	};
+	let repo = host.open(repo_root, None, &read)?;
+	match repo.preview(&git_source, path, None, &read) {
 		Ok(p) => Ok((
 			browser::SourcePreview {
 				content: p.content,
@@ -8869,6 +8882,7 @@ mod tests {
 		git(&["add", "a.txt"]);
 		std::fs::write(dir.path().join("a.txt"), "working B\n").unwrap();
 		let result = super::read_preview(
+			&super::githost::GitHost::Local,
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::Commit {
@@ -8881,6 +8895,7 @@ mod tests {
 			"missing commit must not display working B as a successful preview"
 		);
 		let (staged, source) = super::read_preview(
+			&super::githost::GitHost::Local,
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::Staged,
@@ -8891,6 +8906,7 @@ mod tests {
 		assert_eq!(staged.content.as_deref(), Some("staged A\n"));
 		assert!(!staged.patch.contains("working B"));
 		let (working, source) = super::read_preview(
+			&super::githost::GitHost::Local,
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::File,
@@ -8901,6 +8917,7 @@ mod tests {
 		assert_eq!(working.content.as_deref(), Some("working B\n"));
 		git(&["rm", "-q", "-f", "a.txt"]);
 		let (deleted, source) = super::read_preview(
+			&super::githost::GitHost::Local,
 			dir.path(),
 			"a.txt",
 			&super::SourceKind::Staged,
@@ -8943,7 +8960,8 @@ mod tests {
 		git(&["commit", "-qm", "initial"]);
 		git(&["mv", "old-name.txt", "new-name.txt"]);
 
-		let (_summary, items) = super::read_change_list(
+		let (_summary, items, _total) = super::read_change_list(
+			&super::githost::GitHost::Local,
 			dir.path(),
 			None,
 			super::CancelToken::new(),
@@ -9026,6 +9044,7 @@ mod tests {
 		symlink(&secret_file, &notes_path).unwrap();
 
 		let result = super::read_preview(
+			&super::githost::GitHost::Local,
 			repo_dir.path(),
 			"notes.txt",
 			&super::SourceKind::Unstaged,
@@ -9051,6 +9070,33 @@ mod tests {
 				panic!("read_preview must return Err for symlink leaving workspace, got Ok");
 			}
 		}
+	}
+
+	#[test]
+	fn read_change_list_reports_total_and_respects_cap() {
+		let dir = tempfile::tempdir().unwrap();
+		let git = |args: &[&str]| {
+			let out = std::process::Command::new("git")
+				.current_dir(dir.path())
+				.args(args)
+				.output()
+				.unwrap();
+			assert!(out.status.success(), "{args:?}");
+		};
+		git(&["init", "-q", "-b", "main"]);
+		for i in 0..MAX_CHANGES_PER_REPO + 5 {
+			std::fs::File::create(dir.path().join(format!("file_{i:04}.txt")))
+				.unwrap();
+		}
+		let (_summary, items, total) = super::read_change_list(
+			&super::githost::GitHost::Local,
+			dir.path(),
+			None,
+			super::CancelToken::new(),
+		)
+		.unwrap();
+		assert_eq!(items.len(), MAX_CHANGES_PER_REPO);
+		assert_eq!(total, MAX_CHANGES_PER_REPO + 5);
 	}
 
 	use super::*;
