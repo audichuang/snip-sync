@@ -206,7 +206,7 @@ CLI 與 App 共用 `snip-core` 的 `clip` 模組,底層用 [`arboard`](https://c
 ### 7.1 Git 命令參數與環境變數強化（S3）
 
 遠端 worker 在共享目錄（boundary）下執行 Git 讀取操作時，增加安全邊界防護：
-- `-c core.fsmonitor=false`：支援此設定鍵的任何 Git 版本（不支援時 `-c` 亦不報錯忽略）。
+- `-c core.fsmonitor=`：刻意設為空值以停用 fsmonitor；因 Git 2.36 之前任何非空值（包含 `false`）皆會被視為 hook 指令路徑。
 - `-c protocol.allow=never`：Git >= 2.12（阻擋所有 submodule 傳輸協議與 clone/fetch 網路傳輸；更舊版本的 Git 會靜默忽略未知的設定鍵，但 partial clone / lazy fetch 需 Git >= ~2.19 始支援，因此無實質外洩風險）。
 - `-c core.hooksPath=/dev/null`（Windows 為 `NUL`）：避免觸發 repo 內的 hooks（例如 post-index-change）。
 - `GIT_NO_LAZY_FETCH=1`：Git >= 2.44（舊版 Git 主要仰賴 `protocol.allow=never` 阻擋 lazy fetch）。

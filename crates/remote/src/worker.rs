@@ -220,29 +220,29 @@ impl Worker {
 				Err(err) => errors.push((path.clone(), err)),
 			}
 		}
-		let old_ids: Vec<String> = self
-			.state
-			.roots
-			.read()
-			.unwrap_or_else(PoisonError::into_inner)
-			.iter()
-			.map(|r| r.id.clone())
-			.collect();
-		let new_ids: std::collections::HashSet<_> =
-			roots.iter().map(|r| &r.id).collect();
+		let new_ids: std::collections::HashSet<String> =
+			roots.iter().map(|r| r.id.clone()).collect();
+		let old_roots = {
+			let mut lock = self
+				.state
+				.roots
+				.write()
+				.unwrap_or_else(PoisonError::into_inner);
+			std::mem::replace(&mut *lock, roots)
+		};
+		let old_ids: Vec<String> =
+			old_roots.into_iter().map(|r| r.id).collect();
 		let removed: Vec<String> = old_ids
 			.into_iter()
 			.filter(|id| !new_ids.contains(id))
 			.collect();
+		// Swapping roots first ensures that jobs admitted after the swap fail
+		// get_shared_root; jobs admitted before are already in by_workspace and
+		// get cancelled here before repo_cache is cleared.
 		if !removed.is_empty() {
 			self.state.jobs.cancel_workspaces(&removed);
 		}
 		lock(&self.state.repo_cache).clear();
-		*self
-			.state
-			.roots
-			.write()
-			.unwrap_or_else(PoisonError::into_inner) = roots;
 		errors
 	}
 
@@ -925,5 +925,65 @@ mod tests {
 			);
 		}));
 		assert_eq!(counter.load(Ordering::SeqCst), 0);
+	}
+
+	#[test]
+	fn set_roots_removal_cancels_jobs_clears_cache_and_fails_lookup() {
+		let dir = tempfile::tempdir().unwrap();
+		let id = Identity::generate().unwrap();
+		let worker = Worker::start(
+			"127.0.0.1:0".parse().unwrap(),
+			&id,
+			WorkerOptions {
+				name: "test-worker".into(),
+				trust_file: None,
+				..Default::default()
+			},
+		)
+		.unwrap();
+		let root_path = dir.path().to_path_buf();
+		let errs = worker.set_roots(std::slice::from_ref(&root_path));
+		assert!(errs.is_empty());
+
+		let roots = worker.roots();
+		assert_eq!(roots.len(), 1);
+		let ws_id = roots[0].id.clone();
+
+		let cancel = snip_core::gitrun::CancelToken::new();
+		let _guard = worker
+			.state
+			.jobs
+			.admit(&ws_id, crate::jobs::JobKind::View, &cancel)
+			.unwrap();
+		assert!(!cancel.is_cancelled());
+
+		let dummy_id = snip_core::workspace::RepoIdentity {
+			toplevel: root_path.clone(),
+			git_dir: root_path.join(".git"),
+			common_dir: root_path.join(".git"),
+			kind: snip_core::workspace::RepoKind::Main,
+		};
+		lock(&worker.state.repo_cache).insert(
+			ws_id.clone(),
+			"repo".into(),
+			dummy_id,
+		);
+		assert!(lock(&worker.state.repo_cache).get(&ws_id, "repo").is_some());
+
+		let errs = worker.set_roots(&[]);
+		assert!(errs.is_empty());
+
+		assert!(
+			cancel.is_cancelled(),
+			"job admitted before workspace removal should be cancelled"
+		);
+		assert!(
+			lock(&worker.state.repo_cache).get(&ws_id, "repo").is_none(),
+			"repo_cache should be empty after workspace removal"
+		);
+		assert!(
+			worker.state.get_shared_root(&ws_id).is_err(),
+			"get_shared_root should fail for removed workspace"
+		);
 	}
 }

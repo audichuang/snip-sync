@@ -426,7 +426,9 @@ impl Git {
 		if let Some(ref b) = self.boundary {
 			cmd.args([
 				"-c",
-				"core.fsmonitor=false",
+				// Empty disables fsmonitor on every git version; before
+				// 2.36 any non-empty value ("false" included) is a hook path.
+				"core.fsmonitor=",
 				"-c",
 				"protocol.allow=never",
 				"-c",
@@ -2832,7 +2834,7 @@ mod tests {
 			&args[..4],
 			&[
 				OsStr::new("-c"),
-				OsStr::new("core.fsmonitor=false"),
+				OsStr::new("core.fsmonitor="),
 				OsStr::new("-c"),
 				OsStr::new("protocol.allow=never"),
 			]

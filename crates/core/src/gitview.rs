@@ -3750,7 +3750,7 @@ mod tests {
 		let args: Vec<_> = cmd.get_args().collect();
 		assert!(args.len() >= 4);
 		assert_eq!(args[0], "-c");
-		assert_eq!(args[1], "core.fsmonitor=false");
+		assert_eq!(args[1], "core.fsmonitor=");
 	}
 
 	#[test]
