@@ -6441,6 +6441,9 @@ mod tests {
 				let p = m.preview.as_ref().expect("remote preview");
 				assert_eq!(&*p.text, "fn main() {}\n");
 				assert_eq!(m.preview_error, None);
+				// The breadcrumb names the worker, never the internal root.
+				let root = m.ws_root().unwrap();
+				assert_eq!(m.log_repo_name(&root), "win-worker ▸ shared");
 				// Copy and paste stay local; a remote workspace refuses them.
 				m.trigger_paste_preview(cx);
 				assert_eq!(m.status.key, "remote_unsupported");
@@ -6455,6 +6458,35 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.preview_error.is_some(), "refused read shown");
+			});
+
+			// Forgetting the worker closes its open workspace: the trust is
+			// gone, so the session must not keep reading.
+			model.update(cx, |m, cx| {
+				m.forget_remote_worker(0, cx);
+				if m.remote.session.is_some() {
+					assert_eq!(m.lifecycle.intent_name(), "close-workspace");
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now(),
+						crate::lifecycle::GitLoad::idle(),
+					);
+					assert!(
+						matches!(
+							step,
+							crate::lifecycle::Step::Ready(
+								crate::lifecycle::Intent::CloseWorkspace
+							)
+						),
+						"drain not ready: {step:?}"
+					);
+					m.finish_close(cx);
+				}
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.remote.workers.is_empty());
+				assert!(m.remote.session.is_none(), "session closed");
+				assert!(!m.workspace_open && m.ws_tree.is_none());
 			});
 		}
 

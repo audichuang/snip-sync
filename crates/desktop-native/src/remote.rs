@@ -535,6 +535,17 @@ impl WorkbenchModel {
 			self.remote_note(false, err, cx);
 		}
 		self.remote.browse = None;
+		// Its open workspace goes too: the session would keep reading
+		// with a trust the user just withdrew.
+		let open_here = self
+			.remote
+			.session
+			.as_ref()
+			.is_some_and(|s| s.client.worker().fingerprint == fp);
+		if open_here && !self.remote.workers.iter().any(|w| w.fingerprint == fp)
+		{
+			self.request_user_close(lifecycle::Intent::CloseWorkspace, cx);
+		}
 		cx.notify();
 	}
 
