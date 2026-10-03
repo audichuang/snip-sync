@@ -28,6 +28,7 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 - `native-acceptance` needs a Python with Pillow in `SNIP_NATIVE_PYTHON` and fails if the checkout changes after its build: commit first, then leave the tree alone.
 - Where a test goes: pure logic → a unit test in `crates/core` or the native crate; UI state and interaction → `#[gpui::test]` in `crates/desktop-native/src/main.rs` `tests::in_process` (no display, all OSes); real input, clipboard or pixels → `crates/native-e2e/tests/smoke.rs` / `lifecycle.rs` (Xvfb; on macOS inside the preflight container); CLI behaviour and output → `crates/cli/tests/cli.rs`; byte round trips and TS compatibility → `crates/cli/tests/e2e.rs`; cross-machine file/commit semantics → a collaboration manifest step; remote-node connection behaviour → a check in `scripts/remote_e2e.sh`. macOS and Windows have no real-input GUI test.
 - A control a test drives gets a `probe(...)` id; drivers read it from `[APP:CTRL_BOUNDS]`.
+- Every file the desktop app persists resolves its folder through `recent::config_dir()`, which returns nothing under `cfg(test)` and in an e2e run without `SNIP_CONFIG_DIR`. A store that took another path let `cargo test` overwrite the user's real `recent-workspaces.json`.
 - Real-app waits go through `snip_native_e2e::scaled(...)`, or `bench_native_memory.e2e_scaled(...)` in the Python harness. On a slow machine set `SNIP_E2E_TIMEOUT_SCALE` (CI uses 2) instead of raising a deadline or rerunning; when the gates share one machine, as in the macOS container, lower their parallelism with `SNIP_ACCEPTANCE_ARGS`.
 
 ## Cross-platform
@@ -35,7 +36,8 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 - Path/fs code has broken on both macOS and Windows because git reports its resolved toplevel, which did not match the root the user gave. Test with the root spelled through a symlink (as macOS `/var` → `/private/var` is).
 - A test that skips when something is missing (display, node, `.ts-ref`) must `assert!(std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(), …)` first. CI sets it, so a skip cannot pass as green.
 - CI's macOS and Windows VMs are several times slower than a dev machine. Deadlines on helper processes (spawning `ps`, reaping a child) must survive that: a 500 ms `ps` check in `gitrun` failed clean git calls on CI and leaked their budget slot.
-- A test that waits on another thread, channel or process needs a timeout that fails with a message. An unbounded `recv()` hung CI's macOS job for 45 minutes.
+- A test that waits on another thread, channel or process, or loops until something converges, needs a bound that fails with a message. An unbounded `recv()` hung CI's macOS job for 45 minutes, and an unbounded load-more loop hung the Windows job for 36.
+- The tree's byte budget counts each node's `size_of`, which is more than twice as large on Windows: a remote listing that admits all 700 names on macOS admits about 266 there. A test about something other than the budget builds its state directly instead of relying on how many names fit.
 
 ## GitHub Actions
 

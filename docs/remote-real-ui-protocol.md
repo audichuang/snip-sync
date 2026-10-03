@@ -262,7 +262,7 @@ R34 之前，先重新開回 `edge`（R15 的步驟）。
 | R41 | 復原：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk`，點 `remote-worker:0` | `REMOTE_WORKSPACES: count=2` |
 | R42 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` 重新啟動（寫進新的 `app-N.log`），開選單 | `remote-worker:0` 仍然是 `ubuntu-ui`，點它就能列出工作區，不需要重新配對 |
 | R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk` 拿新的配對碼 C。Cmd+Q，改用全新的 `SNIP_CONFIG_DIR="$RUN/master-config-r43"` 啟動 App（寫進新的 `app-N.log`）。用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C。再 Cmd+Q，用原本的 `SNIP_CONFIG_DIR` 重新啟動，點 `remote-worker:0` | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；換回原本的設定後，`remote-worker:0` 仍然能列出工作區。一定要用全新的 master：已配對的 master，worker 認得它的憑證，不看配對碼就放行 |
-| R44 | 把視窗調成 900×600，開選單並打開配對表單 | 兩個輸入框和「配對」按鈕的 bounds 都 `w,h ≥ 1`，而且都在內容區裡面；選單可以捲動到最下面；焦點在輸入框時按 Escape，選單收起；再開選單，點 `btn-workspace-menu`，選單也會收起 |
+| R44 | 把視窗調成 900×600（從系統層設定，例如 System Events 設成 900×632；送給 App 的合成拖曳碰不到視窗框），開選單並打開配對表單 | 兩個輸入框和「配對」按鈕的 bounds 都 `w,h ≥ 1`，而且都在內容區裡面；選單可以捲動到最下面；焦點在輸入框時按 Escape，選單收起；再開選單，點 `btn-workspace-menu`，選單也會收起 |
 | R45 | 先開著 `edge`，再點 `btn-remote-forget:0` | 開著的 `edge` 跟著關閉：左上角不再有 `ubuntu-ui ▸`，`ws-tree-row:*` 都有 `CTRL_GONE`；`remote-worker:0` 有 `CTRL_GONE`；`remote-workers.json` 不再有 `ubuntu-ui`；重開選單也不會再出現 |
 
 ### 4.6 CLI master 交叉驗證
@@ -300,3 +300,9 @@ ssh ubuntu "kill \$(cat '$W/worker.pid') 2>/dev/null; rm -rf '$W'"
 - 有任何 `ui-defect`、`fail` 或 `not-run`，第一句就寫「遠端節點真實 UI 閘門打開」，並列出那些 ID。
 - I01 或 I02 不是 `pass`，整輪結果作廢：這一輪動到了真實資料，先報告，再處理其他格子。
 - R27、R32 的預期本來就允許多種畫面。判 `pass` 時，證據欄要寫實際看到的是哪一種，下一輪才能收緊。
+
+處理結果時，每個不是 `pass` 的格子先分清楚是哪一種錯，再動手。三種的修法不同，混在一起會修錯地方：
+
+- **規程錯**：通過線和產品的設計不符，例如要求一個不會出現的日誌 tag、把刻意隱藏的 `.git` 當成必須列出、量測步驟自己弄髒了受測資料。修這份規程；產品不動。
+- **工具做不到**：操作者的工具到不了驗證點，例如捲動或拖曳視窗沒有作用。該格維持 `not-run`；在規程寫下已驗證可行的做法，或換工具。產品不動。
+- **產品缺陷**：從截圖和日誌確認後，先寫一個會失敗的測試，再修產品；需要的話，規程也補上對應的通過線。
