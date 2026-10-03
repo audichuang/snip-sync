@@ -440,6 +440,9 @@ impl WorkbenchModel {
 								crate::ChangesEmpty::NoMatch => {
 									t("changes_no_match", loc).to_string()
 								}
+								crate::ChangesEmpty::CleanPartial => {
+									t("changes_clean_partial", loc).to_string()
+								}
 								crate::ChangesEmpty::Clean => {
 									t("clean_working_copy", loc).to_string()
 								}

@@ -217,7 +217,7 @@ CLI 與 App 共用 `snip-core` 的 `clip` 模組,底層用 [`arboard`](https://c
 ### 7.2 圍界檢查與設計取捨（S3–S10）
 
 - **主 repo 在分享外的 linked worktree**：worker 端的 `LocalRepo::open_within` 驗證 `common_dir` 必須在分享內；若主 repo 在分享外，該 worktree 列為錯誤列（Note），錯誤訊息提示「這是 linked worktree，主 repo 在分享範圍外；請分享主 repo 所在的資料夾」，絕不穿透讀取主 repo。
-- **物件庫與參照目錄遞迴防逃逸**：為防止 `objects/pack/`、`objects/xx/`、`refs/heads/` 或 `refs/remotes/` 內部藏有指向分享外的 symlink，以 `read_dir` 遞迴檢查 `objects/` 與 `refs/`（深度上限 8、總項目上限 20,000），遇 symlink 檢查 canonical realpath 是否在分享內（不跟隨遍歷），一般檔案不呼叫 canonicalize 兼顧效能。
+- **物件庫與參照目錄遞迴防逃逸**：為防止 `objects/pack/`、`objects/xx/`、`refs/heads/` 或 `refs/remotes/` 內部藏有指向分享外的 symlink，以 `read_dir` 遞迴檢查 `objects/` 與 `refs/`。若遇到指向分享目錄內的資料夾 symlink，亦必須遞迴走訪其內部目標以防止跳板逃逸，並使用 visited 集合追蹤 canonical 路徑以防止 symlink 迴圈與重複走訪。僅資料夾走訪計入上限（目錄走訪上限 20,000、深度上限 64），一般檔案不計入上限以避免大量 loose objects 造成誤判；若觸發資源上限則回報獨立的 `GitError::VerifyLimit`（「repository too large to verify: <what>」）而非誤報為 `OutsideBoundary`；走訪過程於目錄讀取間檢查 cancellation token 確保即時取消。
 - **alternates 物件庫指向分享外**：檢查 `objects/info/alternates`（遞迴深度 ≤ 5），若指向分享外一律拒絕並列為錯誤列，避免透過 commit OID 逐一讀取外部物件庫。
 - **空的 `.git` 目錄**：`classify_git` 將其視為 repo marker，但 `open_within` 無法初始化為合法 repo，列為錯誤列（Note），防止 git 向上逃逸到父目錄。
 - **symlink 的 `.git`**：核心探索以 `symlink_metadata` 檢查，symlink 既非一般檔案亦非一般目錄，因此不被視為 repo marker，完全不列報，無外洩風險。

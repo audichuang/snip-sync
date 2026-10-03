@@ -215,6 +215,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"changes_loading" => "正在讀取變更…",
 			"changes_no_repository" => "這個資料夾裡沒有 Git 儲存庫",
 			"changes_no_match" => "沒有符合篩選條件的變更",
+			"changes_clean_partial" => {
+				"已找到的儲存庫沒有變更；部分資料夾尚未掃描（可繼續掃描）"
+			}
 			"clean_working_copy" => "目前沒有未提交的變更檔案。",
 			"find_placeholder" => "在檔案中搜尋",
 			"jump_placeholder" => "行號...",
@@ -615,6 +618,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"changes_loading" => "Loading changes…",
 			"changes_no_repository" => "No Git repository in this folder",
 			"changes_no_match" => "No changes match the filter",
+			"changes_clean_partial" => {
+				"No changes in the repositories found; some folders were not scanned (use continue scanning)"
+			}
 			"clean_working_copy" => "Working tree is clean.",
 			"find_placeholder" => "Find in file",
 			"jump_placeholder" => "Line #...",
@@ -1119,6 +1125,7 @@ mod tests {
 			"changes_loading",
 			"changes_no_repository",
 			"changes_no_match",
+			"changes_clean_partial",
 			"log_loading",
 			"log_no_repository",
 			"log_failed_feeds",

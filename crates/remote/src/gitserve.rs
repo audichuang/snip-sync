@@ -758,6 +758,10 @@ pub(crate) fn map_git_error_with_leaked(
 			ErrorCode::OutsideShare,
 			scrub(&format!("outside the shared folder: {what}"), share),
 		),
+		GitError::VerifyLimit { what } => (
+			ErrorCode::TooLarge,
+			scrub(&format!("repository too large to verify: {what}"), share),
+		),
 		GitError::OutputLimit { .. } => (
 			ErrorCode::TooLarge,
 			"the result is too large to send; narrow the request".into(),
@@ -1377,6 +1381,18 @@ mod tests {
 				..
 			}
 		));
+
+		let r_limit = map_git_error(
+			GitError::VerifyLimit {
+				what: "object store",
+			},
+			share,
+		);
+		let Response::Error { code, message } = r_limit else {
+			panic!("expected Error");
+		};
+		assert_eq!(code, ErrorCode::TooLarge);
+		assert_eq!(message, "repository too large to verify: object store");
 
 		let r_parent =
 			map_git_error(GitError::ToplevelAbove(share.join("sub")), share);

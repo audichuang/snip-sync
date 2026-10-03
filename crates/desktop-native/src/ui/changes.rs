@@ -1012,6 +1012,13 @@ impl WorkbenchModel {
 					));
 				}
 				// Clean only when truly clean; repos the scan never reached may have changes.
+				// Incomplete leaves out only depth-limited folders with no read failure,
+				// so clean loaded repos report a non-error partial-clean state.
+				if self.discovery_status
+					== Some(snip_core::workspace::ScanStatus::Incomplete)
+				{
+					return Some(ChangesEmpty::CleanPartial);
+				}
 				if self.discovery_status
 					!= Some(snip_core::workspace::ScanStatus::Complete)
 				{
@@ -1029,6 +1036,7 @@ impl WorkbenchModel {
 			Some(ChangesEmpty::NoRepository) => Some("no_repository"),
 			Some(ChangesEmpty::ScanFailed(_)) => Some("scan_failed"),
 			Some(ChangesEmpty::NoMatch) => Some("no_match"),
+			Some(ChangesEmpty::CleanPartial) => Some("clean_partial"),
 			Some(ChangesEmpty::Clean) => Some("clean"),
 		};
 		if state_str != self.last_changes_empty.get() {

@@ -337,6 +337,7 @@ pub enum ChangesEmpty {
 	NoRepository,
 	ScanFailed(Msg),
 	NoMatch,
+	CleanPartial,
 	Clean,
 }
 
@@ -10720,7 +10721,6 @@ mod tests {
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
 			for status in [
 				snip_core::workspace::ScanStatus::TimedOut,
-				snip_core::workspace::ScanStatus::Incomplete,
 				snip_core::workspace::ScanStatus::LimitReached,
 				snip_core::workspace::ScanStatus::Cancelled,
 			] {
@@ -10743,6 +10743,11 @@ mod tests {
 					Some(ChangesEmpty::Clean),
 					"expected non-Clean for {status:?}"
 				);
+				assert_ne!(
+					state,
+					Some(ChangesEmpty::CleanPartial),
+					"expected non-CleanPartial for {status:?}"
+				);
 				let expected_msg =
 					model.read_with(cx, |m, _| m.discovery_error_msg());
 				assert_eq!(
@@ -10761,6 +10766,23 @@ mod tests {
 					"{status:?} En should contain discovery: {en}"
 				);
 			}
+
+			// Incomplete discovery with clean loaded repos -> CleanPartial.
+			model.update(cx, |m, _| {
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Incomplete);
+			});
+			let state = model.read_with(cx, |m, _| m.changes_empty_state());
+			assert_ne!(
+				state,
+				Some(ChangesEmpty::Clean),
+				"expected non-Clean for Incomplete"
+			);
+			assert_eq!(
+				state,
+				Some(ChangesEmpty::CleanPartial),
+				"expected CleanPartial for Incomplete"
+			);
 
 			model.update(cx, |m, _| {
 				m.discovery_status =

@@ -349,60 +349,123 @@ fn check_alternates_recursive(
 	Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundaryLimits {
+	pub max_depth: usize,
+	pub max_dirs: usize,
+}
+
+impl Default for BoundaryLimits {
+	fn default() -> Self {
+		Self {
+			max_depth: 64,
+			max_dirs: 20_000,
+		}
+	}
+}
+
+struct BoundaryWalk<'a> {
+	boundary: &'a Path,
+	what: &'static str,
+	limits: BoundaryLimits,
+	opts: &'a RunOptions,
+	dir_count: usize,
+	visited: HashSet<PathBuf>,
+}
+
+impl<'a> BoundaryWalk<'a> {
+	fn new(
+		boundary: &'a Path,
+		what: &'static str,
+		limits: BoundaryLimits,
+		opts: &'a RunOptions,
+	) -> Self {
+		Self {
+			boundary,
+			what,
+			limits,
+			opts,
+			dir_count: 0,
+			visited: HashSet::new(),
+		}
+	}
+
+	fn walk(&mut self, dir: &Path, depth: usize) -> Result<(), GitError> {
+		gitsrc::already_cancelled(self.opts, "verify boundary")?;
+
+		// Canonicalize directory to prevent traversal cycles and duplicate work.
+		// If canonicalization fails (e.g. non-existent or unreadable), read_dir below handles it.
+		if let Ok(canon_dir) = dunce::canonicalize(dir) {
+			if !self.visited.insert(canon_dir) {
+				return Ok(());
+			}
+		}
+
+		if depth >= self.limits.max_depth {
+			return Err(GitError::VerifyLimit { what: self.what });
+		}
+
+		self.dir_count += 1;
+		if self.dir_count > self.limits.max_dirs {
+			return Err(GitError::VerifyLimit { what: self.what });
+		}
+
+		let Ok(entries) = std::fs::read_dir(dir) else {
+			return Ok(());
+		};
+
+		for entry in entries {
+			gitsrc::already_cancelled(self.opts, "verify boundary")?;
+			let entry = entry
+				.map_err(|_| GitError::OutsideBoundary { what: self.what })?;
+			let path = entry.path();
+			if let Ok(meta) = path.symlink_metadata() {
+				if meta.file_type().is_symlink() {
+					// Refuse symlinks escaping boundary; walk in-share directory targets.
+					let canon = dunce::canonicalize(&path).map_err(|_| {
+						GitError::OutsideBoundary { what: self.what }
+					})?;
+					if !canon.starts_with(self.boundary) {
+						return Err(GitError::OutsideBoundary {
+							what: self.what,
+						});
+					}
+					if canon.is_dir() {
+						self.walk(&canon, depth + 1)?;
+					}
+				} else if meta.is_dir() {
+					self.walk(&path, depth + 1)?;
+				}
+			}
+		}
+		Ok(())
+	}
+}
+
+pub(crate) fn check_dir_children_boundary_with_limits(
+	dir: &Path,
+	boundary: &Path,
+	what: &'static str,
+	limits: BoundaryLimits,
+	opts: &RunOptions,
+) -> Result<(), GitError> {
+	let mut walk = BoundaryWalk::new(boundary, what, limits, opts);
+	walk.walk(dir, 0)
+}
+
 fn check_dir_children_boundary(
 	dir: &Path,
 	boundary: &Path,
 	what: &'static str,
+	opts: &RunOptions,
 ) -> Result<(), GitError> {
-	let mut count = 0;
-	check_dir_children_recursive(dir, boundary, what, 0, &mut count)
-}
-
-fn check_dir_children_recursive(
-	dir: &Path,
-	boundary: &Path,
-	what: &'static str,
-	depth: usize,
-	count: &mut usize,
-) -> Result<(), GitError> {
-	const MAX_DEPTH: usize = 8;
-	const MAX_ENTRIES: usize = 20_000;
-
-	if depth >= MAX_DEPTH {
-		return Err(GitError::OutsideBoundary { what });
-	}
-
-	let Ok(entries) = std::fs::read_dir(dir) else {
-		return Ok(());
-	};
-
-	for entry in entries {
-		*count += 1;
-		if *count > MAX_ENTRIES {
-			return Err(GitError::OutsideBoundary { what });
-		}
-		let entry = entry.map_err(|_| GitError::OutsideBoundary { what })?;
-		let path = entry.path();
-		if let Ok(meta) = path.symlink_metadata() {
-			if meta.file_type().is_symlink() {
-				// Refuse symlinks escaping boundary; never follow them during walk.
-				let canon = dunce::canonicalize(&path)
-					.map_err(|_| GitError::OutsideBoundary { what })?;
-				if !canon.starts_with(boundary) {
-					return Err(GitError::OutsideBoundary { what });
-				}
-			} else if meta.is_dir() {
-				check_dir_children_recursive(
-					&path,
-					boundary,
-					what,
-					depth + 1,
-					count,
-				)?;
-			}
-		}
-	}
-	Ok(())
+	check_dir_children_boundary_with_limits(
+		dir,
+		boundary,
+		what,
+		BoundaryLimits::default(),
+		opts,
+	)
 }
 
 pub(crate) fn check_repo_boundary(
@@ -506,7 +569,7 @@ pub(crate) fn check_repo_boundary(
 			p.to_path_buf()
 		}
 	};
-	check_dir_children_boundary(&objects_dir, &boundary, "object store")?;
+	check_dir_children_boundary(&objects_dir, &boundary, "object store", opts)?;
 
 	let refs_dir = {
 		let p = Path::new(lines[2]);
@@ -516,7 +579,7 @@ pub(crate) fn check_repo_boundary(
 			p.to_path_buf()
 		}
 	};
-	check_dir_children_boundary(&refs_dir, &boundary, "refs")?;
+	check_dir_children_boundary(&refs_dir, &boundary, "refs", opts)?;
 
 	let alternates_path = {
 		let p = Path::new(lines[1]);
@@ -1324,6 +1387,7 @@ mod tests {
 		);
 	}
 
+	#[cfg(unix)]
 	fn git_output(cwd: &Path, args: &[&str]) -> String {
 		let _ = std::fs::create_dir_all(cwd);
 		let out = match std::process::Command::new("git")
@@ -2772,6 +2836,286 @@ mod tests {
 		}
 	}
 
+	#[cfg(unix)]
+	#[test]
+	fn open_within_boundary_walk_in_share_dir_symlink_hop_and_loop() {
+		if !has_git() {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"git is required when SNIP_REQUIRE_ALL_TESTS is set"
+			);
+			return;
+		}
+		let _lock = SERVED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+		let dir = tempfile::tempdir().unwrap();
+		let share = dir.path().join("share");
+		let outside = dir.path().join("outside");
+		std::fs::create_dir_all(&share).unwrap();
+		std::fs::create_dir_all(&outside).unwrap();
+
+		let outside_repo = outside.join("repo");
+		run_git(&outside_repo, &["init", "-q", "-b", "main"]);
+		std::fs::write(outside_repo.join("outside.txt"), "outside content\n")
+			.unwrap();
+		run_git(&outside_repo, &["add", "outside.txt"]);
+		run_git(&outside_repo, &["commit", "-qm", "outside commit"]);
+		run_git(&outside_repo, &["gc", "--quiet"]);
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+
+		// 1. In-share dir symlink hop in objects/pack:
+		// objects/pack -> <share>/stash/pack whose pack files are symlinks to outside repo.
+		// The boundary walk must follow in-share directory symlinks and refuse the escaped children.
+		{
+			let repo = share.join("repo_pack_hop");
+			run_git(&repo, &["init", "-q", "-b", "main"]);
+			std::fs::write(repo.join("f.txt"), "f\n").unwrap();
+			run_git(&repo, &["add", "f.txt"]);
+			run_git(&repo, &["commit", "-qm", "init"]);
+
+			let pack_dir = repo.join(".git/objects/pack");
+			if pack_dir.exists() {
+				std::fs::remove_dir_all(&pack_dir).unwrap();
+			}
+			let stash_pack = share.join("stash/pack");
+			std::fs::create_dir_all(&stash_pack).unwrap();
+
+			let outside_pack_dir = outside_repo.join(".git/objects/pack");
+			let mut pack_count = 0;
+			for entry in std::fs::read_dir(&outside_pack_dir).unwrap() {
+				let entry = entry.unwrap();
+				let name = entry.file_name();
+				let name_str = name.to_str().unwrap();
+				if name_str.starts_with("pack-") {
+					std::os::unix::fs::symlink(
+						entry.path(),
+						stash_pack.join(name),
+					)
+					.unwrap();
+					pack_count += 1;
+				}
+			}
+			assert!(pack_count > 0, "outside repo gc must produce pack files");
+
+			std::os::unix::fs::symlink(&stash_pack, &pack_dir).unwrap();
+
+			let res = LocalRepo::open_within(&repo, &share, &read);
+			assert!(
+				matches!(
+					res,
+					Err(GitError::OutsideBoundary {
+						what: "object store"
+					})
+				),
+				"expected OutsideBoundary for in-share dir symlink hop to outside pack files, got {res:?}"
+			);
+		}
+
+		// 2. In-share dir symlink hop in refs/remotes/origin:
+		// refs/remotes/origin -> <share>/stash/remotes containing a symlink pointing outside.
+		{
+			let repo = share.join("repo_ref_hop");
+			run_git(&repo, &["init", "-q", "-b", "main"]);
+			std::fs::write(repo.join("f.txt"), "f\n").unwrap();
+			run_git(&repo, &["add", "f.txt"]);
+			run_git(&repo, &["commit", "-qm", "init"]);
+
+			let remotes_dir = repo.join(".git/refs/remotes");
+			std::fs::create_dir_all(&remotes_dir).unwrap();
+
+			let stash_remotes = share.join("stash/remotes");
+			std::fs::create_dir_all(&stash_remotes).unwrap();
+
+			let outside_ref = outside.join("outside_ref");
+			std::fs::write(
+				&outside_ref,
+				"0000000000000000000000000000000000000000\n",
+			)
+			.unwrap();
+			std::os::unix::fs::symlink(
+				&outside_ref,
+				stash_remotes.join("main"),
+			)
+			.unwrap();
+
+			std::os::unix::fs::symlink(
+				&stash_remotes,
+				remotes_dir.join("origin"),
+			)
+			.unwrap();
+
+			let res = LocalRepo::open_within(&repo, &share, &read);
+			assert!(
+				matches!(res, Err(GitError::OutsideBoundary { what: "refs" })),
+				"expected OutsideBoundary for refs in-share dir hop pointing outside, got {res:?}"
+			);
+		}
+
+		// 3. Symlink loop between in-share dirs:
+		// loop_a/to_b -> loop_b and loop_b/to_a -> loop_a.
+		// Traversal must track visited canonical paths, avoid hanging, and not falsely refuse valid in-share repos.
+		{
+			let repo = share.join("repo_loop");
+			run_git(&repo, &["init", "-q", "-b", "main"]);
+			std::fs::write(repo.join("f.txt"), "f\n").unwrap();
+			run_git(&repo, &["add", "f.txt"]);
+			run_git(&repo, &["commit", "-qm", "init"]);
+
+			let heads_dir = repo.join(".git/refs/heads");
+			let loop_a = heads_dir.join("loop_a");
+			let loop_b = heads_dir.join("loop_b");
+			std::fs::create_dir_all(&loop_a).unwrap();
+			std::fs::create_dir_all(&loop_b).unwrap();
+
+			std::os::unix::fs::symlink(&loop_b, loop_a.join("to_b")).unwrap();
+			std::os::unix::fs::symlink(&loop_a, loop_b.join("to_a")).unwrap();
+
+			let res = LocalRepo::open_within(&repo, &share, &read);
+			assert!(
+				res.is_ok(),
+				"symlink loop between in-share dirs must not hang or fail, got {res:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn open_within_accepts_large_loose_objects_and_deep_refs() {
+		if !has_git() {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"git is required when SNIP_REQUIRE_ALL_TESTS is set"
+			);
+			return;
+		}
+		let _lock = SERVED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+		let dir = tempfile::tempdir().unwrap();
+		let share = dir.path().join("share");
+		std::fs::create_dir_all(&share).unwrap();
+
+		let repo = share.join("repo");
+		run_git(&repo, &["init", "-q", "-b", "main"]);
+		std::fs::write(repo.join("f.txt"), "f\n").unwrap();
+		run_git(&repo, &["add", "f.txt"]);
+		run_git(&repo, &["commit", "-qm", "init"]);
+
+		// 1. More than 20_000 loose object files directly under objects/ab/
+		// Real repos after large `git add` can easily exceed the old 20,000 entries cap.
+		let loose_dir = repo.join(".git/objects/ab");
+		std::fs::create_dir_all(&loose_dir).unwrap();
+		for i in 0..21_000 {
+			let name = format!("{:04x}", i);
+			std::fs::write(loose_dir.join(name), "").unwrap();
+		}
+
+		// 2. Loose ref nested 9 directories deep (refs/heads/d1/d2/d3/d4/d5/d6/d7/d8/d9/x)
+		// Old walk capped depth at 8 and falsely returned OutsideBoundary.
+		let deep_ref_dir =
+			repo.join(".git/refs/heads/d1/d2/d3/d4/d5/d6/d7/d8/d9");
+		std::fs::create_dir_all(&deep_ref_dir).unwrap();
+		let head_oid =
+			std::fs::read_to_string(repo.join(".git/refs/heads/main")).unwrap();
+		std::fs::write(deep_ref_dir.join("x"), head_oid).unwrap();
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let res = LocalRepo::open_within(&repo, &share, &read);
+		assert!(
+			res.is_ok(),
+			"open_within must accept >20k loose objects and 9-level deep ref, got {res:?}"
+		);
+	}
+
+	#[test]
+	fn boundary_walk_resource_limits_return_distinct_verify_limit_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().join("root");
+		let boundary = dir.path().to_path_buf();
+		std::fs::create_dir_all(&root).unwrap();
+
+		let opts = RunOptions::default();
+
+		// max_depth exceeded returns VerifyLimit, not OutsideBoundary
+		let mut deep = root.clone();
+		for i in 0..5 {
+			deep = deep.join(format!("d{i}"));
+		}
+		std::fs::create_dir_all(&deep).unwrap();
+
+		let depth_limits = BoundaryLimits {
+			max_depth: 3,
+			max_dirs: 1000,
+		};
+		let res_depth = check_dir_children_boundary_with_limits(
+			&root,
+			&boundary,
+			"object store",
+			depth_limits,
+			&opts,
+		);
+		assert!(
+			matches!(
+				res_depth,
+				Err(GitError::VerifyLimit {
+					what: "object store"
+				})
+			),
+			"expected VerifyLimit on max_depth, got {res_depth:?}"
+		);
+
+		// max_dirs exceeded returns VerifyLimit, not OutsideBoundary
+		let dirs_root = dir.path().join("dirs_root");
+		std::fs::create_dir_all(&dirs_root).unwrap();
+		for i in 0..5 {
+			std::fs::create_dir_all(dirs_root.join(format!("sub{i}"))).unwrap();
+		}
+
+		let dirs_limits = BoundaryLimits {
+			max_depth: 64,
+			max_dirs: 3,
+		};
+		let res_dirs = check_dir_children_boundary_with_limits(
+			&dirs_root,
+			&boundary,
+			"refs",
+			dirs_limits,
+			&opts,
+		);
+		assert!(
+			matches!(res_dirs, Err(GitError::VerifyLimit { what: "refs" })),
+			"expected VerifyLimit on max_dirs, got {res_dirs:?}"
+		);
+	}
+
+	#[test]
+	fn boundary_walk_honors_pre_cancelled_token() {
+		let dir = tempfile::tempdir().unwrap();
+		let objects_dir = dir.path().join("objects");
+		std::fs::create_dir_all(objects_dir.join("sub")).unwrap();
+
+		let cancel = CancelToken::new();
+		cancel.cancel();
+		let opts = RunOptions {
+			cancel: Some(cancel),
+			..Default::default()
+		};
+
+		let res = check_dir_children_boundary(
+			&objects_dir,
+			dir.path(),
+			"object store",
+			&opts,
+		);
+		assert!(
+			matches!(res, Err(GitError::Cancelled { .. })),
+			"expected GitError::Cancelled on pre-cancelled options, got {res:?}"
+		);
+	}
+
 	#[test]
 	fn open_within_refuses_a_linked_worktree_of_an_outside_repo() {
 		if !has_git() {
@@ -4091,5 +4435,29 @@ mod tests {
 			),
 			"expected OutsideBoundary for text of symlink to outside file, got {outside_text:?}"
 		);
+
+		// 4. Untracked dangling symlink: served preview and changed_file_text must return Ok
+		std::os::unix::fs::symlink(
+			Path::new("releases/123"),
+			repo.join("current"),
+		)
+		.unwrap();
+
+		let dangling_prev = repo_within
+			.preview(&GitSource::Working, "current", None, &read)
+			.expect(
+				"preview of dangling symlink should succeed like local mode",
+			);
+		assert!(
+			dangling_prev.patch.is_empty(),
+			"preview patch for dangling symlink should be empty, got: {}",
+			dangling_prev.patch
+		);
+		let dangling_text = repo_within
+			.changed_file_text(&GitSource::Working, "current", 1024, &read)
+			.expect(
+				"changed_file_text of dangling symlink should return Ok(None)",
+			);
+		assert_eq!(dangling_text, None);
 	}
 }

@@ -89,6 +89,8 @@ pub enum GitError {
 	Malformed(String),
 	#[error("outside the shared folder: {what}")]
 	OutsideBoundary { what: &'static str },
+	#[error("repository too large to verify: {what}")]
+	VerifyLimit { what: &'static str },
 	#[error("{0}")]
 	Host(String),
 	#[error(transparent)]
@@ -175,8 +177,38 @@ const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
 /// A temporary copy of a repository index file, cleaned up on drop.
 #[derive(Debug)]
 pub(crate) struct TempIndexFile {
-	_temp: tempfile::NamedTempFile,
+	_dir: tempfile::TempDir,
 	path: PathBuf,
+}
+
+#[cfg(unix)]
+pub(crate) fn open_index_source(
+	source: &Path,
+) -> Result<(std::fs::File, std::fs::Metadata), GitError> {
+	use std::os::unix::fs::OpenOptionsExt;
+
+	// Open with O_NONBLOCK so a FIFO swapped in cannot hang the process indefinitely.
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(source)?;
+	let meta = file.metadata()?;
+	if !meta.is_file() {
+		return Err(GitError::OutsideBoundary { what: "index" });
+	}
+	Ok((file, meta))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_index_source(
+	source: &Path,
+) -> Result<(std::fs::File, std::fs::Metadata), GitError> {
+	let file = std::fs::File::open(source)?;
+	let meta = file.metadata()?;
+	if !meta.is_file() {
+		return Err(GitError::OutsideBoundary { what: "index" });
+	}
+	Ok((file, meta))
 }
 
 impl TempIndexFile {
@@ -193,20 +225,41 @@ impl TempIndexFile {
 		if !symlink_meta.is_file() && !symlink_meta.file_type().is_symlink() {
 			return Err(GitError::OutsideBoundary { what: "index" });
 		}
-		let meta = std::fs::metadata(source)?;
-		if !meta.is_file() {
+		let path_meta = std::fs::metadata(source)?;
+		if !path_meta.is_file() {
 			return Err(GitError::OutsideBoundary { what: "index" });
 		}
+		if path_meta.len() > max_bytes {
+			return Err(GitError::OutputLimit {
+				args: "index".into(),
+				limit: usize::try_from(max_bytes).unwrap_or(usize::MAX),
+			});
+		}
+		let (mut src, meta) = open_index_source(source)?;
 		if meta.len() > max_bytes {
 			return Err(GitError::OutputLimit {
 				args: "index".into(),
 				limit: usize::try_from(max_bytes).unwrap_or(usize::MAX),
 			});
 		}
-		let mut src = std::fs::File::open(source)?;
-		let mut temp = tempfile::Builder::new()
-			.prefix("snip-diff-index-")
-			.tempfile()?;
+		let mut builder = tempfile::Builder::new();
+		builder.prefix("snip-diff-index-");
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			builder.permissions(std::fs::Permissions::from_mode(0o700));
+		}
+		let dir = builder.tempdir()?;
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let _ = std::fs::set_permissions(
+				dir.path(),
+				std::fs::Permissions::from_mode(0o700),
+			);
+		}
+		let path = dir.path().join("index");
+		let mut temp = std::fs::File::create(&path)?;
 		let mut total: u64 = 0;
 		let mut buf = [0u8; 64 * 1024];
 		loop {
@@ -226,9 +279,8 @@ impl TempIndexFile {
 		temp.flush()?;
 		// Preserve source mtime so git's racy-clean check remains accurate.
 		let mtime = meta.modified()?;
-		temp.as_file().set_modified(mtime)?;
-		let path = temp.path().to_path_buf();
-		Ok(Self { _temp: temp, path })
+		temp.set_modified(mtime)?;
+		Ok(Self { _dir: dir, path })
 	}
 
 	pub(crate) fn path(&self) -> &Path {
@@ -1314,21 +1366,37 @@ fn read_changes(
 					if git.boundary.is_some() {
 						let file_path = git.root.join(&c.path);
 						if file_path.symlink_metadata().is_ok() {
-							let canonical_file =
-								dunce::canonicalize(&file_path)?;
-							let canonical_root =
-								dunce::canonicalize(&git.root)?;
-							if !canonical_file.starts_with(&canonical_root) {
-								return Err(GitError::OutsideBoundary {
-									what: "working file",
-								});
-							}
-							if let Ok(m) = canonical_file.metadata() {
-								if !m.is_file() && !m.is_dir() {
-									return Err(GitError::OutsideBoundary {
-										what: "working file",
-									});
+							match dunce::canonicalize(&file_path) {
+								Ok(canonical_file) => {
+									let canonical_root =
+										dunce::canonicalize(&git.root)?;
+									if !canonical_file
+										.starts_with(&canonical_root)
+									{
+										return Err(
+											GitError::OutsideBoundary {
+												what: "working file",
+											},
+										);
+									}
+									if let Ok(m) = canonical_file.metadata() {
+										if !m.is_file() && !m.is_dir() {
+											return Err(
+												GitError::OutsideBoundary {
+													what: "working file",
+												},
+											);
+										}
+									}
 								}
+								Err(e)
+									if e.kind()
+										== std::io::ErrorKind::NotFound =>
+								{
+									// Dangling symlink: skip boundary check and fall through to
+									// read_working, which yields Ok(None) matching local mode.
+								}
+								Err(e) => return Err(GitError::from(e)),
 							}
 						}
 					}
@@ -2837,7 +2905,7 @@ mod tests {
 		std::fs::write(&src, b"index data").unwrap();
 		let target_time = std::time::SystemTime::UNIX_EPOCH
 			+ std::time::Duration::from_secs(1_700_000_000);
-		let file = std::fs::File::open(&src).unwrap();
+		let file = std::fs::File::options().write(true).open(&src).unwrap();
 		file.set_modified(target_time).unwrap();
 		drop(file);
 
@@ -2877,6 +2945,90 @@ mod tests {
 		};
 		assert!(status.success(), "mkfifo failed");
 		let res = TempIndexFile::create_from(&fifo);
+		assert!(
+			matches!(res, Err(GitError::OutsideBoundary { what: "index" })),
+			"expected OutsideBoundary for FIFO index, got {res:?}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn temp_index_file_in_private_dir_cleaned_up_on_drop() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let src = dir.path().join("index");
+		std::fs::write(&src, b"dummy index content").unwrap();
+
+		let temp_index = TempIndexFile::create_from(&src).expect(
+			"TempIndexFile creation must succeed for valid regular file",
+		);
+		let index_path = temp_index.path().to_path_buf();
+		let parent_dir = index_path
+			.parent()
+			.expect("temp index must have a parent directory")
+			.to_path_buf();
+
+		// Parent dir must not be the shared temp dir itself
+		assert_ne!(
+			parent_dir,
+			std::env::temp_dir(),
+			"temp index parent directory must be a private subdirectory, not the shared temp dir"
+		);
+
+		// Parent dir must have mode 0700
+		let mode = parent_dir
+			.metadata()
+			.expect("parent directory metadata")
+			.permissions()
+			.mode() & 0o777;
+		assert_eq!(
+			mode, 0o700,
+			"expected private directory mode 0700, got 0{:o}",
+			mode
+		);
+
+		// A stray "<index>.lock" file next to it is removed when TempIndexFile drops
+		let lock_file = parent_dir.join("index.lock");
+		std::fs::write(&lock_file, b"lock content").unwrap();
+		assert!(lock_file.exists());
+
+		drop(temp_index);
+		assert!(
+			!parent_dir.exists(),
+			"private directory should be removed on drop, but still exists"
+		);
+		assert!(
+			!lock_file.exists(),
+			"stray lock file inside private directory should be removed on drop"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_index_source_fifo_race_prompt_failure() {
+		let dir = tempfile::tempdir().unwrap();
+		let fifo = dir.path().join("fifo_race");
+		let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+		let Ok(status) = status else {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"mkfifo command unavailable"
+			);
+			return;
+		};
+		assert!(status.success(), "mkfifo failed");
+
+		let (tx, rx) = std::sync::mpsc::channel();
+		let fifo_clone = fifo.clone();
+		let _handle = std::thread::spawn(move || {
+			let res = open_index_source(&fifo_clone);
+			let _ = tx.send(res);
+		});
+
+		let res = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+			"open_index_source on FIFO must return promptly without blocking",
+		);
 		assert!(
 			matches!(res, Err(GitError::OutsideBoundary { what: "index" })),
 			"expected OutsideBoundary for FIFO index, got {res:?}"
