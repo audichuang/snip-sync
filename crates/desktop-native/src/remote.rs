@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use snip_core::browser::SourcePreview;
+use snip_core::transfer::SourceKind;
 use snip_remote::{
 	Client, Identity, PairedWorker, RemoteError, RemoteWorkspace, Worker,
 	WorkerOptions, WorkerStore, TRUSTED_FILE, WORKERS_FILE,
@@ -620,6 +621,15 @@ impl WorkbenchModel {
 		};
 		self.ws_tree = Some(FileTreeNode::unloaded_root(&root));
 		self.resume_remote_tree(cx);
+		// Refresh re-reads the open file too: changed text shows, and a file
+		// deleted on the worker shows its error instead of the old text.
+		if self.selected_commit.is_none()
+			&& self.selected_file_source == Some(SourceKind::File)
+		{
+			if let Some(path) = self.selected_file.clone() {
+				self.select_file_in(Some(root), &path, SourceKind::File, cx);
+			}
+		}
 	}
 
 	fn resume_remote_tree(&mut self, cx: &mut Context<Self>) {
