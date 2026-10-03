@@ -1213,6 +1213,9 @@ impl WorkbenchModel {
 		if !self.history_extending {
 			self.history_error = None;
 		}
+		if matches!(load, PageLoad::Replace(0)) {
+			self.history_loaded = false;
+		}
 
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
@@ -1403,6 +1406,9 @@ impl WorkbenchModel {
 			MAX_RETAINED_GRAPH_BYTES
 		);
 		candidate.install(self);
+		if matches!(load, PageLoad::Replace(_)) {
+			self.history_loaded = true;
+		}
 		self.history_autoload = true;
 		if let Some((sha, old)) =
 			anchor.filter(|_| !matches!(load, PageLoad::Replace(_)))
@@ -3547,6 +3553,7 @@ impl WorkbenchModel {
 		self.history_generation += 1;
 		let _ = arm_cancel(&mut self.history_cancel);
 		self.history_error = None;
+		self.history_loaded = false;
 		app_log!("[APP:MULTI_LOG: repos={}]", self.log_feeds.len());
 		self.merged_step(self.history_page_size, cx);
 	}
@@ -3765,6 +3772,7 @@ impl WorkbenchModel {
 			MAX_RETAINED_GRAPH_BYTES
 		);
 		candidate.install(self);
+		self.history_loaded = true;
 		for (feed, n) in self.log_feeds.iter_mut().zip(taken) {
 			feed.pending.drain(..n);
 		}

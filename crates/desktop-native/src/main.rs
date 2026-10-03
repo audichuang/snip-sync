@@ -330,6 +330,25 @@ pub enum ChangeRepoState {
 	Failed(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangesEmpty {
+	Scanning,
+	Loading,
+	NoRepository,
+	ScanFailed(Msg),
+	NoMatch,
+	Clean,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogEmpty {
+	Scanning,
+	Loading,
+	NoRepository,
+	Failed(Msg),
+	Empty,
+}
+
 /// One repository node of the Changes tool window. Its rows are the
 /// contiguous run of `WorkbenchModel::files` tagged with this slot's index.
 #[derive(Clone, Debug)]
@@ -1022,6 +1041,7 @@ pub struct WorkbenchModel {
 	pub log_first_page: usize,
 	/// A neighbouring page is being read into the window.
 	pub history_extending: bool,
+	pub history_loaded: bool,
 	/// Scrolling to either end reads the next page; off after a failed read
 	/// until the user scrolls again.
 	pub history_autoload: bool,
@@ -1220,6 +1240,8 @@ pub struct WorkbenchModel {
 	pub changes_queue: ReadQueue<PathBuf>,
 	pub changes_cancel: Option<CancelToken>,
 	pub changes_generation: u64,
+	pub(crate) last_changes_empty: std::cell::Cell<Option<&'static str>>,
+	pub(crate) last_log_empty: std::cell::Cell<Option<&'static str>>,
 	/// Repo the shown preview was read from, with `preview_identity`.
 	pub preview_root: Option<(PathBuf, usize)>,
 	/// Repositories the log's Repository chip picked; empty is all of them.
@@ -1464,6 +1486,7 @@ impl WorkbenchModel {
 			select_head_after_load: false,
 			log_first_page: 0,
 			history_extending: false,
+			history_loaded: false,
 			history_autoload: true,
 			log_on_head: Vec::new(),
 			log_filter: LogQuery::default(),
@@ -1597,6 +1620,8 @@ impl WorkbenchModel {
 			changes_queue: ReadQueue::new(MAX_CHANGES_READS),
 			changes_cancel: None,
 			changes_generation: 0,
+			last_changes_empty: std::cell::Cell::new(None),
+			last_log_empty: std::cell::Cell::new(None),
 			preview_root: None,
 			log_repo_filter: Vec::new(),
 			log_scope_key: Vec::new(),
@@ -1641,6 +1666,126 @@ impl WorkbenchModel {
 	pub fn selected_change_slot(&self) -> Option<usize> {
 		let root = self.repo_root()?;
 		self.change_repos.iter().position(|s| s.root == root)
+	}
+
+	pub(crate) fn discovery_error_msg(&self) -> Msg {
+		if let Some((_, err)) = self.discovery_errors.first() {
+			Msg::new("error_repo_status", [err.clone()])
+		} else {
+			let desc = match self.discovery_status {
+				Some(ScanStatus::Incomplete) => {
+					"discovery incomplete".to_string()
+				}
+				Some(ScanStatus::LimitReached) => {
+					"discovery limit reached".to_string()
+				}
+				Some(ScanStatus::Cancelled) => {
+					"discovery cancelled".to_string()
+				}
+				Some(ScanStatus::TimedOut) => "discovery timed out".to_string(),
+				Some(other) => format!("{other:?}"),
+				None => "discovery not run".to_string(),
+			};
+			Msg::new("error_repo_status", [desc])
+		}
+	}
+
+	pub(crate) fn changes_title_text(&self) -> String {
+		let loc = self.locale;
+		if self
+			.change_repos
+			.iter()
+			.any(|s| matches!(s.state, ChangeRepoState::Loading))
+		{
+			crate::i18n::tf("changes_title", loc, &[&"…"])
+		} else {
+			crate::i18n::tf("changes_title", loc, &[&self.files.len()])
+		}
+	}
+
+	pub(crate) fn failed_feeds_msg(&self) -> Option<Msg> {
+		if self.log_feeds.len() <= 1 {
+			return None;
+		}
+		let failed_names: Vec<String> = self
+			.log_feeds
+			.iter()
+			.filter(|f| f.failed)
+			.map(|f| f.name.clone())
+			.collect();
+		if !failed_names.is_empty() && failed_names.len() < self.log_feeds.len()
+		{
+			Some(Msg::new(
+				"log_failed_feeds",
+				[failed_names.len().to_string(), failed_names.join(", ")],
+			))
+		} else {
+			None
+		}
+	}
+
+	pub(crate) fn log_empty_state(&self) -> Option<LogEmpty> {
+		let res = (|| {
+			if !self.display_commits().is_empty() {
+				return None;
+			}
+			if let Some(msg) = &self.remote.scan_error {
+				return Some(LogEmpty::Failed(msg.clone()));
+			}
+			if self.is_loading
+				|| self.discovery_status.is_none()
+				|| self.discovery_status
+					== Some(snip_core::workspace::ScanStatus::More)
+			{
+				return Some(LogEmpty::Scanning);
+			}
+			if self.repos.is_empty() {
+				if self.discovery_status
+					== Some(snip_core::workspace::ScanStatus::Complete)
+					&& self.discovery_errors.is_empty()
+				{
+					return Some(LogEmpty::NoRepository);
+				} else {
+					return Some(LogEmpty::Failed(self.discovery_error_msg()));
+				}
+			}
+			if let Some(err) = &self.history_error {
+				return Some(LogEmpty::Failed(Msg::new(
+					"error_history",
+					[err.clone()],
+				)));
+			}
+			if !self.log_feeds.is_empty()
+				&& self.log_feeds.iter().all(|f| f.failed)
+			{
+				let failed_names: Vec<&str> =
+					self.log_feeds.iter().map(|f| f.name.as_str()).collect();
+				return Some(LogEmpty::Failed(Msg::new(
+					"log_failed_feeds",
+					[self.log_feeds.len().to_string(), failed_names.join(", ")],
+				)));
+			}
+			if !self.history_loaded {
+				return Some(LogEmpty::Loading);
+			}
+			Some(LogEmpty::Empty)
+		})();
+
+		let state_str = match &res {
+			None => None,
+			Some(LogEmpty::Scanning) => Some("scanning"),
+			Some(LogEmpty::Loading) => Some("loading"),
+			Some(LogEmpty::NoRepository) => Some("no_repository"),
+			Some(LogEmpty::Failed(_)) => Some("failed"),
+			Some(LogEmpty::Empty) => Some("empty"),
+		};
+		if state_str != self.last_log_empty.get() {
+			self.last_log_empty.set(state_str);
+			if let Some(s) = state_str {
+				app_log!("[APP:LOG_EMPTY: state={s}]");
+			}
+		}
+		res
 	}
 
 	fn ensure_change_slot(
@@ -2431,6 +2576,7 @@ impl WorkbenchModel {
 		release_vec(&mut self.basket);
 		release_vec(&mut self.files);
 		release_vec(&mut self.change_repos);
+		self.last_changes_empty.set(None);
 		if let Some(token) = self.changes_cancel.take() {
 			token.cancel();
 		}
@@ -2510,6 +2656,8 @@ impl WorkbenchModel {
 		self.commit_rows_cache.take();
 		self.log_first_page = 0;
 		self.history_extending = false;
+		self.history_loaded = false;
+		self.last_log_empty.set(None);
 		self.history_autoload = true;
 		release_vec(&mut self.log_on_head);
 		self.log_filter = LogQuery::default();
@@ -6114,7 +6262,7 @@ mod tests {
 	/// UI state driven in-process: no display, so these also run in the
 	/// Windows and macOS Test jobs, which have no real-app GUI test.
 	mod in_process {
-		use crate::{WorkbenchModel, WorkbenchTab};
+		use crate::{ChangesEmpty, LogEmpty, WorkbenchModel, WorkbenchTab};
 		use gpui::{Entity, TestAppContext, VisualTestContext};
 		use snip_core::clip;
 		use snip_core::format::parse_clipboard;
@@ -8181,6 +8329,546 @@ mod tests {
 					assert!(m.log_selected.is_empty());
 				});
 			});
+		}
+
+		fn make_test_repo(root: PathBuf, name: &str) -> crate::RepoEntry {
+			crate::RepoEntry {
+				root,
+				name: name.into(),
+				kind: crate::RepoEntryKind::Main,
+				identity: None,
+				summary: Err("offline".into()),
+			}
+		}
+
+		fn make_test_commit(sha: &str) -> snip_core::browser::CommitSummary {
+			snip_core::browser::CommitSummary {
+				sha: sha.into(),
+				parents: Vec::new(),
+				author_name: "a".into(),
+				author_email: "a@a".into(),
+				author_date: "2026-01-01".into(),
+				subject: sha.into(),
+			}
+		}
+
+		fn make_test_file(path: &str, repo: u32) -> crate::FileChangeItem {
+			crate::FileChangeItem {
+				path: path.into(),
+				change_type: Some(crate::ChangeType::Modified),
+				source: snip_core::transfer::SourceKind::Working,
+				is_conflict: false,
+				selected: true,
+				repo,
+			}
+		}
+
+		#[gpui::test]
+		fn local_non_repo_folder_says_no_repository_empty(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.probes = Some(crate::ui::Probes::for_test());
+			});
+			settle(cx);
+			for _ in 0..50 {
+				let done = model.read_with(cx, |m, _| {
+					!m.is_loading && m.discovery_status.is_some()
+				});
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+			for _ in 0..2 {
+				cx.update(|w, _| w.refresh());
+				settle(cx);
+			}
+			let (changes_empty, log_empty) = model.read_with(cx, |m, _| {
+				(m.changes_empty_state(), m.log_empty_state())
+			});
+			assert_eq!(changes_empty, Some(ChangesEmpty::NoRepository));
+			assert_eq!(log_empty, Some(LogEmpty::NoRepository));
+			assert_ne!(changes_empty, Some(ChangesEmpty::Clean));
+			assert_ne!(log_empty, Some(LogEmpty::Empty));
+			let drawn =
+				model.read_with(cx, |m, _| m.probes.as_ref().unwrap().drawn());
+			assert!(
+				drawn.contains(&"changes-empty".to_string()),
+				"drawn: {drawn:?}"
+			);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.last_changes_empty.get()),
+				Some("no_repository")
+			);
+		}
+
+		#[gpui::test]
+		fn a_loading_slot_is_not_shown_as_clean_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos =
+					vec![make_test_repo(tmp.path().to_path_buf(), "repo")];
+				m.change_repos = vec![crate::ChangeRepo {
+					root: tmp.path().to_path_buf(),
+					name: "repo".into(),
+					state: crate::ChangeRepoState::Loading,
+					total: 0,
+				}];
+				m.files.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+			});
+			let empty = model.read_with(cx, |m, _| m.changes_empty_state());
+			assert_eq!(empty, Some(ChangesEmpty::Loading));
+			assert_ne!(empty, Some(ChangesEmpty::Clean));
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_title_text()),
+				"變更 (…)"
+			);
+		}
+
+		#[gpui::test]
+		fn speed_search_with_no_match_is_not_clean_empty(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos = vec![
+					make_test_repo(tmp.path().join("r1"), "r1"),
+					make_test_repo(tmp.path().join("r2"), "r2"),
+				];
+				m.change_repos = vec![
+					crate::ChangeRepo {
+						root: tmp.path().join("r1"),
+						name: "r1".into(),
+						state: crate::ChangeRepoState::Loaded,
+						total: 1,
+					},
+					crate::ChangeRepo {
+						root: tmp.path().join("r2"),
+						name: "r2".into(),
+						state: crate::ChangeRepoState::Loaded,
+						total: 0,
+					},
+				];
+				m.files = vec![make_test_file("foo.txt", 0)];
+				m.chrome.speed = "nomatch_filter_query".into();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+			});
+			let empty = model.read_with(cx, |m, _| m.changes_empty_state());
+			assert_eq!(empty, Some(ChangesEmpty::NoMatch));
+			assert_ne!(empty, Some(ChangesEmpty::Clean));
+		}
+
+		#[gpui::test]
+		fn log_while_loading_is_not_empty_log_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos =
+					vec![make_test_repo(tmp.path().to_path_buf(), "repo")];
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+				m.history_loaded = false;
+				m.commits.clear();
+			});
+			let empty = model.read_with(cx, |m, _| m.log_empty_state());
+			assert_eq!(empty, Some(LogEmpty::Loading));
+			assert_ne!(empty, Some(LogEmpty::Empty));
+
+			model.update(cx, |m, _| {
+				m.history_loaded = true;
+			});
+			let empty_after = model.read_with(cx, |m, _| m.log_empty_state());
+			assert_eq!(empty_after, Some(LogEmpty::Empty));
+
+			model.update(cx, |m, _| {
+				m.commits = vec![make_test_commit("abcdef123456")];
+			});
+			let empty_commits = model.read_with(cx, |m, _| m.log_empty_state());
+			assert_eq!(empty_commits, None);
+		}
+
+		#[gpui::test]
+		fn failed_feed_is_reported_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos = vec![
+					make_test_repo(tmp.path().join("r1"), "r1"),
+					make_test_repo(tmp.path().join("r2"), "r2"),
+				];
+				m.log_feeds = vec![
+					crate::multi_log::Feed {
+						name: "r1".into(),
+						failed: false,
+						loaded: true,
+						..Default::default()
+					},
+					crate::multi_log::Feed {
+						name: "r2".into(),
+						failed: true,
+						loaded: false,
+						..Default::default()
+					},
+				];
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+				m.history_loaded = true;
+			});
+			let msg = model.read_with(cx, |m, _| m.failed_feeds_msg());
+			let expected = crate::i18n::Msg::new(
+				"log_failed_feeds",
+				["1".to_string(), "r2".to_string()],
+			);
+			assert_eq!(msg, Some(expected.clone()));
+			assert_eq!(
+				expected.render(crate::i18n::Locale::ZhTw),
+				"1 個儲存庫無法讀取：r2"
+			);
+			assert_eq!(
+				expected.render(crate::i18n::Locale::En),
+				"1 repository(ies) could not be read: r2"
+			);
+
+			// All feeds failed -> Failed
+			model.update(cx, |m, _| {
+				m.log_feeds[0].failed = true;
+				m.commits.clear();
+			});
+			let (failed_msg, log_empty) = model.read_with(cx, |m, _| {
+				(m.failed_feeds_msg(), m.log_empty_state())
+			});
+			assert!(failed_msg.is_none());
+			assert!(matches!(log_empty, Some(LogEmpty::Failed(_))));
+		}
+
+		#[gpui::test]
+		fn changes_empty_scanning_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.is_loading = true;
+				m.discovery_status = None;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::Scanning)
+			);
+		}
+
+		#[gpui::test]
+		fn changes_empty_scan_failed_scan_error_branch_empty(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			let err_msg = crate::i18n::Msg::new(
+				"remote_scan_failed",
+				["network error".to_string()],
+			);
+			model.update(cx, |m, _| {
+				m.remote.scan_error = Some(err_msg.clone());
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::ScanFailed(err_msg))
+			);
+		}
+
+		#[gpui::test]
+		fn changes_empty_scan_failed_discovery_error_branch_empty(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Incomplete);
+				m.discovery_errors =
+					vec![(tmp.path().join("sub"), "read failed".into())];
+				m.is_loading = false;
+			});
+			let state = model.read_with(cx, |m, _| m.changes_empty_state());
+			assert_eq!(
+				state,
+				Some(ChangesEmpty::ScanFailed(crate::i18n::Msg::new(
+					"error_repo_status",
+					["read failed".to_string()]
+				)))
+			);
+		}
+
+		#[gpui::test]
+		fn changes_empty_no_repository_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.discovery_errors.clear();
+				m.is_loading = false;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::NoRepository)
+			);
+		}
+
+		#[gpui::test]
+		fn changes_empty_loading_unsynced_slots_branch_empty(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.change_repos.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::Loading)
+			);
+		}
+
+		#[gpui::test]
+		fn changes_empty_loading_slot_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.change_repos = vec![crate::ChangeRepo {
+					root: tmp.path().join("r1"),
+					name: "r1".into(),
+					state: crate::ChangeRepoState::Loading,
+					total: 0,
+				}];
+				m.files.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::Loading)
+			);
+		}
+
+		#[gpui::test]
+		fn changes_empty_no_match_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos = vec![
+					make_test_repo(tmp.path().join("r1"), "r1"),
+					make_test_repo(tmp.path().join("r2"), "r2"),
+				];
+				m.change_repos = vec![
+					crate::ChangeRepo {
+						root: tmp.path().join("r1"),
+						name: "r1".into(),
+						state: crate::ChangeRepoState::Loaded,
+						total: 1,
+					},
+					crate::ChangeRepo {
+						root: tmp.path().join("r2"),
+						name: "r2".into(),
+						state: crate::ChangeRepoState::Loaded,
+						total: 0,
+					},
+				];
+				m.files = vec![make_test_file("a.txt", 0)];
+				m.chrome.speed = "zzz_nomatch".into();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::NoMatch)
+			);
+		}
+
+		#[gpui::test]
+		fn changes_empty_clean_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.change_repos = vec![crate::ChangeRepo {
+					root: tmp.path().join("r1"),
+					name: "r1".into(),
+					state: crate::ChangeRepoState::Loaded,
+					total: 0,
+				}];
+				m.files.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::Clean)
+			);
+		}
+
+		#[gpui::test]
+		fn changes_empty_none_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.change_repos = vec![crate::ChangeRepo {
+					root: tmp.path().join("r1"),
+					name: "r1".into(),
+					state: crate::ChangeRepoState::Loaded,
+					total: 1,
+				}];
+				m.files = vec![make_test_file("a.txt", 0)];
+				m.chrome.speed.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				None
+			);
+		}
+
+		#[gpui::test]
+		fn log_empty_none_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.commits = vec![make_test_commit("abc1234")];
+			});
+			assert_eq!(model.read_with(cx, |m, _| m.log_empty_state()), None);
+		}
+
+		#[gpui::test]
+		fn log_empty_failed_scan_error_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			let err = crate::i18n::Msg::new(
+				"remote_scan_failed",
+				["fail".to_string()],
+			);
+			model.update(cx, |m, _| {
+				m.commits.clear();
+				m.remote.scan_error = Some(err.clone());
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.log_empty_state()),
+				Some(LogEmpty::Failed(err))
+			);
+		}
+
+		#[gpui::test]
+		fn log_empty_scanning_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.commits.clear();
+				m.is_loading = true;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.log_empty_state()),
+				Some(LogEmpty::Scanning)
+			);
+		}
+
+		#[gpui::test]
+		fn log_empty_no_repository_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.commits.clear();
+				m.repos.clear();
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.discovery_errors.clear();
+				m.is_loading = false;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.log_empty_state()),
+				Some(LogEmpty::NoRepository)
+			);
+		}
+
+		#[gpui::test]
+		fn log_empty_failed_history_error_branch_empty(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.commits.clear();
+				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+				m.history_error = Some("git read failure".into());
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.log_empty_state()),
+				Some(LogEmpty::Failed(crate::i18n::Msg::new(
+					"error_history",
+					["git read failure".to_string()]
+				)))
+			);
+		}
+
+		#[gpui::test]
+		fn log_empty_loading_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.commits.clear();
+				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+				m.history_loaded = false;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.log_empty_state()),
+				Some(LogEmpty::Loading)
+			);
+		}
+
+		#[gpui::test]
+		fn log_empty_empty_branch_empty(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			model.update(cx, |m, _| {
+				m.commits.clear();
+				m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+				m.history_loaded = true;
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.log_empty_state()),
+				Some(LogEmpty::Empty)
+			);
 		}
 	}
 

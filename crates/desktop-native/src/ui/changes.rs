@@ -2,6 +2,7 @@
 //! directory tree) and the row renderers.
 
 use super::*;
+use crate::ChangesEmpty;
 
 /// One row of the Git Changes tool window (section header or file change).
 #[derive(Clone, Debug)]
@@ -932,5 +933,70 @@ impl WorkbenchModel {
 			.children(row_id.and_then(|id| probe(log, id)))
 			.children(src_row_id.and_then(|id| probe(log, id)))
 			.into_any_element()
+	}
+
+	pub(crate) fn changes_empty_state(&self) -> Option<ChangesEmpty> {
+		let res =
+			(|| {
+				if !self.change_item_rows().is_empty() {
+					return None;
+				}
+				if !self.files.is_empty() {
+					return Some(ChangesEmpty::NoMatch);
+				}
+				if let Some(msg) = &self.remote.scan_error {
+					return Some(ChangesEmpty::ScanFailed(msg.clone()));
+				}
+				if self.is_loading
+					|| self.discovery_status.is_none()
+					|| self.discovery_status
+						== Some(snip_core::workspace::ScanStatus::More)
+				{
+					return Some(ChangesEmpty::Scanning);
+				}
+				if self.repos.is_empty() {
+					if self.discovery_status
+						== Some(snip_core::workspace::ScanStatus::Complete)
+						&& self.discovery_errors.is_empty()
+					{
+						return Some(ChangesEmpty::NoRepository);
+					} else {
+						return Some(ChangesEmpty::ScanFailed(
+							self.discovery_error_msg(),
+						));
+					}
+				}
+				if self.change_repos.len() != self.repos.len()
+					|| !self.repos.iter().all(|r| {
+						self.change_repos.iter().any(|c| c.root == r.root)
+					}) {
+					return Some(ChangesEmpty::Loading);
+				}
+				if self
+					.change_repos
+					.iter()
+					.any(|s| matches!(s.state, crate::ChangeRepoState::Loading))
+				{
+					return Some(ChangesEmpty::Loading);
+				}
+				Some(ChangesEmpty::Clean)
+			})();
+
+		let state_str = match &res {
+			None => None,
+			Some(ChangesEmpty::Scanning) => Some("scanning"),
+			Some(ChangesEmpty::Loading) => Some("loading"),
+			Some(ChangesEmpty::NoRepository) => Some("no_repository"),
+			Some(ChangesEmpty::ScanFailed(_)) => Some("scan_failed"),
+			Some(ChangesEmpty::NoMatch) => Some("no_match"),
+			Some(ChangesEmpty::Clean) => Some("clean"),
+		};
+		if state_str != self.last_changes_empty.get() {
+			self.last_changes_empty.set(state_str);
+			if let Some(s) = state_str {
+				app_log!("[APP:CHANGES_EMPTY: state={s}]");
+			}
+		}
+		res
 	}
 }

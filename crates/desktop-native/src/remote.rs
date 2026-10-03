@@ -260,6 +260,7 @@ pub struct MasterState {
 	pub message: Option<(bool, String)>,
 	/// Worker whose workspaces are listed, and the listing once it lands.
 	pub browse: Option<(usize, Option<WorkspaceListing>)>,
+	pub scan_error: Option<Msg>,
 }
 
 /// Blocking: the remote counterpart of [`crate::tree::execute_tree_io`].
