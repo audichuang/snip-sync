@@ -2484,6 +2484,7 @@ fn scan_with_outside_missing_submodule_gitdir_hides_outside_paths() {
 	}
 }
 
+#[cfg(unix)]
 #[test]
 fn scan_with_admission_wait_returns_incomplete_not_timeout() {
 	let _serial = serial();

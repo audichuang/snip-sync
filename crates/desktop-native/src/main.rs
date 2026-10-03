@@ -10713,6 +10713,66 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn changes_empty_non_complete_discovery_with_clean_repos_is_scan_failed(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			for status in [
+				snip_core::workspace::ScanStatus::TimedOut,
+				snip_core::workspace::ScanStatus::Incomplete,
+				snip_core::workspace::ScanStatus::LimitReached,
+				snip_core::workspace::ScanStatus::Cancelled,
+			] {
+				model.update(cx, |m, _| {
+					m.repos = vec![make_test_repo(tmp.path().join("r1"), "r1")];
+					m.change_repos = vec![crate::ChangeRepo {
+						root: tmp.path().join("r1"),
+						name: "r1".into(),
+						state: crate::ChangeRepoState::Loaded,
+						total: 0,
+					}];
+					m.files.clear();
+					m.discovery_errors.clear();
+					m.discovery_status = Some(status);
+					m.is_loading = false;
+				});
+				let state = model.read_with(cx, |m, _| m.changes_empty_state());
+				assert_ne!(
+					state,
+					Some(ChangesEmpty::Clean),
+					"expected non-Clean for {status:?}"
+				);
+				let expected_msg =
+					model.read_with(cx, |m, _| m.discovery_error_msg());
+				assert_eq!(
+					state,
+					Some(ChangesEmpty::ScanFailed(expected_msg.clone())),
+					"expected ScanFailed for {status:?}"
+				);
+				let zh = expected_msg.render(crate::i18n::Locale::ZhTw);
+				assert!(
+					!zh.to_lowercase().contains("discovery"),
+					"{status:?} ZhTw contains discovery: {zh}"
+				);
+				let en = expected_msg.render(crate::i18n::Locale::En);
+				assert!(
+					en.to_lowercase().contains("discovery"),
+					"{status:?} En should contain discovery: {en}"
+				);
+			}
+
+			model.update(cx, |m, _| {
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+			});
+			assert_eq!(
+				model.read_with(cx, |m, _| m.changes_empty_state()),
+				Some(ChangesEmpty::Clean)
+			);
+		}
+
+		#[gpui::test]
 		fn changes_empty_failed_slot_with_speed_filter_is_no_match(
 			cx: &mut TestAppContext,
 		) {

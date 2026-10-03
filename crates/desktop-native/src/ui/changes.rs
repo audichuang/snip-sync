@@ -1011,6 +1011,14 @@ impl WorkbenchModel {
 						self.discovery_error_msg(),
 					));
 				}
+				// Clean only when truly clean; repos the scan never reached may have changes.
+				if self.discovery_status
+					!= Some(snip_core::workspace::ScanStatus::Complete)
+				{
+					return Some(ChangesEmpty::ScanFailed(
+						self.discovery_error_msg(),
+					));
+				}
 				Some(ChangesEmpty::Clean)
 			})();
 

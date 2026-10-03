@@ -388,6 +388,8 @@ else
 	bad "changes on linked worktree  rc=$rc err=$wt_err"
 fi
 
+# A diff that covers the stat-dirty b.txt is what makes git refresh an index it may write.
+"$SNIP" remote diff 1 gitws alpha b.txt >/dev/null 2>&1 || true
 alpha_index_after=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
 check "alpha .git/index sha256 unchanged" test "$alpha_index_after" = "$alpha_index_before" -a -n "$alpha_index_after"
 check "alpha .git/index.lock does not exist" w <<<"test ! -e '$WD/gitws/alpha/.git/index.lock'"

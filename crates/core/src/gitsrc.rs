@@ -6,7 +6,7 @@
 //! files; `collect_payload` applies filters, limits and counts on top.
 
 use std::collections::HashSet;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -169,31 +169,70 @@ fn run_strict(
 	Ok(output.stdout)
 }
 
+/// Maximum index file bytes copied for a served diff (256 MiB).
+const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+
 /// A temporary copy of a repository index file, cleaned up on drop.
+#[derive(Debug)]
 pub(crate) struct TempIndexFile {
+	_temp: tempfile::NamedTempFile,
 	path: PathBuf,
 }
 
 impl TempIndexFile {
-	fn create_from(source: &Path) -> io::Result<Self> {
-		let nanos = std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_nanos())
-			.unwrap_or(0);
-		let path = std::env::temp_dir()
-			.join(format!("snip-diff-index-{}-{nanos}", std::process::id()));
-		std::fs::copy(source, &path)?;
-		Ok(Self { path })
+	pub(crate) fn create_from(source: &Path) -> Result<Self, GitError> {
+		Self::create_from_with_cap(source, MAX_INDEX_BYTES)
 	}
 
-	fn path(&self) -> &Path {
+	pub(crate) fn create_from_with_cap(
+		source: &Path,
+		max_bytes: u64,
+	) -> Result<Self, GitError> {
+		// Stat before opening to avoid blocking indefinitely on a FIFO.
+		let symlink_meta = std::fs::symlink_metadata(source)?;
+		if !symlink_meta.is_file() && !symlink_meta.file_type().is_symlink() {
+			return Err(GitError::OutsideBoundary { what: "index" });
+		}
+		let meta = std::fs::metadata(source)?;
+		if !meta.is_file() {
+			return Err(GitError::OutsideBoundary { what: "index" });
+		}
+		if meta.len() > max_bytes {
+			return Err(GitError::OutputLimit {
+				args: "index".into(),
+				limit: usize::try_from(max_bytes).unwrap_or(usize::MAX),
+			});
+		}
+		let mut src = std::fs::File::open(source)?;
+		let mut temp = tempfile::Builder::new()
+			.prefix("snip-diff-index-")
+			.tempfile()?;
+		let mut total: u64 = 0;
+		let mut buf = [0u8; 64 * 1024];
+		loop {
+			let n = src.read(&mut buf)?;
+			if n == 0 {
+				break;
+			}
+			total += n as u64;
+			if total > max_bytes {
+				return Err(GitError::OutputLimit {
+					args: "index".into(),
+					limit: usize::try_from(max_bytes).unwrap_or(usize::MAX),
+				});
+			}
+			temp.write_all(&buf[..n])?;
+		}
+		temp.flush()?;
+		// Preserve source mtime so git's racy-clean check remains accurate.
+		let mtime = meta.modified()?;
+		temp.as_file().set_modified(mtime)?;
+		let path = temp.path().to_path_buf();
+		Ok(Self { _temp: temp, path })
+	}
+
+	pub(crate) fn path(&self) -> &Path {
 		&self.path
-	}
-}
-
-impl Drop for TempIndexFile {
-	fn drop(&mut self) {
-		let _ = std::fs::remove_file(&self.path);
 	}
 }
 
@@ -385,6 +424,38 @@ impl Git {
 		self.exec(cmd, &args.join(" "), None, opts)
 	}
 
+	/// Inspects diff argv to decide whether `git diff` reads the index/worktree.
+	/// Two-tree diffs (e.g. `diff <a> <b>` or `diff a..b`) skip index reading.
+	fn diff_reads_index(args: &[&str]) -> bool {
+		let mut rev_or_positional = Vec::new();
+		let mut has_cached = false;
+		let before_dashdash = match args.iter().position(|&a| a == "--") {
+			Some(pos) => &args[..pos],
+			None => args,
+		};
+		for &arg in before_dashdash {
+			if arg == "diff" {
+				continue;
+			}
+			if arg == "--cached" || arg == "--staged" {
+				has_cached = true;
+				continue;
+			}
+			if !arg.starts_with('-') {
+				rev_or_positional.push(arg);
+			}
+		}
+		if has_cached {
+			return true;
+		}
+		if rev_or_positional.iter().any(|arg| arg.contains("..")) {
+			return false;
+		}
+		// 0 args (worktree vs index) or 1 arg (tree-ish vs worktree) read the index/worktree.
+		// 2 or more args (e.g. tree1 tree2) diff two trees and do not read the index.
+		rev_or_positional.len() < 2
+	}
+
 	/// Creates a command for `diff`, ensuring that in boundary mode, any index
 	/// auto-refresh writes to a private temporary copy instead of the real index.
 	pub(crate) fn diff_command(
@@ -395,13 +466,13 @@ impl Git {
 		let mut cmd = self.command();
 		cmd.args(args);
 		let mut temp_index = None;
-		if self.boundary.is_some() {
+		if self.boundary.is_some() && Self::diff_reads_index(args) {
 			let out =
 				self.run_with(&["rev-parse", "--git-path", "index"], opts)?;
 			let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
 			if !rel.is_empty() {
 				let index_path = self.root.join(rel);
-				if index_path.exists() {
+				if index_path.symlink_metadata().is_ok() {
 					let temp_file = TempIndexFile::create_from(&index_path)?;
 					cmd.env("GIT_INDEX_FILE", temp_file.path());
 					temp_index = Some(temp_file);
@@ -1247,15 +1318,17 @@ fn read_changes(
 								dunce::canonicalize(&file_path)?;
 							let canonical_root =
 								dunce::canonicalize(&git.root)?;
-							if !canonical_file.starts_with(&canonical_root)
-								|| !canonical_file
-									.metadata()
-									.map(|m| m.is_file())
-									.unwrap_or(false)
-							{
+							if !canonical_file.starts_with(&canonical_root) {
 								return Err(GitError::OutsideBoundary {
 									what: "working file",
 								});
+							}
+							if let Ok(m) = canonical_file.metadata() {
+								if !m.is_file() && !m.is_dir() {
+									return Err(GitError::OutsideBoundary {
+										what: "working file",
+									});
+								}
 							}
 						}
 					}
@@ -2755,5 +2828,83 @@ mod tests {
 		] {
 			assert_eq!(plain_envs.get(OsStr::new(var)), None);
 		}
+	}
+
+	#[test]
+	fn temp_index_file_preserves_source_mtime() {
+		let dir = tempfile::tempdir().unwrap();
+		let src = dir.path().join("index");
+		std::fs::write(&src, b"index data").unwrap();
+		let target_time = std::time::SystemTime::UNIX_EPOCH
+			+ std::time::Duration::from_secs(1_700_000_000);
+		let file = std::fs::File::open(&src).unwrap();
+		file.set_modified(target_time).unwrap();
+		drop(file);
+
+		let temp = TempIndexFile::create_from(&src).unwrap();
+		let temp_meta = std::fs::metadata(temp.path()).unwrap();
+		assert_eq!(
+			temp_meta.modified().unwrap(),
+			target_time,
+			"temp copy must preserve source index mtime for racy-clean check"
+		);
+	}
+
+	#[test]
+	fn temp_index_file_refuses_oversized_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let src = dir.path().join("index");
+		std::fs::write(&src, b"01234567890123456789").unwrap();
+		let res = TempIndexFile::create_from_with_cap(&src, 10);
+		assert!(
+			matches!(res, Err(GitError::OutputLimit { limit: 10, .. })),
+			"expected OutputLimit for index exceeding cap, got {res:?}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn temp_index_file_refuses_fifo_promptly() {
+		let dir = tempfile::tempdir().unwrap();
+		let fifo = dir.path().join("fifo_index");
+		let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+		let Ok(status) = status else {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"mkfifo command unavailable"
+			);
+			return;
+		};
+		assert!(status.success(), "mkfifo failed");
+		let res = TempIndexFile::create_from(&fifo);
+		assert!(
+			matches!(res, Err(GitError::OutsideBoundary { what: "index" })),
+			"expected OutsideBoundary for FIFO index, got {res:?}"
+		);
+	}
+
+	#[test]
+	fn diff_reads_index_classification() {
+		// Plain working tree diff reads index
+		assert!(Git::diff_reads_index(&[
+			"diff",
+			"-z",
+			"--raw",
+			"--no-abbrev",
+			"-M"
+		]));
+		// Diff with HEAD (1 tree-ish vs worktree) reads index
+		assert!(Git::diff_reads_index(&["diff", "HEAD", "--", "f.txt"]));
+		// Diff cached reads index
+		assert!(Git::diff_reads_index(&[
+			"diff", "--cached", "HEAD", "--", "f.txt"
+		]));
+		assert!(Git::diff_reads_index(&["diff", "--cached"]));
+		// Two-tree diffs do not read index
+		assert!(!Git::diff_reads_index(&[
+			"diff", "sha1", "sha2", "--", "f.txt"
+		]));
+		assert!(!Git::diff_reads_index(&["diff", "sha1..sha2"]));
+		assert!(!Git::diff_reads_index(&["diff", "sha1...sha2"]));
 	}
 }

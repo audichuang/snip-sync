@@ -208,14 +208,16 @@ CLI 與 App 共用 `snip-core` 的 `clip` 模組,底層用 [`arboard`](https://c
 遠端 worker 在共享目錄（boundary）下執行 Git 讀取操作時，增加安全邊界防護：
 - `-c core.fsmonitor=false`：支援此設定鍵的任何 Git 版本（不支援時 `-c` 亦不報錯忽略）。
 - `-c protocol.allow=never`：Git >= 2.12（阻擋所有 submodule 傳輸協議與 clone/fetch 網路傳輸；更舊版本的 Git 會靜默忽略未知的設定鍵，但 partial clone / lazy fetch 需 Git >= ~2.19 始支援，因此無實質外洩風險）。
+- `-c core.hooksPath=/dev/null`（Windows 為 `NUL`）：避免觸發 repo 內的 hooks（例如 post-index-change）。
 - `GIT_NO_LAZY_FETCH=1`：Git >= 2.44（舊版 Git 主要仰賴 `protocol.allow=never` 阻擋 lazy fetch）。
 - `GIT_CEILING_DIRECTORIES`：需要正規化後的絕對路徑（canonical absolute path），設定為共享目錄的父目錄以阻擋向上遍歷至上層 repo。
 - Windows 環境下 `GIT_CEILING_DIRECTORIES` 搭配 dunce 標準化路徑的行為未在本機單獨實測，僅由 CI 驗證（即使 ceiling 被忽略，事後對 toplevel / git_dir 的邊界檢查依然提供安全防護）。
-- 清除 `GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE`、`GIT_COMMON_DIR`、`GIT_OBJECT_DIRECTORY`、`GIT_ALTERNATE_OBJECT_DIRECTORIES` 等環境變數，並設定 `GIT_OPTIONAL_LOCKS=0` 避免產生或更新 `.git/index.lock`。
+- 清除 `GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE`、`GIT_COMMON_DIR`、`GIT_OBJECT_DIRECTORY`、`GIT_ALTERNATE_OBJECT_DIRECTORIES` 等環境變數，並設定 `GIT_OPTIONAL_LOCKS=0` 避免產生或更新 `.git/index.lock`。因 `GIT_OPTIONAL_LOCKS=0` 無法完全阻止 `git diff` 自動刷新／寫入 index 或觸發 post-index-change hook，served `git diff` 在需要讀取 index 時會以 `GIT_INDEX_FILE` 指向私有暫存副本（僅限一般檔案、設有 256 MiB 大小上限並保留原 mtime 以維護 racy-clean 判定），其餘情況一律從環境變數清除 `GIT_INDEX_FILE`。
 
 ### 7.2 圍界檢查與設計取捨（S3–S10）
 
 - **主 repo 在分享外的 linked worktree**：worker 端的 `LocalRepo::open_within` 驗證 `common_dir` 必須在分享內；若主 repo 在分享外，該 worktree 列為錯誤列（Note），錯誤訊息提示「這是 linked worktree，主 repo 在分享範圍外；請分享主 repo 所在的資料夾」，絕不穿透讀取主 repo。
+- **物件庫與參照目錄遞迴防逃逸**：為防止 `objects/pack/`、`objects/xx/`、`refs/heads/` 或 `refs/remotes/` 內部藏有指向分享外的 symlink，以 `read_dir` 遞迴檢查 `objects/` 與 `refs/`（深度上限 8、總項目上限 20,000），遇 symlink 檢查 canonical realpath 是否在分享內（不跟隨遍歷），一般檔案不呼叫 canonicalize 兼顧效能。
 - **alternates 物件庫指向分享外**：檢查 `objects/info/alternates`（遞迴深度 ≤ 5），若指向分享外一律拒絕並列為錯誤列，避免透過 commit OID 逐一讀取外部物件庫。
 - **空的 `.git` 目錄**：`classify_git` 將其視為 repo marker，但 `open_within` 無法初始化為合法 repo，列為錯誤列（Note），防止 git 向上逃逸到父目錄。
 - **symlink 的 `.git`**：核心探索以 `symlink_metadata` 檢查，symlink 既非一般檔案亦非一般目錄，因此不被視為 repo marker，完全不列報，無外洩風險。
