@@ -1799,6 +1799,14 @@ impl WorkbenchModel {
 		self.sync_list_row();
 	}
 
+	/// A tree row whose name is not UTF-8 cannot be addressed: say so, so
+	/// the click is not silently ignored while the old preview stays.
+	pub fn refuse_unaddressable_row(&mut self, cx: &mut Context<Self>) {
+		app_log!("[APP:TREE_ROW_REFUSED: not-utf8]");
+		self.set_status("tree_name_not_utf8", []);
+		cx.notify();
+	}
+
 	pub fn set_status(
 		&mut self,
 		key: &'static str,
@@ -6447,6 +6455,40 @@ mod tests {
 				// Copy and paste stay local; a remote workspace refuses them.
 				m.trigger_paste_preview(cx);
 				assert_eq!(m.status.key, "remote_unsupported");
+			});
+
+			// Refresh re-reads the open file: deleted on the worker, it shows
+			// an error, not its old text.
+			model.update(cx, |m, cx| {
+				let root = m.ws_root();
+				m.select_file_in(root, "README.md", SourceKind::File, cx);
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("README preview");
+				assert_eq!(&*p.text, "# remote\n");
+			});
+			fs::remove_file(shared.join("README.md")).unwrap();
+			model.update(cx, |m, cx| m.reload_repos(cx));
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.preview_error.is_some(),
+					"deleted file shown as error"
+				);
+				assert!(
+					m.preview.as_ref().is_none_or(|p| &*p.text != "# remote\n"),
+					"old text left in place"
+				);
+				let tree = m.ws_tree.as_ref().unwrap();
+				assert!(tree.children.iter().all(|c| c.name != "README.md"));
+			});
+			fs::write(shared.join("README.md"), "# remote\n").unwrap();
+
+			// A name that is not UTF-8 cannot be opened; the click says so.
+			model.update(cx, |m, cx| m.refuse_unaddressable_row(cx));
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "tree_name_not_utf8");
 			});
 
 			// The worker unshares the folder: the next read is refused.

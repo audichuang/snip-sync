@@ -184,6 +184,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | `[APP:REMOTE_PAIR_FAILED: <訊息>]` | 配對失敗 |
 | `[APP:REMOTE_WORKSPACES: count=N]` | 列出工作區成功（失敗時沒有這行，只在選單顯示紅字） |
 | `[APP:REMOTE_OPENED: <worker> ▸ <工作區> generation=N]` | 開啟遠端工作區 |
+| `[APP:TREE_ROW_REFUSED: not-utf8]` | 點了名稱不是 UTF-8 的列，無法開啟 |
 | `[APP:REMOTE_WORKER: state=…]`、`[APP:REMOTE_PAIRING: state=open]` | 本機當 worker（本規程不測） |
 
 ## 4. 測案
@@ -230,7 +231,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | R24 | 點 `escape.txt` | 失敗格：錯誤文字說路徑離開了工作區；`top-secret-c0ffee` 不出現在截圖，也不在 `app-*.log` 裡（`grep -c top-secret "$RUN"/app-*.log` 要是 0） |
 | R25 | 點 `escape-dir` | 拒絕。指向分享外的資料夾 symlink 列成檔案列（CLI `snip remote ls 1 edge` 印 `escape-dir`，沒有尾端 `/`）；點下去是失敗格，錯誤是「Path leaves the workspace」。**不能**列出 `/etc` 的內容（截圖裡沒有 `passwd`、`hostname`） |
 | R26 | 點 `inner-link` | 指向分享內的資料夾 symlink 列成資料夾（CLI `snip remote ls 1 edge` 印 `inner-link/`）：可以展開，列出 `deep`、`main.rs`；點 `inner-link/main.rs` 能預覽。顯示成檔案列或無法展開，判 `fail` |
-| R27 | 找到非 UTF-8 名稱那一列 | 它的 ID 是 `ws-tree-invalid:<suffix>`，名稱用替代字元顯示；點它不能讓 App 崩潰，也不能預覽到別的檔案的內容（錯誤或「無法預覽」都算對）。把實際行為寫進證據欄 |
+| R27 | 找到非 UTF-8 名稱那一列 | 它的 ID 是 `ws-tree-invalid:<suffix>`，名稱用替代字元顯示；點它有一行新的 `TREE_ROW_REFUSED: not-utf8`，狀態列顯示「檔名不是有效的 UTF-8，無法開啟或預覽」；App 不崩潰，選取與預覽維持原樣 |
 | R28 | 依序展開 `a/b/c/d/e`，點 `leaf.txt` | 每層各有一行 `WS_TREE_PAGE`；顯示 `deepest` |
 | R29 | 看 `nested` 和 `.hidden` | `nested` 是資料夾列，可以展開；它只有 `.git`，所以展開後是空的（`WS_TREE_PAGE: rel=nested … children=0`）；`.hidden` 有列出，可以預覽 |
 
@@ -253,7 +254,7 @@ R34 之前，先重新開回 `edge`（R15 的步驟）。
 |---|---|---|
 | R34 | `ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 樹重新讀取；出現 `ws-tree-row:new.txt`，預覽顯示 `fresh-1` |
 | R35 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2`，不是快取的舊內容 |
-| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | `ws-tree-row:new.txt` 出現 `CTRL_GONE` |
+| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | `ws-tree-row:new.txt` 出現 `CTRL_GONE`；R35 開著的 `new.txt` 預覽重新讀取，改顯示錯誤，不再是 `fresh-2` |
 | R37 | 停掉 worker：`ssh ubuntu "kill \$(cat '$W/worker.pid')"`，在 App 點一個沒預覽過的檔案 | 失敗格；`PREVIEW_LOADING` 之後 10 秒內出現錯誤（master 連線逾時 2 秒、讀取 5 秒）；這段時間 App 沒有凍結（可以捲動、可以開選單）；接著按 Cmd+Shift+W 關掉工作區，要在 8 秒內完成 |
 | R38 | `start_worker wcfg "$W/edge" /home/audichuang/research/rtk`；確認指紋和第一次一樣；在 App 選單點 `remote-worker:0`，開 `edge`，點一個檔案 | 不需要重新配對；`REMOTE_WORKSPACES: count=2`、`REMOTE_OPENED`、`PREVIEW_LOADED` |
 | R39 | 取消分享：`start_worker wcfg /home/audichuang/research/rtk`（只分享 rtk）。App 不重開，直接點 `edge` 裡另一個檔案，再開選單點 `remote-worker:0` | 預覽被拒絕（失敗格）；選單只列出 `rtk`（`REMOTE_WORKSPACES: count=1`） |

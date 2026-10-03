@@ -832,6 +832,11 @@ impl WorkbenchModel {
 					this.open_left_menu(items, ev, w, cx);
 				}),
 			)
+			.when(!is_valid_utf8, |d| {
+				d.on_click(cx.listener(|this, _, _, cx| {
+					this.refuse_unaddressable_row(cx)
+				}))
+			})
 			.when(is_valid_utf8, |d| {
 				d.on_click(cx.listener(
 					move |this, ev: &gpui::ClickEvent, _, cx| {
