@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
 use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
 use crate::paths::{
-	escapes_all_roots, resolve_delete_target, resolve_write_target,
-	RejectReason,
+	escapes_all_roots, has_git_segment, resolve_delete_target,
+	resolve_write_target, RejectReason,
 };
 
 /// One file from the payload; `parse_clipboard` produces these.
@@ -155,6 +155,12 @@ pub fn plan_restore<P: AsRef<Path>>(
 			reason,
 		};
 
+		if has_git_segment(&entry.path) {
+			plan.skipped_operations
+				.push(skip(None, SkipReason::UnresolvedPath));
+			continue;
+		}
+
 		if entry.change_types.contains(&ChangeType::Deleted) {
 			match resolve_delete_target(roots, &entry.path) {
 				Ok(t) => plan.delete_operations.push(DeleteOperation {
@@ -200,6 +206,12 @@ pub fn plan_restore<P: AsRef<Path>>(
 				continue;
 			}
 		};
+
+		if has_git_segment(&t.relative_path) {
+			plan.skipped_operations
+				.push(skip(None, SkipReason::UnresolvedPath));
+			continue;
+		}
 
 		if must_not_overwrite(&t.absolute_path) {
 			plan.skipped_operations
@@ -263,7 +275,9 @@ pub fn execute_restore_plan(
 		}
 		// A symlink appearing between plan and execute must not turn a
 		// contained target into one outside the workspace.
-		if escapes_all_roots(&plan.roots, &op.absolute_path) {
+		if escapes_all_roots(&plan.roots, &op.absolute_path)
+			|| has_git_segment(&op.relative_path)
+		{
 			result
 				.errors
 				.push(format!("{}: unsafe path", op.relative_path));
@@ -293,7 +307,9 @@ fn run_create(
 	selection: &RestoreSelection,
 	op: &CreateOperation,
 ) -> Result<CreateOutcome, String> {
-	if escapes_all_roots(roots, &op.absolute_path) {
+	if escapes_all_roots(roots, &op.absolute_path)
+		|| has_git_segment(&op.relative_path)
+	{
 		return Err(format!("{}: unsafe path", op.relative_path));
 	}
 	if must_not_overwrite(&op.absolute_path) {
@@ -1217,5 +1233,93 @@ mod tests {
 		assert!(!is_relative("/abs"));
 		assert!(!is_relative("C:/x"));
 		assert!(!is_relative("\\\\server\\x"));
+	}
+
+	#[test]
+	fn plan_restore_refuses_git_path_segments() {
+		let (_d, root) = tmp();
+		let entries = vec![
+			entry(".git/config", "hacked"),
+			entry("sub/.git/hooks/pre-commit", "hacked"),
+			entry(".GIT/config", "hacked"),
+			entry(".gitignore", "valid"),
+			entry(".github/workflow.yml", "valid"),
+			entry("foo.git/file", "valid"),
+		];
+
+		let plan = plan_restore(&[&root], &entries);
+
+		assert_eq!(plan.skipped_operations.len(), 3);
+		assert_eq!(plan.skipped_operations[0].raw_path, ".git/config");
+		assert_eq!(
+			plan.skipped_operations[0].reason,
+			SkipReason::UnresolvedPath
+		);
+		assert_eq!(
+			plan.skipped_operations[1].raw_path,
+			"sub/.git/hooks/pre-commit"
+		);
+		assert_eq!(
+			plan.skipped_operations[1].reason,
+			SkipReason::UnresolvedPath
+		);
+		assert_eq!(plan.skipped_operations[2].raw_path, ".GIT/config");
+		assert_eq!(
+			plan.skipped_operations[2].reason,
+			SkipReason::UnresolvedPath
+		);
+
+		assert_eq!(plan.create_operations.len(), 3);
+		assert_eq!(plan.create_operations[0].relative_path, ".gitignore");
+		assert_eq!(
+			plan.create_operations[1].relative_path,
+			".github/workflow.yml"
+		);
+		assert_eq!(plan.create_operations[2].relative_path, "foo.git/file");
+	}
+
+	#[test]
+	fn plan_restore_refuses_git_path_segments_on_delete() {
+		let (_d, root) = tmp();
+		let mut del_entry = entry(".git/config", "");
+		del_entry.change_types = BTreeSet::from([ChangeType::Deleted]);
+		let mut del_sub = entry("sub/.git/hooks", "");
+		del_sub.change_types = BTreeSet::from([ChangeType::Deleted]);
+		let mut del_caps = entry(".GIT/config", "");
+		del_caps.change_types = BTreeSet::from([ChangeType::Deleted]);
+
+		let plan = plan_restore(&[&root], &[del_entry, del_sub, del_caps]);
+		assert_eq!(plan.delete_operations.len(), 0);
+		assert_eq!(plan.skipped_operations.len(), 3);
+		for op in &plan.skipped_operations {
+			assert_eq!(op.reason, SkipReason::UnresolvedPath);
+		}
+	}
+
+	#[test]
+	fn execute_restore_plan_guards_against_git_path_segments() {
+		let (_d, root) = tmp();
+		let op = CreateOperation {
+			relative_path: ".git/config".to_string(),
+			absolute_path: root.join(".git/config"),
+			content: "evil".to_string(),
+			existed: false,
+			root_path: root.clone(),
+		};
+		let plan = RestorePlan {
+			roots: vec![root.clone()],
+			create_operations: vec![op],
+			delete_operations: vec![DeleteOperation {
+				relative_path: ".git/config".to_string(),
+				absolute_path: root.join(".git/config"),
+			}],
+			skipped_operations: vec![],
+		};
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert_eq!(result.created_count, 0);
+		assert_eq!(result.deleted_count, 0);
+		assert_eq!(result.errors.len(), 2);
+		assert!(result.errors[0].contains(".git/config: unsafe path"));
+		assert!(result.errors[1].contains(".git/config: unsafe path"));
 	}
 }

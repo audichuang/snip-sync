@@ -2324,6 +2324,73 @@ mod tests {
 	}
 
 	#[test]
+	fn commits_git_path_and_old_path_are_skipped_as_unsafe_path() {
+		let dst = Repo::new("main");
+		dst.write("a.txt", b"a\n");
+		dst.commit("root", "2019-01-01T00:00:00+00:00");
+		let git_config = dst.path().join(".git").join("config");
+		assert!(git_config.exists());
+		let original_config = fs::read(&git_config).unwrap();
+
+		let file = |path: &str, old_path: Option<&str>, change: FileChange| {
+			CommitFile {
+				path: path.into(),
+				old_path: old_path.map(str::to_string),
+				change,
+				content: Some("data\n".into()),
+				not_copied: None,
+			}
+		};
+		let record = |msg: &str, files| CommitRecord {
+			message: msg.into(),
+			author_name: "Bob".into(),
+			author_email: "bob@example.com".into(),
+			author_date: "2020-01-01T00:00:00+00:00".into(),
+			files,
+		};
+		let payload = CommitsPayload {
+			commits: vec![record(
+				"git paths\n",
+				vec![
+					file(".git/evil.txt", None, FileChange::Added),
+					file("dest.txt", Some(".git/config"), FileChange::Renamed),
+					file("safe.txt", None, FileChange::Added),
+				],
+			)],
+		};
+
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		let skips: Vec<_> = plan.commits[0]
+			.files
+			.iter()
+			.map(|f| f.skip_reason)
+			.collect();
+		assert_eq!(
+			skips,
+			vec![
+				Some(ReplaySkipReason::UnsafePath),
+				Some(ReplaySkipReason::UnsafePath),
+				None,
+			]
+		);
+
+		let result = replay(&g, &payload);
+		assert_eq!(result.created.len(), 1);
+		assert_eq!(result.failure, None);
+
+		// Nothing is written or removed under .git
+		assert!(!dst.path().join(".git").join("evil.txt").exists());
+		assert!(git_config.exists());
+		assert_eq!(fs::read(&git_config).unwrap(), original_config);
+
+		// Safe file is committed
+		let tree =
+			dst.git(&["ls-tree", "-r", "--name-only", &result.created[0]]);
+		assert_eq!(tree, "a.txt\nsafe.txt");
+	}
+
+	#[test]
 	fn commit_plan_detects_layout_conflicts_and_distinguishes_path_unsafe() {
 		let dst = Repo::new("main");
 		dst.write("blocker_file", b"regular file\n");

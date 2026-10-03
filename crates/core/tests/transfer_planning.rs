@@ -36,6 +36,7 @@ use snip_core::copy;
 use snip_core::format::{self, ChangeType};
 use snip_core::gitrun::{CancelToken, RunOptions};
 use snip_core::gitsrc::{self, Git, GitSource};
+use snip_core::paths;
 use snip_core::restore::{
 	self, RestoreBase, RestoreBaseSuggestion, RestoreSelection, SkipReason,
 };
@@ -1106,10 +1107,25 @@ content 2
 	)
 	.unwrap_err();
 
-	match err {
+	match &err {
 		TransferError::TargetCollision { path, msg } => {
-			assert_eq!(path, dst.canonical_id().path().join("target.txt"));
-			assert!(msg.contains("multiple operations target"));
+			assert_eq!(path, &dst.canonical_id().path().join("target.txt"));
+			assert_eq!(
+				msg,
+				"previous was 'create target.txt', current is 'create target.txt'"
+			);
+			let full = err.to_string();
+			assert_eq!(
+				full.matches(&path.display().to_string()).count(),
+				1,
+				"path should appear once, got: {full}"
+			);
+			assert!(
+				!full.contains("identity"),
+				"identity should not appear, got: {full}"
+			);
+			assert!(full.contains("previous was 'create target.txt'"));
+			assert!(full.contains("current is 'create target.txt'"));
 		}
 		other => panic!("expected TargetCollision, got {other:?}"),
 	}
@@ -1131,15 +1147,137 @@ content 2
 		)
 		.unwrap_err();
 
-		match err_symlink {
+		match &err_symlink {
 			TransferError::TargetCollision { path, msg } => {
-				assert_eq!(path, dst.canonical_id().path().join("target.txt"));
-				assert!(msg.contains("multiple operations target"));
+				assert_eq!(path, &dst.canonical_id().path().join("target.txt"));
+				assert_eq!(
+					msg,
+					"previous was 'create target.txt', current is 'create target.txt'"
+				);
+				let full = err_symlink.to_string();
+				assert_eq!(
+					full.matches(&path.display().to_string()).count(),
+					1,
+					"path should appear once, got: {full}"
+				);
+				assert!(
+					!full.contains("identity"),
+					"identity should not appear, got: {full}"
+				);
+				assert!(full.contains("previous was 'create target.txt'"));
+				assert!(full.contains("current is 'create target.txt'"));
 			}
 			other => panic!("expected TargetCollision, got {other:?}"),
 		}
 		assert!(!dst.canonical_id().path().join("target.txt").exists());
 	}
+}
+
+#[test]
+fn test_paste_destination_not_regular_refuses_overwrite() {
+	let dst = TestRepo::new("destination-not-regular");
+	let build_dir = dst.path().join("build");
+	fs::create_dir_all(&build_dir).unwrap();
+
+	let clipboard_text = "\
+// file: build
+content
+";
+	let mapping = ImportMapping::with_primary(dst.canonical_id());
+	let err = plan_import(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		&[dst.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap_err();
+
+	let msg = err.paste_message();
+	assert!(
+		msg.contains("refuses to overwrite"),
+		"expected paste message to contain 'refuses to overwrite', got: {msg}"
+	);
+	assert!(
+		!msg.contains("exported"),
+		"expected paste message not to contain 'exported', got: {msg}"
+	);
+	let disp = err.to_string();
+	assert!(
+		disp.contains("refuses to overwrite"),
+		"expected display to contain 'refuses to overwrite', got: {disp}"
+	);
+	assert!(
+		!disp.contains("exported"),
+		"expected display not to contain 'exported', got: {disp}"
+	);
+}
+
+#[test]
+fn test_plan_import_refuses_git_path_segment() {
+	let repo = TestRepo::new("refuse-git-import");
+	let git_dir = repo.path().join(".git");
+	fs::create_dir_all(&git_dir).unwrap();
+	let config_file = git_dir.join("config");
+	fs::write(&config_file, "[core]\n\trepo = test\n").unwrap();
+
+	let clipboard_text = "\
+// file: .git/config
+[core]
+\trepo = hacked
+// file: sub/.git/hooks/pre-commit
+evil
+// file: .GIT/config
+[core]
+\trepo = hacked_caps
+// file: .gitignore
+target/
+";
+
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+	let import_plan = plan_import_with(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+		&RunOptions::default(),
+	)
+	.unwrap();
+
+	let restore_plan = import_plan.restore_plan();
+
+	let skipped_git: Vec<_> = restore_plan
+		.skipped_operations
+		.iter()
+		.filter(|op| paths::has_git_segment(&op.raw_path))
+		.collect();
+	assert_eq!(skipped_git.len(), 3);
+	for op in skipped_git {
+		assert_eq!(op.reason, SkipReason::UnresolvedPath);
+	}
+
+	assert_eq!(restore_plan.create_operations.len(), 1);
+	assert_eq!(
+		restore_plan.create_operations[0].relative_path,
+		".gitignore"
+	);
+
+	let res = import_plan
+		.apply(&RestoreSelection {
+			overwrite_existing: true,
+			..Default::default()
+		})
+		.unwrap();
+
+	assert_eq!(res.created_count, 1);
+	assert_eq!(
+		fs::read_to_string(repo.path().join(".gitignore")).unwrap(),
+		"target/"
+	);
+	assert_eq!(
+		fs::read_to_string(&config_file).unwrap(),
+		"[core]\n\trepo = test\n"
+	);
+	assert!(!repo.path().join("sub/.git/hooks/pre-commit").exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,10 +2495,29 @@ second content
 		)
 		.unwrap_err();
 
-		match err {
+		match &err {
 			TransferError::TargetCollision { path, msg } => {
 				assert!(path.to_string_lossy().contains("target.txt"));
-				assert!(msg.contains("multiple operations target"));
+				assert_eq!(
+					msg,
+					"previous was 'create real_dir/target.txt', current is 'create link_dir/target.txt'"
+				);
+				let full = err.to_string();
+				assert_eq!(
+					full.matches(&path.display().to_string()).count(),
+					1,
+					"path should appear once, got: {full}"
+				);
+				assert!(
+					!full.contains("identity"),
+					"identity should not appear, got: {full}"
+				);
+				assert!(
+					full.contains("previous was 'create real_dir/target.txt'")
+				);
+				assert!(
+					full.contains("current is 'create link_dir/target.txt'")
+				);
 			}
 			other => panic!("expected TargetCollision, got: {other:?}"),
 		}
@@ -6643,4 +6800,104 @@ fn test_oversize_binary_and_budget_handling_in_file_mode() {
 		}
 		other => panic!("expected PayloadLimitExceeded, got: {other:?}"),
 	}
+}
+
+#[test]
+fn destination_root_under_git_ancestor_plans_and_pastes_normally() {
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join(".git").join("work");
+	fs::create_dir_all(root.join("src")).unwrap();
+	let root_canon = dunce::canonicalize(&root).unwrap_or(root.clone());
+	let root_id = CanonicalRootId::new(&root_canon).unwrap();
+
+	// resolve_write_target accepts normal file, rejects .git/config
+	let write_target = paths::resolve_write_target(&[&root_canon], "src/a.txt");
+	assert!(write_target.is_ok());
+
+	let git_target = paths::resolve_write_target(&[&root_canon], ".git/config");
+	assert!(git_target.is_err());
+
+	// resolve_delete_target accepts normal existing file under such a root
+	fs::write(root_canon.join("src/existing.txt"), "delete me\n").unwrap();
+	let del_target =
+		paths::resolve_delete_target(&[&root_canon], "src/existing.txt");
+	assert!(del_target.is_ok());
+
+	let clipboard_text = "\
+// file: src/a.txt
+normal content
+// file: .git/config
+evil git config
+";
+	let mapping = ImportMapping::with_primary(root_id);
+	let import_plan = plan_import_with(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		std::slice::from_ref(&root_canon),
+		&mapping,
+		&RunOptions::default(),
+	)
+	.expect("plan_import_with should succeed");
+
+	let restore_plan = import_plan.restore_plan();
+	assert_eq!(restore_plan.create_operations.len(), 1);
+	assert_eq!(restore_plan.create_operations[0].relative_path, "src/a.txt");
+
+	let skipped = &restore_plan.skipped_operations;
+	assert_eq!(skipped.len(), 1);
+	assert_eq!(skipped[0].raw_path, ".git/config");
+	assert_eq!(skipped[0].reason, SkipReason::UnresolvedPath);
+
+	let res = import_plan
+		.apply(&RestoreSelection::default())
+		.expect("apply should succeed");
+	assert_eq!(res.created_count, 1);
+	assert_eq!(
+		fs::read_to_string(root_canon.join("src/a.txt")).unwrap(),
+		"normal content"
+	);
+	assert!(!root_canon.join(".git/config").exists());
+}
+
+#[test]
+fn import_refuses_deleted_git_file_and_leaves_it_intact() {
+	let repo = TestRepo::new("dst");
+	let git_config = repo.path().join(".git").join("config");
+	let git_head = repo.path().join(".git").join("HEAD");
+	assert!(git_config.exists());
+	assert!(git_head.exists());
+	let original_config = fs::read(&git_config).unwrap();
+	let original_head = fs::read(&git_head).unwrap();
+
+	let clipboard_text = "\
+// file: [DELETED] .git/config
+// file: [DELETED] .git/HEAD
+";
+	let mapping = ImportMapping::with_primary(repo.canonical_id());
+	let import_plan = plan_import_with(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		&[repo.path().to_path_buf()],
+		&mapping,
+		&RunOptions::default(),
+	)
+	.expect("plan_import_with should succeed");
+
+	let restore_plan = import_plan.restore_plan();
+	// Plan has no delete op for .git files
+	assert!(restore_plan.delete_operations.is_empty());
+	assert_eq!(restore_plan.skipped_operations.len(), 2);
+	for op in &restore_plan.skipped_operations {
+		assert_eq!(op.reason, SkipReason::UnresolvedPath);
+	}
+
+	// After executing nothing is removed
+	let res = import_plan
+		.apply(&RestoreSelection::default())
+		.expect("apply should succeed");
+	assert_eq!(res.deleted_count, 0);
+	assert!(git_config.exists());
+	assert!(git_head.exists());
+	assert_eq!(fs::read(&git_config).unwrap(), original_config);
+	assert_eq!(fs::read(&git_head).unwrap(), original_head);
 }
