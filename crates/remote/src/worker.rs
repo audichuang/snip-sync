@@ -109,6 +109,8 @@ struct State {
 	connections: Arc<AtomicUsize>,
 	waiting: AtomicUsize,
 	stop: AtomicBool,
+	#[cfg(test)]
+	set_roots_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 pub(crate) struct ConnSlot(Arc<AtomicUsize>);
@@ -161,6 +163,8 @@ impl Worker {
 			connections: Arc::new(AtomicUsize::new(0)),
 			waiting: AtomicUsize::new(0),
 			stop: AtomicBool::new(false),
+			#[cfg(test)]
+			set_roots_hook: Mutex::new(None),
 		});
 		let accept_state = state.clone();
 		let accept = std::thread::Builder::new()
@@ -239,6 +243,10 @@ impl Worker {
 		// Swapping roots first ensures that jobs admitted after the swap fail
 		// get_shared_root; jobs admitted before are already in by_workspace and
 		// get cancelled here before repo_cache is cleared.
+		#[cfg(test)]
+		if let Some(hook) = lock(&self.state.set_roots_hook).as_ref() {
+			hook();
+		}
 		if !removed.is_empty() {
 			self.state.jobs.cancel_workspaces(&removed);
 		}
@@ -970,8 +978,33 @@ mod tests {
 		);
 		assert!(lock(&worker.state.repo_cache).get(&ws_id, "repo").is_some());
 
+		let hook_runs = Arc::new(AtomicUsize::new(0));
+		let hook_runs_in_hook = hook_runs.clone();
+		let hook_state = worker.state.clone();
+		let hook_ws_id = ws_id.clone();
+		let hook_cancel = cancel.clone();
+		*lock(&worker.state.set_roots_hook) = Some(Box::new(move || {
+			hook_runs_in_hook.fetch_add(1, Ordering::SeqCst);
+			// Security ordering property: the roots swap must be visible to
+			// requests arriving during teardown before existing jobs are cancelled.
+			assert!(
+				hook_state.get_shared_root(&hook_ws_id).is_err(),
+				"roots swap must be visible before cancel_workspaces runs"
+			);
+			assert!(
+				!hook_cancel.is_cancelled(),
+				"job must not be cancelled before cancel_workspaces runs"
+			);
+		}));
+
 		let errs = worker.set_roots(&[]);
 		assert!(errs.is_empty());
+
+		assert_eq!(
+			hook_runs.load(Ordering::SeqCst),
+			1,
+			"ordering verification hook must run exactly once during root removal"
+		);
 
 		assert!(
 			cancel.is_cancelled(),
