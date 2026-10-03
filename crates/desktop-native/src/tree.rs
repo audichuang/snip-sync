@@ -1848,29 +1848,30 @@ mod tests {
 	/// of a folder must raise that cap too, or the click changes nothing.
 	#[test]
 	fn reveal_more_rows_reaches_past_the_view_cap() {
-		let dir = tempfile::tempdir().unwrap();
-		let root = dir.path();
-		fs::create_dir(root.join("many")).unwrap();
-		for n in 0..700 {
-			fs::write(root.join(format!("many/f{n:03}")), b"x").unwrap();
-		}
-		fs::write(root.join("z-last.txt"), b"z").unwrap();
-		let mut tree = FileTreeNode::new_root(root);
-		tree.toggle_expand("many", root);
-		while let Some(more) = tree
-			.flatten_visible(tree.visible_limit())
-			.into_iter()
-			.find(|row| row.is_more_marker)
-		{
-			drive(
-				&mut tree,
-				command_for_row(&more, RowGesture::Primary).unwrap(),
-			);
-		}
 		// A worker returns a folder in one listing, so its window stays at
 		// one page however many names arrived.
-		let many = tree.children.iter_mut().find(|c| c.name == "many").unwrap();
-		many.row_window = DIR_PAGE_ROWS;
+		fn listed(tree: &mut FileTreeNode, key: NodeKey, names: &[&str]) {
+			let TreeEffect::Io(io) = tree.start(TreeCommand::Expand(key))
+			else {
+				panic!("expanding a folder starts a listing");
+			};
+			let children = names
+				.iter()
+				.map(|name| ListedChild {
+					name: name.to_string(),
+					utf8: true,
+					directory: *name == "many",
+					nested_repo: false,
+				})
+				.collect();
+			tree.apply_io_result(listed_tree_result(io, Ok((children, false))));
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let mut tree = FileTreeNode::unloaded_root(dir.path());
+		listed(&mut tree, NodeKey::root(), &["many", "z-last.txt"]);
+		let files: Vec<String> = (0..700).map(|n| format!("f{n:03}")).collect();
+		let files: Vec<&str> = files.iter().map(String::as_str).collect();
+		listed(&mut tree, NodeKey::from_utf8_rel("many"), &files);
 		let rows =
 			|tree: &FileTreeNode| tree.flatten_visible(tree.visible_limit());
 		assert_eq!(rows(&tree).len(), MAX_VISIBLE_ROWS);
