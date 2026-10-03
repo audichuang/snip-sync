@@ -3436,6 +3436,12 @@ impl WorkbenchModel {
 	}
 
 	pub fn log_repo_name(&self, root: &std::path::Path) -> String {
+		// A remote root is an internal key, not a path to show.
+		if let Some(session) =
+			self.remote.session.as_ref().filter(|s| s.root == root)
+		{
+			return session.label();
+		}
 		self.repos
 			.iter()
 			.find(|r| r.root == root)
