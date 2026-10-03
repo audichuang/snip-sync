@@ -1342,7 +1342,8 @@ impl PastePreviewPlan {
 						);
 					}
 				}
-				self.error = Some(Msg::new("paste_err_plan", [e.to_string()]));
+				self.error =
+					Some(Msg::new("paste_err_plan", [e.paste_message()]));
 				return Ok(());
 			}
 		};

@@ -1164,6 +1164,10 @@ pub struct WorkbenchModel {
 	pub e2e_export_hold: Option<PathBuf>,
 	pub workspace_open: bool,
 	pub workspace_menu: bool,
+	/// Where the workspace menu button was drawn: a press there toggles the
+	/// menu, so the menu's outside-press close must leave it alone.
+	pub workspace_menu_button:
+		std::rc::Rc<std::cell::Cell<Option<Bounds<gpui::Pixels>>>>,
 	pub workspace_picker: bool,
 	pub workspace_path_input: Entity<TextInput>,
 	/// Remembered workspaces, newest first.
@@ -1366,11 +1370,13 @@ impl WorkbenchModel {
 		});
 		cx.subscribe(
 			&workspace_path_input,
-			|this, input, ev: &InputEvent, cx| {
-				if matches!(ev, InputEvent::Submit) {
+			|this, input, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => {
 					let text = input.read(cx).text().trim().to_string();
 					this.confirm_open_workspace(&text, cx);
 				}
+				InputEvent::Dismiss => this.close_workspace_menu(cx),
+				_ => {}
 			},
 		)
 		.detach();
@@ -1381,10 +1387,10 @@ impl WorkbenchModel {
 			TextInput::new(i18n::t("remote_code_placeholder", loc), 72, cx)
 		});
 		for input in [&remote_addr_input, &remote_code_input] {
-			cx.subscribe(input, |this, _, ev: &InputEvent, cx| {
-				if matches!(ev, InputEvent::Submit) {
-					this.pair_remote_worker(cx);
-				}
+			cx.subscribe(input, |this, _, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => this.pair_remote_worker(cx),
+				InputEvent::Dismiss => this.close_workspace_menu(cx),
+				_ => {}
 			})
 			.detach();
 		}
@@ -1544,6 +1550,7 @@ impl WorkbenchModel {
 			e2e_export_hold: ui::e2e_export_hold(),
 			workspace_open: workspace.is_some(),
 			workspace_menu: false,
+			workspace_menu_button: Default::default(),
 			workspace_picker: false,
 			workspace_path_input,
 			recent_workspaces: recent::load(),
@@ -1797,6 +1804,14 @@ impl WorkbenchModel {
 		}
 		self.install_slot_changes(slot, result);
 		self.sync_list_row();
+	}
+
+	/// A tree row whose name is not UTF-8 cannot be addressed: say so, so
+	/// the click is not silently ignored while the old preview stays.
+	pub fn refuse_unaddressable_row(&mut self, cx: &mut Context<Self>) {
+		app_log!("[APP:TREE_ROW_REFUSED: not-utf8]");
+		self.set_status("tree_name_not_utf8", []);
+		cx.notify();
 	}
 
 	pub fn set_status(
@@ -2682,6 +2697,13 @@ impl WorkbenchModel {
 		}
 		self.set_status("workspace_opening", [path.display().to_string()]);
 		self.reload_repos(cx);
+	}
+
+	/// Escape in one of its fields, or a press outside it.
+	pub fn close_workspace_menu(&mut self, cx: &mut Context<Self>) {
+		self.workspace_menu = false;
+		self.workspace_picker = false;
+		cx.notify();
 	}
 
 	pub fn toggle_workspace_menu(&mut self, cx: &mut Context<Self>) {
@@ -6309,6 +6331,13 @@ mod tests {
 			fs::create_dir_all(shared.join("src")).unwrap();
 			fs::write(shared.join("src/main.rs"), "fn main() {}\n").unwrap();
 			fs::write(shared.join("README.md"), "# remote\n").unwrap();
+			// A folder symlink inside the share is a folder in the tree.
+			#[cfg(unix)]
+			std::os::unix::fs::symlink(
+				shared.join("src"),
+				shared.join("zz-link"),
+			)
+			.unwrap();
 			let id = snip_remote::Identity::generate().unwrap();
 			let worker = snip_remote::Worker::start(
 				"127.0.0.1:0".parse().unwrap(),
@@ -6384,8 +6413,35 @@ mod tests {
 				assert!(tree.is_loaded, "root listed: {tree:?}");
 				let names: Vec<_> =
 					tree.children.iter().map(|c| c.name.as_str()).collect();
+				#[cfg(unix)]
+				assert_eq!(names, ["src", "zz-link", "README.md"]);
+				#[cfg(not(unix))]
 				assert_eq!(names, ["src", "README.md"]);
 			});
+
+			#[cfg(unix)]
+			{
+				model.update(cx, |m, cx| {
+					m.dispatch_ws_tree(
+						Some(TreeCommand::Expand(NodeKey::from_utf8_rel(
+							"zz-link",
+						))),
+						cx,
+					);
+				});
+				settle(cx);
+				model.read_with(cx, |m, _| {
+					let tree = m.ws_tree.as_ref().unwrap();
+					let link = &tree.children[1];
+					assert!(link.is_dir && link.is_loaded, "link: {link:?}");
+					let names: Vec<_> = link
+						.children
+						.iter()
+						.map(|c| c.rel_path.as_str())
+						.collect();
+					assert_eq!(names, ["zz-link/main.rs"]);
+				});
+			}
 
 			model.update(cx, |m, cx| {
 				m.dispatch_ws_tree(
@@ -6407,9 +6463,46 @@ mod tests {
 				let p = m.preview.as_ref().expect("remote preview");
 				assert_eq!(&*p.text, "fn main() {}\n");
 				assert_eq!(m.preview_error, None);
+				// The breadcrumb names the worker, never the internal root.
+				let root = m.ws_root().unwrap();
+				assert_eq!(m.log_repo_name(&root), "win-worker ▸ shared");
 				// Copy and paste stay local; a remote workspace refuses them.
 				m.trigger_paste_preview(cx);
 				assert_eq!(m.status.key, "remote_unsupported");
+			});
+
+			// Refresh re-reads the open file: deleted on the worker, it shows
+			// an error, not its old text.
+			model.update(cx, |m, cx| {
+				let root = m.ws_root();
+				m.select_file_in(root, "README.md", SourceKind::File, cx);
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("README preview");
+				assert_eq!(&*p.text, "# remote\n");
+			});
+			fs::remove_file(shared.join("README.md")).unwrap();
+			model.update(cx, |m, cx| m.reload_repos(cx));
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.preview_error.is_some(),
+					"deleted file shown as error"
+				);
+				assert!(
+					m.preview.as_ref().is_none_or(|p| &*p.text != "# remote\n"),
+					"old text left in place"
+				);
+				let tree = m.ws_tree.as_ref().unwrap();
+				assert!(tree.children.iter().all(|c| c.name != "README.md"));
+			});
+			fs::write(shared.join("README.md"), "# remote\n").unwrap();
+
+			// A name that is not UTF-8 cannot be opened; the click says so.
+			model.update(cx, |m, cx| m.refuse_unaddressable_row(cx));
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "tree_name_not_utf8");
 			});
 
 			// The worker unshares the folder: the next read is refused.
@@ -6421,6 +6514,75 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.preview_error.is_some(), "refused read shown");
+			});
+
+			// Forgetting the worker closes its open workspace: the trust is
+			// gone, so the session must not keep reading.
+			model.update(cx, |m, cx| {
+				m.forget_remote_worker(0, cx);
+				if m.remote.session.is_some() {
+					assert_eq!(m.lifecycle.intent_name(), "close-workspace");
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now(),
+						crate::lifecycle::GitLoad::idle(),
+					);
+					assert!(
+						matches!(
+							step,
+							crate::lifecycle::Step::Ready(
+								crate::lifecycle::Intent::CloseWorkspace
+							)
+						),
+						"drain not ready: {step:?}"
+					);
+					m.finish_close(cx);
+				}
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.remote.workers.is_empty());
+				assert!(m.remote.session.is_none(), "session closed");
+				assert!(!m.workspace_open && m.ws_tree.is_none());
+			});
+		}
+
+		/// The workspace menu closes on Escape in the pairing form and on a
+		/// second press of its own button, as a popup menu should.
+		#[gpui::test]
+		fn workspace_menu_closes_on_escape_and_on_its_button(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			model.update(cx, |m, cx| {
+				m.toggle_workspace_menu(cx);
+				m.show_remote_pairing(cx);
+			});
+			settle(cx);
+			let addr = model.read_with(cx, |m, cx| {
+				assert!(m.workspace_menu);
+				m.remote_addr_input.read(cx).handle()
+			});
+			assert!(
+				cx.update(|window, _| addr.is_focused(window)),
+				"the address field has the focus"
+			);
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_menu, "Escape in the pairing form");
+			});
+
+			model.update(cx, |m, cx| m.toggle_workspace_menu(cx));
+			settle(cx);
+			let button = cx
+				.debug_bounds("btn-workspace-menu")
+				.expect("menu button drawn");
+			cx.simulate_click(button.center(), gpui::Modifiers::none());
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_menu, "second press of the button");
 			});
 		}
 

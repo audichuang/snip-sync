@@ -1186,7 +1186,9 @@ impl WorkbenchModel {
 					"open" => Some(RowGesture::Primary),
 					_ => None,
 				};
-				if let Some(gesture) = gesture {
+				if action == "open" && !r.is_valid_utf8 && !r.is_error {
+					self.refuse_unaddressable_row(cx);
+				} else if let Some(gesture) = gesture {
 					let cmd = command_for_row(r, gesture);
 					if ws {
 						self.dispatch_ws_tree(cmd, cx);

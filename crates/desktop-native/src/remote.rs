@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use snip_core::browser::SourcePreview;
+use snip_core::transfer::SourceKind;
 use snip_remote::{
 	Client, Identity, PairedWorker, RemoteError, RemoteWorkspace, Worker,
 	WorkerOptions, WorkerStore, TRUSTED_FILE, WORKERS_FILE,
@@ -43,11 +44,11 @@ pub struct WorkerCli {
 pub use snip_remote::device_name;
 
 /// The device identity, kept in the config folder; in memory only when
-/// there is none (an e2e run without `SNIP_CONFIG_DIR`).
+/// there is none (a test, or an e2e run without `SNIP_CONFIG_DIR`).
 pub fn identity() -> Result<Arc<Identity>, String> {
 	static ID: OnceLock<Result<Arc<Identity>, String>> = OnceLock::new();
 	ID.get_or_init(|| {
-		let id = match config_dir() {
+		let id = match crate::recent::config_dir() {
 			Some(dir) => Identity::load_or_create(&dir),
 			None => Identity::generate(),
 		};
@@ -56,16 +57,8 @@ pub fn identity() -> Result<Arc<Identity>, String> {
 	.clone()
 }
 
-/// In-process tests never touch the user's pairings.
-fn config_dir() -> Option<PathBuf> {
-	if cfg!(test) {
-		return None;
-	}
-	crate::recent::config_dir()
-}
-
 fn config_file(name: &str) -> Option<PathBuf> {
-	config_dir().map(|dir| dir.join(name))
+	crate::recent::config_dir().map(|dir| dir.join(name))
 }
 
 fn worker_store() -> Option<WorkerStore> {
@@ -204,7 +197,7 @@ pub fn run_headless(cli: &WorkerCli) -> ! {
 	let Err(err) = snip_remote::run_headless_worker(
 		listen,
 		&cli.shares,
-		config_dir().as_deref(),
+		crate::recent::config_dir().as_deref(),
 	);
 	eprintln!("Error: cannot start the worker: {err}");
 	std::process::exit(1);
@@ -344,6 +337,25 @@ fn apply_pairing(
 			});
 			workers.insert(0, worker);
 			Ok(0)
+		}
+	}
+}
+
+fn apply_forget(
+	store: Option<&WorkerStore>,
+	workers: &mut Vec<PairedWorker>,
+	fingerprint: &str,
+) -> Result<(), String> {
+	match store {
+		Some(store) => {
+			let res = store.forget(fingerprint);
+			*workers = store.load();
+			res.map(|_| ())
+				.map_err(|e| format!("cannot save pairings: {e}"))
+		}
+		None => {
+			workers.retain(|w| w.fingerprint != fingerprint);
+			Ok(())
 		}
 	}
 }
@@ -517,19 +529,24 @@ impl WorkbenchModel {
 			return;
 		};
 		let fp = worker.fingerprint.clone();
-		if let Some(store) = worker_store() {
-			if let Err(err) = store.forget(&fp) {
-				self.remote_note(
-					false,
-					format!("cannot save pairings: {err}"),
-					cx,
-				);
-			}
-			self.remote.workers = load_workers();
-		} else {
-			self.remote.workers.remove(idx);
+		let store = worker_store();
+		if let Err(err) =
+			apply_forget(store.as_ref(), &mut self.remote.workers, &fp)
+		{
+			self.remote_note(false, err, cx);
 		}
 		self.remote.browse = None;
+		// Its open workspace goes too: the session would keep reading
+		// with a trust the user just withdrew.
+		let open_here = self
+			.remote
+			.session
+			.as_ref()
+			.is_some_and(|s| s.client.worker().fingerprint == fp);
+		if open_here && !self.remote.workers.iter().any(|w| w.fingerprint == fp)
+		{
+			self.request_user_close(lifecycle::Intent::CloseWorkspace, cx);
+		}
 		cx.notify();
 	}
 
@@ -604,6 +621,15 @@ impl WorkbenchModel {
 		};
 		self.ws_tree = Some(FileTreeNode::unloaded_root(&root));
 		self.resume_remote_tree(cx);
+		// Refresh re-reads the open file too: changed text shows, and a file
+		// deleted on the worker shows its error instead of the old text.
+		if self.selected_commit.is_none()
+			&& self.selected_file_source == Some(SourceKind::File)
+		{
+			if let Some(path) = self.selected_file.clone() {
+				self.select_file_in(Some(root), &path, SourceKind::File, cx);
+			}
+		}
 	}
 
 	fn resume_remote_tree(&mut self, cx: &mut Context<Self>) {
@@ -714,5 +740,100 @@ mod tests {
 		assert_eq!(workers.len(), 3);
 		assert_eq!(workers.iter().filter(|w| w.addr == "2.2.2.2:2").count(), 1);
 		assert!(!workers.iter().any(|w| w.fingerprint == "fp2"));
+	}
+
+	#[test]
+	fn apply_forget_store_removes_by_fingerprint_and_persists() {
+		let tmp = tempfile::tempdir().unwrap();
+		let store = WorkerStore::in_config_dir(tmp.path());
+		let w1 = sample_worker("w1", "1.1.1.1:1", "fp1");
+		let w2 = sample_worker("w2", "2.2.2.2:2", "fp2");
+		store.add(w1.clone()).unwrap();
+		store.add(w2.clone()).unwrap();
+
+		let mut workers = store.load();
+		apply_forget(Some(&store), &mut workers, "fp1")
+			.expect("apply_forget should succeed");
+
+		assert_eq!(workers.len(), 1);
+		assert_eq!(workers[0].fingerprint, "fp2");
+
+		let persisted = store.load();
+		assert_eq!(persisted.len(), 1);
+		assert_eq!(persisted[0].fingerprint, "fp2");
+	}
+
+	#[test]
+	fn apply_forget_stale_in_memory_list_preserves_concurrent_addition() {
+		let tmp = tempfile::tempdir().unwrap();
+		let store = WorkerStore::in_config_dir(tmp.path());
+		let w2 = sample_worker("w2", "2.2.2.2:2", "fp2");
+		let w1 = sample_worker("w1", "1.1.1.1:1", "fp1");
+		store.add(w2.clone()).unwrap();
+		store.add(w1.clone()).unwrap();
+
+		// GUI loads [w1, w2]
+		let mut workers = store.load();
+		assert_eq!(workers.len(), 2);
+		assert_eq!(workers[0].fingerprint, "fp1");
+		assert_eq!(workers[1].fingerprint, "fp2");
+
+		// Another process adds w3 at the front
+		let w3 = sample_worker("w3", "3.3.3.3:3", "fp3");
+		store.add(w3.clone()).unwrap();
+
+		// Forget w1 by fingerprint
+		apply_forget(Some(&store), &mut workers, "fp1")
+			.expect("apply_forget should succeed");
+
+		// Must leave exactly w2 and w3 both in memory and on disk
+		assert_eq!(workers.len(), 2);
+		assert!(workers.iter().any(|w| w.fingerprint == "fp2"));
+		assert!(workers.iter().any(|w| w.fingerprint == "fp3"));
+		assert!(!workers.iter().any(|w| w.fingerprint == "fp1"));
+
+		let on_disk = store.load();
+		assert_eq!(on_disk.len(), 2);
+		assert!(on_disk.iter().any(|w| w.fingerprint == "fp2"));
+		assert!(on_disk.iter().any(|w| w.fingerprint == "fp3"));
+		assert!(!on_disk.iter().any(|w| w.fingerprint == "fp1"));
+	}
+
+	#[test]
+	fn apply_forget_none_store_removes_by_fingerprint() {
+		let mut workers = vec![
+			sample_worker("w1", "1.1.1.1:1", "fp1"),
+			sample_worker("w2", "2.2.2.2:2", "fp2"),
+			sample_worker("w3", "3.3.3.3:3", "fp3"),
+		];
+
+		apply_forget(None, &mut workers, "fp2")
+			.expect("apply_forget should succeed");
+		assert_eq!(workers.len(), 2);
+		assert_eq!(workers[0].fingerprint, "fp1");
+		assert_eq!(workers[1].fingerprint, "fp3");
+
+		// Forgetting a non-existent fingerprint is a no-op
+		apply_forget(None, &mut workers, "fp_unknown")
+			.expect("apply_forget should succeed");
+		assert_eq!(workers.len(), 2);
+	}
+
+	#[test]
+	fn apply_forget_unwritable_store_returns_error() {
+		let tmp = tempfile::tempdir().unwrap();
+		let regular_file = tmp.path().join("a_file");
+		std::fs::write(&regular_file, "blocking").unwrap();
+		let bad_path = regular_file.join(WORKERS_FILE);
+		let store = WorkerStore::new(bad_path);
+
+		let mut workers = vec![sample_worker("w1", "1.1.1.1:1", "fp1")];
+
+		let err = apply_forget(Some(&store), &mut workers, "fp1")
+			.expect_err("expected error for unwritable path");
+		assert!(
+			err.contains("cannot save pairings"),
+			"expected error containing 'cannot save pairings', got: {err}"
+		);
 	}
 }

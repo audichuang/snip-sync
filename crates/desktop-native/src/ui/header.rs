@@ -48,6 +48,8 @@ impl WorkbenchModel {
 					70 + ix as isize,
 				)
 				.h(px(38.))
+				// The row clips a long path; hover shows all of it.
+				.tooltip(tip(path.display().to_string()))
 				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.workspace_menu = false;
@@ -96,11 +98,18 @@ impl WorkbenchModel {
 			.border_color(rgb(pal().popup_border))
 			.rounded(px(8.))
 			.shadow_lg()
-			.on_mouse_down_out(cx.listener(|this, _, _, cx| {
-				this.workspace_menu = false;
-				this.workspace_picker = false;
-				cx.notify();
-			}))
+			.on_mouse_down_out(cx.listener(
+				|this, ev: &MouseDownEvent, _, cx| {
+					// The button's own click toggles the menu closed.
+					let on_button = this
+						.workspace_menu_button
+						.get()
+						.is_some_and(|b| b.contains(&ev.position));
+					if !on_button {
+						this.close_workspace_menu(cx);
+					}
+				},
+			))
 			.child(
 				menu_row("btn-open-folder", 60)
 					.on_click(cx.listener(|this, _, _, cx| {
@@ -202,6 +211,7 @@ impl WorkbenchModel {
 			.child(
 				div()
 					.id("btn-workspace-menu")
+					.debug_selector(|| "btn-workspace-menu".into())
 					.relative()
 					.flex()
 					.items_center()
@@ -221,6 +231,17 @@ impl WorkbenchModel {
 						this.toggle_workspace_menu(cx);
 					}))
 					.child(clip_text(label))
+					.child({
+						let slot = self.workspace_menu_button.clone();
+						canvas(
+							move |b, _, _| slot.set(Some(b)),
+							|_, _, _, _| {},
+						)
+						.absolute()
+						.top_0()
+						.left_0()
+						.size_full()
+					})
 					.children(probe(log, "btn-workspace-menu")),
 			)
 			.when(self.workspace_menu, |d| {

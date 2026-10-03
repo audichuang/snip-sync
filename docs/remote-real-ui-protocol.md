@@ -97,12 +97,12 @@ echo 'hidden' > .hidden
 EOF
 ```
 
-這段已在 `b41817f` 上試跑過：Ubuntu 編譯約 20 秒（有快取時），fixture 全部建立成功，`manydir` 有 1200 個檔案。試跑時從 Mac 用 `snip remote` 讀過：`escape.txt` 和 `escape-dir` 都回「Path leaves the workspace」，`target/release/rtk` 回「Preview exceeds 1 MiB」，`exact-1MiB.txt` 完整讀到 1048576 bytes，`.git/HEAD` 讀得到。
+這段已在 `b41817f` 上試跑過：Ubuntu 編譯約 20 秒（有快取時），fixture 全部建立成功，`manydir` 有 1200 個檔案。試跑時從 Mac 用 `snip remote` 讀過：`escape.txt` 和 `escape-dir` 都回「Path leaves the workspace」，`target/release/rtk` 回「Preview exceeds 1 MiB」，`exact-1MiB.txt` 完整讀到 1048576 bytes，`.git/HEAD` 讀得到（專案樹不列 `.git`，但指名路徑仍可讀）。
 
 rtk 的基準（I01 用）：
 
 ```bash
-ssh ubuntu 'cd ~/research/rtk && git rev-parse HEAD && git status --porcelain=v1 -z | sha256sum && find . -newer .git/HEAD -not -path "./.git/*" | wc -l' > "$RUN/rtk-before.txt"
+ssh ubuntu 'cd ~/research/rtk && git rev-parse HEAD && GIT_OPTIONAL_LOCKS=0 git status --porcelain=v1 -z | sha256sum && find . -newer .git/HEAD -not -path "./.git/*" | wc -l' > "$RUN/rtk-before.txt"
 ssh ubuntu "touch '$W/rtk-marker'"
 ```
 
@@ -184,6 +184,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | `[APP:REMOTE_PAIR_FAILED: <訊息>]` | 配對失敗 |
 | `[APP:REMOTE_WORKSPACES: count=N]` | 列出工作區成功（失敗時沒有這行，只在選單顯示紅字） |
 | `[APP:REMOTE_OPENED: <worker> ▸ <工作區> generation=N]` | 開啟遠端工作區 |
+| `[APP:TREE_ROW_REFUSED: not-utf8]` | 點了名稱不是 UTF-8 的列，無法開啟 |
 | `[APP:REMOTE_WORKER: state=…]`、`[APP:REMOTE_PAIRING: state=open]` | 本機當 worker（本規程不測） |
 
 ## 4. 測案
@@ -197,21 +198,21 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | R01 | 點 `btn-workspace-menu` | 有 `btn-remote-pair-new`、`btn-remote-worker-toggle` 的 bounds；沒有任何 `remote-worker:*`（全新的設定資料夾）。截圖有「遠端節點」區塊 |
 | R02 | 點 `btn-remote-pair-new`，兩個欄位都空著，點 `btn-remote-pair` | 出現 `remote-addr-input`、`remote-code-input`；狀態顯示「請輸入位址與配對碼」；沒有 `REMOTE_PAIRED`／`REMOTE_PAIR_FAILED` |
 | R03 | 位址輸入 `100.95.28.19`，配對碼輸入錯的 `AAAA-AAAA`，點 `btn-remote-pair` | 一行新的 `REMOTE_PAIR_FAILED`；選單裡是紅字錯誤；`master-config/remote-workers.json` 不存在或沒有這台 |
-| R04 | 配對碼改成 worker 印出的那組（位址不加埠，預設 47821），點 `btn-remote-pair` | 按鈕先變成「配對中…」；然後出現 `REMOTE_PAIRED: name=ubuntu-ui fp=…`，fp 和 worker 指紋一致（第 3 節規則 5）；接著 `REMOTE_WORKSPACES: count=2`；`remote-workers.json` 有一筆 `ubuntu-ui` |
-| R05 | 截圖選單 | `remote-worker:0` 那一列顯示 `ubuntu-ui`、`100.95.28.19 · XXXX-XXXX-XXXX-XXXX`（指紋同 R04；存下來的位址不含預設埠）；底下兩列 `remote-workspace:0/1` 是 `edge`、`rtk`（試跑時是這個順序，順序不列入判定），各自附有 Ubuntu 上的完整路徑 |
+| R04 | 配對碼改成 worker 印出的那組（位址不加埠，預設 47821），點 `btn-remote-pair` | 出現 `REMOTE_PAIRED: name=ubuntu-ui fp=…`，fp 和 worker 指紋一致（第 3 節規則 5）；接著 `REMOTE_WORKSPACES: count=2`；`remote-workers.json` 有一筆 `ubuntu-ui`。按鈕在配對時會短暫顯示「配對中…」，截到就附上，截不到不影響判定 |
+| R05 | 截圖選單 | `remote-worker:0` 那一列顯示 `ubuntu-ui`、`100.95.28.19 · XXXX-XXXX-XXXX-XXXX`（指紋同 R04；存下來的位址不含預設埠）；底下兩列 `remote-workspace:0/1` 是 `edge`、`rtk`（試跑時是這個順序，順序不列入判定），各自附有 Ubuntu 上的路徑；路徑太長被截斷時，滑鼠移到那一列，tooltip 顯示完整路徑 |
 
 ### 4.2 瀏覽真實專案 rtk
 
 | ID | 動作 | 通過線 |
 |---|---|---|
 | R06 | 點顯示 `rtk` 的那一列 `remote-workspace:<wx>` | `REMOTE_OPENED: ubuntu-ui ▸ rtk`；選單關閉；左上角顯示 `ubuntu-ui ▸ rtk`；狀態列顯示「已開啟遠端工作區 …」；`local.txt` 那一列有 `CTRL_GONE` |
-| R07 | 讀根目錄 | 根目錄的 `ws-tree-row:*` 集合等於 `ssh ubuntu 'ls -A ~/research/rtk'` 的結果（包含 `.git`、`target`）；資料夾排在前面，同類照名稱排序 |
+| R07 | 讀根目錄 | 根目錄的 `ws-tree-row:*` 集合等於 `ssh ubuntu 'ls -A ~/research/rtk'` 的結果去掉 `.git`（專案樹刻意不列 `.git`，和本機模式一致），`target` 要在；資料夾排在前面，同類照名稱排序 |
 | R08 | 點 `ws-tree-row:src` 展開 | `WS_TREE_PAGE: rel=src … children=N`，N 等於 `ls -A src \| wc -l`；子列的 ID 是 `ws-tree-row:src/<名稱>` |
-| R09 | 點 `ws-tree-row:src/main.rs` | `WS_FILE_SELECTED`、`PREVIEW_LOADING`、`PREVIEW_LOADED: src/main.rs`；預覽前 20 行和 `ssh ubuntu 'head -20 ~/research/rtk/src/main.rs'` 一致（截圖比對）；有 Rust 語法上色 |
+| R09 | 點 `ws-tree-row:src/main.rs` | `WS_FILE_SELECTED`、`PREVIEW_LOADING`、`PREVIEW_LOADED: src/main.rs`；預覽前 20 行和 `ssh ubuntu 'head -20 ~/research/rtk/src/main.rs'` 一致（截圖比對）；有 Rust 語法上色；預覽上方的路徑列是 `ubuntu-ui ▸ rtk › src › main.rs`，不是 `snip-remote://…` |
 | R10 | 點 `ws-tree-row:README_zh.md` | `PREVIEW_LOADED`；中文正常顯示，沒有豆腐字或亂碼 |
 | R11 | 展開 `src/hooks`，點 `init.rs`（238 KB），在預覽裡捲到最後 | `PREVIEW_LOADED`；最後一行和 `tail -1` 一致；捲動時 App 不卡 |
 | R12 | 展開 `target`、`release`，點 `target/release/rtk`（8 MB 二進位） | 依第 3 節規則 4 判失敗格：顯示二進位或超過 1 MiB 的錯誤都算對；沒有亂碼文字；5 秒內可以點下一列 |
-| R13 | 展開 `.git`，點 `HEAD` | 預覽顯示 `ref: refs/heads/…`（worker 照原樣分享資料夾內容，包含 `.git`） |
+| R13 | 看根目錄，再執行 `target/debug/snip remote cat 1 rtk .git/HEAD` | 樹裡沒有 `.git` 列；CLI 印出 `ref: refs/heads/…`（`.git` 只是不列在樹裡，指名路徑仍可讀） |
 | R14 | 把 `src` 收合再展開 | 第二次也有 `WS_TREE_PAGE: rel=src`，清單和 R08 相同 |
 
 ### 4.3 邊界案例 edge
@@ -228,11 +229,11 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | R22 | 點 `latin.txt` | 失敗格：同 R21 |
 | R23 | 點 `manydir` 展開，再反覆點最新的 `ws-tree-view-more:manydir` 或 `ws-tree-view-more:`，直到沒有更多列 | `snip remote ls` 回 1000 項；`WS_TREE_PAGE: rel=manydir … children=N`，N ≤ 1000（GUI 的記憶體預算可能收得比 1000 少，記下實際值）；每點一次，畫面都出現新的 `ws-tree-row:manydir/…`；最後有 `ws-tree-marker:manydir`，顯示「[目錄未完整列出: 已截斷]」；捲到底不卡 |
 | R24 | 點 `escape.txt` | 失敗格：錯誤文字說路徑離開了工作區；`top-secret-c0ffee` 不出現在截圖，也不在 `app-*.log` 裡（`grep -c top-secret "$RUN"/app-*.log` 要是 0） |
-| R25 | 點 `escape-dir` | 拒絕。worker 清單把 symlink 回報成非資料夾，所以它可能顯示成檔案列：點下去是失敗格，錯誤是「Path leaves the workspace」；如果顯示成資料夾，展開時要出現錯誤列 `ws-tree-retry:escape-dir`。兩種情況都**不能**列出 `/etc` 的內容（截圖裡沒有 `passwd`、`hostname`） |
-| R26 | 點 `inner-link` | 預期：可以展開，列出 `deep`、`main.rs`，點 `inner-link/main.rs` 能預覽（CLI `snip remote ls 1 edge inner-link` 會列出 `deep/`）。試跑時 worker 把它回報成非資料夾（清單裡沒有尾端 `/`），GUI 可能顯示成檔案列、無法展開；這種情況判 `ui-defect`，並寫下實際畫面 |
-| R27 | 找到非 UTF-8 名稱那一列 | 它的 ID 是 `ws-tree-invalid:<suffix>`，名稱用替代字元顯示；點它不能讓 App 崩潰，也不能預覽到別的檔案的內容（錯誤或「無法預覽」都算對）。把實際行為寫進證據欄 |
+| R25 | 點 `escape-dir` | 拒絕。指向分享外的資料夾 symlink 列成檔案列（CLI `snip remote ls 1 edge` 印 `escape-dir`，沒有尾端 `/`）；點下去是失敗格，錯誤是「Path leaves the workspace」。**不能**列出 `/etc` 的內容（截圖裡沒有 `passwd`、`hostname`） |
+| R26 | 點 `inner-link` | 指向分享內的資料夾 symlink 列成資料夾（CLI `snip remote ls 1 edge` 印 `inner-link/`）：可以展開，列出 `deep`、`main.rs`；點 `inner-link/main.rs` 能預覽。顯示成檔案列或無法展開，判 `fail` |
+| R27 | 找到非 UTF-8 名稱那一列 | 它的 ID 是 `ws-tree-invalid:<suffix>`，名稱用替代字元顯示；點它有一行新的 `TREE_ROW_REFUSED: not-utf8`，狀態列顯示「檔名不是有效的 UTF-8，無法開啟或預覽」；App 不崩潰，選取與預覽維持原樣 |
 | R28 | 依序展開 `a/b/c/d/e`，點 `leaf.txt` | 每層各有一行 `WS_TREE_PAGE`；顯示 `deepest` |
-| R29 | 看 `nested` 和 `.hidden` | `nested` 是資料夾列，可以展開，裡面有 `.git`；`.hidden` 有列出，可以預覽 |
+| R29 | 看 `nested` 和 `.hidden` | `nested` 是資料夾列，可以展開；它只有 `.git`，所以展開後是空的（`WS_TREE_PAGE: rel=nested … children=0`）；`.hidden` 有列出，可以預覽 |
 
 ### 4.4 拒絕寫入類操作（任一遠端工作區）
 
@@ -253,16 +254,16 @@ R34 之前，先重新開回 `edge`（R15 的步驟）。
 |---|---|---|
 | R34 | `ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 樹重新讀取；出現 `ws-tree-row:new.txt`，預覽顯示 `fresh-1` |
 | R35 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2`，不是快取的舊內容 |
-| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | `ws-tree-row:new.txt` 出現 `CTRL_GONE` |
+| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | `ws-tree-row:new.txt` 出現 `CTRL_GONE`；R35 開著的 `new.txt` 預覽重新讀取，改顯示錯誤，不再是 `fresh-2` |
 | R37 | 停掉 worker：`ssh ubuntu "kill \$(cat '$W/worker.pid')"`，在 App 點一個沒預覽過的檔案 | 失敗格；`PREVIEW_LOADING` 之後 10 秒內出現錯誤（master 連線逾時 2 秒、讀取 5 秒）；這段時間 App 沒有凍結（可以捲動、可以開選單）；接著按 Cmd+Shift+W 關掉工作區，要在 8 秒內完成 |
 | R38 | `start_worker wcfg "$W/edge" /home/audichuang/research/rtk`；確認指紋和第一次一樣；在 App 選單點 `remote-worker:0`，開 `edge`，點一個檔案 | 不需要重新配對；`REMOTE_WORKSPACES: count=2`、`REMOTE_OPENED`、`PREVIEW_LOADED` |
 | R39 | 取消分享：`start_worker wcfg /home/audichuang/research/rtk`（只分享 rtk）。App 不重開，直接點 `edge` 裡另一個檔案，再開選單點 `remote-worker:0` | 預覽被拒絕（失敗格）；選單只列出 `rtk`（`REMOTE_WORKSPACES: count=1`） |
 | R40 | 換一張憑證：`start_worker wcfg-other "$W/edge"`（同一個位址，新的設定資料夾），在 App 選單點 `remote-worker:0` | 拒絕；選單顯示紅字，內容說明這不是已配對的 worker（內容含兩個指紋）；`remote-workers.json` 的指紋沒有被改成新的 |
 | R41 | 復原：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk`，點 `remote-worker:0` | `REMOTE_WORKSPACES: count=2` |
 | R42 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` 重新啟動（寫進新的 `app-N.log`），開選單 | `remote-worker:0` 仍然是 `ubuntu-ui`，點它就能列出工作區，不需要重新配對 |
-| R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk` 拿新的配對碼 C。在 App 用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；原本的配對紀錄還在，`remote-worker:0` 仍然能用 |
-| R44 | 把視窗調成 900×600，開選單並打開配對表單 | 兩個輸入框和「配對」按鈕的 bounds 都 `w,h ≥ 1`，而且都在內容區裡面；選單可以捲動到最下面 |
-| R45 | 點 `btn-remote-forget:0` | `remote-worker:0` 有 `CTRL_GONE`；`remote-workers.json` 不再有 `ubuntu-ui`；重開選單也不會再出現 |
+| R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk` 拿新的配對碼 C。Cmd+Q，改用全新的 `SNIP_CONFIG_DIR="$RUN/master-config-r43"` 啟動 App（寫進新的 `app-N.log`）。用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C。再 Cmd+Q，用原本的 `SNIP_CONFIG_DIR` 重新啟動，點 `remote-worker:0` | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；換回原本的設定後，`remote-worker:0` 仍然能列出工作區。一定要用全新的 master：已配對的 master，worker 認得它的憑證，不看配對碼就放行 |
+| R44 | 把視窗調成 900×600（從系統層設定，例如 System Events 設成 900×632；送給 App 的合成拖曳碰不到視窗框），開選單並打開配對表單 | 兩個輸入框和「配對」按鈕的 bounds 都 `w,h ≥ 1`，而且都在內容區裡面；選單可以捲動到最下面；焦點在輸入框時按 Escape，選單收起；再開選單，點 `btn-workspace-menu`，選單也會收起 |
+| R45 | 先開著 `edge`，再點 `btn-remote-forget:0` | 開著的 `edge` 跟著關閉：左上角不再有 `ubuntu-ui ▸`，`ws-tree-row:*` 都有 `CTRL_GONE`；`remote-worker:0` 有 `CTRL_GONE`；`remote-workers.json` 不再有 `ubuntu-ui`；重開選單也不會再出現 |
 
 ### 4.6 CLI master 交叉驗證
 
@@ -279,7 +280,7 @@ R45 之前，或在 R45 之後重新配對一次（重啟 worker 拿新碼，用
 
 | ID | 檢查 | 通過線 |
 |---|---|---|
-| I01 | 結束時重新產生 `rtk-before.txt` 的三項，寫進 `rtk-after.txt` | 和 `rtk-before.txt` 完全相同；另外 `ssh ubuntu "find ~/research/rtk -newer '$W/rtk-marker' -not -path '*/.git/*' \| wc -l"` 是 0 |
+| I01 | 結束時用同一行命令重新產生三項，寫進 `rtk-after.txt`。`git status` 一定要加 `GIT_OPTIONAL_LOCKS=0`：少了它，git 會建立又刪掉 `.git/index.lock`，`.git` 目錄的修改時間因此變新，下面的 `find` 就會算到它 | 和 `rtk-before.txt` 完全相同；另外 `ssh ubuntu "find ~/research/rtk -newer '$W/rtk-marker' -not -path '*/.git/*' \| wc -l"` 是 0 |
 | I02 | 同 2.2，重新列出 `$REAL` 並算雜湊 | 和 `real-config-before.*` 相同（這一輪沒有碰真實的配對紀錄） |
 | I03 | `grep -c top-secret-c0ffee "$RUN"/app-*.log "$RUN"/*/action.json` | 全部是 0 |
 
@@ -299,3 +300,9 @@ ssh ubuntu "kill \$(cat '$W/worker.pid') 2>/dev/null; rm -rf '$W'"
 - 有任何 `ui-defect`、`fail` 或 `not-run`，第一句就寫「遠端節點真實 UI 閘門打開」，並列出那些 ID。
 - I01 或 I02 不是 `pass`，整輪結果作廢：這一輪動到了真實資料，先報告，再處理其他格子。
 - R27、R32 的預期本來就允許多種畫面。判 `pass` 時，證據欄要寫實際看到的是哪一種，下一輪才能收緊。
+
+處理結果時，每個不是 `pass` 的格子先分清楚是哪一種錯，再動手。三種的修法不同，混在一起會修錯地方：
+
+- **規程錯**：通過線和產品的設計不符，例如要求一個不會出現的日誌 tag、把刻意隱藏的 `.git` 當成必須列出、量測步驟自己弄髒了受測資料。修這份規程；產品不動。
+- **工具做不到**：操作者的工具到不了驗證點，例如捲動或拖曳視窗沒有作用。該格維持 `not-run`；在規程寫下已驗證可行的做法，或換工具。產品不動。
+- **產品缺陷**：從截圖和日誌確認後，先寫一個會失敗的測試，再修產品；需要的話，規程也補上對應的通過線。

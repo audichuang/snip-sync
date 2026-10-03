@@ -110,6 +110,16 @@ pub fn resolve_delete_target<P: AsRef<Path>>(
 		.resolve_delete_target(clipboard_path)
 }
 
+/// Returns true if any path segment equals `.git` (ASCII case-insensitive).
+/// Trailing dots and spaces are stripped per segment so Win32 spellings like
+/// `.git.` and `.git ` are caught across all platforms.
+pub fn has_git_segment(path: &str) -> bool {
+	path.split(['/', '\\']).any(|seg| {
+		seg.trim_end_matches(['.', ' '])
+			.eq_ignore_ascii_case(".git")
+	})
+}
+
 pub(crate) fn resolve_absolute_import_candidate<P: AsRef<Path>>(
 	dest_roots: &[P],
 	primary_root: Option<&Path>,
@@ -344,6 +354,9 @@ impl PathResolver {
 	}
 
 	fn resolve_write_target(&self, raw_path: &str) -> RestoreTargetResolution {
+		if has_git_segment(raw_path) {
+			return Err(unsafe_path(None));
+		}
 		let absolute = self
 			.absolute_root_candidate(raw_path)
 			.or_else(|| self.cross_machine_suffix_candidate(raw_path))
@@ -421,7 +434,10 @@ impl PathResolver {
 		c: TargetCandidate,
 		relative_path: String,
 	) -> RestoreTargetResolution {
-		if self.escapes(&c.target) {
+		if self.escapes(&c.target)
+			|| has_git_segment(&relative_path)
+			|| has_git_segment(&c.root_relative_path)
+		{
 			return Err(unsafe_path(Some(relative_path)));
 		}
 		Ok(self.resolved_target(&c, relative_path, true))
@@ -430,6 +446,9 @@ impl PathResolver {
 	/// Delete an existing file, or report it missing.
 	fn delete_existing(&self, c: TargetCandidate) -> RestoreTargetResolution {
 		let rel = c.root_relative_path.clone();
+		if has_git_segment(&rel) {
+			return Err(unsafe_path(Some(rel)));
+		}
 		if is_existing_file(&c.target) {
 			self.resolve_delete_candidate(c, rel)
 		} else {
@@ -438,6 +457,9 @@ impl PathResolver {
 	}
 
 	fn resolve_delete_target(&self, raw_path: &str) -> RestoreTargetResolution {
+		if has_git_segment(raw_path) {
+			return Err(unsafe_path(None));
+		}
 		if let Some(c) = self.absolute_root_candidate(raw_path) {
 			return self.delete_existing(c);
 		}
@@ -674,7 +696,10 @@ impl PathResolver {
 		relative_path: String,
 		existed: Option<bool>,
 	) -> RestoreTargetResolution {
-		if self.escapes(&c.target) {
+		if self.escapes(&c.target)
+			|| has_git_segment(&relative_path)
+			|| has_git_segment(&c.root_relative_path)
+		{
 			return Err(unsafe_path(Some(relative_path)));
 		}
 		let existed = existed.unwrap_or_else(|| is_existing_file(&c.target));
@@ -1243,5 +1268,44 @@ mod tests {
 		fs::create_dir_all(&sibling).unwrap();
 		symlink(&sibling, &repo.join("backlink"));
 		assert!(resolve_write_target(&[&repo], "backlink/new.txt").is_err());
+	}
+
+	#[test]
+	fn has_git_segment_detects_trailing_dots_and_spaces() {
+		assert!(has_git_segment(".git."));
+		assert!(has_git_segment(".git "));
+		assert!(has_git_segment(".git. /x"));
+		assert!(has_git_segment("a/.GIT../b"));
+
+		assert!(!has_git_segment(".gitignore"));
+		assert!(!has_git_segment(".git.x"));
+		assert!(!has_git_segment("foo.git/x"));
+		assert!(!has_git_segment(".github/x"));
+	}
+
+	#[test]
+	fn resolves_targets_when_destination_root_ancestor_is_named_git() {
+		let (temp, _real) = tmp();
+		let root = temp.path().join(".git").join("work");
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::write(root.join("src/existing.txt"), "hello").unwrap();
+
+		let write_res = resolve_write_target(&[&root], "src/a.txt");
+		assert!(write_res.is_ok());
+		assert_eq!(ok(&write_res).relative_path, "src/a.txt");
+		assert_eq!(ok(&write_res).absolute_path, root.join("src/a.txt"));
+
+		let git_res = resolve_write_target(&[&root], ".git/config");
+		assert!(git_res.is_err());
+		assert_eq!(git_res.unwrap_err().reason, RejectReason::UnsafePath);
+
+		let del_res = resolve_delete_target(&[&root], "src/existing.txt");
+		assert!(del_res.is_ok());
+		assert_eq!(ok(&del_res).relative_path, "src/existing.txt");
+		assert_eq!(ok(&del_res).absolute_path, root.join("src/existing.txt"));
+
+		let del_git_res = resolve_delete_target(&[&root], ".git/config");
+		assert!(del_git_res.is_err());
+		assert_eq!(del_git_res.unwrap_err().reason, RejectReason::UnsafePath);
 	}
 }

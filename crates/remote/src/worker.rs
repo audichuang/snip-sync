@@ -424,7 +424,7 @@ impl State {
 			},
 			Request::ListDir { workspace, path } => self
 				.resolve(&workspace, &path)
-				.and_then(|(_, dir)| list_dir(&dir))
+				.and_then(|(root, dir)| list_dir(&root, &dir))
 				.unwrap_or_else(|e| e),
 			Request::Stat { workspace, path } => self
 				.resolve(&workspace, &path)
@@ -530,7 +530,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 		&& a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn list_dir(dir: &Path) -> Result<Response, Response> {
+/// Lists `dir` inside the shared `root`. A symlink to a folder inside the
+/// share lists as a folder, as the copy engine treats it; one that leads
+/// out of the share (or into `.git`) stays a plain entry the master cannot
+/// open.
+fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
 	let mut truncated = false;
@@ -550,13 +554,16 @@ fn list_dir(dir: &Path) -> Result<Response, Response> {
 				truncated = true;
 				break;
 			}
-			let nested_repo = entry.directory
-				&& fs::symlink_metadata(dir.join(&entry.name).join(".git"))
-					.is_ok();
+			let path = dir.join(&entry.name);
+			let directory = entry.directory
+				|| (entry.symlink
+					&& snip_core::transfer::is_safe_dir_symlink(root, &path));
+			let nested_repo =
+				directory && fs::symlink_metadata(path.join(".git")).is_ok();
 			entries.push(DirEntry {
 				utf8: entry.utf8_name().is_some(),
 				name: entry.name.to_string_lossy().into_owned(),
-				directory: entry.directory,
+				directory,
 				symlink: entry.symlink,
 				nested_repo,
 			});
