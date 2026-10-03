@@ -151,7 +151,7 @@ fn a_restarted_newer_worker_is_used_after_too_old() {
 	};
 	worker_b.set_roots(&[shared]);
 
-	// Next git call must not report too old: reaches worker B and gets Unsupported
+	// Next git call must not report too old: reaches worker B and gets NotARepository
 	let reply_err = client
 		.git(
 			&ws,
@@ -163,9 +163,9 @@ fn a_restarted_newer_worker_is_used_after_too_old() {
 		.unwrap_err();
 	match reply_err {
 		RemoteError::Refused { code, .. } => {
-			assert_eq!(code, ErrorCode::Unsupported);
+			assert_eq!(code, ErrorCode::NotARepository);
 		}
-		other => panic!("expected Refused(Unsupported), got {other:?}"),
+		other => panic!("expected Refused(NotARepository), got {other:?}"),
 	}
 	assert_eq!(worker_b.git_requests_seen(), 1);
 }

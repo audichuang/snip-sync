@@ -139,7 +139,7 @@ fn pairs_then_lists_stats_and_reads_inside_the_shared_root_only() {
 		ErrorCode::Forbidden
 	);
 
-	// Write, rename and Git are reserved for later slices.
+	// GitView on a non-repo share returns NotARepository.
 	assert_eq!(
 		refused(client.call(&Request::GitView {
 			workspace: ws.clone(),
@@ -147,7 +147,7 @@ fn pairs_then_lists_stats_and_reads_inside_the_shared_root_only() {
 			profile: snip_core::gitview::ReadProfile::Interactive,
 			query: snip_remote::proto::GitQuery::ChangeList,
 		})),
-		ErrorCode::Unsupported
+		ErrorCode::NotARepository
 	);
 
 	// Unsharing a root takes it away at once.

@@ -275,7 +275,7 @@ fn cli_worker_max_protocol_flag_limits_negotiation() {
 		other => panic!("expected WorkerTooOld, got {other:?}"),
 	}
 
-	// 2. Worker with no flag: Git request reaches the worker and gets Unsupported
+	// 2. Worker with no flag: Git request reaches the worker and gets NotARepository (non-repo shared dir)
 	let (_w2, addr2, code2) = start_worker(&shared, &tmp.path().join("w2"));
 	let master2 = Arc::new(Identity::generate().unwrap());
 	let paired2 = pair(&addr2, &code2, &master2, "mac").unwrap();
@@ -296,8 +296,8 @@ fn cli_worker_max_protocol_flag_limits_negotiation() {
 		.unwrap_err();
 	match err2 {
 		snip_remote::RemoteError::Refused { code, .. } => {
-			assert_eq!(code, snip_remote::proto::ErrorCode::Unsupported);
+			assert_eq!(code, snip_remote::proto::ErrorCode::NotARepository);
 		}
-		other => panic!("expected Refused(Unsupported), got {other:?}"),
+		other => panic!("expected Refused(NotARepository), got {other:?}"),
 	}
 }

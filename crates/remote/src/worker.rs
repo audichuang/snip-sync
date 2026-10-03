@@ -102,6 +102,7 @@ struct State {
 	git_requests: AtomicUsize,
 	deadlines: Mutex<(Duration, Duration)>,
 	jobs: crate::jobs::Jobs,
+	repo_cache: Mutex<crate::gitserve::RepoCache>,
 	trusted: Mutex<Vec<TrustedMaster>>,
 	pairing: Mutex<Option<PairingWindow>>,
 	roots: RwLock<Vec<SharedRoot>>,
@@ -153,6 +154,7 @@ impl Worker {
 				crate::jobs::SCAN_DEADLINE,
 			)),
 			jobs: crate::jobs::Jobs::new(),
+			repo_cache: Mutex::new(crate::gitserve::RepoCache::new()),
 			trusted: Mutex::new(trusted),
 			pairing: Mutex::new(None),
 			roots: RwLock::new(Vec::new()),
@@ -235,6 +237,7 @@ impl Worker {
 		if !removed.is_empty() {
 			self.state.jobs.cancel_workspaces(&removed);
 		}
+		lock(&self.state.repo_cache).clear();
 		*self
 			.state
 			.roots
@@ -450,38 +453,24 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 									job_cancel,
 									scan_deadline,
 								);
-								match state.get_shared_root(&workspace) {
-										Ok(cur)
-											if cur.id == initial_root.id
-												&& cur.path
-													== initial_root.path =>
-										{
-											reply
-										}
-										_ => error(
-											ErrorCode::Forbidden,
-											"that workspace is not shared by this worker"
-												.into(),
-										),
-									}
+								verify_root_unchanged(
+									state,
+									&workspace,
+									&initial_root,
+									reply,
+								)
 							}
-							Err(ErrorCode::Busy) => error(
-								ErrorCode::Busy,
-								"the worker is busy with other Git requests"
-									.into(),
-							),
-							Err(ErrorCode::Cancelled) => {
-								error(ErrorCode::Cancelled, "cancelled".into())
-							}
-							Err(code) => error(
-								code,
-								"the worker cannot admit this job".into(),
-							),
+							Err(code) => map_admit_error(code),
 						},
 					)?;
 				}
 			}
-			Request::GitView { .. } => {
+			Request::GitView {
+				workspace,
+				repo,
+				profile,
+				query,
+			} => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
 				if !state.is_trusted(&peer) {
 					crate::jobs::write_response(
@@ -491,7 +480,7 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 							"this master is not paired with the worker".into(),
 						),
 					)?;
-				} else {
+				} else if negotiated < crate::proto::GIT_VIEWS_VERSION {
 					crate::jobs::write_response(
 						&mut tls,
 						&error(
@@ -499,6 +488,52 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 							"Git views are not available on this worker yet"
 								.into(),
 						),
+					)?;
+				} else if let Err(msg) =
+					crate::gitserve::validate(&repo, &query)
+				{
+					crate::jobs::write_response(
+						&mut tls,
+						&error(ErrorCode::BadRequest, msg),
+					)?;
+				} else {
+					let (view_deadline, _) = *lock(&state.deadlines);
+					let cancel = snip_core::gitrun::CancelToken::new();
+					crate::jobs::run_job(
+						&mut tls,
+						view_deadline,
+						cancel,
+						|job_cancel| match state.jobs.admit(
+							&workspace,
+							crate::jobs::JobKind::View,
+							job_cancel,
+						) {
+							Ok(_guard) => {
+								let initial_root =
+									match state.get_shared_root(&workspace) {
+										Ok(r) => r,
+										Err(resp) => return resp,
+									};
+								let read = snip_core::gitview::Read {
+									profile,
+									cancel: Some(job_cancel.clone()),
+								};
+								let reply = crate::gitserve::handle_git_view(
+									&initial_root,
+									&repo,
+									query,
+									&read,
+									&state.repo_cache,
+								);
+								verify_root_unchanged(
+									state,
+									&workspace,
+									&initial_root,
+									reply,
+								)
+							}
+							Err(code) => map_admit_error(code),
+						},
 					)?;
 				}
 			}
@@ -513,6 +548,36 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 
 fn error(code: ErrorCode, message: String) -> Response {
 	Response::Error { code, message }
+}
+
+fn map_admit_error(code: ErrorCode) -> Response {
+	match code {
+		ErrorCode::Busy => error(
+			ErrorCode::Busy,
+			"the worker is busy with other Git requests".into(),
+		),
+		ErrorCode::Cancelled => error(ErrorCode::Cancelled, "cancelled".into()),
+		other => error(other, "the worker cannot admit this job".into()),
+	}
+}
+
+fn verify_root_unchanged(
+	state: &State,
+	workspace: &str,
+	initial_root: &SharedRoot,
+	reply: Response,
+) -> Response {
+	match state.get_shared_root(workspace) {
+		Ok(cur)
+			if cur.id == initial_root.id && cur.path == initial_root.path =>
+		{
+			reply
+		}
+		_ => error(
+			ErrorCode::Forbidden,
+			"that workspace is not shared by this worker".into(),
+		),
+	}
 }
 
 pub(crate) fn io_error(err: io::Error) -> Response {
