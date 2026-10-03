@@ -301,3 +301,381 @@ fn cli_worker_max_protocol_flag_limits_negotiation() {
 		other => panic!("expected Refused(NotARepository), got {other:?}"),
 	}
 }
+
+fn require_git() -> bool {
+	match Command::new("git").arg("--version").output() {
+		Ok(out) if out.status.success() => true,
+		_ => {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"git is required"
+			);
+			false
+		}
+	}
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+	let out = Command::new("git")
+		.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+		.args(args)
+		.current_dir(dir)
+		.output()
+		.expect("git failed to execute");
+	assert!(
+		out.status.success(),
+		"git {args:?} failed in {}: {}",
+		dir.display(),
+		String::from_utf8_lossy(&out.stderr)
+	);
+}
+
+fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+	let out = Command::new("git")
+		.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+		.args(args)
+		.current_dir(dir)
+		.output()
+		.expect("git failed to execute");
+	assert!(
+		out.status.success(),
+		"git {args:?} failed in {}: {}",
+		dir.display(),
+		String::from_utf8_lossy(&out.stderr)
+	);
+	String::from_utf8(out.stdout).expect("git stdout not utf8")
+}
+
+#[test]
+fn cli_master_git_views_repos_changes_log_show_and_diff() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let alpha = ws.join("alpha");
+	let beta = ws.join("beta");
+	let plain = ws.join("plain");
+	std::fs::create_dir_all(&alpha).unwrap();
+	std::fs::create_dir_all(&beta).unwrap();
+	std::fs::create_dir_all(&plain).unwrap();
+	std::fs::write(plain.join("file.txt"), "plain content\n").unwrap();
+
+	// Repo alpha: two commits
+	git(&alpha, &["init"]);
+	std::fs::write(alpha.join("a.txt"), "commit 1 a\n").unwrap();
+	git(&alpha, &["add", "a.txt"]);
+	git(&alpha, &["commit", "-q", "-m", "first commit"]);
+
+	std::fs::write(alpha.join("a.txt"), "commit 2 a\n").unwrap();
+	std::fs::write(alpha.join("b.txt"), "commit 2 b\n").unwrap();
+	git(&alpha, &["add", "a.txt", "b.txt"]);
+	git(&alpha, &["commit", "-q", "-m", "second commit"]);
+
+	// Then modify tracked a.txt, add untracked new.txt, git add staged.txt with new content
+	std::fs::write(alpha.join("a.txt"), "commit 2 a modified\n").unwrap();
+	std::fs::write(alpha.join("new.txt"), "new file content\n").unwrap();
+	std::fs::write(alpha.join("staged.txt"), "staged file content\n").unwrap();
+	git(&alpha, &["add", "staged.txt"]);
+
+	// Repo beta: clean, one commit
+	git(&beta, &["init"]);
+	std::fs::write(beta.join("b.txt"), "beta content\n").unwrap();
+	git(&beta, &["add", "b.txt"]);
+	git(&beta, &["commit", "-q", "-m", "beta commit"]);
+
+	let (_worker, addr, code) = start_worker(&ws, &tmp.path().join("w"));
+	let master_cfg = tmp.path().join("m");
+	let snip = |args: &[&str]| {
+		let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+			.args(["remote"])
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &master_cfg)
+			.output()
+			.unwrap();
+		(
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout).into_owned(),
+			String::from_utf8_lossy(&out.stderr).into_owned(),
+		)
+	};
+	let ok = |args: &[&str]| {
+		let (status, stdout, stderr) = snip(args);
+		assert_eq!(status, Some(0), "snip remote {args:?}: {stderr}");
+		stdout
+	};
+
+	assert!(ok(&["pair", &addr, &code]).starts_with("paired with "));
+
+	// repos 1 ws
+	let repos_out = ok(&["repos", "1", "ws"]);
+	assert!(repos_out.contains("alpha\t"));
+	assert!(repos_out.contains("beta\t"));
+	assert!(!repos_out.contains("plain"));
+	let alpha_line = repos_out
+		.lines()
+		.find(|l| l.starts_with("alpha\t"))
+		.expect("alpha line");
+	let alpha_cols: Vec<&str> = alpha_line.split('\t').collect();
+	assert_eq!(alpha_cols.len(), 6, "{alpha_line}");
+	assert_eq!(alpha_cols[2], "1", "staged");
+	assert_eq!(alpha_cols[3], "1", "unstaged");
+	assert_eq!(alpha_cols[4], "1", "untracked");
+	assert_eq!(alpha_cols[5], "0", "conflicted");
+
+	// changes 1 ws alpha
+	let changes_alpha = ok(&["changes", "1", "ws", "alpha"]);
+	assert!(changes_alpha.contains("U\tM\ta.txt"), "{changes_alpha}");
+	assert!(changes_alpha.contains("W\tN\tnew.txt"), "{changes_alpha}");
+	assert!(
+		changes_alpha.contains("S\tN\tstaged.txt"),
+		"{changes_alpha}"
+	);
+
+	// changes 1 ws beta
+	let changes_beta = ok(&["changes", "1", "ws", "beta"]);
+	assert_eq!(changes_beta, "");
+
+	// log 1 ws alpha -n 50
+	let log_alpha = ok(&["log", "1", "ws", "alpha", "-n", "50"]);
+	let log_lines: Vec<&str> = log_alpha.lines().collect();
+	assert_eq!(log_lines.len(), 2, "{log_alpha}");
+	let log_shas: std::collections::BTreeSet<&str> = log_lines
+		.iter()
+		.map(|l| l.split('\t').next().unwrap())
+		.collect();
+	let rev_list = git_out(&alpha, &["rev-list", "HEAD"]);
+	let rev_shas: std::collections::BTreeSet<&str> = rev_list.lines().collect();
+	assert_eq!(log_shas, rev_shas);
+	assert!(log_lines[0].ends_with("second commit"), "{log_alpha}");
+
+	// show 1 ws alpha <HEAD sha>
+	let head_sha = git_out(&alpha, &["rev-parse", "HEAD"]).trim().to_string();
+	let show_out = ok(&["show", "1", "ws", "alpha", &head_sha]);
+	let diff_tree = git_out(
+		&alpha,
+		&["diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"],
+	);
+	let expected_show: String = diff_tree
+		.lines()
+		.map(|line| {
+			if let Some(rest) = line.strip_prefix("A\t") {
+				format!("N\t{rest}")
+			} else {
+				line.to_string()
+			}
+		})
+		.collect::<Vec<_>>()
+		.join("\n")
+		+ "\n";
+	assert_eq!(show_out, expected_show);
+	assert!(show_out.contains("N\tb.txt"), "{show_out}");
+
+	// diff
+	let diff_a = ok(&["diff", "1", "ws", "alpha", "a.txt"]);
+	assert!(diff_a.contains("commit 2 a modified"), "{diff_a}");
+
+	let diff_staged =
+		ok(&["diff", "1", "ws", "alpha", "staged.txt", "--staged"]);
+	assert!(diff_staged.contains("staged file content"), "{diff_staged}");
+
+	let diff_commit =
+		ok(&["diff", "1", "ws", "alpha", "a.txt", "--commit", &head_sha]);
+	assert!(diff_commit.contains("commit 2 a"), "{diff_commit}");
+
+	// changes 1 ws plain
+	let (status, _, stderr) = snip(&["changes", "1", "ws", "plain"]);
+	assert_eq!(status, Some(1));
+	assert!(
+		!stderr.is_empty(),
+		"expected worker's NotARepository error in stderr"
+	);
+}
+
+#[test]
+fn cli_master_git_views_single_repo_share_uses_the_empty_repo_path() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("single_repo");
+	std::fs::create_dir_all(&ws).unwrap();
+	git(&ws, &["init"]);
+	std::fs::write(ws.join("init.txt"), "hello single\n").unwrap();
+	git(&ws, &["add", "init.txt"]);
+	git(&ws, &["commit", "-q", "-m", "initial single"]);
+
+	let (_worker, addr, code) = start_worker(&ws, &tmp.path().join("w"));
+	let master_cfg = tmp.path().join("m");
+	let snip = |args: &[&str]| {
+		let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+			.args(["remote"])
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &master_cfg)
+			.output()
+			.unwrap();
+		(
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout).into_owned(),
+			String::from_utf8_lossy(&out.stderr).into_owned(),
+		)
+	};
+	let ok = |args: &[&str]| {
+		let (status, stdout, stderr) = snip(args);
+		assert_eq!(status, Some(0), "snip remote {args:?}: {stderr}");
+		stdout
+	};
+
+	assert!(ok(&["pair", &addr, &code]).starts_with("paired with "));
+
+	let repos_out = ok(&["repos", "1", "single_repo"]);
+	let first_line = repos_out.lines().next().expect("repos line");
+	assert_eq!(first_line.split('\t').next(), Some("."));
+
+	let changes_out = ok(&["changes", "1", "single_repo"]);
+	assert_eq!(changes_out, "");
+
+	let head_sha = git_out(&ws, &["rev-parse", "HEAD"]).trim().to_string();
+	let show_out = ok(&["show", "1", "single_repo", &head_sha]);
+	assert!(show_out.contains("N\tinit.txt"), "{show_out}");
+}
+
+#[test]
+fn cli_master_repos_of_a_non_repo_share_says_so() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("plain_share");
+	std::fs::create_dir_all(&ws).unwrap();
+	std::fs::write(ws.join("note.txt"), "just a note\n").unwrap();
+
+	let (_worker, addr, code) = start_worker(&ws, &tmp.path().join("w"));
+	let master_cfg = tmp.path().join("m");
+	let snip = |args: &[&str]| {
+		let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+			.args(["remote"])
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &master_cfg)
+			.output()
+			.unwrap();
+		(
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout).into_owned(),
+			String::from_utf8_lossy(&out.stderr).into_owned(),
+		)
+	};
+
+	let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+		.args(["remote", "pair", &addr, &code])
+		.env("SNIP_CONFIG_DIR", &master_cfg)
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(0));
+
+	let (status, stdout, stderr) = snip(&["repos", "1", "plain_share"]);
+	assert_eq!(status, Some(0));
+	assert_eq!(stdout, "");
+	assert!(
+		stderr.contains("no Git repository in"),
+		"expected 'no Git repository in' in stderr, got: {stderr}"
+	);
+}
+
+#[test]
+fn cli_master_git_views_refuse_an_old_worker() {
+	let tmp = tempfile::tempdir().unwrap();
+	let shared = tmp.path().join("proj");
+	std::fs::create_dir_all(&shared).unwrap();
+	std::fs::write(shared.join("file.txt"), "hello").unwrap();
+
+	let (_worker, addr, code) = start_worker_with(
+		&shared,
+		&tmp.path().join("w"),
+		&["--max-protocol", "1"],
+	);
+	let master_cfg = tmp.path().join("m");
+	let snip = |args: &[&str]| {
+		let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+			.args(["remote"])
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &master_cfg)
+			.output()
+			.unwrap();
+		(
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout).into_owned(),
+			String::from_utf8_lossy(&out.stderr).into_owned(),
+		)
+	};
+	let ok = |args: &[&str]| {
+		let (status, stdout, stderr) = snip(args);
+		assert_eq!(status, Some(0), "snip remote {args:?}: {stderr}");
+		stdout
+	};
+
+	assert!(ok(&["pair", &addr, &code]).starts_with("paired with "));
+
+	let (status_repos, _, stderr_repos) = snip(&["repos", "1", "proj"]);
+	assert_eq!(status_repos, Some(1));
+	assert!(
+		stderr_repos.contains("too old"),
+		"expected 'too old' in stderr, got: {stderr_repos}"
+	);
+
+	let (status_changes, _, stderr_changes) = snip(&["changes", "1", "proj"]);
+	assert_eq!(status_changes, Some(1));
+	assert!(
+		stderr_changes.contains("too old"),
+		"expected 'too old' in stderr, got: {stderr_changes}"
+	);
+
+	assert_eq!(snip(&["workspaces", "1"]).0, Some(0));
+	assert_eq!(snip(&["ls", "1", "proj"]).0, Some(0));
+}
+
+#[test]
+fn cli_master_git_view_rejects_escaping_paths() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let alpha = ws.join("alpha");
+	std::fs::create_dir_all(&alpha).unwrap();
+	git(&alpha, &["init"]);
+	std::fs::write(alpha.join("a.txt"), "content\n").unwrap();
+	git(&alpha, &["add", "a.txt"]);
+	git(&alpha, &["commit", "-q", "-m", "init"]);
+
+	let (_worker, addr, code) = start_worker(&ws, &tmp.path().join("w"));
+	let master_cfg = tmp.path().join("m");
+	let snip = |args: &[&str]| {
+		let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+			.args(["remote"])
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &master_cfg)
+			.output()
+			.unwrap();
+		(
+			out.status.code(),
+			String::from_utf8_lossy(&out.stdout).into_owned(),
+			String::from_utf8_lossy(&out.stderr).into_owned(),
+		)
+	};
+	let ok = |args: &[&str]| {
+		let (status, stdout, stderr) = snip(args);
+		assert_eq!(status, Some(0), "snip remote {args:?}: {stderr}");
+		stdout
+	};
+
+	assert!(ok(&["pair", &addr, &code]).starts_with("paired with "));
+
+	let (status_diff, _, _) =
+		snip(&["diff", "1", "ws", "alpha", "../../secret.txt"]);
+	assert_eq!(status_diff, Some(1));
+
+	let (status_show, _, _) =
+		snip(&["show", "1", "ws", "alpha", "--", "--output=x"]);
+	assert_eq!(status_show, Some(1));
+}
