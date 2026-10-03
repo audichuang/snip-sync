@@ -100,12 +100,22 @@ struct State {
 	trust_file: Option<PathBuf>,
 	max_protocol: Option<u32>,
 	git_requests: AtomicUsize,
+	deadlines: Mutex<(Duration, Duration)>,
+	jobs: crate::jobs::Jobs,
 	trusted: Mutex<Vec<TrustedMaster>>,
 	pairing: Mutex<Option<PairingWindow>>,
 	roots: RwLock<Vec<SharedRoot>>,
-	connections: AtomicUsize,
+	connections: Arc<AtomicUsize>,
 	waiting: AtomicUsize,
 	stop: AtomicBool,
+}
+
+pub(crate) struct ConnSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnSlot {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::SeqCst);
+	}
 }
 
 pub struct Worker {
@@ -138,10 +148,15 @@ impl Worker {
 			trust_file: opts.trust_file,
 			max_protocol: opts.max_protocol,
 			git_requests: AtomicUsize::new(0),
+			deadlines: Mutex::new((
+				crate::jobs::VIEW_DEADLINE,
+				crate::jobs::SCAN_DEADLINE,
+			)),
+			jobs: crate::jobs::Jobs::new(),
 			trusted: Mutex::new(trusted),
 			pairing: Mutex::new(None),
 			roots: RwLock::new(Vec::new()),
-			connections: AtomicUsize::new(0),
+			connections: Arc::new(AtomicUsize::new(0)),
 			waiting: AtomicUsize::new(0),
 			stop: AtomicBool::new(false),
 		});
@@ -203,6 +218,23 @@ impl Worker {
 				Err(err) => errors.push((path.clone(), err)),
 			}
 		}
+		let old_ids: Vec<String> = self
+			.state
+			.roots
+			.read()
+			.unwrap_or_else(PoisonError::into_inner)
+			.iter()
+			.map(|r| r.id.clone())
+			.collect();
+		let new_ids: std::collections::HashSet<_> =
+			roots.iter().map(|r| &r.id).collect();
+		let removed: Vec<String> = old_ids
+			.into_iter()
+			.filter(|id| !new_ids.contains(id))
+			.collect();
+		if !removed.is_empty() {
+			self.state.jobs.cancel_workspaces(&removed);
+		}
 		*self
 			.state
 			.roots
@@ -227,9 +259,25 @@ impl Worker {
 		self.state.connections.load(Ordering::SeqCst)
 	}
 
+	#[doc(hidden)]
+	pub fn set_deadlines_for_tests(&self, view: Duration, scan: Duration) {
+		*lock(&self.state.deadlines) = (view, scan);
+	}
+
+	#[doc(hidden)]
+	pub fn running_jobs(&self) -> usize {
+		self.state.jobs.running()
+	}
+
+	#[doc(hidden)]
+	pub fn jobs_waiting(&self) -> usize {
+		self.state.jobs.waiting()
+	}
+
 	/// Stops accepting; open connections end at their next request.
 	pub fn stop(&mut self) {
 		self.state.stop.store(true, Ordering::SeqCst);
+		self.state.jobs.cancel_all();
 		if let Some(accept) = self.accept.take() {
 			let _ = accept.join();
 		}
@@ -273,11 +321,8 @@ fn accept_loop(listener: TcpListener, state: Arc<State>) {
 					.spawn(move || {
 						let slot = conn_state.take_slot();
 						conn_state.waiting.fetch_sub(1, Ordering::SeqCst);
-						if slot {
+						if let Some(_slot) = slot {
 							let _ = serve(tcp, &conn_state);
-							conn_state
-								.connections
-								.fetch_sub(1, Ordering::SeqCst);
 						}
 					});
 				if spawned.is_err() {
@@ -293,6 +338,14 @@ fn accept_loop(listener: TcpListener, state: Arc<State>) {
 }
 
 fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
+	// TCP keepalive: best effort attempt to detect vanished masters.
+	let sock = socket2::SockRef::from(&tcp);
+	let mut keepalive =
+		socket2::TcpKeepalive::new().with_time(Duration::from_secs(15));
+	keepalive = keepalive.with_interval(Duration::from_secs(5));
+	// Ignore errors if the platform or socket doesn't support keepalive parameters.
+	let _ = sock.set_tcp_keepalive(&keepalive);
+
 	tcp.set_nonblocking(false)?;
 	tcp.set_nodelay(true)?;
 	tcp.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -353,15 +406,106 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 		let Some(request) = read_frame::<Request>(&mut tls)? else {
 			return Ok(());
 		};
-		let response = state.handle(&peer, request, negotiated);
-		match write_frame(&mut tls, &response) {
-			Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-				write_frame(
-					&mut tls,
-					&error(ErrorCode::TooLarge, err.to_string()),
-				)?;
+		match request {
+			Request::ScanRepos { workspace, under } => {
+				state.git_requests.fetch_add(1, Ordering::SeqCst);
+				if !state.is_trusted(&peer) {
+					crate::jobs::write_response(
+						&mut tls,
+						&error(
+							ErrorCode::NotPaired,
+							"this master is not paired with the worker".into(),
+						),
+					)?;
+				} else if negotiated < crate::proto::GIT_VIEWS_VERSION {
+					crate::jobs::write_response(
+						&mut tls,
+						&error(
+							ErrorCode::Unsupported,
+							"Git views are not available on this worker yet"
+								.into(),
+						),
+					)?;
+				} else {
+					let (_, scan_deadline) = *lock(&state.deadlines);
+					let cancel = snip_core::gitrun::CancelToken::new();
+					crate::jobs::run_job(
+						&mut tls,
+						scan_deadline,
+						cancel,
+						|job_cancel| match state.jobs.admit(
+							&workspace,
+							crate::jobs::JobKind::Scan,
+							job_cancel,
+						) {
+							Ok(_guard) => {
+								let initial_root =
+									match state.get_shared_root(&workspace) {
+										Ok(r) => r,
+										Err(resp) => return resp,
+									};
+								let reply = crate::gitserve::scan(
+									&initial_root,
+									under.as_deref(),
+									job_cancel,
+									scan_deadline,
+								);
+								match state.get_shared_root(&workspace) {
+										Ok(cur)
+											if cur.id == initial_root.id
+												&& cur.path
+													== initial_root.path =>
+										{
+											reply
+										}
+										_ => error(
+											ErrorCode::Forbidden,
+											"that workspace is not shared by this worker"
+												.into(),
+										),
+									}
+							}
+							Err(ErrorCode::Busy) => error(
+								ErrorCode::Busy,
+								"the worker is busy with other Git requests"
+									.into(),
+							),
+							Err(ErrorCode::Cancelled) => {
+								error(ErrorCode::Cancelled, "cancelled".into())
+							}
+							Err(code) => error(
+								code,
+								"the worker cannot admit this job".into(),
+							),
+						},
+					)?;
+				}
 			}
-			other => other?,
+			Request::GitView { .. } => {
+				state.git_requests.fetch_add(1, Ordering::SeqCst);
+				if !state.is_trusted(&peer) {
+					crate::jobs::write_response(
+						&mut tls,
+						&error(
+							ErrorCode::NotPaired,
+							"this master is not paired with the worker".into(),
+						),
+					)?;
+				} else {
+					crate::jobs::write_response(
+						&mut tls,
+						&error(
+							ErrorCode::Unsupported,
+							"Git views are not available on this worker yet"
+								.into(),
+						),
+					)?;
+				}
+			}
+			other => {
+				let response = state.handle(&peer, other, negotiated);
+				crate::jobs::write_response(&mut tls, &response)?;
+			}
 		}
 	}
 	Ok(())
@@ -371,7 +515,7 @@ fn error(code: ErrorCode, message: String) -> Response {
 	Response::Error { code, message }
 }
 
-fn io_error(err: io::Error) -> Response {
+pub(crate) fn io_error(err: io::Error) -> Response {
 	let code = match err.kind() {
 		io::ErrorKind::NotFound => ErrorCode::NotFound,
 		io::ErrorKind::PermissionDenied => ErrorCode::Forbidden,
@@ -384,7 +528,7 @@ fn io_error(err: io::Error) -> Response {
 
 impl State {
 	/// Waits up to [`SLOT_WAIT`] for one of [`MAX_CONNECTIONS`] slots.
-	fn take_slot(&self) -> bool {
+	fn take_slot(&self) -> Option<ConnSlot> {
 		let deadline = Instant::now() + SLOT_WAIT;
 		loop {
 			// compare_exchange rather than fetch_update: newer toolchains
@@ -401,14 +545,14 @@ impl State {
 					)
 					.is_ok()
 			{
-				return true;
+				return Some(ConnSlot(self.connections.clone()));
 			}
 			if n < MAX_CONNECTIONS {
 				// Lost a race for the slot: look again at once.
 				continue;
 			}
 			if Instant::now() >= deadline || self.stop.load(Ordering::SeqCst) {
-				return false;
+				return None;
 			}
 			std::thread::sleep(Duration::from_millis(10));
 		}
@@ -530,19 +674,27 @@ impl State {
 	}
 
 	#[allow(clippy::result_large_err)]
-	fn root(&self, workspace: &str) -> Result<PathBuf, Response> {
+	pub(crate) fn get_shared_root(
+		&self,
+		workspace: &str,
+	) -> Result<SharedRoot, Response> {
 		self.roots
 			.read()
 			.unwrap_or_else(PoisonError::into_inner)
 			.iter()
 			.find(|r| r.id == workspace)
-			.map(|r| r.path.clone())
+			.cloned()
 			.ok_or_else(|| {
 				error(
 					ErrorCode::Forbidden,
 					"that workspace is not shared by this worker".into(),
 				)
 			})
+	}
+
+	#[allow(clippy::result_large_err)]
+	fn root(&self, workspace: &str) -> Result<PathBuf, Response> {
+		self.get_shared_root(workspace).map(|r| r.path)
 	}
 
 	#[allow(clippy::result_large_err)]
@@ -674,5 +826,22 @@ mod tests {
 		}
 		assert_eq!(a.name, "real");
 		assert!(SharedRoot::new(&dir.path().join("missing")).is_err());
+	}
+
+	#[test]
+	fn a_panicking_job_frees_its_connection_slot() {
+		let counter = Arc::new(AtomicUsize::new(1));
+		let slot = ConnSlot(counter.clone());
+		let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			let _held_slot = slot;
+			let mut buf = Vec::new();
+			let _ = crate::jobs::run_job(
+				&mut buf,
+				Duration::from_secs(1),
+				snip_core::gitrun::CancelToken::new(),
+				|_| panic!("simulated job panic"),
+			);
+		}));
+		assert_eq!(counter.load(Ordering::SeqCst), 0);
 	}
 }

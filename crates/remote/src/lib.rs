@@ -25,6 +25,8 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Serialize};
 
 pub mod client;
+pub(crate) mod gitserve;
+pub(crate) mod jobs;
 pub mod proto;
 pub mod store;
 pub mod tls;
