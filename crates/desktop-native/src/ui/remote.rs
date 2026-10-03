@@ -164,6 +164,7 @@ impl WorkbenchModel {
 						out.push(
 							menu_row(SharedString::from(id.clone()), 84)
 								.pl(px(32.))
+								.tooltip(tip(ws.path.clone()))
 								.on_click(cx.listener(move |this, _, _, cx| {
 									this.open_remote_workspace(ix, wx, cx);
 								}))
