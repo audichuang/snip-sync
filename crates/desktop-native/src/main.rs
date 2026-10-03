@@ -1164,6 +1164,10 @@ pub struct WorkbenchModel {
 	pub e2e_export_hold: Option<PathBuf>,
 	pub workspace_open: bool,
 	pub workspace_menu: bool,
+	/// Where the workspace menu button was drawn: a press there toggles the
+	/// menu, so the menu's outside-press close must leave it alone.
+	pub workspace_menu_button:
+		std::rc::Rc<std::cell::Cell<Option<Bounds<gpui::Pixels>>>>,
 	pub workspace_picker: bool,
 	pub workspace_path_input: Entity<TextInput>,
 	/// Remembered workspaces, newest first.
@@ -1366,11 +1370,13 @@ impl WorkbenchModel {
 		});
 		cx.subscribe(
 			&workspace_path_input,
-			|this, input, ev: &InputEvent, cx| {
-				if matches!(ev, InputEvent::Submit) {
+			|this, input, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => {
 					let text = input.read(cx).text().trim().to_string();
 					this.confirm_open_workspace(&text, cx);
 				}
+				InputEvent::Dismiss => this.close_workspace_menu(cx),
+				_ => {}
 			},
 		)
 		.detach();
@@ -1381,10 +1387,10 @@ impl WorkbenchModel {
 			TextInput::new(i18n::t("remote_code_placeholder", loc), 72, cx)
 		});
 		for input in [&remote_addr_input, &remote_code_input] {
-			cx.subscribe(input, |this, _, ev: &InputEvent, cx| {
-				if matches!(ev, InputEvent::Submit) {
-					this.pair_remote_worker(cx);
-				}
+			cx.subscribe(input, |this, _, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => this.pair_remote_worker(cx),
+				InputEvent::Dismiss => this.close_workspace_menu(cx),
+				_ => {}
 			})
 			.detach();
 		}
@@ -1544,6 +1550,7 @@ impl WorkbenchModel {
 			e2e_export_hold: ui::e2e_export_hold(),
 			workspace_open: workspace.is_some(),
 			workspace_menu: false,
+			workspace_menu_button: Default::default(),
 			workspace_picker: false,
 			workspace_path_input,
 			recent_workspaces: recent::load(),
@@ -2690,6 +2697,13 @@ impl WorkbenchModel {
 		}
 		self.set_status("workspace_opening", [path.display().to_string()]);
 		self.reload_repos(cx);
+	}
+
+	/// Escape in one of its fields, or a press outside it.
+	pub fn close_workspace_menu(&mut self, cx: &mut Context<Self>) {
+		self.workspace_menu = false;
+		self.workspace_picker = false;
+		cx.notify();
 	}
 
 	pub fn toggle_workspace_menu(&mut self, cx: &mut Context<Self>) {
@@ -6529,6 +6543,46 @@ mod tests {
 				assert!(m.remote.workers.is_empty());
 				assert!(m.remote.session.is_none(), "session closed");
 				assert!(!m.workspace_open && m.ws_tree.is_none());
+			});
+		}
+
+		/// The workspace menu closes on Escape in the pairing form and on a
+		/// second press of its own button, as a popup menu should.
+		#[gpui::test]
+		fn workspace_menu_closes_on_escape_and_on_its_button(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "a", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			model.update(cx, |m, cx| {
+				m.toggle_workspace_menu(cx);
+				m.show_remote_pairing(cx);
+			});
+			settle(cx);
+			let addr = model.read_with(cx, |m, cx| {
+				assert!(m.workspace_menu);
+				m.remote_addr_input.read(cx).handle()
+			});
+			assert!(
+				cx.update(|window, _| addr.is_focused(window)),
+				"the address field has the focus"
+			);
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_menu, "Escape in the pairing form");
+			});
+
+			model.update(cx, |m, cx| m.toggle_workspace_menu(cx));
+			settle(cx);
+			let button = cx
+				.debug_bounds("btn-workspace-menu")
+				.expect("menu button drawn");
+			cx.simulate_click(button.center(), gpui::Modifiers::none());
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_menu, "second press of the button");
 			});
 		}
 
