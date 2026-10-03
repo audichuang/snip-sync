@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::browser::{
+	BlobText, CommitSummary, GitPreview, LogQuery, RefSnapshot, TreeEntry,
+};
 use crate::format::ChangeType;
-use crate::gitrun::RunOptions;
+use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{self, ChangedPaths, Git, GitError, GitSource};
 use crate::workspace::{
 	declared_submodules, status_details, summarize, summarize_with_details,
@@ -490,6 +493,280 @@ pub fn identify_repo(path: &Path, opts: &RunOptions) -> FoundRepo {
 	}
 }
 
+/// The limits a view read runs under. Each variant is one combination the
+/// desktop uses today; `options` rebuilds it exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadProfile {
+	/// RunOptions::interactive — lists, refs, log, details.
+	Interactive,
+	/// interactive + max_stdout = PREVIEW_LIMIT, Overflow::Error.
+	InteractivePreview,
+	/// preview() + max_stdout = PREVIEW_LIMIT, Overflow::Error.
+	PreviewStrict,
+	/// plain RunOptions::preview — 15 s, 1 MiB, Overflow::Truncate.
+	Preview,
+}
+
+impl ReadProfile {
+	pub fn options(self, cancel: Option<CancelToken>) -> RunOptions {
+		match self {
+			Self::Interactive => RunOptions::interactive(cancel),
+			Self::InteractivePreview => RunOptions {
+				max_stdout: crate::browser::PREVIEW_LIMIT,
+				overflow: crate::gitrun::Overflow::Error,
+				..RunOptions::interactive(cancel)
+			},
+			Self::PreviewStrict => RunOptions {
+				max_stdout: crate::browser::PREVIEW_LIMIT,
+				overflow: crate::gitrun::Overflow::Error,
+				..RunOptions::preview(cancel)
+			},
+			Self::Preview => RunOptions::preview(cancel),
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct Read {
+	pub profile: ReadProfile,
+	pub cancel: Option<CancelToken>,
+}
+
+pub trait RepoView: Send + Sync {
+	fn change_list(
+		&self,
+		max_rows: usize,
+		read: &Read,
+	) -> Result<ChangeList, GitError>;
+	fn refs(&self, read: &Read) -> Result<RefSnapshot, GitError>;
+	fn resolve_commit(
+		&self,
+		rev: &str,
+		read: &Read,
+	) -> Result<String, GitError>;
+	fn log_from_tips(
+		&self,
+		tips: &[String],
+		skip: usize,
+		limit: usize,
+		read: &Read,
+	) -> Result<(Vec<CommitSummary>, bool), GitError>;
+	fn history_query(
+		&self,
+		reference: Option<&str>,
+		query: &LogQuery,
+		skip: usize,
+		limit: usize,
+		read: &Read,
+	) -> Result<(Vec<CommitSummary>, bool), GitError>;
+	fn commit_details(
+		&self,
+		sha: &str,
+		read: &Read,
+	) -> Result<CommitDetails, GitError>;
+	fn user_email(&self, read: &Read) -> Option<String>;
+	fn changed_paths(
+		&self,
+		source: &GitSource,
+		max: usize,
+		read: &Read,
+	) -> Result<ChangedPathList, GitError>;
+	/// `listed`: the change type and, for a log row, the parents, when the
+	/// caller listed the path itself. Honoured for Commit and Range only.
+	fn preview(
+		&self,
+		source: &GitSource,
+		path: &str,
+		listed: Option<(ChangeType, Option<&[String]>)>,
+		read: &Read,
+	) -> Result<GitPreview, GitError>;
+	fn changed_file_text(
+		&self,
+		source: &GitSource,
+		path: &str,
+		max: u64,
+		read: &Read,
+	) -> Result<Option<String>, GitError>;
+	fn commit_directory(
+		&self,
+		rev: &str,
+		dir: &str,
+		limit: usize,
+		read: &Read,
+	) -> Result<(Vec<TreeEntry>, bool), GitError>;
+	fn commit_blob(
+		&self,
+		rev: &str,
+		path: &str,
+		max: u64,
+		read: &Read,
+	) -> Result<BlobText, GitError>;
+}
+
+pub struct LocalRepo {
+	git: Git,
+	identity: Option<RepoIdentity>,
+}
+
+impl LocalRepo {
+	/// Spawns no process; identity cloned in.
+	pub fn known(identity: &RepoIdentity) -> Self {
+		Self {
+			git: Git::at_known_root(identity),
+			identity: Some(identity.clone()),
+		}
+	}
+
+	/// Opens the repository at `root` under the given read profile; identity is `None`.
+	pub fn open(root: &Path, read: &Read) -> Result<Self, GitError> {
+		let opts = Self::opts(read);
+		let git = Git::open_with(root, &opts)?;
+		Ok(Self {
+			git,
+			identity: None,
+		})
+	}
+
+	pub fn identity(&self) -> Option<&RepoIdentity> {
+		self.identity.as_ref()
+	}
+
+	fn opts(read: &Read) -> RunOptions {
+		read.profile.options(read.cancel.clone())
+	}
+}
+
+impl RepoView for LocalRepo {
+	fn change_list(
+		&self,
+		max_rows: usize,
+		read: &Read,
+	) -> Result<ChangeList, GitError> {
+		let opts = Self::opts(read);
+		change_list_with(&self.git, self.identity.as_ref(), max_rows, &opts)
+	}
+
+	fn refs(&self, read: &Read) -> Result<RefSnapshot, GitError> {
+		let opts = Self::opts(read);
+		crate::browser::refs_with(&self.git, &opts)
+	}
+
+	fn resolve_commit(
+		&self,
+		rev: &str,
+		read: &Read,
+	) -> Result<String, GitError> {
+		let opts = Self::opts(read);
+		self.git.resolve_commit_with(rev, &opts)
+	}
+
+	fn log_from_tips(
+		&self,
+		tips: &[String],
+		skip: usize,
+		limit: usize,
+		read: &Read,
+	) -> Result<(Vec<CommitSummary>, bool), GitError> {
+		let opts = Self::opts(read);
+		crate::browser::log_from_tips_with(&self.git, tips, skip, limit, &opts)
+	}
+
+	fn history_query(
+		&self,
+		reference: Option<&str>,
+		query: &LogQuery,
+		skip: usize,
+		limit: usize,
+		read: &Read,
+	) -> Result<(Vec<CommitSummary>, bool), GitError> {
+		let opts = Self::opts(read);
+		crate::browser::history_query_with(
+			&self.git, reference, query, skip, limit, &opts,
+		)
+	}
+
+	fn commit_details(
+		&self,
+		sha: &str,
+		read: &Read,
+	) -> Result<CommitDetails, GitError> {
+		let opts = Self::opts(read);
+		commit_details_with(&self.git, sha, &opts)
+	}
+
+	fn user_email(&self, read: &Read) -> Option<String> {
+		let opts = Self::opts(read);
+		user_email_with(&self.git, &opts)
+	}
+
+	fn changed_paths(
+		&self,
+		source: &GitSource,
+		max: usize,
+		read: &Read,
+	) -> Result<ChangedPathList, GitError> {
+		let opts = Self::opts(read);
+		changed_paths_with(&self.git, source, max, &opts)
+	}
+
+	fn preview(
+		&self,
+		source: &GitSource,
+		path: &str,
+		listed: Option<(ChangeType, Option<&[String]>)>,
+		read: &Read,
+	) -> Result<GitPreview, GitError> {
+		let opts = Self::opts(read);
+		match (listed, source) {
+			(
+				Some((change, parents)),
+				GitSource::Commit(_) | GitSource::Range(..),
+			) => crate::browser::git_preview_for(
+				&self.git, source, path, change, parents, &opts,
+			),
+			_ => {
+				crate::browser::git_preview_with(&self.git, source, path, &opts)
+			}
+		}
+	}
+
+	fn changed_file_text(
+		&self,
+		source: &GitSource,
+		path: &str,
+		max: u64,
+		read: &Read,
+	) -> Result<Option<String>, GitError> {
+		let opts = Self::opts(read);
+		crate::gitsrc::read_changed_file_with(
+			&self.git, source, path, max, &opts,
+		)
+		.map(|opt| opt.and_then(|f| f.content))
+	}
+
+	fn commit_directory(
+		&self,
+		rev: &str,
+		dir: &str,
+		limit: usize,
+		read: &Read,
+	) -> Result<(Vec<TreeEntry>, bool), GitError> {
+		let opts = Self::opts(read);
+		crate::browser::commit_directory_with(&self.git, rev, dir, limit, &opts)
+	}
+
+	fn commit_blob(
+		&self,
+		rev: &str,
+		path: &str,
+		max: u64,
+		read: &Read,
+	) -> Result<BlobText, GitError> {
+		let opts = Self::opts(read);
+		crate::browser::commit_blob_with(&self.git, rev, path, max, &opts)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -943,5 +1220,440 @@ mod tests {
 		};
 		let h2 = h1.clone();
 		assert_eq!(h1, h2);
+	}
+
+	#[test]
+	fn read_profile_options_match_todays_run_options() {
+		use crate::gitrun::{CancelToken, GitPool, Overflow, RunOptions};
+
+		// 1. Interactive
+		let opt = ReadProfile::Interactive.options(None);
+		let exp = RunOptions::interactive(None);
+		assert_eq!(opt.timeout, exp.timeout);
+		assert_eq!(opt.queue_timeout, exp.queue_timeout);
+		assert_eq!(opt.max_stdout, exp.max_stdout);
+		assert_eq!(opt.overflow, exp.overflow);
+		assert_eq!(opt.pool, GitPool::Local);
+		assert!(opt.cancel.is_none());
+
+		// 2. InteractivePreview
+		let opt = ReadProfile::InteractivePreview.options(None);
+		let exp = RunOptions {
+			max_stdout: crate::browser::PREVIEW_LIMIT,
+			overflow: Overflow::Error,
+			..RunOptions::interactive(None)
+		};
+		assert_eq!(opt.timeout, exp.timeout);
+		assert_eq!(opt.queue_timeout, exp.queue_timeout);
+		assert_eq!(opt.max_stdout, exp.max_stdout);
+		assert_eq!(opt.overflow, exp.overflow);
+		assert_eq!(opt.pool, GitPool::Local);
+		assert!(opt.cancel.is_none());
+
+		// 3. PreviewStrict
+		let opt = ReadProfile::PreviewStrict.options(None);
+		let exp = RunOptions {
+			max_stdout: crate::browser::PREVIEW_LIMIT,
+			overflow: Overflow::Error,
+			..RunOptions::preview(None)
+		};
+		assert_eq!(opt.timeout, exp.timeout);
+		assert_eq!(opt.queue_timeout, exp.queue_timeout);
+		assert_eq!(opt.max_stdout, exp.max_stdout);
+		assert_eq!(opt.overflow, exp.overflow);
+		assert_eq!(opt.pool, GitPool::Local);
+		assert!(opt.cancel.is_none());
+
+		// 4. Preview
+		let opt = ReadProfile::Preview.options(None);
+		let exp = RunOptions::preview(None);
+		assert_eq!(opt.timeout, exp.timeout);
+		assert_eq!(opt.queue_timeout, exp.queue_timeout);
+		assert_eq!(opt.max_stdout, exp.max_stdout);
+		assert_eq!(opt.overflow, exp.overflow);
+		assert_eq!(opt.pool, GitPool::Local);
+		assert!(opt.cancel.is_none());
+
+		// Check cancel token carried
+		for profile in [
+			ReadProfile::Interactive,
+			ReadProfile::InteractivePreview,
+			ReadProfile::PreviewStrict,
+			ReadProfile::Preview,
+		] {
+			let token = CancelToken::new();
+			let opt = profile.options(Some(token));
+			assert!(opt.cancel.is_some());
+		}
+
+		// Serde round trip for all variants of ReadProfile
+		for profile in [
+			ReadProfile::Interactive,
+			ReadProfile::InteractivePreview,
+			ReadProfile::PreviewStrict,
+			ReadProfile::Preview,
+		] {
+			let json = serde_json::to_string(&profile).expect("serialize");
+			let de: ReadProfile =
+				serde_json::from_str(&json).expect("deserialize");
+			assert_eq!(profile, de);
+		}
+	}
+
+	#[test]
+	fn local_repo_matches_the_direct_core_calls() {
+		if !has_git() {
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run_git(root, &["init", "-q", "-b", "main"]);
+		run_git(root, &["config", "user.name", "Tester"]);
+		run_git(root, &["config", "user.email", "tester@test.local"]);
+
+		// Commit 1: a.txt and unmodified.txt
+		std::fs::write(root.join("a.txt"), "hello world\n").unwrap();
+		std::fs::write(root.join("unmodified.txt"), "unmodified content\n")
+			.unwrap();
+		run_git(root, &["add", "a.txt", "unmodified.txt"]);
+		run_git(
+			root,
+			&[
+				"-c",
+				"user.name=Tester",
+				"-c",
+				"user.email=tester@test.local",
+				"commit",
+				"-qm",
+				"initial commit",
+			],
+		);
+
+		// Commit 2: modify a.txt
+		std::fs::write(root.join("a.txt"), "hello world\nsecond line\n")
+			.unwrap();
+		run_git(
+			root,
+			&[
+				"-c",
+				"user.name=Tester",
+				"-c",
+				"user.email=tester@test.local",
+				"commit",
+				"-am",
+				"second commit",
+			],
+		);
+
+		// Working tree state:
+		// a.txt: modified in working tree
+		std::fs::write(
+			root.join("a.txt"),
+			"hello world\nsecond line\nworking line\n",
+		)
+		.unwrap();
+		// staged.txt: staged
+		std::fs::write(root.join("staged.txt"), "staged content\n").unwrap();
+		run_git(root, &["add", "staged.txt"]);
+		// untracked.txt: untracked
+		std::fs::write(root.join("untracked.txt"), "untracked content\n")
+			.unwrap();
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let opts = read.profile.options(None);
+
+		let open_repo = LocalRepo::open(root, &read).unwrap();
+		let git = Git::open_with(root, &opts).unwrap();
+		let identity = RepoIdentity::resolve(&git, &opts).unwrap();
+		let known_repo = LocalRepo::known(&identity);
+
+		assert_eq!(open_repo.identity(), None);
+		assert_eq!(known_repo.identity(), Some(&identity));
+
+		// 1. change_list
+		let cl_open = open_repo.change_list(100, &read).unwrap();
+		let cl_direct_open = change_list_with(&git, None, 100, &opts).unwrap();
+		assert_eq!(cl_open, cl_direct_open);
+		assert!(cl_open.summary.is_none());
+
+		let cl_known = known_repo.change_list(100, &read).unwrap();
+		let cl_direct_known =
+			change_list_with(&git, Some(&identity), 100, &opts).unwrap();
+		assert_eq!(cl_known, cl_direct_known);
+		assert!(cl_known.summary.is_some());
+		assert_eq!(cl_known.rows, cl_open.rows);
+		assert_eq!(cl_known.total, cl_open.total);
+
+		// 2. refs
+		let refs = known_repo.refs(&read).unwrap();
+		let direct_refs = crate::browser::refs_with(&git, &opts).unwrap();
+		assert_eq!(refs, direct_refs);
+
+		// 3. resolve_commit
+		let head = known_repo.resolve_commit("HEAD", &read).unwrap();
+		let direct_head = git.resolve_commit_with("HEAD", &opts).unwrap();
+		assert_eq!(head, direct_head);
+
+		// 4. log_from_tips
+		let tips = refs.tips();
+		let log = known_repo.log_from_tips(&tips, 0, 10, &read).unwrap();
+		let direct_log =
+			crate::browser::log_from_tips_with(&git, &tips, 0, 10, &opts)
+				.unwrap();
+		assert_eq!(log, direct_log);
+
+		// 5. history_query
+		let query = crate::browser::LogQuery::default();
+		let hq = known_repo
+			.history_query(None, &query, 0, 10, &read)
+			.unwrap();
+		let direct_hq = crate::browser::history_query_with(
+			&git, None, &query, 0, 10, &opts,
+		)
+		.unwrap();
+		assert_eq!(hq, direct_hq);
+
+		// 6. commit_details
+		let details = known_repo.commit_details(&head, &read).unwrap();
+		let direct_details = commit_details_with(&git, &head, &opts).unwrap();
+		assert_eq!(details, direct_details);
+
+		// 7. user_email
+		let email = known_repo.user_email(&read);
+		let direct_email = user_email_with(&git, &opts);
+		assert_eq!(email, direct_email);
+
+		// 8. changed_paths
+		let src_commit = GitSource::Commit(head.clone());
+		let cp = known_repo.changed_paths(&src_commit, 100, &read).unwrap();
+		let direct_cp =
+			changed_paths_with(&git, &src_commit, 100, &opts).unwrap();
+		assert_eq!(cp, direct_cp);
+
+		// 9. commit_directory
+		let cd = known_repo.commit_directory(&head, "", 100, &read).unwrap();
+		let direct_cd =
+			crate::browser::commit_directory_with(&git, &head, "", 100, &opts)
+				.unwrap();
+		assert_eq!(cd, direct_cd);
+
+		// 10. commit_blob
+		let cb = known_repo
+			.commit_blob(&head, "a.txt", 1024 * 1024, &read)
+			.unwrap();
+		let direct_cb = crate::browser::commit_blob_with(
+			&git,
+			&head,
+			"a.txt",
+			1024 * 1024,
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(cb, direct_cb);
+
+		// 11. changed_file_text
+		let cft = known_repo
+			.changed_file_text(&GitSource::Working, "a.txt", 1024 * 1024, &read)
+			.unwrap();
+		let direct_cft = crate::gitsrc::read_changed_file_with(
+			&git,
+			&GitSource::Working,
+			"a.txt",
+			1024 * 1024,
+			&opts,
+		)
+		.unwrap()
+		.and_then(|f| f.content);
+		assert_eq!(cft, direct_cft);
+
+		// 12. preview (Working/Staged/Commit with and without listed)
+		// Working without listed:
+		let p_work = known_repo
+			.preview(&GitSource::Working, "a.txt", None, &read)
+			.unwrap();
+		let direct_p_work = crate::browser::git_preview_with(
+			&git,
+			&GitSource::Working,
+			"a.txt",
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(p_work, direct_p_work);
+
+		// Working with listed:
+		let p_work_listed = known_repo
+			.preview(
+				&GitSource::Working,
+				"a.txt",
+				Some((ChangeType::Modified, None)),
+				&read,
+			)
+			.unwrap();
+		assert_eq!(p_work_listed, direct_p_work);
+
+		// Staged without listed:
+		let p_stage = known_repo
+			.preview(&GitSource::Staged, "staged.txt", None, &read)
+			.unwrap();
+		let direct_p_stage = crate::browser::git_preview_with(
+			&git,
+			&GitSource::Staged,
+			"staged.txt",
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(p_stage, direct_p_stage);
+
+		// Staged with listed:
+		let p_stage_listed = known_repo
+			.preview(
+				&GitSource::Staged,
+				"staged.txt",
+				Some((ChangeType::New, None)),
+				&read,
+			)
+			.unwrap();
+		assert_eq!(p_stage_listed, direct_p_stage);
+
+		// Commit without listed:
+		let p_commit = known_repo
+			.preview(&src_commit, "a.txt", None, &read)
+			.unwrap();
+		let direct_p_commit =
+			crate::browser::git_preview_with(&git, &src_commit, "a.txt", &opts)
+				.unwrap();
+		assert_eq!(p_commit, direct_p_commit);
+
+		// Commit with listed:
+		let p_commit_listed = known_repo
+			.preview(
+				&src_commit,
+				"a.txt",
+				Some((ChangeType::Modified, Some(&details.parents))),
+				&read,
+			)
+			.unwrap();
+		let direct_p_commit_listed = crate::browser::git_preview_for(
+			&git,
+			&src_commit,
+			"a.txt",
+			ChangeType::Modified,
+			Some(&details.parents),
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(p_commit_listed, direct_p_commit_listed);
+	}
+
+	#[test]
+	fn local_repo_preview_uses_membership_for_working_and_staged() {
+		if !has_git() {
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run_git(root, &["init", "-q", "-b", "main"]);
+		run_git(root, &["config", "user.name", "Tester"]);
+		run_git(root, &["config", "user.email", "tester@test.local"]);
+
+		std::fs::write(root.join("unmodified.txt"), "committed\n").unwrap();
+		std::fs::write(root.join("modified.txt"), "v1\n").unwrap();
+		run_git(root, &["add", "unmodified.txt", "modified.txt"]);
+		run_git(root, &["commit", "-qm", "initial"]);
+
+		// Modify modified.txt in working copy
+		std::fs::write(root.join("modified.txt"), "v2\n").unwrap();
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let repo = LocalRepo::open(root, &read).unwrap();
+		let opts = read.profile.options(None);
+		let git = Git::open_with(root, &opts).unwrap();
+		let head = git.resolve_commit_with("HEAD", &opts).unwrap();
+
+		// For Working and Staged, passing listed = Some(...) for unmodified file
+		// must return GitError::Malformed("Path is not in this Git source")
+		let err_work = repo
+			.preview(
+				&GitSource::Working,
+				"unmodified.txt",
+				Some((ChangeType::Modified, None)),
+				&read,
+			)
+			.unwrap_err();
+		assert!(
+			matches!(&err_work, GitError::Malformed(msg) if msg == "Path is not in this Git source"),
+			"expected Malformed, got {err_work:?}"
+		);
+
+		let err_stage = repo
+			.preview(
+				&GitSource::Staged,
+				"unmodified.txt",
+				Some((ChangeType::Modified, None)),
+				&read,
+			)
+			.unwrap_err();
+		assert!(
+			matches!(&err_stage, GitError::Malformed(msg) if msg == "Path is not in this Git source"),
+			"expected Malformed, got {err_stage:?}"
+		);
+
+		// With GitSource::Commit(head) and listed = Some(..), for a real changed path,
+		// result equals git_preview_for
+		let commit_preview = repo
+			.preview(
+				&GitSource::Commit(head.clone()),
+				"modified.txt",
+				Some((ChangeType::New, None)),
+				&read,
+			)
+			.unwrap();
+		let direct_commit_preview = crate::browser::git_preview_for(
+			&git,
+			&GitSource::Commit(head),
+			"modified.txt",
+			ChangeType::New,
+			None,
+			&opts,
+		)
+		.unwrap();
+		assert_eq!(commit_preview, direct_commit_preview);
+
+		// Working preview of genuinely modified file with listed = None and with Some gives identical results
+		let p_none = repo
+			.preview(&GitSource::Working, "modified.txt", None, &read)
+			.unwrap();
+		let p_some = repo
+			.preview(
+				&GitSource::Working,
+				"modified.txt",
+				Some((ChangeType::Modified, None)),
+				&read,
+			)
+			.unwrap();
+		assert_eq!(p_none, p_some);
+	}
+
+	#[test]
+	fn local_repo_trait_object_and_send_sync() {
+		fn assert_send_sync<T: Send + Sync>() {}
+		fn take_repo_view(_view: &dyn RepoView) {}
+
+		assert_send_sync::<LocalRepo>();
+
+		let identity = RepoIdentity {
+			toplevel: PathBuf::from("/nonexistent/repo"),
+			git_dir: PathBuf::from("/nonexistent/repo/.git"),
+			common_dir: PathBuf::from("/nonexistent/repo/.git"),
+			kind: RepoKind::Main,
+		};
+		let repo = LocalRepo::known(&identity);
+		take_repo_view(&repo);
 	}
 }
