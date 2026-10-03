@@ -3,11 +3,13 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitrun::{Overflow, RunOptions};
 use crate::gitsrc::{self, Git, GitError, GitSource, EMPTY_TREE};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitSummary {
 	pub sha: String,
 	pub parents: Vec<String>,
@@ -17,13 +19,13 @@ pub struct CommitSummary {
 	pub subject: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitReference {
 	pub name: String,
 	pub sha: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryHistory {
 	pub root: String,
 	pub commits: Vec<CommitSummary>,
@@ -79,7 +81,7 @@ const VISIBLE_TIPS: [&str; 4] = ["--branches", "--remotes", "--tags", "HEAD"];
 
 /// Refs, HEAD and shallow boundaries read once, so later pages of one
 /// history walk the same tips even if the repository changes meanwhile.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefSnapshot {
 	/// Branches, remote-tracking branches and tags, each peeled to the
 	/// commit it names.
@@ -377,7 +379,7 @@ pub fn history_by_author_with(
 
 /// IntelliJ-style log filters, combined with AND. An empty query is the
 /// plain history.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogQuery {
 	/// Message text, or a commit hash (4+ hex digits that resolve).
 	pub text: String,
@@ -519,14 +521,14 @@ pub const MAX_TREE_ENTRIES: usize = 2000;
 /// Hard upper bound on stdout captured during commit directory listing (8 MiB).
 pub const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TreeKind {
 	Blob,
 	Tree,
 	Submodule,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
 	/// Repo-relative path.
 	pub path: String,
@@ -649,7 +651,7 @@ pub fn commit_directory_with(
 /// Largest blob read for preview (same as core's preview limit).
 pub const MAX_BLOB_BYTES: u64 = 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobText {
 	Text(String),
 	Binary,
@@ -729,7 +731,7 @@ pub struct SourcePreview {
 }
 
 /// A preview whose patch may be cut ([`git_preview_with`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitPreview {
 	pub content: Option<String>,
 	/// Whole hunks only: every hunk header counts exactly the lines kept.

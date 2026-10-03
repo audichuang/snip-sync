@@ -26,7 +26,7 @@ pub const MAX_SELECTION_READS: usize = 100;
 /// Commits of an open multi-selection whose full details are read.
 pub const MAX_SELECTION_DETAILS: usize = 20;
 /// Files listed for one commit or compare; more are counted, not kept.
-pub const MAX_COMMIT_FILES: usize = 5_000;
+pub const MAX_COMMIT_FILES: usize = snip_core::gitview::MAX_COMMIT_FILES;
 /// Rows shown in the commit tree at once.
 pub const MAX_REV_ROWS: usize = 2_000;
 /// Retained directories budget for RevTree browsing memory.
@@ -66,12 +66,12 @@ pub use browser::LogQuery;
 /// page and evicts the farthest one; evicted pages are read back from their
 /// graph checkpoints.
 pub const MAX_WINDOW_PAGES: usize = 10;
-/// Commit message bytes kept for the details pane.
-pub const MAX_DETAILS_MESSAGE: usize = 16 * 1024;
-/// Branches listed as containing the selected commit; more are counted.
-pub const MAX_CONTAINING_BRANCHES: usize = 20;
 /// Longest `user.email` kept to mark the user's own commits.
-const MAX_USER_EMAIL: usize = 256;
+pub const MAX_USER_EMAIL: usize = snip_core::gitview::MAX_USER_EMAIL;
+
+pub use snip_core::gitview::{
+	clip_utf8, commit_details_with, user_email_with, CommitDetails,
+};
 
 /// How a history read changes the loaded window of pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,35 +181,6 @@ pub fn date_range(
 	))
 }
 
-/// What the details pane shows beyond the log row.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CommitDetails {
-	pub sha: String,
-	pub parents: Vec<String>,
-	pub message: String,
-	pub author: String,
-	pub author_email: String,
-	pub author_date: String,
-	pub committer: String,
-	pub committer_email: String,
-	pub commit_date: String,
-	pub branches: Vec<String>,
-	/// More branches contain the commit than `branches` lists.
-	pub branches_more: bool,
-}
-
-fn clip_utf8(mut s: String, max: usize) -> String {
-	if s.len() > max {
-		let mut end = max;
-		while !s.is_char_boundary(end) {
-			end -= 1;
-		}
-		s.truncate(end);
-		s.push('…');
-	}
-	s.into_boxed_str().into_string()
-}
-
 /// A listed repository's Git: a resolved identity starts no process; an
 /// entry discovery could not identify is opened from its listed root.
 fn known_or_open(
@@ -221,88 +192,6 @@ fn known_or_open(
 		Some(id) => Ok(Git::at_known_root(id)),
 		None => Git::open_with(root, opts).map_err(|e| e.to_string()),
 	}
-}
-
-fn read_commit_details(
-	git: &Git,
-	sha: &str,
-	opts: &RunOptions,
-) -> Result<CommitDetails, String> {
-	let out = git
-		.run_with(
-			&[
-				"show",
-				"-s",
-				"--no-show-signature",
-				"--encoding=UTF-8",
-				"--format=%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B",
-				sha,
-				"--",
-			],
-			opts,
-		)
-		.map_err(|e| e.to_string())?;
-	let text = String::from_utf8_lossy(&out.stdout);
-	let mut f = text.splitn(8, '\0');
-	let parents: Vec<String> = f
-		.next()
-		.unwrap_or_default()
-		.split_whitespace()
-		.take(64)
-		.map(str::to_string)
-		.collect();
-	let author = f.next().unwrap_or_default().to_string();
-	let author_email = f.next().unwrap_or_default().to_string();
-	let author_date = f.next().unwrap_or_default().to_string();
-	let committer = f.next().unwrap_or_default().to_string();
-	let committer_email = f.next().unwrap_or_default().to_string();
-	let commit_date = f.next().unwrap_or_default().to_string();
-	let message = f.next().unwrap_or_default().trim().to_string();
-	// Best effort: a failure here only hides the branch list.
-	let contains = git
-		.run_with(
-			&[
-				"for-each-ref",
-				&format!("--count={}", MAX_CONTAINING_BRANCHES + 1),
-				"--contains",
-				sha,
-				"--format=%(refname:short)",
-				"refs/heads",
-				"refs/remotes",
-			],
-			opts,
-		)
-		.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-		.unwrap_or_default();
-	let mut branches: Vec<String> = contains
-		.lines()
-		.filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
-		.map(|l| clip_utf8(l.to_string(), 200))
-		.collect();
-	let branches_more = branches.len() > MAX_CONTAINING_BRANCHES;
-	branches.truncate(MAX_CONTAINING_BRANCHES);
-	Ok(CommitDetails {
-		sha: sha.to_string(),
-		parents,
-		message: clip_utf8(message, MAX_DETAILS_MESSAGE),
-		author: clip_utf8(author, 200),
-		author_email: clip_utf8(author_email, 200),
-		author_date: clip_utf8(author_date, 64),
-		committer: clip_utf8(committer, 200),
-		committer_email: clip_utf8(committer_email, 200),
-		commit_date: clip_utf8(commit_date, 64),
-		branches,
-		branches_more,
-	})
-}
-
-/// `user.email`, when set, to mark the user's own commits.
-fn read_user_email(git: &Git, opts: &RunOptions) -> Option<String> {
-	let out = git
-		.run_with(&["config", "--get", "user.email"], opts)
-		.ok()?;
-	let email = String::from_utf8_lossy(&out.stdout).trim().to_string();
-	(!email.is_empty() && email.len() <= MAX_USER_EMAIL).then_some(email)
 }
 
 /// Lazily listed tree of one commit (no checkout).
@@ -1383,7 +1272,7 @@ impl WorkbenchModel {
 										&opts,
 									)
 									.ok()?;
-									read_user_email(&git, &opts)
+									user_email_with(&git, &opts)
 								})
 								.flatten();
 							return read_graph_page(
@@ -1400,7 +1289,7 @@ impl WorkbenchModel {
 						} else {
 							let snap = browser::refs_with(&git, &opts)
 								.map_err(|e| e.to_string())?;
-							(snap.refs, snap.head, read_user_email(&git, &opts))
+							(snap.refs, snap.head, user_email_with(&git, &opts))
 						};
 						let (commits, has_more) = browser::history_query_with(
 							&git,
@@ -2129,7 +2018,8 @@ impl WorkbenchModel {
 						let opts = crate::interactive_read_opts(cancel);
 						let git =
 							known_or_open(identity.as_ref(), &root, &opts)?;
-						read_commit_details(&git, &sha, &opts)
+						commit_details_with(&git, &sha, &opts)
+							.map_err(|e| e.to_string())
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2210,7 +2100,7 @@ impl WorkbenchModel {
 								)
 								.ok()?;
 								let mut d =
-									read_commit_details(&git, &sha, &opts)
+									commit_details_with(&git, &sha, &opts)
 										.ok()?;
 								d.sha = id;
 								Some(d)
@@ -2593,12 +2483,14 @@ impl WorkbenchModel {
 						// 有 identity 時不起 probe 程序；沒有則從列出的 root 開啟。
 						let git =
 							known_or_open(identity.as_ref(), &root, &listing)?;
-						let (files, gitlinks) =
-							gitsrc::list_changed_paths_and_gitlinks_with(
-								&git, &source, &listing,
-							)
-							.map_err(|e| e.to_string())?;
-						let first = files.first().map(|(p, change)| {
+						let list = snip_core::gitview::changed_paths_with(
+							&git,
+							&source,
+							MAX_COMMIT_FILES,
+							&listing,
+						)
+						.map_err(|e| e.to_string())?;
+						let first = list.paths.first().map(|(p, change)| {
 							(
 								p.clone(),
 								read_preview(
@@ -2611,7 +2503,12 @@ impl WorkbenchModel {
 								),
 							)
 						});
-						Ok::<_, String>((files, gitlinks, first))
+						Ok::<_, String>((
+							list.paths,
+							list.gitlinks,
+							list.total,
+							first,
+						))
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2619,9 +2516,7 @@ impl WorkbenchModel {
 						return;
 					}
 					match res {
-						Ok((mut files, gitlinks, first)) => {
-							let total = files.len();
-							files.truncate(MAX_COMMIT_FILES);
+						Ok((mut files, gitlinks, total, first)) => {
 							files.shrink_to_fit();
 							app_log!("[APP:E2E_CHANGES: files={}]", total);
 							if total > MAX_COMMIT_FILES {
@@ -3337,7 +3232,7 @@ fn read_feed_page(
 		more: false,
 		snapshot: None,
 		tips,
-		email: want_email.then(|| read_user_email(&git, opts)).flatten(),
+		email: want_email.then(|| user_email_with(&git, opts)).flatten(),
 	};
 	if first {
 		let snap = browser::refs_with(&git, opts).map_err(|e| e.to_string())?;

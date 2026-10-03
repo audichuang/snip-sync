@@ -10,6 +10,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 pub use crate::blob::{
 	read_batch_header, read_batch_response, CatFile, CatObject,
 	DELETED_FILE_MARKER,
@@ -536,7 +538,7 @@ pub fn change_type_for_status(status: u8) -> ChangeType {
 }
 
 /// Which changes to copy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitSource {
 	/// Every uncommitted change, labelled and read like the SCM view:
 	/// working tree, then untracked, then index; content from disk.

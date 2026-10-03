@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime};
 
+use serde::{Deserialize, Serialize};
+
 use crate::format::ChangeType;
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{Git, GitError};
@@ -42,7 +44,7 @@ impl ScanBudget {
 	}
 
 	/// Why the scan must stop now, if it must.
-	fn stop(&self, visited: usize) -> Option<ScanStatus> {
+	pub fn stop(&self, visited: usize) -> Option<ScanStatus> {
 		if self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
 			Some(ScanStatus::Cancelled)
 		} else if self.deadline.is_some_and(|d| Instant::now() >= d) {
@@ -56,7 +58,7 @@ impl ScanBudget {
 }
 
 /// How a scan call ended. Only `Complete` means everything was seen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScanStatus {
 	Complete,
 	/// The call's budget ran out; call again to continue.
@@ -807,7 +809,9 @@ impl Drop for HeavyGuard {
 // Summaries
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(
+	Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 pub struct ChangeCounts {
 	/// Paths with an index change (X of `XY`).
 	pub staged: usize,

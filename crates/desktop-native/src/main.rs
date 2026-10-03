@@ -204,9 +204,8 @@ use snip_core::transfer::{
 	CanonicalRootId, ExportItem, ExportSelection, FolderExpansion, SourceKind,
 };
 use snip_core::workspace::{
-	declared_submodules, status_details, summarize, summarize_with_details,
-	summarize_with_identity, DiscoveredRepo, Discovery, RepoIdentity, RepoKind,
-	RepoSummary, ScanBudget, ScanStatus, SubmoduleState,
+	DiscoveredRepo, Discovery, RepoIdentity, RepoSummary, ScanBudget,
+	ScanStatus,
 };
 
 use crate::history::RevTree;
@@ -318,7 +317,7 @@ type WorkingChangeTuple = (String, Option<ChangeType>, SourceKind, bool);
 /// Rows kept per repo in the Changes tool window. Every repo's rows count
 /// against `MAX_RETAINED_TREE_BYTES` and each checkbox click clones them, so
 /// 15 repos at this cap stay well inside that budget.
-pub const MAX_CHANGES_PER_REPO: usize = 2_000;
+pub const MAX_CHANGES_PER_REPO: usize = snip_core::gitview::MAX_CHANGE_ROWS;
 
 /// Status reads the Changes queue runs at once (the Git runner's own limit).
 pub const MAX_CHANGES_READS: usize = 2;
@@ -480,36 +479,41 @@ fn read_change_list(
 	cancel: CancelToken,
 ) -> Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>), String> {
 	let opts = interactive_read_opts(cancel);
-	// A known identity skips the open and the identity reads, and one
-	// status feeds both the list and the repo's summary.
-	let (summary, details) = match known {
-		Some(id) => {
-			let git = Git::at_known_root(id);
-			let (summary, details) = summarize_with_details(&git, id, &opts)
-				.map_err(|e| e.to_string())?;
-			(Some(summary), details)
-		}
-		None => {
-			let git = Git::open_with(root, &opts).map_err(|e| e.to_string())?;
-			let details =
-				status_details(&git, &opts).map_err(|e| e.to_string())?;
-			(None, details)
-		}
+	let (git, known_id) = match known {
+		Some(id) => (Git::at_known_root(id), Some(id)),
+		None => (
+			Git::open_with(root, &opts).map_err(|e| e.to_string())?,
+			None,
+		),
 	};
-	let mut items = Vec::new();
-	for (p, ct) in details.staged {
-		items.push((p, ct, SourceKind::Staged, false));
-	}
-	for (p, ct) in details.unstaged {
-		items.push((p, ct, SourceKind::Unstaged, false));
-	}
-	for p in details.untracked {
-		items.push((p, Some(ChangeType::New), SourceKind::Working, false));
-	}
-	for p in details.conflicted {
-		items.push((p, Some(ChangeType::Modified), SourceKind::Working, true));
-	}
-	items.sort_by(|a, b| a.0.cmp(&b.0));
+	let list =
+		snip_core::gitview::change_list_with(&git, known_id, usize::MAX, &opts)
+			.map_err(|e| e.to_string())?;
+	let summary = match (known, list.summary) {
+		(Some(id), Some(s)) => Some(RepoSummary {
+			identity: id.clone(),
+			head: s.head,
+			branch: s.branch,
+			changes: s.changes,
+		}),
+		_ => None,
+	};
+	let items = list
+		.rows
+		.into_iter()
+		.map(|r| {
+			let source = match r.source {
+				snip_core::gitview::ChangeSource::Staged => SourceKind::Staged,
+				snip_core::gitview::ChangeSource::Unstaged => {
+					SourceKind::Unstaged
+				}
+				snip_core::gitview::ChangeSource::Working => {
+					SourceKind::Working
+				}
+			};
+			(r.path, r.change_type, source, r.conflict)
+		})
+		.collect();
 	Ok((summary, items))
 }
 
@@ -527,6 +531,23 @@ pub enum RepoEntryKind {
 	UninitializedSubmodule,
 }
 
+impl From<snip_core::gitview::FoundKind> for RepoEntryKind {
+	fn from(kind: snip_core::gitview::FoundKind) -> Self {
+		match kind {
+			snip_core::gitview::FoundKind::Main => RepoEntryKind::Main,
+			snip_core::gitview::FoundKind::LinkedWorktree => {
+				RepoEntryKind::LinkedWorktree
+			}
+			snip_core::gitview::FoundKind::Submodule => {
+				RepoEntryKind::Submodule
+			}
+			snip_core::gitview::FoundKind::UninitializedSubmodule => {
+				RepoEntryKind::UninitializedSubmodule
+			}
+		}
+	}
+}
+
 /// One discovered repository; a failed status read stays visible as an error
 /// instead of silently disappearing or showing as clean.
 #[derive(Clone, Debug)]
@@ -536,6 +557,18 @@ pub struct RepoEntry {
 	pub kind: RepoEntryKind,
 	pub identity: Option<RepoIdentity>,
 	pub summary: Result<RepoSummary, String>,
+}
+
+impl From<snip_core::gitview::FoundRepo> for RepoEntry {
+	fn from(repo: snip_core::gitview::FoundRepo) -> Self {
+		RepoEntry {
+			root: repo.root,
+			name: repo.name,
+			kind: repo.kind.into(),
+			identity: repo.identity,
+			summary: repo.summary,
+		}
+	}
 }
 
 const MAX_RETAINED_TREE_BYTES: usize = 8 * 1024 * 1024;
@@ -2053,144 +2086,12 @@ impl WorkbenchModel {
 		discovered: Vec<DiscoveredRepo>,
 		opts: &RunOptions,
 	) -> (Vec<RepoEntry>, Vec<(PathBuf, String)>) {
-		let mut seen_identities: HashSet<(PathBuf, PathBuf)> = HashSet::new();
-		let mut seen_roots: HashSet<PathBuf> = HashSet::new();
-		let mut list = Vec::new();
-		let mut errors = Vec::new();
-
-		for r in discovered {
-			let canonical_path =
-				dunce::canonicalize(&r.path).unwrap_or_else(|_| r.path.clone());
-			let name = r
-				.path
-				.file_name()
-				.map(|n| n.to_string_lossy().into_owned())
-				.unwrap_or_else(|| r.path.display().to_string());
-
-			match Git::open_with(&r.path, opts) {
-				Ok(git) => {
-					let id_res = RepoIdentity::resolve(&git, opts);
-					let (kind, identity) = match &id_res {
-						Ok(id) => {
-							// Symlink alias dedup:
-							if !seen_identities.insert((
-								id.toplevel.clone(),
-								id.git_dir.clone(),
-							)) {
-								continue;
-							}
-							seen_roots.insert(canonical_path.clone());
-							let k = match id.kind {
-								RepoKind::LinkedWorktree => {
-									RepoEntryKind::LinkedWorktree
-								}
-								RepoKind::Submodule => RepoEntryKind::Submodule,
-								RepoKind::Main => RepoEntryKind::Main,
-							};
-							(k, Some(id.clone()))
-						}
-						Err(err) => {
-							let root = git.root().to_path_buf();
-							if !seen_roots.insert(root.clone()) {
-								continue;
-							}
-							list.push(RepoEntry {
-								root,
-								name,
-								kind: RepoEntryKind::Main,
-								identity: None,
-								summary: Err(format!(
-									"repository identity: {err}"
-								)),
-							});
-							continue;
-						}
-					};
-
-					let root = identity
-						.as_ref()
-						.map(|id| id.toplevel.clone())
-						.unwrap_or_else(|| git.root().to_path_buf());
-					let name = root
-						.file_name()
-						.map(|n| n.to_string_lossy().into_owned())
-						.unwrap_or(name);
-					// The identity was just resolved; reuse it.
-					let summary = match &identity {
-						Some(id) => summarize_with_identity(&git, id, opts),
-						None => summarize(&git, opts),
-					}
-					.map_err(|e| e.to_string());
-
-					list.push(RepoEntry {
-						root: root.clone(),
-						name,
-						kind,
-						identity,
-						summary,
-					});
-
-					let submodules = match declared_submodules(&git, opts) {
-						Ok(submodules) => submodules,
-						Err(err) => {
-							errors.push((root, format!("submodules: {err}")));
-							Vec::new()
-						}
-					};
-					{
-						for subm in submodules {
-							let sub_path = git.root().join(&subm.path);
-							let canonical_sub = dunce::canonicalize(&sub_path)
-								.unwrap_or_else(|_| sub_path.clone());
-							match subm.state {
-								SubmoduleState::NotCheckedOut
-									if seen_roots
-										.insert(canonical_sub.clone()) =>
-								{
-									list.push(RepoEntry {
-									root: sub_path,
-									name: subm.name,
-									kind: RepoEntryKind::UninitializedSubmodule,
-									identity: None,
-									summary: Err(
-										"Submodule not checked out (uninitialized)"
-											.into(),
-									),
-								});
-								}
-								SubmoduleState::Unreadable(reason)
-									if seen_roots.insert(canonical_sub) =>
-								{
-									list.push(RepoEntry {
-									root: sub_path,
-									name: subm.name,
-									kind: RepoEntryKind::UninitializedSubmodule,
-									identity: None,
-									summary: Err(format!(
-										"Submodule unreadable: {reason}"
-									)),
-								});
-								}
-								_ => {}
-							}
-						}
-					}
-				}
-				Err(e) => {
-					if seen_roots.insert(canonical_path) {
-						list.push(RepoEntry {
-							root: r.path,
-							name,
-							kind: RepoEntryKind::Main,
-							identity: None,
-							summary: Err(e.to_string()),
-						});
-					}
-				}
-			}
-		}
-
-		(list, errors)
+		let (found, errors) = snip_core::gitview::identify_repos(
+			discovered,
+			&snip_core::workspace::ScanBudget::visits(usize::MAX),
+			opts,
+		);
+		(found.into_iter().map(RepoEntry::from).collect(), errors)
 	}
 
 	pub fn disambiguate_repo_names(
@@ -5833,43 +5734,9 @@ fn resolve_added_repo(
 		cancel: Some(cancel.clone()),
 		..RunOptions::interactive(None)
 	};
-	let (root, kind, identity, summary) = match Git::open_with(&path, &opts) {
-		Ok(git) => {
-			let root = git.root().to_path_buf();
-			match RepoIdentity::resolve(&git, &opts) {
-				Ok(id) => {
-					let kind = match id.kind {
-						RepoKind::LinkedWorktree => {
-							RepoEntryKind::LinkedWorktree
-						}
-						RepoKind::Submodule => RepoEntryKind::Submodule,
-						RepoKind::Main => RepoEntryKind::Main,
-					};
-					let summary = summarize_with_identity(&git, &id, &opts)
-						.map_err(|err| err.to_string());
-					(id.toplevel.clone(), kind, Some(id), summary)
-				}
-				Err(err) => (
-					root,
-					RepoEntryKind::Main,
-					None,
-					Err(format!("repository identity: {err}")),
-				),
-			}
-		}
-		Err(err) => (path, RepoEntryKind::Main, None, Err(err.to_string())),
-	};
-	let name = root
-		.file_name()
-		.map(|n| n.to_string_lossy().into_owned())
-		.unwrap_or_else(|| root.display().to_string());
-	Ok(RepoEntry {
-		root,
-		name,
-		kind,
-		identity,
-		summary,
-	})
+	Ok(RepoEntry::from(snip_core::gitview::identify_repo(
+		&path, &opts,
+	)))
 }
 
 fn read_preview(
@@ -8569,6 +8436,7 @@ mod tests {
 
 	#[test]
 	fn prepared_removal_uses_admitted_identity_after_root_deletion() {
+		use snip_core::workspace::RepoKind;
 		let temp = tempfile::tempdir().unwrap();
 		let path = temp.path().join("selected");
 		std::fs::create_dir(&path).unwrap();
