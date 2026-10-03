@@ -95,14 +95,15 @@ impl WorkbenchModel {
 /// Translates Git errors encountered while querying refs into a displayable string.
 /// For remote hosts exceeding the worker's frame limit (`GitError::OutputLimit`),
 /// returns the localized message of `remote_refs_too_large`.
-pub(crate) fn refs_error(host: &GitHost, e: GitError) -> String {
+pub(crate) fn refs_error(
+	host: &GitHost,
+	e: GitError,
+	locale: crate::i18n::Locale,
+) -> String {
 	if matches!(host, GitHost::Remote { .. })
 		&& matches!(e, GitError::OutputLimit { .. })
 	{
-		// Background threads querying history have no workbench model context,
-		// so the application's default locale (zh-TW) is used for the error text.
-		crate::i18n::t("remote_refs_too_large", crate::i18n::Locale::default())
-			.to_string()
+		crate::i18n::t("remote_refs_too_large", locale).to_string()
 	} else {
 		e.to_string()
 	}
@@ -136,25 +137,41 @@ mod tests {
 		};
 		let local_host = GitHost::Local;
 
-		// Remote + OutputLimit -> localized text of remote_refs_too_large
+		// Remote + OutputLimit -> localized text of remote_refs_too_large (ZhTw and En)
+		let zh_err = refs_error(
+			&remote_host,
+			GitError::OutputLimit {
+				args: "remote view".into(),
+				limit: 0,
+			},
+			crate::i18n::Locale::ZhTw,
+		);
+		assert_eq!(zh_err, "遠端參照資料過大");
 		assert_eq!(
-			refs_error(
-				&remote_host,
-				GitError::OutputLimit {
-					args: "remote view".into(),
-					limit: 0,
-				}
-			),
-			crate::i18n::t(
-				"remote_refs_too_large",
-				crate::i18n::Locale::default()
-			)
+			zh_err,
+			crate::i18n::t("remote_refs_too_large", crate::i18n::Locale::ZhTw)
+		);
+		let en_err = refs_error(
+			&remote_host,
+			GitError::OutputLimit {
+				args: "remote view".into(),
+				limit: 0,
+			},
+			crate::i18n::Locale::En,
+		);
+		assert_eq!(en_err, "Remote references too large");
+		assert_eq!(
+			en_err,
+			crate::i18n::t("remote_refs_too_large", crate::i18n::Locale::En)
 		);
 
 		// Remote + other -> to_string()
 		let other_err = GitError::Host("server died".into());
 		let other_str = other_err.to_string();
-		assert_eq!(refs_error(&remote_host, other_err), other_str);
+		assert_eq!(
+			refs_error(&remote_host, other_err, crate::i18n::Locale::En),
+			other_str
+		);
 
 		// Local + OutputLimit -> to_string()
 		let local_err = GitError::OutputLimit {
@@ -162,7 +179,10 @@ mod tests {
 			limit: 0,
 		};
 		let local_str = local_err.to_string();
-		assert_eq!(refs_error(&local_host, local_err), local_str);
+		assert_eq!(
+			refs_error(&local_host, local_err, crate::i18n::Locale::En),
+			local_str
+		);
 	}
 
 	#[test]

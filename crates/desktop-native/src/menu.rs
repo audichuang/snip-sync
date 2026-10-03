@@ -362,14 +362,12 @@ impl WorkbenchModel {
 			),
 			MenuEntry::Sep,
 		];
-		if let Some(session) = &self.remote.session {
-			// The worker's own path, never revealed on this machine.
-			let abs = format!(
-				"{}/{}",
-				session.workspace.path,
-				row.rel_path.trim_end_matches('/')
-			);
-			v.extend(copy_entries(Some(abs), &row.rel_path));
+		if self.remote.session.is_some() {
+			let root = if ws { self.ws_root() } else { self.repo_root() };
+			let abs = root.map(|r| r.join(row.rel_path.trim_end_matches('/')));
+			let worker_path =
+				abs.as_deref().and_then(|p| self.remote_worker_path(p));
+			v.extend(copy_entries(worker_path, &row.rel_path));
 		} else if ws {
 			let abs = self
 				.ws_root()

@@ -74,6 +74,11 @@ pub enum GitError {
 		.0.display()
 	)]
 	NotARepository(PathBuf),
+	#[error(
+		"{} is inside a parent repository, not a repository root itself",
+		.0.display()
+	)]
+	ToplevelAbove(PathBuf),
 	#[error("invalid revision: {0}")]
 	InvalidRevision(String),
 	#[error(
@@ -162,6 +167,34 @@ fn run_strict(
 		});
 	}
 	Ok(output.stdout)
+}
+
+/// A temporary copy of a repository index file, cleaned up on drop.
+pub(crate) struct TempIndexFile {
+	path: PathBuf,
+}
+
+impl TempIndexFile {
+	fn create_from(source: &Path) -> io::Result<Self> {
+		let nanos = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_nanos())
+			.unwrap_or(0);
+		let path = std::env::temp_dir()
+			.join(format!("snip-diff-index-{}-{nanos}", std::process::id()));
+		std::fs::copy(source, &path)?;
+		Ok(Self { path })
+	}
+
+	fn path(&self) -> &Path {
+		&self.path
+	}
+}
+
+impl Drop for TempIndexFile {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_file(&self.path);
+	}
 }
 
 impl Git {
@@ -256,10 +289,11 @@ impl Git {
 		if let Some(ref b) = canonical_boundary {
 			let canonical_top = dunce::canonicalize(&top_path)?;
 			let canonical_dir = dunce::canonicalize(dir)?;
-			if canonical_top != canonical_dir || !canonical_top.starts_with(b) {
-				return Err(GitError::OutsideBoundary {
-					what: "repository (it is not the folder itself)",
-				});
+			if !canonical_top.starts_with(b) {
+				return Err(GitError::OutsideBoundary { what: "repository" });
+			}
+			if canonical_top != canonical_dir {
+				return Err(GitError::ToplevelAbove(dir.to_path_buf()));
 			}
 		}
 		Ok(Self {
@@ -304,6 +338,11 @@ impl Git {
 				"core.fsmonitor=false",
 				"-c",
 				"protocol.allow=never",
+				"-c",
+				#[cfg(windows)]
+				"core.hooksPath=NUL",
+				#[cfg(not(windows))]
+				"core.hooksPath=/dev/null",
 			]);
 			if let Some(parent) = b.parent() {
 				if !parent.as_os_str().is_empty() {
@@ -343,6 +382,42 @@ impl Git {
 	) -> Result<RunOutput, GitError> {
 		let mut cmd = self.command();
 		cmd.args(args);
+		self.exec(cmd, &args.join(" "), None, opts)
+	}
+
+	/// Creates a command for `diff`, ensuring that in boundary mode, any index
+	/// auto-refresh writes to a private temporary copy instead of the real index.
+	pub(crate) fn diff_command(
+		&self,
+		args: &[&str],
+		opts: &RunOptions,
+	) -> Result<(Command, Option<TempIndexFile>), GitError> {
+		let mut cmd = self.command();
+		cmd.args(args);
+		let mut temp_index = None;
+		if self.boundary.is_some() {
+			let out =
+				self.run_with(&["rev-parse", "--git-path", "index"], opts)?;
+			let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+			if !rel.is_empty() {
+				let index_path = self.root.join(rel);
+				if index_path.exists() {
+					let temp_file = TempIndexFile::create_from(&index_path)?;
+					cmd.env("GIT_INDEX_FILE", temp_file.path());
+					temp_index = Some(temp_file);
+				}
+			}
+		}
+		Ok((cmd, temp_index))
+	}
+
+	/// [`Git::run_with`] for `diff` invocations, isolating index writes in boundary mode.
+	pub fn run_diff_with(
+		&self,
+		args: &[&str],
+		opts: &RunOptions,
+	) -> Result<RunOutput, GitError> {
+		let (cmd, _temp_index) = self.diff_command(args, opts)?;
 		self.exec(cmd, &args.join(" "), None, opts)
 	}
 
@@ -739,6 +814,21 @@ fn unmerged(
 
 const RAW: [&str; 4] = ["-z", "--raw", "--no-abbrev", "-M"];
 
+fn run_strict_diff(
+	git: &Git,
+	args: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<u8>, GitError> {
+	let output = git.run_diff_with(args, opts)?;
+	if output.truncated {
+		return Err(GitError::OutputLimit {
+			args: args.join(" "),
+			limit: opts.max_stdout,
+		});
+	}
+	Ok(output.stdout)
+}
+
 fn diff(
 	git: &Git,
 	args: &[&str],
@@ -746,7 +836,7 @@ fn diff(
 ) -> Result<Vec<RawEntry>, GitError> {
 	let mut all = vec!["diff"];
 	all.extend_from_slice(args);
-	parse_raw_z(&run_strict(git, &all, opts)?)
+	parse_raw_z(&run_strict_diff(git, &all, opts)?)
 }
 
 /// Collects the changed files of `source` as payload files.
@@ -1081,6 +1171,12 @@ fn read_working(
 	path: &Path,
 	max: Option<u64>,
 ) -> Result<Option<String>, GitError> {
+	let Ok(meta) = std::fs::metadata(path) else {
+		return Ok(None);
+	};
+	if !meta.is_file() {
+		return Ok(None);
+	}
 	let Some(max) = max else {
 		return Ok(read_text_file(path).ok().flatten());
 	};
@@ -1151,7 +1247,12 @@ fn read_changes(
 								dunce::canonicalize(&file_path)?;
 							let canonical_root =
 								dunce::canonicalize(&git.root)?;
-							if !canonical_file.starts_with(&canonical_root) {
+							if !canonical_file.starts_with(&canonical_root)
+								|| !canonical_file
+									.metadata()
+									.map(|m| m.is_file())
+									.unwrap_or(false)
+							{
 								return Err(GitError::OutsideBoundary {
 									what: "working file",
 								});

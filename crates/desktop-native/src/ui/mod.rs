@@ -857,7 +857,7 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn change_item_rows(&self) -> Vec<ChangeItemRow> {
+	pub(crate) fn change_item_rows(&self) -> Vec<ChangeItemRow> {
 		change_rows(
 			&self.change_repos,
 			&self.files,

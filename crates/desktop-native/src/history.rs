@@ -793,6 +793,7 @@ fn read_graph_page(
 	skip: usize,
 	size: usize,
 	read: &Read,
+	locale: crate::i18n::Locale,
 ) -> Result<(browser::RepositoryHistory, HistoryWalk), String> {
 	let mut git: Option<Box<dyn RepoView>> = None;
 	let open = || host.open(repo_root, known, read);
@@ -802,7 +803,7 @@ fn read_graph_page(
 			let g = open()?;
 			let snap = g
 				.refs(read)
-				.map_err(|e| crate::githost::refs_error(host, e))?;
+				.map_err(|e| crate::githost::refs_error(host, e, locale))?;
 			let filter_tip =
 				match ref_filter.as_deref().filter(|r| !r.is_empty()) {
 					Some(r) => Some(
@@ -1235,6 +1236,7 @@ impl WorkbenchModel {
 		let want_email = matches!(load, PageLoad::Replace(0));
 		let repo_identity = self.identity_for(&repo_root);
 		let host = self.git_host();
+		let locale = self.locale;
 
 		self.spawn_owned(
 			cx,
@@ -1269,6 +1271,7 @@ impl WorkbenchModel {
 								skip,
 								page_size,
 								&read,
+								locale,
 							)
 							.map(|(h, w)| (h, Some(w), email));
 						};
@@ -1282,7 +1285,7 @@ impl WorkbenchModel {
 							(snapshot.0, snapshot.1, None)
 						} else {
 							let snap = g.refs(&read).map_err(|e| {
-								crate::githost::refs_error(&host, e)
+								crate::githost::refs_error(&host, e, locale)
 							})?;
 							(snap.refs, snap.head, g.user_email(&read))
 						};
@@ -1956,6 +1959,7 @@ impl WorkbenchModel {
 		self.reset_selection_details();
 		self.compare = None;
 		self.selected_file = None;
+		self.selected_file_root = None;
 		self.selected_commit_file = None;
 		self.commit_file_sel.clear();
 		self.commit_files.clear();
@@ -2259,6 +2263,7 @@ impl WorkbenchModel {
 		self.reset_selection_details();
 		self.compare = None;
 		self.selected_file = None;
+		self.selected_file_root = None;
 		self.selected_commit_file = None;
 		self.commit_file_sel.clear();
 		self.commit_files.clear();
@@ -2957,6 +2962,7 @@ impl WorkbenchModel {
 		let identity = self.identity_for(&root);
 
 		self.selected_file = None;
+		self.selected_file_root = None;
 		self.selected_commit_file = Some(path.clone());
 		self.commit_file_sel.clear();
 		self.preview_loading = true;
@@ -3251,6 +3257,7 @@ fn read_feed_page(
 	skip: usize,
 	want_email: bool,
 	read: &Read,
+	locale: crate::i18n::Locale,
 ) -> Result<FeedRead, String> {
 	let g = host.open(root, known, read)?;
 	let mut out = FeedRead {
@@ -3263,7 +3270,7 @@ fn read_feed_page(
 	if first {
 		let snap = g
 			.refs(read)
-			.map_err(|e| crate::githost::refs_error(host, e))?;
+			.map_err(|e| crate::githost::refs_error(host, e, locale))?;
 		let tips = match ref_filter.filter(|r| !r.is_empty()) {
 			// A branch filter picks that branch in every repository that
 			// has it; the others show nothing.
@@ -3631,6 +3638,7 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
+		let locale = self.locale;
 		let identity = self.identity_for(&root);
 		self.spawn_owned(
 			cx,
@@ -3654,6 +3662,7 @@ impl WorkbenchModel {
 							skip,
 							want_email,
 							&read,
+							locale,
 						)
 					})
 					.await;
@@ -4145,9 +4154,18 @@ mod tests {
 			cancel: None,
 		};
 		let host = crate::githost::GitHost::Local;
-		let (first, walk) =
-			read_graph_page(&host, root, None, None, None, 0, 2, &read)
-				.unwrap();
+		let (first, walk) = read_graph_page(
+			&host,
+			root,
+			None,
+			None,
+			None,
+			0,
+			2,
+			&read,
+			crate::i18n::Locale::default(),
+		)
+		.unwrap();
 		assert!(first.has_more);
 		// The repository moves on; later pages are sliced from the window
 		// page 0 fetched (frozen tips on refetch are covered in browser.rs).
@@ -4163,13 +4181,31 @@ mod tests {
 			"new",
 		]);
 		let reuse = Some((walk, first.refs.clone(), first.head.clone()));
-		let (second, walk) =
-			read_graph_page(&host, root, None, reuse, None, 2, 2, &read)
-				.unwrap();
+		let (second, walk) = read_graph_page(
+			&host,
+			root,
+			None,
+			reuse,
+			None,
+			2,
+			2,
+			&read,
+			crate::i18n::Locale::default(),
+		)
+		.unwrap();
 		let reuse = Some((walk, second.refs.clone(), second.head.clone()));
-		let (third, _) =
-			read_graph_page(&host, root, None, reuse, None, 4, 2, &read)
-				.unwrap();
+		let (third, _) = read_graph_page(
+			&host,
+			root,
+			None,
+			reuse,
+			None,
+			4,
+			2,
+			&read,
+			crate::i18n::Locale::default(),
+		)
+		.unwrap();
 		assert!(!third.has_more);
 		let seen: Vec<String> = [first, second, third]
 			.into_iter()
@@ -4210,17 +4246,35 @@ mod tests {
 			cancel: None,
 		};
 		let host = crate::githost::GitHost::Local;
-		let (first, walk) =
-			read_graph_page(&host, root, None, None, None, 0, 2, &read)
-				.unwrap();
+		let (first, walk) = read_graph_page(
+			&host,
+			root,
+			None,
+			None,
+			None,
+			0,
+			2,
+			&read,
+			crate::i18n::Locale::default(),
+		)
+		.unwrap();
 		assert!(first.has_more);
 		let reuse = Some((walk, first.refs.clone(), first.head.clone()));
 		let nonexistent = std::path::Path::new("/nonexistent/graph/page/test");
 		let before_flight = snip_core::gitrun::in_flight();
 		let before_queued = snip_core::gitrun::queued();
-		let (second, _) =
-			read_graph_page(&host, nonexistent, None, reuse, None, 2, 2, &read)
-				.unwrap();
+		let (second, _) = read_graph_page(
+			&host,
+			nonexistent,
+			None,
+			reuse,
+			None,
+			2,
+			2,
+			&read,
+			crate::i18n::Locale::default(),
+		)
+		.unwrap();
 		assert_eq!(second.commits.len(), 2);
 		assert_eq!(snip_core::gitrun::in_flight(), before_flight);
 		assert_eq!(snip_core::gitrun::queued(), before_queued);

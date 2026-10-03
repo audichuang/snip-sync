@@ -315,21 +315,22 @@ err=$(SNIP_CONFIG_DIR=$other "$SNIP" remote pair "$ADDR" "$code" 2>&1)
 check "a used code pairs nobody else" grep -q "pairing failed" <<<"$err"
 
 echo "== git views"
+w <<<"sleep 1 && touch '$WD/gitws/alpha/b.txt'"
 alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
 
 repos_gitws=$("$SNIP" remote repos 1 gitws)
 check "repos 1 gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
 check "wt, broken, borrowed appear as error rows" test "$(grep -c '^wt	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^borrowed	error: ' <<<"$repos_gitws")" = 1
-check "no error row contains the outside path" test "$(grep -F -c "$WD/outside-repo" <<<"$repos_gitws")" = 0
+check "no error row contains the outside path" test "$(grep -c "outside-repo" <<<"$repos_gitws")" = 0
 
 alpha_line=$(grep '^alpha	' <<<"$repos_gitws")
 alpha_counts=$(cut -f3,4,5 <<<"$alpha_line")
-oracle_counts=$(w <<<"git -C '$WD/gitws/alpha' status --porcelain=v2" | awk '/^1/ || /^2/ { if (substr($2, 1, 1) != ".") staged++; if (substr($2, 2, 1) != ".") unstaged++; } /^\?/ { untracked++ } END { printf "%d\t%d\t%d\n", staged+0, unstaged+0, untracked+0 }')
+oracle_counts=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' status --porcelain=v2" | awk '/^1/ || /^2/ { if (substr($2, 1, 1) != ".") staged++; if (substr($2, 2, 1) != ".") unstaged++; } /^\?/ { untracked++ } END { printf "%d\t%d\t%d\n", staged+0, unstaged+0, untracked+0 }')
 check "alpha status counts match oracle ($alpha_counts)" test "$alpha_counts" = "$oracle_counts" -a -n "$alpha_counts"
 
 changes_alpha=$("$SNIP" remote changes 1 gitws alpha)
 changes_paths=$(cut -f3 <<<"$changes_alpha" | LC_ALL=C sort)
-oracle_changes_paths=$(w <<<"git -C '$WD/gitws/alpha' status --porcelain=v2 --untracked-files=all" | awk '/^1/ || /^2/ { print $9 } /^\?/ { print $2 }' | LC_ALL=C sort)
+oracle_changes_paths=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' status --porcelain=v2 --untracked-files=all" | awk '/^1/ || /^2/ { print $9 } /^\?/ { print $2 }' | LC_ALL=C sort)
 check "changes alpha path set == oracle path set" test "$changes_paths" = "$oracle_changes_paths" -a -n "$changes_paths"
 
 changes_beta=$("$SNIP" remote changes 1 gitws beta 2>&1)
@@ -344,13 +345,13 @@ refused "changes inner exits 1" "" changes 1 inner
 
 log_alpha=$("$SNIP" remote log 1 gitws alpha -n 50)
 log_shas=$(cut -f1 <<<"$log_alpha" | LC_ALL=C sort)
-oracle_rev_shas=$(w <<<"git -C '$WD/gitws/alpha' rev-list --all" | LC_ALL=C sort)
+oracle_rev_shas=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' rev-list --all" | LC_ALL=C sort)
 check "log alpha sha set == git rev-list --all" test "$log_shas" = "$oracle_rev_shas" -a -n "$log_shas"
 
-alpha_head=$(w <<<"git -C '$WD/gitws/alpha' rev-parse HEAD")
+alpha_head=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' rev-parse HEAD")
 show_alpha=$("$SNIP" remote show 1 gitws alpha "$alpha_head")
 show_paths=$(cut -f2 <<<"$show_alpha" | LC_ALL=C sort)
-oracle_diff_paths=$(w <<<"git -C '$WD/gitws/alpha' diff-tree --no-commit-id --name-only -r HEAD" | LC_ALL=C sort)
+oracle_diff_paths=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' diff-tree --no-commit-id --name-only -r HEAD" | LC_ALL=C sort)
 check "show alpha HEAD path set == diff-tree path set" test "$show_paths" = "$oracle_diff_paths" -a -n "$show_paths"
 
 diff_a=$("$SNIP" remote diff 1 gitws alpha a.txt)
@@ -395,7 +396,7 @@ if [ -n "$SRC" ]; then
 	if w <<<"test -d '$SRC/.git'"; then
 		src_log=$("$SNIP" remote log 1 "$srcname" -n 3)
 		src_log_shas=$(cut -f1 <<<"$src_log")
-		oracle_revs=$(w <<<"git -C '$SRC' rev-list --all")
+		oracle_revs=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$SRC' rev-list --all")
 		all_found=true
 		while IFS= read -r sha; do
 			[ -n "$sha" ] || continue

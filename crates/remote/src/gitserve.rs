@@ -1,6 +1,7 @@
 //! Git view request handling on the worker.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use snip_core::gitview::{
 	LocalRepo, Read, ReadProfile, RepoView, StatusSummary, MAX_CHANGE_ROWS,
 	MAX_COMMIT_FILES, SERVED_MAX_STDOUT,
 };
-use snip_core::workspace::{RepoIdentity, ScanBudget};
+use snip_core::workspace::{RepoIdentity, ScanBudget, ScanStatus};
 
 use crate::proto::{
 	valid_log_query, valid_rel_path, valid_rev, valid_tips, ErrorCode,
@@ -19,11 +20,25 @@ use crate::proto::{
 };
 use crate::worker::{io_error, SharedRoot};
 
+pub(crate) static SERVED_LEAK_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn sanitize_scan_error(msg: &str, share: &Path) -> String {
+	let text = if let Some(idx) = msg.find(" failed:") {
+		format!("{} failed (details withheld)", &msg[..idx])
+	} else if msg.starts_with("failed:") {
+		"git failed (details withheld)".to_string()
+	} else {
+		msg.to_string()
+	};
+	scrub(&text, share)
+}
+
 /// Answers a ScanRepos request within the shared root.
 pub(crate) fn scan(
 	root: &SharedRoot,
 	under: Option<&str>,
 	cancel: &CancelToken,
+	job_deadline: Instant,
 	scan_deadline: Duration,
 ) -> Response {
 	let under_dir = match under {
@@ -55,16 +70,27 @@ pub(crate) fn scan(
 
 	// Reserve 5s for network write / cleanup when scan_deadline > 6s;
 	// for short test deadlines, clamp to half the deadline to avoid underflow.
-	let reserve = Duration::from_secs(5);
-	let budget_duration = if scan_deadline > Duration::from_secs(6) {
-		scan_deadline.saturating_sub(reserve)
+	let reserve = if scan_deadline > Duration::from_secs(6) {
+		Duration::from_secs(5)
 	} else {
 		scan_deadline / 2
 	};
+	let now = Instant::now();
+	let budget_deadline = job_deadline.checked_sub(reserve);
+	if budget_deadline.is_none_or(|d| now >= d) {
+		return Response::Repos(RepoScan {
+			repos: Vec::new(),
+			errors: Vec::new(),
+			error_overflow: 0,
+			depth_limited: Vec::new(),
+			depth_overflow: 0,
+			status: ScanStatus::Incomplete,
+		});
+	}
 
 	let budget = ScanBudget {
 		max_visited: 200_000,
-		deadline: Some(Instant::now() + budget_duration),
+		deadline: budget_deadline,
 		cancel: Some(cancel.clone()),
 	};
 
@@ -103,7 +129,7 @@ pub(crate) fn scan(
 						branch: s.branch,
 						changes: s.changes,
 					}),
-					Err(msg) => Err(scrub(&msg, &root.path)),
+					Err(msg) => Err(sanitize_scan_error(&msg, &root.path)),
 				};
 				repos.push(ScannedRepo {
 					rel,
@@ -142,7 +168,7 @@ pub(crate) fn scan(
 			}
 			Err(_) => ".".to_string(),
 		};
-		errors.push((rel, scrub(&err_msg, &root.path)));
+		errors.push((rel, sanitize_scan_error(&err_msg, &root.path)));
 	}
 
 	let depth_limited: Vec<String> = ws_scan
@@ -197,14 +223,57 @@ pub(crate) fn scrub(msg: &str, share: &Path) -> String {
 	}
 	candidates.sort_by_key(|a| std::cmp::Reverse(a.len()));
 
+	let result = replace_share_prefix(msg, &candidates);
+	scrub_outside_paths(&result)
+}
+
+fn replace_share_prefix(msg: &str, candidates: &[String]) -> String {
 	let mut result = msg.to_string();
 	for c in candidates {
-		result = result.replace(&format!("{c}/"), "");
-		result = result.replace(&format!("{c}\\"), "");
-		result = result.replace(&c, ".");
-	}
+		let mut out = String::with_capacity(result.len());
+		let mut start = 0;
+		while let Some(pos) = result[start..].find(c.as_str()) {
+			let abs_pos = start + pos;
+			let is_prefix_boundary = if abs_pos == 0 {
+				true
+			} else {
+				let prev = result[..abs_pos].chars().next_back().unwrap();
+				is_delim(prev) || matches!(prev, ':' | '=' | '(' | '[' | '<')
+			};
 
-	scrub_outside_paths(&result)
+			if !is_prefix_boundary {
+				out.push_str(&result[start..abs_pos + c.len()]);
+				start = abs_pos + c.len();
+				continue;
+			}
+
+			out.push_str(&result[start..abs_pos]);
+			let after = &result[abs_pos + c.len()..];
+			if after.starts_with('/') || after.starts_with('\\') {
+				start = abs_pos + c.len() + 1;
+			} else if after.is_empty()
+				|| after.starts_with(|ch: char| {
+					is_delim(ch)
+						|| matches!(
+							ch,
+							':' | ',' | '.' | ';' | ')' | ']' | '}' | '>'
+						)
+				}) {
+				out.push('.');
+				start = abs_pos + c.len();
+			} else {
+				out.push_str(c);
+				start = abs_pos + c.len();
+			}
+		}
+		out.push_str(&result[start..]);
+		result = out;
+	}
+	result
+}
+
+fn has_dotdot_segment(s: &str) -> bool {
+	s.split(['/', '\\']).any(|segment| segment == "..")
 }
 
 fn is_delim(c: char) -> bool {
@@ -231,7 +300,41 @@ fn scrub_outside_paths(s: &str) -> String {
 	let mut chars = s.char_indices().peekable();
 
 	while let Some(&(idx, ch)) = chars.peek() {
-		if is_delim(ch) {
+		if ch == '\'' || ch == '"' || ch == '`' {
+			let quote = ch;
+			let start = idx;
+			chars.next();
+			let mut end = s.len();
+			while let Some(&(next_idx, next_ch)) = chars.peek() {
+				if next_ch == quote {
+					chars.next();
+					end = next_idx + quote.len_utf8();
+					break;
+				}
+				if next_ch == '\n' || next_ch == '\r' {
+					end = next_idx;
+					break;
+				}
+				chars.next();
+			}
+			let token = &s[start..end];
+			if token.len() >= 2 && token.ends_with(quote) {
+				let inner = &token[1..token.len() - 1];
+				let trimmed = inner.trim_end_matches(|c| {
+					matches!(c, ':' | ',' | '.' | ';' | ')' | ']' | '}')
+				});
+				if is_absolute_path(trimmed) || has_dotdot_segment(trimmed) {
+					out.push(quote);
+					out.push_str("<outside the share>");
+					out.push_str(&inner[trimmed.len()..]);
+					out.push(quote);
+				} else {
+					out.push_str(token);
+				}
+			} else {
+				out.push_str(token);
+			}
+		} else if is_delim(ch) {
 			out.push(ch);
 			chars.next();
 		} else {
@@ -245,11 +348,68 @@ fn scrub_outside_paths(s: &str) -> String {
 				end = next_idx + next_ch.len_utf8();
 				chars.next();
 			}
-			let token = &s[start..end];
+			let mut token_end = end;
+			let first_token = &s[start..end];
+			if is_absolute_path(first_token) || has_dotdot_segment(first_token)
+			{
+				if let Some(&(space_idx, ' ')) = chars.peek() {
+					let mut look = chars.clone();
+					let mut word_has_sep = false;
+					let mut word_end = space_idx;
+					while let Some((_, c)) = look.peek() {
+						if *c == ' ' {
+							look.next();
+						} else {
+							break;
+						}
+					}
+					let mut temp_end = word_end;
+					while let Some(&(w_idx, w_c)) = look.peek() {
+						if w_c == '\n'
+							|| w_c == '\r' || w_c == '\''
+							|| w_c == '"' || w_c == '`'
+						{
+							break;
+						}
+						if w_c == ' ' {
+							look.next();
+							continue;
+						}
+						let mut this_word_has_sep = false;
+						let mut this_word_end = w_idx;
+						while let Some(&(c_idx, c_ch)) = look.peek() {
+							if is_delim(c_ch) {
+								break;
+							}
+							if c_ch == '/' || c_ch == '\\' {
+								this_word_has_sep = true;
+							}
+							this_word_end = c_idx + c_ch.len_utf8();
+							look.next();
+						}
+						if this_word_has_sep {
+							word_has_sep = true;
+							temp_end = this_word_end;
+						}
+					}
+					if word_has_sep {
+						word_end = temp_end;
+						while let Some(&(cur_idx, cur_ch)) = chars.peek() {
+							if cur_idx + cur_ch.len_utf8() <= word_end {
+								chars.next();
+							} else {
+								break;
+							}
+						}
+						token_end = word_end;
+					}
+				}
+			}
+			let token = &s[start..token_end];
 			let trimmed = token.trim_end_matches(|c| {
 				matches!(c, ':' | ',' | '.' | ';' | ')' | ']' | '}')
 			});
-			if is_absolute_path(trimmed) {
+			if is_absolute_path(trimmed) || has_dotdot_segment(trimmed) {
 				out.push_str("<outside the share>");
 				out.push_str(&token[trimmed.len()..]);
 			} else {
@@ -553,8 +713,16 @@ pub(crate) fn answer(
 
 /// Maps a GitError to protocol Response::Error, scrubbing paths and concealing stderr.
 pub(crate) fn map_git_error(err: GitError, share: &Path) -> Response {
+	map_git_error_with_leaked(err, share, snip_core::gitrun::served_leaked())
+}
+
+pub(crate) fn map_git_error_with_leaked(
+	err: GitError,
+	share: &Path,
+	leaked: usize,
+) -> Response {
 	let (code, message) = match err {
-		GitError::NotARepository(_) => {
+		GitError::NotARepository(_) | GitError::ToplevelAbove(_) => {
 			(ErrorCode::NotARepository, "not a git repository".into())
 		}
 		GitError::InvalidRevision(msg) => {
@@ -565,30 +733,31 @@ pub(crate) fn map_git_error(err: GitError, share: &Path) -> Response {
 		}
 		GitError::QueueTimeout { .. }
 		| GitError::QueueFull { .. }
-		| GitError::WorktreeBusy { .. } => (
-			ErrorCode::Busy,
-			"the worker is busy with other Git operations".into(),
-		),
-		GitError::Cancelled { .. } => {
-			(ErrorCode::Cancelled, "cancelled".into())
-		}
-		GitError::OutsideBoundary { what } => {
-			if what.contains("not the folder itself") {
-				(ErrorCode::NotARepository, "not a git repository".into())
-			} else if what.contains("linked worktree")
-				|| what.contains("main repository")
-			{
+		| GitError::WorktreeBusy { .. } => {
+			if leaked > 0 {
+				if !SERVED_LEAK_WARNED.swap(true, Ordering::Relaxed) {
+					eprintln!(
+						"[worker] Git permit leak detected; restart required"
+					);
+				}
 				(
-					ErrorCode::OutsideShare,
-					scrub(&format!("outside the shared folder: {what}"), share),
+					ErrorCode::Busy,
+					"a Git process on the worker could not be cleaned up and the worker needs a restart".into(),
 				)
 			} else {
 				(
-					ErrorCode::OutsideShare,
-					"this repository is outside the shared folder".into(),
+					ErrorCode::Busy,
+					"the worker is busy with other Git operations".into(),
 				)
 			}
 		}
+		GitError::Cancelled { .. } => {
+			(ErrorCode::Cancelled, "cancelled".into())
+		}
+		GitError::OutsideBoundary { what } => (
+			ErrorCode::OutsideShare,
+			scrub(&format!("outside the shared folder: {what}"), share),
+		),
 		GitError::OutputLimit { .. } => (
 			ErrorCode::TooLarge,
 			"the result is too large to send; narrow the request".into(),
@@ -739,6 +908,99 @@ mod tests {
 
 		let msg2 = "failed at D:/Secret/repo/config";
 		assert_eq!(scrub(msg2, share), "failed at <outside the share>");
+	}
+
+	#[test]
+	fn scrub_proj_secret() {
+		let share = Path::new("/home/u/proj");
+		let msg = "error at /home/u/proj-secret/x";
+		assert_eq!(scrub(msg, share), "error at <outside the share>");
+	}
+
+	#[test]
+	fn scrub_path_with_space() {
+		let share = Path::new("/var/workspace");
+		let msg = "fatal: not a git repository: /Volumes/My Drive/secret/.git/modules/sub";
+		assert_eq!(
+			scrub(msg, share),
+			"fatal: not a git repository: <outside the share>"
+		);
+
+		let quoted = "fatal: not a git repository: '/Volumes/My Drive/secret/.git/modules/sub'";
+		assert_eq!(
+			scrub(quoted, share),
+			"fatal: not a git repository: '<outside the share>'"
+		);
+	}
+
+	#[test]
+	fn scrub_relative_dotdot_path() {
+		let share = Path::new("/var/workspace");
+		let msg = "fatal: not a git repository: ../../secret/.git/modules/sub";
+		assert_eq!(
+			scrub(msg, share),
+			"fatal: not a git repository: <outside the share>"
+		);
+
+		let quoted =
+			"fatal: not a git repository: '../../secret/.git/modules/sub'";
+		assert_eq!(
+			scrub(quoted, share),
+			"fatal: not a git repository: '<outside the share>'"
+		);
+	}
+
+	#[test]
+	fn sanitize_scan_error_withholds_failed_stderr() {
+		let share = Path::new("/var/workspace");
+		let msg = "git status failed: fatal: not a git repository: /Volumes/My Drive/secret/.git";
+		assert_eq!(
+			sanitize_scan_error(msg, share),
+			"git status failed (details withheld)"
+		);
+	}
+
+	#[test]
+	fn map_git_error_reports_leak_when_served_permit_leaked() {
+		let share = Path::new("/workspace");
+		let r_busy_clean = map_git_error_with_leaked(
+			GitError::QueueTimeout { args: "".into() },
+			share,
+			0,
+		);
+		let Response::Error { code, message } = r_busy_clean else {
+			panic!("expected Error");
+		};
+		assert_eq!(code, ErrorCode::Busy);
+		assert_eq!(message, "the worker is busy with other Git operations");
+
+		let r_busy_leaked = map_git_error_with_leaked(
+			GitError::QueueTimeout { args: "".into() },
+			share,
+			1,
+		);
+		let Response::Error { code, message } = r_busy_leaked else {
+			panic!("expected Error");
+		};
+		assert_eq!(code, ErrorCode::Busy);
+		assert_eq!(
+			message,
+			"a Git process on the worker could not be cleaned up and the worker needs a restart"
+		);
+
+		let r_qfull_leaked = map_git_error_with_leaked(
+			GitError::QueueFull { args: "".into() },
+			share,
+			2,
+		);
+		let Response::Error { code, message } = r_qfull_leaked else {
+			panic!("expected Error");
+		};
+		assert_eq!(code, ErrorCode::Busy);
+		assert_eq!(
+			message,
+			"a Git process on the worker could not be cleaned up and the worker needs a restart"
+		);
 	}
 
 	#[test]
@@ -1116,12 +1378,8 @@ mod tests {
 			}
 		));
 
-		let r_parent = map_git_error(
-			GitError::OutsideBoundary {
-				what: "repository (it is not the folder itself)",
-			},
-			share,
-		);
+		let r_parent =
+			map_git_error(GitError::ToplevelAbove(share.join("sub")), share);
 		assert!(matches!(
 			r_parent,
 			Response::Error {

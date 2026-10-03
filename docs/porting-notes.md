@@ -207,7 +207,7 @@ CLI 與 App 共用 `snip-core` 的 `clip` 模組,底層用 [`arboard`](https://c
 
 遠端 worker 在共享目錄（boundary）下執行 Git 讀取操作時，增加安全邊界防護：
 - `-c core.fsmonitor=false`：支援此設定鍵的任何 Git 版本（不支援時 `-c` 亦不報錯忽略）。
-- `-c protocol.allow=never`：Git >= 1.8.3（阻擋所有 submodule 傳輸協議與 clone/fetch 網路傳輸）。
+- `-c protocol.allow=never`：Git >= 2.12（阻擋所有 submodule 傳輸協議與 clone/fetch 網路傳輸；更舊版本的 Git 會靜默忽略未知的設定鍵，但 partial clone / lazy fetch 需 Git >= ~2.19 始支援，因此無實質外洩風險）。
 - `GIT_NO_LAZY_FETCH=1`：Git >= 2.44（舊版 Git 主要仰賴 `protocol.allow=never` 阻擋 lazy fetch）。
 - `GIT_CEILING_DIRECTORIES`：需要正規化後的絕對路徑（canonical absolute path），設定為共享目錄的父目錄以阻擋向上遍歷至上層 repo。
 - Windows 環境下 `GIT_CEILING_DIRECTORIES` 搭配 dunce 標準化路徑的行為未在本機單獨實測，僅由 CI 驗證（即使 ceiling 被忽略，事後對 toplevel / git_dir 的邊界檢查依然提供安全防護）。

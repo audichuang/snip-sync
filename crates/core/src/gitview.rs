@@ -349,6 +349,35 @@ fn check_alternates_recursive(
 	Ok(())
 }
 
+fn check_dir_children_boundary(
+	dir: &Path,
+	boundary: &Path,
+	what: &'static str,
+) -> Result<(), GitError> {
+	let Ok(entries) = std::fs::read_dir(dir) else {
+		return Ok(());
+	};
+	let mut count = 0;
+	for entry in entries {
+		count += 1;
+		if count > 1024 {
+			return Err(GitError::OutsideBoundary { what });
+		}
+		let entry = entry.map_err(|_| GitError::OutsideBoundary { what })?;
+		let path = entry.path();
+		if let Ok(meta) = path.symlink_metadata() {
+			if meta.file_type().is_symlink() {
+				let canon = dunce::canonicalize(&path)
+					.map_err(|_| GitError::OutsideBoundary { what })?;
+				if !canon.starts_with(boundary) {
+					return Err(GitError::OutsideBoundary { what });
+				}
+			}
+		}
+	}
+	Ok(())
+}
+
 pub(crate) fn check_repo_boundary(
 	git: &Git,
 	boundary: &Path,
@@ -441,6 +470,26 @@ pub(crate) fn check_repo_boundary(
 			}
 		}
 	}
+
+	let objects_dir = {
+		let p = Path::new(lines[0]);
+		if p.is_relative() {
+			git.root().join(p)
+		} else {
+			p.to_path_buf()
+		}
+	};
+	check_dir_children_boundary(&objects_dir, &boundary, "object store")?;
+
+	let refs_dir = {
+		let p = Path::new(lines[2]);
+		if p.is_relative() {
+			git.root().join(p)
+		} else {
+			p.to_path_buf()
+		}
+	};
+	check_dir_children_boundary(&refs_dir, &boundary, "refs")?;
 
 	let alternates_path = {
 		let p = Path::new(lines[1]);
@@ -2150,6 +2199,12 @@ mod tests {
 			matches!(res, Err(GitError::NotARepository(_))),
 			"expected NotARepository, got {res:?}"
 		);
+
+		let res_above = Git::open_within(&inner, &outer, &opts);
+		assert!(
+			matches!(res_above, Err(GitError::ToplevelAbove(ref p)) if p == &inner),
+			"expected ToplevelAbove, got {res_above:?}"
+		);
 	}
 
 	#[test]
@@ -2197,8 +2252,11 @@ mod tests {
 		};
 		let res = LocalRepo::open_within(&repo, &share, &read);
 		assert!(
-			matches!(res, Err(GitError::OutsideBoundary { .. })),
-			"expected OutsideBoundary, got {res:?}"
+			matches!(
+				res,
+				Err(GitError::OutsideBoundary { what: "repository" })
+			),
+			"expected OutsideBoundary for repository, got {res:?}"
 		);
 	}
 
@@ -2384,6 +2442,103 @@ mod tests {
 			matches!(res, Err(GitError::OutsideBoundary { what: "index" })),
 			"expected OutsideBoundary for index, got {res:?}"
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_within_refuses_symlinked_pack_and_refs_heads_outside() {
+		if !has_git() {
+			return;
+		}
+		let _lock = SERVED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+		let dir = tempfile::tempdir().unwrap();
+		let share = dir.path().join("share");
+		let outside = dir.path().join("outside");
+		std::fs::create_dir_all(&share).unwrap();
+		std::fs::create_dir_all(&outside).unwrap();
+
+		let outside_repo = outside.join("repo");
+		run_git(&outside_repo, &["init", "-q", "-b", "main"]);
+		std::fs::write(outside_repo.join("outside.txt"), "outside").unwrap();
+		run_git(&outside_repo, &["add", "outside.txt"]);
+		run_git(&outside_repo, &["commit", "-qm", "init"]);
+		run_git(&outside_repo, &["gc", "--quiet"]);
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+
+		// 1. Symlinked .git/objects/pack pointing outside
+		{
+			let repo1 = share.join("repo1");
+			run_git(&repo1, &["init", "-q", "-b", "main"]);
+			std::fs::write(repo1.join("f.txt"), "f").unwrap();
+			run_git(&repo1, &["add", "f.txt"]);
+			run_git(&repo1, &["commit", "-qm", "init"]);
+
+			let pack_dir = repo1.join(".git/objects/pack");
+			if pack_dir.exists() {
+				std::fs::remove_dir_all(&pack_dir).unwrap();
+			}
+			std::os::unix::fs::symlink(
+				outside_repo.join(".git/objects/pack"),
+				&pack_dir,
+			)
+			.unwrap();
+
+			let res = LocalRepo::open_within(&repo1, &share, &read);
+			assert!(
+				matches!(
+					res,
+					Err(GitError::OutsideBoundary {
+						what: "object store"
+					})
+				),
+				"expected OutsideBoundary for symlinked pack dir, got {res:?}"
+			);
+		}
+
+		// 2. Symlinked .git/refs/heads pointing outside
+		{
+			let repo2 = share.join("repo2");
+			run_git(&repo2, &["init", "-q", "-b", "main"]);
+			std::fs::write(repo2.join("f.txt"), "f").unwrap();
+			run_git(&repo2, &["add", "f.txt"]);
+			run_git(&repo2, &["commit", "-qm", "init"]);
+
+			let heads_dir = repo2.join(".git/refs/heads");
+			if heads_dir.exists() {
+				std::fs::remove_dir_all(&heads_dir).unwrap();
+			}
+			std::os::unix::fs::symlink(
+				outside_repo.join(".git/refs/heads"),
+				&heads_dir,
+			)
+			.unwrap();
+
+			let res = LocalRepo::open_within(&repo2, &share, &read);
+			assert!(
+				matches!(res, Err(GitError::OutsideBoundary { what: "refs" })),
+				"expected OutsideBoundary for symlinked refs/heads, got {res:?}"
+			);
+		}
+
+		// 3. Ordinary repo after git gc (real packed repo) must still open
+		{
+			let repo3 = share.join("repo3");
+			run_git(&repo3, &["init", "-q", "-b", "main"]);
+			std::fs::write(repo3.join("f.txt"), "f").unwrap();
+			run_git(&repo3, &["add", "f.txt"]);
+			run_git(&repo3, &["commit", "-qm", "init"]);
+			run_git(&repo3, &["gc", "--quiet"]);
+
+			let res = LocalRepo::open_within(&repo3, &share, &read);
+			assert!(
+				res.is_ok(),
+				"ordinary packed repo after git gc must open, got {res:?}"
+			);
+		}
 	}
 
 	#[test]
@@ -2594,6 +2749,121 @@ mod tests {
 			.changed_file_text(&GitSource::Working, "tracked.txt", 1024, &read)
 			.unwrap();
 		assert_eq!(open_text.as_deref(), Some("TOPSECRET\n"));
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn boundary_read_working_refuses_fifo_and_symlink_to_fifo() {
+		if !has_git() {
+			return;
+		}
+		let _lock = SERVED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+		let dir = tempfile::tempdir().unwrap();
+		let share = dir.path().join("share");
+		std::fs::create_dir_all(&share).unwrap();
+
+		let repo = share.join("repo");
+		run_git(&repo, &["init", "-q", "-b", "main"]);
+
+		let tracked = repo.join("f");
+		std::fs::write(&tracked, "normal\n").unwrap();
+		run_git(&repo, &["add", "f"]);
+		run_git(&repo, &["commit", "-qm", "init"]);
+
+		// Replace tracked file with a FIFO
+		std::fs::remove_file(&tracked).unwrap();
+		let status =
+			std::process::Command::new("mkfifo").arg(&tracked).status();
+		let Ok(status) = status else {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"mkfifo command unavailable"
+			);
+			return;
+		};
+		assert!(status.success(), "mkfifo failed for tracked f");
+
+		// Create untracked symlink pointing to a FIFO inside repo
+		let fifo2 = repo.join("fifo2");
+		let status2 = std::process::Command::new("mkfifo")
+			.arg(&fifo2)
+			.status()
+			.unwrap();
+		assert!(status2.success(), "mkfifo failed for fifo2");
+		let sym = repo.join("untracked_sym_fifo");
+		std::os::unix::fs::symlink(&fifo2, &sym).unwrap();
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let repo_within = LocalRepo::open_within(&repo, &share, &read).unwrap();
+
+		// Run in a thread with a bounded wait so regression fails with timeout instead of hanging
+		let (tx, rx) = std::sync::mpsc::channel();
+		let handle = std::thread::spawn(move || {
+			let err1 = repo_within
+				.changed_file_text(&GitSource::Working, "f", 1024, &read)
+				.unwrap_err();
+			let err2 = repo_within
+				.changed_file_text(
+					&GitSource::Working,
+					"untracked_sym_fifo",
+					1024,
+					&read,
+				)
+				.unwrap_err();
+			let err_prev1 = repo_within
+				.preview(&GitSource::Working, "f", None, &read)
+				.unwrap_err();
+			let err_prev2 = repo_within
+				.preview(&GitSource::Working, "untracked_sym_fifo", None, &read)
+				.unwrap_err();
+			tx.send((err1, err2, err_prev1, err_prev2)).unwrap();
+		});
+
+		let (err1, err2, err_prev1, err_prev2) =
+			rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+				"served read on FIFO must return promptly without blocking",
+			);
+		handle.join().expect("thread join");
+
+		assert!(
+			matches!(
+				err1,
+				GitError::OutsideBoundary {
+					what: "working file"
+				}
+			),
+			"expected OutsideBoundary for tracked FIFO text, got {err1:?}"
+		);
+		assert!(
+			matches!(
+				err2,
+				GitError::OutsideBoundary {
+					what: "working file"
+				}
+			),
+			"expected OutsideBoundary for symlink to FIFO text, got {err2:?}"
+		);
+		assert!(
+			matches!(
+				err_prev1,
+				GitError::OutsideBoundary {
+					what: "working file"
+				}
+			),
+			"expected OutsideBoundary for tracked FIFO preview, got {err_prev1:?}"
+		);
+		assert!(
+			matches!(
+				err_prev2,
+				GitError::OutsideBoundary {
+					what: "working file"
+				}
+			),
+			"expected OutsideBoundary for symlink to FIFO preview, got {err_prev2:?}"
+		);
 	}
 
 	#[cfg(unix)]
@@ -3207,5 +3477,129 @@ mod tests {
 		let scan = scan_repos_within(root, None, 1, 100, &budget, &opts);
 		assert_eq!(scan.depth_limited.len(), MAX_SCAN_NOTES);
 		assert_eq!(scan.depth_overflow, 70 - MAX_SCAN_NOTES);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn served_diff_preserves_index_bytes_and_skips_hooks() {
+		if !has_git() {
+			return;
+		}
+		let _lock = SERVED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+		let dir = tempfile::tempdir().unwrap();
+		let share = dir.path().join("share");
+		std::fs::create_dir_all(&share).unwrap();
+
+		let repo = share.join("repo");
+		run_git(&repo, &["init", "-q", "-b", "main"]);
+
+		let f1 = repo.join("f1.txt");
+		let f2 = repo.join("f2.txt");
+		let f3 = repo.join("f3.txt");
+		std::fs::write(&f1, "file 1\n").unwrap();
+		std::fs::write(&f2, "file 2\n").unwrap();
+		std::fs::write(&f3, "file 3\n").unwrap();
+		run_git(&repo, &["add", "f1.txt", "f2.txt", "f3.txt"]);
+		run_git(&repo, &["commit", "-qm", "init"]);
+
+		let index_path = repo.join(".git/index");
+		let original_index_bytes = std::fs::read(&index_path).unwrap();
+
+		// Install post-index-change hook that appends to a marker file
+		let hooks_dir = repo.join(".git/hooks");
+		std::fs::create_dir_all(&hooks_dir).unwrap();
+		let hook_file = hooks_dir.join("post-index-change");
+		let marker_file = repo.join("marker.txt");
+		let hook_script = format!(
+			"#!/bin/sh\necho 'hook ran' >> {}\n",
+			marker_file.display()
+		);
+		std::fs::write(&hook_file, hook_script).unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(
+				&hook_file,
+				std::fs::Permissions::from_mode(0o755),
+			)
+			.unwrap();
+		}
+
+		// Let the clock move past the index mtime so the touch below makes the
+		// entries stat-dirty (not merely racy-clean) on coarse filesystems.
+		std::thread::sleep(std::time::Duration::from_millis(1100));
+		// Touch f1.txt and f2.txt (mtime changed, content identical)
+		let touch_status = std::process::Command::new("touch")
+			.arg(&f1)
+			.arg(&f2)
+			.status();
+		let Ok(touch_status) = touch_status else {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"touch command unavailable"
+			);
+			return;
+		};
+		assert!(touch_status.success(), "touch failed");
+
+		// Modify f3.txt with real change
+		std::fs::write(&f3, "file 3 modified\n").unwrap();
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let repo_within = LocalRepo::open_within(&repo, &share, &read).unwrap();
+
+		// Run served Working listing
+		let changes = repo_within
+			.changed_paths(&GitSource::Working, 100, &read)
+			.unwrap();
+		assert_eq!(
+			changes.paths.len(),
+			1,
+			"only real modified file should be listed"
+		);
+		assert_eq!(changes.paths[0].0, "f3.txt");
+
+		// Run served preview and changed_file_text on stat-dirty file f1.txt
+		let _ = repo_within.preview(&GitSource::Working, "f1.txt", None, &read);
+		let _ = repo_within.changed_file_text(
+			&GitSource::Working,
+			"f1.txt",
+			1024,
+			&read,
+		);
+
+		// Run served preview on real modified file f3.txt
+		let prev3 = repo_within
+			.preview(&GitSource::Working, "f3.txt", None, &read)
+			.unwrap();
+		assert!(prev3.patch.contains("+file 3 modified"));
+
+		let text3 = repo_within
+			.changed_file_text(&GitSource::Working, "f3.txt", 1024, &read)
+			.unwrap();
+		assert_eq!(text3.as_deref(), Some("file 3 modified\n"));
+
+		// 1. .git/index bytes unchanged
+		let current_index_bytes = std::fs::read(&index_path).unwrap();
+		assert_eq!(
+			current_index_bytes, original_index_bytes,
+			".git/index bytes must remain untouched by served diff"
+		);
+
+		// 2. Hook marker file absent
+		assert!(
+			!marker_file.exists(),
+			"post-index-change hook must not run during served diff"
+		);
+
+		// 3. No index.lock left
+		let lock_file = repo.join(".git/index.lock");
+		assert!(
+			!lock_file.exists(),
+			"index.lock must not exist in the repository"
+		);
 	}
 }

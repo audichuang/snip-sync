@@ -278,7 +278,7 @@ pub(crate) fn run_job<W: Write>(
 	w: &mut W,
 	deadline: Duration,
 	cancel: CancelToken,
-	op: impl FnOnce(&CancelToken) -> Response + Send,
+	op: impl FnOnce(&CancelToken, Instant) -> Response + Send,
 ) -> io::Result<()> {
 	run_job_with(w, HEARTBEAT, deadline, cancel, op)
 }
@@ -288,7 +288,7 @@ pub(crate) fn run_job_with<W: Write>(
 	heartbeat: Duration,
 	deadline: Duration,
 	cancel: CancelToken,
-	op: impl FnOnce(&CancelToken) -> Response + Send,
+	op: impl FnOnce(&CancelToken, Instant) -> Response + Send,
 ) -> io::Result<()> {
 	let (tx, rx) = std::sync::mpsc::sync_channel::<Response>(1);
 	let start = Instant::now();
@@ -297,7 +297,7 @@ pub(crate) fn run_job_with<W: Write>(
 	std::thread::scope(|s| {
 		let op_cancel = cancel.clone();
 		s.spawn(move || {
-			let res = op(&op_cancel);
+			let res = op(&op_cancel, deadline_instant);
 			let _ = tx.send(res);
 		});
 
@@ -543,7 +543,7 @@ mod tests {
 		let heartbeat = Duration::from_millis(15);
 		let deadline = Duration::from_millis(500);
 
-		run_job_with(&mut buf, heartbeat, deadline, cancel, |_| {
+		run_job_with(&mut buf, heartbeat, deadline, cancel, |_, _| {
 			std::thread::sleep(Duration::from_millis(45));
 			Response::Stat(Stat {
 				kind: crate::proto::EntryKind::File,
@@ -596,8 +596,12 @@ mod tests {
 		let op_cancelled = Arc::new(Mutex::new(false));
 		let op_cancelled_clone = op_cancelled.clone();
 
-		let res =
-			run_job_with(&mut writer, heartbeat, deadline, cancel, |token| {
+		let res = run_job_with(
+			&mut writer,
+			heartbeat,
+			deadline,
+			cancel,
+			|token, _| {
 				let start = Instant::now();
 				while !token.is_cancelled() {
 					if start.elapsed() > Duration::from_secs(2) {
@@ -607,7 +611,8 @@ mod tests {
 				}
 				*op_cancelled_clone.lock().unwrap() = true;
 				Response::Pending
-			});
+			},
+		);
 
 		assert!(res.is_err());
 		assert!(*op_cancelled.lock().unwrap());
@@ -623,7 +628,7 @@ mod tests {
 		let op_cancelled = Arc::new(Mutex::new(false));
 		let op_cancelled_clone = op_cancelled.clone();
 
-		run_job_with(&mut buf, heartbeat, deadline, cancel, |token| {
+		run_job_with(&mut buf, heartbeat, deadline, cancel, |token, _| {
 			let start = Instant::now();
 			while !token.is_cancelled() {
 				if start.elapsed() > Duration::from_secs(2) {
@@ -666,7 +671,7 @@ mod tests {
 		// MAX_FRAME is 8 MiB in proto.rs
 		let huge_string = "x".repeat(crate::proto::MAX_FRAME + 1024);
 
-		run_job_with(&mut buf, heartbeat, deadline, cancel, move |_| {
+		run_job_with(&mut buf, heartbeat, deadline, cancel, move |_, _| {
 			Response::Text {
 				content: Some(huge_string),
 			}

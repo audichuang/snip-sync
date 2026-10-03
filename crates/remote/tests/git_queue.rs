@@ -91,8 +91,11 @@ fn run_git(cwd: &Path, args: &[&str]) {
 	);
 }
 
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn a_master_cannot_fill_the_git_queue() {
+	let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 	init_git_shim();
 
 	let tmp = tempfile::tempdir().unwrap();
@@ -172,10 +175,27 @@ fn a_master_cannot_fill_the_git_queue() {
 	let poll_deadline = Instant::now() + Duration::from_secs(10);
 	let mut saw_busy = false;
 	let mut saw_ok = false;
+	let mut saw_served_in_flight = false;
+	let mut tested_local_while_busy = false;
 
 	while Instant::now() < poll_deadline {
 		let in_flight = served_in_flight();
 		let queued = served_queued();
+		if in_flight >= 1 {
+			saw_served_in_flight = true;
+		}
+
+		let local_inf = snip_core::gitrun::in_flight();
+		let local_q = snip_core::gitrun::queued();
+		assert_eq!(
+			local_inf, 0,
+			"local in_flight must stay 0 during served storm, got {local_inf}"
+		);
+		assert_eq!(
+			local_q, 0,
+			"local queued must stay 0 during served storm, got {local_q}"
+		);
+
 		assert!(
 			in_flight <= MAX_CONCURRENT_SERVED_GIT,
 			"served pool running cap exceeded: in_flight={in_flight}"
@@ -185,6 +205,27 @@ fn a_master_cannot_fill_the_git_queue() {
 				<= MAX_CONCURRENT_SERVED_GIT + MAX_QUEUED_SERVED_GIT,
 			"served pool overflow: in_flight={in_flight}, queued={queued}"
 		);
+
+		if in_flight >= 1 && !tested_local_while_busy {
+			let local_git = Git::open(&local_repo).unwrap();
+			let local_start = Instant::now();
+			let local_out = local_git
+				.run_with(
+					&["status"],
+					&RunOptions {
+						queue_timeout: Duration::from_millis(500),
+						..RunOptions::default()
+					},
+				)
+				.expect("local Git::run_with must succeed even when served pool is saturated");
+			assert!(
+				local_start.elapsed() < Duration::from_millis(400),
+				"local git status must not queue behind served operations, took {:?}",
+				local_start.elapsed()
+			);
+			assert!(!local_out.truncated);
+			tested_local_while_busy = true;
+		}
 
 		let res = results.lock().unwrap();
 		for r in res.iter() {
@@ -197,27 +238,24 @@ fn a_master_cannot_fill_the_git_queue() {
 				_ => {}
 			}
 		}
-		if saw_busy && saw_ok {
+		if saw_busy && saw_ok && saw_served_in_flight && tested_local_while_busy
+		{
 			break;
 		}
 		drop(res);
 		std::thread::sleep(Duration::from_millis(20));
 	}
 
-	assert!(saw_busy, "expected at least one call to return Busy");
-	assert!(saw_ok, "expected at least one call to succeed");
-
-	// Meanwhile a same-process LOCAL git operation in a different non-slow repo succeeds
-	let local_git = Git::open(&local_repo).unwrap();
-	let local_out = local_git
-		.run_with(&["status"], &RunOptions::default())
-		.expect(
-		"local Git::run_with must succeed even when served pool is saturated",
+	assert!(
+		saw_served_in_flight,
+		"served_in_flight() must be observed >= 1 at least once"
 	);
 	assert!(
-		!local_out.truncated,
-		"local git status must not be truncated"
+		tested_local_while_busy,
+		"local git status must be tested while served pool is busy"
 	);
+	assert!(saw_busy, "expected at least one call to return Busy");
+	assert!(saw_ok, "expected at least one call to succeed");
 
 	// Cleanup: remove .slow_active, cancel tokens, stop worker
 	let _ = fs::remove_file(ws.join(".slow_active"));
@@ -231,6 +269,121 @@ fn a_master_cannot_fill_the_git_queue() {
 		assert!(
 			!remaining.is_zero(),
 			"timed out waiting for worker threads to finish"
+		);
+		let _ = h.join();
+	}
+}
+
+#[test]
+fn scan_repos_uses_served_pool_and_leaves_local_pool_untouched() {
+	let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+	init_git_shim();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+
+	// Create 3 slow repos in ws
+	for i in 1..=3 {
+		let repo = ws.join(format!("repo{i}"));
+		run_git(&repo, &["init", "-b", "main"]);
+		fs::write(repo.join("file.txt"), format!("content{i}")).unwrap();
+		run_git(&repo, &["add", "file.txt"]);
+		run_git(&repo, &["commit", "-m", "init"]);
+		fs::write(repo.join(".slow_sleep"), "0.2").unwrap();
+		fs::write(repo.join(".slow_active"), "").unwrap();
+	}
+
+	let id = Identity::generate().unwrap();
+	let mut w = Worker::start(
+		"127.0.0.1:0".parse().unwrap(),
+		&id,
+		WorkerOptions {
+			name: "scan-pool-worker".into(),
+			trust_file: None,
+			max_protocol: None,
+		},
+	)
+	.unwrap();
+	assert!(w.set_roots(std::slice::from_ref(&ws)).is_empty());
+	let ws_id = w.roots()[0].id.clone();
+
+	let master = Arc::new(Identity::generate().unwrap());
+	let code = w.open_pairing();
+	let paired =
+		pair(&w.local_addr().to_string(), &code, &master, "mac").unwrap();
+
+	const NUM_CLIENTS: usize = 6;
+	let clients: Vec<Arc<Client>> = (0..NUM_CLIENTS)
+		.map(|_| {
+			Arc::new(
+				Client::new(paired.clone(), master.clone(), "mac".into())
+					.unwrap(),
+			)
+		})
+		.collect();
+
+	let cancel = CancelToken::new();
+	let stopped = Arc::new(AtomicBool::new(false));
+	let mut handles = Vec::new();
+
+	for client in &clients {
+		let client = client.clone();
+		let ws_clone = ws_id.clone();
+		let cancel_clone = cancel.clone();
+		let stopped_clone = stopped.clone();
+		handles.push(std::thread::spawn(move || {
+			let res = client.scan_repos(&ws_clone, None, Some(&cancel_clone));
+			if !stopped_clone.load(Ordering::SeqCst) {
+				let _ = res;
+			}
+		}));
+	}
+
+	let poll_deadline = Instant::now() + Duration::from_secs(10);
+	let mut saw_served_in_flight = false;
+
+	while Instant::now() < poll_deadline {
+		let in_flight = served_in_flight();
+		if in_flight >= 1 {
+			saw_served_in_flight = true;
+		}
+
+		let local_inf = snip_core::gitrun::in_flight();
+		let local_q = snip_core::gitrun::queued();
+		assert_eq!(
+			local_inf, 0,
+			"local in_flight must stay 0 during scan_repos storm, got {local_inf}"
+		);
+		assert_eq!(
+			local_q, 0,
+			"local queued must stay 0 during scan_repos storm, got {local_q}"
+		);
+
+		if saw_served_in_flight {
+			break;
+		}
+		std::thread::sleep(Duration::from_millis(15));
+	}
+
+	assert!(
+		saw_served_in_flight,
+		"served_in_flight() must be observed >= 1 during concurrent scan_repos"
+	);
+
+	for i in 1..=3 {
+		let _ = fs::remove_file(ws.join(format!("repo{i}/.slow_active")));
+	}
+	stopped.store(true, Ordering::SeqCst);
+	cancel.cancel();
+	w.stop();
+
+	let join_deadline = Instant::now() + Duration::from_secs(10);
+	for h in handles {
+		let remaining = join_deadline.saturating_duration_since(Instant::now());
+		assert!(
+			!remaining.is_zero(),
+			"timed out waiting for scan threads to finish"
 		);
 		let _ = h.join();
 	}

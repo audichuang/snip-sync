@@ -2053,6 +2053,20 @@ fn refused_git_view_error_does_not_name_outside_paths() {
 	)
 	.unwrap();
 
+	// 3. Repo with core.worktree pointing outside
+	let worktree_outside = share.join("worktree_outside");
+	run_git(&worktree_outside, &["init", "-b", "main"]);
+	run_git(
+		&worktree_outside,
+		&["config", "core.worktree", outside.to_str().unwrap()],
+	);
+
+	// 4. Folder inside parent repository
+	let parent = share.join("parent");
+	run_git(&parent, &["init", "-b", "main"]);
+	let sub = parent.join("sub");
+	fs::create_dir_all(&sub).unwrap();
+
 	let (w, _) = test_worker(&[&share], None);
 	let (client, ws_id) = paired_client(&w);
 
@@ -2062,7 +2076,7 @@ fn refused_git_view_error_does_not_name_outside_paths() {
 		.to_string_lossy()
 		.into_owned();
 
-	for rel in ["wt", "gitdir_repo"] {
+	for rel in ["wt", "gitdir_repo", "worktree_outside"] {
 		let res = client.git(
 			&ws_id,
 			rel,
@@ -2072,10 +2086,10 @@ fn refused_git_view_error_does_not_name_outside_paths() {
 		);
 		match res {
 			Err(RemoteError::Refused { code, message }) => {
-				assert!(
-					code == ErrorCode::OutsideShare
-						|| code == ErrorCode::NotARepository,
-					"expected OutsideShare or NotARepository, got {code:?}"
+				assert_eq!(
+					code,
+					ErrorCode::OutsideShare,
+					"expected OutsideShare for {rel}, got {code:?}"
 				);
 				assert!(
 					!message.contains(&outside_str)
@@ -2085,6 +2099,29 @@ fn refused_git_view_error_does_not_name_outside_paths() {
 			}
 			other => panic!("expected Refused error for {rel}, got {other:?}"),
 		}
+	}
+
+	let res_parent = client.git(
+		&ws_id,
+		"parent/sub",
+		ReadProfile::Interactive,
+		GitQuery::ChangeList,
+		None,
+	);
+	match res_parent {
+		Err(RemoteError::Refused { code, message }) => {
+			assert_eq!(
+				code,
+				ErrorCode::NotARepository,
+				"expected NotARepository for parent/sub, got {code:?}"
+			);
+			assert!(
+				!message.contains(&outside_str)
+					&& !message.contains(&outside_canon),
+				"message leaked outside path: {message}"
+			);
+		}
+		other => panic!("expected Refused error for parent/sub, got {other:?}"),
 	}
 }
 
@@ -2372,4 +2409,140 @@ fn a_git_view_for_an_unshared_workspace_is_forbidden() {
 		),
 		"expected Forbidden, got {res:?}"
 	);
+}
+
+#[test]
+fn scan_with_outside_missing_submodule_gitdir_hides_outside_paths() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let outside = tmp.path().join("outside_secret_zone");
+	let share = tmp.path().join("share");
+	fs::create_dir_all(&share).unwrap();
+
+	let repo = share.join("repo");
+	run_git(&repo, &["init", "-b", "main"]);
+	fs::write(repo.join("file.txt"), "hello").unwrap();
+	run_git(&repo, &["add", "file.txt"]);
+	run_git(&repo, &["commit", "-m", "init"]);
+
+	// Create submodule inside repo with .git pointing to an outside missing gitdir
+	let sub = repo.join("sub");
+	fs::create_dir_all(&sub).unwrap();
+	let outside_gitdir = outside.join("modules").join("sub");
+	fs::write(
+		sub.join(".git"),
+		format!("gitdir: {}\n", outside_gitdir.display()),
+	)
+	.unwrap();
+	fs::write(
+		repo.join(".gitmodules"),
+		"[submodule \"sub\"]\n\tpath = sub\n\turl = https://example.com/sub.git\n",
+	)
+	.unwrap();
+	run_git(&repo, &["add", ".gitmodules"]);
+	let head_rev = {
+		let out = std::process::Command::new("git")
+			.args(["rev-parse", "HEAD"])
+			.current_dir(&repo)
+			.output()
+			.unwrap();
+		String::from_utf8(out.stdout).unwrap().trim().to_string()
+	};
+	run_git(
+		&repo,
+		&[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			"160000",
+			&head_rev,
+			"sub",
+		],
+	);
+
+	let (w, _) = test_worker(&[&share], None);
+	let (client, ws_id) = paired_client(&w);
+
+	let scan_res = client
+		.scan_repos(&ws_id, None, None)
+		.expect("scan_repos succeeds");
+	for r in &scan_res.repos {
+		if let Err(ref msg) = r.summary {
+			assert!(
+				!msg.contains("outside_secret_zone")
+					&& !msg.contains("modules/sub"),
+				"repo summary leaked outside path: {msg}"
+			);
+		}
+	}
+	for (rel, err_msg) in &scan_res.errors {
+		assert!(
+			!err_msg.contains("outside_secret_zone")
+				&& !err_msg.contains("modules/sub"),
+			"scan error row for {rel} leaked outside path: {err_msg}"
+		);
+	}
+}
+
+#[test]
+fn scan_with_admission_wait_returns_incomplete_not_timeout() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+
+	// Create a slow repo
+	let slow_repo = ws.join("slow_repo");
+	run_git(&slow_repo, &["init", "-b", "main"]);
+	fs::write(slow_repo.join("f.txt"), "hello").unwrap();
+	run_git(&slow_repo, &["add", "f.txt"]);
+	run_git(&slow_repo, &["commit", "-m", "init"]);
+	fs::write(slow_repo.join(".slow_sleep"), "0.6").unwrap();
+	fs::write(slow_repo.join(".slow_active"), "").unwrap();
+
+	let (w, _) = test_worker(&[&ws], None);
+	// Set scan deadline to 1000ms: budget reserve is 500ms (scan_deadline / 2),
+	// so budget deadline is entry + 500ms. Admission wait of ~600ms exceeds budget.
+	w.set_deadlines_for_tests(
+		Duration::from_secs(60),
+		Duration::from_millis(1000),
+	);
+
+	let (client, ws_id) = paired_client(&w);
+	let client = Arc::new(client);
+	let client1 = client.clone();
+	let client2 = client.clone();
+	let ws_id2 = ws_id.clone();
+
+	// Client 1 starts scan on ws, holding the scan slot while slow_repo runs (~300ms)
+	let t1 = std::thread::spawn(move || client1.scan_repos(&ws_id, None, None));
+
+	// Wait until client 1 is running
+	let wait_deadline = Instant::now() + Duration::from_secs(2);
+	while w.running_jobs() == 0 && Instant::now() < wait_deadline {
+		std::thread::sleep(Duration::from_millis(10));
+	}
+
+	// Client 2 starts scan while scan slot is held
+	let res2 = client2.scan_repos(&ws_id2, None, None);
+
+	let _ = t1.join().unwrap();
+
+	// Client 2 must receive an Incomplete scan, NOT a Timeout error
+	match res2 {
+		Ok(scan) => {
+			assert!(
+				matches!(
+					scan.status,
+					snip_core::workspace::ScanStatus::Incomplete
+						| snip_core::workspace::ScanStatus::TimedOut
+				),
+				"expected Incomplete or TimedOut scan status, got {:?}",
+				scan.status
+			);
+		}
+		Err(other) => {
+			panic!("expected Incomplete scan result, got error {other:?}")
+		}
+	}
 }

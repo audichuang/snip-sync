@@ -484,10 +484,24 @@ impl Client {
 					return Err(RemoteError::TimedOut);
 				}
 				if let Ok(mut fresh) = self.connect() {
-					if need <= 1 || fresh.version() >= need {
-						result = fresh.call(request, cancel, remaining_retry);
-						conn = fresh;
+					if need > 1 && fresh.version() < need {
+						let worker = fresh.worker_name().to_string();
+						let have = fresh.version();
+						let mut idle = self
+							.idle
+							.lock()
+							.unwrap_or_else(PoisonError::into_inner);
+						if idle.len() < POOL {
+							idle.push(fresh);
+						}
+						return Err(RemoteError::WorkerTooOld {
+							worker,
+							have,
+							need,
+						});
 					}
+					result = fresh.call(request, cancel, remaining_retry);
+					conn = fresh;
 				}
 			}
 		}

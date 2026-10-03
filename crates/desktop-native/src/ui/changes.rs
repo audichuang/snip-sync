@@ -941,11 +941,24 @@ impl WorkbenchModel {
 				if !self.change_item_rows().is_empty() {
 					return None;
 				}
-				if !self.files.is_empty() {
+				let speed_active = !self.chrome.speed.trim().is_empty();
+				let any_failed = self.change_repos.iter().any(|s| {
+					matches!(s.state, crate::ChangeRepoState::Failed(_))
+				});
+				let any_truncated =
+					self.change_repos.iter().enumerate().any(|(slot, r)| {
+						r.truncated(crate::slot_range(&self.files, slot).len())
+					});
+
+				if speed_active
+					&& (!self.files.is_empty() || any_failed || any_truncated)
+				{
 					return Some(ChangesEmpty::NoMatch);
 				}
-				if let Some(msg) = &self.remote.scan_error {
-					return Some(ChangesEmpty::ScanFailed(msg.clone()));
+				if self.remote.session.is_some() {
+					if let Some(msg) = &self.remote.scan_error {
+						return Some(ChangesEmpty::ScanFailed(msg.clone()));
+					}
 				}
 				if self.is_loading
 					|| self.discovery_status.is_none()
@@ -978,6 +991,25 @@ impl WorkbenchModel {
 					.any(|s| matches!(s.state, crate::ChangeRepoState::Loading))
 				{
 					return Some(ChangesEmpty::Loading);
+				}
+				if !self.discovery_errors.is_empty() {
+					return Some(ChangesEmpty::ScanFailed(
+						self.discovery_error_msg(),
+					));
+				}
+				if let Some(err) =
+					self.change_repos.iter().find_map(|s| match &s.state {
+						crate::ChangeRepoState::Failed(e) => Some(e.clone()),
+						_ => None,
+					}) {
+					return Some(ChangesEmpty::ScanFailed(
+						crate::i18n::Msg::new("error_repo_status", [err]),
+					));
+				}
+				if any_truncated {
+					return Some(ChangesEmpty::ScanFailed(
+						self.discovery_error_msg(),
+					));
 				}
 				Some(ChangesEmpty::Clean)
 			})();

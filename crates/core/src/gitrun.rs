@@ -185,6 +185,7 @@ static SERVED_BUDGET: Mutex<Budget> = Mutex::new(Budget {
 	leaked: 0,
 });
 static SERVED_FREED: Condvar = Condvar::new();
+static SERVED_LEAK_WARNED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
 	static HOLDING: Cell<bool> = const { Cell::new(false) };
@@ -223,6 +224,17 @@ pub fn served_in_flight() -> usize {
 /// Callers waiting for a slot in the served pool (diagnostics and tests).
 pub fn served_queued() -> usize {
 	served_budget().waiting
+}
+
+/// Slots that stay taken in the served pool because a process tree could not
+/// be confirmed dead. Each one permanently lowers the served budget.
+pub fn served_leaked() -> usize {
+	served_budget().leaked
+}
+
+/// Whether any slot in the served pool has leaked.
+pub fn served_has_leaked() -> bool {
+	served_budget().leaked > 0
 }
 
 /// One budget slot. `!Send`: the per-thread nesting guard relies on the
@@ -304,6 +316,11 @@ impl Permit {
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner)
 			.leaked += 1;
+		if pool == GitPool::Served
+			&& !SERVED_LEAK_WARNED.swap(true, Ordering::Relaxed)
+		{
+			eprintln!("[gitrun] served Git permit leaked: remote Git operations disabled");
+		}
 		HOLDING.set(false);
 		std::mem::forget(self);
 	}
@@ -2510,6 +2527,21 @@ mod tests {
 	#[test]
 	fn served_pool_is_not_counted_by_in_flight() {
 		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let exe = std::env::current_exe().expect("current test exe");
+			let status = Command::new(exe)
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args([
+					"--exact",
+					"gitrun::tests::served_pool_is_not_counted_by_in_flight",
+					"--nocapture",
+				])
+				.status()
+				.expect("spawn isolated test subprocess");
+			assert!(status.success(), "isolated subprocess test failed");
+			return;
+		}
+
 		let opts = RunOptions {
 			pool: GitPool::Served,
 			timeout: Duration::from_secs(10),
@@ -2542,6 +2574,21 @@ mod tests {
 	#[test]
 	fn served_pool_has_its_own_queue_limit() {
 		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let exe = std::env::current_exe().expect("current test exe");
+			let status = Command::new(exe)
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args([
+					"--exact",
+					"gitrun::tests::served_pool_has_its_own_queue_limit",
+					"--nocapture",
+				])
+				.status()
+				.expect("spawn isolated test subprocess");
+			assert!(status.success(), "isolated subprocess test failed");
+			return;
+		}
+
 		let opts = RunOptions {
 			pool: GitPool::Served,
 			queue_timeout: Duration::from_secs(5),
@@ -2614,5 +2661,55 @@ mod tests {
 		release_tx.send(()).unwrap();
 		holder.join().expect("holder thread join");
 		assert_eq!(served_in_flight(), 0);
+	}
+
+	#[test]
+	fn served_permit_leak_bumps_served_leaked_and_leaves_local_untouched() {
+		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let exe = std::env::current_exe().expect("current test exe");
+			let status = Command::new(exe)
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args([
+					"--exact",
+					"gitrun::tests::served_permit_leak_bumps_served_leaked_and_leaves_local_untouched",
+					"--nocapture",
+				])
+				.status()
+				.expect("spawn isolated test subprocess");
+			assert!(status.success(), "isolated subprocess test failed");
+			return;
+		}
+
+		assert_eq!(served_leaked(), 0);
+		assert_eq!(leaked_slots(), 0);
+		assert!(!served_has_leaked());
+
+		let cmd = test_long_running_command();
+		let opts = RunOptions {
+			pool: GitPool::Served,
+			..Default::default()
+		};
+		let mut proc =
+			ManagedChild::spawn(cmd, "test-served-proc", false, &opts).unwrap();
+
+		let _inj = InjectionGuard;
+		test_inject_kill_tree_failure(true);
+
+		let err = proc.finish().unwrap_err();
+		assert!(matches!(err, GitError::Cleanup { .. }), "{err:?}");
+
+		test_inject_kill_tree_failure(false);
+		drop(proc);
+
+		assert_eq!(
+			served_leaked(),
+			1,
+			"served pool must record the leaked slot"
+		);
+		assert_eq!(served_in_flight(), 1);
+		assert!(served_has_leaked());
+		assert_eq!(leaked_slots(), 0, "local pool must remain 0");
+		assert_eq!(in_flight(), 0, "local in_flight must remain 0");
 	}
 }

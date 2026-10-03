@@ -436,7 +436,7 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 						&mut tls,
 						scan_deadline,
 						cancel,
-						|job_cancel| match state.jobs.admit(
+						|job_cancel, job_deadline| match state.jobs.admit(
 							&workspace,
 							crate::jobs::JobKind::Scan,
 							job_cancel,
@@ -451,6 +451,7 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 									&initial_root,
 									under.as_deref(),
 									job_cancel,
+									job_deadline,
 									scan_deadline,
 								);
 								verify_root_unchanged(
@@ -503,7 +504,7 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 						&mut tls,
 						view_deadline,
 						cancel,
-						|job_cancel| match state.jobs.admit(
+						|job_cancel, _job_deadline| match state.jobs.admit(
 							&workspace,
 							crate::jobs::JobKind::View,
 							job_cancel,
@@ -552,10 +553,26 @@ fn error(code: ErrorCode, message: String) -> Response {
 
 fn map_admit_error(code: ErrorCode) -> Response {
 	match code {
-		ErrorCode::Busy => error(
-			ErrorCode::Busy,
-			"the worker is busy with other Git requests".into(),
-		),
+		ErrorCode::Busy => {
+			if snip_core::gitrun::served_leaked() > 0 {
+				if !crate::gitserve::SERVED_LEAK_WARNED
+					.swap(true, std::sync::atomic::Ordering::Relaxed)
+				{
+					eprintln!(
+						"[worker] Git permit leak detected; restart required"
+					);
+				}
+				error(
+					ErrorCode::Busy,
+					"a Git process on the worker could not be cleaned up and the worker needs a restart".into(),
+				)
+			} else {
+				error(
+					ErrorCode::Busy,
+					"the worker is busy with other Git requests".into(),
+				)
+			}
+		}
 		ErrorCode::Cancelled => error(ErrorCode::Cancelled, "cancelled".into()),
 		other => error(other, "the worker cannot admit this job".into()),
 	}
@@ -904,7 +921,7 @@ mod tests {
 				&mut buf,
 				Duration::from_secs(1),
 				snip_core::gitrun::CancelToken::new(),
-				|_| panic!("simulated job panic"),
+				|_, _| panic!("simulated job panic"),
 			);
 		}));
 		assert_eq!(counter.load(Ordering::SeqCst), 0);

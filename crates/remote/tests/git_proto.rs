@@ -538,3 +538,144 @@ fn reset_before_any_frame_on_a_reused_connection_is_retried_once() {
 
 	stop.store(true, Ordering::SeqCst);
 }
+
+#[test]
+fn downgraded_worker_on_pooled_v2_connection_returns_worker_too_old() {
+	let worker_id = Identity::generate().unwrap();
+	let config = server_config(&worker_id).unwrap();
+	let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+	listener.set_nonblocking(true).unwrap();
+	let addr = listener.local_addr().unwrap();
+
+	let conn_count = Arc::new(AtomicUsize::new(0));
+	let stop = Arc::new(AtomicBool::new(false));
+
+	let cc_clone = conn_count.clone();
+	let stop_clone = stop.clone();
+
+	std::thread::spawn(move || {
+		while !stop_clone.load(Ordering::SeqCst) {
+			match listener.accept() {
+				Ok((tcp, _)) => {
+					tcp.set_nonblocking(false).unwrap();
+					tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+					tcp.set_write_timeout(Some(Duration::from_secs(5)))
+						.unwrap();
+					let conn = ServerConnection::new(config.clone()).unwrap();
+					let mut tls = StreamOwned::new(conn, tcp);
+
+					let count = cc_clone.fetch_add(1, Ordering::SeqCst);
+					std::thread::spawn(move || {
+						let hello =
+							read_frame::<Request>(&mut tls).ok().flatten();
+						if let Some(Request::Hello { .. }) = hello {
+							if count <= 1 {
+								// Handshake probe (count 0) and pooled connection (count 1): version 2
+								let _ = write_frame(
+									&mut tls,
+									&Response::Hello {
+										version: PROTOCOL_VERSION,
+										name: "fake".into(),
+										paired: true,
+										max_version: Some(2),
+									},
+								);
+								if count == 1 {
+									// Answer one ListWorkspaces so it gets pooled
+									if let Ok(Some(Request::ListWorkspaces)) =
+										read_frame::<Request>(&mut tls)
+									{
+										let _ = write_frame(
+											&mut tls,
+											&Response::Workspaces {
+												items: vec![],
+											},
+										);
+									}
+									// When next request comes (GitView), close socket immediately (EOF)
+									let _ = read_frame::<Request>(&mut tls);
+									// Drops TLS connection
+								}
+							} else {
+								// Reconnected connection (count >= 2): downgraded to version 1
+								let _ = write_frame(
+									&mut tls,
+									&Response::Hello {
+										version: PROTOCOL_VERSION,
+										name: "fake".into(),
+										paired: true,
+										max_version: Some(1),
+									},
+								);
+								// Answer subsequent ListWorkspaces
+								while let Ok(Some(req)) =
+									read_frame::<Request>(&mut tls)
+								{
+									if let Request::ListWorkspaces = req {
+										let _ = write_frame(
+											&mut tls,
+											&Response::Workspaces {
+												items: vec![],
+											},
+										);
+									}
+								}
+							}
+						}
+					});
+				}
+				Err(_) => std::thread::sleep(Duration::from_millis(10)),
+			}
+		}
+	});
+
+	let master = Arc::new(Identity::generate().unwrap());
+	let deadline = Instant::now() + Duration::from_secs(5);
+	let conn = loop {
+		match Connection::open(&addr.to_string(), &master, None, "mac") {
+			Ok(c) => break c,
+			Err(_) if Instant::now() < deadline => {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			Err(e) => panic!("Connection::open failed: {e}"),
+		}
+	};
+	let paired = snip_remote::PairedWorker {
+		name: "fake".into(),
+		addr: addr.to_string(),
+		fingerprint: conn.seen_fingerprint().to_hex(),
+	};
+	drop(conn);
+
+	let client = Client::new(paired, master, "mac".into()).unwrap();
+	// 1. Connection 1 is established and pooled in idle (has version 2)
+	let ws = client.list_workspaces().unwrap();
+	assert_eq!(ws.len(), 0);
+
+	// 2. Next git call uses pooled connection 1, writes GitView, hits EOF on read,
+	// triggers should_resend, reconnects (connection 2), receives max_version 1.
+	// Must return WorkerTooOld, not Io.
+	let err = client
+		.git(
+			"ws",
+			"",
+			ReadProfile::Interactive,
+			GitQuery::ChangeList,
+			None,
+		)
+		.unwrap_err();
+
+	match err {
+		RemoteError::WorkerTooOld { have, need, .. } => {
+			assert_eq!(have, 1);
+			assert_eq!(need, 2);
+		}
+		other => panic!("expected WorkerTooOld, got {other:?}"),
+	}
+
+	// 3. Fresh connection (version 1) was pooled into idle, so subsequent non-git call succeeds
+	let ws2 = client.list_workspaces().unwrap();
+	assert_eq!(ws2.len(), 0);
+
+	stop.store(true, Ordering::SeqCst);
+}
