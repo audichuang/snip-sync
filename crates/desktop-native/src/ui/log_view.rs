@@ -518,6 +518,9 @@ impl WorkbenchModel {
 										self.log_empty_state(),
 										|d, state| {
 											let text = match state {
+											crate::LogEmpty::NoWorkspace => {
+												t("workspace_closed", loc).to_string()
+											}
 											crate::LogEmpty::Scanning => {
 												t("changes_scanning", loc).to_string()
 											}

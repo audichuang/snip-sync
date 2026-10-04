@@ -542,7 +542,7 @@ impl WorkbenchModel {
 		let id = format!("change-repo:{group_id}:{name}");
 		let chk_id = format!("change-repo-chk:{group_id}:{name}");
 		let toggle_id = format!("change-repo-toggle:{group_id}:{name}");
-		let tooltip = repo.root.display().to_string();
+		let tooltip = self.change_repo_tooltip(&repo.root);
 		div()
 			.id(SharedString::from(id.clone()))
 			.relative()
@@ -941,6 +941,12 @@ impl WorkbenchModel {
 				if !self.change_item_rows().is_empty() {
 					return None;
 				}
+				if !self.workspace_open {
+					if self.is_loading {
+						return Some(ChangesEmpty::Loading);
+					}
+					return Some(ChangesEmpty::NoWorkspace);
+				}
 				let speed_active = !self.chrome.speed.trim().is_empty();
 				let any_failed = self.change_repos.iter().any(|s| {
 					matches!(s.state, crate::ChangeRepoState::Failed(_))
@@ -1031,6 +1037,7 @@ impl WorkbenchModel {
 
 		let state_str = match &res {
 			None => None,
+			Some(ChangesEmpty::NoWorkspace) => Some("no_workspace"),
 			Some(ChangesEmpty::Scanning) => Some("scanning"),
 			Some(ChangesEmpty::Loading) => Some("loading"),
 			Some(ChangesEmpty::NoRepository) => Some("no_repository"),

@@ -360,6 +360,7 @@ pub enum ChangeRepoState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangesEmpty {
+	NoWorkspace,
 	Scanning,
 	Loading,
 	NoRepository,
@@ -371,6 +372,7 @@ pub enum ChangesEmpty {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEmpty {
+	NoWorkspace,
 	Scanning,
 	Loading,
 	NoRepository,
@@ -1274,6 +1276,8 @@ pub struct WorkbenchModel {
 	pub(crate) last_log_empty: std::cell::Cell<Option<&'static str>>,
 	/// Repo the shown preview was read from, with `preview_identity`.
 	pub preview_root: Option<(PathBuf, usize)>,
+	/// Repo of the failed preview load when `preview_error` is Some.
+	pub preview_error_root: Option<PathBuf>,
 	/// Repositories the log's Repository chip picked; empty is all of them.
 	pub log_repo_filter: Vec<PathBuf>,
 	/// Repositories the loaded log covers (two or more: the merged log).
@@ -1605,10 +1609,14 @@ impl WorkbenchModel {
 			add_cancel: None,
 			is_adding_repo: false,
 			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
-			status: Msg::new("status_scanning", []),
+			status: if workspace.is_some() {
+				Msg::new("status_scanning", [])
+			} else {
+				Msg::new("workspace_closed", [])
+			},
 			toast: None,
 			toast_seq: 0,
-			is_loading: true,
+			is_loading: workspace.is_some(),
 			is_copying: false,
 			locale: loc,
 			generation: 0,
@@ -1654,6 +1662,7 @@ impl WorkbenchModel {
 			last_changes_empty: std::cell::Cell::new(None),
 			last_log_empty: std::cell::Cell::new(None),
 			preview_root: None,
+			preview_error_root: None,
 			log_repo_filter: Vec::new(),
 			log_scope_key: Vec::new(),
 			log_feeds: Vec::new(),
@@ -1676,6 +1685,11 @@ impl WorkbenchModel {
 	/// The repo the shown preview came from: a log commit's own repo, the
 	/// Changes row's repo, else the open repo.
 	pub fn preview_root(&self) -> Option<PathBuf> {
+		if self.preview.is_none() && self.preview_error.is_some() {
+			if let Some(root) = &self.preview_error_root {
+				return Some(root.clone());
+			}
+		}
 		match (&self.preview_root, &self.preview) {
 			(_, Some(p))
 				if matches!(
@@ -1690,6 +1704,28 @@ impl WorkbenchModel {
 				Some(root.clone())
 			}
 			_ => self.repo_root(),
+		}
+	}
+
+	/// Returns a human-friendly display path for a repository root.
+	/// In a remote session, maps paths under session root to worker_name:workspace_path[/rel].
+	pub fn display_repo_path(&self, root: &std::path::Path) -> String {
+		crate::remote::display_path(self.remote.session.as_ref(), root)
+	}
+
+	pub fn change_repo_tooltip(&self, root: &std::path::Path) -> String {
+		self.display_repo_path(root)
+	}
+
+	pub fn project_repo_tooltip(&self, repo: &RepoEntry) -> String {
+		let path = self.display_repo_path(&repo.root);
+		match &repo.summary {
+			Ok(_) => format!(
+				"{}\n{}",
+				path,
+				crate::i18n::t("counts_tip", self.locale)
+			),
+			Err(e) => format!("{}\n{}", path, e),
 		}
 	}
 
@@ -1754,6 +1790,12 @@ impl WorkbenchModel {
 			if !self.display_commits().is_empty() {
 				return None;
 			}
+			if !self.workspace_open {
+				if self.is_loading {
+					return Some(LogEmpty::Loading);
+				}
+				return Some(LogEmpty::NoWorkspace);
+			}
 			if self.remote.session.is_some() {
 				if let Some(msg) = &self.remote.scan_error {
 					return Some(LogEmpty::Failed(msg.clone()));
@@ -1800,6 +1842,7 @@ impl WorkbenchModel {
 
 		let state_str = match &res {
 			None => None,
+			Some(LogEmpty::NoWorkspace) => Some("no_workspace"),
 			Some(LogEmpty::Scanning) => Some("scanning"),
 			Some(LogEmpty::Loading) => Some("loading"),
 			Some(LogEmpty::NoRepository) => Some("no_repository"),
@@ -2084,6 +2127,7 @@ impl WorkbenchModel {
 		if let Err(err) = self.paste.admit_ordinary(Some(&p)) {
 			self.preview_loading = false;
 			self.preview_error = None;
+			self.preview_error_root = None;
 			self.status = err;
 			app_log!("[APP:PREVIEW_REFUSED: reason=retained_budget]");
 			return false;
@@ -2120,6 +2164,7 @@ impl WorkbenchModel {
 		}
 		// The caller that read it names its repo again after installing.
 		self.preview_root = None;
+		self.preview_error_root = None;
 		self.preview = Some(p);
 		self.preview_loading = false;
 		self.preview_error = None;
@@ -2132,6 +2177,7 @@ impl WorkbenchModel {
 	pub(crate) fn clear_preview(&mut self) {
 		self.preview = None;
 		self.preview_root = None;
+		self.preview_error_root = None;
 		self.paste.release_ordinary();
 	}
 
@@ -2621,6 +2667,7 @@ impl WorkbenchModel {
 		self.changes_generation = self.changes_generation.wrapping_add(1);
 		self.changes_queue.clear_pending();
 		self.preview_root = None;
+		self.preview_error_root = None;
 		self.basket_view = (String::new(), None);
 		self.paste.invalidate_job();
 		if !self.paste_busy() {
@@ -3716,7 +3763,7 @@ impl WorkbenchModel {
 
 	/// A dropped tree queue or worker also dropped the workspace tree's
 	/// reads: unmark them and re-read its root if it never landed.
-	fn resume_ws_tree(&mut self, cx: &mut Context<Self>) {
+	pub(crate) fn resume_ws_tree(&mut self, cx: &mut Context<Self>) {
 		let Some(tree) = self.ws_tree.as_mut() else {
 			return;
 		};
@@ -4010,8 +4057,16 @@ impl WorkbenchModel {
 			repo_root.display()
 		);
 		self.set_status("status_repo_loading", [repo_name.clone()]);
-		if let Err(e) = &self.repos[idx].summary {
-			self.show_preview_error(Msg::new("error_repo_status", [e.clone()]));
+		let is_file_anchor = preserve_anchors
+			&& anchor_source.as_ref() == Some(&SourceKind::File)
+			&& anchor_file.is_some();
+		if !is_file_anchor {
+			if let Err(e) = &self.repos[idx].summary {
+				self.show_preview_error(Msg::new(
+					"error_repo_status",
+					[e.clone()],
+				));
+			}
 		}
 
 		let saved_files = self.file_paths_in_basket(&repo_root);
@@ -4191,10 +4246,34 @@ impl WorkbenchModel {
 								"error_repo_changes",
 								[repo_name.clone(), err.clone()],
 							);
-							model.show_preview_error(Msg::new(
-								"error_repo_changes",
-								[repo_name.clone(), err],
-							));
+							if let (true, Some(anchor)) = (
+								anchor_source.as_ref()
+									== Some(&SourceKind::File),
+								anchor_file.as_ref(),
+							) {
+								let root = model
+									.selected_file_root
+									.clone()
+									.or_else(|| {
+										model
+											.remote
+											.session
+											.as_ref()
+											.map(|s| s.root.clone())
+									})
+									.or_else(|| model.repo_root());
+								model.select_file_in(
+									root,
+									anchor,
+									SourceKind::File,
+									cx,
+								);
+							} else {
+								model.show_preview_error(Msg::new(
+									"error_repo_changes",
+									[repo_name.clone(), err],
+								));
+							}
 						}
 					}
 					if reload_log {
@@ -4282,6 +4361,7 @@ impl WorkbenchModel {
 		let file_path = path.to_string();
 		self.preview_loading = true;
 		self.preview_error = None;
+		self.preview_error_root = None;
 
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let kind = if fs_only {
@@ -4357,6 +4437,8 @@ impl WorkbenchModel {
 						model.selected_file_root,
 						model.selected_commit,
 					) = shown_selection;
+				} else {
+					model.preview_error_root = Some(shown_root);
 				}
 				cx.notify();
 			});
@@ -6774,6 +6856,338 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn test_display_repo_path_unit(cx: &mut TestAppContext) {
+			let tmp = tempfile::tempdir().unwrap();
+			let local_path = tmp.path().join("local-repo");
+			let (model, cx) = open(cx, local_path.clone(), None);
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.display_repo_path(&local_path),
+					local_path.display().to_string()
+				);
+			});
+
+			let session_root = PathBuf::from(
+				"snip-remote://5134d3b34076abcd1234567890abcdef5134d3b34076abcd1234567890abcdef/ws123",
+			);
+			model.update(cx, |m, _| {
+				use std::sync::Arc;
+				m.remote.session = Some(crate::remote::RemoteSession {
+					client: Arc::new(
+						snip_remote::Client::new(
+							snip_remote::PairedWorker {
+								name: "ubuntu-ui".into(),
+								addr: "100.95.28.19:47899".into(),
+								fingerprint: "5134d3b34076abcd1234567890abcdef5134d3b34076abcd1234567890abcdef".into(),
+							},
+							snip_remote::Identity::generate().unwrap().into(),
+							"test-mac".into(),
+						)
+						.unwrap(),
+					),
+					workspace: snip_remote::RemoteWorkspace {
+						id: "ws123".into(),
+						name: "gitws".into(),
+						path: "/home/ubuntu/gitws".into(),
+					},
+					root: session_root.clone(),
+				});
+			});
+
+			model.read_with(cx, |m, _| {
+				let root_tip = m.display_repo_path(&session_root);
+				assert_eq!(root_tip, "ubuntu-ui:/home/ubuntu/gitws");
+
+				let nested = session_root.join("alpha");
+				let nested_tip = m.display_repo_path(&nested);
+				assert_eq!(nested_tip, "ubuntu-ui:/home/ubuntu/gitws/alpha");
+			});
+		}
+
+		#[gpui::test]
+		fn remote_failed_preview_crumb_names_the_failed_repo_not_open_repo(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			let beta = shared.join("beta");
+			fs::create_dir_all(&alpha).unwrap();
+			fs::create_dir_all(&beta).unwrap();
+
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("a.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "a.txt"]);
+			crate::paste::tests::git_run(
+				&alpha,
+				&["commit", "-m", "init alpha"],
+			);
+			fs::write(alpha.join("a.txt"), "hello modified alpha\n").unwrap();
+
+			crate::paste::tests::git_init(&beta);
+			fs::write(beta.join("b.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&beta, &["add", "b.txt"]);
+			crate::paste::tests::git_run(&beta, &["commit", "-m", "init beta"]);
+			fs::write(beta.join("b.txt"), "hello modified beta\n").unwrap();
+
+			let (model, cx, mut worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			settle(cx);
+			for _ in 0..20 {
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() >= 2
+						&& m.change_repos.len() >= 2
+						&& !m.is_loading && m.files.iter().any(|f| {
+						m.change_repos
+							.get(f.repo as usize)
+							.is_some_and(|s| s.name == "beta")
+					})
+				});
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+
+			// Verify alpha is the open repo
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repo_root(), Some(m.repos[0].root.clone()));
+				assert_eq!(m.repos[0].name, "alpha");
+			});
+
+			// Stop the worker so reading file preview from worker fails
+			worker.stop();
+
+			// Find beta's file in m.files
+			let beta_idx = model.read_with(cx, |m, _| {
+				m.files
+					.iter()
+					.position(|f| {
+						let slot = f.repo as usize;
+						m.change_repos
+							.get(slot)
+							.is_some_and(|s| s.name == "beta")
+					})
+					.expect("beta change item found in files")
+			});
+
+			model.update(cx, |m, cx| {
+				m.select_change(beta_idx, cx);
+			});
+
+			settle(cx);
+			for _ in 0..20 {
+				let done = model.read_with(cx, |m, _| {
+					!m.preview_loading && m.preview_error.is_some()
+				});
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+
+			model.read_with(cx, |m, _| {
+				assert!(m.preview_error.is_some(), "expected preview error");
+				assert!(m.preview.is_none(), "preview should be none on error");
+				let (tab, crumbs, _badge) = m.source_labels();
+				assert_eq!(tab, "b.txt");
+				assert!(
+					crumbs.contains("beta"),
+					"crumbs should contain beta, got: {crumbs}"
+				);
+				assert!(
+					!crumbs.contains("alpha"),
+					"crumbs must not contain alpha, got: {crumbs}"
+				);
+				assert!(
+					crumbs.contains("b.txt"),
+					"crumbs must contain file path b.txt, got: {crumbs}"
+				);
+			});
+
+			model.update(cx, |m, _| {
+				m.clear_preview();
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.preview_error_root, None);
+			});
+		}
+
+		#[gpui::test]
+		fn no_workspace_empty_state_is_no_workspace_not_scanning(
+			cx: &mut TestAppContext,
+		) {
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(None, None, "normal".into(), cx)
+			});
+			settle(cx);
+
+			// (1) Fresh model with no workspace open
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_open);
+				assert_ne!(
+					m.log_empty_state(),
+					Some(crate::LogEmpty::Scanning),
+					"fresh model log_empty_state must not be Scanning"
+				);
+				assert_ne!(
+					m.changes_empty_state(),
+					Some(crate::ChangesEmpty::Scanning),
+					"fresh model changes_empty_state must not be Scanning"
+				);
+				assert_eq!(
+					m.log_empty_state(),
+					Some(crate::LogEmpty::NoWorkspace),
+					"fresh model log_empty_state should be NoWorkspace"
+				);
+				assert_eq!(
+					m.changes_empty_state(),
+					Some(crate::ChangesEmpty::NoWorkspace),
+					"fresh model changes_empty_state should be NoWorkspace"
+				);
+			});
+
+			// (2) Open a local workspace and then close it
+			let tmp = tempfile::tempdir().unwrap();
+			let repo_dir = tmp.path().join("repo");
+			fs::create_dir_all(&repo_dir).unwrap();
+			crate::paste::tests::git_init(&repo_dir);
+
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(Some(repo_dir), None, "normal".into(), cx)
+			});
+			settle(cx);
+
+			model.read_with(cx, |m, _| {
+				assert!(m.workspace_open);
+			});
+
+			model.update(cx, |m, cx| {
+				m.finish_close(cx);
+			});
+			settle(cx);
+
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_open);
+				assert_ne!(
+					m.log_empty_state(),
+					Some(crate::LogEmpty::Scanning),
+					"closed workspace log_empty_state must not be Scanning"
+				);
+				assert_ne!(
+					m.changes_empty_state(),
+					Some(crate::ChangesEmpty::Scanning),
+					"closed workspace changes_empty_state must not be Scanning"
+				);
+				assert_eq!(
+					m.log_empty_state(),
+					Some(crate::LogEmpty::NoWorkspace),
+					"closed workspace log_empty_state should be NoWorkspace"
+				);
+				assert_eq!(
+					m.changes_empty_state(),
+					Some(crate::ChangesEmpty::NoWorkspace),
+					"closed workspace changes_empty_state should be NoWorkspace"
+				);
+			});
+		}
+
+		#[gpui::test]
+		fn remote_repo_tooltips_do_not_expose_snip_remote_internal_scheme(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			let beta = shared.join("beta");
+			fs::create_dir_all(&alpha).unwrap();
+			fs::create_dir_all(&beta).unwrap();
+
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("a.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "a.txt"]);
+			crate::paste::tests::git_run(
+				&alpha,
+				&["commit", "-m", "init alpha"],
+			);
+
+			crate::paste::tests::git_init(&beta);
+			fs::write(beta.join("b.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&beta, &["add", "b.txt"]);
+			crate::paste::tests::git_run(&beta, &["commit", "-m", "init beta"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			settle(cx);
+			for _ in 0..20 {
+				let done = model
+					.read_with(cx, |m, _| m.repos.len() >= 2 && !m.is_loading);
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos.len(), 2);
+				for repo in &m.repos {
+					let display_path = m.display_repo_path(&repo.root);
+					assert!(
+						!display_path.contains("snip-remote://"),
+						"display_repo_path must not contain snip-remote://, got: {display_path}"
+					);
+					assert!(
+						display_path.starts_with("test-worker:"),
+						"display_repo_path must start with test-worker:, got: {display_path}"
+					);
+
+					let chg_tip = m.change_repo_tooltip(&repo.root);
+					assert!(
+						!chg_tip.contains("snip-remote://"),
+						"change_repo_tooltip must not contain snip-remote://, got: {chg_tip}"
+					);
+					assert!(
+						chg_tip.contains("test-worker:"),
+						"change_repo_tooltip must contain test-worker:, got: {chg_tip}"
+					);
+
+					let proj_tip = m.project_repo_tooltip(repo);
+					assert!(
+						!proj_tip.contains("snip-remote://"),
+						"project_repo_tooltip must not contain snip-remote://, got: {proj_tip}"
+					);
+					assert!(
+						proj_tip.contains("test-worker:"),
+						"project_repo_tooltip must contain test-worker:, got: {proj_tip}"
+					);
+				}
+			});
+		}
+
+		#[gpui::test]
 		fn remote_multi_repo_workspace_lists_every_repo_with_its_changes(
 			cx: &mut TestAppContext,
 		) {
@@ -7419,6 +7833,122 @@ mod tests {
 				let p = m.preview.as_ref().expect("preview restored");
 				assert_eq!(p.text.as_ref(), "root readme v2\n");
 				assert_eq!(m.selected_file_root.as_ref(), Some(&ws_root));
+			});
+		}
+
+		#[gpui::test]
+		fn remote_refresh_with_deleted_file_in_error_repo_shows_file_preview_error(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&shared).unwrap();
+
+			let nested = shared.join("nested");
+			fs::create_dir_all(nested.join(".git")).unwrap();
+			fs::write(shared.join("new.txt"), "hello new file\n").unwrap();
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos.len(), 1);
+				assert_eq!(m.repos[0].name, "nested");
+				assert!(
+					m.repos[0].summary.is_err(),
+					"nested should have error summary"
+				);
+			});
+
+			model.update(cx, |m, cx| {
+				m.dispatch_ws_tree(
+					Some(crate::TreeCommand::OpenFile("new.txt".into())),
+					cx,
+				);
+			});
+			settle(cx);
+
+			for _ in 0..20 {
+				let done = model.read_with(cx, |m, _| {
+					!m.preview_loading && m.preview.is_some()
+				});
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("preview loaded");
+				assert_eq!(p.text.as_ref(), "hello new file\n");
+				assert_eq!(m.selected_file.as_deref(), Some("new.txt"));
+			});
+
+			// (1) Delete new.txt on worker, then Refresh -> preview error should name new.txt, not nested
+			fs::remove_file(shared.join("new.txt")).unwrap();
+			model.update(cx, |m, cx| {
+				m.reload_repos(cx);
+			});
+
+			for _ in 0..20 {
+				let done = model
+					.read_with(cx, |m, _| !m.is_loading && !m.preview_loading);
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_file.as_deref(), Some("new.txt"));
+				let err = m
+					.preview_error
+					.as_ref()
+					.expect("preview error for deleted file");
+				let err_text = err.render(m.locale);
+				assert_eq!(err.key, "error_preview");
+				assert!(
+					err_text.contains("new.txt"),
+					"preview error text should name new.txt, got: {err_text}"
+				);
+				assert!(
+					!err_text.contains("nested"),
+					"preview error text must not name nested, got: {err_text}"
+				);
+			});
+
+			// (2) When file still exists, refresh keeps its content showing (no hijack)
+			fs::write(shared.join("new.txt"), "hello restored\n").unwrap();
+			model.update(cx, |m, cx| {
+				m.reload_repos(cx);
+			});
+
+			for _ in 0..20 {
+				let done = model.read_with(cx, |m, _| {
+					!m.is_loading && !m.preview_loading && m.preview.is_some()
+				});
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("preview restored");
+				assert_eq!(p.text.as_ref(), "hello restored\n");
+				assert_eq!(m.selected_file.as_deref(), Some("new.txt"));
+				assert!(m.preview_error.is_none());
 			});
 		}
 
@@ -8077,15 +8607,33 @@ mod tests {
 				},
 			);
 
+			// Without any manual refresh, wait (bounded) until ws_tree is loaded with top-level entries.
+			for _ in 0..20 {
+				settle(cx);
+				let loaded = model.read_with(cx, |m, _| {
+					m.ws_tree.as_ref().is_some_and(|t| {
+						t.is_loaded
+							&& t.children.iter().any(|c| c.name == "file.txt")
+					})
+				});
+				if loaded {
+					break;
+				}
+			}
+
 			model.read_with(cx, |m, _| {
 				let tree_has_file = m.ws_tree.as_ref().is_some_and(|t| {
 					t.is_loaded
 						&& t.children.iter().any(|c| c.name == "file.txt")
-				}) || m.file_tree.as_ref().is_some_and(|t| {
-					t.is_loaded
-						&& t.children.iter().any(|c| c.name == "file.txt")
 				});
 				assert!(tree_has_file, "project tree should list file.txt");
+
+				let scan_err = m
+					.remote
+					.scan_error
+					.as_ref()
+					.expect("scan_error expected");
+				assert_eq!(scan_err.key, "remote_worker_too_old");
 
 				let changes_state = m.changes_empty_state();
 				assert!(
@@ -8099,6 +8647,31 @@ mod tests {
 					"log_empty_state should be Failed(..), got: {log_state:?}"
 				);
 				assert_ne!(log_state, Some(crate::LogEmpty::Empty));
+			});
+
+			model.update(cx, |m, cx| {
+				m.dispatch_ws_tree(
+					Some(crate::TreeCommand::OpenFile("file.txt".into())),
+					cx,
+				);
+			});
+			settle(cx);
+
+			for _ in 0..20 {
+				let done = model.read_with(cx, |m, _| {
+					!m.preview_loading && m.preview.is_some()
+				});
+				if done {
+					break;
+				}
+				cx.run_until_parked();
+				cx.executor().advance_clock(Duration::from_millis(50));
+			}
+
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("preview loaded");
+				assert_eq!(p.text.as_ref(), "hello\n");
+				assert_eq!(m.selected_file.as_deref(), Some("file.txt"));
 			});
 		}
 

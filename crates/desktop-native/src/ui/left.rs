@@ -425,6 +425,9 @@ impl WorkbenchModel {
 							.flatten(),
 						|d, state| {
 							let text = match state {
+								crate::ChangesEmpty::NoWorkspace => {
+									t("workspace_closed", loc).to_string()
+								}
 								crate::ChangesEmpty::Scanning => {
 									t("changes_scanning", loc).to_string()
 								}
@@ -576,7 +579,6 @@ impl WorkbenchModel {
 					.flex_shrink_0()
 					.gap(px(5.))
 					.text_size(px(SMALL_TEXT));
-				let tooltip;
 				match &repo.summary {
 					Ok(s) => {
 						let parts = [
@@ -603,21 +605,16 @@ impl WorkbenchModel {
 									.child(t("clean", self.locale)),
 							);
 						}
-						tooltip = format!(
-							"{}\n{}",
-							repo.root.display(),
-							t("counts_tip", self.locale)
-						);
 					}
-					Err(e) => {
+					Err(_) => {
 						counts = counts.child(
 							div()
 								.text_color(rgb(pal().error))
 								.child(t("repo_error_short", self.locale)),
 						);
-						tooltip = format!("{}\n{}", repo.root.display(), e);
 					}
 				}
+				let tooltip = self.project_repo_tooltip(repo);
 				let branch = match &repo.summary {
 					Ok(s) => {
 						if let Some(ref b) = s.branch {

@@ -89,8 +89,10 @@ impl WorkbenchModel {
 		let browse = self.remote.browse.as_ref();
 		for (ix, worker) in self.remote.workers.iter().enumerate() {
 			let forget = format!("btn-remote-forget:{ix}");
+			let tip_text = crate::remote::remote_worker_tip(worker);
 			out.push(
 				menu_row(SharedString::from(format!("remote-worker:{ix}")), 82)
+					.tooltip(tip(tip_text))
 					.when(browse.is_some_and(|(i, _)| *i == ix), |d| {
 						d.bg(rgb(pal().hover_bg))
 					})
@@ -120,7 +122,9 @@ impl WorkbenchModel {
 											&worker.fingerprint
 										)
 										.map(|f| f.short())
-										.unwrap_or_default()
+										.unwrap_or_else(|| worker
+											.fingerprint
+											.clone())
 									))),
 							),
 					)

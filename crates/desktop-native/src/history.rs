@@ -2662,6 +2662,8 @@ impl WorkbenchModel {
 		self.selected_commit_file = Some(path.to_string());
 		self.commit_file_sel.clear();
 		self.preview_loading = true;
+		self.preview_error = None;
+		self.preview_error_root = None;
 		let path = path.to_string();
 		let for_bg = path.clone();
 		let cancel = arm_cancel(&mut self.preview_cancel);
@@ -2675,6 +2677,7 @@ impl WorkbenchModel {
 			crate::lifecycle::JobKind::CancellableRead,
 			Some(cancel.clone()),
 			async move {
+				let err_root = root.clone();
 				let res = bg
 					.spawn(async move {
 						let read = Read {
@@ -2701,6 +2704,8 @@ impl WorkbenchModel {
 						res.map(|p| (p, psource)),
 					) {
 						app_log!("[APP:PREVIEW_LOADED: {}]", path);
+					} else {
+						model.preview_error_root = Some(err_root);
 					}
 					cx.notify();
 				});
@@ -3385,7 +3390,7 @@ impl WorkbenchModel {
 			.iter()
 			.find(|r| r.root == root)
 			.map(|r| r.name.clone())
-			.unwrap_or_else(|| root.display().to_string())
+			.unwrap_or_else(|| self.display_repo_path(root))
 	}
 
 	/// A repository's root-stripe color: its place in the workspace, so

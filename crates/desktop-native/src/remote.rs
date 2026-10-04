@@ -25,8 +25,7 @@ use gpui::Context;
 use crate::i18n::Msg;
 use crate::reader::PreviewSource;
 use crate::tree::{
-	listed_tree_result, FileTreeNode, ListedChild, NodeKey, TreeCommand,
-	TreeEffect, TreeIo, TreeIoResult,
+	listed_tree_result, FileTreeNode, ListedChild, TreeIo, TreeIoResult,
 };
 use crate::{arm_cancel, lifecycle, RepoEntry, WorkbenchModel};
 
@@ -211,6 +210,14 @@ pub fn load_workers() -> Vec<PairedWorker> {
 	worker_store().map(|s| s.load()).unwrap_or_default()
 }
 
+/// Two-line tooltip for a paired worker row: name on first line, address and full grouped fingerprint on second.
+pub fn remote_worker_tip(worker: &PairedWorker) -> String {
+	let fp = snip_remote::Fingerprint::from_hex(&worker.fingerprint)
+		.map(|f| f.short())
+		.unwrap_or_else(|| worker.fingerprint.clone());
+	format!("{}\n{} · {}", worker.name, worker.addr, fp)
+}
+
 /// The remote workspace open in place of a local one.
 pub struct RemoteSession {
 	pub client: Arc<Client>,
@@ -244,6 +251,23 @@ impl RemoteSession {
 	pub fn tip(&self) -> String {
 		format!("{}:{}", self.client.worker().name, self.workspace.path)
 	}
+}
+
+/// Formats a repo path for display: in a remote session, maps paths under session root to worker:workspace_path[/rel].
+pub fn display_path(session: Option<&RemoteSession>, root: &Path) -> String {
+	if let Some(session) = session {
+		if let Some(rel) = remote_rel(&session.root, root) {
+			let base = session.workspace.path.trim_end_matches('/');
+			let worker = &session.client.worker().name;
+			if rel.is_empty() {
+				return format!("{worker}:{base}");
+			} else {
+				return format!("{worker}:{base}/{rel}");
+			}
+		}
+		return session.tip();
+	}
+	root.display().to_string()
 }
 
 /// A worker's shared workspaces, or why they could not be listed.
@@ -844,8 +868,8 @@ impl WorkbenchModel {
 			self.lifecycle.generation()
 		);
 		self.status = Msg::new("remote_opened", [label]);
-		self.resume_remote_tree(cx);
 		self.launch_remote_scan(None, true, cx);
+		self.resume_ws_tree(cx);
 	}
 
 	/// Scans the worker workspace for Git repositories in the background, updating discovery state.
@@ -989,24 +1013,19 @@ impl WorkbenchModel {
 								model.sync_change_slots();
 							}
 							model.ensure_ws_tree(cx);
+							if model
+								.ws_tree
+								.as_ref()
+								.is_some_and(|t| !t.is_loaded)
+							{
+								model.resume_ws_tree(cx);
+							}
 							cx.notify();
 						}
 					}
 				});
 			},
 		);
-	}
-
-	fn resume_remote_tree(&mut self, cx: &mut Context<Self>) {
-		let Some(tree) = self.ws_tree.as_mut() else {
-			return;
-		};
-		if let TreeEffect::Io(io) =
-			tree.start(TreeCommand::Expand(NodeKey::root()))
-		{
-			self.submit_tree_io(io, cx);
-		}
-		cx.notify();
 	}
 }
 
@@ -1401,5 +1420,29 @@ mod tests {
 		let msg = scan_incomplete_msg(ScanStatus::More, 5).unwrap();
 		assert_eq!(msg.key, "remote_scan_incomplete");
 		assert_eq!(msg.args, vec!["5".to_string()]);
+	}
+
+	#[test]
+	fn test_remote_worker_tip() {
+		let worker = snip_remote::PairedWorker {
+			name: "ubuntu-ui".into(),
+			addr: "100.95.28.19:47899".into(),
+			fingerprint:
+				"5134d3b34076abcd1234567890abcdef5134d3b34076abcd1234567890abcdef"
+					.into(),
+		};
+		let tip = remote_worker_tip(&worker);
+		assert_eq!(tip, "ubuntu-ui\n100.95.28.19:47899 · 5134-D3B3-4076-ABCD");
+
+		let bad_worker = snip_remote::PairedWorker {
+			name: "test-node".into(),
+			addr: "127.0.0.1:12345".into(),
+			fingerprint: "invalid-hex-fingerprint".into(),
+		};
+		let bad_tip = remote_worker_tip(&bad_worker);
+		assert_eq!(
+			bad_tip,
+			"test-node\n127.0.0.1:12345 · invalid-hex-fingerprint"
+		);
 	}
 }
