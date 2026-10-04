@@ -14,7 +14,7 @@ use crate::gitsrc::{self, ChangedPaths, Git, GitError, GitSource};
 use crate::workspace::{
 	declared_submodules, status_details, summarize_with_details,
 	summarize_with_identity, ChangeCounts, DiscoveredRepo, Discovery,
-	RepoIdentity, RepoKind, RepoSummary, ScanBudget, ScanStatus,
+	DiscoveryPage, RepoIdentity, RepoKind, RepoSummary, ScanBudget, ScanStatus,
 	SubmoduleState,
 };
 
@@ -965,8 +965,17 @@ pub fn scan_repos_within(
 	};
 
 	let page = discovery.next_page(budget);
+	finish_scan(page, &canonical_root, budget, opts)
+}
+
+fn finish_scan(
+	page: DiscoveryPage,
+	canonical_root: &Path,
+	budget: &ScanBudget,
+	opts: &RunOptions,
+) -> WorkspaceScan {
 	let (repos, id_errors) =
-		identify_repos(page.repos, Some(&canonical_root), budget, opts);
+		identify_repos(page.repos, Some(canonical_root), budget, opts);
 
 	let mut all_errors = page.errors;
 	all_errors.extend(id_errors);
@@ -3974,15 +3983,26 @@ mod tests {
 		run_git(&repo2, &["add", "f"]);
 		run_git(&repo2, &["commit", "-qm", "2"]);
 
-		let budget = ScanBudget {
+		let canonical_share = dunce::canonicalize(&share).unwrap();
+
+		// Discovery must complete to find both repos, but identification must run
+		// out of budget. Splitting them avoids racing wall-clock time: discovery runs
+		// with infinite visits, then finish_scan runs with an already-expired deadline.
+		let budget = ScanBudget::visits(usize::MAX);
+		let mut discovery = Discovery::new(&canonical_share, 3, 10).unwrap();
+		let page = discovery.next_page(&budget);
+
+		let identify_budget = ScanBudget {
 			max_visited: usize::MAX,
 			deadline: Some(
-				std::time::Instant::now() + std::time::Duration::from_millis(5),
+				std::time::Instant::now()
+					.checked_sub(std::time::Duration::from_secs(10))
+					.unwrap(),
 			),
 			cancel: None,
 		};
 		let opts = RunOptions::default();
-		let scan = scan_repos_within(&share, None, 3, 10, &budget, &opts);
+		let scan = finish_scan(page, &canonical_share, &identify_budget, &opts);
 		assert_eq!(scan.status, ScanStatus::TimedOut);
 		assert_eq!(scan.repos.len(), 2);
 		assert!(scan.repos.iter().any(|r| {
