@@ -211,34 +211,6 @@ impl WorkbenchModel {
 					}))
 					.children(probe(&self.probes, "btn-changes-group-dir")),
 				)
-				.child(
-					icon_button(
-						"btn-select-all",
-						Icon::SelectAll,
-						t("btn_select_all", loc),
-						true,
-						13,
-					)
-					.on_click(
-						cx.listener(|this, _, _, cx| this.select_all_files(cx)),
-					),
-				)
-			})
-			.when(self.rev_tree.is_none() || !is_project, |d| {
-				d.child(
-					icon_button(
-						"btn-select-none",
-						Icon::SelectNone,
-						t("btn_deselect_all", loc),
-						true,
-						14,
-					)
-					.on_click(
-						cx.listener(|this, _, _, cx| {
-							this.deselect_all_files(cx)
-						}),
-					),
-				)
 			});
 		let n = if is_project {
 			self.project_rows().len()
@@ -1008,15 +980,7 @@ impl WorkbenchModel {
 		let submodule = row.kind == snip_core::browser::TreeKind::Submodule;
 		let is_file = row.kind == snip_core::browser::TreeKind::Blob;
 		let path = row.path.clone();
-		let tree_sha = self
-			.rev_tree
-			.as_ref()
-			.map(|t| t.sha.clone())
-			.unwrap_or_default();
-		let is_basket_selected =
-			is_file && self.is_rev_file_selected(&tree_sha, &path);
 		let id = format!("rev-row:{path}");
-		let chk_id = format!("rev-chk:{}:{}", tree_sha, path);
 		div()
 			.id(SharedString::from(id.clone()))
 			.relative()
@@ -1059,31 +1023,6 @@ impl WorkbenchModel {
 				.into_any_element()
 			} else {
 				div().flex_shrink_0().w(px(10.)).into_any_element()
-			})
-			.child(if is_file {
-				div()
-					.id(SharedString::from(chk_id.clone()))
-					.relative()
-					.flex_shrink_0()
-					.size(px(18.))
-					.flex()
-					.items_center()
-					.justify_center()
-					.cursor_pointer()
-					.on_click(cx.listener({
-						let chk_path = path.clone();
-						let sha = tree_sha.clone();
-						move |this, _, _, cx| {
-							cx.stop_propagation();
-							this.tree_cursor = ix;
-							this.toggle_rev_file_selection(&sha, &chk_path, cx);
-						}
-					}))
-					.child(checkbox(is_basket_selected))
-					.children(probe(log, chk_id))
-					.into_any_element()
-			} else {
-				div().flex_shrink_0().size(px(18.)).into_any_element()
 			})
 			.child(icon(
 				if is_dir {

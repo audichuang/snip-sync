@@ -309,18 +309,6 @@ impl WorkbenchModel {
 		let log = &self.probes;
 
 		let repo = self.repo();
-		let count = self.basket_count();
-		let copy_reason = if self.is_copying {
-			Some(t("btn_copying", loc))
-		} else if count > 0 {
-			None
-		} else if self.selected_commit.is_some() && self.selected_file.is_none()
-		{
-			Some(t("btn_copy_commit_readonly", loc))
-		} else {
-			Some(t("btn_copy_empty", loc))
-		};
-		let copy_enabled = copy_reason.is_none();
 		let branch = repo
 			.and_then(|r| r.summary.as_ref().ok())
 			.and_then(|s| s.branch.clone())
@@ -445,45 +433,6 @@ impl WorkbenchModel {
 					.items_center()
 					.gap(px(2.))
 					.flex_shrink_0()
-					.child(
-						// IntelliJ main toolbar widget: a transparent icon with a
-						// small count badge instead of a filled button.
-						icon_button(
-							"btn-copy",
-							Icon::Basket,
-							copy_reason.map(str::to_string).unwrap_or_else(
-								|| tf("tip_basket_copy", loc, &[count]),
-							),
-							copy_enabled,
-							3,
-						)
-						.when(copy_enabled, |b| {
-							b.on_click(cx.listener(|this, _, _, cx| {
-								this.copy_selection_to_clipboard(cx)
-							}))
-						})
-						.when(count > 0, |b| {
-							b.child(
-								div()
-									.absolute()
-									.top(px(-3.))
-									.right(px(-4.))
-									.min_w(px(13.))
-									.h(px(13.))
-									.px(px(3.))
-									.rounded(px(7.))
-									.flex()
-									.items_center()
-									.justify_center()
-									.bg(rgb(pal().accent))
-									.text_size(px(9.))
-									.font_weight(FontWeight::SEMIBOLD)
-									.text_color(rgb(pal().accent_text))
-									.child(count.to_string()),
-							)
-						})
-						.children(probe(log, "btn-copy")),
-					)
 					.when(self.is_copying, |row| {
 						row.child(
 							button(
@@ -497,21 +446,6 @@ impl WorkbenchModel {
 								this.cancel_copy(cx)
 							}))
 							.children(probe(log, "btn-copy-cancel")),
-						)
-					})
-					.when(count > 0, |row| {
-						row.child(
-							icon_button(
-								"btn-basket-clear",
-								Icon::Close,
-								t("basket_clear", loc),
-								true,
-								31,
-							)
-							.on_click(cx.listener(|this, _, _, cx| {
-								this.clear_basket(cx);
-							}))
-							.children(probe(log, "btn-basket-clear")),
 						)
 					})
 					.child(
@@ -768,15 +702,6 @@ impl WorkbenchModel {
 	pub(super) fn render_status(&self, cx: &mut Context<Self>) -> AnyElement {
 		let loc = self.locale;
 		let errors = self.repos.iter().filter(|r| r.summary.is_err()).count();
-		let basket_n = self.basket_count().to_string();
-		let (basket_detail, collision) = &self.basket_view;
-		let basket_label = if let Some(collision) = collision {
-			tf("basket_collision", loc, &[collision])
-		} else if self.basket_count() == 0 {
-			t("basket_empty", loc).to_string()
-		} else {
-			tf("basket_summary", loc, &[&basket_n, basket_detail])
-		};
 		let repos_s = self.repos.len().to_string();
 		let repo_label = if errors > 0 {
 			tf("status_repo_count", loc, &[&repos_s, &errors.to_string()])
@@ -825,17 +750,6 @@ impl WorkbenchModel {
 					.tooltip(tip(status))
 					.mr(px(8.))
 			})
-			.child(
-				widget()
-					.id("basket-summary")
-					.relative()
-					.max_w(px(360.))
-					.min_w(px(40.))
-					.overflow_hidden()
-					.tooltip(tip(basket_label.clone()))
-					.child(clip_text(basket_label))
-					.children(probe(&self.probes, "basket-summary")),
-			)
 			.child(
 				widget()
 					.text_color(rgb(if errors > 0 {

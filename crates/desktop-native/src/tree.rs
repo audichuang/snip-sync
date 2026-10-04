@@ -834,18 +834,6 @@ impl FileTreeNode {
 		&self.selected_paths
 	}
 
-	/// Prepares the whole path intent without changing visible checkboxes.
-	pub fn selection_for_all(&self, selected: bool) -> Vec<String> {
-		if !selected {
-			return Vec::new();
-		}
-		let mut paths = self.selected_paths.clone();
-		for child in &self.children {
-			child.collect_selectable(&mut paths);
-		}
-		paths
-	}
-
 	pub fn selection_for_toggle(&self, key: &NodeKey) -> Option<Vec<String>> {
 		if key.is_root() {
 			return None;
@@ -894,14 +882,6 @@ impl FileTreeNode {
 
 	pub fn apply_selection(&mut self, selected: &[String]) {
 		self.install_selection(selected.to_vec());
-	}
-
-	pub fn set_all_selected(&mut self, selected: bool) {
-		self.install_selection(self.selection_for_all(selected));
-	}
-
-	pub fn collect_selected_paths(&self, out: &mut Vec<String>) {
-		out.extend(self.selected_paths.iter().cloned());
 	}
 
 	pub fn collect_expanded_paths(&self, out: &mut Vec<String>) {
@@ -1066,20 +1046,6 @@ impl FileTreeNode {
 	fn toggle_key(&mut self, key: &NodeKey) {
 		if let Some(paths) = self.selection_for_toggle(key) {
 			self.install_selection(paths);
-		}
-	}
-
-	fn collect_selectable(&self, out: &mut Vec<String>) {
-		if self.is_nested_repo {
-			return;
-		}
-		if self.is_valid_utf8 && !self.rel_path.is_empty() {
-			if let Err(index) = out.binary_search(&self.rel_path) {
-				out.insert(index, self.rel_path.clone());
-			}
-		}
-		for child in &self.children {
-			child.collect_selectable(out);
 		}
 	}
 
@@ -1291,10 +1257,7 @@ mod tests {
 	}
 
 	fn selected(tree: &FileTreeNode) -> Vec<String> {
-		let mut paths = Vec::new();
-		tree.collect_selected_paths(&mut paths);
-		paths.sort();
-		paths
+		tree.selected_paths().to_vec()
 	}
 
 	#[cfg(unix)]
@@ -1334,46 +1297,9 @@ mod tests {
 			2000,
 			"cache pressure never drops checked paths"
 		);
-		tree.set_all_selected(false);
+		tree.install_selection(Vec::new());
 		assert_eq!(tree.selection_bytes(), 0);
 		assert_eq!(tree.retained_bytes(), cache);
-	}
-
-	#[test]
-	fn whole_folder_selection_prepares_without_changing_visible_checks() {
-		let dir = tempfile::tempdir().unwrap();
-		fs::create_dir(dir.path().join("folder")).unwrap();
-		fs::write(dir.path().join("folder/a.txt"), "a").unwrap();
-		fs::write(dir.path().join("folder/b.txt"), "b").unwrap();
-		let mut tree = FileTreeNode::new_root(dir.path());
-		let key = NodeKey::from_utf8_rel("folder");
-		drive(&mut tree, TreeCommand::Expand(key.clone()));
-		let proposed = tree.selection_for_all(true);
-		assert_eq!(proposed, ["folder", "folder/a.txt", "folder/b.txt"]);
-		assert!(tree.selected_paths().is_empty());
-		assert!(tree
-			.flatten_visible(MAX_VISIBLE_ROWS)
-			.iter()
-			.all(|row| !row.selected));
-		tree.install_selection(proposed);
-		assert_eq!(tree.selected_paths().len(), 3);
-		let old_bytes = tree.selection_bytes();
-		let old_capacity = tree.selected_paths.capacity();
-		let all_again = tree.selection_for_all(true);
-		assert_eq!(all_again, tree.selected_paths());
-		assert!(
-			all_again.capacity() <= old_capacity,
-			"no-op Select All must not grow storage for duplicate paths"
-		);
-		assert!(selection_bytes(&all_again) <= old_bytes);
-		assert_eq!(tree.selection_bytes(), old_bytes);
-		let removed = tree.selection_for_toggle(&key).unwrap();
-		assert!(removed.is_empty());
-		assert_eq!(
-			tree.selected_paths().len(),
-			3,
-			"preparing removal is also read-only"
-		);
 	}
 
 	#[test]

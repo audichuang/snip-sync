@@ -1098,8 +1098,7 @@ impl WorkbenchModel {
 
 	/// One row of the changed-files pane, drawn like the Changes tool
 	/// window's tree (chevron, folder, compacted name, muted count; a file
-	/// by its name in its change colour) without the checkboxes: history
-	/// is read-only here.
+	/// by its name in its change colour).
 	pub(super) fn changed_file_row(
 		&self,
 		row: super::changes::ChangeItemRow,
