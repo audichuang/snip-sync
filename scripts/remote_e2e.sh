@@ -13,8 +13,7 @@
 #       `git archive HEAD`.
 #
 # Every check prints PASS or FAIL; the exit code is 0 only when all passed.
-# Waits scale with SNIP_E2E_TIMEOUT_SCALE. A check that cannot run here
-# (no symlinks) fails instead of skipping when SNIP_REQUIRE_ALL_TESTS is set.
+# A check that cannot run here (no symlinks) fails instead of skipping when SNIP_REQUIRE_ALL_TESTS is set.
 set -uo pipefail
 
 SNIP=""
@@ -33,7 +32,6 @@ done
 [ -x "$SNIP" ] || { echo "$SNIP is not an executable" >&2; exit 2; }
 SNIP=$(cd "$(dirname "$SNIP")" && pwd)/$(basename "$SNIP")
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-SCALE=${SNIP_E2E_TIMEOUT_SCALE:-1}
 
 # Runs a bash snippet on the worker machine (stdin), prints its output.
 w() {
@@ -183,11 +181,10 @@ EOF
 
 echo "== connect"
 check "the worker answers on stdio" bash -c "'$SNIP' remote ls h $WD | grep -qx edge/"
-home=$("$SNIP" remote ls h "~" 2>&1)
-check "~ opens the worker's home" test "$?" = 0
+check "~ opens the worker's home" "$SNIP" remote ls h "~"
 refused "a relative workspace" "absolute" ls h relative/dir
-refused "a missing workspace" "" ls h $WD/nope
-err=$(SNIP_REMOTE_EXEC="$WD/no-such-snip serve --stdio" "$SNIP" remote ls h $WD 2>&1)
+refused "a missing workspace" "" ls h "$WD/nope"
+err=$(SNIP_REMOTE_EXEC="$WD/no-such-snip serve --stdio" "$SNIP" remote ls h "$WD" 2>&1)
 check "a worker that cannot start says why ($err)" test -n "$err"
 srcname=$(basename "$SRC")
 
@@ -195,8 +192,8 @@ echo "== browsing"
 check "folders first" bash -c "'$SNIP' remote ls h $WD/edge | head -1 | grep -q '/\$'"
 check "a Chinese name with spaces" bash -c "'$SNIP' remote cat h $WD/edge 'src/deep/中文 有空白.txt' | grep -q 深層"
 check "stat of an empty file" bash -c "'$SNIP' remote stat h $WD/edge empty.txt | grep -q '^file	0	'"
-check "exactly 1 MiB is served" test "$("$SNIP" remote cat h $WD/edge exact-1MiB.txt | wc -c | tr -d ' ')" = 1048576
-check "1200 entries are cut at 1000" test "$("$SNIP" remote ls h $WD/edge manydir 2>/dev/null | wc -l | tr -d ' ')" = 1000
+check "exactly 1 MiB is served" test "$("$SNIP" remote cat h "$WD/edge" exact-1MiB.txt | wc -c | tr -d ' ')" = 1048576
+check "1200 entries are cut at 1000" test "$("$SNIP" remote ls h "$WD/edge" manydir 2>/dev/null | wc -l | tr -d ' ')" = 1000
 check "a nested repo is a folder" bash -c "'$SNIP' remote stat h $WD/edge nested | grep -q '^directory'"
 if w <<<"[ -L '$WD/edge/inner-link' ]"; then
 	check "a symlink inside the workspace is followed" bash -c "'$SNIP' remote ls h $WD/edge inner-link | grep -qx deep/"
@@ -227,30 +224,30 @@ EOF
 	check "$total files in $ws identical to the worker's bytes" test "$badfiles" = 0 -a "$total" -gt 0
 }
 compare "$WD/text" "$WD/text" .
-check "CRLF kept" test "$("$SNIP" remote cat h $WD/edge crlf.txt | hash_of)" = "$(printf 'line1\r\nline2\r\n' | hash_of)"
+check "CRLF kept" test "$("$SNIP" remote cat h "$WD/edge" crlf.txt | hash_of)" = "$(printf 'line1\r\nline2\r\n' | hash_of)"
 if [ -n "$SRC" ]; then
 	compare "$SRC" "$SRC" "crates docs scripts fixtures -size -1024k \\( -name '*.rs' -o -name '*.md' -o -name '*.toml' -o -name '*.py' -o -name '*.sh' -o -name '*.json' \\)"
 fi
 
 echo "== refused"
-refused "binary" "binary or not UTF-8" cat h $WD/edge blob.bin
-refused "not UTF-8" "binary or not UTF-8" cat h $WD/edge latin.txt
-refused "over 1 MiB" "exceeds 1 MiB" cat h $WD/edge over-1MiB.txt
-refused "../" "inside the workspace" cat h $WD/edge ../secret.txt
-refused "src/../../" "inside the workspace" cat h $WD/edge src/../../secret.txt
-refused "an absolute path" "inside the workspace" cat h $WD/edge "$WD/secret.txt"
-refused "ls .." "inside the workspace" ls h $WD/edge ..
-refused "a folder read as a file" "" cat h $WD/edge src
+refused "binary" "binary or not UTF-8" cat h "$WD/edge" blob.bin
+refused "not UTF-8" "binary or not UTF-8" cat h "$WD/edge" latin.txt
+refused "over 1 MiB" "exceeds 1 MiB" cat h "$WD/edge" over-1MiB.txt
+refused "../" "inside the workspace" cat h "$WD/edge" ../secret.txt
+refused "src/../../" "inside the workspace" cat h "$WD/edge" src/../../secret.txt
+refused "an absolute path" "inside the workspace" cat h "$WD/edge" "$WD/secret.txt"
+refused "ls .." "inside the workspace" ls h "$WD/edge" ..
+refused "a folder read as a file" "" cat h "$WD/edge" src
 if w <<<"[ -L '$WD/edge/escape.txt' ]"; then
-	refused "a symlink out of the workspace" "leaves the workspace" cat h $WD/edge escape.txt
+	refused "a symlink out of the workspace" "leaves the workspace" cat h "$WD/edge" escape.txt
 	check "a folder symlink out of the workspace lists as a plain entry" bash -c "'$SNIP' remote ls h $WD/edge | grep -qx escape-dir"
-	refused "a folder symlink out of the workspace" "leaves the workspace" ls h $WD/edge escape-dir
+	refused "a folder symlink out of the workspace" "leaves the workspace" ls h "$WD/edge" escape-dir
 else
 	skip "a symlink out of the workspace" "no symlinks on the worker"
 fi
 
 echo "== parallel"
-want=$("$SNIP" remote cat h $WD/text plain_60.txt | hash_of)
+want=$("$SNIP" remote cat h "$WD/text" plain_60.txt | hash_of)
 # Each command is a worker process; over ssh each is a login too, and sshd
 # drops logins beyond MaxStartups (10 by default).
 counts="20 50 100"
@@ -258,7 +255,7 @@ counts="20 50 100"
 for n in $counts; do
 	rm -f "$MASTER"/par.*
 	for i in $(seq 1 "$n"); do
-		("$SNIP" remote cat h $WD/text plain_60.txt 2>/dev/null | hash_of >"$MASTER/par.$i") &
+		("$SNIP" remote cat h "$WD/text" plain_60.txt 2>/dev/null | hash_of >"$MASTER/par.$i") &
 	done
 	wait
 	good=$(cat "$MASTER"/par.* | grep -c "$want")
@@ -269,13 +266,13 @@ echo "== git views"
 w <<<"sleep 1 && touch '$WD/gitws/alpha/b.txt'"
 alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
 
-repos_gitws=$("$SNIP" remote repos h $WD/gitws)
+repos_gitws=$("$SNIP" remote repos h "$WD/gitws")
 check "repos gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
 check "broken appears as an error row" test "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1
 check "wt and borrowed are served as locally" test "$(grep '^wt	' <<<"$repos_gitws" | grep -vc error)" = 1 -a "$(grep '^borrowed	' <<<"$repos_gitws" | grep -vc error)" = 1
 
-changes_mainwt=$("$SNIP" remote changes h $WD/gitws mainwt)
-log_mainwt=$("$SNIP" remote log h $WD/gitws mainwt)
+changes_mainwt=$("$SNIP" remote changes h "$WD/gitws" mainwt)
+log_mainwt=$("$SNIP" remote log h "$WD/gitws" mainwt)
 all_mainwt="$repos_gitws
 $changes_mainwt
 $log_mainwt"
@@ -291,40 +288,40 @@ alpha_counts=$(cut -f3,4,5 <<<"$alpha_line")
 oracle_counts=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' status --porcelain=v2" | awk '/^1/ || /^2/ { if (substr($2, 1, 1) != ".") staged++; if (substr($2, 2, 1) != ".") unstaged++; } /^\?/ { untracked++ } END { printf "%d\t%d\t%d\n", staged+0, unstaged+0, untracked+0 }')
 check "alpha status counts match oracle ($alpha_counts)" test "$alpha_counts" = "$oracle_counts" -a -n "$alpha_counts"
 
-changes_alpha=$("$SNIP" remote changes h $WD/gitws alpha)
+changes_alpha=$("$SNIP" remote changes h "$WD/gitws" alpha)
 changes_paths=$(cut -f3 <<<"$changes_alpha" | LC_ALL=C sort)
 oracle_changes_paths=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' status --porcelain=v2 --untracked-files=all" | awk '/^1/ || /^2/ { print $9 } /^\?/ { print $2 }' | LC_ALL=C sort)
 check "changes alpha path set == oracle path set" test "$changes_paths" = "$oracle_changes_paths" -a -n "$changes_paths"
 
-changes_beta=$("$SNIP" remote changes h $WD/gitws beta 2>&1)
+changes_beta=$("$SNIP" remote changes h "$WD/gitws" beta 2>&1)
 rc=$?
 check "changes beta prints nothing and exits 0" test "$rc" = 0 -a -z "$changes_beta"
 
-repos_inner_out=$("$SNIP" remote repos h $WD/outer/inner)
-repos_inner_all=$("$SNIP" remote repos h $WD/outer/inner 2>&1)
+repos_inner_out=$("$SNIP" remote repos h "$WD/outer/inner")
+repos_inner_all=$("$SNIP" remote repos h "$WD/outer/inner" 2>&1)
 rc=$?
 check "repos inner prints no repo rows and does not contain outer-dirty" test "$rc" = 0 -a -z "$repos_inner_out" -a "$(grep -c outer-dirty <<<"$repos_inner_all")" = 0 -a "$(grep -c 'no Git repository in' <<<"$repos_inner_all")" -ge 1
-refused "changes inner exits 1" "" changes h $WD/outer/inner
+refused "changes inner exits 1" "" changes h "$WD/outer/inner"
 
-log_alpha=$("$SNIP" remote log h $WD/gitws alpha -n 50)
+log_alpha=$("$SNIP" remote log h "$WD/gitws" alpha -n 50)
 log_shas=$(cut -f1 <<<"$log_alpha" | LC_ALL=C sort)
 oracle_rev_shas=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' rev-list --all" | LC_ALL=C sort)
 check "log alpha sha set == git rev-list --all" test "$log_shas" = "$oracle_rev_shas" -a -n "$log_shas"
 
 alpha_head=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' rev-parse HEAD")
-show_alpha=$("$SNIP" remote show h $WD/gitws alpha "$alpha_head")
+show_alpha=$("$SNIP" remote show h "$WD/gitws" alpha "$alpha_head")
 show_paths=$(cut -f2 <<<"$show_alpha" | LC_ALL=C sort)
 oracle_diff_paths=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' diff-tree --no-commit-id --name-only -r HEAD" | LC_ALL=C sort)
 check "show alpha HEAD path set == diff-tree path set" test "$show_paths" = "$oracle_diff_paths" -a -n "$show_paths"
 
-diff_a=$("$SNIP" remote diff h $WD/gitws alpha a.txt)
+diff_a=$("$SNIP" remote diff h "$WD/gitws" alpha a.txt)
 check "diff alpha a.txt contains changed line" grep -q "commit 2 a modified" <<<"$diff_a"
-diff_staged=$("$SNIP" remote diff h $WD/gitws alpha staged.txt --staged)
+diff_staged=$("$SNIP" remote diff h "$WD/gitws" alpha staged.txt --staged)
 check "diff alpha staged.txt --staged contains staged content" grep -q "staged file content" <<<"$diff_staged"
 
-refused "diff ../../secret.txt" "" diff h $WD/gitws alpha ../../secret.txt
+refused "diff ../../secret.txt" "" diff h "$WD/gitws" alpha ../../secret.txt
 if w <<<"[ -L '$WD/gitws/alpha/link-to-secret' ]"; then
-	link_out=$("$SNIP" remote diff h $WD/gitws alpha link-to-secret 2>&1)
+	link_out=$("$SNIP" remote diff h "$WD/gitws" alpha link-to-secret 2>&1)
 	rc=$?
 	if [ "$rc" = 1 ] && ! grep -q "TOPSECRET" <<<"$link_out"; then
 		ok "diff link-to-secret  ($link_out)"
@@ -334,20 +331,19 @@ if w <<<"[ -L '$WD/gitws/alpha/link-to-secret' ]"; then
 else
 	skip "diff link-to-secret" "no symlinks on the worker"
 fi
-show_pwned_out=$("$SNIP" remote show h $WD/gitws alpha -- "--output=$WD/pwned" 2>&1)
+show_pwned_out=$("$SNIP" remote show h "$WD/gitws" alpha -- "--output=$WD/pwned" 2>&1)
 rc=$?
 if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/pwned'"; then
 	ok "show --output refused without creating file  ($show_pwned_out)"
 else
 	bad "show --output  rc=$rc out=$show_pwned_out"
 fi
-refused "show invalid revision ':/x'" "" show h $WD/gitws alpha ':/x'
+refused "show invalid revision ':/x'" "" show h "$WD/gitws" alpha ':/x'
 
-wt_changes=$("$SNIP" remote changes h $WD/gitws wt 2>&1)
-check "changes on a linked worktree of an outside repo" test "$?" = 0
+check "changes on a linked worktree of an outside repo" "$SNIP" remote changes h "$WD/gitws" wt
 
 # A diff that covers the stat-dirty b.txt is what makes git refresh an index it may write.
-"$SNIP" remote diff h $WD/gitws alpha b.txt >/dev/null 2>&1 || true
+"$SNIP" remote diff h "$WD/gitws" alpha b.txt >/dev/null 2>&1 || true
 alpha_index_after=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
 check "alpha .git/index sha256 unchanged" test "$alpha_index_after" = "$alpha_index_before" -a -n "$alpha_index_after"
 check "alpha .git/index.lock does not exist" w <<<"test ! -e '$WD/gitws/alpha/.git/index.lock'"
