@@ -236,7 +236,7 @@ pub fn run(
 			let ws = find_workspace(&c, &workspace)?;
 			let mut out = io::stdout().lock();
 			let mut offset = 0;
-			let mut last_truncated = false;
+			let last_truncated;
 			loop {
 				let page = c
 					.list_dir_page(&ws.id, &path, offset)

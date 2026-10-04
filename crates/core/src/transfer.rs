@@ -3340,14 +3340,6 @@ impl CommitReplayPreview {
 	}
 }
 
-fn replay_plan(
-	git: &Git,
-	payload: &CommitsPayload,
-	opts: &RunOptions,
-) -> Result<commits::CommitReplayPlan, TransferError> {
-	replay_plan_in(git, git.root(), payload, opts)
-}
-
 fn replay_plan_in(
 	git: &Git,
 	scope: &Path,

@@ -75,10 +75,12 @@ pub fn is_multi_link(path: &Path) -> bool {
 	{
 		std::os::unix::fs::MetadataExt::nlink(&info) > 1
 	}
-	#[cfg(windows)]
+	// Windows: `MetadataExt::number_of_links` is unstable (`windows_by_handle`)
+	// and the workspace forbids `unsafe`, so the link count cannot be read
+	// here; the guard is Unix-only (documented in porting-notes).
+	#[cfg(not(unix))]
 	{
-		use std::os::windows::fs::MetadataExt as _;
-		info.number_of_links() > 1
+		false
 	}
 	#[cfg(not(any(unix, windows)))]
 	{

@@ -1753,17 +1753,10 @@ pub(crate) struct ReplaySession {
 }
 
 impl ReplaySession {
-	/// Heavy lock + empty hooks dir, taken before any write. Err is the ReplayResult
-	/// the old replay returned for that failure (failure at index 0, or none for an empty payload).
-	pub(crate) fn begin(
-		git: &Git,
-		payload: &CommitsPayload,
-		opts: &RunOptions,
-	) -> Result<Self, ReplayResult> {
-		Self::begin_in(git, git.root(), payload, opts)
-	}
-
-	/// [`Self::begin`] with the replay's write scope ([`plan_commit_replay_in`]).
+	/// Heavy lock + empty hooks dir, taken before any write, with the
+	/// replay's write scope ([`plan_commit_replay_in`]). Err is the
+	/// ReplayResult the old replay returned for that failure (failure at
+	/// index 0, or none for an empty payload).
 	pub(crate) fn begin_in(
 		git: &Git,
 		scope: &Path,
@@ -1839,7 +1832,12 @@ impl ReplaySession {
 
 #[cfg(test)]
 pub(crate) fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
-	match ReplaySession::begin(git, payload, &RunOptions::default()) {
+	match ReplaySession::begin_in(
+		git,
+		git.root(),
+		payload,
+		&RunOptions::default(),
+	) {
 		Ok(session) => session.run(git, payload),
 		Err(refused) => refused,
 	}
