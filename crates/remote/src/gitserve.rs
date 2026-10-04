@@ -801,7 +801,7 @@ fn open_repo(
 		c.get(&root.id, repo)
 	};
 	if let Some(identity) = cached_id {
-		return Ok(LocalRepo::known_within(&identity, &root.path));
+		return Ok(LocalRepo::known_served(&identity));
 	}
 
 	let dir = if repo.is_empty() {
@@ -830,7 +830,7 @@ fn open_repo(
 		return Err((ErrorCode::NotARepository, "not a git repository".into()));
 	}
 
-	match LocalRepo::open_within(&dir, &root.path, read) {
+	match LocalRepo::open_served(&dir, read) {
 		Ok(view) => {
 			if let Some(id) = view.identity() {
 				let mut c = cache

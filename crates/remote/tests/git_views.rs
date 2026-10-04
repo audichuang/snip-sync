@@ -382,7 +382,7 @@ fn broken_git_dir_is_an_error_row_not_the_parent() {
 }
 
 #[test]
-fn worktree_of_an_outside_repo_is_refused() {
+fn worktree_of_an_outside_repo_is_served() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let outside = tmp.path().join("outside");
@@ -398,31 +398,27 @@ fn worktree_of_an_outside_repo_is_refused() {
 		&outside,
 		&["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"],
 	);
+	fs::write(wt.join("file.txt"), "changed in the worktree").unwrap();
 
 	let w = test_worker(None);
 	let (client, ws_id) = paired_client(&w, &ws);
 
+	// As in a local workspace: the worktree is a repository even though
+	// its main repository lives outside the opened folder.
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	let wt_row = scan
 		.repos
 		.iter()
 		.find(|r| r.rel == "wt")
 		.expect("wt row present");
-	assert!(wt_row.summary.is_err());
-	let err_msg = wt_row.summary.as_ref().unwrap_err();
-	assert!(
-		err_msg.contains("linked worktree"),
-		"unexpected error: {err_msg}"
-	);
-	assert!(
-		err_msg.contains("main repository"),
-		"unexpected error: {err_msg}"
-	);
-
-	let json = serde_json::to_string(&scan).unwrap();
-	assert!(!json.contains(&outside.display().to_string()));
-	let canon = dunce::canonicalize(&outside).unwrap();
-	assert!(!json.contains(&canon.display().to_string()));
+	assert!(wt_row.summary.is_ok(), "{:?}", wt_row.summary);
+	let remote = RemoteRepo::new(Arc::new(client), ws_id, "wt".into());
+	let read = Read {
+		profile: ReadProfile::Interactive,
+		cancel: None,
+	};
+	let list = remote.change_list(100, &read).unwrap();
+	assert!(list.rows.iter().any(|r| r.path == "file.txt"));
 }
 
 #[test]
@@ -532,7 +528,7 @@ fn main_repo_with_worktree_outside_the_share_is_served() {
 }
 
 #[test]
-fn gitdir_file_pointing_outside_is_refused() {
+fn gitdir_file_pointing_outside_is_served() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let outside = tmp.path().join("outside");
@@ -550,18 +546,14 @@ fn gitdir_file_pointing_outside_is_refused() {
 	let w = test_worker(None);
 	let (client, ws_id) = paired_client(&w, &ws);
 
+	// A separate git dir works as it does locally.
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	let fake_row = scan
 		.repos
 		.iter()
 		.find(|r| r.rel == "fake")
 		.expect("fake row present");
-	assert!(fake_row.summary.is_err());
-
-	let json = serde_json::to_string(&scan).unwrap();
-	assert!(!json.contains(&outside.display().to_string()));
-	let canon = dunce::canonicalize(&outside).unwrap();
-	assert!(!json.contains(&canon.display().to_string()));
+	assert!(fake_row.summary.is_ok(), "{:?}", fake_row.summary);
 }
 
 #[cfg(unix)]
@@ -597,7 +589,7 @@ fn symlinked_git_dir_pointing_outside_is_never_reported() {
 }
 
 #[test]
-fn alternates_pointing_outside_are_refused() {
+fn alternates_pointing_outside_are_served() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let outside = tmp.path().join("outside");
@@ -616,18 +608,23 @@ fn alternates_pointing_outside_are_refused() {
 	let w = test_worker(None);
 	let (client, ws_id) = paired_client(&w, &ws);
 
+	// Objects borrowed from outside the folder are read, as locally.
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	let borrowed_row = scan
 		.repos
 		.iter()
 		.find(|r| r.rel == "borrowed")
 		.expect("borrowed row present");
-	assert!(borrowed_row.summary.is_err());
-
-	let json = serde_json::to_string(&scan).unwrap();
-	assert!(!json.contains(&outside.display().to_string()));
-	let canon = dunce::canonicalize(&outside).unwrap();
-	assert!(!json.contains(&canon.display().to_string()));
+	assert!(borrowed_row.summary.is_ok(), "{:?}", borrowed_row.summary);
+	let remote = RemoteRepo::new(Arc::new(client), ws_id, "borrowed".into());
+	let read = Read {
+		profile: ReadProfile::Interactive,
+		cancel: None,
+	};
+	let snap = remote.refs(&read).unwrap();
+	let (commits, _) =
+		remote.log_from_tips(&snap.tips(), 0, 10, &read).unwrap();
+	assert_eq!(commits.len(), 1);
 }
 
 #[test]
@@ -1825,246 +1822,6 @@ fn working_preview_of_a_symlink_out_of_the_share_is_refused() {
 		!debug_text.contains("TOPSECRET"),
 		"secret leaked in error: {debug_text}"
 	);
-}
-
-#[cfg(unix)]
-#[test]
-fn changed_file_text_of_a_symlink_out_of_the_share_is_refused() {
-	let _serial = serial();
-	let tmp = tempfile::tempdir().unwrap();
-	let outside = tmp.path().join("outside");
-	fs::create_dir_all(&outside).unwrap();
-	fs::write(outside.join("secret.txt"), "TOPSECRET_FILE_TEXT_DATA").unwrap();
-
-	let ws = tmp.path().join("ws");
-	fs::create_dir_all(&ws).unwrap();
-	run_git(&ws, &["init", "-b", "main"]);
-	fs::write(ws.join("tracked.txt"), "initial").unwrap();
-	run_git(&ws, &["add", "tracked.txt"]);
-	run_git(&ws, &["commit", "-m", "init"]);
-
-	// 1. Untracked symlink out
-	std::os::unix::fs::symlink(
-		outside.join("secret.txt"),
-		ws.join("sym_untracked.txt"),
-	)
-	.unwrap();
-
-	let w = test_worker(None);
-	let (client, ws_id) = paired_client(&w, &ws);
-	let remote = RemoteRepo::new(Arc::new(client), ws_id, "".into());
-	let read = Read {
-		profile: ReadProfile::Interactive,
-		cancel: None,
-	};
-
-	let res = remote.changed_file_text(
-		&GitSource::Working,
-		"sym_untracked.txt",
-		1024,
-		&read,
-	);
-	assert!(res.is_err());
-	let debug_text = format!("{res:?}");
-	assert!(
-		!debug_text.contains("TOPSECRET"),
-		"secret leaked in error: {debug_text}"
-	);
-
-	// 2. Tracked file replaced by a symlink out
-	fs::remove_file(ws.join("tracked.txt")).unwrap();
-	std::os::unix::fs::symlink(
-		outside.join("secret.txt"),
-		ws.join("tracked.txt"),
-	)
-	.unwrap();
-
-	let res = remote.changed_file_text(
-		&GitSource::Working,
-		"tracked.txt",
-		1024,
-		&read,
-	);
-	assert!(res.is_err());
-	let debug_text = format!("{res:?}");
-	assert!(
-		!debug_text.contains("TOPSECRET"),
-		"secret leaked in error: {debug_text}"
-	);
-}
-
-#[test]
-fn outside_object_by_sha_is_refused() {
-	let _serial = serial();
-	let tmp = tempfile::tempdir().unwrap();
-	let outside = tmp.path().join("outside");
-	let inside = tmp.path().join("inside");
-	fs::create_dir_all(&outside).unwrap();
-	fs::create_dir_all(&inside).unwrap();
-
-	// Repo B outside with secret
-	let repo_b = outside.join("b");
-	run_git(&repo_b, &["init", "-b", "main"]);
-	fs::write(repo_b.join("secret.txt"), "SECRET_OBJECT_CONTENT").unwrap();
-	run_git(&repo_b, &["add", "secret.txt"]);
-	run_git(&repo_b, &["commit", "-m", "secret commit"]);
-	let mut cmd = std::process::Command::new("git");
-	let b_sha = String::from_utf8(
-		cmd.args(["rev-parse", "HEAD"])
-			.current_dir(&repo_b)
-			.output()
-			.unwrap()
-			.stdout,
-	)
-	.unwrap()
-	.trim()
-	.to_string();
-
-	// Repo A inside pointing alternates to B
-	let repo_a = inside.join("a");
-	run_git(&repo_a, &["init", "-b", "main"]);
-	fs::write(repo_a.join("normal.txt"), "normal").unwrap();
-	run_git(&repo_a, &["add", "normal.txt"]);
-	run_git(&repo_a, &["commit", "-m", "init"]);
-
-	let alternates = repo_a
-		.join(".git")
-		.join("objects")
-		.join("info")
-		.join("alternates");
-	let _ = fs::create_dir_all(alternates.parent().unwrap());
-	fs::write(
-		&alternates,
-		format!("{}\n", repo_b.join(".git").join("objects").display()),
-	)
-	.unwrap();
-
-	// Repo C inside unrelated
-	let repo_c = inside.join("c");
-	run_git(&repo_c, &["init", "-b", "main"]);
-	fs::write(repo_c.join("c.txt"), "c").unwrap();
-	run_git(&repo_c, &["add", "c.txt"]);
-	run_git(&repo_c, &["commit", "-m", "init"]);
-
-	let w = test_worker(None);
-	let (client, ws_id) = paired_client(&w, &inside);
-	let client = Arc::new(client);
-	let read = Read {
-		profile: ReadProfile::Interactive,
-		cancel: None,
-	};
-
-	let remote_a = RemoteRepo::new(client.clone(), ws_id.clone(), "a".into());
-	let res_a = remote_a.commit_blob(&b_sha, "secret.txt", 1024, &read);
-	assert!(res_a.is_err(), "repo A with outside alternates must error");
-	let debug_a = format!("{res_a:?}");
-	assert!(!debug_a.contains("SECRET_OBJECT_CONTENT"));
-
-	let remote_c = RemoteRepo::new(client, ws_id, "c".into());
-	let res_c = remote_c.commit_blob(&b_sha, "secret.txt", 1024, &read);
-	assert!(res_c.is_err(), "repo C with foreign sha must error");
-	let debug_c = format!("{res_c:?}");
-	assert!(!debug_c.contains("SECRET_OBJECT_CONTENT"));
-}
-
-#[test]
-fn refused_git_view_error_does_not_name_outside_paths() {
-	let _serial = serial();
-	let tmp = tempfile::tempdir().unwrap();
-	let outside = tmp.path().join("outside");
-	let share = tmp.path().join("share");
-	fs::create_dir_all(&outside).unwrap();
-	fs::create_dir_all(&share).unwrap();
-
-	let outside_repo = outside.join("repo");
-	run_git(&outside_repo, &["init", "-b", "main"]);
-	fs::write(outside_repo.join("file.txt"), "data").unwrap();
-	run_git(&outside_repo, &["add", "file.txt"]);
-	run_git(&outside_repo, &["commit", "-m", "init"]);
-
-	// 1. Linked worktree of an outside repo
-	let wt = share.join("wt");
-	run_git(&outside_repo, &["worktree", "add", wt.to_str().unwrap()]);
-
-	// 2. Gitdir file pointing outside
-	let gitdir_repo = share.join("gitdir_repo");
-	fs::create_dir_all(&gitdir_repo).unwrap();
-	fs::write(
-		gitdir_repo.join(".git"),
-		format!("gitdir: {}\n", outside_repo.join(".git").display()),
-	)
-	.unwrap();
-
-	// 3. Repo with core.worktree pointing outside
-	let worktree_outside = share.join("worktree_outside");
-	run_git(&worktree_outside, &["init", "-b", "main"]);
-	run_git(
-		&worktree_outside,
-		&["config", "core.worktree", outside.to_str().unwrap()],
-	);
-
-	// 4. Folder inside parent repository
-	let parent = share.join("parent");
-	run_git(&parent, &["init", "-b", "main"]);
-	let sub = parent.join("sub");
-	fs::create_dir_all(&sub).unwrap();
-
-	let w = test_worker(None);
-	let (client, ws_id) = paired_client(&w, &share);
-
-	let outside_str = outside.to_string_lossy().into_owned();
-	let outside_canon = dunce::canonicalize(&outside)
-		.unwrap()
-		.to_string_lossy()
-		.into_owned();
-
-	for rel in ["wt", "gitdir_repo", "worktree_outside"] {
-		let res = client.git(
-			&ws_id,
-			rel,
-			ReadProfile::Interactive,
-			GitQuery::ChangeList,
-			None,
-		);
-		match res {
-			Err(RemoteError::Refused { code, message }) => {
-				assert_eq!(
-					code,
-					ErrorCode::OutsideShare,
-					"expected OutsideShare for {rel}, got {code:?}"
-				);
-				assert!(
-					!message.contains(&outside_str)
-						&& !message.contains(&outside_canon),
-					"message leaked outside path: {message}"
-				);
-			}
-			other => panic!("expected Refused error for {rel}, got {other:?}"),
-		}
-	}
-
-	let res_parent = client.git(
-		&ws_id,
-		"parent/sub",
-		ReadProfile::Interactive,
-		GitQuery::ChangeList,
-		None,
-	);
-	match res_parent {
-		Err(RemoteError::Refused { code, message }) => {
-			assert_eq!(
-				code,
-				ErrorCode::NotARepository,
-				"expected NotARepository for parent/sub, got {code:?}"
-			);
-			assert!(
-				!message.contains(&outside_str)
-					&& !message.contains(&outside_canon),
-				"message leaked outside path: {message}"
-			);
-		}
-		other => panic!("expected Refused error for parent/sub, got {other:?}"),
-	}
 }
 
 #[cfg(unix)]

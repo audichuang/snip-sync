@@ -271,15 +271,15 @@ alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/
 
 repos_gitws=$("$SNIP" remote repos h $WD/gitws)
 check "repos gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
-check "wt, broken, borrowed appear as error rows" test "$(grep -c '^wt	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^borrowed	error: ' <<<"$repos_gitws")" = 1
-check "no error row contains the outside path" test "$(grep -c "outside-repo" <<<"$repos_gitws")" = 0
+check "broken appears as an error row" test "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1
+check "wt and borrowed are served as locally" test "$(grep '^wt	' <<<"$repos_gitws" | grep -vc error)" = 1 -a "$(grep '^borrowed	' <<<"$repos_gitws" | grep -vc error)" = 1
 
 changes_mainwt=$("$SNIP" remote changes h $WD/gitws mainwt)
 log_mainwt=$("$SNIP" remote log h $WD/gitws mainwt)
 all_mainwt="$repos_gitws
 $changes_mainwt
 $log_mainwt"
-check "main repo with a worktree outside the share is served" test "$(grep -c '^mainwt	' <<<"$repos_gitws")" = 1 \
+check "main repo with a worktree outside the workspace is served" test "$(grep -c '^mainwt	' <<<"$repos_gitws")" = 1 \
 	-a "$(grep '^mainwt	' <<<"$repos_gitws" | grep -c 'error:')" = 0 \
 	-a "$(grep -c '	tracked.txt$' <<<"$changes_mainwt")" -ge 1 \
 	-a "$(grep -c 'untracked.txt' <<<"$changes_mainwt")" -ge 1 \
@@ -343,13 +343,8 @@ else
 fi
 refused "show invalid revision ':/x'" "" show h $WD/gitws alpha ':/x'
 
-wt_err=$("$SNIP" remote changes h $WD/gitws wt 2>&1 >/dev/null)
-rc=$?
-if [ "$rc" = 1 ] && grep -iq "outside" <<<"$wt_err"; then
-	ok "changes on linked worktree refused  ($wt_err)"
-else
-	bad "changes on linked worktree  rc=$rc err=$wt_err"
-fi
+wt_changes=$("$SNIP" remote changes h $WD/gitws wt 2>&1)
+check "changes on a linked worktree of an outside repo" test "$?" = 0
 
 # A diff that covers the stat-dirty b.txt is what makes git refresh an index it may write.
 "$SNIP" remote diff h $WD/gitws alpha b.txt >/dev/null 2>&1 || true
@@ -372,8 +367,8 @@ if [ -n "$SRC" ]; then
 		done <<<"$src_log_shas"
 		check "log $srcname -n 3 shas contained in rev-list --all" test "$all_found" = true -a -n "$src_log_shas"
 	elif w <<<"test -f '$SRC/.git'"; then
-		src_repos=$("$SNIP" remote repos h "$SRC" 2>&1)
-		check "repos $srcname reports an error row for linked worktree" grep -q "error: " <<<"$src_repos"
+		src_log=$("$SNIP" remote log h "$SRC" -n 3 2>&1)
+		check "log $srcname (a linked worktree) is served" test "$?" = 0 -a -n "$src_log"
 	else
 		src_repos=$("$SNIP" remote repos h "$SRC" 2>&1)
 		check "repos $srcname reports no Git repository for archive" grep -q "no Git repository in" <<<"$src_repos"

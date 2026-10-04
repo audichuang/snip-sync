@@ -720,6 +720,22 @@ pub fn identify_repos(
 			}
 		};
 
+		// A marker git did not take (an empty `.git`) makes git climb to an
+		// enclosing repository: that one is not this folder's.
+		let toplevel = dunce::canonicalize(&id.toplevel)
+			.unwrap_or_else(|_| id.toplevel.clone());
+		if toplevel != canonical_path {
+			if seen_roots.insert(canonical_path) {
+				list.push(FoundRepo {
+					root: r.path,
+					name,
+					kind: FoundKind::Main,
+					identity: None,
+					summary: Err("not a git repository".to_string()),
+				});
+			}
+			continue;
+		}
 		if !seen_identities.insert((id.toplevel.clone(), id.git_dir.clone())) {
 			continue;
 		}
@@ -965,17 +981,17 @@ pub fn scan_repos_within(
 	};
 
 	let page = discovery.next_page(budget);
-	finish_scan(page, &canonical_root, budget, opts)
+	finish_scan(page, budget, opts)
 }
 
 fn finish_scan(
 	page: DiscoveryPage,
-	canonical_root: &Path,
 	budget: &ScanBudget,
 	opts: &RunOptions,
 ) -> WorkspaceScan {
-	let (repos, id_errors) =
-		identify_repos(page.repos, Some(canonical_root), budget, opts);
+	// Identified as a local workspace's repos are: a worktree whose main
+	// repository is elsewhere is still served.
+	let (repos, id_errors) = identify_repos(page.repos, None, budget, opts);
 
 	let mut all_errors = page.errors;
 	all_errors.extend(id_errors);
@@ -1178,6 +1194,37 @@ impl LocalRepo {
 			identity: Some(identity),
 			served: true,
 		})
+	}
+
+	/// Worker: opens as a local repo would, on the served pool and its
+	/// output cap; identity resolved for the worker's cache.
+	pub fn open_served(dir: &Path, read: &Read) -> Result<Self, GitError> {
+		let mut opts = Self::base_opts(read);
+		opts.pool = GitPool::Served;
+		opts.max_stdout = opts.max_stdout.min(SERVED_MAX_STDOUT);
+		let git = Git::open_with(dir, &opts)?;
+		let identity = RepoIdentity::resolve(&git, &opts)?;
+		// The folder itself must be the repository, not one enclosing it.
+		let canon = |p: &Path| {
+			dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+		};
+		if canon(&identity.toplevel) != canon(dir) {
+			return Err(GitError::NotARepository(dir.to_path_buf()));
+		}
+		Ok(Self {
+			git,
+			identity: Some(identity),
+			served: true,
+		})
+	}
+
+	/// Worker cache hit for [`Self::open_served`]: no process.
+	pub fn known_served(identity: &RepoIdentity) -> Self {
+		Self {
+			git: Git::at_known_root(identity),
+			identity: Some(identity.clone()),
+			served: true,
+		}
 	}
 
 	/// Worker cache hit: no process, boundary env and served limits stay on.
@@ -4092,7 +4139,7 @@ mod tests {
 			cancel: None,
 		};
 		let opts = RunOptions::default();
-		let scan = finish_scan(page, &canonical_share, &identify_budget, &opts);
+		let scan = finish_scan(page, &identify_budget, &opts);
 		assert_eq!(scan.status, ScanStatus::TimedOut);
 		assert_eq!(scan.repos.len(), 2);
 		assert!(scan.repos.iter().any(|r| {
