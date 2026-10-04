@@ -3,11 +3,13 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitrun::{Overflow, RunOptions};
 use crate::gitsrc::{self, Git, GitError, GitSource, EMPTY_TREE};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitSummary {
 	pub sha: String,
 	pub parents: Vec<String>,
@@ -17,13 +19,13 @@ pub struct CommitSummary {
 	pub subject: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitReference {
 	pub name: String,
 	pub sha: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryHistory {
 	pub root: String,
 	pub commits: Vec<CommitSummary>,
@@ -79,7 +81,7 @@ const VISIBLE_TIPS: [&str; 4] = ["--branches", "--remotes", "--tags", "HEAD"];
 
 /// Refs, HEAD and shallow boundaries read once, so later pages of one
 /// history walk the same tips even if the repository changes meanwhile.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefSnapshot {
 	/// Branches, remote-tracking branches and tags, each peeled to the
 	/// commit it names.
@@ -197,7 +199,14 @@ fn shallow_boundaries(
 ) -> Result<Vec<String>, GitError> {
 	let out = git.run_with(&["rev-parse", "--git-path", "shallow"], opts)?;
 	let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-	let Ok(file) = fs::File::open(git.root().join(rel)) else {
+	let shallow_path = git.root().join(rel);
+	let Ok(meta) = fs::metadata(&shallow_path) else {
+		return Ok(Vec::new());
+	};
+	if !meta.is_file() {
+		return Ok(Vec::new());
+	}
+	let Ok(file) = fs::File::open(shallow_path) else {
 		return Ok(Vec::new());
 	};
 	let mut text = String::new();
@@ -377,7 +386,7 @@ pub fn history_by_author_with(
 
 /// IntelliJ-style log filters, combined with AND. An empty query is the
 /// plain history.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogQuery {
 	/// Message text, or a commit hash (4+ hex digits that resolve).
 	pub text: String,
@@ -519,14 +528,14 @@ pub const MAX_TREE_ENTRIES: usize = 2000;
 /// Hard upper bound on stdout captured during commit directory listing (8 MiB).
 pub const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TreeKind {
 	Blob,
 	Tree,
 	Submodule,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
 	/// Repo-relative path.
 	pub path: String,
@@ -649,7 +658,7 @@ pub fn commit_directory_with(
 /// Largest blob read for preview (same as core's preview limit).
 pub const MAX_BLOB_BYTES: u64 = 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobText {
 	Text(String),
 	Binary,
@@ -729,7 +738,7 @@ pub struct SourcePreview {
 }
 
 /// A preview whose patch may be cut ([`git_preview_with`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitPreview {
 	pub content: Option<String>,
 	/// Whole hunks only: every hunk header counts exactly the lines kept.
@@ -740,8 +749,15 @@ pub struct GitPreview {
 pub const PREVIEW_LIMIT: usize = 1024 * 1024;
 
 pub fn file_preview(root: &Path, path: &str) -> io::Result<SourcePreview> {
+	let target = inside(root, path)?;
+	if !target.metadata()?.is_file() {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"Not a regular file",
+		));
+	}
 	let mut bytes = Vec::new();
-	fs::File::open(inside(root, path)?)?
+	fs::File::open(target)?
 		.take((PREVIEW_LIMIT + 1) as u64)
 		.read_to_end(&mut bytes)?;
 	if bytes.len() > PREVIEW_LIMIT {
@@ -860,8 +876,8 @@ fn finish_preview(
 	];
 	args.extend(revs);
 	args.extend(["--".into(), format!(":(literal){path}")]);
-	let diff = git
-		.run_with(&args.iter().map(String::as_str).collect::<Vec<_>>(), opts)?;
+	let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
+	let diff = git.run_diff_with(&str_args, opts)?;
 	let (mut patch, mut patch_truncated) = if diff.truncated {
 		(whole_hunks(diff.stdout), true)
 	} else {

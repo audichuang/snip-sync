@@ -166,6 +166,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 貼上檔案:兩邊都以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。
 - 貼上 commits:兩邊都經 `transfer::CommitReplayPreview`(`capture` / `revalidate` / `apply`)。
 - 配對清單:兩邊都經 `snip_remote::WorkerStore`;worker 端的受信任 master 清單經 `TrustedMasterStore`。
+- 遠端 Git 檢視：兩邊都經 `snip_core::gitview::RepoView`（`snip_remote::RemoteRepo`）；worker 以 served `LocalRepo` 回答。
 - 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 
 兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是預覽、勾選與時間軸),以及下列例外:
@@ -196,12 +197,12 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 
 ## 8. 遠端節點模式(master／worker)
 
-> 狀態:第一刀(2026-10-02)。只做瀏覽與預覽;寫入、rename、stage、git 留給後續切片。
+> 狀態:第二刀(2026-10-03)。支援瀏覽、預覽與唯讀 Git 檢視；寫入類操作（stage、commit、write、rename 等）維持拒絕。
 
 這是**操作另一台電腦上檔案的控制通道**,不是剪貼簿的傳輸方式:第 1 節「不管傳輸」指的是複製／貼上之間的剪貼簿,照舊不變。
 
 - **角色**:
-  - **master**:桌面 App。在工作區選單的「遠端節點」配對 worker、列出它分享的工作區、開啟其中一個。CLI 也能當 master:`snip remote pair|workers|forget|workspaces|ls|stat|cat`,與桌面版共用配對紀錄。
+  - **master**:桌面 App。在工作區選單的「遠端節點」配對 worker、列出它分享的工作區、開啟其中一個。CLI 也能當 master:`snip remote pair|workers|forget|workspaces|ls|stat|cat|repos|changes|log|show|diff`,與桌面版共用配對紀錄。
   - **worker**:被操作的那台。用 CLI `snip worker --share <資料夾>` 就能跑,不需要桌面 App,也不需要螢幕。桌面 App 也能當 worker:從工作區選單啟用,或用 `--worker` 啟動。
 - **連線**:建議走 Tailscale 私網,不依賴公網。TCP 上跑 TLS 1.3,預設埠 47821。
 - **配對**:每台機器第一次使用時,各自產生一張自簽憑證。worker 顯示一次性配對碼,10 分鐘內有效,只能配對一台 master,連錯 5 次就作廢。master 輸入 worker 的位址與配對碼。配對成功後,worker 記住 master 憑證的指紋,master 固定(pin)worker 憑證的指紋。之後換了憑證的一方連不上,要重新配對。
@@ -210,6 +211,46 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 專案樹逐層列出 worker 上的目錄,和本機一樣不列 `.git`(指名路徑仍可讀)。單一目錄最多列 1000 筆,超過就顯示截斷。
   - 指向分享範圍內資料夾的 symlink 列成資料夾,可以展開;指向分享範圍外或 `.git` 的 symlink 列成一般項目,打開時拒絕。規則與複製時展開資料夾相同(`transfer::is_safe_dir_symlink`)。
   - 點檔案就預覽,規則與本機相同:上限 1 MiB,二進位與非 UTF-8 不顯示文字。重新整理會重讀樹和開著的預覽,檔案在 worker 上已刪除就顯示錯誤。
-  - 複製、貼上、Git 檢視在遠端工作區都會拒絕,並顯示「遠端工作區目前只支援瀏覽與預覽」。
+  - 複製、貼上、加入儲存庫路徑（`add_repo_path`）、為複製而勾選在遠端工作區都會拒絕,狀態列顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」（`remote_unsupported`）。右鍵選單的儲存庫與檔案列只提供複製 worker 上的路徑（`copy-worker-path`）,不提供本機 reveal（在 Finder／檔案總管顯示）。
   - 移除(forget)一台 worker 時,開著的它的工作區會跟著關閉。
-- **明確不做(本切片)**:遠端寫入、rename、stage、git 操作(協定已保留這些請求,worker 回 `Unsupported`)、遠端 diff、遠端複製到剪貼簿、Windows 服務安裝。
+
+### Git 檢視
+
+- **儲存庫掃描與路由**:
+  - master 開啟遠端工作區後在背景發送掃描請求（`ScanRepos`），掃描 worker 上分享資料夾內的 repo。掃描規則同本機探索：搜尋深度 8、最多 256 個 repo、單一 75 秒期限（`SCAN_DEADLINE`）。
+  - 若逾時或達上限，狀態列與提示顯示「找到 N 個儲存庫，遠端掃描未完成；重新整理可重掃」（`remote_scan_incomplete`）以及未到達的資料夾清單；狀態 `More` 亦對映至未完成。遠端續掃僅支援 depth-limited 資料夾，逾時或達到數量上限時不支援游標續掃，需以重新整理（Refresh）重新掃描。
+  - 每個 repo 的 Changes、diff、歷史（graph、commit 檔案與 diff、commit 樹）、分支／ref 篩選皆透過型別化 RPC（`GitQuery`）在 worker 端執行 git，不跨網路傳遞命令列字串。
+  - 遠端 repo 的樹 IO 與預覽路徑自動帶上相對於分享根目錄的路徑前綴。單一 repo 分享時直接復用單一樹，不建立多餘的虛擬工作區樹。
+- **三種情況的畫面**:
+  - 多 repo：列出所有掃描到的儲存庫。Changes 面板依 repo 分組顯示變更；Log 面板顯示跨 repo 合併歷史，可透過 Repository 下拉選單篩選單一 repo。
+  - 單 repo（分享根目錄本身即 repo）：直接開啟為該 repo，專案樹即 repo 樹。
+  - 非 repo（分享資料夾內無任何 `.git`）：專案樹維持一般檔案瀏覽；Changes 面板顯示「這個資料夾裡沒有 Git 儲存庫」（`changes_no_repository`），Log 面板顯示「這個資料夾裡沒有 Git 儲存庫」（`log_no_repository`），絕不顯示為乾淨或空 log。
+- **「沒讀到不顯示成乾淨」規則**:
+  - Changes 空狀態（`ChangesEmpty`）：依序判定「掃描中（Scanning）→ 讀取中（Loading）→ 讀取失敗（ScanFailed）→ 沒有 repo（NoRepository）→ 無符合（NoMatch）→ 乾淨（Clean）」。任一 repo 讀取失敗時顯示 Note 錯誤列，未完成讀取前絕不顯示為乾淨（`clean_working_copy`）。
+  - Log 空狀態（`LogEmpty`）：依序判定「掃描中（Scanning）→ 讀取中（Loading）→ 沒有 repo（NoRepository）→ 失敗（Failed）→ 空（Empty）」。多 repo 合併 log 中若有部分 repo 讀取失敗，log 上方顯示「N 個儲存庫無法讀取：a、b」提示（`log_failed_feeds`）。
+- **圍界規則（boundary）**:
+  - worker 端以 `LocalRepo::open_within` 在分享目錄圍界內開啟 repo。
+  - 父 repo 阻擋：透過 `GIT_CEILING_DIRECTORIES`（設為分享目錄的父目錄）與 `toplevel == dir` 檢查，禁止向上逃逸到分享外的父 repo；空的 `.git` 目錄視為損毀並列為錯誤列，不向上穿透。
+  - 外部物件庫與參照阻擋：repo 的 `git_dir`、`common_dir` 以及 `--git-path` 清單（objects、refs、packed-refs、index、shallow、config、reftable 等）皆必須在分享目錄內。遞迴檢查 `objects/` 與 `refs/` 內部 symlink，若逃逸至分享外一律拒絕；若 symlink 目標為分享目錄內的資料夾則遞迴走訪（以 visited 集合防範迴圈），一般檔案不計入目錄計數上限。為避免資源耗盡設有資源上限（走訪目錄上限 20,000 個、深度 ≤ 64），超出上限時回報獨立的資源上限錯誤（「repository too large to verify: <what>」）而非視為逃逸；走訪過程支援協同取消。遞迴檢查 `objects/info/alternates`（深度 ≤ 5），若指向分享外一律拒絕並回報錯誤列。主 repo 在分享外的 linked worktree 會被拒絕（錯誤提示說明「這是 linked worktree，主 repo 在分享範圍外；請分享主 repo 所在的資料夾」）。symlink 的 `.git` 目錄不被核心探索視為合法 marker，直接略過不列報。
+  - working tree 檔案圍界：Working 來源讀取檔案時先驗證 canonical realpath 落在 repo 根目錄內，未追蹤或修改中指向分享外的 symlink 一律拒絕，防止藉由 diff 或 preview 竊取外部內容。
+  - 執行環境強化：git 執行時固定 argv 前綴 `-c core.fsmonitor= -c protocol.allow=never -c core.hooksPath=/dev/null`（Windows 為 `NUL`）；環境變數注入 `GIT_OPTIONAL_LOCKS=0`、`GIT_NO_LAZY_FETCH=1`，並清除 `GIT_DIR`、`GIT_WORK_TREE` 等變數。因 `GIT_OPTIONAL_LOCKS=0` 無法阻止 `git diff` 刷新／寫入 index 或觸發 post-index-change hook，served `git diff` 僅在讀取 index 時以 `GIT_INDEX_FILE` 指向私有暫存副本（僅限一般檔案、設有大小上限並保留 mtime），其餘狀況則清除環境中的 `GIT_INDEX_FILE`。錯誤訊息經 `scrub` 去除分享外的本機路徑與內部 stderr。
+- **資源規則**:
+  - 獨立名額池：遠端讀取使用 `gitrun` 獨立的 `GitPool::Served`（並行 1、佇列 4），不計入 worker 主人的 `Local` 名額池，遠端 master 的請求絕不排擠 worker 主人自己的 UI 操作，也不會卡住桌面版的工作區切換或結束（drain）。master 端亦對遠端 Git 呼叫限制最多 4 個並行請求。
+  - job 管理：每個請求為一個 job，同時最多 2 個 job（其中掃描最多 1 個），等待佇列上限 16，超過或等候逾時（10 秒）立即回報 `Busy`。整體期限 View 60 秒、Scan 75 秒，逾時取消 job 並回報 `Timeout`。worker 每秒發送 `Pending` heartbeat 幀；master 斷線或取消請求時立即中止 worker 背景 job。
+- **已知限制**:
+  - tag 與參照極多（refs 輸出超過 `SERVED_MAX_STDOUT = 4 MiB`）的 repo，在遠端會顯示「遠端參照資料過大」（`remote_refs_too_large`）錯誤（本機可看）。
+  - Refresh 時，開著的 Changes 列預覽若不屬於正在重新載入的 repo（或尚未讀完），預覽會清掉，回到該 repo 的預設畫面，不保留也不重讀；本機與遠端相同。專案樹開著的檔案照常重讀。
+  - Refresh 時 worker 掃描失敗（舊版 worker、連線中斷），repo 清單清空，已開的預覽與展開的資料夾不保留；當時正在載入的資料夾可能停在載入中，需重新開啟工作區。
+  - `UserEmail` 查詢會將 worker 上的 `user.email`（含全域設定）提供給已配對的 master。
+  - 外指 submodule 取捨：submodule 的 `.git` 指向分享外時，該 submodule 自身的列會被拒絕，但父 repo 的 status 仍會計算該 submodule 的 dirty bit（僅洩漏一個位元的改動狀態，換取與本機一致的變更標記）。
+- **版本相容**:
+  - 協定透過 `hello` 握手以 `max_version` 協商升級至版本 2（`GIT_VIEWS_VERSION = 2`）。新 master 連線至 0.5.0 舊 worker 時，專案樹瀏覽與預覽照常，Changes 與 Log 則明確顯示「{0} 的 snip-sync 版本太舊（協定 1），不支援 Git 檢視；請在 worker 上更新」（`remote_worker_too_old`）。
+- **寫入不變式**:
+  - 將來若開放 `Request::Write`/`Rename`，必須拒絕任何 `.git` 目錄底下、以及 git dir／common dir 目標底下的路徑；否則 Git 檢視會把「可寫檔案」變成「在 worker 上執行程式」（hooks、filter、fsmonitor 設定）。
+- **明確不做(本切片)**:
+  - 遠端寫入類 Git 操作（stage、unstage、commit、checkout、discard、rename、write）：(1) 能寫入 worker 檔案就能寫入 `.git/config`、hooks 或 filter，等於讓 master 在 worker 執行任意程式（違反寫入不變式）；(2) 本機寫入依賴 HeavyGuard、新鮮度與碰撞檢查（§3.2、§4.3），跨機器版本尚未設計；(3) 讀取先做正確，避免因誤判狀態做出錯誤決策。
+  - 遠端的加入 repo 路徑（`add_repo_path`）、複製到剪貼簿、貼上、為複製而勾選：維持拒絕（回報 `remote_unsupported`）。
+  - 主 repo 在分享外的 linked worktree、alternates／symlink 物件庫指向分享外：顯示為錯誤列，不提供 Git 檢視。
+  - 掃描逾時（`TimedOut`）或達上限（`LimitReached`）在遠端不支援游標續掃（僅 depth-limited 資料夾可續），需重新整理重掃。
+  - 自動 fetch、遠端分支操作：本機亦無此功能。
+  - Windows 服務安裝。

@@ -6,9 +6,11 @@
 //! files; `collect_payload` applies filters, limits and counts on top.
 
 use std::collections::HashSet;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use serde::{Deserialize, Serialize};
 
 pub use crate::blob::{
 	read_batch_header, read_batch_response, CatFile, CatObject,
@@ -72,6 +74,11 @@ pub enum GitError {
 		.0.display()
 	)]
 	NotARepository(PathBuf),
+	#[error(
+		"{} is inside a parent repository, not a repository root itself",
+		.0.display()
+	)]
+	ToplevelAbove(PathBuf),
 	#[error("invalid revision: {0}")]
 	InvalidRevision(String),
 	#[error(
@@ -80,6 +87,12 @@ pub enum GitError {
 	Shallow(String),
 	#[error("unexpected git output: {0}")]
 	Malformed(String),
+	#[error("outside the shared folder: {what}")]
+	OutsideBoundary { what: &'static str },
+	#[error("repository too large to verify: {what}")]
+	VerifyLimit { what: &'static str },
+	#[error("{0}")]
+	Host(String),
 	#[error(transparent)]
 	Io(#[from] io::Error),
 }
@@ -90,6 +103,7 @@ pub enum GitError {
 #[derive(Debug, Clone)]
 pub struct Git {
 	root: PathBuf,
+	boundary: Option<PathBuf>, /* canonical */
 }
 
 #[cfg(test)]
@@ -157,6 +171,123 @@ fn run_strict(
 	Ok(output.stdout)
 }
 
+/// Maximum index file bytes copied for a served diff (256 MiB).
+const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A temporary copy of a repository index file, cleaned up on drop.
+#[derive(Debug)]
+pub(crate) struct TempIndexFile {
+	_dir: tempfile::TempDir,
+	path: PathBuf,
+}
+
+#[cfg(unix)]
+pub(crate) fn open_index_source(
+	source: &Path,
+) -> Result<(std::fs::File, std::fs::Metadata), GitError> {
+	use std::os::unix::fs::OpenOptionsExt;
+
+	// Open with O_NONBLOCK so a FIFO swapped in cannot hang the process indefinitely.
+	let file = std::fs::OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_NONBLOCK)
+		.open(source)?;
+	let meta = file.metadata()?;
+	if !meta.is_file() {
+		return Err(GitError::OutsideBoundary { what: "index" });
+	}
+	Ok((file, meta))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_index_source(
+	source: &Path,
+) -> Result<(std::fs::File, std::fs::Metadata), GitError> {
+	let file = std::fs::File::open(source)?;
+	let meta = file.metadata()?;
+	if !meta.is_file() {
+		return Err(GitError::OutsideBoundary { what: "index" });
+	}
+	Ok((file, meta))
+}
+
+impl TempIndexFile {
+	pub(crate) fn create_from(source: &Path) -> Result<Self, GitError> {
+		Self::create_from_with_cap(source, MAX_INDEX_BYTES)
+	}
+
+	pub(crate) fn create_from_with_cap(
+		source: &Path,
+		max_bytes: u64,
+	) -> Result<Self, GitError> {
+		// Stat before opening to avoid blocking indefinitely on a FIFO.
+		let symlink_meta = std::fs::symlink_metadata(source)?;
+		if !symlink_meta.is_file() && !symlink_meta.file_type().is_symlink() {
+			return Err(GitError::OutsideBoundary { what: "index" });
+		}
+		let path_meta = std::fs::metadata(source)?;
+		if !path_meta.is_file() {
+			return Err(GitError::OutsideBoundary { what: "index" });
+		}
+		if path_meta.len() > max_bytes {
+			return Err(GitError::OutputLimit {
+				args: "index".into(),
+				limit: usize::try_from(max_bytes).unwrap_or(usize::MAX),
+			});
+		}
+		let (mut src, meta) = open_index_source(source)?;
+		if meta.len() > max_bytes {
+			return Err(GitError::OutputLimit {
+				args: "index".into(),
+				limit: usize::try_from(max_bytes).unwrap_or(usize::MAX),
+			});
+		}
+		let mut builder = tempfile::Builder::new();
+		builder.prefix("snip-diff-index-");
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			builder.permissions(std::fs::Permissions::from_mode(0o700));
+		}
+		let dir = builder.tempdir()?;
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let _ = std::fs::set_permissions(
+				dir.path(),
+				std::fs::Permissions::from_mode(0o700),
+			);
+		}
+		let path = dir.path().join("index");
+		let mut temp = std::fs::File::create(&path)?;
+		let mut total: u64 = 0;
+		let mut buf = [0u8; 64 * 1024];
+		loop {
+			let n = src.read(&mut buf)?;
+			if n == 0 {
+				break;
+			}
+			total += n as u64;
+			if total > max_bytes {
+				return Err(GitError::OutputLimit {
+					args: "index".into(),
+					limit: usize::try_from(max_bytes).unwrap_or(usize::MAX),
+				});
+			}
+			temp.write_all(&buf[..n])?;
+		}
+		temp.flush()?;
+		// Preserve source mtime so git's racy-clean check remains accurate.
+		let mtime = meta.modified()?;
+		temp.set_modified(mtime)?;
+		Ok(Self { _dir: dir, path })
+	}
+
+	pub(crate) fn path(&self) -> &Path {
+		&self.path
+	}
+}
+
 impl Git {
 	/// Checks that git is installed, then resolves the repository top level
 	/// containing `dir`.
@@ -170,9 +301,27 @@ impl Git {
 	/// A truncated read is [`GitError::OutputLimit`], not a partial root.
 	/// A directory outside a repository is still [`GitError::NotARepository`].
 	pub fn open_with(dir: &Path, opts: &RunOptions) -> Result<Self, GitError> {
+		Self::open_shared(dir, None, opts)
+	}
+
+	/// Worker only: opens with boundary enforcement.
+	pub fn open_within(
+		dir: &Path,
+		boundary: &Path,
+		opts: &RunOptions,
+	) -> Result<Self, GitError> {
+		Self::open_shared(dir, Some(boundary), opts)
+	}
+
+	fn open_shared(
+		dir: &Path,
+		boundary: Option<&Path>,
+		opts: &RunOptions,
+	) -> Result<Self, GitError> {
 		already_cancelled(opts, "--version")?;
 		// `git --version` runs once per `PATH`: a changed `PATH` may find
 		// another git, or none. Only success is remembered.
+		// `git --version` touches no repository and stays as is without boundary.
 		static CHECKED_PATH: std::sync::Mutex<Option<std::ffi::OsString>> =
 			std::sync::Mutex::new(None);
 		let path = std::env::var_os("PATH").unwrap_or_default();
@@ -198,8 +347,13 @@ impl Git {
 					.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
 			}
 		}
+		let canonical_boundary = match boundary {
+			Some(b) => Some(dunce::canonicalize(b)?),
+			None => None,
+		};
 		let probe = Self {
 			root: dir.to_path_buf(),
+			boundary: canonical_boundary.clone(),
 		};
 		already_cancelled(opts, "rev-parse --show-toplevel")?;
 		let out = probe
@@ -222,8 +376,20 @@ impl Git {
 		let top = out.stdout.strip_suffix(b"\n").ok_or_else(|| {
 			GitError::Malformed("rev-parse --show-toplevel output".into())
 		})?;
+		let top_path = path_from_git_bytes(top)?;
+		if let Some(ref b) = canonical_boundary {
+			let canonical_top = dunce::canonicalize(&top_path)?;
+			let canonical_dir = dunce::canonicalize(dir)?;
+			if !canonical_top.starts_with(b) {
+				return Err(GitError::OutsideBoundary { what: "repository" });
+			}
+			if canonical_top != canonical_dir {
+				return Err(GitError::ToplevelAbove(dir.to_path_buf()));
+			}
+		}
 		Ok(Self {
-			root: path_from_git_bytes(top)?,
+			root: top_path,
+			boundary: canonical_boundary,
 		})
 	}
 
@@ -232,7 +398,19 @@ impl Git {
 	pub fn at_known_root(known: &RepoIdentity) -> Self {
 		Self {
 			root: known.toplevel.clone(),
+			boundary: None,
 		}
+	}
+
+	/// Boundary of this repository, when bounded.
+	pub fn boundary(&self) -> Option<&Path> {
+		self.boundary.as_deref()
+	}
+
+	/// Sets or clears the boundary for this repository.
+	pub fn with_boundary(mut self, boundary: Option<PathBuf>) -> Self {
+		self.boundary = boundary;
+		self
 	}
 
 	/// The repository top level; every git path is relative to it.
@@ -245,6 +423,42 @@ impl Git {
 	pub(crate) fn command(&self) -> Command {
 		let mut cmd = git_command();
 		cmd.current_dir(&self.root);
+		if let Some(ref b) = self.boundary {
+			cmd.args([
+				"-c",
+				// Empty disables fsmonitor on every git version; before
+				// 2.36 any non-empty value ("false" included) is a hook path.
+				"core.fsmonitor=",
+				"-c",
+				"protocol.allow=never",
+				"-c",
+				#[cfg(windows)]
+				"core.hooksPath=NUL",
+				#[cfg(not(windows))]
+				"core.hooksPath=/dev/null",
+			]);
+			if let Some(parent) = b.parent() {
+				if !parent.as_os_str().is_empty() {
+					cmd.env("GIT_CEILING_DIRECTORIES", parent);
+				}
+			}
+			cmd.env("GIT_OPTIONAL_LOCKS", "0");
+			cmd.env("GIT_NO_LAZY_FETCH", "1");
+			for var in [
+				"GIT_DIR",
+				"GIT_WORK_TREE",
+				"GIT_INDEX_FILE",
+				"GIT_COMMON_DIR",
+				"GIT_OBJECT_DIRECTORY",
+				"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+				"GIT_NAMESPACE",
+				"GIT_EXTERNAL_DIFF",
+				"GIT_CONFIG_PARAMETERS",
+				"GIT_CONFIG_COUNT",
+			] {
+				cmd.env_remove(var);
+			}
+		}
 		cmd
 	}
 
@@ -261,6 +475,74 @@ impl Git {
 	) -> Result<RunOutput, GitError> {
 		let mut cmd = self.command();
 		cmd.args(args);
+		self.exec(cmd, &args.join(" "), None, opts)
+	}
+
+	/// Inspects diff argv to decide whether `git diff` reads the index/worktree.
+	/// Two-tree diffs (e.g. `diff <a> <b>` or `diff a..b`) skip index reading.
+	fn diff_reads_index(args: &[&str]) -> bool {
+		let mut rev_or_positional = Vec::new();
+		let mut has_cached = false;
+		let before_dashdash = match args.iter().position(|&a| a == "--") {
+			Some(pos) => &args[..pos],
+			None => args,
+		};
+		for &arg in before_dashdash {
+			if arg == "diff" {
+				continue;
+			}
+			if arg == "--cached" || arg == "--staged" {
+				has_cached = true;
+				continue;
+			}
+			if !arg.starts_with('-') {
+				rev_or_positional.push(arg);
+			}
+		}
+		if has_cached {
+			return true;
+		}
+		if rev_or_positional.iter().any(|arg| arg.contains("..")) {
+			return false;
+		}
+		// 0 args (worktree vs index) or 1 arg (tree-ish vs worktree) read the index/worktree.
+		// 2 or more args (e.g. tree1 tree2) diff two trees and do not read the index.
+		rev_or_positional.len() < 2
+	}
+
+	/// Creates a command for `diff`, ensuring that in boundary mode, any index
+	/// auto-refresh writes to a private temporary copy instead of the real index.
+	pub(crate) fn diff_command(
+		&self,
+		args: &[&str],
+		opts: &RunOptions,
+	) -> Result<(Command, Option<TempIndexFile>), GitError> {
+		let mut cmd = self.command();
+		cmd.args(args);
+		let mut temp_index = None;
+		if self.boundary.is_some() && Self::diff_reads_index(args) {
+			let out =
+				self.run_with(&["rev-parse", "--git-path", "index"], opts)?;
+			let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+			if !rel.is_empty() {
+				let index_path = self.root.join(rel);
+				if index_path.symlink_metadata().is_ok() {
+					let temp_file = TempIndexFile::create_from(&index_path)?;
+					cmd.env("GIT_INDEX_FILE", temp_file.path());
+					temp_index = Some(temp_file);
+				}
+			}
+		}
+		Ok((cmd, temp_index))
+	}
+
+	/// [`Git::run_with`] for `diff` invocations, isolating index writes in boundary mode.
+	pub fn run_diff_with(
+		&self,
+		args: &[&str],
+		opts: &RunOptions,
+	) -> Result<RunOutput, GitError> {
+		let (cmd, _temp_index) = self.diff_command(args, opts)?;
 		self.exec(cmd, &args.join(" "), None, opts)
 	}
 
@@ -536,7 +818,7 @@ pub fn change_type_for_status(status: u8) -> ChangeType {
 }
 
 /// Which changes to copy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitSource {
 	/// Every uncommitted change, labelled and read like the SCM view:
 	/// working tree, then untracked, then index; content from disk.
@@ -657,6 +939,21 @@ fn unmerged(
 
 const RAW: [&str; 4] = ["-z", "--raw", "--no-abbrev", "-M"];
 
+fn run_strict_diff(
+	git: &Git,
+	args: &[&str],
+	opts: &RunOptions,
+) -> Result<Vec<u8>, GitError> {
+	let output = git.run_diff_with(args, opts)?;
+	if output.truncated {
+		return Err(GitError::OutputLimit {
+			args: args.join(" "),
+			limit: opts.max_stdout,
+		});
+	}
+	Ok(output.stdout)
+}
+
 fn diff(
 	git: &Git,
 	args: &[&str],
@@ -664,7 +961,7 @@ fn diff(
 ) -> Result<Vec<RawEntry>, GitError> {
 	let mut all = vec!["diff"];
 	all.extend_from_slice(args);
-	parse_raw_z(&run_strict(git, &all, opts)?)
+	parse_raw_z(&run_strict_diff(git, &all, opts)?)
 }
 
 /// Collects the changed files of `source` as payload files.
@@ -999,6 +1296,12 @@ fn read_working(
 	path: &Path,
 	max: Option<u64>,
 ) -> Result<Option<String>, GitError> {
+	let Ok(meta) = std::fs::metadata(path) else {
+		return Ok(None);
+	};
+	if !meta.is_file() {
+		return Ok(None);
+	}
 	let Some(max) = max else {
 		return Ok(read_text_file(path).ok().flatten());
 	};
@@ -1062,6 +1365,43 @@ fn read_changes(
 		} else {
 			match source {
 				GitSource::Working => {
+					if git.boundary.is_some() {
+						let file_path = git.root.join(&c.path);
+						if file_path.symlink_metadata().is_ok() {
+							match dunce::canonicalize(&file_path) {
+								Ok(canonical_file) => {
+									let canonical_root =
+										dunce::canonicalize(&git.root)?;
+									if !canonical_file
+										.starts_with(&canonical_root)
+									{
+										return Err(
+											GitError::OutsideBoundary {
+												what: "working file",
+											},
+										);
+									}
+									if let Ok(m) = canonical_file.metadata() {
+										if !m.is_file() && !m.is_dir() {
+											return Err(
+												GitError::OutsideBoundary {
+													what: "working file",
+												},
+											);
+										}
+									}
+								}
+								Err(e)
+									if e.kind()
+										== std::io::ErrorKind::NotFound =>
+								{
+									// Dangling symlink: skip boundary check and fall through to
+									// read_working, which yields Ok(None) matching local mode.
+								}
+								Err(e) => return Err(GitError::from(e)),
+							}
+						}
+					}
 					read_working(&git.root.join(&c.path), max)?
 				}
 				// Staged content was asked for: an index entry that cannot
@@ -2474,5 +2814,251 @@ mod tests {
 		.unwrap();
 		assert_eq!(got.files, vec![file("a.txt", "a\n", New)]);
 		assert!(got.payload.starts_with("// clipcode-root: r\n"));
+	}
+
+	#[test]
+	fn hardened_command_has_the_flags_and_env() {
+		use std::ffi::OsStr;
+		let dummy_root = PathBuf::from("/dummy/repo");
+		let dummy_boundary = PathBuf::from("/dummy/repo/sub");
+		let parent_of_boundary = dummy_boundary.parent().unwrap().to_path_buf();
+
+		let hardened_git = Git {
+			root: dummy_root.clone(),
+			boundary: Some(dummy_boundary),
+		};
+		let cmd = hardened_git.command();
+		let args: Vec<_> = cmd.get_args().collect();
+		assert!(args.len() >= 4);
+		assert_eq!(
+			&args[..4],
+			&[
+				OsStr::new("-c"),
+				OsStr::new("core.fsmonitor="),
+				OsStr::new("-c"),
+				OsStr::new("protocol.allow=never"),
+			]
+		);
+		let envs: std::collections::HashMap<&OsStr, Option<&OsStr>> =
+			cmd.get_envs().collect();
+		assert_eq!(
+			envs.get(OsStr::new("GIT_CEILING_DIRECTORIES")),
+			Some(&Some(parent_of_boundary.as_os_str()))
+		);
+		assert_eq!(
+			envs.get(OsStr::new("GIT_OPTIONAL_LOCKS")),
+			Some(&Some(OsStr::new("0")))
+		);
+		assert_eq!(
+			envs.get(OsStr::new("GIT_NO_LAZY_FETCH")),
+			Some(&Some(OsStr::new("1")))
+		);
+		for var in [
+			"GIT_DIR",
+			"GIT_WORK_TREE",
+			"GIT_INDEX_FILE",
+			"GIT_COMMON_DIR",
+			"GIT_OBJECT_DIRECTORY",
+			"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+			"GIT_NAMESPACE",
+			"GIT_EXTERNAL_DIFF",
+			"GIT_CONFIG_PARAMETERS",
+			"GIT_CONFIG_COUNT",
+		] {
+			assert_eq!(
+				envs.get(OsStr::new(var)),
+				Some(&None),
+				"expected {var} to be removed in env"
+			);
+		}
+
+		let plain_git = Git {
+			root: dummy_root,
+			boundary: None,
+		};
+		let plain_cmd = plain_git.command();
+		let plain_args: Vec<_> = plain_cmd.get_args().collect();
+		assert_eq!(plain_args.len(), 0);
+		let plain_envs: std::collections::HashMap<&OsStr, Option<&OsStr>> =
+			plain_cmd.get_envs().collect();
+		assert_eq!(plain_envs.get(OsStr::new("GIT_CEILING_DIRECTORIES")), None);
+		assert_eq!(plain_envs.get(OsStr::new("GIT_OPTIONAL_LOCKS")), None);
+		assert_eq!(plain_envs.get(OsStr::new("GIT_NO_LAZY_FETCH")), None);
+		for var in [
+			"GIT_DIR",
+			"GIT_WORK_TREE",
+			"GIT_INDEX_FILE",
+			"GIT_COMMON_DIR",
+			"GIT_OBJECT_DIRECTORY",
+			"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+			"GIT_NAMESPACE",
+			"GIT_EXTERNAL_DIFF",
+			"GIT_CONFIG_PARAMETERS",
+			"GIT_CONFIG_COUNT",
+		] {
+			assert_eq!(plain_envs.get(OsStr::new(var)), None);
+		}
+	}
+
+	#[test]
+	fn temp_index_file_preserves_source_mtime() {
+		let dir = tempfile::tempdir().unwrap();
+		let src = dir.path().join("index");
+		std::fs::write(&src, b"index data").unwrap();
+		let target_time = std::time::SystemTime::UNIX_EPOCH
+			+ std::time::Duration::from_secs(1_700_000_000);
+		let file = std::fs::File::options().write(true).open(&src).unwrap();
+		file.set_modified(target_time).unwrap();
+		drop(file);
+
+		let temp = TempIndexFile::create_from(&src).unwrap();
+		let temp_meta = std::fs::metadata(temp.path()).unwrap();
+		assert_eq!(
+			temp_meta.modified().unwrap(),
+			target_time,
+			"temp copy must preserve source index mtime for racy-clean check"
+		);
+	}
+
+	#[test]
+	fn temp_index_file_refuses_oversized_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let src = dir.path().join("index");
+		std::fs::write(&src, b"01234567890123456789").unwrap();
+		let res = TempIndexFile::create_from_with_cap(&src, 10);
+		assert!(
+			matches!(res, Err(GitError::OutputLimit { limit: 10, .. })),
+			"expected OutputLimit for index exceeding cap, got {res:?}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn temp_index_file_refuses_fifo_promptly() {
+		let dir = tempfile::tempdir().unwrap();
+		let fifo = dir.path().join("fifo_index");
+		let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+		let Ok(status) = status else {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"mkfifo command unavailable"
+			);
+			return;
+		};
+		assert!(status.success(), "mkfifo failed");
+		let res = TempIndexFile::create_from(&fifo);
+		assert!(
+			matches!(res, Err(GitError::OutsideBoundary { what: "index" })),
+			"expected OutsideBoundary for FIFO index, got {res:?}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn temp_index_file_in_private_dir_cleaned_up_on_drop() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let dir = tempfile::tempdir().unwrap();
+		let src = dir.path().join("index");
+		std::fs::write(&src, b"dummy index content").unwrap();
+
+		let temp_index = TempIndexFile::create_from(&src).expect(
+			"TempIndexFile creation must succeed for valid regular file",
+		);
+		let index_path = temp_index.path().to_path_buf();
+		let parent_dir = index_path
+			.parent()
+			.expect("temp index must have a parent directory")
+			.to_path_buf();
+
+		// Parent dir must not be the shared temp dir itself
+		assert_ne!(
+			parent_dir,
+			std::env::temp_dir(),
+			"temp index parent directory must be a private subdirectory, not the shared temp dir"
+		);
+
+		// Parent dir must have mode 0700
+		let mode = parent_dir
+			.metadata()
+			.expect("parent directory metadata")
+			.permissions()
+			.mode() & 0o777;
+		assert_eq!(
+			mode, 0o700,
+			"expected private directory mode 0700, got 0{:o}",
+			mode
+		);
+
+		// A stray "<index>.lock" file next to it is removed when TempIndexFile drops
+		let lock_file = parent_dir.join("index.lock");
+		std::fs::write(&lock_file, b"lock content").unwrap();
+		assert!(lock_file.exists());
+
+		drop(temp_index);
+		assert!(
+			!parent_dir.exists(),
+			"private directory should be removed on drop, but still exists"
+		);
+		assert!(
+			!lock_file.exists(),
+			"stray lock file inside private directory should be removed on drop"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn open_index_source_fifo_race_prompt_failure() {
+		let dir = tempfile::tempdir().unwrap();
+		let fifo = dir.path().join("fifo_race");
+		let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+		let Ok(status) = status else {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"mkfifo command unavailable"
+			);
+			return;
+		};
+		assert!(status.success(), "mkfifo failed");
+
+		let (tx, rx) = std::sync::mpsc::channel();
+		let fifo_clone = fifo.clone();
+		let _handle = std::thread::spawn(move || {
+			let res = open_index_source(&fifo_clone);
+			let _ = tx.send(res);
+		});
+
+		let res = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+			"open_index_source on FIFO must return promptly without blocking",
+		);
+		assert!(
+			matches!(res, Err(GitError::OutsideBoundary { what: "index" })),
+			"expected OutsideBoundary for FIFO index, got {res:?}"
+		);
+	}
+
+	#[test]
+	fn diff_reads_index_classification() {
+		// Plain working tree diff reads index
+		assert!(Git::diff_reads_index(&[
+			"diff",
+			"-z",
+			"--raw",
+			"--no-abbrev",
+			"-M"
+		]));
+		// Diff with HEAD (1 tree-ish vs worktree) reads index
+		assert!(Git::diff_reads_index(&["diff", "HEAD", "--", "f.txt"]));
+		// Diff cached reads index
+		assert!(Git::diff_reads_index(&[
+			"diff", "--cached", "HEAD", "--", "f.txt"
+		]));
+		assert!(Git::diff_reads_index(&["diff", "--cached"]));
+		// Two-tree diffs do not read index
+		assert!(!Git::diff_reads_index(&[
+			"diff", "sha1", "sha2", "--", "f.txt"
+		]));
+		assert!(!Git::diff_reads_index(&["diff", "sha1..sha2"]));
+		assert!(!Git::diff_reads_index(&["diff", "sha1...sha2"]));
 	}
 }

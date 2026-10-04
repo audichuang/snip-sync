@@ -140,7 +140,7 @@ impl WorkbenchModel {
 	}
 
 	/// Breadcrumb text and source badge: says exactly which version is shown.
-	pub(super) fn source_labels(&self) -> (String, String, String) {
+	pub(crate) fn source_labels(&self) -> (String, String, String) {
 		let loc = self.locale;
 		// A commit from the log names its own repository.
 		let repo = self
@@ -148,6 +148,23 @@ impl WorkbenchModel {
 			.map(|root| self.log_repo_name(&root))
 			.unwrap_or_default();
 		let Some(p) = &self.preview else {
+			if self.preview_error.is_some() {
+				let file_path = self
+					.selected_file
+					.as_deref()
+					.or(self.selected_commit_file.as_deref());
+				if let Some(path) = file_path {
+					let name =
+						path.rsplit('/').next().unwrap_or(path).to_string();
+					let segs = path.replace('/', " › ");
+					let crumbs = if repo.is_empty() {
+						segs
+					} else {
+						format!("{repo} › {segs}")
+					};
+					return (name, crumbs, String::new());
+				}
+			}
 			let tab = match (&self.selected_commit, &self.compare) {
 				(_, Some((a, b))) => format!("{}..{}", short(a), short(b)),
 				(Some(s), None) => format!("commit {}", short(s)),

@@ -116,12 +116,40 @@ pub fn tf<T: std::fmt::Display>(key: &str, loc: Locale, args: &[T]) -> String {
 	let mut arg_iter = args.iter();
 	let mut chars = raw.chars().peekable();
 	while let Some(c) = chars.next() {
-		if c == '{' && chars.peek() == Some(&'}') {
-			chars.next();
-			if let Some(arg) = arg_iter.next() {
-				res.push_str(&arg.to_string());
+		if c == '{' {
+			let mut num_str = String::new();
+			let mut matched_end = false;
+			while let Some(&next_c) = chars.peek() {
+				if next_c == '}' {
+					chars.next();
+					matched_end = true;
+					break;
+				} else if next_c.is_ascii_digit() {
+					num_str.push(next_c);
+					chars.next();
+				} else {
+					break;
+				}
+			}
+			if matched_end {
+				if num_str.is_empty() {
+					if let Some(arg) = arg_iter.next() {
+						res.push_str(&arg.to_string());
+					} else {
+						res.push_str("{}");
+					}
+				} else if let Ok(idx) = num_str.parse::<usize>() {
+					if let Some(arg) = args.get(idx) {
+						res.push_str(&arg.to_string());
+					} else {
+						res.push('{');
+						res.push_str(&num_str);
+						res.push('}');
+					}
+				}
 			} else {
-				res.push_str("{}");
+				res.push(c);
+				res.push_str(&num_str);
 			}
 		} else {
 			res.push(c);
@@ -153,6 +181,12 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"btn_refresh" => "重新整理",
 			"btn_discovery_continue" => "繼續搜尋",
 			"btn_discovery_retry" => "重試搜尋",
+			"discovery_incomplete" => "搜尋未完成",
+			"discovery_limit_reached" => "已達搜尋上限",
+			"discovery_cancelled" => "搜尋已取消",
+			"discovery_timed_out" => "搜尋逾時",
+			"discovery_not_run" => "尚未執行搜尋",
+			"discovery_failed" => "搜尋失敗",
 			"btn_add_repo" => "新增",
 			"add_repo_placeholder" => "儲存庫路徑...",
 			"repo_kind_worktree" => "工作樹",
@@ -177,6 +211,13 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"paste_cancelled" => "已取消貼上預覽",
 			"paste_loading" => "正在讀取目的地以建立貼上預覽…",
 			"paste_loading_refused" => "貼上預覽仍在建立中，尚不能套用",
+			"changes_scanning" => "正在搜尋 Git 儲存庫…",
+			"changes_loading" => "正在讀取變更…",
+			"changes_no_repository" => "這個資料夾裡沒有 Git 儲存庫",
+			"changes_no_match" => "沒有符合篩選條件的變更",
+			"changes_clean_partial" => {
+				"已找到的儲存庫沒有變更；部分資料夾尚未掃描（可繼續掃描）"
+			}
 			"clean_working_copy" => "目前沒有未提交的變更檔案。",
 			"find_placeholder" => "在檔案中搜尋",
 			"jump_placeholder" => "行號...",
@@ -254,6 +295,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_today" => "今天 {}",
 			"log_yesterday" => "昨天 {}",
 			// end log pane (IJ-2a)
+			"log_loading" => "正在載入 commit 歷史…",
+			"log_no_repository" => "這個資料夾裡沒有 Git 儲存庫",
+			"log_failed_feeds" => "{0} 個儲存庫無法讀取：{1}",
 			"empty_log" => "沒有 commit",
 			"src_working_file" => "工作目錄檔案",
 			"src_working_diff" => "工作目錄變更",
@@ -401,6 +445,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_history_loaded" => "已載入 {} 筆 commit",
 			"status_graph_fallback" => "已載入 {} 筆 commit；同時進行的分支太多，本頁改以清單顯示，不畫線圖",
 			"status_commit_files_truncated" => "此 commit 變更 {} 個檔案，只列出前 {} 個",
+			"status_commit_files_truncated_min" => "此選取至少變更 {} 個檔案，只列出前 {} 個",
 			"status_paste_done" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}、失敗 {}",
 			"status_paste_partial" => "還原完成：建立 {}、覆寫 {}、跳過 {}、刪除 {}，{} 個檔案失敗：{}",
 			"submodule" => "子模組",
@@ -467,7 +512,11 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"remote_forget" => "移除",
 			"remote_opened" => "已開啟遠端工作區 {}",
 			"remote_open_failed" => "無法開啟遠端工作區：{}",
-			"remote_unsupported" => "遠端工作區目前只支援瀏覽與預覽",
+			"remote_worker_too_old" => "{0} 的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在 worker 上更新",
+			"remote_scan_failed" => "無法讀取遠端的 Git 儲存庫：{0}",
+			"remote_scan_incomplete" => "找到 {} 個儲存庫，遠端掃描未完成；重新整理可重掃",
+			"remote_refs_too_large" => "遠端參照資料過大",
+			"remote_unsupported" => "遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視",
 			"workspace_opening" => "正在開啟工作區 {}…",
 			"workspace_bad_path" => "找不到工作區資料夾：{}",
 			"lifecycle_jobs" => "工作 {}",
@@ -535,6 +584,12 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"btn_refresh" => "Refresh",
 			"btn_discovery_continue" => "Continue Discovery",
 			"btn_discovery_retry" => "Retry Discovery",
+			"discovery_incomplete" => "discovery incomplete",
+			"discovery_limit_reached" => "discovery limit reached",
+			"discovery_cancelled" => "discovery cancelled",
+			"discovery_timed_out" => "discovery timed out",
+			"discovery_not_run" => "discovery not run",
+			"discovery_failed" => "discovery failed",
 			"btn_add_repo" => "Add",
 			"add_repo_placeholder" => "Repository path...",
 			"repo_kind_worktree" => "worktree",
@@ -559,6 +614,13 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"paste_cancelled" => "Paste preview cancelled",
 			"paste_loading" => "Reading the destination to build the paste preview…",
 			"paste_loading_refused" => "The paste preview is still being built; it cannot be applied yet",
+			"changes_scanning" => "Scanning for Git repositories…",
+			"changes_loading" => "Loading changes…",
+			"changes_no_repository" => "No Git repository in this folder",
+			"changes_no_match" => "No changes match the filter",
+			"changes_clean_partial" => {
+				"No changes in the repositories found; some folders were not scanned (use continue scanning)"
+			}
 			"clean_working_copy" => "Working tree is clean.",
 			"find_placeholder" => "Find in file",
 			"jump_placeholder" => "Line #...",
@@ -636,6 +698,9 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"log_today" => "Today {}",
 			"log_yesterday" => "Yesterday {}",
 			// end log pane (IJ-2a)
+			"log_loading" => "Loading commit history…",
+			"log_no_repository" => "No Git repository in this folder",
+			"log_failed_feeds" => "{0} repository(ies) could not be read: {1}",
 			"empty_log" => "No commits",
 			"src_working_file" => "Working tree file",
 			"src_working_diff" => "Working changes",
@@ -783,6 +848,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"status_history_loaded" => "Loaded {} commits",
 			"status_graph_fallback" => "Loaded {} commits; too many concurrent branches, so this page is a plain list without graph lines",
 			"status_commit_files_truncated" => "This commit changes {} files; showing the first {}",
+			"status_commit_files_truncated_min" => "This selection changes at least {} files; showing the first {}",
 			"status_paste_done" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}, errors {}",
 			"status_paste_partial" => "Restore done: created {}, overwritten {}, skipped {}, deleted {}; {} files failed: {}",
 			"submodule" => "Submodule",
@@ -849,7 +915,11 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"remote_forget" => "Forget",
 			"remote_opened" => "Opened remote workspace {}",
 			"remote_open_failed" => "Cannot open the remote workspace: {}",
-			"remote_unsupported" => "A remote workspace supports browsing and preview only for now",
+			"remote_worker_too_old" => "{0} has an outdated snip-sync version (protocol {1}), Git view is not supported; please update on the worker",
+			"remote_scan_failed" => "Failed to read remote Git repositories: {0}",
+			"remote_scan_incomplete" => "Found {} repositories; the remote scan is incomplete. Refresh to rescan",
+			"remote_refs_too_large" => "Remote references too large",
+			"remote_unsupported" => "A remote workspace supports browsing, preview, and read-only Git view",
 			"workspace_opening" => "Opening workspace {}…",
 			"workspace_bad_path" => "Workspace folder was not found: {}",
 			"lifecycle_jobs" => "jobs {}",
@@ -979,6 +1049,12 @@ mod tests {
 			"btn_browse_tree",
 			"diff_inline",
 			"diff_side",
+			"discovery_incomplete",
+			"discovery_limit_reached",
+			"discovery_cancelled",
+			"discovery_timed_out",
+			"discovery_not_run",
+			"discovery_failed",
 			"empty_project",
 			"goto_placeholder",
 			"log_search_placeholder",
@@ -988,6 +1064,8 @@ mod tests {
 			"selector_repo_title",
 			"src_vs_empty_tree",
 			"src_vs_first_parent",
+			"status_commit_files_truncated",
+			"status_commit_files_truncated_min",
 			"status_history_loaded",
 			"status_paste_done",
 			"status_paste_partial",
@@ -1043,6 +1121,18 @@ mod tests {
 			"remote_opened",
 			"remote_open_failed",
 			"remote_unsupported",
+			"changes_scanning",
+			"changes_loading",
+			"changes_no_repository",
+			"changes_no_match",
+			"changes_clean_partial",
+			"log_loading",
+			"log_no_repository",
+			"log_failed_feeds",
+			"remote_worker_too_old",
+			"remote_scan_failed",
+			"remote_scan_incomplete",
+			"remote_refs_too_large",
 			"lifecycle_jobs",
 			"tip_workspace_menu",
 			"status_repo_vanished",
@@ -1206,6 +1296,17 @@ mod tests {
 				"Commit #2 was refused: path.txt: a file is in the way of its parent directory"
 			),
 			"{rendered_en}"
+		);
+	}
+
+	#[test]
+	fn test_indexed_placeholder_formatting() {
+		let msg =
+			Msg::new("log_failed_feeds", ["2".to_string(), "a, b".to_string()]);
+		assert_eq!(msg.render(Locale::ZhTw), "2 個儲存庫無法讀取：a, b");
+		assert_eq!(
+			msg.render(Locale::En),
+			"2 repository(ies) could not be read: a, b"
 		);
 	}
 }

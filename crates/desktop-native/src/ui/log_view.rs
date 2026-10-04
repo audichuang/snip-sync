@@ -436,6 +436,24 @@ impl WorkbenchModel {
 							.flex_1()
 							.min_w_0()
 							.child(filter_bar)
+							.when_some(self.failed_feeds_msg(), |d, msg| {
+								d.child(
+									div()
+										.id("log-failed-feeds")
+										.relative()
+										.flex_shrink_0()
+										.px(px(10.))
+										.py(px(2.))
+										.bg(rgb(pal().error_bg))
+										.text_size(px(SMALL_TEXT))
+										.text_color(rgb(pal().error))
+										.child(msg.render(loc))
+										.children(probe(
+											log,
+											"log-failed-feeds",
+										)),
+								)
+							})
 							.child(
 								div()
 									.id("log-list")
@@ -496,18 +514,41 @@ impl WorkbenchModel {
 									))
 									.flex_1()
 									.min_h_0()
-									.when(
-										n == 0
-											&& self.history_error.is_none()
-											&& !self.history_extending,
-										|d| {
+									.when_some(
+										self.log_empty_state(),
+										|d, state| {
+											let text = match state {
+											crate::LogEmpty::NoWorkspace => {
+												t("workspace_closed", loc).to_string()
+											}
+											crate::LogEmpty::Scanning => {
+												t("changes_scanning", loc).to_string()
+											}
+											crate::LogEmpty::Loading => {
+												t("log_loading", loc).to_string()
+											}
+											crate::LogEmpty::NoRepository => {
+												t("log_no_repository", loc).to_string()
+											}
+											crate::LogEmpty::Failed(msg) => {
+												msg.render(loc)
+											}
+											crate::LogEmpty::Empty => {
+												t("empty_log", loc).to_string()
+											}
+										};
 											d.child(
 												div()
+													.relative()
 													.p(px(10.))
 													.text_color(rgb(
 														pal().text_muted
 													))
-													.child(t("empty_log", loc)),
+													.child(text)
+													.children(probe(
+														log,
+														"log-empty",
+													)),
 											)
 										},
 									)

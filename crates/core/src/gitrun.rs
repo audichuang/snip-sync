@@ -41,11 +41,27 @@ pub const MAX_CONCURRENT_GIT: usize = 2;
 /// Callers allowed to wait for a slot; one more is refused at once
 /// ([`GitError::QueueFull`]) instead of joining an unbounded queue.
 pub const MAX_QUEUED_GIT: usize = 64;
+/// Served budget: Git processes alive at once for served requests.
+pub const MAX_CONCURRENT_SERVED_GIT: usize = 1;
+/// Callers allowed to wait for a served Git process slot.
+pub const MAX_QUEUED_SERVED_GIT: usize = 4;
 const TICK: Duration = Duration::from_millis(20);
 /// How long cleanup waits for a killed tree to die and its pipes to close.
 const GRACE: Duration = Duration::from_secs(5);
 const STDERR_CAP: usize = 64 * 1024;
 const CHUNK: usize = 64 * 1024;
+
+/// Concurrency pool a Git run draws its permit from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GitPool {
+	/// This process's own work: the UI, the CLI. What a drain waits for.
+	#[default]
+	Local,
+	/// Reads answered for a remote master. Own budget, never counted by
+	/// in_flight()/queued()/leaked_slots(), so a master can neither starve
+	/// the host's UI nor hold up its workspace switch or quit.
+	Served,
+}
 
 /// Cooperative cancellation shared between a caller and a running Git call.
 #[derive(Debug, Clone, Default)]
@@ -88,6 +104,7 @@ pub struct RunOptions {
 	pub max_stdout: usize,
 	pub overflow: Overflow,
 	pub cancel: Option<CancelToken>,
+	pub pool: GitPool,
 }
 
 impl Default for RunOptions {
@@ -98,6 +115,7 @@ impl Default for RunOptions {
 			max_stdout: 256 * 1024 * 1024,
 			overflow: Overflow::Error,
 			cancel: None,
+			pool: GitPool::Local,
 		}
 	}
 }
@@ -117,6 +135,7 @@ impl RunOptions {
 			max_stdout: Self::INTERACTIVE_MAX_STDOUT,
 			overflow: Overflow::Error,
 			cancel,
+			pool: GitPool::Local,
 		}
 	}
 
@@ -128,6 +147,7 @@ impl RunOptions {
 			max_stdout: Self::PREVIEW_MAX_STDOUT,
 			overflow: Overflow::Truncate,
 			cancel,
+			pool: GitPool::Local,
 		}
 	}
 
@@ -152,19 +172,31 @@ struct Budget {
 	leaked: usize,
 }
 
-static BUDGET: Mutex<Budget> = Mutex::new(Budget {
+static LOCAL_BUDGET: Mutex<Budget> = Mutex::new(Budget {
 	used: 0,
 	waiting: 0,
 	leaked: 0,
 });
 static FREED: Condvar = Condvar::new();
 
+static SERVED_BUDGET: Mutex<Budget> = Mutex::new(Budget {
+	used: 0,
+	waiting: 0,
+	leaked: 0,
+});
+static SERVED_FREED: Condvar = Condvar::new();
+static SERVED_LEAK_WARNED: AtomicBool = AtomicBool::new(false);
+
 thread_local! {
 	static HOLDING: Cell<bool> = const { Cell::new(false) };
 }
 
 fn budget() -> MutexGuard<'static, Budget> {
-	BUDGET.lock().unwrap_or_else(PoisonError::into_inner)
+	LOCAL_BUDGET.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn served_budget() -> MutexGuard<'static, Budget> {
+	SERVED_BUDGET.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Slots taken, including leaked ones (diagnostics and tests).
@@ -184,9 +216,34 @@ pub fn leaked_slots() -> usize {
 	budget().leaked
 }
 
+/// Slots taken in the served pool (diagnostics and tests).
+pub fn served_in_flight() -> usize {
+	served_budget().used
+}
+
+/// Callers waiting for a slot in the served pool (diagnostics and tests).
+pub fn served_queued() -> usize {
+	served_budget().waiting
+}
+
+/// Slots that stay taken in the served pool because a process tree could not
+/// be confirmed dead. Each one permanently lowers the served budget.
+pub fn served_leaked() -> usize {
+	served_budget().leaked
+}
+
+/// Whether any slot in the served pool has leaked.
+pub fn served_has_leaked() -> bool {
+	served_budget().leaked > 0
+}
+
 /// One budget slot. `!Send`: the per-thread nesting guard relies on the
 /// permit being released on the thread that took it.
-struct Permit(PhantomData<*const ()>);
+#[derive(Debug)]
+struct Permit {
+	pool: GitPool,
+	_not_send: PhantomData<*const ()>,
+}
 
 impl Permit {
 	fn acquire(opts: &RunOptions, args: &str) -> Result<Self, GitError> {
@@ -195,13 +252,30 @@ impl Permit {
 		if HOLDING.get() {
 			return Err(GitError::NestedProcess { args: args.into() });
 		}
-		let mut b = budget();
-		if b.used < MAX_CONCURRENT_GIT {
+		let pool = opts.pool;
+		let (budget_mutex, freed_condvar, max_concurrent, max_queued) =
+			match pool {
+				GitPool::Local => {
+					(&LOCAL_BUDGET, &FREED, MAX_CONCURRENT_GIT, MAX_QUEUED_GIT)
+				}
+				GitPool::Served => (
+					&SERVED_BUDGET,
+					&SERVED_FREED,
+					MAX_CONCURRENT_SERVED_GIT,
+					MAX_QUEUED_SERVED_GIT,
+				),
+			};
+
+		let mut b = budget_mutex.lock().unwrap_or_else(PoisonError::into_inner);
+		if b.used < max_concurrent {
 			b.used += 1;
 			HOLDING.set(true);
-			return Ok(Self(PhantomData));
+			return Ok(Self {
+				pool,
+				_not_send: PhantomData,
+			});
 		}
-		if b.waiting >= MAX_QUEUED_GIT {
+		if b.waiting >= max_queued {
 			return Err(GitError::QueueFull { args: args.into() });
 		}
 		b.waiting += 1;
@@ -210,16 +284,19 @@ impl Permit {
 			if opts.cancelled() {
 				break Err(GitError::Cancelled { args: args.into() });
 			}
-			if b.used < MAX_CONCURRENT_GIT {
+			if b.used < max_concurrent {
 				b.used += 1;
 				HOLDING.set(true);
-				break Ok(Self(PhantomData));
+				break Ok(Self {
+					pool,
+					_not_send: PhantomData,
+				});
 			}
 			let now = Instant::now();
 			if now >= deadline {
 				break Err(GitError::QueueTimeout { args: args.into() });
 			}
-			b = FREED
+			b = freed_condvar
 				.wait_timeout(b, TICK.min(deadline - now))
 				.unwrap_or_else(PoisonError::into_inner)
 				.0;
@@ -230,7 +307,20 @@ impl Permit {
 
 	/// Keeps the slot taken forever: what it guarded may still be alive.
 	fn leak(self) {
-		budget().leaked += 1;
+		let pool = self.pool;
+		let budget_mutex = match pool {
+			GitPool::Local => &LOCAL_BUDGET,
+			GitPool::Served => &SERVED_BUDGET,
+		};
+		budget_mutex
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.leaked += 1;
+		if pool == GitPool::Served
+			&& !SERVED_LEAK_WARNED.swap(true, Ordering::Relaxed)
+		{
+			eprintln!("[gitrun] served Git permit leaked: remote Git operations disabled");
+		}
 		HOLDING.set(false);
 		std::mem::forget(self);
 	}
@@ -238,9 +328,16 @@ impl Permit {
 
 impl Drop for Permit {
 	fn drop(&mut self) {
-		budget().used -= 1;
+		let (budget_mutex, freed_condvar) = match self.pool {
+			GitPool::Local => (&LOCAL_BUDGET, &FREED),
+			GitPool::Served => (&SERVED_BUDGET, &SERVED_FREED),
+		};
+		budget_mutex
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.used -= 1;
 		HOLDING.set(false);
-		FREED.notify_all();
+		freed_condvar.notify_all();
 	}
 }
 
@@ -2424,5 +2521,195 @@ mod tests {
 			parse_ps_group_liveness(out_malformed, 100).is_err(),
 			"extra columns must strictly fail"
 		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn served_pool_is_not_counted_by_in_flight() {
+		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let exe = std::env::current_exe().expect("current test exe");
+			let status = Command::new(exe)
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args([
+					"--exact",
+					"gitrun::tests::served_pool_is_not_counted_by_in_flight",
+					"--nocapture",
+				])
+				.status()
+				.expect("spawn isolated test subprocess");
+			assert!(status.success(), "isolated subprocess test failed");
+			return;
+		}
+
+		let opts = RunOptions {
+			pool: GitPool::Served,
+			timeout: Duration::from_secs(10),
+			..Default::default()
+		};
+		let handle = std::thread::spawn(move || {
+			let mut cmd = Command::new("git");
+			cmd.args(["-c", "alias.slow=!sleep 2", "slow"]);
+			run(cmd, "slow", None, &opts)
+		});
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while served_in_flight() == 0 {
+			assert!(
+				Instant::now() < deadline,
+				"served_in_flight never became 1"
+			);
+			std::thread::sleep(Duration::from_millis(20));
+		}
+
+		assert_eq!(served_in_flight(), 1);
+		assert_eq!(in_flight(), 0);
+		assert_eq!(queued(), 0);
+
+		let res = handle.join().expect("thread join");
+		assert!(res.is_ok());
+		assert_eq!(served_in_flight(), 0);
+	}
+
+	#[test]
+	fn served_pool_has_its_own_queue_limit() {
+		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let exe = std::env::current_exe().expect("current test exe");
+			let status = Command::new(exe)
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args([
+					"--exact",
+					"gitrun::tests::served_pool_has_its_own_queue_limit",
+					"--nocapture",
+				])
+				.status()
+				.expect("spawn isolated test subprocess");
+			assert!(status.success(), "isolated subprocess test failed");
+			return;
+		}
+
+		let opts = RunOptions {
+			pool: GitPool::Served,
+			queue_timeout: Duration::from_secs(5),
+			..Default::default()
+		};
+
+		// 1. Thread 0 acquires the 1 served concurrency slot
+		let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+		let (release_tx, release_rx) = std::sync::mpsc::channel();
+		let opts_holder = opts.clone();
+		let holder = std::thread::spawn(move || {
+			let permit = Permit::acquire(&opts_holder, "holder").unwrap();
+			ready_tx.send(()).unwrap();
+			release_rx.recv().unwrap();
+			drop(permit);
+		});
+		ready_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("holder acquired permit");
+		assert_eq!(served_in_flight(), 1);
+
+		// 2. Spawn MAX_QUEUED_SERVED_GIT waiters
+		let cancel_tokens: Vec<_> = (0..MAX_QUEUED_SERVED_GIT)
+			.map(|_| CancelToken::new())
+			.collect();
+		let mut waiters = Vec::new();
+		for token in &cancel_tokens {
+			let mut waiter_opts = opts.clone();
+			waiter_opts.cancel = Some(token.clone());
+			waiters.push(std::thread::spawn(move || {
+				match Permit::acquire(&waiter_opts, "waiter") {
+					Ok(permit) => {
+						drop(permit);
+						Ok(())
+					}
+					Err(e) => Err(e),
+				}
+			}));
+		}
+
+		// Wait until all 4 are queued
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while served_queued() < MAX_QUEUED_SERVED_GIT {
+			assert!(Instant::now() < deadline, "waiters never queued up");
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		assert_eq!(served_queued(), MAX_QUEUED_SERVED_GIT);
+
+		// 3. The next caller gets GitError::QueueFull immediately
+		let overflow_err = Permit::acquire(&opts, "overflow").unwrap_err();
+		assert!(
+			matches!(overflow_err, GitError::QueueFull { .. }),
+			"expected QueueFull, got {overflow_err:?}"
+		);
+
+		// 4. Cancel the waiting threads
+		for token in &cancel_tokens {
+			token.cancel();
+		}
+		for waiter in waiters {
+			let err = waiter.join().expect("waiter thread join").unwrap_err();
+			assert!(
+				matches!(err, GitError::Cancelled { .. }),
+				"expected Cancelled, got {err:?}"
+			);
+		}
+		assert_eq!(served_queued(), 0);
+
+		// 5. Release holder
+		release_tx.send(()).unwrap();
+		holder.join().expect("holder thread join");
+		assert_eq!(served_in_flight(), 0);
+	}
+
+	#[test]
+	fn served_permit_leak_bumps_served_leaked_and_leaves_local_untouched() {
+		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let exe = std::env::current_exe().expect("current test exe");
+			let status = Command::new(exe)
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args([
+					"--exact",
+					"gitrun::tests::served_permit_leak_bumps_served_leaked_and_leaves_local_untouched",
+					"--nocapture",
+				])
+				.status()
+				.expect("spawn isolated test subprocess");
+			assert!(status.success(), "isolated subprocess test failed");
+			return;
+		}
+
+		assert_eq!(served_leaked(), 0);
+		assert_eq!(leaked_slots(), 0);
+		assert!(!served_has_leaked());
+
+		let cmd = test_long_running_command();
+		let opts = RunOptions {
+			pool: GitPool::Served,
+			..Default::default()
+		};
+		let mut proc =
+			ManagedChild::spawn(cmd, "test-served-proc", false, &opts).unwrap();
+
+		let _inj = InjectionGuard;
+		test_inject_kill_tree_failure(true);
+
+		let err = proc.finish().unwrap_err();
+		assert!(matches!(err, GitError::Cleanup { .. }), "{err:?}");
+
+		test_inject_kill_tree_failure(false);
+		drop(proc);
+
+		assert_eq!(
+			served_leaked(),
+			1,
+			"served pool must record the leaked slot"
+		);
+		assert_eq!(served_in_flight(), 1);
+		assert!(served_has_leaked());
+		assert_eq!(leaked_slots(), 0, "local pool must remain 0");
+		assert_eq!(in_flight(), 0, "local in_flight must remain 0");
 	}
 }

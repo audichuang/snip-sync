@@ -5409,6 +5409,7 @@ version = "0.5.0"
 dependencies = [
  "arboard",
  "dunce",
+ "libc",
  "nix 0.27.1",
  "process-wrap",
  "regex",
@@ -5458,6 +5459,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snip-core",
+ "socket2",
  "tempfile",
  "thiserror 2.0.20",
 ]

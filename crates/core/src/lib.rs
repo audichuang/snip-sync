@@ -10,6 +10,7 @@ pub mod format;
 pub mod fsutil;
 pub mod gitrun;
 pub mod gitsrc;
+pub mod gitview;
 pub mod graph;
 pub mod paths;
 pub mod restore;

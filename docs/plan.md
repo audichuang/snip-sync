@@ -241,14 +241,24 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
 ## 6.5 遠端節點模式(spec 第 8 節)
 
 - **crate**:`crates/remote`(`snip-remote`)。它不依賴 GPUI,所以 CLI(`snip worker`)與桌面 App 共用同一份 worker 程式。模組分工:
-  - `proto`:幀格式與請求／回應。
+  - `proto`:幀格式、請求／回應與協商版本常數。
   - `tls`:裝置身分、憑證驗證、配對證明。
-  - `worker`:監聽與處理請求。
-  - `client`:配對,以及 pin 住 worker 憑證後的呼叫。
-- **傳輸**:用 std 的阻塞 TCP 加 rustls(TLS 1.3,ring provider),不引入第二個 async runtime。rustls 與 ring 原本就經由 gpui 連進桌面版。每個 socket 都設逾時。master 端的連線逾時 2 s、讀寫的閒置逾時 5 s,讓卡住的 worker 在桌面版 8 s 的 drain 時限內失敗;慢但有在傳的資料不受影響。worker 端的讀寫逾時 30 s,閒置連線 60 s 後關閉;同時最多服務 64 條連線,超過的最多等 4 s 拿到名額(短於 master 的 5 s),排隊的連線也上限 64 條,再多就關閉。
+  - `worker`:監聽與連線派送。
+  - `client`:配對、連線池、重試與呼叫機制。
+  - `jobs`:worker 端背景任務管理（名額 admission、heartbeat、期限、取消）。
+  - `gitserve`:worker 端處理 `ScanRepos` 與 `GitView` 查詢、圍界與參數驗證、錯誤對映。
+- **傳輸**:用 std 的阻塞 TCP 加 rustls(TLS 1.3,ring provider),不引入第二個 async runtime。rustls 與 ring 原本就經由 gpui 連進桌面版。每個 socket 都設逾時。master 端的連線逾時 2 s、讀寫的閒置逾時 5 s,讓卡住的 worker 在桌面版 8 s 的 drain 時限內失敗;慢但有在傳的資料不受影響。master 端 Git 呼叫上限 `GIT_CALL_LIMIT = 90 s`（大於 worker job 期限）。worker 端的讀寫逾時 30 s,閒置連線 60 s 後關閉;同時最多服務 64 條連線,超過的最多等 4 s 拿到名額(短於 master 的 5 s),排隊的連線也上限 64 條,再多就關閉。
 - **協定**:每一幀是 4 位元組 big-endian 長度,接一段 JSON。幀大小上限 8 MiB,超過就拒收,不會先配置記憶體。
-  - 第一幀是 `hello`,帶協定版本(`PROTOCOL_VERSION`)。版本不同時回 `version_mismatch`。
-  - 請求共有 `list_workspaces`、`list_dir`、`stat`、`read`、`write`、`rename`、`git` 幾種。其中 `write`、`rename`、`git` 目前回 `unsupported`。
+  - 第一幀是 `hello`,帶基礎版本 `version` (1) 與可選的上限 `max_version`（`PROTOCOL_MAX = 2`、`GIT_VIEWS_VERSION = 2`）。新 worker 協商 `min(master.max_version, worker_max)`；舊 worker（0.5.0）無此欄位被 serde 忽略，回覆無 `max_version`，協商為 1。master 在發送 `ScanRepos` 或 `GitView` 前檢查連線版本，不足時重連；重連仍不足則直接回報 `WorkerTooOld`，絕不將新請求送給舊 worker。`snip worker` 提供隱藏旗標 `--max-protocol <N>` 供測試模擬。
+  - 請求包含 `list_workspaces`、`list_dir`、`stat`、`read`、`write`、`rename`、`scan_repos`、`git_view`（原保留的 `git` 已移除）。其中 `write`、`rename` 回 `unsupported`。
+  - 長時間任務（`ScanRepos`、`GitView`）由 worker 背景 job 執行，每秒（`HEARTBEAT = 1 s`）發送 `Response::Pending` heartbeat 幀，master 在等待期間重設逾時，避免慢操作誤判。
+  - 錯誤碼（`ErrorCode`）新增 `NotARepository`、`InvalidRevision`、`Timeout`、`Busy`、`Cancelled`、`OutsideShare`。
+- **worker 的圍界與參數驗證**:
+  - 圍界（boundary）：worker 在分享目錄下以 `LocalRepo::open_within` 開啟 repo，驗證 canonical toplevel、`git_dir`、`common_dir` 均在 boundary 內；透過 `--git-path` 驗證 objects、refs、index、shallow、config 等路徑皆在 boundary 內；遞迴檢查 `objects/info/alternates`（深度 ≤ 5）亦須在 boundary 內。拒絕主 repo 在分享外的 linked worktree、alternates 指向分享外的 repo，以及空 `.git` 目錄（防止向上逃逸到父 repo）。working tree 檔案讀取（Working source）經 `browser::inside` 與 realpath 檢查，阻擋指向分享外的 symlink。錯誤訊息經 `scrub` 去除分享外部路徑與詳細內部 stderr。
+  - 參數驗證：rev 嚴格限制為 4..=64 位元 hex、`HEAD` 或合法的單層 ref 名稱（`valid_rev`），並一律在 worker 上先解析成完整 OID（`resolve_commit_with`），再交給 core，杜絕偽選項與參數注入（如 `:/regex`、`HEAD@{n}`、`--output=`）；path 與 dir 嚴格要求相對且為 Normal 元件；tips 僅收 hex 且上限 50,000；`limit` 上限 1,000；輸出 stdout min 到 `SERVED_MAX_STDOUT = 4 MiB`。
+- **job 與 Served 名額**:
+  - job 管理（`jobs.rs`）：同時執行的 GitView/ScanRepos 上限 `MAX_GIT_JOBS = 2`（其中掃描 `MAX_SCAN_JOBS = 1`），等待名額上限 `MAX_JOBS_WAITING = 16`，超過或等候逾時（10 s）立即回報 `Busy`。整體期限 View 60 s、Scan 75 s，逾時取消 job 並回報 `Timeout`。master 斷線或寫入 Pending 失敗即取消 job；取消分享（`set_roots`）與 worker 停止（`stop`）時取消對應 workspace 或全部 job。連線槽位以 RAII guard 確保即便 panic 也能安全釋放。
+  - Served 名額池（`gitrun.rs`）：遠端讀取的 git 程序皆使用獨立的 `GitPool::Served`（`MAX_CONCURRENT_SERVED_GIT = 1`、`MAX_QUEUED_SERVED_GIT = 4`），不計入本機的 `in_flight()`/`queued()`/`leaked_slots()`，因此遠端 master 的讀取絕不排擠 worker 主人自己的 UI，也不會阻擋桌面版的 drain（切換工作區與結束程式）。master 端對遠端 Git 呼叫亦加上並行上限 `MAX_GIT_CALLS_IN_FLIGHT = 4`，避免合併 log 請求塞滿 worker 佇列。
 - **身分與配對**:
   - 憑證由 rcgen 產生,ECDSA P-256,自簽,CN 固定為 `snip-sync`。對方的身分只看憑證 DER 的 SHA-256 指紋。兩邊都出示憑證(mTLS)。
   - worker 的 TLS 層接受任何客戶端憑證,未配對的 master 只能送 `pair`。
@@ -260,18 +270,26 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
   - master 端:`remote-workers.json`。
   - `remote-workers.json` 與 `remote-trusted-masters.json` 一律僅透過 `snip_remote::WorkerStore` 與 `TrustedMasterStore`(`crates/remote/src/store.rs`)存取:每次變更皆先取得旁車鎖檔 `<name>.lock` 的獨占建議鎖(exclusive advisory lock),在鎖內重新載入清單、套用變更,並透過獨立命名的暫存檔(`save_json`:寫入 `<name>.<pid>.<count>.tmp` 後 rename 覆蓋)原子寫入,因此 CLI 與桌面版絕不互相覆蓋彼此剛加入的配對;`add` 會移除相同指紋或位址的既有項目並將新項目置於首位;`forget` 若查無相符項目則不重新寫入檔案。
 - **桌面版接法**:`WorkbenchModel.remote.session` 有值時,工作區就是遠端的。
+  - 引入 `GitHost`（`githost.rs`）：區分 `Local` 與 `Remote`。UI 的 Changes、Log、Diff、歷史樹等統一向 `GitHost` 索取 `Box<dyn RepoView>`，本機走 `LocalRepo`，遠端走 `RemoteRepo`（將方法轉為型別化 `GitQuery` 經 `Client` 發送）。
   - `submit_tree_io` 改走 `remote::tree_io`,它呼叫 `tree::listed_tree_result`,一次列完,沒有游標。
   - `select_file_in` 對 `SourceKind::File` 改走 `remote::read_preview`。
-  - 樹的根是虛擬路徑 `snip-remote://<指紋>/<id>`,不碰本機磁碟,也不跑 repo 探索。
+  - 樹的根是虛擬路徑 `snip-remote://<指紋>/<id>`,不碰本機磁碟。開啟遠端工作區後在背景發送 `ScanRepos` 掃描 repo（深度 8、上限 256、期限 75 s），若未完成顯示 `remote_scan_incomplete`。Refresh（重新整理）觸發重掃。繼續探索僅支援 depth-limited 資料夾。
+  - 前綴路由：遠端 repo 的樹 IO 與預覽路徑自動加上相對於 session root 的 repo 前綴。單一 repo 分享時復用單一樹，避免多餘的虛擬工作區樹。
+  - 空狀態：Changes 與 Log 引入純函式判定，嚴格遵守「沒讀到不顯示成乾淨」（Changes 包含 no_workspace、scanning、loading、no_repository、scan_failed、no_match、clean、clean_partial（乾淨但至少一個 repo 沒讀完整，不是完整乾淨）；Log 包含 no_workspace、scanning、loading、no_repository、failed、empty），並在 UI 埋入 `changes-empty`、`log-empty` probe 與 `[APP:CHANGES_EMPTY]` / `[APP:LOG_EMPTY]` 日誌。
+  - 遠端守門：遠端工作區下複製、貼上、加入 repo 路徑、為複製勾選皆嚴格阻擋（回報 `remote_unsupported`）；右鍵選單的 repo 與檔案列僅提供複製 worker 路徑，不提供本機 reveal。
   - 開啟遠端工作區是 `lifecycle::Intent::OpenRemoteWorkspace`,與開本機工作區走同一套關閉檢查。
   - worker 監聽器是程序層級的全域物件,先於視窗啟動,也不隨工作區切換而停止。這是之後做無螢幕常駐(Windows 登入項目或服務)的路徑。
 - **測試**:
   - `crates/remote/src/store.rs`:單元測試(涵蓋 add / forget / find 基本操作、過期實例與兩個 process 交錯 add 不遺失項目、不可寫位置回報錯誤、暫存檔命名唯一且不留殘檔)。
-  - `scripts/remote_e2e.sh`:連線能力的端到端驗證,獨立於容器裡的 native acceptance。它只用 CLI:起真的 `snip worker` 程序,由真的 `snip remote` 經 TLS 配對、瀏覽、逐位元組比對、確認該拒絕的情況、平行讀取、重啟、換憑證,並包含配對後 forget 其他項目不影響現有配對的檢查。
+  - `crates/remote/src/jobs.rs`:單元測試（admit 名額、等待上限 → Busy、取消、心跳幀與逾時）。
+  - `crates/remote/tests/git_views.rs`:loopback 真 TLS 測試，涵蓋三種工作區掃描、`RemoteRepo` 與 `LocalRepo` 同函式對照、圍界安全測試、版本協商與斷線取消。
+  - `crates/remote/tests/git_queue.rs`:獨立測試，驗證大量並行請求下 Served 池與 job 佇列的有界等待、`Busy` 回報及不排擠 Local git。
+  - `crates/cli/tests/worker.rs`:真的啟動 `snip worker` 程序，測試 CLI 唯讀 Git 子命令（repos/changes/log/show/diff）與 `--max-protocol`。
+  - `crates/desktop-native`:gpui 整合測試，涵蓋遠端多 repo / 單 repo / 非 repo 工作區、空狀態判定、守門拒絕與 Refresh。
+  - `scripts/remote_e2e.sh`:連線能力的端到端驗證,獨立於容器裡的 native acceptance。它只用 CLI:起真的 `snip worker` 程序,由真的 `snip remote` 經 TLS 配對、瀏覽、逐位元組比對、確認該拒絕的情況、平行讀取、重啟、換憑證,並包含配對後 forget 其他項目不影響現有配對的檢查；包含 `== git views` 段，驗證跨機器 TLS 上的唯讀 Git 檢視、圍界防護、參數注入防護以及 `.git/index` 不變性。
     - `just remote-e2e`:worker 在本機 127.0.0.1。preflight 會跑;CI 的 `Remote E2E` job 在 Ubuntu、macOS、Windows 各跑一次,列入 CI gate。
     - `just remote-e2e-ssh <host>`:worker 在另一台機器,經 ssh 從 `git archive HEAD` 編出並啟動,走 Tailscale 連線。改到遠端節點的程式時必跑。
   - `crates/remote/tests/loopback.rs`:真實 TLS 走 127.0.0.1,涵蓋配對、拒絕、pin、containment、symlink root。
-  - `crates/cli/tests/worker.rs`:真的啟動 `snip worker` 程序。
   - `main.rs` `tests::in_process::remote_workspace_pairs_lists_and_previews_through_a_worker`:配對表單、遠端樹、預覽。
 
 ## 7. 風險
