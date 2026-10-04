@@ -417,8 +417,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | L01 | 在 `edge`：`ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 出現 `ws-tree-row:new.txt`，預覽是 `fresh-1` |
 | L02 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2` |
 | L03 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄沒有 `new.txt` |
-| L04 | 中斷連線：`ssh ubuntu "pkill -f '/home/audichuang/.local/bin/snip serve'"`，在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh）；絕不顯示成空白或上一個檔案 |
-| L05 | 貼上中斷：P01 的 payload 對 `pastews/plain` 按 Cmd+V，預覽出現後執行 L04 的 pkill，再點 `btn-apply` | 寫入成功，或者畫面說「無法確認貼上是否完成；請重新整理確認」；絕不說成功卻沒寫，也不說失敗卻寫了（用 `ssh ubuntu ls` 對照） |
+| L04 | 中斷連線：worker 的 argv 是 `snip serve --stdio`（從 PATH 起的），不是絕對路徑，舊的 pkill 殺不到。先記下並核對本輪 worker 的 PID：`ssh ubuntu "pgrep -u audichuang -f '^snip serve --stdio$'" \| tee "$RUN/worker-pids-before.txt"`（App 開著時非空；若機器上有別的 `snip serve --stdio`，先弄清楚哪些是本輪的），再 `ssh ubuntu "pkill -u audichuang -f '^snip serve --stdio$'"`，接著 `ssh ubuntu "pgrep -u audichuang -f '^snip serve --stdio$'"` 必須沒有輸出（驗證已結束）；在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh）；絕不顯示成空白或上一個檔案 |
+| L05 | 貼上中斷（寫入途中斷線，不是閒置時）：P01 的 payload 對 `pastews/plain` 按 Cmd+V，`PASTE_PREVIEW` 出現後點 `btn-apply`；**等 `PASTE_APPLYING` 出現、再等 2 秒**（寫入已開始）才執行 L04 的斷線與驗證。之後用 `ssh ubuntu "find '$W/pastews/plain' -type f \| sort"` 與 CLI 往返 oracle（§4.7 開頭的做法）逐檔對照 | `PASTE_DONE`，或畫面說「無法確認貼上是否完成；請重新整理確認」（`paste_outcome_unknown`）；絕不說成功卻沒寫，也不說失敗卻寫了。已寫入的檔案內容與 CLI 往返 oracle 一致（正規化照 spec 第 1 節）；之後 App 的下一次操作一定有回應（自動重連） |
 
 ### 4.10 CLI master 交叉驗證（C01–C04）
 
