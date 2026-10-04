@@ -511,6 +511,31 @@ fn a_commit_replay_refuses_a_changed_repo_and_a_repo_above_the_workspace() {
 }
 
 #[test]
+fn a_payload_over_the_clipboard_limit_is_refused_whole() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let w = worker(None);
+	let (client, id) = open(&w, tmp.path());
+	let body = "x".repeat(snip_core::transfer::CLIPBOARD_PAYLOAD_MAX);
+	let text = entry("big.txt", &body);
+	let res =
+		client.import_plan(&id, "", &text, &PasteMapping::default(), None);
+	assert_eq!(refused(res), ErrorCode::TooLarge);
+	assert!(!tmp.path().join("big.txt").exists());
+	// The connection is still in step: the next paste is planned.
+	let planned = client
+		.import_plan(
+			&id,
+			"",
+			&entry("a.txt", "a"),
+			&PasteMapping::default(),
+			None,
+		)
+		.unwrap();
+	assert_eq!(planned.plan.create_operations().len(), 1);
+}
+
+#[test]
 fn a_worker_without_paste_says_it_is_too_old() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();

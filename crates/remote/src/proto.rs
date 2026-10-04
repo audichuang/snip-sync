@@ -857,6 +857,25 @@ mod tests {
 
 		let responses = [
 			Response::Pending,
+			Response::Joined,
+			Response::Fresh,
+			Response::Imported(snip_core::restore::RestoreExecutionResult {
+				created_count: 1,
+				errors: vec!["x: denied".into()],
+				..Default::default()
+			}),
+			Response::Replayed(snip_core::commits::ReplayResult {
+				created: vec!["abcd".into()],
+				failure: None,
+			}),
+			Response::Error {
+				code: ErrorCode::Stale,
+				message: "stale destination in '/w': gone".into(),
+			},
+			Response::Error {
+				code: ErrorCode::Collision,
+				message: "target collision".into(),
+			},
 			Response::Repos(RepoScan {
 				repos: vec![ScannedRepo {
 					rel: "sub".into(),
