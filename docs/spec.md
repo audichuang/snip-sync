@@ -239,6 +239,8 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - job 管理：每個請求為一個 job，同時最多 2 個 job（其中掃描最多 1 個），等待佇列上限 16，超過或等候逾時（10 秒）立即回報 `Busy`。整體期限 View 60 秒、Scan 75 秒，逾時取消 job 並回報 `Timeout`。worker 每秒發送 `Pending` heartbeat 幀；master 斷線或取消請求時立即中止 worker 背景 job。
 - **已知限制**:
   - tag 與參照極多（refs 輸出超過 `SERVED_MAX_STDOUT = 4 MiB`）的 repo，在遠端會顯示「遠端參照資料過大」（`remote_refs_too_large`）錯誤（本機可看）。
+  - Refresh 時，開著的 Changes 列預覽若不屬於正在重新載入的 repo（或尚未讀完），預覽會清掉，回到該 repo 的預設畫面，不保留也不重讀；本機與遠端相同。專案樹開著的檔案照常重讀。
+  - Refresh 時 worker 掃描失敗（舊版 worker、連線中斷），repo 清單清空，已開的預覽與展開的資料夾不保留；當時正在載入的資料夾可能停在載入中，需重新開啟工作區。
   - `UserEmail` 查詢會將 worker 上的 `user.email`（含全域設定）提供給已配對的 master。
   - 外指 submodule 取捨：submodule 的 `.git` 指向分享外時，該 submodule 自身的列會被拒絕，但父 repo 的 status 仍會計算該 submodule 的 dirty bit（僅洩漏一個位元的改動狀態，換取與本機一致的變更標記）。
 - **版本相容**:

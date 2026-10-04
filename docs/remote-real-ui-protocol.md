@@ -319,7 +319,7 @@ R34 之前，先重新開回 `edge`（R15 的步驟）。
 |---|---|---|
 | R34 | `ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 樹重新讀取；出現 `ws-tree-row:new.txt`，預覽顯示 `fresh-1` |
 | R35 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2`，不是快取的舊內容 |
-| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄 `WS_TREE_PAGE: rel= …` 行（Refresh 後根目錄清單抵達）之後，不再出現 `ws-tree-row:new.txt` 的 `CTRL_BOUNDS`（該列不在重建後的清單中）；最後一行 `PREVIEW_LOADING` 為 `new.txt` 且其後沒有 `PREVIEW_LOADED`；預覽改顯示指名 `new.txt` 的找不到檔案或讀取失敗錯誤，不再是 `fresh-2`（註：其間若出現 `new.txt` 的 `PREVIEW_DISCARDED` 屬預期現象，因 Refresh 會重新讀取開啟的檔案兩次，非屬異常）；絕不可顯示其他 repo 的 Git 錯誤，`edge/nested`（錯誤 repo）絕不能搶佔預覽區 |
+| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄 `WS_TREE_PAGE: rel= …` 行（Refresh 後根目錄清單抵達）之後，不再出現 `ws-tree-row:new.txt` 的 `CTRL_BOUNDS`（該列不在重建後的清單中）；最後一行 `PREVIEW_LOADING` 為 `new.txt` 且其後沒有 `PREVIEW_LOADED`；預覽改顯示指名 `new.txt` 的找不到檔案或讀取失敗錯誤，不再是 `fresh-2`；絕不可顯示其他 repo 的 Git 錯誤，`edge/nested`（錯誤 repo）絕不能搶佔預覽區 |
 | R37 | 停掉 worker：`ssh ubuntu "kill \$(cat '$W/worker.pid')"`，在 App 點一個沒預覽過的檔案 | 失敗格；`PREVIEW_LOADING` 之後 10 秒內出現錯誤（master 連線逾時 2 秒、讀取 5 秒）；這段時間 App 沒有凍結（可以捲動、可以開選單）；接著按 Cmd+Shift+W 關掉工作區，要在 8 秒內完成 |
 | R38 | `start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"`；確認指紋和第一次一樣；在 App 選單點 `remote-worker:0`，開 `edge`，點一個檔案 | 不需要重新配對；`REMOTE_WORKSPACES: count=5`、`REMOTE_OPENED`、`PREVIEW_LOADED` |
 | R39 | 取消分享：`start_worker wcfg /home/audichuang/research/rtk`（只分享 rtk）。App 不重開，直接點 `edge` 裡另一個檔案，再開選單點 `remote-worker:0` | 預覽被拒絕（失敗格）；選單只列出 `rtk`（`REMOTE_WORKSPACES: count=1`） |
