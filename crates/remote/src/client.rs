@@ -119,7 +119,6 @@ impl RemoteHost {
 
 /// One frame in either direction, with a read deadline.
 pub(crate) trait FrameIo {
-	fn send(&mut self, request: &Request) -> io::Result<()>;
 	fn recv(
 		&mut self,
 		timeout: Duration,
@@ -128,10 +127,6 @@ pub(crate) trait FrameIo {
 
 /// A plain stream has no deadline; tests feed one frames from memory.
 impl<S: IoRead + IoWrite> FrameIo for S {
-	fn send(&mut self, request: &Request) -> io::Result<()> {
-		write_request(self, request)
-	}
-
 	fn recv(&mut self, _: Duration) -> Result<Option<Response>, RemoteError> {
 		Ok(read_frame::<Response>(self)?)
 	}
@@ -189,8 +184,7 @@ impl Connection {
 			max_version: Some(PROTOCOL_MAX),
 		};
 		let reply = conn
-			.send(&hello)
-			.map_err(RemoteError::from)
+			.send_guarded(&hello, None, Instant::now() + CONNECT_TIMEOUT)
 			.and_then(|()| conn.recv(CONNECT_TIMEOUT));
 		match reply {
 			Ok(Some(Response::Hello {
@@ -279,21 +273,94 @@ impl Connection {
 		cancel: Option<&CancelToken>,
 		limit: Duration,
 	) -> Result<Response, RemoteError> {
+		// The whole call holds to one absolute deadline: the send included,
+		// not only the wait for the answer.
+		let deadline = Instant::now() + limit;
 		let mut frames = 0;
-		let res = exchange(self, request, cancel, limit, &mut frames);
+		let res = self
+			.send_guarded(request, cancel, deadline)
+			.and_then(|()| exchange(self, cancel, deadline, &mut frames));
 		self.frames_seen = frames;
 		if res.is_err() && !matches!(res, Err(RemoteError::Refused { .. })) {
 			self.broken = true;
 		}
 		res
 	}
+
+	/// Writes `request` under the call's absolute deadline. The write runs
+	/// on its own thread: a `ChildStdin` whose worker stopped reading
+	/// blocks without end, and only the transport's death unblocks it, so
+	/// on the deadline (or a cancel) the process is killed and the call
+	/// fails in time. The writer is abandoned with the thread when it
+	/// cannot come back; the connection is broken either way.
+	fn send_guarded(
+		&mut self,
+		request: &Request,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<(), RemoteError> {
+		let mut writer =
+			std::mem::replace(&mut self.writer, Box::new(DeadWriter));
+		let request = request.clone();
+		let (done_tx, done_rx) = mpsc::channel();
+		let _ = std::thread::Builder::new()
+			.name("snip-remote-write".into())
+			.spawn(move || {
+				let result = write_request(&mut writer, &request);
+				let _ = done_tx.send((writer, result));
+			});
+		loop {
+			match done_rx.recv_timeout(Duration::from_millis(20)) {
+				Ok((writer, result)) => {
+					self.writer = writer;
+					return result.map_err(RemoteError::from);
+				}
+				Err(RecvTimeoutError::Disconnected) => {
+					return Err(RemoteError::Protocol(
+						"the send thread died".into(),
+					));
+				}
+				Err(RecvTimeoutError::Timeout) => {}
+			}
+			if Instant::now() >= deadline {
+				self.kill_transport();
+				return Err(RemoteError::TimedOut);
+			}
+			if cancel.is_some_and(|c| c.is_cancelled()) {
+				self.kill_transport();
+				return Err(RemoteError::Cancelled);
+			}
+		}
+	}
+
+	/// Kills the transport process, closing the pipes a stuck write or
+	/// read is parked on. Without a process (an in-process worker) there
+	/// is nothing to kill; its stuck writer thread is simply abandoned.
+	fn kill_transport(&mut self) {
+		if let Some(child) = self.child.as_mut() {
+			let _ = child.kill();
+			let _ = child.wait();
+		}
+	}
+}
+
+/// Placeholder for a writer that is in flight, or was abandoned with the
+/// thread that blocked writing it.
+struct DeadWriter;
+
+impl io::Write for DeadWriter {
+	fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+		Err(io::Error::new(
+			io::ErrorKind::BrokenPipe,
+			"the transport's writer was abandoned",
+		))
+	}
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
 }
 
 impl FrameIo for Connection {
-	fn send(&mut self, request: &Request) -> io::Result<()> {
-		write_request(&mut self.writer, request)
-	}
-
 	fn recv(
 		&mut self,
 		timeout: Duration,
@@ -464,17 +531,17 @@ fn pump_frames(
 	}
 }
 
-/// Sends `request` and waits for its answer, skipping heartbeats.
+/// Waits for `request`'s answer, skipping heartbeats. Every frame — chunk
+/// frames included — holds to the absolute `deadline`, so a worker cannot
+/// stretch one call by dripping frames. The request itself was sent by
+/// [`Connection::send_guarded`] under the same deadline.
 pub(crate) fn exchange(
 	io: &mut impl FrameIo,
-	request: &Request,
 	cancel: Option<&CancelToken>,
-	limit: Duration,
+	deadline: Instant,
 	frames: &mut usize,
 ) -> Result<Response, RemoteError> {
 	*frames = 0;
-	io.send(request)?;
-	let started = Instant::now();
 	// A copy's text, or a large reply's JSON, arriving ahead of it.
 	let mut text = String::new();
 	let over_clipboard = |text: &str| {
@@ -486,64 +553,61 @@ pub(crate) fn exchange(
 	};
 	loop {
 		match io.recv(IO_TIMEOUT)? {
-			Some(Response::Chunk { data }) => {
-				*frames += 1;
-				if text.len() + data.len() > JOINED_MAX {
-					return Err(RemoteError::Protocol(
-						"the worker's reply is too large".into(),
-					));
-				}
-				text.push_str(&data);
-			}
-			Some(Response::Joined) => {
-				*frames += 1;
-				return match serde_json::from_str::<Response>(&text) {
-					Ok(Response::Error { code, message }) => {
-						Err(RemoteError::Refused { code, message })
-					}
-					Ok(
-						Response::Chunk { .. }
-						| Response::Joined
-						| Response::Pending,
-					)
-					| Err(_) => Err(RemoteError::Protocol(
-						"the worker's chunked reply is not valid".into(),
-					)),
-					Ok(response) => Ok(response),
-				};
-			}
-			Some(Response::Copied(mut out)) if !text.is_empty() => {
-				*frames += 1;
-				if let Some(err) = over_clipboard(&text) {
-					return Err(err);
-				}
-				out.payload = text;
-				return Ok(Response::Copied(out));
-			}
-			Some(Response::CommitsCopied(mut out)) if !text.is_empty() => {
-				*frames += 1;
-				if let Some(err) = over_clipboard(&text) {
-					return Err(err);
-				}
-				out.text = text;
-				return Ok(Response::CommitsCopied(out));
-			}
-			Some(Response::Pending) => {
-				*frames += 1;
-				if cancel.is_some_and(|c| c.is_cancelled()) {
-					return Err(RemoteError::Cancelled);
-				}
-				if started.elapsed() >= limit {
-					return Err(RemoteError::TimedOut);
-				}
-			}
-			Some(Response::Error { code, message }) => {
-				*frames += 1;
-				return Err(RemoteError::Refused { code, message });
-			}
 			Some(response) => {
 				*frames += 1;
-				return Ok(response);
+				if Instant::now() >= deadline {
+					return Err(RemoteError::TimedOut);
+				}
+				match response {
+					Response::Chunk { data } => {
+						if text.len() + data.len() > JOINED_MAX {
+							return Err(RemoteError::Protocol(
+								"the worker's reply is too large".into(),
+							));
+						}
+						text.push_str(&data);
+					}
+					Response::Joined => {
+						return match serde_json::from_str::<Response>(&text) {
+							Ok(Response::Error { code, message }) => {
+								Err(RemoteError::Refused { code, message })
+							}
+							Ok(
+								Response::Chunk { .. }
+								| Response::Joined
+								| Response::Pending,
+							)
+							| Err(_) => Err(RemoteError::Protocol(
+								"the worker's chunked reply is not valid"
+									.into(),
+							)),
+							Ok(response) => Ok(response),
+						};
+					}
+					Response::Copied(mut out) if !text.is_empty() => {
+						if let Some(err) = over_clipboard(&text) {
+							return Err(err);
+						}
+						out.payload = text;
+						return Ok(Response::Copied(out));
+					}
+					Response::CommitsCopied(mut out) if !text.is_empty() => {
+						if let Some(err) = over_clipboard(&text) {
+							return Err(err);
+						}
+						out.text = text;
+						return Ok(Response::CommitsCopied(out));
+					}
+					Response::Pending => {
+						if cancel.is_some_and(|c| c.is_cancelled()) {
+							return Err(RemoteError::Cancelled);
+						}
+					}
+					Response::Error { code, message } => {
+						return Err(RemoteError::Refused { code, message });
+					}
+					response => return Ok(response),
+				}
 			}
 			None => {
 				return Err(RemoteError::Io(io::Error::new(
@@ -1394,6 +1458,29 @@ mod tests {
 		}
 	}
 
+	/// Feeds its frames with a pause before each read, so a deadline can
+	/// pass between them.
+	struct SlowDuplex {
+		incoming: io::Cursor<Vec<u8>>,
+		pause: Duration,
+	}
+
+	impl io::Read for SlowDuplex {
+		fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+			std::thread::sleep(self.pause);
+			self.incoming.read(buf)
+		}
+	}
+
+	impl io::Write for SlowDuplex {
+		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+			Ok(buf.len())
+		}
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
 	#[test]
 	fn exchange_skips_pending_frames_and_counts_frames() {
 		let mut stream = FakeDuplex::new(&[
@@ -1401,13 +1488,11 @@ mod tests {
 			Response::Pending,
 			Response::Text { content: None },
 		]);
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let res = exchange(
 			&mut stream,
-			&req,
 			None,
-			Duration::from_secs(10),
+			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
 		.unwrap();
@@ -1422,13 +1507,11 @@ mod tests {
 			FakeDuplex::new(&[Response::Pending, Response::Pending]);
 		let cancel = CancelToken::new();
 		cancel.cancel();
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
-			&req,
 			Some(&cancel),
-			Duration::from_secs(10),
+			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
 		.unwrap_err();
@@ -1440,11 +1523,9 @@ mod tests {
 	#[test]
 	fn exchange_zero_limit_with_pending_returns_timed_out() {
 		let mut stream = FakeDuplex::new(&[Response::Pending]);
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
-		let err =
-			exchange(&mut stream, &req, None, Duration::ZERO, &mut frames)
-				.unwrap_err();
+		let err = exchange(&mut stream, None, Instant::now(), &mut frames)
+			.unwrap_err();
 
 		assert!(matches!(err, RemoteError::TimedOut));
 		assert_eq!(frames, 1);
@@ -1456,13 +1537,11 @@ mod tests {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
 		}]);
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
-			&req,
 			None,
-			Duration::from_secs(10),
+			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
 		.unwrap_err();
@@ -1480,13 +1559,11 @@ mod tests {
 	#[test]
 	fn exchange_eof_returns_unexpected_eof() {
 		let mut stream = FakeDuplex::new(&[]);
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
-			&req,
 			None,
-			Duration::from_secs(10),
+			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
 		.unwrap_err();
@@ -1716,5 +1793,138 @@ mod tests {
 			0,
 			"the queue is drained: a pooled connection is clean"
 		);
+	}
+
+	/// A writer the write side can be parked inside, like `ChildStdin` on a
+	/// worker that stopped reading.
+	struct ParkedWriter(std::sync::Mutex<Option<mpsc::Receiver<()>>>);
+
+	impl io::Write for ParkedWriter {
+		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+			let receiver =
+				self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+			match receiver {
+				Some(receiver) => {
+					// Park forever, as a write to a full pipe does, until
+					// the gate is dropped.
+					let _ = receiver.recv();
+					Err(io::Error::from(io::ErrorKind::BrokenPipe))
+				}
+				None => Ok(buf.len()),
+			}
+		}
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	fn parked_connection(gate: mpsc::Receiver<()>) -> Connection {
+		Connection {
+			writer: Box::new(ParkedWriter(std::sync::Mutex::new(Some(gate)))),
+			frames: mpsc::sync_channel(1).1,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::default(),
+		}
+	}
+
+	/// A request the far end never reads fails by its deadline instead of
+	/// blocking forever, and the call returns in time.
+	#[test]
+	fn a_request_nobody_reads_fails_by_its_deadline() {
+		let (gate_tx, gate_rx) = mpsc::channel();
+		let mut conn = parked_connection(gate_rx);
+		// A body big enough that no pipe buffer swallows it whole.
+		let request = Request::ImportPlan {
+			workspace: "w".into(),
+			dest: String::new(),
+			text: "x".repeat(1024 * 1024),
+			mapping: Default::default(),
+		};
+		let started = Instant::now();
+		let deadline = started + scaled(Duration::from_millis(300));
+		let err = conn.send_guarded(&request, None, deadline).unwrap_err();
+		assert!(matches!(err, RemoteError::TimedOut), "{err:?}");
+		assert!(
+			started.elapsed() < scaled(Duration::from_secs(5)),
+			"the send must fail by its deadline, took {:?}",
+			started.elapsed()
+		);
+		drop(gate_tx);
+	}
+
+	/// A cancelled send fails at once instead of blocking forever.
+	#[test]
+	fn a_cancelled_send_fails_at_once() {
+		let (gate_tx, gate_rx) = mpsc::channel();
+		let mut conn = parked_connection(gate_rx);
+		let cancel = CancelToken::new();
+		cancel.cancel();
+		let request = Request::OpenWorkspace { path: "~".into() };
+		let started = Instant::now();
+		let deadline = started + scaled(Duration::from_secs(30));
+		let err = conn
+			.send_guarded(&request, Some(&cancel), deadline)
+			.unwrap_err();
+		assert!(matches!(err, RemoteError::Cancelled), "{err:?}");
+		assert!(started.elapsed() < scaled(Duration::from_secs(2)));
+		drop(gate_tx);
+	}
+
+	/// A send that goes out in time hands the writer back: the connection
+	/// carries on reading its answers.
+	#[test]
+	fn a_send_that_goes_out_keeps_the_connection_whole() {
+		let (r, w) = io::pipe().unwrap();
+		let mut conn = Connection {
+			writer: Box::new(w),
+			frames: mpsc::sync_channel(1).1,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::default(),
+		};
+		let request = Request::OpenWorkspace { path: "~".into() };
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
+		conn.send_guarded(&request, None, deadline).unwrap();
+		// The pipe holds one small frame; the read side sees a clean end
+		// once it is dropped.
+		drop(r);
+		assert_eq!(conn.recv(scaled(Duration::from_secs(1))).unwrap(), None);
+	}
+
+	/// Every received frame checks the call's absolute deadline, chunk
+	/// frames included: a worker may not stretch one call by dripping
+	/// chunks.
+	#[test]
+	fn exchange_holds_chunk_frames_to_the_absolute_deadline() {
+		let mut buf = Vec::new();
+		for i in 0..3 {
+			write_frame(
+				&mut buf,
+				&Response::Chunk {
+					data: format!("piece {i}"),
+				},
+			)
+			.unwrap();
+		}
+		let mut stream = SlowDuplex {
+			incoming: io::Cursor::new(buf),
+			pause: scaled(Duration::from_millis(200)),
+		};
+		let mut frames = 0;
+		let deadline = Instant::now() + scaled(Duration::from_millis(300));
+		let err =
+			exchange(&mut stream, None, deadline, &mut frames).unwrap_err();
+		assert!(matches!(err, RemoteError::TimedOut), "{err:?}");
 	}
 }
