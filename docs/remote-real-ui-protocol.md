@@ -151,6 +151,7 @@ cd '$W'
 pkill -f '$W/src/target/release/snip worker' 2>/dev/null
 for i in \$(seq 1 20); do pgrep -f '$W/src/target/release/snip worker' >/dev/null || break; sleep 0.5; done
 SNIP_CONFIG_DIR='$W/$cfg' SNIP_DEVICE_NAME=ubuntu-ui nohup '$W/src/target/release/snip' worker $WORKER_EXTRA $shares --listen 100.95.28.19:47899 > worker.log 2>&1 < /dev/null &
+echo \$! > '$W/worker.pid'
 for i in \$(seq 1 40); do grep -q 'pairing code' worker.log && break; grep -q rror worker.log && break; sleep 0.5; done
 cat worker.log
 SH
@@ -158,11 +159,12 @@ SH
 start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner" | tee "$RUN/worker-start-1.log"
 ```
 
-這個函式已經試跑過。有三個陷阱，不要改掉：
+這個函式已經試跑過。有四個陷阱，不要改掉：
 
 - 一定要有 `< /dev/null`，否則 ssh 會一直等背景的 worker，不會返回。
 - 要等舊的 worker 真的結束才啟動新的，否則會出現 `Address already in use`。
 - `pkill -f` 要放在 `bash -s` 的 stdin 裡執行。如果直接寫成 `ssh ubuntu 'pkill -f "snip worker"'`，pattern 會比對到執行它的那個 bash 自己，連 ssh 連線一起被殺掉（exit 255）。pattern 必須包含 `$W/src/target/release/snip`，不可寫成會比對到使用者服務 binary 的寬鬆字串（例如 `pkill snip`）。
+- start_worker 會把 worker 的 PID 寫進 `$W/worker.pid`，R37、G11 與第 6 節收尾都靠它停 worker；不要用 pkill 取代。
 
 輸出要有 `snip-sync worker listening on 100.95.28.19:47899`、`fingerprint XXXX-XXXX-XXXX-XXXX`、五行 `sharing …`，以及 `pairing code ABCD-EFGH (valid 10 minutes; restart for a new one)`。
 
