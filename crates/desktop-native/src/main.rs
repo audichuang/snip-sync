@@ -4495,14 +4495,14 @@ impl WorkbenchModel {
 						"[APP:PASTE_MAP_CANDIDATE: prefix={} idx={} path={}]",
 						choice.prefix,
 						idx,
-						path.display()
+						plan.shown(path)
 					);
 				}
 			}
 			app_log!(
 				"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
 				items_count,
-				plan.destination.display(),
+				plan.shown(&plan.destination),
 				plan.mapping_ready()
 			);
 		}
@@ -4928,13 +4928,13 @@ impl WorkbenchModel {
 /// Where `prefix` lands, as printed in `[APP:PASTE_MAPPED]`.
 fn prefix_target(plan: &PastePreviewPlan, prefix: &str, keep: bool) -> String {
 	if keep {
-		return plan.destination.display().to_string();
+		return plan.shown(&plan.destination);
 	}
 	plan.prefix_choices
 		.iter()
 		.find(|choice| choice.prefix == prefix)
 		.and_then(|choice| choice.destination.as_ref())
-		.map(|dest| dest.display().to_string())
+		.map(|dest| plan.shown(dest))
 		.unwrap_or_default()
 }
 
