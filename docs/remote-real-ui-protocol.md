@@ -365,16 +365,18 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 仍在 `gitws`。每格開始前寫 sentinel；oracle 在 Ubuntu 上執行，例如 `ssh ubuntu "cd '$W/gitws/alpha' && snip copy a.txt --stdout" | shasum -a 256`。
 
+**先弄清楚 App 送出的是什麼**（對照程式碼 `menu.rs` 的 `change_row_targets` 與 `project_targets`）：Changes 的列（檔案、資料夾、repo、群組標頭）複製的是 **git 變更匯出**，payload 路徑帶變更標籤（`// file: [MODIFIED] a.txt`），來源是 working/staged；repo 列與群組標頭只複製**那一個群組**的列。專案樹的選取複製的是**檔案模式**（無變更標籤），root 是選取所在的 repo（`alpha`），路徑以 alpha 為根。所以 oracle 有兩種形狀：變更匯出比對 `snip copy --working/--staged --stdout` 輸出裡的**對應區塊**（一個區塊 = 一行 `// file: …` 到下個區塊前，含檔尾空行）；檔案模式比對整份 payload。
+
 | ID | 操作 | oracle（在 `$W/gitws/alpha` 執行） |
 |---|---|---|
-| X01 | Changes 的 `a.txt`（未暫存）右鍵 →「複製」 | `snip copy --working` 裡只取 `a.txt` 那一項：改用 `snip copy a.txt --stdout` |
-| X02 | Changes 的 `staged.txt`（暫存列）右鍵 →「複製」 | `snip copy --staged --stdout`（只有 staged.txt） |
-| X03 | Changes 的 `dir` 資料夾列右鍵 →「複製」 | `snip copy dir/c.txt --stdout` |
-| X04 | Changes 的 alpha repo 列右鍵 →「複製」 | `snip copy --working --stdout` |
-| X05 | Changes 的 Unstaged 群組標頭右鍵 →「複製」 | 同 X04 的未暫存部分；`COPY_DONE: copied=` 等於群組裡的列數 |
-| X06 | 選 Changes 的 `new.txt`，按 Cmd+C | `snip copy new.txt --stdout` |
-| X07 | 專案樹 Cmd 點選 `alpha/a.txt` 與 `alpha/b.txt`，右鍵 →「複製」 | 在 `$W/gitws` 執行 `snip copy alpha/a.txt alpha/b.txt --stdout` |
-| X08 | 專案樹右鍵整個 `alpha` 資料夾 →「複製」 | 在 `$W/gitws` 執行 `snip copy alpha --stdout` |
+| X01 | Changes 的 `a.txt`（未暫存）右鍵 →「複製」 | `snip copy --working --stdout` 輸出裡 `// file: [MODIFIED] a.txt` 的那一個區塊（不是 `snip copy a.txt`：純檔案複製沒有變更標籤） |
+| X02 | Changes 的 `staged.txt`（暫存列）右鍵 →「複製」 | `snip copy --staged --stdout` 裡 `// file: [NEW] staged.txt` 的區塊（這份輸出只有它） |
+| X03 | Changes 的 `dir` 資料夾列右鍵 →「複製」 | `snip copy --working --stdout` 裡 `// file: [MODIFIED] dir/c.txt` 的區塊（資料夾列複製該 repo 該群組底下的所有變更，這裡只有一個） |
+| X04 | Changes 的 **Unstaged 群組裡的 alpha repo 列**右鍵 →「複製」 | repo 列只複製一個群組：`snip copy --working --stdout` 裡 alpha 的未暫存區塊（`[MODIFIED] a.txt`、`[MODIFIED] dir/c.txt`、`[NEW] new.txt`），**不含** `staged.txt` 的暫存區塊 |
+| X05 | Changes 的 Unstaged 群組標頭右鍵 →「複製」 | 同 X04 的未暫存區塊整份（gitws 只有 alpha 有變更）；`COPY_DONE: copied=` 等於群組裡的列數 |
+| X06 | 選 Changes 的 `new.txt`，按 Cmd+C | `snip copy --working --stdout` 裡 `// file: [NEW] new.txt` 的區塊 |
+| X07 | 專案樹展開 alpha，Cmd 點選 `a.txt` 與 `b.txt`，右鍵 →「複製」 | 在 `$W/gitws/alpha` 執行 `snip copy a.txt b.txt --stdout`（選取以 alpha 為根，不是 `alpha/a.txt`） |
+| X08 | 專案樹展開 alpha，右鍵 `dir` 子資料夾 →「複製」 | 在 `$W/gitws/alpha` 執行 `snip copy dir --stdout`（整個 alpha 是 repo 列，選單只有「複製路徑」，選不得，改用子資料夾） |
 | X09 | Log 選 alpha 的 HEAD commit，在變更檔案清單對 `b.txt` 右鍵 →「複製」 | `snip copy --commit HEAD --stdout` 裡的 `b.txt`；內容是 commit 時的 `commit 2 b`，不是工作樹 |
 | X10 | Log 選 alpha 的兩個 commit，點複製 commit | `snip copy --commits -n 2 --stdout`；`pbpaste` 第一行是 commit 模式的標記 |
 
@@ -397,7 +399,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | P09 | `"$SNIP" copy --repo "$RUN/commit-local" --commits -n 1 --stdout \| pbcopy`；打開一份新的 `commit-dst` 副本（`ssh ubuntu "cd '$W/pastews' && rm -rf commit-dst2 && git clone -q commit-src commit-dst2 && git -C commit-dst2 reset -q --hard HEAD~2"`），Cmd+V，`btn-apply` | 本機的 commit 重播到遠端：`git -C commit-dst2 log -1 --format=%s` 是 `from mac`，`mac.txt` 內容是 `from mac` |
 | P10 | 遠端貼回本機：在 `edge` 對 `src` 資料夾右鍵 →「複製」；打開本機 `local-ws`，Cmd+V，`btn-apply` | `local-ws/src/main.rs` 與 `local-ws/src/deep/中文 有空白.txt` 的 SHA-256 等於 worker 上的原檔 |
 | P11 | `(cd "$RUN/paste-big" && "$SNIP" copy . --stdout) > "$RUN/p-big.txt"`，命令成功才 `pbcopy < "$RUN/p-big.txt"`（不要直接管線進 pbcopy：複製失敗也會蓋掉剪貼簿）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `PASTE_DONE`；30 個檔案與本機來源相同 |
-| P12 | 遠端到遠端：在 `gitws` 複製 alpha 資料夾（X08）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `plain/alpha/*` 與 worker 上的 `gitws/alpha` 工作樹檔案相同（不含 `.git`） |
+| P12 | 遠端到遠端：在 `gitws` 複製 alpha 的 `dir` 資料夾（X08）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `plain/dir/` 下的檔案與獨立 CLI 往返的結果相同（在 Ubuntu 上 `cd '$W/gitws/alpha' && snip copy dir --stdout`，再 `snip paste --apply --stdin` 貼進 oracle 副本；正規化照 spec 第 1 節） |
 
 ### 4.8 拒絕的操作（N01–N02）
 
