@@ -29,7 +29,8 @@ pub struct Chrome {
 	/// Speed search text typed into the Project / Changes list.
 	pub speed: String,
 	/// Collapsed Changes groups (`change-header:<id>`): groups span the
-	/// whole workspace, so the key is the group alone.
+	/// whole workspace, so the key is the group alone. The unreadable-repos
+	/// node starts collapsed, so for it a listed id means opened.
 	pub collapsed_groups: Vec<&'static str>,
 	/// Expanded (group, repo root) nodes of the Changes tool window: repo
 	/// rows start collapsed, and opening a repo expands it in every group.
@@ -999,7 +1000,8 @@ impl WorkbenchModel {
 	}
 
 	pub(crate) fn group_collapsed(&self, group: &str) -> bool {
-		self.chrome.collapsed_groups.contains(&group)
+		let listed = self.chrome.collapsed_groups.contains(&group);
+		listed != (group == crate::ui::UNREADABLE)
 	}
 
 	pub(crate) fn repo_changes_collapsed(
@@ -1022,13 +1024,12 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		let c = &mut self.chrome.collapsed_groups;
-		let collapsed = if let Some(i) = c.iter().position(|g| *g == group) {
+		if let Some(i) = c.iter().position(|g| *g == group) {
 			c.remove(i);
-			false
 		} else {
 			c.push(group);
-			true
-		};
+		}
+		let collapsed = self.group_collapsed(group);
 		app_log!("[APP:GROUP_COLLAPSED: {group} collapsed={collapsed}]");
 		cx.notify();
 	}

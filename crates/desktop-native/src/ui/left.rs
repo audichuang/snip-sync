@@ -276,6 +276,11 @@ impl WorkbenchModel {
 								ChangeItemRow::Note { slot } => {
 									out.push(this.change_note_row(slot));
 								}
+								ChangeItemRow::Unreadable { count } => {
+									out.push(this.change_unreadable_row(
+										count, row_idx, cx,
+									));
+								}
 								ChangeItemRow::Header {
 									label,
 									count,

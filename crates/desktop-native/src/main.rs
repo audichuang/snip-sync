@@ -358,6 +358,9 @@ pub enum ChangeRepoState {
 	Failed(String),
 }
 
+/// Failed repos the log's banner names before "…".
+pub(crate) const FAILED_FEEDS_NAMED: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangesEmpty {
 	NoWorkspace,
@@ -1781,25 +1784,40 @@ impl WorkbenchModel {
 		}
 	}
 
-	pub(crate) fn failed_feeds_msg(&self) -> Option<Msg> {
+	/// Repos of a merged log that failed while others loaded.
+	pub(crate) fn failed_feed_names(&self) -> Vec<String> {
 		if self.log_feeds.len() <= 1 {
-			return None;
+			return Vec::new();
 		}
-		let failed_names: Vec<String> = self
+		let failed: Vec<String> = self
 			.log_feeds
 			.iter()
 			.filter(|f| f.failed)
 			.map(|f| f.name.clone())
 			.collect();
-		if !failed_names.is_empty() && failed_names.len() < self.log_feeds.len()
-		{
-			Some(Msg::new(
-				"log_failed_feeds",
-				[failed_names.len().to_string(), failed_names.join(", ")],
-			))
+		if failed.len() < self.log_feeds.len() {
+			failed
 		} else {
-			None
+			Vec::new()
 		}
+	}
+
+	/// The log's banner over those repos: the count and the first
+	/// [`FAILED_FEEDS_NAMED`] names; the banner's tooltip lists them all.
+	pub(crate) fn failed_feeds_msg(&self) -> Option<Msg> {
+		let failed = self.failed_feed_names();
+		if failed.is_empty() {
+			return None;
+		}
+		let mut named =
+			failed[..failed.len().min(FAILED_FEEDS_NAMED)].join(", ");
+		if failed.len() > FAILED_FEEDS_NAMED {
+			named.push_str(", …");
+		}
+		Some(Msg::new(
+			"log_failed_feeds",
+			[failed.len().to_string(), named],
+		))
 	}
 
 	pub(crate) fn log_empty_state(&self) -> Option<LogEmpty> {
@@ -11215,6 +11233,26 @@ mod tests {
 				"1 repository(ies) could not be read: r2"
 			);
 
+			// Many failed repos: the banner names two, the tooltip all.
+			model.update(cx, |m, _| {
+				for name in ["r3", "r4"] {
+					m.log_feeds.push(crate::multi_log::Feed {
+						name: name.into(),
+						failed: true,
+						..Default::default()
+					});
+				}
+			});
+			let (msg, names) = model.read_with(cx, |m, _| {
+				(m.failed_feeds_msg(), m.failed_feed_names())
+			});
+			assert_eq!(
+				msg.map(|m| m.render(crate::i18n::Locale::ZhTw)),
+				Some("3 個儲存庫無法讀取：r2, r3, …".to_string())
+			);
+			assert_eq!(names, ["r2", "r3", "r4"]);
+			model.update(cx, |m, _| m.log_feeds.truncate(2));
+
 			// All feeds failed -> Failed
 			model.update(cx, |m, _| {
 				m.log_feeds[0].failed = true;
@@ -13027,6 +13065,7 @@ mod tests {
 				ui::ChangeItemRow::Note { slot } => {
 					format!("N:{}", slots[*slot].name)
 				}
+				ui::ChangeItemRow::Unreadable { count } => format!("U:{count}"),
 				ui::ChangeItemRow::Dir {
 					slot,
 					name,
@@ -13135,6 +13174,46 @@ mod tests {
 		assert_eq!(got[0], "N:c");
 		assert_eq!(got[3..6], ["R:staged:b:1", "N:b", "F2:b:s.txt"]);
 		assert_eq!(got.iter().filter(|r| *r == "N:b").count(), 2);
+	}
+
+	#[test]
+	fn change_rows_fold_many_unreadable_repos_into_one_node() {
+		use std::path::Path;
+		let (mut slots, mut files) = three_repos();
+		for name in ["d", "e"] {
+			slot_insert(
+				&mut slots,
+				&mut files,
+				&Path::new("/w").join(name),
+				name,
+			);
+		}
+		for slot in [2, 3, 4] {
+			slots[slot].state = ChangeRepoState::Failed("boom".into());
+		}
+		// Three unreadable repos: one node after the changes, collapsed
+		// until opened, then one note per repo under it.
+		let folded = |g: &str| g == ui::UNREADABLE;
+		let rows =
+			ui::change_rows(&slots, &files, folded, |_, _| true, "", &FLAT);
+		let got = shape(&slots, &files, &rows);
+		assert_eq!(got[0], "G:staged:2");
+		assert_eq!(got.last().map(String::as_str), Some("U:3"));
+		assert!(!got.iter().any(|r| r.starts_with("N:")), "{got:?}");
+		let rows =
+			ui::change_rows(&slots, &files, |_| false, |_, _| true, "", &FLAT);
+		let got = shape(&slots, &files, &rows);
+		assert_eq!(got[got.len() - 4..], ["U:3", "N:c", "N:d", "N:e"]);
+
+		// One unreadable repo keeps its note at the top, with no node.
+		for slot in [3, 4] {
+			slots[slot].state = ChangeRepoState::Loaded;
+		}
+		let rows =
+			ui::change_rows(&slots, &files, folded, |_, _| true, "", &FLAT);
+		let got = shape(&slots, &files, &rows);
+		assert_eq!(got[0], "N:c");
+		assert!(!got.iter().any(|r| r.starts_with("U:")), "{got:?}");
 	}
 
 	#[test]
