@@ -544,8 +544,7 @@ fn a_remote_commit_replay_makes_the_commits_a_local_replay_makes() {
 }
 
 #[test]
-fn a_commit_replay_refuses_a_changed_repo_and_follows_a_repo_above_the_workspace(
-) {
+fn a_commit_replay_refuses_a_changed_repo_and_is_scoped_to_the_opened_folder() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let ws = tmp.path().join("ws");
@@ -579,18 +578,32 @@ fn a_commit_replay_refuses_a_changed_repo_and_follows_a_repo_above_the_workspace
 	);
 	assert_eq!(git_out(&dst, &["rev-list", "--count", "HEAD"]), "1");
 
-	// A workspace inside a repository replays onto that repository, as a
-	// local replay from a subfolder does.
+	// A workspace inside a repository is the replay's write scope: a
+	// commit whose targets reach outside the opened folder is refused,
+	// and nothing is written there. Replaying the whole repository means
+	// opening the repository root.
 	let outer = tmp.path().join("outer");
 	init_repo(&outer);
 	fs::create_dir_all(outer.join("sub")).unwrap();
 	let (client2, sub_id) = open(&w, &outer.join("sub"));
-	let preview = client2
-		.replay_plan(&sub_id, "", &text, payload, None)
+	let Err(RemoteError::Refused { message, .. }) =
+		client2.replay_plan(&sub_id, "", &text, payload.clone(), None)
+	else {
+		panic!("expected a refusal, got a preview");
+	};
+	assert!(message.contains("outside the opened folder"), "{message}");
+	assert!(
+		!outer.join("a.txt").exists(),
+		"nothing is written outside the opened folder"
+	);
+
+	let (client3, outer_id) = open(&w, &outer);
+	let preview = client3
+		.replay_plan(&outer_id, "", &text, payload, None)
 		.unwrap();
 	assert_eq!(preview.destination(), dunce::canonicalize(&outer).unwrap());
-	let result = client2
-		.replay_apply(&sub_id, "", &text, &preview, false, None)
+	let result = client3
+		.replay_apply(&outer_id, "", &text, &preview, false, None)
 		.unwrap()
 		.unwrap();
 	assert_eq!(result.created.len(), 1, "{result:?}");

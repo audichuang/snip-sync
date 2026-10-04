@@ -52,6 +52,9 @@ fn transfer_refusal(err: TransferError, cancel: &CancelToken) -> Refusal {
 	let code = match &err {
 		TransferError::StaleDestination { .. } => ErrorCode::Stale,
 		TransferError::TargetCollision { .. } => ErrorCode::Collision,
+		TransferError::Commit(
+			snip_core::commits::CommitError::OutsideScope { .. },
+		) => ErrorCode::Forbidden,
 		TransferError::Git(_) if cancel.is_cancelled() => ErrorCode::Cancelled,
 		TransferError::Git(GitError::Cancelled { .. }) => ErrorCode::Cancelled,
 		TransferError::Git(GitError::Timeout { .. }) => ErrorCode::Timeout,
@@ -251,16 +254,21 @@ pub(crate) fn import_apply(
 
 /// The repository a commit payload replays onto: the top folder of the
 /// repository at `dest`, as a local replay finds it (it may lie above the
-/// workspace, as local Git views follow it).
+/// workspace, as local Git views follow it), plus the write scope: the
+/// opened folder the master named. Replay targets outside the scope are
+/// refused by the shared engine, so replaying the whole repository means
+/// opening the repository root.
 fn replay_root(
 	root: &SharedRoot,
 	dest: &str,
 	cancel: &CancelToken,
-) -> Result<PathBuf, Refusal> {
-	let dir = destination(root, dest)?;
-	let git = Git::open_with(&dir, &options(cancel))
+) -> Result<(PathBuf, PathBuf), Refusal> {
+	let scope = destination(root, dest)?;
+	let git = Git::open_with(&scope, &options(cancel))
 		.map_err(|e| transfer_refusal(TransferError::Git(e), cancel))?;
-	dunce::canonicalize(git.root()).map_err(|e| Box::new(io_error(e)))
+	let top =
+		dunce::canonicalize(git.root()).map_err(|e| Box::new(io_error(e)))?;
+	Ok((top, scope))
 }
 
 fn payload(text: &str) -> Result<commits::CommitsPayload, Refusal> {
@@ -276,11 +284,15 @@ pub(crate) fn replay_plan(
 	cancel: &CancelToken,
 ) -> Response {
 	let run = || -> Result<Response, Refusal> {
-		let top = replay_root(root, dest, cancel)?;
+		let (top, scope) = replay_root(root, dest, cancel)?;
 		let payload = payload(text)?;
-		let preview =
-			CommitReplayPreview::capture_with(&top, &payload, &options(cancel))
-				.map_err(|e| transfer_refusal(e, cancel))?;
+		let preview = CommitReplayPreview::capture_in(
+			&top,
+			&scope,
+			&payload,
+			&options(cancel),
+		)
+		.map_err(|e| transfer_refusal(e, cancel))?;
 		Ok(Response::ReplayPlanned(ReplayExpect::of(&preview)))
 	};
 	run().unwrap_or_else(|resp| *resp)
@@ -288,7 +300,8 @@ pub(crate) fn replay_plan(
 
 /// Answers [`crate::proto::Request::ReplayApply`]: the preview put back
 /// together re-plans the payload and re-reads every recorded path under the
-/// replay lock, exactly as a local Apply.
+/// replay lock, exactly as a local Apply. The scope is derived from `dest`
+/// again, so a master cannot widen it by sending a preview of its own.
 pub(crate) fn replay_apply(
 	root: &SharedRoot,
 	dest: &str,
@@ -298,7 +311,7 @@ pub(crate) fn replay_apply(
 	cancel: &CancelToken,
 ) -> Response {
 	let run = || -> Result<Response, Refusal> {
-		let top = replay_root(root, dest, cancel)?;
+		let (top, scope) = replay_root(root, dest, cancel)?;
 		if expect.destination != top || expect.plan.root != top {
 			return Err(stale(
 				&top,
@@ -307,8 +320,9 @@ pub(crate) fn replay_apply(
 		}
 		check_snapshot(&top, &expect.freshness)?;
 		let payload = payload(text)?;
-		let preview = CommitReplayPreview::from_parts(
+		let preview = CommitReplayPreview::from_parts_scoped(
 			expect.destination,
+			scope,
 			payload,
 			expect.plan,
 			expect.freshness,

@@ -19,8 +19,12 @@ use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
 
 /// Replay replaces a symlink at the target instead of writing through it,
 /// so only the folder it lands in decides whether it is inside Git.
-fn unsafe_replay_target(root: &Path, abs: &Path) -> bool {
-	escapes_all_roots(&[root], abs) || abs.parent().is_none_or(lands_in_git_dir)
+/// True when a write or delete at `abs` leaves the replay's write `scope`
+/// (the folder the user pasted into, at most the repository root), or
+/// lands in a Git directory, or where that cannot be established.
+fn unsafe_replay_target(scope: &Path, abs: &Path) -> bool {
+	escapes_all_roots(&[scope], abs)
+		|| abs.parent().is_none_or(lands_in_git_dir)
 }
 use crate::workspace::{lock_heavy, RepoIdentity};
 
@@ -47,6 +51,11 @@ pub enum CommitError {
 	NotCommitPayload,
 	#[error("invalid commits payload: {0}")]
 	InvalidPayload(String),
+	/// The replay's write scope is the folder the user pasted into; a
+	/// target outside it is refused, and replaying the whole repository
+	/// means opening the repository root.
+	#[error("{path} lies outside the opened folder ({scope}); open the repository root to replay the whole repository")]
+	OutsideScope { path: String, scope: PathBuf },
 	/// The clipboard document (marker, newline, JSON) would exceed the cap.
 	/// `actual` is the size already measured, or a lower bound when a blob
 	/// was refused from its header before the body was kept.
@@ -1658,6 +1667,20 @@ pub fn plan_commit_replay_with(
 	payload: &CommitsPayload,
 	opts: &RunOptions,
 ) -> Result<CommitReplayPlan, CommitError> {
+	plan_commit_replay_in(git, git.root(), payload, opts)
+}
+
+/// [`plan_commit_replay_with`] with the replay's write scope: only
+/// `scope`'s targets may be written or deleted. A whole-repository replay
+/// passes the repository root. A write or delete (a rename's old path
+/// included) outside `scope` is refused before anything is planned as
+/// writable.
+pub fn plan_commit_replay_in(
+	git: &Git,
+	scope: &Path,
+	payload: &CommitsPayload,
+	opts: &RunOptions,
+) -> Result<CommitReplayPlan, CommitError> {
 	refuse_if_cancelled(opts, "replay-plan")?;
 	let root = git.root().to_path_buf();
 	let mut commits = Vec::new();
@@ -1685,7 +1708,21 @@ pub fn plan_commit_replay_with(
 		commits.push(plan);
 	}
 	refuse_if_cancelled(opts, "replay-plan")?;
-	Ok(CommitReplayPlan { commits, root })
+	let plan = CommitReplayPlan { commits, root };
+	for commit in &plan.commits {
+		for f in &commit.files {
+			for abs in f.old_absolute_path.iter().chain(f.absolute_path.iter())
+			{
+				if unsafe_replay_target(scope, abs) {
+					return Err(CommitError::OutsideScope {
+						path: f.path.clone(),
+						scope: scope.to_path_buf(),
+					});
+				}
+			}
+		}
+	}
+	Ok(plan)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1710,6 +1747,8 @@ pub struct ReplayResult {
 
 pub(crate) struct ReplaySession {
 	no_hooks: NoHooks,
+	/// The write scope: every target is held to it, as the preview was.
+	scope: PathBuf,
 	_guard: crate::workspace::HeavyGuard,
 }
 
@@ -1718,6 +1757,16 @@ impl ReplaySession {
 	/// the old replay returned for that failure (failure at index 0, or none for an empty payload).
 	pub(crate) fn begin(
 		git: &Git,
+		payload: &CommitsPayload,
+		opts: &RunOptions,
+	) -> Result<Self, ReplayResult> {
+		Self::begin_in(git, git.root(), payload, opts)
+	}
+
+	/// [`Self::begin`] with the replay's write scope ([`plan_commit_replay_in`]).
+	pub(crate) fn begin_in(
+		git: &Git,
+		scope: &Path,
 		payload: &CommitsPayload,
 		opts: &RunOptions,
 	) -> Result<Self, ReplayResult> {
@@ -1754,7 +1803,11 @@ impl ReplaySession {
 				return Err(result);
 			}
 		};
-		Ok(Self { no_hooks, _guard })
+		Ok(Self {
+			no_hooks,
+			scope: scope.to_path_buf(),
+			_guard,
+		})
 	}
 
 	/// Replays every commit; never polls cancellation.
@@ -1765,7 +1818,8 @@ impl ReplaySession {
 	) -> ReplayResult {
 		let mut result = ReplayResult::default();
 		for (index, commit) in payload.commits.iter().enumerate() {
-			match replay_commit(git, commit, &self.no_hooks.config) {
+			match replay_commit(git, &self.scope, commit, &self.no_hooks.config)
+			{
 				Ok(sha) => result.created.push(sha),
 				Err(err) => {
 					result.failure = Some(ReplayFailure {
@@ -1843,6 +1897,7 @@ impl From<String> for ReplayCommitError {
 
 fn replay_commit(
 	git: &Git,
+	scope: &Path,
 	commit: &CommitRecord,
 	no_hooks: &str,
 ) -> Result<String, ReplayCommitError> {
@@ -1877,7 +1932,7 @@ fn replay_commit(
 		else {
 			continue;
 		};
-		if unsafe_replay_target(root, abs) {
+		if unsafe_replay_target(scope, abs) {
 			return Err(format!("{}: unsafe path", f.path).into());
 		}
 		if !is_symlink(abs) && must_not_overwrite(abs) {
@@ -1902,7 +1957,7 @@ fn replay_commit(
 			.then(|| f.absolute_path.as_deref().map(|a| (a, f.path.as_str())))
 			.flatten();
 		for (abs, rel) in old.into_iter().chain(del) {
-			delete(root, abs, rel)?;
+			delete(scope, root, abs, rel)?;
 			deleted.push(rel);
 		}
 	}
@@ -1990,9 +2045,16 @@ fn replay_commit(
 }
 
 /// Removes `abs`; already absent is fine. Parent directories left empty go
-/// too (as git checkout does), so a later write may put a file there.
-fn delete(root: &Path, abs: &Path, rel: &str) -> Result<(), String> {
-	if unsafe_replay_target(root, abs) {
+/// too (as git checkout does), so a later write may put a file there. The
+/// safety check is held to the replay's write `scope`; the upward walk is
+/// bounded by the resolved repository `root`, never above it.
+fn delete(
+	scope: &Path,
+	root: &Path,
+	abs: &Path,
+	rel: &str,
+) -> Result<(), String> {
+	if unsafe_replay_target(scope, abs) {
 		return Err(format!("{rel}: unsafe path"));
 	}
 	match fs::remove_file(abs) {
@@ -3707,6 +3769,65 @@ mod tests {
 			fs::read_to_string(repo.path().join("alias.txt")).unwrap(),
 			config
 		);
+	}
+
+	/// The replay's write scope is the folder the user pasted into, not the
+	/// whole repository: opening a subfolder refuses targets outside it,
+	/// and only the repository root replays the whole repo.
+	#[test]
+	fn a_replay_scoped_to_a_subfolder_refuses_targets_outside_it() {
+		let repo = Repo::new("main");
+		repo.write("keep.txt", b"keep\n");
+		repo.commit("init", "2020-01-01T00:00:00+00:00");
+		fs::create_dir_all(repo.path().join("sub")).unwrap();
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "both\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files: vec![
+					CommitFile {
+						path: "outside.txt".into(),
+						old_path: None,
+						change: FileChange::Added,
+						content: Some("out\n".into()),
+						not_copied: None,
+					},
+					CommitFile {
+						path: "sub/inside.txt".into(),
+						old_path: None,
+						change: FileChange::Added,
+						content: Some("in\n".into()),
+						not_copied: None,
+					},
+				],
+			}],
+		};
+		// Scoped to the subfolder: the root-level target is refused before
+		// anything is written.
+		let err = plan_commit_replay_in(
+			&repo.open(),
+			&repo.path().join("sub"),
+			&payload,
+			&RunOptions::default(),
+		)
+		.unwrap_err();
+		assert!(matches!(
+			err,
+			CommitError::OutsideScope { ref path, .. } if path == "outside.txt"
+		));
+		assert!(!repo.path().join("outside.txt").exists());
+
+		// Scoped to the repository root: the whole repo may be replayed.
+		let plan = plan_commit_replay_in(
+			&repo.open(),
+			&repo.path(),
+			&payload,
+			&RunOptions::default(),
+		)
+		.unwrap();
+		assert_eq!(plan.commits[0].files.len(), 2);
 	}
 
 	/// A bare repository kept inside the worktree is a Git directory: a

@@ -3131,6 +3131,10 @@ fn select_exact_chain(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitReplayPreview {
 	destination: PathBuf,
+	/// The write scope: the folder the user pasted into, at most the
+	/// repository root. Targets outside it are refused, so a whole-repo
+	/// replay requires opening the repo root.
+	scope: PathBuf,
 	payload: CommitsPayload,
 	replay: commits::CommitReplayPlan,
 	freshness: DestinationFreshnessSnapshot,
@@ -3139,6 +3143,11 @@ pub struct CommitReplayPreview {
 impl CommitReplayPreview {
 	pub fn destination(&self) -> &Path {
 		&self.destination
+	}
+
+	/// The replay's write scope ([`Self::capture_in`]).
+	pub fn scope(&self) -> &Path {
+		&self.scope
 	}
 
 	pub fn payload(&self) -> &CommitsPayload {
@@ -3159,6 +3168,7 @@ impl CommitReplayPreview {
 	pub fn retained_heap_bytes(&self) -> usize {
 		self.destination
 			.capacity()
+			.saturating_add(self.scope.capacity())
 			.saturating_add(self.payload.retained_heap_bytes())
 			.saturating_add(self.replay.retained_heap_bytes())
 			.saturating_add(self.freshness.fresh_capture_heap_bytes())
@@ -3171,25 +3181,41 @@ impl CommitReplayPreview {
 		Self::capture_with(dest, payload, &RunOptions::default())
 	}
 
-	/// [`Self::capture`] with the caller's runner options.
+	/// [`Self::capture`] with the caller's runner options. The write scope
+	/// is the repository root: the destination's whole repository may be
+	/// replayed. Nothing is written.
+	pub fn capture_with(
+		dest: &Path,
+		payload: &CommitsPayload,
+		opts: &RunOptions,
+	) -> Result<Self, TransferError> {
+		Self::capture_in(dest, dest, payload, opts)
+	}
+
+	/// [`Self::capture_with`] with the replay's write scope: only
+	/// `scope`'s targets may be written or deleted. Both front ends pass
+	/// the folder the user pasted into, so a subfolder paste refuses
+	/// targets outside it; a whole-repository replay passes the
+	/// repository root.
 	///
 	/// Opens the destination with `Git::open_with`. Eligibility planning polls
 	/// `opts` between files, then HEAD, the symbolic ref, the index and each
 	/// target hash use the same options. Nothing is written.
-	pub fn capture_with(
+	pub fn capture_in(
 		dest: &Path,
+		scope: &Path,
 		payload: &CommitsPayload,
 		opts: &RunOptions,
 	) -> Result<Self, TransferError> {
 		cancelled_err(opts, "replay-preview")?;
 		let git = Git::open_with(dest, opts)?;
 		let root = git.root().to_path_buf();
-		let replay = replay_plan(&git, payload, opts)?;
+		let replay = replay_plan_in(&git, scope, payload, opts)?;
 		let freshness = capture_replay_freshness(&root, &replay, opts)?;
 		// Plan first, then the snapshot, then plan again. A change between
 		// those reads makes the preview unusable instead of storing a mix.
 		cancelled_err(opts, "replay-preview")?;
-		let again = replay_plan(&git, payload, opts)?;
+		let again = replay_plan_in(&git, scope, payload, opts)?;
 		if again != replay {
 			return Err(TransferError::StaleDestination {
 				root: root.clone(),
@@ -3201,6 +3227,7 @@ impl CommitReplayPreview {
 		revalidate_replay_freshness(&freshness, opts)?;
 		let preview = Self {
 			destination: root,
+			scope: scope.to_path_buf(),
 			payload: payload.clone(),
 			replay,
 			freshness,
@@ -3214,15 +3241,30 @@ impl CommitReplayPreview {
 	/// A preview captured elsewhere (a remote worker) put back together with
 	/// its payload. Nothing here is trusted: [`Self::apply_with`] and
 	/// [`Self::revalidate_with`] re-plan the payload and re-read every
-	/// recorded path before anything is written.
+	/// recorded path before anything is written. The scope is the
+	/// destination; callers that captured with a narrower scope restate it
+	/// with [`Self::from_parts_scoped`].
 	pub fn from_parts(
 		destination: PathBuf,
 		payload: CommitsPayload,
 		replay: commits::CommitReplayPlan,
 		freshness: DestinationFreshnessSnapshot,
 	) -> Self {
+		let scope = destination.clone();
+		Self::from_parts_scoped(destination, scope, payload, replay, freshness)
+	}
+
+	/// [`Self::from_parts`] with the replay's write scope restored.
+	pub fn from_parts_scoped(
+		destination: PathBuf,
+		scope: PathBuf,
+		payload: CommitsPayload,
+		replay: commits::CommitReplayPlan,
+		freshness: DestinationFreshnessSnapshot,
+	) -> Self {
 		Self {
 			destination,
+			scope,
 			payload,
 			replay,
 			freshness,
@@ -3248,14 +3290,18 @@ impl CommitReplayPreview {
 	) -> Result<commits::ReplayResult, TransferError> {
 		cancelled_err(opts, "replay-apply")?;
 		let git = Git::open_with(&self.destination, opts)?;
-		let session =
-			match commits::ReplaySession::begin(&git, &self.payload, opts) {
-				Ok(s) => s,
-				Err(refused) => {
-					cancelled_err(opts, "replay-apply")?;
-					return Ok(refused);
-				}
-			};
+		let session = match commits::ReplaySession::begin_in(
+			&git,
+			&self.scope,
+			&self.payload,
+			opts,
+		) {
+			Ok(s) => s,
+			Err(refused) => {
+				cancelled_err(opts, "replay-apply")?;
+				return Ok(refused);
+			}
+		};
 		self.revalidate_with(opts)?; // under the heavy lock, right before the first write
 		cancelled_err(opts, "replay-apply")?;
 		Ok(session.run(&git, &self.payload))
@@ -3280,7 +3326,7 @@ impl CommitReplayPreview {
 		cancelled_err(opts, "replay-preview")?;
 		revalidate_replay_freshness(&self.freshness, opts)?;
 		let git = Git::open_with(&self.destination, opts)?;
-		let now = replay_plan(&git, &self.payload, opts)?;
+		let now = replay_plan_in(&git, &self.scope, &self.payload, opts)?;
 		if now != self.replay {
 			return Err(TransferError::StaleDestination {
 				root: self.destination.clone(),
@@ -3299,12 +3345,21 @@ fn replay_plan(
 	payload: &CommitsPayload,
 	opts: &RunOptions,
 ) -> Result<commits::CommitReplayPlan, TransferError> {
-	commits::plan_commit_replay_with(git, payload, opts).map_err(
-		|err| match err {
+	replay_plan_in(git, git.root(), payload, opts)
+}
+
+fn replay_plan_in(
+	git: &Git,
+	scope: &Path,
+	payload: &CommitsPayload,
+	opts: &RunOptions,
+) -> Result<commits::CommitReplayPlan, TransferError> {
+	commits::plan_commit_replay_in(git, scope, payload, opts).map_err(|err| {
+		match err {
 			CommitError::Git(git_err) => TransferError::Git(git_err),
 			other => TransferError::Commit(other),
-		},
-	)
+		}
+	})
 }
 
 /// Repo freshness plus every path the replay plan named. Symlinks are hashed

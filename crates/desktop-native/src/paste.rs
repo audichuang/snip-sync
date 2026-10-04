@@ -1191,7 +1191,9 @@ impl PastePreviewPlan {
 		let payload = commits::parse_commit_payload(raw_text)
 			.map_err(|e| Msg::new("paste_err_plan", [e.to_string()]))?;
 		let preview = match &remote {
-			None => CommitReplayPreview::capture_with(dest, &payload, opts)
+			// The write scope is the folder the user pasted into: the
+			// worker holds the replay to it the same way.
+			None => CommitReplayPreview::capture_in(dest, dest, &payload, opts)
 				.map_err(|e| destination_error(dest, &e))?,
 			Some(r) => r
 				.client()

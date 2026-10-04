@@ -927,8 +927,15 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 		commits::parse_commit_payload(text).map_err(|e| e.to_string())?;
 
 	let preview = match at {
-		PasteAt::Local(repo) => CommitReplayPreview::capture(repo, &payload)
-			.map_err(format_transfer_error)?,
+		// The write scope is the folder `--repo` names: targets outside it
+		// are refused, and a whole-repo replay opens the repo root.
+		PasteAt::Local(repo) => CommitReplayPreview::capture_in(
+			repo,
+			repo,
+			&payload,
+			&RunOptions::default(),
+		)
+		.map_err(format_transfer_error)?,
 		PasteAt::Remote {
 			client,
 			workspace,
