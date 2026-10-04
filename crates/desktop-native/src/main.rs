@@ -1198,9 +1198,9 @@ pub struct WorkbenchModel {
 	/// A user Refresh also reloads the open repo once the rescan ends.
 	refresh_reload: bool,
 	manual_repos: Vec<RepoEntry>,
-	tree_queue: VecDeque<TreeIo>,
+	pub(crate) tree_queue: VecDeque<TreeIo>,
 	tree_worker: u64,
-	tree_worker_alive: bool,
+	pub(crate) tree_worker_alive: bool,
 	restore_expanded: Vec<String>,
 	/// Workspace-tree folders to reopen once a Refresh rebuilds it.
 	restore_ws_expanded: Vec<String>,
@@ -1687,6 +1687,11 @@ impl WorkbenchModel {
 	pub fn preview_root(&self) -> Option<PathBuf> {
 		if self.preview.is_none() && self.preview_error.is_some() {
 			if let Some(root) = &self.preview_error_root {
+				return Some(root.clone());
+			}
+		}
+		if self.preview.is_none() && self.selected_commit.is_some() {
+			if let Some(root) = &self.log_commit_root {
 				return Some(root.clone());
 			}
 		}
@@ -7026,6 +7031,62 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn commit_preview_error_crumb_names_commit_repo_not_open_repo(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let alpha = tmp.path().join("alpha");
+			let beta = tmp.path().join("beta");
+			fs::create_dir_all(&alpha).unwrap();
+			fs::create_dir_all(&beta).unwrap();
+			crate::paste::tests::git_init(&alpha);
+
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(Some(alpha), None, "normal".into(), cx)
+			});
+			settle(cx);
+
+			let alpha_root = model
+				.read_with(cx, |m, _| m.repo_root().expect("open repo root"));
+			assert_ne!(alpha_root, beta);
+
+			model.update(cx, |m, _| {
+				m.selected_commit = Some("1234567890abcdef".to_string());
+				m.log_commit_root = Some(beta.clone());
+				m.show_preview_error(crate::i18n::Msg::new(
+					"error_history",
+					[String::from("worker stopped")],
+				));
+			});
+
+			model.read_with(cx, |m, _| {
+				assert!(m.preview.is_none());
+				assert!(m.preview_error.is_some());
+				assert_eq!(m.preview_error_root, None);
+				assert_eq!(m.preview_root(), Some(beta.clone()));
+			});
+
+			let gamma = tmp.path().join("gamma");
+			model.update(cx, |m, _| {
+				m.preview_error_root = Some(gamma.clone());
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.preview_root(), Some(gamma));
+			});
+			model.update(cx, |m, _| {
+				m.preview_error_root = None;
+			});
+
+			model.update(cx, |m, _| {
+				m.selected_commit = None;
+			});
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.preview_root(), Some(alpha_root));
+			});
+		}
+
+		#[gpui::test]
 		fn no_workspace_empty_state_is_no_workspace_not_scanning(
 			cx: &mut TestAppContext,
 		) {
@@ -8672,6 +8733,80 @@ mod tests {
 				let p = m.preview.as_ref().expect("preview loaded");
 				assert_eq!(p.text.as_ref(), "hello\n");
 				assert_eq!(m.selected_file.as_deref(), Some("file.txt"));
+			});
+		}
+
+		#[gpui::test]
+		fn remote_scan_failure_refresh_submits_only_one_root_listing(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&shared).unwrap();
+			fs::write(shared.join("file.txt"), "hello\n").unwrap();
+			let _r = repo(&shared, "repo", &[]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "ancient".into(),
+					trust_file: None,
+					max_protocol: Some(1),
+				},
+			);
+
+			// Let initial open finish: ws_tree is loaded with top-level entries.
+			let mut initial_loaded = false;
+			for _ in 0..20 {
+				settle(cx);
+				initial_loaded = model.read_with(cx, |m, _| {
+					m.ws_tree.as_ref().is_some_and(|t| {
+						t.is_loaded
+							&& t.children.iter().any(|c| c.name == "file.txt")
+					})
+				});
+				if initial_loaded {
+					break;
+				}
+			}
+			assert!(initial_loaded, "initial open must load ws_tree");
+
+			// Trigger Refresh: reload_repos takes ws_tree and launches scan.
+			model.update(cx, |m, cx| m.reload_repos(cx));
+
+			// Wait until the rescan fails and ensure_ws_tree recreates ws_tree.
+			let mut scan_failed = false;
+			for _ in 0..50 {
+				settle(cx);
+				scan_failed = model.read_with(cx, |m, _| {
+					!m.is_loading
+						&& m.remote.scan_error.is_some()
+						&& m.ws_tree.is_some()
+				});
+				if scan_failed {
+					break;
+				}
+			}
+			assert!(scan_failed, "scan failure should have landed");
+
+			// After the failed-scan Refresh, ensure_ws_tree builds a fresh unloaded
+			// root and resumes it once (load_epoch == 2: clear_loading + begin_io).
+			// The second resume must not be triggered, keeping load_epoch at 2
+			// and leaving no redundant read queued.
+			model.read_with(cx, |m, _| {
+				let tree = m.ws_tree.as_ref().expect("ws_tree exists");
+				assert_eq!(
+					tree.load_epoch, 2,
+					"failed-scan refresh must submit only one root listing (epoch 2), got epoch {}",
+					tree.load_epoch
+				);
+				assert!(
+					m.tree_queue.is_empty(),
+					"tree_queue must be empty, but had {} entries",
+					m.tree_queue.len()
+				);
 			});
 		}
 

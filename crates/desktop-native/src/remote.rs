@@ -1013,10 +1013,11 @@ impl WorkbenchModel {
 								model.sync_change_slots();
 							}
 							model.ensure_ws_tree(cx);
-							if model
-								.ws_tree
-								.as_ref()
-								.is_some_and(|t| !t.is_loaded)
+							if !model.tree_worker_alive
+								&& model
+									.ws_tree
+									.as_ref()
+									.is_some_and(|t| !t.is_loaded)
 							{
 								model.resume_ws_tree(cx);
 							}

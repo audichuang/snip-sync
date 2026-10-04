@@ -275,7 +275,7 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
   - `select_file_in` 對 `SourceKind::File` 改走 `remote::read_preview`。
   - 樹的根是虛擬路徑 `snip-remote://<指紋>/<id>`,不碰本機磁碟。開啟遠端工作區後在背景發送 `ScanRepos` 掃描 repo（深度 8、上限 256、期限 75 s），若未完成顯示 `remote_scan_incomplete`。Refresh（重新整理）觸發重掃。繼續探索僅支援 depth-limited 資料夾。
   - 前綴路由：遠端 repo 的樹 IO 與預覽路徑自動加上相對於 session root 的 repo 前綴。單一 repo 分享時復用單一樹，避免多餘的虛擬工作區樹。
-  - 空狀態：Changes 與 Log 引入純函式判定，嚴格遵守「沒讀到不顯示成乾淨」（Changes 包含 scanning、loading、no_repository、scan_failed、no_match、clean；Log 包含 scanning、loading、no_repository、failed、empty），並在 UI 埋入 `changes-empty`、`log-empty` probe 與 `[APP:CHANGES_EMPTY]` / `[APP:LOG_EMPTY]` 日誌。
+  - 空狀態：Changes 與 Log 引入純函式判定，嚴格遵守「沒讀到不顯示成乾淨」（Changes 包含 no_workspace、scanning、loading、no_repository、scan_failed、no_match、clean；Log 包含 no_workspace、scanning、loading、no_repository、failed、empty），並在 UI 埋入 `changes-empty`、`log-empty` probe 與 `[APP:CHANGES_EMPTY]` / `[APP:LOG_EMPTY]` 日誌。
   - 遠端守門：遠端工作區下複製、貼上、加入 repo 路徑、為複製勾選皆嚴格阻擋（回報 `remote_unsupported`）；右鍵選單的 repo 與檔案列僅提供複製 worker 路徑，不提供本機 reveal。
   - 開啟遠端工作區是 `lifecycle::Intent::OpenRemoteWorkspace`,與開本機工作區走同一套關閉檢查。
   - worker 監聽器是程序層級的全域物件,先於視窗啟動,也不隨工作區切換而停止。這是之後做無螢幕常駐(Windows 登入項目或服務)的路徑。

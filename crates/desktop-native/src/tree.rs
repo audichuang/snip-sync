@@ -33,7 +33,7 @@ pub struct FileTreeNode {
 	scan: Option<DirectoryScan>,
 	held: Option<ScanEntry>,
 	loading: bool,
-	load_epoch: u64,
+	pub(crate) load_epoch: u64,
 	selected_paths: Vec<String>,
 	budget_blocked: bool,
 	extra_rows: usize,

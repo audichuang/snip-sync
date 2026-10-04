@@ -213,7 +213,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 1. **用索引編號的 ID**。`remote-worker:<ix>`、`btn-remote-forget:<ix>`、`remote-workspace:<wx>` 用的是清單裡的序號，不是名稱。第 3 節「ID 要和路徑完全相等」的規則不適用於它們。要點某個工作區之前，先截圖確認那一列顯示的名稱。點了之後，用 `[APP:REMOTE_OPENED: <worker> ▸ <name> …]` 的 label 確認點到的是哪一個。label 不對，判 `fail`，證據欄寫 `identity-fail`。
 2. **專案樹的兩套列家族與日誌（依工作區形狀決定）**：
    - **單一 repo 工作區（工作區資料夾本身就是 Git 儲存庫，例如 `rtk`）**：呈現方式與本機單一 repo 完全一致，以 `repo-row:<名稱>` 標頭列（附帶 `repo-chevron:<名稱>`）為頂層，其下的檔案／目錄列使用無前綴家族：`tree-row:<相對路徑>`、`tree-chevron:<相對路徑>`、截斷標記 `tree-marker:<資料夾>`、更多列 `tree-view-more:<資料夾>`（整棵樹截斷列為 `tree-view-more:`）、錯誤列 `tree-retry:<資料夾>`、非 UTF-8 名稱 `tree-invalid:<suffix>`。日誌為 `TREE_PAGE: rel= kind= children= has_more= selected=`、`TREE_FILE_SELECTED`。
-   - **多 repo 或純資料夾工作區（工作區資料夾本身不是開啟的 repo，例如 `edge`、`plainws`、`outer/inner`）**：工作區資料夾本身的樹使用 `ws-` 前綴家族：`ws-tree-row:<相對路徑>`、`ws-tree-chevron:<相對路徑>`、截斷標記 `ws-tree-marker:<資料夾>`、更多列 `ws-tree-view-more:<資料夾>`（整棵樹截斷列為 `ws-tree-view-more:`）、錯誤列 `ws-tree-retry:<資料夾>`、非 UTF-8 名稱 `ws-tree-invalid:<suffix>`。日誌為 `WS_TREE_PAGE: rel= kind= children= has_more= selected=`、`WS_FILE_SELECTED`。多 repo 資料夾中探索到的 repo（例如 `edge` 裡的 `nested`）顯示為 `repo-row:<名稱>` 標頭列（附帶 `repo-chevron:<名稱>`），不是 `ws-tree-row`；若 repo summary 發生錯誤（例如 `nested` 僅含空 `.git`），顯示錯誤標記，點擊顯示其 Git 錯誤，不能當作純資料夾展開。
+   - **多 repo 或純資料夾工作區（工作區資料夾本身不是開啟的 repo，例如 `edge`、`plainws`、`outer/inner`）**：工作區資料夾本身的樹使用 `ws-` 前綴家族：`ws-tree-row:<相對路徑>`、`ws-tree-chevron:<相對路徑>`、截斷標記 `ws-tree-marker:<資料夾>`、更多列 `ws-tree-view-more:<資料夾>`（整棵樹截斷列為 `ws-tree-view-more:`）、錯誤列 `ws-tree-retry:<資料夾>`、非 UTF-8 名稱 `ws-tree-invalid:<suffix>`。日誌為 `WS_TREE_PAGE: rel= kind= children= has_more= selected=`、`WS_FILE_SELECTED`。多 repo 資料夾中探索到的 repo（例如 `edge` 裡的 `nested`）顯示為 `repo-row:<名稱>` 標頭列（附帶 `repo-chevron:<名稱>`），不是 `ws-tree-row`；若 repo summary 發生錯誤（例如 `nested` 僅含空 `.git`），nested 列顯示警告標記；開啟 `edge` 時會自動選取 nested，因此最初即顯示其錯誤；點擊已展開且已選取的 `repo-row:nested` 僅會將其收合（預覽不變）；重新展開（第二次點擊）會重新選取並顯示 Git 錯誤。絕不能當作純資料夾展開（不得有 `WS_TREE_PAGE: rel=nested`）。
    - `TREE_TOGGLED`／`WS_TREE_TOGGLED` 只在勾選時印，遠端模式不能勾選，所以展開不會有它。
 3. **只在狀態列顯示、沒有日誌 tag 的訊息**：`remote_unsupported`（遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視）、`remote_pair_missing`（請輸入位址與配對碼）、工作區清單讀取失敗。這些格子的通過線是：截圖裡有那段文字、剪貼簿 sentinel 的 SHA 不變、1 秒內沒有新的 `COPY_*` 或 `PASTE_*` 行。**不要因為少一行日誌就判 `fail`。**
 4. **預覽成功與失敗的分法**（`apply_source_preview`）：成功時日誌是 `PREVIEW_LOADING: <path>` 接著 `PREVIEW_LOADED: <path>`。worker 拒絕、二進位、過大時，只有 `PREVIEW_LOADING`，**沒有** `PREVIEW_LOADED`，預覽區顯示錯誤文字。失敗格的通過線：有 `PREVIEW_LOADING`、沒有 `PREVIEW_LOADED`、截圖裡是錯誤文字而不是檔案內容、下一次點擊 App 仍有反應。
@@ -244,8 +244,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | `[APP:REMOTE_WORKSPACES: count=N]` | 列出工作區成功（失敗時沒有這行，只在選單顯示紅字） |
 | `[APP:REMOTE_OPENED: <worker> ▸ <工作區> generation=N]` | 開啟遠端工作區 |
 | `[APP:TREE_ROW_REFUSED: not-utf8]` | 點了名稱不是 UTF-8 的列，無法開啟 |
-| `[APP:CHANGES_EMPTY: state=…]` | Changes 空狀態改變：`scanning`、`loading`、`no_repository`、`scan_failed`、`no_match`、`clean` |
-| `[APP:LOG_EMPTY: state=…]` | Log 空狀態改變：`scanning`、`loading`、`no_repository`、`failed`、`empty` |
+| `[APP:CHANGES_EMPTY: state=…]` | Changes 空狀態改變：`no_workspace`、`scanning`、`loading`、`no_repository`、`scan_failed`、`no_match`、`clean` |
+| `[APP:LOG_EMPTY: state=…]` | Log 空狀態改變：`no_workspace`、`scanning`、`loading`、`no_repository`、`failed`、`empty` |
 | `[APP:E2E_REPO: name=<名稱> ok=true/false …]` | 儲存庫掃描或載入狀態 |
 | `[APP:CHANGES_LOADED: <名稱> files=N]` | Changes 面板儲存庫變更清單載入完成 |
 | `[APP:REPO_LOADED: <名稱> files=N]` | 單一儲存庫變更載入完成 |
@@ -253,7 +253,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 ## 4. 測案
 
-每格都要截圖（點擊前、點擊後各一張），存在 `$RUN/<ID>/`，再加一份 `action.json`，內容是 bounds、scale、算出的螢幕點和新的日誌行。
+每格都要截圖（點擊前、點擊後各一張），存在 `$RUN/<ID>/`，再加一份 `action.json`，內容是 bounds、scale、算出的螢幕點和新的日誌行。操作者在寫入任何檔案至該處前必須先 `mkdir -p "$RUN/<ID>"`（R02、R03、R13、R25、R26 會透過 shell 重新導向寫入該處）。
 
 ### 4.1 配對（R01–R05 連續做完，要在配對碼過期前）
 
@@ -276,7 +276,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | R10 | 點 `tree-row:README_zh.md` | `PREVIEW_LOADED`；中文正常顯示，沒有豆腐字或亂碼 |
 | R11 | 展開 `src/hooks`，點 `tree-row:src/hooks/init.rs`（238 KB），在預覽裡捲到最後 | `PREVIEW_LOADED`；最後一行和 `tail -1` 一致；捲動時 App 不卡 |
 | R12 | 展開 `target`、`release`，點 `tree-row:target/release/rtk`（8 MB 二進位） | 依第 3 節規則 4 判失敗格：顯示二進位或超過 1 MiB 的錯誤都算對；沒有亂碼文字；5 秒內可以點下一列 |
-| R13 | 看根目錄，再執行 `target/debug/snip remote cat 1 rtk .git/HEAD`（存為 `R13/head.txt`） | 樹裡沒有 `tree-row:.git` 列；CLI 印出 `ref: refs/heads/…`（`.git` 只是不列在樹裡，指名路徑仍可讀）。證據：截圖顯示完整根目錄清單（必要時捲動，註明清單完整），加上從 App 日誌 grep `CTRL_BOUNDS` 得到的 `tree-row:` ID 原始清單證明無 `tree-row:.git`，以及儲存的 CLI 輸出 `R13/head.txt` |
+| R13 | 看根目錄，再執行 `mkdir -p "$RUN/R13" && target/debug/snip remote cat 1 rtk .git/HEAD`（存為 `R13/head.txt`） | 樹裡沒有 `tree-row:.git` 列；CLI 印出 `ref: refs/heads/…`（`.git` 只是不列在樹裡，指名路徑仍可讀）。證據：截圖顯示完整根目錄清單（必要時捲動，註明清單完整），加上從 App 日誌 grep `CTRL_BOUNDS` 得到的 `tree-row:` ID 原始清單證明無 `tree-row:.git`，以及儲存的 CLI 輸出 `R13/head.txt` |
 | R14 | 把 `src` 收合再展開（點 `tree-chevron:src`） | 第二次也有 `TREE_PAGE: rel=src`，清單和 R08 相同 |
 
 ### 4.3 邊界案例 edge
@@ -291,10 +291,10 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | R20 | 點 `over-1MiB.txt` | 失敗格：錯誤文字提到超過 1 MiB |
 | R21 | 點 `blob.bin` | 失敗格：二進位或非 UTF-8，無法預覽 |
 | R22 | 點 `latin.txt` | 失敗格：同 R21 |
-| R23 | 點 `manydir` 展開，再反覆點最新的 `ws-tree-view-more:manydir` 或 `ws-tree-view-more:`，直到沒有更多列；執行 oracle 命令：`target/debug/snip remote ls 1 edge manydir > "$RUN/R23/cli-ls.txt"; wc -l` | CLI 每行一項，stdout 存入 `R23/cli-ls.txt`，`wc -l` 為 1000（stderr 印出 `(listing truncated)` 截斷提示）；GUI 日誌 `WS_TREE_PAGE: rel=manydir … children=N`，N ≤ 1000（GUI 的記憶體預算可能收得比 1000 少，記下實際值）；每點一次，畫面都出現新的 `ws-tree-row:manydir/…`；最後有 `ws-tree-marker:manydir`，顯示「[目錄未完整列出: 已截斷]」；捲到底不卡。缺少存檔 `R23/cli-ls.txt` 者判 `not-run` |
+| R23 | 點 `manydir` 展開，再反覆點最新的 `ws-tree-view-more:manydir` 或 `ws-tree-view-more:`，直到沒有更多列；執行 oracle 命令：`mkdir -p "$RUN/R23" && target/debug/snip remote ls 1 edge manydir > "$RUN/R23/cli-ls.txt" 2> "$RUN/R23/cli-ls.err"; wc -l < "$RUN/R23/cli-ls.txt"` | CLI 每行一項，stdout 存入 `R23/cli-ls.txt`，`wc -l` 印出 1000（`R23/cli-ls.err` 包含 `(listing truncated)` 截斷提示）；GUI 日誌 `WS_TREE_PAGE: rel=manydir … children=N`，N ≤ 1000（GUI 的記憶體預算可能收得比 1000 少，記下實際值）；每點一次，畫面都出現新的 `ws-tree-row:manydir/…`；最後有 `ws-tree-marker:manydir`，顯示「[目錄未完整列出: 已截斷]」；捲到底不卡。缺少存檔 `R23/cli-ls.txt` 者判 `not-run` |
 | R24 | 點 `escape.txt` | 失敗格：錯誤文字說路徑離開了工作區；`top-secret-c0ffee` 不出現在截圖，也不在 `app-*.log` 裡（`grep -c top-secret "$RUN"/app-*.log` 要是 0） |
-| R25 | 執行 oracle 命令：`target/debug/snip remote ls 1 edge > "$RUN/R25/cli-ls.txt"`；在 App 點 `escape-dir` | 拒絕。指向分享外的資料夾 symlink 列成檔案列（CLI 每行一項，在 `R25/cli-ls.txt` 中印為 `escape-dir`，沒有尾端 `/`）；點下去是失敗格，錯誤文字是「Path leaves the workspace」。**不能**列出 `/etc` 的內容（截圖裡沒有 `passwd`、`hostname`）。缺少存檔 `R25/cli-ls.txt` 者判 `not-run` |
-| R26 | 點 `inner-link`；對照 R25 保存之 oracle `"$RUN/R25/cli-ls.txt"`（或執行 `target/debug/snip remote ls 1 edge > "$RUN/R26/cli-ls.txt"`） | 指向分享內的資料夾 symlink 列成資料夾（CLI 在 `cli-ls.txt` 中每行一項，印為 `inner-link/`，帶有尾端 `/`）：可以展開，列出 `deep`、`main.rs`；點 `inner-link/main.rs` 能預覽。顯示成檔案列或無法展開，判 `fail`。缺少 `cli-ls.txt` 存檔（R25 或 R26 的）者判 `not-run` |
+| R25 | 執行 oracle 命令：`mkdir -p "$RUN/R25" && target/debug/snip remote ls 1 edge > "$RUN/R25/cli-ls.txt"`；在 App 點 `escape-dir` | 拒絕。指向分享外的資料夾 symlink 列成檔案列（CLI 每行一項，在 `R25/cli-ls.txt` 中印為 `escape-dir`，沒有尾端 `/`）；點下去是失敗格，錯誤文字是「Path leaves the workspace」。**不能**列出 `/etc` 的內容（截圖裡沒有 `passwd`、`hostname`）。缺少存檔 `R25/cli-ls.txt` 者判 `not-run` |
+| R26 | 點 `inner-link`；對照 R25 保存之 oracle `"$RUN/R25/cli-ls.txt"`（或執行 `mkdir -p "$RUN/R26" && target/debug/snip remote ls 1 edge > "$RUN/R26/cli-ls.txt"`） | 指向分享內的資料夾 symlink 列成資料夾（CLI 在 `cli-ls.txt` 中每行一項，印為 `inner-link/`，帶有尾端 `/`）：可以展開，列出 `deep`、`main.rs`；點 `inner-link/main.rs` 能預覽。顯示成檔案列或無法展開，判 `fail`。缺少 `cli-ls.txt` 存檔（R25 或 R26 的）者判 `not-run` |
 | R27 | 找到非 UTF-8 名稱那一列 | 它的 ID 是 `ws-tree-invalid:<suffix>`，名稱用替代字元顯示；點它有一行新的 `TREE_ROW_REFUSED: not-utf8`，狀態列顯示「檔名不是有效的 UTF-8，無法開啟或預覽」；App 不崩潰，選取與預覽維持原樣 |
 | R28 | 依序展開 `a/b/c/d/e`，點 `leaf.txt` | 每層各有一行 `WS_TREE_PAGE`；顯示 `deepest` |
 | R29 | 看 `nested` 和 `.hidden` | `nested` 視為 repo（僅含空 `.git`，見 R32），顯示為 `repo-row:nested` 標頭列（具錯誤狀態），不是可展開的資料夾，點擊不產生 `WS_TREE_PAGE: rel=nested`；`.hidden` 列出為 `ws-tree-row:.hidden`，可以預覽 |
@@ -328,7 +328,7 @@ R34 之前，先重新開回 `edge`（R15 的步驟）。
 | R42 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` 重新啟動（寫進新的 `app-N.log`），開選單 | `remote-worker:0` 仍然是 `ubuntu-ui`，點它就能列出工作區，不需要重新配對 |
 | R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"` 拿新的配對碼 C。Cmd+Q，改用全新的 `SNIP_CONFIG_DIR="$RUN/master-config-r43"` 啟動 App（寫進新的 `app-N.log`）。用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C（位址同樣用 `100.95.28.19:47899`）。再 Cmd+Q，用原本的 `SNIP_CONFIG_DIR` 重新啟動，點 `remote-worker:0` | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；換回原本的設定後，`remote-worker:0` 仍然能列出工作區。一定要用全新的 master：已配對的 master，worker 認得它的憑證，不看配對碼就放行 |
 | R44 | 把視窗調成 900×600（從系統層設定，例如 System Events 設成 900×632；送給 App 的合成拖曳碰不到視窗框），開選單並打開配對表單 | 兩個輸入框和「配對」按鈕的 bounds 都 `w,h ≥ 1`，而且都在內容區裡面；選單可以捲動到最下面；焦點在輸入框時按 Escape，選單收起；再開選單，點 `btn-workspace-menu`，選單也會收起 |
-| R45 | 先開著 `edge`，再點 `btn-remote-forget:0` | 開著的 `edge` 跟著關閉：左上角不再有 `ubuntu-ui ▸`，`ws-tree-row:*` 都有 `CTRL_GONE`；`remote-worker:0` 有 `CTRL_GONE`；`remote-workers.json` 不再有 `ubuntu-ui`；重開選單也不會再出現；忘記 worker 且工作區關閉後，Log 面板絕不可顯示掃描／搜尋狀態（如「正在搜尋 Git 儲存庫…」），必須顯示無工作區／空狀態（未開工作區時 `log-empty` 不為 `scanning`，採納 `LOG_EMPTY` 印出的新狀態名稱） |
+| R45 | 先開著 `edge`，再點 `btn-remote-forget:0` | 開著的 `edge` 跟著關閉：左上角不再有 `ubuntu-ui ▸`，`ws-tree-row:*` 都有 `CTRL_GONE`；`remote-worker:0` 有 `CTRL_GONE`；`remote-workers.json` 不再有 `ubuntu-ui`；重開選單也不會再出現；忘記 worker 且工作區關閉後，Log 面板絕不可顯示掃描／搜尋狀態（如「正在搜尋 Git 儲存庫…」），必須顯示無工作區／空狀態（未開工作區時 `log-empty` 不為 `scanning`，關閉完成後印出 `[APP:LOG_EMPTY: state=no_workspace]`（若顯示 Changes 面板則印出 `[APP:CHANGES_EMPTY: state=no_workspace]`），且 `log-empty` probe 顯示文字「未開啟工作區。開啟一個 Git 儲存庫，或內含多個儲存庫的資料夾。」；短暫的 `loading` 或 `scanning` 不算通過） |
 
 ### 4.6 CLI master 交叉驗證
 
@@ -362,7 +362,7 @@ start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws
 | G07 | 歷史面板切換至 commit 樹瀏覽 | 可展開目錄、瀏覽 commit 樹節點與檢視 blob 檔案內容 |
 | G08 | 從工作區選單開 `plainws` | 專案樹正常瀏覽檔案；點 `rail-changes` 顯示 `changes-empty` probe，日誌為 `[APP:CHANGES_EMPTY: state=no_repository]`；點 `rail-log` 顯示 `log-empty` probe，日誌為 `[APP:LOG_EMPTY: state=no_repository]`，提示「這個資料夾裡沒有 Git 儲存庫」，不是 clean 或 empty |
 | G09 | 從工作區選單開 `outer/inner` | 判定為 `no_repository`，專案樹只列出 `inner` 的檔案，專案樹與變更清單絕不出現父 repo 的 `outer-dirty.txt` |
-| G10 | 在 worker 端修改 beta 的檔案：`ssh ubuntu "echo beta-change >> '$W/gitws/beta/b.txt'"`，在 App 點 `btn-refresh`；hover `change-repo-toggle_unstaged_beta` 列截取 tooltip（方法見第 3 節規則 8） | 重新整理後 Changes 面板中 `beta` 出現變更列，即時反映 worker 上的檔案修改；hover repo 標頭列（例如 `change-repo-toggle_unstaged_beta`）時，tooltip 顯示 worker 名稱加上 worker 路徑（如 `ubuntu-ui:/home/.../gitws/beta`），絕不可露出 `snip-remote://` 內部識別路徑 |
+| G10 | 在 worker 端修改 beta 的檔案：`ssh ubuntu "echo beta-change >> '$W/gitws/beta/b.txt'"`，在 App 點 `btn-refresh`；hover `change-repo:unstaged:beta` 列截取 tooltip（方法見第 3 節規則 8） | 重新整理後 Changes 面板中 `beta` 出現變更列，即時反映 worker 上的檔案修改；hover repo 標頭列（例如 `change-repo:unstaged:beta`）時，tooltip 顯示 worker 名稱加上 worker 路徑（如 `ubuntu-ui:/home/.../gitws/beta`），絕不可露出 `snip-remote://` 內部識別路徑 |
 | G11 | 停掉 worker（`ssh ubuntu "kill \$(cat '$W/worker.pid')"`），在 Changes 點選一個檔案（例如 `beta` 的 `b.txt`） | 預覽顯示連線失敗錯誤，絕不誤顯示為乾淨或空內容；預覽上方的路徑列（`breadcrumb`）必須指名所點選檔案所屬的 repo（點 `beta/b.txt` 時為 `beta`），不可誤顯示為先前開啟的 repo；App 不凍結 |
 | G12 | 以受測 SHA 的 `snip worker --max-protocol 1` 啟動 worker，分享 `gitws` 與 `edge`：`WORKER_EXTRA='--max-protocol 1' start_worker wcfg "$W/edge" "$W/gitws"`，從工作區選單重新開啟 `gitws` | 開啟後專案樹檔案瀏覽與預覽立即正常運作，無需按重新整理；若專案樹卡在載入狀態、必須手動按 Refresh 才出現，判 `fail`；點 `rail-changes` 與 `rail-log` 皆顯示「版本太舊」錯誤（`remote_worker_too_old`），提示在 worker 上更新；絕不顯示成 clean 或 empty |
 
