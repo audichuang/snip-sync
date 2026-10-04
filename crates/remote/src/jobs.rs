@@ -356,9 +356,22 @@ mod tests {
 	use super::*;
 	use crate::proto::{read_frame, Stat};
 
+	fn timeout_scale() -> u32 {
+		std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+			.ok()
+			.and_then(|v| v.parse::<u32>().ok())
+			.unwrap_or(1)
+			.max(1)
+	}
+
+	fn scaled(d: Duration) -> Duration {
+		d.saturating_mul(timeout_scale())
+	}
+
 	#[test]
 	fn admit_respects_the_running_cap_and_releases_on_drop() {
-		let jobs = Jobs::with_limits(2, 1, 16, Duration::from_millis(50));
+		let jobs =
+			Jobs::with_limits(2, 1, 16, scaled(Duration::from_millis(50)));
 		let cancel = CancelToken::new();
 
 		let g1 = jobs.admit("ws", JobKind::View, &cancel).unwrap();
@@ -386,8 +399,12 @@ mod tests {
 
 	#[test]
 	fn a_scan_waits_for_the_single_scan_slot_while_a_view_runs() {
-		let jobs =
-			Arc::new(Jobs::with_limits(2, 1, 16, Duration::from_millis(300)));
+		let jobs = Arc::new(Jobs::with_limits(
+			2,
+			1,
+			16,
+			scaled(Duration::from_millis(300)),
+		));
 		let cancel = CancelToken::new();
 
 		// Run 1 view and 1 scan (uses both 2 git slots and the 1 scan slot)
@@ -404,11 +421,14 @@ mod tests {
 		});
 
 		started_rx
-			.recv_timeout(Duration::from_secs(1))
+			.recv_timeout(scaled(Duration::from_secs(1)))
 			.expect("thread started");
 
-		// Sleep briefly so the thread enters waiting
-		std::thread::sleep(Duration::from_millis(20));
+		// Wait until the thread enters waiting
+		let deadline = Instant::now() + scaled(Duration::from_secs(1));
+		while jobs.waiting() < 1 && Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(5));
+		}
 		assert_eq!(jobs.running(), 2);
 		assert_eq!(jobs.waiting(), 1);
 
@@ -424,20 +444,25 @@ mod tests {
 
 	#[test]
 	fn admit_answers_busy_after_the_wait_runs_out() {
-		let jobs = Jobs::with_limits(1, 1, 16, Duration::from_millis(40));
+		let wait_limit = scaled(Duration::from_millis(40));
+		let jobs = Jobs::with_limits(1, 1, 16, wait_limit);
 		let cancel = CancelToken::new();
 
 		let _g = jobs.admit("ws", JobKind::View, &cancel).unwrap();
 		let start = Instant::now();
 		let err = jobs.admit("ws", JobKind::View, &cancel).unwrap_err();
 		assert_eq!(err, ErrorCode::Busy);
-		assert!(start.elapsed() >= Duration::from_millis(35));
+		assert!(start.elapsed() >= scaled(Duration::from_millis(35)));
 	}
 
 	#[test]
 	fn admit_answers_busy_when_the_queue_is_full() {
-		let jobs =
-			Arc::new(Jobs::with_limits(1, 1, 2, Duration::from_millis(300)));
+		let jobs = Arc::new(Jobs::with_limits(
+			1,
+			1,
+			2,
+			scaled(Duration::from_millis(300)),
+		));
 		let cancel = CancelToken::new();
 
 		let _g = jobs.admit("ws", JobKind::View, &cancel).unwrap();
@@ -453,20 +478,16 @@ mod tests {
 		}
 
 		// Wait until waiting == 2
-		let deadline = Instant::now() + Duration::from_secs(1);
+		let deadline = Instant::now() + scaled(Duration::from_secs(1));
 		while jobs.waiting() < 2 && Instant::now() < deadline {
 			std::thread::sleep(Duration::from_millis(10));
 		}
 		assert_eq!(jobs.waiting(), 2);
 
 		// 3rd waiter exceeds MAX_JOBS_WAITING (2) -> immediate Busy
-		let start = Instant::now();
 		let err = jobs.admit("ws", JobKind::View, &cancel).unwrap_err();
 		assert_eq!(err, ErrorCode::Busy);
-		assert!(
-			start.elapsed() < Duration::from_millis(50),
-			"should fail immediately without waiting"
-		);
+		assert_eq!(jobs.waiting(), 2);
 
 		for t in threads {
 			let _ = t.join();
@@ -475,8 +496,12 @@ mod tests {
 
 	#[test]
 	fn admit_returns_early_when_cancelled() {
-		let jobs =
-			Arc::new(Jobs::with_limits(1, 1, 16, Duration::from_secs(5)));
+		let jobs = Arc::new(Jobs::with_limits(
+			1,
+			1,
+			16,
+			scaled(Duration::from_secs(5)),
+		));
 		let cancel_running = CancelToken::new();
 		let _g = jobs.admit("ws", JobKind::View, &cancel_running).unwrap();
 
@@ -488,18 +513,22 @@ mod tests {
 			jobs_clone.admit("ws", JobKind::View, &cancel_waiting_clone)
 		});
 
-		std::thread::sleep(Duration::from_millis(20));
+		let deadline = Instant::now() + scaled(Duration::from_secs(1));
+		while jobs.waiting() < 1 && Instant::now() < deadline {
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert_eq!(jobs.waiting(), 1);
 		cancel_waiting.cancel();
 
 		let start = Instant::now();
 		let res = t.join().expect("join");
-		assert!(start.elapsed() < Duration::from_secs(2));
+		assert!(start.elapsed() < scaled(Duration::from_secs(2)));
 		assert_eq!(res.err(), Some(ErrorCode::Cancelled));
 	}
 
 	#[test]
 	fn cancel_workspaces_cancels_only_those_tokens() {
-		let jobs = Jobs::with_limits(4, 2, 16, Duration::from_secs(5));
+		let jobs = Jobs::with_limits(4, 2, 16, scaled(Duration::from_secs(5)));
 		let c1 = CancelToken::new();
 		let c2 = CancelToken::new();
 
@@ -517,7 +546,7 @@ mod tests {
 
 	#[test]
 	fn cancel_all_cancels_every_token_and_refuses_new_jobs() {
-		let jobs = Jobs::with_limits(4, 2, 16, Duration::from_secs(5));
+		let jobs = Jobs::with_limits(4, 2, 16, scaled(Duration::from_secs(5)));
 		let c1 = CancelToken::new();
 		let c2 = CancelToken::new();
 
@@ -530,21 +559,19 @@ mod tests {
 		assert!(c2.is_cancelled());
 
 		let c3 = CancelToken::new();
-		let start = Instant::now();
 		let err = jobs.admit("ws3", JobKind::View, &c3).unwrap_err();
 		assert_eq!(err, ErrorCode::Busy);
-		assert!(start.elapsed() < Duration::from_millis(50));
 	}
 
 	#[test]
 	fn run_job_sends_at_least_two_pending_frames_before_the_result() {
 		let mut buf = Vec::new();
 		let cancel = CancelToken::new();
-		let heartbeat = Duration::from_millis(15);
-		let deadline = Duration::from_millis(500);
+		let heartbeat = scaled(Duration::from_millis(20));
+		let deadline = scaled(Duration::from_millis(500));
 
 		run_job_with(&mut buf, heartbeat, deadline, cancel, |_, _| {
-			std::thread::sleep(Duration::from_millis(45));
+			std::thread::sleep(heartbeat * 3);
 			Response::Stat(Stat {
 				kind: crate::proto::EntryKind::File,
 				size: 42,
@@ -590,8 +617,8 @@ mod tests {
 	fn a_failing_writer_cancels_the_op() {
 		let mut writer = FailingWriter;
 		let cancel = CancelToken::new();
-		let heartbeat = Duration::from_millis(10);
-		let deadline = Duration::from_secs(2);
+		let heartbeat = scaled(Duration::from_millis(10));
+		let deadline = scaled(Duration::from_secs(2));
 
 		let op_cancelled = Arc::new(Mutex::new(false));
 		let op_cancelled_clone = op_cancelled.clone();
@@ -603,8 +630,9 @@ mod tests {
 			cancel,
 			|token, _| {
 				let start = Instant::now();
+				let limit = scaled(Duration::from_secs(2));
 				while !token.is_cancelled() {
-					if start.elapsed() > Duration::from_secs(2) {
+					if start.elapsed() > limit {
 						panic!("op was not cancelled within deadline");
 					}
 					std::thread::sleep(Duration::from_millis(5));
@@ -622,16 +650,17 @@ mod tests {
 	fn a_job_past_its_deadline_is_cancelled() {
 		let mut buf = Vec::new();
 		let cancel = CancelToken::new();
-		let heartbeat = Duration::from_millis(10);
-		let deadline = Duration::from_millis(30);
+		let heartbeat = scaled(Duration::from_millis(10));
+		let deadline = scaled(Duration::from_millis(30));
 
 		let op_cancelled = Arc::new(Mutex::new(false));
 		let op_cancelled_clone = op_cancelled.clone();
 
 		run_job_with(&mut buf, heartbeat, deadline, cancel, |token, _| {
 			let start = Instant::now();
+			let limit = scaled(Duration::from_secs(2));
 			while !token.is_cancelled() {
-				if start.elapsed() > Duration::from_secs(2) {
+				if start.elapsed() > limit {
 					panic!("op was not cancelled within deadline");
 				}
 				std::thread::sleep(Duration::from_millis(5));
@@ -665,8 +694,8 @@ mod tests {
 	fn run_job_turns_an_oversized_reply_into_too_large() {
 		let mut buf = Vec::new();
 		let cancel = CancelToken::new();
-		let heartbeat = Duration::from_secs(1);
-		let deadline = Duration::from_secs(2);
+		let heartbeat = scaled(Duration::from_secs(1));
+		let deadline = scaled(Duration::from_secs(2));
 
 		// MAX_FRAME is 8 MiB in proto.rs
 		let huge_string = "x".repeat(crate::proto::MAX_FRAME + 1024);

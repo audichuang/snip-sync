@@ -69,6 +69,34 @@ fn release_path(slot: &mut PathBuf) {
 	*slot = PathBuf::new();
 }
 
+/// Re-runs one test alone in a child process so it can read process-global counters (gitrun budgets) without other tests' git calls racing; true inside the child.
+#[cfg(test)]
+pub(crate) fn run_isolated(exact_test_path: &str) -> bool {
+	if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+		let exe = std::env::current_exe().expect("current test exe");
+		let output = std::process::Command::new(exe)
+			.env("SNIP_TEST_ISOLATED", "1")
+			.args([
+				"--exact",
+				exact_test_path,
+				"--nocapture",
+				"--test-threads=1",
+			])
+			.output()
+			.expect("spawn isolated test subprocess");
+		assert!(
+			output.status.success(),
+			"isolated subprocess test failed ({exact_test_path}): status={:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+			output.status,
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		false
+	} else {
+		true
+	}
+}
+
 /// Test-harness event line.
 macro_rules! app_log {
 	($($arg:tt)*) => {{
@@ -8080,6 +8108,11 @@ mod tests {
 			_cx: &mut TestAppContext,
 		) {
 			let _serial = remote_lock();
+			if !crate::run_isolated(
+				"tests::in_process::served_git_in_flight_does_not_block_a_workspace_switch",
+			) {
+				return;
+			}
 			use snip_core::gitrun::{served_in_flight, GitPool, RunOptions};
 			use snip_core::gitsrc::Git;
 
@@ -8113,20 +8146,13 @@ mod tests {
 				load_after, load_before,
 				"GitLoad should not count Served pool git calls"
 			);
-			if load_after.in_flight == 0 {
-				assert_eq!(load_after, crate::lifecycle::GitLoad::idle());
-			}
+			assert_eq!(load_after, crate::lifecycle::GitLoad::idle());
 
 			let mut lc = crate::lifecycle::Lifecycle::new(1);
 			let now = std::time::Instant::now();
 			let req = lc.request(crate::lifecycle::Intent::CloseWorkspace, now);
 			assert_eq!(req, crate::lifecycle::Request::Accepted);
-			let drain_load = if load_after.in_flight == 0 {
-				load_after
-			} else {
-				crate::lifecycle::GitLoad::idle()
-			};
-			let step = lc.poll_at(now, drain_load);
+			let step = lc.poll_at(now, load_after);
 			assert_eq!(
 				step,
 				crate::lifecycle::Step::Ready(

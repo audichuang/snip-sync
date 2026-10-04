@@ -932,6 +932,18 @@ impl From<RemoteError> for GitError {
 mod tests {
 	use super::*;
 
+	fn timeout_scale() -> u32 {
+		std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+			.ok()
+			.and_then(|v| v.parse::<u32>().ok())
+			.unwrap_or(1)
+			.max(1)
+	}
+
+	fn scaled(d: Duration) -> Duration {
+		d.saturating_mul(timeout_scale())
+	}
+
 	struct FakeDuplex {
 		incoming: io::Cursor<Vec<u8>>,
 		outgoing: Vec<u8>,
@@ -1172,14 +1184,22 @@ mod tests {
 	#[test]
 	fn in_flight_limiter_bounds_and_cancels() {
 		let limiter = GitLimiter::new();
-		let g1 = limiter.acquire(None, Duration::from_secs(1)).unwrap();
-		let g2 = limiter.acquire(None, Duration::from_secs(1)).unwrap();
-		let g3 = limiter.acquire(None, Duration::from_secs(1)).unwrap();
-		let g4 = limiter.acquire(None, Duration::from_secs(1)).unwrap();
+		let g1 = limiter
+			.acquire(None, scaled(Duration::from_secs(1)))
+			.unwrap();
+		let g2 = limiter
+			.acquire(None, scaled(Duration::from_secs(1)))
+			.unwrap();
+		let g3 = limiter
+			.acquire(None, scaled(Duration::from_secs(1)))
+			.unwrap();
+		let g4 = limiter
+			.acquire(None, scaled(Duration::from_secs(1)))
+			.unwrap();
 
 		// 5th with short limit returns TimedOut
 		let timed_out = limiter
-			.acquire(None, Duration::from_millis(20))
+			.acquire(None, scaled(Duration::from_millis(20)))
 			.unwrap_err();
 		assert!(matches!(timed_out, RemoteError::TimedOut));
 
@@ -1187,14 +1207,14 @@ mod tests {
 		let cancel = CancelToken::new();
 		cancel.cancel();
 		let cancelled = limiter
-			.acquire(Some(&cancel), Duration::from_secs(1))
+			.acquire(Some(&cancel), scaled(Duration::from_secs(1)))
 			.unwrap_err();
 		assert!(matches!(cancelled, RemoteError::Cancelled));
 
 		// Release one guard lets the 5th through
 		drop(g1);
 		let g5 = limiter
-			.acquire(None, Duration::from_millis(100))
+			.acquire(None, scaled(Duration::from_millis(100)))
 			.expect("releasing one guard should allow acquisition");
 		drop((g2, g3, g4, g5));
 	}

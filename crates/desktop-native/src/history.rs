@@ -4216,6 +4216,11 @@ mod tests {
 
 	#[test]
 	fn a_later_graph_page_in_the_window_runs_no_git() {
+		if !crate::run_isolated(
+			"history::tests::a_later_graph_page_in_the_window_runs_no_git",
+		) {
+			return;
+		}
 		let dir = tempfile::tempdir().unwrap();
 		let root = dir.path();
 		let git = |args: &[&str]| {

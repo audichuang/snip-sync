@@ -19,6 +19,18 @@ use snip_remote::{
 	pair, Client, Connection, Identity, RemoteError, Worker, WorkerOptions,
 };
 
+fn timeout_scale() -> u32 {
+	std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+		.ok()
+		.and_then(|v| v.parse::<u32>().ok())
+		.unwrap_or(1)
+		.max(1)
+}
+
+fn scaled(d: Duration) -> Duration {
+	d.saturating_mul(timeout_scale())
+}
+
 fn worker(
 	roots: &[&std::path::Path],
 	max_protocol: Option<u32>,
@@ -131,7 +143,7 @@ fn a_restarted_newer_worker_is_used_after_too_old() {
 	drop(worker_a);
 
 	// Start worker B on the same address (retry bind within 5 s)
-	let deadline = Instant::now() + Duration::from_secs(5);
+	let deadline = Instant::now() + scaled(Duration::from_secs(5));
 	let worker_b = loop {
 		match Worker::start(
 			worker_addr,
@@ -182,8 +194,10 @@ fn hand_written_v1_hello_still_lists_workspaces() {
 	let (config, _) =
 		client_config(&master, Some(paired.pin().unwrap())).unwrap();
 	let tcp = TcpStream::connect(w.local_addr()).unwrap();
-	tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-	tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+	tcp.set_read_timeout(Some(scaled(Duration::from_secs(5))))
+		.unwrap();
+	tcp.set_write_timeout(Some(scaled(Duration::from_secs(5))))
+		.unwrap();
 	let conn = rustls::ClientConnection::new(config, server_name()).unwrap();
 	let mut tls = StreamOwned::new(conn, tcp);
 
@@ -326,8 +340,9 @@ where
 			match listener.accept() {
 				Ok((tcp, _)) => {
 					tcp.set_nonblocking(false).unwrap();
-					tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-					tcp.set_write_timeout(Some(Duration::from_secs(5)))
+					tcp.set_read_timeout(Some(scaled(Duration::from_secs(5))))
+						.unwrap();
+					tcp.set_write_timeout(Some(scaled(Duration::from_secs(5))))
 						.unwrap();
 					let conn = ServerConnection::new(config.clone()).unwrap();
 					let mut tls = StreamOwned::new(conn, tcp);
@@ -558,8 +573,9 @@ fn downgraded_worker_on_pooled_v2_connection_returns_worker_too_old() {
 			match listener.accept() {
 				Ok((tcp, _)) => {
 					tcp.set_nonblocking(false).unwrap();
-					tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-					tcp.set_write_timeout(Some(Duration::from_secs(5)))
+					tcp.set_read_timeout(Some(scaled(Duration::from_secs(5))))
+						.unwrap();
+					tcp.set_write_timeout(Some(scaled(Duration::from_secs(5))))
 						.unwrap();
 					let conn = ServerConnection::new(config.clone()).unwrap();
 					let mut tls = StreamOwned::new(conn, tcp);
@@ -630,7 +646,7 @@ fn downgraded_worker_on_pooled_v2_connection_returns_worker_too_old() {
 	});
 
 	let master = Arc::new(Identity::generate().unwrap());
-	let deadline = Instant::now() + Duration::from_secs(5);
+	let deadline = Instant::now() + scaled(Duration::from_secs(5));
 	let conn = loop {
 		match Connection::open(&addr.to_string(), &master, None, "mac") {
 			Ok(c) => break c,

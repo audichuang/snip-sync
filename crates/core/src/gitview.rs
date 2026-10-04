@@ -1397,6 +1397,7 @@ mod tests {
 		None
 	}
 
+	#[cfg(unix)]
 	fn git_supports_filter_clone() -> bool {
 		let out =
 			match std::process::Command::new("git").arg("--version").output() {

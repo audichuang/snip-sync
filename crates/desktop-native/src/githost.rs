@@ -187,6 +187,11 @@ mod tests {
 
 	#[test]
 	fn local_host_refuses_a_remote_key() {
+		if !crate::run_isolated(
+			"githost::tests::local_host_refuses_a_remote_key",
+		) {
+			return;
+		}
 		let read = Read {
 			profile: ReadProfile::Interactive,
 			cancel: None,
@@ -255,6 +260,11 @@ mod tests {
 
 	#[test]
 	fn remote_host_opens_without_io_and_maps_roots() {
+		if !crate::run_isolated(
+			"githost::tests::remote_host_opens_without_io_and_maps_roots",
+		) {
+			return;
+		}
 		let id = snip_remote::Identity::generate().unwrap();
 		let worker = snip_remote::PairedWorker {
 			name: "w".into(),

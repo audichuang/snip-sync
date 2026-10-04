@@ -17,6 +17,18 @@ use snip_remote::{pair, Client, Identity, RemoteError, Worker, WorkerOptions};
 
 static SHIM_INIT: std::sync::Once = std::sync::Once::new();
 
+fn timeout_scale() -> u32 {
+	std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+		.ok()
+		.and_then(|v| v.parse::<u32>().ok())
+		.unwrap_or(1)
+		.max(1)
+}
+
+fn scaled(d: Duration) -> Duration {
+	d.saturating_mul(timeout_scale())
+}
+
 fn init_git_shim() {
 	SHIM_INIT.call_once(|| {
 		let path_var = std::env::var("PATH").unwrap_or_default();
@@ -172,7 +184,7 @@ fn a_master_cannot_fill_the_git_queue() {
 	}
 
 	// Poll with bounded deadline: served pool in-flight + queued stays within limit
-	let poll_deadline = Instant::now() + Duration::from_secs(10);
+	let poll_deadline = Instant::now() + scaled(Duration::from_secs(10));
 	let mut saw_busy = false;
 	let mut saw_ok = false;
 	let mut saw_served_in_flight = false;
@@ -212,7 +224,7 @@ fn a_master_cannot_fill_the_git_queue() {
 				.run_with(
 					&["status"],
 					&RunOptions {
-						queue_timeout: Duration::from_millis(500),
+						queue_timeout: scaled(Duration::from_millis(500)),
 						..RunOptions::default()
 					},
 				)
@@ -257,7 +269,7 @@ fn a_master_cannot_fill_the_git_queue() {
 	cancel.cancel();
 	w.stop();
 
-	let join_deadline = Instant::now() + Duration::from_secs(10);
+	let join_deadline = Instant::now() + scaled(Duration::from_secs(10));
 	for h in handles {
 		let remaining = join_deadline.saturating_duration_since(Instant::now());
 		assert!(
@@ -334,7 +346,7 @@ fn scan_repos_uses_served_pool_and_leaves_local_pool_untouched() {
 		}));
 	}
 
-	let poll_deadline = Instant::now() + Duration::from_secs(10);
+	let poll_deadline = Instant::now() + scaled(Duration::from_secs(10));
 	let mut saw_served_in_flight = false;
 
 	while Instant::now() < poll_deadline {
@@ -372,7 +384,7 @@ fn scan_repos_uses_served_pool_and_leaves_local_pool_untouched() {
 	cancel.cancel();
 	w.stop();
 
-	let join_deadline = Instant::now() + Duration::from_secs(10);
+	let join_deadline = Instant::now() + scaled(Duration::from_secs(10));
 	for h in handles {
 		let remaining = join_deadline.saturating_duration_since(Instant::now());
 		assert!(

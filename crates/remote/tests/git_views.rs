@@ -13,6 +13,18 @@ fn serial() -> MutexGuard<'static, ()> {
 	SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn timeout_scale() -> u32 {
+	std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+		.ok()
+		.and_then(|v| v.parse::<u32>().ok())
+		.unwrap_or(1)
+		.max(1)
+}
+
+fn scaled(d: Duration) -> Duration {
+	d.saturating_mul(timeout_scale())
+}
+
 use rustls::StreamOwned;
 use snip_core::browser::LogQuery;
 use snip_core::format::ChangeType;
@@ -726,7 +738,7 @@ fn git_requests_need_a_paired_master() {
 		workspace: "any".into(),
 		under: None,
 	};
-	let scan_res = conn.call(&scan_req, None, Duration::from_secs(5));
+	let scan_res = conn.call(&scan_req, None, scaled(Duration::from_secs(5)));
 	match scan_res {
 		Err(RemoteError::Refused { code, .. }) => {
 			assert_eq!(code, ErrorCode::NotPaired);
@@ -740,7 +752,7 @@ fn git_requests_need_a_paired_master() {
 		profile: snip_core::gitview::ReadProfile::Interactive,
 		query: GitQuery::ChangeList,
 	};
-	let git_res = conn.call(&git_req, None, Duration::from_secs(5));
+	let git_res = conn.call(&git_req, None, scaled(Duration::from_secs(5)));
 	match git_res {
 		Err(RemoteError::Refused { code, .. }) => {
 			assert_eq!(code, ErrorCode::NotPaired);
@@ -801,8 +813,10 @@ fn v1_connection_never_sees_pending() {
 	let (config, _) =
 		client_config(&master, Some(paired.pin().unwrap())).unwrap();
 	let tcp = TcpStream::connect(w.local_addr()).unwrap();
-	tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-	tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+	tcp.set_read_timeout(Some(scaled(Duration::from_secs(5))))
+		.unwrap();
+	tcp.set_write_timeout(Some(scaled(Duration::from_secs(5))))
+		.unwrap();
 	let conn = rustls::ClientConnection::new(config, server_name()).unwrap();
 	let mut tls = StreamOwned::new(conn, tcp);
 
@@ -879,8 +893,10 @@ fn dropping_the_connection_cancels_the_worker_git() {
 	let (config, _) =
 		client_config(&master, Some(paired.pin().unwrap())).unwrap();
 	let tcp = TcpStream::connect(w.local_addr()).unwrap();
-	tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-	tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+	tcp.set_read_timeout(Some(scaled(Duration::from_secs(5))))
+		.unwrap();
+	tcp.set_write_timeout(Some(scaled(Duration::from_secs(5))))
+		.unwrap();
 	let conn = rustls::ClientConnection::new(config, server_name()).unwrap();
 	let mut tls = StreamOwned::new(conn, tcp);
 
@@ -913,7 +929,7 @@ fn dropping_the_connection_cancels_the_worker_git() {
 	drop(tls);
 
 	// Read pid from pid_file
-	let pid_deadline = Instant::now() + Duration::from_secs(5);
+	let pid_deadline = Instant::now() + scaled(Duration::from_secs(5));
 	let mut slow_pid = None;
 	while Instant::now() < pid_deadline {
 		if let Ok(content) = fs::read_to_string(&pid_file) {
@@ -927,7 +943,7 @@ fn dropping_the_connection_cancels_the_worker_git() {
 	let pid = slow_pid.expect("slow git PID file was not written");
 
 	// Verify within bounded wait that running_jobs is 0 and process is dead
-	let wait_deadline = Instant::now() + Duration::from_secs(10);
+	let wait_deadline = Instant::now() + scaled(Duration::from_secs(10));
 	let mut jobs_zero = false;
 	let mut proc_dead = false;
 
@@ -970,10 +986,10 @@ fn vanished_master_does_not_keep_git_running() {
 	run_git(&slow_repo, &["commit", "-m", "init"]);
 
 	let (w, _) = test_worker(&[&ws], None);
-	// Short scan deadline of 2 seconds for this test
+	// Short scan deadline for this test
 	w.set_deadlines_for_tests(
-		Duration::from_secs(60),
-		Duration::from_millis(1500),
+		scaled(Duration::from_secs(60)),
+		scaled(Duration::from_millis(1500)),
 	);
 
 	let master = Arc::new(Identity::generate().unwrap());
@@ -1015,7 +1031,7 @@ fn vanished_master_does_not_keep_git_running() {
 	.unwrap();
 
 	// Master stops reading without dropping connection
-	let pid_deadline = Instant::now() + Duration::from_secs(5);
+	let pid_deadline = Instant::now() + scaled(Duration::from_secs(5));
 	let mut slow_pid = None;
 	while Instant::now() < pid_deadline {
 		if let Ok(content) = fs::read_to_string(&pid_file) {
@@ -1029,7 +1045,7 @@ fn vanished_master_does_not_keep_git_running() {
 	let pid = slow_pid.expect("slow git PID file was not written");
 
 	// Within deadline, job deadline fires, worker cancels git and running_jobs -> 0
-	let wait_deadline = Instant::now() + Duration::from_secs(10);
+	let wait_deadline = Instant::now() + scaled(Duration::from_secs(10));
 	let mut jobs_zero = false;
 	let mut proc_dead = false;
 
@@ -1146,7 +1162,7 @@ fn disconnect_storm_stays_within_the_job_cap() {
 		max_observed.load(std::sync::atomic::Ordering::SeqCst)
 	);
 
-	let deadline = Instant::now() + Duration::from_secs(10);
+	let deadline = Instant::now() + scaled(Duration::from_secs(10));
 	while w.running_jobs() > 0 && Instant::now() < deadline {
 		std::thread::sleep(Duration::from_millis(25));
 	}
@@ -1176,7 +1192,8 @@ fn unsharing_mid_scan_cancels_and_refuses() {
 	let (config, _) =
 		client_config(&master, Some(paired.pin().unwrap())).unwrap();
 	let tcp = TcpStream::connect(w.local_addr()).unwrap();
-	tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+	tcp.set_read_timeout(Some(scaled(Duration::from_secs(10))))
+		.unwrap();
 	let conn = rustls::ClientConnection::new(config, server_name()).unwrap();
 	let mut tls = StreamOwned::new(conn, tcp);
 
@@ -1210,7 +1227,7 @@ fn unsharing_mid_scan_cancels_and_refuses() {
 
 	// Read reply frame
 	let mut final_error = None;
-	let deadline = Instant::now() + Duration::from_secs(8);
+	let deadline = Instant::now() + scaled(Duration::from_secs(8));
 	while Instant::now() < deadline {
 		match read_frame::<Response>(&mut tls).unwrap() {
 			Some(Response::Pending) => {}
@@ -1231,7 +1248,7 @@ fn unsharing_mid_scan_cancels_and_refuses() {
 		"expected Forbidden or Cancelled, got {code:?}"
 	);
 
-	let wait_deadline = Instant::now() + Duration::from_secs(5);
+	let wait_deadline = Instant::now() + scaled(Duration::from_secs(5));
 	while w.running_jobs() > 0 && Instant::now() < wait_deadline {
 		std::thread::sleep(Duration::from_millis(20));
 	}
@@ -1242,6 +1259,7 @@ fn unsharing_mid_scan_cancels_and_refuses() {
 #[test]
 fn scan_of_many_slow_repos_returns_partial_not_timeout() {
 	let _serial = serial();
+	let s = timeout_scale() as u64;
 	let tmp = tempfile::tempdir().unwrap();
 	let ws = tmp.path().join("ws");
 	fs::create_dir_all(&ws).unwrap();
@@ -1254,19 +1272,23 @@ fn scan_of_many_slow_repos_returns_partial_not_timeout() {
 	run_git(&fast, &["commit", "-m", "init"]);
 
 	// Several slow repos (slow-1 .. slow-4)
+	let budget_secs = 6 * s;
+	let slow_sleep_secs = budget_secs + 1;
+	let slow_sleep_str = format!("{slow_sleep_secs}.0");
 	for i in 1..=4 {
 		let repo_dir = ws.join(format!("slow-{i}"));
 		run_git(&repo_dir, &["init", "-b", "main"]);
 		fs::write(repo_dir.join("f.txt"), "s").unwrap();
 		run_git(&repo_dir, &["add", "f.txt"]);
 		run_git(&repo_dir, &["commit", "-m", "init"]);
-		fs::write(repo_dir.join(".slow_sleep"), "1").unwrap();
+		fs::write(repo_dir.join(".slow_sleep"), &slow_sleep_str).unwrap();
 		fs::write(repo_dir.join(".slow_active"), "").unwrap();
 	}
 
 	let (w, _) = test_worker(&[&ws], None);
-	// Scan deadline 8s -> budget is 8s - 5s = 3s
-	w.set_deadlines_for_tests(Duration::from_secs(60), Duration::from_secs(8));
+	// Scan deadline = 5s (reserve) + 6s*s so budget = 6s*s
+	let scan_deadline = Duration::from_secs(5 + budget_secs);
+	w.set_deadlines_for_tests(Duration::from_secs(60 * s), scan_deadline);
 
 	let (client, ws_id) = paired_client(&w);
 	let start = Instant::now();
@@ -1274,8 +1296,8 @@ fn scan_of_many_slow_repos_returns_partial_not_timeout() {
 	let elapsed = start.elapsed();
 
 	assert!(
-		elapsed < Duration::from_secs(7),
-		"should complete before the 8s job deadline, took {elapsed:?}"
+		elapsed < scan_deadline,
+		"should complete before the {scan_deadline:?} job deadline, took {elapsed:?}"
 	);
 	assert_eq!(scan.status, ScanStatus::TimedOut);
 
@@ -2598,22 +2620,24 @@ fn scan_with_admission_wait_returns_incomplete_not_timeout() {
 	let ws = tmp.path().join("ws");
 	fs::create_dir_all(&ws).unwrap();
 
+	let s = timeout_scale() as u64;
+
 	// Create a slow repo
 	let slow_repo = ws.join("slow_repo");
 	run_git(&slow_repo, &["init", "-b", "main"]);
 	fs::write(slow_repo.join("f.txt"), "hello").unwrap();
 	run_git(&slow_repo, &["add", "f.txt"]);
 	run_git(&slow_repo, &["commit", "-m", "init"]);
-	fs::write(slow_repo.join(".slow_sleep"), "0.6").unwrap();
+	let slow_sleep_str = format!("{:.1}", 2.0 * s as f64);
+	fs::write(slow_repo.join(".slow_sleep"), &slow_sleep_str).unwrap();
 	fs::write(slow_repo.join(".slow_active"), "").unwrap();
 
 	let (w, _) = test_worker(&[&ws], None);
-	// Set scan deadline to 1000ms: budget reserve is 500ms (scan_deadline / 2),
-	// so budget deadline is entry + 500ms. Admission wait of ~600ms exceeds budget.
-	w.set_deadlines_for_tests(
-		Duration::from_secs(60),
-		Duration::from_millis(1000),
-	);
+	// Set scan deadline to 3000ms * s: budget reserve is 1500ms * s (scan_deadline / 2),
+	// so budget deadline is entry + 1500ms * s. Admission wait of ~2000ms * s exceeds budget
+	// but is well within the 3000ms * s job deadline.
+	let scan_deadline = Duration::from_millis(3000 * s);
+	w.set_deadlines_for_tests(Duration::from_secs(60 * s), scan_deadline);
 
 	let (client, ws_id) = paired_client(&w);
 	let client = Arc::new(client);
@@ -2621,11 +2645,11 @@ fn scan_with_admission_wait_returns_incomplete_not_timeout() {
 	let client2 = client.clone();
 	let ws_id2 = ws_id.clone();
 
-	// Client 1 starts scan on ws, holding the scan slot while slow_repo runs (~300ms)
+	// Client 1 starts scan on ws, holding the scan slot while slow_repo runs (~2s*s)
 	let t1 = std::thread::spawn(move || client1.scan_repos(&ws_id, None, None));
 
 	// Wait until client 1 is running
-	let wait_deadline = Instant::now() + Duration::from_secs(2);
+	let wait_deadline = Instant::now() + Duration::from_secs(5 * s);
 	while w.running_jobs() == 0 && Instant::now() < wait_deadline {
 		std::thread::sleep(Duration::from_millis(10));
 	}
