@@ -234,7 +234,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - Log 空狀態（`LogEmpty`）：依序判定「掃描中（Scanning）→ 讀取中（Loading）→ 沒有 repo（NoRepository）→ 失敗（Failed）→ 空（Empty）」。多 repo 合併 log 中若有部分 repo 讀取失敗，log 上方顯示「N 個儲存庫無法讀取：a, b, …」提示（`log_failed_feeds`），只列前 2 個名稱，完整清單在提示的 tooltip。
 - **和本機一樣開 repo**:
   - worker 以 `LocalRepo::open_served` 開 repo:探索與身分判定和本機工作區相同(`identify_repos` 不帶 boundary),所以主 repo 在工作區外的 linked worktree、獨立 git dir、借用外部物件庫(alternates／`--shared`)都照常顯示,和本機一致。
-  - 探索到的 `.git` 必須解析回它自己所在的資料夾:空的 `.git` 讓 git 往上找到外層 repo 時,列為錯誤列「not a git repository」,不把外層 repo 當成這個資料夾的。本機與遠端都套用。
+  - 探索到的 `.git` 必須解析回它自己所在的資料夾:空的 `.git` 讓 git 往上找到外層 repo 時,這個資料夾不算 repo、直接略過(和 git 一致),也不把外層 repo 當成它的。本機與遠端都套用。
   - 不改 worker 端的 index:served `git diff` 需要讀 index 時,以 `GIT_INDEX_FILE` 指向私有暫存副本,不寫入真正的 `.git/index`、不搶 `index.lock`,因為那台機器的使用者可能同時在用 git。
   - 執行環境強化照舊:固定 argv 前綴 `-c core.fsmonitor= -c protocol.allow=never -c core.hooksPath=/dev/null`(Windows 為 `NUL`),注入 `GIT_OPTIONAL_LOCKS=0`、`GIT_NO_LAZY_FETCH=1`,清除 `GIT_DIR`、`GIT_WORK_TREE` 等變數。
 - **資源規則**:

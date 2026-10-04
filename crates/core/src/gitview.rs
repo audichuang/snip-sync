@@ -721,19 +721,10 @@ pub fn identify_repos(
 		};
 
 		// A marker git did not take (an empty `.git`) makes git climb to an
-		// enclosing repository: that one is not this folder's.
+		// enclosing repository: git does not see a repo here, so neither do we.
 		let toplevel = dunce::canonicalize(&id.toplevel)
 			.unwrap_or_else(|_| id.toplevel.clone());
 		if toplevel != canonical_path {
-			if seen_roots.insert(canonical_path) {
-				list.push(FoundRepo {
-					root: r.path,
-					name,
-					kind: FoundKind::Main,
-					identity: None,
-					summary: Err("not a git repository".to_string()),
-				});
-			}
 			continue;
 		}
 		if !seen_identities.insert((id.toplevel.clone(), id.git_dir.clone())) {

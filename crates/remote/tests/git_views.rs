@@ -357,7 +357,7 @@ fn scan_never_reports_a_parent_repository() {
 }
 
 #[test]
-fn broken_git_dir_is_an_error_row_not_the_parent() {
+fn empty_git_dir_is_skipped_not_the_parent() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let parent = tmp.path().join("parent");
@@ -376,9 +376,12 @@ fn broken_git_dir_is_an_error_row_not_the_parent() {
 		"must not report parent repo"
 	);
 
-	let broken_row = scan.repos.iter().find(|r| r.rel == "broken");
-	assert!(broken_row.is_some(), "must have row for broken");
-	assert!(broken_row.unwrap().summary.is_err());
+	// git sees no repo in `broken`, so the scan lists none (as locally).
+	assert!(
+		!scan.repos.iter().any(|r| r.rel == "broken"),
+		"an empty .git is not a repo: {:?}",
+		scan.repos.iter().map(|r| &r.rel).collect::<Vec<_>>()
+	);
 }
 
 #[test]
