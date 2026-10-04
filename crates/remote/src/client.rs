@@ -20,10 +20,13 @@ use snip_core::gitview::{
 	ChangeList, ChangedPathList, CommitDetails, Read, ReadProfile, RepoView,
 };
 
+use snip_core::commits::CommitCopyOutcome;
+use snip_core::transfer::CopyOutcome;
+
 use crate::proto::{
-	read_frame, write_frame, DirEntry, ErrorCode, GitQuery, GitReply,
-	RemoteWorkspace, RepoScan, Request, Response, Stat, GIT_CALL_LIMIT,
-	MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
+	read_frame, write_frame, DirEntry, ErrorCode, ExportTarget, GitQuery,
+	GitReply, RemoteWorkspace, RepoScan, Request, Response, Stat,
+	GIT_CALL_LIMIT, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::worker::{Worker, PREAMBLE};
 use crate::RemoteError;
@@ -427,8 +430,31 @@ pub(crate) fn exchange(
 	*frames = 0;
 	io.send(request)?;
 	let started = Instant::now();
+	// A copy's text arriving ahead of its reply.
+	let mut text = String::new();
 	loop {
 		match io.recv(IO_TIMEOUT)? {
+			Some(Response::Chunk { data }) => {
+				*frames += 1;
+				if text.len() + data.len()
+					> snip_core::transfer::CLIPBOARD_PAYLOAD_MAX
+				{
+					return Err(RemoteError::Protocol(
+						"the copied text is over the clipboard limit".into(),
+					));
+				}
+				text.push_str(&data);
+			}
+			Some(Response::Copied(mut out)) if !text.is_empty() => {
+				*frames += 1;
+				out.payload = text;
+				return Ok(Response::Copied(out));
+			}
+			Some(Response::CommitsCopied(mut out)) if !text.is_empty() => {
+				*frames += 1;
+				out.text = text;
+				return Ok(Response::CommitsCopied(out));
+			}
 			Some(Response::Pending) => {
 				*frames += 1;
 				if cancel.is_some_and(|c| c.is_cancelled()) {
@@ -595,7 +621,10 @@ impl Client {
 		let start = Instant::now();
 		let is_git = matches!(
 			request,
-			Request::ScanRepos { .. } | Request::GitView { .. }
+			Request::ScanRepos { .. }
+				| Request::GitView { .. }
+				| Request::Export { .. }
+				| Request::ExportCommits { .. }
 		);
 		let _guard = if is_git {
 			Some(self.limiter.acquire(cancel, limit)?)
@@ -653,6 +682,49 @@ impl Client {
 		}
 		self.keep(conn);
 		result
+	}
+
+	/// Copies `items` of `workspace` as one snip-sync payload, run by the
+	/// worker with the local copy engine.
+	pub fn export_files(
+		&self,
+		workspace: &str,
+		items: Vec<ExportTarget>,
+		settings: &snip_core::settings::Settings,
+		file_limit: usize,
+		cancel: Option<&CancelToken>,
+	) -> Result<CopyOutcome, RemoteError> {
+		let req = Request::Export {
+			workspace: workspace.into(),
+			items,
+			settings: settings.clone(),
+			file_limit,
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::Copied(out) => Ok(out),
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Copies the commits `selected` (ending at `tip`) of `repo`.
+	pub fn export_commits(
+		&self,
+		workspace: &str,
+		repo: &str,
+		tip: &str,
+		selected: Vec<String>,
+		cancel: Option<&CancelToken>,
+	) -> Result<CommitCopyOutcome, RemoteError> {
+		let req = Request::ExportCommits {
+			workspace: workspace.into(),
+			repo: repo.into(),
+			tip: tip.into(),
+			selected,
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::CommitsCopied(out) => Ok(out),
+			_ => Err(unexpected()),
+		}
 	}
 
 	/// Resolves `path` (absolute, or `~/…`) to a workspace on the worker.

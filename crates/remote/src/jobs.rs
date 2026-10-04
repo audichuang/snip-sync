@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use snip_core::gitrun::CancelToken;
 
-use crate::proto::{write_frame, ErrorCode, Response};
+use crate::proto::{write_frame, ErrorCode, Response, CHUNK_BYTES};
 
 pub(crate) const MAX_GIT_JOBS: usize = 2; // running GitView/ScanRepos at once
 pub(crate) const MAX_SCAN_JOBS: usize = 1; // of those, scans
@@ -238,10 +238,50 @@ impl Jobs {
 	}
 }
 
+/// Splits `text` into pieces of at most [`CHUNK_BYTES`] on char boundaries.
+fn chunks(text: &str) -> impl Iterator<Item = &str> {
+	let mut rest = text;
+	std::iter::from_fn(move || {
+		if rest.is_empty() {
+			return None;
+		}
+		let mut end = rest.len().min(CHUNK_BYTES);
+		while !rest.is_char_boundary(end) {
+			end -= 1;
+		}
+		let (head, tail) = rest.split_at(end);
+		rest = tail;
+		Some(head)
+	})
+}
+
 pub(crate) fn write_response<W: Write>(
 	w: &mut W,
 	response: &Response,
 ) -> io::Result<()> {
+	// A copy's text goes ahead in chunks; the reply itself carries none.
+	let text = match response {
+		Response::Copied(out) => Some(out.payload.as_str()),
+		Response::CommitsCopied(out) => Some(out.text.as_str()),
+		_ => None,
+	};
+	if let Some(text) = text.filter(|t| t.len() > CHUNK_BYTES) {
+		for data in chunks(text) {
+			write_frame(
+				w,
+				&Response::Chunk {
+					data: data.to_string(),
+				},
+			)?;
+		}
+		let mut reply = response.clone();
+		match &mut reply {
+			Response::Copied(out) => out.payload.clear(),
+			Response::CommitsCopied(out) => out.text.clear(),
+			_ => {}
+		}
+		return write_response(w, &reply);
+	}
 	match write_frame(w, response) {
 		Err(err) if err.kind() == io::ErrorKind::InvalidData => write_frame(
 			w,

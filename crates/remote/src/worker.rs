@@ -377,6 +377,42 @@ fn serve(
 					)?;
 				}
 			}
+			Request::Export {
+				workspace,
+				items,
+				settings,
+				file_limit,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					|root, cancel| {
+						crate::copyserve::export(
+							root, items, &settings, file_limit, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ExportCommits {
+				workspace,
+				repo,
+				tip,
+				selected,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					|root, cancel| {
+						crate::copyserve::export_commits(
+							root, &repo, &tip, &selected, cancel,
+						)
+					},
+				)?;
+			}
 			other => {
 				let response = state.handle(other);
 				crate::jobs::write_response(&mut writer, &response)?;
@@ -384,6 +420,44 @@ fn serve(
 		}
 	}
 	Ok(())
+}
+
+/// Runs a copy as a job of `workspace`, as Git views run.
+fn serve_copy(
+	writer: &mut impl Write,
+	state: &State,
+	negotiated: u32,
+	workspace: &str,
+	op: impl FnOnce(&SharedRoot, &snip_core::gitrun::CancelToken) -> Response + Send,
+) -> io::Result<()> {
+	if negotiated < crate::proto::TRANSFER_VERSION {
+		return crate::jobs::write_response(
+			writer,
+			&error(
+				ErrorCode::Unsupported,
+				"copy is not available on this worker yet".into(),
+			),
+		);
+	}
+	let (view_deadline, _) = *lock(&state.deadlines);
+	let cancel = snip_core::gitrun::CancelToken::new();
+	crate::jobs::run_job(writer, view_deadline, cancel, |job_cancel, _| {
+		match state.jobs.admit(
+			workspace,
+			crate::jobs::JobKind::View,
+			job_cancel,
+		) {
+			Ok(_guard) => {
+				let root = match state.get_shared_root(workspace) {
+					Ok(r) => r,
+					Err(resp) => return resp,
+				};
+				let reply = op(&root, job_cancel);
+				verify_root_unchanged(state, workspace, &root, reply)
+			}
+			Err(code) => map_admit_error(code),
+		}
+	})
 }
 
 fn error(code: ErrorCode, message: String) -> Response {
@@ -486,6 +560,10 @@ impl State {
 					"Git views are not available on this worker yet".into(),
 				)
 			}
+			Request::Export { .. } | Request::ExportCommits { .. } => error(
+				ErrorCode::BadRequest,
+				"copy requests are served as jobs".into(),
+			),
 			Request::Write { .. } | Request::Rename { .. } => error(
 				ErrorCode::Unsupported,
 				"not available on this worker yet".into(),

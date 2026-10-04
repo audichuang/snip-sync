@@ -266,7 +266,7 @@ fn cli_master_git_views_refuse_an_old_worker() {
 	for args in [["repos", "anyhost", ws], ["changes", "anyhost", ws]] {
 		let stderr = old.fails(&args);
 		assert!(
-			stderr.contains("too old for Git views")
+			stderr.contains("too old for this")
 				&& stderr.contains("protocol 1, this needs 2"),
 			"snip remote {args:?}: {stderr}"
 		);
@@ -497,4 +497,69 @@ fn cli_master_git_view_rejects_escaping_paths() {
 	m.fails(&["diff", "anyhost", ws, "alpha", "../../secret.txt"]);
 	m.fails(&["show", "anyhost", ws, "alpha", "--", "--output=x"]);
 	m.fails(&["changes", "anyhost", ws, "../.."]);
+}
+
+/// `snip copy` of a folder, run locally, as the payload a remote copy of
+/// the same folder must equal.
+fn local_copy(dir: &Path) -> String {
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args(["copy", ".", "--stdout"])
+		.current_dir(dir)
+		.env("SNIP_CONFIG_DIR", dir.join("../cfg-local"));
+	let (status, stdout, stderr) = output(cmd, "snip copy");
+	assert_eq!(status, Some(0), "snip copy: {stderr}");
+	stdout
+}
+
+#[test]
+fn cli_remote_copy_of_a_folder_equals_a_local_copy() {
+	let tmp = tempfile::tempdir().unwrap();
+	let proj = tmp.path().join("proj");
+	std::fs::create_dir_all(proj.join("sub")).unwrap();
+	std::fs::create_dir_all(proj.join(".hidden")).unwrap();
+	std::fs::write(proj.join("a.txt"), "alpha\n").unwrap();
+	std::fs::write(proj.join("z.txt"), "zed").unwrap();
+	std::fs::write(proj.join("sub/中文.txt"), "深層\r\nx\n").unwrap();
+	std::fs::write(proj.join(".hidden/h.txt"), "h\n").unwrap();
+	let m = Master::new(tmp.path());
+	let remote = m.ok(&["copy", "h", s(&proj), "--stdout"]);
+	assert_eq!(remote, local_copy(&proj));
+	let one = m.ok(&["copy", "h", s(&proj), "sub", "--stdout"]);
+	assert!(one.contains("// file: sub/中文.txt"), "{one}");
+	assert!(!one.contains("a.txt"), "{one}");
+}
+
+#[test]
+fn cli_remote_copy_of_staged_changes_and_commits() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	std::fs::create_dir_all(&repo).unwrap();
+	git(&repo, &["init", "-q", "-b", "main"]);
+	std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+	git(&repo, &["add", "a.txt"]);
+	git(&repo, &["commit", "-q", "-m", "first"]);
+	std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+	git(&repo, &["add", "a.txt"]);
+	std::fs::write(repo.join("b.txt"), "untracked\n").unwrap();
+	let m = Master::new(tmp.path());
+	let staged = m.ok(&["copy", "h", s(&repo), "--staged", "--stdout"]);
+	assert!(staged.contains("// file: [MODIFIED] a.txt"), "{staged}");
+	assert!(!staged.contains("b.txt"), "{staged}");
+	let head = git_out(&repo, &["rev-parse", "HEAD"]);
+	let commits =
+		m.ok(&["copy-commits", "h", s(&repo), head.trim(), "--stdout"]);
+	assert!(commits.starts_with("// snip-sync commits v1"), "{commits}");
+	assert!(commits.contains("\"message\":\"first"), "{commits}");
+}
+
+#[test]
+fn cli_remote_copy_refuses_a_worker_without_copy() {
+	let tmp = tempfile::tempdir().unwrap();
+	std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+	let m = Master::with_exec(tmp.path(), serve_exec("--max-protocol 2"));
+	let err = m.fails(&["copy", "h", s(tmp.path()), "a.txt", "--stdout"]);
+	assert!(err.contains("too old"), "{err}");
 }

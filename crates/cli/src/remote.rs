@@ -62,6 +62,53 @@ pub enum RemoteCommand {
 		workspace: String,
 		args: Vec<String>,
 	},
+	/// Copy files or changes of a workspace as one snip-sync payload, made
+	/// on the host by the same engine a local copy uses.
+	Copy {
+		host: String,
+		workspace: String,
+		/// Paths relative to --in (default: the whole folder).
+		paths: Vec<String>,
+		/// The repository the paths are relative to, inside the workspace.
+		#[arg(
+			long = "in",
+			id = "in_repo",
+			value_name = "REPO",
+			default_value = ""
+		)]
+		repo: String,
+		/// Uncommitted changes (all of them without paths).
+		#[arg(long, conflicts_with_all = ["staged", "commit"])]
+		working: bool,
+		/// Staged (index) content (all of it without paths).
+		#[arg(long, conflicts_with = "commit")]
+		staged: bool,
+		/// The changes of one commit (all of them without paths).
+		#[arg(long, value_name = "SHA")]
+		commit: Option<String>,
+		/// Print the payload instead of writing the clipboard.
+		#[arg(long)]
+		stdout: bool,
+	},
+	/// Copy commits of a repository as a commit payload: the newest first,
+	/// then the rest of a contiguous first-parent chain.
+	CopyCommits {
+		host: String,
+		workspace: String,
+		#[arg(required = true)]
+		shas: Vec<String>,
+		/// The repository, inside the workspace.
+		#[arg(
+			long = "in",
+			id = "in_repo",
+			value_name = "REPO",
+			default_value = ""
+		)]
+		repo: String,
+		/// Print the payload instead of writing the clipboard.
+		#[arg(long)]
+		stdout: bool,
+	},
 	/// Diff a file against the working tree, index, or a commit.
 	Diff {
 		host: String,
@@ -88,6 +135,64 @@ fn find_workspace(
 	workspace: &str,
 ) -> Result<RemoteWorkspace, String> {
 	client.open_workspace(workspace).map_err(|e| e.to_string())
+}
+
+/// Paths to copy, with the change type when a change list named it.
+type Named = Vec<(String, Option<ChangeType>)>;
+
+/// Files a copy of `source` takes when the user named none: every change
+/// of that kind in `repo`.
+fn all_changes(
+	client: Client,
+	ws: &RemoteWorkspace,
+	repo: &str,
+	source: &snip_core::transfer::SourceKind,
+) -> Result<(Client, Named), String> {
+	use snip_core::transfer::SourceKind;
+	let client = Arc::new(client);
+	let view = RemoteRepo::new(client.clone(), ws.id.clone(), repo.into());
+	let read = Read {
+		profile: ReadProfile::Interactive,
+		cancel: None,
+	};
+	let paths = match source {
+		SourceKind::Commit { rev } => {
+			view.changed_paths(&GitSource::Commit(rev.clone()), 100_000, &read)
+				.map_err(|e| e.to_string())?
+				.paths
+		}
+		_ => {
+			let want = match source {
+				SourceKind::Staged => ChangeSource::Staged,
+				_ => ChangeSource::Working,
+			};
+			view.change_list(100_000, &read)
+				.map_err(|e| e.to_string())?
+				.rows
+				.into_iter()
+				.filter(|r| {
+					r.source == want
+						|| (want == ChangeSource::Working
+							&& r.source == ChangeSource::Unstaged)
+				})
+				.map(|r| (r.path, r.change_type))
+				.collect()
+		}
+	};
+	drop(view);
+	let client = Arc::try_unwrap(client).map_err(|_| "client still shared")?;
+	Ok((client, paths))
+}
+
+fn emit(text: &str, stdout: bool) -> Result<(), String> {
+	if stdout {
+		let mut out = io::stdout().lock();
+		return out
+			.write_all(text.as_bytes())
+			.and_then(|()| out.flush())
+			.map_err(|e| e.to_string());
+	}
+	crate::write_clipboard(text)
 }
 
 fn change_char(change: Option<ChangeType>) -> char {
@@ -304,6 +409,101 @@ pub fn run(cmd: RemoteCommand) -> Outcome {
 				let type_char = change_char(*change_type);
 				println!("{type_char}\t{path}");
 			}
+			Ok(())
+		}
+		RemoteCommand::Copy {
+			host,
+			workspace,
+			paths,
+			repo,
+			working,
+			staged,
+			commit,
+			stdout,
+		} => {
+			use snip_core::transfer::SourceKind;
+			let c = client(&host);
+			let ws = find_workspace(&c, &workspace)?;
+			let source = if working {
+				SourceKind::Working
+			} else if staged {
+				SourceKind::Staged
+			} else if let Some(rev) = commit {
+				SourceKind::Commit { rev }
+			} else {
+				SourceKind::File
+			};
+			let (c, named) = if paths.is_empty() && source != SourceKind::File {
+				all_changes(c, &ws, &repo, &source)?
+			} else if paths.is_empty() {
+				// The whole folder: its entries, as a local copy of `.` takes.
+				let (entries, _) =
+					c.list_dir(&ws.id, &repo).map_err(|e| e.to_string())?;
+				let mut names: Vec<String> = entries
+					.into_iter()
+					.filter(|e| e.utf8)
+					.map(|e| e.name)
+					.collect();
+				names.sort();
+				(c, names.into_iter().map(|n| (n, None)).collect())
+			} else {
+				(c, paths.into_iter().map(|p| (p, None)).collect())
+			};
+			if named.is_empty() {
+				return Err("nothing to copy".into());
+			}
+			let items = named
+				.into_iter()
+				.map(|(path, change_type)| snip_remote::ExportTarget {
+					root: repo.clone(),
+					path,
+					source: source.clone(),
+					change_type,
+				})
+				.collect();
+			let settings = snip_core::settings::Settings::default();
+			let limit = settings.file_count_limit as usize;
+			let out = c
+				.export_files(&ws.id, items, &settings, limit, None)
+				.map_err(|e| e.to_string())?;
+			if out.copied == 0 {
+				return Err("nothing could be copied".into());
+			}
+			emit(&out.payload, stdout)?;
+			eprintln!(
+				"copied {} files, {} chars{}{}",
+				out.copied,
+				out.chars,
+				if out.skipped > 0 {
+					format!(", {} skipped", out.skipped)
+				} else {
+					String::new()
+				},
+				if out.truncated {
+					" (file limit reached)"
+				} else {
+					""
+				},
+			);
+			Ok(())
+		}
+		RemoteCommand::CopyCommits {
+			host,
+			workspace,
+			shas,
+			repo,
+			stdout,
+		} => {
+			let c = client(&host);
+			let ws = find_workspace(&c, &workspace)?;
+			let out = c
+				.export_commits(&ws.id, &repo, &shas[0], shas.clone(), None)
+				.map_err(|e| e.to_string())?;
+			emit(&out.text, stdout)?;
+			eprintln!(
+				"copied {} commits, {} files, {} chars",
+				out.commit_count, out.file_count, out.chars
+			);
 			Ok(())
 		}
 		RemoteCommand::Diff {
