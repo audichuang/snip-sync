@@ -141,6 +141,12 @@ g_init() {
 }
 mkdir -p gitws/plain gitws/broken/.git outer/inner
 echo plain > gitws/plain/file.txt
+# Worktrees synced from another machine: their .git names a gitdir that
+# does not exist here, as in a Google Drive copy.
+mkdir -p gitws/wt-gone-1 gitws/wt-gone-2
+echo 'gitdir: /nonexistent/other-machine/.git/worktrees/wt-gone-1' > gitws/wt-gone-1/.git
+echo 'gitdir: /nonexistent/other-machine/.git/worktrees/wt-gone-2' > gitws/wt-gone-2/.git
+echo kept > gitws/wt-gone-1/kept.txt
 
 g_init gitws/alpha
 printf 'commit 1 a\n' > gitws/alpha/a.txt
@@ -286,6 +292,9 @@ alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/
 repos_gitws=$("$SNIP" remote repos h "$WD/gitws")
 check "repos gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
 check "broken appears as an error row" test "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1
+check "two worktrees with a missing gitdir are error rows" test "$(grep -cE '^wt-gone-[12]	error: ' <<<"$repos_gitws")" = 2
+check "the broken worktrees do not hide alpha's changes" bash -c "'$SNIP' remote changes h '$WD/gitws' alpha | grep -q 'a.txt'"
+check "a broken worktree's files still browse" bash -c "'$SNIP' remote cat h '$WD/gitws' wt-gone-1/kept.txt | grep -qx kept"
 check "wt and borrowed are served as locally" test "$(grep '^wt	' <<<"$repos_gitws" | grep -vc error)" = 1 -a "$(grep '^borrowed	' <<<"$repos_gitws" | grep -vc error)" = 1
 
 changes_mainwt=$("$SNIP" remote changes h "$WD/gitws" mainwt)
