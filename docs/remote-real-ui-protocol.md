@@ -244,7 +244,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | `[APP:REMOTE_WORKSPACES: count=N]` | 列出工作區成功（失敗時沒有這行，只在選單顯示紅字） |
 | `[APP:REMOTE_OPENED: <worker> ▸ <工作區> generation=N]` | 開啟遠端工作區 |
 | `[APP:TREE_ROW_REFUSED: not-utf8]` | 點了名稱不是 UTF-8 的列，無法開啟 |
-| `[APP:CHANGES_EMPTY: state=…]` | Changes 空狀態改變：`no_workspace`、`scanning`、`loading`、`no_repository`、`scan_failed`、`no_match`、`clean` |
+| `[APP:CHANGES_EMPTY: state=…]` | Changes 空狀態改變：`no_workspace`、`scanning`、`loading`、`no_repository`、`scan_failed`、`no_match`、`clean`、`clean_partial`（乾淨，但至少一個 repo 沒讀完整，不等於完整乾淨，R32b 等步驟仍以 `state=clean` 判定） |
 | `[APP:LOG_EMPTY: state=…]` | Log 空狀態改變：`no_workspace`、`scanning`、`loading`、`no_repository`、`failed`、`empty` |
 | `[APP:E2E_REPO: name=<名稱> ok=true/false …]` | 儲存庫掃描或載入狀態 |
 | `[APP:CHANGES_LOADED: <名稱> files=N]` | Changes 面板儲存庫變更清單載入完成 |

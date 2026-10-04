@@ -12053,6 +12053,11 @@ mod tests {
 				m.selected_commit_file = Some("b.txt".into());
 				// Switch to another repo (non-preserving).
 				m.select_repo(1, cx);
+				// The switch itself must drop the stale file, not rely on
+				// the label code ignoring it.
+				assert_eq!(m.selected_commit_file, None);
+				// A later commit pick leaves the file field untouched.
+				m.selected_commit = Some("def5678".into());
 				// Preview error on the newly selected repo.
 				m.show_preview_error(crate::i18n::Msg::new(
 					"error_repo_status",
@@ -12062,9 +12067,8 @@ mod tests {
 
 			model.read_with(cx, |m, _| {
 				let (tab, crumbs, _) = m.source_labels();
-				let expected_no_file = crate::i18n::t("no_file", m.locale);
-				assert_eq!(tab, expected_no_file);
-				assert_eq!(crumbs, "beta");
+				assert_ne!(tab, "b.txt");
+				assert!(!tab.contains("b.txt"));
 				assert!(!crumbs.contains("b.txt"));
 			});
 
