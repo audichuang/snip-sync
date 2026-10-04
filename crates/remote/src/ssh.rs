@@ -51,7 +51,12 @@ pub fn config_hosts() -> Vec<String> {
 	let ssh_dir = home.join(".ssh");
 	let mut hosts = Vec::new();
 	let mut seen_files = Vec::new();
-	read_hosts(&ssh_dir.join("config"), &ssh_dir, &mut hosts, &mut seen_files);
+	read_hosts(
+		&ssh_dir.join("config"),
+		&ssh_dir,
+		&mut hosts,
+		&mut seen_files,
+	);
 	hosts
 }
 

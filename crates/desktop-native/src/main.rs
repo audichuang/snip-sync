@@ -1291,10 +1291,9 @@ pub struct WorkbenchModel {
 	pub log_commit_root: Option<PathBuf>,
 	/// A Replace load waited for discovery to reach the picked repositories.
 	pub log_deferred: bool,
-	/// Remote-node mode: paired workers and an open remote workspace.
+	/// Remote workspaces: ssh hosts and an open remote workspace.
 	pub remote: remote::MasterState,
-	pub remote_addr_input: Entity<TextInput>,
-	pub remote_code_input: Entity<TextInput>,
+	pub remote_path_input: Entity<TextInput>,
 }
 
 /// Identity of a shown preview's text, as `reader.rs` compares it.
@@ -1472,20 +1471,18 @@ impl WorkbenchModel {
 			},
 		)
 		.detach();
-		let remote_addr_input = cx.new(|cx| {
-			TextInput::new(i18n::t("remote_addr_placeholder", loc), 71, cx)
+		let remote_path_input = cx.new(|cx| {
+			TextInput::new(i18n::t("remote_path_placeholder", loc), 71, cx)
 		});
-		let remote_code_input = cx.new(|cx| {
-			TextInput::new(i18n::t("remote_code_placeholder", loc), 72, cx)
-		});
-		for input in [&remote_addr_input, &remote_code_input] {
-			cx.subscribe(input, |this, _, ev: &InputEvent, cx| match ev {
-				InputEvent::Submit => this.pair_remote_worker(cx),
+		cx.subscribe(
+			&remote_path_input,
+			|this, _, ev: &InputEvent, cx| match ev {
+				InputEvent::Submit => this.open_remote_typed(cx),
 				InputEvent::Dismiss => this.close_workspace_menu(cx),
 				_ => {}
-			})
-			.detach();
-		}
+			},
+		)
+		.detach();
 		cx.on_release(|this, _| {
 			this.lifecycle.cancel_cancellable();
 			if e2e_on() {
@@ -1672,11 +1669,11 @@ impl WorkbenchModel {
 			log_commit_root: None,
 			log_deferred: false,
 			remote: remote::MasterState {
-				workers: remote::load_workers(),
+				hosts: remote::load_hosts(),
+				recent: remote::load_recent(),
 				..Default::default()
 			},
-			remote_addr_input,
-			remote_code_input,
+			remote_path_input,
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
@@ -2680,8 +2677,8 @@ impl WorkbenchModel {
 				self.finish_open(path, cx)
 			}
 			lifecycle::Intent::OpenRemoteWorkspace(target) => {
-				let (worker, workspace) = *target;
-				self.finish_open_remote(worker, workspace, cx)
+				let (host, workspace) = *target;
+				self.finish_open_remote(host, workspace, cx)
 			}
 		}
 	}
@@ -2838,7 +2835,6 @@ impl WorkbenchModel {
 
 	fn finish_close(&mut self, cx: &mut Context<Self>) {
 		self.release_workspace_state(cx);
-		remote::worker_set_open(None);
 		self.workspace_open = false;
 		self.workspace_menu = true;
 		self.workspace_picker = false;
@@ -2860,7 +2856,6 @@ impl WorkbenchModel {
 		}
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
-		remote::worker_set_open(Some(&path));
 		recent::remember(&mut self.recent_workspaces, &path);
 		self.workspace_open = true;
 		self.workspace_menu = false;
@@ -6248,13 +6243,12 @@ fn startup_workspace(arg: Option<PathBuf>) -> Option<PathBuf> {
 		.then_some(cwd)
 }
 
-type CliArgs = (Option<PathBuf>, String, Option<PathBuf>, remote::WorkerCli);
+type CliArgs = (Option<PathBuf>, String, Option<PathBuf>);
 
 fn parse_cli_args() -> CliArgs {
 	let mut workspace = None;
 	let mut mode = "normal".to_string();
 	let mut restore_dir = None;
-	let mut worker = remote::WorkerCli::default();
 
 	let args: Vec<String> = std::env::args().collect();
 
@@ -6282,10 +6276,6 @@ fn parse_cli_args() -> CliArgs {
 				println!("  --workspace <DIR>    Set workspace folder containing repos");
 				println!("  --mode <MODE>        Run mode: normal, idle, overview, preview");
 				println!("  --restore-dir <DIR>  Target folder for paste restore operations");
-				println!("  --worker             Serve shared workspaces to paired masters (remote-node mode)");
-				println!("  --listen <ADDR:PORT> Worker listen address [default: {}]", remote::DEFAULT_LISTEN);
-				println!("  --share <DIR>        Folder the worker shares (repeatable); the open workspace is shared too");
-				println!("  --headless           With --worker: no window; print the pairing code and serve until stopped");
 				println!("  -V, --version        Print version information");
 				println!("  -h, --help           Print help");
 				std::process::exit(0);
@@ -6331,29 +6321,6 @@ fn parse_cli_args() -> CliArgs {
 					std::process::exit(2);
 				}
 			}
-			"--worker" => worker.enabled = true,
-			"--headless" => worker.headless = true,
-			"--listen" => {
-				match args.get(i + 1).and_then(|a| a.parse().ok()) {
-					Some(addr) => worker.listen = Some(addr),
-					None => {
-						eprintln!(
-							"Error: --listen requires an address such as 100.64.0.1:47821"
-						);
-						std::process::exit(2);
-					}
-				}
-				i += 1;
-			}
-			"--share" => {
-				if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-					worker.shares.push(PathBuf::from(&args[i + 1]));
-					i += 1;
-				} else {
-					eprintln!("Error: --share requires a directory argument");
-					std::process::exit(2);
-				}
-			}
 			unknown => {
 				eprintln!("Error: unrecognized argument: {unknown}");
 				std::process::exit(2);
@@ -6361,16 +6328,7 @@ fn parse_cli_args() -> CliArgs {
 		}
 		i += 1;
 	}
-	if !worker.enabled
-		&& (worker.headless
-			|| worker.listen.is_some()
-			|| !worker.shares.is_empty())
-	{
-		eprintln!("Error: --headless, --listen and --share need --worker");
-		std::process::exit(2);
-	}
-
-	(workspace, mode, restore_dir, worker)
+	(workspace, mode, restore_dir)
 }
 
 fn key_bindings() -> Vec<KeyBinding> {
@@ -6465,25 +6423,8 @@ fn key_bindings() -> Vec<KeyBinding> {
 }
 
 fn main() {
-	let (workspace, mode, restore_dir, worker) = parse_cli_args();
-	if worker.headless {
-		remote::run_headless(&worker);
-	}
+	let (workspace, mode, restore_dir) = parse_cli_args();
 	let workspace = startup_workspace(workspace);
-	// Before the window and independent of it: the listener stays up across
-	// workspace switches and a closed window.
-	if worker.enabled {
-		let listen = worker.listen.unwrap_or_else(|| {
-			remote::DEFAULT_LISTEN.parse().expect("a socket address")
-		});
-		match remote::start_worker(listen, &worker.shares, workspace.as_deref())
-		{
-			Ok(addr) => {
-				app_log!("[APP:REMOTE_WORKER: state=listening addr={addr}]")
-			}
-			Err(err) => eprintln!("snip-sync worker: cannot listen: {err}"),
-		}
-	}
 	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
@@ -6634,7 +6575,9 @@ mod tests {
 			REMOTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 		}
 
-		/// Pairs with a test worker, opens a remote workspace, and awaits background tree and status reads.
+		/// Lists an in-process worker as the only ssh host, opens `shared`
+		/// on it as the workspace, and awaits background tree and status
+		/// reads.
 		fn open_remote<'a>(
 			cx: &'a mut TestAppContext,
 			shared: &Path,
@@ -6642,32 +6585,23 @@ mod tests {
 		) -> (
 			Entity<WorkbenchModel>,
 			&'a mut VisualTestContext,
-			snip_remote::Worker,
+			std::sync::Arc<snip_remote::Worker>,
 		) {
-			let id = snip_remote::Identity::generate().unwrap();
-			let worker = snip_remote::Worker::start(
-				"127.0.0.1:0".parse().unwrap(),
-				&id,
-				opts,
-			)
-			.unwrap();
-			assert!(worker.set_roots(&[shared.to_path_buf()]).is_empty());
-			let code = worker.open_pairing();
-			let addr = worker.local_addr().to_string();
+			let worker = std::sync::Arc::new(snip_remote::Worker::new(opts));
+			let host = snip_remote::RemoteHost::in_process(worker.clone());
 
 			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
 			let (model, cx) = cx.add_window_view(|_, cx| {
 				WorkbenchModel::new(None, None, "normal".into(), cx)
 			});
 			cx.run_until_parked();
+			let path = shared.display().to_string();
 			model.update(cx, |m, cx| {
 				m.workspace_menu = true;
-				m.show_remote_pairing(cx);
-				m.remote_addr_input
-					.update(cx, |i, cx| i.set_text(&addr, cx));
-				m.remote_code_input
-					.update(cx, |i, cx| i.set_text(&code, cx));
-				m.pair_remote_worker(cx);
+				m.remote.hosts = vec![host];
+				m.remote.recent.clear();
+				m.browse_remote_host(0, cx);
+				m.open_remote_path(0, path, cx);
 			});
 			settle(cx);
 
@@ -6676,8 +6610,7 @@ mod tests {
 			// wide), so under parallel tests it may not end on its own here.
 			// Polled as if git were idle, the intent it queued lands.
 			model.update(cx, |m, cx| {
-				m.open_remote_workspace(0, 0, cx);
-				assert!(!m.workspace_menu);
+				assert!(!m.workspace_menu, "{:?}", m.remote.message);
 				if m.remote.session.is_none() {
 					assert_eq!(
 						m.lifecycle.intent_name(),
@@ -6694,8 +6627,8 @@ mod tests {
 						panic!("drain not ready: {step:?}");
 					};
 					// finish_intent would check the real GitLoad again.
-					let (worker, ws) = *target;
-					m.finish_open_remote(worker, ws, cx);
+					let (host, ws) = *target;
+					m.finish_open_remote(host, ws, cx);
 				}
 			});
 			for _ in 0..10 {
@@ -6719,12 +6652,13 @@ mod tests {
 			(model, cx, worker)
 		}
 
-		/// Remote-node mode end to end in one process: a real worker on
-		/// loopback, the pairing form, the workspace list, the Project tree
-		/// and a file preview, all read through the worker. Every socket has
-		/// a timeout (snip-remote), so a hang fails rather than blocks.
+		/// Remote workspaces end to end in one process: a worker listed as
+		/// the only host, its home listing, the folder opened by path, the
+		/// Project tree and a file preview, all read through the worker.
+		/// Every read has a deadline (snip-remote), so a hang fails rather
+		/// than blocks.
 		#[gpui::test]
-		fn remote_workspace_pairs_lists_and_previews_through_a_worker(
+		fn remote_workspace_opens_a_host_folder_and_previews_through_a_worker(
 			cx: &mut TestAppContext,
 		) {
 			let _serial = remote_lock();
@@ -6743,25 +6677,25 @@ mod tests {
 			)
 			.unwrap();
 
-			let (model, cx, worker) = open_remote(
+			let (model, cx, _worker) = open_remote(
 				cx,
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "win-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
 
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.remote.message, None);
-				assert_eq!(m.remote.workers.len(), 1);
-				assert_eq!(m.remote.workers[0].name, "win-worker");
-				let Some((0, Some(Ok(items)))) = &m.remote.browse else {
-					panic!("workspaces not listed: {:?}", m.remote.browse);
+				assert_eq!(m.remote.hosts.len(), 1);
+				let Some((0, Some(Ok(listing)))) = &m.remote.browse else {
+					panic!("home not listed: {:?}", m.remote.browse);
 				};
-				assert_eq!(items.len(), 1);
-				assert_eq!(items[0].name, "shared");
+				assert!(!listing.home.is_empty());
+				let session = m.remote.session.as_ref().expect("open");
+				assert_eq!(session.workspace.name, "shared");
+				assert_eq!(m.remote.recent[0].path, session.workspace.id);
 
 				assert!(m.workspace_open && !m.workspace_menu);
 				assert_eq!(
@@ -6822,9 +6756,9 @@ mod tests {
 				let p = m.preview.as_ref().expect("remote preview");
 				assert_eq!(&*p.text, "fn main() {}\n");
 				assert_eq!(m.preview_error, None);
-				// The breadcrumb names the worker, never the internal root.
+				// The breadcrumb names the host, never the internal root.
 				let root = m.ws_root().unwrap();
-				assert_eq!(m.log_repo_name(&root), "win-worker ▸ shared");
+				assert_eq!(m.log_repo_name(&root), "test-worker ▸ shared");
 				// Copy and paste stay local; a remote workspace refuses them.
 				m.trigger_paste_preview(cx);
 				assert_eq!(m.status.key, "remote_unsupported");
@@ -6864,8 +6798,8 @@ mod tests {
 				assert_eq!(m.status.key, "tree_name_not_utf8");
 			});
 
-			// The worker unshares the folder: the next read is refused.
-			worker.set_roots(&[]);
+			// The folder goes away on the worker: the next read fails.
+			fs::rename(&shared, shared.with_extension("gone")).unwrap();
 			model.update(cx, |m, cx| {
 				let root = m.ws_root();
 				m.select_file_in(root, "README.md", SourceKind::File, cx);
@@ -6873,35 +6807,6 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.preview_error.is_some(), "refused read shown");
-			});
-
-			// Forgetting the worker closes its open workspace: the trust is
-			// gone, so the session must not keep reading.
-			model.update(cx, |m, cx| {
-				m.forget_remote_worker(0, cx);
-				if m.remote.session.is_some() {
-					assert_eq!(m.lifecycle.intent_name(), "close-workspace");
-					let step = m.lifecycle.poll_at(
-						std::time::Instant::now(),
-						crate::lifecycle::GitLoad::idle(),
-					);
-					assert!(
-						matches!(
-							step,
-							crate::lifecycle::Step::Ready(
-								crate::lifecycle::Intent::CloseWorkspace
-							)
-						),
-						"drain not ready: {step:?}"
-					);
-					m.finish_close(cx);
-				}
-			});
-			settle(cx);
-			model.read_with(cx, |m, _| {
-				assert!(m.remote.workers.is_empty());
-				assert!(m.remote.session.is_none(), "session closed");
-				assert!(!m.workspace_open && m.ws_tree.is_none());
 			});
 		}
 
@@ -6924,18 +6829,10 @@ mod tests {
 			model.update(cx, |m, _| {
 				use std::sync::Arc;
 				m.remote.session = Some(crate::remote::RemoteSession {
-					client: Arc::new(
-						snip_remote::Client::new(
-							snip_remote::PairedWorker {
-								name: "ubuntu-ui".into(),
-								addr: "100.95.28.19:47899".into(),
-								fingerprint: "5134d3b34076abcd1234567890abcdef5134d3b34076abcd1234567890abcdef".into(),
-							},
-							snip_remote::Identity::generate().unwrap().into(),
-							"test-mac".into(),
-						)
-						.unwrap(),
-					),
+					client: Arc::new(snip_remote::Client::new(
+						snip_remote::RemoteHost::ssh("ubuntu-ui"),
+						"test-mac".into(),
+					)),
 					workspace: snip_remote::RemoteWorkspace {
 						id: "ws123".into(),
 						name: "gitws".into(),
@@ -6982,12 +6879,11 @@ mod tests {
 			crate::paste::tests::git_run(&beta, &["commit", "-m", "init beta"]);
 			fs::write(beta.join("b.txt"), "hello modified beta\n").unwrap();
 
-			let (model, cx, mut worker) = open_remote(
+			let (model, cx, worker) = open_remote(
 				cx,
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -7185,7 +7081,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -7303,7 +7198,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -7500,7 +7394,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -7554,7 +7447,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -7613,7 +7505,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "ancient".into(),
-					trust_file: None,
 					max_protocol: Some(1),
 				},
 			);
@@ -7641,7 +7532,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "ancient".into(),
-					trust_file: None,
 					max_protocol: Some(1),
 				},
 			);
@@ -7904,7 +7794,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -8024,7 +7913,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -8140,7 +8028,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -8197,7 +8084,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -8294,7 +8180,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -8374,7 +8259,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "test-worker".into(),
-					trust_file: None,
 					..Default::default()
 				},
 			);
@@ -8545,7 +8429,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "worker".into(),
-					trust_file: None,
 					max_protocol: None,
 				},
 			);
@@ -8627,7 +8510,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "worker".into(),
-					trust_file: None,
 					max_protocol: None,
 				},
 			);
@@ -8660,12 +8542,11 @@ mod tests {
 			// Corrupt beta/.git/HEAD BEFORE opening
 			fs::write(beta.join(".git/HEAD"), "garbage not a ref\n").unwrap();
 
-			let (model, cx, worker) = open_remote(
+			let (model, cx, _worker) = open_remote(
 				cx,
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "worker".into(),
-					trust_file: None,
 					max_protocol: None,
 				},
 			);
@@ -8708,7 +8589,8 @@ mod tests {
 				);
 			});
 
-			assert!(worker.set_roots(&[]).is_empty());
+			let gone = shared.with_extension("gone");
+			fs::rename(&shared, &gone).unwrap();
 			model.update(cx, |m, cx| m.reload_repos(cx));
 			let mut scan_failed = false;
 			for _ in 0..50 {
@@ -8732,7 +8614,7 @@ mod tests {
 				);
 			});
 
-			assert!(worker.set_roots(std::slice::from_ref(&shared)).is_empty());
+			fs::rename(&gone, &shared).unwrap();
 			model.update(cx, |m, cx| m.reload_repos(cx));
 			let mut recovered = false;
 			for _ in 0..50 {
@@ -8772,7 +8654,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "ancient".into(),
-					trust_file: None,
 					max_protocol: Some(1),
 				},
 			);
@@ -8924,7 +8805,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "worker".into(),
-					trust_file: None,
 					max_protocol: None,
 				},
 			);
@@ -9048,7 +8928,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "worker".into(),
-					trust_file: None,
 					max_protocol: None,
 				},
 			);
@@ -9152,7 +9031,6 @@ mod tests {
 				&single_repo,
 				snip_remote::WorkerOptions {
 					name: "worker2".into(),
-					trust_file: None,
 					max_protocol: None,
 				},
 			);
@@ -9219,7 +9097,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "worker".into(),
-					trust_file: None,
 					max_protocol: None,
 				},
 			);
@@ -9247,7 +9124,6 @@ mod tests {
 				&shared,
 				snip_remote::WorkerOptions {
 					name: "worker".into(),
-					trust_file: None,
 					max_protocol: None,
 				},
 			);
@@ -9276,23 +9152,28 @@ mod tests {
 			let ws = tempfile::tempdir().unwrap();
 			repo(ws.path(), "a", &[]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let worker = std::sync::Arc::new(snip_remote::Worker::new(
+				snip_remote::WorkerOptions::default(),
+			));
 			model.update(cx, |m, cx| {
 				m.toggle_workspace_menu(cx);
-				m.show_remote_pairing(cx);
+				m.remote.hosts =
+					vec![snip_remote::RemoteHost::in_process(worker.clone())];
+				m.browse_remote_host(0, cx);
 			});
 			settle(cx);
-			let addr = model.read_with(cx, |m, cx| {
+			let field = model.read_with(cx, |m, cx| {
 				assert!(m.workspace_menu);
-				m.remote_addr_input.read(cx).handle()
+				m.remote_path_input.read(cx).handle()
 			});
 			assert!(
-				cx.update(|window, _| addr.is_focused(window)),
-				"the address field has the focus"
+				cx.update(|window, _| field.is_focused(window)),
+				"the path field has the focus"
 			);
 			cx.simulate_keystrokes("escape");
 			settle(cx);
 			model.read_with(cx, |m, _| {
-				assert!(!m.workspace_menu, "Escape in the pairing form");
+				assert!(!m.workspace_menu, "Escape in the path field");
 			});
 
 			model.update(cx, |m, cx| m.toggle_workspace_menu(cx));
@@ -11289,12 +11170,7 @@ mod tests {
 				"remote_scan_failed",
 				["network error".to_string()],
 			);
-			let id = snip_remote::Identity::generate().unwrap();
-			let worker = snip_remote::PairedWorker {
-				name: "w".into(),
-				addr: "127.0.0.1:0".into(),
-				fingerprint: id.fingerprint().to_hex(),
-			};
+			let worker = snip_remote::RemoteHost::ssh("w");
 			let ws = snip_remote::RemoteWorkspace {
 				id: "ws1".into(),
 				name: "ws1".into(),
@@ -11302,7 +11178,7 @@ mod tests {
 			};
 			model.update(cx, |m, _| {
 				m.remote.session =
-					crate::remote::RemoteSession::new(worker, ws).ok();
+					Some(crate::remote::RemoteSession::new(worker, ws));
 				m.remote.scan_error = Some(err_msg.clone());
 			});
 			assert_eq!(
@@ -11716,12 +11592,7 @@ mod tests {
 				"remote_scan_failed",
 				["fail".to_string()],
 			);
-			let id = snip_remote::Identity::generate().unwrap();
-			let worker = snip_remote::PairedWorker {
-				name: "w".into(),
-				addr: "127.0.0.1:0".into(),
-				fingerprint: id.fingerprint().to_hex(),
-			};
+			let worker = snip_remote::RemoteHost::ssh("w");
 			let ws = snip_remote::RemoteWorkspace {
 				id: "ws1".into(),
 				name: "ws1".into(),
@@ -11729,7 +11600,7 @@ mod tests {
 			};
 			model.update(cx, |m, _| {
 				m.remote.session =
-					crate::remote::RemoteSession::new(worker, ws).ok();
+					Some(crate::remote::RemoteSession::new(worker, ws));
 				m.commits.clear();
 				m.remote.scan_error = Some(err.clone());
 			});

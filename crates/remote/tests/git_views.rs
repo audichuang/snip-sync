@@ -1,7 +1,6 @@
 //! Loopback integration tests for worker git views and repository scanning.
 
 use std::fs;
-use std::net::TcpStream;
 use std::path::Path;
 #[cfg(unix)]
 use std::sync::atomic::AtomicBool;
@@ -28,7 +27,6 @@ fn scaled(d: Duration) -> Duration {
 	d.saturating_mul(timeout_scale())
 }
 
-use rustls::StreamOwned;
 use snip_core::browser::LogQuery;
 use snip_core::format::ChangeType;
 use snip_core::gitsrc::{GitError, GitSource};
@@ -42,10 +40,8 @@ use snip_remote::proto::{
 };
 #[cfg(unix)]
 use snip_remote::proto::{Response, PROTOCOL_MAX, PROTOCOL_VERSION};
-use snip_remote::tls::{client_config, server_name};
 use snip_remote::{
-	pair, Client, Connection, Identity, RemoteError, RemoteRepo, Worker,
-	WorkerOptions,
+	Client, RemoteError, RemoteHost, RemoteRepo, Worker, WorkerOptions,
 };
 
 #[cfg(unix)]
@@ -144,40 +140,80 @@ fn run_git(cwd: &Path, args: &[&str]) {
 	);
 }
 
-fn test_worker(
-	roots: &[&Path],
-	max_protocol: Option<u32>,
-) -> (Worker, Identity) {
+fn test_worker(max_protocol: Option<u32>) -> Arc<Worker> {
 	#[cfg(unix)]
 	init_git_shim();
 
-	let id = Identity::generate().unwrap();
-	let w = Worker::start(
-		"127.0.0.1:0".parse().unwrap(),
-		&id,
-		WorkerOptions {
-			name: "test-worker".into(),
-			trust_file: None,
-			max_protocol,
-		},
-	)
-	.unwrap();
-	let roots: Vec<_> = roots.iter().map(|p| p.to_path_buf()).collect();
-	assert!(w.set_roots(&roots).is_empty());
-	(w, id)
+	Arc::new(Worker::new(WorkerOptions {
+		name: "test-worker".into(),
+		max_protocol,
+	}))
 }
 
-fn addr(w: &Worker) -> String {
-	w.local_addr().to_string()
+fn paired_client(w: &Arc<Worker>, root: &Path) -> (Client, String) {
+	let client = Client::new(RemoteHost::in_process(w.clone()), "mac".into());
+	let ws = client.open_workspace(&root.display().to_string()).unwrap();
+	(client, ws.id)
 }
 
-fn paired_client(w: &Worker) -> (Client, String) {
-	let master = Arc::new(Identity::generate().unwrap());
-	let code = w.open_pairing();
-	let paired = pair(&addr(w), &code, &master, "mac").unwrap();
-	let client = Client::new(paired, master, "mac".into()).unwrap();
-	let ws = client.list_workspaces().unwrap()[0].id.clone();
-	(client, ws)
+/// The id a master gets for `root`: its real path.
+fn workspace_id(root: &Path) -> String {
+	dunce::canonicalize(root).unwrap().display().to_string()
+}
+
+/// A raw connection: requests go to the pipe, replies come back through a
+/// thread, so a missing reply fails the test instead of hanging it.
+/// Dropping it is the master hanging up.
+struct Raw {
+	writer: std::io::PipeWriter,
+	frames: std::sync::mpsc::Receiver<serde_json::Value>,
+}
+
+impl Raw {
+	fn open(w: &Arc<Worker>) -> Self {
+		let (writer, mut reader) = w.connect_in_process().unwrap();
+		let (tx, frames) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			while let Ok(Some(frame)) =
+				read_frame::<serde_json::Value>(&mut reader)
+			{
+				if tx.send(frame).is_err() {
+					return;
+				}
+			}
+		});
+		Self { writer, frames }
+	}
+
+	fn send(&mut self, frame: &impl serde::Serialize) {
+		write_frame(&mut self.writer, frame).unwrap();
+	}
+
+	fn recv_json(&self, within: Duration) -> serde_json::Value {
+		self.frames.recv_timeout(within).unwrap_or_else(|e| {
+			panic!("no frame from the worker in {within:?}: {e}")
+		})
+	}
+}
+
+#[cfg(unix)]
+impl Raw {
+	fn recv(&self, within: Duration) -> Response {
+		serde_json::from_value(self.recv_json(within)).unwrap()
+	}
+
+	/// A connection that has said hello at the newest protocol.
+	fn hello(w: &Arc<Worker>, name: &str) -> Self {
+		let mut raw = Self::open(w);
+		raw.send(&Request::Hello {
+			version: PROTOCOL_VERSION,
+			max_version: Some(PROTOCOL_MAX),
+			name: name.into(),
+		});
+		let reply = raw.recv(scaled(Duration::from_secs(5)));
+		assert!(matches!(reply, Response::Hello { .. }), "{reply:?}");
+		raw
+	}
 }
 
 #[test]
@@ -208,8 +244,8 @@ fn scan_of_a_multi_repo_workspace() {
 	fs::create_dir_all(&plain).unwrap();
 	fs::write(plain.join("note.txt"), "plain content").unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	assert_eq!(scan.status, ScanStatus::Complete);
@@ -246,8 +282,8 @@ fn scan_of_a_multi_repo_workspace() {
 		// Variant where the share root is spelled through a symlink
 		let link_ws = tmp.path().join("link_ws");
 		std::os::unix::fs::symlink(&ws, &link_ws).unwrap();
-		let (w_link, _) = test_worker(&[&link_ws], None);
-		let (client_link, link_id) = paired_client(&w_link);
+		let w_link = test_worker(None);
+		let (client_link, link_id) = paired_client(&w_link, &link_ws);
 
 		let scan_link = client_link.scan_repos(&link_id, None, None).unwrap();
 		assert_eq!(scan_link.status, ScanStatus::Complete);
@@ -267,8 +303,8 @@ fn scan_of_a_single_repo_workspace_is_the_repo_itself() {
 	run_git(&ws, &["add", "README"]);
 	run_git(&ws, &["commit", "-m", "init"]);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	assert_eq!(scan.status, ScanStatus::Complete);
@@ -289,8 +325,8 @@ fn scan_of_a_non_repo_workspace_is_empty_and_complete() {
 	fs::create_dir_all(ws.join("folder")).unwrap();
 	fs::write(ws.join("folder").join("file.txt"), "text").unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	assert_eq!(scan.status, ScanStatus::Complete);
@@ -309,8 +345,8 @@ fn scan_never_reports_a_parent_repository() {
 	fs::create_dir_all(&inner).unwrap();
 	fs::write(inner.join("file.txt"), "clean").unwrap();
 
-	let (w, _) = test_worker(&[&inner], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &inner);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	assert!(scan.repos.is_empty());
@@ -331,8 +367,8 @@ fn broken_git_dir_is_an_error_row_not_the_parent() {
 	let broken = ws.join("broken");
 	fs::create_dir_all(broken.join(".git")).unwrap(); // empty dir
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	assert!(
@@ -363,8 +399,8 @@ fn worktree_of_an_outside_repo_is_refused() {
 		&["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"],
 	);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	let wt_row = scan
@@ -417,8 +453,8 @@ fn main_repo_with_worktree_outside_the_share_is_served() {
 		&["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"],
 	);
 
-	let (w, _) = test_worker(&[&share], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &share);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	assert!(
@@ -511,8 +547,8 @@ fn gitdir_file_pointing_outside_is_refused() {
 	)
 	.unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	let fake_row = scan
@@ -542,8 +578,8 @@ fn symlinked_git_dir_pointing_outside_is_never_reported() {
 	std::os::unix::fs::symlink(outside.join(".git"), sym_repo.join(".git"))
 		.unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	// Core discovery ignores a symlinked .git; the boundary check in core guards the case where git is reached some other way.
@@ -577,8 +613,8 @@ fn alternates_pointing_outside_are_refused() {
 		&["clone", "--shared", outside.to_str().unwrap(), "borrowed"],
 	);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	let borrowed_row = scan
@@ -634,8 +670,8 @@ fn refused_repo_error_does_not_name_outside_paths() {
 		&["clone", "--shared", outside.to_str().unwrap(), "borrowed"],
 	);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	let json = serde_json::to_string(&scan).unwrap();
@@ -674,8 +710,8 @@ fn scan_under_a_subfolder_scans_only_that_branch() {
 	run_git(&repo2, &["add", "b.txt"]);
 	run_git(&repo2, &["commit", "-m", "init"]);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let scan = client.scan_repos(&ws_id, Some("sub"), None).unwrap();
 	assert_eq!(scan.repos.len(), 1);
@@ -690,8 +726,8 @@ fn scan_under_dotdot_or_absolute_or_symlink_out_is_refused() {
 	let ws = tmp.path().join("ws");
 	fs::create_dir_all(&ws).unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let dotdot = client.scan_repos(&ws_id, Some("../outside"), None);
 	match dotdot {
@@ -728,55 +764,14 @@ fn scan_under_dotdot_or_absolute_or_symlink_out_is_refused() {
 }
 
 #[test]
-fn git_requests_need_a_paired_master() {
-	let _serial = serial();
-	let tmp = tempfile::tempdir().unwrap();
-	let ws = tmp.path().join("ws");
-	fs::create_dir_all(&ws).unwrap();
-
-	let (w, _) = test_worker(&[&ws], None);
-	let master = Arc::new(Identity::generate().unwrap());
-	let mut conn = Connection::open(&addr(&w), &master, None, "mac").unwrap();
-	assert!(!conn.paired());
-
-	let scan_req = Request::ScanRepos {
-		workspace: "any".into(),
-		under: None,
-	};
-	let scan_res = conn.call(&scan_req, None, scaled(Duration::from_secs(5)));
-	match scan_res {
-		Err(RemoteError::Refused { code, .. }) => {
-			assert_eq!(code, ErrorCode::NotPaired);
-		}
-		other => panic!("expected NotPaired refusal for scan, got {other:?}"),
-	}
-
-	let git_req = Request::GitView {
-		workspace: "any".into(),
-		repo: "".into(),
-		profile: snip_core::gitview::ReadProfile::Interactive,
-		query: GitQuery::ChangeList,
-	};
-	let git_res = conn.call(&git_req, None, scaled(Duration::from_secs(5)));
-	match git_res {
-		Err(RemoteError::Refused { code, .. }) => {
-			assert_eq!(code, ErrorCode::NotPaired);
-		}
-		other => {
-			panic!("expected NotPaired refusal for git_view, got {other:?}")
-		}
-	}
-}
-
-#[test]
 fn write_and_rename_stay_unsupported() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let ws = tmp.path().join("ws");
 	fs::create_dir_all(&ws).unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let write_res = client.call(&Request::Write {
 		workspace: ws_id.clone(),
@@ -810,53 +805,39 @@ fn v1_connection_never_sees_pending() {
 	let ws = tmp.path().join("ws");
 	fs::create_dir_all(&ws).unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let master = Arc::new(Identity::generate().unwrap());
-	let code = w.open_pairing();
-	let paired = pair(&addr(&w), &code, &master, "mac").unwrap();
-
-	let (config, _) =
-		client_config(&master, Some(paired.pin().unwrap())).unwrap();
-	let tcp = TcpStream::connect(w.local_addr()).unwrap();
-	tcp.set_read_timeout(Some(scaled(Duration::from_secs(5))))
-		.unwrap();
-	tcp.set_write_timeout(Some(scaled(Duration::from_secs(5))))
-		.unwrap();
-	let conn = rustls::ClientConnection::new(config, server_name()).unwrap();
-	let mut tls = StreamOwned::new(conn, tcp);
+	let w = test_worker(None);
+	let within = scaled(Duration::from_secs(5));
+	let mut raw = Raw::open(&w);
 
 	// Hand-written v1 hello without max_version
-	let v1_hello = serde_json::json!({
+	raw.send(&serde_json::json!({
 		"op": "hello",
 		"version": 1,
 		"name": "v1_master"
-	});
-	write_frame(&mut tls, &v1_hello).unwrap();
-	let _hello_resp: serde_json::Value = read_frame(&mut tls).unwrap().unwrap();
+	}));
+	let _hello_resp = raw.recv_json(within);
 
-	let ws_id = w.roots()[0].id.clone();
+	let ws_id = workspace_id(&ws);
 
 	// ListDir works
-	let list_req = serde_json::json!({
+	raw.send(&serde_json::json!({
 		"op": "list_dir",
 		"workspace": ws_id,
 		"path": ""
-	});
-	write_frame(&mut tls, &list_req).unwrap();
-	let list_reply: serde_json::Value = read_frame(&mut tls).unwrap().unwrap();
+	}));
+	let list_reply = raw.recv_json(within);
 	assert_eq!(
 		list_reply.get("reply").and_then(|r| r.as_str()),
 		Some("dir")
 	);
 
 	// ScanRepos receives Unsupported without any Pending frame
-	let scan_req = serde_json::json!({
+	raw.send(&serde_json::json!({
 		"op": "scan_repos",
 		"workspace": ws_id,
 		"under": null
-	});
-	write_frame(&mut tls, &scan_req).unwrap();
-	let scan_reply: serde_json::Value = read_frame(&mut tls).unwrap().unwrap();
+	}));
+	let scan_reply = raw.recv_json(within);
 	assert_eq!(
 		scan_reply.get("reply").and_then(|r| r.as_str()),
 		Some("error")
@@ -883,11 +864,7 @@ fn dropping_the_connection_cancels_the_worker_git() {
 	run_git(&slow_repo, &["add", "file.txt"]);
 	run_git(&slow_repo, &["commit", "-m", "init"]);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let master = Arc::new(Identity::generate().unwrap());
-	let code = w.open_pairing();
-	let paired = pair(&addr(&w), &code, &master, "mac").unwrap();
-
+	let w = test_worker(None);
 	fs::write(slow_repo.join(".slow_active"), "").unwrap();
 	fs::write(
 		slow_repo.join(".slow_pid_target"),
@@ -895,43 +872,18 @@ fn dropping_the_connection_cancels_the_worker_git() {
 	)
 	.unwrap();
 
-	let (config, _) =
-		client_config(&master, Some(paired.pin().unwrap())).unwrap();
-	let tcp = TcpStream::connect(w.local_addr()).unwrap();
-	tcp.set_read_timeout(Some(scaled(Duration::from_secs(5))))
-		.unwrap();
-	tcp.set_write_timeout(Some(scaled(Duration::from_secs(5))))
-		.unwrap();
-	let conn = rustls::ClientConnection::new(config, server_name()).unwrap();
-	let mut tls = StreamOwned::new(conn, tcp);
-
-	write_frame(
-		&mut tls,
-		&Request::Hello {
-			version: PROTOCOL_VERSION,
-			max_version: Some(PROTOCOL_MAX),
-			name: "test".into(),
-		},
-	)
-	.unwrap();
-	let _ = read_frame::<Response>(&mut tls).unwrap().unwrap();
-
-	let ws_id = w.roots()[0].id.clone();
-	write_frame(
-		&mut tls,
-		&Request::ScanRepos {
-			workspace: ws_id,
-			under: None,
-		},
-	)
-	.unwrap();
+	let mut raw = Raw::hello(&w, "test");
+	raw.send(&Request::ScanRepos {
+		workspace: workspace_id(&ws),
+		under: None,
+	});
 
 	// Read the first Pending frame
-	let first_frame = read_frame::<Response>(&mut tls).unwrap().unwrap();
+	let first_frame = raw.recv(scaled(Duration::from_secs(5)));
 	assert_eq!(first_frame, Response::Pending);
 
-	// Drop socket connection
-	drop(tls);
+	// The master hangs up
+	drop(raw);
 
 	// Read pid from pid_file
 	let pid_deadline = Instant::now() + scaled(Duration::from_secs(5));
@@ -990,16 +942,12 @@ fn vanished_master_does_not_keep_git_running() {
 	run_git(&slow_repo, &["add", "file.txt"]);
 	run_git(&slow_repo, &["commit", "-m", "init"]);
 
-	let (w, _) = test_worker(&[&ws], None);
+	let w = test_worker(None);
 	// Short scan deadline for this test
 	w.set_deadlines_for_tests(
 		scaled(Duration::from_secs(60)),
 		scaled(Duration::from_millis(1500)),
 	);
-
-	let master = Arc::new(Identity::generate().unwrap());
-	let code = w.open_pairing();
-	let paired = pair(&addr(&w), &code, &master, "mac").unwrap();
 
 	fs::write(slow_repo.join(".slow_active"), "").unwrap();
 	fs::write(
@@ -1008,32 +956,11 @@ fn vanished_master_does_not_keep_git_running() {
 	)
 	.unwrap();
 
-	let (config, _) =
-		client_config(&master, Some(paired.pin().unwrap())).unwrap();
-	let tcp = TcpStream::connect(w.local_addr()).unwrap();
-	let conn = rustls::ClientConnection::new(config, server_name()).unwrap();
-	let mut tls = StreamOwned::new(conn, tcp);
-
-	write_frame(
-		&mut tls,
-		&Request::Hello {
-			version: PROTOCOL_VERSION,
-			max_version: Some(PROTOCOL_MAX),
-			name: "test".into(),
-		},
-	)
-	.unwrap();
-	let _ = read_frame::<Response>(&mut tls).unwrap().unwrap();
-
-	let ws_id = w.roots()[0].id.clone();
-	write_frame(
-		&mut tls,
-		&Request::ScanRepos {
-			workspace: ws_id,
-			under: None,
-		},
-	)
-	.unwrap();
+	let mut raw = Raw::hello(&w, "test");
+	raw.send(&Request::ScanRepos {
+		workspace: workspace_id(&ws),
+		under: None,
+	});
 
 	// Master stops reading without dropping connection
 	let pid_deadline = Instant::now() + scaled(Duration::from_secs(5));
@@ -1076,7 +1003,7 @@ fn vanished_master_does_not_keep_git_running() {
 		"slow git process {pid} should be terminated after job deadline"
 	);
 
-	drop(tls);
+	drop(raw);
 }
 
 #[cfg(unix)]
@@ -1095,12 +1022,8 @@ fn disconnect_storm_stays_within_the_job_cap() {
 	fs::write(slow_repo.join(".slow_active"), "").unwrap();
 	fs::write(slow_repo.join(".slow_sleep"), "1").unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let w = Arc::new(w);
-	let master = Arc::new(Identity::generate().unwrap());
-	let code = w.open_pairing();
-	let paired = pair(&addr(&w), &code, &master, "mac").unwrap();
-	let ws_id = w.roots()[0].id.clone();
+	let w = test_worker(None);
+	let ws_id = workspace_id(&ws);
 
 	let max_observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 	let done = Arc::new(AtomicBool::new(false));
@@ -1119,43 +1042,20 @@ fn disconnect_storm_stays_within_the_job_cap() {
 	let mut clients = Vec::new();
 	for _ in 0..10 {
 		let w_clone = w.clone();
-		let master_clone = master.clone();
-		let paired_pin = paired.pin().unwrap();
 		let ws_id_clone = ws_id.clone();
 		clients.push(std::thread::spawn(move || {
-			let (config, _) =
-				client_config(&master_clone, Some(paired_pin)).unwrap();
-			if let Ok(tcp) = TcpStream::connect(w_clone.local_addr()) {
-				let conn = rustls::ClientConnection::new(config, server_name())
-					.unwrap();
-				let mut tls = StreamOwned::new(conn, tcp);
-				if write_frame(
-					&mut tls,
-					&Request::Hello {
-						version: PROTOCOL_VERSION,
-						max_version: Some(PROTOCOL_MAX),
-						name: "storm".into(),
-					},
-				)
-				.is_ok()
-				{
-					let _ = read_frame::<Response>(&mut tls);
-					let _ = write_frame(
-						&mut tls,
-						&Request::ScanRepos {
-							workspace: ws_id_clone,
-							under: None,
-						},
-					);
-					// Hold briefly then drop
-					std::thread::sleep(Duration::from_millis(50));
-				}
-			}
+			let mut raw = Raw::hello(&w_clone, "storm");
+			raw.send(&Request::ScanRepos {
+				workspace: ws_id_clone,
+				under: None,
+			});
+			// Hold briefly then hang up
+			std::thread::sleep(Duration::from_millis(50));
 		}));
 	}
 
 	for c in clients {
-		let _ = c.join();
+		c.join().expect("a storm master panicked");
 	}
 
 	done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1170,92 +1070,6 @@ fn disconnect_storm_stays_within_the_job_cap() {
 	let deadline = Instant::now() + scaled(Duration::from_secs(10));
 	while w.running_jobs() > 0 && Instant::now() < deadline {
 		std::thread::sleep(Duration::from_millis(25));
-	}
-	assert_eq!(w.running_jobs(), 0);
-}
-
-#[cfg(unix)]
-#[test]
-fn unsharing_mid_scan_cancels_and_refuses() {
-	let _serial = serial();
-	let tmp = tempfile::tempdir().unwrap();
-	let ws = tmp.path().join("ws");
-	fs::create_dir_all(&ws).unwrap();
-
-	let slow_repo = ws.join("slow-unshare");
-	run_git(&slow_repo, &["init", "-b", "main"]);
-	fs::write(slow_repo.join("file.txt"), "unshare").unwrap();
-	run_git(&slow_repo, &["add", "file.txt"]);
-	run_git(&slow_repo, &["commit", "-m", "init"]);
-	fs::write(slow_repo.join(".slow_active"), "").unwrap();
-
-	let (w, _) = test_worker(&[&ws], None);
-	let master = Arc::new(Identity::generate().unwrap());
-	let code = w.open_pairing();
-	let paired = pair(&addr(&w), &code, &master, "mac").unwrap();
-
-	let (config, _) =
-		client_config(&master, Some(paired.pin().unwrap())).unwrap();
-	let tcp = TcpStream::connect(w.local_addr()).unwrap();
-	tcp.set_read_timeout(Some(scaled(Duration::from_secs(10))))
-		.unwrap();
-	let conn = rustls::ClientConnection::new(config, server_name()).unwrap();
-	let mut tls = StreamOwned::new(conn, tcp);
-
-	write_frame(
-		&mut tls,
-		&Request::Hello {
-			version: PROTOCOL_VERSION,
-			max_version: Some(PROTOCOL_MAX),
-			name: "test".into(),
-		},
-	)
-	.unwrap();
-	let _ = read_frame::<Response>(&mut tls).unwrap().unwrap();
-
-	let ws_id = w.roots()[0].id.clone();
-	write_frame(
-		&mut tls,
-		&Request::ScanRepos {
-			workspace: ws_id,
-			under: None,
-		},
-	)
-	.unwrap();
-
-	// Wait for first Pending
-	let frame: Response = read_frame(&mut tls).unwrap().unwrap();
-	assert_eq!(frame, Response::Pending);
-
-	// Unshare mid-scan
-	w.set_roots(&[]);
-
-	// Read reply frame
-	let mut final_error = None;
-	let deadline = Instant::now() + scaled(Duration::from_secs(8));
-	while Instant::now() < deadline {
-		match read_frame::<Response>(&mut tls).unwrap() {
-			Some(Response::Pending) => {}
-			Some(Response::Error { code, message }) => {
-				final_error = Some((code, message));
-				break;
-			}
-			Some(Response::Repos(_)) => {
-				panic!("must never return Repos reply after unsharing");
-			}
-			other => panic!("unexpected response: {other:?}"),
-		}
-	}
-
-	let (code, _) = final_error.expect("expected error response");
-	assert!(
-		code == ErrorCode::Forbidden || code == ErrorCode::Cancelled,
-		"expected Forbidden or Cancelled, got {code:?}"
-	);
-
-	let wait_deadline = Instant::now() + scaled(Duration::from_secs(5));
-	while w.running_jobs() > 0 && Instant::now() < wait_deadline {
-		std::thread::sleep(Duration::from_millis(20));
 	}
 	assert_eq!(w.running_jobs(), 0);
 }
@@ -1290,12 +1104,12 @@ fn scan_of_many_slow_repos_returns_partial_not_timeout() {
 		fs::write(repo_dir.join(".slow_active"), "").unwrap();
 	}
 
-	let (w, _) = test_worker(&[&ws], None);
+	let w = test_worker(None);
 	// Scan deadline = 5s (reserve) + 6s*s so budget = 6s*s
 	let scan_deadline = Duration::from_secs(5 + budget_secs);
 	w.set_deadlines_for_tests(Duration::from_secs(60 * s), scan_deadline);
 
-	let (client, ws_id) = paired_client(&w);
+	let (client, ws_id) = paired_client(&w, &ws);
 	let start = Instant::now();
 	let scan = client.scan_repos(&ws_id, None, None).unwrap();
 	let elapsed = start.elapsed();
@@ -1577,8 +1391,8 @@ fn every_repo_view_method_matches_a_local_repo() {
 	let repo = tmp.path().join("repo");
 	setup_rich_repo(&repo);
 
-	let (w, _) = test_worker(&[&repo], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &repo);
 	let read = Read {
 		profile: ReadProfile::Interactive,
 		cancel: None,
@@ -1591,8 +1405,8 @@ fn every_repo_view_method_matches_a_local_repo() {
 	let parent = tmp.path().join("parent");
 	let sub_repo = parent.join("sub").join("repo");
 	setup_rich_repo(&sub_repo);
-	let (w2, _) = test_worker(&[&parent], None);
-	let (client2, ws2_id) = paired_client(&w2);
+	let w2 = test_worker(None);
+	let (client2, ws2_id) = paired_client(&w2, &parent);
 	let local2 = LocalRepo::open(&sub_repo, &read).unwrap();
 	let remote2 = RemoteRepo::new(Arc::new(client2), ws2_id, "sub/repo".into());
 	assert_repo_views_match(&local2, &remote2, &read);
@@ -1605,8 +1419,8 @@ fn every_repo_view_method_matches_a_local_repo() {
 		setup_rich_repo(&real_repo);
 		let sym_repo = sym_parent.join("sym");
 		std::os::unix::fs::symlink(&real_repo, &sym_repo).unwrap();
-		let (w3, _) = test_worker(&[&sym_repo], None);
-		let (client3, ws3_id) = paired_client(&w3);
+		let w3 = test_worker(None);
+		let (client3, ws3_id) = paired_client(&w3, &sym_repo);
 		let local3 = LocalRepo::open(&sym_repo, &read).unwrap();
 		let remote3 = RemoteRepo::new(Arc::new(client3), ws3_id, "".into());
 		assert_repo_views_match(&local3, &remote3, &read);
@@ -1624,8 +1438,8 @@ fn revision_syntax_beyond_oids_and_refnames_is_refused() {
 	run_git(&ws, &["add", "f.txt"]);
 	run_git(&ws, &["commit", "-m", "init"]);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let pwned_path = tmp.path().join("pwned");
 	let pwned_arg = format!("--output={}", pwned_path.display());
@@ -1876,8 +1690,8 @@ fn an_unknown_but_valid_ref_is_invalid_revision_not_bad_request() {
 	run_git(&ws, &["add", "f.txt"]);
 	run_git(&ws, &["commit", "-m", "init"]);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 	let remote = RemoteRepo::new(Arc::new(client), ws_id, "".into());
 	let read = Read {
 		profile: ReadProfile::Interactive,
@@ -1898,8 +1712,8 @@ fn preview_parents_are_recomputed_on_the_worker() {
 	fs::create_dir_all(&ws).unwrap();
 	setup_rich_repo(&ws);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 	let read = Read {
 		profile: ReadProfile::Interactive,
 		cancel: None,
@@ -1979,8 +1793,8 @@ fn working_preview_of_a_symlink_out_of_the_share_is_refused() {
 	)
 	.unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 	let remote = RemoteRepo::new(Arc::new(client), ws_id, "".into());
 	let read = Read {
 		profile: ReadProfile::Interactive,
@@ -2036,8 +1850,8 @@ fn changed_file_text_of_a_symlink_out_of_the_share_is_refused() {
 	)
 	.unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 	let remote = RemoteRepo::new(Arc::new(client), ws_id, "".into());
 	let read = Read {
 		profile: ReadProfile::Interactive,
@@ -2132,8 +1946,8 @@ fn outside_object_by_sha_is_refused() {
 	run_git(&repo_c, &["add", "c.txt"]);
 	run_git(&repo_c, &["commit", "-m", "init"]);
 
-	let (w, _) = test_worker(&[&inside], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &inside);
 	let client = Arc::new(client);
 	let read = Read {
 		profile: ReadProfile::Interactive,
@@ -2195,8 +2009,8 @@ fn refused_git_view_error_does_not_name_outside_paths() {
 	let sub = parent.join("sub");
 	fs::create_dir_all(&sub).unwrap();
 
-	let (w, _) = test_worker(&[&share], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &share);
 
 	let outside_str = outside.to_string_lossy().into_owned();
 	let outside_canon = dunce::canonicalize(&outside)
@@ -2271,8 +2085,8 @@ fn repo_through_a_symlink_out_of_the_share_is_refused() {
 
 	std::os::unix::fs::symlink(&outside_repo, share.join("sym_repo")).unwrap();
 
-	let (w, _) = test_worker(&[&share], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &share);
 
 	let res = client.git(
 		&ws_id,
@@ -2300,8 +2114,8 @@ fn repo_dotdot_and_absolute_are_refused() {
 	let ws = tmp.path().join("ws");
 	fs::create_dir_all(&ws).unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let res1 = client.git(
 		&ws_id,
@@ -2345,8 +2159,8 @@ fn git_view_on_a_non_repo_share_is_not_the_parent() {
 	run_git(&outer, &["init", "-b", "main"]);
 	fs::write(outer.join("dirty_outside_secret.txt"), "dirty").unwrap();
 
-	let (w, _) = test_worker(&[&inner], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &inner);
 
 	let res = client.git(
 		&ws_id,
@@ -2385,8 +2199,8 @@ fn oversized_change_list_is_capped_with_its_total() {
 		fs::write(ws.join(format!("u{i:04}.txt")), "").unwrap();
 	}
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 	let remote = RemoteRepo::new(Arc::new(client), ws_id, "".into());
 	let read = Read {
 		profile: ReadProfile::Interactive,
@@ -2449,8 +2263,8 @@ fn refs_of_a_tag_heavy_repo_are_an_error_not_empty() {
 	}
 	fs::write(ws.join(".git").join("packed-refs"), packed).unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 	let remote = RemoteRepo::new(Arc::new(client), ws_id, "".into());
 	let read = Read {
 		profile: ReadProfile::Interactive,
@@ -2482,8 +2296,8 @@ fn a_preview_too_large_for_a_frame_is_too_large_not_empty() {
 	run_git(&ws, &["add", "huge.txt"]);
 	run_git(&ws, &["commit", "-qm", "huge quotes"]);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &ws);
 
 	let res = client.git(
 		&ws_id,
@@ -2510,18 +2324,19 @@ fn a_preview_too_large_for_a_frame_is_too_large_not_empty() {
 }
 
 #[test]
-fn a_git_view_for_an_unshared_workspace_is_forbidden() {
+fn a_git_view_for_a_missing_workspace_is_not_found() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let ws = tmp.path().join("ws");
 	fs::create_dir_all(&ws).unwrap();
 	run_git(&ws, &["init", "-b", "main"]);
 
-	let (w, _) = test_worker(&[&ws], None);
-	let (client, _) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, _) = paired_client(&w, &ws);
 
+	let missing = tmp.path().join("nosuchworkspace").display().to_string();
 	let res = client.git(
-		"nosuchworkspace",
+		&missing,
 		"",
 		ReadProfile::Interactive,
 		GitQuery::ChangeList,
@@ -2531,11 +2346,11 @@ fn a_git_view_for_an_unshared_workspace_is_forbidden() {
 		matches!(
 			res,
 			Err(RemoteError::Refused {
-				code: ErrorCode::Forbidden,
+				code: ErrorCode::NotFound,
 				..
 			})
 		),
-		"expected Forbidden, got {res:?}"
+		"expected NotFound, got {res:?}"
 	);
 }
 
@@ -2588,8 +2403,8 @@ fn scan_with_outside_missing_submodule_gitdir_hides_outside_paths() {
 		],
 	);
 
-	let (w, _) = test_worker(&[&share], None);
-	let (client, ws_id) = paired_client(&w);
+	let w = test_worker(None);
+	let (client, ws_id) = paired_client(&w, &share);
 
 	let scan_res = client
 		.scan_repos(&ws_id, None, None)
@@ -2632,14 +2447,14 @@ fn scan_with_admission_wait_returns_incomplete_not_timeout() {
 	fs::write(slow_repo.join(".slow_sleep"), &slow_sleep_str).unwrap();
 	fs::write(slow_repo.join(".slow_active"), "").unwrap();
 
-	let (w, _) = test_worker(&[&ws], None);
+	let w = test_worker(None);
 	// Set scan deadline to 3000ms * s: budget reserve is 1500ms * s (scan_deadline / 2),
 	// so budget deadline is entry + 1500ms * s. Admission wait of ~2000ms * s exceeds budget
 	// but is well within the 3000ms * s job deadline.
 	let scan_deadline = Duration::from_millis(3000 * s);
 	w.set_deadlines_for_tests(Duration::from_secs(60 * s), scan_deadline);
 
-	let (client, ws_id) = paired_client(&w);
+	let (client, ws_id) = paired_client(&w, &ws);
 	let client = Arc::new(client);
 	let client1 = client.clone();
 	let client2 = client.clone();

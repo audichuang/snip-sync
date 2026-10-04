@@ -211,6 +211,10 @@ fn serve(
 	mut writer: impl Write,
 	state: &State,
 ) -> Result<(), RemoteError> {
+	// A stopped worker hangs up on every master, as a dead process would.
+	if state.stop.load(Ordering::SeqCst) {
+		return Ok(());
+	}
 	let Some(hello) = read_frame::<Request>(&mut reader)? else {
 		return Ok(());
 	};
@@ -257,6 +261,9 @@ fn serve(
 		let Some(request) = read_frame::<Request>(&mut reader)? else {
 			return Ok(());
 		};
+		if state.stop.load(Ordering::SeqCst) {
+			return Ok(());
+		}
 		match request {
 			Request::ScanRepos { workspace, under } => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
@@ -491,7 +498,7 @@ impl State {
 		&self,
 		workspace: &str,
 	) -> Result<SharedRoot, Response> {
-		SharedRoot::new(Path::new(workspace)).map_err(io_error)
+		SharedRoot::open(workspace).map_err(io_error)
 	}
 
 	#[allow(clippy::result_large_err)]

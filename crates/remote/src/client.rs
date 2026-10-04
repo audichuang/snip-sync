@@ -62,6 +62,28 @@ pub struct RemoteHost {
 	pub transport: Transport,
 }
 
+impl std::fmt::Debug for RemoteHost {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("RemoteHost").field(&self.name).finish()
+	}
+}
+
+/// The same host started the same way.
+impl PartialEq for RemoteHost {
+	fn eq(&self, other: &Self) -> bool {
+		self.name == other.name
+			&& match (&self.transport, &other.transport) {
+				(Transport::Command(a), Transport::Command(b)) => a == b,
+				(Transport::InProcess(a), Transport::InProcess(b)) => {
+					Arc::ptr_eq(a, b)
+				}
+				_ => false,
+			}
+	}
+}
+
+impl Eq for RemoteHost {}
+
 impl RemoteHost {
 	/// A worker in this process, for tests.
 	#[doc(hidden)]
@@ -166,9 +188,7 @@ impl Connection {
 			Ok(Some(Response::Error { code, message })) => {
 				Err(RemoteError::Refused { code, message })
 			}
-			Ok(Some(_)) => {
-				Err(RemoteError::Protocol("expected hello".into()))
-			}
+			Ok(Some(_)) => Err(RemoteError::Protocol("expected hello".into())),
 			Ok(None) | Err(RemoteError::Io(_)) | Err(RemoteError::TimedOut) => {
 				Err(conn.start_error())
 			}
@@ -281,17 +301,16 @@ pub(crate) fn start_message(code: Option<i32>, stderr: &str) -> String {
 	stderr.to_string()
 }
 
-fn spawn(
-	argv: &[OsString],
-) -> Result<
-	(
-		Box<dyn IoWrite + Send>,
-		Frames,
-		Option<Child>,
-		Arc<Mutex<Vec<u8>>>,
-	),
-	RemoteError,
-> {
+/// A started worker: where to write requests, the frames it answers, the
+/// process to stop, and what it said on stderr.
+type Started = (
+	Box<dyn IoWrite + Send>,
+	Frames,
+	Option<Child>,
+	Arc<Mutex<Vec<u8>>>,
+);
+
+fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 	let (program, args) = argv.split_first().ok_or_else(|| {
 		RemoteError::Connect("no command to start the worker".into())
 	})?;
@@ -321,7 +340,8 @@ fn spawn(
 				if n == 0 {
 					break;
 				}
-				let mut buf = keep.lock().unwrap_or_else(PoisonError::into_inner);
+				let mut buf =
+					keep.lock().unwrap_or_else(PoisonError::into_inner);
 				let room = MAX_STDERR.saturating_sub(buf.len());
 				buf.extend_from_slice(&chunk[..n.min(room)]);
 			}

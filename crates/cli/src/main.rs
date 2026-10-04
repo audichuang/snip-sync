@@ -112,21 +112,17 @@ enum Command {
 		#[arg(long)]
 		stdin: bool,
 	},
-	/// Serve folders to a paired snip-sync desktop app (remote-node
-	/// worker). Runs until stopped; prints a one-time pairing code.
-	Worker {
-		/// A folder the master may browse (repeatable). Nothing outside
-		/// these folders is served.
-		#[arg(long = "share", value_name = "DIR", required = true)]
-		shares: Vec<PathBuf>,
-		/// Address to listen on, e.g. the machine's Tailscale IP.
-		#[arg(long, value_name = "ADDR:PORT", default_value = snip_remote::DEFAULT_LISTEN)]
-		listen: std::net::SocketAddr,
+	/// Answer a snip-sync master on stdin and stdout. A master starts this
+	/// over ssh (`ssh <host> snip serve --stdio`); it is not run by hand.
+	Serve {
+		/// Speak the protocol on stdin and stdout (the only mode).
+		#[arg(long, required = true)]
+		stdio: bool,
 		/// Test knob, pretend to be an older worker.
 		#[arg(long, hide = true, value_name = "N")]
 		max_protocol: Option<u32>,
 	},
-	/// Operate a paired worker's shared folders (remote-node master).
+	/// Work on another machine's folders over ssh (hosts from ~/.ssh/config).
 	#[command(subcommand)]
 	Remote(remote::RemoteCommand),
 }
@@ -204,21 +200,12 @@ fn main() -> ExitCode {
 			paste(&repo, &settings, &opts, stdin)
 		}
 		Command::Remote(cmd) => remote::run(cmd),
-		Command::Worker {
-			shares,
-			listen,
-			max_protocol,
-		} => {
-			let config = snip_remote::default_config_dir();
-			match snip_remote::run_headless_worker(
-				listen,
-				&shares,
-				config.as_deref(),
+		Command::Serve { max_protocol, .. } => {
+			snip_remote::serve_stdio(snip_remote::WorkerOptions {
+				name: snip_remote::device_name(),
 				max_protocol,
-			) {
-				Ok(never) => match never {},
-				Err(err) => Err(format!("cannot start the worker: {err}")),
-			}
+			})
+			.map_err(|err| format!("serve: {err}"))
 		}
 	};
 	match result {

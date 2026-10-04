@@ -433,7 +433,8 @@ mod tests {
 			path: "src/多行".into(),
 		};
 		write_frame(&mut buf, &req).unwrap();
-		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() }).unwrap();
+		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() })
+			.unwrap();
 		let mut r = buf.as_slice();
 		assert_eq!(read_frame::<Request>(&mut r).unwrap(), Some(req));
 		assert_eq!(
@@ -454,7 +455,8 @@ mod tests {
 	#[test]
 	fn truncated_frame_is_an_error_not_a_clean_end() {
 		let mut buf = Vec::new();
-		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() }).unwrap();
+		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() })
+			.unwrap();
 		buf.pop();
 		assert!(read_frame::<Request>(&mut buf.as_slice()).is_err());
 	}

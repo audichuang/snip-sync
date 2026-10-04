@@ -65,8 +65,8 @@ preflight-host:
 	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
 	{{just_executable()}} remote-e2e
 
-# Remote-node connectivity end to end, apart from the GUI gates: a real `snip worker`
-# process and a real `snip remote` master over TLS on 127.0.0.1 (scripts/remote_e2e.sh).
+# Remote workspaces end to end, apart from the GUI gates: a real `snip remote` master
+# starting real `snip serve --stdio` workers on this machine (scripts/remote_e2e.sh).
 remote-e2e:
 	#!/usr/bin/env bash
 	set -euo pipefail
@@ -75,9 +75,9 @@ remote-e2e:
 	[ -x "$snip" ] || snip=$snip.exe
 	scripts/remote_e2e.sh --snip "$snip"
 
-# The same checks with the worker on another machine, over ssh and Tailscale: the
-# worker is built there from `git archive HEAD`. Extra args go to the script
-# (--listen ADDR:PORT, --remote-snip PATH).
+# The same checks with the worker on another machine, started over ssh as a master
+# does: the worker is built there from `git archive HEAD`. Extra args go to the
+# script (--remote-snip PATH).
 remote-e2e-ssh host *args:
 	#!/usr/bin/env bash
 	set -euo pipefail

@@ -165,7 +165,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 複製 commits:兩邊都經 `commits::copy_commits_with`。CLI 以範圍或 `-n` 選取(`transfer::plan_commit_export_with`),GUI 以時間軸選取的精確 chain(`plan_commit_export_exact_with`)。
 - 貼上檔案:兩邊都以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。
 - 貼上 commits:兩邊都經 `transfer::CommitReplayPreview`(`capture` / `revalidate` / `apply`)。
-- 配對清單:兩邊都經 `snip_remote::WorkerStore`;worker 端的受信任 master 清單經 `TrustedMasterStore`。
+- 遠端連線:兩邊都經 `snip_remote::Client`(`RemoteHost::ssh`,主機來自 `ssh::config_hosts`)。
 - 遠端 Git 檢視：兩邊都經 `snip_core::gitview::RepoView`（`snip_remote::RemoteRepo`）；worker 以 served `LocalRepo` 回答。
 - 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 
@@ -195,24 +195,28 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 選不連續的 commit 時,複製被拒絕並說明原因。
 - 三個平台都能完成一次「A 複製 → B 貼上」與「B 複製 → A 貼上」。
 
-## 8. 遠端節點模式(master／worker)
+## 8. 遠端工作區(SSH)
 
-> 狀態:第二刀(2026-10-03)。支援瀏覽、預覽與唯讀 Git 檢視；寫入類操作（stage、commit、write、rename 等）維持拒絕。
+> 狀態:第三刀(2026-10-04)。改走 SSH,拿掉配對;支援瀏覽、預覽與唯讀 Git 檢視。複製與貼上在後續切片加入(見下方「明確不做」)。
 
 這是**操作另一台電腦上檔案的控制通道**,不是剪貼簿的傳輸方式:第 1 節「不管傳輸」指的是複製／貼上之間的剪貼簿,照舊不變。
 
 - **角色**:
-  - **master**:桌面 App。在工作區選單的「遠端節點」配對 worker、列出它分享的工作區、開啟其中一個。CLI 也能當 master:`snip remote pair|workers|forget|workspaces|ls|stat|cat|repos|changes|log|show|diff`,與桌面版共用配對紀錄。
-  - **worker**:被操作的那台。用 CLI `snip worker --share <資料夾>` 就能跑,不需要桌面 App,也不需要螢幕。桌面 App 也能當 worker:從工作區選單啟用,或用 `--worker` 啟動。
-- **連線**:建議走 Tailscale 私網,不依賴公網。TCP 上跑 TLS 1.3,預設埠 47821。
-- **配對**:每台機器第一次使用時,各自產生一張自簽憑證。worker 顯示一次性配對碼,10 分鐘內有效,只能配對一台 master,連錯 5 次就作廢。master 輸入 worker 的位址與配對碼。配對成功後,worker 記住 master 憑證的指紋,master 固定(pin)worker 憑證的指紋。之後換了憑證的一方連不上,要重新配對。
-- **權限**:worker 只回應它分享的資料夾,也就是 `--share` 指定的資料夾,加上桌面版 worker 目前開著的工作區。每個路徑都先以 realpath 解析,再判斷是否在分享的資料夾內,所以 `..`、絕對路徑、指向外面的 symlink 一律拒絕。取消分享後立即生效。
+  - **master**:桌面 App,或 CLI `snip remote hosts|ls|stat|cat|repos|changes|log|show|diff <host> <資料夾> …`。兩者共用 `snip_remote::Client`。
+  - **worker**:被操作的那台,只要裝了 `snip`。master 每條連線都透過 ssh 在那台啟動一個 `snip serve --stdio`,連線結束就退出;不需要常駐服務,也不需要桌面 App。
+- **主機與連線**:
+  - 主機清單就是 `~/.ssh/config` 的 `Host` 項目(跟著 `Include` 走,略過萬用字元樣式)。
+  - master 執行 `ssh -T -o BatchMode=yes <host> snip serve --stdio`;遠端非互動 shell 的 PATH 找不到 `snip` 時,依序試 `~/.local/bin`、`/opt/homebrew/bin`、`/home/linuxbrew/.linuxbrew/bin`、`/usr/local/bin`。
+  - 身分驗證與加密完全交給 SSH,所以必須先設好金鑰登入;BatchMode 不會問密碼,失敗時顯示 ssh 自己的錯誤訊息。遠端沒有 `snip` 或版本太舊時,顯示「那台機器沒有安裝 snip,或版本太舊」。
+  - worker 先印一行 `snip-serve-stdio/1`,之後才是協定的 frame;登入 shell 在這之前印的歡迎訊息會被略過。
+  - `SNIP_REMOTE_EXEC` 環境變數可以整個取代啟動指令(以空白分隔),供測試與驗收使用。
+- **權限**:SSH 登入的使用者讀得到的資料夾,都能開成遠端工作區。工作區開啟後,每個請求仍以 realpath 解析,必須留在該工作區之內,所以 `..`、絕對路徑、指向工作區外的 symlink 一律拒絕。
+- **開啟遠端工作區**:工作區選單的「遠端主機（SSH）」列出主機。點一台主機會先連線並列出它家目錄底下的資料夾,也列出這台主機最近開過的資料夾,另有路徑欄可輸入任何資料夾(絕對路徑或 `~/…`)。開過的資料夾記在設定資料夾的 `remote-recent.json`,每台主機合計最多 10 筆。
 - **master 開啟遠端工作區後**:
   - 專案樹逐層列出 worker 上的目錄,和本機一樣不列 `.git`(指名路徑仍可讀)。單一目錄最多列 1000 筆,超過就顯示截斷。
-  - 指向分享範圍內資料夾的 symlink 列成資料夾,可以展開;指向分享範圍外或 `.git` 的 symlink 列成一般項目,打開時拒絕。規則與複製時展開資料夾相同(`transfer::is_safe_dir_symlink`)。
+  - 指向工作區內資料夾的 symlink 列成資料夾,可以展開;指向工作區外或 `.git` 的 symlink 列成一般項目,打開時拒絕。規則與複製時展開資料夾相同(`transfer::is_safe_dir_symlink`)。
   - 點檔案就預覽,規則與本機相同:上限 1 MiB,二進位與非 UTF-8 不顯示文字。重新整理會重讀樹和開著的預覽,檔案在 worker 上已刪除就顯示錯誤。
   - 複製、貼上、加入儲存庫路徑（`add_repo_path`）、為複製而勾選在遠端工作區都會拒絕,狀態列顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」（`remote_unsupported`）。右鍵選單的儲存庫與檔案列只提供複製 worker 上的路徑（`copy-worker-path`）,不提供本機 reveal（在 Finder／檔案總管顯示）。
-  - 移除(forget)一台 worker 時,開著的它的工作區會跟著關閉。
 
 ### Git 檢視
 
@@ -241,10 +245,11 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - tag 與參照極多（refs 輸出超過 `SERVED_MAX_STDOUT = 4 MiB`）的 repo，在遠端會顯示「遠端參照資料過大」（`remote_refs_too_large`）錯誤（本機可看）。
   - Refresh 時，開著的 Changes 列預覽若不屬於正在重新載入的 repo（或尚未讀完），預覽會清掉，回到該 repo 的預設畫面，不保留也不重讀；本機與遠端相同。專案樹開著的檔案照常重讀。
   - Refresh 時 worker 掃描失敗（舊版 worker、連線中斷），repo 清單清空，已開的預覽與展開的資料夾不保留；當時正在載入的資料夾可能停在載入中，需重新開啟工作區。
-  - `UserEmail` 查詢會將 worker 上的 `user.email`（含全域設定）提供給已配對的 master。
+  - 每條連線是一個 ssh 程序;master 每台主機最多留 2 條閒置連線。worker 的 job 與 `Served` 名額限制以單一程序計。
   - 外指 submodule 取捨：submodule 的 `.git` 指向分享外時，該 submodule 自身的列會被拒絕，但父 repo 的 status 仍會計算該 submodule 的 dirty bit（僅洩漏一個位元的改動狀態，換取與本機一致的變更標記）。
 - **版本相容**:
-  - 協定透過 `hello` 握手以 `max_version` 協商升級至版本 2（`GIT_VIEWS_VERSION = 2`）。新 master 連線至 0.5.0 舊 worker 時，專案樹瀏覽與預覽照常，Changes 與 Log 則明確顯示「{0} 的 snip-sync 版本太舊（協定 1），不支援 Git 檢視；請在 worker 上更新」（`remote_worker_too_old`）。
+  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 2,`GIT_VIEWS_VERSION = 2`）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）。
+  - 0.6.x 以前的 TLS worker(`snip worker`)不支援 `serve --stdio`,連不上時顯示「沒有安裝 snip,或版本太舊」。
 - **寫入不變式**:
   - 將來若開放 `Request::Write`/`Rename`，必須拒絕任何 `.git` 目錄底下、以及 git dir／common dir 目標底下的路徑；否則 Git 檢視會把「可寫檔案」變成「在 worker 上執行程式」（hooks、filter、fsmonitor 設定）。
 - **明確不做(本切片)**:
@@ -253,4 +258,4 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 主 repo 在分享外的 linked worktree、alternates／symlink 物件庫指向分享外：顯示為錯誤列，不提供 Git 檢視。
   - 掃描逾時（`TimedOut`）或達上限（`LimitReached`）在遠端不支援游標續掃（僅 depth-limited 資料夾可續），需重新整理重掃。
   - 自動 fetch、遠端分支操作：本機亦無此功能。
-  - Windows 服務安裝。
+  - Windows 作為 worker:遠端啟動指令用 POSIX `sh`。
