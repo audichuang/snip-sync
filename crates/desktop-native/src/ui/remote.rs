@@ -84,6 +84,7 @@ impl WorkbenchModel {
 							listed && !busy,
 							83,
 						)
+						.debug_selector(|| "btn-remote-open-here".into())
 						.when(listed && !busy, |d| {
 							d.on_click(cx.listener(|this, _, _, cx| {
 								this.open_remote_here(cx);
@@ -96,6 +97,7 @@ impl WorkbenchModel {
 			if !crate::remote::is_root(&browse.path) {
 				out.push(
 					menu_row("remote-up", 84)
+						.debug_selector(|| "remote-up".into())
 						.pl(px(32.))
 						.on_click(cx.listener(|this, _, _, cx| {
 							this.remote_up(cx);
@@ -133,8 +135,10 @@ impl WorkbenchModel {
 						let tip_path =
 							crate::remote::child_path(&listing.path, name);
 						let enter = name.clone();
+						let selector = id.clone();
 						out.push(
 							menu_row(SharedString::from(id.clone()), 84)
+								.debug_selector(move || selector)
 								.pl(px(32.))
 								.tooltip(tip(tip_path))
 								.on_click(cx.listener(move |this, _, _, cx| {

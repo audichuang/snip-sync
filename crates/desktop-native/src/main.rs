@@ -5529,6 +5529,23 @@ mod tests {
 			(model, cx)
 		}
 
+		/// Clicks the row of subfolder `name` in the host's block.
+		fn click_remote_folder(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			name: &str,
+		) {
+			let ix = model.read_with(cx, |m, _| {
+				let b = m.remote.browse.as_ref().expect("a host browsed");
+				let Some(Ok(listing)) = &b.listing else {
+					panic!("not listed: {b:?}");
+				};
+				listing.folders.iter().position(|f| f == name).unwrap()
+			});
+			let id = format!("remote-folder:{ix}");
+			click(cx, Box::leak(id.into_boxed_str()));
+		}
+
 		/// The folder shown in the host's block, and its subfolders.
 		fn shown_folder(
 			model: &Entity<WorkbenchModel>,
@@ -5788,7 +5805,7 @@ mod tests {
 				assert_eq!(m.remote_path_input.read(cx).text(), real(&base));
 			});
 
-			model.update(cx, |m, cx| m.enter_remote_folder("a", cx));
+			click_remote_folder(&model, cx, "a");
 			settle(cx);
 			let (path, folders) = shown_folder(&model, cx);
 			assert_eq!(path, real(&base.join("a")));
@@ -5803,15 +5820,15 @@ mod tests {
 				);
 			});
 
-			model.update(cx, |m, cx| m.remote_up(cx));
+			click(cx, "remote-up");
 			settle(cx);
 			let (path, folders) = shown_folder(&model, cx);
 			assert_eq!(path, real(&base));
 			assert_eq!(folders, ["a", "b"]);
 
-			model.update(cx, |m, cx| m.enter_remote_folder("b", cx));
+			click_remote_folder(&model, cx, "b");
 			settle(cx);
-			model.update(cx, |m, cx| m.open_remote_here(cx));
+			click(cx, "btn-remote-open-here");
 			settle(cx);
 			land_remote_open(&model, cx);
 			settle(cx);
@@ -5862,6 +5879,51 @@ mod tests {
 			});
 			settle(cx);
 			assert_eq!(shown_folder(&model, cx).0, before.0.clone());
+		}
+
+		/// A remote folder opened before is listed in the menu's top-level
+		/// recent list, after the local ones, and one click reopens it.
+		#[gpui::test]
+		fn remote_recent_is_in_the_top_level_list_and_reopens(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let local = tmp.path().join("local");
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&local).unwrap();
+			fs::create_dir_all(&shared).unwrap();
+			let shared_id =
+				dunce::canonicalize(&shared).unwrap().display().to_string();
+			let (model, cx) = remote_menu(cx);
+			model.update(cx, |m, cx| {
+				m.recent_workspaces = vec![local.clone()];
+				m.remote.recent = vec![crate::remote::RecentRemote {
+					host: m.remote.hosts[0].name.clone(),
+					path: shared_id.clone(),
+				}];
+				cx.notify();
+			});
+			settle(cx);
+			let local_row = cx
+				.debug_bounds("workspace-recent:0")
+				.expect("local recent listed");
+			let remote_row = cx
+				.debug_bounds("remote-recent:0")
+				.expect("remote recent listed at the top level");
+			assert!(
+				local_row.origin.y < remote_row.origin.y,
+				"after the local ones"
+			);
+			click(cx, "remote-recent:0");
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("reopened");
+				assert_eq!(session.workspace.id, shared_id);
+				assert_eq!(m.remote.recent.len(), 1);
+			});
 		}
 
 		#[gpui::test]
