@@ -54,6 +54,7 @@ struct Master {
 	exec: String,
 	config: PathBuf,
 	home: Option<PathBuf>,
+	settings: Option<String>,
 }
 
 impl Master {
@@ -66,11 +67,25 @@ impl Master {
 			exec,
 			config: tmp.join("cfg"),
 			home: None,
+			settings: None,
+		}
+	}
+
+	/// A master whose global `--settings` reach every command.
+	fn with_settings(tmp: &Path, exec: String, settings: &str) -> Self {
+		Self {
+			exec,
+			config: tmp.join("cfg"),
+			home: None,
+			settings: Some(settings.to_string()),
 		}
 	}
 
 	fn snip(&self, args: &[&str]) -> (Option<i32>, String, String) {
 		let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+		if let Some(settings) = &self.settings {
+			cmd.args(["--settings", settings]);
+		}
 		cmd.arg("remote")
 			.args(args)
 			.env("SNIP_CONFIG_DIR", &self.config)
@@ -527,6 +542,44 @@ fn cli_remote_copy_of_a_folder_equals_a_local_copy() {
 	let one = m.ok(&["copy", "h", s(&proj), "sub", "--stdout"]);
 	assert!(one.contains("// file: sub/中文.txt"), "{one}");
 	assert!(!one.contains("a.txt"), "{one}");
+}
+
+/// The user's `--settings` reach a remote copy: the same exclusion filter,
+/// header format and file-count cap a local copy applies.
+#[test]
+fn cli_remote_copy_forwards_the_users_settings() {
+	let tmp = tempfile::tempdir().unwrap();
+	let proj = tmp.path().join("proj");
+	std::fs::create_dir_all(&proj).unwrap();
+	for i in 0..40 {
+		std::fs::write(proj.join(format!("f{i:02}.txt")), "body\n").unwrap();
+	}
+	std::fs::write(proj.join("secrets.env"), "top secret\n").unwrap();
+	let settings = r###"{"useFilters":true,"useExcludeFilters":true,"filterRules":[{"type":"PATH","action":"EXCLUDE","value":"secrets.env","enabled":true}],"headerFormat":"## $FILE_PATH","setMaxFileCount":false}"###;
+	let m = Master::with_settings(tmp.path(), serve_exec(""), settings);
+
+	let remote = m.ok(&["copy", "h", s(&proj), "--stdout"]);
+	assert!(
+		!remote.contains("secrets.env") && !remote.contains("top secret"),
+		"the excluded file must not be copied: {remote}"
+	);
+	assert!(remote.contains("## f00.txt"), "{remote}");
+	assert!(
+		remote.contains("## f39.txt"),
+		"the disabled cap keeps every file: {}",
+		remote.contains("f39")
+	);
+
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args(["--settings", settings, "copy", ".", "--stdout"])
+		.current_dir(&proj)
+		.env("SNIP_CONFIG_DIR", tmp.path().join("cfg-local"));
+	let (status, local, stderr) = output(cmd, "snip copy");
+	assert_eq!(status, Some(0), "{stderr}");
+	assert_eq!(
+		remote, local,
+		"remote and local copy under the same settings agree"
+	);
 }
 
 #[test]

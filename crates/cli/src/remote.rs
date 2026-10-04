@@ -446,8 +446,10 @@ pub fn run(
 			} else {
 				SourceKind::File
 			};
-			let settings = snip_core::settings::Settings::default();
-			let limit = expand_limit(&settings);
+			// The user's --settings reach the worker: filtering, size caps
+			// and the header format are the local copy's, and the
+			// expansion limit follows them too.
+			let limit = expand_limit(settings);
 			let out = if paths.is_empty() && source != SourceKind::File {
 				// The selection is resolved on the worker with the same
 				// `changed_items` a local copy runs, so the payload is the
@@ -462,7 +464,7 @@ pub fn run(
 					&ws.id,
 					&repo,
 					&git_source,
-					&settings,
+					settings,
 					limit,
 					None,
 				)
@@ -494,7 +496,7 @@ pub fn run(
 						change_type,
 					})
 					.collect();
-				c.export_files(&ws.id, items, &settings, limit, None)
+				c.export_files(&ws.id, items, settings, limit, None)
 					.map_err(|e| e.to_string())?
 			};
 			if out.copied == 0 {
