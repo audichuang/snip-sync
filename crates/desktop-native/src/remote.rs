@@ -1000,6 +1000,7 @@ impl WorkbenchModel {
 								}
 							};
 							app_log!("[APP:REMOTE_SCAN_FAILED: {text}]");
+							model.status = msg.clone();
 							model.remote.scan_error = Some(msg);
 							model.discovery_status =
 								Some(ScanStatus::Incomplete);

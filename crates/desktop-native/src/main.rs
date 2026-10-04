@@ -7604,6 +7604,8 @@ mod tests {
 				let err = m.remote.scan_error.as_ref().expect("scan error");
 				assert_eq!(err.key, "remote_worker_too_old");
 				assert_eq!(err.args[0], "ancient");
+				// The status bar says it too, never a scan still running.
+				assert_eq!(m.status.key, "remote_worker_too_old");
 			});
 		}
 
