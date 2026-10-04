@@ -386,7 +386,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 | ID | 操作 | 通過線 |
 |---|---|---|
-| P01 | `"$SNIP" copy --repo "$RUN/paste-src" . --stdout > "$RUN/p-files.txt" && pbcopy < "$RUN/p-files.txt"`；打開 `pastews/plain`，按 Cmd+V | `PASTE_PREVIEW`；面板列出 `a.txt`、`new.txt`、`sub/crlf.txt`、`sub/noeol.txt`，全部是新增 |
+| P01 | `(cd "$RUN/paste-src" && "$SNIP" copy . --stdout) > "$RUN/p-files.txt"`（`selection_from_paths` 以 cwd 解析路徑，必須在來源資料夾裡跑；`--repo` 只管引擎根）；命令成功（`$?` 為 0）才 `pbcopy < "$RUN/p-files.txt"`；打開 `pastews/plain`，按 Cmd+V | `PASTE_PREVIEW`；面板列出 `a.txt`、`new.txt`、`sub/crlf.txt`、`sub/noeol.txt`，全部是新增 |
 | P02 | 點 `btn-apply` | `PASTE_DONE`；四個檔案與 oracle 相同（CRLF、沒有結尾換行都保留） |
 | P03 | 打開 `pastews/target`，同一個 payload 再按 Cmd+V | `a.txt` 標示為已存在、需要確認覆寫（`paste-overwrite`），其他是新增 |
 | P04 | 取消勾選 `new.txt`（`paste-include`），勾選 `a.txt` 的覆寫，點 `btn-apply` | `a.txt` 被覆寫、`new.txt` 不存在、`keep.txt` 不變；與 oracle（`--overwrite`，事後刪掉 oracle 的 new.txt）相同 |
@@ -396,7 +396,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | P08 | X10 的方式從遠端 `pastews/commit-src` 複製兩個 commit；打開 `pastews/commit-dst`，Cmd+V，`btn-apply` | `PASTE_DONE`；`git -C commit-dst log -2 --format=%s` 是 `replay two`、`replay one`，樹與 oracle（在 oracle 副本的 commit-dst 執行 `snip paste --apply --stdin`）相同 |
 | P09 | `"$SNIP" copy --repo "$RUN/commit-local" --commits -n 1 --stdout \| pbcopy`；打開一份新的 `commit-dst` 副本（`ssh ubuntu "cd '$W/pastews' && rm -rf commit-dst2 && git clone -q commit-src commit-dst2 && git -C commit-dst2 reset -q --hard HEAD~2"`），Cmd+V，`btn-apply` | 本機的 commit 重播到遠端：`git -C commit-dst2 log -1 --format=%s` 是 `from mac`，`mac.txt` 內容是 `from mac` |
 | P10 | 遠端貼回本機：在 `edge` 對 `src` 資料夾右鍵 →「複製」；打開本機 `local-ws`，Cmd+V，`btn-apply` | `local-ws/src/main.rs` 與 `local-ws/src/deep/中文 有空白.txt` 的 SHA-256 等於 worker 上的原檔 |
-| P11 | `"$SNIP" copy --repo "$RUN/paste-big" . --stdout \| pbcopy`（超過 8 MiB）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `PASTE_DONE`；30 個檔案與本機來源相同 |
+| P11 | `(cd "$RUN/paste-big" && "$SNIP" copy . --stdout) > "$RUN/p-big.txt"`，命令成功才 `pbcopy < "$RUN/p-big.txt"`（不要直接管線進 pbcopy：複製失敗也會蓋掉剪貼簿）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `PASTE_DONE`；30 個檔案與本機來源相同 |
 | P12 | 遠端到遠端：在 `gitws` 複製 alpha 資料夾（X08）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `plain/alpha/*` 與 worker 上的 `gitws/alpha` 工作樹檔案相同（不含 `.git`） |
 
 ### 4.8 拒絕的操作（N01–N02）
@@ -422,8 +422,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 |---|---|---|
 | C01 | `"$SNIP" remote hosts` | 包含 `ubuntu`，和 S01 的清單一致 |
 | C02 | `"$SNIP" remote ls ubuntu "$W/gitws" alpha` | 和 App 專案樹 `alpha` 的子項目相同 |
-| C03 | 對 rtk 抽 20 個 tracked 文字檔，比較 `"$SNIP" remote cat ubuntu ~/research/rtk <f> \| shasum -a 256` 和 `ssh ubuntu sha256sum` | 20/20 相同 |
-| C04 | App 開著 rtk 的時候，同時跑 20 個平行的 `"$SNIP" remote cat ubuntu ~/research/rtk src/main.rs` | 20/20 正確；這段時間在 GUI 點檔案仍然能預覽 |
+| C03 | 對 rtk 抽 20 個 tracked 文字檔，比較 `"$SNIP" remote cat ubuntu '~/research/rtk' "<f>" \| shasum -a 256`（路徑要用引號：不加引號 `~/…` 會在 Mac 端展開成 Mac 的家目錄）和 `ssh ubuntu "sha256sum '~/research/rtk/<f>'"` | 20/20 相同 |
+| C04 | App 開著 rtk 的時候，同時跑 20 個平行的 `"$SNIP" remote cat ubuntu '~/research/rtk' src/main.rs`（同樣加引號） | 20/20 正確；這段時間在 GUI 點檔案仍然能預覽 |
 
 ## 5. 完整性（決定這一輪可不可信）
 
