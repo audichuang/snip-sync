@@ -563,24 +563,64 @@ mod tests {
 		assert_eq!(err, ErrorCode::Busy);
 	}
 
+	/// A writer the job's op can read back while `run_job_with` writes.
+	#[derive(Clone, Default)]
+	struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+	impl Write for SharedBuf {
+		fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+			self.0.lock().unwrap().extend_from_slice(data);
+			Ok(data.len())
+		}
+
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	fn pending_frames(bytes: &[u8]) -> usize {
+		let mut cursor = std::io::Cursor::new(bytes);
+		let mut n = 0;
+		while let Ok(Some(Response::Pending)) =
+			read_frame::<Response>(&mut cursor)
+		{
+			n += 1;
+		}
+		n
+	}
+
 	#[test]
 	fn run_job_sends_at_least_two_pending_frames_before_the_result() {
-		let mut buf = Vec::new();
+		let buf = SharedBuf::default();
 		let cancel = CancelToken::new();
-		let heartbeat = scaled(Duration::from_millis(20));
-		let deadline = scaled(Duration::from_millis(500));
+		let heartbeat = Duration::from_millis(20);
+		let deadline = scaled(Duration::from_secs(10));
 
-		run_job_with(&mut buf, heartbeat, deadline, cancel, |_, _| {
-			std::thread::sleep(heartbeat * 3);
-			Response::Stat(Stat {
-				kind: crate::proto::EntryKind::File,
-				size: 42,
-				modified: None,
-			})
-		})
+		// The op returns once two heartbeats were written, not after a
+		// fixed sleep a slow machine can outlast with one heartbeat.
+		let seen = buf.clone();
+		run_job_with(
+			&mut buf.clone(),
+			heartbeat,
+			deadline,
+			cancel,
+			|_, end| {
+				while pending_frames(&seen.0.lock().unwrap()) < 2
+					&& Instant::now() < end
+				{
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				Response::Stat(Stat {
+					kind: crate::proto::EntryKind::File,
+					size: 42,
+					modified: None,
+				})
+			},
+		)
 		.unwrap();
 
-		let mut cursor = std::io::Cursor::new(buf);
+		let bytes = buf.0.lock().unwrap().clone();
+		let mut cursor = std::io::Cursor::new(bytes);
 		let mut pending_count = 0;
 		let got_stat;
 

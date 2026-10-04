@@ -3,9 +3,12 @@
 use std::fs;
 use std::net::TcpStream;
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -34,9 +37,11 @@ use snip_core::gitview::{
 };
 use snip_core::workspace::ScanStatus;
 use snip_remote::proto::{
-	read_frame, write_frame, ErrorCode, GitQuery, GitReply, Request, Response,
-	PROTOCOL_MAX, PROTOCOL_VERSION, REMOTE_MAX_LOG_LIMIT, REMOTE_MAX_TIPS,
+	read_frame, write_frame, ErrorCode, GitQuery, GitReply, Request,
+	REMOTE_MAX_LOG_LIMIT, REMOTE_MAX_TIPS,
 };
+#[cfg(unix)]
+use snip_remote::proto::{Response, PROTOCOL_MAX, PROTOCOL_VERSION};
 use snip_remote::tls::{client_config, server_name};
 use snip_remote::{
 	pair, Client, Connection, Identity, RemoteError, RemoteRepo, Worker,
@@ -1301,15 +1306,10 @@ fn scan_of_many_slow_repos_returns_partial_not_timeout() {
 	);
 	assert_eq!(scan.status, ScanStatus::TimedOut);
 
-	// Fast repo should have been summarized cleanly
-	let fast_repo = scan
-		.repos
-		.iter()
-		.find(|r| r.rel == "fast-a")
-		.expect("fast-a should be found");
-	assert!(fast_repo.summary.is_ok());
-
-	// Unread repos should have error rows containing "not read"
+	// Discovery walks in `read_dir` order, which Linux does not sort, so
+	// which repos fit the budget varies: every repo is still listed, and
+	// those past the budget say they were not read.
+	assert_eq!(scan.repos.len(), 5, "no repo dropped: {:?}", scan.repos);
 	let unread = scan.repos.iter().filter(|r| {
 		r.summary
 			.as_ref()
