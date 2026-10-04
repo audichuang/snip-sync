@@ -211,6 +211,15 @@ impl Connection {
 				}
 			}
 		});
+		// The stderr reader holds the other reference until the pipe closes:
+		// wait for it, or a fast exit is classified before its message lands.
+		let deadline = Instant::now() + Duration::from_secs(2);
+		while status.is_some()
+			&& Arc::strong_count(&self.stderr) > 1
+			&& Instant::now() < deadline
+		{
+			std::thread::sleep(Duration::from_millis(10));
+		}
 		let stderr = String::from_utf8_lossy(
 			&self.stderr.lock().unwrap_or_else(PoisonError::into_inner),
 		)
