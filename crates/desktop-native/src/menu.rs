@@ -589,7 +589,13 @@ impl WorkbenchModel {
 			})
 		})
 		.collect();
-		let mut v = vec![copy_entry(copy)];
+		// Cmd/Ctrl+C reads the left tool window, not the Log: no shortcut.
+		let mut v = vec![item(
+			"copy-files",
+			"menu_copy_files",
+			None,
+			(!copy.is_empty()).then_some(MenuAct::CopyNode(copy)),
+		)];
 		let rev = self.commit_file_rev(path).or_else(|| {
 			self.log_commit_root.clone().map(|r| (r, String::new()))
 		});
