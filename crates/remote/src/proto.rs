@@ -48,13 +48,11 @@ pub enum Request {
 		#[serde(default)]
 		max_version: Option<u32>,
 	},
-	/// Turns an unknown master into a trusted one. `proof` is
-	/// [`crate::tls::pairing_proof`] in hex.
-	Pair {
-		name: String,
-		proof: String,
+	/// Resolves `path` (absolute, or `~` / `~/…` for the worker's home)
+	/// to the folder every later request names as its `workspace`.
+	OpenWorkspace {
+		path: String,
 	},
-	ListWorkspaces,
 	ListDir {
 		workspace: String,
 		path: String,
@@ -154,17 +152,13 @@ pub enum Response {
 	Hello {
 		version: u32,
 		name: String,
-		/// Whether this connection's certificate is already trusted.
-		paired: bool,
+		/// The worker's home folder, where a master starts browsing.
+		#[serde(default)]
+		home: Option<String>,
 		#[serde(default)]
 		max_version: Option<u32>,
 	},
-	Paired {
-		name: String,
-	},
-	Workspaces {
-		items: Vec<RemoteWorkspace>,
-	},
+	Workspace(RemoteWorkspace),
 	Dir {
 		entries: Vec<DirEntry>,
 		truncated: bool,
@@ -226,7 +220,8 @@ pub struct ScannedRepo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteWorkspace {
-	/// Stable for the same folder: derived from its real path.
+	/// The folder's real path on the worker: the `workspace` of every
+	/// request about it.
 	pub id: String,
 	pub name: String,
 	/// The worker's own spelling of the path, for display only.
@@ -264,11 +259,7 @@ pub struct Stat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
-	/// The request needs a paired master.
-	NotPaired,
-	/// No pairing code is open, or the proof did not match it.
-	PairingRefused,
-	/// Outside every shared workspace.
+	/// Outside the workspace, or not readable.
 	Forbidden,
 	NotFound,
 	Unsupported,
@@ -442,12 +433,12 @@ mod tests {
 			path: "src/多行".into(),
 		};
 		write_frame(&mut buf, &req).unwrap();
-		write_frame(&mut buf, &Request::ListWorkspaces).unwrap();
+		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() }).unwrap();
 		let mut r = buf.as_slice();
 		assert_eq!(read_frame::<Request>(&mut r).unwrap(), Some(req));
 		assert_eq!(
 			read_frame::<Request>(&mut r).unwrap(),
-			Some(Request::ListWorkspaces)
+			Some(Request::OpenWorkspace { path: "~".into() })
 		);
 		assert_eq!(read_frame::<Request>(&mut r).unwrap(), None);
 	}
@@ -463,7 +454,7 @@ mod tests {
 	#[test]
 	fn truncated_frame_is_an_error_not_a_clean_end() {
 		let mut buf = Vec::new();
-		write_frame(&mut buf, &Request::ListWorkspaces).unwrap();
+		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() }).unwrap();
 		buf.pop();
 		assert!(read_frame::<Request>(&mut buf.as_slice()).is_err());
 	}
@@ -701,19 +692,19 @@ mod tests {
 	}
 
 	#[test]
-	fn old_worker_hello_reply_without_max_version_parses_as_none() {
-		let json = r#"{"reply":"hello","version":1,"name":"w","paired":true}"#;
+	fn hello_reply_without_home_or_max_version_parses_as_none() {
+		let json = r#"{"reply":"hello","version":1,"name":"w"}"#;
 		let res: Response = serde_json::from_str(json).unwrap();
 		match res {
 			Response::Hello {
 				version,
 				name,
-				paired,
+				home,
 				max_version,
 			} => {
 				assert_eq!(version, 1);
 				assert_eq!(name, "w");
-				assert!(paired);
+				assert_eq!(home, None);
 				assert_eq!(max_version, None);
 			}
 			other => panic!("expected Hello, got {other:?}"),
@@ -732,7 +723,7 @@ mod tests {
 		let hello_reply = Response::Hello {
 			version: PROTOCOL_VERSION,
 			name: "worker".into(),
-			paired: true,
+			home: Some("/home/u".into()),
 			max_version: Some(2),
 		};
 		round_trip_check(&hello_reply);
@@ -762,11 +753,7 @@ mod tests {
 				name: "n".into(),
 				max_version: None,
 			},
-			Request::Pair {
-				name: "n".into(),
-				proof: "p".into(),
-			},
-			Request::ListWorkspaces,
+			Request::OpenWorkspace { path: "~".into() },
 			Request::ListDir {
 				workspace: "w".into(),
 				path: "p".into(),

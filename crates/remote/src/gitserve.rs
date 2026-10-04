@@ -489,10 +489,6 @@ impl RepoCache {
 		self.entries.push(((ws, repo), (identity, now)));
 	}
 
-	pub fn clear(&mut self) {
-		self.entries.clear();
-	}
-
 	fn evict_expired(&mut self, now: Instant) {
 		let ttl = self.ttl;
 		self.entries
@@ -1485,11 +1481,6 @@ mod tests {
 		assert!(cache.get_at("ws", "b", t2).is_some());
 		assert!(cache.get_at("ws", "c", t2).is_some());
 		assert!(cache.get_at("ws", "d", t2).is_some());
-
-		// Clear
-		cache.clear();
-		assert!(cache.get_at("ws", "b", t2).is_none());
-		assert_eq!(cache.entries.len(), 0);
 	}
 
 	#[test]
