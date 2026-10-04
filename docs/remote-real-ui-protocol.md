@@ -20,7 +20,7 @@
 | worker | Ubuntu `audichuang-desktop`（x86_64） | 100.95.28.19 | `ssh ubuntu`（LAN 192.168.31.65） |
 
 - 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含 `ffcbb04`（#79 遠端節點第一刀）和 `64b6fde`（#81 連線排隊），用 `git merge-base --is-ancestor` 檢查，缺一個就不開跑。
-- Ubuntu 上 `/home/linuxbrew/.linuxbrew/bin/snip` 是 0.4.0，**沒有 `worker` 指令，不能用**。worker 一律用本輪從受測 SHA 編出來的 binary。
+- Ubuntu 上 `/home/linuxbrew/.linuxbrew/bin/snip` 是使用者常駐的 worker 服務 binary（`snip-worker.service`，47821 埠），不是受測對象；不要使用、替換或改動它。本輪的 worker 一律用從受測 SHA 編出來的 binary。
 - 受測專案：Ubuntu 上的 `~/research/rtk`。這是真實的 Rust 專案，HEAD `87a6c69`，tracked 檔 414 個，工作樹乾淨。它有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs` 238 KB）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**：第 7 節 I01 會驗證這一輪沒有動到它。
 - 邊界案例另外放在 fixture 資料夾 `edge`（第 2.3 節），不放進 rtk。
 
