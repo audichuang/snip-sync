@@ -309,7 +309,23 @@ pub(crate) fn run_job<W: Write>(
 	cancel: CancelToken,
 	op: impl FnOnce(&CancelToken, Instant) -> Response + Send,
 ) -> io::Result<()> {
-	run_job_with(w, HEARTBEAT, deadline, cancel, op)
+	run_job_with(w, HEARTBEAT, deadline, cancel, DeadlineReply::Fail, op)
+}
+
+/// What the caller answers once a job runs past its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadlineReply {
+	/// The op is cancelled, its response discarded, Timeout answered: right
+	/// for reads, where nothing was written.
+	Fail,
+	/// A write's own response is never discarded: the op is cancelled (a
+	/// confirmed write ignores that), Pending keeps the master informed
+	/// while the write finishes, and the real response goes out whatever
+	/// it says. A master waits longer than this job's deadline
+	/// ([`crate::client::APPLY_CALL_LIMIT`]), so a definite Timeout here
+	/// would be the only frame that turns a landed write into a reported
+	/// failure.
+	WriteOutcome,
 }
 
 pub(crate) fn run_job_with<W: Write>(
@@ -317,11 +333,13 @@ pub(crate) fn run_job_with<W: Write>(
 	heartbeat: Duration,
 	deadline: Duration,
 	cancel: CancelToken,
+	reply: DeadlineReply,
 	op: impl FnOnce(&CancelToken, Instant) -> Response + Send,
 ) -> io::Result<()> {
 	let (tx, rx) = std::sync::mpsc::sync_channel::<Response>(1);
 	let start = Instant::now();
 	let deadline_instant = start + deadline;
+	let write = reply == DeadlineReply::WriteOutcome;
 
 	std::thread::scope(|s| {
 		let op_cancel = cancel.clone();
@@ -334,14 +352,7 @@ pub(crate) fn run_job_with<W: Write>(
 			let now = Instant::now();
 			if now >= deadline_instant {
 				cancel.cancel();
-				let _ = rx.recv();
-				return write_response(
-					w,
-					&Response::Error {
-						code: ErrorCode::Timeout,
-						message: "the job timed out".into(),
-					},
-				);
+				return past_deadline_reply(w, &rx, heartbeat, write);
 			}
 
 			let remaining = deadline_instant - now;
@@ -352,17 +363,9 @@ pub(crate) fn run_job_with<W: Write>(
 					return write_response(w, &response);
 				}
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-					let now_after = Instant::now();
-					if now_after >= deadline_instant {
+					if Instant::now() >= deadline_instant {
 						cancel.cancel();
-						let _ = rx.recv();
-						return write_response(
-							w,
-							&Response::Error {
-								code: ErrorCode::Timeout,
-								message: "the job timed out".into(),
-							},
-						);
+						return past_deadline_reply(w, &rx, heartbeat, write);
 					}
 					if let Err(err) = write_response(w, &Response::Pending) {
 						cancel.cancel();
@@ -378,6 +381,45 @@ pub(crate) fn run_job_with<W: Write>(
 		}
 		Ok(())
 	})
+}
+
+/// The answer once a job is past its deadline. A read's response is
+/// discarded and Timeout answered; a write's own response follows, with
+/// Pending covering the silence while it finishes.
+fn past_deadline_reply<W: Write>(
+	w: &mut W,
+	rx: &std::sync::mpsc::Receiver<Response>,
+	heartbeat: Duration,
+	write: bool,
+) -> io::Result<()> {
+	if !write {
+		let _ = rx.recv();
+		return write_response(
+			w,
+			&Response::Error {
+				code: ErrorCode::Timeout,
+				message: "the job timed out".into(),
+			},
+		);
+	}
+	loop {
+		match rx.recv_timeout(heartbeat) {
+			Ok(response) => return write_response(w, &response),
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+				// The master waits longer than the job's deadline; these
+				// heartbeats keep its per-frame idle timeout from firing
+				// while the write finishes.
+				if let Err(err) = write_response(w, &Response::Pending) {
+					let _ = rx.recv();
+					return Err(err);
+				}
+			}
+			Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+				// op panicked; thread::scope joins and rethrows.
+				return Ok(());
+			}
+		}
+	}
 }
 
 #[cfg(test)]
@@ -615,6 +657,7 @@ mod tests {
 			heartbeat,
 			deadline,
 			cancel,
+			DeadlineReply::Fail,
 			|_, end| {
 				while pending_frames(&seen.0.lock().unwrap()) < 2
 					&& Instant::now() < end
@@ -679,6 +722,7 @@ mod tests {
 			heartbeat,
 			deadline,
 			cancel,
+			DeadlineReply::Fail,
 			|token, _| {
 				let start = Instant::now();
 				let limit = scaled(Duration::from_secs(2));
@@ -707,20 +751,27 @@ mod tests {
 		let op_cancelled = Arc::new(Mutex::new(false));
 		let op_cancelled_clone = op_cancelled.clone();
 
-		run_job_with(&mut buf, heartbeat, deadline, cancel, |token, _| {
-			let start = Instant::now();
-			let limit = scaled(Duration::from_secs(2));
-			while !token.is_cancelled() {
-				if start.elapsed() > limit {
-					panic!("op was not cancelled within deadline");
+		run_job_with(
+			&mut buf,
+			heartbeat,
+			deadline,
+			cancel,
+			DeadlineReply::Fail,
+			|token, _| {
+				let start = Instant::now();
+				let limit = scaled(Duration::from_secs(2));
+				while !token.is_cancelled() {
+					if start.elapsed() > limit {
+						panic!("op was not cancelled within deadline");
+					}
+					std::thread::sleep(Duration::from_millis(5));
 				}
-				std::thread::sleep(Duration::from_millis(5));
-			}
-			*op_cancelled_clone.lock().unwrap() = true;
-			Response::Text {
-				content: Some("finished late".into()),
-			}
-		})
+				*op_cancelled_clone.lock().unwrap() = true;
+				Response::Text {
+					content: Some("finished late".into()),
+				}
+			},
+		)
 		.unwrap();
 
 		assert!(*op_cancelled.lock().unwrap());
@@ -741,6 +792,57 @@ mod tests {
 		assert_eq!(code, ErrorCode::Timeout);
 	}
 
+	/// A write that finishes after its deadline keeps its own response:
+	/// Pending heartbeats cover the silence, then the real response goes
+	/// out. A Timeout refusal here would report a failure for a write that
+	/// landed, and a master cannot tell that apart from the truth.
+	#[test]
+	fn a_write_job_answers_its_real_response_past_the_deadline() {
+		let buf = SharedBuf::default();
+		let cancel = CancelToken::new();
+		let heartbeat = scaled(Duration::from_millis(10));
+		let deadline = scaled(Duration::from_millis(30));
+
+		// A confirmed write ignores cancellation and finishes late.
+		run_job_with(
+			&mut buf.clone(),
+			heartbeat,
+			deadline,
+			cancel,
+			DeadlineReply::WriteOutcome,
+			|_token, _| {
+				let start = Instant::now();
+				while start.elapsed() < scaled(Duration::from_millis(120)) {
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				Response::Text {
+					content: Some("the write landed".into()),
+				}
+			},
+		)
+		.unwrap();
+
+		let mut cursor = std::io::Cursor::new(buf.0.lock().unwrap().clone());
+		let mut pending_after = 0usize;
+		let final_response = loop {
+			match read_frame::<Response>(&mut cursor).unwrap() {
+				Some(Response::Pending) => pending_after += 1,
+				Some(response) => break response,
+				None => panic!("the response was discarded"),
+			}
+		};
+		assert_eq!(
+			final_response,
+			Response::Text {
+				content: Some("the write landed".into())
+			}
+		);
+		assert!(
+			pending_after >= 1,
+			"heartbeats cover the silence while the write finishes"
+		);
+	}
+
 	#[test]
 	fn run_job_turns_an_oversized_reply_into_too_large() {
 		let mut buf = Vec::new();
@@ -751,11 +853,16 @@ mod tests {
 		// MAX_FRAME is 8 MiB in proto.rs
 		let huge_string = "x".repeat(crate::proto::MAX_FRAME + 1024);
 
-		run_job_with(&mut buf, heartbeat, deadline, cancel, move |_, _| {
-			Response::Text {
+		run_job_with(
+			&mut buf,
+			heartbeat,
+			deadline,
+			cancel,
+			DeadlineReply::Fail,
+			move |_, _| Response::Text {
 				content: Some(huge_string),
-			}
-		})
+			},
+		)
 		.unwrap();
 
 		let mut cursor = std::io::Cursor::new(buf);

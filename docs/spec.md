@@ -224,7 +224,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - worker 在自己的磁碟上跑本機貼上同一套引擎(`transfer::plan_import_with`、`CommitReplayPreview`),不是逐檔寫入的 RPC。`ImportPlan`／`ReplayPlan` 只規劃、不寫入,回傳計畫與新鮮度快照(路徑是 worker 的)。
   - Apply 不留狀態:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,在重放鎖底下重新驗證後重放;「先允許覆寫」的提示之前,同樣先檢查是否過期。
   - CLI `snip remote paste <host> <資料夾> [--in 資料夾] --dry-run|--apply [--overwrite|--skip-existing] [--adjust-paths] [--stdin]` 的旗標、輸出與結束碼和 `snip paste` 相同;路徑調整建議由 worker 依它的資料夾提出。
-  - payload 可達剪貼簿上限(32 MiB),大於一個 frame:請求的貼上文字以 `Chunk` frame 先送(worker 端上限為剪貼簿上限),回覆的計畫以 `Chunk` + `Joined` 分段。寫入中的 Apply 不能中途取消,所以期限較長(30 分鐘),master 也不會重送寫入請求。送出 Apply 後連線中斷、沒收到回答時,結果未知:App 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」(`paste_outcome_unknown`),CLI 在 stderr 說明並以非零結束。
+  - payload 可達剪貼簿上限(32 MiB),大於一個 frame:請求的貼上文字以 `Chunk` frame 先送(worker 端上限為剪貼簿上限),回覆的計畫以 `Chunk` + `Joined` 分段。寫入中的 Apply 不能中途取消,所以期限較長(30 分鐘),master 也不會重送寫入請求;超過 worker 期限時,寫入工作自己的回應(成功或它自己的錯誤)不會被丟掉換成 `Timeout`,worker 以 heartbeat 撐住並送出實際結果,master 的期限(31 分鐘)較長,若 master 先放棄則結果未知:App 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」(`paste_outcome_unknown`),CLI 在 stderr 說明並以非零結束。
 
 ### Git 檢視
 

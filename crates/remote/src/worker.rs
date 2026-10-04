@@ -591,28 +591,42 @@ fn serve_copy(
 		view_deadline
 	};
 	let cancel = snip_core::gitrun::CancelToken::new();
-	crate::jobs::run_job(writer, deadline, cancel, |job_cancel, _| {
-		match state.jobs.admit(
-			workspace,
-			crate::jobs::JobKind::View,
-			job_cancel,
-		) {
-			Ok(_guard) => {
-				let root = match state.get_shared_root(workspace) {
-					Ok(r) => r,
-					Err(resp) => return resp,
-				};
-				let reply = op(&root, job_cancel);
-				if job == Job::PasteApply {
-					// Whatever was written is reported as it is.
-					reply
-				} else {
-					verify_root_unchanged(state, workspace, &root, reply)
+	// A write that runs past its deadline still answers with its own
+	// response: a Timeout here would report a landed write as a failure.
+	let reply = if job == Job::PasteApply {
+		crate::jobs::DeadlineReply::WriteOutcome
+	} else {
+		crate::jobs::DeadlineReply::Fail
+	};
+	crate::jobs::run_job_with(
+		writer,
+		crate::jobs::HEARTBEAT,
+		deadline,
+		cancel,
+		reply,
+		|job_cancel, _| {
+			match state.jobs.admit(
+				workspace,
+				crate::jobs::JobKind::View,
+				job_cancel,
+			) {
+				Ok(_guard) => {
+					let root = match state.get_shared_root(workspace) {
+						Ok(r) => r,
+						Err(resp) => return resp,
+					};
+					let reply = op(&root, job_cancel);
+					if job == Job::PasteApply {
+						// Whatever was written is reported as it is.
+						reply
+					} else {
+						verify_root_unchanged(state, workspace, &root, reply)
+					}
 				}
+				Err(code) => map_admit_error(code),
 			}
-			Err(code) => map_admit_error(code),
-		}
-	})
+		},
+	)
 }
 
 fn error(code: ErrorCode, message: String) -> Response {
