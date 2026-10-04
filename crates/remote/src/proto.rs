@@ -31,8 +31,12 @@ pub const TRANSFER_VERSION: u32 = 3;
 /// The first protocol with paste ([`Request::ImportPlan`] and the rest).
 pub const PASTE_VERSION: u32 = 4;
 /// The first protocol where the worker resolves a change selection itself
-/// ([`Request::ExportChanges`]).
+/// ([`Request::ExportChanges`]) and pages a directory listing
+/// ([`Request::ListDir`] with an offset).
 pub const EXPORT_CHANGES_VERSION: u32 = 5;
+/// The first protocol with paged remote listings ([`Response::Dir`]'s
+/// `next`).
+pub const DIR_PAGES_VERSION: u32 = 5;
 /// Payload bytes one [`Response::Chunk`] carries: JSON escaping can grow
 /// text several times and must stay under [`MAX_FRAME`].
 pub const CHUNK_BYTES: usize = 1024 * 1024;
@@ -73,6 +77,12 @@ pub enum Request {
 	ListDir {
 		workspace: String,
 		path: String,
+		/// Ask for the listing's continuation: entries from this index of
+		/// the worker's sorted listing on. Zero is the first page. A
+		/// non-zero offset needs [`DIR_PAGES_VERSION`]; workers before it
+		/// answer the first page again.
+		#[serde(default)]
+		offset: usize,
 	},
 	Stat {
 		workspace: String,
@@ -278,6 +288,9 @@ impl Request {
 				TRANSFER_VERSION
 			}
 			Self::ExportChanges { .. } => EXPORT_CHANGES_VERSION,
+			// Only a continuation needs a paging worker; the first page is
+			// protocol 1.
+			Self::ListDir { offset, .. } if *offset > 0 => DIR_PAGES_VERSION,
 			Self::ImportPlan { .. }
 			| Self::ImportApply { .. }
 			| Self::ReplayPlan { .. }
@@ -351,7 +364,15 @@ pub enum Response {
 	Workspace(RemoteWorkspace),
 	Dir {
 		entries: Vec<DirEntry>,
+		/// More entries exist than this reply holds: the listing is
+		/// truncated, or a further page carries the rest.
 		truncated: bool,
+		/// The offset to request for the next page: `Some` only when the
+		/// worker pages ([`DIR_PAGES_VERSION`]) and more entries remain.
+		/// Workers before that version have no field here, and a master
+		/// reads `None`: a truncated listing is all there is.
+		#[serde(default)]
+		next: Option<usize>,
 	},
 	Stat(Stat),
 	/// `content` is `None` for a binary or non-UTF-8 file, as local preview.
@@ -680,6 +701,7 @@ mod tests {
 		let req = Request::ListDir {
 			workspace: "w".into(),
 			path: "src/多行".into(),
+			offset: 0,
 		};
 		write_frame(&mut buf, &req).unwrap();
 		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() })
@@ -1027,6 +1049,7 @@ mod tests {
 			Request::ListDir {
 				workspace: "w".into(),
 				path: "p".into(),
+				offset: 0,
 			},
 			Request::Stat {
 				workspace: "w".into(),
@@ -1050,6 +1073,19 @@ mod tests {
 		for req in &v1_requests {
 			assert_eq!(req.needs_version(), 1);
 		}
+		// A listing continuation needs a paging worker; the first page does not.
+		let first_page = Request::ListDir {
+			workspace: "w".into(),
+			path: "p".into(),
+			offset: 0,
+		};
+		assert_eq!(first_page.needs_version(), 1);
+		let continuation = Request::ListDir {
+			workspace: "w".into(),
+			path: "p".into(),
+			offset: 1000,
+		};
+		assert_eq!(continuation.needs_version(), DIR_PAGES_VERSION);
 
 		let v4_requests = [
 			Request::ImportPlan {

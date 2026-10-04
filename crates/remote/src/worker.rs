@@ -734,9 +734,13 @@ impl State {
 				}),
 				Err(err) => io_error(err),
 			},
-			Request::ListDir { workspace, path } => self
+			Request::ListDir {
+				workspace,
+				path,
+				offset,
+			} => self
 				.resolve(&workspace, &path)
-				.and_then(|(root, dir)| list_dir(&root, &dir))
+				.and_then(|(root, dir)| list_dir(&root, &dir, offset))
 				.unwrap_or_else(|e| e),
 			Request::Stat { workspace, path } => self
 				.resolve(&workspace, &path)
@@ -802,12 +806,23 @@ impl State {
 	}
 }
 
-/// Lists `dir` inside the shared `root`. A symlink to a folder inside the
-/// share lists as a folder, as the copy engine treats it; one that leads
-/// out of the share (or into `.git`) stays a plain entry the master cannot
-/// open.
+/// The scan stops here even if the directory holds more: the sorted
+/// continuation's memory bound on the worker. Far past any real folder; a
+/// listing that hits it reports `truncated` with no next page.
+const MAX_DIR_SCAN_ENTRIES: usize = 50_000;
+
+/// Lists `dir` inside the shared `root`, sorted (folders first), served as
+/// pages of [`MAX_DIR_ENTRIES`] starting at `offset`. A symlink to a
+/// folder inside the share lists as a folder, as the copy engine treats
+/// it; one that leads out of the share (or into `.git`) stays a plain
+/// entry the master cannot open. `next` names the following page, and is
+/// absent when the listing ended here.
 #[allow(clippy::result_large_err)]
-fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
+fn list_dir(
+	root: &Path,
+	dir: &Path,
+	offset: usize,
+) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
 	let mut truncated = false;
@@ -823,7 +838,7 @@ fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 			Err(ScanError::Io(err)) => return Err(io_error(err)),
 		};
 		for entry in page.entries {
-			if entries.len() >= MAX_DIR_ENTRIES {
+			if entries.len() >= MAX_DIR_SCAN_ENTRIES {
 				truncated = true;
 				break;
 			}
@@ -861,7 +876,23 @@ fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 			.cmp(&a.directory)
 			.then_with(|| a.name.cmp(&b.name))
 	});
-	Ok(Response::Dir { entries, truncated })
+	// A scan that hit its own cap cannot be continued (the rest was never
+	// sorted in): the listing ends here, truncated. Otherwise a page short
+	// of the sorted listing's end has a next page.
+	let scan_truncated = truncated;
+	let total = entries.len();
+	let page_end = (offset + MAX_DIR_ENTRIES).min(total);
+	let page: Vec<DirEntry> = if offset < total {
+		entries[offset..page_end].to_vec()
+	} else {
+		Vec::new()
+	};
+	let has_next = !scan_truncated && page_end < total;
+	Ok(Response::Dir {
+		entries: page,
+		truncated: scan_truncated || page_end < total,
+		next: has_next.then_some(page_end),
+	})
 }
 
 #[allow(clippy::result_large_err)]

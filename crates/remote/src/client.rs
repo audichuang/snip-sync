@@ -1070,11 +1070,31 @@ impl Client {
 		workspace: &str,
 		path: &str,
 	) -> Result<(Vec<DirEntry>, bool), RemoteError> {
+		Ok(self.list_dir_page(workspace, path, 0)?.into_first_page())
+	}
+
+	/// One page of a remote listing, starting at `offset` of the worker's
+	/// sorted order (0 is the first page).
+	pub fn list_dir_page(
+		&self,
+		workspace: &str,
+		path: &str,
+		offset: usize,
+	) -> Result<DirPage, RemoteError> {
 		match self.call(&Request::ListDir {
 			workspace: workspace.into(),
 			path: path.into(),
+			offset,
 		})? {
-			Response::Dir { entries, truncated } => Ok((entries, truncated)),
+			Response::Dir {
+				entries,
+				truncated,
+				next,
+			} => Ok(DirPage {
+				entries,
+				truncated,
+				next,
+			}),
 			_ => Err(unexpected()),
 		}
 	}
@@ -1106,6 +1126,25 @@ impl Client {
 			Response::Text { content } => Ok(content),
 			_ => Err(unexpected()),
 		}
+	}
+}
+
+/// One page of a remote directory listing.
+#[derive(Debug, Clone)]
+pub struct DirPage {
+	pub entries: Vec<DirEntry>,
+	/// More entries exist than this page holds.
+	pub truncated: bool,
+	/// The offset to request for the next page, when the worker pages
+	/// ([`crate::proto::DIR_PAGES_VERSION`]) and more entries remain. An
+	/// older worker answers `None`: a truncated page is all there is.
+	pub next: Option<usize>,
+}
+
+impl DirPage {
+	/// The pre-pagination shape: the page and its truncation flag.
+	pub fn into_first_page(self) -> (Vec<DirEntry>, bool) {
+		(self.entries, self.truncated)
 	}
 }
 

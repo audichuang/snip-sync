@@ -434,9 +434,10 @@ pub fn tree_io(
 		Some(key_rel) => {
 			let req_path = join_rel(&prefix, &key_rel);
 			client
-				.list_dir(workspace, &req_path)
-				.map(|(entries, truncated)| {
-					let children = entries
+				.list_dir_page(workspace, &req_path, io.remote_offset)
+				.map(|page| {
+					let children = page
+						.entries
 						.into_iter()
 						.map(|e| ListedChild {
 							name: e.name,
@@ -445,7 +446,7 @@ pub fn tree_io(
 							nested_repo: e.nested_repo,
 						})
 						.collect();
-					(children, truncated)
+					(children, page.truncated, page.next)
 				})
 				.map_err(describe)
 		}

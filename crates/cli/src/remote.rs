@@ -234,18 +234,30 @@ pub fn run(
 		} => {
 			let c = client(&host);
 			let ws = find_workspace(&c, &workspace)?;
-			let (entries, truncated) =
-				c.list_dir(&ws.id, &path).map_err(|e| e.to_string())?;
 			let mut out = io::stdout().lock();
-			for e in entries {
-				let _ = writeln!(
-					out,
-					"{}{}",
-					e.name,
-					if e.directory { "/" } else { "" }
-				);
+			let mut offset = 0;
+			let mut last_truncated = false;
+			loop {
+				let page = c
+					.list_dir_page(&ws.id, &path, offset)
+					.map_err(|e| e.to_string())?;
+				for e in &page.entries {
+					let _ = writeln!(
+						out,
+						"{}{}",
+						e.name,
+						if e.directory { "/" } else { "" }
+					);
+				}
+				match page.next {
+					Some(next) => offset = next,
+					None => {
+						last_truncated = page.truncated;
+						break;
+					}
+				}
 			}
-			if truncated {
+			if last_truncated {
 				eprintln!("(listing truncated)");
 			}
 			Ok(())
@@ -471,14 +483,25 @@ pub fn run(
 				.map_err(|e| e.to_string())?
 			} else {
 				let named: Named = if paths.is_empty() {
-					// The whole folder: its entries, as a local copy of `.` takes.
-					let (entries, _) =
-						c.list_dir(&ws.id, &repo).map_err(|e| e.to_string())?;
-					let mut names: Vec<String> = entries
-						.into_iter()
-						.filter(|e| e.utf8)
-						.map(|e| e.name)
-						.collect();
+					// The whole folder: its entries, as a local copy of `.`
+					// takes, every page of the listing.
+					let mut names: Vec<String> = Vec::new();
+					let mut offset = 0;
+					loop {
+						let page = c
+							.list_dir_page(&ws.id, &repo, offset)
+							.map_err(|e| e.to_string())?;
+						names.extend(
+							page.entries
+								.iter()
+								.filter(|e| e.utf8)
+								.map(|e| e.name.clone()),
+						);
+						match page.next {
+							Some(next) => offset = next,
+							None => break,
+						}
+					}
 					names.sort();
 					names.into_iter().map(|n| (n, None)).collect()
 				} else {

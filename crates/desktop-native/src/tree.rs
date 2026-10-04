@@ -32,6 +32,9 @@ pub struct FileTreeNode {
 	key: NodeKey,
 	scan: Option<DirectoryScan>,
 	held: Option<ScanEntry>,
+	/// For a directory listed by a remote worker: the offset its next
+	/// page starts at. Zero means no continuation is due.
+	remote_offset: usize,
 	loading: bool,
 	load_epoch: u64,
 	selected_paths: Vec<String>,
@@ -152,6 +155,9 @@ pub struct TreeIo {
 	pub held: Option<ScanEntry>,
 	pub replace_children: bool,
 	pub kind: TreeIoKind,
+	/// A remote listing's continuation: the offset its next page starts
+	/// at. Zero lists from the start; local reads ignore it.
+	pub remote_offset: usize,
 }
 
 impl TreeIo {
@@ -179,6 +185,9 @@ pub struct TreeIoResult {
 	pub scan: Option<DirectoryScan>,
 	pub held: Option<ScanEntry>,
 	pub has_more: bool,
+	/// The remote listing's next page (0 for a local read, or when the
+	/// listing ended).
+	pub remote_offset: usize,
 	pub error: Option<String>,
 	pub truncated: bool,
 	pub skipped_oversize: usize,
@@ -344,6 +353,7 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 		scan: None,
 		held: None,
 		has_more: false,
+		remote_offset: 0,
 		error: None,
 		truncated: false,
 		skipped_oversize: 0,
@@ -470,6 +480,7 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 }
 
 /// One child of a directory listed somewhere else (a remote worker).
+#[derive(Clone)]
 pub struct ListedChild {
 	pub name: String,
 	/// False when the worker's name was not UTF-8 and `name` is lossy: the
@@ -479,12 +490,14 @@ pub struct ListedChild {
 	pub nested_repo: bool,
 }
 
-/// [`execute_tree_io`] for a directory listed by someone else: the whole
-/// listing arrives at once, so there is no cursor to keep and no page to
-/// continue. Children are admitted under the same byte budget.
+/// [`execute_tree_io`] for a directory listed by a remote worker: the
+/// page arrives whole, and a continuation is the next page's offset. The
+/// byte budget may stop a page short; the next page then re-fetches from
+/// the first entry it dropped, so no name is lost or doubled. Children
+/// are admitted under the same byte budget as a local read.
 pub fn listed_tree_result(
 	io: TreeIo,
-	listed: Result<(Vec<ListedChild>, bool), String>,
+	listed: Result<(Vec<ListedChild>, bool, Option<usize>), String>,
 ) -> TreeIoResult {
 	let mut result = TreeIoResult {
 		key: io.key.clone(),
@@ -495,6 +508,7 @@ pub fn listed_tree_result(
 		scan: None,
 		held: None,
 		has_more: false,
+		remote_offset: 0,
 		error: None,
 		truncated: false,
 		skipped_oversize: 0,
@@ -502,7 +516,7 @@ pub fn listed_tree_result(
 		cancelled: false,
 		replace_children: io.replace_children,
 	};
-	let (children, truncated) = match listed {
+	let (children, truncated, next) = match listed {
 		Ok(listed) => listed,
 		Err(err) => {
 			result.error = Some(err);
@@ -510,6 +524,7 @@ pub fn listed_tree_result(
 		}
 	};
 	result.truncated = truncated;
+	let total = children.len();
 	let mut room = io.byte_budget;
 	for child in children {
 		let entry = ScanEntry {
@@ -536,6 +551,18 @@ pub fn listed_tree_result(
 		}
 		room -= cost;
 		result.children.push(node);
+	}
+	// The next page starts after everything this page held, served or
+	// dropped: the worker's own continuation when all of it fit, the
+	// first dropped entry otherwise (it is fetched again).
+	if let Some(worker_next) = next {
+		let served = result.children.len();
+		result.remote_offset = if served < total {
+			io.remote_offset + served
+		} else {
+			worker_next
+		};
+		result.has_more = result.remote_offset > io.remote_offset;
 	}
 	result
 }
@@ -600,6 +627,7 @@ fn build_node(
 		selected_paths: Vec::new(),
 		budget_blocked: false,
 		extra_rows: 0,
+		remote_offset: 0,
 		row_window: DIR_PAGE_ROWS,
 	}
 }
@@ -621,6 +649,7 @@ impl FileTreeNode {
 			is_loaded: false,
 			is_truncated: false,
 			has_more: false,
+			remote_offset: 0,
 			is_valid_utf8: true,
 			read_error: None,
 			selected: false,
@@ -773,6 +802,7 @@ impl FileTreeNode {
 			node.is_truncated = result.truncated || result.skipped_oversize > 0;
 			node.budget_blocked = result.budget_blocked;
 			node.held = result.held.take();
+			node.remote_offset = result.remote_offset;
 			node.has_more = result.has_more || node.held.is_some();
 			node.scan = if node.has_more {
 				result.scan.take()
@@ -973,18 +1003,21 @@ impl FileTreeNode {
 			node.budget_blocked = false;
 			let mut scan = node.scan.take();
 			let mut held = node.held.take();
+			// A retry or re-expand re-lists from the start, locally and remotely.
+			let mut remote_offset = node.remote_offset;
 			if matches!(kind, TreeIoKind::Retry | TreeIoKind::Expand) {
 				node.children = Vec::new();
 				node.is_loaded = false;
 				node.has_more = false;
+				remote_offset = 0;
 				if matches!(kind, TreeIoKind::Retry) {
 					scan = None;
 					held = None;
 				}
 			}
-			(epoch, depth, scan, held)
+			(epoch, depth, scan, held, remote_offset)
 		};
-		let (epoch, depth, scan, held) = prepared;
+		let (epoch, depth, scan, held, remote_offset) = prepared;
 		let byte_budget =
 			MAX_RETAINED_WORKING_TREE_BYTES.saturating_sub(self.cache_bytes());
 		TreeEffect::Io(TreeIo {
@@ -996,6 +1029,7 @@ impl FileTreeNode {
 			byte_budget,
 			scan,
 			held,
+			remote_offset,
 			replace_children: matches!(
 				kind,
 				TreeIoKind::Retry | TreeIoKind::Expand
@@ -1241,6 +1275,62 @@ enum MarkerKind {
 #[cfg(test)]
 mod tests {
 	use std::collections::HashSet;
+	/// A remote listing the byte budget cuts short re-fetches the dropped
+	/// entries on the next page: pages join into every name, no doubles.
+	#[test]
+	fn a_remote_listing_continues_after_a_budget_cut() {
+		let key = NodeKey::root();
+		let io_for = |offset: usize, budget: usize| TreeIo {
+			key: key.clone(),
+			epoch: 1,
+			dir: PathBuf::from("/remote"),
+			base: PathBuf::from("/remote"),
+			depth: 1,
+			byte_budget: budget,
+			scan: None,
+			held: None,
+			remote_offset: offset,
+			replace_children: true,
+			kind: TreeIoKind::Expand,
+		};
+		let child = |name: &str| ListedChild {
+			name: name.into(),
+			utf8: true,
+			directory: false,
+			nested_repo: false,
+		};
+		let page1 = vec!["a", "b", "c", "d", "e"]
+			.into_iter()
+			.map(child)
+			.collect::<Vec<_>>();
+		let whole = listed_tree_result(
+			io_for(0, usize::MAX),
+			Ok((page1.clone(), true, Some(5))),
+		);
+		assert_eq!(whole.children.len(), 5);
+		assert_eq!(whole.remote_offset, 5, "the worker's continuation is kept");
+		// A budget that admits only some of the page.
+		let budget = whole.children[0].retained_bytes() * 3 + 1;
+		let first =
+			listed_tree_result(io_for(0, budget), Ok((page1, true, Some(5))));
+		let taken = first.children.len();
+		assert!(taken < 5, "{taken} admitted of 5");
+		assert!(first.has_more);
+		assert_eq!(
+			first.remote_offset, taken,
+			"the next page re-fetches the dropped entries"
+		);
+		// The worker's continuation, whole page admitted.
+		let page2: Vec<ListedChild> =
+			(taken..5).map(|i| child(&format!("{i}"))).collect();
+		let second = listed_tree_result(
+			io_for(taken, usize::MAX),
+			Ok((page2, false, None)),
+		);
+		assert!(!second.has_more);
+		assert_eq!(second.remote_offset, 0, "the listing ended");
+	}
+
 	#[cfg(unix)]
 	use std::ffi::OsString;
 	use std::fs;

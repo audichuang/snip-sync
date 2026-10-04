@@ -175,3 +175,57 @@ fn a_folder_symlink_inside_the_share_lists_as_a_folder() {
 		ErrorCode::Forbidden
 	);
 }
+
+/// A listing past the worker's page size continues: every entry arrives
+/// exactly once, in sorted order, until the listing ends.
+#[test]
+fn a_listing_past_the_page_size_pages_through_every_entry() {
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("many");
+	fs::create_dir_all(real.join("many/z-dir")).unwrap();
+	for i in 0..1199 {
+		fs::write(real.join("many").join(format!("f{i:04}")), "").unwrap();
+	}
+	fs::write(real.join("many/z-dir/inner"), "").unwrap();
+	let w = worker();
+	let client = Client::new(RemoteHost::in_process(w.clone()), "mac".into());
+	let ws = client
+		.open_workspace(&real.display().to_string())
+		.unwrap()
+		.id;
+
+	let mut names: Vec<String> = Vec::new();
+	let mut offset = 0;
+	let mut pages = 0;
+	loop {
+		let page = client.list_dir_page(&ws, "many", offset).unwrap();
+		pages += 1;
+		assert!(
+			page.entries.len() <= snip_remote::proto::MAX_DIR_ENTRIES,
+			"a page never exceeds the page size"
+		);
+		names.extend(page.entries.iter().map(|e| e.name.clone()));
+		match page.next {
+			Some(next) => offset = next,
+			None => break,
+		}
+	}
+	assert!(pages >= 2, "{pages} pages for 1200 entries");
+	assert_eq!(names.len(), 1200, "every entry arrives");
+	let mut sorted = names.clone();
+	sorted.sort();
+	sorted.dedup();
+	assert_eq!(sorted.len(), 1200, "no duplicates: {names:?}");
+	// The whole listing is the sorted order, folders first.
+	assert!(names.first().is_some_and(|n| n == "z-dir"));
+	assert!(names.contains(&"f0000".to_string()));
+	assert!(names.last().is_some_and(|n| n == "f1198"));
+	// An offset past the end answers an empty last page, cleanly.
+	let page = client.list_dir_page(&ws, "many", 1200).unwrap();
+	assert!(page.entries.is_empty());
+	assert_eq!(page.next, None);
+	// The plain listing still answers its single first page.
+	let (first, truncated) = client.list_dir(&ws, "many").unwrap();
+	assert_eq!(first.len(), snip_remote::proto::MAX_DIR_ENTRIES);
+	assert!(truncated);
+}
