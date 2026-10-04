@@ -90,10 +90,13 @@ printf '// FILE: target/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n' > "$RUN/
 ### 2.3 Ubuntu 端：編譯、放置受測 binary、fixture
 
 ```bash
-ssh ubuntu 'test ! -e ~/.local/bin/snip' || { echo "~/.local/bin/snip 已存在，不開跑" >&2; exit 1; }
+# 兩個名稱都要查：`test -e` 對懸空的 symlink 是假，必須再加 `-L`。
+# snip.uirun-$SHA 是本輪 S11 專用的備份名，開跑前也要不存在。
+ssh ubuntu '[ ! -e ~/.local/bin/snip ] && [ ! -L ~/.local/bin/snip ] && [ ! -e ~/.local/bin/snip.uirun-'"$SHA"' ] && [ ! -L ~/.local/bin/snip.uirun-'"$SHA"' ]' || { echo "~/.local/bin/snip 或本輪備份名已存在，不開跑" >&2; exit 1; }
 git archive HEAD | ssh ubuntu "rm -rf '$W' && mkdir -p '$W/src' && tar -x -C '$W/src'"
 ssh ubuntu "cd '$W/src' && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p snip-cli --locked 2>&1 | tail -1"
 ssh ubuntu "mkdir -p ~/.local/bin && cp '$W/src/target/release/snip' ~/.local/bin/snip && sh -c 'command -v snip' && snip --version"
+ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"   # 收尾比對用：只刪本輪放的 binary
 ```
 
 最後一行必須印出 `/home/audichuang/.local/bin/snip` 和受測版本。印出 linuxbrew 的路徑就停下：產品不會選到受測 binary。
@@ -290,7 +293,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | S08 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/edge`，點 `btn-remote-open` | `REMOTE_OPENED: ubuntu ▸ edge`；`~` 展開成對方的家目錄 |
 | S09 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/no-such`，點 `btn-remote-open` | 失敗格：選單裡紅字說資料夾不存在；目前的工作區不變（仍是 edge） |
 | S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `REMOTE_REOPEN` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`；啟動過程畫面不卡（重新連線在背景） |
-| S11 | 對方沒有受測版本：`ssh ubuntu 'mv ~/.local/bin/snip ~/.local/bin/snip.away'`，在 App 選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu 'mv ~/.local/bin/snip.away ~/.local/bin/snip'` | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
+| S11 | 對方沒有受測版本：`ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），在 App 選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
 | S12 | 把視窗調成 900×600（System Events 設成 900×632），開選單並點進一層資料夾 | `remote-path`、`remote-up`、`btn-remote-open-here`、`remote-path-input`、`btn-remote-open` 的 bounds 都 `w,h ≥ 1` 且在內容區裡；長路徑被截斷時 hover 顯示完整路徑；做完調回 1080×720 |
 
 ### 4.2 瀏覽真實專案 rtk（R01–R08）
@@ -428,16 +431,42 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 |---|---|---|
 | I01 | `rtk_snapshot "$RUN/rtk-after.txt" && cmp "$RUN/rtk-before.txt" "$RUN/rtk-after.txt"` | 相同 |
 | I02 | 同 2.2 重新列出 `$REAL` 並算雜湊 | 和 `real-config-before.*` 相同 |
-| I03 | 第 6 節收尾後 `ssh ubuntu 'test ! -e ~/.local/bin/snip && sh -c "command -v snip"'` | `~/.local/bin/snip` 不存在，`command -v snip` 回到 linuxbrew 的路徑 |
+| I03 | 第 6 節收尾後 `ssh ubuntu '[ ! -e ~/.local/bin/snip ] && [ ! -L ~/.local/bin/snip ] && [ ! -e ~/.local/bin/snip.uirun-$SHA ] && [ ! -L ~/.local/bin/snip.uirun-$SHA ] && sh -c "command -v snip"'` | `~/.local/bin/snip` 與本輪備份名都不存在（懸空 symlink 也算存在），`command -v snip` 回到 linuxbrew 的路徑 |
 | I04 | `grep -c top-secret-c0ffee "$RUN"/app-*.log "$RUN"/*/action.json` | 全部是 0 |
 
 ## 6. 收尾
 
 ```bash
-ssh ubuntu "pkill -f '/home/audichuang/.local/bin/snip serve' 2>/dev/null; rm -f ~/.local/bin/snip ~/.local/bin/snip.away; rm -rf '$W'"
+# 1) 本輪 worker 依 PID 收掉（argv 是 `snip serve --stdio`，不是絕對路徑），
+#    並驗證已結束；沒有 PID 就略過。
+ssh ubuntu "pgrep -u audichuang -f '^snip serve --stdio$'" > "$RUN/workers-at-cleanup.txt" || true
+pids=$(tr '\n' ' ' < "$RUN/workers-at-cleanup.txt")
+[ -n "$pids" ] && ssh ubuntu "kill $pids" || true
+sleep 1
+ssh ubuntu "pgrep -u audichuang -f '^snip serve --stdio$'" > "$RUN/workers-after-cleanup.txt" || true
+[ ! -s "$RUN/workers-after-cleanup.txt" ] || { echo "還有 worker 殘留，收尾未完成" >&2; exit 1; }
+
+# 2) S11 的備份若還在（S11 做到一半中斷）：先還原成 snip。
+ssh ubuntu "if [ -e ~/.local/bin/snip.uirun-$SHA ] && [ ! -e ~/.local/bin/snip ]; then mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip; fi"
+
+# 3) 只刪本輪放的 binary：hash 與安裝時記下的一致才刪；懸空 symlink 也先清掉。
+want=$(cut -d' ' -f1 "$RUN/snip-installed.sha")
+got=$(ssh ubuntu 'sha256sum ~/.local/bin/snip 2>/dev/null' | cut -d' ' -f1)
+if [ -n "$got" ] && [ "$got" = "$want" ]; then
+  ssh ubuntu 'rm -f ~/.local/bin/snip'
+else
+  echo "~/.local/bin/snip 已非本輪安裝的 binary，保留不刪" >&2
+fi
+ssh ubuntu "rm -f ~/.local/bin/snip.uirun-$SHA"
+
+# 4) 本輪目錄。
+ssh ubuntu "rm -rf '$W'"
 ```
 
-只刪 `$W` 和本輪放的 `~/.local/bin/snip`。不要動 `~/research/rtk`、linuxbrew 的 `snip`、`snip-worker.service`、`~/.ssh/config`。Mac 上的 `$RUN` 保留，裡面是證據。
+只刪 `$W`、本輪放的 `~/.local/bin/snip`（hash 一致才刪）與本輪備份名
+`~/.local/bin/snip.uirun-$SHA`。`snip.away` 或使用者自己的任何備份、
+`~/research/rtk`、linuxbrew 的 `snip`、`snip-worker.service`、
+`~/.ssh/config` 都不動。Mac 上的 `$RUN` 保留，裡面是證據。
 
 ## 7. 計分
 
