@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use snip_core::browser::SourcePreview;
+use snip_core::transfer::SourceKind;
 use snip_core::workspace::{RepoIdentity, RepoKind, RepoSummary, ScanStatus};
 use snip_remote::{
 	Client, Identity, PairedWorker, RemoteError, RemoteWorkspace, Worker,
@@ -1006,19 +1007,42 @@ impl WorkbenchModel {
 							model.is_loading = false;
 							model.refresh_reload = false;
 							if wipe {
+								let file_sel = (model
+									.selected_commit
+									.is_none() && model
+									.selected_file_source
+									== Some(SourceKind::File))
+								.then(|| {
+									let path = model.selected_file.clone()?;
+									let root = model
+										.selected_file_root
+										.clone()
+										.or_else(|| {
+											model
+												.remote
+												.session
+												.as_ref()
+												.map(|s| s.root.clone())
+										})?;
+									Some((root, path))
+								})
+								.flatten();
 								model.repos.clear();
 								model.pinned_repo = None;
 								model.selected_repo_idx = None;
 								model.release_repo_state();
 								model.sync_change_slots();
+								if let Some((root, path)) = file_sel {
+									model.select_file_in(
+										Some(root),
+										&path,
+										SourceKind::File,
+										cx,
+									);
+								}
 							}
 							model.ensure_ws_tree(cx);
-							if !model.tree_worker_alive
-								&& model
-									.ws_tree
-									.as_ref()
-									.is_some_and(|t| !t.is_loaded)
-							{
+							if !model.tree_worker_alive {
 								model.resume_ws_tree(cx);
 							}
 							cx.notify();

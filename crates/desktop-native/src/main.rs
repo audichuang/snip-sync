@@ -8737,6 +8737,206 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn remote_wipe_scan_failure_keeps_expanded_folder_recoverable(
+			cx: &mut TestAppContext,
+		) {
+			use crate::tree::{NodeKey, TreeCommand};
+
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(shared.join("sub")).unwrap();
+			fs::write(shared.join("sub").join("inner.txt"), "hello\n").unwrap();
+			let _r = repo(&shared, "repo", &[]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "ancient".into(),
+					trust_file: None,
+					max_protocol: Some(1),
+				},
+			);
+
+			let mut initial_loaded = false;
+			for _ in 0..50 {
+				settle(cx);
+				initial_loaded = model.read_with(cx, |m, _| {
+					m.ws_tree.as_ref().is_some_and(|t| {
+						t.is_loaded
+							&& t.children.iter().any(|c| c.name == "sub")
+					})
+				});
+				if initial_loaded {
+					break;
+				}
+			}
+			assert!(initial_loaded, "initial open must load ws_tree");
+
+			model.update(cx, |m, cx| {
+				m.launch_remote_scan(None, true, cx);
+				m.dispatch_ws_tree(
+					Some(TreeCommand::Expand(NodeKey::from_utf8_rel("sub"))),
+					cx,
+				);
+			});
+
+			let mut scan_failed = false;
+			for _ in 0..50 {
+				settle(cx);
+				scan_failed = model.read_with(cx, |m, _| {
+					!m.is_loading && m.remote.scan_error.is_some()
+				});
+				if scan_failed {
+					break;
+				}
+			}
+			assert!(scan_failed, "scan failure should have landed");
+
+			model.update(cx, |m, cx| {
+				m.dispatch_ws_tree(
+					Some(TreeCommand::Expand(NodeKey::from_utf8_rel("sub"))),
+					cx,
+				);
+			});
+
+			let mut sub_loaded = false;
+			for _ in 0..50 {
+				settle(cx);
+				sub_loaded = model.read_with(cx, |m, _| {
+					let Some(tree) = m.ws_tree.as_ref() else {
+						return false;
+					};
+					let Some(sub) =
+						tree.children.iter().find(|c| c.name == "sub")
+					else {
+						return false;
+					};
+					sub.is_loaded
+						&& !sub.loading && sub
+						.children
+						.iter()
+						.any(|c| c.name == "inner.txt")
+				});
+				if sub_loaded {
+					break;
+				}
+			}
+			assert!(
+				sub_loaded,
+				"sub folder should recover and load inner.txt after re-expand"
+			);
+
+			model.read_with(cx, |m, _| {
+				let tree = m.ws_tree.as_ref().expect("ws_tree exists");
+				let sub = tree
+					.children
+					.iter()
+					.find(|c| c.name == "sub")
+					.expect("sub node exists");
+				assert_eq!(sub.children.len(), 1);
+				assert_eq!(sub.children[0].name, "inner.txt");
+				assert!(!sub.loading);
+			});
+		}
+
+		#[gpui::test]
+		fn remote_wipe_scan_failure_keeps_file_preview(
+			cx: &mut TestAppContext,
+		) {
+			use crate::tree::TreeCommand;
+
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&shared).unwrap();
+			fs::write(shared.join("file.txt"), "hello\n").unwrap();
+			let _r = repo(&shared, "repo", &[]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "ancient".into(),
+					trust_file: None,
+					max_protocol: Some(1),
+				},
+			);
+
+			let mut initial_loaded = false;
+			for _ in 0..50 {
+				settle(cx);
+				initial_loaded = model.read_with(cx, |m, _| {
+					m.ws_tree.as_ref().is_some_and(|t| {
+						t.is_loaded
+							&& t.children.iter().any(|c| c.name == "file.txt")
+					})
+				});
+				if initial_loaded {
+					break;
+				}
+			}
+			assert!(initial_loaded, "initial open must load ws_tree");
+
+			model.update(cx, |m, cx| {
+				m.dispatch_ws_tree(
+					Some(TreeCommand::OpenFile("file.txt".into())),
+					cx,
+				);
+			});
+
+			let mut preview_loaded = false;
+			for _ in 0..50 {
+				settle(cx);
+				preview_loaded = model.read_with(cx, |m, _| {
+					!m.preview_loading && m.preview.is_some()
+				});
+				if preview_loaded {
+					break;
+				}
+			}
+			assert!(preview_loaded, "file.txt preview must load");
+
+			model.update(cx, |m, cx| m.reload_repos(cx));
+
+			let mut scan_failed = false;
+			for _ in 0..50 {
+				settle(cx);
+				scan_failed = model.read_with(cx, |m, _| {
+					!m.is_loading && m.remote.scan_error.is_some()
+				});
+				if scan_failed {
+					break;
+				}
+			}
+			assert!(scan_failed, "scan failure should have landed");
+
+			let mut preview_settled = false;
+			for _ in 0..50 {
+				settle(cx);
+				preview_settled = model.read_with(cx, |m, _| {
+					!m.preview_loading && m.preview.is_some()
+				});
+				if preview_settled {
+					break;
+				}
+			}
+			assert!(
+				preview_settled,
+				"preview should settle after scan failure"
+			);
+
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("preview should be Some");
+				assert_eq!(p.text.as_ref(), "hello\n");
+				assert_eq!(m.selected_file.as_deref(), Some("file.txt"));
+				assert!(m.preview_error.is_none());
+				assert!(!m.preview_loading);
+			});
+		}
+
+		#[gpui::test]
 		fn remote_scan_failure_refresh_submits_only_one_root_listing(
 			cx: &mut TestAppContext,
 		) {

@@ -276,7 +276,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | R10 | 點 `tree-row:README_zh.md` | `PREVIEW_LOADED`；中文正常顯示，沒有豆腐字或亂碼 |
 | R11 | 展開 `src/hooks`，點 `tree-row:src/hooks/init.rs`（238 KB），在預覽裡捲到最後 | `PREVIEW_LOADED`；最後一行和 `tail -1` 一致；捲動時 App 不卡 |
 | R12 | 展開 `target`、`release`，點 `tree-row:target/release/rtk`（8 MB 二進位） | 依第 3 節規則 4 判失敗格：顯示二進位或超過 1 MiB 的錯誤都算對；沒有亂碼文字；5 秒內可以點下一列 |
-| R13 | 看根目錄，再執行 `mkdir -p "$RUN/R13" && target/debug/snip remote cat 1 rtk .git/HEAD`（存為 `R13/head.txt`） | 樹裡沒有 `tree-row:.git` 列；CLI 印出 `ref: refs/heads/…`（`.git` 只是不列在樹裡，指名路徑仍可讀）。證據：截圖顯示完整根目錄清單（必要時捲動，註明清單完整），加上從 App 日誌 grep `CTRL_BOUNDS` 得到的 `tree-row:` ID 原始清單證明無 `tree-row:.git`，以及儲存的 CLI 輸出 `R13/head.txt` |
+| R13 | 看根目錄，再執行 `mkdir -p "$RUN/R13" && target/debug/snip remote cat 1 rtk .git/HEAD > "$RUN/R13/head.txt"; cat "$RUN/R13/head.txt"` | 樹裡沒有 `tree-row:.git` 列；CLI 印出 `ref: refs/heads/…`（`.git` 只是不列在樹裡，指名路徑仍可讀）。證據：截圖顯示完整根目錄清單（必要時捲動，註明清單完整），加上從 App 日誌 grep `CTRL_BOUNDS` 得到的 `tree-row:` ID 原始清單證明無 `tree-row:.git`，以及儲存的 CLI 輸出 `R13/head.txt`。缺少存檔 `R13/head.txt` 者判 `not-run` |
 | R14 | 把 `src` 收合再展開（點 `tree-chevron:src`） | 第二次也有 `TREE_PAGE: rel=src`，清單和 R08 相同 |
 
 ### 4.3 邊界案例 edge
@@ -319,7 +319,7 @@ R34 之前，先重新開回 `edge`（R15 的步驟）。
 |---|---|---|
 | R34 | `ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 樹重新讀取；出現 `ws-tree-row:new.txt`，預覽顯示 `fresh-1` |
 | R35 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2`，不是快取的舊內容 |
-| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | `ws-tree-row:new.txt` 出現 `CTRL_GONE`；R35 開著的 `new.txt` 預覽重新讀取，改顯示指名 `new.txt` 的找不到檔案或讀取失敗錯誤，不再是 `fresh-2`；絕不可顯示其他 repo 的 Git 錯誤，`edge/nested`（錯誤 repo）絕不能搶佔預覽區 |
+| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄 `WS_TREE_PAGE: rel= …` 行（Refresh 後根目錄清單抵達）之後，不再出現 `ws-tree-row:new.txt` 的 `CTRL_BOUNDS`（該列不在重建後的清單中）；最後一行 `PREVIEW_LOADING` 為 `new.txt` 且其後沒有 `PREVIEW_LOADED`；預覽改顯示指名 `new.txt` 的找不到檔案或讀取失敗錯誤，不再是 `fresh-2`（註：其間若出現 `new.txt` 的 `PREVIEW_DISCARDED` 屬預期現象，因 Refresh 會重新讀取開啟的檔案兩次，非屬異常）；絕不可顯示其他 repo 的 Git 錯誤，`edge/nested`（錯誤 repo）絕不能搶佔預覽區 |
 | R37 | 停掉 worker：`ssh ubuntu "kill \$(cat '$W/worker.pid')"`，在 App 點一個沒預覽過的檔案 | 失敗格；`PREVIEW_LOADING` 之後 10 秒內出現錯誤（master 連線逾時 2 秒、讀取 5 秒）；這段時間 App 沒有凍結（可以捲動、可以開選單）；接著按 Cmd+Shift+W 關掉工作區，要在 8 秒內完成 |
 | R38 | `start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"`；確認指紋和第一次一樣；在 App 選單點 `remote-worker:0`，開 `edge`，點一個檔案 | 不需要重新配對；`REMOTE_WORKSPACES: count=5`、`REMOTE_OPENED`、`PREVIEW_LOADED` |
 | R39 | 取消分享：`start_worker wcfg /home/audichuang/research/rtk`（只分享 rtk）。App 不重開，直接點 `edge` 裡另一個檔案，再開選單點 `remote-worker:0` | 預覽被拒絕（失敗格）；選單只列出 `rtk`（`REMOTE_WORKSPACES: count=1`） |
