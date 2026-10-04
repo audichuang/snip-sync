@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Remote-node end to end, CLI only: a real `snip worker` process serves
-# folders, a real `snip remote` master pairs with it and reads them over TLS.
-# Independent of native acceptance (the GUI gates in the container).
+# Remote workspaces end to end, CLI only: a real `snip remote` master starts
+# a real `snip serve --stdio` worker for every command and reads folders
+# through it. Independent of native acceptance (the GUI gates in the
+# container).
 #
 #   scripts/remote_e2e.sh --snip target/debug/snip
-#       Worker on this machine at 127.0.0.1 (CI and `just preflight`).
+#       Worker on this machine, started directly (CI and `just preflight`).
 #   scripts/remote_e2e.sh --snip target/release/snip --worker-ssh ubuntu \
-#           [--listen 100.x.y.z:47821] [--remote-snip /path/to/snip]
-#       Worker on another machine over ssh, reached on its Tailscale address
-#       (`tailscale ip -4` there unless --listen). Without --remote-snip the
-#       worker is built there from `git archive HEAD`.
+#           [--remote-snip /path/to/snip]
+#       Worker on another machine, started over ssh as a master does.
+#       Without --remote-snip the worker is built there from
+#       `git archive HEAD`.
 #
 # Every check prints PASS or FAIL; the exit code is 0 only when all passed.
 # Waits scale with SNIP_E2E_TIMEOUT_SCALE. A check that cannot run here
@@ -18,15 +19,13 @@ set -uo pipefail
 
 SNIP=""
 HOST=""
-LISTEN=""
 RSNIP=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--snip) SNIP=$2; shift 2 ;;
 	--worker-ssh) HOST=$2; shift 2 ;;
-	--listen) LISTEN=$2; shift 2 ;;
 	--remote-snip) RSNIP=$2; shift 2 ;;
-	-h | --help) sed -n '2,17p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,18p' "$0"; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -78,12 +77,12 @@ refused() { # name, expected stderr fragment ("" = any), snip remote args...
 }
 
 MASTER=$(mktemp -d)
-export SNIP_CONFIG_DIR="$MASTER/master" # a fresh master: pairing is part of the run
+export SNIP_CONFIG_DIR="$MASTER/master"
 WD=$(w <<<'mktemp -d')
 [ -n "$WD" ] || { echo "cannot make a work folder on the worker" >&2; exit 1; }
 
 cleanup() {
-	w <<<"[ -f '$WD/worker.pid' ] && kill \$(cat '$WD/worker.pid') 2>/dev/null; sleep 1; rm -rf '$WD'" >/dev/null 2>&1
+	w <<<"rm -rf '$WD'" >/dev/null 2>&1
 	rm -rf "$MASTER"
 }
 trap cleanup EXIT
@@ -102,17 +101,15 @@ elif [ -z "$RSNIP" ]; then
 	RSNIP="$WD/src/target/release/snip"
 	SRC="$WD/src"
 fi
-if [ -z "$LISTEN" ]; then
-	if [ -z "$HOST" ]; then
-		LISTEN=127.0.0.1:0
-	else
-		ip=$(w <<<'tailscale ip -4 2>/dev/null | head -1')
-		[ -n "$ip" ] || { echo "no Tailscale address on $HOST; pass --listen" >&2; exit 2; }
-		LISTEN=$ip:47821
-	fi
+# How every `snip remote` below starts its worker: directly, or over ssh as
+# a master does. The host argument `h` is then only a label.
+if [ -z "$HOST" ]; then
+	export SNIP_REMOTE_EXEC="$RSNIP serve --stdio"
+else
+	export SNIP_REMOTE_EXEC="ssh -T -o BatchMode=yes -o ConnectTimeout=10 $HOST $RSNIP serve --stdio"
 fi
 
-# Fixtures, made on the worker. `secret.txt` sits outside every share.
+# Fixtures, made on the worker. `secret.txt` sits outside every workspace.
 w <<EOF || { echo "cannot make the fixtures" >&2; exit 1; }
 set -e
 cd '$WD'
@@ -184,74 +181,28 @@ printf 'outer dirty\n' > outer/outer-dirty.txt
 printf 'inner file\n' > outer/inner/file.txt
 EOF
 
-start_worker() { # config folder name; prints the worker log
-	local tries=0 log=""
-	while [ $tries -lt 10 ]; do
-		w <<EOF
-cd '$WD'
-[ -f worker.pid ] && kill \$(cat worker.pid) 2>/dev/null && sleep 1
-shares="--share '$WD/edge' --share '$WD/text' --share '$WD/gitws' --share '$WD/outer/inner'"
-[ -n '$SRC' ] && shares="\$shares --share '$SRC'"
-eval "SNIP_CONFIG_DIR='$WD/$1' nohup '$RSNIP' worker \$shares --listen '$LISTEN' > worker.log 2>&1 &"
-echo \$! > worker.pid
-EOF
-		local waited=0 limit=$((20 * SCALE))
-		while [ $waited -lt "$limit" ]; do
-			log=$(w <<<"cat '$WD/worker.log' 2>/dev/null")
-			case "$log" in
-			*"pairing code"*) echo "$log"; return 0 ;;
-			*rror*) break ;;
-			esac
-			sleep 1
-			waited=$((waited + 1))
-		done
-		# A port just released can still be held for a moment (Windows).
-		tries=$((tries + 1))
-		sleep 1
-	done
-	echo "$log"
-	return 1
-}
-
-echo "== start the worker"
-log=$(start_worker wcfg) || { echo "$log"; bad "worker starts"; exit 1; }
-echo "$log"
-ADDR=$(sed -n 's/^snip-sync worker listening on //p' <<<"$log" | tr -d '\r')
-LISTEN=$ADDR # restarts reuse the same address
-code=$(sed -n 's/^pairing code \([^ ]*\).*/\1/p' <<<"$log")
-wfp=$(sed -n 's/^fingerprint //p' <<<"$log" | tr -d '\r')
-
-echo "== pairing"
-mkdir -p "$SNIP_CONFIG_DIR"
-decoy_fp=$(printf 'ab%.0s' {1..32})
-printf '[{"name":"decoy","addr":"192.0.2.1:47821","fingerprint":"%s"}]\n' "$decoy_fp" > "$SNIP_CONFIG_DIR/remote-workers.json"
-out=$("$SNIP" remote pair "$ADDR" "$code" 2>&1)
-check "pair with the printed code" grep -q "^paired with" <<<"$out"
-check "the master shows the worker's fingerprint ($wfp)" grep -q "$wfp" <<<"$out"
-w_out=$("$SNIP" remote workers)
-check "pairing keeps another worker's entry" test "$(grep -c . <<<"$w_out")" = 2 -a "$(grep -c decoy <<<"$w_out")" = 1 -a "$(head -1 <<<"$w_out" | grep -c "$ADDR")" = 1
-"$SNIP" remote forget decoy >/dev/null
-w_after=$("$SNIP" remote workers)
-check "forgetting another pairing leaves ours" test "$(grep -c . <<<"$w_after")" = 1 -a "$(head -1 <<<"$w_after" | grep -c "^1	")" = 1
-check "listed as worker 1" bash -c "'$SNIP' remote workers | grep -q '^1	'"
-spaces=$("$SNIP" remote workspaces 1)
-expect=4
-[ -n "$SRC" ] && expect=5
-check "$expect shared workspaces" test "$(grep -c . <<<"$spaces")" = "$expect"
+echo "== connect"
+check "the worker answers on stdio" bash -c "'$SNIP' remote ls h $WD | grep -qx edge/"
+home=$("$SNIP" remote ls h "~" 2>&1)
+check "~ opens the worker's home" test "$?" = 0
+refused "a relative workspace" "absolute" ls h relative/dir
+refused "a missing workspace" "" ls h $WD/nope
+err=$(SNIP_REMOTE_EXEC="$WD/no-such-snip serve --stdio" "$SNIP" remote ls h $WD 2>&1)
+check "a worker that cannot start says why ($err)" test -n "$err"
 srcname=$(basename "$SRC")
 
 echo "== browsing"
-check "folders first" bash -c "'$SNIP' remote ls 1 edge | head -1 | grep -q '/\$'"
-check "a Chinese name with spaces" bash -c "'$SNIP' remote cat 1 edge 'src/deep/中文 有空白.txt' | grep -q 深層"
-check "stat of an empty file" bash -c "'$SNIP' remote stat 1 edge empty.txt | grep -q '^file	0	'"
-check "exactly 1 MiB is served" test "$("$SNIP" remote cat 1 edge exact-1MiB.txt | wc -c | tr -d ' ')" = 1048576
-check "1200 entries are cut at 1000" test "$("$SNIP" remote ls 1 edge manydir 2>/dev/null | wc -l | tr -d ' ')" = 1000
-check "a nested repo is a folder" bash -c "'$SNIP' remote stat 1 edge nested | grep -q '^directory'"
+check "folders first" bash -c "'$SNIP' remote ls h $WD/edge | head -1 | grep -q '/\$'"
+check "a Chinese name with spaces" bash -c "'$SNIP' remote cat h $WD/edge 'src/deep/中文 有空白.txt' | grep -q 深層"
+check "stat of an empty file" bash -c "'$SNIP' remote stat h $WD/edge empty.txt | grep -q '^file	0	'"
+check "exactly 1 MiB is served" test "$("$SNIP" remote cat h $WD/edge exact-1MiB.txt | wc -c | tr -d ' ')" = 1048576
+check "1200 entries are cut at 1000" test "$("$SNIP" remote ls h $WD/edge manydir 2>/dev/null | wc -l | tr -d ' ')" = 1000
+check "a nested repo is a folder" bash -c "'$SNIP' remote stat h $WD/edge nested | grep -q '^directory'"
 if w <<<"[ -L '$WD/edge/inner-link' ]"; then
-	check "a symlink inside the share is followed" bash -c "'$SNIP' remote ls 1 edge inner-link | grep -qx deep/"
-	check "a folder symlink inside the share lists as a folder" bash -c "'$SNIP' remote ls 1 edge | grep -qx inner-link/"
+	check "a symlink inside the workspace is followed" bash -c "'$SNIP' remote ls h $WD/edge inner-link | grep -qx deep/"
+	check "a folder symlink inside the workspace lists as a folder" bash -c "'$SNIP' remote ls h $WD/edge | grep -qx inner-link/"
 else
-	skip "a symlink inside the share is followed" "no symlinks on the worker"
+	skip "a symlink inside the workspace is followed" "no symlinks on the worker"
 fi
 
 echo "== byte for byte"
@@ -268,74 +219,67 @@ EOF
 		[ -n "$f" ] || continue
 		total=$((total + 1))
 		f=${f#./}
-		if [ "$("$SNIP" remote cat 1 "$ws" "$f" | hash_of)" != "$sum" ]; then
+		if [ "$("$SNIP" remote cat h "$ws" "$f" | hash_of)" != "$sum" ]; then
 			badfiles=$((badfiles + 1))
 			echo "      differs: $f"
 		fi
 	done <<<"$sums"
 	check "$total files in $ws identical to the worker's bytes" test "$badfiles" = 0 -a "$total" -gt 0
 }
-compare text "$WD/text" .
-check "CRLF kept" test "$("$SNIP" remote cat 1 edge crlf.txt | hash_of)" = "$(printf 'line1\r\nline2\r\n' | hash_of)"
+compare "$WD/text" "$WD/text" .
+check "CRLF kept" test "$("$SNIP" remote cat h $WD/edge crlf.txt | hash_of)" = "$(printf 'line1\r\nline2\r\n' | hash_of)"
 if [ -n "$SRC" ]; then
-	compare "$srcname" "$SRC" "crates docs scripts fixtures -size -1024k \\( -name '*.rs' -o -name '*.md' -o -name '*.toml' -o -name '*.py' -o -name '*.sh' -o -name '*.json' \\)"
+	compare "$SRC" "$SRC" "crates docs scripts fixtures -size -1024k \\( -name '*.rs' -o -name '*.md' -o -name '*.toml' -o -name '*.py' -o -name '*.sh' -o -name '*.json' \\)"
 fi
 
 echo "== refused"
-refused "binary" "binary or not UTF-8" cat 1 edge blob.bin
-refused "not UTF-8" "binary or not UTF-8" cat 1 edge latin.txt
-refused "over 1 MiB" "exceeds 1 MiB" cat 1 edge over-1MiB.txt
-refused "../" "inside the workspace" cat 1 edge ../secret.txt
-refused "src/../../" "inside the workspace" cat 1 edge src/../../secret.txt
-refused "an absolute path" "inside the workspace" cat 1 edge "$WD/secret.txt"
-refused "ls .." "inside the workspace" ls 1 edge ..
-refused "a folder read as a file" "" cat 1 edge src
-refused "an unknown workspace" "no workspace named" ls 1 nope
-refused "an unknown worker" "no paired worker" ls nobody edge
+refused "binary" "binary or not UTF-8" cat h $WD/edge blob.bin
+refused "not UTF-8" "binary or not UTF-8" cat h $WD/edge latin.txt
+refused "over 1 MiB" "exceeds 1 MiB" cat h $WD/edge over-1MiB.txt
+refused "../" "inside the workspace" cat h $WD/edge ../secret.txt
+refused "src/../../" "inside the workspace" cat h $WD/edge src/../../secret.txt
+refused "an absolute path" "inside the workspace" cat h $WD/edge "$WD/secret.txt"
+refused "ls .." "inside the workspace" ls h $WD/edge ..
+refused "a folder read as a file" "" cat h $WD/edge src
 if w <<<"[ -L '$WD/edge/escape.txt' ]"; then
-	refused "a symlink out of the share" "leaves the workspace" cat 1 edge escape.txt
-	check "a folder symlink out of the share lists as a plain entry" bash -c "'$SNIP' remote ls 1 edge | grep -qx escape-dir"
-	refused "a folder symlink out of the share" "leaves the workspace" ls 1 edge escape-dir
+	refused "a symlink out of the workspace" "leaves the workspace" cat h $WD/edge escape.txt
+	check "a folder symlink out of the workspace lists as a plain entry" bash -c "'$SNIP' remote ls h $WD/edge | grep -qx escape-dir"
+	refused "a folder symlink out of the workspace" "leaves the workspace" ls h $WD/edge escape-dir
 else
-	skip "a symlink out of the share" "no symlinks on the worker"
+	skip "a symlink out of the workspace" "no symlinks on the worker"
 fi
 
 echo "== parallel"
-want=$("$SNIP" remote cat 1 text plain_60.txt | hash_of)
-for n in 20 50 100; do
+want=$("$SNIP" remote cat h $WD/text plain_60.txt | hash_of)
+# Each command is a worker process; over ssh each is a login too, and sshd
+# drops logins beyond MaxStartups (10 by default).
+counts="20 50 100"
+[ -n "$HOST" ] && counts="4 8"
+for n in $counts; do
 	rm -f "$MASTER"/par.*
 	for i in $(seq 1 "$n"); do
-		("$SNIP" remote cat 1 text plain_60.txt 2>/dev/null | hash_of >"$MASTER/par.$i") &
+		("$SNIP" remote cat h $WD/text plain_60.txt 2>/dev/null | hash_of >"$MASTER/par.$i") &
 	done
 	wait
 	good=$(cat "$MASTER"/par.* | grep -c "$want")
 	check "$n parallel reads all correct ($good/$n)" test "$good" = "$n"
 done
 
-echo "== other devices"
-other="$MASTER/other"
-mkdir -p "$other"
-cp "$SNIP_CONFIG_DIR/remote-workers.json" "$other/"
-err=$(SNIP_CONFIG_DIR=$other "$SNIP" remote workspaces 1 2>&1)
-check "a copied pairing record lets no other device in" grep -q "no longer trusts" <<<"$err"
-err=$(SNIP_CONFIG_DIR=$other "$SNIP" remote pair "$ADDR" "$code" 2>&1)
-check "a used code pairs nobody else" grep -q "pairing failed" <<<"$err"
-
 echo "== git views"
 w <<<"sleep 1 && touch '$WD/gitws/alpha/b.txt'"
 alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
 
-repos_gitws=$("$SNIP" remote repos 1 gitws)
-check "repos 1 gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
-check "wt, broken, borrowed appear as error rows" test "$(grep -c '^wt	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^borrowed	error: ' <<<"$repos_gitws")" = 1
-check "no error row contains the outside path" test "$(grep -c "outside-repo" <<<"$repos_gitws")" = 0
+repos_gitws=$("$SNIP" remote repos h $WD/gitws)
+check "repos gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
+check "broken appears as an error row" test "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1
+check "wt and borrowed are served as locally" test "$(grep '^wt	' <<<"$repos_gitws" | grep -vc error)" = 1 -a "$(grep '^borrowed	' <<<"$repos_gitws" | grep -vc error)" = 1
 
-changes_mainwt=$("$SNIP" remote changes 1 gitws mainwt)
-log_mainwt=$("$SNIP" remote log 1 gitws mainwt)
+changes_mainwt=$("$SNIP" remote changes h $WD/gitws mainwt)
+log_mainwt=$("$SNIP" remote log h $WD/gitws mainwt)
 all_mainwt="$repos_gitws
 $changes_mainwt
 $log_mainwt"
-check "main repo with a worktree outside the share is served" test "$(grep -c '^mainwt	' <<<"$repos_gitws")" = 1 \
+check "main repo with a worktree outside the workspace is served" test "$(grep -c '^mainwt	' <<<"$repos_gitws")" = 1 \
 	-a "$(grep '^mainwt	' <<<"$repos_gitws" | grep -c 'error:')" = 0 \
 	-a "$(grep -c '	tracked.txt$' <<<"$changes_mainwt")" -ge 1 \
 	-a "$(grep -c 'untracked.txt' <<<"$changes_mainwt")" -ge 1 \
@@ -347,40 +291,40 @@ alpha_counts=$(cut -f3,4,5 <<<"$alpha_line")
 oracle_counts=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' status --porcelain=v2" | awk '/^1/ || /^2/ { if (substr($2, 1, 1) != ".") staged++; if (substr($2, 2, 1) != ".") unstaged++; } /^\?/ { untracked++ } END { printf "%d\t%d\t%d\n", staged+0, unstaged+0, untracked+0 }')
 check "alpha status counts match oracle ($alpha_counts)" test "$alpha_counts" = "$oracle_counts" -a -n "$alpha_counts"
 
-changes_alpha=$("$SNIP" remote changes 1 gitws alpha)
+changes_alpha=$("$SNIP" remote changes h $WD/gitws alpha)
 changes_paths=$(cut -f3 <<<"$changes_alpha" | LC_ALL=C sort)
 oracle_changes_paths=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' status --porcelain=v2 --untracked-files=all" | awk '/^1/ || /^2/ { print $9 } /^\?/ { print $2 }' | LC_ALL=C sort)
 check "changes alpha path set == oracle path set" test "$changes_paths" = "$oracle_changes_paths" -a -n "$changes_paths"
 
-changes_beta=$("$SNIP" remote changes 1 gitws beta 2>&1)
+changes_beta=$("$SNIP" remote changes h $WD/gitws beta 2>&1)
 rc=$?
 check "changes beta prints nothing and exits 0" test "$rc" = 0 -a -z "$changes_beta"
 
-repos_inner_out=$("$SNIP" remote repos 1 inner)
-repos_inner_all=$("$SNIP" remote repos 1 inner 2>&1)
+repos_inner_out=$("$SNIP" remote repos h $WD/outer/inner)
+repos_inner_all=$("$SNIP" remote repos h $WD/outer/inner 2>&1)
 rc=$?
 check "repos inner prints no repo rows and does not contain outer-dirty" test "$rc" = 0 -a -z "$repos_inner_out" -a "$(grep -c outer-dirty <<<"$repos_inner_all")" = 0 -a "$(grep -c 'no Git repository in' <<<"$repos_inner_all")" -ge 1
-refused "changes inner exits 1" "" changes 1 inner
+refused "changes inner exits 1" "" changes h $WD/outer/inner
 
-log_alpha=$("$SNIP" remote log 1 gitws alpha -n 50)
+log_alpha=$("$SNIP" remote log h $WD/gitws alpha -n 50)
 log_shas=$(cut -f1 <<<"$log_alpha" | LC_ALL=C sort)
 oracle_rev_shas=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' rev-list --all" | LC_ALL=C sort)
 check "log alpha sha set == git rev-list --all" test "$log_shas" = "$oracle_rev_shas" -a -n "$log_shas"
 
 alpha_head=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' rev-parse HEAD")
-show_alpha=$("$SNIP" remote show 1 gitws alpha "$alpha_head")
+show_alpha=$("$SNIP" remote show h $WD/gitws alpha "$alpha_head")
 show_paths=$(cut -f2 <<<"$show_alpha" | LC_ALL=C sort)
 oracle_diff_paths=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' diff-tree --no-commit-id --name-only -r HEAD" | LC_ALL=C sort)
 check "show alpha HEAD path set == diff-tree path set" test "$show_paths" = "$oracle_diff_paths" -a -n "$show_paths"
 
-diff_a=$("$SNIP" remote diff 1 gitws alpha a.txt)
+diff_a=$("$SNIP" remote diff h $WD/gitws alpha a.txt)
 check "diff alpha a.txt contains changed line" grep -q "commit 2 a modified" <<<"$diff_a"
-diff_staged=$("$SNIP" remote diff 1 gitws alpha staged.txt --staged)
+diff_staged=$("$SNIP" remote diff h $WD/gitws alpha staged.txt --staged)
 check "diff alpha staged.txt --staged contains staged content" grep -q "staged file content" <<<"$diff_staged"
 
-refused "diff ../../secret.txt" "" diff 1 gitws alpha ../../secret.txt
+refused "diff ../../secret.txt" "" diff h $WD/gitws alpha ../../secret.txt
 if w <<<"[ -L '$WD/gitws/alpha/link-to-secret' ]"; then
-	link_out=$("$SNIP" remote diff 1 gitws alpha link-to-secret 2>&1)
+	link_out=$("$SNIP" remote diff h $WD/gitws alpha link-to-secret 2>&1)
 	rc=$?
 	if [ "$rc" = 1 ] && ! grep -q "TOPSECRET" <<<"$link_out"; then
 		ok "diff link-to-secret  ($link_out)"
@@ -390,32 +334,27 @@ if w <<<"[ -L '$WD/gitws/alpha/link-to-secret' ]"; then
 else
 	skip "diff link-to-secret" "no symlinks on the worker"
 fi
-show_pwned_out=$("$SNIP" remote show 1 gitws alpha -- "--output=$WD/pwned" 2>&1)
+show_pwned_out=$("$SNIP" remote show h $WD/gitws alpha -- "--output=$WD/pwned" 2>&1)
 rc=$?
 if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/pwned'"; then
 	ok "show --output refused without creating file  ($show_pwned_out)"
 else
 	bad "show --output  rc=$rc out=$show_pwned_out"
 fi
-refused "show invalid revision ':/x'" "" show 1 gitws alpha ':/x'
+refused "show invalid revision ':/x'" "" show h $WD/gitws alpha ':/x'
 
-wt_err=$("$SNIP" remote changes 1 gitws wt 2>&1 >/dev/null)
-rc=$?
-if [ "$rc" = 1 ] && grep -iq "outside" <<<"$wt_err"; then
-	ok "changes on linked worktree refused  ($wt_err)"
-else
-	bad "changes on linked worktree  rc=$rc err=$wt_err"
-fi
+wt_changes=$("$SNIP" remote changes h $WD/gitws wt 2>&1)
+check "changes on a linked worktree of an outside repo" test "$?" = 0
 
 # A diff that covers the stat-dirty b.txt is what makes git refresh an index it may write.
-"$SNIP" remote diff 1 gitws alpha b.txt >/dev/null 2>&1 || true
+"$SNIP" remote diff h $WD/gitws alpha b.txt >/dev/null 2>&1 || true
 alpha_index_after=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
 check "alpha .git/index sha256 unchanged" test "$alpha_index_after" = "$alpha_index_before" -a -n "$alpha_index_after"
 check "alpha .git/index.lock does not exist" w <<<"test ! -e '$WD/gitws/alpha/.git/index.lock'"
 
 if [ -n "$SRC" ]; then
 	if w <<<"test -d '$SRC/.git'"; then
-		src_log=$("$SNIP" remote log 1 "$srcname" -n 3)
+		src_log=$("$SNIP" remote log h "$SRC" -n 3)
 		src_log_shas=$(cut -f1 <<<"$src_log")
 		oracle_revs=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$SRC' rev-list --all")
 		all_found=true
@@ -428,23 +367,13 @@ if [ -n "$SRC" ]; then
 		done <<<"$src_log_shas"
 		check "log $srcname -n 3 shas contained in rev-list --all" test "$all_found" = true -a -n "$src_log_shas"
 	elif w <<<"test -f '$SRC/.git'"; then
-		src_repos=$("$SNIP" remote repos 1 "$srcname" 2>&1)
-		check "repos $srcname reports an error row for linked worktree" grep -q "error: " <<<"$src_repos"
+		src_log=$("$SNIP" remote log h "$SRC" -n 3 2>&1)
+		check "log $srcname (a linked worktree) is served" test "$?" = 0 -a -n "$src_log"
 	else
-		src_repos=$("$SNIP" remote repos 1 "$srcname" 2>&1)
+		src_repos=$("$SNIP" remote repos h "$SRC" 2>&1)
 		check "repos $srcname reports no Git repository for archive" grep -q "no Git repository in" <<<"$src_repos"
 	fi
 fi
-
-echo "== restart"
-log=$(start_worker wcfg) || bad "the worker restarts"
-check "same fingerprint after a restart" grep -q "fingerprint $wfp" <<<"$log"
-check "still paired after a restart" bash -c "'$SNIP' remote cat 1 edge crlf.txt | grep -q line1"
-
-echo "== another certificate at the same address"
-start_worker wcfg-other >/dev/null || bad "the other worker starts"
-err=$("$SNIP" remote ls 1 edge 2>&1)
-check "the pinned master refuses it" grep -q "is not the paired" <<<"$err"
 
 echo "== $pass passed, $fail failed"
 [ "$fail" = 0 ]

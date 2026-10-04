@@ -116,20 +116,10 @@ mod tests {
 
 	#[test]
 	fn refs_error_mapping() {
-		let id = snip_remote::Identity::generate().unwrap();
-		let worker = snip_remote::PairedWorker {
-			name: "w".into(),
-			addr: "127.0.0.1:0".into(),
-			fingerprint: id.fingerprint().to_hex(),
-		};
-		let client = std::sync::Arc::new(
-			snip_remote::Client::new(
-				worker,
-				std::sync::Arc::new(id),
-				"master".into(),
-			)
-			.unwrap(),
-		);
+		let client = std::sync::Arc::new(snip_remote::Client::new(
+			snip_remote::RemoteHost::ssh("w"),
+			"master".into(),
+		));
 		let remote_host = GitHost::Remote {
 			client,
 			workspace: "ws1".into(),
@@ -265,20 +255,10 @@ mod tests {
 		) {
 			return;
 		}
-		let id = snip_remote::Identity::generate().unwrap();
-		let worker = snip_remote::PairedWorker {
-			name: "w".into(),
-			addr: "127.0.0.1:0".into(),
-			fingerprint: id.fingerprint().to_hex(),
-		};
-		let client = std::sync::Arc::new(
-			snip_remote::Client::new(
-				worker,
-				std::sync::Arc::new(id),
-				"master".into(),
-			)
-			.unwrap(),
-		);
+		let client = std::sync::Arc::new(snip_remote::Client::new(
+			snip_remote::RemoteHost::ssh("w"),
+			"master".into(),
+		));
 		let session_root = std::path::PathBuf::from("snip-remote://fp/ws1");
 		let host = GitHost::Remote {
 			client,

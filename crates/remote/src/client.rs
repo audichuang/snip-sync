@@ -1,14 +1,15 @@
-//! The master: pairs with a worker once, then calls it over pinned TLS.
-//! Every call blocks; the desktop app makes them on its background
-//! executor, as it does local reads.
+//! The master: starts a worker on another machine over ssh
+//! (`ssh <host> snip serve --stdio`) and calls it on that process's stdin
+//! and stdout. Every call blocks; the desktop app makes them on its
+//! background executor, as it does local reads.
 
-use std::io::{self, Read as IoRead, Write as IoWrite};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::ffi::OsString;
+use std::io::{self, BufRead, BufReader, Read as IoRead, Write as IoWrite};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use rustls::{ClientConnection, StreamOwned};
-use serde::{Deserialize, Serialize};
 use snip_core::browser::{
 	BlobText, CommitSummary, GitPreview, LogQuery, RefSnapshot, TreeEntry,
 };
@@ -24,155 +25,214 @@ use crate::proto::{
 	RemoteWorkspace, RepoScan, Request, Response, Stat, GIT_CALL_LIMIT,
 	MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
-use crate::tls::{client_config, pairing_proof, server_name, Fingerprint};
-use crate::{to_hex, Identity, RemoteError};
+use crate::worker::{Worker, PREAMBLE};
+use crate::RemoteError;
 
-/// The port a worker listens on unless told otherwise.
-pub const DEFAULT_PORT: u16 = 47821;
-// Kept under the desktop app's 8 s drain deadline (lifecycle.rs): a call
-// cannot be cancelled mid-read, so a stalled worker must fail it in time.
-// The read timeout is idle time per read, so a slow but moving transfer
-// still completes.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a new connection may take to reach the worker's hello: ssh
+/// resolves, authenticates and starts a shell first.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+// Kept under the desktop app's 8 s drain deadline (lifecycle.rs): a stalled
+// worker must fail a call in time. It is idle time per frame; a long job
+// sends a heartbeat every second.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-/// Idle connections a client keeps for reuse.
-const POOL: usize = 4;
-/// Default limit for non-git calls.
+/// Bytes a login shell may print before the preamble.
+const MAX_BANNER: usize = 64 * 1024;
+/// Bytes of the transport's stderr kept for an error message.
+const MAX_STDERR: usize = 8 * 1024;
+/// Idle connections kept per worker: each is an ssh process.
+const POOL: usize = 2;
 pub const CALL_LIMIT_DEFAULT: Duration = Duration::from_secs(30);
 
-/// A worker this master has paired with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairedWorker {
+/// How a master reaches a worker.
+#[derive(Clone)]
+pub enum Transport {
+	/// A command whose stdin and stdout speak the protocol, after
+	/// [`PREAMBLE`]: `ssh … snip serve --stdio` ([`crate::ssh::command`]).
+	Command(Vec<OsString>),
+	/// A worker in this process, for tests.
+	#[doc(hidden)]
+	InProcess(Arc<Worker>),
+}
+
+/// A worker as the master knows it: what to show and how to start it.
+#[derive(Clone)]
+pub struct RemoteHost {
+	/// The ssh host name, as the user picked it.
 	pub name: String,
-	/// As the user typed it: a Tailscale IP or MagicDNS name, maybe a port.
-	pub addr: String,
-	/// Hex SHA-256 of the worker's certificate.
-	pub fingerprint: String,
+	pub transport: Transport,
 }
 
-impl PairedWorker {
-	pub fn pin(&self) -> Result<Fingerprint, RemoteError> {
-		Fingerprint::from_hex(&self.fingerprint).ok_or_else(|| {
-			RemoteError::Protocol("stored worker fingerprint is damaged".into())
-		})
+impl std::fmt::Debug for RemoteHost {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("RemoteHost").field(&self.name).finish()
 	}
 }
 
-/// `host`, `host:port`, `ip`, `[v6]:port`; a missing port is
-/// [`DEFAULT_PORT`].
-pub fn resolve_addr(addr: &str) -> io::Result<Vec<SocketAddr>> {
-	let addr = addr.trim();
-	if let Ok(ip) = addr.parse::<IpAddr>() {
-		return Ok(vec![SocketAddr::new(ip, DEFAULT_PORT)]);
+/// The same host started the same way.
+impl PartialEq for RemoteHost {
+	fn eq(&self, other: &Self) -> bool {
+		self.name == other.name
+			&& match (&self.transport, &other.transport) {
+				(Transport::Command(a), Transport::Command(b)) => a == b,
+				(Transport::InProcess(a), Transport::InProcess(b)) => {
+					Arc::ptr_eq(a, b)
+				}
+				_ => false,
+			}
 	}
-	let with_port = match addr.rsplit_once(':') {
-		Some((_, port)) if port.parse::<u16>().is_ok() => addr.to_string(),
-		_ => format!("{addr}:{DEFAULT_PORT}"),
-	};
-	let found: Vec<SocketAddr> = with_port.to_socket_addrs()?.collect();
-	if found.is_empty() {
-		return Err(io::Error::new(
-			io::ErrorKind::NotFound,
-			format!("{addr} does not resolve"),
-		));
-	}
-	Ok(found)
 }
 
+impl Eq for RemoteHost {}
+
+impl RemoteHost {
+	/// A worker in this process, for tests.
+	#[doc(hidden)]
+	pub fn in_process(worker: Arc<Worker>) -> Self {
+		Self {
+			name: "test-worker".into(),
+			transport: Transport::InProcess(worker),
+		}
+	}
+
+	/// `host` reached through ssh, as [`crate::ssh::command`] spells it.
+	pub fn ssh(host: &str) -> Self {
+		Self {
+			name: host.to_string(),
+			transport: Transport::Command(crate::ssh::command(host)),
+		}
+	}
+}
+
+/// One frame in either direction, with a read deadline.
+pub(crate) trait FrameIo {
+	fn send(&mut self, request: &Request) -> io::Result<()>;
+	fn recv(
+		&mut self,
+		timeout: Duration,
+	) -> Result<Option<Response>, RemoteError>;
+}
+
+/// A plain stream has no deadline; tests feed one frames from memory.
+impl<S: IoRead + IoWrite> FrameIo for S {
+	fn send(&mut self, request: &Request) -> io::Result<()> {
+		write_frame(self, request)
+	}
+
+	fn recv(&mut self, _: Duration) -> Result<Option<Response>, RemoteError> {
+		Ok(read_frame::<Response>(self)?)
+	}
+}
+
+type Frames = Receiver<io::Result<Option<Response>>>;
+
+/// One worker process (or in-process worker) and its hello.
 pub struct Connection {
-	tls: StreamOwned<ClientConnection, TcpStream>,
+	writer: Box<dyn IoWrite + Send>,
+	frames: Frames,
+	child: Option<Child>,
+	stderr: Arc<Mutex<Vec<u8>>>,
 	worker_name: String,
-	paired: bool,
-	seen: Fingerprint,
+	home: Option<String>,
 	version: u32,
+	/// A read timed out or failed: the stream may be mid-frame.
+	broken: bool,
 	pub(crate) frames_seen: usize,
 }
 
 impl Connection {
-	/// Connects and says hello. With `pin`, a worker presenting another
-	/// certificate fails here.
+	/// Starts the worker and says hello.
 	pub fn open(
-		addr: &str,
-		identity: &Identity,
-		pin: Option<Fingerprint>,
+		transport: &Transport,
 		my_name: &str,
 	) -> Result<Self, RemoteError> {
-		let mut last = None;
-		let mut tcp = None;
-		for sock in resolve_addr(addr)? {
-			match TcpStream::connect_timeout(&sock, CONNECT_TIMEOUT) {
-				Ok(stream) => {
-					tcp = Some(stream);
-					break;
-				}
-				Err(err) => last = Some(err),
-			}
-		}
-		let tcp = match tcp {
-			Some(tcp) => tcp,
-			None => {
-				return Err(last
-					.unwrap_or_else(|| io::Error::other("no address"))
-					.into())
+		let (writer, frames, child, stderr) = match transport {
+			Transport::Command(argv) => spawn(argv)?,
+			Transport::InProcess(worker) => {
+				let (req_w, res_r) = worker.connect_in_process()?;
+				let writer: Box<dyn IoWrite + Send> = Box::new(req_w);
+				(writer, read_frames(res_r), None, Arc::default())
 			}
 		};
-		tcp.set_nodelay(true)?;
-		tcp.set_read_timeout(Some(IO_TIMEOUT))?;
-		tcp.set_write_timeout(Some(IO_TIMEOUT))?;
-		let (config, seen) = client_config(identity, pin)?;
-		let conn = ClientConnection::new(config, server_name())?;
-		let mut tls = StreamOwned::new(conn, tcp);
-		write_frame(
-			&mut tls,
-			&Request::Hello {
-				version: PROTOCOL_VERSION,
-				name: my_name.to_string(),
-				max_version: Some(PROTOCOL_MAX),
-			},
-		)
-		.map_err(tls_error)?;
-		let reply = read_frame::<Response>(&mut tls).map_err(tls_error)?;
-		let seen = seen.get().ok_or_else(|| {
-			RemoteError::Protocol("the worker sent no certificate".into())
-		})?;
+		let mut conn = Self {
+			writer,
+			frames,
+			child,
+			stderr,
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+		};
+		let hello = Request::Hello {
+			version: PROTOCOL_VERSION,
+			name: my_name.to_string(),
+			max_version: Some(PROTOCOL_MAX),
+		};
+		let reply = conn
+			.send(&hello)
+			.map_err(RemoteError::from)
+			.and_then(|()| conn.recv(CONNECT_TIMEOUT));
 		match reply {
-			Some(Response::Hello {
+			Ok(Some(Response::Hello {
 				name,
-				paired,
+				home,
 				max_version,
 				..
-			}) => {
-				let version = max_version.unwrap_or(1).clamp(1, PROTOCOL_MAX);
-				Ok(Self {
-					tls,
-					worker_name: name,
-					paired,
-					seen,
-					version,
-					frames_seen: 0,
-				})
+			})) => {
+				conn.worker_name = name;
+				conn.home = home;
+				conn.version = max_version.unwrap_or(1).clamp(1, PROTOCOL_MAX);
+				Ok(conn)
 			}
-			Some(Response::Error { code, message }) => {
+			Ok(Some(Response::Error { code, message })) => {
 				Err(RemoteError::Refused { code, message })
 			}
-			_ => Err(RemoteError::Protocol("expected hello".into())),
+			Ok(Some(_)) => Err(RemoteError::Protocol("expected hello".into())),
+			Ok(None) | Err(RemoteError::Io(_)) | Err(RemoteError::TimedOut) => {
+				Err(conn.start_error())
+			}
+			Err(err) => Err(err),
 		}
+	}
+
+	/// Why the worker never said hello, from the transport's exit status
+	/// and stderr: ssh's own message, or that the far end has no snip.
+	fn start_error(&mut self) -> RemoteError {
+		let status = self.child.as_mut().and_then(|c| {
+			let deadline = Instant::now() + Duration::from_secs(2);
+			loop {
+				match c.try_wait() {
+					Ok(Some(status)) => return Some(status),
+					Ok(None) if Instant::now() < deadline => {
+						std::thread::sleep(Duration::from_millis(20))
+					}
+					_ => return None,
+				}
+			}
+		});
+		let stderr = String::from_utf8_lossy(
+			&self.stderr.lock().unwrap_or_else(PoisonError::into_inner),
+		)
+		.trim()
+		.to_string();
+		RemoteError::Connect(start_message(
+			status.and_then(|s| s.code()),
+			&stderr,
+		))
 	}
 
 	pub fn worker_name(&self) -> &str {
 		&self.worker_name
 	}
 
-	pub fn paired(&self) -> bool {
-		self.paired
+	/// The worker's home folder, where browsing starts.
+	pub fn home(&self) -> Option<&str> {
+		self.home.as_deref()
 	}
 
 	pub fn version(&self) -> u32 {
 		self.version
-	}
-
-	pub fn seen_fingerprint(&self) -> Fingerprint {
-		self.seen
 	}
 
 	pub fn frames_seen(&self) -> usize {
@@ -185,24 +245,181 @@ impl Connection {
 		cancel: Option<&CancelToken>,
 		limit: Duration,
 	) -> Result<Response, RemoteError> {
-		exchange(&mut self.tls, request, cancel, limit, &mut self.frames_seen)
+		let mut frames = 0;
+		let res = exchange(self, request, cancel, limit, &mut frames);
+		self.frames_seen = frames;
+		if res.is_err() && !matches!(res, Err(RemoteError::Refused { .. })) {
+			self.broken = true;
+		}
+		res
 	}
 }
 
-/// Generic frame exchange loop over any `Read + Write` stream.
-pub(crate) fn exchange<S: IoRead + IoWrite>(
-	stream: &mut S,
+impl FrameIo for Connection {
+	fn send(&mut self, request: &Request) -> io::Result<()> {
+		write_frame(&mut self.writer, request)
+	}
+
+	fn recv(
+		&mut self,
+		timeout: Duration,
+	) -> Result<Option<Response>, RemoteError> {
+		match self.frames.recv_timeout(timeout) {
+			Ok(frame) => Ok(frame?),
+			Err(RecvTimeoutError::Timeout) => Err(RemoteError::TimedOut),
+			Err(RecvTimeoutError::Disconnected) => Ok(None),
+		}
+	}
+}
+
+impl Drop for Connection {
+	fn drop(&mut self) {
+		if let Some(mut child) = self.child.take() {
+			let _ = child.kill();
+			let _ = child.wait();
+		}
+	}
+}
+
+/// The user-facing reason a worker did not start.
+pub(crate) fn start_message(code: Option<i32>, stderr: &str) -> String {
+	if code == Some(127) || stderr.contains("unrecognized subcommand") {
+		return "snip is not installed on that machine, or is too old for \
+		        ssh connections; install snip-sync there"
+			.into();
+	}
+	if stderr.contains("Permission denied") {
+		return format!(
+			"ssh could not log in without a password; set up key login \
+			 (ssh-copy-id) first: {stderr}"
+		);
+	}
+	if stderr.is_empty() {
+		return "the remote end closed the connection before snip started"
+			.into();
+	}
+	stderr.to_string()
+}
+
+/// A started worker: where to write requests, the frames it answers, the
+/// process to stop, and what it said on stderr.
+type Started = (
+	Box<dyn IoWrite + Send>,
+	Frames,
+	Option<Child>,
+	Arc<Mutex<Vec<u8>>>,
+);
+
+fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
+	let (program, args) = argv.split_first().ok_or_else(|| {
+		RemoteError::Connect("no command to start the worker".into())
+	})?;
+	let mut child = Command::new(program)
+		.args(args)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.map_err(|err| {
+			RemoteError::Connect(format!(
+				"cannot run {}: {err}",
+				program.to_string_lossy()
+			))
+		})?;
+	let stdin: ChildStdin = child.stdin.take().expect("piped stdin");
+	let stdout = child.stdout.take().expect("piped stdout");
+	let stderr_pipe = child.stderr.take().expect("piped stderr");
+	let stderr = Arc::new(Mutex::new(Vec::new()));
+	let keep = stderr.clone();
+	std::thread::Builder::new()
+		.name("snip-remote-stderr".into())
+		.spawn(move || {
+			let mut pipe = stderr_pipe;
+			let mut chunk = [0u8; 1024];
+			while let Ok(n) = pipe.read(&mut chunk) {
+				if n == 0 {
+					break;
+				}
+				let mut buf =
+					keep.lock().unwrap_or_else(PoisonError::into_inner);
+				let room = MAX_STDERR.saturating_sub(buf.len());
+				buf.extend_from_slice(&chunk[..n.min(room)]);
+			}
+		})?;
+	let mut stdout = BufReader::new(stdout);
+	let (tx, rx) = mpsc::channel();
+	std::thread::Builder::new()
+		.name("snip-remote-read".into())
+		.spawn(move || {
+			if let Err(err) = skip_banner(&mut stdout) {
+				let _ = tx.send(Err(err));
+				return;
+			}
+			pump_frames(stdout, tx);
+		})?;
+	let writer: Box<dyn IoWrite + Send> = Box::new(stdin);
+	Ok((writer, rx, Some(child), stderr))
+}
+
+/// Reads up to the [`PREAMBLE`] line, skipping what a login shell printed.
+/// A clean end first is not an error: the caller reports the exit.
+pub(crate) fn skip_banner(r: &mut impl BufRead) -> io::Result<()> {
+	let mut seen = 0usize;
+	let mut line = Vec::new();
+	loop {
+		line.clear();
+		let n = r.take(MAX_BANNER as u64).read_until(b'\n', &mut line)?;
+		if n == 0 {
+			return Err(io::Error::new(
+				io::ErrorKind::UnexpectedEof,
+				"the worker ended before starting",
+			));
+		}
+		if line.trim_ascii_end() == PREAMBLE.as_bytes() {
+			return Ok(());
+		}
+		seen += n;
+		if seen > MAX_BANNER {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"the remote shell printed too much before snip started",
+			));
+		}
+	}
+}
+
+fn read_frames(r: impl IoRead + Send + 'static) -> Frames {
+	let (tx, rx) = mpsc::channel();
+	std::thread::spawn(move || pump_frames(r, tx));
+	rx
+}
+
+fn pump_frames(
+	mut r: impl IoRead,
+	tx: mpsc::Sender<io::Result<Option<Response>>>,
+) {
+	loop {
+		let frame = read_frame::<Response>(&mut r);
+		let end = !matches!(frame, Ok(Some(_)));
+		if tx.send(frame).is_err() || end {
+			return;
+		}
+	}
+}
+
+/// Sends `request` and waits for its answer, skipping heartbeats.
+pub(crate) fn exchange(
+	io: &mut impl FrameIo,
 	request: &Request,
 	cancel: Option<&CancelToken>,
 	limit: Duration,
 	frames: &mut usize,
 ) -> Result<Response, RemoteError> {
 	*frames = 0;
-	write_frame(stream, request).map_err(tls_error)?;
+	io.send(request)?;
 	let started = Instant::now();
 	loop {
-		let reply = read_frame::<Response>(stream).map_err(tls_error)?;
-		match reply {
+		match io.recv(IO_TIMEOUT)? {
 			Some(Response::Pending) => {
 				*frames += 1;
 				if cancel.is_some_and(|c| c.is_cancelled()) {
@@ -312,85 +529,48 @@ impl<'a> Drop for GitLimiterGuard<'a> {
 	}
 }
 
-/// A pin mismatch surfaces from rustls inside an `io::Error`; keep its text.
-fn tls_error(err: io::Error) -> RemoteError {
-	RemoteError::Io(err)
-}
-
-/// Pairs with the worker at `addr` using the code it shows. The worker's
-/// certificate is trusted from here on; compare
-/// [`Fingerprint::short`] on both screens to rule out a relay.
-pub fn pair(
-	addr: &str,
-	code: &str,
-	identity: &Identity,
-	my_name: &str,
-) -> Result<PairedWorker, RemoteError> {
-	let mut conn = Connection::open(addr, identity, None, my_name)?;
-	let worker_fp = conn.seen;
-	let proof = pairing_proof(code, &worker_fp, &identity.fingerprint());
-	match conn.call(
-		&Request::Pair {
-			name: my_name.to_string(),
-			proof: to_hex(&proof),
-		},
-		None,
-		CALL_LIMIT_DEFAULT,
-	)? {
-		Response::Paired { name } => Ok(PairedWorker {
-			name,
-			addr: addr.trim().to_string(),
-			fingerprint: worker_fp.to_hex(),
-		}),
-		_ => Err(RemoteError::Protocol("expected paired".into())),
-	}
-}
-
-/// Calls to one paired worker, reusing a few idle connections.
+/// Calls to one worker, reusing a few idle connections.
 pub struct Client {
-	worker: PairedWorker,
-	pin: Fingerprint,
-	identity: Arc<Identity>,
+	host: RemoteHost,
 	my_name: String,
 	idle: Mutex<Vec<Connection>>,
 	limiter: GitLimiter,
 }
 
 impl Client {
-	pub fn new(
-		worker: PairedWorker,
-		identity: Arc<Identity>,
-		my_name: String,
-	) -> Result<Self, RemoteError> {
-		Ok(Self {
-			pin: worker.pin()?,
-			worker,
-			identity,
+	pub fn new(host: RemoteHost, my_name: String) -> Self {
+		Self {
+			host,
 			my_name,
 			idle: Mutex::new(Vec::new()),
 			limiter: GitLimiter::new(),
-		})
+		}
 	}
 
-	pub fn worker(&self) -> &PairedWorker {
-		&self.worker
+	pub fn host(&self) -> &RemoteHost {
+		&self.host
 	}
 
 	fn connect(&self) -> Result<Connection, RemoteError> {
-		let conn = Connection::open(
-			&self.worker.addr,
-			&self.identity,
-			Some(self.pin),
-			&self.my_name,
-		)?;
-		if !conn.paired {
-			return Err(RemoteError::Refused {
-				code: ErrorCode::NotPaired,
-				message: "the worker no longer trusts this master; pair again"
-					.into(),
-			});
+		Connection::open(&self.host.transport, &self.my_name)
+	}
+
+	fn keep(&self, conn: Connection) {
+		if conn.broken {
+			return;
 		}
-		Ok(conn)
+		let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+		if idle.len() < POOL {
+			idle.push(conn);
+		}
+	}
+
+	/// Starts the worker and returns its home folder.
+	pub fn home(&self) -> Result<Option<String>, RemoteError> {
+		let conn = self.connect()?;
+		let home = conn.home().map(str::to_string);
+		self.keep(conn);
+		Ok(home)
 	}
 
 	pub fn call(&self, request: &Request) -> Result<Response, RemoteError> {
@@ -415,56 +595,27 @@ impl Client {
 		};
 
 		let need = request.needs_version();
+		let too_old = |conn: Connection| {
+			let err = RemoteError::WorkerTooOld {
+				worker: conn.worker_name().to_string(),
+				have: conn.version(),
+				need,
+			};
+			self.keep(conn);
+			err
+		};
 		let pooled = self
 			.idle
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner)
 			.pop();
-
 		let (mut conn, reused) = match pooled {
-			Some(conn) if need > 1 && conn.version() < need => {
-				drop(conn);
-				self.idle
-					.lock()
-					.unwrap_or_else(PoisonError::into_inner)
-					.retain(|c| c.version() >= need);
-				let fresh = self.connect()?;
-				if fresh.version() < need {
-					let worker = fresh.worker_name().to_string();
-					let have = fresh.version();
-					let mut idle = self
-						.idle
-						.lock()
-						.unwrap_or_else(PoisonError::into_inner);
-					if idle.len() < POOL {
-						idle.push(fresh);
-					}
-					return Err(RemoteError::WorkerTooOld {
-						worker,
-						have,
-						need,
-					});
-				}
-				(fresh, false)
-			}
-			Some(conn) => (conn, true),
+			Some(conn) if conn.version() >= need => (conn, true),
+			Some(conn) => return Err(too_old(conn)),
 			None => {
 				let fresh = self.connect()?;
-				if need > 1 && fresh.version() < need {
-					let worker = fresh.worker_name().to_string();
-					let have = fresh.version();
-					let mut idle = self
-						.idle
-						.lock()
-						.unwrap_or_else(PoisonError::into_inner);
-					if idle.len() < POOL {
-						idle.push(fresh);
-					}
-					return Err(RemoteError::WorkerTooOld {
-						worker,
-						have,
-						need,
-					});
+				if fresh.version() < need {
+					return Err(too_old(fresh));
 				}
 				(fresh, false)
 			}
@@ -474,7 +625,6 @@ impl Client {
 		if remaining.is_zero() {
 			return Err(RemoteError::TimedOut);
 		}
-
 		let mut result = conn.call(request, cancel, remaining);
 
 		if let Err(ref err) = result {
@@ -484,37 +634,27 @@ impl Client {
 					return Err(RemoteError::TimedOut);
 				}
 				if let Ok(mut fresh) = self.connect() {
-					if need > 1 && fresh.version() < need {
-						let worker = fresh.worker_name().to_string();
-						let have = fresh.version();
-						let mut idle = self
-							.idle
-							.lock()
-							.unwrap_or_else(PoisonError::into_inner);
-						if idle.len() < POOL {
-							idle.push(fresh);
-						}
-						return Err(RemoteError::WorkerTooOld {
-							worker,
-							have,
-							need,
-						});
+					if fresh.version() < need {
+						return Err(too_old(fresh));
 					}
 					result = fresh.call(request, cancel, remaining_retry);
 					conn = fresh;
 				}
 			}
 		}
-
-		if matches!(&result, Ok(_) | Err(RemoteError::Refused { .. })) {
-			let mut idle =
-				self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-			if idle.len() < POOL {
-				idle.push(conn);
-			}
-		}
-
+		self.keep(conn);
 		result
+	}
+
+	/// Resolves `path` (absolute, or `~/…`) to a workspace on the worker.
+	pub fn open_workspace(
+		&self,
+		path: &str,
+	) -> Result<RemoteWorkspace, RemoteError> {
+		match self.call(&Request::OpenWorkspace { path: path.into() })? {
+			Response::Workspace(ws) => Ok(ws),
+			_ => Err(unexpected()),
+		}
 	}
 
 	pub fn scan_repos(
@@ -549,13 +689,6 @@ impl Client {
 		};
 		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
 			Response::Git(reply) => Ok(reply),
-			_ => Err(unexpected()),
-		}
-	}
-
-	pub fn list_workspaces(&self) -> Result<Vec<RemoteWorkspace>, RemoteError> {
-		match self.call(&Request::ListWorkspaces)? {
-			Response::Workspaces { items } => Ok(items),
 			_ => Err(unexpected()),
 		}
 	}
@@ -982,9 +1115,9 @@ mod tests {
 		let mut stream = FakeDuplex::new(&[
 			Response::Pending,
 			Response::Pending,
-			Response::Workspaces { items: vec![] },
+			Response::Text { content: None },
 		]);
-		let req = Request::ListWorkspaces;
+		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let res = exchange(
 			&mut stream,
@@ -995,7 +1128,7 @@ mod tests {
 		)
 		.unwrap();
 
-		assert_eq!(res, Response::Workspaces { items: vec![] });
+		assert_eq!(res, Response::Text { content: None });
 		assert_eq!(frames, 3);
 	}
 
@@ -1005,7 +1138,7 @@ mod tests {
 			FakeDuplex::new(&[Response::Pending, Response::Pending]);
 		let cancel = CancelToken::new();
 		cancel.cancel();
-		let req = Request::ListWorkspaces;
+		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
@@ -1023,7 +1156,7 @@ mod tests {
 	#[test]
 	fn exchange_zero_limit_with_pending_returns_timed_out() {
 		let mut stream = FakeDuplex::new(&[Response::Pending]);
-		let req = Request::ListWorkspaces;
+		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err =
 			exchange(&mut stream, &req, None, Duration::ZERO, &mut frames)
@@ -1039,7 +1172,7 @@ mod tests {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
 		}]);
-		let req = Request::ListWorkspaces;
+		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
@@ -1063,7 +1196,7 @@ mod tests {
 	#[test]
 	fn exchange_eof_returns_unexpected_eof() {
 		let mut stream = FakeDuplex::new(&[]);
-		let req = Request::ListWorkspaces;
+		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
