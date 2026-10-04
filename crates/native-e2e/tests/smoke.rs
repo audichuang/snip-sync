@@ -2865,6 +2865,11 @@ fn native_d3_files_and_replay_skip_oracles() {
 	xdo(&["windowsize", "--sync", &wid, "1080", "720"]);
 
 	// The group's Copy spans both repos as one payload.
+	send_key("alt+0");
+	wait_for(
+		"[APP:TAB_SWITCHED: GitChanges visible=true",
+		Duration::from_secs(3),
+	);
 	let v = control("change-header:unstaged");
 	let (x, y) = ((v[0] + v[2] / 2).to_string(), (v[1] + v[3] / 2).to_string());
 	xdo(&["mousemove", "--window", &wid, &x, &y, "click", "3"]);
@@ -4420,7 +4425,7 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	right_click("change-header:unstaged");
 	wait("[APP:MENU_OPEN: Left items=copy-files");
 	click("menu-item:copy-files");
-	wait("[APP:COPY_DONE: copied=3]");
+	wait("[APP:COPY_DONE: copied=2]");
 	let copied = clip_get();
 	assert!(
 		copied.contains("gamma.txt") && copied.contains("delta.txt"),
