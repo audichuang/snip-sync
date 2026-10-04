@@ -6,7 +6,8 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,11 @@ const MAX_BANNER: usize = 64 * 1024;
 const MAX_STDERR: usize = 8 * 1024;
 /// Idle connections kept per worker: each is an ssh process.
 const POOL: usize = 2;
+/// Frames buffered between the worker's stdout and the caller. Bounded so
+/// a worker cannot make the master allocate without end while its
+/// connection sits idle in the pool; at [`MAX_FRAME`] a piece, retained
+/// bytes are bounded by [`FRAME_QUEUE`] × 8 MiB.
+const FRAME_QUEUE: usize = 16;
 pub const CALL_LIMIT_DEFAULT: Duration = Duration::from_secs(30);
 /// A paste Apply: longer than the worker's own deadline for it, so the
 /// master always hears how the write ended.
@@ -145,6 +151,9 @@ pub struct Connection {
 	/// A read timed out or failed: the stream may be mid-frame.
 	broken: bool,
 	pub(crate) frames_seen: usize,
+	/// Frames queued and not yet consumed, shared with the read thread.
+	/// Above zero while idle, the worker is speaking without a request.
+	retained: Arc<AtomicUsize>,
 }
 
 impl Connection {
@@ -153,12 +162,13 @@ impl Connection {
 		transport: &Transport,
 		my_name: &str,
 	) -> Result<Self, RemoteError> {
-		let (writer, frames, child, stderr) = match transport {
+		let (writer, frames, child, stderr, retained) = match transport {
 			Transport::Command(argv) => spawn(argv)?,
 			Transport::InProcess(worker) => {
 				let (req_w, res_r) = worker.connect_in_process()?;
 				let writer: Box<dyn IoWrite + Send> = Box::new(req_w);
-				(writer, read_frames(res_r), None, Arc::default())
+				let (frames, retained) = read_frames(res_r);
+				(writer, frames, None, Arc::default(), retained)
 			}
 		};
 		let mut conn = Self {
@@ -171,6 +181,7 @@ impl Connection {
 			version: 1,
 			broken: false,
 			frames_seen: 0,
+			retained,
 		};
 		let hello = Request::Hello {
 			version: PROTOCOL_VERSION,
@@ -256,6 +267,12 @@ impl Connection {
 		self.frames_seen
 	}
 
+	/// Frames the worker sent that no call has consumed: above zero while
+	/// the connection sits idle, it spoke without a request.
+	fn unsolicited_frames(&self) -> usize {
+		self.retained.load(Ordering::Relaxed)
+	}
+
 	pub fn call(
 		&mut self,
 		request: &Request,
@@ -282,7 +299,11 @@ impl FrameIo for Connection {
 		timeout: Duration,
 	) -> Result<Option<Response>, RemoteError> {
 		match self.frames.recv_timeout(timeout) {
-			Ok(frame) => Ok(frame?),
+			Ok(frame) => {
+				// The frame left the queue; the pump may read on.
+				self.retained.fetch_sub(1, Ordering::Relaxed);
+				Ok(frame?)
+			}
 			Err(RecvTimeoutError::Timeout) => Err(RemoteError::TimedOut),
 			Err(RecvTimeoutError::Disconnected) => Ok(None),
 		}
@@ -319,12 +340,13 @@ pub(crate) fn start_message(code: Option<i32>, stderr: &str) -> String {
 }
 
 /// A started worker: where to write requests, the frames it answers, the
-/// process to stop, and what it said on stderr.
+/// process to stop, what it said on stderr, and its retained-frame counter.
 type Started = (
 	Box<dyn IoWrite + Send>,
 	Frames,
 	Option<Child>,
 	Arc<Mutex<Vec<u8>>>,
+	Arc<AtomicUsize>,
 );
 
 fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
@@ -364,7 +386,9 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 			}
 		})?;
 	let mut stdout = BufReader::new(stdout);
-	let (tx, rx) = mpsc::channel();
+	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+	let retained = Arc::new(AtomicUsize::new(0));
+	let pump_retained = Arc::clone(&retained);
 	std::thread::Builder::new()
 		.name("snip-remote-read".into())
 		.spawn(move || {
@@ -372,10 +396,10 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 				let _ = tx.send(Err(err));
 				return;
 			}
-			pump_frames(stdout, tx);
+			pump_frames(stdout, tx, pump_retained);
 		})?;
 	let writer: Box<dyn IoWrite + Send> = Box::new(stdin);
-	Ok((writer, rx, Some(child), stderr))
+	Ok((writer, rx, Some(child), stderr, retained))
 }
 
 /// Reads up to the [`PREAMBLE`] line, skipping what a login shell printed.
@@ -405,20 +429,36 @@ pub(crate) fn skip_banner(r: &mut impl BufRead) -> io::Result<()> {
 	}
 }
 
-fn read_frames(r: impl IoRead + Send + 'static) -> Frames {
-	let (tx, rx) = mpsc::channel();
-	std::thread::spawn(move || pump_frames(r, tx));
-	rx
+fn read_frames(r: impl IoRead + Send + 'static) -> (Frames, Arc<AtomicUsize>) {
+	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+	let retained = Arc::new(AtomicUsize::new(0));
+	let pump_retained = Arc::clone(&retained);
+	std::thread::spawn(move || pump_frames(r, tx, pump_retained));
+	(rx, retained)
 }
 
+/// Reads frames until the worker stops or the consumer does. The queue is
+/// bounded and every queued frame is accounted in `retained`, so a worker
+/// that keeps speaking while nobody listens cannot grow the master's
+/// memory: at [`FRAME_QUEUE`] retained frames the pump hangs up, which the
+/// caller sees as a worker that closed the connection.
 fn pump_frames(
 	mut r: impl IoRead,
-	tx: mpsc::Sender<io::Result<Option<Response>>>,
+	tx: SyncSender<io::Result<Option<Response>>>,
+	retained: Arc<AtomicUsize>,
 ) {
 	loop {
+		if retained.load(Ordering::Relaxed) >= FRAME_QUEUE {
+			return;
+		}
 		let frame = read_frame::<Response>(&mut r);
 		let end = !matches!(frame, Ok(Some(_)));
-		if tx.send(frame).is_err() || end {
+		retained.fetch_add(1, Ordering::Relaxed);
+		if tx.send(frame).is_err() {
+			retained.fetch_sub(1, Ordering::Relaxed);
+			return;
+		}
+		if end {
 			return;
 		}
 	}
@@ -694,6 +734,13 @@ impl Client {
 			.unwrap_or_else(PoisonError::into_inner)
 			.pop();
 		let (mut conn, reused) = match pooled {
+			Some(conn) if conn.unsolicited_frames() > 0 => {
+				// The worker spoke while nobody was asking. Whatever the
+				// reason, its stream is out of step with the protocol:
+				// drop the connection (killing its process) and start a
+				// clean one.
+				(self.connect()?, false)
+			}
 			Some(conn) if conn.version() >= need => (conn, true),
 			Some(conn) => return Err(too_old(conn)),
 			None => {
@@ -1587,5 +1634,87 @@ mod tests {
 			.acquire(None, scaled(Duration::from_millis(100)))
 			.expect("releasing one guard should allow acquisition");
 		drop((g2, g3, g4, g5));
+	}
+
+	/// A worker that keeps speaking while nobody listens cannot make the
+	/// master buffer without end: the pump hangs up once the retained
+	/// frames reach the cap, and the ssh writer is left with a closed pipe.
+	#[test]
+	fn an_idle_flood_of_frames_is_bounded_and_ends_the_read() {
+		let (r, mut w) = io::pipe().unwrap();
+		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+		let retained = Arc::new(AtomicUsize::new(0));
+		let pump_retained = Arc::clone(&retained);
+		let pump = std::thread::spawn(move || {
+			pump_frames(r, tx, pump_retained);
+		});
+		// ~64 KiB frames: the OS pipe cannot buffer many, so the producer
+		// stalls as soon as the pump does.
+		let body = "x".repeat(64 * 1024);
+		let producer = std::thread::spawn(move || {
+			let mut written = 0usize;
+			for _ in 0..10_000 {
+				let frame = Response::Text {
+					content: Some(body.clone()),
+				};
+				if write_frame(&mut w, &frame).is_err() {
+					break;
+				}
+				written += 1;
+			}
+			written
+		});
+
+		// The pump hangs up at the cap; the producer then hits a closed
+		// pipe well before 10,000 frames.
+		let producer = producer.join().unwrap();
+		pump.join().unwrap();
+		assert_eq!(
+			retained.load(std::sync::atomic::Ordering::Relaxed),
+			FRAME_QUEUE
+		);
+		assert!(
+			producer < 200,
+			"an unconsumed pump must stop at the cap, wrote {producer}"
+		);
+		drop(rx);
+	}
+
+	/// Every consumed frame releases its retained slot, so a call that
+	/// drains its answers leaves the connection reusable.
+	#[test]
+	fn consuming_frames_releases_the_retained_cap() {
+		let (r, w) = io::pipe().unwrap();
+		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+		let retained = Arc::new(AtomicUsize::new(0));
+		for i in 0..3 {
+			retained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			tx.send(Ok(Some(Response::Text {
+				content: Some(i.to_string()),
+			})))
+			.unwrap();
+		}
+		let mut conn = Connection {
+			writer: Box::new(w),
+			frames: rx,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::clone(&retained),
+		};
+		drop(r);
+		for _ in 0..3 {
+			conn.recv(Duration::from_secs(1)).unwrap().unwrap();
+		}
+		assert_eq!(conn.unsolicited_frames(), 0);
+		assert_eq!(
+			retained.load(std::sync::atomic::Ordering::Relaxed),
+			0,
+			"the queue is drained: a pooled connection is clean"
+		);
 	}
 }
