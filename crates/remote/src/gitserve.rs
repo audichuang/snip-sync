@@ -489,10 +489,6 @@ impl RepoCache {
 		self.entries.push(((ws, repo), (identity, now)));
 	}
 
-	pub fn clear(&mut self) {
-		self.entries.clear();
-	}
-
 	fn evict_expired(&mut self, now: Instant) {
 		let ttl = self.ttl;
 		self.entries
@@ -805,7 +801,7 @@ fn open_repo(
 		c.get(&root.id, repo)
 	};
 	if let Some(identity) = cached_id {
-		return Ok(LocalRepo::known_within(&identity, &root.path));
+		return Ok(LocalRepo::known_served(&identity));
 	}
 
 	let dir = if repo.is_empty() {
@@ -834,7 +830,7 @@ fn open_repo(
 		return Err((ErrorCode::NotARepository, "not a git repository".into()));
 	}
 
-	match LocalRepo::open_within(&dir, &root.path, read) {
+	match LocalRepo::open_served(&dir, read) {
 		Ok(view) => {
 			if let Some(id) = view.identity() {
 				let mut c = cache
@@ -1485,11 +1481,6 @@ mod tests {
 		assert!(cache.get_at("ws", "b", t2).is_some());
 		assert!(cache.get_at("ws", "c", t2).is_some());
 		assert!(cache.get_at("ws", "d", t2).is_some());
-
-		// Clear
-		cache.clear();
-		assert!(cache.get_at("ws", "b", t2).is_none());
-		assert_eq!(cache.entries.len(), 0);
 	}
 
 	#[test]

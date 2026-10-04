@@ -67,9 +67,9 @@ pub enum Intent {
 	Quit,
 	CloseWorkspace,
 	OpenWorkspace(std::path::PathBuf),
-	/// A worker's shared workspace (remote-node mode).
+	/// A folder of an ssh host (remote workspace).
 	OpenRemoteWorkspace(
-		Box<(snip_remote::PairedWorker, snip_remote::RemoteWorkspace)>,
+		Box<(snip_remote::RemoteHost, snip_remote::RemoteWorkspace)>,
 	),
 }
 

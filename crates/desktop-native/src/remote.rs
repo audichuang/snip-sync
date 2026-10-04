@@ -1,24 +1,17 @@
-//! Remote-node mode (snip-remote) inside the workbench.
+//! Remote workspaces (snip-remote) inside the workbench.
 //!
-//! - Worker: a listener that outlives any window, started by `--worker`
-//!   or from the workspace menu. It shares the `--share` folders and the
-//!   workspace this app has open.
-//! - Master: paired workers, and the remote workspace that replaces the
-//!   local one while it is open. Its Project tree and file previews are
-//!   read through the worker; everything else stays local and is refused
-//!   while a remote workspace is open.
+//! The hosts are the ones `~/.ssh/config` names. Picking one starts
+//! `snip serve --stdio` there over ssh; a folder of that machine then
+//! opens in place of the local workspace. Its Project tree, previews and
+//! Git views are read through that worker.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Instant;
+use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use snip_core::browser::SourcePreview;
 use snip_core::workspace::{RepoIdentity, RepoKind, RepoSummary, ScanStatus};
-use snip_remote::{
-	Client, Identity, PairedWorker, RemoteError, RemoteWorkspace, Worker,
-	WorkerOptions, WorkerStore, TRUSTED_FILE, WORKERS_FILE,
-};
+use snip_remote::{Client, RemoteError, RemoteHost, RemoteWorkspace};
 
 use gpui::Context;
 
@@ -29,193 +22,52 @@ use crate::tree::{
 };
 use crate::{arm_cancel, lifecycle, RepoEntry, WorkbenchModel};
 
-pub use snip_remote::DEFAULT_LISTEN;
-
-/// Worker flags from the command line.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WorkerCli {
-	pub enabled: bool,
-	pub headless: bool,
-	pub listen: Option<SocketAddr>,
-	pub shares: Vec<PathBuf>,
-}
-
 pub use snip_remote::device_name;
 
-/// The device identity, kept in the config folder; in memory only when
-/// there is none (a test, or an e2e run without `SNIP_CONFIG_DIR`).
-pub fn identity() -> Result<Arc<Identity>, String> {
-	static ID: OnceLock<Result<Arc<Identity>, String>> = OnceLock::new();
-	ID.get_or_init(|| {
-		let id = match crate::recent::config_dir() {
-			Some(dir) => Identity::load_or_create(&dir),
-			None => Identity::generate(),
-		};
-		id.map(Arc::new).map_err(|e| e.to_string())
-	})
-	.clone()
+/// A remote folder opened before, listed under its host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentRemote {
+	pub host: String,
+	pub path: String,
 }
 
-fn config_file(name: &str) -> Option<PathBuf> {
-	crate::recent::config_dir().map(|dir| dir.join(name))
+const RECENT_FILE: &str = "remote-recent.json";
+const MAX_RECENT: usize = 10;
+
+/// Remote folders opened before; none without a config folder (a test, or
+/// an e2e run without `SNIP_CONFIG_DIR`).
+pub fn load_recent() -> Vec<RecentRemote> {
+	crate::recent::config_dir()
+		.map(|dir| snip_remote::load_json(&dir.join(RECENT_FILE)))
+		.unwrap_or_default()
 }
 
-fn worker_store() -> Option<WorkerStore> {
-	config_file(WORKERS_FILE).map(WorkerStore::new)
-}
-
-// ───────────────────────── worker ─────────────────────────
-
-struct WorkerHost {
-	worker: Worker,
-	shares: Vec<PathBuf>,
-	open: Option<PathBuf>,
-	code: Option<(String, Instant)>,
-}
-
-impl WorkerHost {
-	fn apply_roots(&self) {
-		let mut roots = self.shares.clone();
-		roots.extend(self.open.clone());
-		for (path, err) in self.worker.set_roots(&roots) {
-			eprintln!(
-				"snip-sync worker: not sharing {}: {err}",
-				path.display()
-			);
-		}
+/// Moves `host`'s `path` to the front, keeping [`MAX_RECENT`].
+pub(crate) fn remember_recent(
+	list: &mut Vec<RecentRemote>,
+	host: &str,
+	path: &str,
+) {
+	list.retain(|r| !(r.host == host && r.path == path));
+	list.insert(
+		0,
+		RecentRemote {
+			host: host.to_string(),
+			path: path.to_string(),
+		},
+	);
+	list.truncate(MAX_RECENT);
+	if let Some(dir) = crate::recent::config_dir() {
+		let _ = snip_remote::save_json(&dir.join(RECENT_FILE), list);
 	}
 }
 
-fn host() -> &'static Mutex<Option<WorkerHost>> {
-	static HOST: OnceLock<Mutex<Option<WorkerHost>>> = OnceLock::new();
-	HOST.get_or_init(|| Mutex::new(None))
-}
-
-fn with_host<T>(f: impl FnOnce(&mut Option<WorkerHost>) -> T) -> T {
-	f(&mut host().lock().unwrap_or_else(PoisonError::into_inner))
-}
-
-/// What the workspace menu shows about this machine's worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerStatus {
-	pub addr: SocketAddr,
-	pub fingerprint: String,
-	pub shared: usize,
-	pub masters: usize,
-	/// The open pairing code and its seconds left.
-	pub code: Option<(String, u64)>,
-}
-
-/// Starts the worker unless one runs. `open` is the workspace already open.
-pub fn start_worker(
-	listen: SocketAddr,
-	shares: &[PathBuf],
-	open: Option<&Path>,
-) -> Result<SocketAddr, String> {
-	with_host(|slot| {
-		if let Some(host) = slot {
-			return Ok(host.worker.local_addr());
-		}
-		let id = identity()?;
-		let worker = Worker::start(
-			listen,
-			&id,
-			WorkerOptions {
-				name: device_name(),
-				trust_file: config_file(TRUSTED_FILE),
-				..Default::default()
-			},
-		)
-		.map_err(|e| format!("{listen}: {e}"))?;
-		let addr = worker.local_addr();
-		let host = WorkerHost {
-			worker,
-			shares: shares.to_vec(),
-			open: open.map(Path::to_path_buf),
-			code: None,
-		};
-		host.apply_roots();
-		*slot = Some(host);
-		Ok(addr)
-	})
-}
-
-pub fn stop_worker() {
-	// Dropped outside the lock: stopping joins the accept thread.
-	let host = with_host(Option::take);
-	drop(host);
-}
-
-pub fn worker_running() -> bool {
-	with_host(|slot| slot.is_some())
-}
-
-/// The workspace this app has open, shared while the worker runs.
-pub fn worker_set_open(open: Option<&Path>) {
-	with_host(|slot| {
-		if let Some(host) = slot {
-			host.open = open.map(Path::to_path_buf);
-			host.apply_roots();
-		}
-	});
-}
-
-pub fn worker_open_pairing() -> Option<String> {
-	with_host(|slot| {
-		let host = slot.as_mut()?;
-		let code = host.worker.open_pairing();
-		host.code = Some((code.clone(), Instant::now()));
-		Some(code)
-	})
-}
-
-pub fn worker_status() -> Option<WorkerStatus> {
-	with_host(|slot| {
-		let host = slot.as_ref()?;
-		let ttl = snip_remote::worker::PAIRING_TTL;
-		let code = host.code.as_ref().and_then(|(code, at)| {
-			let left = ttl.checked_sub(at.elapsed())?;
-			host.worker
-				.pairing_open()
-				.then(|| (code.clone(), left.as_secs()))
-		});
-		Some(WorkerStatus {
-			addr: host.worker.local_addr(),
-			fingerprint: host.worker.fingerprint().short(),
-			shared: host.worker.roots().len(),
-			masters: host.worker.trusted().len(),
-			code,
-		})
-	})
-}
-
-/// `--worker --headless`: the CLI's `snip worker`, from the desktop build.
-pub fn run_headless(cli: &WorkerCli) -> ! {
-	let listen = cli
-		.listen
-		.unwrap_or_else(|| DEFAULT_LISTEN.parse().expect("a socket address"));
-	let Err(err) = snip_remote::run_headless_worker(
-		listen,
-		&cli.shares,
-		crate::recent::config_dir().as_deref(),
-		None,
-	);
-	eprintln!("Error: cannot start the worker: {err}");
-	std::process::exit(1);
-}
-
-// ───────────────────────── master ─────────────────────────
-
-pub fn load_workers() -> Vec<PairedWorker> {
-	worker_store().map(|s| s.load()).unwrap_or_default()
-}
-
-/// Two-line tooltip for a paired worker row: name on first line, address and full grouped fingerprint on second.
-pub fn remote_worker_tip(worker: &PairedWorker) -> String {
-	let fp = snip_remote::Fingerprint::from_hex(&worker.fingerprint)
-		.map(|f| f.short())
-		.unwrap_or_else(|| worker.fingerprint.clone());
-	format!("{}\n{} · {}", worker.name, worker.addr, fp)
+/// The hosts of `~/.ssh/config`, reached through ssh.
+pub fn load_hosts() -> Vec<RemoteHost> {
+	snip_remote::ssh::config_hosts()
+		.iter()
+		.map(|h| RemoteHost::ssh(h))
+		.collect()
 }
 
 /// The remote workspace open in place of a local one.
@@ -227,42 +79,45 @@ pub struct RemoteSession {
 }
 
 impl RemoteSession {
-	pub fn new(
-		worker: PairedWorker,
-		workspace: RemoteWorkspace,
-	) -> Result<Self, String> {
+	pub fn new(host: RemoteHost, workspace: RemoteWorkspace) -> Self {
+		use std::hash::{Hash, Hasher};
+		let mut h = std::collections::hash_map::DefaultHasher::new();
+		workspace.id.hash(&mut h);
 		let root = PathBuf::from(format!(
-			"snip-remote://{}/{}",
-			worker.fingerprint, workspace.id
+			"snip-remote://{}/{:016x}",
+			host.name,
+			h.finish()
 		));
-		let client = Client::new(worker, identity()?, device_name())
-			.map_err(|e| e.to_string())?;
-		Ok(Self {
-			client: Arc::new(client),
+		Self {
+			client: Arc::new(Client::new(host, device_name())),
 			workspace,
 			root,
-		})
+		}
+	}
+
+	pub fn host(&self) -> &str {
+		&self.client.host().name
 	}
 
 	pub fn label(&self) -> String {
-		format!("{} ▸ {}", self.client.worker().name, self.workspace.name)
+		format!("{} ▸ {}", self.host(), self.workspace.name)
 	}
 
 	pub fn tip(&self) -> String {
-		format!("{}:{}", self.client.worker().name, self.workspace.path)
+		format!("{}:{}", self.host(), self.workspace.path)
 	}
 }
 
-/// Formats a repo path for display: in a remote session, maps paths under session root to worker:workspace_path[/rel].
+/// Formats a repo path for display: in a remote session, maps paths under session root to host:workspace_path[/rel].
 pub fn display_path(session: Option<&RemoteSession>, root: &Path) -> String {
 	if let Some(session) = session {
 		if let Some(rel) = remote_rel(&session.root, root) {
 			let base = session.workspace.path.trim_end_matches('/');
-			let worker = &session.client.worker().name;
+			let host = session.host();
 			if rel.is_empty() {
-				return format!("{worker}:{base}");
+				return format!("{host}:{base}");
 			} else {
-				return format!("{worker}:{base}/{rel}");
+				return format!("{host}:{base}/{rel}");
 			}
 		}
 		return session.tip();
@@ -270,20 +125,23 @@ pub fn display_path(session: Option<&RemoteSession>, root: &Path) -> String {
 	root.display().to_string()
 }
 
-/// A worker's shared workspaces, or why they could not be listed.
-pub type WorkspaceListing = Result<Vec<RemoteWorkspace>, String>;
+/// A host's home folder and the folders in it, for the menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostListing {
+	pub home: String,
+	pub folders: Vec<String>,
+}
 
 /// What master UI holds about remote work.
 #[derive(Default)]
 pub struct MasterState {
-	pub workers: Vec<PairedWorker>,
+	pub hosts: Vec<RemoteHost>,
+	pub recent: Vec<RecentRemote>,
 	pub session: Option<RemoteSession>,
-	/// The pairing form is shown.
-	pub pairing: bool,
 	pub busy: bool,
 	pub message: Option<(bool, String)>,
-	/// Worker whose workspaces are listed, and the listing once it lands.
-	pub browse: Option<(usize, Option<WorkspaceListing>)>,
+	/// Host whose folders are listed, and the listing once it lands.
+	pub browse: Option<(usize, Option<Result<HostListing, String>>)>,
 	pub scan_error: Option<Msg>,
 }
 
@@ -544,53 +402,6 @@ pub fn describe(err: RemoteError) -> String {
 	}
 }
 
-fn apply_pairing(
-	store: Option<&WorkerStore>,
-	workers: &mut Vec<PairedWorker>,
-	worker: PairedWorker,
-) -> Result<usize, String> {
-	match store {
-		Some(store) => {
-			if let Err(e) = store.add(worker.clone()) {
-				*workers = store.load();
-				return Err(format!("cannot save pairings: {e}"));
-			}
-			*workers = store.load();
-			let idx = workers
-				.iter()
-				.position(|w| w.fingerprint == worker.fingerprint)
-				.unwrap_or(0);
-			Ok(idx)
-		}
-		None => {
-			workers.retain(|w| {
-				w.fingerprint != worker.fingerprint && w.addr != worker.addr
-			});
-			workers.insert(0, worker);
-			Ok(0)
-		}
-	}
-}
-
-fn apply_forget(
-	store: Option<&WorkerStore>,
-	workers: &mut Vec<PairedWorker>,
-	fingerprint: &str,
-) -> Result<(), String> {
-	match store {
-		Some(store) => {
-			let res = store.forget(fingerprint);
-			*workers = store.load();
-			res.map(|_| ())
-				.map_err(|e| format!("cannot save pairings: {e}"))
-		}
-		None => {
-			workers.retain(|w| w.fingerprint != fingerprint);
-			Ok(())
-		}
-	}
-}
-
 // ───────────────────────── model ─────────────────────────
 
 impl WorkbenchModel {
@@ -634,146 +445,54 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
-	/// Starts or stops this machine's worker (role switch).
-	pub fn toggle_worker_mode(&mut self, cx: &mut Context<Self>) {
-		if worker_running() {
-			stop_worker();
-			app_log!("[APP:REMOTE_WORKER: state=stopped]");
-			self.remote_note(
-				true,
-				crate::i18n::t("remote_worker_stopped", self.locale).into(),
-				cx,
-			);
+	/// Lists host `idx`'s home folder in the menu.
+	pub fn browse_remote_host(&mut self, idx: usize, cx: &mut Context<Self>) {
+		let Some(host) = self.remote.hosts.get(idx).cloned() else {
 			return;
-		}
-		let open = (self.workspace_open && self.remote.session.is_none())
-			.then(|| self.workspace_root.clone());
-		let listen = DEFAULT_LISTEN.parse().expect("a socket address");
-		match start_worker(listen, &[], open.as_deref()) {
-			Ok(addr) => {
-				app_log!("[APP:REMOTE_WORKER: state=listening addr={addr}]");
-				self.remote.message = None;
-			}
-			Err(err) => self.remote.message = Some((false, err)),
-		}
-		cx.notify();
-	}
-
-	pub fn open_worker_pairing(&mut self, cx: &mut Context<Self>) {
-		if worker_open_pairing().is_some() {
-			app_log!("[APP:REMOTE_PAIRING: state=open]");
-		}
-		cx.notify();
-	}
-
-	pub fn show_remote_pairing(&mut self, cx: &mut Context<Self>) {
-		self.remote.pairing = !self.remote.pairing;
-		if self.remote.pairing {
-			self.pending_focus = Some(self.remote_addr_input.read(cx).handle());
-		}
-		cx.notify();
-	}
-
-	/// Pairs with the worker typed into the form, then lists its workspaces.
-	pub fn pair_remote_worker(&mut self, cx: &mut Context<Self>) {
-		if self.remote.busy {
-			return;
-		}
-		let addr = self.remote_addr_input.read(cx).text().trim().to_string();
-		let code = self.remote_code_input.read(cx).text().trim().to_string();
-		if addr.is_empty() || code.is_empty() {
-			let text = crate::i18n::t("remote_pair_missing", self.locale);
-			self.remote_note(false, text.into(), cx);
-			return;
-		}
-		let id = match identity() {
-			Ok(id) => id,
-			Err(err) => return self.remote_note(false, err, cx),
-		};
-		self.remote.busy = true;
-		self.remote.message = None;
-		cx.notify();
-		let bg = cx.background_executor().clone();
-		cx.spawn(async move |this, cx| {
-			let result = bg
-				.spawn(async move {
-					snip_remote::pair(&addr, &code, &id, &device_name())
-				})
-				.await;
-			let _ = this.update(cx, |this, cx| {
-				this.remote.busy = false;
-				match result {
-					Ok(worker) => {
-						app_log!(
-							"[APP:REMOTE_PAIRED: name={} fp={}]",
-							worker.name,
-							&worker.fingerprint[..16]
-						);
-						let store = worker_store();
-						let idx = match apply_pairing(
-							store.as_ref(),
-							&mut this.remote.workers,
-							worker,
-						) {
-							Ok(idx) => idx,
-							Err(msg) => {
-								this.remote_note(false, msg, cx);
-								return;
-							}
-						};
-						this.remote.pairing = false;
-						for input in [
-							this.remote_addr_input.clone(),
-							this.remote_code_input.clone(),
-						] {
-							input.update(cx, |i, _| i.clear_retained());
-						}
-						this.browse_remote_worker(idx, cx);
-					}
-					Err(err) => {
-						let text = describe(err);
-						app_log!("[APP:REMOTE_PAIR_FAILED: {text}]");
-						this.remote_note(false, text, cx);
-					}
-				}
-			});
-		})
-		.detach();
-	}
-
-	/// Lists worker `idx`'s shared workspaces in the menu.
-	pub fn browse_remote_worker(&mut self, idx: usize, cx: &mut Context<Self>) {
-		let Some(worker) = self.remote.workers.get(idx).cloned() else {
-			return;
-		};
-		let id = match identity() {
-			Ok(id) => id,
-			Err(err) => return self.remote_note(false, err, cx),
 		};
 		self.remote.browse = Some((idx, None));
 		self.remote.message = None;
+		self.pending_focus = Some(self.remote_path_input.read(cx).handle());
 		cx.notify();
 		let bg = cx.background_executor().clone();
-		let fingerprint = worker.fingerprint.clone();
+		let name = host.name.clone();
 		cx.spawn(async move |this, cx| {
 			let result = bg
 				.spawn(async move {
-					Client::new(worker, id, device_name())
-						.and_then(|c| c.list_workspaces())
-						.map_err(describe)
+					let client = Client::new(host, device_name());
+					let home = client.open_workspace("~")?;
+					let (entries, _) = client.list_dir(&home.id, "")?;
+					let folders = entries
+						.into_iter()
+						.filter(|e| {
+							e.directory && e.utf8 && !e.name.starts_with('.')
+						})
+						.map(|e| e.name)
+						.collect();
+					Ok(HostListing {
+						home: home.id,
+						folders,
+					})
 				})
-				.await;
+				.await
+				.map_err(describe);
 			let _ = this.update(cx, |this, cx| {
-				// The list moved or another worker is shown now.
+				// Another host is shown now.
 				let current = this.remote.browse.as_ref().map(|(i, _)| *i);
 				let same = current
-					.and_then(|i| this.remote.workers.get(i))
-					.is_some_and(|w| w.fingerprint == fingerprint);
+					.and_then(|i| this.remote.hosts.get(i))
+					.is_some_and(|h| h.name == name);
 				if !same {
 					return;
 				}
-				if let Ok(items) = &result {
-					app_log!("[APP:REMOTE_WORKSPACES: count={}]", items.len());
+				match &result {
+					Ok(listing) => app_log!(
+						"[APP:REMOTE_HOST_LISTED: host={name} folders={}]",
+						listing.folders.len()
+					),
+					Err(err) => {
+						app_log!("[APP:REMOTE_HOST_FAILED: host={name} {err}]")
+					}
 				}
 				this.remote.browse = current.map(|i| (i, Some(result)));
 				cx.notify();
@@ -782,78 +501,95 @@ impl WorkbenchModel {
 		.detach();
 	}
 
-	pub fn forget_remote_worker(&mut self, idx: usize, cx: &mut Context<Self>) {
-		let Some(worker) = self.remote.workers.get(idx) else {
-			return;
-		};
-		let fp = worker.fingerprint.clone();
-		let store = worker_store();
-		if let Err(err) =
-			apply_forget(store.as_ref(), &mut self.remote.workers, &fp)
-		{
-			self.remote_note(false, err, cx);
-		}
-		self.remote.browse = None;
-		// Its open workspace goes too: the session would keep reading
-		// with a trust the user just withdrew.
-		let open_here = self
-			.remote
-			.session
-			.as_ref()
-			.is_some_and(|s| s.client.worker().fingerprint == fp);
-		if open_here && !self.remote.workers.iter().any(|w| w.fingerprint == fp)
-		{
-			self.request_user_close(lifecycle::Intent::CloseWorkspace, cx);
-		}
-		cx.notify();
-	}
-
-	/// Opens a listed remote workspace after the usual close checks.
-	pub fn open_remote_workspace(
+	/// Opens `path` (absolute, or `~/…`) of host `idx` as the workspace,
+	/// after the usual close checks.
+	pub fn open_remote_path(
 		&mut self,
-		worker: usize,
-		workspace: usize,
+		idx: usize,
+		path: String,
 		cx: &mut Context<Self>,
 	) {
-		let Some(paired) = self.remote.workers.get(worker).cloned() else {
+		let Some(host) = self.remote.hosts.get(idx).cloned() else {
 			return;
 		};
-		let Some(Some(Ok(items))) = self
-			.remote
-			.browse
-			.as_ref()
-			.filter(|(i, _)| *i == worker)
-			.map(|(_, items)| items)
-		else {
+		if self.remote.busy {
+			return;
+		}
+		if path.trim().is_empty() {
+			let text = crate::i18n::t("remote_path_missing", self.locale);
+			return self.remote_note(false, text.into(), cx);
+		}
+		self.remote.busy = true;
+		self.remote.message = None;
+		cx.notify();
+		let bg = cx.background_executor().clone();
+		cx.spawn(async move |this, cx| {
+			let probe = host.clone();
+			let result = bg
+				.spawn(async move {
+					Client::new(probe, device_name())
+						.open_workspace(path.trim())
+						.map_err(describe)
+				})
+				.await;
+			let _ = this.update(cx, |this, cx| {
+				this.remote.busy = false;
+				match result {
+					Ok(ws) => {
+						this.workspace_menu = false;
+						this.request_user_close(
+							lifecycle::Intent::OpenRemoteWorkspace(Box::new((
+								host, ws,
+							))),
+							cx,
+						);
+					}
+					Err(err) => {
+						app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
+						this.remote_note(false, err, cx);
+					}
+				}
+			});
+		})
+		.detach();
+	}
+
+	/// Opens the path typed into the menu, on the host being browsed.
+	pub fn open_remote_typed(&mut self, cx: &mut Context<Self>) {
+		let Some((idx, _)) = self.remote.browse else {
 			return;
 		};
-		let Some(ws) = items.get(workspace).cloned() else {
+		let path = self.remote_path_input.read(cx).text().to_string();
+		self.open_remote_path(idx, path, cx);
+	}
+
+	/// Opens a recent remote folder: its host from `~/.ssh/config`.
+	pub fn open_remote_recent(&mut self, n: usize, cx: &mut Context<Self>) {
+		let Some(recent) = self.remote.recent.get(n).cloned() else {
 			return;
 		};
-		self.workspace_menu = false;
-		self.request_user_close(
-			lifecycle::Intent::OpenRemoteWorkspace(Box::new((paired, ws))),
-			cx,
-		);
+		match self.remote.hosts.iter().position(|h| h.name == recent.host) {
+			Some(idx) => self.open_remote_path(idx, recent.path, cx),
+			None => {
+				let text = crate::i18n::tf(
+					"remote_host_missing",
+					self.locale,
+					&[&recent.host],
+				);
+				self.remote_note(false, text, cx);
+			}
+		}
 	}
 
 	pub(crate) fn finish_open_remote(
 		&mut self,
-		worker: PairedWorker,
+		host: RemoteHost,
 		workspace: RemoteWorkspace,
 		cx: &mut Context<Self>,
 	) {
 		self.release_workspace_state(cx);
-		remote_drop_local_share();
-		let session = match RemoteSession::new(worker, workspace) {
-			Ok(session) => session,
-			Err(err) => {
-				self.workspace_open = false;
-				self.status = Msg::new("remote_open_failed", [err]);
-				cx.notify();
-				return;
-			}
-		};
+		remember_recent(&mut self.remote.recent, &host.name, &workspace.id);
+		let session = RemoteSession::new(host, workspace);
 		let root = session.root.clone();
 		let label = session.label();
 		self.workspace_root = root.clone();
@@ -1030,196 +766,24 @@ impl WorkbenchModel {
 	}
 }
 
-/// A master browsing another machine shares nothing of its own.
-fn remote_drop_local_share() {
-	worker_set_open(None);
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	fn sample_worker(name: &str, addr: &str, fp: &str) -> PairedWorker {
-		PairedWorker {
-			name: name.into(),
-			addr: addr.into(),
-			fingerprint: fp.into(),
+	#[test]
+	fn recent_folders_move_to_the_front_and_stay_bounded() {
+		let mut list = Vec::new();
+		for n in 0..12 {
+			remember_recent(&mut list, "h", &format!("/p{n}"));
 		}
-	}
-
-	#[test]
-	fn apply_pairing_fails_on_unwritable_store() {
-		let tmp = tempfile::tempdir().unwrap();
-		let regular_file = tmp.path().join("a_file");
-		std::fs::write(&regular_file, "blocking").unwrap();
-		let bad_path = regular_file.join(WORKERS_FILE);
-		let store = WorkerStore::new(bad_path);
-
-		let existing = sample_worker("w1", "1.1.1.1:1", "fp1");
-		let mut workers = vec![existing.clone()];
-		let new_worker = sample_worker("w2", "2.2.2.2:2", "fp2");
-
-		let res = apply_pairing(Some(&store), &mut workers, new_worker.clone());
-		let err = res.expect_err("expected error for unwritable path");
-		assert!(
-			err.contains("cannot save pairings"),
-			"expected error containing 'cannot save pairings', got: {err}"
-		);
-		assert!(
-			!workers
-				.iter()
-				.any(|w| w.fingerprint == new_worker.fingerprint),
-			"new worker should not be in workers on save failure"
-		);
-	}
-
-	#[test]
-	fn apply_pairing_succeeds_and_locates_worker_with_concurrent_addition() {
-		let tmp = tempfile::tempdir().unwrap();
-		let store = WorkerStore::in_config_dir(tmp.path());
-		let w1 = sample_worker("w1", "1.1.1.1:1", "fp1");
-		store.add(w1.clone()).unwrap();
-
-		let mut workers = store.load();
-		let w_concurrent =
-			sample_worker("w_concurrent", "2.2.2.2:2", "fp_concurrent");
-		store.add(w_concurrent.clone()).unwrap();
-
-		let new_worker = sample_worker("w_new", "3.3.3.3:3", "fp_new");
-		let idx = apply_pairing(Some(&store), &mut workers, new_worker.clone())
-			.expect("apply_pairing should succeed");
-
-		assert_eq!(workers[idx].fingerprint, new_worker.fingerprint);
-		assert_eq!(workers.len(), 3);
-	}
-
-	#[test]
-	fn apply_pairing_none_store_in_memory_and_dedupes() {
-		let mut workers = vec![
-			sample_worker("w1", "1.1.1.1:1", "fp1"),
-			sample_worker("w2", "2.2.2.2:2", "fp2"),
-		];
-
-		let w3 = sample_worker("w3", "3.3.3.3:3", "fp3");
-		let idx = apply_pairing(None, &mut workers, w3.clone()).unwrap();
-		assert_eq!(idx, 0);
-		assert_eq!(workers[0], w3);
-		assert_eq!(workers.len(), 3);
-
-		let w1_updated = sample_worker("w1_renamed", "1.1.1.1:99", "fp1");
-		let idx =
-			apply_pairing(None, &mut workers, w1_updated.clone()).unwrap();
-		assert_eq!(idx, 0);
-		assert_eq!(workers[0], w1_updated);
-		assert_eq!(workers.len(), 3);
-		assert_eq!(
-			workers.iter().filter(|w| w.fingerprint == "fp1").count(),
-			1
-		);
-
-		let w_same_addr = sample_worker("w_new_addr", "2.2.2.2:2", "fp_diff");
-		let idx =
-			apply_pairing(None, &mut workers, w_same_addr.clone()).unwrap();
-		assert_eq!(idx, 0);
-		assert_eq!(workers[0], w_same_addr);
-		assert_eq!(workers.len(), 3);
-		assert_eq!(workers.iter().filter(|w| w.addr == "2.2.2.2:2").count(), 1);
-		assert!(!workers.iter().any(|w| w.fingerprint == "fp2"));
-	}
-
-	#[test]
-	fn apply_forget_store_removes_by_fingerprint_and_persists() {
-		let tmp = tempfile::tempdir().unwrap();
-		let store = WorkerStore::in_config_dir(tmp.path());
-		let w1 = sample_worker("w1", "1.1.1.1:1", "fp1");
-		let w2 = sample_worker("w2", "2.2.2.2:2", "fp2");
-		store.add(w1.clone()).unwrap();
-		store.add(w2.clone()).unwrap();
-
-		let mut workers = store.load();
-		apply_forget(Some(&store), &mut workers, "fp1")
-			.expect("apply_forget should succeed");
-
-		assert_eq!(workers.len(), 1);
-		assert_eq!(workers[0].fingerprint, "fp2");
-
-		let persisted = store.load();
-		assert_eq!(persisted.len(), 1);
-		assert_eq!(persisted[0].fingerprint, "fp2");
-	}
-
-	#[test]
-	fn apply_forget_stale_in_memory_list_preserves_concurrent_addition() {
-		let tmp = tempfile::tempdir().unwrap();
-		let store = WorkerStore::in_config_dir(tmp.path());
-		let w2 = sample_worker("w2", "2.2.2.2:2", "fp2");
-		let w1 = sample_worker("w1", "1.1.1.1:1", "fp1");
-		store.add(w2.clone()).unwrap();
-		store.add(w1.clone()).unwrap();
-
-		// GUI loads [w1, w2]
-		let mut workers = store.load();
-		assert_eq!(workers.len(), 2);
-		assert_eq!(workers[0].fingerprint, "fp1");
-		assert_eq!(workers[1].fingerprint, "fp2");
-
-		// Another process adds w3 at the front
-		let w3 = sample_worker("w3", "3.3.3.3:3", "fp3");
-		store.add(w3.clone()).unwrap();
-
-		// Forget w1 by fingerprint
-		apply_forget(Some(&store), &mut workers, "fp1")
-			.expect("apply_forget should succeed");
-
-		// Must leave exactly w2 and w3 both in memory and on disk
-		assert_eq!(workers.len(), 2);
-		assert!(workers.iter().any(|w| w.fingerprint == "fp2"));
-		assert!(workers.iter().any(|w| w.fingerprint == "fp3"));
-		assert!(!workers.iter().any(|w| w.fingerprint == "fp1"));
-
-		let on_disk = store.load();
-		assert_eq!(on_disk.len(), 2);
-		assert!(on_disk.iter().any(|w| w.fingerprint == "fp2"));
-		assert!(on_disk.iter().any(|w| w.fingerprint == "fp3"));
-		assert!(!on_disk.iter().any(|w| w.fingerprint == "fp1"));
-	}
-
-	#[test]
-	fn apply_forget_none_store_removes_by_fingerprint() {
-		let mut workers = vec![
-			sample_worker("w1", "1.1.1.1:1", "fp1"),
-			sample_worker("w2", "2.2.2.2:2", "fp2"),
-			sample_worker("w3", "3.3.3.3:3", "fp3"),
-		];
-
-		apply_forget(None, &mut workers, "fp2")
-			.expect("apply_forget should succeed");
-		assert_eq!(workers.len(), 2);
-		assert_eq!(workers[0].fingerprint, "fp1");
-		assert_eq!(workers[1].fingerprint, "fp3");
-
-		// Forgetting a non-existent fingerprint is a no-op
-		apply_forget(None, &mut workers, "fp_unknown")
-			.expect("apply_forget should succeed");
-		assert_eq!(workers.len(), 2);
-	}
-
-	#[test]
-	fn apply_forget_unwritable_store_returns_error() {
-		let tmp = tempfile::tempdir().unwrap();
-		let regular_file = tmp.path().join("a_file");
-		std::fs::write(&regular_file, "blocking").unwrap();
-		let bad_path = regular_file.join(WORKERS_FILE);
-		let store = WorkerStore::new(bad_path);
-
-		let mut workers = vec![sample_worker("w1", "1.1.1.1:1", "fp1")];
-
-		let err = apply_forget(Some(&store), &mut workers, "fp1")
-			.expect_err("expected error for unwritable path");
-		assert!(
-			err.contains("cannot save pairings"),
-			"expected error containing 'cannot save pairings', got: {err}"
-		);
+		assert_eq!(list.len(), MAX_RECENT);
+		assert_eq!(list[0].path, "/p11");
+		remember_recent(&mut list, "h", "/p5");
+		assert_eq!(list[0].path, "/p5");
+		assert_eq!(list.iter().filter(|r| r.path == "/p5").count(), 1);
+		remember_recent(&mut list, "other", "/p5");
+		assert_eq!(list[0].host, "other");
+		assert_eq!(list[1].host, "h");
 	}
 
 	#[test]
@@ -1421,29 +985,5 @@ mod tests {
 		let msg = scan_incomplete_msg(ScanStatus::More, 5).unwrap();
 		assert_eq!(msg.key, "remote_scan_incomplete");
 		assert_eq!(msg.args, vec!["5".to_string()]);
-	}
-
-	#[test]
-	fn test_remote_worker_tip() {
-		let worker = snip_remote::PairedWorker {
-			name: "ubuntu-ui".into(),
-			addr: "100.95.28.19:47899".into(),
-			fingerprint:
-				"5134d3b34076abcd1234567890abcdef5134d3b34076abcd1234567890abcdef"
-					.into(),
-		};
-		let tip = remote_worker_tip(&worker);
-		assert_eq!(tip, "ubuntu-ui\n100.95.28.19:47899 · 5134-D3B3-4076-ABCD");
-
-		let bad_worker = snip_remote::PairedWorker {
-			name: "test-node".into(),
-			addr: "127.0.0.1:12345".into(),
-			fingerprint: "invalid-hex-fingerprint".into(),
-		};
-		let bad_tip = remote_worker_tip(&bad_worker);
-		assert_eq!(
-			bad_tip,
-			"test-node\n127.0.0.1:12345 · invalid-hex-fingerprint"
-		);
 	}
 }

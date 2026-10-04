@@ -13,7 +13,7 @@ use snip_core::gitrun::{
 use snip_core::gitsrc::Git;
 use snip_core::gitview::ReadProfile;
 use snip_remote::proto::{ErrorCode, GitQuery};
-use snip_remote::{pair, Client, Identity, RemoteError, Worker, WorkerOptions};
+use snip_remote::{Client, RemoteError, RemoteHost, Worker, WorkerOptions};
 
 static SHIM_INIT: std::sync::Once = std::sync::Once::new();
 
@@ -127,35 +127,25 @@ fn a_master_cannot_fill_the_git_queue() {
 	run_git(&local_repo, &["add", "local.txt"]);
 	run_git(&local_repo, &["commit", "-m", "init"]);
 
-	let id = Identity::generate().unwrap();
-	let mut w = Worker::start(
-		"127.0.0.1:0".parse().unwrap(),
-		&id,
-		WorkerOptions {
-			name: "queue-worker".into(),
-			trust_file: None,
-			max_protocol: None,
-		},
-	)
-	.unwrap();
-	assert!(w.set_roots(std::slice::from_ref(&ws)).is_empty());
-	let ws_id = w.roots()[0].id.clone();
-
-	let master = Arc::new(Identity::generate().unwrap());
-	let code = w.open_pairing();
-	let paired =
-		pair(&w.local_addr().to_string(), &code, &master, "mac").unwrap();
+	let w = Arc::new(Worker::new(WorkerOptions {
+		name: "queue-worker".into(),
+		max_protocol: None,
+	}));
 
 	// Create multiple clients so we exceed client-side limiter of 4 in flight
 	const NUM_CLIENTS: usize = 20;
 	let clients: Vec<Arc<Client>> = (0..NUM_CLIENTS)
 		.map(|_| {
-			Arc::new(
-				Client::new(paired.clone(), master.clone(), "mac".into())
-					.unwrap(),
-			)
+			Arc::new(Client::new(
+				RemoteHost::in_process(w.clone()),
+				"mac".into(),
+			))
 		})
 		.collect();
+	let ws_id = clients[0]
+		.open_workspace(&ws.display().to_string())
+		.unwrap()
+		.id;
 
 	const CALLS: usize = 70;
 	let cancel = CancelToken::new();
@@ -300,34 +290,24 @@ fn scan_repos_uses_served_pool_and_leaves_local_pool_untouched() {
 		fs::write(repo.join(".slow_active"), "").unwrap();
 	}
 
-	let id = Identity::generate().unwrap();
-	let mut w = Worker::start(
-		"127.0.0.1:0".parse().unwrap(),
-		&id,
-		WorkerOptions {
-			name: "scan-pool-worker".into(),
-			trust_file: None,
-			max_protocol: None,
-		},
-	)
-	.unwrap();
-	assert!(w.set_roots(std::slice::from_ref(&ws)).is_empty());
-	let ws_id = w.roots()[0].id.clone();
-
-	let master = Arc::new(Identity::generate().unwrap());
-	let code = w.open_pairing();
-	let paired =
-		pair(&w.local_addr().to_string(), &code, &master, "mac").unwrap();
+	let w = Arc::new(Worker::new(WorkerOptions {
+		name: "scan-pool-worker".into(),
+		max_protocol: None,
+	}));
 
 	const NUM_CLIENTS: usize = 6;
 	let clients: Vec<Arc<Client>> = (0..NUM_CLIENTS)
 		.map(|_| {
-			Arc::new(
-				Client::new(paired.clone(), master.clone(), "mac".into())
-					.unwrap(),
-			)
+			Arc::new(Client::new(
+				RemoteHost::in_process(w.clone()),
+				"mac".into(),
+			))
 		})
 		.collect();
+	let ws_id = clients[0]
+		.open_workspace(&ws.display().to_string())
+		.unwrap()
+		.id;
 
 	let cancel = CancelToken::new();
 	let stopped = Arc::new(AtomicBool::new(false));

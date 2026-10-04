@@ -510,8 +510,10 @@ impl Git {
 		rev_or_positional.len() < 2
 	}
 
-	/// Creates a command for `diff`, ensuring that in boundary mode, any index
-	/// auto-refresh writes to a private temporary copy instead of the real index.
+	/// Creates a command for `diff`, ensuring that for a worker (served pool
+	/// or boundary mode) any index auto-refresh writes to a private
+	/// temporary copy instead of the real index: the machine's own user may
+	/// be running git in that repository.
 	pub(crate) fn diff_command(
 		&self,
 		args: &[&str],
@@ -520,7 +522,9 @@ impl Git {
 		let mut cmd = self.command();
 		cmd.args(args);
 		let mut temp_index = None;
-		if self.boundary.is_some() && Self::diff_reads_index(args) {
+		let served = self.boundary.is_some()
+			|| opts.pool == crate::gitrun::GitPool::Served;
+		if served && Self::diff_reads_index(args) {
 			let out =
 				self.run_with(&["rev-parse", "--git-path", "index"], opts)?;
 			let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -536,7 +540,7 @@ impl Git {
 		Ok((cmd, temp_index))
 	}
 
-	/// [`Git::run_with`] for `diff` invocations, isolating index writes in boundary mode.
+	/// [`Git::run_with`] for `diff` invocations, isolating a worker's index writes.
 	pub fn run_diff_with(
 		&self,
 		args: &[&str],

@@ -206,21 +206,6 @@ impl Jobs {
 		}
 	}
 
-	pub fn cancel_workspaces(&self, ids: &[String]) {
-		let inner = self
-			.shared
-			.inner
-			.lock()
-			.unwrap_or_else(PoisonError::into_inner);
-		for id in ids {
-			if let Some(list) = inner.by_workspace.get(id) {
-				for (_, token) in list {
-					token.cancel();
-				}
-			}
-		}
-	}
-
 	pub fn cancel_all(&self) {
 		let mut inner = self
 			.shared
@@ -524,24 +509,6 @@ mod tests {
 		let res = t.join().expect("join");
 		assert!(start.elapsed() < scaled(Duration::from_secs(2)));
 		assert_eq!(res.err(), Some(ErrorCode::Cancelled));
-	}
-
-	#[test]
-	fn cancel_workspaces_cancels_only_those_tokens() {
-		let jobs = Jobs::with_limits(4, 2, 16, scaled(Duration::from_secs(5)));
-		let c1 = CancelToken::new();
-		let c2 = CancelToken::new();
-
-		let _g1 = jobs.admit("ws1", JobKind::View, &c1).unwrap();
-		let _g2 = jobs.admit("ws2", JobKind::View, &c2).unwrap();
-
-		assert!(!c1.is_cancelled());
-		assert!(!c2.is_cancelled());
-
-		jobs.cancel_workspaces(&["ws1".into()]);
-
-		assert!(c1.is_cancelled());
-		assert!(!c2.is_cancelled());
 	}
 
 	#[test]

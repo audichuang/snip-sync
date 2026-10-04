@@ -1,49 +1,32 @@
-//! The worker: a listener that serves the shared workspaces of this machine
-//! to paired masters. It runs on its own threads, independent of any window,
-//! so the same code serves a GUI session and a headless one.
+//! The worker: the far end of a master's connection. A master starts it
+//! over ssh (`snip serve --stdio`) and it answers that one master on stdin
+//! and stdout until the stream ends. SSH has already authenticated the
+//! user, so anything that user can read on this machine can be opened as a
+//! workspace; requests about a workspace stay inside it.
 
 use std::fs;
-use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
-use serde::{Deserialize, Serialize};
 use snip_core::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
 
 use crate::proto::{
 	read_frame, write_frame, DirEntry, EntryKind, ErrorCode, RemoteWorkspace,
 	Request, Response, Stat, MAX_DIR_ENTRIES, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
-use crate::tls::{normalize_code, pairing_proof, server_config, Fingerprint};
-use crate::{Identity, RemoteError};
+use crate::RemoteError;
 
-/// How long a pairing code stays valid.
-pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
-/// Wrong proofs before an open code is withdrawn.
-pub const PAIRING_ATTEMPTS: u32 = 5;
-/// Connections served at once, idle pooled ones included (each is one
-/// blocked thread). More wait for a slot.
-pub const MAX_CONNECTIONS: usize = 64;
-/// Connections waiting for a slot; beyond this they are closed on accept.
-pub const MAX_WAITING: usize = 64;
-/// How long a connection waits for a slot: under the master's 5 s read
-/// timeout, so a master gives up only after the worker did.
-pub const SLOT_WAIT: Duration = Duration::from_secs(4);
-/// A master's idle pooled connection is closed after this; the master
-/// reconnects on its next call.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const ACCEPT_POLL: Duration = Duration::from_millis(50);
-const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+/// First line `snip serve --stdio` prints, before any frame: a login
+/// shell's banner ahead of it is skipped by the master.
+pub const PREAMBLE: &str = "snip-serve-stdio/1";
 
-/// A folder this worker lets paired masters read.
+/// A workspace this worker serves: a folder resolved by real path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedRoot {
+	/// The real path as text: what requests name the workspace by.
 	pub id: String,
 	pub name: String,
 	/// Real path; every request is resolved and contained against it.
@@ -56,218 +39,128 @@ impl SharedRoot {
 		if !path.is_dir() {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
-				"a shared workspace must be a folder",
+				"a workspace must be a folder",
 			));
 		}
-		let id = Fingerprint::of(path.as_os_str().as_encoded_bytes()).to_hex()
-			[..16]
-			.to_string();
+		let id = path.display().to_string();
 		let name = path
 			.file_name()
 			.map(|n| n.to_string_lossy().into_owned())
-			.unwrap_or_else(|| path.display().to_string());
+			.unwrap_or_else(|| id.clone());
 		Ok(Self { id, name, path })
+	}
+
+	/// `spelled` as a master sends it: an absolute path, or `~` / `~/…`
+	/// for this user's home.
+	pub fn open(spelled: &str) -> io::Result<Self> {
+		Self::new(&expand_home(spelled)?)
 	}
 }
 
-/// A master this worker serves, known by its certificate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TrustedMaster {
-	pub name: String,
-	pub fingerprint: String,
+/// This user's home folder.
+pub fn home_dir() -> Option<PathBuf> {
+	std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+		.filter(|h| !h.is_empty())
+		.map(PathBuf::from)
+}
+
+fn expand_home(spelled: &str) -> io::Result<PathBuf> {
+	let rest = if spelled == "~" {
+		Some("")
+	} else {
+		spelled
+			.strip_prefix("~/")
+			.or_else(|| spelled.strip_prefix("~\\"))
+	};
+	let path = match rest {
+		Some(rest) => home_dir()
+			.ok_or_else(|| {
+				io::Error::new(io::ErrorKind::NotFound, "no home folder")
+			})?
+			.join(rest),
+		None => PathBuf::from(spelled),
+	};
+	if !path.is_absolute() {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"a workspace path must be absolute or start with ~",
+		));
+	}
+	Ok(path)
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkerOptions {
 	/// Shown to masters.
 	pub name: String,
-	/// Where trusted masters are kept; `None` keeps them in memory only.
-	pub trust_file: Option<PathBuf>,
 	/// Highest protocol version this worker will negotiate.
 	pub max_protocol: Option<u32>,
 }
 
-struct PairingWindow {
-	code: String,
-	expires: Instant,
-	failures: u32,
-}
-
 struct State {
 	name: String,
-	fingerprint: Fingerprint,
-	tls: Arc<ServerConfig>,
-	trust_file: Option<PathBuf>,
 	max_protocol: Option<u32>,
 	git_requests: AtomicUsize,
 	deadlines: Mutex<(Duration, Duration)>,
 	jobs: crate::jobs::Jobs,
 	repo_cache: Mutex<crate::gitserve::RepoCache>,
-	trusted: Mutex<Vec<TrustedMaster>>,
-	pairing: Mutex<Option<PairingWindow>>,
-	roots: RwLock<Vec<SharedRoot>>,
-	connections: Arc<AtomicUsize>,
-	waiting: AtomicUsize,
 	stop: AtomicBool,
-	#[cfg(test)]
-	set_roots_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
-pub(crate) struct ConnSlot(Arc<AtomicUsize>);
-
-impl Drop for ConnSlot {
-	fn drop(&mut self) {
-		self.0.fetch_sub(1, Ordering::SeqCst);
-	}
-}
-
+/// One worker's state. `snip serve --stdio` serves a single connection;
+/// tests serve several against one worker.
 pub struct Worker {
 	state: Arc<State>,
-	addr: SocketAddr,
-	accept: Option<JoinHandle<()>>,
 }
 
 impl Worker {
-	pub fn start(
-		bind: SocketAddr,
-		identity: &Identity,
-		opts: WorkerOptions,
-	) -> Result<Self, RemoteError> {
-		let listener = TcpListener::bind(bind)?;
-		// Polled, so a stop needs no wake-up connection.
-		listener.set_nonblocking(true)?;
-		let addr = listener.local_addr()?;
-		let trusted = opts
-			.trust_file
-			.as_deref()
-			.map(|f| {
-				crate::store::TrustedMasterStore::new(f.to_path_buf()).load()
-			})
-			.unwrap_or_default();
-		let state = Arc::new(State {
-			name: opts.name,
-			fingerprint: identity.fingerprint(),
-			tls: server_config(identity)?,
-			trust_file: opts.trust_file,
-			max_protocol: opts.max_protocol,
-			git_requests: AtomicUsize::new(0),
-			deadlines: Mutex::new((
-				crate::jobs::VIEW_DEADLINE,
-				crate::jobs::SCAN_DEADLINE,
-			)),
-			jobs: crate::jobs::Jobs::new(),
-			repo_cache: Mutex::new(crate::gitserve::RepoCache::new()),
-			trusted: Mutex::new(trusted),
-			pairing: Mutex::new(None),
-			roots: RwLock::new(Vec::new()),
-			connections: Arc::new(AtomicUsize::new(0)),
-			waiting: AtomicUsize::new(0),
-			stop: AtomicBool::new(false),
-			#[cfg(test)]
-			set_roots_hook: Mutex::new(None),
-		});
-		let accept_state = state.clone();
-		let accept = std::thread::Builder::new()
-			.name("snip-remote-accept".into())
-			.spawn(move || accept_loop(listener, accept_state))?;
-		Ok(Self {
-			state,
-			addr,
-			accept: Some(accept),
-		})
+	pub fn new(opts: WorkerOptions) -> Self {
+		Self {
+			state: Arc::new(State {
+				name: opts.name,
+				max_protocol: opts.max_protocol,
+				git_requests: AtomicUsize::new(0),
+				deadlines: Mutex::new((
+					crate::jobs::VIEW_DEADLINE,
+					crate::jobs::SCAN_DEADLINE,
+				)),
+				jobs: crate::jobs::Jobs::new(),
+				repo_cache: Mutex::new(crate::gitserve::RepoCache::new()),
+				stop: AtomicBool::new(false),
+			}),
+		}
 	}
 
-	pub fn local_addr(&self) -> SocketAddr {
-		self.addr
+	/// Answers one master on `reader` / `writer` until the stream ends.
+	pub fn serve(
+		&self,
+		reader: impl Read,
+		writer: impl Write,
+	) -> Result<(), RemoteError> {
+		serve(reader, writer, &self.state)
 	}
 
-	pub fn fingerprint(&self) -> Fingerprint {
-		self.state.fingerprint
+	/// A connection to this worker on a thread of this process: write
+	/// requests to the first end, read responses from the second. Dropping
+	/// either end is a master hanging up. For tests.
+	#[doc(hidden)]
+	pub fn connect_in_process(
+		self: &Arc<Self>,
+	) -> io::Result<(io::PipeWriter, io::PipeReader)> {
+		let (req_r, req_w) = io::pipe()?;
+		let (res_r, res_w) = io::pipe()?;
+		let worker = self.clone();
+		std::thread::Builder::new()
+			.name("snip-remote-inproc".into())
+			.spawn(move || {
+				let _ = worker.serve(req_r, res_w);
+			})?;
+		Ok((req_w, res_r))
 	}
 
 	/// Counts GitView/ScanRepos requests received, for tests and diagnostics.
 	pub fn git_requests_seen(&self) -> usize {
 		self.state.git_requests.load(Ordering::SeqCst)
-	}
-
-	/// Opens a one-time pairing code, replacing any open one.
-	pub fn open_pairing(&self) -> String {
-		let code = new_code();
-		*lock(&self.state.pairing) = Some(PairingWindow {
-			code: normalize_code(&code),
-			expires: Instant::now() + PAIRING_TTL,
-			failures: 0,
-		});
-		code
-	}
-
-	pub fn close_pairing(&self) {
-		*lock(&self.state.pairing) = None;
-	}
-
-	/// Whether a code is open and unexpired.
-	pub fn pairing_open(&self) -> bool {
-		lock(&self.state.pairing)
-			.as_ref()
-			.is_some_and(|w| w.expires > Instant::now())
-	}
-
-	/// Replaces the shared folders. A folder that cannot be resolved is left
-	/// out and returned with its error.
-	pub fn set_roots(&self, paths: &[PathBuf]) -> Vec<(PathBuf, io::Error)> {
-		let mut roots: Vec<SharedRoot> = Vec::new();
-		let mut errors = Vec::new();
-		for path in paths {
-			match SharedRoot::new(path) {
-				Ok(root) if roots.iter().any(|r| r.id == root.id) => {}
-				Ok(root) => roots.push(root),
-				Err(err) => errors.push((path.clone(), err)),
-			}
-		}
-		let new_ids: std::collections::HashSet<String> =
-			roots.iter().map(|r| r.id.clone()).collect();
-		let old_roots = {
-			let mut lock = self
-				.state
-				.roots
-				.write()
-				.unwrap_or_else(PoisonError::into_inner);
-			std::mem::replace(&mut *lock, roots)
-		};
-		let old_ids: Vec<String> =
-			old_roots.into_iter().map(|r| r.id).collect();
-		let removed: Vec<String> = old_ids
-			.into_iter()
-			.filter(|id| !new_ids.contains(id))
-			.collect();
-		// Swapping roots first ensures that jobs admitted after the swap fail
-		// get_shared_root; jobs admitted before are already in by_workspace and
-		// get cancelled here before repo_cache is cleared.
-		#[cfg(test)]
-		if let Some(hook) = lock(&self.state.set_roots_hook).as_ref() {
-			hook();
-		}
-		if !removed.is_empty() {
-			self.state.jobs.cancel_workspaces(&removed);
-		}
-		lock(&self.state.repo_cache).clear();
-		errors
-	}
-
-	pub fn roots(&self) -> Vec<SharedRoot> {
-		self.state
-			.roots
-			.read()
-			.unwrap_or_else(PoisonError::into_inner)
-			.clone()
-	}
-
-	pub fn trusted(&self) -> Vec<TrustedMaster> {
-		lock(&self.state.trusted).clone()
-	}
-
-	pub fn active_connections(&self) -> usize {
-		self.state.connections.load(Ordering::SeqCst)
 	}
 
 	#[doc(hidden)]
@@ -285,13 +178,10 @@ impl Worker {
 		self.state.jobs.waiting()
 	}
 
-	/// Stops accepting; open connections end at their next request.
-	pub fn stop(&mut self) {
+	/// Cancels every job; each connection ends at its next request.
+	pub fn stop(&self) {
 		self.state.stop.store(true, Ordering::SeqCst);
 		self.state.jobs.cancel_all();
-		if let Some(accept) = self.accept.take() {
-			let _ = accept.join();
-		}
 	}
 }
 
@@ -301,78 +191,33 @@ impl Drop for Worker {
 	}
 }
 
+/// `snip serve --stdio`: prints [`PREAMBLE`], then serves the master on
+/// stdin / stdout until it hangs up.
+pub fn serve_stdio(opts: WorkerOptions) -> Result<(), RemoteError> {
+	let stdin = io::stdin();
+	let stdout = io::stdout();
+	let mut out = stdout.lock();
+	writeln!(out, "{PREAMBLE}")?;
+	out.flush()?;
+	Worker::new(opts).serve(stdin.lock(), out)
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 	m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn new_code() -> String {
-	use ring::rand::SecureRandom;
-	let mut bytes = [0u8; 8];
-	ring::rand::SystemRandom::new()
-		.fill(&mut bytes)
-		.expect("the OS random source");
-	let chars: String = bytes
-		.iter()
-		.map(|b| CODE_ALPHABET[(*b & 31) as usize] as char)
-		.collect();
-	format!("{}-{}", &chars[..4], &chars[4..])
-}
-
-fn accept_loop(listener: TcpListener, state: Arc<State>) {
-	while !state.stop.load(Ordering::SeqCst) {
-		match listener.accept() {
-			Ok((tcp, _)) => {
-				if state.waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITING {
-					state.waiting.fetch_sub(1, Ordering::SeqCst);
-					continue;
-				}
-				let conn_state = state.clone();
-				let spawned = std::thread::Builder::new()
-					.name("snip-remote-conn".into())
-					.spawn(move || {
-						let slot = conn_state.take_slot();
-						conn_state.waiting.fetch_sub(1, Ordering::SeqCst);
-						if let Some(_slot) = slot {
-							let _ = serve(tcp, &conn_state);
-						}
-					});
-				if spawned.is_err() {
-					state.waiting.fetch_sub(1, Ordering::SeqCst);
-				}
-			}
-			Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-				std::thread::sleep(ACCEPT_POLL);
-			}
-			Err(_) => std::thread::sleep(ACCEPT_POLL),
-		}
+fn serve(
+	mut reader: impl Read,
+	mut writer: impl Write,
+	state: &State,
+) -> Result<(), RemoteError> {
+	// A stopped worker hangs up on every master, as a dead process would.
+	if state.stop.load(Ordering::SeqCst) {
+		return Ok(());
 	}
-}
-
-fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
-	// TCP keepalive: best effort attempt to detect vanished masters.
-	let sock = socket2::SockRef::from(&tcp);
-	let mut keepalive =
-		socket2::TcpKeepalive::new().with_time(Duration::from_secs(15));
-	keepalive = keepalive.with_interval(Duration::from_secs(5));
-	// Ignore errors if the platform or socket doesn't support keepalive parameters.
-	let _ = sock.set_tcp_keepalive(&keepalive);
-
-	tcp.set_nonblocking(false)?;
-	tcp.set_nodelay(true)?;
-	tcp.set_read_timeout(Some(IO_TIMEOUT))?;
-	tcp.set_write_timeout(Some(IO_TIMEOUT))?;
-	let conn = ServerConnection::new(state.tls.clone())?;
-	let mut tls = StreamOwned::new(conn, tcp);
-	// The handshake completes inside the first read.
-	let Some(hello) = read_frame::<Request>(&mut tls)? else {
+	let Some(hello) = read_frame::<Request>(&mut reader)? else {
 		return Ok(());
 	};
-	let peer = tls
-		.conn
-		.peer_certificates()
-		.and_then(|certs| certs.first())
-		.map(|cert| Fingerprint::of(cert))
-		.ok_or_else(|| RemoteError::Protocol("no client certificate".into()))?;
 	let negotiated = match hello {
 		Request::Hello {
 			version,
@@ -385,7 +230,7 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 		}
 		Request::Hello { version, .. } => {
 			write_frame(
-				&mut tls,
+				&mut writer,
 				&error(
 					ErrorCode::VersionMismatch,
 					format!(
@@ -397,40 +242,34 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 		}
 		_ => {
 			write_frame(
-				&mut tls,
+				&mut writer,
 				&error(ErrorCode::BadRequest, "expected hello".into()),
 			)?;
 			return Ok(());
 		}
 	};
 	write_frame(
-		&mut tls,
+		&mut writer,
 		&Response::Hello {
 			version: PROTOCOL_VERSION,
 			name: state.name.clone(),
-			paired: state.is_trusted(&peer),
+			home: home_dir().map(|h| h.display().to_string()),
 			max_version: Some(negotiated),
 		},
 	)?;
-	tls.sock.set_read_timeout(Some(IDLE_TIMEOUT))?;
 	while !state.stop.load(Ordering::SeqCst) {
-		let Some(request) = read_frame::<Request>(&mut tls)? else {
+		let Some(request) = read_frame::<Request>(&mut reader)? else {
 			return Ok(());
 		};
+		if state.stop.load(Ordering::SeqCst) {
+			return Ok(());
+		}
 		match request {
 			Request::ScanRepos { workspace, under } => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
-				if !state.is_trusted(&peer) {
+				if negotiated < crate::proto::GIT_VIEWS_VERSION {
 					crate::jobs::write_response(
-						&mut tls,
-						&error(
-							ErrorCode::NotPaired,
-							"this master is not paired with the worker".into(),
-						),
-					)?;
-				} else if negotiated < crate::proto::GIT_VIEWS_VERSION {
-					crate::jobs::write_response(
-						&mut tls,
+						&mut writer,
 						&error(
 							ErrorCode::Unsupported,
 							"Git views are not available on this worker yet"
@@ -441,7 +280,7 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 					let (_, scan_deadline) = *lock(&state.deadlines);
 					let cancel = snip_core::gitrun::CancelToken::new();
 					crate::jobs::run_job(
-						&mut tls,
+						&mut writer,
 						scan_deadline,
 						cancel,
 						|job_cancel, job_deadline| match state.jobs.admit(
@@ -481,17 +320,9 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 				query,
 			} => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
-				if !state.is_trusted(&peer) {
+				if negotiated < crate::proto::GIT_VIEWS_VERSION {
 					crate::jobs::write_response(
-						&mut tls,
-						&error(
-							ErrorCode::NotPaired,
-							"this master is not paired with the worker".into(),
-						),
-					)?;
-				} else if negotiated < crate::proto::GIT_VIEWS_VERSION {
-					crate::jobs::write_response(
-						&mut tls,
+						&mut writer,
 						&error(
 							ErrorCode::Unsupported,
 							"Git views are not available on this worker yet"
@@ -502,14 +333,14 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 					crate::gitserve::validate(&repo, &query)
 				{
 					crate::jobs::write_response(
-						&mut tls,
+						&mut writer,
 						&error(ErrorCode::BadRequest, msg),
 					)?;
 				} else {
 					let (view_deadline, _) = *lock(&state.deadlines);
 					let cancel = snip_core::gitrun::CancelToken::new();
 					crate::jobs::run_job(
-						&mut tls,
+						&mut writer,
 						view_deadline,
 						cancel,
 						|job_cancel, _job_deadline| match state.jobs.admit(
@@ -547,8 +378,8 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 				}
 			}
 			other => {
-				let response = state.handle(&peer, other, negotiated);
-				crate::jobs::write_response(&mut tls, &response)?;
+				let response = state.handle(other);
+				crate::jobs::write_response(&mut writer, &response)?;
 			}
 		}
 	}
@@ -600,7 +431,7 @@ fn verify_root_unchanged(
 		}
 		_ => error(
 			ErrorCode::Forbidden,
-			"that workspace is not shared by this worker".into(),
+			"the workspace folder changed while it was read".into(),
 		),
 	}
 }
@@ -617,70 +448,19 @@ pub(crate) fn io_error(err: io::Error) -> Response {
 }
 
 impl State {
-	/// Waits up to [`SLOT_WAIT`] for one of [`MAX_CONNECTIONS`] slots.
-	fn take_slot(&self) -> Option<ConnSlot> {
-		let deadline = Instant::now() + SLOT_WAIT;
-		loop {
-			// compare_exchange rather than fetch_update: newer toolchains
-			// deprecate that name, and CI denies warnings.
-			let n = self.connections.load(Ordering::SeqCst);
-			if n < MAX_CONNECTIONS
-				&& self
-					.connections
-					.compare_exchange(
-						n,
-						n + 1,
-						Ordering::SeqCst,
-						Ordering::SeqCst,
-					)
-					.is_ok()
-			{
-				return Some(ConnSlot(self.connections.clone()));
-			}
-			if n < MAX_CONNECTIONS {
-				// Lost a race for the slot: look again at once.
-				continue;
-			}
-			if Instant::now() >= deadline || self.stop.load(Ordering::SeqCst) {
-				return None;
-			}
-			std::thread::sleep(Duration::from_millis(10));
-		}
-	}
-
-	fn is_trusted(&self, peer: &Fingerprint) -> bool {
-		let hex = peer.to_hex();
-		lock(&self.trusted).iter().any(|m| m.fingerprint == hex)
-	}
-
 	#[allow(clippy::result_large_err)]
-	fn handle(
-		&self,
-		peer: &Fingerprint,
-		request: Request,
-		_negotiated: u32,
-	) -> Response {
+	fn handle(&self, request: Request) -> Response {
 		match request {
 			Request::Hello { .. } => {
 				error(ErrorCode::BadRequest, "hello was already sent".into())
 			}
-			Request::Pair { name, proof } => self.pair(peer, name, &proof),
-			_ if !self.is_trusted(peer) => error(
-				ErrorCode::NotPaired,
-				"this master is not paired with the worker".into(),
-			),
-			Request::ListWorkspaces => Response::Workspaces {
-				items: self
-					.roots
-					.read()
-					.unwrap_or_else(PoisonError::into_inner)
-					.iter()
-					.map(|r| RemoteWorkspace {
-						id: r.id.clone(),
-						name: r.name.clone(),
-						path: r.path.display().to_string(),
-					})
-					.collect(),
+			Request::OpenWorkspace { path } => match SharedRoot::open(&path) {
+				Ok(root) => Response::Workspace(RemoteWorkspace {
+					id: root.id,
+					name: root.name,
+					path: root.path.display().to_string(),
+				}),
+				Err(err) => io_error(err),
 			},
 			Request::ListDir { workspace, path } => self
 				.resolve(&workspace, &path)
@@ -713,73 +493,12 @@ impl State {
 		}
 	}
 
-	fn pair(&self, peer: &Fingerprint, name: String, proof: &str) -> Response {
-		if self.is_trusted(peer) {
-			return Response::Paired {
-				name: self.name.clone(),
-			};
-		}
-		let mut window = lock(&self.pairing);
-		let Some(open) = window.as_mut().filter(|w| w.expires > Instant::now())
-		else {
-			*window = None;
-			return error(
-				ErrorCode::PairingRefused,
-				"no pairing code is open on the worker".into(),
-			);
-		};
-		let expected = pairing_proof(&open.code, &self.fingerprint, peer);
-		let given = crate::from_hex(proof).unwrap_or_default();
-		if !constant_time_eq(&expected, &given) {
-			open.failures += 1;
-			if open.failures >= PAIRING_ATTEMPTS {
-				*window = None;
-			}
-			return error(
-				ErrorCode::PairingRefused,
-				"the pairing code does not match".into(),
-			);
-		}
-		let master = TrustedMaster {
-			name,
-			fingerprint: peer.to_hex(),
-		};
-		if let Some(file) = &self.trust_file {
-			let store = crate::store::TrustedMasterStore::new(file.clone());
-			if let Err(err) = store.add(master.clone()) {
-				return error(
-					ErrorCode::Io,
-					format!("cannot save the trusted master: {err}"),
-				);
-			}
-		}
-		// One code pairs one master.
-		*window = None;
-		drop(window);
-		let mut trusted = lock(&self.trusted);
-		trusted.push(master);
-		Response::Paired {
-			name: self.name.clone(),
-		}
-	}
-
 	#[allow(clippy::result_large_err)]
 	pub(crate) fn get_shared_root(
 		&self,
 		workspace: &str,
 	) -> Result<SharedRoot, Response> {
-		self.roots
-			.read()
-			.unwrap_or_else(PoisonError::into_inner)
-			.iter()
-			.find(|r| r.id == workspace)
-			.cloned()
-			.ok_or_else(|| {
-				error(
-					ErrorCode::Forbidden,
-					"that workspace is not shared by this worker".into(),
-				)
-			})
+		SharedRoot::open(workspace).map_err(io_error)
 	}
 
 	#[allow(clippy::result_large_err)]
@@ -798,11 +517,6 @@ impl State {
 			snip_core::browser::inside(&root, path).map_err(io_error)?;
 		Ok((root, resolved))
 	}
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-	a.len() == b.len()
-		&& a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Lists `dir` inside the shared `root`. A symlink to a folder inside the
@@ -894,15 +608,6 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn codes_use_the_unambiguous_alphabet() {
-		let code = new_code();
-		assert_eq!(code.len(), 9);
-		assert!(normalize_code(&code)
-			.bytes()
-			.all(|b| CODE_ALPHABET.contains(&b)));
-	}
-
-	#[test]
 	fn shared_root_id_is_stable_through_a_symlinked_spelling() {
 		let dir = tempfile::tempdir().unwrap();
 		let real = dir.path().join("real");
@@ -919,104 +624,17 @@ mod tests {
 	}
 
 	#[test]
-	fn a_panicking_job_frees_its_connection_slot() {
-		let counter = Arc::new(AtomicUsize::new(1));
-		let slot = ConnSlot(counter.clone());
-		let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-			let _held_slot = slot;
-			let mut buf = Vec::new();
-			let _ = crate::jobs::run_job(
-				&mut buf,
-				Duration::from_secs(1),
-				snip_core::gitrun::CancelToken::new(),
-				|_, _| panic!("simulated job panic"),
-			);
-		}));
-		assert_eq!(counter.load(Ordering::SeqCst), 0);
-	}
-
-	#[test]
-	fn set_roots_removal_cancels_jobs_clears_cache_and_fails_lookup() {
+	fn a_workspace_is_absolute_or_under_home() {
+		assert!(expand_home("relative/dir").is_err());
+		if let Some(home) = home_dir() {
+			assert_eq!(expand_home("~").unwrap(), home);
+			assert_eq!(expand_home("~/a/b").unwrap(), home.join("a/b"));
+		}
 		let dir = tempfile::tempdir().unwrap();
-		let id = Identity::generate().unwrap();
-		let worker = Worker::start(
-			"127.0.0.1:0".parse().unwrap(),
-			&id,
-			WorkerOptions {
-				name: "test-worker".into(),
-				trust_file: None,
-				..Default::default()
-			},
-		)
-		.unwrap();
-		let root_path = dir.path().to_path_buf();
-		let errs = worker.set_roots(std::slice::from_ref(&root_path));
-		assert!(errs.is_empty());
-
-		let roots = worker.roots();
-		assert_eq!(roots.len(), 1);
-		let ws_id = roots[0].id.clone();
-
-		let cancel = snip_core::gitrun::CancelToken::new();
-		let _guard = worker
-			.state
-			.jobs
-			.admit(&ws_id, crate::jobs::JobKind::View, &cancel)
-			.unwrap();
-		assert!(!cancel.is_cancelled());
-
-		let dummy_id = snip_core::workspace::RepoIdentity {
-			toplevel: root_path.clone(),
-			git_dir: root_path.join(".git"),
-			common_dir: root_path.join(".git"),
-			kind: snip_core::workspace::RepoKind::Main,
-		};
-		lock(&worker.state.repo_cache).insert(
-			ws_id.clone(),
-			"repo".into(),
-			dummy_id,
-		);
-		assert!(lock(&worker.state.repo_cache).get(&ws_id, "repo").is_some());
-
-		let hook_runs = Arc::new(AtomicUsize::new(0));
-		let hook_runs_in_hook = hook_runs.clone();
-		let hook_state = worker.state.clone();
-		let hook_ws_id = ws_id.clone();
-		let hook_cancel = cancel.clone();
-		*lock(&worker.state.set_roots_hook) = Some(Box::new(move || {
-			hook_runs_in_hook.fetch_add(1, Ordering::SeqCst);
-			// Security ordering property: the roots swap must be visible to
-			// requests arriving during teardown before existing jobs are cancelled.
-			assert!(
-				hook_state.get_shared_root(&hook_ws_id).is_err(),
-				"roots swap must be visible before cancel_workspaces runs"
-			);
-			assert!(
-				!hook_cancel.is_cancelled(),
-				"job must not be cancelled before cancel_workspaces runs"
-			);
-		}));
-
-		let errs = worker.set_roots(&[]);
-		assert!(errs.is_empty());
-
+		let spelled = dir.path().display().to_string();
 		assert_eq!(
-			hook_runs.load(Ordering::SeqCst),
-			1,
-			"ordering verification hook must run exactly once during root removal"
-		);
-
-		assert!(
-			cancel.is_cancelled(),
-			"job admitted before workspace removal should be cancelled"
-		);
-		assert!(
-			lock(&worker.state.repo_cache).get(&ws_id, "repo").is_none(),
-			"repo_cache should be empty after workspace removal"
-		);
-		assert!(
-			worker.state.get_shared_root(&ws_id).is_err(),
-			"get_shared_root should fail for removed workspace"
+			SharedRoot::open(&spelled).unwrap().path,
+			dunce::canonicalize(dir.path()).unwrap()
 		);
 	}
 }
