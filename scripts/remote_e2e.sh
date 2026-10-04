@@ -170,6 +170,13 @@ printf 'outside\n' > outside-repo/outside.txt
 
 \$G clone --shared outside-repo gitws/borrowed
 
+g_init gitws/mainwt
+printf 'mainwt tracked\n' > gitws/mainwt/tracked.txt
+(cd gitws/mainwt && \$G add tracked.txt && \$G commit -q -m "mainwt commit")
+printf 'mainwt tracked modified\n' > gitws/mainwt/tracked.txt
+printf 'mainwt untracked\n' > gitws/mainwt/untracked.txt
+(cd gitws/mainwt && \$G worktree add -b mainwt-branch ../../outside-mainwt-wt)
+
 g_init outer
 printf 'outer committed\n' > outer/committed.txt
 (cd outer && \$G add committed.txt && \$G commit -q -m "outer commit")
@@ -322,6 +329,18 @@ repos_gitws=$("$SNIP" remote repos 1 gitws)
 check "repos 1 gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
 check "wt, broken, borrowed appear as error rows" test "$(grep -c '^wt	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^borrowed	error: ' <<<"$repos_gitws")" = 1
 check "no error row contains the outside path" test "$(grep -c "outside-repo" <<<"$repos_gitws")" = 0
+
+changes_mainwt=$("$SNIP" remote changes 1 gitws mainwt)
+log_mainwt=$("$SNIP" remote log 1 gitws mainwt)
+all_mainwt="$repos_gitws
+$changes_mainwt
+$log_mainwt"
+check "main repo with a worktree outside the share is served" test "$(grep -c '^mainwt	' <<<"$repos_gitws")" = 1 \
+	-a "$(grep '^mainwt	' <<<"$repos_gitws" | grep -c 'error:')" = 0 \
+	-a "$(grep -c '	tracked.txt$' <<<"$changes_mainwt")" -ge 1 \
+	-a "$(grep -c 'untracked.txt' <<<"$changes_mainwt")" -ge 1 \
+	-a "$(grep -c 'mainwt commit' <<<"$log_mainwt")" -ge 1 \
+	-a "$(grep -c 'outside-mainwt-wt' <<<"$all_mainwt")" = 0
 
 alpha_line=$(grep '^alpha	' <<<"$repos_gitws")
 alpha_counts=$(cut -f3,4,5 <<<"$alpha_line")

@@ -1372,6 +1372,59 @@ mod tests {
 		}
 	}
 
+	fn parse_git_version(output: &str) -> Option<(u32, u32)> {
+		for word in output.split_whitespace() {
+			let trimmed =
+				word.trim_start_matches(|c: char| !c.is_ascii_digit());
+			let mut parts = trimmed.split('.');
+			if let (Some(maj_str), Some(min_str)) = (parts.next(), parts.next())
+			{
+				let maj_digits: String = maj_str
+					.chars()
+					.take_while(|c| c.is_ascii_digit())
+					.collect();
+				let min_digits: String = min_str
+					.chars()
+					.take_while(|c| c.is_ascii_digit())
+					.collect();
+				if let (Ok(major), Ok(minor)) =
+					(maj_digits.parse::<u32>(), min_digits.parse::<u32>())
+				{
+					return Some((major, minor));
+				}
+			}
+		}
+		None
+	}
+
+	fn git_supports_filter_clone() -> bool {
+		let out =
+			match std::process::Command::new("git").arg("--version").output() {
+				Ok(out) if out.status.success() => out,
+				_ => return false,
+			};
+		let text = String::from_utf8_lossy(&out.stdout);
+		match parse_git_version(&text) {
+			Some((major, minor)) => (major, minor) >= (2, 19),
+			None => false,
+		}
+	}
+
+	#[test]
+	fn parse_git_version_examples() {
+		assert_eq!(
+			parse_git_version("git version 2.54.0 (Apple Git-157)"),
+			Some((2, 54))
+		);
+		assert_eq!(
+			parse_git_version("git version 2.45.1.windows.1"),
+			Some((2, 45))
+		);
+		assert_eq!(parse_git_version("git version 2.18.0"), Some((2, 18)));
+		assert_eq!(parse_git_version("git version 1.9.1"), Some((1, 9)));
+		assert_eq!(parse_git_version("garbage"), None);
+	}
+
 	fn run_git(cwd: &Path, args: &[&str]) {
 		let _ = std::fs::create_dir_all(cwd);
 		let out = match std::process::Command::new("git")
@@ -3168,6 +3221,45 @@ mod tests {
 	}
 
 	#[test]
+	fn check_repo_boundary_allows_main_repo_with_worktree_outside() {
+		if !has_git() {
+			return;
+		}
+		let _lock = SERVED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+		let dir = tempfile::tempdir().unwrap();
+		let share = dir.path().join("share");
+		let outside = dir.path().join("outside");
+		std::fs::create_dir_all(&share).unwrap();
+		std::fs::create_dir_all(&outside).unwrap();
+
+		let main_repo = share.join("main");
+		run_git(&main_repo, &["init", "-q", "-b", "main"]);
+		std::fs::write(main_repo.join("f.txt"), "data").unwrap();
+		run_git(&main_repo, &["add", "f.txt"]);
+		run_git(&main_repo, &["commit", "-qm", "init"]);
+
+		let wt = outside.join("wt");
+		run_git(&main_repo, &["worktree", "add", wt.to_str().unwrap()]);
+
+		let opts = RunOptions::default();
+		let git = Git::open_within(&main_repo, &share, &opts).unwrap();
+		let id = check_repo_boundary(&git, &share, &opts).expect(
+			"main repo with outside worktree must pass check_repo_boundary",
+		);
+		assert_eq!(id.kind, RepoKind::Main);
+
+		let read = Read {
+			profile: ReadProfile::Interactive,
+			cancel: None,
+		};
+		let local = LocalRepo::open_within(&main_repo, &share, &read);
+		assert!(
+			local.is_ok(),
+			"expected LocalRepo::open_within Ok, got {local:?}"
+		);
+	}
+
+	#[test]
 	fn open_within_refused_errors_name_no_outside_path() {
 		if !has_git() {
 			return;
@@ -3562,10 +3654,7 @@ mod tests {
 			return;
 		}
 		let _lock = SERVED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-		let check = std::process::Command::new("git")
-			.args(["clone", "--filter=blob:none", "--help"])
-			.output();
-		if check.is_err() || !check.unwrap().status.success() {
+		if !git_supports_filter_clone() {
 			assert!(
 				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
 				"git partial clone is required when SNIP_REQUIRE_ALL_TESTS is set"

@@ -373,6 +373,112 @@ fn worktree_of_an_outside_repo_is_refused() {
 }
 
 #[test]
+fn main_repo_with_worktree_outside_the_share_is_served() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let share = tmp.path().join("share");
+	let outside = tmp.path().join("outside");
+	fs::create_dir_all(&share).unwrap();
+	fs::create_dir_all(&outside).unwrap();
+
+	let main = share.join("main");
+	run_git(&main, &["init", "-b", "main"]);
+	fs::write(main.join("file1.txt"), "v1").unwrap();
+	run_git(&main, &["add", "file1.txt"]);
+	run_git(&main, &["commit", "-m", "commit1"]);
+
+	fs::write(main.join("file2.txt"), "v2").unwrap();
+	run_git(&main, &["add", "file2.txt"]);
+	run_git(&main, &["commit", "-m", "commit2"]);
+
+	fs::write(main.join("file1.txt"), "v1 modified").unwrap();
+	fs::write(main.join("untracked.txt"), "new").unwrap();
+
+	let wt = outside.join("wt");
+	run_git(
+		&main,
+		&["worktree", "add", wt.to_str().unwrap(), "-b", "wt-branch"],
+	);
+
+	let (w, _) = test_worker(&[&share], None);
+	let (client, ws_id) = paired_client(&w);
+
+	let scan = client.scan_repos(&ws_id, None, None).unwrap();
+	assert!(
+		scan.errors.is_empty(),
+		"expected no scan errors, got {:?}",
+		scan.errors
+	);
+	assert_eq!(scan.repos.len(), 1);
+
+	let main_row = scan
+		.repos
+		.iter()
+		.find(|r| r.rel == "main")
+		.expect("main row present");
+	assert!(main_row.summary.is_ok());
+	let summary = main_row.summary.as_ref().unwrap();
+	assert_eq!(summary.changes.unstaged, 1);
+	assert_eq!(summary.changes.untracked, 1);
+	assert!(scan.repos.iter().all(|r| r.summary.is_ok()));
+
+	let json = serde_json::to_string(&scan).unwrap();
+	assert!(!json.contains(&outside.display().to_string()));
+	let canon = dunce::canonicalize(&outside).unwrap();
+	assert!(!json.contains(&canon.display().to_string()));
+
+	let changes_reply = client
+		.git(
+			&ws_id,
+			"main",
+			ReadProfile::Interactive,
+			GitQuery::ChangeList,
+			None,
+		)
+		.unwrap();
+	let changes = match changes_reply {
+		GitReply::ChangeList(cl) => cl,
+		other => panic!("expected ChangeList, got {other:?}"),
+	};
+	assert_eq!(changes.rows.len(), 2);
+	assert!(changes.rows.iter().any(|r| r.path == "file1.txt"));
+	assert!(changes.rows.iter().any(|r| r.path == "untracked.txt"));
+
+	let head = match client
+		.git(
+			&ws_id,
+			"main",
+			ReadProfile::Interactive,
+			GitQuery::ResolveCommit { rev: "HEAD".into() },
+			None,
+		)
+		.unwrap()
+	{
+		GitReply::Commit(sha) => sha,
+		other => panic!("expected Commit, got {other:?}"),
+	};
+
+	let log_reply = client
+		.git(
+			&ws_id,
+			"main",
+			ReadProfile::Interactive,
+			GitQuery::LogFromTips {
+				tips: vec![head],
+				skip: 0,
+				limit: 10,
+			},
+			None,
+		)
+		.unwrap();
+	let commits = match log_reply {
+		GitReply::Log { commits, .. } => commits,
+		other => panic!("expected Log, got {other:?}"),
+	};
+	assert_eq!(commits.len(), 2);
+}
+
+#[test]
 fn gitdir_file_pointing_outside_is_refused() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
