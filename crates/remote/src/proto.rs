@@ -21,12 +21,14 @@ use snip_core::workspace::ScanStatus;
 /// Base protocol, both sides must speak it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Newest protocol this build speaks. 2 = Git views, 3 = copy.
-pub const PROTOCOL_MAX: u32 = 3;
+/// Newest protocol this build speaks. 2 = Git views, 3 = copy, 4 = paste.
+pub const PROTOCOL_MAX: u32 = 4;
 /// The first protocol with Git views.
 pub const GIT_VIEWS_VERSION: u32 = 2;
 /// The first protocol with copy ([`Request::Export`]).
 pub const TRANSFER_VERSION: u32 = 3;
+/// The first protocol with paste ([`Request::ImportPlan`] and the rest).
+pub const PASTE_VERSION: u32 = 4;
 /// Payload bytes one [`Response::Chunk`] carries: JSON escaping can grow
 /// text several times and must stay under [`MAX_FRAME`].
 pub const CHUNK_BYTES: usize = 1024 * 1024;
@@ -34,6 +36,12 @@ pub const GIT_CALL_LIMIT: Duration = Duration::from_secs(90); // > worker job de
 pub const MAX_GIT_CALLS_IN_FLIGHT: usize = 4;
 pub const REMOTE_MAX_LOG_LIMIT: usize = 1_000;
 pub const REMOTE_MAX_TIPS: usize = 50_000;
+
+/// Largest reply JSON a master joins from [`Response::Chunk`] frames. A
+/// paste plan carries every file of a payload of up to
+/// [`snip_core::transfer::CLIPBOARD_PAYLOAD_MAX`], and JSON escaping can
+/// grow text several times.
+pub const JOINED_MAX: usize = 8 * snip_core::transfer::CLIPBOARD_PAYLOAD_MAX;
 
 /// Largest frame either side sends or accepts. A preview is at most 1 MiB
 /// of text, and JSON escaping can grow it several times.
@@ -70,7 +78,8 @@ pub enum Request {
 		workspace: String,
 		path: String,
 	},
-	/// Reserved for the next slices; a worker answers `Unsupported`.
+	/// Never served: a paste plans and writes on the worker as a whole
+	/// ([`Request::ImportApply`]); a worker answers `Unsupported`.
 	Write {
 		workspace: String,
 		path: String,
@@ -107,6 +116,109 @@ pub enum Request {
 		tip: String,
 		selected: Vec<String>,
 	},
+	/// Plans pasting the file payload `text` into the folder `dest` of the
+	/// workspace, as a local paste previews it. Nothing is written.
+	ImportPlan {
+		workspace: String,
+		/// Relative to the workspace; "" is the workspace itself.
+		dest: String,
+		text: String,
+		mapping: PasteMapping,
+	},
+	/// Plans again and writes what the master previewed and the user
+	/// confirmed, or refuses as stale what changed since that preview.
+	ImportApply {
+		workspace: String,
+		dest: String,
+		text: String,
+		mapping: PasteMapping,
+		selection: snip_core::restore::RestoreSelection,
+		expect: ImportExpect,
+	},
+	/// Plans replaying the commit payload `text` onto the repository at
+	/// `dest`. Nothing is written.
+	ReplayPlan {
+		workspace: String,
+		dest: String,
+		text: String,
+	},
+	/// Replays what [`Request::ReplayPlan`] previewed, or refuses as stale.
+	/// `check_only` re-checks without writing.
+	ReplayApply {
+		workspace: String,
+		dest: String,
+		text: String,
+		expect: ReplayExpect,
+		#[serde(default)]
+		check_only: bool,
+	},
+	/// Part of the next request's `text`, which then arrives empty: a
+	/// payload can be larger than one frame.
+	Chunk {
+		data: String,
+	},
+}
+
+/// A paste's routing choices. Entries under `prefix/` of each pair land in
+/// its folder (relative to the workspace); every other entry lands in the
+/// request's `dest`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasteMapping {
+	pub prefixes: Vec<(String, String)>,
+	/// The CLI's `--adjust-paths`: apply the worker's suggested base.
+	#[serde(default)]
+	pub adjust_paths: bool,
+	/// The settings' header format ("" is the default).
+	#[serde(default)]
+	pub header_format: String,
+}
+
+/// What a master previewed: an import Apply refuses when the plan made
+/// again differs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportExpect {
+	/// The worker's digest of the previewed [`snip_core::restore::RestorePlan`].
+	pub digest: String,
+	pub freshness: snip_core::transfer::DestinationFreshnessSnapshot,
+}
+
+/// [`Response::ImportPlanned`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportPlanned {
+	/// Paths in it are the worker's.
+	pub plan: snip_core::transfer::TransferImportPlan,
+	pub digest: String,
+	/// What `snip paste` suggests for the destination folder.
+	pub suggestion: Option<snip_core::restore::RestoreBaseSuggestion>,
+}
+
+impl ImportPlanned {
+	pub fn expect(&self) -> ImportExpect {
+		ImportExpect {
+			digest: self.digest.clone(),
+			freshness: self.plan.destination_freshness().clone(),
+		}
+	}
+}
+
+/// A commit replay preview without its payload, which the master has:
+/// [`snip_core::transfer::CommitReplayPreview::from_parts`] joins them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayExpect {
+	/// The repository's top folder on the worker.
+	pub destination: std::path::PathBuf,
+	pub plan: snip_core::commits::CommitReplayPlan,
+	pub freshness: snip_core::transfer::DestinationFreshnessSnapshot,
+}
+
+impl ReplayExpect {
+	pub fn of(preview: &snip_core::transfer::CommitReplayPreview) -> Self {
+		Self {
+			destination: preview.destination().to_path_buf(),
+			plan: preview.plan().clone(),
+			freshness: preview.freshness().clone(),
+		}
+	}
 }
 
 /// One item to copy: `path` under `root`, both relative to the workspace.
@@ -121,12 +233,38 @@ pub struct ExportTarget {
 }
 
 impl Request {
+	/// The payload text of a paste request.
+	pub fn text(&self) -> Option<&str> {
+		match self {
+			Self::ImportPlan { text, .. }
+			| Self::ImportApply { text, .. }
+			| Self::ReplayPlan { text, .. }
+			| Self::ReplayApply { text, .. } => Some(text),
+			_ => None,
+		}
+	}
+
+	pub fn text_mut(&mut self) -> Option<&mut String> {
+		match self {
+			Self::ImportPlan { text, .. }
+			| Self::ImportApply { text, .. }
+			| Self::ReplayPlan { text, .. }
+			| Self::ReplayApply { text, .. } => Some(text),
+			_ => None,
+		}
+	}
+
 	pub fn needs_version(&self) -> u32 {
 		match self {
 			Self::ScanRepos { .. } | Self::GitView { .. } => GIT_VIEWS_VERSION,
 			Self::Export { .. } | Self::ExportCommits { .. } => {
 				TRANSFER_VERSION
 			}
+			Self::ImportPlan { .. }
+			| Self::ImportApply { .. }
+			| Self::ReplayPlan { .. }
+			| Self::ReplayApply { .. }
+			| Self::Chunk { .. } => PASTE_VERSION,
 			_ => 1,
 		}
 	}
@@ -208,10 +346,19 @@ pub enum Response {
 	Copied(snip_core::transfer::CopyOutcome),
 	CommitsCopied(snip_core::commits::CommitCopyOutcome),
 	/// Part of the next `Copied` / `CommitsCopied` text, which then
-	/// arrives with that text empty.
+	/// arrives with that text empty; or, ended by [`Response::Joined`],
+	/// part of the JSON of a reply too large for one frame.
 	Chunk {
 		data: String,
 	},
+	/// The chunks since the last reply are one reply's JSON.
+	Joined,
+	ImportPlanned(ImportPlanned),
+	Imported(snip_core::restore::RestoreExecutionResult),
+	ReplayPlanned(ReplayExpect),
+	Replayed(snip_core::commits::ReplayResult),
+	/// A `check_only` replay found nothing changed.
+	Fresh,
 	Error {
 		code: ErrorCode,
 		message: String,
@@ -320,6 +467,11 @@ pub enum ErrorCode {
 	Cancelled,
 	/// Repository escapes shared boundary.
 	OutsideShare,
+	/// The paste destination changed since the preview; the message is
+	/// the local paste's wording.
+	Stale,
+	/// Two entries of a paste land on one file.
+	Collision,
 }
 
 pub fn write_frame<T: Serialize>(
@@ -336,6 +488,44 @@ pub fn write_frame<T: Serialize>(
 	w.write_all(&(bytes.len() as u32).to_be_bytes())?;
 	w.write_all(&bytes)?;
 	w.flush()
+}
+
+/// Splits `text` into pieces of at most [`CHUNK_BYTES`] on char boundaries.
+pub(crate) fn chunks(text: &str) -> impl Iterator<Item = &str> {
+	let mut rest = text;
+	std::iter::from_fn(move || {
+		if rest.is_empty() {
+			return None;
+		}
+		let mut end = rest.len().min(CHUNK_BYTES);
+		while !rest.is_char_boundary(end) {
+			end -= 1;
+		}
+		let (head, tail) = rest.split_at(end);
+		rest = tail;
+		Some(head)
+	})
+}
+
+/// Writes `request`; a paste's text larger than one chunk goes ahead in
+/// [`Request::Chunk`] frames and the request itself carries none.
+pub fn write_request(w: &mut impl Write, request: &Request) -> io::Result<()> {
+	let Some(text) = request.text().filter(|t| t.len() > CHUNK_BYTES) else {
+		return write_frame(w, request);
+	};
+	for data in chunks(text) {
+		write_frame(
+			w,
+			&Request::Chunk {
+				data: data.to_string(),
+			},
+		)?;
+	}
+	let mut bare = request.clone();
+	if let Some(t) = bare.text_mut() {
+		t.clear();
+	}
+	write_frame(w, &bare)
 }
 
 /// `Ok(None)` on a clean end of stream before a frame starts.
@@ -822,6 +1012,25 @@ mod tests {
 		];
 		for req in &v1_requests {
 			assert_eq!(req.needs_version(), 1);
+		}
+
+		let v4_requests = [
+			Request::ImportPlan {
+				workspace: "w".into(),
+				dest: "".into(),
+				text: "t".into(),
+				mapping: PasteMapping::default(),
+			},
+			Request::ReplayPlan {
+				workspace: "w".into(),
+				dest: "repo".into(),
+				text: "t".into(),
+			},
+			Request::Chunk { data: "d".into() },
+		];
+		for req in &v4_requests {
+			assert_eq!(req.needs_version(), PASTE_VERSION);
+			round_trip_check(req);
 		}
 	}
 

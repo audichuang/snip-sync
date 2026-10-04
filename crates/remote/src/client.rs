@@ -24,9 +24,10 @@ use snip_core::commits::CommitCopyOutcome;
 use snip_core::transfer::CopyOutcome;
 
 use crate::proto::{
-	read_frame, write_frame, DirEntry, ErrorCode, ExportTarget, GitQuery,
-	GitReply, RemoteWorkspace, RepoScan, Request, Response, Stat,
-	GIT_CALL_LIMIT, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
+	read_frame, write_request, DirEntry, ErrorCode, ExportTarget, GitQuery,
+	GitReply, ImportExpect, ImportPlanned, PasteMapping, RemoteWorkspace,
+	ReplayExpect, RepoScan, Request, Response, Stat, GIT_CALL_LIMIT,
+	JOINED_MAX, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::worker::{Worker, PREAMBLE};
 use crate::RemoteError;
@@ -45,6 +46,10 @@ const MAX_STDERR: usize = 8 * 1024;
 /// Idle connections kept per worker: each is an ssh process.
 const POOL: usize = 2;
 pub const CALL_LIMIT_DEFAULT: Duration = Duration::from_secs(30);
+/// A paste Apply: longer than the worker's own deadline for it, so the
+/// master always hears how the write ended.
+pub const APPLY_CALL_LIMIT: Duration =
+	Duration::from_secs(crate::jobs::APPLY_DEADLINE.as_secs() + 60);
 
 /// How a master reaches a worker.
 #[derive(Clone)]
@@ -118,7 +123,7 @@ pub(crate) trait FrameIo {
 /// A plain stream has no deadline; tests feed one frames from memory.
 impl<S: IoRead + IoWrite> FrameIo for S {
 	fn send(&mut self, request: &Request) -> io::Result<()> {
-		write_frame(self, request)
+		write_request(self, request)
 	}
 
 	fn recv(&mut self, _: Duration) -> Result<Option<Response>, RemoteError> {
@@ -269,7 +274,7 @@ impl Connection {
 
 impl FrameIo for Connection {
 	fn send(&mut self, request: &Request) -> io::Result<()> {
-		write_frame(&mut self.writer, request)
+		write_request(&mut self.writer, request)
 	}
 
 	fn recv(
@@ -430,28 +435,56 @@ pub(crate) fn exchange(
 	*frames = 0;
 	io.send(request)?;
 	let started = Instant::now();
-	// A copy's text arriving ahead of its reply.
+	// A copy's text, or a large reply's JSON, arriving ahead of it.
 	let mut text = String::new();
+	let over_clipboard = |text: &str| {
+		(text.len() > snip_core::transfer::CLIPBOARD_PAYLOAD_MAX).then(|| {
+			RemoteError::Protocol(
+				"the copied text is over the clipboard limit".into(),
+			)
+		})
+	};
 	loop {
 		match io.recv(IO_TIMEOUT)? {
 			Some(Response::Chunk { data }) => {
 				*frames += 1;
-				if text.len() + data.len()
-					> snip_core::transfer::CLIPBOARD_PAYLOAD_MAX
-				{
+				if text.len() + data.len() > JOINED_MAX {
 					return Err(RemoteError::Protocol(
-						"the copied text is over the clipboard limit".into(),
+						"the worker's reply is too large".into(),
 					));
 				}
 				text.push_str(&data);
 			}
+			Some(Response::Joined) => {
+				*frames += 1;
+				return match serde_json::from_str::<Response>(&text) {
+					Ok(Response::Error { code, message }) => {
+						Err(RemoteError::Refused { code, message })
+					}
+					Ok(
+						Response::Chunk { .. }
+						| Response::Joined
+						| Response::Pending,
+					)
+					| Err(_) => Err(RemoteError::Protocol(
+						"the worker's chunked reply is not valid".into(),
+					)),
+					Ok(response) => Ok(response),
+				};
+			}
 			Some(Response::Copied(mut out)) if !text.is_empty() => {
 				*frames += 1;
+				if let Some(err) = over_clipboard(&text) {
+					return Err(err);
+				}
 				out.payload = text;
 				return Ok(Response::Copied(out));
 			}
 			Some(Response::CommitsCopied(mut out)) if !text.is_empty() => {
 				*frames += 1;
+				if let Some(err) = over_clipboard(&text) {
+					return Err(err);
+				}
 				out.text = text;
 				return Ok(Response::CommitsCopied(out));
 			}
@@ -625,6 +658,19 @@ impl Client {
 				| Request::GitView { .. }
 				| Request::Export { .. }
 				| Request::ExportCommits { .. }
+				| Request::ImportPlan { .. }
+				| Request::ImportApply { .. }
+				| Request::ReplayPlan { .. }
+				| Request::ReplayApply { .. }
+		);
+		// A write is never sent twice, even when the first send seemed lost.
+		let writes = matches!(
+			request,
+			Request::ImportApply { .. }
+				| Request::ReplayApply {
+					check_only: false,
+					..
+				}
 		);
 		let _guard = if is_git {
 			Some(self.limiter.acquire(cancel, limit)?)
@@ -666,7 +712,7 @@ impl Client {
 		let mut result = conn.call(request, cancel, remaining);
 
 		if let Err(ref err) = result {
-			if should_resend(reused, conn.frames_seen, err) {
+			if !writes && should_resend(reused, conn.frames_seen, err) {
 				let remaining_retry = limit.saturating_sub(start.elapsed());
 				if remaining_retry.is_zero() {
 					return Err(RemoteError::TimedOut);
@@ -723,6 +769,115 @@ impl Client {
 		};
 		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
 			Response::CommitsCopied(out) => Ok(out),
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Plans pasting the file payload `text` into the folder `dest`
+	/// (relative to the workspace) on the worker. Nothing is written.
+	pub fn import_plan(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		cancel: Option<&CancelToken>,
+	) -> Result<ImportPlanned, RemoteError> {
+		let req = Request::ImportPlan {
+			workspace: workspace.into(),
+			dest: dest.into(),
+			text: text.into(),
+			mapping: mapping.clone(),
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::ImportPlanned(planned) => Ok(planned),
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Writes what [`Self::import_plan`] previewed, as `selection` confirms,
+	/// or refuses ([`ErrorCode::Stale`]) when the destination changed.
+	#[allow(clippy::too_many_arguments)]
+	pub fn import_apply(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		selection: &snip_core::restore::RestoreSelection,
+		expect: &ImportExpect,
+		cancel: Option<&CancelToken>,
+	) -> Result<snip_core::restore::RestoreExecutionResult, RemoteError> {
+		let req = Request::ImportApply {
+			workspace: workspace.into(),
+			dest: dest.into(),
+			text: text.into(),
+			mapping: mapping.clone(),
+			selection: selection.clone(),
+			expect: expect.clone(),
+		};
+		match self.call_with(&req, cancel, APPLY_CALL_LIMIT)? {
+			Response::Imported(result) => Ok(result),
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Plans replaying the commit payload `text` onto the repository at
+	/// `dest`: the preview, put back together with the payload the caller
+	/// already parsed.
+	pub fn replay_plan(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		payload: snip_core::commits::CommitsPayload,
+		cancel: Option<&CancelToken>,
+	) -> Result<snip_core::transfer::CommitReplayPreview, RemoteError> {
+		let req = Request::ReplayPlan {
+			workspace: workspace.into(),
+			dest: dest.into(),
+			text: text.into(),
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::ReplayPlanned(e) => {
+				Ok(snip_core::transfer::CommitReplayPreview::from_parts(
+					e.destination,
+					payload,
+					e.plan,
+					e.freshness,
+				))
+			}
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Replays what [`Self::replay_plan`] previewed, or refuses
+	/// ([`ErrorCode::Stale`]) when the repository changed. With
+	/// `check_only`, only re-checks and answers `None`.
+	pub fn replay_apply(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		preview: &snip_core::transfer::CommitReplayPreview,
+		check_only: bool,
+		cancel: Option<&CancelToken>,
+	) -> Result<Option<snip_core::commits::ReplayResult>, RemoteError> {
+		let req = Request::ReplayApply {
+			workspace: workspace.into(),
+			dest: dest.into(),
+			text: text.into(),
+			expect: ReplayExpect::of(preview),
+			check_only,
+		};
+		let limit = if check_only {
+			GIT_CALL_LIMIT
+		} else {
+			APPLY_CALL_LIMIT
+		};
+		match self.call_with(&req, cancel, limit)? {
+			Response::Replayed(result) if !check_only => Ok(Some(result)),
+			Response::Fresh if check_only => Ok(None),
 			_ => Err(unexpected()),
 		}
 	}
@@ -1145,6 +1300,7 @@ impl From<RemoteError> for GitError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::proto::write_frame;
 
 	fn timeout_scale() -> u32 {
 		std::env::var("SNIP_E2E_TIMEOUT_SCALE")

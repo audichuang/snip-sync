@@ -3983,12 +3983,15 @@ mod wire_tests {
 		let payload = "// File: a.txt\nnew\n\n// File: b.txt\nb\n";
 		let mapping =
 			ImportMapping::with_primary(CanonicalRootId::new(&root).unwrap());
-		let plan = plan_import(payload, "", &[root.clone()], &mapping).unwrap();
+		let plan =
+			plan_import(payload, "", std::slice::from_ref(&root), &mapping)
+				.unwrap();
 		assert_eq!(plan.create_operations().len(), 2);
 		let json = serde_json::to_string(&plan).unwrap();
 		let back: TransferImportPlan = serde_json::from_str(&json).unwrap();
 		assert_eq!(back, plan);
-		let fresh = serde_json::to_string(plan.destination_freshness()).unwrap();
+		let fresh =
+			serde_json::to_string(plan.destination_freshness()).unwrap();
 		let back: DestinationFreshnessSnapshot =
 			serde_json::from_str(&fresh).unwrap();
 		assert_eq!(&back, plan.destination_freshness());

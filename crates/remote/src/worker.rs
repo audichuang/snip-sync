@@ -257,12 +257,53 @@ fn serve(
 			max_version: Some(negotiated),
 		},
 	)?;
+	// A paste's text arriving ahead of its request.
+	let mut pending = String::new();
+	let mut overflow = false;
 	while !state.stop.load(Ordering::SeqCst) {
-		let Some(request) = read_frame::<Request>(&mut reader)? else {
+		let Some(mut request) = read_frame::<Request>(&mut reader)? else {
 			return Ok(());
 		};
 		if state.stop.load(Ordering::SeqCst) {
 			return Ok(());
+		}
+		if let Request::Chunk { data } = request {
+			if overflow
+				|| pending.len() + data.len()
+					> snip_core::transfer::CLIPBOARD_PAYLOAD_MAX
+			{
+				overflow = true;
+				pending = String::new();
+			} else {
+				pending.push_str(&data);
+			}
+			continue;
+		}
+		let joined = std::mem::take(&mut pending);
+		if std::mem::replace(&mut overflow, false) {
+			crate::jobs::write_response(
+				&mut writer,
+				&error(
+					ErrorCode::TooLarge,
+					"the pasted text is over the clipboard limit".into(),
+				),
+			)?;
+			continue;
+		}
+		if !joined.is_empty() {
+			match request.text_mut() {
+				Some(text) if text.is_empty() => *text = joined,
+				_ => {
+					crate::jobs::write_response(
+						&mut writer,
+						&error(
+							ErrorCode::BadRequest,
+							"text chunks must precede a paste request".into(),
+						),
+					)?;
+					continue;
+				}
+			}
 		}
 		match request {
 			Request::ScanRepos { workspace, under } => {
@@ -388,6 +429,7 @@ fn serve(
 					state,
 					negotiated,
 					&workspace,
+					Job::Copy,
 					|root, cancel| {
 						crate::copyserve::export(
 							root, items, &settings, file_limit, cancel,
@@ -406,9 +448,94 @@ fn serve(
 					state,
 					negotiated,
 					&workspace,
+					Job::Copy,
 					|root, cancel| {
 						crate::copyserve::export_commits(
 							root, &repo, &tip, &selected, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ImportPlan {
+				workspace,
+				dest,
+				text,
+				mapping,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					|root, cancel| {
+						crate::pasteserve::import_plan(
+							root, &dest, &text, &mapping, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ImportApply {
+				workspace,
+				dest,
+				text,
+				mapping,
+				selection,
+				expect,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PasteApply,
+					|root, cancel| {
+						crate::pasteserve::import_apply(
+							root, &dest, &text, &mapping, &selection, &expect,
+							cancel,
+						)
+					},
+				)?;
+			}
+			Request::ReplayPlan {
+				workspace,
+				dest,
+				text,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					|root, cancel| {
+						crate::pasteserve::replay_plan(
+							root, &dest, &text, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ReplayApply {
+				workspace,
+				dest,
+				text,
+				expect,
+				check_only,
+			} => {
+				let job = if check_only {
+					Job::PastePlan
+				} else {
+					Job::PasteApply
+				};
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					job,
+					|root, cancel| {
+						crate::pasteserve::replay_apply(
+							root, &dest, &text, expect, check_only, cancel,
 						)
 					},
 				)?;
@@ -422,26 +549,49 @@ fn serve(
 	Ok(())
 }
 
-/// Runs a copy as a job of `workspace`, as Git views run.
+/// What a copy or paste job is, for its protocol and deadline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Job {
+	Copy,
+	/// Reads only: a preview, or a re-check.
+	PastePlan,
+	/// Writes. Its deadline is long: a write cannot be cancelled midway, and
+	/// a master must hear how it ended rather than a time-out.
+	PasteApply,
+}
+
+/// Runs a copy or paste as a job of `workspace`, as Git views run.
 fn serve_copy(
 	writer: &mut impl Write,
 	state: &State,
 	negotiated: u32,
 	workspace: &str,
+	job: Job,
 	op: impl FnOnce(&SharedRoot, &snip_core::gitrun::CancelToken) -> Response + Send,
 ) -> io::Result<()> {
-	if negotiated < crate::proto::TRANSFER_VERSION {
+	let (need, what) = match job {
+		Job::Copy => (crate::proto::TRANSFER_VERSION, "copy"),
+		Job::PastePlan | Job::PasteApply => {
+			(crate::proto::PASTE_VERSION, "paste")
+		}
+	};
+	if negotiated < need {
 		return crate::jobs::write_response(
 			writer,
 			&error(
 				ErrorCode::Unsupported,
-				"copy is not available on this worker yet".into(),
+				format!("{what} is not available on this worker yet"),
 			),
 		);
 	}
 	let (view_deadline, _) = *lock(&state.deadlines);
+	let deadline = if job == Job::PasteApply {
+		crate::jobs::APPLY_DEADLINE.max(view_deadline)
+	} else {
+		view_deadline
+	};
 	let cancel = snip_core::gitrun::CancelToken::new();
-	crate::jobs::run_job(writer, view_deadline, cancel, |job_cancel, _| {
+	crate::jobs::run_job(writer, deadline, cancel, |job_cancel, _| {
 		match state.jobs.admit(
 			workspace,
 			crate::jobs::JobKind::View,
@@ -453,7 +603,12 @@ fn serve_copy(
 					Err(resp) => return resp,
 				};
 				let reply = op(&root, job_cancel);
-				verify_root_unchanged(state, workspace, &root, reply)
+				if job == Job::PasteApply {
+					// Whatever was written is reported as it is.
+					reply
+				} else {
+					verify_root_unchanged(state, workspace, &root, reply)
+				}
 			}
 			Err(code) => map_admit_error(code),
 		}
@@ -560,9 +715,15 @@ impl State {
 					"Git views are not available on this worker yet".into(),
 				)
 			}
-			Request::Export { .. } | Request::ExportCommits { .. } => error(
+			Request::Export { .. }
+			| Request::ExportCommits { .. }
+			| Request::ImportPlan { .. }
+			| Request::ImportApply { .. }
+			| Request::ReplayPlan { .. }
+			| Request::ReplayApply { .. }
+			| Request::Chunk { .. } => error(
 				ErrorCode::BadRequest,
-				"copy requests are served as jobs".into(),
+				"copy and paste requests are served as jobs".into(),
 			),
 			Request::Write { .. } | Request::Rename { .. } => error(
 				ErrorCode::Unsupported,

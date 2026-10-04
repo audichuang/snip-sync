@@ -19,14 +19,16 @@ pub mod client;
 pub(crate) mod copyserve;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;
+pub(crate) mod pasteserve;
 pub mod proto;
 pub mod ssh;
 pub mod worker;
 
 pub use client::{Client, Connection, RemoteHost, RemoteRepo, Transport};
 pub use proto::{
-	DirEntry, ErrorCode, ExportTarget, GitQuery, GitReply, RemoteWorkspace,
-	RepoScan, Request, Response, ScannedRepo, PROTOCOL_MAX,
+	DirEntry, ErrorCode, ExportTarget, GitQuery, GitReply, ImportExpect,
+	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,
+	Request, Response, ScannedRepo, PROTOCOL_MAX,
 };
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
 

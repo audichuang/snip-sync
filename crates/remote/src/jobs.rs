@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use snip_core::gitrun::CancelToken;
 
-use crate::proto::{write_frame, ErrorCode, Response, CHUNK_BYTES};
+use crate::proto::{chunks, write_frame, ErrorCode, Response, CHUNK_BYTES};
 
 pub(crate) const MAX_GIT_JOBS: usize = 2; // running GitView/ScanRepos at once
 pub(crate) const MAX_SCAN_JOBS: usize = 1; // of those, scans
@@ -17,6 +17,9 @@ pub(crate) const ADMIT_WAIT: Duration = Duration::from_secs(10);
 pub(crate) const VIEW_DEADLINE: Duration = Duration::from_secs(60);
 pub(crate) const SCAN_DEADLINE: Duration = Duration::from_secs(75);
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(1);
+/// A paste Apply: writes are not cancelled midway, so this only stops a
+/// worker that hangs. A master waits longer ([`crate::client`]).
+pub(crate) const APPLY_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,27 +241,28 @@ impl Jobs {
 	}
 }
 
-/// Splits `text` into pieces of at most [`CHUNK_BYTES`] on char boundaries.
-fn chunks(text: &str) -> impl Iterator<Item = &str> {
-	let mut rest = text;
-	std::iter::from_fn(move || {
-		if rest.is_empty() {
-			return None;
-		}
-		let mut end = rest.len().min(CHUNK_BYTES);
-		while !rest.is_char_boundary(end) {
-			end -= 1;
-		}
-		let (head, tail) = rest.split_at(end);
-		rest = tail;
-		Some(head)
-	})
-}
-
 pub(crate) fn write_response<W: Write>(
 	w: &mut W,
 	response: &Response,
 ) -> io::Result<()> {
+	// A paste plan carries file bodies: its whole JSON goes in chunks.
+	if matches!(
+		response,
+		Response::ImportPlanned(_) | Response::ReplayPlanned(_)
+	) {
+		let json = serde_json::to_string(response).map_err(io::Error::other)?;
+		if json.len() > CHUNK_BYTES {
+			for data in chunks(&json) {
+				write_frame(
+					w,
+					&Response::Chunk {
+						data: data.to_string(),
+					},
+				)?;
+			}
+			return write_frame(w, &Response::Joined);
+		}
+	}
 	// A copy's text goes ahead in chunks; the reply itself carries none.
 	let text = match response {
 		Response::Copied(out) => Some(out.payload.as_str()),
