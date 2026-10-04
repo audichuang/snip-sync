@@ -328,6 +328,24 @@ impl WorkbenchModel {
 							.text_color(rgb(pal().text_muted))
 							.child(t("workspace_closed", loc)),
 					)
+					// A remote folder that failed to open, the one reconnected
+					// to on launch included.
+					.when_some(
+						self.remote.message.as_ref().filter(|(ok, _)| !ok),
+						|d, (_, text)| {
+							d.child(
+								div()
+									.id("workspace-closed-remote-error")
+									.relative()
+									.text_color(rgb(pal().error))
+									.child(text.clone())
+									.children(probe(
+										&self.probes,
+										"workspace-closed-remote-error",
+									)),
+							)
+						},
+					)
 					.child(
 						button(
 							"btn-welcome-open-folder",

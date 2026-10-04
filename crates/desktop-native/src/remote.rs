@@ -62,6 +62,43 @@ pub(crate) fn remember_recent(
 	}
 }
 
+/// Names the remote folder that was the last workspace open; absent when
+/// the last one was local.
+const LAST_FILE: &str = "remote-last.json";
+
+fn last_file() -> Option<PathBuf> {
+	Some(crate::recent::config_dir()?.join(LAST_FILE))
+}
+
+/// The remote folder to reconnect to on launch: the last workspace open,
+/// when it was remote. None without a config folder.
+pub fn load_last() -> Option<RecentRemote> {
+	last_file().and_then(|f| load_last_from(&f))
+}
+
+/// Records the workspace just opened: `Some` for a remote folder, `None`
+/// for a local one. A failed write only loses the reconnect.
+pub(crate) fn remember_last(last: Option<&RecentRemote>) {
+	if let Some(f) = last_file() {
+		save_last_to(&f, last);
+	}
+}
+
+fn load_last_from(f: &Path) -> Option<RecentRemote> {
+	snip_remote::load_json(f)
+}
+
+fn save_last_to(f: &Path, last: Option<&RecentRemote>) {
+	match last {
+		Some(last) => {
+			let _ = snip_remote::save_json(f, last);
+		}
+		None => {
+			let _ = std::fs::remove_file(f);
+		}
+	}
+}
+
 /// The hosts of `~/.ssh/config`, reached through ssh.
 pub fn load_hosts() -> Vec<RemoteHost> {
 	snip_remote::ssh::config_hosts()
@@ -673,6 +710,9 @@ impl WorkbenchModel {
 					}
 					Err(err) => {
 						app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
+						// Also on the status bar: a reconnect on launch runs
+						// with the menu closed.
+						this.set_status("remote_open_failed", [err.clone()]);
 						this.remote_note(false, err, cx);
 					}
 				}
@@ -695,14 +735,40 @@ impl WorkbenchModel {
 		let Some(recent) = self.remote.recent.get(n).cloned() else {
 			return;
 		};
-		match self.remote.hosts.iter().position(|h| h.name == recent.host) {
-			Some(idx) => self.open_remote_path(idx, recent.path, cx),
+		self.open_remote_folder(recent, cx);
+	}
+
+	/// Launched without `--workspace` after a remote workspace was the last
+	/// one open: reconnects to it in the background. A failure leaves the
+	/// app with no workspace and says why.
+	pub fn reopen_last_remote(
+		&mut self,
+		last: RecentRemote,
+		cx: &mut Context<Self>,
+	) {
+		app_log!("[APP:REMOTE_REOPEN: host={} path={}]", last.host, last.path);
+		self.set_status(
+			"remote_reconnecting",
+			[format!("{} ▸ {}", last.host, last.path)],
+		);
+		self.open_remote_folder(last, cx);
+	}
+
+	/// Opens `folder` on its host from `~/.ssh/config`.
+	fn open_remote_folder(
+		&mut self,
+		folder: RecentRemote,
+		cx: &mut Context<Self>,
+	) {
+		match self.remote.hosts.iter().position(|h| h.name == folder.host) {
+			Some(idx) => self.open_remote_path(idx, folder.path, cx),
 			None => {
 				let text = crate::i18n::tf(
 					"remote_host_missing",
 					self.locale,
-					&[&recent.host],
+					&[&folder.host],
 				);
+				self.status = Msg::new("remote_open_failed", [text.clone()]);
 				self.remote_note(false, text, cx);
 			}
 		}
@@ -716,6 +782,7 @@ impl WorkbenchModel {
 	) {
 		self.release_workspace_state(cx);
 		remember_recent(&mut self.remote.recent, &host.name, &workspace.id);
+		remember_last(self.remote.recent.first());
 		let session = RemoteSession::new(host, workspace);
 		let root = session.root.clone();
 		let label = session.label();
@@ -911,6 +978,24 @@ mod tests {
 		remember_recent(&mut list, "other", "/p5");
 		assert_eq!(list[0].host, "other");
 		assert_eq!(list[1].host, "h");
+	}
+
+	#[test]
+	fn last_remote_workspace_round_trips_and_a_local_one_clears_it() {
+		assert_eq!(load_last(), None, "no config folder under cfg(test)");
+		let tmp = tempfile::tempdir().unwrap();
+		let f = tmp.path().join("cfg").join(LAST_FILE);
+		assert_eq!(load_last_from(&f), None);
+		let last = RecentRemote {
+			host: "macmini".into(),
+			path: "/Users/x/ck/cat".into(),
+		};
+		save_last_to(&f, Some(&last));
+		assert_eq!(load_last_from(&f), Some(last));
+		save_last_to(&f, None);
+		assert!(!f.exists());
+		assert_eq!(load_last_from(&f), None);
+		save_last_to(&f, None);
 	}
 
 	#[test]

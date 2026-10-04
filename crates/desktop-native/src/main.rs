@@ -1236,6 +1236,7 @@ impl WorkbenchModel {
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
+			remote::remember_last(None);
 			model.reload_repos(cx);
 		}
 		model
@@ -2299,6 +2300,7 @@ impl WorkbenchModel {
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
 		recent::remember(&mut self.recent_workspaces, &path);
+		remote::remember_last(None);
 		self.workspace_open = true;
 		self.workspace_menu = false;
 		self.workspace_picker = false;
@@ -5130,19 +5132,65 @@ fn read_preview(
 	}
 }
 
-/// `--workspace`, else the last remembered workspace (IntelliJ reopens the
-/// last project), else the launch folder. A Finder or Explorer launch starts
-/// in `/` or the home folder: that opens nothing rather than scanning it.
-fn startup_workspace(arg: Option<PathBuf>) -> Option<PathBuf> {
+/// What the app opens when it starts.
+#[derive(Debug, PartialEq, Eq)]
+enum Startup {
+	Local(PathBuf),
+	/// Reconnected in the background once the window is up.
+	Remote(remote::RecentRemote),
+	Nothing,
+}
+
+impl Startup {
+	fn local(self) -> Option<PathBuf> {
+		match self {
+			Startup::Local(path) => Some(path),
+			_ => None,
+		}
+	}
+}
+
+/// `--workspace`, else the last workspace open when it was remote, else the
+/// last remembered local one (IntelliJ reopens the last project), else the
+/// launch folder. A Finder or Explorer launch starts in `/` or the home
+/// folder: that opens nothing rather than scanning it.
+fn startup_choice(
+	arg: Option<PathBuf>,
+	last_remote: Option<remote::RecentRemote>,
+	last_local: Option<PathBuf>,
+	cwd: Option<PathBuf>,
+	home: Option<PathBuf>,
+) -> Startup {
+	if let Some(arg) = arg {
+		return Startup::Local(arg);
+	}
+	if let Some(last) = last_remote {
+		return Startup::Remote(last);
+	}
+	if let Some(last) = last_local {
+		return Startup::Local(last);
+	}
+	match cwd {
+		Some(cwd) if cwd.parent().is_some() && Some(&cwd) != home.as_ref() => {
+			Startup::Local(cwd)
+		}
+		_ => Startup::Nothing,
+	}
+}
+
+/// [`startup_choice`] on the remembered workspaces; nothing is read under
+/// `cfg(test)` or in an e2e run without `SNIP_CONFIG_DIR`.
+fn startup_workspace(arg: Option<PathBuf>) -> Startup {
 	if arg.is_some() {
-		return arg;
+		return startup_choice(arg, None, None, None, None);
 	}
-	if let Some(last) = recent::load().into_iter().next() {
-		return Some(last);
-	}
-	let cwd = std::env::current_dir().ok()?;
-	(cwd.parent().is_some() && Some(&cwd) != recent::home().as_ref())
-		.then_some(cwd)
+	startup_choice(
+		None,
+		remote::load_last(),
+		recent::load().into_iter().next(),
+		std::env::current_dir().ok(),
+		recent::home(),
+	)
 }
 
 type CliArgs = (Option<PathBuf>, String, Option<PathBuf>);
@@ -5324,7 +5372,10 @@ fn key_bindings() -> Vec<KeyBinding> {
 
 fn main() {
 	let (workspace, mode, restore_dir) = parse_cli_args();
-	let workspace = startup_workspace(workspace);
+	let (workspace, reconnect) = match startup_workspace(workspace) {
+		Startup::Remote(last) if mode == "normal" => (None, Some(last)),
+		other => (other.local(), None),
+	};
 	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
@@ -5333,6 +5384,7 @@ fn main() {
 
 		let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
 		let ws = workspace.clone();
+		let last_remote = reconnect.clone();
 		let app_mode = mode.clone();
 		let paste_dir = restore_dir.clone();
 
@@ -5361,6 +5413,9 @@ fn main() {
 				}
 				let model = cx
 					.new(|cx| WorkbenchModel::new(ws, paste_dir, app_mode, cx));
+				if let Some(last) = last_remote {
+					model.update(cx, |m, cx| m.reopen_last_remote(last, cx));
+				}
 				let fh = model.read(cx).focus_handle.clone();
 				window.focus(&fh);
 				let close_target = model.clone();
@@ -5382,6 +5437,48 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+	/// `--workspace` wins; then the last workspace open when it was remote;
+	/// then the last local one; then a launch folder other than `/` or home.
+	#[test]
+	fn startup_reconnects_the_last_remote_workspace_unless_told_otherwise() {
+		use super::{startup_choice, startup_workspace, Startup};
+		use crate::remote::RecentRemote;
+		use std::path::PathBuf;
+		let last = || {
+			Some(RecentRemote {
+				host: "macmini".into(),
+				path: "/Users/x/ck/cat".into(),
+			})
+		};
+		let p = |s: &str| Some(PathBuf::from(s));
+		assert_eq!(
+			startup_choice(p("/arg"), last(), p("/local"), p("/cwd"), None),
+			Startup::Local(PathBuf::from("/arg"))
+		);
+		assert_eq!(
+			startup_choice(None, last(), p("/local"), p("/cwd"), None),
+			Startup::Remote(last().unwrap())
+		);
+		assert_eq!(
+			startup_choice(None, None, p("/local"), p("/cwd"), None),
+			Startup::Local(PathBuf::from("/local"))
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/home/u/w"), p("/home/u")),
+			Startup::Local(PathBuf::from("/home/u/w"))
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/home/u"), p("/home/u")),
+			Startup::Nothing
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/"), None),
+			Startup::Nothing
+		);
+		// Nothing remembered is read under cfg(test).
+		assert!(!matches!(startup_workspace(None), Startup::Remote(_)));
+	}
+
 	/// UI state driven in-process: no display, so these also run in the
 	/// Windows and macOS Test jobs, which have no real-app GUI test.
 	mod in_process {
@@ -5923,6 +6020,74 @@ mod tests {
 				let session = m.remote.session.as_ref().expect("reopened");
 				assert_eq!(session.workspace.id, shared_id);
 				assert_eq!(m.remote.recent.len(), 1);
+			});
+		}
+
+		/// The launch reconnect: the last remote workspace opens in the
+		/// background; a folder or host that is gone leaves the app with no
+		/// workspace and says why, on the status bar and the empty screen.
+		#[gpui::test]
+		fn launch_reconnects_the_last_remote_workspace_or_says_why_not(
+			cx: &mut TestAppContext,
+		) {
+			use crate::remote::RecentRemote;
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let id = dunce::canonicalize(tmp.path())
+				.unwrap()
+				.display()
+				.to_string();
+			let (model, cx) = remote_menu(cx);
+			let host = model.update(cx, |m, _| {
+				m.workspace_menu = false;
+				m.remote.hosts[0].name.clone()
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: "gone-host".into(),
+						path: id.clone(),
+					},
+					cx,
+				);
+				assert_eq!(m.status.key, "remote_open_failed");
+				assert!(!m.workspace_open && !m.remote.busy);
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: host.clone(),
+						path: format!("{id}/missing"),
+					},
+					cx,
+				);
+				assert_eq!(m.status.key, "remote_reconnecting");
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "remote_open_failed");
+				assert!(!m.workspace_open && m.remote.session.is_none());
+				assert!(matches!(m.remote.message, Some((false, _))));
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: host.clone(),
+						path: id.clone(),
+					},
+					cx,
+				);
+			});
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("reconnected");
+				assert_eq!(session.workspace.id, id);
+				assert!(m.workspace_open);
 			});
 		}
 
