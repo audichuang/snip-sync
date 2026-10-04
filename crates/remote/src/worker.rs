@@ -260,6 +260,9 @@ fn serve(
 	// A paste's text arriving ahead of its request.
 	let mut pending = String::new();
 	let mut overflow = false;
+	// A request too large for one frame, arriving as JSON pieces.
+	let mut frame_json = String::new();
+	let mut frame_overflow = false;
 	while !state.stop.load(Ordering::SeqCst) {
 		let Some(mut request) = read_frame::<Request>(&mut reader)? else {
 			return Ok(());
@@ -277,6 +280,52 @@ fn serve(
 			} else {
 				pending.push_str(&data);
 			}
+			continue;
+		}
+		if let Request::FrameChunk { data } = request {
+			if frame_overflow
+				|| frame_json.len() + data.len() > crate::proto::JOINED_MAX
+			{
+				frame_overflow = true;
+				frame_json = String::new();
+			} else {
+				frame_json.push_str(&data);
+			}
+			continue;
+		}
+		if let Request::FrameJoin = request {
+			if frame_overflow {
+				crate::jobs::write_response(
+					&mut writer,
+					&error(
+						ErrorCode::TooLarge,
+						"the request is over the join limit".into(),
+					),
+				)?;
+				continue;
+			}
+			let joined = std::mem::take(&mut frame_json);
+			match serde_json::from_str::<Request>(&joined) {
+				Ok(parsed) => request = parsed,
+				Err(_) => {
+					crate::jobs::write_response(
+						&mut writer,
+						&error(
+							ErrorCode::BadRequest,
+							"the joined request is not valid".into(),
+						),
+					)?;
+					continue;
+				}
+			}
+		} else if !frame_json.is_empty() {
+			crate::jobs::write_response(
+				&mut writer,
+				&error(
+					ErrorCode::BadRequest,
+					"frame chunks must end with a join".into(),
+				),
+			)?;
 			continue;
 		}
 		let joined = std::mem::take(&mut pending);
@@ -769,7 +818,9 @@ impl State {
 			| Request::ImportApply { .. }
 			| Request::ReplayPlan { .. }
 			| Request::ReplayApply { .. }
-			| Request::Chunk { .. } => error(
+			| Request::Chunk { .. }
+			| Request::FrameChunk { .. }
+			| Request::FrameJoin => error(
 				ErrorCode::BadRequest,
 				"copy and paste requests are served as jobs".into(),
 			),

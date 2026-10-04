@@ -656,3 +656,41 @@ fn a_worker_without_paste_says_it_is_too_old() {
 	}
 	assert!(!tmp.path().join("a.txt").exists());
 }
+
+/// An Apply request whose freshness snapshot is far over one frame — many
+/// long paths — goes out in bounded JSON pieces and the apply lands.
+#[test]
+fn an_apply_with_a_huge_freshness_snapshot_rides_back_in_chunks() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let filler = "x".repeat(300);
+	let text: String = (0..4_000)
+		.map(|i| {
+			let dir = format!(
+				"level-one/level-two/level-three/level-four/dir-{i:04}"
+			);
+			entry(&format!("{dir}/file-with-a-long-name-{i:04}.rs"), &filler)
+		})
+		.collect();
+	assert!(text.len() > snip_remote::proto::CHUNK_BYTES);
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	let sel = unchecked(&[]);
+	let result = client
+		.import_apply(&id, "", &text, &mapping, &sel, &planned.expect(), None)
+		.unwrap();
+	assert_eq!(result.created_count, 4_000, "{result:?}");
+	assert!(ws.join("level-one").join("level-two").is_dir());
+	assert_eq!(
+		fs::read_to_string(
+			ws.join("level-one/level-two/level-three/level-four/dir-0000")
+				.join("file-with-a-long-name-0000.rs")
+		)
+		.unwrap(),
+		filler
+	);
+}

@@ -37,6 +37,9 @@ pub const EXPORT_CHANGES_VERSION: u32 = 5;
 /// The first protocol with paged remote listings ([`Response::Dir`]'s
 /// `next`).
 pub const DIR_PAGES_VERSION: u32 = 5;
+/// The first protocol with a request sent as joined JSON pieces
+/// ([`Request::FrameChunk`]).
+pub const REQUEST_CHUNKS_VERSION: u32 = 5;
 /// Payload bytes one [`Response::Chunk`] carries: JSON escaping can grow
 /// text several times and must stay under [`MAX_FRAME`].
 pub const CHUNK_BYTES: usize = 1024 * 1024;
@@ -184,6 +187,14 @@ pub enum Request {
 	Chunk {
 		data: String,
 	},
+	/// A piece of the next request's JSON, which arrives as
+	/// [`Request::FrameJoin`]: an Apply request with its freshness snapshot
+	/// can be larger than one frame.
+	FrameChunk {
+		data: String,
+	},
+	/// The [`Request::FrameChunk`] pieces so far are one request's JSON.
+	FrameJoin,
 }
 
 /// A paste's routing choices. Entries under `prefix/` of each pair land in
@@ -288,6 +299,7 @@ impl Request {
 				TRANSFER_VERSION
 			}
 			Self::ExportChanges { .. } => EXPORT_CHANGES_VERSION,
+			Self::FrameChunk { .. } | Self::FrameJoin => REQUEST_CHUNKS_VERSION,
 			// Only a continuation needs a paging worker; the first page is
 			// protocol 1.
 			Self::ListDir { offset, .. } if *offset > 0 => DIR_PAGES_VERSION,
@@ -549,8 +561,22 @@ pub(crate) fn chunks(text: &str) -> impl Iterator<Item = &str> {
 /// Writes `request`; a paste's text larger than one chunk goes ahead in
 /// [`Request::Chunk`] frames and the request itself carries none.
 pub fn write_request(w: &mut impl Write, request: &Request) -> io::Result<()> {
+	write_request_for(w, request, 0)
+}
+
+/// [`write_request`] with the negotiated protocol: from
+/// [`REQUEST_CHUNKS_VERSION`] on, a request whose JSON is larger than one
+/// chunk — an Apply's freshness snapshot included — goes out as
+/// [`Request::FrameChunk`] pieces ended by [`Request::FrameJoin`], bounded
+/// by [`JOINED_MAX`]. Below that version the request must fit one frame,
+/// as before.
+pub fn write_request_for(
+	w: &mut impl Write,
+	request: &Request,
+	negotiated: u32,
+) -> io::Result<()> {
 	let Some(text) = request.text().filter(|t| t.len() > CHUNK_BYTES) else {
-		return write_frame(w, request);
+		return write_whole_request(w, request, negotiated);
 	};
 	for data in chunks(text) {
 		write_frame(
@@ -564,7 +590,38 @@ pub fn write_request(w: &mut impl Write, request: &Request) -> io::Result<()> {
 	if let Some(t) = bare.text_mut() {
 		t.clear();
 	}
-	write_frame(w, &bare)
+	write_whole_request(w, &bare, negotiated)
+}
+
+/// Writes `request` as one frame, or — when the peer joins frames — as
+/// bounded JSON pieces the worker joins and parses.
+fn write_whole_request(
+	w: &mut impl Write,
+	request: &Request,
+	negotiated: u32,
+) -> io::Result<()> {
+	if negotiated < REQUEST_CHUNKS_VERSION {
+		return write_frame(w, request);
+	}
+	let json = serde_json::to_vec(request).map_err(io::Error::other)?;
+	if json.len() <= CHUNK_BYTES {
+		return write_frame(w, request);
+	}
+	if json.len() > JOINED_MAX {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("request of {} bytes exceeds {JOINED_MAX}", json.len()),
+		));
+	}
+	for piece in chunks(std::str::from_utf8(&json).map_err(io::Error::other)?) {
+		write_frame(
+			w,
+			&Request::FrameChunk {
+				data: piece.to_string(),
+			},
+		)?;
+	}
+	write_frame(w, &Request::FrameJoin)
 }
 
 /// `Ok(None)` on a clean end of stream before a frame starts.
@@ -693,6 +750,10 @@ pub fn valid_tips(tips: &[String]) -> bool {
 mod tests {
 	use super::*;
 	use snip_core::browser::TreeKind;
+	use snip_core::transfer::{
+		CanonicalRootId, DestinationFreshnessSnapshot, FileFreshness,
+		TargetFileFreshness,
+	};
 	use snip_core::workspace::ChangeCounts;
 
 	#[test]
@@ -1019,6 +1080,84 @@ mod tests {
 			max_version: Some(2),
 		};
 		round_trip_check(&hello_reply);
+	}
+
+	#[test]
+	fn a_oversized_apply_request_goes_out_as_joined_pieces() {
+		// A freshness snapshot big enough that the whole request's JSON is
+		// over one chunk: only a peer that joins frames can take it.
+		let dir = tempfile::tempdir().unwrap();
+		let root = CanonicalRootId::new(dir.path()).unwrap();
+		let target_files = (0..4_000)
+			.map(|i| {
+				let path = std::path::PathBuf::from(format!(
+					"/w/level-one/level-two/dir-{i:04}/file-with-a-long-name.rs"
+				));
+				(
+					path,
+					TargetFileFreshness {
+						root: root.clone(),
+						relative_path: "rel".into(),
+						existed: false,
+						file_state: Some(FileFreshness {
+							size: 4,
+							mtime: std::time::SystemTime::UNIX_EPOCH,
+							content_hash: [i as u8; 32],
+						}),
+					},
+				)
+			})
+			.collect();
+		let request = Request::ImportApply {
+			workspace: "w".into(),
+			dest: String::new(),
+			text: String::new(),
+			mapping: PasteMapping::default(),
+			selection: Default::default(),
+			expect: ImportExpect {
+				digest: "d".into(),
+				freshness: DestinationFreshnessSnapshot {
+					roots: Default::default(),
+					target_files,
+				},
+			},
+		};
+		let json = serde_json::to_vec(&request).unwrap();
+		assert!(json.len() > CHUNK_BYTES, "{}", json.len());
+
+		// Joined pieces, each one a small frame.
+		let mut buf = Vec::new();
+		write_request_for(&mut buf, &request, REQUEST_CHUNKS_VERSION).unwrap();
+		let mut reader = buf.as_slice();
+		let mut joined = String::new();
+		let mut frames = 0;
+		loop {
+			match read_frame::<Request>(&mut reader).unwrap() {
+				Some(Request::FrameChunk { data }) => {
+					frames += 1;
+					joined.push_str(&data);
+				}
+				Some(Request::FrameJoin) => break,
+				other => panic!("expected a frame piece, got {other:?}"),
+			}
+		}
+		assert!(frames > 1, "{frames} pieces");
+		assert_eq!(
+			joined.len(),
+			json.len(),
+			"the pieces are the request's JSON"
+		);
+		assert_eq!(read_frame::<Request>(&mut reader).unwrap(), None);
+
+		// Below the version, the whole request still goes as one frame.
+		let mut buf = Vec::new();
+		write_request_for(&mut buf, &request, 4).unwrap();
+		let mut reader = buf.as_slice();
+		assert_eq!(
+			read_frame::<Request>(&mut reader).unwrap().as_ref(),
+			Some(&request)
+		);
+		assert_eq!(read_frame::<Request>(&mut reader).unwrap(), None);
 	}
 
 	#[test]

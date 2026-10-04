@@ -25,7 +25,7 @@ use snip_core::commits::CommitCopyOutcome;
 use snip_core::transfer::CopyOutcome;
 
 use crate::proto::{
-	read_frame, write_request, DirEntry, ErrorCode, ExportTarget, GitQuery,
+	read_frame, write_request_for, DirEntry, ErrorCode, ExportTarget, GitQuery,
 	GitReply, ImportExpect, ImportPlanned, PasteMapping, RemoteWorkspace,
 	ReplayExpect, RepoScan, Request, Response, Stat, GIT_CALL_LIMIT,
 	JOINED_MAX, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
@@ -299,6 +299,7 @@ impl Connection {
 		cancel: Option<&CancelToken>,
 		deadline: Instant,
 	) -> Result<(), RemoteError> {
+		let version = self.version;
 		let mut writer =
 			std::mem::replace(&mut self.writer, Box::new(DeadWriter));
 		let request = request.clone();
@@ -306,7 +307,7 @@ impl Connection {
 		let _ = std::thread::Builder::new()
 			.name("snip-remote-write".into())
 			.spawn(move || {
-				let result = write_request(&mut writer, &request);
+				let result = write_request_for(&mut writer, &request, version);
 				let _ = done_tx.send((writer, result));
 			});
 		loop {
