@@ -1101,7 +1101,7 @@ pub fn copy_summary(payload: &CommitsPayload, text: &str) -> CommitCopySummary {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReplayAction {
 	/// Write the content (a rename also deletes `old_path` first).
@@ -1110,7 +1110,7 @@ pub enum ReplayAction {
 	Skip,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReplaySkipReason {
 	/// See the file's `not_copied`.
@@ -1121,7 +1121,7 @@ pub enum ReplaySkipReason {
 	NonUtf8Target,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum LayoutConflict {
 	RenamedFromIsDirectory,
@@ -1153,7 +1153,7 @@ impl std::fmt::Display for LayoutConflict {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilePlan {
 	pub path: String,
@@ -1196,7 +1196,7 @@ impl FilePlan {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitPlan {
 	pub message: String,
@@ -1213,7 +1213,7 @@ impl CommitPlan {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitReplayPlan {
 	pub root: PathBuf,
@@ -1667,7 +1667,7 @@ pub fn plan_commit_replay_with(
 	Ok(CommitReplayPlan { commits, root })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplayFailure {
 	/// Index into the payload's commits.
@@ -1678,7 +1678,7 @@ pub struct ReplayFailure {
 	pub conflict_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplayResult {
 	/// New commit OIDs, in replay order. Never rolled back.

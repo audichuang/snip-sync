@@ -284,7 +284,7 @@ impl TransferError {
 }
 
 /// Cryptographic and timestamp identity of a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFreshness {
 	pub size: u64,
 	pub mtime: SystemTime,
@@ -292,7 +292,7 @@ pub struct FileFreshness {
 }
 
 /// Freshness state of a repository (HEAD commit, symbolic ref, and index).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFreshness {
 	pub head_commit: Option<String>,
 	pub head_ref: Option<String>,
@@ -539,7 +539,7 @@ impl ImportMapping {
 }
 
 /// Target file state recorded at preview time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetFileFreshness {
 	pub root: CanonicalRootId,
 	pub relative_path: String,
@@ -548,7 +548,7 @@ pub struct TargetFileFreshness {
 }
 
 /// Destination freshness snapshot captured during import preview.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestinationFreshnessSnapshot {
 	pub roots: HashMap<CanonicalRootId, RepoFreshness>,
 	pub target_files: HashMap<PathBuf, TargetFileFreshness>,
@@ -759,7 +759,7 @@ impl DestinationFreshnessSnapshot {
 }
 
 /// An immutable import plan containing the exact file restore operations and freshness token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferImportPlan {
 	roots: Vec<PathBuf>,
 	restore_plan: RestorePlan,
@@ -3211,6 +3211,24 @@ impl CommitReplayPreview {
 		Ok(preview)
 	}
 
+	/// A preview captured elsewhere (a remote worker) put back together with
+	/// its payload. Nothing here is trusted: [`Self::apply_with`] and
+	/// [`Self::revalidate_with`] re-plan the payload and re-read every
+	/// recorded path before anything is written.
+	pub fn from_parts(
+		destination: PathBuf,
+		payload: CommitsPayload,
+		replay: commits::CommitReplayPlan,
+		freshness: DestinationFreshnessSnapshot,
+	) -> Self {
+		Self {
+			destination,
+			payload,
+			replay,
+			freshness,
+		}
+	}
+
 	pub fn apply(&self) -> Result<commits::ReplayResult, TransferError> {
 		self.apply_with(&RunOptions::default())
 	}
@@ -3947,5 +3965,42 @@ mod freshness_error_tests {
 			direct_import,
 			TransferError::DestinationNotRegular(_)
 		));
+	}
+}
+
+#[cfg(test)]
+mod wire_tests {
+	use super::*;
+
+	/// A remote worker sends an import plan and its freshness snapshot to the
+	/// master and gets the snapshot back: both must survive JSON unchanged,
+	/// map keys included.
+	#[test]
+	fn import_plan_and_freshness_round_trip_through_json() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(dir.path()).unwrap();
+		fs::write(root.join("a.txt"), "old\n").unwrap();
+		let payload = "// File: a.txt\nnew\n\n// File: b.txt\nb\n";
+		let mapping =
+			ImportMapping::with_primary(CanonicalRootId::new(&root).unwrap());
+		let plan = plan_import(payload, "", &[root.clone()], &mapping).unwrap();
+		assert_eq!(plan.create_operations().len(), 2);
+		let json = serde_json::to_string(&plan).unwrap();
+		let back: TransferImportPlan = serde_json::from_str(&json).unwrap();
+		assert_eq!(back, plan);
+		let fresh = serde_json::to_string(plan.destination_freshness()).unwrap();
+		let back: DestinationFreshnessSnapshot =
+			serde_json::from_str(&fresh).unwrap();
+		assert_eq!(&back, plan.destination_freshness());
+		back.revalidate().unwrap();
+		let sel = RestoreSelection {
+			overwrite_existing: true,
+			unchecked_creates: [1].into_iter().collect(),
+			..Default::default()
+		};
+		let back: RestoreSelection =
+			serde_json::from_str(&serde_json::to_string(&sel).unwrap())
+				.unwrap();
+		assert_eq!(back, sel);
 	}
 }

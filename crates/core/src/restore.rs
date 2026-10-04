@@ -20,7 +20,7 @@ use crate::paths::{
 /// One file from the payload; `parse_clipboard` produces these.
 pub type RestoreEntry = ParsedEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateOperation {
 	pub relative_path: String,
@@ -31,14 +31,14 @@ pub struct CreateOperation {
 	pub root_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteOperation {
 	pub relative_path: String,
 	pub absolute_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SkipReason {
 	AlreadyAbsent,
@@ -63,7 +63,7 @@ impl SkipReason {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedOperation {
 	pub raw_path: String,
@@ -71,7 +71,7 @@ pub struct SkippedOperation {
 	pub reason: SkipReason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestorePlan {
 	/// Every root the plan was validated against; re-checked before writes.
@@ -119,7 +119,7 @@ impl RestorePlan {
 /// What the user confirmed. Unchecked operations are indices into the
 /// plan's `create_operations` / `delete_operations`; they are not run and
 /// not counted.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreSelection {
 	pub overwrite_existing: bool,
 	pub skip_existing: bool,
@@ -127,7 +127,7 @@ pub struct RestoreSelection {
 	pub unchecked_deletes: BTreeSet<usize>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreExecutionResult {
 	pub created_count: usize,
@@ -358,7 +358,7 @@ pub enum RestoreBase {
 	Add { prefix: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreBaseSuggestion {
 	pub base: RestoreBase,
