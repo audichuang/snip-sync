@@ -564,6 +564,54 @@ fn cli_remote_copy_refuses_a_worker_without_copy() {
 	assert!(err.contains("too old"), "{err}");
 }
 
+/// `snip remote copy --working` resolves on the worker with the same
+/// `changed_items` a local copy runs: staged-only entries included, in the
+/// local order, so both payloads are identical.
+#[test]
+fn cli_remote_working_copy_matches_the_local_copy() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	std::fs::create_dir_all(&repo).unwrap();
+	git(&repo, &["init", "-q", "-b", "main"]);
+	std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+	git(&repo, &["add", "a.txt"]);
+	git(&repo, &["commit", "-q", "-m", "first"]);
+	// Only staged: a.txt's second version sits in the index, never in the
+	// working tree, and b.txt is a staged new file.
+	std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+	git(&repo, &["add", "a.txt"]);
+	std::fs::write(repo.join("b.txt"), "staged new\n").unwrap();
+	git(&repo, &["add", "b.txt"]);
+	std::fs::write(repo.join("c.txt"), "untracked\n").unwrap();
+	std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+	let m = Master::new(tmp.path());
+	let remote = m.ok(&["copy", "h", s(&repo), "--working", "--stdout"]);
+	let mut local_cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	local_cmd
+		.args(["--repo", s(&repo), "copy", "--working", "--stdout"])
+		.env("SNIP_CONFIG_DIR", tmp.path().join("cfg-local"));
+	let (status, local, stderr) = output(local_cmd, "snip copy --working");
+	assert_eq!(status, Some(0), "{stderr}");
+	assert_eq!(remote, local, "staged-only changes ride along");
+	assert!(remote.contains("staged new"), "{remote}");
+	assert!(remote.contains("three"), "{remote}");
+
+	// --staged likewise resolves on the worker.
+	let remote = m.ok(&["copy", "h", s(&repo), "--staged", "--stdout"]);
+	assert!(remote.contains("[MODIFIED] a.txt"), "{remote}");
+	assert!(remote.contains("[NEW] b.txt"), "{remote}");
+	assert!(!remote.contains("c.txt"), "{remote}");
+
+	// A worker that cannot resolve changes on its own says so.
+	let old = Master::with_exec(tmp.path(), serve_exec("--max-protocol 4"));
+	let err = old.fails(&["copy", "h", s(&repo), "--working", "--stdout"]);
+	assert!(err.contains("too old"), "{err}");
+}
+
 /// Runs `cmd` with `input` on stdin, failing the test after [`DEADLINE`].
 fn output_with_input(
 	mut cmd: Command,

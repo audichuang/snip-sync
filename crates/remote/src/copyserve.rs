@@ -5,12 +5,13 @@
 use std::path::PathBuf;
 
 use snip_core::gitrun::{CancelToken, GitPool};
-use snip_core::gitsrc::Git;
+use snip_core::gitsrc::{Git, GitSource};
 use snip_core::gitview::ReadProfile;
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	copy_selection, plan_commit_export_exact_with, CanonicalRootId, ExportItem,
-	ExportSelection, SourceKind, CLIPBOARD_PAYLOAD_MAX,
+	changed_items, copy_selection, plan_commit_export_exact_with,
+	CanonicalRootId, ExportItem, ExportSelection, SourceKind,
+	CLIPBOARD_PAYLOAD_MAX,
 };
 
 use crate::proto::{
@@ -100,6 +101,87 @@ pub(crate) fn export(
 			refused(ErrorCode::Cancelled, err.to_string())
 		}
 		Err(err) => refused(ErrorCode::Io, err.to_string()),
+	}
+}
+
+/// Answers [`crate::proto::Request::ExportChanges`]: the change selection
+/// for `source` is resolved here with the shared [`changed_items`], so the
+/// copy sees exactly what a local `snip copy --working/--staged/--commit`
+/// sees — same order, dedup, change types, and staged-only entries.
+pub(crate) fn export_changes(
+	root: &SharedRoot,
+	repo: &str,
+	source: &GitSource,
+	settings: &Settings,
+	file_limit: usize,
+	cancel: &CancelToken,
+) -> Response {
+	if !valid_rel_path(repo, true) || !valid_change_source(source) {
+		return refused(ErrorCode::BadRequest, "invalid change copy");
+	}
+	let dir = match folder(root, repo) {
+		Ok(dir) => dir,
+		Err(resp) => return resp,
+	};
+	let opts = options(cancel);
+	let git = match Git::open_with(&dir, &opts) {
+		Ok(git) => git,
+		Err(err) => return refused(ErrorCode::NotARepository, err.to_string()),
+	};
+	// Local copy_git: commit/range sources resolve against the repository
+	// root (their paths are repo-relative); working/staged keep the opened
+	// folder and skip changes outside it.
+	let graph = matches!(source, GitSource::Commit(_) | GitSource::Range(..));
+	let effective_root = if graph {
+		git.root().to_path_buf()
+	} else {
+		dir.clone()
+	};
+	let root_id = match CanonicalRootId::new(&effective_root) {
+		Ok(id) => id,
+		Err(err) => return io_error(err),
+	};
+	let changed = match changed_items(&root_id, &git, source, &opts) {
+		Ok(changed) => changed,
+		Err(err) => {
+			let code = if cancel.is_cancelled() {
+				ErrorCode::Cancelled
+			} else {
+				ErrorCode::Io
+			};
+			return refused(code, err.to_string());
+		}
+	};
+	if changed.items.is_empty() {
+		return refused(ErrorCode::BadRequest, "No Git changes found to copy.");
+	}
+	let sel = match ExportSelection::new(
+		vec![effective_root.clone()],
+		Some(effective_root),
+		changed.items,
+	) {
+		Ok(sel) => sel,
+		Err(err) => return refused(ErrorCode::BadRequest, err.to_string()),
+	};
+	let sel = if graph {
+		sel.with_filter_root(Some(dir))
+	} else {
+		sel
+	};
+	match copy_selection(sel, settings, file_limit, &opts, |_| {}) {
+		Ok(out) => Response::Copied(out),
+		Err(err) if cancel.is_cancelled() => {
+			refused(ErrorCode::Cancelled, err.to_string())
+		}
+		Err(err) => refused(ErrorCode::Io, err.to_string()),
+	}
+}
+
+fn valid_change_source(source: &GitSource) -> bool {
+	match source {
+		GitSource::Commit(rev) => valid_rev(rev),
+		GitSource::Range(base, tip) => valid_rev(base) && valid_rev(tip),
+		GitSource::Working | GitSource::Staged => true,
 	}
 }
 

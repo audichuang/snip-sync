@@ -24,7 +24,7 @@
 | master | Mac mini `AudideMac-mini` | 本機 |
 | worker | Ubuntu `audichuang-desktop`（x86_64） | `ssh ubuntu`（`~/.ssh/config` 的 `Host ubuntu`，金鑰登入） |
 
-- 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上（協定 4）：`grep -q 'PROTOCOL_MAX: u32 = 4' crates/remote/src/proto.rs`，不符就不開跑。
+- 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上與 worker 端變更選取（協定 5）：`grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs`，不符就不開跑。
 - **受測的 worker binary 怎麼被選到**：產品在對方執行 `snip serve --stdio` 時，依序找 PATH 上的 `snip`、`~/.local/bin/snip`…。Ubuntu 的非互動 ssh PATH 第一項是 `~/.local/bin`，所以本輪把受測 SHA 編出來的 `snip` 暫時放在 `~/.local/bin/snip`，產品就會走真實的 ssh 路徑選到它。開跑前那個位置必須不存在（2.3 會檢查），收尾一定要刪掉（第 6 節，I03 驗證）。**不要用 `SNIP_REMOTE_EXEC`**，那會繞過要測的 ssh 路徑。
 - 受測專案：Ubuntu 上的 `~/research/rtk`。真實的 Rust 專案，有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs`）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**。
 - 其他情境放在 fixture（第 2.3 節），全部在 Ubuntu 的 `$W` 底下。
@@ -39,7 +39,7 @@
 
 ```bash
 export PATH=$HOME/.cargo/bin:$PATH
-grep -q 'PROTOCOL_MAX: u32 = 4' crates/remote/src/proto.rs
+grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs
 cargo build --release -p snip-cli --locked
 just remote-e2e-ssh ubuntu
 ```

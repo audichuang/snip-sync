@@ -863,6 +863,31 @@ impl Client {
 		}
 	}
 
+	/// Copies every change of `source` in `repo` as one snip-sync payload,
+	/// the selection resolved by the worker with the local copy engine's
+	/// own `changed_items`.
+	pub fn export_changes(
+		&self,
+		workspace: &str,
+		repo: &str,
+		source: &snip_core::gitsrc::GitSource,
+		settings: &snip_core::settings::Settings,
+		file_limit: usize,
+		cancel: Option<&CancelToken>,
+	) -> Result<CopyOutcome, RemoteError> {
+		let req = Request::ExportChanges {
+			workspace: workspace.into(),
+			repo: repo.into(),
+			source: source.clone(),
+			settings: settings.clone(),
+			file_limit,
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::Copied(out) => Ok(out),
+			_ => Err(unexpected()),
+		}
+	}
+
 	/// Copies the commits `selected` (ending at `tip`) of `repo`.
 	pub fn export_commits(
 		&self,

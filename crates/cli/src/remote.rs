@@ -177,48 +177,20 @@ fn find_workspace(
 /// Paths to copy, with the change type when a change list named it.
 type Named = Vec<(String, Option<ChangeType>)>;
 
-/// Files a copy of `source` takes when the user named none: every change
-/// of that kind in `repo`.
-fn all_changes(
-	client: Client,
-	ws: &RemoteWorkspace,
-	repo: &str,
-	source: &snip_core::transfer::SourceKind,
-) -> Result<(Client, Named), String> {
-	use snip_core::transfer::SourceKind;
-	let client = Arc::new(client);
-	let view = RemoteRepo::new(client.clone(), ws.id.clone(), repo.into());
-	let read = Read {
-		profile: ReadProfile::Interactive,
-		cancel: None,
-	};
-	let paths = match source {
-		SourceKind::Commit { rev } => {
-			view.changed_paths(&GitSource::Commit(rev.clone()), 100_000, &read)
-				.map_err(|e| e.to_string())?
-				.paths
-		}
-		_ => {
-			let want = match source {
-				SourceKind::Staged => ChangeSource::Staged,
-				_ => ChangeSource::Working,
-			};
-			view.change_list(100_000, &read)
-				.map_err(|e| e.to_string())?
-				.rows
-				.into_iter()
-				.filter(|r| {
-					r.source == want
-						|| (want == ChangeSource::Working
-							&& r.source == ChangeSource::Unstaged)
-				})
-				.map(|r| (r.path, r.change_type))
-				.collect()
-		}
-	};
-	drop(view);
-	let client = Arc::try_unwrap(client).map_err(|_| "client still shared")?;
-	Ok((client, paths))
+/// The folder-expansion cap a local copy derives from settings
+/// (`plan_export_expanding`): doubling batches bounded by the file count
+/// limit when it applies, unbounded otherwise.
+fn expand_limit(settings: &snip_core::settings::Settings) -> usize {
+	if settings.set_max_file_count {
+		let count_limit = if settings.file_count_limit > 0.0 {
+			settings.file_count_limit as usize
+		} else {
+			0
+		};
+		64usize.max(4usize.saturating_mul(count_limit))
+	} else {
+		usize::MAX
+	}
 }
 
 fn emit(text: &str, stdout: bool) -> Result<(), String> {
@@ -474,39 +446,57 @@ pub fn run(
 			} else {
 				SourceKind::File
 			};
-			let (c, named) = if paths.is_empty() && source != SourceKind::File {
-				all_changes(c, &ws, &repo, &source)?
-			} else if paths.is_empty() {
-				// The whole folder: its entries, as a local copy of `.` takes.
-				let (entries, _) =
-					c.list_dir(&ws.id, &repo).map_err(|e| e.to_string())?;
-				let mut names: Vec<String> = entries
-					.into_iter()
-					.filter(|e| e.utf8)
-					.map(|e| e.name)
-					.collect();
-				names.sort();
-				(c, names.into_iter().map(|n| (n, None)).collect())
-			} else {
-				(c, paths.into_iter().map(|p| (p, None)).collect())
-			};
-			if named.is_empty() {
-				return Err("nothing to copy".into());
-			}
-			let items = named
-				.into_iter()
-				.map(|(path, change_type)| snip_remote::ExportTarget {
-					root: repo.clone(),
-					path,
-					source: source.clone(),
-					change_type,
-				})
-				.collect();
 			let settings = snip_core::settings::Settings::default();
-			let limit = settings.file_count_limit as usize;
-			let out = c
-				.export_files(&ws.id, items, &settings, limit, None)
-				.map_err(|e| e.to_string())?;
+			let limit = expand_limit(&settings);
+			let out = if paths.is_empty() && source != SourceKind::File {
+				// The selection is resolved on the worker with the same
+				// `changed_items` a local copy runs, so the payload is the
+				// local one — staged-only entries included.
+				let git_source = match source {
+					SourceKind::Working => GitSource::Working,
+					SourceKind::Staged => GitSource::Staged,
+					SourceKind::Commit { rev } => GitSource::Commit(rev),
+					_ => unreachable!("change sources only"),
+				};
+				c.export_changes(
+					&ws.id,
+					&repo,
+					&git_source,
+					&settings,
+					limit,
+					None,
+				)
+				.map_err(|e| e.to_string())?
+			} else {
+				let named: Named = if paths.is_empty() {
+					// The whole folder: its entries, as a local copy of `.` takes.
+					let (entries, _) =
+						c.list_dir(&ws.id, &repo).map_err(|e| e.to_string())?;
+					let mut names: Vec<String> = entries
+						.into_iter()
+						.filter(|e| e.utf8)
+						.map(|e| e.name)
+						.collect();
+					names.sort();
+					names.into_iter().map(|n| (n, None)).collect()
+				} else {
+					paths.into_iter().map(|p| (p, None)).collect()
+				};
+				if named.is_empty() {
+					return Err("nothing to copy".into());
+				}
+				let items = named
+					.into_iter()
+					.map(|(path, change_type)| snip_remote::ExportTarget {
+						root: repo.clone(),
+						path,
+						source: source.clone(),
+						change_type,
+					})
+					.collect();
+				c.export_files(&ws.id, items, &settings, limit, None)
+					.map_err(|e| e.to_string())?
+			};
 			if out.copied == 0 {
 				return Err("nothing could be copied".into());
 			}

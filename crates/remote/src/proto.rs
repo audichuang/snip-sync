@@ -21,14 +21,18 @@ use snip_core::workspace::ScanStatus;
 /// Base protocol, both sides must speak it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Newest protocol this build speaks. 2 = Git views, 3 = copy, 4 = paste.
-pub const PROTOCOL_MAX: u32 = 4;
+/// Newest protocol this build speaks. 2 = Git views, 3 = copy, 4 = paste,
+/// 5 = worker-side change selection ([`Request::ExportChanges`]).
+pub const PROTOCOL_MAX: u32 = 5;
 /// The first protocol with Git views.
 pub const GIT_VIEWS_VERSION: u32 = 2;
 /// The first protocol with copy ([`Request::Export`]).
 pub const TRANSFER_VERSION: u32 = 3;
 /// The first protocol with paste ([`Request::ImportPlan`] and the rest).
 pub const PASTE_VERSION: u32 = 4;
+/// The first protocol where the worker resolves a change selection itself
+/// ([`Request::ExportChanges`]).
+pub const EXPORT_CHANGES_VERSION: u32 = 5;
 /// Payload bytes one [`Response::Chunk`] carries: JSON escaping can grow
 /// text several times and must stay under [`MAX_FRAME`].
 pub const CHUNK_BYTES: usize = 1024 * 1024;
@@ -115,6 +119,19 @@ pub enum Request {
 		repo: String,
 		tip: String,
 		selected: Vec<String>,
+	},
+	/// Copies every change of `source` in `repo` as one snip-sync payload,
+	/// the selection resolved on the worker with the same
+	/// [`snip_core::transfer::changed_items`] a local copy runs: the
+	/// master-side change list cannot express its order, dedup, or its
+	/// staged-only entries.
+	ExportChanges {
+		workspace: String,
+		/// The repository the changes belong to, inside the workspace.
+		repo: String,
+		source: snip_core::gitsrc::GitSource,
+		settings: snip_core::settings::Settings,
+		file_limit: usize,
 	},
 	/// Plans pasting the file payload `text` into the folder `dest` of the
 	/// workspace, as a local paste previews it. Nothing is written.
@@ -260,6 +277,7 @@ impl Request {
 			Self::Export { .. } | Self::ExportCommits { .. } => {
 				TRANSFER_VERSION
 			}
+			Self::ExportChanges { .. } => EXPORT_CHANGES_VERSION,
 			Self::ImportPlan { .. }
 			| Self::ImportApply { .. }
 			| Self::ReplayPlan { .. }

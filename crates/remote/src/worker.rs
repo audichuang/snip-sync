@@ -430,6 +430,7 @@ fn serve(
 					negotiated,
 					&workspace,
 					Job::Copy,
+					crate::proto::TRANSFER_VERSION,
 					|root, cancel| {
 						crate::copyserve::export(
 							root, items, &settings, file_limit, cancel,
@@ -449,9 +450,31 @@ fn serve(
 					negotiated,
 					&workspace,
 					Job::Copy,
+					crate::proto::TRANSFER_VERSION,
 					|root, cancel| {
 						crate::copyserve::export_commits(
 							root, &repo, &tip, &selected, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ExportChanges {
+				workspace,
+				repo,
+				source,
+				settings,
+				file_limit,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::Copy,
+					crate::proto::EXPORT_CHANGES_VERSION,
+					|root, cancel| {
+						crate::copyserve::export_changes(
+							root, &repo, &source, &settings, file_limit, cancel,
 						)
 					},
 				)?;
@@ -468,6 +491,7 @@ fn serve(
 					negotiated,
 					&workspace,
 					Job::PastePlan,
+					crate::proto::PASTE_VERSION,
 					|root, cancel| {
 						crate::pasteserve::import_plan(
 							root, &dest, &text, &mapping, cancel,
@@ -489,6 +513,7 @@ fn serve(
 					negotiated,
 					&workspace,
 					Job::PasteApply,
+					crate::proto::PASTE_VERSION,
 					|root, cancel| {
 						crate::pasteserve::import_apply(
 							root, &dest, &text, &mapping, &selection, &expect,
@@ -508,6 +533,7 @@ fn serve(
 					negotiated,
 					&workspace,
 					Job::PastePlan,
+					crate::proto::PASTE_VERSION,
 					|root, cancel| {
 						crate::pasteserve::replay_plan(
 							root, &dest, &text, cancel,
@@ -533,6 +559,7 @@ fn serve(
 					negotiated,
 					&workspace,
 					job,
+					crate::proto::PASTE_VERSION,
 					|root, cancel| {
 						crate::pasteserve::replay_apply(
 							root, &dest, &text, expect, check_only, cancel,
@@ -560,20 +587,22 @@ enum Job {
 	PasteApply,
 }
 
-/// Runs a copy or paste as a job of `workspace`, as Git views run.
+/// Runs a copy or paste as a job of `workspace`, as Git views run. `need`
+/// is the protocol the request itself requires: a request a worker this
+/// old cannot even parse never reaches dispatch (the master gates on its
+/// `needs_version`), so this is the semantic gate beside it.
 fn serve_copy(
 	writer: &mut impl Write,
 	state: &State,
 	negotiated: u32,
 	workspace: &str,
 	job: Job,
+	need: u32,
 	op: impl FnOnce(&SharedRoot, &snip_core::gitrun::CancelToken) -> Response + Send,
 ) -> io::Result<()> {
-	let (need, what) = match job {
-		Job::Copy => (crate::proto::TRANSFER_VERSION, "copy"),
-		Job::PastePlan | Job::PasteApply => {
-			(crate::proto::PASTE_VERSION, "paste")
-		}
+	let what = match job {
+		Job::Copy => "copy",
+		Job::PastePlan | Job::PasteApply => "paste",
 	};
 	if negotiated < need {
 		return crate::jobs::write_response(
@@ -731,6 +760,7 @@ impl State {
 			}
 			Request::Export { .. }
 			| Request::ExportCommits { .. }
+			| Request::ExportChanges { .. }
 			| Request::ImportPlan { .. }
 			| Request::ImportApply { .. }
 			| Request::ReplayPlan { .. }
