@@ -8,7 +8,7 @@
 
 - **受測**：master 是 Mac mini 上的桌面 App（GUI），另有一段用 `snip remote`（CLI master）交叉驗證。worker 是 Ubuntu 上的 CLI `snip worker`，不開 GUI。
 - **SSH 不是受測功能**。產品沒有「經 SSH 管理 worker」的功能。master 和 worker 之間走 Tailscale 上的 TLS 1.3，靠配對碼與指紋 pin 互信。本規程只在準備階段用 ssh：在 Ubuntu 上編譯、建 fixture、啟動和重啟 worker，以及在 worker 端讀檔案當 oracle。
-- **本輪受測含唯讀 Git 檢視**。寫入、rename、stage、commit、discard、以及專案列的選取仍不在範圍內；複製（右鍵「複製」與 Cmd+C）、貼上、加入儲存庫路徑、專案列的 Ctrl/Cmd 點擊選取在遠端工作區都要拒絕，這也是受測項目。
+- **本輪受測含唯讀 Git 檢視**。寫入、rename、stage、commit、discard、以及專案列的選取仍不在範圍內；貼上與加入儲存庫路徑在遠端工作區要拒絕，這也是受測項目；複製（右鍵「複製」、Cmd+C、專案列選取）要和本機一樣成功。
 - **不能碰使用者自己的 worker 服務**：Ubuntu 的 systemd user unit `snip-worker.service` 和 Mac mini 的 LaunchAgent `com.audichuang.snip-worker`（都在 47821 埠）不屬於這一輪，不可停止、重啟或改設定。測試 worker 一律用 47899；`pkill` 的 pattern 只能比對本輪的 `$W/src/target/release/snip`。
 - 不改產品程式，不 commit 這一輪的產出。
 
@@ -215,7 +215,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
    - **單一 repo 工作區（工作區資料夾本身就是 Git 儲存庫，例如 `rtk`）**：呈現方式與本機單一 repo 完全一致，以 `repo-row:<名稱>` 標頭列（附帶 `repo-chevron:<名稱>`）為頂層，其下的檔案／目錄列使用無前綴家族：`tree-row:<相對路徑>`、`tree-chevron:<相對路徑>`、截斷標記 `tree-marker:<資料夾>`、更多列 `tree-view-more:<資料夾>`（整棵樹截斷列為 `tree-view-more:`）、錯誤列 `tree-retry:<資料夾>`、非 UTF-8 名稱 `tree-invalid:<suffix>`。日誌為 `TREE_PAGE: rel= kind= children= has_more= selected=`、`TREE_FILE_SELECTED`。
    - **多 repo 或純資料夾工作區（工作區資料夾本身不是開啟的 repo，例如 `edge`、`plainws`、`outer/inner`）**：工作區資料夾本身的樹使用 `ws-` 前綴家族：`ws-tree-row:<相對路徑>`、`ws-tree-chevron:<相對路徑>`、截斷標記 `ws-tree-marker:<資料夾>`、更多列 `ws-tree-view-more:<資料夾>`（整棵樹截斷列為 `ws-tree-view-more:`）、錯誤列 `ws-tree-retry:<資料夾>`、非 UTF-8 名稱 `ws-tree-invalid:<suffix>`。日誌為 `WS_TREE_PAGE: rel= kind= children= has_more= selected=`、`WS_FILE_SELECTED`。多 repo 資料夾中探索到的 repo（例如 `edge` 裡的 `nested`）顯示為 `repo-row:<名稱>` 標頭列（附帶 `repo-chevron:<名稱>`），不是 `ws-tree-row`；若 repo summary 發生錯誤（例如 `nested` 僅含空 `.git`），nested 列顯示警告標記；開啟 `edge` 時會自動選取 nested，因此最初即顯示其錯誤；點擊已展開且已選取的 `repo-row:nested` 僅會將其收合（預覽不變）；重新展開（第二次點擊）會重新選取並顯示 Git 錯誤。絕不能當作純資料夾展開（不得有 `WS_TREE_PAGE: rel=nested`）。
    - `TREE_TOGGLED`／`WS_TREE_TOGGLED` 只在 Ctrl/Cmd 點擊切換專案列選取時印，遠端模式不能選取，所以展開不會有它。
-3. **沒有日誌 tag 的訊息**：`remote_unsupported`（遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視）顯示在狀態列；`remote_pair_missing`（請輸入位址與配對碼）與工作區清單讀取失敗顯示在工作區選單裡的紅字，不在狀態列。這些格子的通過線是：截圖裡在上述位置有那段文字、剪貼簿 sentinel 的 SHA 不變、1 秒內沒有新的 `COPY_*` 或 `PASTE_*` 行。**不要因為少一行日誌就判 `fail`。**
+3. **沒有日誌 tag 的訊息**：`remote_unsupported`（遠端工作區還不支援這個操作（貼上即將支援））顯示在狀態列；`remote_pair_missing`（請輸入位址與配對碼）與工作區清單讀取失敗顯示在工作區選單裡的紅字，不在狀態列。這些格子的通過線是：截圖裡在上述位置有那段文字、剪貼簿 sentinel 的 SHA 不變、1 秒內沒有新的 `COPY_*` 或 `PASTE_*` 行。**不要因為少一行日誌就判 `fail`。**
 4. **預覽成功與失敗的分法**（`apply_source_preview`）：成功時日誌是 `PREVIEW_LOADING: <path>` 接著 `PREVIEW_LOADED: <path>`。worker 拒絕、二進位、過大時，只有 `PREVIEW_LOADING`，**沒有** `PREVIEW_LOADED`，預覽區顯示錯誤文字。失敗格的通過線：有 `PREVIEW_LOADING`、沒有 `PREVIEW_LOADED`、截圖裡是錯誤文字而不是檔案內容、下一次點擊 App 仍有反應。
 5. **指紋比對**：`REMOTE_PAIRED: fp=` 是 16 個十六進位字元。worker 印出的是 `XXXX-XXXX-XXXX-XXXX`。去掉 `-`、不分大小寫比較，兩者必須相同。選單列顯示的是 `XXXX-XXXX-XXXX-XXXX`。
 6. **文字輸入**：先點 `remote-addr-input` 或 `remote-code-input` 的 bounds，再用鍵盤輸入，然後截圖確認輸入框裡的字。貼上文字用 Cmd+V 時，要確認焦點在輸入框裡；否則 Cmd+V 是 App 的貼上。
@@ -306,7 +306,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 | ID | 動作 | 通過線 |
 |---|---|---|
-| R30 | 選一個檔案列，按 Cmd+C；再對該列右鍵 | Cmd+C 顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」；右鍵選單的「複製」（`menu-item:copy-files`）是停用的（遠端模式不能選取專案列，沒有東西可複製）；sentinel 的 SHA 不變；沒有 `COPY_PREP`／`COPY_DONE` |
+| R30 | 選一個檔案列，按 Cmd+C；再對該列右鍵 →「複製」（`menu-item:copy-files`） | 兩次都有 `COPY_PREP` 與 `COPY_DONE: copied=1`；剪貼簿內容與在 worker 上對同一檔案跑 `snip copy` 逐 byte 相同 |
 | R31 | 按 Cmd+V，再點 `btn-paste` | 兩次都顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」；沒有 `PASTE_PREVIEW`／`PASTE_LOADING`；沒有出現貼上面板；`ssh ubuntu "find '$W/edge' -newer '$W/rtk-marker' \| wc -l"` 是 0 |
 | R32 | 點 `rail-changes`、`rail-log` | 此時開著的是 `edge`（R15 切過去的）：點 `rail-changes`，`edge/nested` 只有空的 `.git` 資料夾，探索把它當 repo（`workspace.rs:540-548` `classify_git`），所以必須看到 `nested` 的錯誤列（Note），**不能**出現 `state=clean`，也沒有 `local-ws` 的任何列；點 `rail-log`，看到 `log-empty` 為 `failed`（或錯誤提示列含 `nested`），不是「沒有 commit」。**空畫面或 `state=clean` 判 `fail`** |
 | R32b | 從工作區選單切回 `rtk`，點 `rail-changes` 與 `rail-log` | 點 `rail-changes` → `state=clean`（rtk 工作樹乾淨）；點 `rail-log` → 第一列是受測當天 `ssh ubuntu 'git -C ~/research/rtk rev-parse HEAD'` 的 commit。**空畫面判 `fail`**。R34 之前照原文先開回 `edge` |

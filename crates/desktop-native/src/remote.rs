@@ -71,6 +71,7 @@ pub fn load_hosts() -> Vec<RemoteHost> {
 }
 
 /// The remote workspace open in place of a local one.
+#[derive(Clone)]
 pub struct RemoteSession {
 	pub client: Arc<Client>,
 	pub workspace: RemoteWorkspace,

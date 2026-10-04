@@ -252,7 +252,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 將來若開放 `Request::Write`/`Rename`，必須拒絕任何 `.git` 目錄底下、以及 git dir／common dir 目標底下的路徑；否則 Git 檢視會把「可寫檔案」變成「在 worker 上執行程式」（hooks、filter、fsmonitor 設定）。
 - **明確不做(本切片)**:
   - 遠端寫入類 Git 操作（stage、unstage、commit、checkout、discard、rename、write）：(1) 能寫入 worker 檔案就能寫入 `.git/config`、hooks 或 filter，等於讓 master 在 worker 執行任意程式（違反寫入不變式）；(2) 本機寫入依賴 HeavyGuard、新鮮度與碰撞檢查（§3.2、§4.3），跨機器版本尚未設計；(3) 讀取先做正確，避免因誤判狀態做出錯誤決策。
-  - 遠端的加入 repo 路徑（`add_repo_path`）、複製到剪貼簿、貼上、專案列的選取：維持拒絕（回報 `remote_unsupported`）。
+  - 遠端的加入 repo 路徑（`add_repo_path`）與貼上：維持拒絕（回報 `remote_unsupported`）。複製（變更列、群組、資料夾、專案列選取、commit 檔案、commit）和本機一樣：worker 用同一個複製引擎產生 payload（協定 3 的 `Export` / `ExportCommits`），App 寫進剪貼簿。
   - 掃描逾時（`TimedOut`）或達上限（`LimitReached`）在遠端不支援游標續掃（僅 depth-limited 資料夾可續），需重新整理重掃。
   - 自動 fetch、遠端分支操作：本機亦無此功能。
   - Windows 作為 worker:遠端啟動指令用 POSIX `sh`。
