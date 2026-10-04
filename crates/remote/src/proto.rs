@@ -21,10 +21,15 @@ use snip_core::workspace::ScanStatus;
 /// Base protocol, both sides must speak it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Newest protocol this build speaks. 2 = Git views.
-pub const PROTOCOL_MAX: u32 = 2;
+/// Newest protocol this build speaks. 2 = Git views, 3 = copy.
+pub const PROTOCOL_MAX: u32 = 3;
 /// The first protocol with Git views.
 pub const GIT_VIEWS_VERSION: u32 = 2;
+/// The first protocol with copy ([`Request::Export`]).
+pub const TRANSFER_VERSION: u32 = 3;
+/// Payload bytes one [`Response::Chunk`] carries: JSON escaping can grow
+/// text several times and must stay under [`MAX_FRAME`].
+pub const CHUNK_BYTES: usize = 1024 * 1024;
 pub const GIT_CALL_LIMIT: Duration = Duration::from_secs(90); // > worker job deadlines 60/75 s
 pub const MAX_GIT_CALLS_IN_FLIGHT: usize = 4;
 pub const REMOTE_MAX_LOG_LIMIT: usize = 1_000;
@@ -38,7 +43,7 @@ pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// `truncated`.
 pub const MAX_DIR_ENTRIES: usize = 1000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
 	/// First frame of every connection.
@@ -87,12 +92,41 @@ pub enum Request {
 		profile: ReadProfile,
 		query: GitQuery,
 	},
+	/// Copies files or changes as one snip-sync payload, with the same
+	/// engine a local copy uses ([`snip_core::transfer::copy_selection`]).
+	Export {
+		workspace: String,
+		items: Vec<ExportTarget>,
+		settings: snip_core::settings::Settings,
+		file_limit: usize,
+	},
+	/// Copies commits of `repo` as a commit payload.
+	ExportCommits {
+		workspace: String,
+		repo: String,
+		tip: String,
+		selected: Vec<String>,
+	},
+}
+
+/// One item to copy: `path` under `root`, both relative to the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportTarget {
+	/// The repository (or folder) the path is relative to; "" is the
+	/// workspace itself.
+	pub root: String,
+	pub path: String,
+	pub source: snip_core::transfer::SourceKind,
+	pub change_type: Option<ChangeType>,
 }
 
 impl Request {
 	pub fn needs_version(&self) -> u32 {
 		match self {
 			Self::ScanRepos { .. } | Self::GitView { .. } => GIT_VIEWS_VERSION,
+			Self::Export { .. } | Self::ExportCommits { .. } => {
+				TRANSFER_VERSION
+			}
 			_ => 1,
 		}
 	}
@@ -171,6 +205,13 @@ pub enum Response {
 	Pending,
 	Repos(RepoScan),
 	Git(GitReply),
+	Copied(snip_core::transfer::CopyOutcome),
+	CommitsCopied(snip_core::commits::CommitCopyOutcome),
+	/// Part of the next `Copied` / `CommitsCopied` text, which then
+	/// arrives with that text empty.
+	Chunk {
+		data: String,
+	},
 	Error {
 		code: ErrorCode,
 		message: String,

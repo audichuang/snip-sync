@@ -1,5 +1,5 @@
-//! Workspace menu: the remote section (the hosts of `~/.ssh/config`, the
-//! folders of the one being browsed, its recent folders and a path field).
+//! Workspace menu: the remote section (the hosts of `~/.ssh/config`, a
+//! folder browser on the one being browsed, and a path field).
 
 use super::*;
 
@@ -31,7 +31,7 @@ impl WorkbenchModel {
 		let browse = self.remote.browse.as_ref();
 		for (ix, host) in self.remote.hosts.iter().enumerate() {
 			let id = format!("remote-host:{ix}");
-			let open = browse.is_some_and(|(i, _)| *i == ix);
+			let open = browse.is_some_and(|b| b.host == ix);
 			out.push(
 				menu_row(SharedString::from(id.clone()), 82)
 					.tooltip(tip(host.name.clone()))
@@ -50,39 +50,69 @@ impl WorkbenchModel {
 					.children(probe(log, id))
 					.into_any_element(),
 			);
-			let Some((_, listing)) = browse.filter(|(i, _)| *i == ix) else {
+			let Some(browse) = browse.filter(|b| b.host == ix) else {
 				continue;
 			};
-			// Recent folders of this host first, then its home's folders.
-			let recent: Vec<(usize, &crate::remote::RecentRemote)> = self
-				.remote
-				.recent
-				.iter()
-				.enumerate()
-				.filter(|(_, r)| r.host == host.name)
-				.collect();
-			if !recent.is_empty() {
+			let busy = self.remote.busy;
+			// The folder shown, and the button that opens it.
+			let listed = matches!(browse.listing, Some(Ok(_)));
+			out.push(
+				div()
+					.flex()
+					.flex_row()
+					.items_center()
+					.gap(px(6.))
+					.pl(px(32.))
+					.pr(px(8.))
+					.py(px(2.))
+					.child(
+						div()
+							.id("remote-path")
+							.flex_1()
+							.min_w_0()
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().text_muted))
+							.tooltip(tip(browse.path.clone()))
+							.child(clip_text(browse.path.clone()))
+							.children(probe(log, "remote-path")),
+					)
+					.child(
+						button(
+							"btn-remote-open-here",
+							t("remote_open_here", loc),
+							Btn::Primary,
+							listed && !busy,
+							83,
+						)
+						.debug_selector(|| "btn-remote-open-here".into())
+						.when(listed && !busy, |d| {
+							d.on_click(cx.listener(|this, _, _, cx| {
+								this.open_remote_here(cx);
+							}))
+						})
+						.children(probe(log, "btn-remote-open-here")),
+					)
+					.into_any_element(),
+			);
+			if !crate::remote::is_root(&browse.path) {
 				out.push(
-					muted(t("remote_recent", loc).to_string())
+					menu_row("remote-up", 84)
+						.debug_selector(|| "remote-up".into())
 						.pl(px(32.))
-						.into_any_element(),
-				);
-			}
-			for (n, r) in recent {
-				let id = format!("remote-recent:{n}");
-				out.push(
-					menu_row(SharedString::from(id.clone()), 84)
-						.pl(px(32.))
-						.tooltip(tip(r.path.clone()))
-						.on_click(cx.listener(move |this, _, _, cx| {
-							this.open_remote_recent(n, cx);
+						.on_click(cx.listener(|this, _, _, cx| {
+							this.remote_up(cx);
 						}))
-						.child(fill_text(r.path.clone()))
-						.children(probe(log, id))
+						.child(
+							div()
+								.flex_shrink_0()
+								.child(icon(Icon::Folder, 14.)),
+						)
+						.child(fill_text(t("remote_up", loc)))
+						.children(probe(log, "remote-up"))
 						.into_any_element(),
 				);
 			}
-			match listing {
+			match &browse.listing {
 				None => out.push(
 					muted(t("remote_loading", loc).to_string())
 						.pl(px(32.))
@@ -94,18 +124,25 @@ impl WorkbenchModel {
 						.text_color(rgb(pal().error))
 						.into_any_element(),
 				),
+				Some(Ok(listing)) if listing.folders.is_empty() => out.push(
+					muted(t("remote_no_subfolders", loc).to_string())
+						.pl(px(32.))
+						.into_any_element(),
+				),
 				Some(Ok(listing)) => {
-					let base = listing.home.trim_end_matches(['/', '\\']);
 					for (fx, name) in listing.folders.iter().enumerate() {
 						let id = format!("remote-folder:{fx}");
-						let path = format!("{base}/{name}");
-						let tip_path = path.clone();
+						let tip_path =
+							crate::remote::child_path(&listing.path, name);
+						let enter = name.clone();
+						let selector = id.clone();
 						out.push(
 							menu_row(SharedString::from(id.clone()), 84)
+								.debug_selector(move || selector)
 								.pl(px(32.))
 								.tooltip(tip(tip_path))
 								.on_click(cx.listener(move |this, _, _, cx| {
-									this.open_remote_path(ix, path.clone(), cx);
+									this.enter_remote_folder(&enter, cx);
 								}))
 								.child(
 									div()
@@ -119,7 +156,6 @@ impl WorkbenchModel {
 					}
 				}
 			}
-			let busy = self.remote.busy;
 			out.push(
 				div()
 					.flex()
@@ -148,7 +184,7 @@ impl WorkbenchModel {
 								},
 								loc,
 							),
-							Btn::Primary,
+							Btn::Default,
 							!busy,
 							86,
 						)

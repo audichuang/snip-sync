@@ -110,36 +110,32 @@ const COMMIT_TOAST_PATHS: usize = 3;
 
 /// The commit copy toast (spec 4.2): commit, file and character counts, and
 /// when files were left out, which commit lost which files.
-fn commit_copied_status(export: &snip_core::commits::CommitExport) -> Msg {
-	let sum = snip_core::commits::copy_summary(&export.payload, &export.text);
+fn commit_copied_status(out: &snip_core::commits::CommitCopyOutcome) -> Msg {
 	let mut args = vec![
-		sum.commit_count.to_string(),
-		sum.file_count.to_string(),
-		sum.chars.to_string(),
+		out.commit_count.to_string(),
+		out.file_count.to_string(),
+		out.chars.to_string(),
 	];
-	if sum.not_copied_count == 0 {
+	if out.not_copied.is_empty() {
 		return Msg::new("status_commits_copied", args);
 	}
-	let mut named = 0;
-	let mut parts = Vec::new();
-	for (n, commit) in export.payload.commits.iter().enumerate() {
-		let paths: Vec<&str> = commit
-			.files
-			.iter()
-			.filter(|f| f.not_copied.is_some())
-			.map(|f| f.path.as_str())
-			.take(COMMIT_TOAST_PATHS.saturating_sub(named))
-			.collect();
-		named += paths.len();
-		if !paths.is_empty() {
-			parts.push(format!("#{} {}", n + 1, paths.join(", ")));
+	// "#n path, path; #m path", at most COMMIT_TOAST_PATHS paths.
+	let mut parts: Vec<(usize, Vec<&str>)> = Vec::new();
+	for (n, path) in out.not_copied.iter().take(COMMIT_TOAST_PATHS) {
+		match parts.last_mut() {
+			Some((m, paths)) if m == n => paths.push(path),
+			_ => parts.push((*n, vec![path.as_str()])),
 		}
 	}
-	let mut detail = parts.join("; ");
-	if named < sum.not_copied_count {
+	let mut detail = parts
+		.iter()
+		.map(|(n, paths)| format!("#{} {}", n + 1, paths.join(", ")))
+		.collect::<Vec<_>>()
+		.join("; ");
+	if out.not_copied.len() > COMMIT_TOAST_PATHS {
 		detail.push_str(" …");
 	}
-	args.push(sum.not_copied_count.to_string());
+	args.push(out.not_copied.len().to_string());
 	args.push(detail);
 	Msg::new("status_commits_copied_skipped", args)
 }
@@ -1240,6 +1236,7 @@ impl WorkbenchModel {
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
+			remote::remember_last(None);
 			model.reload_repos(cx);
 		}
 		model
@@ -2303,6 +2300,7 @@ impl WorkbenchModel {
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
 		recent::remember(&mut self.recent_workspaces, &path);
+		remote::remember_last(None);
 		self.workspace_open = true;
 		self.workspace_menu = false;
 		self.workspace_picker = false;
@@ -2947,10 +2945,6 @@ impl WorkbenchModel {
 				return;
 			}
 			TreeCommand::ToggleSelect(key) => {
-				if self.remote_blocks() {
-					cx.notify();
-					return;
-				}
 				let Some(paths) = self
 					.file_tree
 					.as_ref()
@@ -3223,10 +3217,6 @@ impl WorkbenchModel {
 			return;
 		};
 		if let TreeCommand::ToggleSelect(key) = &cmd {
-			if self.remote_blocks() {
-				cx.notify();
-				return;
-			}
 			let Some(paths) = self
 				.ws_tree
 				.as_ref()
@@ -3933,14 +3923,13 @@ impl WorkbenchModel {
 		targets: Vec<menu::CopyTarget>,
 		cx: &mut Context<Self>,
 	) {
-		if self.remote_blocks() {
-			cx.notify();
-			return;
-		}
 		let name = targets
 			.first()
 			.map(|target| self.log_repo_name(&target.root))
 			.unwrap_or_default();
+		if let Some(session) = self.remote.session.clone() {
+			return self.copy_remote_targets(session, targets, name, cx);
+		}
 		let items: Option<Vec<ExportItem>> = targets
 			.into_iter()
 			.map(|target| {
@@ -4092,41 +4081,147 @@ impl WorkbenchModel {
 					})
 					.await;
 
-				match this.update(&mut async_app, |model, cx| {
-					if !model.accept_copy_result(ws_gen, &cancel) {
-						cx.notify();
-						return;
-					}
-					match result {
-						Ok((text, copied_count, msg)) => {
-							if let Err(e) = clip::write_text(&text) {
-								model.set_status(
-									"status_clipboard_failed",
-									[e.to_string()],
-								);
-							} else {
-								app_log!(
-									"[APP:COPY_DONE: copied={copied_count}]"
-								);
-								model.status = msg;
-							}
-						}
-						Err(err) => {
-							model.status = err;
-						}
-					}
-					let ok = matches!(
-						model.status.key,
-						"status_copied" | "status_copied_limit"
-					);
-					model.show_toast(ok, model.status.clone(), cx);
-					app_log!("[APP:COPY_IDLE]");
-					cx.notify();
+				if let Err(err) = this.update(&mut async_app, |model, cx| {
+					model.finish_copy(ws_gen, &cancel, result, cx)
 				}) {
-					Ok(()) => {}
-					Err(err) => {
-						app_log!("[APP:COPY_IDLE_FAILED: {err}]");
-					}
+					app_log!("[APP:COPY_IDLE_FAILED: {err}]");
+				}
+			},
+		);
+	}
+
+	/// Writes a finished file copy (local or remote) to the clipboard and
+	/// reports it.
+	fn finish_copy(
+		&mut self,
+		ws_gen: u64,
+		cancel: &CancelToken,
+		result: Result<(String, usize, Msg), Msg>,
+		cx: &mut Context<Self>,
+	) {
+		if !self.accept_copy_result(ws_gen, cancel) {
+			cx.notify();
+			return;
+		}
+		match result {
+			Ok((text, copied_count, msg)) => {
+				if let Err(e) = clip::write_text(&text) {
+					self.set_status("status_clipboard_failed", [e.to_string()]);
+				} else {
+					app_log!("[APP:COPY_DONE: copied={copied_count}]");
+					self.status = msg;
+				}
+			}
+			Err(err) => self.status = err,
+		}
+		let ok =
+			matches!(self.status.key, "status_copied" | "status_copied_limit");
+		self.show_toast(ok, self.status.clone(), cx);
+		app_log!("[APP:COPY_IDLE]");
+		cx.notify();
+	}
+
+	/// A remote workspace's Copy: the worker runs the same copy engine on
+	/// its files and sends the payload back.
+	fn copy_remote_targets(
+		&mut self,
+		session: crate::remote::RemoteSession,
+		targets: Vec<menu::CopyTarget>,
+		repo_name: String,
+		cx: &mut Context<Self>,
+	) {
+		if !self.accepting_work() {
+			return;
+		}
+		if self.is_copying {
+			app_log!("[APP:COPY_BUSY]");
+			return;
+		}
+		if targets.is_empty() {
+			app_log!("[APP:COPY_REFUSED: empty_selection]");
+			self.set_status("status_copy_empty", []);
+			cx.notify();
+			return;
+		}
+		let items: Option<Vec<snip_remote::proto::ExportTarget>> = targets
+			.into_iter()
+			.map(|target| {
+				Some(snip_remote::proto::ExportTarget {
+					root: crate::remote::remote_rel(
+						&session.root,
+						&target.root,
+					)?,
+					path: target.path,
+					source: target.source,
+					change_type: target.change_type,
+				})
+			})
+			.collect();
+		let Some(items) = items else {
+			self.set_status("error_selection_root", []);
+			cx.notify();
+			return;
+		};
+
+		self.is_copying = true;
+		self.set_status("status_copying", [repo_name.clone()]);
+		if e2e_on() {
+			app_log!("[APP:COPY_PREP: files={}]", items.len());
+		}
+		cx.notify();
+
+		let cancel = arm_cancel(&mut self.copy_cancel);
+		let job_token = cancel.clone();
+		let run_token = cancel.clone();
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		let ws_gen = self.lifecycle.generation();
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(job_token),
+			async move {
+				let result: Result<(String, usize, Msg), Msg> = bg
+					.spawn(async move {
+						let out = session
+							.client
+							.export_files(
+								&session.workspace.id,
+								items,
+								&native_export_settings(),
+								NATIVE_FILE_COUNT_LIMIT,
+								Some(&run_token),
+							)
+							.map_err(|e| {
+								Msg::new(
+									"error_payload",
+									[crate::remote::describe(e)],
+								)
+							})?;
+						if out.copied == 0 {
+							return Err(Msg::new("status_copy_nothing", []));
+						}
+						let mut args = vec![
+							repo_name,
+							out.copied.to_string(),
+							out.chars.to_string(),
+							out.lines.to_string(),
+							out.skipped.to_string(),
+						];
+						let msg = if out.truncated {
+							args.push(NATIVE_FILE_COUNT_LIMIT.to_string());
+							Msg::new("status_copied_limit", args)
+						} else {
+							Msg::new("status_copied", args)
+						};
+						Ok((out.payload, out.copied, msg))
+					})
+					.await;
+				if let Err(err) = this.update(&mut async_app, |model, cx| {
+					model.finish_copy(ws_gen, &cancel, result, cx)
+				}) {
+					app_log!("[APP:COPY_IDLE_FAILED: {err}]");
 				}
 			},
 		);
@@ -4135,10 +4230,6 @@ impl WorkbenchModel {
 	/// Exports the selected commit or first-parent commit range to the clipboard.
 	pub fn copy_commits_to_clipboard(&mut self, cx: &mut Context<Self>) {
 		if !self.accepting_work() {
-			return;
-		}
-		if self.remote_blocks() {
-			cx.notify();
 			return;
 		}
 		if self.is_copying {
@@ -4166,6 +4257,21 @@ impl WorkbenchModel {
 				}
 			};
 
+		// A remote repo is named by its path under the workspace.
+		let remote = match self.remote.session.clone() {
+			Some(session) => {
+				match crate::remote::remote_rel(&session.root, &repo_root) {
+					Some(repo) => Some((session, repo)),
+					None => {
+						self.set_status("error_selection_root", []);
+						cx.notify();
+						return;
+					}
+				}
+			}
+			None => None,
+		};
+
 		self.is_copying = true;
 		self.set_status("status_copying", [repo_name.clone()]);
 		if e2e_on() {
@@ -4188,6 +4294,20 @@ impl WorkbenchModel {
 			async move {
 				let result: Result<(String, usize, Msg), String> = bg
 					.spawn(async move {
+						if let Some((session, repo)) = remote {
+							let out = session
+								.client
+								.export_commits(
+									&session.workspace.id,
+									&repo,
+									&tip_sha,
+									selected,
+									Some(&run_token),
+								)
+								.map_err(crate::remote::describe)?;
+							let status = commit_copied_status(&out);
+							return Ok((out.text, out.commit_count, status));
+						}
 						let opts = interactive_read_opts(run_token);
 						let git = Git::open_with(&repo_root, &opts)
 							.map_err(|e| e.to_string())?;
@@ -4199,9 +4319,9 @@ impl WorkbenchModel {
 							snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 						)
 						.map_err(|e| e.to_string())?;
-						let n_commits = exported.payload.commits.len();
-						let status = commit_copied_status(&exported);
-						Ok((exported.text, n_commits, status))
+						let out = exported.outcome();
+						let status = commit_copied_status(&out);
+						Ok((out.text, out.commit_count, status))
 					})
 					.await;
 
@@ -5012,19 +5132,66 @@ fn read_preview(
 	}
 }
 
-/// `--workspace`, else the last remembered workspace (IntelliJ reopens the
-/// last project), else the launch folder. A Finder or Explorer launch starts
-/// in `/` or the home folder: that opens nothing rather than scanning it.
-fn startup_workspace(arg: Option<PathBuf>) -> Option<PathBuf> {
+/// What the app opens when it starts.
+#[derive(Debug, PartialEq, Eq)]
+enum Startup {
+	Local(PathBuf),
+	/// Reconnected in the background once the window is up.
+	Remote(remote::RecentRemote),
+	Nothing,
+}
+
+impl Startup {
+	fn local(self) -> Option<PathBuf> {
+		match self {
+			Startup::Local(path) => Some(path),
+			_ => None,
+		}
+	}
+}
+
+/// `--workspace`, else the last workspace open when it was remote, else the
+/// last remembered local one (IntelliJ reopens the last project), else the
+/// launch folder. A Finder or Explorer launch starts in `/` or the home
+/// folder: that opens nothing rather than scanning it.
+fn startup_choice(
+	arg: Option<PathBuf>,
+	last_remote: Option<remote::RecentRemote>,
+	last_local: Option<PathBuf>,
+	cwd: Option<PathBuf>,
+	home: Option<PathBuf>,
+) -> Startup {
+	if let Some(arg) = arg {
+		return Startup::Local(arg);
+	}
+	if let Some(last) = last_remote {
+		return Startup::Remote(last);
+	}
+	if let Some(last) = last_local {
+		return Startup::Local(last);
+	}
+	match cwd {
+		Some(cwd) if cwd.parent().is_some() && Some(&cwd) != home.as_ref() => {
+			Startup::Local(cwd)
+		}
+		_ => Startup::Nothing,
+	}
+}
+
+/// [`startup_choice`] on the remembered workspaces; nothing is read under
+/// `cfg(test)` or in an e2e run without `SNIP_CONFIG_DIR`. Only a normal
+/// launch (`allow_remote`) reconnects to a remote workspace.
+fn startup_workspace(arg: Option<PathBuf>, allow_remote: bool) -> Startup {
 	if arg.is_some() {
-		return arg;
+		return startup_choice(arg, None, None, None, None);
 	}
-	if let Some(last) = recent::load().into_iter().next() {
-		return Some(last);
-	}
-	let cwd = std::env::current_dir().ok()?;
-	(cwd.parent().is_some() && Some(&cwd) != recent::home().as_ref())
-		.then_some(cwd)
+	startup_choice(
+		None,
+		remote::load_last().filter(|_| allow_remote),
+		recent::load().into_iter().next(),
+		std::env::current_dir().ok(),
+		recent::home(),
+	)
 }
 
 type CliArgs = (Option<PathBuf>, String, Option<PathBuf>);
@@ -5206,7 +5373,11 @@ fn key_bindings() -> Vec<KeyBinding> {
 
 fn main() {
 	let (workspace, mode, restore_dir) = parse_cli_args();
-	let workspace = startup_workspace(workspace);
+	let (workspace, reconnect) =
+		match startup_workspace(workspace, mode == "normal") {
+			Startup::Remote(last) => (None, Some(last)),
+			other => (other.local(), None),
+		};
 	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
@@ -5215,6 +5386,7 @@ fn main() {
 
 		let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
 		let ws = workspace.clone();
+		let last_remote = reconnect.clone();
 		let app_mode = mode.clone();
 		let paste_dir = restore_dir.clone();
 
@@ -5243,6 +5415,9 @@ fn main() {
 				}
 				let model = cx
 					.new(|cx| WorkbenchModel::new(ws, paste_dir, app_mode, cx));
+				if let Some(last) = last_remote {
+					model.update(cx, |m, cx| m.reopen_last_remote(last, cx));
+				}
 				let fh = model.read(cx).focus_handle.clone();
 				window.focus(&fh);
 				let close_target = model.clone();
@@ -5264,6 +5439,48 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+	/// `--workspace` wins; then the last workspace open when it was remote;
+	/// then the last local one; then a launch folder other than `/` or home.
+	#[test]
+	fn startup_reconnects_the_last_remote_workspace_unless_told_otherwise() {
+		use super::{startup_choice, startup_workspace, Startup};
+		use crate::remote::RecentRemote;
+		use std::path::PathBuf;
+		let last = || {
+			Some(RecentRemote {
+				host: "macmini".into(),
+				path: "/Users/x/ck/cat".into(),
+			})
+		};
+		let p = |s: &str| Some(PathBuf::from(s));
+		assert_eq!(
+			startup_choice(p("/arg"), last(), p("/local"), p("/cwd"), None),
+			Startup::Local(PathBuf::from("/arg"))
+		);
+		assert_eq!(
+			startup_choice(None, last(), p("/local"), p("/cwd"), None),
+			Startup::Remote(last().unwrap())
+		);
+		assert_eq!(
+			startup_choice(None, None, p("/local"), p("/cwd"), None),
+			Startup::Local(PathBuf::from("/local"))
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/home/u/w"), p("/home/u")),
+			Startup::Local(PathBuf::from("/home/u/w"))
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/home/u"), p("/home/u")),
+			Startup::Nothing
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/"), None),
+			Startup::Nothing
+		);
+		// Nothing remembered is read under cfg(test).
+		assert!(!matches!(startup_workspace(None, true), Startup::Remote(_)));
+	}
+
 	/// UI state driven in-process: no display, so these also run in the
 	/// Windows and macOS Test jobs, which have no real-app GUI test.
 	mod in_process {
@@ -5357,6 +5574,94 @@ mod tests {
 			REMOTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 		}
 
+		/// A remote open goes through the shared close drain, which also
+		/// waits for every git process in this test binary (GitLoad is
+		/// process wide), so under parallel tests it may not end on its own
+		/// here. Polled as if git were idle, the intent it queued lands.
+		fn land_remote_open(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			model.update(cx, |m, cx| {
+				assert!(!m.workspace_menu, "{:?}", m.remote.message);
+				if m.remote.session.is_none() {
+					assert_eq!(
+						m.lifecycle.intent_name(),
+						"open-remote-workspace"
+					);
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now(),
+						crate::lifecycle::GitLoad::idle(),
+					);
+					let crate::lifecycle::Step::Ready(
+						crate::lifecycle::Intent::OpenRemoteWorkspace(target),
+					) = step
+					else {
+						panic!("drain not ready: {step:?}");
+					};
+					// finish_intent would check the real GitLoad again.
+					let (host, ws) = *target;
+					m.finish_open_remote(host, ws, cx);
+				}
+			});
+		}
+
+		/// A window with no workspace and an in-process worker as the only
+		/// ssh host, its menu open.
+		fn remote_menu(
+			cx: &mut TestAppContext,
+		) -> (Entity<WorkbenchModel>, &mut VisualTestContext) {
+			let worker = std::sync::Arc::new(snip_remote::Worker::new(
+				snip_remote::WorkerOptions::default(),
+			));
+			let host = snip_remote::RemoteHost::in_process(worker);
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(None, None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			model.update(cx, |m, _| {
+				m.workspace_menu = true;
+				m.remote.hosts = vec![host];
+				m.remote.recent.clear();
+			});
+			(model, cx)
+		}
+
+		/// Clicks the row of subfolder `name` in the host's block.
+		fn click_remote_folder(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			name: &str,
+		) {
+			let ix = model.read_with(cx, |m, _| {
+				let b = m.remote.browse.as_ref().expect("a host browsed");
+				let Some(Ok(listing)) = &b.listing else {
+					panic!("not listed: {b:?}");
+				};
+				listing.folders.iter().position(|f| f == name).unwrap()
+			});
+			let id = format!("remote-folder:{ix}");
+			click(cx, Box::leak(id.into_boxed_str()));
+		}
+
+		/// The folder shown in the host's block, and its subfolders.
+		fn shown_folder(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> (String, Vec<String>) {
+			model.read_with(cx, |m, _| {
+				let b = m.remote.browse.as_ref().expect("a host browsed");
+				let Some(Ok(listing)) = &b.listing else {
+					panic!("not listed: {b:?}");
+				};
+				assert_eq!(b.path, listing.path);
+				let mut folders = listing.folders.clone();
+				folders.sort();
+				(listing.path.clone(), folders)
+			})
+		}
+
 		/// Lists an in-process worker as the only ssh host, opens `shared`
 		/// on it as the workspace, and awaits background tree and status
 		/// reads.
@@ -5386,33 +5691,7 @@ mod tests {
 				m.open_remote_path(0, path, cx);
 			});
 			settle(cx);
-
-			// The open goes through the shared close drain, which also waits
-			// for every git process in this test binary (GitLoad is process
-			// wide), so under parallel tests it may not end on its own here.
-			// Polled as if git were idle, the intent it queued lands.
-			model.update(cx, |m, cx| {
-				assert!(!m.workspace_menu, "{:?}", m.remote.message);
-				if m.remote.session.is_none() {
-					assert_eq!(
-						m.lifecycle.intent_name(),
-						"open-remote-workspace"
-					);
-					let step = m.lifecycle.poll_at(
-						std::time::Instant::now(),
-						crate::lifecycle::GitLoad::idle(),
-					);
-					let crate::lifecycle::Step::Ready(
-						crate::lifecycle::Intent::OpenRemoteWorkspace(target),
-					) = step
-					else {
-						panic!("drain not ready: {step:?}");
-					};
-					// finish_intent would check the real GitLoad again.
-					let (host, ws) = *target;
-					m.finish_open_remote(host, ws, cx);
-				}
-			});
+			land_remote_open(&model, cx);
 			for _ in 0..10 {
 				settle(cx);
 				let done = model.read_with(cx, |m, _| {
@@ -5471,10 +5750,12 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.remote.message, None);
 				assert_eq!(m.remote.hosts.len(), 1);
-				let Some((0, Some(Ok(listing)))) = &m.remote.browse else {
+				let Some(Some(Ok(listing))) =
+					m.remote.browse.as_ref().map(|b| &b.listing)
+				else {
 					panic!("home not listed: {:?}", m.remote.browse);
 				};
-				assert!(!listing.home.is_empty());
+				assert!(!listing.path.is_empty());
 				let session = m.remote.session.as_ref().expect("open");
 				assert_eq!(session.workspace.name, "shared");
 				assert_eq!(m.remote.recent[0].path, session.workspace.id);
@@ -5589,6 +5870,226 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.preview_error.is_some(), "refused read shown");
+			});
+		}
+
+		/// Clicking a folder of a host enters it and opens nothing; "up one
+		/// level" goes back; "open this folder" opens the folder shown. The
+		/// temp folder is reached through macOS's `/var` symlink, so the
+		/// worker's real path differs from the one asked for.
+		#[gpui::test]
+		fn remote_folder_browser_enters_goes_up_and_opens_here(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("base");
+			for d in ["a/x", "a/y", "b", ".hidden"] {
+				fs::create_dir_all(base.join(d)).unwrap();
+			}
+			fs::write(base.join("file.txt"), "f").unwrap();
+			let real = |p: &Path| {
+				dunce::canonicalize(p).unwrap().display().to_string()
+			};
+			let (model, cx) = remote_menu(cx);
+
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+			});
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base));
+			assert_eq!(folders, ["a", "b"], "dot folders and files hidden");
+			model.read_with(cx, |m, cx| {
+				assert_eq!(m.remote_path_input.read(cx).text(), real(&base));
+			});
+
+			click_remote_folder(&model, cx, "a");
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base.join("a")));
+			assert_eq!(folders, ["x", "y"]);
+			model.read_with(cx, |m, cx| {
+				assert!(m.remote.session.is_none(), "entering opens nothing");
+				assert!(!m.workspace_open && m.workspace_menu);
+				assert_eq!(m.lifecycle.intent_name(), "none");
+				assert_eq!(
+					m.remote_path_input.read(cx).text(),
+					real(&base.join("a"))
+				);
+			});
+
+			click(cx, "remote-up");
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base));
+			assert_eq!(folders, ["a", "b"]);
+
+			click_remote_folder(&model, cx, "b");
+			settle(cx);
+			click(cx, "btn-remote-open-here");
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("opened");
+				assert_eq!(session.workspace.id, real(&base.join("b")));
+				assert_eq!(m.remote.recent[0].path, session.workspace.id);
+				assert!(m.workspace_open);
+			});
+		}
+
+		/// A listing that lands for a folder or host no longer shown is
+		/// dropped.
+		#[gpui::test]
+		fn remote_folder_listing_for_a_folder_no_longer_shown_is_dropped(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			fs::create_dir_all(tmp.path().join("a")).unwrap();
+			let (model, cx) = remote_menu(cx);
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, tmp.path().display().to_string(), cx);
+			});
+			settle(cx);
+			let before = shown_folder(&model, cx);
+			model.update(cx, |m, cx| {
+				let seq = m.remote.browse.as_ref().unwrap().seq();
+				m.remote_listing_landed(
+					seq.wrapping_sub(1),
+					Ok(crate::remote::FolderListing {
+						path: "/elsewhere".into(),
+						folders: vec!["zzz".into()],
+					}),
+					cx,
+				);
+			});
+			assert_eq!(shown_folder(&model, cx), before);
+
+			// Asked for while another listing was on its way: only the newer
+			// one lands.
+			model.update(cx, |m, cx| {
+				m.enter_remote_folder("a", cx);
+				let stale = m.remote.browse.as_ref().unwrap().seq();
+				m.remote_up(cx);
+				m.remote_listing_landed(stale, Err("late failure".into()), cx);
+				assert_eq!(m.remote.browse.as_ref().unwrap().listing, None);
+			});
+			settle(cx);
+			assert_eq!(shown_folder(&model, cx).0, before.0.clone());
+		}
+
+		/// A remote folder opened before is listed in the menu's top-level
+		/// recent list, after the local ones, and one click reopens it.
+		#[gpui::test]
+		fn remote_recent_is_in_the_top_level_list_and_reopens(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let local = tmp.path().join("local");
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&local).unwrap();
+			fs::create_dir_all(&shared).unwrap();
+			let shared_id =
+				dunce::canonicalize(&shared).unwrap().display().to_string();
+			let (model, cx) = remote_menu(cx);
+			model.update(cx, |m, cx| {
+				m.recent_workspaces = vec![local.clone()];
+				m.remote.recent = vec![crate::remote::RecentRemote {
+					host: m.remote.hosts[0].name.clone(),
+					path: shared_id.clone(),
+				}];
+				cx.notify();
+			});
+			settle(cx);
+			let local_row = cx
+				.debug_bounds("workspace-recent:0")
+				.expect("local recent listed");
+			let remote_row = cx
+				.debug_bounds("remote-recent:0")
+				.expect("remote recent listed at the top level");
+			assert!(
+				local_row.origin.y < remote_row.origin.y,
+				"after the local ones"
+			);
+			click(cx, "remote-recent:0");
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("reopened");
+				assert_eq!(session.workspace.id, shared_id);
+				assert_eq!(m.remote.recent.len(), 1);
+			});
+		}
+
+		/// The launch reconnect: the last remote workspace opens in the
+		/// background; a folder or host that is gone leaves the app with no
+		/// workspace and says why, on the status bar and the empty screen.
+		#[gpui::test]
+		fn launch_reconnects_the_last_remote_workspace_or_says_why_not(
+			cx: &mut TestAppContext,
+		) {
+			use crate::remote::RecentRemote;
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let id = dunce::canonicalize(tmp.path())
+				.unwrap()
+				.display()
+				.to_string();
+			let (model, cx) = remote_menu(cx);
+			let host = model.update(cx, |m, _| {
+				m.workspace_menu = false;
+				m.remote.hosts[0].name.clone()
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: "gone-host".into(),
+						path: id.clone(),
+					},
+					cx,
+				);
+				assert_eq!(m.status.key, "remote_open_failed");
+				assert!(!m.workspace_open && !m.remote.busy);
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: host.clone(),
+						path: format!("{id}/missing"),
+					},
+					cx,
+				);
+				assert_eq!(m.status.key, "remote_reconnecting");
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "remote_open_failed");
+				assert!(!m.workspace_open && m.remote.session.is_none());
+				assert!(matches!(m.remote.message, Some((false, _))));
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: host.clone(),
+						path: id.clone(),
+					},
+					cx,
+				);
+			});
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("reconnected");
+				assert_eq!(session.workspace.id, id);
+				assert!(m.workspace_open);
 			});
 		}
 
@@ -7015,8 +7516,9 @@ mod tests {
 		}
 
 		#[gpui::test]
-		fn remote_copy_paths_are_refused(cx: &mut TestAppContext) {
+		fn remote_copy_runs_on_the_worker(cx: &mut TestAppContext) {
 			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
 			use crate::tree::{NodeKey, TreeCommand};
 			let tmp = tempfile::tempdir().unwrap();
 			let shared = tmp.path().join("shared");
@@ -7072,130 +7574,128 @@ mod tests {
 				}
 			}
 
-			let check = |model: &Entity<WorkbenchModel>,
-			             cx: &mut VisualTestContext,
-			             act: &str| {
-				model.read_with(cx, |m, _| {
-					assert_eq!(
-						m.status.key, "remote_unsupported",
-						"{act} should set status to remote_unsupported"
-					);
-					assert!(!m.is_copying, "{act} should not set is_copying");
+			// Runs one copy and waits for the worker's payload to land.
+			let run = |model: &Entity<WorkbenchModel>,
+			           cx: &mut VisualTestContext,
+			           act: &dyn Fn(
+				&mut WorkbenchModel,
+				&mut gpui::Context<WorkbenchModel>,
+			),
+			           what: &str|
+			 -> String {
+				clip::write_text("before").unwrap();
+				model.update(cx, |m, cx| {
+					m.set_status("status_idle", []);
+					act(m, cx);
 				});
+				for _ in 0..200 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.is_copying) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+				model.read_with(cx, |m, _| {
+					assert!(!m.is_copying, "{what}: still copying");
+					assert!(
+						matches!(
+							m.status.key,
+							"status_copied" | "status_commits_copied"
+						),
+						"{what}: {}",
+						m.status
+					);
+				});
+				clip::read_text().unwrap()
+			};
+			let files = |text: &str| -> Vec<(String, String)> {
+				parse_clipboard(text, "")
+					.into_iter()
+					.map(|e| (e.path, e.content))
+					.collect()
+			};
+			let copy_node = |targets: Vec<crate::menu::CopyTarget>| {
+				move |m: &mut WorkbenchModel,
+				      cx: &mut gpui::Context<WorkbenchModel>| {
+					m.copy_targets(targets.clone(), cx)
+				}
 			};
 
-			let copy_node =
-				|model: &Entity<WorkbenchModel>,
-				 cx: &mut VisualTestContext,
-				 targets: Vec<crate::menu::CopyTarget>| {
-					assert!(!targets.is_empty());
-					cx.update(|window, cx| {
-						model.update(cx, |m, cx| {
-							m.run_menu_act(
-								crate::menu::MenuAct::CopyNode(targets),
-								window,
-								cx,
-							);
-						});
-					});
-				};
-
-			// 1. Copy on a Changes file row
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			let targets = model.read_with(cx, |m, _| {
-				m.change_row_menu(0)
-					.into_iter()
-					.find_map(|e| match e {
-						crate::menu::MenuEntry::Item {
-							act: Some(crate::menu::MenuAct::CopyNode(t)),
-							..
-						} => Some(t),
-						_ => None,
-					})
-					.expect("the file row offers Copy")
+			// A Changes file row: the worker's working-tree bytes.
+			let row = model.read_with(cx, |m, _| {
+				let idx = m
+					.files
+					.iter()
+					.position(|f| f.path == "dirty.txt")
+					.expect("dirty.txt is a change");
+				copy_of(m.change_row_menu(idx)).expect("the row offers Copy")
 			});
-			copy_node(&model, cx, targets);
-			check(&model, cx, "Copy on a file row");
+			let text = run(&model, cx, &copy_node(row), "file row");
+			assert_eq!(files(&text), entries(&[("dirty.txt", "dirty")]));
 
-			// 2. Copy on the Unstaged group
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			let targets = model.read_with(cx, |m, _| {
+			// The Unstaged group.
+			let group = model.read_with(cx, |m, _| {
 				m.change_targets(|_, f| {
 					crate::menu::change_group(f) == Some("unstaged")
 				})
 			});
-			copy_node(&model, cx, targets);
-			check(&model, cx, "Copy on a group");
+			assert!(!group.is_empty());
+			let text = run(&model, cx, &copy_node(group), "group");
+			assert_eq!(files(&text), entries(&[("dirty.txt", "dirty")]));
 
-			// 5. dispatch_tree(ToggleSelect(..)) on file_tree
-			model.update(cx, |m, _| m.set_status("status_idle", []));
+			// A Project tree selection.
 			model.update(cx, |m, cx| {
 				m.dispatch_tree(
 					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
-						"dirty.txt",
+						"init.txt",
 					))),
 					cx,
 				);
 			});
-			check(&model, cx, "dispatch_tree(ToggleSelect)");
+			let picked = model.read_with(cx, |m, _| m.project_targets());
+			assert_eq!(picked.len(), 1, "{picked:?}");
+			let text = run(&model, cx, &copy_node(picked), "project");
+			assert_eq!(files(&text), entries(&[("init.txt", "hello")]));
 
-			// 6. dispatch_ws_tree(ToggleSelect(..)) on ws_tree
-			model.update(cx, |m, _| m.set_status("status_idle", []));
+			// A file at a commit, after the worktree changed.
+			// The log row's id names its repo; the menu splits it the same way.
+			let (repo_root, sha) = model.read_with(cx, |m, _| {
+				let id = &m.commits.first().expect("commit exists").sha;
+				m.log_root_for(id).expect("the row's repo and sha")
+			});
+			fs::write(alpha.join("init.txt"), "changed\n").unwrap();
+			let at = vec![crate::menu::CopyTarget {
+				root: repo_root,
+				path: "init.txt".into(),
+				source: snip_core::transfer::SourceKind::Commit { rev: sha },
+				change_type: None,
+			}];
+			let text = run(&model, cx, &copy_node(at), "commit file");
+			assert_eq!(files(&text), entries(&[("init.txt", "hello")]));
+
+			// The selected commit as a commit payload.
 			model.update(cx, |m, cx| {
-				m.dispatch_ws_tree(
-					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
-						"alpha",
-					))),
-					cx,
-				);
+				let id = m.commits.first().expect("commit exists").sha.clone();
+				m.select_commit(&id, cx);
 			});
-			check(&model, cx, "dispatch_ws_tree(ToggleSelect)");
-
-			// 7. Copy of a file at a commit
-			let (sha, repo_root) = model.read_with(cx, |m, _| {
-				(
-					m.commits.first().expect("commit exists").sha.clone(),
-					m.repo().unwrap().root.clone(),
-				)
-			});
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			copy_node(
+			settle(cx);
+			let text = run(
 				&model,
 				cx,
-				vec![crate::menu::CopyTarget {
-					root: repo_root,
-					path: "init.txt".into(),
-					source: snip_core::transfer::SourceKind::Commit {
-						rev: sha,
-					},
-					change_type: None,
-				}],
+				&|m: &mut WorkbenchModel,
+				  cx: &mut gpui::Context<WorkbenchModel>| {
+					m.copy_commits_to_clipboard(cx)
+				},
+				"commits",
 			);
-			check(&model, cx, "Copy at a commit");
-
-			// 10. copy_commits_to_clipboard
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.copy_commits_to_clipboard(cx));
-			check(&model, cx, "copy_commits_to_clipboard");
-
-			// 11. copy_cursor_node
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.copy_cursor_node(cx));
-			check(&model, cx, "copy_cursor_node");
-
-			// 12. cx.simulate_keystrokes("cmd-c") and "ctrl-c"
-			cx.update(|window, cx| {
-				window.focus(&model.read(cx).focus_handle.clone());
-			});
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			cx.simulate_keystrokes("cmd-c");
-			cx.run_until_parked();
-			check(&model, cx, "cmd-c");
-
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			cx.simulate_keystrokes("ctrl-c");
-			cx.run_until_parked();
-			check(&model, cx, "ctrl-c");
+			assert!(text.contains("init.txt"), "{text}");
+			assert!(
+				matches!(
+					snip_core::clip::detect_mode(&text),
+					snip_core::clip::Mode::Commits
+				),
+				"{text}"
+			);
 		}
 
 		#[gpui::test]
@@ -12061,9 +12561,9 @@ mod tests {
 		let clean = export(CommitsPayload {
 			commits: vec![record(vec![file("a.txt", None)]), record(vec![])],
 		});
-		let msg = commit_copied_status(&clean);
-		assert_eq!(msg.key, "status_commits_copied");
 		let chars = clean.text.encode_utf16().count().to_string();
+		let msg = commit_copied_status(&clean.outcome());
+		assert_eq!(msg.key, "status_commits_copied");
 		assert_eq!(msg.args, ["2", "1", chars.as_str()]);
 
 		let lossy = export(CommitsPayload {
@@ -12073,7 +12573,7 @@ mod tests {
 				record(vec![file("w.bin", bin)]),
 			],
 		});
-		let msg = commit_copied_status(&lossy);
+		let msg = commit_copied_status(&lossy.outcome());
 		assert_eq!(msg.key, "status_commits_copied_skipped");
 		assert_eq!(&msg.args[..2], ["3", "5"]);
 		assert_eq!(&msg.args[3..], ["4", "#1 x.bin; #2 y.bin, z.bin …"]);

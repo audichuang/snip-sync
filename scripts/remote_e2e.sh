@@ -141,6 +141,12 @@ g_init() {
 }
 mkdir -p gitws/plain gitws/broken/.git outer/inner
 echo plain > gitws/plain/file.txt
+# Worktrees synced from another machine: their .git names a gitdir that
+# does not exist here, as in a Google Drive copy.
+mkdir -p gitws/wt-gone-1 gitws/wt-gone-2
+echo 'gitdir: /nonexistent/other-machine/.git/worktrees/wt-gone-1' > gitws/wt-gone-1/.git
+echo 'gitdir: /nonexistent/other-machine/.git/worktrees/wt-gone-2' > gitws/wt-gone-2/.git
+echo kept > gitws/wt-gone-1/kept.txt
 
 g_init gitws/alpha
 printf 'commit 1 a\n' > gitws/alpha/a.txt
@@ -262,6 +268,23 @@ for n in $counts; do
 	check "$n parallel reads all correct ($good/$n)" test "$good" = "$n"
 done
 
+echo "== copy"
+# The payload made on the worker, sent back (crossing many frames when
+# large), equals `snip copy` run on that machine itself.
+local_sum=$(w <<<"cd '$WD/text' && '$RSNIP' copy . --stdout 2>/dev/null" | hash_of)
+remote_sum=$("$SNIP" remote copy h "$WD/text" --stdout 2>/dev/null | hash_of)
+check "a remote copy of a folder equals snip copy on the worker" test "$remote_sum" = "$local_sum" -a -n "$remote_sum"
+w <<<"mkdir -p '$WD/big' && for i in \$(seq 10 39); do head -c 330000 /dev/zero | tr '\\000' \"\${i:1:1}\" > '$WD/big/f'\$i.txt; done"
+local_big=$(w <<<"cd '$WD/big' && '$RSNIP' copy . --stdout 2>/dev/null" | hash_of)
+remote_big=$("$SNIP" remote copy h "$WD/big" --stdout 2>/dev/null | hash_of)
+check "a 10 MB copy crosses frames intact" test "$remote_big" = "$local_big" -a -n "$remote_big"
+staged_copy=$("$SNIP" remote copy h "$WD/gitws" --in alpha --staged --stdout 2>/dev/null)
+check "a remote copy of staged changes" grep -q "staged file content" <<<"$staged_copy"
+alpha_tip=$(w <<<"git -C '$WD/gitws/alpha' rev-parse HEAD")
+commit_copy=$("$SNIP" remote copy-commits h "$WD/gitws" --in alpha "$alpha_tip" --stdout 2>/dev/null)
+check "a remote copy of a commit" grep -q '"message":"second commit' <<<"$commit_copy"
+refused "a copy out of the workspace" "" copy h "$WD/edge" ../secret.txt --stdout
+
 echo "== git views"
 w <<<"sleep 1 && touch '$WD/gitws/alpha/b.txt'"
 alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
@@ -269,6 +292,9 @@ alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/
 repos_gitws=$("$SNIP" remote repos h "$WD/gitws")
 check "repos gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
 check "broken appears as an error row" test "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1
+check "two worktrees with a missing gitdir are error rows" test "$(grep -cE '^wt-gone-[12]	error: ' <<<"$repos_gitws")" = 2
+check "the broken worktrees do not hide alpha's changes" bash -c "'$SNIP' remote changes h '$WD/gitws' alpha | grep -q 'a.txt'"
+check "a broken worktree's files still browse" bash -c "'$SNIP' remote cat h '$WD/gitws' wt-gone-1/kept.txt | grep -qx kept"
 check "wt and borrowed are served as locally" test "$(grep '^wt	' <<<"$repos_gitws" | grep -vc error)" = 1 -a "$(grep '^borrowed	' <<<"$repos_gitws" | grep -vc error)" = 1
 
 changes_mainwt=$("$SNIP" remote changes h "$WD/gitws" mainwt)

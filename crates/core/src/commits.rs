@@ -1053,6 +1053,44 @@ pub struct CommitCopySummary {
 	pub not_copied_count: usize,
 }
 
+/// A commit copy as its status line needs it, without the payload's file
+/// contents: what a remote worker sends back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitCopyOutcome {
+	pub text: String,
+	pub commit_count: usize,
+	pub file_count: usize,
+	/// UTF-16 code units of `text`.
+	pub chars: usize,
+	/// (commit index, path) of every file left out, in commit order.
+	pub not_copied: Vec<(usize, String)>,
+}
+
+impl CommitExport {
+	pub fn outcome(self) -> CommitCopyOutcome {
+		let sum = copy_summary(&self.payload, &self.text);
+		let not_copied = self
+			.payload
+			.commits
+			.iter()
+			.enumerate()
+			.flat_map(|(n, c)| {
+				c.files
+					.iter()
+					.filter(|f| f.not_copied.is_some())
+					.map(move |f| (n, f.path.clone()))
+			})
+			.collect();
+		CommitCopyOutcome {
+			text: self.text,
+			commit_count: sum.commit_count,
+			file_count: sum.file_count,
+			chars: sum.chars,
+			not_copied,
+		}
+	}
+}
+
 pub fn copy_summary(payload: &CommitsPayload, text: &str) -> CommitCopySummary {
 	let files = payload.commits.iter().flat_map(|c| &c.files);
 	CommitCopySummary {

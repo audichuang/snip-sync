@@ -32,7 +32,7 @@ impl WorkbenchModel {
 		};
 		let open = self.workspace_open;
 		let current = self.workspace_root.clone();
-		let recent: Vec<AnyElement> = self
+		let mut recent: Vec<AnyElement> = self
 			.recent_workspaces
 			.iter()
 			.enumerate()
@@ -47,6 +47,7 @@ impl WorkbenchModel {
 					SharedString::from(format!("workspace-recent:{ix}")),
 					70 + ix as isize,
 				)
+				.debug_selector(move || format!("workspace-recent:{ix}"))
 				.h(px(38.))
 				// The row clips a long path; hover shows all of it.
 				.tooltip(tip(path.display().to_string()))
@@ -77,6 +78,50 @@ impl WorkbenchModel {
 				.into_any_element()
 			})
 			.collect();
+		// Remote folders opened before, after the local ones (the local
+		// list keeps no times to merge by).
+		recent.extend(self.remote.recent.iter().enumerate().map(|(n, r)| {
+			let id = format!("remote-recent:{n}");
+			let name = r
+				.path
+				.trim_end_matches(['/', '\\'])
+				.rsplit(['/', '\\'])
+				.next()
+				.filter(|n| !n.is_empty())
+				.unwrap_or(&r.path);
+			let is_current = remote.is_some_and(|s| {
+				s.host() == r.host && s.workspace.id == r.path
+			});
+			let selector = id.clone();
+			menu_row(SharedString::from(id.clone()), 87)
+				.debug_selector(move || selector)
+				.h(px(38.))
+				.tooltip(tip(format!("{}:{}", r.host, r.path)))
+				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
+				.on_click(cx.listener(move |this, _, _, cx| {
+					this.open_remote_recent(n, cx);
+				}))
+				.child(div().flex_shrink_0().child(icon(Icon::Folder, 16.)))
+				.child(
+					div()
+						.flex()
+						.flex_col()
+						.min_w_0()
+						.child(
+							div().font_weight(FontWeight::SEMIBOLD).child(
+								clip_text(format!("{} ▸ {name}", r.host)),
+							),
+						)
+						.child(
+							div()
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(clip_text(r.path.clone())),
+						),
+				)
+				.children(probe(log, id))
+				.into_any_element()
+		}));
 		let sep = || {
 			div()
 				.h(px(1.))
@@ -282,6 +327,24 @@ impl WorkbenchModel {
 						div()
 							.text_color(rgb(pal().text_muted))
 							.child(t("workspace_closed", loc)),
+					)
+					// A remote folder that failed to open, the one reconnected
+					// to on launch included.
+					.when_some(
+						self.remote.message.as_ref().filter(|(ok, _)| !ok),
+						|d, (_, text)| {
+							d.child(
+								div()
+									.id("workspace-closed-remote-error")
+									.relative()
+									.text_color(rgb(pal().error))
+									.child(text.clone())
+									.children(probe(
+										&self.probes,
+										"workspace-closed-remote-error",
+									)),
+							)
+						},
 					)
 					.child(
 						button(

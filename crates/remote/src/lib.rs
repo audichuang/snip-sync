@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub mod client;
+pub(crate) mod copyserve;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;
 pub mod proto;
@@ -24,8 +25,8 @@ pub mod worker;
 
 pub use client::{Client, Connection, RemoteHost, RemoteRepo, Transport};
 pub use proto::{
-	DirEntry, ErrorCode, GitQuery, GitReply, RemoteWorkspace, RepoScan,
-	Request, Response, ScannedRepo, PROTOCOL_MAX,
+	DirEntry, ErrorCode, ExportTarget, GitQuery, GitReply, RemoteWorkspace,
+	RepoScan, Request, Response, ScannedRepo, PROTOCOL_MAX,
 };
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
 
@@ -46,7 +47,7 @@ pub enum RemoteError {
 	#[error("the worker did not answer in time")]
 	TimedOut,
 	#[error(
-		"{worker} is too old for Git views (it speaks protocol {have}, this needs {need}); update it"
+		"snip-sync on {worker} is too old for this (it speaks protocol {have}, this needs {need}); update it there"
 	)]
 	WorkerTooOld {
 		worker: String,

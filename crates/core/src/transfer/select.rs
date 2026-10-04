@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::fsutil;
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::paths;
@@ -60,6 +62,80 @@ pub fn is_safe_dir_symlink(root: &Path, path: &Path) -> bool {
 		}
 	}
 	false
+}
+
+/// What one copy produced: the payload and the counts its status line
+/// reports. `copied == 0` means nothing could be copied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyOutcome {
+	pub payload: String,
+	pub copied: usize,
+	/// UTF-16 code units of the payload.
+	pub chars: usize,
+	pub lines: usize,
+	/// Files left out: unreadable, over the size limit, or a name a folder
+	/// walk could not carry.
+	pub skipped: usize,
+	/// The file limit cut the copy short.
+	pub truncated: bool,
+}
+
+/// The copy engine for a selection, shared by the desktop app and a
+/// remote worker: expands folders (at most `file_limit` files), plans the
+/// payload (at most [`super::CLIPBOARD_PAYLOAD_MAX`]), runs `hold` (an e2e
+/// hook), and checks the sources did not change meanwhile.
+pub fn copy_selection(
+	sel: ExportSelection,
+	settings: &Settings,
+	file_limit: usize,
+	opts: &RunOptions,
+	hold: impl FnOnce(&ExportPlan),
+) -> Result<CopyOutcome, TransferError> {
+	let cancel = opts.cancel.clone().unwrap_or_default();
+	let expanded = match expand_folder_items(sel, file_limit, &cancel) {
+		Ok(expanded) => expanded,
+		// Every file under the folders was skipped.
+		Err(TransferError::EmptySelection) => {
+			return Ok(CopyOutcome {
+				payload: String::new(),
+				copied: 0,
+				chars: 0,
+				lines: 0,
+				skipped: 1,
+				truncated: false,
+			})
+		}
+		Err(err) => return Err(err),
+	};
+	let plan = super::plan_export_with(
+		&expanded.sel,
+		settings,
+		Some(super::CLIPBOARD_PAYLOAD_MAX),
+		opts,
+	)?;
+	let skipped = plan.skipped_unreadable_count
+		+ plan.skipped_file_size_count
+		+ expanded.skipped;
+	if plan.files.is_empty() {
+		return Ok(CopyOutcome {
+			payload: String::new(),
+			copied: 0,
+			chars: 0,
+			lines: 0,
+			skipped,
+			truncated: false,
+		});
+	}
+	hold(&plan);
+	plan.revalidate_with(opts)?;
+	Ok(CopyOutcome {
+		copied: plan.copied_file_count,
+		chars: plan.stats.chars,
+		lines: plan.stats.lines,
+		skipped,
+		truncated: expanded.truncated || plan.file_limit_reached,
+		payload: plan.payload,
+	})
 }
 
 /// A selected folder copies its files, walked in the copy job: a folder
