@@ -728,16 +728,24 @@ impl RemotePaste {
 		)
 	}
 
-	/// An Apply's failure, worded as a local Apply words it.
+	/// An Apply's failure, worded as a local Apply words it. A lost answer
+	/// says the write may or may not have happened.
 	fn apply_error(&self, dest: &Path, err: snip_remote::RemoteError) -> Msg {
 		match err {
 			snip_remote::RemoteError::Refused {
 				code: snip_remote::ErrorCode::Stale,
 				message,
 			} => remote_stale_msg(&message),
+			other if other.outcome_unknown() => outcome_unknown(),
 			other => self.destination_error(dest, other),
 		}
 	}
+}
+
+/// The connection was lost after an Apply was sent: the worker may have
+/// written it. Refresh shows what landed.
+fn outcome_unknown() -> Msg {
+	Msg::new("paste_outcome_unknown", [])
 }
 
 /// A worker's stale refusal (the local error's text) as [`stale_msg`].
@@ -2206,6 +2214,9 @@ impl PastePreviewPlan {
 				snip_remote::RemoteError::Refused { message, .. } => {
 					Msg::new("error_open_repo", [message])
 				}
+				other if !check_only && other.outcome_unknown() => {
+					outcome_unknown()
+				}
 				other => remote.destination_error(&self.destination, other),
 			})
 	}
@@ -2301,6 +2312,53 @@ pub(crate) mod tests {
 		assert_eq!(path(plan.selected_item_idx), "r/b/z.txt");
 	}
 	use std::fs;
+
+	/// A remote Apply whose answer never came may have written: it is
+	/// reported as unknown, never as a refused destination.
+	#[test]
+	fn a_lost_answer_after_a_remote_apply_is_unknown_not_refused() {
+		use snip_remote::{ErrorCode, RemoteError};
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: "/w".into(),
+					name: "w".into(),
+					path: "/w".into(),
+				},
+			),
+		};
+		let dest = remote.session.root.clone();
+		let lost = || {
+			RemoteError::Io(std::io::Error::new(
+				std::io::ErrorKind::BrokenPipe,
+				"the worker closed the connection",
+			))
+		};
+		assert_eq!(
+			remote.apply_error(&dest, lost()).key,
+			"paste_outcome_unknown"
+		);
+		assert_eq!(
+			remote.apply_error(&dest, RemoteError::TimedOut).key,
+			"paste_outcome_unknown"
+		);
+		let stale = RemoteError::Refused {
+			code: ErrorCode::Stale,
+			message: "stale destination in '/w': target file 'a' was created \
+			          externally after preview"
+				.into(),
+		};
+		assert_eq!(remote.apply_error(&dest, stale).key, "stale_created");
+		// Never reached the worker: nothing can have been written.
+		assert_eq!(
+			remote
+				.apply_error(&dest, RemoteError::Connect("no route".into()))
+				.key,
+			"paste_err_destination"
+		);
+	}
 
 	fn captured(text: String, dest: &Path) -> PasteRequest {
 		PasteRequest::Clipboard {

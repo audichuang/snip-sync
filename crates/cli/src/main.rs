@@ -675,6 +675,18 @@ fn format_remote_error(err: snip_remote::RemoteError) -> String {
 	}
 }
 
+/// A worker's answer to a write: a lost connection means the write may or
+/// may not have happened, never "refused".
+fn format_remote_apply_error(err: snip_remote::RemoteError) -> String {
+	if err.outcome_unknown() {
+		return format!(
+			"The connection was lost; whether the paste finished is unknown ({err}). \
+			 Check the destination (snip remote changes / ls) before pasting again."
+		);
+	}
+	format_remote_error(err)
+}
+
 /// Says what `--adjust-paths` would do, or does.
 fn note_suggestion(
 	suggestion: &snip_core::restore::RestoreBaseSuggestion,
@@ -746,7 +758,7 @@ impl FilePaste<'_> {
 					&planned.expect(),
 					None,
 				)
-				.map_err(format_remote_error),
+				.map_err(format_remote_apply_error),
 		}
 	}
 }
@@ -940,7 +952,11 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 			dest,
 		} => client
 			.replay_apply(workspace, dest, text, &preview, check_only, None)
-			.map_err(format_remote_error),
+			.map_err(if check_only {
+				format_remote_error
+			} else {
+				format_remote_apply_error
+			}),
 	};
 
 	if !opts.apply {
