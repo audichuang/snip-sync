@@ -15,7 +15,13 @@ use crate::blob::{BlobRead, BlobReader, NotText};
 use crate::fsutil::{must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{Git, GitError, RawZ, EMPTY_TREE};
-use crate::paths::{escapes_all_roots, resolve_write_target};
+use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
+
+/// Replay replaces a symlink at the target instead of writing through it,
+/// so only the folder it lands in decides whether it is inside Git.
+fn unsafe_replay_target(root: &Path, abs: &Path) -> bool {
+	escapes_all_roots(&[root], abs) || abs.parent().is_none_or(lands_in_git_dir)
+}
 use crate::workspace::{lock_heavy, RepoIdentity};
 
 /// First line of a commit-mode payload; the rest is JSON.
@@ -1279,6 +1285,7 @@ fn target(root: &Path, path: &str, layout: &PlannedLayout) -> Option<PathBuf> {
 		.ok()
 		.filter(|t| t.relative_path == path)
 		.map(|t| t.absolute_path)
+		.filter(|abs| !unsafe_replay_target(root, abs))
 }
 
 fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
@@ -1856,7 +1863,7 @@ fn replay_commit(
 		else {
 			continue;
 		};
-		if escapes_all_roots(&[root], abs) {
+		if unsafe_replay_target(root, abs) {
 			return Err(format!("{}: unsafe path", f.path).into());
 		}
 		if !is_symlink(abs) && must_not_overwrite(abs) {
@@ -1886,7 +1893,7 @@ fn replay_commit(
 		else {
 			continue;
 		};
-		if escapes_all_roots(&[root], abs) {
+		if unsafe_replay_target(root, abs) {
 			return Err(format!("{}: unsafe path", f.path).into());
 		}
 		if is_symlink(abs) {
@@ -1966,7 +1973,7 @@ fn replay_commit(
 /// Removes `abs`; already absent is fine. Parent directories left empty go
 /// too (as git checkout does), so a later write may put a file there.
 fn delete(root: &Path, abs: &Path, rel: &str) -> Result<(), String> {
-	if escapes_all_roots(&[root], abs) {
+	if unsafe_replay_target(root, abs) {
 		return Err(format!("{rel}: unsafe path"));
 	}
 	match fs::remove_file(abs) {
@@ -3614,6 +3621,45 @@ mod tests {
 		assert_eq!(result.failure, None);
 		assert_eq!(dst.git(&["log", "-1", "--format=%B"]), "");
 		assert_eq!(dst.git(&["show", "HEAD:b.txt"]), "b");
+	}
+
+	/// A bare repository kept inside the worktree is a Git directory: a
+	/// replayed file landing in it is an unsafe-path skip, never written.
+	#[test]
+	fn replay_never_writes_into_a_git_directory_inside_the_worktree() {
+		let repo = Repo::new("main");
+		repo.write("vendor/lib.git/HEAD", b"ref: refs/heads/main\n");
+		fs::create_dir_all(repo.path().join("vendor/lib.git/objects")).unwrap();
+		fs::create_dir_all(repo.path().join("vendor/lib.git/refs")).unwrap();
+		repo.write("vendor/lib.git/hooks/.keep", b"");
+		repo.commit("init", "2020-01-01T00:00:00+00:00");
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some("x\n".into()),
+			not_copied: None,
+		};
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "hooks\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files: vec![
+					file("vendor/lib.git/hooks/pre-commit"),
+					file("ok.txt"),
+				],
+			}],
+		};
+		let plan = plan_commit_replay(&repo.open(), &payload);
+		let files = &plan.commits[0].files;
+		assert_eq!(files[0].skip_reason, Some(ReplaySkipReason::UnsafePath));
+		assert_eq!(files[1].action, ReplayAction::Write);
+		let result = replay(&repo.open(), &payload);
+		assert_eq!(result.failure, None);
+		assert!(!repo.path().join("vendor/lib.git/hooks/pre-commit").exists());
+		assert_eq!(fs::read(repo.path().join("ok.txt")).unwrap(), b"x\n");
 	}
 
 	#[test]

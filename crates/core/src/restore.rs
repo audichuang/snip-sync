@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
 use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
 use crate::paths::{
-	escapes_all_roots, has_git_segment, resolve_delete_target,
-	resolve_write_target, RejectReason,
+	escapes_all_roots, has_git_segment, lands_in_git_dir,
+	resolve_delete_target, resolve_write_target, RejectReason,
 };
 
 /// One file from the payload; `parse_clipboard` produces these.
@@ -163,6 +163,10 @@ pub fn plan_restore<P: AsRef<Path>>(
 
 		if entry.change_types.contains(&ChangeType::Deleted) {
 			match resolve_delete_target(roots, &entry.path) {
+				Ok(t) if lands_in_git_dir(&t.absolute_path) => {
+					plan.skipped_operations
+						.push(skip(None, SkipReason::UnresolvedPath));
+				}
 				Ok(t) => plan.delete_operations.push(DeleteOperation {
 					relative_path: t.relative_path,
 					absolute_path: t.absolute_path,
@@ -207,7 +211,11 @@ pub fn plan_restore<P: AsRef<Path>>(
 			}
 		};
 
-		if has_git_segment(&t.relative_path) {
+		// Also through a symlink, or into a destination that is itself a
+		// Git directory.
+		if has_git_segment(&t.relative_path)
+			|| lands_in_git_dir(&t.absolute_path)
+		{
 			plan.skipped_operations
 				.push(skip(None, SkipReason::UnresolvedPath));
 			continue;
@@ -277,6 +285,7 @@ pub fn execute_restore_plan(
 		// contained target into one outside the workspace.
 		if escapes_all_roots(&plan.roots, &op.absolute_path)
 			|| has_git_segment(&op.relative_path)
+			|| lands_in_git_dir(&op.absolute_path)
 		{
 			result
 				.errors
@@ -309,6 +318,7 @@ fn run_create(
 ) -> Result<CreateOutcome, String> {
 	if escapes_all_roots(roots, &op.absolute_path)
 		|| has_git_segment(&op.relative_path)
+		|| lands_in_git_dir(&op.absolute_path)
 	{
 		return Err(format!("{}: unsafe path", op.relative_path));
 	}
@@ -676,6 +686,78 @@ mod tests {
 		for (i, (_, rel)) in paths.iter().enumerate() {
 			assert_eq!(read(root.join(rel)), format!("content-{i}"));
 		}
+	}
+
+	/// A Git directory's shape: what `paths::is_git_dir` recognises.
+	fn fake_git_dir(dir: &Path) {
+		fs::create_dir_all(dir.join("objects")).unwrap();
+		fs::create_dir_all(dir.join("refs")).unwrap();
+		fs::create_dir_all(dir.join("hooks")).unwrap();
+		fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+	}
+
+	#[test]
+	fn a_destination_that_is_a_git_directory_skips_every_entry() {
+		let (_d, root) = tmp();
+		let bare = root.join("bare.git");
+		fake_git_dir(&bare);
+		let entries = [entry("hooks/pre-commit", "x"), entry("config", "y")];
+		let plan = plan_restore(&[&bare], &entries);
+		assert!(plan.create_operations.is_empty());
+		assert_eq!(plan.skipped_operations.len(), 2);
+		assert!(plan
+			.skipped_operations
+			.iter()
+			.all(|s| s.reason == SkipReason::UnresolvedPath));
+		assert!(!bare.join("hooks/pre-commit").exists());
+	}
+
+	/// A folder symlink inside the destination that leads into `.git`: the
+	/// entry's path has no `.git` segment, but its write would land there.
+	/// That entry is a skipped row; the others are written.
+	#[cfg(unix)]
+	#[test]
+	fn an_entry_reaching_git_through_a_symlink_is_skipped_and_the_rest_written()
+	{
+		let (_d, root) = tmp();
+		fake_git_dir(&root.join(".git"));
+		std::os::unix::fs::symlink(root.join(".git"), root.join("gitlink"))
+			.unwrap();
+		fs::write(root.join("gitlink/config"), "[core]\n").unwrap();
+		let entries = [
+			entry("gitlink/hooks/pre-commit", "owned"),
+			deleted("gitlink/config"),
+			entry("ok.txt", "fine"),
+		];
+		let plan = plan_restore(&[&root], &entries);
+		assert_eq!(rels(&plan), ["ok.txt"]);
+		assert!(plan.delete_operations.is_empty());
+		assert_eq!(plan.skipped_operations.len(), 2);
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert_eq!(result.created_count, 1);
+		assert!(!root.join(".git/hooks/pre-commit").exists());
+		assert!(root.join(".git/config").exists());
+	}
+
+	/// A folder that turns into a symlink to `.git` after the preview: the
+	/// write is refused as unsafe, and the other files still land.
+	#[cfg(unix)]
+	#[test]
+	fn a_symlink_into_git_appearing_after_the_plan_refuses_only_that_write() {
+		let (_d, root) = tmp();
+		fake_git_dir(&root.join(".git"));
+		fs::create_dir(root.join("sub")).unwrap();
+		let entries = [entry("sub/pre-commit", "owned"), entry("ok.txt", "x")];
+		let plan = plan_restore(&[&root], &entries);
+		assert_eq!(rels(&plan), ["sub/pre-commit", "ok.txt"]);
+		fs::remove_dir(root.join("sub")).unwrap();
+		std::os::unix::fs::symlink(root.join(".git/hooks"), root.join("sub"))
+			.unwrap();
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert_eq!(result.created_count, 1);
+		assert_eq!(result.errors, ["sub/pre-commit: unsafe path"]);
+		assert!(!root.join(".git/hooks/pre-commit").exists());
+		assert_eq!(read(root.join("ok.txt")), "x");
 	}
 
 	#[test]
