@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::blob::{BlobRead, BlobReader, NotText};
-use crate::fsutil::{must_not_overwrite, write_text_file};
+use crate::fsutil::{is_multi_link, must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{Git, GitError, RawZ, EMPTY_TREE};
 use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
@@ -1326,6 +1326,20 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 	// deleted symlink ancestor, or a case-only alias on a case-insensitive
 	// filesystem, still reads the real disk and the preview may disagree
 	// with Apply.
+	// A hard link shares its file with another name: writing it in place
+	// would edit what that name holds (a Git directory's, or one outside
+	// the repository) through this entry. A symlink is replaced, not
+	// written through; a multi-link file is refused as unsafe.
+	if !deleted
+		&& !layout.overrides.contains_key(&abs)
+		&& !is_symlink(&abs)
+		&& is_multi_link(&abs)
+	{
+		plan.skip_reason = Some(ReplaySkipReason::UnsafePath);
+		plan.existed = abs.exists();
+		plan.absolute_path = Some(abs);
+		return plan;
+	}
 	if !deleted
 		&& !layout.overrides.contains_key(&abs)
 		&& !is_symlink(&abs)
@@ -1872,6 +1886,11 @@ fn replay_commit(
 				f.path
 			)
 			.into());
+		}
+		// A hard link would carry the write to the file its other names
+		// hold, around the Git-directory guard.
+		if !is_symlink(abs) && is_multi_link(abs) {
+			return Err(format!("{}: unsafe path", f.path).into());
 		}
 	}
 
@@ -3621,6 +3640,73 @@ mod tests {
 		assert_eq!(result.failure, None);
 		assert_eq!(dst.git(&["log", "-1", "--format=%B"]), "");
 		assert_eq!(dst.git(&["show", "HEAD:b.txt"]), "b");
+	}
+
+	/// A write target that is a hard link alias of a Git directory's file
+	/// is skipped in the preview and refused at the write: overwriting it
+	/// in place would edit `.git/config` through the alias.
+	#[cfg(unix)]
+	#[test]
+	fn a_replay_refuses_a_hard_link_alias_of_a_git_file() {
+		let repo = Repo::new("main");
+		repo.write("old.txt", b"base\n");
+		repo.commit("init", "2020-01-01T00:00:00+00:00");
+		let config =
+			fs::read_to_string(repo.path().join(".git/config")).unwrap();
+		fs::hard_link(
+			repo.path().join(".git/config"),
+			repo.path().join("alias.txt"),
+		)
+		.unwrap();
+		let payload = CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "alias\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "alias.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("owned\n".into()),
+					not_copied: None,
+				}],
+			}],
+		};
+		let plan = plan_commit_replay(&repo.open(), &payload);
+		let file = &plan.commits[0].files[0];
+		assert_eq!(file.skip_reason, Some(ReplaySkipReason::UnsafePath));
+		let result = replay(&repo.open(), &payload);
+		assert_eq!(result.failure, None, "the file is only skipped");
+		assert_eq!(
+			fs::read_to_string(repo.path().join(".git/config")).unwrap(),
+			config
+		);
+		assert_eq!(
+			fs::read_to_string(repo.path().join("alias.txt")).unwrap(),
+			config
+		);
+
+		// An alias that appears after the preview is skipped at the write,
+		// like a target that turned non-UTF-8: nothing reaches
+		// `.git/config` through it.
+		fs::remove_file(repo.path().join("alias.txt")).unwrap();
+		let plan = plan_commit_replay(&repo.open(), &payload);
+		assert_eq!(plan.commits[0].files[0].action, ReplayAction::Write);
+		fs::hard_link(
+			repo.path().join(".git/config"),
+			repo.path().join("alias.txt"),
+		)
+		.unwrap();
+		let _ = replay(&repo.open(), &payload);
+		assert_eq!(
+			fs::read_to_string(repo.path().join(".git/config")).unwrap(),
+			config
+		);
+		assert_eq!(
+			fs::read_to_string(repo.path().join("alias.txt")).unwrap(),
+			config
+		);
 	}
 
 	/// A bare repository kept inside the worktree is a Git directory: a

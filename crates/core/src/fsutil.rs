@@ -59,6 +59,33 @@ pub fn must_not_overwrite(path: &Path) -> bool {
 	)
 }
 
+/// True when `path` exists with more than one directory entry (a hard
+/// link). Overwriting such a file in place would edit what its other
+/// names hold — a Git directory's files, a file outside the destination —
+/// through this entry, around every path-based guard. A missing file, a
+/// directory, or a symlink's own entry (one link) is not.
+pub fn is_multi_link(path: &Path) -> bool {
+	let Ok(info) = fs::metadata(path) else {
+		return false;
+	};
+	if !info.is_file() {
+		return false;
+	}
+	#[cfg(unix)]
+	{
+		std::os::unix::fs::MetadataExt::nlink(&info) > 1
+	}
+	#[cfg(windows)]
+	{
+		use std::os::windows::fs::MetadataExt as _;
+		info.number_of_links() > 1
+	}
+	#[cfg(not(any(unix, windows)))]
+	{
+		false
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalkItem {
 	File(PathBuf),

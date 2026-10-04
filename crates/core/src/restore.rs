@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
-use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
+use crate::fsutil::{
+	delete_file, is_multi_link, must_not_overwrite, write_text_file,
+};
 use crate::paths::{
 	escapes_all_roots, has_git_segment, lands_in_git_dir,
 	resolve_delete_target, resolve_write_target, RejectReason,
@@ -221,6 +223,15 @@ pub fn plan_restore<P: AsRef<Path>>(
 			continue;
 		}
 
+		// An existing hard link shares its file with another name: writing
+		// it in place would edit that name's file (a Git directory's, or
+		// one outside the roots) through this entry.
+		if is_multi_link(&t.absolute_path) {
+			plan.skipped_operations
+				.push(skip(None, SkipReason::UnresolvedPath));
+			continue;
+		}
+
 		if must_not_overwrite(&t.absolute_path) {
 			plan.skipped_operations
 				.push(skip(Some(t.relative_path), SkipReason::NonUtf8Target));
@@ -329,6 +340,11 @@ fn run_create(
 		Ok(info) if info.is_dir() => return Ok(CreateOutcome::Skipped),
 		Ok(_) if selection.skip_existing || !selection.overwrite_existing => {
 			return Ok(CreateOutcome::Skipped)
+		}
+		// A hard link that appeared after the preview: refused like any
+		// other unsafe target.
+		Ok(_) if is_multi_link(&op.absolute_path) => {
+			return Err(format!("{}: unsafe path", op.relative_path))
 		}
 		Ok(_) => CreateOutcome::Overwritten,
 		Err(_) => CreateOutcome::Created,
@@ -758,6 +774,75 @@ mod tests {
 		assert_eq!(result.errors, ["sub/pre-commit: unsafe path"]);
 		assert!(!root.join(".git/hooks/pre-commit").exists());
 		assert_eq!(read(root.join("ok.txt")), "x");
+	}
+
+	/// A hard link inside the destination sharing its inode with a Git
+	/// directory's file: overwriting the alias in place would edit that
+	/// file through another name, around the Git-directory guard. The
+	/// alias is a skipped row in the plan, and a write that reaches the
+	/// execution anyway fails as an unsafe path.
+	#[cfg(unix)]
+	#[test]
+	fn an_overwrite_of_a_hard_link_alias_of_git_metadata_is_refused() {
+		let (_d, root) = tmp();
+		fake_git_dir(&root.join(".git"));
+		fs::write(root.join(".git/config"), "[core]\n").unwrap();
+		fs::hard_link(root.join(".git/config"), root.join("config-alias.txt"))
+			.unwrap();
+		let entries =
+			[entry("config-alias.txt", "owned"), entry("ok.txt", "x")];
+		let plan = plan_restore(&[&root], &entries);
+		assert_eq!(rels(&plan), ["ok.txt"]);
+		assert_eq!(plan.skipped_operations.len(), 1);
+		assert_eq!(plan.skipped_operations[0].raw_path, "config-alias.txt");
+		assert_eq!(
+			plan.skipped_operations[0].reason,
+			SkipReason::UnresolvedPath
+		);
+		let mut forced = plan.clone();
+		forced.create_operations.push(CreateOperation {
+			relative_path: "config-alias.txt".into(),
+			absolute_path: root.join("config-alias.txt"),
+			content: "owned".into(),
+			existed: true,
+			root_path: root.clone(),
+		});
+		let result = execute_restore_plan(&forced, &overwrite());
+		assert_eq!(result.errors, ["config-alias.txt: unsafe path"]);
+		assert_eq!(result.created_count + result.overwritten_count, 1);
+		assert_eq!(read(root.join(".git/config")), "[core]\n");
+		assert_eq!(read(root.join("config-alias.txt")), "[core]\n");
+		assert_eq!(read(root.join("ok.txt")), "x");
+	}
+
+	/// The same alias trick against a file outside the destination's roots.
+	#[cfg(unix)]
+	#[test]
+	fn an_overwrite_of_a_hard_link_alias_outside_the_roots_is_refused() {
+		let (_d, root) = tmp();
+		let outside_dir = tempfile::tempdir().unwrap();
+		let outside = outside_dir.path().join("precious.txt");
+		fs::write(&outside, "keep\n").unwrap();
+		fs::hard_link(&outside, root.join("alias.txt")).unwrap();
+		let plan = plan_restore(&[&root], &[entry("alias.txt", "owned")]);
+		assert!(plan.create_operations.is_empty());
+		assert_eq!(plan.skipped_operations.len(), 1);
+		assert_eq!(plan.skipped_operations[0].raw_path, "alias.txt");
+		assert_eq!(
+			plan.skipped_operations[0].reason,
+			SkipReason::UnresolvedPath
+		);
+		let mut forced = plan.clone();
+		forced.create_operations.push(CreateOperation {
+			relative_path: "alias.txt".into(),
+			absolute_path: root.join("alias.txt"),
+			content: "owned".into(),
+			existed: true,
+			root_path: root.clone(),
+		});
+		let result = execute_restore_plan(&forced, &overwrite());
+		assert_eq!(result.errors, ["alias.txt: unsafe path"]);
+		assert_eq!(fs::read_to_string(&outside).unwrap(), "keep\n");
 	}
 
 	#[test]
