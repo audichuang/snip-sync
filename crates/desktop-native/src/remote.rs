@@ -1027,10 +1027,42 @@ impl WorkbenchModel {
 									Some((root, path))
 								})
 								.flatten();
+								let ws_root =
+									model.ws_home.clone().or_else(|| {
+										model
+											.remote
+											.session
+											.as_ref()
+											.map(|s| s.root.clone())
+									});
+								let is_ws_file_tree =
+									model.file_tree.as_ref().is_some_and(|t| {
+										Some(&t.full_path) == ws_root.as_ref()
+									});
+								let mut saved_ws_expanded = std::mem::take(
+									&mut model.restore_ws_expanded,
+								);
+								let saved_expanded = if is_ws_file_tree {
+									if let Some(tree) = &model.file_tree {
+										tree.collect_expanded_paths(
+											&mut saved_ws_expanded,
+										);
+									}
+									std::mem::take(&mut model.restore_expanded)
+								} else {
+									Vec::new()
+								};
 								model.repos.clear();
 								model.pinned_repo = None;
 								model.selected_repo_idx = None;
 								model.release_repo_state();
+								model.restore_ws_expanded = saved_ws_expanded;
+								if !saved_expanded.is_empty() {
+									model
+										.restore_ws_expanded
+										.extend(saved_expanded.clone());
+									model.restore_expanded = saved_expanded;
+								}
 								model.sync_change_slots();
 								if let Some((root, path)) = file_sel {
 									model.select_file_in(

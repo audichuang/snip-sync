@@ -149,10 +149,14 @@ impl WorkbenchModel {
 			.unwrap_or_default();
 		let Some(p) = &self.preview else {
 			if self.preview_error.is_some() {
-				let file_path = self
-					.selected_file
-					.as_deref()
-					.or(self.selected_commit_file.as_deref());
+				let file_path = self.selected_file.as_deref().or_else(|| {
+					if self.selected_commit.is_some() || self.compare.is_some()
+					{
+						self.selected_commit_file.as_deref()
+					} else {
+						None
+					}
+				});
 				if let Some(path) = file_path {
 					let name =
 						path.rsplit('/').next().unwrap_or(path).to_string();
