@@ -9,6 +9,7 @@
 - **受測**：master 是 Mac mini 上的桌面 App（GUI），另有一段用 `snip remote`（CLI master）交叉驗證。worker 是 Ubuntu 上的 CLI `snip worker`，不開 GUI。
 - **SSH 不是受測功能**。產品沒有「經 SSH 管理 worker」的功能。master 和 worker 之間走 Tailscale 上的 TLS 1.3，靠配對碼與指紋 pin 互信。本規程只在準備階段用 ssh：在 Ubuntu 上編譯、建 fixture、啟動和重啟 worker，以及在 worker 端讀檔案當 oracle。
 - **本輪受測含唯讀 Git 檢視**。寫入、rename、stage、commit、discard、以及為複製而勾選仍不在範圍內；複製、貼上、加入儲存庫路徑、為複製而勾選在遠端工作區都要拒絕，這也是受測項目。
+- **不能碰使用者自己的 worker 服務**：Ubuntu 的 systemd user unit `snip-worker.service` 和 Mac mini 的 LaunchAgent `com.audichuang.snip-worker`（都在 47821 埠）不屬於這一輪，不可停止、重啟或改設定。測試 worker 一律用 47899；`pkill` 的 pattern 只能比對本輪的 `$W/src/target/release/snip`。
 - 不改產品程式，不 commit 這一輪的產出。
 
 ## 1. 機器與受測版本
@@ -35,7 +36,7 @@
 export PATH=$HOME/.cargo/bin:$PATH
 git merge-base --is-ancestor ffcbb04 HEAD && git merge-base --is-ancestor 64b6fde HEAD
 cargo build --release -p snip-cli --locked
-just remote-e2e-ssh ubuntu
+just remote-e2e-ssh ubuntu --listen 100.95.28.19:47899
 ```
 
 最後一行必須是 `== N passed, 0 failed`，結束碼 0。這一步一次確認編譯、Tailscale 連得到、Ubuntu 防火牆沒擋、TLS 與配對都正常。**沒過就不開始點 GUI**，計分表全部寫 `not-run`，證據欄寫「第 0 步閘門失敗」並附上輸出。這一步只有失敗時才算產品問題，因為它不涉及 GUI。
@@ -149,7 +150,7 @@ start_worker() {   # $1 = 設定資料夾名稱；其餘參數 = 要分享的資
 cd '$W'
 pkill -f '$W/src/target/release/snip worker' 2>/dev/null
 for i in \$(seq 1 20); do pgrep -f '$W/src/target/release/snip worker' >/dev/null || break; sleep 0.5; done
-SNIP_CONFIG_DIR='$W/$cfg' SNIP_DEVICE_NAME=ubuntu-ui nohup '$W/src/target/release/snip' worker $WORKER_EXTRA $shares --listen 100.95.28.19:47821 > worker.log 2>&1 < /dev/null &
+SNIP_CONFIG_DIR='$W/$cfg' SNIP_DEVICE_NAME=ubuntu-ui nohup '$W/src/target/release/snip' worker $WORKER_EXTRA $shares --listen 100.95.28.19:47899 > worker.log 2>&1 < /dev/null &
 for i in \$(seq 1 40); do grep -q 'pairing code' worker.log && break; grep -q rror worker.log && break; sleep 0.5; done
 cat worker.log
 SH
@@ -161,9 +162,9 @@ start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws
 
 - 一定要有 `< /dev/null`，否則 ssh 會一直等背景的 worker，不會返回。
 - 要等舊的 worker 真的結束才啟動新的，否則會出現 `Address already in use`。
-- `pkill -f` 要放在 `bash -s` 的 stdin 裡執行。如果直接寫成 `ssh ubuntu 'pkill -f "snip worker"'`，pattern 會比對到執行它的那個 bash 自己，連 ssh 連線一起被殺掉（exit 255）。
+- `pkill -f` 要放在 `bash -s` 的 stdin 裡執行。如果直接寫成 `ssh ubuntu 'pkill -f "snip worker"'`，pattern 會比對到執行它的那個 bash 自己，連 ssh 連線一起被殺掉（exit 255）。pattern 必須包含 `$W/src/target/release/snip`，不可寫成會比對到使用者服務 binary 的寬鬆字串（例如 `pkill snip`）。
 
-輸出要有 `snip-sync worker listening on 100.95.28.19:47821`、`fingerprint XXXX-XXXX-XXXX-XXXX`、五行 `sharing …`，以及 `pairing code ABCD-EFGH (valid 10 minutes; restart for a new one)`。
+輸出要有 `snip-sync worker listening on 100.95.28.19:47899`、`fingerprint XXXX-XXXX-XXXX-XXXX`、五行 `sharing …`，以及 `pairing code ABCD-EFGH (valid 10 minutes; restart for a new one)`。
 
 **配對碼 10 分鐘內有效**。啟動 worker、讀配對碼、在 GUI 配對（R01–R05）要連續做完，中間不做別的。過期或用掉了，就再執行一次 `start_worker wcfg …` 拿新碼；同一個 `wcfg` 會保留指紋。
 
@@ -237,9 +238,9 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 |---|---|---|
 | R01 | 點 `btn-workspace-menu` | 有 `btn-remote-pair-new`、`btn-remote-worker-toggle` 的 bounds；沒有任何 `remote-worker:*`（全新的設定資料夾）。截圖有「遠端節點」區塊 |
 | R02 | 點 `btn-remote-pair-new`，兩個欄位都空著，點 `btn-remote-pair` | 出現 `remote-addr-input`、`remote-code-input`；狀態顯示「請輸入位址與配對碼」；沒有 `REMOTE_PAIRED`／`REMOTE_PAIR_FAILED` |
-| R03 | 位址輸入 `100.95.28.19`，配對碼輸入錯的 `AAAA-AAAA`，點 `btn-remote-pair` | 一行新的 `REMOTE_PAIR_FAILED`；選單裡是紅字錯誤；`master-config/remote-workers.json` 不存在或沒有這台 |
-| R04 | 配對碼改成 worker 印出的那組（位址不加埠，預設 47821），點 `btn-remote-pair` | 出現 `REMOTE_PAIRED: name=ubuntu-ui fp=…`，fp 和 worker 指紋一致（第 3 節規則 5）；接著 `REMOTE_WORKSPACES: count=5`；`remote-workers.json` 有一筆 `ubuntu-ui`。按鈕在配對時會短暫顯示「配對中…」，截到就附上，截不到不影響判定 |
-| R05 | 截圖選單 | `remote-worker:0` 那一列顯示 `ubuntu-ui`、`100.95.28.19 · XXXX-XXXX-XXXX-XXXX`（指紋同 R04；存下來的位址不含預設埠）；底下五列 `remote-workspace:0..4` 依序為 `edge`、`rtk`、`gitws`、`plainws`、`inner`（依 worker 啟動時傳入的順序排列），各自附有 Ubuntu 上的路徑；路徑太長被截斷時，滑鼠移到那一列，tooltip 顯示完整路徑 |
+| R03 | 位址輸入 `100.95.28.19:47899`，配對碼輸入錯的 `AAAA-AAAA`，點 `btn-remote-pair` | 一行新的 `REMOTE_PAIR_FAILED`；選單裡是紅字錯誤；`master-config/remote-workers.json` 不存在或沒有這台 |
+| R04 | 配對碼改成 worker 印出的那組（位址用 `100.95.28.19:47899`，要帶埠，因為測試 worker 不在預設埠），點 `btn-remote-pair` | 出現 `REMOTE_PAIRED: name=ubuntu-ui fp=…`，fp 和 worker 指紋一致（第 3 節規則 5）；接著 `REMOTE_WORKSPACES: count=5`；`remote-workers.json` 有一筆 `ubuntu-ui`。按鈕在配對時會短暫顯示「配對中…」，截到就附上，截不到不影響判定 |
+| R05 | 截圖選單 | `remote-worker:0` 那一列顯示 `ubuntu-ui`、`100.95.28.19:47899 · XXXX-XXXX-XXXX-XXXX`（指紋同 R04）；底下五列 `remote-workspace:0..4` 依序為 `edge`、`rtk`、`gitws`、`plainws`、`inner`（依 worker 啟動時傳入的順序排列），各自附有 Ubuntu 上的路徑；路徑太長被截斷時，滑鼠移到那一列，tooltip 顯示完整路徑 |
 
 ### 4.2 瀏覽真實專案 rtk
 
@@ -302,7 +303,7 @@ R34 之前，先重新開回 `edge`（R15 的步驟）。
 | R40 | 換一張憑證：`start_worker wcfg-other "$W/edge"`（同一個位址，新的設定資料夾），在 App 選單點 `remote-worker:0` | 拒絕；選單顯示紅字，內容說明這不是已配對的 worker（內容含兩個指紋）；`remote-workers.json` 的指紋沒有被改成新的 |
 | R41 | 復原：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"`，點 `remote-worker:0` | `REMOTE_WORKSPACES: count=5` |
 | R42 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` 重新啟動（寫進新的 `app-N.log`），開選單 | `remote-worker:0` 仍然是 `ubuntu-ui`，點它就能列出工作區，不需要重新配對 |
-| R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"` 拿新的配對碼 C。Cmd+Q，改用全新的 `SNIP_CONFIG_DIR="$RUN/master-config-r43"` 啟動 App（寫進新的 `app-N.log`）。用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C。再 Cmd+Q，用原本的 `SNIP_CONFIG_DIR` 重新啟動，點 `remote-worker:0` | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；換回原本的設定後，`remote-worker:0` 仍然能列出工作區。一定要用全新的 master：已配對的 master，worker 認得它的憑證，不看配對碼就放行 |
+| R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"` 拿新的配對碼 C。Cmd+Q，改用全新的 `SNIP_CONFIG_DIR="$RUN/master-config-r43"` 啟動 App（寫進新的 `app-N.log`）。用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C（位址同樣用 `100.95.28.19:47899`）。再 Cmd+Q，用原本的 `SNIP_CONFIG_DIR` 重新啟動，點 `remote-worker:0` | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；換回原本的設定後，`remote-worker:0` 仍然能列出工作區。一定要用全新的 master：已配對的 master，worker 認得它的憑證，不看配對碼就放行 |
 | R44 | 把視窗調成 900×600（從系統層設定，例如 System Events 設成 900×632；送給 App 的合成拖曳碰不到視窗框），開選單並打開配對表單 | 兩個輸入框和「配對」按鈕的 bounds 都 `w,h ≥ 1`，而且都在內容區裡面；選單可以捲動到最下面；焦點在輸入框時按 Escape，選單收起；再開選單，點 `btn-workspace-menu`，選單也會收起 |
 | R45 | 先開著 `edge`，再點 `btn-remote-forget:0` | 開著的 `edge` 跟著關閉：左上角不再有 `ubuntu-ui ▸`，`ws-tree-row:*` 都有 `CTRL_GONE`；`remote-worker:0` 有 `CTRL_GONE`；`remote-workers.json` 不再有 `ubuntu-ui`；重開選單也不會再出現 |
 
@@ -312,7 +313,7 @@ R45 之前，或在 R45 之後重新配對一次（重啟 worker 拿新碼，用
 
 | ID | 動作 | 通過線 |
 |---|---|---|
-| C01 | `target/debug/snip remote workers`（同一個 `SNIP_CONFIG_DIR`） | 不用另外配對就列出 `1	ubuntu-ui	100.95.28.19	<指紋>`，證明 GUI 和 CLI 共用配對紀錄 |
+| C01 | `target/debug/snip remote workers`（同一個 `SNIP_CONFIG_DIR`） | 不用另外配對就列出 `1	ubuntu-ui	100.95.28.19:47899	<指紋>`，證明 GUI 和 CLI 共用配對紀錄 |
 | C02 | `snip remote workspaces 1`、`snip remote ls 1 rtk src` | 結果和 R05、R08 在 GUI 上看到的一致 |
 | C03 | 對 rtk 抽 20 個 tracked 文字檔，比較 `snip remote cat 1 rtk <f> \| shasum -a 256` 和 `ssh ubuntu sha256sum` | 20/20 相同 |
 | C04 | App 開著 rtk 的時候，同時跑 50 個平行的 `snip remote cat 1 rtk src/main.rs` | 50/50 正確；這段時間在 GUI 點檔案仍然能預覽（`PREVIEW_LOADED`） |
@@ -356,7 +357,7 @@ start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws
 ssh ubuntu "kill \$(cat '$W/worker.pid') 2>/dev/null; rm -rf '$W'"
 ```
 
-只刪 `$W`。不要動 `~/research/rtk`，也不要動 Ubuntu 上 linuxbrew 的 `snip`。Mac 上的 `$RUN` 保留，裡面是證據。
+只刪 `$W`。只停本輪的 worker，不要停使用者的 `snip-worker.service` / `com.audichuang.snip-worker`（47821 埠）。不要動 `~/research/rtk`，也不要動 Ubuntu 上 linuxbrew 的 `snip`。Mac 上的 `$RUN` 保留，裡面是證據。
 
 ## 7. 計分
 
