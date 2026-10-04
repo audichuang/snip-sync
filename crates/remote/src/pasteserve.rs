@@ -3,9 +3,9 @@
 //! runs ([`plan_import_with`], [`CommitReplayPreview`]) on its own disk.
 //!
 //! Stateless: an Apply plans again and refuses as stale whatever changed
-//! since the preview the master showed. Nothing is ever written inside a
-//! `.git` folder or a Git directory, and every destination stays inside
-//! the workspace.
+//! since the preview the master showed. Destinations stay inside the
+//! workspace (the remote access scope); every other rule, the Git-directory
+//! write guard included, is the core engine's and the same as locally.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,6 @@ use snip_core::commits;
 use snip_core::gitrun::{CancelToken, GitPool, RunOptions};
 use snip_core::gitsrc::Git;
 use snip_core::gitview::ReadProfile;
-use snip_core::paths::has_git_segment;
 use snip_core::restore::{
 	suggest_restore_base, FsProbe, RestorePlan, RestoreSelection,
 };
@@ -79,51 +78,13 @@ fn stale(root: &Path, reason: &str) -> Refusal {
 	)
 }
 
-/// A folder with the files of a Git directory (bare repository, separate
-/// git dir, `.git` itself).
-fn is_git_dir(dir: &Path) -> bool {
-	dir.join("HEAD").is_file()
-		&& dir.join("objects").is_dir()
-		&& dir.join("refs").is_dir()
-}
-
-/// True when `path` (real, absolute) is or lies inside a `.git` folder or
-/// a Git directory.
-fn in_git_dir(path: &Path) -> bool {
-	has_git_segment(&path.to_string_lossy()) || path.ancestors().any(is_git_dir)
-}
-
-/// Where `path` really lands, the deepest existing ancestor resolved: a
-/// file that does not exist yet still lands under a real folder.
-fn real_target(path: &Path) -> Option<PathBuf> {
-	let mut rest = Vec::new();
-	let mut cur = path;
-	loop {
-		if let Ok(real) = dunce::canonicalize(cur) {
-			let mut out = real;
-			for name in rest.iter().rev() {
-				out.push(name);
-			}
-			return Some(out);
-		}
-		rest.push(cur.file_name()?.to_os_string());
-		cur = cur.parent()?;
-	}
-}
-
 /// The folder `rel` of the workspace as a paste destination: real, a
-/// folder, inside the workspace and outside every Git directory.
+/// folder, inside the workspace. A Git directory is not refused here: the
+/// engine lists every entry that would land in it as a skipped row, as a
+/// local paste does.
 fn destination(root: &SharedRoot, rel: &str) -> Result<PathBuf, Refusal> {
 	if !valid_rel_path(rel, true) {
 		return Err(refused(ErrorCode::BadRequest, "invalid destination"));
-	}
-	if has_git_segment(rel) {
-		return Err(refused(
-			ErrorCode::Forbidden,
-			format!(
-				"'{rel}' is inside a .git folder; paste never writes there"
-			),
-		));
 	}
 	let path = if rel.is_empty() {
 		root.path.clone()
@@ -137,56 +98,16 @@ fn destination(root: &SharedRoot, rel: &str) -> Result<PathBuf, Refusal> {
 			format!("'{}' is not a folder", path.display()),
 		));
 	}
-	if in_git_dir(&path) {
-		return Err(refused(
-			ErrorCode::Forbidden,
-			format!(
-				"'{}' is inside a Git directory; paste never writes there",
-				path.display()
-			),
-		));
-	}
 	Ok(path)
 }
 
-/// Refuses a plan that would write outside the workspace or into a Git
-/// directory, however a symlink on the way resolves.
-fn check_targets<'a>(
-	root: &SharedRoot,
-	targets: impl IntoIterator<Item = &'a Path>,
-) -> Result<(), Refusal> {
-	for target in targets {
-		let real = real_target(target);
-		let ok = real.as_deref().is_some_and(|real| {
-			real.starts_with(&root.path) && !in_git_dir(real)
-		});
-		if !ok {
-			return Err(refused(
-				ErrorCode::Forbidden,
-				format!(
-					"'{}' is outside the workspace or inside a Git directory; \
-					 paste never writes there",
-					target.display()
-				),
-			));
-		}
-	}
-	Ok(())
-}
-
-fn plan_targets(plan: &RestorePlan) -> impl Iterator<Item = &Path> {
-	let creates = plan.create_operations.iter().map(|o| &o.absolute_path);
-	let deletes = plan.delete_operations.iter().map(|o| &o.absolute_path);
-	creates.chain(deletes).map(PathBuf::as_path)
-}
-
-/// The paths a master sent back with a snapshot must be ones this
-/// workspace could have recorded.
+/// The paths a master sent back with a snapshot must be ones this paste
+/// could have recorded: under `base`.
 fn check_snapshot(
-	root: &SharedRoot,
+	base: &Path,
 	freshness: &DestinationFreshnessSnapshot,
 ) -> Result<(), Refusal> {
-	let inside = |p: &Path| p.is_absolute() && p.starts_with(&root.path);
+	let inside = |p: &Path| p.is_absolute() && p.starts_with(base);
 	let ok = freshness.roots.keys().all(|r| inside(r.path()))
 		&& freshness
 			.target_files
@@ -197,7 +118,7 @@ fn check_snapshot(
 	} else {
 		Err(refused(
 			ErrorCode::BadRequest,
-			"the preview names a path outside the workspace",
+			"the preview names a path this paste cannot have recorded",
 		))
 	}
 }
@@ -262,7 +183,6 @@ fn plan(
 	let plan =
 		plan_import_with(text, header, &roots, &import, &options(cancel))
 			.map_err(|e| transfer_refusal(e, cancel))?;
-	check_targets(root, plan_targets(plan.restore_plan()))?;
 	Ok(Planned { plan, suggestion })
 }
 
@@ -299,7 +219,7 @@ pub(crate) fn import_apply(
 	cancel: &CancelToken,
 ) -> Response {
 	let run = || -> Result<Response, Refusal> {
-		check_snapshot(root, &expect.freshness)?;
+		check_snapshot(&root.path, &expect.freshness)?;
 		expect
 			.freshness
 			.revalidate()
@@ -330,7 +250,8 @@ pub(crate) fn import_apply(
 }
 
 /// The repository a commit payload replays onto: the top folder of the
-/// repository at `dest`, which must lie inside the workspace too.
+/// repository at `dest`, as a local replay finds it (it may lie above the
+/// workspace, as local Git views follow it).
 fn replay_root(
 	root: &SharedRoot,
 	dest: &str,
@@ -339,33 +260,12 @@ fn replay_root(
 	let dir = destination(root, dest)?;
 	let git = Git::open_with(&dir, &options(cancel))
 		.map_err(|e| transfer_refusal(TransferError::Git(e), cancel))?;
-	let top =
-		dunce::canonicalize(git.root()).map_err(|e| Box::new(io_error(e)))?;
-	if !top.starts_with(&root.path) || in_git_dir(&top) {
-		return Err(refused(
-			ErrorCode::Forbidden,
-			format!(
-				"the repository '{}' is not inside the workspace",
-				top.display()
-			),
-		));
-	}
-	Ok(top)
+	dunce::canonicalize(git.root()).map_err(|e| Box::new(io_error(e)))
 }
 
 fn payload(text: &str) -> Result<commits::CommitsPayload, Refusal> {
 	commits::parse_commit_payload(text)
 		.map_err(|e| refused(ErrorCode::BadRequest, e.to_string()))
-}
-
-fn replay_targets(plan: &commits::CommitReplayPlan) -> Vec<&Path> {
-	plan.commits
-		.iter()
-		.flat_map(|c| &c.files)
-		.flat_map(|f| [&f.absolute_path, &f.old_absolute_path])
-		.flatten()
-		.map(PathBuf::as_path)
-		.collect()
 }
 
 /// Answers [`crate::proto::Request::ReplayPlan`].
@@ -381,7 +281,6 @@ pub(crate) fn replay_plan(
 		let preview =
 			CommitReplayPreview::capture_with(&top, &payload, &options(cancel))
 				.map_err(|e| transfer_refusal(e, cancel))?;
-		check_targets(root, replay_targets(preview.plan()))?;
 		Ok(Response::ReplayPlanned(ReplayExpect::of(&preview)))
 	};
 	run().unwrap_or_else(|resp| *resp)
@@ -406,8 +305,7 @@ pub(crate) fn replay_apply(
 				"replay eligibility changed after preview",
 			));
 		}
-		check_snapshot(root, &expect.freshness)?;
-		check_targets(root, replay_targets(&expect.plan))?;
+		check_snapshot(&top, &expect.freshness)?;
 		let payload = payload(text)?;
 		let preview = CommitReplayPreview::from_parts(
 			expect.destination,

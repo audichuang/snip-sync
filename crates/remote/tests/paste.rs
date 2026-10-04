@@ -8,7 +8,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use snip_core::restore::{RestoreExecutionResult, RestoreSelection};
+use snip_core::restore::{
+	RestoreExecutionResult, RestorePlan, RestoreSelection,
+};
 use snip_core::transfer::{
 	plan_import, CanonicalRootId, CommitReplayPreview, ImportMapping,
 };
@@ -93,6 +95,46 @@ fn local_paste(
 	)
 	.unwrap();
 	plan.apply(sel).unwrap()
+}
+
+/// What a local paste of `text` into `dest` answers, prefixes routed to
+/// other folders as the app routes them: its operations, or its refusal in
+/// the words the worker sends.
+fn local_outcome(
+	dest: &Path,
+	text: &str,
+	prefixes: &[(&str, &Path)],
+) -> Result<RestorePlan, String> {
+	let dest = dunce::canonicalize(dest).unwrap();
+	let mut roots = vec![dest.clone()];
+	let mut mapping =
+		ImportMapping::with_primary(CanonicalRootId::new(&dest).unwrap());
+	for (prefix, folder) in prefixes {
+		let folder = dunce::canonicalize(folder).unwrap();
+		mapping.map_prefix(*prefix, CanonicalRootId::new(&folder).unwrap());
+		roots.push(folder);
+	}
+	plan_import(text, "", &roots, &mapping)
+		.map(|p| p.restore_plan().clone())
+		.map_err(|e| e.paste_message())
+}
+
+/// The worker's answer to the same paste, in the same shape.
+fn remote_outcome(
+	res: Result<snip_remote::ImportPlanned, RemoteError>,
+) -> Result<RestorePlan, String> {
+	match res {
+		Ok(planned) => Ok(planned.plan.restore_plan().clone()),
+		Err(RemoteError::Refused { message, .. }) => Err(message),
+		Err(other) => panic!("not a worker answer: {other:?}"),
+	}
+}
+
+/// A refusal, or a plan with nothing to write.
+fn no_writes(outcome: &Result<RestorePlan, String>) -> bool {
+	outcome.as_ref().map_or(true, |p| {
+		p.create_operations.is_empty() && p.delete_operations.is_empty()
+	})
 }
 
 fn unchecked(creates: &[usize]) -> RestoreSelection {
@@ -276,35 +318,48 @@ fn a_paste_never_writes_into_git_or_outside_the_workspace() {
 	assert!(!ws.join(".git").exists());
 	assert!(!hooks.join("pre-commit").exists());
 
-	// A destination inside `.git`, or a Git directory itself, is refused.
-	let text = entry("pre-commit", "#!/bin/sh\necho owned");
-	for dest in ["repo/.git", "repo/.git/hooks", "../ws/repo/.git"] {
-		let res = client.import_plan(&id, dest, &text, &mapping, None);
-		assert!(
-			matches!(
-				refused(res),
-				ErrorCode::Forbidden | ErrorCode::BadRequest
-			),
-			"{dest}"
-		);
-	}
+	// A destination inside a Git directory gets the answer a local paste
+	// gets there, and nothing is written.
 	let bare = ws.join("bare.git");
 	fs::create_dir_all(&bare).unwrap();
 	git(&bare, &["init", "-q", "--bare"]);
-	let res = client.import_plan(&id, "bare.git", &text, &mapping, None);
-	assert_eq!(refused(res), ErrorCode::Forbidden);
-	let res = client.import_plan(&id, "bare.git/hooks", &text, &mapping, None);
-	assert_eq!(refused(res), ErrorCode::Forbidden);
-	// A mapped prefix destination is held to the same rule.
+	let bare_hooks = fs::read_dir(bare.join("hooks")).unwrap().count();
+	let text = entry("pre-commit", "#!/bin/sh\necho owned");
+	for dest in ["repo/.git", "repo/.git/hooks", "bare.git", "bare.git/hooks"] {
+		let remote = remote_outcome(
+			client.import_plan(&id, dest, &text, &mapping, None),
+		);
+		assert_eq!(remote, local_outcome(&ws.join(dest), &text, &[]), "{dest}");
+		assert!(no_writes(&remote), "{dest}: {remote:?}");
+	}
+	assert_eq!(
+		refused(client.import_plan(
+			&id,
+			"../ws/repo/.git",
+			&text,
+			&mapping,
+			None
+		)),
+		ErrorCode::BadRequest
+	);
+	// A mapped prefix folder is held to the same rule.
 	let mapped = PasteMapping {
 		prefixes: vec![("x".into(), "repo/.git/hooks".into())],
 		..PasteMapping::default()
 	};
-	let res =
-		client.import_plan(&id, "", &entry("x/pre-commit", "x"), &mapped, None);
-	assert_eq!(refused(res), ErrorCode::Forbidden);
+	let text = entry("x/pre-commit", "x");
+	let remote =
+		remote_outcome(client.import_plan(&id, "", &text, &mapped, None));
+	assert_eq!(remote, local_outcome(&ws, &text, &[("x", &hooks)]));
+	assert!(no_writes(&remote), "{remote:?}");
 	assert!(!hooks.join("pre-commit").exists());
 	assert_eq!(fs::read_dir(&hooks).unwrap().count(), before);
+	assert_eq!(
+		fs::read_dir(bare.join("hooks")).unwrap().count(),
+		bare_hooks
+	);
+	assert!(!repo.join(".git/pre-commit").exists());
+	assert!(!bare.join("pre-commit").exists());
 
 	// Outside the workspace.
 	let res = client.import_plan(&id, "../", &text, &mapping, None);
@@ -317,7 +372,7 @@ fn a_paste_never_writes_into_git_or_outside_the_workspace() {
 
 #[cfg(unix)]
 #[test]
-fn a_symlinked_destination_cannot_lead_out_of_the_workspace_or_into_git() {
+fn a_symlink_cannot_lead_a_paste_out_of_the_workspace_or_into_git() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let ws = tmp.path().join("ws");
@@ -336,14 +391,37 @@ fn a_symlinked_destination_cannot_lead_out_of_the_workspace_or_into_git() {
 		refused(client.import_plan(&id, "out", &text, &mapping, None)),
 		ErrorCode::Forbidden
 	);
-	assert_eq!(
-		refused(client.import_plan(&id, "gitlink", &text, &mapping, None)),
-		ErrorCode::Forbidden
+	// Into `.git` through a symlink: skipped rows, as locally.
+	let remote = remote_outcome(
+		client.import_plan(&id, "gitlink", &text, &mapping, None),
 	);
+	assert_eq!(remote, local_outcome(&ws.join("gitlink"), &text, &[]));
+	assert!(no_writes(&remote), "{remote:?}");
 	// An entry reaching `.git` through a symlinked folder inside the
-	// workspace is refused before anything is written.
-	let text = entry("gitlink/hooks/pre-commit", "x");
-	assert!(client.import_plan(&id, "", &text, &mapping, None).is_err());
+	// workspace is a skipped row; the others are written.
+	let text = [
+		entry("gitlink/hooks/pre-commit", "x"),
+		entry("ok.txt", "ok"),
+	]
+	.concat();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	assert_eq!(
+		Ok(planned.plan.restore_plan().clone()),
+		local_outcome(&ws, &text, &[])
+	);
+	assert_eq!(planned.plan.create_operations().len(), 1);
+	client
+		.import_apply(
+			&id,
+			"",
+			&text,
+			&mapping,
+			&unchecked(&[]),
+			&planned.expect(),
+			None,
+		)
+		.unwrap();
+	assert_eq!(fs::read_to_string(ws.join("ok.txt")).unwrap(), "ok");
 	assert!(!repo.join(".git/hooks/pre-commit").exists());
 	assert!(fs::read_dir(&outside).unwrap().next().is_none());
 }
@@ -466,7 +544,8 @@ fn a_remote_commit_replay_makes_the_commits_a_local_replay_makes() {
 }
 
 #[test]
-fn a_commit_replay_refuses_a_changed_repo_and_a_repo_above_the_workspace() {
+fn a_commit_replay_refuses_a_changed_repo_and_follows_a_repo_above_the_workspace(
+) {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let ws = tmp.path().join("ws");
@@ -500,14 +579,22 @@ fn a_commit_replay_refuses_a_changed_repo_and_a_repo_above_the_workspace() {
 	);
 	assert_eq!(git_out(&dst, &["rev-list", "--count", "HEAD"]), "1");
 
-	// A workspace inside a repository: the repository's top folder is
-	// outside it, so a replay would write outside the workspace.
-	fs::create_dir_all(src.join("sub")).unwrap();
-	let (client2, sub_id) = open(&w, &src.join("sub"));
-	assert_eq!(
-		refused(client2.replay_plan(&sub_id, "", &text, payload, None)),
-		ErrorCode::Forbidden
-	);
+	// A workspace inside a repository replays onto that repository, as a
+	// local replay from a subfolder does.
+	let outer = tmp.path().join("outer");
+	init_repo(&outer);
+	fs::create_dir_all(outer.join("sub")).unwrap();
+	let (client2, sub_id) = open(&w, &outer.join("sub"));
+	let preview = client2
+		.replay_plan(&sub_id, "", &text, payload, None)
+		.unwrap();
+	assert_eq!(preview.destination(), dunce::canonicalize(&outer).unwrap());
+	let result = client2
+		.replay_apply(&sub_id, "", &text, &preview, false, None)
+		.unwrap()
+		.unwrap();
+	assert_eq!(result.created.len(), 1, "{result:?}");
+	assert_eq!(fs::read_to_string(outer.join("a.txt")).unwrap(), "one\n");
 }
 
 #[test]

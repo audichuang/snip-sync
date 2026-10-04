@@ -691,11 +691,26 @@ fn cli_remote_paste_of_files_matches_a_local_paste() {
 	assert_eq!(tree_bytes(&remote), tree_bytes(&local));
 	assert!(remote.join("sub/中文.txt").is_file());
 
-	// A destination inside `.git` is refused and nothing is written.
-	std::fs::create_dir_all(ws.join(".git")).unwrap();
+	// A Git directory as the destination: refused as locally, nothing
+	// written.
+	if !require_git() {
+		return;
+	}
+	git(&ws, &["init", "-q"]);
+	let local_repo = tmp.path().join("l/repo");
+	std::fs::create_dir_all(&local_repo).unwrap();
+	git(&local_repo, &["init", "-q"]);
+	let l = local_paste(
+		&cfg,
+		&local_repo.join(".git"),
+		&text,
+		&["--apply", "--overwrite"],
+	);
 	let r = m.paste(&ws, ".git", &text, &["--apply", "--overwrite"]);
-	assert_eq!(r.0, Some(1), "{}", r.2);
+	assert_eq!(l.0, Some(1), "{}", l.2);
+	assert_eq!(r.0, l.0, "{}", r.2);
 	assert!(!ws.join(".git/a.txt").exists());
+	assert!(!local_repo.join(".git/a.txt").exists());
 }
 
 #[test]
