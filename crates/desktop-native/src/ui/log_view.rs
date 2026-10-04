@@ -447,6 +447,11 @@ impl WorkbenchModel {
 										.bg(rgb(pal().error_bg))
 										.text_size(px(SMALL_TEXT))
 										.text_color(rgb(pal().error))
+										.when(self.chrome.menu.is_none(), |d| {
+											d.tooltip(tip(self
+												.failed_feed_names()
+												.join("\n")))
+										})
 										.child(msg.render(loc))
 										.children(probe(
 											log,
