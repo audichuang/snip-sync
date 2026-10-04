@@ -86,8 +86,7 @@ pub(crate) fn unreadable_slots(
 }
 
 /// Left padding of a Changes row at tree level `depth`: each level moves
-/// one chevron plus gap, so a child's chevron sits under its parent's
-/// checkbox and every level's chevrons share one column.
+/// one chevron plus gap, so every level's chevrons share one column.
 pub(super) fn change_pad(depth: usize) -> f32 {
 	4. + 18. * depth as f32
 }
@@ -436,7 +435,7 @@ impl<T: TreePath, F: Fn(usize, &str, &str) -> bool> DirTree<'_, T, F> {
 
 impl WorkbenchModel {
 	/// Changes group node, like IntelliJ's commit tool window: chevron,
-	/// tri-state group checkbox, name and count.
+	/// name and count. Its menu copies the whole group.
 	pub(super) fn change_header_row(
 		&self,
 		label_key: &'static str,
@@ -453,7 +452,6 @@ impl WorkbenchModel {
 		// IntelliJ's double click.
 		let clicks = if self.change_repos.len() > 1 { 1 } else { 2 };
 		let id = format!("change-header:{group_id}");
-		let chk_id = format!("change-group-chk:{group_id}");
 		let toggle_id = format!("change-group-toggle:{group_id}");
 		div()
 			.id(SharedString::from(id.clone()))
@@ -510,22 +508,6 @@ impl WorkbenchModel {
 					.children(probe(log, toggle_id)),
 			)
 			.child(
-				div()
-					.id(SharedString::from(chk_id.clone()))
-					.relative()
-					.flex_shrink_0()
-					.size(px(18.))
-					.flex()
-					.items_center()
-					.justify_center()
-					.on_click(cx.listener(move |this, _, _, cx| {
-						cx.stop_propagation();
-						this.toggle_change_group(group_id, cx);
-					}))
-					.child(tri_checkbox(self.group_state(group_id)))
-					.children(probe(log, chk_id)),
-			)
-			.child(
 				clip_text(t(label_key, loc))
 					.ml(px(4.))
 					.font_weight(FontWeight::SEMIBOLD),
@@ -556,8 +538,7 @@ impl WorkbenchModel {
 		(legacy, name)
 	}
 
-	/// Repo row under a workspace group: chevron, tri-state checkbox for
-	/// the repo's changes in that group, a square in the repo's Git Log
+	/// Repo row under a workspace group: chevron, a square in the repo's Git Log
 	/// root-stripe color, the name, its count and the branch as a pill.
 	pub(super) fn change_repo_row(
 		&self,
@@ -589,7 +570,6 @@ impl WorkbenchModel {
 			})
 			.unwrap_or_default();
 		let id = format!("change-repo:{group_id}:{name}");
-		let chk_id = format!("change-repo-chk:{group_id}:{name}");
 		let toggle_id = format!("change-repo-toggle:{group_id}:{name}");
 		let tooltip = self.change_repo_tooltip(&repo.root);
 		div()
@@ -623,23 +603,6 @@ impl WorkbenchModel {
 			.child(
 				tree_chevron(toggle_id.clone(), collapsed)
 					.children(probe(log, toggle_id)),
-			)
-			.child(
-				div()
-					.id(SharedString::from(chk_id.clone()))
-					.relative()
-					.flex_shrink_0()
-					.size(px(18.))
-					.flex()
-					.items_center()
-					.justify_center()
-					.on_click(cx.listener(move |this, _, _, cx| {
-						cx.stop_propagation();
-						this.selected_list_row = row_idx;
-						this.toggle_change_repo(slot, group_id, cx);
-					}))
-					.child(tri_checkbox(self.repo_state(slot, group_id)))
-					.children(probe(log, chk_id)),
 			)
 			.child(if failed {
 				div()
@@ -770,7 +733,7 @@ impl WorkbenchModel {
 			.gap(px(6.))
 			.w_full()
 			.h(px(ROW_H))
-			// Otherwise it lines up with the checkboxes of the rows it
+			// Otherwise it lines up with the icons of the rows it
 			// speaks for: a single repo's groups, or a repo row's children.
 			.pl(px(if folded {
 				change_pad(1) + 4.
@@ -792,7 +755,7 @@ impl WorkbenchModel {
 	}
 
 	/// Directory node under a repo ("Group By > Directory"): chevron,
-	/// tri-state checkbox over every file beneath it, folder icon, the
+	/// folder icon, the
 	/// (possibly compacted) name and the muted count of files beneath it.
 	pub(super) fn change_dir_row(
 		&self,
@@ -817,9 +780,7 @@ impl WorkbenchModel {
 		let cursor = row_idx == self.selected_list_row;
 		let key = format!("{group_id}:{repo}:{path}");
 		let id = format!("change-dir:{key}");
-		let chk_id = format!("change-dir-chk:{key}");
 		let toggle_id = format!("change-dir-toggle:{key}");
-		let state = self.dir_state(slot, group_id, &path);
 		let tooltip = path.clone();
 		let (p1, p2) = (path.clone(), path);
 		div()
@@ -842,26 +803,17 @@ impl WorkbenchModel {
 				this.selected_list_row = row_idx;
 				this.toggle_dir_collapsed(slot, group_id, &p1, cx);
 			}))
+			.on_mouse_down(
+				MouseButton::Right,
+				cx.listener(move |this, ev: &MouseDownEvent, w, cx| {
+					this.selected_list_row = row_idx;
+					let items = this.change_dir_menu(slot, group_id, &p2);
+					this.open_left_menu(items, ev, w, cx);
+				}),
+			)
 			.child(
 				tree_chevron(toggle_id.clone(), collapsed)
 					.children(probe(log, toggle_id)),
-			)
-			.child(
-				div()
-					.id(SharedString::from(chk_id.clone()))
-					.relative()
-					.flex_shrink_0()
-					.size(px(18.))
-					.flex()
-					.items_center()
-					.justify_center()
-					.on_click(cx.listener(move |this, _, _, cx| {
-						cx.stop_propagation();
-						this.selected_list_row = row_idx;
-						this.toggle_change_dir(slot, group_id, &p2, cx);
-					}))
-					.child(tri_checkbox(state))
-					.children(probe(log, chk_id)),
 			)
 			.child(
 				div()
@@ -930,25 +882,8 @@ impl WorkbenchModel {
 		} else {
 			(None, None)
 		};
-		// Like the project tree, a name that is not UTF-8 cannot be selected.
-		let checkable = item.is_valid_utf8();
-		let repo_chk_id = if checkable {
-			format!("change-chk@{repo}:{source_str}:{path}")
-		} else {
-			format!("change-chk-invalid@{repo}:{source_str}:{ix}")
-		};
-		let (chk_id, src_chk_id) = match (legacy, checkable) {
-			(false, _) => (None, None),
-			(true, true) => (
-				Some(format!("change-chk:{path}")),
-				Some(format!("change-chk:{source_str}:{path}")),
-			),
-			(true, false) => (
-				Some(format!("change-chk-invalid:{ix}")),
-				Some(format!("change-chk-invalid:{source_str}:{ix}")),
-			),
-		};
-		let tooltip = if checkable {
+		// Like the project tree, a name that is not UTF-8 cannot be copied.
+		let tooltip = if item.is_valid_utf8() {
 			format!("{path}  ({letter})")
 		} else {
 			format!("{path}  ({letter})\n{}", t("change_not_utf8", self.locale))
@@ -963,7 +898,7 @@ impl WorkbenchModel {
 			.w_full()
 			.h(px(ROW_H))
 			// Leaves keep their parent's chevron column empty, so a file's
-			// checkbox lines up with its sibling directories' checkboxes.
+			// icon lines up with its sibling directories' icons.
 			.pl(px(change_pad(depth) + 18.))
 			.pr(px(6.))
 			.gap(px(6.))
@@ -984,35 +919,6 @@ impl WorkbenchModel {
 				this.selected_list_row = row_idx;
 				this.select_change(ix, cx);
 			}))
-			.child(
-				div()
-					.id(SharedString::from(repo_chk_id.clone()))
-					.relative()
-					.flex_shrink_0()
-					.size(px(18.))
-					.flex()
-					.items_center()
-					.justify_center()
-					.when(checkable, |d| {
-						d.on_click(cx.listener(move |this, _, _, cx| {
-							cx.stop_propagation();
-							this.selected_list_row = row_idx;
-							this.toggle_file(ix, cx);
-						}))
-					})
-					.child(if checkable {
-						checkbox(item.selected).into_any_element()
-					} else {
-						div()
-							.text_size(px(9.))
-							.text_color(rgb(pal().text_muted))
-							.child("×")
-							.into_any_element()
-					})
-					.children(probe(log, repo_chk_id))
-					.children(chk_id.and_then(|id| probe(log, id)))
-					.children(src_chk_id.and_then(|id| probe(log, id))),
-			)
 			.child(icon(
 				if is_dir {
 					Icon::Folder

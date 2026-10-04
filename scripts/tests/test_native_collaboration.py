@@ -234,7 +234,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(found.count("billing"), 2)
 
     def test_missing_control_timeout_and_clipboard_mismatch_are_not_passes(self) -> None:
-        self.assertEqual(driver.classify_exception(driver.MissingControl("btn-copy")), "blocked")
+        self.assertEqual(driver.classify_exception(driver.MissingControl("menu-item:copy-files")), "blocked")
         self.assertEqual(driver.classify_exception(driver.OperationTimeout("timed out")), "timeout")
         self.assertFalse(driver.counts_as_pass("blocked"))
         self.assertFalse(driver.counts_as_pass("timeout"))
@@ -313,9 +313,7 @@ class SelectionTests(unittest.TestCase):
         source_kind, path = driver.resolve_operation_source(op)
         self.assertEqual(source_kind, "unstaged")
         self.assertEqual(path, "src/extra.txt")
-        row_id, chk_id = driver.change_control(source_kind, path)
-        self.assertEqual(row_id, "change-row:unstaged:src/extra.txt")
-        self.assertEqual(chk_id, "change-chk:unstaged:src/extra.txt")
+        self.assertEqual(driver.change_control(source_kind, path), "change-row:unstaged:src/extra.txt")
 
     def test_index_deletion_provenance_resolves_to_staged(self) -> None:
         op = {
@@ -336,9 +334,7 @@ class SelectionTests(unittest.TestCase):
         source_kind, path = driver.resolve_operation_source(op)
         self.assertEqual(source_kind, "staged")
         self.assertEqual(path, "notes/guide.txt")
-        row_id, chk_id = driver.change_control(source_kind, path)
-        self.assertEqual(row_id, "change-row:staged:notes/guide.txt")
-        self.assertEqual(chk_id, "change-chk:staged:notes/guide.txt")
+        self.assertEqual(driver.change_control(source_kind, path), "change-row:staged:notes/guide.txt")
 
     def test_deletion_operation_source_kind_delete_is_rejected(self) -> None:
         op = {
@@ -395,13 +391,11 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(driver.DriverError):
             driver.resolve_operation_source(no_oid)
 
-    def test_fixed_oid_controls_and_error_on_change_control(self) -> None:
-        row, chk = driver.fixed_oid_controls("c0ffee" * 6 + "1234", "src/util.rs")
-        self.assertEqual(row, "rev-row:src/util.rs")
-        self.assertEqual(chk, f"rev-chk:{'c0ffee' * 6 + '1234'}:src/util.rs")
+    def test_fixed_oid_control_and_error_on_change_control(self) -> None:
+        self.assertEqual(driver.fixed_oid_control("src/util.rs"), "rev-row:src/util.rs")
         with self.assertRaises(driver.MissingControl) as caught:
             driver.change_control("fixed-oid", "src/util.rs")
-        self.assertIn("rev-chk", str(caught.exception))
+        self.assertIn("rev-row", str(caught.exception))
 
     def test_parse_paste_map_candidates(self) -> None:
         lines = [
@@ -622,8 +616,8 @@ class ReportTests(unittest.TestCase):
 
 
 class OrchestratorHistoricalTreeTests(unittest.TestCase):
-    def test_select_fixed_oid_browse_tree_expansion_and_rev_chk(self) -> None:
-        """Verify full historical sequence: select commit -> browse-tree -> REV_TREE/E2E_TREE -> expand parents -> rev-row -> PREVIEW_LOADED/E2E_PREVIEW -> rev-chk."""
+    def test_select_fixed_oid_browse_tree_expansion_returns_rev_row(self) -> None:
+        """Verify full historical sequence: select commit -> browse-tree -> REV_TREE/E2E_TREE -> expand parents -> rev-row -> PREVIEW_LOADED/E2E_PREVIEW; the rev-row is what gets copied."""
         with tempfile.TemporaryDirectory() as tmp:
             repo_path = Path(tmp) / "repo"
             repo_path.mkdir()
@@ -696,14 +690,12 @@ class OrchestratorHistoricalTreeTests(unittest.TestCase):
                     elif control == f"rev-row:{file_path}":
                         sess.lines.append((0.0, f"[APP:PREVIEW_LOADED: {file_path}]"))
                         sess.lines.append((0.0, f"[APP:E2E_PREVIEW: source=commit_file rev={full_commit} path={file_path} lines=5 fnv=abc]"))
-                    elif control == f"rev-chk:{full_commit}:{file_path}":
-                        sess.lines.append((0.0, "[APP:BASKET: n=1 ...]"))
 
                 driver.click_control = mock_click_control
 
                 win = {"wid": 1, "x": 0, "y": 0, "w": 800, "h": 600}
                 trace: list[dict] = []
-                driver.select_fixed_oid(
+                row = driver.select_fixed_oid(
                     MockNative(),
                     sess,
                     win,
@@ -714,15 +706,15 @@ class OrchestratorHistoricalTreeTests(unittest.TestCase):
                     timeout=1.0,
                     trace=trace,
                 )
+                self.assertEqual(row, f"rev-row:{file_path}")
 
                 self.assertIn(f"commit-row:{short_commit}", sess.clicked)
                 self.assertEqual(sess.clicked.count(f"btn-browse-tree:{full_commit}"), 1)
                 self.assertIn("rev-row:notes", sess.clicked)
                 self.assertIn("rev-row:notes/guide", sess.clicked)
                 self.assertIn(f"rev-row:{file_path}", sess.clicked)
-                self.assertIn(f"rev-chk:{full_commit}:{file_path}", sess.clicked)
                 actions = [t["action"] for t in trace]
-                self.assertEqual(actions, ["commit-click", "browse-tree", "expand-rev", "expand-rev", "rev-nav", "check-fixed-oid"])
+                self.assertEqual(actions, ["commit-click", "browse-tree", "expand-rev", "expand-rev", "rev-nav"])
 
             finally:
                 driver.git_read = orig_git_read
@@ -1609,7 +1601,7 @@ class MappingFlowTests(unittest.TestCase):
             "select_repo": lambda *a: None,
             "click_control": self.click,
             "capture_checked": lambda *a: {"png": "shot.png"},
-            "copy_from_button": lambda *a: b"payload",
+            "copy_node": lambda *a, **k: b"payload",
             "transfer_os_clipboard": lambda *a: None,
             "paste_preview": self.preview,
             "apply_or_cancel": lambda *a: "[APP:PASTE_CANCELLED]",
@@ -1620,7 +1612,7 @@ class MappingFlowTests(unittest.TestCase):
         self.controls.append(control)
         if control.startswith("tree-row:") and modifier == "ctrl":
             self.assertEqual(self.controls[-2], "tree-chevron:src")
-            session.add("[APP:BASKET: n=1]")
+            session.add(f"[APP:TREE_TOGGLED: {control.split(':', 1)[1]}]")
         elif control.startswith("tree-chevron:"):
             self.assertIsNone(modifier)
             session.add(f"[APP:TREE_EXPANDED: {control.split(':', 1)[1]}]")
@@ -1651,8 +1643,10 @@ class MappingFlowTests(unittest.TestCase):
     def collide(self):
         step = {"maps": [{"sourceRepoId": rid, "sourcePath": "src/app.txt", "destRepoId": "b-north-ledger", "destPath": "src/app.txt"} for rid in ("a-west-billing", "a-west-docs")]}
         payload = b"// file: billing/src/app.txt\nfirst\n// file: src/app.txt\nsecond\n"
-        with patch.object(driver, "copy_from_button", return_value=payload):
+        with patch.object(driver, "copy_node", return_value=payload) as copy:
             driver.attempt_collision(self.native, self.sessions, self.manifest, step, {}, self.root, self.root, .001, [], self.record, self.root)
+        # The Copy is the menu of the last row ctrl-clicked into the Project selection.
+        self.assertEqual(copy.call_args.args[3], "tree-row:src/app.txt")
 
     def test_collision_requires_both_confirmed_mappings_and_specific_probe(self):
         self.collide()
@@ -1696,13 +1690,13 @@ class MappingFlowTests(unittest.TestCase):
         with self.assertRaises(driver.DriverError):
             driver.block_ambiguous(self.native, self.sessions, self.manifest, {}, self.root, self.root, .001, [], self.record, self.root)
 
-    def test_stale_basket_event_cannot_confirm_source_selection(self):
-        self.sessions["a"].add("[APP:BASKET: n=1]")
+    def test_stale_toggle_event_cannot_confirm_source_selection(self):
+        self.sessions["a"].add("[APP:TREE_TOGGLED: src/app.txt]")
         original_click = self.click
-        def no_fresh_basket(*args, **kwargs):
+        def no_fresh_toggle(*args, **kwargs):
             if kwargs.get("modifier") != "ctrl":
                 original_click(*args, **kwargs)
-        with patch.object(driver, "click_control", side_effect=no_fresh_basket), self.assertRaises(driver.DriverError):
+        with patch.object(driver, "click_control", side_effect=no_fresh_toggle), self.assertRaises(driver.DriverError):
             self.collide()
 
     def missing_destination(self, truncate=False, auto_map=False, changed_clipboard=False):
@@ -1824,7 +1818,7 @@ class ReportOutcomeTests(unittest.TestCase):
         manifest = {"repos": [{"repoId": "a", "basename": "source", "relativePath": "machine-a/source"}, {"repoId": "b", "basename": "dest", "relativePath": "machine-b/dest"}]}
         step = {"operation": {"sourceRepoId": "a", "destRepoId": "b", "sourcePath": "src/app.txt"}}
         native = SimpleNamespace(parse_bounds=lambda lines: {"paste-overwrite:0:src/app.txt": (0, 0, 10, 10)}, require_control=lambda lines, control: (0, 0, 10, 10))
-        with tempfile.TemporaryDirectory() as tmp, patch.object(driver, "select_repo"), patch.object(driver, "select_tree_file") as tree, patch.object(driver, "preview_change", side_effect=AssertionError("unchanged file is absent from Changes")), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "copy_from_button", return_value=b"payload"), patch.object(driver, "transfer_os_clipboard"), patch.object(driver, "paste_preview", return_value="preview"), patch.object(driver, "apply_or_cancel", return_value="[APP:PASTE_DONE: created=0 overwritten=0 skipped=1]"):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(driver, "select_repo"), patch.object(driver, "select_tree_file") as tree, patch.object(driver, "preview_change", side_effect=AssertionError("unchanged file is absent from Changes")), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "copy_node", return_value=b"payload"), patch.object(driver, "transfer_os_clipboard"), patch.object(driver, "paste_preview", return_value="preview"), patch.object(driver, "apply_or_cancel", return_value="[APP:PASTE_DONE: created=0 overwritten=0 skipped=1]"):
             record = driver.blank_step("neg-overwrite-unauthorized")
             driver.run_unauthorized(native, {"a": session, "b": session}, manifest, step, {}, Path(tmp), Path(tmp), 1, [], record, Path(tmp))
             tree.assert_called_once()
@@ -1893,11 +1887,14 @@ class StaleSourceFlowTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), b"original\nSTALE-SOURCE\n")
             events.append("post-mutation-baseline")
             driver.write_json(path, {"repos": [{"bytes": source.read_text()}]})
-        with patch.object(driver, "select_repo"), patch.object(driver, "preview_change"), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "click_control", side_effect=click), patch.object(driver, "snapshot_file", side_effect=snapshot):
+        # The row's menu is open; the click on its Copy item captures the plan.
+        session.click = click
+        with patch.object(driver, "select_repo"), patch.object(driver, "preview_change", return_value="change-row:unstaged:transfer/working.txt"), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "open_copy_menu", return_value=(1, 1, 10, 10)) as menu, patch.object(driver, "snapshot_file", side_effect=snapshot):
             try:
                 driver.run_stale_source(None, {"a": session}, manifest, step, {}, root, root, .001, [], record, root)
             finally:
                 self.assertFalse(hold.exists())
+        self.assertEqual(menu.call_args.args[3], "change-row:unstaged:transfer/working.txt")
         return record, events
 
     def test_plan_capture_precedes_mutation_baseline_and_release(self):
@@ -2018,6 +2015,114 @@ class DiscontinuousFlowTests(unittest.TestCase):
         with patch.object(driver, "select_repo"), patch.object(driver, "capture_checked", return_value={"png": "shot.png"}), patch.object(driver, "click_commit_row"), patch.object(driver, "shift_click_commit", side_effect=shift), patch.object(driver, "copy_commits", side_effect=driver.UiRefusal("[APP:COPY_COMMITS_REFUSED: no_selection]")):
             with self.assertRaisesRegex(driver.DriverError, "does not prove discontinuous"):
                 driver.refuse_discontinuous(None, {"a": session}, manifest, step, {}, Path("/tmp"), .001, [], driver.blank_step("neg-noncontiguous-tips"), Path("/tmp"))
+
+
+
+class CopyNodeTests(unittest.TestCase):
+    """A Copy is the row's right-click menu item, never a toolbar button."""
+
+    ROW = "change-row:unstaged:transfer/working.txt"
+
+    def run_copy(self, menu_items="copy-files,show-diff", done="[APP:COPY_DONE: copied=1]"):
+        session = _FlowSession()
+        clicks = []
+
+        def click(native, sess, win, control, timeout, viewport=None, modifier=None, button="1"):
+            clicks.append((control, button))
+            sess.add(f"[APP:MENU_OPEN: Left items={menu_items}]")
+
+        def item_click(win, box):
+            clicks.append(("menu-item:copy-files", "1"))
+            session.add("[APP:MENU_ACTION: copy-files]")
+            session.add(done)
+            if "COPY_DONE" in done:
+                session.set_clipboard(b"// file: transfer/working.txt\nbody\n")
+
+        session.click = item_click
+        native = SimpleNamespace(
+            parse_bounds=lambda lines: {"menu-item:copy-files": (1, 1, 10, 10)},
+            require_control=lambda lines, control: (1, 1, 10, 10),
+            assert_on_window=lambda box, win, control: None,
+        )
+        trace = []
+        with patch.object(driver, "click_control", side_effect=click):
+            payload = driver.copy_node(native, session, session.window(), self.ROW, .5, trace)
+        return payload, clicks, trace
+
+    def test_right_click_then_copy_item(self):
+        payload, clicks, trace = self.run_copy()
+        self.assertEqual(clicks, [(self.ROW, "3"), ("menu-item:copy-files", "1")])
+        self.assertEqual(payload, b"// file: transfer/working.txt\nbody\n")
+        self.assertEqual(trace[-1]["control"], self.ROW)
+
+    def test_menu_without_copy_is_a_missing_control(self):
+        with self.assertRaises(driver.MissingControl):
+            self.run_copy(menu_items="copy-relative-path")
+
+    def test_refused_copy_is_a_ui_refusal(self):
+        with self.assertRaises(driver.UiRefusal):
+            self.run_copy(done="[APP:COPY_REFUSED: empty_selection]")
+
+
+
+class PositiveFilePerOperationTests(unittest.TestCase):
+    """A step mixes sources, so each operation is its own node copy and paste."""
+
+    def test_each_operation_is_copied_pasted_and_applied_alone(self):
+        manifest = {"repos": [
+            {"repoId": "src", "basename": "billing", "relativePath": "machine-a/west/billing"},
+            {"repoId": "dst", "basename": "ledger", "relativePath": "machine-b/north/ledger"},
+        ]}
+        step = {"id": "file-x", "sourceRepoId": "src", "destRepoId": "dst", "operations": [
+            {"op": "write", "source": {"kind": "working", "path": "transfer/working.txt"}, "dest": {"path": "transfer/working.txt"}, "overwrite": True},
+            {"op": "write", "source": {"kind": "fixed-oid", "path": "src/keep.txt", "rev": "v1", "oid": "1" * 40}, "dest": {"path": "src/keep.txt"}, "overwrite": True},
+            {"op": "delete", "source": {"kind": "working", "path": "src/extra.txt"}, "dest": {"path": "src/extra.txt"}},
+        ]}
+        source, dest = _FlowSession(), _FlowSession()
+        copied, overwrites, applied = [], [], []
+
+        def copy(native, session, win, control, timeout, trace, viewport=None):
+            copied.append((control, viewport))
+            payload = f"payload {len(copied)}".encode()
+            dest.set_clipboard(payload)
+            return payload
+
+        def resolve(op):
+            path = op["source"]["path"]
+            return ("unstaged", path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            step_dir = Path(tmp) / "runs" / "step"
+            step_dir.mkdir(parents=True)
+            record = driver.blank_step("positive-file")
+            with ExitStack() as stack:
+                for name, kwargs in {
+                    "select_repo": {},
+                    "capture_checked": {"return_value": {"png": "shot.png"}},
+                    "leave_rev_tree_if_open": {},
+                    "transfer_os_clipboard": {"return_value": "bridge"},
+                    "paste_preview": {"return_value": "preview"},
+                    "resolve_paste_mappings": {},
+                    "compare_after": {},
+                    "copy_node": {"side_effect": copy},
+                    "resolve_operation_source": {"side_effect": resolve},
+                    "preview_change": {"side_effect": lambda native, s, w, kind, path, t, tr: f"change-row:{kind}:{path}"},
+                    "select_fixed_oid": {"side_effect": lambda native, s, w, repo, rev, path, oid, t, tr: f"rev-row:{path}"},
+                    "click_overwrites": {"side_effect": lambda native, s, w, paths, t, tr: overwrites.append(paths)},
+                    "apply_or_cancel": {"side_effect": lambda *a: applied.append(a[3]) or "[APP:PASTE_DONE: created=0 overwritten=1 skipped=0]"},
+                }.items():
+                    stack.enter_context(patch.object(driver, name, **kwargs))
+                driver.run_positive_file(None, {"a": source, "b": dest}, manifest, step, {}, Path(tmp), step_dir, .001, [], record, {})
+        self.assertEqual(copied, [
+            ("change-row:unstaged:transfer/working.txt", None),
+            ("rev-row:src/keep.txt", "left-list"),
+            ("change-row:unstaged:src/extra.txt", None),
+        ])
+        self.assertEqual(overwrites, [["transfer/working.txt"], ["src/keep.txt"], []])
+        self.assertEqual(applied, ["btn-apply"] * 3)
+        self.assertEqual(len(record["clipboard"]["operations"]), 3)
+        self.assertEqual(record["clipboard"]["source"]["sha256"], record["clipboard"]["readback"]["sha256"])
+        self.assertIn("source-selected-3", record["screenshots"])
 
 
 if __name__ == "__main__":

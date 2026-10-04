@@ -149,18 +149,14 @@ pub(crate) fn commit_copy_selection<'a>(
 	out
 }
 
-/// Tri-state of the checkable `files` matching `pred`: all / none
-/// selected, `None` if mixed. Non-UTF-8 names do not count.
-pub(crate) fn rows_tri_state(
-	files: &[crate::FileChangeItem],
-	pred: impl Fn(&crate::FileChangeItem) -> bool,
-) -> Option<bool> {
-	let mut sel = files
-		.iter()
-		.filter(|f| pred(f) && f.is_valid_utf8())
-		.map(|f| f.selected);
-	let first = sel.next().unwrap_or(false);
-	sel.all(|s| s == first).then_some(first)
+/// One node a Copy reads. Plain paths, no `CanonicalRootId`: the same
+/// targets will go to a remote worker, whose roots are virtual paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyTarget {
+	pub root: PathBuf,
+	pub path: String,
+	pub source: SourceKind,
+	pub change_type: Option<snip_core::format::ChangeType>,
 }
 
 /// Where focus returns when the menu closes.
@@ -181,29 +177,15 @@ pub struct ContextMenu {
 
 #[derive(Clone, Debug)]
 pub enum MenuAct {
-	RevToggle {
-		sha: String,
-		path: String,
-	},
-	ChangeToggle {
-		idx: usize,
-		path: String,
-	},
 	ChangeOpen {
 		idx: usize,
 		path: String,
 	},
-	GroupToggle(&'static str),
-	RepoToggle(usize, &'static str),
 	CopyText(String),
 	CommitDiff(String),
 	CopyCommits(String),
-	/// Snip-sync copy of files as they are in a commit: (repository root,
-	/// commit, path).
-	/// (root, rev, path, deleted by that rev)
-	CopyRevFiles(Vec<(PathBuf, String, String, bool)>),
-	/// The Project view's selection, as one snip-sync payload.
-	CopyProjectSelection,
+	/// The node's files as one snip-sync payload.
+	CopyNode(Vec<CopyTarget>),
 	CommitFileDiff(String),
 	Select(String),
 	BrowseTree(String),
@@ -265,17 +247,14 @@ fn copy_entries(abs: Option<String>, rel: &str) -> [MenuEntry; 2] {
 	]
 }
 
-fn basket_entry(selected: bool, act: Option<MenuAct>) -> MenuEntry {
-	if selected {
-		item(
-			"remove-basket",
-			"menu_remove_basket",
-			Some("Space".into()),
-			act,
-		)
-	} else {
-		item("add-basket", "menu_add_basket", Some("Space".into()), act)
-	}
+/// The node's Copy: disabled when it holds nothing copyable.
+fn copy_entry(targets: Vec<CopyTarget>) -> MenuEntry {
+	item(
+		"copy-files",
+		"menu_copy_files",
+		Some(secondary("C")),
+		(!targets.is_empty()).then_some(MenuAct::CopyNode(targets)),
+	)
 }
 
 impl WorkbenchModel {
@@ -347,22 +326,19 @@ impl WorkbenchModel {
 		]
 	}
 
-	/// `ws`: a row of the workspace tree (outside every repo). Copy Files
-	/// copies the whole Project selection, which this row is part of.
+	/// `ws`: a row of the workspace tree (outside every repo). Copy copies
+	/// the whole Project selection, which this row is part of.
 	pub(crate) fn work_row_menu(
 		&self,
 		row: &FlattenedTreeRow,
 		ws: bool,
 	) -> Vec<MenuEntry> {
-		let mut v = vec![
-			item(
-				"copy-files",
-				"menu_copy_files",
-				None,
-				row.selected.then_some(MenuAct::CopyProjectSelection),
-			),
-			MenuEntry::Sep,
-		];
+		let targets = if row.selected {
+			self.project_targets()
+		} else {
+			Vec::new()
+		};
+		let mut v = vec![copy_entry(targets), MenuEntry::Sep];
 		if self.remote.session.is_some() {
 			let root = if ws { self.ws_root() } else { self.repo_root() };
 			let abs = root.map(|r| r.join(row.rel_path.trim_end_matches('/')));
@@ -390,26 +366,21 @@ impl WorkbenchModel {
 		path: &str,
 		is_file: bool,
 	) -> Vec<MenuEntry> {
-		let sha = self.rev_tree.as_ref().map(|t| t.sha.clone());
-		let mut v = Vec::new();
-		if let (true, Some(sha)) = (is_file, sha) {
-			let selected = self.is_rev_file_selected(&sha, path);
-			v.push(basket_entry(
-				selected,
-				Some(MenuAct::RevToggle {
-					sha,
-					path: path.to_string(),
-				}),
-			));
-			v.push(MenuEntry::Sep);
-		}
-		v.push(item(
-			"copy-relative-path",
-			"menu_copy_relative_path",
-			None,
-			Some(MenuAct::CopyText(path.to_string())),
-		));
-		v
+		let targets = if is_file {
+			self.rev_targets(path)
+		} else {
+			Vec::new()
+		};
+		vec![
+			copy_entry(targets),
+			MenuEntry::Sep,
+			item(
+				"copy-relative-path",
+				"menu_copy_relative_path",
+				None,
+				Some(MenuAct::CopyText(path.to_string())),
+			),
+		]
 	}
 
 	pub(crate) fn change_row_menu(&self, idx: usize) -> Vec<MenuEntry> {
@@ -417,12 +388,8 @@ impl WorkbenchModel {
 			return Vec::new();
 		};
 		let path = f.path.clone();
-		let toggle = f.is_valid_utf8().then(|| MenuAct::ChangeToggle {
-			idx,
-			path: path.clone(),
-		});
 		let mut v = vec![
-			basket_entry(f.selected, toggle),
+			copy_entry(self.change_targets(|i, _| i == idx)),
 			item(
 				"show-diff",
 				"menu_show_diff",
@@ -455,23 +422,41 @@ impl WorkbenchModel {
 		&self,
 		group: &'static str,
 	) -> Vec<MenuEntry> {
-		let all = self.group_state(group) == Some(true);
-		vec![basket_entry(all, Some(MenuAct::GroupToggle(group)))]
+		vec![copy_entry(
+			self.change_targets(|_, f| change_group(f) == Some(group)),
+		)]
 	}
 
-	/// Repo row under a group: its basket entry covers that repo's files
-	/// of that group only, like the row's checkbox.
+	/// Directory row: Copy covers every file of that repo and group
+	/// beneath it.
+	pub(crate) fn change_dir_menu(
+		&self,
+		slot: usize,
+		group: &'static str,
+		dir: &str,
+	) -> Vec<MenuEntry> {
+		vec![copy_entry(self.change_targets(|_, f| {
+			f.repo as usize == slot
+				&& change_group(f) == Some(group)
+				&& path_under(&f.path, dir)
+		}))]
+	}
+
+	/// Repo row under a group: its Copy covers that repo's files of that
+	/// group only.
 	pub(crate) fn change_repo_menu(
 		&self,
 		slot: usize,
 		group: &'static str,
 	) -> Vec<MenuEntry> {
-		let all = self.repo_state(slot, group) == Some(true);
+		let copy = copy_entry(self.change_targets(|_, f| {
+			f.repo as usize == slot && change_group(f) == Some(group)
+		}));
 		let root = self.change_repos.get(slot).map(|s| s.root.clone());
 		if self.remote.session.is_some() {
 			let path = root.as_deref().and_then(|r| self.remote_worker_path(r));
 			return vec![
-				basket_entry(all, Some(MenuAct::RepoToggle(slot, group))),
+				copy,
 				MenuEntry::Sep,
 				item(
 					"copy-path",
@@ -482,7 +467,7 @@ impl WorkbenchModel {
 			];
 		}
 		vec![
-			basket_entry(all, Some(MenuAct::RepoToggle(slot, group))),
+			copy,
 			MenuEntry::Sep,
 			item(
 				"copy-path",
@@ -558,7 +543,7 @@ impl WorkbenchModel {
 	}
 
 	/// A changed-files row of the Log (a file, or a directory for every
-	/// file under it): copy as snip-sync, diff, basket and paths.
+	/// file under it): copy as snip-sync, diff and paths.
 	pub(crate) fn commit_file_menu(
 		&self,
 		path: &str,
@@ -573,7 +558,7 @@ impl WorkbenchModel {
 		};
 		let multi = self.commit_file_sel.len() > 1
 			&& self.commit_file_sel.contains(&key);
-		let copy: Vec<(PathBuf, String, String, bool)> = if multi {
+		let copy: Vec<CopyTarget> = if multi {
 			let targets: Vec<&str> =
 				self.commit_file_sel.iter().map(String::as_str).collect();
 			commit_copy_selection(
@@ -594,15 +579,22 @@ impl WorkbenchModel {
 		}
 		.into_iter()
 		.filter_map(|(p, deleted)| {
-			let (root, sha) = self.commit_file_rev(p)?;
-			Some((root, sha, p.to_string(), deleted))
+			let (root, rev) = self.commit_file_rev(p)?;
+			Some(CopyTarget {
+				root,
+				path: p.to_string(),
+				source: SourceKind::Commit { rev },
+				change_type: deleted
+					.then_some(snip_core::format::ChangeType::Deleted),
+			})
 		})
 		.collect();
+		// Cmd/Ctrl+C reads the left tool window, not the Log: no shortcut.
 		let mut v = vec![item(
 			"copy-files",
 			"menu_copy_files",
 			None,
-			(!copy.is_empty()).then_some(MenuAct::CopyRevFiles(copy)),
+			(!copy.is_empty()).then_some(MenuAct::CopyNode(copy)),
 		)];
 		let rev = self.commit_file_rev(path).or_else(|| {
 			self.log_commit_root.clone().map(|r| (r, String::new()))
@@ -614,21 +606,6 @@ impl WorkbenchModel {
 				Some(secondary("D")),
 				Some(MenuAct::CommitFileDiff(path.to_string())),
 			));
-			// The basket holds the selected repository's files only; its
-			// entry toggles one file, so a multi-selection leaves it out.
-			if let Some((_, sha)) = rev.as_ref().filter(|(root, sha)| {
-				!multi
-					&& !sha.is_empty()
-					&& self.repo_root().as_ref() == Some(root)
-			}) {
-				v.push(basket_entry(
-					self.is_rev_file_selected(sha, path),
-					Some(MenuAct::RevToggle {
-						sha: sha.clone(),
-						path: path.to_string(),
-					}),
-				));
-			}
 		}
 		v.push(MenuEntry::Sep);
 		let abs = if self.remote.session.is_some() {
@@ -809,23 +786,11 @@ impl WorkbenchModel {
 				.map(|f| f.source.clone())
 		};
 		match act {
-			MenuAct::RevToggle { sha, path } => {
-				self.toggle_rev_file_selection(&sha, &path, cx)
-			}
-			MenuAct::ChangeToggle { idx, path } => {
-				if file_at(self, idx, &path).is_some() {
-					self.toggle_file(idx, cx);
-				}
-			}
 			MenuAct::ChangeOpen { idx, path } => {
 				if file_at(self, idx, &path).is_some() {
 					self.select_change(idx, cx);
 					window.focus(&self.reader_focus);
 				}
-			}
-			MenuAct::GroupToggle(group) => self.toggle_change_group(group, cx),
-			MenuAct::RepoToggle(slot, group) => {
-				self.toggle_change_repo(slot, group, cx)
 			}
 			MenuAct::CopyText(text) => self.copy_text(&text),
 			MenuAct::CommitDiff(sha) => {
@@ -835,40 +800,7 @@ impl WorkbenchModel {
 				window.focus(&self.reader_focus);
 			}
 			MenuAct::CopyCommits(_) => self.copy_commits_to_clipboard(cx),
-			MenuAct::CopyProjectSelection => self.copy_project_selection(cx),
-			MenuAct::CopyRevFiles(files) => {
-				if self.remote_blocks() {
-					cx.notify();
-					return;
-				}
-				let name = files
-					.first()
-					.map(|(root, ..)| self.log_repo_name(root))
-					.unwrap_or_default();
-				let items: Option<Vec<_>> = files
-					.into_iter()
-					.map(|(root, rev, path, deleted)| {
-						Some(snip_core::transfer::ExportItem {
-							root: snip_core::transfer::CanonicalRootId::new(
-								&root,
-							)
-							.ok()?,
-							relative_path: path,
-							source: SourceKind::Commit { rev },
-							change_type: deleted.then_some(
-								snip_core::format::ChangeType::Deleted,
-							),
-							gitlink: false,
-						})
-					})
-					.collect();
-				match items {
-					Some(items) => {
-						self.export_items_to_clipboard(items, name, cx)
-					}
-					None => self.set_status("error_selection_root", []),
-				}
-			}
+			MenuAct::CopyNode(targets) => self.copy_targets(targets, cx),
 			MenuAct::CommitFileDiff(path) => {
 				self.select_commit_file(&path, cx);
 				window.focus(&self.reader_focus);
@@ -902,101 +834,108 @@ impl WorkbenchModel {
 
 	// ───────────────────────── Changes groups ─────────────────────────
 
-	/// Tri-state of the checkable Changes rows matching `pred`: all / none
-	/// selected, `None` if mixed. Non-UTF-8 names do not count.
-	fn rows_state(
+	/// Copy targets of the Changes rows matching `pred` (row index, row),
+	/// in list order. A name that is not UTF-8 does not exist on disk under
+	/// its lossy spelling, and a repo whose status read has not landed has
+	/// no rows to copy, so both are left out.
+	pub(crate) fn change_targets(
 		&self,
-		pred: impl Fn(&crate::FileChangeItem) -> bool,
-	) -> Option<bool> {
-		rows_tri_state(&self.files, pred)
+		pred: impl Fn(usize, &crate::FileChangeItem) -> bool,
+	) -> Vec<CopyTarget> {
+		self.files
+			.iter()
+			.enumerate()
+			.filter(|&(i, f)| {
+				pred(i, f)
+					&& f.is_valid_utf8()
+					&& self.change_slot_loaded(f.repo)
+			})
+			.filter_map(|(_, f)| {
+				Some(CopyTarget {
+					root: self.change_repos.get(f.repo as usize)?.root.clone(),
+					path: f.path.clone(),
+					source: f.source.clone(),
+					change_type: f.change_type,
+				})
+			})
+			.collect()
 	}
 
-	/// Tri-state of a Changes group across every repo.
-	pub(crate) fn group_state(&self, group: &str) -> Option<bool> {
-		self.rows_state(|f| change_group(f) == Some(group))
-	}
-
-	/// Tri-state of repo `slot`'s changes in `group`.
-	pub(crate) fn repo_state(&self, slot: usize, group: &str) -> Option<bool> {
-		self.rows_state(|f| {
-			f.repo as usize == slot && change_group(f) == Some(group)
-		})
-	}
-
-	/// IntelliJ node checkbox: selects the matching rows unless they
-	/// already all are, in which case it clears them. Rows of a repo whose
-	/// status read has not landed are inert.
-	fn toggle_rows(
-		&mut self,
-		pred: impl Fn(&crate::FileChangeItem) -> bool,
-	) -> Option<bool> {
-		if self.remote_blocks() {
-			return None;
-		}
-		let pred = |f: &crate::FileChangeItem| {
-			pred(f) && f.is_valid_utf8() && self.change_slot_loaded(f.repo)
-		};
-		if !self.files.iter().any(pred) {
-			return None;
-		}
-		let select = self.rows_state(pred) != Some(true);
-		let hit: Vec<bool> = self.files.iter().map(pred).collect();
-		let mut candidate = self.selection_candidate();
-		for (f, hit) in candidate.files.iter_mut().zip(hit) {
-			if hit {
-				f.selected = select;
+	/// What a Changes row's Copy reads, keyboard and menu alike.
+	pub(crate) fn change_row_targets(
+		&self,
+		row: &crate::ui::ChangeItemRow,
+	) -> Vec<CopyTarget> {
+		use crate::ui::ChangeItemRow as Row;
+		match row {
+			Row::Header { group_id, .. } => {
+				self.change_targets(|_, f| change_group(f) == Some(*group_id))
 			}
+			Row::Repo { slot, group_id, .. } => self.change_targets(|_, f| {
+				f.repo as usize == *slot && change_group(f) == Some(*group_id)
+			}),
+			Row::Dir {
+				slot,
+				group_id,
+				path,
+				..
+			} => self.change_targets(|_, f| {
+				f.repo as usize == *slot
+					&& change_group(f) == Some(*group_id)
+					&& path_under(&f.path, path)
+			}),
+			Row::File { file_idx, .. } => {
+				self.change_targets(|i, _| i == *file_idx)
+			}
+			Row::Note { .. } | Row::Unreadable { .. } => Vec::new(),
 		}
-		candidate.replace_git_group = true;
-		candidate.remove_only = !select;
-		candidate.status = Some(crate::i18n::Msg::new(
-			if select {
-				"status_selected_all"
-			} else {
-				"status_selection_removed"
+	}
+
+	/// The Project selection as File targets, a folder as itself: the
+	/// exporter walks it. That is the highlighted rows of both trees plus
+	/// the rows Cmd-clicked in a repo since left (a plain click drops
+	/// those), so one Copy can span repos.
+	pub(crate) fn project_targets(&self) -> Vec<CopyTarget> {
+		let live: Vec<(&PathBuf, &[String])> = [&self.file_tree, &self.ws_tree]
+			.into_iter()
+			.flatten()
+			.map(|tree| (&tree.full_path, tree.selected_paths()))
+			.collect();
+		let mut picks: Vec<(&PathBuf, &[String])> = self
+			.tree_selections
+			.iter()
+			.filter(|(root, _)| !live.iter().any(|(have, _)| *have == root))
+			.map(|(root, paths)| (root, paths.as_slice()))
+			.chain(live.iter().copied())
+			.collect();
+		picks.sort_by(|a, b| a.0.cmp(b.0));
+		picks
+			.into_iter()
+			.flat_map(|(root, paths)| {
+				paths.iter().map(|path| CopyTarget {
+					root: root.clone(),
+					path: path.clone(),
+					source: SourceKind::File,
+					change_type: None,
+				})
+			})
+			.collect()
+	}
+
+	/// A file of the browsed commit tree, at that commit.
+	pub(crate) fn rev_targets(&self, path: &str) -> Vec<CopyTarget> {
+		let (Some(tree), Some(root)) = (&self.rev_tree, self.repo_root())
+		else {
+			return Vec::new();
+		};
+		vec![CopyTarget {
+			root,
+			path: path.to_string(),
+			source: SourceKind::Commit {
+				rev: tree.sha.clone(),
 			},
-			[],
-		));
-		if self.install_selection_candidate(candidate) {
-			self.log_basket();
-			Some(select)
-		} else {
-			None
-		}
-	}
-
-	/// IntelliJ group checkbox: selects the whole group (every repo)
-	/// unless it already is fully selected, in which case it clears it.
-	pub(crate) fn toggle_change_group(
-		&mut self,
-		group: &str,
-		cx: &mut Context<Self>,
-	) {
-		if let Some(select) =
-			self.toggle_rows(|f| change_group(f) == Some(group))
-		{
-			app_log!("[APP:GROUP_TOGGLED: {group} selected={select}]");
-		}
-		cx.notify();
-	}
-
-	/// Repository row checkbox: that repo's changes in `group`.
-	pub(crate) fn toggle_change_repo(
-		&mut self,
-		slot: usize,
-		group: &str,
-		cx: &mut Context<Self>,
-	) {
-		if let Some(select) = self.toggle_rows(|f| {
-			f.repo as usize == slot && change_group(f) == Some(group)
-		}) {
-			let name =
-				self.change_repos.get(slot).map_or("", |s| s.name.as_str());
-			app_log!(
-				"[APP:REPO_CHANGES_TOGGLED: {group} {name} selected={select}]"
-			);
-		}
-		cx.notify();
+			change_type: None,
+		}]
 	}
 
 	pub(crate) fn group_collapsed(&self, group: &str) -> bool {
@@ -1082,42 +1021,6 @@ impl WorkbenchModel {
 		app_log!(
 			"[APP:CHANGE_DIR_COLLAPSED: {group} {name} {dir} files={files} collapsed={collapsed}]"
 		);
-		cx.notify();
-	}
-
-	/// Tri-state of repo `slot`'s changes in `group` under directory `dir`.
-	pub(crate) fn dir_state(
-		&self,
-		slot: usize,
-		group: &str,
-		dir: &str,
-	) -> Option<bool> {
-		self.rows_state(|f| {
-			f.repo as usize == slot
-				&& change_group(f) == Some(group)
-				&& path_under(&f.path, dir)
-		})
-	}
-
-	/// Directory row checkbox: every file beneath it in that group.
-	pub(crate) fn toggle_change_dir(
-		&mut self,
-		slot: usize,
-		group: &str,
-		dir: &str,
-		cx: &mut Context<Self>,
-	) {
-		if let Some(select) = self.toggle_rows(|f| {
-			f.repo as usize == slot
-				&& change_group(f) == Some(group)
-				&& path_under(&f.path, dir)
-		}) {
-			let name =
-				self.change_repos.get(slot).map_or("", |s| s.name.as_str());
-			app_log!(
-				"[APP:DIR_CHANGES_TOGGLED: {group} {name} {dir} selected={select}]"
-			);
-		}
 		cx.notify();
 	}
 
@@ -1437,11 +1340,11 @@ fn menu_width(entries: &[MenuEntry], loc: crate::i18n::Locale) -> f32 {
 /// Leading icon of a menu item, as IntelliJ shows for common actions.
 fn item_icon(id: &str) -> Option<Icon> {
 	Some(match id {
-		"copy-path" | "copy-relative-path" | "copy-revision" => Icon::Copy,
+		"copy-files" | "copy-path" | "copy-relative-path" | "copy-revision" => {
+			Icon::Copy
+		}
 		"copy-commits" => Icon::Commit,
 		"show-diff" => Icon::Diff,
-		"add-basket" => Icon::Basket,
-		"remove-basket" => Icon::Minus,
 		// The Log lists newest first: the parent is below, the child above.
 		"go-parent" => Icon::ArrowDown,
 		"go-child" => Icon::ArrowUp,
@@ -1738,7 +1641,7 @@ mod tests {
 		for id in [
 			"copy-path",
 			"show-diff",
-			"add-basket",
+			"copy-files",
 			"close-tab",
 			"reveal",
 		] {

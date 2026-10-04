@@ -132,16 +132,17 @@ python3 scripts/check_native_collaboration.py \
 
 ### 控制項與互動規範
 
+0. **複製是右鍵選單的「複製」**：App 沒有選取籃也沒有勾選框。對一列右鍵（`[APP:MENU_OPEN: Left items=copy-files,…]`）再點 `menu-item:copy-files`，只複製那一個節點，等 `[APP:COPY_DONE: copied=N]`；Cmd/Ctrl+C 複製左側工具視窗游標所在的節點。檔案步驟的操作混了不同來源（worktree、index、fixed OID、刪除），所以 `run_positive_file` 對每個操作各做一次「選列 → 複製 → 貼上 → 映射 → 覆寫 → 套用」，全部套用後才比對快照；`clipboard` 證據的 `source`／`readback` 是最後一次，`operations` 列出每一次。跨 repo 的匯出（碰撞、歧義、缺少目的地）用專案樹 Ctrl 點擊把各 repo 的檔案加入選取（等 `[APP:TREE_TOGGLED: <path>]`），再對最後一列右鍵「複製」。
 1. **Repo 選擇與消歧義**：Repo 列表將同名 repo 顯示成 workspace 相對路徑（如 `west/billing` 與 `east/billing`）；由 header 的 `btn-repo-selector` 展開帶序號的 `pick-repo:N:label`。點選後必須由 `[APP:REPO_SELECTING:` 解析出的 canonical root 與 manifest 目的 root 嚴格比對。
-2. **刪除操作（Deletion Provenance）**：Manifest 刪除規格為 `op: "delete"` 且 `source.kind` 為 `"working"` 或 `"index"`（非發明的 `sourceKind` 欄位；原始 fixture 產生的 schema 即是如此，絕無假造的刪除崩潰修復）。Driver 依 `source.kind` 解析來源：`"working"` 對應 `unstaged`（`change-row:unstaged:<path>` / `change-chk:unstaged:<path>`），`"index"` 對應 `staged`（`change-row:staged:<path>` / `change-chk:staged:<path>`）。嚴格要求 `status == "D"`、`inWorktree is False`、`diffAgainst` 與 blob `oid`；歧義或無效欄位直接失敗，絕不假通過。
+2. **刪除操作（Deletion Provenance）**：Manifest 刪除規格為 `op: "delete"` 且 `source.kind` 為 `"working"` 或 `"index"`（非發明的 `sourceKind` 欄位；原始 fixture 產生的 schema 即是如此，絕無假造的刪除崩潰修復）。Driver 依 `source.kind` 解析來源：`"working"` 對應 `unstaged`（`change-row:unstaged:<path>`），`"index"` 對應 `staged`（`change-row:staged:<path>`）；複製就是對該列右鍵、點 `menu-item:copy-files`。嚴格要求 `status == "D"`、`inWorktree is False`、`diffAgainst` 與 blob `oid`；歧義或無效欄位直接失敗，絕不假通過。
 3. **歷史檔案固定 OID（Fixed-OID Selection）**：依循 current `smoke.rs` 規範歷史瀏覽流程：
    - 點選 commit 列（`commit-row:<short>`），驗證當前 active root 與預期 canonical root 嚴格相符。
    - 讀取 Git oracle（`git rev-parse {commit}:{path}`）驗證 blob OID 與 manifest 預期完全一致。
    - 等待所選 commit 完成載入後的 bounds probe `btn-browse-tree:<full SHA>`，點選進入歷史樹瀏覽，等待 `[APP:REV_TREE: <short>]` 與 `[APP:E2E_TREE: rev=<short> dir=/` 根目錄準備完成。
    - 逐層點選目錄列（`rev-row:<parent>`）展開父目錄，等待 `[APP:TREE_EXPANDED:`（禁止壓制 `MissingControl`）。
    - 點選檔案列（`rev-row:<path>`），等待 `[APP:PREVIEW_LOADED:` 與 `[APP:E2E_PREVIEW: source=commit_file` 完成載入。
-   - 勾選歷史核取方塊（`rev-chk:<full-commit-oid>:<relative-path>`），等待 `[APP:BASKET: n=` 更新。
-   - 在進行後續工作區/index 檔案選取前，點選 `btn-leave-tree` 退出歷史樹模式（`[APP:REV_TREE: off]`），再明確點選 `rail-changes` 並要求 fresh `TAB_SWITCHED: GitChanges visible=true`。產品進入歷史樹直接切至 Project，退出後也維持 Project，因此不能只信任 helper 的舊 tab 事件。
+   - 趁歷史樹還開著，對同一個 `rev-row:<path>` 右鍵，等 `[APP:MENU_OPEN: Left items=copy-files,…]`，點 `menu-item:copy-files`，等 `[APP:COPY_DONE: copied=1]`。
+   - 在進行後續工作區/index 檔案操作前，點選 `btn-leave-tree` 退出歷史樹模式（`[APP:REV_TREE: off]`），再明確點選 `rail-changes` 並要求 fresh `TAB_SWITCHED: GitChanges visible=true`。產品進入歷史樹直接切至 Project，退出後也維持 Project，因此不能只信任 helper 的舊 tab 事件。
 4. **目的地映射（Paste Destination Mapping）**：
    - `NativeSession.lines` 契約為 `list[tuple[float, str]]`，文字檢索一律透過 `session.texts(start)`，游標一律取 `len(session.lines)`。
    - `[APP:PASTE_MAP_CANDIDATE:` 於產品中係在 `[APP:PASTE_PREVIEW:` **之前**輸出。Driver 必須在點選 Paste 前即儲存游標，並將該起點傳入映射解析，禁止以 preview 後的游標截斷候選名單。
@@ -157,7 +158,7 @@ python3 scripts/check_native_collaboration.py \
    - **缺少目的地（`neg-mapping-missing-destination`）**：依驗收決策，以 `prevention=canonical-destination-whitelist` 記錄 prevention，而非提交無效 ID 後的拒絕。保留原 manifest，明確標示 `originalMappedIdSubmitted=false`。要求 `billing` prefix 的完整候選 canonical roots 精確等於 B 工作區 15 個實際存在的 repo，沒有不存在的 ID/path、沒有自動 mapping；Return 必須產生 fresh `mapping_required`，rendered disabled Apply 必須確實點擊且未套用，clipboard bytes 未變，30-repo snapshot 零寫入，兩個 App 都正常 drained/exit 0。缺少或截斷候選、任何自動映射、缺鍵盤拒絕、寫入或 cleanup 缺證據都不能通過。現有 UI 只允許 canonical root 白名單或 keep-relative，因此不新增可提交不存在目的地的產品控制。核心 `test_missing_root_rejected_at_boundaries` 覆蓋未宣告 root 拒絕，但不列為 UI 執行證據。
 
    - **套用拒絕（`try_apply_refusal`）**：要求當前世代的 `mapping=false`，送出 Return 並取得 fresh `[APP:PASTE_ERR: mapping_required]`，再以真實視窗 bounds 點擊 rendered `btn-apply`，有界觀察最多 1 秒。任一鍵盤或點擊後 `PASTE_APPLYING`／`PASTE_DONE`、缺少控制、視窗範圍錯誤或程序退出都失敗；沉默不是拒絕證據。
-   - **過期來源（`neg-stale-source`）**：在 session 建構前設定 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選取完成後、Copy 前建立 hold 檔，等待 fresh `[APP:EXPORT_PLAN_READY: files=N]`（N > 0），此時才修改自己 fixture 的來源檔；修改後拍 pre-action snapshot，再移除 hold。必須得到 fresh `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`、clipboard sentinel bytes 未變，且動作後所有 repo 等於修改後的 pre-action snapshot。hold 在任何失敗路徑也由 `finally` 移除。兩個 `NativeSession` constructor 共用鎖，僅暫時設定所需環境鍵並在 `finally` 還原那些鍵；沒有 env 參數相容層或清空整個 process environment。
+   - **過期來源（`neg-stale-source`）**：在 session 建構前設定 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選好變更列並開啟它的右鍵選單後、點「複製」前建立 hold 檔，等待 fresh `[APP:EXPORT_PLAN_READY: files=N]`（N > 0），此時才修改自己 fixture 的來源檔；修改後拍 pre-action snapshot，再移除 hold。必須得到 fresh `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`、clipboard sentinel bytes 未變，且動作後所有 repo 等於修改後的 pre-action snapshot。hold 在任何失敗路徑也由 `finally` 移除。兩個 `NativeSession` constructor 共用鎖，僅暫時設定所需環境鍵並在 `finally` 還原那些鍵；沒有 env 參數相容層或清空整個 process environment。
    - 負向案例必須截取完整的 `source-selected` 與 `result` 截圖，禁止空白截圖。
 6. **生命週期與程序退出規範（Lifecycle & Process Termination）**：
    - 每步必須記錄兩個不同且有效的 App 身分（正整數 PID + starttime），在 App 存活期間與 Xvfb/dbus/xclip 控制器分開維護。空清單、缺欄位、null、0 或虛構 starttime 皆失敗。

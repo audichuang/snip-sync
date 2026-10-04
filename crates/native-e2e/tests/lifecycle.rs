@@ -462,6 +462,39 @@ fn click(wid: &str, id: &str) {
 	assert!(st.success(), "click {id} failed");
 }
 
+/// Right-click: opens the row's context menu.
+fn right_click(wid: &str, id: &str) {
+	std::thread::sleep(Duration::from_millis(180));
+	focus(wid);
+	let v = control(id);
+	let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+	let st = Command::new("xdotool")
+		.args([
+			"mousemove",
+			"--window",
+			wid,
+			&x.to_string(),
+			&y.to_string(),
+			"click",
+			"3",
+		])
+		.status()
+		.expect("xdotool right-click");
+	assert!(st.success(), "right-click {id} failed");
+}
+
+/// Opens row `id`'s context menu, ready for `menu-item:copy-files`.
+fn open_copy_menu(app: &App, wid: &str, id: &str) {
+	right_click(wid, id);
+	lines_until(&app.rx, "[APP:MENU_OPEN: Left", Duration::from_secs(4));
+}
+
+/// Right-click > Copy on row `id`: copies exactly that node.
+fn copy_node(app: &App, wid: &str, id: &str) {
+	open_copy_menu(app, wid, id);
+	click(wid, "menu-item:copy-files");
+}
+
 /// Ctrl-click: the Project view's multi-selection toggle.
 fn ctrl_click(wid: &str, id: &str) {
 	std::thread::sleep(Duration::from_millis(180));
@@ -628,9 +661,7 @@ fn close_reopen_same_pid_discards_stale_preview_and_keeps_clipboard() {
 	capture(&wid, &shots().join("01-workspace-open.png"));
 	snapshot(app.pid, &app.starttime);
 
-	click(&wid, "change-chk:note.txt");
-	lines_until(&app.rx, "[APP:FILE_TOGGLED:", Duration::from_secs(4));
-	click(&wid, "btn-copy");
+	copy_node(&app, &wid, "change-row:note.txt");
 	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(8));
 	click(&wid, "btn-paste");
 	lines_until(&app.rx, "[APP:PASTE_PREVIEW:", Duration::from_secs(6));
@@ -1028,9 +1059,7 @@ fn close_cancels_in_flight_copy_without_writing_clipboard() {
 		"a git child existed before copy; that would not prove the copy token"
 	);
 
-	click(&wid, "change-chk:note.txt");
-	lines_until(&app.rx, "[APP:FILE_TOGGLED:", Duration::from_secs(4));
-	click(&wid, "btn-copy");
+	copy_node(&app, &wid, "change-row:note.txt");
 	let prep = lines_until(&app.rx, "[APP:COPY_PREP:", Duration::from_secs(4));
 	assert!(
 		prep.iter().all(|l| !l.contains("[APP:COPY_DONE:")),
@@ -1611,13 +1640,12 @@ fn copy_cancel_button_stops_file_and_commit_copy() {
 
 	let sentinel = "CLIP-SENTINEL-copy-button-file";
 	clip_set(sentinel);
-	click(&wid, "change-chk:note.txt");
-	lines_until(&app.rx, "[APP:FILE_TOGGLED:", Duration::from_secs(4));
+	open_copy_menu(&app, &wid, "change-row:note.txt");
 	let child = start_held_copy(
 		&mut app,
 		&wid,
 		&fx,
-		"btn-copy",
+		"menu-item:copy-files",
 		"[APP:COPY_PREP:",
 		"[APP:COPY_DONE:",
 	);
@@ -1625,7 +1653,7 @@ fn copy_cancel_button_stops_file_and_commit_copy() {
 
 	// Busy is cleared: the same copy runs to the end once Git is released.
 	fs::remove_file(&fx.hold).unwrap();
-	click(&wid, "btn-copy");
+	copy_node(&app, &wid, "change-row:note.txt");
 	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(8));
 	let copied = clip_get();
 	assert!(
@@ -1789,9 +1817,7 @@ fn open_workspace_is_refused_while_apply_writes() {
 		.args(["windowsize", "--sync", &wid, "1080", "720"])
 		.status();
 
-	click(&wid, "change-chk:note.txt");
-	lines_until(&app.rx, "[APP:FILE_TOGGLED:", Duration::from_secs(4));
-	click(&wid, "btn-copy");
+	copy_node(&app, &wid, "change-row:note.txt");
 	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(8));
 	click(&wid, "btn-paste");
 	lines_until(&app.rx, "[APP:PASTE_PREVIEW:", Duration::from_secs(6));
@@ -2453,7 +2479,7 @@ fn project_tree_finishes_while_historical_tree_loads() {
 
 /// When a drain times out after >8s deadline, the workspace remains open and recovers:
 /// stale late results are discarded, tree cancel token is rearmed, loading flags cleared,
-/// basket selection is preserved, new directory expansion and preview succeed, and
+/// the row selection is preserved, new directory expansion and preview succeed, and
 /// subsequent close drains cleanly.
 #[test]
 fn failed_drain_recovers_and_allows_expand_preview_and_close() {
@@ -2517,9 +2543,13 @@ fn failed_drain_recovers_and_allows_expand_preview_and_close() {
 		Duration::from_secs(4),
 	);
 
-	// Select note.txt into basket so we can prove selection survives failed drain
+	// Select note.txt so we can prove the selection survives the failed drain
 	ctrl_click(&wid, "tree-row:note.txt");
-	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
+	lines_until(
+		&app.rx,
+		"[APP:TREE_TOGGLED: note.txt]",
+		Duration::from_secs(4),
+	);
 
 	// Hold the directory expansion of "sub"
 	fs::write(&hold, b"hold").unwrap();
@@ -2581,10 +2611,6 @@ fn failed_drain_recovers_and_allows_expand_preview_and_close() {
 			.any(|l| l.contains("[APP:TREE_PAGE: rel=sub")),
 		"fresh directory expansion was not received: {tree_lines:?}"
 	);
-
-	// Basket summary must still report 1 item
-	let summary = control("basket-summary");
-	assert!(summary[2] > 0, "basket summary must be visible");
 
 	click(&wid, "tree-row:note.txt");
 	lines_until(
@@ -2672,12 +2698,14 @@ fn export_refuses_when_source_mutated_after_plan_ready() {
 		Duration::from_secs(4),
 	);
 
-	// Select note.txt into basket
+	// Select note.txt, then Copy it from its context menu
 	ctrl_click(&wid, "tree-row:note.txt");
-	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
-
-	// Trigger copy
-	click(&wid, "btn-copy");
+	lines_until(
+		&app.rx,
+		"[APP:TREE_TOGGLED: note.txt]",
+		Duration::from_secs(4),
+	);
+	copy_node(&app, &wid, "tree-row:note.txt");
 
 	// Wait for plan ready marker
 	lines_until(
@@ -2910,10 +2938,6 @@ fn refresh_reloads_the_open_repo_and_releases_a_vanished_one() {
 	);
 	control("change-row:extra.txt");
 
-	// A selection in the repo about to vanish must not block a later Copy.
-	click(&wid, "change-chk:note.txt");
-	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
-
 	fs::remove_dir_all(fx.ws.join("a")).unwrap();
 	key(&wid, "ctrl+r");
 	let lines = lines_until_all(
@@ -2924,10 +2948,6 @@ fn refresh_reloads_the_open_repo_and_releases_a_vanished_one() {
 	assert!(
 		position(&lines, "[APP:REPO_SELECTING:").is_none(),
 		"the vanished repo's view was handed to another repo: {lines:?}"
-	);
-	assert!(
-		position(&lines, "[APP:BASKET: n=0").is_some(),
-		"the vanished repo's selections stayed in the basket: {lines:?}"
 	);
 	absent("change-row:note.txt");
 	absent("change-row:extra.txt");
@@ -2942,11 +2962,9 @@ fn refresh_reloads_the_open_repo_and_releases_a_vanished_one() {
 	switch_repo(&app, &wid, "b", 0);
 	lines_until(&app.rx, "[APP:REPO_LOADED: b", Duration::from_secs(8));
 	key(&wid, "alt+0");
-	click(&wid, "change-chk:note.txt");
-	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
 	let sentinel = "CLIP-SENTINEL-vanished-repo";
 	clip_set(sentinel);
-	click(&wid, "btn-copy");
+	copy_node(&app, &wid, "change-row:note.txt");
 	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(10));
 	let copied = clip_get();
 	assert!(
@@ -2956,66 +2974,10 @@ fn refresh_reloads_the_open_repo_and_releases_a_vanished_one() {
 	quit_cleanly(&mut app, &wid);
 }
 
-/// While the Changes list is still loading, Copy and Select All must not
-/// drop that repo's Git-source selections.
+/// A file name that is not UTF-8 is shown but left out of a Copy, so the
+/// other changes of its group still copy.
 #[test]
-fn unloaded_change_list_keeps_git_selections() {
-	let _lock = DisplayLock::acquire();
-	if !require_display_tools() {
-		return;
-	}
-	let fx = two_repos();
-	let (mut app, wid) = spawn_two(&fx, None);
-	click(&wid, "change-chk:note.txt");
-	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
-
-	switch_repo(&app, &wid, "b", 1);
-	lines_until(&app.rx, "[APP:REPO_LOADED: b", Duration::from_secs(8));
-	wait_git_idle(app.pid, &app.starttime);
-
-	// `a`'s status read blocks, so its Changes list stays unloaded.
-	fs::write(&fx.hold, b"hold").unwrap();
-	switch_repo(&app, &wid, "a", 0);
-	app.tracked.push(wait_git_child(app.pid, &app.starttime));
-
-	key(&wid, "alt+s");
-	let lines = lines_until(
-		&app.rx,
-		"[APP:FILES_SELECTED_ALL]",
-		Duration::from_secs(4),
-	);
-	let basket = lines.iter().rfind(|l| l.contains("[APP:BASKET:")).unwrap();
-	assert!(
-		basket.contains("a untracked note.txt"),
-		"Select All while loading dropped the Git selection: {basket}"
-	);
-	key(&wid, "alt+d");
-	lines_until(&app.rx, "[APP:FILES_DESELECTED]", Duration::from_secs(4));
-
-	let sentinel = "CLIP-SENTINEL-unloaded-changes";
-	clip_set(sentinel);
-	click(&wid, "btn-copy");
-	let lines = lines_until(&app.rx, "[APP:BASKET:", Duration::from_secs(4));
-	let basket = lines.last().unwrap();
-	assert!(
-		basket.contains("n=1") && basket.contains("a untracked note.txt"),
-		"Copy while loading dropped the Git selection: {lines:?}"
-	);
-	fs::remove_file(&fx.hold).unwrap();
-	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(10));
-	let copied = clip_get();
-	assert!(
-		copied.contains("note.txt") && copied.contains("note from a"),
-		"the copy lost the selected change: {copied:?}"
-	);
-	wait_git_idle(app.pid, &app.starttime);
-	quit_cleanly(&mut app, &wid);
-}
-
-/// A file name that is not UTF-8 is shown but cannot be checked, so the other
-/// selected changes still copy.
-#[test]
-fn non_utf8_change_is_not_checkable_and_does_not_block_copy() {
+fn non_utf8_change_is_left_out_and_does_not_block_copy() {
 	use std::os::unix::ffi::OsStrExt;
 	let _lock = DisplayLock::acquire();
 	if !require_display_tools() {
@@ -3051,24 +3013,22 @@ fn non_utf8_change_is_not_checkable_and_does_not_block_copy() {
 		Duration::from_secs(12),
 	);
 
-	// Files are path-sorted; the lossy `bad\u{FFFD}.txt` is index 0.
-	click(&wid, "change-chk-invalid:0");
-	let lines = lines_for(&app.rx, Duration::from_millis(800));
-	assert!(
-		position(&lines, "[APP:FILE_TOGGLED:").is_none(),
-		"a non-UTF-8 change was selectable: {lines:?}"
-	);
-	click(&wid, "change-chk:good.txt");
-	lines_until(&app.rx, "[APP:BASKET: n=1", Duration::from_secs(4));
-
+	// The group's Copy takes every change but the lossy `bad\u{FFFD}.txt`.
 	let sentinel = "CLIP-SENTINEL-non-utf8";
 	clip_set(sentinel);
-	click(&wid, "btn-copy");
-	lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(10));
+	copy_node(&app, &wid, "change-header:unstaged");
+	let lines =
+		lines_until(&app.rx, "[APP:COPY_DONE:", Duration::from_secs(10));
+	assert!(
+		position(&lines, "[APP:COPY_PREP: files=1]").is_some(),
+		"the non-UTF-8 change was not left out: {lines:?}"
+	);
 	let copied = clip_get();
 	assert!(
-		copied.contains("good.txt") && copied.contains("good bytes"),
-		"copy did not publish the valid change: {copied:?}"
+		copied.contains("good.txt")
+			&& copied.contains("good bytes")
+			&& !copied.contains("bad"),
+		"copy did not publish the valid change alone: {copied:?}"
 	);
 	quit_cleanly(&mut app, &wid);
 }

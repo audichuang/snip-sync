@@ -1734,17 +1734,8 @@ def _try_tree(session: NativeSession, win: dict[str, Any], interactions: list[di
             lambda text: "TREE_FILE_SELECTED" in text or "TREE_EXPANDED" in text or "TREE_TOGGLED" in text,
             start=before, timeout=8,
         )
-        if "TREE_TOGGLED" not in line:
-            # A plain click on a file or folder also selects it into the basket;
-            # Ctrl-click toggles it back out so the copy item starts from an
-            # empty basket.
-            again = len(session.lines)
-            session.x("xdotool", "keydown", "ctrl")
-            try:
-                session.click(win, bounds)
-            finally:
-                session.x("xdotool", "keyup", "ctrl")
-            session.wait_line(lambda text: "[APP:BASKET: n=0" in text, start=again, timeout=8)
+        # The Project selection this click leaves does not reach the copy item:
+        # that one copies a Changes row through its own right-click Copy.
         note(item="tree", ok=True, input="click", control=tree_ids[0], log=line, root=_root_dict(session))
     except (NativeBenchError, LeakError) as exc:
         note(item="tree", ok=False, input="click", log="", reason=str(exc))
@@ -1756,18 +1747,15 @@ def _root_dict(session: NativeSession) -> dict[str, Any] | None:
     return {key: session.app.get(key) for key in ("pid", "starttime", "exe", "comm")}
 
 
-def _try_copy_paste(session: NativeSession, win: dict[str, Any], repo: str, note) -> str | None:
-    checkbox: str | None = None
+def _try_copy_paste(session: NativeSession, win: dict[str, Any], repo: str, note) -> None:
     try:
         oracle = repo_oracle(repo)
         result = copy_explicit_selection(session, win, oracle)
         controls = result.get("controls") if isinstance(result.get("controls"), dict) else {}
-        if isinstance(controls.get("checkbox"), str):
-            checkbox = controls["checkbox"]
         copy_line = next((line for line in reversed(session.texts()) if "[APP:COPY_DONE:" in line), "")
         note(
             item="copy", ok=True, input="click", log=copy_line,
-            oracle={"verified": result.get("verified") is True}, root=_root_dict(session), control=checkbox,
+            oracle={"verified": result.get("verified") is True}, root=_root_dict(session), control=controls.get("row"),
         )
     except (NativeBenchError, LeakError, OSError) as exc:
         note(item="copy", ok=False, input="click", log="", reason=str(exc))
@@ -1788,21 +1776,6 @@ def _try_copy_paste(session: NativeSession, win: dict[str, Any], repo: str, note
         note(item="cancel", ok=True, input="click", control="btn-cancel", log=line, root=_root_dict(session))
     except (NativeBenchError, LeakError) as exc:
         note(item="cancel", ok=False, input="click", log="", reason=str(exc))
-    return checkbox
-
-
-def _restore_basket(session: NativeSession, win: dict[str, Any], checkbox_id: str | None, note) -> None:
-    if not checkbox_id:
-        note(item="basket-restore", ok=False, input="click", log="", reason="copy did not return a checkbox; basket was not forged")
-        return
-    try:
-        bounds = scroll_into_view(session, win, checkbox_id)
-        before = len(session.lines)
-        session.click(win, bounds)
-        _index, _when, line = session.wait_line(lambda text: "[APP:BASKET: n=0" in text, start=before, timeout=10)
-        note(item="basket-restore", ok=True, input="click", control=checkbox_id, log=line, root=_root_dict(session))
-    except (NativeBenchError, LeakError) as exc:
-        note(item="basket-restore", ok=False, input="click", control=checkbox_id, log="", reason=str(exc))
 
 
 def _click_control_when_ready(
@@ -2098,8 +2071,7 @@ def drive_product(report: dict[str, Any], out_dir: str) -> None:
             _try_tree(session, win, report["interactions"], note)
         for _ in range(3):
             _track_app_descendants(session, tracked_descendants)
-            checkbox = _try_copy_paste(session, win, canonical, note)
-            _restore_basket(session, win, checkbox, note)
+            _try_copy_paste(session, win, canonical, note)
         _track_app_descendants(session, tracked_descendants)
         _try_workspace_close_reopen(session, win, report["workload"]["path"], len(repos), tracked_descendants, note)
         for item, reason in (

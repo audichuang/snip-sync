@@ -32,16 +32,16 @@ use crate::selector::Pick;
 use crate::theme::*;
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
-	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, DeselectAllFiles,
-	FindInFile, FindNext, FindPrev, FocusNext, FocusPrev, GotoLine,
-	HistoryNextPage, HistoryPrevPage, LogDown, LogExtendDown, LogExtendUp,
-	LogHead, LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle, NavUp,
-	OpenRefSelector, OpenRepoSelector, OpenWorkspace, PastePreview, Popover,
-	Quit, ReaderClear, ReaderCopy, ReaderDown, ReaderPageDown, ReaderPageUp,
-	ReaderSelectAll, ReaderUp, Refresh, RepoEntryKind, SelectAllFiles,
-	SelectRepo1, SelectRepo2, ShowChanges, ShowProject, Splitter, ToggleLocale,
-	ToggleLog, ToggleTab, TreeCollapse, TreeDown, TreeExpand, TreeOpen,
-	TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
+	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
+	FindNext, FindPrev, FocusNext, FocusPrev, GotoLine, HistoryNextPage,
+	HistoryPrevPage, LogDown, LogExtendDown, LogExtendUp, LogHead, LogOpen,
+	LogSearchFocus, LogUp, NavDown, NavToggle, NavUp, OpenRefSelector,
+	OpenRepoSelector, OpenWorkspace, PastePreview, Popover, Quit, ReaderClear,
+	ReaderCopy, ReaderDown, ReaderPageDown, ReaderPageUp, ReaderSelectAll,
+	ReaderUp, Refresh, RepoEntryKind, SelectRepo1, SelectRepo2, ShowChanges,
+	ShowProject, Splitter, ToggleLocale, ToggleLog, ToggleTab, TreeCollapse,
+	TreeDown, TreeExpand, TreeOpen, TreeToggle, TreeUp, WorkbenchModel,
+	WorkbenchTab,
 };
 use crate::{NextDiff, PrevDiff};
 
@@ -401,14 +401,8 @@ fn clip_text(text: impl Into<SharedString>) -> Div {
 		.child(text.into())
 }
 
+/// IntelliJ checkbox: small, thin border, accent fill with a painted check.
 fn checkbox(checked: bool) -> Div {
-	tri_checkbox(Some(checked))
-}
-
-/// IntelliJ checkbox with the "some children" state (`None`: a dash).
-fn tri_checkbox(state: Option<bool>) -> Div {
-	let on = state != Some(false);
-	// IntelliJ-style: small, thin border, accent fill with a painted check.
 	div()
 		.flex_shrink_0()
 		.size(px(12.))
@@ -417,22 +411,17 @@ fn tri_checkbox(state: Option<bool>) -> Div {
 		.flex()
 		.items_center()
 		.justify_center()
-		.border_color(rgb(if on { pal().accent } else { pal().check_border }))
-		.when(state == Some(true), |d| {
+		.border_color(rgb(if checked {
+			pal().accent
+		} else {
+			pal().check_border
+		}))
+		.when(checked, |d| {
 			d.bg(rgb(pal().accent)).child(icon_tinted(
 				Icon::Checked,
 				10.,
 				pal().accent_text,
 			))
-		})
-		.when(state.is_none(), |d| {
-			d.bg(rgb(pal().accent)).child(
-				div()
-					.w(px(6.))
-					.h(px(2.))
-					.rounded(px(1.))
-					.bg(rgb(pal().accent_text)),
-			)
 		})
 }
 
@@ -615,21 +604,13 @@ fn placed_repos(
 }
 
 impl WorkbenchModel {
+	/// Highlighted Project rows, in both trees.
 	pub fn selected_count(&self) -> usize {
-		match self.active_tab {
-			WorkbenchTab::GitChanges => {
-				self.files.iter().filter(|f| f.selected).count()
-			}
-			WorkbenchTab::FileExplorer => {
-				let mut paths = Vec::new();
-				for tree in
-					[&self.file_tree, &self.ws_tree].into_iter().flatten()
-				{
-					tree.collect_selected_paths(&mut paths);
-				}
-				paths.len()
-			}
-		}
+		[&self.file_tree, &self.ws_tree]
+			.into_iter()
+			.flatten()
+			.map(|tree| tree.selected_paths().len())
+			.sum()
 	}
 
 	/// Rail behaviour: clicking another tool window opens it, clicking the
@@ -1048,7 +1029,34 @@ impl WorkbenchModel {
 		}
 	}
 
-	/// Keyboard: activate / expand / toggle the row under the tool cursor.
+	/// Cmd/Ctrl+C: the node under the tool-window cursor, as its menu's
+	/// Copy reads it. In the Project view that is the row selection, or
+	/// the file under the cursor of a browsed commit tree.
+	pub fn copy_cursor_node(&mut self, cx: &mut Context<Self>) {
+		let targets = match self.active_tab {
+			WorkbenchTab::GitChanges => self
+				.change_item_rows()
+				.get(self.selected_list_row)
+				.map(|row| self.change_row_targets(row))
+				.unwrap_or_default(),
+			WorkbenchTab::FileExplorer => {
+				match self.project_rows().get(self.tree_cursor) {
+					Some(ProjRow::Rev(row))
+						if row.marker.is_none()
+							&& row.kind
+								== snip_core::browser::TreeKind::Blob =>
+					{
+						self.rev_targets(&row.path)
+					}
+					_ => self.project_targets(),
+				}
+			}
+		};
+		self.copy_targets(targets, cx);
+	}
+
+	/// Keyboard: activate / expand the row under the tool cursor; Space
+	/// toggles a Project row's selection.
 	fn tool_action(
 		&mut self,
 		action: &str,
@@ -1081,7 +1089,6 @@ impl WorkbenchModel {
 					let (slot, group) = (*slot, *group_id);
 					let collapsed = self.repo_changes_collapsed(slot, group);
 					match action {
-						"toggle" => self.toggle_change_repo(slot, group, cx),
 						"open" => self.toggle_repo_collapsed(slot, group, cx),
 						"expand" if collapsed => {
 							self.toggle_repo_collapsed(slot, group, cx)
@@ -1110,9 +1117,6 @@ impl WorkbenchModel {
 					let collapsed =
 						!self.change_dir_expanded(slot, group, path);
 					match action {
-						"toggle" => {
-							self.toggle_change_dir(slot, group, path, cx)
-						}
 						"open" => {
 							self.toggle_dir_collapsed(slot, group, path, cx)
 						}
@@ -1148,7 +1152,6 @@ impl WorkbenchModel {
 					let group = *group_id;
 					let collapsed = self.group_collapsed(group);
 					match action {
-						"toggle" => self.toggle_change_group(group, cx),
 						"open" => self.toggle_group_collapsed(group, cx),
 						"expand" if collapsed => {
 							self.toggle_group_collapsed(group, cx)
@@ -1158,9 +1161,6 @@ impl WorkbenchModel {
 						}
 						_ => {}
 					}
-				}
-				(ChangeItemRow::File { file_idx, .. }, "toggle") => {
-					self.toggle_file(*file_idx, cx);
 				}
 				(ChangeItemRow::File { .. }, "open") => {
 					self.set_tool_cursor(cur, cx);
@@ -1214,14 +1214,7 @@ impl WorkbenchModel {
 			ProjRow::Rev(r) if r.marker.is_none() => {
 				let dir = r.kind == snip_core::browser::TreeKind::Tree;
 				let path = r.path.clone();
-				if action == "toggle" {
-					if r.kind == snip_core::browser::TreeKind::Blob {
-						if let Some(tree) = &self.rev_tree {
-							let sha = tree.sha.clone();
-							self.toggle_rev_file_selection(&sha, &path, cx);
-						}
-					}
-				} else if (dir
+				if (dir
 					&& ((expand && !r.expanded) || (collapse && r.expanded)))
 					|| action == "open"
 				{
@@ -1354,7 +1347,7 @@ impl Render for WorkbenchModel {
 				this.open_folder_dialog(cx);
 			}))
 			.on_action(cx.listener(|this, _: &CopySelection, _, cx| {
-				this.copy_selection_to_clipboard(cx)
+				this.copy_cursor_node(cx)
 			}))
 			.on_action(cx.listener(|this, _: &PastePreview, _, cx| {
 				this.trigger_paste_preview(cx)
@@ -1368,12 +1361,6 @@ impl Render for WorkbenchModel {
 			.on_action(
 				cx.listener(|this, _: &Refresh, _, cx| this.reload_repos(cx)),
 			)
-			.on_action(cx.listener(|this, _: &DeselectAllFiles, _, cx| {
-				this.deselect_all_files(cx)
-			}))
-			.on_action(cx.listener(|this, _: &SelectAllFiles, _, cx| {
-				this.select_all_files(cx)
-			}))
 			.on_action(cx.listener(|this, _: &HistoryNextPage, _, cx| {
 				this.history_next_page(cx)
 			}))

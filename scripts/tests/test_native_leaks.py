@@ -1757,12 +1757,13 @@ class TestDriverFailure(unittest.TestCase):
 
 
 class _TreeSession:
-    """Plain-clicking a row selects it into the basket; Ctrl-click toggles it out."""
+    """A plain click selects the Project row; nothing else is clicked or held."""
 
     def __init__(self, folder: bool = False) -> None:
         self.folder = folder
         self.lines = ["[APP:CTRL_BOUNDS: id=tree-row:a.txt x=10 y=20 w=100 h=20]"]
         self.held: set[str] = set()
+        self.clicks = 0
         self.app = None
 
     def texts(self, start: int = 0) -> list[str]:
@@ -1775,12 +1776,9 @@ class _TreeSession:
             self.held.discard(args[2])
 
     def click(self, win, bounds) -> None:
-        if "ctrl" in self.held:
-            self.lines += ["[APP:TREE_TOGGLED: a.txt]", "[APP:BASKET: n=0 summary=]"]
-        elif self.folder:
-            self.lines += ["[APP:TREE_SELECTED: a.txt]", "[APP:BASKET: n=1 summary=r file a.txt]", "[APP:TREE_EXPANDED: a.txt]"]
-        else:
-            self.lines += ["[APP:TREE_SELECTED: a.txt]", "[APP:BASKET: n=1 summary=r file a.txt]", "[APP:TREE_FILE_SELECTED: a.txt]"]
+        self.clicks += 1
+        last = "[APP:TREE_EXPANDED: a.txt]" if self.folder else "[APP:TREE_FILE_SELECTED: a.txt]"
+        self.lines += ["[APP:TREE_SELECTED: a.txt]", last]
 
     def wait_line(self, pred, start: int = 0, timeout: float = 60.0):
         for index, line in enumerate(self.lines[start:], start):
@@ -1790,23 +1788,25 @@ class _TreeSession:
 
 
 class TestTryTree(unittest.TestCase):
-    def test_folder_click_leaves_the_basket_empty(self):
-        session = _TreeSession(folder=True)
+    def run_tree(self, session):
         notes = []
         with mock.patch.object(gate, "open_project_list"), mock.patch.object(gate, "scroll_into_view", return_value=(10, 20, 100, 20)):
             gate._try_tree(session, {"wid": "1", "x": 0, "y": 0}, [], lambda **row: notes.append(row))
-        self.assertTrue(notes[-1]["ok"], notes)
-        self.assertEqual(session.lines[-1], "[APP:BASKET: n=0 summary=]")
-        self.assertEqual(session.held, set())
+        return notes
 
-    def test_file_click_leaves_the_basket_empty(self):
-        session = _TreeSession()
-        notes = []
-        with mock.patch.object(gate, "open_project_list"), mock.patch.object(gate, "scroll_into_view", return_value=(10, 20, 100, 20)):
-            gate._try_tree(session, {"wid": "1", "x": 0, "y": 0}, [], lambda **row: notes.append(row))
+    def test_folder_click_is_one_plain_click(self):
+        session = _TreeSession(folder=True)
+        notes = self.run_tree(session)
         self.assertTrue(notes[-1]["ok"], notes)
-        self.assertEqual(session.lines[-1], "[APP:BASKET: n=0 summary=]")
-        self.assertEqual(session.held, set())
+        self.assertIn("TREE_EXPANDED", notes[-1]["log"])
+        self.assertEqual((session.clicks, session.held), (1, set()))
+
+    def test_file_click_is_one_plain_click(self):
+        session = _TreeSession()
+        notes = self.run_tree(session)
+        self.assertTrue(notes[-1]["ok"], notes)
+        self.assertIn("TREE_FILE_SELECTED", notes[-1]["log"])
+        self.assertEqual((session.clicks, session.held), (1, set()))
 
 
 if __name__ == "__main__":

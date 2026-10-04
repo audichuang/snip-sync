@@ -44,9 +44,8 @@ from bench_native_memory import (  # noqa: E402
     DEFAULT_PROFILES,
     NativeBenchError,
     NativeSession,
-    assert_basket_empty,
     assert_copied_payload,
-    assert_current_basket_empty,
+    assert_nothing_copied,
     check_repo_state,
     check_native_matched,
     e2e_scaled,
@@ -149,11 +148,11 @@ class TestOpenRepoName(unittest.TestCase):
 class TestBoundsAndGone(unittest.TestCase):
     def test_parse_single_and_update(self) -> None:
         lines = [
-            "[APP:CTRL_BOUNDS: id=btn-copy x=777 y=8 w=91 h=22]",
+            "[APP:CTRL_BOUNDS: id=btn-paste x=777 y=8 w=91 h=22]",
             "[APP:CTRL_BOUNDS: id=repo-row:repo-a x=36 y=66 w=280 h=24]",
         ]
         bounds = parse_bounds(lines)
-        self.assertEqual(bounds["btn-copy"], (777, 8, 91, 22))
+        self.assertEqual(bounds["btn-paste"], (777, 8, 91, 22))
         self.assertEqual(bounds["repo-row:repo-a"], (36, 66, 280, 24))
 
         # Position updates on new report
@@ -601,8 +600,6 @@ class TestIndexAndWorktreeOracle(unittest.TestCase):
         lines = [
             "[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=400]",
             "[APP:CTRL_BOUNDS: id=change-row:staged:both.txt x=8 y=80 w=280 h=22]",
-            "[APP:CTRL_BOUNDS: id=change-chk:staged:both.txt x=8 y=82 w=16 h=16]",
-            "[APP:CTRL_BOUNDS: id=btn-copy x=400 y=8 w=90 h=24]",
         ]
         session = _ScriptedCopySession(lines, payload, self.tmp.name)
         win = {"wid": "0x1", "x": 0, "y": 0, "width": 800, "height": 600}
@@ -618,7 +615,10 @@ class TestIndexAndWorktreeOracle(unittest.TestCase):
         self.assertEqual(result["paths"], ["both.txt"])
         self.assertEqual(result["copiedCount"], 1)
         self.assertEqual(session.keys, [])
-        self.assertEqual(len(session.clicks), 3)
+        # Preview click, right click on the same row, then the menu's Copy.
+        self.assertEqual([button for _, button in session.clicks], ["1", "3", "1"])
+        self.assertEqual(session.clicks[0][0], session.clicks[1][0])
+        self.assertEqual(result["controls"], {"row": "change-row:staged:both.txt", "copy": "menu-item:copy-files"})
         self.assertTrue(result["sentinelReplaced"])
 
     def test_staged_rename_reports_moved_and_handles_worktree_edit(self) -> None:
@@ -676,44 +676,22 @@ class TestIndexAndWorktreeOracle(unittest.TestCase):
             self.assertIn("missing rename origPath", str(cm.exception))
 
 
-class TestCurrentBasketPrecondition(unittest.TestCase):
-    """A cleared basket may switch. The historical full-log helper still rejects the old n=1."""
+class TestNothingCopied(unittest.TestCase):
+    """Loading or switching a repository must not run a Copy."""
 
-    def test_cleared_explicit_copy_allows_current_precondition(self) -> None:
-        lines = [
-            "[APP:BASKET: n=1 summary=repo-01 staged file.txt]",
-            "[APP:FILE_TOGGLED: file.txt selected=true]",
-            "[APP:BASKET: n=0 summary=]",
-        ]
-        with self.assertRaises(NativeBenchError):
-            assert_basket_empty(lines, "historical full log")
-        current = assert_current_basket_empty(lines, "before opening repo-02")
-        self.assertTrue(current["empty"])
-        self.assertEqual(current["currentN"], 0)
+    def test_load_logs_without_copy_pass(self) -> None:
+        lines = ["[APP:REPO_LOADED: repo-01 files=1]", "[APP:TREE_SELECTED: a.txt]", "[APP:MENU_OPEN: Left items=copy-files]"]
+        self.assertEqual(assert_nothing_copied(lines, "opening repo-02"), {"copyEvents": 0, "empty": True})
+
+    def test_any_copy_event_fails(self) -> None:
+        for line in ("[APP:COPY_PREP: files=1]", "[APP:COPY_DONE: copied=1]"):
+            with self.subTest(line=line), self.assertRaises(NativeBenchError) as caught:
+                assert_nothing_copied(["[APP:REPO_LOADED: repo-01 files=1]", line], "opening repo-02")
+            self.assertIn(line, str(caught.exception))
+
+    def test_click_repo_checks_its_fresh_slice(self) -> None:
         source = inspect.getsource(click_repo)
-        self.assertIn("assert_current_basket_empty", source)
-        self.assertNotIn("assert_basket_empty(", source)
-
-    def test_current_nonempty_basket_is_rejected(self) -> None:
-        lines = [
-            "[APP:BASKET: n=0 summary=]",
-            "[APP:BASKET: n=1 summary=repo-01 staged file.txt]",
-        ]
-        with self.assertRaises(NativeBenchError) as caught:
-            assert_current_basket_empty(lines, "before opening repo-02")
-        self.assertIn("n=1", str(caught.exception))
-
-    def test_fresh_slice_still_rejects_basket_and_selected_toggle(self) -> None:
-        with self.assertRaises(NativeBenchError):
-            assert_basket_empty(
-                ["[APP:BASKET: n=1 summary=repo-01 staged file.txt]"],
-                "opening repo-02",
-            )
-        with self.assertRaises(NativeBenchError):
-            assert_basket_empty(
-                ["[APP:FILE_TOGGLED: README.md selected=true]"],
-                "opening repo-02",
-            )
+        self.assertIn("assert_nothing_copied(s.texts(before)", source)
 
 
 class ChangeTreeSession:
@@ -772,7 +750,7 @@ class TestChangeDirectoryExpansion(unittest.TestCase):
 
     def test_untracked_rows_sit_in_unstaged(self) -> None:
         self.assertEqual(change_row_group("change-row:untracked:a/b.txt"), "unstaged")
-        self.assertEqual(change_row_group("change-chk:staged:a/b.txt"), "staged")
+        self.assertEqual(change_row_group("change-row:staged:a/b.txt"), "staged")
 
     def test_opens_each_collapsed_ancestor_down_to_the_row(self) -> None:
         src = "change-dir:unstaged:repo:src"
@@ -848,24 +826,27 @@ class _ScriptedCopySession:
         self.payload = payload
         self.run_dir = run_dir
         self.clip = b""
-        self.clicks: list[tuple[int, int, int, int]] = []
+        self.clicks: list[tuple[tuple[int, int, int, int], str]] = []
         self.keys: list[str] = []
         self.copied = False
 
     def texts(self, start: int = 0) -> list[str]:
         return self.lines[start:]
 
-    def click(self, win: dict[str, Any], bounds: tuple[int, int, int, int]) -> float:
-        self.clicks.append(bounds)
+    def click(self, win: dict[str, Any], bounds: tuple[int, int, int, int], button: str = "1") -> float:
+        self.clicks.append((bounds, button))
         n = len(self.clicks)
         if n == 1:
             self.lines.append("[APP:PREVIEW_LOADED: both.txt]")
             self.lines.append(
                 "[APP:E2E_PREVIEW: source=staged_changes rev=- path=both.txt lines=1 fnv=1]"
             )
-        elif n == 2:
-            self.lines.append("[APP:BASKET: n=1 summary=idx-repo staged both.txt]")
+        elif n == 2 and button == "3":
+            self.lines.append("[APP:MENU_OPEN: Left items=copy-files,show-diff,copy-path]")
+            self.lines.append("[APP:CTRL_BOUNDS: id=menu-item:copy-files x=20 y=100 w=180 h=22]")
         elif n == 3:
+            self.lines.append("[APP:MENU_ACTION: copy-files]")
+            self.lines.append("[APP:COPY_PREP: files=1]")
             self.lines.append("[APP:COPY_DONE: copied=1]")
             self.copied = True
         return 1.0
@@ -1016,7 +997,7 @@ class TestMatchedNative(unittest.TestCase):
         self.assertTrue(observed["retainedPatchMatchedGit"])
         self.assertEqual(observed["displayedHistoryShortOids"], ["aaaaaaa", "bbbbbbb"])
 
-    def test_rejects_oid_path_count_order_patch_basket_and_copy_mismatch(self) -> None:
+    def test_rejects_oid_path_count_order_patch_and_copy_mismatch(self) -> None:
         for old, new in (("rev=" + "a" * 40, "rev=" + "b" * 40), ("path=a.txt", "path=other.txt"),
                          ("commits=2", "commits=50"), ("y=600", "y=640"),
                          ("lines=1", "lines=2"), ("fnv=a430d84680aabd0b", "fnv=0"),
@@ -1024,7 +1005,7 @@ class TestMatchedNative(unittest.TestCase):
                          ("LOCALE: En", "LOCALE: ZhTw")):
             with self.subTest(change=new), self.assertRaises((NativeBenchError, BenchError)):
                 check_native_matched([line.replace(old, new) for line in self.lines], self.window, self.oracle, MATCHED_SENTINEL)
-        for extra in ("[APP:BASKET: n=1 summary=repo staged a.txt]", "[APP:COPY_DONE: copied=1]"):
+        for extra in ("[APP:COPY_PREP: files=1]", "[APP:COPY_DONE: copied=1]"):
             with self.subTest(extra=extra), self.assertRaises(NativeBenchError):
                 check_native_matched(self.lines + [extra], self.window, self.oracle, MATCHED_SENTINEL)
 
@@ -1299,7 +1280,7 @@ class TestScrollHintScope(unittest.TestCase):
         ], "repo-row:repo-01-core"), "4")
 
     def test_same_view_retains_gone_row_upward_hint(self) -> None:
-        for control in ("tree-row:src", "rev-row:src", "rev-chk:bbbbbbb:src/app.txt"):
+        for control in ("tree-row:src", "rev-row:src", "rev-row:src/app.txt"):
             with self.subTest(control=control):
                 self.assertEqual(self.first_wheel([
                     self.VIEWPORT, self.WEST, "[APP:REV_TREE: bbbbbbb]",

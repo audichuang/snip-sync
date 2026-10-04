@@ -261,7 +261,7 @@ def check_matched_state(observed: dict[str, Any], oracle: dict[str, Any]) -> Non
     expected = {"ref": MATCHED_REF, "historyOids": oracle["historyOids"],
                 "sha": oracle["sha"], "path": oracle["path"], "previewMode": "diff",
                 "observedLocale": "en",
-                "width": MATCHED_SIZE[0], "height": MATCHED_SIZE[1], "basketEmpty": True,
+                "width": MATCHED_SIZE[0], "height": MATCHED_SIZE[1], "nothingCopied": True,
                 "clipboardSha256": hashlib.sha256(MATCHED_SENTINEL).hexdigest()}
     for key, wanted in expected.items():
         if observed.get(key) != wanted:
@@ -513,11 +513,10 @@ APPLICATION_HISTORY_PAGE_LENGTH = 50
 DELETED_FILE_MARKER = b"// This file has been deleted in this change"
 BOUNDS_RE = re.compile(r"\[APP:CTRL_BOUNDS: id=(?P<id>.+?) x=(?P<x>-?\d+) y=(?P<y>-?\d+) w=(?P<w>\d+) h=(?P<h>\d+)\]")
 REPO_SELECT_RE = re.compile(r"\[APP:REPO_SELECTING: (?P<idx>\d+) \((?P<name>[^)]+)\)")
-BASKET_RE = re.compile(r"\[APP:BASKET: n=(?P<n>\d+) summary=(?P<summary>.*)\]")
 FILE_HEADER_RE = re.compile(
     rb"(?:^|\n)// file: (?:\[(?:NEW|MODIFIED|DELETED|MOVED)\] )*([^\r\n]+)\r?\n"
 )
-# Basket / preview labels for the three change groups the D3 list actually copies.
+# Preview labels for the three change groups the D3 list actually copies.
 PREVIEW_KIND = {
     "staged": "staged_changes",
     "unstaged": "unstaged_changes",
@@ -712,7 +711,7 @@ def repo_oracle(repo: str) -> dict[str, Any]:
 
 
 def source_file_bytes(repo: str, row: dict[str, Any]) -> bytes | None:
-    """Bytes the basket export stores for this row, or None when they are not UTF-8 text.
+    """Bytes the row's Copy exports, or None when they are not UTF-8 text.
 
     Staged content is the index blob. Unstaged and untracked content is the worktree
     file. A deletion is the core deleted-file marker, not the missing worktree bytes.
@@ -797,7 +796,7 @@ def assert_copied_payload(
     copied_count: int,
     sentinel: bytes | None = None,
 ) -> dict[str, Any]:
-    """Byte oracle for one explicitly selected basket entry."""
+    """Byte oracle for one explicitly copied row."""
     if sentinel is not None and (clip_bytes == sentinel or sentinel in clip_bytes):
         raise NativeBenchError("copy left the clipboard sentinel in place")
     if not clip_bytes:
@@ -847,46 +846,12 @@ def assert_copied_payload(
     }
 
 
-def basket_events(lines: list[str]) -> list[dict[str, Any]]:
-    events = []
-    for line in lines:
-        m = BASKET_RE.search(line)
-        if not m:
-            continue
-        summary = m["summary"]
-        entries = []
-        if summary:
-            for part in summary.split("; "):
-                bits = part.split(" ", 2)
-                if len(bits) != 3:
-                    raise NativeBenchError(f"unparsed basket summary {summary!r}")
-                entries.append({"repo": bits[0], "source": bits[1], "path": bits[2]})
-        events.append({"n": int(m["n"]), "summary": summary, "entries": entries, "line": line})
-    return events
-
-
-def assert_basket_empty(lines: list[str], what: str) -> dict[str, Any]:
-    """Any earlier non-empty basket event or selected toggle fails. Fresh slices use this."""
-    events = basket_events(lines)
-    bad = [event for event in events if event["n"] != 0]
-    toggles = [line for line in lines if "[APP:FILE_TOGGLED:" in line and "selected=true" in line]
-    if bad or toggles:
-        detail = bad[-1]["line"] if bad else toggles[-1]
-        raise NativeBenchError(f"{what} put entries in the basket: {detail}")
-    return {"events": len(events), "nonEmpty": 0, "empty": True}
-
-
-def assert_current_basket_empty(lines: list[str], what: str) -> dict[str, Any]:
-    """Precondition: the latest basket event is empty. An earlier n=1 that was cleared does not count."""
-    events = basket_events(lines)
-    current = events[-1] if events else None
-    if current is not None and current["n"] != 0:
-        raise NativeBenchError(f"{what} put entries in the basket: {current['line']}")
-    return {
-        "events": len(events),
-        "currentN": None if current is None else current["n"],
-        "empty": True,
-    }
+def assert_nothing_copied(lines: list[str], what: str) -> dict[str, Any]:
+    """Loading, switching or previewing must not run a Copy: no COPY_PREP / COPY_DONE in `lines`."""
+    copies = [line for line in lines if "[APP:COPY_PREP:" in line or "[APP:COPY_DONE:" in line]
+    if copies:
+        raise NativeBenchError(f"{what} ran a copy: {copies[-1]}")
+    return {"copyEvents": 0, "empty": True}
 
 
 def extract_clipcode_file_bytes(
@@ -957,7 +922,7 @@ def extract_clipcode_file_bytes(
 def _empty_text_wrappers(payload: bytes) -> bool:
     """True when the root header is followed by a blank line, then a file header.
 
-    Default settings write that blank line for empty pre-text only when the basket
+    Default settings write that blank line for empty pre-text only when the copy
     is not staged/deleted fallback. The same mode appends an empty post-text newline
     after the last file and does not write `// clipcode-end`.
     """
@@ -979,10 +944,10 @@ def copy_explicit_selection(
     oracle: dict[str, Any],
     selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Select one source row with its real checkbox and copy it through btn-copy.
+    """Preview one source row, then copy it through its right-click Copy (`menu-item:copy-files`).
 
-    The basket starts empty. Ctrl+C is not used: with the reader focused it copies
-    the preview text instead of the basket. A path-only control id is not a substitute.
+    Ctrl+C is not used: with the reader focused and text selected it copies the
+    preview text instead of the row. A path-only control id is not a substitute.
     `selection` picks one source row; otherwise the driver chooses a row whose bytes
     identify the source.
     """
@@ -1006,7 +971,7 @@ def copy_explicit_selection(
         raise NativeBenchError(f"refusing to copy unsupported source {source!r} for {path}")
     kind = PREVIEW_KIND[source]
     row_id = f"change-row:{source}:{path}"
-    chk_id = f"change-chk:{source}:{path}"
+    copy_id = "menu-item:copy-files"
     show_changes(s, win)
 
     expand_change_dirs(s, win, row_id, oracle["name"])
@@ -1023,23 +988,21 @@ def copy_explicit_selection(
     except NativeBenchError as e:
         raise NativeBenchError(f"clicking {row_id} did not preview {kind} {path}: {e}") from e
 
-    chk_bounds = scroll_into_view(s, win, chk_id)
-    assert_on_window(chk_bounds, win, chk_id)
+    row_bounds = scroll_into_view(s, win, row_id)
+    assert_on_window(row_bounds, win, row_id)
     before = len(s.lines)
-    s.click(win, chk_bounds)
+    s.click(win, row_bounds, button="3")
     try:
-        _, _, basket_line = s.wait_line(lambda line: "[APP:BASKET: n=" in line, start=before, timeout=10)
+        _, _, menu_line = s.wait_line(lambda line: "[APP:MENU_OPEN: Left" in line, start=before, timeout=10)
     except NativeBenchError as e:
-        raise NativeBenchError(f"clicking {chk_id} did not log a basket change: {e}") from e
-    event = basket_events([basket_line])[0]
-    wanted = [{"repo": oracle["name"], "source": source, "path": path}]
-    if event["n"] != 1 or event["entries"] != wanted:
-        raise NativeBenchError(
-            f"basket after {chk_id} is n={event['n']} {event['entries']}, expected {wanted}"
-        )
-
-    copy_bounds = require_control(s.texts(), "btn-copy")
-    assert_on_window(copy_bounds, win, "btn-copy")
+        raise NativeBenchError(f"right-clicking {row_id} did not open its menu: {e}") from e
+    if "copy-files" not in menu_line:
+        raise NativeBenchError(f"{row_id} menu has no Copy: {menu_line}")
+    deadline = time.monotonic() + 5
+    while copy_id not in parse_bounds(s.texts(before)) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    copy_bounds = require_control(s.texts(before), copy_id)
+    assert_on_window(copy_bounds, win, copy_id)
     sentinel = f"SNIP-DRIVER-SENTINEL-{uuid.uuid4().hex}\n".encode()
     s.set_clipboard(sentinel)
     stuck = s.read_clipboard()
@@ -1047,9 +1010,9 @@ def copy_explicit_selection(
         raise NativeBenchError("clipboard sentinel did not stick before copy")
 
     before = len(s.lines)
-    # The copy button enables on the frame after the basket update and drops
-    # clicks until then. Re-click only while no copy log has appeared at all.
-    copy_logs = ("[APP:COPY_PREP:", "[APP:COPY_REFUSED:", "[APP:COPY_BUSY]", "[APP:COPY_DONE:")
+    # The menu item takes clicks once its frame is painted. Re-click only while
+    # no copy log has appeared at all.
+    copy_logs = ("[APP:MENU_ACTION: copy-files]", "[APP:COPY_PREP:", "[APP:COPY_REFUSED:", "[APP:COPY_BUSY]", "[APP:COPY_DONE:")
     for _ in range(5):
         s.click(win, copy_bounds)
         try:
@@ -1061,7 +1024,7 @@ def copy_explicit_selection(
         _, _, copy_line = s.wait_line(lambda line: "[APP:COPY_DONE:" in line, start=before, timeout=8)
     except NativeBenchError as e:
         refused = [line for line in s.texts(before) if "COPY_REFUSED" in line or "COPY_DONE" in line]
-        raise NativeBenchError(f"btn-copy did not log COPY_DONE ({refused or 'no copy log'}): {e}") from e
+        raise NativeBenchError(f"{copy_id} did not log COPY_DONE ({refused or 'no copy log'}): {e}") from e
     copied_m = re.search(r"copied=(\d+)", copy_line)
     if not copied_m:
         raise NativeBenchError(f"COPY_DONE line has no copied count: {copy_line}")
@@ -1100,8 +1063,7 @@ def copy_explicit_selection(
         "oracleKind": oracle_kind(row),
         "worktreeDiffers": worktree_differs,
         "sentinelReplaced": True,
-        "controls": {"row": row_id, "checkbox": chk_id, "copy": "btn-copy"},
-        "basket": {"n": event["n"], "summary": event["summary"], "entries": event["entries"]},
+        "controls": {"row": row_id, "copy": copy_id},
         **checked,
     }
 
@@ -1482,7 +1444,8 @@ class NativeSession:
         self.x("xdotool", "keyup", "ctrl", "alt", "shift", "super")
         return t
 
-    def click(self, win: dict[str, Any], bounds: tuple[int, int, int, int]) -> float:
+    def click(self, win: dict[str, Any], bounds: tuple[int, int, int, int], button: str = "1") -> float:
+        """Click the centre of `bounds`; `button` "3" is a right click (a row's context menu)."""
         x, y, w, h = bounds
         ax, ay = win["x"] + x + w // 2, win["y"] + y + h // 2
         self.focus(win["wid"])
@@ -1490,7 +1453,7 @@ class NativeSession:
         t = time.monotonic()
         # No --sync: xdotool waits for a motion event, which never comes when the
         # pointer is already on this pixel. Move and click are one invocation.
-        self.x("xdotool", "mousemove", str(ax), str(ay), "click", "1")
+        self.x("xdotool", "mousemove", str(ax), str(ay), "click", button)
         return t
 
     def capture(self, win: dict[str, Any], name: str, timeout: float = 20.0) -> dict[str, Any]:
@@ -1626,13 +1589,13 @@ def check_native_matched(lines: list[str], win: dict[str, Any], oracle: dict[str
         raise NativeBenchError("matched retained diff source/line count/fingerprint differs from Git patch")
     if any("COPY_DONE:" in line or "SELECTION_COPIED:" in line for line in lines):
         raise NativeBenchError("matched profile unexpectedly copied content")
-    basket = assert_basket_empty(lines, "matched diff")
+    nothing = assert_nothing_copied(lines, "matched diff")
     observed = {"ref": refs[-1].removeprefix("[APP:REF_FILTER: ").removesuffix("]") if refs else None,
                 "historyOids": oracle["historyOids"], "displayedHistoryShortOids": [short for short, _ in rows],
                 "historyEvidence": "two unique Git short OIDs, in live row y-order; full OID on E2E_PREVIEW",
                 "sha": preview[2], "path": preview[3], "previewMode": "diff", "width": win["width"],
                 "observedLocale": "en",
-                "height": win["height"], "basketEmpty": basket["empty"], "basket": basket,
+                "height": win["height"], "nothingCopied": nothing["empty"], "copies": nothing,
                 "clipboardSha256": hashlib.sha256(clipboard).hexdigest(),
                 "retainedPatchMatchedGit": True, "patchSha256": oracle["patchSha256"]}
     check_matched_state(observed, oracle)
@@ -1717,7 +1680,7 @@ def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: 
             selected_repo = next(r for r in repos if os.path.basename(r) == name)
             wait_repo_loaded(s, selected_repo, 0)
             state["selected"] = check_repo_state(s.texts(), repo_oracle(selected_repo))
-            state["basketAfterLoad"] = assert_basket_empty(s.texts(), f"loading {name}")
+            state["copiesAfterLoad"] = assert_nothing_copied(s.texts(), f"loading {name}")
 
         win = s.window()
         result["window"] = win
@@ -1765,7 +1728,7 @@ def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: 
             oracle = repo_oracle(selected_repo)
             if not oracle["sourceRows"]:
                 raise NativeBenchError(f"{oracle['name']} has no source rows to copy")
-            state["basketBeforeCopy"] = assert_basket_empty(s.texts(), "before explicit copy")
+            state["copiesBeforeCopy"] = assert_nothing_copied(s.texts(), "before explicit copy")
             state["selected"]["autoPreviewPath"] = state["selected"].get("previewPath")
             copied = copy_explicit_selection(s, win, oracle)
             state["selected"]["clipboard"] = copied
@@ -1846,7 +1809,7 @@ def require_control(lines: list[str], control_id: str) -> tuple[int, int, int, i
     if control_id not in bounds:
         extra = ""
         head, sep, tail = control_id.partition(":")
-        if sep and ":" in tail and head in ("change-row", "change-chk"):
+        if sep and ":" in tail and head == "change-row":
             legacy = f"{head}:{tail.split(':', 1)[1]}"
             if legacy in bounds:
                 extra = f"; {legacy} is visible and is not accepted"
@@ -1884,7 +1847,7 @@ def _last_reported_bounds(lines: list[str], control: str) -> tuple[int, int, int
     found: tuple[int, int, int, int] | None = None
     for line in lines:
         if ("[APP:REPO_SELECTING:" in line and not control.startswith("repo-row:")) or (
-            control.startswith(("rev-row:", "rev-chk:")) and "[APP:REV_TREE:" in line
+            control.startswith("rev-row:") and "[APP:REV_TREE:" in line
         ):
             found = None
         match = BOUNDS_RE.search(line)
@@ -2191,7 +2154,6 @@ def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[f
     """Click one repo row. Returns click time, load times, and the log index of the click."""
     open_project_list(s, win)
     name = os.path.basename(repo_path)
-    assert_current_basket_empty(s.texts(), f"before opening {name}")
     bounds = scroll_into_view(s, win, f"repo-row:{name}")
     assert_on_window(bounds, win, f"repo-row:{name}")
     if open_repo_name(s.texts()) == name:
@@ -2210,16 +2172,12 @@ def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[f
     narrowed = narrow_log(s, win, name)
     if narrowed is not None:
         t_graph = narrowed
-    fresh = s.texts(before)
-    bad = [event for event in basket_events(fresh) if event["n"] != 0]
-    toggles = [line for line in fresh if "[APP:FILE_TOGGLED:" in line and "selected=true" in line]
-    if bad or toggles:
-        raise NativeBenchError(f"opening {name} added a basket entry: {(bad or toggles)[-1]}")
+    assert_nothing_copied(s.texts(before), f"opening {name}")
     return sent, t_loaded, t_graph, before
 
 
 def run_soak(s: NativeSession, win: dict[str, Any], repos: list[str], switches: int) -> tuple[dict[str, list[float]], dict[str, Any]]:
-    """Clicks repo rows round-robin. Each switch must load, and must not check a file."""
+    """Clicks repo rows round-robin. Each switch must load, and must not copy anything."""
     names = [os.path.basename(r) for r in repos]
     clicks: list[float] = []
     graphs: list[float] = []
@@ -2242,7 +2200,7 @@ def run_soak(s: NativeSession, win: dict[str, Any], repos: list[str], switches: 
         raise NativeBenchError(f"soak recorded {len(clicks)} switches, requested {switches}")
     return ({"clickToRepoLoadedMs": clicks, "clickToGraphLoadedMs": graphs},
             {"switches": len(clicks), "oracleChecks": checked, "lastRepo": current,
-             "basketEmpty": True, "lastState": last_state})
+             "nothingCopied": True, "lastState": last_state})
 
 
 PROFILE_SETUP = {
@@ -2337,9 +2295,9 @@ def markdown(report: dict[str, Any]) -> str:
         f"- **Artifact status**: {meta['binary']['label']} (build profile `{meta['binary'].get('buildProfile')}`). A profile label or a receipt does not pass the release D4 gate.",
         "- **Release comparison**: this driver does not emit one. `--compare-baseline` exits UNSUPPORTED. The supervisor compares matched run artifacts.",
         "- **Cache**: process-cold (fresh process, private XDG and D-Bus). Filesystem cache is uncontrolled. Filesystem-cold is UNSUPPORTED. This driver does not drop caches.",
-        "- **15overview Semantics**: In current prototype, repository 0 is automatically selected upon launch, loading its graph and preview into memory. 15overview reflects 15 discovered repos + 1 loaded active repo; it does not certify summary-only overview memory until app mode defers graph/preview retention. Auto-preview does not fill the basket.",
-        "- **1repo-diff**: selected two-commit feature branch on the standard repository; 1080x720 client, fixed tip/file diff, empty basket, unchanged clipboard, no Copy. This optional scenario does not match the default 50/300-row histories or 15 repositories.",
-        "- **Explicit copy (other repository profiles)**: one source-aware checkbox, then `btn-copy`. Staged bytes are the index. Unstaged and untracked bytes are the worktree. `files=` is source rows, not distinct paths. A non-empty basket before that click fails the run.",
+        "- **15overview Semantics**: In current prototype, repository 0 is automatically selected upon launch, loading its graph and preview into memory. 15overview reflects 15 discovered repos + 1 loaded active repo; it does not certify summary-only overview memory until app mode defers graph/preview retention. Auto-preview does not copy anything.",
+        "- **1repo-diff**: selected two-commit feature branch on the standard repository; 1080x720 client, fixed tip/file diff, no copy events, unchanged clipboard, no Copy. This optional scenario does not match the default 50/300-row histories or 15 repositories.",
+        "- **Explicit copy (other repository profiles)**: right-click one source-aware Changes row, then `menu-item:copy-files`. Staged bytes are the index. Unstaged and untracked bytes are the worktree. `files=` is source rows, not distinct paths. Any copy before the driver's own fails the run.",
         "- **History page**: the application built-in length is "
         f"{APPLICATION_HISTORY_PAGE_LENGTH}. There is no history-page CLI. Observed row counts stay on each run.",
         "- **Steady CPU %**: Reflects Mesa lavapipe (llvmpipe) software rasterization overhead on CPU under headless Xvfb.",

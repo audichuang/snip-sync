@@ -980,25 +980,8 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		.expect("harmless locale focus anchor must switch to English");
 	// IntelliJ draws no focus ring after a mouse click, only after keys.
 	capture_focus("keyboard-anchor-locale.png", &[("btn-locale", false)]);
-	println!("[TEST DRIVER] Disabled Copy must neither focus nor activate...");
-	// The basket is still empty. Clicking the disabled button must not focus it;
-	// Enter/Space may retain the harmless locale focus, but cannot invoke Copy.
-	let _: Vec<_> = rx.try_iter().collect();
-	click("btn-copy");
-	send_key("Return");
-	send_key("space");
-	capture_focus("keyboard-disabled-copy.png", &[("btn-copy", false)]);
-	assert_eq!(clip_get(), sentinel, "disabled Copy changed the clipboard");
-	let disabled_events: Vec<_> = rx.try_iter().collect();
-	assert!(
-		!disabled_events
-			.iter()
-			.any(|line| line.contains("[APP:COPY")),
-		"disabled Copy dispatched an action: {disabled_events:?}"
-	);
-
 	// A real click gives us a known focus anchor. From locale, traverse back
-	// through Refresh and Paste to Ref: disabled Copy (tab index 3) is skipped.
+	// through Refresh and Paste to Ref.
 	click("btn-locale");
 	wait_for_pattern("[APP:LOCALE: ZhTw]", Duration::from_secs(3))
 		.expect("locale anchor click must restore Chinese");
@@ -1008,23 +991,13 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		&[("btn-refresh", true), ("btn-locale", false)],
 	);
 	send_key("Shift+Tab");
-	capture_focus(
-		"keyboard-paste-focus.png",
-		&[("btn-paste", true), ("btn-copy", false)],
-	);
+	capture_focus("keyboard-paste-focus.png", &[("btn-paste", true)]);
 	send_key("Shift+Tab");
-	capture_focus(
-		"keyboard-ref-focus.png",
-		&[("btn-ref-selector", true), ("btn-copy", false)],
-	);
+	capture_focus("keyboard-ref-focus.png", &[("btn-ref-selector", true)]);
 	send_key("Tab");
 	capture_focus(
-		"keyboard-forward-skip-copy.png",
-		&[
-			("btn-paste", true),
-			("btn-ref-selector", false),
-			("btn-copy", false),
-		],
+		"keyboard-forward-paste.png",
+		&[("btn-paste", true), ("btn-ref-selector", false)],
 	);
 	send_key("Tab");
 	send_key("Tab");
@@ -1706,7 +1679,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	// 13. Small window: 900x600 must keep every control reachable.
 	println!("[TEST DRIVER] Resizing to 900x600...");
 	resize(900, 600);
-	for id in ["btn-copy", "btn-paste", "rail-project", "rail-log"] {
+	for id in ["btn-paste", "rail-project", "rail-log"] {
 		control(id);
 	}
 	capture_artifact("workbench_900x600.png");
@@ -1795,7 +1768,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	// 13c. English labels are wider; header must still fit at 900x600.
 	send_key("alt+l");
 	std::thread::sleep(Duration::from_millis(400));
-	for id in ["btn-copy", "btn-paste", "btn-refresh", "btn-locale"] {
+	for id in ["btn-paste", "btn-refresh", "btn-locale"] {
 		control(id);
 	}
 	capture_artifact("workbench_900x600_en.png");
@@ -2299,9 +2272,9 @@ fn native_graph_failed_next_page_is_transactional() {
 	quit_cleanly(&mut app, &wid);
 }
 
-/// Real clipboard and git oracles for basket, mapping, and commit replay.
+/// Real clipboard and git oracles for node copy, mapping, and commit replay.
 #[test]
-fn native_d3_basket_mapping_and_replay() {
+fn native_d3_copy_mapping_and_replay() {
 	if std::env::var_os("DISPLAY").is_none() {
 		assert!(
 			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
@@ -2430,6 +2403,26 @@ fn native_d3_basket_mapping_and_replay() {
 			"1",
 		]);
 	};
+	// Right-click > Copy: copies exactly that row's node.
+	let copy_node = |id: &str| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+			"click",
+			"3",
+		]);
+		wait_for("[APP:MENU_OPEN: Left", Duration::from_secs(3));
+		click("menu-item:copy-files");
+	};
 	let resize = |w: i32, h: i32| {
 		xdo(&["windowsize", "--sync", &wid, &w.to_string(), &h.to_string()]);
 		let deadline = Instant::now() + scaled(Duration::from_secs(5));
@@ -2466,8 +2459,7 @@ fn native_d3_basket_mapping_and_replay() {
 		"staged preview must not show the worktree bytes"
 	);
 
-	click("change-chk:staged:both.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	// Ctrl+C copies the Changes row under the cursor: the staged row.
 	send_key("ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
 	let staged_copy = clip::read_text().unwrap();
@@ -2475,8 +2467,6 @@ fn native_d3_basket_mapping_and_replay() {
 	assert!(!staged_copy.contains("WORK_B"), "{staged_copy}");
 	assert!(!staged_copy.contains("UNSELECTED"), "{staged_copy}");
 
-	click("change-chk:staged:both.txt");
-	wait_for("[APP:BASKET: n=0", Duration::from_secs(3));
 	click("change-row:unstaged:both.txt");
 	let unstaged_preview = wait_for(
 		"[APP:E2E_PREVIEW: source=unstaged_changes",
@@ -2490,64 +2480,27 @@ fn native_d3_basket_mapping_and_replay() {
 		unstaged_view.contains("WORK_B"),
 		"unstaged preview must show worktree bytes: {unstaged_view}"
 	);
-	click("change-chk:unstaged:both.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
-	send_key("ctrl+c");
+	copy_node("change-row:unstaged:both.txt");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
 	let unstaged_copy = clip::read_text().unwrap();
 	assert!(unstaged_copy.contains("WORK_B\n"), "{unstaged_copy}");
 	assert!(!unstaged_copy.contains("INDEX_A"), "{unstaged_copy}");
 
-	click("change-chk:staged:both.txt");
-	wait_for("[APP:BASKET_COLLISION:", Duration::from_secs(3));
-	let sentinel = clip::read_text().unwrap();
-	send_key("ctrl+c");
-	wait_for("[APP:COPY_REFUSED: collision]", Duration::from_secs(4));
-	assert_eq!(clip::read_text().unwrap(), sentinel);
-
-	click("change-chk:staged:both.txt");
-	click("change-chk:unstaged:both.txt");
-	wait_for("[APP:BASKET: n=0", Duration::from_secs(3));
-	click("change-chk:unstaged:keep.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
-	click("btn-repo-selector");
-	wait_for("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3));
-	click("pick-repo:a-source/lib");
-	let browsed = lines_until(
-		rx,
-		"[APP:REPO_LOADED: a-source/lib",
-		Duration::from_secs(6),
-	)
-	.expect("source lib must load");
-	let basket_after_browse = browsed
-		.iter()
-		.find(|line| line.contains("[APP:BASKET: n=1"))
-		.cloned()
-		.unwrap_or_default();
-	assert!(
-		basket_after_browse.contains("keep.txt"),
-		"browsing lib must keep the src-app selection: {browsed:?}"
-	);
-	assert!(
-		!basket_after_browse.contains("moved.txt"),
-		"browsing must not add hidden selections: {basket_after_browse}"
-	);
-	click("change-chk:untracked:moved.txt");
-	let basket = wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
-	assert!(basket.contains("src-app"));
-	assert!(basket.contains("keep.txt"));
-	assert!(basket.contains("moved.txt"));
-	capture_window(&wid, &out_dir.join("d3_basket_1080x720.png"));
-	choose_repo("pick-repo:src-app", "[APP:REPO_LOADED: src-app");
-
-	send_key("ctrl+c");
+	// Leave only keep.txt (src-app) and moved.txt (lib) in the Unstaged
+	// group: its Copy spans both repos as one payload.
+	git_ok(&src_app, &["checkout", "--", "both.txt", "other.txt"]);
+	send_key("ctrl+r");
+	wait_for("[APP:REPO_LOADED: src-app", Duration::from_secs(8));
+	copy_node("change-header:unstaged");
 	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
+	capture_window(&wid, &out_dir.join("d3_copy_1080x720.png"));
 	let exported = clip::read_text().unwrap();
 	assert!(exported.contains("KEEP_BYTES\n"), "{exported}");
 	assert!(exported.contains("MOVED_BYTES\n"), "{exported}");
 	assert!(exported.contains("lib/moved.txt"), "{exported}");
 	assert!(!exported.contains("UNSELECTED"), "{exported}");
 	assert!(!exported.contains("WORK_B"), "{exported}");
+	assert!(!exported.contains("INDEX_A"), "{exported}");
 
 	send_key("ctrl+v");
 	let preview_lines =
@@ -2617,11 +2570,11 @@ fn native_d3_basket_mapping_and_replay() {
 	);
 	assert_eq!(
 		fs::read_to_string(src_app.join("both.txt")).unwrap(),
-		"WORK_B\n"
+		"INDEX_A\n"
 	);
 	assert_eq!(
 		fs::read_to_string(src_app.join("other.txt")).unwrap(),
-		"UNSELECTED\n"
+		"do not copy\n"
 	);
 
 	resize(900, 600);
@@ -2814,7 +2767,7 @@ fn native_d3_basket_mapping_and_replay() {
 	quit_cleanly(&mut app, &wid);
 }
 
-/// Cross-repo file basket and a skipped non-UTF-8 replay that must not write.
+/// Cross-repo node copy and a skipped non-UTF-8 replay that must not write.
 #[test]
 fn native_d3_files_and_replay_skip_oracles() {
 	if std::env::var_os("DISPLAY").is_none() {
@@ -2838,12 +2791,15 @@ fn native_d3_files_and_replay_skip_oracles() {
 		git_ok(dir, &["config", "user.email", "test@example.com"]);
 		git_ok(dir, &["config", "commit.gpgsign", "false"]);
 	}
-	fs::write(one.join("one.txt"), "ONE_BYTES\n").unwrap();
+	fs::write(one.join("one.txt"), "one base\n").unwrap();
 	git_ok(&one, &["add", "."]);
 	git_ok(&one, &["commit", "-qm", "one"]);
-	fs::write(two.join("two.txt"), "TWO_BYTES\n").unwrap();
+	fs::write(two.join("two.txt"), "two base\n").unwrap();
 	git_ok(&two, &["add", "."]);
 	git_ok(&two, &["commit", "-qm", "two"]);
+	// Both repos' changes sit in the workspace-wide Unstaged group.
+	fs::write(one.join("one.txt"), "ONE_BYTES\n").unwrap();
+	fs::write(two.join("two.txt"), "TWO_BYTES\n").unwrap();
 	fs::write(dest.join("a.txt"), "base\n").unwrap();
 	git_ok(&dest, &["add", "."]);
 	git_ok(&dest, &["commit", "-qm", "base"]);
@@ -2908,69 +2864,40 @@ fn native_d3_files_and_replay_skip_oracles() {
 	};
 	xdo(&["windowsize", "--sync", &wid, "1080", "720"]);
 
-	click("rail-project");
-	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
-	click("btn-repo-selector");
-	wait_for("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3));
-	click("pick-repo:repo-one");
-	wait_for("[APP:REPO_LOADED: repo-one", Duration::from_secs(6));
-	std::thread::sleep(Duration::from_millis(180));
-	ctrl_click_at(&wid, control("tree-row:one.txt"));
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
-	click("btn-repo-selector");
-	wait_for("[APP:SELECTOR_OPEN: Repo", Duration::from_secs(3));
-	click("pick-repo:repo-two");
-	wait_for("[APP:REPO_LOADED: repo-two", Duration::from_secs(6));
-	std::thread::sleep(Duration::from_millis(180));
-	ctrl_click_at(&wid, control("tree-row:two.txt"));
-	let basket = wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
-	assert!(basket.contains("one.txt"), "{basket}");
-	assert!(basket.contains("two.txt"), "{basket}");
-	click("rail-changes");
-	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
+	// The group's Copy spans both repos as one payload.
+	send_key("alt+0");
+	wait_for(
+		"[APP:TAB_SWITCHED: GitChanges visible=true",
+		Duration::from_secs(3),
+	);
+	let v = control("change-header:unstaged");
+	let (x, y) = ((v[0] + v[2] / 2).to_string(), (v[1] + v[3] / 2).to_string());
+	xdo(&["mousemove", "--window", &wid, &x, &y, "click", "3"]);
+	wait_for("[APP:MENU_OPEN: Left", Duration::from_secs(3));
 	let out_dir = std::env::var_os("SNIP_E2E_OUT")
 		.map(PathBuf::from)
 		.unwrap_or_else(|| PathBuf::from("target/native-e2e-artifacts"));
 	fs::create_dir_all(&out_dir).unwrap();
-	capture_window(&wid, &out_dir.join("d3_basket_count_1080x720.png"));
-	send_key("ctrl+c");
+	capture_window(&wid, &out_dir.join("d3_copy_menu_1080x720.png"));
+	click("menu-item:copy-files");
 	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
 	wait_for("[APP:COPY_IDLE]", Duration::from_secs(3));
 	let copied = clip::read_text().unwrap();
 	assert!(copied.contains("ONE_BYTES\n"), "{copied}");
 	assert!(copied.contains("TWO_BYTES\n"), "{copied}");
 
-	click("btn-basket-clear");
-	wait_for("[APP:BASKET_CLEARED]", Duration::from_secs(3));
-	assert_eq!(
-		clip::read_text().unwrap(),
-		copied,
-		"clearing the basket must not write the clipboard"
-	);
-	let sentinel = format!("SENTINEL_BASKET_{}", std::process::id());
+	// Ctrl+C with nothing under the cursor (no Project selection) refuses
+	// and leaves the clipboard alone.
+	let sentinel = format!("SENTINEL_COPY_{}", std::process::id());
 	clip::write_text(&sentinel).unwrap();
-	// The toolbar control is disabled for an empty basket. A click has no
-	// handler, so it must not log a copy and must not replace the sentinel.
-	click("btn-copy");
-	match lines_until(rx, "[APP:COPY_DONE:", Duration::from_millis(500)) {
-		Ok(lines) => panic!("disabled copy must not export: {lines:?}"),
-		Err(err) => {
-			let saw = err.split("saw ").nth(1).unwrap_or("");
-			assert!(
-				!saw.contains("COPY_DONE"),
-				"disabled copy must not export: {err}"
-			);
-		}
-	}
-	assert_eq!(clip::read_text().unwrap(), sentinel);
-	click("rail-changes");
+	click("rail-project");
+	wait_for(
+		"[APP:TAB_SWITCHED: FileExplorer visible=true selected=0]",
+		Duration::from_secs(3),
+	);
 	send_key("ctrl+c");
 	let refusal = wait_for("[APP:COPY_REFUSED:", Duration::from_secs(3));
-	assert!(
-		refusal.contains("empty_selection")
-			|| refusal.contains("commit_readonly"),
-		"{refusal}"
-	);
+	assert!(refusal.contains("empty_selection"), "{refusal}");
 	assert_eq!(clip::read_text().unwrap(), sentinel);
 
 	fs::write(dest.join("a.txt"), [0xff, 0xfe, 0x01]).unwrap();
@@ -3290,12 +3217,12 @@ fn native_tree_paging_retry_selection_900x600() {
 	quit_cleanly(&mut app, &wid);
 }
 
-/// Real OS UI scenario selecting non-HEAD historical file into shared basket,
-/// proving panel/repo switches, Space/checkbox toggle, collision rejection
-/// with clipboard sentinel, successful multi-repo copy with exact git show bytes,
-/// and basket clear without git mutations.
+/// Real OS UI scenario copying a non-HEAD historical file from its commit
+/// tree (right-click Copy and Ctrl+C), each revision of the same path by its
+/// full OID with exact git show bytes, a folder row whose Copy is disabled,
+/// and a repo-b change copy, all without git mutations.
 #[test]
-fn native_historical_file_basket_and_collision() {
+fn native_historical_file_copy() {
 	if std::env::var_os("DISPLAY").is_none() {
 		assert!(
 			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
@@ -3512,101 +3439,99 @@ fn native_historical_file_basket_and_collision() {
 		Duration::from_secs(6),
 	);
 
+	// Right-click > Copy on row `id`, then wait for `done`.
+	let copy_node = |id: &str, done: &str| -> String {
+		activate();
+		std::thread::sleep(Duration::from_millis(150));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		xdo(&[
+			"mousemove",
+			"--window",
+			&wid,
+			&x.to_string(),
+			&y.to_string(),
+			"click",
+			"3",
+		]);
+		wait_for("[APP:MENU_OPEN: Left", Duration::from_secs(4));
+		click("menu-item:copy-files");
+		wait_for(done, Duration::from_secs(8));
+		clip_get()
+	};
+	let git_show = |rev: &str, path: &str| -> String {
+		let out = Command::new("git")
+			.current_dir(&repo_a)
+			.args(["show", &format!("{rev}:{path}")])
+			.output()
+			.expect("git show");
+		assert!(out.status.success());
+		String::from_utf8(out.stdout).unwrap()
+	};
+	let only_entry = |text: &str| -> (String, String) {
+		let parsed = snip_core::format::parse_clipboard(text, "");
+		assert_eq!(parsed.len(), 1, "one entry expected: {text}");
+		(parsed[0].path.clone(), parsed[0].content.clone())
+	};
+
 	// Wait for historical tree controls to render
-	let chk_probe = format!("rev-chk:{feat_sha}:feature_only.txt");
-	control(&chk_probe);
 	control("rev-row:feature_only.txt");
 	control("rev-row:sub");
 
-	// Directory must NOT have a checkbox probe
-	assert!(
-		bounds.lock().unwrap().get(&format!("rev-chk:{feat_sha}:sub")).is_none(),
-		"directory row must not masquerade as selectable file with a checkbox probe"
-	);
-
-	// Capture unselected 1080x720 screenshot
 	settled();
 	std::thread::sleep(Duration::from_millis(200));
-	let shot_1080 = out_dir.join("d3_historical_basket_1080x720.png");
-	capture_window(&wid, &shot_1080);
-
-	// Capture unselected 900x600 screenshot (settled layout, key controls bounded)
+	capture_window(&wid, &out_dir.join("d3_historical_copy_1080x720.png"));
 	resize(900, 600);
 	std::thread::sleep(Duration::from_millis(200));
-	let shot_900 = out_dir.join("d3_historical_basket_900x600.png");
-	capture_window(&wid, &shot_900);
-
-	// Restore 1080x720
+	capture_window(&wid, &out_dir.join("d3_historical_copy_900x600.png"));
 	resize(1080, 720);
 
-	// Test Space toggle and row navigation on historical file:
-	// Clicking row only selects for preview
+	// Clicking a row previews it; a folder row only navigates.
 	click("rev-row:feature_only.txt");
 	wait_for(
 		"[APP:PREVIEW_LOADED: feature_only.txt]",
 		Duration::from_secs(6),
 	);
-	// Clicking directory row navigates/expands and must NOT affect basket
 	click("rev-row:sub");
+
+	// A folder's Copy is disabled: clicking it does nothing.
+	let v = control("rev-row:sub");
+	let (x, y) = ((v[0] + v[2] / 2).to_string(), (v[1] + v[3] / 2).to_string());
+	activate();
+	xdo(&["mousemove", "--window", &wid, &x, &y, "click", "3"]);
+	wait_for("[APP:MENU_OPEN: Left", Duration::from_secs(4));
+	click("menu-item:copy-files");
+	match lines_until(rx, "[APP:MENU_ACTION:", Duration::from_millis(600)) {
+		Ok(lines) => panic!("a folder's Copy ran: {lines:?}"),
+		Err(err) => assert!(!err.contains("COPY_PREP"), "{err}"),
+	}
+	send_key("Escape");
+	wait_for("[APP:MENU_CLOSED]", Duration::from_secs(4));
+
+	let sentinel = "SENTINEL_HISTORICAL_COPY";
+	clip_set(sentinel);
+	let feat_expected = git_show(&feat_sha, "feature_only.txt");
+	let copied =
+		copy_node("rev-row:feature_only.txt", "[APP:COPY_DONE: copied=1]");
+	assert_ne!(copied, sentinel);
+	let (path, content) = only_entry(&copied);
+	assert!(path.ends_with("feature_only.txt"), "{path}");
+	assert_eq!(
+		content,
+		feat_expected.trim_end_matches('\n'),
+		"historical file content must match git show normalized by codec"
+	);
+
+	// Ctrl+C copies the commit-tree file under the cursor.
+	clip_set(sentinel);
 	click("rev-row:feature_only.txt");
-	assert!(bounds.lock().unwrap().get("basket-summary").is_some());
+	send_key("ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(8));
+	assert_eq!(only_entry(&clip_get()).1, content);
 
-	// Press Space to toggle selection on
-	send_key("space");
-	wait_for(
-		&format!("[APP:REV_FILE_TOGGLED: sha={feat_short} path=feature_only.txt selected=true]"),
-		Duration::from_secs(4),
-	);
-	let b_line = wait_for("[APP:BASKET: n=1", Duration::from_secs(4));
-	assert!(
-		b_line.contains(&format!("commit@{feat_short}"))
-			|| b_line.contains("commit@")
-	);
-	assert!(b_line.contains("feature_only.txt"));
-
-	// Navigation while selected must NOT change basket
-	click("rev-row:sub");
-	click("rev-row:feature_only.txt");
-	let sum_v = control("basket-summary");
-	assert!(sum_v[2] > 0);
-
-	// Press Space again to toggle selection off
-	send_key("space");
-	wait_for(
-		&format!("[APP:REV_FILE_TOGGLED: sha={feat_short} path=feature_only.txt selected=false]"),
-		Duration::from_secs(4),
-	);
-	wait_for("[APP:BASKET: n=0", Duration::from_secs(4));
-
-	// Click checkbox directly to toggle selection on
-	click(&chk_probe);
-	wait_for(
-		&format!("[APP:REV_FILE_TOGGLED: sha={feat_short} path=feature_only.txt selected=true]"),
-		Duration::from_secs(4),
-	);
-	let b_line = wait_for("[APP:BASKET: n=1", Duration::from_secs(4));
-	assert!(b_line.contains("feature_only.txt"));
-
-	// Capture selected screenshots at 1080x720 and 900x600
-	settled();
-	std::thread::sleep(Duration::from_millis(200));
-	let shot_1080_sel =
-		out_dir.join("d3_historical_basket_1080x720_selected.png");
-	capture_window(&wid, &shot_1080_sel);
-
-	resize(900, 600);
-	std::thread::sleep(Duration::from_millis(200));
-	let shot_900_sel =
-		out_dir.join("d3_historical_basket_900x600_selected.png");
-	capture_window(&wid, &shot_900_sel);
-
-	resize(1080, 720);
-
-	// Test exact full-OID identity deselection with TWO revisions of the same relative path:
+	// The same path in another commit copies that revision's bytes.
 	click("btn-leave-tree");
 	wait_for("[APP:REV_TREE: off]", Duration::from_secs(4));
-
-	// Select feat2 in GitLog and browse its tree
 	click(&format!("commit-row:{feat2_short}"));
 	wait_for(
 		&format!("[APP:COMMIT_SELECTED: {feat2_short}]"),
@@ -3621,141 +3546,29 @@ fn native_historical_file_basket_and_collision() {
 		&format!("[APP:REV_TREE: {feat2_short}]"),
 		Duration::from_secs(6),
 	);
-
-	let chk_probe_feat2 = format!("rev-chk:{feat2_sha}:feature_only.txt");
-	control(&chk_probe_feat2);
-
-	// Select feat2 revision of feature_only.txt: basket now holds 2 revisions of same path
-	click(&chk_probe_feat2);
-	wait_for(
-		&format!("[APP:REV_FILE_TOGGLED: sha={feat2_short} path=feature_only.txt selected=true]"),
-		Duration::from_secs(4),
+	let feat2_expected = git_show(&feat2_sha, "feature_only.txt");
+	let copied =
+		copy_node("rev-row:feature_only.txt", "[APP:COPY_DONE: copied=1]");
+	assert_eq!(
+		only_entry(&copied).1,
+		feat2_expected.trim_end_matches('\n'),
+		"feat2's copy must carry feat2's bytes"
 	);
-	let b_line = wait_for("[APP:BASKET: n=2", Duration::from_secs(4));
-	assert!(b_line.contains(&format!("commit@{feat_short}")));
-	assert!(b_line.contains(&format!("commit@{feat2_short}")));
-
-	// Deselect feat2 revision: ONLY feat2 is removed, feat1 remains in basket!
-	click(&chk_probe_feat2);
-	wait_for(
-		&format!("[APP:REV_FILE_TOGGLED: sha={feat2_short} path=feature_only.txt selected=false]"),
-		Duration::from_secs(4),
-	);
-	let b_line = wait_for("[APP:BASKET: n=1", Duration::from_secs(4));
-	assert!(
-		b_line.contains(&format!("commit@{feat_short}")),
-		"feat1 selection must remain after feat2 deselected"
-	);
-	assert!(
-		!b_line.contains(&format!("commit@{feat2_short}")),
-		"feat2 selection must be gone"
-	);
-
 	click("btn-leave-tree");
 	wait_for("[APP:REV_TREE: off]", Duration::from_secs(4));
 
-	// Switch to Git Changes tab
+	// A change of repo-b copies from its Changes row.
 	click("rail-changes");
 	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(4));
-
-	// Switch to repo-b
 	choose_repo("pick-repo:repo-b", "[APP:REPO_LOADED: repo-b");
-
-	// In repo-b, select b_file.txt from GitChanges
-	click("change-chk:b_file.txt");
-	wait_for("[APP:BASKET: n=2", Duration::from_secs(4));
-
-	// Switch back to repo-a
-	choose_repo("pick-repo:repo-a", "[APP:REPO_LOADED: repo-a");
-
-	// Basket must still hold 2 items!
-	let summary_b = control("basket-summary");
-	assert!(summary_b[2] > 0);
-
-	// 3. Collision refusal with clipboard sentinel
-	let sentinel = "SENTINEL_HISTORICAL_COLLISION_MUST_NOT_OVERWRITE";
-	clip_set(sentinel);
-	assert_eq!(clip_get(), sentinel);
-
-	// In repo-a, select untracked feature_only.txt (which collides with commit@feat_sha:feature_only.txt)
-	click("change-chk:feature_only.txt");
-	let col_line = wait_for("[APP:BASKET_COLLISION:", Duration::from_secs(4));
-	assert!(col_line.contains("feature_only.txt"));
-
-	// Click Copy button: must refuse due to collision!
-	click("btn-copy");
-	wait_for("[APP:COPY_REFUSED: collision]", Duration::from_secs(4));
-
-	// Clipboard MUST remain the unchanged sentinel
+	let copied =
+		copy_node("change-row:b_file.txt", "[APP:COPY_DONE: copied=1]");
+	let (path, content) = only_entry(&copied);
+	assert!(path.ends_with("b_file.txt"), "{path}");
 	assert_eq!(
-		clip_get(),
-		sentinel,
-		"clipboard must not be overwritten when copy is refused due to collision"
-	);
-
-	// 4. Deselect colliding file, then successful copy
-	click("change-chk:feature_only.txt");
-	wait_for("[APP:BASKET: n=2", Duration::from_secs(4));
-
-	// Copy now succeeds!
-	click("btn-copy");
-	wait_for("[APP:COPY_PREP: files=2]", Duration::from_secs(4));
-	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(8));
-
-	// Verify clipboard payload against git show exact bytes
-	let copied_text = clip_get();
-	assert_ne!(copied_text, sentinel);
-
-	let parsed = snip_core::format::parse_clipboard(&copied_text, "");
-	assert_eq!(parsed.len(), 2, "copied payload must contain 2 entries");
-
-	let feat_entry = parsed
-		.iter()
-		.find(|e| e.path.ends_with("feature_only.txt"))
-		.expect("feature_only.txt in clipboard payload");
-	let git_show = Command::new("git")
-		.current_dir(&repo_a)
-		.args(["show", &format!("{feat_sha}:feature_only.txt")])
-		.output()
-		.expect("git show");
-	assert!(git_show.status.success());
-	let expected_feat_bytes = String::from_utf8(git_show.stdout).unwrap();
-	assert_eq!(
-		feat_entry.content,
-		expected_feat_bytes.trim_end_matches('\n'),
-		"historical file content must match git show normalized by codec"
-	);
-
-	let b_entry = parsed
-		.iter()
-		.find(|e| e.path.ends_with("b_file.txt"))
-		.expect("b_file.txt in clipboard payload");
-	assert_eq!(
-		b_entry.content, "repo-b file bytes",
+		content, "repo-b file bytes",
 		"repo-b file content must match working file"
 	);
-
-	// 5. Clear basket
-	click("btn-basket-clear");
-	wait_for("[APP:BASKET: n=0", Duration::from_secs(4));
-	wait_for("[APP:BASKET_CLEARED]", Duration::from_secs(4));
-
-	// Re-verify in rev tree that checkbox is cleared
-	click(&format!("commit-row:{feat_short}"));
-	wait_for(
-		&format!("[APP:COMMIT_SELECTED: {feat_short}]"),
-		Duration::from_secs(6),
-	);
-	wait_for(
-		&format!("[APP:E2E_PREVIEW: source=commit_diff rev={feat_sha} "),
-		Duration::from_secs(6),
-	);
-	click(&format!("btn-browse-tree:{feat_sha}"));
-	wait_for(
-		&format!("[APP:REV_TREE: {feat_short}]"),
-		Duration::from_secs(6),
-	);
-	control(&chk_probe);
 
 	// 6. Verify NO HEAD / index / worktree mutations in either repository
 	let st_a = Command::new("git")
@@ -4463,9 +4276,9 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	assert_eq!(clip_get(), "subfolder/nested.txt");
 
 	// 2. Keyboard: Down highlights the first item, Enter runs it. The
-	// right-click selected the row alone, so Copy Files copies just it.
+	// right-click selected the row alone, so Copy copies just it.
 	right_click("tree-row:alpha.txt");
-	wait("[APP:BASKET: n=1");
+	wait("[APP:TREE_SELECTED: alpha.txt]");
 	wait("[APP:MENU_OPEN: Left items=copy-files");
 	key(&wid, "Down");
 	key(&wid, "Return");
@@ -4604,22 +4417,19 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 	key(&wid, "Escape");
 	wait("[APP:SELECTOR_CLOSED]");
 
-	// 7. Changes groups are tree nodes: the group checkbox selects the
-	// whole group, the chevron collapses it. Untracked files list under
+	// 7. Changes groups are tree nodes: the group's Copy copies the whole
+	// group, the chevron collapses it. Untracked files list under
 	// Unstaged and keep their own source in the row id.
 	key(&wid, "alt+0");
 	wait("[APP:TAB_SWITCHED: GitChanges visible=true");
-	click("change-group-chk:unstaged");
-	let toggled = wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
-	let basket = toggled
-		.iter()
-		.find(|l| l.contains("[APP:BASKET: n=3"))
-		.unwrap_or_else(|| {
-			panic!("group toggle must fill the basket: {toggled:?}")
-		});
+	right_click("change-header:unstaged");
+	wait("[APP:MENU_OPEN: Left items=copy-files");
+	click("menu-item:copy-files");
+	wait("[APP:COPY_DONE: copied=2]");
+	let copied = clip_get();
 	assert!(
-		basket.contains("gamma.txt") && basket.contains("delta.txt"),
-		"{basket}"
+		copied.contains("gamma.txt") && copied.contains("delta.txt"),
+		"{copied}"
 	);
 	control("change-row:untracked:gamma.txt");
 	click("change-group-toggle:unstaged");
@@ -4636,10 +4446,10 @@ fn native_intellij_menus_shortcuts_and_speed_search() {
 /// row its files grouped by directory, like IntelliJ's "Group By >
 /// Directory". A clean repo is not listed; repo rows and directories start
 /// collapsed and expand per group; a chain of single-child directories is
-/// one row; a directory's checkbox covers every file beneath it; the
-/// header toggle switches to flat lists and back. A file of a repo that is
-/// not the open one previews from its own repo and checks into that repo's
-/// basket entry, and the group checkbox spans every repo.
+/// one row; a directory's Copy covers every file beneath it; the header
+/// toggle switches to flat lists and back. A file of a repo that is not the
+/// open one previews and copies from its own repo, a repo row's Copy covers
+/// that repo's files of the group, and the group's Copy spans every repo.
 #[test]
 fn native_changes_group_all_repos() {
 	changes_group_all_repos("dark");
@@ -4777,7 +4587,7 @@ fn changes_group_all_repos(theme: &str) {
 			std::thread::sleep(Duration::from_millis(40));
 		}
 	};
-	let click = |id: &str| {
+	let press = |id: &str, button: &str| {
 		let v = control(id);
 		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
 		let st = Command::new("xdotool")
@@ -4788,11 +4598,23 @@ fn changes_group_all_repos(theme: &str) {
 				&x.to_string(),
 				&y.to_string(),
 				"click",
-				"1",
+				button,
 			])
 			.status()
 			.unwrap();
 		assert!(st.success());
+	};
+	let click = |id: &str| press(id, "1");
+	// Right-click > Copy on row `id`: the copied entries' paths.
+	let copy_node = |id: &str, files: usize| -> Vec<String> {
+		press(id, "3");
+		wait("[APP:MENU_OPEN: Left items=copy-files");
+		click("menu-item:copy-files");
+		wait(&format!("[APP:COPY_DONE: copied={files}]"));
+		snip_core::format::parse_clipboard(&clip_get(), "")
+			.into_iter()
+			.map(|e| e.path)
+			.collect()
 	};
 
 	// Groups first, each over the repos with files in it, in name order;
@@ -4856,10 +4678,6 @@ fn changes_group_all_repos(theme: &str) {
 		control("change-row:staged:staged.txt"),
 		control("change-row@alpha:staged:staged.txt")
 	);
-	// The file rows sit under their repo row, indented past its checkbox.
-	let repo_chk = control("change-repo-chk:staged:beta");
-	let file_chk = control("change-chk@beta:staged:beta-staged.txt");
-	assert!(file_chk[0] > repo_chk[0], "{file_chk:?} {repo_chk:?}");
 
 	// One click opens a directory; the log carries its file count. `src`
 	// shows the compacted chain and `test`, both collapsed.
@@ -4882,24 +4700,14 @@ fn changes_group_all_repos(theme: &str) {
 	wait("[APP:CHANGE_DIR_COLLAPSED: unstaged beta newdir files=2 collapsed=false]");
 	control("change-row@beta:untracked:newdir/one.txt");
 	control("change-row@beta:untracked:newdir/two.txt");
-	// Chevrons of one level share a column, a child's sits right of its
-	// parent's, and sibling files line up with sibling directories'
-	// checkboxes.
+	// Chevrons of one level share a column, and a child's sits right of
+	// its parent's.
 	let x = |id: &str| control(id)[0];
 	let level2 = x("change-dir-toggle:unstaged:alpha:src");
 	let level3 = x("change-dir-toggle:unstaged:alpha:src/main/java/pkg");
 	assert_eq!(level3, x("change-dir-toggle:unstaged:alpha:src/test"));
 	assert_eq!(level2, x("change-dir-toggle:unstaged:beta:newdir"));
 	assert!(level3 > level2, "{level3} {level2}");
-	assert_eq!(
-		x("change-dir-chk:unstaged:alpha:src"),
-		x("change-chk@alpha:unstaged:shared.txt")
-	);
-	assert_eq!(
-		x("change-dir-chk:unstaged:alpha:src/test"),
-		x("change-chk@alpha:unstaged:src/main/java/pkg/App.java")
-			- (level3 - level2)
-	);
 
 	let out = std::env::var_os("SNIP_E2E_OUT")
 		.map(PathBuf::from)
@@ -4938,44 +4746,29 @@ fn changes_group_all_repos(theme: &str) {
 	);
 	wait("[APP:PREVIEW_LOADED: newdir/one.txt]");
 
-	// Its checkbox fills that repo's basket entry, still as untracked.
-	click("change-chk@beta:untracked:newdir/one.txt");
-	let basket = wait("[APP:BASKET: n=1");
-	assert!(
-		basket
-			.last()
-			.unwrap()
-			.contains("beta untracked newdir/one.txt"),
-		"{basket:?}"
+	// Its Copy reads it from that repo, still as untracked.
+	let paths = copy_node("change-row@beta:untracked:newdir/one.txt", 1);
+	assert_eq!(paths, ["newdir/one.txt"]);
+	assert!(clip_get().contains("one\ntwo\nthree"), "{}", clip_get());
+	// A repo row's Copy covers that repo's files of that group only.
+	let paths = copy_node("change-repo:staged:beta", 1);
+	assert_eq!(paths, ["beta-staged.txt"]);
+	// A directory's Copy covers every file beneath it, collapsed `test`
+	// included, and nothing beside it.
+	let mut paths = copy_node("change-dir:unstaged:alpha:src", 2);
+	paths.sort();
+	assert_eq!(
+		paths,
+		["src/main/java/pkg/App.java", "src/test/AppTest.java"]
 	);
-	// A repo row's checkbox covers that repo's files of that group only.
-	click("change-repo-chk:staged:beta");
-	let basket = wait("[APP:BASKET: n=2");
-	wait("[APP:REPO_CHANGES_TOGGLED: staged beta selected=true]");
-	assert!(!basket.last().unwrap().contains("alpha"), "{basket:?}");
-	// A directory's checkbox covers every file beneath it, collapsed
-	// `test` included, and nothing beside it.
-	click("change-dir-chk:unstaged:alpha:src");
-	let basket = wait("[APP:BASKET: n=4");
-	wait("[APP:DIR_CHANGES_TOGGLED: unstaged alpha src selected=true]");
-	let last = basket.last().unwrap();
-	assert!(
-		last.contains("alpha unstaged src/main/java/pkg/App.java")
-			&& last.contains("alpha unstaged src/test/AppTest.java")
-			&& !last.contains("alpha unstaged shared.txt"),
-		"{basket:?}"
-	);
-	// A group's checkbox spans every repo, untracked files included.
-	click("change-group-chk:unstaged");
-	let basket = wait("[APP:BASKET: n=7");
-	wait("[APP:GROUP_TOGGLED: unstaged selected=true]");
-	let last = basket.last().unwrap();
-	assert!(
-		last.contains("alpha unstaged shared.txt")
-			&& last.contains("beta unstaged shared.txt")
-			&& last.contains("beta untracked newdir/two.txt"),
-		"{basket:?}"
-	);
+	// A group's Copy spans every repo, untracked files included.
+	let paths = copy_node("change-header:unstaged", 6);
+	for want in ["shared.txt", "beta/shared.txt", "newdir/two.txt"] {
+		assert!(
+			paths.iter().any(|p| p.ends_with(want)),
+			"{want} missing: {paths:?}"
+		);
+	}
 
 	// The header toggle lists files flat under each repo, and back.
 	click("btn-changes-group-dir");
@@ -5908,8 +5701,8 @@ fn native_merged_graph_over_four_repositories() {
 }
 
 /// The Project view shows the whole workspace like IntelliJ: a plain
-/// folder beside a repo is listed, its file previews, checks into the
-/// basket and copies as a file-mode payload. The repo keeps its row.
+/// folder beside a repo is listed, its file previews, joins the row
+/// selection and copies as a file-mode payload. The repo keeps its row.
 #[test]
 fn native_project_view_lists_and_copies_non_git_files() {
 	if std::env::var_os("DISPLAY").is_none() {
@@ -6003,7 +5796,10 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	wait_for("[APP:WS_TREE_PAGE: rel=notes", Duration::from_secs(4));
 	// A plain click selects the file alone and previews it.
 	click("ws-tree-row:notes/readme.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	wait_for(
+		"[APP:TREE_SELECTED: notes/readme.txt]",
+		Duration::from_secs(3),
+	);
 	wait_for(
 		"[APP:PREVIEW_LOADED: notes/readme.txt]",
 		Duration::from_secs(4),
@@ -6018,7 +5814,7 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	// A repo file and a workspace file copy together as one payload.
 	std::thread::sleep(Duration::from_millis(200));
 	ctrl_click_at(&wid, control("tree-row:main.rs"));
-	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	wait_for("[APP:TREE_TOGGLED: main.rs]", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
 	let both = clip::read_text().unwrap();
@@ -6163,7 +5959,7 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 	control("tree-row:lib.rs");
 
 	click("ws-tree-row:plain/x.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	wait_for("[APP:TREE_SELECTED: plain/x.txt]", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
 	let copied = clip::read_text().unwrap();
@@ -6171,7 +5967,7 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 	assert!(copied.contains("plain/x.txt"), "{copied}");
 	assert!(!copied.contains("ROOT_BYTES"), "{copied}");
 
-	// Back on the workspace repo, the folder stays open and checked.
+	// Back on the workspace repo, the folder stays open and selected.
 	click("repo-row:INVI_SRC");
 	wait_for("(INVI_SRC) root=", Duration::from_secs(4));
 	wait_for("[APP:TREE_EXPANDED: plain]", Duration::from_secs(4));
@@ -6341,10 +6137,15 @@ fn native_project_view_plain_click_selects_one_row() {
 	);
 	only("", "docs/a.txt,docs/b.txt");
 
-	// After plain clicks in Project, a Changes staged row still previews
-	// its index bytes, and Copy / paste preview work on the whole basket.
+	// After plain clicks in Project, Ctrl+C copies the row selection; a
+	// Changes staged row still previews and copies its index bytes, and
+	// paste preview reads that copy.
 	click("tree-row:src/main/java/TextResource.java");
 	only("src/main/java/TextResource.java", "");
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
+	let copied = clip::read_text().unwrap();
+	assert!(copied.contains("class T {}"), "{copied}");
 	click("rail-changes");
 	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
 	click("change-row:staged:staged.txt");
@@ -6353,23 +6154,20 @@ fn native_project_view_plain_click_selects_one_row() {
 		Duration::from_secs(6),
 	);
 	assert!(preview.contains("path=staged.txt"), "{preview}");
-	click("change-chk:staged:staged.txt");
-	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
-	click("btn-copy");
-	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
+	key(&wid, "ctrl+c");
+	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
 	let copied = clip::read_text().unwrap();
 	assert!(copied.contains("STAGED_BYTES"), "{copied}");
 	assert!(!copied.contains("WORKING_BYTES"), "{copied}");
-	assert!(copied.contains("class T {}"), "{copied}");
 	key(&wid, "ctrl+v");
-	wait_for("[APP:PASTE_PREVIEW: items=2", Duration::from_secs(6));
+	wait_for("[APP:PASTE_PREVIEW: items=1", Duration::from_secs(6));
 	key(&wid, "Escape");
 	wait_for("[APP:PASTE_CANCELLED]", Duration::from_secs(3));
 	quit_cleanly(&mut app, &wid);
 }
 
 /// The Project view has no checkboxes (IntelliJ): Ctrl/Cmd-click gathers
-/// files from different folders, right-click > Copy Files copies them all;
+/// files from different folders, right-click > Copy copies them all;
 /// Shift-click selects a range; a plain click selects one file alone.
 #[test]
 fn native_project_view_multiselect_and_right_click_copy() {
@@ -6485,14 +6283,14 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	click("tree-row:a/one.txt");
 	wait_for("[APP:TREE_SELECTED: a/one.txt]", Duration::from_secs(3));
 	ctrl_click("tree-row:b/two.txt");
-	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	wait_for("[APP:TREE_TOGGLED: b/two.txt]", Duration::from_secs(3));
 	let both = copy_by_menu("tree-row:b/two.txt");
 	assert!(both.contains("ONE_BYTES"), "{both}");
 	assert!(both.contains("TWO_BYTES"), "{both}");
 	assert!(!both.contains("C_BYTES"), "{both}");
 
 	// Right-clicking a row that cannot be selected (a repo folder) keeps
-	// the selection; its menu has Copy Files disabled.
+	// the selection; its menu has Copy disabled.
 	press("tree-row:fake", &[], "3", &[]);
 	wait_for(
 		"[APP:MENU_OPEN: Left items=copy-files",
@@ -6506,7 +6304,7 @@ fn native_project_view_multiselect_and_right_click_copy() {
 
 	// A plain click selects that file alone.
 	click("tree-row:c.txt");
-	wait_for("[APP:BASKET: n=1", Duration::from_secs(3));
+	wait_for("[APP:TREE_SELECTED: c.txt]", Duration::from_secs(3));
 	let alone = copy_by_menu("tree-row:c.txt");
 	assert!(alone.contains("C_BYTES"), "{alone}");
 	assert!(!alone.contains("ONE_BYTES"), "{alone}");
@@ -6515,7 +6313,7 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	click("tree-row:a/one.txt");
 	wait_for("[APP:TREE_SELECTED: a/one.txt]", Duration::from_secs(3));
 	ctrl_click("tree-row:b/two.txt");
-	wait_for("[APP:BASKET: n=2", Duration::from_secs(3));
+	wait_for("[APP:TREE_TOGGLED: b/two.txt]", Duration::from_secs(3));
 	let picked = copy_by_menu("tree-row:b/two.txt");
 	assert!(picked.contains("ONE_BYTES"), "{picked}");
 	assert!(picked.contains("TWO_BYTES"), "{picked}");
@@ -6550,24 +6348,14 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	assert!(folder.contains("MORE_BYTES"), "{folder}");
 	assert!(folder.contains("TWO_BYTES"), "{folder}");
 
-	// A Project-selected file also checked in Changes (Working) is the
-	// same bytes on disk: the toolbar Copy takes it once, not a collision.
+	// A Changes row copies that change alone, whatever the Project
+	// selection holds.
 	click("rail-changes");
 	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
-	click("change-chk:e.txt");
-	wait_for("[APP:BASKET: n=", Duration::from_secs(3));
-	click("rail-project");
-	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
-	click("tree-row:e.txt");
-	wait_for("[APP:TREE_FILE_SELECTED: e.txt]", Duration::from_secs(3));
-	click("btn-copy");
-	// A refusal logs COPY_REFUSED instead of COPY_PREP.
-	let first = wait_for("[APP:COPY_", Duration::from_secs(6));
-	assert!(first.contains("COPY_PREP"), "{first}");
-	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
-	let mixed = clip::read_text().unwrap();
-	assert_eq!(mixed.matches("E_DIRTY").count(), 1, "{mixed}");
-	assert!(!mixed.contains("C_BYTES"), "{mixed}");
+	let change = copy_by_menu("change-row:e.txt");
+	assert_eq!(change.matches("E_DIRTY").count(), 1, "{change}");
+	assert!(!change.contains("C_BYTES"), "{change}");
+	assert!(!change.contains("DEEP_BYTES"), "{change}");
 	quit_cleanly(&mut app, &wid);
 }
 
