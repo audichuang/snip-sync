@@ -226,8 +226,8 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 單 repo（分享根目錄本身即 repo）：直接開啟為該 repo，專案樹即 repo 樹。
   - 非 repo（分享資料夾內無任何 `.git`）：專案樹維持一般檔案瀏覽；Changes 面板顯示「這個資料夾裡沒有 Git 儲存庫」（`changes_no_repository`），Log 面板顯示「這個資料夾裡沒有 Git 儲存庫」（`log_no_repository`），絕不顯示為乾淨或空 log。
 - **「沒讀到不顯示成乾淨」規則**:
-  - Changes 空狀態（`ChangesEmpty`）：依序判定「掃描中（Scanning）→ 讀取中（Loading）→ 讀取失敗（ScanFailed）→ 沒有 repo（NoRepository）→ 無符合（NoMatch）→ 乾淨（Clean）」。任一 repo 讀取失敗時顯示 Note 錯誤列，未完成讀取前絕不顯示為乾淨（`clean_working_copy`）。
-  - Log 空狀態（`LogEmpty`）：依序判定「掃描中（Scanning）→ 讀取中（Loading）→ 沒有 repo（NoRepository）→ 失敗（Failed）→ 空（Empty）」。多 repo 合併 log 中若有部分 repo 讀取失敗，log 上方顯示「N 個儲存庫無法讀取：a、b」提示（`log_failed_feeds`）。
+  - Changes 空狀態（`ChangesEmpty`）：依序判定「掃描中（Scanning）→ 讀取中（Loading）→ 讀取失敗（ScanFailed）→ 沒有 repo（NoRepository）→ 無符合（NoMatch）→ 乾淨（Clean）」。任一 repo 讀取失敗時顯示 Note 錯誤列，未完成讀取前絕不顯示為乾淨（`clean_working_copy`）。多 repo 工作區中沒有變更列的讀取失敗 repo 達 2 個以上時，錯誤列收進清單末端一個「無法讀取的儲存庫 (N)」節點，預設收合（`change-unreadable`）；只有 1 個時錯誤列留在最上方。
+  - Log 空狀態（`LogEmpty`）：依序判定「掃描中（Scanning）→ 讀取中（Loading）→ 沒有 repo（NoRepository）→ 失敗（Failed）→ 空（Empty）」。多 repo 合併 log 中若有部分 repo 讀取失敗，log 上方顯示「N 個儲存庫無法讀取：a, b, …」提示（`log_failed_feeds`），只列前 2 個名稱，完整清單在提示的 tooltip。
 - **圍界規則（boundary）**:
   - worker 端以 `LocalRepo::open_within` 在分享目錄圍界內開啟 repo。
   - 父 repo 阻擋：透過 `GIT_CEILING_DIRECTORIES`（設為分享目錄的父目錄）與 `toplevel == dir` 檢查，禁止向上逃逸到分享外的父 repo；空的 `.git` 目錄視為損毀並列為錯誤列，不向上穿透。

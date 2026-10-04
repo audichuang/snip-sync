@@ -36,6 +36,11 @@ pub enum ChangeItemRow {
 	Note {
 		slot: usize,
 	},
+	/// The node over the read errors of [`UNREADABLE_MIN`] or more repos
+	/// that have no rows; collapsed until opened.
+	Unreadable {
+		count: usize,
+	},
 	File {
 		file_idx: usize,
 		depth: usize,
@@ -51,8 +56,33 @@ impl ChangeItemRow {
 			ChangeItemRow::Dir { depth, .. }
 			| ChangeItemRow::File { depth, .. } => Some(*depth),
 			ChangeItemRow::Note { .. } => None,
+			ChangeItemRow::Unreadable { .. } => Some(0),
 		}
 	}
+}
+
+/// Group id [`change_rows`] asks `group_collapsed` about for the
+/// unreadable-repos node.
+pub(crate) const UNREADABLE: &str = "unreadable";
+
+/// From this many failed repos with no rows, their errors fold into one
+/// node at the bottom; fewer stay at the top, one row each.
+pub(crate) const UNREADABLE_MIN: usize = 2;
+
+/// Repos of a multi-repo workspace whose read failed with nothing listed.
+pub(crate) fn unreadable_slots(
+	slots: &[crate::ChangeRepo],
+	files: &[crate::FileChangeItem],
+) -> Vec<usize> {
+	if slots.len() <= 1 {
+		return Vec::new();
+	}
+	(0..slots.len())
+		.filter(|&s| {
+			matches!(slots[s].state, crate::ChangeRepoState::Failed(_))
+				&& crate::slot_range(files, s).is_empty()
+		})
+		.collect()
 }
 
 /// Left padding of a Changes row at tree level `depth`: each level moves
@@ -113,7 +143,8 @@ pub(crate) struct ChangeLayout<F: Fn(usize, &str, &str) -> bool> {
 /// with the files under them. Several repos invert that: each non-empty
 /// group is a workspace-wide node over one row per repo with files in it
 /// (in repo name order), and the files sit under the repo rows. Clean
-/// repos are not listed; a failed read with no rows gets a top-level note.
+/// repos are not listed; a failed read with no rows gets a top-level note,
+/// or with [`UNREADABLE_MIN`] such repos, a note under one node at the end.
 /// Under each (group, repo) the files are a directory tree or flat, per
 /// `layout`.
 pub(crate) fn change_rows<F: Fn(usize, &str, &str) -> bool>(
@@ -163,10 +194,16 @@ pub(crate) fn change_rows<F: Fn(usize, &str, &str) -> bool>(
 	let shown: Vec<usize> = (0..slots.len())
 		.filter(|&s| slots[s].name.to_lowercase().contains(&query))
 		.collect();
-	for &slot in &shown {
-		if crate::slot_range(files, slot).is_empty() && note(slot) {
-			rows.push(ChangeItemRow::Note { slot });
-		}
+	let unreadable: Vec<usize> = shown
+		.iter()
+		.copied()
+		.filter(|&slot| crate::slot_range(files, slot).is_empty() && note(slot))
+		.collect();
+	let fold = unreadable.len() >= UNREADABLE_MIN;
+	if !fold {
+		rows.extend(
+			unreadable.iter().map(|&slot| ChangeItemRow::Note { slot }),
+		);
 	}
 	for (group_id, label) in crate::menu::WORKSPACE_GROUPS {
 		let total = files
@@ -203,6 +240,18 @@ pub(crate) fn change_rows<F: Fn(usize, &str, &str) -> bool>(
 			}
 			push_change_files(
 				&mut rows, files, members, slot, group_id, 2, layout,
+			);
+		}
+	}
+	if fold {
+		rows.push(ChangeItemRow::Unreadable {
+			count: unreadable.len(),
+		});
+		if !group_collapsed(UNREADABLE) {
+			rows.extend(
+				unreadable
+					.into_iter()
+					.map(|slot| ChangeItemRow::Note { slot }),
 			);
 		}
 	}
@@ -630,6 +679,59 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
+	/// The collapsed node over the read errors of many repos: chevron,
+	/// warning, label and how many repos could not be read.
+	pub(super) fn change_unreadable_row(
+		&self,
+		count: usize,
+		row_idx: usize,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let collapsed = self.group_collapsed(UNREADABLE);
+		let cursor = row_idx == self.selected_list_row;
+		let id = "change-unreadable";
+		let toggle_id = "change-unreadable-toggle";
+		div()
+			.id(id)
+			.relative()
+			.flex()
+			.flex_row()
+			.items_center()
+			.w_full()
+			.h(px(ROW_H))
+			.pl(px(4.))
+			.pr(px(6.))
+			.gap(px(2.))
+			.rounded(px(4.))
+			.cursor_pointer()
+			.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
+			.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
+			.on_click(cx.listener(move |this, _, _, cx| {
+				this.selected_list_row = row_idx;
+				this.toggle_group_collapsed(UNREADABLE, cx);
+			}))
+			.child(
+				tree_chevron(toggle_id.into(), collapsed)
+					.children(probe(&self.probes, toggle_id)),
+			)
+			.child(
+				div()
+					.flex_shrink_0()
+					.ml(px(4.))
+					.child(icon(Icon::Warning, 12.)),
+			)
+			.child(
+				div()
+					.ml(px(6.))
+					.flex_shrink()
+					.text_color(rgb(pal().error))
+					.child(t("changes_unreadable", self.locale)),
+			)
+			.child(tree_count(count))
+			.children(probe(&self.probes, id))
+			.into_any_element()
+	}
+
 	/// A repo's read error or the notice that its list was cut at the cap.
 	pub(super) fn change_note_row(&self, slot: usize) -> AnyElement {
 		let loc = self.locale;
@@ -647,8 +749,12 @@ impl WorkbenchModel {
 			),
 		};
 		// A multi-repo failure with no rows sits at the top level, under no
-		// repo row, so it names its repo.
+		// repo row, so it names its repo; with enough of them, under the
+		// unreadable-repos node.
 		let top = self.change_repos.len() > 1 && kept == 0;
+		let folded = top
+			&& unreadable_slots(&self.change_repos, &self.files).len()
+				>= UNREADABLE_MIN;
 		let text = if top {
 			format!("{}: {text}", repo.name)
 		} else {
@@ -666,7 +772,9 @@ impl WorkbenchModel {
 			.h(px(ROW_H))
 			// Otherwise it lines up with the checkboxes of the rows it
 			// speaks for: a single repo's groups, or a repo row's children.
-			.pl(px(if top {
+			.pl(px(if folded {
+				change_pad(1) + 4.
+			} else if top {
 				8.
 			} else if self.change_repos.len() > 1 {
 				change_pad(2) + 18.

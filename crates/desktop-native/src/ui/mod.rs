@@ -56,7 +56,7 @@ mod remote;
 
 use changes::*;
 pub(crate) use changes::{
-	change_rows, commit_file_rows, ChangeItemRow, ChangeLayout,
+	change_rows, commit_file_rows, ChangeItemRow, ChangeLayout, UNREADABLE,
 };
 pub use log::LogMenu;
 use log::*;
@@ -954,7 +954,8 @@ impl WorkbenchModel {
 						.get(slot)
 						.map(|s| s.name.clone())
 						.unwrap_or_default(),
-					ChangeItemRow::Note { .. } => String::new(),
+					ChangeItemRow::Note { .. }
+					| ChangeItemRow::Unreadable { .. } => String::new(),
 					ChangeItemRow::Header { label, .. } => {
 						t(label, self.locale).to_string()
 					}
@@ -1130,6 +1131,19 @@ impl WorkbenchModel {
 					}
 				}
 				(ChangeItemRow::Note { .. }, _) => {}
+				(ChangeItemRow::Unreadable { .. }, _) => {
+					let collapsed = self.group_collapsed(UNREADABLE);
+					match action {
+						"open" => self.toggle_group_collapsed(UNREADABLE, cx),
+						"expand" if collapsed => {
+							self.toggle_group_collapsed(UNREADABLE, cx)
+						}
+						"collapse" if !collapsed => {
+							self.toggle_group_collapsed(UNREADABLE, cx)
+						}
+						_ => {}
+					}
+				}
 				(ChangeItemRow::Header { group_id, .. }, _) => {
 					let group = *group_id;
 					let collapsed = self.group_collapsed(group);
