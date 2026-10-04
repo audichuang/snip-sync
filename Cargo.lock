@@ -5393,7 +5393,7 @@ checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 
 [[package]]
 name = "snip-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "serde",
@@ -5405,10 +5405,11 @@ dependencies = [
 
 [[package]]
 name = "snip-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arboard",
  "dunce",
+ "libc",
  "nix 0.27.1",
  "process-wrap",
  "regex",
@@ -5422,7 +5423,7 @@ dependencies = [
 
 [[package]]
 name = "snip-desktop-native"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arboard",
  "chrono",
@@ -5439,7 +5440,7 @@ dependencies = [
 
 [[package]]
 name = "snip-native-e2e"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "snip-core",
  "tempfile",
@@ -5447,7 +5448,7 @@ dependencies = [
 
 [[package]]
 name = "snip-remote"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dunce",
  "hmac",
@@ -5458,6 +5459,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snip-core",
+ "socket2",
  "tempfile",
  "thiserror 2.0.20",
 ]

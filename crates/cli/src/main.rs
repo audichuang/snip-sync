@@ -122,6 +122,9 @@ enum Command {
 		/// Address to listen on, e.g. the machine's Tailscale IP.
 		#[arg(long, value_name = "ADDR:PORT", default_value = snip_remote::DEFAULT_LISTEN)]
 		listen: std::net::SocketAddr,
+		/// Test knob, pretend to be an older worker.
+		#[arg(long, hide = true, value_name = "N")]
+		max_protocol: Option<u32>,
 	},
 	/// Operate a paired worker's shared folders (remote-node master).
 	#[command(subcommand)]
@@ -201,12 +204,17 @@ fn main() -> ExitCode {
 			paste(&repo, &settings, &opts, stdin)
 		}
 		Command::Remote(cmd) => remote::run(cmd),
-		Command::Worker { shares, listen } => {
+		Command::Worker {
+			shares,
+			listen,
+			max_protocol,
+		} => {
 			let config = snip_remote::default_config_dir();
 			match snip_remote::run_headless_worker(
 				listen,
 				&shares,
 				config.as_deref(),
+				max_protocol,
 			) {
 				Ok(never) => match never {},
 				Err(err) => Err(format!("cannot start the worker: {err}")),

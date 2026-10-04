@@ -14,9 +14,11 @@ use gpui::{
 	TextRun, UniformListScrollHandle, Window,
 };
 
-use snip_core::gitrun::{CancelToken, Overflow, RunOptions};
-use snip_core::gitsrc::{Git, GitSource};
+use snip_core::gitrun::CancelToken;
+use snip_core::gitsrc::GitSource;
+use snip_core::gitview::{Read, ReadProfile};
 
+use crate::githost::GitHost;
 use crate::i18n::{t, tf};
 use crate::syntax::{highlight_line, Language, SyntaxTheme};
 use crate::theme::*;
@@ -1335,6 +1337,7 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 		let job_cancel = cancel.clone();
+		let host = self.git_host();
 		self.spawn_owned(
 			cx,
 			crate::lifecycle::JobKind::CancellableRead,
@@ -1342,7 +1345,7 @@ impl WorkbenchModel {
 			async move {
 				let result = bg
 					.spawn(async move {
-						read_new_side(&root, &source, &path, cancel)
+						read_new_side(&host, &root, &source, &path, cancel)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2218,28 +2221,20 @@ impl WorkbenchModel {
 
 /// The new-side file a diff was made from (bounded by the preview cap).
 fn read_new_side(
+	host: &GitHost,
 	root: &std::path::Path,
 	source: &GitSource,
 	path: &str,
 	cancel: CancelToken,
 ) -> Result<String, String> {
-	let opts = RunOptions {
+	let read = Read {
+		profile: ReadProfile::InteractivePreview,
 		cancel: Some(cancel),
-		max_stdout: MAX_PREVIEW_BYTES,
-		overflow: Overflow::Error,
-		..RunOptions::interactive(None)
 	};
-	let git = Git::open_with(root, &opts).map_err(|e| e.to_string())?;
-	snip_core::gitsrc::read_changed_file_with(
-		&git,
-		source,
-		path,
-		MAX_PREVIEW_BYTES as u64,
-		&opts,
-	)
-	.map_err(|e| e.to_string())?
-	.and_then(|f| f.content)
-	.ok_or_else(|| "no new-side text".to_string())
+	host.open(root, None, &read)?
+		.changed_file_text(source, path, MAX_PREVIEW_BYTES as u64, &read)
+		.map_err(|e| e.to_string())?
+		.ok_or_else(|| "no new-side text".to_string())
 }
 
 /// Space between the line-number gutter and the code.

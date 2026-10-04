@@ -29,6 +29,7 @@ pub(crate) enum SelectorCandidate<'a> {
 	Repo {
 		index: usize,
 		repos: &'a [crate::RepoEntry],
+		session: Option<&'a crate::remote::RemoteSession>,
 		locale: crate::i18n::Locale,
 	},
 	Ref {
@@ -75,6 +76,7 @@ impl SelectorCandidate<'_> {
 			Self::Repo {
 				index,
 				repos,
+				session,
 				locale,
 			} => {
 				let r = &repos[index];
@@ -111,7 +113,10 @@ impl SelectorCandidate<'_> {
 					},
 					label: r.name.clone(),
 					detail: if duplicate {
-						format!("{detail}\n{}", r.root.display())
+						format!(
+							"{detail}\n{}",
+							crate::remote::display_path(session, &r.root)
+						)
 					} else {
 						detail
 					},
@@ -140,6 +145,7 @@ impl SelectorCandidate<'_> {
 fn candidates<'a>(
 	popover: Option<Popover>,
 	repos: &'a [crate::RepoEntry],
+	session: Option<&'a crate::remote::RemoteSession>,
 	refs: &'a [snip_core::browser::GitReference],
 	has_head: bool,
 	locale: crate::i18n::Locale,
@@ -160,6 +166,7 @@ fn candidates<'a>(
 		(0..repos.len()).map(move |index| SelectorCandidate::Repo {
 			index,
 			repos,
+			session,
 			locale,
 		});
 	let special_refs = [
@@ -225,6 +232,7 @@ impl WorkbenchModel {
 		candidates(
 			self.popover,
 			&self.repos,
+			self.remote.session.as_ref(),
 			&self.refs,
 			// The merged log's HEAD filter picks every repository's HEAD.
 			self.head_sha.is_some() || self.log_is_merged(),
@@ -349,8 +357,17 @@ mod tests {
 			.map(|i| reference(&format!("refs/heads/branch-{i:04}")))
 			.collect();
 		refs.push(reference("refs/heads/Feature/計畫"));
-		let rows =
-			|| candidates(Some(Popover::Ref), &[], &refs, true, Locale::En, "");
+		let rows = || {
+			candidates(
+				Some(Popover::Ref),
+				&[],
+				None,
+				&refs,
+				true,
+				Locale::En,
+				"",
+			)
+		};
 		MATERIALIZED_ITEMS.with(|count| count.set(0));
 		assert_eq!(rows().count(), 5_003);
 		assert_eq!(
@@ -391,8 +408,17 @@ mod tests {
 			reference("refs/heads/Alpha計畫"),
 			reference("refs/notes/private"),
 		];
-		let rows =
-			|| candidates(Some(Popover::Ref), &[], &refs, true, Locale::En, "");
+		let rows = || {
+			candidates(
+				Some(Popover::Ref),
+				&[],
+				None,
+				&refs,
+				true,
+				Locale::En,
+				"",
+			)
+		};
 		let items: Vec<_> = items_for_range(rows(), 0..10)
 			.map(|(_, item)| item)
 			.collect();
@@ -425,6 +451,7 @@ mod tests {
 		let filtered: Vec<_> = candidates(
 			Some(Popover::Ref),
 			&[],
+			None,
 			&refs,
 			false,
 			Locale::ZhTw,
@@ -440,6 +467,7 @@ mod tests {
 			candidates(
 				Some(Popover::Ref),
 				&[],
+				None,
 				&refs,
 				false,
 				Locale::En,
@@ -449,7 +477,7 @@ mod tests {
 			0
 		);
 		assert_eq!(
-			candidates(None, &[], &refs, true, Locale::En, "").count(),
+			candidates(None, &[], None, &refs, true, Locale::En, "").count(),
 			0
 		);
 	}
@@ -472,6 +500,7 @@ mod tests {
 			candidates(
 				Some(Popover::Repo),
 				&repos,
+				None,
 				&[],
 				false,
 				Locale::En,
@@ -512,6 +541,7 @@ mod tests {
 			candidates(
 				Some(Popover::Repo),
 				&repos,
+				None,
 				&[],
 				false,
 				Locale::En,

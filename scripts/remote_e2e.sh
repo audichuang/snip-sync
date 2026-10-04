@@ -138,6 +138,50 @@ for i in \$(seq 1 60); do
 done
 printf '\357\273\277BOM first\n' > text/bom.txt
 head -c 200000 /dev/zero | tr '\000' 'y' > text/long-line.txt
+# Git fixtures for git views
+echo TOPSECRET > git-secret.txt
+G="git -c user.name=t -c user.email=t@t"
+g_init() {
+	\$G init -b main "\$1" 2>/dev/null || { \$G init "\$1" && (cd "\$1" && \$G checkout -B main 2>/dev/null || true); }
+}
+mkdir -p gitws/plain gitws/broken/.git outer/inner
+echo plain > gitws/plain/file.txt
+
+g_init gitws/alpha
+printf 'commit 1 a\n' > gitws/alpha/a.txt
+(cd gitws/alpha && \$G add a.txt && \$G commit -q -m "first commit")
+printf 'commit 2 a\n' > gitws/alpha/a.txt
+printf 'commit 2 b\n' > gitws/alpha/b.txt
+(cd gitws/alpha && \$G add a.txt b.txt && \$G commit -q -m "second commit")
+printf 'commit 2 a modified\n' > gitws/alpha/a.txt
+printf 'new file content\n' > gitws/alpha/new.txt
+printf 'staged file content\n' > gitws/alpha/staged.txt
+(cd gitws/alpha && \$G add staged.txt)
+ln -s "\$PWD/git-secret.txt" gitws/alpha/link-to-secret 2>/dev/null || true
+
+g_init gitws/beta
+printf 'beta content\n' > gitws/beta/b.txt
+(cd gitws/beta && \$G add b.txt && \$G commit -q -m "beta commit")
+
+g_init outside-repo
+printf 'outside\n' > outside-repo/outside.txt
+(cd outside-repo && \$G add outside.txt && \$G commit -q -m "outside commit")
+(cd outside-repo && \$G worktree add -b wt ../gitws/wt)
+
+\$G clone --shared outside-repo gitws/borrowed
+
+g_init gitws/mainwt
+printf 'mainwt tracked\n' > gitws/mainwt/tracked.txt
+(cd gitws/mainwt && \$G add tracked.txt && \$G commit -q -m "mainwt commit")
+printf 'mainwt tracked modified\n' > gitws/mainwt/tracked.txt
+printf 'mainwt untracked\n' > gitws/mainwt/untracked.txt
+(cd gitws/mainwt && \$G worktree add -b mainwt-branch ../../outside-mainwt-wt)
+
+g_init outer
+printf 'outer committed\n' > outer/committed.txt
+(cd outer && \$G add committed.txt && \$G commit -q -m "outer commit")
+printf 'outer dirty\n' > outer/outer-dirty.txt
+printf 'inner file\n' > outer/inner/file.txt
 EOF
 
 start_worker() { # config folder name; prints the worker log
@@ -146,7 +190,7 @@ start_worker() { # config folder name; prints the worker log
 		w <<EOF
 cd '$WD'
 [ -f worker.pid ] && kill \$(cat worker.pid) 2>/dev/null && sleep 1
-shares="--share '$WD/edge' --share '$WD/text'"
+shares="--share '$WD/edge' --share '$WD/text' --share '$WD/gitws' --share '$WD/outer/inner'"
 [ -n '$SRC' ] && shares="\$shares --share '$SRC'"
 eval "SNIP_CONFIG_DIR='$WD/$1' nohup '$RSNIP' worker \$shares --listen '$LISTEN' > worker.log 2>&1 &"
 echo \$! > worker.pid
@@ -191,8 +235,8 @@ w_after=$("$SNIP" remote workers)
 check "forgetting another pairing leaves ours" test "$(grep -c . <<<"$w_after")" = 1 -a "$(head -1 <<<"$w_after" | grep -c "^1	")" = 1
 check "listed as worker 1" bash -c "'$SNIP' remote workers | grep -q '^1	'"
 spaces=$("$SNIP" remote workspaces 1)
-expect=2
-[ -n "$SRC" ] && expect=3
+expect=4
+[ -n "$SRC" ] && expect=5
 check "$expect shared workspaces" test "$(grep -c . <<<"$spaces")" = "$expect"
 srcname=$(basename "$SRC")
 
@@ -276,6 +320,121 @@ err=$(SNIP_CONFIG_DIR=$other "$SNIP" remote workspaces 1 2>&1)
 check "a copied pairing record lets no other device in" grep -q "no longer trusts" <<<"$err"
 err=$(SNIP_CONFIG_DIR=$other "$SNIP" remote pair "$ADDR" "$code" 2>&1)
 check "a used code pairs nobody else" grep -q "pairing failed" <<<"$err"
+
+echo "== git views"
+w <<<"sleep 1 && touch '$WD/gitws/alpha/b.txt'"
+alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
+
+repos_gitws=$("$SNIP" remote repos 1 gitws)
+check "repos 1 gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
+check "wt, broken, borrowed appear as error rows" test "$(grep -c '^wt	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1 -a "$(grep -c '^borrowed	error: ' <<<"$repos_gitws")" = 1
+check "no error row contains the outside path" test "$(grep -c "outside-repo" <<<"$repos_gitws")" = 0
+
+changes_mainwt=$("$SNIP" remote changes 1 gitws mainwt)
+log_mainwt=$("$SNIP" remote log 1 gitws mainwt)
+all_mainwt="$repos_gitws
+$changes_mainwt
+$log_mainwt"
+check "main repo with a worktree outside the share is served" test "$(grep -c '^mainwt	' <<<"$repos_gitws")" = 1 \
+	-a "$(grep '^mainwt	' <<<"$repos_gitws" | grep -c 'error:')" = 0 \
+	-a "$(grep -c '	tracked.txt$' <<<"$changes_mainwt")" -ge 1 \
+	-a "$(grep -c 'untracked.txt' <<<"$changes_mainwt")" -ge 1 \
+	-a "$(grep -c 'mainwt commit' <<<"$log_mainwt")" -ge 1 \
+	-a "$(grep -c 'outside-mainwt-wt' <<<"$all_mainwt")" = 0
+
+alpha_line=$(grep '^alpha	' <<<"$repos_gitws")
+alpha_counts=$(cut -f3,4,5 <<<"$alpha_line")
+oracle_counts=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' status --porcelain=v2" | awk '/^1/ || /^2/ { if (substr($2, 1, 1) != ".") staged++; if (substr($2, 2, 1) != ".") unstaged++; } /^\?/ { untracked++ } END { printf "%d\t%d\t%d\n", staged+0, unstaged+0, untracked+0 }')
+check "alpha status counts match oracle ($alpha_counts)" test "$alpha_counts" = "$oracle_counts" -a -n "$alpha_counts"
+
+changes_alpha=$("$SNIP" remote changes 1 gitws alpha)
+changes_paths=$(cut -f3 <<<"$changes_alpha" | LC_ALL=C sort)
+oracle_changes_paths=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' status --porcelain=v2 --untracked-files=all" | awk '/^1/ || /^2/ { print $9 } /^\?/ { print $2 }' | LC_ALL=C sort)
+check "changes alpha path set == oracle path set" test "$changes_paths" = "$oracle_changes_paths" -a -n "$changes_paths"
+
+changes_beta=$("$SNIP" remote changes 1 gitws beta 2>&1)
+rc=$?
+check "changes beta prints nothing and exits 0" test "$rc" = 0 -a -z "$changes_beta"
+
+repos_inner_out=$("$SNIP" remote repos 1 inner)
+repos_inner_all=$("$SNIP" remote repos 1 inner 2>&1)
+rc=$?
+check "repos inner prints no repo rows and does not contain outer-dirty" test "$rc" = 0 -a -z "$repos_inner_out" -a "$(grep -c outer-dirty <<<"$repos_inner_all")" = 0 -a "$(grep -c 'no Git repository in' <<<"$repos_inner_all")" -ge 1
+refused "changes inner exits 1" "" changes 1 inner
+
+log_alpha=$("$SNIP" remote log 1 gitws alpha -n 50)
+log_shas=$(cut -f1 <<<"$log_alpha" | LC_ALL=C sort)
+oracle_rev_shas=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' rev-list --all" | LC_ALL=C sort)
+check "log alpha sha set == git rev-list --all" test "$log_shas" = "$oracle_rev_shas" -a -n "$log_shas"
+
+alpha_head=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' rev-parse HEAD")
+show_alpha=$("$SNIP" remote show 1 gitws alpha "$alpha_head")
+show_paths=$(cut -f2 <<<"$show_alpha" | LC_ALL=C sort)
+oracle_diff_paths=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$WD/gitws/alpha' diff-tree --no-commit-id --name-only -r HEAD" | LC_ALL=C sort)
+check "show alpha HEAD path set == diff-tree path set" test "$show_paths" = "$oracle_diff_paths" -a -n "$show_paths"
+
+diff_a=$("$SNIP" remote diff 1 gitws alpha a.txt)
+check "diff alpha a.txt contains changed line" grep -q "commit 2 a modified" <<<"$diff_a"
+diff_staged=$("$SNIP" remote diff 1 gitws alpha staged.txt --staged)
+check "diff alpha staged.txt --staged contains staged content" grep -q "staged file content" <<<"$diff_staged"
+
+refused "diff ../../secret.txt" "" diff 1 gitws alpha ../../secret.txt
+if w <<<"[ -L '$WD/gitws/alpha/link-to-secret' ]"; then
+	link_out=$("$SNIP" remote diff 1 gitws alpha link-to-secret 2>&1)
+	rc=$?
+	if [ "$rc" = 1 ] && ! grep -q "TOPSECRET" <<<"$link_out"; then
+		ok "diff link-to-secret  ($link_out)"
+	else
+		bad "diff link-to-secret  rc=$rc out=$link_out"
+	fi
+else
+	skip "diff link-to-secret" "no symlinks on the worker"
+fi
+show_pwned_out=$("$SNIP" remote show 1 gitws alpha -- "--output=$WD/pwned" 2>&1)
+rc=$?
+if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/pwned'"; then
+	ok "show --output refused without creating file  ($show_pwned_out)"
+else
+	bad "show --output  rc=$rc out=$show_pwned_out"
+fi
+refused "show invalid revision ':/x'" "" show 1 gitws alpha ':/x'
+
+wt_err=$("$SNIP" remote changes 1 gitws wt 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" = 1 ] && grep -iq "outside" <<<"$wt_err"; then
+	ok "changes on linked worktree refused  ($wt_err)"
+else
+	bad "changes on linked worktree  rc=$rc err=$wt_err"
+fi
+
+# A diff that covers the stat-dirty b.txt is what makes git refresh an index it may write.
+"$SNIP" remote diff 1 gitws alpha b.txt >/dev/null 2>&1 || true
+alpha_index_after=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
+check "alpha .git/index sha256 unchanged" test "$alpha_index_after" = "$alpha_index_before" -a -n "$alpha_index_after"
+check "alpha .git/index.lock does not exist" w <<<"test ! -e '$WD/gitws/alpha/.git/index.lock'"
+
+if [ -n "$SRC" ]; then
+	if w <<<"test -d '$SRC/.git'"; then
+		src_log=$("$SNIP" remote log 1 "$srcname" -n 3)
+		src_log_shas=$(cut -f1 <<<"$src_log")
+		oracle_revs=$(w <<<"GIT_OPTIONAL_LOCKS=0 git --no-optional-locks -C '$SRC' rev-list --all")
+		all_found=true
+		while IFS= read -r sha; do
+			[ -n "$sha" ] || continue
+			if ! grep -q "^$sha" <<<"$oracle_revs"; then
+				all_found=false
+				break
+			fi
+		done <<<"$src_log_shas"
+		check "log $srcname -n 3 shas contained in rev-list --all" test "$all_found" = true -a -n "$src_log_shas"
+	elif w <<<"test -f '$SRC/.git'"; then
+		src_repos=$("$SNIP" remote repos 1 "$srcname" 2>&1)
+		check "repos $srcname reports an error row for linked worktree" grep -q "error: " <<<"$src_repos"
+	else
+		src_repos=$("$SNIP" remote repos 1 "$srcname" 2>&1)
+		check "repos $srcname reports no Git repository for archive" grep -q "no Git repository in" <<<"$src_repos"
+	fi
+fi
 
 echo "== restart"
 log=$(start_worker wcfg) || bad "the worker restarts"

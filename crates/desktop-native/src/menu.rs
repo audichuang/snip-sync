@@ -293,6 +293,15 @@ impl WorkbenchModel {
 
 	pub(crate) fn repo_row_menu(&self, idx: usize) -> Vec<MenuEntry> {
 		let root = self.repos.get(idx).map(|r| r.root.clone());
+		if self.remote.session.is_some() {
+			let path = root.as_deref().and_then(|r| self.remote_worker_path(r));
+			return vec![item(
+				"copy-path",
+				"menu_copy_path",
+				None,
+				path.map(MenuAct::CopyText),
+			)];
+		}
 		vec![
 			item(
 				"copy-path",
@@ -353,14 +362,12 @@ impl WorkbenchModel {
 			),
 			MenuEntry::Sep,
 		];
-		if let Some(session) = &self.remote.session {
-			// The worker's own path, never revealed on this machine.
-			let abs = format!(
-				"{}/{}",
-				session.workspace.path,
-				row.rel_path.trim_end_matches('/')
-			);
-			v.extend(copy_entries(Some(abs), &row.rel_path));
+		if self.remote.session.is_some() {
+			let root = if ws { self.ws_root() } else { self.repo_root() };
+			let abs = root.map(|r| r.join(row.rel_path.trim_end_matches('/')));
+			let worker_path =
+				abs.as_deref().and_then(|p| self.remote_worker_path(p));
+			v.extend(copy_entries(worker_path, &row.rel_path));
 		} else if ws {
 			let abs = self
 				.ws_root()
@@ -429,11 +436,17 @@ impl WorkbenchModel {
 		let abs = self
 			.change_root(idx)
 			.map(|r| r.join(path.trim_end_matches('/')));
-		v.extend(copy_entries(
-			abs.as_ref().map(|p| p.display().to_string()),
-			&path,
-		));
-		v.push(reveal_entry(abs));
+		if self.remote.session.is_some() {
+			let worker_path =
+				abs.as_deref().and_then(|p| self.remote_worker_path(p));
+			v.extend(copy_entries(worker_path, &path));
+		} else {
+			v.extend(copy_entries(
+				abs.as_ref().map(|p| p.display().to_string()),
+				&path,
+			));
+			v.push(reveal_entry(abs));
+		}
 		v
 	}
 
@@ -454,6 +467,19 @@ impl WorkbenchModel {
 	) -> Vec<MenuEntry> {
 		let all = self.repo_state(slot, group) == Some(true);
 		let root = self.change_repos.get(slot).map(|s| s.root.clone());
+		if self.remote.session.is_some() {
+			let path = root.as_deref().and_then(|r| self.remote_worker_path(r));
+			return vec![
+				basket_entry(all, Some(MenuAct::RepoToggle(slot, group))),
+				MenuEntry::Sep,
+				item(
+					"copy-path",
+					"menu_copy_path",
+					None,
+					path.map(MenuAct::CopyText),
+				),
+			];
+		}
 		vec![
 			basket_entry(all, Some(MenuAct::RepoToggle(slot, group))),
 			MenuEntry::Sep,
@@ -604,10 +630,12 @@ impl WorkbenchModel {
 			}
 		}
 		v.push(MenuEntry::Sep);
-		v.extend(copy_entries(
-			rev.map(|(root, _)| root.join(path).display().to_string()),
-			path,
-		));
+		let abs = if self.remote.session.is_some() {
+			rev.and_then(|(root, _)| self.remote_worker_path(&root.join(path)))
+		} else {
+			rev.map(|(root, _)| root.join(path).display().to_string())
+		};
+		v.extend(copy_entries(abs, path));
 		v
 	}
 
@@ -767,7 +795,7 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn run_menu_act(
+	pub(crate) fn run_menu_act(
 		&mut self,
 		act: MenuAct,
 		window: &mut Window,
@@ -808,6 +836,10 @@ impl WorkbenchModel {
 			MenuAct::CopyCommits(_) => self.copy_commits_to_clipboard(cx),
 			MenuAct::CopyProjectSelection => self.copy_project_selection(cx),
 			MenuAct::CopyRevFiles(files) => {
+				if self.remote_blocks() {
+					cx.notify();
+					return;
+				}
 				let name = files
 					.first()
 					.map(|(root, ..)| self.log_repo_name(root))
@@ -842,12 +874,15 @@ impl WorkbenchModel {
 			}
 			MenuAct::Select(sha) => self.log_select_row(&sha, cx),
 			MenuAct::Reveal(path) => {
-				let result = reveal_command(TargetOs::current(), &path)
-					.and_then(|(prog, args)| spawn_detached(&prog, &args));
-				match result {
-					Ok(()) => app_log!("[APP:REVEAL: {}]", path.display()),
-					Err(e) => {
-						self.set_status("status_reveal_failed", [e.to_string()])
+				if !self.remote_blocks() {
+					let result = reveal_command(TargetOs::current(), &path)
+						.and_then(|(prog, args)| spawn_detached(&prog, &args));
+					match result {
+						Ok(()) => app_log!("[APP:REVEAL: {}]", path.display()),
+						Err(e) => self.set_status(
+							"status_reveal_failed",
+							[e.to_string()],
+						),
 					}
 				}
 			}
@@ -894,6 +929,9 @@ impl WorkbenchModel {
 		&mut self,
 		pred: impl Fn(&crate::FileChangeItem) -> bool,
 	) -> Option<bool> {
+		if self.remote_blocks() {
+			return None;
+		}
 		let pred = |f: &crate::FileChangeItem| {
 			pred(f) && f.is_valid_utf8() && self.change_slot_loaded(f.repo)
 		};

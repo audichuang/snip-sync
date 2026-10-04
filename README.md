@@ -55,9 +55,9 @@ xattr -cr /Applications/snip-sync.app
 - 完全雙向，支援 macOS、Windows、Linux。可以打開單一 repo，也可以打開內含多個 repo 的資料夾。
 - 不處理傳輸通道、不做分段與雜湊、不偵測衝突、不保留 commit hash、不做自動更新。
 
-## 遠端節點(master／worker,第一刀)
+## 遠端節點(master／worker)
 
-讓 Mac 上的桌面 App(master)透過 Tailscale,瀏覽與預覽另一台機器(worker,例如沒接螢幕的 Windows)上的檔案。worker 只要裝 CLI `snip`。目前只能瀏覽與預覽，寫入、rename、stage、git 還沒做。規格見 [spec 第 8 節](docs/spec.md)。
+讓 Mac 上的桌面 App(master)透過 Tailscale,瀏覽與預覽另一台機器(worker,例如沒接螢幕的 Windows)上的檔案。worker 只要裝 CLI `snip`。目前支援瀏覽、預覽與唯讀 Git 檢視。規格見 [spec 第 8 節](docs/spec.md)。
 
 ### 兩機 smoke test
 
@@ -76,7 +76,7 @@ xattr -cr /Applications/snip-sync.app
    - 預期:左上角顯示 `<worker> ▸ proj`,專案樹列出 worker 上的檔案。展開資料夾、點檔案,右側出現預覽。
    - 二進位檔顯示無法預覽;超過 1 MiB 的檔案顯示錯誤。
 4. 在遠端工作區按貼上或複製。
-   - 預期:狀態列顯示「遠端工作區目前只支援瀏覽與預覽」。
+   - 預期:狀態列顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」。
 5. 把 worker 停掉(Ctrl+C)後重新執行,印出的指紋應該不變。重開 master 的選單點 worker。
    - 預期:不必重新配對,仍能列出工作區。
 6. 安全性檢查:
@@ -104,6 +104,11 @@ snip remote workspaces 1                     # worker 用編號、名稱或位�
 snip remote ls   1 proj [src]                # 工作區用名稱或 id 指定
 snip remote stat 1 proj src/main.rs
 snip remote cat  1 proj src/main.rs          # 二進位、非 UTF-8、超過 1 MiB 都會拒絕
+snip remote repos    1 proj                  # 探索 Git 儲存庫與狀態概覽
+snip remote changes  1 proj [repo]           # 檢視變更清單（S/U/W/C 來源與異動類別）
+snip remote log      1 proj [repo] [-n 50]   # commit 歷史（sha、日期、標題）
+snip remote show     1 proj [repo] <sha>     # commit 變更路徑清單
+snip remote diff     1 proj [repo] <path> [--staged | --commit <sha>] # 預覽 patch / 內容
 snip remote forget 1
 ```
 

@@ -18,6 +18,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 ring = "0.17"
 # One self-signed device certificate per install, pinned by fingerprint.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 tempfile = "3"

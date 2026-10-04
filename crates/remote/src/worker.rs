@@ -17,7 +17,7 @@ use snip_core::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
 
 use crate::proto::{
 	read_frame, write_frame, DirEntry, EntryKind, ErrorCode, RemoteWorkspace,
-	Request, Response, Stat, MAX_DIR_ENTRIES, PROTOCOL_VERSION,
+	Request, Response, Stat, MAX_DIR_ENTRIES, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::tls::{normalize_code, pairing_proof, server_config, Fingerprint};
 use crate::{Identity, RemoteError};
@@ -83,6 +83,8 @@ pub struct WorkerOptions {
 	pub name: String,
 	/// Where trusted masters are kept; `None` keeps them in memory only.
 	pub trust_file: Option<PathBuf>,
+	/// Highest protocol version this worker will negotiate.
+	pub max_protocol: Option<u32>,
 }
 
 struct PairingWindow {
@@ -96,12 +98,27 @@ struct State {
 	fingerprint: Fingerprint,
 	tls: Arc<ServerConfig>,
 	trust_file: Option<PathBuf>,
+	max_protocol: Option<u32>,
+	git_requests: AtomicUsize,
+	deadlines: Mutex<(Duration, Duration)>,
+	jobs: crate::jobs::Jobs,
+	repo_cache: Mutex<crate::gitserve::RepoCache>,
 	trusted: Mutex<Vec<TrustedMaster>>,
 	pairing: Mutex<Option<PairingWindow>>,
 	roots: RwLock<Vec<SharedRoot>>,
-	connections: AtomicUsize,
+	connections: Arc<AtomicUsize>,
 	waiting: AtomicUsize,
 	stop: AtomicBool,
+	#[cfg(test)]
+	set_roots_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+pub(crate) struct ConnSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnSlot {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::SeqCst);
+	}
 }
 
 pub struct Worker {
@@ -132,12 +149,22 @@ impl Worker {
 			fingerprint: identity.fingerprint(),
 			tls: server_config(identity)?,
 			trust_file: opts.trust_file,
+			max_protocol: opts.max_protocol,
+			git_requests: AtomicUsize::new(0),
+			deadlines: Mutex::new((
+				crate::jobs::VIEW_DEADLINE,
+				crate::jobs::SCAN_DEADLINE,
+			)),
+			jobs: crate::jobs::Jobs::new(),
+			repo_cache: Mutex::new(crate::gitserve::RepoCache::new()),
 			trusted: Mutex::new(trusted),
 			pairing: Mutex::new(None),
 			roots: RwLock::new(Vec::new()),
-			connections: AtomicUsize::new(0),
+			connections: Arc::new(AtomicUsize::new(0)),
 			waiting: AtomicUsize::new(0),
 			stop: AtomicBool::new(false),
+			#[cfg(test)]
+			set_roots_hook: Mutex::new(None),
 		});
 		let accept_state = state.clone();
 		let accept = std::thread::Builder::new()
@@ -156,6 +183,11 @@ impl Worker {
 
 	pub fn fingerprint(&self) -> Fingerprint {
 		self.state.fingerprint
+	}
+
+	/// Counts GitView/ScanRepos requests received, for tests and diagnostics.
+	pub fn git_requests_seen(&self) -> usize {
+		self.state.git_requests.load(Ordering::SeqCst)
 	}
 
 	/// Opens a one-time pairing code, replacing any open one.
@@ -192,11 +224,33 @@ impl Worker {
 				Err(err) => errors.push((path.clone(), err)),
 			}
 		}
-		*self
-			.state
-			.roots
-			.write()
-			.unwrap_or_else(PoisonError::into_inner) = roots;
+		let new_ids: std::collections::HashSet<String> =
+			roots.iter().map(|r| r.id.clone()).collect();
+		let old_roots = {
+			let mut lock = self
+				.state
+				.roots
+				.write()
+				.unwrap_or_else(PoisonError::into_inner);
+			std::mem::replace(&mut *lock, roots)
+		};
+		let old_ids: Vec<String> =
+			old_roots.into_iter().map(|r| r.id).collect();
+		let removed: Vec<String> = old_ids
+			.into_iter()
+			.filter(|id| !new_ids.contains(id))
+			.collect();
+		// Swapping roots first ensures that jobs admitted after the swap fail
+		// get_shared_root; jobs admitted before are already in by_workspace and
+		// get cancelled here before repo_cache is cleared.
+		#[cfg(test)]
+		if let Some(hook) = lock(&self.state.set_roots_hook).as_ref() {
+			hook();
+		}
+		if !removed.is_empty() {
+			self.state.jobs.cancel_workspaces(&removed);
+		}
+		lock(&self.state.repo_cache).clear();
 		errors
 	}
 
@@ -216,9 +270,25 @@ impl Worker {
 		self.state.connections.load(Ordering::SeqCst)
 	}
 
+	#[doc(hidden)]
+	pub fn set_deadlines_for_tests(&self, view: Duration, scan: Duration) {
+		*lock(&self.state.deadlines) = (view, scan);
+	}
+
+	#[doc(hidden)]
+	pub fn running_jobs(&self) -> usize {
+		self.state.jobs.running()
+	}
+
+	#[doc(hidden)]
+	pub fn jobs_waiting(&self) -> usize {
+		self.state.jobs.waiting()
+	}
+
 	/// Stops accepting; open connections end at their next request.
 	pub fn stop(&mut self) {
 		self.state.stop.store(true, Ordering::SeqCst);
+		self.state.jobs.cancel_all();
 		if let Some(accept) = self.accept.take() {
 			let _ = accept.join();
 		}
@@ -262,11 +332,8 @@ fn accept_loop(listener: TcpListener, state: Arc<State>) {
 					.spawn(move || {
 						let slot = conn_state.take_slot();
 						conn_state.waiting.fetch_sub(1, Ordering::SeqCst);
-						if slot {
+						if let Some(_slot) = slot {
 							let _ = serve(tcp, &conn_state);
-							conn_state
-								.connections
-								.fetch_sub(1, Ordering::SeqCst);
 						}
 					});
 				if spawned.is_err() {
@@ -282,6 +349,14 @@ fn accept_loop(listener: TcpListener, state: Arc<State>) {
 }
 
 fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
+	// TCP keepalive: best effort attempt to detect vanished masters.
+	let sock = socket2::SockRef::from(&tcp);
+	let mut keepalive =
+		socket2::TcpKeepalive::new().with_time(Duration::from_secs(15));
+	keepalive = keepalive.with_interval(Duration::from_secs(5));
+	// Ignore errors if the platform or socket doesn't support keepalive parameters.
+	let _ = sock.set_tcp_keepalive(&keepalive);
+
 	tcp.set_nonblocking(false)?;
 	tcp.set_nodelay(true)?;
 	tcp.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -298,8 +373,16 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 		.and_then(|certs| certs.first())
 		.map(|cert| Fingerprint::of(cert))
 		.ok_or_else(|| RemoteError::Protocol("no client certificate".into()))?;
-	match hello {
-		Request::Hello { version, .. } if version == PROTOCOL_VERSION => {}
+	let negotiated = match hello {
+		Request::Hello {
+			version,
+			max_version,
+			..
+		} if version == PROTOCOL_VERSION => {
+			let worker_max = state.max_protocol.unwrap_or(PROTOCOL_MAX).max(1);
+			let master_max = max_version.unwrap_or(1);
+			master_max.min(worker_max)
+		}
 		Request::Hello { version, .. } => {
 			write_frame(
 				&mut tls,
@@ -319,13 +402,14 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 			)?;
 			return Ok(());
 		}
-	}
+	};
 	write_frame(
 		&mut tls,
 		&Response::Hello {
 			version: PROTOCOL_VERSION,
 			name: state.name.clone(),
 			paired: state.is_trusted(&peer),
+			max_version: Some(negotiated),
 		},
 	)?;
 	tls.sock.set_read_timeout(Some(IDLE_TIMEOUT))?;
@@ -333,15 +417,139 @@ fn serve(tcp: TcpStream, state: &State) -> Result<(), RemoteError> {
 		let Some(request) = read_frame::<Request>(&mut tls)? else {
 			return Ok(());
 		};
-		let response = state.handle(&peer, request);
-		match write_frame(&mut tls, &response) {
-			Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-				write_frame(
-					&mut tls,
-					&error(ErrorCode::TooLarge, err.to_string()),
-				)?;
+		match request {
+			Request::ScanRepos { workspace, under } => {
+				state.git_requests.fetch_add(1, Ordering::SeqCst);
+				if !state.is_trusted(&peer) {
+					crate::jobs::write_response(
+						&mut tls,
+						&error(
+							ErrorCode::NotPaired,
+							"this master is not paired with the worker".into(),
+						),
+					)?;
+				} else if negotiated < crate::proto::GIT_VIEWS_VERSION {
+					crate::jobs::write_response(
+						&mut tls,
+						&error(
+							ErrorCode::Unsupported,
+							"Git views are not available on this worker yet"
+								.into(),
+						),
+					)?;
+				} else {
+					let (_, scan_deadline) = *lock(&state.deadlines);
+					let cancel = snip_core::gitrun::CancelToken::new();
+					crate::jobs::run_job(
+						&mut tls,
+						scan_deadline,
+						cancel,
+						|job_cancel, job_deadline| match state.jobs.admit(
+							&workspace,
+							crate::jobs::JobKind::Scan,
+							job_cancel,
+						) {
+							Ok(_guard) => {
+								let initial_root =
+									match state.get_shared_root(&workspace) {
+										Ok(r) => r,
+										Err(resp) => return resp,
+									};
+								let reply = crate::gitserve::scan(
+									&initial_root,
+									under.as_deref(),
+									job_cancel,
+									job_deadline,
+									scan_deadline,
+								);
+								verify_root_unchanged(
+									state,
+									&workspace,
+									&initial_root,
+									reply,
+								)
+							}
+							Err(code) => map_admit_error(code),
+						},
+					)?;
+				}
 			}
-			other => other?,
+			Request::GitView {
+				workspace,
+				repo,
+				profile,
+				query,
+			} => {
+				state.git_requests.fetch_add(1, Ordering::SeqCst);
+				if !state.is_trusted(&peer) {
+					crate::jobs::write_response(
+						&mut tls,
+						&error(
+							ErrorCode::NotPaired,
+							"this master is not paired with the worker".into(),
+						),
+					)?;
+				} else if negotiated < crate::proto::GIT_VIEWS_VERSION {
+					crate::jobs::write_response(
+						&mut tls,
+						&error(
+							ErrorCode::Unsupported,
+							"Git views are not available on this worker yet"
+								.into(),
+						),
+					)?;
+				} else if let Err(msg) =
+					crate::gitserve::validate(&repo, &query)
+				{
+					crate::jobs::write_response(
+						&mut tls,
+						&error(ErrorCode::BadRequest, msg),
+					)?;
+				} else {
+					let (view_deadline, _) = *lock(&state.deadlines);
+					let cancel = snip_core::gitrun::CancelToken::new();
+					crate::jobs::run_job(
+						&mut tls,
+						view_deadline,
+						cancel,
+						|job_cancel, _job_deadline| match state.jobs.admit(
+							&workspace,
+							crate::jobs::JobKind::View,
+							job_cancel,
+						) {
+							Ok(_guard) => {
+								let initial_root =
+									match state.get_shared_root(&workspace) {
+										Ok(r) => r,
+										Err(resp) => return resp,
+									};
+								let read = snip_core::gitview::Read {
+									profile,
+									cancel: Some(job_cancel.clone()),
+								};
+								let reply = crate::gitserve::handle_git_view(
+									&initial_root,
+									&repo,
+									query,
+									&read,
+									&state.repo_cache,
+								);
+								verify_root_unchanged(
+									state,
+									&workspace,
+									&initial_root,
+									reply,
+								)
+							}
+							Err(code) => map_admit_error(code),
+						},
+					)?;
+				}
+			}
+			other => {
+				let response = state.handle(&peer, other, negotiated);
+				crate::jobs::write_response(&mut tls, &response)?;
+			}
 		}
 	}
 	Ok(())
@@ -351,7 +559,53 @@ fn error(code: ErrorCode, message: String) -> Response {
 	Response::Error { code, message }
 }
 
-fn io_error(err: io::Error) -> Response {
+fn map_admit_error(code: ErrorCode) -> Response {
+	match code {
+		ErrorCode::Busy => {
+			if snip_core::gitrun::served_leaked() > 0 {
+				if !crate::gitserve::SERVED_LEAK_WARNED
+					.swap(true, std::sync::atomic::Ordering::Relaxed)
+				{
+					eprintln!(
+						"[worker] Git permit leak detected; restart required"
+					);
+				}
+				error(
+					ErrorCode::Busy,
+					"a Git process on the worker could not be cleaned up and the worker needs a restart".into(),
+				)
+			} else {
+				error(
+					ErrorCode::Busy,
+					"the worker is busy with other Git requests".into(),
+				)
+			}
+		}
+		ErrorCode::Cancelled => error(ErrorCode::Cancelled, "cancelled".into()),
+		other => error(other, "the worker cannot admit this job".into()),
+	}
+}
+
+fn verify_root_unchanged(
+	state: &State,
+	workspace: &str,
+	initial_root: &SharedRoot,
+	reply: Response,
+) -> Response {
+	match state.get_shared_root(workspace) {
+		Ok(cur)
+			if cur.id == initial_root.id && cur.path == initial_root.path =>
+		{
+			reply
+		}
+		_ => error(
+			ErrorCode::Forbidden,
+			"that workspace is not shared by this worker".into(),
+		),
+	}
+}
+
+pub(crate) fn io_error(err: io::Error) -> Response {
 	let code = match err.kind() {
 		io::ErrorKind::NotFound => ErrorCode::NotFound,
 		io::ErrorKind::PermissionDenied => ErrorCode::Forbidden,
@@ -364,7 +618,7 @@ fn io_error(err: io::Error) -> Response {
 
 impl State {
 	/// Waits up to [`SLOT_WAIT`] for one of [`MAX_CONNECTIONS`] slots.
-	fn take_slot(&self) -> bool {
+	fn take_slot(&self) -> Option<ConnSlot> {
 		let deadline = Instant::now() + SLOT_WAIT;
 		loop {
 			// compare_exchange rather than fetch_update: newer toolchains
@@ -381,14 +635,14 @@ impl State {
 					)
 					.is_ok()
 			{
-				return true;
+				return Some(ConnSlot(self.connections.clone()));
 			}
 			if n < MAX_CONNECTIONS {
 				// Lost a race for the slot: look again at once.
 				continue;
 			}
 			if Instant::now() >= deadline || self.stop.load(Ordering::SeqCst) {
-				return false;
+				return None;
 			}
 			std::thread::sleep(Duration::from_millis(10));
 		}
@@ -399,7 +653,13 @@ impl State {
 		lock(&self.trusted).iter().any(|m| m.fingerprint == hex)
 	}
 
-	fn handle(&self, peer: &Fingerprint, request: Request) -> Response {
+	#[allow(clippy::result_large_err)]
+	fn handle(
+		&self,
+		peer: &Fingerprint,
+		request: Request,
+		_negotiated: u32,
+	) -> Response {
 		match request {
 			Request::Hello { .. } => {
 				error(ErrorCode::BadRequest, "hello was already sent".into())
@@ -439,9 +699,14 @@ impl State {
 				}
 				Err(e) => e,
 			},
-			Request::Write { .. }
-			| Request::Rename { .. }
-			| Request::Git { .. } => error(
+			Request::ScanRepos { .. } | Request::GitView { .. } => {
+				self.git_requests.fetch_add(1, Ordering::SeqCst);
+				error(
+					ErrorCode::Unsupported,
+					"Git views are not available on this worker yet".into(),
+				)
+			}
+			Request::Write { .. } | Request::Rename { .. } => error(
 				ErrorCode::Unsupported,
 				"not available on this worker yet".into(),
 			),
@@ -498,13 +763,17 @@ impl State {
 		}
 	}
 
-	fn root(&self, workspace: &str) -> Result<PathBuf, Response> {
+	#[allow(clippy::result_large_err)]
+	pub(crate) fn get_shared_root(
+		&self,
+		workspace: &str,
+	) -> Result<SharedRoot, Response> {
 		self.roots
 			.read()
 			.unwrap_or_else(PoisonError::into_inner)
 			.iter()
 			.find(|r| r.id == workspace)
-			.map(|r| r.path.clone())
+			.cloned()
 			.ok_or_else(|| {
 				error(
 					ErrorCode::Forbidden,
@@ -513,6 +782,12 @@ impl State {
 			})
 	}
 
+	#[allow(clippy::result_large_err)]
+	fn root(&self, workspace: &str) -> Result<PathBuf, Response> {
+		self.get_shared_root(workspace).map(|r| r.path)
+	}
+
+	#[allow(clippy::result_large_err)]
 	fn resolve(
 		&self,
 		workspace: &str,
@@ -534,6 +809,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// share lists as a folder, as the copy engine treats it; one that leads
 /// out of the share (or into `.git`) stays a plain entry the master cannot
 /// open.
+#[allow(clippy::result_large_err)]
 fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
@@ -591,6 +867,7 @@ fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 	Ok(Response::Dir { entries, truncated })
 }
 
+#[allow(clippy::result_large_err)]
 fn stat(path: &Path) -> Result<Response, Response> {
 	let meta = fs::metadata(path).map_err(io_error)?;
 	let kind = if meta.is_dir() {
@@ -639,5 +916,107 @@ mod tests {
 		}
 		assert_eq!(a.name, "real");
 		assert!(SharedRoot::new(&dir.path().join("missing")).is_err());
+	}
+
+	#[test]
+	fn a_panicking_job_frees_its_connection_slot() {
+		let counter = Arc::new(AtomicUsize::new(1));
+		let slot = ConnSlot(counter.clone());
+		let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			let _held_slot = slot;
+			let mut buf = Vec::new();
+			let _ = crate::jobs::run_job(
+				&mut buf,
+				Duration::from_secs(1),
+				snip_core::gitrun::CancelToken::new(),
+				|_, _| panic!("simulated job panic"),
+			);
+		}));
+		assert_eq!(counter.load(Ordering::SeqCst), 0);
+	}
+
+	#[test]
+	fn set_roots_removal_cancels_jobs_clears_cache_and_fails_lookup() {
+		let dir = tempfile::tempdir().unwrap();
+		let id = Identity::generate().unwrap();
+		let worker = Worker::start(
+			"127.0.0.1:0".parse().unwrap(),
+			&id,
+			WorkerOptions {
+				name: "test-worker".into(),
+				trust_file: None,
+				..Default::default()
+			},
+		)
+		.unwrap();
+		let root_path = dir.path().to_path_buf();
+		let errs = worker.set_roots(std::slice::from_ref(&root_path));
+		assert!(errs.is_empty());
+
+		let roots = worker.roots();
+		assert_eq!(roots.len(), 1);
+		let ws_id = roots[0].id.clone();
+
+		let cancel = snip_core::gitrun::CancelToken::new();
+		let _guard = worker
+			.state
+			.jobs
+			.admit(&ws_id, crate::jobs::JobKind::View, &cancel)
+			.unwrap();
+		assert!(!cancel.is_cancelled());
+
+		let dummy_id = snip_core::workspace::RepoIdentity {
+			toplevel: root_path.clone(),
+			git_dir: root_path.join(".git"),
+			common_dir: root_path.join(".git"),
+			kind: snip_core::workspace::RepoKind::Main,
+		};
+		lock(&worker.state.repo_cache).insert(
+			ws_id.clone(),
+			"repo".into(),
+			dummy_id,
+		);
+		assert!(lock(&worker.state.repo_cache).get(&ws_id, "repo").is_some());
+
+		let hook_runs = Arc::new(AtomicUsize::new(0));
+		let hook_runs_in_hook = hook_runs.clone();
+		let hook_state = worker.state.clone();
+		let hook_ws_id = ws_id.clone();
+		let hook_cancel = cancel.clone();
+		*lock(&worker.state.set_roots_hook) = Some(Box::new(move || {
+			hook_runs_in_hook.fetch_add(1, Ordering::SeqCst);
+			// Security ordering property: the roots swap must be visible to
+			// requests arriving during teardown before existing jobs are cancelled.
+			assert!(
+				hook_state.get_shared_root(&hook_ws_id).is_err(),
+				"roots swap must be visible before cancel_workspaces runs"
+			);
+			assert!(
+				!hook_cancel.is_cancelled(),
+				"job must not be cancelled before cancel_workspaces runs"
+			);
+		}));
+
+		let errs = worker.set_roots(&[]);
+		assert!(errs.is_empty());
+
+		assert_eq!(
+			hook_runs.load(Ordering::SeqCst),
+			1,
+			"ordering verification hook must run exactly once during root removal"
+		);
+
+		assert!(
+			cancel.is_cancelled(),
+			"job admitted before workspace removal should be cancelled"
+		);
+		assert!(
+			lock(&worker.state.repo_cache).get(&ws_id, "repo").is_none(),
+			"repo_cache should be empty after workspace removal"
+		);
+		assert!(
+			worker.state.get_shared_root(&ws_id).is_err(),
+			"get_shared_root should fail for removed workspace"
+		);
 	}
 }
