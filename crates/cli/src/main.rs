@@ -197,9 +197,11 @@ fn main() -> ExitCode {
 				skip_existing,
 				adjust_paths,
 			};
-			paste(&repo, &settings, &opts, stdin)
+			read_paste_text(stdin).and_then(|text| {
+				paste(PasteAt::Local(&repo), &text, &settings, &opts)
+			})
 		}
-		Command::Remote(cmd) => remote::run(cmd),
+		Command::Remote(cmd) => remote::run(cmd, &settings),
 		Command::Serve { max_protocol, .. } => {
 			snip_remote::serve_stdio(snip_remote::WorkerOptions {
 				name: snip_remote::device_name(),
@@ -588,28 +590,45 @@ fn write_clipboard(text: &str) -> Outcome {
 
 // ---- paste ----
 
-struct PasteOptions {
-	apply: bool,
-	overwrite: bool,
-	skip_existing: bool,
-	adjust_paths: bool,
+pub(crate) struct PasteOptions {
+	pub apply: bool,
+	pub overwrite: bool,
+	pub skip_existing: bool,
+	pub adjust_paths: bool,
 }
 
-fn paste(
-	repo: &Path,
-	settings: &Settings,
-	opts: &PasteOptions,
-	stdin: bool,
-) -> Outcome {
-	let text = if stdin {
+/// Where a paste plans and writes: this machine, or a folder of a worker
+/// that plans and writes on its own disk with the same engine.
+#[derive(Clone, Copy)]
+pub(crate) enum PasteAt<'a> {
+	Local(&'a Path),
+	Remote {
+		client: &'a snip_remote::Client,
+		workspace: &'a str,
+		/// Relative to the workspace; "" is the workspace itself.
+		dest: &'a str,
+	},
+}
+
+/// The payload: stdin, or the clipboard.
+pub(crate) fn read_paste_text(stdin: bool) -> Result<String, String> {
+	if stdin {
 		let mut text = String::new();
 		io::stdin()
 			.read_to_string(&mut text)
 			.map_err(|e| e.to_string())?;
-		text
+		Ok(text)
 	} else {
-		clip::read_text().map_err(|e| e.to_string())?
-	};
+		clip::read_text().map_err(|e| e.to_string())
+	}
+}
+
+pub(crate) fn paste(
+	at: PasteAt<'_>,
+	text: &str,
+	settings: &Settings,
+	opts: &PasteOptions,
+) -> Outcome {
 	// JS `trim()`: Unicode whitespace plus the BOM.
 	if text
 		.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
@@ -617,9 +636,9 @@ fn paste(
 	{
 		return Err("Clipboard is empty or does not contain text.".into());
 	}
-	match clip::detect_mode(&text) {
-		Mode::Commits => paste_commits(repo, &text, opts),
-		Mode::Files => paste_files(repo, &text, settings, opts),
+	match clip::detect_mode(text) {
+		Mode::Commits => paste_commits(at, text, opts),
+		Mode::Files => paste_files(at, text, settings, opts),
 	}
 }
 
@@ -637,8 +656,103 @@ fn format_transfer_error(err: TransferError) -> String {
 	}
 }
 
+/// A worker's refusal in the words [`format_transfer_error`] gives the
+/// same refusal here: the worker sends the local paste message.
+fn format_remote_error(err: snip_remote::RemoteError) -> String {
+	use snip_remote::{ErrorCode, RemoteError};
+	match err {
+		RemoteError::Refused {
+			code: ErrorCode::Collision,
+			message,
+		} => format!("Snipcode refused to paste: {message}"),
+		RemoteError::Refused {
+			code: ErrorCode::Stale,
+			message,
+		} => format!(
+			"Snipcode refused to paste: {message}; re-run to inspect updated destinations"
+		),
+		other => other.to_string(),
+	}
+}
+
+/// Says what `--adjust-paths` would do, or does.
+fn note_suggestion(
+	suggestion: &snip_core::restore::RestoreBaseSuggestion,
+	paths: &[String],
+	adjust: bool,
+) {
+	let s = suggestion;
+	let example = paths
+		.iter()
+		.find(|p| is_relative(p) && p.contains('/'))
+		.map(|p| format!(" Example: {p} → {}", apply_restore_base(&s.base, p)))
+		.unwrap_or_default();
+	if adjust {
+		eprintln!(
+			"Adjusting paths: {} for all {} file(s).{example}",
+			s.label, s.total
+		);
+	} else {
+		eprintln!(
+			"These paths look like they belong elsewhere in this folder. \
+			 Pass --adjust-paths to {} for all {} file(s).{example}",
+			s.label, s.total
+		);
+	}
+}
+
+/// A planned file paste, applied where it was planned.
+enum FilePaste<'a> {
+	Local(snip_core::transfer::TransferImportPlan),
+	Remote {
+		client: &'a snip_remote::Client,
+		workspace: &'a str,
+		dest: &'a str,
+		mapping: snip_remote::PasteMapping,
+		planned: snip_remote::ImportPlanned,
+	},
+}
+
+impl FilePaste<'_> {
+	fn restore_plan(&self) -> &RestorePlan {
+		match self {
+			Self::Local(plan) => plan.restore_plan(),
+			Self::Remote { planned, .. } => planned.plan.restore_plan(),
+		}
+	}
+
+	fn apply(
+		&self,
+		text: &str,
+		selection: &RestoreSelection,
+	) -> Result<snip_core::restore::RestoreExecutionResult, String> {
+		match self {
+			Self::Local(plan) => {
+				plan.apply(selection).map_err(format_transfer_error)
+			}
+			Self::Remote {
+				client,
+				workspace,
+				dest,
+				mapping,
+				planned,
+			} => client
+				.import_apply(
+					workspace,
+					dest,
+					text,
+					mapping,
+					selection,
+					&planned.expect(),
+					None,
+				)
+				.map_err(format_remote_error),
+		}
+	}
+}
+
 fn paste_files(
-	repo: &Path,
+	at: PasteAt<'_>,
 	text: &str,
 	settings: &Settings,
 	opts: &PasteOptions,
@@ -651,55 +765,66 @@ fn paste_files(
 	// TS asks in a modal; here the suggestion is printed and applied only
 	// with --adjust-paths.
 	let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
-	let suggestion = suggest_restore_base(
-		&repo.to_string_lossy(),
-		&paths,
-		&FsProbe,
-		extract_source_root(text).as_deref(),
-	);
-	if let Some(ref s) = suggestion {
-		let example = paths
-			.iter()
-			.find(|p| is_relative(p) && p.contains('/'))
-			.map(|p| {
-				format!(" Example: {p} → {}", apply_restore_base(&s.base, p))
-			})
-			.unwrap_or_default();
-		if opts.adjust_paths {
-			eprintln!(
-				"Adjusting paths: {} for all {} file(s).{example}",
-				s.label, s.total
+	let import = match at {
+		PasteAt::Local(repo) => {
+			let suggestion = suggest_restore_base(
+				&repo.to_string_lossy(),
+				&paths,
+				&FsProbe,
+				extract_source_root(text).as_deref(),
 			);
-		} else {
-			eprintln!(
-				"These paths look like they belong elsewhere in this folder. \
-				 Pass --adjust-paths to {} for all {} file(s).{example}",
-				s.label, s.total
-			);
+			if let Some(ref s) = suggestion {
+				note_suggestion(s, &paths, opts.adjust_paths);
+			}
+			let root_id = CanonicalRootId::new(repo).map_err(|e| {
+				format!(
+					"--repo {} does not exist or cannot be resolved: {e}",
+					repo.display()
+				)
+			})?;
+			let mapping = match (&suggestion, opts.adjust_paths) {
+				(Some(s), true) => ImportMapping::from_restore_base(s, root_id),
+				_ => ImportMapping::with_primary(root_id),
+			};
+			let plan = plan_import_with(
+				text,
+				&settings.header_format,
+				&[repo.to_path_buf()],
+				&mapping,
+				&RunOptions::default(),
+			)
+			.map_err(format_transfer_error)?;
+			FilePaste::Local(plan)
 		}
-	}
-
-	let root_id = CanonicalRootId::new(repo).map_err(|e| {
-		format!(
-			"--repo {} does not exist or cannot be resolved: {e}",
-			repo.display()
-		)
-	})?;
-	let mapping = match (&suggestion, opts.adjust_paths) {
-		(Some(s), true) => ImportMapping::from_restore_base(s, root_id),
-		_ => ImportMapping::with_primary(root_id),
+		PasteAt::Remote {
+			client,
+			workspace,
+			dest,
+		} => {
+			// The worker suggests against its own folders, as `--repo`
+			// would be probed here.
+			let mapping = snip_remote::PasteMapping {
+				prefixes: Vec::new(),
+				adjust_paths: opts.adjust_paths,
+				header_format: settings.header_format.clone(),
+			};
+			let planned = client
+				.import_plan(workspace, dest, text, &mapping, None)
+				.map_err(format_remote_error)?;
+			if let Some(ref s) = planned.suggestion {
+				note_suggestion(s, &paths, opts.adjust_paths);
+			}
+			FilePaste::Remote {
+				client,
+				workspace,
+				dest,
+				mapping,
+				planned,
+			}
+		}
 	};
 
-	let import_plan = plan_import_with(
-		text,
-		&settings.header_format,
-		&[repo.to_path_buf()],
-		&mapping,
-		&RunOptions::default(),
-	)
-	.map_err(format_transfer_error)?;
-
-	let plan = import_plan.restore_plan();
+	let plan = import.restore_plan();
 	if !opts.apply {
 		print_plan(plan);
 	}
@@ -721,13 +846,14 @@ fn paste_files(
 			"{existing} file(s) already exist; pass --overwrite or --skip-existing"
 		));
 	}
-	let result = import_plan
-		.apply(&RestoreSelection {
+	let result = import.apply(
+		text,
+		&RestoreSelection {
 			overwrite_existing: opts.overwrite,
 			skip_existing: opts.skip_existing,
 			..Default::default()
-		})
-		.map_err(format_transfer_error)?;
+		},
+	)?;
 
 	let parts: Vec<String> = [
 		("Created", result.created_count),
@@ -778,7 +904,7 @@ fn confirmation_summary(plan: &RestorePlan) -> String {
 	)
 }
 
-fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
+fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 	if opts.skip_existing {
 		usage("commit payloads do not support --skip-existing");
 	}
@@ -788,8 +914,34 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 	let payload =
 		commits::parse_commit_payload(text).map_err(|e| e.to_string())?;
 
-	let preview = CommitReplayPreview::capture(repo, &payload)
-		.map_err(format_transfer_error)?;
+	let preview = match at {
+		PasteAt::Local(repo) => CommitReplayPreview::capture(repo, &payload)
+			.map_err(format_transfer_error)?,
+		PasteAt::Remote {
+			client,
+			workspace,
+			dest,
+		} => client
+			.replay_plan(workspace, dest, text, payload.clone(), None)
+			.map_err(format_remote_error)?,
+	};
+	// Re-checks, or replays, where the preview was made.
+	let replay = |check_only: bool| match at {
+		PasteAt::Local(_) if check_only => preview
+			.revalidate()
+			.map(|()| None)
+			.map_err(format_transfer_error),
+		PasteAt::Local(_) => {
+			preview.apply().map(Some).map_err(format_transfer_error)
+		}
+		PasteAt::Remote {
+			client,
+			workspace,
+			dest,
+		} => client
+			.replay_apply(workspace, dest, text, &preview, check_only, None)
+			.map_err(format_remote_error),
+	};
 
 	if !opts.apply {
 		let plan = preview.plan();
@@ -852,13 +1004,13 @@ fn paste_commits(repo: &Path, text: &str, opts: &PasteOptions) -> Outcome {
 
 	let existing = distinct_existing_paths(preview.plan());
 	if existing > 0 && !opts.overwrite {
-		preview.revalidate().map_err(format_transfer_error)?;
+		replay(true)?;
 		usage(format!(
 			"{existing} destination file(s) already exist; commit payloads need --overwrite"
 		));
 	}
 
-	let result = preview.apply().map_err(format_transfer_error)?;
+	let result = replay(false)?.ok_or("the replay returned no result")?;
 	println!("Created {} commit(s).", result.created.len());
 	for sha in &result.created {
 		println!("  {sha}");

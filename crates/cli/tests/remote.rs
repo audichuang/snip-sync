@@ -563,3 +563,218 @@ fn cli_remote_copy_refuses_a_worker_without_copy() {
 	let err = m.fails(&["copy", "h", s(tmp.path()), "a.txt", "--stdout"]);
 	assert!(err.contains("too old"), "{err}");
 }
+
+/// Runs `cmd` with `input` on stdin, failing the test after [`DEADLINE`].
+fn output_with_input(
+	mut cmd: Command,
+	input: &str,
+	what: &str,
+) -> (Option<i32>, String, String) {
+	use std::io::Write;
+	let mut child = cmd
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap_or_else(|err| panic!("cannot start {what}: {err}"));
+	let mut stdin = child.stdin.take().unwrap();
+	let input = input.to_string();
+	std::thread::spawn(move || {
+		let _ = stdin.write_all(input.as_bytes());
+	});
+	let (tx, rx) = mpsc::channel();
+	std::thread::spawn(move || {
+		let _ = tx.send(child.wait_with_output());
+	});
+	let out = rx
+		.recv_timeout(DEADLINE)
+		.unwrap_or_else(|_| panic!("{what} did not finish within {DEADLINE:?}"))
+		.unwrap();
+	(
+		out.status.code(),
+		String::from_utf8_lossy(&out.stdout).into_owned(),
+		String::from_utf8_lossy(&out.stderr).into_owned(),
+	)
+}
+
+/// `snip paste … --stdin` into `dest`, run locally.
+fn local_paste(
+	cfg: &Path,
+	dest: &Path,
+	text: &str,
+	args: &[&str],
+) -> (Option<i32>, String, String) {
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args(["--repo", s(dest), "paste", "--stdin"])
+		.args(args)
+		.env("SNIP_CONFIG_DIR", cfg);
+	output_with_input(cmd, text, "snip paste")
+}
+
+impl Master {
+	/// `snip remote paste h <workspace> --in <dest> --stdin …`.
+	fn paste(
+		&self,
+		workspace: &Path,
+		dest: &str,
+		text: &str,
+		args: &[&str],
+	) -> (Option<i32>, String, String) {
+		let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+		cmd.args(["remote", "paste", "h", s(workspace), "--in", dest])
+			.arg("--stdin")
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &self.config)
+			.env("SNIP_REMOTE_EXEC", &self.exec);
+		output_with_input(cmd, text, "snip remote paste")
+	}
+}
+
+fn tree_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+	let mut out = Vec::new();
+	let mut stack = vec![dir.to_path_buf()];
+	while let Some(d) = stack.pop() {
+		for e in std::fs::read_dir(&d).unwrap() {
+			let p = e.unwrap().path();
+			if p.file_name().is_some_and(|n| n == ".git") {
+				continue;
+			}
+			if p.is_dir() {
+				stack.push(p);
+			} else {
+				let rel = p.strip_prefix(dir).unwrap().display().to_string();
+				out.push((rel, std::fs::read(&p).unwrap()));
+			}
+		}
+	}
+	out.sort();
+	out
+}
+
+#[test]
+fn cli_remote_paste_of_files_matches_a_local_paste() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	std::fs::create_dir_all(src.join("sub")).unwrap();
+	std::fs::write(src.join("a.txt"), "new\n").unwrap();
+	std::fs::write(src.join("sub/中文.txt"), "深層\nx\n").unwrap();
+	let text = local_copy(&src);
+	// Same folder names on both sides: messages name them.
+	let local = tmp.path().join("l/dst");
+	let ws = tmp.path().join("r");
+	let remote = ws.join("dst");
+	for dir in [&local, &remote] {
+		std::fs::create_dir_all(dir).unwrap();
+		std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+	}
+	let cfg = tmp.path().join("cfg-local");
+	let m = Master::new(tmp.path());
+
+	let l = local_paste(&cfg, &local, &text, &["--dry-run"]);
+	let r = m.paste(&ws, "dst", &text, &["--dry-run"]);
+	assert_eq!(l.0, Some(0), "{}", l.2);
+	assert_eq!(r, l, "dry run");
+	assert!(l.1.contains("overwrite\ta.txt"), "{}", l.1);
+
+	// Existing files need a choice, as locally.
+	let l = local_paste(&cfg, &local, &text, &["--apply"]);
+	let r = m.paste(&ws, "dst", &text, &["--apply"]);
+	assert_eq!(l.0, Some(2), "{}", l.2);
+	assert_eq!(r.0, l.0);
+	assert!(r.2.contains("already exist"), "{}", r.2);
+	assert_eq!(tree_bytes(&remote), tree_bytes(&local));
+
+	let l = local_paste(&cfg, &local, &text, &["--apply", "--overwrite"]);
+	let r = m.paste(&ws, "dst", &text, &["--apply", "--overwrite"]);
+	assert_eq!(l.0, Some(0), "{}", l.2);
+	assert_eq!(r, l, "apply");
+	assert_eq!(tree_bytes(&remote), tree_bytes(&local));
+	assert!(remote.join("sub/中文.txt").is_file());
+
+	// A destination inside `.git` is refused and nothing is written.
+	std::fs::create_dir_all(ws.join(".git")).unwrap();
+	let r = m.paste(&ws, ".git", &text, &["--apply", "--overwrite"]);
+	assert_eq!(r.0, Some(1), "{}", r.2);
+	assert!(!ws.join(".git/a.txt").exists());
+}
+
+#[test]
+fn cli_remote_paste_of_commits_matches_a_local_paste() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	std::fs::create_dir_all(&src).unwrap();
+	git(&src, &["init", "-q", "-b", "main"]);
+	std::fs::write(src.join("a.txt"), "one\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "first"]);
+	std::fs::write(src.join("a.txt"), "two\n").unwrap();
+	std::fs::write(src.join("b.txt"), "b\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "second"]);
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args([
+		"--repo",
+		s(&src),
+		"copy",
+		"--commits",
+		"-n",
+		"2",
+		"--stdout",
+	])
+	.env("SNIP_CONFIG_DIR", tmp.path().join("cfg-local"));
+	let (status, text, stderr) = output(cmd, "snip copy --commits");
+	assert_eq!(status, Some(0), "{stderr}");
+
+	let local = tmp.path().join("l/repo");
+	let ws = tmp.path().join("r");
+	let remote = ws.join("repo");
+	for dir in [&local, &remote] {
+		std::fs::create_dir_all(dir).unwrap();
+		git(dir, &["init", "-q", "-b", "main"]);
+		git(dir, &["config", "user.name", "t"]);
+		git(dir, &["config", "user.email", "t@t"]);
+		std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+		git(dir, &["add", "."]);
+		git(dir, &["commit", "-q", "-m", "base"]);
+	}
+	let cfg = tmp.path().join("cfg-local");
+	let m = Master::new(tmp.path());
+
+	let l = local_paste(&cfg, &local, &text, &["--dry-run"]);
+	let r = m.paste(&ws, "repo", &text, &["--dry-run"]);
+	assert_eq!(l.0, Some(0), "{}", l.2);
+	assert_eq!(r, l, "dry run");
+
+	let l = local_paste(&cfg, &local, &text, &["--apply"]);
+	let r = m.paste(&ws, "repo", &text, &["--apply"]);
+	assert_eq!(l.0, Some(2), "{}", l.2);
+	assert_eq!((r.0, &r.2), (l.0, &l.2), "overwrite needed");
+
+	let l = local_paste(&cfg, &local, &text, &["--apply", "--overwrite"]);
+	let r = m.paste(&ws, "repo", &text, &["--apply", "--overwrite"]);
+	assert_eq!(l.0, Some(0), "{}", l.2);
+	assert_eq!(r.0, l.0, "{}", r.2);
+	assert_eq!(r.2, l.2);
+	// Commit ids carry the committer's clock; the rest must match.
+	let first = |out: &str| out.lines().next().unwrap_or("").to_string();
+	assert_eq!(first(&r.1), first(&l.1));
+	assert_eq!(first(&r.1), "Created 2 commit(s).");
+	let log = |dir: &Path| {
+		git_out(dir, &["log", "-2", "--format=%T %an <%ae> %ad %s"])
+	};
+	assert_eq!(log(&remote), log(&local));
+	assert_eq!(tree_bytes(&remote), tree_bytes(&local));
+}
+
+#[test]
+fn cli_remote_paste_refuses_a_worker_without_paste() {
+	let tmp = tempfile::tempdir().unwrap();
+	let m = Master::with_exec(tmp.path(), serve_exec("--max-protocol 3"));
+	let r = m.paste(tmp.path(), "", "// File: a.txt\na\n", &["--apply"]);
+	assert_eq!(r.0, Some(1), "{}", r.2);
+	assert!(r.2.contains("too old"), "{}", r.2);
+	assert!(!tmp.path().join("a.txt").exists());
+}

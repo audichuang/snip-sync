@@ -5,7 +5,7 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use clap::Subcommand;
+use clap::{ArgGroup, Subcommand};
 use snip_core::format::ChangeType;
 use snip_core::gitsrc::GitSource;
 use snip_core::gitview::{ChangeSource, Read, ReadProfile, RepoView};
@@ -109,6 +109,43 @@ pub enum RemoteCommand {
 		#[arg(long)]
 		stdout: bool,
 	},
+	/// Restore the clipboard contents into a folder of the host (mode
+	/// detected automatically), planned and written there by the same
+	/// engine `snip paste` uses.
+	#[command(group(
+		ArgGroup::new("run").required(true).args(["dry_run", "apply"])
+	))]
+	Paste {
+		host: String,
+		workspace: String,
+		/// The folder to paste into, inside the workspace (commit payloads:
+		/// a repository).
+		#[arg(
+			long = "in",
+			id = "in_repo",
+			value_name = "REPO",
+			default_value = ""
+		)]
+		repo: String,
+		/// Only list what would happen.
+		#[arg(long)]
+		dry_run: bool,
+		/// Perform the restore.
+		#[arg(long)]
+		apply: bool,
+		/// Overwrite files that already exist.
+		#[arg(long, conflicts_with = "skip_existing")]
+		overwrite: bool,
+		/// Leave files that already exist untouched.
+		#[arg(long)]
+		skip_existing: bool,
+		/// Apply the suggested folder-level path adjustment.
+		#[arg(long)]
+		adjust_paths: bool,
+		/// Read the payload from stdin instead of the clipboard.
+		#[arg(long)]
+		stdin: bool,
+	},
 	/// Diff a file against the working tree, index, or a commit.
 	Diff {
 		host: String,
@@ -205,7 +242,11 @@ fn change_char(change: Option<ChangeType>) -> char {
 	}
 }
 
-pub fn run(cmd: RemoteCommand) -> Outcome {
+/// `settings` is the global `--settings` (a paste's header format).
+pub fn run(
+	cmd: RemoteCommand,
+	settings: &snip_core::settings::Settings,
+) -> Outcome {
 	match cmd {
 		RemoteCommand::Hosts => {
 			let mut out = io::stdout().lock();
@@ -505,6 +546,33 @@ pub fn run(cmd: RemoteCommand) -> Outcome {
 				out.commit_count, out.file_count, out.chars
 			);
 			Ok(())
+		}
+		RemoteCommand::Paste {
+			host,
+			workspace,
+			repo,
+			apply,
+			overwrite,
+			skip_existing,
+			adjust_paths,
+			stdin,
+			..
+		} => {
+			let text = crate::read_paste_text(stdin)?;
+			let c = client(&host);
+			let ws = find_workspace(&c, &workspace)?;
+			let opts = crate::PasteOptions {
+				apply,
+				overwrite,
+				skip_existing,
+				adjust_paths,
+			};
+			let at = crate::PasteAt::Remote {
+				client: &c,
+				workspace: &ws.id,
+				dest: &repo,
+			};
+			crate::paste(at, &text, settings, &opts)
 		}
 		RemoteCommand::Diff {
 			host,
