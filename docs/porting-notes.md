@@ -200,3 +200,31 @@ CLI 與 App 共用 `snip-core` 的 `clip` 模組,底層用 [`arboard`](https://c
 | Windows | Win32 API,`CF_UNICODETEXT` | 不要透過 `clip.exe` 或 PowerShell,編碼容易出錯;需驗證換行是否被轉換 |
 | macOS | `NSPasteboard` | |
 | Linux | X11 / Wayland(`wayland-data-control` feature) | CI 需要 xvfb;X11 上擁有剪貼簿的程序一結束內容就消失,CLI 的 `copy` 要用 arboard 的 `SetExtLinux::wait()` 留在背景直到內容被取走 |
+
+## 7. 遠端 worker 的 git 邊界強化與檢視行為（S3–S10）
+
+### 7.1 Git 命令參數與環境變數強化（S3）
+
+遠端 worker 在共享目錄（boundary）下執行 Git 讀取操作時，增加安全邊界防護：
+- `-c core.fsmonitor=`：刻意設為空值以停用 fsmonitor；因 Git 2.36 之前任何非空值（包含 `false`）皆會被視為 hook 指令路徑。
+- `-c protocol.allow=never`：Git >= 2.12（阻擋所有 submodule 傳輸協議與 clone/fetch 網路傳輸；更舊版本的 Git 會靜默忽略未知的設定鍵，但 partial clone / lazy fetch 需 Git >= ~2.19 始支援，因此無實質外洩風險）。
+- `-c core.hooksPath=/dev/null`（Windows 為 `NUL`）：避免觸發 repo 內的 hooks（例如 post-index-change）。
+- `GIT_NO_LAZY_FETCH=1`：Git >= 2.44（舊版 Git 主要仰賴 `protocol.allow=never` 阻擋 lazy fetch）。
+- `GIT_CEILING_DIRECTORIES`：需要正規化後的絕對路徑（canonical absolute path），設定為共享目錄的父目錄以阻擋向上遍歷至上層 repo。
+- Windows 環境下 `GIT_CEILING_DIRECTORIES` 搭配 dunce 標準化路徑的行為未在本機單獨實測，僅由 CI 驗證（即使 ceiling 被忽略，事後對 toplevel / git_dir 的邊界檢查依然提供安全防護）。
+- 清除 `GIT_DIR`、`GIT_WORK_TREE`、`GIT_INDEX_FILE`、`GIT_COMMON_DIR`、`GIT_OBJECT_DIRECTORY`、`GIT_ALTERNATE_OBJECT_DIRECTORIES` 等環境變數，並設定 `GIT_OPTIONAL_LOCKS=0` 避免產生或更新 `.git/index.lock`。因 `GIT_OPTIONAL_LOCKS=0` 無法完全阻止 `git diff` 自動刷新／寫入 index 或觸發 post-index-change hook，served `git diff` 在需要讀取 index 時會以 `GIT_INDEX_FILE` 指向私有暫存副本（僅限一般檔案、設有 256 MiB 大小上限並保留原 mtime 以維護 racy-clean 判定），其餘情況一律從環境變數清除 `GIT_INDEX_FILE`。
+
+### 7.2 圍界檢查與設計取捨（S3–S10）
+
+- **主 repo 在分享外的 linked worktree**：worker 端的 `LocalRepo::open_within` 驗證 `common_dir` 必須在分享內；若主 repo 在分享外，該 worktree 列為錯誤列（Note），錯誤訊息提示「這是 linked worktree，主 repo 在分享範圍外；請分享主 repo 所在的資料夾」，絕不穿透讀取主 repo。
+- **物件庫與參照目錄遞迴防逃逸**：為防止 `objects/pack/`、`objects/xx/`、`refs/heads/` 或 `refs/remotes/` 內部藏有指向分享外的 symlink，以 `read_dir` 遞迴檢查 `objects/` 與 `refs/`。若遇到指向分享目錄內的資料夾 symlink，亦必須遞迴走訪其內部目標以防止跳板逃逸，並使用 visited 集合追蹤 canonical 路徑以防止 symlink 迴圈與重複走訪。僅資料夾走訪計入上限（目錄走訪上限 20,000、深度上限 64），一般檔案不計入上限以避免大量 loose objects 造成誤判；若觸發資源上限則回報獨立的 `GitError::VerifyLimit`（「repository too large to verify: <what>」）而非誤報為 `OutsideBoundary`；走訪過程於目錄讀取間檢查 cancellation token 確保即時取消。
+- **alternates 物件庫指向分享外**：檢查 `objects/info/alternates`（遞迴深度 ≤ 5），若指向分享外一律拒絕並列為錯誤列，避免透過 commit OID 逐一讀取外部物件庫。
+- **空的 `.git` 目錄**：`classify_git` 將其視為 repo marker，但 `open_within` 無法初始化為合法 repo，列為錯誤列（Note），防止 git 向上逃逸到父目錄。
+- **symlink 的 `.git`**：核心探索以 `symlink_metadata` 檢查，symlink 既非一般檔案亦非一般目錄，因此不被視為 repo marker，完全不列報，無外洩風險。
+- **外指的 submodule**：submodule 的 `.git` 指向分享外時，其自身的 repo 列會被拒絕；但父 repo 的 status 仍會進入並計算 submodule 是否有修改（dirty bit），此處取捨為接受洩漏「有改動」這一個位元，以換取與本機一致的變更標記。
+- **超大 refs 上限**：遠端 served git 的 stdout 上限為 `SERVED_MAX_STDOUT = 4 MiB`。tag 與 ref 極多（超過約 4 MiB）的 repo 在遠端會回報「遠端參照資料過大」（`remote_refs_too_large`）錯誤，不提供遠端顯示（本機可看）。
+- **`UserEmail` 查詢**：透過型別化 RPC 回傳 worker 上的 `user.email`（含全域設定）給已配對的 master。
+- **掃描常數與續掃限制**：worker 掃描 repo 限制深度 8、最多 256 個 repo、單一 75 秒期限（`SCAN_DEADLINE`），走訪上限 200,000 次。掃描狀態 `More`、`TimedOut`、`LimitReached`、`Incomplete` 一律對映至「未完成」（`remote_scan_incomplete`）。遠端續掃僅支援 depth-limited 資料夾，逾時或達到數量上限時無法從游標續掃，需以重新整理（Refresh）重新掃描。
+- **選單與寫入守門**：遠端模式下右鍵選單的 repo 與檔案列只提供複製 worker 上的路徑（`copy-worker-path`），不提供本機 reveal（在 Finder／檔案總管中顯示）；遠端複製、貼上、加入 repo 路徑（`add_repo_path`）均維持拒絕（回報 `remote_unsupported`）。v2 協定連線上 `Request::Write` 與 `Request::Rename` 仍回傳 `Unsupported`。
+
+

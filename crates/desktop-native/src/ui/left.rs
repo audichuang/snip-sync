@@ -103,7 +103,7 @@ impl WorkbenchModel {
 		} else if is_project {
 			t("project", loc).to_string()
 		} else {
-			tf("changes_title", loc, &[&self.files.len()])
+			self.changes_title_text()
 		};
 		let header = div()
 			.flex()
@@ -411,18 +411,55 @@ impl WorkbenchModel {
 					))
 					.flex_1()
 					.min_h_0()
-					.when(n == 0, |d| {
+					.when(is_project && n == 0, |d| {
 						d.child(
 							div()
 								.p(px(10.))
 								.text_color(rgb(pal().text_muted))
-								.child(if is_project {
-									t("empty_project", loc)
-								} else {
-									t("clean_working_copy", loc)
-								}),
+								.child(t("empty_project", loc)),
 						)
 					})
+					.when_some(
+						(!is_project)
+							.then(|| self.changes_empty_state())
+							.flatten(),
+						|d, state| {
+							let text = match state {
+								crate::ChangesEmpty::Scanning => {
+									t("changes_scanning", loc).to_string()
+								}
+								crate::ChangesEmpty::Loading => {
+									t("changes_loading", loc).to_string()
+								}
+								crate::ChangesEmpty::NoRepository => {
+									t("changes_no_repository", loc).to_string()
+								}
+								crate::ChangesEmpty::ScanFailed(msg) => {
+									msg.render(loc)
+								}
+								crate::ChangesEmpty::NoMatch => {
+									t("changes_no_match", loc).to_string()
+								}
+								crate::ChangesEmpty::CleanPartial => {
+									t("changes_clean_partial", loc).to_string()
+								}
+								crate::ChangesEmpty::Clean => {
+									t("clean_working_copy", loc).to_string()
+								}
+							};
+							d.child(
+								div()
+									.relative()
+									.p(px(10.))
+									.text_color(rgb(pal().text_muted))
+									.child(text)
+									.children(probe(
+										&self.probes,
+										"changes-empty",
+									)),
+							)
+						},
+					)
 					.child(list)
 					.when(!self.chrome.speed.is_empty(), |d| {
 						d.child(self.speed_search_popup())

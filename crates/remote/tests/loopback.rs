@@ -20,6 +20,7 @@ fn worker(roots: &[&Path]) -> (Worker, Identity) {
 		WorkerOptions {
 			name: "win-worker".into(),
 			trust_file: None,
+			..Default::default()
 		},
 	)
 	.unwrap();
@@ -69,7 +70,11 @@ fn pairs_then_lists_stats_and_reads_inside_the_shared_root_only() {
 		snip_remote::Connection::open(&addr(&w), &master, None, "mac").unwrap();
 	assert!(!conn.paired());
 	assert_eq!(
-		refused(conn.call(&Request::ListWorkspaces)),
+		refused(conn.call(
+			&Request::ListWorkspaces,
+			None,
+			snip_remote::client::CALL_LIMIT_DEFAULT
+		)),
 		ErrorCode::NotPaired
 	);
 
@@ -134,13 +139,15 @@ fn pairs_then_lists_stats_and_reads_inside_the_shared_root_only() {
 		ErrorCode::Forbidden
 	);
 
-	// Write, rename and Git are reserved for later slices.
+	// GitView on a non-repo share returns NotARepository.
 	assert_eq!(
-		refused(client.call(&Request::Git {
+		refused(client.call(&Request::GitView {
 			workspace: ws.clone(),
-			args: vec!["status".into()],
+			repo: "".into(),
+			profile: snip_core::gitview::ReadProfile::Interactive,
+			query: snip_remote::proto::GitQuery::ChangeList,
 		})),
-		ErrorCode::Unsupported
+		ErrorCode::NotARepository
 	);
 
 	// Unsharing a root takes it away at once.
@@ -182,6 +189,7 @@ fn a_worker_restarted_with_its_trust_file_still_knows_the_master() {
 			WorkerOptions {
 				name: "w".into(),
 				trust_file: Some(trust.clone()),
+				..Default::default()
 			},
 		)
 		.unwrap();
@@ -283,6 +291,7 @@ fn unwritable_trust_file_refuses_pairing_and_leaves_code_open() {
 		WorkerOptions {
 			name: "win-worker".into(),
 			trust_file: Some(trust_file.clone()),
+			..Default::default()
 		},
 	)
 	.unwrap();

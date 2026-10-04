@@ -8,7 +8,8 @@
 
 - **受測**：master 是 Mac mini 上的桌面 App（GUI），另有一段用 `snip remote`（CLI master）交叉驗證。worker 是 Ubuntu 上的 CLI `snip worker`，不開 GUI。
 - **SSH 不是受測功能**。產品沒有「經 SSH 管理 worker」的功能。master 和 worker 之間走 Tailscale 上的 TLS 1.3，靠配對碼與指紋 pin 互信。本規程只在準備階段用 ssh：在 Ubuntu 上編譯、建 fixture、啟動和重啟 worker，以及在 worker 端讀檔案當 oracle。
-- **本切片只做瀏覽與預覽**。寫入、rename、stage、git、遠端 diff 不在範圍。複製、貼上、Git 檢視在遠端工作區都要拒絕，這也是受測項目。
+- **本輪受測含唯讀 Git 檢視**。寫入、rename、stage、commit、discard、以及為複製而勾選仍不在範圍內；複製、貼上、加入儲存庫路徑、為複製而勾選在遠端工作區都要拒絕，這也是受測項目。
+- **不能碰使用者自己的 worker 服務**：Ubuntu 的 systemd user unit `snip-worker.service` 和 Mac mini 的 LaunchAgent `com.audichuang.snip-worker`（都在 47821 埠）不屬於這一輪，不可停止、重啟或改設定。測試 worker 一律用 47899；`pkill` 的 pattern 只能比對本輪的 `$W/src/target/release/snip`。
 - 不改產品程式，不 commit 這一輪的產出。
 
 ## 1. 機器與受測版本
@@ -19,7 +20,7 @@
 | worker | Ubuntu `audichuang-desktop`（x86_64） | 100.95.28.19 | `ssh ubuntu`（LAN 192.168.31.65） |
 
 - 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含 `ffcbb04`（#79 遠端節點第一刀）和 `64b6fde`（#81 連線排隊），用 `git merge-base --is-ancestor` 檢查，缺一個就不開跑。
-- Ubuntu 上 `/home/linuxbrew/.linuxbrew/bin/snip` 是 0.4.0，**沒有 `worker` 指令，不能用**。worker 一律用本輪從受測 SHA 編出來的 binary。
+- Ubuntu 上 `/home/linuxbrew/.linuxbrew/bin/snip` 是使用者常駐的 worker 服務 binary（`snip-worker.service`，47821 埠），不是受測對象；不要使用、替換或改動它。本輪的 worker 一律用從受測 SHA 編出來的 binary。
 - 受測專案：Ubuntu 上的 `~/research/rtk`。這是真實的 Rust 專案，HEAD `87a6c69`，tracked 檔 414 個，工作樹乾淨。它有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs` 238 KB）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**：第 7 節 I01 會驗證這一輪沒有動到它。
 - 邊界案例另外放在 fixture 資料夾 `edge`（第 2.3 節），不放進 rtk。
 
@@ -35,7 +36,7 @@
 export PATH=$HOME/.cargo/bin:$PATH
 git merge-base --is-ancestor ffcbb04 HEAD && git merge-base --is-ancestor 64b6fde HEAD
 cargo build --release -p snip-cli --locked
-just remote-e2e-ssh ubuntu
+just remote-e2e-ssh ubuntu --listen 100.95.28.19:47899
 ```
 
 最後一行必須是 `== N passed, 0 failed`，結束碼 0。這一步一次確認編譯、Tailscale 連得到、Ubuntu 防火牆沒擋、TLS 與配對都正常。**沒過就不開始點 GUI**，計分表全部寫 `not-run`，證據欄寫「第 0 步閘門失敗」並附上輸出。這一步只有失敗時才算產品問題，因為它不涉及 GUI。
@@ -94,43 +95,78 @@ ln -s /etc escape-dir                          # 指向分享外的資料夾
 ln -s "$W/edge/src" inner-link                 # 指向分享內
 echo 'invalid name' > "$(printf 'bad\377name.txt')"   # 非 UTF-8 檔名
 echo 'hidden' > .hidden
+
+# Git 檢視測試 fixture
+echo TOPSECRET > "$W/git-secret.txt"
+G="git -c user.name=t -c user.email=t@t"
+g_init() {
+  $G init -b main "$1" 2>/dev/null || { $G init "$1" && (cd "$1" && $G checkout -B main 2>/dev/null || true); }
+}
+cd "$W"
+mkdir -p gitws/plain gitws/broken/.git outer/inner plainws
+echo plain > gitws/plain/file.txt
+echo 'plain text' > plainws/hello.txt
+
+g_init gitws/alpha
+printf 'commit 1 a\n' > gitws/alpha/a.txt
+(cd gitws/alpha && $G add a.txt && $G commit -q -m "first commit")
+printf 'commit 2 a\n' > gitws/alpha/a.txt
+printf 'commit 2 b\n' > gitws/alpha/b.txt
+(cd gitws/alpha && $G add a.txt b.txt && $G commit -q -m "second commit")
+printf 'commit 2 a modified\n' > gitws/alpha/a.txt
+printf 'new file content\n' > gitws/alpha/new.txt
+printf 'staged file content\n' > gitws/alpha/staged.txt
+(cd gitws/alpha && $G add staged.txt)
+ln -s "$W/git-secret.txt" gitws/alpha/link-to-secret 2>/dev/null || true
+
+g_init gitws/beta
+printf 'beta content\n' > gitws/beta/b.txt
+(cd gitws/beta && $G add b.txt && $G commit -q -m "beta commit")
+
+g_init outer
+printf 'outer committed\n' > outer/committed.txt
+(cd outer && $G add committed.txt && $G commit -q -m "outer commit")
+printf 'outer dirty\n' > outer/outer-dirty.txt
+printf 'inner file\n' > outer/inner/file.txt
 EOF
 ```
 
 這段已在 `b41817f` 上試跑過：Ubuntu 編譯約 20 秒（有快取時），fixture 全部建立成功，`manydir` 有 1200 個檔案。試跑時從 Mac 用 `snip remote` 讀過：`escape.txt` 和 `escape-dir` 都回「Path leaves the workspace」，`target/release/rtk` 回「Preview exceeds 1 MiB」，`exact-1MiB.txt` 完整讀到 1048576 bytes，`.git/HEAD` 讀得到（專案樹不列 `.git`，但指名路徑仍可讀）。
 
-rtk 的基準（I01 用）：
+rtk 的基準（I01 用；包含 HEAD、status、`.git/index` 的 sha256 與檔案時間戳；worker 端 oracle 與驗證命令均需加 `GIT_OPTIONAL_LOCKS=0`。真實專案不為此 touch 檔案；「stat-dirty 的 index 不被改寫」由 `scripts/remote_e2e.sh` 的 git views 段在 fixture 上驗證）：
 
 ```bash
-ssh ubuntu 'cd ~/research/rtk && git rev-parse HEAD && GIT_OPTIONAL_LOCKS=0 git status --porcelain=v1 -z | sha256sum && find . -newer .git/HEAD -not -path "./.git/*" | wc -l' > "$RUN/rtk-before.txt"
+ssh ubuntu 'cd ~/research/rtk && GIT_OPTIONAL_LOCKS=0 git --no-optional-locks rev-parse HEAD && GIT_OPTIONAL_LOCKS=0 git --no-optional-locks status --porcelain=v1 -z | sha256sum && (command -v sha256sum >/dev/null && sha256sum < .git/index || shasum -a 256 < .git/index) | cut -c1-64 && find . -newer .git/HEAD -not -path "./.git/*" | wc -l' > "$RUN/rtk-before.txt"
 ssh ubuntu "touch '$W/rtk-marker'"
 ```
 
 ### 2.4 啟動 worker（每次都用這個函式）
 
 ```bash
-start_worker() {   # $1 = 設定資料夾名稱；其餘參數 = 要分享的資料夾
+start_worker() {   # $1 = 設定資料夾名稱；其餘參數 = 要分享的資料夾；環境變數 WORKER_EXTRA = 額外的 worker 旗標（例如 --max-protocol 1）
   local cfg=$1; shift
   local shares=""; for d in "$@"; do shares="$shares --share '$d'"; done
   ssh -o BatchMode=yes ubuntu "bash -s" <<SH
 cd '$W'
 pkill -f '$W/src/target/release/snip worker' 2>/dev/null
 for i in \$(seq 1 20); do pgrep -f '$W/src/target/release/snip worker' >/dev/null || break; sleep 0.5; done
-SNIP_CONFIG_DIR='$W/$cfg' SNIP_DEVICE_NAME=ubuntu-ui nohup '$W/src/target/release/snip' worker $shares --listen 100.95.28.19:47821 > worker.log 2>&1 < /dev/null &
+SNIP_CONFIG_DIR='$W/$cfg' SNIP_DEVICE_NAME=ubuntu-ui nohup '$W/src/target/release/snip' worker $WORKER_EXTRA $shares --listen 100.95.28.19:47899 > worker.log 2>&1 < /dev/null &
+echo \$! > '$W/worker.pid'
 for i in \$(seq 1 40); do grep -q 'pairing code' worker.log && break; grep -q rror worker.log && break; sleep 0.5; done
 cat worker.log
 SH
 }
-start_worker wcfg "$W/edge" /home/audichuang/research/rtk | tee "$RUN/worker-start-1.log"
+start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner" | tee "$RUN/worker-start-1.log"
 ```
 
-這個函式已經試跑過。有三個陷阱，不要改掉：
+這個函式已經試跑過。有四個陷阱，不要改掉：
 
 - 一定要有 `< /dev/null`，否則 ssh 會一直等背景的 worker，不會返回。
 - 要等舊的 worker 真的結束才啟動新的，否則會出現 `Address already in use`。
-- `pkill -f` 要放在 `bash -s` 的 stdin 裡執行。如果直接寫成 `ssh ubuntu 'pkill -f "snip worker"'`，pattern 會比對到執行它的那個 bash 自己，連 ssh 連線一起被殺掉（exit 255）。
+- `pkill -f` 要放在 `bash -s` 的 stdin 裡執行。如果直接寫成 `ssh ubuntu 'pkill -f "snip worker"'`，pattern 會比對到執行它的那個 bash 自己，連 ssh 連線一起被殺掉（exit 255）。pattern 必須包含 `$W/src/target/release/snip`，不可寫成會比對到使用者服務 binary 的寬鬆字串（例如 `pkill snip`）。
+- start_worker 會把 worker 的 PID 寫進 `$W/worker.pid`，R37、G11 與第 6 節收尾都靠它停 worker；不要用 pkill 取代。
 
-輸出要有 `snip-sync worker listening on 100.95.28.19:47821`、`fingerprint XXXX-XXXX-XXXX-XXXX`、兩行 `sharing …`，以及 `pairing code ABCD-EFGH (valid 10 minutes; restart for a new one)`。
+輸出要有 `snip-sync worker listening on 100.95.28.19:47899`、`fingerprint XXXX-XXXX-XXXX-XXXX`、五行 `sharing …`，以及 `pairing code ABCD-EFGH (valid 10 minutes; restart for a new one)`。
 
 **配對碼 10 分鐘內有效**。啟動 worker、讀配對碼、在 GUI 配對（R01–R05）要連續做完，中間不做別的。過期或用掉了，就再執行一次 `start_worker wcfg …` 拿新碼；同一個 `wcfg` 會保留指紋。
 
@@ -159,7 +195,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 1. **用索引編號的 ID**。`remote-worker:<ix>`、`btn-remote-forget:<ix>`、`remote-workspace:<wx>` 用的是清單裡的序號，不是名稱。第 3 節「ID 要和路徑完全相等」的規則不適用於它們。要點某個工作區之前，先截圖確認那一列顯示的名稱。點了之後，用 `[APP:REMOTE_OPENED: <worker> ▸ <name> …]` 的 label 確認點到的是哪一個。label 不對，判 `fail`，證據欄寫 `identity-fail`。
 2. **遠端工作區的樹用 `ws-` 前綴**：`ws-tree-row:<相對路徑>`、`ws-tree-chevron:<相對路徑>`、截斷標記 `ws-tree-marker:<資料夾>`、更多列 `ws-tree-view-more:<資料夾>`（整棵樹的截斷列是 `ws-tree-view-more:`）、錯誤列 `ws-tree-retry:<資料夾>`、非 UTF-8 名稱 `ws-tree-invalid:<suffix>`。日誌是 `WS_TREE_PAGE: rel= kind= children= has_more= selected=`、`WS_FILE_SELECTED`。`WS_TREE_TOGGLED` 只在勾選時印，遠端模式不能勾選，所以展開不會有它。
-3. **只在狀態列顯示、沒有日誌 tag 的訊息**：`remote_unsupported`（遠端工作區目前只支援瀏覽與預覽）、`remote_pair_missing`（請輸入位址與配對碼）、工作區清單讀取失敗。這些格子的通過線是：截圖裡有那段文字、剪貼簿 sentinel 的 SHA 不變、1 秒內沒有新的 `COPY_*` 或 `PASTE_*` 行。**不要因為少一行日誌就判 `fail`。**
+3. **只在狀態列顯示、沒有日誌 tag 的訊息**：`remote_unsupported`（遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視）、`remote_pair_missing`（請輸入位址與配對碼）、工作區清單讀取失敗。這些格子的通過線是：截圖裡有那段文字、剪貼簿 sentinel 的 SHA 不變、1 秒內沒有新的 `COPY_*` 或 `PASTE_*` 行。**不要因為少一行日誌就判 `fail`。**
 4. **預覽成功與失敗的分法**（`apply_source_preview`）：成功時日誌是 `PREVIEW_LOADING: <path>` 接著 `PREVIEW_LOADED: <path>`。worker 拒絕、二進位、過大時，只有 `PREVIEW_LOADING`，**沒有** `PREVIEW_LOADED`，預覽區顯示錯誤文字。失敗格的通過線：有 `PREVIEW_LOADING`、沒有 `PREVIEW_LOADED`、截圖裡是錯誤文字而不是檔案內容、下一次點擊 App 仍有反應。
 5. **指紋比對**：`REMOTE_PAIRED: fp=` 是 16 個十六進位字元。worker 印出的是 `XXXX-XXXX-XXXX-XXXX`。去掉 `-`、不分大小寫比較，兩者必須相同。選單列顯示的是 `XXXX-XXXX-XXXX-XXXX`。
 6. **文字輸入**：先點 `remote-addr-input` 或 `remote-code-input` 的 bounds，再用鍵盤輸入，然後截圖確認輸入框裡的字。貼上文字用 Cmd+V 時，要確認焦點在輸入框裡；否則 Cmd+V 是 App 的貼上。
@@ -177,6 +213,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | 該 worker 分享的工作區 | `remote-workspace:<wx>` |
 | 配對表單 | `btn-remote-pair-new`、`remote-addr-input`、`remote-code-input`、`btn-remote-pair` |
 | 工具列 | `btn-copy`、`btn-paste`、`btn-refresh`；左軌 `rail-project`、`rail-changes`、`rail-log` |
+| Changes 空狀態 | `changes-empty` |
+| Log 空狀態 | `log-empty` |
 
 | 日誌 | 意思 |
 |---|---|
@@ -185,6 +223,11 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | `[APP:REMOTE_WORKSPACES: count=N]` | 列出工作區成功（失敗時沒有這行，只在選單顯示紅字） |
 | `[APP:REMOTE_OPENED: <worker> ▸ <工作區> generation=N]` | 開啟遠端工作區 |
 | `[APP:TREE_ROW_REFUSED: not-utf8]` | 點了名稱不是 UTF-8 的列，無法開啟 |
+| `[APP:CHANGES_EMPTY: state=…]` | Changes 空狀態改變：`scanning`、`loading`、`no_repository`、`scan_failed`、`no_match`、`clean` |
+| `[APP:LOG_EMPTY: state=…]` | Log 空狀態改變：`scanning`、`loading`、`no_repository`、`failed`、`empty` |
+| `[APP:E2E_REPO: name=<名稱> ok=true/false …]` | 儲存庫掃描或載入狀態 |
+| `[APP:CHANGES_LOADED: <名稱> files=N]` | Changes 面板儲存庫變更清單載入完成 |
+| `[APP:REPO_LOADED: <名稱> files=N]` | 單一儲存庫變更載入完成 |
 | `[APP:REMOTE_WORKER: state=…]`、`[APP:REMOTE_PAIRING: state=open]` | 本機當 worker（本規程不測） |
 
 ## 4. 測案
@@ -197,9 +240,9 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 |---|---|---|
 | R01 | 點 `btn-workspace-menu` | 有 `btn-remote-pair-new`、`btn-remote-worker-toggle` 的 bounds；沒有任何 `remote-worker:*`（全新的設定資料夾）。截圖有「遠端節點」區塊 |
 | R02 | 點 `btn-remote-pair-new`，兩個欄位都空著，點 `btn-remote-pair` | 出現 `remote-addr-input`、`remote-code-input`；狀態顯示「請輸入位址與配對碼」；沒有 `REMOTE_PAIRED`／`REMOTE_PAIR_FAILED` |
-| R03 | 位址輸入 `100.95.28.19`，配對碼輸入錯的 `AAAA-AAAA`，點 `btn-remote-pair` | 一行新的 `REMOTE_PAIR_FAILED`；選單裡是紅字錯誤；`master-config/remote-workers.json` 不存在或沒有這台 |
-| R04 | 配對碼改成 worker 印出的那組（位址不加埠，預設 47821），點 `btn-remote-pair` | 出現 `REMOTE_PAIRED: name=ubuntu-ui fp=…`，fp 和 worker 指紋一致（第 3 節規則 5）；接著 `REMOTE_WORKSPACES: count=2`；`remote-workers.json` 有一筆 `ubuntu-ui`。按鈕在配對時會短暫顯示「配對中…」，截到就附上，截不到不影響判定 |
-| R05 | 截圖選單 | `remote-worker:0` 那一列顯示 `ubuntu-ui`、`100.95.28.19 · XXXX-XXXX-XXXX-XXXX`（指紋同 R04；存下來的位址不含預設埠）；底下兩列 `remote-workspace:0/1` 是 `edge`、`rtk`（試跑時是這個順序，順序不列入判定），各自附有 Ubuntu 上的路徑；路徑太長被截斷時，滑鼠移到那一列，tooltip 顯示完整路徑 |
+| R03 | 位址輸入 `100.95.28.19:47899`，配對碼輸入錯的 `AAAA-AAAA`，點 `btn-remote-pair` | 一行新的 `REMOTE_PAIR_FAILED`；選單裡是紅字錯誤；`master-config/remote-workers.json` 不存在或沒有這台 |
+| R04 | 配對碼改成 worker 印出的那組（位址用 `100.95.28.19:47899`，要帶埠，因為測試 worker 不在預設埠），點 `btn-remote-pair` | 出現 `REMOTE_PAIRED: name=ubuntu-ui fp=…`，fp 和 worker 指紋一致（第 3 節規則 5）；接著 `REMOTE_WORKSPACES: count=5`；`remote-workers.json` 有一筆 `ubuntu-ui`。按鈕在配對時會短暫顯示「配對中…」，截到就附上，截不到不影響判定 |
+| R05 | 截圖選單 | `remote-worker:0` 那一列顯示 `ubuntu-ui`、`100.95.28.19:47899 · XXXX-XXXX-XXXX-XXXX`（指紋同 R04）；底下五列 `remote-workspace:0..4` 依序為 `edge`、`rtk`、`gitws`、`plainws`、`inner`（依 worker 啟動時傳入的順序排列），各自附有 Ubuntu 上的路徑；路徑太長被截斷時，滑鼠移到那一列，tooltip 顯示完整路徑 |
 
 ### 4.2 瀏覽真實專案 rtk
 
@@ -241,9 +284,10 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 | ID | 動作 | 通過線 |
 |---|---|---|
-| R30 | 選一個檔案列，按 Cmd+C，再點 `btn-copy` | 兩次都顯示「遠端工作區目前只支援瀏覽與預覽」；sentinel 的 SHA 不變；沒有 `COPY_PREP`／`COPY_DONE` |
-| R31 | 按 Cmd+V，再點 `btn-paste` | 同一段狀態文字；沒有 `PASTE_PREVIEW`／`PASTE_LOADING`；沒有出現貼上面板；`ssh ubuntu "find '$W/edge' -newer '$W/rtk-marker' \| wc -l"` 是 0 |
-| R32 | 點 `rail-changes`、`rail-log` | 不顯示本機 repo 的資料，也不執行 git（spec：Git 檢視要拒絕）。顯示拒絕訊息或空畫面都算對；顯示 `local-ws` 的變更或 commit 判 `fail`。截圖並寫下實際畫面 |
+| R30 | 選一個檔案列，按 Cmd+C，再點 `btn-copy` | 兩次都顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」；sentinel 的 SHA 不變；沒有 `COPY_PREP`／`COPY_DONE` |
+| R31 | 按 Cmd+V，再點 `btn-paste` | 兩次都顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」；沒有 `PASTE_PREVIEW`／`PASTE_LOADING`；沒有出現貼上面板；`ssh ubuntu "find '$W/edge' -newer '$W/rtk-marker' \| wc -l"` 是 0 |
+| R32 | 點 `rail-changes`、`rail-log` | 此時開著的是 `edge`（R15 切過去的）：點 `rail-changes`，`edge/nested` 只有空的 `.git` 資料夾，探索把它當 repo（`workspace.rs:540-548` `classify_git`），所以必須看到 `nested` 的錯誤列（Note），**不能**出現 `state=clean`，也沒有 `local-ws` 的任何列；點 `rail-log`，看到 `log-empty` 為 `failed`（或錯誤提示列含 `nested`），不是「沒有 commit」。**空畫面或 `state=clean` 判 `fail`** |
+| R32b | 從工作區選單切回 `rtk`，點 `rail-changes` 與 `rail-log` | 點 `rail-changes` → `state=clean`（rtk 工作樹乾淨）；點 `rail-log` → 第一列是受測當天 `ssh ubuntu 'git -C ~/research/rtk rev-parse HEAD'` 的 commit。**空畫面判 `fail`**。R34 之前照原文先開回 `edge` |
 | R33 | 用 Cmd+Shift+O（或工作區選單的最近工作區）打開本機的 `$RUN/local-ws`，選 `local.txt`，按 Cmd+C | 左上角不再有 `ubuntu-ui ▸`；`COPY_DONE`；`pbpaste` 拿到 snip-sync 的 payload（剪貼簿 SHA 和 sentinel 不同）。這格驗證離開遠端之後，遠端狀態有清乾淨 |
 
 ### 4.5 即時變化與 worker 生命週期
@@ -256,12 +300,12 @@ R34 之前，先重新開回 `edge`（R15 的步驟）。
 | R35 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2`，不是快取的舊內容 |
 | R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | `ws-tree-row:new.txt` 出現 `CTRL_GONE`；R35 開著的 `new.txt` 預覽重新讀取，改顯示錯誤，不再是 `fresh-2` |
 | R37 | 停掉 worker：`ssh ubuntu "kill \$(cat '$W/worker.pid')"`，在 App 點一個沒預覽過的檔案 | 失敗格；`PREVIEW_LOADING` 之後 10 秒內出現錯誤（master 連線逾時 2 秒、讀取 5 秒）；這段時間 App 沒有凍結（可以捲動、可以開選單）；接著按 Cmd+Shift+W 關掉工作區，要在 8 秒內完成 |
-| R38 | `start_worker wcfg "$W/edge" /home/audichuang/research/rtk`；確認指紋和第一次一樣；在 App 選單點 `remote-worker:0`，開 `edge`，點一個檔案 | 不需要重新配對；`REMOTE_WORKSPACES: count=2`、`REMOTE_OPENED`、`PREVIEW_LOADED` |
+| R38 | `start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"`；確認指紋和第一次一樣；在 App 選單點 `remote-worker:0`，開 `edge`，點一個檔案 | 不需要重新配對；`REMOTE_WORKSPACES: count=5`、`REMOTE_OPENED`、`PREVIEW_LOADED` |
 | R39 | 取消分享：`start_worker wcfg /home/audichuang/research/rtk`（只分享 rtk）。App 不重開，直接點 `edge` 裡另一個檔案，再開選單點 `remote-worker:0` | 預覽被拒絕（失敗格）；選單只列出 `rtk`（`REMOTE_WORKSPACES: count=1`） |
 | R40 | 換一張憑證：`start_worker wcfg-other "$W/edge"`（同一個位址，新的設定資料夾），在 App 選單點 `remote-worker:0` | 拒絕；選單顯示紅字，內容說明這不是已配對的 worker（內容含兩個指紋）；`remote-workers.json` 的指紋沒有被改成新的 |
-| R41 | 復原：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk`，點 `remote-worker:0` | `REMOTE_WORKSPACES: count=2` |
+| R41 | 復原：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"`，點 `remote-worker:0` | `REMOTE_WORKSPACES: count=5` |
 | R42 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` 重新啟動（寫進新的 `app-N.log`），開選單 | `remote-worker:0` 仍然是 `ubuntu-ui`，點它就能列出工作區，不需要重新配對 |
-| R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk` 拿新的配對碼 C。Cmd+Q，改用全新的 `SNIP_CONFIG_DIR="$RUN/master-config-r43"` 啟動 App（寫進新的 `app-N.log`）。用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C。再 Cmd+Q，用原本的 `SNIP_CONFIG_DIR` 重新啟動，點 `remote-worker:0` | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；換回原本的設定後，`remote-worker:0` 仍然能列出工作區。一定要用全新的 master：已配對的 master，worker 認得它的憑證，不看配對碼就放行 |
+| R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"` 拿新的配對碼 C。Cmd+Q，改用全新的 `SNIP_CONFIG_DIR="$RUN/master-config-r43"` 啟動 App（寫進新的 `app-N.log`）。用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C（位址同樣用 `100.95.28.19:47899`）。再 Cmd+Q，用原本的 `SNIP_CONFIG_DIR` 重新啟動，點 `remote-worker:0` | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；換回原本的設定後，`remote-worker:0` 仍然能列出工作區。一定要用全新的 master：已配對的 master，worker 認得它的憑證，不看配對碼就放行 |
 | R44 | 把視窗調成 900×600（從系統層設定，例如 System Events 設成 900×632；送給 App 的合成拖曳碰不到視窗框），開選單並打開配對表單 | 兩個輸入框和「配對」按鈕的 bounds 都 `w,h ≥ 1`，而且都在內容區裡面；選單可以捲動到最下面；焦點在輸入框時按 Escape，選單收起；再開選單，點 `btn-workspace-menu`，選單也會收起 |
 | R45 | 先開著 `edge`，再點 `btn-remote-forget:0` | 開著的 `edge` 跟著關閉：左上角不再有 `ubuntu-ui ▸`，`ws-tree-row:*` 都有 `CTRL_GONE`；`remote-worker:0` 有 `CTRL_GONE`；`remote-workers.json` 不再有 `ubuntu-ui`；重開選單也不會再出現 |
 
@@ -271,16 +315,41 @@ R45 之前，或在 R45 之後重新配對一次（重啟 worker 拿新碼，用
 
 | ID | 動作 | 通過線 |
 |---|---|---|
-| C01 | `target/debug/snip remote workers`（同一個 `SNIP_CONFIG_DIR`） | 不用另外配對就列出 `1	ubuntu-ui	100.95.28.19	<指紋>`，證明 GUI 和 CLI 共用配對紀錄 |
+| C01 | `target/debug/snip remote workers`（同一個 `SNIP_CONFIG_DIR`） | 不用另外配對就列出 `1	ubuntu-ui	100.95.28.19:47899	<指紋>`，證明 GUI 和 CLI 共用配對紀錄 |
 | C02 | `snip remote workspaces 1`、`snip remote ls 1 rtk src` | 結果和 R05、R08 在 GUI 上看到的一致 |
 | C03 | 對 rtk 抽 20 個 tracked 文字檔，比較 `snip remote cat 1 rtk <f> \| shasum -a 256` 和 `ssh ubuntu sha256sum` | 20/20 相同 |
 | C04 | App 開著 rtk 的時候，同時跑 50 個平行的 `snip remote cat 1 rtk src/main.rs` | 50/50 正確；這段時間在 GUI 點檔案仍然能預覽（`PREVIEW_LOADED`） |
+
+### 4.7 遠端唯讀 Git 檢視（G01–G12）
+
+若 R45 已忘記 worker，進入 §4.7 之前需重新啟動 worker 並在 GUI 重新配對一次：
+
+```bash
+start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"
+```
+
+在 GUI 完成配對，以確保 `gitws`、`plainws` 與 `outer/inner` 均已分享且完成配對。
+
+| ID | 動作 | 通過線 |
+|---|---|---|
+| G01 | 從工作區選單開 `gitws`，點 `rail-changes` | 掃描發現儲存庫；Changes 列出 alpha 的四個項目（`a.txt` 改動、`staged.txt` 暫存、`new.txt` 未追蹤、`link-to-secret` 未追蹤符號連結），分組與 `git status --porcelain=v2` 的 oracle 一致（若點選 `link-to-secret` 預覽必須被拒絕）；beta 乾淨沒有列出；`broken`（空 `.git`）顯示為 Note 錯誤列；日誌有 `[APP:E2E_REPO: …]`，筆數與狀態與 oracle 一致 |
+| G02 | 在 Changes 面板點 `a.txt` | 右側 diff 顯示 patch，內容包含 `commit 2 a modified` 改動行，不是空畫面或錯誤 |
+| G03 | 點 `rail-log`，看跨 repo 合併歷史，再使用 Repository 下拉選單只選 `alpha` | 預設顯示跨 repo 的 merged log（包含 alpha 與 beta 的 commit）；在 Repository 篩選器只選取 alpha 後，commit 清單僅顯示 alpha 的 commit |
+| G04 | 點選 alpha 的 HEAD commit | 右下方變更檔案清單與 worker 端 `git diff-tree --no-commit-id --name-only -r HEAD` 逐一相符 |
+| G05 | 在 commit 變更檔案清單中點選其中一個檔案 | 右側預覽顯示該 commit 檔案的 diff |
+| G06 | 點開分支／ref 選擇器 | 選擇器下拉清單正確列出 `main` 分支 |
+| G07 | 歷史面板切換至 commit 樹瀏覽 | 可展開目錄、瀏覽 commit 樹節點與檢視 blob 檔案內容 |
+| G08 | 從工作區選單開 `plainws` | 專案樹正常瀏覽檔案；點 `rail-changes` 顯示 `changes-empty` probe，日誌為 `[APP:CHANGES_EMPTY: state=no_repository]`；點 `rail-log` 顯示 `log-empty` probe，日誌為 `[APP:LOG_EMPTY: state=no_repository]`，提示「這個資料夾裡沒有 Git 儲存庫」，不是 clean 或 empty |
+| G09 | 從工作區選單開 `outer/inner` | 判定為 `no_repository`，專案樹只列出 `inner` 的檔案，專案樹與變更清單絕不出現父 repo 的 `outer-dirty.txt` |
+| G10 | 在 worker 端修改 beta 的檔案：`ssh ubuntu "echo beta-change >> '$W/gitws/beta/b.txt'"`，在 App 點 `btn-refresh` | 重新整理後 Changes 面板中 `beta` 出現變更列，即時反映 worker 上的檔案修改 |
+| G11 | 停掉 worker（`ssh ubuntu "kill \$(cat '$W/worker.pid')"`），在 Changes 點選一個檔案 | 預覽顯示連線失敗錯誤，絕不誤顯示為乾淨或空內容；App 不凍結 |
+| G12 | 以受測 SHA 的 `snip worker --max-protocol 1` 啟動 worker，分享 `gitws` 與 `edge`：`WORKER_EXTRA='--max-protocol 1' start_worker wcfg "$W/edge" "$W/gitws"`，從工作區選單重新開啟 `gitws` | 專案樹檔案瀏覽與預覽正常；點 `rail-changes` 與 `rail-log` 皆顯示「版本太舊」錯誤（`remote_worker_too_old`），提示在 worker 上更新；絕不顯示成 clean 或 empty |
 
 ## 5. 完整性（決定這一輪可不可信）
 
 | ID | 檢查 | 通過線 |
 |---|---|---|
-| I01 | 結束時用同一行命令重新產生三項，寫進 `rtk-after.txt`。`git status` 一定要加 `GIT_OPTIONAL_LOCKS=0`：少了它，git 會建立又刪掉 `.git/index.lock`，`.git` 目錄的修改時間因此變新，下面的 `find` 就會算到它 | 和 `rtk-before.txt` 完全相同；另外 `ssh ubuntu "find ~/research/rtk -newer '$W/rtk-marker' -not -path '*/.git/*' \| wc -l"` 是 0 |
+| I01 | 結束時用同一行命令重新產生各項（包含 HEAD、status、`.git/index` 的 sha256 與檔案時間戳），寫進 `rtk-after.txt`。所有 git 指令一定要加 `GIT_OPTIONAL_LOCKS=0`（及 `--no-optional-locks`）：少了它，git 會建立又刪掉 `.git/index.lock`，`.git` 目錄的修改時間因此變新，下面的 `find` 就會算到它 | 和 `rtk-before.txt` 完全相同（`.git/index` 的 sha256 亦未改變，證明 Git 檢視未修改 index）；另外 `ssh ubuntu "find ~/research/rtk -newer '$W/rtk-marker' -not -path '*/.git/*' \| wc -l"` 是 0 |
 | I02 | 同 2.2，重新列出 `$REAL` 並算雜湊 | 和 `real-config-before.*` 相同（這一輪沒有碰真實的配對紀錄） |
 | I03 | `grep -c top-secret-c0ffee "$RUN"/app-*.log "$RUN"/*/action.json` | 全部是 0 |
 
@@ -290,16 +359,16 @@ R45 之前，或在 R45 之後重新配對一次（重啟 worker 拿新碼，用
 ssh ubuntu "kill \$(cat '$W/worker.pid') 2>/dev/null; rm -rf '$W'"
 ```
 
-只刪 `$W`。不要動 `~/research/rtk`，也不要動 Ubuntu 上 linuxbrew 的 `snip`。Mac 上的 `$RUN` 保留，裡面是證據。
+只刪 `$W`。只停本輪的 worker，不要停使用者的 `snip-worker.service` / `com.audichuang.snip-worker`（47821 埠）。不要動 `~/research/rtk`，也不要動 Ubuntu 上 linuxbrew 的 `snip`。Mac 上的 `$RUN` 保留，裡面是證據。
 
 ## 7. 計分
 
-`scorecard.md` 列出 R01–R45、C01–C04、I01–I03，每格一個判定，並附證據路徑。
+`scorecard.md` 列出 R01–R45、R32b、G01–G12、C01–C04、I01–I03，每格一個判定，並附證據路徑。
 
-- **閘門**：第 0 步閘門通過，而且 R01–R45、C01–C04、I01–I03 全部是 `pass`，才寫「遠端節點真實 UI 閘門關閉」。
+- **閘門**：第 0 步閘門通過，而且 R01–R45、R32b、G01–G12、C01–C04、I01–I03 全部是 `pass`，才寫「遠端節點真實 UI 閘門關閉」。
 - 有任何 `ui-defect`、`fail` 或 `not-run`，第一句就寫「遠端節點真實 UI 閘門打開」，並列出那些 ID。
 - I01 或 I02 不是 `pass`，整輪結果作廢：這一輪動到了真實資料，先報告，再處理其他格子。
-- R27、R32 的預期本來就允許多種畫面。判 `pass` 時，證據欄要寫實際看到的是哪一種，下一輪才能收緊。
+- R27 的預期允許多種畫面。判 `pass` 時，證據欄要寫實際看到的是哪一種，下一輪才能收緊。
 
 處理結果時，每個不是 `pass` 的格子先分清楚是哪一種錯，再動手。三種的修法不同，混在一起會修錯地方：
 
