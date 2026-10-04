@@ -5179,14 +5179,15 @@ fn startup_choice(
 }
 
 /// [`startup_choice`] on the remembered workspaces; nothing is read under
-/// `cfg(test)` or in an e2e run without `SNIP_CONFIG_DIR`.
-fn startup_workspace(arg: Option<PathBuf>) -> Startup {
+/// `cfg(test)` or in an e2e run without `SNIP_CONFIG_DIR`. Only a normal
+/// launch (`allow_remote`) reconnects to a remote workspace.
+fn startup_workspace(arg: Option<PathBuf>, allow_remote: bool) -> Startup {
 	if arg.is_some() {
 		return startup_choice(arg, None, None, None, None);
 	}
 	startup_choice(
 		None,
-		remote::load_last(),
+		remote::load_last().filter(|_| allow_remote),
 		recent::load().into_iter().next(),
 		std::env::current_dir().ok(),
 		recent::home(),
@@ -5372,10 +5373,11 @@ fn key_bindings() -> Vec<KeyBinding> {
 
 fn main() {
 	let (workspace, mode, restore_dir) = parse_cli_args();
-	let (workspace, reconnect) = match startup_workspace(workspace) {
-		Startup::Remote(last) if mode == "normal" => (None, Some(last)),
-		other => (other.local(), None),
-	};
+	let (workspace, reconnect) =
+		match startup_workspace(workspace, mode == "normal") {
+			Startup::Remote(last) => (None, Some(last)),
+			other => (other.local(), None),
+		};
 	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
@@ -5476,7 +5478,7 @@ mod tests {
 			Startup::Nothing
 		);
 		// Nothing remembered is read under cfg(test).
-		assert!(!matches!(startup_workspace(None), Startup::Remote(_)));
+		assert!(!matches!(startup_workspace(None, true), Startup::Remote(_)));
 	}
 
 	/// UI state driven in-process: no display, so these also run in the

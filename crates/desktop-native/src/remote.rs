@@ -612,9 +612,9 @@ impl WorkbenchModel {
 		match &result {
 			Ok(listing) => {
 				app_log!(
-					"[APP:REMOTE_HOST_LISTED: host={name} path={} folders={}]",
-					listing.path,
-					listing.folders.len()
+					"[APP:REMOTE_HOST_LISTED: host={name} folders={} path={}]",
+					listing.folders.len(),
+					listing.path
 				);
 				browse.path = listing.path.clone();
 				let path = listing.path.clone();
