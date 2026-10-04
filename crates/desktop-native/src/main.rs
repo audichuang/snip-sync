@@ -5475,6 +5475,77 @@ mod tests {
 			REMOTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 		}
 
+		/// A remote open goes through the shared close drain, which also
+		/// waits for every git process in this test binary (GitLoad is
+		/// process wide), so under parallel tests it may not end on its own
+		/// here. Polled as if git were idle, the intent it queued lands.
+		fn land_remote_open(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			model.update(cx, |m, cx| {
+				assert!(!m.workspace_menu, "{:?}", m.remote.message);
+				if m.remote.session.is_none() {
+					assert_eq!(
+						m.lifecycle.intent_name(),
+						"open-remote-workspace"
+					);
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now(),
+						crate::lifecycle::GitLoad::idle(),
+					);
+					let crate::lifecycle::Step::Ready(
+						crate::lifecycle::Intent::OpenRemoteWorkspace(target),
+					) = step
+					else {
+						panic!("drain not ready: {step:?}");
+					};
+					// finish_intent would check the real GitLoad again.
+					let (host, ws) = *target;
+					m.finish_open_remote(host, ws, cx);
+				}
+			});
+		}
+
+		/// A window with no workspace and an in-process worker as the only
+		/// ssh host, its menu open.
+		fn remote_menu(
+			cx: &mut TestAppContext,
+		) -> (Entity<WorkbenchModel>, &mut VisualTestContext) {
+			let worker = std::sync::Arc::new(snip_remote::Worker::new(
+				snip_remote::WorkerOptions::default(),
+			));
+			let host = snip_remote::RemoteHost::in_process(worker);
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(None, None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			model.update(cx, |m, _| {
+				m.workspace_menu = true;
+				m.remote.hosts = vec![host];
+				m.remote.recent.clear();
+			});
+			(model, cx)
+		}
+
+		/// The folder shown in the host's block, and its subfolders.
+		fn shown_folder(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> (String, Vec<String>) {
+			model.read_with(cx, |m, _| {
+				let b = m.remote.browse.as_ref().expect("a host browsed");
+				let Some(Ok(listing)) = &b.listing else {
+					panic!("not listed: {b:?}");
+				};
+				assert_eq!(b.path, listing.path);
+				let mut folders = listing.folders.clone();
+				folders.sort();
+				(listing.path.clone(), folders)
+			})
+		}
+
 		/// Lists an in-process worker as the only ssh host, opens `shared`
 		/// on it as the workspace, and awaits background tree and status
 		/// reads.
@@ -5504,33 +5575,7 @@ mod tests {
 				m.open_remote_path(0, path, cx);
 			});
 			settle(cx);
-
-			// The open goes through the shared close drain, which also waits
-			// for every git process in this test binary (GitLoad is process
-			// wide), so under parallel tests it may not end on its own here.
-			// Polled as if git were idle, the intent it queued lands.
-			model.update(cx, |m, cx| {
-				assert!(!m.workspace_menu, "{:?}", m.remote.message);
-				if m.remote.session.is_none() {
-					assert_eq!(
-						m.lifecycle.intent_name(),
-						"open-remote-workspace"
-					);
-					let step = m.lifecycle.poll_at(
-						std::time::Instant::now(),
-						crate::lifecycle::GitLoad::idle(),
-					);
-					let crate::lifecycle::Step::Ready(
-						crate::lifecycle::Intent::OpenRemoteWorkspace(target),
-					) = step
-					else {
-						panic!("drain not ready: {step:?}");
-					};
-					// finish_intent would check the real GitLoad again.
-					let (host, ws) = *target;
-					m.finish_open_remote(host, ws, cx);
-				}
-			});
+			land_remote_open(&model, cx);
 			for _ in 0..10 {
 				settle(cx);
 				let done = model.read_with(cx, |m, _| {
@@ -5589,10 +5634,12 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.remote.message, None);
 				assert_eq!(m.remote.hosts.len(), 1);
-				let Some((0, Some(Ok(listing)))) = &m.remote.browse else {
+				let Some(Some(Ok(listing))) =
+					m.remote.browse.as_ref().map(|b| &b.listing)
+				else {
 					panic!("home not listed: {:?}", m.remote.browse);
 				};
-				assert!(!listing.home.is_empty());
+				assert!(!listing.path.is_empty());
 				let session = m.remote.session.as_ref().expect("open");
 				assert_eq!(session.workspace.name, "shared");
 				assert_eq!(m.remote.recent[0].path, session.workspace.id);
@@ -5708,6 +5755,113 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert!(m.preview_error.is_some(), "refused read shown");
 			});
+		}
+
+		/// Clicking a folder of a host enters it and opens nothing; "up one
+		/// level" goes back; "open this folder" opens the folder shown. The
+		/// temp folder is reached through macOS's `/var` symlink, so the
+		/// worker's real path differs from the one asked for.
+		#[gpui::test]
+		fn remote_folder_browser_enters_goes_up_and_opens_here(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("base");
+			for d in ["a/x", "a/y", "b", ".hidden"] {
+				fs::create_dir_all(base.join(d)).unwrap();
+			}
+			fs::write(base.join("file.txt"), "f").unwrap();
+			let real = |p: &Path| {
+				dunce::canonicalize(p).unwrap().display().to_string()
+			};
+			let (model, cx) = remote_menu(cx);
+
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+			});
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base));
+			assert_eq!(folders, ["a", "b"], "dot folders and files hidden");
+			model.read_with(cx, |m, cx| {
+				assert_eq!(m.remote_path_input.read(cx).text(), real(&base));
+			});
+
+			model.update(cx, |m, cx| m.enter_remote_folder("a", cx));
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base.join("a")));
+			assert_eq!(folders, ["x", "y"]);
+			model.read_with(cx, |m, cx| {
+				assert!(m.remote.session.is_none(), "entering opens nothing");
+				assert!(!m.workspace_open && m.workspace_menu);
+				assert_eq!(m.lifecycle.intent_name(), "none");
+				assert_eq!(
+					m.remote_path_input.read(cx).text(),
+					real(&base.join("a"))
+				);
+			});
+
+			model.update(cx, |m, cx| m.remote_up(cx));
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base));
+			assert_eq!(folders, ["a", "b"]);
+
+			model.update(cx, |m, cx| m.enter_remote_folder("b", cx));
+			settle(cx);
+			model.update(cx, |m, cx| m.open_remote_here(cx));
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("opened");
+				assert_eq!(session.workspace.id, real(&base.join("b")));
+				assert_eq!(m.remote.recent[0].path, session.workspace.id);
+				assert!(m.workspace_open);
+			});
+		}
+
+		/// A listing that lands for a folder or host no longer shown is
+		/// dropped.
+		#[gpui::test]
+		fn remote_folder_listing_for_a_folder_no_longer_shown_is_dropped(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			fs::create_dir_all(tmp.path().join("a")).unwrap();
+			let (model, cx) = remote_menu(cx);
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, tmp.path().display().to_string(), cx);
+			});
+			settle(cx);
+			let before = shown_folder(&model, cx);
+			model.update(cx, |m, cx| {
+				let seq = m.remote.browse.as_ref().unwrap().seq();
+				m.remote_listing_landed(
+					seq.wrapping_sub(1),
+					Ok(crate::remote::FolderListing {
+						path: "/elsewhere".into(),
+						folders: vec!["zzz".into()],
+					}),
+					cx,
+				);
+			});
+			assert_eq!(shown_folder(&model, cx), before);
+
+			// Asked for while another listing was on its way: only the newer
+			// one lands.
+			model.update(cx, |m, cx| {
+				m.enter_remote_folder("a", cx);
+				let stale = m.remote.browse.as_ref().unwrap().seq();
+				m.remote_up(cx);
+				m.remote_listing_landed(stale, Err("late failure".into()), cx);
+				assert_eq!(m.remote.browse.as_ref().unwrap().listing, None);
+			});
+			settle(cx);
+			assert_eq!(shown_folder(&model, cx).0, before.0.clone());
 		}
 
 		#[gpui::test]
