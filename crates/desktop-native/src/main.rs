@@ -1681,7 +1681,13 @@ impl WorkbenchModel {
 	}
 
 	pub fn current_restore_destination(&self) -> PathBuf {
-		if let Some(ref d) = self.restore_dir {
+		// A remote workspace pastes into its own folders only.
+		let remote_root = self.remote.session.as_ref().map(|s| &s.root);
+		let restore_dir = self
+			.restore_dir
+			.as_ref()
+			.filter(|d| remote_root.is_none_or(|root| d.starts_with(root)));
+		if let Some(d) = restore_dir {
 			d.clone()
 		} else if let Some(root) = self.repo_root() {
 			root
@@ -4518,10 +4524,6 @@ impl WorkbenchModel {
 		if self.refuse_while_applying("preview", cx) {
 			return;
 		}
-		if self.remote_blocks() {
-			cx.notify();
-			return;
-		}
 		if !self.workspace_open {
 			self.set_status("workspace_not_open", []);
 			cx.notify();
@@ -4570,6 +4572,11 @@ impl WorkbenchModel {
 				dest: target_dest,
 				roots: known_roots,
 				generation: self.generation,
+				remote: self
+					.remote
+					.session
+					.clone()
+					.map(|session| paste::RemotePaste { session }),
 			},
 			cx,
 		);
@@ -5815,16 +5822,13 @@ mod tests {
 				m.select_file_in(root, "src/main.rs", SourceKind::File, cx);
 			});
 			settle(cx);
-			model.update(cx, |m, cx| {
+			model.read_with(cx, |m, _| {
 				let p = m.preview.as_ref().expect("remote preview");
 				assert_eq!(&*p.text, "fn main() {}\n");
 				assert_eq!(m.preview_error, None);
 				// The breadcrumb names the host, never the internal root.
 				let root = m.ws_root().unwrap();
 				assert_eq!(m.log_repo_name(&root), "test-worker ▸ shared");
-				// Copy and paste stay local; a remote workspace refuses them.
-				m.trigger_paste_preview(cx);
-				assert_eq!(m.status.key, "remote_unsupported");
 			});
 
 			// Refresh re-reads the open file: deleted on the worker, it shows
@@ -7695,6 +7699,340 @@ mod tests {
 					snip_core::clip::Mode::Commits
 				),
 				"{text}"
+			);
+		}
+
+		/// Puts `payload` on the clipboard, opens its paste preview in the
+		/// remote workspace and waits (bounded) for the worker's plan.
+		fn remote_paste_preview(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			payload: &str,
+		) {
+			clip::write_text(payload).unwrap();
+			model.update(cx, |m, cx| m.trigger_paste_preview(cx));
+			for _ in 0..300 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				});
+				if done {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.paste.plan().is_some() && !m.paste.is_loading(),
+					"no remote preview: {}",
+					m.status
+				);
+			});
+		}
+
+		/// Applies, as the Apply button does, and waits (bounded) for the
+		/// worker's answer.
+		fn remote_paste_apply(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			model.update(cx, |m, cx| m.apply_paste_restore(cx));
+			for _ in 0..300 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste_busy()) {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			assert!(
+				!model.read_with(cx, |m, _| m.paste_busy()),
+				"remote apply never ended"
+			);
+		}
+
+		/// Paste into a remote workspace through the real panel: the worker
+		/// plans (rows, overwrite gating, unchecked rows), writes what was
+		/// confirmed, refuses a destination changed behind the preview, never
+		/// writes into `.git`, and replays a commit payload.
+		#[gpui::test]
+		fn remote_paste_runs_on_the_worker(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			let real = dunce::canonicalize(&alpha).unwrap();
+
+			// Rows come from the worker's plan, with its paths.
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: init.txt\nnew init\n// FILE: a.txt\nA\n// FILE: b.txt\nB\n",
+			);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.remote.is_some());
+				let rows: Vec<_> = plan
+					.items
+					.iter()
+					.map(|i| (i.path.as_str(), i.op, i.dest_exists))
+					.collect();
+				assert_eq!(
+					rows,
+					[
+						("init.txt", crate::paste::PlannedOp::Overwrite, true),
+						("a.txt", crate::paste::PlannedOp::Create, false),
+						("b.txt", crate::paste::PlannedOp::Create, false),
+					]
+				);
+				assert_eq!(plan.items[1].dest_path, real.join("a.txt"));
+				// Shown as the host's folder, never the internal root.
+				assert!(
+					plan.shown(&plan.destination).starts_with("test-worker:"),
+					"{}",
+					plan.shown(&plan.destination)
+				);
+				assert!(plan.overwrite_missing());
+			});
+			// Overwrite is off by default: Apply keeps init.txt. b.txt is
+			// unticked.
+			click(cx, "paste-include:2:b.txt");
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
+			});
+			assert_eq!(fs::read_to_string(alpha.join("a.txt")).unwrap(), "A");
+			assert_eq!(
+				fs::read_to_string(alpha.join("init.txt")).unwrap(),
+				"hello\n"
+			);
+			assert!(!alpha.join("b.txt").exists());
+
+			// Allowing the overwrite writes it, byte for byte.
+			remote_paste_preview(&model, cx, "// FILE: init.txt\nnew init\n");
+			click(cx, "paste-overwrite:0:init.txt");
+			remote_paste_apply(&model, cx);
+			assert_eq!(
+				fs::read_to_string(alpha.join("init.txt")).unwrap(),
+				"new init"
+			);
+
+			// A target created behind the preview's back: refused as stale,
+			// nothing written, the plan stays open.
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: c.txt\nfrom clipboard\n",
+			);
+			fs::write(alpha.join("c.txt"), "external").unwrap();
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "stale_created", "{}", m.status);
+				let plan = m.paste.plan().expect("plan stays open");
+				assert!(!plan.is_applying);
+			});
+			assert_eq!(
+				fs::read_to_string(alpha.join("c.txt")).unwrap(),
+				"external"
+			);
+			model.update(cx, |m, cx| m.cancel_paste_preview(cx));
+
+			// `.git` entries are skipped rows; Apply writes nothing there.
+			let hooks = alpha.join(".git/hooks");
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: .git/hooks/pre-commit\n#!/bin/sh\necho owned\n// FILE: d.txt\nD\n",
+			);
+			// `.git/` reads as a folder prefix: keep it under the destination,
+			// as a user would to get past the mapping row.
+			model.update(cx, |m, cx| m.choose_paste_keep(".git", cx));
+			for _ in 0..300 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					!m.paste.is_loading()
+						&& m.paste.plan().is_some_and(|p| p.executable())
+				});
+				if done {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				let paths: Vec<_> =
+					plan.items.iter().map(|i| i.path.as_str()).collect();
+				assert_eq!(paths, ["d.txt"]);
+				assert_eq!(plan.counts().skips, 1);
+			});
+			remote_paste_apply(&model, cx);
+			assert!(!hooks.join("pre-commit").exists());
+			assert_eq!(fs::read_to_string(alpha.join("d.txt")).unwrap(), "D");
+
+			// Commit mode: the worker replays the payload onto the repo.
+			crate::paste::tests::git_run(&alpha, &["add", "."]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "pasted"]);
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "incoming\n".into(),
+						author_name: "Author".into(),
+						author_email: "author@example.invalid".into(),
+						author_date: "2026-09-21T12:00:00+00:00".into(),
+						files: vec![CommitFile {
+							path: "replayed.txt".into(),
+							old_path: None,
+							change: FileChange::Added,
+							content: Some("replayed\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			remote_paste_preview(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.whole_commit, "{}", m.status);
+				assert_eq!(plan.items.len(), 1);
+				assert_eq!(plan.items[0].dest_root_name, "alpha");
+				assert_eq!(plan.items[0].dest_path, real.join("replayed.txt"));
+			});
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
+			});
+			assert_eq!(
+				crate::paste::tests::git_run(
+					&alpha,
+					&["log", "-1", "--format=%s %an"]
+				)
+				.trim(),
+				"incoming Author"
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("replayed.txt")).unwrap(),
+				"replayed\n"
+			);
+		}
+
+		/// Prefix rows offer the remote workspace's repositories, shown as
+		/// the host's folders, and route each prefix to the one picked.
+		#[gpui::test]
+		fn remote_paste_maps_prefixes_to_remote_repositories(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			for name in ["alpha", "beta"] {
+				let repo = shared.join(name);
+				fs::create_dir_all(&repo).unwrap();
+				crate::paste::tests::git_init(&repo);
+				fs::write(repo.join("init.txt"), "hello\n").unwrap();
+				crate::paste::tests::git_run(&repo, &["add", "init.txt"]);
+				crate::paste::tests::git_run(&repo, &["commit", "-m", "init"]);
+			}
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.repos.len() == 2) {
+					break;
+				}
+			}
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: alpha/x.txt\nx\n// FILE: beta/y.txt\ny\n",
+			);
+			for prefix in ["alpha", "beta"] {
+				let idx = model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					let choice = plan
+						.prefix_choices
+						.iter()
+						.find(|c| c.prefix == prefix)
+						.unwrap();
+					let shown: Vec<_> = choice
+						.candidates
+						.iter()
+						.map(|c| plan.shown(c))
+						.collect();
+					assert!(
+						shown.iter().all(|s| s.starts_with("test-worker:")),
+						"{shown:?}"
+					);
+					choice
+						.candidates
+						.iter()
+						.position(|c| c.ends_with(prefix))
+						.unwrap()
+				});
+				model
+					.update(cx, |m, cx| m.choose_paste_prefix(prefix, idx, cx));
+				for _ in 0..300 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.paste.is_loading()) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.executable(), "{}", m.status);
+				let rows: Vec<_> = plan
+					.items
+					.iter()
+					.map(|i| (i.dest_root_name.as_str(), i.path.as_str()))
+					.collect();
+				assert_eq!(rows, [("alpha", "x.txt"), ("beta", "y.txt")]);
+			});
+			remote_paste_apply(&model, cx);
+			assert_eq!(
+				fs::read_to_string(shared.join("alpha/x.txt")).unwrap(),
+				"x"
+			);
+			assert_eq!(
+				fs::read_to_string(shared.join("beta/y.txt")).unwrap(),
+				"y"
 			);
 		}
 

@@ -169,7 +169,10 @@ impl WorkbenchModel {
 		&self,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
-		let dest = self.current_restore_destination().display().to_string();
+		let dest = crate::remote::display_path(
+			self.remote.session.as_ref(),
+			&self.current_restore_destination(),
+		);
 		div()
 			.id("paste-panel")
 			.key_context("PastePanel")
@@ -301,7 +304,7 @@ impl WorkbenchModel {
 			skips,
 		} = plan.counts();
 		let commit_label = plan.commit_summary_label(loc);
-		let dest = plan.destination.display().to_string();
+		let dest = plan.shown(&plan.destination);
 		let applying = plan.is_applying;
 		let mapping_ready = plan.mapping_ready();
 		let selected = plan.items.get(plan.selected_item_idx);
@@ -574,14 +577,14 @@ impl WorkbenchModel {
 						let target = if kept {
 							format!(
 								"{}/{}",
-								plan.destination.display(),
+								plan.shown(&plan.destination),
 								choice.prefix
 							)
 						} else {
 							choice
 								.destination
 								.as_ref()
-								.map(|p| p.display().to_string())
+								.map(|p| plan.shown(p))
 								.unwrap_or_else(|| {
 									t("mapping_unresolved", loc).into()
 								})
@@ -589,9 +592,13 @@ impl WorkbenchModel {
 						let resolved = kept || choice.destination.is_some();
 						let target_id = format!("paste-map-target:{prefix}");
 						let row_id = format!("paste-map:{prefix}");
-						let labels = Self::disambiguate_candidate_labels(
-							&choice.candidates,
-						);
+						let shown: Vec<PathBuf> = choice
+							.candidates
+							.iter()
+							.map(|p| PathBuf::from(plan.shown(p)))
+							.collect();
+						let labels =
+							Self::disambiguate_candidate_labels(&shown);
 						let keep_id = format!("paste-map-keep:{prefix}");
 						let prefix_keep = prefix.clone();
 						let keep_btn = button(
@@ -603,7 +610,7 @@ impl WorkbenchModel {
 						)
 						.tooltip(tip(format!(
 							"{}/{}",
-							plan.destination.display(),
+							plan.shown(&plan.destination),
 							prefix
 						)))
 						.when(!applying, |b| {
@@ -618,7 +625,7 @@ impl WorkbenchModel {
 									choice.destination.as_ref() == Some(path);
 								let id =
 									format!("paste-map-pick:{prefix}:{idx}");
-								let full = path.display().to_string();
+								let full = plan.shown(path);
 								let label = labels
 									.get(idx)
 									.cloned()
