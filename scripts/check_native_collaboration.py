@@ -296,31 +296,24 @@ def selecting_fields(line: str) -> tuple[str, str]:
     return name, root
 
 
-def change_control(kind: str, path: str) -> tuple[str, str]:
+def change_control(kind: str, path: str) -> str:
+    """The Changes row whose right-click Copy exports `path` from `kind`."""
     if kind == "fixed-oid":
         raise MissingControl(
             f"fixed-oid:{path}",
-            "historical tree selection uses rev-chk:<commit>:<path>, not change-chk",
+            "a fixed OID is copied from rev-row:<path> of the browsed commit tree, not a Changes row",
         )
     if kind == "delete":
         raise DriverError(f"cannot treat operation kind 'delete' as source for {path}")
     source = {"working": "unstaged", "index": "staged", "unstaged": "unstaged", "staged": "staged"}.get(kind)
     if source is None:
         raise MissingControl(f"{kind}:{path}", f"unsupported source kind {kind!r}")
-    return f"change-row:{source}:{path}", f"change-chk:{source}:{path}"
+    return f"change-row:{source}:{path}"
 
 
-def fixed_oid_controls(commit: str, path: str) -> tuple[str, str]:
-    return f"rev-row:{path}", f"rev-chk:{commit}:{path}"
-
-
-def fixed_oid_blocker(path: str, rev: str, oid: str) -> str:
-    return (
-        f"no rendered checkbox exports fixed OID {rev}:{path} blob {oid}. "
-        "commit-file:{path} and rev-row:{path} only preview. "
-        "btn-copy of a commit selection is COPY_REFUSED commit_readonly. "
-        "a Project tree selection would copy worktree bytes and is not a substitute"
-    )
+def fixed_oid_control(path: str) -> str:
+    """The commit-tree row whose right-click Copy exports `path` at the browsed commit."""
+    return f"rev-row:{path}"
 
 
 def resolve_operation_source(op: Mapping[str, Any]) -> tuple[str, str]:
@@ -915,7 +908,7 @@ def interesting(lines: Sequence[str]) -> list[str]:
         "E2E_LOG:",
         "E2E_PREVIEW:",
         "PREVIEW_LOADED:",
-        "BASKET:",
+        "MENU_",
         "COPY_",
         "EXPORT_PLAN_READY:",
         "PASTE_",
@@ -924,7 +917,6 @@ def interesting(lines: Sequence[str]) -> list[str]:
         "REF_FILTER:",
         "REV_TREE:",
         "TREE_",
-        "FILE_TOGGLED:",
         "APPLY_IGNORED:",
     )
     return [line for line in lines if any(key in line for key in keys)]
@@ -1113,8 +1105,11 @@ def wait_control(native: Any, session: Any, control: str, timeout: float) -> tup
         time.sleep(min(0.05, remaining))
 
 
-def click_control(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, viewport: str | None = None, modifier: str | None = None) -> None:
-    """Click `control`; `modifier` (e.g. "ctrl") is held for the click, as the Project tree's multi-select toggle needs."""
+def click_control(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, viewport: str | None = None, modifier: str | None = None, button: str = "1") -> None:
+    """Click `control`; `modifier` (e.g. "ctrl") is held for the click, as the Project tree's multi-select toggle needs.
+
+    `button` "3" is a right click, which opens the row's context menu.
+    """
     left_row = control.startswith(("change-", "tree-", "left-"))
     if viewport == "left-list" or (viewport is None and left_row):
         try:
@@ -1132,6 +1127,9 @@ def click_control(native: Any, session: Any, win: dict[str, Any], control: str, 
         except Exception as exc:
             raise MissingControl(control, str(exc)) from exc
     native.assert_on_window(box, win, control)
+    if button != "1":
+        session.click(win, box, button=button)
+        return
     if modifier is None:
         session.click(win, box)
         return
@@ -1314,8 +1312,9 @@ def expand_open_repo_changes(native: Any, session: Any, win: dict[str, Any], row
         trace.append({"action": "expand-change-dirs", "dirs": opened})
 
 
-def preview_change(native: Any, session: Any, win: dict[str, Any], kind: str, path: str, timeout: float, trace: list[dict[str, Any]], check: bool) -> None:
-    row_id, chk_id = change_control(kind, path)
+def preview_change(native: Any, session: Any, win: dict[str, Any], kind: str, path: str, timeout: float, trace: list[dict[str, Any]]) -> str:
+    """Click the Changes row of `path` and wait for its preview; returns the row id to copy from."""
+    row_id = change_control(kind, path)
     native.show_changes(session, win)
     expand_open_repo_changes(native, session, win, row_id, timeout, trace)
     before = len(session.lines)
@@ -1330,12 +1329,7 @@ def preview_change(native: Any, session: Any, win: dict[str, Any], kind: str, pa
     wait_substr(session, f"[APP:PREVIEW_LOADED: {path}]", before, timeout)
     wait_substr(session, f"[APP:E2E_PREVIEW: source={preview_kind} ", before, timeout)
     trace.append({"action": "preview", "control": row_id, "kind": kind, "path": path})
-    if not check:
-        return
-    before = len(session.lines)
-    click_control(native, session, win, chk_id, timeout)
-    wait_substr(session, "[APP:BASKET: n=", before, timeout)
-    trace.append({"action": "check", "control": chk_id, "path": path})
+    return row_id
 
 
 def click_until_logged(session: Any, win: dict[str, Any], box: tuple[int, int, int, int], needles: Sequence[str], timeout: float, tries: int = 4) -> int:
@@ -1356,18 +1350,30 @@ def click_until_logged(session: Any, win: dict[str, Any], box: tuple[int, int, i
     return before
 
 
-def copy_from_button(native: Any, session: Any, win: dict[str, Any], timeout: float, trace: list[dict[str, Any]]) -> bytes:
+def open_copy_menu(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, viewport: str | None = None) -> tuple[int, int, int, int]:
+    """Right-click `control` and return the bounds of its enabled Copy item."""
+    before = len(session.lines)
+    click_control(native, session, win, control, timeout, viewport=viewport, button="3")
+    line = wait_substr(session, "[APP:MENU_OPEN: Left", before, timeout)
+    if "copy-files" not in line:
+        raise MissingControl("menu-item:copy-files", f"{control} menu has no Copy: {line}")
+    box = wait_control(native, session, "menu-item:copy-files", timeout)
+    native.assert_on_window(box, win, "menu-item:copy-files")
+    return box
+
+
+def copy_node(native: Any, session: Any, win: dict[str, Any], control: str, timeout: float, trace: list[dict[str, Any]], viewport: str | None = None) -> bytes:
+    """Copy one node: right-click `control`, pick Copy, return the payload the app published."""
     sentinel = f"SNIP-COLLAB-SENTINEL-{uuid.uuid4().hex}\n".encode()
     session.set_clipboard(sentinel)
     if session.read_clipboard() != sentinel:
         raise ClipboardMismatch("sentinel did not stick on the source clipboard")
-    box = wait_control(native, session, "btn-copy", timeout)
-    native.assert_on_window(box, win, "btn-copy")
-    before = click_until_logged(session, win, box, ("[APP:COPY_PREP:", "[APP:COPY_BUSY]", "[APP:COPY_DONE:", "[APP:COPY_REFUSED:"), timeout)
+    box = open_copy_menu(native, session, win, control, timeout, viewport)
+    before = click_until_logged(session, win, box, ("[APP:MENU_ACTION: copy-files]", "[APP:COPY_PREP:", "[APP:COPY_BUSY]", "[APP:COPY_DONE:", "[APP:COPY_REFUSED:"), timeout)
     line = wait_any(session, ("[APP:COPY_DONE:", "[APP:COPY_REFUSED:"), before, timeout)
     if "COPY_REFUSED" in line:
         raise UiRefusal(line)
-    trace.append({"action": "copy", "control": "btn-copy", "line": line})
+    trace.append({"action": "copy", "control": control, "menu": "menu-item:copy-files", "line": line})
     deadline = time.monotonic() + timeout
     payload = b""
     while time.monotonic() < deadline:
@@ -1614,8 +1620,8 @@ def select_fixed_oid(
     oid: str,
     timeout: float,
     trace: list[dict[str, Any]],
-) -> None:
-    """Select a pinned blob via historical tree navigation and rev-chk:<commit>:<path>.
+) -> str:
+    """Show a pinned blob through historical tree navigation; returns its rev-row:<path> to copy from.
 
     Per 4c38d79 smoke.rs:
     1. Select commit row by full/short OID.
@@ -1624,7 +1630,7 @@ def select_fixed_oid(
     4. Click 'btn-browse-tree:<full SHA>' after its completed-layout probe -> wait REV_TREE matching selected commit and E2E_TREE root.
     5. Expand parent directories via rev-row:<parent> (do not suppress MissingControl).
     6. Navigate to file row: rev-row:<path> -> wait PREVIEW_LOADED and E2E_PREVIEW.
-    7. Click historical checkbox: rev-chk:<commit>:<path> -> wait BASKET.
+    The caller copies that row (right-click > Copy) while the tree is still open.
     """
     commit = git_read(repo, ["rev-parse", "--verify", f"{rev}^{{commit}}"], timeout).strip()
     selection_start = len(session.lines)
@@ -1660,18 +1666,13 @@ def select_fixed_oid(
         trace.append({"action": "expand-rev", "path": parent})
 
     # Navigate to the file row: rev-row:<path>
-    nav_id, chk_id = fixed_oid_controls(commit, path)
+    nav_id = fixed_oid_control(path)
     before = len(session.lines)
     click_control(native, session, win, nav_id, timeout, viewport="left-list")
     wait_substr(session, f"[APP:PREVIEW_LOADED: {path}]", before, timeout)
     wait_substr(session, f"[APP:E2E_PREVIEW: source=commit_file rev={commit} path={path} ", before, timeout)
     trace.append({"action": "rev-nav", "control": nav_id, "path": path, "commit": commit, "oid": oid})
-
-    # Click historical file checkbox rev-chk:<commit>:<path>
-    before = len(session.lines)
-    click_control(native, session, win, chk_id, timeout, viewport="left-list")
-    wait_substr(session, "[APP:BASKET: n=", before, timeout)
-    trace.append({"action": "check-fixed-oid", "control": chk_id, "commit": commit, "path": path, "oid": oid})
+    return nav_id
 
 
 def leave_rev_tree_if_open(
@@ -1713,8 +1714,8 @@ def demonstrate_fixed_oid(
     oid: str,
     timeout: float,
     trace: list[dict[str, Any]],
-) -> None:
-    select_fixed_oid(native, session, win, repo, rev, path, oid, timeout, trace)
+) -> str:
+    return select_fixed_oid(native, session, win, repo, rev, path, oid, timeout, trace)
 
 
 def click_ref(native: Any, session: Any, win: dict[str, Any], ref: str, timeout: float, trace: list[dict[str, Any]]) -> None:
@@ -2314,14 +2315,20 @@ def run_positive_file(
     dest = repo_by_id(manifest, step["destRepoId"])
     source_session = machine_session(sessions, source)
     dest_session = machine_session(sessions, dest)
-    source_win = window_of(source_session, timeout)
-    select_repo(native, source_session, source_win, source["basename"], fixture / source["relativePath"], timeout, trace)
-    record["screenshots"]["graph"] = relative_shot(step_dir.parents[1], capture_checked(native, source_session, source_session.window(timeout=timeout), "graph", timeout))
-    for op in step["operations"]:
+    # A Copy reads one node, and a step mixes sources (working, index, a
+    # fixed OID, deletions): every operation is its own copy and paste.
+    copies: list[dict[str, Any]] = []
+    for index, op in enumerate(step["operations"]):
+        suffix = "" if index == 0 else f"-{index + 1}"
+        source_win = window_of(source_session, timeout)
+        select_repo(native, source_session, source_win, source["basename"], fixture / source["relativePath"], timeout, trace)
+        if index == 0:
+            record["screenshots"]["graph"] = relative_shot(step_dir.parents[1], capture_checked(native, source_session, source_session.window(timeout=timeout), "graph", timeout))
         op_source = op.get("source") or {}
         kind = op_source.get("kind") or op.get("kind")
+        viewport = None
         if kind == "fixed-oid":
-            select_fixed_oid(
+            control = select_fixed_oid(
                 native,
                 source_session,
                 source_session.window(timeout=timeout),
@@ -2332,43 +2339,48 @@ def run_positive_file(
                 timeout,
                 trace,
             )
-            continue
-        ui_source, path = resolve_operation_source(op)
+            viewport = "left-list"
+        else:
+            ui_source, path = resolve_operation_source(op)
+            leave_rev_tree_if_open(native, source_session, source_session.window(timeout=timeout), timeout, trace)
+            control = preview_change(native, source_session, source_session.window(timeout=timeout), ui_source, path, timeout, trace)
+        record["screenshots"][f"source-selected{suffix}"] = relative_shot(
+            step_dir.parents[1], capture_checked(native, source_session, source_session.window(timeout=timeout), f"source-selected{suffix}", timeout)
+        )
+        payload = copy_node(native, source_session, source_session.window(timeout=timeout), control, timeout, trace, viewport=viewport)
         leave_rev_tree_if_open(native, source_session, source_session.window(timeout=timeout), timeout, trace)
-        preview_change(native, source_session, source_session.window(timeout=timeout), ui_source, path, timeout, trace, True)
-    leave_rev_tree_if_open(native, source_session, source_session.window(timeout=timeout), timeout, trace)
-    record["screenshots"]["source-selected"] = relative_shot(
-        step_dir.parents[1], capture_checked(native, source_session, source_session.window(timeout=timeout), "source-selected", timeout)
-    )
-    payload = copy_from_button(native, source_session, source_session.window(timeout=timeout), timeout, trace)
-    source_meta = save_payload(step_dir / "clipboard-source.bin", payload)
-    dest_win = window_of(dest_session, timeout)
-    select_repo(native, dest_session, dest_win, dest["basename"], fixture / dest["relativePath"], timeout, trace)
-    bridged = transfer_os_clipboard(source_session, dest_session)
-    readback = dest_session.read_clipboard()
-    read_meta = save_payload(step_dir / "clipboard-readback.bin", readback)
-    record["clipboard"] = {"source": source_meta, "readback": read_meta, "bridge": bridged}
-    paste_cursor = len(dest_session.lines)
-    paste_preview(native, dest_session, dest_session.window(timeout=timeout), timeout, trace)
-    record["screenshots"]["preview"] = relative_shot(
-        step_dir.parents[1], capture_checked(native, dest_session, dest_session.window(timeout=timeout), "preview", timeout)
-    )
-    resolve_paste_mappings(
-        native,
-        dest_session,
-        dest_session.window(timeout=timeout),
-        manifest,
-        step["destRepoId"],
-        fixture,
-        timeout,
-        trace,
-        start_line=paste_cursor,
-    )
-    overwrite_paths = [op["dest"]["path"] for op in step["operations"] if op.get("overwrite")]
-    click_overwrites(native, dest_session, dest_session.window(timeout=timeout), overwrite_paths, timeout, trace)
-    line = apply_or_cancel(native, dest_session, dest_session.window(timeout=timeout), "btn-apply", timeout, trace)
-    if "PASTE_DONE" not in line:
-        raise UiRefusal(line)
+        source_meta = save_payload(step_dir / f"clipboard-source{suffix}.bin", payload)
+        dest_win = window_of(dest_session, timeout)
+        select_repo(native, dest_session, dest_win, dest["basename"], fixture / dest["relativePath"], timeout, trace)
+        bridged = transfer_os_clipboard(source_session, dest_session)
+        readback = dest_session.read_clipboard()
+        read_meta = save_payload(step_dir / f"clipboard-readback{suffix}.bin", readback)
+        if read_meta["sha256"] != source_meta["sha256"]:
+            raise ClipboardMismatch(f"operation {index + 1}: destination clipboard differs from the copied payload")
+        copies.append({"control": control, "source": source_meta, "readback": read_meta, "bridge": bridged})
+        paste_cursor = len(dest_session.lines)
+        paste_preview(native, dest_session, dest_session.window(timeout=timeout), timeout, trace)
+        record["screenshots"][f"preview{suffix}"] = relative_shot(
+            step_dir.parents[1], capture_checked(native, dest_session, dest_session.window(timeout=timeout), f"preview{suffix}", timeout)
+        )
+        resolve_paste_mappings(
+            native,
+            dest_session,
+            dest_session.window(timeout=timeout),
+            manifest,
+            step["destRepoId"],
+            fixture,
+            timeout,
+            trace,
+            start_line=paste_cursor,
+        )
+        overwrite_paths = [op["dest"]["path"]] if op.get("overwrite") else []
+        click_overwrites(native, dest_session, dest_session.window(timeout=timeout), overwrite_paths, timeout, trace)
+        line = apply_or_cancel(native, dest_session, dest_session.window(timeout=timeout), "btn-apply", timeout, trace)
+        if "PASTE_DONE" not in line:
+            raise UiRefusal(line)
+    # The last operation's copy is the step's clipboard proof; every copy is kept.
+    record["clipboard"] = {**copies[-1], "operations": copies}
     record["screenshots"]["result"] = relative_shot(
         step_dir.parents[1], capture_checked(native, dest_session, dest_session.window(timeout=timeout), "result", timeout)
     )
@@ -2731,7 +2743,8 @@ def refuse_discontinuous(native: Any, sessions: Mapping[str, Any], manifest: Map
     raise DriverError(f"discontinuous tips copied after {ranged.strip()}; payload was not pasted")
 
 
-def select_tree_file(native: Any, session: Any, repo: Mapping[str, Any], fixture: Path, path: str, timeout: float, trace: list[dict[str, Any]]) -> None:
+def select_tree_file(native: Any, session: Any, repo: Mapping[str, Any], fixture: Path, path: str, timeout: float, trace: list[dict[str, Any]]) -> str:
+    """Ctrl-click `path` into the Project selection; returns its row, whose Copy copies the selection."""
     win = window_of(session, timeout)
     select_repo(native, session, win, repo["basename"], fixture / repo["relativePath"], timeout, trace)
     native.open_project_list(session, win)
@@ -2743,21 +2756,24 @@ def select_tree_file(native: Any, session: Any, repo: Mapping[str, Any], fixture
         # select the folder alone and drop the other repos' picks).
         click_control(native, session, win, f"tree-chevron:{parent}", timeout)
         wait_substr(session, f"[APP:TREE_EXPANDED: {parent}]", before, timeout)
+    row = f"tree-row:{path}"
     before = len(session.lines)
-    click_control(native, session, win, f"tree-row:{path}", timeout, modifier="ctrl")
-    wait_substr(session, "[APP:BASKET: n=", before, timeout)
-    trace.append({"action": "tree-check", "repo": repo["repoId"], "path": path})
+    click_control(native, session, win, row, timeout, modifier="ctrl")
+    wait_substr(session, f"[APP:TREE_TOGGLED: {path}]", before, timeout)
+    trace.append({"action": "tree-select", "repo": repo["repoId"], "path": path})
+    return row
 
 
 def attempt_collision(native: Any, sessions: Mapping[str, Any], manifest: Mapping[str, Any], step: Mapping[str, Any], names: Mapping[str, Mapping[str, str]], fixture: Path, step_dir: Path, timeout: float, trace: list[dict[str, Any]], record: dict[str, Any], output: Path) -> None:
     maps = step["maps"]
     source_session = sessions["a"]
+    row = ""
     for item in maps:
         repo = repo_by_id(manifest, item["sourceRepoId"])
-        select_tree_file(native, source_session, repo, fixture, item["sourcePath"], timeout, trace)
+        row = select_tree_file(native, source_session, repo, fixture, item["sourcePath"], timeout, trace)
     record["screenshots"]["source-selected"] = relative_shot(output, capture_checked(native, source_session, window_of(source_session, timeout), "source-selected", timeout))
 
-    payload = copy_from_button(native, source_session, window_of(source_session, timeout), timeout, trace)
+    payload = copy_node(native, source_session, window_of(source_session, timeout), row, timeout, trace)
     source_meta = save_payload(step_dir / "clipboard-source.bin", payload)
 
     dest = repo_by_id(manifest, maps[0]["destRepoId"])
@@ -2847,12 +2863,12 @@ def block_ambiguous(
     win_a = window_of(session_a, timeout)
 
     select_tree_file(native, session_a, billing_repo, fixture, "src/app.txt", timeout, trace)
-    select_tree_file(native, session_a, docs_repo, fixture, "src/app.txt", timeout, trace)
+    row = select_tree_file(native, session_a, docs_repo, fixture, "src/app.txt", timeout, trace)
 
     record["screenshots"]["source-selected"] = relative_shot(output, capture_checked(native, session_a, win_a, "source-selected", timeout))
 
     # 3. Copy multi-root bundle via UI
-    payload = copy_from_button(native, session_a, win_a, timeout, trace)
+    payload = copy_node(native, session_a, win_a, row, timeout, trace)
     source_meta = save_payload(step_dir / "clipboard-source.bin", payload)
 
     # 4. Paste within workspace A (which contains both a-west-billing and a-east-billing)
@@ -2915,10 +2931,10 @@ def block_missing_dest(native: Any, sessions: Mapping[str, Any], manifest: Mappi
     if step["sourceRepoId"] != billing_repo["repoId"]:
         raise DriverError("missing-destination source does not match selected repository")
     select_tree_file(native, source_session, billing_repo, fixture, step["sourcePath"], timeout, trace)
-    select_tree_file(native, source_session, docs_repo, fixture, "src/app.txt", timeout, trace)
+    row = select_tree_file(native, source_session, docs_repo, fixture, "src/app.txt", timeout, trace)
 
     record["screenshots"]["source-selected"] = relative_shot(output, capture_checked(native, source_session, win_a, "source-selected", timeout))
-    payload = copy_from_button(native, source_session, win_a, timeout, trace)
+    payload = copy_node(native, source_session, win_a, row, timeout, trace)
     source_meta = save_payload(step_dir / "clipboard-source.bin", payload)
 
     # Destination on session b: b-north-ledger
@@ -2986,17 +3002,18 @@ def run_stale_source(native: Any, sessions: Mapping[str, Any], manifest: Mapping
     repo = repo_by_id(manifest, step["preview"]["repoId"])
     session = sessions["a"]
     select_repo(native, session, window_of(session, timeout), repo["basename"], fixture / repo["relativePath"], timeout, trace)
-    preview_change(native, session, window_of(session, timeout), "working", step["preview"]["path"], timeout, trace, True)
+    row = preview_change(native, session, window_of(session, timeout), "working", step["preview"]["path"], timeout, trace)
     record["screenshots"]["source-selected"] = relative_shot(output, capture_checked(native, session, window_of(session, timeout), "source-selected", timeout))
     hold = step_dir / "export_hold.signal"
     sentinel = f"SNIP-STALE-SOURCE-SENTINEL-{uuid.uuid4().hex}\n".encode()
     session.set_clipboard(sentinel)
     if session.read_clipboard() != sentinel:
         raise ClipboardMismatch("stale-source sentinel did not stick")
+    copy_item = open_copy_menu(native, session, window_of(session, timeout), row, timeout)
     before_copy = len(session.lines)
     hold.write_text("hold export before final revalidation\n", encoding="utf-8")
     try:
-        click_control(native, session, window_of(session, timeout), "btn-copy", timeout)
+        session.click(window_of(session, timeout), copy_item)
         ready = wait_any(session, ("[APP:EXPORT_PLAN_READY:", "[APP:COPY_DONE:", "[APP:COPY_FAILED:", "[APP:COPY_REFUSED:"), before_copy, timeout)
         if not re.search(r"\[APP:EXPORT_PLAN_READY: files=[1-9][0-9]*\]", ready):
             raise DriverError(f"export did not stop after capturing a nonempty plan: {ready}")
@@ -3039,9 +3056,9 @@ def run_stale_target(native: Any, sessions: Mapping[str, Any], manifest: Mapping
         wait_substr(source_session, f"[APP:TREE_EXPANDED: {parent}]", before, timeout)
     before = len(source_session.lines)
     click_control(native, source_session, window_of(source_session, timeout), f"tree-row:{path}", timeout, modifier="ctrl")
-    wait_substr(source_session, "[APP:BASKET: n=", before, timeout)
+    wait_substr(source_session, f"[APP:TREE_TOGGLED: {path}]", before, timeout)
     record["screenshots"]["source-selected"] = relative_shot(output, capture_checked(native, source_session, window_of(source_session, timeout), "source-selected", timeout))
-    payload = copy_from_button(native, source_session, window_of(source_session, timeout), timeout, trace)
+    payload = copy_node(native, source_session, window_of(source_session, timeout), f"tree-row:{path}", timeout, trace)
     save_payload(step_dir / "clipboard-source.bin", payload)
     select_repo(native, dest_session, window_of(dest_session, timeout), dest["basename"], fixture / dest["relativePath"], timeout, trace)
     transfer_os_clipboard(source_session, dest_session)
@@ -3070,9 +3087,9 @@ def run_unauthorized(native: Any, sessions: Mapping[str, Any], manifest: Mapping
     source_session = sessions["a"]
     dest_session = sessions["b"]
     select_repo(native, source_session, window_of(source_session, timeout), source["basename"], fixture / source["relativePath"], timeout, trace)
-    select_tree_file(native, source_session, source, fixture, path, timeout, trace)
+    row = select_tree_file(native, source_session, source, fixture, path, timeout, trace)
     record["screenshots"]["source-selected"] = relative_shot(output, capture_checked(native, source_session, window_of(source_session, timeout), "source-selected", timeout))
-    payload = copy_from_button(native, source_session, window_of(source_session, timeout), timeout, trace)
+    payload = copy_node(native, source_session, window_of(source_session, timeout), row, timeout, trace)
     save_payload(step_dir / "clipboard-source.bin", payload)
     select_repo(native, dest_session, window_of(dest_session, timeout), dest["basename"], fixture / dest["relativePath"], timeout, trace)
     transfer_os_clipboard(source_session, dest_session)
@@ -3097,9 +3114,9 @@ def run_cancel(native: Any, sessions: Mapping[str, Any], manifest: Mapping[str, 
     source_session = sessions["a"]
     dest_session = sessions["b"]
     select_repo(native, source_session, window_of(source_session, timeout), source["basename"], fixture / source["relativePath"], timeout, trace)
-    preview_change(native, source_session, window_of(source_session, timeout), "working", "transfer/working.txt", timeout, trace, True)
+    row = preview_change(native, source_session, window_of(source_session, timeout), "working", "transfer/working.txt", timeout, trace)
     record["screenshots"]["source-selected"] = relative_shot(output, capture_checked(native, source_session, window_of(source_session, timeout), "source-selected", timeout))
-    payload = copy_from_button(native, source_session, window_of(source_session, timeout), timeout, trace)
+    payload = copy_node(native, source_session, window_of(source_session, timeout), row, timeout, trace)
     save_payload(step_dir / "clipboard-source.bin", payload)
     select_repo(native, dest_session, window_of(dest_session, timeout), dest["basename"], fixture / dest["relativePath"], timeout, trace)
     transfer_os_clipboard(source_session, dest_session)

@@ -139,7 +139,7 @@ snip-sync 自訂,只要求 snip ↔ snip 互通:
 - **常駐系統匣**。選單:從剪貼簿貼上、複製上一次的選取、開啟主視窗、結束。
 - **主視窗**(同一個視窗,可從系統匣的小尺寸展開):
   - 選 repo / 資料夾。
-  - 檔案模式:專案工具視窗照實顯示工作區資料夾(含非 Git 檔案,儲存庫在其所在位置標出分支與變更數),逐層載入目錄,單擊任一列即單獨選取(檔案在右側預覽,資料夾同時展開/收合;箭頭只展開不選取),選資料夾只選它本身,複製時才走訪;以 Ctrl/Cmd 多選、Shift 範圍選取,右鍵複製所選檔案與資料夾。選來源(檔案、working tree、staged、commit、區間);Git 來源顯示真正的目錄階層、變更狀態與 diff,可逐檔或整個資料夾選取再複製。選 monorepo 子資料夾時只列出並複製該資料夾內的變更。一般文字預覽上限 1 MiB,二進位不顯示文字內容。
+  - 檔案模式:專案工具視窗照實顯示工作區資料夾(含非 Git 檔案,儲存庫在其所在位置標出分支與變更數),逐層載入目錄,單擊任一列即單獨選取(檔案在右側預覽,資料夾同時展開/收合;箭頭只展開不選取),選資料夾只選它本身,複製時才走訪;以 Ctrl/Cmd 多選、Shift 範圍選取,右鍵複製所選檔案與資料夾。選來源(檔案、working tree、staged、commit、區間);Git 來源(Changes)顯示真正的目錄階層、變更狀態與 diff;沒有勾選框也沒有選取籃,對任一節點右鍵「複製」就只複製那個節點:檔案列是該檔(帶它的來源 staged／unstaged／untracked),資料夾列是該 repo、該群組底下的檔案,repo 列是該 repo 在該群組的檔案,群組列是所有 repo 在該群組的檔案;名稱不是有效 UTF-8 的列不納入,沒有可複製內容時「複製」停用。commit 樹瀏覽的檔案列右鍵「複製」該檔在那個 commit 的內容。Cmd/Ctrl+C 複製左側工具視窗游標所在的節點(專案工具視窗是選取的列;閱讀器有選取文字時複製文字)。選 monorepo 子資料夾時只列出並複製該資料夾內的變更。一般文字預覽上限 1 MiB,二進位不顯示文字內容。
   - commit 模式:歷史時間軸,選一段連續 commit → 複製。
   - 貼上:預覽(3.2 / 4.3)→ 確認 → 結果。
 - 複製與貼上的通知內容見 3.1、4.2。
@@ -169,7 +169,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 遠端 Git 檢視：兩邊都經 `snip_core::gitview::RepoView`（`snip_remote::RemoteRepo`）；worker 以 served `LocalRepo` 回答。
 - 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 
-兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是預覽、勾選與時間軸),以及下列例外:
+兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是右鍵複製、貼上預覽的逐檔勾選與時間軸),以及下列例外:
 1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 套用全部檔案(經 `ImportMapping::from_restore_base`);GUI 維持逐 prefix 選擇(D4)。兩者最後都是同一個 `ImportMapping`。
 2. 沒有選到任何檔案:CLI 顯示 `No files selected.` 並以 exit 1 結束、不碰剪貼簿;GUI 顯示提示、同樣不寫剪貼簿。
 
@@ -216,7 +216,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 專案樹逐層列出 worker 上的目錄,和本機一樣不列 `.git`(指名路徑仍可讀)。單一目錄最多列 1000 筆,超過就顯示截斷。
   - 指向工作區內資料夾的 symlink 列成資料夾,可以展開;指向工作區外或 `.git` 的 symlink 列成一般項目,打開時拒絕。規則與複製時展開資料夾相同(`transfer::is_safe_dir_symlink`)。
   - 點檔案就預覽,規則與本機相同:上限 1 MiB,二進位與非 UTF-8 不顯示文字。重新整理會重讀樹和開著的預覽,檔案在 worker 上已刪除就顯示錯誤。
-  - 複製、貼上、加入儲存庫路徑（`add_repo_path`）、為複製而勾選在遠端工作區都會拒絕,狀態列顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」（`remote_unsupported`）。右鍵選單的儲存庫與檔案列只提供複製 worker 上的路徑（`copy-worker-path`）,不提供本機 reveal（在 Finder／檔案總管顯示）。
+  - 複製（右鍵「複製」與 Cmd/Ctrl+C）、貼上、加入儲存庫路徑（`add_repo_path`）、專案列的 Ctrl/Cmd 點擊選取在遠端工作區都會拒絕,狀態列顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」（`remote_unsupported`）。右鍵選單的儲存庫與檔案列只提供複製 worker 上的路徑（`copy-worker-path`）,不提供本機 reveal（在 Finder／檔案總管顯示）。
 
 ### Git 檢視
 
@@ -252,7 +252,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 將來若開放 `Request::Write`/`Rename`，必須拒絕任何 `.git` 目錄底下、以及 git dir／common dir 目標底下的路徑；否則 Git 檢視會把「可寫檔案」變成「在 worker 上執行程式」（hooks、filter、fsmonitor 設定）。
 - **明確不做(本切片)**:
   - 遠端寫入類 Git 操作（stage、unstage、commit、checkout、discard、rename、write）：(1) 能寫入 worker 檔案就能寫入 `.git/config`、hooks 或 filter，等於讓 master 在 worker 執行任意程式（違反寫入不變式）；(2) 本機寫入依賴 HeavyGuard、新鮮度與碰撞檢查（§3.2、§4.3），跨機器版本尚未設計；(3) 讀取先做正確，避免因誤判狀態做出錯誤決策。
-  - 遠端的加入 repo 路徑（`add_repo_path`）、複製到剪貼簿、貼上、為複製而勾選：維持拒絕（回報 `remote_unsupported`）。
+  - 遠端的加入 repo 路徑（`add_repo_path`）、複製到剪貼簿、貼上、專案列的選取：維持拒絕（回報 `remote_unsupported`）。
   - 掃描逾時（`TimedOut`）或達上限（`LimitReached`）在遠端不支援游標續掃（僅 depth-limited 資料夾可續），需重新整理重掃。
   - 自動 fetch、遠端分支操作：本機亦無此功能。
   - Windows 作為 worker:遠端啟動指令用 POSIX `sh`。
