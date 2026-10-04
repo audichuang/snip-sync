@@ -3972,8 +3972,20 @@ impl WorkbenchModel {
 		} else {
 			None
 		};
+		// The open file's root when preserving anchors (e.g. a workspace-root
+		// file). A mid-flight user click is protected by selection_changed.
 		let anchor_file_root = if preserve_anchors {
 			self.selected_file_root.clone()
+		} else {
+			None
+		};
+		let has_preview =
+			self.preview.is_some() || self.preview_error.is_some();
+		let anchor_repo = if preserve_anchors
+			&& anchor_source.as_ref() != Some(&SourceKind::File)
+			&& has_preview
+		{
+			self.preview_root()
 		} else {
 			None
 		};
@@ -4060,6 +4072,8 @@ impl WorkbenchModel {
 
 		let repo_root = self.repos[idx].root.clone();
 		let repo_name = self.repos[idx].name.clone();
+		let is_foreign_anchor =
+			anchor_repo.as_ref().is_some_and(|r| r != &repo_root);
 		app_log!(
 			"[APP:REPO_SELECTING: {} ({}) root={}]",
 			idx,
@@ -4070,7 +4084,7 @@ impl WorkbenchModel {
 		let is_file_anchor = preserve_anchors
 			&& anchor_source.as_ref() == Some(&SourceKind::File)
 			&& anchor_file.is_some();
-		if !is_file_anchor {
+		if !is_file_anchor && !is_foreign_anchor {
 			if let Err(e) = &self.repos[idx].summary {
 				self.show_preview_error(Msg::new(
 					"error_repo_status",
@@ -4181,7 +4195,7 @@ impl WorkbenchModel {
 							);
 							if anchor_commit.is_some() {
 								// The history reload re-selects the commit.
-							} else if !selection_changed {
+							} else if !selection_changed && !is_foreign_anchor {
 								if let Some(ref anchor) = anchor_file {
 									let kept =
 										anchor_source.as_ref().filter(|s| {
@@ -4262,7 +4276,7 @@ impl WorkbenchModel {
 								"error_repo_changes",
 								[repo_name.clone(), err.clone()],
 							);
-							if !selection_changed {
+							if !selection_changed && !is_foreign_anchor {
 								if let (true, Some(anchor)) = (
 									anchor_source.as_ref()
 										== Some(&SourceKind::File),
@@ -8998,6 +9012,166 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn remote_wipe_scan_failure_with_loaded_repo_preserves_tree_and_preview(
+			cx: &mut TestAppContext,
+		) {
+			use crate::tree::{NodeKey, TreeCommand};
+
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(shared.join("sub")).unwrap();
+			fs::write(shared.join("sub").join("inner.txt"), "inner text\n")
+				.unwrap();
+			crate::paste::tests::git_init(&shared);
+			fs::write(shared.join("base.txt"), "base\n").unwrap();
+			crate::paste::tests::git_run(&shared, &["add", "."]);
+			crate::paste::tests::git_run(&shared, &["commit", "-m", "init"]);
+
+			let (model, cx, worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					trust_file: None,
+					..Default::default()
+				},
+			);
+
+			let mut initial_loaded = false;
+			for _ in 0..50 {
+				settle(cx);
+				initial_loaded = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.selected_repo_idx == Some(0)
+						&& m.file_tree.as_ref().is_some_and(|t| {
+							t.is_loaded
+								&& t.children.iter().any(|c| c.name == "sub")
+						})
+				});
+				if initial_loaded {
+					break;
+				}
+			}
+			assert!(
+				initial_loaded,
+				"initial open must load repo and its file_tree"
+			);
+
+			model.update(cx, |m, cx| {
+				m.dispatch_tree(
+					Some(TreeCommand::Expand(NodeKey::from_utf8_rel("sub"))),
+					cx,
+				);
+				m.dispatch_tree(
+					Some(TreeCommand::OpenFile("sub/inner.txt".into())),
+					cx,
+				);
+			});
+
+			let mut sub_and_preview_loaded = false;
+			for _ in 0..50 {
+				settle(cx);
+				sub_and_preview_loaded = model.read_with(cx, |m, _| {
+					let preview_ok = !m.preview_loading
+						&& m.preview
+							.as_ref()
+							.is_some_and(|p| p.text.as_ref() == "inner text\n");
+					let sub_ok = m
+						.file_tree
+						.as_ref()
+						.and_then(|t| {
+							t.children.iter().find(|c| c.name == "sub")
+						})
+						.is_some_and(|sub| {
+							sub.is_expanded
+								&& sub.is_loaded && !sub.loading
+								&& sub
+									.children
+									.iter()
+									.any(|c| c.name == "inner.txt")
+						});
+					preview_ok && sub_ok
+				});
+				if sub_and_preview_loaded {
+					break;
+				}
+			}
+			assert!(
+				sub_and_preview_loaded,
+				"sub folder and inner.txt preview must load"
+			);
+
+			// Make the next scan fail while reads still work.
+			worker.set_deadlines_for_tests(
+				Duration::from_secs(60),
+				Duration::ZERO,
+			);
+
+			model.update(cx, |m, cx| m.reload_repos(cx));
+
+			let mut scan_failed = false;
+			for _ in 0..50 {
+				settle(cx);
+				scan_failed = model.read_with(cx, |m, _| {
+					!m.is_loading && m.remote.scan_error.is_some()
+				});
+				if scan_failed {
+					break;
+				}
+			}
+			assert!(scan_failed, "scan failure should have landed");
+
+			let mut tree_re_expanded = false;
+			for _ in 0..50 {
+				settle(cx);
+				tree_re_expanded = model.read_with(cx, |m, _| {
+					let Some(tree) = m.ws_tree.as_ref() else {
+						return false;
+					};
+					let Some(sub) =
+						tree.children.iter().find(|c| c.name == "sub")
+					else {
+						return false;
+					};
+					sub.is_expanded
+						&& sub.is_loaded && !sub.loading
+						&& sub.children.iter().any(|c| c.name == "inner.txt")
+				});
+				if tree_re_expanded {
+					break;
+				}
+			}
+			assert!(
+				tree_re_expanded,
+				"sub folder must be expanded again in rebuilt ws_tree"
+			);
+
+			let mut preview_settled = false;
+			for _ in 0..50 {
+				settle(cx);
+				preview_settled = model.read_with(cx, |m, _| {
+					!m.preview_loading && m.preview.is_some()
+				});
+				if preview_settled {
+					break;
+				}
+			}
+			assert!(
+				preview_settled,
+				"preview should settle after wipe failure"
+			);
+
+			model.read_with(cx, |m, _| {
+				let p = m.preview.as_ref().expect("preview should be Some");
+				assert_eq!(p.text.as_ref(), "inner text\n");
+				assert_eq!(m.selected_file.as_deref(), Some("sub/inner.txt"));
+				assert!(m.preview_error.is_none());
+				assert!(!m.preview_loading);
+			});
+		}
+
+		#[gpui::test]
 		fn remote_scan_failure_refresh_submits_only_one_root_listing(
 			cx: &mut TestAppContext,
 		) {
@@ -12096,17 +12270,25 @@ mod tests {
 			use crate::SourceKind;
 
 			let ws = tempfile::tempdir().unwrap();
-			let alpha = repo(ws.path(), "alpha", &[("a.txt", "alpha a\n")]);
-			let beta = repo(ws.path(), "beta", &[("b.txt", "beta b\n")]);
+			let shared = dunce::canonicalize(ws.path()).unwrap();
+			let _alpha = repo(&shared, "alpha", &[]);
+			let beta = repo(&shared, "beta", &[("b.txt", "beta b\n")]);
+			fs::write(shared.join("root.txt"), "shared root text\n").unwrap();
 
-			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let (model, cx) = open(cx, shared.clone(), None);
 			settle(cx);
 
-			// Preview anchor file in alpha.
+			// Open alpha repo.
+			model.update(cx, |m, cx| {
+				m.select_repo_internal(0, false, cx);
+			});
+			settle(cx);
+
+			// Preview root.txt with root = shared (ws-root file while alpha repo is open).
 			model.update(cx, |m, cx| {
 				m.select_file_in(
-					Some(alpha.clone()),
-					"a.txt",
+					Some(shared.clone()),
+					"root.txt",
 					SourceKind::File,
 					cx,
 				);
@@ -12121,8 +12303,9 @@ mod tests {
 				}
 			}
 			model.read_with(cx, |m, _| {
-				assert_eq!(m.selected_file.as_deref(), Some("a.txt"));
-				assert_eq!(m.selected_file_root.as_ref(), Some(&alpha));
+				assert_eq!(m.selected_file.as_deref(), Some("root.txt"));
+				assert_eq!(m.selected_file_root.as_ref(), Some(&shared));
+				assert_ne!(m.repo_root().as_ref(), Some(&shared));
 			});
 
 			// Trigger preserving select_repo_internal, then before its
@@ -12169,32 +12352,81 @@ mod tests {
 		}
 
 		#[gpui::test]
-		fn refresh_anchor_re_read_uses_captured_root(cx: &mut TestAppContext) {
-			use crate::SourceKind;
-
+		fn refresh_preserves_foreign_changes_row_preview(
+			cx: &mut TestAppContext,
+		) {
 			let ws = tempfile::tempdir().unwrap();
-			let shared = dunce::canonicalize(ws.path()).unwrap();
-			let _alpha = repo(&shared, "alpha", &[]);
-			fs::write(shared.join("root.txt"), "shared root text\n").unwrap();
+			let ws_path = dunce::canonicalize(ws.path()).unwrap();
+			let alpha = repo(&ws_path, "alpha", &[]);
+			let beta = repo(&ws_path, "beta", &[]);
 
-			let (model, cx) = open(cx, shared.clone(), None);
+			fs::write(alpha.join("README.md"), "alpha initial\n").unwrap();
+			git(&alpha, &["add", "README.md"]);
+			git(&alpha, &["commit", "-q", "-m", "init readme"]);
+			fs::write(alpha.join("README.md"), "alpha modified\n").unwrap();
+
+			fs::write(beta.join("README.md"), "beta initial\n").unwrap();
+			git(&beta, &["add", "README.md"]);
+			git(&beta, &["commit", "-q", "-m", "init readme"]);
+			fs::write(beta.join("README.md"), "beta modified\n").unwrap();
+
+			let (model, cx) = open(cx, ws_path.clone(), None);
 			settle(cx);
 
-			// Open alpha repo.
-			model.update(cx, |m, cx| {
-				m.select_repo_internal(0, false, cx);
-			});
-			settle(cx);
+			// Ensure alpha is open and both repos have loaded changes.
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.repos.len() >= 2
+						&& m.change_repos.len() >= 2
+						&& m.change_repos
+							.iter()
+							.all(|r| r.state == crate::ChangeRepoState::Loaded)
+				});
+				if ready {
+					break;
+				}
+			}
 
-			// Preview root.txt with root = shared (different from alpha repo root).
-			model.update(cx, |m, cx| {
-				m.select_file_in(
-					Some(shared.clone()),
-					"root.txt",
-					SourceKind::File,
-					cx,
-				);
+			let alpha_idx = model.read_with(cx, |m, _| {
+				m.repos
+					.iter()
+					.position(|r| r.name == "alpha")
+					.expect("alpha repo")
 			});
+			model.update(cx, |m, cx| {
+				if m.selected_repo_idx != Some(alpha_idx) {
+					m.select_repo_internal(alpha_idx, false, cx);
+				}
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.selected_repo_idx == Some(alpha_idx) && m.changes_loaded
+				});
+				if ready {
+					break;
+				}
+			}
+
+			// User clicks beta's Changes row for README.md.
+			let beta_row = model.read_with(cx, |m, _| {
+				let beta_slot = m
+					.change_repos
+					.iter()
+					.position(|r| r.root == beta)
+					.expect("beta slot");
+				m.files
+					.iter()
+					.position(|f| {
+						f.repo as usize == beta_slot && f.path == "README.md"
+					})
+					.expect("beta README change row")
+			});
+			model.update(cx, |m, cx| {
+				m.select_change(beta_row, cx);
+			});
+
 			for _ in 0..50 {
 				settle(cx);
 				let done = model.read_with(cx, |m, _| {
@@ -12204,25 +12436,28 @@ mod tests {
 					break;
 				}
 			}
+
 			model.read_with(cx, |m, _| {
-				assert_eq!(m.selected_file.as_deref(), Some("root.txt"));
-				assert_eq!(m.selected_file_root.as_ref(), Some(&shared));
-				assert_ne!(m.repo_root().as_ref(), Some(&shared));
+				assert_eq!(m.preview_root(), Some(beta.clone()));
+				let p = m.preview.as_ref().expect("beta preview loaded");
+				assert!(p.text.contains("beta modified"));
+				assert!(!p.text.contains("alpha modified"));
 			});
 
-			// Trigger preserving select_repo_internal.
-			// Before change-list read lands, clear live selected_file_root.
+			// Trigger Refresh.
 			model.update(cx, |m, cx| {
-				m.select_repo_internal(0, true, cx);
-				m.selected_file_root = None;
+				m.reload_repos(cx);
 			});
 
 			for _ in 0..50 {
 				settle(cx);
 				let done = model.read_with(cx, |m, _| {
-					m.changes_loaded
+					!m.is_loading
+						&& m.changes_loaded
 						&& !m.preview_loading
-						&& m.preview.is_some()
+						&& m.change_repos
+							.iter()
+							.all(|r| r.state == crate::ChangeRepoState::Loaded)
 				});
 				if done {
 					break;
@@ -12231,9 +12466,151 @@ mod tests {
 
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.selected_file_root.as_ref(),
-					Some(&shared),
-					"anchor re-read must use captured root (shared), not fallback to repo_root"
+					m.preview_root(),
+					Some(beta.clone()),
+					"preview_root must remain beta after refresh"
+				);
+				let p = m.preview.as_ref().expect("preview must be retained");
+				assert!(
+					p.text.contains("beta modified"),
+					"preview text must still be beta's content"
+				);
+				assert!(
+					!p.text.contains("alpha modified"),
+					"preview text must not be replaced by alpha's content"
+				);
+				assert!(
+					m.preview_error.is_none(),
+					"no alpha error should be shown"
+				);
+			});
+		}
+
+		#[gpui::test]
+		fn refresh_preserves_foreign_changes_row_preview_when_open_repo_err(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let ws_path = dunce::canonicalize(ws.path()).unwrap();
+			let alpha = repo(&ws_path, "alpha", &[]);
+			let beta = repo(&ws_path, "beta", &[]);
+
+			fs::write(beta.join("beta.txt"), "beta initial\n").unwrap();
+			git(&beta, &["add", "beta.txt"]);
+			git(&beta, &["commit", "-q", "-m", "init beta"]);
+			fs::write(beta.join("beta.txt"), "beta modified\n").unwrap();
+
+			let (model, cx) = open(cx, ws_path.clone(), None);
+			settle(cx);
+
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.repos.len() >= 2
+						&& m.change_repos.len() >= 2
+						&& m.change_repos
+							.iter()
+							.all(|r| r.state == crate::ChangeRepoState::Loaded)
+				});
+				if ready {
+					break;
+				}
+			}
+
+			let alpha_idx = model.read_with(cx, |m, _| {
+				m.repos
+					.iter()
+					.position(|r| r.name == "alpha")
+					.expect("alpha repo")
+			});
+			model.update(cx, |m, cx| {
+				if m.selected_repo_idx != Some(alpha_idx) {
+					m.select_repo_internal(alpha_idx, false, cx);
+				}
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.selected_repo_idx == Some(alpha_idx) && m.changes_loaded
+				});
+				if ready {
+					break;
+				}
+			}
+
+			// User clicks beta's Changes row for beta.txt.
+			let beta_row = model.read_with(cx, |m, _| {
+				let beta_slot = m
+					.change_repos
+					.iter()
+					.position(|r| r.root == beta)
+					.expect("beta slot");
+				m.files
+					.iter()
+					.position(|f| {
+						f.repo as usize == beta_slot && f.path == "beta.txt"
+					})
+					.expect("beta change row")
+			});
+			model.update(cx, |m, cx| {
+				m.select_change(beta_row, cx);
+			});
+
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					!m.preview_loading && m.preview.is_some()
+				});
+				if done {
+					break;
+				}
+			}
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.preview_root(), Some(beta.clone()));
+				let p = m.preview.as_ref().expect("beta preview loaded");
+				assert!(p.text.contains("beta modified"));
+			});
+
+			// Corrupt alpha so its summary becomes Err on refresh.
+			fs::write(
+				alpha.join(".git").join("HEAD"),
+				"ref: refs/heads/nonexistent\n",
+			)
+			.unwrap();
+			fs::remove_file(
+				alpha.join(".git").join("refs").join("heads").join("main"),
+			)
+			.unwrap();
+
+			// Trigger Refresh.
+			model.update(cx, |m, cx| {
+				m.reload_repos(cx);
+			});
+
+			for _ in 0..50 {
+				settle(cx);
+				let done = model
+					.read_with(cx, |m, _| !m.is_loading && !m.preview_loading);
+				if done {
+					break;
+				}
+			}
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.preview_root(),
+					Some(beta.clone()),
+					"preview_root must remain beta after refresh"
+				);
+				let p = m.preview.as_ref().expect("preview must be retained");
+				assert!(
+					p.text.contains("beta modified"),
+					"preview text must still be beta's content"
+				);
+				assert!(
+					m.preview_error.is_none(),
+					"no alpha error should be shown over beta preview"
 				);
 			});
 		}
