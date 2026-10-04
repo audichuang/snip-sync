@@ -386,10 +386,12 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 每格先建一份目的地副本給 oracle 用：`ssh ubuntu "rm -rf '$W/oracle' && cp -a '$W/pastews' '$W/oracle'"`，oracle 是 `ssh ubuntu "cd '$W/oracle/<同一個目的地>' && snip paste --apply <同樣的旗標> --stdin" < payload`，再比較 `$W/pastews/…` 與 `$W/oracle/…` 每個檔案的 SHA-256。
 
+**正規化是刻意的**（spec 第 1 節）：檔案模式不保留檔尾換行與前後空行，CRLF 變成 LF。所以貼上的檔案**不會**逐位元組等於原始檔；通過線一律是「與獨立 CLI 往返的結果相同」——在 Ubuntu 上 `(cd <同一個來源> && snip copy … --stdout)` 產生同一份 payload，`snip paste --apply --stdin` 貼進 oracle 副本，兩邊的貼上結果逐檔案比 SHA-256。
+
 | ID | 操作 | 通過線 |
 |---|---|---|
 | P01 | `(cd "$RUN/paste-src" && "$SNIP" copy . --stdout) > "$RUN/p-files.txt"`（`selection_from_paths` 以 cwd 解析路徑，必須在來源資料夾裡跑；`--repo` 只管引擎根）；命令成功（`$?` 為 0）才 `pbcopy < "$RUN/p-files.txt"`；打開 `pastews/plain`，按 Cmd+V | `PASTE_PREVIEW`；面板列出 `a.txt`、`new.txt`、`sub/crlf.txt`、`sub/noeol.txt`，全部是新增 |
-| P02 | 點 `btn-apply` | `PASTE_DONE`；四個檔案與 oracle 相同（CRLF、沒有結尾換行都保留） |
+| P02 | 點 `btn-apply` | `PASTE_DONE`；四個檔案與「在 Ubuntu 上對 paste-src 做同一個 `snip copy` 再 `snip paste` 進 oracle 副本」的結果逐檔相同。接受的正規化（spec 第 1 節）：`sub/crlf.txt` 變 LF、`sub/noeol.txt` 的檔尾換行狀態不保留——所以這兩個檔**不必**逐位元組等於原始檔，與 CLI 往返一致即通過 |
 | P03 | 打開 `pastews/target`，同一個 payload 再按 Cmd+V | `a.txt` 標示為已存在、需要確認覆寫（`paste-overwrite`），其他是新增 |
 | P04 | 取消勾選 `new.txt`（`paste-include`），勾選 `a.txt` 的覆寫，點 `btn-apply` | `a.txt` 被覆寫、`new.txt` 不存在、`keep.txt` 不變；與 oracle（`--overwrite`，事後刪掉 oracle 的 new.txt）相同 |
 | P05 | 再按一次 Cmd+V，預覽出現後執行 `ssh ubuntu "echo changed-outside > '$W/pastews/target/a.txt'"`，再勾選覆寫、點 `btn-apply` | 拒絕：`PASTE_STALE_DETECTED` 或畫面說目的地已在外部修改；worker 上 `a.txt` 是 `changed-outside` |
@@ -397,7 +399,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | P07 | `pbcopy < "$RUN/git-payload.txt"`；打開 `pastews`，Cmd+V，若可套用就點 `btn-apply` | `target/.git/hooks/pre-commit` 那一列被拒絕或標成不可寫；`ssh ubuntu "test ! -e '$W/pastews/target/.git/hooks/pre-commit'"` 成立 |
 | P08 | X10 的方式從遠端 `pastews/commit-src` 複製兩個 commit；打開 `pastews/commit-dst`，Cmd+V，`btn-apply` | `PASTE_DONE`；`git -C commit-dst log -2 --format=%s` 是 `replay two`、`replay one`，樹與 oracle（在 oracle 副本的 commit-dst 執行 `snip paste --apply --stdin`）相同 |
 | P09 | `"$SNIP" copy --repo "$RUN/commit-local" --commits -n 1 --stdout \| pbcopy`；打開一份新的 `commit-dst` 副本（`ssh ubuntu "cd '$W/pastews' && rm -rf commit-dst2 && git clone -q commit-src commit-dst2 && git -C commit-dst2 reset -q --hard HEAD~2"`），Cmd+V，`btn-apply` | 本機的 commit 重播到遠端：`git -C commit-dst2 log -1 --format=%s` 是 `from mac`，`mac.txt` 內容是 `from mac` |
-| P10 | 遠端貼回本機：在 `edge` 對 `src` 資料夾右鍵 →「複製」；打開本機 `local-ws`，Cmd+V，`btn-apply` | `local-ws/src/main.rs` 與 `local-ws/src/deep/中文 有空白.txt` 的 SHA-256 等於 worker 上的原檔 |
+| P10 | 遠端貼回本機：在 `edge` 對 `src` 資料夾右鍵 →「複製」；打開本機 `local-ws`，Cmd+V，`btn-apply` | `local-ws/src/main.rs` 與 `local-ws/src/deep/中文 有空白.txt` 的 SHA-256 等於「Ubuntu 上 `cd '$W/edge' && snip copy src --stdout` 再 `snip paste --apply --stdin` 貼進一份副本」的結果（與 worker 上的原檔比會差正規化：檔尾換行不保留，spec 第 1 節） |
 | P11 | `(cd "$RUN/paste-big" && "$SNIP" copy . --stdout) > "$RUN/p-big.txt"`，命令成功才 `pbcopy < "$RUN/p-big.txt"`（不要直接管線進 pbcopy：複製失敗也會蓋掉剪貼簿）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `PASTE_DONE`；30 個檔案與本機來源相同 |
 | P12 | 遠端到遠端：在 `gitws` 複製 alpha 的 `dir` 資料夾（X08）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `plain/dir/` 下的檔案與獨立 CLI 往返的結果相同（在 Ubuntu 上 `cd '$W/gitws/alpha' && snip copy dir --stdout`，再 `snip paste --apply --stdin` 貼進 oracle 副本；正規化照 spec 第 1 節） |
 
