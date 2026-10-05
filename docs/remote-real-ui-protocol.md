@@ -25,7 +25,7 @@
 | worker | Ubuntu `audichuang-desktop`（x86_64） | `ssh ubuntu`（`~/.ssh/config` 的 `Host ubuntu`，金鑰登入） |
 
 - 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上與 worker 端變更選取（協定 5）：`grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs`，不符就不開跑。
-- **受測的 worker binary 怎麼被選到**：產品在對方執行 `snip serve --stdio` 時，依序找 PATH 上的 `snip`、`~/.local/bin/snip`…。Ubuntu 的非互動 ssh PATH 第一項是 `~/.local/bin`，所以本輪在 `~/.local/bin/snip` 放一個**三行 wrapper**（把執行時的 PID 記到 `$W/pids/`，再 `exec` 受測 SHA 編出的 binary），產品就會走真實的 ssh 路徑選到它，而 L04、L05 與收尾只殺本輪記下的 PID（2.3 安裝）。開跑前那個位置必須不存在（2.3 會檢查），收尾一定要刪掉（第 6 節，I03 驗證）。**不要用 `SNIP_REMOTE_EXEC`**，那會繞過要測的 ssh 路徑。
+- **受測的 worker binary 怎麼被選到**：產品在對方執行 `snip serve --stdio` 時，依序找 PATH 上的 `snip`、`~/.local/bin/snip`…。Ubuntu 的非互動 ssh PATH 第一項是 `~/.local/bin`，所以本輪在 `~/.local/bin/snip` 放一個**wrapper**（把執行時的 PID 記到 `$W/pids/`，再 `exec` 受測 SHA 編出的 binary），產品就會走真實的 ssh 路徑選到它，而 L04、L05 與收尾只殺本輪記下的 PID（2.3 安裝）。開跑前那個位置必須不存在（2.3 會檢查），收尾一定要刪掉（第 6 節，I03 驗證）。**不要用 `SNIP_REMOTE_EXEC`**，那會繞過要測的 ssh 路徑。
 - 受測專案：Ubuntu 上的 `~/research/rtk`。真實的 Rust 專案，有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs`）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**。
 - 其他情境放在 fixture（第 2.3 節），全部在 Ubuntu 的 `$W` 底下。
 
@@ -95,9 +95,9 @@ printf '// FILE: target/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n' > "$RUN/
 ssh ubuntu '[ ! -e ~/.local/bin/snip ] && [ ! -L ~/.local/bin/snip ] && [ ! -e ~/.local/bin/snip.uirun-'"$SHA"' ] && [ ! -L ~/.local/bin/snip.uirun-'"$SHA"' ]' || { echo "~/.local/bin/snip 或本輪備份名已存在，不開跑" >&2; exit 1; }
 git archive HEAD | ssh ubuntu "rm -rf '$W' && mkdir -p '$W/src' '$W/pids' && tar -x -C '$W/src'"
 ssh ubuntu "cd '$W/src' && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p snip-cli --locked 2>&1 | tail -1"
-# ~/.local/bin/snip 放三行 wrapper：每次被 exec 前把自己的 PID 記進
+# ~/.local/bin/snip 放 wrapper：每次被 exec 前把自己的 PID 記進
 # $W/pids/（檔名就是 PID），L04/L05/收尾只殺這些記下的 PID；
-# SNIP_E2E_PASTE_HOLD 只在 $W/paste-hold 存在時才會暫停（L05），閒置輪不影響。
+# SNIP_E2E_PASTE_HOLD 只接受絕對路徑，且該檔存在時才暫停（L05）。
 ssh ubuntu "mkdir -p ~/.local/bin"
 printf '#!/bin/sh\necho $$ > "%s/pids/$$"\nexport SNIP_E2E_PASTE_HOLD="%s/paste-hold"\nexec "%s/src/target/release/snip" "$@"\n' "$W" "$W" "$W" \
   | ssh ubuntu 'cat > ~/.local/bin/snip && chmod +x ~/.local/bin/snip'
@@ -106,6 +106,40 @@ ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"   # 收尾�
 ```
 
 最後一行必須印出 `/home/audichuang/.local/bin/snip` 和受測版本。印出 linuxbrew 的路徑就停下：產品不會選到受測 binary。
+
+L04、L05 與收尾共用下面的函式，在 Mac 的同一個 bash 定義一次。wrapper `exec` 的是絕對路徑，所以 `ps` 必須精確等於 `$W/src/target/release/snip serve --stdio`。已退出的 PID 略過；仍存活但參數不符的 PID 不殺且判 fail。每個受測 worker 最多等 10 秒，未退出就判 fail；PID 紀錄保留作證據。
+
+```bash
+stop_run_workers() {
+  # shellcheck disable=SC2029 # W 在 master 展開，傳給 worker 的 bash。
+  ssh ubuntu "W='$W' bash -s" <<'EOF'
+set -euo pipefail
+failed=0
+for record in "$W"/pids/*; do
+  [ -f "$record" ] || continue
+  pid=$(cat "$record")
+  if ! [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "無效的 PID 紀錄：$record" >&2; failed=1; continue
+  fi
+  args=$(ps -o args= -p "$pid" || true)
+  [ -n "$args" ] || continue
+  if [ "$args" != "$W/src/target/release/snip serve --stdio" ]; then
+    echo "PID $pid 參數不符，拒絕終止：$args" >&2; failed=1; continue
+  fi
+  kill "$pid" 2>/dev/null || true
+  deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    [ -z "$(ps -o args= -p "$pid" || true)" ] && break
+    sleep 0.1
+  done
+  if [ -n "$(ps -o args= -p "$pid" || true)" ]; then
+    echo "worker $pid 未在 10 秒內退出" >&2; failed=1
+  fi
+done
+[ "$failed" = 0 ]
+EOF
+}
+```
 
 Ubuntu 端 fixture（`$WS` 是 worker 上的 snip，下面的 oracle 都用它）：
 
@@ -485,8 +519,8 @@ snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>s
 | L01 | 在 `edge`：`ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 出現 `ws-tree-row:new.txt`，預覽是 `fresh-1` |
 | L02 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2` |
 | L03 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄沒有 `new.txt` |
-| L04 | 中斷連線：只殺本輪 wrapper 記在 `$W/pids/` 裡的 PID，**不用 `pkill`／`pgrep -u`** 殺光所有符合的程序（機器上可能有別人的 `snip serve --stdio`）。每個 PID 殺之前都用 `ps -o args= -p <pid>` 確認它**仍是** `snip serve --stdio`：不是（已結束、或 PID 被別的程序重用）就一律不殺。做法：`for p in $(ssh ubuntu "cat '$W/pids/'* 2>/dev/null"); do [ "$(ssh ubuntu "ps -o args= -p $p")" = "snip serve --stdio" ] && ssh ubuntu "kill $p"; done`（App 開著時 `$W/pids/` 非空；wrapper 被嵌進 sh -c 時 argv 會多出前綴，那種也照 `ps` 的輸出原樣比對，對不上就不殺）。殺完再逐個 `ps -o args= -p <pid>` 必須都沒有輸出（已結束）；pids 裡的檔案留著當證據。在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh，新的 PID 又記進 `$W/pids/`）；絕不顯示成空白或上一個檔案 |
-| L05 | 貼上中斷（寫入途中斷線，不是閒置時；wrapper 已 export `SNIP_E2E_PASTE_HOLD="$W/paste-hold"`，暫停點只在該檔存在時生效）。步驟：(1) `ssh ubuntu "rm -rf '$W/pastews/cut-dst' && mkdir -p '$W/pastews/cut-dst' && touch '$W/paste-hold'"`——全新的目的地、掛上暫停點。(2) P01 的 payload 對 `pastews/cut-dst` 按 Cmd+V，`PASTE_PREVIEW` 出現後點 `btn-apply`。(3) 等 worker 寫下第一個檔案：`timeout 10 ssh ubuntu "until [ -e '$W/pastews/cut-dst/a.txt' ]; do sleep 0.1; done"`（有上限；逾時就是暫停點沒生效，判 fail）。(4) 用 L04 的做法殺掉 `$W/pids/` 記下的 PID。(5) `ssh ubuntu "rm -f '$W/paste-hold'"`。(6) `ssh ubuntu "find '$W/pastews/cut-dst' -type f \| sort"` 與 CLI 往返 oracle（§4.7 開頭的做法）逐檔對照；在 App 點 `btn-refresh` | UI 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」（`paste_outcome_unknown`）——絕不說成功卻沒寫，也不說失敗卻一個都沒寫；`find` 只看到**部分**檔案（`a.txt` 已寫入，後面的沒有）；已寫入的內容與 CLI 往返 oracle 一致（正規化照 spec 第 1 節）；重新整理後專案樹與 worker 上的實際檔案一致；之後 App 的下一次操作一定有回應（自動重連） |
+| L04 | 中斷連線：執行第 2.3 節的 `stop_run_workers`，必須結束碼 0（只殺本輪記錄、且參數精確符合絕對 binary 路徑的 worker，並確認已退出；任何不符或逾時就判 fail）。不用 `pkill`／`pgrep -u`。在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh，新的 PID 又記進 `$W/pids/`）；絕不顯示成空白或上一個檔案 |
+| L05 | 貼上中斷（寫入途中斷線；wrapper 的 `SNIP_E2E_PASTE_HOLD` 是絕對路徑）。順序：(1) `ssh ubuntu "rm -f '$W/paste-hold'; rm -rf '$W/pastews/cut-dst' '$W/oracle/cut-dst'; mkdir -p '$W/pastews/cut-dst' '$W/oracle/cut-dst'"`；先在 hold 不存在時執行 `ssh ubuntu "cd '$W/oracle/cut-dst' && snip paste --apply --stdin" < "$RUN/p-files.txt"`，完成 P01 payload 的獨立 CLI oracle。(2) `ssh ubuntu "touch '$W/paste-hold'"`；App 打開 `pastews/cut-dst`，對 P01 payload 按 Cmd+V，`PASTE_PREVIEW` 後點 `btn-apply`。(3) `ssh ubuntu "for i in \$(seq 1 100); do [ -f '$W/pastews/cut-dst/a.txt' ] && exit 0; sleep 0.1; done; exit 1"`，必須結束碼 0；逾時判 fail。(4) 執行 `stop_run_workers`，必須結束碼 0，確認 worker 已退出，**先不移除 hold**。(5) `ssh ubuntu "test -f '$W/paste-hold' && test -f '$W/pastews/cut-dst/a.txt' && test ! -e '$W/pastews/cut-dst/new.txt' && test ! -e '$W/pastews/cut-dst/sub/crlf.txt' && test ! -e '$W/pastews/cut-dst/sub/noeol.txt' && cmp '$W/pastews/cut-dst/a.txt' '$W/oracle/cut-dst/a.txt'"`，必須結束碼 0；保存 `ssh ubuntu "find '$W/pastews/cut-dst' -type f"` 的輸出，只能有 `a.txt`。(6) 完成部分寫入檢查後，才 `ssh ubuntu "rm -f '$W/paste-hold'"`，在 App 點 `btn-refresh` | UI 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」（`paste_outcome_unknown`）；確認只有 `a.txt` 已寫入且與 CLI oracle 一致，其餘三個檔案不存在；重新整理後專案樹與 worker 上的實際檔案一致；之後 App 的下一次操作一定有回應（自動重連）。任何步驟失敗都記 fail，再移除 hold 收尾，不當作通過 |
 
 ### 4.10 CLI master 交叉驗證（C01–C04）
 
@@ -509,22 +543,9 @@ snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>s
 ## 6. 收尾
 
 ```bash
-# 1) 本輪 worker 依 $W/pids/ 記下的 PID 收掉——每個 PID 殺之前先用
-#    `ps -o args= -p <pid>` 確認仍是 `snip serve --stdio`（已結束或被
-#    重用的不殺），不用 pkill／pgrep -u 殺光所有符合的程序。殺完逐個
-#    再查一次 ps，必須都沒有輸出；pids/ 的檔案隨 $W 一起刪。
+# 1) 保存 PID 紀錄，使用第 2.3 節的共用 helper；失敗就停止收尾。
 ssh ubuntu "cat '$W/pids/'* 2>/dev/null" > "$RUN/workers-at-cleanup.txt" || true
-while read -r p; do
-  [ -n "$p" ] || continue
-  [ "$(ssh ubuntu "ps -o args= -p $p")" = "snip serve --stdio" ] && ssh ubuntu "kill $p" || true
-done < "$RUN/workers-at-cleanup.txt"
-sleep 1
-left=0
-while read -r p; do
-  [ -n "$p" ] || continue
-  ssh ubuntu "ps -o args= -p $p" | grep -qx "snip serve --stdio" && left=$((left + 1))
-done < "$RUN/workers-at-cleanup.txt"
-[ "$left" = 0 ] || { echo "還有 worker 殘留，收尾未完成" >&2; exit 1; }
+stop_run_workers || { echo "worker 清理失敗，保留本輪目錄" >&2; exit 1; }
 
 # 2) S11 的備份若還在（S11 做到一半中斷）：先還原成 snip。
 ssh ubuntu "if [ -e ~/.local/bin/snip.uirun-$SHA ] && [ ! -e ~/.local/bin/snip ]; then mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip; fi"
