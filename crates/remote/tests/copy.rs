@@ -255,3 +255,65 @@ fn a_worker_without_copy_says_it_is_too_old() {
 		other => panic!("expected too old, got {other:?}"),
 	}
 }
+
+#[test]
+fn whole_folder_copy_requires_protocol_5_but_named_targets_still_work() {
+	let tmp = tempfile::tempdir().unwrap();
+	fs::create_dir(tmp.path().join("sub")).unwrap();
+	fs::write(tmp.path().join("a.txt"), "alpha\n").unwrap();
+	fs::write(tmp.path().join("sub/b.txt"), "beta\n").unwrap();
+	for version in [4, 5] {
+		let w = worker(Some(version));
+		let (client, id) = open(&w, tmp.path());
+		let named = client
+			.export_files(
+				&id,
+				vec![file("a.txt"), file("sub")],
+				&Settings::default(),
+				10_000,
+				None,
+			)
+			.unwrap();
+		assert_eq!(named.copied, 2);
+		for root in ["", "sub"] {
+			let target = ExportTarget {
+				root: root.into(),
+				..file("")
+			};
+			let result = client.export_files(
+				&id,
+				vec![target],
+				&Settings::default(),
+				10_000,
+				None,
+			);
+			if version == 4 {
+				let err =
+					result.expect_err("whole-folder export needs protocol 5");
+				assert!(
+					matches!(
+						err,
+						RemoteError::WorkerTooOld {
+							have: 4,
+							need: 5,
+							..
+						}
+					),
+					"{err:?}"
+				);
+				let message = err.to_string();
+				assert!(
+					message.contains("too old")
+						&& message.contains("update it there"),
+					"{message}"
+				);
+				assert!(!message.contains("unsafe path"), "{message}");
+			} else {
+				assert_eq!(
+					result.unwrap().copied,
+					if root.is_empty() { 2 } else { 1 }
+				);
+			}
+		}
+	}
+}

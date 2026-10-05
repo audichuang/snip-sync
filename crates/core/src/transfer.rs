@@ -45,9 +45,10 @@ mod select;
 
 pub use changes::{changed_items, ChangedItems};
 pub use select::{
-	copy_selection, expand_folder_items, expand_folder_items_in_input_order,
-	is_safe_dir_symlink, plan_export_expanding, selection_from_paths,
-	CopyOutcome, FolderExpansion, PathSelection,
+	copy_selection, copy_selection_detailed, expand_folder_items,
+	expand_folder_items_in_input_order, is_safe_dir_symlink,
+	plan_export_expanding, selection_from_paths, CopyOutcome, CopyReport,
+	FolderExpansion, PathSelection,
 };
 
 /// A stable canonical identifier for an existing, resolved workspace or repository root.
@@ -284,7 +285,7 @@ impl TransferError {
 }
 
 /// Cryptographic and timestamp identity of a file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFreshness {
 	pub size: u64,
 	pub mtime: SystemTime,
@@ -292,7 +293,7 @@ pub struct FileFreshness {
 }
 
 /// Freshness state of a repository (HEAD commit, symbolic ref, and index).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoFreshness {
 	pub head_commit: Option<String>,
 	pub head_ref: Option<String>,
@@ -539,7 +540,7 @@ impl ImportMapping {
 }
 
 /// Target file state recorded at preview time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetFileFreshness {
 	pub root: CanonicalRootId,
 	pub relative_path: String,
@@ -548,7 +549,7 @@ pub struct TargetFileFreshness {
 }
 
 /// Destination freshness snapshot captured during import preview.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DestinationFreshnessSnapshot {
 	pub roots: HashMap<CanonicalRootId, RepoFreshness>,
 	pub target_files: HashMap<PathBuf, TargetFileFreshness>,
@@ -759,7 +760,7 @@ impl DestinationFreshnessSnapshot {
 }
 
 /// An immutable import plan containing the exact file restore operations and freshness token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferImportPlan {
 	roots: Vec<PathBuf>,
 	restore_plan: RestorePlan,
@@ -813,9 +814,25 @@ impl TransferImportPlan {
 		&self,
 		selection: &RestoreSelection,
 	) -> Result<RestoreExecutionResult, TransferError> {
+		self.apply_observed(selection, &mut |_, _| {})
+	}
+
+	/// [`Self::apply`] observing every committed write as it lands: a
+	/// remote worker's e2e paste-hold pauses after the first.
+	pub fn apply_observed(
+		&self,
+		selection: &RestoreSelection,
+		after_write: &mut dyn FnMut(
+			&restore::CreateOperation,
+			&restore::CreateOutcome,
+		),
+	) -> Result<RestoreExecutionResult, TransferError> {
 		self.destination_freshness.revalidate()?;
-		let result =
-			restore::execute_restore_plan(&self.restore_plan, selection);
+		let result = restore::execute_restore_plan_observed(
+			&self.restore_plan,
+			selection,
+			after_write,
+		);
 		Ok(result)
 	}
 }
@@ -3131,6 +3148,10 @@ fn select_exact_chain(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitReplayPreview {
 	destination: PathBuf,
+	/// The write scope: the folder the user pasted into, at most the
+	/// repository root. Targets outside it are refused, so a whole-repo
+	/// replay requires opening the repo root.
+	scope: PathBuf,
 	payload: CommitsPayload,
 	replay: commits::CommitReplayPlan,
 	freshness: DestinationFreshnessSnapshot,
@@ -3139,6 +3160,11 @@ pub struct CommitReplayPreview {
 impl CommitReplayPreview {
 	pub fn destination(&self) -> &Path {
 		&self.destination
+	}
+
+	/// The replay's write scope ([`Self::capture_in`]).
+	pub fn scope(&self) -> &Path {
+		&self.scope
 	}
 
 	pub fn payload(&self) -> &CommitsPayload {
@@ -3159,6 +3185,7 @@ impl CommitReplayPreview {
 	pub fn retained_heap_bytes(&self) -> usize {
 		self.destination
 			.capacity()
+			.saturating_add(self.scope.capacity())
 			.saturating_add(self.payload.retained_heap_bytes())
 			.saturating_add(self.replay.retained_heap_bytes())
 			.saturating_add(self.freshness.fresh_capture_heap_bytes())
@@ -3171,25 +3198,41 @@ impl CommitReplayPreview {
 		Self::capture_with(dest, payload, &RunOptions::default())
 	}
 
-	/// [`Self::capture`] with the caller's runner options.
+	/// [`Self::capture`] with the caller's runner options. The write scope
+	/// is the repository root: the destination's whole repository may be
+	/// replayed. Nothing is written.
+	pub fn capture_with(
+		dest: &Path,
+		payload: &CommitsPayload,
+		opts: &RunOptions,
+	) -> Result<Self, TransferError> {
+		Self::capture_in(dest, dest, payload, opts)
+	}
+
+	/// [`Self::capture_with`] with the replay's write scope: only
+	/// `scope`'s targets may be written or deleted. Both front ends pass
+	/// the folder the user pasted into, so a subfolder paste refuses
+	/// targets outside it; a whole-repository replay passes the
+	/// repository root.
 	///
 	/// Opens the destination with `Git::open_with`. Eligibility planning polls
 	/// `opts` between files, then HEAD, the symbolic ref, the index and each
 	/// target hash use the same options. Nothing is written.
-	pub fn capture_with(
+	pub fn capture_in(
 		dest: &Path,
+		scope: &Path,
 		payload: &CommitsPayload,
 		opts: &RunOptions,
 	) -> Result<Self, TransferError> {
 		cancelled_err(opts, "replay-preview")?;
 		let git = Git::open_with(dest, opts)?;
 		let root = git.root().to_path_buf();
-		let replay = replay_plan(&git, payload, opts)?;
+		let replay = replay_plan_in(&git, scope, payload, opts)?;
 		let freshness = capture_replay_freshness(&root, &replay, opts)?;
 		// Plan first, then the snapshot, then plan again. A change between
 		// those reads makes the preview unusable instead of storing a mix.
 		cancelled_err(opts, "replay-preview")?;
-		let again = replay_plan(&git, payload, opts)?;
+		let again = replay_plan_in(&git, scope, payload, opts)?;
 		if again != replay {
 			return Err(TransferError::StaleDestination {
 				root: root.clone(),
@@ -3201,6 +3244,7 @@ impl CommitReplayPreview {
 		revalidate_replay_freshness(&freshness, opts)?;
 		let preview = Self {
 			destination: root,
+			scope: scope.to_path_buf(),
 			payload: payload.clone(),
 			replay,
 			freshness,
@@ -3209,6 +3253,39 @@ impl CommitReplayPreview {
 		final_boundary_cancel_hook("replay-preview-capture");
 		cancelled_err(opts, "replay-preview")?;
 		Ok(preview)
+	}
+
+	/// A preview captured elsewhere (a remote worker) put back together with
+	/// its payload. Nothing here is trusted: [`Self::apply_with`] and
+	/// [`Self::revalidate_with`] re-plan the payload and re-read every
+	/// recorded path before anything is written. The scope is the
+	/// destination; callers that captured with a narrower scope restate it
+	/// with [`Self::from_parts_scoped`].
+	pub fn from_parts(
+		destination: PathBuf,
+		payload: CommitsPayload,
+		replay: commits::CommitReplayPlan,
+		freshness: DestinationFreshnessSnapshot,
+	) -> Self {
+		let scope = destination.clone();
+		Self::from_parts_scoped(destination, scope, payload, replay, freshness)
+	}
+
+	/// [`Self::from_parts`] with the replay's write scope restored.
+	pub fn from_parts_scoped(
+		destination: PathBuf,
+		scope: PathBuf,
+		payload: CommitsPayload,
+		replay: commits::CommitReplayPlan,
+		freshness: DestinationFreshnessSnapshot,
+	) -> Self {
+		Self {
+			destination,
+			scope,
+			payload,
+			replay,
+			freshness,
+		}
 	}
 
 	pub fn apply(&self) -> Result<commits::ReplayResult, TransferError> {
@@ -3230,14 +3307,18 @@ impl CommitReplayPreview {
 	) -> Result<commits::ReplayResult, TransferError> {
 		cancelled_err(opts, "replay-apply")?;
 		let git = Git::open_with(&self.destination, opts)?;
-		let session =
-			match commits::ReplaySession::begin(&git, &self.payload, opts) {
-				Ok(s) => s,
-				Err(refused) => {
-					cancelled_err(opts, "replay-apply")?;
-					return Ok(refused);
-				}
-			};
+		let session = match commits::ReplaySession::begin_in(
+			&git,
+			&self.scope,
+			&self.payload,
+			opts,
+		) {
+			Ok(s) => s,
+			Err(refused) => {
+				cancelled_err(opts, "replay-apply")?;
+				return Ok(refused);
+			}
+		};
 		self.revalidate_with(opts)?; // under the heavy lock, right before the first write
 		cancelled_err(opts, "replay-apply")?;
 		Ok(session.run(&git, &self.payload))
@@ -3262,7 +3343,7 @@ impl CommitReplayPreview {
 		cancelled_err(opts, "replay-preview")?;
 		revalidate_replay_freshness(&self.freshness, opts)?;
 		let git = Git::open_with(&self.destination, opts)?;
-		let now = replay_plan(&git, &self.payload, opts)?;
+		let now = replay_plan_in(&git, &self.scope, &self.payload, opts)?;
 		if now != self.replay {
 			return Err(TransferError::StaleDestination {
 				root: self.destination.clone(),
@@ -3276,17 +3357,18 @@ impl CommitReplayPreview {
 	}
 }
 
-fn replay_plan(
+fn replay_plan_in(
 	git: &Git,
+	scope: &Path,
 	payload: &CommitsPayload,
 	opts: &RunOptions,
 ) -> Result<commits::CommitReplayPlan, TransferError> {
-	commits::plan_commit_replay_with(git, payload, opts).map_err(
-		|err| match err {
+	commits::plan_commit_replay_in(git, scope, payload, opts).map_err(|err| {
+		match err {
 			CommitError::Git(git_err) => TransferError::Git(git_err),
 			other => TransferError::Commit(other),
-		},
-	)
+		}
+	})
 }
 
 /// Repo freshness plus every path the replay plan named. Symlinks are hashed
@@ -3947,5 +4029,45 @@ mod freshness_error_tests {
 			direct_import,
 			TransferError::DestinationNotRegular(_)
 		));
+	}
+}
+
+#[cfg(test)]
+mod wire_tests {
+	use super::*;
+
+	/// A remote worker sends an import plan and its freshness snapshot to the
+	/// master and gets the snapshot back: both must survive JSON unchanged,
+	/// map keys included.
+	#[test]
+	fn import_plan_and_freshness_round_trip_through_json() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(dir.path()).unwrap();
+		fs::write(root.join("a.txt"), "old\n").unwrap();
+		let payload = "// File: a.txt\nnew\n\n// File: b.txt\nb\n";
+		let mapping =
+			ImportMapping::with_primary(CanonicalRootId::new(&root).unwrap());
+		let plan =
+			plan_import(payload, "", std::slice::from_ref(&root), &mapping)
+				.unwrap();
+		assert_eq!(plan.create_operations().len(), 2);
+		let json = serde_json::to_string(&plan).unwrap();
+		let back: TransferImportPlan = serde_json::from_str(&json).unwrap();
+		assert_eq!(back, plan);
+		let fresh =
+			serde_json::to_string(plan.destination_freshness()).unwrap();
+		let back: DestinationFreshnessSnapshot =
+			serde_json::from_str(&fresh).unwrap();
+		assert_eq!(&back, plan.destination_freshness());
+		back.revalidate().unwrap();
+		let sel = RestoreSelection {
+			overwrite_existing: true,
+			unchecked_creates: [1].into_iter().collect(),
+			..Default::default()
+		};
+		let back: RestoreSelection =
+			serde_json::from_str(&serde_json::to_string(&sel).unwrap())
+				.unwrap();
+		assert_eq!(back, sel);
 	}
 }

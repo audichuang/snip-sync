@@ -199,7 +199,9 @@ check "folders first" bash -c "'$SNIP' remote ls h $WD/edge | head -1 | grep -q 
 check "a Chinese name with spaces" bash -c "'$SNIP' remote cat h $WD/edge 'src/deep/中文 有空白.txt' | grep -q 深層"
 check "stat of an empty file" bash -c "'$SNIP' remote stat h $WD/edge empty.txt | grep -q '^file	0	'"
 check "exactly 1 MiB is served" test "$("$SNIP" remote cat h "$WD/edge" exact-1MiB.txt | wc -c | tr -d ' ')" = 1048576
-check "1200 entries are cut at 1000" test "$("$SNIP" remote ls h "$WD/edge" manydir 2>/dev/null | wc -l | tr -d ' ')" = 1000
+# The whole listing arrives in ONE reply, far under the worker's
+# 20,000-entry cap: every one of the 1200 entries exactly once.
+check "1200 entries all listed, none twice" bash -c "n=\$('$SNIP' remote ls h '$WD/edge' manydir 2>/dev/null | wc -l | tr -d ' '); u=\$('$SNIP' remote ls h '$WD/edge' manydir 2>/dev/null | sort -u | wc -l | tr -d ' '); test \$n = 1200 && test \$u = 1200"
 check "a nested repo is a folder" bash -c "'$SNIP' remote stat h $WD/edge nested | grep -q '^directory'"
 if w <<<"[ -L '$WD/edge/inner-link' ]"; then
 	check "a symlink inside the workspace is followed" bash -c "'$SNIP' remote ls h $WD/edge inner-link | grep -qx deep/"
@@ -284,6 +286,76 @@ alpha_tip=$(w <<<"git -C '$WD/gitws/alpha' rev-parse HEAD")
 commit_copy=$("$SNIP" remote copy-commits h "$WD/gitws" --in alpha "$alpha_tip" --stdout 2>/dev/null)
 check "a remote copy of a commit" grep -q '"message":"second commit' <<<"$commit_copy"
 refused "a copy out of the workspace" "" copy h "$WD/edge" ../secret.txt --stdout
+
+echo "== paste"
+# A payload made by `snip copy` on this machine, pasted into a folder of the
+# worker: planned and written there by the worker with the engine `snip
+# paste` runs here. Every pasted file must match a local paste byte for byte.
+gitc() { git -c user.name=t -c user.email=t@t "$@"; }
+PSRC="$MASTER/paste-src"
+mkdir -p "$PSRC/sub" "$MASTER/paste-local"
+printf 'pasted\tTab 中文 ✓ 🦀\n' >"$PSRC/a.txt"
+printf 'crlf\r\nsecond\r\n' >"$PSRC/sub/crlf.txt"
+printf 'no newline at the end' >"$PSRC/sub/noeol.txt"
+head -c 300000 /dev/zero | tr '\000' z >"$PSRC/long.txt"
+(cd "$PSRC" && "$SNIP" copy . --stdout >"$MASTER/payload.txt" 2>/dev/null)
+w <<<"mkdir -p '$WD/pastews/dst' && printf 'old\n' > '$WD/pastews/dst/a.txt'"
+printf 'old\n' >"$MASTER/paste-local/a.txt"
+"$SNIP" --repo "$MASTER/paste-local" paste --apply --overwrite --stdin <"$MASTER/payload.txt" >/dev/null 2>&1
+"$SNIP" remote paste h "$WD/pastews" --in dst --apply --overwrite --stdin <"$MASTER/payload.txt" >/dev/null 2>&1
+check "a remote paste exits as a local one" test "$?" = 0
+pasted=0
+differs=0
+while IFS= read -r f; do
+	pasted=$((pasted + 1))
+	there=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/pastews/dst/$f' || shasum -a 256 < '$WD/pastews/dst/$f') | cut -c1-64")
+	if [ "$there" != "$(hash_of <"$MASTER/paste-local/$f")" ]; then
+		differs=$((differs + 1))
+		echo "      differs: $f"
+	fi
+done < <(cd "$MASTER/paste-local" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+check "$pasted pasted files on the worker identical to a local paste" test "$differs" = 0 -a "$pasted" -gt 3
+
+w <<<"cd '$WD/pastews' && git init -q repo"
+printf '// FILE: repo/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n' >"$MASTER/git-payload.txt"
+"$SNIP" remote paste h "$WD/pastews" --apply --stdin <"$MASTER/git-payload.txt" >/dev/null 2>&1
+check "a payload entry inside .git is skipped" w <<<"test ! -e '$WD/pastews/repo/.git/hooks/pre-commit'"
+err=$("$SNIP" remote paste h "$WD/pastews" --in repo/.git --apply --overwrite --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/pastews/repo/.git/a.txt'"; then
+	ok "a paste into .git is refused and writes nothing  ($err)"
+else
+	bad "a paste into .git  rc=$rc err=$err"
+fi
+err=$("$SNIP" remote paste h "$WD/pastews" --in .. --apply --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/a.txt'"; then
+	ok "a paste out of the workspace is refused  ($err)"
+else
+	bad "a paste out of the workspace  rc=$rc err=$err"
+fi
+
+# Commit mode: the worker replays the commits as a local replay does.
+CSRC="$MASTER/commit-src"
+mkdir -p "$CSRC"
+(cd "$CSRC" && gitc init -q && printf 'one\n' >a.txt && gitc add . && gitc commit -q -m "replay one" &&
+	printf 'two\n' >a.txt && mkdir d && printf 'b\n' >d/b.txt && gitc add . && gitc commit -q -m "replay two")
+"$SNIP" --repo "$CSRC" copy --commits -n 2 --stdout >"$MASTER/commits.txt" 2>/dev/null
+base_repo() { # the same starting commit on both machines
+	git init -q "$1" && git -C "$1" config user.name t && git -C "$1" config user.email t@t &&
+		printf 'base\n' >"$1/base.txt" && git -C "$1" add . && git -C "$1" commit -q -m base
+}
+base_repo "$MASTER/commit-local"
+w <<EOF
+$(declare -f base_repo)
+base_repo '$WD/pastews/crepo'
+EOF
+"$SNIP" --repo "$MASTER/commit-local" paste --apply --stdin <"$MASTER/commits.txt" >/dev/null 2>&1
+"$SNIP" remote paste h "$WD/pastews" --in crepo --apply --stdin <"$MASTER/commits.txt" >/dev/null 2>&1
+check "a remote commit replay exits as a local one" test "$?" = 0
+local_log=$(git -C "$MASTER/commit-local" log -2 --format='%T %an <%ae> %ad %s')
+remote_log=$(w <<<"git -C '$WD/pastews/crepo' log -2 --format='%T %an <%ae> %ad %s'")
+check "the replayed commits match a local replay" test "$remote_log" = "$local_log" -a -n "$local_log"
 
 echo "== git views"
 w <<<"sleep 1 && touch '$WD/gitws/alpha/b.txt'"

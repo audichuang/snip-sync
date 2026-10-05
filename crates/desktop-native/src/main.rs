@@ -141,23 +141,20 @@ fn commit_copied_status(out: &snip_core::commits::CommitCopyOutcome) -> Msg {
 }
 
 /// The copy toast: a partial copy (file limit hit in the folder walk or
-/// in the plan) always says so, with the limit.
+/// in the plan) always says so, with the limit. Local and remote copies
+/// report the same [`snip_core::transfer::CopyOutcome`] shape.
 fn copied_status(
 	repo_name: String,
-	plan: &snip_core::transfer::ExportPlan,
-	expanded: &FolderExpansion,
+	out: &snip_core::transfer::CopyOutcome,
 ) -> Msg {
-	let skipped = plan.skipped_unreadable_count
-		+ plan.skipped_file_size_count
-		+ expanded.skipped;
 	let mut args = vec![
 		repo_name,
-		plan.copied_file_count.to_string(),
-		plan.stats.chars.to_string(),
-		plan.stats.lines.to_string(),
-		skipped.to_string(),
+		out.copied.to_string(),
+		out.chars.to_string(),
+		out.lines.to_string(),
+		out.skipped.to_string(),
 	];
-	if !(expanded.truncated || plan.file_limit_reached) {
+	if !out.truncated {
 		return Msg::new("status_copied", args);
 	}
 	if e2e_on() {
@@ -204,8 +201,8 @@ use snip_core::gitsrc::{Git, GitSource};
 use snip_core::graph::GraphLayout;
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	expand_folder_items, plan_commit_export_exact_with, plan_export_with,
-	CanonicalRootId, ExportItem, ExportSelection, FolderExpansion, SourceKind,
+	copy_selection_detailed, plan_commit_export_exact_with, CanonicalRootId,
+	ExportItem, ExportSelection, SourceKind,
 };
 use snip_core::workspace::{
 	DiscoveredRepo, Discovery, RepoIdentity, RepoSummary, ScanBudget,
@@ -1681,7 +1678,13 @@ impl WorkbenchModel {
 	}
 
 	pub fn current_restore_destination(&self) -> PathBuf {
-		if let Some(ref d) = self.restore_dir {
+		// A remote workspace pastes into its own folders only.
+		let remote_root = self.remote.session.as_ref().map(|s| &s.root);
+		let restore_dir = self
+			.restore_dir
+			.as_ref()
+			.filter(|d| remote_root.is_none_or(|root| d.starts_with(root)));
+		if let Some(d) = restore_dir {
 			d.clone()
 		} else if let Some(root) = self.repo_root() {
 			root
@@ -4019,55 +4022,45 @@ impl WorkbenchModel {
 			lifecycle::JobKind::CancellableRead,
 			Some(job_token),
 			async move {
-				let result: Result<(String, usize, Msg), Msg> = bg
+					let result: Result<(String, usize, Msg), Msg> = bg
 					.spawn(async move {
 						let opts = interactive_read_opts(run_token.clone());
 						let settings = native_export_settings();
-						let expanded = expand_folder_items(
-							export_sel,
-							NATIVE_FILE_COUNT_LIMIT,
-							&run_token,
-						)
-						.map_err(|e| match e {
-							// Every file under the folders was skipped.
-							snip_core::transfer::TransferError::EmptySelection => {
-								Msg::new("status_copy_nothing_skipped", [])
-							}
-							e => Msg::new("error_payload", [e.to_string()]),
-						})?;
-						let export_sel = &expanded.sel;
-						// Document cap is the retained UI output ceiling.
-						// It is not `RunOptions::max_stdout`.
-						let plan = plan_export_with(
+						// The same engine a remote copy and the CLI run,
+						// batches doubling past what a filter excludes.
+						let report = copy_selection_detailed(
 							export_sel,
 							&settings,
-							Some(snip_core::transfer::CLIPBOARD_PAYLOAD_MAX),
+							NATIVE_FILE_COUNT_LIMIT,
 							&opts,
+							|plan| {
+								if let Some(ref hold) = export_hold {
+									if hold.exists() {
+										app_log!(
+											"[APP:EXPORT_PLAN_READY: files={}]",
+											plan.files.len()
+										);
+										while hold.exists() {
+											if run_token.is_cancelled() {
+												break;
+											}
+											std::thread::sleep(
+												std::time::Duration::from_millis(20),
+											);
+										}
+									}
+								}
+							},
 						)
 						.map_err(|e| {
-							Msg::new("error_payload", [e.to_string()])
-						})?;
-						if plan.files.is_empty() {
-							return Err(Msg::new("status_copy_nothing", []));
-						}
-						if let Some(ref hold) = export_hold {
-							if hold.exists() {
-								app_log!(
-									"[APP:EXPORT_PLAN_READY: files={}]",
-									plan.files.len()
-								);
-								while hold.exists() {
-									if run_token.is_cancelled() {
-										break;
-									}
-									std::thread::sleep(
-										std::time::Duration::from_millis(20),
-									);
-								}
-							}
-						}
-						plan.revalidate_with(&opts).map_err(|e| {
 							let reason = match &e {
+								// Every file under the folders was skipped.
+								snip_core::transfer::TransferError::EmptySelection => {
+									return Msg::new(
+										"status_copy_nothing_skipped",
+										[],
+									)
+								}
 								snip_core::transfer::TransferError::StaleSource { .. } => "stale_source",
 								_ => "revalidate",
 							};
@@ -4076,8 +4069,15 @@ impl WorkbenchModel {
 							}
 							Msg::new("error_payload", [e.to_string()])
 						})?;
-						let msg = copied_status(repo_name, &plan, &expanded);
-						Ok((plan.payload, plan.copied_file_count, msg))
+						if report.outcome.copied == 0 {
+							return Err(Msg::new("status_copy_nothing", []));
+						}
+						let msg = copied_status(repo_name, &report.outcome);
+						Ok((
+							report.outcome.payload,
+							report.outcome.copied,
+							msg,
+						))
 					})
 					.await;
 
@@ -4202,19 +4202,7 @@ impl WorkbenchModel {
 						if out.copied == 0 {
 							return Err(Msg::new("status_copy_nothing", []));
 						}
-						let mut args = vec![
-							repo_name,
-							out.copied.to_string(),
-							out.chars.to_string(),
-							out.lines.to_string(),
-							out.skipped.to_string(),
-						];
-						let msg = if out.truncated {
-							args.push(NATIVE_FILE_COUNT_LIMIT.to_string());
-							Msg::new("status_copied_limit", args)
-						} else {
-							Msg::new("status_copied", args)
-						};
+						let msg = copied_status(repo_name, &out);
 						Ok((out.payload, out.copied, msg))
 					})
 					.await;
@@ -4489,14 +4477,14 @@ impl WorkbenchModel {
 						"[APP:PASTE_MAP_CANDIDATE: prefix={} idx={} path={}]",
 						choice.prefix,
 						idx,
-						path.display()
+						plan.shown(path)
 					);
 				}
 			}
 			app_log!(
 				"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
 				items_count,
-				plan.destination.display(),
+				plan.shown(&plan.destination),
 				plan.mapping_ready()
 			);
 		}
@@ -4516,10 +4504,6 @@ impl WorkbenchModel {
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
 		if self.refuse_while_applying("preview", cx) {
-			return;
-		}
-		if self.remote_blocks() {
-			cx.notify();
 			return;
 		}
 		if !self.workspace_open {
@@ -4570,6 +4554,11 @@ impl WorkbenchModel {
 				dest: target_dest,
 				roots: known_roots,
 				generation: self.generation,
+				remote: self
+					.remote
+					.session
+					.clone()
+					.map(|session| paste::RemotePaste { session }),
 			},
 			cx,
 		);
@@ -4921,13 +4910,13 @@ impl WorkbenchModel {
 /// Where `prefix` lands, as printed in `[APP:PASTE_MAPPED]`.
 fn prefix_target(plan: &PastePreviewPlan, prefix: &str, keep: bool) -> String {
 	if keep {
-		return plan.destination.display().to_string();
+		return plan.shown(&plan.destination);
 	}
 	plan.prefix_choices
 		.iter()
 		.find(|choice| choice.prefix == prefix)
 		.and_then(|choice| choice.destination.as_ref())
-		.map(|dest| dest.display().to_string())
+		.map(|dest| plan.shown(dest))
 		.unwrap_or_default()
 }
 
@@ -5718,6 +5707,283 @@ mod tests {
 		/// Project tree and a file preview, all read through the worker.
 		/// Every read has a deadline (snip-remote), so a hang fails rather
 		/// than blocks.
+		/// A remote listing the byte budget cuts short finishes through the
+		/// ORDINARY LoadMore path: Expand fetches the whole listing once,
+		/// the budget admits four of ten, and「顯示更多」walks the held
+		/// tail to the end — no refetch, no name lost or doubled.
+		#[gpui::test]
+		fn a_remote_listing_cut_by_the_budget_finishes_through_load_more(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect, TreeIo, TreeIoKind,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::VecDeque;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let children: Vec<ListedChild> = (0..10)
+				.map(|i| ListedChild {
+					name: format!("f{i:02}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			let mut tree = FileTreeNode::unloaded_root(&root);
+
+			// One row's cost, measured on a directly built io: the tree's
+			// command state is not what this measures, and one Expand is
+			// all an unloaded root will schedule.
+			let probe = listed_tree_result(
+				TreeIo {
+					key: NodeKey::root(),
+					epoch: 0,
+					dir: root.clone(),
+					base: root.clone(),
+					depth: 1,
+					byte_budget: usize::MAX,
+					scan: None,
+					held: VecDeque::new(),
+					replace_children: true,
+					kind: TreeIoKind::Expand,
+				},
+				Ok((children[..1].to_vec(), false)),
+			);
+			let cost = probe.children[0].retained_bytes();
+
+			let TreeEffect::Io(mut io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("expand must schedule io");
+			};
+			io.byte_budget = cost.saturating_mul(4).saturating_add(64);
+			let first = listed_tree_result(io, Ok((children, false)));
+			tree.apply_io_result(first).expect("the expand applies");
+			assert_eq!(tree.children.len(), 4, "the budget admits four of ten");
+			assert!(tree.has_more, "the rest is held for LoadMore");
+			assert!(
+				tree.flatten_visible(100).iter().any(|r| r.is_more_marker),
+				"the「顯示更多」marker is visible"
+			);
+
+			// LoadMore through the real command path, with the workbench's
+			// own budget logic.
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::LoadMore(NodeKey::root()))
+			else {
+				panic!("load more must schedule io from the held tail");
+			};
+			let rest = execute_tree_io(io, &CancelToken::new());
+			tree.apply_io_result(rest)
+				.expect("the continuation applies");
+			assert!(!tree.has_more);
+			let names: Vec<&str> =
+				tree.children.iter().map(|c| c.name.as_str()).collect();
+			assert_eq!(names.len(), 10, "{names:?}");
+			assert_eq!(
+				names,
+				[
+					"f00", "f01", "f02", "f03", "f04", "f05", "f06", "f07",
+					"f08", "f09"
+				],
+				"every name exactly once, in order"
+			);
+		}
+
+		/// A 1,200-entry remote listing shows every name through LoadMore:
+		/// the first Expand admits one page, the held tail carries the rest,
+		/// and no name is lost or doubled on the way.
+		#[gpui::test]
+		fn a_remote_listing_of_1200_shows_every_name_through_load_more(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect, MAX_DIR_ENTRIES,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::HashSet;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let children: Vec<ListedChild> = (0..1200)
+				.map(|i| ListedChild {
+					name: format!("f{i:04}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			let mut tree = FileTreeNode::unloaded_root(&root);
+
+			// The budget is not what this test is about (AGENTS: build the
+			// state rather than rely on how many names fit), so each batch
+			// runs with the budget open.
+			let TreeEffect::Io(mut io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("expand must schedule io");
+			};
+			io.byte_budget = usize::MAX;
+			let result = listed_tree_result(io, Ok((children, false)));
+			tree.apply_io_result(result).expect("the expand applies");
+			assert_eq!(
+				tree.children.len(),
+				MAX_DIR_ENTRIES,
+				"the first batch is the ordinary page"
+			);
+			assert!(tree.has_more);
+
+			let mut guard = 0;
+			while tree.has_more {
+				guard += 1;
+				assert!(guard < 30, "load more must converge");
+				let TreeEffect::Io(mut io) =
+					tree.start(TreeCommand::LoadMore(NodeKey::root()))
+				else {
+					panic!("load more must schedule io while names remain");
+				};
+				io.byte_budget = usize::MAX;
+				let result = execute_tree_io(io, &CancelToken::new());
+				tree.apply_io_result(result)
+					.expect("a continuation applies");
+			}
+			assert_eq!(tree.children.len(), 1200);
+			let seen: HashSet<&str> =
+				tree.children.iter().map(|c| c.name.as_str()).collect();
+			assert_eq!(seen.len(), 1200, "no duplicates");
+			assert!(tree.children[0].name == "f0000");
+			assert!(tree.children[1199].name == "f1199");
+		}
+
+		#[gpui::test]
+		fn a_nested_remote_listing_of_6000_survives_cache_reclaim(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect,
+				MAX_RETAINED_WORKING_TREE_BYTES,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::HashSet;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let mut tree = FileTreeNode::unloaded_root(&root);
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("root expansion must schedule io");
+			};
+			tree.apply_io_result(listed_tree_result(
+				io,
+				Ok((
+					vec![ListedChild {
+						name: "nested".into(),
+						utf8: true,
+						directory: true,
+						nested_repo: false,
+					}],
+					false,
+				)),
+			))
+			.unwrap();
+			let key = NodeKey::from_utf8_rel("nested");
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::Expand(key.clone()))
+			else {
+				panic!("nested expansion must schedule io");
+			};
+			let listing = (0..6000)
+				.map(|i| ListedChild {
+					name: format!("f{i:04}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			tree.apply_io_result(listed_tree_result(io, Ok((listing, false))))
+				.unwrap();
+			assert!(
+				tree.children[0].is_expanded,
+				"cache reclaim must not collapse the listing"
+			);
+			assert!(
+				tree.retained_bytes() > tree.cache_bytes(),
+				"the remote tail still counts toward aggregate storage"
+			);
+			assert!(!tree.children[0].children.is_empty());
+			assert!(tree
+				.flatten_visible(tree.visible_limit())
+				.iter()
+				.any(|row| row.rel_path == "nested/f0000"));
+			tree.toggle_select("nested/f0000");
+			let mut seen = HashSet::new();
+			for page in 0..100 {
+				assert!(tree.cache_bytes() <= MAX_RETAINED_WORKING_TREE_BYTES);
+				let folder = &tree.children[0];
+				assert!(folder.is_expanded && folder.read_error.is_none());
+				seen.extend(
+					folder.children.iter().map(|node| node.name.clone()),
+				);
+				if !folder.has_more {
+					break;
+				}
+				assert!(page < 99, "Load More must reach all 6000 names");
+				assert!(tree
+					.flatten_visible(tree.visible_limit())
+					.iter()
+					.any(|row| row.is_more_marker && row.rel_path == "nested"));
+				let TreeEffect::Io(io) =
+					tree.start(TreeCommand::LoadMore(key.clone()))
+				else {
+					panic!("Load More must retain the remote tail");
+				};
+				tree.apply_io_result(execute_tree_io(io, &CancelToken::new()))
+					.unwrap();
+			}
+			assert_eq!(seen.len(), 6000);
+			assert!((0..6000).all(|i| seen.contains(&format!("f{i:04}"))));
+			assert!(tree
+				.selected_paths()
+				.contains(&"nested/f0000".to_string()));
+		}
+
+		#[gpui::test]
+		fn an_empty_remote_listing_never_reads_the_master_directory(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				listed_tree_result, FileTreeNode, NodeKey, TreeCommand,
+				TreeEffect,
+			};
+			let tmp = tempfile::tempdir().unwrap();
+			fs::write(tmp.path().join("master-only.txt"), "local").unwrap();
+			let mut tree = FileTreeNode::unloaded_root(tmp.path());
+			for command in [
+				TreeCommand::Expand(NodeKey::root()),
+				TreeCommand::Retry(NodeKey::root()),
+			] {
+				let TreeEffect::Io(io) = tree.start(command) else {
+					panic!("listing must schedule io");
+				};
+				tree.apply_io_result(listed_tree_result(
+					io,
+					Ok((Vec::new(), false)),
+				))
+				.unwrap();
+				assert!(tree.is_loaded && tree.is_expanded);
+				assert!(
+					tree.children.is_empty(),
+					"the worker's empty answer must stay empty"
+				);
+				assert!(tree.read_error.is_none() && !tree.has_more);
+				assert!(tree.flatten_visible(tree.visible_limit()).is_empty());
+				assert!(matches!(
+					tree.start(TreeCommand::LoadMore(NodeKey::root())),
+					TreeEffect::Idle
+				));
+			}
+		}
+
 		#[gpui::test]
 		fn remote_workspace_opens_a_host_folder_and_previews_through_a_worker(
 			cx: &mut TestAppContext,
@@ -5815,16 +6081,13 @@ mod tests {
 				m.select_file_in(root, "src/main.rs", SourceKind::File, cx);
 			});
 			settle(cx);
-			model.update(cx, |m, cx| {
+			model.read_with(cx, |m, _| {
 				let p = m.preview.as_ref().expect("remote preview");
 				assert_eq!(&*p.text, "fn main() {}\n");
 				assert_eq!(m.preview_error, None);
 				// The breadcrumb names the host, never the internal root.
 				let root = m.ws_root().unwrap();
 				assert_eq!(m.log_repo_name(&root), "test-worker ▸ shared");
-				// Copy and paste stay local; a remote workspace refuses them.
-				m.trigger_paste_preview(cx);
-				assert_eq!(m.status.key, "remote_unsupported");
 			});
 
 			// Refresh re-reads the open file: deleted on the worker, it shows
@@ -7695,6 +7958,340 @@ mod tests {
 					snip_core::clip::Mode::Commits
 				),
 				"{text}"
+			);
+		}
+
+		/// Puts `payload` on the clipboard, opens its paste preview in the
+		/// remote workspace and waits (bounded) for the worker's plan.
+		fn remote_paste_preview(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			payload: &str,
+		) {
+			clip::write_text(payload).unwrap();
+			model.update(cx, |m, cx| m.trigger_paste_preview(cx));
+			for _ in 0..300 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				});
+				if done {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.paste.plan().is_some() && !m.paste.is_loading(),
+					"no remote preview: {}",
+					m.status
+				);
+			});
+		}
+
+		/// Applies, as the Apply button does, and waits (bounded) for the
+		/// worker's answer.
+		fn remote_paste_apply(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			model.update(cx, |m, cx| m.apply_paste_restore(cx));
+			for _ in 0..300 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste_busy()) {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			assert!(
+				!model.read_with(cx, |m, _| m.paste_busy()),
+				"remote apply never ended"
+			);
+		}
+
+		/// Paste into a remote workspace through the real panel: the worker
+		/// plans (rows, overwrite gating, unchecked rows), writes what was
+		/// confirmed, refuses a destination changed behind the preview, never
+		/// writes into `.git`, and replays a commit payload.
+		#[gpui::test]
+		fn remote_paste_runs_on_the_worker(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			let real = dunce::canonicalize(&alpha).unwrap();
+
+			// Rows come from the worker's plan, with its paths.
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: init.txt\nnew init\n// FILE: a.txt\nA\n// FILE: b.txt\nB\n",
+			);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.remote.is_some());
+				let rows: Vec<_> = plan
+					.items
+					.iter()
+					.map(|i| (i.path.as_str(), i.op, i.dest_exists))
+					.collect();
+				assert_eq!(
+					rows,
+					[
+						("init.txt", crate::paste::PlannedOp::Overwrite, true),
+						("a.txt", crate::paste::PlannedOp::Create, false),
+						("b.txt", crate::paste::PlannedOp::Create, false),
+					]
+				);
+				assert_eq!(plan.items[1].dest_path, real.join("a.txt"));
+				// Shown as the host's folder, never the internal root.
+				assert!(
+					plan.shown(&plan.destination).starts_with("test-worker:"),
+					"{}",
+					plan.shown(&plan.destination)
+				);
+				assert!(plan.overwrite_missing());
+			});
+			// Overwrite is off by default: Apply keeps init.txt. b.txt is
+			// unticked.
+			click(cx, "paste-include:2:b.txt");
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
+			});
+			assert_eq!(fs::read_to_string(alpha.join("a.txt")).unwrap(), "A");
+			assert_eq!(
+				fs::read_to_string(alpha.join("init.txt")).unwrap(),
+				"hello\n"
+			);
+			assert!(!alpha.join("b.txt").exists());
+
+			// Allowing the overwrite writes it, byte for byte.
+			remote_paste_preview(&model, cx, "// FILE: init.txt\nnew init\n");
+			click(cx, "paste-overwrite:0:init.txt");
+			remote_paste_apply(&model, cx);
+			assert_eq!(
+				fs::read_to_string(alpha.join("init.txt")).unwrap(),
+				"new init"
+			);
+
+			// A target created behind the preview's back: refused as stale,
+			// nothing written, the plan stays open.
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: c.txt\nfrom clipboard\n",
+			);
+			fs::write(alpha.join("c.txt"), "external").unwrap();
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "stale_created", "{}", m.status);
+				let plan = m.paste.plan().expect("plan stays open");
+				assert!(!plan.is_applying);
+			});
+			assert_eq!(
+				fs::read_to_string(alpha.join("c.txt")).unwrap(),
+				"external"
+			);
+			model.update(cx, |m, cx| m.cancel_paste_preview(cx));
+
+			// `.git` entries are skipped rows; Apply writes nothing there.
+			let hooks = alpha.join(".git/hooks");
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: .git/hooks/pre-commit\n#!/bin/sh\necho owned\n// FILE: d.txt\nD\n",
+			);
+			// `.git/` reads as a folder prefix: keep it under the destination,
+			// as a user would to get past the mapping row.
+			model.update(cx, |m, cx| m.choose_paste_keep(".git", cx));
+			for _ in 0..300 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					!m.paste.is_loading()
+						&& m.paste.plan().is_some_and(|p| p.executable())
+				});
+				if done {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				let paths: Vec<_> =
+					plan.items.iter().map(|i| i.path.as_str()).collect();
+				assert_eq!(paths, ["d.txt"]);
+				assert_eq!(plan.counts().skips, 1);
+			});
+			remote_paste_apply(&model, cx);
+			assert!(!hooks.join("pre-commit").exists());
+			assert_eq!(fs::read_to_string(alpha.join("d.txt")).unwrap(), "D");
+
+			// Commit mode: the worker replays the payload onto the repo.
+			crate::paste::tests::git_run(&alpha, &["add", "."]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "pasted"]);
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "incoming\n".into(),
+						author_name: "Author".into(),
+						author_email: "author@example.invalid".into(),
+						author_date: "2026-09-21T12:00:00+00:00".into(),
+						files: vec![CommitFile {
+							path: "replayed.txt".into(),
+							old_path: None,
+							change: FileChange::Added,
+							content: Some("replayed\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			remote_paste_preview(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.whole_commit, "{}", m.status);
+				assert_eq!(plan.items.len(), 1);
+				assert_eq!(plan.items[0].dest_root_name, "alpha");
+				assert_eq!(plan.items[0].dest_path, real.join("replayed.txt"));
+			});
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
+			});
+			assert_eq!(
+				crate::paste::tests::git_run(
+					&alpha,
+					&["log", "-1", "--format=%s %an"]
+				)
+				.trim(),
+				"incoming Author"
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("replayed.txt")).unwrap(),
+				"replayed\n"
+			);
+		}
+
+		/// Prefix rows offer the remote workspace's repositories, shown as
+		/// the host's folders, and route each prefix to the one picked.
+		#[gpui::test]
+		fn remote_paste_maps_prefixes_to_remote_repositories(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			for name in ["alpha", "beta"] {
+				let repo = shared.join(name);
+				fs::create_dir_all(&repo).unwrap();
+				crate::paste::tests::git_init(&repo);
+				fs::write(repo.join("init.txt"), "hello\n").unwrap();
+				crate::paste::tests::git_run(&repo, &["add", "init.txt"]);
+				crate::paste::tests::git_run(&repo, &["commit", "-m", "init"]);
+			}
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.repos.len() == 2) {
+					break;
+				}
+			}
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: alpha/x.txt\nx\n// FILE: beta/y.txt\ny\n",
+			);
+			for prefix in ["alpha", "beta"] {
+				let idx = model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					let choice = plan
+						.prefix_choices
+						.iter()
+						.find(|c| c.prefix == prefix)
+						.unwrap();
+					let shown: Vec<_> = choice
+						.candidates
+						.iter()
+						.map(|c| plan.shown(c))
+						.collect();
+					assert!(
+						shown.iter().all(|s| s.starts_with("test-worker:")),
+						"{shown:?}"
+					);
+					choice
+						.candidates
+						.iter()
+						.position(|c| c.ends_with(prefix))
+						.unwrap()
+				});
+				model
+					.update(cx, |m, cx| m.choose_paste_prefix(prefix, idx, cx));
+				for _ in 0..300 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.paste.is_loading()) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.executable(), "{}", m.status);
+				let rows: Vec<_> = plan
+					.items
+					.iter()
+					.map(|i| (i.dest_root_name.as_str(), i.path.as_str()))
+					.collect();
+				assert_eq!(rows, [("alpha", "x.txt"), ("beta", "y.txt")]);
+			});
+			remote_paste_apply(&model, cx);
+			assert_eq!(
+				fs::read_to_string(shared.join("alpha/x.txt")).unwrap(),
+				"x"
+			);
+			assert_eq!(
+				fs::read_to_string(shared.join("beta/y.txt")).unwrap(),
+				"y"
 			);
 		}
 
@@ -11401,14 +11998,12 @@ mod tests {
 	}
 
 	mod folder_copy {
-		use crate::{
-			expand_folder_items, native_export_settings,
-			NATIVE_FILE_COUNT_LIMIT,
-		};
-		use snip_core::gitrun::CancelToken;
+		use crate::{native_export_settings, NATIVE_FILE_COUNT_LIMIT};
+		use snip_core::gitrun::{CancelToken, RunOptions};
+		use snip_core::transfer::expand_folder_items;
 		use snip_core::transfer::{
-			plan_export, CanonicalRootId, ExportItem, ExportSelection,
-			SourceKind,
+			copy_selection_detailed, plan_export, CanonicalRootId, ExportItem,
+			ExportSelection, SourceKind,
 		};
 		use std::fs;
 		use std::path::{Path, PathBuf};
@@ -11573,7 +12168,9 @@ mod tests {
 			assert!(!exact.truncated);
 		}
 
-		/// A walk cut at the limit reaches the toast as a partial copy.
+		/// A copy the file limit cuts reaches the toast as a partial copy;
+		/// the shared engine stops at the limit, and copies the whole
+		/// folder without one.
 		#[test]
 		fn truncated_copy_says_so_in_the_status() {
 			let (_tmp, root) = canonical_tmp();
@@ -11581,28 +12178,38 @@ mod tests {
 			for i in 0..8 {
 				fs::write(root.join(format!("big/{i}.txt")), "B").unwrap();
 			}
-			let cut = expand_folder_items(
+			let mut cut = native_export_settings();
+			cut.set_max_file_count = true;
+			cut.file_count_limit = 3.0;
+			let report = copy_selection_detailed(
 				selection(&root, &["big"]),
-				3,
-				&CancelToken::new(),
+				&cut,
+				NATIVE_FILE_COUNT_LIMIT,
+				&RunOptions::default(),
+				|_| {},
 			)
 			.unwrap();
-			let plan =
-				plan_export(&cut.sel, &native_export_settings(), None).unwrap();
-			let msg = crate::copied_status("r".into(), &plan, &cut);
+			assert_eq!(report.outcome.copied, 3);
+			assert!(report.outcome.truncated);
+			let msg = crate::copied_status("r".into(), &report.outcome);
 			assert_eq!(msg.key, "status_copied_limit");
 			assert_eq!(msg.args[1], "3");
 			assert_eq!(msg.args[5], NATIVE_FILE_COUNT_LIMIT.to_string());
-			let whole = expand_folder_items(
+
+			let mut whole = native_export_settings();
+			whole.set_max_file_count = false;
+			let report = copy_selection_detailed(
 				selection(&root, &["big"]),
-				8,
-				&CancelToken::new(),
+				&whole,
+				NATIVE_FILE_COUNT_LIMIT,
+				&RunOptions::default(),
+				|_| {},
 			)
 			.unwrap();
-			let plan = plan_export(&whole.sel, &native_export_settings(), None)
-				.unwrap();
+			assert_eq!(report.outcome.copied, 8);
+			assert!(!report.outcome.truncated);
 			assert_eq!(
-				crate::copied_status("r".into(), &plan, &whole).key,
+				crate::copied_status("r".into(), &report.outcome).key,
 				"status_copied"
 			);
 		}

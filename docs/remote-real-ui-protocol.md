@@ -1,28 +1,33 @@
-# 遠端節點真實 UI 驗收規程（Mac mini master ↔ Ubuntu worker）
+# 遠端工作區真實 UI 驗收規程（Mac mini master ↔ Ubuntu，經 ssh）
 
-狀態：操作規程。給會操作滑鼠的 agent（Codex）照著點真實 macOS 視窗。產品行為以 [spec.md 第 8 節](spec.md) 為準。點擊方法、座標換算、判定用詞沿用 [real-ui-operator-protocol.md](real-ui-operator-protocol.md)，本文只寫遠端節點多出來的部分。
+狀態：操作規程。給會操作滑鼠的 agent（Codex）照著點真實 macOS 視窗。產品行為以 [spec.md 第 8 節](spec.md) 為準。點擊方法、座標換算、判定用詞沿用 [real-ui-operator-protocol.md](real-ui-operator-protocol.md)，本文只寫遠端工作區多出來的部分。
 
-這份規程只回答一件事：從 Mac mini 的桌面 App 點過去，瀏覽 Ubuntu 上的專案，怎樣才算正確。
+這份規程只回答一件事：從 Mac mini 的桌面 App 經 ssh 打開 Ubuntu 上的資料夾，所有操作是不是**和打開本機資料夾完全一樣**。
 
 ## 0. 範圍
 
-- **受測**：master 是 Mac mini 上的桌面 App（GUI），另有一段用 `snip remote`（CLI master）交叉驗證。worker 是 Ubuntu 上的 CLI `snip worker`，不開 GUI。
-- **SSH 不是受測功能**。產品沒有「經 SSH 管理 worker」的功能。master 和 worker 之間走 Tailscale 上的 TLS 1.3，靠配對碼與指紋 pin 互信。本規程只在準備階段用 ssh：在 Ubuntu 上編譯、建 fixture、啟動和重啟 worker，以及在 worker 端讀檔案當 oracle。
-- **本輪受測含唯讀 Git 檢視**。寫入、rename、stage、commit、discard、以及專案列的選取仍不在範圍內；貼上與加入儲存庫路徑在遠端工作區要拒絕，這也是受測項目；複製（右鍵「複製」、Cmd+C、專案列選取）要和本機一樣成功。
-- **不能碰使用者自己的 worker 服務**：Ubuntu 的 systemd user unit `snip-worker.service` 和 Mac mini 的 LaunchAgent `com.audichuang.snip-worker`（都在 47821 埠）不屬於這一輪，不可停止、重啟或改設定。測試 worker 一律用 47899；`pkill` 的 pattern 只能比對本輪的 `$W/src/target/release/snip`。
+- **受測**：master 是 Mac mini 上的桌面 App（GUI），另有一段用 `snip remote`（CLI master）交叉驗證。App 從 `~/.ssh/config` 列主機，點主機時執行 `ssh ubuntu snip serve --stdio`；Ubuntu 上不常駐任何 worker。
+- **ssh 是受測功能**：主機清單、逐層選資料夾、最近開啟、重開 App 自動接回、對方沒有 snip 或版本太舊時的錯誤，都要測。
+- **和本機相同是通過線**：瀏覽、預覽、Changes、Log、右鍵「複製」與 Cmd+C、貼上（檔案模式與 commit 模式），在遠端工作區要和本機工作區有一樣的結果。每一格的 oracle 都是「在 Ubuntu 上用同一個 `snip` 對同一個資料夾做同一件事」的輸出，不是 App 自己的輸出。
+- **仍然拒絕的操作**：加入儲存庫路徑、「在 Finder 中顯示」。按了顯示 `remote_unsupported`，什麼都不寫。
+- **不能碰使用者自己的東西**：
+  - Ubuntu 的 `/home/linuxbrew/.linuxbrew/bin/snip` 與 Mac 的 `/opt/homebrew/bin/snip` 不使用、不替換。
+  - Ubuntu 的 systemd user unit `snip-worker.service`（若還在）不停止、不重啟、不改設定。
+  - `~/.ssh/config` 不改。Mac 的真實設定資料夾不碰（第 2.2 節隔離）。
+  - `~/research/rtk` 只讀（第 5 節 I01 驗證）。
 - 不改產品程式，不 commit 這一輪的產出。
 
 ## 1. 機器與受測版本
 
-| 角色 | 機器 | Tailscale IP | 怎麼到 |
-|---|---|---|---|
-| master | Mac mini `AudideMac-mini` | 100.118.97.71 | 本機 |
-| worker | Ubuntu `audichuang-desktop`（x86_64） | 100.95.28.19 | `ssh ubuntu`（LAN 192.168.31.65） |
+| 角色 | 機器 | 怎麼到 |
+|---|---|---|
+| master | Mac mini `AudideMac-mini` | 本機 |
+| worker | Ubuntu `audichuang-desktop`（x86_64） | `ssh ubuntu`（`~/.ssh/config` 的 `Host ubuntu`，金鑰登入） |
 
-- 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含 `ffcbb04`（#79 遠端節點第一刀）和 `64b6fde`（#81 連線排隊），用 `git merge-base --is-ancestor` 檢查，缺一個就不開跑。
-- Ubuntu 上 `/home/linuxbrew/.linuxbrew/bin/snip` 是使用者常駐的 worker 服務 binary（`snip-worker.service`，47821 埠），不是受測對象；不要使用、替換或改動它。本輪的 worker 一律用從受測 SHA 編出來的 binary。
-- 受測專案：Ubuntu 上的 `~/research/rtk`。這是真實的 Rust 專案，HEAD `87a6c69`，tracked 檔 414 個，工作樹乾淨。它有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs` 238 KB）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**：第 7 節 I01 會驗證這一輪沒有動到它。
-- 邊界案例另外放在 fixture 資料夾 `edge`（第 2.3 節），不放進 rtk。
+- 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上與 worker 端變更選取（協定 5）：`grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs`，不符就不開跑。
+- **受測的 worker binary 怎麼被選到**：產品在對方執行 `snip serve --stdio` 時，依序找 PATH 上的 `snip`、`~/.local/bin/snip`…。Ubuntu 的非互動 ssh PATH 第一項是 `~/.local/bin`，所以本輪在 `~/.local/bin/snip` 放一個**wrapper**（把執行時的 PID 記到 `$W/pids/`，再 `exec` 受測 SHA 編出的 binary），產品就會走真實的 ssh 路徑選到它，而 L04、L05 與收尾只殺本輪記下的 PID（2.3 安裝）。開跑前那個位置必須不存在（2.3 會檢查），收尾一定要刪掉（第 6 節，I03 驗證）。**不要用 `SNIP_REMOTE_EXEC`**，那會繞過要測的 ssh 路徑。
+- 受測專案：Ubuntu 上的 `~/research/rtk`。真實的 Rust 專案，有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs`）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**。
+- 其他情境放在 fixture（第 2.3 節），全部在 Ubuntu 的 `$W` 底下。
 
 ## 2. 開跑
 
@@ -34,12 +39,12 @@
 
 ```bash
 export PATH=$HOME/.cargo/bin:$PATH
-git merge-base --is-ancestor ffcbb04 HEAD && git merge-base --is-ancestor 64b6fde HEAD
+grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs
 cargo build --release -p snip-cli --locked
-just remote-e2e-ssh ubuntu --listen 100.95.28.19:47899
+just remote-e2e-ssh ubuntu
 ```
 
-最後一行必須是 `== N passed, 0 failed`，結束碼 0。這一步一次確認編譯、Tailscale 連得到、Ubuntu 防火牆沒擋、TLS 與配對都正常。**沒過就不開始點 GUI**，計分表全部寫 `not-run`，證據欄寫「第 0 步閘門失敗」並附上輸出。這一步只有失敗時才算產品問題，因為它不涉及 GUI。
+最後一行必須是 `== N passed, 0 failed`，結束碼 0。這一步確認編譯、ssh 金鑰登入、worker 啟動、複製與貼上的位元組比對都正常。**沒過就不開始點 GUI**，計分表全部寫 `not-run`，證據欄寫「第 0 步閘門失敗」並附上輸出。
 
 ### 2.2 本輪目錄與 Mac 端建置
 
@@ -50,9 +55,10 @@ export W="/home/audichuang/snip-ui-run/$SHA"     # Ubuntu 上的本輪目錄
 mkdir -p "$RUN"
 cargo build -p snip-desktop-native -p snip-cli --locked
 shasum -a 256 target/debug/snip-desktop-native target/debug/snip
+export SNIP="$PWD/target/debug/snip"
 ```
 
-設定資料夾兩端都要隔離，不碰真實的配對紀錄：
+設定資料夾隔離，不碰真實的最近開啟與遠端紀錄：
 
 ```bash
 export SNIP_CONFIG_DIR="$RUN/master-config"      # GUI 與 CLI master 共用
@@ -60,25 +66,93 @@ mkdir -p "$SNIP_CONFIG_DIR"
 REAL="$HOME/Library/Application Support/com.audichuang.snip-sync"
 ls -la "$REAL" > "$RUN/real-config-before.txt" 2>&1
 shasum -a 256 "$REAL"/* > "$RUN/real-config-before.sha" 2>/dev/null || true
+grep -qE '^Host( .*)? ubuntu( |$)' ~/.ssh/config || { echo "~/.ssh/config 沒有 Host ubuntu" >&2; exit 1; }
 ```
 
-本機要有一個小的工作區，讓 App 啟動時就有 `btn-workspace-menu`，也用來驗證離開遠端之後複製會恢復（R33）：
+Mac 端的本機 fixture：
 
 ```bash
-mkdir -p "$RUN/local-ws" && cd "$RUN/local-ws" && git init -q && echo local > local.txt \
-  && git add . && git -c user.name=t -c user.email=t@t commit -qm init && cd -
+G="git -c user.name=t -c user.email=t@t"
+# 本機工作區：App 啟動時開它；L 段把遠端內容貼到這裡。
+mkdir -p "$RUN/local-ws" && (cd "$RUN/local-ws" && git init -q && echo local > local.txt && git add . && $G commit -qm init)
+# 檔案模式的貼上來源（P 段）。
+mkdir -p "$RUN/paste-src/sub"
+printf 'pasted\tTab 中文 ✓ 🦀\n' > "$RUN/paste-src/a.txt"
+printf 'crlf\r\nsecond\r\n' > "$RUN/paste-src/sub/crlf.txt"
+printf 'no newline at the end' > "$RUN/paste-src/sub/noeol.txt"
+printf 'new file\n' > "$RUN/paste-src/new.txt"
+# 超過 8 MiB 的貼上來源（P11）：30 個 300 KB 的檔案。
+mkdir -p "$RUN/paste-big" && for i in $(seq 1 30); do head -c 300000 /dev/zero | tr '\000' "$(printf "\\x$(printf %x $((97 + i % 26)))")" > "$RUN/paste-big/f$i.txt"; done
+# 指向 .git 的惡意 payload（P07）。
+printf '// FILE: target/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n' > "$RUN/git-payload.txt"
 ```
 
-### 2.3 Ubuntu 端：編譯與 fixture
+### 2.3 Ubuntu 端：編譯、放置受測 binary、fixture
 
 ```bash
-git archive HEAD | ssh ubuntu "rm -rf '$W' && mkdir -p '$W/src' && tar -x -C '$W/src'"
+# 兩個名稱都要查：`test -e` 對懸空的 symlink 是假，必須再加 `-L`。
+# snip.uirun-$SHA 是本輪 S11 專用的備份名，開跑前也要不存在。
+ssh ubuntu '[ ! -e ~/.local/bin/snip ] && [ ! -L ~/.local/bin/snip ] && [ ! -e ~/.local/bin/snip.uirun-'"$SHA"' ] && [ ! -L ~/.local/bin/snip.uirun-'"$SHA"' ]' || { echo "~/.local/bin/snip 或本輪備份名已存在，不開跑" >&2; exit 1; }
+git archive HEAD | ssh ubuntu "rm -rf '$W' && mkdir -p '$W/src' '$W/pids' && tar -x -C '$W/src'"
 ssh ubuntu "cd '$W/src' && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p snip-cli --locked 2>&1 | tail -1"
+# ~/.local/bin/snip 放 wrapper：每次被 exec 前把自己的 PID 記進
+# $W/pids/（檔名就是 PID），L04/L05/收尾只殺這些記下的 PID；
+# SNIP_E2E_PASTE_HOLD 只接受絕對路徑，且該檔存在時才暫停（L05）。
+ssh ubuntu "mkdir -p ~/.local/bin"
+printf '#!/bin/sh\necho $$ > "%s/pids/$$"\nexport SNIP_E2E_PASTE_HOLD="%s/paste-hold"\nexec "%s/src/target/release/snip" "$@"\n' "$W" "$W" "$W" \
+  | ssh ubuntu 'cat > ~/.local/bin/snip && chmod +x ~/.local/bin/snip'
+ssh ubuntu 'command -v snip && snip --version'
+ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"   # 收尾比對用：只刪本輪放的 wrapper
+```
+
+最後一行必須印出 `/home/audichuang/.local/bin/snip` 和受測版本。印出 linuxbrew 的路徑就停下：產品不會選到受測 binary。
+
+L04、L05 與收尾共用下面的函式，在 Mac 的同一個 bash 定義一次。wrapper `exec` 的是絕對路徑，所以 `ps` 必須精確等於 `$W/src/target/release/snip serve --stdio`。已退出的 PID 略過；仍存活但參數不符的 PID 不殺且判 fail。每個受測 worker 最多等 10 秒，未退出就判 fail；PID 紀錄保留作證據。
+
+```bash
+stop_run_workers() {
+  # shellcheck disable=SC2029 # W 在 master 展開，傳給 worker 的 bash。
+  ssh ubuntu "W='$W' bash -s" <<'EOF'
+set -euo pipefail
+failed=0
+for record in "$W"/pids/*; do
+  [ -f "$record" ] || continue
+  pid=$(cat "$record")
+  if ! [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    echo "無效的 PID 紀錄：$record" >&2; failed=1; continue
+  fi
+  args=$(ps -o args= -p "$pid" || true)
+  [ -n "$args" ] || continue
+  if [ "$args" != "$W/src/target/release/snip serve --stdio" ]; then
+    echo "PID $pid 參數不符，拒絕終止：$args" >&2; failed=1; continue
+  fi
+  kill "$pid" 2>/dev/null || true
+  deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    [ -z "$(ps -o args= -p "$pid" || true)" ] && break
+    sleep 0.1
+  done
+  if [ -n "$(ps -o args= -p "$pid" || true)" ]; then
+    echo "worker $pid 未在 10 秒內退出" >&2; failed=1
+  fi
+done
+[ "$failed" = 0 ]
+EOF
+}
+```
+
+Ubuntu 端 fixture（`$WS` 是 worker 上的 snip，下面的 oracle 都用它）：
+
+```bash
 ssh ubuntu "W='$W' bash -s" <<'EOF'
 set -euo pipefail
-mkdir -p "$W/edge/src/deep" "$W/edge/nested/.git" "$W/edge/manydir" "$W/edge/a/b/c/d/e"
+G="git -c user.name=t -c user.email=t@t"
+g_init() { $G init -q -b main "$1"; }
 cd "$W"
-echo top-secret-c0ffee > secret.txt            # 在所有分享之外
+echo top-secret-c0ffee > secret.txt            # 在所有工作區之外
+
+# edge：檔名、大小、編碼、symlink 的邊界
+mkdir -p edge/src/deep edge/nested/.git edge/manydir edge/a/b/c/d/e
 cd edge
 printf 'line1\r\nline2\r\n' > crlf.txt
 : > empty.txt
@@ -90,310 +164,423 @@ printf '\377\376latin' > latin.txt
 head -c 1048576 /dev/zero | tr '\000' a > exact-1MiB.txt
 head -c 1048577 /dev/zero | tr '\000' a > over-1MiB.txt
 (cd manydir && for i in $(seq 1 1200); do : > "f$i"; done)
-ln -s "$W/secret.txt" escape.txt               # 指向分享外的檔案
-ln -s /etc escape-dir                          # 指向分享外的資料夾
-ln -s "$W/edge/src" inner-link                 # 指向分享內
-echo 'invalid name' > "$(printf 'bad\377name.txt')"   # 非 UTF-8 檔名
+ln -s "$W/secret.txt" escape.txt
+ln -s /etc escape-dir
+ln -s "$W/edge/src" inner-link
+echo 'invalid name' > "$(printf 'bad\377name.txt')"
 echo 'hidden' > .hidden
-
-# Git 檢視測試 fixture
-echo TOPSECRET > "$W/git-secret.txt"
-G="git -c user.name=t -c user.email=t@t"
-g_init() {
-  $G init -b main "$1" 2>/dev/null || { $G init "$1" && (cd "$1" && $G checkout -B main 2>/dev/null || true); }
-}
 cd "$W"
-mkdir -p gitws/plain gitws/broken/.git outer/inner plainws
-echo plain > gitws/plain/file.txt
-echo 'plain text' > plainws/hello.txt
 
+# gitws：多 repo（alpha 有四種變更、beta 乾淨、一個空 .git）
+mkdir -p gitws/plain gitws/broken/.git
+echo plain > gitws/plain/file.txt
 g_init gitws/alpha
 printf 'commit 1 a\n' > gitws/alpha/a.txt
 (cd gitws/alpha && $G add a.txt && $G commit -q -m "first commit")
 printf 'commit 2 a\n' > gitws/alpha/a.txt
 printf 'commit 2 b\n' > gitws/alpha/b.txt
-(cd gitws/alpha && $G add a.txt b.txt && $G commit -q -m "second commit")
+mkdir -p gitws/alpha/dir && printf 'in dir\n' > gitws/alpha/dir/c.txt
+(cd gitws/alpha && $G add -A && $G commit -q -m "second commit")
 printf 'commit 2 a modified\n' > gitws/alpha/a.txt
 printf 'new file content\n' > gitws/alpha/new.txt
 printf 'staged file content\n' > gitws/alpha/staged.txt
+printf 'dir change\n' > gitws/alpha/dir/c.txt
 (cd gitws/alpha && $G add staged.txt)
-ln -s "$W/git-secret.txt" gitws/alpha/link-to-secret 2>/dev/null || true
-
 g_init gitws/beta
 printf 'beta content\n' > gitws/beta/b.txt
 (cd gitws/beta && $G add b.txt && $G commit -q -m "beta commit")
 
+# brokenws：像從另一台機器同步來的資料夾。一個正常 repo、
+# 三個 .git 指向不存在路徑的 worktree、一個空 .git。
+mkdir -p brokenws
+g_init brokenws/good
+printf 'good\n' > brokenws/good/g.txt
+(cd brokenws/good && $G add . && $G commit -q -m "good commit")
+printf 'good dirty\n' > brokenws/good/g.txt
+for n in 1 2 3; do
+  mkdir -p "brokenws/wt-gone-$n"
+  echo "gitdir: /Users/someone/GoogleDrive/cat/main/.git/worktrees/wt-gone-$n" > "brokenws/wt-gone-$n/.git"
+  echo "kept $n" > "brokenws/wt-gone-$n/kept.txt"
+done
+mkdir -p brokenws/empty-git/.git
+
+# plainws 與 outer/inner：不是 repo
+mkdir -p plainws outer/inner
+echo 'plain text' > plainws/hello.txt
 g_init outer
 printf 'outer committed\n' > outer/committed.txt
 (cd outer && $G add committed.txt && $G commit -q -m "outer commit")
 printf 'outer dirty\n' > outer/outer-dirty.txt
 printf 'inner file\n' > outer/inner/file.txt
+
+# pastews：貼上的目的地
+mkdir -p pastews/plain
+g_init pastews/target
+printf 'old\n' > pastews/target/a.txt
+printf 'keep me\n' > pastews/target/keep.txt
+(cd pastews/target && $G add . && $G commit -q -m "target base")
+# commit 模式：commit-src 有兩個新 commit，commit-dst 停在它們的前一個
+g_init pastews/commit-src
+printf 'base\n' > pastews/commit-src/base.txt
+(cd pastews/commit-src && $G add . && $G commit -q -m base)
+git clone -q pastews/commit-src pastews/commit-dst
+(cd pastews/commit-src && printf 'one\n' > a.txt && $G add . && $G commit -q -m "replay one" \
+  && printf 'two\n' > a.txt && mkdir -p d && printf 'b\n' > d/b.txt && $G add . && $G commit -q -m "replay two")
 EOF
 ```
 
-這段已在 `b41817f` 上試跑過：Ubuntu 編譯約 20 秒（有快取時），fixture 全部建立成功，`manydir` 有 1200 個檔案。試跑時從 Mac 用 `snip remote` 讀過：`escape.txt` 和 `escape-dir` 都回「Path leaves the workspace」，`target/release/rtk` 回「Preview exceeds 1 MiB」，`exact-1MiB.txt` 完整讀到 1048576 bytes，`.git/HEAD` 讀得到（專案樹不列 `.git`，但指名路徑仍可讀）。
+本機 commit 模式的來源（P09）：把 `commit-src` 的 base 帶回 Mac，再加一個本機 commit。
 
-rtk 的基準（I01 用；包含 HEAD、status、`.git/index` 的 sha256 與檔案時間戳；worker 端 oracle 與驗證命令均需加 `GIT_OPTIONAL_LOCKS=0`。真實專案不為此 touch 檔案；「stat-dirty 的 index 不被改寫」由 `scripts/remote_e2e.sh` 的 git views 段在 fixture 上驗證）。
+```bash
+ssh ubuntu "cd '$W/pastews/commit-src' && git bundle create - --all" > "$RUN/commit-src.bundle"
+git clone -q "$RUN/commit-src.bundle" "$RUN/commit-local" && (cd "$RUN/commit-local" && git reset -q --hard HEAD~2 \
+  && printf 'from mac\n' > mac.txt && git add . && git -c user.name=t -c user.email=t@t commit -qm "from mac")
+```
 
-定義快照函式（具備防覆寫保護）：
+rtk 的基準（I01 用）。定義快照函式，開跑時只執行一次：
 
 ```bash
 rtk_snapshot() {
   local out="$1"
-  if [ -e "$out" ]; then
-    echo "rtk_snapshot: $out 已存在，拒絕覆寫" >&2
-    return 1
-  fi
-  ssh ubuntu 'cd ~/research/rtk && GIT_OPTIONAL_LOCKS=0 git --no-optional-locks rev-parse HEAD && GIT_OPTIONAL_LOCKS=0 git --no-optional-locks status --porcelain=v1 -z | sha256sum && (command -v sha256sum >/dev/null && sha256sum < .git/index || shasum -a 256 < .git/index) | cut -c1-64 && find . -newer .git/HEAD -not -path "./.git/*" | wc -l' > "$out"
+  [ -e "$out" ] && { echo "rtk_snapshot: $out 已存在，拒絕覆寫" >&2; return 1; }
+  ssh ubuntu 'cd ~/research/rtk && GIT_OPTIONAL_LOCKS=0 git --no-optional-locks rev-parse HEAD && GIT_OPTIONAL_LOCKS=0 git --no-optional-locks status --porcelain=v1 -z | sha256sum && sha256sum < .git/index | cut -c1-64 && find . -newer .git/HEAD -not -path "./.git/*" | wc -l' > "$out"
 }
-```
-
-開跑時僅執行一次，建立 `rtk-before.txt` 與時間戳 marker：
-
-```bash
 rtk_snapshot "$RUN/rtk-before.txt"
-ssh ubuntu "[ -e '$W/rtk-marker' ] || touch '$W/rtk-marker'"
 ```
 
-**警告：上述基準建立區塊僅在開跑時執行一次，收尾時絕不可重新執行（否則會覆寫基準並更新 marker 導致完整性失效）；收尾驗證請直接依照第 5 節 I01 執行。**
+**收尾時絕不可重跑這一段**，否則會覆寫基準；收尾直接照第 5 節 I01。
 
-### 2.4 啟動 worker（每次都用這個函式）
+worker 端 oracle 的寫法：在 Ubuntu 上用同一個受測 `snip` 做同一件事，例如 `ssh ubuntu "cd '$W/gitws/alpha' && snip copy a.txt --stdout" > "$RUN/X01/oracle.txt"`。內容比較一律用 SHA-256。
 
-```bash
-start_worker() {   # $1 = 設定資料夾名稱；其餘參數 = 要分享的資料夾；環境變數 WORKER_EXTRA = 額外的 worker 旗標（例如 --max-protocol 1）
-  local cfg=$1; shift
-  local shares=""; for d in "$@"; do shares="$shares --share '$d'"; done
-  ssh -o BatchMode=yes ubuntu "bash -s" <<SH
-cd '$W'
-pkill -f '$W/src/target/release/snip worker' 2>/dev/null
-for i in \$(seq 1 20); do pgrep -f '$W/src/target/release/snip worker' >/dev/null || break; sleep 0.5; done
-SNIP_CONFIG_DIR='$W/$cfg' SNIP_DEVICE_NAME=ubuntu-ui nohup '$W/src/target/release/snip' worker $WORKER_EXTRA $shares --listen 100.95.28.19:47899 > worker.log 2>&1 < /dev/null &
-echo \$! > '$W/worker.pid'
-for i in \$(seq 1 40); do grep -q 'pairing code' worker.log && break; grep -q rror worker.log && break; sleep 0.5; done
-cat worker.log
-SH
-}
-start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner" | tee "$RUN/worker-start-1.log"
-```
+### 2.4 啟動 App
 
-這個函式已經試跑過。有四個陷阱，不要改掉：
-
-- 一定要有 `< /dev/null`，否則 ssh 會一直等背景的 worker，不會返回。
-- 要等舊的 worker 真的結束才啟動新的，否則會出現 `Address already in use`。
-- `pkill -f` 要放在 `bash -s` 的 stdin 裡執行。如果直接寫成 `ssh ubuntu 'pkill -f "snip worker"'`，pattern 會比對到執行它的那個 bash 自己，連 ssh 連線一起被殺掉（exit 255）。pattern 必須包含 `$W/src/target/release/snip`，不可寫成會比對到使用者服務 binary 的寬鬆字串（例如 `pkill snip`）。
-- start_worker 會把 worker 的 PID 寫進 `$W/worker.pid`，R37、G11 與第 6 節收尾都靠它停 worker；不要用 pkill 取代。
-
-輸出要有 `snip-sync worker listening on 100.95.28.19:47899`、`fingerprint XXXX-XXXX-XXXX-XXXX`、五行 `sharing …`，以及 `pairing code ABCD-EFGH (valid 10 minutes; restart for a new one)`。
-
-**配對碼 10 分鐘內有效**。啟動 worker、讀配對碼、在 GUI 配對（R01–R05）要連續做完，中間不做別的。過期或用掉了，就再執行一次 `start_worker wcfg …` 拿新碼；同一個 `wcfg` 會保留指紋。
-
-### 2.5 啟動 App
-
-同一時間只開一個 App。每次啟動都寫進新的日誌檔（`app-1.log`、`app-2.log`…），不要用 `>` 蓋掉前一次。
+同一時間只開一個 App。每次啟動都寫進新的日誌檔（`app-1.log`、`app-2.log`…），不要用 `>` 蓋掉前一次。**不設 `SNIP_REMOTE_EXEC`**。
 
 ```bash
 export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 ./target/debug/snip-desktop-native --workspace "$RUN/local-ws" > "$RUN/app-1.log" 2>&1
 ```
 
-`SNIP_CONFIG_DIR` 已在 2.2 export，App 的配對紀錄寫在 `$RUN/master-config/remote-workers.json`。
+視窗用 1080×720。S12 另外在 900×600 再看一次選單。
 
-視窗用 1080×720。R40 另外在 900×600 再做一次配對表單。
+### 2.5 `environment.json`
 
-### 2.6 `environment.json`
-
-至少包含：受測 SHA、兩個 Mac binary 與 Ubuntu `snip` 的 SHA-256、第 0 步閘門的結果行、`$RUN`、`$W`、worker 的 listen 位址與指紋、每次 App 啟動的命令和日誌路徑、視窗邏輯尺寸與 `[APP:VIEWPORT]`、`backingScaleFactor`。
+至少包含：受測 SHA、Mac 兩個 binary 與 Ubuntu `~/.local/bin/snip` 的 SHA-256、第 0 步閘門的結果行、`$RUN`、`$W`、每次 App 啟動的命令和日誌路徑、視窗邏輯尺寸與 `[APP:VIEWPORT]`、`backingScaleFactor`。
 
 ## 3. 怎麼點、怎麼判
 
-點擊照 [real-ui-operator-protocol.md 第 3 節](real-ui-operator-protocol.md) 的七步做：從這一次的日誌取最新的 `CTRL_BOUNDS`，確認沒有更晚的 `CTRL_GONE`，換算 Retina 座標，點下去之後要有新的日誌行。判定也一樣只有 `pass`、`ui-defect`、`fail`、`not-run` 四種。
+點擊照 [real-ui-operator-protocol.md 第 3 節](real-ui-operator-protocol.md) 的七步做：從這一次的日誌取最新的 `CTRL_BOUNDS`，確認沒有更晚的 `CTRL_GONE`，換算 Retina 座標，點下去之後要有新的日誌行。判定只有 `pass`、`ui-defect`、`fail`、`not-run` 四種。
 
-遠端節點多出來的規則：
+遠端工作區多出來的規則：
 
-1. **用索引編號的 ID**。`remote-worker:<ix>`、`btn-remote-forget:<ix>`、`remote-workspace:<wx>` 用的是清單裡的序號，不是名稱。第 3 節「ID 要和路徑完全相等」的規則不適用於它們。要點某個工作區之前，先截圖確認那一列顯示的名稱。點了之後，用 `[APP:REMOTE_OPENED: <worker> ▸ <name> …]` 的 label 確認點到的是哪一個。label 不對，判 `fail`，證據欄寫 `identity-fail`。
-2. **專案樹的兩套列家族與日誌（依工作區形狀決定）**：
-   - **單一 repo 工作區（工作區資料夾本身就是 Git 儲存庫，例如 `rtk`）**：呈現方式與本機單一 repo 完全一致，以 `repo-row:<名稱>` 標頭列（附帶 `repo-chevron:<名稱>`）為頂層，其下的檔案／目錄列使用無前綴家族：`tree-row:<相對路徑>`、`tree-chevron:<相對路徑>`、截斷標記 `tree-marker:<資料夾>`、更多列 `tree-view-more:<資料夾>`（整棵樹截斷列為 `tree-view-more:`）、錯誤列 `tree-retry:<資料夾>`、非 UTF-8 名稱 `tree-invalid:<suffix>`。日誌為 `TREE_PAGE: rel= kind= children= has_more= selected=`、`TREE_FILE_SELECTED`。
-   - **多 repo 或純資料夾工作區（工作區資料夾本身不是開啟的 repo，例如 `edge`、`plainws`、`outer/inner`）**：工作區資料夾本身的樹使用 `ws-` 前綴家族：`ws-tree-row:<相對路徑>`、`ws-tree-chevron:<相對路徑>`、截斷標記 `ws-tree-marker:<資料夾>`、更多列 `ws-tree-view-more:<資料夾>`（整棵樹截斷列為 `ws-tree-view-more:`）、錯誤列 `ws-tree-retry:<資料夾>`、非 UTF-8 名稱 `ws-tree-invalid:<suffix>`。日誌為 `WS_TREE_PAGE: rel= kind= children= has_more= selected=`、`WS_FILE_SELECTED`。多 repo 資料夾中探索到的 repo（例如 `edge` 裡的 `nested`）顯示為 `repo-row:<名稱>` 標頭列（附帶 `repo-chevron:<名稱>`），不是 `ws-tree-row`；若 repo summary 發生錯誤（例如 `nested` 僅含空 `.git`），nested 列顯示警告標記；開啟 `edge` 時會自動選取 nested，因此最初即顯示其錯誤；點擊已展開且已選取的 `repo-row:nested` 僅會將其收合（預覽不變）；重新展開（第二次點擊）會重新選取並顯示 Git 錯誤。絕不能當作純資料夾展開（不得有 `WS_TREE_PAGE: rel=nested`）。
-   - `TREE_TOGGLED`／`WS_TREE_TOGGLED` 只在 Ctrl/Cmd 點擊切換專案列選取時印，遠端模式不能選取，所以展開不會有它。
-3. **沒有日誌 tag 的訊息**：`remote_unsupported`（遠端工作區還不支援這個操作（貼上即將支援））顯示在狀態列；`remote_pair_missing`（請輸入位址與配對碼）與工作區清單讀取失敗顯示在工作區選單裡的紅字，不在狀態列。這些格子的通過線是：截圖裡在上述位置有那段文字、剪貼簿 sentinel 的 SHA 不變、1 秒內沒有新的 `COPY_*` 或 `PASTE_*` 行。**不要因為少一行日誌就判 `fail`。**
-4. **預覽成功與失敗的分法**（`apply_source_preview`）：成功時日誌是 `PREVIEW_LOADING: <path>` 接著 `PREVIEW_LOADED: <path>`。worker 拒絕、二進位、過大時，只有 `PREVIEW_LOADING`，**沒有** `PREVIEW_LOADED`，預覽區顯示錯誤文字。失敗格的通過線：有 `PREVIEW_LOADING`、沒有 `PREVIEW_LOADED`、截圖裡是錯誤文字而不是檔案內容、下一次點擊 App 仍有反應。
-5. **指紋比對**：`REMOTE_PAIRED: fp=` 是 16 個十六進位字元。worker 印出的是 `XXXX-XXXX-XXXX-XXXX`。去掉 `-`、不分大小寫比較，兩者必須相同。選單列顯示的是 `XXXX-XXXX-XXXX-XXXX`。
-6. **文字輸入**：先點 `remote-addr-input` 或 `remote-code-input` 的 bounds，再用鍵盤輸入，然後截圖確認輸入框裡的字。貼上文字用 Cmd+V 時，要確認焦點在輸入框裡；否則 Cmd+V 是 App 的貼上。
-7. **worker 端 oracle**：worker 上檔案的內容和清單，用 `ssh ubuntu` 讀，存成檔再算 SHA-256。不要拿 App 自己的輸出去驗證 App。
-8. **擷取 tooltip 方法**：將滑鼠移至目標列的 bounds 中心 hover，等待約 1 秒，再進行截圖。
+1. **用索引編號的 ID**。`remote-host:<ix>`、`remote-folder:<n>`、`remote-recent:<n>` 用的是清單裡的序號，不是名稱。點之前先截圖確認那一列顯示的名稱；點了之後，用 `[APP:REMOTE_HOST_LISTED: … path=<路徑>]` 或 `[APP:REMOTE_OPENED: <主機> ▸ <名稱> …]` 確認點到的是哪一個。不對就判 `fail`，證據欄寫 `identity-fail`。
+2. **專案樹的兩套列家族**（和本機一樣，依工作區形狀決定）：
+   - **單一 repo 工作區**（工作區資料夾本身就是 repo，例如 `rtk`）：頂層是 `repo-row:<名稱>`，其下是 `tree-row:<相對路徑>`、`tree-chevron:`、`tree-view-more:`、`tree-retry:`、`tree-invalid:`；日誌 `TREE_PAGE`、`TREE_FILE_SELECTED`。
+   - **多 repo 或純資料夾工作區**（例如 `edge`、`gitws`、`brokenws`、`plainws`）：工作區自己的樹用 `ws-tree-row:`、`ws-tree-chevron:`、`ws-tree-view-more:`、`ws-tree-retry:`、`ws-tree-invalid:`；日誌 `WS_TREE_PAGE`、`WS_FILE_SELECTED`。探索到的 repo 顯示為 `repo-row:<名稱>`。
+3. **沒有日誌 tag 的訊息**：`remote_unsupported`（「遠端工作區還不支援這個操作」）顯示在狀態列。這種格子的通過線是：截圖裡狀態列有那段文字、剪貼簿 sentinel 的 SHA 不變、worker 上沒有新檔案、1 秒內沒有新的 `COPY_*` 或 `PASTE_*` 行。**不要因為少一行日誌就判 `fail`。**
+4. **預覽成功與失敗**：成功是 `PREVIEW_LOADING: <path>` 接著 `PREVIEW_LOADED: <path>`。拒絕、二進位、過大時只有 `PREVIEW_LOADING`，沒有 `PREVIEW_LOADED`，預覽區顯示錯誤文字，下一次點擊 App 仍有反應。
+5. **複製的通過線**：有 `COPY_PREP` 與 `COPY_DONE: copied=N`（commit 是 `COPY_COMMITS_PREP` / `COPY_COMMITS_DONE: commits=N`）；`pbpaste | shasum -a 256` 等於 worker 端 oracle 的 SHA-256。
+6. **貼上的通過線**：`PASTE_PREVIEW` → 面板 → 點 `btn-apply` → `PASTE_APPLYING` → `PASTE_DONE`；之後 worker 上每個寫入的檔案 SHA-256 等於「在 Ubuntu 上用受測 `snip paste --stdin` 對同一個 payload 貼到一份同樣的目的地副本」的結果，沒勾選的列不變。拒絕格：有 `PASTE_ERR`、`PASTE_STALE_DETECTED` 或 `PASTE_PLAN_REFUSED`，worker 上的檔案不變。
+7. **文字輸入**：先點 `remote-path-input` 的 bounds，再用鍵盤輸入，截圖確認輸入框裡的字。Cmd+V 前要確認焦點在哪裡：焦點在輸入框是貼文字，不在是 App 的貼上。
+8. **worker 端 oracle** 一律用 `ssh ubuntu` 讀，存成檔再算 SHA-256。不要拿 App 自己的輸出去驗證 App。
+9. **tooltip**：滑鼠移到目標列 bounds 中心，等約 1 秒再截圖。
 
-剪貼簿 sentinel：每個拒絕格開始前，`printf 'sentinel-%s' "$RANDOM" | pbcopy`，再用 `pbpaste | shasum -a 256` 記下雜湊。
+剪貼簿 sentinel：每個拒絕格和每個複製格開始前，`printf 'sentinel-%s' "$RANDOM" | pbcopy`，再用 `pbpaste | shasum -a 256` 記下雜湊。
 
-### 3.1 遠端節點的控制項與日誌
+### 3.1 控制項與日誌
 
 | 位置 | ID |
 |---|---|
 | 工作區選單 | `btn-workspace-menu` |
-| 本機當 worker | `btn-remote-worker-toggle`、`btn-remote-worker-pair`、`remote-worker-code` |
-| 已配對的 worker | `remote-worker:<ix>`、`btn-remote-forget:<ix>` |
-| 該 worker 分享的工作區 | `remote-workspace:<wx>` |
-| 配對表單 | `btn-remote-pair-new`、`remote-addr-input`、`remote-code-input`、`btn-remote-pair` |
+| ssh 主機 | `remote-host:<ix>` |
+| 資料夾瀏覽 | `remote-path`（目前路徑）、`remote-up`（上一層）、`remote-folder:<n>`（進入）、`btn-remote-open-here`（開啟這個資料夾） |
+| 輸入路徑 | `remote-path-input`、`btn-remote-open` |
+| 最近開啟 | `remote-recent:<n>`（在選單最上方的「最近開啟」，本機項目之後） |
+| 重開失敗 | `workspace-closed-remote-error`（空工作區畫面上的紅字） |
 | 工具列 | `btn-paste`、`btn-refresh`；左軌 `rail-project`、`rail-changes`、`rail-log` |
-| 右鍵選單 | `context-menu`、`menu-item:copy-files`（複製）、`menu-item:copy-path` |
-| Changes 空狀態 | `changes-empty` |
-| Log 空狀態 | `log-empty` |
+| 右鍵選單 | `menu-item:copy-files`（複製）、`menu-item:copy-path` |
+| Changes | `change-row:<path>`、`change-header:<group>`、`change-dir:<key>`、`change-unreadable`（無法讀取的儲存庫節點）、`change-unreadable-toggle`、`changes-empty` |
+| Log | `log-subject:<ix>`、`log-error`、`log-failed-feeds`（讀不到的 repo 橫幅）、`log-empty` |
+| 貼上面板 | `paste-panel`、`paste-items`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`、`paste-map:<prefix>`、`paste-map-pick:<…>`、`paste-commit:<n>`、`btn-apply`、`btn-cancel` |
 
 | 日誌 | 意思 |
 |---|---|
-| `[APP:REMOTE_PAIRED: name=<名稱> fp=<16 hex>]` | 配對成功。之後 App 會自動列出它的工作區 |
-| `[APP:REMOTE_PAIR_FAILED: <訊息>]` | 配對失敗 |
-| `[APP:REMOTE_WORKSPACES: count=N]` | 列出工作區成功（失敗時沒有這行，只在選單顯示紅字） |
-| `[APP:REMOTE_OPENED: <worker> ▸ <工作區> generation=N]` | 開啟遠端工作區 |
-| `[APP:TREE_ROW_REFUSED: not-utf8]` | 點了名稱不是 UTF-8 的列，無法開啟 |
-| `[APP:CHANGES_EMPTY: state=…]` | Changes 空狀態改變：`no_workspace`、`scanning`、`loading`、`no_repository`、`scan_failed`、`no_match`、`clean`、`clean_partial`（乾淨，但至少一個 repo 沒讀完整，不等於完整乾淨，R32b 等步驟仍以 `state=clean` 判定） |
-| `[APP:LOG_EMPTY: state=…]` | Log 空狀態改變：`no_workspace`、`scanning`、`loading`、`no_repository`、`failed`、`empty` |
-| `[APP:E2E_REPO: name=<名稱> ok=true/false …]` | 儲存庫掃描或載入狀態 |
-| `[APP:CHANGES_LOADED: <名稱> files=N]` | Changes 面板儲存庫變更清單載入完成 |
-| `[APP:REPO_LOADED: <名稱> files=N]` | 單一儲存庫變更載入完成 |
-| `[APP:REMOTE_WORKER: state=…]`、`[APP:REMOTE_PAIRING: state=open]` | 本機當 worker（本規程不測） |
+| `[APP:REMOTE_HOST_LISTED: host=<主機> folders=N path=<路徑>]` | 列出主機上某個資料夾的子資料夾 |
+| `[APP:REMOTE_HOST_FAILED: host=<主機> <訊息>]` | 連不上或列不出 |
+| `[APP:REMOTE_OPENED: <主機> ▸ <名稱> generation=N]` | 開啟遠端工作區 |
+| `[APP:REMOTE_OPEN_FAILED: …]`、`[APP:REMOTE_REOPEN: …]` | 開啟失敗；啟動時重新連線 |
+| `[APP:REMOTE_SCAN_FAILED: …]` | 掃描儲存庫失敗 |
+| `[APP:CHANGES_EMPTY: state=…]`、`[APP:LOG_EMPTY: state=…]` | 空狀態（`clean`、`clean_partial`、`no_repository`、`scan_failed`、`failed` 等） |
+| `[APP:E2E_REPO: name=<名稱> ok=true/false …]` | 儲存庫掃描結果 |
+| `[APP:COPY_PREP: files=N]`、`[APP:COPY_DONE: copied=N]`、`[APP:COPY_COMMITS_DONE: commits=N]` | 複製 |
+| `[APP:PASTE_PREVIEW …]`、`[APP:PASTE_APPLYING]`、`[APP:PASTE_DONE …]`、`[APP:PASTE_ERR: …]`、`[APP:PASTE_STALE_DETECTED …]` | 貼上 |
 
 ## 4. 測案
 
-每格都要截圖（點擊前、點擊後各一張），存在 `$RUN/<ID>/`，再加一份 `action.json`，內容是 bounds、scale、算出的螢幕點和新的日誌行。操作者在寫入任何檔案至該處前必須先 `mkdir -p "$RUN/<ID>"`（R02、R03、R13、R25、R26 會透過 shell 重新導向寫入該處）。
+每格都要截圖（點擊前、點擊後各一張），存在 `$RUN/<ID>/`，再加一份 `action.json`，內容是 bounds、scale、算出的螢幕點和新的日誌行。寫入任何檔案前先 `mkdir -p "$RUN/<ID>"`。
 
-### 4.1 配對（R01–R05 連續做完，要在配對碼過期前）
+### 4.1 ssh 主機與選專案（S01–S12，依序做）
 
-| ID | 動作 | 通過線 |
+| ID | 操作 | 通過線 |
 |---|---|---|
-| R01 | 點 `btn-workspace-menu` | 有 `btn-remote-pair-new`、`btn-remote-worker-toggle` 的 bounds；沒有任何 `remote-worker:*`（全新的設定資料夾）。截圖有「遠端節點」區塊 |
-| R02 | 本格遵循第 3 節規則 3（沒有日誌 tag 的訊息）：點擊前依剪貼簿 sentinel 說明寫入 sentinel；點 `btn-remote-pair-new`，兩個欄位都空著，點 `btn-remote-pair` | 出現 `remote-addr-input`、`remote-code-input`；選單截圖在配對表單處以紅字顯示「請輸入位址與配對碼」；沒有 `REMOTE_PAIRED`／`REMOTE_PAIR_FAILED`；儲存 `R02/sentinel-before.sha` 與 `R02/sentinel-after.sha` 且雜湊不變，1 秒內沒有新的 `COPY_*` 或 `PASTE_*` 行 |
-| R03 | 位址輸入 `100.95.28.19:47899`，配對碼輸入錯的 `AAAA-AAAA`，點 `btn-remote-pair` | 一行新的 `REMOTE_PAIR_FAILED`；選單裡是紅字錯誤；「未記錄配對」之證據必須在配對失敗後立即存檔：執行 `ls -l "$RUN/master-config"` 與 `cat "$RUN/master-config/remote-workers.json"`（若存在），存為 `R03/workers-json.txt`（檔案不存在或內容未含此 worker）。缺少該存檔者本格判 `not-run` |
-| R04 | 配對碼改成 worker 印出的那組（位址用 `100.95.28.19:47899`，要帶埠，因為測試 worker 不在預設埠），點 `btn-remote-pair` | 出現 `REMOTE_PAIRED: name=ubuntu-ui fp=…`，fp 和 worker 指紋一致（第 3 節規則 5）；接著 `REMOTE_WORKSPACES: count=5`；`remote-workers.json` 有一筆 `ubuntu-ui`。按鈕在配對時會短暫顯示「配對中…」，截到就附上，截不到不影響判定 |
-| R05 | 截圖選單；hover 擷取 tooltip（將滑鼠移至目標列 bounds 中心，等待約 1 秒再截圖） | `remote-worker:0` 那一列顯示 `ubuntu-ui` 與位址；當第二行文字被截斷時，hover 該列顯示 tooltip，其內容包含完整位址與完整指紋（`XXXX-XXXX-XXXX-XXXX`），指紋必須與 R04 一致（第 3 節規則 5）；底下五列 `remote-workspace:0..4` 依序為 `edge`、`rtk`、`gitws`、`plainws`、`inner`（依 worker 啟動時傳入的順序排列），各自附有 Ubuntu 上的路徑；路徑太長被截斷時，hover 該工作區列，tooltip 顯示完整路徑（擷取方式同上） |
+| S01 | 點 `btn-workspace-menu` | 遠端區列出 `~/.ssh/config` 的主機（不含萬用字元），其中有 `ubuntu`；順序和 `snip remote hosts` 的輸出一致 |
+| S02 | 點 `ubuntu` 那一列的 `remote-host:<ix>` | `REMOTE_HOST_LISTED: host=ubuntu … path=/home/audichuang`；`remote-folder:*` 的名稱集合等於 `ssh ubuntu 'cd ~ && ls -A'` 的資料夾去掉以 `.` 開頭的；看得到 `btn-remote-open-here`；沒有 `REMOTE_OPENED` |
+| S03 | 依序點進 `snip-ui-run`、`<SHA>` | 每一次都是新的 `REMOTE_HOST_LISTED … path=<那一層>`，**不是**開啟工作區；`remote-path` 顯示目前路徑；`remote-path-input` 被填成目前路徑 |
+| S04 | 點 `remote-up` | 回到上一層（`path=/home/audichuang/snip-ui-run`）；再點進 `<SHA>` |
+| S05 | 點進 `gitws`，點 `btn-remote-open-here` | `REMOTE_OPENED: ubuntu ▸ gitws`；左上角麵包屑是 `ubuntu ▸ gitws`；專案樹列出 alpha、beta、broken、plain |
+| S06 | 開選單 | 最上方「最近開啟」有 `ubuntu ▸ gitws`（`remote-recent:<n>`），排在本機的 `local-ws` 之後；第二行是完整路徑 |
+| S07 | 從最近開啟點 `local-ws`，再點 `remote-recent:<n>`（gitws） | 先回到本機（麵包屑沒有 `ubuntu ▸`），再一次點擊就回到 `ubuntu ▸ gitws`，不用重新逐層選 |
+| S08 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/edge`，點 `btn-remote-open` | `REMOTE_OPENED: ubuntu ▸ edge`；`~` 展開成對方的家目錄 |
+| S09 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/no-such`，點 `btn-remote-open` | 失敗格：選單裡紅字說資料夾不存在；目前的工作區不變（仍是 edge） |
+| S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `REMOTE_REOPEN` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`；啟動過程畫面不卡（重新連線在背景） |
+| S11 | 對方沒有受測版本：`ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），在 App 選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
+| S12 | 把視窗調成 900×600（System Events 設成 900×632），開選單並點進一層資料夾 | `remote-path`、`remote-up`、`btn-remote-open-here`、`remote-path-input`、`btn-remote-open` 的 bounds 都 `w,h ≥ 1` 且在內容區裡；長路徑被截斷時 hover 顯示完整路徑；做完調回 1080×720 |
 
-### 4.2 瀏覽真實專案 rtk
+### 4.2 瀏覽真實專案 rtk（R01–R08）
 
-| ID | 動作 | 通過線 |
+先在選單逐層選到 `/home/audichuang/research/rtk`，點 `btn-remote-open-here`。
+
+| ID | 操作 | 通過線 |
 |---|---|---|
-| R06 | 前置條件：切換前，`local-ws` 的專案樹必須正顯示 `tree-row:local.txt`（必要時打開 `rail-project`）並記錄其最新 `CTRL_BOUNDS`；只有先取得過 bounds 的 ID 才能斷言 GONE。若切換前不可見，本格判 `not-run`，絕不可判 `pass`。<br>動作：點顯示 `rtk` 的那一列 `remote-workspace:<wx>` | `REMOTE_OPENED: ubuntu-ui ▸ rtk`；選單關閉；左上角顯示 `ubuntu-ui ▸ rtk`；狀態列顯示「已開啟遠端工作區 …」；`tree-row:local.txt` 那一列有 `CTRL_GONE` |
-| R07 | 讀根目錄 | 頂層顯示 `repo-row:rtk` 標頭列；其下根目錄的 `tree-row:*` 集合等於 `ssh ubuntu 'ls -A ~/research/rtk'` 的結果去掉 `.git`（專案樹刻意不列 `.git`，和本機模式一致），`target` 要在；資料夾排在前面，同類照名稱排序 |
-| R08 | 點 `tree-row:src`（或 `tree-chevron:src`）展開 | `TREE_PAGE: rel=src … children=N`，N 等於 `ls -A src \| wc -l`；子列的 ID 是 `tree-row:src/<名稱>` |
-| R09 | 點 `tree-row:src/main.rs` | `TREE_FILE_SELECTED`、`PREVIEW_LOADING`、`PREVIEW_LOADED: src/main.rs`；預覽前 20 行和 `ssh ubuntu 'head -20 ~/research/rtk/src/main.rs'` 一致（截圖比對）；有 Rust 語法上色；預覽上方的路徑列是 `ubuntu-ui ▸ rtk › src › main.rs`，不是 `snip-remote://…` |
-| R10 | 點 `tree-row:README_zh.md` | `PREVIEW_LOADED`；中文正常顯示，沒有豆腐字或亂碼 |
-| R11 | 展開 `src/hooks`，點 `tree-row:src/hooks/init.rs`（238 KB），在預覽裡捲到最後 | `PREVIEW_LOADED`；最後一行和 `tail -1` 一致；捲動時 App 不卡 |
-| R12 | 展開 `target`、`release`，點 `tree-row:target/release/rtk`（8 MB 二進位） | 依第 3 節規則 4 判失敗格：顯示二進位或超過 1 MiB 的錯誤都算對；沒有亂碼文字；5 秒內可以點下一列 |
-| R13 | 看根目錄，再執行 `mkdir -p "$RUN/R13" && target/debug/snip remote cat 1 rtk .git/HEAD > "$RUN/R13/head.txt"; cat "$RUN/R13/head.txt"` | 樹裡沒有 `tree-row:.git` 列；CLI 印出 `ref: refs/heads/…`（`.git` 只是不列在樹裡，指名路徑仍可讀）。證據：截圖顯示完整根目錄清單（必要時捲動，註明清單完整），加上從 App 日誌 grep `CTRL_BOUNDS` 得到的 `tree-row:` ID 原始清單證明無 `tree-row:.git`，以及儲存的 CLI 輸出 `R13/head.txt`。缺少存檔 `R13/head.txt` 者判 `not-run` |
-| R14 | 把 `src` 收合再展開（點 `tree-chevron:src`） | 第二次也有 `TREE_PAGE: rel=src`，清單和 R08 相同 |
+| R01 | 讀根目錄 | 頂層是 `repo-row:rtk`；其下 `tree-row:*` 集合等於 `ssh ubuntu 'ls -A ~/research/rtk'` 去掉 `.git` |
+| R02 | 點 `tree-row:src` 展開 | `TREE_PAGE: rel=src … children=N`，N 等於 `ls -A src \| wc -l` |
+| R03 | 點 `tree-row:src/main.rs` | `PREVIEW_LOADED: src/main.rs`；預覽前 20 行和 `ssh ubuntu 'head -20 ~/research/rtk/src/main.rs'` 相同 |
+| R04 | 點 `tree-row:README_zh.md` | `PREVIEW_LOADED`；中文正常顯示 |
+| R05 | 展開 `src/hooks`，點 `init.rs`（238 KB），捲到最後 | 最後一行和 `tail -1` 一致；捲動不卡 |
+| R06 | 展開 `target/release`，點 `rtk`（8 MB 二進位） | 失敗格：顯示二進位或超過 1 MiB；5 秒內可以點下一列 |
+| R07 | 點 `rail-changes`、`rail-log` | Changes `state=clean`；Log 第一列的 subject 與 SHA 等於 `ssh ubuntu 'git -C ~/research/rtk log -1 --format="%h %s"'` |
+| R08 | 把 `src` 收合再展開 | 第二次也有 `TREE_PAGE: rel=src`，清單和 R02 相同 |
 
-### 4.3 邊界案例 edge
+### 4.3 邊界案例 edge（E01–E12）
 
-| ID | 動作 | 通過線 |
+從最近開啟或選單打開 `edge`。
+
+| ID | 操作 | 通過線 |
 |---|---|---|
-| R15 | 從工作區選單切到 `edge`（先截圖確認列名） | `REMOTE_OPENED: ubuntu-ui ▸ edge`；rtk 的列（`tree-row:*`、`repo-row:rtk`）都有 `CTRL_GONE`；edge 的根目錄由 `ws-tree-row:*` 列加上 `repo-row:nested` 標頭列組成，合起來與 `ls -A "$W/edge"` 一致，非 UTF-8 那個名稱除外（見 R27） |
-| R16 | 依序展開 `src`、`deep`，點 `中文 有空白.txt` | `PREVIEW_LOADED: src/deep/中文 有空白.txt`；顯示 `深層 檔案 ✓ 🦀` |
-| R17 | 點 `empty.txt` | `PREVIEW_LOADED`；預覽是空的，不是錯誤，也不是上一個檔案的內容 |
-| R18 | 點 `crlf.txt` | `PREVIEW_LOADED`；兩行 `line1`、`line2`，沒有顯示 `^M` 或多出空行 |
-| R19 | 點 `exact-1MiB.txt` | `PREVIEW_LOADED`（剛好 1 MiB 要能預覽）；就算 App 的長行顯示另外截斷，也只能出現本機同一規則的截斷提示 |
-| R20 | 點 `over-1MiB.txt` | 失敗格：錯誤文字提到超過 1 MiB |
-| R21 | 點 `blob.bin` | 失敗格：二進位或非 UTF-8，無法預覽 |
-| R22 | 點 `latin.txt` | 失敗格：同 R21 |
-| R23 | 點 `manydir` 展開，再反覆點最新的 `ws-tree-view-more:manydir` 或 `ws-tree-view-more:`，直到沒有更多列；執行 oracle 命令：`mkdir -p "$RUN/R23" && target/debug/snip remote ls 1 edge manydir > "$RUN/R23/cli-ls.txt" 2> "$RUN/R23/cli-ls.err"; wc -l < "$RUN/R23/cli-ls.txt"` | CLI 每行一項，stdout 存入 `R23/cli-ls.txt`，`wc -l` 印出 1000（`R23/cli-ls.err` 包含 `(listing truncated)` 截斷提示）；GUI 日誌 `WS_TREE_PAGE: rel=manydir … children=N`，N ≤ 1000（GUI 的記憶體預算可能收得比 1000 少，記下實際值）；每點一次，畫面都出現新的 `ws-tree-row:manydir/…`；最後有 `ws-tree-marker:manydir`，顯示「[目錄未完整列出: 已截斷]」；捲到底不卡。缺少存檔 `R23/cli-ls.txt` 者判 `not-run` |
-| R24 | 點 `escape.txt` | 失敗格：錯誤文字說路徑離開了工作區；`top-secret-c0ffee` 不出現在截圖，也不在 `app-*.log` 裡（`grep -c top-secret "$RUN"/app-*.log` 要是 0） |
-| R25 | 執行 oracle 命令：`mkdir -p "$RUN/R25" && target/debug/snip remote ls 1 edge > "$RUN/R25/cli-ls.txt"`；在 App 點 `escape-dir` | 拒絕。指向分享外的資料夾 symlink 列成檔案列（CLI 每行一項，在 `R25/cli-ls.txt` 中印為 `escape-dir`，沒有尾端 `/`）；點下去是失敗格，錯誤文字是「Path leaves the workspace」。**不能**列出 `/etc` 的內容（截圖裡沒有 `passwd`、`hostname`）。缺少存檔 `R25/cli-ls.txt` 者判 `not-run` |
-| R26 | 點 `inner-link`；對照 R25 保存之 oracle `"$RUN/R25/cli-ls.txt"`（或執行 `mkdir -p "$RUN/R26" && target/debug/snip remote ls 1 edge > "$RUN/R26/cli-ls.txt"`） | 指向分享內的資料夾 symlink 列成資料夾（CLI 在 `cli-ls.txt` 中每行一項，印為 `inner-link/`，帶有尾端 `/`）：可以展開，列出 `deep`、`main.rs`；點 `inner-link/main.rs` 能預覽。顯示成檔案列或無法展開，判 `fail`。缺少 `cli-ls.txt` 存檔（R25 或 R26 的）者判 `not-run` |
-| R27 | 找到非 UTF-8 名稱那一列 | 它的 ID 是 `ws-tree-invalid:<suffix>`，名稱用替代字元顯示；點它有一行新的 `TREE_ROW_REFUSED: not-utf8`，狀態列顯示「檔名不是有效的 UTF-8，無法開啟或預覽」；App 不崩潰，選取與預覽維持原樣 |
-| R28 | 依序展開 `a/b/c/d/e`，點 `leaf.txt` | 每層各有一行 `WS_TREE_PAGE`；顯示 `deepest` |
-| R29 | 看 `nested` 和 `.hidden` | `nested` 視為 repo（僅含空 `.git`，見 R32），顯示為 `repo-row:nested` 標頭列（具錯誤狀態），不是可展開的資料夾，點擊不產生 `WS_TREE_PAGE: rel=nested`；`.hidden` 列出為 `ws-tree-row:.hidden`，可以預覽 |
+| E01 | 依序展開 `src`、`deep`，點 `中文 有空白.txt` | `PREVIEW_LOADED`；顯示 `深層 檔案 ✓ 🦀` |
+| E02 | 點 `empty.txt` | `PREVIEW_LOADED`；空白預覽，不是錯誤，也不是上一個檔案 |
+| E03 | 點 `crlf.txt` | 兩行 `line1`、`line2`，沒有 `^M` 或多出空行 |
+| E04 | 點 `exact-1MiB.txt` | `PREVIEW_LOADED` |
+| E05 | 點 `over-1MiB.txt` | 失敗格：錯誤文字提到超過 1 MiB |
+| E06 | 點 `blob.bin`、`latin.txt` | 失敗格：二進位或非 UTF-8 |
+| E07 | 展開 `manydir`，反覆點最新的 `ws-tree-view-more:manydir`，直到沒有更多列 | 列數總和等於 1200；每次點擊都有新的 `WS_TREE_PAGE` |
+| E08 | 點 `escape.txt`、`escape-dir` | 失敗格：錯誤說路徑離開了工作區；`top-secret-c0ffee` 不在截圖也不在 `app-*.log` |
+| E09 | 點 `inner-link` | 當資料夾展開，列出 `deep/` 與 `main.rs` |
+| E10 | 找到非 UTF-8 名稱那一列 | ID 是 `ws-tree-invalid:<suffix>`，名稱用替代字元；點它有 `TREE_ROW_REFUSED: not-utf8` |
+| E11 | 依序展開 `a/b/c/d/e`，點 `leaf.txt` | 每層一行 `WS_TREE_PAGE`；顯示 `deepest` |
+| E12 | 看 `nested` 和 `.hidden` | `nested`（空 `.git`）顯示為 `repo-row:nested` 錯誤列，不是可展開的資料夾；`.hidden` 照本機規則顯示 |
 
-### 4.4 拒絕寫入類操作（任一遠端工作區）
+### 4.4 多 repo 加壞掉的 git：brokenws（B01–B07）
 
-每格開始前先放 sentinel（第 3 節）。
+打開 `brokenws`。對照：`"$SNIP" remote repos ubuntu "$W/brokenws"` 會列出 `good` 一列正常、`wt-gone-1`、`wt-gone-2`、`wt-gone-3`、`empty-git` 四列 `error:`。
 
-| ID | 動作 | 通過線 |
+| ID | 操作 | 通過線 |
 |---|---|---|
-| R30 | 選一個檔案列，按 Cmd+C；再對該列右鍵 →「複製」（`menu-item:copy-files`） | 兩次都有 `COPY_PREP` 與 `COPY_DONE: copied=1`；剪貼簿內容與在 worker 上對同一檔案跑 `snip copy` 逐 byte 相同 |
-| R31 | 按 Cmd+V，再點 `btn-paste` | 兩次都顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」；沒有 `PASTE_PREVIEW`／`PASTE_LOADING`；沒有出現貼上面板；`ssh ubuntu "find '$W/edge' -newer '$W/rtk-marker' \| wc -l"` 是 0 |
-| R32 | 點 `rail-changes`、`rail-log` | 此時開著的是 `edge`（R15 切過去的）：點 `rail-changes`，`edge/nested` 只有空的 `.git` 資料夾，探索把它當 repo（`workspace.rs:540-548` `classify_git`），所以必須看到 `nested` 的錯誤列（Note），**不能**出現 `state=clean`，也沒有 `local-ws` 的任何列；點 `rail-log`，看到 `log-empty` 為 `failed`（或錯誤提示列含 `nested`），不是「沒有 commit」。**空畫面或 `state=clean` 判 `fail`** |
-| R32b | 從工作區選單切回 `rtk`，點 `rail-changes` 與 `rail-log` | 點 `rail-changes` → `state=clean`（rtk 工作樹乾淨）；點 `rail-log` → 第一列是受測當天 `ssh ubuntu 'git -C ~/research/rtk rev-parse HEAD'` 的 commit。**空畫面判 `fail`**。R34 之前照原文先開回 `edge` |
-| R33 | 用 Cmd+Shift+O（或工作區選單的最近工作區）打開本機的 `$RUN/local-ws`，選 `local.txt`，按 Cmd+C | 左上角不再有 `ubuntu-ui ▸`；`COPY_DONE`；`pbpaste` 拿到 snip-sync 的 payload（剪貼簿 SHA 和 sentinel 不同）。這格驗證離開遠端之後，遠端狀態有清乾淨 |
+| B01 | 點 `rail-changes` | `good` 的 `g.txt` 列在最上面；清單最下面一列是 `change-unreadable`「⚠ 無法讀取的儲存庫 (4)」，預設收合（看不到逐個錯誤列）；數字等於對照命令的 `error:` 列數 |
+| B02 | 點 `change-unreadable-toggle` | 展開後逐一列出每個 repo 的名稱與原因（`not a git repository` 之類），縮排在節點底下；再點一次收合 |
+| B03 | 點 `good` 的 `g.txt` | 預覽顯示 diff，內容是 `good dirty`；壞掉的 repo 不影響 |
+| B04 | 點 `rail-log` | `log-failed-feeds` 橫幅寫「N 個儲存庫無法讀取：」後面只列前 2 個名稱接「…」；hover 橫幅，tooltip 列出全部 N 個；Log 列表有 `good commit` |
+| B05 | 點 `rail-project`，展開 `wt-gone-1`，點 `kept.txt` | `PREVIEW_LOADED`，顯示 `kept 1`：壞掉的 worktree 檔案照樣能瀏覽 |
+| B06 | 在 B01 的 `change-unreadable` 上右鍵 | 沒有會失敗的「複製」：選單的複製是停用的，或複製後 `COPY_REFUSED`／狀態列說明沒有可複製的內容；剪貼簿 sentinel 不變 |
+| B07 | `ssh ubuntu "echo fixed > '$W/brokenws/good/new.txt'"`，點 `btn-refresh` | `good` 多一列 `new.txt`；無法讀取的節點數字不變，仍收合 |
 
-### 4.5 即時變化與 worker 生命週期
+### 4.5 遠端唯讀 Git 檢視：gitws（G01–G10）
 
-R34 之前，先重新開回 `edge`（R15 的步驟）。
+打開 `gitws`。
 
-| ID | 動作 | 通過線 |
+| ID | 操作 | 通過線 |
 |---|---|---|
-| R34 | `ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 樹重新讀取；出現 `ws-tree-row:new.txt`，預覽顯示 `fresh-1` |
-| R35 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2`，不是快取的舊內容 |
-| R36 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄 `WS_TREE_PAGE: rel= …` 行（Refresh 後根目錄清單抵達）之後，不再出現 `ws-tree-row:new.txt` 的 `CTRL_BOUNDS`（該列不在重建後的清單中）；最後一行 `PREVIEW_LOADING` 為 `new.txt` 且其後沒有 `PREVIEW_LOADED`；預覽改顯示指名 `new.txt` 的找不到檔案或讀取失敗錯誤，不再是 `fresh-2`；絕不可顯示其他 repo 的 Git 錯誤，`edge/nested`（錯誤 repo）絕不能搶佔預覽區 |
-| R37 | 停掉 worker：`ssh ubuntu "kill \$(cat '$W/worker.pid')"`，在 App 點一個沒預覽過的檔案 | 失敗格；`PREVIEW_LOADING` 之後 10 秒內出現錯誤（master 連線逾時 2 秒、讀取 5 秒）；這段時間 App 沒有凍結（可以捲動、可以開選單）；接著按 Cmd+Shift+W 關掉工作區，要在 8 秒內完成 |
-| R38 | `start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"`；確認指紋和第一次一樣；在 App 選單點 `remote-worker:0`，開 `edge`，點一個檔案 | 不需要重新配對；`REMOTE_WORKSPACES: count=5`、`REMOTE_OPENED`、`PREVIEW_LOADED` |
-| R39 | 取消分享：`start_worker wcfg /home/audichuang/research/rtk`（只分享 rtk）。App 不重開，直接點 `edge` 裡另一個檔案，再開選單點 `remote-worker:0` | 預覽被拒絕（失敗格）；選單只列出 `rtk`（`REMOTE_WORKSPACES: count=1`） |
-| R40 | 換一張憑證：`start_worker wcfg-other "$W/edge"`（同一個位址，新的設定資料夾），在 App 選單點 `remote-worker:0` | 拒絕；選單顯示紅字，內容說明這不是已配對的 worker（內容含兩個指紋）；`remote-workers.json` 的指紋沒有被改成新的 |
-| R41 | 復原：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"`，點 `remote-worker:0` | `REMOTE_WORKSPACES: count=5` |
-| R42 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` 重新啟動（寫進新的 `app-N.log`），開選單 | `remote-worker:0` 仍然是 `ubuntu-ui`，點它就能列出工作區，不需要重新配對 |
-| R43 | 錯誤 5 次作廢：`start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"` 拿新的配對碼 C。Cmd+Q，改用全新的 `SNIP_CONFIG_DIR="$RUN/master-config-r43"` 啟動 App（寫進新的 `app-N.log`）。用 `btn-remote-pair-new` 以錯碼配對 5 次，第 6 次用 C（位址同樣用 `100.95.28.19:47899`）。再 Cmd+Q，用原本的 `SNIP_CONFIG_DIR` 重新啟動，點 `remote-worker:0` | 5 行 `REMOTE_PAIR_FAILED`；第 6 次也是 `REMOTE_PAIR_FAILED`（碼已作廢）；換回原本的設定後，`remote-worker:0` 仍然能列出工作區。一定要用全新的 master：已配對的 master，worker 認得它的憑證，不看配對碼就放行 |
-| R44 | 把視窗調成 900×600（從系統層設定，例如 System Events 設成 900×632；送給 App 的合成拖曳碰不到視窗框），開選單並打開配對表單 | 兩個輸入框和「配對」按鈕的 bounds 都 `w,h ≥ 1`，而且都在內容區裡面；選單可以捲動到最下面；焦點在輸入框時按 Escape，選單收起；再開選單，點 `btn-workspace-menu`，選單也會收起 |
-| R45 | 先開著 `edge`，再點 `btn-remote-forget:0` | 開著的 `edge` 跟著關閉：左上角不再有 `ubuntu-ui ▸`，`ws-tree-row:*` 都有 `CTRL_GONE`；`remote-worker:0` 有 `CTRL_GONE`；`remote-workers.json` 不再有 `ubuntu-ui`；重開選單也不會再出現；忘記 worker 且工作區關閉後，Log 面板絕不可顯示掃描／搜尋狀態（如「正在搜尋 Git 儲存庫…」），必須顯示無工作區／空狀態（未開工作區時 `log-empty` 不為 `scanning`，關閉完成後印出 `[APP:LOG_EMPTY: state=no_workspace]`（若顯示 Changes 面板則印出 `[APP:CHANGES_EMPTY: state=no_workspace]`），且 `log-empty` probe 顯示文字「未開啟工作區。開啟一個 Git 儲存庫，或內含多個儲存庫的資料夾。」；短暫的 `loading` 或 `scanning` 不算通過） |
+| G01 | 點 `rail-changes` | alpha 的變更與 `git -C alpha status --porcelain=v2` 一致：`a.txt`、`dir/c.txt` 改動，`staged.txt` 暫存，`new.txt` 未追蹤；beta 乾淨不列；`broken` 是一列錯誤（只有一個時不收合，留在最上方） |
+| G02 | 點 `a.txt` | 右側 diff 包含 `commit 2 a modified` |
+| G03 | 點 `rail-log`；用 Repository 篩選只選 alpha | 預設是 alpha 與 beta 合併的 log；篩選後只剩 alpha |
+| G04 | 點 alpha 的 HEAD commit | 變更檔案清單等於 `git diff-tree --no-commit-id --name-only -r HEAD` |
+| G05 | 點其中一個檔案 | 顯示該 commit 的 diff |
+| G06 | 打開分支選擇器 | 列出 `main` |
+| G07 | 切到 commit 樹瀏覽 | 可展開目錄、看 blob 內容 |
+| G08 | 打開 `plainws`，看 Changes 與 Log | `CHANGES_EMPTY: state=no_repository`、`LOG_EMPTY: state=no_repository` |
+| G09 | 打開 `outer/inner` | `no_repository`；絕不出現父 repo 的 `outer-dirty.txt` |
+| G10 | `ssh ubuntu "echo beta-change >> '$W/gitws/beta/b.txt'"`，點 `btn-refresh` | beta 出現 `b.txt` 改動 |
 
-### 4.6 CLI master 交叉驗證
+### 4.6 遠端複製和本機一樣（X01–X10）
 
-R45 之前，或在 R45 之後重新配對一次（重啟 worker 拿新碼，用 GUI 配對）。
+仍在 `gitws`。每格開始前寫 sentinel。
 
-| ID | 動作 | 通過線 |
-|---|---|---|
-| C01 | `target/debug/snip remote workers`（同一個 `SNIP_CONFIG_DIR`） | 不用另外配對就列出 `1	ubuntu-ui	100.95.28.19:47899	<指紋>`，證明 GUI 和 CLI 共用配對紀錄 |
-| C02 | `snip remote workspaces 1`、`snip remote ls 1 rtk src` | 工作區清單與 R05 在 GUI 上看到的五個工作區一致；`snip remote ls 1 rtk src` 的項目與個數和 GUI 上 `tree-row:src` 展開的子項目及 `TREE_PAGE` children 計數一致 |
-| C03 | 對 rtk 抽 20 個 tracked 文字檔，比較 `snip remote cat 1 rtk <f> \| shasum -a 256` 和 `ssh ubuntu sha256sum` | 20/20 相同 |
-| C04 | App 開著 rtk 的時候，同時跑 50 個平行的 `snip remote cat 1 rtk src/main.rs` | 50/50 正確；這段時間在 GUI 點檔案仍然能預覽（`PREVIEW_LOADED`） |
-
-### 4.7 遠端唯讀 Git 檢視（G01–G12）
-
-若 R45 已忘記 worker，進入 §4.7 之前需重新啟動 worker 並在 GUI 重新配對一次：
+**對照答案的 helper**（X01–X06、X09 用）：把檔案模式 payload 切成每檔 `path<TAB>sha256(body)` 的清單，worker 端也對每個檔案算同一份清單（`cat`／`git show` 的原始內容做同樣正規化），兩邊逐行相等、路徑集合正確才算過。切法與 `crates/core/src/format.rs` 的 `parse_clipboard`／`join_content` 一致：行切分照 JS `split(/\r?\n/)`（`\n` 前的一個 `\r` 去掉、檔尾 `\r` 保留）、第一行 `clipcode-root` 略過、header 是泛用 `// FILE:` 形（可帶 `[NEW]` 等標籤，標籤不計入 path）、body 前後的空白行去掉、中間原樣、每行剝一個 `//clipcode-esc: ` 前綴。開跑時在 Mac 定義一次（腳本存檔，stdin 才留給資料）：
 
 ```bash
-start_worker wcfg "$W/edge" /home/audichuang/research/rtk "$W/gitws" "$W/plainws" "$W/outer/inner"
+mkdir -p "$RUN" && cat > "$RUN/snip_payload_list.py" <<'PY'
+import hashlib, re, sys
+WS = r"[ \t\n\x0b\x0c\r]"
+DOT = r"[^\n\r\u2028\u2029]"
+HEADER = re.compile(rf"^{WS}*(?:(//|#|/\*){WS}*)?[Ff][Ii][Ll][Ee]:{WS}*({DOT}+?){WS}*(?:\*/)?$")
+LEADING_LABELS = re.compile(rf"^(?:\[(?:NEW|MODIFIED|DELETED|MOVED)\]{WS}*)+")
+def js_split(text):
+    lines = text.split("\n")
+    return [l[:-1] if l.endswith("\r") else l for l in lines[:-1]] + [lines[-1]]
+def blank(s):
+    return s.strip(" \t\n\x0b\x0c\r") == ""
+def normalize(lines):
+    body = list(lines)
+    while body and blank(body[0]): body.pop(0)
+    while body and blank(body[-1]): body.pop()
+    body = [l[len("//clipcode-esc: "):] if l.startswith("//clipcode-esc: ") else l for l in body]
+    return "\n".join(body)
+def strip_labels(path):
+    return LEADING_LABELS.sub("", path).strip(" \t\n\x0b\x0c\r")
+def likely(path):
+    p = strip_labels(path)
+    return bool(p) and p[0] not in "\"'" and p[-1] not in ",;" and any(c in p for c in "/\\.")
+def digest(content):
+    return hashlib.sha256(content.encode()).hexdigest()
+mode = sys.argv[1] if len(sys.argv) > 1 else "list"
+if mode == "file":
+    print(f"{sys.argv[2]}\t{digest(normalize(js_split(sys.stdin.read())))}")
+    sys.exit(0)
+entries, cur, body = [], None, []
+lines = js_split(sys.stdin.read())
+if lines and lines[0].startswith("// clipcode-root: "):
+    lines = lines[1:]
+for line in lines:
+    m = HEADER.match(line)
+    if m and (m.group(1) or likely(m.group(2))):
+        if cur is not None:
+            entries.append((cur, normalize(body)))
+        cur, body = strip_labels(m.group(2)), []
+    elif line == "// clipcode-end":
+        if cur is not None:
+            entries.append((cur, normalize(body)))
+        cur, body = None, []
+    elif cur is not None:
+        body.append(line)
+if cur is not None:
+    entries.append((cur, normalize(body)))
+for path, content in entries:
+    print(f"{path}\t{digest(content)}")
+PY
+snip_payload_list() {   # stdin：payload → 每檔一行 path<TAB>sha256(body)
+  python3 "$RUN/snip_payload_list.py" list
+}
+snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>sha256(正規化後)
+  python3 "$RUN/snip_payload_list.py" file "$1"
+}
 ```
 
-在 GUI 完成配對，以確保 `gitws`、`plainws` 與 `outer/inner` 均已分享且完成配對。
+用法：`pbpaste \| snip_payload_list > 剪貼簿清單`；oracle 端 `ssh ubuntu "cat '$W/gitws/alpha/a.txt'" \| snip_file_digest a.txt > oracle清單`，`cmp` 兩份清單，再另文斷言 `pbpaste \| snip_payload_list \| cut -f1` 的路徑集合正確。
 
-| ID | 動作 | 通過線 |
+**先弄清楚 App 送出的是什麼**（對照程式碼 `menu.rs` 的 `change_row_targets` 與 `project_targets`）：Changes 的列（檔案、資料夾、repo、群組標頭）複製的是 **git 變更匯出**，payload 路徑帶變更標籤（`// file: [MODIFIED] a.txt`），來源是 working/staged；repo 列與群組標頭只複製**那一個群組**的列。專案樹的選取複製的是**檔案模式**（無變更標籤），root 是選取所在的 repo（`alpha`），路徑以 alpha 為根。所以 oracle 有兩種形狀：變更匯出（X01–X06）與 commit 內容（X09）比對上面的清單；X07、X08、X10 可以和 worker 上的 `snip copy` 逐 byte 比對的，比對整份 payload 的 SHA-256。
+
+| ID | 操作 | oracle（清單來源，`cat`／`git show` 都在 Ubuntu 上讀） |
 |---|---|---|
-| G01 | 從工作區選單開 `gitws`，點 `rail-changes` | 掃描發現儲存庫；Changes 列出 alpha 的四個項目（`a.txt` 改動、`staged.txt` 暫存、`new.txt` 未追蹤、`link-to-secret` 未追蹤符號連結），分組與 `git status --porcelain=v2` 的 oracle 一致（若點選 `link-to-secret` 預覽必須被拒絕）；beta 乾淨沒有列出；`broken`（空 `.git`）顯示為 Note 錯誤列；日誌有 `[APP:E2E_REPO: …]`，筆數與狀態與 oracle 一致 |
-| G02 | 在 Changes 面板點 `a.txt` | 右側 diff 顯示 patch，內容包含 `commit 2 a modified` 改動行，不是空畫面或錯誤 |
-| G03 | 點 `rail-log`，看跨 repo 合併歷史，再使用 Repository 下拉選單只選 `alpha` | 預設顯示跨 repo 的 merged log（包含 alpha 與 beta 的 commit）；在 Repository 篩選器只選取 alpha 後，commit 清單僅顯示 alpha 的 commit |
-| G04 | 點選 alpha 的 HEAD commit | 右下方變更檔案清單與 worker 端 `git diff-tree --no-commit-id --name-only -r HEAD` 逐一相符 |
-| G05 | 在 commit 變更檔案清單中點選其中一個檔案 | 右側預覽顯示該 commit 檔案的 diff |
-| G06 | 點開分支／ref 選擇器 | 選擇器下拉清單正確列出 `main` 分支 |
-| G07 | 歷史面板切換至 commit 樹瀏覽 | 可展開目錄、瀏覽 commit 樹節點與檢視 blob 檔案內容 |
-| G08 | 從工作區選單開 `plainws` | 專案樹正常瀏覽檔案；點 `rail-changes` 顯示 `changes-empty` probe，日誌為 `[APP:CHANGES_EMPTY: state=no_repository]`；點 `rail-log` 顯示 `log-empty` probe，日誌為 `[APP:LOG_EMPTY: state=no_repository]`，提示「這個資料夾裡沒有 Git 儲存庫」，不是 clean 或 empty |
-| G09 | 從工作區選單開 `outer/inner` | 判定為 `no_repository`，專案樹只列出 `inner` 的檔案，專案樹與變更清單絕不出現父 repo 的 `outer-dirty.txt` |
-| G10 | 在 worker 端修改 beta 的檔案：`ssh ubuntu "echo beta-change >> '$W/gitws/beta/b.txt'"`，在 App 點 `btn-refresh`；hover `change-repo:unstaged:beta` 列截取 tooltip（方法見第 3 節規則 8） | 重新整理後 Changes 面板中 `beta` 出現變更列，即時反映 worker 上的檔案修改；hover repo 標頭列（例如 `change-repo:unstaged:beta`）時，tooltip 顯示 worker 名稱加上 worker 路徑（如 `ubuntu-ui:/home/.../gitws/beta`），絕不可露出 `snip-remote://` 內部識別路徑 |
-| G11 | 停掉 worker（`ssh ubuntu "kill \$(cat '$W/worker.pid')"`），在 Changes 點選一個檔案（例如 `beta` 的 `b.txt`） | 預覽顯示連線失敗錯誤，絕不誤顯示為乾淨或空內容；預覽上方的路徑列（`breadcrumb`）必須指名所點選檔案所屬的 repo（點 `beta/b.txt` 時為 `beta`），不可誤顯示為先前開啟的 repo；App 不凍結 |
-| G12 | 以受測 SHA 的 `snip worker --max-protocol 1` 啟動 worker，分享 `gitws` 與 `edge`：`WORKER_EXTRA='--max-protocol 1' start_worker wcfg "$W/edge" "$W/gitws"`，從工作區選單重新開啟 `gitws` | 開啟後專案樹檔案瀏覽與預覽立即正常運作，無需按重新整理；若專案樹卡在載入狀態、必須手動按 Refresh 才出現，判 `fail`；點 `rail-changes` 與 `rail-log` 皆顯示「版本太舊」錯誤（`remote_worker_too_old`），提示在 worker 上更新；底部狀態列也顯示同一則錯誤，不可停在「正在掃描儲存庫…」；絕不顯示成 clean 或 empty |
+| X01 | Changes 的 `a.txt`（未暫存）右鍵 →「複製」 | 清單只有 `a.txt` 一行：`cat '$W/gitws/alpha/a.txt' \| snip_file_digest a.txt`（不是 `snip copy a.txt`：變更匯出帶 `[MODIFIED]` 標籤，標籤不計入清單的 path） |
+| X02 | Changes 的 `staged.txt`（暫存列）右鍵 →「複製」 | 清單只有 `staged.txt` 一行：`cat staged.txt \| snip_file_digest staged.txt` |
+| X03 | Changes 的 `dir` 資料夾列右鍵 →「複製」 | 清單只有 `dir/c.txt` 一行：`cat dir/c.txt \| snip_file_digest dir/c.txt`（資料夾列複製該 repo 該群組底下的所有變更，這裡只有一個） |
+| X04 | Changes 的 **Unstaged 群組裡的 alpha repo 列**右鍵 →「複製」 | repo 列只複製一個群組：清單是 `a.txt`、`dir/c.txt`、`new.txt` 三行（各自由 working tree 的 `cat` 算出），**不含** `staged.txt` |
+| X05 | Changes 的 Unstaged 群組標頭右鍵 →「複製」 | 同 X04 的三行清單（gitws 只有 alpha 有變更）；`COPY_DONE: copied=` 等於群組裡的列數 |
+| X06 | 選 Changes 的 `new.txt`，按 Cmd+C | 清單只有 `new.txt` 一行：`cat new.txt \| snip_file_digest new.txt` |
+| X07 | 專案樹展開 alpha，Cmd 點選 `a.txt` 與 `b.txt`，右鍵 →「複製」 | 在 `$W/gitws/alpha` 執行 `snip copy a.txt b.txt --stdout`（選取以 alpha 為根，不是 `alpha/a.txt`）；整份 payload 逐 byte 比對 |
+| X08 | 專案樹展開 alpha，右鍵 `dir` 子資料夾 →「複製」 | 在 `$W/gitws/alpha` 執行 `snip copy dir --stdout`（整個 alpha 是 repo 列，選單只有「複製路徑」，選不得，改用子資料夾）；整份 payload 逐 byte 比對 |
+| X09 | Log 選 alpha 的 HEAD commit，在變更檔案清單對 `b.txt` 右鍵 →「複製」 | 清單只有 `b.txt` 一行：`cd '$W/gitws/alpha' && git show HEAD:b.txt \| snip_file_digest b.txt`；內容是 commit 時的 `commit 2 b`，不是工作樹 |
+| X10 | Log 選 alpha 的兩個 commit，點複製 commit | `snip copy --commits -n 2 --stdout`；`pbpaste` 第一行是 commit 模式的標記；整份 payload 逐 byte 比對 |
+
+每格都要：`COPY_DONE`（或 `COPY_COMMITS_DONE`）。X01–X06、X09：`pbpaste \| snip_payload_list` 與 oracle 清單 `cmp` 相等，且路徑集合（`cut -f1`）與該格寫的一致。X07、X08、X10：`pbpaste \| shasum -a 256` 等於 oracle 的 SHA-256。
+
+### 4.7 遠端貼上和本機一樣（P01–P12）
+
+每格先建一份目的地副本給 oracle 用：`ssh ubuntu "rm -rf '$W/oracle' && cp -a '$W/pastews' '$W/oracle'"`，oracle 是 `ssh ubuntu "cd '$W/oracle/<同一個目的地>' && snip paste --apply <同樣的旗標> --stdin" < payload`，再比較 `$W/pastews/…` 與 `$W/oracle/…` 每個檔案的 SHA-256。
+
+**正規化是刻意的**（spec 第 1 節）：檔案模式不保留檔尾換行與前後空行，CRLF 變成 LF。所以貼上的檔案**不會**逐位元組等於原始檔；通過線一律是「與獨立 CLI 往返的結果相同」——在 Ubuntu 上 `(cd <同一個來源> && snip copy … --stdout)` 產生同一份 payload，`snip paste --apply --stdin` 貼進 oracle 副本，兩邊的貼上結果逐檔案比 SHA-256。
+
+| ID | 操作 | 通過線 |
+|---|---|---|
+| P01 | `(cd "$RUN/paste-src" && "$SNIP" copy . --stdout) > "$RUN/p-files.txt"`（`selection_from_paths` 以 cwd 解析路徑，必須在來源資料夾裡跑；`--repo` 只管引擎根）；命令成功（`$?` 為 0）才 `pbcopy < "$RUN/p-files.txt"`；打開 `pastews/plain`，按 Cmd+V | `PASTE_PREVIEW`；面板列出 `a.txt`、`new.txt`、`sub/crlf.txt`、`sub/noeol.txt`，全部是新增 |
+| P02 | 點 `btn-apply` | `PASTE_DONE`；四個檔案與「在 Ubuntu 上對 paste-src 做同一個 `snip copy` 再 `snip paste` 進 oracle 副本」的結果逐檔相同。接受的正規化（spec 第 1 節）：`sub/crlf.txt` 變 LF、`sub/noeol.txt` 的檔尾換行狀態不保留——所以這兩個檔**不必**逐位元組等於原始檔，與 CLI 往返一致即通過 |
+| P03 | 打開 `pastews/target`，同一個 payload 再按 Cmd+V | `a.txt` 標示為已存在、需要確認覆寫（`paste-overwrite`），其他是新增 |
+| P04 | 取消勾選 `new.txt`（`paste-include`），勾選 `a.txt` 的覆寫，點 `btn-apply` | `a.txt` 被覆寫、`new.txt` 不存在、`keep.txt` 不變；與 oracle（`--overwrite`，事後刪掉 oracle 的 new.txt）相同 |
+| P05 | 再按一次 Cmd+V，預覽出現後執行 `ssh ubuntu "echo changed-outside > '$W/pastews/target/a.txt'"`，再勾選覆寫、點 `btn-apply` | 拒絕：`PASTE_STALE_DETECTED` 或畫面說目的地已在外部修改；worker 上 `a.txt` 是 `changed-outside` |
+| P06 | 做一個會產生前綴選擇的 payload（P01 的 payload 帶 `clipcode-root`，單一根，不會有前綴選項）：`sed -e '/^\/\/ clipcode-root:/d' -e 's|^// file: |// file: src/|' "$RUN/p-files.txt" > "$RUN/p-prefixed.txt" && pbcopy < "$RUN/p-prefixed.txt"`——沒有 `clipcode-root` 中繼資料、每個路徑都帶 `src/`，面板才會出現 `paste-map:src`；打開 `pastews`（多個資料夾），Cmd+V | `PASTE_PREVIEW`；面板出現 `paste-map:src` 要求為前綴選目的地，兩種選擇各做一次（先建兩份 oracle 副本）：**(a) 選 `target`**（剝掉前綴）：`btn-apply` 後寫入 `target/a.txt`、`target/sub/crlf.txt` 等；oracle 是把 payload 路徑的 `src/` 去掉（`sed 's|^// file: src/|// file: |'`）後用 `snip paste --apply --stdin` 貼進 oracle 副本的 `target`——本機 `snip paste` 沒有 `--in`，目的地用 `--repo` 指定。**(b) 選保持 `src/` 於原位（keep relative）**：寫入 `pastews/src/…`；oracle 是 p-prefixed.txt 原樣貼進 oracle 副本的 `pastews` 根（`--repo` 指向 oracle 的 `pastews`） |
+| P07 | `pbcopy < "$RUN/git-payload.txt"`；打開 `pastews`，Cmd+V，若可套用就點 `btn-apply` | `target/.git/hooks/pre-commit` 那一列被拒絕或標成不可寫；`ssh ubuntu "test ! -e '$W/pastews/target/.git/hooks/pre-commit'"` 成立 |
+| P08 | X10 的方式從遠端 `pastews/commit-src` 複製兩個 commit；打開 `pastews/commit-dst`，Cmd+V，`btn-apply` | `PASTE_DONE`；`git -C commit-dst log -2 --format=%s` 是 `replay two`、`replay one`，樹與 oracle（在 oracle 副本的 commit-dst 執行 `snip paste --apply --stdin`）相同 |
+| P09 | `"$SNIP" copy --repo "$RUN/commit-local" --commits -n 1 --stdout \| pbcopy`；打開一份新的 `commit-dst` 副本（`ssh ubuntu "cd '$W/pastews' && rm -rf commit-dst2 && git clone -q commit-src commit-dst2 && git -C commit-dst2 reset -q --hard HEAD~2"`），Cmd+V，`btn-apply` | 本機的 commit 重播到遠端：`git -C commit-dst2 log -1 --format=%s` 是 `from mac`，`mac.txt` 內容是 `from mac` |
+| P10 | 遠端貼回本機：在 `edge` 對 `src` 資料夾右鍵 →「複製」；打開本機 `local-ws`，Cmd+V，`btn-apply` | `local-ws/src/main.rs` 與 `local-ws/src/deep/中文 有空白.txt` 的 SHA-256 等於「Ubuntu 上 `cd '$W/edge' && snip copy src --stdout` 再 `snip paste --apply --stdin` 貼進一份副本」的結果（與 worker 上的原檔比會差正規化：檔尾換行不保留，spec 第 1 節） |
+| P11 | `(cd "$RUN/paste-big" && "$SNIP" copy . --stdout) > "$RUN/p-big.txt"`，命令成功才 `pbcopy < "$RUN/p-big.txt"`（不要直接管線進 pbcopy：複製失敗也會蓋掉剪貼簿）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `PASTE_DONE`；30 個檔案與本機來源相同 |
+| P12 | 遠端到遠端：在 `gitws` 複製 alpha 的 `dir` 資料夾（X08）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `plain/dir/` 下的檔案與獨立 CLI 往返的結果相同（在 Ubuntu 上 `cd '$W/gitws/alpha' && snip copy dir --stdout`，再 `snip paste --apply --stdin` 貼進 oracle 副本；正規化照 spec 第 1 節） |
+
+### 4.8 拒絕的操作（N01–N02）
+
+| ID | 操作 | 通過線 |
+|---|---|---|
+| N01 | 在遠端工作區用「加入儲存庫路徑」 | 規則 3：狀態列顯示 `remote_unsupported` 文字；沒有新的 repo |
+| N02 | 在遠端檔案列右鍵找「在 Finder 中顯示」 | 沒有這個項目，或按了顯示 `remote_unsupported`；沒有開啟 Finder |
+
+### 4.9 即時變化與連線中斷（L01–L05）
+
+| ID | 操作 | 通過線 |
+|---|---|---|
+| L01 | 在 `edge`：`ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 出現 `ws-tree-row:new.txt`，預覽是 `fresh-1` |
+| L02 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2` |
+| L03 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄沒有 `new.txt` |
+| L04 | 中斷連線：執行第 2.3 節的 `stop_run_workers`，必須結束碼 0（只殺本輪記錄、且參數精確符合絕對 binary 路徑的 worker，並確認已退出；任何不符或逾時就判 fail）。不用 `pkill`／`pgrep -u`。在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh，新的 PID 又記進 `$W/pids/`）；絕不顯示成空白或上一個檔案 |
+| L05 | 貼上中斷（寫入途中斷線；wrapper 的 `SNIP_E2E_PASTE_HOLD` 是絕對路徑）。順序：(1) `ssh ubuntu "rm -f '$W/paste-hold'; rm -rf '$W/pastews/cut-dst' '$W/oracle/cut-dst'; mkdir -p '$W/pastews/cut-dst' '$W/oracle/cut-dst'"`；先在 hold 不存在時執行 `ssh ubuntu "cd '$W/oracle/cut-dst' && snip paste --apply --stdin" < "$RUN/p-files.txt"`，完成 P01 payload 的獨立 CLI oracle。(2) `ssh ubuntu "touch '$W/paste-hold'"`；App 打開 `pastews/cut-dst`，對 P01 payload 按 Cmd+V，`PASTE_PREVIEW` 後點 `btn-apply`。(3) `ssh ubuntu "for i in \$(seq 1 100); do [ -f '$W/pastews/cut-dst/a.txt' ] && exit 0; sleep 0.1; done; exit 1"`，必須結束碼 0；逾時判 fail。(4) 執行 `stop_run_workers`，必須結束碼 0，確認 worker 已退出，**先不移除 hold**。(5) `ssh ubuntu "test -f '$W/paste-hold' && test -f '$W/pastews/cut-dst/a.txt' && test ! -e '$W/pastews/cut-dst/new.txt' && test ! -e '$W/pastews/cut-dst/sub/crlf.txt' && test ! -e '$W/pastews/cut-dst/sub/noeol.txt' && cmp '$W/pastews/cut-dst/a.txt' '$W/oracle/cut-dst/a.txt'"`，必須結束碼 0；保存 `ssh ubuntu "find '$W/pastews/cut-dst' -type f"` 的輸出，只能有 `a.txt`。(6) 完成部分寫入檢查後，才 `ssh ubuntu "rm -f '$W/paste-hold'"`，在 App 點 `btn-refresh` | UI 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」（`paste_outcome_unknown`）；確認只有 `a.txt` 已寫入且與 CLI oracle 一致，其餘三個檔案不存在；重新整理後專案樹與 worker 上的實際檔案一致；之後 App 的下一次操作一定有回應（自動重連）。任何步驟失敗都記 fail，再移除 hold 收尾，不當作通過 |
+
+### 4.10 CLI master 交叉驗證（C01–C04）
+
+| ID | 命令 | 通過線 |
+|---|---|---|
+| C01 | `"$SNIP" remote hosts` | 包含 `ubuntu`，和 S01 的清單一致 |
+| C02 | `"$SNIP" remote ls ubuntu "$W/gitws" alpha` | 和 App 專案樹 `alpha` 的子項目相同 |
+| C03 | 先在 worker 上展開 `$HOME` 取得絕對路徑，不要送字面上的 `~`：`RTK=$(ssh ubuntu 'echo "$HOME/research/rtk"')`。對 rtk 抽 20 個 tracked 文字檔，比較 `"$SNIP" remote cat ubuntu "$RTK" "<f>" \| shasum -a 256` 和 `ssh ubuntu "sha256sum '$RTK/<f>'"` | 20/20 相同 |
+| C04 | App 開著 rtk 的時候，同時跑 20 個平行的 `"$SNIP" remote cat ubuntu "$RTK" src/main.rs`（`$RTK` 同 C03 先展開好） | 20/20 正確；這段時間在 GUI 點檔案仍然能預覽 |
 
 ## 5. 完整性（決定這一輪可不可信）
 
-| ID | 檢查 | 通過線 |
+| ID | 驗證 | 通過線 |
 |---|---|---|
-| I01 | 結束時僅呼叫 `rtk_snapshot "$RUN/rtk-after.txt"`（絕不重跑 2.3 基準區塊，避免覆寫 before 或 touch marker），接著比對 `cmp "$RUN/rtk-before.txt" "$RUN/rtk-after.txt"`（或 `diff -u`），並執行 `ssh ubuntu "find ~/research/rtk -newer '$W/rtk-marker' -not -path '*/.git/*' \| wc -l"`。所有 git 指令一定要加 `GIT_OPTIONAL_LOCKS=0`（及 `--no-optional-locks`）：少了它，git 會建立又刪掉 `.git/index.lock`，`.git` 目錄的修改時間因此變新，下面的 `find` 就會算到它 | 和 `rtk-before.txt` 完全相同（HEAD、status、`.git/index` 的 sha256 與檔案時間戳均未改變，證明 Git 檢視未修改 index）；另外 `find` 結果是 0 |
-| I02 | 同 2.2，重新列出 `$REAL` 並算雜湊 | 和 `real-config-before.*` 相同（這一輪沒有碰真實的配對紀錄） |
-| I03 | `grep -c top-secret-c0ffee "$RUN"/app-*.log "$RUN"/*/action.json` | 全部是 0 |
+| I01 | `rtk_snapshot "$RUN/rtk-after.txt" && cmp "$RUN/rtk-before.txt" "$RUN/rtk-after.txt"` | 相同 |
+| I02 | 同 2.2 重新列出 `$REAL` 並算雜湊 | 和 `real-config-before.*` 相同 |
+| I03 | 第 6 節收尾後 `ssh ubuntu "[ ! -e ~/.local/bin/snip ] && [ ! -L ~/.local/bin/snip ] && [ ! -e ~/.local/bin/snip.uirun-$SHA ] && [ ! -L ~/.local/bin/snip.uirun-$SHA ] && command -v snip"`（用 Mac 端的 `$SHA` 插值進命令字串——單引號裡的 `$SHA` 在遠端不會展開） | `~/.local/bin/snip` 與本輪備份名都不存在（懸空 symlink 也算存在），`command -v snip` 回到 linuxbrew 的路徑 |
+| I04 | `grep -c top-secret-c0ffee "$RUN"/app-*.log "$RUN"/*/action.json` | 全部是 0 |
 
 ## 6. 收尾
 
 ```bash
-ssh ubuntu "kill \$(cat '$W/worker.pid') 2>/dev/null; rm -rf '$W'"
+# 1) 保存 PID 紀錄，使用第 2.3 節的共用 helper；失敗就停止收尾。
+ssh ubuntu "cat '$W/pids/'* 2>/dev/null" > "$RUN/workers-at-cleanup.txt" || true
+stop_run_workers || { echo "worker 清理失敗，保留本輪目錄" >&2; exit 1; }
+
+# 2) S11 的備份若還在（S11 做到一半中斷）：先還原成 snip。
+ssh ubuntu "if [ -e ~/.local/bin/snip.uirun-$SHA ] && [ ! -e ~/.local/bin/snip ]; then mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip; fi"
+
+# 3) 只刪本輪放的 wrapper：hash 與安裝時記下的一致才刪（不一致代表
+#    期間被換過，保留不刪）；懸空 symlink 也先清掉。
+want=$(cut -d' ' -f1 "$RUN/snip-installed.sha")
+got=$(ssh ubuntu 'sha256sum ~/.local/bin/snip 2>/dev/null' | cut -d' ' -f1)
+if [ -n "$got" ] && [ "$got" = "$want" ]; then
+  ssh ubuntu 'rm -f ~/.local/bin/snip'
+else
+  echo "~/.local/bin/snip 已非本輪安裝的 wrapper，保留不刪" >&2
+fi
+ssh ubuntu "rm -f ~/.local/bin/snip.uirun-$SHA"
+
+# 4) 本輪目錄。
+ssh ubuntu "rm -rf '$W'"
 ```
 
-只刪 `$W`。只停本輪的 worker，不要停使用者的 `snip-worker.service` / `com.audichuang.snip-worker`（47821 埠）。不要動 `~/research/rtk`，也不要動 Ubuntu 上 linuxbrew 的 `snip`。Mac 上的 `$RUN` 保留，裡面是證據。
+只刪 `$W`（含 `pids/` 與 `paste-hold`）、本輪放的 `~/.local/bin/snip`
+wrapper（hash 一致才刪）與本輪備份名 `~/.local/bin/snip.uirun-$SHA`。
+`snip.away` 或使用者自己的任何備份、`~/research/rtk`、linuxbrew 的
+`snip`、`snip-worker.service`、`~/.ssh/config` 都不動。Mac 上的
+`$RUN` 保留，裡面是證據。
 
 ## 7. 計分
 
-`scorecard.md` 列出 R01–R45、R32b、G01–G12、C01–C04、I01–I03，每格一個判定，並附證據路徑。
+`scorecard.md` 列出 S01–S12、R01–R08、E01–E12、B01–B07、G01–G10、X01–X10、P01–P12、N01–N02、L01–L05、C01–C04、I01–I04，每格一個判定，並附證據路徑。
 
-- **閘門**：第 0 步閘門通過，而且 R01–R45、R32b、G01–G12、C01–C04、I01–I03 全部是 `pass`，才寫「遠端節點真實 UI 閘門關閉」。
-- 有任何 `ui-defect`、`fail` 或 `not-run`，第一句就寫「遠端節點真實 UI 閘門打開」，並列出那些 ID。
-- I01 或 I02 不是 `pass`，整輪結果作廢：這一輪動到了真實資料，先報告，再處理其他格子。
-- R27 的預期允許多種畫面。判 `pass` 時，證據欄要寫實際看到的是哪一種，下一輪才能收緊。
+- **閘門**：第 0 步閘門通過，而且上面全部是 `pass`，才寫「遠端工作區真實 UI 閘門關閉」。
+- 有任何 `ui-defect`、`fail` 或 `not-run`，第一句就寫「遠端工作區真實 UI 閘門打開」，並列出那些 ID。
+- I01、I02 或 I03 不是 `pass`，整輪結果作廢：這一輪動到了真實資料，先報告，再處理其他格子。
 
-處理結果時，每個不是 `pass` 的格子先分清楚是哪一種錯，再動手。三種的修法不同，混在一起會修錯地方：
+每個不是 `pass` 的格子先分清楚是哪一種錯，再動手：
 
-- **規程錯**：通過線和產品的設計不符，例如要求一個不會出現的日誌 tag、把刻意隱藏的 `.git` 當成必須列出、量測步驟自己弄髒了受測資料。修這份規程；產品不動。
-- **工具做不到**：操作者的工具到不了驗證點，例如捲動或拖曳視窗沒有作用。該格維持 `not-run`；在規程寫下已驗證可行的做法，或換工具。產品不動。
+- **規程錯**：通過線和產品的設計不符。修這份規程；產品不動。
+- **工具做不到**：操作者的工具到不了驗證點。該格維持 `not-run`；在規程寫下已驗證可行的做法，或換工具。
 - **產品缺陷**：從截圖和日誌確認後，先寫一個會失敗的測試，再修產品；需要的話，規程也補上對應的通過線。

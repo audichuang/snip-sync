@@ -175,3 +175,60 @@ fn a_folder_symlink_inside_the_share_lists_as_a_folder() {
 		ErrorCode::Forbidden
 	);
 }
+
+/// The whole listing arrives in ONE reply: every entry exactly once, in
+/// sorted order, folders first, with no continuation to ask for.
+#[test]
+fn a_whole_listing_arrives_once_sorted() {
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("many");
+	fs::create_dir_all(real.join("many/z-dir")).unwrap();
+	for i in 0..1199 {
+		fs::write(real.join("many").join(format!("f{i:04}")), "").unwrap();
+	}
+	fs::write(real.join("many/z-dir/inner"), "").unwrap();
+	let w = worker();
+	let client = Client::new(RemoteHost::in_process(w.clone()), "mac".into());
+	let ws = client
+		.open_workspace(&real.display().to_string())
+		.unwrap()
+		.id;
+
+	let (entries, truncated) = client.list_dir(&ws, "many").unwrap();
+	assert!(!truncated, "1200 entries are under the cap");
+	assert_eq!(entries.len(), 1200, "every entry arrives");
+	let mut sorted: Vec<String> =
+		entries.iter().map(|e| e.name.clone()).collect();
+	sorted.sort();
+	sorted.dedup();
+	assert_eq!(sorted.len(), 1200, "no duplicates");
+	// The reply is the sorted order itself, folders first.
+	assert!(entries.first().is_some_and(|e| e.name == "z-dir"));
+	assert!(entries.iter().any(|e| e.name == "f0000"));
+	assert!(entries.last().is_some_and(|e| e.name == "f1198"));
+}
+
+/// A listing over the cap is ONE truncated reply: the master asks for
+/// nothing more, because there is no continuation.
+#[test]
+fn a_listing_over_the_cap_reports_truncated_with_no_continuation() {
+	let tmp = tempfile::tempdir().unwrap();
+	let real = tmp.path().join("big");
+	fs::create_dir_all(&real).unwrap();
+	for i in 0..50 {
+		fs::write(real.join(format!("f{i:03}")), "").unwrap();
+	}
+	let w = worker();
+	w.set_dir_cap_for_tests(20);
+	let client = Client::new(RemoteHost::in_process(w.clone()), "mac".into());
+	let ws = client
+		.open_workspace(&real.display().to_string())
+		.unwrap()
+		.id;
+
+	let (entries, truncated) = client.list_dir(&ws, "").unwrap();
+	assert!(truncated);
+	assert_eq!(entries.len(), 20, "exactly the cap, in sorted order");
+	assert_eq!(entries[0].name, "f000");
+	assert_eq!(entries[19].name, "f019");
+}

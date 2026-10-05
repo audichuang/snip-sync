@@ -42,6 +42,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   使用者寫原始 regex 時很少碰到;真的出現分歧再逐項轉譯。
 - git 來源(graph:commit / 區間)被過濾規則排除的**刪除檔**不會進 payload。TS graphCopy 會先放刪除檔再過濾,
   會把被排除的檔案(例如 `secrets.env`)的舊內容帶出去;Rust 刻意不照做。
+- 所有覆寫寫入(貼上與 commit 重播的 `fsutil::write_text_file`)以「同資料夾暫存檔 + rename」**取代目錄項目**,不是像 TS 一樣原地截斷:hard link 的另一個名字、symlink 指向的檔案永遠不會被寫穿(`.git/config`、工作區外檔案),且行為在 macOS / Linux / Windows 一致,不讀 link count(NTFS 硬連結同樣被涵蓋)。代價是覆寫會拆掉目標上的 symlink(以一般檔案取代連結本身);寫入後目標是新的 inode。刪除不受影響(unlink 只拆本目錄項)。(早期的 link-count 守門已移除:它 Unix only,Windows 上完全不設防。)這是安全差異,刻意與 TS 不同。
 - commit 模式重播時,路徑逐一放在 `git add` / `git commit` 的參數上。Windows 命令列約 32K 字元上限,
   一個 commit 動到數千個檔案時會失敗;需要時改用 `--pathspec-from-file=- --pathspec-file-nul`。
 - commit 模式不帶檔案 mode(`CommitFile` 沒有 mode 欄位;剪貼簿格式由 ClipCodeVSCode 擁有,不在這裡改):
@@ -225,6 +226,6 @@ CLI 與 App 共用 `snip-core` 的 `clip` 模組,底層用 [`arboard`](https://c
 - **超大 refs 上限**：遠端 served git 的 stdout 上限為 `SERVED_MAX_STDOUT = 4 MiB`。tag 與 ref 極多（超過約 4 MiB）的 repo 在遠端會回報「遠端參照資料過大」（`remote_refs_too_large`）錯誤，不提供遠端顯示（本機可看）。
 - **`UserEmail` 查詢**：透過型別化 RPC 回傳 worker 上的 `user.email`（含全域設定）給已配對的 master。
 - **掃描常數與續掃限制**：worker 掃描 repo 限制深度 8、最多 256 個 repo、單一 75 秒期限（`SCAN_DEADLINE`），走訪上限 200,000 次。掃描狀態 `More`、`TimedOut`、`LimitReached`、`Incomplete` 一律對映至「未完成」（`remote_scan_incomplete`）。遠端續掃僅支援 depth-limited 資料夾，逾時或達到數量上限時無法從游標續掃，需以重新整理（Refresh）重新掃描。
-- **選單與寫入守門**：遠端模式下右鍵選單的 repo 與檔案列只提供複製 worker 上的路徑（`copy-worker-path`），不提供本機 reveal（在 Finder／檔案總管中顯示）；遠端複製、貼上、加入 repo 路徑（`add_repo_path`）均維持拒絕（回報 `remote_unsupported`）。v2 協定連線上 `Request::Write` 與 `Request::Rename` 仍回傳 `Unsupported`。
+- **選單與寫入守門**：遠端模式下右鍵選單的 repo 與檔案列只提供複製 worker 上的路徑（`copy-worker-path`），不提供本機 reveal（在 Finder／檔案總管中顯示）；加入 repo 路徑（`add_repo_path`）維持拒絕（回報 `remote_unsupported`）；複製（協定 3）與貼上（協定 4）由 worker 跑同一套引擎。`Request::Write` 與 `Request::Rename` 仍回傳 `Unsupported`：貼上整份在 worker 規劃與寫入。
 
 

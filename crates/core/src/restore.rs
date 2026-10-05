@@ -13,14 +13,14 @@ use serde::{Deserialize, Serialize};
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
 use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
 use crate::paths::{
-	escapes_all_roots, has_git_segment, resolve_delete_target,
-	resolve_write_target, RejectReason,
+	escapes_all_roots, has_git_segment, lands_in_git_dir,
+	resolve_delete_target, resolve_write_target, RejectReason,
 };
 
 /// One file from the payload; `parse_clipboard` produces these.
 pub type RestoreEntry = ParsedEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateOperation {
 	pub relative_path: String,
@@ -31,14 +31,14 @@ pub struct CreateOperation {
 	pub root_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteOperation {
 	pub relative_path: String,
 	pub absolute_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SkipReason {
 	AlreadyAbsent,
@@ -63,7 +63,7 @@ impl SkipReason {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkippedOperation {
 	pub raw_path: String,
@@ -71,7 +71,7 @@ pub struct SkippedOperation {
 	pub reason: SkipReason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestorePlan {
 	/// Every root the plan was validated against; re-checked before writes.
@@ -119,7 +119,7 @@ impl RestorePlan {
 /// What the user confirmed. Unchecked operations are indices into the
 /// plan's `create_operations` / `delete_operations`; they are not run and
 /// not counted.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreSelection {
 	pub overwrite_existing: bool,
 	pub skip_existing: bool,
@@ -127,7 +127,7 @@ pub struct RestoreSelection {
 	pub unchecked_deletes: BTreeSet<usize>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreExecutionResult {
 	pub created_count: usize,
@@ -163,6 +163,10 @@ pub fn plan_restore<P: AsRef<Path>>(
 
 		if entry.change_types.contains(&ChangeType::Deleted) {
 			match resolve_delete_target(roots, &entry.path) {
+				Ok(t) if lands_in_git_dir(&t.absolute_path) => {
+					plan.skipped_operations
+						.push(skip(None, SkipReason::UnresolvedPath));
+				}
 				Ok(t) => plan.delete_operations.push(DeleteOperation {
 					relative_path: t.relative_path,
 					absolute_path: t.absolute_path,
@@ -207,7 +211,11 @@ pub fn plan_restore<P: AsRef<Path>>(
 			}
 		};
 
-		if has_git_segment(&t.relative_path) {
+		// Also through a symlink, or into a destination that is itself a
+		// Git directory.
+		if has_git_segment(&t.relative_path)
+			|| lands_in_git_dir(&t.absolute_path)
+		{
 			plan.skipped_operations
 				.push(skip(None, SkipReason::UnresolvedPath));
 			continue;
@@ -254,6 +262,17 @@ pub fn execute_restore_plan(
 	plan: &RestorePlan,
 	selection: &RestoreSelection,
 ) -> RestoreExecutionResult {
+	execute_restore_plan_observed(plan, selection, &mut |_, _| {})
+}
+
+/// [`execute_restore_plan`] with a sink that observes every file as soon
+/// as its write committed (created or overwritten; a skipped row wrote
+/// nothing): a remote worker's e2e paste-hold keys on the first.
+pub fn execute_restore_plan_observed(
+	plan: &RestorePlan,
+	selection: &RestoreSelection,
+	after_write: &mut dyn FnMut(&CreateOperation, &CreateOutcome),
+) -> RestoreExecutionResult {
 	let mut result = RestoreExecutionResult::default();
 
 	for (i, op) in plan.create_operations.iter().enumerate() {
@@ -262,8 +281,16 @@ pub fn execute_restore_plan(
 		}
 		// The plan's FULL root set, not only the op's own root.
 		match run_create(&plan.roots, selection, op) {
-			Ok(CreateOutcome::Created) => result.created_count += 1,
-			Ok(CreateOutcome::Overwritten) => result.overwritten_count += 1,
+			Ok(
+				outcome @ (CreateOutcome::Created | CreateOutcome::Overwritten),
+			) => {
+				match outcome {
+					CreateOutcome::Created => result.created_count += 1,
+					CreateOutcome::Overwritten => result.overwritten_count += 1,
+					CreateOutcome::Skipped => unreachable!(),
+				}
+				after_write(op, &outcome);
+			}
 			Ok(CreateOutcome::Skipped) => result.skipped_existing_count += 1,
 			Err(message) => result.errors.push(message),
 		}
@@ -277,6 +304,7 @@ pub fn execute_restore_plan(
 		// contained target into one outside the workspace.
 		if escapes_all_roots(&plan.roots, &op.absolute_path)
 			|| has_git_segment(&op.relative_path)
+			|| lands_in_git_dir(&op.absolute_path)
 		{
 			result
 				.errors
@@ -296,7 +324,8 @@ pub fn execute_restore_plan(
 	result
 }
 
-enum CreateOutcome {
+/// What one create operation ended in. A skipped row wrote nothing.
+pub enum CreateOutcome {
 	Created,
 	Overwritten,
 	Skipped,
@@ -309,6 +338,7 @@ fn run_create(
 ) -> Result<CreateOutcome, String> {
 	if escapes_all_roots(roots, &op.absolute_path)
 		|| has_git_segment(&op.relative_path)
+		|| lands_in_git_dir(&op.absolute_path)
 	{
 		return Err(format!("{}: unsafe path", op.relative_path));
 	}
@@ -320,6 +350,8 @@ fn run_create(
 		Ok(_) if selection.skip_existing || !selection.overwrite_existing => {
 			return Ok(CreateOutcome::Skipped)
 		}
+		// A hard link that appeared after the preview needs no check of its
+		// own: the write replaces this entry, never the shared file.
 		Ok(_) => CreateOutcome::Overwritten,
 		Err(_) => CreateOutcome::Created,
 	};
@@ -358,7 +390,7 @@ pub enum RestoreBase {
 	Add { prefix: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestoreBaseSuggestion {
 	pub base: RestoreBase,
@@ -676,6 +708,124 @@ mod tests {
 		for (i, (_, rel)) in paths.iter().enumerate() {
 			assert_eq!(read(root.join(rel)), format!("content-{i}"));
 		}
+	}
+
+	/// A Git directory's shape: what `paths::is_git_dir` recognises.
+	fn fake_git_dir(dir: &Path) {
+		fs::create_dir_all(dir.join("objects")).unwrap();
+		fs::create_dir_all(dir.join("refs")).unwrap();
+		fs::create_dir_all(dir.join("hooks")).unwrap();
+		fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+	}
+
+	#[test]
+	fn a_destination_that_is_a_git_directory_skips_every_entry() {
+		let (_d, root) = tmp();
+		let bare = root.join("bare.git");
+		fake_git_dir(&bare);
+		let entries = [entry("hooks/pre-commit", "x"), entry("config", "y")];
+		let plan = plan_restore(&[&bare], &entries);
+		assert!(plan.create_operations.is_empty());
+		assert_eq!(plan.skipped_operations.len(), 2);
+		assert!(plan
+			.skipped_operations
+			.iter()
+			.all(|s| s.reason == SkipReason::UnresolvedPath));
+		assert!(!bare.join("hooks/pre-commit").exists());
+	}
+
+	/// A folder symlink inside the destination that leads into `.git`: the
+	/// entry's path has no `.git` segment, but its write would land there.
+	/// That entry is a skipped row; the others are written.
+	#[cfg(unix)]
+	#[test]
+	fn an_entry_reaching_git_through_a_symlink_is_skipped_and_the_rest_written()
+	{
+		let (_d, root) = tmp();
+		fake_git_dir(&root.join(".git"));
+		std::os::unix::fs::symlink(root.join(".git"), root.join("gitlink"))
+			.unwrap();
+		fs::write(root.join("gitlink/config"), "[core]\n").unwrap();
+		let entries = [
+			entry("gitlink/hooks/pre-commit", "owned"),
+			deleted("gitlink/config"),
+			entry("ok.txt", "fine"),
+		];
+		let plan = plan_restore(&[&root], &entries);
+		assert_eq!(rels(&plan), ["ok.txt"]);
+		assert!(plan.delete_operations.is_empty());
+		assert_eq!(plan.skipped_operations.len(), 2);
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert_eq!(result.created_count, 1);
+		assert!(!root.join(".git/hooks/pre-commit").exists());
+		assert!(root.join(".git/config").exists());
+	}
+
+	/// A folder that turns into a symlink to `.git` after the preview: the
+	/// write is refused as unsafe, and the other files still land.
+	#[cfg(unix)]
+	#[test]
+	fn a_symlink_into_git_appearing_after_the_plan_refuses_only_that_write() {
+		let (_d, root) = tmp();
+		fake_git_dir(&root.join(".git"));
+		fs::create_dir(root.join("sub")).unwrap();
+		let entries = [entry("sub/pre-commit", "owned"), entry("ok.txt", "x")];
+		let plan = plan_restore(&[&root], &entries);
+		assert_eq!(rels(&plan), ["sub/pre-commit", "ok.txt"]);
+		fs::remove_dir(root.join("sub")).unwrap();
+		std::os::unix::fs::symlink(root.join(".git/hooks"), root.join("sub"))
+			.unwrap();
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert_eq!(result.created_count, 1);
+		assert_eq!(result.errors, ["sub/pre-commit: unsafe path"]);
+		assert!(!root.join(".git/hooks/pre-commit").exists());
+		assert_eq!(read(root.join("ok.txt")), "x");
+	}
+
+	/// A hard link inside the destination sharing its inode with a Git
+	/// directory's file: the overwrite REPLACES the alias's directory entry,
+	/// so `.git/config` keeps its bytes and the alias path ends up a
+	/// regular file holding the pasted content. Same behaviour on every
+	/// OS — nothing reads a link count.
+	#[cfg(unix)]
+	#[test]
+	fn an_overwrite_of_a_hard_link_alias_of_git_metadata_writes_a_new_file() {
+		let (_d, root) = tmp();
+		fake_git_dir(&root.join(".git"));
+		fs::write(root.join(".git/config"), "[core]\n").unwrap();
+		fs::hard_link(root.join(".git/config"), root.join("config-alias.txt"))
+			.unwrap();
+		let entries =
+			[entry("config-alias.txt", "owned"), entry("ok.txt", "x")];
+		let plan = plan_restore(&[&root], &entries);
+		assert_eq!(rels(&plan), ["config-alias.txt", "ok.txt"]);
+		assert!(plan.skipped_operations.is_empty());
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert!(result.errors.is_empty());
+		assert_eq!(result.created_count, 1);
+		assert_eq!(result.overwritten_count, 1);
+		assert_eq!(read(root.join(".git/config")), "[core]\n");
+		assert_eq!(read(root.join("config-alias.txt")), "owned");
+		assert_eq!(read(root.join("ok.txt")), "x");
+	}
+
+	/// The same alias trick against a file outside the destination's roots:
+	/// the entry is replaced here, the outside name keeps its bytes.
+	#[cfg(unix)]
+	#[test]
+	fn an_overwrite_of_a_hard_link_alias_outside_the_roots_writes_a_new_file() {
+		let (_d, root) = tmp();
+		let outside_dir = tempfile::tempdir().unwrap();
+		let outside = outside_dir.path().join("precious.txt");
+		fs::write(&outside, "keep\n").unwrap();
+		fs::hard_link(&outside, root.join("alias.txt")).unwrap();
+		let plan = plan_restore(&[&root], &[entry("alias.txt", "owned")]);
+		assert_eq!(rels(&plan), ["alias.txt"]);
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert!(result.errors.is_empty());
+		assert_eq!(result.overwritten_count, 1);
+		assert_eq!(fs::read_to_string(&outside).unwrap(), "keep\n");
+		assert_eq!(read(root.join("alias.txt")), "owned");
 	}
 
 	#[test]

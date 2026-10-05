@@ -6,7 +6,8 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -24,9 +25,10 @@ use snip_core::commits::CommitCopyOutcome;
 use snip_core::transfer::CopyOutcome;
 
 use crate::proto::{
-	read_frame, write_frame, DirEntry, ErrorCode, ExportTarget, GitQuery,
-	GitReply, RemoteWorkspace, RepoScan, Request, Response, Stat,
-	GIT_CALL_LIMIT, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
+	read_frame, write_request_for, DirEntry, ErrorCode, ExportTarget, GitQuery,
+	GitReply, ImportExpect, ImportPlanned, PasteMapping, RemoteWorkspace,
+	ReplayExpect, RepoScan, Request, Response, Stat, GIT_CALL_LIMIT,
+	JOINED_MAX, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::worker::{Worker, PREAMBLE};
 use crate::RemoteError;
@@ -44,7 +46,17 @@ const MAX_BANNER: usize = 64 * 1024;
 const MAX_STDERR: usize = 8 * 1024;
 /// Idle connections kept per worker: each is an ssh process.
 const POOL: usize = 2;
+/// Frames buffered between the worker's stdout and the caller. During a
+/// call a full queue BLOCKS the pump on `send` — backpressure, so a reply
+/// larger than the queue still reaches a slow consumer whole. While the
+/// connection sits idle the queue plus one blocking `send` bound what a
+/// speaking worker can make the master retain: [`FRAME_QUEUE`] × 8 MiB.
+const FRAME_QUEUE: usize = 16;
 pub const CALL_LIMIT_DEFAULT: Duration = Duration::from_secs(30);
+/// A paste Apply: longer than the worker's own deadline for it, so the
+/// master always hears how the write ended.
+pub const APPLY_CALL_LIMIT: Duration =
+	Duration::from_secs(crate::jobs::APPLY_DEADLINE.as_secs() + 60);
 
 /// How a master reaches a worker.
 #[derive(Clone)]
@@ -108,7 +120,6 @@ impl RemoteHost {
 
 /// One frame in either direction, with a read deadline.
 pub(crate) trait FrameIo {
-	fn send(&mut self, request: &Request) -> io::Result<()>;
 	fn recv(
 		&mut self,
 		timeout: Duration,
@@ -117,10 +128,6 @@ pub(crate) trait FrameIo {
 
 /// A plain stream has no deadline; tests feed one frames from memory.
 impl<S: IoRead + IoWrite> FrameIo for S {
-	fn send(&mut self, request: &Request) -> io::Result<()> {
-		write_frame(self, request)
-	}
-
 	fn recv(&mut self, _: Duration) -> Result<Option<Response>, RemoteError> {
 		Ok(read_frame::<Response>(self)?)
 	}
@@ -140,6 +147,14 @@ pub struct Connection {
 	/// A read timed out or failed: the stream may be mid-frame.
 	broken: bool,
 	pub(crate) frames_seen: usize,
+	/// Frames queued and not yet consumed, shared with the read thread.
+	/// Above zero while idle, the worker is speaking without a request.
+	retained: Arc<AtomicUsize>,
+	/// True while this connection's master is inside an exchange (request
+	/// sent, its answer not fully consumed): frames may arrive, and the
+	/// pump applies backpressure instead of hanging up. Shared with the
+	/// read thread.
+	in_flight: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -148,14 +163,16 @@ impl Connection {
 		transport: &Transport,
 		my_name: &str,
 	) -> Result<Self, RemoteError> {
-		let (writer, frames, child, stderr) = match transport {
-			Transport::Command(argv) => spawn(argv)?,
-			Transport::InProcess(worker) => {
-				let (req_w, res_r) = worker.connect_in_process()?;
-				let writer: Box<dyn IoWrite + Send> = Box::new(req_w);
-				(writer, read_frames(res_r), None, Arc::default())
-			}
-		};
+		let (writer, frames, child, stderr, retained, in_flight) =
+			match transport {
+				Transport::Command(argv) => spawn(argv)?,
+				Transport::InProcess(worker) => {
+					let (req_w, res_r) = worker.connect_in_process()?;
+					let writer: Box<dyn IoWrite + Send> = Box::new(req_w);
+					let (frames, retained, in_flight) = read_frames(res_r);
+					(writer, frames, None, Arc::default(), retained, in_flight)
+				}
+			};
 		let mut conn = Self {
 			writer,
 			frames,
@@ -166,16 +183,21 @@ impl Connection {
 			version: 1,
 			broken: false,
 			frames_seen: 0,
+			retained,
+			in_flight,
 		};
 		let hello = Request::Hello {
 			version: PROTOCOL_VERSION,
 			name: my_name.to_string(),
 			max_version: Some(PROTOCOL_MAX),
 		};
+		// The hello exchange is a call: its reply may arrive before the
+		// master waits for it, so the pump must see it as in flight.
+		conn.in_flight.store(true, Ordering::SeqCst);
 		let reply = conn
-			.send(&hello)
-			.map_err(RemoteError::from)
+			.send_guarded(&hello, None, Instant::now() + CONNECT_TIMEOUT)
 			.and_then(|()| conn.recv(CONNECT_TIMEOUT));
+		conn.in_flight.store(false, Ordering::SeqCst);
 		match reply {
 			Ok(Some(Response::Hello {
 				name,
@@ -251,33 +273,119 @@ impl Connection {
 		self.frames_seen
 	}
 
+	/// Frames the worker sent that no call has consumed: above zero while
+	/// the connection sits idle, it spoke without a request.
+	fn unsolicited_frames(&self) -> usize {
+		self.retained.load(Ordering::Relaxed)
+	}
+
 	pub fn call(
 		&mut self,
 		request: &Request,
 		cancel: Option<&CancelToken>,
 		limit: Duration,
 	) -> Result<Response, RemoteError> {
+		// The whole call holds to one absolute deadline: the send included,
+		// not only the wait for the answer.
+		let deadline = Instant::now() + limit;
 		let mut frames = 0;
-		let res = exchange(self, request, cancel, limit, &mut frames);
+		self.in_flight.store(true, Ordering::SeqCst);
+		let res = self
+			.send_guarded(request, cancel, deadline)
+			.and_then(|()| exchange(self, cancel, deadline, &mut frames));
+		self.in_flight.store(false, Ordering::SeqCst);
 		self.frames_seen = frames;
 		if res.is_err() && !matches!(res, Err(RemoteError::Refused { .. })) {
 			self.broken = true;
 		}
 		res
 	}
+
+	/// Writes `request` under the call's absolute deadline. The write runs
+	/// on its own thread: a `ChildStdin` whose worker stopped reading
+	/// blocks without end, and only the transport's death unblocks it, so
+	/// on the deadline (or a cancel) the process is killed and the call
+	/// fails in time. The writer is abandoned with the thread when it
+	/// cannot come back; the connection is broken either way.
+	fn send_guarded(
+		&mut self,
+		request: &Request,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<(), RemoteError> {
+		let version = self.version;
+		let mut writer =
+			std::mem::replace(&mut self.writer, Box::new(DeadWriter));
+		let request = request.clone();
+		let (done_tx, done_rx) = mpsc::channel();
+		let _ = std::thread::Builder::new()
+			.name("snip-remote-write".into())
+			.spawn(move || {
+				let result = write_request_for(&mut writer, &request, version);
+				let _ = done_tx.send((writer, result));
+			});
+		loop {
+			match done_rx.recv_timeout(Duration::from_millis(20)) {
+				Ok((writer, result)) => {
+					self.writer = writer;
+					return result.map_err(RemoteError::from);
+				}
+				Err(RecvTimeoutError::Disconnected) => {
+					return Err(RemoteError::Protocol(
+						"the send thread died".into(),
+					));
+				}
+				Err(RecvTimeoutError::Timeout) => {}
+			}
+			if Instant::now() >= deadline {
+				self.kill_transport();
+				return Err(RemoteError::TimedOut);
+			}
+			if cancel.is_some_and(|c| c.is_cancelled()) {
+				self.kill_transport();
+				return Err(RemoteError::Cancelled);
+			}
+		}
+	}
+
+	/// Kills the transport process, closing the pipes a stuck write or
+	/// read is parked on. Without a process (an in-process worker) there
+	/// is nothing to kill; its stuck writer thread is simply abandoned.
+	fn kill_transport(&mut self) {
+		if let Some(child) = self.child.as_mut() {
+			let _ = child.kill();
+			let _ = child.wait();
+		}
+	}
+}
+
+/// Placeholder for a writer that is in flight, or was abandoned with the
+/// thread that blocked writing it.
+struct DeadWriter;
+
+impl io::Write for DeadWriter {
+	fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+		Err(io::Error::new(
+			io::ErrorKind::BrokenPipe,
+			"the transport's writer was abandoned",
+		))
+	}
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
 }
 
 impl FrameIo for Connection {
-	fn send(&mut self, request: &Request) -> io::Result<()> {
-		write_frame(&mut self.writer, request)
-	}
-
 	fn recv(
 		&mut self,
 		timeout: Duration,
 	) -> Result<Option<Response>, RemoteError> {
 		match self.frames.recv_timeout(timeout) {
-			Ok(frame) => Ok(frame?),
+			Ok(frame) => {
+				// The frame left the queue; the pump may read on.
+				self.retained.fetch_sub(1, Ordering::Relaxed);
+				Ok(frame?)
+			}
 			Err(RecvTimeoutError::Timeout) => Err(RemoteError::TimedOut),
 			Err(RecvTimeoutError::Disconnected) => Ok(None),
 		}
@@ -314,12 +422,15 @@ pub(crate) fn start_message(code: Option<i32>, stderr: &str) -> String {
 }
 
 /// A started worker: where to write requests, the frames it answers, the
-/// process to stop, and what it said on stderr.
+/// process to stop, what it said on stderr, its retained-frame counter, and
+/// the in-flight flag shared with the read thread.
 type Started = (
 	Box<dyn IoWrite + Send>,
 	Frames,
 	Option<Child>,
 	Arc<Mutex<Vec<u8>>>,
+	Arc<AtomicUsize>,
+	Arc<AtomicBool>,
 );
 
 fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
@@ -359,7 +470,11 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 			}
 		})?;
 	let mut stdout = BufReader::new(stdout);
-	let (tx, rx) = mpsc::channel();
+	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+	let retained = Arc::new(AtomicUsize::new(0));
+	let in_flight = Arc::new(AtomicBool::new(false));
+	let pump_retained = Arc::clone(&retained);
+	let pump_in_flight = Arc::clone(&in_flight);
 	std::thread::Builder::new()
 		.name("snip-remote-read".into())
 		.spawn(move || {
@@ -367,10 +482,10 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 				let _ = tx.send(Err(err));
 				return;
 			}
-			pump_frames(stdout, tx);
+			pump_frames(stdout, tx, pump_retained, pump_in_flight);
 		})?;
 	let writer: Box<dyn IoWrite + Send> = Box::new(stdin);
-	Ok((writer, rx, Some(child), stderr))
+	Ok((writer, rx, Some(child), stderr, retained, in_flight))
 }
 
 /// Reads up to the [`PREAMBLE`] line, skipping what a login shell printed.
@@ -400,77 +515,129 @@ pub(crate) fn skip_banner(r: &mut impl BufRead) -> io::Result<()> {
 	}
 }
 
-fn read_frames(r: impl IoRead + Send + 'static) -> Frames {
-	let (tx, rx) = mpsc::channel();
-	std::thread::spawn(move || pump_frames(r, tx));
-	rx
+fn read_frames(
+	r: impl IoRead + Send + 'static,
+) -> (Frames, Arc<AtomicUsize>, Arc<AtomicBool>) {
+	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+	let retained = Arc::new(AtomicUsize::new(0));
+	let in_flight = Arc::new(AtomicBool::new(false));
+	let pump_retained = Arc::clone(&retained);
+	let pump_in_flight = Arc::clone(&in_flight);
+	std::thread::spawn(move || {
+		pump_frames(r, tx, pump_retained, pump_in_flight)
+	});
+	(rx, retained, in_flight)
 }
 
+/// Reads frames until the worker stops or the consumer does. A frame that
+/// ARRIVES while an exchange is [`in_flight`] may be part of its answer:
+/// the blocking `send` is the backpressure that carries a reply larger
+/// than the queue to a slow consumer. A frame that arrives while no call
+/// is running is out of step with the protocol — it is queued (accounted
+/// in `retained`, so the pooled connection is never reused) and the pump
+/// hangs up, which bounds what an unsolicited worker can make the master
+/// retain. Dropping the receiver ends a pump parked in `send`.
 fn pump_frames(
 	mut r: impl IoRead,
-	tx: mpsc::Sender<io::Result<Option<Response>>>,
+	tx: SyncSender<io::Result<Option<Response>>>,
+	retained: Arc<AtomicUsize>,
+	in_flight: Arc<AtomicBool>,
 ) {
 	loop {
 		let frame = read_frame::<Response>(&mut r);
 		let end = !matches!(frame, Ok(Some(_)));
-		if tx.send(frame).is_err() || end {
+		// Read BEFORE send: the consumer cannot finish the call this frame
+		// belongs to before it is delivered, so a reply's last frame is
+		// never mistaken for an unsolicited one.
+		let unsolicited = !in_flight.load(Ordering::SeqCst);
+		retained.fetch_add(1, Ordering::Relaxed);
+		if tx.send(frame).is_err() {
+			retained.fetch_sub(1, Ordering::Relaxed);
+			return;
+		}
+		if end || unsolicited {
 			return;
 		}
 	}
 }
 
-/// Sends `request` and waits for its answer, skipping heartbeats.
+/// Waits for `request`'s answer, skipping heartbeats. Every frame — chunk
+/// frames included — holds to the absolute `deadline`, so a worker cannot
+/// stretch one call by dripping frames. The request itself was sent by
+/// [`Connection::send_guarded`] under the same deadline.
 pub(crate) fn exchange(
 	io: &mut impl FrameIo,
-	request: &Request,
 	cancel: Option<&CancelToken>,
-	limit: Duration,
+	deadline: Instant,
 	frames: &mut usize,
 ) -> Result<Response, RemoteError> {
 	*frames = 0;
-	io.send(request)?;
-	let started = Instant::now();
-	// A copy's text arriving ahead of its reply.
+	// A copy's text, or a large reply's JSON, arriving ahead of it.
 	let mut text = String::new();
+	let over_clipboard = |text: &str| {
+		(text.len() > snip_core::transfer::CLIPBOARD_PAYLOAD_MAX).then(|| {
+			RemoteError::Protocol(
+				"the copied text is over the clipboard limit".into(),
+			)
+		})
+	};
 	loop {
 		match io.recv(IO_TIMEOUT)? {
-			Some(Response::Chunk { data }) => {
-				*frames += 1;
-				if text.len() + data.len()
-					> snip_core::transfer::CLIPBOARD_PAYLOAD_MAX
-				{
-					return Err(RemoteError::Protocol(
-						"the copied text is over the clipboard limit".into(),
-					));
-				}
-				text.push_str(&data);
-			}
-			Some(Response::Copied(mut out)) if !text.is_empty() => {
-				*frames += 1;
-				out.payload = text;
-				return Ok(Response::Copied(out));
-			}
-			Some(Response::CommitsCopied(mut out)) if !text.is_empty() => {
-				*frames += 1;
-				out.text = text;
-				return Ok(Response::CommitsCopied(out));
-			}
-			Some(Response::Pending) => {
-				*frames += 1;
-				if cancel.is_some_and(|c| c.is_cancelled()) {
-					return Err(RemoteError::Cancelled);
-				}
-				if started.elapsed() >= limit {
-					return Err(RemoteError::TimedOut);
-				}
-			}
-			Some(Response::Error { code, message }) => {
-				*frames += 1;
-				return Err(RemoteError::Refused { code, message });
-			}
 			Some(response) => {
 				*frames += 1;
-				return Ok(response);
+				if Instant::now() >= deadline {
+					return Err(RemoteError::TimedOut);
+				}
+				match response {
+					Response::Chunk { data } => {
+						if text.len() + data.len() > JOINED_MAX {
+							return Err(RemoteError::Protocol(
+								"the worker's reply is too large".into(),
+							));
+						}
+						text.push_str(&data);
+					}
+					Response::Joined => {
+						return match serde_json::from_str::<Response>(&text) {
+							Ok(Response::Error { code, message }) => {
+								Err(RemoteError::Refused { code, message })
+							}
+							Ok(
+								Response::Chunk { .. }
+								| Response::Joined
+								| Response::Pending,
+							)
+							| Err(_) => Err(RemoteError::Protocol(
+								"the worker's chunked reply is not valid"
+									.into(),
+							)),
+							Ok(response) => Ok(response),
+						};
+					}
+					Response::Copied(mut out) if !text.is_empty() => {
+						if let Some(err) = over_clipboard(&text) {
+							return Err(err);
+						}
+						out.payload = text;
+						return Ok(Response::Copied(out));
+					}
+					Response::CommitsCopied(mut out) if !text.is_empty() => {
+						if let Some(err) = over_clipboard(&text) {
+							return Err(err);
+						}
+						out.text = text;
+						return Ok(Response::CommitsCopied(out));
+					}
+					Response::Pending => {
+						if cancel.is_some_and(|c| c.is_cancelled()) {
+							return Err(RemoteError::Cancelled);
+						}
+					}
+					Response::Error { code, message } => {
+						return Err(RemoteError::Refused { code, message });
+					}
+					response => return Ok(response),
+				}
 			}
 			None => {
 				return Err(RemoteError::Io(io::Error::new(
@@ -625,6 +792,19 @@ impl Client {
 				| Request::GitView { .. }
 				| Request::Export { .. }
 				| Request::ExportCommits { .. }
+				| Request::ImportPlan { .. }
+				| Request::ImportApply { .. }
+				| Request::ReplayPlan { .. }
+				| Request::ReplayApply { .. }
+		);
+		// A write is never sent twice, even when the first send seemed lost.
+		let writes = matches!(
+			request,
+			Request::ImportApply { .. }
+				| Request::ReplayApply {
+					check_only: false,
+					..
+				}
 		);
 		let _guard = if is_git {
 			Some(self.limiter.acquire(cancel, limit)?)
@@ -648,6 +828,13 @@ impl Client {
 			.unwrap_or_else(PoisonError::into_inner)
 			.pop();
 		let (mut conn, reused) = match pooled {
+			Some(conn) if conn.unsolicited_frames() > 0 => {
+				// The worker spoke while nobody was asking. Whatever the
+				// reason, its stream is out of step with the protocol:
+				// drop the connection (killing its process) and start a
+				// clean one.
+				(self.connect()?, false)
+			}
 			Some(conn) if conn.version() >= need => (conn, true),
 			Some(conn) => return Err(too_old(conn)),
 			None => {
@@ -666,7 +853,7 @@ impl Client {
 		let mut result = conn.call(request, cancel, remaining);
 
 		if let Err(ref err) = result {
-			if should_resend(reused, conn.frames_seen, err) {
+			if !writes && should_resend(reused, conn.frames_seen, err) {
 				let remaining_retry = limit.saturating_sub(start.elapsed());
 				if remaining_retry.is_zero() {
 					return Err(RemoteError::TimedOut);
@@ -706,6 +893,31 @@ impl Client {
 		}
 	}
 
+	/// Copies every change of `source` in `repo` as one snip-sync payload,
+	/// the selection resolved by the worker with the local copy engine's
+	/// own `changed_items`.
+	pub fn export_changes(
+		&self,
+		workspace: &str,
+		repo: &str,
+		source: &snip_core::gitsrc::GitSource,
+		settings: &snip_core::settings::Settings,
+		file_limit: usize,
+		cancel: Option<&CancelToken>,
+	) -> Result<CopyOutcome, RemoteError> {
+		let req = Request::ExportChanges {
+			workspace: workspace.into(),
+			repo: repo.into(),
+			source: source.clone(),
+			settings: settings.clone(),
+			file_limit,
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::Copied(out) => Ok(out),
+			_ => Err(unexpected()),
+		}
+	}
+
 	/// Copies the commits `selected` (ending at `tip`) of `repo`.
 	pub fn export_commits(
 		&self,
@@ -723,6 +935,115 @@ impl Client {
 		};
 		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
 			Response::CommitsCopied(out) => Ok(out),
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Plans pasting the file payload `text` into the folder `dest`
+	/// (relative to the workspace) on the worker. Nothing is written.
+	pub fn import_plan(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		cancel: Option<&CancelToken>,
+	) -> Result<ImportPlanned, RemoteError> {
+		let req = Request::ImportPlan {
+			workspace: workspace.into(),
+			dest: dest.into(),
+			text: text.into(),
+			mapping: mapping.clone(),
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::ImportPlanned(planned) => Ok(planned),
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Writes what [`Self::import_plan`] previewed, as `selection` confirms,
+	/// or refuses ([`ErrorCode::Stale`]) when the destination changed.
+	#[allow(clippy::too_many_arguments)]
+	pub fn import_apply(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		selection: &snip_core::restore::RestoreSelection,
+		expect: &ImportExpect,
+		cancel: Option<&CancelToken>,
+	) -> Result<snip_core::restore::RestoreExecutionResult, RemoteError> {
+		let req = Request::ImportApply {
+			workspace: workspace.into(),
+			dest: dest.into(),
+			text: text.into(),
+			mapping: mapping.clone(),
+			selection: selection.clone(),
+			expect: expect.clone(),
+		};
+		match self.call_with(&req, cancel, APPLY_CALL_LIMIT)? {
+			Response::Imported(result) => Ok(result),
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Plans replaying the commit payload `text` onto the repository at
+	/// `dest`: the preview, put back together with the payload the caller
+	/// already parsed.
+	pub fn replay_plan(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		payload: snip_core::commits::CommitsPayload,
+		cancel: Option<&CancelToken>,
+	) -> Result<snip_core::transfer::CommitReplayPreview, RemoteError> {
+		let req = Request::ReplayPlan {
+			workspace: workspace.into(),
+			dest: dest.into(),
+			text: text.into(),
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::ReplayPlanned(e) => {
+				Ok(snip_core::transfer::CommitReplayPreview::from_parts(
+					e.destination,
+					payload,
+					e.plan,
+					e.freshness,
+				))
+			}
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// Replays what [`Self::replay_plan`] previewed, or refuses
+	/// ([`ErrorCode::Stale`]) when the repository changed. With
+	/// `check_only`, only re-checks and answers `None`.
+	pub fn replay_apply(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		preview: &snip_core::transfer::CommitReplayPreview,
+		check_only: bool,
+		cancel: Option<&CancelToken>,
+	) -> Result<Option<snip_core::commits::ReplayResult>, RemoteError> {
+		let req = Request::ReplayApply {
+			workspace: workspace.into(),
+			dest: dest.into(),
+			text: text.into(),
+			expect: ReplayExpect::of(preview),
+			check_only,
+		};
+		let limit = if check_only {
+			GIT_CALL_LIMIT
+		} else {
+			APPLY_CALL_LIMIT
+		};
+		match self.call_with(&req, cancel, limit)? {
+			Response::Replayed(result) if !check_only => Ok(Some(result)),
+			Response::Fresh if check_only => Ok(None),
 			_ => Err(unexpected()),
 		}
 	}
@@ -774,6 +1095,9 @@ impl Client {
 		}
 	}
 
+	/// The whole sorted listing of a remote folder, and whether the worker
+	/// capped it ([`crate::proto::MAX_DIR_ENTRIES`]). One call: there is no
+	/// continuation to ask for.
 	pub fn list_dir(
 		&self,
 		workspace: &str,
@@ -1145,6 +1469,7 @@ impl From<RemoteError> for GitError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::proto::write_frame;
 
 	fn timeout_scale() -> u32 {
 		std::env::var("SNIP_E2E_TIMEOUT_SCALE")
@@ -1191,6 +1516,29 @@ mod tests {
 		}
 	}
 
+	/// Feeds its frames with a pause before each read, so a deadline can
+	/// pass between them.
+	struct SlowDuplex {
+		incoming: io::Cursor<Vec<u8>>,
+		pause: Duration,
+	}
+
+	impl io::Read for SlowDuplex {
+		fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+			std::thread::sleep(self.pause);
+			self.incoming.read(buf)
+		}
+	}
+
+	impl io::Write for SlowDuplex {
+		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+			Ok(buf.len())
+		}
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
 	#[test]
 	fn exchange_skips_pending_frames_and_counts_frames() {
 		let mut stream = FakeDuplex::new(&[
@@ -1198,13 +1546,11 @@ mod tests {
 			Response::Pending,
 			Response::Text { content: None },
 		]);
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let res = exchange(
 			&mut stream,
-			&req,
 			None,
-			Duration::from_secs(10),
+			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
 		.unwrap();
@@ -1219,13 +1565,11 @@ mod tests {
 			FakeDuplex::new(&[Response::Pending, Response::Pending]);
 		let cancel = CancelToken::new();
 		cancel.cancel();
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
-			&req,
 			Some(&cancel),
-			Duration::from_secs(10),
+			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
 		.unwrap_err();
@@ -1237,11 +1581,9 @@ mod tests {
 	#[test]
 	fn exchange_zero_limit_with_pending_returns_timed_out() {
 		let mut stream = FakeDuplex::new(&[Response::Pending]);
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
-		let err =
-			exchange(&mut stream, &req, None, Duration::ZERO, &mut frames)
-				.unwrap_err();
+		let err = exchange(&mut stream, None, Instant::now(), &mut frames)
+			.unwrap_err();
 
 		assert!(matches!(err, RemoteError::TimedOut));
 		assert_eq!(frames, 1);
@@ -1253,13 +1595,11 @@ mod tests {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
 		}]);
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
-			&req,
 			None,
-			Duration::from_secs(10),
+			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
 		.unwrap_err();
@@ -1277,13 +1617,11 @@ mod tests {
 	#[test]
 	fn exchange_eof_returns_unexpected_eof() {
 		let mut stream = FakeDuplex::new(&[]);
-		let req = Request::OpenWorkspace { path: "~".into() };
 		let mut frames = 0;
 		let err = exchange(
 			&mut stream,
-			&req,
 			None,
-			Duration::from_secs(10),
+			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
 		.unwrap_err();
@@ -1431,5 +1769,368 @@ mod tests {
 			.acquire(None, scaled(Duration::from_millis(100)))
 			.expect("releasing one guard should allow acquisition");
 		drop((g2, g3, g4, g5));
+	}
+
+	/// A worker that keeps speaking while nobody listens cannot make the
+	/// master buffer without end: the FIRST unsolicited frame ends the pump
+	/// (the connection is discarded at its next use), and the ssh writer is
+	/// left with a closed pipe.
+	#[test]
+	fn an_idle_flood_of_frames_is_bounded_and_ends_the_read() {
+		let (r, mut w) = io::pipe().unwrap();
+		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+		let retained = Arc::new(AtomicUsize::new(0));
+		let in_flight = Arc::new(AtomicBool::new(false));
+		let pump_retained = Arc::clone(&retained);
+		let pump_in_flight = Arc::clone(&in_flight);
+		let pump = std::thread::spawn(move || {
+			pump_frames(r, tx, pump_retained, pump_in_flight);
+		});
+		// ~64 KiB frames: the OS pipe cannot buffer many, so the producer
+		// stalls as soon as the pump does.
+		let body = "x".repeat(64 * 1024);
+		let producer = std::thread::spawn(move || {
+			let mut written = 0usize;
+			for _ in 0..10_000 {
+				let frame = Response::Text {
+					content: Some(body.clone()),
+				};
+				if write_frame(&mut w, &frame).is_err() {
+					break;
+				}
+				written += 1;
+			}
+			written
+		});
+
+		// The pump hangs up on the first unsolicited frame; the producer
+		// then hits a closed pipe well before 10,000 frames.
+		let producer = producer.join().unwrap();
+		pump.join().unwrap();
+		assert_eq!(
+			retained.load(std::sync::atomic::Ordering::Relaxed),
+			1,
+			"one unsolicited frame is queued as the marker, no more"
+		);
+		assert!(
+			producer < 200,
+			"an unconsumed pump must stop early, wrote {producer}"
+		);
+		drop(rx);
+	}
+
+	/// A pump parked in `send` (queue full, consumer gone) ends when the
+	/// connection drops the receiver — bounded, never stuck for good.
+	#[test]
+	fn the_pump_unblocks_when_the_connection_drops() {
+		let (r, mut w) = io::pipe().unwrap();
+		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+		let retained = Arc::new(AtomicUsize::new(0));
+		let in_flight = Arc::new(AtomicBool::new(true));
+		let pump_retained = Arc::clone(&retained);
+		let pump_in_flight = Arc::clone(&in_flight);
+		let pump = std::thread::spawn(move || {
+			pump_frames(r, tx, pump_retained, pump_in_flight);
+		});
+		let body = "x".repeat(64 * 1024);
+		let producer = std::thread::spawn(move || {
+			for _ in 0..40 {
+				let frame = Response::Text {
+					content: Some(body.clone()),
+				};
+				if write_frame(&mut w, &frame).is_err() {
+					break;
+				}
+			}
+		});
+		// The queue (plus the pipe) fills; the pump parks in `send`.
+		std::thread::sleep(scaled(Duration::from_millis(200)));
+		drop(rx);
+		assert!(
+			join_bounded(pump, scaled(Duration::from_secs(5))),
+			"dropping the receiver must unblock the parked pump"
+		);
+		producer.join().unwrap();
+	}
+
+	/// A segmented reply far larger than the frame queue, with the consumer
+	/// paused while it streams in: the pump must apply backpressure (block)
+	/// rather than hang up, and every piece still arrives once the consumer
+	/// resumes.
+	#[test]
+	fn a_paused_consumer_still_receives_a_20mib_segmented_reply() {
+		let (r, w) = io::pipe().unwrap();
+		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+		let retained = Arc::new(AtomicUsize::new(0));
+		let in_flight = Arc::new(AtomicBool::new(false));
+		let pump_retained = Arc::clone(&retained);
+		let pump_in_flight = Arc::clone(&in_flight);
+		let pump = std::thread::spawn(move || {
+			pump_frames(r, tx, pump_retained, pump_in_flight);
+		});
+		let piece = "x".repeat(1024 * 1024);
+		let producer = std::thread::spawn(move || {
+			let mut w = w;
+			let mut wrote = 0usize;
+			for _ in 0..20 {
+				if write_frame(
+					&mut w,
+					&Response::Chunk {
+						data: piece.clone(),
+					},
+				)
+				.is_err()
+				{
+					break;
+				}
+				wrote += 1;
+			}
+			let _ = write_frame(
+				&mut w,
+				&Response::Copied(CopyOutcome {
+					payload: String::new(),
+					copied: 1,
+					chars: 0,
+					lines: 0,
+					skipped: 0,
+					truncated: false,
+				}),
+			);
+			wrote
+		});
+		// The exchange is running; its consumer is paused while the reply
+		// streams in.
+		in_flight.store(true, Ordering::SeqCst);
+		std::thread::sleep(scaled(Duration::from_millis(300)));
+		let mut conn = Connection {
+			writer: Box::new(std::io::sink()),
+			frames: rx,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::clone(&retained),
+			in_flight: Arc::clone(&in_flight),
+		};
+		let deadline = Instant::now() + scaled(Duration::from_secs(30));
+		let mut text = String::new();
+		let reply = loop {
+			assert!(
+				Instant::now() < deadline,
+				"the reply never finished arriving"
+			);
+			match conn.recv(scaled(Duration::from_secs(5))).unwrap() {
+				Some(Response::Chunk { data }) => text.push_str(&data),
+				Some(other) => break other,
+				None => panic!("the pump hung up while a reply was streaming"),
+			}
+		};
+		in_flight.store(false, Ordering::SeqCst);
+		match reply {
+			Response::Copied(out) => assert_eq!(out.copied, 1),
+			other => panic!("expected Copied, got {other:?}"),
+		}
+		assert_eq!(text.len(), 20 * 1024 * 1024);
+		assert_eq!(
+			producer.join().unwrap(),
+			20,
+			"the producer wrote every piece"
+		);
+		drop(conn);
+		assert!(
+			join_bounded(pump, scaled(Duration::from_secs(5))),
+			"dropping the receiver must end the pump"
+		);
+	}
+
+	/// Joins `handle` within `limit`, so a hung thread fails the test
+	/// instead of hanging it.
+	fn join_bounded(
+		handle: std::thread::JoinHandle<()>,
+		limit: Duration,
+	) -> bool {
+		let (tx, rx) = mpsc::channel();
+		std::thread::spawn(move || {
+			let _ = handle.join();
+			let _ = tx.send(());
+		});
+		rx.recv_timeout(limit).is_ok()
+	}
+
+	/// Every consumed frame releases its retained slot, so a call that
+	/// drains its answers leaves the connection reusable.
+	#[test]
+	fn consuming_frames_releases_the_retained_cap() {
+		let (r, w) = io::pipe().unwrap();
+		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+		let retained = Arc::new(AtomicUsize::new(0));
+		for i in 0..3 {
+			retained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			tx.send(Ok(Some(Response::Text {
+				content: Some(i.to_string()),
+			})))
+			.unwrap();
+		}
+		let mut conn = Connection {
+			writer: Box::new(w),
+			frames: rx,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::clone(&retained),
+			in_flight: Arc::new(AtomicBool::new(false)),
+		};
+		drop(r);
+		for _ in 0..3 {
+			conn.recv(Duration::from_secs(1)).unwrap().unwrap();
+		}
+		assert_eq!(conn.unsolicited_frames(), 0);
+		assert_eq!(
+			retained.load(std::sync::atomic::Ordering::Relaxed),
+			0,
+			"the queue is drained: a pooled connection is clean"
+		);
+	}
+
+	/// A writer the write side can be parked inside, like `ChildStdin` on a
+	/// worker that stopped reading.
+	struct ParkedWriter(std::sync::Mutex<Option<mpsc::Receiver<()>>>);
+
+	impl io::Write for ParkedWriter {
+		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+			let receiver =
+				self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+			match receiver {
+				Some(receiver) => {
+					// Park forever, as a write to a full pipe does, until
+					// the gate is dropped.
+					let _ = receiver.recv();
+					Err(io::Error::from(io::ErrorKind::BrokenPipe))
+				}
+				None => Ok(buf.len()),
+			}
+		}
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	fn parked_connection(gate: mpsc::Receiver<()>) -> Connection {
+		Connection {
+			writer: Box::new(ParkedWriter(std::sync::Mutex::new(Some(gate)))),
+			frames: mpsc::sync_channel(1).1,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::default(),
+			in_flight: Arc::default(),
+		}
+	}
+
+	/// A request the far end never reads fails by its deadline instead of
+	/// blocking forever, and the call returns in time.
+	#[test]
+	fn a_request_nobody_reads_fails_by_its_deadline() {
+		let (gate_tx, gate_rx) = mpsc::channel();
+		let mut conn = parked_connection(gate_rx);
+		// A body big enough that no pipe buffer swallows it whole.
+		let request = Request::ImportPlan {
+			workspace: "w".into(),
+			dest: String::new(),
+			text: "x".repeat(1024 * 1024),
+			mapping: Default::default(),
+		};
+		let started = Instant::now();
+		let deadline = started + scaled(Duration::from_millis(300));
+		let err = conn.send_guarded(&request, None, deadline).unwrap_err();
+		assert!(matches!(err, RemoteError::TimedOut), "{err:?}");
+		assert!(
+			started.elapsed() < scaled(Duration::from_secs(5)),
+			"the send must fail by its deadline, took {:?}",
+			started.elapsed()
+		);
+		drop(gate_tx);
+	}
+
+	/// A cancelled send fails at once instead of blocking forever.
+	#[test]
+	fn a_cancelled_send_fails_at_once() {
+		let (gate_tx, gate_rx) = mpsc::channel();
+		let mut conn = parked_connection(gate_rx);
+		let cancel = CancelToken::new();
+		cancel.cancel();
+		let request = Request::OpenWorkspace { path: "~".into() };
+		let started = Instant::now();
+		let deadline = started + scaled(Duration::from_secs(30));
+		let err = conn
+			.send_guarded(&request, Some(&cancel), deadline)
+			.unwrap_err();
+		assert!(matches!(err, RemoteError::Cancelled), "{err:?}");
+		assert!(started.elapsed() < scaled(Duration::from_secs(2)));
+		drop(gate_tx);
+	}
+
+	/// A send that goes out in time hands the writer back: the connection
+	/// carries on reading its answers.
+	#[test]
+	fn a_send_that_goes_out_keeps_the_connection_whole() {
+		let (r, w) = io::pipe().unwrap();
+		let mut conn = Connection {
+			writer: Box::new(w),
+			frames: mpsc::sync_channel(1).1,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::default(),
+			in_flight: Arc::default(),
+		};
+		let request = Request::OpenWorkspace { path: "~".into() };
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
+		conn.send_guarded(&request, None, deadline).unwrap();
+		// The pipe holds one small frame; the read side sees a clean end
+		// once it is dropped.
+		drop(r);
+		assert_eq!(conn.recv(scaled(Duration::from_secs(1))).unwrap(), None);
+	}
+
+	/// Every received frame checks the call's absolute deadline, chunk
+	/// frames included: a worker may not stretch one call by dripping
+	/// chunks.
+	#[test]
+	fn exchange_holds_chunk_frames_to_the_absolute_deadline() {
+		let mut buf = Vec::new();
+		for i in 0..3 {
+			write_frame(
+				&mut buf,
+				&Response::Chunk {
+					data: format!("piece {i}"),
+				},
+			)
+			.unwrap();
+		}
+		let mut stream = SlowDuplex {
+			incoming: io::Cursor::new(buf),
+			pause: scaled(Duration::from_millis(200)),
+		};
+		let mut frames = 0;
+		let deadline = Instant::now() + scaled(Duration::from_millis(300));
+		let err =
+			exchange(&mut stream, None, deadline, &mut frames).unwrap_err();
+		assert!(matches!(err, RemoteError::TimedOut), "{err:?}");
 	}
 }

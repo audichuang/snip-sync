@@ -54,6 +54,7 @@ struct Master {
 	exec: String,
 	config: PathBuf,
 	home: Option<PathBuf>,
+	settings: Option<String>,
 }
 
 impl Master {
@@ -66,11 +67,25 @@ impl Master {
 			exec,
 			config: tmp.join("cfg"),
 			home: None,
+			settings: None,
+		}
+	}
+
+	/// A master whose global `--settings` reach every command.
+	fn with_settings(tmp: &Path, exec: String, settings: &str) -> Self {
+		Self {
+			exec,
+			config: tmp.join("cfg"),
+			home: None,
+			settings: Some(settings.to_string()),
 		}
 	}
 
 	fn snip(&self, args: &[&str]) -> (Option<i32>, String, String) {
 		let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+		if let Some(settings) = &self.settings {
+			cmd.args(["--settings", settings]);
+		}
 		cmd.arg("remote")
 			.args(args)
 			.env("SNIP_CONFIG_DIR", &self.config)
@@ -153,6 +168,28 @@ fn serve_needs_the_stdio_flag() {
 		.env("SNIP_CONFIG_DIR", tmp.path().join("cfg"));
 	let (status, _, _) = output(cmd, "snip serve");
 	assert_eq!(status, Some(2));
+}
+
+/// `ls` prints the WHOLE listing in one call: 1,200 names, sorted, no
+/// duplicates, and nothing left to ask a second call for.
+#[test]
+fn cli_master_ls_prints_a_whole_1200_entry_listing() {
+	let tmp = tempfile::tempdir().unwrap();
+	let many = tmp.path().join("many");
+	std::fs::create_dir_all(&many).unwrap();
+	for i in 0..1200 {
+		std::fs::write(many.join(format!("f{i:04}")), "").unwrap();
+	}
+	let m = Master::new(tmp.path());
+	let out = m.ok(&["ls", "anyhost", s(&many)]);
+	let mut lines: Vec<&str> = out.lines().collect();
+	assert_eq!(lines.len(), 1200, "{lines:?}");
+	let mut sorted = lines.clone();
+	sorted.sort_unstable();
+	assert_eq!(lines, sorted, "the reply is the sorted listing itself");
+	lines.sort_unstable();
+	lines.dedup();
+	assert_eq!(lines.len(), 1200, "no name arrives twice");
 }
 
 #[test]
@@ -529,6 +566,77 @@ fn cli_remote_copy_of_a_folder_equals_a_local_copy() {
 	assert!(!one.contains("a.txt"), "{one}");
 }
 
+/// The user's `--settings` reach a remote copy: the same exclusion filter,
+/// header format and file-count cap a local copy applies.
+#[test]
+fn cli_remote_copy_forwards_the_users_settings() {
+	let tmp = tempfile::tempdir().unwrap();
+	let proj = tmp.path().join("proj");
+	std::fs::create_dir_all(&proj).unwrap();
+	for i in 0..40 {
+		std::fs::write(proj.join(format!("f{i:02}.txt")), "body\n").unwrap();
+	}
+	std::fs::write(proj.join("secrets.env"), "top secret\n").unwrap();
+	let settings = r###"{"useFilters":true,"useExcludeFilters":true,"filterRules":[{"type":"PATH","action":"EXCLUDE","value":"secrets.env","enabled":true}],"headerFormat":"## $FILE_PATH","setMaxFileCount":false}"###;
+	let m = Master::with_settings(tmp.path(), serve_exec(""), settings);
+
+	let remote = m.ok(&["copy", "h", s(&proj), "--stdout"]);
+	assert!(
+		!remote.contains("secrets.env") && !remote.contains("top secret"),
+		"the excluded file must not be copied: {remote}"
+	);
+	assert!(remote.contains("## f00.txt"), "{remote}");
+	assert!(
+		remote.contains("## f39.txt"),
+		"the disabled cap keeps every file: {}",
+		remote.contains("f39")
+	);
+
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args(["--settings", settings, "copy", ".", "--stdout"])
+		.current_dir(&proj)
+		.env("SNIP_CONFIG_DIR", tmp.path().join("cfg-local"));
+	let (status, local, stderr) = output(cmd, "snip copy");
+	assert_eq!(status, Some(0), "{stderr}");
+	assert_eq!(
+		remote, local,
+		"remote and local copy under the same settings agree"
+	);
+}
+
+/// The excluded prefix of a folder can outgrow the first expansion batch
+/// (the default 30-file cap makes it 120 files): both copies double past
+/// it — remote and local agree, and the eligible tail is copied instead
+/// of "nothing could be copied".
+#[test]
+fn cli_remote_copy_expands_past_an_excluded_prefix_like_a_local_copy() {
+	let tmp = tempfile::tempdir().unwrap();
+	let proj = tmp.path().join("proj");
+	std::fs::create_dir_all(proj.join("sub")).unwrap();
+	for i in 0..130 {
+		std::fs::write(proj.join(format!("sub/skip_{i:03}.txt")), "s\n")
+			.unwrap();
+	}
+	std::fs::write(proj.join("sub/keep.txt"), "keep me\n").unwrap();
+	let settings = r###"{"useFilters":true,"useExcludeFilters":true,"filterRules":[{"type":"PATTERN","action":"EXCLUDE","value":"*skip*","enabled":true}]}"###;
+	let m = Master::with_settings(tmp.path(), serve_exec(""), settings);
+
+	let remote = m.ok(&["copy", "h", s(&proj), "--stdout"]);
+	assert!(remote.contains("keep.txt"), "{remote}");
+	assert!(!remote.contains("skip_"), "{remote}");
+
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args(["--settings", settings, "copy", ".", "--stdout"])
+		.current_dir(&proj)
+		.env("SNIP_CONFIG_DIR", tmp.path().join("cfg-local"));
+	let (status, local, stderr) = output(cmd, "snip copy");
+	assert_eq!(status, Some(0), "{stderr}");
+	assert_eq!(
+		remote, local,
+		"remote and local copy under the same settings agree"
+	);
+}
+
 #[test]
 fn cli_remote_copy_of_staged_changes_and_commits() {
 	if !require_git() {
@@ -562,4 +670,282 @@ fn cli_remote_copy_refuses_a_worker_without_copy() {
 	let m = Master::with_exec(tmp.path(), serve_exec("--max-protocol 2"));
 	let err = m.fails(&["copy", "h", s(tmp.path()), "a.txt", "--stdout"]);
 	assert!(err.contains("too old"), "{err}");
+}
+
+/// `snip remote copy --working` resolves on the worker with the same
+/// `changed_items` a local copy runs: staged-only entries included, in the
+/// local order, so both payloads are identical.
+#[test]
+fn cli_remote_working_copy_matches_the_local_copy() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("repo");
+	std::fs::create_dir_all(&repo).unwrap();
+	git(&repo, &["init", "-q", "-b", "main"]);
+	std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+	git(&repo, &["add", "a.txt"]);
+	git(&repo, &["commit", "-q", "-m", "first"]);
+	// Only staged: a.txt's second version sits in the index, never in the
+	// working tree, and b.txt is a staged new file.
+	std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+	git(&repo, &["add", "a.txt"]);
+	std::fs::write(repo.join("b.txt"), "staged new\n").unwrap();
+	git(&repo, &["add", "b.txt"]);
+	std::fs::write(repo.join("c.txt"), "untracked\n").unwrap();
+	std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+	let m = Master::new(tmp.path());
+	let remote = m.ok(&["copy", "h", s(&repo), "--working", "--stdout"]);
+	let mut local_cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	local_cmd
+		.args(["--repo", s(&repo), "copy", "--working", "--stdout"])
+		.env("SNIP_CONFIG_DIR", tmp.path().join("cfg-local"));
+	let (status, local, stderr) = output(local_cmd, "snip copy --working");
+	assert_eq!(status, Some(0), "{stderr}");
+	assert_eq!(remote, local, "staged-only changes ride along");
+	assert!(remote.contains("staged new"), "{remote}");
+	assert!(remote.contains("three"), "{remote}");
+
+	// --staged likewise resolves on the worker.
+	let remote = m.ok(&["copy", "h", s(&repo), "--staged", "--stdout"]);
+	assert!(remote.contains("[MODIFIED] a.txt"), "{remote}");
+	assert!(remote.contains("[NEW] b.txt"), "{remote}");
+	assert!(!remote.contains("c.txt"), "{remote}");
+
+	// A worker that cannot resolve changes on its own says so.
+	let old = Master::with_exec(tmp.path(), serve_exec("--max-protocol 4"));
+	let err = old.fails(&["copy", "h", s(&repo), "--working", "--stdout"]);
+	assert!(err.contains("too old"), "{err}");
+}
+
+/// Runs `cmd` with `input` on stdin, failing the test after [`DEADLINE`].
+fn output_with_input(
+	mut cmd: Command,
+	input: &str,
+	what: &str,
+) -> (Option<i32>, String, String) {
+	use std::io::Write;
+	let mut child = cmd
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap_or_else(|err| panic!("cannot start {what}: {err}"));
+	let mut stdin = child.stdin.take().unwrap();
+	let input = input.to_string();
+	std::thread::spawn(move || {
+		let _ = stdin.write_all(input.as_bytes());
+	});
+	let (tx, rx) = mpsc::channel();
+	std::thread::spawn(move || {
+		let _ = tx.send(child.wait_with_output());
+	});
+	let out = rx
+		.recv_timeout(DEADLINE)
+		.unwrap_or_else(|_| panic!("{what} did not finish within {DEADLINE:?}"))
+		.unwrap();
+	(
+		out.status.code(),
+		String::from_utf8_lossy(&out.stdout).into_owned(),
+		String::from_utf8_lossy(&out.stderr).into_owned(),
+	)
+}
+
+/// `snip paste … --stdin` into `dest`, run locally.
+fn local_paste(
+	cfg: &Path,
+	dest: &Path,
+	text: &str,
+	args: &[&str],
+) -> (Option<i32>, String, String) {
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args(["--repo", s(dest), "paste", "--stdin"])
+		.args(args)
+		.env("SNIP_CONFIG_DIR", cfg);
+	output_with_input(cmd, text, "snip paste")
+}
+
+impl Master {
+	/// `snip remote paste h <workspace> --in <dest> --stdin …`.
+	fn paste(
+		&self,
+		workspace: &Path,
+		dest: &str,
+		text: &str,
+		args: &[&str],
+	) -> (Option<i32>, String, String) {
+		let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+		cmd.args(["remote", "paste", "h", s(workspace), "--in", dest])
+			.arg("--stdin")
+			.args(args)
+			.env("SNIP_CONFIG_DIR", &self.config)
+			.env("SNIP_REMOTE_EXEC", &self.exec);
+		output_with_input(cmd, text, "snip remote paste")
+	}
+}
+
+fn tree_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+	let mut out = Vec::new();
+	let mut stack = vec![dir.to_path_buf()];
+	while let Some(d) = stack.pop() {
+		for e in std::fs::read_dir(&d).unwrap() {
+			let p = e.unwrap().path();
+			if p.file_name().is_some_and(|n| n == ".git") {
+				continue;
+			}
+			if p.is_dir() {
+				stack.push(p);
+			} else {
+				let rel = p.strip_prefix(dir).unwrap().display().to_string();
+				out.push((rel, std::fs::read(&p).unwrap()));
+			}
+		}
+	}
+	out.sort();
+	out
+}
+
+#[test]
+fn cli_remote_paste_of_files_matches_a_local_paste() {
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	std::fs::create_dir_all(src.join("sub")).unwrap();
+	std::fs::write(src.join("a.txt"), "new\n").unwrap();
+	std::fs::write(src.join("sub/中文.txt"), "深層\nx\n").unwrap();
+	let text = local_copy(&src);
+	// Same folder names on both sides: messages name them.
+	let local = tmp.path().join("l/dst");
+	let ws = tmp.path().join("r");
+	let remote = ws.join("dst");
+	for dir in [&local, &remote] {
+		std::fs::create_dir_all(dir).unwrap();
+		std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+	}
+	let cfg = tmp.path().join("cfg-local");
+	let m = Master::new(tmp.path());
+
+	let l = local_paste(&cfg, &local, &text, &["--dry-run"]);
+	let r = m.paste(&ws, "dst", &text, &["--dry-run"]);
+	assert_eq!(l.0, Some(0), "{}", l.2);
+	assert_eq!(r, l, "dry run");
+	assert!(l.1.contains("overwrite\ta.txt"), "{}", l.1);
+
+	// Existing files need a choice, as locally.
+	let l = local_paste(&cfg, &local, &text, &["--apply"]);
+	let r = m.paste(&ws, "dst", &text, &["--apply"]);
+	assert_eq!(l.0, Some(2), "{}", l.2);
+	assert_eq!(r.0, l.0);
+	assert!(r.2.contains("already exist"), "{}", r.2);
+	assert_eq!(tree_bytes(&remote), tree_bytes(&local));
+
+	let l = local_paste(&cfg, &local, &text, &["--apply", "--overwrite"]);
+	let r = m.paste(&ws, "dst", &text, &["--apply", "--overwrite"]);
+	assert_eq!(l.0, Some(0), "{}", l.2);
+	assert_eq!(r, l, "apply");
+	assert_eq!(tree_bytes(&remote), tree_bytes(&local));
+	assert!(remote.join("sub/中文.txt").is_file());
+
+	// A Git directory as the destination: refused as locally, nothing
+	// written.
+	if !require_git() {
+		return;
+	}
+	git(&ws, &["init", "-q"]);
+	let local_repo = tmp.path().join("l/repo");
+	std::fs::create_dir_all(&local_repo).unwrap();
+	git(&local_repo, &["init", "-q"]);
+	let l = local_paste(
+		&cfg,
+		&local_repo.join(".git"),
+		&text,
+		&["--apply", "--overwrite"],
+	);
+	let r = m.paste(&ws, ".git", &text, &["--apply", "--overwrite"]);
+	assert_eq!(l.0, Some(1), "{}", l.2);
+	assert_eq!(r.0, l.0, "{}", r.2);
+	assert!(!ws.join(".git/a.txt").exists());
+	assert!(!local_repo.join(".git/a.txt").exists());
+}
+
+#[test]
+fn cli_remote_paste_of_commits_matches_a_local_paste() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let src = tmp.path().join("src");
+	std::fs::create_dir_all(&src).unwrap();
+	git(&src, &["init", "-q", "-b", "main"]);
+	std::fs::write(src.join("a.txt"), "one\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "first"]);
+	std::fs::write(src.join("a.txt"), "two\n").unwrap();
+	std::fs::write(src.join("b.txt"), "b\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "second"]);
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args([
+		"--repo",
+		s(&src),
+		"copy",
+		"--commits",
+		"-n",
+		"2",
+		"--stdout",
+	])
+	.env("SNIP_CONFIG_DIR", tmp.path().join("cfg-local"));
+	let (status, text, stderr) = output(cmd, "snip copy --commits");
+	assert_eq!(status, Some(0), "{stderr}");
+
+	let local = tmp.path().join("l/repo");
+	let ws = tmp.path().join("r");
+	let remote = ws.join("repo");
+	for dir in [&local, &remote] {
+		std::fs::create_dir_all(dir).unwrap();
+		git(dir, &["init", "-q", "-b", "main"]);
+		git(dir, &["config", "user.name", "t"]);
+		git(dir, &["config", "user.email", "t@t"]);
+		std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+		git(dir, &["add", "."]);
+		git(dir, &["commit", "-q", "-m", "base"]);
+	}
+	let cfg = tmp.path().join("cfg-local");
+	let m = Master::new(tmp.path());
+
+	let l = local_paste(&cfg, &local, &text, &["--dry-run"]);
+	let r = m.paste(&ws, "repo", &text, &["--dry-run"]);
+	assert_eq!(l.0, Some(0), "{}", l.2);
+	assert_eq!(r, l, "dry run");
+
+	let l = local_paste(&cfg, &local, &text, &["--apply"]);
+	let r = m.paste(&ws, "repo", &text, &["--apply"]);
+	assert_eq!(l.0, Some(2), "{}", l.2);
+	assert_eq!((r.0, &r.2), (l.0, &l.2), "overwrite needed");
+
+	let l = local_paste(&cfg, &local, &text, &["--apply", "--overwrite"]);
+	let r = m.paste(&ws, "repo", &text, &["--apply", "--overwrite"]);
+	assert_eq!(l.0, Some(0), "{}", l.2);
+	assert_eq!(r.0, l.0, "{}", r.2);
+	assert_eq!(r.2, l.2);
+	// Commit ids carry the committer's clock; the rest must match.
+	let first = |out: &str| out.lines().next().unwrap_or("").to_string();
+	assert_eq!(first(&r.1), first(&l.1));
+	assert_eq!(first(&r.1), "Created 2 commit(s).");
+	let log = |dir: &Path| {
+		git_out(dir, &["log", "-2", "--format=%T %an <%ae> %ad %s"])
+	};
+	assert_eq!(log(&remote), log(&local));
+	assert_eq!(tree_bytes(&remote), tree_bytes(&local));
+}
+
+#[test]
+fn cli_remote_paste_refuses_a_worker_without_paste() {
+	let tmp = tempfile::tempdir().unwrap();
+	let m = Master::with_exec(tmp.path(), serve_exec("--max-protocol 3"));
+	let r = m.paste(tmp.path(), "", "// File: a.txt\na\n", &["--apply"]);
+	assert_eq!(r.0, Some(1), "{}", r.2);
+	assert!(r.2.contains("too old"), "{}", r.2);
+	assert!(!tmp.path().join("a.txt").exists());
 }

@@ -102,6 +102,9 @@ struct State {
 	max_protocol: Option<u32>,
 	git_requests: AtomicUsize,
 	deadlines: Mutex<(Duration, Duration)>,
+	/// A ListDir reply's entry cap; [`MAX_DIR_ENTRIES`] unless a test
+	/// shrank it.
+	dir_cap: AtomicUsize,
 	jobs: crate::jobs::Jobs,
 	repo_cache: Mutex<crate::gitserve::RepoCache>,
 	stop: AtomicBool,
@@ -124,6 +127,7 @@ impl Worker {
 					crate::jobs::VIEW_DEADLINE,
 					crate::jobs::SCAN_DEADLINE,
 				)),
+				dir_cap: AtomicUsize::new(MAX_DIR_ENTRIES),
 				jobs: crate::jobs::Jobs::new(),
 				repo_cache: Mutex::new(crate::gitserve::RepoCache::new()),
 				stop: AtomicBool::new(false),
@@ -166,6 +170,13 @@ impl Worker {
 	#[doc(hidden)]
 	pub fn set_deadlines_for_tests(&self, view: Duration, scan: Duration) {
 		*lock(&self.state.deadlines) = (view, scan);
+	}
+
+	/// Shrinks a ListDir reply's entry cap, so the truncation path is
+	/// testable without a 20,001-entry folder on a slow machine.
+	#[doc(hidden)]
+	pub fn set_dir_cap_for_tests(&self, cap: usize) {
+		self.state.dir_cap.store(cap.max(1), Ordering::SeqCst);
 	}
 
 	#[doc(hidden)]
@@ -257,12 +268,102 @@ fn serve(
 			max_version: Some(negotiated),
 		},
 	)?;
+	// A paste's text arriving ahead of its request.
+	let mut pending = String::new();
+	let mut overflow = false;
+	// A request too large for one frame, arriving as JSON pieces.
+	let mut frame_json = String::new();
+	let mut frame_overflow = false;
 	while !state.stop.load(Ordering::SeqCst) {
-		let Some(request) = read_frame::<Request>(&mut reader)? else {
+		let Some(mut request) = read_frame::<Request>(&mut reader)? else {
 			return Ok(());
 		};
 		if state.stop.load(Ordering::SeqCst) {
 			return Ok(());
+		}
+		if let Request::Chunk { data } = request {
+			if overflow
+				|| pending.len() + data.len()
+					> snip_core::transfer::CLIPBOARD_PAYLOAD_MAX
+			{
+				overflow = true;
+				pending = String::new();
+			} else {
+				pending.push_str(&data);
+			}
+			continue;
+		}
+		if let Request::FrameChunk { data } = request {
+			if frame_overflow
+				|| frame_json.len() + data.len() > crate::proto::JOINED_MAX
+			{
+				frame_overflow = true;
+				frame_json = String::new();
+			} else {
+				frame_json.push_str(&data);
+			}
+			continue;
+		}
+		if let Request::FrameJoin = request {
+			if frame_overflow {
+				crate::jobs::write_response(
+					&mut writer,
+					&error(
+						ErrorCode::TooLarge,
+						"the request is over the join limit".into(),
+					),
+				)?;
+				continue;
+			}
+			let joined = std::mem::take(&mut frame_json);
+			match serde_json::from_str::<Request>(&joined) {
+				Ok(parsed) => request = parsed,
+				Err(_) => {
+					crate::jobs::write_response(
+						&mut writer,
+						&error(
+							ErrorCode::BadRequest,
+							"the joined request is not valid".into(),
+						),
+					)?;
+					continue;
+				}
+			}
+		} else if !frame_json.is_empty() {
+			crate::jobs::write_response(
+				&mut writer,
+				&error(
+					ErrorCode::BadRequest,
+					"frame chunks must end with a join".into(),
+				),
+			)?;
+			continue;
+		}
+		let joined = std::mem::take(&mut pending);
+		if std::mem::replace(&mut overflow, false) {
+			crate::jobs::write_response(
+				&mut writer,
+				&error(
+					ErrorCode::TooLarge,
+					"the pasted text is over the clipboard limit".into(),
+				),
+			)?;
+			continue;
+		}
+		if !joined.is_empty() {
+			match request.text_mut() {
+				Some(text) if text.is_empty() => *text = joined,
+				_ => {
+					crate::jobs::write_response(
+						&mut writer,
+						&error(
+							ErrorCode::BadRequest,
+							"text chunks must precede a paste request".into(),
+						),
+					)?;
+					continue;
+				}
+			}
 		}
 		match request {
 			Request::ScanRepos { workspace, under } => {
@@ -388,6 +489,8 @@ fn serve(
 					state,
 					negotiated,
 					&workspace,
+					Job::Copy,
+					crate::proto::TRANSFER_VERSION,
 					|root, cancel| {
 						crate::copyserve::export(
 							root, items, &settings, file_limit, cancel,
@@ -406,9 +509,120 @@ fn serve(
 					state,
 					negotiated,
 					&workspace,
+					Job::Copy,
+					crate::proto::TRANSFER_VERSION,
 					|root, cancel| {
 						crate::copyserve::export_commits(
 							root, &repo, &tip, &selected, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ExportChanges {
+				workspace,
+				repo,
+				source,
+				settings,
+				file_limit,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::Copy,
+					crate::proto::EXPORT_CHANGES_VERSION,
+					|root, cancel| {
+						crate::copyserve::export_changes(
+							root, &repo, &source, &settings, file_limit, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ImportPlan {
+				workspace,
+				dest,
+				text,
+				mapping,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					crate::proto::PASTE_VERSION,
+					|root, cancel| {
+						crate::pasteserve::import_plan(
+							root, &dest, &text, &mapping, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ImportApply {
+				workspace,
+				dest,
+				text,
+				mapping,
+				selection,
+				expect,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PasteApply,
+					crate::proto::PASTE_VERSION,
+					|root, cancel| {
+						crate::pasteserve::import_apply(
+							root, &dest, &text, &mapping, &selection, &expect,
+							cancel,
+						)
+					},
+				)?;
+			}
+			Request::ReplayPlan {
+				workspace,
+				dest,
+				text,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					crate::proto::PASTE_VERSION,
+					|root, cancel| {
+						crate::pasteserve::replay_plan(
+							root, &dest, &text, cancel,
+						)
+					},
+				)?;
+			}
+			Request::ReplayApply {
+				workspace,
+				dest,
+				text,
+				expect,
+				check_only,
+			} => {
+				let job = if check_only {
+					Job::PastePlan
+				} else {
+					Job::PasteApply
+				};
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					job,
+					crate::proto::PASTE_VERSION,
+					|root, cancel| {
+						crate::pasteserve::replay_apply(
+							root, &dest, &text, expect, check_only, cancel,
 						)
 					},
 				)?;
@@ -422,42 +636,86 @@ fn serve(
 	Ok(())
 }
 
-/// Runs a copy as a job of `workspace`, as Git views run.
+/// What a copy or paste job is, for its protocol and deadline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Job {
+	Copy,
+	/// Reads only: a preview, or a re-check.
+	PastePlan,
+	/// Writes. Its deadline is long: a write cannot be cancelled midway, and
+	/// a master must hear how it ended rather than a time-out.
+	PasteApply,
+}
+
+/// Runs a copy or paste as a job of `workspace`, as Git views run. `need`
+/// is the protocol the request itself requires: a request a worker this
+/// old cannot even parse never reaches dispatch (the master gates on its
+/// `needs_version`), so this is the semantic gate beside it.
 fn serve_copy(
 	writer: &mut impl Write,
 	state: &State,
 	negotiated: u32,
 	workspace: &str,
+	job: Job,
+	need: u32,
 	op: impl FnOnce(&SharedRoot, &snip_core::gitrun::CancelToken) -> Response + Send,
 ) -> io::Result<()> {
-	if negotiated < crate::proto::TRANSFER_VERSION {
+	let what = match job {
+		Job::Copy => "copy",
+		Job::PastePlan | Job::PasteApply => "paste",
+	};
+	if negotiated < need {
 		return crate::jobs::write_response(
 			writer,
 			&error(
 				ErrorCode::Unsupported,
-				"copy is not available on this worker yet".into(),
+				format!("{what} is not available on this worker yet"),
 			),
 		);
 	}
 	let (view_deadline, _) = *lock(&state.deadlines);
+	let deadline = if job == Job::PasteApply {
+		crate::jobs::APPLY_DEADLINE.max(view_deadline)
+	} else {
+		view_deadline
+	};
 	let cancel = snip_core::gitrun::CancelToken::new();
-	crate::jobs::run_job(writer, view_deadline, cancel, |job_cancel, _| {
-		match state.jobs.admit(
-			workspace,
-			crate::jobs::JobKind::View,
-			job_cancel,
-		) {
-			Ok(_guard) => {
-				let root = match state.get_shared_root(workspace) {
-					Ok(r) => r,
-					Err(resp) => return resp,
-				};
-				let reply = op(&root, job_cancel);
-				verify_root_unchanged(state, workspace, &root, reply)
+	// A write that runs past its deadline still answers with its own
+	// response: a Timeout here would report a landed write as a failure.
+	let reply = if job == Job::PasteApply {
+		crate::jobs::DeadlineReply::WriteOutcome
+	} else {
+		crate::jobs::DeadlineReply::Fail
+	};
+	crate::jobs::run_job_with(
+		writer,
+		crate::jobs::HEARTBEAT,
+		deadline,
+		cancel,
+		reply,
+		|job_cancel, _| {
+			match state.jobs.admit(
+				workspace,
+				crate::jobs::JobKind::View,
+				job_cancel,
+			) {
+				Ok(_guard) => {
+					let root = match state.get_shared_root(workspace) {
+						Ok(r) => r,
+						Err(resp) => return resp,
+					};
+					let reply = op(&root, job_cancel);
+					if job == Job::PasteApply {
+						// Whatever was written is reported as it is.
+						reply
+					} else {
+						verify_root_unchanged(state, workspace, &root, reply)
+					}
+				}
+				Err(code) => map_admit_error(code),
 			}
-			Err(code) => map_admit_error(code),
-		}
-	})
+		},
+	)
 }
 
 fn error(code: ErrorCode, message: String) -> Response {
@@ -538,7 +796,10 @@ impl State {
 			},
 			Request::ListDir { workspace, path } => self
 				.resolve(&workspace, &path)
-				.and_then(|(root, dir)| list_dir(&root, &dir))
+				.and_then(|(root, dir)| {
+					let cap = self.dir_cap.load(Ordering::SeqCst);
+					list_dir(&root, &dir, cap)
+				})
 				.unwrap_or_else(|e| e),
 			Request::Stat { workspace, path } => self
 				.resolve(&workspace, &path)
@@ -560,9 +821,18 @@ impl State {
 					"Git views are not available on this worker yet".into(),
 				)
 			}
-			Request::Export { .. } | Request::ExportCommits { .. } => error(
+			Request::Export { .. }
+			| Request::ExportCommits { .. }
+			| Request::ExportChanges { .. }
+			| Request::ImportPlan { .. }
+			| Request::ImportApply { .. }
+			| Request::ReplayPlan { .. }
+			| Request::ReplayApply { .. }
+			| Request::Chunk { .. }
+			| Request::FrameChunk { .. }
+			| Request::FrameJoin => error(
 				ErrorCode::BadRequest,
-				"copy requests are served as jobs".into(),
+				"copy and paste requests are served as jobs".into(),
 			),
 			Request::Write { .. } | Request::Rename { .. } => error(
 				ErrorCode::Unsupported,
@@ -597,16 +867,19 @@ impl State {
 	}
 }
 
-/// Lists `dir` inside the shared `root`. A symlink to a folder inside the
-/// share lists as a folder, as the copy engine treats it; one that leads
-/// out of the share (or into `.git`) stays a plain entry the master cannot
-/// open.
+/// Lists `dir` inside the shared `root` as ONE sorted reply (folders
+/// first), at most `cap` entries; more than that is reported as
+/// `truncated`, with no continuation to ask for — one reply is the whole
+/// listing, so two replies can never miss or double a name between pages.
+/// A symlink to a folder inside the share lists as a folder, as the copy
+/// engine treats it; one that leads out of the share (or into `.git`)
+/// stays a plain entry the master cannot open.
 #[allow(clippy::result_large_err)]
-fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
+fn list_dir(root: &Path, dir: &Path, cap: usize) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
 	let mut truncated = false;
-	loop {
+	'scan: loop {
 		let page = match scan.next_page(&ScanBudget::visits(256)) {
 			Ok(page) => page,
 			Err(ScanError::Changed) => {
@@ -618,9 +891,9 @@ fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 			Err(ScanError::Io(err)) => return Err(io_error(err)),
 		};
 		for entry in page.entries {
-			if entries.len() >= MAX_DIR_ENTRIES {
+			if entries.len() >= cap {
 				truncated = true;
-				break;
+				break 'scan;
 			}
 			let path = dir.join(&entry.name);
 			let directory = entry.directory
@@ -635,9 +908,6 @@ fn list_dir(root: &Path, dir: &Path) -> Result<Response, Response> {
 				symlink: entry.symlink,
 				nested_repo,
 			});
-		}
-		if truncated {
-			break;
 		}
 		match page.status {
 			ScanStatus::Complete => break,
