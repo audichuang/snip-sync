@@ -5276,7 +5276,7 @@ checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 
 [[package]]
 name = "snip-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "clap",
  "serde",
@@ -5288,7 +5288,7 @@ dependencies = [
 
 [[package]]
 name = "snip-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arboard",
  "dunce",
@@ -5306,7 +5306,7 @@ dependencies = [
 
 [[package]]
 name = "snip-desktop-native"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arboard",
  "chrono",
@@ -5323,7 +5323,7 @@ dependencies = [
 
 [[package]]
 name = "snip-native-e2e"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "snip-core",
  "tempfile",
@@ -5331,7 +5331,7 @@ dependencies = [
 
 [[package]]
 name = "snip-remote"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "dunce",
  "serde",
