@@ -72,3 +72,21 @@ fn failed_replacement_removes_the_temp_file() {
 	assert!(path.is_dir());
 	assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
 }
+
+/// A new file gets the same mode a plain `fs::write` gives it (0666 less
+/// umask), not the temporary file's owner-only 0600.
+#[cfg(unix)]
+#[test]
+fn a_new_file_gets_the_usual_mode_not_owner_only() {
+	use std::os::unix::fs::PermissionsExt;
+	let dir = tempfile::tempdir().unwrap();
+	let root = root(dir.path());
+	let plain = root.join("plain.txt");
+	fs::write(&plain, "x").unwrap();
+	let pasted = root.join("pasted.txt");
+	write_text_file(&pasted, "x").unwrap();
+	let mode = |p: &std::path::Path| {
+		fs::metadata(p).unwrap().permissions().mode() & 0o777
+	};
+	assert_eq!(mode(&pasted), mode(&plain));
+}
