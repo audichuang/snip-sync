@@ -803,16 +803,30 @@ mod tests {
 		let heartbeat = scaled(Duration::from_millis(10));
 		let deadline = scaled(Duration::from_millis(30));
 
-		// A confirmed write ignores cancellation and finishes late.
+		// A confirmed write ignores cancellation and finishes late: past
+		// the deadline, and only once a heartbeat has gone out (waited for,
+		// not counted during a fixed sleep).
+		let written = buf.0.clone();
 		run_job_with(
 			&mut buf.clone(),
 			heartbeat,
 			deadline,
 			cancel,
 			DeadlineReply::WriteOutcome,
-			|_token, _| {
+			move |_token, _| {
 				let start = Instant::now();
-				while start.elapsed() < scaled(Duration::from_millis(120)) {
+				let bound = scaled(Duration::from_secs(10));
+				let heartbeat_seen = || {
+					let bytes = written.lock().unwrap().clone();
+					let mut cursor = std::io::Cursor::new(bytes);
+					matches!(
+						read_frame::<Response>(&mut cursor),
+						Ok(Some(Response::Pending))
+					)
+				};
+				while (start.elapsed() < deadline * 2 || !heartbeat_seen())
+					&& start.elapsed() < bound
+				{
 					std::thread::sleep(Duration::from_millis(5));
 				}
 				Response::Text {
