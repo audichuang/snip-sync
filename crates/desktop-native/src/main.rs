@@ -798,6 +798,8 @@ pub struct WorkbenchModel {
 	pub bottom_visible: bool,
 	pub dragging: Option<Splitter>,
 	pub last_viewport: (i32, i32),
+	/// Logical window height, for popups that must fit inside it.
+	pub viewport_h: f32,
 	/// E2E control-bounds reporting; `None` unless `SNIP_NATIVE_E2E=1`.
 	pub probes: Option<ui::Probes>,
 	/// Focus requested from a context without a `Window`; applied on render.
@@ -1194,6 +1196,7 @@ impl WorkbenchModel {
 			bottom_visible: true,
 			dragging: None,
 			last_viewport: (0, 0),
+			viewport_h: 0.,
 			probes: ui::Probes::from_env(),
 			pending_focus: None,
 			e2e_read_delay: ui::e2e_read_delay(),
@@ -6200,6 +6203,52 @@ mod tests {
 				assert_eq!(m.remote.recent[0].path, session.workspace.id);
 				assert!(m.workspace_open);
 			});
+		}
+
+		/// A host with many folders in a small window: the menu stays inside
+		/// the window and the path field and both open buttons stay
+		/// reachable, the folder list scrolling on its own.
+		#[gpui::test]
+		fn remote_menu_with_many_folders_fits_a_small_window(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("home");
+			for i in 0..43 {
+				fs::create_dir_all(base.join(format!("folder-{i:02}")))
+					.unwrap();
+			}
+			let (model, cx) = remote_menu(cx);
+			cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+			});
+			settle(cx);
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+			assert_eq!(shown_folder(&model, cx).1.len(), 43);
+			let bottom = |b: gpui::Bounds<gpui::Pixels>| {
+				f32::from(b.origin.y) + f32::from(b.size.height)
+			};
+			let menu = cx.debug_bounds("workspace-menu").expect("menu drawn");
+			assert!(bottom(menu) <= 600., "menu runs off the window: {menu:?}");
+			for id in [
+				"remote-path-input",
+				"btn-remote-open",
+				"btn-remote-open-here",
+			] {
+				let b = cx
+					.debug_bounds(id)
+					.unwrap_or_else(|| panic!("{id} not drawn"));
+				assert!(
+					f32::from(b.origin.y) >= f32::from(menu.origin.y)
+						&& bottom(b) <= bottom(menu),
+					"{id} {b:?} outside the menu {menu:?}"
+				);
+			}
 		}
 
 		/// A listing that lands for a folder or host no longer shown is

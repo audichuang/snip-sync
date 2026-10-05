@@ -2,6 +2,8 @@
 
 use super::*;
 
+/// Window space above the workspace menu (header and button) plus a margin.
+const WORKSPACE_MENU_TOP: f32 = 80.;
 impl WorkbenchModel {
 	// ───────────────────────── header ─────────────────────────
 
@@ -129,10 +131,16 @@ impl WorkbenchModel {
 				.my(px(4.))
 				.bg(rgb(pal().popup_border))
 		};
+		// The menu sits under the header; past the window's height it
+		// scrolls instead of running off screen.
+		let max_h = (self.viewport_h - WORKSPACE_MENU_TOP).max(200.);
 		let panel = div()
 			.id("workspace-menu")
+			.debug_selector(|| "workspace-menu".into())
 			.occlude()
 			.w(px(340.))
+			.when(self.viewport_h > 0., |d| d.max_h(px(max_h)))
+			.overflow_y_scroll()
 			.flex()
 			.flex_col()
 			.p(px(4.))

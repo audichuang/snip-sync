@@ -319,6 +319,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 每格都要截圖（點擊前、點擊後各一張），存在 `$RUN/<ID>/`，再加一份 `action.json`，內容是 bounds、scale、算出的螢幕點和新的日誌行。寫入任何檔案前先 `mkdir -p "$RUN/<ID>"`。
 
+**每一格都從零開始收證據**：開始前記下目前 `app-N.log` 的行數當這一格的日誌起點，只用起點之後的日誌行判定；截圖、oracle、`action.json` 都寫進這一格自己的 `$RUN/<ID>/`。不要沿用上一格的變數、日誌起點或檔名；同一格重做時先把舊的 `$RUN/<ID>/` 改名保留，不要覆寫。
+
 ### 4.1 ssh 主機與選專案（S01–S12，依序做）
 
 | ID | 操作 | 通過線 |
@@ -333,7 +335,7 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | S08 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/edge`，點 `btn-remote-open` | `REMOTE_OPENED: ubuntu ▸ edge`；`~` 展開成對方的家目錄 |
 | S09 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/no-such`，點 `btn-remote-open` | 失敗格：選單裡紅字說資料夾不存在；目前的工作區不變（仍是 edge） |
 | S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `REMOTE_REOPEN` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`；啟動過程畫面不卡（重新連線在背景） |
-| S11 | 對方沒有受測版本：`ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），在 App 選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
+| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
 | S12 | 把視窗調成 900×600（System Events 設成 900×632），開選單並點進一層資料夾 | `remote-path`、`remote-up`、`btn-remote-open-here`、`remote-path-input`、`btn-remote-open` 的 bounds 都 `w,h ≥ 1` 且在內容區裡；長路徑被截斷時 hover 顯示完整路徑；做完調回 1080×720 |
 
 ### 4.2 瀏覽真實專案 rtk（R01–R08）
