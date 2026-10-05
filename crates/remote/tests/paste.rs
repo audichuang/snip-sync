@@ -695,6 +695,56 @@ fn an_apply_with_a_huge_freshness_snapshot_rides_back_in_chunks() {
 	);
 }
 
+/// A relative hook path must not pause Apply even when that file exists.
+#[test]
+fn a_relative_paste_hold_path_does_not_pause_apply() {
+	use std::time::{Duration, Instant};
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir(&ws).unwrap();
+	let text = [entry("a.txt", "first"), entry("b.txt", "second")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	// A real file in the current directory, addressed by its relative name.
+	let hold = tempfile::NamedTempFile::new_in(".").unwrap();
+	let relative = Path::new(hold.path().file_name().unwrap());
+	assert!(!relative.is_absolute() && relative.is_file());
+	std::env::set_var("SNIP_E2E_PASTE_HOLD", relative);
+	let result = client.call_with(
+		&snip_remote::Request::ImportApply {
+			workspace: id,
+			dest: String::new(),
+			text,
+			mapping,
+			selection: unchecked(&[]),
+			expect: planned.expect(),
+		},
+		None,
+		Duration::from_secs(3),
+	);
+	std::env::remove_var("SNIP_E2E_PASTE_HOLD");
+	drop(hold);
+	// On the failing implementation, release and drain the paused worker
+	// before reporting the failure so it cannot leak into the next test.
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while !ws.join("b.txt").exists() && Instant::now() < deadline {
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	assert!(
+		ws.join("b.txt").exists(),
+		"apply must finish within the bound"
+	);
+	assert!(
+		matches!(&result, Ok(snip_remote::Response::Imported(applied)) if applied.created_count == 2 && applied.errors.is_empty()),
+		"a relative hook path must be ignored: {result:?}"
+	);
+	assert_eq!(fs::read(ws.join("a.txt")).unwrap(), b"first");
+	assert_eq!(fs::read(ws.join("b.txt")).unwrap(), b"second");
+}
+
 /// `SNIP_E2E_PASTE_HOLD`: an Apply paused after its first committed write,
 /// with the master's call cut before any answer came back, reports
 /// outcome unknown while the worker keeps that first write — the L05

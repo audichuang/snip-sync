@@ -209,17 +209,17 @@ pub(crate) fn import_plan(
 	}
 }
 
-/// `SNIP_E2E_PASTE_HOLD` names a file: when the variable is set and the
+/// `SNIP_E2E_PASTE_HOLD` names an absolute path: when set and the
 /// file exists, an Apply that just committed its first write waits until
 /// the file disappears (at most 60 s, polled every 50 ms), so a protocol
 /// run can cut the connection mid-write deterministically. Unset, or the
-/// file absent: no pause.
+/// path relative or file absent: no pause.
 fn hold_after_first_write() {
 	let Some(path) = std::env::var_os("SNIP_E2E_PASTE_HOLD") else {
 		return;
 	};
 	let path = PathBuf::from(path);
-	if !path.is_file() {
+	if !path.is_absolute() || !path.is_file() {
 		return;
 	}
 	let deadline =
