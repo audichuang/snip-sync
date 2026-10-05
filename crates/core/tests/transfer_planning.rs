@@ -3844,6 +3844,113 @@ fn commit_replay_apply_replays_the_previewed_payload() {
 	assert!(staged.lines().any(|l| l == "staged.txt"));
 }
 
+#[cfg(unix)]
+#[test]
+fn paste_overwrite_preserves_0755_and_0600_through_a_symlinked_root() {
+	use std::os::unix::fs::{symlink, PermissionsExt};
+	let repo = TestRepo::new("paste-modes");
+	for (name, mode) in [("exec.txt", 0o755), ("private.txt", 0o600)] {
+		repo.write(name, "old\n");
+		fs::set_permissions(
+			repo.path().join(name),
+			fs::Permissions::from_mode(mode),
+		)
+		.unwrap();
+	}
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("link");
+	symlink(repo.path(), &root).unwrap();
+	let plan = plan_import(
+		"// file: exec.txt\npasted\n// file: private.txt\npasted\n",
+		"// file: $FILE_PATH",
+		&[root],
+		&ImportMapping::with_primary(repo.canonical_id()),
+	)
+	.unwrap();
+	let result = plan
+		.apply(&RestoreSelection {
+			overwrite_existing: true,
+			..Default::default()
+		})
+		.unwrap();
+	assert!(result.errors.is_empty(), "{:?}", result.errors);
+	assert_eq!(result.overwritten_count, 2);
+	for (name, mode) in [("exec.txt", 0o755), ("private.txt", 0o600)] {
+		assert_eq!(
+			fs::read_to_string(repo.path().join(name)).unwrap(),
+			"pasted"
+		);
+		assert_eq!(
+			fs::metadata(repo.path().join(name))
+				.unwrap()
+				.permissions()
+				.mode() & 0o777,
+			mode,
+			"{name}"
+		);
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn commit_replay_preserves_0755_and_0600_through_a_symlinked_root() {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+	use std::os::unix::fs::{symlink, PermissionsExt};
+	let repo = TestRepo::new("replay-modes");
+	for (name, mode) in [("exec.txt", 0o755), ("private.txt", 0o600)] {
+		repo.write(name, "old\n");
+		fs::set_permissions(
+			repo.path().join(name),
+			fs::Permissions::from_mode(mode),
+		)
+		.unwrap();
+	}
+	repo.commit("base");
+	let dir = tempfile::tempdir().unwrap();
+	let root = dir.path().join("link");
+	symlink(repo.path(), &root).unwrap();
+	let payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "preserve permissions\n".into(),
+			author_name: "Test".into(),
+			author_email: "test@example.invalid".into(),
+			author_date: "2026-10-05T12:00:00Z".into(),
+			files: ["exec.txt", "private.txt"]
+				.into_iter()
+				.map(|name| CommitFile {
+					path: name.into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some("replayed\n".into()),
+					not_copied: None,
+				})
+				.collect(),
+		}],
+	};
+	let result = CommitReplayPreview::capture(&root, &payload)
+		.unwrap()
+		.apply()
+		.unwrap();
+	assert_eq!(result.failure, None);
+	assert_eq!(result.created.len(), 1);
+	for (name, mode) in [("exec.txt", 0o755), ("private.txt", 0o600)] {
+		assert_eq!(
+			fs::read_to_string(repo.path().join(name)).unwrap(),
+			"replayed\n"
+		);
+		assert_eq!(
+			fs::metadata(repo.path().join(name))
+				.unwrap()
+				.permissions()
+				.mode() & 0o777,
+			mode,
+			"{name}"
+		);
+	}
+}
+
 #[test]
 fn commit_replay_apply_refuses_a_destination_changed_after_preview() {
 	use snip_core::commits::{

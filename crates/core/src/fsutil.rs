@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Strict UTF-8 decode; `None` means "not copyable as text".
@@ -140,25 +140,26 @@ pub(crate) fn sort_names_js_order(names: &mut [OsString]) {
 /// written through — the file its other name or its target holds keeps its
 /// bytes, on every OS. The temporary file is removed when anything fails.
 pub fn write_text_file(path: &Path, content: &str) -> io::Result<()> {
-	if let Some(parent) = path.parent() {
-		fs::create_dir_all(parent)?;
+	let parent = path
+		.parent()
+		.filter(|p| !p.as_os_str().is_empty())
+		.unwrap_or_else(|| Path::new("."));
+	fs::create_dir_all(parent)?;
+	let mut tmp = tempfile::Builder::new()
+		.prefix(".snip-write.")
+		.tempfile_in(parent)?;
+	tmp.write_all(content.as_bytes())?;
+	tmp.flush()?;
+	match fs::symlink_metadata(path) {
+		Ok(info) if info.is_file() => {
+			tmp.as_file().set_permissions(info.permissions())?;
+		}
+		Ok(_) => {}
+		Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+		Err(err) => return Err(err),
 	}
-	static WRITES: std::sync::atomic::AtomicU64 =
-		std::sync::atomic::AtomicU64::new(0);
-	let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-	let stem = path
-		.file_name()
-		.map(|n| n.to_string_lossy().into_owned())
-		.unwrap_or_else(|| "file".into());
-	let tmp = path.with_file_name(format!(
-		".{stem}.snip-write.{n}.{}",
-		std::process::id()
-	));
-	let res = fs::write(&tmp, content).and_then(|()| fs::rename(&tmp, path));
-	if res.is_err() {
-		let _ = fs::remove_file(&tmp);
-	}
-	res
+	tmp.as_file().sync_all()?;
+	tmp.persist(path).map(|_| ()).map_err(|err| err.error)
 }
 
 pub fn delete_file(path: &Path) -> io::Result<()> {
