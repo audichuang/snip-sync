@@ -1301,6 +1301,7 @@ impl Render for WorkbenchModel {
 		let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
 		let s = window.scale_factor();
 		let phys = ((vw * s).round() as i32, (vh * s).round() as i32);
+		self.viewport_h = vh;
 		if self.probes.is_some() && phys != self.last_viewport {
 			self.last_viewport = phys;
 			app_log!("[APP:VIEWPORT: {}x{}]", phys.0, phys.1);

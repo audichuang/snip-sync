@@ -3,6 +3,9 @@
 
 use super::*;
 
+/// Height of the folder list before it scrolls: about eight rows.
+const REMOTE_FOLDERS_MAX_H: f32 = 240.;
+
 impl WorkbenchModel {
 	pub(super) fn render_remote_section(
 		&self,
@@ -94,6 +97,51 @@ impl WorkbenchModel {
 					)
 					.into_any_element(),
 			);
+			// The path field stays right under the folder shown, so a long
+			// folder list never pushes it out of reach.
+			out.push(
+				div()
+					.flex()
+					.flex_row()
+					.gap(px(6.))
+					.pl(px(32.))
+					.pr(px(8.))
+					.py(px(4.))
+					.child(
+						div()
+							.id("remote-path-input")
+							.debug_selector(|| "remote-path-input".into())
+							.relative()
+							.flex_1()
+							.min_w_0()
+							.child(self.remote_path_input.clone())
+							.children(probe(log, "remote-path-input")),
+					)
+					.child(
+						button(
+							"btn-remote-open",
+							t(
+								if busy {
+									"remote_opening"
+								} else {
+									"remote_open_path"
+								},
+								loc,
+							),
+							Btn::Default,
+							!busy,
+							86,
+						)
+						.debug_selector(|| "btn-remote-open".into())
+						.when(!busy, |d| {
+							d.on_click(cx.listener(|this, _, _, cx| {
+								this.open_remote_typed(cx);
+							}))
+						})
+						.children(probe(log, "btn-remote-open")),
+					)
+					.into_any_element(),
+			);
 			if !crate::remote::is_root(&browse.path) {
 				out.push(
 					menu_row("remote-up", 84)
@@ -130,13 +178,14 @@ impl WorkbenchModel {
 						.into_any_element(),
 				),
 				Some(Ok(listing)) => {
+					let mut rows = Vec::with_capacity(listing.folders.len());
 					for (fx, name) in listing.folders.iter().enumerate() {
 						let id = format!("remote-folder:{fx}");
 						let tip_path =
 							crate::remote::child_path(&listing.path, name);
 						let enter = name.clone();
 						let selector = id.clone();
-						out.push(
+						rows.push(
 							menu_row(SharedString::from(id.clone()), 84)
 								.debug_selector(move || selector)
 								.pl(px(32.))
@@ -154,49 +203,19 @@ impl WorkbenchModel {
 								.into_any_element(),
 						);
 					}
+					// Many folders scroll inside their own area.
+					out.push(
+						div()
+							.id("remote-folders")
+							.flex()
+							.flex_col()
+							.max_h(px(REMOTE_FOLDERS_MAX_H))
+							.overflow_y_scroll()
+							.children(rows)
+							.into_any_element(),
+					);
 				}
 			}
-			out.push(
-				div()
-					.flex()
-					.flex_row()
-					.gap(px(6.))
-					.pl(px(32.))
-					.pr(px(8.))
-					.py(px(4.))
-					.child(
-						div()
-							.id("remote-path-input")
-							.relative()
-							.flex_1()
-							.min_w_0()
-							.child(self.remote_path_input.clone())
-							.children(probe(log, "remote-path-input")),
-					)
-					.child(
-						button(
-							"btn-remote-open",
-							t(
-								if busy {
-									"remote_opening"
-								} else {
-									"remote_open_path"
-								},
-								loc,
-							),
-							Btn::Default,
-							!busy,
-							86,
-						)
-						.when(!busy, |d| {
-							d.on_click(cx.listener(|this, _, _, cx| {
-								this.open_remote_typed(cx);
-							}))
-						})
-						.children(probe(log, "btn-remote-open")),
-					)
-					.into_any_element(),
-			);
 		}
 		if let Some((ok, text)) = &self.remote.message {
 			out.push(
