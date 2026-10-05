@@ -42,7 +42,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   使用者寫原始 regex 時很少碰到;真的出現分歧再逐項轉譯。
 - git 來源(graph:commit / 區間)被過濾規則排除的**刪除檔**不會進 payload。TS graphCopy 會先放刪除檔再過濾,
   會把被排除的檔案(例如 `secrets.env`)的舊內容帶出去;Rust 刻意不照做。
-- 貼上(檔案模式)與 commit 重播對「已存在的硬連結別名」的覆寫會拒絕:覆寫目標若 link count > 1(`fsutil::is_multi_link`),該項在預覽標成 `UNRESOLVED_PATH` / `UNSAFE_PATH` 跳過,執行期才出現的別名則該次寫入回報 unsafe path、重播跳過該檔。TS 沒有這個檢查:hard link 的目錄項在 root 內,路徑守門(`lands_in_git_dir`、containment)全部通過,但原地覆寫會透過共用的 inode 改到別名指向的檔案(`.git/config`、工作區外檔案)。刪除不受影響(unlink 只拆本目錄項)。這是安全差異,刻意與 TS 不同。link count 的讀取是 Unix only(NTFS 硬連結存在,但 stable std 取不到連結數、workspace 又禁止 unsafe),Windows 上此守門不存在。
+- 所有覆寫寫入(貼上與 commit 重播的 `fsutil::write_text_file`)以「同資料夾暫存檔 + rename」**取代目錄項目**,不是像 TS 一樣原地截斷:hard link 的另一個名字、symlink 指向的檔案永遠不會被寫穿(`.git/config`、工作區外檔案),且行為在 macOS / Linux / Windows 一致,不讀 link count(NTFS 硬連結同樣被涵蓋)。代價是覆寫會拆掉目標上的 symlink(以一般檔案取代連結本身);寫入後目標是新的 inode。刪除不受影響(unlink 只拆本目錄項)。(早期的 link-count 守門已移除:它 Unix only,Windows 上完全不設防。)這是安全差異,刻意與 TS 不同。
 - commit 模式重播時,路徑逐一放在 `git add` / `git commit` 的參數上。Windows 命令列約 32K 字元上限,
   一個 commit 動到數千個檔案時會失敗;需要時改用 `--pathspec-from-file=- --pathspec-file-nul`。
 - commit 模式不帶檔案 mode(`CommitFile` 沒有 mode 欄位;剪貼簿格式由 ClipCodeVSCode 擁有,不在這裡改):

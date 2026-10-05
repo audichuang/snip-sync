@@ -11,9 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::format::{ascii_trim, ChangeType, ParsedEntry};
-use crate::fsutil::{
-	delete_file, is_multi_link, must_not_overwrite, write_text_file,
-};
+use crate::fsutil::{delete_file, must_not_overwrite, write_text_file};
 use crate::paths::{
 	escapes_all_roots, has_git_segment, lands_in_git_dir,
 	resolve_delete_target, resolve_write_target, RejectReason,
@@ -223,15 +221,6 @@ pub fn plan_restore<P: AsRef<Path>>(
 			continue;
 		}
 
-		// An existing hard link shares its file with another name: writing
-		// it in place would edit that name's file (a Git directory's, or
-		// one outside the roots) through this entry.
-		if is_multi_link(&t.absolute_path) {
-			plan.skipped_operations
-				.push(skip(None, SkipReason::UnresolvedPath));
-			continue;
-		}
-
 		if must_not_overwrite(&t.absolute_path) {
 			plan.skipped_operations
 				.push(skip(Some(t.relative_path), SkipReason::NonUtf8Target));
@@ -341,11 +330,8 @@ fn run_create(
 		Ok(_) if selection.skip_existing || !selection.overwrite_existing => {
 			return Ok(CreateOutcome::Skipped)
 		}
-		// A hard link that appeared after the preview: refused like any
-		// other unsafe target.
-		Ok(_) if is_multi_link(&op.absolute_path) => {
-			return Err(format!("{}: unsafe path", op.relative_path))
-		}
+		// A hard link that appeared after the preview needs no check of its
+		// own: the write replaces this entry, never the shared file.
 		Ok(_) => CreateOutcome::Overwritten,
 		Err(_) => CreateOutcome::Created,
 	};
@@ -777,13 +763,13 @@ mod tests {
 	}
 
 	/// A hard link inside the destination sharing its inode with a Git
-	/// directory's file: overwriting the alias in place would edit that
-	/// file through another name, around the Git-directory guard. The
-	/// alias is a skipped row in the plan, and a write that reaches the
-	/// execution anyway fails as an unsafe path.
+	/// directory's file: the overwrite REPLACES the alias's directory entry,
+	/// so `.git/config` keeps its bytes and the alias path ends up a
+	/// regular file holding the pasted content. Same behaviour on every
+	/// OS — nothing reads a link count.
 	#[cfg(unix)]
 	#[test]
-	fn an_overwrite_of_a_hard_link_alias_of_git_metadata_is_refused() {
+	fn an_overwrite_of_a_hard_link_alias_of_git_metadata_writes_a_new_file() {
 		let (_d, root) = tmp();
 		fake_git_dir(&root.join(".git"));
 		fs::write(root.join(".git/config"), "[core]\n").unwrap();
@@ -792,57 +778,34 @@ mod tests {
 		let entries =
 			[entry("config-alias.txt", "owned"), entry("ok.txt", "x")];
 		let plan = plan_restore(&[&root], &entries);
-		assert_eq!(rels(&plan), ["ok.txt"]);
-		assert_eq!(plan.skipped_operations.len(), 1);
-		assert_eq!(plan.skipped_operations[0].raw_path, "config-alias.txt");
-		assert_eq!(
-			plan.skipped_operations[0].reason,
-			SkipReason::UnresolvedPath
-		);
-		let mut forced = plan.clone();
-		forced.create_operations.push(CreateOperation {
-			relative_path: "config-alias.txt".into(),
-			absolute_path: root.join("config-alias.txt"),
-			content: "owned".into(),
-			existed: true,
-			root_path: root.clone(),
-		});
-		let result = execute_restore_plan(&forced, &overwrite());
-		assert_eq!(result.errors, ["config-alias.txt: unsafe path"]);
-		assert_eq!(result.created_count + result.overwritten_count, 1);
+		assert_eq!(rels(&plan), ["config-alias.txt", "ok.txt"]);
+		assert!(plan.skipped_operations.is_empty());
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert!(result.errors.is_empty());
+		assert_eq!(result.created_count, 1);
+		assert_eq!(result.overwritten_count, 1);
 		assert_eq!(read(root.join(".git/config")), "[core]\n");
-		assert_eq!(read(root.join("config-alias.txt")), "[core]\n");
+		assert_eq!(read(root.join("config-alias.txt")), "owned");
 		assert_eq!(read(root.join("ok.txt")), "x");
 	}
 
-	/// The same alias trick against a file outside the destination's roots.
+	/// The same alias trick against a file outside the destination's roots:
+	/// the entry is replaced here, the outside name keeps its bytes.
 	#[cfg(unix)]
 	#[test]
-	fn an_overwrite_of_a_hard_link_alias_outside_the_roots_is_refused() {
+	fn an_overwrite_of_a_hard_link_alias_outside_the_roots_writes_a_new_file() {
 		let (_d, root) = tmp();
 		let outside_dir = tempfile::tempdir().unwrap();
 		let outside = outside_dir.path().join("precious.txt");
 		fs::write(&outside, "keep\n").unwrap();
 		fs::hard_link(&outside, root.join("alias.txt")).unwrap();
 		let plan = plan_restore(&[&root], &[entry("alias.txt", "owned")]);
-		assert!(plan.create_operations.is_empty());
-		assert_eq!(plan.skipped_operations.len(), 1);
-		assert_eq!(plan.skipped_operations[0].raw_path, "alias.txt");
-		assert_eq!(
-			plan.skipped_operations[0].reason,
-			SkipReason::UnresolvedPath
-		);
-		let mut forced = plan.clone();
-		forced.create_operations.push(CreateOperation {
-			relative_path: "alias.txt".into(),
-			absolute_path: root.join("alias.txt"),
-			content: "owned".into(),
-			existed: true,
-			root_path: root.clone(),
-		});
-		let result = execute_restore_plan(&forced, &overwrite());
-		assert_eq!(result.errors, ["alias.txt: unsafe path"]);
+		assert_eq!(rels(&plan), ["alias.txt"]);
+		let result = execute_restore_plan(&plan, &overwrite());
+		assert!(result.errors.is_empty());
+		assert_eq!(result.overwritten_count, 1);
 		assert_eq!(fs::read_to_string(&outside).unwrap(), "keep\n");
+		assert_eq!(read(root.join("alias.txt")), "owned");
 	}
 
 	#[test]

@@ -59,35 +59,6 @@ pub fn must_not_overwrite(path: &Path) -> bool {
 	)
 }
 
-/// True when `path` exists with more than one directory entry (a hard
-/// link). Overwriting such a file in place would edit what its other
-/// names hold — a Git directory's files, a file outside the destination —
-/// through this entry, around every path-based guard. A missing file, a
-/// directory, or a symlink's own entry (one link) is not.
-pub fn is_multi_link(path: &Path) -> bool {
-	let Ok(info) = fs::metadata(path) else {
-		return false;
-	};
-	if !info.is_file() {
-		return false;
-	}
-	#[cfg(unix)]
-	{
-		std::os::unix::fs::MetadataExt::nlink(&info) > 1
-	}
-	// Windows: `MetadataExt::number_of_links` is unstable (`windows_by_handle`)
-	// and the workspace forbids `unsafe`, so the link count cannot be read
-	// here; the guard is Unix-only (documented in porting-notes).
-	#[cfg(not(unix))]
-	{
-		false
-	}
-	#[cfg(not(any(unix, windows)))]
-	{
-		false
-	}
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalkItem {
 	File(PathBuf),
@@ -163,12 +134,31 @@ pub(crate) fn sort_names_js_order(names: &mut [OsString]) {
 	});
 }
 
-/// Writes UTF-8 `content`, creating parent directories as needed.
+/// Writes UTF-8 `content` by REPLACING the directory entry, creating parent
+/// directories as needed: a temporary file in the same folder is written and
+/// renamed over `path`. A hard link or a symlink at `path` is therefore never
+/// written through — the file its other name or its target holds keeps its
+/// bytes, on every OS. The temporary file is removed when anything fails.
 pub fn write_text_file(path: &Path, content: &str) -> io::Result<()> {
 	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent)?;
 	}
-	fs::write(path, content)
+	static WRITES: std::sync::atomic::AtomicU64 =
+		std::sync::atomic::AtomicU64::new(0);
+	let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	let stem = path
+		.file_name()
+		.map(|n| n.to_string_lossy().into_owned())
+		.unwrap_or_else(|| "file".into());
+	let tmp = path.with_file_name(format!(
+		".{stem}.snip-write.{n}.{}",
+		std::process::id()
+	));
+	let res = fs::write(&tmp, content).and_then(|()| fs::rename(&tmp, path));
+	if res.is_err() {
+		let _ = fs::remove_file(&tmp);
+	}
+	res
 }
 
 pub fn delete_file(path: &Path) -> io::Result<()> {
@@ -344,5 +334,58 @@ mod tests {
 		delete_file(&p).unwrap();
 		assert!(!p.exists());
 		assert!(delete_file(&p).is_err());
+	}
+
+	/// An overwrite REPLACES the directory entry instead of truncating the
+	/// file in place: a handle opened before the write still reads the old
+	/// bytes afterwards. Platform-independent — a hard link's other name or
+	/// a symlink's target is exactly such a handle's file.
+	#[test]
+	fn write_replaces_the_entry_not_the_open_file() {
+		use std::io::Read;
+		let dir = tempfile::tempdir().unwrap();
+		let p = dir.path().join("f.txt");
+		write_text_file(&p, "old").unwrap();
+		let mut before = fs::File::open(&p).unwrap();
+		write_text_file(&p, "brand new").unwrap();
+		let mut seen = String::new();
+		before.read_to_string(&mut seen).unwrap();
+		assert_eq!(
+			seen, "old",
+			"the previous entry's bytes must survive an overwrite"
+		);
+		assert_eq!(fs::read_to_string(&p).unwrap(), "brand new");
+		// A second overwrite replaces the replaced entry again.
+		write_text_file(&p, "again").unwrap();
+		assert_eq!(fs::read_to_string(&p).unwrap(), "again");
+		// Nothing temporary is left in the folder.
+		let left: Vec<_> = fs::read_dir(dir.path())
+			.unwrap()
+			.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+			.collect();
+		assert_eq!(left, vec!["f.txt".to_string()]);
+	}
+
+	/// A symlink at the write target is itself replaced, never written
+	/// through: whatever the link points at keeps its bytes.
+	#[cfg(unix)]
+	#[test]
+	fn write_replaces_a_symlink_entry_not_its_target() {
+		use std::os::unix::fs::symlink;
+		let dir = tempfile::tempdir().unwrap();
+		let target = dir.path().join("real.txt");
+		fs::write(&target, "precious\n").unwrap();
+		let link = dir.path().join("link.txt");
+		symlink(&target, &link).unwrap();
+		write_text_file(&link, "owned\n").unwrap();
+		assert_eq!(fs::read_to_string(&target).unwrap(), "precious\n");
+		assert_eq!(fs::read_to_string(&link).unwrap(), "owned\n");
+		assert!(
+			!fs::symlink_metadata(&link)
+				.unwrap()
+				.file_type()
+				.is_symlink(),
+			"the link entry itself is now a regular file"
+		);
 	}
 }

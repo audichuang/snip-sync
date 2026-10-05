@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::blob::{BlobRead, BlobReader, NotText};
-use crate::fsutil::{is_multi_link, must_not_overwrite, write_text_file};
+use crate::fsutil::{must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::gitsrc::{Git, GitError, RawZ, EMPTY_TREE};
 use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
@@ -1335,20 +1335,8 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 	// deleted symlink ancestor, or a case-only alias on a case-insensitive
 	// filesystem, still reads the real disk and the preview may disagree
 	// with Apply.
-	// A hard link shares its file with another name: writing it in place
-	// would edit what that name holds (a Git directory's, or one outside
-	// the repository) through this entry. A symlink is replaced, not
-	// written through; a multi-link file is refused as unsafe.
-	if !deleted
-		&& !layout.overrides.contains_key(&abs)
-		&& !is_symlink(&abs)
-		&& is_multi_link(&abs)
-	{
-		plan.skip_reason = Some(ReplaySkipReason::UnsafePath);
-		plan.existed = abs.exists();
-		plan.absolute_path = Some(abs);
-		return plan;
-	}
+	// A hard link needs no check of its own: the write replaces this entry,
+	// never the shared file (see `fsutil::write_text_file`).
 	if !deleted
 		&& !layout.overrides.contains_key(&abs)
 		&& !is_symlink(&abs)
@@ -1940,11 +1928,6 @@ fn replay_commit(
 			)
 			.into());
 		}
-		// A hard link would carry the write to the file its other names
-		// hold, around the Git-directory guard.
-		if !is_symlink(abs) && is_multi_link(abs) {
-			return Err(format!("{}: unsafe path", f.path).into());
-		}
 	}
 
 	// Deletions first: a rename swap or a rename onto a re-added path must
@@ -1968,10 +1951,8 @@ fn replay_commit(
 		if unsafe_replay_target(root, abs) {
 			return Err(format!("{}: unsafe path", f.path).into());
 		}
-		if is_symlink(abs) {
-			// Replace the link itself; writing would follow it.
-			fs::remove_file(abs).map_err(|e| format!("{}: {e}", f.path))?;
-		}
+		// The write replaces the entry: a symlink or a hard link here is
+		// itself replaced, never written through.
 		write_text_file(abs, content)
 			.map_err(|e| format!("{}: {e}", f.path))?;
 		paths.push(&f.path);
@@ -3702,12 +3683,13 @@ mod tests {
 		assert_eq!(dst.git(&["show", "HEAD:b.txt"]), "b");
 	}
 
-	/// A write target that is a hard link alias of a Git directory's file
-	/// is skipped in the preview and refused at the write: overwriting it
-	/// in place would edit `.git/config` through the alias.
+	/// A write target that is a hard link alias of a Git directory's file:
+	/// the replay's write REPLACES the directory entry, so `.git/config`
+	/// keeps its bytes and the alias path ends up a regular file with the
+	/// payload's content. Same on every OS — nothing reads a link count.
 	#[cfg(unix)]
 	#[test]
-	fn a_replay_refuses_a_hard_link_alias_of_a_git_file() {
+	fn a_replay_replaces_a_hard_link_alias_of_a_git_file() {
 		let repo = Repo::new("main");
 		repo.write("old.txt", b"base\n");
 		repo.commit("init", "2020-01-01T00:00:00+00:00");
@@ -3734,25 +3716,21 @@ mod tests {
 			}],
 		};
 		let plan = plan_commit_replay(&repo.open(), &payload);
-		let file = &plan.commits[0].files[0];
-		assert_eq!(file.skip_reason, Some(ReplaySkipReason::UnsafePath));
+		assert_eq!(plan.commits[0].files[0].action, ReplayAction::Write);
 		let result = replay(&repo.open(), &payload);
-		assert_eq!(result.failure, None, "the file is only skipped");
+		assert_eq!(result.failure, None);
 		assert_eq!(
 			fs::read_to_string(repo.path().join(".git/config")).unwrap(),
-			config
+			config,
+			"the alias's other name is never written through"
 		);
 		assert_eq!(
 			fs::read_to_string(repo.path().join("alias.txt")).unwrap(),
-			config
+			"owned\n"
 		);
 
-		// An alias that appears after the preview is skipped at the write,
-		// like a target that turned non-UTF-8: nothing reaches
-		// `.git/config` through it.
+		// An alias that appears after the preview is replaced the same way.
 		fs::remove_file(repo.path().join("alias.txt")).unwrap();
-		let plan = plan_commit_replay(&repo.open(), &payload);
-		assert_eq!(plan.commits[0].files[0].action, ReplayAction::Write);
 		fs::hard_link(
 			repo.path().join(".git/config"),
 			repo.path().join("alias.txt"),
@@ -3765,7 +3743,7 @@ mod tests {
 		);
 		assert_eq!(
 			fs::read_to_string(repo.path().join("alias.txt")).unwrap(),
-			config
+			"owned\n"
 		);
 	}
 

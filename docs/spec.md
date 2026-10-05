@@ -69,7 +69,7 @@
   (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
   這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
 - 安全規則照 porting-notes 第 3 節:路徑片段等於 `.git`(ASCII 不區分大小寫,含 Win32 結尾點或空白拼寫如 `.git.`)視為 unsafe/unresolved 拒絕(檔案模式的寫入與刪除、commit 模式的 `path`/`old_path` 皆阻擋)、路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、寫入或刪除的目標把 symlink 解析到底後落在 Git 目錄(repo 的 `.git`、bare repo、獨立 git dir)裡的,規劃時列為略過(檔案模式 UNRESOLVED_PATH、commit 模式 UnsafePath)、寫入前再檢查一次(只拒絕那一筆,其餘照寫)、
-  placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8。
+  placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8,而且一律以「同資料夾暫存檔 + rename」**取代目錄項目**:硬連結或 symlink 的另一個名字(或指向的檔案)永遠不會被寫穿,三個作業系統一致。
 - CLI 補充(現行行為/CLI 於階段 6 已切換):絕對路徑在 sanitize 前先解析(root 內部、跨機器後綴 → 相對路徑,同 TS);絕對 [DELETED] 解析不到 root → 拒絕(視為 unsafe/unresolved 跳過,同 TS);寫入對不到 root 的 POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`)→ 去首斜線放主 root 下(同 TS);帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因 `sanitize_relative_path` 的絕對路徑/磁碟機檢查(`is_absolute_path`/`has_drive_slash`)而跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`。CLI 只有單一 root。`paste` 的 `--repo` 必須已存在,否則 exit 1(見 porting-notes「已知且接受的差異」)。
 - 目的端路徑為目錄、FIFO 等非一般檔案時整批以 `DestinationNotRegular` / `SpecialFile` 拒絕(含 `--dry-run`,exit 1;錯誤訊息明確提示貼上拒絕覆寫非一般檔案),見 porting-notes「已知且接受的差異」。父層片段為一般檔案或目的端為懸空 symlink 時亦以 `TransferError::Io` 整批拒絕(exit 1),同見該條目。
 
