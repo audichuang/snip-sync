@@ -199,7 +199,9 @@ check "folders first" bash -c "'$SNIP' remote ls h $WD/edge | head -1 | grep -q 
 check "a Chinese name with spaces" bash -c "'$SNIP' remote cat h $WD/edge 'src/deep/中文 有空白.txt' | grep -q 深層"
 check "stat of an empty file" bash -c "'$SNIP' remote stat h $WD/edge empty.txt | grep -q '^file	0	'"
 check "exactly 1 MiB is served" test "$("$SNIP" remote cat h "$WD/edge" exact-1MiB.txt | wc -c | tr -d ' ')" = 1048576
-check "1200 entries are cut at 1000" test "$("$SNIP" remote ls h "$WD/edge" manydir 2>/dev/null | wc -l | tr -d ' ')" = 1000
+# The listing pages past the worker's 1000-entry page size: every one of
+# the 1200 entries arrives exactly once.
+check "1200 entries all listed, none twice" bash -c "n=\$('$SNIP' remote ls h '$WD/edge' manydir 2>/dev/null | wc -l | tr -d ' '); u=\$('$SNIP' remote ls h '$WD/edge' manydir 2>/dev/null | sort -u | wc -l | tr -d ' '); test \$n = 1200 && test \$u = 1200"
 check "a nested repo is a folder" bash -c "'$SNIP' remote stat h $WD/edge nested | grep -q '^directory'"
 if w <<<"[ -L '$WD/edge/inner-link' ]"; then
 	check "a symlink inside the workspace is followed" bash -c "'$SNIP' remote ls h $WD/edge inner-link | grep -qx deep/"
