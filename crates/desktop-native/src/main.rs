@@ -9156,6 +9156,39 @@ mod tests {
 			});
 		}
 
+		/// The menu's path field keeps the focus after the menu closes, and a
+		/// key sent to a field no longer drawn reaches no listener: the first
+		/// Cmd+V after opening a remote folder from the menu did nothing.
+		#[gpui::test]
+		fn keys_reach_the_workbench_after_the_workspace_menu_closes(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&shared).unwrap();
+			let (model, cx, _worker) =
+				open_remote(cx, &shared, Default::default());
+			let reaches = |cx: &mut VisualTestContext| {
+				cx.update(|window, cx| {
+					model.read(cx).focus_handle.contains_focused(window, cx)
+				})
+			};
+			model.read_with(cx, |m, _| {
+				assert!(m.remote.session.is_some() && !m.workspace_menu);
+			});
+			assert!(reaches(cx), "after opening a remote folder");
+
+			model.update(cx, |m, cx| {
+				m.toggle_workspace_menu(cx);
+				m.browse_remote_host(0, cx);
+			});
+			settle(cx);
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| assert!(!m.workspace_menu));
+			assert!(reaches(cx), "after Escape in the path field");
+		}
+
 		/// The workspace menu closes on Escape in the pairing form and on a
 		/// second press of its own button, as a popup menu should.
 		#[gpui::test]
