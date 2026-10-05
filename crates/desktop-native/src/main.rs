@@ -8298,6 +8298,38 @@ mod tests {
 				fs::read_to_string(alpha.join("replayed.txt")).unwrap(),
 				"replayed\n"
 			);
+
+			// A paste several chunks long goes out in pieces; it is held to
+			// the same preview limit (MAX_RETAINED_PREVIEW_BYTES) as a local
+			// paste.
+			let c1 = "a".repeat(900_000);
+			let c2 = "b".repeat(900_000);
+			let c3 = "c".repeat(900_000);
+			let payload = format!(
+				"// FILE: chunk_1.txt\n{c1}\n// FILE: chunk_2.txt\n{c2}\n// FILE: chunk_3.txt\n{c3}\n"
+			);
+			assert!(payload.len() > 2 * snip_remote::proto::CHUNK_BYTES);
+			remote_paste_preview(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.items.len(), 3);
+			});
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
+			});
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_1.txt")).unwrap(),
+				c1
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_2.txt")).unwrap(),
+				c2
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_3.txt")).unwrap(),
+				c3
+			);
 		}
 
 		/// Prefix rows offer the remote workspace's repositories, shown as
