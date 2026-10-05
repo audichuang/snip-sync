@@ -14,6 +14,20 @@ lint:
 fmt:
 	cargo fmt --all
 
+# Frees build output: this checkout's target/, its worktrees' target/, and on macOS the
+# preflight container's target/ volumes of this checkout and of every deleted clone or
+# worktree (12-25 GB each, otherwise kept until the next preflight).
+clean:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cargo clean
+	git worktree list --porcelain | sed -n 's/^worktree //p' | tail -n +2 | while IFS= read -r w; do
+		if [ -d "$w/target" ]; then rm -rf "$w/target" && echo "removed $w/target"; fi
+	done
+	if command -v container >/dev/null 2>&1 && container system status >/dev/null 2>&1; then
+		scripts/linux_container.sh --prune-all
+	fi
+
 # On Linux this is preflight-linux. Elsewhere this OS's checks run on the host, then the
 # Linux jobs run in a container (scripts/linux_container.sh), native acceptance included.
 # Everything CI runs that a machine can run (see .github/workflows/ci.yml for the rest).

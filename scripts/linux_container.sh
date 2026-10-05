@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs a command in the Linux preflight container: `scripts/linux_container.sh just preflight-linux`.
 # `--clean` removes this checkout's containers, volumes, images and kernel cache instead;
-# `--prune` only removes the target/ volumes of checkouts that no longer exist.
+# `--prune` only removes the target/ volumes of checkouts that no longer exist;
+# `--prune-all` also removes this checkout's (`just clean` uses it).
 # Uses Apple's `container` (macOS 26+, Apple silicon): brew install container,
 # then container system start --enable-kernel-install.
 # The checkout is mounted read-only at its host path, so receipts and fixture paths
@@ -83,6 +84,12 @@ prune_volumes() {
 }
 prune_volumes
 if [ "${1:-}" = --prune ]; then
+	exit 0
+fi
+if [ "${1:-}" = --prune-all ]; then
+	if container volume rm "$target_volume" >/dev/null 2>&1; then
+		echo "linux_container: removed $target_volume ($ROOT)" >&2
+	fi
 	exit 0
 fi
 
