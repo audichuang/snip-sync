@@ -6,7 +6,7 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -46,10 +46,11 @@ const MAX_BANNER: usize = 64 * 1024;
 const MAX_STDERR: usize = 8 * 1024;
 /// Idle connections kept per worker: each is an ssh process.
 const POOL: usize = 2;
-/// Frames buffered between the worker's stdout and the caller. Bounded so
-/// a worker cannot make the master allocate without end while its
-/// connection sits idle in the pool; at [`MAX_FRAME`] a piece, retained
-/// bytes are bounded by [`FRAME_QUEUE`] × 8 MiB.
+/// Frames buffered between the worker's stdout and the caller. During a
+/// call a full queue BLOCKS the pump on `send` — backpressure, so a reply
+/// larger than the queue still reaches a slow consumer whole. While the
+/// connection sits idle the queue plus one blocking `send` bound what a
+/// speaking worker can make the master retain: [`FRAME_QUEUE`] × 8 MiB.
 const FRAME_QUEUE: usize = 16;
 pub const CALL_LIMIT_DEFAULT: Duration = Duration::from_secs(30);
 /// A paste Apply: longer than the worker's own deadline for it, so the
@@ -149,6 +150,11 @@ pub struct Connection {
 	/// Frames queued and not yet consumed, shared with the read thread.
 	/// Above zero while idle, the worker is speaking without a request.
 	retained: Arc<AtomicUsize>,
+	/// True while this connection's master is inside an exchange (request
+	/// sent, its answer not fully consumed): frames may arrive, and the
+	/// pump applies backpressure instead of hanging up. Shared with the
+	/// read thread.
+	in_flight: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -157,15 +163,16 @@ impl Connection {
 		transport: &Transport,
 		my_name: &str,
 	) -> Result<Self, RemoteError> {
-		let (writer, frames, child, stderr, retained) = match transport {
-			Transport::Command(argv) => spawn(argv)?,
-			Transport::InProcess(worker) => {
-				let (req_w, res_r) = worker.connect_in_process()?;
-				let writer: Box<dyn IoWrite + Send> = Box::new(req_w);
-				let (frames, retained) = read_frames(res_r);
-				(writer, frames, None, Arc::default(), retained)
-			}
-		};
+		let (writer, frames, child, stderr, retained, in_flight) =
+			match transport {
+				Transport::Command(argv) => spawn(argv)?,
+				Transport::InProcess(worker) => {
+					let (req_w, res_r) = worker.connect_in_process()?;
+					let writer: Box<dyn IoWrite + Send> = Box::new(req_w);
+					let (frames, retained, in_flight) = read_frames(res_r);
+					(writer, frames, None, Arc::default(), retained, in_flight)
+				}
+			};
 		let mut conn = Self {
 			writer,
 			frames,
@@ -177,15 +184,20 @@ impl Connection {
 			broken: false,
 			frames_seen: 0,
 			retained,
+			in_flight,
 		};
 		let hello = Request::Hello {
 			version: PROTOCOL_VERSION,
 			name: my_name.to_string(),
 			max_version: Some(PROTOCOL_MAX),
 		};
+		// The hello exchange is a call: its reply may arrive before the
+		// master waits for it, so the pump must see it as in flight.
+		conn.in_flight.store(true, Ordering::SeqCst);
 		let reply = conn
 			.send_guarded(&hello, None, Instant::now() + CONNECT_TIMEOUT)
 			.and_then(|()| conn.recv(CONNECT_TIMEOUT));
+		conn.in_flight.store(false, Ordering::SeqCst);
 		match reply {
 			Ok(Some(Response::Hello {
 				name,
@@ -277,9 +289,11 @@ impl Connection {
 		// not only the wait for the answer.
 		let deadline = Instant::now() + limit;
 		let mut frames = 0;
+		self.in_flight.store(true, Ordering::SeqCst);
 		let res = self
 			.send_guarded(request, cancel, deadline)
 			.and_then(|()| exchange(self, cancel, deadline, &mut frames));
+		self.in_flight.store(false, Ordering::SeqCst);
 		self.frames_seen = frames;
 		if res.is_err() && !matches!(res, Err(RemoteError::Refused { .. })) {
 			self.broken = true;
@@ -408,13 +422,15 @@ pub(crate) fn start_message(code: Option<i32>, stderr: &str) -> String {
 }
 
 /// A started worker: where to write requests, the frames it answers, the
-/// process to stop, what it said on stderr, and its retained-frame counter.
+/// process to stop, what it said on stderr, its retained-frame counter, and
+/// the in-flight flag shared with the read thread.
 type Started = (
 	Box<dyn IoWrite + Send>,
 	Frames,
 	Option<Child>,
 	Arc<Mutex<Vec<u8>>>,
 	Arc<AtomicUsize>,
+	Arc<AtomicBool>,
 );
 
 fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
@@ -456,7 +472,9 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 	let mut stdout = BufReader::new(stdout);
 	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
 	let retained = Arc::new(AtomicUsize::new(0));
+	let in_flight = Arc::new(AtomicBool::new(false));
 	let pump_retained = Arc::clone(&retained);
+	let pump_in_flight = Arc::clone(&in_flight);
 	std::thread::Builder::new()
 		.name("snip-remote-read".into())
 		.spawn(move || {
@@ -464,10 +482,10 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 				let _ = tx.send(Err(err));
 				return;
 			}
-			pump_frames(stdout, tx, pump_retained);
+			pump_frames(stdout, tx, pump_retained, pump_in_flight);
 		})?;
 	let writer: Box<dyn IoWrite + Send> = Box::new(stdin);
-	Ok((writer, rx, Some(child), stderr, retained))
+	Ok((writer, rx, Some(child), stderr, retained, in_flight))
 }
 
 /// Reads up to the [`PREAMBLE`] line, skipping what a login shell printed.
@@ -497,36 +515,47 @@ pub(crate) fn skip_banner(r: &mut impl BufRead) -> io::Result<()> {
 	}
 }
 
-fn read_frames(r: impl IoRead + Send + 'static) -> (Frames, Arc<AtomicUsize>) {
+fn read_frames(
+	r: impl IoRead + Send + 'static,
+) -> (Frames, Arc<AtomicUsize>, Arc<AtomicBool>) {
 	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
 	let retained = Arc::new(AtomicUsize::new(0));
+	let in_flight = Arc::new(AtomicBool::new(false));
 	let pump_retained = Arc::clone(&retained);
-	std::thread::spawn(move || pump_frames(r, tx, pump_retained));
-	(rx, retained)
+	let pump_in_flight = Arc::clone(&in_flight);
+	std::thread::spawn(move || {
+		pump_frames(r, tx, pump_retained, pump_in_flight)
+	});
+	(rx, retained, in_flight)
 }
 
-/// Reads frames until the worker stops or the consumer does. The queue is
-/// bounded and every queued frame is accounted in `retained`, so a worker
-/// that keeps speaking while nobody listens cannot grow the master's
-/// memory: at [`FRAME_QUEUE`] retained frames the pump hangs up, which the
-/// caller sees as a worker that closed the connection.
+/// Reads frames until the worker stops or the consumer does. A frame that
+/// ARRIVES while an exchange is [`in_flight`] may be part of its answer:
+/// the blocking `send` is the backpressure that carries a reply larger
+/// than the queue to a slow consumer. A frame that arrives while no call
+/// is running is out of step with the protocol — it is queued (accounted
+/// in `retained`, so the pooled connection is never reused) and the pump
+/// hangs up, which bounds what an unsolicited worker can make the master
+/// retain. Dropping the receiver ends a pump parked in `send`.
 fn pump_frames(
 	mut r: impl IoRead,
 	tx: SyncSender<io::Result<Option<Response>>>,
 	retained: Arc<AtomicUsize>,
+	in_flight: Arc<AtomicBool>,
 ) {
 	loop {
-		if retained.load(Ordering::Relaxed) >= FRAME_QUEUE {
-			return;
-		}
 		let frame = read_frame::<Response>(&mut r);
 		let end = !matches!(frame, Ok(Some(_)));
+		// Read BEFORE send: the consumer cannot finish the call this frame
+		// belongs to before it is delivered, so a reply's last frame is
+		// never mistaken for an unsolicited one.
+		let unsolicited = !in_flight.load(Ordering::SeqCst);
 		retained.fetch_add(1, Ordering::Relaxed);
 		if tx.send(frame).is_err() {
 			retained.fetch_sub(1, Ordering::Relaxed);
 			return;
 		}
-		if end {
+		if end || unsolicited {
 			return;
 		}
 	}
@@ -1779,16 +1808,19 @@ mod tests {
 	}
 
 	/// A worker that keeps speaking while nobody listens cannot make the
-	/// master buffer without end: the pump hangs up once the retained
-	/// frames reach the cap, and the ssh writer is left with a closed pipe.
+	/// master buffer without end: the FIRST unsolicited frame ends the pump
+	/// (the connection is discarded at its next use), and the ssh writer is
+	/// left with a closed pipe.
 	#[test]
 	fn an_idle_flood_of_frames_is_bounded_and_ends_the_read() {
 		let (r, mut w) = io::pipe().unwrap();
 		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
 		let retained = Arc::new(AtomicUsize::new(0));
+		let in_flight = Arc::new(AtomicBool::new(false));
 		let pump_retained = Arc::clone(&retained);
+		let pump_in_flight = Arc::clone(&in_flight);
 		let pump = std::thread::spawn(move || {
-			pump_frames(r, tx, pump_retained);
+			pump_frames(r, tx, pump_retained, pump_in_flight);
 		});
 		// ~64 KiB frames: the OS pipe cannot buffer many, so the producer
 		// stalls as soon as the pump does.
@@ -1807,19 +1839,161 @@ mod tests {
 			written
 		});
 
-		// The pump hangs up at the cap; the producer then hits a closed
-		// pipe well before 10,000 frames.
+		// The pump hangs up on the first unsolicited frame; the producer
+		// then hits a closed pipe well before 10,000 frames.
 		let producer = producer.join().unwrap();
 		pump.join().unwrap();
 		assert_eq!(
 			retained.load(std::sync::atomic::Ordering::Relaxed),
-			FRAME_QUEUE
+			1,
+			"one unsolicited frame is queued as the marker, no more"
 		);
 		assert!(
 			producer < 200,
-			"an unconsumed pump must stop at the cap, wrote {producer}"
+			"an unconsumed pump must stop early, wrote {producer}"
 		);
 		drop(rx);
+	}
+
+	/// A pump parked in `send` (queue full, consumer gone) ends when the
+	/// connection drops the receiver — bounded, never stuck for good.
+	#[test]
+	fn the_pump_unblocks_when_the_connection_drops() {
+		let (r, mut w) = io::pipe().unwrap();
+		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+		let retained = Arc::new(AtomicUsize::new(0));
+		let in_flight = Arc::new(AtomicBool::new(true));
+		let pump_retained = Arc::clone(&retained);
+		let pump_in_flight = Arc::clone(&in_flight);
+		let pump = std::thread::spawn(move || {
+			pump_frames(r, tx, pump_retained, pump_in_flight);
+		});
+		let body = "x".repeat(64 * 1024);
+		let producer = std::thread::spawn(move || {
+			for _ in 0..40 {
+				let frame = Response::Text {
+					content: Some(body.clone()),
+				};
+				if write_frame(&mut w, &frame).is_err() {
+					break;
+				}
+			}
+		});
+		// The queue (plus the pipe) fills; the pump parks in `send`.
+		std::thread::sleep(scaled(Duration::from_millis(200)));
+		drop(rx);
+		assert!(
+			join_bounded(pump, scaled(Duration::from_secs(5))),
+			"dropping the receiver must unblock the parked pump"
+		);
+		producer.join().unwrap();
+	}
+
+	/// A segmented reply far larger than the frame queue, with the consumer
+	/// paused while it streams in: the pump must apply backpressure (block)
+	/// rather than hang up, and every piece still arrives once the consumer
+	/// resumes.
+	#[test]
+	fn a_paused_consumer_still_receives_a_20mib_segmented_reply() {
+		let (r, w) = io::pipe().unwrap();
+		let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
+		let retained = Arc::new(AtomicUsize::new(0));
+		let in_flight = Arc::new(AtomicBool::new(false));
+		let pump_retained = Arc::clone(&retained);
+		let pump_in_flight = Arc::clone(&in_flight);
+		let pump = std::thread::spawn(move || {
+			pump_frames(r, tx, pump_retained, pump_in_flight);
+		});
+		let piece = "x".repeat(1024 * 1024);
+		let producer = std::thread::spawn(move || {
+			let mut w = w;
+			let mut wrote = 0usize;
+			for _ in 0..20 {
+				if write_frame(
+					&mut w,
+					&Response::Chunk {
+						data: piece.clone(),
+					},
+				)
+				.is_err()
+				{
+					break;
+				}
+				wrote += 1;
+			}
+			let _ = write_frame(
+				&mut w,
+				&Response::Copied(CopyOutcome {
+					payload: String::new(),
+					copied: 1,
+					chars: 0,
+					lines: 0,
+					skipped: 0,
+					truncated: false,
+				}),
+			);
+			wrote
+		});
+		// The exchange is running; its consumer is paused while the reply
+		// streams in.
+		in_flight.store(true, Ordering::SeqCst);
+		std::thread::sleep(scaled(Duration::from_millis(300)));
+		let mut conn = Connection {
+			writer: Box::new(std::io::sink()),
+			frames: rx,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::clone(&retained),
+			in_flight: Arc::clone(&in_flight),
+		};
+		let deadline = Instant::now() + scaled(Duration::from_secs(30));
+		let mut text = String::new();
+		let reply = loop {
+			assert!(
+				Instant::now() < deadline,
+				"the reply never finished arriving"
+			);
+			match conn.recv(scaled(Duration::from_secs(5))).unwrap() {
+				Some(Response::Chunk { data }) => text.push_str(&data),
+				Some(other) => break other,
+				None => panic!("the pump hung up while a reply was streaming"),
+			}
+		};
+		in_flight.store(false, Ordering::SeqCst);
+		match reply {
+			Response::Copied(out) => assert_eq!(out.copied, 1),
+			other => panic!("expected Copied, got {other:?}"),
+		}
+		assert_eq!(text.len(), 20 * 1024 * 1024);
+		assert_eq!(
+			producer.join().unwrap(),
+			20,
+			"the producer wrote every piece"
+		);
+		drop(conn);
+		assert!(
+			join_bounded(pump, scaled(Duration::from_secs(5))),
+			"dropping the receiver must end the pump"
+		);
+	}
+
+	/// Joins `handle` within `limit`, so a hung thread fails the test
+	/// instead of hanging it.
+	fn join_bounded(
+		handle: std::thread::JoinHandle<()>,
+		limit: Duration,
+	) -> bool {
+		let (tx, rx) = mpsc::channel();
+		std::thread::spawn(move || {
+			let _ = handle.join();
+			let _ = tx.send(());
+		});
+		rx.recv_timeout(limit).is_ok()
 	}
 
 	/// Every consumed frame releases its retained slot, so a call that
@@ -1847,6 +2021,7 @@ mod tests {
 			broken: false,
 			frames_seen: 0,
 			retained: Arc::clone(&retained),
+			in_flight: Arc::new(AtomicBool::new(false)),
 		};
 		drop(r);
 		for _ in 0..3 {
@@ -1895,6 +2070,7 @@ mod tests {
 			broken: false,
 			frames_seen: 0,
 			retained: Arc::default(),
+			in_flight: Arc::default(),
 		}
 	}
 
@@ -1957,6 +2133,7 @@ mod tests {
 			broken: false,
 			frames_seen: 0,
 			retained: Arc::default(),
+			in_flight: Arc::default(),
 		};
 		let request = Request::OpenWorkspace { path: "~".into() };
 		let deadline = Instant::now() + scaled(Duration::from_secs(5));
