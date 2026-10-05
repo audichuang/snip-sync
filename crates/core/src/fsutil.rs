@@ -145,16 +145,22 @@ pub fn write_text_file(path: &Path, content: &str) -> io::Result<()> {
 		.filter(|p| !p.as_os_str().is_empty())
 		.unwrap_or_else(|| Path::new("."));
 	fs::create_dir_all(parent)?;
-	let mut builder = tempfile::Builder::new();
-	builder.prefix(".snip-write.");
-	// A new file gets the usual 0666 less umask, not tempfile's 0600; an
-	// existing file's mode is copied below.
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-		builder.permissions(fs::Permissions::from_mode(0o666));
-	}
-	let mut tmp = builder.tempfile_in(parent)?;
+	// Our own exclusive create: a fresh random name, never an existing
+	// entry or link. tempfile's default would mark the file temporary on
+	// Windows and 0600 on Unix; a new file here gets 0666 less umask.
+	let mut tmp = tempfile::Builder::new().prefix(".snip-write.").make_in(
+		parent,
+		|p| {
+			let mut opts = fs::OpenOptions::new();
+			opts.write(true).create_new(true);
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::OpenOptionsExt;
+				opts.mode(0o666);
+			}
+			opts.open(p)
+		},
+	)?;
 	tmp.write_all(content.as_bytes())?;
 	tmp.flush()?;
 	match fs::symlink_metadata(path) {
@@ -167,10 +173,12 @@ pub fn write_text_file(path: &Path, content: &str) -> io::Result<()> {
 	}
 	tmp.as_file().sync_all()?;
 	// std's rename handles Windows long paths; tempfile's persist does not.
-	// The temporary file is removed if the rename fails.
-	let tmp = tmp.into_temp_path();
+	// The temporary file is removed if the rename fails; after it succeeds
+	// nothing at the old name is touched again.
+	let mut tmp = tmp.into_temp_path();
 	fs::rename(&tmp, path)?;
-	tmp.keep().map(|_| ()).map_err(|err| err.error)
+	tmp.disable_cleanup(true);
+	Ok(())
 }
 
 pub fn delete_file(path: &Path) -> io::Result<()> {
