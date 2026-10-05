@@ -5856,6 +5856,135 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn a_nested_remote_listing_of_6000_survives_cache_reclaim(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect,
+				MAX_RETAINED_WORKING_TREE_BYTES,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::HashSet;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let mut tree = FileTreeNode::unloaded_root(&root);
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("root expansion must schedule io");
+			};
+			tree.apply_io_result(listed_tree_result(
+				io,
+				Ok((
+					vec![ListedChild {
+						name: "nested".into(),
+						utf8: true,
+						directory: true,
+						nested_repo: false,
+					}],
+					false,
+				)),
+			))
+			.unwrap();
+			let key = NodeKey::from_utf8_rel("nested");
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::Expand(key.clone()))
+			else {
+				panic!("nested expansion must schedule io");
+			};
+			let listing = (0..6000)
+				.map(|i| ListedChild {
+					name: format!("f{i:04}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			tree.apply_io_result(listed_tree_result(io, Ok((listing, false))))
+				.unwrap();
+			assert!(
+				tree.children[0].is_expanded,
+				"cache reclaim must not collapse the listing"
+			);
+			assert!(
+				tree.retained_bytes() > tree.cache_bytes(),
+				"the remote tail still counts toward aggregate storage"
+			);
+			assert!(!tree.children[0].children.is_empty());
+			assert!(tree
+				.flatten_visible(tree.visible_limit())
+				.iter()
+				.any(|row| row.rel_path == "nested/f0000"));
+			tree.toggle_select("nested/f0000");
+			let mut seen = HashSet::new();
+			for page in 0..100 {
+				assert!(tree.cache_bytes() <= MAX_RETAINED_WORKING_TREE_BYTES);
+				let folder = &tree.children[0];
+				assert!(folder.is_expanded && folder.read_error.is_none());
+				seen.extend(
+					folder.children.iter().map(|node| node.name.clone()),
+				);
+				if !folder.has_more {
+					break;
+				}
+				assert!(page < 99, "Load More must reach all 6000 names");
+				assert!(tree
+					.flatten_visible(tree.visible_limit())
+					.iter()
+					.any(|row| row.is_more_marker && row.rel_path == "nested"));
+				let TreeEffect::Io(io) =
+					tree.start(TreeCommand::LoadMore(key.clone()))
+				else {
+					panic!("Load More must retain the remote tail");
+				};
+				tree.apply_io_result(execute_tree_io(io, &CancelToken::new()))
+					.unwrap();
+			}
+			assert_eq!(seen.len(), 6000);
+			assert!((0..6000).all(|i| seen.contains(&format!("f{i:04}"))));
+			assert!(tree
+				.selected_paths()
+				.contains(&"nested/f0000".to_string()));
+		}
+
+		#[gpui::test]
+		fn an_empty_remote_listing_never_reads_the_master_directory(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				listed_tree_result, FileTreeNode, NodeKey, TreeCommand,
+				TreeEffect,
+			};
+			let tmp = tempfile::tempdir().unwrap();
+			fs::write(tmp.path().join("master-only.txt"), "local").unwrap();
+			let mut tree = FileTreeNode::unloaded_root(tmp.path());
+			for command in [
+				TreeCommand::Expand(NodeKey::root()),
+				TreeCommand::Retry(NodeKey::root()),
+			] {
+				let TreeEffect::Io(io) = tree.start(command) else {
+					panic!("listing must schedule io");
+				};
+				tree.apply_io_result(listed_tree_result(
+					io,
+					Ok((Vec::new(), false)),
+				))
+				.unwrap();
+				assert!(tree.is_loaded && tree.is_expanded);
+				assert!(
+					tree.children.is_empty(),
+					"the worker's empty answer must stay empty"
+				);
+				assert!(tree.read_error.is_none() && !tree.has_more);
+				assert!(tree.flatten_visible(tree.visible_limit()).is_empty());
+				assert!(matches!(
+					tree.start(TreeCommand::LoadMore(NodeKey::root())),
+					TreeEffect::Idle
+				));
+			}
+		}
+
+		#[gpui::test]
 		fn remote_workspace_opens_a_host_folder_and_previews_through_a_worker(
 			cx: &mut TestAppContext,
 		) {

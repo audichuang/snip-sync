@@ -544,8 +544,15 @@ pub fn listed_tree_result(
 	listed: Result<(Vec<ListedChild>, bool), String>,
 ) -> TreeIoResult {
 	let (children, truncated) = match listed {
-		Ok(listed) => listed,
-		Err(err) => {
+		Ok((children, truncated)) if !children.is_empty() => {
+			(children, truncated)
+		}
+		listed => {
+			let (error, truncated) = match listed {
+				Ok((_, truncated)) => (None, truncated),
+				Err(err) => (Some(err), false),
+			};
+			// An empty worker answer is complete; never open `io.dir` locally.
 			return TreeIoResult {
 				key: io.key.clone(),
 				epoch: io.epoch,
@@ -555,8 +562,8 @@ pub fn listed_tree_result(
 				scan: None,
 				held: VecDeque::new(),
 				has_more: false,
-				error: Some(err),
-				truncated: false,
+				error,
+				truncated,
 				skipped_oversize: 0,
 				budget_blocked: false,
 				cancelled: false,
@@ -709,8 +716,9 @@ impl FileTreeNode {
 		}
 	}
 
-	/// Node/cursor cache only. Persistent paths survive cache eviction and
-	/// belong to the aggregate tree/selection budget instead of the256KiB cache.
+	/// Node/cursor cache only. Persistent paths survive cache eviction,
+	/// and unadmitted remote names belong to the aggregate tree/selection
+	/// budget instead of the 256 KiB cache.
 	pub fn cache_bytes(&self) -> usize {
 		let mut total = std::mem::size_of::<Self>();
 		total = total.saturating_add(self.name.capacity());
@@ -726,7 +734,7 @@ impl FileTreeNode {
 				scan.retained_bytes() - std::mem::size_of::<DirectoryScan>(),
 			);
 		}
-		for held in &self.held {
+		for held in self.held.iter().filter(|held| held.utf8.is_none()) {
 			total = total
 				.saturating_add(std::mem::size_of::<HeldEntry>())
 				.saturating_add(held.entry.name.capacity());
@@ -749,7 +757,23 @@ impl FileTreeNode {
 	}
 
 	pub fn retained_bytes(&self) -> usize {
-		self.cache_bytes().saturating_add(self.selection_bytes())
+		self.cache_bytes()
+			.saturating_add(self.selection_bytes())
+			.saturating_add(self.remote_tail_bytes())
+	}
+
+	fn remote_tail_bytes(&self) -> usize {
+		let own = self.held.iter().filter(|held| held.utf8.is_some()).fold(
+			0usize,
+			|bytes, held| {
+				bytes
+					.saturating_add(std::mem::size_of::<HeldEntry>())
+					.saturating_add(held.entry.name.capacity())
+			},
+		);
+		self.children.iter().fold(own, |bytes, child| {
+			bytes.saturating_add(child.remote_tail_bytes())
+		})
 	}
 
 	pub fn start(&mut self, cmd: TreeCommand) -> TreeEffect {
@@ -1007,6 +1031,8 @@ impl FileTreeNode {
 
 	fn begin_io(&mut self, key: &NodeKey, kind: TreeIoKind) -> TreeEffect {
 		let base = self.full_path.clone();
+		let room =
+			MAX_RETAINED_WORKING_TREE_BYTES.saturating_sub(self.cache_bytes());
 		let prepared = {
 			let Some(node) = self.find_mut(key) else {
 				return TreeEffect::Idle;
@@ -1017,6 +1043,23 @@ impl FileTreeNode {
 			node.loading = true;
 			node.is_expanded = true;
 			node.read_error = None;
+			// Once admitted pages fill the cache, release them to make room
+			// for the remote tail. Checked paths live on the root and survive.
+			if kind == TreeIoKind::LoadMore
+				&& node.budget_blocked
+				&& node.held.front().is_some_and(|held| {
+					held.utf8.is_some()
+						&& build_node(
+							&held.entry,
+							&base.join(&key.relative),
+							key,
+							depth,
+							held.nested_repo,
+						)
+						.retained_bytes() > room
+				}) {
+				node.children = Vec::new();
+			}
 			node.budget_blocked = false;
 			let mut scan = node.scan.take();
 			let mut held = std::mem::take(&mut node.held);
