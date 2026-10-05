@@ -1938,7 +1938,7 @@ fn replay_commit(
 			.then(|| f.absolute_path.as_deref().map(|a| (a, f.path.as_str())))
 			.flatten();
 		for (abs, rel) in old.into_iter().chain(del) {
-			delete(scope, root, abs, rel)?;
+			delete(scope, abs, rel)?;
 			deleted.push(rel);
 		}
 	}
@@ -2026,13 +2026,10 @@ fn replay_commit(
 /// Removes `abs`; already absent is fine. Parent directories left empty go
 /// too (as git checkout does), so a later write may put a file there. The
 /// safety check is held to the replay's write `scope`; the upward walk is
-/// bounded by the resolved repository `root`, never above it.
-fn delete(
-	scope: &Path,
-	root: &Path,
-	abs: &Path,
-	rel: &str,
-) -> Result<(), String> {
+/// bounded by the RESOLVED `scope` — the folder the user opened — and never
+/// removes the scope folder itself, however the scope was spelled (a
+/// symlinked spelling resolves to the same bound).
+fn delete(scope: &Path, abs: &Path, rel: &str) -> Result<(), String> {
 	if unsafe_replay_target(scope, abs) {
 		return Err(format!("{rel}: unsafe path"));
 	}
@@ -2049,9 +2046,11 @@ fn delete(
 		}
 		Err(e) => return Err(format!("{rel}: {e}")),
 	}
+	let bound =
+		dunce::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf());
 	let mut dir = abs.parent();
 	// `remove_dir` fails on a non-empty directory, which ends the walk.
-	while let Some(d) = dir.filter(|d| *d != root && d.starts_with(root)) {
+	while let Some(d) = dir.filter(|d| *d != bound && d.starts_with(&bound)) {
 		if fs::remove_dir(d).is_err() {
 			break;
 		}
@@ -3804,6 +3803,78 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(plan.commits[0].files.len(), 2);
+	}
+
+	/// A scoped replay that deletes the opened folder's last file leaves the
+	/// folder and its parents in place: the empty-directory cleanup is
+	/// bounded by the opened scope (resolved, so a symlinked spelling of it
+	/// — as macOS `/var` → `/private/var` — holds too) and never removes
+	/// the scope folder itself. A whole-repository replay still prunes the
+	/// folders it empties, up to the repository root.
+	#[cfg(unix)]
+	#[test]
+	fn a_scoped_replay_deleting_the_last_file_keeps_the_opened_folder() {
+		let deleting = |path: &str| CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "remove\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2020-01-01T00:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: path.into(),
+					old_path: None,
+					change: FileChange::Deleted,
+					content: None,
+					not_copied: None,
+				}],
+			}],
+		};
+
+		// Scoped: parent/sub is opened, spelled through a symlink.
+		let repo = Repo::new("main");
+		repo.write("parent/sub/last.txt", b"last\n");
+		repo.commit("init", "2020-01-01T00:00:00+00:00");
+		let spelled = repo.dir.path().join("sub-link");
+		std::os::unix::fs::symlink(repo.path().join("parent/sub"), &spelled)
+			.unwrap();
+		let payload = deleting("parent/sub/last.txt");
+		let git = repo.open();
+		let session = ReplaySession::begin_in(
+			&git,
+			&spelled,
+			&payload,
+			&RunOptions::default(),
+		)
+		.map_err(|refused| {
+			refused
+				.failure
+				.as_ref()
+				.map(|f| f.error.clone())
+				.unwrap_or_default()
+		})
+		.unwrap();
+		let result = session.run(&git, &payload);
+		assert_eq!(result.failure, None);
+		assert!(!repo.path().join("parent/sub/last.txt").exists());
+		assert!(
+			repo.path().join("parent/sub").is_dir(),
+			"the opened folder survives its last file"
+		);
+		assert!(
+			repo.path().join("parent").is_dir(),
+			"folders above the scope are untouched"
+		);
+
+		// Whole repository: the emptied folders below the root are pruned.
+		let repo = Repo::new("main");
+		repo.write("deep/nested/last.txt", b"last\n");
+		repo.write("keep.txt", b"keep\n");
+		repo.commit("init", "2020-01-01T00:00:00+00:00");
+		let payload = deleting("deep/nested/last.txt");
+		let result = replay(&repo.open(), &payload);
+		assert_eq!(result.failure, None);
+		assert!(!repo.path().join("deep").exists());
+		assert!(repo.path().join("keep.txt").exists());
 	}
 
 	/// A bare repository kept inside the worktree is a Git directory: a
