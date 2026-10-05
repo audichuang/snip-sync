@@ -708,9 +708,9 @@ fn a_relative_paste_hold_path_does_not_pause_apply() {
 	let (client, id) = open(&w, &ws);
 	let mapping = PasteMapping::default();
 	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
-	// A real file in the current directory, addressed by its relative name.
-	let hold = tempfile::NamedTempFile::new_in(".").unwrap();
-	let relative = Path::new(hold.path().file_name().unwrap());
+	// A real file in the current directory (the crate root), addressed by
+	// its relative name; nothing is written into the source tree.
+	let relative = Path::new("Cargo.toml");
 	assert!(!relative.is_absolute() && relative.is_file());
 	std::env::set_var("SNIP_E2E_PASTE_HOLD", relative);
 	let result = client.call_with(
@@ -726,7 +726,6 @@ fn a_relative_paste_hold_path_does_not_pause_apply() {
 		Duration::from_secs(3),
 	);
 	std::env::remove_var("SNIP_E2E_PASTE_HOLD");
-	drop(hold);
 	// On the failing implementation, release and drain the paused worker
 	// before reporting the failure so it cannot leak into the next test.
 	let deadline = Instant::now() + Duration::from_secs(10);
