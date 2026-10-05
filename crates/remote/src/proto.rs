@@ -22,7 +22,8 @@ use snip_core::workspace::ScanStatus;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Newest protocol this build speaks. 2 = Git views, 3 = copy, 4 = paste,
-/// 5 = worker-side change selection ([`Request::ExportChanges`]).
+/// 5 = worker-side change selection ([`Request::ExportChanges`]), whole-folder
+/// export (an empty [`ExportTarget::path`]), and chunked requests.
 pub const PROTOCOL_MAX: u32 = 5;
 /// The first protocol with Git views.
 pub const GIT_VIEWS_VERSION: u32 = 2;
@@ -287,6 +288,11 @@ impl Request {
 	pub fn needs_version(&self) -> u32 {
 		match self {
 			Self::ScanRepos { .. } | Self::GitView { .. } => GIT_VIEWS_VERSION,
+			Self::Export { items, .. }
+				if items.iter().any(|item| item.path.is_empty()) =>
+			{
+				5
+			}
 			Self::Export { .. } | Self::ExportCommits { .. } => {
 				TRANSFER_VERSION
 			}
