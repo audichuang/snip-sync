@@ -25,7 +25,7 @@
 | worker | Ubuntu `audichuang-desktop`（x86_64） | `ssh ubuntu`（`~/.ssh/config` 的 `Host ubuntu`，金鑰登入） |
 
 - 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上與 worker 端變更選取（協定 5）：`grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs`，不符就不開跑。
-- **受測的 worker binary 怎麼被選到**：產品在對方執行 `snip serve --stdio` 時，依序找 PATH 上的 `snip`、`~/.local/bin/snip`…。Ubuntu 的非互動 ssh PATH 第一項是 `~/.local/bin`，所以本輪把受測 SHA 編出來的 `snip` 暫時放在 `~/.local/bin/snip`，產品就會走真實的 ssh 路徑選到它。開跑前那個位置必須不存在（2.3 會檢查），收尾一定要刪掉（第 6 節，I03 驗證）。**不要用 `SNIP_REMOTE_EXEC`**，那會繞過要測的 ssh 路徑。
+- **受測的 worker binary 怎麼被選到**：產品在對方執行 `snip serve --stdio` 時，依序找 PATH 上的 `snip`、`~/.local/bin/snip`…。Ubuntu 的非互動 ssh PATH 第一項是 `~/.local/bin`，所以本輪在 `~/.local/bin/snip` 放一個**三行 wrapper**（把執行時的 PID 記到 `$W/pids/`，再 `exec` 受測 SHA 編出的 binary），產品就會走真實的 ssh 路徑選到它，而 L04、L05 與收尾只殺本輪記下的 PID（2.3 安裝）。開跑前那個位置必須不存在（2.3 會檢查），收尾一定要刪掉（第 6 節，I03 驗證）。**不要用 `SNIP_REMOTE_EXEC`**，那會繞過要測的 ssh 路徑。
 - 受測專案：Ubuntu 上的 `~/research/rtk`。真實的 Rust 專案，有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs`）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**。
 - 其他情境放在 fixture（第 2.3 節），全部在 Ubuntu 的 `$W` 底下。
 
@@ -93,10 +93,16 @@ printf '// FILE: target/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n' > "$RUN/
 # 兩個名稱都要查：`test -e` 對懸空的 symlink 是假，必須再加 `-L`。
 # snip.uirun-$SHA 是本輪 S11 專用的備份名，開跑前也要不存在。
 ssh ubuntu '[ ! -e ~/.local/bin/snip ] && [ ! -L ~/.local/bin/snip ] && [ ! -e ~/.local/bin/snip.uirun-'"$SHA"' ] && [ ! -L ~/.local/bin/snip.uirun-'"$SHA"' ]' || { echo "~/.local/bin/snip 或本輪備份名已存在，不開跑" >&2; exit 1; }
-git archive HEAD | ssh ubuntu "rm -rf '$W' && mkdir -p '$W/src' && tar -x -C '$W/src'"
+git archive HEAD | ssh ubuntu "rm -rf '$W' && mkdir -p '$W/src' '$W/pids' && tar -x -C '$W/src'"
 ssh ubuntu "cd '$W/src' && export PATH=\$HOME/.cargo/bin:\$PATH && cargo build --release -p snip-cli --locked 2>&1 | tail -1"
-ssh ubuntu "mkdir -p ~/.local/bin && cp '$W/src/target/release/snip' ~/.local/bin/snip && sh -c 'command -v snip' && snip --version"
-ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"   # 收尾比對用：只刪本輪放的 binary
+# ~/.local/bin/snip 放三行 wrapper：每次被 exec 前把自己的 PID 記進
+# $W/pids/（檔名就是 PID），L04/L05/收尾只殺這些記下的 PID；
+# SNIP_E2E_PASTE_HOLD 只在 $W/paste-hold 存在時才會暫停（L05），閒置輪不影響。
+ssh ubuntu "mkdir -p ~/.local/bin"
+printf '#!/bin/sh\necho $$ > "%s/pids/$$"\nexport SNIP_E2E_PASTE_HOLD="%s/paste-hold"\nexec "%s/src/target/release/snip" "$@"\n' "$W" "$W" "$W" \
+  | ssh ubuntu 'cat > ~/.local/bin/snip && chmod +x ~/.local/bin/snip'
+ssh ubuntu 'command -v snip && snip --version'
+ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"   # 收尾比對用：只刪本輪放的 wrapper
 ```
 
 最後一行必須印出 `/home/audichuang/.local/bin/snip` 和受測版本。印出 linuxbrew 的路徑就停下：產品不會選到受測 binary。
@@ -363,24 +369,86 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 
 ### 4.6 遠端複製和本機一樣（X01–X10）
 
-仍在 `gitws`。每格開始前寫 sentinel；oracle 在 Ubuntu 上執行，例如 `ssh ubuntu "cd '$W/gitws/alpha' && snip copy a.txt --stdout" | shasum -a 256`。
+仍在 `gitws`。每格開始前寫 sentinel。
 
-**先弄清楚 App 送出的是什麼**（對照程式碼 `menu.rs` 的 `change_row_targets` 與 `project_targets`）：Changes 的列（檔案、資料夾、repo、群組標頭）複製的是 **git 變更匯出**，payload 路徑帶變更標籤（`// file: [MODIFIED] a.txt`），來源是 working/staged；repo 列與群組標頭只複製**那一個群組**的列。專案樹的選取複製的是**檔案模式**（無變更標籤），root 是選取所在的 repo（`alpha`），路徑以 alpha 為根。所以 oracle 有兩種形狀：變更匯出比對 `snip copy --working/--staged --stdout` 輸出裡的**對應區塊**（一個區塊 = 一行 `// file: …` 到下個區塊前，含檔尾空行）；檔案模式比對整份 payload。
+**對照答案的 helper**（X01–X06、X09 用）：把檔案模式 payload 切成每檔 `path<TAB>sha256(body)` 的清單，worker 端也對每個檔案算同一份清單（`cat`／`git show` 的原始內容做同樣正規化），兩邊逐行相等、路徑集合正確才算過。切法與 `crates/core/src/format.rs` 的 `parse_clipboard`／`join_content` 一致：行切分照 JS `split(/\r?\n/)`（`\n` 前的一個 `\r` 去掉、檔尾 `\r` 保留）、第一行 `clipcode-root` 略過、header 是泛用 `// FILE:` 形（可帶 `[NEW]` 等標籤，標籤不計入 path）、body 前後的空白行去掉、中間原樣、每行剝一個 `//clipcode-esc: ` 前綴。開跑時在 Mac 定義一次（腳本存檔，stdin 才留給資料）：
 
-| ID | 操作 | oracle（在 `$W/gitws/alpha` 執行） |
+```bash
+mkdir -p "$RUN" && cat > "$RUN/snip_payload_list.py" <<'PY'
+import hashlib, re, sys
+WS = r"[ \t\n\x0b\x0c\r]"
+DOT = r"[^\n\r\u2028\u2029]"
+HEADER = re.compile(rf"^{WS}*(?:(//|#|/\*){WS}*)?[Ff][Ii][Ll][Ee]:{WS}*({DOT}+?){WS}*(?:\*/)?$")
+LEADING_LABELS = re.compile(rf"^(?:\[(?:NEW|MODIFIED|DELETED|MOVED)\]{WS}*)+")
+def js_split(text):
+    lines = text.split("\n")
+    return [l[:-1] if l.endswith("\r") else l for l in lines[:-1]] + [lines[-1]]
+def blank(s):
+    return s.strip(" \t\n\x0b\x0c\r") == ""
+def normalize(lines):
+    body = list(lines)
+    while body and blank(body[0]): body.pop(0)
+    while body and blank(body[-1]): body.pop()
+    body = [l[len("//clipcode-esc: "):] if l.startswith("//clipcode-esc: ") else l for l in body]
+    return "\n".join(body)
+def strip_labels(path):
+    return LEADING_LABELS.sub("", path).strip(" \t\n\x0b\x0c\r")
+def likely(path):
+    p = strip_labels(path)
+    return bool(p) and p[0] not in "\"'" and p[-1] not in ",;" and any(c in p for c in "/\\.")
+def digest(content):
+    return hashlib.sha256(content.encode()).hexdigest()
+mode = sys.argv[1] if len(sys.argv) > 1 else "list"
+if mode == "file":
+    print(f"{sys.argv[2]}\t{digest(normalize(js_split(sys.stdin.read())))}")
+    sys.exit(0)
+entries, cur, body = [], None, []
+lines = js_split(sys.stdin.read())
+if lines and lines[0].startswith("// clipcode-root: "):
+    lines = lines[1:]
+for line in lines:
+    m = HEADER.match(line)
+    if m and (m.group(1) or likely(m.group(2))):
+        if cur is not None:
+            entries.append((cur, normalize(body)))
+        cur, body = strip_labels(m.group(2)), []
+    elif line == "// clipcode-end":
+        if cur is not None:
+            entries.append((cur, normalize(body)))
+        cur, body = None, []
+    elif cur is not None:
+        body.append(line)
+if cur is not None:
+    entries.append((cur, normalize(body)))
+for path, content in entries:
+    print(f"{path}\t{digest(content)}")
+PY
+snip_payload_list() {   # stdin：payload → 每檔一行 path<TAB>sha256(body)
+  python3 "$RUN/snip_payload_list.py" list
+}
+snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>sha256(正規化後)
+  python3 "$RUN/snip_payload_list.py" file "$1"
+}
+```
+
+用法：`pbpaste \| snip_payload_list > 剪貼簿清單`；oracle 端 `ssh ubuntu "cat '$W/gitws/alpha/a.txt'" \| snip_file_digest a.txt > oracle清單`，`cmp` 兩份清單，再另文斷言 `pbpaste \| snip_payload_list \| cut -f1` 的路徑集合正確。
+
+**先弄清楚 App 送出的是什麼**（對照程式碼 `menu.rs` 的 `change_row_targets` 與 `project_targets`）：Changes 的列（檔案、資料夾、repo、群組標頭）複製的是 **git 變更匯出**，payload 路徑帶變更標籤（`// file: [MODIFIED] a.txt`），來源是 working/staged；repo 列與群組標頭只複製**那一個群組**的列。專案樹的選取複製的是**檔案模式**（無變更標籤），root 是選取所在的 repo（`alpha`），路徑以 alpha 為根。所以 oracle 有兩種形狀：變更匯出（X01–X06）與 commit 內容（X09）比對上面的清單；X07、X08、X10 可以和 worker 上的 `snip copy` 逐 byte 比對的，比對整份 payload 的 SHA-256。
+
+| ID | 操作 | oracle（清單來源，`cat`／`git show` 都在 Ubuntu 上讀） |
 |---|---|---|
-| X01 | Changes 的 `a.txt`（未暫存）右鍵 →「複製」 | `snip copy --working --stdout` 輸出裡 `// file: [MODIFIED] a.txt` 的那一個區塊（不是 `snip copy a.txt`：純檔案複製沒有變更標籤） |
-| X02 | Changes 的 `staged.txt`（暫存列）右鍵 →「複製」 | `snip copy --staged --stdout` 裡 `// file: [NEW] staged.txt` 的區塊（這份輸出只有它） |
-| X03 | Changes 的 `dir` 資料夾列右鍵 →「複製」 | `snip copy --working --stdout` 裡 `// file: [MODIFIED] dir/c.txt` 的區塊（資料夾列複製該 repo 該群組底下的所有變更，這裡只有一個） |
-| X04 | Changes 的 **Unstaged 群組裡的 alpha repo 列**右鍵 →「複製」 | repo 列只複製一個群組：`snip copy --working --stdout` 裡 alpha 的未暫存區塊（`[MODIFIED] a.txt`、`[MODIFIED] dir/c.txt`、`[NEW] new.txt`），**不含** `staged.txt` 的暫存區塊 |
-| X05 | Changes 的 Unstaged 群組標頭右鍵 →「複製」 | 同 X04 的未暫存區塊整份（gitws 只有 alpha 有變更）；`COPY_DONE: copied=` 等於群組裡的列數 |
-| X06 | 選 Changes 的 `new.txt`，按 Cmd+C | `snip copy --working --stdout` 裡 `// file: [NEW] new.txt` 的區塊 |
-| X07 | 專案樹展開 alpha，Cmd 點選 `a.txt` 與 `b.txt`，右鍵 →「複製」 | 在 `$W/gitws/alpha` 執行 `snip copy a.txt b.txt --stdout`（選取以 alpha 為根，不是 `alpha/a.txt`） |
-| X08 | 專案樹展開 alpha，右鍵 `dir` 子資料夾 →「複製」 | 在 `$W/gitws/alpha` 執行 `snip copy dir --stdout`（整個 alpha 是 repo 列，選單只有「複製路徑」，選不得，改用子資料夾） |
-| X09 | Log 選 alpha 的 HEAD commit，在變更檔案清單對 `b.txt` 右鍵 →「複製」 | `snip copy --commit HEAD --stdout` 裡的 `b.txt`；內容是 commit 時的 `commit 2 b`，不是工作樹 |
-| X10 | Log 選 alpha 的兩個 commit，點複製 commit | `snip copy --commits -n 2 --stdout`；`pbpaste` 第一行是 commit 模式的標記 |
+| X01 | Changes 的 `a.txt`（未暫存）右鍵 →「複製」 | 清單只有 `a.txt` 一行：`cat '$W/gitws/alpha/a.txt' \| snip_file_digest a.txt`（不是 `snip copy a.txt`：變更匯出帶 `[MODIFIED]` 標籤，標籤不計入清單的 path） |
+| X02 | Changes 的 `staged.txt`（暫存列）右鍵 →「複製」 | 清單只有 `staged.txt` 一行：`cat staged.txt \| snip_file_digest staged.txt` |
+| X03 | Changes 的 `dir` 資料夾列右鍵 →「複製」 | 清單只有 `dir/c.txt` 一行：`cat dir/c.txt \| snip_file_digest dir/c.txt`（資料夾列複製該 repo 該群組底下的所有變更，這裡只有一個） |
+| X04 | Changes 的 **Unstaged 群組裡的 alpha repo 列**右鍵 →「複製」 | repo 列只複製一個群組：清單是 `a.txt`、`dir/c.txt`、`new.txt` 三行（各自由 working tree 的 `cat` 算出），**不含** `staged.txt` |
+| X05 | Changes 的 Unstaged 群組標頭右鍵 →「複製」 | 同 X04 的三行清單（gitws 只有 alpha 有變更）；`COPY_DONE: copied=` 等於群組裡的列數 |
+| X06 | 選 Changes 的 `new.txt`，按 Cmd+C | 清單只有 `new.txt` 一行：`cat new.txt \| snip_file_digest new.txt` |
+| X07 | 專案樹展開 alpha，Cmd 點選 `a.txt` 與 `b.txt`，右鍵 →「複製」 | 在 `$W/gitws/alpha` 執行 `snip copy a.txt b.txt --stdout`（選取以 alpha 為根，不是 `alpha/a.txt`）；整份 payload 逐 byte 比對 |
+| X08 | 專案樹展開 alpha，右鍵 `dir` 子資料夾 →「複製」 | 在 `$W/gitws/alpha` 執行 `snip copy dir --stdout`（整個 alpha 是 repo 列，選單只有「複製路徑」，選不得，改用子資料夾）；整份 payload 逐 byte 比對 |
+| X09 | Log 選 alpha 的 HEAD commit，在變更檔案清單對 `b.txt` 右鍵 →「複製」 | 清單只有 `b.txt` 一行：`cd '$W/gitws/alpha' && git show HEAD:b.txt \| snip_file_digest b.txt`；內容是 commit 時的 `commit 2 b`，不是工作樹 |
+| X10 | Log 選 alpha 的兩個 commit，點複製 commit | `snip copy --commits -n 2 --stdout`；`pbpaste` 第一行是 commit 模式的標記；整份 payload 逐 byte 比對 |
 
-每格都要：`COPY_DONE`（或 `COPY_COMMITS_DONE`），`pbpaste | shasum -a 256` 等於 oracle。
+每格都要：`COPY_DONE`（或 `COPY_COMMITS_DONE`）。X01–X06、X09：`pbpaste \| snip_payload_list` 與 oracle 清單 `cmp` 相等，且路徑集合（`cut -f1`）與該格寫的一致。X07、X08、X10：`pbpaste \| shasum -a 256` 等於 oracle 的 SHA-256。
 
 ### 4.7 遠端貼上和本機一樣（P01–P12）
 
@@ -417,8 +485,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | L01 | 在 `edge`：`ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 出現 `ws-tree-row:new.txt`，預覽是 `fresh-1` |
 | L02 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2` |
 | L03 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄沒有 `new.txt` |
-| L04 | 中斷連線：worker 的 argv 是 `snip serve --stdio`（從 PATH 起的），不是絕對路徑，舊的 pkill 殺不到。先記下並核對本輪 worker 的 PID：`ssh ubuntu "pgrep -u audichuang -f '^snip serve --stdio$'" \| tee "$RUN/worker-pids-before.txt"`（App 開著時非空；若機器上有別的 `snip serve --stdio`，先弄清楚哪些是本輪的），再 `ssh ubuntu "pkill -u audichuang -f '^snip serve --stdio$'"`，接著 `ssh ubuntu "pgrep -u audichuang -f '^snip serve --stdio$'"` 必須沒有輸出（驗證已結束）；在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh）；絕不顯示成空白或上一個檔案 |
-| L05 | 貼上中斷（寫入途中斷線，不是閒置時）：P01 的 payload 對 `pastews/plain` 按 Cmd+V，`PASTE_PREVIEW` 出現後點 `btn-apply`；**等 `PASTE_APPLYING` 出現、再等 2 秒**（寫入已開始）才執行 L04 的斷線與驗證。之後用 `ssh ubuntu "find '$W/pastews/plain' -type f \| sort"` 與 CLI 往返 oracle（§4.7 開頭的做法）逐檔對照 | `PASTE_DONE`，或畫面說「無法確認貼上是否完成；請重新整理確認」（`paste_outcome_unknown`）；絕不說成功卻沒寫，也不說失敗卻寫了。已寫入的檔案內容與 CLI 往返 oracle 一致（正規化照 spec 第 1 節）；之後 App 的下一次操作一定有回應（自動重連） |
+| L04 | 中斷連線：只殺本輪 wrapper 記在 `$W/pids/` 裡的 PID，**不用 `pkill`／`pgrep -u`** 殺光所有符合的程序（機器上可能有別人的 `snip serve --stdio`）。每個 PID 殺之前都用 `ps -o args= -p <pid>` 確認它**仍是** `snip serve --stdio`：不是（已結束、或 PID 被別的程序重用）就一律不殺。做法：`for p in $(ssh ubuntu "cat '$W/pids/'* 2>/dev/null"); do [ "$(ssh ubuntu "ps -o args= -p $p")" = "snip serve --stdio" ] && ssh ubuntu "kill $p"; done`（App 開著時 `$W/pids/` 非空；wrapper 被嵌進 sh -c 時 argv 會多出前綴，那種也照 `ps` 的輸出原樣比對，對不上就不殺）。殺完再逐個 `ps -o args= -p <pid>` 必須都沒有輸出（已結束）；pids 裡的檔案留著當證據。在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh，新的 PID 又記進 `$W/pids/`）；絕不顯示成空白或上一個檔案 |
+| L05 | 貼上中斷（寫入途中斷線，不是閒置時；wrapper 已 export `SNIP_E2E_PASTE_HOLD="$W/paste-hold"`，暫停點只在該檔存在時生效）。步驟：(1) `ssh ubuntu "rm -rf '$W/pastews/cut-dst' && mkdir -p '$W/pastews/cut-dst' && touch '$W/paste-hold'"`——全新的目的地、掛上暫停點。(2) P01 的 payload 對 `pastews/cut-dst` 按 Cmd+V，`PASTE_PREVIEW` 出現後點 `btn-apply`。(3) 等 worker 寫下第一個檔案：`timeout 10 ssh ubuntu "until [ -e '$W/pastews/cut-dst/a.txt' ]; do sleep 0.1; done"`（有上限；逾時就是暫停點沒生效，判 fail）。(4) 用 L04 的做法殺掉 `$W/pids/` 記下的 PID。(5) `ssh ubuntu "rm -f '$W/paste-hold'"`。(6) `ssh ubuntu "find '$W/pastews/cut-dst' -type f \| sort"` 與 CLI 往返 oracle（§4.7 開頭的做法）逐檔對照；在 App 點 `btn-refresh` | UI 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」（`paste_outcome_unknown`）——絕不說成功卻沒寫，也不說失敗卻一個都沒寫；`find` 只看到**部分**檔案（`a.txt` 已寫入，後面的沒有）；已寫入的內容與 CLI 往返 oracle 一致（正規化照 spec 第 1 節）；重新整理後專案樹與 worker 上的實際檔案一致；之後 App 的下一次操作一定有回應（自動重連） |
 
 ### 4.10 CLI master 交叉驗證（C01–C04）
 
@@ -426,8 +494,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 |---|---|---|
 | C01 | `"$SNIP" remote hosts` | 包含 `ubuntu`，和 S01 的清單一致 |
 | C02 | `"$SNIP" remote ls ubuntu "$W/gitws" alpha` | 和 App 專案樹 `alpha` 的子項目相同 |
-| C03 | 對 rtk 抽 20 個 tracked 文字檔，比較 `"$SNIP" remote cat ubuntu '~/research/rtk' "<f>" \| shasum -a 256`（路徑要用引號：不加引號 `~/…` 會在 Mac 端展開成 Mac 的家目錄）和 `ssh ubuntu "sha256sum '~/research/rtk/<f>'"` | 20/20 相同 |
-| C04 | App 開著 rtk 的時候，同時跑 20 個平行的 `"$SNIP" remote cat ubuntu '~/research/rtk' src/main.rs`（同樣加引號） | 20/20 正確；這段時間在 GUI 點檔案仍然能預覽 |
+| C03 | 先在 worker 上展開 `$HOME` 取得絕對路徑，不要送字面上的 `~`：`RTK=$(ssh ubuntu 'echo "$HOME/research/rtk"')`。對 rtk 抽 20 個 tracked 文字檔，比較 `"$SNIP" remote cat ubuntu "$RTK" "<f>" \| shasum -a 256` 和 `ssh ubuntu "sha256sum '$RTK/<f>'"` | 20/20 相同 |
+| C04 | App 開著 rtk 的時候，同時跑 20 個平行的 `"$SNIP" remote cat ubuntu "$RTK" src/main.rs`（`$RTK` 同 C03 先展開好） | 20/20 正確；這段時間在 GUI 點檔案仍然能預覽 |
 
 ## 5. 完整性（決定這一輪可不可信）
 
@@ -435,31 +503,40 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 |---|---|---|
 | I01 | `rtk_snapshot "$RUN/rtk-after.txt" && cmp "$RUN/rtk-before.txt" "$RUN/rtk-after.txt"` | 相同 |
 | I02 | 同 2.2 重新列出 `$REAL` 並算雜湊 | 和 `real-config-before.*` 相同 |
-| I03 | 第 6 節收尾後 `ssh ubuntu '[ ! -e ~/.local/bin/snip ] && [ ! -L ~/.local/bin/snip ] && [ ! -e ~/.local/bin/snip.uirun-$SHA ] && [ ! -L ~/.local/bin/snip.uirun-$SHA ] && sh -c "command -v snip"'` | `~/.local/bin/snip` 與本輪備份名都不存在（懸空 symlink 也算存在），`command -v snip` 回到 linuxbrew 的路徑 |
+| I03 | 第 6 節收尾後 `ssh ubuntu "[ ! -e ~/.local/bin/snip ] && [ ! -L ~/.local/bin/snip ] && [ ! -e ~/.local/bin/snip.uirun-$SHA ] && [ ! -L ~/.local/bin/snip.uirun-$SHA ] && command -v snip"`（用 Mac 端的 `$SHA` 插值進命令字串——單引號裡的 `$SHA` 在遠端不會展開） | `~/.local/bin/snip` 與本輪備份名都不存在（懸空 symlink 也算存在），`command -v snip` 回到 linuxbrew 的路徑 |
 | I04 | `grep -c top-secret-c0ffee "$RUN"/app-*.log "$RUN"/*/action.json` | 全部是 0 |
 
 ## 6. 收尾
 
 ```bash
-# 1) 本輪 worker 依 PID 收掉（argv 是 `snip serve --stdio`，不是絕對路徑），
-#    並驗證已結束；沒有 PID 就略過。
-ssh ubuntu "pgrep -u audichuang -f '^snip serve --stdio$'" > "$RUN/workers-at-cleanup.txt" || true
-pids=$(tr '\n' ' ' < "$RUN/workers-at-cleanup.txt")
-[ -n "$pids" ] && ssh ubuntu "kill $pids" || true
+# 1) 本輪 worker 依 $W/pids/ 記下的 PID 收掉——每個 PID 殺之前先用
+#    `ps -o args= -p <pid>` 確認仍是 `snip serve --stdio`（已結束或被
+#    重用的不殺），不用 pkill／pgrep -u 殺光所有符合的程序。殺完逐個
+#    再查一次 ps，必須都沒有輸出；pids/ 的檔案隨 $W 一起刪。
+ssh ubuntu "cat '$W/pids/'* 2>/dev/null" > "$RUN/workers-at-cleanup.txt" || true
+while read -r p; do
+  [ -n "$p" ] || continue
+  [ "$(ssh ubuntu "ps -o args= -p $p")" = "snip serve --stdio" ] && ssh ubuntu "kill $p" || true
+done < "$RUN/workers-at-cleanup.txt"
 sleep 1
-ssh ubuntu "pgrep -u audichuang -f '^snip serve --stdio$'" > "$RUN/workers-after-cleanup.txt" || true
-[ ! -s "$RUN/workers-after-cleanup.txt" ] || { echo "還有 worker 殘留，收尾未完成" >&2; exit 1; }
+left=0
+while read -r p; do
+  [ -n "$p" ] || continue
+  ssh ubuntu "ps -o args= -p $p" | grep -qx "snip serve --stdio" && left=$((left + 1))
+done < "$RUN/workers-at-cleanup.txt"
+[ "$left" = 0 ] || { echo "還有 worker 殘留，收尾未完成" >&2; exit 1; }
 
 # 2) S11 的備份若還在（S11 做到一半中斷）：先還原成 snip。
 ssh ubuntu "if [ -e ~/.local/bin/snip.uirun-$SHA ] && [ ! -e ~/.local/bin/snip ]; then mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip; fi"
 
-# 3) 只刪本輪放的 binary：hash 與安裝時記下的一致才刪；懸空 symlink 也先清掉。
+# 3) 只刪本輪放的 wrapper：hash 與安裝時記下的一致才刪（不一致代表
+#    期間被換過，保留不刪）；懸空 symlink 也先清掉。
 want=$(cut -d' ' -f1 "$RUN/snip-installed.sha")
 got=$(ssh ubuntu 'sha256sum ~/.local/bin/snip 2>/dev/null' | cut -d' ' -f1)
 if [ -n "$got" ] && [ "$got" = "$want" ]; then
   ssh ubuntu 'rm -f ~/.local/bin/snip'
 else
-  echo "~/.local/bin/snip 已非本輪安裝的 binary，保留不刪" >&2
+  echo "~/.local/bin/snip 已非本輪安裝的 wrapper，保留不刪" >&2
 fi
 ssh ubuntu "rm -f ~/.local/bin/snip.uirun-$SHA"
 
@@ -467,10 +544,11 @@ ssh ubuntu "rm -f ~/.local/bin/snip.uirun-$SHA"
 ssh ubuntu "rm -rf '$W'"
 ```
 
-只刪 `$W`、本輪放的 `~/.local/bin/snip`（hash 一致才刪）與本輪備份名
-`~/.local/bin/snip.uirun-$SHA`。`snip.away` 或使用者自己的任何備份、
-`~/research/rtk`、linuxbrew 的 `snip`、`snip-worker.service`、
-`~/.ssh/config` 都不動。Mac 上的 `$RUN` 保留，裡面是證據。
+只刪 `$W`（含 `pids/` 與 `paste-hold`）、本輪放的 `~/.local/bin/snip`
+wrapper（hash 一致才刪）與本輪備份名 `~/.local/bin/snip.uirun-$SHA`。
+`snip.away` 或使用者自己的任何備份、`~/research/rtk`、linuxbrew 的
+`snip`、`snip-worker.service`、`~/.ssh/config` 都不動。Mac 上的
+`$RUN` 保留，裡面是證據。
 
 ## 7. 計分
 
