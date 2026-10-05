@@ -25,7 +25,7 @@ use snip_core::restore::{
 };
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	changed_items, plan_commit_export_with, plan_export_expanding,
+	changed_items, copy_selection_detailed, plan_commit_export_with,
 	plan_export_with, plan_import_with, selection_from_paths, CanonicalRootId,
 	CommitReplayPreview, ExportSelection, ImportMapping, TransferError,
 	CLIPBOARD_PAYLOAD_MAX,
@@ -265,28 +265,31 @@ fn copy_paths(
 	let path_sel =
 		selection_from_paths(repo, &cwd, paths).map_err(map_transfer_err)?;
 	let cancel = CancelToken::new();
-	let (plan, expanded_skipped) = plan_export_expanding(
-		&path_sel.sel,
+	// The same engine a remote copy and the desktop run, batches doubling
+	// past what the filter excludes, so all three surfaces agree.
+	let report = copy_selection_detailed(
+		path_sel.sel,
 		settings,
-		Some(CLIPBOARD_PAYLOAD_MAX),
-		&RunOptions::default(),
-		&cancel,
+		crate::remote::expand_limit(settings),
+		&RunOptions {
+			cancel: Some(cancel),
+			..RunOptions::default()
+		},
+		|_| {},
 	)
 	.map_err(map_transfer_err)?;
 
-	if plan.files.is_empty() {
+	if report.outcome.copied == 0 {
 		return Err("No files selected.".to_string());
 	}
 
 	let result = CopyResult {
-		files: plan.files,
-		payload: plan.payload,
-		copied_file_count: plan.copied_file_count,
-		skipped_file_size_count: plan.skipped_file_size_count,
-		skipped_unreadable_count: plan.skipped_unreadable_count
-			+ path_sel.skipped
-			+ expanded_skipped,
-		file_limit_reached: plan.file_limit_reached,
+		files: report.files,
+		payload: report.outcome.payload,
+		copied_file_count: report.outcome.copied,
+		skipped_file_size_count: report.skipped_file_size,
+		skipped_unreadable_count: report.skipped_unreadable + path_sel.skipped,
+		file_limit_reached: report.file_limit_reached,
 	};
 
 	emit(&result.payload, stdout)?;

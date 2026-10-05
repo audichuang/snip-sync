@@ -604,6 +604,39 @@ fn cli_remote_copy_forwards_the_users_settings() {
 	);
 }
 
+/// The excluded prefix of a folder can outgrow the first expansion batch
+/// (the default 30-file cap makes it 120 files): both copies double past
+/// it — remote and local agree, and the eligible tail is copied instead
+/// of "nothing could be copied".
+#[test]
+fn cli_remote_copy_expands_past_an_excluded_prefix_like_a_local_copy() {
+	let tmp = tempfile::tempdir().unwrap();
+	let proj = tmp.path().join("proj");
+	std::fs::create_dir_all(proj.join("sub")).unwrap();
+	for i in 0..130 {
+		std::fs::write(proj.join(format!("sub/skip_{i:03}.txt")), "s\n")
+			.unwrap();
+	}
+	std::fs::write(proj.join("sub/keep.txt"), "keep me\n").unwrap();
+	let settings = r###"{"useFilters":true,"useExcludeFilters":true,"filterRules":[{"type":"PATTERN","action":"EXCLUDE","value":"*skip*","enabled":true}]}"###;
+	let m = Master::with_settings(tmp.path(), serve_exec(""), settings);
+
+	let remote = m.ok(&["copy", "h", s(&proj), "--stdout"]);
+	assert!(remote.contains("keep.txt"), "{remote}");
+	assert!(!remote.contains("skip_"), "{remote}");
+
+	let mut cmd = Command::new(env!("CARGO_BIN_EXE_snip"));
+	cmd.args(["--settings", settings, "copy", ".", "--stdout"])
+		.current_dir(&proj)
+		.env("SNIP_CONFIG_DIR", tmp.path().join("cfg-local"));
+	let (status, local, stderr) = output(cmd, "snip copy");
+	assert_eq!(status, Some(0), "{stderr}");
+	assert_eq!(
+		remote, local,
+		"remote and local copy under the same settings agree"
+	);
+}
+
 #[test]
 fn cli_remote_copy_of_staged_changes_and_commits() {
 	if !require_git() {

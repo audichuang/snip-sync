@@ -176,8 +176,10 @@ fn find_workspace(
 
 /// The folder-expansion cap a local copy derives from settings
 /// (`plan_export_expanding`): doubling batches bounded by the file count
-/// limit when it applies, unbounded otherwise.
-fn expand_limit(settings: &snip_core::settings::Settings) -> usize {
+/// limit when it applies, unbounded otherwise. The remote copy sends the
+/// same number to its worker, and the local copy starts
+/// `copy_selection`'s batches from it too.
+pub(crate) fn expand_limit(settings: &snip_core::settings::Settings) -> usize {
 	if settings.set_max_file_count {
 		let count_limit = if settings.file_count_limit > 0.0 {
 			settings.file_count_limit as usize

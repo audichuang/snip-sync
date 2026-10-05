@@ -45,9 +45,10 @@ mod select;
 
 pub use changes::{changed_items, ChangedItems};
 pub use select::{
-	copy_selection, expand_folder_items, expand_folder_items_in_input_order,
-	is_safe_dir_symlink, plan_export_expanding, selection_from_paths,
-	CopyOutcome, FolderExpansion, PathSelection,
+	copy_selection, copy_selection_detailed, expand_folder_items,
+	expand_folder_items_in_input_order, is_safe_dir_symlink,
+	plan_export_expanding, selection_from_paths, CopyOutcome, CopyReport,
+	FolderExpansion, PathSelection,
 };
 
 /// A stable canonical identifier for an existing, resolved workspace or repository root.

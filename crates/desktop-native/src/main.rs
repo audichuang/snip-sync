@@ -141,23 +141,20 @@ fn commit_copied_status(out: &snip_core::commits::CommitCopyOutcome) -> Msg {
 }
 
 /// The copy toast: a partial copy (file limit hit in the folder walk or
-/// in the plan) always says so, with the limit.
+/// in the plan) always says so, with the limit. Local and remote copies
+/// report the same [`CopyOutcome`] shape.
 fn copied_status(
 	repo_name: String,
-	plan: &snip_core::transfer::ExportPlan,
-	expanded: &FolderExpansion,
+	out: &snip_core::transfer::CopyOutcome,
 ) -> Msg {
-	let skipped = plan.skipped_unreadable_count
-		+ plan.skipped_file_size_count
-		+ expanded.skipped;
 	let mut args = vec![
 		repo_name,
-		plan.copied_file_count.to_string(),
-		plan.stats.chars.to_string(),
-		plan.stats.lines.to_string(),
-		skipped.to_string(),
+		out.copied.to_string(),
+		out.chars.to_string(),
+		out.lines.to_string(),
+		out.skipped.to_string(),
 	];
-	if !(expanded.truncated || plan.file_limit_reached) {
+	if !out.truncated {
 		return Msg::new("status_copied", args);
 	}
 	if e2e_on() {
@@ -204,8 +201,8 @@ use snip_core::gitsrc::{Git, GitSource};
 use snip_core::graph::GraphLayout;
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	expand_folder_items, plan_commit_export_exact_with, plan_export_with,
-	CanonicalRootId, ExportItem, ExportSelection, FolderExpansion, SourceKind,
+	copy_selection_detailed, plan_commit_export_exact_with, CanonicalRootId,
+	ExportItem, ExportSelection, SourceKind,
 };
 use snip_core::workspace::{
 	DiscoveredRepo, Discovery, RepoIdentity, RepoSummary, ScanBudget,
@@ -4025,55 +4022,45 @@ impl WorkbenchModel {
 			lifecycle::JobKind::CancellableRead,
 			Some(job_token),
 			async move {
-				let result: Result<(String, usize, Msg), Msg> = bg
+					let result: Result<(String, usize, Msg), Msg> = bg
 					.spawn(async move {
 						let opts = interactive_read_opts(run_token.clone());
 						let settings = native_export_settings();
-						let expanded = expand_folder_items(
-							export_sel,
-							NATIVE_FILE_COUNT_LIMIT,
-							&run_token,
-						)
-						.map_err(|e| match e {
-							// Every file under the folders was skipped.
-							snip_core::transfer::TransferError::EmptySelection => {
-								Msg::new("status_copy_nothing_skipped", [])
-							}
-							e => Msg::new("error_payload", [e.to_string()]),
-						})?;
-						let export_sel = &expanded.sel;
-						// Document cap is the retained UI output ceiling.
-						// It is not `RunOptions::max_stdout`.
-						let plan = plan_export_with(
+						// The same engine a remote copy and the CLI run,
+						// batches doubling past what a filter excludes.
+						let report = copy_selection_detailed(
 							export_sel,
 							&settings,
-							Some(snip_core::transfer::CLIPBOARD_PAYLOAD_MAX),
+							NATIVE_FILE_COUNT_LIMIT,
 							&opts,
+							|plan| {
+								if let Some(ref hold) = export_hold {
+									if hold.exists() {
+										app_log!(
+											"[APP:EXPORT_PLAN_READY: files={}]",
+											plan.files.len()
+										);
+										while hold.exists() {
+											if run_token.is_cancelled() {
+												break;
+											}
+											std::thread::sleep(
+												std::time::Duration::from_millis(20),
+											);
+										}
+									}
+								}
+							},
 						)
 						.map_err(|e| {
-							Msg::new("error_payload", [e.to_string()])
-						})?;
-						if plan.files.is_empty() {
-							return Err(Msg::new("status_copy_nothing", []));
-						}
-						if let Some(ref hold) = export_hold {
-							if hold.exists() {
-								app_log!(
-									"[APP:EXPORT_PLAN_READY: files={}]",
-									plan.files.len()
-								);
-								while hold.exists() {
-									if run_token.is_cancelled() {
-										break;
-									}
-									std::thread::sleep(
-										std::time::Duration::from_millis(20),
-									);
-								}
-							}
-						}
-						plan.revalidate_with(&opts).map_err(|e| {
 							let reason = match &e {
+								// Every file under the folders was skipped.
+								snip_core::transfer::TransferError::EmptySelection => {
+									return Msg::new(
+										"status_copy_nothing_skipped",
+										[],
+									)
+								}
 								snip_core::transfer::TransferError::StaleSource { .. } => "stale_source",
 								_ => "revalidate",
 							};
@@ -4082,8 +4069,15 @@ impl WorkbenchModel {
 							}
 							Msg::new("error_payload", [e.to_string()])
 						})?;
-						let msg = copied_status(repo_name, &plan, &expanded);
-						Ok((plan.payload, plan.copied_file_count, msg))
+						if report.outcome.copied == 0 {
+							return Err(Msg::new("status_copy_nothing", []));
+						}
+						let msg = copied_status(repo_name, &report.outcome);
+						Ok((
+							report.outcome.payload,
+							report.outcome.copied,
+							msg,
+						))
 					})
 					.await;
 
@@ -4208,19 +4202,7 @@ impl WorkbenchModel {
 						if out.copied == 0 {
 							return Err(Msg::new("status_copy_nothing", []));
 						}
-						let mut args = vec![
-							repo_name,
-							out.copied.to_string(),
-							out.chars.to_string(),
-							out.lines.to_string(),
-							out.skipped.to_string(),
-						];
-						let msg = if out.truncated {
-							args.push(NATIVE_FILE_COUNT_LIMIT.to_string());
-							Msg::new("status_copied_limit", args)
-						} else {
-							Msg::new("status_copied", args)
-						};
+						let msg = copied_status(repo_name, &out);
 						Ok((out.payload, out.copied, msg))
 					})
 					.await;
@@ -11887,14 +11869,12 @@ mod tests {
 	}
 
 	mod folder_copy {
-		use crate::{
-			expand_folder_items, native_export_settings,
-			NATIVE_FILE_COUNT_LIMIT,
-		};
-		use snip_core::gitrun::CancelToken;
+		use crate::{native_export_settings, NATIVE_FILE_COUNT_LIMIT};
+		use snip_core::gitrun::{CancelToken, RunOptions};
+		use snip_core::transfer::expand_folder_items;
 		use snip_core::transfer::{
-			plan_export, CanonicalRootId, ExportItem, ExportSelection,
-			SourceKind,
+			copy_selection_detailed, plan_export, CanonicalRootId, ExportItem,
+			ExportSelection, SourceKind,
 		};
 		use std::fs;
 		use std::path::{Path, PathBuf};
@@ -12059,7 +12039,9 @@ mod tests {
 			assert!(!exact.truncated);
 		}
 
-		/// A walk cut at the limit reaches the toast as a partial copy.
+		/// A copy the file limit cuts reaches the toast as a partial copy;
+		/// the shared engine stops at the limit, and copies the whole
+		/// folder without one.
 		#[test]
 		fn truncated_copy_says_so_in_the_status() {
 			let (_tmp, root) = canonical_tmp();
@@ -12067,28 +12049,38 @@ mod tests {
 			for i in 0..8 {
 				fs::write(root.join(format!("big/{i}.txt")), "B").unwrap();
 			}
-			let cut = expand_folder_items(
+			let mut cut = native_export_settings();
+			cut.set_max_file_count = true;
+			cut.file_count_limit = 3.0;
+			let report = copy_selection_detailed(
 				selection(&root, &["big"]),
-				3,
-				&CancelToken::new(),
+				&cut,
+				NATIVE_FILE_COUNT_LIMIT,
+				&RunOptions::default(),
+				|_| {},
 			)
 			.unwrap();
-			let plan =
-				plan_export(&cut.sel, &native_export_settings(), None).unwrap();
-			let msg = crate::copied_status("r".into(), &plan, &cut);
+			assert_eq!(report.outcome.copied, 3);
+			assert!(report.outcome.truncated);
+			let msg = crate::copied_status("r".into(), &report.outcome);
 			assert_eq!(msg.key, "status_copied_limit");
 			assert_eq!(msg.args[1], "3");
 			assert_eq!(msg.args[5], NATIVE_FILE_COUNT_LIMIT.to_string());
-			let whole = expand_folder_items(
+
+			let mut whole = native_export_settings();
+			whole.set_max_file_count = false;
+			let report = copy_selection_detailed(
 				selection(&root, &["big"]),
-				8,
-				&CancelToken::new(),
+				&whole,
+				NATIVE_FILE_COUNT_LIMIT,
+				&RunOptions::default(),
+				|_| {},
 			)
 			.unwrap();
-			let plan = plan_export(&whole.sel, &native_export_settings(), None)
-				.unwrap();
+			assert_eq!(report.outcome.copied, 8);
+			assert!(!report.outcome.truncated);
 			assert_eq!(
-				crate::copied_status("r".into(), &plan, &whole).key,
+				crate::copied_status("r".into(), &report.outcome).key,
 				"status_copied"
 			);
 		}
