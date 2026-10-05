@@ -8,7 +8,8 @@
 # The checkout is mounted read-only at its host path, so receipts and fixture paths
 # read the same inside and out, and nothing inside writes the host's repository: a git
 # refreshing .git/index through the shared mount made the next read see an empty index. The container's target/ is a volume per checkout: Linux
-# artifacts never land in the host's target/, and incremental builds survive runs.
+# artifacts never land in the host's target/, and a rerun after a failure is incremental
+# (`just preflight` drops the volume after a pass).
 # Each volume is labelled with its checkout's path, and every run removes the volumes
 # whose checkout is gone: a clone or worktree used once otherwise left 12-18 GB behind.
 # SNIP_CONTAINER_CPUS / SNIP_CONTAINER_MEMORY size the VM (container's default is 4 CPUs, 1 GB).

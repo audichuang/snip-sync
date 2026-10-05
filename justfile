@@ -15,8 +15,8 @@ fmt:
 	cargo fmt --all
 
 # Frees build output: this checkout's target/, its worktrees' target/, and on macOS the
-# preflight container's target/ volumes of this checkout and of every deleted clone or
-# worktree (12-25 GB each, otherwise kept until the next preflight).
+# preflight container's target/ volumes of this checkout (kept by a failed preflight) and
+# of every deleted clone or worktree (12-25 GB each, otherwise kept until the next preflight).
 clean:
 	#!/usr/bin/env bash
 	set -euo pipefail
@@ -39,6 +39,9 @@ preflight:
 	fi
 	{{just_executable()}} preflight-host
 	scripts/linux_container.sh just preflight-linux
+	# A pass drops this checkout's target/ volume (12-25 GB): each task uses a fresh
+	# clone, so it would only serve a rerun. A failure keeps it for an incremental rerun.
+	scripts/linux_container.sh --prune-all
 
 # The Python harness tests are light, so they overlap the Rust checks; their output
 # is held back and printed after, so a failure is not buried in cargo's.
