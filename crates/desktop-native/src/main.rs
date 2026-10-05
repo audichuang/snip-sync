@@ -142,7 +142,7 @@ fn commit_copied_status(out: &snip_core::commits::CommitCopyOutcome) -> Msg {
 
 /// The copy toast: a partial copy (file limit hit in the folder walk or
 /// in the plan) always says so, with the limit. Local and remote copies
-/// report the same [`CopyOutcome`] shape.
+/// report the same [`snip_core::transfer::CopyOutcome`] shape.
 fn copied_status(
 	repo_name: String,
 	out: &snip_core::transfer::CopyOutcome,
