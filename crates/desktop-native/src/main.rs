@@ -3259,7 +3259,7 @@ impl WorkbenchModel {
 		rels: &[String],
 		cx: &mut Context<Self>,
 	) {
-		if !self.accepting_work() || self.remote.session.is_some() {
+		if !self.accepting_work() {
 			return;
 		}
 		let tree = if ws { &self.ws_tree } else { &self.file_tree };
@@ -7841,7 +7841,9 @@ mod tests {
 
 			crate::paste::tests::git_init(&alpha);
 			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
-			crate::paste::tests::git_run(&alpha, &["add", "init.txt"]);
+			fs::create_dir_all(alpha.join("dir")).unwrap();
+			fs::write(alpha.join("dir").join("c.txt"), "C\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "."]);
 			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
 			fs::write(alpha.join("dirty.txt"), "dirty\n").unwrap();
 
@@ -7849,6 +7851,10 @@ mod tests {
 			fs::write(beta.join("init.txt"), "hello\n").unwrap();
 			crate::paste::tests::git_run(&beta, &["add", "init.txt"]);
 			crate::paste::tests::git_run(&beta, &["commit", "-m", "init"]);
+
+			let notes = shared.join("notes");
+			fs::create_dir_all(&notes).unwrap();
+			fs::write(notes.join("n.txt"), "N\n").unwrap();
 
 			let (model, cx, _worker) = open_remote(
 				cx,
@@ -7932,6 +7938,19 @@ mod tests {
 					m.copy_targets(targets.clone(), cx)
 				}
 			};
+			// The row's menu Copy, as the right-click handler opens it.
+			let menu_copy = |m: &WorkbenchModel, ws: bool, rel: &str| {
+				let tree = if ws { &m.ws_tree } else { &m.file_tree };
+				let tree = tree.as_ref().expect("tree loaded");
+				let row = tree
+					.flatten_visible(tree.visible_limit())
+					.into_iter()
+					.find(|r| r.rel_path == rel)
+					.unwrap_or_else(|| panic!("{rel} row"));
+				assert!(row.selected, "{rel} is selected");
+				copy_of(m.work_row_menu(&row, ws))
+					.unwrap_or_else(|| panic!("{rel}: Copy enabled"))
+			};
 
 			// A Changes file row: the worker's working-tree bytes.
 			let row = model.read_with(cx, |m, _| {
@@ -7955,7 +7974,7 @@ mod tests {
 			let text = run(&model, cx, &copy_node(group), "group");
 			assert_eq!(files(&text), entries(&[("dirty.txt", "dirty")]));
 
-			// A Project tree selection.
+			// A Project tree selection (multi-select).
 			model.update(cx, |m, cx| {
 				m.dispatch_tree(
 					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
@@ -7963,11 +7982,39 @@ mod tests {
 					))),
 					cx,
 				);
+				m.dispatch_tree(
+					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
+						"dirty.txt",
+					))),
+					cx,
+				);
 			});
-			let picked = model.read_with(cx, |m, _| m.project_targets());
-			assert_eq!(picked.len(), 1, "{picked:?}");
+			let picked =
+				model.read_with(cx, |m, _| menu_copy(m, false, "init.txt"));
+			assert_eq!(picked.len(), 2, "{picked:?}");
 			let text = run(&model, cx, &copy_node(picked), "project");
-			assert_eq!(files(&text), entries(&[("init.txt", "hello")]));
+			assert_eq!(
+				files(&text),
+				entries(&[("dirty.txt", "dirty"), ("init.txt", "hello")])
+			);
+
+			// A repo subfolder right-click.
+			model.update(cx, |m, cx| {
+				m.select_tree_rows_alone(false, &["dir".into()], cx);
+			});
+			let targets =
+				model.read_with(cx, |m, _| menu_copy(m, false, "dir"));
+			let text = run(&model, cx, &copy_node(targets), "repo folder");
+			assert_eq!(files(&text), entries(&[("dir/c.txt", "C")]));
+
+			// A workspace-level non-repo folder right-click.
+			model.update(cx, |m, cx| {
+				m.select_tree_rows_alone(true, &["notes".into()], cx);
+			});
+			let targets =
+				model.read_with(cx, |m, _| menu_copy(m, true, "notes"));
+			let text = run(&model, cx, &copy_node(targets), "workspace folder");
+			assert_eq!(files(&text), entries(&[("notes/n.txt", "N")]));
 
 			// A file at a commit, after the worktree changed.
 			// The log row's id names its repo; the menu splits it the same way.
@@ -8250,6 +8297,38 @@ mod tests {
 			assert_eq!(
 				fs::read_to_string(alpha.join("replayed.txt")).unwrap(),
 				"replayed\n"
+			);
+
+			// A paste several chunks long goes out in pieces; it is held to
+			// the same preview limit (MAX_RETAINED_PREVIEW_BYTES) as a local
+			// paste.
+			let c1 = "a".repeat(900_000);
+			let c2 = "b".repeat(900_000);
+			let c3 = "c".repeat(900_000);
+			let payload = format!(
+				"// FILE: chunk_1.txt\n{c1}\n// FILE: chunk_2.txt\n{c2}\n// FILE: chunk_3.txt\n{c3}\n"
+			);
+			assert!(payload.len() > 2 * snip_remote::proto::CHUNK_BYTES);
+			remote_paste_preview(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.items.len(), 3);
+			});
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
+			});
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_1.txt")).unwrap(),
+				c1
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_2.txt")).unwrap(),
+				c2
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_3.txt")).unwrap(),
+				c3
 			);
 		}
 
