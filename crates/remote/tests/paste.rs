@@ -694,3 +694,77 @@ fn an_apply_with_a_huge_freshness_snapshot_rides_back_in_chunks() {
 		filler
 	);
 }
+
+/// `SNIP_E2E_PASTE_HOLD`: an Apply paused after its first committed write,
+/// with the master's call cut before any answer came back, reports
+/// outcome unknown while the worker keeps that first write — the L05
+///「寫入途中斷線」case, made deterministic.
+#[test]
+fn a_cut_apply_reports_outcome_unknown_and_keeps_its_first_write() {
+	use std::time::{Duration, Instant};
+
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let hold = tmp.path().join("paste-hold");
+	let text = [entry("a.txt", "first"), entry("b.txt", "second")].concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	let sel = unchecked(&[]);
+
+	fs::write(&hold, b"").unwrap();
+	std::env::set_var("SNIP_E2E_PASTE_HOLD", &hold);
+	let req = snip_remote::Request::ImportApply {
+		workspace: id,
+		dest: String::new(),
+		text,
+		mapping,
+		selection: sel,
+		expect: planned.expect(),
+	};
+	let call = std::thread::spawn(move || {
+		client.call_with(&req, None, Duration::from_secs(3))
+	});
+	// The worker's first write is on disk before the cut: the pause sits
+	// between the two files, not before the first.
+	let deadline = Instant::now() + Duration::from_secs(10);
+	while !ws.join("a.txt").exists() && Instant::now() < deadline {
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	assert!(
+		ws.join("a.txt").exists(),
+		"the worker must commit its first write"
+	);
+	assert!(
+		!ws.join("b.txt").exists(),
+		"the hold sits between the two writes"
+	);
+
+	// The call is cut by its own deadline while the worker is still
+	// parked; only the cut releases the hold.
+	let answer = call.join().expect("the call thread must end");
+	std::env::remove_var("SNIP_E2E_PASTE_HOLD");
+	fs::remove_file(&hold).unwrap();
+	let err = match answer {
+		Err(err) => err,
+		Ok(ok) => panic!("a cut apply cannot answer: {ok:?}"),
+	};
+	assert!(err.outcome_unknown(), "{err:?}");
+	assert_eq!(
+		fs::read(ws.join("a.txt")).unwrap(),
+		b"first",
+		"the worker wrote the first file before the cut"
+	);
+	// Lifted, the worker finishes the apply it already started.
+	let resume = Instant::now() + Duration::from_secs(10);
+	while !ws.join("b.txt").exists() && Instant::now() < resume {
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	assert!(
+		ws.join("b.txt").exists(),
+		"the worker finishes after the hold lifts"
+	);
+}

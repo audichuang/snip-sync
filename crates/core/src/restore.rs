@@ -262,6 +262,17 @@ pub fn execute_restore_plan(
 	plan: &RestorePlan,
 	selection: &RestoreSelection,
 ) -> RestoreExecutionResult {
+	execute_restore_plan_observed(plan, selection, &mut |_, _| {})
+}
+
+/// [`execute_restore_plan`] with a sink that observes every file as soon
+/// as its write committed (created or overwritten; a skipped row wrote
+/// nothing): a remote worker's e2e paste-hold keys on the first.
+pub fn execute_restore_plan_observed(
+	plan: &RestorePlan,
+	selection: &RestoreSelection,
+	after_write: &mut dyn FnMut(&CreateOperation, &CreateOutcome),
+) -> RestoreExecutionResult {
 	let mut result = RestoreExecutionResult::default();
 
 	for (i, op) in plan.create_operations.iter().enumerate() {
@@ -270,8 +281,16 @@ pub fn execute_restore_plan(
 		}
 		// The plan's FULL root set, not only the op's own root.
 		match run_create(&plan.roots, selection, op) {
-			Ok(CreateOutcome::Created) => result.created_count += 1,
-			Ok(CreateOutcome::Overwritten) => result.overwritten_count += 1,
+			Ok(
+				outcome @ (CreateOutcome::Created | CreateOutcome::Overwritten),
+			) => {
+				match outcome {
+					CreateOutcome::Created => result.created_count += 1,
+					CreateOutcome::Overwritten => result.overwritten_count += 1,
+					CreateOutcome::Skipped => unreachable!(),
+				}
+				after_write(op, &outcome);
+			}
 			Ok(CreateOutcome::Skipped) => result.skipped_existing_count += 1,
 			Err(message) => result.errors.push(message),
 		}
@@ -305,7 +324,8 @@ pub fn execute_restore_plan(
 	result
 }
 
-enum CreateOutcome {
+/// What one create operation ended in. A skipped row wrote nothing.
+pub enum CreateOutcome {
 	Created,
 	Overwritten,
 	Skipped,

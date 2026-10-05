@@ -209,6 +209,26 @@ pub(crate) fn import_plan(
 	}
 }
 
+/// `SNIP_E2E_PASTE_HOLD` names a file: when the variable is set and the
+/// file exists, an Apply that just committed its first write waits until
+/// the file disappears (at most 60 s, polled every 50 ms), so a protocol
+/// run can cut the connection mid-write deterministically. Unset, or the
+/// file absent: no pause.
+fn hold_after_first_write() {
+	let Some(path) = std::env::var_os("SNIP_E2E_PASTE_HOLD") else {
+		return;
+	};
+	let path = PathBuf::from(path);
+	if !path.is_file() {
+		return;
+	}
+	let deadline =
+		std::time::Instant::now() + std::time::Duration::from_secs(60);
+	while path.is_file() && std::time::Instant::now() < deadline {
+		std::thread::sleep(std::time::Duration::from_millis(50));
+	}
+}
+
 /// Answers [`crate::proto::Request::ImportApply`]: the preview's snapshot
 /// is checked first, as a local Apply does, then the plan made again must
 /// be the one previewed.
@@ -244,8 +264,14 @@ pub(crate) fn import_apply(
 		if cancel.is_cancelled() {
 			return Err(refused(ErrorCode::Cancelled, "cancelled"));
 		}
+		let mut held_once = false;
 		let result = plan
-			.apply(selection)
+			.apply_observed(selection, &mut |_op, _outcome| {
+				if !held_once {
+					held_once = true;
+					hold_after_first_write();
+				}
+			})
 			.map_err(|e| transfer_refusal(e, cancel))?;
 		Ok(Response::Imported(result))
 	};

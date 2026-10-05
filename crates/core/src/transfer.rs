@@ -814,9 +814,25 @@ impl TransferImportPlan {
 		&self,
 		selection: &RestoreSelection,
 	) -> Result<RestoreExecutionResult, TransferError> {
+		self.apply_observed(selection, &mut |_, _| {})
+	}
+
+	/// [`Self::apply`] observing every committed write as it lands: a
+	/// remote worker's e2e paste-hold pauses after the first.
+	pub fn apply_observed(
+		&self,
+		selection: &RestoreSelection,
+		after_write: &mut dyn FnMut(
+			&restore::CreateOperation,
+			&restore::CreateOutcome,
+		),
+	) -> Result<RestoreExecutionResult, TransferError> {
 		self.destination_freshness.revalidate()?;
-		let result =
-			restore::execute_restore_plan(&self.restore_plan, selection);
+		let result = restore::execute_restore_plan_observed(
+			&self.restore_plan,
+			selection,
+			after_write,
+		);
 		Ok(result)
 	}
 }
