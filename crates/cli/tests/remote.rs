@@ -170,6 +170,28 @@ fn serve_needs_the_stdio_flag() {
 	assert_eq!(status, Some(2));
 }
 
+/// `ls` prints the WHOLE listing in one call: 1,200 names, sorted, no
+/// duplicates, and nothing left to ask a second call for.
+#[test]
+fn cli_master_ls_prints_a_whole_1200_entry_listing() {
+	let tmp = tempfile::tempdir().unwrap();
+	let many = tmp.path().join("many");
+	std::fs::create_dir_all(&many).unwrap();
+	for i in 0..1200 {
+		std::fs::write(many.join(format!("f{i:04}")), "").unwrap();
+	}
+	let m = Master::new(tmp.path());
+	let out = m.ok(&["ls", "anyhost", s(&many)]);
+	let mut lines: Vec<&str> = out.lines().collect();
+	assert_eq!(lines.len(), 1200, "{lines:?}");
+	let mut sorted = lines.clone();
+	sorted.sort_unstable();
+	assert_eq!(lines, sorted, "the reply is the sorted listing itself");
+	lines.sort_unstable();
+	lines.dedup();
+	assert_eq!(lines.len(), 1200, "no name arrives twice");
+}
+
 #[test]
 fn cli_master_lists_stats_and_cats_a_folder() {
 	let tmp = tempfile::tempdir().unwrap();

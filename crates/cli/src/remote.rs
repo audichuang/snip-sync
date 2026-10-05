@@ -174,9 +174,6 @@ fn find_workspace(
 	client.open_workspace(workspace).map_err(|e| e.to_string())
 }
 
-/// Paths to copy, with the change type when a change list named it.
-type Named = Vec<(String, Option<ChangeType>)>;
-
 /// The folder-expansion cap a local copy derives from settings
 /// (`plan_export_expanding`): doubling batches bounded by the file count
 /// limit when it applies, unbounded otherwise.
@@ -234,30 +231,18 @@ pub fn run(
 		} => {
 			let c = client(&host);
 			let ws = find_workspace(&c, &workspace)?;
+			let (entries, truncated) =
+				c.list_dir(&ws.id, &path).map_err(|e| e.to_string())?;
 			let mut out = io::stdout().lock();
-			let mut offset = 0;
-			let last_truncated;
-			loop {
-				let page = c
-					.list_dir_page(&ws.id, &path, offset)
-					.map_err(|e| e.to_string())?;
-				for e in &page.entries {
-					let _ = writeln!(
-						out,
-						"{}{}",
-						e.name,
-						if e.directory { "/" } else { "" }
-					);
-				}
-				match page.next {
-					Some(next) => offset = next,
-					None => {
-						last_truncated = page.truncated;
-						break;
-					}
-				}
+			for e in &entries {
+				let _ = writeln!(
+					out,
+					"{}{}",
+					e.name,
+					if e.directory { "/" } else { "" }
+				);
 			}
-			if last_truncated {
+			if truncated {
 				eprintln!("(listing truncated)");
 			}
 			Ok(())
@@ -481,42 +466,26 @@ pub fn run(
 					None,
 				)
 				.map_err(|e| e.to_string())?
+			} else if paths.is_empty() {
+				// The whole folder: ONE target the worker expands with the
+				// shared copy engine, exactly as the desktop's folder row
+				// does — nothing is listed on the client.
+				let items = vec![snip_remote::ExportTarget {
+					root: repo.clone(),
+					path: String::new(),
+					source: source.clone(),
+					change_type: None,
+				}];
+				c.export_files(&ws.id, items, settings, limit, None)
+					.map_err(|e| e.to_string())?
 			} else {
-				let named: Named = if paths.is_empty() {
-					// The whole folder: its entries, as a local copy of `.`
-					// takes, every page of the listing.
-					let mut names: Vec<String> = Vec::new();
-					let mut offset = 0;
-					loop {
-						let page = c
-							.list_dir_page(&ws.id, &repo, offset)
-							.map_err(|e| e.to_string())?;
-						names.extend(
-							page.entries
-								.iter()
-								.filter(|e| e.utf8)
-								.map(|e| e.name.clone()),
-						);
-						match page.next {
-							Some(next) => offset = next,
-							None => break,
-						}
-					}
-					names.sort();
-					names.into_iter().map(|n| (n, None)).collect()
-				} else {
-					paths.into_iter().map(|p| (p, None)).collect()
-				};
-				if named.is_empty() {
-					return Err("nothing to copy".into());
-				}
-				let items = named
+				let items = paths
 					.into_iter()
-					.map(|(path, change_type)| snip_remote::ExportTarget {
+					.map(|path| snip_remote::ExportTarget {
 						root: repo.clone(),
 						path,
 						source: source.clone(),
-						change_type,
+						change_type: None,
 					})
 					.collect();
 				c.export_files(&ws.id, items, settings, limit, None)

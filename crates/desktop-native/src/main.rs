@@ -5725,6 +5725,154 @@ mod tests {
 		/// Project tree and a file preview, all read through the worker.
 		/// Every read has a deadline (snip-remote), so a hang fails rather
 		/// than blocks.
+		/// A remote listing the byte budget cuts short finishes through the
+		/// ORDINARY LoadMore path: Expand fetches the whole listing once,
+		/// the budget admits four of ten, and「顯示更多」walks the held
+		/// tail to the end — no refetch, no name lost or doubled.
+		#[gpui::test]
+		fn a_remote_listing_cut_by_the_budget_finishes_through_load_more(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect, TreeIo, TreeIoKind,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::VecDeque;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let children: Vec<ListedChild> = (0..10)
+				.map(|i| ListedChild {
+					name: format!("f{i:02}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			let mut tree = FileTreeNode::unloaded_root(&root);
+
+			// One row's cost, measured on a directly built io: the tree's
+			// command state is not what this measures, and one Expand is
+			// all an unloaded root will schedule.
+			let probe = listed_tree_result(
+				TreeIo {
+					key: NodeKey::root(),
+					epoch: 0,
+					dir: root.clone(),
+					base: root.clone(),
+					depth: 1,
+					byte_budget: usize::MAX,
+					scan: None,
+					held: VecDeque::new(),
+					replace_children: true,
+					kind: TreeIoKind::Expand,
+				},
+				Ok((children[..1].to_vec(), false)),
+			);
+			let cost = probe.children[0].retained_bytes();
+
+			let TreeEffect::Io(mut io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("expand must schedule io");
+			};
+			io.byte_budget = cost.saturating_mul(4).saturating_add(64);
+			let first = listed_tree_result(io, Ok((children, false)));
+			tree.apply_io_result(first).expect("the expand applies");
+			assert_eq!(tree.children.len(), 4, "the budget admits four of ten");
+			assert!(tree.has_more, "the rest is held for LoadMore");
+			assert!(
+				tree.flatten_visible(100).iter().any(|r| r.is_more_marker),
+				"the「顯示更多」marker is visible"
+			);
+
+			// LoadMore through the real command path, with the workbench's
+			// own budget logic.
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::LoadMore(NodeKey::root()))
+			else {
+				panic!("load more must schedule io from the held tail");
+			};
+			let rest = execute_tree_io(io, &CancelToken::new());
+			tree.apply_io_result(rest)
+				.expect("the continuation applies");
+			assert!(!tree.has_more);
+			let names: Vec<&str> =
+				tree.children.iter().map(|c| c.name.as_str()).collect();
+			assert_eq!(names.len(), 10, "{names:?}");
+			assert_eq!(
+				names,
+				[
+					"f00", "f01", "f02", "f03", "f04", "f05", "f06", "f07",
+					"f08", "f09"
+				],
+				"every name exactly once, in order"
+			);
+		}
+
+		/// A 1,200-entry remote listing shows every name through LoadMore:
+		/// the first Expand admits one page, the held tail carries the rest,
+		/// and no name is lost or doubled on the way.
+		#[gpui::test]
+		fn a_remote_listing_of_1200_shows_every_name_through_load_more(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect, MAX_DIR_ENTRIES,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::HashSet;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let children: Vec<ListedChild> = (0..1200)
+				.map(|i| ListedChild {
+					name: format!("f{i:04}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			let mut tree = FileTreeNode::unloaded_root(&root);
+
+			// The budget is not what this test is about (AGENTS: build the
+			// state rather than rely on how many names fit), so each batch
+			// runs with the budget open.
+			let TreeEffect::Io(mut io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("expand must schedule io");
+			};
+			io.byte_budget = usize::MAX;
+			let result = listed_tree_result(io, Ok((children, false)));
+			tree.apply_io_result(result).expect("the expand applies");
+			assert_eq!(
+				tree.children.len(),
+				MAX_DIR_ENTRIES,
+				"the first batch is the ordinary page"
+			);
+			assert!(tree.has_more);
+
+			let mut guard = 0;
+			while tree.has_more {
+				guard += 1;
+				assert!(guard < 30, "load more must converge");
+				let TreeEffect::Io(mut io) =
+					tree.start(TreeCommand::LoadMore(NodeKey::root()))
+				else {
+					panic!("load more must schedule io while names remain");
+				};
+				io.byte_budget = usize::MAX;
+				let result = execute_tree_io(io, &CancelToken::new());
+				tree.apply_io_result(result)
+					.expect("a continuation applies");
+			}
+			assert_eq!(tree.children.len(), 1200);
+			let seen: HashSet<&str> =
+				tree.children.iter().map(|c| c.name.as_str()).collect();
+			assert_eq!(seen.len(), 1200, "no duplicates");
+			assert!(tree.children[0].name == "f0000");
+			assert!(tree.children[1199].name == "f1199");
+		}
+
 		#[gpui::test]
 		fn remote_workspace_opens_a_host_folder_and_previews_through_a_worker(
 			cx: &mut TestAppContext,

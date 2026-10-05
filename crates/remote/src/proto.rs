@@ -31,12 +31,8 @@ pub const TRANSFER_VERSION: u32 = 3;
 /// The first protocol with paste ([`Request::ImportPlan`] and the rest).
 pub const PASTE_VERSION: u32 = 4;
 /// The first protocol where the worker resolves a change selection itself
-/// ([`Request::ExportChanges`]) and pages a directory listing
-/// ([`Request::ListDir`] with an offset).
+/// ([`Request::ExportChanges`]).
 pub const EXPORT_CHANGES_VERSION: u32 = 5;
-/// The first protocol with paged remote listings ([`Response::Dir`]'s
-/// `next`).
-pub const DIR_PAGES_VERSION: u32 = 5;
 /// The first protocol with a request sent as joined JSON pieces
 /// ([`Request::FrameChunk`]).
 pub const REQUEST_CHUNKS_VERSION: u32 = 5;
@@ -58,9 +54,11 @@ pub const JOINED_MAX: usize = 8 * snip_core::transfer::CLIPBOARD_PAYLOAD_MAX;
 /// of text, and JSON escaping can grow it several times.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
-/// Entries one `ListDir` reply carries at most; the rest is reported as
-/// `truncated`.
-pub const MAX_DIR_ENTRIES: usize = 1000;
+/// Entries one `ListDir` reply carries at most: the whole sorted listing
+/// up to this cap, and `truncated` when the folder holds more. The local
+/// tree has no fixed cap of its own (its byte budget pages on disk), so
+/// this one bounds a remote listing's memory on both ends.
+pub const MAX_DIR_ENTRIES: usize = 20_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -80,12 +78,6 @@ pub enum Request {
 	ListDir {
 		workspace: String,
 		path: String,
-		/// Ask for the listing's continuation: entries from this index of
-		/// the worker's sorted listing on. Zero is the first page. A
-		/// non-zero offset needs [`DIR_PAGES_VERSION`]; workers before it
-		/// answer the first page again.
-		#[serde(default)]
-		offset: usize,
 	},
 	Stat {
 		workspace: String,
@@ -300,9 +292,6 @@ impl Request {
 			}
 			Self::ExportChanges { .. } => EXPORT_CHANGES_VERSION,
 			Self::FrameChunk { .. } | Self::FrameJoin => REQUEST_CHUNKS_VERSION,
-			// Only a continuation needs a paging worker; the first page is
-			// protocol 1.
-			Self::ListDir { offset, .. } if *offset > 0 => DIR_PAGES_VERSION,
 			Self::ImportPlan { .. }
 			| Self::ImportApply { .. }
 			| Self::ReplayPlan { .. }
@@ -375,16 +364,12 @@ pub enum Response {
 	},
 	Workspace(RemoteWorkspace),
 	Dir {
+		/// The whole sorted listing, at most [`MAX_DIR_ENTRIES`] of it.
 		entries: Vec<DirEntry>,
 		/// More entries exist than this reply holds: the listing is
-		/// truncated, or a further page carries the rest.
-		truncated: bool,
-		/// The offset to request for the next page: `Some` only when the
-		/// worker pages ([`DIR_PAGES_VERSION`]) and more entries remain.
-		/// Workers before that version have no field here, and a master
-		/// reads `None`: a truncated listing is all there is.
+		/// truncated, and there is no continuation to ask for.
 		#[serde(default)]
-		next: Option<usize>,
+		truncated: bool,
 	},
 	Stat(Stat),
 	/// `content` is `None` for a binary or non-UTF-8 file, as local preview.
@@ -762,7 +747,6 @@ mod tests {
 		let req = Request::ListDir {
 			workspace: "w".into(),
 			path: "src/多行".into(),
-			offset: 0,
 		};
 		write_frame(&mut buf, &req).unwrap();
 		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() })
@@ -1045,6 +1029,20 @@ mod tests {
 	}
 
 	#[test]
+	fn dir_reply_without_truncated_parses_as_not_truncated() {
+		// A worker built before the whole-listing reply still parses.
+		let json = r#"{"reply":"dir","entries":[{"name":"a","utf8":true,"directory":false,"symlink":false,"nested_repo":false}]}"#;
+		let res: Response = serde_json::from_str(json).unwrap();
+		match res {
+			Response::Dir { entries, truncated } => {
+				assert_eq!(entries.len(), 1);
+				assert!(!truncated);
+			}
+			other => panic!("expected Dir, got {other:?}"),
+		}
+	}
+
+	#[test]
 	fn hello_reply_without_home_or_max_version_parses_as_none() {
 		let json = r#"{"reply":"hello","version":1,"name":"w"}"#;
 		let res: Response = serde_json::from_str(json).unwrap();
@@ -1188,7 +1186,6 @@ mod tests {
 			Request::ListDir {
 				workspace: "w".into(),
 				path: "p".into(),
-				offset: 0,
 			},
 			Request::Stat {
 				workspace: "w".into(),
@@ -1212,19 +1209,12 @@ mod tests {
 		for req in &v1_requests {
 			assert_eq!(req.needs_version(), 1);
 		}
-		// A listing continuation needs a paging worker; the first page does not.
-		let first_page = Request::ListDir {
+		// A whole listing is protocol 1, as the first page always was.
+		let listing = Request::ListDir {
 			workspace: "w".into(),
 			path: "p".into(),
-			offset: 0,
 		};
-		assert_eq!(first_page.needs_version(), 1);
-		let continuation = Request::ListDir {
-			workspace: "w".into(),
-			path: "p".into(),
-			offset: 1000,
-		};
-		assert_eq!(continuation.needs_version(), DIR_PAGES_VERSION);
+		assert_eq!(listing.needs_version(), 1);
 
 		let v4_requests = [
 			Request::ImportPlan {

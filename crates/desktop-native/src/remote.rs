@@ -415,12 +415,21 @@ pub(crate) fn remote_scan_entries(
 }
 
 /// Blocking: the remote counterpart of [`crate::tree::execute_tree_io`].
+/// A fresh Expand/Retry fetches the worker's WHOLE listing once; a
+/// continuation (LoadMore, entries still in `held`) is the ordinary local
+/// admission path — nothing to fetch, no remote branch.
 pub fn tree_io(
 	client: &Client,
 	workspace: &str,
 	session_root: &Path,
 	io: TreeIo,
 ) -> TreeIoResult {
+	if !io.held.is_empty() {
+		return crate::tree::execute_tree_io(
+			io,
+			&snip_core::gitrun::CancelToken::new(),
+		);
+	}
 	let prefix = match remote_rel(session_root, &io.base) {
 		Some(p) => p,
 		None => {
@@ -434,10 +443,9 @@ pub fn tree_io(
 		Some(key_rel) => {
 			let req_path = join_rel(&prefix, &key_rel);
 			client
-				.list_dir_page(workspace, &req_path, io.remote_offset)
-				.map(|page| {
-					let children = page
-						.entries
+				.list_dir(workspace, &req_path)
+				.map(|(entries, truncated)| {
+					let children = entries
 						.into_iter()
 						.map(|e| ListedChild {
 							name: e.name,
@@ -446,7 +454,7 @@ pub fn tree_io(
 							nested_repo: e.nested_repo,
 						})
 						.collect();
-					(children, page.truncated, page.next)
+					(children, truncated)
 				})
 				.map_err(describe)
 		}
