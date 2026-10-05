@@ -583,7 +583,7 @@ impl WorkbenchModel {
 				.track_focus(&self.reader_focus)
 				.on_action(cx.listener(|this, _: &ReaderCopy, _, cx| {
 					if !this.copy_reader_selection(cx) {
-						this.copy_selection_to_clipboard(cx);
+						this.copy_cursor_node(cx);
 					}
 				}))
 				.on_action(cx.listener(|this, _: &ReaderSelectAll, _, cx| {

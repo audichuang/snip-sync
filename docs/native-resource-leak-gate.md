@@ -48,7 +48,7 @@ short 子閘要求 8 項互動的完整覆蓋：repo 切換與 history 的新鮮
 
 隔離顯示上的剪貼簿在取樣前放進固定 payload。收尾要嘛仍是同一份內容，要嘛明文標出 copy 留下的 payload。不可以把剪貼簿清成空的來過記憶體預算。workspace close 與 reopen 必須保留剪貼簿。
 
-tree、copy、paste、cancel、basket restore 與 workspace close/reopen 都在終點資源窗之前完成。清完回到同一個 canonical repo／GitChanges，settle 之後才寫終點樣本。長閘的 30 秒結尾窗也在這些操作之後，並且落在觀察的最後 30 秒。終點資源取樣完成後才送出 graceful quit。
+tree、copy（右鍵「複製」一個變更列）、paste、cancel 與 workspace close/reopen 都在終點資源窗之前完成。清完回到同一個 canonical repo／GitChanges，settle 之後才寫終點樣本。長閘的 30 秒結尾窗也在這些操作之後，並且落在觀察的最後 30 秒。終點資源取樣完成後才送出 graceful quit。
 
 long 仍要求 600 秒浸泡、500 次切換、30 秒基線與結尾窗，以及包含 hide 與 tray 的完整 release 覆蓋（10 項）。在 hide 與 tray 產品契約尚未就緒前，long 誠實回傳 `NOT_ACCEPTED`（exit code 1，`missing-coverage`），不跳過也不做整體產品或 D4 認證。
 

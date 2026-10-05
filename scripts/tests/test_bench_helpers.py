@@ -173,18 +173,18 @@ class TestGitOracle(unittest.TestCase):
 
 
 class TestMatchedContracts(unittest.TestCase):
-    def test_oid_order_path_count_geometry_clipboard_and_basket_fail_closed(self) -> None:
+    def test_oid_order_path_count_geometry_clipboard_and_copies_fail_closed(self) -> None:
         oracle = {"sha": "a" * 40, "path": "a.txt", "historyOids": ["a" * 40, "b" * 40]}
         observed = {**oracle, "ref": MATCHED_REF, "width": 1080, "height": 720,
                     "observedLocale": "en",
-                    "previewMode": "diff", "basketEmpty": True,
+                    "previewMode": "diff", "nothingCopied": True,
                     "clipboardSha256": hashlib.sha256(MATCHED_SENTINEL).hexdigest()}
         check_matched_state(observed, oracle)
         for field, invalid in (("sha", "b" * 40), ("path", "other.txt"),
                                ("historyOids", list(reversed(oracle["historyOids"]))),
                                ("historyOids", oracle["historyOids"][:1]), ("width", 1000),
                                ("height", 700), ("ref", "HEAD"), ("previewMode", "content"), ("observedLocale", "zh-Hant"),
-                               ("basketEmpty", False), ("clipboardSha256", "changed")):
+                               ("nothingCopied", False), ("clipboardSha256", "changed")):
             with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(BenchError, field):
                 check_matched_state({**observed, field: invalid}, oracle)
 

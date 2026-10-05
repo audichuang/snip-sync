@@ -49,8 +49,8 @@ CLI 與桌面 App 均統一呼叫核心傳輸引擎與遠端模組,實作參考 
 
 | 動作 | 共用入口 (core/remote) | CLI | App |
 |---|---|---|---|
-| 複製檔案／資料夾 | `transfer::plan_export_expanding` (`selection_from_paths`, `expand_folder_items`) / `transfer::plan_export_with` | `snip copy <路徑…>` | 專案樹勾選檔案／資料夾,展開走訪後匯出 |
-| 複製 Git 來源 | `transfer::changed_items` + `transfer::plan_export_with` 搭配 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` | `snip copy --working` / `--staged` / `--commit` / `--range` | Git 檢視勾選變更項目,依選取清單匯出 |
+| 複製檔案／資料夾 | `transfer::plan_export_expanding` (`selection_from_paths`, `expand_folder_items`) / `transfer::plan_export_with` | `snip copy <路徑…>` | 專案樹選取檔案／資料夾後右鍵「複製」,展開走訪後匯出 |
+| 複製 Git 來源 | `transfer::changed_items` + `transfer::plan_export_with` 搭配 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` | `snip copy --working` / `--staged` / `--commit` / `--range` | Git 檢視對變更節點(檔案、資料夾、repo、群組)右鍵「複製」,匯出該節點的項目 |
 | 複製 commits | `transfer::plan_commit_export_with` | `snip copy --commits -n <N>` / `<a>..<b>` | 時間軸選取連續 commit 複製 |
 | 貼上檔案 | `transfer::plan_import_with` + `TransferImportPlan::apply` 搭配 `ImportMapping` | `snip paste [--dry-run \| --apply]` | 貼上預覽視窗、衝突與新鮮度檢驗後確認套用 |
 | 貼上 commits | `transfer::CommitReplayPreview` (`capture` / `plan` / `revalidate` / `apply`) | `snip paste` (`--overwrite` 門禁) | commit 貼上預覽視窗、覆寫開關後確認重播 |
@@ -276,7 +276,7 @@ spec 第 4 節:連續性檢查、marker + JSON 格式、依序重播建立 commi
   - 樹的根是虛擬路徑 `snip-remote://<指紋>/<id>`,不碰本機磁碟。開啟遠端工作區後在背景發送 `ScanRepos` 掃描 repo（深度 8、上限 256、期限 75 s），若未完成顯示 `remote_scan_incomplete`。Refresh（重新整理）觸發重掃。繼續探索僅支援 depth-limited 資料夾。
   - 前綴路由：遠端 repo 的樹 IO 與預覽路徑自動加上相對於 session root 的 repo 前綴。單一 repo 分享時復用單一樹，避免多餘的虛擬工作區樹。
   - 空狀態：Changes 與 Log 引入純函式判定，嚴格遵守「沒讀到不顯示成乾淨」（Changes 包含 no_workspace、scanning、loading、no_repository、scan_failed、no_match、clean、clean_partial（乾淨但至少一個 repo 沒讀完整，不是完整乾淨）；Log 包含 no_workspace、scanning、loading、no_repository、failed、empty），並在 UI 埋入 `changes-empty`、`log-empty` probe 與 `[APP:CHANGES_EMPTY]` / `[APP:LOG_EMPTY]` 日誌。
-  - 遠端守門：遠端工作區下複製、貼上、加入 repo 路徑、為複製勾選皆嚴格阻擋（回報 `remote_unsupported`）；右鍵選單的 repo 與檔案列僅提供複製 worker 路徑，不提供本機 reveal。
+  - 遠端守門：遠端工作區下複製、貼上、加入 repo 路徑、專案列選取皆嚴格阻擋（回報 `remote_unsupported`）；右鍵選單的 repo 與檔案列僅提供複製 worker 路徑，不提供本機 reveal。
   - 開啟遠端工作區是 `lifecycle::Intent::OpenRemoteWorkspace`,與開本機工作區走同一套關閉檢查。
   - worker 監聽器是程序層級的全域物件,先於視窗啟動,也不隨工作區切換而停止。這是之後做無螢幕常駐(Windows 登入項目或服務)的路徑。
 - **測試**:

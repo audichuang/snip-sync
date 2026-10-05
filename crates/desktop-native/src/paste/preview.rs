@@ -472,6 +472,7 @@ mod tests {
 			dest: dest.into(),
 			roots: Vec::new(),
 			generation: 1,
+			remote: None,
 		})
 		.unwrap();
 		let (work, cancel) = s.start_job().unwrap().expect("job");
@@ -660,6 +661,7 @@ mod tests {
 			dest: dir.path().into(),
 			roots: Vec::new(),
 			generation: 1,
+			remote: None,
 		};
 		let req_bytes = req.bytes();
 		let headroom =
@@ -704,6 +706,7 @@ mod tests {
 			dest: dir.path().into(),
 			roots: Vec::new(),
 			generation: 1,
+			remote: None,
 		})
 		.unwrap();
 		let (work1, cancel1) = s.start_job().unwrap().expect("job 1");
@@ -726,6 +729,7 @@ mod tests {
 			dest: dir.path().into(),
 			roots: Vec::new(),
 			generation: 2,
+			remote: None,
 		};
 		s.enqueue(req2).unwrap();
 		let (work2, cancel2) = s.start_job().unwrap().expect("job 2");
@@ -780,6 +784,7 @@ mod tests {
 			dest: dir.path().into(),
 			roots: Vec::new(),
 			generation: 1,
+			remote: None,
 		})
 		.unwrap();
 		let (work, cancel) = s.start_job().unwrap().expect("job");
@@ -856,6 +861,7 @@ mod tests {
 			dest: dir.path().into(),
 			roots: Vec::new(),
 			generation: 1,
+			remote: None,
 		})
 		.unwrap();
 		assert_eq!(s.begin_apply().err(), Some(ApplyRefused::Loading));

@@ -141,6 +141,12 @@ g_init() {
 }
 mkdir -p gitws/plain gitws/broken/.git outer/inner
 echo plain > gitws/plain/file.txt
+# Worktrees synced from another machine: their .git names a gitdir that
+# does not exist here, as in a Google Drive copy.
+mkdir -p gitws/wt-gone-1 gitws/wt-gone-2
+echo 'gitdir: /nonexistent/other-machine/.git/worktrees/wt-gone-1' > gitws/wt-gone-1/.git
+echo 'gitdir: /nonexistent/other-machine/.git/worktrees/wt-gone-2' > gitws/wt-gone-2/.git
+echo kept > gitws/wt-gone-1/kept.txt
 
 g_init gitws/alpha
 printf 'commit 1 a\n' > gitws/alpha/a.txt
@@ -193,7 +199,9 @@ check "folders first" bash -c "'$SNIP' remote ls h $WD/edge | head -1 | grep -q 
 check "a Chinese name with spaces" bash -c "'$SNIP' remote cat h $WD/edge 'src/deep/中文 有空白.txt' | grep -q 深層"
 check "stat of an empty file" bash -c "'$SNIP' remote stat h $WD/edge empty.txt | grep -q '^file	0	'"
 check "exactly 1 MiB is served" test "$("$SNIP" remote cat h "$WD/edge" exact-1MiB.txt | wc -c | tr -d ' ')" = 1048576
-check "1200 entries are cut at 1000" test "$("$SNIP" remote ls h "$WD/edge" manydir 2>/dev/null | wc -l | tr -d ' ')" = 1000
+# The whole listing arrives in ONE reply, far under the worker's
+# 20,000-entry cap: every one of the 1200 entries exactly once.
+check "1200 entries all listed, none twice" bash -c "n=\$('$SNIP' remote ls h '$WD/edge' manydir 2>/dev/null | wc -l | tr -d ' '); u=\$('$SNIP' remote ls h '$WD/edge' manydir 2>/dev/null | sort -u | wc -l | tr -d ' '); test \$n = 1200 && test \$u = 1200"
 check "a nested repo is a folder" bash -c "'$SNIP' remote stat h $WD/edge nested | grep -q '^directory'"
 if w <<<"[ -L '$WD/edge/inner-link' ]"; then
 	check "a symlink inside the workspace is followed" bash -c "'$SNIP' remote ls h $WD/edge inner-link | grep -qx deep/"
@@ -262,6 +270,93 @@ for n in $counts; do
 	check "$n parallel reads all correct ($good/$n)" test "$good" = "$n"
 done
 
+echo "== copy"
+# The payload made on the worker, sent back (crossing many frames when
+# large), equals `snip copy` run on that machine itself.
+local_sum=$(w <<<"cd '$WD/text' && '$RSNIP' copy . --stdout 2>/dev/null" | hash_of)
+remote_sum=$("$SNIP" remote copy h "$WD/text" --stdout 2>/dev/null | hash_of)
+check "a remote copy of a folder equals snip copy on the worker" test "$remote_sum" = "$local_sum" -a -n "$remote_sum"
+w <<<"mkdir -p '$WD/big' && for i in \$(seq 10 39); do head -c 330000 /dev/zero | tr '\\000' \"\${i:1:1}\" > '$WD/big/f'\$i.txt; done"
+local_big=$(w <<<"cd '$WD/big' && '$RSNIP' copy . --stdout 2>/dev/null" | hash_of)
+remote_big=$("$SNIP" remote copy h "$WD/big" --stdout 2>/dev/null | hash_of)
+check "a 10 MB copy crosses frames intact" test "$remote_big" = "$local_big" -a -n "$remote_big"
+staged_copy=$("$SNIP" remote copy h "$WD/gitws" --in alpha --staged --stdout 2>/dev/null)
+check "a remote copy of staged changes" grep -q "staged file content" <<<"$staged_copy"
+alpha_tip=$(w <<<"git -C '$WD/gitws/alpha' rev-parse HEAD")
+commit_copy=$("$SNIP" remote copy-commits h "$WD/gitws" --in alpha "$alpha_tip" --stdout 2>/dev/null)
+check "a remote copy of a commit" grep -q '"message":"second commit' <<<"$commit_copy"
+refused "a copy out of the workspace" "" copy h "$WD/edge" ../secret.txt --stdout
+
+echo "== paste"
+# A payload made by `snip copy` on this machine, pasted into a folder of the
+# worker: planned and written there by the worker with the engine `snip
+# paste` runs here. Every pasted file must match a local paste byte for byte.
+gitc() { git -c user.name=t -c user.email=t@t "$@"; }
+PSRC="$MASTER/paste-src"
+mkdir -p "$PSRC/sub" "$MASTER/paste-local"
+printf 'pasted\tTab 中文 ✓ 🦀\n' >"$PSRC/a.txt"
+printf 'crlf\r\nsecond\r\n' >"$PSRC/sub/crlf.txt"
+printf 'no newline at the end' >"$PSRC/sub/noeol.txt"
+head -c 300000 /dev/zero | tr '\000' z >"$PSRC/long.txt"
+(cd "$PSRC" && "$SNIP" copy . --stdout >"$MASTER/payload.txt" 2>/dev/null)
+w <<<"mkdir -p '$WD/pastews/dst' && printf 'old\n' > '$WD/pastews/dst/a.txt'"
+printf 'old\n' >"$MASTER/paste-local/a.txt"
+"$SNIP" --repo "$MASTER/paste-local" paste --apply --overwrite --stdin <"$MASTER/payload.txt" >/dev/null 2>&1
+"$SNIP" remote paste h "$WD/pastews" --in dst --apply --overwrite --stdin <"$MASTER/payload.txt" >/dev/null 2>&1
+check "a remote paste exits as a local one" test "$?" = 0
+pasted=0
+differs=0
+while IFS= read -r f; do
+	pasted=$((pasted + 1))
+	there=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/pastews/dst/$f' || shasum -a 256 < '$WD/pastews/dst/$f') | cut -c1-64")
+	if [ "$there" != "$(hash_of <"$MASTER/paste-local/$f")" ]; then
+		differs=$((differs + 1))
+		echo "      differs: $f"
+	fi
+done < <(cd "$MASTER/paste-local" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)
+check "$pasted pasted files on the worker identical to a local paste" test "$differs" = 0 -a "$pasted" -gt 3
+
+w <<<"cd '$WD/pastews' && git init -q repo"
+printf '// FILE: repo/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n' >"$MASTER/git-payload.txt"
+"$SNIP" remote paste h "$WD/pastews" --apply --stdin <"$MASTER/git-payload.txt" >/dev/null 2>&1
+check "a payload entry inside .git is skipped" w <<<"test ! -e '$WD/pastews/repo/.git/hooks/pre-commit'"
+err=$("$SNIP" remote paste h "$WD/pastews" --in repo/.git --apply --overwrite --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/pastews/repo/.git/a.txt'"; then
+	ok "a paste into .git is refused and writes nothing  ($err)"
+else
+	bad "a paste into .git  rc=$rc err=$err"
+fi
+err=$("$SNIP" remote paste h "$WD/pastews" --in .. --apply --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
+rc=$?
+if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/a.txt'"; then
+	ok "a paste out of the workspace is refused  ($err)"
+else
+	bad "a paste out of the workspace  rc=$rc err=$err"
+fi
+
+# Commit mode: the worker replays the commits as a local replay does.
+CSRC="$MASTER/commit-src"
+mkdir -p "$CSRC"
+(cd "$CSRC" && gitc init -q && printf 'one\n' >a.txt && gitc add . && gitc commit -q -m "replay one" &&
+	printf 'two\n' >a.txt && mkdir d && printf 'b\n' >d/b.txt && gitc add . && gitc commit -q -m "replay two")
+"$SNIP" --repo "$CSRC" copy --commits -n 2 --stdout >"$MASTER/commits.txt" 2>/dev/null
+base_repo() { # the same starting commit on both machines
+	git init -q "$1" && git -C "$1" config user.name t && git -C "$1" config user.email t@t &&
+		printf 'base\n' >"$1/base.txt" && git -C "$1" add . && git -C "$1" commit -q -m base
+}
+base_repo "$MASTER/commit-local"
+w <<EOF
+$(declare -f base_repo)
+base_repo '$WD/pastews/crepo'
+EOF
+"$SNIP" --repo "$MASTER/commit-local" paste --apply --stdin <"$MASTER/commits.txt" >/dev/null 2>&1
+"$SNIP" remote paste h "$WD/pastews" --in crepo --apply --stdin <"$MASTER/commits.txt" >/dev/null 2>&1
+check "a remote commit replay exits as a local one" test "$?" = 0
+local_log=$(git -C "$MASTER/commit-local" log -2 --format='%T %an <%ae> %ad %s')
+remote_log=$(w <<<"git -C '$WD/pastews/crepo' log -2 --format='%T %an <%ae> %ad %s'")
+check "the replayed commits match a local replay" test "$remote_log" = "$local_log" -a -n "$local_log"
+
 echo "== git views"
 w <<<"sleep 1 && touch '$WD/gitws/alpha/b.txt'"
 alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/gitws/alpha/.git/index' || shasum -a 256 < '$WD/gitws/alpha/.git/index') | cut -c1-64")
@@ -269,6 +364,9 @@ alpha_index_before=$(w <<<"(command -v sha256sum >/dev/null && sha256sum < '$WD/
 repos_gitws=$("$SNIP" remote repos h "$WD/gitws")
 check "repos gitws lists alpha and beta" test "$(grep -c '^alpha	' <<<"$repos_gitws")" = 1 -a "$(grep -c '^beta	' <<<"$repos_gitws")" = 1
 check "broken appears as an error row" test "$(grep -c '^broken	error: ' <<<"$repos_gitws")" = 1
+check "two worktrees with a missing gitdir are error rows" test "$(grep -cE '^wt-gone-[12]	error: ' <<<"$repos_gitws")" = 2
+check "the broken worktrees do not hide alpha's changes" bash -c "'$SNIP' remote changes h '$WD/gitws' alpha | grep -q 'a.txt'"
+check "a broken worktree's files still browse" bash -c "'$SNIP' remote cat h '$WD/gitws' wt-gone-1/kept.txt | grep -qx kept"
 check "wt and borrowed are served as locally" test "$(grep '^wt	' <<<"$repos_gitws" | grep -vc error)" = 1 -a "$(grep '^borrowed	' <<<"$repos_gitws" | grep -vc error)" = 1
 
 changes_mainwt=$("$SNIP" remote changes h "$WD/gitws" mainwt)

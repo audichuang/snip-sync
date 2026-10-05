@@ -28,12 +28,12 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
 - 原生工作台(`desktop-native`)的檔案模式上限是 10,000 個檔案(`NATIVE_FILE_COUNT_LIMIT`),不是 ClipCode 預設的 30:它沒有設定畫面,
   而專案視窗選資料夾會帶進底下所有檔案。位元組仍受 payload 上限約束(GUI 複製上限現為 32 MiB(`CLIPBOARD_PAYLOAD_MAX`,階段 2 起),CLI 於階段 3/4 採用,超過是明確錯誤)。payload 格式不變。
   碰到上限時狀態列與複製提示明說「已達 N 個檔案上限,其餘檔案未複製」,不會默默少檔。
-  截斷順序:單獨選的檔案與 Changes / Log 項目先保留名額;資料夾依選取籃順序(root 依路徑排序,
-  root 內的專案選取依相對路徑排序)分用剩下的名額,先到先用,走訪到上限多一個檔案就停,不把大資料夾整個列出。
+  截斷順序:單獨選的檔案與 Changes / Log 項目先保留名額;資料夾依複製項目的順序(專案選取是 root 依路徑排序,
+  root 內依相對路徑排序)分用剩下的名額,先到先用,走訪到上限多一個檔案就停,不把大資料夾整個列出。
   資料夾內 payload 無法攜帶的檔案(名稱含 `< > : " | ? *`、控制字元、結尾空白、Unix 上的 `\`、非 UTF-8,
   斷掉或指出 root 的 symlink、FIFO/socket、讀不到的檔案)逐檔略過並計入「略過」,不讓整次複製失敗;
   含 `.git` 的目錄(包括選到的資料夾本身)一律不走訪。
-- 桌面 App 在 monorepo 子資料夾選 Git 來源時,變更清單與複製範圍限制在該資料夾,並可逐檔勾選;CLI 與原本的 `collect_payload` 仍複製整個 Git 來源(對 CLI 而言,這適用於 commit/range,以及 `--repo` 位於 toplevel 時的 working/staged;working/staged 若 `--repo` 為子目錄則僅複製該子樹,見第一項差異)。這是桌面選取範圍的行為,不改剪貼簿格式。commit / 區間的 payload 路徑仍依 TS graphCopy 使用 repo 相對路徑。
+- 桌面 App 在 monorepo 子資料夾選 Git 來源時,變更清單與複製範圍限制在該資料夾,並可逐檔或逐資料夾右鍵複製;CLI 與原本的 `collect_payload` 仍複製整個 Git 來源(對 CLI 而言,這適用於 commit/range,以及 `--repo` 位於 toplevel 時的 working/staged;working/staged 若 `--repo` 為子目錄則僅複製該子樹,見第一項差異)。這是桌面選取範圍的行為,不改剪貼簿格式。commit / 區間的 payload 路徑仍依 TS graphCopy 使用 repo 相對路徑。
 - Git 圖(`graph::compute_graph_layout`)預設照 SourceGit / TS 壓縮車道。`GraphConfig::hold_root_lanes` 是 Rust 才有的選項,只有原生工作台的多儲存庫合併 log(列 id 帶 `@<feed>`)會開:
   一條 rail 停在 root commit 後,它的車道空一列才讓右邊的 rail 往左移(保留的車道不會被相鄰的保留解除帶著左移),沒有入線的新節點也放在上一列所有車道的右邊。
   否則另一個儲存庫的 rail 會在下一列彎進該車道、commit 正好落在別人的 root 正下方,看起來像接在一起。單一儲存庫與 checkpoint 的幾何不變(保留的車道不寫進 checkpoint)。
@@ -42,6 +42,7 @@ Rust 的標準函式庫與 `regex` crate 在幾個地方跟 Java、JavaScript �
   使用者寫原始 regex 時很少碰到;真的出現分歧再逐項轉譯。
 - git 來源(graph:commit / 區間)被過濾規則排除的**刪除檔**不會進 payload。TS graphCopy 會先放刪除檔再過濾,
   會把被排除的檔案(例如 `secrets.env`)的舊內容帶出去;Rust 刻意不照做。
+- 所有覆寫寫入(貼上與 commit 重播的 `fsutil::write_text_file`)以「同資料夾暫存檔 + rename」**取代目錄項目**,不是像 TS 一樣原地截斷:hard link 的另一個名字、symlink 指向的檔案永遠不會被寫穿(`.git/config`、工作區外檔案),且行為在 macOS / Linux / Windows 一致,不讀 link count(NTFS 硬連結同樣被涵蓋)。代價是覆寫會拆掉目標上的 symlink(以一般檔案取代連結本身);寫入後目標是新的 inode。刪除不受影響(unlink 只拆本目錄項)。(早期的 link-count 守門已移除:它 Unix only,Windows 上完全不設防。)這是安全差異,刻意與 TS 不同。
 - commit 模式重播時,路徑逐一放在 `git add` / `git commit` 的參數上。Windows 命令列約 32K 字元上限,
   一個 commit 動到數千個檔案時會失敗;需要時改用 `--pathspec-from-file=- --pathspec-file-nul`。
 - commit 模式不帶檔案 mode(`CommitFile` 沒有 mode 欄位;剪貼簿格式由 ClipCodeVSCode 擁有,不在這裡改):
@@ -225,6 +226,6 @@ CLI 與 App 共用 `snip-core` 的 `clip` 模組,底層用 [`arboard`](https://c
 - **超大 refs 上限**：遠端 served git 的 stdout 上限為 `SERVED_MAX_STDOUT = 4 MiB`。tag 與 ref 極多（超過約 4 MiB）的 repo 在遠端會回報「遠端參照資料過大」（`remote_refs_too_large`）錯誤，不提供遠端顯示（本機可看）。
 - **`UserEmail` 查詢**：透過型別化 RPC 回傳 worker 上的 `user.email`（含全域設定）給已配對的 master。
 - **掃描常數與續掃限制**：worker 掃描 repo 限制深度 8、最多 256 個 repo、單一 75 秒期限（`SCAN_DEADLINE`），走訪上限 200,000 次。掃描狀態 `More`、`TimedOut`、`LimitReached`、`Incomplete` 一律對映至「未完成」（`remote_scan_incomplete`）。遠端續掃僅支援 depth-limited 資料夾，逾時或達到數量上限時無法從游標續掃，需以重新整理（Refresh）重新掃描。
-- **選單與寫入守門**：遠端模式下右鍵選單的 repo 與檔案列只提供複製 worker 上的路徑（`copy-worker-path`），不提供本機 reveal（在 Finder／檔案總管中顯示）；遠端複製、貼上、加入 repo 路徑（`add_repo_path`）均維持拒絕（回報 `remote_unsupported`）。v2 協定連線上 `Request::Write` 與 `Request::Rename` 仍回傳 `Unsupported`。
+- **選單與寫入守門**：遠端模式下右鍵選單的 repo 與檔案列只提供複製 worker 上的路徑（`copy-worker-path`），不提供本機 reveal（在 Finder／檔案總管中顯示）；加入 repo 路徑（`add_repo_path`）維持拒絕（回報 `remote_unsupported`）；複製（協定 3）與貼上（協定 4）由 worker 跑同一套引擎。`Request::Write` 與 `Request::Rename` 仍回傳 `Unsupported`：貼上整份在 worker 規劃與寫入。
 
 

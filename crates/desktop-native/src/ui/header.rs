@@ -2,6 +2,8 @@
 
 use super::*;
 
+/// Window space above the workspace menu (header and button) plus a margin.
+const WORKSPACE_MENU_TOP: f32 = 80.;
 impl WorkbenchModel {
 	// ───────────────────────── header ─────────────────────────
 
@@ -32,7 +34,7 @@ impl WorkbenchModel {
 		};
 		let open = self.workspace_open;
 		let current = self.workspace_root.clone();
-		let recent: Vec<AnyElement> = self
+		let mut recent: Vec<AnyElement> = self
 			.recent_workspaces
 			.iter()
 			.enumerate()
@@ -47,6 +49,7 @@ impl WorkbenchModel {
 					SharedString::from(format!("workspace-recent:{ix}")),
 					70 + ix as isize,
 				)
+				.debug_selector(move || format!("workspace-recent:{ix}"))
 				.h(px(38.))
 				// The row clips a long path; hover shows all of it.
 				.tooltip(tip(path.display().to_string()))
@@ -77,6 +80,50 @@ impl WorkbenchModel {
 				.into_any_element()
 			})
 			.collect();
+		// Remote folders opened before, after the local ones (the local
+		// list keeps no times to merge by).
+		recent.extend(self.remote.recent.iter().enumerate().map(|(n, r)| {
+			let id = format!("remote-recent:{n}");
+			let name = r
+				.path
+				.trim_end_matches(['/', '\\'])
+				.rsplit(['/', '\\'])
+				.next()
+				.filter(|n| !n.is_empty())
+				.unwrap_or(&r.path);
+			let is_current = remote.is_some_and(|s| {
+				s.host() == r.host && s.workspace.id == r.path
+			});
+			let selector = id.clone();
+			menu_row(SharedString::from(id.clone()), 87)
+				.debug_selector(move || selector)
+				.h(px(38.))
+				.tooltip(tip(format!("{}:{}", r.host, r.path)))
+				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
+				.on_click(cx.listener(move |this, _, _, cx| {
+					this.open_remote_recent(n, cx);
+				}))
+				.child(div().flex_shrink_0().child(icon(Icon::Folder, 16.)))
+				.child(
+					div()
+						.flex()
+						.flex_col()
+						.min_w_0()
+						.child(
+							div().font_weight(FontWeight::SEMIBOLD).child(
+								clip_text(format!("{} ▸ {name}", r.host)),
+							),
+						)
+						.child(
+							div()
+								.text_size(px(SMALL_TEXT))
+								.text_color(rgb(pal().text_muted))
+								.child(clip_text(r.path.clone())),
+						),
+				)
+				.children(probe(log, id))
+				.into_any_element()
+		}));
 		let sep = || {
 			div()
 				.h(px(1.))
@@ -84,10 +131,16 @@ impl WorkbenchModel {
 				.my(px(4.))
 				.bg(rgb(pal().popup_border))
 		};
+		// The menu sits under the header; past the window's height it
+		// scrolls instead of running off screen.
+		let max_h = (self.viewport_h - WORKSPACE_MENU_TOP).max(200.);
 		let panel = div()
 			.id("workspace-menu")
+			.debug_selector(|| "workspace-menu".into())
 			.occlude()
 			.w(px(340.))
+			.when(self.viewport_h > 0., |d| d.max_h(px(max_h)))
+			.overflow_y_scroll()
 			.flex()
 			.flex_col()
 			.p(px(4.))
@@ -283,6 +336,24 @@ impl WorkbenchModel {
 							.text_color(rgb(pal().text_muted))
 							.child(t("workspace_closed", loc)),
 					)
+					// A remote folder that failed to open, the one reconnected
+					// to on launch included.
+					.when_some(
+						self.remote.message.as_ref().filter(|(ok, _)| !ok),
+						|d, (_, text)| {
+							d.child(
+								div()
+									.id("workspace-closed-remote-error")
+									.relative()
+									.text_color(rgb(pal().error))
+									.child(text.clone())
+									.children(probe(
+										&self.probes,
+										"workspace-closed-remote-error",
+									)),
+							)
+						},
+					)
 					.child(
 						button(
 							"btn-welcome-open-folder",
@@ -309,18 +380,6 @@ impl WorkbenchModel {
 		let log = &self.probes;
 
 		let repo = self.repo();
-		let count = self.basket_count();
-		let copy_reason = if self.is_copying {
-			Some(t("btn_copying", loc))
-		} else if count > 0 {
-			None
-		} else if self.selected_commit.is_some() && self.selected_file.is_none()
-		{
-			Some(t("btn_copy_commit_readonly", loc))
-		} else {
-			Some(t("btn_copy_empty", loc))
-		};
-		let copy_enabled = copy_reason.is_none();
 		let branch = repo
 			.and_then(|r| r.summary.as_ref().ok())
 			.and_then(|s| s.branch.clone())
@@ -445,45 +504,6 @@ impl WorkbenchModel {
 					.items_center()
 					.gap(px(2.))
 					.flex_shrink_0()
-					.child(
-						// IntelliJ main toolbar widget: a transparent icon with a
-						// small count badge instead of a filled button.
-						icon_button(
-							"btn-copy",
-							Icon::Basket,
-							copy_reason.map(str::to_string).unwrap_or_else(
-								|| tf("tip_basket_copy", loc, &[count]),
-							),
-							copy_enabled,
-							3,
-						)
-						.when(copy_enabled, |b| {
-							b.on_click(cx.listener(|this, _, _, cx| {
-								this.copy_selection_to_clipboard(cx)
-							}))
-						})
-						.when(count > 0, |b| {
-							b.child(
-								div()
-									.absolute()
-									.top(px(-3.))
-									.right(px(-4.))
-									.min_w(px(13.))
-									.h(px(13.))
-									.px(px(3.))
-									.rounded(px(7.))
-									.flex()
-									.items_center()
-									.justify_center()
-									.bg(rgb(pal().accent))
-									.text_size(px(9.))
-									.font_weight(FontWeight::SEMIBOLD)
-									.text_color(rgb(pal().accent_text))
-									.child(count.to_string()),
-							)
-						})
-						.children(probe(log, "btn-copy")),
-					)
 					.when(self.is_copying, |row| {
 						row.child(
 							button(
@@ -497,21 +517,6 @@ impl WorkbenchModel {
 								this.cancel_copy(cx)
 							}))
 							.children(probe(log, "btn-copy-cancel")),
-						)
-					})
-					.when(count > 0, |row| {
-						row.child(
-							icon_button(
-								"btn-basket-clear",
-								Icon::Close,
-								t("basket_clear", loc),
-								true,
-								31,
-							)
-							.on_click(cx.listener(|this, _, _, cx| {
-								this.clear_basket(cx);
-							}))
-							.children(probe(log, "btn-basket-clear")),
 						)
 					})
 					.child(
@@ -768,15 +773,6 @@ impl WorkbenchModel {
 	pub(super) fn render_status(&self, cx: &mut Context<Self>) -> AnyElement {
 		let loc = self.locale;
 		let errors = self.repos.iter().filter(|r| r.summary.is_err()).count();
-		let basket_n = self.basket_count().to_string();
-		let (basket_detail, collision) = &self.basket_view;
-		let basket_label = if let Some(collision) = collision {
-			tf("basket_collision", loc, &[collision])
-		} else if self.basket_count() == 0 {
-			t("basket_empty", loc).to_string()
-		} else {
-			tf("basket_summary", loc, &[&basket_n, basket_detail])
-		};
 		let repos_s = self.repos.len().to_string();
 		let repo_label = if errors > 0 {
 			tf("status_repo_count", loc, &[&repos_s, &errors.to_string()])
@@ -825,17 +821,6 @@ impl WorkbenchModel {
 					.tooltip(tip(status))
 					.mr(px(8.))
 			})
-			.child(
-				widget()
-					.id("basket-summary")
-					.relative()
-					.max_w(px(360.))
-					.min_w(px(40.))
-					.overflow_hidden()
-					.tooltip(tip(basket_label.clone()))
-					.child(clip_text(basket_label))
-					.children(probe(&self.probes, "basket-summary")),
-			)
 			.child(
 				widget()
 					.text_color(rgb(if errors > 0 {

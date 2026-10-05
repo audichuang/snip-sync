@@ -21,24 +21,47 @@ use snip_core::workspace::ScanStatus;
 /// Base protocol, both sides must speak it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Newest protocol this build speaks. 2 = Git views.
-pub const PROTOCOL_MAX: u32 = 2;
+/// Newest protocol this build speaks. 2 = Git views, 3 = copy, 4 = paste,
+/// 5 = worker-side change selection ([`Request::ExportChanges`]), whole-folder
+/// export (an empty [`ExportTarget::path`]), and chunked requests.
+pub const PROTOCOL_MAX: u32 = 5;
 /// The first protocol with Git views.
 pub const GIT_VIEWS_VERSION: u32 = 2;
+/// The first protocol with copy ([`Request::Export`]).
+pub const TRANSFER_VERSION: u32 = 3;
+/// The first protocol with paste ([`Request::ImportPlan`] and the rest).
+pub const PASTE_VERSION: u32 = 4;
+/// The first protocol where the worker resolves a change selection itself
+/// ([`Request::ExportChanges`]).
+pub const EXPORT_CHANGES_VERSION: u32 = 5;
+/// The first protocol with a request sent as joined JSON pieces
+/// ([`Request::FrameChunk`]).
+pub const REQUEST_CHUNKS_VERSION: u32 = 5;
+/// Payload bytes one [`Response::Chunk`] carries: JSON escaping can grow
+/// text several times and must stay under [`MAX_FRAME`].
+pub const CHUNK_BYTES: usize = 1024 * 1024;
 pub const GIT_CALL_LIMIT: Duration = Duration::from_secs(90); // > worker job deadlines 60/75 s
 pub const MAX_GIT_CALLS_IN_FLIGHT: usize = 4;
 pub const REMOTE_MAX_LOG_LIMIT: usize = 1_000;
 pub const REMOTE_MAX_TIPS: usize = 50_000;
 
+/// Largest reply JSON a master joins from [`Response::Chunk`] frames. A
+/// paste plan carries every file of a payload of up to
+/// [`snip_core::transfer::CLIPBOARD_PAYLOAD_MAX`], and JSON escaping can
+/// grow text several times.
+pub const JOINED_MAX: usize = 8 * snip_core::transfer::CLIPBOARD_PAYLOAD_MAX;
+
 /// Largest frame either side sends or accepts. A preview is at most 1 MiB
 /// of text, and JSON escaping can grow it several times.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
-/// Entries one `ListDir` reply carries at most; the rest is reported as
-/// `truncated`.
-pub const MAX_DIR_ENTRIES: usize = 1000;
+/// Entries one `ListDir` reply carries at most: the whole sorted listing
+/// up to this cap, and `truncated` when the folder holds more. The local
+/// tree has no fixed cap of its own (its byte budget pages on disk), so
+/// this one bounds a remote listing's memory on both ends.
+pub const MAX_DIR_ENTRIES: usize = 20_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
 	/// First frame of every connection.
@@ -65,7 +88,8 @@ pub enum Request {
 		workspace: String,
 		path: String,
 	},
-	/// Reserved for the next slices; a worker answers `Unsupported`.
+	/// Never served: a paste plans and writes on the worker as a whole
+	/// ([`Request::ImportApply`]); a worker answers `Unsupported`.
 	Write {
 		workspace: String,
 		path: String,
@@ -87,12 +111,198 @@ pub enum Request {
 		profile: ReadProfile,
 		query: GitQuery,
 	},
+	/// Copies files or changes as one snip-sync payload, with the same
+	/// engine a local copy uses ([`snip_core::transfer::copy_selection`]).
+	Export {
+		workspace: String,
+		items: Vec<ExportTarget>,
+		settings: snip_core::settings::Settings,
+		file_limit: usize,
+	},
+	/// Copies commits of `repo` as a commit payload.
+	ExportCommits {
+		workspace: String,
+		repo: String,
+		tip: String,
+		selected: Vec<String>,
+	},
+	/// Copies every change of `source` in `repo` as one snip-sync payload,
+	/// the selection resolved on the worker with the same
+	/// [`snip_core::transfer::changed_items`] a local copy runs: the
+	/// master-side change list cannot express its order, dedup, or its
+	/// staged-only entries.
+	ExportChanges {
+		workspace: String,
+		/// The repository the changes belong to, inside the workspace.
+		repo: String,
+		source: snip_core::gitsrc::GitSource,
+		settings: snip_core::settings::Settings,
+		file_limit: usize,
+	},
+	/// Plans pasting the file payload `text` into the folder `dest` of the
+	/// workspace, as a local paste previews it. Nothing is written.
+	ImportPlan {
+		workspace: String,
+		/// Relative to the workspace; "" is the workspace itself.
+		dest: String,
+		text: String,
+		mapping: PasteMapping,
+	},
+	/// Plans again and writes what the master previewed and the user
+	/// confirmed, or refuses as stale what changed since that preview.
+	ImportApply {
+		workspace: String,
+		dest: String,
+		text: String,
+		mapping: PasteMapping,
+		selection: snip_core::restore::RestoreSelection,
+		expect: ImportExpect,
+	},
+	/// Plans replaying the commit payload `text` onto the repository at
+	/// `dest`. Nothing is written.
+	ReplayPlan {
+		workspace: String,
+		dest: String,
+		text: String,
+	},
+	/// Replays what [`Request::ReplayPlan`] previewed, or refuses as stale.
+	/// `check_only` re-checks without writing.
+	ReplayApply {
+		workspace: String,
+		dest: String,
+		text: String,
+		expect: ReplayExpect,
+		#[serde(default)]
+		check_only: bool,
+	},
+	/// Part of the next request's `text`, which then arrives empty: a
+	/// payload can be larger than one frame.
+	Chunk {
+		data: String,
+	},
+	/// A piece of the next request's JSON, which arrives as
+	/// [`Request::FrameJoin`]: an Apply request with its freshness snapshot
+	/// can be larger than one frame.
+	FrameChunk {
+		data: String,
+	},
+	/// The [`Request::FrameChunk`] pieces so far are one request's JSON.
+	FrameJoin,
+}
+
+/// A paste's routing choices. Entries under `prefix/` of each pair land in
+/// its folder (relative to the workspace); every other entry lands in the
+/// request's `dest`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasteMapping {
+	pub prefixes: Vec<(String, String)>,
+	/// The CLI's `--adjust-paths`: apply the worker's suggested base.
+	#[serde(default)]
+	pub adjust_paths: bool,
+	/// The settings' header format ("" is the default).
+	#[serde(default)]
+	pub header_format: String,
+}
+
+/// What a master previewed: an import Apply refuses when the plan made
+/// again differs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportExpect {
+	/// The worker's digest of the previewed [`snip_core::restore::RestorePlan`].
+	pub digest: String,
+	pub freshness: snip_core::transfer::DestinationFreshnessSnapshot,
+}
+
+/// [`Response::ImportPlanned`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportPlanned {
+	/// Paths in it are the worker's.
+	pub plan: snip_core::transfer::TransferImportPlan,
+	pub digest: String,
+	/// What `snip paste` suggests for the destination folder.
+	pub suggestion: Option<snip_core::restore::RestoreBaseSuggestion>,
+}
+
+impl ImportPlanned {
+	pub fn expect(&self) -> ImportExpect {
+		ImportExpect {
+			digest: self.digest.clone(),
+			freshness: self.plan.destination_freshness().clone(),
+		}
+	}
+}
+
+/// A commit replay preview without its payload, which the master has:
+/// [`snip_core::transfer::CommitReplayPreview::from_parts`] joins them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayExpect {
+	/// The repository's top folder on the worker.
+	pub destination: std::path::PathBuf,
+	pub plan: snip_core::commits::CommitReplayPlan,
+	pub freshness: snip_core::transfer::DestinationFreshnessSnapshot,
+}
+
+impl ReplayExpect {
+	pub fn of(preview: &snip_core::transfer::CommitReplayPreview) -> Self {
+		Self {
+			destination: preview.destination().to_path_buf(),
+			plan: preview.plan().clone(),
+			freshness: preview.freshness().clone(),
+		}
+	}
+}
+
+/// One item to copy: `path` under `root`, both relative to the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportTarget {
+	/// The repository (or folder) the path is relative to; "" is the
+	/// workspace itself.
+	pub root: String,
+	pub path: String,
+	pub source: snip_core::transfer::SourceKind,
+	pub change_type: Option<ChangeType>,
 }
 
 impl Request {
+	/// The payload text of a paste request.
+	pub fn text(&self) -> Option<&str> {
+		match self {
+			Self::ImportPlan { text, .. }
+			| Self::ImportApply { text, .. }
+			| Self::ReplayPlan { text, .. }
+			| Self::ReplayApply { text, .. } => Some(text),
+			_ => None,
+		}
+	}
+
+	pub fn text_mut(&mut self) -> Option<&mut String> {
+		match self {
+			Self::ImportPlan { text, .. }
+			| Self::ImportApply { text, .. }
+			| Self::ReplayPlan { text, .. }
+			| Self::ReplayApply { text, .. } => Some(text),
+			_ => None,
+		}
+	}
+
 	pub fn needs_version(&self) -> u32 {
 		match self {
 			Self::ScanRepos { .. } | Self::GitView { .. } => GIT_VIEWS_VERSION,
+			Self::Export { items, .. }
+				if items.iter().any(|item| item.path.is_empty()) =>
+			{
+				5
+			}
+			Self::Export { .. } | Self::ExportCommits { .. } => {
+				TRANSFER_VERSION
+			}
+			Self::ExportChanges { .. } => EXPORT_CHANGES_VERSION,
+			Self::FrameChunk { .. } | Self::FrameJoin => REQUEST_CHUNKS_VERSION,
+			Self::ImportPlan { .. }
+			| Self::ImportApply { .. }
+			| Self::ReplayPlan { .. }
+			| Self::ReplayApply { .. }
+			| Self::Chunk { .. } => PASTE_VERSION,
 			_ => 1,
 		}
 	}
@@ -160,7 +370,11 @@ pub enum Response {
 	},
 	Workspace(RemoteWorkspace),
 	Dir {
+		/// The whole sorted listing, at most [`MAX_DIR_ENTRIES`] of it.
 		entries: Vec<DirEntry>,
+		/// More entries exist than this reply holds: the listing is
+		/// truncated, and there is no continuation to ask for.
+		#[serde(default)]
 		truncated: bool,
 	},
 	Stat(Stat),
@@ -171,6 +385,22 @@ pub enum Response {
 	Pending,
 	Repos(RepoScan),
 	Git(GitReply),
+	Copied(snip_core::transfer::CopyOutcome),
+	CommitsCopied(snip_core::commits::CommitCopyOutcome),
+	/// Part of the next `Copied` / `CommitsCopied` text, which then
+	/// arrives with that text empty; or, ended by [`Response::Joined`],
+	/// part of the JSON of a reply too large for one frame.
+	Chunk {
+		data: String,
+	},
+	/// The chunks since the last reply are one reply's JSON.
+	Joined,
+	ImportPlanned(ImportPlanned),
+	Imported(snip_core::restore::RestoreExecutionResult),
+	ReplayPlanned(ReplayExpect),
+	Replayed(snip_core::commits::ReplayResult),
+	/// A `check_only` replay found nothing changed.
+	Fresh,
 	Error {
 		code: ErrorCode,
 		message: String,
@@ -279,6 +509,11 @@ pub enum ErrorCode {
 	Cancelled,
 	/// Repository escapes shared boundary.
 	OutsideShare,
+	/// The paste destination changed since the preview; the message is
+	/// the local paste's wording.
+	Stale,
+	/// Two entries of a paste land on one file.
+	Collision,
 }
 
 pub fn write_frame<T: Serialize>(
@@ -295,6 +530,89 @@ pub fn write_frame<T: Serialize>(
 	w.write_all(&(bytes.len() as u32).to_be_bytes())?;
 	w.write_all(&bytes)?;
 	w.flush()
+}
+
+/// Splits `text` into pieces of at most [`CHUNK_BYTES`] on char boundaries.
+pub(crate) fn chunks(text: &str) -> impl Iterator<Item = &str> {
+	let mut rest = text;
+	std::iter::from_fn(move || {
+		if rest.is_empty() {
+			return None;
+		}
+		let mut end = rest.len().min(CHUNK_BYTES);
+		while !rest.is_char_boundary(end) {
+			end -= 1;
+		}
+		let (head, tail) = rest.split_at(end);
+		rest = tail;
+		Some(head)
+	})
+}
+
+/// Writes `request`; a paste's text larger than one chunk goes ahead in
+/// [`Request::Chunk`] frames and the request itself carries none.
+pub fn write_request(w: &mut impl Write, request: &Request) -> io::Result<()> {
+	write_request_for(w, request, 0)
+}
+
+/// [`write_request`] with the negotiated protocol: from
+/// [`REQUEST_CHUNKS_VERSION`] on, a request whose JSON is larger than one
+/// chunk — an Apply's freshness snapshot included — goes out as
+/// [`Request::FrameChunk`] pieces ended by [`Request::FrameJoin`], bounded
+/// by [`JOINED_MAX`]. Below that version the request must fit one frame,
+/// as before.
+pub fn write_request_for(
+	w: &mut impl Write,
+	request: &Request,
+	negotiated: u32,
+) -> io::Result<()> {
+	let Some(text) = request.text().filter(|t| t.len() > CHUNK_BYTES) else {
+		return write_whole_request(w, request, negotiated);
+	};
+	for data in chunks(text) {
+		write_frame(
+			w,
+			&Request::Chunk {
+				data: data.to_string(),
+			},
+		)?;
+	}
+	let mut bare = request.clone();
+	if let Some(t) = bare.text_mut() {
+		t.clear();
+	}
+	write_whole_request(w, &bare, negotiated)
+}
+
+/// Writes `request` as one frame, or — when the peer joins frames — as
+/// bounded JSON pieces the worker joins and parses.
+fn write_whole_request(
+	w: &mut impl Write,
+	request: &Request,
+	negotiated: u32,
+) -> io::Result<()> {
+	if negotiated < REQUEST_CHUNKS_VERSION {
+		return write_frame(w, request);
+	}
+	let json = serde_json::to_vec(request).map_err(io::Error::other)?;
+	if json.len() <= CHUNK_BYTES {
+		return write_frame(w, request);
+	}
+	if json.len() > JOINED_MAX {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("request of {} bytes exceeds {JOINED_MAX}", json.len()),
+		));
+	}
+	for piece in chunks(std::str::from_utf8(&json).map_err(io::Error::other)?) {
+		write_frame(
+			w,
+			&Request::FrameChunk {
+				data: piece.to_string(),
+			},
+		)?;
+	}
+	write_frame(w, &Request::FrameJoin)
 }
 
 /// `Ok(None)` on a clean end of stream before a frame starts.
@@ -423,6 +741,10 @@ pub fn valid_tips(tips: &[String]) -> bool {
 mod tests {
 	use super::*;
 	use snip_core::browser::TreeKind;
+	use snip_core::transfer::{
+		CanonicalRootId, DestinationFreshnessSnapshot, FileFreshness,
+		TargetFileFreshness,
+	};
 	use snip_core::workspace::ChangeCounts;
 
 	#[test]
@@ -626,6 +948,25 @@ mod tests {
 
 		let responses = [
 			Response::Pending,
+			Response::Joined,
+			Response::Fresh,
+			Response::Imported(snip_core::restore::RestoreExecutionResult {
+				created_count: 1,
+				errors: vec!["x: denied".into()],
+				..Default::default()
+			}),
+			Response::Replayed(snip_core::commits::ReplayResult {
+				created: vec!["abcd".into()],
+				failure: None,
+			}),
+			Response::Error {
+				code: ErrorCode::Stale,
+				message: "stale destination in '/w': gone".into(),
+			},
+			Response::Error {
+				code: ErrorCode::Collision,
+				message: "target collision".into(),
+			},
 			Response::Repos(RepoScan {
 				repos: vec![ScannedRepo {
 					rel: "sub".into(),
@@ -694,6 +1035,20 @@ mod tests {
 	}
 
 	#[test]
+	fn dir_reply_without_truncated_parses_as_not_truncated() {
+		// A worker built before the whole-listing reply still parses.
+		let json = r#"{"reply":"dir","entries":[{"name":"a","utf8":true,"directory":false,"symlink":false,"nested_repo":false}]}"#;
+		let res: Response = serde_json::from_str(json).unwrap();
+		match res {
+			Response::Dir { entries, truncated } => {
+				assert_eq!(entries.len(), 1);
+				assert!(!truncated);
+			}
+			other => panic!("expected Dir, got {other:?}"),
+		}
+	}
+
+	#[test]
 	fn hello_reply_without_home_or_max_version_parses_as_none() {
 		let json = r#"{"reply":"hello","version":1,"name":"w"}"#;
 		let res: Response = serde_json::from_str(json).unwrap();
@@ -729,6 +1084,84 @@ mod tests {
 			max_version: Some(2),
 		};
 		round_trip_check(&hello_reply);
+	}
+
+	#[test]
+	fn a_oversized_apply_request_goes_out_as_joined_pieces() {
+		// A freshness snapshot big enough that the whole request's JSON is
+		// over one chunk: only a peer that joins frames can take it.
+		let dir = tempfile::tempdir().unwrap();
+		let root = CanonicalRootId::new(dir.path()).unwrap();
+		let target_files = (0..4_000)
+			.map(|i| {
+				let path = std::path::PathBuf::from(format!(
+					"/w/level-one/level-two/dir-{i:04}/file-with-a-long-name.rs"
+				));
+				(
+					path,
+					TargetFileFreshness {
+						root: root.clone(),
+						relative_path: "rel".into(),
+						existed: false,
+						file_state: Some(FileFreshness {
+							size: 4,
+							mtime: std::time::SystemTime::UNIX_EPOCH,
+							content_hash: [i as u8; 32],
+						}),
+					},
+				)
+			})
+			.collect();
+		let request = Request::ImportApply {
+			workspace: "w".into(),
+			dest: String::new(),
+			text: String::new(),
+			mapping: PasteMapping::default(),
+			selection: Default::default(),
+			expect: ImportExpect {
+				digest: "d".into(),
+				freshness: DestinationFreshnessSnapshot {
+					roots: Default::default(),
+					target_files,
+				},
+			},
+		};
+		let json = serde_json::to_vec(&request).unwrap();
+		assert!(json.len() > CHUNK_BYTES, "{}", json.len());
+
+		// Joined pieces, each one a small frame.
+		let mut buf = Vec::new();
+		write_request_for(&mut buf, &request, REQUEST_CHUNKS_VERSION).unwrap();
+		let mut reader = buf.as_slice();
+		let mut joined = String::new();
+		let mut frames = 0;
+		loop {
+			match read_frame::<Request>(&mut reader).unwrap() {
+				Some(Request::FrameChunk { data }) => {
+					frames += 1;
+					joined.push_str(&data);
+				}
+				Some(Request::FrameJoin) => break,
+				other => panic!("expected a frame piece, got {other:?}"),
+			}
+		}
+		assert!(frames > 1, "{frames} pieces");
+		assert_eq!(
+			joined.len(),
+			json.len(),
+			"the pieces are the request's JSON"
+		);
+		assert_eq!(read_frame::<Request>(&mut reader).unwrap(), None);
+
+		// Below the version, the whole request still goes as one frame.
+		let mut buf = Vec::new();
+		write_request_for(&mut buf, &request, 4).unwrap();
+		let mut reader = buf.as_slice();
+		assert_eq!(
+			read_frame::<Request>(&mut reader).unwrap().as_ref(),
+			Some(&request)
+		);
+		assert_eq!(read_frame::<Request>(&mut reader).unwrap(), None);
 	}
 
 	#[test]
@@ -781,6 +1214,31 @@ mod tests {
 		];
 		for req in &v1_requests {
 			assert_eq!(req.needs_version(), 1);
+		}
+		// A whole listing is protocol 1, as the first page always was.
+		let listing = Request::ListDir {
+			workspace: "w".into(),
+			path: "p".into(),
+		};
+		assert_eq!(listing.needs_version(), 1);
+
+		let v4_requests = [
+			Request::ImportPlan {
+				workspace: "w".into(),
+				dest: "".into(),
+				text: "t".into(),
+				mapping: PasteMapping::default(),
+			},
+			Request::ReplayPlan {
+				workspace: "w".into(),
+				dest: "repo".into(),
+				text: "t".into(),
+			},
+			Request::Chunk { data: "d".into() },
+		];
+		for req in &v4_requests {
+			assert_eq!(req.needs_version(), PASTE_VERSION);
+			round_trip_check(req);
 		}
 	}
 

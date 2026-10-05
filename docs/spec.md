@@ -68,8 +68,8 @@
   (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;偵測目的端是否不分大小寫,不分大小寫則新目標也摺疊大小寫(D10,階段 5b 已實作);以及 symlink 別名、同一路徑出現兩次)就整批拒絕;錯誤訊息格式呈現為單一目標路徑並列出衝突的操作名稱（如 `target collision: multiple operations target '<p>': previous was 'create a', current is 'create b'`，不重複輸出路徑亦不暴露內部大小寫摺疊字串）;
   (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
   這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
-- 安全規則照 porting-notes 第 3 節:路徑片段等於 `.git`(ASCII 不區分大小寫,含 Win32 結尾點或空白拼寫如 `.git.`)視為 unsafe/unresolved 拒絕(檔案模式的寫入與刪除、commit 模式的 `path`/`old_path` 皆阻擋)、路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、
-  placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8。
+- 安全規則照 porting-notes 第 3 節:路徑片段等於 `.git`(ASCII 不區分大小寫,含 Win32 結尾點或空白拼寫如 `.git.`)視為 unsafe/unresolved 拒絕(檔案模式的寫入與刪除、commit 模式的 `path`/`old_path` 皆阻擋)、路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、寫入或刪除的目標把 symlink 解析到底後落在 Git 目錄(repo 的 `.git`、bare repo、獨立 git dir)裡的,規劃時列為略過(檔案模式 UNRESOLVED_PATH、commit 模式 UnsafePath)、寫入前再檢查一次(只拒絕那一筆,其餘照寫)、
+  placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8,而且一律以「同資料夾暫存檔 + rename」**取代目錄項目**:硬連結或 symlink 的另一個名字(或指向的檔案)永遠不會被寫穿,三個作業系統一致。
 - CLI 補充(現行行為/CLI 於階段 6 已切換):絕對路徑在 sanitize 前先解析(root 內部、跨機器後綴 → 相對路徑,同 TS);絕對 [DELETED] 解析不到 root → 拒絕(視為 unsafe/unresolved 跳過,同 TS);寫入對不到 root 的 POSIX 絕對路徑(如 `/Users/bob/other/src/a.ts`)→ 去首斜線放主 root 下(同 TS);帶磁碟機代號的路徑(如 `D:\work\lib\b.ts`)因 `sanitize_relative_path` 的絕對路徑/磁碟機檢查(`is_absolute_path`/`has_drive_slash`)而跳過(`UNRESOLVED_PATH`),不再放進 `D/work/...`。CLI 只有單一 root。`paste` 的 `--repo` 必須已存在,否則 exit 1(見 porting-notes「已知且接受的差異」)。
 - 目的端路徑為目錄、FIFO 等非一般檔案時整批以 `DestinationNotRegular` / `SpecialFile` 拒絕(含 `--dry-run`,exit 1;錯誤訊息明確提示貼上拒絕覆寫非一般檔案),見 porting-notes「已知且接受的差異」。父層片段為一般檔案或目的端為懸空 symlink 時亦以 `TransferError::Io` 整批拒絕(exit 1),同見該條目。
 
@@ -139,7 +139,7 @@ snip-sync 自訂,只要求 snip ↔ snip 互通:
 - **常駐系統匣**。選單:從剪貼簿貼上、複製上一次的選取、開啟主視窗、結束。
 - **主視窗**(同一個視窗,可從系統匣的小尺寸展開):
   - 選 repo / 資料夾。
-  - 檔案模式:專案工具視窗照實顯示工作區資料夾(含非 Git 檔案,儲存庫在其所在位置標出分支與變更數),逐層載入目錄,單擊任一列即單獨選取(檔案在右側預覽,資料夾同時展開/收合;箭頭只展開不選取),選資料夾只選它本身,複製時才走訪;以 Ctrl/Cmd 多選、Shift 範圍選取,右鍵複製所選檔案與資料夾。選來源(檔案、working tree、staged、commit、區間);Git 來源顯示真正的目錄階層、變更狀態與 diff,可逐檔或整個資料夾選取再複製。選 monorepo 子資料夾時只列出並複製該資料夾內的變更。一般文字預覽上限 1 MiB,二進位不顯示文字內容。
+  - 檔案模式:專案工具視窗照實顯示工作區資料夾(含非 Git 檔案,儲存庫在其所在位置標出分支與變更數),逐層載入目錄,單擊任一列即單獨選取(檔案在右側預覽,資料夾同時展開/收合;箭頭只展開不選取),選資料夾只選它本身,複製時才走訪;以 Ctrl/Cmd 多選、Shift 範圍選取,右鍵複製所選檔案與資料夾。選來源(檔案、working tree、staged、commit、區間);Git 來源(Changes)顯示真正的目錄階層、變更狀態與 diff;沒有勾選框也沒有選取籃,對任一節點右鍵「複製」就只複製那個節點:檔案列是該檔(帶它的來源 staged／unstaged／untracked),資料夾列是該 repo、該群組底下的檔案,repo 列是該 repo 在該群組的檔案,群組列是所有 repo 在該群組的檔案;名稱不是有效 UTF-8 的列不納入,沒有可複製內容時「複製」停用。commit 樹瀏覽的檔案列右鍵「複製」該檔在那個 commit 的內容。Cmd/Ctrl+C 複製左側工具視窗游標所在的節點(專案工具視窗是選取的列;閱讀器有選取文字時複製文字)。選 monorepo 子資料夾時只列出並複製該資料夾內的變更。一般文字預覽上限 1 MiB,二進位不顯示文字內容。
   - commit 模式:歷史時間軸,選一段連續 commit → 複製。
   - 貼上:預覽(3.2 / 4.3)→ 確認 → 結果。
 - 複製與貼上的通知內容見 3.1、4.2。
@@ -167,9 +167,10 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 貼上 commits:兩邊都經 `transfer::CommitReplayPreview`(`capture` / `revalidate` / `apply`)。
 - 遠端連線:兩邊都經 `snip_remote::Client`(`RemoteHost::ssh`,主機來自 `ssh::config_hosts`)。
 - 遠端 Git 檢視：兩邊都經 `snip_core::gitview::RepoView`（`snip_remote::RemoteRepo`）；worker 以 served `LocalRepo` 回答。
+- 遠端複製與貼上:兩邊都經 `snip_remote::Client`(`export_files`／`export_commits`、`import_plan`／`import_apply`、`replay_plan`／`replay_apply`),worker 跑上面同一組函式(§8「貼上」)。
 - 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 
-兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是預覽、勾選與時間軸),以及下列例外:
+兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是右鍵複製、貼上預覽的逐檔勾選與時間軸),以及下列例外:
 1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 套用全部檔案(經 `ImportMapping::from_restore_base`);GUI 維持逐 prefix 選擇(D4)。兩者最後都是同一個 `ImportMapping`。
 2. 沒有選到任何檔案:CLI 顯示 `No files selected.` 並以 exit 1 結束、不碰剪貼簿;GUI 顯示提示、同樣不寫剪貼簿。
 
@@ -197,12 +198,12 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 
 ## 8. 遠端工作區(SSH)
 
-> 狀態:第三刀(2026-10-04)。改走 SSH,拿掉配對;支援瀏覽、預覽與唯讀 Git 檢視。複製與貼上在後續切片加入(見下方「明確不做」)。
+> 狀態:第三刀(2026-10-04)改走 SSH,拿掉配對;支援瀏覽、預覽與唯讀 Git 檢視。之後加入複製(協定 3)與貼上(協定 4),和本機資料夾一樣用。
 
 這是**操作另一台電腦上檔案的控制通道**,不是剪貼簿的傳輸方式:第 1 節「不管傳輸」指的是複製／貼上之間的剪貼簿,照舊不變。
 
 - **角色**:
-  - **master**:桌面 App,或 CLI `snip remote hosts|ls|stat|cat|repos|changes|log|show|diff <host> <資料夾> …`。兩者共用 `snip_remote::Client`。
+  - **master**:桌面 App,或 CLI `snip remote hosts|ls|stat|cat|repos|changes|log|show|diff|copy|copy-commits|paste <host> <資料夾> …`。兩者共用 `snip_remote::Client`。
   - **worker**:被操作的那台,只要裝了 `snip`。master 每條連線都透過 ssh 在那台啟動一個 `snip serve --stdio`,連線結束就退出;不需要常駐服務,也不需要桌面 App。
 - **主機與連線**:
   - 主機清單就是 `~/.ssh/config` 的 `Host` 項目(跟著 `Include` 走,略過萬用字元樣式)。
@@ -210,13 +211,21 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 身分驗證與加密完全交給 SSH,所以必須先設好金鑰登入;BatchMode 不會問密碼,失敗時顯示 ssh 自己的錯誤訊息。遠端沒有 `snip` 或版本太舊時,顯示「那台機器沒有安裝 snip,或版本太舊」。
   - worker 先印一行 `snip-serve-stdio/1`,之後才是協定的 frame;登入 shell 在這之前印的歡迎訊息會被略過。
   - `SNIP_REMOTE_EXEC` 環境變數可以整個取代啟動指令(以空白分隔),供測試與驗收使用。
+  - `SNIP_E2E_PASTE_HOLD` 是貼上中斷驗收用的暫停點：只有設成**絕對路徑**且該檔案存在時，worker 才在第一個檔案寫入後暫停，等檔案移除再繼續（最多 60 秒）；未設定、相對路徑或檔案不存在都不暫停。
 - **權限**:SSH 登入的使用者讀得到的資料夾,都能開成遠端工作區。工作區開啟後,每個請求仍以 realpath 解析,必須留在該工作區之內,所以 `..`、絕對路徑、指向工作區外的 symlink 一律拒絕。
-- **開啟遠端工作區**:工作區選單的「遠端主機（SSH）」列出主機。點一台主機會先連線並列出它家目錄底下的資料夾,也列出這台主機最近開過的資料夾,另有路徑欄可輸入任何資料夾(絕對路徑或 `~/…`)。開過的資料夾記在設定資料夾的 `remote-recent.json`,每台主機合計最多 10 筆。
+- **開啟遠端工作區**:工作區選單的「遠端主機（SSH）」列出主機。點一台主機會先連線並列出它家目錄底下的資料夾(不列 `.` 開頭的)。點資料夾是進入它、列出它的子資料夾,不會開啟;上方顯示目前的資料夾和「開啟這個資料夾」按鈕,另有「上一層」(在根目錄時不顯示)。晚到的列表若不是目前顯示的資料夾就丟掉。路徑欄跟著填入目前的資料夾,也可輸入任何資料夾(絕對路徑或 `~/…`)再按「開啟」。路徑欄緊接在目前資料夾下方;資料夾很多時清單在自己的區塊內捲動,整個工作區選單也不超出視窗高度,所以路徑欄與兩個開啟按鈕一直點得到。
+- **遠端的最近開啟與重新連線**:開過的資料夾記在設定資料夾的 `remote-recent.json`,所有主機合計最多 10 筆,列在工作區選單上方的「最近開啟」、排在本機的之後,標成「主機 ▸ 資料夾名」,點一下就重開。最後開著的工作區是遠端時記在 `remote-last.json`(開本機工作區時刪掉);之後沒帶 `--workspace` 啟動,App 會在背景重新連線,連不上就停在沒有工作區的畫面並顯示原因。
 - **master 開啟遠端工作區後**:
-  - 專案樹逐層列出 worker 上的目錄,和本機一樣不列 `.git`(指名路徑仍可讀)。單一目錄最多列 1000 筆,超過就顯示截斷。
+  - 專案樹逐層列出 worker 上的目錄,和本機一樣不列 `.git`(指名路徑仍可讀)。`ListDir` 一次回整份排序好的清單(資料夾在前),上限 20,000 筆,超過時回 `truncated` 並顯示與本機相同的截斷標記,沒有游標續讀;「顯示更多」把清單餵進本機樹同一個 held 續讀路徑。`snip remote ls` 一次印出整份,超過上限時附截斷提示。
   - 指向工作區內資料夾的 symlink 列成資料夾,可以展開;指向工作區外或 `.git` 的 symlink 列成一般項目,打開時拒絕。規則與複製時展開資料夾相同(`transfer::is_safe_dir_symlink`)。
   - 點檔案就預覽,規則與本機相同:上限 1 MiB,二進位與非 UTF-8 不顯示文字。重新整理會重讀樹和開著的預覽,檔案在 worker 上已刪除就顯示錯誤。
-  - 複製、貼上、加入儲存庫路徑（`add_repo_path`）、為複製而勾選在遠端工作區都會拒絕,狀態列顯示「遠端工作區只支援瀏覽、預覽與唯讀的 Git 檢視」（`remote_unsupported`）。右鍵選單的儲存庫與檔案列只提供複製 worker 上的路徑（`copy-worker-path`）,不提供本機 reveal（在 Finder／檔案總管顯示）。
+  - 複製與貼上和本機一樣(見下方「貼上」)。加入儲存庫路徑（`add_repo_path`）會拒絕,狀態列顯示「遠端工作區不支援這個操作」（`remote_unsupported`）。右鍵選單的儲存庫與檔案列只提供複製 worker 上的路徑（`copy-worker-path`）,不提供本機 reveal（在 Finder／檔案總管顯示）。
+- **貼上**(協定 4):
+  - 檔案模式與 commit 模式都和本機同一個預覽面板與流程:同樣的列、勾選、覆寫預設關閉、前綴對應選擇(候選是遠端工作區的 repo 與資料夾,顯示成 `主機:路徑`)、新鮮度與碰撞檢查,結果也相同。目的地是目前的 repo,沒有 repo 時是工作區資料夾。
+  - worker 在自己的磁碟上跑本機貼上同一套引擎(`transfer::plan_import_with`、`CommitReplayPreview`),不是逐檔寫入的 RPC。`ImportPlan`／`ReplayPlan` 只規劃、不寫入,回傳計畫與新鮮度快照(路徑是 worker 的)。
+  - Apply 不留狀態:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,在重放鎖底下重新驗證後重放;「先允許覆寫」的提示之前,同樣先檢查是否過期。
+  - CLI `snip remote paste <host> <資料夾> [--in 資料夾] --dry-run|--apply [--overwrite|--skip-existing] [--adjust-paths] [--stdin]` 的旗標、輸出與結束碼和 `snip paste` 相同;路徑調整建議由 worker 依它的資料夾提出。
+  - payload 可達剪貼簿上限(32 MiB),大於一個 frame:請求的貼上文字以 `Chunk` frame 先送(worker 端上限為剪貼簿上限),回覆的計畫以 `Chunk` + `Joined` 分段;整個請求(含 Apply 的新鮮度快照)超過一個 chunk 時,以 `FrameChunk` + `FrameJoin` 有上限地分段(協定 5)。寫入中的 Apply 不能中途取消,所以期限較長(30 分鐘),master 也不會重送寫入請求;超過 worker 期限時,寫入工作自己的回應(成功或它自己的錯誤)不會被丟掉換成 `Timeout`,worker 以 heartbeat 撐住並送出實際結果,master 的期限(31 分鐘)較長,若 master 先放棄則結果未知:App 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」(`paste_outcome_unknown`),CLI 在 stderr 說明並以非零結束。
 
 ### Git 檢視
 
@@ -246,13 +255,14 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - Refresh 時 worker 掃描失敗（舊版 worker、連線中斷），repo 清單清空，已開的預覽與展開的資料夾不保留；當時正在載入的資料夾可能停在載入中，需重新開啟工作區。
   - 每條連線是一個 ssh 程序;master 每台主機最多留 2 條閒置連線。worker 的 job 與 `Served` 名額限制以單一程序計。
 - **版本相容**:
-  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 2,`GIT_VIEWS_VERSION = 2`）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）。
+  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 4:`GIT_VIEWS_VERSION = 2`、`TRANSFER_VERSION = 3` 複製、`PASTE_VERSION = 4` 貼上）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）;複製與貼上回報「那台的 snip-sync 太舊」。
   - 0.6.x 以前的 TLS worker(`snip worker`)不支援 `serve --stdio`,連不上時顯示「沒有安裝 snip,或版本太舊」。
 - **寫入不變式**:
-  - 將來若開放 `Request::Write`/`Rename`，必須拒絕任何 `.git` 目錄底下、以及 git dir／common dir 目標底下的路徑；否則 Git 檢視會把「可寫檔案」變成「在 worker 上執行程式」（hooks、filter、fsmonitor 設定）。
+  - 能寫進 `.git` 就能寫 `.git/config`、hooks 或 filter,等於讓 master 在 worker 執行程式。這條守門在 snip-core 的貼上引擎裡(§3.2 安全規則),本機與遠端是同一段程式:payload 路徑含 `.git` 片段,或目標經 symlink 解析後落在 Git 目錄裡的,都是略過列、不寫入,其餘照寫。worker 另外只要求目的地與每個前綴對應的資料夾在工作區內(遠端的存取範圍);commit 重放和本機一樣進到目的地所在的 repo,即使它的頂層在工作區之上。
+  - `Request::Write`/`Rename` 不提供(回 `Unsupported`):貼上整份在 worker 規劃與寫入,沒有逐檔寫入的 RPC。
 - **明確不做(本切片)**:
   - 遠端寫入類 Git 操作（stage、unstage、commit、checkout、discard、rename、write）：(1) 能寫入 worker 檔案就能寫入 `.git/config`、hooks 或 filter，等於讓 master 在 worker 執行任意程式（違反寫入不變式）；(2) 本機寫入依賴 HeavyGuard、新鮮度與碰撞檢查（§3.2、§4.3），跨機器版本尚未設計；(3) 讀取先做正確，避免因誤判狀態做出錯誤決策。
-  - 遠端的加入 repo 路徑（`add_repo_path`）、複製到剪貼簿、貼上、為複製而勾選：維持拒絕（回報 `remote_unsupported`）。
+  - 遠端的加入 repo 路徑（`add_repo_path`）：維持拒絕（回報 `remote_unsupported`）。複製（變更列、群組、資料夾、專案列選取、commit 檔案、commit）和本機一樣：worker 用同一個複製引擎產生 payload（協定 3 的 `Export` / `ExportCommits`），App 寫進剪貼簿。貼上見上方「貼上」。
   - 掃描逾時（`TimedOut`）或達上限（`LimitReached`）在遠端不支援游標續掃（僅 depth-limited 資料夾可續），需重新整理重掃。
   - 自動 fetch、遠端分支操作：本機亦無此功能。
   - Windows 作為 worker:遠端啟動指令用 POSIX `sh`。

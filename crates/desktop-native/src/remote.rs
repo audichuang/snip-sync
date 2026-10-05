@@ -62,6 +62,43 @@ pub(crate) fn remember_recent(
 	}
 }
 
+/// Names the remote folder that was the last workspace open; absent when
+/// the last one was local.
+const LAST_FILE: &str = "remote-last.json";
+
+fn last_file() -> Option<PathBuf> {
+	Some(crate::recent::config_dir()?.join(LAST_FILE))
+}
+
+/// The remote folder to reconnect to on launch: the last workspace open,
+/// when it was remote. None without a config folder.
+pub fn load_last() -> Option<RecentRemote> {
+	last_file().and_then(|f| load_last_from(&f))
+}
+
+/// Records the workspace just opened: `Some` for a remote folder, `None`
+/// for a local one. A failed write only loses the reconnect.
+pub(crate) fn remember_last(last: Option<&RecentRemote>) {
+	if let Some(f) = last_file() {
+		save_last_to(&f, last);
+	}
+}
+
+fn load_last_from(f: &Path) -> Option<RecentRemote> {
+	snip_remote::load_json(f)
+}
+
+fn save_last_to(f: &Path, last: Option<&RecentRemote>) {
+	match last {
+		Some(last) => {
+			let _ = snip_remote::save_json(f, last);
+		}
+		None => {
+			let _ = std::fs::remove_file(f);
+		}
+	}
+}
+
 /// The hosts of `~/.ssh/config`, reached through ssh.
 pub fn load_hosts() -> Vec<RemoteHost> {
 	snip_remote::ssh::config_hosts()
@@ -71,6 +108,7 @@ pub fn load_hosts() -> Vec<RemoteHost> {
 }
 
 /// The remote workspace open in place of a local one.
+#[derive(Clone)]
 pub struct RemoteSession {
 	pub client: Arc<Client>,
 	pub workspace: RemoteWorkspace,
@@ -125,11 +163,56 @@ pub fn display_path(session: Option<&RemoteSession>, root: &Path) -> String {
 	root.display().to_string()
 }
 
-/// A host's home folder and the folders in it, for the menu.
+/// A folder of a host and the folders in it, for the menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostListing {
-	pub home: String,
+pub struct FolderListing {
+	/// The worker's real path of the folder.
+	pub path: String,
 	pub folders: Vec<String>,
+}
+
+/// The folder a host's block in the menu shows. Clicking a subfolder
+/// enters it; only "open this folder" opens it as the workspace.
+pub struct Browse {
+	pub host: usize,
+	/// The worker's real path once listed, else as asked for (`~`, `…/..`).
+	pub path: String,
+	pub listing: Option<Result<FolderListing, String>>,
+	/// A listing that lands with another number is for a folder no longer
+	/// shown.
+	seq: u64,
+	/// Kept across hops on one host, so a click does not start ssh again.
+	client: Option<Arc<Client>>,
+}
+
+impl std::fmt::Debug for Browse {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Browse")
+			.field("host", &self.host)
+			.field("path", &self.path)
+			.field("listing", &self.listing)
+			.field("seq", &self.seq)
+			.finish()
+	}
+}
+
+impl Browse {
+	pub fn seq(&self) -> u64 {
+		self.seq
+	}
+}
+
+/// `name` inside `dir`, as the worker resolves it (`..` included).
+pub(crate) fn child_path(dir: &str, name: &str) -> String {
+	format!("{}/{name}", dir.trim_end_matches(['/', '\\']))
+}
+
+/// True for `/`, and for a drive root (`C:\`, `C:`) of a Windows worker:
+/// no "up one level" there.
+pub(crate) fn is_root(path: &str) -> bool {
+	let p = path.trim_end_matches(['/', '\\']);
+	let b = p.as_bytes();
+	p.is_empty() || (b.len() == 2 && b[1] == b':' && b[0].is_ascii_alphabetic())
 }
 
 /// What master UI holds about remote work.
@@ -140,8 +223,9 @@ pub struct MasterState {
 	pub session: Option<RemoteSession>,
 	pub busy: bool,
 	pub message: Option<(bool, String)>,
-	/// Host whose folders are listed, and the listing once it lands.
-	pub browse: Option<(usize, Option<Result<HostListing, String>>)>,
+	/// The host whose folders are listed, and the folder shown.
+	pub browse: Option<Browse>,
+	pub(crate) browse_seq: u64,
 	pub scan_error: Option<Msg>,
 }
 
@@ -331,12 +415,21 @@ pub(crate) fn remote_scan_entries(
 }
 
 /// Blocking: the remote counterpart of [`crate::tree::execute_tree_io`].
+/// A fresh Expand/Retry fetches the worker's WHOLE listing once; a
+/// continuation (LoadMore, entries still in `held`) is the ordinary local
+/// admission path — nothing to fetch, no remote branch.
 pub fn tree_io(
 	client: &Client,
 	workspace: &str,
 	session_root: &Path,
 	io: TreeIo,
 ) -> TreeIoResult {
+	if !io.held.is_empty() {
+		return crate::tree::execute_tree_io(
+			io,
+			&snip_core::gitrun::CancelToken::new(),
+		);
+	}
 	let prefix = match remote_rel(session_root, &io.base) {
 		Some(p) => p,
 		None => {
@@ -447,21 +540,45 @@ impl WorkbenchModel {
 
 	/// Lists host `idx`'s home folder in the menu.
 	pub fn browse_remote_host(&mut self, idx: usize, cx: &mut Context<Self>) {
+		self.browse_remote_folder(idx, "~".to_string(), cx);
+	}
+
+	/// Lists `path` (absolute, or `~/…`) of host `idx` in the menu.
+	pub fn browse_remote_folder(
+		&mut self,
+		idx: usize,
+		path: String,
+		cx: &mut Context<Self>,
+	) {
 		let Some(host) = self.remote.hosts.get(idx).cloned() else {
 			return;
 		};
-		self.remote.browse = Some((idx, None));
+		let client = self
+			.remote
+			.browse
+			.as_ref()
+			.filter(|b| b.host == idx)
+			.and_then(|b| b.client.clone())
+			.filter(|c| c.host().name == host.name)
+			.unwrap_or_else(|| Arc::new(Client::new(host, device_name())));
+		self.remote.browse_seq = self.remote.browse_seq.wrapping_add(1);
+		let seq = self.remote.browse_seq;
+		self.remote.browse = Some(Browse {
+			host: idx,
+			path: path.clone(),
+			listing: None,
+			seq,
+			client: Some(client.clone()),
+		});
 		self.remote.message = None;
 		self.pending_focus = Some(self.remote_path_input.read(cx).handle());
 		cx.notify();
 		let bg = cx.background_executor().clone();
-		let name = host.name.clone();
 		cx.spawn(async move |this, cx| {
 			let result = bg
 				.spawn(async move {
-					let client = Client::new(host, device_name());
-					let home = client.open_workspace("~")?;
-					let (entries, _) = client.list_dir(&home.id, "")?;
+					let ws = client.open_workspace(&path)?;
+					let (entries, _) = client.list_dir(&ws.id, "")?;
 					let folders = entries
 						.into_iter()
 						.filter(|e| {
@@ -469,36 +586,92 @@ impl WorkbenchModel {
 						})
 						.map(|e| e.name)
 						.collect();
-					Ok(HostListing {
-						home: home.id,
+					Ok(FolderListing {
+						path: ws.id,
 						folders,
 					})
 				})
 				.await
 				.map_err(describe);
 			let _ = this.update(cx, |this, cx| {
-				// Another host is shown now.
-				let current = this.remote.browse.as_ref().map(|(i, _)| *i);
-				let same = current
-					.and_then(|i| this.remote.hosts.get(i))
-					.is_some_and(|h| h.name == name);
-				if !same {
-					return;
-				}
-				match &result {
-					Ok(listing) => app_log!(
-						"[APP:REMOTE_HOST_LISTED: host={name} folders={}]",
-						listing.folders.len()
-					),
-					Err(err) => {
-						app_log!("[APP:REMOTE_HOST_FAILED: host={name} {err}]")
-					}
-				}
-				this.remote.browse = current.map(|i| (i, Some(result)));
-				cx.notify();
+				this.remote_listing_landed(seq, result, cx);
 			});
 		})
 		.detach();
+	}
+
+	/// A folder listing lands; dropped when another folder or host is
+	/// shown now.
+	pub(crate) fn remote_listing_landed(
+		&mut self,
+		seq: u64,
+		result: Result<FolderListing, String>,
+		cx: &mut Context<Self>,
+	) {
+		let Some(browse) = self.remote.browse.as_mut().filter(|b| b.seq == seq)
+		else {
+			return;
+		};
+		let name = self
+			.remote
+			.hosts
+			.get(browse.host)
+			.map(|h| h.name.clone())
+			.unwrap_or_default();
+		match &result {
+			Ok(listing) => {
+				app_log!(
+					"[APP:REMOTE_HOST_LISTED: host={name} folders={} path={}]",
+					listing.folders.len(),
+					listing.path
+				);
+				browse.path = listing.path.clone();
+				let path = listing.path.clone();
+				self.remote_path_input
+					.update(cx, |field, cx| field.set_text(&path, cx));
+			}
+			Err(err) => {
+				app_log!("[APP:REMOTE_HOST_FAILED: host={name} {err}]");
+				browse.client = None;
+			}
+		}
+		if let Some(browse) = self.remote.browse.as_mut() {
+			browse.listing = Some(result);
+		}
+		cx.notify();
+	}
+
+	/// Enters subfolder `name` of the folder shown.
+	pub fn enter_remote_folder(&mut self, name: &str, cx: &mut Context<Self>) {
+		let Some(b) = &self.remote.browse else {
+			return;
+		};
+		let (idx, path) = (b.host, child_path(&b.path, name));
+		self.browse_remote_folder(idx, path, cx);
+	}
+
+	/// Lists the parent of the folder shown.
+	pub fn remote_up(&mut self, cx: &mut Context<Self>) {
+		let Some(b) = &self.remote.browse else {
+			return;
+		};
+		if is_root(&b.path) {
+			return;
+		}
+		let (idx, path) = (b.host, child_path(&b.path, ".."));
+		self.browse_remote_folder(idx, path, cx);
+	}
+
+	/// Opens the folder shown as the workspace.
+	pub fn open_remote_here(&mut self, cx: &mut Context<Self>) {
+		let Some(b) = &self.remote.browse else {
+			return;
+		};
+		let Some(Ok(listing)) = &b.listing else {
+			return;
+		};
+		let (idx, path) = (b.host, listing.path.clone());
+		self.open_remote_path(idx, path, cx);
 	}
 
 	/// Opens `path` (absolute, or `~/…`) of host `idx` as the workspace,
@@ -546,6 +719,9 @@ impl WorkbenchModel {
 					}
 					Err(err) => {
 						app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
+						// Also on the status bar: a reconnect on launch runs
+						// with the menu closed.
+						this.set_status("remote_open_failed", [err.clone()]);
 						this.remote_note(false, err, cx);
 					}
 				}
@@ -556,7 +732,7 @@ impl WorkbenchModel {
 
 	/// Opens the path typed into the menu, on the host being browsed.
 	pub fn open_remote_typed(&mut self, cx: &mut Context<Self>) {
-		let Some((idx, _)) = self.remote.browse else {
+		let Some(idx) = self.remote.browse.as_ref().map(|b| b.host) else {
 			return;
 		};
 		let path = self.remote_path_input.read(cx).text().to_string();
@@ -568,14 +744,40 @@ impl WorkbenchModel {
 		let Some(recent) = self.remote.recent.get(n).cloned() else {
 			return;
 		};
-		match self.remote.hosts.iter().position(|h| h.name == recent.host) {
-			Some(idx) => self.open_remote_path(idx, recent.path, cx),
+		self.open_remote_folder(recent, cx);
+	}
+
+	/// Launched without `--workspace` after a remote workspace was the last
+	/// one open: reconnects to it in the background. A failure leaves the
+	/// app with no workspace and says why.
+	pub fn reopen_last_remote(
+		&mut self,
+		last: RecentRemote,
+		cx: &mut Context<Self>,
+	) {
+		app_log!("[APP:REMOTE_REOPEN: host={} path={}]", last.host, last.path);
+		self.set_status(
+			"remote_reconnecting",
+			[format!("{} ▸ {}", last.host, last.path)],
+		);
+		self.open_remote_folder(last, cx);
+	}
+
+	/// Opens `folder` on its host from `~/.ssh/config`.
+	fn open_remote_folder(
+		&mut self,
+		folder: RecentRemote,
+		cx: &mut Context<Self>,
+	) {
+		match self.remote.hosts.iter().position(|h| h.name == folder.host) {
+			Some(idx) => self.open_remote_path(idx, folder.path, cx),
 			None => {
 				let text = crate::i18n::tf(
 					"remote_host_missing",
 					self.locale,
-					&[&recent.host],
+					&[&folder.host],
 				);
+				self.status = Msg::new("remote_open_failed", [text.clone()]);
 				self.remote_note(false, text, cx);
 			}
 		}
@@ -589,6 +791,7 @@ impl WorkbenchModel {
 	) {
 		self.release_workspace_state(cx);
 		remember_recent(&mut self.remote.recent, &host.name, &workspace.id);
+		remember_last(self.remote.recent.first());
 		let session = RemoteSession::new(host, workspace);
 		let root = session.root.clone();
 		let label = session.label();
@@ -784,6 +987,39 @@ mod tests {
 		remember_recent(&mut list, "other", "/p5");
 		assert_eq!(list[0].host, "other");
 		assert_eq!(list[1].host, "h");
+	}
+
+	#[test]
+	fn last_remote_workspace_round_trips_and_a_local_one_clears_it() {
+		assert_eq!(load_last(), None, "no config folder under cfg(test)");
+		let tmp = tempfile::tempdir().unwrap();
+		let f = tmp.path().join("cfg").join(LAST_FILE);
+		assert_eq!(load_last_from(&f), None);
+		let last = RecentRemote {
+			host: "macmini".into(),
+			path: "/Users/x/ck/cat".into(),
+		};
+		save_last_to(&f, Some(&last));
+		assert_eq!(load_last_from(&f), Some(last));
+		save_last_to(&f, None);
+		assert!(!f.exists());
+		assert_eq!(load_last_from(&f), None);
+		save_last_to(&f, None);
+	}
+
+	#[test]
+	fn folder_browser_paths_and_roots() {
+		assert_eq!(child_path("/home/u", "ck"), "/home/u/ck");
+		assert_eq!(child_path("/home/u/", ".."), "/home/u/..");
+		assert_eq!(child_path("/", "etc"), "/etc");
+		assert_eq!(child_path(r"C:\Users\u", "ck"), r"C:\Users\u/ck");
+		assert_eq!(child_path(r"C:\", "Users"), "C:/Users");
+		for root in ["/", "", r"C:\", "C:", "c:/"] {
+			assert!(is_root(root), "{root:?}");
+		}
+		for not in ["/home", "~", r"C:\Users", "CC:", "1:"] {
+			assert!(!is_root(not), "{not:?}");
+		}
 	}
 
 	#[test]

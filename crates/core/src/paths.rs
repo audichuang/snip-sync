@@ -1010,6 +1010,29 @@ fn containment_target(target_path: &Path, hops: u32) -> Option<PathBuf> {
 	Some(target)
 }
 
+/// A folder holding a Git directory's files: a bare repository, a separate
+/// git dir, or `.git` itself.
+pub fn is_git_dir(dir: &Path) -> bool {
+	dir.join("HEAD").is_file()
+		&& dir.join("objects").is_dir()
+		&& dir.join("refs").is_dir()
+}
+
+/// True when a write to `target`, following symlinks as the write would,
+/// lands in a Git directory (a repository's `.git`, a bare repository, a
+/// separate git dir), or where that cannot be established. Writing there
+/// lets a payload set hooks, filters or `core.fsmonitor`: code that runs on
+/// this machine. A relative path without a `.git` segment can still get
+/// there through a symlink, so the real path is checked. A folder merely
+/// named `.git` above the destination is not a Git directory (the
+/// `.git` segment rule for payload paths is separate).
+pub fn lands_in_git_dir(target: &Path) -> bool {
+	let Some(real) = containment_target(target, 0) else {
+		return true;
+	};
+	real.ancestors().any(is_git_dir)
+}
+
 fn real_or_self(p: &Path) -> PathBuf {
 	containment_target(p, 0).unwrap_or_else(|| absolutize(p))
 }

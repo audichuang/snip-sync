@@ -16,15 +16,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub mod client;
+pub(crate) mod copyserve;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;
+pub(crate) mod pasteserve;
 pub mod proto;
 pub mod ssh;
 pub mod worker;
 
 pub use client::{Client, Connection, RemoteHost, RemoteRepo, Transport};
 pub use proto::{
-	DirEntry, ErrorCode, GitQuery, GitReply, RemoteWorkspace, RepoScan,
+	DirEntry, ErrorCode, ExportTarget, GitQuery, GitReply, ImportExpect,
+	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,
 	Request, Response, ScannedRepo, PROTOCOL_MAX,
 };
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
@@ -46,7 +49,7 @@ pub enum RemoteError {
 	#[error("the worker did not answer in time")]
 	TimedOut,
 	#[error(
-		"{worker} is too old for Git views (it speaks protocol {have}, this needs {need}); update it"
+		"snip-sync on {worker} is too old for this (it speaks protocol {have}, this needs {need}); update it there"
 	)]
 	WorkerTooOld {
 		worker: String,
@@ -56,6 +59,17 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
+	/// The request may have reached the worker and run there, but no answer
+	/// came back: after a write, whether it happened is unknown. A refusal,
+	/// a worker that never started, or one too old answered (or never got
+	/// the request).
+	pub fn outcome_unknown(&self) -> bool {
+		matches!(
+			self,
+			Self::Io(_) | Self::TimedOut | Self::Protocol(_) | Self::Cancelled
+		)
+	}
+
 	pub fn code(&self) -> Option<ErrorCode> {
 		match self {
 			Self::Refused { code, .. } => Some(*code),

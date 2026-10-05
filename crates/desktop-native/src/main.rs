@@ -11,7 +11,7 @@
 	windows_subsystem = "windows"
 )]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -110,58 +110,51 @@ const COMMIT_TOAST_PATHS: usize = 3;
 
 /// The commit copy toast (spec 4.2): commit, file and character counts, and
 /// when files were left out, which commit lost which files.
-fn commit_copied_status(export: &snip_core::commits::CommitExport) -> Msg {
-	let sum = snip_core::commits::copy_summary(&export.payload, &export.text);
+fn commit_copied_status(out: &snip_core::commits::CommitCopyOutcome) -> Msg {
 	let mut args = vec![
-		sum.commit_count.to_string(),
-		sum.file_count.to_string(),
-		sum.chars.to_string(),
+		out.commit_count.to_string(),
+		out.file_count.to_string(),
+		out.chars.to_string(),
 	];
-	if sum.not_copied_count == 0 {
+	if out.not_copied.is_empty() {
 		return Msg::new("status_commits_copied", args);
 	}
-	let mut named = 0;
-	let mut parts = Vec::new();
-	for (n, commit) in export.payload.commits.iter().enumerate() {
-		let paths: Vec<&str> = commit
-			.files
-			.iter()
-			.filter(|f| f.not_copied.is_some())
-			.map(|f| f.path.as_str())
-			.take(COMMIT_TOAST_PATHS.saturating_sub(named))
-			.collect();
-		named += paths.len();
-		if !paths.is_empty() {
-			parts.push(format!("#{} {}", n + 1, paths.join(", ")));
+	// "#n path, path; #m path", at most COMMIT_TOAST_PATHS paths.
+	let mut parts: Vec<(usize, Vec<&str>)> = Vec::new();
+	for (n, path) in out.not_copied.iter().take(COMMIT_TOAST_PATHS) {
+		match parts.last_mut() {
+			Some((m, paths)) if m == n => paths.push(path),
+			_ => parts.push((*n, vec![path.as_str()])),
 		}
 	}
-	let mut detail = parts.join("; ");
-	if named < sum.not_copied_count {
+	let mut detail = parts
+		.iter()
+		.map(|(n, paths)| format!("#{} {}", n + 1, paths.join(", ")))
+		.collect::<Vec<_>>()
+		.join("; ");
+	if out.not_copied.len() > COMMIT_TOAST_PATHS {
 		detail.push_str(" …");
 	}
-	args.push(sum.not_copied_count.to_string());
+	args.push(out.not_copied.len().to_string());
 	args.push(detail);
 	Msg::new("status_commits_copied_skipped", args)
 }
 
 /// The copy toast: a partial copy (file limit hit in the folder walk or
-/// in the plan) always says so, with the limit.
+/// in the plan) always says so, with the limit. Local and remote copies
+/// report the same [`snip_core::transfer::CopyOutcome`] shape.
 fn copied_status(
 	repo_name: String,
-	plan: &snip_core::transfer::ExportPlan,
-	expanded: &FolderExpansion,
+	out: &snip_core::transfer::CopyOutcome,
 ) -> Msg {
-	let skipped = plan.skipped_unreadable_count
-		+ plan.skipped_file_size_count
-		+ expanded.skipped;
 	let mut args = vec![
 		repo_name,
-		plan.copied_file_count.to_string(),
-		plan.stats.chars.to_string(),
-		plan.stats.lines.to_string(),
-		skipped.to_string(),
+		out.copied.to_string(),
+		out.chars.to_string(),
+		out.lines.to_string(),
+		out.skipped.to_string(),
 	];
-	if !(expanded.truncated || plan.file_limit_reached) {
+	if !out.truncated {
 		return Msg::new("status_copied", args);
 	}
 	if e2e_on() {
@@ -169,27 +162,6 @@ fn copied_status(
 	}
 	args.push(NATIVE_FILE_COUNT_LIMIT.to_string());
 	Msg::new("status_copied_limit", args)
-}
-
-/// One root's basket items without a Project File item whose path is also
-/// a worktree Changes item (Working/Unstaged): both read the same bytes on
-/// disk, so Copy takes it once. Other same-path pairs (Staged vs Working,
-/// two commits) stay and are refused as collisions.
-fn without_worktree_twins(items: &[ExportItem]) -> Vec<&ExportItem> {
-	let worktree: HashSet<&str> = items
-		.iter()
-		.filter(|item| {
-			matches!(item.source, SourceKind::Working | SourceKind::Unstaged)
-		})
-		.map(|item| item.relative_path.as_str())
-		.collect();
-	items
-		.iter()
-		.filter(|item| {
-			item.source != SourceKind::File
-				|| !worktree.contains(item.relative_path.as_str())
-		})
-		.collect()
 }
 
 /// Measurement harness readiness marker (`--mode idle|overview|preview`).
@@ -229,8 +201,8 @@ use snip_core::gitsrc::{Git, GitSource};
 use snip_core::graph::GraphLayout;
 use snip_core::settings::Settings;
 use snip_core::transfer::{
-	expand_folder_items, plan_commit_export_exact_with, plan_export_with,
-	CanonicalRootId, ExportItem, ExportSelection, FolderExpansion, SourceKind,
+	copy_selection_detailed, plan_commit_export_exact_with, CanonicalRootId,
+	ExportItem, ExportSelection, SourceKind,
 };
 use snip_core::workspace::{
 	DiscoveredRepo, Discovery, RepoIdentity, RepoSummary, ScanBudget,
@@ -256,8 +228,6 @@ actions!(
 		ApplyPaste,
 		CancelPaste,
 		Refresh,
-		DeselectAllFiles,
-		SelectAllFiles,
 		NavUp,
 		NavDown,
 		NavToggle,
@@ -325,14 +295,13 @@ pub struct FileChangeItem {
 	pub change_type: Option<ChangeType>,
 	pub source: SourceKind,
 	pub is_conflict: bool,
-	pub selected: bool,
 	/// Index of the owning repo in `WorkbenchModel::change_repos`.
 	pub repo: u32,
 }
 
 impl FileChangeItem {
 	/// False when Git's path bytes were not UTF-8: the lossy name here does
-	/// not exist on disk, so selecting it would make the whole Copy fail.
+	/// not exist on disk, so copying it would make the whole Copy fail.
 	// ponytail: core's status listing is already lossy, so U+FFFD is the only
 	// signal (a real U+FFFD name is refused too); carry raw bytes from core to
 	// tell them apart.
@@ -343,9 +312,7 @@ impl FileChangeItem {
 
 type WorkingChangeTuple = (String, Option<ChangeType>, SourceKind, bool);
 
-/// Rows kept per repo in the Changes tool window. Every repo's rows count
-/// against `MAX_RETAINED_TREE_BYTES` and each checkbox click clones them, so
-/// 15 repos at this cap stay well inside that budget.
+/// Rows kept per repo in the Changes tool window.
 pub const MAX_CHANGES_PER_REPO: usize = snip_core::gitview::MAX_CHANGE_ROWS;
 
 /// Status reads the Changes queue runs at once (the Git runner's own limit).
@@ -624,413 +591,6 @@ impl From<snip_core::gitview::FoundRepo> for RepoEntry {
 	}
 }
 
-const MAX_RETAINED_TREE_BYTES: usize = 8 * 1024 * 1024;
-
-fn source_heap_bytes(source: &SourceKind) -> usize {
-	match source {
-		SourceKind::Commit { rev } => rev.capacity(),
-		_ => 0,
-	}
-}
-
-fn repo_identity_heap_bytes(identity: &RepoIdentity) -> usize {
-	identity
-		.toplevel
-		.capacity()
-		.saturating_add(identity.git_dir.capacity())
-		.saturating_add(identity.common_dir.capacity())
-}
-
-fn repo_entries_bytes(repos: &Vec<RepoEntry>) -> usize {
-	let mut bytes = std::mem::size_of_val(repos).saturating_add(
-		repos
-			.capacity()
-			.saturating_mul(std::mem::size_of::<RepoEntry>()),
-	);
-	for repo in repos {
-		bytes = bytes
-			.saturating_add(repo.root.capacity())
-			.saturating_add(repo.name.capacity())
-			.saturating_add(
-				repo.identity.as_ref().map_or(0, repo_identity_heap_bytes),
-			);
-		bytes = bytes.saturating_add(match &repo.summary {
-			Ok(summary) => repo_identity_heap_bytes(&summary.identity)
-				.saturating_add(
-					summary.head.as_ref().map_or(0, String::capacity),
-				)
-				.saturating_add(
-					summary.branch.as_ref().map_or(0, String::capacity),
-				),
-			Err(error) => error.capacity(),
-		});
-	}
-	bytes
-}
-
-fn basket_bytes(basket: &Vec<(CanonicalRootId, Vec<ExportItem>)>) -> usize {
-	let mut bytes = std::mem::size_of_val(basket).saturating_add(
-		basket.capacity().saturating_mul(std::mem::size_of::<(
-			CanonicalRootId,
-			Vec<ExportItem>,
-		)>()),
-	);
-	for (root, items) in basket {
-		bytes = bytes
-			.saturating_add(root.retained_heap_bytes())
-			.saturating_add(
-				items
-					.capacity()
-					.saturating_mul(std::mem::size_of::<ExportItem>()),
-			);
-		for item in items {
-			bytes = bytes.saturating_add(export_item_heap_bytes(item));
-		}
-	}
-	bytes
-}
-
-fn admitted_selection_root(
-	repo: &RepoEntry,
-	basket: &[(CanonicalRootId, Vec<ExportItem>)],
-) -> Option<CanonicalRootId> {
-	let canonical = repo
-		.identity
-		.as_ref()
-		.or_else(|| repo.summary.as_ref().ok().map(|summary| &summary.identity))
-		.map(|identity| identity.toplevel.as_path());
-	basket
-		.iter()
-		.find(|(root, _)| {
-			root.path() == repo.root.as_path() || Some(root.path()) == canonical
-		})
-		.map(|(root, _)| root.clone())
-}
-
-fn files_bytes(files: &Vec<FileChangeItem>) -> usize {
-	files.iter().fold(
-		std::mem::size_of_val(files).saturating_add(
-			files
-				.capacity()
-				.saturating_mul(std::mem::size_of::<FileChangeItem>()),
-		),
-		|bytes, file| {
-			bytes
-				.saturating_add(file.path.capacity())
-				.saturating_add(source_heap_bytes(&file.source))
-		},
-	)
-}
-
-fn message_bytes(message: &Msg) -> usize {
-	message.args.iter().fold(
-		std::mem::size_of::<Msg>().saturating_add(
-			message
-				.args
-				.capacity()
-				.saturating_mul(std::mem::size_of::<String>()),
-		),
-		|bytes, arg| bytes.saturating_add(arg.capacity()),
-	)
-}
-
-fn export_item_heap_bytes(item: &ExportItem) -> usize {
-	item.root
-		.retained_heap_bytes()
-		.saturating_add(item.relative_path.capacity())
-		.saturating_add(source_heap_bytes(&item.source))
-}
-
-const MAX_BASKET_DISPLAY_BYTES: usize = 1024;
-
-fn append_basket_display(out: &mut String, text: &str) -> bool {
-	if out.len().saturating_add(text.len()) <= MAX_BASKET_DISPLAY_BYTES {
-		out.push_str(text);
-		return true;
-	}
-	let room = MAX_BASKET_DISPLAY_BYTES
-		.saturating_sub(out.len())
-		.saturating_sub('…'.len_utf8());
-	let mut end = text.len().min(room);
-	while !text.is_char_boundary(end) {
-		end -= 1;
-	}
-	// Make space for the marker even when previous pieces exactly filled it.
-	while out.len() + '…'.len_utf8() > MAX_BASKET_DISPLAY_BYTES {
-		out.pop();
-	}
-	if end > 0 {
-		out.push_str(&text[..end]);
-	}
-	out.push('…');
-	false
-}
-
-/// One complete checkbox/basket replacement. Preparation leaves the current
-/// view unchanged; refusal cannot apply a prefix of Select All or relabel sources.
-/// The owned clones are synchronous construction scratch and overlap the old
-/// view until installation or rejection; they are not queued or published.
-/// This replacement check bounds the installed candidate, not that transient
-/// overlap. Complete source admission and pending-worker charges are later stages.
-struct PreparedSelection {
-	replace_file_group: bool,
-	replace_git_group: bool,
-	remove_only: bool,
-	status: Option<Msg>,
-	files: Vec<FileChangeItem>,
-	paths: Vec<String>,
-	/// The workspace tree's checked paths (its File group).
-	ws_paths: Vec<String>,
-	basket: Vec<(CanonicalRootId, Vec<ExportItem>)>,
-}
-
-impl PreparedSelection {
-	fn new(
-		files: &[FileChangeItem],
-		paths: &[String],
-		basket: &[(CanonicalRootId, Vec<ExportItem>)],
-	) -> Self {
-		Self {
-			replace_file_group: false,
-			replace_git_group: false,
-			remove_only: false,
-			status: None,
-			files: files.to_vec(),
-			paths: paths.to_vec(),
-			ws_paths: Vec::new(),
-			basket: basket.to_vec(),
-		}
-	}
-
-	fn retained_bytes(&self) -> usize {
-		files_bytes(&self.files)
-			.saturating_add(crate::tree::selection_bytes(&self.paths))
-			.saturating_add(crate::tree::selection_bytes(&self.ws_paths))
-			.saturating_add(basket_bytes(&self.basket))
-			.saturating_add(self.status.as_ref().map_or(0, message_bytes))
-	}
-
-	/// [`Self::sync_root`] for the workspace tree's File group. Swapping keeps
-	/// `retained_bytes` exact, since it counts both path lists.
-	fn sync_ws_root(&mut self, root: CanonicalRootId) -> bool {
-		std::mem::swap(&mut self.paths, &mut self.ws_paths);
-		let ok = self.sync_root(root, true, None);
-		std::mem::swap(&mut self.paths, &mut self.ws_paths);
-		ok
-	}
-
-	/// Preserve every other root and historical source while replacing
-	/// `root`'s File group (when `file_group`) and its working-change group
-	/// from the checkboxes of Changes slot `git_slot`.
-	fn sync_root(
-		&mut self,
-		root: CanonicalRootId,
-		file_group: bool,
-		git_slot: Option<u32>,
-	) -> bool {
-		let replace_file_group = self.replace_file_group && file_group;
-		let replace_git_group = self.replace_git_group && git_slot.is_some();
-		let in_slot = |file: &FileChangeItem| Some(file.repo) == git_slot;
-		if !replace_file_group && !replace_git_group {
-			return true;
-		}
-		self.paths.retain(|path| !path.is_empty());
-		self.paths.sort();
-		self.paths.dedup();
-		let index = self
-			.basket
-			.binary_search_by(|(have, _)| have.path().cmp(root.path()));
-		if self.remove_only {
-			// Deselecting must not need the filesystem, clone roots per item, or
-			// rebuild spare vector capacity while the old allocation is near its cap.
-			if let Ok(index) = index {
-				let paths = &self.paths;
-				let (replace_file, replace_git) =
-					(replace_file_group, replace_git_group);
-				// One pass over the checkboxes, not one per basket item.
-				let kept: HashSet<(&str, &SourceKind)> = if replace_git {
-					self.files
-						.iter()
-						.filter(|file| file.selected && in_slot(file))
-						.map(|file| (file.path.as_str(), &file.source))
-						.collect()
-				} else {
-					HashSet::new()
-				};
-				self.basket[index].1.retain(|item| match &item.source {
-					SourceKind::File if replace_file => {
-						paths.binary_search(&item.relative_path).is_ok()
-					}
-					SourceKind::Working
-					| SourceKind::Unstaged
-					| SourceKind::Staged
-						if replace_git =>
-					{
-						kept.contains(&(
-							item.relative_path.as_str(),
-							&item.source,
-						))
-					}
-					_ => true,
-				});
-				if self.basket[index].1.is_empty() {
-					self.basket.remove(index);
-				}
-			}
-			return true;
-		}
-		// Source/list admission is a later stage. Until then an already-large
-		// input may be reduced, while this builder never amplifies beyond it.
-		let allocation_limit =
-			MAX_RETAINED_TREE_BYTES.max(self.retained_bytes());
-		let mut items = match index {
-			Ok(index) => self.basket.remove(index).1,
-			Err(_) => Vec::new(),
-		};
-		items.retain(|item| match item.source {
-			SourceKind::File => !replace_file_group,
-			SourceKind::Working | SourceKind::Unstaged | SourceKind::Staged => {
-				!replace_git_group
-			}
-			SourceKind::Commit { .. } | SourceKind::Range { .. } => true,
-		});
-		let other = self
-			.retained_bytes()
-			.saturating_add(root.retained_heap_bytes());
-		let mut heap = items.iter().fold(0usize, |bytes, item| {
-			bytes.saturating_add(export_item_heap_bytes(item))
-		});
-		let file_count = if replace_file_group {
-			self.paths.len()
-		} else {
-			0
-		};
-		let git_count = if replace_git_group {
-			self.files
-				.iter()
-				.filter(|file| file.selected && in_slot(file))
-				.count()
-		} else {
-			0
-		};
-		let add_count = file_count.saturating_add(git_count);
-		let needed = items.len().saturating_add(add_count);
-		if other
-			.saturating_add(
-				needed.saturating_mul(std::mem::size_of::<ExportItem>()),
-			)
-			.saturating_add(heap)
-			> allocation_limit
-		{
-			return false;
-		}
-		items.reserve_exact(add_count);
-		let slots = items
-			.capacity()
-			.saturating_mul(std::mem::size_of::<ExportItem>());
-		if other.saturating_add(slots).saturating_add(heap) > allocation_limit {
-			return false;
-		}
-		let added = self
-			.paths
-			.iter()
-			.filter(|_| replace_file_group)
-			.map(|path| ExportItem {
-				root: root.clone(),
-				relative_path: path.clone(),
-				source: SourceKind::File,
-				change_type: None,
-				gitlink: false,
-			})
-			.chain(
-				self.files
-					.iter()
-					.filter(|file| {
-						replace_git_group && file.selected && in_slot(file)
-					})
-					.map(|file| ExportItem {
-						root: root.clone(),
-						relative_path: file.path.clone(),
-						source: file.source.clone(),
-						change_type: file.change_type,
-						gitlink: false,
-					}),
-			);
-		for item in added {
-			let proposed_heap =
-				heap.saturating_add(export_item_heap_bytes(&item));
-			if other.saturating_add(slots).saturating_add(proposed_heap)
-				> allocation_limit
-			{
-				return false;
-			}
-			heap = proposed_heap;
-			items.push(item);
-		}
-		if !items.is_empty() {
-			let index = self
-				.basket
-				.binary_search_by(|(have, _)| have.path().cmp(root.path()))
-				.unwrap_err();
-			self.basket.insert(index, (root, items));
-		}
-		self.retained_bytes() <= allocation_limit
-	}
-
-	fn toggle_revision(
-		&mut self,
-		root: CanonicalRootId,
-		sha: &str,
-		path: &str,
-	) -> bool {
-		let index = match self
-			.basket
-			.binary_search_by(|(have, _)| have.path().cmp(root.path()))
-		{
-			Ok(index) => index,
-			Err(index) => {
-				self.basket.insert(index, (root.clone(), Vec::new()));
-				index
-			}
-		};
-		let items = &mut self.basket[index].1;
-		if let Some(position) = items.iter().position(|item| {
-			item.relative_path == path
-				&& matches!(&item.source, SourceKind::Commit { rev } if rev == sha)
-		}) {
-			items.remove(position);
-			if items.is_empty() {
-				self.basket.remove(index);
-			}
-			false
-		} else {
-			items.push(ExportItem {
-				root,
-				relative_path: path.to_owned(),
-				source: SourceKind::Commit {
-					rev: sha.to_owned(),
-				},
-				change_type: None,
-				gitlink: false,
-			});
-			true
-		}
-	}
-
-	fn fits_replacing(
-		&self,
-		current_bytes: usize,
-		old_bytes: usize,
-		limit: usize,
-	) -> bool {
-		let candidate = self.retained_bytes();
-		current_bytes
-			.checked_sub(old_bytes)
-			.and_then(|other| other.checked_add(candidate))
-			.is_some_and(|total| total <= limit || candidate <= old_bytes)
-	}
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Popover {
 	Repo,
@@ -1145,8 +705,7 @@ pub struct WorkbenchModel {
 
 	// Tool windows.
 	pub files: Vec<FileChangeItem>,
-	/// `files` holds the current repo's finished status listing. Until then
-	/// its empty checkboxes say nothing about the basket's Git group.
+	/// `files` holds the current repo's finished status listing.
 	pub changes_loaded: bool,
 	pub file_tree: Option<FileTreeNode>,
 	/// The workspace folder's tree, rooted at its canonical path: every
@@ -1175,11 +734,9 @@ pub struct WorkbenchModel {
 	pub popover: Option<Popover>,
 	pub popover_cursor: usize,
 
-	pub basket: Vec<(CanonicalRootId, Vec<ExportItem>)>,
-	/// Status-bar basket text (localized summary, collision), rebuilt by
-	/// `refresh_basket_view` when the basket, repo names or locale change
-	/// instead of on every frame.
-	pub basket_view: (String, Option<String>),
+	/// Project rows stay selected across a tree rebuild (repo switch,
+	/// Refresh): an outgoing tree leaves its selected paths here, by root.
+	pub tree_selections: Vec<(PathBuf, Vec<String>)>,
 	pub history_cancel: Option<CancelToken>,
 	pub preview_cancel: Option<CancelToken>,
 	pub tree_cancel: Option<CancelToken>,
@@ -1241,6 +798,8 @@ pub struct WorkbenchModel {
 	pub bottom_visible: bool,
 	pub dragging: Option<Splitter>,
 	pub last_viewport: (i32, i32),
+	/// Logical window height, for popups that must fit inside it.
+	pub viewport_h: f32,
 	/// E2E control-bounds reporting; `None` unless `SNIP_NATIVE_E2E=1`.
 	pub probes: Option<ui::Probes>,
 	/// Focus requested from a context without a `Window`; applied on render.
@@ -1581,8 +1140,7 @@ impl WorkbenchModel {
 			add_repo_input,
 			popover: None,
 			popover_cursor: 0,
-			basket: Vec::new(),
-			basket_view: (String::new(), None),
+			tree_selections: Vec::new(),
 			history_cancel: None,
 			preview_cancel: None,
 			tree_cancel: None,
@@ -1638,6 +1196,7 @@ impl WorkbenchModel {
 			bottom_visible: true,
 			dragging: None,
 			last_viewport: (0, 0),
+			viewport_h: 0.,
 			probes: ui::Probes::from_env(),
 			pending_focus: None,
 			e2e_read_delay: ui::e2e_read_delay(),
@@ -1677,6 +1236,7 @@ impl WorkbenchModel {
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
+			remote::remember_last(None);
 			model.reload_repos(cx);
 		}
 		model
@@ -1898,15 +1458,14 @@ impl WorkbenchModel {
 		slot_insert(&mut self.change_repos, &mut self.files, root, name)
 	}
 
-	/// Installs one repo's status read into its slot: checkboxes follow the
-	/// basket, rows past `MAX_CHANGES_PER_REPO` are dropped (the node says
-	/// so), and a failure leaves an error row instead of rows.
+	/// Installs one repo's status read into its slot: rows past
+	/// `MAX_CHANGES_PER_REPO` are dropped (the node says so), and a failure
+	/// leaves an error row instead of rows.
 	fn install_slot_changes(
 		&mut self,
 		slot: usize,
 		result: Result<(Vec<WorkingChangeTuple>, usize), String>,
 	) {
-		let root = self.change_repos[slot].root.clone();
 		let (changes, total) = match result {
 			Ok(pair) => pair,
 			Err(err) => {
@@ -1917,41 +1476,17 @@ impl WorkbenchModel {
 				return;
 			}
 		};
-		let canonical = if self.remote.session.is_some() {
-			None
-		} else {
-			self.repos
-				.iter()
-				.find(|r| r.root == root)
-				.and_then(|r| admitted_selection_root(r, &self.basket))
-				.or_else(|| CanonicalRootId::new(&root).ok())
-		};
-		let saved: HashSet<(&str, &SourceKind)> = canonical
-			.as_ref()
-			.and_then(|c| self.basket_items(c))
-			.into_iter()
-			.flatten()
-			.map(|i| (i.relative_path.as_str(), &i.source))
-			.collect();
-		// ponytail: rows past the cap are not listed, so a Git-group sync of
-		// this repo drops a basket entry for one of them; preserve unlisted
-		// entries if a real repo ever needs more than the cap.
 		let rows: Vec<FileChangeItem> = changes
 			.into_iter()
 			.take(MAX_CHANGES_PER_REPO)
-			.map(|(path, change_type, source, is_conflict)| {
-				let selected = saved.contains(&(path.as_str(), &source));
-				FileChangeItem {
-					path,
-					change_type,
-					source,
-					is_conflict,
-					selected,
-					repo: slot as u32,
-				}
+			.map(|(path, change_type, source, is_conflict)| FileChangeItem {
+				path,
+				change_type,
+				source,
+				is_conflict,
+				repo: slot as u32,
 			})
 			.collect();
-		drop(saved);
 		slot_replace_rows(&mut self.files, slot, rows);
 		let s = &mut self.change_repos[slot];
 		s.state = ChangeRepoState::Loaded;
@@ -2146,7 +1681,13 @@ impl WorkbenchModel {
 	}
 
 	pub fn current_restore_destination(&self) -> PathBuf {
-		if let Some(ref d) = self.restore_dir {
+		// A remote workspace pastes into its own folders only.
+		let remote_root = self.remote.session.as_ref().map(|s| &s.root);
+		let restore_dir = self
+			.restore_dir
+			.as_ref()
+			.filter(|d| remote_root.is_none_or(|root| d.starts_with(root)));
+		if let Some(d) = restore_dir {
 			d.clone()
 		} else if let Some(root) = self.repo_root() {
 			root
@@ -2226,101 +1767,11 @@ impl WorkbenchModel {
 		self.preview.is_some() && self.preview_error.is_none()
 	}
 
-	pub fn deselect_all_files(&mut self, cx: &mut Context<Self>) {
-		let mut candidate = self.selection_candidate();
-		for file in &mut candidate.files {
-			if self.change_slot_loaded(file.repo) {
-				file.selected = false;
-			}
-		}
-		candidate.paths = Vec::new();
-		candidate.ws_paths = Vec::new();
-		candidate.replace_file_group = true;
-		candidate.replace_git_group = true;
-		candidate.remove_only = true;
-		candidate.status = Some(Msg::new("status_deselected_all", []));
-		if self.install_selection_candidate(candidate) {
-			self.log_basket();
-			app_log!("[APP:FILES_DESELECTED]");
-		}
-		cx.notify();
-	}
-
-	pub fn select_all_files(&mut self, cx: &mut Context<Self>) {
-		if self.remote_blocks() {
-			cx.notify();
-			return;
-		}
-		let mut candidate = self.selection_candidate();
-		for file in &mut candidate.files {
-			if self.change_slot_loaded(file.repo) {
-				file.selected = file.is_valid_utf8();
-			}
-		}
-		if let Some(tree) = &self.file_tree {
-			candidate.paths = tree.selection_for_all(true);
-		}
-		if let Some(tree) = &self.ws_tree {
-			candidate.ws_paths = tree.selection_for_all(true);
-		}
-		candidate.replace_file_group = true;
-		candidate.replace_git_group = true;
-		candidate.status = Some(Msg::new("status_selected_all", []));
-		if self.install_selection_candidate(candidate) {
-			self.log_basket();
-			app_log!("[APP:FILES_SELECTED_ALL]");
-		}
-		cx.notify();
-	}
-
 	/// A slot whose status read has landed; a loading one's rows are inert.
 	pub fn change_slot_loaded(&self, slot: u32) -> bool {
 		self.change_repos
 			.get(slot as usize)
 			.is_some_and(|s| s.state == ChangeRepoState::Loaded)
-	}
-
-	pub fn toggle_file(&mut self, idx: usize, cx: &mut Context<Self>) {
-		if self.remote_blocks() {
-			cx.notify();
-			return;
-		}
-		if self
-			.files
-			.get(idx)
-			.is_some_and(|f| !self.change_slot_loaded(f.repo))
-		{
-			return;
-		}
-		if self.files.get(idx).is_some_and(|f| !f.is_valid_utf8()) {
-			self.set_status("change_not_utf8", []);
-			app_log!("[APP:FILE_TOGGLE_REFUSED: not_utf8]");
-			cx.notify();
-			return;
-		}
-		let mut candidate = self.selection_candidate();
-		let Some(file) = candidate.files.get_mut(idx) else {
-			return;
-		};
-		file.selected = !file.selected;
-		let (path, selected) = (file.path.clone(), file.selected);
-		candidate.replace_git_group = true;
-		candidate.remove_only = !selected;
-		candidate.status = Some(if selected {
-			Msg::new("status_toggled_file", [path.clone()])
-		} else {
-			Msg::new("status_selection_removed", [])
-		});
-		if self.install_selection_candidate(candidate) {
-			self.log_basket();
-			app_log!(
-				"[APP:FILE_TOGGLED: {}: {}: selected={}]",
-				idx,
-				path,
-				selected
-			);
-		}
-		cx.notify();
 	}
 
 	pub fn toggle_locale(&mut self, cx: &mut Context<Self>) {
@@ -2342,7 +1793,6 @@ impl WorkbenchModel {
 		] {
 			input.update(cx, |i, _| i.set_placeholder(i18n::t(key, loc)));
 		}
-		self.refresh_basket_view();
 		app_log!("[APP:LOCALE: {:?}]", self.locale);
 		cx.notify();
 	}
@@ -2689,7 +2139,7 @@ impl WorkbenchModel {
 		self.release_repo_state();
 		self.ws_tree = None;
 		self.ws_home = None;
-		release_vec(&mut self.basket);
+		release_vec(&mut self.tree_selections);
 		release_vec(&mut self.files);
 		release_vec(&mut self.change_repos);
 		self.last_changes_empty.set(None);
@@ -2700,7 +2150,6 @@ impl WorkbenchModel {
 		self.changes_queue.clear_pending();
 		self.preview_root = None;
 		self.preview_error_root = None;
-		self.basket_view = (String::new(), None);
 		self.paste.invalidate_job();
 		if !self.paste_busy() {
 			self.paste.clear(self.preview.as_ref());
@@ -2857,6 +2306,7 @@ impl WorkbenchModel {
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
 		recent::remember(&mut self.recent_workspaces, &path);
+		remote::remember_last(None);
 		self.workspace_open = true;
 		self.workspace_menu = false;
 		self.workspace_picker = false;
@@ -2990,7 +2440,8 @@ impl WorkbenchModel {
 		// the open one, whose summary alone would otherwise update.
 		self.refresh_reload = self.file_tree.is_some();
 		// Rebuilt when the walk ends, so a Refresh re-reads plain folders;
-		// its checks come back from the basket, its open folders from here.
+		// its selection and open folders come back from here.
+		self.keep_tree_selections();
 		if let Some(tree) = self.ws_tree.take() {
 			self.restore_ws_expanded.clear();
 			tree.collect_expanded_paths(&mut self.restore_ws_expanded);
@@ -3216,7 +2667,6 @@ impl WorkbenchModel {
 		Self::disambiguate_repo_names(&mut self.repos, &self.workspace_root);
 		self.repos
 			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
-		self.refresh_basket_view();
 	}
 
 	fn push_discovery_error(&mut self, item: (PathBuf, String)) {
@@ -3285,16 +2735,8 @@ impl WorkbenchModel {
 	) -> Option<String> {
 		let pos = self.repos.iter().position(|e| repo_key_matches(e, key))?;
 		let gone = self.repos.remove(pos);
-		// Its selections can no longer be read, and one unreadable root
-		// would make every later Copy fail.
-		let dropped = admitted_selection_root(&gone, &self.basket);
-		if let Some(root) = &dropped {
-			self.basket.retain(|(have, _)| have != root);
-		}
-		self.refresh_basket_view();
-		if dropped.is_some() {
-			self.log_basket();
-		}
+		// Its kept selection names files that can no longer be read.
+		self.tree_selections.retain(|(root, _)| root != &gone.root);
 		if self.pinned_repo.as_ref() == Some(key) {
 			self.pinned_repo = None;
 			self.selected_repo_idx = None;
@@ -3424,7 +2866,6 @@ impl WorkbenchModel {
 		Self::disambiguate_repo_names(&mut self.repos, &self.workspace_root);
 		self.repos
 			.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root)));
-		self.refresh_basket_view();
 		if let Some(pos) = self
 			.repos
 			.iter()
@@ -3510,10 +2951,6 @@ impl WorkbenchModel {
 				return;
 			}
 			TreeCommand::ToggleSelect(key) => {
-				if self.remote_blocks() {
-					cx.notify();
-					return;
-				}
 				let Some(paths) = self
 					.file_tree
 					.as_ref()
@@ -3521,22 +2958,11 @@ impl WorkbenchModel {
 				else {
 					return;
 				};
-				let mut candidate = self.selection_candidate();
-				candidate.remove_only = paths
-					.iter()
-					.all(|path| candidate.paths.binary_search(path).is_ok());
-				candidate.paths = paths;
-				candidate.replace_file_group = true;
-				if candidate.remove_only {
-					candidate.status =
-						Some(Msg::new("status_selection_removed", []));
+				if let Some(rel) = key.utf8_rel() {
+					app_log!("[APP:TREE_TOGGLED: {}]", rel);
 				}
-				if self.install_selection_candidate(candidate) {
-					if let Some(rel) = key.utf8_rel() {
-						app_log!("[APP:TREE_TOGGLED: {}]", rel);
-					}
-					self.log_basket();
-				}
+				self.install_tree_selection(false, paths);
+				self.log_tree_selection();
 				cx.notify();
 				return;
 			}
@@ -3555,13 +2981,7 @@ impl WorkbenchModel {
 				self.select_file_with_source(&rel, SourceKind::File, cx);
 				app_log!("[APP:TREE_FILE_SELECTED: {}]", rel);
 			}
-			Some(TreeEffect::Idle) => {
-				if !self.remember_tree_selection() {
-					cx.notify();
-					return;
-				}
-				cx.notify();
-			}
+			Some(TreeEffect::Idle) => cx.notify(),
 			None => {}
 		}
 	}
@@ -3669,10 +3089,6 @@ impl WorkbenchModel {
 			self.apply_ws_tree_result(result);
 			return;
 		}
-		let previous_selection = self
-			.file_tree
-			.as_ref()
-			.map(|tree| tree.selected_paths().to_vec());
 		let Some(tree) = self.file_tree.as_mut() else {
 			return;
 		};
@@ -3682,16 +3098,6 @@ impl WorkbenchModel {
 		let Some(applied) = tree.apply_io_result(result) else {
 			return;
 		};
-		if !self.remember_tree_selection() {
-			// Incoming page/cache admission is stage4; even before that lands,
-			// a refused inherited selection cannot change the existing basket or checks.
-			if let (Some(tree), Some(paths)) =
-				(&mut self.file_tree, previous_selection)
-			{
-				tree.install_selection(paths);
-			}
-			return;
-		}
 		if applied.kind == crate::tree::TreeIoKind::Expand
 			&& !applied.rel.is_empty()
 		{
@@ -3711,16 +3117,9 @@ impl WorkbenchModel {
 		let Some(tree) = self.ws_tree.as_mut() else {
 			return;
 		};
-		let previous = tree.selected_paths().to_vec();
 		let Some(applied) = tree.apply_io_result(result) else {
 			return;
 		};
-		if !self.remember_tree_selection() {
-			if let Some(tree) = &mut self.ws_tree {
-				tree.install_selection(previous);
-			}
-			return;
-		}
 		app_log!(
 			"[APP:WS_TREE_PAGE: rel={} kind={:?} children={} has_more={} selected={}]",
 			applied.rel,
@@ -3784,7 +3183,7 @@ impl WorkbenchModel {
 		{
 			return;
 		}
-		let saved = self.file_paths_in_basket(&root);
+		let saved = self.kept_tree_selection(&root);
 		let mut tree = FileTreeNode::unloaded_root(&root);
 		tree.apply_selection(&saved);
 		self.ws_tree = Some(tree);
@@ -3824,10 +3223,6 @@ impl WorkbenchModel {
 			return;
 		};
 		if let TreeCommand::ToggleSelect(key) = &cmd {
-			if self.remote_blocks() {
-				cx.notify();
-				return;
-			}
 			let Some(paths) = self
 				.ws_tree
 				.as_ref()
@@ -3835,22 +3230,11 @@ impl WorkbenchModel {
 			else {
 				return;
 			};
-			let mut candidate = self.selection_candidate();
-			candidate.remove_only = paths
-				.iter()
-				.all(|path| candidate.ws_paths.binary_search(path).is_ok());
-			candidate.ws_paths = paths;
-			candidate.replace_file_group = true;
-			if candidate.remove_only {
-				candidate.status =
-					Some(Msg::new("status_selection_removed", []));
+			if let Some(rel) = key.utf8_rel() {
+				app_log!("[APP:WS_TREE_TOGGLED: {}]", rel);
 			}
-			if self.install_selection_candidate(candidate) {
-				if let Some(rel) = key.utf8_rel() {
-					app_log!("[APP:WS_TREE_TOGGLED: {}]", rel);
-				}
-				self.log_basket();
-			}
+			self.install_tree_selection(true, paths);
+			self.log_tree_selection();
 			cx.notify();
 			return;
 		}
@@ -3861,24 +3245,21 @@ impl WorkbenchModel {
 				app_log!("[APP:WS_FILE_SELECTED: {}]", rel);
 				self.select_file_in(Some(root), &rel, SourceKind::File, cx);
 			}
-			Some(TreeEffect::Idle) => {
-				self.remember_tree_selection();
-				cx.notify();
-			}
+			Some(TreeEffect::Idle) => cx.notify(),
 			None => {}
 		}
 	}
 
-	/// The Project view's selection is the basket's File items, across
-	/// every root: selecting rows alone (click, range, right-click) drops
-	/// every other File item, never the Changes checks or Log picks.
+	/// The Project view's selection spans both trees and the selections
+	/// kept for trees not shown: selecting rows alone (click, range,
+	/// right-click) drops all of them.
 	pub fn select_tree_rows_alone(
 		&mut self,
 		ws: bool,
 		rels: &[String],
 		cx: &mut Context<Self>,
 	) {
-		if !self.accepting_work() || self.remote.session.is_some() {
+		if !self.accepting_work() {
 			return;
 		}
 		let tree = if ws { &self.ws_tree } else { &self.file_tree };
@@ -3891,41 +3272,12 @@ impl WorkbenchModel {
 		if paths.is_empty() {
 			return;
 		}
-		let mut candidate = self.selection_candidate();
-		for (_, items) in &mut candidate.basket {
-			items.retain(|item| item.source != SourceKind::File);
-		}
-		candidate.basket.retain(|(_, items)| !items.is_empty());
-		if ws {
-			candidate.paths = Vec::new();
-			candidate.ws_paths = paths;
-		} else {
-			candidate.paths = paths;
-			candidate.ws_paths = Vec::new();
-		}
-		candidate.replace_file_group = true;
-		if self.install_selection_candidate(candidate) {
-			app_log!("[APP:TREE_SELECTED: {}]", rels.join(","));
-			self.log_basket();
-		}
+		self.tree_selections.clear();
+		app_log!("[APP:TREE_SELECTED: {}]", rels.join(","));
+		self.install_tree_selection(!ws, Vec::new());
+		self.install_tree_selection(ws, paths);
+		self.log_tree_selection();
 		cx.notify();
-	}
-
-	/// The Project view's "Copy Files": its selection (the basket's File
-	/// items) alone, without the Changes checks or Log picks.
-	pub fn copy_project_selection(&mut self, cx: &mut Context<Self>) {
-		let items: Vec<ExportItem> = self
-			.basket
-			.iter()
-			.flat_map(|(_, items)| items.iter())
-			.filter(|item| item.source == SourceKind::File)
-			.cloned()
-			.collect();
-		let name = self
-			.repo()
-			.map(|repo| repo.name.clone())
-			.unwrap_or_else(|| "basket".into());
-		self.export_items_to_clipboard(items, name, cx);
 	}
 
 	fn next_tree_io(&mut self) -> Option<TreeIo> {
@@ -3964,10 +3316,6 @@ impl WorkbenchModel {
 			return;
 		}
 		if idx >= self.repos.len() {
-			return;
-		}
-		if !self.remember_tree_selection() {
-			cx.notify();
 			return;
 		}
 		// The log shows the workspace: a plain switch keeps it.
@@ -4050,8 +3398,7 @@ impl WorkbenchModel {
 		self.compare = None;
 		self.commit_files.clear();
 		self.changes_loaded = false;
-		// Its rows stay shown but inert until the re-read lands: their
-		// checkboxes must not replace the repo's Git group meanwhile.
+		// Its rows stay shown but inert until the re-read lands.
 		let reloading = self.repos[idx].root.clone();
 		if let Some(slot) =
 			self.change_repos.iter_mut().find(|s| s.root == reloading)
@@ -4114,7 +3461,8 @@ impl WorkbenchModel {
 			}
 		}
 
-		let saved_files = self.file_paths_in_basket(&repo_root);
+		self.keep_tree_selections();
+		let saved_files = self.kept_tree_selection(&repo_root);
 		self.tree_queue.clear();
 		self.tree_worker = self.tree_worker.wrapping_add(1);
 		self.tree_worker_alive = false;
@@ -4527,317 +3875,40 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn source_summary(source: &SourceKind) -> String {
-		match source {
-			SourceKind::Staged => "staged".to_string(),
-			SourceKind::Unstaged => "unstaged".to_string(),
-			SourceKind::Working => "untracked".to_string(),
-			SourceKind::File => "file".to_string(),
-			SourceKind::Commit { rev } => {
-				let short = &rev[..7.min(rev.len())];
-				format!("commit@{short}")
-			}
-			SourceKind::Range { base, tip } => {
-				let b = &base[..7.min(base.len())];
-				let t = &tip[..7.min(tip.len())];
-				format!("range@{b}..{t}")
+	/// Keeps both trees' selections for when their roots come back.
+	fn keep_tree_selections(&mut self) {
+		for tree in [&self.file_tree, &self.ws_tree].into_iter().flatten() {
+			let root = &tree.full_path;
+			self.tree_selections.retain(|(have, _)| have != root);
+			if !tree.selected_paths().is_empty() {
+				self.tree_selections
+					.push((root.clone(), tree.selected_paths().to_vec()));
 			}
 		}
 	}
 
-	/// Current model and queued tree storage. Background input/publication
-	/// ownership is added in the worker-admission stage before tree8 acceptance.
-	fn tree_retained_bytes(&self) -> usize {
-		let mut bytes = message_bytes(&self.status)
-			.saturating_add(repo_entries_bytes(&self.repos))
-			.saturating_add(repo_entries_bytes(&self.manual_repos))
-			.saturating_add(basket_bytes(&self.basket));
-		bytes = bytes.saturating_add(files_bytes(&self.files));
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.commit_files))
-			.saturating_add(self.commit_files.capacity().saturating_mul(
-				std::mem::size_of::<(String, Option<ChangeType>)>(),
-			));
-		for (path, _) in &self.commit_files {
-			bytes = bytes.saturating_add(path.capacity());
-		}
-		bytes = bytes
-			.saturating_add(self.commit_file_origin.capacity() * 4)
-			.saturating_add(
-				self.log_selected.capacity() * std::mem::size_of::<String>(),
-			);
-		for id in &self.log_selected {
-			bytes = bytes.saturating_add(id.capacity());
-		}
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.file_tree))
-			.saturating_add(self.file_tree.as_ref().map_or(0, |tree| {
-				tree.retained_bytes() - std::mem::size_of::<FileTreeNode>()
-			}))
-			.saturating_add(std::mem::size_of_val(&self.ws_tree))
-			.saturating_add(self.ws_tree.as_ref().map_or(0, |tree| {
-				tree.retained_bytes() - std::mem::size_of::<FileTreeNode>()
-			}));
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.rev_tree))
-			.saturating_add(self.rev_tree.as_ref().map_or(0, |tree| {
-				tree.retained_bytes() - std::mem::size_of::<RevTree>()
-			}));
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.workspace_root))
-			.saturating_add(self.workspace_root.capacity())
-			.saturating_add(std::mem::size_of_val(&self.restore_dir))
-			.saturating_add(
-				self.restore_dir.as_ref().map_or(0, PathBuf::capacity),
-			)
-			.saturating_add(std::mem::size_of_val(&self.pinned_repo));
-		if let Some((root, git_dir)) = &self.pinned_repo {
-			bytes = bytes
-				.saturating_add(root.capacity())
-				.saturating_add(git_dir.capacity());
-		}
-		for path in [&self.selected_file, &self.selected_commit_file] {
-			bytes = bytes
-				.saturating_add(std::mem::size_of_val(path))
-				.saturating_add(path.as_ref().map_or(0, String::capacity));
-		}
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.selected_file_source))
-			.saturating_add(
-				self.selected_file_source
-					.as_ref()
-					.map_or(0, source_heap_bytes),
-			);
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.selected_file_root))
-			.saturating_add(
-				self.selected_file_root.as_ref().map_or(0, |p| p.capacity()),
-			);
-		for restore in [&self.restore_expanded, &self.restore_ws_expanded] {
-			bytes = bytes
-				.saturating_add(std::mem::size_of_val(restore))
-				.saturating_add(
-					restore
-						.capacity()
-						.saturating_mul(std::mem::size_of::<String>()),
-				);
-			for path in restore {
-				bytes = bytes.saturating_add(path.capacity());
-			}
-		}
-		let dirs = &self.chrome.expanded_dirs;
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(dirs))
-			.saturating_add(dirs.capacity().saturating_mul(
-				std::mem::size_of::<(&'static str, PathBuf, String)>(),
-			));
-		for (_, root, dir) in dirs {
-			bytes = bytes
-				.saturating_add(root.capacity())
-				.saturating_add(dir.capacity());
-		}
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.discovery))
-			.saturating_add(self.discovery.as_ref().map_or(0, |discovery| {
-				discovery.retained_bytes() - std::mem::size_of::<Discovery>()
-			}));
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.discovery_errors))
-			.saturating_add(
-				self.discovery_errors
-					.capacity()
-					.saturating_mul(std::mem::size_of::<(PathBuf, String)>()),
-			);
-		for (path, error) in &self.discovery_errors {
-			bytes = bytes
-				.saturating_add(path.capacity())
-				.saturating_add(error.capacity());
-		}
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(
-				&self.discovery_depth_limited,
-			))
-			.saturating_add(
-				self.discovery_depth_limited
-					.capacity()
-					.saturating_mul(std::mem::size_of::<PathBuf>()),
-			);
-		for path in &self.discovery_depth_limited {
-			bytes = bytes.saturating_add(path.capacity());
-		}
-		bytes = bytes
-			.saturating_add(std::mem::size_of_val(&self.tree_queue))
-			.saturating_add(
-				self.tree_queue
-					.capacity()
-					.saturating_mul(std::mem::size_of::<TreeIo>()),
-			);
-		for io in &self.tree_queue {
-			bytes = bytes.saturating_add(
-				io.retained_bytes() - std::mem::size_of::<TreeIo>(),
-			);
-		}
-		bytes
+	fn kept_tree_selection(&self, root: &std::path::Path) -> Vec<String> {
+		self.tree_selections
+			.iter()
+			.find(|(have, _)| have == root)
+			.map(|(_, paths)| paths.clone())
+			.unwrap_or_default()
 	}
 
-	fn basket_items(&self, root: &CanonicalRootId) -> Option<&Vec<ExportItem>> {
-		self.basket
-			.binary_search_by(|(have, _)| have.path().cmp(root.path()))
-			.ok()
-			.map(|index| &self.basket[index].1)
+	/// Highlights exactly `paths` in the repo tree, or the workspace tree
+	/// when `ws`; callers log the result once with `log_tree_selection`.
+	fn install_tree_selection(&mut self, ws: bool, paths: Vec<String>) {
+		let tree = if ws {
+			&mut self.ws_tree
+		} else {
+			&mut self.file_tree
+		};
+		if let Some(tree) = tree {
+			tree.install_selection(paths);
+		}
 	}
 
-	fn selection_candidate(&self) -> PreparedSelection {
-		let mut candidate = PreparedSelection::new(
-			&self.files,
-			self.file_tree
-				.as_ref()
-				.map_or(&[], FileTreeNode::selected_paths),
-			&self.basket,
-		);
-		if let Some(ws) = &self.ws_tree {
-			candidate.ws_paths = ws.selected_paths().to_vec();
-		}
-		candidate
-	}
-
-	fn selection_bytes(&self) -> usize {
-		files_bytes(&self.files)
-			.saturating_add(basket_bytes(&self.basket))
-			.saturating_add(
-				self.file_tree
-					.as_ref()
-					.map_or(0, FileTreeNode::selection_bytes),
-			)
-			.saturating_add(
-				self.ws_tree
-					.as_ref()
-					.map_or(0, FileTreeNode::selection_bytes),
-			)
-	}
-
-	fn install_selection_candidate(
-		&mut self,
-		mut candidate: PreparedSelection,
-	) -> bool {
-		// Each loaded repo's Changes rows replace that repo's Git group; an
-		// unloaded or failed list has no checkboxes to replace it with, and
-		// doing so would silently drop the repo's selections. The Project
-		// tree's File group belongs to the open repo.
-		if candidate.replace_file_group || candidate.replace_git_group {
-			let open = self.repo_root();
-			let mut jobs: Vec<(PathBuf, bool, Option<u32>)> = Vec::new();
-			if candidate.replace_git_group {
-				for (i, slot) in self.change_repos.iter().enumerate() {
-					if slot.state == ChangeRepoState::Loaded {
-						let file_group = candidate.replace_file_group
-							&& open.as_ref() == Some(&slot.root);
-						jobs.push((
-							slot.root.clone(),
-							file_group,
-							Some(i as u32),
-						));
-					}
-				}
-			}
-			if candidate.replace_file_group && !jobs.iter().any(|job| job.1) {
-				if let Some(root) = open {
-					jobs.push((root, true, None));
-				}
-			}
-			for (path, file_group, git_slot) in jobs {
-				let admitted =
-					self.repos.iter().find(|repo| repo.root == path).and_then(
-						|repo| admitted_selection_root(repo, &self.basket),
-					);
-				let adds = (file_group && !candidate.paths.is_empty())
-					|| git_slot.is_some_and(|slot| {
-						candidate
-							.files
-							.iter()
-							.any(|f| f.repo == slot && f.selected)
-					});
-				let root = match admitted {
-					Some(root) => root,
-					None if candidate.remove_only || !adds => continue,
-					None => match CanonicalRootId::new(&path) {
-						Ok(root) => root,
-						Err(_) => {
-							self.set_status("error_selection_root", []);
-							return false;
-						}
-					},
-				};
-				if !candidate.sync_root(root, file_group, git_slot) {
-					self.set_status("error_tree_budget", []);
-					app_log!(
-						"[APP:TREE_ADMISSION_REFUSED: selection_amplification]"
-					);
-					return false;
-				}
-			}
-		}
-		// The workspace tree's File group: files outside every repo.
-		let ws = self
-			.ws_tree
-			.as_ref()
-			.filter(|_| candidate.replace_file_group)
-			.map(|tree| tree.full_path.clone());
-		if let Some(ws) = ws {
-			let admitted = self
-				.basket
-				.iter()
-				.find(|(root, _)| root.path() == ws)
-				.map(|(root, _)| root.clone());
-			let adds = !candidate.ws_paths.is_empty();
-			let root = match admitted {
-				Some(root) => Some(root),
-				None if candidate.remove_only || !adds => None,
-				None => match CanonicalRootId::new(&ws) {
-					Ok(root) => Some(root),
-					Err(_) => {
-						self.set_status("error_selection_root", []);
-						return false;
-					}
-				},
-			};
-			if let Some(root) = root {
-				if !candidate.sync_ws_root(root) {
-					self.set_status("error_tree_budget", []);
-					app_log!(
-						"[APP:TREE_ADMISSION_REFUSED: selection_amplification]"
-					);
-					return false;
-				}
-			}
-		}
-		if !candidate.fits_replacing(
-			self.tree_retained_bytes(),
-			self.selection_bytes().saturating_add(
-				if candidate.status.is_some() {
-					message_bytes(&self.status)
-				} else {
-					0
-				},
-			),
-			MAX_RETAINED_TREE_BYTES,
-		) {
-			self.set_status("error_tree_budget", []);
-			app_log!("[APP:TREE_ADMISSION_REFUSED: selection]");
-			return false;
-		}
-		if let Some(status) = candidate.status {
-			self.status = status;
-		}
-		self.files = candidate.files;
-		self.basket = candidate.basket;
-		self.refresh_basket_view();
-		if let Some(tree) = &mut self.file_tree {
-			tree.install_selection(candidate.paths);
-		}
-		if let Some(tree) = &mut self.ws_tree {
-			tree.install_selection(candidate.ws_paths);
-		}
+	fn log_tree_selection(&self) {
 		if e2e_on() {
 			// The highlighted Project rows, exactly.
 			let rows = |tree: &Option<FileTreeNode>| {
@@ -4850,319 +3921,44 @@ impl WorkbenchModel {
 				rows(&self.ws_tree)
 			);
 		}
-		// Callers emit their established action/basket event order only after
-		// this complete intent has been admitted and installed.
-		true
 	}
 
-	pub fn is_rev_file_selected(&self, sha: &str, path: &str) -> bool {
-		let Some(repo) = self.repo() else {
-			return false;
-		};
-		let Some(root) = admitted_selection_root(repo, &self.basket) else {
-			return false;
-		};
-		let Some(items) = self.basket_items(&root) else {
-			return false;
-		};
-		items.iter().any(|item| {
-			item.relative_path == path
-				&& matches!(&item.source, SourceKind::Commit { rev } if rev == sha)
-		})
-	}
-
-	pub fn toggle_rev_file_selection(
+	/// The Copy of a node: its targets as one snip-sync payload.
+	pub fn copy_targets(
 		&mut self,
-		sha: &str,
-		path: &str,
+		targets: Vec<menu::CopyTarget>,
 		cx: &mut Context<Self>,
 	) {
-		if self.remote_blocks() {
-			cx.notify();
-			return;
+		let name = targets
+			.first()
+			.map(|target| self.log_repo_name(&target.root))
+			.unwrap_or_default();
+		if let Some(session) = self.remote.session.clone() {
+			return self.copy_remote_targets(session, targets, name, cx);
 		}
-		let Some(repo) = self.repo() else {
-			return;
-		};
-		let Some(root) = admitted_selection_root(repo, &self.basket)
-			.or_else(|| CanonicalRootId::new(&repo.root).ok())
-		else {
-			self.set_status("error_selection_root", []);
-			cx.notify();
-			return;
-		};
-		let mut candidate = self.selection_candidate();
-		let selected = candidate.toggle_revision(root, sha, path);
-		candidate.remove_only = !selected;
-		if !selected {
-			candidate.status = Some(Msg::new("status_selection_removed", []));
-		}
-		if self.install_selection_candidate(candidate) {
-			app_log!(
-				"[APP:REV_FILE_TOGGLED: sha={} path={} selected={}]",
-				&sha[..7.min(sha.len())],
-				path,
-				selected
-			);
-			self.log_basket();
-		}
-		cx.notify();
-	}
-
-	fn log_basket(&self) {
-		app_log!(
-			"[APP:BASKET: n={} summary={}]",
-			self.basket_count(),
-			self.basket_summary()
-		);
-		if let Some(collision) = &self.basket_view.1 {
-			app_log!("[APP:BASKET_COLLISION: {}]", collision);
-		}
-	}
-
-	pub fn basket_count(&self) -> usize {
-		self.basket.iter().map(|(_, items)| items.len()).sum()
-	}
-
-	fn basket_summary_with<F>(&self, format_source: F) -> String
-	where
-		F: Fn(&SourceKind) -> String,
-	{
-		let mut out = String::new();
-		for (root, items) in &self.basket {
-			let name = self
-				.repos
-				.iter()
-				.find(|repo| {
-					CanonicalRootId::new(&repo.root).ok().as_ref() == Some(root)
+		let items: Option<Vec<ExportItem>> = targets
+			.into_iter()
+			.map(|target| {
+				Some(ExportItem {
+					root: CanonicalRootId::new(&target.root).ok()?,
+					relative_path: target.path,
+					source: target.source,
+					change_type: target.change_type,
+					gitlink: false,
 				})
-				.map(|repo| repo.name.clone())
-				.unwrap_or_else(|| root.path().display().to_string());
-			let mut ordered: Vec<_> = items.iter().collect();
-			ordered.sort_by(|a, b| {
-				(&a.relative_path, source_order(&a.source))
-					.cmp(&(&b.relative_path, source_order(&b.source)))
-			});
-			for item in ordered {
-				if !out.is_empty() && !append_basket_display(&mut out, "; ") {
-					return out;
-				}
-				for part in [
-					&name,
-					" ",
-					&format_source(&item.source),
-					" ",
-					&item.relative_path,
-				] {
-					if !append_basket_display(&mut out, part) {
-						return out;
-					}
-				}
-			}
-		}
-		out
-	}
-
-	pub fn basket_summary(&self) -> String {
-		self.basket_summary_with(Self::source_summary)
-	}
-
-	pub fn basket_summary_localized(&self, loc: Locale) -> String {
-		self.basket_summary_with(|source| match source {
-			SourceKind::File => i18n::t("src_working_file", loc).to_string(),
-			SourceKind::Working => i18n::t("tag_untracked", loc).to_string(),
-			SourceKind::Unstaged => i18n::t("tag_unstaged", loc).to_string(),
-			SourceKind::Staged => i18n::t("tag_staged", loc).to_string(),
-			SourceKind::Commit { rev } => {
-				let short = &rev[..7.min(rev.len())];
-				let tmpl = i18n::t("src_commit_short", loc);
-				if tmpl.contains("{}") {
-					tmpl.replace("{}", short)
-				} else {
-					format!("commit@{short}")
-				}
-			}
-			SourceKind::Range { base, tip } => {
-				let b = &base[..7.min(base.len())];
-				let t = &tip[..7.min(tip.len())];
-				format!("range@{b}..{t}")
-			}
-		})
-	}
-
-	pub(crate) fn refresh_basket_view(&mut self) {
-		self.basket_view = (
-			self.basket_summary_localized(self.locale),
-			self.basket_collision_text(),
-		);
-	}
-
-	/// Two selections of one path cannot share a wire header. File rows count;
-	/// a matching basename is not a reason to drop one of them.
-	pub fn basket_collision_text(&self) -> Option<String> {
-		let mut out = String::new();
-		for (root, items) in &self.basket {
-			let mut paths: Vec<_> = without_worktree_twins(items)
-				.into_iter()
-				.map(|item| item.relative_path.as_str())
-				.collect();
-			paths.sort_unstable();
-			let mut previous_hit = None;
-			for pair in paths.windows(2) {
-				if pair[0] != pair[1] || previous_hit == Some(pair[0]) {
-					continue;
-				}
-				previous_hit = Some(pair[0]);
-				if !out.is_empty() && !append_basket_display(&mut out, ", ") {
-					return Some(out);
-				}
-				for part in
-					[root.path().to_string_lossy().as_ref(), ":", pair[0]]
-				{
-					if !append_basket_display(&mut out, part) {
-						return Some(out);
-					}
-				}
-			}
-		}
-		(!out.is_empty()).then_some(out)
-	}
-
-	fn file_paths_in_basket(&self, root: &std::path::Path) -> Vec<String> {
-		let id = self
-			.repos
-			.iter()
-			.find(|repo| repo.root == root)
-			.and_then(|repo| admitted_selection_root(repo, &self.basket))
-			.or_else(|| {
-				self.basket
-					.iter()
-					.find(|(id, _)| id.path() == root)
-					.map(|(id, _)| id.clone())
-			});
-		let Some(id) = id else {
-			return Vec::new();
-		};
-		self.basket_items(&id)
-			.map(|items| {
-				items
-					.iter()
-					.filter(|item| matches!(item.source, SourceKind::File))
-					.map(|item| item.relative_path.clone())
-					.collect()
 			})
-			.unwrap_or_default()
-	}
-
-	/// Synchronization also goes through whole-selection admission; callers
-	/// must not publish Copy or success after a refusal.
-	pub fn remember_tree_selection(&mut self) -> bool {
-		let mut candidate = self.selection_candidate();
-		candidate.replace_file_group = true;
-		let accepted = self.install_selection_candidate(candidate);
-		if accepted {
-			self.log_basket();
-		}
-		accepted
-	}
-
-	pub fn reapply_tree_selection(&mut self) -> bool {
-		let Some(root) = self.repo_root() else {
-			return true;
-		};
-		let mut candidate = self.selection_candidate();
-		candidate.paths = self.file_paths_in_basket(&root);
-		self.install_selection_candidate(candidate)
-	}
-
-	pub fn sync_git_selection_to_basket(&mut self) -> bool {
-		let mut candidate = self.selection_candidate();
-		candidate.replace_git_group = true;
-		let accepted = self.install_selection_candidate(candidate);
-		if accepted {
-			self.log_basket();
-		}
-		accepted
-	}
-
-	pub fn clear_basket(&mut self, cx: &mut Context<Self>) {
-		self.basket = Vec::new();
-		self.refresh_basket_view();
-		for file in &mut self.files {
-			file.selected = false;
-		}
-		if let Some(tree) = &mut self.file_tree {
-			tree.install_selection(Vec::new());
-		}
-		if let Some(tree) = &mut self.ws_tree {
-			tree.install_selection(Vec::new());
-		}
-		self.log_basket();
-		app_log!("[APP:BASKET_CLEARED]");
-		self.set_status("basket_cleared", []);
-		cx.notify();
-	}
-
-	pub fn sync_current_selection_to_basket(&mut self) -> bool {
-		match self.active_tab {
-			WorkbenchTab::FileExplorer => self.remember_tree_selection(),
-			WorkbenchTab::GitChanges => self.sync_git_selection_to_basket(),
-		}
-	}
-
-	pub fn copy_selection_to_clipboard(&mut self, cx: &mut Context<Self>) {
-		if !self.accepting_work() {
-			return;
-		}
-		if self.remote_blocks() {
-			cx.notify();
-			return;
-		}
-		if self.is_copying {
-			app_log!("[APP:COPY_BUSY]");
-			return;
-		}
-		// Change-list checkboxes already update the basket as they toggle;
-		// only the project tree's selection is synced lazily.
-		let mut candidate = self.selection_candidate();
-		candidate.replace_file_group = true;
-		if !self.install_selection_candidate(candidate) {
-			cx.notify();
-			return;
-		}
-		self.log_basket();
-		if self.basket_count() == 0
-			&& self.selected_commit.is_some()
-			&& self.selected_file.is_none()
-		{
-			app_log!("[APP:COPY_REFUSED: commit_readonly]");
-			self.set_status("btn_copy_commit_readonly", []);
-			cx.notify();
-			return;
-		}
-		if let Some(collision) = self.basket_collision_text() {
-			app_log!("[APP:COPY_REFUSED: collision]");
-			let mut candidate = self.selection_candidate();
-			candidate.status = Some(Msg::new("basket_collision", [collision]));
-			self.install_selection_candidate(candidate);
-			cx.notify();
-			return;
-		}
-		let repo_name = self
-			.repo()
-			.map(|repo| repo.name.clone())
-			.unwrap_or_else(|| "basket".into());
-		let items: Vec<ExportItem> = self
-			.basket
-			.iter()
-			.flat_map(|(_, items)| without_worktree_twins(items))
-			.cloned()
 			.collect();
-		self.export_items_to_clipboard(items, repo_name, cx);
+		match items {
+			Some(items) => self.export_items_to_clipboard(items, name, cx),
+			None => {
+				self.set_status("error_selection_root", []);
+				cx.notify();
+			}
+		}
 	}
 
 	/// Exports `items` (any roots) as one snip-sync payload to the
-	/// clipboard: the basket's Copy, and a Log file's Copy.
+	/// clipboard: every node's Copy.
 	pub fn export_items_to_clipboard(
 		&mut self,
 		items: Vec<ExportItem>,
@@ -5229,55 +4025,45 @@ impl WorkbenchModel {
 			lifecycle::JobKind::CancellableRead,
 			Some(job_token),
 			async move {
-				let result: Result<(String, usize, Msg), Msg> = bg
+					let result: Result<(String, usize, Msg), Msg> = bg
 					.spawn(async move {
 						let opts = interactive_read_opts(run_token.clone());
 						let settings = native_export_settings();
-						let expanded = expand_folder_items(
-							export_sel,
-							NATIVE_FILE_COUNT_LIMIT,
-							&run_token,
-						)
-						.map_err(|e| match e {
-							// Every file under the folders was skipped.
-							snip_core::transfer::TransferError::EmptySelection => {
-								Msg::new("status_copy_nothing_skipped", [])
-							}
-							e => Msg::new("error_payload", [e.to_string()]),
-						})?;
-						let export_sel = &expanded.sel;
-						// Document cap is the retained UI output ceiling.
-						// It is not `RunOptions::max_stdout`.
-						let plan = plan_export_with(
+						// The same engine a remote copy and the CLI run,
+						// batches doubling past what a filter excludes.
+						let report = copy_selection_detailed(
 							export_sel,
 							&settings,
-							Some(snip_core::transfer::CLIPBOARD_PAYLOAD_MAX),
+							NATIVE_FILE_COUNT_LIMIT,
 							&opts,
+							|plan| {
+								if let Some(ref hold) = export_hold {
+									if hold.exists() {
+										app_log!(
+											"[APP:EXPORT_PLAN_READY: files={}]",
+											plan.files.len()
+										);
+										while hold.exists() {
+											if run_token.is_cancelled() {
+												break;
+											}
+											std::thread::sleep(
+												std::time::Duration::from_millis(20),
+											);
+										}
+									}
+								}
+							},
 						)
 						.map_err(|e| {
-							Msg::new("error_payload", [e.to_string()])
-						})?;
-						if plan.files.is_empty() {
-							return Err(Msg::new("status_copy_nothing", []));
-						}
-						if let Some(ref hold) = export_hold {
-							if hold.exists() {
-								app_log!(
-									"[APP:EXPORT_PLAN_READY: files={}]",
-									plan.files.len()
-								);
-								while hold.exists() {
-									if run_token.is_cancelled() {
-										break;
-									}
-									std::thread::sleep(
-										std::time::Duration::from_millis(20),
-									);
-								}
-							}
-						}
-						plan.revalidate_with(&opts).map_err(|e| {
 							let reason = match &e {
+								// Every file under the folders was skipped.
+								snip_core::transfer::TransferError::EmptySelection => {
+									return Msg::new(
+										"status_copy_nothing_skipped",
+										[],
+									)
+								}
 								snip_core::transfer::TransferError::StaleSource { .. } => "stale_source",
 								_ => "revalidate",
 							};
@@ -5286,46 +4072,147 @@ impl WorkbenchModel {
 							}
 							Msg::new("error_payload", [e.to_string()])
 						})?;
-						let msg = copied_status(repo_name, &plan, &expanded);
-						Ok((plan.payload, plan.copied_file_count, msg))
+						if report.outcome.copied == 0 {
+							return Err(Msg::new("status_copy_nothing", []));
+						}
+						let msg = copied_status(repo_name, &report.outcome);
+						Ok((
+							report.outcome.payload,
+							report.outcome.copied,
+							msg,
+						))
 					})
 					.await;
 
-				match this.update(&mut async_app, |model, cx| {
-					if !model.accept_copy_result(ws_gen, &cancel) {
-						cx.notify();
-						return;
-					}
-					match result {
-						Ok((text, copied_count, msg)) => {
-							if let Err(e) = clip::write_text(&text) {
-								model.set_status(
-									"status_clipboard_failed",
-									[e.to_string()],
-								);
-							} else {
-								app_log!(
-									"[APP:COPY_DONE: copied={copied_count}]"
-								);
-								model.status = msg;
-							}
-						}
-						Err(err) => {
-							model.status = err;
-						}
-					}
-					let ok = matches!(
-						model.status.key,
-						"status_copied" | "status_copied_limit"
-					);
-					model.show_toast(ok, model.status.clone(), cx);
-					app_log!("[APP:COPY_IDLE]");
-					cx.notify();
+				if let Err(err) = this.update(&mut async_app, |model, cx| {
+					model.finish_copy(ws_gen, &cancel, result, cx)
 				}) {
-					Ok(()) => {}
-					Err(err) => {
-						app_log!("[APP:COPY_IDLE_FAILED: {err}]");
-					}
+					app_log!("[APP:COPY_IDLE_FAILED: {err}]");
+				}
+			},
+		);
+	}
+
+	/// Writes a finished file copy (local or remote) to the clipboard and
+	/// reports it.
+	fn finish_copy(
+		&mut self,
+		ws_gen: u64,
+		cancel: &CancelToken,
+		result: Result<(String, usize, Msg), Msg>,
+		cx: &mut Context<Self>,
+	) {
+		if !self.accept_copy_result(ws_gen, cancel) {
+			cx.notify();
+			return;
+		}
+		match result {
+			Ok((text, copied_count, msg)) => {
+				if let Err(e) = clip::write_text(&text) {
+					self.set_status("status_clipboard_failed", [e.to_string()]);
+				} else {
+					app_log!("[APP:COPY_DONE: copied={copied_count}]");
+					self.status = msg;
+				}
+			}
+			Err(err) => self.status = err,
+		}
+		let ok =
+			matches!(self.status.key, "status_copied" | "status_copied_limit");
+		self.show_toast(ok, self.status.clone(), cx);
+		app_log!("[APP:COPY_IDLE]");
+		cx.notify();
+	}
+
+	/// A remote workspace's Copy: the worker runs the same copy engine on
+	/// its files and sends the payload back.
+	fn copy_remote_targets(
+		&mut self,
+		session: crate::remote::RemoteSession,
+		targets: Vec<menu::CopyTarget>,
+		repo_name: String,
+		cx: &mut Context<Self>,
+	) {
+		if !self.accepting_work() {
+			return;
+		}
+		if self.is_copying {
+			app_log!("[APP:COPY_BUSY]");
+			return;
+		}
+		if targets.is_empty() {
+			app_log!("[APP:COPY_REFUSED: empty_selection]");
+			self.set_status("status_copy_empty", []);
+			cx.notify();
+			return;
+		}
+		let items: Option<Vec<snip_remote::proto::ExportTarget>> = targets
+			.into_iter()
+			.map(|target| {
+				Some(snip_remote::proto::ExportTarget {
+					root: crate::remote::remote_rel(
+						&session.root,
+						&target.root,
+					)?,
+					path: target.path,
+					source: target.source,
+					change_type: target.change_type,
+				})
+			})
+			.collect();
+		let Some(items) = items else {
+			self.set_status("error_selection_root", []);
+			cx.notify();
+			return;
+		};
+
+		self.is_copying = true;
+		self.set_status("status_copying", [repo_name.clone()]);
+		if e2e_on() {
+			app_log!("[APP:COPY_PREP: files={}]", items.len());
+		}
+		cx.notify();
+
+		let cancel = arm_cancel(&mut self.copy_cancel);
+		let job_token = cancel.clone();
+		let run_token = cancel.clone();
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+		let ws_gen = self.lifecycle.generation();
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(job_token),
+			async move {
+				let result: Result<(String, usize, Msg), Msg> = bg
+					.spawn(async move {
+						let out = session
+							.client
+							.export_files(
+								&session.workspace.id,
+								items,
+								&native_export_settings(),
+								NATIVE_FILE_COUNT_LIMIT,
+								Some(&run_token),
+							)
+							.map_err(|e| {
+								Msg::new(
+									"error_payload",
+									[crate::remote::describe(e)],
+								)
+							})?;
+						if out.copied == 0 {
+							return Err(Msg::new("status_copy_nothing", []));
+						}
+						let msg = copied_status(repo_name, &out);
+						Ok((out.payload, out.copied, msg))
+					})
+					.await;
+				if let Err(err) = this.update(&mut async_app, |model, cx| {
+					model.finish_copy(ws_gen, &cancel, result, cx)
+				}) {
+					app_log!("[APP:COPY_IDLE_FAILED: {err}]");
 				}
 			},
 		);
@@ -5334,10 +4221,6 @@ impl WorkbenchModel {
 	/// Exports the selected commit or first-parent commit range to the clipboard.
 	pub fn copy_commits_to_clipboard(&mut self, cx: &mut Context<Self>) {
 		if !self.accepting_work() {
-			return;
-		}
-		if self.remote_blocks() {
-			cx.notify();
 			return;
 		}
 		if self.is_copying {
@@ -5365,6 +4248,21 @@ impl WorkbenchModel {
 				}
 			};
 
+		// A remote repo is named by its path under the workspace.
+		let remote = match self.remote.session.clone() {
+			Some(session) => {
+				match crate::remote::remote_rel(&session.root, &repo_root) {
+					Some(repo) => Some((session, repo)),
+					None => {
+						self.set_status("error_selection_root", []);
+						cx.notify();
+						return;
+					}
+				}
+			}
+			None => None,
+		};
+
 		self.is_copying = true;
 		self.set_status("status_copying", [repo_name.clone()]);
 		if e2e_on() {
@@ -5387,6 +4285,20 @@ impl WorkbenchModel {
 			async move {
 				let result: Result<(String, usize, Msg), String> = bg
 					.spawn(async move {
+						if let Some((session, repo)) = remote {
+							let out = session
+								.client
+								.export_commits(
+									&session.workspace.id,
+									&repo,
+									&tip_sha,
+									selected,
+									Some(&run_token),
+								)
+								.map_err(crate::remote::describe)?;
+							let status = commit_copied_status(&out);
+							return Ok((out.text, out.commit_count, status));
+						}
 						let opts = interactive_read_opts(run_token);
 						let git = Git::open_with(&repo_root, &opts)
 							.map_err(|e| e.to_string())?;
@@ -5398,9 +4310,9 @@ impl WorkbenchModel {
 							snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 						)
 						.map_err(|e| e.to_string())?;
-						let n_commits = exported.payload.commits.len();
-						let status = commit_copied_status(&exported);
-						Ok((exported.text, n_commits, status))
+						let out = exported.outcome();
+						let status = commit_copied_status(&out);
+						Ok((out.text, out.commit_count, status))
 					})
 					.await;
 
@@ -5568,14 +4480,14 @@ impl WorkbenchModel {
 						"[APP:PASTE_MAP_CANDIDATE: prefix={} idx={} path={}]",
 						choice.prefix,
 						idx,
-						path.display()
+						plan.shown(path)
 					);
 				}
 			}
 			app_log!(
 				"[APP:PASTE_PREVIEW: items={} dest={} mapping={}]",
 				items_count,
-				plan.destination.display(),
+				plan.shown(&plan.destination),
 				plan.mapping_ready()
 			);
 		}
@@ -5595,10 +4507,6 @@ impl WorkbenchModel {
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
 		if self.refuse_while_applying("preview", cx) {
-			return;
-		}
-		if self.remote_blocks() {
-			cx.notify();
 			return;
 		}
 		if !self.workspace_open {
@@ -5649,6 +4557,11 @@ impl WorkbenchModel {
 				dest: target_dest,
 				roots: known_roots,
 				generation: self.generation,
+				remote: self
+					.remote
+					.session
+					.clone()
+					.map(|session| paste::RemotePaste { session }),
 			},
 			cx,
 		);
@@ -6000,13 +4913,13 @@ impl WorkbenchModel {
 /// Where `prefix` lands, as printed in `[APP:PASTE_MAPPED]`.
 fn prefix_target(plan: &PastePreviewPlan, prefix: &str, keep: bool) -> String {
 	if keep {
-		return plan.destination.display().to_string();
+		return plan.shown(&plan.destination);
 	}
 	plan.prefix_choices
 		.iter()
 		.find(|choice| choice.prefix == prefix)
 		.and_then(|choice| choice.destination.as_ref())
-		.map(|dest| dest.display().to_string())
+		.map(|dest| plan.shown(dest))
 		.unwrap_or_default()
 }
 
@@ -6030,23 +4943,6 @@ fn repo_key(entry: &RepoEntry) -> (PathBuf, PathBuf) {
 		(id.toplevel.clone(), id.git_dir.clone())
 	} else {
 		(entry.root.clone(), PathBuf::new())
-	}
-}
-
-/// Orders like `WorkbenchModel::source_summary` text without allocating: no
-/// tag is a prefix of another, so comparing (tag, rev) equals comparing tag+rev.
-fn source_order(source: &SourceKind) -> (&'static str, &str) {
-	match source {
-		SourceKind::Staged => ("staged", ""),
-		SourceKind::Unstaged => ("unstaged", ""),
-		SourceKind::Working => ("untracked", ""),
-		SourceKind::File => ("file", ""),
-		SourceKind::Commit { rev } => {
-			("commit@", rev.get(..7).unwrap_or(rev.as_str()))
-		}
-		SourceKind::Range { tip, .. } => {
-			("range@", tip.get(..7).unwrap_or(tip.as_str()))
-		}
 	}
 }
 
@@ -6228,19 +5124,66 @@ fn read_preview(
 	}
 }
 
-/// `--workspace`, else the last remembered workspace (IntelliJ reopens the
-/// last project), else the launch folder. A Finder or Explorer launch starts
-/// in `/` or the home folder: that opens nothing rather than scanning it.
-fn startup_workspace(arg: Option<PathBuf>) -> Option<PathBuf> {
+/// What the app opens when it starts.
+#[derive(Debug, PartialEq, Eq)]
+enum Startup {
+	Local(PathBuf),
+	/// Reconnected in the background once the window is up.
+	Remote(remote::RecentRemote),
+	Nothing,
+}
+
+impl Startup {
+	fn local(self) -> Option<PathBuf> {
+		match self {
+			Startup::Local(path) => Some(path),
+			_ => None,
+		}
+	}
+}
+
+/// `--workspace`, else the last workspace open when it was remote, else the
+/// last remembered local one (IntelliJ reopens the last project), else the
+/// launch folder. A Finder or Explorer launch starts in `/` or the home
+/// folder: that opens nothing rather than scanning it.
+fn startup_choice(
+	arg: Option<PathBuf>,
+	last_remote: Option<remote::RecentRemote>,
+	last_local: Option<PathBuf>,
+	cwd: Option<PathBuf>,
+	home: Option<PathBuf>,
+) -> Startup {
+	if let Some(arg) = arg {
+		return Startup::Local(arg);
+	}
+	if let Some(last) = last_remote {
+		return Startup::Remote(last);
+	}
+	if let Some(last) = last_local {
+		return Startup::Local(last);
+	}
+	match cwd {
+		Some(cwd) if cwd.parent().is_some() && Some(&cwd) != home.as_ref() => {
+			Startup::Local(cwd)
+		}
+		_ => Startup::Nothing,
+	}
+}
+
+/// [`startup_choice`] on the remembered workspaces; nothing is read under
+/// `cfg(test)` or in an e2e run without `SNIP_CONFIG_DIR`. Only a normal
+/// launch (`allow_remote`) reconnects to a remote workspace.
+fn startup_workspace(arg: Option<PathBuf>, allow_remote: bool) -> Startup {
 	if arg.is_some() {
-		return arg;
+		return startup_choice(arg, None, None, None, None);
 	}
-	if let Some(last) = recent::load().into_iter().next() {
-		return Some(last);
-	}
-	let cwd = std::env::current_dir().ok()?;
-	(cwd.parent().is_some() && Some(&cwd) != recent::home().as_ref())
-		.then_some(cwd)
+	startup_choice(
+		None,
+		remote::load_last().filter(|_| allow_remote),
+		recent::load().into_iter().next(),
+		std::env::current_dir().ok(),
+		recent::home(),
+	)
 }
 
 type CliArgs = (Option<PathBuf>, String, Option<PathBuf>);
@@ -6341,8 +5284,6 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("cmd-v", PastePreview, None),
 		KeyBinding::new("ctrl-r", Refresh, None),
 		KeyBinding::new("cmd-r", Refresh, None),
-		KeyBinding::new("alt-d", DeselectAllFiles, None),
-		KeyBinding::new("alt-s", SelectAllFiles, None),
 		KeyBinding::new("tab", FocusNext, None),
 		KeyBinding::new("shift-tab", FocusPrev, None),
 		KeyBinding::new("ctrl-tab", FocusNext, None),
@@ -6424,7 +5365,11 @@ fn key_bindings() -> Vec<KeyBinding> {
 
 fn main() {
 	let (workspace, mode, restore_dir) = parse_cli_args();
-	let workspace = startup_workspace(workspace);
+	let (workspace, reconnect) =
+		match startup_workspace(workspace, mode == "normal") {
+			Startup::Remote(last) => (None, Some(last)),
+			other => (other.local(), None),
+		};
 	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
@@ -6433,6 +5378,7 @@ fn main() {
 
 		let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
 		let ws = workspace.clone();
+		let last_remote = reconnect.clone();
 		let app_mode = mode.clone();
 		let paste_dir = restore_dir.clone();
 
@@ -6461,6 +5407,9 @@ fn main() {
 				}
 				let model = cx
 					.new(|cx| WorkbenchModel::new(ws, paste_dir, app_mode, cx));
+				if let Some(last) = last_remote {
+					model.update(cx, |m, cx| m.reopen_last_remote(last, cx));
+				}
 				let fh = model.read(cx).focus_handle.clone();
 				window.focus(&fh);
 				let close_target = model.clone();
@@ -6482,6 +5431,48 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+	/// `--workspace` wins; then the last workspace open when it was remote;
+	/// then the last local one; then a launch folder other than `/` or home.
+	#[test]
+	fn startup_reconnects_the_last_remote_workspace_unless_told_otherwise() {
+		use super::{startup_choice, startup_workspace, Startup};
+		use crate::remote::RecentRemote;
+		use std::path::PathBuf;
+		let last = || {
+			Some(RecentRemote {
+				host: "macmini".into(),
+				path: "/Users/x/ck/cat".into(),
+			})
+		};
+		let p = |s: &str| Some(PathBuf::from(s));
+		assert_eq!(
+			startup_choice(p("/arg"), last(), p("/local"), p("/cwd"), None),
+			Startup::Local(PathBuf::from("/arg"))
+		);
+		assert_eq!(
+			startup_choice(None, last(), p("/local"), p("/cwd"), None),
+			Startup::Remote(last().unwrap())
+		);
+		assert_eq!(
+			startup_choice(None, None, p("/local"), p("/cwd"), None),
+			Startup::Local(PathBuf::from("/local"))
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/home/u/w"), p("/home/u")),
+			Startup::Local(PathBuf::from("/home/u/w"))
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/home/u"), p("/home/u")),
+			Startup::Nothing
+		);
+		assert_eq!(
+			startup_choice(None, None, None, p("/"), None),
+			Startup::Nothing
+		);
+		// Nothing remembered is read under cfg(test).
+		assert!(!matches!(startup_workspace(None, true), Startup::Remote(_)));
+	}
+
 	/// UI state driven in-process: no display, so these also run in the
 	/// Windows and macOS Test jobs, which have no real-app GUI test.
 	mod in_process {
@@ -6575,6 +5566,94 @@ mod tests {
 			REMOTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 		}
 
+		/// A remote open goes through the shared close drain, which also
+		/// waits for every git process in this test binary (GitLoad is
+		/// process wide), so under parallel tests it may not end on its own
+		/// here. Polled as if git were idle, the intent it queued lands.
+		fn land_remote_open(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			model.update(cx, |m, cx| {
+				assert!(!m.workspace_menu, "{:?}", m.remote.message);
+				if m.remote.session.is_none() {
+					assert_eq!(
+						m.lifecycle.intent_name(),
+						"open-remote-workspace"
+					);
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now(),
+						crate::lifecycle::GitLoad::idle(),
+					);
+					let crate::lifecycle::Step::Ready(
+						crate::lifecycle::Intent::OpenRemoteWorkspace(target),
+					) = step
+					else {
+						panic!("drain not ready: {step:?}");
+					};
+					// finish_intent would check the real GitLoad again.
+					let (host, ws) = *target;
+					m.finish_open_remote(host, ws, cx);
+				}
+			});
+		}
+
+		/// A window with no workspace and an in-process worker as the only
+		/// ssh host, its menu open.
+		fn remote_menu(
+			cx: &mut TestAppContext,
+		) -> (Entity<WorkbenchModel>, &mut VisualTestContext) {
+			let worker = std::sync::Arc::new(snip_remote::Worker::new(
+				snip_remote::WorkerOptions::default(),
+			));
+			let host = snip_remote::RemoteHost::in_process(worker);
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(None, None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			model.update(cx, |m, _| {
+				m.workspace_menu = true;
+				m.remote.hosts = vec![host];
+				m.remote.recent.clear();
+			});
+			(model, cx)
+		}
+
+		/// Clicks the row of subfolder `name` in the host's block.
+		fn click_remote_folder(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			name: &str,
+		) {
+			let ix = model.read_with(cx, |m, _| {
+				let b = m.remote.browse.as_ref().expect("a host browsed");
+				let Some(Ok(listing)) = &b.listing else {
+					panic!("not listed: {b:?}");
+				};
+				listing.folders.iter().position(|f| f == name).unwrap()
+			});
+			let id = format!("remote-folder:{ix}");
+			click(cx, Box::leak(id.into_boxed_str()));
+		}
+
+		/// The folder shown in the host's block, and its subfolders.
+		fn shown_folder(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> (String, Vec<String>) {
+			model.read_with(cx, |m, _| {
+				let b = m.remote.browse.as_ref().expect("a host browsed");
+				let Some(Ok(listing)) = &b.listing else {
+					panic!("not listed: {b:?}");
+				};
+				assert_eq!(b.path, listing.path);
+				let mut folders = listing.folders.clone();
+				folders.sort();
+				(listing.path.clone(), folders)
+			})
+		}
+
 		/// Lists an in-process worker as the only ssh host, opens `shared`
 		/// on it as the workspace, and awaits background tree and status
 		/// reads.
@@ -6604,33 +5683,7 @@ mod tests {
 				m.open_remote_path(0, path, cx);
 			});
 			settle(cx);
-
-			// The open goes through the shared close drain, which also waits
-			// for every git process in this test binary (GitLoad is process
-			// wide), so under parallel tests it may not end on its own here.
-			// Polled as if git were idle, the intent it queued lands.
-			model.update(cx, |m, cx| {
-				assert!(!m.workspace_menu, "{:?}", m.remote.message);
-				if m.remote.session.is_none() {
-					assert_eq!(
-						m.lifecycle.intent_name(),
-						"open-remote-workspace"
-					);
-					let step = m.lifecycle.poll_at(
-						std::time::Instant::now(),
-						crate::lifecycle::GitLoad::idle(),
-					);
-					let crate::lifecycle::Step::Ready(
-						crate::lifecycle::Intent::OpenRemoteWorkspace(target),
-					) = step
-					else {
-						panic!("drain not ready: {step:?}");
-					};
-					// finish_intent would check the real GitLoad again.
-					let (host, ws) = *target;
-					m.finish_open_remote(host, ws, cx);
-				}
-			});
+			land_remote_open(&model, cx);
 			for _ in 0..10 {
 				settle(cx);
 				let done = model.read_with(cx, |m, _| {
@@ -6657,6 +5710,283 @@ mod tests {
 		/// Project tree and a file preview, all read through the worker.
 		/// Every read has a deadline (snip-remote), so a hang fails rather
 		/// than blocks.
+		/// A remote listing the byte budget cuts short finishes through the
+		/// ORDINARY LoadMore path: Expand fetches the whole listing once,
+		/// the budget admits four of ten, and「顯示更多」walks the held
+		/// tail to the end — no refetch, no name lost or doubled.
+		#[gpui::test]
+		fn a_remote_listing_cut_by_the_budget_finishes_through_load_more(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect, TreeIo, TreeIoKind,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::VecDeque;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let children: Vec<ListedChild> = (0..10)
+				.map(|i| ListedChild {
+					name: format!("f{i:02}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			let mut tree = FileTreeNode::unloaded_root(&root);
+
+			// One row's cost, measured on a directly built io: the tree's
+			// command state is not what this measures, and one Expand is
+			// all an unloaded root will schedule.
+			let probe = listed_tree_result(
+				TreeIo {
+					key: NodeKey::root(),
+					epoch: 0,
+					dir: root.clone(),
+					base: root.clone(),
+					depth: 1,
+					byte_budget: usize::MAX,
+					scan: None,
+					held: VecDeque::new(),
+					replace_children: true,
+					kind: TreeIoKind::Expand,
+				},
+				Ok((children[..1].to_vec(), false)),
+			);
+			let cost = probe.children[0].retained_bytes();
+
+			let TreeEffect::Io(mut io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("expand must schedule io");
+			};
+			io.byte_budget = cost.saturating_mul(4).saturating_add(64);
+			let first = listed_tree_result(io, Ok((children, false)));
+			tree.apply_io_result(first).expect("the expand applies");
+			assert_eq!(tree.children.len(), 4, "the budget admits four of ten");
+			assert!(tree.has_more, "the rest is held for LoadMore");
+			assert!(
+				tree.flatten_visible(100).iter().any(|r| r.is_more_marker),
+				"the「顯示更多」marker is visible"
+			);
+
+			// LoadMore through the real command path, with the workbench's
+			// own budget logic.
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::LoadMore(NodeKey::root()))
+			else {
+				panic!("load more must schedule io from the held tail");
+			};
+			let rest = execute_tree_io(io, &CancelToken::new());
+			tree.apply_io_result(rest)
+				.expect("the continuation applies");
+			assert!(!tree.has_more);
+			let names: Vec<&str> =
+				tree.children.iter().map(|c| c.name.as_str()).collect();
+			assert_eq!(names.len(), 10, "{names:?}");
+			assert_eq!(
+				names,
+				[
+					"f00", "f01", "f02", "f03", "f04", "f05", "f06", "f07",
+					"f08", "f09"
+				],
+				"every name exactly once, in order"
+			);
+		}
+
+		/// A 1,200-entry remote listing shows every name through LoadMore:
+		/// the first Expand admits one page, the held tail carries the rest,
+		/// and no name is lost or doubled on the way.
+		#[gpui::test]
+		fn a_remote_listing_of_1200_shows_every_name_through_load_more(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect, MAX_DIR_ENTRIES,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::HashSet;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let children: Vec<ListedChild> = (0..1200)
+				.map(|i| ListedChild {
+					name: format!("f{i:04}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			let mut tree = FileTreeNode::unloaded_root(&root);
+
+			// The budget is not what this test is about (AGENTS: build the
+			// state rather than rely on how many names fit), so each batch
+			// runs with the budget open.
+			let TreeEffect::Io(mut io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("expand must schedule io");
+			};
+			io.byte_budget = usize::MAX;
+			let result = listed_tree_result(io, Ok((children, false)));
+			tree.apply_io_result(result).expect("the expand applies");
+			assert_eq!(
+				tree.children.len(),
+				MAX_DIR_ENTRIES,
+				"the first batch is the ordinary page"
+			);
+			assert!(tree.has_more);
+
+			let mut guard = 0;
+			while tree.has_more {
+				guard += 1;
+				assert!(guard < 30, "load more must converge");
+				let TreeEffect::Io(mut io) =
+					tree.start(TreeCommand::LoadMore(NodeKey::root()))
+				else {
+					panic!("load more must schedule io while names remain");
+				};
+				io.byte_budget = usize::MAX;
+				let result = execute_tree_io(io, &CancelToken::new());
+				tree.apply_io_result(result)
+					.expect("a continuation applies");
+			}
+			assert_eq!(tree.children.len(), 1200);
+			let seen: HashSet<&str> =
+				tree.children.iter().map(|c| c.name.as_str()).collect();
+			assert_eq!(seen.len(), 1200, "no duplicates");
+			assert!(tree.children[0].name == "f0000");
+			assert!(tree.children[1199].name == "f1199");
+		}
+
+		#[gpui::test]
+		fn a_nested_remote_listing_of_6000_survives_cache_reclaim(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				execute_tree_io, listed_tree_result, FileTreeNode, ListedChild,
+				NodeKey, TreeCommand, TreeEffect,
+				MAX_RETAINED_WORKING_TREE_BYTES,
+			};
+			use snip_core::gitrun::CancelToken;
+			use std::collections::HashSet;
+			let root = PathBuf::from("snip-remote://test/ws");
+			let mut tree = FileTreeNode::unloaded_root(&root);
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::Expand(NodeKey::root()))
+			else {
+				panic!("root expansion must schedule io");
+			};
+			tree.apply_io_result(listed_tree_result(
+				io,
+				Ok((
+					vec![ListedChild {
+						name: "nested".into(),
+						utf8: true,
+						directory: true,
+						nested_repo: false,
+					}],
+					false,
+				)),
+			))
+			.unwrap();
+			let key = NodeKey::from_utf8_rel("nested");
+			let TreeEffect::Io(io) =
+				tree.start(TreeCommand::Expand(key.clone()))
+			else {
+				panic!("nested expansion must schedule io");
+			};
+			let listing = (0..6000)
+				.map(|i| ListedChild {
+					name: format!("f{i:04}"),
+					utf8: true,
+					directory: false,
+					nested_repo: false,
+				})
+				.collect();
+			tree.apply_io_result(listed_tree_result(io, Ok((listing, false))))
+				.unwrap();
+			assert!(
+				tree.children[0].is_expanded,
+				"cache reclaim must not collapse the listing"
+			);
+			assert!(
+				tree.retained_bytes() > tree.cache_bytes(),
+				"the remote tail still counts toward aggregate storage"
+			);
+			assert!(!tree.children[0].children.is_empty());
+			assert!(tree
+				.flatten_visible(tree.visible_limit())
+				.iter()
+				.any(|row| row.rel_path == "nested/f0000"));
+			tree.toggle_select("nested/f0000");
+			let mut seen = HashSet::new();
+			for page in 0..100 {
+				assert!(tree.cache_bytes() <= MAX_RETAINED_WORKING_TREE_BYTES);
+				let folder = &tree.children[0];
+				assert!(folder.is_expanded && folder.read_error.is_none());
+				seen.extend(
+					folder.children.iter().map(|node| node.name.clone()),
+				);
+				if !folder.has_more {
+					break;
+				}
+				assert!(page < 99, "Load More must reach all 6000 names");
+				assert!(tree
+					.flatten_visible(tree.visible_limit())
+					.iter()
+					.any(|row| row.is_more_marker && row.rel_path == "nested"));
+				let TreeEffect::Io(io) =
+					tree.start(TreeCommand::LoadMore(key.clone()))
+				else {
+					panic!("Load More must retain the remote tail");
+				};
+				tree.apply_io_result(execute_tree_io(io, &CancelToken::new()))
+					.unwrap();
+			}
+			assert_eq!(seen.len(), 6000);
+			assert!((0..6000).all(|i| seen.contains(&format!("f{i:04}"))));
+			assert!(tree
+				.selected_paths()
+				.contains(&"nested/f0000".to_string()));
+		}
+
+		#[gpui::test]
+		fn an_empty_remote_listing_never_reads_the_master_directory(
+			_cx: &mut TestAppContext,
+		) {
+			use crate::tree::{
+				listed_tree_result, FileTreeNode, NodeKey, TreeCommand,
+				TreeEffect,
+			};
+			let tmp = tempfile::tempdir().unwrap();
+			fs::write(tmp.path().join("master-only.txt"), "local").unwrap();
+			let mut tree = FileTreeNode::unloaded_root(tmp.path());
+			for command in [
+				TreeCommand::Expand(NodeKey::root()),
+				TreeCommand::Retry(NodeKey::root()),
+			] {
+				let TreeEffect::Io(io) = tree.start(command) else {
+					panic!("listing must schedule io");
+				};
+				tree.apply_io_result(listed_tree_result(
+					io,
+					Ok((Vec::new(), false)),
+				))
+				.unwrap();
+				assert!(tree.is_loaded && tree.is_expanded);
+				assert!(
+					tree.children.is_empty(),
+					"the worker's empty answer must stay empty"
+				);
+				assert!(tree.read_error.is_none() && !tree.has_more);
+				assert!(tree.flatten_visible(tree.visible_limit()).is_empty());
+				assert!(matches!(
+					tree.start(TreeCommand::LoadMore(NodeKey::root())),
+					TreeEffect::Idle
+				));
+			}
+		}
+
 		#[gpui::test]
 		fn remote_workspace_opens_a_host_folder_and_previews_through_a_worker(
 			cx: &mut TestAppContext,
@@ -6689,10 +6019,12 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.remote.message, None);
 				assert_eq!(m.remote.hosts.len(), 1);
-				let Some((0, Some(Ok(listing)))) = &m.remote.browse else {
+				let Some(Some(Ok(listing))) =
+					m.remote.browse.as_ref().map(|b| &b.listing)
+				else {
 					panic!("home not listed: {:?}", m.remote.browse);
 				};
-				assert!(!listing.home.is_empty());
+				assert!(!listing.path.is_empty());
 				let session = m.remote.session.as_ref().expect("open");
 				assert_eq!(session.workspace.name, "shared");
 				assert_eq!(m.remote.recent[0].path, session.workspace.id);
@@ -6752,16 +6084,13 @@ mod tests {
 				m.select_file_in(root, "src/main.rs", SourceKind::File, cx);
 			});
 			settle(cx);
-			model.update(cx, |m, cx| {
+			model.read_with(cx, |m, _| {
 				let p = m.preview.as_ref().expect("remote preview");
 				assert_eq!(&*p.text, "fn main() {}\n");
 				assert_eq!(m.preview_error, None);
 				// The breadcrumb names the host, never the internal root.
 				let root = m.ws_root().unwrap();
 				assert_eq!(m.log_repo_name(&root), "test-worker ▸ shared");
-				// Copy and paste stay local; a remote workspace refuses them.
-				m.trigger_paste_preview(cx);
-				assert_eq!(m.status.key, "remote_unsupported");
 			});
 
 			// Refresh re-reads the open file: deleted on the worker, it shows
@@ -6807,6 +6136,272 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(m.preview_error.is_some(), "refused read shown");
+			});
+		}
+
+		/// Clicking a folder of a host enters it and opens nothing; "up one
+		/// level" goes back; "open this folder" opens the folder shown. The
+		/// temp folder is reached through macOS's `/var` symlink, so the
+		/// worker's real path differs from the one asked for.
+		#[gpui::test]
+		fn remote_folder_browser_enters_goes_up_and_opens_here(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("base");
+			for d in ["a/x", "a/y", "b", ".hidden"] {
+				fs::create_dir_all(base.join(d)).unwrap();
+			}
+			fs::write(base.join("file.txt"), "f").unwrap();
+			let real = |p: &Path| {
+				dunce::canonicalize(p).unwrap().display().to_string()
+			};
+			let (model, cx) = remote_menu(cx);
+
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+			});
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base));
+			assert_eq!(folders, ["a", "b"], "dot folders and files hidden");
+			model.read_with(cx, |m, cx| {
+				assert_eq!(m.remote_path_input.read(cx).text(), real(&base));
+			});
+
+			click_remote_folder(&model, cx, "a");
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base.join("a")));
+			assert_eq!(folders, ["x", "y"]);
+			model.read_with(cx, |m, cx| {
+				assert!(m.remote.session.is_none(), "entering opens nothing");
+				assert!(!m.workspace_open && m.workspace_menu);
+				assert_eq!(m.lifecycle.intent_name(), "none");
+				assert_eq!(
+					m.remote_path_input.read(cx).text(),
+					real(&base.join("a"))
+				);
+			});
+
+			click(cx, "remote-up");
+			settle(cx);
+			let (path, folders) = shown_folder(&model, cx);
+			assert_eq!(path, real(&base));
+			assert_eq!(folders, ["a", "b"]);
+
+			click_remote_folder(&model, cx, "b");
+			settle(cx);
+			click(cx, "btn-remote-open-here");
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("opened");
+				assert_eq!(session.workspace.id, real(&base.join("b")));
+				assert_eq!(m.remote.recent[0].path, session.workspace.id);
+				assert!(m.workspace_open);
+			});
+		}
+
+		/// A host with many folders in a small window: the menu stays inside
+		/// the window and the path field and both open buttons stay
+		/// reachable, the folder list scrolling on its own.
+		#[gpui::test]
+		fn remote_menu_with_many_folders_fits_a_small_window(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("home");
+			for i in 0..43 {
+				fs::create_dir_all(base.join(format!("folder-{i:02}")))
+					.unwrap();
+			}
+			let (model, cx) = remote_menu(cx);
+			cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+			});
+			settle(cx);
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+			assert_eq!(shown_folder(&model, cx).1.len(), 43);
+			let bottom = |b: gpui::Bounds<gpui::Pixels>| {
+				f32::from(b.origin.y) + f32::from(b.size.height)
+			};
+			let menu = cx.debug_bounds("workspace-menu").expect("menu drawn");
+			assert!(bottom(menu) <= 600., "menu runs off the window: {menu:?}");
+			for id in [
+				"remote-path-input",
+				"btn-remote-open",
+				"btn-remote-open-here",
+			] {
+				let b = cx
+					.debug_bounds(id)
+					.unwrap_or_else(|| panic!("{id} not drawn"));
+				assert!(
+					f32::from(b.origin.y) >= f32::from(menu.origin.y)
+						&& bottom(b) <= bottom(menu),
+					"{id} {b:?} outside the menu {menu:?}"
+				);
+			}
+		}
+
+		/// A listing that lands for a folder or host no longer shown is
+		/// dropped.
+		#[gpui::test]
+		fn remote_folder_listing_for_a_folder_no_longer_shown_is_dropped(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			fs::create_dir_all(tmp.path().join("a")).unwrap();
+			let (model, cx) = remote_menu(cx);
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, tmp.path().display().to_string(), cx);
+			});
+			settle(cx);
+			let before = shown_folder(&model, cx);
+			model.update(cx, |m, cx| {
+				let seq = m.remote.browse.as_ref().unwrap().seq();
+				m.remote_listing_landed(
+					seq.wrapping_sub(1),
+					Ok(crate::remote::FolderListing {
+						path: "/elsewhere".into(),
+						folders: vec!["zzz".into()],
+					}),
+					cx,
+				);
+			});
+			assert_eq!(shown_folder(&model, cx), before);
+
+			// Asked for while another listing was on its way: only the newer
+			// one lands.
+			model.update(cx, |m, cx| {
+				m.enter_remote_folder("a", cx);
+				let stale = m.remote.browse.as_ref().unwrap().seq();
+				m.remote_up(cx);
+				m.remote_listing_landed(stale, Err("late failure".into()), cx);
+				assert_eq!(m.remote.browse.as_ref().unwrap().listing, None);
+			});
+			settle(cx);
+			assert_eq!(shown_folder(&model, cx).0, before.0.clone());
+		}
+
+		/// A remote folder opened before is listed in the menu's top-level
+		/// recent list, after the local ones, and one click reopens it.
+		#[gpui::test]
+		fn remote_recent_is_in_the_top_level_list_and_reopens(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let local = tmp.path().join("local");
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&local).unwrap();
+			fs::create_dir_all(&shared).unwrap();
+			let shared_id =
+				dunce::canonicalize(&shared).unwrap().display().to_string();
+			let (model, cx) = remote_menu(cx);
+			model.update(cx, |m, cx| {
+				m.recent_workspaces = vec![local.clone()];
+				m.remote.recent = vec![crate::remote::RecentRemote {
+					host: m.remote.hosts[0].name.clone(),
+					path: shared_id.clone(),
+				}];
+				cx.notify();
+			});
+			settle(cx);
+			let local_row = cx
+				.debug_bounds("workspace-recent:0")
+				.expect("local recent listed");
+			let remote_row = cx
+				.debug_bounds("remote-recent:0")
+				.expect("remote recent listed at the top level");
+			assert!(
+				local_row.origin.y < remote_row.origin.y,
+				"after the local ones"
+			);
+			click(cx, "remote-recent:0");
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("reopened");
+				assert_eq!(session.workspace.id, shared_id);
+				assert_eq!(m.remote.recent.len(), 1);
+			});
+		}
+
+		/// The launch reconnect: the last remote workspace opens in the
+		/// background; a folder or host that is gone leaves the app with no
+		/// workspace and says why, on the status bar and the empty screen.
+		#[gpui::test]
+		fn launch_reconnects_the_last_remote_workspace_or_says_why_not(
+			cx: &mut TestAppContext,
+		) {
+			use crate::remote::RecentRemote;
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let id = dunce::canonicalize(tmp.path())
+				.unwrap()
+				.display()
+				.to_string();
+			let (model, cx) = remote_menu(cx);
+			let host = model.update(cx, |m, _| {
+				m.workspace_menu = false;
+				m.remote.hosts[0].name.clone()
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: "gone-host".into(),
+						path: id.clone(),
+					},
+					cx,
+				);
+				assert_eq!(m.status.key, "remote_open_failed");
+				assert!(!m.workspace_open && !m.remote.busy);
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: host.clone(),
+						path: format!("{id}/missing"),
+					},
+					cx,
+				);
+				assert_eq!(m.status.key, "remote_reconnecting");
+			});
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "remote_open_failed");
+				assert!(!m.workspace_open && m.remote.session.is_none());
+				assert!(matches!(m.remote.message, Some((false, _))));
+			});
+
+			model.update(cx, |m, cx| {
+				m.reopen_last_remote(
+					RecentRemote {
+						host: host.clone(),
+						path: id.clone(),
+					},
+					cx,
+				);
+			});
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("reconnected");
+				assert_eq!(session.workspace.id, id);
+				assert!(m.workspace_open);
 			});
 		}
 
@@ -8233,8 +7828,9 @@ mod tests {
 		}
 
 		#[gpui::test]
-		fn remote_copy_paths_are_refused(cx: &mut TestAppContext) {
+		fn remote_copy_runs_on_the_worker(cx: &mut TestAppContext) {
 			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
 			use crate::tree::{NodeKey, TreeCommand};
 			let tmp = tempfile::tempdir().unwrap();
 			let shared = tmp.path().join("shared");
@@ -8245,7 +7841,9 @@ mod tests {
 
 			crate::paste::tests::git_init(&alpha);
 			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
-			crate::paste::tests::git_run(&alpha, &["add", "init.txt"]);
+			fs::create_dir_all(alpha.join("dir")).unwrap();
+			fs::write(alpha.join("dir").join("c.txt"), "C\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "."]);
 			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
 			fs::write(alpha.join("dirty.txt"), "dirty\n").unwrap();
 
@@ -8253,6 +7851,10 @@ mod tests {
 			fs::write(beta.join("init.txt"), "hello\n").unwrap();
 			crate::paste::tests::git_run(&beta, &["add", "init.txt"]);
 			crate::paste::tests::git_run(&beta, &["commit", "-m", "init"]);
+
+			let notes = shared.join("notes");
+			fs::create_dir_all(&notes).unwrap();
+			fs::write(notes.join("n.txt"), "N\n").unwrap();
 
 			let (model, cx, _worker) = open_remote(
 				cx,
@@ -8290,45 +7892,96 @@ mod tests {
 				}
 			}
 
-			let check = |model: &Entity<WorkbenchModel>,
-			             cx: &mut VisualTestContext,
-			             act: &str| {
+			// Runs one copy and waits for the worker's payload to land.
+			let run = |model: &Entity<WorkbenchModel>,
+			           cx: &mut VisualTestContext,
+			           act: &dyn Fn(
+				&mut WorkbenchModel,
+				&mut gpui::Context<WorkbenchModel>,
+			),
+			           what: &str|
+			 -> String {
+				clip::write_text("before").unwrap();
+				model.update(cx, |m, cx| {
+					m.set_status("status_idle", []);
+					act(m, cx);
+				});
+				for _ in 0..200 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.is_copying) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
 				model.read_with(cx, |m, _| {
-					assert_eq!(
-						m.status.key, "remote_unsupported",
-						"{act} should set status to remote_unsupported"
-					);
-					assert!(!m.is_copying, "{act} should not set is_copying");
+					assert!(!m.is_copying, "{what}: still copying");
 					assert!(
-						m.basket.is_empty(),
-						"{act} should leave basket empty"
+						matches!(
+							m.status.key,
+							"status_copied" | "status_commits_copied"
+						),
+						"{what}: {}",
+						m.status
 					);
 				});
+				clip::read_text().unwrap()
+			};
+			let files = |text: &str| -> Vec<(String, String)> {
+				parse_clipboard(text, "")
+					.into_iter()
+					.map(|e| (e.path, e.content))
+					.collect()
+			};
+			let copy_node = |targets: Vec<crate::menu::CopyTarget>| {
+				move |m: &mut WorkbenchModel,
+				      cx: &mut gpui::Context<WorkbenchModel>| {
+					m.copy_targets(targets.clone(), cx)
+				}
+			};
+			// The row's menu Copy, as the right-click handler opens it.
+			let menu_copy = |m: &WorkbenchModel, ws: bool, rel: &str| {
+				let tree = if ws { &m.ws_tree } else { &m.file_tree };
+				let tree = tree.as_ref().expect("tree loaded");
+				let row = tree
+					.flatten_visible(tree.visible_limit())
+					.into_iter()
+					.find(|r| r.rel_path == rel)
+					.unwrap_or_else(|| panic!("{rel} row"));
+				assert!(row.selected, "{rel} is selected");
+				copy_of(m.work_row_menu(&row, ws))
+					.unwrap_or_else(|| panic!("{rel}: Copy enabled"))
 			};
 
-			// 1. toggle_file(0)
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.toggle_file(0, cx));
-			check(&model, cx, "toggle_file(0)");
+			// A Changes file row: the worker's working-tree bytes.
+			let row = model.read_with(cx, |m, _| {
+				let idx = m
+					.files
+					.iter()
+					.position(|f| f.path == "dirty.txt")
+					.expect("dirty.txt is a change");
+				copy_of(m.change_row_menu(idx)).expect("the row offers Copy")
+			});
+			let text = run(&model, cx, &copy_node(row), "file row");
+			assert_eq!(files(&text), entries(&[("dirty.txt", "dirty")]));
 
-			// 2. select_all_files
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.select_all_files(cx));
-			check(&model, cx, "select_all_files");
+			// The Unstaged group.
+			let group = model.read_with(cx, |m, _| {
+				m.change_targets(|_, f| {
+					crate::menu::change_group(f) == Some("unstaged")
+				})
+			});
+			assert!(!group.is_empty());
+			let text = run(&model, cx, &copy_node(group), "group");
+			assert_eq!(files(&text), entries(&[("dirty.txt", "dirty")]));
 
-			// 3. toggle_change_group
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.toggle_change_group("unstaged", cx));
-			check(&model, cx, "toggle_change_group");
-
-			// 4. toggle_change_repo
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.toggle_change_repo(0, "unstaged", cx));
-			check(&model, cx, "toggle_change_repo");
-
-			// 5. dispatch_tree(ToggleSelect(..)) on file_tree
-			model.update(cx, |m, _| m.set_status("status_idle", []));
+			// A Project tree selection (multi-select).
 			model.update(cx, |m, cx| {
+				m.dispatch_tree(
+					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
+						"init.txt",
+					))),
+					cx,
+				);
 				m.dispatch_tree(
 					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
 						"dirty.txt",
@@ -8336,78 +7989,438 @@ mod tests {
 					cx,
 				);
 			});
-			check(&model, cx, "dispatch_tree(ToggleSelect)");
+			let picked =
+				model.read_with(cx, |m, _| menu_copy(m, false, "init.txt"));
+			assert_eq!(picked.len(), 2, "{picked:?}");
+			let text = run(&model, cx, &copy_node(picked), "project");
+			assert_eq!(
+				files(&text),
+				entries(&[("dirty.txt", "dirty"), ("init.txt", "hello")])
+			);
 
-			// 6. dispatch_ws_tree(ToggleSelect(..)) on ws_tree
-			model.update(cx, |m, _| m.set_status("status_idle", []));
+			// A repo subfolder right-click.
 			model.update(cx, |m, cx| {
-				m.dispatch_ws_tree(
-					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
-						"alpha",
-					))),
-					cx,
+				m.select_tree_rows_alone(false, &["dir".into()], cx);
+			});
+			let targets =
+				model.read_with(cx, |m, _| menu_copy(m, false, "dir"));
+			let text = run(&model, cx, &copy_node(targets), "repo folder");
+			assert_eq!(files(&text), entries(&[("dir/c.txt", "C")]));
+
+			// A workspace-level non-repo folder right-click.
+			model.update(cx, |m, cx| {
+				m.select_tree_rows_alone(true, &["notes".into()], cx);
+			});
+			let targets =
+				model.read_with(cx, |m, _| menu_copy(m, true, "notes"));
+			let text = run(&model, cx, &copy_node(targets), "workspace folder");
+			assert_eq!(files(&text), entries(&[("notes/n.txt", "N")]));
+
+			// A file at a commit, after the worktree changed.
+			// The log row's id names its repo; the menu splits it the same way.
+			let (repo_root, sha) = model.read_with(cx, |m, _| {
+				let id = &m.commits.first().expect("commit exists").sha;
+				m.log_root_for(id).expect("the row's repo and sha")
+			});
+			fs::write(alpha.join("init.txt"), "changed\n").unwrap();
+			let at = vec![crate::menu::CopyTarget {
+				root: repo_root,
+				path: "init.txt".into(),
+				source: snip_core::transfer::SourceKind::Commit { rev: sha },
+				change_type: None,
+			}];
+			let text = run(&model, cx, &copy_node(at), "commit file");
+			assert_eq!(files(&text), entries(&[("init.txt", "hello")]));
+
+			// The selected commit as a commit payload.
+			model.update(cx, |m, cx| {
+				let id = m.commits.first().expect("commit exists").sha.clone();
+				m.select_commit(&id, cx);
+			});
+			settle(cx);
+			let text = run(
+				&model,
+				cx,
+				&|m: &mut WorkbenchModel,
+				  cx: &mut gpui::Context<WorkbenchModel>| {
+					m.copy_commits_to_clipboard(cx)
+				},
+				"commits",
+			);
+			assert!(text.contains("init.txt"), "{text}");
+			assert!(
+				matches!(
+					snip_core::clip::detect_mode(&text),
+					snip_core::clip::Mode::Commits
+				),
+				"{text}"
+			);
+		}
+
+		/// Puts `payload` on the clipboard, opens its paste preview in the
+		/// remote workspace and waits (bounded) for the worker's plan.
+		fn remote_paste_preview(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			payload: &str,
+		) {
+			clip::write_text(payload).unwrap();
+			model.update(cx, |m, cx| m.trigger_paste_preview(cx));
+			for _ in 0..300 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				});
+				if done {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.paste.plan().is_some() && !m.paste.is_loading(),
+					"no remote preview: {}",
+					m.status
 				);
 			});
-			check(&model, cx, "dispatch_ws_tree(ToggleSelect)");
+		}
 
-			// 7. toggle_rev_file_selection
-			let sha = model.read_with(cx, |m, _| {
-				m.commits.first().expect("commit exists").sha.clone()
-			});
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| {
-				m.toggle_rev_file_selection(&sha, "init.txt", cx)
-			});
-			check(&model, cx, "toggle_rev_file_selection");
+		/// Applies, as the Apply button does, and waits (bounded) for the
+		/// worker's answer.
+		fn remote_paste_apply(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			model.update(cx, |m, cx| m.apply_paste_restore(cx));
+			for _ in 0..300 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste_busy()) {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			assert!(
+				!model.read_with(cx, |m, _| m.paste_busy()),
+				"remote apply never ended"
+			);
+		}
 
-			// 8. run_menu_act(MenuAct::CopyRevFiles(..))
-			let repo_root =
-				model.read_with(cx, |m, _| m.repo().unwrap().root.clone());
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			cx.update(|window, cx| {
-				model.update(cx, |m, cx| {
-					m.run_menu_act(
-						crate::menu::MenuAct::CopyRevFiles(vec![(
-							repo_root,
-							"HEAD".into(),
-							"init.txt".into(),
-							false,
-						)]),
-						window,
-						cx,
-					);
+		/// Paste into a remote workspace through the real panel: the worker
+		/// plans (rows, overwrite gating, unchecked rows), writes what was
+		/// confirmed, refuses a destination changed behind the preview, never
+		/// writes into `.git`, and replays a commit payload.
+		#[gpui::test]
+		fn remote_paste_runs_on_the_worker(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
 				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			let real = dunce::canonicalize(&alpha).unwrap();
+
+			// Rows come from the worker's plan, with its paths.
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: init.txt\nnew init\n// FILE: a.txt\nA\n// FILE: b.txt\nB\n",
+			);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.remote.is_some());
+				let rows: Vec<_> = plan
+					.items
+					.iter()
+					.map(|i| (i.path.as_str(), i.op, i.dest_exists))
+					.collect();
+				assert_eq!(
+					rows,
+					[
+						("init.txt", crate::paste::PlannedOp::Overwrite, true),
+						("a.txt", crate::paste::PlannedOp::Create, false),
+						("b.txt", crate::paste::PlannedOp::Create, false),
+					]
+				);
+				assert_eq!(plan.items[1].dest_path, real.join("a.txt"));
+				// Shown as the host's folder, never the internal root.
+				assert!(
+					plan.shown(&plan.destination).starts_with("test-worker:"),
+					"{}",
+					plan.shown(&plan.destination)
+				);
+				assert!(plan.overwrite_missing());
 			});
-			check(&model, cx, "run_menu_act(CopyRevFiles)");
-
-			// 9. copy_project_selection
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.copy_project_selection(cx));
-			check(&model, cx, "copy_project_selection");
-
-			// 10. copy_commits_to_clipboard
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.copy_commits_to_clipboard(cx));
-			check(&model, cx, "copy_commits_to_clipboard");
-
-			// 11. copy_selection_to_clipboard
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			model.update(cx, |m, cx| m.copy_selection_to_clipboard(cx));
-			check(&model, cx, "copy_selection_to_clipboard");
-
-			// 12. cx.simulate_keystrokes("cmd-c") and "ctrl-c"
-			cx.update(|window, cx| {
-				window.focus(&model.read(cx).focus_handle.clone());
+			// Overwrite is off by default: Apply keeps init.txt. b.txt is
+			// unticked.
+			click(cx, "paste-include:2:b.txt");
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
 			});
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			cx.simulate_keystrokes("cmd-c");
-			cx.run_until_parked();
-			check(&model, cx, "cmd-c");
+			assert_eq!(fs::read_to_string(alpha.join("a.txt")).unwrap(), "A");
+			assert_eq!(
+				fs::read_to_string(alpha.join("init.txt")).unwrap(),
+				"hello\n"
+			);
+			assert!(!alpha.join("b.txt").exists());
 
-			model.update(cx, |m, _| m.set_status("status_idle", []));
-			cx.simulate_keystrokes("ctrl-c");
-			cx.run_until_parked();
-			check(&model, cx, "ctrl-c");
+			// Allowing the overwrite writes it, byte for byte.
+			remote_paste_preview(&model, cx, "// FILE: init.txt\nnew init\n");
+			click(cx, "paste-overwrite:0:init.txt");
+			remote_paste_apply(&model, cx);
+			assert_eq!(
+				fs::read_to_string(alpha.join("init.txt")).unwrap(),
+				"new init"
+			);
+
+			// A target created behind the preview's back: refused as stale,
+			// nothing written, the plan stays open.
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: c.txt\nfrom clipboard\n",
+			);
+			fs::write(alpha.join("c.txt"), "external").unwrap();
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "stale_created", "{}", m.status);
+				let plan = m.paste.plan().expect("plan stays open");
+				assert!(!plan.is_applying);
+			});
+			assert_eq!(
+				fs::read_to_string(alpha.join("c.txt")).unwrap(),
+				"external"
+			);
+			model.update(cx, |m, cx| m.cancel_paste_preview(cx));
+
+			// `.git` entries are skipped rows; Apply writes nothing there.
+			let hooks = alpha.join(".git/hooks");
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: .git/hooks/pre-commit\n#!/bin/sh\necho owned\n// FILE: d.txt\nD\n",
+			);
+			// `.git/` reads as a folder prefix: keep it under the destination,
+			// as a user would to get past the mapping row.
+			model.update(cx, |m, cx| m.choose_paste_keep(".git", cx));
+			for _ in 0..300 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					!m.paste.is_loading()
+						&& m.paste.plan().is_some_and(|p| p.executable())
+				});
+				if done {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				let paths: Vec<_> =
+					plan.items.iter().map(|i| i.path.as_str()).collect();
+				assert_eq!(paths, ["d.txt"]);
+				assert_eq!(plan.counts().skips, 1);
+			});
+			remote_paste_apply(&model, cx);
+			assert!(!hooks.join("pre-commit").exists());
+			assert_eq!(fs::read_to_string(alpha.join("d.txt")).unwrap(), "D");
+
+			// Commit mode: the worker replays the payload onto the repo.
+			crate::paste::tests::git_run(&alpha, &["add", "."]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "pasted"]);
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "incoming\n".into(),
+						author_name: "Author".into(),
+						author_email: "author@example.invalid".into(),
+						author_date: "2026-09-21T12:00:00+00:00".into(),
+						files: vec![CommitFile {
+							path: "replayed.txt".into(),
+							old_path: None,
+							change: FileChange::Added,
+							content: Some("replayed\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			remote_paste_preview(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.whole_commit, "{}", m.status);
+				assert_eq!(plan.items.len(), 1);
+				assert_eq!(plan.items[0].dest_root_name, "alpha");
+				assert_eq!(plan.items[0].dest_path, real.join("replayed.txt"));
+			});
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
+			});
+			assert_eq!(
+				crate::paste::tests::git_run(
+					&alpha,
+					&["log", "-1", "--format=%s %an"]
+				)
+				.trim(),
+				"incoming Author"
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("replayed.txt")).unwrap(),
+				"replayed\n"
+			);
+
+			// A paste several chunks long goes out in pieces; it is held to
+			// the same preview limit (MAX_RETAINED_PREVIEW_BYTES) as a local
+			// paste.
+			let c1 = "a".repeat(900_000);
+			let c2 = "b".repeat(900_000);
+			let c3 = "c".repeat(900_000);
+			let payload = format!(
+				"// FILE: chunk_1.txt\n{c1}\n// FILE: chunk_2.txt\n{c2}\n// FILE: chunk_3.txt\n{c3}\n"
+			);
+			assert!(payload.len() > 2 * snip_remote::proto::CHUNK_BYTES);
+			remote_paste_preview(&model, cx, &payload);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(plan.items.len(), 3);
+			});
+			remote_paste_apply(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().is_none(), "{}", m.status);
+			});
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_1.txt")).unwrap(),
+				c1
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_2.txt")).unwrap(),
+				c2
+			);
+			assert_eq!(
+				fs::read_to_string(alpha.join("chunk_3.txt")).unwrap(),
+				c3
+			);
+		}
+
+		/// Prefix rows offer the remote workspace's repositories, shown as
+		/// the host's folders, and route each prefix to the one picked.
+		#[gpui::test]
+		fn remote_paste_maps_prefixes_to_remote_repositories(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			for name in ["alpha", "beta"] {
+				let repo = shared.join(name);
+				fs::create_dir_all(&repo).unwrap();
+				crate::paste::tests::git_init(&repo);
+				fs::write(repo.join("init.txt"), "hello\n").unwrap();
+				crate::paste::tests::git_run(&repo, &["add", "init.txt"]);
+				crate::paste::tests::git_run(&repo, &["commit", "-m", "init"]);
+			}
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.repos.len() == 2) {
+					break;
+				}
+			}
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: alpha/x.txt\nx\n// FILE: beta/y.txt\ny\n",
+			);
+			for prefix in ["alpha", "beta"] {
+				let idx = model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					let choice = plan
+						.prefix_choices
+						.iter()
+						.find(|c| c.prefix == prefix)
+						.unwrap();
+					let shown: Vec<_> = choice
+						.candidates
+						.iter()
+						.map(|c| plan.shown(c))
+						.collect();
+					assert!(
+						shown.iter().all(|s| s.starts_with("test-worker:")),
+						"{shown:?}"
+					);
+					choice
+						.candidates
+						.iter()
+						.position(|c| c.ends_with(prefix))
+						.unwrap()
+				});
+				model
+					.update(cx, |m, cx| m.choose_paste_prefix(prefix, idx, cx));
+				for _ in 0..300 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.paste.is_loading()) {
+						break;
+					}
+					std::thread::sleep(Duration::from_millis(10));
+				}
+			}
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.executable(), "{}", m.status);
+				let rows: Vec<_> = plan
+					.items
+					.iter()
+					.map(|i| (i.dest_root_name.as_str(), i.path.as_str()))
+					.collect();
+				assert_eq!(rows, [("alpha", "x.txt"), ("beta", "y.txt")]);
+			});
+			remote_paste_apply(&model, cx);
+			assert_eq!(
+				fs::read_to_string(shared.join("alpha/x.txt")).unwrap(),
+				"x"
+			);
+			assert_eq!(
+				fs::read_to_string(shared.join("beta/y.txt")).unwrap(),
+				"y"
+			);
 		}
 
 		#[gpui::test]
@@ -9236,15 +9249,23 @@ mod tests {
 				menu.into_iter()
 					.find_map(|e| match e {
 						MenuEntry::Item {
-							act: Some(MenuAct::CopyRevFiles(f)),
+							act: Some(MenuAct::CopyNode(f)),
 							..
 						} => Some(f),
 						_ => None,
 					})
 					.unwrap()
 			});
-			let got: Vec<_> =
-				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			let got: Vec<_> = copied
+				.iter()
+				.map(|t| {
+					(
+						t.path.as_str(),
+						t.change_type
+							== Some(snip_core::format::ChangeType::Deleted),
+					)
+				})
+				.collect();
 			assert_eq!(
 				got,
 				[
@@ -9282,15 +9303,23 @@ mod tests {
 				menu.into_iter()
 					.find_map(|e| match e {
 						MenuEntry::Item {
-							act: Some(MenuAct::CopyRevFiles(f)),
+							act: Some(MenuAct::CopyNode(f)),
 							..
 						} => Some(f),
 						_ => None,
 					})
 					.unwrap()
 			});
-			let got: Vec<_> =
-				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			let got: Vec<_> = copied
+				.iter()
+				.map(|t| {
+					(
+						t.path.as_str(),
+						t.change_type
+							== Some(snip_core::format::ChangeType::Deleted),
+					)
+				})
+				.collect();
 			assert_eq!(got, [("common.txt", false), ("emoji.txt", false)]);
 		}
 
@@ -9324,15 +9353,23 @@ mod tests {
 				menu.into_iter()
 					.find_map(|e| match e {
 						MenuEntry::Item {
-							act: Some(MenuAct::CopyRevFiles(f)),
+							act: Some(MenuAct::CopyNode(f)),
 							..
 						} => Some(f),
 						_ => None,
 					})
 					.unwrap()
 			});
-			let got: Vec<_> =
-				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			let got: Vec<_> = copied
+				.iter()
+				.map(|t| {
+					(
+						t.path.as_str(),
+						t.change_type
+							== Some(snip_core::format::ChangeType::Deleted),
+					)
+				})
+				.collect();
 			assert_eq!(
 				got,
 				[("z.txt", false), ("a/x.txt", false), ("b.txt", false)]
@@ -9368,15 +9405,23 @@ mod tests {
 				menu.into_iter()
 					.find_map(|e| match e {
 						MenuEntry::Item {
-							act: Some(MenuAct::CopyRevFiles(f)),
+							act: Some(MenuAct::CopyNode(f)),
 							..
 						} => Some(f),
 						_ => None,
 					})
 					.unwrap()
 			});
-			let got: Vec<_> =
-				copied.iter().map(|(_, _, p, d)| (p.as_str(), *d)).collect();
+			let got: Vec<_> = copied
+				.iter()
+				.map(|t| {
+					(
+						t.path.as_str(),
+						t.change_type
+							== Some(snip_core::format::ChangeType::Deleted),
+					)
+				})
+				.collect();
 			assert_eq!(got, [("dir/gone.txt", true), ("dir/keep.txt", false)]);
 		}
 
@@ -9760,28 +9805,6 @@ mod tests {
 		}
 
 		#[gpui::test]
-		fn alt_s_selects_every_change_and_alt_d_empties_the_basket(
-			cx: &mut TestAppContext,
-		) {
-			let ws = tempfile::tempdir().unwrap();
-			repo(ws.path(), "alpha", &[("new0.txt", "x"), ("new1.txt", "y")]);
-			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
-			cx.simulate_keystrokes("alt-s");
-			model.read_with(cx, |m, _| {
-				assert_eq!(m.files.len(), 2);
-				assert!(m.files.iter().all(|f| f.selected));
-				assert!(m.basket_count() >= 2, "{}", m.basket_count());
-				assert_eq!(m.status.key, "status_selected_all");
-			});
-			cx.simulate_keystrokes("alt-d");
-			model.read_with(cx, |m, _| {
-				assert!(m.files.iter().all(|f| !f.selected));
-				assert_eq!(m.basket_count(), 0);
-				assert_eq!(m.status.key, "status_deselected_all");
-			});
-		}
-
-		#[gpui::test]
 		fn ctrl_r_lists_a_file_created_after_the_load(cx: &mut TestAppContext) {
 			let ws = tempfile::tempdir().unwrap();
 			let repo = repo(ws.path(), "alpha", &[]);
@@ -9823,32 +9846,443 @@ mod tests {
 			});
 		}
 
+		/// The Copy item of a context menu: its targets, or None when the
+		/// item is shown disabled.
+		fn copy_of(
+			menu: Vec<crate::menu::MenuEntry>,
+		) -> Option<Vec<crate::menu::CopyTarget>> {
+			let act = menu
+				.into_iter()
+				.find_map(|e| match e {
+					crate::menu::MenuEntry::Item {
+						id: "copy-files",
+						act,
+						..
+					} => Some(act),
+					_ => None,
+				})
+				.expect("the menu offers copy-files");
+			act.map(|act| match act {
+				crate::menu::MenuAct::CopyNode(targets) => targets,
+				other => panic!("copy-files runs {other:?}"),
+			})
+		}
+
+		/// The clipboard's snip-sync entries as (path, content), in payload
+		/// order.
+		fn clipboard_entries() -> Vec<(String, String)> {
+			parse_clipboard(&clip::read_text().unwrap(), "")
+				.into_iter()
+				.map(|e| (e.path, e.content))
+				.collect()
+		}
+
+		/// Clicks a node's Copy and returns what landed on the clipboard.
+		fn run_copy(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			targets: Vec<crate::menu::CopyTarget>,
+		) -> Vec<(String, String)> {
+			cx.update(|window, cx| {
+				model.update(cx, |m, cx| {
+					m.run_menu_act(
+						crate::menu::MenuAct::CopyNode(targets),
+						window,
+						cx,
+					)
+				})
+			});
+			cx.run_until_parked();
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "status_copied", "{}", m.status)
+			});
+			clipboard_entries()
+		}
+
+		fn entries(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+			pairs
+				.iter()
+				.map(|(p, c)| (p.to_string(), c.to_string()))
+				.collect()
+		}
+
+		/// A repo whose `tracked` files are committed and then rewritten, so
+		/// each is an Unstaged change with the new body.
+		fn modified_repo(
+			ws: &Path,
+			name: &str,
+			tracked: &[(&str, &str)],
+		) -> PathBuf {
+			let root = repo(ws, name, &[]);
+			for (rel, _) in tracked {
+				let path = root.join(rel);
+				fs::create_dir_all(path.parent().unwrap()).unwrap();
+				fs::write(path, "old").unwrap();
+			}
+			git(&root, &["add", "."]);
+			git(&root, &["commit", "-q", "-m", "tracked"]);
+			for (rel, body) in tracked {
+				fs::write(root.join(rel), body).unwrap();
+			}
+			root
+		}
+
+		fn change_idx(
+			m: &WorkbenchModel,
+			path: &str,
+			source: &snip_core::transfer::SourceKind,
+		) -> usize {
+			m.files
+				.iter()
+				.position(|f| f.path == path && &f.source == source)
+				.unwrap_or_else(|| panic!("no {source:?} row {path}"))
+		}
+
+		/// A file row copies that row only, with its own source: the
+		/// staged row the index bytes, the unstaged row the working bytes.
 		#[gpui::test]
-		fn ctrl_c_writes_the_selection_as_a_payload_that_parses_back(
+		fn copy_on_a_change_row_reads_that_rows_source(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::transfer::SourceKind;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "alpha", &[]);
+			fs::write(root.join("base.txt"), "staged").unwrap();
+			git(&root, &["add", "base.txt"]);
+			fs::write(root.join("base.txt"), "working").unwrap();
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let (staged, unstaged) = model.read_with(cx, |m, _| {
+				let staged = change_idx(m, "base.txt", &SourceKind::Staged);
+				let unstaged = change_idx(m, "base.txt", &SourceKind::Unstaged);
+				(
+					copy_of(m.change_row_menu(staged)).unwrap(),
+					copy_of(m.change_row_menu(unstaged)).unwrap(),
+				)
+			});
+			assert_eq!(staged.len(), 1);
+			assert_eq!(staged[0].source, SourceKind::Staged);
+			assert_eq!(
+				run_copy(&model, cx, staged),
+				entries(&[("base.txt", "staged")])
+			);
+			assert_eq!(
+				run_copy(&model, cx, unstaged),
+				entries(&[("base.txt", "working")])
+			);
+		}
+
+		/// A directory, repo or group row copies every file beneath it,
+		/// in list order, and nothing else.
+		#[gpui::test]
+		fn copy_on_a_dir_repo_or_group_covers_the_files_beneath(
 			cx: &mut TestAppContext,
 		) {
 			let Some(_clip) = clipboard() else { return };
 			let ws = tempfile::tempdir().unwrap();
-			repo(ws.path(), "alpha", &[("new0.txt", "hello")]);
+			modified_repo(
+				ws.path(),
+				"alpha",
+				&[
+					("src/a.txt", "A"),
+					("src/sub/b.txt", "B"),
+					("srcx.txt", "X"),
+					("top.txt", "T"),
+				],
+			);
+			modified_repo(ws.path(), "beta", &[("other.txt", "O")]);
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
-			cx.simulate_keystrokes("alt-s");
+			cx.run_until_parked();
+			let (dir, repo_row, group) = model.read_with(cx, |m, _| {
+				let alpha = m
+					.change_repos
+					.iter()
+					.position(|s| s.name == "alpha")
+					.unwrap();
+				(
+					copy_of(m.change_dir_menu(alpha, "unstaged", "src"))
+						.unwrap(),
+					copy_of(m.change_repo_menu(alpha, "unstaged")).unwrap(),
+					copy_of(m.change_group_menu("unstaged")).unwrap(),
+				)
+			});
+			assert_eq!(
+				run_copy(&model, cx, dir),
+				entries(&[("src/a.txt", "A"), ("src/sub/b.txt", "B")])
+			);
+			assert_eq!(
+				run_copy(&model, cx, repo_row),
+				entries(&[
+					("src/a.txt", "A"),
+					("src/sub/b.txt", "B"),
+					("srcx.txt", "X"),
+					("top.txt", "T"),
+				])
+			);
+			// The exporter names other repos' files by repo; the open
+			// repo's stay bare.
+			assert_eq!(
+				model.read_with(cx, |m, _| m.repo().unwrap().name.clone()),
+				"alpha"
+			);
+			assert_eq!(
+				run_copy(&model, cx, group),
+				entries(&[
+					("src/a.txt", "A"),
+					("src/sub/b.txt", "B"),
+					("srcx.txt", "X"),
+					("top.txt", "T"),
+					("beta/other.txt", "O"),
+				])
+			);
+			// Nothing is staged: that group has nothing to copy.
+			model.read_with(cx, |m, _| {
+				assert!(copy_of(m.change_group_menu("staged")).is_none());
+			});
+		}
+
+		/// Ctrl+C copies the node under the Changes cursor: a file row, or
+		/// a whole group from its header.
+		#[gpui::test]
+		fn ctrl_c_copies_the_change_under_the_cursor(cx: &mut TestAppContext) {
+			use crate::ui::ChangeItemRow;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(
+				ws.path(),
+				"alpha",
+				&[("new0.txt", "hello"), ("new1.txt", "x")],
+			);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let row_of = |m: &WorkbenchModel, want: &str| {
+				m.change_item_rows()
+					.iter()
+					.position(|r| match r {
+						ChangeItemRow::File { file_idx, .. } => {
+							m.files[*file_idx].path == want
+						}
+						ChangeItemRow::Header { group_id, .. } => {
+							*group_id == want
+						}
+						_ => false,
+					})
+					.unwrap()
+			};
+			model
+				.update(cx, |m, _| m.selected_list_row = row_of(m, "new0.txt"));
 			cx.simulate_keystrokes("ctrl-c");
 			cx.run_until_parked();
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.status.key, "status_copied", "{}", m.status)
 			});
-			let mut got: Vec<(String, String)> =
-				parse_clipboard(&clip::read_text().unwrap(), "")
-					.into_iter()
-					.map(|e| (e.path, e.content))
-					.collect();
-			got.sort();
+			assert_eq!(clipboard_entries(), entries(&[("new0.txt", "hello")]));
+			model
+				.update(cx, |m, _| m.selected_list_row = row_of(m, "unstaged"));
+			cx.simulate_keystrokes("ctrl-c");
+			cx.run_until_parked();
 			assert_eq!(
-				got,
-				[
-					("base.txt".to_string(), "base".to_string()),
-					("new0.txt".to_string(), "hello".to_string()),
-				]
+				clipboard_entries(),
+				entries(&[("new0.txt", "hello"), ("new1.txt", "x")])
+			);
+			// The Reader's Ctrl+C with no text selected copies that node too.
+			let idx = model.read_with(cx, |m, _| {
+				m.files.iter().position(|f| f.path == "new1.txt").unwrap()
+			});
+			model.update(cx, |m, cx| m.select_change(idx, cx));
+			settle(cx);
+			cx.update(|window, cx| {
+				model.update(cx, |m, _| {
+					assert!(m.preview.is_some());
+					m.selected_list_row = row_of(m, "new0.txt");
+					window.focus(&m.reader_focus);
+				})
+			});
+			clip::write_text("other").unwrap();
+			cx.simulate_keystrokes("ctrl-c");
+			cx.run_until_parked();
+			assert_eq!(clipboard_entries(), entries(&[("new0.txt", "hello")]));
+		}
+
+		/// Loads `idx`'s Project tree.
+		fn open_repo_tree(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			idx: usize,
+		) {
+			model.update(cx, |m, cx| m.select_repo(idx, cx));
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| {
+					m.file_tree.as_ref().is_some_and(|t| t.is_loaded)
+				}) {
+					return;
+				}
+			}
+			panic!("repo {idx} tree never loaded");
+		}
+
+		/// Project rows picked with click and Cmd-click copy together from
+		/// any selected row's menu and from Ctrl+C; a folder copies the
+		/// files under it.
+		#[gpui::test]
+		fn copy_on_project_rows_copies_the_selection(cx: &mut TestAppContext) {
+			use crate::tree::{NodeKey, TreeCommand};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "alpha", &[]);
+			fs::create_dir(root.join("dir")).unwrap();
+			fs::write(root.join("dir/b.txt"), "B").unwrap();
+			fs::write(root.join("dir/c.txt"), "C").unwrap();
+			fs::write(root.join("z.txt"), "Z").unwrap();
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			open_repo_tree(&model, cx, 0);
+			model.update(cx, |m, cx| {
+				m.select_tree_rows_alone(false, &["base.txt".into()], cx);
+				m.dispatch_tree(
+					Some(TreeCommand::ToggleSelect(NodeKey::from_utf8_rel(
+						"dir",
+					))),
+					cx,
+				);
+			});
+			let targets = model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_count(), 2);
+				let tree = m.file_tree.as_ref().unwrap();
+				let rows = tree.flatten_visible(tree.visible_limit());
+				let row = |rel: &str| {
+					rows.iter().find(|r| r.rel_path == rel).unwrap().clone()
+				};
+				assert!(
+					copy_of(m.work_row_menu(&row("z.txt"), false)).is_none()
+				);
+				copy_of(m.work_row_menu(&row("base.txt"), false)).unwrap()
+			});
+			let want = entries(&[
+				("base.txt", "base"),
+				("dir/b.txt", "B"),
+				("dir/c.txt", "C"),
+			]);
+			assert_eq!(run_copy(&model, cx, targets), want);
+			clip::write_text("other").unwrap();
+			cx.simulate_keystrokes("alt-1");
+			cx.simulate_keystrokes("ctrl-c");
+			cx.run_until_parked();
+			assert_eq!(clipboard_entries(), want);
+		}
+
+		/// The Project selection is tree state: leaving the repo and coming
+		/// back shows the same rows selected; a plain click elsewhere drops
+		/// it.
+		#[gpui::test]
+		fn project_selection_survives_switching_repos(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[("a.txt", "a")]);
+			repo(ws.path(), "beta", &[("b.txt", "b")]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let idx = |m: &WorkbenchModel, name: &str| {
+				m.repos.iter().position(|r| r.name == name).unwrap()
+			};
+			let alpha = model.read_with(cx, |m, _| idx(m, "alpha"));
+			let beta = model.read_with(cx, |m, _| idx(m, "beta"));
+			let selected = |model: &Entity<WorkbenchModel>,
+			                cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.file_tree.as_ref().unwrap().selected_paths().to_vec()
+				})
+			};
+			open_repo_tree(&model, cx, alpha);
+			model.update(cx, |m, cx| {
+				m.select_tree_rows_alone(false, &["a.txt".into()], cx)
+			});
+			open_repo_tree(&model, cx, beta);
+			assert!(selected(&model, cx).is_empty());
+			open_repo_tree(&model, cx, alpha);
+			assert_eq!(selected(&model, cx), ["a.txt"]);
+			model.update(cx, |m, cx| {
+				m.select_tree_rows_alone(false, &["base.txt".into()], cx)
+			});
+			assert_eq!(selected(&model, cx), ["base.txt"]);
+		}
+
+		/// Rows Cmd-clicked in one repo and then in another copy together,
+		/// the way one payload spans repos; a plain click drops the first
+		/// repo's rows.
+		#[gpui::test]
+		fn project_copy_spans_repos_picked_with_cmd_click(
+			cx: &mut TestAppContext,
+		) {
+			use crate::tree::{NodeKey, TreeCommand};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[("a.txt", "A")]);
+			repo(ws.path(), "beta", &[("b.txt", "B")]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let idx = |m: &WorkbenchModel, name: &str| {
+				m.repos.iter().position(|r| r.name == name).unwrap()
+			};
+			let alpha = model.read_with(cx, |m, _| idx(m, "alpha"));
+			let beta = model.read_with(cx, |m, _| idx(m, "beta"));
+			let toggle = |model: &Entity<WorkbenchModel>,
+			              cx: &mut VisualTestContext,
+			              rel: &str| {
+				model.update(cx, |m, cx| {
+					m.dispatch_tree(
+						Some(TreeCommand::ToggleSelect(
+							NodeKey::from_utf8_rel(rel),
+						)),
+						cx,
+					)
+				})
+			};
+			open_repo_tree(&model, cx, alpha);
+			toggle(&model, cx, "a.txt");
+			open_repo_tree(&model, cx, beta);
+			toggle(&model, cx, "b.txt");
+			let targets = model.read_with(cx, |m, _| m.project_targets());
+			assert_eq!(
+				run_copy(&model, cx, targets),
+				entries(&[("alpha/a.txt", "A"), ("b.txt", "B")])
+			);
+			model.update(cx, |m, cx| {
+				m.select_tree_rows_alone(false, &["b.txt".into()], cx)
+			});
+			let targets = model.read_with(cx, |m, _| m.project_targets());
+			assert_eq!(
+				run_copy(&model, cx, targets),
+				entries(&[("b.txt", "B")])
+			);
+		}
+
+		/// A file of a browsed commit tree copies its bytes at that commit,
+		/// not the working copy; a folder row offers no Copy.
+		#[gpui::test]
+		fn copy_on_a_commit_tree_file_reads_it_at_that_commit(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::transfer::SourceKind;
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let root = repo(ws.path(), "alpha", &[]);
+			fs::write(root.join("base.txt"), "changed").unwrap();
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let sha = model.read_with(cx, |m, _| m.commits[0].sha.clone());
+			model.update(cx, |m, cx| {
+				m.select_commit(&sha, cx);
+				m.browse_commit_tree(cx);
+			});
+			settle(cx);
+			let targets = model.read_with(cx, |m, _| {
+				assert!(m.rev_tree.is_some());
+				assert!(copy_of(m.rev_row_menu("dir", false)).is_none());
+				copy_of(m.rev_row_menu("base.txt", true)).unwrap()
+			});
+			assert!(matches!(
+				&targets[0].source,
+				SourceKind::Commit { rev } if *rev == sha
+			));
+			assert_eq!(
+				run_copy(&model, cx, targets),
+				entries(&[("base.txt", "base")])
 			);
 		}
 
@@ -10520,34 +10954,24 @@ mod tests {
 		/// APFS refuses such names, so Linux only.
 		#[cfg(target_os = "linux")]
 		#[gpui::test]
-		fn a_non_utf8_change_is_left_out_of_the_selection(
-			cx: &mut TestAppContext,
-		) {
+		fn a_non_utf8_change_is_left_out_of_the_copy(cx: &mut TestAppContext) {
 			use std::os::unix::ffi::OsStrExt;
+			let Some(_clip) = clipboard() else { return };
 			let ws = tempfile::tempdir().unwrap();
 			let repo = repo(ws.path(), "alpha", &[("good.txt", "g")]);
 			let bad = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
 			fs::write(repo.join(bad), "b").unwrap();
 			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
-			cx.simulate_keystrokes("alt-s");
-			let bad_idx = model.read_with(cx, |m, _| {
-				let mut rows: Vec<(&str, bool)> = m
-					.files
-					.iter()
-					.map(|f| (f.path.as_str(), f.selected))
-					.collect();
-				rows.sort();
-				assert_eq!(
-					rows,
-					[("bad\u{FFFD}.txt", false), ("good.txt", true)]
-				);
-				m.files.iter().position(|f| !f.is_valid_utf8()).unwrap()
+			let group = model.read_with(cx, |m, _| {
+				let bad_idx =
+					m.files.iter().position(|f| !f.is_valid_utf8()).unwrap();
+				assert!(copy_of(m.change_row_menu(bad_idx)).is_none());
+				copy_of(m.change_group_menu("unstaged")).unwrap()
 			});
-			model.update(cx, |m, cx| m.toggle_file(bad_idx, cx));
-			model.read_with(cx, |m, _| {
-				assert!(!m.files[bad_idx].selected);
-				assert_eq!(m.status.key, "change_not_utf8");
-			});
+			assert_eq!(
+				run_copy(&model, cx, group),
+				entries(&[("good.txt", "g")])
+			);
 		}
 
 		/// Click the centre of the rendered control `id`, the way a user
@@ -10930,7 +11354,6 @@ mod tests {
 				change_type: Some(crate::ChangeType::Modified),
 				source: snip_core::transfer::SourceKind::Working,
 				is_conflict: false,
-				selected: true,
 				repo,
 			}
 		}
@@ -11703,14 +12126,12 @@ mod tests {
 	}
 
 	mod folder_copy {
-		use crate::{
-			expand_folder_items, native_export_settings,
-			NATIVE_FILE_COUNT_LIMIT,
-		};
-		use snip_core::gitrun::CancelToken;
+		use crate::{native_export_settings, NATIVE_FILE_COUNT_LIMIT};
+		use snip_core::gitrun::{CancelToken, RunOptions};
+		use snip_core::transfer::expand_folder_items;
 		use snip_core::transfer::{
-			plan_export, CanonicalRootId, ExportItem, ExportSelection,
-			SourceKind,
+			copy_selection_detailed, plan_export, CanonicalRootId, ExportItem,
+			ExportSelection, SourceKind,
 		};
 		use std::fs;
 		use std::path::{Path, PathBuf};
@@ -11875,7 +12296,9 @@ mod tests {
 			assert!(!exact.truncated);
 		}
 
-		/// A walk cut at the limit reaches the toast as a partial copy.
+		/// A copy the file limit cuts reaches the toast as a partial copy;
+		/// the shared engine stops at the limit, and copies the whole
+		/// folder without one.
 		#[test]
 		fn truncated_copy_says_so_in_the_status() {
 			let (_tmp, root) = canonical_tmp();
@@ -11883,65 +12306,39 @@ mod tests {
 			for i in 0..8 {
 				fs::write(root.join(format!("big/{i}.txt")), "B").unwrap();
 			}
-			let cut = expand_folder_items(
+			let mut cut = native_export_settings();
+			cut.set_max_file_count = true;
+			cut.file_count_limit = 3.0;
+			let report = copy_selection_detailed(
 				selection(&root, &["big"]),
-				3,
-				&CancelToken::new(),
+				&cut,
+				NATIVE_FILE_COUNT_LIMIT,
+				&RunOptions::default(),
+				|_| {},
 			)
 			.unwrap();
-			let plan =
-				plan_export(&cut.sel, &native_export_settings(), None).unwrap();
-			let msg = crate::copied_status("r".into(), &plan, &cut);
+			assert_eq!(report.outcome.copied, 3);
+			assert!(report.outcome.truncated);
+			let msg = crate::copied_status("r".into(), &report.outcome);
 			assert_eq!(msg.key, "status_copied_limit");
 			assert_eq!(msg.args[1], "3");
 			assert_eq!(msg.args[5], NATIVE_FILE_COUNT_LIMIT.to_string());
-			let whole = expand_folder_items(
+
+			let mut whole = native_export_settings();
+			whole.set_max_file_count = false;
+			let report = copy_selection_detailed(
 				selection(&root, &["big"]),
-				8,
-				&CancelToken::new(),
+				&whole,
+				NATIVE_FILE_COUNT_LIMIT,
+				&RunOptions::default(),
+				|_| {},
 			)
 			.unwrap();
-			let plan = plan_export(&whole.sel, &native_export_settings(), None)
-				.unwrap();
+			assert_eq!(report.outcome.copied, 8);
+			assert!(!report.outcome.truncated);
 			assert_eq!(
-				crate::copied_status("r".into(), &plan, &whole).key,
+				crate::copied_status("r".into(), &report.outcome).key,
 				"status_copied"
-			);
-		}
-
-		/// A Project file that is also a Working change copies once; a
-		/// Staged twin is still a real conflict.
-		#[test]
-		fn worktree_twin_of_a_project_file_is_dropped() {
-			let (_tmp, root) = canonical_tmp();
-			let id = CanonicalRootId::new(&root).unwrap();
-			let item = |path: &str, source: SourceKind| ExportItem {
-				root: id.clone(),
-				relative_path: path.into(),
-				source,
-				change_type: None,
-				gitlink: false,
-			};
-			let items = [
-				item("a.txt", SourceKind::File),
-				item("a.txt", SourceKind::Working),
-				item("b.txt", SourceKind::File),
-				item("b.txt", SourceKind::Staged),
-				item("c.txt", SourceKind::Unstaged),
-				item("c.txt", SourceKind::File),
-			];
-			let kept: Vec<_> = crate::without_worktree_twins(&items)
-				.into_iter()
-				.map(|i| (i.relative_path.as_str(), i.source.clone()))
-				.collect();
-			assert_eq!(
-				kept,
-				[
-					("a.txt", SourceKind::Working),
-					("b.txt", SourceKind::File),
-					("b.txt", SourceKind::Staged),
-					("c.txt", SourceKind::Unstaged),
-				]
 			);
 		}
 
@@ -11968,412 +12365,17 @@ mod tests {
 	}
 
 	#[test]
-	fn prepared_removal_uses_admitted_identity_after_root_deletion() {
-		use snip_core::workspace::RepoKind;
-		let temp = tempfile::tempdir().unwrap();
-		let path = temp.path().join("selected");
-		std::fs::create_dir(&path).unwrap();
-		let other_dir = tempfile::tempdir().unwrap();
-		let root = CanonicalRootId::new(&path).unwrap();
-		#[cfg(unix)]
-		let presented = {
-			let alias = temp.path().join("presented");
-			std::os::unix::fs::symlink(&path, &alias).unwrap();
-			alias
-		};
-		#[cfg(not(unix))]
-		let presented = {
-			let alias = temp.path().join("parent");
-			std::fs::create_dir(&alias).unwrap();
-			alias.join("..").join("selected")
-		};
-		assert_eq!(CanonicalRootId::new(&presented).unwrap(), root);
-		let other_root = CanonicalRootId::new(other_dir.path()).unwrap();
-		let repo = RepoEntry {
-			root: presented,
-			name: "selected".into(),
-			kind: RepoEntryKind::Main,
-			identity: Some(RepoIdentity {
-				toplevel: root.path().to_path_buf(),
-				git_dir: path.join(".git"),
-				common_dir: path.join(".git"),
-				kind: RepoKind::Main,
-			}),
-			summary: Err("offline".into()),
-		};
-		let files: Vec<_> = ["same.txt", "kept.txt"]
-			.into_iter()
-			.map(|path| FileChangeItem {
-				path: path.into(),
-				source: SourceKind::Staged,
-				change_type: None,
-				is_conflict: false,
-				selected: true,
-				repo: 0,
-			})
-			.collect();
-		let sha_a = "a".repeat(40);
-		let sha_b = "b".repeat(40);
-		let mut old = PreparedSelection::new(
-			&files,
-			&["same.txt".into(), "kept.txt".into()],
-			&[],
-		);
-		old.replace_file_group = true;
-		old.replace_git_group = true;
-		assert!(old.sync_root(root.clone(), true, Some(0)));
-		assert!(old.toggle_revision(root.clone(), &sha_a, "same.txt"));
-		assert!(old.toggle_revision(root.clone(), &sha_b, "same.txt"));
-		assert!(old.toggle_revision(other_root.clone(), &sha_a, "same.txt"));
-		old.basket.reserve_exact(7);
-		for (_, items) in &mut old.basket {
-			items.reserve_exact(19);
-		}
-		let reserve = MAX_RETAINED_TREE_BYTES - old.retained_bytes() - 2048;
-		old.files[0].path.reserve_exact(reserve);
-		let old_bytes = old.retained_bytes();
-		assert!(
-			old_bytes < MAX_RETAINED_TREE_BYTES
-				&& old_bytes > MAX_RETAINED_TREE_BYTES - 4096
-		);
-		let before = old.basket.clone();
-		std::fs::remove_dir(&path).unwrap();
-		assert!(
-			CanonicalRootId::new(&repo.root).is_err(),
-			"the real root has disappeared"
-		);
-		let admitted = admitted_selection_root(&repo, &old.basket)
-			.expect("stored canonical identity survives deletion");
-		assert_eq!(admitted, root);
-		let mut removal =
-			PreparedSelection::new(&old.files, &old.paths, &old.basket);
-		removal.replace_file_group = true;
-		removal.replace_git_group = true;
-		removal.remove_only = true;
-		removal.files[0].selected = false;
-		removal.paths.retain(|path| path != "same.txt");
-		let kept_item = removal
-			.basket
-			.iter_mut()
-			.find(|(id, _)| id == &root)
-			.unwrap()
-			.1
-			.iter_mut()
-			.find(|item| {
-				item.relative_path == "kept.txt"
-					&& item.source == SourceKind::Staged
-			})
-			.unwrap();
-		kept_item.relative_path.reserve_exact(4096);
-		let retained_path = (
-			kept_item.relative_path.as_ptr(),
-			kept_item.relative_path.capacity(),
-		);
-		removal.status = Some(Msg::new("status_selection_removed", []));
-		assert!(removal.sync_root(admitted, true, Some(0)));
-		assert!(removal.retained_bytes() < old_bytes);
-		assert!(removal.fits_replacing(
-			MAX_RETAINED_TREE_BYTES,
-			old_bytes,
-			MAX_RETAINED_TREE_BYTES
-		));
-		let kept =
-			&removal.basket.iter().find(|(id, _)| id == &root).unwrap().1;
-		assert_eq!(kept.len(), 4);
-		let still_selected = kept
-			.iter()
-			.find(|item| {
-				item.relative_path == "kept.txt"
-					&& item.source == SourceKind::Staged
-			})
-			.unwrap();
-		assert_eq!((still_selected.relative_path.as_ptr(), still_selected.relative_path.capacity()), retained_path,
-			"toggle-off filters in place instead of rebuilding the remaining group");
-		assert!(kept.iter().all(|item| item.relative_path == "kept.txt" || matches!(&item.source, SourceKind::Commit { rev } if rev == &sha_a || rev == &sha_b)));
-		assert_eq!(
-			removal
-				.basket
-				.iter()
-				.find(|(id, _)| id == &other_root)
-				.unwrap()
-				.1,
-			before.iter().find(|(id, _)| id == &other_root).unwrap().1
-		);
-		assert_eq!(old.basket, before);
-		for file in &mut removal.files {
-			file.selected = false;
-		}
-		removal.paths = Vec::new();
-		assert!(removal.sync_root(root.clone(), true, Some(0)));
-		let kept =
-			&removal.basket.iter().find(|(id, _)| id == &root).unwrap().1;
-		assert_eq!(
-			kept.len(),
-			2,
-			"Deselect All keeps both explicit historical selections"
-		);
-		assert!(kept
-			.iter()
-			.all(|item| matches!(item.source, SourceKind::Commit { .. })));
-		assert!(!removal.toggle_revision(root.clone(), &sha_a, "same.txt"));
-		assert!(removal.fits_replacing(
-			MAX_RETAINED_TREE_BYTES,
-			old_bytes,
-			MAX_RETAINED_TREE_BYTES
-		));
-	}
-
-	#[test]
-	fn lossy_change_names_are_not_checkable() {
+	fn lossy_change_names_are_not_copyable() {
 		let item = |path: String| FileChangeItem {
 			path,
 			change_type: None,
 			source: SourceKind::Working,
 			is_conflict: false,
-			selected: false,
 			repo: 0,
 		};
 		let lossy = String::from_utf8_lossy(b"bad\xff.txt").into_owned();
 		assert!(!item(lossy).is_valid_utf8());
 		assert!(item("長路徑/good.txt".into()).is_valid_utf8());
-	}
-
-	#[test]
-	fn basket_order_key_matches_the_source_summary_text() {
-		let sources = [
-			SourceKind::Staged,
-			SourceKind::Unstaged,
-			SourceKind::Working,
-			SourceKind::File,
-			SourceKind::Commit {
-				rev: "b".repeat(40),
-			},
-			SourceKind::Commit {
-				rev: "a".repeat(40),
-			},
-			SourceKind::Commit { rev: "abc".into() },
-		];
-		for a in &sources {
-			for b in &sources {
-				assert_eq!(
-					source_order(a).cmp(&source_order(b)),
-					WorkbenchModel::source_summary(a)
-						.cmp(&WorkbenchModel::source_summary(b)),
-					"{a:?} vs {b:?}"
-				);
-			}
-		}
-	}
-
-	#[test]
-	fn project_intent_preserves_git_group_while_change_list_is_unloaded() {
-		let dir = tempfile::tempdir().unwrap();
-		let root = CanonicalRootId::new(dir.path()).unwrap();
-		let staged = ExportItem {
-			root: root.clone(),
-			relative_path: "same.txt".into(),
-			source: SourceKind::Staged,
-			change_type: None,
-			gitlink: false,
-		};
-		let historical = ExportItem {
-			root: root.clone(),
-			relative_path: "same.txt".into(),
-			source: SourceKind::Commit {
-				rev: "a".repeat(40),
-			},
-			change_type: None,
-			gitlink: false,
-		};
-		let mut candidate = PreparedSelection::new(
-			&[],
-			&["new.txt".into()],
-			&[(root.clone(), vec![staged.clone(), historical.clone()])],
-		);
-		candidate.replace_file_group = true;
-		assert!(candidate.sync_root(root, true, Some(0)));
-		assert!(candidate.basket[0].1.contains(&staged));
-		assert!(candidate.basket[0].1.contains(&historical));
-		assert_eq!(candidate.basket[0].1.len(), 3);
-	}
-
-	#[test]
-	fn prepared_selection_is_whole_and_keeps_root_source_and_full_oid() {
-		let one = tempfile::tempdir().unwrap();
-		let two = tempfile::tempdir().unwrap();
-		let root = CanonicalRootId::new(one.path()).unwrap();
-		let other_root = CanonicalRootId::new(two.path()).unwrap();
-		let sha_a = "a".repeat(40);
-		let sha_b = "b".repeat(40);
-		let files: Vec<_> = [
-			SourceKind::Staged,
-			SourceKind::Unstaged,
-			SourceKind::Working,
-		]
-		.into_iter()
-		.map(|source| FileChangeItem {
-			path: "same.txt".into(),
-			change_type: None,
-			source,
-			is_conflict: false,
-			selected: false,
-			repo: 0,
-		})
-		.collect();
-		let mut old = PreparedSelection::new(&files, &["same.txt".into()], &[]);
-		old.replace_file_group = true;
-		old.replace_git_group = true;
-		assert!(old.sync_root(root.clone(), true, Some(0)));
-		assert!(old.toggle_revision(other_root.clone(), &sha_b, "same.txt"));
-		let before = old.basket.clone();
-		let old_bytes = old.retained_bytes();
-		let mut candidate =
-			PreparedSelection::new(&old.files, &old.paths, &old.basket);
-		for file in &mut candidate.files {
-			file.selected = true;
-		}
-		assert!(candidate.toggle_revision(root.clone(), &sha_a, "same.txt"));
-		assert!(candidate.toggle_revision(root.clone(), &sha_b, "same.txt"));
-		candidate.replace_file_group = true;
-		candidate.replace_git_group = true;
-		assert!(candidate.sync_root(root.clone(), true, Some(0)));
-		let bytes = candidate.retained_bytes();
-		assert!(bytes > old_bytes);
-		let other_owners = 173;
-		assert!(candidate.fits_replacing(
-			other_owners + old_bytes,
-			old_bytes,
-			other_owners + bytes
-		));
-		assert!(!candidate.fits_replacing(
-			other_owners + old_bytes,
-			old_bytes,
-			other_owners + bytes - 1
-		));
-		assert!(!candidate.fits_replacing(
-			old_bytes - 1,
-			old_bytes,
-			usize::MAX
-		));
-		assert_eq!(
-			old.basket, before,
-			"refusing the intent cannot install a prefix"
-		);
-		assert!(old.files.iter().all(|file| !file.selected));
-		let items = &candidate
-			.basket
-			.iter()
-			.find(|(id, _)| id == &root)
-			.unwrap()
-			.1;
-		assert_eq!(
-			items.len(),
-			6,
-			"File, index, working changes and both commits stay distinct"
-		);
-		for source in [
-			SourceKind::File,
-			SourceKind::Staged,
-			SourceKind::Unstaged,
-			SourceKind::Working,
-			SourceKind::Commit { rev: sha_a.clone() },
-			SourceKind::Commit { rev: sha_b.clone() },
-		] {
-			assert!(items.iter().any(|item| item.source == source
-				&& item.relative_path == "same.txt"));
-		}
-		assert_eq!(
-			candidate
-				.basket
-				.iter()
-				.find(|(id, _)| id == &other_root)
-				.unwrap()
-				.1,
-			before.iter().find(|(id, _)| id == &other_root).unwrap().1
-		);
-	}
-
-	#[test]
-	fn prepared_selection_counts_spare_storage_and_new_status_before_install() {
-		let temp = tempfile::tempdir().unwrap();
-		let root = CanonicalRootId::new(temp.path()).unwrap();
-		let mut candidate =
-			PreparedSelection::new(&[], &["same.txt".into()], &[]);
-		assert!(candidate.toggle_revision(
-			root.clone(),
-			&"a".repeat(40),
-			"same.txt"
-		));
-		candidate.replace_file_group = true;
-		assert!(candidate.sync_root(root, true, Some(0)));
-		let before = candidate.retained_bytes();
-		let slots = candidate.paths.capacity();
-		candidate.paths.reserve_exact(31);
-		let path_cap = candidate.paths[0].capacity();
-		candidate.paths[0].reserve_exact(4096);
-		let (root_slots, item_slots) = (
-			candidate.basket.capacity(),
-			candidate.basket[0].1.capacity(),
-		);
-		candidate.basket.reserve_exact(5);
-		candidate.basket[0].1.reserve_exact(17);
-		let after = candidate.retained_bytes();
-		assert_eq!(
-			after - before,
-			(candidate.paths.capacity() - slots)
-				* std::mem::size_of::<String>()
-				+ candidate.paths[0].capacity()
-				- path_cap + (candidate.basket.capacity() - root_slots)
-				* std::mem::size_of::<(CanonicalRootId, Vec<ExportItem>)>()
-				+ (candidate.basket[0].1.capacity() - item_slots)
-					* std::mem::size_of::<ExportItem>()
-		);
-		let mut status_path = String::with_capacity(8192);
-		status_path.push_str("same.txt");
-		candidate.status = Some(Msg::new("status_toggled_file", [status_path]));
-		assert_eq!(
-			candidate.retained_bytes() - after,
-			message_bytes(candidate.status.as_ref().unwrap())
-		);
-		assert!(!candidate.fits_replacing(before, before, after));
-	}
-
-	#[test]
-	fn prepared_selection_stops_repeated_root_amplification() {
-		let temp = tempfile::tempdir().unwrap();
-		let root_path = temp.path().join("r".repeat(200));
-		std::fs::create_dir(&root_path).unwrap();
-		let root = CanonicalRootId::new(root_path).unwrap();
-		let paths: Vec<_> = (0..40_000).map(|i| format!("p{i:06}")).collect();
-		let mut candidate = PreparedSelection::new(&[], &paths, &[]);
-		candidate.replace_file_group = true;
-		assert!(
-			candidate.retained_bytes()
-				+ root.retained_heap_bytes()
-				+ paths.len() * std::mem::size_of::<ExportItem>()
-				< MAX_RETAINED_TREE_BYTES,
-			"the whole slot allocation fits; repeated root/path heaps must reject"
-		);
-		assert!(!candidate.sync_root(root, true, Some(0)), "per-item root/path copies must be checked while building the whole basket");
-		assert!(
-			candidate.basket.is_empty(),
-			"a rejected partial group is never installed"
-		);
-		assert_eq!(paths.len(), 40_000);
-	}
-
-	#[test]
-	fn basket_display_clips_on_utf8_boundaries_without_growing_past_limit() {
-		let mut text = String::new();
-		assert!(append_basket_display(&mut text, "prefix "));
-		assert!(!append_basket_display(
-			&mut text,
-			&"漢".repeat(MAX_BASKET_DISPLAY_BYTES)
-		));
-		assert!(text.len() <= MAX_BASKET_DISPLAY_BYTES && text.ends_with('…'));
-		let mut exact = "a".repeat(MAX_BASKET_DISPLAY_BYTES);
-		assert!(!append_basket_display(&mut exact, "next"));
-		assert_eq!(exact.len(), MAX_BASKET_DISPLAY_BYTES);
 	}
 
 	#[test]
@@ -12805,7 +12807,6 @@ mod tests {
 			change_type: None,
 			source,
 			is_conflict: false,
-			selected: false,
 			repo,
 		}
 	}
@@ -13295,9 +13296,9 @@ mod tests {
 		let clean = export(CommitsPayload {
 			commits: vec![record(vec![file("a.txt", None)]), record(vec![])],
 		});
-		let msg = commit_copied_status(&clean);
-		assert_eq!(msg.key, "status_commits_copied");
 		let chars = clean.text.encode_utf16().count().to_string();
+		let msg = commit_copied_status(&clean.outcome());
+		assert_eq!(msg.key, "status_commits_copied");
 		assert_eq!(msg.args, ["2", "1", chars.as_str()]);
 
 		let lossy = export(CommitsPayload {
@@ -13307,7 +13308,7 @@ mod tests {
 				record(vec![file("w.bin", bin)]),
 			],
 		});
-		let msg = commit_copied_status(&lossy);
+		let msg = commit_copied_status(&lossy.outcome());
 		assert_eq!(msg.key, "status_commits_copied_skipped");
 		assert_eq!(&msg.args[..2], ["3", "5"]);
 		assert_eq!(&msg.args[3..], ["4", "#1 x.bin; #2 y.bin, z.bin …"]);
@@ -13382,39 +13383,5 @@ mod tests {
 				"F0:docs/guide.md",
 			]
 		);
-	}
-
-	#[test]
-	fn change_dir_checkbox_is_tri_state() {
-		let (_, mut files) = nested_repo();
-		let under = |dir: &'static str| {
-			move |f: &FileChangeItem| {
-				menu::change_group(f) == Some("unstaged")
-					&& menu::path_under(&f.path, dir)
-			}
-		};
-		assert_eq!(menu::rows_tri_state(&files, under("src")), Some(false));
-		// A prefix that is not a whole directory name does not match.
-		assert!(!menu::path_under("src2/a", "src"));
-		assert!(!menu::path_under("src", "src"));
-		for f in &mut files {
-			if f.path.starts_with("src/main/") {
-				f.selected = true;
-			}
-		}
-		assert_eq!(menu::rows_tri_state(&files, under("src")), None);
-		assert_eq!(
-			menu::rows_tri_state(&files, under("src/main/java/pkg")),
-			Some(true)
-		);
-		for f in &mut files {
-			if f.path.starts_with("src/") {
-				f.selected = true;
-			}
-		}
-		assert_eq!(menu::rows_tri_state(&files, under("src")), Some(true));
-		// Only files of that group count: the staged `docs` file is not
-		// under an Unstaged directory.
-		assert_eq!(menu::rows_tri_state(&files, under("docs")), Some(false));
 	}
 }

@@ -122,7 +122,7 @@ export SNIP_NATIVE_E2E_EXPORT_HOLD_FILE="$RUN/export-hold"
 
 視窗要跑三種邏輯尺寸：1080×752（對照 2026-09-29 報告的 BUG-04）、1080×720 與 900×600（驗收規格）。把視窗調到該尺寸後，從這一次啟動的日誌抄下最新的 `[APP:VIEWPORT: WxH]`。這行是實體像素，Retina 上會比邏輯尺寸大。兩組數字都留下。功能 oracle 在三種尺寸相同；T36 每種尺寸各判一次。
 
-快捷鍵用 macOS 的 Cmd：Cmd+C 複製、Cmd+V 開預覽、Cmd+Q 結束、Cmd+Shift+O 開工作區、Cmd+Shift+W 關工作區。Option+1 專案、Option+0 變更、Option+9 Git log、Option+Shift+R 選 repo。預覽面板裡 Enter 套用、Escape 取消、Space 切換目前列。程式也綁了 Ctrl；操作仍按 Cmd，並用日誌確認送到的是複製。在這個 App 裡按 Cmd+C 是 App 自己的複製。
+快捷鍵用 macOS 的 Cmd：Cmd+C 複製（左側工具視窗游標所在的節點，等同它右鍵的「複製」；專案視窗是選取的列；閱讀器有選取文字時複製文字）、Cmd+V 開預覽、Cmd+Q 結束、Cmd+Shift+O 開工作區、Cmd+Shift+W 關工作區。Option+1 專案、Option+0 變更、Option+9 Git log、Option+Shift+R 選 repo。預覽面板裡 Enter 套用、Escape 取消、Space 切換目前列。程式也綁了 Ctrl；操作仍按 Cmd，並用日誌確認送到的是複製。在這個 App 裡按 Cmd+C 是 App 自己的複製。
 
 Shell 可以建立 fixture、用 argv 叫 Git、把 Git 輸出寫進檔再算雜湊、用 `pbcopy` 放入 sentinel 或 T15 的普通文字、用 `pbpaste` 讀剪貼簿。Shell 不執行 `snip copy` 或 `snip paste` 來代替畫面上的複製與貼上。
 
@@ -164,15 +164,17 @@ ID 以受測 binary 印出的為準。下面是 `ed3d057`（develop）的名字�
 |---|---|
 | 左軌 | `rail-project`、`rail-changes`、`rail-log` |
 | 工作區 | `btn-workspace-menu`、`btn-open-workspace`、`btn-workspace-open-confirm`、`btn-close-workspace`、`btn-open-folder` |
-| 工具列 | `btn-repo-selector`、`btn-ref-selector`、`btn-copy`、`btn-paste`、`btn-refresh`、`btn-basket-clear` |
+| 工具列 | `btn-repo-selector`、`btn-ref-selector`、`btn-paste`、`btn-refresh` |
+| 右鍵選單 | `context-menu`、`menu-item:copy-files`（「複製」：只複製選單所在的那個節點）、`menu-item:show-diff`、`menu-item:copy-path`、`menu-item:copy-relative-path`。日誌 `[APP:MENU_OPEN: Left items=…]`、`[APP:MENU_ACTION: <id>]`、`[APP:MENU_CLOSED]` |
 | 選單列 | `pick-repo:<名稱>`；只有同名的 repo 才用 `pick-repo:<序號>:<名稱>`（新產生的閘門 A 在 machine-a 只有 `billing` 與 `docs` 兩個同名，其他都是 `pick-repo:<名稱>`）。`pick-ref:<名稱>` |
-| 變更列 | `change-row@<repo>:<staged\|unstaged\|untracked\|conflicted>:<path>`，勾選是 `change-chk@...`。目前選取中的 repo 才同時有舊 ID `change-row:<source>:<path>` |
-| 變更群組 | `change-repo:<群組>:<repo>`、`change-repo-toggle:<群組>:<repo>` |
+| 變更列 | `change-row@<repo>:<staged\|unstaged\|untracked\|conflicted>:<path>`，沒有勾選框；右鍵「複製」複製這一個檔案（帶它的來源）。目前選取中的 repo 才同時有舊 ID `change-row:<source>:<path>` |
+| 變更群組 | `change-header:<群組>`、`change-repo:<群組>:<repo>`、`change-repo-toggle:<群組>:<repo>`、`change-dir:<群組>:<repo>:<path>`。右鍵「複製」：群組列是所有 repo 在該群組的檔案，repo 列是該 repo 在該群組的檔案，資料夾列是該 repo、該群組、該資料夾底下的檔案 |
+| 專案列 | `tree-row:<path>`、`ws-tree-row:<path>`。點擊選取該列，Ctrl/Cmd 點擊加入或移出選取（`[APP:TREE_TOGGLED: <path>]`），Shift 點擊選範圍。右鍵「複製」複製目前選取的列（資料夾整個走訪）；右鍵點在選取之外會先單獨選取那一列 |
 | Git log | `commit-row:<repo>:<7 字元 SHA>`；目前選取 repo 的列另外有 `commit-row:<7 字元 SHA>`。`btn-copy-commits`、`btn-log-regex`、`btn-head`、`log-search-input` |
 | log 顯示 | `btn-log-more` → `log-more:hash`（hash 欄，預設關）。日誌 `[APP:LOG_VIEW: hash]` |
 | 多 repo 篩選 | `log-filter-repo`、`log-repo:<名稱>`、`log-repo-check:<名稱>` |
 | 單一 repo 工作區的路徑篩選 | `log-filter-paths`。多 repo 工作區不要去點這個 ID |
-| 歷史檔案 | `btn-browse-tree:<完整 SHA>`、`rev-row:<path>`、`rev-chk:<完整 oid>:<path>`、`btn-leave-tree` |
+| 歷史檔案 | `btn-browse-tree:<完整 SHA>`、`rev-row:<path>`、`btn-leave-tree`。檔案列右鍵「複製」複製該檔在這個 commit 的內容；資料夾列的「複製」是停用的 |
 | Git log 變更檔案 | `commit-file:<path>`、`commit-dir:<path>`。資料夾列的選取 key 是 `<path>/`。左鍵資料夾是展開或收合；複製用右鍵 |
 | 貼上 | `btn-apply`、`btn-cancel`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`（`ix` 是計畫內的項目索引，由 `crate::paste::control_id` 產生）、`paste-items` |
 | commit 預覽 | `paste-commit:<c>`（`c` 從 0 起算，是該 commit 的標頭，點擊收合或展開）、`paste-commit-count`、`paste-commit-whole` |
@@ -243,8 +245,8 @@ python3 scripts/collaboration_fixture.py compare-step \
 正向步驟的共同點法：
 
 1. `btn-repo-selector` → `pick-repo:<名稱>`；只有同名的 `billing` 與 `docs` 用 `pick-repo:<序號>:<名稱>`，其他 repo 沒有序號。等 `[APP:REPO_SELECTING]` 的 canonical root 與 manifest 的 `relativePath` 一致。basename 相同的 repo 不能只看名字。
-2. 檔案步驟走 `rail-changes`，展開 `change-repo-toggle:<群組>:<repo>`，再點 `change-chk@<repo>:<source>:<path>`。
-3. `btn-copy`。等 `[APP:COPY_DONE]`。剪貼簿讀回 SHA-256 等於複製當下。
+2. 檔案步驟走 `rail-changes`，展開 `change-repo-toggle:<群組>:<repo>`，點 `change-row@<repo>:<source>:<path>` 看預覽；fixed OID 走 `btn-browse-tree:<完整 SHA>` 再點 `rev-row:<path>`。
+3. 對同一列右鍵，等 `[APP:MENU_OPEN: Left items=copy-files,…]`，點 `menu-item:copy-files`。等 `[APP:COPY_DONE]`。剪貼簿讀回 SHA-256 等於複製當下。一次「複製」只讀一個節點，而一個檔案步驟的操作混了不同來源（worktree、index、fixed OID、刪除），所以每個操作各自走一次第 2–6 步（複製、貼上、套用），全部套用完才跑 `compare-step`。
 4. 換到目的工作區，`btn-paste`。`[APP:PASTE_MAP_CANDIDATE]` 在 `[APP:PASTE_PREVIEW]` 之前出現，從按貼上之前的日誌位置開始讀。
 5. 點 `paste-map-pick:<prefix>:<idx>`，等 `[APP:PASTE_MAPPED]` 的 `dest` 就是那個 canonical root。已存在且內容會變的檔才點覆寫。
 6. `btn-apply`。等 `[APP:PASTE_DONE: ...]`，再跑 `compare-step`。
@@ -272,7 +274,7 @@ Commit 步驟把第 2–3 步換成：`rail-log`，點起點 `commit-row:<7 字�
 | `neg-mapping-collision` | 兩條路徑最後都映到同一個目的檔 | 第二次 replan 出現 `[APP:PASTE_PLAN_REFUSED: reason=target_collision]`；零寫入 |
 | `neg-mapping-ambiguous-basename` | 只給 `billing`，west 與 east 都有 | 候選 root 同時含這兩個 canonical path；`mapping_required`；取消後零寫入 |
 | `neg-mapping-missing-destination` | 不提交不存在的 repo id | `billing` 的候選正好是目的工作區那 15 個真實 root；Return 後 `[APP:PASTE_ERR: mapping_required]`；點 `btn-apply` 後 1 秒內沒有 `PASTE_APPLYING` 或 `PASTE_DONE` |
-| `neg-stale-source` | 啟動命令裡已經有 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選好變更後用 `pbcopy` 放入 sentinel，建立 `$RUN/export-hold`，再按一次 `btn-copy`。等到新的 `[APP:EXPORT_PLAN_READY: files=N]`（N 至少 1），改來源檔，拍快照，刪掉 hold 檔。同一次複製會接著跑。不要再按一次複製，也不要等選完才去設環境變數。這一步結束時 `$RUN/export-hold` 必須不存在。中途失敗而檔還在，先刪掉它，證據欄寫「hold 殘留，已刪」，然後才做後面的檔案模式複製。檔留著的話，之後每一次檔案模式複製都會停在 `EXPORT_PLAN_READY` | `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`；沒有 `COPY_DONE`；sentinel 不變；快照等於改完之後、刪掉 hold 之前那張；`$RUN/export-hold` 不存在 |
+| `neg-stale-source` | 啟動命令裡已經有 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選好變更列後對它右鍵，用 `pbcopy` 放入 sentinel，建立 `$RUN/export-hold`，再點一次 `menu-item:copy-files`。等到新的 `[APP:EXPORT_PLAN_READY: files=N]`（N 至少 1），改來源檔，拍快照，刪掉 hold 檔。同一次複製會接著跑。不要再按一次複製，也不要等選完才去設環境變數。這一步結束時 `$RUN/export-hold` 必須不存在。中途失敗而檔還在，先刪掉它，證據欄寫「hold 殘留，已刪」，然後才做後面的檔案模式複製。檔留著的話，之後每一次檔案模式複製都會停在 `EXPORT_PLAN_READY` | `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`；沒有 `COPY_DONE`；sentinel 不變；快照等於改完之後、刪掉 hold 之前那張；`$RUN/export-hold` 不存在 |
 | `neg-stale-target` | 預覽出現後改目的端，再 Apply | `[APP:PASTE_STALE_DETECTED: stale_modified]`（`stale_created`、`stale_deleted` 看外部改法）；畫面文字是「目的地檔案已在外部修改: …」；快照等於改完之後、Apply 之前那張 |
 | `neg-overwrite-unauthorized` | 目的檔已存在，不勾覆寫就 Apply | `[APP:PASTE_DONE:]` 且 `overwritten=0`；該檔位元組不變 |
 | `neg-cancel` | 預覽後 Escape 或 `btn-cancel` | `[APP:PASTE_CANCELLED]`；快照等於生成時的 baseline |

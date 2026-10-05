@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::fsutil;
 use crate::gitrun::{CancelToken, RunOptions};
 use crate::paths;
@@ -60,6 +62,170 @@ pub fn is_safe_dir_symlink(root: &Path, path: &Path) -> bool {
 		}
 	}
 	false
+}
+
+/// What one copy produced: the payload and the counts its status line
+/// reports. `copied == 0` means nothing could be copied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopyOutcome {
+	pub payload: String,
+	pub copied: usize,
+	/// UTF-16 code units of the payload.
+	pub chars: usize,
+	pub lines: usize,
+	/// Files left out: unreadable, over the size limit, or a name a folder
+	/// walk could not carry.
+	pub skipped: usize,
+	/// The file limit cut the copy short.
+	pub truncated: bool,
+}
+
+/// [`CopyOutcome`] plus the detail a local CLI prints: per-file skip
+/// reasons and the size/unreadable split its notes report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyReport {
+	pub outcome: CopyOutcome,
+	pub files: Vec<crate::format::PayloadFile>,
+	pub skipped_file_size: usize,
+	/// Plan-level unreadable plus the folder walk's refusals.
+	pub skipped_unreadable: usize,
+	pub file_limit_reached: bool,
+}
+
+/// The copy engine for a selection, shared by the desktop app, a remote
+/// worker and the local CLI: expands folders in progressively doubling
+/// batches starting at `file_limit` (so files a filter later excludes
+/// cannot hide the eligible ones behind the first batch, exactly as
+/// [`plan_export_expanding`] does), in input order — the TS copy layout —
+/// plans the payload (at most [`super::CLIPBOARD_PAYLOAD_MAX`]), runs
+/// `hold` (an e2e hook), and checks the sources did not change meanwhile.
+pub fn copy_selection(
+	sel: ExportSelection,
+	settings: &Settings,
+	file_limit: usize,
+	opts: &RunOptions,
+	hold: impl FnOnce(&ExportPlan),
+) -> Result<CopyOutcome, TransferError> {
+	match copy_selection_detailed(sel, settings, file_limit, opts, hold) {
+		Ok(report) => Ok(report.outcome),
+		// Every file under the folders was skipped: the wire answer is an
+		// empty copy with one skip, not an error.
+		Err(TransferError::EmptySelection) => Ok(CopyOutcome {
+			payload: String::new(),
+			copied: 0,
+			chars: 0,
+			lines: 0,
+			skipped: 1,
+			truncated: false,
+		}),
+		Err(err) => Err(err),
+	}
+}
+
+/// [`copy_selection`] with the detail a local CLI prints: the per-file
+/// skip reasons and the size/unreadable split its notes report.
+/// [`TransferError::EmptySelection`] reaches the caller, so a surface can
+/// say「every file in the selected folders was skipped」its own way.
+pub fn copy_selection_detailed(
+	sel: ExportSelection,
+	settings: &Settings,
+	file_limit: usize,
+	opts: &RunOptions,
+	hold: impl FnOnce(&ExportPlan),
+) -> Result<CopyReport, TransferError> {
+	let cancel = opts.cancel.clone().unwrap_or_default();
+	// Expands in doubling batches, as `plan_export_expanding` plans: when
+	// a batch truncates, the prefix alone answers if the file limit is
+	// already reached; otherwise the next batch doubles, because the items
+	// this prefix plans away (a filter's exclusions) say nothing about
+	// what the rest of the folder holds.
+	let mut limit = file_limit;
+	let (expanded, plan) = loop {
+		let expanded =
+			expand_folder_items_in_input_order(sel.clone(), limit, &cancel)?;
+		if !expanded.truncated {
+			let plan = super::plan_export_with(
+				&expanded.sel,
+				settings,
+				Some(super::CLIPBOARD_PAYLOAD_MAX),
+				opts,
+			)?;
+			break (expanded, plan);
+		}
+		let trunc_idx =
+			expanded.truncated_at.unwrap_or(expanded.sel.items.len());
+		let prefix_items = expanded.sel.items[..trunc_idx].to_vec();
+		let roots = sel.roots.iter().map(|r| r.path().to_path_buf()).collect();
+		let primary_root =
+			sel.primary_root.as_ref().map(|r| r.path().to_path_buf());
+		match ExportSelection::new(roots, primary_root, prefix_items) {
+			Ok(prefix_sel) => {
+				let prefix_sel = prefix_sel
+					.with_source_root(sel.source_root.clone())
+					.with_spelled_root(sel.spelled_root.clone());
+				match super::plan_export_with(
+					&prefix_sel,
+					settings,
+					Some(super::CLIPBOARD_PAYLOAD_MAX),
+					opts,
+				) {
+					Ok(plan) if plan.file_limit_reached => {
+						break (expanded, plan)
+					}
+					Ok(_) => {}
+					Err(e) => return Err(e),
+				}
+			}
+			Err(TransferError::EmptySelection) => {}
+			Err(e) => return Err(e),
+		}
+		if limit == usize::MAX {
+			let plan = super::plan_export_with(
+				&expanded.sel,
+				settings,
+				Some(super::CLIPBOARD_PAYLOAD_MAX),
+				opts,
+			)?;
+			break (expanded, plan);
+		}
+		limit = limit.saturating_mul(2);
+	};
+	let skipped = plan.skipped_unreadable_count
+		+ plan.skipped_file_size_count
+		+ expanded.skipped;
+	if plan.files.is_empty() {
+		return Ok(CopyReport {
+			outcome: CopyOutcome {
+				payload: String::new(),
+				copied: 0,
+				chars: 0,
+				lines: 0,
+				skipped,
+				truncated: false,
+			},
+			files: plan.files,
+			skipped_file_size: plan.skipped_file_size_count,
+			skipped_unreadable: plan.skipped_unreadable_count
+				+ expanded.skipped,
+			file_limit_reached: plan.file_limit_reached,
+		});
+	}
+	hold(&plan);
+	plan.revalidate_with(opts)?;
+	Ok(CopyReport {
+		outcome: CopyOutcome {
+			copied: plan.copied_file_count,
+			chars: plan.stats.chars,
+			lines: plan.stats.lines,
+			skipped,
+			truncated: expanded.truncated || plan.file_limit_reached,
+			payload: plan.payload,
+		},
+		files: plan.files,
+		skipped_file_size: plan.skipped_file_size_count,
+		skipped_unreadable: plan.skipped_unreadable_count + expanded.skipped,
+		file_limit_reached: plan.file_limit_reached,
+	})
 }
 
 /// A selected folder copies its files, walked in the copy job: a folder
@@ -748,6 +914,47 @@ mod tests {
 		);
 		assert!(!batched_plan_nl.file_limit_reached);
 		assert_eq!(batched_plan_nl.copied_file_count, 65);
+	}
+
+	#[test]
+	fn copy_selection_expands_past_an_excluded_prefix() {
+		use crate::settings::{FilterAction, FilterRule, FilterType};
+
+		// A folder whose first 70 files the filter excludes and whose one
+		// eligible file sorts last: one expansion at the initial batch
+		// never reaches it, so the copy must double the batch, exactly as
+		// `plan_export_expanding` does for a local CLI copy.
+		let dir = tempfile::tempdir().unwrap();
+		let sub = dir.path().join("sub");
+		std::fs::create_dir_all(&sub).unwrap();
+		for i in 0..70 {
+			std::fs::write(sub.join(format!("skip_{i:02}.txt")), "s\n")
+				.unwrap();
+		}
+		std::fs::write(sub.join("zz.txt"), "keep me\n").unwrap();
+		let settings = Settings {
+			use_filters: true,
+			filter_rules: vec![FilterRule {
+				kind: FilterType::Pattern,
+				action: FilterAction::Exclude,
+				value: "*skip*".to_string(),
+				enabled: true,
+			}],
+			..Settings::default()
+		};
+		let sel = selection_from_paths(
+			dir.path(),
+			dir.path(),
+			&[PathBuf::from("sub")],
+		)
+		.unwrap()
+		.sel;
+		let out =
+			copy_selection(sel, &settings, 64, &RunOptions::default(), |_| {})
+				.unwrap();
+		assert_eq!(out.copied, 1, "the eligible file is copied");
+		assert!(out.payload.contains("zz.txt"), "{}", out.payload);
+		assert!(!out.payload.contains("skip_"), "{}", out.payload);
 	}
 
 	#[test]

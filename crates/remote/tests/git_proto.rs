@@ -166,10 +166,10 @@ fn hand_written_v1_hello_still_opens_a_workspace() {
 }
 
 #[test]
-fn new_master_negotiates_two_with_a_new_worker() {
+fn new_master_negotiates_the_newest_with_a_new_worker() {
 	let w = worker(None);
 	let conn = Connection::open(&Transport::InProcess(w), "mac").unwrap();
-	assert_eq!(conn.version(), 2);
+	assert_eq!(conn.version(), snip_remote::PROTOCOL_MAX);
 }
 
 #[test]
