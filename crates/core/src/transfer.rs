@@ -187,6 +187,25 @@ impl ExportSelection {
 		self.filter_root = filter_root;
 		self
 	}
+
+	/// A selection over the same roots with `items` replaced, carrying over
+	/// the optional fields [`ExportSelection::new`] does not set
+	/// (`source_root`, `spelled_root`, `filter_root`): the folder walk and
+	/// the truncation-prefix rebuilds must not drop them, or a commit copy
+	/// from a subfolder loses the root its relative filters match against.
+	pub fn with_items(
+		&self,
+		items: Vec<ExportItem>,
+	) -> Result<Self, TransferError> {
+		Ok(ExportSelection::new(
+			self.roots.iter().map(|r| r.path().to_path_buf()).collect(),
+			self.primary_root.as_ref().map(|r| r.path().to_path_buf()),
+			items,
+		)?
+		.with_source_root(self.source_root.clone())
+		.with_spelled_root(self.spelled_root.clone())
+		.with_filter_root(self.filter_root.clone()))
+	}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1692,6 +1711,14 @@ fn deleted_read(
 	}
 }
 
+/// The git revision spec for reading a path's stage-0 index content. The
+/// stage must be spelled out: a bare `:<path>` turns a leading `0:` in the
+/// name into a stage number, so `:0:a` reads `a` where the file `0:a` was
+/// meant.
+fn staged_index_spec(toplevel_rel: String) -> String {
+	format!(":0:{toplevel_rel}")
+}
+
 fn make_payload_opts<'a, 'f>(
 	settings: &'a Settings,
 	source_root: Option<&'a str>,
@@ -2169,13 +2196,13 @@ pub fn plan_export_with(
 						)?;
 						deleted_read(content, cap, &wire_path, &b)?
 					} else if item.gitlink {
-						let spec = format!(":{toplevel_rel}");
+						let spec = staged_index_spec(toplevel_rel);
 						let b = blob_budget(false);
 						let cap = b.cap();
 						let read = blobs.read_lenient(git, &spec, cap)?;
 						gitlink_read(read, cap, &wire_path, &b, true)?
 					} else {
-						let spec = format!(":{toplevel_rel}");
+						let spec = staged_index_spec(toplevel_rel);
 						let b = blob_budget(false);
 						let cap = b.cap();
 						let read = blobs.read(git, &spec, cap)?;
@@ -2201,7 +2228,7 @@ pub fn plan_export_with(
 					// the index, so the index has it; `Working` is the SCM view
 					// and reads HEAD like gitsrc (TS parity), as does `File`.
 					let spec = if item.source == SourceKind::Unstaged {
-						format!(":{toplevel_rel}")
+						staged_index_spec(toplevel_rel)
 					} else {
 						format!("HEAD:{toplevel_rel}")
 					};
@@ -3945,6 +3972,92 @@ mod root_retained_tests {
 		assert!(root.retained_heap_bytes() > before);
 		assert_eq!(root.retained_heap_bytes(), root.0.capacity());
 		assert!(root.retained_heap_bytes() > root.path().as_os_str().len());
+	}
+}
+
+#[cfg(test)]
+mod staged_index_spec_tests {
+	use super::*;
+
+	/// The staged content is read through a git revision spec. A bare
+	/// `:<path>` misparses a file named `0:a` as stage 0 of `a`, so the
+	/// spec must always spell the stage: `:0:<path>`.
+	///
+	/// Every product entry point refuses a `:` in a relative path before
+	/// any read (`sanitize_relative_path` — the payload format cannot
+	/// restore such a path), so the selection here is a struct literal and
+	/// the spec is asserted through [`staged_index_spec`]: a misparsing
+	/// spec would hand the wrong blob to `git cat-file`.
+	#[test]
+	fn staged_spec_spells_stage_zero_so_a_leading_stage_number_cannot_misparse()
+	{
+		assert_eq!(staged_index_spec("a".into()), ":0:a");
+		assert_eq!(
+			staged_index_spec("0:a".into()),
+			":0:0:a",
+			"the naive `:<path>` form yields `:0:a` here, which git reads \
+			 as stage 0 of `a`"
+		);
+		assert_eq!(
+			staged_index_spec("dir/0:b".into()),
+			":0:dir/0:b",
+			"only the first colon separates the stage; the path stays whole"
+		);
+	}
+
+	/// End to end through a real index: the spec `staged_spec_spells…`
+	/// pins must read each file's own staged bytes. Both files are staged
+	/// edits whose worktree matches the index, so a wrong spec is the only
+	/// way the read contents can disagree.
+	#[test]
+	fn staged_read_returns_each_index_entrys_own_bytes() {
+		let dir = tempfile::tempdir().unwrap();
+		let repo_raw = dir.path().join("repo");
+		fs::create_dir_all(&repo_raw).unwrap();
+		let repo = dunce::canonicalize(&repo_raw).unwrap();
+		let cfg = dir.path().join("cfg");
+		fs::write(&cfg, "").unwrap();
+		let run = |args: &[&str]| {
+			let out = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&repo)
+				.env("GIT_CONFIG_GLOBAL", &cfg)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"git {args:?}: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+			String::from_utf8_lossy(&out.stdout).trim().to_string()
+		};
+		run(&["init", "-q", "-b", "main"]);
+		run(&["config", "user.name", "T"]);
+		run(&["config", "user.email", "t@example.com"]);
+		fs::write(repo.join("a"), "head a\n").unwrap();
+		fs::write(repo.join("0:a"), "head 0a\n").unwrap();
+		run(&["add", "-A"]);
+		run(&["commit", "-q", "-m", "base"]);
+		fs::write(repo.join("a"), "staged a\n").unwrap();
+		fs::write(repo.join("0:a"), "staged 0a\n").unwrap();
+		run(&["add", "-A"]);
+
+		let git = Git::open(&repo).unwrap();
+		let mut blobs = BlobReader::blobs_only(&RunOptions::default());
+		let mut read = |rel: &str| {
+			let spec = staged_index_spec(rel.to_string());
+			match blobs.read(&git, &spec, u64::MAX).unwrap() {
+				BlobRead::Text(s) => s,
+				other => panic!("expected text for `{spec}`, got {other:?}"),
+			}
+		};
+		assert_eq!(read("a"), "staged a\n");
+		assert_eq!(
+			read("0:a"),
+			"staged 0a\n",
+			"`:0:a` reads stage 0 of `a` instead of the file `0:a`"
+		);
 	}
 }
 
