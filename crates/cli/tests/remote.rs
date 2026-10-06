@@ -2,7 +2,7 @@
 //! master starts the worker through `SNIP_REMOTE_EXEC` (the built `snip
 //! serve --stdio`) instead of ssh, so any host name reaches it.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -971,15 +971,27 @@ fn cli_master_show_reports_a_truncated_path_listing() {
 		.to_string();
 	let cap = 5000usize;
 	let total = cap + 1;
-	let infos: Vec<String> = (0..total)
-		.map(|i| format!("100644,{blob},p{i:04}"))
+	// Through stdin: 5001 `--cacheinfo` arguments overflow Windows'
+	// command line.
+	let infos: String = (0..total)
+		.map(|i| format!("100644 {blob}\tp{i:04}\n"))
 		.collect();
-	let mut update = vec!["update-index", "--add"];
-	for info in &infos {
-		update.push("--cacheinfo");
-		update.push(info);
-	}
-	git_out(&ws_dir, &update);
+	let mut child = Command::new("git")
+		.args(["update-index", "--add", "--index-info"])
+		.current_dir(&ws_dir)
+		.stdin(Stdio::piped())
+		.spawn()
+		.unwrap();
+	child
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(infos.as_bytes())
+		.unwrap();
+	assert!(
+		child.wait().unwrap().success(),
+		"git update-index --index-info"
+	);
 	let tree = git_out(&ws_dir, &["write-tree"]);
 	let commit = git_out(&ws_dir, &["commit-tree", tree.trim(), "-m", "big"]);
 

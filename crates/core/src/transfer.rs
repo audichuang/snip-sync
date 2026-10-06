@@ -4009,6 +4009,9 @@ mod staged_index_spec_tests {
 	/// pins must read each file's own staged bytes. Both files are staged
 	/// edits whose worktree matches the index, so a wrong spec is the only
 	/// way the read contents can disagree.
+	// Unix only: Windows refuses `:` in a file name (NTFS reads `0:a` as
+	// the stream `a` of a file `0`).
+	#[cfg(unix)]
 	#[test]
 	fn staged_read_returns_each_index_entrys_own_bytes() {
 		let dir = tempfile::tempdir().unwrap();
