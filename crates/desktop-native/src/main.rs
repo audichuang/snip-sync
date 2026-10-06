@@ -9156,6 +9156,73 @@ mod tests {
 			});
 		}
 
+		/// Keys reach the Workbench once the workspace menu closes. Opening a
+		/// folder with the menu's button left the focus on that button, which
+		/// went with the menu, and Escape in the path field left it on the
+		/// field: either way the first Cmd+V did nothing.
+		#[gpui::test]
+		fn keys_reach_the_workbench_after_the_workspace_menu_closes(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&shared).unwrap();
+			let worker = std::sync::Arc::new(snip_remote::Worker::new(
+				snip_remote::WorkerOptions::default(),
+			));
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(None, None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			let reaches = |cx: &mut VisualTestContext| {
+				cx.update(|window, cx| {
+					model.read(cx).focus_handle.contains_focused(window, cx)
+				})
+			};
+			model.update(cx, |m, cx| {
+				m.toggle_workspace_menu(cx);
+				m.remote.hosts =
+					vec![snip_remote::RemoteHost::in_process(worker.clone())];
+				m.remote.recent.clear();
+				m.browse_remote_host(0, cx);
+			});
+			settle(cx);
+			let path = shared.display().to_string();
+			model.update(cx, |m, cx| {
+				m.remote_path_input
+					.update(cx, |i, cx| i.set_text(&path, cx));
+			});
+			settle(cx);
+			let open = cx
+				.debug_bounds("btn-remote-open")
+				.expect("open button drawn");
+			cx.simulate_click(open.center(), gpui::Modifiers::none());
+			// The open replies on a worker thread; the menu closes with it.
+			let deadline = std::time::Instant::now() + Duration::from_secs(10);
+			while model.read_with(cx, |m, _| m.workspace_menu) {
+				assert!(
+					std::time::Instant::now() < deadline,
+					"the open never replied"
+				);
+				settle(cx);
+			}
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| assert!(m.remote.session.is_some()));
+			assert!(reaches(cx), "after opening with the menu's button");
+
+			model.update(cx, |m, cx| {
+				m.toggle_workspace_menu(cx);
+				m.browse_remote_host(0, cx);
+			});
+			settle(cx);
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| assert!(!m.workspace_menu));
+			assert!(reaches(cx), "after Escape in the path field");
+		}
+
 		/// The workspace menu closes on Escape in the pairing form and on a
 		/// second press of its own button, as a popup menu should.
 		#[gpui::test]
