@@ -417,12 +417,14 @@ pub(crate) fn remote_scan_entries(
 /// Blocking: the remote counterpart of [`crate::tree::execute_tree_io`].
 /// A fresh Expand/Retry fetches the worker's WHOLE listing once; a
 /// continuation (LoadMore, entries still in `held`) is the ordinary local
-/// admission path — nothing to fetch, no remote branch.
+/// admission path — nothing to fetch, no remote branch. The job's cancel
+/// token ends a fetch against a host that stopped answering.
 pub fn tree_io(
 	client: &Client,
 	workspace: &str,
 	session_root: &Path,
 	io: TreeIo,
+	cancel: Option<&snip_core::gitrun::CancelToken>,
 ) -> TreeIoResult {
 	if !io.held.is_empty() {
 		return crate::tree::execute_tree_io(
@@ -443,7 +445,7 @@ pub fn tree_io(
 		Some(key_rel) => {
 			let req_path = join_rel(&prefix, &key_rel);
 			client
-				.list_dir(workspace, &req_path)
+				.list_dir(workspace, &req_path, cancel)
 				.map(|(entries, truncated)| {
 					let children = entries
 						.into_iter()
@@ -464,16 +466,18 @@ pub fn tree_io(
 }
 
 /// Blocking: a file preview read on the worker. Only working-tree files
-/// are served in this slice.
+/// are served in this slice. The job's cancel token ends a read against a
+/// host that stopped answering.
 pub fn read_preview(
 	client: &Client,
 	workspace: &str,
 	prefix: &str,
 	path: &str,
+	cancel: Option<&snip_core::gitrun::CancelToken>,
 ) -> Result<(SourcePreview, PreviewSource), String> {
 	let full_path = join_rel(prefix, path);
 	client
-		.read(workspace, &full_path)
+		.read(workspace, &full_path, cancel)
 		.map(|content| {
 			(
 				SourcePreview {
@@ -578,7 +582,7 @@ impl WorkbenchModel {
 			let result = bg
 				.spawn(async move {
 					let ws = client.open_workspace(&path)?;
-					let (entries, _) = client.list_dir(&ws.id, "")?;
+					let (entries, _) = client.list_dir(&ws.id, "", None)?;
 					let folders = entries
 						.into_iter()
 						.filter(|e| {

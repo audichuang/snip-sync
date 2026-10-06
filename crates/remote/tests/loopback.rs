@@ -66,46 +66,58 @@ fn lists_stats_and_reads_inside_the_workspace_only() {
 	);
 	let ws = opened.id.clone();
 
-	let (root, truncated) = client.list_dir(&ws, "").unwrap();
+	let (root, truncated) = client.list_dir(&ws, "", None).unwrap();
 	assert!(!truncated);
 	let names: Vec<_> = root.iter().map(|e| e.name.as_str()).collect();
 	assert_eq!(names[0], "src", "directories first: {names:?}");
 	assert!(names.contains(&"bin.dat"));
-	let (src, _) = client.list_dir(&ws, "src").unwrap();
+	let (src, _) = client.list_dir(&ws, "src", None).unwrap();
 	let nested = src.iter().find(|e| e.name == "nested").unwrap();
 	assert!(nested.directory && nested.nested_repo);
 
-	let stat = client.stat(&ws, "src/main.rs").unwrap();
+	let stat = client.stat(&ws, "src/main.rs", None).unwrap();
 	assert_eq!((stat.kind, stat.size), (EntryKind::File, 13));
 	assert_eq!(
-		client.read(&ws, "src/main.rs").unwrap().as_deref(),
+		client.read(&ws, "src/main.rs", None).unwrap().as_deref(),
 		Some("fn main() {}\n")
 	);
 	assert_eq!(
-		client.read(&ws, "bin.dat").unwrap(),
+		client.read(&ws, "bin.dat", None).unwrap(),
 		None,
 		"binary: no text"
 	);
 
 	// Containment: parent components, absolute paths, symlinks out.
 	for path in ["../secret.txt", "src/../../secret.txt"] {
-		assert_eq!(refused(client.read(&ws, path)), ErrorCode::Forbidden);
-		assert_eq!(refused(client.list_dir(&ws, path)), ErrorCode::Forbidden);
+		assert_eq!(refused(client.read(&ws, path, None)), ErrorCode::Forbidden);
+		assert_eq!(
+			refused(client.list_dir(&ws, path, None)),
+			ErrorCode::Forbidden
+		);
 	}
 	let absolute = tmp.path().join("secret.txt").display().to_string();
-	assert_eq!(refused(client.read(&ws, &absolute)), ErrorCode::Forbidden);
-	#[cfg(unix)]
 	assert_eq!(
-		refused(client.read(&ws, "escape.txt")),
+		refused(client.read(&ws, &absolute, None)),
 		ErrorCode::Forbidden
 	);
-	assert_eq!(refused(client.read(&ws, "missing.rs")), ErrorCode::NotFound);
+	#[cfg(unix)]
+	assert_eq!(
+		refused(client.read(&ws, "escape.txt", None)),
+		ErrorCode::Forbidden
+	);
+	assert_eq!(
+		refused(client.read(&ws, "missing.rs", None)),
+		ErrorCode::NotFound
+	);
 	assert_eq!(
 		refused(client.open_workspace("relative/dir")),
 		ErrorCode::Forbidden
 	);
 	let missing = tmp.path().join("missing-ws").display().to_string();
-	assert_eq!(refused(client.list_dir(&missing, "")), ErrorCode::NotFound);
+	assert_eq!(
+		refused(client.list_dir(&missing, "", None)),
+		ErrorCode::NotFound
+	);
 
 	// GitView on a non-repo share returns NotARepository.
 	assert_eq!(
@@ -144,7 +156,7 @@ fn a_folder_symlink_inside_the_share_lists_as_a_folder() {
 	let w = worker();
 	let (client, ws) = client_for(&w, &shared);
 
-	let (root, _) = client.list_dir(&ws, "").unwrap();
+	let (root, _) = client.list_dir(&ws, "", None).unwrap();
 	let entry = |name: &str| {
 		root.iter()
 			.find(|e| e.name == name)
@@ -163,15 +175,18 @@ fn a_folder_symlink_inside_the_share_lists_as_a_folder() {
 		.collect();
 	assert_eq!(folders, ["inner-link", "relative-link", "src"]);
 
-	let (inner, _) = client.list_dir(&ws, "inner-link").unwrap();
+	let (inner, _) = client.list_dir(&ws, "inner-link", None).unwrap();
 	let names: Vec<_> = inner.iter().map(|e| e.name.as_str()).collect();
 	assert_eq!(names, ["deep", "main.rs"]);
 	assert_eq!(
-		client.read(&ws, "inner-link/main.rs").unwrap().as_deref(),
+		client
+			.read(&ws, "inner-link/main.rs", None)
+			.unwrap()
+			.as_deref(),
 		Some("fn main() {}\n")
 	);
 	assert_eq!(
-		refused(client.list_dir(&ws, "escape-dir")),
+		refused(client.list_dir(&ws, "escape-dir", None)),
 		ErrorCode::Forbidden
 	);
 }
@@ -194,7 +209,7 @@ fn a_whole_listing_arrives_once_sorted() {
 		.unwrap()
 		.id;
 
-	let (entries, truncated) = client.list_dir(&ws, "many").unwrap();
+	let (entries, truncated) = client.list_dir(&ws, "many", None).unwrap();
 	assert!(!truncated, "1200 entries are under the cap");
 	assert_eq!(entries.len(), 1200, "every entry arrives");
 	let mut sorted: Vec<String> =
@@ -226,7 +241,7 @@ fn a_listing_over_the_cap_reports_truncated_with_no_continuation() {
 		.unwrap()
 		.id;
 
-	let (entries, truncated) = client.list_dir(&ws, "").unwrap();
+	let (entries, truncated) = client.list_dir(&ws, "", None).unwrap();
 	assert!(truncated);
 	assert_eq!(entries.len(), 20, "exactly the cap, in sorted order");
 	assert_eq!(entries[0].name, "f000");
