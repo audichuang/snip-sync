@@ -1297,14 +1297,16 @@ impl Render for WorkbenchModel {
 		if let Some(h) = self.pending_focus.take() {
 			window.focus(&h);
 		}
-		// A path field of the workspace menu keeps the focus after the menu
-		// closes, and keys sent to a field no longer drawn reach no listener:
-		// the first Cmd+V after opening a remote folder did nothing.
-		if !self.workspace_menu
+		// Keys reach the Workbench's actions only through a focused element
+		// it draws. A clicked menu button takes the focus and drops it with
+		// itself when the menu closes, and a menu path field keeps it while
+		// no longer drawn: the first Cmd+V after opening a workspace from the
+		// menu did nothing.
+		let menu_field = !self.workspace_menu
 			&& [&self.remote_path_input, &self.workspace_path_input]
 				.iter()
-				.any(|f| f.read(cx).handle().is_focused(window))
-		{
+				.any(|f| f.read(cx).handle().is_focused(window));
+		if menu_field || window.focused(cx).is_none() {
 			window.focus(&self.focus_handle);
 		}
 		let vp = window.viewport_size();
