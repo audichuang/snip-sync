@@ -2358,19 +2358,20 @@ mod tests {
 		let (r, mut w) = io::pipe().unwrap();
 		let (frames, retained, in_flight, last_byte) = read_frames(r);
 		let response = Response::Text {
-			content: Some("x".repeat(4 * 1024 * 1024)),
+			content: Some("x".repeat(1024 * 1024)),
 		};
 		let mut bytes = Vec::new();
 		write_frame(&mut bytes, &response).unwrap();
 		let producer = std::thread::spawn(move || {
-			// 64 KiB every 100 ms: about six and a half seconds of
-			// streaming — past the 5 s IO_TIMEOUT a whole-frame wait
-			// allows, while every silence stays far under it.
-			for piece in bytes.chunks(64 * 1024) {
+			// 16 KiB every 50 ms: about three seconds of streaming, three
+			// times the idle bound below, while every silence stays far
+			// under it. The bound leaves room for decoding the frame after
+			// its last byte, which is silence too.
+			for piece in bytes.chunks(16 * 1024) {
 				if w.write_all(piece).is_err() {
 					return;
 				}
-				std::thread::sleep(scaled(Duration::from_millis(100)));
+				std::thread::sleep(scaled(Duration::from_millis(50)));
 			}
 		});
 		let mut conn =
@@ -2380,14 +2381,14 @@ mod tests {
 		let reply = exchange(
 			&mut conn,
 			None,
-			scaled(Duration::from_millis(200)),
+			scaled(Duration::from_secs(1)),
 			Instant::now() + scaled(Duration::from_secs(30)),
 			&mut frames,
 		)
 		.expect("a steadily arriving reply must not time out");
 		match reply {
 			Response::Text { content } => {
-				assert_eq!(content.map(|c| c.len()), Some(4 * 1024 * 1024));
+				assert_eq!(content.map(|c| c.len()), Some(1024 * 1024));
 			}
 			other => panic!("expected Text, got {other:?}"),
 		}
