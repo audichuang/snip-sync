@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Runs a command in the Linux preflight container: `scripts/linux_container.sh just preflight-linux`.
 # `--clean` removes this checkout's containers, volumes, images and kernel cache instead;
-# `--prune` only removes the target/ volumes of checkouts that no longer exist.
+# `--prune` only removes the target/ volumes of checkouts that no longer exist;
+# `--prune-all` also removes this checkout's (`just clean` uses it).
 # Uses Apple's `container` (macOS 26+, Apple silicon): brew install container,
 # then container system start --enable-kernel-install.
 # The checkout is mounted read-only at its host path, so receipts and fixture paths
 # read the same inside and out, and nothing inside writes the host's repository: a git
 # refreshing .git/index through the shared mount made the next read see an empty index. The container's target/ is a volume per checkout: Linux
-# artifacts never land in the host's target/, and incremental builds survive runs.
+# artifacts never land in the host's target/, and a rerun after a failure is incremental
+# (`just preflight` drops the volume after a pass).
 # Each volume is labelled with its checkout's path, and every run removes the volumes
 # whose checkout is gone: a clone or worktree used once otherwise left 12-18 GB behind.
 # SNIP_CONTAINER_CPUS / SNIP_CONTAINER_MEMORY size the VM (container's default is 4 CPUs, 1 GB).
@@ -83,6 +85,12 @@ prune_volumes() {
 }
 prune_volumes
 if [ "${1:-}" = --prune ]; then
+	exit 0
+fi
+if [ "${1:-}" = --prune-all ]; then
+	if container volume rm "$target_volume" >/dev/null 2>&1; then
+		echo "linux_container: removed $target_volume ($ROOT)" >&2
+	fi
 	exit 0
 fi
 
