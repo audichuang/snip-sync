@@ -1298,15 +1298,20 @@ impl Render for WorkbenchModel {
 			window.focus(&h);
 		}
 		// Keys reach the Workbench's actions only through a focused element
-		// it draws. A clicked menu button takes the focus and drops it with
-		// itself when the menu closes, and a menu path field keeps it while
-		// no longer drawn: the first Cmd+V after opening a workspace from the
-		// menu did nothing.
-		let menu_field = !self.workspace_menu
-			&& [&self.remote_path_input, &self.workspace_path_input]
-				.iter()
-				.any(|f| f.read(cx).handle().is_focused(window));
-		if menu_field || window.focused(cx).is_none() {
+		// it draws. A handle whose element left the frame (a menu closed, a
+		// tool window collapsed, an editor state without a reader) keeps the
+		// focus otherwise: keys then fall to the dispatch tree's root and no
+		// action fires. The guard below hands the keyboard back to the one
+		// handle every frame tracks.
+		if self.focus_lost_guard.is_none() {
+			self.focus_lost_guard =
+				Some(cx.on_focus_lost(window, |this, window, cx| {
+					window.focus(&this.focus_handle);
+					app_log!("[APP:FOCUS: workbench (stale handle)]");
+					cx.notify();
+				}));
+		}
+		if window.focused(cx).is_none() {
 			window.focus(&self.focus_handle);
 		}
 		let vp = window.viewport_size();

@@ -652,10 +652,12 @@ impl WorkbenchModel {
 		};
 		let id = format!("log-filter-{key}");
 		let clear_id = format!("log-filter-{key}-clear");
+		let selector = id.clone();
 		let open = self.log_menu == Some(menu);
 		let active = value.is_some();
 		div()
 			.id(SharedString::from(id.clone()))
+			.debug_selector(move || selector)
 			.relative()
 			.flex_shrink_0()
 			.h(px(24.))
@@ -744,8 +746,10 @@ impl WorkbenchModel {
 		            checked: bool,
 		            on: MenuAction,
 		            cx: &mut Context<Self>| {
+			let selector = id.clone();
 			div()
 				.id(SharedString::from(id.clone()))
+				.debug_selector(move || selector)
 				.relative()
 				.h(px(24.))
 				.px(px(8.))
@@ -986,9 +990,11 @@ impl WorkbenchModel {
 							..
 						} => {
 							let id = format!("log-branch-group:{key}");
+							let selector = id.clone();
 							items.push(
 								div()
 									.id(SharedString::from(id.clone()))
+									.debug_selector(move || selector)
 									.relative()
 									.h(px(24.))
 									.px(px(8.))
@@ -1041,7 +1047,7 @@ impl WorkbenchModel {
 										label,
 										checked,
 										Box::new(move |this, cx| {
-											this.log_menu = None;
+											this.dismiss_log_menu(cx);
 											this.filter_by_ref(
 												Some(target.clone()),
 												cx,
