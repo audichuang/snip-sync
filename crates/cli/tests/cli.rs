@@ -2903,8 +2903,7 @@ fn paste_dry_run_reports_a_failing_stdout_target() {
 			fs::OpenOptions::new()
 				.write(true)
 				.open("/dev/full")
-				.unwrap()
-				.into(),
+				.unwrap(),
 		)
 		.stderr(Stdio::piped())
 		.spawn()
