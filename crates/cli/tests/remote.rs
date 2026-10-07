@@ -2,7 +2,7 @@
 //! master starts the worker through `SNIP_REMOTE_EXEC` (the built `snip
 //! serve --stdio`) instead of ssh, so any host name reaches it.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -270,6 +270,44 @@ fn cli_master_says_snip_is_too_old_when_serve_is_unknown() {
 	let m = Master::with_exec(tmp.path(), exec);
 	let stderr = m.fails(&["ls", "anyhost", s(tmp.path())]);
 	assert!(stderr.contains("not installed"), "{stderr}");
+}
+
+/// A command that reads nothing, prints nothing and stays alive holds the
+/// hello until its timeout: the message must say the worker did not
+/// answer, not that it closed the connection.
+#[cfg(unix)]
+#[test]
+fn cli_master_says_a_silent_worker_did_not_answer_in_time() {
+	let tmp = tempfile::tempdir().unwrap();
+	let m = Master::with_exec(tmp.path(), "sleep 300".into());
+	let started = Instant::now();
+	let stderr = m.fails(&["ls", "anyhost", s(tmp.path())]);
+	assert!(stderr.contains("did not answer in time"), "{stderr}");
+	assert!(!stderr.contains("closed the connection"), "{stderr}");
+	assert!(
+		started.elapsed() < DEADLINE,
+		"the master gave up after {:?}",
+		started.elapsed()
+	);
+}
+
+/// A login shell that prints more than a banner before snip starts is
+/// named as such, not swallowed into a generic closed-connection message.
+#[cfg(unix)]
+#[test]
+fn cli_master_says_when_the_shell_prints_too_much_before_snip() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let script = tmp.path().join("banner.sh");
+	std::fs::write(&script, "#!/bin/sh\nyes 'login banner' | head -c 200000\n")
+		.unwrap();
+	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+		.unwrap();
+	let m = Master::with_exec(tmp.path(), s(&script).to_string());
+	let stderr = m.fails(&["ls", "anyhost", s(tmp.path())]);
+	assert!(stderr.contains("printed too much"), "{stderr}");
+	assert!(!stderr.contains("closed the connection"), "{stderr}");
 }
 
 /// What ssh's remote script does when no snip is on the far end.
@@ -948,4 +986,60 @@ fn cli_remote_paste_refuses_a_worker_without_paste() {
 	assert_eq!(r.0, Some(1), "{}", r.2);
 	assert!(r.2.contains("too old"), "{}", r.2);
 	assert!(!tmp.path().join("a.txt").exists());
+}
+
+/// `show` caps its changed-path listing (5000 rows); a commit touching
+/// more paths must say so on stderr — "showing 5000 of 5001 paths" —
+/// instead of silently dropping the tail.
+#[test]
+fn cli_master_show_reports_a_truncated_path_listing() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let ws_dir = tmp.path().join("big_commit");
+	std::fs::create_dir_all(&ws_dir).unwrap();
+	git(&ws_dir, &["init"]);
+
+	// One shared blob, 5001 index entries, one commit: cheap to build,
+	// and its change list is one path over the `show` cap.
+	std::fs::write(ws_dir.join("seed"), "x\n").unwrap();
+	let blob = git_out(&ws_dir, &["hash-object", "-w", "seed"])
+		.trim()
+		.to_string();
+	let cap = 5000usize;
+	let total = cap + 1;
+	// Through stdin: 5001 `--cacheinfo` arguments overflow Windows'
+	// command line.
+	let infos: String = (0..total)
+		.map(|i| format!("100644 {blob}\tp{i:04}\n"))
+		.collect();
+	let mut child = Command::new("git")
+		.args(["update-index", "--add", "--index-info"])
+		.current_dir(&ws_dir)
+		.stdin(Stdio::piped())
+		.spawn()
+		.unwrap();
+	child
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(infos.as_bytes())
+		.unwrap();
+	assert!(
+		child.wait().unwrap().success(),
+		"git update-index --index-info"
+	);
+	let tree = git_out(&ws_dir, &["write-tree"]);
+	let commit = git_out(&ws_dir, &["commit-tree", tree.trim(), "-m", "big"]);
+
+	let m = Master::new(tmp.path());
+	let (status, stdout, stderr) =
+		m.snip(&["show", "anyhost", s(&ws_dir), commit.trim()]);
+	assert_eq!(status, Some(0), "{stderr}");
+	assert_eq!(stdout.lines().count(), cap, "the cap bounds the rows");
+	assert!(
+		stderr.contains(&format!("showing {cap} of {total} paths")),
+		"the truncation must be announced on stderr: {stderr:?}"
+	);
 }

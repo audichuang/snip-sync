@@ -2798,3 +2798,129 @@ fn paste_into_missing_repo_exits_one_naming_the_path() {
 	assert!(dry_err.contains("nope"), "stderr was: {dry_err}");
 	assert!(!nope.exists());
 }
+
+/// `snip paste --dry-run | head -1` closes the read end while the plan is
+/// still being printed: the command must end quietly with success, the
+/// way every Unix filter behaves, not panic inside a println macro
+/// (exit 101).
+#[test]
+fn paste_dry_run_ends_quietly_when_stdout_closes() {
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	let dst_s = dst.to_str().unwrap();
+	let payload = "// file: a.txt\nhello\n// file: b.txt\nbravo\n";
+
+	let mut child = Command::new(env!("CARGO_BIN_EXE_snip"))
+		.arg("--repo")
+		.arg(dst_s)
+		.args(["paste", "--dry-run", "--stdin"])
+		.env("GIT_CONFIG_GLOBAL", "/dev/null")
+		.env("GIT_CONFIG_NOSYSTEM", "1")
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	// Drop the read end before the child writes: every later stdout write
+	// fails with EPIPE, like a reader that went away after the first line.
+	drop(child.stdout.take());
+	let mut stdin = child.stdin.take().unwrap();
+	let _ = stdin.write_all(payload.as_bytes());
+	drop(stdin);
+	let out = child.wait_with_output().unwrap();
+	assert_eq!(
+		out.status.code(),
+		Some(0),
+		"a closed pipe must end the command with success: {}",
+		text(&out.stderr)
+	);
+	assert!(
+		!text(&out.stderr).contains("panicked"),
+		"stdout must not panic on a closed pipe: {}",
+		text(&out.stderr)
+	);
+}
+
+/// A write failure that is not a closed pipe must reach the exit code:
+/// `/dev/full` fails every write, and the old `let _ = writeln!(…)`
+/// swallowed it into a green exit. Linux-only: other platforms have no
+/// /dev/full to fail with.
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_hosts_reports_a_failing_stdout_target() {
+	let home = tempfile::tempdir().unwrap();
+	fs::create_dir_all(home.path().join(".ssh")).unwrap();
+	fs::write(
+		home.path().join(".ssh/config"),
+		"Host alpha\n  user u\nHost beta\n",
+	)
+	.unwrap();
+	let full = fs::OpenOptions::new()
+		.write(true)
+		.open("/dev/full")
+		.unwrap();
+	let out = Command::new(env!("CARGO_BIN_EXE_snip"))
+		.args(["remote", "hosts"])
+		.env("HOME", home.path())
+		.stdin(Stdio::null())
+		.stdout(Stdio::from(full))
+		.stderr(Stdio::piped())
+		.output()
+		.unwrap();
+	assert_eq!(
+		out.status.code(),
+		Some(1),
+		"a failing stdout target must exit non-zero"
+	);
+	assert!(
+		!text(&out.stderr).contains("panicked"),
+		"the write error must be reported, not panicked: {}",
+		text(&out.stderr)
+	);
+}
+
+/// Same contract for a main-command print loop: a failing stdout target
+/// exits 1 with the error on stderr instead of panicking (the old
+/// println! behavior).
+#[cfg(target_os = "linux")]
+#[test]
+fn paste_dry_run_reports_a_failing_stdout_target() {
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	let dst_s = dst.to_str().unwrap();
+	let payload = "// file: a.txt\nhello\n";
+
+	let mut child = Command::new(env!("CARGO_BIN_EXE_snip"))
+		.arg("--repo")
+		.arg(dst_s)
+		.args(["paste", "--dry-run", "--stdin"])
+		.env("GIT_CONFIG_GLOBAL", "/dev/null")
+		.env("GIT_CONFIG_NOSYSTEM", "1")
+		.stdin(Stdio::piped())
+		.stdout(
+			fs::OpenOptions::new()
+				.write(true)
+				.open("/dev/full")
+				.unwrap(),
+		)
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	let mut stdin = child.stdin.take().unwrap();
+	let _ = stdin.write_all(payload.as_bytes());
+	drop(stdin);
+	let out = child.wait_with_output().unwrap();
+	assert_eq!(
+		out.status.code(),
+		Some(1),
+		"a failing stdout target must exit 1, not panic: {}",
+		text(&out.stderr)
+	);
+	assert!(
+		!text(&out.stderr).contains("panicked"),
+		"the write error must be reported, not panicked: {}",
+		text(&out.stderr)
+	);
+}

@@ -6,9 +6,9 @@
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use snip_core::browser::{
@@ -37,9 +37,14 @@ use crate::RemoteError;
 /// resolves, authenticates and starts a shell first.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 // Kept under the desktop app's 8 s drain deadline (lifecycle.rs): a stalled
-// worker must fail a call in time. It is idle time per frame; a long job
-// sends a heartbeat every second.
+// worker must fail a call in time. It bounds the SILENCE between bytes, not
+// a frame's whole transfer: a long job sends a heartbeat every second, and
+// a large reply may take longer than this to arrive whole on a slow link
+// as long as it keeps moving.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a wait re-checks its deadline, its cancel token and the
+/// stream's last-byte clock.
+const WAIT_SLICE: Duration = Duration::from_millis(50);
 /// Bytes a login shell may print before the preamble.
 const MAX_BANNER: usize = 64 * 1024;
 /// Bytes of the transport's stderr kept for an error message.
@@ -124,12 +129,59 @@ pub(crate) trait FrameIo {
 		&mut self,
 		timeout: Duration,
 	) -> Result<Option<Response>, RemoteError>;
+
+	/// The next frame while bytes keep arriving: `idle` bounds the SILENCE
+	/// between bytes, not the arrival of a whole frame — a large reply may
+	/// take longer than that to cross a slow link. The wait also ends at
+	/// the absolute `deadline` or on `cancel`. The default has no byte
+	/// clock and simply reads the next frame (tests feed memory streams).
+	fn recv_idle(
+		&mut self,
+		idle: Duration,
+		deadline: Instant,
+		cancel: Option<&CancelToken>,
+	) -> Result<Option<Response>, RemoteError> {
+		let _ = (deadline, cancel);
+		self.recv(idle)
+	}
 }
 
 /// A plain stream has no deadline; tests feed one frames from memory.
 impl<S: IoRead + IoWrite> FrameIo for S {
 	fn recv(&mut self, _: Duration) -> Result<Option<Response>, RemoteError> {
 		Ok(read_frame::<Response>(self)?)
+	}
+}
+
+/// Milliseconds since this process started (offset by one hour so a clock
+/// can be set into the past near process start without saturating at zero):
+/// the base of the shared last-byte clock.
+fn now_millis() -> u64 {
+	static START: OnceLock<Instant> = OnceLock::new();
+	const BASE_MILLIS: u64 = 60 * 60 * 1000;
+	BASE_MILLIS + START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Records when the stream last produced a byte, so a wait can tell a
+/// frame that is still moving from a worker that went quiet.
+struct Progress<R> {
+	inner: R,
+	last_byte: Arc<AtomicU64>,
+}
+
+impl<R> Progress<R> {
+	fn new(inner: R, last_byte: Arc<AtomicU64>) -> Self {
+		Self { inner, last_byte }
+	}
+}
+
+impl<R: IoRead> IoRead for Progress<R> {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		let n = self.inner.read(buf)?;
+		if n > 0 {
+			self.last_byte.store(now_millis(), Ordering::Relaxed);
+		}
+		Ok(n)
 	}
 }
 
@@ -155,6 +207,10 @@ pub struct Connection {
 	/// pump applies backpressure instead of hanging up. Shared with the
 	/// read thread.
 	in_flight: Arc<AtomicBool>,
+	/// When the pump last pulled a byte off the stream, as [`now_millis`].
+	/// Shared with the read thread; a wait ends when the stream goes
+	/// silent past [`IO_TIMEOUT`].
+	last_byte: Arc<AtomicU64>,
 }
 
 impl Connection {
@@ -163,14 +219,23 @@ impl Connection {
 		transport: &Transport,
 		my_name: &str,
 	) -> Result<Self, RemoteError> {
-		let (writer, frames, child, stderr, retained, in_flight) =
+		let (writer, frames, child, stderr, retained, in_flight, last_byte) =
 			match transport {
 				Transport::Command(argv) => spawn(argv)?,
 				Transport::InProcess(worker) => {
 					let (req_w, res_r) = worker.connect_in_process()?;
 					let writer: Box<dyn IoWrite + Send> = Box::new(req_w);
-					let (frames, retained, in_flight) = read_frames(res_r);
-					(writer, frames, None, Arc::default(), retained, in_flight)
+					let (frames, retained, in_flight, last_byte) =
+						read_frames(res_r);
+					(
+						writer,
+						frames,
+						None,
+						Arc::default(),
+						retained,
+						in_flight,
+						last_byte,
+					)
 				}
 			};
 		let mut conn = Self {
@@ -185,6 +250,7 @@ impl Connection {
 			frames_seen: 0,
 			retained,
 			in_flight,
+			last_byte,
 		};
 		let hello = Request::Hello {
 			version: PROTOCOL_VERSION,
@@ -215,7 +281,16 @@ impl Connection {
 			}
 			Ok(Some(_)) => Err(RemoteError::Protocol("expected hello".into())),
 			Ok(None) | Err(RemoteError::Io(_)) | Err(RemoteError::TimedOut) => {
-				Err(conn.start_error())
+				let cause = match &reply {
+					Err(RemoteError::TimedOut) => StartCause::NoAnswer,
+					Err(RemoteError::Io(err))
+						if err.kind() == io::ErrorKind::InvalidData =>
+					{
+						StartCause::BadData(err.to_string())
+					}
+					_ => StartCause::Ended,
+				};
+				Err(conn.start_error(cause))
 			}
 			Err(err) => Err(err),
 		}
@@ -223,7 +298,7 @@ impl Connection {
 
 	/// Why the worker never said hello, from the transport's exit status
 	/// and stderr: ssh's own message, or that the far end has no snip.
-	fn start_error(&mut self) -> RemoteError {
+	fn start_error(&mut self, cause: StartCause) -> RemoteError {
 		let status = self.child.as_mut().and_then(|c| {
 			let deadline = Instant::now() + Duration::from_secs(2);
 			loop {
@@ -251,6 +326,7 @@ impl Connection {
 		.trim()
 		.to_string();
 		RemoteError::Connect(start_message(
+			cause,
 			status.and_then(|s| s.code()),
 			&stderr,
 		))
@@ -290,9 +366,10 @@ impl Connection {
 		let deadline = Instant::now() + limit;
 		let mut frames = 0;
 		self.in_flight.store(true, Ordering::SeqCst);
-		let res = self
-			.send_guarded(request, cancel, deadline)
-			.and_then(|()| exchange(self, cancel, deadline, &mut frames));
+		let res = self.send_guarded(request, cancel, deadline).and_then(|()| {
+			self.last_byte.store(now_millis(), Ordering::Relaxed);
+			exchange(self, cancel, IO_TIMEOUT, deadline, &mut frames)
+		});
 		self.in_flight.store(false, Ordering::SeqCst);
 		self.frames_seen = frames;
 		if res.is_err() && !matches!(res, Err(RemoteError::Refused { .. })) {
@@ -390,6 +467,40 @@ impl FrameIo for Connection {
 			Err(RecvTimeoutError::Disconnected) => Ok(None),
 		}
 	}
+
+	fn recv_idle(
+		&mut self,
+		idle: Duration,
+		deadline: Instant,
+		cancel: Option<&CancelToken>,
+	) -> Result<Option<Response>, RemoteError> {
+		loop {
+			match self.frames.recv_timeout(WAIT_SLICE) {
+				Ok(frame) => {
+					// The frame left the queue; the pump may read on.
+					self.retained.fetch_sub(1, Ordering::Relaxed);
+					return Ok(frame?);
+				}
+				Err(RecvTimeoutError::Disconnected) => return Ok(None),
+				Err(RecvTimeoutError::Timeout) => {}
+			}
+			if cancel.is_some_and(|c| c.is_cancelled()) {
+				return Err(RemoteError::Cancelled);
+			}
+			if Instant::now() >= deadline {
+				return Err(RemoteError::TimedOut);
+			}
+			// No byte for `idle`: the worker is stuck, whatever it may
+			// still be computing. Bytes still moving (a large frame on a
+			// slow link, a heartbeat) keep the wait alive.
+			if now_millis()
+				.saturating_sub(self.last_byte.load(Ordering::Relaxed))
+				>= idle.as_millis() as u64
+			{
+				return Err(RemoteError::TimedOut);
+			}
+		}
+	}
 }
 
 impl Drop for Connection {
@@ -401,29 +512,61 @@ impl Drop for Connection {
 	}
 }
 
+/// What the transport did while the master waited for the hello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartCause {
+	/// The hello never arrived and the transport still runs: it hung, or
+	/// the far machine is too busy to answer.
+	NoAnswer,
+	/// The stream itself said why: a login shell's banner over the cap, a
+	/// frame that breaks the protocol. The message is the stream's own.
+	BadData(String),
+	/// The transport ended before the hello: classify by exit status and
+	/// stderr.
+	Ended,
+}
+
 /// The user-facing reason a worker did not start.
-pub(crate) fn start_message(code: Option<i32>, stderr: &str) -> String {
-	if code == Some(127) || stderr.contains("unrecognized subcommand") {
-		return "snip is not installed on that machine, or is too old for \
-		        ssh connections; install snip-sync there"
-			.into();
+pub(crate) fn start_message(
+	cause: StartCause,
+	code: Option<i32>,
+	stderr: &str,
+) -> String {
+	match cause {
+		StartCause::NoAnswer if stderr.is_empty() => {
+			"the worker on that machine did not answer in time; check its \
+			 load and connection, then try again"
+				.into()
+		}
+		// Whatever the transport said outranks the bare timeout.
+		StartCause::NoAnswer => stderr.to_string(),
+		// The stream's own message: a banner, an out-of-step frame.
+		StartCause::BadData(message) => message,
+		StartCause::Ended => {
+			if code == Some(127) || stderr.contains("unrecognized subcommand") {
+				return "snip is not installed on that machine, or is too old for \
+				        ssh connections; install snip-sync there"
+					.into();
+			}
+			if stderr.contains("Permission denied") {
+				return format!(
+					"ssh could not log in without a password; set up key login \
+					 (ssh-copy-id) first: {stderr}"
+				);
+			}
+			if stderr.is_empty() {
+				return "the remote end closed the connection before snip started"
+					.into();
+			}
+			stderr.to_string()
+		}
 	}
-	if stderr.contains("Permission denied") {
-		return format!(
-			"ssh could not log in without a password; set up key login \
-			 (ssh-copy-id) first: {stderr}"
-		);
-	}
-	if stderr.is_empty() {
-		return "the remote end closed the connection before snip started"
-			.into();
-	}
-	stderr.to_string()
 }
 
 /// A started worker: where to write requests, the frames it answers, the
-/// process to stop, what it said on stderr, its retained-frame counter, and
-/// the in-flight flag shared with the read thread.
+/// process to stop, what it said on stderr, its retained-frame counter,
+/// the in-flight flag shared with the read thread, and the shared
+/// last-byte clock.
 type Started = (
 	Box<dyn IoWrite + Send>,
 	Frames,
@@ -431,6 +574,7 @@ type Started = (
 	Arc<Mutex<Vec<u8>>>,
 	Arc<AtomicUsize>,
 	Arc<AtomicBool>,
+	Arc<AtomicU64>,
 );
 
 fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
@@ -473,8 +617,10 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
 	let retained = Arc::new(AtomicUsize::new(0));
 	let in_flight = Arc::new(AtomicBool::new(false));
+	let last_byte = Arc::new(AtomicU64::new(now_millis()));
 	let pump_retained = Arc::clone(&retained);
 	let pump_in_flight = Arc::clone(&in_flight);
+	let pump_last_byte = Arc::clone(&last_byte);
 	std::thread::Builder::new()
 		.name("snip-remote-read".into())
 		.spawn(move || {
@@ -482,10 +628,23 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 				let _ = tx.send(Err(err));
 				return;
 			}
-			pump_frames(stdout, tx, pump_retained, pump_in_flight);
+			pump_frames(
+				Progress::new(stdout, pump_last_byte),
+				tx,
+				pump_retained,
+				pump_in_flight,
+			);
 		})?;
 	let writer: Box<dyn IoWrite + Send> = Box::new(stdin);
-	Ok((writer, rx, Some(child), stderr, retained, in_flight))
+	Ok((
+		writer,
+		rx,
+		Some(child),
+		stderr,
+		retained,
+		in_flight,
+		last_byte,
+	))
 }
 
 /// Reads up to the [`PREAMBLE`] line, skipping what a login shell printed.
@@ -517,16 +676,23 @@ pub(crate) fn skip_banner(r: &mut impl BufRead) -> io::Result<()> {
 
 fn read_frames(
 	r: impl IoRead + Send + 'static,
-) -> (Frames, Arc<AtomicUsize>, Arc<AtomicBool>) {
+) -> (Frames, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicU64>) {
 	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
 	let retained = Arc::new(AtomicUsize::new(0));
 	let in_flight = Arc::new(AtomicBool::new(false));
+	let last_byte = Arc::new(AtomicU64::new(now_millis()));
 	let pump_retained = Arc::clone(&retained);
 	let pump_in_flight = Arc::clone(&in_flight);
+	let pump_last_byte = Arc::clone(&last_byte);
 	std::thread::spawn(move || {
-		pump_frames(r, tx, pump_retained, pump_in_flight)
+		pump_frames(
+			Progress::new(r, pump_last_byte),
+			tx,
+			pump_retained,
+			pump_in_flight,
+		)
 	});
-	(rx, retained, in_flight)
+	(rx, retained, in_flight, last_byte)
 }
 
 /// Reads frames until the worker stops or the consumer does. A frame that
@@ -561,13 +727,16 @@ fn pump_frames(
 	}
 }
 
-/// Waits for `request`'s answer, skipping heartbeats. Every frame — chunk
-/// frames included — holds to the absolute `deadline`, so a worker cannot
-/// stretch one call by dripping frames. The request itself was sent by
+/// Waits for `request`'s answer, skipping heartbeats. Two bounds hold at
+/// once: the stream must not go SILENT past `idle` (no byte at all — a
+/// large reply crossing a slow link keeps moving and stays alive), and the
+/// whole call holds to the absolute `deadline`, so a worker cannot stretch
+/// one call by dripping frames. The request itself was sent by
 /// [`Connection::send_guarded`] under the same deadline.
 pub(crate) fn exchange(
 	io: &mut impl FrameIo,
 	cancel: Option<&CancelToken>,
+	idle: Duration,
 	deadline: Instant,
 	frames: &mut usize,
 ) -> Result<Response, RemoteError> {
@@ -582,7 +751,7 @@ pub(crate) fn exchange(
 		})
 	};
 	loop {
-		match io.recv(IO_TIMEOUT)? {
+		match io.recv_idle(idle, deadline, cancel)? {
 			Some(response) => {
 				*frames += 1;
 				if Instant::now() >= deadline {
@@ -757,6 +926,19 @@ impl Client {
 		Connection::open(&self.host.transport, &self.my_name)
 	}
 
+	/// A fresh connection whose worker speaks at least `need`, or
+	/// [`RemoteError::WorkerTooOld`]. A too-old worker is kept in the pool
+	/// for the requests it can still serve.
+	fn connect_at_least(&self, need: u32) -> Result<Connection, RemoteError> {
+		let fresh = self.connect()?;
+		if fresh.version() < need {
+			let err = too_old_error(&fresh, need);
+			self.keep(fresh);
+			return Err(err);
+		}
+		Ok(fresh)
+	}
+
 	fn keep(&self, conn: Connection) {
 		if conn.broken {
 			return;
@@ -786,17 +968,7 @@ impl Client {
 		limit: Duration,
 	) -> Result<Response, RemoteError> {
 		let start = Instant::now();
-		let is_git = matches!(
-			request,
-			Request::ScanRepos { .. }
-				| Request::GitView { .. }
-				| Request::Export { .. }
-				| Request::ExportCommits { .. }
-				| Request::ImportPlan { .. }
-				| Request::ImportApply { .. }
-				| Request::ReplayPlan { .. }
-				| Request::ReplayApply { .. }
-		);
+		let is_git = runs_git(request);
 		// A write is never sent twice, even when the first send seemed lost.
 		let writes = matches!(
 			request,
@@ -814,11 +986,7 @@ impl Client {
 
 		let need = request.needs_version();
 		let too_old = |conn: Connection| {
-			let err = RemoteError::WorkerTooOld {
-				worker: conn.worker_name().to_string(),
-				have: conn.version(),
-				need,
-			};
+			let err = too_old_error(&conn, need);
 			self.keep(conn);
 			err
 		};
@@ -832,18 +1000,12 @@ impl Client {
 				// The worker spoke while nobody was asking. Whatever the
 				// reason, its stream is out of step with the protocol:
 				// drop the connection (killing its process) and start a
-				// clean one.
-				(self.connect()?, false)
+				// clean one — which must speak a new enough protocol too.
+				(self.connect_at_least(need)?, false)
 			}
 			Some(conn) if conn.version() >= need => (conn, true),
 			Some(conn) => return Err(too_old(conn)),
-			None => {
-				let fresh = self.connect()?;
-				if fresh.version() < need {
-					return Err(too_old(fresh));
-				}
-				(fresh, false)
-			}
+			None => (self.connect_at_least(need)?, false),
 		};
 
 		let remaining = limit.saturating_sub(start.elapsed());
@@ -858,12 +1020,18 @@ impl Client {
 				if remaining_retry.is_zero() {
 					return Err(RemoteError::TimedOut);
 				}
-				if let Ok(mut fresh) = self.connect() {
-					if fresh.version() < need {
-						return Err(too_old(fresh));
+				match self.connect_at_least(need) {
+					Ok(mut fresh) => {
+						result = fresh.call(request, cancel, remaining_retry);
+						conn = fresh;
 					}
-					result = fresh.call(request, cancel, remaining_retry);
-					conn = fresh;
+					// A fresh worker that cannot serve this request at all
+					// outranks the first failure.
+					Err(err @ RemoteError::WorkerTooOld { .. }) => {
+						return Err(err)
+					}
+					// Without a replacement, the original failure stands.
+					Err(_) => {}
 				}
 			}
 		}
@@ -1102,11 +1270,13 @@ impl Client {
 		&self,
 		workspace: &str,
 		path: &str,
+		cancel: Option<&CancelToken>,
 	) -> Result<(Vec<DirEntry>, bool), RemoteError> {
-		match self.call(&Request::ListDir {
+		let req = Request::ListDir {
 			workspace: workspace.into(),
 			path: path.into(),
-		})? {
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
 			Response::Dir { entries, truncated } => Ok((entries, truncated)),
 			_ => Err(unexpected()),
 		}
@@ -1116,11 +1286,13 @@ impl Client {
 		&self,
 		workspace: &str,
 		path: &str,
+		cancel: Option<&CancelToken>,
 	) -> Result<Stat, RemoteError> {
-		match self.call(&Request::Stat {
+		let req = Request::Stat {
 			workspace: workspace.into(),
 			path: path.into(),
-		})? {
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
 			Response::Stat(stat) => Ok(stat),
 			_ => Err(unexpected()),
 		}
@@ -1131,11 +1303,13 @@ impl Client {
 		&self,
 		workspace: &str,
 		path: &str,
+		cancel: Option<&CancelToken>,
 	) -> Result<Option<String>, RemoteError> {
-		match self.call(&Request::Read {
+		let req = Request::Read {
 			workspace: workspace.into(),
 			path: path.into(),
-		})? {
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
 			Response::Text { content } => Ok(content),
 			_ => Err(unexpected()),
 		}
@@ -1144,6 +1318,36 @@ impl Client {
 
 fn unexpected() -> RemoteError {
 	RemoteError::Protocol("unexpected reply".into())
+}
+
+/// The error for a worker too old for `need`.
+fn too_old_error(conn: &Connection, need: u32) -> RemoteError {
+	RemoteError::WorkerTooOld {
+		worker: conn.worker_name().to_string(),
+		have: conn.version(),
+		need,
+	}
+}
+
+/// Requests whose worker side runs git: bounded by
+/// [`MAX_GIT_CALLS_IN_FLIGHT`] per client, so one master cannot stack more
+/// git work on a worker than the worker can serve. That includes the
+/// pastes into a repository: their freshness snapshot and re-check read
+/// HEAD and the index with git (`capture_repo_freshness`). Listing,
+/// reading and stating are plain fs work.
+pub(crate) fn runs_git(request: &Request) -> bool {
+	matches!(
+		request,
+		Request::ScanRepos { .. }
+			| Request::GitView { .. }
+			| Request::Export { .. }
+			| Request::ExportCommits { .. }
+			| Request::ExportChanges { .. }
+			| Request::ImportPlan { .. }
+			| Request::ImportApply { .. }
+			| Request::ReplayPlan { .. }
+			| Request::ReplayApply { .. }
+	)
 }
 
 fn unexpected_reply() -> GitError {
@@ -1483,6 +1687,34 @@ mod tests {
 		d.saturating_mul(timeout_scale())
 	}
 
+	fn fresh_clock() -> Arc<AtomicU64> {
+		Arc::new(AtomicU64::new(now_millis()))
+	}
+
+	/// A connection over ready-made parts, as the real one is assembled in
+	/// [`Connection::open`]: no child, no stderr, hello already done.
+	fn test_conn(
+		writer: Box<dyn IoWrite + Send>,
+		frames: Frames,
+		retained: Arc<AtomicUsize>,
+		in_flight: Arc<AtomicBool>,
+	) -> Connection {
+		Connection {
+			writer,
+			frames,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: 1,
+			broken: false,
+			frames_seen: 0,
+			retained,
+			in_flight,
+			last_byte: fresh_clock(),
+		}
+	}
+
 	struct FakeDuplex {
 		incoming: io::Cursor<Vec<u8>>,
 		outgoing: Vec<u8>,
@@ -1550,6 +1782,7 @@ mod tests {
 		let res = exchange(
 			&mut stream,
 			None,
+			IO_TIMEOUT,
 			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
@@ -1569,6 +1802,7 @@ mod tests {
 		let err = exchange(
 			&mut stream,
 			Some(&cancel),
+			IO_TIMEOUT,
 			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
@@ -1582,8 +1816,14 @@ mod tests {
 	fn exchange_zero_limit_with_pending_returns_timed_out() {
 		let mut stream = FakeDuplex::new(&[Response::Pending]);
 		let mut frames = 0;
-		let err = exchange(&mut stream, None, Instant::now(), &mut frames)
-			.unwrap_err();
+		let err = exchange(
+			&mut stream,
+			None,
+			IO_TIMEOUT,
+			Instant::now(),
+			&mut frames,
+		)
+		.unwrap_err();
 
 		assert!(matches!(err, RemoteError::TimedOut));
 		assert_eq!(frames, 1);
@@ -1599,6 +1839,7 @@ mod tests {
 		let err = exchange(
 			&mut stream,
 			None,
+			IO_TIMEOUT,
 			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
@@ -1621,6 +1862,7 @@ mod tests {
 		let err = exchange(
 			&mut stream,
 			None,
+			IO_TIMEOUT,
 			Instant::now() + Duration::from_secs(10),
 			&mut frames,
 		)
@@ -1902,19 +2144,12 @@ mod tests {
 		// streams in.
 		in_flight.store(true, Ordering::SeqCst);
 		std::thread::sleep(scaled(Duration::from_millis(300)));
-		let mut conn = Connection {
-			writer: Box::new(std::io::sink()),
-			frames: rx,
-			child: None,
-			stderr: Arc::default(),
-			worker_name: String::new(),
-			home: None,
-			version: 1,
-			broken: false,
-			frames_seen: 0,
-			retained: Arc::clone(&retained),
-			in_flight: Arc::clone(&in_flight),
-		};
+		let mut conn = test_conn(
+			Box::new(std::io::sink()),
+			rx,
+			Arc::clone(&retained),
+			Arc::clone(&in_flight),
+		);
 		let deadline = Instant::now() + scaled(Duration::from_secs(30));
 		let mut text = String::new();
 		let reply = loop {
@@ -1974,19 +2209,12 @@ mod tests {
 			})))
 			.unwrap();
 		}
-		let mut conn = Connection {
-			writer: Box::new(w),
-			frames: rx,
-			child: None,
-			stderr: Arc::default(),
-			worker_name: String::new(),
-			home: None,
-			version: 1,
-			broken: false,
-			frames_seen: 0,
-			retained: Arc::clone(&retained),
-			in_flight: Arc::new(AtomicBool::new(false)),
-		};
+		let mut conn = test_conn(
+			Box::new(w),
+			rx,
+			Arc::clone(&retained),
+			Arc::new(AtomicBool::new(false)),
+		);
 		drop(r);
 		for _ in 0..3 {
 			conn.recv(Duration::from_secs(1)).unwrap().unwrap();
@@ -2023,19 +2251,12 @@ mod tests {
 	}
 
 	fn parked_connection(gate: mpsc::Receiver<()>) -> Connection {
-		Connection {
-			writer: Box::new(ParkedWriter(std::sync::Mutex::new(Some(gate)))),
-			frames: mpsc::sync_channel(1).1,
-			child: None,
-			stderr: Arc::default(),
-			worker_name: String::new(),
-			home: None,
-			version: 1,
-			broken: false,
-			frames_seen: 0,
-			retained: Arc::default(),
-			in_flight: Arc::default(),
-		}
+		test_conn(
+			Box::new(ParkedWriter(std::sync::Mutex::new(Some(gate)))),
+			mpsc::sync_channel(1).1,
+			Arc::default(),
+			Arc::default(),
+		)
 	}
 
 	/// A request the far end never reads fails by its deadline instead of
@@ -2086,19 +2307,12 @@ mod tests {
 	#[test]
 	fn a_send_that_goes_out_keeps_the_connection_whole() {
 		let (r, w) = io::pipe().unwrap();
-		let mut conn = Connection {
-			writer: Box::new(w),
-			frames: mpsc::sync_channel(1).1,
-			child: None,
-			stderr: Arc::default(),
-			worker_name: String::new(),
-			home: None,
-			version: 1,
-			broken: false,
-			frames_seen: 0,
-			retained: Arc::default(),
-			in_flight: Arc::default(),
-		};
+		let mut conn = test_conn(
+			Box::new(w),
+			mpsc::sync_channel(1).1,
+			Arc::default(),
+			Arc::default(),
+		);
 		let request = Request::OpenWorkspace { path: "~".into() };
 		let deadline = Instant::now() + scaled(Duration::from_secs(5));
 		conn.send_guarded(&request, None, deadline).unwrap();
@@ -2130,7 +2344,436 @@ mod tests {
 		let mut frames = 0;
 		let deadline = Instant::now() + scaled(Duration::from_millis(300));
 		let err =
-			exchange(&mut stream, None, deadline, &mut frames).unwrap_err();
+			exchange(&mut stream, None, IO_TIMEOUT, deadline, &mut frames)
+				.unwrap_err();
 		assert!(matches!(err, RemoteError::TimedOut), "{err:?}");
+	}
+
+	/// A reply that takes longer than the idle timeout to arrive whole, but
+	/// never goes silent for that long, must succeed: the idle timeout
+	/// bounds the stream's silence, not a frame's total transfer. On the
+	/// old whole-frame reading this call always timed out.
+	#[test]
+	fn a_slow_but_steady_reply_outlasts_the_idle_timeout() {
+		let (r, mut w) = io::pipe().unwrap();
+		let (frames, retained, in_flight, last_byte) = read_frames(r);
+		let response = Response::Text {
+			content: Some("x".repeat(1024 * 1024)),
+		};
+		let mut bytes = Vec::new();
+		write_frame(&mut bytes, &response).unwrap();
+		let producer = std::thread::spawn(move || {
+			// 16 KiB every 50 ms: about three seconds of streaming, three
+			// times the idle bound below, while every silence stays far
+			// under it. The bound leaves room for decoding the frame after
+			// its last byte, which is silence too.
+			for piece in bytes.chunks(16 * 1024) {
+				if w.write_all(piece).is_err() {
+					return;
+				}
+				std::thread::sleep(scaled(Duration::from_millis(50)));
+			}
+		});
+		let mut conn =
+			test_conn(Box::new(std::io::sink()), frames, retained, in_flight);
+		conn.last_byte = last_byte;
+		let mut frames = 0;
+		let reply = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_secs(1)),
+			Instant::now() + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.expect("a steadily arriving reply must not time out");
+		match reply {
+			Response::Text { content } => {
+				assert_eq!(content.map(|c| c.len()), Some(1024 * 1024));
+			}
+			other => panic!("expected Text, got {other:?}"),
+		}
+		assert_eq!(frames, 1);
+		producer.join().unwrap();
+	}
+
+	/// A stream that goes silent — bytes stopped, no end of stream — ends
+	/// the call by the idle timeout, well before the call's own deadline.
+	#[test]
+	fn a_worker_gone_silent_ends_the_call_by_the_idle_timeout() {
+		let (r, w) = io::pipe().unwrap();
+		let (frames, retained, in_flight, last_byte) = read_frames(r);
+		let mut conn =
+			test_conn(Box::new(std::io::sink()), frames, retained, in_flight);
+		conn.last_byte = last_byte;
+		let mut frames = 0;
+		let started = Instant::now();
+		let err = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_millis(300)),
+			started + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.unwrap_err();
+		assert!(matches!(err, RemoteError::TimedOut), "{err:?}");
+		assert!(
+			started.elapsed() < scaled(Duration::from_secs(5)),
+			"the silence must end the call promptly, took {:?}",
+			started.elapsed()
+		);
+		// The pipe stays open until here: no end of stream, only silence.
+		drop(w);
+	}
+
+	/// A cancel ends a call whose worker never answers: the wait polls the
+	/// token instead of sitting out the idle timeout or the call's limit.
+	#[test]
+	fn a_cancel_ends_a_call_with_no_answer() {
+		let (r, w) = io::pipe().unwrap();
+		let (frames, retained, in_flight, last_byte) = read_frames(r);
+		let mut conn =
+			test_conn(Box::new(std::io::sink()), frames, retained, in_flight);
+		conn.last_byte = last_byte;
+		let token = CancelToken::new();
+		let canceller = {
+			let token = token.clone();
+			std::thread::spawn(move || {
+				std::thread::sleep(scaled(Duration::from_millis(100)));
+				token.cancel();
+			})
+		};
+		let mut frames = 0;
+		let started = Instant::now();
+		let err = exchange(
+			&mut conn,
+			Some(&token),
+			scaled(Duration::from_secs(30)),
+			started + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.unwrap_err();
+		assert!(matches!(err, RemoteError::Cancelled), "{err:?}");
+		assert!(
+			started.elapsed() < scaled(Duration::from_secs(5)),
+			"the cancel must end the call promptly, took {:?}",
+			started.elapsed()
+		);
+		drop(w);
+		canceller.join().unwrap();
+	}
+
+	/// A connection whose idle timer has expired while sitting idle must
+	/// not fail a new call immediately: the idle timer must be reset to
+	/// the send time, so a worker answering within the idle timeout succeeds.
+	#[test]
+	fn a_call_resets_the_idle_timer_on_send() {
+		let (r, mut w) = io::pipe().unwrap();
+		let (frames, retained, in_flight, last_byte) = read_frames(r);
+		let mut conn =
+			test_conn(Box::new(std::io::sink()), frames, retained, in_flight);
+		conn.last_byte = last_byte;
+		// The connection sat idle well past IO_TIMEOUT.
+		conn.last_byte
+			.store(now_millis().saturating_sub(60_000), Ordering::Relaxed);
+		let worker = std::thread::spawn(move || {
+			// The worker takes about half of idle to compute its answer:
+			// longer than the 50 ms WAIT_SLICE, but well under IO_TIMEOUT.
+			std::thread::sleep(Duration::from_millis(2500));
+			let reply = Response::Workspace(RemoteWorkspace {
+				id: "ws-1".into(),
+				name: "test".into(),
+				path: "/test/workspace".into(),
+			});
+			let mut buf = Vec::new();
+			write_frame(&mut buf, &reply).unwrap();
+			let _ = w.write_all(&buf);
+		});
+		let reply = conn
+			.call(
+				&Request::OpenWorkspace { path: "~".into() },
+				None,
+				scaled(Duration::from_secs(30)),
+			)
+			.expect("a call on an idle connection must reset the idle timer and succeed");
+		match reply {
+			Response::Workspace(ws) => assert_eq!(ws.path, "/test/workspace"),
+			other => panic!("expected Workspace, got {other:?}"),
+		}
+		assert!(
+			join_bounded(worker, scaled(Duration::from_secs(5))),
+			"the worker thread must finish promptly"
+		);
+	}
+
+	/// Replacing an out-of-step connection must refuse a worker too old
+	/// for the request, as a fresh connect does — not the worker's generic
+	/// `Unsupported` refusal.
+	#[test]
+	fn a_reconnect_after_unsolicited_frames_reports_a_worker_too_old() {
+		use crate::worker::WorkerOptions;
+
+		let worker = Arc::new(Worker::new(WorkerOptions {
+			name: "old".into(),
+			max_protocol: Some(1),
+		}));
+		let client = Client::new(RemoteHost::in_process(worker), "test".into());
+
+		// A connection the worker spoke on with nobody asking: its reply
+		// was pumped while no call was in flight, so the master discards
+		// it at the next use.
+		let mut stale = client.connect().unwrap();
+		let deadline = Instant::now() + scaled(Duration::from_secs(5));
+		stale
+			.send_guarded(
+				&Request::OpenWorkspace { path: "~".into() },
+				None,
+				deadline,
+			)
+			.unwrap();
+		let limit = Instant::now() + scaled(Duration::from_secs(5));
+		while stale.unsolicited_frames() == 0 {
+			assert!(
+				Instant::now() < limit,
+				"the worker's unsolicited reply never arrived"
+			);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		client.idle.lock().unwrap().push(stale);
+
+		let err = client
+			.call_with(
+				&Request::ScanRepos {
+					workspace: "~".into(),
+					under: None,
+				},
+				None,
+				scaled(GIT_CALL_LIMIT),
+			)
+			.unwrap_err();
+		match err {
+			RemoteError::WorkerTooOld { have, need, .. } => {
+				assert_eq!((have, need), (1, 2));
+			}
+			other => panic!("expected WorkerTooOld, got {other:?}"),
+		}
+	}
+
+	/// The requests whose worker side runs git — the in-flight limiter's
+	/// set. Every request type is listed, so a new one must be placed
+	/// deliberately.
+	#[test]
+	fn requests_that_run_git_on_the_worker_are_limited() {
+		use snip_core::gitsrc::GitSource;
+		use snip_core::gitview::ReadProfile;
+
+		let settings = snip_core::settings::Settings::default();
+		let expect = ImportExpect {
+			digest: String::new(),
+			freshness: snip_core::transfer::DestinationFreshnessSnapshot {
+				roots: Default::default(),
+				target_files: Default::default(),
+			},
+		};
+		let requests = [
+			(
+				Request::Hello {
+					version: 1,
+					name: "m".into(),
+					max_version: None,
+				},
+				false,
+			),
+			(Request::OpenWorkspace { path: "~".into() }, false),
+			(
+				Request::ListDir {
+					workspace: "w".into(),
+					path: "p".into(),
+				},
+				false,
+			),
+			(
+				Request::Stat {
+					workspace: "w".into(),
+					path: "p".into(),
+				},
+				false,
+			),
+			(
+				Request::Read {
+					workspace: "w".into(),
+					path: "p".into(),
+				},
+				false,
+			),
+			(
+				Request::Write {
+					workspace: "w".into(),
+					path: "p".into(),
+					content: "c".into(),
+				},
+				false,
+			),
+			(
+				Request::Rename {
+					workspace: "w".into(),
+					from: "a".into(),
+					to: "b".into(),
+				},
+				false,
+			),
+			(
+				Request::ScanRepos {
+					workspace: "w".into(),
+					under: None,
+				},
+				true,
+			),
+			(
+				Request::GitView {
+					workspace: "w".into(),
+					repo: "r".into(),
+					profile: ReadProfile::Interactive,
+					query: GitQuery::ChangeList,
+				},
+				true,
+			),
+			(
+				Request::Export {
+					workspace: "w".into(),
+					items: vec![],
+					settings: settings.clone(),
+					file_limit: 1,
+				},
+				true,
+			),
+			(
+				Request::ExportCommits {
+					workspace: "w".into(),
+					repo: "r".into(),
+					tip: "HEAD".into(),
+					selected: vec!["a".into()],
+				},
+				true,
+			),
+			(
+				Request::ExportChanges {
+					workspace: "w".into(),
+					repo: "r".into(),
+					source: GitSource::Working,
+					settings: settings.clone(),
+					file_limit: 1,
+				},
+				true,
+			),
+			(
+				Request::ImportPlan {
+					workspace: "w".into(),
+					dest: String::new(),
+					text: String::new(),
+					mapping: PasteMapping::default(),
+				},
+				true, // its freshness snapshot reads HEAD and the index
+			),
+			(
+				Request::ImportApply {
+					workspace: "w".into(),
+					dest: String::new(),
+					text: String::new(),
+					mapping: PasteMapping::default(),
+					selection: Default::default(),
+					expect: expect.clone(),
+				},
+				true, // its re-check reads HEAD and the index
+			),
+			(
+				Request::ReplayPlan {
+					workspace: "w".into(),
+					dest: "d".into(),
+					text: String::new(),
+				},
+				true,
+			),
+			(
+				Request::ReplayApply {
+					workspace: "w".into(),
+					dest: "d".into(),
+					text: String::new(),
+					expect: ReplayExpect {
+						destination: Default::default(),
+						plan: snip_core::commits::CommitReplayPlan {
+							root: Default::default(),
+							commits: vec![],
+						},
+						freshness:
+							snip_core::transfer::DestinationFreshnessSnapshot {
+								roots: Default::default(),
+								target_files: Default::default(),
+							},
+					},
+					check_only: false,
+				},
+				true,
+			),
+			(Request::Chunk { data: "d".into() }, false),
+			(Request::FrameChunk { data: "d".into() }, false),
+			(Request::FrameJoin, false),
+		];
+		for (request, git) in requests {
+			assert_eq!(runs_git(&request), git, "{request:?}");
+		}
+	}
+
+	/// A transport that is alive but silent through the whole hello wait
+	/// says so, instead of the old closed-connection message.
+	#[test]
+	fn a_silent_alive_transport_says_it_did_not_answer() {
+		let msg = start_message(StartCause::NoAnswer, None, "");
+		assert!(msg.contains("did not answer in time"), "{msg}");
+		assert!(!msg.contains("closed the connection"), "{msg}");
+	}
+
+	/// A timeout still defers to what the transport itself said.
+	#[test]
+	fn a_timed_out_hello_keeps_stderr_that_says_why() {
+		let msg = start_message(StartCause::NoAnswer, None, "ssh: swapped out");
+		assert_eq!(msg, "ssh: swapped out");
+	}
+
+	/// A stream that broke the protocol keeps its own message: a login
+	/// shell printing too much is named as such.
+	#[test]
+	fn a_banner_over_the_cap_keeps_its_own_message() {
+		let msg = start_message(
+			StartCause::BadData(
+				"the remote shell printed too much before snip started".into(),
+			),
+			Some(0),
+			"",
+		);
+		assert!(msg.contains("printed too much"), "{msg}");
+	}
+
+	/// The ended-transport classification is what it was.
+	#[test]
+	fn an_ended_transport_keeps_the_old_classification() {
+		assert_eq!(
+			start_message(StartCause::Ended, None, ""),
+			"the remote end closed the connection before snip started"
+		);
+		assert!(start_message(StartCause::Ended, Some(127), "")
+			.contains("not installed"));
+		assert!(start_message(
+			StartCause::Ended,
+			Some(1),
+			"unrecognized subcommand"
+		)
+		.contains("not installed"));
+		assert!(start_message(
+			StartCause::Ended,
+			Some(255),
+			"Permission denied"
+		)
+		.contains("ssh-copy-id"));
+		assert_eq!(start_message(StartCause::Ended, Some(1), "boom"), "boom");
 	}
 }

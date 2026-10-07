@@ -74,14 +74,16 @@ preflight-rust:
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	# Same as CI's Linux Test job: one run, clipboard tests on a private display.
-	RUSTFLAGS="-D warnings" xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+	RUSTFLAGS="-D warnings" xvfb-run -a cargo nextest run --workspace --exclude snip-native-e2e --locked --no-fail-fast
+	RUSTFLAGS="-D warnings" cargo test --doc --workspace --exclude snip-native-e2e --locked
 
 # CI's Lint and Test jobs on macOS and Windows: no Xvfb, the host's own clipboard.
 preflight-host:
 	cargo fmt --all --check
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-	RUSTFLAGS="-D warnings" cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+	RUSTFLAGS="-D warnings" cargo nextest run --workspace --exclude snip-native-e2e --locked --no-fail-fast
+	RUSTFLAGS="-D warnings" cargo test --doc --workspace --exclude snip-native-e2e --locked
 	{{just_executable()}} remote-e2e
 
 # Remote workspaces end to end, apart from the GUI gates: a real `snip remote` master
