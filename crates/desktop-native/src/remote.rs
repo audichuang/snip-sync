@@ -222,6 +222,11 @@ pub struct MasterState {
 	pub recent: Vec<RecentRemote>,
 	pub session: Option<RemoteSession>,
 	pub busy: bool,
+	/// Bumped when the workspace the user is looking at changes under an
+	/// in-flight open: a local open, a close or a newer remote open. A
+	/// result landing with an older seq is dropped, workspace and status
+	/// bar untouched.
+	pub open_seq: u64,
 	pub message: Option<(bool, String)>,
 	/// The host whose folders are listed, and the folder shown.
 	pub browse: Option<Browse>,
@@ -417,12 +422,14 @@ pub(crate) fn remote_scan_entries(
 /// Blocking: the remote counterpart of [`crate::tree::execute_tree_io`].
 /// A fresh Expand/Retry fetches the worker's WHOLE listing once; a
 /// continuation (LoadMore, entries still in `held`) is the ordinary local
-/// admission path — nothing to fetch, no remote branch.
+/// admission path — nothing to fetch, no remote branch. The job's cancel
+/// token ends a fetch against a host that stopped answering.
 pub fn tree_io(
 	client: &Client,
 	workspace: &str,
 	session_root: &Path,
 	io: TreeIo,
+	cancel: Option<&snip_core::gitrun::CancelToken>,
 ) -> TreeIoResult {
 	if !io.held.is_empty() {
 		return crate::tree::execute_tree_io(
@@ -443,7 +450,7 @@ pub fn tree_io(
 		Some(key_rel) => {
 			let req_path = join_rel(&prefix, &key_rel);
 			client
-				.list_dir(workspace, &req_path)
+				.list_dir(workspace, &req_path, cancel)
 				.map(|(entries, truncated)| {
 					let children = entries
 						.into_iter()
@@ -464,16 +471,18 @@ pub fn tree_io(
 }
 
 /// Blocking: a file preview read on the worker. Only working-tree files
-/// are served in this slice.
+/// are served in this slice. The job's cancel token ends a read against a
+/// host that stopped answering.
 pub fn read_preview(
 	client: &Client,
 	workspace: &str,
 	prefix: &str,
 	path: &str,
+	cancel: Option<&snip_core::gitrun::CancelToken>,
 ) -> Result<(SourcePreview, PreviewSource), String> {
 	let full_path = join_rel(prefix, path);
 	client
-		.read(workspace, &full_path)
+		.read(workspace, &full_path, cancel)
 		.map(|content| {
 			(
 				SourcePreview {
@@ -578,7 +587,7 @@ impl WorkbenchModel {
 			let result = bg
 				.spawn(async move {
 					let ws = client.open_workspace(&path)?;
-					let (entries, _) = client.list_dir(&ws.id, "")?;
+					let (entries, _) = client.list_dir(&ws.id, "", None)?;
 					let folders = entries
 						.into_iter()
 						.filter(|e| {
@@ -694,9 +703,20 @@ impl WorkbenchModel {
 		}
 		self.remote.busy = true;
 		self.remote.message = None;
+		// Any open that follows (local or remote) invalidates this one.
+		self.remote.open_seq = self.remote.open_seq.wrapping_add(1);
+		let open_seq = self.remote.open_seq;
+		#[cfg(test)]
+		let open_delay = self.e2e_remote_open_delay;
 		cx.notify();
 		let bg = cx.background_executor().clone();
 		cx.spawn(async move |this, cx| {
+			// Tests hold the open at the test clock so a user action can
+			// land while it is in flight.
+			#[cfg(test)]
+			if let Some(delay) = open_delay {
+				cx.background_executor().timer(delay).await;
+			}
 			let probe = host.clone();
 			let result = bg
 				.spawn(async move {
@@ -707,6 +727,16 @@ impl WorkbenchModel {
 				.await;
 			let _ = this.update(cx, |this, cx| {
 				this.remote.busy = false;
+				if this.remote.open_seq != open_seq {
+					// The user opened a local workspace, closed the
+					// workspace or started another remote open meanwhile:
+					// neither the workspace nor the status bar moves.
+					app_log!(
+						"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
+						this.remote.open_seq
+					);
+					return;
+				}
 				match result {
 					Ok(ws) => {
 						this.workspace_menu = false;

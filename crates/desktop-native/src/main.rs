@@ -140,6 +140,18 @@ fn commit_copied_status(out: &snip_core::commits::CommitCopyOutcome) -> Msg {
 	Msg::new("status_commits_copied_skipped", args)
 }
 
+/// The copy toast when nothing could be copied: a worker that skipped
+/// every file it saw (unreadable, oversize) says so, as the local copy's
+/// `EmptySelection` does. Local and remote copies report the same
+/// [`snip_core::transfer::CopyOutcome`] shape.
+fn remote_copy_nothing_status(out: &snip_core::transfer::CopyOutcome) -> Msg {
+	if out.skipped > 0 {
+		Msg::new("status_copy_nothing_skipped", [])
+	} else {
+		Msg::new("status_copy_nothing", [])
+	}
+}
+
 /// The copy toast: a partial copy (file limit hit in the folder walk or
 /// in the plan) always says so, with the limit. Local and remote copies
 /// report the same [`snip_core::transfer::CopyOutcome`] shape.
@@ -270,6 +282,7 @@ actions!(
 		LogOpen,
 		LogSearchFocus,
 		LogHead,
+		LogCopy,
 		// IntelliJ chrome (IJ-2c).
 		NextDiff,
 		PrevDiff,
@@ -804,11 +817,18 @@ pub struct WorkbenchModel {
 	pub probes: Option<ui::Probes>,
 	/// Focus requested from a context without a `Window`; applied on render.
 	pub pending_focus: Option<FocusHandle>,
+	/// The frame's focus guard, registered once: a focused element that is
+	/// no longer drawn returns the keyboard to `focus_handle`.
+	pub(crate) focus_lost_guard: Option<gpui::Subscription>,
 	pub e2e_read_delay: Option<std::time::Duration>,
 	/// Test-only hold file for project-tree reads, honoured only in E2E mode.
 	pub e2e_tree_hold: Option<PathBuf>,
 	/// Test-only hold file for copy export revalidation, honoured only in E2E mode.
 	pub e2e_export_hold: Option<PathBuf>,
+	/// Test-only: holds an in-flight remote open at the test clock, so a
+	/// result can land after a later user action.
+	#[cfg(test)]
+	pub(crate) e2e_remote_open_delay: Option<std::time::Duration>,
 	pub workspace_open: bool,
 	pub workspace_menu: bool,
 	/// Where the workspace menu button was drawn: a press there toggles the
@@ -919,7 +939,7 @@ impl WorkbenchModel {
 			let input = cx.new(|cx| TextInput::new(i18n::t(key, loc), 0, cx));
 			cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
 				InputEvent::Submit => this.apply_log_date_range(cx),
-				InputEvent::Dismiss => this.close_log_menu(cx),
+				InputEvent::Dismiss => this.dismiss_log_menu(cx),
 				_ => {}
 			})
 			.detach();
@@ -1199,9 +1219,12 @@ impl WorkbenchModel {
 			viewport_h: 0.,
 			probes: ui::Probes::from_env(),
 			pending_focus: None,
+			focus_lost_guard: None,
 			e2e_read_delay: ui::e2e_read_delay(),
 			e2e_tree_hold: ui::e2e_tree_hold(),
 			e2e_export_hold: ui::e2e_export_hold(),
+			#[cfg(test)]
+			e2e_remote_open_delay: None,
 			workspace_open: workspace.is_some(),
 			workspace_menu: false,
 			workspace_menu_button: Default::default(),
@@ -2007,6 +2030,9 @@ impl WorkbenchModel {
 				self.set_status("workspace_draining", []);
 			}
 			lifecycle::Request::Accepted => {
+				// A workspace open/close is under way: an in-flight remote
+				// open that lands later must not touch it (remote.rs).
+				self.remote.open_seq = self.remote.open_seq.wrapping_add(1);
 				self.generation = self.generation.wrapping_add(1);
 				self.preview_generation =
 					self.preview_generation.wrapping_add(1);
@@ -3028,6 +3054,7 @@ impl WorkbenchModel {
 										&ws,
 										&session_root,
 										io,
+										Some(&cancel_bg),
 									)
 								}
 								None => {
@@ -3783,7 +3810,11 @@ impl WorkbenchModel {
 							match remote::remote_rel(&session_root, &repo_root)
 							{
 								Some(prefix) => remote::read_preview(
-									&client, &ws, &prefix, &for_bg,
+									&client,
+									&ws,
+									&prefix,
+									&for_bg,
+									Some(&cancel),
 								),
 								None => {
 									Err("not under the workspace".to_string())
@@ -4203,7 +4234,7 @@ impl WorkbenchModel {
 								)
 							})?;
 						if out.copied == 0 {
-							return Err(Msg::new("status_copy_nothing", []));
+							return Err(remote_copy_nothing_status(&out));
 						}
 						let msg = copied_status(repo_name, &out);
 						Ok((out.payload, out.copied, msg))
@@ -5344,6 +5375,8 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
 		KeyBinding::new("escape", MenuCancel, Some("ContextMenu")),
 		// Git log.
+		KeyBinding::new("ctrl-c", LogCopy, Some("GitLog")),
+		KeyBinding::new("cmd-c", LogCopy, Some("GitLog")),
 		KeyBinding::new("up", LogUp, Some("GitLog")),
 		KeyBinding::new("down", LogDown, Some("GitLog")),
 		KeyBinding::new("shift-up", LogExtendUp, Some("GitLog")),
@@ -5473,6 +5506,29 @@ mod tests {
 		assert!(!matches!(startup_workspace(None, true), Startup::Remote(_)));
 	}
 
+	/// A remote copy that copies nothing reports the same "skipped" status
+	/// the local copy does when the worker skipped every file it saw.
+	#[test]
+	fn remote_copy_all_skipped_reports_the_skipped_status() {
+		let outcome =
+			|copied: usize, skipped: usize| snip_core::transfer::CopyOutcome {
+				payload: String::new(),
+				copied,
+				chars: 0,
+				lines: 0,
+				skipped,
+				truncated: false,
+			};
+		assert_eq!(
+			super::remote_copy_nothing_status(&outcome(0, 3)).key,
+			"status_copy_nothing_skipped"
+		);
+		assert_eq!(
+			super::remote_copy_nothing_status(&outcome(0, 0)).key,
+			"status_copy_nothing"
+		);
+	}
+
 	/// UI state driven in-process: no display, so these also run in the
 	/// Windows and macOS Test jobs, which have no real-app GUI test.
 	mod in_process {
@@ -5539,10 +5595,22 @@ mod tests {
 		}
 
 		/// arboard talks to the one OS clipboard, so tests that use it run one
-		/// at a time, and on Linux only under a display (CI uses xvfb-run).
+		/// at a time, across threads and processes, and on Linux only under a
+		/// display (CI uses xvfb-run).
 		static CLIPBOARD: Mutex<()> = Mutex::new(());
 
-		fn clipboard() -> Option<MutexGuard<'static, ()>> {
+		pub(crate) struct ClipboardTestGuard {
+			_mutex: MutexGuard<'static, ()>,
+			_file: std::fs::File,
+		}
+
+		impl Drop for ClipboardTestGuard {
+			fn drop(&mut self) {
+				let _ = self._file.unlock();
+			}
+		}
+
+		fn clipboard() -> Option<ClipboardTestGuard> {
 			let unset =
 				|k: &str| std::env::var_os(k).is_none_or(|v| v.is_empty());
 			if cfg!(target_os = "linux")
@@ -5556,7 +5624,40 @@ mod tests {
 				eprintln!("skipping clipboard test: no display");
 				return None;
 			}
-			Some(CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner))
+			let mutex =
+				CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner);
+			let lock_path =
+				std::env::temp_dir().join("snip-test-os-clipboard.lock");
+			let file = std::fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.create(true)
+				.truncate(false)
+				.open(&lock_path)
+				.expect("open clipboard lock file");
+			// Bounded: a test stuck holding the OS clipboard fails the waiter
+			// with a message instead of hanging the run.
+			let deadline =
+				std::time::Instant::now() + std::time::Duration::from_secs(300);
+			loop {
+				match file.try_lock() {
+					Ok(()) => break,
+					Err(std::fs::TryLockError::WouldBlock)
+						if std::time::Instant::now() < deadline =>
+					{
+						std::thread::sleep(std::time::Duration::from_millis(50))
+					}
+					Err(e) => panic!(
+						"clipboard lock {}: {e:?} (another test held the OS \
+						 clipboard for 300 s)",
+						lock_path.display()
+					),
+				}
+			}
+			Some(ClipboardTestGuard {
+				_mutex: mutex,
+				_file: file,
+			})
 		}
 
 		/// Serializes remote tests: the worker's Served git pool admits one process at a time and tests share the process.
@@ -9578,6 +9679,255 @@ mod tests {
 			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
 		}
 
+		/// With no file open the reader is never drawn, yet Esc in the
+		/// Project tree hands it the focus: the handle stays valid, keys
+		/// fell to the dispatch tree's root and Alt+9, Alt+1, Cmd+V all
+		/// went dead. Driven the way the user drives it: Alt+1 takes the
+		/// tree, Esc leaves it, then the keys must still work.
+		#[gpui::test]
+		fn keys_survive_escape_from_the_tree_without_a_preview(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			// Alt+1 opens the Project tool window and focuses its tree.
+			cx.simulate_keystrokes("alt-1");
+			cx.update(|window, cx| {
+				assert!(
+					model.read(cx).tree_focus.is_focused(window),
+					"Alt+1 must focus the tree",
+				);
+			});
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			// Alt+9 still toggles the log…
+			let before = model.read_with(cx, |m, _| m.bottom_visible);
+			cx.simulate_keystrokes("alt-9");
+			assert_eq!(
+				model.read_with(cx, |m, _| m.bottom_visible),
+				!before,
+				"Alt+9 must work after Esc in the tree",
+			);
+			cx.simulate_keystrokes("alt-9");
+			assert_eq!(model.read_with(cx, |m, _| m.bottom_visible), before);
+			// …and Alt+1 still opens the Project tool window.
+			cx.simulate_keystrokes("alt-1");
+			model.read_with(cx, |m, _| {
+				assert!(m.left_visible);
+				assert_eq!(m.active_tab, WorkbenchTab::FileExplorer);
+			});
+		}
+
+		/// Alt+9 closing a log that held the focus left the focus on the
+		/// no-longer-drawn list, and the next Alt+9 never reached the
+		/// Workbench: the log would not come back.
+		#[gpui::test]
+		fn alt_9_reopens_the_log_after_closing_it_while_it_holds_the_focus(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			// The log starts open without the focus: close, then open the
+			// way Alt+9 does, with the focus on the log.
+			cx.simulate_keystrokes("alt-9");
+			assert!(!model.read_with(cx, |m, _| m.bottom_visible));
+			cx.simulate_keystrokes("alt-9");
+			assert!(model.read_with(cx, |m, _| m.bottom_visible));
+			cx.update(|window, cx| {
+				assert!(model.read(cx).log_focus.is_focused(window));
+			});
+			// Closing it while it holds the focus must not strand the
+			// keyboard on the hidden list.
+			cx.simulate_keystrokes("alt-9");
+			assert!(!model.read_with(cx, |m, _| m.bottom_visible));
+			cx.simulate_keystrokes("alt-9");
+			assert!(
+				model.read_with(cx, |m, _| m.bottom_visible),
+				"Alt+9 must reopen the log",
+			);
+		}
+
+		/// Picking a branch in the Branch menu used to close the menu and
+		/// strand the keyboard on the closed menu's field: Up/Down and
+		/// Cmd+C stopped working. The log keeps the keyboard, as it does
+		/// after Esc.
+		#[gpui::test]
+		fn picking_a_branch_keeps_the_log_keyboard(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			for i in 0..3 {
+				fs::write(alpha.join(format!("f{i}.txt")), "x").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("c{i}")]);
+			}
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			// The filter chips give way first on a narrow window. The bar
+			// re-measures its search field on the first frames, which moves
+			// the chips: wait until they stop moving, or the click below
+			// lands on a neighbour.
+			cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(752.)));
+			let mut last_chip = None;
+			for _ in 0..10 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+				let pos = cx
+					.debug_bounds("log-filter-branch")
+					.map(|b| (f32::from(b.origin.x), f32::from(b.origin.y)));
+				if pos.is_some() && pos == last_chip {
+					break;
+				}
+				last_chip = pos;
+			}
+			for _ in 0..10 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.display_commits().len() >= 3 && !m.refs.is_empty()
+				});
+				if ready {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.display_commits().len() >= 3 && !m.refs.is_empty(),
+					"the log and its refs must be loaded",
+				);
+			});
+			// Open the Branch menu, expand its Local section, pick a branch.
+			{
+				let b = cx.debug_bounds("log-filter-branch").unwrap();
+				for (dx, dy) in [
+					(0., 0.),
+					(-8., -4.),
+					(0., -6.),
+					(8., 0.),
+					(0., 4.),
+					(-20., 0.),
+					(-30., 0.),
+				] {
+					let pos = gpui::point(
+						b.center().x + gpui::px(dx),
+						b.center().y + gpui::px(dy),
+					);
+					cx.simulate_click(pos, gpui::Modifiers::none());
+					let menu = model.read_with(cx, |m, _| m.log_menu);
+					eprintln!("DBG offset ({dx},{dy}) -> menu={menu:?}");
+					if menu.is_some() {
+						break;
+					}
+				}
+			}
+			click(cx, "log-branch-group:refs_local");
+			let branch = model.read_with(cx, |m, _| {
+				m.refs
+					.iter()
+					.map(|r| r.name.clone())
+					.find(|n| n.starts_with("refs/heads/"))
+					.expect("a local branch")
+			});
+			click(
+				cx,
+				Box::leak(format!("log-branch:{branch}").into_boxed_str()),
+			);
+			settle(cx);
+			let before = model.read_with(cx, |m, _| m.selected_commit.clone());
+			cx.simulate_keystrokes("down");
+			let after = model.read_with(cx, |m, _| m.selected_commit.clone());
+			assert!(
+				after.is_some() && after != before,
+				"Down must move the log selection after a branch pick \
+				 (before: {before:?}, after: {after:?})",
+			);
+		}
+
+		/// A remote open that lands after the user opened a local workspace
+		/// from the recents must leave that workspace and the status bar
+		/// alone. The open is held at the test clock, so the worker's
+		/// answer cannot land before the click.
+		#[gpui::test]
+		fn a_late_remote_open_leaves_a_local_workspace_alone(
+			cx: &mut TestAppContext,
+		) {
+			let local = tempfile::tempdir().unwrap();
+			let remote_ws = tempfile::tempdir().unwrap();
+			let worker = std::sync::Arc::new(snip_remote::Worker::new(
+				snip_remote::WorkerOptions::default(),
+			));
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let (model, cx) = cx.add_window_view(|_, cx| {
+				WorkbenchModel::new(None, None, "normal".into(), cx)
+			});
+			cx.run_until_parked();
+			model.update(cx, |m, _| {
+				m.workspace_menu = true;
+				m.recent_workspaces = vec![local.path().to_path_buf()];
+				m.remote.hosts =
+					vec![snip_remote::RemoteHost::in_process(worker.clone())];
+				m.remote.recent.clear();
+			});
+			cx.run_until_parked();
+			// The remote open starts and stays in flight at the test clock.
+			model.update(cx, |m, cx| {
+				m.e2e_remote_open_delay = Some(Duration::from_millis(100));
+				m.open_remote_path(
+					0,
+					remote_ws.path().display().to_string(),
+					cx,
+				);
+			});
+			// While it is in flight, the user opens a local workspace.
+			click(cx, "workspace-recent:0");
+			// The answer lands now; it must be dropped.
+			for _ in 0..5 {
+				settle(cx);
+			}
+			settle(cx);
+			// The open goes through the shared close drain, which waits for
+			// every git child in this test binary (GitLoad is process wide);
+			// under parallel tests it may not end on its own. Poll it as if
+			// git were idle, like land_remote_open does.
+			for _ in 0..10 {
+				let open = model.read_with(cx, |m, _| m.workspace_open);
+				if open {
+					break;
+				}
+				model.update(cx, |m, cx| {
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now(),
+						crate::lifecycle::GitLoad::idle(),
+					);
+					if let crate::lifecycle::Step::Ready(
+						crate::lifecycle::Intent::OpenWorkspace(path),
+					) = step
+					{
+						m.finish_open(path, cx);
+					}
+				});
+				settle(cx);
+			}
+			let local_path = dunce::canonicalize(local.path()).unwrap();
+			model.read_with(cx, |m, _| {
+				assert!(m.workspace_open, "the local workspace must be open");
+				assert!(
+					m.remote.session.is_none(),
+					"the late remote open must be dropped",
+				);
+				assert_eq!(m.workspace_root, local_path);
+				assert!(
+					!matches!(
+						m.status.key,
+						"remote_open_failed" | "remote_opened"
+					),
+					"the status bar was overwritten: {}",
+					m.status.key,
+				);
+			});
+		}
+
 		/// The log list width and, per laid-out row, the widths of its graph
 		/// gutter and subject cell.
 		struct LogMeasure {
@@ -12188,6 +12538,112 @@ mod tests {
 			assert_eq!(
 				model.read_with(cx, |m, _| m.log_empty_state()),
 				Some(LogEmpty::Empty)
+			);
+		}
+
+		#[gpui::test]
+		fn git_log_cmd_c_copies_selected_commit(cx: &mut TestAppContext) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			fs::write(r.join("dirty.txt"), "dirty content\n").unwrap();
+
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty()
+						&& !m.files.is_empty()
+						&& m.display_commits().len() >= 2
+				});
+				if ready {
+					break;
+				}
+			}
+
+			// Control group: when focus is outside Git Log (default focus on workbench / left tool window),
+			// pressing Cmd+C triggers CopySelection, copying the tool window's node (dirty.txt),
+			// not a commit payload.
+			clip::write_text("before").unwrap();
+			cx.simulate_keystrokes("cmd-c");
+			for _ in 0..100 {
+				settle(cx);
+				if model.read_with(cx, |m, _| !m.is_copying) {
+					break;
+				}
+			}
+			let text_ctrl = clip::read_text().unwrap();
+			assert!(
+				!text_ctrl.starts_with("// snip-sync commits v1"),
+				"control group should not copy commits: {text_ctrl}"
+			);
+			assert!(
+				text_ctrl.contains("dirty.txt"),
+				"control group should copy tool window node: {text_ctrl}"
+			);
+
+			// User action: click the commit row via debug_bounds to focus Git Log and select the commit.
+			let target_sha =
+				model.read_with(cx, |m, _| m.display_commits()[0].sha.clone());
+			let row_bounds = cx
+				.debug_bounds("log-subject:0")
+				.expect("commit row at index 0 drawn");
+			cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+			settle(cx);
+
+			// Verify focus entered Git Log and target commit is selected.
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.selected_commit.as_deref(),
+					Some(target_sha.as_str())
+				);
+			});
+
+			// Now press Cmd+C while Git Log has focus.
+			clip::write_text("before_commit_copy").unwrap();
+			cx.simulate_keystrokes("cmd-c");
+			for _ in 0..100 {
+				settle(cx);
+				if model.read_with(cx, |m, _| !m.is_copying) {
+					break;
+				}
+			}
+
+			let text = clip::read_text().unwrap();
+			assert!(
+				text.starts_with("// snip-sync commits v1"),
+				"expected commit payload starting with '// snip-sync commits v1', got: {text}"
+			);
+			assert!(
+				text.contains("commit c1"),
+				"expected payload to contain clicked commit 'commit c1', got: {text}"
+			);
+			assert!(
+				!text.contains("base.txt"),
+				"expected payload to be only the selected commit, got: {text}"
+			);
+
+			// Verify that when a TextInput in the Log toolbar (e.g. log_search_input) has focus,
+			// Cmd+C copies the selected text, not commits.
+			cx.update(|window, app| {
+				model.update(app, |m, cx| {
+					m.log_search_input.update(cx, |i, cx| {
+						i.set_text("find_something", cx);
+					});
+					window.focus(&m.log_search_input.read(cx).handle());
+				});
+			});
+			settle(cx);
+			cx.simulate_keystrokes("cmd-a");
+			settle(cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle(cx);
+			assert_eq!(
+				cx.read_from_clipboard().and_then(|i| i.text()),
+				Some("find_something".to_string())
 			);
 		}
 	}

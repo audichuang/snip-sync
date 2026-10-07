@@ -466,6 +466,11 @@ impl WorkbenchModel {
 									.key_context("GitLog")
 									.track_focus(&self.log_focus)
 									.on_action(cx.listener(
+										|this, _: &LogCopy, _, cx| {
+											this.copy_commits_to_clipboard(cx)
+										},
+									))
+									.on_action(cx.listener(
 										|this, _: &LogUp, _, cx| {
 											this.log_move(-1, false, cx)
 										},

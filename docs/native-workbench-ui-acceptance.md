@@ -9,7 +9,7 @@
 - 頂部只保留一組工作區／repo／分支資訊與主要同步操作。
 - 左侧窄工具列，Project／Changes 面板可調寬；樹的展開、導航與待複製勾選是不同操作。
 - 中央保留主要閱讀空間：檔案 tab、路徑及來源、行號、高亮／diff。
-- 下方 Git Log 是橫向工具視窗，可調高／收合，包含 repo／ref 篩選及 graph、message、author 等欄位。不可再把 graph 擠在左側樹底部。
+- 下方 Git Log 是橫向工具視窗，可調高／收合，包含 repo／ref 篩選及 graph、message、author 等欄位。不可再把 graph 擠在左側樹底部；焦點在 Log commit 列表時按 Cmd/Ctrl+C 複製選取的 commit（與工具列複製按鈕一致）。
 - 貼上為獨立且完整的預覽區，單一 Apply／Cancel 區域，顯示目的地、操作、覆寫選擇與內容。不能有兩套重複按鈕。
 - 使用一致的中性深灰背景、細分隔線、克制的藍色選取與 Git 狀態色；以可辨識小圖示取代 emoji。UI 字體與程式碼字體分開，間距和列高統一。
 

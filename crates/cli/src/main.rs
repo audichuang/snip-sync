@@ -544,13 +544,30 @@ fn tag<T: Serialize>(value: &T) -> String {
 	}
 }
 
+/// Every stdout write goes through this one fallible writer: a reader
+/// that closed the pipe (`… | head`) ends the command quietly with
+/// success, any other write failure (a full target) comes back as the
+/// command's error and exits non-zero.
+pub(crate) fn stdout_write(text: &str) -> Outcome {
+	let mut out = io::stdout().lock();
+	match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+		Ok(()) => Ok(()),
+		Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+		Err(e) => Err(e.to_string()),
+	}
+}
+
+/// One stdout line through [`stdout_write`].
+pub(crate) fn stdout_line(text: &str) -> Outcome {
+	let mut line = String::with_capacity(text.len() + 1);
+	line.push_str(text);
+	line.push('\n');
+	stdout_write(&line)
+}
+
 fn emit(text: &str, stdout: bool) -> Outcome {
 	if stdout {
-		let mut out = io::stdout().lock();
-		return out
-			.write_all(text.as_bytes())
-			.and_then(|()| out.flush())
-			.map_err(|e| e.to_string());
+		return stdout_write(text);
 	}
 	write_clipboard(text)
 }
@@ -841,7 +858,7 @@ fn paste_files(
 
 	let plan = import.restore_plan();
 	if !opts.apply {
-		print_plan(plan);
+		print_plan(plan)?;
 	}
 	if plan.create_operations.is_empty() && plan.delete_operations.is_empty() {
 		eprintln!(
@@ -881,9 +898,9 @@ fn paste_files(
 	.map(|(label, n)| format!("{label} {n}"))
 	.collect();
 	if parts.is_empty() {
-		println!("No files changed.");
+		stdout_line("No files changed.")?;
 	} else {
-		println!("{}", parts.join(", "));
+		stdout_line(&parts.join(", "))?;
 	}
 	if result.errors.is_empty() {
 		return Ok(());
@@ -895,17 +912,18 @@ fn paste_files(
 	))
 }
 
-fn print_plan(plan: &RestorePlan) {
+fn print_plan(plan: &RestorePlan) -> Outcome {
 	for op in &plan.create_operations {
 		let action = if op.existed { "overwrite" } else { "create" };
-		println!("{action}\t{}", op.relative_path);
+		stdout_line(&format!("{action}\t{}", op.relative_path))?;
 	}
 	for op in &plan.delete_operations {
-		println!("delete\t{}", op.relative_path);
+		stdout_line(&format!("delete\t{}", op.relative_path))?;
 	}
 	for op in &plan.skipped_operations {
-		println!("skip\t{}\t{}", op.raw_path, op.reason.as_str());
+		stdout_line(&format!("skip\t{}\t{}", op.raw_path, op.reason.as_str()))?;
 	}
+	Ok(())
 }
 
 /// `confirmationSummary`.
@@ -980,13 +998,13 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 				}
 				None => String::new(),
 			};
-			println!(
+			stdout_line(&format!(
 				"[{}/{total}] {subject}{refused_suffix}\n      {} <{}> {}",
 				i + 1,
 				c.author_name,
 				c.author_email,
 				c.author_date
-			);
+			))?;
 			for f in &c.files {
 				let path = match &f.old_path {
 					Some(old) => format!("{old} -> {}", f.path),
@@ -998,11 +1016,11 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 					.or(f.skip_reason.map(|r| tag(&r)))
 					.map(|r| format!("\t{r}"))
 					.unwrap_or_default();
-				println!(
+				stdout_line(&format!(
 					"  {}\t{}\t{path}{why}",
 					tag(&f.action).to_lowercase(),
 					tag(&f.change).to_lowercase()
-				);
+				))?;
 			}
 		}
 		let first_refusal =
@@ -1037,9 +1055,9 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 	}
 
 	let result = replay(false)?.ok_or("the replay returned no result")?;
-	println!("Created {} commit(s).", result.created.len());
+	stdout_line(&format!("Created {} commit(s).", result.created.len()))?;
 	for sha in &result.created {
-		println!("  {sha}");
+		stdout_line(&format!("  {sha}"))?;
 	}
 	match result.failure {
 		None => Ok(()),

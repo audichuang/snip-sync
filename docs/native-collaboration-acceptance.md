@@ -132,7 +132,7 @@ python3 scripts/check_native_collaboration.py \
 
 ### 控制項與互動規範
 
-0. **複製是右鍵選單的「複製」**：App 沒有選取籃也沒有勾選框。對一列右鍵（`[APP:MENU_OPEN: Left items=copy-files,…]`）再點 `menu-item:copy-files`，只複製那一個節點，等 `[APP:COPY_DONE: copied=N]`；Cmd/Ctrl+C 複製左側工具視窗游標所在的節點。檔案步驟的操作混了不同來源（worktree、index、fixed OID、刪除），所以 `run_positive_file` 對每個操作各做一次「選列 → 複製 → 貼上 → 映射 → 覆寫 → 套用」，全部套用後才比對快照；`clipboard` 證據的 `source`／`readback` 是最後一次，`operations` 列出每一次。跨 repo 的匯出（碰撞、歧義、缺少目的地）用專案樹 Ctrl 點擊把各 repo 的檔案加入選取（等 `[APP:TREE_TOGGLED: <path>]`），再對最後一列右鍵「複製」。
+0. **複製是右鍵選單的「複製」**：App 沒有選取籃也沒有勾選框。對一列右鍵（`[APP:MENU_OPEN: Left items=copy-files,…]`）再點 `menu-item:copy-files`，只複製那一個節點，等 `[APP:COPY_DONE: copied=N]`；Cmd/Ctrl+C 複製左側工具視窗游標所在的節點（Git Log 有焦點時複製選取的 commit）。檔案步驟的操作混了不同來源（worktree、index、fixed OID、刪除），所以 `run_positive_file` 對每個操作各做一次「選列 → 複製 → 貼上 → 映射 → 覆寫 → 套用」，全部套用後才比對快照；`clipboard` 證據的 `source`／`readback` 是最後一次，`operations` 列出每一次。跨 repo 的匯出（碰撞、歧義、缺少目的地）用專案樹 Ctrl 點擊把各 repo 的檔案加入選取（等 `[APP:TREE_TOGGLED: <path>]`），再對最後一列右鍵「複製」。
 1. **Repo 選擇與消歧義**：Repo 列表將同名 repo 顯示成 workspace 相對路徑（如 `west/billing` 與 `east/billing`）；由 header 的 `btn-repo-selector` 展開帶序號的 `pick-repo:N:label`。點選後必須由 `[APP:REPO_SELECTING:` 解析出的 canonical root 與 manifest 目的 root 嚴格比對。
 2. **刪除操作（Deletion Provenance）**：Manifest 刪除規格為 `op: "delete"` 且 `source.kind` 為 `"working"` 或 `"index"`（非發明的 `sourceKind` 欄位；原始 fixture 產生的 schema 即是如此，絕無假造的刪除崩潰修復）。Driver 依 `source.kind` 解析來源：`"working"` 對應 `unstaged`（`change-row:unstaged:<path>`），`"index"` 對應 `staged`（`change-row:staged:<path>`）；複製就是對該列右鍵、點 `menu-item:copy-files`。嚴格要求 `status == "D"`、`inWorktree is False`、`diffAgainst` 與 blob `oid`；歧義或無效欄位直接失敗，絕不假通過。
 3. **歷史檔案固定 OID（Fixed-OID Selection）**：依循 current `smoke.rs` 規範歷史瀏覽流程：

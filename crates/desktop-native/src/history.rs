@@ -1724,7 +1724,8 @@ impl WorkbenchModel {
 		let until = self.log_until_input.read(cx).text().trim().to_string();
 		match date_range(&since, &until) {
 			Some((since, until)) => {
-				self.log_menu = None;
+				// The fields go with the menu; the log keeps the keyboard.
+				self.dismiss_log_menu(cx);
 				self.log_date_error = false;
 				self.log_filter.since = since;
 				self.log_filter.until = until;
