@@ -5539,10 +5539,22 @@ mod tests {
 		}
 
 		/// arboard talks to the one OS clipboard, so tests that use it run one
-		/// at a time, and on Linux only under a display (CI uses xvfb-run).
+		/// at a time, across threads and processes, and on Linux only under a
+		/// display (CI uses xvfb-run).
 		static CLIPBOARD: Mutex<()> = Mutex::new(());
 
-		fn clipboard() -> Option<MutexGuard<'static, ()>> {
+		pub(crate) struct ClipboardTestGuard {
+			_mutex: MutexGuard<'static, ()>,
+			_file: std::fs::File,
+		}
+
+		impl Drop for ClipboardTestGuard {
+			fn drop(&mut self) {
+				let _ = self._file.unlock();
+			}
+		}
+
+		fn clipboard() -> Option<ClipboardTestGuard> {
 			let unset =
 				|k: &str| std::env::var_os(k).is_none_or(|v| v.is_empty());
 			if cfg!(target_os = "linux")
@@ -5556,7 +5568,40 @@ mod tests {
 				eprintln!("skipping clipboard test: no display");
 				return None;
 			}
-			Some(CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner))
+			let mutex =
+				CLIPBOARD.lock().unwrap_or_else(PoisonError::into_inner);
+			let lock_path =
+				std::env::temp_dir().join("snip-test-os-clipboard.lock");
+			let file = std::fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.create(true)
+				.truncate(false)
+				.open(&lock_path)
+				.expect("open clipboard lock file");
+			// Bounded: a test stuck holding the OS clipboard fails the waiter
+			// with a message instead of hanging the run.
+			let deadline =
+				std::time::Instant::now() + std::time::Duration::from_secs(300);
+			loop {
+				match file.try_lock() {
+					Ok(()) => break,
+					Err(std::fs::TryLockError::WouldBlock)
+						if std::time::Instant::now() < deadline =>
+					{
+						std::thread::sleep(std::time::Duration::from_millis(50))
+					}
+					Err(e) => panic!(
+						"clipboard lock {}: {e:?} (another test held the OS \
+						 clipboard for 300 s)",
+						lock_path.display()
+					),
+				}
+			}
+			Some(ClipboardTestGuard {
+				_mutex: mutex,
+				_file: file,
+			})
 		}
 
 		/// Serializes remote tests: the worker's Served git pool admits one process at a time and tests share the process.

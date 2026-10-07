@@ -113,17 +113,39 @@ jobs:
 
     # Unit, integration, contract, CLI E2E and cross-tool tests on 3 OSes.
     test:
-        name: Test (${{ matrix.os }})
+        name: Test (${{ matrix.os }}, ${{ matrix.shard }})
         runs-on: ${{ matrix.os }}
         timeout-minutes: 45
         strategy:
             fail-fast: false
             matrix:
-                os: [ubuntu-24.04, macos-latest, windows-latest]
+                include:
+                    - os: ubuntu-24.04
+                      shard: 1/1
+                      shard_index: 1
+                      last: true
+                    - os: macos-latest
+                      shard: 1/2
+                      shard_index: 1
+                    - os: macos-latest
+                      shard: 2/2
+                      shard_index: 2
+                      last: true
+                    - os: windows-latest
+                      shard: 1/3
+                      shard_index: 1
+                    - os: windows-latest
+                      shard: 2/3
+                      shard_index: 2
+                    - os: windows-latest
+                      shard: 3/3
+                      shard_index: 3
+                      last: true
         env:
             RUSTFLAGS: "-D warnings"
             # A test that would skip for a missing prerequisite fails instead.
             SNIP_REQUIRE_ALL_TESTS: "1"
+            SNIP_E2E_TIMEOUT_SCALE: "2"
         steps:
             - uses: actions/checkout@v6
             - name: Normalize git config (cross-platform line endings)
@@ -139,7 +161,8 @@ jobs:
                   # Only main writes: its caches are readable from every branch and
                   # PR, and one set fits the repo's 10 GB quota (per-branch sets
                   # plus sccache evicted each other, leaving ~0% hits).
-                  save-if: ${{ github.ref == 'refs/heads/main' }}
+                  # One writer per OS: shard 1, which builds every test binary too.
+                  save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard_index == 1 }}
                   shared-key: ${{ runner.os }}-test
                   cache-on-failure: true
             - name: Install Linux system dependencies (xvfb for clipboard, X11/xkbcommon/fonts/Wayland/Vulkan for native)
@@ -173,8 +196,12 @@ jobs:
               uses: actions/setup-node@v4
               with:
                   node-version: 24
+            - name: Install cargo-nextest
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-nextest
             - name: Git runner smoke test (macOS fast gate)
-              if: runner.os == 'macOS'
+              if: runner.os == 'macOS' && matrix.shard_index == 1
               timeout-minutes: 5
               run: cargo test -p snip-core --locked --test git_runner fast_child_rapid_cleanup_releases_all_permits_without_leftover_error -- --exact
             # One cargo invocation, so core, CLI and the native crate (its unit
@@ -182,13 +209,19 @@ jobs:
             # drivers (snip-native-e2e) run in native-acceptance instead.
             - name: Workspace tests (Linux, under xvfb for the clipboard)
               if: runner.os == 'Linux'
-              run: xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+              run: xvfb-run -a cargo nextest run --workspace --exclude snip-native-e2e --locked --no-fail-fast --partition hash:${{ matrix.shard }}
             - name: Workspace tests
               if: runner.os != 'Linux'
-              run: cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+              run: cargo nextest run --workspace --exclude snip-native-e2e --locked --no-fail-fast --partition hash:${{ matrix.shard }}
+            # Spread over the shards: doctests on the last, the binary on the first.
+            - name: Doc tests
+              if: matrix.last
+              run: cargo test --doc --workspace --exclude snip-native-e2e --locked
             - name: Build native binary (debug)
+              if: matrix.shard_index == 1
               run: cargo build -p snip-desktop-native --locked
             - name: Native binary CLI smoke test
+              if: matrix.shard_index == 1
               shell: bash
               run: |
                   BIN="target/debug/snip-desktop-native"
