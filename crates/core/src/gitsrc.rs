@@ -5,7 +5,7 @@
 //! git plumbing calls (porting-notes section 5). `collect` only yields the
 //! files; `collect_payload` applies filters, limits and counts on top.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,6 +31,9 @@ use crate::workspace::RepoIdentity;
 
 /// The well-known OID of git's empty tree: the "parent" of a root commit.
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// The empty tree OID of a SHA-256 repository: the same stand-in there.
+pub const SHA256_EMPTY_TREE: &str =
+	"6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
 /// Stands in for content the requested revision could not supply.
 pub const UNREADABLE_FILE_MARKER: &str = "// Unable to read file content";
 
@@ -641,6 +644,37 @@ impl Git {
 		self.head_with(&RunOptions::default())
 	}
 
+	/// The empty tree OID of this repository's object format: the diff
+	/// base of a root commit, and of an unborn HEAD. SHA-1 and SHA-256
+	/// repositories have different well-known empty tree OIDs, so it is
+	/// looked up per repository instead of spelled from a constant.
+	pub fn empty_tree_with(
+		&self,
+		opts: &RunOptions,
+	) -> Result<String, GitError> {
+		const ARGS: &str = "rev-parse --show-object-format";
+		let out =
+			self.run_with(&["rev-parse", "--show-object-format"], opts)?;
+		if out.truncated {
+			return Err(GitError::OutputLimit {
+				args: ARGS.into(),
+				limit: opts.max_stdout,
+			});
+		}
+		let format = std::str::from_utf8(&out.stdout)
+			.map_err(|_| {
+				GitError::Malformed("rev-parse output not utf-8".into())
+			})?
+			.trim();
+		match format {
+			"sha256" => Ok(SHA256_EMPTY_TREE.into()),
+			"sha1" => Ok(EMPTY_TREE.into()),
+			other => Err(GitError::Malformed(format!(
+				"unknown object format: {other}"
+			))),
+		}
+	}
+
 	/// The symbolic ref HEAD points at, `None` when detached.
 	/// An unborn branch still returns its symbolic name.
 	pub fn head_ref(&self) -> Result<Option<String>, GitError> {
@@ -861,19 +895,27 @@ fn union_into(
 	entries: Vec<RawEntry>,
 	skipped: &mut usize,
 ) {
+	// Path -> position in `changes`, rebuilt per union because the Working
+	// source unions four listings into one vector: a linear `find` per
+	// entry made huge untracked-file listings quadratic.
+	let mut index: HashMap<String, usize> = changes
+		.iter()
+		.enumerate()
+		.map(|(i, c)| (c.path.clone(), i))
+		.collect();
 	for e in entries {
 		let Ok(path) = String::from_utf8(e.path) else {
 			*skipped += 1;
 			continue;
 		};
-		// ponytail: linear lookup, O(n^2) per union; index by a HashMap if
-		// huge merges get slow.
-		if let Some(c) = changes.iter_mut().find(|c| c.path == path) {
+		if let Some(i) = index.get(&path).copied() {
+			let c = &mut changes[i];
 			if c.status == b'D' && e.status == b'D' {
 				c.deleted_from.push(e.old_oid);
 			}
 			continue;
 		}
+		index.insert(path.clone(), changes.len());
 		let deleted_from = if e.status == b'D' {
 			vec![e.old_oid]
 		} else {
@@ -1084,8 +1126,9 @@ fn collect_changes_in(
 			// VS Code keeps conflicts out of the working and index lists and
 			// reports them as merge changes between untracked and index.
 			let conflicts = unmerged(git, &only, opts)?;
-			let resolved =
-				|e: &RawEntry| !conflicts.iter().any(|c| c.path == e.path);
+			let conflict_paths: HashSet<Vec<u8>> =
+				conflicts.iter().map(|c| c.path.clone()).collect();
+			let resolved = |e: &RawEntry| !conflict_paths.contains(&e.path);
 			let mut args = raw(&[]);
 			args.extend_from_slice(&only);
 			let worktree = diff(git, &args, opts)?
@@ -1139,7 +1182,7 @@ fn collect_changes_in(
 				if git.is_shallow_with(opts)? {
 					return Err(GitError::Shallow(sha));
 				}
-				parents.push(EMPTY_TREE.to_string());
+				parents.push(git.empty_tree_with(opts)?);
 			}
 			for parent in &parents {
 				let mut args = vec![
@@ -1636,6 +1679,164 @@ mod tests {
 		let err = Git::open(dir.path()).err().unwrap();
 		assert!(matches!(err, GitError::NotARepository(_)), "{err}");
 		assert!(err.to_string().contains("is not inside a git repository"));
+	}
+
+	/// `union_into` feeds `list_changes_with`, whose row order the desktop
+	/// browser and the payload layout rely on: entries must come out in
+	/// first-seen input order across repeated unions, whatever the HashMap
+	/// iteration order inside is, and the merge rules must not change with
+	/// the lookup.
+	#[test]
+	fn union_into_keeps_first_seen_order_across_unions() {
+		let entry = |status: u8, path: &str| RawEntry {
+			status,
+			old_mode: String::new(),
+			new_mode: "100644".into(),
+			old_oid: format!("old-{path}"),
+			new_oid: format!("new-{path}"),
+			old_path: None,
+			path: path.as_bytes().to_vec(),
+		};
+		let mut changes = Vec::new();
+		let mut skipped = 0;
+
+		// First union: b, c, a, g.
+		union_into(
+			&mut changes,
+			vec![
+				entry(b'A', "b.txt"),
+				entry(b'M', "c.txt"),
+				entry(b'A', "a.txt"),
+				entry(b'D', "g.txt"),
+			],
+			&mut skipped,
+		);
+		// Second union repeats paths (a different listing sees them again)
+		// and adds d.
+		union_into(
+			&mut changes,
+			vec![
+				entry(b'M', "c.txt"),
+				entry(b'D', "a.txt"),
+				entry(b'A', "d.txt"),
+				entry(b'D', "g.txt"),
+			],
+			&mut skipped,
+		);
+		// A third deletion of a path already deleted appends its old OID.
+		union_into(&mut changes, vec![entry(b'D', "g.txt")], &mut skipped);
+
+		let paths: Vec<&str> =
+			changes.iter().map(|c| c.path.as_str()).collect();
+		assert_eq!(paths, ["b.txt", "c.txt", "a.txt", "g.txt", "d.txt"]);
+		assert_eq!(skipped, 0);
+		// First sighting wins: c stays an M with the first union's OIDs.
+		let c = &changes[1];
+		assert_eq!(c.status, b'M');
+		assert_eq!(c.new_oid, "new-c.txt");
+		assert_eq!(c.deleted_from, Vec::<String>::new());
+		// A deletion behind an earlier non-deleted sighting changes nothing
+		// on a's row.
+		let a = &changes[2];
+		assert_eq!(a.status, b'A');
+		assert_eq!(a.new_oid, "new-a.txt");
+		assert_eq!(a.deleted_from, Vec::<String>::new());
+		// Deletions of a path first seen deleted accumulate on its row.
+		let g = &changes[3];
+		assert_eq!(g.status, b'D');
+		assert_eq!(g.deleted_from, vec!["old-g.txt", "old-g.txt", "old-g.txt"]);
+	}
+
+	/// Initializes `root` as a SHA-256 repository, or returns `false` when
+	/// this git is too old to know the format.
+	fn init_sha256(root: &Path, cfg: &Path) -> bool {
+		let out = std::process::Command::new("git")
+			.args(["init", "-q", "-b", "main", "--object-format=sha256"])
+			.current_dir(root)
+			.env("GIT_CONFIG_GLOBAL", cfg)
+			.env("GIT_CONFIG_NOSYSTEM", "1")
+			.output()
+			.unwrap();
+		out.status.success()
+	}
+
+	fn assert_sha256_supported(reason: &str) {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but {reason}"
+		);
+	}
+
+	/// A SHA-256 repository has a different well-known empty tree OID. A
+	/// root commit diffs against that tree, not against the SHA-1
+	/// constant, or listing and copying it fail outright.
+	#[test]
+	fn root_commit_lists_against_the_sha256_empty_tree() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().join("r");
+		fs::create_dir_all(&root).unwrap();
+		let cfg = dir.path().join("cfg");
+		fs::write(&cfg, "").unwrap();
+		if !init_sha256(&root, &cfg) {
+			assert_sha256_supported("git lacks --object-format=sha256");
+			return;
+		}
+		let run = |args: &[&str]| {
+			let out = std::process::Command::new("git")
+				.args(args)
+				.current_dir(&root)
+				.env("GIT_CONFIG_GLOBAL", &cfg)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"git {args:?}: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+			String::from_utf8_lossy(&out.stdout).trim().to_string()
+		};
+		run(&["config", "user.name", "T"]);
+		run(&["config", "user.email", "t@example.com"]);
+		fs::write(root.join("one.txt"), "one\n").unwrap();
+		run(&["add", "-A"]);
+		run(&["commit", "-q", "-m", "root"]);
+		let sha = run(&["rev-parse", "HEAD"]);
+		let git = Git::open(&root).unwrap();
+
+		assert_eq!(
+			git.empty_tree_with(&RunOptions::default()).unwrap(),
+			SHA256_EMPTY_TREE
+		);
+
+		let (changes, skipped) = list_changes_with(
+			&git,
+			&GitSource::Commit(sha),
+			&RunOptions::default(),
+		)
+		.unwrap();
+		assert_eq!(skipped, 0);
+		let paths: Vec<&str> =
+			changes.iter().map(|c| c.path.as_str()).collect();
+		assert_eq!(paths, ["one.txt"]);
+	}
+
+	/// A SHA-1 repository still gets the classic constant.
+	#[test]
+	fn sha1_repository_reports_the_classic_empty_tree() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		let out = std::process::Command::new("git")
+			.args(["init", "-q", "-b", "main"])
+			.current_dir(root)
+			.output()
+			.unwrap();
+		assert!(out.status.success());
+		let git = Git::open(root).unwrap();
+		assert_eq!(
+			git.empty_tree_with(&RunOptions::default()).unwrap(),
+			EMPTY_TREE
+		);
 	}
 
 	#[test]

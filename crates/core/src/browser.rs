@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fsutil::decode_utf8_or_skip;
 use crate::gitrun::{Overflow, RunOptions};
-use crate::gitsrc::{self, Git, GitError, GitSource, EMPTY_TREE};
+use crate::gitsrc::{self, Git, GitError, GitSource};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitSummary {
@@ -602,10 +602,6 @@ pub fn commit_directory_with(
 	}
 
 	for rec in records_slice.split(|&b| b == 0).filter(|r| !r.is_empty()) {
-		if entries.len() >= limit {
-			truncated = true;
-			break;
-		}
 		let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
 			return Err(GitError::Malformed(
 				"ls-tree record missing tab".into(),
@@ -640,18 +636,25 @@ pub fn commit_directory_with(
 		entries.push(TreeEntry { path, name, kind });
 	}
 
+	// Sort before truncating: `ls-tree` sorts by full path, so a
+	// subdirectory `z/` sorts after every `a*` file — cutting first drops
+	// it from the listing entirely.
+	entries.sort_by(|a, b| {
+		(b.kind == TreeKind::Tree)
+			.cmp(&(a.kind == TreeKind::Tree))
+			.then(a.name.cmp(&b.name))
+	});
+	if entries.len() > limit {
+		truncated = true;
+		entries.truncate(limit);
+	}
+
 	if out.truncated && entries.is_empty() && limit > 0 {
 		return Err(GitError::OutputLimit {
 			args: format!("ls-tree {sha}"),
 			limit: opts.max_stdout,
 		});
 	}
-
-	entries.sort_by(|a, b| {
-		(b.kind == TreeKind::Tree)
-			.cmp(&(a.kind == TreeKind::Tree))
-			.then(a.name.cmp(&b.name))
-	});
 	Ok((entries, truncated))
 }
 
@@ -835,7 +838,11 @@ fn diff_revs(
 ) -> Result<Vec<String>, GitError> {
 	Ok(match source {
 		GitSource::Working => {
-			vec![git.head_with(opts)?.unwrap_or_else(|| EMPTY_TREE.into())]
+			let base = match git.head_with(opts)? {
+				Some(head) => head,
+				None => git.empty_tree_with(opts)?,
+			};
+			vec![base]
 		}
 		GitSource::Staged => vec!["--cached".into()],
 		GitSource::Commit(rev) => {
@@ -848,7 +855,11 @@ fn diff_revs(
 					(sha, first)
 				}
 			};
-			vec![first.unwrap_or_else(|| EMPTY_TREE.into()), sha]
+			let base = match first {
+				Some(parent) => parent,
+				None => git.empty_tree_with(opts)?,
+			};
+			vec![base, sha]
 		}
 		GitSource::Range(base, tip) => vec![
 			git.resolve_commit_with(base, opts)?,
@@ -1250,6 +1261,90 @@ mod tests {
 		fs::write(dir.path().join("outside"), "secret").unwrap();
 		symlink(dir.path().join("outside"), root.join("escape")).unwrap();
 		assert!(file_preview(&alias, "escape").is_err());
+	}
+
+	#[test]
+	fn commit_directory_sorts_before_it_truncates_so_subdirectories_survive() {
+		// 2500 `a*` files and one `z/` subdirectory: `ls-tree` sorts by
+		// full path, so `z/` arrives last. Cutting at the limit before
+		// sorting dropped it from the page entirely.
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		run(root, &["config", "user.name", "Tester"]);
+		run(root, &["config", "user.email", "t@example.com"]);
+		for i in 0..2500 {
+			fs::write(root.join(format!("a{i:04}.txt")), "x\n").unwrap();
+		}
+		fs::create_dir_all(root.join("z")).unwrap();
+		fs::write(root.join("z/file.txt"), "z\n").unwrap();
+		let sha = commit(root, "big");
+		let git = Git::open(root).unwrap();
+		let (entries, truncated) =
+			commit_directory(&git, &sha, "", 2000).unwrap();
+		assert!(truncated);
+		assert_eq!(entries.len(), 2000);
+		assert_eq!(
+			entries[0].path, "z",
+			"the subdirectory sorts first and must survive the cut"
+		);
+		assert_eq!(entries[0].kind, TreeKind::Tree);
+		assert!(
+			entries[1..]
+				.iter()
+				.all(|e| e.kind == TreeKind::Blob && e.name.starts_with('a')),
+			"the rest of the first page is a* files"
+		);
+	}
+
+	/// A SHA-256 repository's root commit is previewed against its own
+	/// format's empty tree: the SHA-1 constant is a bad object there.
+	#[test]
+	fn root_commit_previews_in_a_sha256_repository() {
+		use crate::format::ChangeType;
+		use crate::gitsrc::SHA256_EMPTY_TREE;
+
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().join("r");
+		fs::create_dir_all(&root).unwrap();
+		let cfg = dir.path().join("cfg");
+		fs::write(&cfg, "").unwrap();
+		let out = Command::new("git")
+			.args(["init", "-q", "-b", "main", "--object-format=sha256"])
+			.current_dir(&root)
+			.env("GIT_CONFIG_GLOBAL", &cfg)
+			.env("GIT_CONFIG_NOSYSTEM", "1")
+			.output()
+			.unwrap();
+		if !out.status.success() {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"SNIP_REQUIRE_ALL_TESTS is set but git lacks \
+				 --object-format=sha256: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+			return;
+		}
+		run(&root, &["config", "user.name", "Tester"]);
+		run(&root, &["config", "user.email", "t@example.com"]);
+		fs::write(root.join("one.txt"), "one\n").unwrap();
+		let sha = commit(&root, "root");
+		let git = Git::open(&root).unwrap();
+		assert_eq!(
+			git.empty_tree_with(&RunOptions::default()).unwrap(),
+			SHA256_EMPTY_TREE
+		);
+		let prev = git_preview_for(
+			&git,
+			&GitSource::Commit(sha),
+			"one.txt",
+			ChangeType::New,
+			Some(&[]),
+			&RunOptions::default(),
+		)
+		.unwrap();
+		assert!(prev.patch.contains("one.txt"), "{}", prev.patch);
+		assert!(prev.patch.contains("one"), "{}", prev.patch);
 	}
 
 	#[test]

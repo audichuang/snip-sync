@@ -233,27 +233,43 @@ pub fn commit_details_with(
 	let commit_date = f.next().unwrap_or_default().to_string();
 	let message = f.next().unwrap_or_default().trim().to_string();
 	// Best effort: a failure here only hides the branch list.
-	let contains = git
-		.run_with(
-			&[
-				"for-each-ref",
-				&format!("--count={}", MAX_CONTAINING_BRANCHES + 1),
-				"--contains",
-				sha,
-				"--format=%(refname:short)",
-				"refs/heads",
-				"refs/remotes",
-			],
-			opts,
-		)
-		.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-		.unwrap_or_default();
-	let mut branches: Vec<String> = contains
+	let containing = git.run_with(
+		&[
+			"for-each-ref",
+			"--contains",
+			sha,
+			"--format=%(refname)",
+			"refs/heads",
+			"refs/remotes",
+		],
+		opts,
+	);
+	let (containing, containing_truncated) = match containing {
+		Ok(out) => (
+			String::from_utf8_lossy(&out.stdout).into_owned(),
+			out.truncated,
+		),
+		Err(_) => (String::new(), false),
+	};
+	// Full refnames, filtered, then counted and capped: `%(refname:short)`
+	// spells `refs/remotes/origin/HEAD` as `origin` (its shortening rule),
+	// so a `/HEAD` filter never hit and a branch named after the remote
+	// leaked into the list. With the git-side `--count` applied before any
+	// filter, the filtered-out ref also hid the last real branch and made
+	// `branches_more` under-report.
+	let mut branches: Vec<String> = containing
 		.lines()
 		.filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
-		.map(|l| clip_utf8(l.to_string(), 200))
+		.map(|l| {
+			let short = l
+				.strip_prefix("refs/heads/")
+				.or_else(|| l.strip_prefix("refs/remotes/"))
+				.unwrap_or(l);
+			clip_utf8(short.to_string(), 200)
+		})
 		.collect();
-	let branches_more = branches.len() > MAX_CONTAINING_BRANCHES;
+	let branches_more =
+		branches.len() > MAX_CONTAINING_BRANCHES || containing_truncated;
 	branches.truncate(MAX_CONTAINING_BRANCHES);
 	Ok(CommitDetails {
 		sha: sha.to_string(),
@@ -1512,6 +1528,74 @@ mod tests {
 			String::from_utf8_lossy(&out.stderr)
 		);
 		String::from_utf8(out.stdout).unwrap().trim().to_string()
+	}
+
+	/// `origin/HEAD` must not leak in as a branch named after the remote,
+	/// and the cap must apply after the `/HEAD` filter: a filtered-out
+	/// ref used to hide the last real branch and silence `branches_more`.
+	#[test]
+	fn containing_branches_filter_head_and_count_after_the_filter() {
+		if !has_git() {
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run_git(root, &["init", "-q", "-b", "main"]);
+		std::fs::write(root.join("f.txt"), "f\n").unwrap();
+		run_git(root, &["add", "-A"]);
+		run_git(root, &["commit", "-qm", "base"]);
+		// The remote-tracking default-branch symref, plus 21 remote
+		// branches that all contain the commit.
+		run_git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+		run_git(
+			root,
+			&[
+				"symbolic-ref",
+				"refs/remotes/origin/HEAD",
+				"refs/remotes/origin/main",
+			],
+		);
+		for i in 0..21 {
+			run_git(
+				root,
+				&[
+					"update-ref",
+					&format!("refs/remotes/origin/b{i:02}"),
+					"HEAD",
+				],
+			);
+		}
+
+		let git = Git::open_with(root, &RunOptions::default()).unwrap();
+		let sha = git
+			.head_with(&RunOptions::default())
+			.unwrap()
+			.expect("HEAD exists");
+		let details =
+			commit_details_with(&git, &sha, &RunOptions::default()).unwrap();
+
+		assert!(
+			!details.branches.iter().any(|b| b == "origin"),
+			"the remote's HEAD symref must not become a branch: {:?}",
+			details.branches
+		);
+		assert!(
+			!details.branches.iter().any(|b| b.ends_with("/HEAD")),
+			"remote HEAD symrefs are filtered: {:?}",
+			details.branches
+		);
+		assert!(details.branches.contains(&"main".to_string()));
+		assert!(details.branches.contains(&"origin/b00".to_string()));
+		// 22 containing branches (main + b00..b20) after the filter:
+		// the page is full and the flag knows more exist. The git-side
+		// `--count` ran before the filter and cut exactly one ref too
+		// few, leaving 20 kept and `branches_more` false.
+		assert_eq!(details.branches.len(), MAX_CONTAINING_BRANCHES);
+		assert!(
+			details.branches_more,
+			"22 containing branches: more than the page shows"
+		);
+		assert!(!details.branches.contains(&"origin/b20".to_string()));
 	}
 
 	#[test]

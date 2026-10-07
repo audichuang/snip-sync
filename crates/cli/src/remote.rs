@@ -2,7 +2,6 @@
 //! a machine without the desktop app. Hosts are the ones `~/.ssh/config`
 //! names; each command starts `snip serve --stdio` there over ssh.
 
-use std::io::{self, Write};
 use std::sync::Arc;
 
 use clap::{ArgGroup, Subcommand};
@@ -192,17 +191,6 @@ pub(crate) fn expand_limit(settings: &snip_core::settings::Settings) -> usize {
 	}
 }
 
-fn emit(text: &str, stdout: bool) -> Result<(), String> {
-	if stdout {
-		let mut out = io::stdout().lock();
-		return out
-			.write_all(text.as_bytes())
-			.and_then(|()| out.flush())
-			.map_err(|e| e.to_string());
-	}
-	crate::write_clipboard(text)
-}
-
 fn change_char(change: Option<ChangeType>) -> char {
 	match change {
 		Some(ChangeType::New) => 'N',
@@ -220,9 +208,8 @@ pub fn run(
 ) -> Outcome {
 	match cmd {
 		RemoteCommand::Hosts => {
-			let mut out = io::stdout().lock();
 			for host in snip_remote::ssh::config_hosts() {
-				let _ = writeln!(out, "{host}");
+				crate::stdout_line(&host)?;
 			}
 			Ok(())
 		}
@@ -235,14 +222,12 @@ pub fn run(
 			let ws = find_workspace(&c, &workspace)?;
 			let (entries, truncated) =
 				c.list_dir(&ws.id, &path, None).map_err(|e| e.to_string())?;
-			let mut out = io::stdout().lock();
 			for e in &entries {
-				let _ = writeln!(
-					out,
+				crate::stdout_line(&format!(
 					"{}{}",
 					e.name,
 					if e.directory { "/" } else { "" }
-				);
+				))?;
 			}
 			if truncated {
 				eprintln!("(listing truncated)");
@@ -264,8 +249,7 @@ pub fn run(
 			};
 			let modified =
 				st.modified.map(|m| m.to_string()).unwrap_or_default();
-			println!("{kind}\t{}\t{modified}", st.size);
-			Ok(())
+			crate::stdout_line(&format!("{kind}\t{}\t{modified}", st.size))
 		}
 		RemoteCommand::Cat {
 			host,
@@ -275,10 +259,7 @@ pub fn run(
 			let c = client(&host);
 			let ws = find_workspace(&c, &workspace)?;
 			match c.read(&ws.id, &path, None).map_err(|e| e.to_string())? {
-				Some(text) => {
-					let _ = io::stdout().lock().write_all(text.as_bytes());
-					Ok(())
-				}
+				Some(text) => crate::stdout_write(&text),
 				None => Err(format!("{path} is binary or not UTF-8")),
 			}
 		}
@@ -299,16 +280,18 @@ pub fn run(
 								.branch
 								.as_deref()
 								.unwrap_or("(detached)");
-							println!(
+							crate::stdout_line(&format!(
 								"{rel}\t{branch}\t{}\t{}\t{}\t{}",
 								summary.changes.staged,
 								summary.changes.unstaged,
 								summary.changes.untracked,
 								summary.changes.conflicted,
-							);
+							))?;
 						}
 						Err(msg) => {
-							println!("{rel}\terror: {msg}");
+							crate::stdout_line(&format!(
+								"{rel}\terror: {msg}"
+							))?;
 						}
 					}
 				}
@@ -318,7 +301,7 @@ pub fn run(
 					} else {
 						rel.as_str()
 					};
-					println!("{rel}\terror: {msg}");
+					crate::stdout_line(&format!("{rel}\terror: {msg}"))?;
 				}
 				if scan.error_overflow > 0 {
 					eprintln!("({} more errors)", scan.error_overflow);
@@ -358,7 +341,10 @@ pub fn run(
 					}
 				};
 				let type_char = change_char(row.change_type);
-				println!("{src_char}\t{type_char}\t{}", row.path);
+				crate::stdout_line(&format!(
+					"{src_char}\t{type_char}\t{}",
+					row.path
+				))?;
 			}
 			if list.total > list.rows.len() {
 				eprintln!("showing {} of {}", list.rows.len(), list.total);
@@ -384,10 +370,10 @@ pub fn run(
 				.log_from_tips(&snap.tips(), 0, n, &read)
 				.map_err(|e| e.to_string())?;
 			for commit in commits {
-				println!(
+				crate::stdout_line(&format!(
 					"{}\t{}\t{}",
 					commit.sha, commit.author_date, commit.subject
-				);
+				))?;
 			}
 			if more {
 				eprintln!("(more commits)");
@@ -419,7 +405,14 @@ pub fn run(
 				.map_err(|e| e.to_string())?;
 			for (path, change_type) in &list.paths {
 				let type_char = change_char(*change_type);
-				println!("{type_char}\t{path}");
+				crate::stdout_line(&format!("{type_char}\t{path}"))?;
+			}
+			if list.total > list.paths.len() {
+				eprintln!(
+					"showing {} of {} paths",
+					list.paths.len(),
+					list.total
+				);
 			}
 			Ok(())
 		}
@@ -496,7 +489,7 @@ pub fn run(
 			if out.copied == 0 {
 				return Err("nothing could be copied".into());
 			}
-			emit(&out.payload, stdout)?;
+			crate::emit(&out.payload, stdout)?;
 			eprintln!(
 				"copied {} files, {} chars{}{}",
 				out.copied,
@@ -526,7 +519,7 @@ pub fn run(
 			let out = c
 				.export_commits(&ws.id, &repo, &shas[0], shas.clone(), None)
 				.map_err(|e| e.to_string())?;
-			emit(&out.text, stdout)?;
+			crate::emit(&out.text, stdout)?;
 			eprintln!(
 				"copied {} commits, {} files, {} chars",
 				out.commit_count, out.file_count, out.chars
@@ -591,9 +584,9 @@ pub fn run(
 				.preview(&source, path, None, &read)
 				.map_err(|e| e.to_string())?;
 			if !prev.patch.is_empty() {
-				print!("{}", prev.patch);
+				crate::stdout_write(&prev.patch)?;
 			} else if let Some(content) = &prev.content {
-				print!("{content}");
+				crate::stdout_write(content)?;
 			}
 			if prev.patch_truncated {
 				eprintln!("(patch truncated)");

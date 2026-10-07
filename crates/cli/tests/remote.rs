@@ -2,7 +2,7 @@
 //! master starts the worker through `SNIP_REMOTE_EXEC` (the built `snip
 //! serve --stdio`) instead of ssh, so any host name reaches it.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -986,4 +986,60 @@ fn cli_remote_paste_refuses_a_worker_without_paste() {
 	assert_eq!(r.0, Some(1), "{}", r.2);
 	assert!(r.2.contains("too old"), "{}", r.2);
 	assert!(!tmp.path().join("a.txt").exists());
+}
+
+/// `show` caps its changed-path listing (5000 rows); a commit touching
+/// more paths must say so on stderr — "showing 5000 of 5001 paths" —
+/// instead of silently dropping the tail.
+#[test]
+fn cli_master_show_reports_a_truncated_path_listing() {
+	if !require_git() {
+		return;
+	}
+	let tmp = tempfile::tempdir().unwrap();
+	let ws_dir = tmp.path().join("big_commit");
+	std::fs::create_dir_all(&ws_dir).unwrap();
+	git(&ws_dir, &["init"]);
+
+	// One shared blob, 5001 index entries, one commit: cheap to build,
+	// and its change list is one path over the `show` cap.
+	std::fs::write(ws_dir.join("seed"), "x\n").unwrap();
+	let blob = git_out(&ws_dir, &["hash-object", "-w", "seed"])
+		.trim()
+		.to_string();
+	let cap = 5000usize;
+	let total = cap + 1;
+	// Through stdin: 5001 `--cacheinfo` arguments overflow Windows'
+	// command line.
+	let infos: String = (0..total)
+		.map(|i| format!("100644 {blob}\tp{i:04}\n"))
+		.collect();
+	let mut child = Command::new("git")
+		.args(["update-index", "--add", "--index-info"])
+		.current_dir(&ws_dir)
+		.stdin(Stdio::piped())
+		.spawn()
+		.unwrap();
+	child
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(infos.as_bytes())
+		.unwrap();
+	assert!(
+		child.wait().unwrap().success(),
+		"git update-index --index-info"
+	);
+	let tree = git_out(&ws_dir, &["write-tree"]);
+	let commit = git_out(&ws_dir, &["commit-tree", tree.trim(), "-m", "big"]);
+
+	let m = Master::new(tmp.path());
+	let (status, stdout, stderr) =
+		m.snip(&["show", "anyhost", s(&ws_dir), commit.trim()]);
+	assert_eq!(status, Some(0), "{stderr}");
+	assert_eq!(stdout.lines().count(), cap, "the cap bounds the rows");
+	assert!(
+		stderr.contains(&format!("showing {cap} of {total} paths")),
+		"the truncation must be announced on stderr: {stderr:?}"
+	);
 }
