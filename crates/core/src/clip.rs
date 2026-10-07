@@ -105,11 +105,51 @@ mod tests {
 		true
 	}
 
+	struct TestClipboardLock(std::fs::File);
+
+	impl Drop for TestClipboardLock {
+		fn drop(&mut self) {
+			let _ = self.0.unlock();
+		}
+	}
+
+	fn lock_test_clipboard() -> TestClipboardLock {
+		let path = std::env::temp_dir().join("snip-test-os-clipboard.lock");
+		let file = std::fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(false)
+			.open(&path)
+			.expect("open clipboard lock file");
+		// Bounded: a test stuck holding the OS clipboard fails the waiter
+		// with a message instead of hanging the run.
+		let deadline =
+			std::time::Instant::now() + std::time::Duration::from_secs(300);
+		loop {
+			match file.try_lock() {
+				Ok(()) => break,
+				Err(std::fs::TryLockError::WouldBlock)
+					if std::time::Instant::now() < deadline =>
+				{
+					std::thread::sleep(std::time::Duration::from_millis(50))
+				}
+				Err(e) => panic!(
+					"clipboard lock {}: {e:?} (another test held the OS \
+					 clipboard for 300 s)",
+					path.display()
+				),
+			}
+		}
+		TestClipboardLock(file)
+	}
+
 	#[test]
 	fn clip_round_trip() {
 		if !has_display() {
 			return;
 		}
+		let _lock = lock_test_clipboard();
 		let text = "snip clip test\n中文\r\nend";
 		write_text(text).unwrap();
 		assert_eq!(read_text().unwrap(), text);
