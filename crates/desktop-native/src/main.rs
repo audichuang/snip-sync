@@ -282,6 +282,7 @@ actions!(
 		LogOpen,
 		LogSearchFocus,
 		LogHead,
+		LogCopy,
 		// IntelliJ chrome (IJ-2c).
 		NextDiff,
 		PrevDiff,
@@ -5374,6 +5375,8 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
 		KeyBinding::new("escape", MenuCancel, Some("ContextMenu")),
 		// Git log.
+		KeyBinding::new("ctrl-c", LogCopy, Some("GitLog")),
+		KeyBinding::new("cmd-c", LogCopy, Some("GitLog")),
 		KeyBinding::new("up", LogUp, Some("GitLog")),
 		KeyBinding::new("down", LogDown, Some("GitLog")),
 		KeyBinding::new("shift-up", LogExtendUp, Some("GitLog")),
@@ -12535,6 +12538,112 @@ mod tests {
 			assert_eq!(
 				model.read_with(cx, |m, _| m.log_empty_state()),
 				Some(LogEmpty::Empty)
+			);
+		}
+
+		#[gpui::test]
+		fn git_log_cmd_c_copies_selected_commit(cx: &mut TestAppContext) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			fs::write(r.join("dirty.txt"), "dirty content\n").unwrap();
+
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty()
+						&& !m.files.is_empty()
+						&& m.display_commits().len() >= 2
+				});
+				if ready {
+					break;
+				}
+			}
+
+			// Control group: when focus is outside Git Log (default focus on workbench / left tool window),
+			// pressing Cmd+C triggers CopySelection, copying the tool window's node (dirty.txt),
+			// not a commit payload.
+			clip::write_text("before").unwrap();
+			cx.simulate_keystrokes("cmd-c");
+			for _ in 0..100 {
+				settle(cx);
+				if model.read_with(cx, |m, _| !m.is_copying) {
+					break;
+				}
+			}
+			let text_ctrl = clip::read_text().unwrap();
+			assert!(
+				!text_ctrl.starts_with("// snip-sync commits v1"),
+				"control group should not copy commits: {text_ctrl}"
+			);
+			assert!(
+				text_ctrl.contains("dirty.txt"),
+				"control group should copy tool window node: {text_ctrl}"
+			);
+
+			// User action: click the commit row via debug_bounds to focus Git Log and select the commit.
+			let target_sha =
+				model.read_with(cx, |m, _| m.display_commits()[0].sha.clone());
+			let row_bounds = cx
+				.debug_bounds("log-subject:0")
+				.expect("commit row at index 0 drawn");
+			cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+			settle(cx);
+
+			// Verify focus entered Git Log and target commit is selected.
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.selected_commit.as_deref(),
+					Some(target_sha.as_str())
+				);
+			});
+
+			// Now press Cmd+C while Git Log has focus.
+			clip::write_text("before_commit_copy").unwrap();
+			cx.simulate_keystrokes("cmd-c");
+			for _ in 0..100 {
+				settle(cx);
+				if model.read_with(cx, |m, _| !m.is_copying) {
+					break;
+				}
+			}
+
+			let text = clip::read_text().unwrap();
+			assert!(
+				text.starts_with("// snip-sync commits v1"),
+				"expected commit payload starting with '// snip-sync commits v1', got: {text}"
+			);
+			assert!(
+				text.contains("commit c1"),
+				"expected payload to contain clicked commit 'commit c1', got: {text}"
+			);
+			assert!(
+				!text.contains("base.txt"),
+				"expected payload to be only the selected commit, got: {text}"
+			);
+
+			// Verify that when a TextInput in the Log toolbar (e.g. log_search_input) has focus,
+			// Cmd+C copies the selected text, not commits.
+			cx.update(|window, app| {
+				model.update(app, |m, cx| {
+					m.log_search_input.update(cx, |i, cx| {
+						i.set_text("find_something", cx);
+					});
+					window.focus(&m.log_search_input.read(cx).handle());
+				});
+			});
+			settle(cx);
+			cx.simulate_keystrokes("cmd-a");
+			settle(cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle(cx);
+			assert_eq!(
+				cx.read_from_clipboard().and_then(|i| i.text()),
+				Some("find_something".to_string())
 			);
 		}
 	}

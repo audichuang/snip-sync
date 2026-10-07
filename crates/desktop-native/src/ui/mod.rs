@@ -34,8 +34,8 @@ use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
 	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
 	FindNext, FindPrev, FocusNext, FocusPrev, GotoLine, HistoryNextPage,
-	HistoryPrevPage, LogDown, LogExtendDown, LogExtendUp, LogHead, LogOpen,
-	LogSearchFocus, LogUp, NavDown, NavToggle, NavUp, OpenRefSelector,
+	HistoryPrevPage, LogCopy, LogDown, LogExtendDown, LogExtendUp, LogHead,
+	LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle, NavUp, OpenRefSelector,
 	OpenRepoSelector, OpenWorkspace, PastePreview, Popover, Quit, ReaderClear,
 	ReaderCopy, ReaderDown, ReaderPageDown, ReaderPageUp, ReaderSelectAll,
 	ReaderUp, Refresh, RepoEntryKind, SelectRepo1, SelectRepo2, ShowChanges,
