@@ -221,7 +221,7 @@ pub fn run(
 			let c = client(&host);
 			let ws = find_workspace(&c, &workspace)?;
 			let (entries, truncated) =
-				c.list_dir(&ws.id, &path).map_err(|e| e.to_string())?;
+				c.list_dir(&ws.id, &path, None).map_err(|e| e.to_string())?;
 			for e in &entries {
 				crate::stdout_line(&format!(
 					"{}{}",
@@ -241,7 +241,7 @@ pub fn run(
 		} => {
 			let c = client(&host);
 			let ws = find_workspace(&c, &workspace)?;
-			let st = c.stat(&ws.id, &path).map_err(|e| e.to_string())?;
+			let st = c.stat(&ws.id, &path, None).map_err(|e| e.to_string())?;
 			let kind = match st.kind {
 				EntryKind::File => "file",
 				EntryKind::Directory => "directory",
@@ -258,7 +258,7 @@ pub fn run(
 		} => {
 			let c = client(&host);
 			let ws = find_workspace(&c, &workspace)?;
-			match c.read(&ws.id, &path).map_err(|e| e.to_string())? {
+			match c.read(&ws.id, &path, None).map_err(|e| e.to_string())? {
 				Some(text) => crate::stdout_write(&text),
 				None => Err(format!("{path} is binary or not UTF-8")),
 			}

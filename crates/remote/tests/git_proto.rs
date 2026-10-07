@@ -111,7 +111,7 @@ fn an_old_worker_is_reported_too_old_before_any_git_request() {
 	}
 
 	assert_eq!(w.git_requests_seen(), 0);
-	assert!(client.list_dir(&ws, "").is_ok());
+	assert!(client.list_dir(&ws, "", None).is_ok());
 }
 
 #[test]

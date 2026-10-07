@@ -3028,6 +3028,7 @@ impl WorkbenchModel {
 										&ws,
 										&session_root,
 										io,
+										Some(&cancel_bg),
 									)
 								}
 								None => {
@@ -3783,7 +3784,11 @@ impl WorkbenchModel {
 							match remote::remote_rel(&session_root, &repo_root)
 							{
 								Some(prefix) => remote::read_preview(
-									&client, &ws, &prefix, &for_bg,
+									&client,
+									&ws,
+									&prefix,
+									&for_bg,
+									Some(&cancel),
 								),
 								None => {
 									Err("not under the workspace".to_string())

@@ -272,6 +272,44 @@ fn cli_master_says_snip_is_too_old_when_serve_is_unknown() {
 	assert!(stderr.contains("not installed"), "{stderr}");
 }
 
+/// A command that reads nothing, prints nothing and stays alive holds the
+/// hello until its timeout: the message must say the worker did not
+/// answer, not that it closed the connection.
+#[cfg(unix)]
+#[test]
+fn cli_master_says_a_silent_worker_did_not_answer_in_time() {
+	let tmp = tempfile::tempdir().unwrap();
+	let m = Master::with_exec(tmp.path(), "sleep 300".into());
+	let started = Instant::now();
+	let stderr = m.fails(&["ls", "anyhost", s(tmp.path())]);
+	assert!(stderr.contains("did not answer in time"), "{stderr}");
+	assert!(!stderr.contains("closed the connection"), "{stderr}");
+	assert!(
+		started.elapsed() < DEADLINE,
+		"the master gave up after {:?}",
+		started.elapsed()
+	);
+}
+
+/// A login shell that prints more than a banner before snip starts is
+/// named as such, not swallowed into a generic closed-connection message.
+#[cfg(unix)]
+#[test]
+fn cli_master_says_when_the_shell_prints_too_much_before_snip() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let script = tmp.path().join("banner.sh");
+	std::fs::write(&script, "#!/bin/sh\nyes 'login banner' | head -c 200000\n")
+		.unwrap();
+	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+		.unwrap();
+	let m = Master::with_exec(tmp.path(), s(&script).to_string());
+	let stderr = m.fails(&["ls", "anyhost", s(tmp.path())]);
+	assert!(stderr.contains("printed too much"), "{stderr}");
+	assert!(!stderr.contains("closed the connection"), "{stderr}");
+}
+
 /// What ssh's remote script does when no snip is on the far end.
 #[cfg(unix)]
 #[test]
