@@ -155,14 +155,8 @@ pub fn copy_selection_detailed(
 		let trunc_idx =
 			expanded.truncated_at.unwrap_or(expanded.sel.items.len());
 		let prefix_items = expanded.sel.items[..trunc_idx].to_vec();
-		let roots = sel.roots.iter().map(|r| r.path().to_path_buf()).collect();
-		let primary_root =
-			sel.primary_root.as_ref().map(|r| r.path().to_path_buf());
-		match ExportSelection::new(roots, primary_root, prefix_items) {
+		match sel.with_items(prefix_items) {
 			Ok(prefix_sel) => {
-				let prefix_sel = prefix_sel
-					.with_source_root(sel.source_root.clone())
-					.with_spelled_root(sel.spelled_root.clone());
 				match super::plan_export_with(
 					&prefix_sel,
 					settings,
@@ -264,7 +258,7 @@ pub fn expand_folder_items_in_input_order(
 }
 
 fn expand_folder_items_inner(
-	sel: ExportSelection,
+	mut sel: ExportSelection,
 	limit: usize,
 	cancel: &CancelToken,
 	input_order_dedupe: bool,
@@ -325,7 +319,7 @@ fn expand_folder_items_inner(
 			.collect()
 	};
 	let mut items = Vec::with_capacity(sel.items.len());
-	for item in sel.items {
+	for item in std::mem::take(&mut sel.items) {
 		if !is_folder(&item) {
 			if is_refused_dir(&item) {
 				skipped += 1;
@@ -386,15 +380,10 @@ fn expand_folder_items_inner(
 			});
 		}
 	}
-	let source_root = sel.source_root.clone();
-	let spelled_root = sel.spelled_root.clone();
-	let sel = ExportSelection::new(
-		sel.roots.iter().map(|r| r.path().to_path_buf()).collect(),
-		sel.primary_root.map(|r| r.path().to_path_buf()),
-		items,
-	)?
-	.with_source_root(source_root)
-	.with_spelled_root(spelled_root);
+	// The rebuild carries the optional fields over (`with_items`): a commit
+	// copy from a subfolder keeps its `filter_root`, so relative exclude
+	// rules keep matching folder-relative paths.
+	let sel = sel.with_items(items)?;
 	Ok(FolderExpansion {
 		sel,
 		skipped,
@@ -452,14 +441,8 @@ pub fn plan_export_expanding(
 		let trunc_idx =
 			expanded.truncated_at.unwrap_or(expanded.sel.items.len());
 		let prefix_items = expanded.sel.items[..trunc_idx].to_vec();
-		let roots = sel.roots.iter().map(|r| r.path().to_path_buf()).collect();
-		let primary_root =
-			sel.primary_root.as_ref().map(|r| r.path().to_path_buf());
-		match ExportSelection::new(roots, primary_root, prefix_items) {
+		match sel.with_items(prefix_items) {
 			Ok(prefix_sel) => {
-				let prefix_sel = prefix_sel
-					.with_source_root(sel.source_root.clone())
-					.with_spelled_root(sel.spelled_root.clone());
 				match super::plan_export_with(
 					&prefix_sel,
 					settings,
@@ -955,6 +938,97 @@ mod tests {
 		assert_eq!(out.copied, 1, "the eligible file is copied");
 		assert!(out.payload.contains("zz.txt"), "{}", out.payload);
 		assert!(!out.payload.contains("skip_"), "{}", out.payload);
+	}
+
+	#[test]
+	fn copy_selection_keeps_filter_root_for_commit_items_in_a_subfolder() {
+		use crate::format::ChangeType;
+		use crate::settings::{FilterAction, FilterRule, FilterType};
+		use std::fs;
+		use std::process::Command;
+
+		// The remote worker's subfolder copy (copyserve): the commit is
+		// copied from the repo root with `filter_root` set to the folder
+		// the user opened, so a relative exclude rule matches
+		// folder-relative paths (`src/…`), not repo-relative ones
+		// (`pkg/src/…`). The folder-expansion rebuild must keep that root.
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dir.path().join("repo");
+		fs::create_dir_all(repo.join("pkg/src")).unwrap();
+		std::fs::write(repo.join("pkg/src/secret.rs"), "hush\n").unwrap();
+		std::fs::write(repo.join("pkg/keep.txt"), "keep\n").unwrap();
+		let cfg = dir.path().join("cfg");
+		fs::write(&cfg, "").unwrap();
+		let run = |args: &[&str]| {
+			let out = Command::new("git")
+				.args(args)
+				.current_dir(&repo)
+				.env("GIT_CONFIG_GLOBAL", &cfg)
+				.env("GIT_CONFIG_NOSYSTEM", "1")
+				.output()
+				.unwrap();
+			assert!(
+				out.status.success(),
+				"git {args:?}: {}",
+				String::from_utf8_lossy(&out.stderr)
+			);
+			String::from_utf8(out.stdout).unwrap().trim().to_string()
+		};
+		run(&["init", "-q", "-b", "main"]);
+		run(&["config", "user.name", "T"]);
+		run(&["config", "user.email", "t@example.com"]);
+		run(&["add", "-A"]);
+		run(&["commit", "-q", "-m", "c"]);
+		let sha = run(&["rev-parse", "HEAD"]);
+
+		let root = CanonicalRootId::new(&repo).unwrap();
+		let item = |rel: &str| ExportItem {
+			root: root.clone(),
+			relative_path: rel.to_string(),
+			source: SourceKind::Commit { rev: sha.clone() },
+			change_type: Some(ChangeType::New),
+			gitlink: false,
+		};
+		let sel = ExportSelection::new(
+			vec![repo.clone()],
+			Some(repo.clone()),
+			vec![item("pkg/src/secret.rs"), item("pkg/keep.txt")],
+		)
+		.unwrap()
+		.with_filter_root(Some(repo.join("pkg")));
+
+		let settings = Settings {
+			use_filters: true,
+			filter_rules: vec![FilterRule {
+				kind: FilterType::Path,
+				action: FilterAction::Exclude,
+				value: "src".to_string(),
+				enabled: true,
+			}],
+			..Settings::default()
+		};
+
+		let plan = crate::transfer::plan_export_with(
+			&sel,
+			&settings,
+			None,
+			&RunOptions::default(),
+		)
+		.unwrap();
+		let planned: Vec<&str> =
+			plan.files.iter().map(|f| f.path.as_str()).collect();
+		assert_eq!(
+			planned,
+			["pkg/keep.txt"],
+			"the plan excludes pkg/src/secret.rs by the folder-relative rule"
+		);
+
+		let out =
+			copy_selection(sel, &settings, 64, &RunOptions::default(), |_| {})
+				.unwrap();
+		assert!(!out.payload.contains("secret.rs"), "{}", out.payload);
+		assert!(out.payload.contains("keep.txt"), "{}", out.payload);
+		assert_eq!(out.copied, 1);
 	}
 
 	#[test]
