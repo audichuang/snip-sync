@@ -222,6 +222,11 @@ pub struct MasterState {
 	pub recent: Vec<RecentRemote>,
 	pub session: Option<RemoteSession>,
 	pub busy: bool,
+	/// Bumped when the workspace the user is looking at changes under an
+	/// in-flight open: a local open, a close or a newer remote open. A
+	/// result landing with an older seq is dropped, workspace and status
+	/// bar untouched.
+	pub open_seq: u64,
 	pub message: Option<(bool, String)>,
 	/// The host whose folders are listed, and the folder shown.
 	pub browse: Option<Browse>,
@@ -698,9 +703,20 @@ impl WorkbenchModel {
 		}
 		self.remote.busy = true;
 		self.remote.message = None;
+		// Any open that follows (local or remote) invalidates this one.
+		self.remote.open_seq = self.remote.open_seq.wrapping_add(1);
+		let open_seq = self.remote.open_seq;
+		#[cfg(test)]
+		let open_delay = self.e2e_remote_open_delay;
 		cx.notify();
 		let bg = cx.background_executor().clone();
 		cx.spawn(async move |this, cx| {
+			// Tests hold the open at the test clock so a user action can
+			// land while it is in flight.
+			#[cfg(test)]
+			if let Some(delay) = open_delay {
+				cx.background_executor().timer(delay).await;
+			}
 			let probe = host.clone();
 			let result = bg
 				.spawn(async move {
@@ -711,6 +727,16 @@ impl WorkbenchModel {
 				.await;
 			let _ = this.update(cx, |this, cx| {
 				this.remote.busy = false;
+				if this.remote.open_seq != open_seq {
+					// The user opened a local workspace, closed the
+					// workspace or started another remote open meanwhile:
+					// neither the workspace nor the status bar moves.
+					app_log!(
+						"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
+						this.remote.open_seq
+					);
+					return;
+				}
 				match result {
 					Ok(ws) => {
 						this.workspace_menu = false;
