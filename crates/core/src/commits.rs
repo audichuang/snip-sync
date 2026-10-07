@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::blob::{BlobRead, BlobReader, NotText};
 use crate::fsutil::{must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, RunOptions};
-use crate::gitsrc::{Git, GitError, RawZ, EMPTY_TREE};
+use crate::gitsrc::{Git, GitError, RawZ};
 use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
 
 /// Replay replaces a symlink at the target instead of writing through it,
@@ -554,7 +554,8 @@ fn parent_or_empty(
 		None if git.is_shallow_with(opts)? => {
 			Err(GitError::Shallow(sha.to_string()).into())
 		}
-		None => Ok(EMPTY_TREE.to_string()),
+		// The object format decides which empty tree OID is valid here.
+		None => Ok(git.empty_tree_with(opts)?),
 	}
 }
 
@@ -1902,8 +1903,6 @@ fn replay_commit(
 			conflict_path: Some(plan.files[i].path.clone()),
 		});
 	}
-	// Paths whose change is on disk now; they alone go into the commit.
-	let mut paths: Vec<&str> = Vec::new();
 	// Deleted paths: staged only if HEAD tracks them. A path that is only in
 	// the index (a staged new file) has nothing to commit, and `commit
 	// --only` would reject it once `add` dropped it from the index.
@@ -1942,6 +1941,9 @@ fn replay_commit(
 			deleted.push(rel);
 		}
 	}
+	let err = |e: GitError| e.to_string();
+
+	let mut paths: Vec<&str> = Vec::new();
 	for (f, src) in plan.files.iter().zip(&commit.files) {
 		let (ReplayAction::Write, Some(abs), Some(content)) =
 			(f.action, &f.absolute_path, &src.content)
@@ -1958,7 +1960,11 @@ fn replay_commit(
 		paths.push(&f.path);
 	}
 
-	let err = |e: GitError| e.to_string();
+	// Tracked deletions are staged with `rm --cached`, never `add -A`: a
+	// destination that already staged `git rm x` / `git mv x y` has the
+	// path neither in the worktree nor the index, and `add -A -- x`
+	// refuses the unmatched pathspec outright.
+	let mut deleted_committed: Vec<&str> = Vec::new();
 	if !deleted.is_empty() {
 		let mut args = vec![
 			"-c",
@@ -1979,12 +1985,26 @@ fn replay_commit(
 		};
 		let tracked: Vec<&[u8]> =
 			out.split(|&b| b == 0).filter(|p| !p.is_empty()).collect();
-		paths
+		deleted_committed
 			.extend(deleted.iter().filter(|p| tracked.contains(&p.as_bytes())));
 	}
-	paths.sort_unstable();
-	paths.dedup();
-
+	// Removals go before the add: a rename swap deletes and rewrites the
+	// same paths, and the add after must win.
+	if !deleted_committed.is_empty() {
+		let mut args = vec![
+			"-c",
+			no_hooks,
+			"--literal-pathspecs",
+			"rm",
+			"--cached",
+			"--force",
+			"--quiet",
+			"--ignore-unmatch",
+			"--",
+		];
+		args.extend(&deleted_committed);
+		git.run(&args).map_err(err)?;
+	}
 	if !paths.is_empty() {
 		// `-f`: the source tracked it, even if it is ignored here.
 		let mut args = vec![
@@ -1999,6 +2019,9 @@ fn replay_commit(
 		args.extend(&paths);
 		git.run(&args).map_err(err)?;
 	}
+	paths.extend(deleted_committed);
+	paths.sort_unstable();
+	paths.dedup();
 	// `--only` with no paths still commits HEAD's tree, never the index.
 	let mut args = vec![
 		"-c",
@@ -2087,6 +2110,7 @@ fn run_commit(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::gitsrc::SHA256_EMPTY_TREE;
 	use std::process::Command;
 	use std::time::Duration;
 
@@ -2108,6 +2132,28 @@ mod tests {
 			repo.git(&["config", "core.autocrlf", "false"]);
 			repo.git(&["config", "commit.gpgsign", "false"]);
 			repo
+		}
+
+		/// A SHA-256 repository, or `None` when this git is too old to
+		/// know the format (2.29 introduced it).
+		fn new_sha256(branch: &str) -> Option<Self> {
+			let dir = tempfile::tempdir().unwrap();
+			let cfg = dir.path().join("empty.gitconfig");
+			fs::write(&cfg, "").unwrap();
+			fs::create_dir(dir.path().join("r")).unwrap();
+			let repo = Self { dir, cfg };
+			let out = repo
+				.cmd(&["init", "-q", "-b", branch, "--object-format=sha256"])
+				.output()
+				.unwrap();
+			if !out.status.success() {
+				return None;
+			}
+			repo.git(&["config", "user.name", "Local"]);
+			repo.git(&["config", "user.email", "local@example.com"]);
+			repo.git(&["config", "core.autocrlf", "false"]);
+			repo.git(&["config", "commit.gpgsign", "false"]);
+			Some(repo)
 		}
 
 		fn path(&self) -> PathBuf {
@@ -2712,6 +2758,113 @@ mod tests {
 		let result = replay(&g, &payload);
 		assert_eq!(result.created.len(), 2);
 		assert!(!dst.path().join("a.txt").exists());
+	}
+
+	#[test]
+	fn replay_deletion_survives_a_destination_staged_removal() {
+		// The destination staged `git rm a.txt` before the replay: the path
+		// is in neither the worktree nor the index while HEAD still tracks
+		// it. The replay's commit must record the deletion instead of dying
+		// on an `add -A` pathspec that matches nothing.
+		let dst = Repo::new("main");
+		dst.write("a.txt", b"tracked\n");
+		dst.write("keep.txt", b"keep\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		dst.git(&["rm", "-q", "a.txt"]);
+		let payload = CommitsPayload {
+			commits: vec![batch_commit(
+				"delete",
+				vec![batch_file("a.txt", FileChange::Deleted)],
+			)],
+		};
+		let preview = crate::transfer::CommitReplayPreview::capture(
+			&dst.path(),
+			&payload,
+		)
+		.expect("a staged removal does not block the preview");
+		let result = preview.apply().expect("the replay runs");
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 1);
+		let head = dst.git(&["ls-tree", "--name-only", "HEAD", "--"]);
+		assert!(!head.contains("a.txt"), "HEAD no longer tracks a.txt");
+		assert!(head.contains("keep.txt"));
+		assert!(!dst.path().join("a.txt").exists());
+		assert_eq!(
+			dst.git(&["status", "--porcelain"]),
+			"",
+			"the staged removal is consumed by the replay commit"
+		);
+	}
+
+	#[test]
+	fn replay_deletion_survives_a_destination_staged_rename() {
+		// Same for a staged `git mv a.txt b.txt`: the replay records the
+		// deletion of `a.txt` and leaves the user's staged rename alone.
+		let dst = Repo::new("main");
+		dst.write("a.txt", b"tracked\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		dst.git(&["mv", "a.txt", "b.txt"]);
+		let payload = CommitsPayload {
+			commits: vec![batch_commit(
+				"delete",
+				vec![batch_file("a.txt", FileChange::Deleted)],
+			)],
+		};
+		let preview = crate::transfer::CommitReplayPreview::capture(
+			&dst.path(),
+			&payload,
+		)
+		.expect("a staged rename does not block the preview");
+		let result = preview.apply().expect("the replay runs");
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 1);
+		let head = dst.git(&["ls-tree", "--name-only", "HEAD", "--"]);
+		assert!(!head.contains("a.txt"), "HEAD no longer tracks a.txt");
+		assert!(
+			!head.contains("b.txt"),
+			"the rename stays staged, outside the replay commit"
+		);
+		assert_eq!(
+			dst.git(&["status", "--porcelain", "--", "b.txt"]),
+			"A  b.txt",
+			"the user's staged rename survives the replay"
+		);
+	}
+
+	/// A SHA-256 repository's root commit diffs against its own format's
+	/// empty tree: the SHA-1 constant is a bad object there, so the
+	/// export dies halfway.
+	#[test]
+	fn root_commit_exports_in_a_sha256_repository() {
+		let Some(dst) = Repo::new_sha256("main") else {
+			assert!(
+				std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+				"SNIP_REQUIRE_ALL_TESTS is set but git lacks \
+				 --object-format=sha256"
+			);
+			return;
+		};
+		dst.write("one.txt", b"one\n");
+		dst.commit("root", "2020-01-01T00:00:00+00:00");
+		let g = dst.open();
+		assert_eq!(
+			g.empty_tree_with(&RunOptions::default()).unwrap(),
+			SHA256_EMPTY_TREE
+		);
+		let export = crate::transfer::plan_commit_export_with(
+			&g,
+			None,
+			Some(1),
+			&RunOptions::default(),
+			usize::MAX,
+		)
+		.unwrap();
+		assert_eq!(export.payload.commits.len(), 1);
+		assert_eq!(export.payload.commits[0].files[0].path, "one.txt");
+		assert_eq!(
+			export.payload.commits[0].files[0].content.as_deref(),
+			Some("one\n")
+		);
 	}
 
 	#[test]
