@@ -124,6 +124,7 @@ jobs:
             RUSTFLAGS: "-D warnings"
             # A test that would skip for a missing prerequisite fails instead.
             SNIP_REQUIRE_ALL_TESTS: "1"
+            SNIP_E2E_TIMEOUT_SCALE: "2"
         steps:
             - uses: actions/checkout@v6
             - name: Normalize git config (cross-platform line endings)
@@ -173,6 +174,10 @@ jobs:
               uses: actions/setup-node@v4
               with:
                   node-version: 24
+            - name: Install cargo-nextest
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-nextest
             - name: Git runner smoke test (macOS fast gate)
               if: runner.os == 'macOS'
               timeout-minutes: 5
@@ -182,12 +187,14 @@ jobs:
             # drivers (snip-native-e2e) run in native-acceptance instead.
             - name: Workspace tests (Linux, under xvfb for the clipboard)
               if: runner.os == 'Linux'
-              run: xvfb-run -a cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+              run: xvfb-run -a cargo nextest run --workspace --exclude snip-native-e2e --locked --no-fail-fast
             - name: Workspace tests
               if: runner.os != 'Linux'
-              run: cargo test --workspace --exclude snip-native-e2e --locked --no-fail-fast
+              run: cargo nextest run --workspace --exclude snip-native-e2e --locked --no-fail-fast
+            - name: Doc tests
+              run: cargo test --doc --workspace --exclude snip-native-e2e --locked
             - name: Build native binary (debug)
-              run: cargo build -p snip-desktop-native --locked
+              run: cargo build --workspace --exclude snip-native-e2e --bins --locked
             - name: Native binary CLI smoke test
               shell: bash
               run: |

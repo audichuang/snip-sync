@@ -187,7 +187,7 @@ Tauri 版(本文件第 2、3 節的技術棧)已從 repo 移除,不再建置、�
   - 位元組往返與 TS 相容性 → `crates/cli/tests/e2e.rs`(第 2 層 CLI E2E 往返與第 3 層比對 `.ts-ref` 抽取之 TS 參考實作)。
 
 - **CI 採最嚴格設定(`.github/workflows/ci.yml`):** 每個 PR 與 push 都跑全部 job,沒有路徑過濾;
-  Rust 與 rustdoc 的警告視為錯誤,`--locked`;三平台 clippy 與 `cargo test`;`cargo audit` 有漏洞即失敗;
+  Rust 與 rustdoc 的警告視為錯誤,`--locked`;三平台 clippy 與 `cargo nextest`（加 doctest）;`cargo audit` 有漏洞即失敗;
   Python harness 測試;Linux 跑原生真實 App 的 smoke / lifecycle / acceptance;
   macOS / Windows 打包並 smoke 原生 binary;每個 job 結束時 checkout 必須乾淨。
   `CI gate` 彙整全部 job,任何一個不是 success(含 skipped)就失敗。
