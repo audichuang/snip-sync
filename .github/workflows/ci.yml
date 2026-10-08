@@ -217,6 +217,8 @@ jobs:
             - name: Doc tests
               if: matrix.last
               run: cargo test --doc --workspace --exclude snip-native-e2e --locked
+            # `-p`, not `--workspace` or `--all-targets`: the smoke test runs the
+            # shipped feature set, without gpui's test-support.
             - name: Build native binary (debug)
               if: matrix.shard_index == 1
               run: cargo build -p snip-desktop-native --locked
