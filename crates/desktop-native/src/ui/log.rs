@@ -1031,7 +1031,18 @@ impl WorkbenchModel {
 		let mask = self
 			.log_filter_layout
 			.compute_split(available_w, has_values);
-		self.log_filter_layout.last_mask.set(mask);
+		let layout = &self.log_filter_layout;
+		if layout.last_mask.replace(mask) != mask {
+			let w: Vec<String> = ALL_LOG_FILTER_MENUS
+				.iter()
+				.map(|m| format!("{:.0}", layout.chip_width_cell(*m).get()))
+				.collect();
+			app_log!(
+				"[APP:LOG_CHIPS: avail={available_w:.0} widths={} more={:.0} shown={mask:04b}]",
+				w.join(","),
+				layout.more_w.get()
+			);
+		}
 		(0..4)
 			.map(|i| (ALL_LOG_FILTER_MENUS[i], mask & (1 << i) != 0))
 			.fold((Vec::new(), Vec::new()), |(mut on, mut off), (m, shown)| {
