@@ -174,7 +174,7 @@ ID 以受測 binary 印出的為準。下面是 `ed3d057`（develop）的名字�
 | log 顯示 | `btn-log-more` → `log-more:hash`（hash 欄，預設關）。日誌 `[APP:LOG_VIEW: hash]` |
 | 多 repo 篩選 | `log-filter-repo`、`log-repo:<名稱>`、`log-repo-check:<名稱>` |
 | 單一 repo 工作區的路徑篩選 | `log-filter-paths`。多 repo 工作區不要去點這個 ID |
-| log 篩選 chip | 分支 `log-filter-branch`、使用者 `log-filter-user`、日期 `log-filter-date`。窄視窗（如 900×600）寬度不足時，容納不下的 chip 會收合至溢位 chip `log-filter-more`，點擊後於選單展開隱藏項 `log-filter-more:<key>`（如 `log-filter-more:user`、`log-filter-more:date`）開啟對應篩選選單 |
+| log 篩選 chip | 分支 `log-filter-branch`、使用者 `log-filter-user`、日期 `log-filter-date`。窄視窗（如 900×600）寬度不足時，容納不下的 chip 會收合至溢位 chip `log-filter-more`，點擊後於選單展開隱藏項 `log-filter-more:<key>`（如 `log-filter-more:user`、`log-filter-more:date`）開啟對應篩選選單。未啟用的 chip 先收合，已啟用的盡量留在列上；已啟用而被收合的篩選，在溢位選單裡有清除項，ID 與 chip 上的清除鈕相同（`log-filter-<key>-clear`） |
 | 歷史檔案 | `btn-browse-tree:<完整 SHA>`、`rev-row:<path>`、`btn-leave-tree`。檔案列右鍵「複製」複製該檔在這個 commit 的內容；資料夾列的「複製」是停用的 |
 | Git log 變更檔案 | `commit-file:<path>`、`commit-dir:<path>`。資料夾列的選取 key 是 `<path>/`。左鍵資料夾是展開或收合；複製用右鍵 |
 | 貼上 | `btn-apply`、`btn-cancel`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`（`ix` 是計畫內的項目索引，由 `crate::paste::control_id` 產生）、`paste-items` |

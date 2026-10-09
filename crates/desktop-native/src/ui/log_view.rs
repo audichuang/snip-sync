@@ -173,7 +173,7 @@ impl WorkbenchModel {
 					.flex_1()
 					.min_w_0()
 					.overflow_hidden();
-				for &menu in visible_menus {
+				for menu in visible_menus {
 					let (label, value) = self.log_menu_value(menu, loc);
 					chips = chips.child(self.log_chip(menu, &label, value, cx));
 				}
@@ -187,11 +187,9 @@ impl WorkbenchModel {
 						move |b, window, _| {
 							let new_w = f32::from(b.size.width);
 							layout.container_w.set(new_w);
-							let new_k =
-								layout.compute_split_count(new_w, has_values);
-							let last_k =
-								layout.last_visible_count.get() as usize;
-							if new_k != last_k {
+							let new_mask =
+								layout.compute_split(new_w, has_values);
+							if new_mask != layout.last_mask.get() {
 								let ref_count = layout.refresh_count.get();
 								if ref_count < 3 {
 									layout.refresh_count.set(ref_count + 1);

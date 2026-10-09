@@ -37,7 +37,7 @@ pub struct LogFilterLayout {
 	pub user_w: std::rc::Rc<std::cell::Cell<f32>>,
 	pub date_w: std::rc::Rc<std::cell::Cell<f32>>,
 	pub more_w: std::rc::Rc<std::cell::Cell<f32>>,
-	pub last_visible_count: std::rc::Rc<std::cell::Cell<u8>>,
+	pub last_mask: std::rc::Rc<std::cell::Cell<u8>>,
 	pub refresh_count: std::rc::Rc<std::cell::Cell<u8>>,
 }
 
@@ -82,41 +82,43 @@ impl LogFilterLayout {
 		}
 	}
 
-	pub fn compute_split_count(
-		&self,
-		available_w: f32,
-		has_values: [bool; 4],
-	) -> usize {
+	/// Which chips stay on the bar, as a bit mask over
+	/// `ALL_LOG_FILTER_MENUS`. Inactive chips give way first, from the
+	/// end: an active chip keeps its clear button in sight as long as it
+	/// fits. The rest go to the overflow chip.
+	pub fn compute_split(&self, available_w: f32, has_values: [bool; 4]) -> u8 {
 		if available_w <= 0.0 {
 			return 0;
 		}
-		let w = [
-			self.chip_effective_w(ALL_LOG_FILTER_MENUS[0], has_values[0]),
-			self.chip_effective_w(ALL_LOG_FILTER_MENUS[1], has_values[1]),
-			self.chip_effective_w(ALL_LOG_FILTER_MENUS[2], has_values[2]),
-			self.chip_effective_w(ALL_LOG_FILTER_MENUS[3], has_values[3]),
-		];
-		let more_w = self.more_effective_w();
-
-		// Case 1: All 4 chips fit without overflow chip.
-		let total_all_4 = w[0]
-			+ LOG_FILTER_GAP
-			+ w[1] + LOG_FILTER_GAP
-			+ w[2] + LOG_FILTER_GAP
-			+ w[3];
-		if available_w >= total_all_4 {
-			return 4;
-		}
-
-		// Case 2: At least 1 chip is hidden, so overflow chip is shown.
-		for k in (1..=3).rev() {
-			let sum_chips: f32 = w[..k].iter().sum();
-			let needed = sum_chips + (k as f32) * LOG_FILTER_GAP + more_w;
-			if available_w >= needed {
-				return k;
+		let w: [f32; 4] = std::array::from_fn(|i| {
+			self.chip_effective_w(ALL_LOG_FILTER_MENUS[i], has_values[i])
+		});
+		let needed = |mask: u8| {
+			let shown: Vec<usize> =
+				(0..4).filter(|i| mask & (1 << i) != 0).collect();
+			let mut sum: f32 = shown.iter().map(|&i| w[i]).sum();
+			let items = shown.len() + usize::from(mask != 0b1111);
+			sum += items.saturating_sub(1) as f32 * LOG_FILTER_GAP;
+			if mask != 0b1111 {
+				sum += self.more_effective_w();
+				// The overflow chip's dot and border mark a hidden value.
+				if (0..4).any(|i| mask & (1 << i) == 0 && has_values[i]) {
+					sum += 9.;
+				}
 			}
+			sum
+		};
+		let mut mask = 0b1111u8;
+		let order = (0..4usize)
+			.rev()
+			.filter(|&i| !has_values[i])
+			.chain((0..4usize).rev().filter(|&i| has_values[i]));
+		for i in order {
+			if needed(mask) <= available_w {
+				return mask;
+			}
+			mask &= !(1 << i);
 		}
-
 		0
 	}
 }
@@ -809,7 +811,7 @@ impl WorkbenchModel {
 	/// Overflow chip collecting filters that do not fit in a narrow window.
 	pub(super) fn log_chip_more(
 		&self,
-		hidden_menus: &'static [LogMenu],
+		hidden_menus: Vec<LogMenu>,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let loc = self.locale;
@@ -825,6 +827,7 @@ impl WorkbenchModel {
 			_ => None,
 		};
 		let open = open_menu.is_some();
+		let hidden = hidden_menus.clone();
 		div()
 			.id(SharedString::from(id.clone()))
 			.debug_selector(move || selector)
@@ -844,7 +847,7 @@ impl WorkbenchModel {
 			.on_click(cx.listener(move |this, _, _, cx| {
 				if this.log_menu == Some(LogMenu::FilterMore)
 					|| (this.log_menu.is_some()
-						&& hidden_menus.contains(&this.log_menu.unwrap()))
+						&& hidden.contains(&this.log_menu.unwrap()))
 				{
 					this.close_log_menu(cx);
 				} else {
@@ -873,10 +876,8 @@ impl WorkbenchModel {
 	pub(super) fn measure_log_chips(&self, window: &Window) {
 		let loc = self.locale;
 		let layout = &self.log_filter_layout;
-		let mut any_value = false;
 		for menu in ALL_LOG_FILTER_MENUS {
 			let (label, value) = self.log_menu_value(menu, loc);
-			any_value |= value.is_some();
 			let text = match &value {
 				Some(v) => format!("{label}: {v}"),
 				None => label,
@@ -885,10 +886,10 @@ impl WorkbenchModel {
 			let w = 12. + text_width(window, &text, UI_TEXT).min(180.) + 16.;
 			layout.chip_width_cell(menu).set(w);
 		}
-		// Padding 4+4, gap 2, 10px icon; an active dot and border add 9.
-		let more = 8.
-			+ text_width(window, t("log_chip_more", loc), UI_TEXT)
-			+ 13. + if any_value { 9. } else { 0. };
+		// Padding 4+4, gap 2, 10px icon, 1px slack. Without the active dot:
+		// `compute_split_count` adds it when a hidden chip has a value.
+		let more =
+			8. + text_width(window, t("log_chip_more", loc), UI_TEXT) + 13.;
 		layout.more_w.set(more);
 	}
 
@@ -1022,23 +1023,25 @@ impl WorkbenchModel {
 		]
 	}
 
-	/// Splits filter chips into visible and overflow lists based on measured sizes.
-	pub(crate) fn log_filter_split(
-		&self,
-	) -> (&'static [LogMenu], &'static [LogMenu]) {
+	/// Splits filter chips into those on the bar and those in the overflow
+	/// chip, in their usual order.
+	pub(crate) fn log_filter_split(&self) -> (Vec<LogMenu>, Vec<LogMenu>) {
 		let available_w = self.log_chips_available_width();
 		let has_values = self.log_filter_split_has_values(self.locale);
-		let k = self
+		let mask = self
 			.log_filter_layout
-			.compute_split_count(available_w, has_values);
-		self.log_filter_layout.last_visible_count.set(k as u8);
-		match k {
-			4 => (&ALL_LOG_FILTER_MENUS[..4], &[]),
-			3 => (&ALL_LOG_FILTER_MENUS[..3], &ALL_LOG_FILTER_MENUS[3..]),
-			2 => (&ALL_LOG_FILTER_MENUS[..2], &ALL_LOG_FILTER_MENUS[2..]),
-			1 => (&ALL_LOG_FILTER_MENUS[..1], &ALL_LOG_FILTER_MENUS[1..]),
-			_ => (&[], &ALL_LOG_FILTER_MENUS[..]),
-		}
+			.compute_split(available_w, has_values);
+		self.log_filter_layout.last_mask.set(mask);
+		(0..4)
+			.map(|i| (ALL_LOG_FILTER_MENUS[i], mask & (1 << i) != 0))
+			.fold((Vec::new(), Vec::new()), |(mut on, mut off), (m, shown)| {
+				if shown {
+					on.push(m)
+				} else {
+					off.push(m)
+				}
+				(on, off)
+			})
 	}
 
 	pub(super) fn clear_log_chip(
@@ -1537,7 +1540,7 @@ impl WorkbenchModel {
 			}
 			LogMenu::FilterMore => {
 				let (_, hidden) = self.log_filter_split();
-				for &m in hidden {
+				for m in hidden {
 					let key = match m {
 						LogMenu::Repo if self.repos.len() <= 1 => "paths",
 						_ => m.key(),
@@ -1545,6 +1548,7 @@ impl WorkbenchModel {
 					let id = format!("log-filter-more:{key}");
 					let (label, val) = self.log_menu_value(m, loc);
 					let is_active = val.is_some();
+					let display_label = label.clone();
 					let display = match val {
 						Some(v) => format!("{label}: {v}"),
 						None => label,
@@ -1558,6 +1562,23 @@ impl WorkbenchModel {
 						}),
 						cx,
 					));
+					// Same id as the chip's own clear button: a filter that
+					// went to the overflow can still be cleared.
+					if is_active {
+						items.push(item(
+							format!("log-filter-{key}-clear"),
+							format!(
+								"{} · {}",
+								t("log_clear_filter", loc),
+								display_label
+							),
+							false,
+							Box::new(move |this, cx| {
+								this.clear_log_chip(m, cx)
+							}),
+							cx,
+						));
+					}
 				}
 			}
 		}
@@ -2172,5 +2193,46 @@ mod row_width_tests {
 		let c = cols(100., WIDE_GUTTER, true, true);
 		let w = row_widths(100., c, 337., true);
 		assert!(w.subject >= 0. && w.labels == 0.);
+	}
+}
+
+#[cfg(test)]
+mod filter_split_tests {
+	use super::*;
+
+	fn layout(widths: [f32; 4], more: f32) -> LogFilterLayout {
+		let l = LogFilterLayout::default();
+		for (m, w) in ALL_LOG_FILTER_MENUS.iter().zip(widths) {
+			l.chip_width_cell(*m).set(w);
+		}
+		l.more_w.set(more);
+		l
+	}
+
+	/// All chips stay when they fit; inactive chips give way before an
+	/// active one, from the end; the overflow chip's dot counts only for
+	/// a hidden value.
+	#[test]
+	fn inactive_chips_give_way_first() {
+		let l = layout([100., 50., 110., 55.], 46.);
+		let all = 100. + 50. + 110. + 55. + 3. * LOG_FILTER_GAP;
+		assert_eq!(l.compute_split(all, [true, false, true, false]), 0b1111);
+		// Repo and User are active: Date, then Branch go first.
+		let two = 100. + 110. + 46. + 2. * LOG_FILTER_GAP;
+		assert_eq!(l.compute_split(two, [true, false, true, false]), 0b0101);
+		assert_eq!(
+			l.compute_split(two + 30., [true, false, true, false]),
+			0b0101
+		);
+		let three = 100. + 50. + 110. + 46. + 3. * LOG_FILTER_GAP;
+		assert_eq!(l.compute_split(three, [true, false, true, false]), 0b0111);
+		// Too narrow for both active chips: the later one hides, and the
+		// overflow chip needs room for its dot.
+		let one = 100. + 46. + 9. + LOG_FILTER_GAP;
+		assert_eq!(l.compute_split(one, [true, false, true, false]), 0b0001);
+		assert_eq!(l.compute_split(one - 1., [true, false, true, false]), 0);
+		// Nothing active: plain prefix order.
+		let prefix = 100. + 50. + 46. + 2. * LOG_FILTER_GAP;
+		assert_eq!(l.compute_split(prefix, [false; 4]), 0b0011);
 	}
 }
