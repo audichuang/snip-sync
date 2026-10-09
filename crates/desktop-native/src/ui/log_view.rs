@@ -184,16 +184,28 @@ impl WorkbenchModel {
 				let has_values = self.log_filter_split_has_values(loc);
 				chips = chips.child(
 					canvas(
-						move |b, window, _| {
+						move |b, window, cx| {
 							let new_w = f32::from(b.size.width);
-							layout.container_w.set(new_w);
+							// A new width is new input: allow fresh refreshes.
+							if (layout.container_w.replace(new_w) - new_w).abs()
+								> 0.5
+							{
+								layout.refresh_count.set(0);
+							}
 							let new_mask =
 								layout.compute_split(new_w, has_values);
 							if new_mask != layout.last_mask.get() {
 								let ref_count = layout.refresh_count.get();
 								if ref_count < 3 {
 									layout.refresh_count.set(ref_count + 1);
-									window.refresh();
+									// `refresh` is a no-op while drawing (this
+									// frame split by last frame's width):
+									// redraw once this frame is done.
+									let handle = window.window_handle();
+									cx.defer(move |cx| {
+										let _ = handle
+											.update(cx, |_, w, _| w.refresh());
+									});
 								}
 							} else {
 								layout.refresh_count.set(0);

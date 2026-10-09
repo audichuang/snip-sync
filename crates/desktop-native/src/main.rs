@@ -13450,6 +13450,46 @@ mod tests {
 			assert_eq!(hidden, 0, "no chip goes to the overflow at 1080");
 		}
 
+		/// One resize to 900×600 settles the chips by itself: the frame that
+		/// meets the new width schedules the next one, with no other input.
+		/// (A real round saw the old layout until the next click.)
+		#[gpui::test]
+		fn log_filter_chips_follow_a_resize_without_input(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-a", "repo-b"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+			}
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(752.)));
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.log_width.get() > 1000.) {
+					break;
+				}
+			}
+			let wide =
+				model.read_with(cx, |m, _| m.log_filter_layout.last_mask.get());
+			assert_eq!(wide, 0b1111, "all chips fit at 1080");
+
+			cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(632.)));
+			settle(cx);
+			let (drawn, wanted) = model.read_with(cx, |m, _| {
+				let layout = &m.log_filter_layout;
+				let has = m.log_filter_split_has_values(m.locale);
+				(
+					layout.last_mask.get(),
+					layout.compute_split(layout.container_w.get(), has),
+				)
+			});
+			assert_ne!(wanted, 0b1111, "700 wide must not fit every chip");
+			assert_eq!(drawn, wanted, "the drawn split follows the new width");
+		}
+
 		/// At a narrow window width with widened details pane and an active long user filter,
 		/// no filter chip intersects action buttons and user filter is reachable.
 		#[gpui::test]

@@ -39,6 +39,11 @@ pub struct LogFilterLayout {
 	pub more_w: std::rc::Rc<std::cell::Cell<f32>>,
 	pub last_mask: std::rc::Rc<std::cell::Cell<u8>>,
 	pub refresh_count: std::rc::Rc<std::cell::Cell<u8>>,
+	/// Each chip's last drawn text and its measured width. A chip whose
+	/// text is unchanged keeps that width while hidden, so a text estimate
+	/// cannot reveal it again and again (estimates run a few px short or
+	/// long where the font falls back).
+	pub measured: std::rc::Rc<std::cell::RefCell<[(String, f32); 4]>>,
 }
 
 pub(crate) const ALL_LOG_FILTER_MENUS: [LogMenu; 4] =
@@ -753,6 +758,10 @@ impl WorkbenchModel {
 		let selector = id.clone();
 		let open = self.log_menu == Some(menu);
 		let active = value.is_some();
+		let text = match &value {
+			Some(v) => format!("{label}: {v}"),
+			None => label.to_string(),
+		};
 		div()
 			.id(SharedString::from(id.clone()))
 			.debug_selector(move || selector)
@@ -807,8 +816,16 @@ impl WorkbenchModel {
 			// a few pixels where the font falls back (CJK on Linux).
 			.child({
 				let cell = self.log_filter_layout.chip_width_cell(menu).clone();
+				let measured = self.log_filter_layout.measured.clone();
+				let slot = ALL_LOG_FILTER_MENUS.iter().position(|m| *m == menu);
 				canvas(
-					move |b, _, _| cell.set(f32::from(b.size.width)),
+					move |b, _, _| {
+						let w = f32::from(b.size.width);
+						cell.set(w);
+						if let Some(i) = slot {
+							measured.borrow_mut()[i] = (text, w);
+						}
+					},
 					|_, _, _, _| {},
 				)
 				.absolute()
@@ -881,26 +898,26 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
-	/// Estimates the width of each chip the last frame did not draw from its
-	/// text, laid out as `log_chip` and `log_chip_more` draw it. A hidden
-	/// chip cannot be measured after layout, so without this it would keep
-	/// a stale or guessed width; a drawn chip keeps its measured one.
+	/// Sets each chip's width for the split: the width it was drawn at with
+	/// this same text, else an estimate from the text laid out as `log_chip`
+	/// and `log_chip_more` draw it. A hidden chip cannot be measured after
+	/// layout, and its text can change while hidden (a filter picked from
+	/// the overflow chip).
 	pub(super) fn measure_log_chips(&self, window: &Window) {
 		let loc = self.locale;
 		let layout = &self.log_filter_layout;
-		let drawn = layout.last_mask.get();
+		let measured = layout.measured.borrow();
 		for (i, menu) in ALL_LOG_FILTER_MENUS.into_iter().enumerate() {
-			if drawn & (1 << i) != 0 && layout.chip_width_cell(menu).get() > 0.
-			{
-				continue;
-			}
 			let (label, value) = self.log_menu_value(menu, loc);
 			let text = match &value {
 				Some(v) => format!("{label}: {v}"),
 				None => label,
 			};
-			// Padding 6+6, label (max 180), gap 3, 12px icon, 1px slack.
-			let w = 12. + text_width(window, &text, UI_TEXT).min(180.) + 16.;
+			let w = match &measured[i] {
+				(drawn, w) if *drawn == text && *w > 0. => *w,
+				// Padding 6+6, label (max 180), gap 3, 12px icon, 1px slack.
+				_ => 12. + text_width(window, &text, UI_TEXT).min(180.) + 16.,
+			};
 			layout.chip_width_cell(menu).set(w);
 		}
 		// Padding 4+4, gap 2, 10px icon, 1px slack. Without the active dot:
