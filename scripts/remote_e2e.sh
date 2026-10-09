@@ -19,11 +19,13 @@ set -uo pipefail
 SNIP=""
 HOST=""
 RSNIP=""
+RECEIPT=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--snip) SNIP=$2; shift 2 ;;
 	--worker-ssh) HOST=$2; shift 2 ;;
 	--remote-snip) RSNIP=$2; shift 2 ;;
+	--receipt) RECEIPT=$2; shift 2 ;;
 	-h | --help) sed -n '2,18p' "$0"; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
@@ -32,6 +34,9 @@ done
 [ -x "$SNIP" ] || { echo "$SNIP is not an executable" >&2; exit 2; }
 SNIP=$(cd "$(dirname "$SNIP")" && pwd)/$(basename "$SNIP")
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+if [ -n "$RECEIPT" ]; then
+	rm -f "$RECEIPT"
+fi
 
 # Runs a bash snippet on the worker machine (stdin), prints its output.
 w() {
@@ -80,6 +85,9 @@ WD=$(w <<<'mktemp -d')
 [ -n "$WD" ] || { echo "cannot make a work folder on the worker" >&2; exit 1; }
 
 cleanup() {
+	if [ -n "$HOST" ] && [ -n "${LOCAL_BIN_CREATED:-}" ]; then
+		w <<<"rm -f ~/.local/bin/snip" >/dev/null 2>&1 || true
+	fi
 	w <<<"rm -rf '$WD'" >/dev/null 2>&1
 	rm -rf "$MASTER"
 }
@@ -192,6 +200,47 @@ refused "a relative workspace" "absolute" ls h relative/dir
 refused "a missing workspace" "" ls h "$WD/nope"
 err=$(SNIP_REMOTE_EXEC="$WD/no-such-snip serve --stdio" "$SNIP" remote ls h "$WD" 2>&1)
 check "a worker that cannot start says why ($err)" test -n "$err"
+unreach_err=$(env -u SNIP_REMOTE_EXEC "$SNIP" remote ls nonexistent.invalid "$WD" 2>&1)
+unreach_rc=$?
+# The wording is ssh's own and differs per OS; the product must fail cleanly
+# with it, not hang or panic.
+if [ "$unreach_rc" = 1 ] && [ -n "$unreach_err" ] && [[ "$unreach_err" != *"panic"* ]]; then
+	ok "unreachable host exits 1 with product message ($unreach_err)"
+else
+	bad "unreachable host failed rc=$unreach_rc err=$unreach_err"
+fi
+
+if [ -n "$HOST" ]; then
+	# Auth failure: ssh.rs exposes no ssh option hook besides SNIP_REMOTE_EXEC;
+	# we simulate rejected auth with -o PubkeyAuthentication=no.
+	auth_err=$(SNIP_REMOTE_EXEC="ssh -T -o BatchMode=yes -o PubkeyAuthentication=no $HOST $RSNIP serve --stdio" "$SNIP" remote ls "$HOST" "$WD" 2>&1)
+	auth_rc=$?
+	if [ "$auth_rc" = 1 ] && [[ "$auth_err" == *"ssh could not log in without a password"* && "$auth_err" == *"Permission denied"* ]]; then
+		ok "auth failure exits 1 with product key-login message"
+	else
+		bad "auth failure rc=$auth_rc err=$auth_err"
+	fi
+
+	# Product launch path: unset SNIP_REMOTE_EXEC so the product builds the ssh command
+	# itself and discovers the worker via ~/.local/bin/snip (fallback path in ssh.rs).
+	had_local_snip=$(w <<<"test -e ~/.local/bin/snip && echo 1 || echo 0")
+	if [ "$had_local_snip" = 0 ]; then
+		LOCAL_BIN_CREATED=1
+		w <<<"mkdir -p ~/.local/bin && ln -sf '$RSNIP' ~/.local/bin/snip"
+	fi
+	expected_ls=$("$SNIP" remote ls h "$WD")
+	product_ls=$(env -u SNIP_REMOTE_EXEC "$SNIP" remote ls "$HOST" "$WD")
+	product_rc=$?
+	if [ "$had_local_snip" = 0 ]; then
+		w <<<"rm -f ~/.local/bin/snip"
+		unset LOCAL_BIN_CREATED
+	fi
+	if [ "$product_rc" = 0 ] && [ "$product_ls" = "$expected_ls" ] && [ -n "$product_ls" ]; then
+		ok "product launch path finds worker and matches SNIP_REMOTE_EXEC listing"
+	else
+		bad "product launch path failed rc=$product_rc"
+	fi
+fi
 srcname=$(basename "$SRC")
 
 echo "== browsing"
@@ -286,6 +335,44 @@ alpha_tip=$(w <<<"git -C '$WD/gitws/alpha' rev-parse HEAD")
 commit_copy=$("$SNIP" remote copy-commits h "$WD/gitws" --in alpha "$alpha_tip" --stdout 2>/dev/null)
 check "a remote copy of a commit" grep -q '"message":"second commit' <<<"$commit_copy"
 refused "a copy out of the workspace" "" copy h "$WD/edge" ../secret.txt --stdout
+
+if [ -n "$HOST" ]; then
+	# Master dies mid-request: start a long remote copy, kill the local master's
+	# child ssh process, then poll the host until no worker process remains.
+	"$SNIP" remote copy h "$WD/big" --stdout >/dev/null 2>&1 &
+	master_pid=$!
+	ssh_child=""
+	for _ in $(seq 1 100); do
+		ssh_child=$(pgrep -P "$master_pid" ssh 2>/dev/null || true)
+		[ -n "$ssh_child" ] && break
+		sleep 0.01
+	done
+	if [ -n "$ssh_child" ]; then
+		kill -9 "$ssh_child" 2>/dev/null || true
+	fi
+	kill -9 "$master_pid" 2>/dev/null || true
+	wait "$master_pid" 2>/dev/null || true
+
+	orphans=1
+	for _ in $(seq 1 20); do
+		orphans=$(w <<EOF
+rsnip_real="\$(readlink -f '$RSNIP' 2>/dev/null || realpath '$RSNIP')"
+count=0
+for exe in /proc/[0-9]*/exe; do
+	[ -e "\$exe" ] || continue
+	target="\$(readlink -f "\$exe" 2>/dev/null || true)"
+	if [ "\$target" = "\$rsnip_real" ]; then
+		count=\$((count + 1))
+	fi
+done
+echo "\$count"
+EOF
+		)
+		[ "$orphans" = 0 ] && break
+		sleep 0.5
+	done
+	check "no orphan worker processes after master killed mid-request ($orphans)" test "$orphans" = 0
+fi
 
 echo "== paste"
 # A payload made by `snip copy` on this machine, pasted into a folder of the
@@ -467,6 +554,21 @@ if [ -n "$SRC" ]; then
 		src_repos=$("$SNIP" remote repos h "$SRC" 2>&1)
 		check "repos $srcname reports no Git repository for archive" grep -q "no Git repository in" <<<"$src_repos"
 	fi
+fi
+
+if [ -n "$RECEIPT" ] && [ "$fail" = 0 ]; then
+	mkdir -p "$(dirname "$RECEIPT")"
+	head_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "unknown")
+	cat >"$RECEIPT" <<EOF
+{
+  "commit": "$head_commit",
+  "host": "${HOST:-local}",
+  "pass_count": $pass,
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "passed": true
+}
+EOF
+	echo "wrote receipt to $RECEIPT"
 fi
 
 echo "== $pass passed, $fail failed"

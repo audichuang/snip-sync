@@ -107,7 +107,7 @@ remote-e2e-ssh host *args:
 	cargo build --release -p snip-cli --locked
 	snip=target/release/snip
 	[ -x "$snip" ] || snip=$snip.exe
-	scripts/remote_e2e.sh --snip "$snip" --worker-ssh {{host}} {{args}}
+	scripts/remote_e2e.sh --snip "$snip" --worker-ssh {{host}} --receipt target/remote-e2e-ssh-receipt.json {{args}}
 
 # Python stdlib memory harness contracts and workload generator tests.
 preflight-harness:
@@ -219,6 +219,13 @@ release version *flags:
 	ok "version $TAG validated (latest was ${LATEST:-none})"
 
 	HEAD_SHA="$(git rev-parse HEAD)"
+	RECEIPT="target/remote-e2e-ssh-receipt.json"
+	[ -f "$RECEIPT" ] || err "no SSH end-to-end receipt found at $RECEIPT; run 'just remote-e2e-ssh <host>' before releasing"
+	RECEIPT_COMMIT="$(jq -r .commit "$RECEIPT" 2>/dev/null || true)"
+	[ "$RECEIPT_COMMIT" = "$HEAD_SHA" ] || err "SSH end-to-end receipt at $RECEIPT is for ${RECEIPT_COMMIT:-unknown}, not current HEAD ($HEAD_SHA); run 'just remote-e2e-ssh <host>'"
+	[ "$(jq -r .passed "$RECEIPT" 2>/dev/null || true)" = "true" ] || err "SSH end-to-end receipt at $RECEIPT recorded a failure; run 'just remote-e2e-ssh <host>'"
+	ok "SSH end-to-end receipt validated for $HEAD_SHA (host $(jq -r .host "$RECEIPT"), $(jq -r .pass_count "$RECEIPT") checks passed)"
+
 	git push "$REMOTE" "$BRANCH"
 	info "waiting for ci.yml (push to $BRANCH) on $HEAD_SHA..."
 	CI_OK=0
