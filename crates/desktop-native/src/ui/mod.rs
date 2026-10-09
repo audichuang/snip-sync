@@ -1578,6 +1578,7 @@ impl Render for WorkbenchModel {
 									.child(center),
 							)
 							.when(self.bottom_visible, |d| {
+								self.measure_log_chips(window);
 								d.child(self.splitter(Splitter::Bottom, cx))
 									.child(self.render_log(bottom_h, cx))
 							}),

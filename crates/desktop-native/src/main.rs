@@ -13405,6 +13405,51 @@ mod tests {
 			);
 		}
 
+		/// The default 1080×720 window keeps every chip, also after the
+		/// window was narrow first: a chip that was hidden still has its
+		/// real width (native smoke clicks `log-filter-user` at this size).
+		#[gpui::test]
+		fn log_filter_chips_return_at_the_default_window_size(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			for (w, h) in [(700., 632.), (1080., 752.)] {
+				cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(h)));
+				for _ in 0..50 {
+					settle(cx);
+					let ready = model.read_with(cx, |m, _| {
+						!m.commits.is_empty()
+							&& (m.log_width.get() - (w - 28.)).abs() < 40.
+					});
+					if ready {
+						break;
+					}
+				}
+				for _ in 0..3 {
+					cx.update(|window, _| window.refresh());
+					settle(cx);
+				}
+			}
+			for id in [
+				"log-filter-paths",
+				"log-filter-branch",
+				"log-filter-user",
+				"log-filter-date",
+			] {
+				assert!(cx.debug_bounds(id).is_some(), "{id} hidden at 1080");
+			}
+			// The test frame keeps stale ids across resizes; ask the split.
+			let hidden =
+				model.read_with(cx, |m, _| m.log_filter_split().1.len());
+			assert_eq!(hidden, 0, "no chip goes to the overflow at 1080");
+		}
+
 		/// At a narrow window width with widened details pane and an active long user filter,
 		/// no filter chip intersects action buttons and user filter is reachable.
 		#[gpui::test]

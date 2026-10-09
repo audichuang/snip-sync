@@ -801,15 +801,6 @@ impl WorkbenchModel {
 			} else {
 				icon(Icon::ChevronDown, 12.).into_any_element()
 			})
-			.child({
-				let cell = self.log_filter_layout.chip_width_cell(menu).clone();
-				canvas(
-					move |b, _, _| cell.set(f32::from(b.size.width)),
-					|_, _, _, _| {},
-				)
-				.absolute()
-				.size_full()
-			})
 			.when(open, |d| d.child(self.log_menu_panel(menu, cx)))
 			.children(probe(log, id))
 			.into_any_element()
@@ -871,18 +862,34 @@ impl WorkbenchModel {
 				)
 			})
 			.child(icon(Icon::ChevronDown, 10.))
-			.child({
-				let cell = self.log_filter_layout.more_w.clone();
-				canvas(
-					move |b, _, _| cell.set(f32::from(b.size.width)),
-					|_, _, _, _| {},
-				)
-				.absolute()
-				.size_full()
-			})
 			.when_some(open_menu, |d, m| d.child(self.log_menu_panel(m, cx)))
 			.children(probe(log, id))
 			.into_any_element()
+	}
+
+	/// Sets every filter chip's width from its text, laid out as
+	/// `log_chip` and `log_chip_more` draw it. A hidden chip is never drawn,
+	/// so it cannot be measured after layout; its text width stays exact.
+	pub(super) fn measure_log_chips(&self, window: &Window) {
+		let loc = self.locale;
+		let layout = &self.log_filter_layout;
+		let mut any_value = false;
+		for menu in ALL_LOG_FILTER_MENUS {
+			let (label, value) = self.log_menu_value(menu, loc);
+			any_value |= value.is_some();
+			let text = match &value {
+				Some(v) => format!("{label}: {v}"),
+				None => label,
+			};
+			// Padding 6+6, label (max 180), gap 3, 12px icon, 1px slack.
+			let w = 12. + text_width(window, &text, UI_TEXT).min(180.) + 16.;
+			layout.chip_width_cell(menu).set(w);
+		}
+		// Padding 4+4, gap 2, 10px icon; an active dot and border add 9.
+		let more = 8.
+			+ text_width(window, t("log_chip_more", loc), UI_TEXT)
+			+ 13. + if any_value { 9. } else { 0. };
+		layout.more_w.set(more);
 	}
 
 	pub(super) fn log_branch_value(&self) -> Option<String> {
