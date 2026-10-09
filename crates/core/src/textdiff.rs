@@ -27,16 +27,12 @@ pub fn unified(
 		return (String::new(), false);
 	}
 	if patch.len() > max_bytes {
-		let cut = match patch[..max_bytes].rfind('\n') {
-			Some(idx) => idx + 1,
-			None => {
-				let mut c = max_bytes;
-				while c > 0 && !patch.is_char_boundary(c) {
-					c -= 1;
-				}
-				c
-			}
-		};
+		// The cap can fall inside a multi-byte character: back off first.
+		let mut limit = max_bytes;
+		while !patch.is_char_boundary(limit) {
+			limit -= 1;
+		}
+		let cut = patch[..limit].rfind('\n').map_or(limit, |idx| idx + 1);
 		patch.truncate(cut);
 		(patch, true)
 	} else {
@@ -105,5 +101,18 @@ mod tests {
 		assert!(patch.len() <= 60);
 		assert!(patch.ends_with('\n'));
 		assert!(patch.contains("--- a/big.txt\n"));
+	}
+
+	#[test]
+	fn diff_truncation_inside_a_multibyte_char() {
+		let old = "中文\n".repeat(40);
+		let new = "新的內容\n".repeat(40);
+		let (full, _) = unified("zh.txt", &old, &new, usize::MAX);
+		for max in 1..full.len() {
+			let (patch, truncated) = unified("zh.txt", &old, &new, max);
+			assert!(truncated);
+			assert!(patch.len() <= max);
+			assert!(full.starts_with(&patch));
+		}
 	}
 }

@@ -4825,8 +4825,8 @@ impl WorkbenchModel {
 					let outcome = if let Some(ref rem) = remote {
 						// The worker plans under its workspace's real path, which
 						// is also the workspace id; never resolve it on this machine.
-						let rel = remote::remote_rel(
-							std::path::Path::new(&rem.session.workspace.id),
+						let rel = remote::worker_rel(
+							&rem.session.workspace.id,
 							&dest_path,
 						);
 						let client = rem.session.client.clone();
@@ -4955,13 +4955,7 @@ impl WorkbenchModel {
 							Language::Diff,
 						);
 						if truncated {
-							p.notice = Some(
-								crate::i18n::t(
-									"line_truncated_notice",
-									model.locale,
-								)
-								.to_string(),
-							);
+							p.notice = Some("truncated".to_string());
 						}
 						(p, "diff")
 					}

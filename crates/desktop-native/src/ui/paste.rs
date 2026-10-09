@@ -824,7 +824,21 @@ impl WorkbenchModel {
 				)
 			})
 			.when_some(
-				self.paste.detail().and_then(|p| p.notice.clone()),
+				// `Preview::new` flags a cut with the bare word "truncated".
+				self.paste.detail().and_then(|p| p.notice.clone()).map(|n| {
+					if n == "truncated" {
+						tf(
+							"truncated_notice",
+							loc,
+							&[
+								&crate::reader::MAX_PREVIEW_LINES,
+								&(crate::reader::MAX_PREVIEW_BYTES / 1024),
+							],
+						)
+					} else {
+						n
+					}
+				}),
 				|d, notice| {
 					d.child(
 						div()
