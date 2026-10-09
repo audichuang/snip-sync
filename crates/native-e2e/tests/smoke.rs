@@ -1221,7 +1221,22 @@ fn native_desktop_smoke_and_clipboard_verification() {
 
 	// 10. Git Log: search by author, HEAD jump, merge collapse, range compare
 	println!("[TEST DRIVER] Testing Git Log author search...");
-	click("log-filter-user");
+	// With the Repository chip active, 1080×720 leaves no room for every
+	// chip: one that does not fit sits in the overflow chip, and the user
+	// reaches it there. Its clear button moves there with it.
+	let drawn = |id: &str| {
+		std::thread::sleep(Duration::from_millis(250));
+		snip_native_e2e::lookup_bounds(&bounds.lock().unwrap(), id).is_some()
+	};
+	let via_overflow = |id: &str, hidden: &str| {
+		if drawn(id) {
+			click(id);
+		} else {
+			click("log-filter-more");
+			click(hidden);
+		}
+	};
+	via_overflow("log-filter-user", "log-filter-more:user");
 	wait_for_pattern("[APP:LOG_MENU: Some(User)]", Duration::from_secs(3))
 		.expect("User chip must open its menu");
 	click("log-user:Tester");
@@ -1248,7 +1263,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	.expect("clearing the text keeps the author filter");
 
 	// Reset author search from the chip's clear button.
-	click("log-filter-user-clear");
+	via_overflow("log-filter-user-clear", "log-filter-user-clear");
 	wait_for_pattern("[APP:LOG_SEARCH: active=false", Duration::from_secs(3))
 		.expect("clearing log search must restore full graph");
 
