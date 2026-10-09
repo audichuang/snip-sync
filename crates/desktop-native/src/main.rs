@@ -8933,6 +8933,69 @@ mod tests {
 			});
 		}
 
+		/// The worker refuses a read over the preview cap; the master names
+		/// that reason instead of "unreadable" and keeps the source view.
+		#[gpui::test]
+		fn remote_paste_preview_over_the_cap_says_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("big.txt"), "y".repeat(2 * 1024 * 1024))
+				.unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "big.txt"]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			remote_paste_preview(&model, cx, "// FILE: big.txt\nsmall\n");
+			let want = model.read_with(cx, |m, _| {
+				crate::i18n::t("paste_diff_too_large", m.locale).to_string()
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let noticed = model.read_with(cx, |m, _| {
+					m.paste.detail().and_then(|d| d.notice.clone()).is_some()
+				});
+				if noticed {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().expect("plan open").remote.is_some());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(!detail.is_diff);
+				assert_eq!(detail.notice.as_deref(), Some(want.as_str()));
+			});
+		}
+
 		#[gpui::test]
 		fn remote_depth_limited_folder_can_be_continued(
 			cx: &mut TestAppContext,
@@ -12074,6 +12137,52 @@ mod tests {
 				assert_eq!(detail.text.as_ref(), "exact content");
 				let notice = detail.notice.as_ref().expect("notice present");
 				assert_eq!(notice, crate::i18n::t("paste_diff_same", m.locale));
+			});
+		}
+
+		/// A destination the reader cannot show as text keeps the source view
+		/// and says why the diff is missing: over the 1 MiB preview cap, or
+		/// not text.
+		#[gpui::test]
+		fn paste_preview_without_a_readable_destination_explains_the_missing_diff(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			fs::write(dest.join("big.txt"), "x".repeat(2 * 1024 * 1024))
+				.unwrap();
+			fs::write(dest.join("bin.txt"), b"old\0bytes\xff\n").unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: big.txt\nsmall now\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert!(plan.items[0].overwritable());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(!detail.is_diff, "an oversized target has no diff");
+				assert_eq!(detail.text.as_ref(), "small now");
+				assert_eq!(
+					detail.notice.as_deref(),
+					Some(crate::i18n::t("paste_diff_too_large", m.locale))
+				);
+			});
+			model.update(cx, |m, cx| m.cancel_paste_preview(cx));
+			paste(&model, cx, "// FILE: bin.txt\ntext now\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				// The plan leaves a target that is not text alone; then there
+				// is nothing to compare. If it ever plans one, say why.
+				if !plan.items.first().is_some_and(|i| i.overwritable()) {
+					return;
+				}
+				let detail = m.paste.detail().expect("detail present");
+				assert!(!detail.is_diff, "a binary target has no diff");
+				assert_eq!(
+					detail.notice.as_deref(),
+					Some(crate::i18n::t("paste_diff_binary", m.locale))
+				);
 			});
 		}
 

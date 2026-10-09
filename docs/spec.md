@@ -208,7 +208,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - **主機與連線**:
   - 主機清單就是 `~/.ssh/config` 的 `Host` 項目(跟著 `Include` 走,略過萬用字元樣式)。
   - master 執行 `ssh -T -o BatchMode=yes <host> snip serve --stdio`;遠端非互動 shell 的 PATH 找不到 `snip` 時,依序試 `~/.local/bin`、`/opt/homebrew/bin`、`/home/linuxbrew/.linuxbrew/bin`、`/usr/local/bin`。
-  - 身分驗證與加密完全交給 SSH,所以必須先設好金鑰登入;BatchMode 不會問密碼,失敗時顯示 ssh 自己的錯誤訊息。遠端沒有 `snip` 或版本太舊時,顯示「那台機器沒有安裝 snip,或版本太舊」。
+  - 身分驗證與加密完全交給 SSH,所以必須先設好金鑰登入;BatchMode 不會問密碼,失敗時顯示 ssh 自己的錯誤訊息（`Permission denied` 時另提示先 `ssh-copy-id`）。BatchMode 也不會詢問未知的 host key:第一次連的主機要先在終端機 `ssh <host>` 接受一次,否則顯示 ssh 的 `Host key verification failed`。遠端沒有 `snip` 或版本太舊時,顯示「那台機器沒有安裝 snip,或版本太舊」。
   - worker 先印一行 `snip-serve-stdio/1`,之後才是協定的 frame;登入 shell 在這之前印的歡迎訊息會被略過。
   - `SNIP_REMOTE_EXEC` 環境變數可以整個取代啟動指令(以空白分隔),供測試與驗收使用。
   - `SNIP_E2E_PASTE_HOLD` 是貼上中斷驗收用的暫停點：只有設成**絕對路徑**且該檔案存在時，worker 才在第一個檔案寫入後暫停，等檔案移除再繼續（最多 60 秒）；未設定、相對路徑或檔案不存在都不暫停。
@@ -255,7 +255,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - Refresh 時 worker 掃描失敗（舊版 worker、連線中斷），repo 清單清空，已開的預覽與展開的資料夾不保留；當時正在載入的資料夾可能停在載入中，需重新開啟工作區。
   - 每條連線是一個 ssh 程序;master 每台主機最多留 2 條閒置連線。worker 的 job 與 `Served` 名額限制以單一程序計。
 - **版本相容**:
-  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 4:`GIT_VIEWS_VERSION = 2`、`TRANSFER_VERSION = 3` 複製、`PASTE_VERSION = 4` 貼上）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）;複製與貼上回報「那台的 snip-sync 太舊」。
+  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 5:`GIT_VIEWS_VERSION = 2`、`TRANSFER_VERSION = 3` 複製、`PASTE_VERSION = 4` 貼上、`EXPORT_CHANGES_VERSION = 5` 由 worker 解析變更選取與整個資料夾匯出、`REQUEST_CHUNKS_VERSION = 5` 分段請求）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）;複製與貼上回報「那台的 snip-sync 太舊」。
   - 0.6.x 以前的 TLS worker(`snip worker`)不支援 `serve --stdio`,連不上時顯示「沒有安裝 snip,或版本太舊」。
 - **寫入不變式**:
   - 能寫進 `.git` 就能寫 `.git/config`、hooks 或 filter,等於讓 master 在 worker 執行程式。這條守門在 snip-core 的貼上引擎裡(§3.2 安全規則),本機與遠端是同一段程式:payload 路徑含 `.git` 片段,或目標經 symlink 解析後落在 Git 目錄裡的,都是略過列、不寫入,其餘照寫。worker 另外只要求目的地與每個前綴對應的資料夾在工作區內(遠端的存取範圍);commit 重放和本機一樣進到目的地所在的 repo,即使它的頂層在工作區之上。

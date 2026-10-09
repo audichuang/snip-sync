@@ -263,9 +263,10 @@ jobs:
     # Apple's container cannot run in a hosted macOS VM, so the same Dockerfile is built
     # here (x86_64; the Mac builds arm64) and the harness runs in it as it does there:
     # unprivileged, with the checkout read-only.
-    # Remote-node connectivity end to end, apart from the GUI gates: a real
-    # `snip worker` process and a real `snip remote` master over TLS on 127.0.0.1
-    # (scripts/remote_e2e.sh). Windows matters most: it is the headless worker.
+    # Remote workspaces end to end, apart from the GUI gates: a real `snip remote`
+    # master starts real `snip serve --stdio` workers on this runner
+    # (scripts/remote_e2e.sh, local mode). The SSH mode needs a second machine and
+    # runs through `just remote-e2e-ssh <host>`, not here.
     remote-e2e:
         name: Remote E2E (${{ matrix.os }})
         runs-on: ${{ matrix.os }}
