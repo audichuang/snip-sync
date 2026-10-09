@@ -6669,6 +6669,7 @@ mod tests {
 			});
 			settle(cx);
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw to recalculate workspace-menu bounds after resize
 				cx.update(|window, _| window.refresh());
 				settle(cx);
 			}
@@ -7504,6 +7505,7 @@ mod tests {
 				cx.executor().advance_clock(Duration::from_millis(50));
 			}
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw after empty discovery completion
 				cx.update(|w, _| w.refresh());
 				settle(cx);
 			}
@@ -10244,6 +10246,7 @@ mod tests {
 			cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(752.)));
 			let mut last_chip = None;
 			for _ in 0..10 {
+				// ALLOWED-TEST-REFRESH: test harness needs redraw frames for search field width re-measurement before clicking branch chip
 				cx.update(|window, _| window.refresh());
 				settle(cx);
 				let pos = cx
@@ -10431,6 +10434,7 @@ mod tests {
 			settle(cx);
 			// The list reads its own width from the previous frame.
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw after resize so log list reads its width from previous frame
 				cx.update(|window, _| window.refresh());
 				settle(cx);
 			}
@@ -10521,6 +10525,7 @@ mod tests {
 				m.probes = Some(crate::ui::Probes::for_test());
 			});
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw to populate Probes::for_test() after opening workspace
 				cx.update(|w, _| w.refresh());
 				settle(cx);
 			}
@@ -12446,6 +12451,7 @@ mod tests {
 				cx.executor().advance_clock(Duration::from_millis(50));
 			}
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw after workspace switch to record probe bounds
 				cx.update(|w, _| w.refresh());
 				settle(cx);
 			}
@@ -13319,6 +13325,7 @@ mod tests {
 				);
 			});
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw after showing toast to measure multiline bounds
 				cx.update(|window, _| window.refresh());
 				settle(cx);
 			}
@@ -13413,10 +13420,7 @@ mod tests {
 					break;
 				}
 			}
-			for _ in 0..3 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
+			settle(cx);
 
 			let more_b = cx
 				.debug_bounds("log-filter-more")
@@ -13438,10 +13442,6 @@ mod tests {
 			// Click overflow chip to reveal hidden filters
 			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
 			settle(cx);
-			for _ in 0..2 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
 
 			// User item should now be present in the overflow menu
 			let user_item_b = cx
@@ -13449,10 +13449,6 @@ mod tests {
 				.expect("User item in overflow menu");
 			cx.simulate_click(user_item_b.center(), gpui::Modifiers::none());
 			settle(cx);
-			for _ in 0..2 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
 
 			// Verify User menu is now open, and refresh was not triggered
 			model.read_with(cx, |m, _| {
@@ -13486,10 +13482,7 @@ mod tests {
 					break;
 				}
 			}
-			for _ in 0..3 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
+			settle(cx);
 
 			assert!(
 				cx.debug_bounds("log-filter-more").is_none(),
@@ -13540,10 +13533,7 @@ mod tests {
 						break;
 					}
 				}
-				for _ in 0..3 {
-					cx.update(|window, _| window.refresh());
-					settle(cx);
-				}
+				settle(cx);
 			}
 			for id in [
 				"log-filter-paths",
@@ -13629,10 +13619,7 @@ mod tests {
 					break;
 				}
 			}
-			for _ in 0..3 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
+			settle(cx);
 
 			assert_no_filter_chips_intersect_actions(cx);
 
@@ -13644,10 +13631,6 @@ mod tests {
 					.expect("more chip must exist when user chip is hidden");
 				cx.simulate_click(more_b.center(), gpui::Modifiers::none());
 				settle(cx);
-				for _ in 0..2 {
-					cx.update(|window, _| window.refresh());
-					settle(cx);
-				}
 				let user_item_b = cx
 					.debug_bounds("log-filter-more:user")
 					.expect("User item in overflow menu");
@@ -13657,10 +13640,6 @@ mod tests {
 				);
 			}
 			settle(cx);
-			for _ in 0..2 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
 
 			model.read_with(cx, |m, _| {
 				assert_eq!(
@@ -13695,10 +13674,7 @@ mod tests {
 					break;
 				}
 			}
-			for _ in 0..3 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
+			settle(cx);
 
 			assert_no_filter_chips_intersect_actions(cx);
 
@@ -13707,19 +13683,11 @@ mod tests {
 				.expect("more chip must exist at 900w English");
 			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
 			settle(cx);
-			for _ in 0..2 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
 			let user_item_b = cx
 				.debug_bounds("log-filter-more:user")
 				.expect("User item in overflow menu");
 			cx.simulate_click(user_item_b.center(), gpui::Modifiers::none());
 			settle(cx);
-			for _ in 0..2 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
 
 			model.read_with(cx, |m, _| {
 				assert_eq!(
@@ -13758,10 +13726,7 @@ mod tests {
 					break;
 				}
 			}
-			for _ in 0..3 {
-				cx.update(|window, _| window.refresh());
-				settle(cx);
-			}
+			settle(cx);
 
 			assert!(
 				cx.debug_bounds("log-filter-more").is_none(),
