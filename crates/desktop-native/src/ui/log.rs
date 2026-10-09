@@ -12,6 +12,7 @@ pub enum LogMenu {
 	User,
 	Date,
 	More,
+	FilterMore,
 }
 
 impl LogMenu {
@@ -22,7 +23,101 @@ impl LogMenu {
 			LogMenu::User => "user",
 			LogMenu::Date => "date",
 			LogMenu::More => "more",
+			LogMenu::FilterMore => "more",
 		}
+	}
+}
+
+/// Measured layout widths for dynamic filter chip overflow.
+#[derive(Clone, Default)]
+pub struct LogFilterLayout {
+	pub container_w: std::rc::Rc<std::cell::Cell<f32>>,
+	pub repo_w: std::rc::Rc<std::cell::Cell<f32>>,
+	pub branch_w: std::rc::Rc<std::cell::Cell<f32>>,
+	pub user_w: std::rc::Rc<std::cell::Cell<f32>>,
+	pub date_w: std::rc::Rc<std::cell::Cell<f32>>,
+	pub more_w: std::rc::Rc<std::cell::Cell<f32>>,
+	pub last_visible_count: std::rc::Rc<std::cell::Cell<u8>>,
+	pub refresh_count: std::rc::Rc<std::cell::Cell<u8>>,
+}
+
+pub(crate) const ALL_LOG_FILTER_MENUS: [LogMenu; 4] =
+	[LogMenu::Repo, LogMenu::Branch, LogMenu::User, LogMenu::Date];
+pub(crate) const LOG_FILTER_GAP: f32 = 4.0;
+pub(crate) const CONSERVATIVE_CHIP_W_EMPTY: f32 = 75.0;
+pub(crate) const CONSERVATIVE_CHIP_W_ACTIVE: f32 = 180.0;
+pub(crate) const CONSERVATIVE_MORE_W: f32 = 42.0;
+
+impl LogFilterLayout {
+	pub fn chip_width_cell(
+		&self,
+		menu: LogMenu,
+	) -> &std::rc::Rc<std::cell::Cell<f32>> {
+		match menu {
+			LogMenu::Repo => &self.repo_w,
+			LogMenu::Branch => &self.branch_w,
+			LogMenu::User => &self.user_w,
+			LogMenu::Date => &self.date_w,
+			LogMenu::More | LogMenu::FilterMore => &self.more_w,
+		}
+	}
+
+	pub fn chip_effective_w(&self, menu: LogMenu, has_value: bool) -> f32 {
+		let measured = self.chip_width_cell(menu).get();
+		if measured > 0.0 {
+			measured
+		} else if has_value {
+			CONSERVATIVE_CHIP_W_ACTIVE
+		} else {
+			CONSERVATIVE_CHIP_W_EMPTY
+		}
+	}
+
+	pub fn more_effective_w(&self) -> f32 {
+		let measured = self.more_w.get();
+		if measured > 0.0 {
+			measured
+		} else {
+			CONSERVATIVE_MORE_W
+		}
+	}
+
+	pub fn compute_split_count(
+		&self,
+		available_w: f32,
+		has_values: [bool; 4],
+	) -> usize {
+		if available_w <= 0.0 {
+			return 0;
+		}
+		let w = [
+			self.chip_effective_w(ALL_LOG_FILTER_MENUS[0], has_values[0]),
+			self.chip_effective_w(ALL_LOG_FILTER_MENUS[1], has_values[1]),
+			self.chip_effective_w(ALL_LOG_FILTER_MENUS[2], has_values[2]),
+			self.chip_effective_w(ALL_LOG_FILTER_MENUS[3], has_values[3]),
+		];
+		let more_w = self.more_effective_w();
+
+		// Case 1: All 4 chips fit without overflow chip.
+		let total_all_4 = w[0]
+			+ LOG_FILTER_GAP
+			+ w[1] + LOG_FILTER_GAP
+			+ w[2] + LOG_FILTER_GAP
+			+ w[3];
+		if available_w >= total_all_4 {
+			return 4;
+		}
+
+		// Case 2: At least 1 chip is hidden, so overflow chip is shown.
+		for k in (1..=3).rev() {
+			let sum_chips: f32 = w[..k].iter().sum();
+			let needed = sum_chips + (k as f32) * LOG_FILTER_GAP + more_w;
+			if available_w >= needed {
+				return k;
+			}
+		}
+
+		0
 	}
 }
 
@@ -532,6 +627,7 @@ pub(super) fn log_icon_button(
 ) -> Stateful<Div> {
 	div()
 		.id(id)
+		.debug_selector(move || id.to_string())
 		.relative()
 		.flex_shrink_0()
 		.size(px(26.))
@@ -705,9 +801,237 @@ impl WorkbenchModel {
 			} else {
 				icon(Icon::ChevronDown, 12.).into_any_element()
 			})
+			.child({
+				let cell = self.log_filter_layout.chip_width_cell(menu).clone();
+				canvas(
+					move |b, _, _| cell.set(f32::from(b.size.width)),
+					|_, _, _, _| {},
+				)
+				.absolute()
+				.size_full()
+			})
 			.when(open, |d| d.child(self.log_menu_panel(menu, cx)))
 			.children(probe(log, id))
 			.into_any_element()
+	}
+
+	/// Overflow chip collecting filters that do not fit in a narrow window.
+	pub(super) fn log_chip_more(
+		&self,
+		hidden_menus: &'static [LogMenu],
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let loc = self.locale;
+		let log = &self.probes;
+		let id = "log-filter-more".to_string();
+		let selector = id.clone();
+		let active = hidden_menus
+			.iter()
+			.any(|m| self.log_menu_value(*m, loc).1.is_some());
+		let open_menu = match self.log_menu {
+			Some(LogMenu::FilterMore) => Some(LogMenu::FilterMore),
+			Some(m) if hidden_menus.contains(&m) => Some(m),
+			_ => None,
+		};
+		let open = open_menu.is_some();
+		div()
+			.id(SharedString::from(id.clone()))
+			.debug_selector(move || selector)
+			.relative()
+			.flex_shrink_0()
+			.h(px(24.))
+			.px(px(4.))
+			.flex()
+			.items_center()
+			.gap(px(2.))
+			.rounded(px(4.))
+			.cursor_pointer()
+			.text_size(px(UI_TEXT))
+			.when(open, |d| d.bg(rgb(pal().hover_bg)))
+			.when(active, |d| d.border_1().border_color(rgb(pal().focus_ring)))
+			.hover(|s| s.bg(rgb(pal().hover_bg)))
+			.on_click(cx.listener(move |this, _, _, cx| {
+				if this.log_menu == Some(LogMenu::FilterMore)
+					|| (this.log_menu.is_some()
+						&& hidden_menus.contains(&this.log_menu.unwrap()))
+				{
+					this.close_log_menu(cx);
+				} else {
+					this.toggle_log_menu(LogMenu::FilterMore, cx);
+				}
+			}))
+			.child(
+				div()
+					.text_color(rgb(pal().text))
+					.child(t("log_chip_more", loc)),
+			)
+			.when(active, |d| {
+				d.child(
+					div().size(px(5.)).rounded_full().bg(rgb(pal().focus_ring)),
+				)
+			})
+			.child(icon(Icon::ChevronDown, 10.))
+			.child({
+				let cell = self.log_filter_layout.more_w.clone();
+				canvas(
+					move |b, _, _| cell.set(f32::from(b.size.width)),
+					|_, _, _, _| {},
+				)
+				.absolute()
+				.size_full()
+			})
+			.when_some(open_menu, |d, m| d.child(self.log_menu_panel(m, cx)))
+			.children(probe(log, id))
+			.into_any_element()
+	}
+
+	pub(super) fn log_branch_value(&self) -> Option<String> {
+		self.active_ref_filter
+			.as_deref()
+			.map(|r| short_ref(r).to_string())
+	}
+
+	pub(super) fn log_user_value(&self, loc: Locale) -> Option<String> {
+		self.log_filter.author.clone().map(|a| {
+			if self.git_user_email.as_deref() == Some(a.as_str()) {
+				t("log_user_me", loc).to_string()
+			} else {
+				a
+			}
+		})
+	}
+
+	pub(super) fn log_date_value(&self, loc: Locale) -> Option<String> {
+		let day = |s: &Option<String>| {
+			s.as_deref()
+				.map(|s| s.split(' ').next().unwrap_or(s).to_string())
+				.unwrap_or_else(|| "…".into())
+		};
+		match (&self.log_filter.since, &self.log_filter.until) {
+			(None, None) => None,
+			(Some(s), None)
+				if DATE_PRESETS.iter().any(|(_, since, _)| since == s) =>
+			{
+				DATE_PRESETS
+					.iter()
+					.find(|(_, since, _)| since == s)
+					.map(|(_, _, label)| t(label, loc).to_string())
+			}
+			(since, until) => Some(format!("{} – {}", day(since), day(until))),
+		}
+	}
+
+	pub(super) fn log_scope_value(&self) -> Option<String> {
+		let repo_value = match self.log_repo_filter.as_slice() {
+			[] => None,
+			_ => {
+				let scope = self.log_scope();
+				scope.first().map(|(_, name)| match scope.len() {
+					1 => name.clone(),
+					n => format!("{name} +{}", n - 1),
+				})
+			}
+		};
+		let paths_value = self.log_filter.paths.first().map(|p| {
+			match self.log_filter.paths.len() {
+				1 => p.clone(),
+				n => format!("{p} +{}", n - 1),
+			}
+		});
+		match (repo_value, paths_value) {
+			(Some(r), Some(p)) => Some(format!("{r} · {p}")),
+			(r, p) => r.or(p),
+		}
+	}
+
+	pub(super) fn log_menu_value(
+		&self,
+		menu: LogMenu,
+		loc: Locale,
+	) -> (String, Option<String>) {
+		match menu {
+			LogMenu::Repo => (
+				t(
+					if self.repos.len() > 1 {
+						"log_chip_repo"
+					} else {
+						"log_chip_paths"
+					},
+					loc,
+				)
+				.to_string(),
+				self.log_scope_value(),
+			),
+			LogMenu::Branch => (
+				t("log_chip_branch", loc).to_string(),
+				self.log_branch_value(),
+			),
+			LogMenu::User => (
+				t("log_chip_user", loc).to_string(),
+				self.log_user_value(loc),
+			),
+			LogMenu::Date => (
+				t("log_chip_date", loc).to_string(),
+				self.log_date_value(loc),
+			),
+			_ => (t("log_chip_more", loc).to_string(), None),
+		}
+	}
+
+	pub(crate) fn log_chips_available_width(&self) -> f32 {
+		let measured = self.log_filter_layout.container_w.get();
+		if measured > 0.0 {
+			measured
+		} else if self.log_width.get() > 0.0 {
+			let branches_w = if self.log_branches_visible {
+				self.log_branches_w()
+			} else {
+				0.0
+			};
+			let details_w = if self.log_details_visible {
+				self.log_details_width()
+			} else {
+				0.0
+			};
+			let search_w = if self.log_width.get() < 1200.0 {
+				160.0
+			} else {
+				240.0
+			};
+			let middle_w =
+				(self.log_width.get() - 28.0 - branches_w - details_w).max(0.0);
+			(middle_w - search_w - 136.0).max(0.0)
+		} else {
+			0.0
+		}
+	}
+
+	pub(crate) fn log_filter_split_has_values(&self, loc: Locale) -> [bool; 4] {
+		[
+			self.log_scope_value().is_some(),
+			self.log_branch_value().is_some(),
+			self.log_user_value(loc).is_some(),
+			self.log_date_value(loc).is_some(),
+		]
+	}
+
+	/// Splits filter chips into visible and overflow lists based on measured sizes.
+	pub(crate) fn log_filter_split(
+		&self,
+	) -> (&'static [LogMenu], &'static [LogMenu]) {
+		let available_w = self.log_chips_available_width();
+		let has_values = self.log_filter_split_has_values(self.locale);
+		let k = self
+			.log_filter_layout
+			.compute_split_count(available_w, has_values);
+		self.log_filter_layout.last_visible_count.set(k as u8);
+		match k {
+			4 => (&ALL_LOG_FILTER_MENUS[..4], &[]),
+			3 => (&ALL_LOG_FILTER_MENUS[..3], &ALL_LOG_FILTER_MENUS[3..]),
+			2 => (&ALL_LOG_FILTER_MENUS[..2], &ALL_LOG_FILTER_MENUS[2..]),
+			1 => (&ALL_LOG_FILTER_MENUS[..1], &ALL_LOG_FILTER_MENUS[1..]),
+			_ => (&[], &ALL_LOG_FILTER_MENUS[..]),
+		}
 	}
 
 	pub(super) fn clear_log_chip(
@@ -729,7 +1053,7 @@ impl WorkbenchModel {
 			LogMenu::Branch => self.filter_by_ref(None, cx),
 			LogMenu::User => self.set_log_author(None, cx),
 			LogMenu::Date => self.set_log_since(None, cx),
-			LogMenu::More => cx.notify(),
+			LogMenu::More | LogMenu::FilterMore => cx.notify(),
 		}
 	}
 
@@ -1199,6 +1523,31 @@ impl WorkbenchModel {
 							}
 							app_log!("[APP:LOG_VIEW: {}]", key);
 							cx.notify();
+						}),
+						cx,
+					));
+				}
+			}
+			LogMenu::FilterMore => {
+				let (_, hidden) = self.log_filter_split();
+				for &m in hidden {
+					let key = match m {
+						LogMenu::Repo if self.repos.len() <= 1 => "paths",
+						_ => m.key(),
+					};
+					let id = format!("log-filter-more:{key}");
+					let (label, val) = self.log_menu_value(m, loc);
+					let is_active = val.is_some();
+					let display = match val {
+						Some(v) => format!("{label}: {v}"),
+						None => label,
+					};
+					items.push(item(
+						id,
+						display,
+						is_active,
+						Box::new(move |this, cx| {
+							this.toggle_log_menu(m, cx);
 						}),
 						cx,
 					));

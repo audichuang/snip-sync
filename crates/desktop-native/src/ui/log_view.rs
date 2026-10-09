@@ -105,56 +105,6 @@ impl WorkbenchModel {
 				.child(icon(ic, 14.))
 				.children(probe(log, id))
 		};
-		let branch_value = self
-			.active_ref_filter
-			.as_deref()
-			.map(|r| short_ref(r).to_string());
-		let user_value = self.log_filter.author.clone().map(|a| {
-			if self.git_user_email.as_deref() == Some(a.as_str()) {
-				t("log_user_me", loc).to_string()
-			} else {
-				a
-			}
-		});
-		let day = |s: &Option<String>| {
-			s.as_deref()
-				.map(|s| s.split(' ').next().unwrap_or(s).to_string())
-				.unwrap_or_else(|| "…".into())
-		};
-		let date_value = match (&self.log_filter.since, &self.log_filter.until)
-		{
-			(None, None) => None,
-			(Some(s), None)
-				if DATE_PRESETS.iter().any(|(_, since, _)| since == s) =>
-			{
-				DATE_PRESETS
-					.iter()
-					.find(|(_, since, _)| since == s)
-					.map(|(_, _, label)| t(label, loc).to_string())
-			}
-			(since, until) => Some(format!("{} – {}", day(since), day(until))),
-		};
-		// The repo chip shows the repository scope, then the paths.
-		let repo_value = match self.log_repo_filter.as_slice() {
-			[] => None,
-			_ => {
-				let scope = self.log_scope();
-				scope.first().map(|(_, name)| match scope.len() {
-					1 => name.clone(),
-					n => format!("{name} +{}", n - 1),
-				})
-			}
-		};
-		let paths_value = self.log_filter.paths.first().map(|p| {
-			match self.log_filter.paths.len() {
-				1 => p.clone(),
-				n => format!("{p} +{}", n - 1),
-			}
-		});
-		let scope_value = match (repo_value, paths_value) {
-			(Some(r), Some(p)) => Some(format!("{r} · {p}")),
-			(r, p) => r.or(p),
-		};
 		let filter_bar = div()
 			.flex()
 			.flex_row()
@@ -212,49 +162,52 @@ impl WorkbenchModel {
 					)),
 			)
 			// Chips give way first on a narrow window; the actions stay.
-			.child(
-				div()
+			.child({
+				let (visible_menus, hidden_menus) = self.log_filter_split();
+				let mut chips = div()
+					.relative()
 					.flex()
 					.flex_row()
 					.items_center()
 					.gap(px(4.))
 					.flex_1()
 					.min_w_0()
-					.overflow_hidden()
-					// Repositories and paths share one chip, first; a one-repo
-					// workspace only has paths.
-					.child(self.log_chip(
-						LogMenu::Repo,
-						t(
-							if self.repos.len() > 1 {
-								"log_chip_repo"
+					.overflow_hidden();
+				for &menu in visible_menus {
+					let (label, value) = self.log_menu_value(menu, loc);
+					chips = chips.child(self.log_chip(menu, &label, value, cx));
+				}
+				if !hidden_menus.is_empty() {
+					chips = chips.child(self.log_chip_more(hidden_menus, cx));
+				}
+				let layout = self.log_filter_layout.clone();
+				let has_values = self.log_filter_split_has_values(loc);
+				chips = chips.child(
+					canvas(
+						move |b, window, _| {
+							let new_w = f32::from(b.size.width);
+							layout.container_w.set(new_w);
+							let new_k =
+								layout.compute_split_count(new_w, has_values);
+							let last_k =
+								layout.last_visible_count.get() as usize;
+							if new_k != last_k {
+								let ref_count = layout.refresh_count.get();
+								if ref_count < 3 {
+									layout.refresh_count.set(ref_count + 1);
+									window.refresh();
+								}
 							} else {
-								"log_chip_paths"
-							},
-							loc,
-						),
-						scope_value,
-						cx,
-					))
-					.child(self.log_chip(
-						LogMenu::Branch,
-						t("log_chip_branch", loc),
-						branch_value,
-						cx,
-					))
-					.child(self.log_chip(
-						LogMenu::User,
-						t("log_chip_user", loc),
-						user_value,
-						cx,
-					))
-					.child(self.log_chip(
-						LogMenu::Date,
-						t("log_chip_date", loc),
-						date_value,
-						cx,
-					)),
-			)
+								layout.refresh_count.set(0);
+							}
+						},
+						|_, _, _, _| {},
+					)
+					.absolute()
+					.size_full(),
+				);
+				chips
+			})
 			.child(
 				log_icon_button(
 					"btn-log-refresh",

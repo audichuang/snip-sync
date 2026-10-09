@@ -610,6 +610,15 @@ pub enum Popover {
 	Ref,
 }
 
+#[derive(Debug)]
+enum PasteDiffOutcome {
+	Same,
+	Diff(String, bool),
+	Binary,
+	TooLarge,
+	Unreadable,
+}
+
 pub struct WorkbenchModel {
 	pub workspace_root: PathBuf,
 	pub restore_dir: Option<PathBuf>,
@@ -678,6 +687,7 @@ pub struct WorkbenchModel {
 	pub log_details_w: f32,
 	/// The log panel's width at the last layout.
 	pub log_width: std::rc::Rc<std::cell::Cell<f32>>,
+	pub log_filter_layout: ui::LogFilterLayout,
 	/// Collapsed directories of the changed-files tree.
 	pub changed_dirs_collapsed: Vec<String>,
 	/// The changed-files pane groups by directory (else a flat list).
@@ -757,6 +767,8 @@ pub struct WorkbenchModel {
 	pub repo_cancel: Option<CancelToken>,
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
+	pub paste_diff_cancel: Option<CancelToken>,
+	pub paste_diff_generation: u64,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, String)>,
@@ -1119,6 +1131,7 @@ impl WorkbenchModel {
 			log_show_hash: false,
 			log_details_w: theme::LOG_DETAILS_W_DEFAULT,
 			log_width: Default::default(),
+			log_filter_layout: Default::default(),
 			changed_dirs_collapsed: Vec::new(),
 			log_details_by_dir: true,
 			commit_rows_cache: Default::default(),
@@ -1187,6 +1200,8 @@ impl WorkbenchModel {
 			add_cancel: None,
 			is_adding_repo: false,
 			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
+			paste_diff_cancel: None,
+			paste_diff_generation: 0,
 			status: if workspace.is_some() {
 				Msg::new("status_scanning", [])
 			} else {
@@ -4441,6 +4456,9 @@ impl WorkbenchModel {
 		match landed {
 			Some(paste::preview::Landed::Shown { remap }) => {
 				self.show_landed_plan(remap);
+				let selected_idx =
+					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
+				self.load_paste_diff(selected_idx, cx);
 				cx.notify();
 			}
 			Some(paste::preview::Landed::Refused { err, closed }) => {
@@ -4715,7 +4733,11 @@ impl WorkbenchModel {
 
 	pub fn select_paste_item(&mut self, idx: usize, cx: &mut Context<Self>) {
 		let nav = self.paste.select(idx, self.preview.as_ref());
+		let moved = matches!(nav, paste::preview::Nav::Moved(_));
 		self.report_paste_nav(nav, cx);
+		if moved {
+			self.load_paste_diff(idx, cx);
+		}
 	}
 
 	pub fn step_paste_selection(
@@ -4724,7 +4746,14 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		let nav = self.paste.step(forward, self.preview.as_ref());
+		let moved = match nav {
+			paste::preview::Nav::Moved(idx) => Some(idx),
+			_ => None,
+		};
 		self.report_paste_nav(nav, cx);
+		if let Some(idx) = moved {
+			self.load_paste_diff(idx, cx);
+		}
 	}
 
 	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
@@ -4736,10 +4765,276 @@ impl WorkbenchModel {
 			}
 			paste::preview::Folded::Reselected(nav) => {
 				app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
+				let moved = match nav {
+					paste::preview::Nav::Moved(idx) => Some(idx),
+					_ => None,
+				};
 				self.report_paste_nav(nav, cx);
+				if let Some(idx) = moved {
+					self.load_paste_diff(idx, cx);
+				}
 				cx.notify();
 			}
 		}
+	}
+
+	pub(crate) fn load_paste_diff(
+		&mut self,
+		idx: usize,
+		cx: &mut Context<Self>,
+	) {
+		if let Some(token) = self.paste_diff_cancel.take() {
+			token.cancel();
+		}
+		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+
+		let Some(plan) = self.paste.plan() else {
+			return;
+		};
+		let Some(item) = plan.items.get(idx) else {
+			return;
+		};
+		if item.commit.is_some() || !item.overwritable() {
+			return;
+		}
+
+		let cancel = arm_cancel(&mut self.paste_diff_cancel);
+		let task_gen = self.paste_diff_generation;
+		let selected_idx = idx;
+		let item_path = item.path.clone();
+		let item_content = item.content.clone();
+		let dest_root = item.dest_root.clone();
+		let dest_path = item.dest_path.clone();
+		let remote = plan.remote.clone();
+		let kind = if remote.is_some() {
+			lifecycle::JobKind::CancellableRead
+		} else {
+			lifecycle::JobKind::UncancellableRead
+		};
+		let job_cancel = remote.is_some().then(|| cancel.clone());
+		let delay = self.e2e_read_delay;
+
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+
+		self.spawn_owned(cx, kind, job_cancel, async move {
+			let for_bg_path = item_path.clone();
+			let outcome = bg
+				.spawn(async move {
+					let outcome = if let Some(ref rem) = remote {
+						// The worker plans under its workspace's real path, which
+						// is also the workspace id; never resolve it on this machine.
+						let rel = remote::remote_rel(
+							std::path::Path::new(&rem.session.workspace.id),
+							&dest_path,
+						);
+						let client = rem.session.client.clone();
+						let ws = rem.session.workspace.id.clone();
+						match rel {
+							Some(rel_path) => {
+								match client.read(&ws, &rel_path, Some(&cancel))
+								{
+									Ok(Some(text)) => {
+										if text == *item_content {
+											PasteDiffOutcome::Same
+										} else {
+											let (patch, trunc) = snip_core::textdiff::unified(
+												&for_bg_path,
+												&text,
+												&item_content,
+												snip_core::browser::PREVIEW_LIMIT,
+											);
+											if patch.is_empty() {
+												PasteDiffOutcome::Same
+											} else {
+												PasteDiffOutcome::Diff(
+													patch, trunc,
+												)
+											}
+										}
+									}
+									Ok(None) => PasteDiffOutcome::Binary,
+									Err(err) => {
+										let s = err.to_string();
+										if s.contains("exceeds")
+											|| s.contains("limit")
+										{
+											PasteDiffOutcome::TooLarge
+										} else {
+											PasteDiffOutcome::Unreadable
+										}
+									}
+								}
+							}
+							None => PasteDiffOutcome::Unreadable,
+						}
+					} else {
+						let rel = dest_path
+							.strip_prefix(&dest_root)
+							.map(|r| r.to_string_lossy().into_owned())
+							.unwrap_or_else(|_| for_bg_path.clone());
+						match snip_core::browser::file_preview(&dest_root, &rel)
+						{
+							Ok(p) => match p.content {
+								Some(text) => {
+									if text == *item_content {
+										PasteDiffOutcome::Same
+									} else {
+										let (patch, trunc) = snip_core::textdiff::unified(
+											&for_bg_path,
+											&text,
+											&item_content,
+											snip_core::browser::PREVIEW_LIMIT,
+										);
+										if patch.is_empty() {
+											PasteDiffOutcome::Same
+										} else {
+											PasteDiffOutcome::Diff(patch, trunc)
+										}
+									}
+								}
+								None => PasteDiffOutcome::Binary,
+							},
+							Err(err) => {
+								let s = err.to_string();
+								if s.contains("exceeds") || s.contains("1 MiB")
+								{
+									PasteDiffOutcome::TooLarge
+								} else {
+									PasteDiffOutcome::Unreadable
+								}
+							}
+						}
+					};
+					if let Some(delay) = delay {
+						std::thread::sleep(delay);
+					}
+					outcome
+				})
+				.await;
+
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.paste_diff_generation != task_gen {
+					return;
+				}
+				let Some(plan) = model.paste.plan() else {
+					return;
+				};
+				if plan.selected_item_idx != selected_idx {
+					return;
+				}
+				let Some(item) = plan.items.get(selected_idx) else {
+					return;
+				};
+				if item.path != item_path {
+					return;
+				}
+
+				let (preview, state) = match outcome {
+					PasteDiffOutcome::Same => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(
+							crate::i18n::t("paste_diff_same", model.locale)
+								.to_string(),
+						);
+						(p, "same")
+					}
+					PasteDiffOutcome::Diff(patch, truncated) => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							patch,
+							true,
+							Language::Diff,
+						);
+						if truncated {
+							p.notice = Some(
+								crate::i18n::t(
+									"line_truncated_notice",
+									model.locale,
+								)
+								.to_string(),
+							);
+						}
+						(p, "diff")
+					}
+					PasteDiffOutcome::Binary => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(
+							crate::i18n::t("paste_diff_binary", model.locale)
+								.to_string(),
+						);
+						(p, "unavailable")
+					}
+					PasteDiffOutcome::TooLarge => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(
+							crate::i18n::t(
+								"paste_diff_too_large",
+								model.locale,
+							)
+							.to_string(),
+						);
+						(p, "unavailable")
+					}
+					PasteDiffOutcome::Unreadable => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(
+							crate::i18n::t(
+								"paste_diff_unreadable",
+								model.locale,
+							)
+							.to_string(),
+						);
+						(p, "unavailable")
+					}
+				};
+
+				match model.paste.replace_detail(
+					selected_idx,
+					preview,
+					model.preview.as_ref(),
+				) {
+					Ok(()) => {
+						app_log!(
+							"[APP:PASTE_DIFF: idx={} state={}]",
+							selected_idx,
+							state
+						);
+						cx.notify();
+					}
+					Err(_) => {
+						app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
+						cx.notify();
+					}
+				}
+			});
+		});
 	}
 
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
@@ -4810,6 +5105,10 @@ impl WorkbenchModel {
 							for error in &result.files.errors {
 								app_log!("[APP:PASTE_FILE_ERROR: {error}]");
 							}
+							if let Some(token) = model.paste_diff_cancel.take() {
+								token.cancel();
+							}
+							model.paste_diff_generation = model.paste_diff_generation.wrapping_add(1);
 							model.paste.clear(model.preview.as_ref());
 							model.restore_log_after_paste();
 							model.pending_focus =
@@ -4899,6 +5198,10 @@ impl WorkbenchModel {
 			return;
 		}
 		let was_loading = self.paste.is_loading();
+		if let Some(token) = self.paste_diff_cancel.take() {
+			token.cancel();
+		}
+		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
 		self.paste.invalidate_job();
 		if self.paste.plan().is_none() && !was_loading {
 			return;
@@ -5577,6 +5880,51 @@ mod tests {
 			let (model, cx) = cx.add_window_view(|_, cx| {
 				WorkbenchModel::new(Some(ws), restore_dir, "normal".into(), cx)
 			});
+			cx.run_until_parked();
+			cx.update(|window, cx| {
+				window.focus(&model.read(cx).focus_handle.clone())
+			});
+			(model, cx)
+		}
+
+		fn open_sized(
+			cx: &mut TestAppContext,
+			ws: PathBuf,
+			restore_dir: Option<PathBuf>,
+			w: f32,
+			h: f32,
+		) -> (Entity<WorkbenchModel>, &mut VisualTestContext) {
+			use gpui::AppContext;
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let bounds = gpui::Bounds::new(
+				gpui::Point::default(),
+				gpui::size(gpui::px(w), gpui::px(h)),
+			);
+			let (model, window) = cx.update(|cx| {
+				let window = cx
+					.open_window(
+						gpui::WindowOptions {
+							window_bounds: Some(gpui::WindowBounds::Windowed(
+								bounds,
+							)),
+							..Default::default()
+						},
+						|_, cx| {
+							cx.new(|cx| {
+								WorkbenchModel::new(
+									Some(ws),
+									restore_dir,
+									"normal".into(),
+									cx,
+								)
+							})
+						},
+					)
+					.unwrap();
+				let model = window.root(cx).unwrap();
+				(model, window)
+			});
+			let cx = VisualTestContext::from_window(*window, cx).into_mut();
 			cx.run_until_parked();
 			cx.update(|window, cx| {
 				window.focus(&model.read(cx).focus_handle.clone())
@@ -8522,6 +8870,73 @@ mod tests {
 				fs::read_to_string(shared.join("beta/y.txt")).unwrap(),
 				"y"
 			);
+		}
+
+		#[gpui::test]
+		fn remote_paste_preview_shows_diff_for_overwritten_file(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("init.txt"), "hello remote\nline2\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: init.txt\nnew remote\nline2\n",
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let has_diff = model.read_with(cx, |m, _| {
+					m.paste.detail().is_some_and(|d| d.is_diff)
+				});
+				if has_diff {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert!(plan.remote.is_some());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(
+					detail.is_diff,
+					"remote overwritable file must show diff"
+				);
+				assert!(detail.text.contains("-hello remote"));
+				assert!(detail.text.contains("+new remote"));
+			});
 		}
 
 		#[gpui::test]
@@ -11595,6 +12010,138 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn paste_preview_shows_diff_for_overwritten_file(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			fs::write(dest.join("target.txt"), "line1\nold line\nline3\n")
+				.unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: target.txt\nline1\nnew line\nline3\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.items.len(), 1);
+				let item = &plan.items[0];
+				assert!(item.overwritable());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(detail.is_diff, "expected diff preview");
+				assert!(detail.notice.is_none());
+				assert!(
+					detail.text.contains("-old line"),
+					"expected old line in diff: {}",
+					detail.text
+				);
+				assert!(
+					detail.text.contains("+new line"),
+					"expected new line in diff: {}",
+					detail.text
+				);
+				assert_eq!(m.reader.diff_mode, crate::reader::DiffMode::Inline);
+			});
+			// Toggle to side-by-side and back via btn-diff-mode
+			click(cx, "btn-diff-mode");
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.reader.diff_mode,
+					crate::reader::DiffMode::SideBySide
+				);
+			});
+			click(cx, "btn-diff-mode");
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.reader.diff_mode, crate::reader::DiffMode::Inline);
+			});
+		}
+
+		#[gpui::test]
+		fn paste_preview_identical_destination_shows_source_with_same_notice(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			fs::write(dest.join("same.txt"), "exact content").unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: same.txt\nexact content\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.items.len(), 1);
+				assert!(plan.items[0].overwritable());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(
+					!detail.is_diff,
+					"identical file must show source view"
+				);
+				assert_eq!(detail.text.as_ref(), "exact content");
+				let notice = detail.notice.as_ref().expect("notice present");
+				assert_eq!(notice, crate::i18n::t("paste_diff_same", m.locale));
+			});
+		}
+
+		#[gpui::test]
+		fn paste_preview_selecting_another_row_before_read_finishes_drops_first_diff(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			// Only b.txt exists in dest
+			fs::write(dest.join("b.txt"), "old b\n").unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			// Three files: a.txt (fresh), b.txt (overwrites), c.txt (fresh)
+			paste(
+				&model,
+				cx,
+				"// FILE: a.txt\nfresh a\n// FILE: b.txt\nnew b\n// FILE: c.txt\nfresh c\n",
+			);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.selected_item_idx, 0);
+				assert!(!m.paste.detail().unwrap().is_diff);
+			});
+
+			// Delay background read by 300ms
+			model.update(cx, |m, _| {
+				m.e2e_read_delay = Some(Duration::from_millis(300));
+			});
+			let b1 = cx.debug_bounds("paste-row:1:b.txt").unwrap();
+			let b2 = cx.debug_bounds("paste-row:2:c.txt").unwrap();
+			// Click row 1 (starts slow read) then immediately row 2 before row 1 finishes
+			cx.simulate_click(b1.center(), gpui::Modifiers::none());
+			cx.simulate_click(b2.center(), gpui::Modifiers::none());
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.selected_item_idx, 2);
+				let detail = m.paste.detail().expect("detail present");
+				assert!(!detail.is_diff);
+				assert_eq!(detail.text.as_ref(), "fresh c");
+			});
+
+			// Drain all background work including row 1's delayed read
+			settle(cx);
+
+			// Row 2 is still showing fresh c, row 1's diff was discarded
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.selected_item_idx, 2);
+				let detail = m.paste.detail().expect("detail present");
+				assert_eq!(detail.path.as_deref(), Some("c.txt"));
+				assert!(
+					!detail.is_diff,
+					"row 2 must not be replaced by row 1 diff"
+				);
+				assert_eq!(detail.text.as_ref(), "fresh c");
+			});
+		}
+
+		#[gpui::test]
 		fn shift_range_selects_first_parent_chain_excluding_side(
 			cx: &mut TestAppContext,
 		) {
@@ -12644,6 +13191,410 @@ mod tests {
 			assert_eq!(
 				cx.read_from_clipboard().and_then(|i| i.text()),
 				Some("find_something".to_string())
+			);
+		}
+
+		/// A long error toast wraps inside the card and never overflows the window.
+		#[gpui::test]
+		fn long_error_toast_wraps_inside_card_in_narrow_window(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let win_w = 480.;
+			let win_h = 400.;
+			cx.simulate_resize(gpui::size(gpui::px(win_w), gpui::px(win_h)));
+			let long_error = "commits are not contiguous: following first parents back from 0123456789abcdef0123456789abcdef01234567, 89abcdef0123456789abcdef0123456789abcdef01";
+			model.update(cx, |m, cx| {
+				m.show_toast(
+					false,
+					crate::i18n::Msg::new(
+						"paste_err_plan",
+						[long_error.to_string()],
+					),
+					cx,
+				);
+			});
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+			let toast =
+				cx.debug_bounds("copy-toast").expect("copy-toast drawn");
+			let left = f32::from(toast.origin.x);
+			let right = left + f32::from(toast.size.width);
+			let height = f32::from(toast.size.height);
+			assert!(left >= 0., "toast left off-screen: {left}");
+			assert!(
+				right <= win_w,
+				"toast right exceeds window width: {right} > {win_w}"
+			);
+			assert!(
+				height > 40.,
+				"toast should wrap to more than one line: height={height}"
+			);
+		}
+
+		fn bounds_intersect(
+			a: gpui::Bounds<gpui::Pixels>,
+			b: gpui::Bounds<gpui::Pixels>,
+		) -> bool {
+			let a_left = f32::from(a.origin.x);
+			let a_right = a_left + f32::from(a.size.width);
+			let a_top = f32::from(a.origin.y);
+			let a_bottom = a_top + f32::from(a.size.height);
+
+			let b_left = f32::from(b.origin.x);
+			let b_right = b_left + f32::from(b.size.width);
+			let b_top = f32::from(b.origin.y);
+			let b_bottom = b_top + f32::from(b.size.height);
+
+			a_left < b_right
+				&& a_right > b_left
+				&& a_top < b_bottom
+				&& a_bottom > b_top
+		}
+
+		fn assert_no_filter_chips_intersect_actions(
+			cx: &mut VisualTestContext,
+		) {
+			let visible_chips = [
+				"log-filter-repo",
+				"log-filter-paths",
+				"log-filter-branch",
+				"log-filter-user",
+				"log-filter-date",
+				"log-filter-more",
+			];
+			let action_buttons = [
+				"btn-log-refresh",
+				"btn-head",
+				"btn-compare",
+				"btn-copy-commits",
+			];
+			for chip_id in visible_chips {
+				if let Some(chip_b) = cx.debug_bounds(chip_id) {
+					for btn_id in action_buttons {
+						if let Some(btn_b) = cx.debug_bounds(btn_id) {
+							assert!(
+								!bounds_intersect(chip_b, btn_b),
+								"chip {chip_id} intersects button {btn_id}: chip={chip_b:?}, btn={btn_b:?}"
+							);
+						}
+					}
+				}
+			}
+		}
+
+		/// At narrow window width (900x600), overflowing log filter chips do
+		/// not overlap action buttons; the overflow chip lists hidden filters,
+		/// and clicking the User item opens the User menu without triggering refresh.
+		#[gpui::test]
+		fn log_filter_narrow_window_overflow_and_user_menu(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				});
+				if ready {
+					break;
+				}
+			}
+			for _ in 0..3 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			let more_b = cx
+				.debug_bounds("log-filter-more")
+				.expect("log-filter-more drawn at 900w");
+
+			// User and Date chips must not be directly visible at narrow width
+			assert!(
+				cx.debug_bounds("log-filter-user").is_none(),
+				"user chip should be hidden into overflow at narrow width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-date").is_none(),
+				"date chip should be hidden into overflow at narrow width"
+			);
+
+			// No visible chip intersects refresh or any other action button
+			assert_no_filter_chips_intersect_actions(cx);
+
+			// Click overflow chip to reveal hidden filters
+			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
+			settle(cx);
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			// User item should now be present in the overflow menu
+			let user_item_b = cx
+				.debug_bounds("log-filter-more:user")
+				.expect("User item in overflow menu");
+			cx.simulate_click(user_item_b.center(), gpui::Modifiers::none());
+			settle(cx);
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			// Verify User menu is now open, and refresh was not triggered
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.log_menu,
+					Some(crate::ui::LogMenu::User),
+					"User menu should be open"
+				);
+			});
+		}
+
+		/// At a wide width all four filter chips render and no overflow chip exists.
+		#[gpui::test]
+		fn log_filter_wide_window_shows_all_chips_and_no_overflow(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(752.)));
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			for _ in 0..3 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			assert!(
+				cx.debug_bounds("log-filter-more").is_none(),
+				"overflow chip should not exist at wide width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-paths").is_some()
+					|| cx.debug_bounds("log-filter-repo").is_some(),
+				"repo/paths chip should exist at wide width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-branch").is_some(),
+				"branch chip should exist at wide width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-user").is_some(),
+				"user chip should exist at wide width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-date").is_some(),
+				"date chip should exist at wide width"
+			);
+		}
+
+		/// At a narrow window width with widened details pane and an active long user filter,
+		/// no filter chip intersects action buttons and user filter is reachable.
+		#[gpui::test]
+		fn log_filter_narrow_window_widened_details_and_long_user_filter(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				m.log_details_w = 400.;
+				m.log_filter.author =
+					Some("very.long.contributor.name@example.com".to_string());
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				});
+				if ready {
+					break;
+				}
+			}
+			for _ in 0..3 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			assert_no_filter_chips_intersect_actions(cx);
+
+			if let Some(user_b) = cx.debug_bounds("log-filter-user") {
+				cx.simulate_click(user_b.center(), gpui::Modifiers::none());
+			} else {
+				let more_b = cx
+					.debug_bounds("log-filter-more")
+					.expect("more chip must exist when user chip is hidden");
+				cx.simulate_click(more_b.center(), gpui::Modifiers::none());
+				settle(cx);
+				for _ in 0..2 {
+					cx.update(|window, _| window.refresh());
+					settle(cx);
+				}
+				let user_item_b = cx
+					.debug_bounds("log-filter-more:user")
+					.expect("User item in overflow menu");
+				cx.simulate_click(
+					user_item_b.center(),
+					gpui::Modifiers::none(),
+				);
+			}
+			settle(cx);
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.log_menu,
+					Some(crate::ui::LogMenu::User),
+					"User menu should be open"
+				);
+			});
+		}
+
+		/// At a narrow window width in English locale, no filter chip intersects action buttons.
+		#[gpui::test]
+		fn log_filter_narrow_window_english_locale(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			model.update(cx, |m, cx| {
+				m.locale = crate::i18n::Locale::En;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				});
+				if ready {
+					break;
+				}
+			}
+			for _ in 0..3 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			assert_no_filter_chips_intersect_actions(cx);
+
+			let more_b = cx
+				.debug_bounds("log-filter-more")
+				.expect("more chip must exist at 900w English");
+			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
+			settle(cx);
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+			let user_item_b = cx
+				.debug_bounds("log-filter-more:user")
+				.expect("User item in overflow menu");
+			cx.simulate_click(user_item_b.center(), gpui::Modifiers::none());
+			settle(cx);
+			for _ in 0..2 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.log_menu,
+					Some(crate::ui::LogMenu::User),
+					"User menu should be open"
+				);
+			});
+		}
+
+		/// At a wide window width with branches and details panes hidden, all four chips
+		/// are visible and no overflow chip exists.
+		#[gpui::test]
+		fn log_filter_wide_window_hidden_panes_shows_all_chips(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1200., 752.);
+			model.update(cx, |m, cx| {
+				m.log_branches_visible = false;
+				m.log_details_visible = false;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			for _ in 0..3 {
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+
+			assert!(
+				cx.debug_bounds("log-filter-more").is_none(),
+				"overflow chip should not exist when all fit"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-paths").is_some()
+					|| cx.debug_bounds("log-filter-repo").is_some(),
+				"repo/paths chip should exist"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-branch").is_some(),
+				"branch chip should exist"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-user").is_some(),
+				"user chip should exist"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-date").is_some(),
+				"date chip should exist"
 			);
 		}
 	}

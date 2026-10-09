@@ -58,8 +58,8 @@ use changes::*;
 pub(crate) use changes::{
 	change_rows, commit_file_rows, ChangeItemRow, ChangeLayout, UNREADABLE,
 };
-pub use log::LogMenu;
 use log::*;
+pub use log::{LogFilterLayout, LogMenu};
 
 // ───────────────────────── E2E probes (opt-in) ─────────────────────────
 
@@ -1316,6 +1316,9 @@ impl Render for WorkbenchModel {
 		}
 		let vp = window.viewport_size();
 		let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
+		if self.log_width.get() == 0.0 && vw > 0.0 {
+			self.log_width.set((vw - 32.0).max(0.0));
+		}
 		let s = window.scale_factor();
 		let phys = ((vw * s).round() as i32, (vh * s).round() as i32);
 		self.viewport_h = vh;
@@ -1602,6 +1605,7 @@ impl WorkbenchModel {
 				.bottom(px(STATUS_H + 16.))
 				.left_0()
 				.right_0()
+				.px(px(16.))
 				.flex()
 				.justify_center()
 				.child(
@@ -1609,10 +1613,12 @@ impl WorkbenchModel {
 					// rows under it.
 					div()
 						.id("copy-toast")
+						.debug_selector(|| "copy-toast".into())
 						.flex()
 						.flex_row()
 						.items_center()
 						.gap(px(10.))
+						.min_w_0()
 						.max_w(px(640.))
 						.px(px(16.))
 						.py(px(10.))
@@ -1624,8 +1630,14 @@ impl WorkbenchModel {
 						.shadow_lg()
 						.text_size(px(UI_TEXT))
 						.text_color(rgb(pal().text))
-						.child(icon(glyph, 18.))
-						.child(msg.render(self.locale))
+						.child(div().flex_shrink_0().child(icon(glyph, 18.)))
+						.child(
+							div()
+								.flex_1()
+								.min_w_0()
+								.line_clamp(6)
+								.child(msg.render(self.locale)),
+						)
 						.children(probe(&self.probes, "copy-toast")),
 				)
 				.into_any_element(),

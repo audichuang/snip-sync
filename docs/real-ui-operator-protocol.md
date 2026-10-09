@@ -174,6 +174,7 @@ ID 以受測 binary 印出的為準。下面是 `ed3d057`（develop）的名字�
 | log 顯示 | `btn-log-more` → `log-more:hash`（hash 欄，預設關）。日誌 `[APP:LOG_VIEW: hash]` |
 | 多 repo 篩選 | `log-filter-repo`、`log-repo:<名稱>`、`log-repo-check:<名稱>` |
 | 單一 repo 工作區的路徑篩選 | `log-filter-paths`。多 repo 工作區不要去點這個 ID |
+| log 篩選 chip | 分支 `log-filter-branch`、使用者 `log-filter-user`、日期 `log-filter-date`。窄視窗（如 900×600）寬度不足時，容納不下的 chip 會收合至溢位 chip `log-filter-more`，點擊後於選單展開隱藏項 `log-filter-more:<key>`（如 `log-filter-more:user`、`log-filter-more:date`）開啟對應篩選選單 |
 | 歷史檔案 | `btn-browse-tree:<完整 SHA>`、`rev-row:<path>`、`btn-leave-tree`。檔案列右鍵「複製」複製該檔在這個 commit 的內容；資料夾列的「複製」是停用的 |
 | Git log 變更檔案 | `commit-file:<path>`、`commit-dir:<path>`。資料夾列的選取 key 是 `<path>/`。左鍵資料夾是展開或收合；複製用右鍵 |
 | 貼上 | `btn-apply`、`btn-cancel`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`（`ix` 是計畫內的項目索引，由 `crate::paste::control_id` 產生）、`paste-items` |
@@ -324,7 +325,7 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T02 | 貼上時先不選 `paste-map-pick`，再選一次 | 未選時 `PASTE_PREVIEW` 的 `mapping=false`；點 `btn-apply` 後 1 秒內沒有任何新的 `PASTE_*` 行（按鈕停用，tooltip 是「請先為每個來源前綴選擇目的地…」）；按 Enter 得到 `[APP:PASTE_ERR: mapping_required]`；點 `paste-map-pick:<prefix>:<idx>` 後出現 `[APP:PASTE_MAPPED: prefix=… dest=<絕對路徑> items=N]`，絕對路徑正確 |
 | T03 | repo01 與 repo03 的 `unrelated.txt` 各點 `paste-overwrite:<ix>:<path>` | 兩個不同 ID，兩次 `[APP:PASTE_TOGGLED]` 的 idx 分別等於所點 ID 的 `ix` 段；套用後覆寫 2、跳過 0，兩邊位元組分別是 `from-repo01` 與 `from-repo03`。身份規則見本節末 |
 | T04 | repo02／repo05 的 `only-src.txt` 與 repo06／repo07 的 `shared.txt` | 建立 2、覆寫 2；其餘 repo 的 HEAD 與 status 不變 |
-| T05 | `files-src` 的 staged 新增、修改、刪除、rename，複製後貼到新鮮的 `files-dst`。預覽裡勾選 `both.txt` 的 `paste-overwrite:<ix>:both.txt` | payload 含 `[NEW] staged-new.txt`、`[MODIFIED] both.txt`（內容 `index-body`）、`[DELETED] gone.txt`、`[MOVED] new-name.txt`。沒有舊路徑的刪除項。貼上後建立 2、覆寫 1、刪除 1、跳過 0：建立 `staged-new.txt` 與 `new-name.txt`、覆寫 `both.txt` 為 `index-body`、刪除 `gone.txt`。`old-name.txt` 仍是 `old-dest`。沒勾 `both.txt` 的覆寫時，結果是跳過 1，這一格不能算過 |
+| T05 | `files-src` 的 staged 新增、修改、刪除、rename，複製後貼到新鮮的 `files-dst`。預覽裡勾選 `both.txt` 的 `paste-overwrite:<ix>:both.txt` | payload 含 `[NEW] staged-new.txt`、`[MODIFIED] both.txt`（內容 `index-body`）、`[DELETED] gone.txt`、`[MOVED] new-name.txt`。沒有舊路徑的刪除項。選取 `both.txt` 列時出現 `[APP:PASTE_DIFF: idx=<ix> state=diff]`，詳情區顯示 diff 視圖（目標檔目前內容 ↔ 剪貼簿內容）與 `btn-diff-mode` 切換按鈕；貼上後建立 2、覆寫 1、刪除 1、跳過 0：建立 `staged-new.txt` 與 `new-name.txt`、覆寫 `both.txt` 為 `index-body`、刪除 `gone.txt`。`old-name.txt` 仍是 `old-dest`。沒勾 `both.txt` 的覆寫時，結果是跳過 1，這一格不能算過 |
 | T06 | 同一路徑 `both.txt` 分別從變更列（index）與 Project（worktree）複製 | 兩次 payload 的位元組分別等於 index 的 `index-body` 與 worktree 的 `worktree-body` |
 | T07 | 複製 `folder/`。這個資料夾有 7 個檔：`a.txt`–`e.txt`、`bin.dat`、`utf16.txt`。`large.txt` 不在裡面 | 通知是已複製 5、略過 2。略過的是 `bin.dat` 與 `utf16.txt`。目的端建立 `a.txt`–`e.txt`；`folder/utf16.txt` 仍是 `keep-utf16`；不建立 `folder/bin.dat` |
 | T08 | 複製來源的 `binary.dat` 與 `folder/utf16.txt`，貼到新鮮的 `files-dst` | payload 沒有這兩個檔的可還原內容。`files-dst/binary.dat` 仍是 `keep-bin`，`files-dst/folder/utf16.txt` 仍是 `keep-utf16` |
@@ -388,7 +389,7 @@ commit 預覽與鍵盤的格子，對應 #58 與 #57。除非該格另有說明�
 | ID | 點什麼 | 通過線 |
 |---|---|---|
 | C-group | 開 T19 的預覽（`commits-dst-clean`） | `paste-commit-count` 是「3 個 commit」；`paste-commit:0`、`paste-commit:1`、`paste-commit:2` 依重播順序，文字依序是「#1 多行中文 QA Operator <qa@example.com> 2026-03-02 09:00 1 個檔案，0 個不寫入」、「#2 C2 rename delete emoji … 2026-03-03 09:00 6 個檔案，3 個不寫入」、「#3 C3 merge … 2026-03-05 09:00 1 個檔案，0 個不寫入」。標頭 tooltip 是完整 message 加作者加 ISO 時間。點 `paste-commit:1` 後出現 `[APP:PASTE_COMMIT_TOGGLED: idx=1]`，畫面上 C2 的 6 列消失，日誌有 6 行 `[APP:CTRL_GONE: id=paste-row:1:binary.dat]` … `[APP:CTRL_GONE: id=paste-row:6:new.txt]`，以及對應的 `paste-include:1:…`–`paste-include:6:…` 的 `CTRL_GONE`（`paste-row` 的完整 ID 抄自 `CTRL_BOUNDS`）；再點一次列回來，這 6 個 ID 各有新的 `CTRL_BOUNDS`。只有「沒有新的 `CTRL_BOUNDS`」不算證據。摘要是建立 5、覆寫 0/0、刪除 0、跳過 3。T18 在 `commits-dst-overwrite` 上的 C2 標頭同樣是「6 個檔案，3 個不寫入」 |
-| C-detail | T18 的預覽，點 `paste-row:0:common.txt` | `[APP:PASTE_NAV: idx=0]`；詳情標題是「common.txt → <目的端絕對路徑>」，內容以「commit: 多行中文」開頭。規格 4.3 寫「每個 commit 可展開看檔案清單與 diff」，規格 3.2 寫覆寫檔可看 diff（目前的目標檔 ↔ 剪貼簿內容）。畫面上有沒有 diff，照實寫進證據欄；沒有 diff 記成規格落差（第 9 節），不判這格 `fail` |
+| C-detail | T18 的預覽，點 `paste-row:0:common.txt` | `[APP:PASTE_NAV: idx=0]`；詳情標題是「common.txt → <目的端絕對路徑>」，內容以「commit: 多行中文」開頭。commit 重播列目前維持來源內容檢視，規格 4.3 的 commit 模式 diff 維持記為規格落差（第 9 節），不判這格 `fail`。檔案還原模式之覆寫列（規格 3.2）則必須顯示 diff（見 T05） |
 | C-reason | 在 T19／T22（`commits-dst-clean`）、T26、T31、T25 的預覽裡，逐列點 `paste-row:<ix>:<path>` | 每次出現 `[APP:PASTE_NAV: idx=<ix>]`，詳情列依序是：二進位（T26 的 `new-binary.bin`、T25 的 `binary.dat`）「未複製：二進位檔，不寫入也不刪除」；版面衝突拒絕（T31 的 `newdir/content.txt`）「整個 commit 會被拒絕：父目錄被檔案佔住」；目的端不存在的刪除（只在 T19／T22 的預覽有，`commits-dst-clean` 的 `old.txt`、`gone.txt`；T25 在 `commits-dst-present` 上同一列是「刪除」）「目的地不存在，無需刪除」。每一列的詳情都不是「此檔案不會寫入」（`reason_skip_generic`）這句泛用話。目的端不存在的刪除列被選取時，下方不顯示紅色區塊「將刪除目的地檔案，不寫入內容」（`reason_delete`）；若出現紅色區塊則視為回歸，判 `ui-defect` |
 | C-nonutf8 | 開 `nonutf8-src`，選 N1、N2 複製，貼到 `nonutf8-dst`（先做這段）。再用 `commits-src` 的 C1，貼到 `nonutf8-dst`，只看預覽，Escape 取消（後做這段） | 前段預覽：N1 標頭「2 個檔案，1 個不寫入」、N2 標頭「1 個檔案，1 個不寫入」；`latin1.txt` 兩列的詳情是「未複製：非 UTF-8 編碼，不寫入也不刪除」，`ok.txt` 是「建立」。複製通知含「2 個檔案未複製」，並列出「#1 latin1.txt」與「#2 latin1.txt」。Apply：`PASTE_DONE created=2 … commits=2`；`latin1.txt` 位元組仍是 `caf` `e9` 換行；`ok.txt` 已建立。後段預覽：`common.txt` 列是「跳過」，詳情「目的地現有檔案不是 UTF-8，不覆寫」；Escape 得到 `[APP:PASTE_CANCELLED]`，`common.txt` 位元組不變、HEAD 不變 |
 | C-blocked | 開 `blocked-src`，複製 `B1 blocked dir and fresh`，貼到 `ws-dst/repo04` | 預覽：標頭帶「 (整個 commit 會被拒絕)」，「2 個檔案，0 個不寫入」；摘要「1 個 commit（1 個被拒絕）」；紅色橫幅「第 1 個 commit「B1 blocked dir and fresh」會被拒絕，重播將在此停止」；`fresh.txt`「建立」，`newdir/x.txt`「拒絕」，詳情「整個 commit 會被拒絕：父目錄被檔案佔住」。Apply：`[APP:PASTE_STALE_DETECTED: commit_replay_refused]`，沒有 `PASTE_DONE`，橫幅「沒有建立任何 commit；第 1 個 commit「B1 blocked dir and fresh」被拒絕：父目錄被檔案佔住」；`fresh.txt` 不存在；HEAD、status 不變。整筆拒絕是規格 4.3 的要求，也證明 #57 commit 說明的「其他檔照常貼上」不成立。判定規則同 T31 的 (a)(b)(c)；本分支（fix/ui-qa-84c71e5）合入 develop 之後的版本預期 `pass`，`ed3d057` 上是 `ui-defect`。T31 與這格都不寫入，`repo04` 可連續做 |
@@ -435,7 +436,7 @@ Windows 與 Linux 的真實輸入、IME、跨機剪貼簿、與 ClipCode 的實�
 規格落差另外記在 `scorecard.md` 末尾，不算判定：
 
 - 規格 4.1 寫 log 每頁 300 筆；程式是單一 repo `history_page_size` 50、多 repo feed `FEED_PAGE` 50。T34 依程式寫 50。
-- 規格 4.3 與 3.2 的 diff：C-detail 看到沒有 diff 時記在這裡。
+- 規格 4.3 的 commit 模式 diff：commit 重播列目前不顯示 diff，C-detail 的 commit 列無 diff 記在這裡（規格 3.2 的檔案模式覆寫 diff 已支援並由 T05 檢核）。
 - 預覽的版面衝突列（父目錄被檔案佔住等）現在標為「拒絕」並說整個 commit 會被拒；路徑規則不安全（如 `../x`）仍是一般「跳過」。CLI 的 `--dry-run` 對被拒的 commit 不計入「would be created」。
 
 檔案模式和 IDE 套件的逐位元組契約由 `fixtures/clipboard-contract.json` 與 core／CLI 測試負責。本規程不重跑那一套。
