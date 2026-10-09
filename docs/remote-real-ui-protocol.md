@@ -46,6 +46,10 @@ just remote-e2e-ssh ubuntu
 
 最後一行必須是 `== N passed, 0 failed`，結束碼 0。這一步確認編譯、ssh 金鑰登入、worker 啟動、複製與貼上的位元組比對都正常。**沒過就不開始點 GUI**，計分表全部寫 `not-run`，證據欄寫「第 0 步閘門失敗」並附上輸出。
 
+`just remote-e2e-ssh ubuntu` 也涵蓋只有真 sshd 才看得到的情況：解除 `SNIP_REMOTE_EXEC`、由產品自己組 ssh 命令並經它的後備路徑找到 worker；連不到的主機名稱；金鑰被拒時的提示；master 在請求中途被殺後 worker 不留孤兒程序。通過時寫 `target/remote-e2e-ssh-receipt.json`（commit、主機、通過數），`just release` 沒有目前 HEAD 的通過收據就拒絕發版。
+
+Mac 端的準備、啟動、縮放、座標換算與收尾用 `scripts/real_ui_round.py`（見 [real-ui-operator-protocol.md](real-ui-operator-protocol.md) 第 2 節）；`prepare --remote ubuntu` 另做 Ubuntu 端的準備。腳本與本節不一致時，以本節為準並在報告寫出差異。點擊前同樣檢查 `CTRL_COVERED`／`CTRL_DUPLICATE`，規則同本機規程第 3 節。
+
 ### 2.2 本輪目錄與 Mac 端建置
 
 ```bash

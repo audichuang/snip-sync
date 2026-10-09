@@ -55,6 +55,18 @@ T31 與 C-blocked 照各自的通過線判定，沒有「預期 `ui-defect`」�
 
 ## 2. 開跑
 
+在 macOS 上用 `scripts/real_ui_round.py` 做本節與收尾，不要手工拼環境（之前幾輪因為縮放、`.app`、未隔離的設定與上一輪殘留整輪作廢）：
+
+```text
+python3 scripts/real_ui_round.py prepare --sha <SHA> --run "$RUN"   # 殘留檢查、worktree 建置、.app、三組 fixture、空的 config、真實設定快照、存剪貼簿、environment.json
+python3 scripts/real_ui_round.py launch --gate b --run "$RUN"       # 帶隔離環境變數啟動，日誌寫進 $RUN/app-gate-b.log
+python3 scripts/real_ui_round.py resize 900 600 --run "$RUN"        # 依程序與視窗標題縮放，等到 VIEWPORT 相符；不符就失敗
+python3 scripts/real_ui_round.py point <控制項 ID> --run "$RUN"      # 第 3 節第 1–4 步：最新 CTRL_BOUNDS、換算螢幕點、action.json 草稿
+python3 scripts/real_ui_round.py finish --run "$RUN"                # Cmd+Q、exit code、殘留、剪貼簿還原、真實設定比對（I-config）、移除 worktree
+```
+
+`prepare` 發現殘留時拒絕開跑並列出來；`--clean-leftovers` 只清能證明屬於先前回合的東西。腳本做不到的步驟照下面的手動流程做，並在證據裡寫明。下面的手動流程也是腳本的規格。
+
 1. 向派工的人確認受測 SHA。沒有另外指定時，用 `origin/develop`。
 2. 在乾淨的 worktree 或 checkout 上建置。不要拿別的分支的 `target/` 混用。
 
@@ -200,6 +212,11 @@ ID 整段相等。`paste-overwrite:0:common.txt` 不能拿去點 `paste-overwrit
 5. 點完之後必須有一行新日誌，而且裡頭的 idx、path、prefix 或 SHA 就是這一格。點下去之前就存在的日誌不算。例外：按停用的按鈕（例如對應還沒選完時的 `btn-apply`），通過線就是「1 秒內沒有任何新的 `PASTE_*` 行」。hover 看 tooltip 不算點擊；座標取所屬列的 `CTRL_BOUNDS`。另一個例外：下列點擊本來就不印日誌，改用該格寫的畫面轉錄或下一步的日誌判定：`log-branch-group:<key>`（展開分支群組）、`commit-file:` 的 Cmd 點與 Shift 點、為了取得焦點點一下 `reader`。
 6. 捲動之後矩形會變。捲完再讀一次 bounds，用新的中心點重算螢幕點。
 7. 然後才跑該格的剪貼簿與 Git／檔案 oracle。
+
+`CTRL_BOUNDS` 是控制項真正看得到的部分（已扣掉被父容器裁掉的範圍）；整個被裁掉時是 `CTRL_GONE`。視窗寬度至少 700 時，App 還會稽核每一幀：
+
+- `[APP:CTRL_COVERED: id=<A> by=<B>]`：A 的可見中心被後畫的 B 蓋住，點 A 的中心會點到 B。不要點；這一格判 `ui-defect`，證據欄寫 `covered A by B`。若已經點了而觸發 B 的動作，判 `fail`。
+- `[APP:CTRL_DUPLICATE: id=<ID>]`：同一幀有兩個控制項用同一個 ID。涉及這個 ID 的格子判 `fail`，證據欄寫 `identity-fail`。
 
 macOS 輔助使用在這個 App 上只到視窗。沒有 `CTRL_BOUNDS` 的點擊，不能記 `pass`。
 
