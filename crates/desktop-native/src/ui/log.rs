@@ -803,6 +803,17 @@ impl WorkbenchModel {
 			} else {
 				icon(Icon::ChevronDown, 12.).into_any_element()
 			})
+			// A drawn chip reports its real width; text estimates are off by
+			// a few pixels where the font falls back (CJK on Linux).
+			.child({
+				let cell = self.log_filter_layout.chip_width_cell(menu).clone();
+				canvas(
+					move |b, _, _| cell.set(f32::from(b.size.width)),
+					|_, _, _, _| {},
+				)
+				.absolute()
+				.size_full()
+			})
 			.when(open, |d| d.child(self.log_menu_panel(menu, cx)))
 			.children(probe(log, id))
 			.into_any_element()
@@ -870,13 +881,19 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
-	/// Sets every filter chip's width from its text, laid out as
-	/// `log_chip` and `log_chip_more` draw it. A hidden chip is never drawn,
-	/// so it cannot be measured after layout; its text width stays exact.
+	/// Estimates the width of each chip the last frame did not draw from its
+	/// text, laid out as `log_chip` and `log_chip_more` draw it. A hidden
+	/// chip cannot be measured after layout, so without this it would keep
+	/// a stale or guessed width; a drawn chip keeps its measured one.
 	pub(super) fn measure_log_chips(&self, window: &Window) {
 		let loc = self.locale;
 		let layout = &self.log_filter_layout;
-		for menu in ALL_LOG_FILTER_MENUS {
+		let drawn = layout.last_mask.get();
+		for (i, menu) in ALL_LOG_FILTER_MENUS.into_iter().enumerate() {
+			if drawn & (1 << i) != 0 && layout.chip_width_cell(menu).get() > 0.
+			{
+				continue;
+			}
 			let (label, value) = self.log_menu_value(menu, loc);
 			let text = match &value {
 				Some(v) => format!("{label}: {v}"),
