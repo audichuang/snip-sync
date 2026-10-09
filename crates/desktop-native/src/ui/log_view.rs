@@ -111,6 +111,9 @@ impl WorkbenchModel {
 			.items_center()
 			.flex_shrink_0()
 			.h(px(34.))
+			// Far below 900 wide the last actions are cut at the column's
+			// edge rather than drawn over the details pane.
+			.overflow_hidden()
 			.px(px(6.))
 			.gap(px(4.))
 			.border_b_1()
@@ -164,6 +167,13 @@ impl WorkbenchModel {
 			// Chips give way first on a narrow window; the actions stay.
 			.child({
 				let (visible_menus, hidden_menus) = self.log_filter_split();
+				// The overflow chip always stays reachable: on a very narrow
+				// window the search box gives way to it (down to its 96px).
+				let floor = if hidden_menus.is_empty() {
+					0.
+				} else {
+					self.log_filter_layout.more_effective_w() + 9.
+				};
 				let mut chips = div()
 					.relative()
 					.flex()
@@ -171,7 +181,7 @@ impl WorkbenchModel {
 					.items_center()
 					.gap(px(4.))
 					.flex_1()
-					.min_w_0()
+					.min_w(px(floor))
 					.overflow_hidden();
 				for menu in visible_menus {
 					let (label, value) = self.log_menu_value(menu, loc);
