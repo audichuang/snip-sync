@@ -1224,9 +1224,22 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	// With the Repository chip active, 1080×720 leaves no room for every
 	// chip: one that does not fit sits in the overflow chip, and the user
 	// reaches it there. Its clear button moves there with it.
+	// Polls, bounded: the frame that places a chip can land late on a
+	// slow machine, and a wrong "not drawn" would open the overflow chip
+	// for a clear button that only exists on the bar.
 	let drawn = |id: &str| {
-		std::thread::sleep(Duration::from_millis(250));
-		snip_native_e2e::lookup_bounds(&bounds.lock().unwrap(), id).is_some()
+		let deadline = Instant::now() + scaled(Duration::from_secs(2));
+		loop {
+			std::thread::sleep(Duration::from_millis(100));
+			if snip_native_e2e::lookup_bounds(&bounds.lock().unwrap(), id)
+				.is_some()
+			{
+				return true;
+			}
+			if Instant::now() >= deadline {
+				return false;
+			}
+		}
 	};
 	let via_overflow = |id: &str, hidden: &str| {
 		if drawn(id) {
