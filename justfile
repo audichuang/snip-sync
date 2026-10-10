@@ -67,10 +67,11 @@ preflight-workflows:
 	@command -v shellcheck >/dev/null || { echo "shellcheck not on PATH: actionlint would skip the run: scripts CI lints (pip install shellcheck-py)" >&2; exit 1; }
 	actionlint
 	@# The scripts CI's Remote E2E and container jobs lint on their own.
-	shellcheck scripts/remote_e2e.sh scripts/linux_container.sh scripts/linux-container/entrypoint.sh
+	shellcheck scripts/remote_e2e.sh scripts/linux_container.sh scripts/linux-container/entrypoint.sh scripts/check_test_refresh.sh
 
 preflight-rust:
 	cargo fmt --all --check
+	scripts/check_test_refresh.sh
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	# Same as CI's Linux Test job: one run, clipboard tests on a private display.
@@ -80,6 +81,7 @@ preflight-rust:
 # CI's Lint and Test jobs on macOS and Windows: no Xvfb, the host's own clipboard.
 preflight-host:
 	cargo fmt --all --check
+	scripts/check_test_refresh.sh
 	RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 	RUSTFLAGS="-D warnings" cargo nextest run --workspace --exclude snip-native-e2e --locked --no-fail-fast
@@ -105,7 +107,7 @@ remote-e2e-ssh host *args:
 	cargo build --release -p snip-cli --locked
 	snip=target/release/snip
 	[ -x "$snip" ] || snip=$snip.exe
-	scripts/remote_e2e.sh --snip "$snip" --worker-ssh {{host}} {{args}}
+	scripts/remote_e2e.sh --snip "$snip" --worker-ssh {{host}} --receipt target/remote-e2e-ssh-receipt.json {{args}}
 
 # Python stdlib memory harness contracts and workload generator tests.
 preflight-harness:
@@ -217,6 +219,13 @@ release version *flags:
 	ok "version $TAG validated (latest was ${LATEST:-none})"
 
 	HEAD_SHA="$(git rev-parse HEAD)"
+	RECEIPT="target/remote-e2e-ssh-receipt.json"
+	[ -f "$RECEIPT" ] || err "no SSH end-to-end receipt found at $RECEIPT; run 'just remote-e2e-ssh <host>' before releasing"
+	RECEIPT_COMMIT="$(jq -r .commit "$RECEIPT" 2>/dev/null || true)"
+	[ "$RECEIPT_COMMIT" = "$HEAD_SHA" ] || err "SSH end-to-end receipt at $RECEIPT is for ${RECEIPT_COMMIT:-unknown}, not current HEAD ($HEAD_SHA); run 'just remote-e2e-ssh <host>'"
+	[ "$(jq -r .passed "$RECEIPT" 2>/dev/null || true)" = "true" ] || err "SSH end-to-end receipt at $RECEIPT recorded a failure; run 'just remote-e2e-ssh <host>'"
+	ok "SSH end-to-end receipt validated for $HEAD_SHA (host $(jq -r .host "$RECEIPT"), $(jq -r .pass_count "$RECEIPT") checks passed)"
+
 	git push "$REMOTE" "$BRANCH"
 	info "waiting for ci.yml (push to $BRANCH) on $HEAD_SHA..."
 	CI_OK=0

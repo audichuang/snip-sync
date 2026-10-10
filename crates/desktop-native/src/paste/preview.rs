@@ -377,6 +377,26 @@ impl PastePreview {
 		}
 	}
 
+	pub fn replace_detail(
+		&mut self,
+		idx: usize,
+		detail: Preview,
+		ordinary: Option<&Preview>,
+	) -> Result<(), Msg> {
+		let Some(plan) = self.plan.as_ref() else {
+			return Err(Msg::new("paste_err_nothing", []));
+		};
+		if plan.selected_item_idx != idx {
+			return Ok(());
+		}
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		pending.admit_ui(ordinary, Some(plan), Some(&detail))?;
+		self.detail = Some(detail);
+		self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+		Ok(())
+	}
+
 	pub fn step(&mut self, forward: bool, ordinary: Option<&Preview>) -> Nav {
 		let Some(plan) = self.plan.as_ref() else {
 			return Nav::Ignored;

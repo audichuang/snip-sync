@@ -2134,6 +2134,8 @@ mod tests {
 					copied: 1,
 					chars: 0,
 					lines: 0,
+					words: 0,
+					tokens: 0,
 					skipped: 0,
 					truncated: false,
 				}),

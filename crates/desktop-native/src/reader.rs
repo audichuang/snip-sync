@@ -1422,7 +1422,7 @@ impl WorkbenchModel {
 			}
 			Err(msg) => {
 				app_log!("[APP:FOLD_REFUSED: {}]", msg.key);
-				self.status = msg;
+				self.set_status_msg(msg);
 			}
 		}
 		cx.notify();
@@ -1735,15 +1735,13 @@ impl WorkbenchModel {
 		let Some(p) = p else {
 			return div().flex_1().into_any_element();
 		};
-		let side = !paste
-			&& p.is_diff
-			&& self.reader.diff_mode == DiffMode::SideBySide;
+		let side = p.is_diff && self.reader.diff_mode == DiffMode::SideBySide;
 		let body_rows = if side {
 			p.diff.as_ref().map(|d| d.side.len()).unwrap_or(0)
 		} else {
 			p.inline_rows()
 		};
-		let tail = !paste && p.diff.as_ref().is_some_and(|d| d.trailing);
+		let tail = p.diff.as_ref().is_some_and(|d| d.trailing);
 		let rows = body_rows + usize::from(tail);
 		// Row (not line) index of the widest drawn line.
 		let widest = if side { 0 } else { p.inline_row_of(p.widest) };
@@ -2263,7 +2261,13 @@ impl gpui::UniformListDecoration for Ribbons {
 		// (first row, left rows, right rows, colour) of blocks on screen.
 		let mut blocks: Vec<(usize, u32, u32, u32)> = Vec::new();
 		if let Some(d) = self.model.upgrade().and_then(|m| {
-			m.read(cx).preview.as_ref().and_then(|p| {
+			let read = m.read(cx);
+			let p = if read.paste.plan().is_some() {
+				read.paste.detail()
+			} else {
+				read.preview.as_ref()
+			};
+			p.and_then(|p| {
 				p.diff.as_ref().map(|d| {
 					visible
 						.clone()

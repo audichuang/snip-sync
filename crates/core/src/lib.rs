@@ -16,5 +16,6 @@ pub mod paths;
 pub mod restore;
 pub mod settings;
 pub mod stats;
+pub mod textdiff;
 pub mod transfer;
 pub mod workspace;

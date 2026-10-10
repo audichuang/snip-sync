@@ -46,6 +46,10 @@ just remote-e2e-ssh ubuntu
 
 最後一行必須是 `== N passed, 0 failed`，結束碼 0。這一步確認編譯、ssh 金鑰登入、worker 啟動、複製與貼上的位元組比對都正常。**沒過就不開始點 GUI**，計分表全部寫 `not-run`，證據欄寫「第 0 步閘門失敗」並附上輸出。
 
+`just remote-e2e-ssh ubuntu` 也涵蓋只有真 sshd 才看得到的情況：解除 `SNIP_REMOTE_EXEC`、由產品自己組 ssh 命令並經它的後備路徑找到 worker；連不到的主機名稱；金鑰被拒時的提示；master 在請求中途被殺後 worker 不留孤兒程序。通過時寫 `target/remote-e2e-ssh-receipt.json`（commit、主機、通過數），`just release` 沒有目前 HEAD 的通過收據就拒絕發版。
+
+Mac 端的準備、啟動、縮放、座標換算與收尾用 `scripts/real_ui_round.py`（見 [real-ui-operator-protocol.md](real-ui-operator-protocol.md) 第 2 節）；`prepare --remote ubuntu` 另做 Ubuntu 端的準備。腳本與本節不一致時，以本節為準並在報告寫出差異。點擊前同樣檢查 `CTRL_COVERED`／`CTRL_DUPLICATE`，規則同本機規程第 3 節。
+
 ### 2.2 本輪目錄與 Mac 端建置
 
 ```bash
@@ -493,7 +497,7 @@ snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>s
 
 每格都要：`COPY_DONE`（或 `COPY_COMMITS_DONE`）。X01–X06、X09：`pbpaste \| snip_payload_list` 與 oracle 清單 `cmp` 相等，且路徑集合（`cut -f1`）與該格寫的一致。X07、X08、X10：`pbpaste \| shasum -a 256` 等於 oracle 的 SHA-256。
 
-### 4.7 遠端貼上和本機一樣（P01–P12）
+### 4.7 遠端貼上和本機一樣（P01–P13）
 
 每格先建一份目的地副本給 oracle 用：`ssh ubuntu "rm -rf '$W/oracle' && cp -a '$W/pastews' '$W/oracle'"`，oracle 是 `ssh ubuntu "cd '$W/oracle/<同一個目的地>' && snip paste --apply <同樣的旗標> --stdin" < payload`，再比較 `$W/pastews/…` 與 `$W/oracle/…` 每個檔案的 SHA-256。
 
@@ -513,6 +517,7 @@ snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>s
 | P10 | 遠端貼回本機：在 `edge` 對 `src` 資料夾右鍵 →「複製」；打開本機 `local-ws`，Cmd+V，`btn-apply` | `local-ws/src/main.rs` 與 `local-ws/src/deep/中文 有空白.txt` 的 SHA-256 等於「Ubuntu 上 `cd '$W/edge' && snip copy src --stdout` 再 `snip paste --apply --stdin` 貼進一份副本」的結果（與 worker 上的原檔比會差正規化：檔尾換行不保留，spec 第 1 節） |
 | P11 | `(cd "$RUN/paste-big" && "$SNIP" copy . --stdout) > "$RUN/p-big.txt"`，命令成功才 `pbcopy < "$RUN/p-big.txt"`（不要直接管線進 pbcopy：複製失敗也會蓋掉剪貼簿）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `PASTE_DONE`；30 個檔案與本機來源相同（App 預覽的上限本機與遠端相同，約 7 MB 以上兩邊都拒絕，見 `docs/porting-notes.md` 的 32 MiB 已接納資料上限） |
 | P12 | 遠端到遠端：在 `gitws` 複製 alpha 的 `dir` 資料夾（X08）；打開 `pastews/plain`，Cmd+V，`btn-apply` | `plain/dir/` 下的檔案與獨立 CLI 往返的結果相同（在 Ubuntu 上 `cd '$W/gitws/alpha' && snip copy dir --stdout`，再 `snip paste --apply --stdin` 貼進 oracle 副本；正規化照 spec 第 1 節） |
+| P13 | 在 P03 的預覽（`a.txt` 已存在）點 `paste-row:<ix>:a.txt`（`ix` 從 `CTRL_BOUNDS` 讀），點 `btn-diff-mode` 切換一次再切回 | 新的一行 `[APP:PASTE_DIFF: idx=<ix> state=diff]`；詳情是 diff：刪除行等於 `ssh ubuntu "cat '$W/pastews/target/a.txt'"` 的內容，新增行等於 payload 裡的 `a.txt`；並排與統一兩種檢視都看過。同一個預覽裡新增列（`new.txt`）沒有 `PASTE_DIFF`，這不是錯。目的檔超過 1 MiB 或不是文字時，詳情維持剪貼簿內容並顯示原因（`state=unavailable`），不是錯誤 |
 
 ### 4.8 拒絕的操作（N01–N02）
 
@@ -582,7 +587,7 @@ wrapper（hash 一致才刪）與本輪備份名 `~/.local/bin/snip.uirun-$SHA`�
 
 ## 7. 計分
 
-`scorecard.md` 列出 S01–S12、R01–R08、E01–E12、B01–B07、G01–G10、X01–X10（X07 寫 `n/a`，附上涵蓋它的 gpui 測試名，不影響閘門）、P01–P12、N01–N02、L01–L05、C01–C04、I01–I04，每格一個判定，並附證據路徑。
+`scorecard.md` 列出 S01–S12、R01–R08、E01–E12、B01–B07、G01–G10、X01–X10（X07 寫 `n/a`，附上涵蓋它的 gpui 測試名，不影響閘門）、P01–P13、N01–N02、L01–L05、C01–C04、I01–I04，每格一個判定，並附證據路徑。
 
 - **閘門**：第 0 步閘門通過，而且上面除了 X07 全部是 `pass`，才寫「遠端工作區真實 UI 閘門關閉」。
 - 有任何 `ui-defect`、`fail` 或 `not-run`，第一句就寫「遠端工作區真實 UI 閘門打開」，並列出那些 ID。

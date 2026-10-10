@@ -2415,18 +2415,29 @@ def _new_commits(repo: Mapping[str, Any], baseline_head: str) -> list[dict[str, 
     return found
 
 
-def compare_step(fixture_dir: str, step_id: str, snap: Mapping[str, Any], phase: str) -> None:
+def compare_step(
+    fixture_dir: str,
+    step_id: str,
+    snap: Mapping[str, Any],
+    phase: str,
+    *,
+    baseline: Mapping[str, Any] | None = None,
+) -> None:
     _root, manifest = load_manifest(fixture_dir)
     step = next((item for item in manifest["steps"] if item["id"] == step_id), None)
     if step is None:
         raise CompareError(f"unknown step {step_id}")
     if phase not in {"initial", "applied"}:
         raise CompareError(f"unknown phase {phase}")
-    base = {item["repoId"]: item for item in manifest["repos"]}
+    base = {item["repoId"]: item for item in (baseline["repos"] if baseline is not None else manifest["repos"])}
     got = {item["repoId"]: item for item in snap["repos"]}
     if set(base) != set(got):
         raise CompareError("snapshot repo ids differ from the fixture")
-    if step.get("noWriteSnapshot") == "immediately-before-action-after-setup-diff" and phase == "applied":
+    if (
+        step.get("noWriteSnapshot") == "immediately-before-action-after-setup-diff"
+        and phase == "applied"
+        and baseline is None
+    ):
         raise CompareError(
             f"{step_id} no-write oracle is the snapshot taken immediately before the action "
             "after the setup diff, not the generation baseline"
@@ -2516,6 +2527,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     compare_cmd.add_argument("--fixture", required=True)
     compare_cmd.add_argument("--step", required=True)
     compare_cmd.add_argument("--snapshot", required=True)
+    compare_cmd.add_argument("--baseline", "--baseline-snapshot", dest="baseline")
     compare_cmd.add_argument("--phase", required=True, choices=["initial", "applied"])
     args = parser.parse_args(argv)
     try:
@@ -2533,7 +2545,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"snapshot={args.output} repos={len(payload['repos'])}")
             return 0
         snap = json.loads(Path(args.snapshot).read_text(encoding="utf-8"))
-        compare_step(args.fixture, args.step, snap, args.phase)
+        baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8")) if getattr(args, "baseline", None) else None
+        compare_step(args.fixture, args.step, snap, args.phase, baseline=baseline)
         print(f"compare ok step={args.step} phase={args.phase}")
         return 0
     except FixtureSafetyError as exc:

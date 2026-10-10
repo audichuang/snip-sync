@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 use snip_core::clip;
 use snip_core::commits;
 
-use snip_native_e2e::{native_bin, scaled};
+use snip_native_e2e::{native_bin, parse_covered, parse_duplicate, scaled};
 
 fn clip_set(text: &str) {
 	let mut child = Command::new("xclip")
@@ -98,6 +98,16 @@ fn bounds_line_parsing() {
 		parse_gone("[APP:CTRL_GONE: id=btn-apply]").as_deref(),
 		Some("btn-apply")
 	);
+	assert_eq!(
+		parse_duplicate("[APP:CTRL_DUPLICATE: id=btn-refresh]").as_deref(),
+		Some("btn-refresh")
+	);
+	assert_eq!(
+		parse_covered(
+			"[APP:CTRL_COVERED: id=log-filter-user by=btn-log-refresh]"
+		),
+		Some(("log-filter-user".to_string(), "btn-log-refresh".to_string()))
+	);
 }
 
 /// Kills the app on drop so a failing assertion never leaks a window.
@@ -105,6 +115,9 @@ struct App {
 	child: Option<Child>,
 	rx: Receiver<String>,
 	pid: u32,
+	covered: Arc<Mutex<Vec<(String, String)>>>,
+	duplicates: Arc<Mutex<Vec<String>>>,
+	log_chips_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for App {
@@ -115,6 +128,13 @@ impl Drop for App {
 		if let Some(mut child) = self.child.take() {
 			let _ = child.kill();
 			let _ = child.wait();
+		}
+		if !std::thread::panicking() {
+			let dups = self.duplicates.lock().unwrap();
+			assert!(
+				dups.is_empty(),
+				"duplicate probe IDs were detected: {dups:?}"
+			);
 		}
 	}
 }
@@ -156,11 +176,27 @@ fn spawn_app_themed(
 	let mut child = cmd.spawn().expect("native desktop should run");
 	let pid = child.id();
 
+	let covered: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+	let duplicates: Arc<Mutex<Vec<String>>> = Arc::default();
+	let log_chips_count: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+	let t_covered = covered.clone();
+	let t_duplicates = duplicates.clone();
+	let t_log_chips = log_chips_count.clone();
+
 	let stdout = child.stdout.take().unwrap();
 	let (tx, rx) = std::sync::mpsc::channel::<String>();
 	std::thread::spawn(move || {
 		use std::io::{BufRead, BufReader};
 		for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+			if let Some(dup) = parse_duplicate(&line) {
+				t_duplicates.lock().unwrap().push(dup);
+			}
+			if let Some(cov) = parse_covered(&line) {
+				t_covered.lock().unwrap().push(cov);
+			}
+			if line.contains("[APP:LOG_CHIPS:") {
+				t_log_chips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			}
 			if let Some((bounds, viewport)) = &probes {
 				if let Some((id, v)) = parse_bounds(&line) {
 					bounds.lock().unwrap().insert(id, v);
@@ -189,7 +225,79 @@ fn spawn_app_themed(
 		child: Some(child),
 		rx,
 		pid,
+		covered,
+		duplicates,
+		log_chips_count,
 	}
+}
+
+/// Asserts that layout has settled after a resize step without further input,
+/// no duplicate probe IDs were logged, visible controls are not covered by other
+/// controls, and no endless redraw occurs while idle.
+fn assert_settled_and_guards(
+	app: &App,
+	bounds: &Bounds,
+	viewport: &Viewport,
+	w: i32,
+	h: i32,
+) -> HashMap<String, [i32; 4]> {
+	let deadline = Instant::now() + scaled(Duration::from_secs(6));
+	while *viewport.lock().unwrap() != (w, h) {
+		assert!(
+			Instant::now() < deadline,
+			"viewport did not become {w}x{h}: {:?}",
+			*viewport.lock().unwrap()
+		);
+		std::thread::sleep(Duration::from_millis(40));
+	}
+
+	let settle_deadline = Instant::now() + scaled(Duration::from_secs(8));
+	let snap = loop {
+		let snap1 = bounds.lock().unwrap().clone();
+		std::thread::sleep(Duration::from_millis(150));
+		let snap2 = bounds.lock().unwrap().clone();
+		if !snap1.is_empty() && snap1 == snap2 {
+			break snap1;
+		}
+		assert!(
+			Instant::now() < settle_deadline,
+			"CTRL_BOUNDS never settled at {w}x{h}"
+		);
+	};
+
+	let dups = app.duplicates.lock().unwrap().clone();
+	assert!(dups.is_empty(), "duplicate probe ids detected: {dups:?}");
+
+	if w >= 700 {
+		let cov = app.covered.lock().unwrap().clone();
+		for (id, by) in &cov {
+			if snap.contains_key(id) {
+				panic!(
+					"visible control {id} is covered by {by} at viewport {w}x{h}"
+				);
+			}
+		}
+	}
+
+	let before_chips = app
+		.log_chips_count
+		.load(std::sync::atomic::Ordering::Relaxed);
+	std::thread::sleep(scaled(Duration::from_millis(250)));
+	let after_chips = app
+		.log_chips_count
+		.load(std::sync::atomic::Ordering::Relaxed);
+	assert_eq!(
+		before_chips,
+		after_chips,
+		"detected endless redraw: {before_chips} -> {after_chips} [APP:LOG_CHIPS ...] while idle at {w}x{h}"
+	);
+	let snap_after = bounds.lock().unwrap().clone();
+	assert_eq!(
+		snap, snap_after,
+		"CTRL_BOUNDS changed while idle without input at {w}x{h}"
+	);
+
+	snap
 }
 
 /// Collects every stdout line up to and including the first that contains
@@ -785,16 +893,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 
 	let resize = |w: i32, h: i32| {
 		xdo(&["windowsize", "--sync", &wid, &w.to_string(), &h.to_string()]);
-		let deadline = Instant::now() + scaled(Duration::from_secs(5));
-		while *viewport.lock().unwrap() != (w, h) {
-			assert!(
-				Instant::now() < deadline,
-				"viewport did not become {w}x{h}: {:?}",
-				*viewport.lock().unwrap()
-			);
-			std::thread::sleep(Duration::from_millis(50));
-		}
-		std::thread::sleep(Duration::from_millis(300));
+		assert_settled_and_guards(&app, &bounds, &viewport, w, h);
 	};
 
 	// Normalize to the reference size in case the WM placed it differently.
@@ -1221,7 +1320,43 @@ fn native_desktop_smoke_and_clipboard_verification() {
 
 	// 10. Git Log: search by author, HEAD jump, merge collapse, range compare
 	println!("[TEST DRIVER] Testing Git Log author search...");
-	click("log-filter-user");
+	// Resize-without-input case for the Log filter bar:
+	// shrink to 900x600 and assert the overflow chip `log-filter-more` appears
+	// and no chip is covered, without any click.
+	println!("[TEST DRIVER] Testing Log filter bar resize without input...");
+	resize(900, 600);
+	control("log-filter-more");
+	resize(1080, 720);
+
+	// With the Repository chip active, 1080×720 leaves no room for every
+	// chip: one that does not fit sits in the overflow chip, and the user
+	// reaches it there. Its clear button moves there with it.
+	// Polls, bounded: the frame that places a chip can land late on a
+	// slow machine, and a wrong "not drawn" would open the overflow chip
+	// for a clear button that only exists on the bar.
+	let drawn = |id: &str| {
+		let deadline = Instant::now() + scaled(Duration::from_secs(2));
+		loop {
+			std::thread::sleep(Duration::from_millis(100));
+			if snip_native_e2e::lookup_bounds(&bounds.lock().unwrap(), id)
+				.is_some()
+			{
+				return true;
+			}
+			if Instant::now() >= deadline {
+				return false;
+			}
+		}
+	};
+	let via_overflow = |id: &str, hidden: &str| {
+		if drawn(id) {
+			click(id);
+		} else {
+			click("log-filter-more");
+			click(hidden);
+		}
+	};
+	via_overflow("log-filter-user", "log-filter-more:user");
 	wait_for_pattern("[APP:LOG_MENU: Some(User)]", Duration::from_secs(3))
 		.expect("User chip must open its menu");
 	click("log-user:Tester");
@@ -1248,7 +1383,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	.expect("clearing the text keeps the author filter");
 
 	// Reset author search from the chip's clear button.
-	click("log-filter-user-clear");
+	via_overflow("log-filter-user-clear", "log-filter-user-clear");
 	wait_for_pattern("[APP:LOG_SEARCH: active=false", Duration::from_secs(3))
 		.expect("clearing log search must restore full graph");
 
@@ -2162,11 +2297,18 @@ fn native_graph_failed_next_page_is_transactional() {
 	// The last loaded row drawn fully inside the list and clear of the banner.
 	let banner = control("log-error");
 	let list = control("log-list");
+	// Probes report the visible part: a row cut by the list's edge is
+	// shorter than a whole one, and must not be the evidence.
+	let full_h = row_ids
+		.iter()
+		.filter_map(|id| bounds.lock().unwrap().get(id.as_str()).map(|v| v[3]))
+		.max()
+		.unwrap_or(0);
 	let clear = |[x, y, w, h]: [i32; 4]| {
 		let [bx, by, bw, bh] = banner;
 		let [_, ly, _, lh] = list;
 		let apart = y + h <= by || by + bh <= y || x + w <= bx || bx + bw <= x;
-		apart && y >= ly && y + h <= ly + lh
+		h == full_h && apart && y >= ly && y + h <= ly + lh
 	};
 	let probe_row = row_ids
 		.iter()
@@ -2425,11 +2567,7 @@ fn native_d3_copy_mapping_and_replay() {
 	};
 	let resize = |w: i32, h: i32| {
 		xdo(&["windowsize", "--sync", &wid, &w.to_string(), &h.to_string()]);
-		let deadline = Instant::now() + scaled(Duration::from_secs(5));
-		while *viewport.lock().unwrap() != (w, h) {
-			assert!(Instant::now() < deadline, "viewport {w}x{h}");
-			std::thread::sleep(Duration::from_millis(40));
-		}
+		assert_settled_and_guards(&app, &bounds, &viewport, w, h);
 	};
 	resize(1080, 720);
 
@@ -3037,15 +3175,7 @@ fn native_tree_paging_retry_selection_900x600() {
 			.status()
 			.unwrap();
 		assert!(st.success());
-		let deadline = Instant::now() + scaled(Duration::from_secs(5));
-		while *viewport.lock().unwrap() != (w, h) {
-			assert!(
-				Instant::now() < deadline,
-				"viewport {:?}",
-				*viewport.lock().unwrap()
-			);
-			std::thread::sleep(Duration::from_millis(50));
-		}
+		assert_settled_and_guards(&app, &bounds, &viewport, w, h);
 	};
 	// Tree pages land asynchronously and shift rows; acting on bounds from
 	// an earlier frame hits the wrong row. Wait until the layout has held
@@ -3386,28 +3516,16 @@ fn native_historical_file_copy() {
 	};
 	let resize = |w: i32, h: i32| {
 		xdo(&["windowsize", "--sync", &wid, &w.to_string(), &h.to_string()]);
-		let deadline = Instant::now() + scaled(Duration::from_secs(6));
-		loop {
-			if *viewport.lock().unwrap() == (w, h) {
-				let snap = settled();
-				if let (Some(sb), Some(bp), Some(bl)) = (
-					snap.get("status-bar"),
-					snap.get("btn-paste"),
-					snap.get("btn-locale"),
-				) {
-					if sb[1] + sb[3] <= h
-						&& bp[0] + bp[2] <= w
-						&& bl[0] + bl[2] <= w
-					{
-						break;
-					}
-				}
-			}
+		let snap = assert_settled_and_guards(&app, &bounds, &viewport, w, h);
+		if let (Some(sb), Some(bp), Some(bl)) = (
+			snap.get("status-bar"),
+			snap.get("btn-paste"),
+			snap.get("btn-locale"),
+		) {
 			assert!(
-				Instant::now() < deadline,
-				"viewport {w}x{h} did not settle in time"
+				sb[1] + sb[3] <= h && bp[0] + bp[2] <= w && bl[0] + bl[2] <= w,
+				"key controls outside viewport {w}x{h}"
 			);
-			std::thread::sleep(Duration::from_millis(40));
 		}
 	};
 
@@ -5357,7 +5475,7 @@ fn log_multiselect(theme: &str) {
 		assert!(st.success());
 	};
 	let click = |id: &str| press(id, None);
-	// Drawn, maybe scrolled past the details pane's edge.
+	// Drawn and at least partly visible (probes are clipped to their pane).
 	let drawn = |id: &str| {
 		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		while !bounds.lock().unwrap().contains_key(id) {
@@ -5365,7 +5483,7 @@ fn log_multiselect(theme: &str) {
 			std::thread::sleep(Duration::from_millis(40));
 		}
 	};
-	let (a2, a4) = (&shas["alpha2"][..7], &shas["alpha4"][..7]);
+	let a4 = &shas["alpha4"][..7];
 
 	// A taller log: every row and the whole details tree on screen.
 	{
@@ -5425,11 +5543,10 @@ fn log_multiselect(theme: &str) {
 	click("log-selection-toggle");
 	wait("[APP:LOG_SELECTION_EXPANDED: true]");
 	wait("[APP:SELECTION_DETAILS: 2]");
-	for sha in [a4, a2] {
-		drawn(&format!("selection-commit:{sha}"));
-		drawn(&format!("commit-details-author:{sha}"));
-		drawn(&format!("commit-details-branches:{sha}"));
-	}
+	// Probes report what is visible; the second commit's block can sit
+	// past the pane's edge, so only the first one is checked here.
+	drawn(&format!("selection-commit:{a4}"));
+	drawn(&format!("commit-details-author:{a4}"));
 	click("log-selection-toggle");
 	wait("[APP:LOG_SELECTION_EXPANDED: false]");
 	absent(&format!("selection-commit:{a4}"));
@@ -5479,7 +5596,8 @@ fn log_multiselect(theme: &str) {
 	// One commit: hash, author and email on one line, then its branches.
 	wait(&format!("[APP:COMMIT_DETAILS: {a4} branches=1]"));
 	drawn(&format!("commit-details-author:{a4}"));
-	drawn(&format!("commit-details-branches:{a4}"));
+	// `COMMIT_DETAILS … branches=1` above is the branches check: the line
+	// can sit below the pane's visible edge, and probes report what shows.
 
 	quit_cleanly(&mut app, &wid);
 }

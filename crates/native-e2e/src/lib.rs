@@ -76,6 +76,22 @@ pub fn lookup_bounds(
 	bounds.get(first).copied()
 }
 
+/// Parses a duplicate probe line `[APP:CTRL_DUPLICATE: id=...]`.
+pub fn parse_duplicate(line: &str) -> Option<String> {
+	let rest = line.split("[APP:CTRL_DUPLICATE: id=").nth(1)?;
+	Some(rest.trim_end().strip_suffix(']')?.to_string())
+}
+
+/// Parses a covered control audit line `[APP:CTRL_COVERED: id=... by=...]`.
+pub fn parse_covered(line: &str) -> Option<(String, String)> {
+	let rest = line.split("[APP:CTRL_COVERED: id=").nth(1)?;
+	let (id_a, rest_b) = rest.split_once(" by=")?;
+	Some((
+		id_a.to_string(),
+		rest_b.trim_end().strip_suffix(']')?.to_string(),
+	))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -113,5 +129,20 @@ mod tests {
 			Some([5, 0, 1, 1])
 		);
 		assert_eq!(lookup_bounds(&bounds, "paste-overwrite:none.txt"), None);
+		assert_eq!(
+			parse_duplicate("[APP:CTRL_DUPLICATE: id=btn-refresh]").as_deref(),
+			Some("btn-refresh")
+		);
+		assert_eq!(parse_duplicate("[APP:LOG_CHIPS: ..."), None);
+		assert_eq!(
+			parse_covered(
+				"[APP:CTRL_COVERED: id=log-filter-user by=btn-log-refresh]"
+			),
+			Some((
+				"log-filter-user".to_string(),
+				"btn-log-refresh".to_string()
+			))
+		);
+		assert_eq!(parse_covered("[APP:CTRL_DUPLICATE: id=foo]"), None);
 	}
 }

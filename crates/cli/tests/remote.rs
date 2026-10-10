@@ -1043,3 +1043,29 @@ fn cli_master_show_reports_a_truncated_path_listing() {
 		"the truncation must be announced on stderr: {stderr:?}"
 	);
 }
+
+/// A worker command that prints a short login banner line before exec'ing
+/// `snip serve --stdio` is skipped by the master during connection setup.
+#[cfg(unix)]
+#[test]
+fn cli_master_connects_past_login_banner() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let tmp = tempfile::tempdir().unwrap();
+	let bin = env!("CARGO_BIN_EXE_snip");
+	let script = tmp.path().join("fake_worker.sh");
+	let script_body = format!(
+		"#!/bin/sh\necho \"Welcome to Ubuntu 24.04 LTS (GNU/Linux)\"\nexec \"{bin}\" serve --stdio\n"
+	);
+	std::fs::write(&script, script_body).unwrap();
+	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+		.unwrap();
+
+	let ws = tmp.path().join("ws");
+	std::fs::create_dir_all(&ws).unwrap();
+	std::fs::write(ws.join("banner_test.txt"), "ok\n").unwrap();
+
+	let m = Master::with_exec(tmp.path(), s(&script).to_string());
+	let out = m.ok(&["ls", "anyhost", s(&ws)]);
+	assert_eq!(out.trim(), "banner_test.txt");
+}

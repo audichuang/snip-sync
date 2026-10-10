@@ -710,6 +710,9 @@ impl WorkbenchModel {
 				.children(probe(log, "paste-mappings"))
 		});
 
+		let is_diff = self.paste.detail().is_some_and(|p| p.is_diff);
+		let side = self.reader.diff_mode == DiffMode::SideBySide;
+
 		div()
 			.id("paste-panel")
 			.key_context("PastePanel")
@@ -785,6 +788,33 @@ impl WorkbenchModel {
 						.bg(rgb(pal().panel_bg))
 						.text_size(px(SMALL_TEXT))
 						.child(fill_text(detail_title))
+						.when(is_diff, |h| {
+							h.child(
+								icon_button(
+									"btn-diff-mode",
+									if side {
+										Icon::SideBySide
+									} else {
+										Icon::Unified
+									},
+									t(
+										if side {
+											"tip_diff_unified"
+										} else {
+											"tip_diff_side"
+										},
+										loc,
+									),
+									true,
+									35,
+								)
+								.debug_selector(|| "btn-diff-mode".into())
+								.on_click(cx.listener(|this, _, _, cx| {
+									this.toggle_diff_mode(cx)
+								}))
+								.children(probe(log, "btn-diff-mode")),
+							)
+						})
 						.child(
 							div()
 								.flex_shrink_0()
@@ -793,6 +823,38 @@ impl WorkbenchModel {
 						),
 				)
 			})
+			.when_some(
+				// `Preview::new` flags a cut with the bare word "truncated".
+				self.paste.detail().and_then(|p| p.notice.clone()).map(|n| {
+					if n == "truncated" {
+						tf(
+							"truncated_notice",
+							loc,
+							&[
+								&crate::reader::MAX_PREVIEW_LINES,
+								&(crate::reader::MAX_PREVIEW_BYTES / 1024),
+							],
+						)
+					} else {
+						n
+					}
+				}),
+				|d, notice| {
+					d.child(
+						div()
+							.id("paste-diff-notice")
+							.relative()
+							.children(probe(log, "paste-diff-notice"))
+							.flex_shrink_0()
+							.px(px(12.))
+							.py(px(2.))
+							.bg(rgb(pal().panel_bg))
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().warning))
+							.child(notice),
+					)
+				},
+			)
 			.when(selected.is_some_and(|i| i.shows_delete_notice()), |d| {
 				d.child(
 					div()

@@ -490,10 +490,20 @@ pub fn run(
 				return Err("nothing could be copied".into());
 			}
 			crate::emit(&out.payload, stdout)?;
+			let (words, tokens) =
+				if out.words > 0 || out.tokens > 0 || out.payload.is_empty() {
+					(out.words, out.tokens)
+				} else {
+					let s = snip_core::stats::payload_stats(&out.payload);
+					(s.words, s.tokens)
+				};
 			eprintln!(
-				"copied {} files, {} chars{}{}",
+				"copied {} files, {} chars, {} lines, {} words, ~{} tokens{}{}",
 				out.copied,
 				out.chars,
+				out.lines,
+				words,
+				tokens,
 				if out.skipped > 0 {
 					format!(", {} skipped", out.skipped)
 				} else {
