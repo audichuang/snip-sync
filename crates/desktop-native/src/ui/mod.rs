@@ -201,7 +201,12 @@ impl ProbeFrame {
 	/// Records a control probed this frame. Returns true when new or moved.
 	/// If v is None, the control is clipped away and omitted from seen controls.
 	pub fn probe(&mut self, id: &str, v: Option<[i32; 4]>) -> bool {
-		if !self.probed_this_frame.insert(id.to_string()) {
+		// `change-row:<path>` is the lenient legacy alias: a file both
+		// staged and unstaged carries it twice by design. The unique id is
+		// `change-row@<repo>:<source>:<path>`.
+		if !self.probed_this_frame.insert(id.to_string())
+			&& !id.starts_with("change-row:")
+		{
 			app_log!("[APP:CTRL_DUPLICATE: id={}]", id);
 		}
 		if let Some(v) = v {
@@ -240,8 +245,16 @@ impl ProbeFrame {
 				let cx = rect_a[0] + rect_a[2] / 2;
 				let cy = rect_a[1] + rect_a[3] / 2;
 				for (id_b, rect_b) in self.seen_order.iter().skip(i + 1) {
-					if rect_b[0] <= cx
-						&& cx < rect_b[0] + rect_b[2]
+					// A probe is reported after its element's children, so a
+					// later rect that holds all of A is A's parent or row, not
+					// something painted over it. The UI01 case is the other
+					// way round: a small button over the middle of a chip.
+					let b_holds_a = rect_b[0] <= rect_a[0]
+						&& rect_b[1] <= rect_a[1]
+						&& rect_a[0] + rect_a[2] <= rect_b[0] + rect_b[2]
+						&& rect_a[1] + rect_a[3] <= rect_b[1] + rect_b[3];
+					if !b_holds_a
+						&& rect_b[0] <= cx && cx < rect_b[0] + rect_b[2]
 						&& rect_b[1] <= cy && cy < rect_b[1] + rect_b[3]
 						&& !is_covered_allowed(id_a, id_b, *rect_a, *rect_b)
 					{

@@ -5468,7 +5468,7 @@ fn log_multiselect(theme: &str) {
 		assert!(st.success());
 	};
 	let click = |id: &str| press(id, None);
-	// Drawn, maybe scrolled past the details pane's edge.
+	// Drawn and at least partly visible (probes are clipped to their pane).
 	let drawn = |id: &str| {
 		let deadline = Instant::now() + scaled(Duration::from_secs(6));
 		while !bounds.lock().unwrap().contains_key(id) {
@@ -5536,10 +5536,11 @@ fn log_multiselect(theme: &str) {
 	click("log-selection-toggle");
 	wait("[APP:LOG_SELECTION_EXPANDED: true]");
 	wait("[APP:SELECTION_DETAILS: 2]");
+	// Probes report what is visible; a block's branches line can sit past
+	// the pane's edge, so only the one-commit case below checks it.
 	for sha in [a4, a2] {
 		drawn(&format!("selection-commit:{sha}"));
 		drawn(&format!("commit-details-author:{sha}"));
-		drawn(&format!("commit-details-branches:{sha}"));
 	}
 	click("log-selection-toggle");
 	wait("[APP:LOG_SELECTION_EXPANDED: false]");
