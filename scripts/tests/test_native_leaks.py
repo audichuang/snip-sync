@@ -99,6 +99,7 @@ def _endpoint(index: int, done: int, rss: int, pss: int, fds: int = 40, threads:
         "resourcesComplete": True,
         "memoryComplete": True,
         "measuredSwitchesCompleted": done,
+        "tabCyclesCompleted": None,
         "settleSeconds": 3.0,
         "equivalentView": {"repo": NAMES[0], "tool": "GitChanges"},
         "viewEvidence": _view(),
@@ -126,9 +127,27 @@ def _flat_endpoints(rss0: int = 200 * MIB, pss0: int = 120 * MIB) -> list[dict]:
     return rows
 
 
+TAB_DONE = list(range(5, 31, 5))
+
+
+def _tab_endpoint(index: int, done: int, rss: int, pss: int, **extra) -> dict:
+    """The end of one batch of workspace tab open/close cycles, back on the canonical view."""
+    row = _endpoint(index, 100, rss, pss, **extra)
+    row.update({"sampleId": f"t-{done}", "kind": "tab-endpoint", "phase": "tab-measured", "tabCyclesCompleted": done})
+    row.update(extra)
+    return row
+
+
+def _flat_tab_endpoints(rss0: int = 200 * MIB, pss0: int = 120 * MIB) -> list[dict]:
+    return [
+        _tab_endpoint(index, done, rss0 + int(DELTAS[index] * MIB), pss0 + int(DELTAS[index] * MIB))
+        for index, done in enumerate(TAB_DONE)
+    ]
+
+
 def _flat_heap(span: int = 50 * MIB, resident: int = 26 * MIB) -> list[dict]:
     """A constant `[heap]` span with a constant untouched part for every endpoint id."""
-    ids = [f"s-{done}" for done in range(10, 101, 10)] + ["terminal-final"]
+    ids = [f"s-{done}" for done in range(10, 101, 10)] + [f"t-{done}" for done in TAB_DONE] + ["terminal-final"]
     return [{"sampleId": sid, "heapVmaBytes": span, "heapRssBytes": resident} for sid in ids]
 
 
@@ -158,6 +177,15 @@ def stable_interactions() -> list[dict]:
                 "drained": True,
                 "reposReady": True,
             },
+            "root": dict(ROOT),
+        },
+        {
+            "item": "workspace-tab-cycle",
+            "ok": True,
+            "input": "click",
+            "control": "ws-tab-new",
+            "log": "[APP:WS_TAB_OPENED: id=40 count=2] | [APP:WORKSPACE: state=open path=/ws/repo-02 generation=2] | [APP:WS_TAB_CLOSED: id=40 count=1]",
+            "oracle": {"sameProcess": True, "countRestored": True, "drained": True, "cycles": 35, "requested": 35},
             "root": dict(ROOT),
         },
         {"item": "hide", "ok": False, "input": "click", "log": "", "reason": "no window-hide contract"},
@@ -198,10 +226,12 @@ def stable_report() -> dict:
         "counts": {
             "warmupSwitchesRequested": 20,
             "measuredSwitchesRequested": 100,
+            "warmupTabCyclesRequested": 5,
+            "measuredTabCyclesRequested": 30,
             "settleSeconds": 3.0,
             "observationSeconds": 40.0,
         },
-        "samples": _flat_endpoints(),
+        "samples": [*_flat_endpoints(), *_flat_tab_endpoints()],
         "evidence": {"measuredSwitches": _actions(100, "measured"), "warmupSwitches": _actions(20, "warmup")},
         "interactions": stable_interactions(),
         "heapReserve": _flat_heap(),
@@ -397,10 +427,100 @@ class TestVerdictMath(unittest.TestCase):
 
     def test_fd_growth_of_two_stays_inside_the_gate(self) -> None:
         report = stable_report()
-        report["samples"] = [_endpoint(i, done, 200 * MIB, 120 * MIB, fds=40 if i < 7 else 42) for i, done in enumerate(range(10, 101, 10))]
+        report["samples"] = [
+            *(_endpoint(i, done, 200 * MIB, 120 * MIB, fds=40 if i < 7 else 42) for i, done in enumerate(range(10, 101, 10))),
+            *_flat_tab_endpoints(),
+        ]
         result = evaluate_report(report)
         self.assertNotIn("fd-growth", result["reasons"])
         self.assertEqual(result["verdict"], "SUBGATE_ACCEPTED", result["reasons"])
+
+    def test_tab_series_fd_growth_of_three_is_rejected(self) -> None:
+        report = stable_report()
+        tabs = _flat_tab_endpoints()
+        for row in tabs[4:]:
+            row["fdCount"] = 43
+        report["samples"] = [*_flat_endpoints(), *tabs]
+        result = evaluate_report(report)
+        self.assertIn("fd-growth", result["reasons"])
+        self.assertEqual(result["verdict"], "NOT_ACCEPTED", result["reasons"])
+
+    def test_tab_series_fd_growth_of_two_stays_inside_the_gate(self) -> None:
+        report = stable_report()
+        tabs = _flat_tab_endpoints()
+        for row in tabs[4:]:
+            row["fdCount"] = 42
+        report["samples"] = [*_flat_endpoints(), *tabs]
+        result = evaluate_report(report)
+        self.assertNotIn("fd-growth", result["reasons"])
+        self.assertEqual(result["verdict"], "SUBGATE_ACCEPTED", result["reasons"])
+
+    def test_tab_series_thread_and_watcher_growth_are_rejected(self) -> None:
+        threads = stable_report()
+        tabs = _flat_tab_endpoints()
+        for row in tabs[4:]:
+            row["threadCount"] = 17
+        threads["samples"] = [*_flat_endpoints(), *tabs]
+        self.assertIn("thread-growth", evaluate_report(threads)["reasons"])
+        watches = stable_report()
+        tabs = _flat_tab_endpoints()
+        for row in tabs[4:]:
+            row["watchCount"] = 5
+        watches["samples"] = [*_flat_endpoints(), *tabs]
+        self.assertIn("watcher-growth", evaluate_report(watches)["reasons"])
+
+    def test_tab_series_memory_growth_is_rejected(self) -> None:
+        report = stable_report()
+        tabs = _flat_tab_endpoints()
+        for row in tabs[4:]:
+            row["rssBytes"] += 40 * MIB
+            row["pssBytes"] += 40 * MIB
+        report["samples"] = [*_flat_endpoints(), *tabs]
+        self.assertIn("memory-growth", evaluate_report(report)["reasons"])
+
+    def test_tab_series_without_endpoints_or_floor_is_undersized(self) -> None:
+        report = stable_report()
+        report["samples"] = _flat_endpoints()
+        self.assertIn("undersized", evaluate_report(report)["reasons"])
+        short = stable_report()
+        short["counts"]["measuredTabCyclesRequested"] = 10
+        self.assertIn("undersized", evaluate_report(short)["reasons"])
+        below = stable_report()
+        below["counts"]["measuredTabCyclesRequested"] = 15
+        below["samples"] = [*_flat_endpoints(), *_flat_tab_endpoints()[:3]]
+        self.assertIn("undersized", evaluate_report(below)["reasons"])
+
+    def test_tab_series_last_endpoint_short_of_requested_is_noop_driver(self) -> None:
+        report = stable_report()
+        report["samples"][-1]["tabCyclesCompleted"] = 29
+        self.assertIn("noop-driver", evaluate_report(report)["reasons"])
+
+    def test_tab_cycle_coverage_gaps_are_missing_coverage(self) -> None:
+        edits = {
+            "removed": None,
+            "oracle-cycles-not-requested": lambda oracle: oracle.update(cycles=34),
+            "count-not-restored": lambda oracle: oracle.update(countRestored=False),
+        }
+        for name, edit in edits.items():
+            with self.subTest(name):
+                report = stable_report()
+                if edit is None:
+                    report["interactions"] = [i for i in report["interactions"] if i.get("item") != "workspace-tab-cycle"]
+                else:
+                    edit(next(i for i in report["interactions"] if i.get("item") == "workspace-tab-cycle")["oracle"])
+                result = evaluate_report(report)
+                self.assertIn("missing-coverage", result["reasons"])
+                self.assertIn("workspace-tab-cycle", result["coverageGaps"])
+
+    def test_tab_endpoints_stay_out_of_the_repo_switch_analysis(self) -> None:
+        base = evaluate_report(stable_report())
+        report = stable_report()
+        for row in report["samples"]:
+            if row.get("kind") == "tab-endpoint" and row["tabCyclesCompleted"] >= 25:
+                row["rssBytes"] += 100 * MIB
+        result = evaluate_report(report)
+        self.assertEqual(result["analysis"]["rssBytes"]["growth"], base["analysis"]["rssBytes"]["growth"])
+        self.assertGreater(result["tabAnalysis"]["rssBytes"]["growth"], 50 * MIB)
 
     def test_nan_noop_undersized_and_wrong_pins(self) -> None:
         nan = stable_report()
@@ -454,6 +574,37 @@ class TestVerdictMath(unittest.TestCase):
         self.assertEqual([name for piece in pieces for name in piece], sequence)
         self.assertEqual(set(planned_repo_sequence(NAMES, 20)), set(NAMES))
         self.assertNotEqual(set(pieces[0]), set(NAMES))
+
+
+class TestTabCycle(unittest.TestCase):
+    def _run(self, opened_count: int, closed_count: int, drained: bool) -> dict:
+        opened = {
+            "count": opened_count, "tab": 40, "start": 0,
+            "openedLine": "[APP:WS_TAB_OPENED: id=40 count=2]",
+            "workspaceLine": "[APP:WORKSPACE: state=open path=/ws/repo-02 generation=2]",
+        }
+        closed = {"count": closed_count, "drained": drained, "closedLine": "[APP:WS_TAB_CLOSED: id=40 count=1]"}
+        with mock.patch.object(gate, "open_workspace_tab", return_value=opened), \
+             mock.patch.object(gate, "wait_repo_loaded", return_value=(0.0, 1.0)), \
+             mock.patch.object(gate, "close_shown_tab", return_value=closed), \
+             mock.patch.object(gate, "is_same_process", return_value=True):
+            return gate._tab_cycle(mock.Mock(), dict(ROOT), NAMES[1])
+
+    def test_tab_cycle_that_opens_and_closes_once_is_ok(self) -> None:
+        result = self._run(opened_count=2, closed_count=1, drained=True)
+        self.assertTrue(result["ok"], result["log"])
+        self.assertTrue(result["countRestored"])
+        self.assertTrue(result["drained"])
+
+    def test_tab_cycle_that_closes_back_to_two_tabs_is_not_ok(self) -> None:
+        result = self._run(opened_count=2, closed_count=2, drained=True)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["countRestored"])
+
+    def test_tab_cycle_that_does_not_drain_is_not_ok(self) -> None:
+        result = self._run(opened_count=2, closed_count=1, drained=False)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["drained"])
 
 
 class TestDiscovery(unittest.TestCase):
@@ -955,7 +1106,7 @@ def _bundle(directory: str) -> tuple[dict, list[dict]]:
         add("action", action)
     for sample in report["samples"]:
         if sample.get("phase") != "terminal":
-            add("endpoint", sample)
+            add(sample.get("kind", "endpoint"), sample)
     for interaction in report["interactions"]:
         if interaction.get("item") != "quit-cleanup":
             add("interaction", interaction)
@@ -1189,6 +1340,15 @@ class TestCanonicalRaw(unittest.TestCase):
             wrong = copy.deepcopy(rows)
             wrong[-1]["runId"] = "other-run"
             result = _judge(report, wrong)
+            self.assertIn("raw-evidence", result["reasons"])
+            self.assertNotEqual(result["verdict"], "SUBGATE_ACCEPTED")
+
+    def test_tab_endpoint_raw_row_without_tab_cycles_is_raw_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report, rows = _bundle(tmp)
+            broken = copy.deepcopy(rows)
+            next(row for row in broken if row["kind"] == "tab-endpoint").pop("tabCyclesCompleted")
+            result = _judge(report, broken)
             self.assertIn("raw-evidence", result["reasons"])
             self.assertNotEqual(result["verdict"], "SUBGATE_ACCEPTED")
 
@@ -1491,6 +1651,8 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
                 measured_switches = 100
                 warmup_switches = 20
                 settle_seconds = 3.0
+                measured_tab_cycles = None
+                warmup_tab_cycles = None
                 absolute_release_budget = False
 
             report = assemble_report(Args())
