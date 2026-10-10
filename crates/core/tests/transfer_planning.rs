@@ -4209,20 +4209,17 @@ fn commit_replay_apply_leaves_a_not_copied_target_alone() {
 }
 
 #[test]
-fn commit_replay_apply_waits_for_the_worktree_lock() {
+fn commit_replay_apply_is_refused_while_the_worktree_lock_is_held() {
 	use snip_core::commits::{
 		CommitFile, CommitRecord, CommitsPayload, FileChange,
 	};
 	use snip_core::gitrun::RunOptions;
-	use snip_core::gitsrc::Git;
+	use snip_core::gitsrc::{Git, GitError};
 	use snip_core::workspace::{lock_heavy, RepoIdentity};
-	use std::sync::mpsc;
-	use std::time::Duration;
 
 	let repo = TestRepo::new("worktree-lock");
 	repo.write("base.txt", "base\n");
 	let head_before = repo.commit("base");
-	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
 	let index_before = repo.git(&["ls-files", "-s"]);
 
 	let payload = CommitsPayload {
@@ -4231,62 +4228,101 @@ fn commit_replay_apply_waits_for_the_worktree_lock() {
 			author_name: "Author".into(),
 			author_email: "author@example.invalid".into(),
 			author_date: "2026-09-25T12:00:00+00:00".into(),
-			files: vec![
-				CommitFile {
-					path: "base.txt".into(),
-					old_path: None,
-					change: FileChange::Modified,
-					content: Some("incoming base\n".into()),
-					not_copied: None,
-				},
-				CommitFile {
-					path: "new.txt".into(),
-					old_path: None,
-					change: FileChange::Added,
-					content: Some("new content\n".into()),
-					not_copied: None,
-				},
-			],
+			files: vec![CommitFile {
+				path: "new.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("new content\n".into()),
+				not_copied: None,
+			}],
 		}],
 	};
 	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
 
 	let git = Git::open(repo.path()).unwrap();
 	let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
-	let guard = lock_heavy(&id, &RunOptions::default()).unwrap();
+	let guard = lock_heavy(&id).unwrap();
 
-	let opts = RunOptions {
-		queue_timeout: Duration::from_secs(30),
-		..RunOptions::default()
-	};
-
-	let (tx, rx) = mpsc::channel();
-	let res = std::thread::scope(|s| {
-		s.spawn(|| {
-			let res = preview.apply_with(&opts);
-			let _ = tx.send(res);
-		});
-
-		std::thread::sleep(Duration::from_millis(300));
-		assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
-
-		repo.write("base.txt", "modified base\n");
-
-		drop(guard);
-
-		rx.recv_timeout(Duration::from_secs(30))
-			.expect("apply_with did not return after worktree lock released")
-	});
-
+	// Refused at once, not queued: nothing was written.
+	let res = preview.apply();
 	assert!(
-		matches!(res, Err(TransferError::StaleDestination { .. })),
-		"expected StaleDestination, got {res:?}"
+		matches!(res, Err(TransferError::Git(GitError::WorktreeBusy { .. }))),
+		"{res:?}"
 	);
 	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
-	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
 	assert_eq!(repo.git(&["ls-files", "-s"]), index_before);
-	assert_eq!(repo.read("base.txt"), "modified base\n");
 	assert!(!repo.exists("new.txt"));
+
+	drop(guard);
+	let res = preview.apply().unwrap();
+	assert!(res.failure.is_none(), "{:?}", res.failure);
+	assert_eq!(res.created.len(), 1);
+	assert_eq!(repo.read("new.txt"), "new content\n");
+}
+
+#[test]
+fn file_paste_apply_is_refused_while_the_worktree_lock_is_held() {
+	use snip_core::gitrun::RunOptions;
+	use snip_core::gitsrc::{Git, GitError};
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	let dst = TestRepo::new("paste-lock");
+	dst.write("keep.txt", "keep\n");
+	dst.commit("base");
+	let clipboard_text = "\
+// file: pkg/new.txt
+new content
+";
+	let mut mapping = ImportMapping::new();
+	mapping.map_prefix("pkg", dst.canonical_id());
+	let import_plan = plan_import(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		&[dst.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+
+	let git = Git::open(dst.path()).unwrap();
+	let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
+	let guard = lock_heavy(&id).unwrap();
+	let res = import_plan.apply(&RestoreSelection::default());
+	assert!(
+		matches!(res, Err(TransferError::Git(GitError::WorktreeBusy { .. }))),
+		"{res:?}"
+	);
+	assert!(!dst.exists("new.txt"));
+
+	drop(guard);
+	let res = import_plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("new.txt"), "new content");
+}
+
+#[test]
+fn file_paste_into_a_plain_folder_takes_no_lock() {
+	let dst = tempfile::tempdir().unwrap();
+	let root = dunce::canonicalize(dst.path()).unwrap();
+	let clipboard_text = "\
+// file: pkg/new.txt
+plain
+";
+	let mut mapping = ImportMapping::new();
+	mapping.map_prefix("pkg", CanonicalRootId::new(&root).unwrap());
+	let import_plan = plan_import(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		std::slice::from_ref(&root),
+		&mapping,
+	)
+	.unwrap();
+	let res = import_plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	let names: Vec<_> = std::fs::read_dir(&root)
+		.unwrap()
+		.map(|e| e.unwrap().file_name())
+		.collect();
+	assert_eq!(names, ["new.txt"], "no lock file in a plain folder");
 }
 
 // ---------------------------------------------------------------------------

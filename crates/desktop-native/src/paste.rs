@@ -19,6 +19,7 @@ use snip_core::commits::{
 };
 use snip_core::format;
 use snip_core::gitrun::{CancelToken, RunOptions};
+use snip_core::gitsrc::GitError;
 use snip_core::restore::{
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
 };
@@ -736,10 +737,22 @@ impl RemotePaste {
 				code: snip_remote::ErrorCode::Stale,
 				message,
 			} => remote_stale_msg(&message),
+			snip_remote::RemoteError::Refused {
+				code: snip_remote::ErrorCode::Busy,
+				message,
+			} if message.contains(REPO_BUSY_TEXT) => repo_busy(),
 			other if other.outcome_unknown() => outcome_unknown(),
 			other => self.destination_error(dest, other),
 		}
 	}
+}
+
+/// How `GitError::WorktreeBusy` prints, so a worker's refusal is known.
+const REPO_BUSY_TEXT: &str = "another paste is writing to this repository";
+
+/// Another tab, process or worker holds the repository's write lock.
+fn repo_busy() -> Msg {
+	Msg::new("paste_repo_busy", [])
 }
 
 /// The connection was lost after an Apply was sent: the worker may have
@@ -912,6 +925,7 @@ fn destination_error(dest: &Path, err: &dyn std::fmt::Display) -> Msg {
 
 fn stale_msg(err: TransferError) -> Msg {
 	match err {
+		TransferError::Git(GitError::WorktreeBusy { .. }) => repo_busy(),
 		TransferError::StaleDestination { reason, .. } => {
 			if reason.contains("created") {
 				Msg::new("stale_created", [reason])
@@ -2095,6 +2109,9 @@ impl PastePreviewPlan {
 		}
 		let replay_res = match &self.remote {
 			None => preview.apply().map_err(|e| match e {
+				TransferError::Git(GitError::WorktreeBusy { .. }) => {
+					repo_busy()
+				}
 				TransferError::Git(e) => {
 					Msg::new("error_open_repo", [e.to_string()])
 				}
@@ -3616,89 +3633,92 @@ pub(crate) mod tests {
 		assert!(!err_en.contains("\"\""), "{err_en}");
 	}
 
+	/// Makes the worktree's lock file unopenable (a directory stands in
+	/// its place), so a replay fails to start without anyone holding it.
 	struct HeavyLockBlocker {
-		held: snip_core::workspace::HeavyGuard,
-		cancel: snip_core::gitrun::CancelToken,
-		waiters: Vec<std::thread::JoinHandle<()>>,
+		path: PathBuf,
 	}
 
 	impl HeavyLockBlocker {
 		fn fill(repo: &Path) -> Self {
-			use snip_core::gitrun::{CancelToken, RunOptions};
-			use snip_core::gitsrc::{Git, GitError};
-			use snip_core::workspace::{
-				lock_heavy, RepoIdentity, MAX_HEAVY_WAITERS,
-			};
-			use std::time::{Duration, Instant};
+			use snip_core::gitrun::RunOptions;
+			use snip_core::gitsrc::Git;
+			use snip_core::workspace::{RepoIdentity, HEAVY_LOCK_FILE};
 
 			let git = Git::open(repo).unwrap();
 			let id =
 				RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
-			let held = lock_heavy(&id, &RunOptions::default()).unwrap();
-			let cancel = CancelToken::new();
-			let mut waiters = Vec::new();
-			for _ in 0..MAX_HEAVY_WAITERS {
-				let id = id.clone();
-				let cancel = cancel.clone();
-				waiters.push(std::thread::spawn(move || {
-					while !cancel.is_cancelled() {
-						let res = lock_heavy(
-							&id,
-							&RunOptions {
-								cancel: Some(cancel.clone()),
-								queue_timeout: Duration::from_secs(60),
-								..Default::default()
-							},
-						);
-						if matches!(res, Err(GitError::Cancelled { .. })) {
-							break;
-						}
-						std::thread::sleep(Duration::from_millis(5));
-					}
-				}));
-			}
-			let deadline = Instant::now() + Duration::from_secs(10);
-			loop {
-				let res = lock_heavy(
-					&id,
-					&RunOptions {
-						queue_timeout: Duration::from_millis(50),
-						..RunOptions::default()
-					},
-				);
-				if matches!(res, Err(GitError::WorktreeBusy { .. })) {
-					break;
-				}
-				assert!(
-					Instant::now() < deadline,
-					"timed out waiting for heavy lock waiting room to fill"
-				);
-				std::thread::sleep(Duration::from_millis(10));
-			}
-			Self {
-				held,
-				cancel,
-				waiters,
-			}
+			let path = id.git_dir.join(HEAVY_LOCK_FILE);
+			fs::create_dir(&path).unwrap();
+			Self { path }
 		}
 
 		fn release(self) {
-			use std::time::{Duration, Instant};
-
-			self.cancel.cancel();
-			drop(self.held);
-			let deadline = Instant::now() + Duration::from_secs(30);
-			for w in self.waiters {
-				while !w.is_finished() {
-					assert!(
-						Instant::now() < deadline,
-						"timed out waiting for heavy lock waiter thread to finish"
-					);
-					std::thread::sleep(Duration::from_millis(5));
-				}
-				let _ = w.join();
-			}
+			fs::remove_dir(&self.path).unwrap();
 		}
+	}
+
+	#[test]
+	fn a_held_repository_lock_refuses_both_paste_kinds_with_the_busy_message() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		use snip_core::gitsrc::Git;
+		use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+		let dir = tempfile::tempdir().unwrap();
+		let repo = dunce::canonicalize(dir.path()).unwrap().join("repo");
+		fs::create_dir(&repo).unwrap();
+		git_init(&repo);
+		fs::write(repo.join("a.txt"), "base\n").unwrap();
+		git_run(&repo, &["add", "."]);
+		git_run(&repo, &["commit", "-qm", "base"]);
+		let id = RepoIdentity::resolve(
+			&Git::open(&repo).unwrap(),
+			&RunOptions::default(),
+		)
+		.unwrap();
+		let held = lock_heavy(&id).unwrap();
+
+		let files = PastePreviewPlan::build_from_clipboard_text(
+			"// FILE: new.txt\nnew content\n",
+			&repo,
+			&[],
+			1,
+		)
+		.unwrap();
+		let err = files.execute().unwrap_err();
+		assert_eq!(err.key, "paste_repo_busy");
+		assert!(!repo.join("new.txt").exists());
+
+		let text = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "first commit\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-25T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "b.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("x\n".into()),
+					not_copied: None,
+				}],
+			}],
+		});
+		let replay =
+			PastePreviewPlan::build_from_clipboard_text(&text, &repo, &[], 1)
+				.unwrap();
+		let err = replay.execute().unwrap_err();
+		assert_eq!(err.key, "paste_repo_busy");
+		assert_eq!(
+			err.render(crate::i18n::Locale::ZhTw),
+			"這個儲存庫正在被另一個貼上作業使用，請稍後再試"
+		);
+		assert!(!repo.join("b.txt").exists());
+
+		drop(held);
+		assert_eq!(files.execute().unwrap().files.created_count, 1);
 	}
 
 	#[test]

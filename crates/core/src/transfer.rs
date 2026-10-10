@@ -39,6 +39,7 @@ use crate::restore::{
 };
 use crate::settings::Settings;
 use crate::stats::{payload_stats, PayloadStats};
+use crate::workspace::{lock_heavy, HeavyGuard, RepoIdentity};
 
 mod changes;
 mod select;
@@ -846,6 +847,9 @@ impl TransferImportPlan {
 			&restore::CreateOutcome,
 		),
 	) -> Result<RestoreExecutionResult, TransferError> {
+		// Lock before revalidating: a check made before the lock leaves a
+		// gap another paste could write into.
+		let _locks = lock_destination_repos(&self.roots)?;
 		self.destination_freshness.revalidate()?;
 		let result = restore::execute_restore_plan_observed(
 			&self.restore_plan,
@@ -859,6 +863,31 @@ impl TransferImportPlan {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The write lock of every repository the roots sit in, all or none.
+/// A root outside any repository takes no lock: the lock lives in a git
+/// dir, and a lock file in a plain folder would show up in its tree.
+fn lock_destination_repos(
+	roots: &[PathBuf],
+) -> Result<Vec<HeavyGuard>, TransferError> {
+	let opts = RunOptions::default();
+	let mut repos = Vec::with_capacity(roots.len());
+	for root in roots {
+		let git = match Git::open_with(root, &opts) {
+			Ok(g) => g,
+			Err(GitError::NotARepository(_)) => continue,
+			Err(e) => return Err(e.into()),
+		};
+		repos.push(RepoIdentity::resolve(&git, &opts)?);
+	}
+	repos.sort_by(|a, b| a.git_dir.cmp(&b.git_dir));
+	repos.dedup_by(|a, b| a.git_dir == b.git_dir);
+	let mut held = Vec::with_capacity(repos.len());
+	for repo in &repos {
+		held.push(lock_heavy(repo)?);
+	}
+	Ok(held)
+}
 
 /// Conservative requested table bytes for std's current SwissTable, for
 /// insertion-only captures. A fresh table has at least half its buckets in
@@ -3320,10 +3349,11 @@ impl CommitReplayPreview {
 	}
 
 	/// Replays this preview's own payload onto its destination, or refuses as stale. `opts` reaches
-	/// Git open, the worktree lock wait and the re-validation under that lock; once the first
-	/// commit starts nothing is cancelled. Cancel at any point before the first write is
-	/// `Err(TransferError::Git(GitError::Cancelled))`. A non-cancel failure inside
-	/// `ReplaySession::begin` (the worktree lock, `RepoIdentity::resolve`, or creating the empty hooks directory) is
+	/// Git open and the re-validation under the worktree lock; once the first commit starts
+	/// nothing is cancelled. Cancel at any point before the first write is
+	/// `Err(TransferError::Git(GitError::Cancelled))`. A lock another paste holds is
+	/// `Err(TransferError::Git(GitError::WorktreeBusy))`, refused at once. Any other failure
+	/// to start (`RepoIdentity::resolve`, the lock file, creating the empty hooks directory) is
 	/// `Ok(ReplayResult)` with failure at index 0 and nothing written; `Git::open_with` and
 	/// re-validation errors, `QueueTimeout` included, are `Err`.
 	/// Overwrites follow spec 4.3 (直接覆蓋): the desktop's "allow overwrite first" gate is that
@@ -3334,11 +3364,21 @@ impl CommitReplayPreview {
 	) -> Result<commits::ReplayResult, TransferError> {
 		cancelled_err(opts, "replay-apply")?;
 		let git = Git::open_with(&self.destination, opts)?;
+		let guard = match commits::ReplaySession::lock(&git, opts) {
+			Ok(g) => g,
+			Err(e @ GitError::WorktreeBusy { .. }) => return Err(e.into()),
+			Err(e) => {
+				cancelled_err(opts, "replay-apply")?;
+				return Ok(commits::ReplaySession::refused(
+					&self.payload,
+					e.to_string(),
+				));
+			}
+		};
 		let session = match commits::ReplaySession::begin_in(
-			&git,
 			&self.scope,
 			&self.payload,
-			opts,
+			guard,
 		) {
 			Ok(s) => s,
 			Err(refused) => {

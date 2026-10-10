@@ -58,9 +58,7 @@ pub enum GitError {
 	QueueTimeout { args: String },
 	#[error("git {args} refused: too many callers already wait for Git")]
 	QueueFull { args: String },
-	#[error(
-		"git {args} refused: another heavy Git operation runs in this worktree"
-	)]
+	#[error("{args} refused: another paste is writing to this repository")]
 	WorktreeBusy { args: String },
 	#[error("git {args} output exceeds {limit} bytes")]
 	OutputLimit { args: String, limit: usize },
