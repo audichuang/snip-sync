@@ -200,6 +200,7 @@ mod icons;
 pub mod lifecycle;
 mod menu;
 mod multi_log;
+pub mod open_tabs;
 pub mod paste;
 mod reader;
 mod recent;
@@ -644,6 +645,7 @@ enum PasteDiffOutcome {
 
 pub struct WorkbenchModel {
 	pub workspace_root: PathBuf,
+	/// `--restore-dir`: the paste destination of the launch's own tab only.
 	pub restore_dir: Option<PathBuf>,
 	pub repos: Vec<RepoEntry>,
 	pub selected_repo_idx: Option<usize>,
@@ -959,6 +961,7 @@ pub fn is_error_status(key: &str) -> bool {
 				| "status_copy_nothing"
 				| "status_copy_nothing_skipped"
 				| "workspace_bad_path"
+				| "workspace_restore_skipped"
 				| "remote_unsupported"
 				| "workspace_not_open"
 				| "preview_memory_limit"
@@ -1407,7 +1410,6 @@ impl WorkbenchModel {
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
-			remote::remember_last(None);
 			model.reload_repos(cx);
 		}
 		model
@@ -2561,7 +2563,7 @@ impl WorkbenchModel {
 		self.release_workspace_state(cx);
 		self.workspace_root = path.clone();
 		recent::remember(&mut self.recent_workspaces, &path);
-		remote::remember_last(None);
+		self.remote.restoring = None;
 		self.workspace_open = true;
 		self.workspace_menu = false;
 		self.workspace_picker = false;
@@ -2696,7 +2698,12 @@ impl WorkbenchModel {
 			}
 		}
 		if !self.workspace_open {
-			return None;
+			return self.remote.restoring.as_ref().map(|r| {
+				tabs::WsIdentity::Remote {
+					host: r.folder.host.clone(),
+					path: r.folder.path.clone(),
+				}
+			});
 		}
 		Some(match &self.remote.session {
 			Some(session) => tabs::WsIdentity::Remote {
@@ -2715,9 +2722,18 @@ impl WorkbenchModel {
 		)
 	}
 
+	/// The tab's own close is draining (not a quit).
+	pub fn is_closing_tab(&self) -> bool {
+		matches!(
+			self.lifecycle.pending_intent(),
+			Some(lifecycle::Intent::CloseWorkspace)
+		)
+	}
+
 	/// No workspace, none opening, no paste: an open may fill this tab.
 	pub fn is_empty_tab(&self) -> bool {
 		!self.workspace_open
+			&& self.remote.restoring.is_none()
 			&& !self.lifecycle.is_draining()
 			&& !self.paste.is_open()
 	}
@@ -2733,9 +2749,17 @@ impl WorkbenchModel {
 		let opening = self.lifecycle.pending_intent().is_some_and(|i| {
 			matches!(i, lifecycle::Intent::OpenRemoteWorkspace(_))
 		});
+		let failed = self
+			.remote
+			.restoring
+			.as_ref()
+			.and_then(|r| r.failed.clone());
 		let (full, conn) = match (&identity, &self.remote.session) {
 			(Some(tabs::WsIdentity::Remote { host, path }), session) => {
-				let conn = if opening || session.is_none() {
+				let conn = if failed.is_some() && !opening && !self.remote.busy
+				{
+					tabs::Conn::Failed
+				} else if opening || session.is_none() {
 					tabs::Conn::Connecting
 				} else if self.remote.scan_error.is_some() {
 					tabs::Conn::Failed
@@ -2757,6 +2781,7 @@ impl WorkbenchModel {
 			full,
 			conn,
 			pasting: self.blocks_close(),
+			failed,
 		}
 	}
 
@@ -5792,66 +5817,66 @@ fn read_preview(
 	}
 }
 
-/// What the app opens when it starts.
-#[derive(Debug, PartialEq, Eq)]
-enum Startup {
-	Local(PathBuf),
-	/// Reconnected in the background once the window is up.
-	Remote(remote::RecentRemote),
-	Nothing,
-}
-
-impl Startup {
-	fn local(self) -> Option<PathBuf> {
-		match self {
-			Startup::Local(path) => Some(path),
-			_ => None,
-		}
-	}
-}
-
-/// `--workspace`, else the last workspace open when it was remote, else the
-/// last remembered local one (IntelliJ reopens the last project), else the
-/// launch folder. A Finder or Explorer launch starts in `/` or the home
-/// folder: that opens nothing rather than scanning it.
+/// The folder a launch opens when nothing restores tabs: `--workspace`,
+/// else the last remembered local one (IntelliJ reopens the last project),
+/// else the launch folder. A Finder or Explorer launch starts in `/` or the
+/// home folder: that opens nothing rather than scanning it.
 fn startup_choice(
 	arg: Option<PathBuf>,
-	last_remote: Option<remote::RecentRemote>,
 	last_local: Option<PathBuf>,
 	cwd: Option<PathBuf>,
 	home: Option<PathBuf>,
-) -> Startup {
-	if let Some(arg) = arg {
-		return Startup::Local(arg);
+) -> Option<PathBuf> {
+	if arg.is_some() {
+		return arg;
 	}
-	if let Some(last) = last_remote {
-		return Startup::Remote(last);
+	if last_local.is_some() {
+		return last_local;
 	}
-	if let Some(last) = last_local {
-		return Startup::Local(last);
-	}
-	match cwd {
-		Some(cwd) if cwd.parent().is_some() && Some(&cwd) != home.as_ref() => {
-			Startup::Local(cwd)
-		}
-		_ => Startup::Nothing,
-	}
+	cwd.filter(|cwd| cwd.parent().is_some() && Some(cwd) != home.as_ref())
 }
 
-/// [`startup_choice`] on the remembered workspaces; nothing is read under
-/// `cfg(test)` or in an e2e run without `SNIP_CONFIG_DIR`. Only a normal
-/// launch (`allow_remote`) reconnects to a remote workspace.
-fn startup_workspace(arg: Option<PathBuf>, allow_remote: bool) -> Startup {
-	if arg.is_some() {
-		return startup_choice(arg, None, None, None, None);
+/// What a launch shows. A normal launch reopens the tabs of the last
+/// session and then opens or switches to `--workspace`; with no tabs ever
+/// saved it falls back to [`startup_choice`]. A test mode opens one tab
+/// and neither restores nor saves. Nothing is read or saved under
+/// `cfg(test)` or in an e2e run without `SNIP_CONFIG_DIR`.
+fn startup_launch(
+	arg: Option<PathBuf>,
+	normal: bool,
+	restore_dir: Option<PathBuf>,
+) -> tabs::Launch {
+	launch_with(open_tabs::store_dir(), arg, normal, restore_dir, |arg| {
+		startup_choice(
+			arg,
+			recent::load().into_iter().next(),
+			std::env::current_dir().ok(),
+			recent::home(),
+		)
+	})
+}
+
+/// [`startup_launch`] with the store folder and the fallback given.
+fn launch_with(
+	store: Option<PathBuf>,
+	arg: Option<PathBuf>,
+	normal: bool,
+	restore_dir: Option<PathBuf>,
+	fallback: impl FnOnce(Option<PathBuf>) -> Option<PathBuf>,
+) -> tabs::Launch {
+	let store = store.filter(|_| normal);
+	let restore = store.as_deref().and_then(open_tabs::load_from);
+	let first = if restore.is_some() {
+		arg
+	} else {
+		fallback(arg)
+	};
+	tabs::Launch {
+		restore,
+		first: first.map_or(tabs::FirstTab::Empty, tabs::FirstTab::Local),
+		restore_dir,
+		store,
 	}
-	startup_choice(
-		None,
-		remote::load_last().filter(|_| allow_remote),
-		recent::load().into_iter().next(),
-		std::env::current_dir().ok(),
-		recent::home(),
-	)
 }
 
 type CliArgs = (Option<PathBuf>, String, Option<PathBuf>);
@@ -6065,11 +6090,7 @@ fn key_bindings() -> Vec<KeyBinding> {
 
 fn main() {
 	let (workspace, mode, restore_dir) = parse_cli_args();
-	let (workspace, reconnect) =
-		match startup_workspace(workspace, mode == "normal") {
-			Startup::Remote(last) => (None, Some(last)),
-			other => (other.local(), None),
-		};
+	let launch = startup_launch(workspace, mode == "normal", restore_dir);
 	let app = Application::new().with_assets(icons::Assets);
 
 	app.run(move |cx: &mut App| {
@@ -6077,10 +6098,7 @@ fn main() {
 		theme::register_fonts(cx);
 
 		let bounds = Bounds::centered(None, size(px(1080.0), px(720.0)), cx);
-		let ws = workspace.clone();
-		let last_remote = reconnect.clone();
 		let app_mode = mode.clone();
-		let paste_dir = restore_dir.clone();
 
 		let window_result = cx.open_window(
 			WindowOptions {
@@ -6105,15 +6123,9 @@ fn main() {
 				if app_mode == "idle" {
 					ready_marker("IDLE");
 				}
-				let first = match (ws, last_remote) {
-					(Some(path), _) => tabs::FirstTab::Local(path),
-					(None, Some(last)) => tabs::FirstTab::Remote(last),
-					(None, None) => tabs::FirstTab::Empty,
-				};
 				let root = cx.new(|cx| {
 					tabs::TabsRoot::new(
-						first,
-						paste_dir,
+						launch,
 						app_mode,
 						ui::Probes::from_env(),
 						window,
@@ -6140,46 +6152,91 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-	/// `--workspace` wins; then the last workspace open when it was remote;
-	/// then the last local one; then a launch folder other than `/` or home.
+	/// `--workspace` wins; then the last local workspace; then a launch
+	/// folder other than `/` or home. Only a launch with no tabs saved
+	/// gets that far.
 	#[test]
-	fn startup_reconnects_the_last_remote_workspace_unless_told_otherwise() {
-		use super::{startup_choice, startup_workspace, Startup};
-		use crate::remote::RecentRemote;
+	fn startup_opens_the_argument_else_the_last_local_workspace() {
+		use super::{startup_choice, startup_launch};
+		use crate::tabs::FirstTab;
 		use std::path::PathBuf;
-		let last = || {
-			Some(RecentRemote {
-				host: "macmini".into(),
-				path: "/Users/x/ck/cat".into(),
-			})
-		};
 		let p = |s: &str| Some(PathBuf::from(s));
 		assert_eq!(
-			startup_choice(p("/arg"), last(), p("/local"), p("/cwd"), None),
-			Startup::Local(PathBuf::from("/arg"))
+			startup_choice(p("/arg"), p("/local"), p("/cwd"), None),
+			p("/arg")
 		);
 		assert_eq!(
-			startup_choice(None, last(), p("/local"), p("/cwd"), None),
-			Startup::Remote(last().unwrap())
+			startup_choice(None, p("/local"), p("/cwd"), None),
+			p("/local")
 		);
 		assert_eq!(
-			startup_choice(None, None, p("/local"), p("/cwd"), None),
-			Startup::Local(PathBuf::from("/local"))
+			startup_choice(None, None, p("/home/u/w"), p("/home/u")),
+			p("/home/u/w")
 		);
 		assert_eq!(
-			startup_choice(None, None, None, p("/home/u/w"), p("/home/u")),
-			Startup::Local(PathBuf::from("/home/u/w"))
+			startup_choice(None, None, p("/home/u"), p("/home/u")),
+			None
 		);
-		assert_eq!(
-			startup_choice(None, None, None, p("/home/u"), p("/home/u")),
-			Startup::Nothing
+		assert_eq!(startup_choice(None, None, p("/"), None), None);
+		// Nothing remembered is read, nor anything saved, under cfg(test).
+		let launch = startup_launch(p("/arg"), true, p("/dest"));
+		assert!(launch.restore.is_none() && launch.store.is_none());
+		assert!(
+			matches!(launch.first, FirstTab::Local(ref a) if a == &PathBuf::from("/arg"))
 		);
-		assert_eq!(
-			startup_choice(None, None, None, p("/"), None),
-			Startup::Nothing
+		assert_eq!(launch.restore_dir, p("/dest"));
+	}
+
+	/// A normal launch restores the saved tabs and adds only `--workspace`;
+	/// with nothing saved it falls back to the remembered folder. A test
+	/// mode neither restores nor saves.
+	#[test]
+	fn a_normal_launch_restores_and_a_test_mode_does_not() {
+		use super::launch_with;
+		use crate::open_tabs::{save_to, OpenTabs, SavedTab};
+		use crate::tabs::FirstTab;
+		use std::path::PathBuf;
+		let tmp = tempfile::tempdir().unwrap();
+		let store = tmp.path().to_path_buf();
+		let p = |s: &str| Some(PathBuf::from(s));
+		let fallback = |arg: Option<PathBuf>| arg.or(p("/remembered"));
+
+		let fresh =
+			launch_with(Some(store.clone()), None, true, None, fallback);
+		assert!(fresh.restore.is_none());
+		assert_eq!(fresh.store, Some(store.clone()));
+		assert!(
+			matches!(fresh.first, FirstTab::Local(ref f) if f == &PathBuf::from("/remembered"))
 		);
-		// Nothing remembered is read under cfg(test).
-		assert!(!matches!(startup_workspace(None, true), Startup::Remote(_)));
+
+		let saved = OpenTabs {
+			tabs: vec![SavedTab::Local {
+				path: "/w/a".into(),
+			}],
+			active: Some(0),
+		};
+		save_to(&store, &saved).unwrap();
+		let normal =
+			launch_with(Some(store.clone()), None, true, None, fallback);
+		assert_eq!(normal.restore, Some(saved.clone()));
+		assert!(matches!(normal.first, FirstTab::Empty), "no fallback");
+		let with_arg = launch_with(
+			Some(store.clone()),
+			p("/arg"),
+			true,
+			p("/d"),
+			fallback,
+		);
+		assert!(
+			matches!(with_arg.first, FirstTab::Local(ref f) if f == &PathBuf::from("/arg"))
+		);
+
+		let test_mode =
+			launch_with(Some(store.clone()), p("/arg"), false, None, fallback);
+		assert!(test_mode.restore.is_none() && test_mode.store.is_none());
+		assert!(
+			matches!(test_mode.first, FirstTab::Local(ref f) if f == &PathBuf::from("/arg"))
+		);
 	}
 
 	/// A remote copy that copies nothing reports the same "skipped" status
@@ -7236,11 +7293,11 @@ mod tests {
 			});
 		}
 
-		/// The launch reconnect: the last remote workspace opens in the
-		/// background; a folder or host that is gone leaves the app with no
-		/// workspace and says why, on the status bar and the empty screen.
+		/// A restored remote tab connects in the background; a folder or
+		/// host that is gone keeps the tab on that folder and says why, on
+		/// the status bar and the empty screen.
 		#[gpui::test]
-		fn launch_reconnects_the_last_remote_workspace_or_says_why_not(
+		fn a_restored_remote_tab_reconnects_or_says_why_not(
 			cx: &mut TestAppContext,
 		) {
 			use crate::remote::RecentRemote;
@@ -7257,7 +7314,7 @@ mod tests {
 			});
 
 			model.update(cx, |m, cx| {
-				m.reopen_last_remote(
+				m.restore_remote(
 					RecentRemote {
 						host: "gone-host".into(),
 						path: id.clone(),
@@ -7266,10 +7323,22 @@ mod tests {
 				);
 				assert_eq!(m.status.key, "remote_open_failed");
 				assert!(!m.workspace_open && !m.remote.busy);
+				let r = m.remote.restoring.as_ref().expect("the tab stays");
+				assert!(r
+					.failed
+					.as_deref()
+					.is_some_and(|w| w.contains("gone-host")));
+				assert_eq!(
+					m.ws_identity(),
+					Some(crate::tabs::WsIdentity::Remote {
+						host: "gone-host".into(),
+						path: id.clone(),
+					})
+				);
 			});
 
 			model.update(cx, |m, cx| {
-				m.reopen_last_remote(
+				m.restore_remote(
 					RecentRemote {
 						host: host.clone(),
 						path: format!("{id}/missing"),
@@ -7283,10 +7352,16 @@ mod tests {
 				assert_eq!(m.status.key, "remote_open_failed");
 				assert!(!m.workspace_open && m.remote.session.is_none());
 				assert!(matches!(m.remote.message, Some((false, _))));
+				assert_eq!(m.tab_info().conn, Some(crate::tabs::Conn::Failed));
+				assert!(m
+					.remote
+					.restoring
+					.as_ref()
+					.is_some_and(|r| r.failed.is_some()));
 			});
 
 			model.update(cx, |m, cx| {
-				m.reopen_last_remote(
+				m.restore_remote(
 					RecentRemote {
 						host: host.clone(),
 						path: id.clone(),
@@ -7301,6 +7376,7 @@ mod tests {
 				let session = m.remote.session.as_ref().expect("reconnected");
 				assert_eq!(session.workspace.id, id);
 				assert!(m.workspace_open);
+				assert_eq!(m.remote.restoring, None);
 			});
 		}
 
@@ -14375,7 +14451,9 @@ mod tests {
 		mod workspace_tabs {
 			use super::*;
 			use crate::lifecycle::JobKind;
-			use crate::tabs::{FirstTab, TabEvent, TabsRoot, WsIdentity};
+			use crate::tabs::{
+				FirstTab, Launch, TabEvent, TabsRoot, WsIdentity,
+			};
 			use std::cell::Cell;
 			use std::rc::Rc;
 
@@ -14384,16 +14462,16 @@ mod tests {
 				first: FirstTab,
 				restore_dir: Option<PathBuf>,
 			) -> (Entity<TabsRoot>, &mut VisualTestContext) {
+				launch_tabs(cx, Launch::single(first, restore_dir))
+			}
+
+			fn launch_tabs(
+				cx: &mut TestAppContext,
+				launch: Launch,
+			) -> (Entity<TabsRoot>, &mut VisualTestContext) {
 				cx.update(|cx| cx.bind_keys(crate::key_bindings()));
 				let (root, cx) = cx.add_window_view(|window, cx| {
-					TabsRoot::new(
-						first,
-						restore_dir,
-						"normal".into(),
-						None,
-						window,
-						cx,
-					)
+					TabsRoot::new(launch, "normal".into(), None, window, cx)
 				});
 				settle(cx);
 				(root, cx)
@@ -15290,6 +15368,396 @@ mod tests {
 				assert_eq!(
 					m.read_with(cx, |m, _| m.top_inset),
 					crate::tabs::TAB_BAR_H
+				);
+			}
+			fn saved(store: &Path) -> crate::open_tabs::OpenTabs {
+				crate::open_tabs::load_from(store).expect("tabs saved")
+			}
+
+			fn local_tab(p: &Path) -> crate::open_tabs::SavedTab {
+				crate::open_tabs::SavedTab::Local {
+					path: p.to_path_buf(),
+				}
+			}
+
+			/// A launch reopens the saved tabs in order and shows the one
+			/// that was shown. A remote tab whose host cannot be reached
+			/// keeps its place and says why, and connects on a later try.
+			#[gpui::test]
+			fn a_launch_restores_the_saved_tabs_and_retries_a_remote_one(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::{OpenTabs, SavedTab};
+				use crate::tabs::Conn;
+				let _remote = remote_lock();
+				let (_tmp, a, b) = two_workspaces();
+				let shared_tmp = tempfile::tempdir().unwrap();
+				let shared = dunce::canonicalize(shared_tmp.path()).unwrap();
+				repo(&shared, "proj", &[("remote.txt", "r\n")]);
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				let host = snip_remote::RemoteHost::in_process(worker);
+				let store = tempfile::tempdir().unwrap();
+				let remote_tab = SavedTab::Remote {
+					host: host.name.clone(),
+					path: shared.display().to_string(),
+				};
+				let tabs = OpenTabs {
+					tabs: vec![local_tab(&a), remote_tab, local_tab(&b)],
+					active: Some(2),
+				};
+				let (root, cx) = launch_tabs(
+					cx,
+					Launch {
+						restore: Some(tabs.clone()),
+						first: FirstTab::Empty,
+						restore_dir: None,
+						store: Some(store.path().to_path_buf()),
+					},
+				);
+				let name =
+					shared.file_name().unwrap().to_string_lossy().into_owned();
+				assert_eq!(
+					labels(&root, cx),
+					[
+						"ws-a".to_string(),
+						format!("{} ▸ {name}", host.name),
+						"ws-b".to_string()
+					]
+				);
+				assert_eq!(active(&root, cx), Some(2));
+				assert!(focused_in(&tab(&root, cx, 2), cx));
+				// No ssh host has that name: the tab stays, failed, and its
+				// hover text says why.
+				let views = root.read_with(cx, |r, cx| r.tab_views(cx));
+				assert_eq!(views[1].1.conn, Some(Conn::Failed));
+				let why = views[1].1.failed.clone().expect("a reason");
+				assert!(why.contains(&host.name), "{why}");
+				click_id(cx, "ws-tab:1".into());
+				assert!(drawn(cx, "ws-tab-state:1:failed"));
+				let remote = tab(&root, cx, 1);
+				remote.read_with(cx, |m, _| {
+					assert_eq!(m.status.key, "remote_open_failed");
+				});
+				assert_eq!(
+					saved(store.path()).tabs,
+					tabs.tabs,
+					"kept while failed"
+				);
+
+				// The host appears; the next try connects the same tab.
+				remote.update(cx, |m, _| m.remote.hosts = vec![host.clone()]);
+				cx.executor().advance_clock(crate::remote::retry_delay(1));
+				settle(cx);
+				wait(cx, "the retry connects", |cx| {
+					remote.read_with(cx, |m, _| m.remote.session.is_some())
+				});
+				assert_eq!(count(&root, cx), 3, "no new tab");
+				let views = root.read_with(cx, |r, cx| r.tab_views(cx));
+				assert_eq!(views[1].1.conn, Some(Conn::Connected));
+				assert_eq!(views[1].1.failed, None);
+				assert_eq!(
+					saved(store.path()),
+					OpenTabs {
+						tabs: tabs.tabs.clone(),
+						active: Some(1),
+					}
+				);
+			}
+
+			/// A saved folder that is gone is skipped, and the status bar
+			/// of the tab shown says how many were.
+			#[gpui::test]
+			fn a_missing_folder_is_skipped_and_counted(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::OpenTabs;
+				let (tmp, a, _b) = two_workspaces();
+				let gone = tmp.path().join("gone");
+				let store = tempfile::tempdir().unwrap();
+				let (root, cx) = launch_tabs(
+					cx,
+					Launch {
+						restore: Some(OpenTabs {
+							tabs: vec![local_tab(&gone), local_tab(&a)],
+							active: Some(0),
+						}),
+						first: FirstTab::Empty,
+						restore_dir: None,
+						store: Some(store.path().to_path_buf()),
+					},
+				);
+				let m = tab(&root, cx, 0);
+				// On the status bar, and in a card that outlives the
+				// statuses of the tab's first load.
+				m.read_with(cx, |m, _| {
+					let (_, ok, msg) = m.toast.clone().expect("a card");
+					assert!(!ok);
+					assert_eq!(msg.key, "workspace_restore_skipped");
+					assert_eq!(msg.args, ["1"]);
+				});
+				wait(cx, "workspace a", |cx| workspace_ready(&m, cx));
+				assert_eq!(labels(&root, cx), ["ws-a"]);
+				assert_eq!(
+					saved(store.path()),
+					OpenTabs {
+						tabs: vec![local_tab(&a)],
+						active: Some(0),
+					}
+				);
+			}
+
+			/// `--workspace` after a restore: a folder already restored,
+			/// even spelled through a symlink, is switched to; a new one is
+			/// added. Either way it is shown, and only it pastes into
+			/// `--restore-dir`.
+			#[gpui::test]
+			fn the_workspace_argument_is_shown_and_alone_gets_the_restore_dir(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::OpenTabs;
+				let (tmp, a, b) = two_workspaces();
+				let dest = tmp.path().join("dest");
+				fs::create_dir(&dest).unwrap();
+				#[cfg(unix)]
+				let arg = {
+					let link = tmp.path().join("link-to-b");
+					std::os::unix::fs::symlink(&b, &link).unwrap();
+					link
+				};
+				#[cfg(not(unix))]
+				let arg = b.clone();
+				let tabs = OpenTabs {
+					tabs: vec![local_tab(&a), local_tab(&b)],
+					active: Some(0),
+				};
+				let launch = |first| Launch {
+					restore: Some(tabs.clone()),
+					first,
+					restore_dir: Some(dest.clone()),
+					store: None,
+				};
+				let (root, cx) = launch_tabs(cx, launch(FirstTab::Local(arg)));
+				assert_eq!(labels(&root, cx), ["ws-a", "ws-b"]);
+				assert_eq!(active(&root, cx), Some(1));
+				let dest_of = |ix, cx: &mut VisualTestContext| {
+					tab(&root, cx, ix)
+						.read_with(cx, |m, _| m.current_restore_destination())
+				};
+				assert_eq!(dest_of(1, cx), dest);
+				assert_ne!(dest_of(0, cx), dest);
+				// A tab opened later pastes into its own repo.
+				click_id(cx, "ws-tab-new".into());
+				let c = tmp.path().join("ws-c");
+				fs::create_dir(&c).unwrap();
+				repo(&c, "gamma", &[]);
+				open_typed(&root, cx, &c);
+				wait(cx, "tab c", |cx| {
+					count(&root, cx) == 3
+						&& workspace_ready(&tab(&root, cx, 2), cx)
+				});
+				assert_ne!(dest_of(2, cx), dest);
+				let _ = c;
+			}
+
+			#[gpui::test]
+			fn a_new_workspace_argument_is_added_after_the_restored_tabs(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::OpenTabs;
+				let (tmp, a, b) = two_workspaces();
+				let c = tmp.path().join("ws-c");
+				fs::create_dir(&c).unwrap();
+				let (root, cx) = launch_tabs(
+					cx,
+					Launch {
+						restore: Some(OpenTabs {
+							tabs: vec![local_tab(&a), local_tab(&b)],
+							active: Some(0),
+						}),
+						first: FirstTab::Local(c.clone()),
+						restore_dir: None,
+						store: None,
+					},
+				);
+				assert_eq!(labels(&root, cx), ["ws-a", "ws-b", "ws-c"]);
+				assert_eq!(active(&root, cx), Some(2));
+			}
+
+			/// Nothing left open last time: one empty tab, and the empty
+			/// list stays saved.
+			#[gpui::test]
+			fn an_empty_saved_list_opens_one_empty_tab(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::OpenTabs;
+				let store = tempfile::tempdir().unwrap();
+				let (root, cx) = launch_tabs(
+					cx,
+					Launch {
+						restore: Some(OpenTabs::default()),
+						first: FirstTab::Empty,
+						restore_dir: None,
+						store: Some(store.path().to_path_buf()),
+					},
+				);
+				assert_eq!(count(&root, cx), 1);
+				assert!(
+					tab(&root, cx, 0).read_with(cx, |m, _| m.is_empty_tab())
+				);
+				assert_eq!(saved(store.path()), OpenTabs::default());
+			}
+
+			/// Opening, switching and closing tabs by mouse and keys each
+			/// save the tabs; quitting leaves them as they were.
+			#[gpui::test]
+			fn tabs_are_saved_on_open_switch_and_close_but_not_on_quit(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::OpenTabs;
+				let (tmp, a, b) = two_workspaces();
+				let store = tempfile::tempdir().unwrap();
+				let (root, cx) = launch_tabs(
+					cx,
+					Launch {
+						restore: None,
+						first: FirstTab::Local(a.clone()),
+						restore_dir: None,
+						store: Some(store.path().to_path_buf()),
+					},
+				);
+				let both = |active| OpenTabs {
+					tabs: vec![local_tab(&a), local_tab(&b)],
+					active: Some(active),
+				};
+				assert_eq!(
+					saved(store.path()),
+					OpenTabs {
+						tabs: vec![local_tab(&a)],
+						active: Some(0)
+					}
+				);
+				click_id(cx, "ws-tab-new".into());
+				open_typed(&root, cx, &b);
+				wait(cx, "tab b", |cx| {
+					count(&root, cx) == 2
+						&& workspace_ready(&tab(&root, cx, 1), cx)
+				});
+				assert_eq!(saved(store.path()), both(1));
+				click_id(cx, "ws-tab:0".into());
+				assert_eq!(saved(store.path()), both(0));
+				cx.simulate_keystrokes("cmd-2");
+				settle(cx);
+				assert_eq!(saved(store.path()), both(1));
+				// An empty tab is not saved, but the shown one is unknown.
+				click_id(cx, "ws-tab-new".into());
+				assert_eq!(
+					saved(store.path()),
+					OpenTabs {
+						tabs: both(0).tabs,
+						active: None
+					}
+				);
+				cx.simulate_keystrokes("cmd-w");
+				settle(cx);
+				wait(cx, "empty tab closed", |cx| count(&root, cx) == 2);
+				cx.simulate_keystrokes("cmd-1 cmd-w");
+				wait(cx, "tab a closed", |cx| count(&root, cx) == 1);
+				let only_b = OpenTabs {
+					tabs: vec![local_tab(&b)],
+					active: Some(0),
+				};
+				assert_eq!(saved(store.path()), only_b);
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				wait(cx, "quit", |cx| root.read_with(cx, |r, _| r.quit_sent));
+				assert_eq!(
+					saved(store.path()),
+					only_b,
+					"a quit keeps the tabs"
+				);
+				let _ = tmp;
+			}
+			/// A quit that stops (a tab's drain gave up) resumes its tabs one
+			/// by one; the saved tabs stay as they were before the quit.
+			#[gpui::test]
+			fn a_stopped_quit_leaves_the_saved_tabs_alone(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, b) = two_workspaces();
+				let store = tempfile::tempdir().unwrap();
+				let (root, cx) = launch_tabs(
+					cx,
+					Launch {
+						restore: None,
+						first: FirstTab::Local(a.clone()),
+						restore_dir: None,
+						store: Some(store.path().to_path_buf()),
+					},
+				);
+				click_id(cx, "ws-tab-new".into());
+				open_typed(&root, cx, &b);
+				wait(cx, "tab b", |cx| {
+					count(&root, cx) == 2
+						&& workspace_ready(&tab(&root, cx, 1), cx)
+				});
+				let file = store.path().join("open-tabs.json");
+				let before = fs::read(&file).unwrap();
+				let (ta, tb) = (tab(&root, cx, 0), tab(&root, cx, 1));
+				let b_load = hold_job(&tb, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				assert_eq!(fs::read(&file).unwrap(), before);
+				tb.update(cx, |_, cx| cx.emit(TabEvent::DrainFailed));
+				settle(cx);
+				assert_eq!(fs::read(&file).unwrap(), before, "while resuming");
+				b_load.set(true);
+				wait(cx, "A reloaded", |cx| {
+					ta.read_with(cx, |m, _| {
+						!m.files.is_empty() && !m.is_loading
+					})
+				});
+				assert!(!root.read_with(cx, |r, _| r.quit_sent));
+				assert_eq!(fs::read(&file).unwrap(), before, "after the stop");
+			}
+
+			/// A restored remote tab that never connected closes like any
+			/// other, and leaves the saved tabs.
+			#[gpui::test]
+			fn a_failed_restored_tab_closes_and_is_no_longer_saved(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::{OpenTabs, SavedTab};
+				let (_tmp, a, _b) = two_workspaces();
+				let store = tempfile::tempdir().unwrap();
+				let (root, cx) = launch_tabs(
+					cx,
+					Launch {
+						restore: Some(OpenTabs {
+							tabs: vec![
+								local_tab(&a),
+								SavedTab::Remote {
+									host: "snip-test-gone-host".into(),
+									path: "/srv/x".into(),
+								},
+							],
+							active: Some(1),
+						}),
+						first: FirstTab::Empty,
+						restore_dir: None,
+						store: Some(store.path().to_path_buf()),
+					},
+				);
+				assert!(drawn(cx, "ws-tab-state:1:failed"));
+				cx.simulate_keystrokes("cmd-w");
+				wait(cx, "failed tab closed", |cx| count(&root, cx) == 1);
+				assert_eq!(
+					saved(store.path()),
+					OpenTabs {
+						tabs: vec![local_tab(&a)],
+						active: Some(0),
+					}
 				);
 			}
 		}

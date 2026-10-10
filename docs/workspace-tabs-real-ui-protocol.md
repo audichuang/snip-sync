@@ -21,6 +21,7 @@
 - 背景（沒顯示）分頁印的 `[APP:…]` 行，在結尾的 `]` 前面多一個 ` ws_tab=<id>`（無冒號形式的行，例如 `[APP:PASTE_APPLYING]`，變成 `[APP:PASTE_APPLYING: ws_tab=<id>]`）。目前顯示的分頁印的行不變。分頁列（root）印的行**永遠不帶** ` ws_tab=`：`WS_TAB_OPENED`、`WS_TAB_ACTIVE`、`WS_TAB_CLOSED`、`QUIT: deferred`，以及 root 印的 `VIEWPORT`，都直接以 `]` 結尾。`<id>` 是分頁的穩定 id，從 1 起算、單調遞增、不重用；`ix` 是分頁列上的位置，從 0 起算，關掉前面的分頁後會變。
 - `generation` 是每個分頁自己的計數，不是全域的。不要拿一個分頁的 generation 去跟另一個分頁比大小。
 - Cmd/Ctrl+Q 與視窗關閉鈕是同一件事：所有分頁都排空之後才結束。任何一個分頁正在寫入已確認的貼上，就拒絕（`PASTE_BUSY: refused=quit`），並切到那個分頁，沒有任何分頁開始排空。每按一次 Cmd+Q 或關閉鈕，`QUIT: deferred` 恰好印一行；拒絕時 `PASTE_BUSY: refused=quit` 也恰好一行（分頁自己的 Quit 處理只轉給 root，不印日誌）。
+- 恢復分頁（#137）：設定資料夾的 `open-tabs.json`（`{"tabs":[{"kind":"local","path":<canonical>}|{"kind":"remote","host":<ssh Host 別名>,"path":<worker 真實路徑>}],"active":<索引或 null>}`）在分頁開、關、切換時寫入（只在有變化時；空的分頁列不存，目前分頁是空分頁時 `active` 是 null；Cmd+Q 不重寫它，內容是排空之前的分頁）。一般啟動先依存檔順序重開分頁，再處理 `--workspace`：它已在恢復的分頁裡就切過去（比對 canonical 路徑），否則新增一個分頁；兩者都顯示該分頁。沒帶 `--workspace` 就顯示存檔的目前分頁。從沒存過 `open-tabs.json` 時走舊的退路（`--workspace`、最近開啟的本機資料夾、啟動資料夾、空分頁）。`--mode idle/overview/preview` 只有一個分頁，不恢復也不存。存檔裡找不到的本機資料夾略過並計數（狀態列與失敗卡片「已略過 N 個找不到的工作區」）；遠端分頁立刻顯示並存成 `host ▸ name`，在背景連線，失敗時分頁保持 `failed` 狀態並在 5、10、20、40 秒、之後每 60 秒重試。`remote-last.json` 已被它取代（只在沒有 `open-tabs.json` 時轉成一個遠端分頁，然後刪除）。腳本的 `launch` 永遠帶 `--workspace`，所以沒帶 `--workspace` 的恢復不在這份規程驅動，由 native-e2e 的 `tabs_open_at_quit_come_back_on_the_next_launch` 涵蓋。
 - 視窗標題：`<目前分頁的標籤> — snip-sync`（em dash U+2014，前後各一個空格），沒有分頁或目前是空分頁時恰好是 `snip-sync`。
 - 標籤：本機是資料夾名稱，遠端是 `host ▸ name`；標籤相同的分頁加上父資料夾直到不同（`one/app`、`two/app`）；空分頁是「新分頁」（英文介面 `New tab`）。標題與分頁列用同一份標籤，標題用完整標籤，分頁列上超過 220 邏輯 px 的標籤以省略號截斷。
 
@@ -56,14 +57,15 @@ python3 "$REPO/scripts/real_ui_round.py" finish --run "$RUN"                  # 
 
 重點：
 
-- `launch --gate b` 一定從 `$RUN/gate-b/fixtures/ws-src` 開始（`--workspace`）。所以**每一次啟動後第一個分頁固定是 `ws-src`，`id=1 ix=0`**，日誌開頭有 `[APP:WS_TAB_OPENED: id=1 count=1` 與 `[APP:WS_TAB_ACTIVE: id=1 ix=0`。腳本沒有「無工作區」的啟動方式；要空狀態就用 Cmd+W 關掉它。
+- `launch --gate b` 一定從 `$RUN/gate-b/fixtures/ws-src` 開始（`--workspace`）。所以**第一次啟動後第一個分頁固定是 `ws-src`，`id=1 ix=0`**，日誌開頭有 `[APP:WS_TAB_OPENED: id=1 count=1` 與 `[APP:WS_TAB_ACTIVE: id=1 ix=0`。腳本沒有「無工作區」的啟動方式；要空狀態就用 Cmd+W 關掉它。**之後的啟動不一定是這樣**：`$RUN/config/open-tabs.json` 存在時，App 先依存檔順序重開上次的分頁（`id` 依存檔順序從 1 起算），再把 `--workspace`（`ws-src`，腳本一律帶）切過去或加在最後，並顯示它。只有存檔不存在（或沒有任何本機分頁可開）時才是 `ws-src` 單一分頁。下面的「重置」做法用來回到 S1；要測恢復的格子（WT100 到 WT103、WT02 d2）不重置。
 - 同一個 `$RUN` 內要重新啟動（換主題、重置分頁）時，**不要跑 `finish`**（它會移除 worktree 並還原剪貼簿，整輪結束）。做法：對 App 按 Cmd+Q，等 exit code 0（`$RUN/app-gate-b-exit.json`），然後
   ```bash
   N=$(ls "$RUN"/app-gate-b-*.log 2>/dev/null | wc -l); mv "$RUN/app-gate-b.log" "$RUN/app-gate-b-$N.log"
+  rm -f "$RUN/config/open-tabs.json"      # 重置分頁，回到 S1；要測恢復的格子不做這一行
   python3 "$REPO/scripts/real_ui_round.py" launch --gate b --run "$RUN"
   ```
   監督程式以附加模式開日誌檔，所以先把舊日誌改名，新日誌才只含這一次啟動。`point` 讀的是 `app-process.json` 裡的 `log`，就是新的 `app-gate-b.log`。
-- 設定資料夾 `$RUN/config` 在重新啟動之間保留（最近開啟的工作區會留下）。這是預期的，用在最近開啟的格子。
+- 設定資料夾 `$RUN/config` 在重新啟動之間保留：最近開啟的工作區（`recent-workspaces.json`）與上次的分頁（`open-tabs.json`）都會留下。這是預期的，前者用在最近開啟的格子，後者用在恢復分頁的格子（4.14）。不是要測恢復時，重新啟動前一定先刪掉 `open-tabs.json`（上面的 `rm -f`），否則新的啟動會多出上一輪的分頁，後面格子假設的 `id` 與 `ix` 全部對不上。
 - `SNIP_THEME` 寫死在 `$RUN/environment.json` 的 `launch_env.SNIP_THEME`（預設 `dark`）。跑 light 的格子：Cmd+Q、改 `launch_env.SNIP_THEME` 成 `light`、照上面重新 `launch`。見 WT81。
 
 ### 1.3 殘留、設定快照
@@ -198,7 +200,7 @@ PY
 | S3 | S1 之後依序 `OPEN($T/alpha)`（`id=2`）、`OPEN($T/beta)`（`id=3`）：`[ws-src, alpha, beta]`，目前 `ix=2` |
 | S4 | S3 之後 `OPEN($T/gamma)`（`id=4`）：`[ws-src, alpha, beta, gamma]`，目前 `ix=3` |
 
-每一格的「前置狀態」寫明用哪個起點、目前是哪個分頁。不確定現在是不是那個狀態時，Cmd+Q、改名日誌、重新 `launch`、重建（`id` 從 1 重新起算）。開始動作前截一張 `before.png` 確認分頁列與標題。
+每一格的「前置狀態」寫明用哪個起點、目前是哪個分頁。不確定現在是不是那個狀態時，Cmd+Q、改名日誌、刪 `open-tabs.json`（1.2）、重新 `launch`、重建（`id` 從 1 重新起算）。開始動作前截一張 `before.png` 確認分頁列與標題。
 
 ## 3. 用到的控制項與日誌
 
@@ -219,6 +221,9 @@ PY
 | `[APP:WS_TAB_OPENED: id=N count=M` | root 印，不帶 ` ws_tab=`。新增了分頁（`N` 是新 id，`M` 是新增後的分頁數）。啟動時第一個分頁也印一行 |
 | `[APP:WS_TAB_ACTIVE: id=N ix=I` | root 印，不帶 ` ws_tab=`。分頁 `N` 成為目前分頁，位置 `I`。已經是目前分頁時不印 |
 | `[APP:WS_TAB_CLOSED: id=N count=M` | root 印，不帶 ` ws_tab=`。分頁 `N` 被移除，剩 `M` 個 |
+| `[APP:WS_TABS_RESTORED: count=N skipped=K]` | root 印，啟動時恰好一行，只在讀到存檔（`open-tabs.json`，或由 `remote-last.json` 轉成的）時印。`N` 是恢復之後的分頁數（含 `--workspace` 新增的），`K` 是因資料夾不存在而略過的本機分頁數。每個恢復的分頁各自先印一行 `WS_TAB_OPENED`，`id` 依存檔順序，`--workspace` 的分頁若是新的，排在最後 |
+| `[APP:REMOTE_REOPEN: host=<h> path=<p>` | 恢復遠端分頁時印，分頁已先顯示，連線在背景進行，狀態列「正在重新連線 …」 |
+| `[APP:REMOTE_RETRY: attempt=N` | 遠端分頁恢復失敗後的背景重試：5、10、20、40 秒，之後每 60 秒一次；成功就在同一個分頁連上 |
 | `... ws_tab=<id>]` | 背景分頁印的行的標記，在結尾 `]` 前；root 印的行永不帶 |
 | `[APP:WORKSPACE: state=open path=<p> generation=G]`／`state=closed` | 該分頁的工作區開／關 |
 | `[APP:LIFECYCLE: phase=<…> intent=<quit\|close-workspace\|open-workspace\|open-remote-workspace> …]` | 該分頁的排空階段；結束時每個分頁各印一行 `phase=drained intent=quit jobs=0 …` |
@@ -274,9 +279,9 @@ PY
   - d（最近開啟，同一工作階段）：目前在 `beta`（`ix=2`），`btn-workspace-menu`。開選單時會重讀 `$RUN/config/recent-workspaces.json` 與 `remote-recent.json`，所以在別的分頁開過的 `alpha` 也會列在 `beta` 的選單裡。`hv` 到每一列看 tooltip 的完整路徑，找出 `$T/alpha` 那一列（`workspace-recent:<ix>`，`ix` 以 `CTRL_BOUNDS` 為準），點它：切到 `alpha`，沒有新分頁。
   - e：目前在 `alpha`（`ix=1`），`OPEN($T/alpha)`（開自己）。
   - f：點目前分頁自己 `ws-tab:1`。
-  - d2（最近開啟，重新啟動版，做在 f 之後）：`Cmd+Q` 結束，等 exit code 0，日誌改名，重新 `launch`（1.2）。新的 `ws-src` 分頁建立時讀取 `$RUN/config/recent-workspaces.json`，所以選單裡有 `$T/alpha`、`$T/beta` 的 `workspace-recent:<ix>`。`btn-workspace-menu`，`hv` 到每一列看 tooltip，點 `$T/alpha` 那一列：開出 `alpha` 的新分頁（`WS_TAB_OPENED`、`WS_TAB_ACTIVE`、`WORKSPACE: state=open`）。`Cmd+1` 回到 `ws-src`，再開選單點同一列：只切換。
-- **預期畫面**：每一步結束後分頁列仍是 `ws-src`、`alpha`、`beta` 三個，沒有新分頁；a 到 d 結束後目前分頁是 `alpha`（`ix=1`），標題 `alpha — snip-sync`，工作區選單已關。e 與 f 之後畫面沒變（e 只是把選單關了）。d、d2：選單裡一定有 `$T/alpha` 那一列；沒有就判 `fail`，證據欄寫 `missing-control`。d2 結束後分頁列是 `ws-src`、`alpha` 兩個。
-- **比對**：a、b、c 各自 `L:` `[APP:WS_TAB_ACTIVE: id=2 ix=1`，`NOT:` `WS_TAB_OPENED`、`WORKSPACE: state=open`、`WORKSPACE: state=closed`、`WS_TAB_CLOSED`。d：同 a 到 c，`L:` `[APP:WS_TAB_ACTIVE: id=2 ix=1`，`NOT:` `WS_TAB_OPENED`、`WORKSPACE: state=open`。d2 的第一次點擊：`L:` `[APP:WS_TAB_OPENED: id=2 count=2`、`[APP:WS_TAB_ACTIVE: id=2 ix=1`、`[APP:WORKSPACE: state=open path=$T/alpha generation=`；第二次點擊：只有 `[APP:WS_TAB_ACTIVE: id=2 ix=1`，`NOT:` `WS_TAB_OPENED`、`WORKSPACE: state=open`。每一步之後 `wtitle` = `alpha — snip-sync`。e、f：`NOT:` 任何 `[APP:WS_TAB_`、任何 `[APP:WORKSPACE:`。`$T/alpha` 的日誌顯示沒有再出現 `READY_REPOS`。每一步 `clip` 與 `git -C "$T/alpha" status --porcelain` 不變。
+  - d2（最近開啟，重新啟動版，做在 f 之後）：`Cmd+Q` 結束，等 exit code 0，日誌改名，**不刪** `open-tabs.json`，重新 `launch`（1.2）。這一次啟動會恢復存檔的 `ws-src`、`alpha`、`beta` 三個分頁（`id=1`、`2`、`3`），`--workspace` 的 `ws-src` 已在其中，所以只是切過去並顯示（`ix=0`）。先 `Cmd+3`、`Cmd+W`、`Cmd+2`、`Cmd+W` 關掉 `beta` 與 `alpha`，只剩 `ws-src`（`WS_TAB_CLOSED: id=3 count=2`、`id=2 count=1`）。再 `btn-workspace-menu`；`$RUN/config/recent-workspaces.json` 仍列著 `$T/alpha`、`$T/beta`，所以選單裡有它們的 `workspace-recent:<ix>`。`hv` 到每一列看 tooltip，點 `$T/alpha` 那一列：開出 `alpha` 的新分頁（`WS_TAB_OPENED: id=4 count=2`，`id` 不重用 2；`WS_TAB_ACTIVE`、`WORKSPACE: state=open`）。`Cmd+1` 回到 `ws-src`，再開選單點同一列：只切換。
+- **預期畫面**：每一步結束後分頁列仍是 `ws-src`、`alpha`、`beta` 三個，沒有新分頁；a 到 d 結束後目前分頁是 `alpha`（`ix=1`），標題 `alpha — snip-sync`，工作區選單已關。e 與 f 之後畫面沒變（e 只是把選單關了）。d、d2：選單裡一定有 `$T/alpha` 那一列；沒有就判 `fail`，證據欄寫 `missing-control`。d2 結束後分頁列是 `ws-src`、`alpha`（`id=4`）兩個。
+- **比對**：a、b、c 各自 `L:` `[APP:WS_TAB_ACTIVE: id=2 ix=1`，`NOT:` `WS_TAB_OPENED`、`WORKSPACE: state=open`、`WORKSPACE: state=closed`、`WS_TAB_CLOSED`。d：同 a 到 c，`L:` `[APP:WS_TAB_ACTIVE: id=2 ix=1`，`NOT:` `WS_TAB_OPENED`、`WORKSPACE: state=open`。d2 重新啟動之後：`L:` `[APP:WS_TABS_RESTORED: count=3 skipped=0]`，三行 `WS_TAB_OPENED` 依序 `id=1 count=1`、`id=2 count=2`、`id=3 count=3`，`NOT:` `id=4`（`--workspace` 沒有加第四個分頁）。d2 的第一次點擊：`L:` `[APP:WS_TAB_OPENED: id=4 count=2`、`[APP:WS_TAB_ACTIVE: id=4 ix=1`、`[APP:WORKSPACE: state=open path=$T/alpha generation=`；第二次點擊：只有 `[APP:WS_TAB_ACTIVE: id=4 ix=1`，`NOT:` `WS_TAB_OPENED`、`WORKSPACE: state=open`。a 到 f 每一步之後 `wtitle` = `alpha — snip-sync`。e、f：`NOT:` 任何 `[APP:WS_TAB_`、任何 `[APP:WORKSPACE:`。`$T/alpha` 的日誌顯示沒有再出現 `READY_REPOS`。每一步 `clip` 與 `git -C "$T/alpha" status --porcelain` 不變。
 - **截圖**：`before.png`、`a-after.png`、`b-after.png`、`c-after.png`、`d-menu.png`（選單與最近開啟列）、`d-after.png`、`e-after.png`、`f-after.png`、`d2-menu.png`、`d2-after.png`。
 
 #### WT03 巢狀資料夾各有自己的分頁
@@ -693,7 +698,7 @@ PY
   ```bash
   python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["launch_env"]["SNIP_THEME"]="light"; json.dump(d,open(p,"w"),indent=2)' "$RUN/environment.json"
   ```
-  然後照 1.2 重新 `launch`、`resize 1080 720`，S3，目前 `alpha`。本格結束後把 `SNIP_THEME` 改回 `dark`（若後面還有格子）。
+  然後照 1.2 重新 `launch`（含刪 `open-tabs.json` 的重置）、`resize 1080 720`，S3，目前 `alpha`。本格結束後把 `SNIP_THEME` 改回 `dark`（若後面還有格子）。
 - **操作**：同 WT80，截圖名稱換成 `light-*`。
 - **預期畫面**：淺色調色盤下，分頁列底色 `#e9eaee`、目前分頁 `#e3ebfe`、hover `#ededed`、非目前文字 `#5f6269`。目前分頁與分頁列的底色差異很小（紅綠通道只差 6 與 1，藍色差 16）：以截圖用肉眼判斷看得出哪個是目前分頁，文字顏色的差異（目前分頁用主要文字色、其他用 `#5f6269`）一併計入；hover 底色 `#ededed` 與分頁列 `#e9eaee` 幾乎一樣，hover 時是否看得出變化：如實記錄，`TODO(verify)`（對比不足時記為 `ui-defect`，附取樣值）。
 - **比對**：取樣值與上表相符（每個通道誤差 ≤ 2），寫進 `action.json`。其他同 WT80。
@@ -727,11 +732,74 @@ PY
 - **比對**：每一步 `wtitle` 與預期逐字相同（em dash U+2014，前後各一個半形空格；以 `wtitle | od -c` 或 `python3 -c` 比對 `"—"`）。每一步也看 `shot` 的標題列。
 - **截圖**：`before.png`、`step-1.png` 起到 `step-9.png`。
 
+### 4.14 恢復分頁（WT100–WT103）
+
+這一節測 #137：正常啟動會重開上次的分頁。`launch` 永遠帶 `--workspace $B/ws-src`，所以每一格的重新啟動都是「恢復存檔的分頁，再處理 `--workspace`」；沒帶 `--workspace`、顯示存檔目前分頁的那條路徑，腳本驅動不到，由 native-e2e 的 `tabs_open_at_quit_come_back_on_the_next_launch` 涵蓋，這裡不重測。遠端分頁的恢復與重試（`REMOTE_REOPEN`、`REMOTE_RETRY`、失敗圖示）需要 Ubuntu 準備與可靠的失敗觸發，由遠端規程與 native-e2e 負責，不在這一節。
+
+共同規則：
+
+- 每一格的第一次啟動從重置好的 S1 開始（1.2：Cmd+Q、改名日誌、`rm -f "$RUN/config/open-tabs.json"`、`launch`）。**第二次啟動不刪 `open-tabs.json`**，這就是受測的動作。
+- 重新啟動之後日誌是新檔，要重新 `export PID=…`（1.5）並 `mark`；`resize 1080 720`。
+- 存檔的比對用 `$RUN/config/open-tabs.json`（`SNIP_CONFIG_DIR` 指到 `$RUN/config`，不是真實設定資料夾）。路徑都是 canonical：`$RUN` 已經是 `pwd -P` 的結果，所以 `$B`、`$T` 展開後就是 canonical 路徑。讀存檔的做法：
+  ```bash
+  OT="$RUN/config/open-tabs.json"
+  ot_check() {   # ot_check <active 索引或 null> <路徑…>：存檔的分頁依序是這些本機路徑，active 相符
+    python3 -I - "$OT" "$@" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+want_active = None if sys.argv[2] == "null" else int(sys.argv[2])
+want = [{"kind": "local", "path": p} for p in sys.argv[3:]]
+assert d["tabs"] == want, d
+assert d["active"] == want_active, d
+print("ok open-tabs.json", d)
+PY
+  }
+  ```
+
+#### WT100 Cmd+Q 之後重新啟動，分頁按存檔順序回來
+
+- **前置狀態**：剛重置的 S1（`[ws-src]`，`id=1`），1080×720。`ln -sfn "$T/beta" "$T/beta-link"`（beta 的 symlink 拼法；`prepare` 與 1.4 沒有建它，這一格自己建，`$T` 下的 symlink 不是 repo）。
+- **操作**：(1) `case_start WT100`，`shot before`。(2) `OPEN($T/alpha)`（`id=2`）。(3) `OPEN("$T/beta-link")`（輸入 symlink 拼法，`id=3`）。(4) `Cmd+1`，再 `Cmd+3`（切到 `beta`，存檔的目前分頁是它）。等 2 秒，`shot before-quit`，`cp "$OT" "$CASE/open-tabs-before.json"`，`ot_check 2 "$B/ws-src" "$T/alpha" "$T/beta"`。(5) `Cmd+Q`，等 exit code 0（`$RUN/app-gate-b-exit.json`），日誌改名，**不刪** `open-tabs.json`，`launch --gate b`，`export PID=…`，`mark`，`resize 1080 720`。(6) 等 5 秒，`shot after-relaunch`，`wtitle`，`cp "$OT" "$CASE/open-tabs-after.json"`。(7) 依序 `Cmd+2`、`Cmd+3`，每次 `wtitle`，`shot tab-alpha`、`shot tab-beta`；`hv` 到 `ws-tab:2` 停 2 秒，`shot hover-beta`。
+- **預期畫面**：(4) 三個分頁 `ws-src`、`alpha`、`beta`，目前 `beta`。(6) 重新啟動後分頁列還是 `ws-src`、`alpha`、`beta` 三個、順序不變，沒有第四個分頁，也沒有空分頁；目前顯示的是 `ws-src`（`--workspace` 的分頁，已在恢復的分頁裡，所以切過去，不新增），標題 `ws-src — snip-sync`。三個分頁都是資料夾圖示。(7) `alpha`、`beta` 的工作台都已載入；`beta` 的 tooltip 是 `$T/beta`（canonical 路徑，不是 `beta-link`）。
+- **比對**：(4) `ot_check 2 "$B/ws-src" "$T/alpha" "$T/beta"` 通過（`beta` 存的是 canonical 的 `$T/beta`，不是 `$T/beta-link`）；`$CASE/open-tabs-before.json` 同。(5) 第二次啟動的新日誌 `L:` 三行 `[APP:WS_TAB_OPENED: id=1 count=1`、`id=2 count=2`、`id=3 count=3`（依存檔順序，所以 `ws-src` 仍是 `id=1`），接著 `[APP:WS_TABS_RESTORED: count=3 skipped=0]`，`NOT:` `WS_TAB_OPENED: id=4`、`count=4`。恢復的分頁不印 `WORKSPACE: state=open`（那一行只在開啟動作完成時印），所以 `NOT:` `[APP:WORKSPACE: state=open`。之後才是啟動唯一的一行 `WS_TAB_ACTIVE`：`L:` `[APP:WS_TAB_ACTIVE: id=1 ix=0]`；`wtitle` = `ws-src — snip-sync`。(6) `ot_check` 的 `tabs` 仍是 `$B/ws-src`、`$T/alpha`、`$T/beta` 三個，順序不變；`active` 是 `0`（啟動時切到 `--workspace` 的分頁也寫進存檔）。(7) `Cmd+2` 之後 `[APP:WS_TAB_ACTIVE: id=2 ix=1`、`wtitle` = `alpha — snip-sync`；`Cmd+3` 之後 `[APP:WS_TAB_ACTIVE: id=3 ix=2`、`wtitle` = `beta — snip-sync`。`git -C "$T/alpha" status --porcelain`、`git -C "$T/beta" status --porcelain` 為空。
+- **截圖**：`before.png`、`before-quit.png`、`after-relaunch.png`、`tab-alpha.png`、`tab-beta.png`、`hover-beta.png`。
+
+#### WT101 存檔裡的資料夾被刪掉：略過並計數
+
+- **前置狀態**：剛重置的 S1，1080×720。`mkrepo "$T/gone"`（1.4 的函式；這一格自己建這個資料夾，做完不必還原）。
+- **操作**：(1) `case_start WT101`，`shot before`。(2) `OPEN($T/gone)`（`id=2`）、`OPEN($T/alpha)`（`id=3`）。等 2 秒，`ot_check 2 "$B/ws-src" "$T/gone" "$T/alpha"`。(3) `Cmd+Q`，等 exit code 0，日誌改名，**不刪** `open-tabs.json`。(4) `rm -rf "$T/gone"`，然後 `launch --gate b`，`export PID=…`，`mark`，`resize 1080 720`。(5) 立刻（卡片 12 秒內）`shot card`，轉錄狀態列與卡片文字進 `screen_text`；再 `shot after-relaunch`，`wtitle`。(6) 等 13 秒，`shot card-gone`（卡片應已消失；狀態列文字可以還在）。
+- **預期畫面**：(5) 分頁列只有 `ws-src`、`alpha` 兩個（`gone` 沒有分頁，也沒有空分頁頂替），目前顯示 `ws-src`，標題 `ws-src — snip-sync`。顯示中的分頁（`ws-src`）的狀態列是「已略過 1 個找不到的工作區」（英文介面 `Skipped 1 workspaces that no longer exist`；中文介面不得是原始 key `workspace_restore_skipped`），並且有一張失敗卡片（toast，持續約 12 秒）寫同一句。(6) 卡片消失。
+- **比對**：`L:` `[APP:WS_TAB_OPENED: id=1 count=1`、`[APP:WS_TAB_OPENED: id=2 count=2`（`alpha` 接著 `ws-src` 拿到 `id=2`，被略過的 `gone` 沒有占 `id`）、`[APP:WS_TABS_RESTORED: count=2 skipped=1]`、`[APP:WS_TAB_ACTIVE: id=1 ix=0]`。`NOT:` `WS_TAB_OPENED: id=3`、`[APP:WORKSPACE: state=open path=$T/gone`。卡片的日誌行：`L:` `[APP:TOAST: ok=false]`。`wtitle` = `ws-src — snip-sync`。存檔在啟動時就改寫成恢復後的樣子，`gone` 不再出現：`ot_check` 的 `tabs` 只有 `$B/ws-src`、`$T/alpha`。切到 `alpha`（`Cmd+2`）後 `[APP:WS_TAB_ACTIVE: id=2 ix=1`、標題 `alpha — snip-sync`。
+- **截圖**：`before.png`、`card.png`、`after-relaunch.png`、`card-gone.png`。
+
+#### WT102 `--workspace` 指到已恢復的資料夾：切過去，不重複開
+
+- **前置狀態**：剛重置的 S1，1080×720。
+- **操作**：(1) `case_start WT102`，`shot before`。(2) `OPEN($T/alpha)`（`id=2`），`Cmd+2`（存檔的目前分頁是 `alpha`），等 2 秒，`ot_check 1 "$B/ws-src" "$T/alpha"`。(3) `Cmd+Q`，等 exit code 0，日誌改名，**不刪** `open-tabs.json`，`launch --gate b`（`--workspace` 是 `$B/ws-src`，它已是存檔的第一個分頁），`export PID=…`，`mark`，`resize 1080 720`。(4) 等 5 秒，`shot after-relaunch`，`wtitle`，`ot_check` 記錄存檔。(5) 再做一次 (3) 與 (4)（再 `Cmd+Q`、改名日誌、不刪存檔、`launch`），`shot after-relaunch-2`，`wtitle`。
+- **預期畫面**：(4) 分頁列是 `ws-src`、`alpha` 兩個，沒有第二個 `ws-src`；顯示的是 `ws-src`（`--workspace` 的分頁優先於存檔的目前分頁 `alpha`），標題 `ws-src — snip-sync`。(5) 同 (4)：再次啟動分頁數不會長大。
+- **比對**：(4) `L:` `[APP:WS_TAB_OPENED: id=1 count=1`、`[APP:WS_TAB_OPENED: id=2 count=2`、`[APP:WS_TABS_RESTORED: count=2 skipped=0]`、`[APP:WS_TAB_ACTIVE: id=1 ix=0]`。`NOT:` 第三個 `WS_TAB_OPENED`（`newlog | grep -c 'WS_TAB_OPENED'` 恰好是 2；`id=3`、`count=3` 都不得出現）。`NOT:` `[APP:WORKSPACE: state=open`（`ws-src` 是切過去的，沒有再開一次）。`wtitle` = `ws-src — snip-sync`。存檔的 `tabs` 仍是兩個（`ot_check` 的路徑只有 `$B/ws-src`、`$T/alpha`；`active` 是 `0`）。(5) 同 (4)，`WS_TABS_RESTORED: count=2 skipped=0`，`WS_TAB_OPENED` 恰好兩行。`--workspace` 用 symlink 拼法時也應切過去（canonical 比對），但腳本的 `launch` 只會帶 `$B/ws-src`，這個拼法留給 `#[gpui::test]` 與 native-e2e，這一格不驅動。
+- **截圖**：`before.png`、`after-relaunch.png`、`after-relaunch-2.png`。
+
+#### WT103 Cmd+Q 不重寫 open-tabs.json
+
+- **前置狀態**：S3（`[ws-src, alpha, beta]`，`id=1`、`2`、`3`），目前 `beta`（`ix=2`），1080×720。
+- **操作**：(1) `case_start WT103`，`shot before`。(2) 等 3 秒（最後一次切換的寫入已經完成），記下存檔的狀態：
+  ```bash
+  python3 -I -c 'import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$OT" > "$CASE/mtime-before"
+  shasum -a 256 "$OT" > "$CASE/sha-before"; cp "$OT" "$CASE/open-tabs-before.json"
+  ot_check 2 "$B/ws-src" "$T/alpha" "$T/beta"
+  ```
+  (3) `mark`，`Cmd+Q`，等 exit code 0（最多 15 秒；`shot` 在按之前做，按之後視窗已關）。(4) 同樣記下 `mtime-after`、`sha-after`、`open-tabs-after.json`，`diff` 前後。(5) 照 WT100 的 (5) 重新啟動（不刪存檔），`shot after-relaunch`，確認三個分頁都回來。
+- **預期畫面**：(5) 重新啟動之後分頁列仍是 `ws-src`、`alpha`、`beta` 三個，沒有因為退出時分頁一個個排空而被存成空的或變少。
+- **比對**：(3) `L:` `[APP:QUIT: deferred`，三行 `[APP:LIFECYCLE: phase=drained intent=quit jobs=0`；三個分頁排空期間沒有被當成「關閉分頁」，所以 `NOT:` `WS_TAB_CLOSED`。(4) `mtime-before` 等於 `mtime-after`，`sha-before` 等於 `sha-after`，`diff open-tabs-before.json open-tabs-after.json` 沒有輸出，`ot_check 2 "$B/ws-src" "$T/alpha" "$T/beta"` 仍通過（`tabs` 還是三個，`active` 還是 `2`）。(5) `L:` `[APP:WS_TABS_RESTORED: count=3 skipped=0]`。
+- **截圖**：`before.png`、`after-relaunch.png`。
+
+
 ## 5. 完整性
 
 | ID | 驗證 | 通過線 |
 |---|---|---|
-| I-config | 同本機規程 I-config：第一次啟動前與最後一個 App 結束後，真實設定資料夾的檔案數、SHA-256、mtime、大小全部相同 | `diff` 兩個 `.sha` 與兩個 `.mtime` 沒有輸出；`$RUN/config/recent-workspaces.json` 存在 |
+| I-config | 同本機規程 I-config：第一次啟動前與最後一個 App 結束後，真實設定資料夾的檔案數、SHA-256、mtime、大小全部相同 | `diff` 兩個 `.sha` 與兩個 `.mtime` 沒有輸出；`$RUN/config/recent-workspaces.json` 與 `open-tabs.json` 存在（`open-tabs.json` 只寫進 `$RUN/config`，真實設定資料夾不得多出檔案） |
 | I-clip | 最後一次 `finish` 之後剪貼簿還原成開跑前的內容 | `finish` 的輸出說明剪貼簿雜湊相同 |
 | I-leftover | 每一次啟動前 `pgrep -fl snip-desktop-native` 沒有輸出；遠端格結束後 Ubuntu 沒有本輪殘留（遠端規程 I03、第 6 節收尾，且 `~/.local/bin/snip` 的 wrapper 雜湊比對用 WT41 之後的那一份） | 全部成立 |
 | I-fixture | `$T` 下每個 repo 的 `git status --porcelain` 在整輪結束時只有這份規程自己做過的改動（WT54 的 `readme.txt`、WT50 貼進的檔案）；`$B` 的 fixture 沒有被改 | 與預期相同 |
@@ -751,7 +819,7 @@ PY
 
 判定只有 `pass`、`ui-defect`、`fail`、`not-run`（意義同本機規程第 1 節）。
 
-- **閘門**：WT00、WT01 到 WT08、WT10 到 WT16、WT20 到 WT23、WT30 到 WT33、WT40、WT43、WT44、WT46、WT50 到 WT54、WT60 到 WT63、WT70 到 WT72、WT80、WT81、WT90、WT91、WT95、I-config、I-clip、I-leftover 全部是 `pass`，才寫「分頁閘門關閉」。
+- **閘門**：WT00、WT01 到 WT08、WT10 到 WT16、WT20 到 WT23、WT30 到 WT33、WT40、WT43、WT44、WT46、WT50 到 WT54、WT60 到 WT63、WT70 到 WT72、WT80、WT81、WT90、WT91、WT95、WT100 到 WT103、I-config、I-clip、I-leftover 全部是 `pass`，才寫「分頁閘門關閉」。
 - **不納入閘門**：WT41（連線中，抓不到暫態時 `not-run`）、WT42（失敗圖示沒有可靠觸發時 `not-run`）、WT45（沒有第二個別名時 `not-run`）、WT65（本機沒有暫停點）。這四格要填，但 `not-run` 不使閘門打開；判成 `fail` 或 `ui-defect` 時閘門打開。
 - 遠端格（WT40、WT43、WT44、WT46、WT60 到 WT63）缺 Ubuntu 準備時整組 `not-run`，證據寫「缺 Ubuntu 準備」，閘門打開。
 - 有任何 `ui-defect`、`fail` 或 `not-run`（上面的例外除外），第一句就寫「分頁閘門打開」，並列出那些 ID。
@@ -815,6 +883,10 @@ PY
 | WT90 | | |
 | WT91 | | |
 | WT95 | | |
+| WT100 | | |
+| WT101 | | |
+| WT102 | | |
+| WT103 | | |
 | I-config | | |
 | I-clip | | |
 | I-leftover | | |

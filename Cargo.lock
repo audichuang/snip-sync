@@ -5332,6 +5332,7 @@ dependencies = [
 name = "snip-native-e2e"
 version = "0.9.0"
 dependencies = [
+ "serde_json",
  "snip-core",
  "tempfile",
 ]

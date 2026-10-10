@@ -26,6 +26,7 @@ use snip_remote::{RemoteHost, RemoteWorkspace};
 
 use crate::i18n::{t, Locale};
 use crate::icons::{icon_tinted, Icon};
+use crate::open_tabs::{OpenTabs, SavedTab};
 use crate::theme::*;
 use crate::ui::{clip_text, probe, probe_frame_end, tip, Probes};
 use crate::{
@@ -214,6 +215,8 @@ pub struct TabInfo {
 	pub full: String,
 	pub conn: Option<Conn>,
 	pub pasting: bool,
+	/// Why the reconnect of a restored remote tab failed.
+	pub failed: Option<String>,
 }
 
 // ─────────────────────────────── labels ───────────────────────────────
@@ -310,23 +313,49 @@ pub struct TabsRoot {
 	pub quit_sent: bool,
 	/// The window's physical size last reported as `[APP:VIEWPORT]`.
 	last_viewport: (i32, i32),
-	/// `--restore-dir`: every tab's paste destination, as the one
-	/// workbench kept it across a close and reopen.
-	restore_dir: Option<PathBuf>,
+	/// Where the tabs are saved for the next launch; none in a test mode,
+	/// a test, or an e2e run without `SNIP_CONFIG_DIR`.
+	store: Option<PathBuf>,
+	/// What was last written there.
+	saved: Option<OpenTabs>,
 }
 
-/// What the first tab opens.
+/// The tab the launch opens: `--workspace`, or (with nothing saved) the
+/// remembered or launch folder.
 pub enum FirstTab {
 	Local(PathBuf),
-	/// Reconnected from an empty tab once the window is up.
-	Remote(crate::remote::RecentRemote),
 	Empty,
+}
+
+/// What a launch shows.
+pub struct Launch {
+	/// The tabs of the last session (`open-tabs.json`), reopened first.
+	/// None in a test mode, or when nothing was ever saved.
+	pub restore: Option<OpenTabs>,
+	/// Opened, or switched to when already restored, and shown.
+	pub first: FirstTab,
+	/// `--restore-dir`: the paste destination of the launch's own tab only
+	/// (the `--workspace` one, else the one shown).
+	pub restore_dir: Option<PathBuf>,
+	/// Where to save the tabs.
+	pub store: Option<PathBuf>,
+}
+
+impl Launch {
+	/// One tab, nothing restored or saved.
+	pub fn single(first: FirstTab, restore_dir: Option<PathBuf>) -> Self {
+		Launch {
+			restore: None,
+			first,
+			restore_dir,
+			store: None,
+		}
+	}
 }
 
 impl TabsRoot {
 	pub fn new(
-		first: FirstTab,
-		restore_dir: Option<PathBuf>,
+		launch: Launch,
 		mode: String,
 		probes: Option<Probes>,
 		window: &mut Window,
@@ -345,24 +374,152 @@ impl TabsRoot {
 			scroll: ScrollHandle::new(),
 			quit_sent: false,
 			last_viewport: (0, 0),
+			store: None,
+			saved: None,
+		};
+		let Launch {
+			restore,
+			first,
 			restore_dir,
-		};
-		let workspace = match &first {
-			FirstTab::Local(path) => {
-				Some(dunce::canonicalize(path).unwrap_or(path.clone()))
+			store,
+		} = launch;
+		let restoring = restore.is_some();
+		let (mut shown, mut skipped) = (None, 0);
+		if let Some(saved) = restore {
+			for (i, tab) in saved.tabs.into_iter().enumerate() {
+				let ix = match tab {
+					SavedTab::Local { path } => {
+						// A folder that is gone is dropped, and said so.
+						let Some(path) = dunce::canonicalize(&path)
+							.ok()
+							.filter(|p| p.is_dir())
+						else {
+							skipped += 1;
+							continue;
+						};
+						let identity = WsIdentity::Local(path.clone());
+						if let Some(ix) = root.find(&identity, cx) {
+							ix
+						} else {
+							root.add_tab(Some(path), false, window, cx)
+						}
+					}
+					SavedTab::Remote { host, path } => {
+						let identity = WsIdentity::Remote {
+							host: host.clone(),
+							path: path.clone(),
+						};
+						if let Some(ix) = root.find(&identity, cx) {
+							ix
+						} else {
+							let ix = root.add_tab(None, false, window, cx);
+							let tab = &root.tabs[ix];
+							with_log_tab(Some(tab.id), || {
+								tab.model.update(cx, |m, cx| {
+									m.restore_remote(
+										crate::remote::RecentRemote {
+											host,
+											path,
+										},
+										cx,
+									)
+								})
+							});
+							ix
+						}
+					}
+				};
+				if saved.active == Some(i) || shown.is_none() {
+					shown = Some(ix);
+				}
 			}
-			_ => None,
+		}
+		let launch_tab = match first {
+			FirstTab::Local(path) => {
+				let path = dunce::canonicalize(&path).unwrap_or(path);
+				let identity = WsIdentity::Local(path.clone());
+				Some(match root.find(&identity, cx) {
+					Some(ix) => ix,
+					None => root.add_tab(Some(path), false, window, cx),
+				})
+			}
+			FirstTab::Empty => None,
 		};
-		let ix = root.add_tab(workspace, false, window, cx);
+		let ix = match launch_tab.or(shown) {
+			Some(ix) => ix,
+			None => root.add_tab(None, false, window, cx),
+		};
+		if restoring && crate::e2e_on() {
+			root_log!(
+				"[APP:WS_TABS_RESTORED: count={} skipped={skipped}]",
+				root.tabs.len()
+			);
+		}
 		root.activate(ix, window, cx);
-		if let FirstTab::Remote(last) = first {
+		if let Some(dir) = restore_dir {
+			root.tabs[ix]
+				.model
+				.update(cx, |m, _| m.restore_dir = Some(dir));
+		}
+		if skipped > 0 {
 			let tab = &root.tabs[ix];
-			let id = tab.id;
-			with_log_tab(Some(id), || {
-				tab.model.update(cx, |m, cx| m.reopen_last_remote(last, cx))
+			with_log_tab(Some(tab.id), || {
+				tab.model.update(cx, |m, cx| {
+					let msg = crate::i18n::Msg::new(
+						"workspace_restore_skipped",
+						[skipped.to_string()],
+					);
+					m.set_status_msg(msg.clone());
+					// The tab's first load soon replaces the status.
+					m.show_toast(false, msg, cx);
+					cx.notify();
+				})
 			});
 		}
+		root.store = store;
+		root.persist(cx);
 		root
+	}
+
+	/// The tabs as the next launch reopens them: every tab that shows a
+	/// workspace (or is reconnecting to one), in order, and the shown one.
+	pub fn snapshot(&self, cx: &App) -> OpenTabs {
+		let mut out = OpenTabs::default();
+		for (ix, tab) in self.tabs.iter().enumerate() {
+			let m = tab.model.read(cx);
+			// A quit freezes the file instead (`persist`): a stopped quit
+			// resumes its tabs one by one and none may drop out meanwhile.
+			if m.is_closing_tab() {
+				continue;
+			}
+			let Some(identity) = m.ws_identity() else {
+				continue;
+			};
+			if self.active == Some(ix) {
+				out.active = Some(out.tabs.len());
+			}
+			out.tabs.push(SavedTab::of(&identity));
+		}
+		out
+	}
+
+	/// Saves the tabs when they changed. A quit leaves the file as it was
+	/// before the tabs started draining.
+	fn persist(&mut self, cx: &App) {
+		let Some(dir) = &self.store else {
+			return;
+		};
+		if self.quitting.is_some() || self.quit_sent {
+			return;
+		}
+		let now = self.snapshot(cx);
+		if self.saved.as_ref() == Some(&now) {
+			return;
+		}
+		if let Err(e) = crate::open_tabs::save_to(dir, &now) {
+			root_log!("[APP:WS_TABS_SAVE_FAILED: {e}]");
+		}
+		self.saved = Some(now);
 	}
 
 	fn add_tab(
@@ -376,16 +533,10 @@ impl TabsRoot {
 		self.next_id += 1;
 		let mode = self.mode.clone();
 		let probes = self.probes.clone();
-		let restore_dir = self.restore_dir.clone();
 		let model = with_log_tab(Some(id), || {
 			cx.new(|cx| {
 				let mut m = WorkbenchModel::new_tab(
-					workspace,
-					restore_dir,
-					mode,
-					id,
-					probes,
-					cx,
+					workspace, None, mode, id, probes, cx,
 				);
 				m.workspace_menu = menu_open;
 				m
@@ -393,7 +544,10 @@ impl TabsRoot {
 		});
 		let subs = [
 			cx.subscribe_in(&model, window, Self::on_tab_event),
-			cx.observe(&model, |_, _, cx| cx.notify()),
+			cx.observe(&model, |this, _, cx| {
+				this.persist(cx);
+				cx.notify()
+			}),
 		];
 		self.tabs.push(WorkspaceTab {
 			id,
@@ -460,6 +614,7 @@ impl TabsRoot {
 			fh
 		});
 		window.focus(&fh);
+		self.persist(cx);
 		cx.notify();
 	}
 
@@ -558,6 +713,7 @@ impl TabsRoot {
 			}
 			_ => cx.notify(),
 		}
+		self.persist(cx);
 		self.maybe_quit(window, cx);
 	}
 
@@ -824,10 +980,14 @@ impl TabsRoot {
 		};
 		let hover = match info.conn {
 			Some(Conn::Connecting) | Some(Conn::Failed) => {
-				let what = if info.conn == Some(Conn::Failed) {
-					t("ws_tab_failed", loc)
-				} else {
-					t("ws_tab_connecting", loc)
+				let what = match (&info.failed, info.conn) {
+					(Some(why), Some(Conn::Failed)) => {
+						crate::i18n::tf("ws_tab_failed_why", loc, &[why])
+					}
+					(_, Some(Conn::Failed)) => {
+						t("ws_tab_failed", loc).to_string()
+					}
+					_ => t("ws_tab_connecting", loc).to_string(),
 				};
 				let base = if info.full.is_empty() {
 					&label

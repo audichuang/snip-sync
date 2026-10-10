@@ -319,7 +319,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | `[APP:REMOTE_HOST_LISTED: host=<主機> folders=N path=<路徑>]` | 列出主機上某個資料夾的子資料夾 |
 | `[APP:REMOTE_HOST_FAILED: host=<主機> <訊息>]` | 連不上或列不出 |
 | `[APP:REMOTE_OPENED: <主機> ▸ <名稱> generation=N]` | 開啟遠端工作區 |
-| `[APP:REMOTE_OPEN_FAILED: …]`、`[APP:REMOTE_REOPEN: …]` | 開啟失敗；啟動時重新連線 |
+| `[APP:REMOTE_OPEN_FAILED: …]`、`[APP:REMOTE_REOPEN: host=<主機> path=<路徑>]`、`[APP:REMOTE_RETRY: attempt=N]` | 開啟失敗；啟動時從 `open-tabs.json` 還原遠端分頁並在背景連線；還原失敗後的背景重試（5、10、20、40 秒，之後每 60 秒） |
+| `[APP:WS_TABS_RESTORED: count=N skipped=N]` | 啟動時讀到 `open-tabs.json`：還原後的分頁數、略過的（找不到的本機資料夾）數 |
 | `[APP:REMOTE_SCAN_FAILED: …]` | 掃描儲存庫失敗 |
 | `[APP:CHANGES_EMPTY: state=…]`、`[APP:LOG_EMPTY: state=…]` | 空狀態（`clean`、`clean_partial`、`no_repository`、`scan_failed`、`failed` 等） |
 | `[APP:E2E_REPO: name=<名稱> ok=true/false …]` | 儲存庫掃描結果 |
@@ -345,8 +346,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | S07 | 從最近開啟點 `local-ws`，再點 `remote-recent:<n>`（gitws） | 先回到本機（麵包屑沒有 `ubuntu ▸`），再一次點擊就回到 `ubuntu ▸ gitws`，不用重新逐層選 |
 | S08 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/edge`，點 `btn-remote-open` | `REMOTE_OPENED: ubuntu ▸ edge`；`~` 展開成對方的家目錄 |
 | S09 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/no-such`，點 `btn-remote-open` | 失敗格：選單裡紅字說資料夾不存在；目前的工作區不變（仍是 edge） |
-| S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `REMOTE_REOPEN` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`；啟動過程畫面不卡（重新連線在背景） |
-| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
+| S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `WS_TABS_RESTORED` 與每個還原分頁的 `WS_TAB_OPENED`；`REMOTE_REOPEN: host=ubuntu path=…/edge` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`，顯示的是離開前的分頁（`open-tabs.json` 的 `active`）；遠端分頁一開始就在，標籤 `ubuntu ▸ edge`，連線在背景（狀態列「正在重新連線 …」），啟動過程畫面不卡 |
+| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`；`open-tabs.json` 裡的 `ubuntu ▸ edge` 也會還原，是 `local-ws` 之前的另一個分頁，`local-ws` 若已在還原的分頁裡就切過去），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。還原的 `ubuntu ▸ edge` 分頁若連線失敗，會保持 failed 狀態（`ws-tab-state:<ix>:failed`，tooltip 結尾「連線失敗：<原因>」，狀態列「無法開啟遠端工作區：<原因>」）並照 `REMOTE_RETRY` 重試，不是這格的失敗，也不會讓 `local-ws` 消失。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
 | S12 | 把視窗調成 900×600（System Events 設成 900×632），開選單並點進一層資料夾 | `remote-path`、`remote-up`、`btn-remote-open-here`、`remote-path-input`、`btn-remote-open` 的 bounds 都 `w,h ≥ 1` 且在內容區裡（tooltip 文字就是 `remote-path` 顯示的同一個字串，見 `crates/desktop-native/src/ui/remote.rs` 的 `tip(browse.path.clone())`，不在真實 UI 驗）；做完調回 1080×720 |
 
 ### 4.2 瀏覽真實專案 rtk（R01–R08）

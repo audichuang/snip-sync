@@ -321,6 +321,8 @@ def isolated_env(iso_root: str) -> tuple[dict[str, str], str]:
         path = os.path.join(iso_root, name.lower())
         os.makedirs(path)
         env[f"XDG_{name}_HOME"] = path
+    # Workspace tabs are restored from and saved here, never the user's.
+    env["SNIP_CONFIG_DIR"] = os.path.join(iso_root, "config", "snip-sync")
     bus_config = os.path.join(iso_root, "session-bus.xml")
     with open(bus_config, "w") as f:
         f.write(

@@ -492,6 +492,8 @@ class Session:
             {
                 "HOME": str(home),
                 "XDG_CONFIG_HOME": str(config),
+                # Workspace tabs are restored from and saved here, not the user's.
+                "SNIP_CONFIG_DIR": str(config / "snip-sync"),
                 "XDG_DATA_HOME": str(data),
                 "XDG_CACHE_HOME": str(cache),
                 "XDG_RUNTIME_DIR": str(runtime),

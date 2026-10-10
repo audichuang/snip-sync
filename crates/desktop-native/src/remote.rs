@@ -66,43 +66,6 @@ pub(crate) fn remember_recent(
 	}
 }
 
-/// Names the remote folder that was the last workspace open; absent when
-/// the last one was local.
-const LAST_FILE: &str = "remote-last.json";
-
-fn last_file() -> Option<PathBuf> {
-	Some(crate::recent::config_dir()?.join(LAST_FILE))
-}
-
-/// The remote folder to reconnect to on launch: the last workspace open,
-/// when it was remote. None without a config folder.
-pub fn load_last() -> Option<RecentRemote> {
-	last_file().and_then(|f| load_last_from(&f))
-}
-
-/// Records the workspace just opened: `Some` for a remote folder, `None`
-/// for a local one. A failed write only loses the reconnect.
-pub(crate) fn remember_last(last: Option<&RecentRemote>) {
-	if let Some(f) = last_file() {
-		save_last_to(&f, last);
-	}
-}
-
-fn load_last_from(f: &Path) -> Option<RecentRemote> {
-	snip_remote::load_json(f)
-}
-
-fn save_last_to(f: &Path, last: Option<&RecentRemote>) {
-	match last {
-		Some(last) => {
-			let _ = snip_remote::save_json(f, last);
-		}
-		None => {
-			let _ = std::fs::remove_file(f);
-		}
-	}
-}
-
 /// The hosts of `~/.ssh/config`, reached through ssh.
 pub fn load_hosts() -> Vec<RemoteHost> {
 	snip_remote::ssh::config_hosts()
@@ -236,6 +199,30 @@ pub struct MasterState {
 	pub browse: Option<Browse>,
 	pub(crate) browse_seq: u64,
 	pub scan_error: Option<Msg>,
+	/// The remote folder this tab was reopened for at launch, until it
+	/// opens: the tab shows and saves it meanwhile, and after a failure.
+	pub restoring: Option<Restoring>,
+}
+
+/// A remote tab of the last session, being reconnected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Restoring {
+	pub folder: RecentRemote,
+	/// Why the last attempt failed; the tab shows it until one succeeds.
+	pub failed: Option<String>,
+	/// The `open_seq` of the attempt in flight.
+	pub(crate) open_seq: Option<u64>,
+	/// Attempts made; the next one waits [`retry_delay`] of it.
+	pub(crate) attempts: u32,
+	/// Tells a retry timer of an earlier restore of this tab from this one.
+	pub(crate) id: u64,
+}
+
+/// How long a failed reconnect waits before the next try: 5 s, doubled
+/// each time, at most a minute.
+pub fn retry_delay(attempts: u32) -> std::time::Duration {
+	let doublings = attempts.saturating_sub(1).min(4);
+	std::time::Duration::from_secs((5u64 << doublings).min(60))
 }
 
 /// Returns true when `s` is empty or a relative path consisting only of normal UTF-8 components.
@@ -769,15 +756,23 @@ impl WorkbenchModel {
 						);
 						return;
 					}
+					let restore = this
+						.remote
+						.restoring
+						.as_ref()
+						.is_some_and(|r| r.open_seq == Some(open_seq));
 					match result {
 						Ok(ws) => {
 							this.workspace_menu = false;
-							this.route_open(
-								crate::tabs::OpenTarget::Remote(Box::new((
-									host, ws,
-								))),
-								cx,
+							let target = crate::tabs::OpenTarget::Remote(
+								Box::new((host, ws)),
 							);
+							if restore {
+								// The tab already stands for this folder.
+								this.open_in_place(target, cx);
+							} else {
+								this.route_open(target, cx);
+							}
 						}
 						Err(err) => {
 							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
@@ -787,7 +782,10 @@ impl WorkbenchModel {
 								"remote_open_failed",
 								[err.clone()],
 							);
-							this.remote_note(false, err, cx);
+							this.remote_note(false, err.clone(), cx);
+							if restore {
+								this.restore_failed(err, cx);
+							}
 						}
 					}
 				});
@@ -814,20 +812,108 @@ impl WorkbenchModel {
 		self.open_remote_folder(recent, cx);
 	}
 
-	/// Launched without `--workspace` after a remote workspace was the last
-	/// one open: reconnects to it in the background. A failure leaves the
-	/// app with no workspace and says why.
-	pub fn reopen_last_remote(
+	/// A remote tab of the last session: shown and saved as that folder
+	/// at once, connected in the background. A failure keeps the tab, says
+	/// why and tries again later.
+	pub fn restore_remote(
 		&mut self,
-		last: RecentRemote,
+		folder: RecentRemote,
 		cx: &mut Context<Self>,
 	) {
-		app_log!("[APP:REMOTE_REOPEN: host={} path={}]", last.host, last.path);
+		app_log!(
+			"[APP:REMOTE_REOPEN: host={} path={}]",
+			folder.host,
+			folder.path
+		);
 		self.set_status(
 			"remote_reconnecting",
-			[format!("{} ▸ {}", last.host, last.path)],
+			[format!("{} ▸ {}", folder.host, folder.path)],
 		);
-		self.open_remote_folder(last, cx);
+		static IDS: std::sync::atomic::AtomicU64 =
+			std::sync::atomic::AtomicU64::new(0);
+		self.remote.restoring = Some(Restoring {
+			folder,
+			failed: None,
+			open_seq: None,
+			attempts: 0,
+			id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+		});
+		self.attempt_restore(cx);
+	}
+
+	fn attempt_restore(&mut self, cx: &mut Context<Self>) {
+		let Some(folder) =
+			self.remote.restoring.as_ref().map(|r| r.folder.clone())
+		else {
+			return;
+		};
+		if !self.remote.hosts.iter().any(|h| h.name == folder.host) {
+			// A host added to ~/.ssh/config since the last try.
+			if let Some(h) =
+				load_hosts().into_iter().find(|h| h.name == folder.host)
+			{
+				self.remote.hosts.push(h);
+			}
+		}
+		if let Some(r) = self.remote.restoring.as_mut() {
+			r.attempts += 1;
+		}
+		let host = folder.host.clone();
+		self.open_remote_folder(folder, cx);
+		if !self.remote.hosts.iter().any(|h| h.name == host) {
+			let why =
+				crate::i18n::tf("remote_host_missing", self.locale, &[&host]);
+			return self.restore_failed(why, cx);
+		}
+		if self.remote.busy {
+			let seq = self.remote.open_seq;
+			if let Some(r) = self.remote.restoring.as_mut() {
+				r.open_seq = Some(seq);
+			}
+		}
+	}
+
+	/// The reconnect failed: the tab keeps the folder and shows why, and
+	/// tries again after [`retry_delay`] unless it opened or closed meanwhile.
+	fn restore_failed(&mut self, why: String, cx: &mut Context<Self>) {
+		let Some(r) = self.remote.restoring.as_mut() else {
+			return;
+		};
+		r.failed = Some(why);
+		r.open_seq = None;
+		let (attempts, id) = (r.attempts, r.id);
+		let delay = retry_delay(attempts);
+		let tab = self.ws_tab;
+		cx.spawn(async move |this, cx| {
+			crate::tabs::tagged(tab, async move {
+				cx.background_executor().timer(delay).await;
+				let _ = this.update(cx, |this, cx| {
+					let due = this.remote.restoring.as_ref().is_some_and(|r| {
+						r.id == id
+							&& r.attempts == attempts
+							&& r.open_seq.is_none()
+					});
+					if !due || this.lifecycle.is_draining() {
+						return;
+					}
+					if this.remote.busy {
+						// Another open of this tab is in flight: try after it.
+						return this.restore_failed(
+							this.remote
+								.restoring
+								.as_ref()
+								.and_then(|r| r.failed.clone())
+								.unwrap_or_default(),
+							cx,
+						);
+					}
+					app_log!("[APP:REMOTE_RETRY: attempt={}]", attempts + 1);
+					this.attempt_restore(cx);
+				});
+			})
+			.await
+		})
+		.detach();
 	}
 
 	/// Opens `folder` on its host from `~/.ssh/config`.
@@ -861,7 +947,7 @@ impl WorkbenchModel {
 	) {
 		self.release_workspace_state(cx);
 		remember_recent(&mut self.remote.recent, &host.name, &workspace.id);
-		remember_last(self.remote.recent.first());
+		self.remote.restoring = None;
 		let session = RemoteSession::new(host, workspace);
 		let root = session.root.clone();
 		let label = session.label();
@@ -1083,21 +1169,10 @@ mod tests {
 	}
 
 	#[test]
-	fn last_remote_workspace_round_trips_and_a_local_one_clears_it() {
-		assert_eq!(load_last(), None, "no config folder under cfg(test)");
-		let tmp = tempfile::tempdir().unwrap();
-		let f = tmp.path().join("cfg").join(LAST_FILE);
-		assert_eq!(load_last_from(&f), None);
-		let last = RecentRemote {
-			host: "macmini".into(),
-			path: "/Users/x/ck/cat".into(),
-		};
-		save_last_to(&f, Some(&last));
-		assert_eq!(load_last_from(&f), Some(last));
-		save_last_to(&f, None);
-		assert!(!f.exists());
-		assert_eq!(load_last_from(&f), None);
-		save_last_to(&f, None);
+	fn a_failed_reconnect_waits_longer_each_time_up_to_a_minute() {
+		let secs: Vec<u64> =
+			(1..=7).map(|n| retry_delay(n).as_secs()).collect();
+		assert_eq!(secs, [5, 10, 20, 40, 60, 60, 60]);
 	}
 
 	#[test]
