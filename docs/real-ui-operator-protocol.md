@@ -522,7 +522,6 @@ Windows 與 Linux 的真實輸入、IME、跨機剪貼簿、與 ClipCode 的實�
 規格落差另外記在 `scorecard.md` 末尾，不算判定：
 
 - 規格 4.3 的 commit 模式 diff：「每個 commit 可展開看檔案清單與 diff」，但 commit 重播列目前只顯示來源內容，沒有 diff。記在這裡；C-detail 不因此判 `fail`（規格 3.2 的檔案模式覆寫 diff 已支援並由 T05 檢核）。
-- 規格 3.1 的檔案模式複製通知：規格寫檔案數、字元數、行數、字數、token 數與跳過數；程式的 `status_copied` 是「已從 {} 複製 {} 個檔案（{} 字元、{} 行，略過 {} 個）至剪貼簿」，沒有字數與 token 數。T07、K-cmdc 不因此判 `fail`。commit 模式的通知（規格 4.2：commit 數、檔案數、字元數、未複製數）與程式相符，由 B-notify 檢核。
 - T13b 的拒絕文字：HEAD 移動被 `paste.rs` 的 `stale_msg` 歸到 `stale_modified`，畫面是「目的地檔案已在外部修改: destination HEAD commit changed from … to …」。前半句說檔案被改，與實際原因不符。記在這裡；T13b 不因此判 `ui-defect`。
 - 預覽的版面衝突列（父目錄被檔案佔住等）現在標為「拒絕」並說整個 commit 會被拒；路徑規則不安全（如 `../x`）仍是一般「跳過」。CLI 的 `--dry-run` 對被拒的 commit 不計入「would be created」。
 

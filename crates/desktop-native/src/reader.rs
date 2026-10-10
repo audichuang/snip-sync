@@ -1422,7 +1422,7 @@ impl WorkbenchModel {
 			}
 			Err(msg) => {
 				app_log!("[APP:FOLD_REFUSED: {}]", msg.key);
-				self.status = msg;
+				self.set_status_msg(msg);
 			}
 		}
 		cx.notify();

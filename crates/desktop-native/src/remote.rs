@@ -828,7 +828,10 @@ impl WorkbenchModel {
 					self.locale,
 					&[&folder.host],
 				);
-				self.status = Msg::new("remote_open_failed", [text.clone()]);
+				self.set_status_msg(Msg::new(
+					"remote_open_failed",
+					[text.clone()],
+				));
 				self.remote_note(false, text, cx);
 			}
 		}
@@ -857,7 +860,7 @@ impl WorkbenchModel {
 			"[APP:REMOTE_OPENED: {label} generation={}]",
 			self.lifecycle.generation()
 		);
-		self.status = Msg::new("remote_opened", [label]);
+		self.set_status_msg(Msg::new("remote_opened", [label]));
 		self.launch_remote_scan(None, true, cx);
 		self.resume_ws_tree(cx);
 	}

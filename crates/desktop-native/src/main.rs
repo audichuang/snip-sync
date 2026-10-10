@@ -159,11 +159,20 @@ fn copied_status(
 	repo_name: String,
 	out: &snip_core::transfer::CopyOutcome,
 ) -> Msg {
+	let (words, tokens) =
+		if out.words > 0 || out.tokens > 0 || out.payload.is_empty() {
+			(out.words, out.tokens)
+		} else {
+			let s = snip_core::stats::payload_stats(&out.payload);
+			(s.words, s.tokens)
+		};
 	let mut args = vec![
 		repo_name,
 		out.copied.to_string(),
 		out.chars.to_string(),
 		out.lines.to_string(),
+		words.to_string(),
+		tokens.to_string(),
 		out.skipped.to_string(),
 	];
 	if !out.truncated {
@@ -794,6 +803,8 @@ pub struct WorkbenchModel {
 	pub add_repo_input: Entity<TextInput>,
 	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
+	pub user_action_seq: u64,
+	pub status_error_action: Option<u64>,
 	/// A finished copy's card over the window (id, succeeded, text): the
 	/// status bar alone is easy to miss.
 	pub toast: Option<(u64, bool, Msg)>,
@@ -899,6 +910,68 @@ pub enum Splitter {
 	LogDetails,
 	/// Between the log's changed files and the commit details.
 	LogFiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StatusPriority {
+	Background = 0,
+	Normal = 1,
+	Error = 2,
+}
+
+pub fn is_error_status(key: &str) -> bool {
+	key.starts_with("error_")
+		|| key.starts_with("paste_err_")
+		|| key.ends_with("_failed")
+		|| key.ends_with("_refused")
+		|| key.ends_with("_rejected")
+		|| key.ends_with("_error")
+		|| key.starts_with("reason_refused_")
+		|| matches!(
+			key,
+			"tree_name_not_utf8"
+				| "tree_read_error"
+				| "status_goto_invalid"
+				| "status_copy_empty"
+				| "status_copy_nothing"
+				| "status_copy_nothing_skipped"
+				| "workspace_bad_path"
+				| "remote_unsupported"
+				| "workspace_not_open"
+				| "preview_memory_limit"
+				| "commit_subset_rejected"
+				| "commit_overwrite_required"
+				| "mapping_required"
+				| "status_fold_stale"
+				| "status_fold_too_large"
+				| "commit_replay_partial_refused"
+				| "workspace_drain_leaked"
+				| "workspace_drain_timeout"
+		)
+}
+
+pub fn is_background_status(key: &str) -> bool {
+	matches!(
+		key,
+		"status_scanning"
+			| "status_repos_loaded"
+			| "status_repo_loading"
+			| "status_repo_loaded"
+			| "status_history_loaded"
+			| "status_log_merged_cap"
+			| "status_graph_fallback"
+			| "status_loading"
+	)
+}
+
+pub fn status_priority(key: &str) -> StatusPriority {
+	if is_error_status(key) {
+		StatusPriority::Error
+	} else if is_background_status(key) {
+		StatusPriority::Background
+	} else {
+		StatusPriority::Normal
+	}
 }
 
 impl WorkbenchModel {
@@ -1207,6 +1280,8 @@ impl WorkbenchModel {
 			} else {
 				Msg::new("workspace_closed", [])
 			},
+			user_action_seq: 0,
+			status_error_action: None,
 			toast: None,
 			toast_seq: 0,
 			is_loading: workspace.is_some(),
@@ -1674,12 +1749,33 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	pub fn user_action(&mut self) {
+		self.user_action_seq = self.user_action_seq.wrapping_add(1);
+	}
+
+	pub fn set_status_msg(&mut self, msg: Msg) {
+		let incoming_prio = status_priority(msg.key);
+		if incoming_prio == StatusPriority::Background {
+			if let Some(err_seq) = self.status_error_action {
+				if err_seq == self.user_action_seq {
+					return;
+				}
+			}
+		}
+		if incoming_prio == StatusPriority::Error {
+			self.status_error_action = Some(self.user_action_seq);
+		} else {
+			self.status_error_action = None;
+		}
+		self.status = msg;
+	}
+
 	pub fn set_status(
 		&mut self,
 		key: &'static str,
 		args: impl crate::i18n::IntoMsgArgs,
 	) {
-		self.status = Msg::new(key, args);
+		self.set_status_msg(Msg::new(key, args));
 	}
 
 	/// Shows `msg` in a card over the window for a few seconds, longer for a
@@ -1739,7 +1835,7 @@ impl WorkbenchModel {
 			self.preview_loading = false;
 			self.preview_error = None;
 			self.preview_error_root = None;
-			self.status = err;
+			self.set_status_msg(err);
 			app_log!("[APP:PREVIEW_REFUSED: reason=retained_budget]");
 			return false;
 		}
@@ -2470,6 +2566,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn reload_repos(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if !self.accepting_work() {
 			return;
 		}
@@ -3767,6 +3864,7 @@ impl WorkbenchModel {
 		source: SourceKind,
 		cx: &mut Context<Self>,
 	) {
+		self.user_action();
 		if !self.accepting_work() {
 			return;
 		}
@@ -4158,10 +4256,10 @@ impl WorkbenchModel {
 					self.set_status("status_clipboard_failed", [e.to_string()]);
 				} else {
 					app_log!("[APP:COPY_DONE: copied={copied_count}]");
-					self.status = msg;
+					self.set_status_msg(msg);
 				}
 			}
-			Err(err) => self.status = err,
+			Err(err) => self.set_status_msg(err),
 		}
 		let ok =
 			matches!(self.status.key, "status_copied" | "status_copied_limit");
@@ -4425,7 +4523,7 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		if let Err(err) = self.paste.enqueue(request) {
-			self.status = err;
+			self.set_status_msg(err);
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 			self.restore_log_after_paste();
 			cx.notify();
@@ -4463,7 +4561,7 @@ impl WorkbenchModel {
 			}
 			Some(paste::preview::Landed::Refused { err, closed }) => {
 				app_log!("[APP:PASTE_ERR: {}]", err.key);
-				self.status = err;
+				self.set_status_msg(err);
 				if closed {
 					self.restore_log_after_paste();
 					self.pending_focus = Some(self.focus_handle.clone());
@@ -4471,10 +4569,10 @@ impl WorkbenchModel {
 				cx.notify();
 			}
 			Some(paste::preview::Landed::WorkerLost) => {
-				self.status = Msg::new(
+				self.set_status_msg(Msg::new(
 					"paste_err_plan",
 					["Preview worker ended before producing a result".into()],
-				);
+				));
 				cx.notify();
 			}
 			None => {}
@@ -4550,11 +4648,12 @@ impl WorkbenchModel {
 	/// Keep full write/read diagnostics in status, but do not let a newly
 	/// allocated diagnostic grow an already admitted plan past its tier.
 	fn set_paste_error(&mut self, err: Msg) {
-		self.status = err.clone();
+		self.set_status_msg(err.clone());
 		self.paste.record_error(err, self.preview.as_ref());
 	}
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if self.refuse_while_applying("preview", cx) {
 			return;
 		}
@@ -4588,7 +4687,7 @@ impl WorkbenchModel {
 			}
 		};
 		if text.len() > paste::MAX_RETAINED_PREVIEW_BYTES {
-			self.status = paste::preview_budget_error();
+			self.set_status_msg(paste::preview_budget_error());
 			self.restore_log_after_paste();
 			self.pending_focus = Some(self.focus_handle.clone());
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
@@ -4658,11 +4757,11 @@ impl WorkbenchModel {
 		match self.paste.remap(prefix, destination, self.preview.as_ref()) {
 			paste::preview::Remapped::NoPlan => {}
 			paste::preview::Remapped::Invalid(err) => {
-				self.status = err;
+				self.set_status_msg(err);
 				cx.notify();
 			}
 			paste::preview::Remapped::Dropped(err) => {
-				self.status = err;
+				self.set_status_msg(err);
 				self.restore_log_after_paste();
 				cx.notify();
 			}
@@ -4724,7 +4823,7 @@ impl WorkbenchModel {
 				cx.notify();
 			}
 			paste::preview::Nav::Refused(err) => {
-				self.status = err;
+				self.set_status_msg(err);
 				app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
 				cx.notify();
 			}
@@ -5032,6 +5131,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		let apply = match self.paste.begin_apply() {
 			Ok(w) => w,
 			Err(paste::preview::ApplyRefused::Loading) => {
@@ -5188,6 +5288,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn cancel_paste_preview(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if self.refuse_while_applying("cancel", cx) {
 			return;
 		}
@@ -5209,6 +5310,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn copy_current_preview_content(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if !self.can_copy_preview() {
 			return;
 		}
@@ -5813,6 +5915,8 @@ mod tests {
 				copied,
 				chars: 0,
 				lines: 0,
+				words: 0,
+				tokens: 0,
 				skipped,
 				truncated: false,
 			};
@@ -5823,6 +5927,80 @@ mod tests {
 		assert_eq!(
 			super::remote_copy_nothing_status(&outcome(0, 0)).key,
 			"status_copy_nothing"
+		);
+	}
+
+	/// Copy notification formats files, characters, lines, words, tokens and
+	/// skipped count in both locales, for normal and limit-cut copies.
+	#[test]
+	fn copy_status_notification_contains_words_and_tokens() {
+		use crate::i18n::{tf, Locale};
+		let payload = "file alpha.txt\nhello world\nanother line with words\n";
+		let expected_stats = snip_core::stats::payload_stats(payload);
+		assert!(expected_stats.words > 0);
+		assert!(expected_stats.tokens > 0);
+
+		let outcome = snip_core::transfer::CopyOutcome {
+			payload: payload.to_string(),
+			copied: 1,
+			chars: expected_stats.chars,
+			lines: expected_stats.lines,
+			words: expected_stats.words,
+			tokens: expected_stats.tokens,
+			skipped: 0,
+			truncated: false,
+		};
+
+		let msg = crate::copied_status("test-repo".into(), &outcome);
+		assert_eq!(msg.key, "status_copied");
+
+		// ZhTw
+		let zh = tf(msg.key, Locale::ZhTw, &msg.args);
+		assert!(
+			zh.contains(&format!("{} 字", expected_stats.words)),
+			"ZhTw message '{zh}' must contain word count"
+		);
+		assert!(
+			zh.contains(&format!("{} 個 token", expected_stats.tokens)),
+			"ZhTw message '{zh}' must contain token count"
+		);
+
+		// En
+		let en = tf(msg.key, Locale::En, &msg.args);
+		assert!(
+			en.contains(&format!("{} words", expected_stats.words)),
+			"En message '{en}' must contain word count"
+		);
+		assert!(
+			en.contains(&format!("~{} tokens", expected_stats.tokens)),
+			"En message '{en}' must contain token count"
+		);
+
+		// Limit outcome
+		let mut truncated_outcome = outcome.clone();
+		truncated_outcome.truncated = true;
+		let limit_msg =
+			crate::copied_status("test-repo".into(), &truncated_outcome);
+		assert_eq!(limit_msg.key, "status_copied_limit");
+
+		let zh_lim = tf(limit_msg.key, Locale::ZhTw, &limit_msg.args);
+		assert!(
+			zh_lim.contains(&format!("{} 字", expected_stats.words)),
+			"ZhTw limit message '{zh_lim}' must contain word count"
+		);
+		assert!(
+			zh_lim.contains(&format!("{} 個 token", expected_stats.tokens)),
+			"ZhTw limit message '{zh_lim}' must contain token count"
+		);
+
+		let en_lim = tf(limit_msg.key, Locale::En, &limit_msg.args);
+		assert!(
+			en_lim.contains(&format!("{} words", expected_stats.words)),
+			"En limit message '{en_lim}' must contain word count"
+		);
+		assert!(
+			en_lim.contains(&format!("~{} tokens", expected_stats.tokens)),
+			"En limit message '{en_lim}' must contain token count"
 		);
 	}
 
@@ -13750,6 +13928,171 @@ mod tests {
 				"date chip should exist"
 			);
 		}
+
+		/// In the Git log with a branch filter active and a non-HEAD commit
+		/// selected, clicking `btn-head` clears the filter, reloads the full
+		/// graph, scrolls to and selects HEAD.
+		#[gpui::test]
+		fn head_button_after_ref_filter_selects_head(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			git(&r, &["checkout", "-b", "side"]);
+			fs::write(r.join("side.txt"), "side content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "side commit"]);
+			let side_sha = {
+				let out = Command::new("git")
+					.current_dir(&r)
+					.args(["rev-parse", "HEAD"])
+					.output()
+					.unwrap();
+				String::from_utf8(out.stdout).unwrap().trim().to_string()
+			};
+			git(&r, &["checkout", "main"]);
+			fs::write(r.join("main.txt"), "main content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "main head commit"]);
+			let head_sha = {
+				let out = Command::new("git")
+					.current_dir(&r)
+					.args(["rev-parse", "HEAD"])
+					.output()
+					.unwrap();
+				String::from_utf8(out.stdout).unwrap().trim().to_string()
+			};
+			assert_ne!(side_sha, head_sha);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1200., 752.);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.display_commits().len() >= 3 && !m.refs.is_empty()
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+
+			// Activate branch filter for "side"
+			model.update(cx, |m, cx| {
+				m.filter_by_ref(Some("side".into()), cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let filtered = model.read_with(cx, |m, _| {
+					m.active_ref_filter.as_deref() == Some("side")
+						&& !m.display_commits().is_empty()
+				});
+				if filtered {
+					break;
+				}
+			}
+			settle(cx);
+
+			// Select the side commit (non-HEAD)
+			if let Some(row_bounds) = cx.debug_bounds("log-subject:0") {
+				cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+			} else {
+				model.update(cx, |m, cx| {
+					m.select_commit(&side_sha, cx);
+				});
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.selected_commit.as_deref(),
+					Some(side_sha.as_str())
+				);
+			});
+
+			// User clicks `btn-head`
+			let btn =
+				cx.debug_bounds("btn-head").expect("btn-head must be drawn");
+			cx.simulate_click(btn.center(), gpui::Modifiers::none());
+
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.active_ref_filter.is_none()
+						&& m.selected_commit.as_deref()
+							== Some(head_sha.as_str())
+				});
+				if done {
+					break;
+				}
+			}
+			settle(cx);
+
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.active_ref_filter.is_none(),
+					"active ref filter must be cleared"
+				);
+				assert_eq!(
+					m.selected_commit.as_deref(),
+					Some(head_sha.as_str()),
+					"HEAD commit must be selected after clicking btn-head"
+				);
+			});
+		}
+
+		/// An error in the status bar is never overwritten by background
+		/// progress/ready messages until the user's next action.
+		#[gpui::test]
+		fn status_bar_error_not_overwritten_by_background_loading(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let _r = repo(ws.path(), "my-repo", &[]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1200., 752.);
+			settle(cx);
+
+			// User causes a paste error
+			model.update(cx, |m, _| {
+				m.user_action();
+				m.set_status_msg(crate::i18n::Msg::new(
+					"paste_err_plan",
+					["Not a directory (os error 20)".into()],
+				));
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "paste_err_plan");
+			});
+
+			// Background progress/ready messages arrive: must not overwrite the error
+			for bg in [
+				"status_scanning",
+				"status_repo_loading",
+				"status_repo_loaded",
+				"status_repos_loaded",
+				"status_history_loaded",
+			] {
+				model.update(cx, |m, _| {
+					m.set_status(bg, []);
+				});
+				model.read_with(cx, |m, _| {
+					assert_eq!(
+						m.status.key, "paste_err_plan",
+						"background status '{bg}' should not overwrite user error"
+					);
+				});
+			}
+
+			// User initiates next action: error can be superseded
+			model.update(cx, |m, _| {
+				m.user_action();
+				m.set_status("status_scanning", []);
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.status.key, "status_scanning",
+					"user's next action allows status update"
+				);
+			});
+		}
 	}
 
 	mod folder_copy {
@@ -13949,7 +14292,9 @@ mod tests {
 			let msg = crate::copied_status("r".into(), &report.outcome);
 			assert_eq!(msg.key, "status_copied_limit");
 			assert_eq!(msg.args[1], "3");
-			assert_eq!(msg.args[5], NATIVE_FILE_COUNT_LIMIT.to_string());
+			assert_eq!(msg.args[4], report.outcome.words.to_string());
+			assert_eq!(msg.args[5], report.outcome.tokens.to_string());
+			assert_eq!(msg.args[7], NATIVE_FILE_COUNT_LIMIT.to_string());
 
 			let mut whole = native_export_settings();
 			whole.set_max_file_count = false;

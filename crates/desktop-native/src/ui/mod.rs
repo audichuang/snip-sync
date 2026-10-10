@@ -1200,6 +1200,7 @@ impl WorkbenchModel {
 	/// Copy reads it. In the Project view that is the row selection, or
 	/// the file under the cursor of a browsed commit tree.
 	pub fn copy_cursor_node(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		let targets = match self.active_tab {
 			WorkbenchTab::GitChanges => self
 				.change_item_rows()

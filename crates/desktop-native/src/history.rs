@@ -1476,21 +1476,15 @@ impl WorkbenchModel {
 		if !matches!(load, PageLoad::Replace(_)) {
 			return;
 		}
-		if let Some(anchor) = self.selected_commit.clone() {
-			if self.reselect_after_load(&anchor, cx) {
-				return;
-			}
-			if self.select_head_after_load {
-				self.select_head_after_load = false;
-				self.focus_head(cx);
-			} else {
+		if self.select_head_after_load {
+			self.select_head_after_load = false;
+			self.focus_head(cx);
+		} else if let Some(anchor) = self.selected_commit.clone() {
+			if !self.reselect_after_load(&anchor, cx) {
 				self.selected_commit = None;
 				self.log_selected.clear();
 				self.commit_details = None;
 			}
-		} else if self.select_head_after_load {
-			self.select_head_after_load = false;
-			self.focus_head(cx);
 		}
 	}
 
@@ -1894,6 +1888,7 @@ impl WorkbenchModel {
 
 	/// Shows HEAD: back to the full graph on page 1, then selects HEAD.
 	pub fn locate_head(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if self.log_is_merged() {
 			self.locate_merged_head(cx);
 			return;
@@ -1952,6 +1947,7 @@ impl WorkbenchModel {
 			cx.notify();
 			return;
 		}
+		self.user_action();
 		self.preview_generation += 1;
 		let task_generation = self.preview_generation;
 		self.selected_commit = Some(Box::<str>::from(sha).into_string());
@@ -3839,8 +3835,10 @@ impl WorkbenchModel {
 			self.commits.first().map(|c| &c.sha[..7]).unwrap_or("-"),
 		);
 		if first {
-			self.select_head_after_load = false;
-			if let Some(anchor) = self.selected_commit.clone() {
+			if self.select_head_after_load {
+				self.select_head_after_load = false;
+				self.locate_merged_head(cx);
+			} else if let Some(anchor) = self.selected_commit.clone() {
 				if !self.reselect_after_load(&anchor, cx) {
 					self.selected_commit = None;
 					self.log_selected.clear();
