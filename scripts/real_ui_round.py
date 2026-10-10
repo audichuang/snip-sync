@@ -50,6 +50,22 @@ class ProcessRecord:
 class SystemOperations:
     """Interface to OS-level operations, mockable in unit tests."""
 
+    def move_mouse(self, x: float, y: float) -> None:
+        """Moves the pointer to screen point (x, y), top-left origin, logical
+        points. Computer-use tools have no hover-only action; this is how a
+        tooltip is shown without clicking."""
+        script = (
+            'ObjC.import("CoreGraphics");'
+            f"$.CGEventPost($.kCGHIDEventTap, $.CGEventCreateMouseEvent("
+            f"null, $.kCGEventMouseMoved, {{x:{x},y:{y}}}, 0));"
+        )
+        subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+
     def list_processes(self) -> List[ProcessRecord]:
         try:
             res = subprocess.run(
@@ -1008,6 +1024,12 @@ def cmd_point(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_
     print(f"Control:               {control_id}")
     print(f"Logical Window Point:  {res['tool_point']}")
     print(f"Screen Point:          {res['screen_point']}")
+    if getattr(args, "hover", None):
+        x, y = res["screen_point"]
+        sys_ops.move_mouse(x, y)
+        time.sleep(args.hover)
+        res["hover_seconds"] = args.hover
+        print(f"Hovered at {res['screen_point']} for {args.hover}s (no click)")
     print("\nDraft action.json entry:")
     print(json.dumps(res, indent=2, ensure_ascii=False))
     return 0
@@ -1163,6 +1185,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_point = subparsers.add_parser("point", help="Calculate coordinates for a control ID from latest CTRL_BOUNDS")
     p_point.add_argument("control_id", help="Exact probe control ID")
     p_point.add_argument("--run", help="Run directory path")
+    p_point.add_argument(
+        "--hover",
+        type=float,
+        metavar="SECONDS",
+        help="Also move the pointer to the control's centre and stay there (tooltips); never clicks",
+    )
 
     # finish
     p_finish = subparsers.add_parser("finish", help="Tear down the round and verify cleanliness")
