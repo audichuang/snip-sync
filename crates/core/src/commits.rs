@@ -1780,7 +1780,8 @@ fn case_alias(
 /// deleted, a directory where a file is written (unless this commit's own
 /// deletions empty it, as `delete` removes emptied parents), or a file where
 /// a write needs a directory (unless this commit deletes that file), or, on
-/// a case-insensitive filesystem, a [`case_alias`].
+/// a case-insensitive filesystem, a path whose spelling differs only in case
+/// from another path of this commit or from a [`case_alias`].
 fn layout_conflicts(
 	root: &Path,
 	files: &[FilePlan],
