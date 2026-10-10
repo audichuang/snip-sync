@@ -52,3 +52,13 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 ## GitHub Actions
 
 The repo is private: an action that reads the GitHub API (PR files, merged PRs) needs the permission in the job's `permissions:`, e.g. `pull-requests: read`. This has failed CI twice.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues, through the `gh` CLI; the older `docs/tickets/T-*.md` are history. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
