@@ -128,6 +128,23 @@ class SystemOperations:
         if sys.platform == "darwin":
             subprocess.run(["pbcopy"], input=data, check=True)
 
+    def register_app(self, app_path: Path) -> None:
+        if sys.platform == "darwin":
+            lsregister_candidates = [
+                "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+                "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister",
+            ]
+            for candidate in lsregister_candidates:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    subprocess.run(
+                        [candidate, "-f", str(app_path)],
+                        check=False,
+                        timeout=10,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return
+
     def unregister_app(self, app_path: Path) -> None:
         if sys.platform == "darwin":
             lsregister_candidates = [
@@ -668,6 +685,10 @@ def cmd_prepare(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SY
         return 1
     bin_sha = sha256_of_file(built_bin)
 
+    # Isolated config directory
+    isolated_config = run_dir / "config"
+    isolated_config.mkdir(parents=True, exist_ok=True)
+
     # 5. Bundle into uniquely named .app
     app_name = f"snip-sync QA {short_sha}.app"
     app_dir = run_dir / app_name
@@ -682,6 +703,27 @@ def cmd_prepare(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SY
         print("ERROR: Binary SHA-256 verification failed after bundling!", file=sys.stderr)
         return 1
 
+    launcher_script = macos_dir / "snip-desktop-launcher"
+    launcher_content = f"""#!/bin/sh
+# Ensures environment isolation and logging when opened via LaunchServices (e.g. open -a or getApp).
+export SNIP_NATIVE_E2E="${{SNIP_NATIVE_E2E:-1}}"
+export SNIP_THEME="${{SNIP_THEME:-dark}}"
+export SNIP_CONFIG_DIR="${{SNIP_CONFIG_DIR:-{isolated_config}}}"
+export SNIP_NATIVE_E2E_EXPORT_HOLD_FILE="${{SNIP_NATIVE_E2E_EXPORT_HOLD_FILE:-{run_dir / "export-hold"}}}"
+
+if [ -n "$SNIP_APP_LOG" ]; then
+    LOG_FILE="$SNIP_APP_LOG"
+elif [ -f "{run_dir}/app-gate-a.log" ] && [ ! -f "{run_dir}/app-gate-b.log" ]; then
+    LOG_FILE="{run_dir}/app-gate-a.log"
+else
+    LOG_FILE="{run_dir}/app-gate-b.log"
+fi
+
+exec "{dest_bin}" "$@" >> "$LOG_FILE" 2>&1
+"""
+    launcher_script.write_text(launcher_content, encoding="utf-8")
+    launcher_script.chmod(0o755)
+
     bundle_id = f"com.snipsync.qa.{run_dir.name}"
     info_plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -690,7 +732,7 @@ def cmd_prepare(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SY
 	<key>CFBundleDisplayName</key>
 	<string>snip-sync QA {short_sha}</string>
 	<key>CFBundleExecutable</key>
-	<string>snip-desktop-native</string>
+	<string>snip-desktop-launcher</string>
 	<key>CFBundleIdentifier</key>
 	<string>{bundle_id}</string>
 	<key>CFBundleName</key>
@@ -699,10 +741,25 @@ def cmd_prepare(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SY
 	<string>APPL</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>LSEnvironment</key>
+	<dict>
+		<key>SNIP_NATIVE_E2E</key>
+		<string>1</string>
+		<key>SNIP_THEME</key>
+		<string>dark</string>
+		<key>SNIP_CONFIG_DIR</key>
+		<string>{isolated_config}</string>
+		<key>SNIP_NATIVE_E2E_EXPORT_HOLD_FILE</key>
+		<string>{run_dir / "export-hold"}</string>
+	</dict>
 </dict>
 </plist>
 """
     (app_dir / "Contents" / "Info.plist").write_text(info_plist_content, encoding="utf-8")
+
+    # Register fresh bundle with LaunchServices
+    sys_ops.register_app(app_dir)
+    print("[OK] Registered .app with LaunchServices.")
 
     # Compile window-info helper if swiftc available
     window_swift_src = run_dir / "window.swift"
@@ -751,10 +808,7 @@ print(String(data: data, encoding: .utf8)!)
             print("ERROR: Gate A verification failed!", file=sys.stderr)
             return 1
 
-    # 7. Isolated config & snapshot real config
-    isolated_config = run_dir / "config"
-    isolated_config.mkdir(parents=True, exist_ok=True)
-
+    # 7. Snapshot real config
     real_config_dir = get_real_config_dir()
     real_snap = snapshot_config_dir(real_config_dir)
     (run_dir / "real-config-snapshot.json").write_text(json.dumps(real_snap, indent=2), encoding="utf-8")
@@ -855,7 +909,73 @@ exec "{w_remote}/src/target/release/snip" "$@"
     return 0
 
 
-def cmd_launch(args: argparse.Namespace) -> int:
+def cmd_supervisor(args: argparse.Namespace) -> int:
+    gate = args.gate.lower()
+    run_dir = resolve_run_dir(args.run)
+    env_file = run_dir / "environment.json"
+    if not env_file.is_file():
+        print(f"ERROR: environment.json not found in {run_dir}", file=sys.stderr)
+        return 1
+
+    env_data = json.loads(env_file.read_text(encoding="utf-8"))
+    binary = Path(env_data["binary"])
+    if not binary.is_file():
+        print(f"ERROR: Binary not found at {binary}", file=sys.stderr)
+        return 1
+
+    workspace = (
+        Path(env_data["fixtures"]["gate_a"]) / "machine-a"
+        if gate == "a"
+        else Path(env_data["fixtures"]["gate_b"]) / "ws-src"
+    )
+
+    log_file = run_dir / f"app-gate-{gate}.log"
+    proc_env = os.environ.copy()
+    proc_env.update(env_data["launch_env"])
+    proc_env["SNIP_APP_LOG"] = str(log_file)
+
+    started_at = datetime.datetime.now().astimezone().isoformat()
+    log_fp = open(log_file, "a", encoding="utf-8")
+
+    app_proc = subprocess.Popen(
+        [str(binary), "--workspace", str(workspace)],
+        env=proc_env,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+    )
+
+    proc_state = {
+        "pid": app_proc.pid,
+        "supervisor_pid": os.getpid(),
+        "gate": gate,
+        "log": str(log_file),
+        "launch_time": time.time(),
+        "started_at": started_at,
+    }
+    (run_dir / "app-process.json").write_text(json.dumps(proc_state, indent=2), encoding="utf-8")
+
+    ret = app_proc.wait()
+    finished_at = datetime.datetime.now().astimezone().isoformat()
+    try:
+        log_fp.flush()
+        log_fp.close()
+    except Exception:
+        pass
+
+    sig = -ret if ret < 0 else None
+    exit_data = {
+        "pid": app_proc.pid,
+        "exit_code": ret,
+        "signal": sig,
+        "started_at": started_at,
+        "finished_at": finished_at,
+    }
+    exit_file = run_dir / f"app-gate-{gate}-exit.json"
+    exit_file.write_text(json.dumps(exit_data, indent=2), encoding="utf-8")
+    return 0
+
+
+def cmd_launch(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_OPS) -> int:
     gate = args.gate.lower()
     if gate not in ("a", "b"):
         print("ERROR: --gate must be 'a' or 'b'", file=sys.stderr)
@@ -880,30 +1000,63 @@ def cmd_launch(args: argparse.Namespace) -> int:
     )
 
     log_file = run_dir / f"app-gate-{gate}.log"
-    proc_env = os.environ.copy()
-    proc_env.update(env_data["launch_env"])
+    exit_file = run_dir / f"app-gate-{gate}-exit.json"
+    proc_file = run_dir / "app-process.json"
 
-    print(f"Launching snip-desktop-native for Gate {gate.upper()}...")
+    # Remove any stale exit or process file from previous attempts
+    if exit_file.exists():
+        exit_file.unlink()
+    if proc_file.exists():
+        proc_file.unlink()
+
+    print(f"Launching snip-desktop-native supervisor for Gate {gate.upper()}...")
     print(f"  Binary:    {binary}")
     print(f"  Workspace: {workspace}")
     print(f"  Log file:  {log_file}")
 
-    log_fp = open(log_file, "w", encoding="utf-8")
-    proc = subprocess.Popen(
-        [str(binary), "--workspace", str(workspace)],
-        env=proc_env,
-        stdout=log_fp,
-        stderr=subprocess.STDOUT,
-    )
+    supervisor_cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "_supervisor",
+        "--gate", gate,
+        "--run", str(run_dir),
+    ]
 
-    proc_state = {
-        "pid": proc.pid,
-        "gate": gate,
-        "log": str(log_file),
-        "launch_time": time.time(),
+    kwargs: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
     }
-    (run_dir / "app-process.json").write_text(json.dumps(proc_state, indent=2), encoding="utf-8")
-    print(f"[OK] Started PID {proc.pid}. Recorded to app-process.json.")
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True
+
+    subprocess.Popen(supervisor_cmd, **kwargs)
+
+    # Bounded wait for supervisor to write app-process.json and ensure PID is alive
+    deadline = time.time() + 5.0
+    app_pid = None
+    proc_state = None
+    while time.time() < deadline:
+        if proc_file.is_file():
+            try:
+                data = json.loads(proc_file.read_text(encoding="utf-8"))
+                if data.get("gate") == gate and data.get("pid"):
+                    app_pid = data["pid"]
+                    if sys_ops.is_pid_alive(app_pid):
+                        proc_state = data
+                        break
+            except Exception:
+                pass
+        time.sleep(0.1)
+
+    if not app_pid or not proc_state:
+        if exit_file.is_file():
+            print(f"ERROR: App exited immediately: {exit_file.read_text(encoding='utf-8')}", file=sys.stderr)
+        else:
+            print("ERROR: Timed out waiting for app process to start.", file=sys.stderr)
+        return 1
+
+    print(f"[OK] Started PID {app_pid} (supervisor PID {proc_state.get('supervisor_pid')}). Recorded to app-process.json.")
     return 0
 
 
@@ -1048,10 +1201,13 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     exit_code = 0
     app_was_running = False
 
-    # 1. Quit app with Cmd+Q if running
+    # 1. Quit app with Cmd+Q if running, and read exit receipt from supervisor
     if proc_file.is_file():
         proc_state = json.loads(proc_file.read_text(encoding="utf-8"))
         pid = proc_state.get("pid")
+        gate = proc_state.get("gate", "a")
+        exit_file = run_dir / f"app-gate-{gate}-exit.json"
+
         if pid and sys_ops.is_pid_alive(pid):
             app_was_running = True
             print(f"Quitting app PID {pid} via Cmd+Q...")
@@ -1066,9 +1222,29 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
             if ec is None:
                 print(f"Process {pid} did not terminate within 10s. Force killing...", file=sys.stderr)
                 sys_ops.kill_process(pid, signal.SIGKILL)
-                exit_code = -9
-            else:
-                exit_code = ec
+
+        # Bounded wait for supervisor to write exit receipt file
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if exit_file.is_file():
+                break
+            time.sleep(0.1)
+
+        if not exit_file.is_file():
+            print(f"ERROR: Missing exit receipt {exit_file.name} for PID {pid}!", file=sys.stderr)
+            return 1
+
+        try:
+            exit_data = json.loads(exit_file.read_text(encoding="utf-8"))
+            exit_code = exit_data["exit_code"]
+            print(f"[OK] Read {exit_file.name}: pid={exit_data.get('pid')} exit_code={exit_code}")
+        except Exception as exc:
+            print(f"ERROR: Failed to read {exit_file.name}: {exc}", file=sys.stderr)
+            return 1
+
+        if exit_code != 0:
+            print(f"ERROR: App exited with non-zero exit code {exit_code}", file=sys.stderr)
+            return 1
 
     # 2. Verify no snip desktop process for this round remains
     app_bundle_path = Path(env_data["app_bundle"])
@@ -1196,6 +1372,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_finish = subparsers.add_parser("finish", help="Tear down the round and verify cleanliness")
     p_finish.add_argument("--run", help="Run directory path")
 
+    # _supervisor (internal detached supervisor for launch)
+    p_sup = subparsers.add_parser("_supervisor", help=argparse.SUPPRESS)
+    p_sup.add_argument("--gate", required=True, choices=["a", "b"], help="Gate to supervise")
+    p_sup.add_argument("--run", help="Run directory path")
+
     return parser
 
 
@@ -1207,6 +1388,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_prepare(args)
     elif args.subcommand == "launch":
         return cmd_launch(args)
+    elif args.subcommand == "_supervisor":
+        return cmd_supervisor(args)
     elif args.subcommand == "resize":
         return cmd_resize(args)
     elif args.subcommand == "point":

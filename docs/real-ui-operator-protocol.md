@@ -298,15 +298,20 @@ Git 的參數以 argv 傳給 `git`。雜湊對寫好的檔算，不把 Git 輸�
 ```text
 python3 scripts/collaboration_fixture.py snapshot \
   --fixture "$RUN/gate-a" --output "$CASE/before.json"
-# 做完這一步
+# 做完這一步（neg-stale-source 與 neg-stale-target：外部修改後、動作前另拍快照 $CASE/pre-action-after-edit.json）
 python3 scripts/collaboration_fixture.py snapshot \
   --fixture "$RUN/gate-a" --output "$CASE/after.json"
 python3 scripts/collaboration_fixture.py compare-step \
   --fixture "$RUN/gate-a" --step <步驟 id> \
   --snapshot "$CASE/after.json" --phase applied
+# neg-stale-source 與 neg-stale-target 需加上 --baseline 指向外部修改後快照：
+# python3 scripts/collaboration_fixture.py compare-step \
+#   --fixture "$RUN/gate-a" --step <步驟 id> \
+#   --snapshot "$CASE/after.json" --phase applied \
+#   --baseline "$CASE/pre-action-after-edit.json"
 ```
 
-`compare-step` 結束碼 0 才算 Git oracle 過。負向步驟的 `applied` 必須等於 baseline，或等於動作前、外部修改之後那張快照。規格寫在 [native-collaboration-acceptance.md](native-collaboration-acceptance.md)。
+`compare-step` 結束碼 0 才算 Git oracle 過。負向步驟的 `applied` 必須等於 baseline，或等於動作前、外部修改之後那張快照（`neg-stale-source` 與 `neg-stale-target` 透過 `--baseline` 指定該快照）。規格寫在 [native-collaboration-acceptance.md](native-collaboration-acceptance.md)。
 
 ## 5. 閘門 A：18 個語意步驟
 
@@ -344,8 +349,8 @@ Commit 步驟把第 2–3 步換成：`rail-log`，點起點 `commit-row:<7 字�
 | `neg-mapping-collision` | 兩條路徑最後都映到同一個目的檔 | 第二次 replan 出現 `[APP:PASTE_PLAN_REFUSED: reason=target_collision]`；零寫入 |
 | `neg-mapping-ambiguous-basename` | 只給 `billing`，west 與 east 都有 | 候選 root 同時含這兩個 canonical path；`mapping_required`；取消後零寫入 |
 | `neg-mapping-missing-destination` | 不提交不存在的 repo id | `billing` 的候選正好是目的工作區那 15 個真實 root；Return 後 `[APP:PASTE_ERR: mapping_required]`；點 `btn-apply` 後 1 秒內沒有 `PASTE_APPLYING` 或 `PASTE_DONE` |
-| `neg-stale-source` | 啟動命令裡已經有 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選好變更列後對它右鍵，用 `pbcopy` 放入 sentinel，建立 `$RUN/export-hold`，再點一次 `menu-item:copy-files`。等到新的 `[APP:EXPORT_PLAN_READY: files=N]`（N 至少 1），改來源檔，拍快照，刪掉 hold 檔。同一次複製會接著跑。不要再按一次複製，也不要等選完才去設環境變數。這一步結束時 `$RUN/export-hold` 必須不存在。中途失敗而檔還在，先刪掉它，證據欄寫「hold 殘留，已刪」，然後才做後面的檔案模式複製。檔留著的話，之後每一次檔案模式複製都會停在 `EXPORT_PLAN_READY` | `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`；沒有 `COPY_DONE`；sentinel 不變；快照等於改完之後、刪掉 hold 之前那張；`$RUN/export-hold` 不存在 |
-| `neg-stale-target` | 預覽出現後改目的端，再 Apply | `[APP:PASTE_STALE_DETECTED: stale_modified]`（`stale_created`、`stale_deleted` 看外部改法）；畫面文字是「目的地檔案已在外部修改: …」；快照等於改完之後、Apply 之前那張 |
+| `neg-stale-source` | 啟動命令裡已經有 `SNIP_NATIVE_E2E_EXPORT_HOLD_FILE`。選好變更列後對它右鍵，用 `pbcopy` 放入 sentinel，建立 `$RUN/export-hold`，再點一次 `menu-item:copy-files`。等到新的 `[APP:EXPORT_PLAN_READY: files=N]`（N 至少 1），改來源檔，拍快照（`$CASE/pre-action-after-edit.json`），刪掉 hold 檔。同一次複製會接著跑。不要再按一次複製，也不要等選完才去設環境變數。這一步結束時 `$RUN/export-hold` 必須不存在。中途失敗而檔還在，先刪掉它，證據欄寫「hold 殘留，已刪」，然後才做後面的檔案模式複製。檔留著的話，之後每一次檔案模式複製都會停在 `EXPORT_PLAN_READY` | `[APP:COPY_FAILED: stale_source]` 與 `[APP:COPY_IDLE]`；沒有 `COPY_DONE`；sentinel 不變；快照等於改完之後、刪掉 hold 之前那張；`$RUN/export-hold` 不存在；以改完後快照為 `--baseline` 執行 `compare-step` 結束碼 0 |
+| `neg-stale-target` | 預覽出現後改目的端，拍快照（`$CASE/pre-action-after-edit.json`），再 Apply | `[APP:PASTE_STALE_DETECTED: stale_modified]`（`stale_created`、`stale_deleted` 看外部改法）；畫面文字是「目的地檔案已在外部修改: …」；快照等於改完之後、Apply 之前那張；以改完後快照為 `--baseline` 執行 `compare-step` 結束碼 0 |
 | `neg-overwrite-unauthorized` | 目的檔已存在，不勾覆寫就 Apply | `[APP:PASTE_DONE:]` 且 `overwritten=0`；該檔位元組不變 |
 | `neg-cancel` | 預覽後 Escape 或 `btn-cancel` | `[APP:PASTE_CANCELLED]`；快照等於生成時的 baseline |
 

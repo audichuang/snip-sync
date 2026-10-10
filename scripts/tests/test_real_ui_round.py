@@ -12,6 +12,8 @@ Tests the platform-independent logic:
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 from pathlib import Path
 import signal
@@ -36,6 +38,7 @@ class FakeSystemOperations(rur.SystemOperations):
         self.clipboard_data: bytes = b""
         self.remote_responses: Dict[str, str] = {}
         self.applescripts_run: List[str] = []
+        self.registered_apps: List[Path] = []
         self.unregistered_apps: List[Path] = []
 
     def list_processes(self) -> List[rur.ProcessRecord]:
@@ -61,6 +64,9 @@ class FakeSystemOperations(rur.SystemOperations):
 
     def set_clipboard_bytes(self, data: bytes) -> None:
         self.clipboard_data = data
+
+    def register_app(self, app_path: Path) -> None:
+        self.registered_apps.append(app_path)
 
     def unregister_app(self, app_path: Path) -> None:
         self.unregistered_apps.append(app_path)
@@ -414,6 +420,208 @@ class TestPasteIdDetection(unittest.TestCase):
         paste_rs.parent.mkdir(parents=True, exist_ok=True)
         paste_rs.write_text('/// legacy format without ix\n')
         self.assertEqual(rur.detect_paste_id_format(self.root), "paste-row:<path>")
+
+
+class TestLaunchSupervisorAndExitFile(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.run_dir = Path(self.temp_dir.name)
+        self.sys_ops = FakeSystemOperations()
+
+        # Create mock binary: a python script that exits 0
+        self.mock_bin = self.run_dir / "mock_app"
+        self.mock_bin.write_text(f"""#!/bin/sh
+echo "[APP:VIEWPORT: 900x600]"
+exit 0
+""")
+        self.mock_bin.chmod(0o755)
+
+        # Setup fixtures
+        fixtures_dir = self.run_dir / "gate-b" / "fixtures" / "ws-src"
+        fixtures_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "gate-a" / "machine-a").mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "config").mkdir(parents=True, exist_ok=True)
+
+        self.env_data = {
+            "sha": "9dffa2e80715e47fec3dd29563414ce933082b4a",
+            "branch": "feature/test",
+            "source_worktree": str(self.run_dir / "worktree"),
+            "build": "cargo build",
+            "binary": str(self.mock_bin),
+            "binary_sha256": "abc123",
+            "app_bundle": str(self.run_dir / "snip-sync QA test.app"),
+            "config_isolated": str(self.run_dir / "config"),
+            "export_hold_file": str(self.run_dir / "export-hold"),
+            "paste_id": "paste-row:<path>",
+            "fixtures": {
+                "gate_b": str(self.run_dir / "gate-b" / "fixtures"),
+                "perf15": str(self.run_dir / "perf15"),
+                "gate_a": str(self.run_dir / "gate-a"),
+            },
+            "fixture_logs": ["fixture.log"],
+            "launch_env": {
+                "SNIP_NATIVE_E2E": "1",
+                "SNIP_THEME": "dark",
+                "SNIP_CONFIG_DIR": str(self.run_dir / "config"),
+                "SNIP_NATIVE_E2E_EXPORT_HOLD_FILE": str(self.run_dir / "export-hold"),
+            },
+            "launch_gate_b": "launch",
+            "launch_gate_a": "launch",
+            "prepared_by": "test",
+            "viewport_measured": {},
+        }
+        (self.run_dir / "environment.json").write_text(json.dumps(self.env_data, indent=2))
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_supervisor_records_exit_code_and_times(self):
+        args = argparse.Namespace(gate="b", run=str(self.run_dir))
+        rc = rur.cmd_supervisor(args)
+        self.assertEqual(rc, 0)
+
+        # Check app-process.json was created
+        proc_file = self.run_dir / "app-process.json"
+        self.assertTrue(proc_file.is_file())
+        proc_data = json.loads(proc_file.read_text(encoding="utf-8"))
+        self.assertIn("pid", proc_data)
+        self.assertIn("supervisor_pid", proc_data)
+        self.assertEqual(proc_data["gate"], "b")
+
+        # Check app-gate-b-exit.json was created
+        exit_file = self.run_dir / "app-gate-b-exit.json"
+        self.assertTrue(exit_file.is_file())
+        exit_data = json.loads(exit_file.read_text(encoding="utf-8"))
+        self.assertEqual(exit_data["exit_code"], 0)
+        self.assertIsNone(exit_data["signal"])
+        self.assertIn("started_at", exit_data)
+        self.assertIn("finished_at", exit_data)
+
+    def test_finish_fails_when_exit_receipt_is_missing(self):
+        # Create app-process.json without exit receipt
+        proc_data = {"pid": 99999, "gate": "b", "log": str(self.run_dir / "app-gate-b.log")}
+        (self.run_dir / "app-process.json").write_text(json.dumps(proc_data))
+
+        args = argparse.Namespace(run=str(self.run_dir))
+        rc = rur.cmd_finish(args, sys_ops=self.sys_ops)
+        self.assertEqual(rc, 1)
+
+    def test_finish_fails_when_app_exited_nonzero(self):
+        proc_data = {"pid": 99999, "gate": "b", "log": str(self.run_dir / "app-gate-b.log")}
+        (self.run_dir / "app-process.json").write_text(json.dumps(proc_data))
+
+        exit_data = {
+            "pid": 99999,
+            "exit_code": 1,
+            "signal": None,
+            "started_at": "2026-10-10T00:00:00Z",
+            "finished_at": "2026-10-10T00:00:01Z",
+        }
+        (self.run_dir / "app-gate-b-exit.json").write_text(json.dumps(exit_data))
+
+        args = argparse.Namespace(run=str(self.run_dir))
+        rc = rur.cmd_finish(args, sys_ops=self.sys_ops)
+        self.assertEqual(rc, 1)
+
+    def test_finish_succeeds_when_exit_receipt_is_zero(self):
+        proc_data = {"pid": 99999, "gate": "b", "log": str(self.run_dir / "app-gate-b.log")}
+        (self.run_dir / "app-process.json").write_text(json.dumps(proc_data))
+
+        exit_data = {
+            "pid": 99999,
+            "exit_code": 0,
+            "signal": None,
+            "started_at": "2026-10-10T00:00:00Z",
+            "finished_at": "2026-10-10T00:00:01Z",
+        }
+        (self.run_dir / "app-gate-b-exit.json").write_text(json.dumps(exit_data))
+
+        # Setup dummy bundle path so finish does not fail on leftover process or unregister
+        app_bundle = Path(self.env_data["app_bundle"])
+        app_bundle.mkdir(parents=True, exist_ok=True)
+
+        args = argparse.Namespace(run=str(self.run_dir))
+        rc = rur.cmd_finish(args, sys_ops=self.sys_ops)
+        self.assertEqual(rc, 0)
+        self.assertIn(app_bundle, self.sys_ops.unregistered_apps)
+
+        # Check recorded finish_results
+        env_res = json.loads((self.run_dir / "environment.json").read_text(encoding="utf-8"))
+        self.assertEqual(env_res["finish_results"]["exit_code"], 0)
+
+
+class TestBundleIsolation(unittest.TestCase):
+    def test_bundle_contains_launcher_and_lsenvironment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            macos_dir = run_dir / "MyApp.app" / "Contents" / "MacOS"
+            macos_dir.mkdir(parents=True, exist_ok=True)
+
+            dest_bin = macos_dir / "snip-desktop-native"
+            dest_bin.write_text("#!/bin/sh\nexit 0\n")
+            dest_bin.chmod(0o755)
+
+            isolated_config = run_dir / "config"
+            isolated_config.mkdir(parents=True, exist_ok=True)
+
+            launcher_script = macos_dir / "snip-desktop-launcher"
+            launcher_content = f"""#!/bin/sh
+export SNIP_NATIVE_E2E="${{SNIP_NATIVE_E2E:-1}}"
+export SNIP_THEME="${{SNIP_THEME:-dark}}"
+export SNIP_CONFIG_DIR="${{SNIP_CONFIG_DIR:-{isolated_config}}}"
+export SNIP_NATIVE_E2E_EXPORT_HOLD_FILE="${{SNIP_NATIVE_E2E_EXPORT_HOLD_FILE:-{run_dir / "export-hold"}}}"
+
+if [ -n "$SNIP_APP_LOG" ]; then
+    LOG_FILE="$SNIP_APP_LOG"
+elif [ -f "{run_dir}/app-gate-a.log" ] && [ ! -f "{run_dir}/app-gate-b.log" ]; then
+    LOG_FILE="{run_dir}/app-gate-a.log"
+else
+    LOG_FILE="{run_dir}/app-gate-b.log"
+fi
+
+exec "{dest_bin}" "$@" >> "$LOG_FILE" 2>&1
+"""
+            launcher_script.write_text(launcher_content, encoding="utf-8")
+            launcher_script.chmod(0o755)
+
+            self.assertTrue(launcher_script.is_file())
+            self.assertTrue(os.access(launcher_script, os.X_OK))
+
+            script_text = launcher_script.read_text(encoding="utf-8")
+            self.assertIn(f"SNIP_CONFIG_DIR:-{isolated_config}", script_text)
+            self.assertIn("SNIP_NATIVE_E2E:-1", script_text)
+            self.assertIn(f'exec "{dest_bin}"', script_text)
+
+            # Plist checks
+            info_plist = run_dir / "MyApp.app" / "Contents" / "Info.plist"
+            bundle_id = "com.snipsync.qa.test"
+            plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>snip-desktop-launcher</string>
+	<key>CFBundleIdentifier</key>
+	<string>{bundle_id}</string>
+	<key>LSEnvironment</key>
+	<dict>
+		<key>SNIP_NATIVE_E2E</key>
+		<string>1</string>
+		<key>SNIP_THEME</key>
+		<string>dark</string>
+		<key>SNIP_CONFIG_DIR</key>
+		<string>{isolated_config}</string>
+		<key>SNIP_NATIVE_E2E_EXPORT_HOLD_FILE</key>
+		<string>{run_dir / "export-hold"}</string>
+	</dict>
+</dict>
+</plist>
+"""
+            info_plist.write_text(plist_content, encoding="utf-8")
+            plist_text = info_plist.read_text(encoding="utf-8")
+            self.assertIn("<key>CFBundleExecutable</key>\n\t<string>snip-desktop-launcher</string>", plist_text)
+            self.assertIn("<key>LSEnvironment</key>", plist_text)
+            self.assertIn(f"<string>{isolated_config}</string>", plist_text)
 
 
 if __name__ == "__main__":
