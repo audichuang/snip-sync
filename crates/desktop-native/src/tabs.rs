@@ -467,9 +467,12 @@ impl TabsRoot {
 		self.tabs.iter().position(|t| &t.model == model)
 	}
 
+	/// The tab showing `identity`; a tab whose close is draining does not
+	/// count, so reopening what was just closed opens it again.
 	fn find(&self, identity: &WsIdentity, cx: &App) -> Option<usize> {
 		self.tabs.iter().position(|t| {
-			t.model.read(cx).ws_identity().as_ref() == Some(identity)
+			let m = t.model.read(cx);
+			!m.is_closing() && m.ws_identity().as_ref() == Some(identity)
 		})
 	}
 
@@ -555,7 +558,7 @@ impl TabsRoot {
 			}
 			_ => cx.notify(),
 		}
-		self.maybe_quit(cx);
+		self.maybe_quit(window, cx);
 	}
 
 	fn open_target(
@@ -615,7 +618,7 @@ impl TabsRoot {
 				}
 				if waiting {
 					self.quit_drained.push(id);
-					self.maybe_quit(cx);
+					self.maybe_quit(window, cx);
 				} else {
 					// The quit stopped meanwhile: reload what it cancelled.
 					with_log_tab(Some(id), || {
@@ -624,18 +627,8 @@ impl TabsRoot {
 				}
 			}
 			TabEvent::DrainFailed => {
-				if self.quitting.take().is_some() {
-					for other in std::mem::take(&mut self.quit_drained) {
-						if let Some(t) =
-							self.tabs.iter().find(|t| t.id == other)
-						{
-							with_log_tab(Some(other), || {
-								t.model.update(cx, |m, cx| {
-									m.resume_after_drain(cx)
-								})
-							});
-						}
-					}
+				if self.quitting.is_some() {
+					self.stop_quit(window, cx);
 					self.activate(ix, window, cx);
 				}
 			}
@@ -688,11 +681,42 @@ impl TabsRoot {
 				})
 			});
 		}
-		self.maybe_quit(cx);
+		self.maybe_quit(window, cx);
 	}
 
-	fn maybe_quit(&mut self, cx: &mut Context<Self>) {
+	/// The quit stops: the tabs that already drained reload what it
+	/// cancelled; the ones still draining do when they report.
+	fn stop_quit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+		self.quitting = None;
+		for other in std::mem::take(&mut self.quit_drained) {
+			if let Some(t) = self.tabs.iter().find(|t| t.id == other) {
+				with_log_tab(Some(other), || {
+					t.model.update(cx, |m, cx| m.resume_after_drain(cx))
+				});
+			}
+		}
+	}
+
+	fn maybe_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
 		if self.quitting.as_ref().is_some_and(Vec::is_empty) {
+			// A tab that drained early may have started a confirmed paste
+			// while another was still draining: that write is not cut off.
+			if let Some(ix) = self
+				.tabs
+				.iter()
+				.position(|t| t.model.read(cx).blocks_close())
+			{
+				self.stop_quit(window, cx);
+				self.activate(ix, window, cx);
+				let tab = &self.tabs[ix];
+				let id = tab.id;
+				with_log_tab(Some(id), || {
+					tab.model.update(cx, |m, cx| {
+						m.request_user_close(lifecycle::Intent::Quit, cx)
+					})
+				});
+				return;
+			}
 			self.quit_sent = true;
 			// Never inside the platform callback that asked (the window's
 			// close button): the X11 client is still borrowed there, and a

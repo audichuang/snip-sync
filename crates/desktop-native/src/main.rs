@@ -2200,9 +2200,10 @@ impl WorkbenchModel {
 		}
 		if !self.workspace_open
 			&& !self.lifecycle.is_draining()
+			&& self.lifecycle.unfinished() == 0
 			&& matches!(intent, lifecycle::Intent::CloseWorkspace)
 		{
-			// An empty tab has nothing to drain.
+			// An empty tab with no job has nothing to drain.
 			if self.ws_tab.is_some() {
 				self.paste.invalidate_job();
 				cx.emit(tabs::TabEvent::Closed);
@@ -2704,6 +2705,14 @@ impl WorkbenchModel {
 			},
 			None => tabs::WsIdentity::Local(self.workspace_root.clone()),
 		})
+	}
+
+	/// The tab's close (or a quit) is draining: it is about to go away.
+	pub fn is_closing(&self) -> bool {
+		matches!(
+			self.lifecycle.pending_intent(),
+			Some(lifecycle::Intent::CloseWorkspace | lifecycle::Intent::Quit)
+		)
 	}
 
 	/// No workspace, none opening, no paste: an open may fill this tab.
@@ -14832,8 +14841,10 @@ mod tests {
 				use snip_core::gitsrc::Git;
 
 				let (_tmp, _a, b, root, cx) = two_tabs(cx);
-				settle(cx);
-				assert_eq!(in_flight(), 0, "both tabs settled");
+				// Both tabs' own loads finish first (bounded): the counter is
+				// process-wide.
+				wait(cx, "both tabs idle", |_| in_flight() == 0);
+				let base = in_flight();
 				let git = Git::open(&b.join("beta")).unwrap();
 				let release = b.join("release");
 				let wait_for = release.display().to_string();
@@ -14849,7 +14860,7 @@ mod tests {
 				});
 				let deadline =
 					std::time::Instant::now() + Duration::from_secs(10);
-				while in_flight() == 0 {
+				while in_flight() < base + 1 {
 					assert!(
 						std::time::Instant::now() < deadline,
 						"git never started"
@@ -14861,7 +14872,7 @@ mod tests {
 				click_id(cx, "ws-tab:0".into());
 				cx.simulate_keystrokes("cmd-w");
 				wait(cx, "A closed", |cx| count(&root, cx) == 1);
-				assert_eq!(in_flight(), 1, "the Git child still runs");
+				assert!(!handle.is_finished(), "the Git child still runs");
 
 				// Quit waits for every Git child.
 				cx.simulate_keystrokes("cmd-q");
@@ -14916,6 +14927,89 @@ mod tests {
 				);
 				b_load.set(true);
 				wait(cx, "quit", |cx| root.read_with(cx, |r, _| r.quit_sent));
+			}
+
+			/// A tab that drained early and then starts a confirmed paste
+			/// while another tab still drains stops the quit: the write is
+			/// not cut off, and that tab is shown.
+			#[gpui::test]
+			fn a_paste_started_during_the_quit_stops_it(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let (ta, tb) = (tab(&root, cx, 0), tab(&root, cx, 1));
+				let b_load = hold_job(&tb, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				assert!(
+					!ta.read_with(cx, |m, _| m.lifecycle.is_draining()),
+					"A drained"
+				);
+				assert!(tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+				let paste = hold_job(&ta, cx, JobKind::Mutating);
+				b_load.set(true);
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert!(
+					!root.read_with(cx, |r, _| r.quit_sent),
+					"the write is not cut off"
+				);
+				assert_eq!(active(&root, cx), Some(0));
+				assert_eq!(
+					ta.read_with(cx, |m, _| m.status.key),
+					"workspace_busy_applying"
+				);
+				assert_eq!(count(&root, cx), 2);
+				// Once written, Quit quits.
+				paste.set(true);
+				settle(cx);
+				cx.simulate_keystrokes("cmd-q");
+				wait(cx, "quit", |cx| root.read_with(cx, |r, _| r.quit_sent));
+			}
+
+			/// Reopening a folder whose tab is still draining its close
+			/// opens it again in a new tab.
+			#[gpui::test]
+			fn reopening_a_closing_workspace_opens_a_new_tab(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b, root, cx) = two_tabs(cx);
+				click_id(cx, "ws-tab:0".into());
+				let ta = tab(&root, cx, 0);
+				let a_load = hold_job(&ta, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-w");
+				settle(cx);
+				assert!(ta.read_with(cx, |m, _| m.is_closing()));
+				open_typed(&root, cx, &a);
+				wait(cx, "a new tab for A", |cx| count(&root, cx) == 3);
+				a_load.set(true);
+				wait(cx, "the old A closed", |cx| count(&root, cx) == 2);
+				let reopened = tab(&root, cx, 1);
+				assert_ne!(reopened, ta);
+				wait(cx, "A open again", |cx| workspace_ready(&reopened, cx));
+				assert_eq!(
+					reopened.read_with(cx, |m, _| m.ws_identity()),
+					Some(WsIdentity::Local(a.clone()))
+				);
+			}
+
+			/// An empty tab with a job still running drains it before it goes.
+			#[gpui::test]
+			fn an_empty_tab_with_a_job_drains_before_closing(
+				cx: &mut TestAppContext,
+			) {
+				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
+				click_id(cx, "ws-tab-new".into());
+				let empty = tab(&root, cx, 1);
+				let job = hold_job(&empty, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-w");
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert_eq!(count(&root, cx), 2, "its job drains first");
+				job.set(true);
+				wait(cx, "closed", |cx| count(&root, cx) == 1);
 			}
 
 			/// A drain that gives up stops the quit; the tabs that already
