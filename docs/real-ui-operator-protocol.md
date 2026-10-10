@@ -85,7 +85,7 @@ shasum -a 256 target/debug/snip-desktop-native
 
 後面的命令都用這個 `$RUN`。`export-hold` 先不要建立；檔案不存在時，複製不會停住。
 
-`$RUN/config` 是這一輪的設定資料夾。`ls -A` 必須沒有輸出；不是空的就換一個新的 `$RUN`。每一次啟動都帶 `SNIP_CONFIG_DIR="$RUN/config"`，最近開啟的工作區與遠端紀錄只寫進這裡。空資料夾也代表設定全是預設值。少了這個變數，E2E 模式下最近開啟的工作區不會存（`recent::config_dir` 回傳空），B-nav 的 `workspace-recent:` 會缺。
+`$RUN/config` 是這一輪的設定資料夾。`ls -A` 必須沒有輸出；不是空的就換一個新的 `$RUN`。每一次啟動都帶 `SNIP_CONFIG_DIR="$RUN/config"`，最近開啟的工作區與開啟中的分頁（`open-tabs.json`）只寫進這裡。空資料夾也代表設定全是預設值。少了這個變數，E2E 模式下最近開啟的工作區不會存（`recent::config_dir` 回傳空），B-nav 的 `workspace-recent:` 會缺。
 
 3. 殘留檢查。第一次啟動前做一次，之後每一次啟動前再做一次：
 
@@ -129,7 +129,7 @@ python3 scripts/collaboration_fixture.py verify --fixture "$RUN/gate-a"
 6. 讀受測 SHA 的 `crates/desktop-native/src/paste.rs` 的 `control_id`，把格式 `paste-<row|include|overwrite>:<ix>:<path>` 抄進 `environment.json`。`ix` 是計畫內的項目索引，從 `CTRL_BOUNDS` 讀，不要自己算。若受測 SHA 的格式仍是只有路徑（`paste-row:<path>`），代表缺 #56。第 1 節只擋缺 `f5247ab`，缺 #56 時不擋：T03、T18 不適用，證據欄寫「缺 #56」，閘門打開；其餘格子的 ID 改照該 SHA 印出的格式。
 7. 啟動 App。探針只有在 `SNIP_NATIVE_E2E=1` 時才會印。`SNIP_NATIVE_E2E_EXPORT_HOLD_FILE` 在 `WorkbenchModel::new` 讀一次，所以必須寫在啟動命令裡。`SNIP_CONFIG_DIR` 寫在每一行啟動命令前面，不靠 shell 裡的 export。不要加 `--restore-dir`，貼上目的地由畫面決定。每一次啟動的 stdout 與 stderr 寫進該次自己的日誌，否則讀不到 `CTRL_BOUNDS`。
 
-同一時間只開一個 App。閘門 A 與閘門 B 各啟動一次，各寫一份日誌。先做哪一個都可以。換下一個之前，對目前這個按 Cmd+Q，等到 exit code 0，再啟動。第二次若用 `>` 寫進第一次的檔，會把 `CTRL_BOUNDS` 與 `PASTE_DONE` 截掉。
+同一時間只開一個 App。閘門 A 與閘門 B 各啟動一次，各寫一份日誌。先做哪一個都可以。換下一個之前，對目前這個按 Cmd+Q，等到 exit code 0，再 `rm -f "$RUN/config/open-tabs.json"`，然後啟動：兩個閘門共用 `$RUN/config`，不刪的話第二次啟動會先恢復第一個閘門的分頁，分頁 id 與數量都會跟著位移。第二次若用 `>` 寫進第一次的檔，會把 `CTRL_BOUNDS` 與 `PASTE_DONE` 截掉。
 
 同一個 shell 裡，下面三個 export 做一次即可。新開 shell 要再 export。
 

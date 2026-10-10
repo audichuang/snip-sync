@@ -118,6 +118,9 @@ struct App {
 	covered: Arc<Mutex<Vec<(String, String)>>>,
 	duplicates: Arc<Mutex<Vec<String>>>,
 	log_chips_count: Arc<std::sync::atomic::AtomicUsize>,
+	/// The launch's own config folder: no test restores another's tabs,
+	/// and none reads or writes the user's.
+	_config: tempfile::TempDir,
 }
 
 impl Drop for App {
@@ -156,12 +159,14 @@ fn spawn_app_themed(
 	theme: &str,
 ) -> App {
 	let mut cmd = Command::new(native_bin());
+	let config = tempfile::tempdir().expect("config dir");
 	cmd.args([
 		"--workspace",
 		&ws.to_string_lossy(),
 		"--restore-dir",
 		&dest.to_string_lossy(),
 	])
+	.env("SNIP_CONFIG_DIR", config.path())
 	.stdout(Stdio::piped())
 	.stderr(Stdio::piped())
 	.env("XMODIFIERS", "@im=none")
@@ -228,6 +233,7 @@ fn spawn_app_themed(
 		covered,
 		duplicates,
 		log_chips_count,
+		_config: config,
 	}
 }
 

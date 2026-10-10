@@ -11,6 +11,7 @@ description = "Real-app X11 drivers for snip-desktop-native (tests only)"
 # compiles a second copy of the app.
 [dev-dependencies]
 snip-core = { path = "../core" }
+serde_json = "1"
 tempfile = "3"
 
 [lints]

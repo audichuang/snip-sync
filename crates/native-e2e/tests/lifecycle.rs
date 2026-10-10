@@ -58,6 +58,8 @@ struct App {
 	starttime: String,
 	tracked: Vec<(u32, String)>,
 	readers: Vec<std::thread::JoinHandle<()>>,
+	/// The launch's own config folder, unless the test gave one.
+	_config: Option<tempfile::TempDir>,
 }
 
 impl Drop for App {
@@ -250,24 +252,49 @@ struct SpawnOpts<'a> {
 	export_hold: Option<&'a Path>,
 }
 
+/// A launch in a config folder of its own: the tabs one test leaves open
+/// are not restored into the next one's window.
 fn spawn_app(opts: SpawnOpts) -> App {
+	spawn_in(opts, None)
+}
+
+/// The config folder a relaunch shares with the launch before it, and
+/// whether it passes `--workspace` (and `--restore-dir`) again.
+struct Relaunch<'a> {
+	config: &'a Path,
+	with_workspace: bool,
+}
+
+fn spawn_in(opts: SpawnOpts, relaunch: Option<Relaunch>) -> App {
 	let mut cmd = Command::new(native_bin());
-	cmd.args([
-		"--workspace",
-		&opts.workspace.to_string_lossy(),
-		"--restore-dir",
-		&opts.restore.to_string_lossy(),
-	])
-	.stdout(Stdio::piped())
-	.stderr(Stdio::piped())
-	.env("XMODIFIERS", "@im=none")
-	.env("SNIP_THEME", "dark")
-	.env("SNIP_NATIVE_E2E", "1")
-	.env_remove("SNIP_E2E_GIT_HOLD_FILE")
-	.env_remove("SNIP_NATIVE_E2E_READ_DELAY_MS")
-	.env_remove("SNIP_NATIVE_E2E_APPLY_DELAY_MS")
-	.env_remove("SNIP_NATIVE_E2E_TREE_HOLD_FILE")
-	.env_remove("SNIP_NATIVE_E2E_EXPORT_HOLD_FILE");
+	let own_config = match &relaunch {
+		Some(_) => None,
+		None => Some(tempfile::tempdir().expect("config dir")),
+	};
+	let config = match (&relaunch, &own_config) {
+		(Some(r), _) => r.config.to_path_buf(),
+		(None, Some(dir)) => dir.path().to_path_buf(),
+		(None, None) => unreachable!(),
+	};
+	if relaunch.as_ref().is_none_or(|r| r.with_workspace) {
+		cmd.args([
+			"--workspace",
+			&opts.workspace.to_string_lossy(),
+			"--restore-dir",
+			&opts.restore.to_string_lossy(),
+		]);
+	}
+	cmd.env("SNIP_CONFIG_DIR", &config)
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.env("XMODIFIERS", "@im=none")
+		.env("SNIP_THEME", "dark")
+		.env("SNIP_NATIVE_E2E", "1")
+		.env_remove("SNIP_E2E_GIT_HOLD_FILE")
+		.env_remove("SNIP_NATIVE_E2E_READ_DELAY_MS")
+		.env_remove("SNIP_NATIVE_E2E_APPLY_DELAY_MS")
+		.env_remove("SNIP_NATIVE_E2E_TREE_HOLD_FILE")
+		.env_remove("SNIP_NATIVE_E2E_EXPORT_HOLD_FILE");
 	if let Some(ms) = opts.read_delay_ms {
 		cmd.env("SNIP_NATIVE_E2E_READ_DELAY_MS", ms.to_string());
 	}
@@ -333,6 +360,7 @@ fn spawn_app(opts: SpawnOpts) -> App {
 		starttime,
 		tracked: Vec::new(),
 		readers: vec![stdout_reader, stderr_reader],
+		_config: own_config,
 	}
 }
 
@@ -2368,7 +2396,9 @@ fn commit_preview_cancel_and_close_leave_the_destination_untouched() {
 	assert_eq!(repo_state(&fx.git_bin, &dest_repo), before);
 	assert_eq!(clip_get(), payload, "clipboard changed across close");
 
-	// Reopened in the same process: the dropped preview does not come back.
+	// Reopened in the same process, in a new tab: the dropped preview does
+	// not come back, and `--restore-dir` stays with the launch's tab, so
+	// this one pastes into its own repo.
 	fs::remove_file(&fx.hold).unwrap();
 	new_tab(&wid);
 	open_workspace(&wid, &fx.ws);
@@ -2386,6 +2416,21 @@ fn commit_preview_cancel_and_close_leave_the_destination_untouched() {
 		"the old preview appeared in the reopened workspace: {opened:?} {settle:?}"
 	);
 	absent("btn-apply");
+	clip_set("// FILE: restore-dir-probe.txt\nprobe\n");
+	click(&wid, "btn-paste");
+	let preview =
+		lines_until(&app.rx, "[APP:PASTE_PREVIEW:", Duration::from_secs(8));
+	let line = preview.last().unwrap();
+	let own = [fx.repo.clone(), fs::canonicalize(&fx.repo).unwrap()];
+	assert!(
+		own.iter()
+			.any(|r| line.contains(&format!("dest={} ", r.display()))),
+		"the reopened tab pastes into its own repo, not --restore-dir: {line}"
+	);
+	click(&wid, "btn-cancel");
+	lines_until(&app.rx, "[APP:PASTE_CANCELLED]", Duration::from_secs(4));
+	wait_git_idle(app.pid, &app.starttime);
+	assert!(!fx.repo.join("restore-dir-probe.txt").exists());
 	assert_eq!(repo_state(&fx.git_bin, &dest_repo), before);
 	assert!(same_proc(app.pid, &app.starttime));
 	quit_cleanly(&mut app, &wid);
@@ -3164,9 +3209,11 @@ fn x_server_loss_exits_instead_of_spinning() {
 		.expect("Xvfb display number");
 	let display = format!(":{}", display.trim());
 	let root = tempfile::tempdir().unwrap();
+	let config = tempfile::tempdir().unwrap();
 	let mut child = Command::new(native_bin())
 		.args(["--workspace", &root.path().to_string_lossy()])
 		.args(["--restore-dir", &root.path().to_string_lossy()])
+		.env("SNIP_CONFIG_DIR", config.path())
 		.env("DISPLAY", &display)
 		.env("XMODIFIERS", "@im=none")
 		.env("SNIP_NATIVE_E2E", "1")
@@ -3218,4 +3265,131 @@ fn x_server_loss_exits_instead_of_spinning() {
 		status.success(),
 		"app exited uncleanly after X loss: {status}"
 	);
+}
+
+fn saved_tabs(config: &Path) -> serde_json::Value {
+	let bytes =
+		fs::read(config.join("open-tabs.json")).expect("open-tabs.json");
+	serde_json::from_slice(&bytes).expect("open-tabs.json is JSON")
+}
+
+fn local_tabs(paths: &[&Path], active: Option<usize>) -> serde_json::Value {
+	serde_json::json!({
+		"tabs": paths
+			.iter()
+			.map(|p| serde_json::json!({"kind": "local", "path": p}))
+			.collect::<Vec<_>>(),
+		"active": active,
+	})
+}
+
+/// The tabs open at a real quit come back on the next launch, in order and
+/// with the one that was shown. A folder opened through a symlink comes
+/// back as the folder; one deleted meanwhile is skipped and counted; and
+/// `--workspace` naming a restored folder switches to it instead of
+/// opening it twice.
+#[test]
+fn tabs_open_at_quit_come_back_on_the_next_launch() {
+	let _lock = DisplayLock::acquire();
+	if !require_display_tools() {
+		return;
+	}
+	let git_bin = real_git();
+	let root = tempfile::tempdir().unwrap();
+	let base = fs::canonicalize(root.path()).unwrap();
+	let (ws_a, ws_b, ws_c) =
+		(base.join("ws-a"), base.join("ws-b"), base.join("ws-c"));
+	for (ws, name) in [(&ws_a, "repo-a"), (&ws_b, "repo-b"), (&ws_c, "repo-c")]
+	{
+		init_repo(&git_bin, &ws.join(name));
+	}
+	let link_b = base.join("link-to-b");
+	std::os::unix::fs::symlink(&ws_b, &link_b).unwrap();
+	let dest = base.join("dest");
+	fs::create_dir_all(&dest).unwrap();
+	let config = base.join("config");
+	let opts = |workspace| SpawnOpts {
+		workspace,
+		restore: &dest,
+		read_delay_ms: None,
+		apply_delay_ms: None,
+		hold_file: None,
+		path_prefix: None,
+		tree_hold: None,
+		export_hold: None,
+	};
+	let relaunch = |with_workspace| {
+		Some(Relaunch {
+			config: &config,
+			with_workspace,
+		})
+	};
+	// Every tab, restored or opened, selects its one repo once loaded.
+	let opened = |repo: &str| format!("({repo}) root=");
+
+	// First launch: A from the argument, B typed through its symlink, C.
+	let mut app = spawn_in(opts(&ws_a), relaunch(true));
+	let wid = find_wid(app.pid);
+	lines_until(&app.rx, &opened("repo-a"), Duration::from_secs(12));
+	new_tab(&wid);
+	open_workspace(&wid, &link_b);
+	lines_until(&app.rx, &opened("repo-b"), Duration::from_secs(12));
+	new_tab(&wid);
+	open_workspace(&wid, &ws_c);
+	lines_until(&app.rx, &opened("repo-c"), Duration::from_secs(12));
+	click(&wid, "ws-tab:1");
+	lines_until(
+		&app.rx,
+		"[APP:WS_TAB_ACTIVE: id=2 ix=1]",
+		Duration::from_secs(4),
+	);
+	quit_cleanly(&mut app, &wid);
+	assert_eq!(
+		saved_tabs(&config),
+		local_tabs(&[&ws_a, &ws_b, &ws_c], Some(1))
+	);
+
+	// Second launch, no argument: C is gone, A and B come back, B shown.
+	fs::remove_dir_all(&ws_c).unwrap();
+	let mut app = spawn_in(opts(&ws_a), relaunch(false));
+	let wid = find_wid(app.pid);
+	let lines = lines_until_all(
+		&app.rx,
+		&[
+			"[APP:WS_TABS_RESTORED: count=2 skipped=1]",
+			"[APP:WS_TAB_ACTIVE: id=2 ix=1]",
+			"[APP:TOAST: ok=false]",
+			&opened("repo-b"),
+		],
+		Duration::from_secs(12),
+	);
+	assert!(
+		!lines.iter().any(|l| l.contains("WS_TAB_OPENED: id=3")),
+		"a skipped folder got a tab: {lines:?}"
+	);
+	let _ = control("ws-tab:1");
+	quit_cleanly(&mut app, &wid);
+	assert_eq!(saved_tabs(&config), local_tabs(&[&ws_a, &ws_b], Some(1)));
+
+	// Third launch with --workspace A: restored, switched to, not doubled.
+	let mut app = spawn_in(opts(&ws_a), relaunch(true));
+	let wid = find_wid(app.pid);
+	let lines = lines_until_all(
+		&app.rx,
+		&[
+			"[APP:WS_TABS_RESTORED: count=2 skipped=0]",
+			"[APP:WS_TAB_ACTIVE: id=1 ix=0]",
+		],
+		Duration::from_secs(12),
+	);
+	let settle = lines_for(&app.rx, Duration::from_millis(800));
+	assert!(
+		!lines
+			.iter()
+			.chain(&settle)
+			.any(|l| l.contains("WS_TAB_OPENED: id=3")),
+		"--workspace opened a restored folder again: {lines:?} {settle:?}"
+	);
+	quit_cleanly(&mut app, &wid);
+	assert_eq!(saved_tabs(&config), local_tabs(&[&ws_a, &ws_b], Some(0)));
 }
