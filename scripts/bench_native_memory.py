@@ -508,8 +508,11 @@ os.execv(bin_path, [bin_path] + app_args)
 def write_preexec_launcher(path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write(PREEXEC_LAUNCHER)
-PROFILES = ("idle", "1repo", "1repo-diff", "15overview", "15active", "soak")
-DEFAULT_PROFILES = tuple(profile for profile in PROFILES if profile != "1repo-diff")
+PROFILES = ("idle", "1repo", "1repo-diff", "15overview", "15active", "soak", "3tabs")
+# Opt-in: 1repo-diff is a matched comparison, 3tabs is measured without a budget yet.
+DEFAULT_PROFILES = tuple(profile for profile in PROFILES if profile not in ("1repo-diff", "3tabs"))
+# Workspace tabs the 3tabs profile has open, one repository each.
+THREE_TABS = 3
 # Built into WorkbenchModel::new of the D3 workbench (mov immediate 0x32). Not a CLI flag.
 APPLICATION_HISTORY_PAGE_LENGTH = 50
 DELETED_FILE_MARKER = b"// This file has been deleted in this change"
@@ -1647,7 +1650,8 @@ def select_native_matched(s: NativeSession, win: dict[str, Any], oracle: dict[st
 
 
 def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: float, interval: float,
-          soak_switches: int, result: dict[str, Any], build_profile: str = "unknown") -> None:
+          soak_switches: int, result: dict[str, Any], build_profile: str = "unknown",
+          extra_tabs: list[str] | None = None) -> None:
     ready_file = os.path.join(run_dir, f"ready-{uuid.uuid4().hex}.signal")
     marker = f"[READY:NATIVE:{profile.upper()}:{uuid.uuid4().hex}]"
     harness: subprocess.Popen | None = None
@@ -1702,6 +1706,24 @@ def drive(s: NativeSession, profile: str, workspace: str, run_dir: str, steady: 
             }
             selected_repo = target
             state["selected"] = check_repo_state(s.texts(switched), repo_oracle(selected_repo))
+        elif profile == "3tabs":
+            if not extra_tabs or len(extra_tabs) != THREE_TABS - 1:
+                raise NativeBenchError(f"3tabs needs {THREE_TABS - 1} more repositories")
+            tabs = []
+            for path in extra_tabs:
+                opened = open_workspace_tab(s, win, path)
+                wait_repo_loaded(s, path, opened["start"], timeout=e2e_scaled(120.0))
+                tabs.append({
+                    **{key: opened[key] for key in ("tab", "count", "workspaceLine", "readyLine")},
+                    "state": check_repo_state(s.texts(opened["start"]), repo_oracle(path)),
+                })
+            if [t["count"] for t in tabs] != list(range(2, THREE_TABS + 1)):
+                raise NativeBenchError(f"tab counts {[t['count'] for t in tabs]}, expected 2..{THREE_TABS}")
+            # Back to the first tab: the copy below is the one 1repo makes, from the same repo.
+            before = len(s.lines)
+            click_control(s, win, "ws-tab:0")
+            s.wait_line(lambda line: "[APP:WS_TAB_ACTIVE: id=1 ix=0]" in line, start=before, timeout=e2e_scaled(10.0))
+            state["tabs"] = tabs
         elif profile == "soak":
             latencies, state["soak"] = run_soak(s, win, repos, soak_switches)
             selected_repo = next(r for r in repos if os.path.basename(r) == state["soak"]["lastRepo"])
@@ -2118,14 +2140,28 @@ def open_project_list(s: NativeSession, win: dict[str, Any]) -> None:
         time.sleep(0.05)
 
 
+TAB_ACTIVE_RE = re.compile(r"\[APP:WS_TAB_ACTIVE: id=(\d+) ")
+TAB_TAG_RE = re.compile(r" ws_tab=(\d+)\]$")
+
+
 def open_repo_name(lines: list[str]) -> str | None:
-    """Basename of the repo the app last selected, or None after a workspace change."""
-    for line in reversed(lines):
+    """Basename of the repo the shown workspace tab last selected, or None after its
+    workspace changed. A background tab tags its lines with ` ws_tab=<id>`; the shown
+    tab's are untagged, so each line belongs to the tab `WS_TAB_ACTIVE` last named."""
+    shown: int | None = None
+    selected: dict[int | None, str | None] = {}
+    for line in lines:
+        active = TAB_ACTIVE_RE.search(line)
+        if active:
+            shown = int(active[1])
+            continue
+        tag = TAB_TAG_RE.search(line)
+        tab = int(tag[1]) if tag else shown
         if "[APP:WORKSPACE: state=" in line:
-            return None
-        if "[APP:REPO_SELECTING:" in line:
-            return parse_repo_select(line)[1]
-    return None
+            selected[tab] = None
+        elif "[APP:REPO_SELECTING:" in line:
+            selected[tab] = parse_repo_select(line)[1]
+    return selected.get(shown)
 
 
 def narrow_log(s: NativeSession, win: dict[str, Any], name: str, timeout: float = 30.0) -> float | None:
@@ -2151,6 +2187,67 @@ def narrow_log(s: NativeSession, win: dict[str, Any], name: str, timeout: float 
     _, t_page, _ = s.wait_line(lambda l: "[APP:E2E_LOG: mode=graph " in l, start=i, timeout=timeout)
     return t_page
 
+
+
+def shown_tab_line(line: str) -> bool:
+    """A line of the shown workspace tab or of the root: a background tab tags its own."""
+    return " ws_tab=" not in line
+
+
+def click_control(s: NativeSession, win: dict[str, Any], control_id: str, timeout: float = 6.0) -> None:
+    """Click `control_id` once the app reports its bounds; the deadline is e2e_scaled."""
+    end = time.monotonic() + e2e_scaled(timeout)
+    while time.monotonic() < end:
+        bounds = parse_bounds(s.texts()).get(control_id)
+        if bounds is not None:
+            s.click(win, bounds)
+            return
+        time.sleep(0.1)
+    raise NativeBenchError(f"control {control_id} not reported within {timeout}s (scaled)")
+
+
+def open_workspace_tab(s: NativeSession, win: dict[str, Any], workspace: str) -> dict[str, Any]:
+    """Open `workspace` in a workspace tab of its own, as a user does: "+", then type the path.
+
+    "+" opens an empty tab with the workspace menu already open. Returns the tab id, the tab
+    count, the log index the open started at, and the lines that show it."""
+    start = len(s.lines)
+    click_control(s, win, "ws-tab-new")
+    _, _, opened = s.wait_line(lambda line: "[APP:WS_TAB_OPENED: id=" in line, start=start, timeout=e2e_scaled(10.0))
+    match = re.search(r"id=(\d+) count=(\d+)", opened)
+    if match is None:
+        raise NativeBenchError(f"unparsable tab line {opened!r}")
+    click_control(s, win, "btn-open-workspace")
+    click_control(s, win, "workspace-path-input")
+    s.focus(win["wid"])
+    s.x("xdotool", "type", "--delay", "15", "--window", win["wid"], workspace)
+    click_control(s, win, "btn-workspace-open-confirm")
+    real = os.path.realpath(workspace)
+    _, _, workspace_line = s.wait_line(
+        lambda line: "[APP:WORKSPACE: state=open " in line and (f"path={real} " in line or f"path={workspace} " in line),
+        start=start, timeout=e2e_scaled(30.0),
+    )
+    _, _, ready = s.wait_line(
+        lambda line: "[APP:READY_REPOS:" in line and shown_tab_line(line), start=start, timeout=e2e_scaled(60.0),
+    )
+    return {
+        "tab": int(match[1]), "count": int(match[2]), "start": start,
+        "openedLine": opened, "workspaceLine": workspace_line, "readyLine": ready,
+    }
+
+
+def close_shown_tab(s: NativeSession, win: dict[str, Any], tab: int) -> dict[str, Any]:
+    """Cmd/Ctrl+W on the shown tab `tab`; returns the close line, the count after it, and
+    whether its own close drain reported nothing left."""
+    start = len(s.lines)
+    s.key(win["wid"], "ctrl+w")
+    _, _, closed = s.wait_line(lambda line: f"[APP:WS_TAB_CLOSED: id={tab} count=" in line, start=start, timeout=e2e_scaled(30.0))
+    count = int(re.search(r"count=(\d+)", closed)[1])
+    drained = any(
+        "phase=drained intent=close-workspace" in line and all(f in line for f in ("jobs=0", "inflight=0", "queued=0", "leaked=0"))
+        for line in s.texts(start)
+    )
+    return {"closedLine": closed, "count": count, "drained": drained}
 
 def click_repo(s: NativeSession, win: dict[str, Any], repo_path: str) -> tuple[float, float, float, int]:
     """Click one repo row. Returns click time, load times, and the log index of the click."""
@@ -2214,7 +2311,17 @@ PROFILE_SETUP = {
     "15overview": ("dataset", "overview", True),
     "15active": ("dataset", "normal", True),
     "soak": ("dataset", "normal", True),
+    # The first tab is the repo; the other two open dataset repos by "+" and a typed path.
+    "3tabs": ("repo", "normal", True),
 }
+
+
+def three_tab_repos(dataset: str, repo: str) -> list[str]:
+    """The repositories 3tabs opens after `repo`: the dataset's first ones that are not it."""
+    others = [path for path in workspace_repos(dataset) if os.path.realpath(path) != os.path.realpath(repo)]
+    if len(others) < THREE_TABS - 1:
+        raise NativeBenchError(f"3tabs needs {THREE_TABS - 1} dataset repositories besides {repo}")
+    return others[:THREE_TABS - 1]
 
 
 def run_profile(profile: str, bin_path: str, dataset: str, repo: str, run_dir: str, steady: float, interval: float,
@@ -2228,9 +2335,13 @@ def run_profile(profile: str, bin_path: str, dataset: str, repo: str, run_dir: s
         os.makedirs(empty)
     workspace = empty or (repo if kind == "repo" else dataset)
     result: dict[str, Any] = {"profile": profile, "runDir": run_dir, "workspace": workspace, "mode": mode}
+    extra_tabs: list[str] | None = None
     error = None
     s: NativeSession | None = None
     try:
+        if profile == "3tabs":
+            extra_tabs = three_tab_repos(dataset, repo)
+            result["extraTabs"] = extra_tabs
         if profile == "1repo-diff":
             if steady < 30:
                 raise NativeBenchError("1repo-diff requires at least 30 steady seconds")
@@ -2239,7 +2350,8 @@ def run_profile(profile: str, bin_path: str, dataset: str, repo: str, run_dir: s
         s = NativeSession(bin_path, workspace, mode, run_dir, e2e)
         result["command"] = s.cmd
         result["isolation"] = s.isolation
-        drive(s, profile, workspace, run_dir, steady, interval, soak_switches, result, build_profile=build_profile)
+        drive(s, profile, workspace, run_dir, steady, interval, soak_switches, result, build_profile=build_profile,
+              extra_tabs=extra_tabs)
         if profile == "1repo-diff":
             result["identityAfter"] = matched_identity(bin_path, repo)
             if result["identityAfter"] != result["identityBefore"]:
@@ -2297,6 +2409,7 @@ def markdown(report: dict[str, Any]) -> str:
         f"- **Artifact status**: {meta['binary']['label']} (build profile `{meta['binary'].get('buildProfile')}`). A profile label or a receipt does not pass the release D4 gate.",
         "- **Release comparison**: this driver does not emit one. `--compare-baseline` exits UNSUPPORTED. The supervisor compares matched run artifacts.",
         "- **Cache**: process-cold (fresh process, private XDG and D-Bus). Filesystem cache is uncontrolled. Filesystem-cold is UNSUPPORTED. This driver does not drop caches.",
+        "- **3tabs Semantics**: three workspace tabs in one window, one repository each: the launch repo, then two more dataset repos opened by \"+\" and a typed path, each loaded before the next; then the first tab is shown again and copied from, as 1repo does. Measured only: no budget is set from it yet.",
         "- **15overview Semantics**: In current prototype, repository 0 is automatically selected upon launch, loading its graph and preview into memory. 15overview reflects 15 discovered repos + 1 loaded active repo; it does not certify summary-only overview memory until app mode defers graph/preview retention. Auto-preview does not copy anything.",
         "- **1repo-diff**: selected two-commit feature branch on the standard repository; 1080x720 client, fixed tip/file diff, no copy events, unchanged clipboard, no Copy. This optional scenario does not match the default 50/300-row histories or 15 repositories.",
         "- **Explicit copy (other repository profiles)**: right-click one source-aware Changes row, then `menu-item:copy-files`. Staged bytes are the index. Unstaged and untracked bytes are the worktree. `files=` is source rows, not distinct paths. Any copy before the driver's own fails the run.",
