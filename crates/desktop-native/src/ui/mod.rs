@@ -2378,6 +2378,10 @@ mod tests {
 			)),
 			("op_refused", pal.error, "reason_refused_file_in_way")
 		);
+		assert_eq!(
+			paste_style(RowAction::CommitRefused(LayoutConflict::CaseAlias)),
+			("op_refused", pal.error, "reason_refused_case_alias")
+		);
 
 		fn all_skip_causes() -> Vec<SkipCause> {
 			// 每個變體各放一個代表值；新增變體時一併加入 seed，否則下方分支不會執行
@@ -2462,6 +2466,9 @@ mod tests {
 						));
 						out.push(RowAction::CommitRefused(
 							LayoutConflict::FileInTheWayOfParent,
+						));
+						out.push(RowAction::CommitRefused(
+							LayoutConflict::CaseAlias,
 						));
 					}
 				}

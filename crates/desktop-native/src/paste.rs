@@ -878,6 +878,7 @@ pub(crate) fn layout_conflict_key(conflict: LayoutConflict) -> &'static str {
 		LayoutConflict::DeleteTargetIsDirectory => "reason_refused_delete_dir",
 		LayoutConflict::DirectoryInTheWay => "reason_refused_dir_in_way",
 		LayoutConflict::FileInTheWayOfParent => "reason_refused_file_in_way",
+		LayoutConflict::CaseAlias => "reason_refused_case_alias",
 	}
 }
 
@@ -895,6 +896,7 @@ pub(crate) fn layout_conflict_cause_key(
 		LayoutConflict::FileInTheWayOfParent => {
 			"reason_refusal_cause_file_in_way"
 		}
+		LayoutConflict::CaseAlias => "reason_refusal_cause_case_alias",
 	}
 }
 
