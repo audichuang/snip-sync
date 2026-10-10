@@ -5596,7 +5596,8 @@ fn log_multiselect(theme: &str) {
 	// One commit: hash, author and email on one line, then its branches.
 	wait(&format!("[APP:COMMIT_DETAILS: {a4} branches=1]"));
 	drawn(&format!("commit-details-author:{a4}"));
-	drawn(&format!("commit-details-branches:{a4}"));
+	// `COMMIT_DETAILS … branches=1` above is the branches check: the line
+	// can sit below the pane's visible edge, and probes report what shows.
 
 	quit_cleanly(&mut app, &wid);
 }

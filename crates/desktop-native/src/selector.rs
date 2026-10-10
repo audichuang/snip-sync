@@ -196,7 +196,12 @@ fn candidates<'a>(
 	]
 	.into_iter()
 	.flat_map(move |(group, prefix)| {
-		refs.iter().filter_map(move |r| {
+		// A multi-repo workspace lists each repo's refs; picking filters by
+		// name across them, so one row per name (and one probe id).
+		refs.iter().enumerate().filter_map(move |(ix, r)| {
+			if refs[..ix].iter().any(|seen| seen.name == r.name) {
+				return None;
+			}
 			let label = r.name.strip_prefix(prefix)?;
 			Some(SelectorCandidate::Ref {
 				name: Some(&r.name),
@@ -397,6 +402,38 @@ mod tests {
 		assert_eq!(late[4].1.id, "pick-ref:refs/heads/Feature/計畫");
 		assert_eq!(items_for_range(rows(), 8_000..8_010).count(), 0);
 		MATERIALIZED_ITEMS.with(|count| assert_eq!(count.get(), 5));
+	}
+
+	/// Several repos each with `main` give one row and one probe id.
+	#[test]
+	fn a_ref_shared_by_repos_is_listed_once() {
+		let refs = [
+			reference("refs/heads/main"),
+			reference("refs/heads/main"),
+			reference("refs/heads/side"),
+		];
+		let ids: Vec<_> = items_for_range(
+			candidates(
+				Some(Popover::Ref),
+				&[],
+				None,
+				&refs,
+				false,
+				Locale::En,
+				"",
+			),
+			0..10,
+		)
+		.map(|(_, item)| item.id)
+		.collect();
+		assert_eq!(
+			ids,
+			vec![
+				"pick-ref:all",
+				"pick-ref:refs/heads/main",
+				"pick-ref:refs/heads/side"
+			]
+		);
 	}
 
 	#[test]
