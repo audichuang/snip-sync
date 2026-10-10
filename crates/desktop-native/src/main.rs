@@ -15760,6 +15760,62 @@ mod tests {
 					}
 				);
 			}
+			/// A retry that falls while the tab drains for a quit that is
+			/// then stopped is put off, not dropped: the tab keeps trying.
+			#[gpui::test]
+			fn a_retry_during_a_stopped_quit_still_comes(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::{OpenTabs, SavedTab};
+				let (_tmp, a, _b) = two_workspaces();
+				let (root, cx) = launch_tabs(
+					cx,
+					Launch {
+						restore: Some(OpenTabs {
+							tabs: vec![
+								local_tab(&a),
+								SavedTab::Remote {
+									host: "snip-test-gone-host".into(),
+									path: "/srv/x".into(),
+								},
+							],
+							active: Some(0),
+						}),
+						first: FirstTab::Empty,
+						restore_dir: None,
+						store: None,
+					},
+				);
+				let tb = tab(&root, cx, 1);
+				let attempts = |cx: &mut VisualTestContext| {
+					tb.read_with(cx, |m, _| {
+						m.remote.restoring.as_ref().map(|r| r.attempts)
+					})
+				};
+				assert_eq!(attempts(cx), Some(1));
+				let held = hold_job(&tb, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				assert!(tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+				// The first retry is due while the tab drains.
+				cx.executor().advance_clock(crate::remote::retry_delay(1));
+				settle(cx);
+				assert_eq!(attempts(cx), Some(1), "no try during the drain");
+				tb.update(cx, |_, cx| cx.emit(TabEvent::DrainFailed));
+				settle(cx);
+				held.set(true);
+				wait(cx, "the drain ends", |cx| {
+					!tb.read_with(cx, |m, _| m.lifecycle.is_draining())
+				});
+				assert!(!root.read_with(cx, |r, _| r.quit_sent));
+				cx.executor().advance_clock(crate::remote::retry_delay(1));
+				settle(cx);
+				assert_eq!(
+					attempts(cx),
+					Some(2),
+					"the retry came after the stop"
+				);
+			}
 		}
 	}
 

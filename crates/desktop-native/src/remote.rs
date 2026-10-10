@@ -874,7 +874,8 @@ impl WorkbenchModel {
 	}
 
 	/// The reconnect failed: the tab keeps the folder and shows why, and
-	/// tries again after [`retry_delay`] unless it opened or closed meanwhile.
+	/// tries again after [`retry_delay`] unless it opened or closed
+	/// meanwhile; a try that falls in a drain waits for the next one.
 	fn restore_failed(&mut self, why: String, cx: &mut Context<Self>) {
 		let Some(r) = self.remote.restoring.as_mut() else {
 			return;
@@ -893,11 +894,13 @@ impl WorkbenchModel {
 							&& r.attempts == attempts
 							&& r.open_seq.is_none()
 					});
-					if !due || this.lifecycle.is_draining() {
+					if !due {
 						return;
 					}
-					if this.remote.busy {
-						// Another open of this tab is in flight: try after it.
+					if this.lifecycle.is_draining() || this.remote.busy {
+						// A drain (a quit that may still be stopped) or
+						// another open of this tab is under way: try after
+						// it. A tab that closes drops this timer with it.
 						return this.restore_failed(
 							this.remote
 								.restoring
