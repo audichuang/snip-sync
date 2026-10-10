@@ -7,11 +7,9 @@ set -euo pipefail
 ERRORS=0
 
 while IFS=: read -r file line_num line_content; do
-	# Skip known product code calls (sync_appearance and log_view deferred refresh)
-	if [[ "$file" == *"src/ui/log_view.rs" ]] && [[ "$line_content" == *"update(cx, |_, w, _| w.refresh())"* ]]; then
-		continue
-	fi
-	if [[ "$file" == *"src/main.rs" ]] && [[ "$line_num" -le 5800 ]] && [[ "$line_content" == *"window.refresh();"* ]]; then
+	# Only the `mod tests` block counts as test code; product code may refresh.
+	tests_start=$(grep -n '^mod tests {' "$file" | head -1 | cut -d: -f1 || true)
+	if [[ -z "$tests_start" ]] || [[ "$line_num" -le "$tests_start" ]]; then
 		continue
 	fi
 
