@@ -13,6 +13,7 @@ dunce = "1"
 arboard = "3"
 thiserror = "2"
 tempfile = "3"
+similar = "2.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

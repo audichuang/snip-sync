@@ -159,11 +159,20 @@ fn copied_status(
 	repo_name: String,
 	out: &snip_core::transfer::CopyOutcome,
 ) -> Msg {
+	let (words, tokens) =
+		if out.words > 0 || out.tokens > 0 || out.payload.is_empty() {
+			(out.words, out.tokens)
+		} else {
+			let s = snip_core::stats::payload_stats(&out.payload);
+			(s.words, s.tokens)
+		};
 	let mut args = vec![
 		repo_name,
 		out.copied.to_string(),
 		out.chars.to_string(),
 		out.lines.to_string(),
+		words.to_string(),
+		tokens.to_string(),
 		out.skipped.to_string(),
 	];
 	if !out.truncated {
@@ -610,6 +619,15 @@ pub enum Popover {
 	Ref,
 }
 
+#[derive(Debug)]
+enum PasteDiffOutcome {
+	Same,
+	Diff(String, bool),
+	Binary,
+	TooLarge,
+	Unreadable,
+}
+
 pub struct WorkbenchModel {
 	pub workspace_root: PathBuf,
 	pub restore_dir: Option<PathBuf>,
@@ -678,6 +696,7 @@ pub struct WorkbenchModel {
 	pub log_details_w: f32,
 	/// The log panel's width at the last layout.
 	pub log_width: std::rc::Rc<std::cell::Cell<f32>>,
+	pub log_filter_layout: ui::LogFilterLayout,
 	/// Collapsed directories of the changed-files tree.
 	pub changed_dirs_collapsed: Vec<String>,
 	/// The changed-files pane groups by directory (else a flat list).
@@ -757,6 +776,8 @@ pub struct WorkbenchModel {
 	pub repo_cancel: Option<CancelToken>,
 	pub scan_cancel: Option<CancelToken>,
 	pub copy_cancel: Option<CancelToken>,
+	pub paste_diff_cancel: Option<CancelToken>,
+	pub paste_diff_generation: u64,
 	pub discovery: Option<Discovery>,
 	pub discovery_status: Option<ScanStatus>,
 	pub discovery_errors: Vec<(PathBuf, String)>,
@@ -782,6 +803,8 @@ pub struct WorkbenchModel {
 	pub add_repo_input: Entity<TextInput>,
 	pub paste: paste::preview::PastePreview,
 	pub status: Msg,
+	pub user_action_seq: u64,
+	pub status_error_action: Option<u64>,
 	/// A finished copy's card over the window (id, succeeded, text): the
 	/// status bar alone is easy to miss.
 	pub toast: Option<(u64, bool, Msg)>,
@@ -887,6 +910,68 @@ pub enum Splitter {
 	LogDetails,
 	/// Between the log's changed files and the commit details.
 	LogFiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StatusPriority {
+	Background = 0,
+	Normal = 1,
+	Error = 2,
+}
+
+pub fn is_error_status(key: &str) -> bool {
+	key.starts_with("error_")
+		|| key.starts_with("paste_err_")
+		|| key.ends_with("_failed")
+		|| key.ends_with("_refused")
+		|| key.ends_with("_rejected")
+		|| key.ends_with("_error")
+		|| key.starts_with("reason_refused_")
+		|| matches!(
+			key,
+			"tree_name_not_utf8"
+				| "tree_read_error"
+				| "status_goto_invalid"
+				| "status_copy_empty"
+				| "status_copy_nothing"
+				| "status_copy_nothing_skipped"
+				| "workspace_bad_path"
+				| "remote_unsupported"
+				| "workspace_not_open"
+				| "preview_memory_limit"
+				| "commit_subset_rejected"
+				| "commit_overwrite_required"
+				| "mapping_required"
+				| "status_fold_stale"
+				| "status_fold_too_large"
+				| "commit_replay_partial_refused"
+				| "workspace_drain_leaked"
+				| "workspace_drain_timeout"
+		)
+}
+
+pub fn is_background_status(key: &str) -> bool {
+	matches!(
+		key,
+		"status_scanning"
+			| "status_repos_loaded"
+			| "status_repo_loading"
+			| "status_repo_loaded"
+			| "status_history_loaded"
+			| "status_log_merged_cap"
+			| "status_graph_fallback"
+			| "status_loading"
+	)
+}
+
+pub fn status_priority(key: &str) -> StatusPriority {
+	if is_error_status(key) {
+		StatusPriority::Error
+	} else if is_background_status(key) {
+		StatusPriority::Background
+	} else {
+		StatusPriority::Normal
+	}
 }
 
 impl WorkbenchModel {
@@ -1119,6 +1204,7 @@ impl WorkbenchModel {
 			log_show_hash: false,
 			log_details_w: theme::LOG_DETAILS_W_DEFAULT,
 			log_width: Default::default(),
+			log_filter_layout: Default::default(),
 			changed_dirs_collapsed: Vec::new(),
 			log_details_by_dir: true,
 			commit_rows_cache: Default::default(),
@@ -1187,11 +1273,15 @@ impl WorkbenchModel {
 			add_cancel: None,
 			is_adding_repo: false,
 			paste: paste::preview::PastePreview::new(ui::e2e_apply_delay()),
+			paste_diff_cancel: None,
+			paste_diff_generation: 0,
 			status: if workspace.is_some() {
 				Msg::new("status_scanning", [])
 			} else {
 				Msg::new("workspace_closed", [])
 			},
+			user_action_seq: 0,
+			status_error_action: None,
 			toast: None,
 			toast_seq: 0,
 			is_loading: workspace.is_some(),
@@ -1659,12 +1749,33 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	pub fn user_action(&mut self) {
+		self.user_action_seq = self.user_action_seq.wrapping_add(1);
+	}
+
+	pub fn set_status_msg(&mut self, msg: Msg) {
+		let incoming_prio = status_priority(msg.key);
+		if incoming_prio == StatusPriority::Background {
+			if let Some(err_seq) = self.status_error_action {
+				if err_seq == self.user_action_seq {
+					return;
+				}
+			}
+		}
+		if incoming_prio == StatusPriority::Error {
+			self.status_error_action = Some(self.user_action_seq);
+		} else {
+			self.status_error_action = None;
+		}
+		self.status = msg;
+	}
+
 	pub fn set_status(
 		&mut self,
 		key: &'static str,
 		args: impl crate::i18n::IntoMsgArgs,
 	) {
-		self.status = Msg::new(key, args);
+		self.set_status_msg(Msg::new(key, args));
 	}
 
 	/// Shows `msg` in a card over the window for a few seconds, longer for a
@@ -1724,7 +1835,7 @@ impl WorkbenchModel {
 			self.preview_loading = false;
 			self.preview_error = None;
 			self.preview_error_root = None;
-			self.status = err;
+			self.set_status_msg(err);
 			app_log!("[APP:PREVIEW_REFUSED: reason=retained_budget]");
 			return false;
 		}
@@ -2455,6 +2566,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn reload_repos(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if !self.accepting_work() {
 			return;
 		}
@@ -3752,6 +3864,7 @@ impl WorkbenchModel {
 		source: SourceKind,
 		cx: &mut Context<Self>,
 	) {
+		self.user_action();
 		if !self.accepting_work() {
 			return;
 		}
@@ -4143,10 +4256,10 @@ impl WorkbenchModel {
 					self.set_status("status_clipboard_failed", [e.to_string()]);
 				} else {
 					app_log!("[APP:COPY_DONE: copied={copied_count}]");
-					self.status = msg;
+					self.set_status_msg(msg);
 				}
 			}
-			Err(err) => self.status = err,
+			Err(err) => self.set_status_msg(err),
 		}
 		let ok =
 			matches!(self.status.key, "status_copied" | "status_copied_limit");
@@ -4410,7 +4523,7 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		if let Err(err) = self.paste.enqueue(request) {
-			self.status = err;
+			self.set_status_msg(err);
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
 			self.restore_log_after_paste();
 			cx.notify();
@@ -4441,11 +4554,14 @@ impl WorkbenchModel {
 		match landed {
 			Some(paste::preview::Landed::Shown { remap }) => {
 				self.show_landed_plan(remap);
+				let selected_idx =
+					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
+				self.load_paste_diff(selected_idx, cx);
 				cx.notify();
 			}
 			Some(paste::preview::Landed::Refused { err, closed }) => {
 				app_log!("[APP:PASTE_ERR: {}]", err.key);
-				self.status = err;
+				self.set_status_msg(err);
 				if closed {
 					self.restore_log_after_paste();
 					self.pending_focus = Some(self.focus_handle.clone());
@@ -4453,10 +4569,10 @@ impl WorkbenchModel {
 				cx.notify();
 			}
 			Some(paste::preview::Landed::WorkerLost) => {
-				self.status = Msg::new(
+				self.set_status_msg(Msg::new(
 					"paste_err_plan",
 					["Preview worker ended before producing a result".into()],
-				);
+				));
 				cx.notify();
 			}
 			None => {}
@@ -4532,11 +4648,12 @@ impl WorkbenchModel {
 	/// Keep full write/read diagnostics in status, but do not let a newly
 	/// allocated diagnostic grow an already admitted plan past its tier.
 	fn set_paste_error(&mut self, err: Msg) {
-		self.status = err.clone();
+		self.set_status_msg(err.clone());
 		self.paste.record_error(err, self.preview.as_ref());
 	}
 
 	pub fn trigger_paste_preview(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if self.refuse_while_applying("preview", cx) {
 			return;
 		}
@@ -4570,7 +4687,7 @@ impl WorkbenchModel {
 			}
 		};
 		if text.len() > paste::MAX_RETAINED_PREVIEW_BYTES {
-			self.status = paste::preview_budget_error();
+			self.set_status_msg(paste::preview_budget_error());
 			self.restore_log_after_paste();
 			self.pending_focus = Some(self.focus_handle.clone());
 			app_log!("[APP:PASTE_ERR: preview_memory_limit]");
@@ -4640,11 +4757,11 @@ impl WorkbenchModel {
 		match self.paste.remap(prefix, destination, self.preview.as_ref()) {
 			paste::preview::Remapped::NoPlan => {}
 			paste::preview::Remapped::Invalid(err) => {
-				self.status = err;
+				self.set_status_msg(err);
 				cx.notify();
 			}
 			paste::preview::Remapped::Dropped(err) => {
-				self.status = err;
+				self.set_status_msg(err);
 				self.restore_log_after_paste();
 				cx.notify();
 			}
@@ -4706,7 +4823,7 @@ impl WorkbenchModel {
 				cx.notify();
 			}
 			paste::preview::Nav::Refused(err) => {
-				self.status = err;
+				self.set_status_msg(err);
 				app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
 				cx.notify();
 			}
@@ -4715,7 +4832,11 @@ impl WorkbenchModel {
 
 	pub fn select_paste_item(&mut self, idx: usize, cx: &mut Context<Self>) {
 		let nav = self.paste.select(idx, self.preview.as_ref());
+		let moved = matches!(nav, paste::preview::Nav::Moved(_));
 		self.report_paste_nav(nav, cx);
+		if moved {
+			self.load_paste_diff(idx, cx);
+		}
 	}
 
 	pub fn step_paste_selection(
@@ -4724,7 +4845,14 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		let nav = self.paste.step(forward, self.preview.as_ref());
+		let moved = match nav {
+			paste::preview::Nav::Moved(idx) => Some(idx),
+			_ => None,
+		};
 		self.report_paste_nav(nav, cx);
+		if let Some(idx) = moved {
+			self.load_paste_diff(idx, cx);
+		}
 	}
 
 	pub fn toggle_paste_commit(&mut self, c: usize, cx: &mut Context<Self>) {
@@ -4736,13 +4864,274 @@ impl WorkbenchModel {
 			}
 			paste::preview::Folded::Reselected(nav) => {
 				app_log!("[APP:PASTE_COMMIT_TOGGLED: idx={}]", c);
+				let moved = match nav {
+					paste::preview::Nav::Moved(idx) => Some(idx),
+					_ => None,
+				};
 				self.report_paste_nav(nav, cx);
+				if let Some(idx) = moved {
+					self.load_paste_diff(idx, cx);
+				}
 				cx.notify();
 			}
 		}
 	}
 
+	pub(crate) fn load_paste_diff(
+		&mut self,
+		idx: usize,
+		cx: &mut Context<Self>,
+	) {
+		if let Some(token) = self.paste_diff_cancel.take() {
+			token.cancel();
+		}
+		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
+
+		let Some(plan) = self.paste.plan() else {
+			return;
+		};
+		let Some(item) = plan.items.get(idx) else {
+			return;
+		};
+		if item.commit.is_some() || !item.overwritable() {
+			return;
+		}
+
+		let cancel = arm_cancel(&mut self.paste_diff_cancel);
+		let task_gen = self.paste_diff_generation;
+		let selected_idx = idx;
+		let item_path = item.path.clone();
+		let item_content = item.content.clone();
+		let dest_root = item.dest_root.clone();
+		let dest_path = item.dest_path.clone();
+		let remote = plan.remote.clone();
+		let kind = if remote.is_some() {
+			lifecycle::JobKind::CancellableRead
+		} else {
+			lifecycle::JobKind::UncancellableRead
+		};
+		let job_cancel = remote.is_some().then(|| cancel.clone());
+		let delay = self.e2e_read_delay;
+
+		let mut async_app = cx.to_async();
+		let this = cx.weak_entity();
+		let bg = cx.background_executor().clone();
+
+		self.spawn_owned(cx, kind, job_cancel, async move {
+			let for_bg_path = item_path.clone();
+			let outcome = bg
+				.spawn(async move {
+					let outcome = if let Some(ref rem) = remote {
+						// The worker plans under its workspace's real path, which
+						// is also the workspace id; never resolve it on this machine.
+						let rel = remote::worker_rel(
+							&rem.session.workspace.id,
+							&dest_path,
+						);
+						let client = rem.session.client.clone();
+						let ws = rem.session.workspace.id.clone();
+						match rel {
+							Some(rel_path) => {
+								match client.read(&ws, &rel_path, Some(&cancel))
+								{
+									Ok(Some(text)) => {
+										if text == *item_content {
+											PasteDiffOutcome::Same
+										} else {
+											let (patch, trunc) = snip_core::textdiff::unified(
+												&for_bg_path,
+												&text,
+												&item_content,
+												snip_core::browser::PREVIEW_LIMIT,
+											);
+											if patch.is_empty() {
+												PasteDiffOutcome::Same
+											} else {
+												PasteDiffOutcome::Diff(
+													patch, trunc,
+												)
+											}
+										}
+									}
+									Ok(None) => PasteDiffOutcome::Binary,
+									Err(err) => {
+										let s = err.to_string();
+										if s.contains("exceeds")
+											|| s.contains("limit")
+										{
+											PasteDiffOutcome::TooLarge
+										} else {
+											PasteDiffOutcome::Unreadable
+										}
+									}
+								}
+							}
+							None => PasteDiffOutcome::Unreadable,
+						}
+					} else {
+						let rel = dest_path
+							.strip_prefix(&dest_root)
+							.map(|r| r.to_string_lossy().into_owned())
+							.unwrap_or_else(|_| for_bg_path.clone());
+						match snip_core::browser::file_preview(&dest_root, &rel)
+						{
+							Ok(p) => match p.content {
+								Some(text) => {
+									if text == *item_content {
+										PasteDiffOutcome::Same
+									} else {
+										let (patch, trunc) = snip_core::textdiff::unified(
+											&for_bg_path,
+											&text,
+											&item_content,
+											snip_core::browser::PREVIEW_LIMIT,
+										);
+										if patch.is_empty() {
+											PasteDiffOutcome::Same
+										} else {
+											PasteDiffOutcome::Diff(patch, trunc)
+										}
+									}
+								}
+								None => PasteDiffOutcome::Binary,
+							},
+							Err(err) => {
+								let s = err.to_string();
+								if s.contains("exceeds") || s.contains("1 MiB")
+								{
+									PasteDiffOutcome::TooLarge
+								} else {
+									PasteDiffOutcome::Unreadable
+								}
+							}
+						}
+					};
+					if let Some(delay) = delay {
+						std::thread::sleep(delay);
+					}
+					outcome
+				})
+				.await;
+
+			let _ = this.update(&mut async_app, |model, cx| {
+				if model.paste_diff_generation != task_gen {
+					return;
+				}
+				let Some(plan) = model.paste.plan() else {
+					return;
+				};
+				if plan.selected_item_idx != selected_idx {
+					return;
+				}
+				let Some(item) = plan.items.get(selected_idx) else {
+					return;
+				};
+				if item.path != item_path {
+					return;
+				}
+
+				let (preview, state) = match outcome {
+					PasteDiffOutcome::Same => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(
+							crate::i18n::t("paste_diff_same", model.locale)
+								.to_string(),
+						);
+						(p, "same")
+					}
+					PasteDiffOutcome::Diff(patch, truncated) => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							patch,
+							true,
+							Language::Diff,
+						);
+						if truncated {
+							p.notice = Some("truncated".to_string());
+						}
+						(p, "diff")
+					}
+					PasteDiffOutcome::Binary => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(
+							crate::i18n::t("paste_diff_binary", model.locale)
+								.to_string(),
+						);
+						(p, "unavailable")
+					}
+					PasteDiffOutcome::TooLarge => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(
+							crate::i18n::t(
+								"paste_diff_too_large",
+								model.locale,
+							)
+							.to_string(),
+						);
+						(p, "unavailable")
+					}
+					PasteDiffOutcome::Unreadable => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(
+							crate::i18n::t(
+								"paste_diff_unreadable",
+								model.locale,
+							)
+							.to_string(),
+						);
+						(p, "unavailable")
+					}
+				};
+
+				match model.paste.replace_detail(
+					selected_idx,
+					preview,
+					model.preview.as_ref(),
+				) {
+					Ok(()) => {
+						app_log!(
+							"[APP:PASTE_DIFF: idx={} state={}]",
+							selected_idx,
+							state
+						);
+						cx.notify();
+					}
+					Err(_) => {
+						app_log!("[APP:PASTE_DETAIL_REFUSED: reason=retained_budget]");
+						cx.notify();
+					}
+				}
+			});
+		});
+	}
+
 	pub fn apply_paste_restore(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		let apply = match self.paste.begin_apply() {
 			Ok(w) => w,
 			Err(paste::preview::ApplyRefused::Loading) => {
@@ -4810,6 +5199,10 @@ impl WorkbenchModel {
 							for error in &result.files.errors {
 								app_log!("[APP:PASTE_FILE_ERROR: {error}]");
 							}
+							if let Some(token) = model.paste_diff_cancel.take() {
+								token.cancel();
+							}
+							model.paste_diff_generation = model.paste_diff_generation.wrapping_add(1);
 							model.paste.clear(model.preview.as_ref());
 							model.restore_log_after_paste();
 							model.pending_focus =
@@ -4895,10 +5288,15 @@ impl WorkbenchModel {
 	}
 
 	pub fn cancel_paste_preview(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if self.refuse_while_applying("cancel", cx) {
 			return;
 		}
 		let was_loading = self.paste.is_loading();
+		if let Some(token) = self.paste_diff_cancel.take() {
+			token.cancel();
+		}
+		self.paste_diff_generation = self.paste_diff_generation.wrapping_add(1);
 		self.paste.invalidate_job();
 		if self.paste.plan().is_none() && !was_loading {
 			return;
@@ -4912,6 +5310,7 @@ impl WorkbenchModel {
 	}
 
 	pub fn copy_current_preview_content(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		if !self.can_copy_preview() {
 			return;
 		}
@@ -5516,6 +5915,8 @@ mod tests {
 				copied,
 				chars: 0,
 				lines: 0,
+				words: 0,
+				tokens: 0,
 				skipped,
 				truncated: false,
 			};
@@ -5526,6 +5927,80 @@ mod tests {
 		assert_eq!(
 			super::remote_copy_nothing_status(&outcome(0, 0)).key,
 			"status_copy_nothing"
+		);
+	}
+
+	/// Copy notification formats files, characters, lines, words, tokens and
+	/// skipped count in both locales, for normal and limit-cut copies.
+	#[test]
+	fn copy_status_notification_contains_words_and_tokens() {
+		use crate::i18n::{tf, Locale};
+		let payload = "file alpha.txt\nhello world\nanother line with words\n";
+		let expected_stats = snip_core::stats::payload_stats(payload);
+		assert!(expected_stats.words > 0);
+		assert!(expected_stats.tokens > 0);
+
+		let outcome = snip_core::transfer::CopyOutcome {
+			payload: payload.to_string(),
+			copied: 1,
+			chars: expected_stats.chars,
+			lines: expected_stats.lines,
+			words: expected_stats.words,
+			tokens: expected_stats.tokens,
+			skipped: 0,
+			truncated: false,
+		};
+
+		let msg = crate::copied_status("test-repo".into(), &outcome);
+		assert_eq!(msg.key, "status_copied");
+
+		// ZhTw
+		let zh = tf(msg.key, Locale::ZhTw, &msg.args);
+		assert!(
+			zh.contains(&format!("{} 字", expected_stats.words)),
+			"ZhTw message '{zh}' must contain word count"
+		);
+		assert!(
+			zh.contains(&format!("{} 個 token", expected_stats.tokens)),
+			"ZhTw message '{zh}' must contain token count"
+		);
+
+		// En
+		let en = tf(msg.key, Locale::En, &msg.args);
+		assert!(
+			en.contains(&format!("{} words", expected_stats.words)),
+			"En message '{en}' must contain word count"
+		);
+		assert!(
+			en.contains(&format!("~{} tokens", expected_stats.tokens)),
+			"En message '{en}' must contain token count"
+		);
+
+		// Limit outcome
+		let mut truncated_outcome = outcome.clone();
+		truncated_outcome.truncated = true;
+		let limit_msg =
+			crate::copied_status("test-repo".into(), &truncated_outcome);
+		assert_eq!(limit_msg.key, "status_copied_limit");
+
+		let zh_lim = tf(limit_msg.key, Locale::ZhTw, &limit_msg.args);
+		assert!(
+			zh_lim.contains(&format!("{} 字", expected_stats.words)),
+			"ZhTw limit message '{zh_lim}' must contain word count"
+		);
+		assert!(
+			zh_lim.contains(&format!("{} 個 token", expected_stats.tokens)),
+			"ZhTw limit message '{zh_lim}' must contain token count"
+		);
+
+		let en_lim = tf(limit_msg.key, Locale::En, &limit_msg.args);
+		assert!(
+			en_lim.contains(&format!("{} words", expected_stats.words)),
+			"En limit message '{en_lim}' must contain word count"
+		);
+		assert!(
+			en_lim.contains(&format!("~{} tokens", expected_stats.tokens)),
+			"En limit message '{en_lim}' must contain token count"
 		);
 	}
 
@@ -5577,6 +6052,51 @@ mod tests {
 			let (model, cx) = cx.add_window_view(|_, cx| {
 				WorkbenchModel::new(Some(ws), restore_dir, "normal".into(), cx)
 			});
+			cx.run_until_parked();
+			cx.update(|window, cx| {
+				window.focus(&model.read(cx).focus_handle.clone())
+			});
+			(model, cx)
+		}
+
+		fn open_sized(
+			cx: &mut TestAppContext,
+			ws: PathBuf,
+			restore_dir: Option<PathBuf>,
+			w: f32,
+			h: f32,
+		) -> (Entity<WorkbenchModel>, &mut VisualTestContext) {
+			use gpui::AppContext;
+			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+			let bounds = gpui::Bounds::new(
+				gpui::Point::default(),
+				gpui::size(gpui::px(w), gpui::px(h)),
+			);
+			let (model, window) = cx.update(|cx| {
+				let window = cx
+					.open_window(
+						gpui::WindowOptions {
+							window_bounds: Some(gpui::WindowBounds::Windowed(
+								bounds,
+							)),
+							..Default::default()
+						},
+						|_, cx| {
+							cx.new(|cx| {
+								WorkbenchModel::new(
+									Some(ws),
+									restore_dir,
+									"normal".into(),
+									cx,
+								)
+							})
+						},
+					)
+					.unwrap();
+				let model = window.root(cx).unwrap();
+				(model, window)
+			});
+			let cx = VisualTestContext::from_window(*window, cx).into_mut();
 			cx.run_until_parked();
 			cx.update(|window, cx| {
 				window.focus(&model.read(cx).focus_handle.clone())
@@ -6327,6 +6847,7 @@ mod tests {
 			});
 			settle(cx);
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw to recalculate workspace-menu bounds after resize
 				cx.update(|window, _| window.refresh());
 				settle(cx);
 			}
@@ -7162,6 +7683,7 @@ mod tests {
 				cx.executor().advance_clock(Duration::from_millis(50));
 			}
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw after empty discovery completion
 				cx.update(|w, _| w.refresh());
 				settle(cx);
 			}
@@ -8525,6 +9047,136 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn remote_paste_preview_shows_diff_for_overwritten_file(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("init.txt"), "hello remote\nline2\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: init.txt\nnew remote\nline2\n",
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let has_diff = model.read_with(cx, |m, _| {
+					m.paste.detail().is_some_and(|d| d.is_diff)
+				});
+				if has_diff {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert!(plan.remote.is_some());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(
+					detail.is_diff,
+					"remote overwritable file must show diff"
+				);
+				assert!(detail.text.contains("-hello remote"));
+				assert!(detail.text.contains("+new remote"));
+			});
+		}
+
+		/// The worker refuses a read over the preview cap; the master names
+		/// that reason instead of "unreadable" and keeps the source view.
+		#[gpui::test]
+		fn remote_paste_preview_over_the_cap_says_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			fs::create_dir_all(&alpha).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("big.txt"), "y".repeat(2 * 1024 * 1024))
+				.unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "big.txt"]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				});
+				if done {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			remote_paste_preview(&model, cx, "// FILE: big.txt\nsmall\n");
+			let want = model.read_with(cx, |m, _| {
+				crate::i18n::t("paste_diff_too_large", m.locale).to_string()
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let noticed = model.read_with(cx, |m, _| {
+					m.paste.detail().and_then(|d| d.notice.clone()).is_some()
+				});
+				if noticed {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			model.read_with(cx, |m, _| {
+				assert!(m.paste.plan().expect("plan open").remote.is_some());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(!detail.is_diff);
+				assert_eq!(detail.notice.as_deref(), Some(want.as_str()));
+			});
+		}
+
+		#[gpui::test]
 		fn remote_depth_limited_folder_can_be_continued(
 			cx: &mut TestAppContext,
 		) {
@@ -9772,6 +10424,7 @@ mod tests {
 			cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(752.)));
 			let mut last_chip = None;
 			for _ in 0..10 {
+				// ALLOWED-TEST-REFRESH: test harness needs redraw frames for search field width re-measurement before clicking branch chip
 				cx.update(|window, _| window.refresh());
 				settle(cx);
 				let pos = cx
@@ -9959,6 +10612,7 @@ mod tests {
 			settle(cx);
 			// The list reads its own width from the previous frame.
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw after resize so log list reads its width from previous frame
 				cx.update(|window, _| window.refresh());
 				settle(cx);
 			}
@@ -10049,6 +10703,7 @@ mod tests {
 				m.probes = Some(crate::ui::Probes::for_test());
 			});
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw to populate Probes::for_test() after opening workspace
 				cx.update(|w, _| w.refresh());
 				settle(cx);
 			}
@@ -11595,6 +12250,184 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn paste_preview_shows_diff_for_overwritten_file(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			fs::write(dest.join("target.txt"), "line1\nold line\nline3\n")
+				.unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: target.txt\nline1\nnew line\nline3\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.items.len(), 1);
+				let item = &plan.items[0];
+				assert!(item.overwritable());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(detail.is_diff, "expected diff preview");
+				assert!(detail.notice.is_none());
+				assert!(
+					detail.text.contains("-old line"),
+					"expected old line in diff: {}",
+					detail.text
+				);
+				assert!(
+					detail.text.contains("+new line"),
+					"expected new line in diff: {}",
+					detail.text
+				);
+				assert_eq!(m.reader.diff_mode, crate::reader::DiffMode::Inline);
+			});
+			// Toggle to side-by-side and back via btn-diff-mode
+			click(cx, "btn-diff-mode");
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.reader.diff_mode,
+					crate::reader::DiffMode::SideBySide
+				);
+			});
+			click(cx, "btn-diff-mode");
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.reader.diff_mode, crate::reader::DiffMode::Inline);
+			});
+		}
+
+		#[gpui::test]
+		fn paste_preview_identical_destination_shows_source_with_same_notice(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			fs::write(dest.join("same.txt"), "exact content").unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: same.txt\nexact content\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.items.len(), 1);
+				assert!(plan.items[0].overwritable());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(
+					!detail.is_diff,
+					"identical file must show source view"
+				);
+				assert_eq!(detail.text.as_ref(), "exact content");
+				let notice = detail.notice.as_ref().expect("notice present");
+				assert_eq!(notice, crate::i18n::t("paste_diff_same", m.locale));
+			});
+		}
+
+		/// A destination the reader cannot show as text keeps the source view
+		/// and says why the diff is missing: over the 1 MiB preview cap, or
+		/// not text.
+		#[gpui::test]
+		fn paste_preview_without_a_readable_destination_explains_the_missing_diff(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			fs::write(dest.join("big.txt"), "x".repeat(2 * 1024 * 1024))
+				.unwrap();
+			fs::write(dest.join("bin.txt"), b"old\0bytes\xff\n").unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			paste(&model, cx, "// FILE: big.txt\nsmall now\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert!(plan.items[0].overwritable());
+				let detail = m.paste.detail().expect("detail present");
+				assert!(!detail.is_diff, "an oversized target has no diff");
+				assert_eq!(detail.text.as_ref(), "small now");
+				assert_eq!(
+					detail.notice.as_deref(),
+					Some(crate::i18n::t("paste_diff_too_large", m.locale))
+				);
+			});
+			model.update(cx, |m, cx| m.cancel_paste_preview(cx));
+			paste(&model, cx, "// FILE: bin.txt\ntext now\n");
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				// The plan leaves a target that is not text alone; then there
+				// is nothing to compare. If it ever plans one, say why.
+				if !plan.items.first().is_some_and(|i| i.overwritable()) {
+					return;
+				}
+				let detail = m.paste.detail().expect("detail present");
+				assert!(!detail.is_diff, "a binary target has no diff");
+				assert_eq!(
+					detail.notice.as_deref(),
+					Some(crate::i18n::t("paste_diff_binary", m.locale))
+				);
+			});
+		}
+
+		#[gpui::test]
+		fn paste_preview_selecting_another_row_before_read_finishes_drops_first_diff(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "alpha", &[]);
+			let (_dest, dest) = canonical_tmp();
+			// Only b.txt exists in dest
+			fs::write(dest.join("b.txt"), "old b\n").unwrap();
+			let (model, cx) =
+				open(cx, ws.path().to_path_buf(), Some(dest.clone()));
+			// Three files: a.txt (fresh), b.txt (overwrites), c.txt (fresh)
+			paste(
+				&model,
+				cx,
+				"// FILE: a.txt\nfresh a\n// FILE: b.txt\nnew b\n// FILE: c.txt\nfresh c\n",
+			);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.selected_item_idx, 0);
+				assert!(!m.paste.detail().unwrap().is_diff);
+			});
+
+			// Delay background read by 300ms
+			model.update(cx, |m, _| {
+				m.e2e_read_delay = Some(Duration::from_millis(300));
+			});
+			let b1 = cx.debug_bounds("paste-row:1:b.txt").unwrap();
+			let b2 = cx.debug_bounds("paste-row:2:c.txt").unwrap();
+			// Click row 1 (starts slow read) then immediately row 2 before row 1 finishes
+			cx.simulate_click(b1.center(), gpui::Modifiers::none());
+			cx.simulate_click(b2.center(), gpui::Modifiers::none());
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.selected_item_idx, 2);
+				let detail = m.paste.detail().expect("detail present");
+				assert!(!detail.is_diff);
+				assert_eq!(detail.text.as_ref(), "fresh c");
+			});
+
+			// Drain all background work including row 1's delayed read
+			settle(cx);
+
+			// Row 2 is still showing fresh c, row 1's diff was discarded
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().expect("plan open");
+				assert_eq!(plan.selected_item_idx, 2);
+				let detail = m.paste.detail().expect("detail present");
+				assert_eq!(detail.path.as_deref(), Some("c.txt"));
+				assert!(
+					!detail.is_diff,
+					"row 2 must not be replaced by row 1 diff"
+				);
+				assert_eq!(detail.text.as_ref(), "fresh c");
+			});
+		}
+
+		#[gpui::test]
 		fn shift_range_selects_first_parent_chain_excluding_side(
 			cx: &mut TestAppContext,
 		) {
@@ -11796,6 +12629,7 @@ mod tests {
 				cx.executor().advance_clock(Duration::from_millis(50));
 			}
 			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw after workspace switch to record probe bounds
 				cx.update(|w, _| w.refresh());
 				settle(cx);
 			}
@@ -12646,6 +13480,619 @@ mod tests {
 				Some("find_something".to_string())
 			);
 		}
+
+		/// A long error toast wraps inside the card and never overflows the window.
+		#[gpui::test]
+		fn long_error_toast_wraps_inside_card_in_narrow_window(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			let win_w = 480.;
+			let win_h = 400.;
+			cx.simulate_resize(gpui::size(gpui::px(win_w), gpui::px(win_h)));
+			let long_error = "commits are not contiguous: following first parents back from 0123456789abcdef0123456789abcdef01234567, 89abcdef0123456789abcdef0123456789abcdef01";
+			model.update(cx, |m, cx| {
+				m.show_toast(
+					false,
+					crate::i18n::Msg::new(
+						"paste_err_plan",
+						[long_error.to_string()],
+					),
+					cx,
+				);
+			});
+			for _ in 0..2 {
+				// ALLOWED-TEST-REFRESH: test harness needs a redraw after showing toast to measure multiline bounds
+				cx.update(|window, _| window.refresh());
+				settle(cx);
+			}
+			let toast =
+				cx.debug_bounds("copy-toast").expect("copy-toast drawn");
+			let left = f32::from(toast.origin.x);
+			let right = left + f32::from(toast.size.width);
+			let height = f32::from(toast.size.height);
+			assert!(left >= 0., "toast left off-screen: {left}");
+			assert!(
+				right <= win_w,
+				"toast right exceeds window width: {right} > {win_w}"
+			);
+			assert!(
+				height > 40.,
+				"toast should wrap to more than one line: height={height}"
+			);
+		}
+
+		fn bounds_intersect(
+			a: gpui::Bounds<gpui::Pixels>,
+			b: gpui::Bounds<gpui::Pixels>,
+		) -> bool {
+			let a_left = f32::from(a.origin.x);
+			let a_right = a_left + f32::from(a.size.width);
+			let a_top = f32::from(a.origin.y);
+			let a_bottom = a_top + f32::from(a.size.height);
+
+			let b_left = f32::from(b.origin.x);
+			let b_right = b_left + f32::from(b.size.width);
+			let b_top = f32::from(b.origin.y);
+			let b_bottom = b_top + f32::from(b.size.height);
+
+			a_left < b_right
+				&& a_right > b_left
+				&& a_top < b_bottom
+				&& a_bottom > b_top
+		}
+
+		fn assert_no_filter_chips_intersect_actions(
+			cx: &mut VisualTestContext,
+		) {
+			let visible_chips = [
+				"log-filter-repo",
+				"log-filter-paths",
+				"log-filter-branch",
+				"log-filter-user",
+				"log-filter-date",
+				"log-filter-more",
+			];
+			let action_buttons = [
+				"btn-log-refresh",
+				"btn-head",
+				"btn-compare",
+				"btn-copy-commits",
+			];
+			for chip_id in visible_chips {
+				if let Some(chip_b) = cx.debug_bounds(chip_id) {
+					for btn_id in action_buttons {
+						if let Some(btn_b) = cx.debug_bounds(btn_id) {
+							assert!(
+								!bounds_intersect(chip_b, btn_b),
+								"chip {chip_id} intersects button {btn_id}: chip={chip_b:?}, btn={btn_b:?}"
+							);
+						}
+					}
+				}
+			}
+		}
+
+		/// At narrow window width (900x600), overflowing log filter chips do
+		/// not overlap action buttons; the overflow chip lists hidden filters,
+		/// and clicking the User item opens the User menu without triggering refresh.
+		#[gpui::test]
+		fn log_filter_narrow_window_overflow_and_user_menu(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+
+			let more_b = cx
+				.debug_bounds("log-filter-more")
+				.expect("log-filter-more drawn at 900w");
+
+			// User and Date chips must not be directly visible at narrow width
+			assert!(
+				cx.debug_bounds("log-filter-user").is_none(),
+				"user chip should be hidden into overflow at narrow width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-date").is_none(),
+				"date chip should be hidden into overflow at narrow width"
+			);
+
+			// No visible chip intersects refresh or any other action button
+			assert_no_filter_chips_intersect_actions(cx);
+
+			// Click overflow chip to reveal hidden filters
+			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
+			settle(cx);
+
+			// User item should now be present in the overflow menu
+			let user_item_b = cx
+				.debug_bounds("log-filter-more:user")
+				.expect("User item in overflow menu");
+			cx.simulate_click(user_item_b.center(), gpui::Modifiers::none());
+			settle(cx);
+
+			// Verify User menu is now open, and refresh was not triggered
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.log_menu,
+					Some(crate::ui::LogMenu::User),
+					"User menu should be open"
+				);
+			});
+		}
+
+		/// At a wide width all four filter chips render and no overflow chip exists.
+		#[gpui::test]
+		fn log_filter_wide_window_shows_all_chips_and_no_overflow(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(752.)));
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+
+			assert!(
+				cx.debug_bounds("log-filter-more").is_none(),
+				"overflow chip should not exist at wide width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-paths").is_some()
+					|| cx.debug_bounds("log-filter-repo").is_some(),
+				"repo/paths chip should exist at wide width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-branch").is_some(),
+				"branch chip should exist at wide width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-user").is_some(),
+				"user chip should exist at wide width"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-date").is_some(),
+				"date chip should exist at wide width"
+			);
+		}
+
+		/// The default 1080×720 window keeps every chip, also after the
+		/// window was narrow first: a chip that was hidden still has its
+		/// real width (native smoke clicks `log-filter-user` at this size).
+		#[gpui::test]
+		fn log_filter_chips_return_at_the_default_window_size(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			for (w, h) in [(700., 632.), (1080., 752.)] {
+				cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(h)));
+				for _ in 0..50 {
+					settle(cx);
+					let ready = model.read_with(cx, |m, _| {
+						!m.commits.is_empty()
+							&& (m.log_width.get() - (w - 28.)).abs() < 40.
+					});
+					if ready {
+						break;
+					}
+				}
+				settle(cx);
+			}
+			for id in [
+				"log-filter-paths",
+				"log-filter-branch",
+				"log-filter-user",
+				"log-filter-date",
+			] {
+				assert!(cx.debug_bounds(id).is_some(), "{id} hidden at 1080");
+			}
+			// The test frame keeps stale ids across resizes; ask the split.
+			let hidden =
+				model.read_with(cx, |m, _| m.log_filter_split().1.len());
+			assert_eq!(hidden, 0, "no chip goes to the overflow at 1080");
+		}
+
+		/// One resize to 900×600 settles the chips by itself: the frame that
+		/// meets the new width schedules the next one, with no other input.
+		/// (A real round saw the old layout until the next click.)
+		#[gpui::test]
+		fn log_filter_chips_follow_a_resize_without_input(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-a", "repo-b"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+			}
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(752.)));
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.log_width.get() > 1000.) {
+					break;
+				}
+			}
+			let wide =
+				model.read_with(cx, |m, _| m.log_filter_layout.last_mask.get());
+			assert_eq!(wide, 0b1111, "all chips fit at 1080");
+
+			cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(632.)));
+			settle(cx);
+			let (drawn, wanted) = model.read_with(cx, |m, _| {
+				let layout = &m.log_filter_layout;
+				let has = m.log_filter_split_has_values(m.locale);
+				(
+					layout.last_mask.get(),
+					layout.compute_split(layout.container_w.get(), has),
+				)
+			});
+			assert_ne!(wanted, 0b1111, "700 wide must not fit every chip");
+			assert_eq!(drawn, wanted, "the drawn split follows the new width");
+		}
+
+		/// At a narrow window width with widened details pane and an active long user filter,
+		/// no filter chip intersects action buttons and user filter is reachable.
+		#[gpui::test]
+		fn log_filter_narrow_window_widened_details_and_long_user_filter(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				m.log_details_w = 400.;
+				m.log_filter.author =
+					Some("very.long.contributor.name@example.com".to_string());
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+
+			assert_no_filter_chips_intersect_actions(cx);
+
+			if let Some(user_b) = cx.debug_bounds("log-filter-user") {
+				cx.simulate_click(user_b.center(), gpui::Modifiers::none());
+			} else {
+				let more_b = cx
+					.debug_bounds("log-filter-more")
+					.expect("more chip must exist when user chip is hidden");
+				cx.simulate_click(more_b.center(), gpui::Modifiers::none());
+				settle(cx);
+				let user_item_b = cx
+					.debug_bounds("log-filter-more:user")
+					.expect("User item in overflow menu");
+				cx.simulate_click(
+					user_item_b.center(),
+					gpui::Modifiers::none(),
+				);
+			}
+			settle(cx);
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.log_menu,
+					Some(crate::ui::LogMenu::User),
+					"User menu should be open"
+				);
+			});
+		}
+
+		/// At a narrow window width in English locale, no filter chip intersects action buttons.
+		#[gpui::test]
+		fn log_filter_narrow_window_english_locale(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			model.update(cx, |m, cx| {
+				m.locale = crate::i18n::Locale::En;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+
+			assert_no_filter_chips_intersect_actions(cx);
+
+			let more_b = cx
+				.debug_bounds("log-filter-more")
+				.expect("more chip must exist at 900w English");
+			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
+			settle(cx);
+			let user_item_b = cx
+				.debug_bounds("log-filter-more:user")
+				.expect("User item in overflow menu");
+			cx.simulate_click(user_item_b.center(), gpui::Modifiers::none());
+			settle(cx);
+
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.log_menu,
+					Some(crate::ui::LogMenu::User),
+					"User menu should be open"
+				);
+			});
+		}
+
+		/// At a wide window width with branches and details panes hidden, all four chips
+		/// are visible and no overflow chip exists.
+		#[gpui::test]
+		fn log_filter_wide_window_hidden_panes_shows_all_chips(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1200., 752.);
+			model.update(cx, |m, cx| {
+				m.log_branches_visible = false;
+				m.log_details_visible = false;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+
+			assert!(
+				cx.debug_bounds("log-filter-more").is_none(),
+				"overflow chip should not exist when all fit"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-paths").is_some()
+					|| cx.debug_bounds("log-filter-repo").is_some(),
+				"repo/paths chip should exist"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-branch").is_some(),
+				"branch chip should exist"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-user").is_some(),
+				"user chip should exist"
+			);
+			assert!(
+				cx.debug_bounds("log-filter-date").is_some(),
+				"date chip should exist"
+			);
+		}
+
+		/// In the Git log with a branch filter active and a non-HEAD commit
+		/// selected, clicking `btn-head` clears the filter, reloads the full
+		/// graph, scrolls to and selects HEAD.
+		#[gpui::test]
+		fn head_button_after_ref_filter_selects_head(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			git(&r, &["checkout", "-b", "side"]);
+			fs::write(r.join("side.txt"), "side content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "side commit"]);
+			let side_sha = {
+				let out = Command::new("git")
+					.current_dir(&r)
+					.args(["rev-parse", "HEAD"])
+					.output()
+					.unwrap();
+				String::from_utf8(out.stdout).unwrap().trim().to_string()
+			};
+			git(&r, &["checkout", "main"]);
+			fs::write(r.join("main.txt"), "main content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "main head commit"]);
+			let head_sha = {
+				let out = Command::new("git")
+					.current_dir(&r)
+					.args(["rev-parse", "HEAD"])
+					.output()
+					.unwrap();
+				String::from_utf8(out.stdout).unwrap().trim().to_string()
+			};
+			assert_ne!(side_sha, head_sha);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1200., 752.);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.display_commits().len() >= 3 && !m.refs.is_empty()
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+
+			// Activate branch filter for "side"
+			model.update(cx, |m, cx| {
+				m.filter_by_ref(Some("side".into()), cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let filtered = model.read_with(cx, |m, _| {
+					m.active_ref_filter.as_deref() == Some("side")
+						&& !m.display_commits().is_empty()
+				});
+				if filtered {
+					break;
+				}
+			}
+			settle(cx);
+
+			// Select the side commit (non-HEAD)
+			if let Some(row_bounds) = cx.debug_bounds("log-subject:0") {
+				cx.simulate_click(row_bounds.center(), gpui::Modifiers::none());
+			} else {
+				model.update(cx, |m, cx| {
+					m.select_commit(&side_sha, cx);
+				});
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.selected_commit.as_deref(),
+					Some(side_sha.as_str())
+				);
+			});
+
+			// User clicks `btn-head`
+			let btn =
+				cx.debug_bounds("btn-head").expect("btn-head must be drawn");
+			cx.simulate_click(btn.center(), gpui::Modifiers::none());
+
+			for _ in 0..50 {
+				settle(cx);
+				let done = model.read_with(cx, |m, _| {
+					m.active_ref_filter.is_none()
+						&& m.selected_commit.as_deref()
+							== Some(head_sha.as_str())
+				});
+				if done {
+					break;
+				}
+			}
+			settle(cx);
+
+			model.read_with(cx, |m, _| {
+				assert!(
+					m.active_ref_filter.is_none(),
+					"active ref filter must be cleared"
+				);
+				assert_eq!(
+					m.selected_commit.as_deref(),
+					Some(head_sha.as_str()),
+					"HEAD commit must be selected after clicking btn-head"
+				);
+			});
+		}
+
+		/// An error in the status bar is never overwritten by background
+		/// progress/ready messages until the user's next action.
+		#[gpui::test]
+		fn status_bar_error_not_overwritten_by_background_loading(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let _r = repo(ws.path(), "my-repo", &[]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1200., 752.);
+			settle(cx);
+
+			// User causes a paste error
+			model.update(cx, |m, _| {
+				m.user_action();
+				m.set_status_msg(crate::i18n::Msg::new(
+					"paste_err_plan",
+					["Not a directory (os error 20)".into()],
+				));
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.status.key, "paste_err_plan");
+			});
+
+			// Background progress/ready messages arrive: must not overwrite the error
+			for bg in [
+				"status_scanning",
+				"status_repo_loading",
+				"status_repo_loaded",
+				"status_repos_loaded",
+				"status_history_loaded",
+			] {
+				model.update(cx, |m, _| {
+					m.set_status(bg, []);
+				});
+				model.read_with(cx, |m, _| {
+					assert_eq!(
+						m.status.key, "paste_err_plan",
+						"background status '{bg}' should not overwrite user error"
+					);
+				});
+			}
+
+			// User initiates next action: error can be superseded
+			model.update(cx, |m, _| {
+				m.user_action();
+				m.set_status("status_scanning", []);
+			});
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.status.key, "status_scanning",
+					"user's next action allows status update"
+				);
+			});
+		}
 	}
 
 	mod folder_copy {
@@ -12845,7 +14292,9 @@ mod tests {
 			let msg = crate::copied_status("r".into(), &report.outcome);
 			assert_eq!(msg.key, "status_copied_limit");
 			assert_eq!(msg.args[1], "3");
-			assert_eq!(msg.args[5], NATIVE_FILE_COUNT_LIMIT.to_string());
+			assert_eq!(msg.args[4], report.outcome.words.to_string());
+			assert_eq!(msg.args[5], report.outcome.tokens.to_string());
+			assert_eq!(msg.args[7], NATIVE_FILE_COUNT_LIMIT.to_string());
 
 			let mut whole = native_export_settings();
 			whole.set_max_file_count = false;

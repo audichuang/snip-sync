@@ -73,6 +73,10 @@ pub struct CopyOutcome {
 	/// UTF-16 code units of the payload.
 	pub chars: usize,
 	pub lines: usize,
+	#[serde(default)]
+	pub words: usize,
+	#[serde(default)]
+	pub tokens: usize,
 	/// Files left out: unreadable, over the size limit, or a name a folder
 	/// walk could not carry.
 	pub skipped: usize,
@@ -115,6 +119,8 @@ pub fn copy_selection(
 			copied: 0,
 			chars: 0,
 			lines: 0,
+			words: 0,
+			tokens: 0,
 			skipped: 1,
 			truncated: false,
 		}),
@@ -194,6 +200,8 @@ pub fn copy_selection_detailed(
 				copied: 0,
 				chars: 0,
 				lines: 0,
+				words: 0,
+				tokens: 0,
 				skipped,
 				truncated: false,
 			},
@@ -211,6 +219,8 @@ pub fn copy_selection_detailed(
 			copied: plan.copied_file_count,
 			chars: plan.stats.chars,
 			lines: plan.stats.lines,
+			words: plan.stats.words,
+			tokens: plan.stats.tokens,
 			skipped,
 			truncated: expanded.truncated || plan.file_limit_reached,
 			payload: plan.payload,

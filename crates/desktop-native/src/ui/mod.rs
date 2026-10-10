@@ -58,8 +58,8 @@ use changes::*;
 pub(crate) use changes::{
 	change_rows, commit_file_rows, ChangeItemRow, ChangeLayout, UNREADABLE,
 };
-pub use log::LogMenu;
 use log::*;
+pub use log::{LogFilterLayout, LogMenu};
 
 // ───────────────────────── E2E probes (opt-in) ─────────────────────────
 
@@ -111,24 +111,128 @@ pub fn e2e_export_hold() -> Option<std::path::PathBuf> {
 		.map(std::path::PathBuf::from)
 }
 
+/// Returns true if control B covering control A's centre is an intended design relationship
+/// rather than an unexpected UI occlusion defect.
+fn is_covered_allowed(
+	id_a: &str,
+	id_b: &str,
+	a_rect: [i32; 4],
+	b_rect: [i32; 4],
+) -> bool {
+	// 1. Same element with multiple probe aliases (e.g. commit-row legacy_id).
+	if a_rect == b_rect {
+		return true;
+	}
+
+	// 2. Known container / layout areas that host child elements.
+	// Their visible centre naturally falls inside child rows / elements.
+	const CONTAINER_IDS: &[&str] = &[
+		"left-list",
+		"left-scroll",
+		"log-list",
+		"commit-panel",
+		"commit-details",
+		"commit-files-pane",
+		"commit-details-selection",
+		"paste-items",
+		"paste-mappings",
+		"status-bar",
+		"discovery-error",
+		"log-loading",
+		"paste-loading",
+	];
+	if CONTAINER_IDS.contains(&id_a) || CONTAINER_IDS.contains(&id_b) {
+		return true;
+	}
+
+	// 3. Parent row containing child controls (e.g. paste-row contains paste-overwrite,
+	// tree-row contains chevron, commit-row contains collapse/stripe).
+	if (id_a.starts_with("paste-row:") && id_b.starts_with("paste-"))
+		|| (id_a.starts_with("commit-row:")
+			&& (id_b.starts_with("collapse:")
+				|| id_b.starts_with("root-stripe:")))
+		|| (id_a.starts_with("tree-row:") && id_b.starts_with("chevron:"))
+		|| (id_a.starts_with("repo-row:") && id_b.starts_with("repo-chevron:"))
+		|| (id_a.starts_with("log-repo:")
+			&& id_b.starts_with("log-repo-check:"))
+	{
+		return true;
+	}
+
+	// 4. Chip clear button inside chip (e.g. log-filter-user-clear inside log-filter-user).
+	if id_b == format!("{id_a}-clear") {
+		return true;
+	}
+
+	// 5. Overlays, popups, dropdowns, menus, toasts:
+	// These controls float above underlying workspace content by design.
+	if id_b.starts_with("menu-item:")
+		|| id_b == "context-menu"
+		|| id_b.starts_with("selector-")
+		|| id_b == "copy-toast"
+		|| id_b.starts_with("pick-ref:")
+		|| id_b.starts_with("ref:")
+		|| id_b.starts_with("pick-repo:")
+		|| id_b.starts_with("log-user:")
+		|| id_b.starts_with("log-repo:")
+		|| id_b.starts_with("log-date-")
+		|| id_b.starts_with("log-path-")
+		|| id_b.starts_with("log-branch-")
+		|| id_b.starts_with("branch-filter-")
+		|| id_b.starts_with("branches-")
+		|| id_b.starts_with("log-filter-more:")
+		|| id_b.starts_with("workspace-")
+	{
+		return true;
+	}
+
+	false
+}
+
 /// Control bounds of the last two frames only, so the bookkeeping is
 /// bounded by what is on screen, never by what was ever shown.
 #[derive(Default)]
 pub struct ProbeFrame {
 	shown: HashMap<String, [i32; 4]>,
 	seen: HashMap<String, [i32; 4]>,
+	seen_order: Vec<(String, [i32; 4])>,
+	probed_this_frame: HashSet<String>,
 }
 
 impl ProbeFrame {
-	/// Records a control drawn this frame; true when new or moved.
-	pub fn report(&mut self, id: &str, v: [i32; 4]) -> bool {
-		let changed = self.shown.get(id) != Some(&v);
-		self.seen.insert(id.to_string(), v);
-		changed
+	/// Records a control probed this frame. Returns true when new or moved.
+	/// If v is None, the control is clipped away and omitted from seen controls.
+	pub fn probe(&mut self, id: &str, v: Option<[i32; 4]>) -> bool {
+		// `change-row:<path>` is the lenient legacy alias: a file both
+		// staged and unstaged carries it twice by design. The unique id is
+		// `change-row@<repo>:<source>:<path>`.
+		if !self.probed_this_frame.insert(id.to_string())
+			&& !id.starts_with("change-row:")
+		{
+			app_log!("[APP:CTRL_DUPLICATE: id={}]", id);
+		}
+		if let Some(v) = v {
+			self.seen_order.push((id.to_string(), v));
+			let changed = self.shown.get(id) != Some(&v);
+			self.seen.insert(id.to_string(), v);
+			changed
+		} else {
+			false
+		}
 	}
 
-	/// Closes the frame; returns controls drawn last frame but not this one.
-	pub fn end_frame(&mut self) -> Vec<String> {
+	/// Test only: records a control drawn this frame; true when new or moved.
+	#[cfg(test)]
+	pub fn report(&mut self, id: &str, v: [i32; 4]) -> bool {
+		self.probe(id, Some(v))
+	}
+
+	/// Closes the frame; returns controls drawn last frame but not this one,
+	/// and any controls whose visible centre is covered by another control painted later.
+	pub fn end_frame_with_audit(
+		&mut self,
+		viewport_w: f32,
+	) -> (Vec<String>, Vec<(String, String)>) {
 		let mut gone: Vec<String> = self
 			.shown
 			.keys()
@@ -136,8 +240,42 @@ impl ProbeFrame {
 			.cloned()
 			.collect();
 		gone.sort();
+
+		let mut covered = Vec::new();
+		if viewport_w >= 700.0 {
+			for (i, (id_a, rect_a)) in self.seen_order.iter().enumerate() {
+				let cx = rect_a[0] + rect_a[2] / 2;
+				let cy = rect_a[1] + rect_a[3] / 2;
+				for (id_b, rect_b) in self.seen_order.iter().skip(i + 1) {
+					// A probe is reported after its element's children, so a
+					// later rect that holds all of A is A's parent or row, not
+					// something painted over it. The UI01 case is the other
+					// way round: a small button over the middle of a chip.
+					let b_holds_a = rect_b[0] <= rect_a[0]
+						&& rect_b[1] <= rect_a[1]
+						&& rect_a[0] + rect_a[2] <= rect_b[0] + rect_b[2]
+						&& rect_a[1] + rect_a[3] <= rect_b[1] + rect_b[3];
+					if !b_holds_a
+						&& rect_b[0] <= cx && cx < rect_b[0] + rect_b[2]
+						&& rect_b[1] <= cy && cy < rect_b[1] + rect_b[3]
+						&& !is_covered_allowed(id_a, id_b, *rect_a, *rect_b)
+					{
+						covered.push((id_a.clone(), id_b.clone()));
+					}
+				}
+			}
+		}
+
 		self.shown = std::mem::take(&mut self.seen);
-		gone
+		self.seen_order.clear();
+		self.probed_this_frame.clear();
+		(gone, covered)
+	}
+
+	/// Test only: closes the frame; returns controls drawn last frame but not this one.
+	#[cfg(test)]
+	pub fn end_frame(&mut self) -> Vec<String> {
+		self.end_frame_with_audit(0.0).0
 	}
 
 	#[cfg(test)]
@@ -167,6 +305,15 @@ impl Probes {
 		ids
 	}
 
+	/// Test only: runs end_frame_with_audit on the underlying ProbeFrame.
+	#[cfg(test)]
+	pub fn end_frame_with_audit(
+		&self,
+		viewport_w: f32,
+	) -> (Vec<String>, Vec<(String, String)>) {
+		self.0.borrow_mut().end_frame_with_audit(viewport_w)
+	}
+
 	pub fn from_env() -> Option<Self> {
 		crate::e2e_on().then(|| Self(Rc::default()))
 	}
@@ -192,16 +339,29 @@ pub fn probe(
 	Some(
 		canvas(
 			move |b, window, _| {
-				let v = physical(b, window.scale_factor());
-				if frame.borrow_mut().report(&id, v) {
-					app_log!(
-						"[APP:CTRL_BOUNDS: id={} x={} y={} w={} h={}]",
-						id,
-						v[0],
-						v[1],
-						v[2],
-						v[3]
-					);
+				let mask = window.content_mask().bounds;
+				let visible = b.intersect(&mask);
+				let v = if visible.is_empty() {
+					None
+				} else {
+					let p = physical(visible, window.scale_factor());
+					if p[2] <= 0 || p[3] <= 0 {
+						None
+					} else {
+						Some(p)
+					}
+				};
+				if frame.borrow_mut().probe(&id, v) {
+					if let Some(v) = v {
+						app_log!(
+							"[APP:CTRL_BOUNDS: id={} x={} y={} w={} h={}]",
+							id,
+							v[0],
+							v[1],
+							v[2],
+							v[3]
+						);
+					}
 				}
 			},
 			|_, _, _, _| {},
@@ -216,15 +376,22 @@ pub fn probe(
 
 /// E2E only: last child of the root, deferred above every popup and menu,
 /// so its prepaint runs after every probe of the frame; announces controls
-/// that are no longer drawn.
+/// that are no longer drawn and covered controls.
 fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
 	let frame = probes.as_ref()?.0.clone();
 	Some(
 		deferred(
 			canvas(
-				move |_, _, _| {
-					for id in frame.borrow_mut().end_frame() {
+				move |_, window, _| {
+					let (gone, covered) =
+						frame.borrow_mut().end_frame_with_audit(f32::from(
+							window.viewport_size().width,
+						));
+					for id in gone {
 						app_log!("[APP:CTRL_GONE: id={}]", id);
+					}
+					for (id, by) in covered {
+						app_log!("[APP:CTRL_COVERED: id={} by={}]", id, by);
 					}
 				},
 				|_, _, _, _| {},
@@ -1033,6 +1200,7 @@ impl WorkbenchModel {
 	/// Copy reads it. In the Project view that is the row selection, or
 	/// the file under the cursor of a browsed commit tree.
 	pub fn copy_cursor_node(&mut self, cx: &mut Context<Self>) {
+		self.user_action();
 		let targets = match self.active_tab {
 			WorkbenchTab::GitChanges => self
 				.change_item_rows()
@@ -1316,6 +1484,9 @@ impl Render for WorkbenchModel {
 		}
 		let vp = window.viewport_size();
 		let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
+		if self.log_width.get() == 0.0 && vw > 0.0 {
+			self.log_width.set((vw - 32.0).max(0.0));
+		}
 		let s = window.scale_factor();
 		let phys = ((vw * s).round() as i32, (vh * s).round() as i32);
 		self.viewport_h = vh;
@@ -1575,6 +1746,7 @@ impl Render for WorkbenchModel {
 									.child(center),
 							)
 							.when(self.bottom_visible, |d| {
+								self.measure_log_chips(window);
 								d.child(self.splitter(Splitter::Bottom, cx))
 									.child(self.render_log(bottom_h, cx))
 							}),
@@ -1602,6 +1774,7 @@ impl WorkbenchModel {
 				.bottom(px(STATUS_H + 16.))
 				.left_0()
 				.right_0()
+				.px(px(16.))
 				.flex()
 				.justify_center()
 				.child(
@@ -1609,10 +1782,12 @@ impl WorkbenchModel {
 					// rows under it.
 					div()
 						.id("copy-toast")
+						.debug_selector(|| "copy-toast".into())
 						.flex()
 						.flex_row()
 						.items_center()
 						.gap(px(10.))
+						.min_w_0()
 						.max_w(px(640.))
 						.px(px(16.))
 						.py(px(10.))
@@ -1624,8 +1799,14 @@ impl WorkbenchModel {
 						.shadow_lg()
 						.text_size(px(UI_TEXT))
 						.text_color(rgb(pal().text))
-						.child(icon(glyph, 18.))
-						.child(msg.render(self.locale))
+						.child(div().flex_shrink_0().child(icon(glyph, 18.)))
+						.child(
+							div()
+								.flex_1()
+								.min_w_0()
+								.line_clamp(6)
+								.child(msg.render(self.locale)),
+						)
 						.children(probe(&self.probes, "copy-toast")),
 				)
 				.into_any_element(),
@@ -1730,6 +1911,74 @@ mod tests {
 		f.end_frame();
 		assert_eq!(f.end_frame(), vec!["btn-apply".to_string()]);
 		assert!(f.report("btn-apply", [5, 2, 3, 4]), "reappearing is new");
+	}
+
+	#[test]
+	fn probe_clipped_away_is_reported_gone() {
+		let mut f = ProbeFrame::default();
+		assert!(f.probe("btn-apply", Some([1, 2, 10, 10])));
+		assert!(f.end_frame().is_empty());
+		// Next frame: clipped away (None)
+		assert!(!f.probe("btn-apply", None));
+		assert_eq!(f.end_frame(), vec!["btn-apply".to_string()]);
+	}
+
+	#[test]
+	fn covered_control_audit_detects_covered_control_at_wide_viewport() {
+		let mut f = ProbeFrame::default();
+		// Control A: chip [100, 10, 80, 24], centre is (140, 22)
+		f.probe("log-filter-user", Some([100, 10, 80, 24]));
+		// Control B: refresh button painted later at [130, 8, 30, 28], covering (140, 22)
+		f.probe("btn-log-refresh", Some([130, 8, 30, 28]));
+
+		// Viewport width 900 >= 700: audit fires!
+		let (_, covered) = f.end_frame_with_audit(900.0);
+		assert_eq!(
+			covered,
+			vec![(
+				"log-filter-user".to_string(),
+				"btn-log-refresh".to_string()
+			)]
+		);
+
+		// Below 700: audit is suppressed (narrow window clipping is intended)
+		f.probe("log-filter-user", Some([100, 10, 80, 24]));
+		f.probe("btn-log-refresh", Some([130, 8, 30, 28]));
+		let (_, covered) = f.end_frame_with_audit(640.0);
+		assert!(covered.is_empty());
+	}
+
+	#[test]
+	fn covered_control_audit_respects_allowlist() {
+		let mut f = ProbeFrame::default();
+		// Container left-list covered by row
+		f.probe("left-list", Some([0, 0, 200, 400]));
+		f.probe("repo-row:repo-a", Some([0, 190, 200, 24]));
+		// Chip clear button inside chip
+		f.probe("log-filter-user", Some([10, 10, 80, 24]));
+		f.probe("log-filter-user-clear", Some([70, 14, 16, 16]));
+		// Overlay menu item covering button
+		f.probe("btn-apply", Some([500, 500, 80, 24]));
+		f.probe("menu-item:copy", Some([480, 480, 120, 50]));
+
+		let (_, covered) = f.end_frame_with_audit(800.0);
+		assert!(
+			covered.is_empty(),
+			"allowed relationships must not be flagged: {covered:?}"
+		);
+	}
+
+	#[test]
+	fn duplicate_probe_id_is_tracked_per_frame() {
+		let mut f = ProbeFrame::default();
+		assert!(f.probe("btn-apply", Some([0, 0, 10, 10])));
+		assert!(f.probed_this_frame.contains("btn-apply"));
+		// Calling again in same frame retains set
+		f.probe("btn-apply", Some([0, 0, 10, 10]));
+		assert_eq!(f.probed_this_frame.len(), 1);
+		// Next frame clears probed_this_frame
+		f.end_frame();
+		assert!(f.probed_this_frame.is_empty());
 	}
 
 	#[test]

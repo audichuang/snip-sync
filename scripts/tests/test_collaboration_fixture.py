@@ -609,6 +609,57 @@ class FixtureTests(unittest.TestCase):
         relocated = verify(str(moved))
         self.assertEqual(relocated["datasetHash"], self.manifest["datasetHash"])
 
+    def test_compare_step_stale_refusal_with_baseline(self) -> None:
+        require_git(self)
+        snap_path = Path(self.tmp.name) / "snap.json"
+        if not snap_path.exists():
+            run_cli(["snapshot", "--fixture", self.dir1, "--output", str(snap_path)], timeout=180)
+        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+
+        for step_id in ("neg-stale-source", "neg-stale-target"):
+            # Without baseline, applied phase raises CompareError
+            with self.assertRaises(CompareError) as caught:
+                compare_step(self.dir1, step_id, snap, "applied")
+            self.assertIn("no-write oracle is the snapshot taken immediately before the action", str(caught.exception))
+
+            # With matching baseline, applied phase passes
+            custom_baseline = copy.deepcopy(snap)
+            compare_step(self.dir1, step_id, snap, "applied", baseline=custom_baseline)
+
+            # With differing baseline (unexpected mutation during refusal), raises CompareError
+            mutated_baseline = copy.deepcopy(snap)
+            mutated_baseline["repos"][0]["head"]["oid"] = "0" * 40
+            with self.assertRaises(CompareError) as caught:
+                compare_step(self.dir1, step_id, snap, "applied", baseline=mutated_baseline)
+            self.assertIn("expected the full baseline snapshot", str(caught.exception))
+
+        # Test CLI compare-step with --baseline
+        baseline_path = Path(self.tmp.name) / "custom_baseline.json"
+        baseline_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        # CLI without --baseline exits 1
+        cli_no_base = run_cli([
+            "compare-step",
+            "--fixture", self.dir1,
+            "--step", "neg-stale-source",
+            "--snapshot", str(snap_path),
+            "--phase", "applied",
+        ])
+        self.assertEqual(cli_no_base.returncode, 1)
+        self.assertIn("no-write oracle", cli_no_base.stderr)
+
+        # CLI with --baseline exits 0
+        cli_with_base = run_cli([
+            "compare-step",
+            "--fixture", self.dir1,
+            "--step", "neg-stale-source",
+            "--snapshot", str(snap_path),
+            "--phase", "applied",
+            "--baseline", str(baseline_path),
+        ])
+        self.assertEqual(cli_with_base.returncode, 0, cli_with_base.stderr)
+        self.assertIn("compare ok", cli_with_base.stdout)
+
 
 def direct_replay(git: GitSession, src: Path, dst: Path, oids: list[str]) -> list[str]:
     """Independent git replay used only by tests. Does not call the fixture oracle."""

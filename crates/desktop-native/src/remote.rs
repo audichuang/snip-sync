@@ -268,6 +268,27 @@ pub(crate) fn remote_rel(session_root: &Path, path: &Path) -> Option<String> {
 	Some(parts.join("/"))
 }
 
+/// A worker's absolute `path` relative to its `root`, both spelled by the
+/// worker. Compared as text so a Windows worker's `C:\…` paths resolve on
+/// a Unix master too; the result uses "/". Only a Windows root (`C:\…`,
+/// `\\server\…`) splits on `\`: on Unix it is a legal file name character.
+pub(crate) fn worker_rel(root: &str, path: &Path) -> Option<String> {
+	let seps: &[char] = if root.contains('\\') {
+		&['/', '\\']
+	} else {
+		&['/']
+	};
+	let rest = path.to_str()?.strip_prefix(root.trim_end_matches(seps))?;
+	if !rest.is_empty() && !rest.starts_with(seps) {
+		return None;
+	}
+	let parts: Vec<&str> = rest.split(seps).filter(|p| !p.is_empty()).collect();
+	if parts.iter().any(|p| *p == "." || *p == "..") {
+		return None;
+	}
+	Some(parts.join("/"))
+}
+
 /// Joins two relative path fragments with a single "/" separator, trimming existing slashes.
 pub(crate) fn join_rel(prefix: &str, rel: &str) -> String {
 	let p = prefix.trim_matches('/');
@@ -807,7 +828,10 @@ impl WorkbenchModel {
 					self.locale,
 					&[&folder.host],
 				);
-				self.status = Msg::new("remote_open_failed", [text.clone()]);
+				self.set_status_msg(Msg::new(
+					"remote_open_failed",
+					[text.clone()],
+				));
 				self.remote_note(false, text, cx);
 			}
 		}
@@ -836,7 +860,7 @@ impl WorkbenchModel {
 			"[APP:REMOTE_OPENED: {label} generation={}]",
 			self.lifecycle.generation()
 		);
-		self.status = Msg::new("remote_opened", [label]);
+		self.set_status_msg(Msg::new("remote_opened", [label]));
 		self.launch_remote_scan(None, true, cx);
 		self.resume_ws_tree(cx);
 	}
@@ -1002,6 +1026,29 @@ impl WorkbenchModel {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Worker paths resolve by the worker's spelling, on any master OS.
+	#[test]
+	fn worker_rel_reads_unix_and_windows_worker_paths() {
+		let rel = |root: &str, path: &str| worker_rel(root, Path::new(path));
+		assert_eq!(
+			rel("/srv/ws", "/srv/ws/a/b.txt").as_deref(),
+			Some("a/b.txt")
+		);
+		assert_eq!(rel("/srv/ws/", "/srv/ws/a.txt").as_deref(), Some("a.txt"));
+		assert_eq!(
+			rel(r"C:\Users\me\ws", r"C:\Users\me\ws\src\x.rs").as_deref(),
+			Some("src/x.rs")
+		);
+		// On a Unix worker `\` is part of the name, not a folder.
+		assert_eq!(
+			rel("/srv/ws", r"/srv/ws/a\b.txt").as_deref(),
+			Some(r"a\b.txt")
+		);
+		assert_eq!(rel("/srv/ws", "/srv/ws2/a.txt"), None);
+		assert_eq!(rel("/srv/ws", "/srv/ws/../etc/passwd"), None);
+		assert_eq!(rel("/srv/ws", "/other/a.txt"), None);
+	}
 
 	#[test]
 	fn recent_folders_move_to_the_front_and_stay_bounded() {
