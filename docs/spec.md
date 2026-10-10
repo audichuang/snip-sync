@@ -67,6 +67,7 @@
 - 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 與 CLI 於階段 6 皆已採用):
   (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;偵測目的端是否不分大小寫,不分大小寫則新目標也摺疊大小寫(D10,階段 5b 已實作);以及 symlink 別名、同一路徑出現兩次)就整批拒絕;錯誤訊息格式呈現為單一目標路徑並列出衝突的操作名稱（如 `target collision: multiple operations target '<p>': previous was 'create a', current is 'create b'`，不重複輸出路徑亦不暴露內部大小寫摺疊字串）;
   (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
+  (c) 寫入鎖:檔案貼上與 commit 重放套用前,先取得目的地每個 repo 的寫入鎖(git dir 裡的 `snip-paste.lock`,OS 檔案鎖,跨行程有效,行程結束即釋放),拿到鎖之後才重新檢查 freshness 並寫入。另一個貼上(另一個工作區分頁、遠端 worker 或 CLI)正持有鎖時立刻拒絕、什麼都不寫,不排隊等待(`GitError::WorktreeBusy`;桌面顯示「這個儲存庫正在被另一個貼上作業使用，請稍後再試」,CLI exit 1)。不在任何 repo 裡的資料夾不加鎖:鎖只放在 git dir,不在一般資料夾留下檔案。無法建立或鎖住鎖檔(而非被占用)時整批以 `Io` 拒絕,不會略過鎖照寫。
   這與 IDE 套件(TS)不同,見 porting-notes「已知且接受的差異」。
 - 安全規則照 porting-notes 第 3 節:路徑片段等於 `.git`(ASCII 不區分大小寫,含 Win32 結尾點或空白拼寫如 `.git.`)視為 unsafe/unresolved 拒絕(檔案模式的寫入與刪除、commit 模式的 `path`/`old_path` 皆阻擋)、路徑含控制字元或 `<>:"|?*` 拒絕、containment 以 realpath 判斷、寫入或刪除的目標把 symlink 解析到底後落在 Git 目錄(repo 的 `.git`、bare repo、獨立 git dir)裡的,規劃時列為略過(檔案模式 UNRESOLVED_PATH、commit 模式 UnsafePath)、寫入前再檢查一次(只拒絕那一筆,其餘照寫)、
   placeholder 永遠不寫到真實檔案、目標不是 UTF-8 不覆寫、所有寫入一律 UTF-8,而且一律以「同資料夾暫存檔 + rename」**取代目錄項目**:硬連結或 symlink 的另一個名字(或指向的檔案)永遠不會被寫穿,三個作業系統一致。
@@ -223,7 +224,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - **貼上**(協定 4):
   - 檔案模式與 commit 模式都和本機同一個預覽面板與流程:同樣的列、勾選、覆寫預設關閉、前綴對應選擇(候選是遠端工作區的 repo 與資料夾,顯示成 `主機:路徑`)、新鮮度與碰撞檢查,結果也相同。目的地是目前的 repo,沒有 repo 時是工作區資料夾。
   - worker 在自己的磁碟上跑本機貼上同一套引擎(`transfer::plan_import_with`、`CommitReplayPreview`),不是逐檔寫入的 RPC。`ImportPlan`／`ReplayPlan` 只規劃、不寫入,回傳計畫與新鮮度快照(路徑是 worker 的)。
-  - Apply 不留狀態:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,在重放鎖底下重新驗證後重放;「先允許覆寫」的提示之前,同樣先檢查是否過期。
+  - Apply 不留狀態:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,取得寫入鎖(見 3.2 (c),被占用時以 `Busy` 拒絕)後重新驗證再重放;`ImportApply` 同樣在寫入鎖底下重新驗證;「先允許覆寫」的提示之前,同樣先檢查是否過期。
   - CLI `snip remote paste <host> <資料夾> [--in 資料夾] --dry-run|--apply [--overwrite|--skip-existing] [--adjust-paths] [--stdin]` 的旗標、輸出與結束碼和 `snip paste` 相同;路徑調整建議由 worker 依它的資料夾提出。
   - payload 可達剪貼簿上限(32 MiB),大於一個 frame:請求的貼上文字以 `Chunk` frame 先送(worker 端上限為剪貼簿上限),回覆的計畫以 `Chunk` + `Joined` 分段;整個請求(含 Apply 的新鮮度快照)超過一個 chunk 時,以 `FrameChunk` + `FrameJoin` 有上限地分段(協定 5)。寫入中的 Apply 不能中途取消,所以期限較長(30 分鐘),master 也不會重送寫入請求;超過 worker 期限時,寫入工作自己的回應(成功或它自己的錯誤)不會被丟掉換成 `Timeout`,worker 以 heartbeat 撐住並送出實際結果,master 的期限(31 分鐘)較長,若 master 先放棄則結果未知:App 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」(`paste_outcome_unknown`),CLI 在 stderr 說明並以非零結束。
 

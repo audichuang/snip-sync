@@ -6,12 +6,10 @@
 //! work ([`ScanBudget`]) and says truthfully whether it finished
 //! ([`ScanStatus`]). Nothing here collects a whole directory tree first.
 
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -716,92 +714,35 @@ impl RepoIdentity {
 // Heavy operations: one at a time per worktree
 // ---------------------------------------------------------------------------
 
-/// Callers allowed to wait for one worktree; one more is refused.
-pub const MAX_HEAVY_WAITERS: usize = 4;
+/// The lock file in a worktree's git dir. File paste and commit replay
+/// take the same one, so neither runs beside the other in that worktree.
+pub const HEAVY_LOCK_FILE: &str = "snip-paste.lock";
 
-#[derive(Default)]
-struct Slot {
-	held: bool,
-	waiting: usize,
-}
-
-static HEAVY: Mutex<Option<HashMap<PathBuf, Slot>>> = Mutex::new(None);
-static HEAVY_FREED: Condvar = Condvar::new();
-
-fn heavy() -> MutexGuard<'static, Option<HashMap<PathBuf, Slot>>> {
-	HEAVY.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Exclusive right to run index- or ref-changing Git work in one worktree
-/// (keyed by its git dir: linked worktrees have their own index and HEAD).
+/// Exclusive right to write one worktree (keyed by its git dir: linked
+/// worktrees have their own index and HEAD). An OS file lock, so it holds
+/// across processes: another desktop tab, a remote worker, the CLI. The OS
+/// releases it when the holding process dies.
+#[derive(Debug)]
 pub struct HeavyGuard {
-	key: PathBuf,
+	_file: fs::File,
 }
 
-/// Waits (bounded by `opts.queue_timeout`, cancellable, at most
-/// [`MAX_HEAVY_WAITERS`] waiters) for the worktree's heavy-operation lock.
-pub fn lock_heavy(
-	identity: &RepoIdentity,
-	opts: &RunOptions,
-) -> Result<HeavyGuard, GitError> {
-	let key = identity.git_dir.clone();
-	let label =
-		|| format!("(heavy operation in {})", identity.toplevel.display());
-	let mut map = heavy();
-	let slot = map
-		.get_or_insert_with(HashMap::new)
-		.entry(key.clone())
-		.or_default();
-	if !slot.held {
-		slot.held = true;
-		return Ok(HeavyGuard { key });
-	}
-	if slot.waiting >= MAX_HEAVY_WAITERS {
-		return Err(GitError::WorktreeBusy { args: label() });
-	}
-	slot.waiting += 1;
-	let deadline = Instant::now() + opts.queue_timeout;
-	let result = loop {
-		let slot = map
-			.get_or_insert_with(HashMap::new)
-			.entry(key.clone())
-			.or_default();
-		if opts.cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
-			break Err(GitError::Cancelled { args: label() });
-		}
-		if !slot.held {
-			slot.held = true;
-			break Ok(HeavyGuard { key: key.clone() });
-		}
-		let now = Instant::now();
-		if now >= deadline {
-			break Err(GitError::QueueTimeout { args: label() });
-		}
-		map = HEAVY_FREED
-			.wait_timeout(
-				map,
-				(deadline - now).min(std::time::Duration::from_millis(20)),
-			)
-			.unwrap_or_else(PoisonError::into_inner)
-			.0;
-	};
-	if let Some(slot) = map.get_or_insert_with(HashMap::new).get_mut(&key) {
-		slot.waiting -= 1;
-	}
-	result
-}
-
-impl Drop for HeavyGuard {
-	fn drop(&mut self) {
-		let mut map = heavy();
-		let map = map.get_or_insert_with(HashMap::new);
-		if let Some(slot) = map.get_mut(&self.key) {
-			slot.held = false;
-			if slot.waiting == 0 {
-				map.remove(&self.key);
-			}
-		}
-		HEAVY_FREED.notify_all();
+/// Takes the worktree's write lock, or refuses at once with
+/// [`GitError::WorktreeBusy`] while anyone else holds it: a paste that
+/// waited would apply a preview the user saw before the other write.
+/// Any other failure to lock is [`GitError::Io`], never a silent pass.
+pub fn lock_heavy(identity: &RepoIdentity) -> Result<HeavyGuard, GitError> {
+	let file = fs::OpenOptions::new()
+		.create(true)
+		.truncate(false)
+		.write(true)
+		.open(identity.git_dir.join(HEAVY_LOCK_FILE))?;
+	match file.try_lock() {
+		Ok(()) => Ok(HeavyGuard { _file: file }),
+		Err(fs::TryLockError::WouldBlock) => Err(GitError::WorktreeBusy {
+			args: format!("(paste into {})", identity.toplevel.display()),
+		}),
+		Err(fs::TryLockError::Error(e)) => Err(GitError::Io(e)),
 	}
 }
 
@@ -1691,7 +1632,7 @@ mod tests {
 	}
 
 	#[test]
-	fn heavy_operations_serialize_per_worktree_with_a_bounded_queue() {
+	fn heavy_lock_refuses_a_second_holder_per_worktree() {
 		let dir = tempfile::tempdir().unwrap();
 		let root = dunce::canonicalize(dir.path()).unwrap();
 		let main = root.join("main");
@@ -1710,63 +1651,41 @@ mod tests {
 		};
 		let (m, w) = (id(&main), id(&root.join("wt")));
 
-		let held = lock_heavy(&m, &RunOptions::default()).unwrap();
+		let held = lock_heavy(&m).unwrap();
 		// Another worktree of the same repository is independent.
-		let other = lock_heavy(&w, &RunOptions::default()).unwrap();
-		drop(other);
-		let short = RunOptions {
-			queue_timeout: Duration::from_millis(50),
-			..RunOptions::default()
-		};
-		assert!(matches!(
-			lock_heavy(&m, &short),
-			Err(GitError::QueueTimeout { .. })
-		));
-
-		// Fill the waiting room, then one more is refused at once.
-		let stop = CancelToken::new();
-		let waiters: Vec<_> = (0..MAX_HEAVY_WAITERS)
-			.map(|_| {
-				let (m, stop) = (m.clone(), stop.clone());
-				std::thread::spawn(move || {
-					lock_heavy(
-						&m,
-						&RunOptions {
-							cancel: Some(stop),
-							queue_timeout: Duration::from_secs(60),
-							..RunOptions::default()
-						},
-					)
-					.map(drop)
-				})
-			})
-			.collect();
-		let deadline = Instant::now() + Duration::from_secs(10);
-		loop {
-			let waiting = heavy()
-				.as_ref()
-				.and_then(|h| h.get(&m.git_dir))
-				.map_or(0, |s| s.waiting);
-			if waiting == MAX_HEAVY_WAITERS {
-				break;
-			}
-			assert!(Instant::now() < deadline);
-			std::thread::sleep(Duration::from_millis(10));
-		}
-		assert!(matches!(
-			lock_heavy(&m, &short),
-			Err(GitError::WorktreeBusy { .. })
-		));
-		stop.cancel();
-		for w in waiters {
-			assert!(matches!(
-				w.join().unwrap(),
-				Err(GitError::Cancelled { .. })
-			));
-		}
+		drop(lock_heavy(&w).unwrap());
+		// A second holder is refused at once, from this process too.
+		assert!(matches!(lock_heavy(&m), Err(GitError::WorktreeBusy { .. })));
+		// The lock file lives in the git dir: the tree stays clean.
+		assert!(m.git_dir.join(HEAVY_LOCK_FILE).is_file());
+		assert_eq!(git(&main, &["status", "--porcelain"]), "");
 		drop(held);
 		// Released: the next caller gets it at once.
-		drop(lock_heavy(&m, &short).unwrap());
+		drop(lock_heavy(&m).unwrap());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn heavy_lock_is_shared_by_a_root_spelled_through_a_symlink() {
+		let dir = tempfile::tempdir().unwrap();
+		let real = dir.path().join("real");
+		init(&real);
+		commit_file(&real, "a.txt", "a\n");
+		let link = dir.path().join("link");
+		std::os::unix::fs::symlink(&real, &link).unwrap();
+		let id = |p: &Path| {
+			RepoIdentity::resolve(
+				&Git::open(p).unwrap(),
+				&RunOptions::default(),
+			)
+			.unwrap()
+		};
+		let held = lock_heavy(&id(&real)).unwrap();
+		assert!(matches!(
+			lock_heavy(&id(&link)),
+			Err(GitError::WorktreeBusy { .. })
+		));
+		drop(held);
 	}
 
 	#[test]

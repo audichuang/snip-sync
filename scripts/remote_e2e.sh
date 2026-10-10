@@ -111,8 +111,11 @@ fi
 # a master does. The host argument `h` is then only a label.
 if [ -z "$HOST" ]; then
 	export SNIP_REMOTE_EXEC="$RSNIP serve --stdio"
+	# A worker whose Apply pauses after its first write while $WD/paste-hold exists.
+	HOLD_EXEC="env SNIP_E2E_PASTE_HOLD=$WD/paste-hold $RSNIP serve --stdio"
 else
 	export SNIP_REMOTE_EXEC="ssh -T -o BatchMode=yes -o ConnectTimeout=10 $HOST $RSNIP serve --stdio"
+	HOLD_EXEC="ssh -T -o BatchMode=yes -o ConnectTimeout=10 $HOST env SNIP_E2E_PASTE_HOLD=$WD/paste-hold $RSNIP serve --stdio"
 fi
 
 # Fixtures, made on the worker. `secret.txt` sits outside every workspace.
@@ -421,6 +424,30 @@ if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/a.txt'"; then
 else
 	bad "a paste out of the workspace  rc=$rc err=$err"
 fi
+
+# Two connections paste into one repository: the one that holds it (paused
+# after its first write) makes the other refuse at once, writing nothing.
+w <<<"cd '$WD/pastews' && git init -q lockrepo && touch '$WD/paste-hold'"
+SNIP_REMOTE_EXEC="$HOLD_EXEC" "$SNIP" remote paste h "$WD/pastews" --in lockrepo --apply --stdin <"$MASTER/payload.txt" >"$MASTER/hold.out" 2>&1 &
+holder=$!
+for _ in $(seq 1 200); do
+	w <<<"test -e '$WD/pastews/lockrepo/.git/snip-paste.lock' && ls '$WD/pastews/lockrepo' | grep -q ." && break
+	sleep 0.1
+done
+before=$(w <<<"cd '$WD/pastews/lockrepo' && find . -path ./.git -prune -o -type f -print | LC_ALL=C sort | wc -l | tr -d ' '")
+err=$("$SNIP" remote paste h "$WD/pastews" --in lockrepo --apply --overwrite --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
+rc=$?
+after=$(w <<<"cd '$WD/pastews/lockrepo' && find . -path ./.git -prune -o -type f -print | LC_ALL=C sort | wc -l | tr -d ' '")
+w <<<"rm -f '$WD/paste-hold'"
+wait "$holder"
+holder_rc=$?
+if [ "$rc" = 1 ] && [[ "$err" == *"another paste is writing to this repository"* ]] && [ "$before" = "$after" ]; then
+	ok "a second paste into a held repository is refused and writes nothing  ($err)"
+else
+	bad "a second paste into a held repository  rc=$rc before=$before after=$after err=$err"
+fi
+check "the holding paste finishes once released ($(cat "$MASTER/hold.out"))" test "$holder_rc" = 0
+check "the holding paste wrote every file" w <<<"test -e '$WD/pastews/lockrepo/sub/noeol.txt' && test -e '$WD/pastews/lockrepo/long.txt'"
 
 # Commit mode: the worker replays the commits as a local replay does.
 CSRC="$MASTER/commit-src"

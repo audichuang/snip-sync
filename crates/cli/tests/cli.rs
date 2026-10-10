@@ -182,6 +182,52 @@ fn file_mode_round_trip() {
 }
 
 #[test]
+fn paste_is_refused_while_another_paste_holds_the_repository() {
+	use snip_core::gitrun::RunOptions;
+	use snip_core::gitsrc::Git;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&dst);
+	fs::write(dst.join("keep.txt"), "keep\n").unwrap();
+	commit(&dst, "base", "2026-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = b"// file: new.txt\nnew content\n";
+
+	let id = RepoIdentity::resolve(
+		&Git::open(&dst).unwrap(),
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let held = lock_heavy(&id).unwrap();
+	let out = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload),
+	);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	assert!(
+		text(&out.stderr)
+			.contains("another paste is writing to this repository"),
+		"{}",
+		text(&out.stderr)
+	);
+	assert!(!dst.join("new.txt").exists());
+
+	drop(held);
+	let out = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload),
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	assert_eq!(
+		fs::read_to_string(dst.join("new.txt")).unwrap(),
+		"new content"
+	);
+}
+
+#[test]
 fn commit_mode_round_trip() {
 	let tmp = tempfile::tempdir().unwrap();
 	let a = tmp.path().join("a");

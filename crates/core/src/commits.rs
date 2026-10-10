@@ -1742,47 +1742,49 @@ pub(crate) struct ReplaySession {
 }
 
 impl ReplaySession {
-	/// Heavy lock + empty hooks dir, taken before any write, with the
-	/// replay's write scope ([`plan_commit_replay_in`]). Err is the
-	/// ReplayResult the old replay returned for that failure (failure at
-	/// index 0, or none for an empty payload).
-	pub(crate) fn begin_in(
+	/// The worktree's write lock for a replay. `WorktreeBusy` means another
+	/// paste holds it; callers refuse that outright rather than as a
+	/// failed commit.
+	pub(crate) fn lock(
 		git: &Git,
+		opts: &RunOptions,
+	) -> Result<crate::workspace::HeavyGuard, GitError> {
+		RepoIdentity::resolve(git, opts).and_then(|id| lock_heavy(&id))
+	}
+
+	/// What the old replay returned when it could not start: failure at
+	/// index 0, or none for an empty payload.
+	pub(crate) fn refused(
+		payload: &CommitsPayload,
+		error: String,
+	) -> ReplayResult {
+		ReplayResult {
+			created: Vec::new(),
+			failure: payload.commits.first().map(|c| ReplayFailure {
+				index: 0,
+				message: c.message.clone(),
+				error,
+				layout_conflict: None,
+				conflict_path: None,
+			}),
+		}
+	}
+
+	/// Empty hooks dir under the held write lock, taken before any write,
+	/// with the replay's write scope ([`plan_commit_replay_in`]). Err is
+	/// the ReplayResult the old replay returned for that failure.
+	pub(crate) fn begin_in(
 		scope: &Path,
 		payload: &CommitsPayload,
-		opts: &RunOptions,
+		_guard: crate::workspace::HeavyGuard,
 	) -> Result<Self, ReplayResult> {
-		let mut result = ReplayResult::default();
-		let guard = RepoIdentity::resolve(git, opts)
-			.and_then(|id| lock_heavy(&id, opts));
-		let _guard = match guard {
-			Ok(g) => g,
-			Err(e) => {
-				result.failure =
-					payload.commits.first().map(|c| ReplayFailure {
-						index: 0,
-						message: c.message.clone(),
-						error: e.to_string(),
-						layout_conflict: None,
-						conflict_path: None,
-					});
-				return Err(result);
-			}
-		};
 		let no_hooks = match NoHooks::create() {
 			Ok(h) => h,
 			Err(e) => {
-				result.failure =
-					payload.commits.first().map(|c| ReplayFailure {
-						index: 0,
-						message: c.message.clone(),
-						error: format!(
-							"cannot create an empty hooks directory: {e}"
-						),
-						layout_conflict: None,
-						conflict_path: None,
-					});
-				return Err(result);
+				return Err(Self::refused(
+					payload,
+					format!("cannot create an empty hooks directory: {e}"),
+				));
 			}
 		};
 		Ok(Self {
@@ -1821,12 +1823,11 @@ impl ReplaySession {
 
 #[cfg(test)]
 pub(crate) fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
-	match ReplaySession::begin_in(
-		git,
-		git.root(),
-		payload,
-		&RunOptions::default(),
-	) {
+	let guard = match ReplaySession::lock(git, &RunOptions::default()) {
+		Ok(g) => g,
+		Err(e) => return ReplaySession::refused(payload, e.to_string()),
+	};
+	match ReplaySession::begin_in(git.root(), payload, guard) {
 		Ok(session) => session.run(git, payload),
 		Err(refused) => refused,
 	}
@@ -3992,20 +3993,16 @@ mod tests {
 			.unwrap();
 		let payload = deleting("parent/sub/last.txt");
 		let git = repo.open();
-		let session = ReplaySession::begin_in(
-			&git,
-			&spelled,
-			&payload,
-			&RunOptions::default(),
-		)
-		.map_err(|refused| {
-			refused
-				.failure
-				.as_ref()
-				.map(|f| f.error.clone())
-				.unwrap_or_default()
-		})
-		.unwrap();
+		let guard = ReplaySession::lock(&git, &RunOptions::default()).unwrap();
+		let session = ReplaySession::begin_in(&spelled, &payload, guard)
+			.map_err(|refused| {
+				refused
+					.failure
+					.as_ref()
+					.map(|f| f.error.clone())
+					.unwrap_or_default()
+			})
+			.unwrap();
 		let result = session.run(&git, &payload);
 		assert_eq!(result.failure, None);
 		assert!(!repo.path().join("parent/sub/last.txt").exists());
