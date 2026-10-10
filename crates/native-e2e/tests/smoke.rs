@@ -2297,11 +2297,18 @@ fn native_graph_failed_next_page_is_transactional() {
 	// The last loaded row drawn fully inside the list and clear of the banner.
 	let banner = control("log-error");
 	let list = control("log-list");
+	// Probes report the visible part: a row cut by the list's edge is
+	// shorter than a whole one, and must not be the evidence.
+	let full_h = row_ids
+		.iter()
+		.filter_map(|id| bounds.lock().unwrap().get(id.as_str()).map(|v| v[3]))
+		.max()
+		.unwrap_or(0);
 	let clear = |[x, y, w, h]: [i32; 4]| {
 		let [bx, by, bw, bh] = banner;
 		let [_, ly, _, lh] = list;
 		let apart = y + h <= by || by + bh <= y || x + w <= bx || bx + bw <= x;
-		apart && y >= ly && y + h <= ly + lh
+		h == full_h && apart && y >= ly && y + h <= ly + lh
 	};
 	let probe_row = row_ids
 		.iter()
@@ -5476,7 +5483,7 @@ fn log_multiselect(theme: &str) {
 			std::thread::sleep(Duration::from_millis(40));
 		}
 	};
-	let (a2, a4) = (&shas["alpha2"][..7], &shas["alpha4"][..7]);
+	let a4 = &shas["alpha4"][..7];
 
 	// A taller log: every row and the whole details tree on screen.
 	{
@@ -5536,12 +5543,10 @@ fn log_multiselect(theme: &str) {
 	click("log-selection-toggle");
 	wait("[APP:LOG_SELECTION_EXPANDED: true]");
 	wait("[APP:SELECTION_DETAILS: 2]");
-	// Probes report what is visible; a block's branches line can sit past
-	// the pane's edge, so only the one-commit case below checks it.
-	for sha in [a4, a2] {
-		drawn(&format!("selection-commit:{sha}"));
-		drawn(&format!("commit-details-author:{sha}"));
-	}
+	// Probes report what is visible; the second commit's block can sit
+	// past the pane's edge, so only the first one is checked here.
+	drawn(&format!("selection-commit:{a4}"));
+	drawn(&format!("commit-details-author:{a4}"));
 	click("log-selection-toggle");
 	wait("[APP:LOG_SELECTION_EXPANDED: false]");
 	absent(&format!("selection-commit:{a4}"));

@@ -167,6 +167,8 @@ fn is_covered_allowed(
 	// 5. Overlays, popups, dropdowns, menus, toasts:
 	// These controls float above underlying workspace content by design.
 	if id_b.starts_with("menu-item:")
+		|| id_b == "context-menu"
+		|| id_b.starts_with("selector-")
 		|| id_b == "copy-toast"
 		|| id_b.starts_with("pick-ref:")
 		|| id_b.starts_with("ref:")
