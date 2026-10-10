@@ -1753,6 +1753,11 @@ impl WorkbenchModel {
 		self.user_action_seq = self.user_action_seq.wrapping_add(1);
 	}
 
+	/// Shows `msg` in the status bar. An error stays until the user's next
+	/// action: a background status (`is_background_status`) arriving before
+	/// then is dropped. Whether a key is an error comes only from its name
+	/// (`is_error_status`), so a new error key must match one of its shapes
+	/// or be added to its list, or scan progress will overwrite it.
 	pub fn set_status_msg(&mut self, msg: Msg) {
 		let incoming_prio = status_priority(msg.key);
 		if incoming_prio == StatusPriority::Background {
