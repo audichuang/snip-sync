@@ -34,18 +34,22 @@ from bench_native_memory import (  # noqa: E402
     NativeSession,
     check_repo_state,
     click_repo,
+    close_shown_tab,
+    e2e_scaled,
     copy_explicit_selection,
     descendants,
     identity,
     is_same_process,
     load_build_receipt,
     open_project_list,
+    open_workspace_tab,
     parse_bounds,
     parse_repo_select,
     repo_oracle,
     scroll_into_view,
     sha256_file,
     show_changes,
+    wait_repo_loaded,
     workspace_repos,
 )
 from memory_harness import read_proc_starttime, sample_app_resources  # noqa: E402
@@ -54,6 +58,8 @@ from workload_generator import PRESETS, REPO_NAMES  # noqa: E402
 CHECK_NAME = "native-resource-leaks"
 SCHEMA_VERSION = 1
 BATCH_SWITCHES = 10
+# Workspace tab open/close cycles between two samples of the tab series.
+TAB_BATCH_CYCLES = 5
 ABS_GROWTH_BYTES = 32 * 1024 * 1024
 GROWTH_FRACTION = 0.10
 TREND_BYTES_PER_SWITCH = 256 * 1024
@@ -65,11 +71,11 @@ LONG_WINDOW_SECONDS = 30.0
 LONG_OBSERVATION_SECONDS = 600.0
 WINDOW_MIN_SAMPLES = 10
 CANONICAL_CLIPBOARD = b"SNIP-LEAK-GATE-CANONICAL-CLIPBOARD-v1\n"
-_RESOURCE_KINDS = frozenset({"settle", "settle-point", "endpoint", "terminal", "extension", "baseline", "final"})
+_RESOURCE_KINDS = frozenset({"settle", "settle-point", "endpoint", "tab-endpoint", "terminal", "extension", "baseline", "final"})
 _KNOWN_KINDS = _RESOURCE_KINDS | frozenset({"action", "interaction", "clipboard"})
 _RESOURCE_KEYS = (
     "sampleId", "phase", "warmup", "activity", "resourcesComplete", "memoryComplete",
-    "measuredSwitchesCompleted", "rssBytes", "pssBytes", "fdCount", "threadCount",
+    "measuredSwitchesCompleted", "tabCyclesCompleted", "rssBytes", "pssBytes", "fdCount", "threadCount",
     "watchCount", "gitChildren", "unreadablePids", "root", "equivalentView",
     "gpuCombinedIntoRss", "vramBytes", "rssProvenance", "pssProvenance",
 )
@@ -84,6 +90,7 @@ RELEASE_COVERAGE = (
     "tree",
     "history",
     "workspace-close-reopen",
+    "workspace-tab-cycle",
     "copy",
     "paste",
     "cancel",
@@ -99,6 +106,7 @@ SHORT_COVERAGE = (
     "paste",
     "cancel",
     "workspace-close-reopen",
+    "workspace-tab-cycle",
     "quit-cleanup",
 )
 THRESHOLDS: dict[str, Any] = {
@@ -118,6 +126,8 @@ FLOORS: dict[str, dict[str, Any]] = {
     "short": {
         "warmupSwitches": 20,
         "measuredSwitches": 100,
+        "warmupTabCycles": 5,
+        "measuredTabCycles": 30,
         "repos": 15,
         "checkpoints": 10,
         "settleSeconds": MIN_SETTLE_SECONDS,
@@ -125,6 +135,8 @@ FLOORS: dict[str, dict[str, Any]] = {
     "long": {
         "warmupSwitches": 20,
         "measuredSwitches": 500,
+        "warmupTabCycles": 5,
+        "measuredTabCycles": 30,
         "repos": 15,
         "checkpoints": 10,
         "settleSeconds": MIN_SETTLE_SECONDS,
@@ -246,6 +258,15 @@ def _batches(total: int) -> list[int]:
     left = total
     while left:
         sizes.append(min(BATCH_SWITCHES, left))
+        left -= sizes[-1]
+    return sizes
+
+
+def tab_batches(total: int) -> list[int]:
+    sizes: list[int] = []
+    left = total
+    while left > 0:
+        sizes.append(min(TAB_BATCH_CYCLES, left))
         left -= sizes[-1]
     return sizes
 
@@ -405,9 +426,9 @@ def _measured_endpoints(samples: list[Any]) -> list[tuple[int, dict[str, Any], l
     return [(key, groups[key][-1], groups[key]) for key in order]
 
 
-def _series_growth(samples: list[dict[str, Any]], key: str) -> dict[str, Any]:
-    ordered = sorted(samples, key=lambda row: row["measuredSwitchesCompleted"])
-    xs = [float(row["measuredSwitchesCompleted"]) for row in ordered]
+def _series_growth(samples: list[dict[str, Any]], key: str, x: str = "measuredSwitchesCompleted") -> dict[str, Any]:
+    ordered = sorted(samples, key=lambda row: row[x])
+    xs = [float(row[x]) for row in ordered]
     ys = [float(row[key]) for row in ordered]
     third = len(ordered) // 3
     first_med = _median(ys[:third])
@@ -433,7 +454,7 @@ def _heap_untouched(report: dict[str, Any]) -> dict[str, float]:
     return out
 
 
-def _trend_slope(samples: list[dict[str, Any]], key: str, untouched: dict[str, float]) -> float | None:
+def _trend_slope(samples: list[dict[str, Any]], key: str, untouched: dict[str, float], x: str = "measuredSwitchesCompleted") -> float | None:
     """Slope of memory plus not-yet-resident main heap.
 
     Lavapipe/LLVM leave ~24 MiB of `[heap]` mapped but never written at startup. Later
@@ -447,8 +468,8 @@ def _trend_slope(samples: list[dict[str, Any]], key: str, untouched: dict[str, f
     # one short run; mallinfo2 in-use bytes from the app would close that gap.
     if any(row.get("sampleId") not in untouched for row in samples):
         return None
-    ordered = sorted(samples, key=lambda row: row["measuredSwitchesCompleted"])
-    xs = [float(row["measuredSwitchesCompleted"]) for row in ordered]
+    ordered = sorted(samples, key=lambda row: row[x])
+    xs = [float(row[x]) for row in ordered]
     ys = [float(row[key]) + untouched[row["sampleId"]] for row in ordered]
     return _slope(xs, ys)
 
@@ -466,6 +487,20 @@ def _log_supports(item: str, row: dict[str, Any]) -> bool:
         return "[APP:PASTE_PREVIEW:" in log or "[APP:PASTE_DONE:" in log
     if item == "cancel":
         return "[APP:PASTE_CANCELLED" in log
+    if item == "workspace-tab-cycle":
+        oracle = row.get("oracle") if isinstance(row.get("oracle"), dict) else {}
+        cycles = oracle.get("cycles")
+        return (
+            "[APP:WS_TAB_OPENED:" in log
+            and "[APP:WS_TAB_CLOSED:" in log
+            and oracle.get("sameProcess") is True
+            and oracle.get("countRestored") is True
+            and oracle.get("drained") is True
+            and isinstance(cycles, int)
+            and not isinstance(cycles, bool)
+            and cycles > 0
+            and cycles == oracle.get("requested")
+        )
     if item == "workspace-close-reopen":
         oracle = row.get("oracle") if isinstance(row.get("oracle"), dict) else {}
         return (
@@ -516,7 +551,7 @@ def _resource_signature(row: dict[str, Any]) -> tuple:
     return (
         row.get("sampleId"), row.get("phase"), row.get("warmup"), row.get("activity"),
         row.get("resourcesComplete"), row.get("memoryComplete"),
-        row.get("measuredSwitchesCompleted"), row.get("settleSeconds"), row.get("offsetSec"),
+        row.get("measuredSwitchesCompleted"), row.get("tabCyclesCompleted", None), row.get("settleSeconds"), row.get("offsetSec"),
         row.get("rssBytes"), row.get("pssBytes"), row.get("fdCount"), row.get("threadCount"),
         row.get("watchCount"), row.get("gitChildren"),
         tuple(unread) if isinstance(unread, list) else unread,
@@ -588,7 +623,7 @@ def _parse_raw_stream(path: str, run_id: Any) -> list[dict[str, Any]] | None:
                 return None
             if kind in ("baseline", "final") and "offsetSec" not in row:
                 return None
-            if kind in ("endpoint", "terminal") and "settleSeconds" not in row:
+            if kind in ("endpoint", "tab-endpoint", "terminal") and "settleSeconds" not in row:
                 return None
             seen_sample.add(sample_id)
         elif kind == "interaction":
@@ -924,6 +959,67 @@ def _same_states(rows: list[Any]) -> bool:
     return bool(keys) and all(key is not None and key == keys[0] for key in keys)
 
 
+
+def _judge_tab_series(
+    samples: list[Any],
+    counts: dict[str, Any],
+    floor: dict[str, Any],
+    app_root: tuple[Any, Any, Any] | None,
+    untouched: dict[str, float],
+    reasons: list[str],
+) -> dict[str, Any]:
+    """The workspace tab series: a tab opened and closed again and again must leave memory,
+    fds, threads and watchers where they were. Judged per cycle, as switches are per switch."""
+    requested = counts.get("measuredTabCyclesRequested")
+    warmup = counts.get("warmupTabCyclesRequested")
+    for value, least in ((requested, floor["measuredTabCycles"]), (warmup, floor["warmupTabCycles"])):
+        if not isinstance(value, int) or isinstance(value, bool) or value < least:
+            _add(reasons, "undersized")
+            return {}
+    endpoints = [row for row in samples if isinstance(row, dict) and row.get("kind") == "tab-endpoint"]
+    if len(endpoints) != len(tab_batches(requested)) or len(endpoints) < 3:
+        _add(reasons, "undersized")
+        return {}
+    if not all(
+        _endpoint_ok(row, floor["settleSeconds"])
+        and row.get("phase") == "tab-measured"
+        and isinstance(row.get("tabCyclesCompleted"), int)
+        and not isinstance(row.get("tabCyclesCompleted"), bool)
+        and row["tabCyclesCompleted"] > 0
+        for row in endpoints
+    ):
+        _add(reasons, "missing-samples")
+        return {}
+    done = [row["tabCyclesCompleted"] for row in endpoints]
+    if done != sorted(set(done)) or done[-1] != requested:
+        _add(reasons, "noop-driver")
+        return {}
+    roots = {_root_key(row.get("root")) for row in endpoints}
+    if len(roots) != 1 or (app_root is not None and roots != {app_root}):
+        _add(reasons, "identity-mismatch")
+    if not _same_states(endpoints):
+        _add(reasons, "equivalent-state")
+        return {}
+    analysis: dict[str, Any] = {}
+    for key in ("rssBytes", "pssBytes"):
+        stats = _series_growth(endpoints, key, x="tabCyclesCompleted")
+        stats["trendSlopePerCycle"] = _trend_slope(endpoints, key, untouched, x="tabCyclesCompleted")
+        analysis[key] = stats
+        if stats["slopePerSwitch"] is None or not _positive(stats["firstThirdMedian"]):
+            _add(reasons, "missing-samples")
+        elif stats["growth"] > stats["growthLimit"]:
+            _add(reasons, "memory-growth")
+        elif stats["trendSlopePerCycle"] is None:
+            _add(reasons, "missing-samples")
+        elif stats["trendSlopePerCycle"] > TREND_BYTES_PER_SWITCH:
+            _add(reasons, "memory-trend")
+    for key, limit, code in (("fdCount", FD_GROWTH_MAX, "fd-growth"), ("threadCount", THREAD_GROWTH_MAX, "thread-growth"), ("watchCount", WATCHER_GROWTH_MAX, "watcher-growth")):
+        stats = _series_growth(endpoints, key, x="tabCyclesCompleted")
+        analysis[key] = stats
+        if stats["growth"] > limit:
+            _add(reasons, code)
+    return analysis
+
 def _window_rows(window: Any) -> list[dict[str, Any]]:
     if not isinstance(window, dict):
         return []
@@ -1145,6 +1241,9 @@ def evaluate_report(report: dict[str, Any]) -> dict[str, Any]:
         for row in post:
             _judge_retained(row, {}, floor["settleSeconds"], reasons)
     out["analysis"] = analysis
+    out["tabAnalysis"] = (
+        _judge_tab_series(samples, counts, floor, app_root, _heap_untouched(out), reasons) if status == "COMPLETED" else {}
+    )
 
     if profile == "long":
         windows = out.get("windows") if isinstance(out.get("windows"), dict) else {}
@@ -1223,6 +1322,7 @@ def evaluate_report(report: dict[str, Any]) -> dict[str, Any]:
         "history": switches_ok and all(isinstance(row, dict) and "[APP:GRAPH_LOADED:" in str(row.get("graphLine")) for row in measured),
         "tree": _item_ok("tree"),
         "workspace-close-reopen": _item_ok("workspace-close-reopen"),
+        "workspace-tab-cycle": _item_ok("workspace-tab-cycle"),
         "copy": _item_ok("copy"),
         "paste": _item_ok("paste"),
         "cancel": _item_ok("cancel"),
@@ -1350,6 +1450,10 @@ def assemble_report(args: argparse.Namespace) -> dict[str, Any]:
     measured = args.measured_switches if args.measured_switches is not None else floor["measuredSwitches"]
     warmup = args.warmup_switches if args.warmup_switches is not None else floor["warmupSwitches"]
     settle = args.settle_seconds if args.settle_seconds is not None else floor["settleSeconds"]
+    tab_measured = args.measured_tab_cycles if args.measured_tab_cycles is not None else floor["measuredTabCycles"]
+    tab_warmup = args.warmup_tab_cycles if args.warmup_tab_cycles is not None else floor["warmupTabCycles"]
+    if tab_measured < floor["measuredTabCycles"] or tab_warmup < floor["warmupTabCycles"]:
+        _add(reasons, "undersized")
     if not isinstance(measured, int) or isinstance(measured, bool) or measured < floor["measuredSwitches"]:
         _add(reasons, "undersized")
     if not isinstance(warmup, int) or isinstance(warmup, bool) or warmup < floor["warmupSwitches"]:
@@ -1449,6 +1553,8 @@ def assemble_report(args: argparse.Namespace) -> dict[str, Any]:
             "warmupSwitchesActual": None,
             "measuredSwitchesRequested": measured,
             "measuredSwitchesActual": None,
+            "warmupTabCyclesRequested": tab_warmup,
+            "measuredTabCyclesRequested": tab_measured,
             "reposExpected": floor["repos"],
             "reposChecked": 0,
             "checkpoints": 0,
@@ -1520,6 +1626,7 @@ def _flatten(snap: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
         "resourcesComplete": snap.get("resourcesComplete") is True,
         "memoryComplete": snap.get("memoryComplete") is True,
         "measuredSwitchesCompleted": meta["measured"],
+        "tabCyclesCompleted": meta.get("tabCycles"),
         "settleSeconds": meta["settle"],
         "equivalentView": meta["view"],
         "viewEvidence": meta["view_evidence"],
@@ -1942,6 +2049,19 @@ def _try_workspace_close_reopen(
         )
 
 
+
+def _tab_cycle(session: NativeSession, win: dict[str, Any], repo: str) -> dict[str, Any]:
+    """Open `repo` in a workspace tab of its own, let it load, and close it with Ctrl+W."""
+    opened = open_workspace_tab(session, win, repo)
+    wait_repo_loaded(session, repo, opened["start"], timeout=e2e_scaled(120.0))
+    closed = close_shown_tab(session, win, opened["tab"])
+    return {
+        "ok": opened["count"] == 2 and closed["count"] == 1 and closed["drained"] and is_same_process(session.app),
+        "countRestored": opened["count"] == 2 and closed["count"] == 1,
+        "drained": closed["drained"],
+        "log": f"{opened['openedLine']} | {opened['workspaceLine']} | {closed['closedLine']}",
+    }
+
 def _read_clip(session: NativeSession) -> dict[str, Any]:
     try:
         payload = session.read_clipboard(timeout=5)
@@ -2009,7 +2129,7 @@ def drive_product(report: dict[str, Any], out_dir: str) -> None:
         payload = emit({"kind": kind, **row})
         report["samples"].append(payload)
         report["sampleOrder"].append(payload["sampleId"])
-        if kind in ("endpoint", "terminal") and session is not None:
+        if kind in ("endpoint", "tab-endpoint", "terminal") and session is not None:
             heap = _capture_proc_snapshot(session.app, payload, out_dir)
             if heap is not None:
                 report["heapReserve"].append({"sampleId": payload["sampleId"], **heap})
@@ -2068,6 +2188,47 @@ def drive_product(report: dict[str, Any], out_dir: str) -> None:
                 for row in rows:
                     kind = "endpoint" if row is rows[-1] and phase == "measured" else "settle-point"
                     emit_sample(kind, row)
+        # The same repo opened again and again in a tab of its own, then closed, while the
+        # first tab keeps the whole workspace: each batch ends back on the canonical view.
+        tab_repo = by_name[names[1]]
+        tab_done = 0
+        cycles: list[dict[str, Any]] = []
+        requested_cycles = report["counts"]["warmupTabCyclesRequested"] + report["counts"]["measuredTabCyclesRequested"]
+        try:
+            for phase, total in (("tab-warmup", report["counts"]["warmupTabCyclesRequested"]), ("tab-measured", report["counts"]["measuredTabCyclesRequested"])):
+                for batch_index, size in enumerate(tab_batches(total)):
+                    print(f"[{phase}] tab cycles batch {batch_index + 1}", flush=True)
+                    for _ in range(size):
+                        _track_app_descendants(session, tracked_descendants)
+                        cycles.append(_tab_cycle(session, win, tab_repo))
+                        if phase == "tab-measured":
+                            tab_done += 1
+                    canonical_view = _equivalent_view(session, win, canonical)
+                    rows = _settle(session, _exclude_controllers(session), settle, {
+                        "batchIndex": batch_index,
+                        "warmup": phase == "tab-warmup",
+                        "phase": phase,
+                        "measured": measured_done,
+                        "tabCycles": tab_done,
+                        "view": _canonical_view(canonical_view["repo"]),
+                        "view_evidence": canonical_view,
+                    })
+                    for row in rows:
+                        emit_sample("tab-endpoint" if row is rows[-1] and phase == "tab-measured" else "settle-point", row)
+            note(
+                item="workspace-tab-cycle", ok=all(cycle["ok"] for cycle in cycles), input="click",
+                control="ws-tab-new", log=cycles[-1]["log"] if cycles else "",
+                oracle={
+                    "sameProcess": is_same_process(session.app),
+                    "countRestored": all(cycle["countRestored"] for cycle in cycles),
+                    "drained": all(cycle["drained"] for cycle in cycles),
+                    "cycles": len(cycles),
+                    "requested": requested_cycles,
+                },
+                root=_root_dict(session),
+            )
+        except (NativeBenchError, LeakError, OSError, subprocess.CalledProcessError) as exc:
+            note(item="workspace-tab-cycle", ok=False, input="click", control="ws-tab-new", log="", reason=str(exc), root=_root_dict(session))
         for _ in range(3):
             _track_app_descendants(session, tracked_descendants)
             _try_tree(session, win, report["interactions"], note)
@@ -2323,6 +2484,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--measured-switches", type=int, default=None)
     parser.add_argument("--warmup-switches", type=int, default=None)
     parser.add_argument("--settle-seconds", type=float, default=None)
+    parser.add_argument("--measured-tab-cycles", type=int, default=None)
+    parser.add_argument("--warmup-tab-cycles", type=int, default=None)
     parser.add_argument("--absolute-release-budget", action="store_true")
     return parser.parse_args(argv)
 
