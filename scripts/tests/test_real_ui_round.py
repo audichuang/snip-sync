@@ -137,6 +137,23 @@ class TestLogParsing(unittest.TestCase):
             rur.parse_latest_viewport(lines)
 
 
+class TestAppWindowTitle(unittest.TestCase):
+    def test_bare_title_matches(self):
+        self.assertTrue(rur.is_app_window_title("snip-sync"))
+
+    def test_tab_label_title_matches(self):
+        self.assertTrue(rur.is_app_window_title("project-a \u2014 snip-sync"))
+        self.assertTrue(rur.is_app_window_title("host \u25b8 name \u2014 snip-sync"))
+
+    def test_other_titles_do_not_match(self):
+        self.assertFalse(rur.is_app_window_title(""))
+        self.assertFalse(rur.is_app_window_title("snip-sync QA abc123"))
+        self.assertFalse(rur.is_app_window_title("project-a - snip-sync"))
+        self.assertFalse(rur.is_app_window_title("project-a snip-sync"))
+        self.assertFalse(rur.is_app_window_title("snip-syncx"))
+        self.assertFalse(rur.is_app_window_title(None))
+
+
 class TestPointCoordinateMath(unittest.TestCase):
     def test_calculate_point_coordinates_scale_1(self):
         # Data mirroring the real reference pending-action.json from the operator

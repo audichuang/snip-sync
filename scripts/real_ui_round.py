@@ -5,7 +5,7 @@ scripts/real_ui_round.py - Setup, orchestration, and teardown for real-UI accept
 Subcommands:
   prepare  - Set up isolated run directory, worktree, build .app, fixtures, snapshot config.
   launch   - Start desktop app with isolated environment for gate a or b.
-  resize   - Resize the round's main window ("snip-sync") to logical WxH via System Events.
+  resize   - Resize the round's main window (title "snip-sync", or "<tab label> — snip-sync") to logical WxH via System Events.
   point    - Compute logical window and screen coordinates from CTRL_BOUNDS probe for action.json.
   finish   - Quit app via Cmd+Q, verify termination, restore clipboard, check config, clean up.
 """
@@ -30,6 +30,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 REQUIRED_PROTOCOL_ANCESTOR = "f5247ab"
 APP_WINDOW_TITLE = "snip-sync"
+# The main window is titled "snip-sync" when no workspace tab is active, and
+# "<active tab label> \u2014 snip-sync" (em dash) once a tab is open.
+APP_WINDOW_TITLE_SEPARATOR = " \u2014 "
+
+
+def is_app_window_title(name: Any) -> bool:
+    """True for the main window title, with or without an active tab label."""
+    if not isinstance(name, str):
+        return False
+    return name == APP_WINDOW_TITLE or name.endswith(APP_WINDOW_TITLE_SEPARATOR + APP_WINDOW_TITLE)
+
 
 # Ensure ~/.cargo/bin is on PATH if present
 cargo_bin_dir = str(Path.home() / ".cargo" / "bin")
@@ -1081,7 +1092,7 @@ def cmd_resize(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     # Query window info
     helper_bin = run_dir / "window-info"
     info = sys_ops.get_window_info(pid, helper_binary=helper_bin)
-    matching_windows = [w for w in info.get("windows", []) if w.get("kCGWindowName") == APP_WINDOW_TITLE]
+    matching_windows = [w for w in info.get("windows", []) if is_app_window_title(w.get("kCGWindowName"))]
 
     if not matching_windows:
         print(f"ERROR: Window titled '{APP_WINDOW_TITLE}' not found for PID {pid}.", file=sys.stderr)
@@ -1105,7 +1116,7 @@ def cmd_resize(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     target_win_h = height + int(round(titlebar))
 
     print(f"Resizing '{APP_WINDOW_TITLE}' (PID {pid}) to logical content {width}x{height} (window: {target_win_w}x{target_win_h})...")
-    script = f'tell application "System Events" to tell first application process whose unix id is {pid}\nset size of window "{APP_WINDOW_TITLE}" to {{{target_win_w}, {target_win_h}}}\nend tell'
+    script = f'tell application "System Events" to tell first application process whose unix id is {pid}\nset size of (first window whose (name is "{APP_WINDOW_TITLE}" or name ends with "{APP_WINDOW_TITLE_SEPARATOR}{APP_WINDOW_TITLE}")) to {{{target_win_w}, {target_win_h}}}\nend tell'
     sys_ops.run_applescript(script)
 
     # Bounded wait for latest VIEWPORT matching expected physical size
@@ -1162,7 +1173,7 @@ def cmd_point(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_
 
     helper_bin = run_dir / "window-info"
     info = sys_ops.get_window_info(pid, helper_binary=helper_bin)
-    matching_windows = [w for w in info.get("windows", []) if w.get("kCGWindowName") == APP_WINDOW_TITLE]
+    matching_windows = [w for w in info.get("windows", []) if is_app_window_title(w.get("kCGWindowName"))]
 
     if not matching_windows:
         print(f"ERROR: Window titled '{APP_WINDOW_TITLE}' not found for PID {pid}.", file=sys.stderr)

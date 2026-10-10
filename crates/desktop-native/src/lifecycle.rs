@@ -100,6 +100,21 @@ impl GitLoad {
 		}
 	}
 
+	/// What one workspace tab's drain waits on besides its owned jobs.
+	///
+	/// Every Git child a tab starts runs inside one of its owned jobs, and
+	/// `gitrun` reaps the child and frees its slot before that job's future
+	/// ends, so the tab's own Git work is its job list. Only a leaked slot is
+	/// read process-wide: it lowers the budget every tab shares. Quit still
+	/// waits on [`GitLoad::current`].
+	pub fn own_tab() -> Self {
+		Self {
+			in_flight: 0,
+			queued: 0,
+			leaked: snip_core::gitrun::leaked_slots(),
+		}
+	}
+
 	pub fn idle() -> Self {
 		Self {
 			in_flight: 0,
@@ -179,6 +194,14 @@ impl Lifecycle {
 
 	pub fn is_draining(&self) -> bool {
 		matches!(self.phase, Phase::Draining { .. })
+	}
+
+	/// The intent the running drain finishes into.
+	pub fn pending_intent(&self) -> Option<&Intent> {
+		match &self.phase {
+			Phase::Draining { intent, .. } => Some(intent),
+			Phase::Idle => None,
+		}
 	}
 
 	pub fn intent_name(&self) -> &'static str {
@@ -526,5 +549,40 @@ mod tests {
 		);
 		assert!(!blocked.contains("phase=drained"));
 		assert!(blocked.contains("reason=timeout"));
+	}
+
+	/// A tab's close ignores another tab's Git child in the shared budget;
+	/// a leaked slot still fails it.
+	#[test]
+	fn a_tab_drain_ignores_git_in_flight_but_not_a_leak() {
+		let now = Instant::now();
+		let busy = GitLoad {
+			in_flight: 1,
+			queued: 1,
+			leaked: 0,
+		};
+		let mut shared = fresh();
+		shared.request(Intent::CloseWorkspace, now);
+		assert_eq!(shared.poll_at(now, busy), Step::Draining);
+		let mut own = fresh();
+		own.request(Intent::CloseWorkspace, now);
+		let tab = GitLoad {
+			in_flight: 0,
+			queued: 0,
+			..busy
+		};
+		assert_eq!(own.poll_at(now, tab), Step::Ready(Intent::CloseWorkspace));
+		let mut leaked = fresh();
+		leaked.request(Intent::CloseWorkspace, now);
+		let tab_leaked = GitLoad { leaked: 1, ..tab };
+		assert_eq!(
+			leaked.poll_at(now, tab_leaked),
+			Step::Failed {
+				intent: Intent::CloseWorkspace,
+				reason: "leaked"
+			}
+		);
+		assert_eq!(GitLoad::own_tab().in_flight, 0);
+		assert_eq!(GitLoad::own_tab().queued, 0);
 	}
 }
