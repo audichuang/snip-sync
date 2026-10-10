@@ -4661,8 +4661,10 @@ fn changes_group_all_repos(theme: &str) {
 	);
 	let wid = find_wid(app.pid);
 	key(&wid, "Escape");
+	// 720 for the workbench under the 34 px workspace tab bar: the last
+	// Changes row sits at the bottom of the list.
 	let st = Command::new("xdotool")
-		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.args(["windowsize", "--sync", &wid, "1080", "754"])
 		.status()
 		.unwrap();
 	assert!(st.success());
@@ -6484,4 +6486,195 @@ fn absent_id(bounds: &Bounds, id: &str) {
 		assert!(Instant::now() < deadline, "{id} must not be drawn");
 		std::thread::sleep(Duration::from_millis(40));
 	}
+}
+
+/// Workspace tabs: Ctrl+C and Ctrl+V act on the tab that was just clicked
+/// and on no other. The first Ctrl+C after clicking tab A exports A's
+/// selection only; the first Ctrl+V after clicking tab B opens the paste
+/// preview in B only (a background tab's log lines carry ` ws_tab=`).
+#[test]
+fn native_workspace_tabs_copy_and_paste_hit_only_the_clicked_tab() {
+	if std::env::var_os("DISPLAY").is_none() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but no X11 DISPLAY is available"
+		);
+		return;
+	}
+	if Command::new("xdotool").arg("--version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xdotool is not available"
+		);
+		return;
+	}
+	if Command::new("xclip").arg("-version").output().is_err() {
+		assert!(
+			std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none(),
+			"SNIP_REQUIRE_ALL_TESTS is set but xclip is not available"
+		);
+		return;
+	}
+	let _gui = gui_lock();
+
+	let tmp = tempfile::tempdir().unwrap();
+	let make_repo = |name: &str, file: &str, body: &str| -> PathBuf {
+		let repo = tmp.path().join(name);
+		fs::create_dir_all(&repo).unwrap();
+		git_ok(&repo, &["init", "-q", "-b", "main"]);
+		git_ok(&repo, &["config", "user.name", "Tester"]);
+		git_ok(&repo, &["config", "user.email", "test@example.com"]);
+		fs::write(repo.join(file), body).unwrap();
+		git_ok(&repo, &["add", "."]);
+		git_ok(&repo, &["commit", "-qm", "base"]);
+		repo
+	};
+	let ws_a = make_repo("tab-a", "only-in-a.txt", "A_TAB_BYTES\n");
+	let ws_b = make_repo("tab-b", "only-in-b.txt", "B_TAB_BYTES\n");
+	let dest = tmp.path().join("dest");
+	fs::create_dir_all(&dest).unwrap();
+
+	let bounds: Bounds = Arc::new(Mutex::new(HashMap::new()));
+	let viewport: Viewport = Arc::new(Mutex::new((0, 0)));
+	let mut app =
+		spawn_app(&ws_a, &dest, Some((bounds.clone(), viewport.clone())));
+	let rx = &app.rx;
+	let wait_for = |pattern: &str, timeout: Duration| -> Vec<String> {
+		lines_until(rx, pattern, timeout).unwrap_or_else(|e| panic!("{e}"))
+	};
+	wait_for("[APP:READY_REPOS: 1]", Duration::from_secs(8));
+	let wid = find_wid(app.pid);
+	let _ = Command::new("xdotool")
+		.args(["windowsize", "--sync", &wid, "1080", "720"])
+		.status();
+	let control = |id: &str| -> [i32; 4] {
+		let deadline = Instant::now() + scaled(Duration::from_secs(6));
+		loop {
+			if let Some(v) = bounds.lock().unwrap().get(id).copied() {
+				if v[2] > 0 && v[3] > 0 {
+					return v;
+				}
+			}
+			assert!(Instant::now() < deadline, "{id} not drawn");
+			std::thread::sleep(Duration::from_millis(40));
+		}
+	};
+	let click = |id: &str| {
+		std::thread::sleep(Duration::from_millis(200));
+		let v = control(id);
+		let (x, y) = (v[0] + v[2] / 2, v[1] + v[3] / 2);
+		let _ = Command::new("xdotool")
+			.args(["windowfocus", "--sync", &wid])
+			.status();
+		let st = Command::new("xdotool")
+			.args([
+				"mousemove",
+				"--window",
+				&wid,
+				&x.to_string(),
+				&y.to_string(),
+				"click",
+				"1",
+			])
+			.status()
+			.unwrap();
+		assert!(st.success(), "click {id}");
+	};
+
+	// Tab A: select its file in the Project view.
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	click("tree-row:only-in-a.txt");
+	wait_for("[APP:TREE_SELECTED: only-in-a.txt]", Duration::from_secs(3));
+
+	// Open workspace B by typed path: a new tab, shown (untagged lines).
+	click("btn-workspace-menu");
+	click("btn-open-workspace");
+	click("workspace-path-input");
+	let st = Command::new("xdotool")
+		.args([
+			"type",
+			"--delay",
+			"15",
+			"--window",
+			&wid,
+			&ws_b.to_string_lossy(),
+		])
+		.status()
+		.expect("xdotool type");
+	assert!(st.success(), "typing the workspace path failed");
+	click("btn-workspace-open-confirm");
+	let opened = wait_for("[APP:WS_TAB_OPENED:", Duration::from_secs(8));
+	let b_path = ws_b.to_string_lossy().to_string();
+	let b_open = if opened.iter().any(|l| {
+		l.contains("[APP:WORKSPACE: state=open path=") && l.contains(&b_path)
+	}) {
+		opened
+	} else {
+		wait_for(
+			&format!("[APP:WORKSPACE: state=open path={b_path}"),
+			Duration::from_secs(8),
+		)
+	};
+	let open_line = b_open
+		.iter()
+		.find(|l| {
+			l.contains("[APP:WORKSPACE: state=open path=")
+				&& l.contains(&b_path)
+		})
+		.unwrap_or_else(|| panic!("no open line for B: {b_open:?}"));
+	assert!(
+		!open_line.contains(" ws_tab="),
+		"B is shown, its lines carry no ws_tab: {open_line}"
+	);
+	wait_for("[APP:READY_REPOS: 1]", Duration::from_secs(12));
+	control("ws-tab:1");
+	click("rail-project");
+	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
+	click("tree-row:only-in-b.txt");
+	wait_for("[APP:TREE_SELECTED: only-in-b.txt]", Duration::from_secs(3));
+
+	// Click tab A, then the very first Ctrl+C copies from A only.
+	click("ws-tab:0");
+	let active = wait_for("[APP:WS_TAB_ACTIVE:", Duration::from_secs(4));
+	assert!(
+		active.last().unwrap().contains(" ix=0]"),
+		"expected tab 0 active: {active:?}"
+	);
+	let sentinel = "SENTINEL_BEFORE_TAB_COPY\n";
+	clip_set(sentinel);
+	key(&wid, "ctrl+c");
+	let copy = wait_for("[APP:COPY_DONE:", Duration::from_secs(6));
+	assert!(
+		copy.iter().all(|l| !l.contains(" ws_tab=")),
+		"copy lines came from a background tab: {copy:?}"
+	);
+	let copied = clip_get();
+	assert!(copied.contains("only-in-a.txt"), "{copied}");
+	assert!(copied.contains("A_TAB_BYTES"), "{copied}");
+	assert!(!copied.contains("only-in-b.txt"), "{copied}");
+	assert!(!copied.contains("B_TAB_BYTES"), "{copied}");
+
+	// Click tab B, then the very first Ctrl+V previews in B only.
+	click("ws-tab:1");
+	let active = wait_for("[APP:WS_TAB_ACTIVE:", Duration::from_secs(4));
+	assert!(
+		active.last().unwrap().contains(" ix=1]"),
+		"expected tab 1 active: {active:?}"
+	);
+	clip_set("// FILE: beta/pasted.txt\nhello\n");
+	key(&wid, "ctrl+v");
+	let paste = wait_for("[APP:PASTE_PREVIEW:", Duration::from_secs(6));
+	assert!(
+		paste
+			.iter()
+			.all(|l| !(l.contains("[APP:PASTE_") && l.contains(" ws_tab="))),
+		"a paste line came from a background tab: {paste:?}"
+	);
+	assert!(
+		!paste.last().unwrap().contains(" ws_tab="),
+		"paste preview was not shown by the active tab: {paste:?}"
+	);
+
+	quit_cleanly(&mut app, &wid);
 }

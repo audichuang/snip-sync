@@ -65,6 +65,8 @@ python3 scripts/real_ui_round.py point <控制項 ID> --run "$RUN"      # 第 3 
 python3 scripts/real_ui_round.py finish --run "$RUN"                # Cmd+Q、exit code、殘留、剪貼簿還原、真實設定比對（I-config）、移除 worktree
 ```
 
+視窗標題：主視窗的標題是 `snip-sync`；開了工作區分頁後，標題會變成 `<目前分頁的標籤> — snip-sync`（中間是 em dash）。腳本與 AppleScript 都以「等於 `snip-sync` 或以 ` — snip-sync` 結尾」比對（見 `is_app_window_title`），不要用完全相等的字串找視窗。
+
 `prepare` 發現殘留時拒絕開跑並列出來；`--clean-leftovers` 只清能證明屬於先前回合的東西。腳本做不到的步驟照下面的手動流程做，並在證據裡寫明。下面的手動流程也是腳本的規格。
 
 1. 向派工的人確認受測 SHA。沒有另外指定時，用 `origin/develop`。
@@ -383,7 +385,7 @@ C1 的 message 是 `多行中文`、空行、`第二段`。C2 改 `common.txt`�
 
 預設單檔上限是 500 KiB（`Settings::max_file_size_kb`）。`large.txt` 是 1,360,000 byte，複製時應被略過。
 
-目的地就是目前選取的 repo（`current_restore_destination`：有選 repo 取它的 root，沒有 repo 取工作區根目錄）。`commits-dst-*`、`nonutf8-dst` 各自用 `btn-workspace-menu` → `btn-open-workspace`，輸入路徑後按 `btn-workspace-open-confirm` 開啟，等 `[APP:WORKSPACE: state=open path=<該路徑> ...]` 與 `[APP:READY_REPOS: 1]`。`repo04` 是開 `ws-dst` 後點 `pick-repo:repo04`。`nongit-dst` 開啟後 `READY_REPOS` 是 0，目的地是工作區根目錄。`PASTE_PREVIEW` 的 `dest=` 必須等於這個路徑。
+目的地就是目前選取的 repo（`current_restore_destination`：有選 repo 取它的 root，沒有 repo 取工作區根目錄）。`commits-dst-*`、`nonutf8-dst` 各自用 `btn-workspace-menu` → `btn-open-workspace`，輸入路徑後按 `btn-workspace-open-confirm` 開啟（每個工作區開在自己的工作區分頁，已經開著就切過去；貼上作用在目前的分頁），等 `[APP:WORKSPACE: state=open path=<該路徑> ...]` 與 `[APP:READY_REPOS: 1]`。`repo04` 是開 `ws-dst` 後點 `pick-repo:repo04`。`nongit-dst` 開啟後 `READY_REPOS` 是 0，目的地是工作區根目錄。`PASTE_PREVIEW` 的 `dest=` 必須等於這個路徑。
 
 複製 commit 的來源是先開 `commits-src`（或該格指定的來源）工作區，`rail-log`，選 commit，`btn-copy-commits`，等 `COPY_COMMITS_DONE`，再換工作區貼上。
 
@@ -433,7 +435,7 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T36 | `perf15`、全部 repo。1080×752、1080×720、900×600 三種尺寸，各分 hash 欄關（預設）與開（`btn-log-more` → `log-more:hash`，日誌 `[APP:LOG_VIEW: hash]`）兩種，各看前 50 列。先從任一 `commit-row:` 的 `w÷scale` 抄下列表寬，1080 應約 574、900 應約 433；偏差超過 10px 時寫下實際值並說明側欄狀態 | 每列的 subject 至少有 1 個可辨識字元；被截斷時結尾是省略號，hover 可看到完整 subject（點擊工具沒有單純 hover 時，用 `real_ui_round.py point <commit-row ID> --hover 2` 把游標移到列中央停留，不點擊，再截圖）。只有右側詳情有 message、列上是空白，就是 `fail`。各狀態的預期：1080、hash 關：ref 標籤未被捨棄（寬度 ≥ min(自然寬度, 80)，短的 ref 如 `main` 會比 80px 窄）、subject 至少 160px，兩者同時可見；1080、hash 開：graph 欄寬超過 64px 時標籤被捨棄；64px 以下時標籤保留，寬度為 min(自然寬度, 80)（欄寬本身上限 72px），兩種都算對，subject 至少 160px；900、hash 關：標籤依設計一律捨棄（與 graph 欄寬無關，#59 的 `a_narrow_list_squeezes_date_then_author_after_the_gutter` 也是 `labels == 0`），subject 至少 160px；900、hash 開：graph 欄寬 72px 時 subject 約 97px（#59 已記錄的下限），欄較窄時會更寬（例如 40px 欄約 129px），數值不當作判準，只要有可辨識前綴就算 `pass`，空白是 `fail`。graph 欄與 subject 儲存格、ref 標籤都沒有 probe（`log-gutter:` 只是 debug selector，不進 `CTRL_BOUNDS`），所以寬度只能從截圖量：graph 欄寬是列的左緣到 subject 文字起點的距離，再減 8px 間距。`collapse:<key>` 的位置是節點所在車道，不是欄的右緣，不能拿來算欄寬。graph 欄寬、subject 寬度與標籤有無量測後寫進 `screen_text`。文字 oracle 見第 4 節 |
 | T37 | `btn-repo-selector` 實際切換 100 次，涵蓋 15 個 repo（`pick-repo:<名稱>`，名稱從 `CTRL_BOUNDS` 讀） | 100 次都有新的選取日誌；最後停在指定的 repo；程序還在。耗時含觀察，不當回應時間 |
 | T38 | 沿用 [memory-measurement-protocol.md](memory-measurement-protocol.md) 的取樣時才記 RSS | 本規程不判記憶體。這格固定 `not-run`，原因寫「改走記憶體規程」 |
-| T39 | Cmd+Shift+W 關掉，再 Cmd+Shift+O 打開一個 repo | 關閉後出現 `[APP:WORKSPACE: state=closed generation=N]`；重開後出現 `[APP:WORKSPACE: state=open path=<該 repo> generation=N+1]`，接著 `[APP:READY_REPOS: 1]`；前後剪貼簿 SHA-256 相同 |
+| T39 | Cmd+Shift+W 關掉，再 Cmd+Shift+O 打開一個 repo | 關閉後出現 `[APP:WORKSPACE: state=closed generation=N]` 與 `[APP:WS_TAB_CLOSED: id=<id> count=0]`，視窗只剩分頁列的「+」；Cmd+Shift+O 先開一個空的工作區分頁（`WS_TAB_OPENED`、`WS_TAB_ACTIVE`）再開資料夾對話框；重開後出現 `[APP:WORKSPACE: state=open path=<該 repo> generation=M]`（M 是新分頁自己的計數，不和 N 比），接著 `[APP:READY_REPOS: 1]`；前後剪貼簿 SHA-256 相同 |
 | T40 | Cmd+Q | 程序消失，exit code 0；這輪出現過的 git 子程序都不在 |
 
 T03 與 T18 的身份規則：`action.json` 要寫兩欄，尾段路徑相同的相異 ID 數，以及畫面上同路徑的列數。相異 ID 數要等於列數；而且每次點擊後 `PASTE_TOGGLED` 的 idx 等於所點 ID 的 `ix` 段。任一條不成立：`fail`，證據欄寫 `identity-fail`。

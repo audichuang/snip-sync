@@ -132,6 +132,14 @@ def _flat_heap(span: int = 50 * MIB, resident: int = 26 * MIB) -> list[dict]:
     return [{"sampleId": sid, "heapVmaBytes": span, "heapRssBytes": resident} for sid in ids]
 
 
+# Controls drawn once "+" adds an empty tab with its workspace menu open.
+MENU_AFTER_NEW_TAB = [
+    "[APP:CTRL_BOUNDS: id=btn-open-workspace x=10 y=50 w=20 h=20]",
+    "[APP:CTRL_BOUNDS: id=workspace-path-input x=10 y=70 w=100 h=20]",
+    "[APP:CTRL_BOUNDS: id=btn-workspace-open-confirm x=10 y=90 w=20 h=20]",
+]
+
+
 def stable_interactions() -> list[dict]:
     return [
         {"item": "tree", "ok": True, "input": "click", "log": "[APP:TREE_FILE_SELECTED: README.md]", "root": dict(ROOT)},
@@ -1599,10 +1607,6 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
             s.lines = [
                 "[APP:CTRL_BOUNDS: id=btn-workspace-menu x=10 y=10 w=20 h=20]",
                 "[APP:CTRL_BOUNDS: id=btn-close-workspace x=10 y=30 w=20 h=20]",
-                "[APP:CTRL_BOUNDS: id=btn-open-workspace x=10 y=50 w=20 h=20]",
-                "[APP:CTRL_BOUNDS: id=workspace-path-input x=10 y=70 w=100 h=20]",
-                "[APP:CTRL_BOUNDS: id=btn-workspace-open-confirm x=10 y=90 w=20 h=20]",
-                "[APP:CTRL_BOUNDS: id=workspace-closed x=10 y=110 w=100 h=100]",
             ]
             s.texts = mock.MagicMock(side_effect=lambda start=0: list(s.lines[start:]))
             s.app = {"pid": 1000, "starttime": 50, "exe": "/bin/snip", "comm": "snip"}
@@ -1617,7 +1621,10 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
                     s.lines.extend([
                         "[APP:WORKSPACE: state=closed generation=1]",
                         "phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0 generation=1",
+                        "[APP:CTRL_BOUNDS: id=ws-tab-new x=10 y=110 w=20 h=20]",
                     ])
+                elif tuple(bounds) == (10, 110, 20, 20):  # ws-tab-new: menu opens in the new tab
+                    s.lines.extend(MENU_AFTER_NEW_TAB)
                 elif tuple(bounds) == (10, 90, 20, 20):  # btn-workspace-open-confirm
                     s.lines.extend([
                         "[APP:WORKSPACE: state=open path=/tmp/ws generation=2]",
@@ -1655,6 +1662,10 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
             self.assertEqual(len(note_calls), 1)
             self.assertTrue(note_calls[0]["ok"])
             self.assertTrue(note_calls[0]["oracle"]["drained"])
+            # The reopen menu exists only after "+" is clicked, and in that order.
+            clicked = [tuple(c.args[1]) for c in session_b.click.call_args_list]
+            self.assertIn((10, 110, 20, 20), clicked)
+            self.assertLess(clicked.index((10, 110, 20, 20)), clicked.index((10, 50, 20, 20)))
 
     def test_close_reopen_rejects_stale_startup_ready_repos(self) -> None:
         session = mock.MagicMock()
@@ -1668,10 +1679,6 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
             "[APP:READY_REPOS: 15]",
             "[APP:CTRL_BOUNDS: id=btn-workspace-menu x=10 y=10 w=20 h=20]",
             "[APP:CTRL_BOUNDS: id=btn-close-workspace x=10 y=30 w=20 h=20]",
-            "[APP:CTRL_BOUNDS: id=btn-open-workspace x=10 y=50 w=20 h=20]",
-            "[APP:CTRL_BOUNDS: id=workspace-path-input x=10 y=70 w=100 h=20]",
-            "[APP:CTRL_BOUNDS: id=btn-workspace-open-confirm x=10 y=90 w=20 h=20]",
-            "[APP:CTRL_BOUNDS: id=workspace-closed x=10 y=110 w=100 h=100]",
         ]
         session.lines = list(startup_lines)
         session.texts = mock.MagicMock(side_effect=lambda start=0: list(session.lines[start:]))
@@ -1687,7 +1694,10 @@ class TestGateCorrectionsAndRegressions(unittest.TestCase):
                 session.lines.extend([
                     "[APP:WORKSPACE: state=closed generation=1]",
                     "phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0 generation=1",
+                    "[APP:CTRL_BOUNDS: id=ws-tab-new x=10 y=110 w=20 h=20]",
                 ])
+            elif tuple(bounds) == (10, 110, 20, 20):  # ws-tab-new
+                session.lines.extend(MENU_AFTER_NEW_TAB)
             elif tuple(bounds) == (10, 90, 20, 20):  # btn-workspace-open-confirm
                 # Fresh state=open, but NO fresh READY_REPOS line!
                 session.lines.extend([

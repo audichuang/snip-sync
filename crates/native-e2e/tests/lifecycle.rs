@@ -745,7 +745,10 @@ fn close_reopen_same_pid_discards_stale_preview_and_keeps_clipboard() {
 		same_proc(app.pid, &app.starttime),
 		"close exited the process"
 	);
-	let _ = control("workspace-closed");
+	let _ = control("ws-tab-new");
+	// The window with no tab is the bar alone, too plain to prove a
+	// drawn frame: the screenshot shows the new empty tab's menu.
+	new_tab(&wid);
 	std::thread::sleep(Duration::from_millis(700));
 	capture(&wid, &shots().join("04-workspace-closed.png"));
 	snapshot(app.pid, &app.starttime);
@@ -1128,7 +1131,10 @@ fn close_cancels_in_flight_copy_without_writing_clipboard() {
 		same_proc(app.pid, &app.starttime),
 		"close exited the process"
 	);
-	let _ = control("workspace-closed");
+	let _ = control("ws-tab-new");
+	// The window with no tab is the bar alone, too plain to prove a
+	// drawn frame: the screenshot shows the new empty tab's menu.
+	new_tab(&wid);
 	std::thread::sleep(Duration::from_millis(700));
 	capture(
 		&wid,
@@ -1269,6 +1275,13 @@ fn open_workspace(wid: &str, path: &Path) {
 	click(wid, "btn-workspace-open-confirm");
 }
 
+/// After the last tab closes, only the tab bar's "+" is drawn. Clicking it
+/// adds an empty tab whose workspace menu is already open.
+fn new_tab(wid: &str) {
+	click(wid, "ws-tab-new");
+	let _ = control("btn-open-workspace");
+}
+
 fn is_drained(line: &str, intent: &str) -> bool {
 	line.contains(&format!("phase=drained intent={intent}"))
 		&& line.contains("jobs=0")
@@ -1378,9 +1391,10 @@ fn close_waits_for_a_held_tree_read_and_reopen_ignores_it() {
 		position(&closed, "[APP:TREE_PAGE:").is_none(),
 		"the stale tree read was applied during close: {closed:?}"
 	);
-	let _ = control("workspace-closed");
+	let _ = control("ws-tab-new");
 
 	// Same path, same process: only the new read may fill the tree.
+	new_tab(&wid);
 	open_workspace(&wid, &ws);
 	let opened = lines_until_all(
 		&app.rx,
@@ -1775,10 +1789,11 @@ fn quit_cancels_in_flight_commit_copy_without_writing_clipboard() {
 	assert_eq!(clip_get(), sentinel, "clipboard changed after quit");
 }
 
-/// A confirmed write is never interrupted: switching workspace is refused
-/// with a reason until the write has finished and reported its result.
+/// A confirmed write is never interrupted: opening another workspace
+/// meanwhile opens it in a new workspace tab, and the writing tab, now in
+/// the background, finishes its write without draining.
 #[test]
-fn open_workspace_is_refused_while_apply_writes() {
+fn opening_a_workspace_during_a_write_uses_a_new_tab() {
 	let _lock = DisplayLock::acquire();
 	if !require_display_tools() {
 		return;
@@ -1826,29 +1841,30 @@ fn open_workspace_is_refused_while_apply_writes() {
 
 	click(&wid, "btn-workspace-menu");
 	open_workspace(&wid, &ws_b);
-	let refused = lines_until(
+	let opened = lines_until(
 		&app.rx,
-		"phase=refused intent=open-workspace reason=applying",
+		"[APP:WS_TAB_OPENED: id=2 count=2]",
 		Duration::from_secs(5),
 	);
 	assert!(
-		position(&refused, "[APP:PASTE_DONE:").is_none(),
-		"the write had already finished; the refusal proves nothing: {refused:?}"
-	);
-	assert!(
-		position(&refused, "[APP:PASTE_BUSY: refused=open-workspace]")
-			.is_some(),
-		"the refusal carried no reason: {refused:?}"
+		position(&opened, "[APP:PASTE_DONE:").is_none(),
+		"the write had already finished; the open proves nothing: {opened:?}"
 	);
 
 	let done =
 		lines_until(&app.rx, "[APP:PASTE_DONE:", Duration::from_secs(10));
+	let done_line = done.last().unwrap();
 	assert!(
-		done.iter().chain(&refused).all(|l| {
-			!l.contains("[APP:WORKSPACE: state=")
-				&& !l.contains("phase=draining")
+		done_line.contains(" ws_tab=1]"),
+		"the write finished in the background tab: {done_line}"
+	);
+	assert!(
+		done.iter().chain(&opened).all(|l| {
+			!(l.contains("ws_tab=1")
+				&& (l.contains("[APP:WORKSPACE: state=")
+					|| l.contains("phase=draining")))
 		}),
-		"the workspace changed during a confirmed write: {refused:?} {done:?}"
+		"the writing tab changed during its write: {opened:?} {done:?}"
 	);
 	assert_eq!(
 		fs::read(dest.join("note.txt")).expect("apply wrote note.txt"),
@@ -2347,13 +2363,14 @@ fn commit_preview_cancel_and_close_leave_the_destination_untouched() {
 	);
 	assert!(fx.hold.is_file());
 	wait_gone(child.0, &child.1, "paste git child after close");
-	let _ = control("workspace-closed");
+	let _ = control("ws-tab-new");
 	absent("btn-apply");
 	assert_eq!(repo_state(&fx.git_bin, &dest_repo), before);
 	assert_eq!(clip_get(), payload, "clipboard changed across close");
 
 	// Reopened in the same process: the dropped preview does not come back.
 	fs::remove_file(&fx.hold).unwrap();
+	new_tab(&wid);
 	open_workspace(&wid, &fx.ws);
 	let opened = lines_until_all(
 		&app.rx,
@@ -2631,7 +2648,7 @@ fn failed_drain_recovers_and_allows_expand_preview_and_close() {
 		closed.iter().any(|l| is_drained(l, "close-workspace")),
 		"close did not report real drain after recovery: {closed:?}"
 	);
-	let _ = control("workspace-closed");
+	let _ = control("ws-tab-new");
 
 	quit_cleanly(&mut app, &wid);
 }
@@ -2747,7 +2764,7 @@ fn export_refuses_when_source_mutated_after_plan_ready() {
 		closed.iter().any(|l| is_drained(l, "close-workspace")),
 		"close did not report real drain: {closed:?}"
 	);
-	let _ = control("workspace-closed");
+	let _ = control("ws-tab-new");
 
 	quit_cleanly(&mut app, &wid);
 }

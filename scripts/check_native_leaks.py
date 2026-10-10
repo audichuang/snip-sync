@@ -1859,7 +1859,8 @@ def _try_workspace_close_reopen(
         )
         fresh_close_texts = session.texts(cursor_close)
         drained_log = any(is_drained(l, "close-workspace") for l in fresh_close_texts)
-        _wait_for_control(session, "workspace-closed", timeout=6.0)
+        # Closing the last tab leaves only the tab bar's "+" drawn.
+        _wait_for_control(session, "ws-tab-new", timeout=6.0)
 
         same_proc_closed = is_same_process(session.app)
         clip_closed = _read_clip(session)
@@ -1872,12 +1873,13 @@ def _try_workspace_close_reopen(
         living_app_descendants = [ident for ident in tracked_descendants.values() if is_same_process(ident)]
         no_surviving_descendants_closed = (len(living_app_descendants) == 0)
 
+        # "+" opens an empty tab whose workspace menu is already open. Do not
+        # click btn-workspace-menu here: it would close that menu again.
+        _click_control_when_ready(session, win, "ws-tab-new", timeout=6.0)
+
         # Record cursor before triggering reopen click
         cursor_open = len(session.lines)
 
-        bounds = parse_bounds(session.texts())
-        if "btn-open-workspace" not in bounds and "btn-workspace-menu" in bounds:
-            session.click(win, bounds["btn-workspace-menu"])
         _click_control_when_ready(session, win, "btn-open-workspace", timeout=6.0)
         _click_control_when_ready(session, win, "workspace-path-input", timeout=6.0)
         session.focus(win["wid"])

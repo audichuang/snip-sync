@@ -48,6 +48,10 @@ pub(crate) fn remember_recent(
 	host: &str,
 	path: &str,
 ) {
+	// Other workspace tabs saved since this copy was read.
+	if crate::recent::config_dir().is_some() {
+		*list = load_recent();
+	}
 	list.retain(|r| !(r.host == host && r.path == path));
 	list.insert(
 		0,
@@ -604,28 +608,33 @@ impl WorkbenchModel {
 		self.pending_focus = Some(self.remote_path_input.read(cx).handle());
 		cx.notify();
 		let bg = cx.background_executor().clone();
+		let tab = self.ws_tab;
 		cx.spawn(async move |this, cx| {
-			let result = bg
-				.spawn(async move {
-					let ws = client.open_workspace(&path)?;
-					let (entries, _) = client.list_dir(&ws.id, "", None)?;
-					let folders = entries
-						.into_iter()
-						.filter(|e| {
-							e.directory && e.utf8 && !e.name.starts_with('.')
+			crate::tabs::tagged(tab, async move {
+				let result = bg
+					.spawn(async move {
+						let ws = client.open_workspace(&path)?;
+						let (entries, _) = client.list_dir(&ws.id, "", None)?;
+						let folders = entries
+							.into_iter()
+							.filter(|e| {
+								e.directory
+									&& e.utf8 && !e.name.starts_with('.')
+							})
+							.map(|e| e.name)
+							.collect();
+						Ok(FolderListing {
+							path: ws.id,
+							folders,
 						})
-						.map(|e| e.name)
-						.collect();
-					Ok(FolderListing {
-						path: ws.id,
-						folders,
 					})
-				})
-				.await
-				.map_err(describe);
-			let _ = this.update(cx, |this, cx| {
-				this.remote_listing_landed(seq, result, cx);
-			});
+					.await
+					.map_err(describe);
+				let _ = this.update(cx, |this, cx| {
+					this.remote_listing_landed(seq, result, cx);
+				});
+			})
+			.await
 		})
 		.detach();
 	}
@@ -731,52 +740,59 @@ impl WorkbenchModel {
 		let open_delay = self.e2e_remote_open_delay;
 		cx.notify();
 		let bg = cx.background_executor().clone();
+		let tab = self.ws_tab;
 		cx.spawn(async move |this, cx| {
-			// Tests hold the open at the test clock so a user action can
-			// land while it is in flight.
-			#[cfg(test)]
-			if let Some(delay) = open_delay {
-				cx.background_executor().timer(delay).await;
-			}
-			let probe = host.clone();
-			let result = bg
-				.spawn(async move {
-					Client::new(probe, device_name())
-						.open_workspace(path.trim())
-						.map_err(describe)
-				})
-				.await;
-			let _ = this.update(cx, |this, cx| {
-				this.remote.busy = false;
-				if this.remote.open_seq != open_seq {
-					// The user opened a local workspace, closed the
-					// workspace or started another remote open meanwhile:
-					// neither the workspace nor the status bar moves.
-					app_log!(
-						"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
-						this.remote.open_seq
-					);
-					return;
+			crate::tabs::tagged(tab, async move {
+				// Tests hold the open at the test clock so a user action can
+				// land while it is in flight.
+				#[cfg(test)]
+				if let Some(delay) = open_delay {
+					cx.background_executor().timer(delay).await;
 				}
-				match result {
-					Ok(ws) => {
-						this.workspace_menu = false;
-						this.request_user_close(
-							lifecycle::Intent::OpenRemoteWorkspace(Box::new((
-								host, ws,
-							))),
-							cx,
+				let probe = host.clone();
+				let result = bg
+					.spawn(async move {
+						Client::new(probe, device_name())
+							.open_workspace(path.trim())
+							.map_err(describe)
+					})
+					.await;
+				let _ = this.update(cx, |this, cx| {
+					this.remote.busy = false;
+					if this.remote.open_seq != open_seq {
+						// The user opened a local workspace, closed the
+						// workspace or started another remote open meanwhile:
+						// neither the workspace nor the status bar moves.
+						app_log!(
+							"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
+							this.remote.open_seq
 						);
+						return;
 					}
-					Err(err) => {
-						app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
-						// Also on the status bar: a reconnect on launch runs
-						// with the menu closed.
-						this.set_status("remote_open_failed", [err.clone()]);
-						this.remote_note(false, err, cx);
+					match result {
+						Ok(ws) => {
+							this.workspace_menu = false;
+							this.route_open(
+								crate::tabs::OpenTarget::Remote(Box::new((
+									host, ws,
+								))),
+								cx,
+							);
+						}
+						Err(err) => {
+							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
+							// Also on the status bar: a reconnect on launch runs
+							// with the menu closed.
+							this.set_status(
+								"remote_open_failed",
+								[err.clone()],
+							);
+							this.remote_note(false, err, cx);
+						}
 					}
-				}
-			});
+				});
+			})
+			.await
 		})
 		.detach();
 	}

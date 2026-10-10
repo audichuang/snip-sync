@@ -97,10 +97,11 @@ pub(crate) fn run_isolated(exact_test_path: &str) -> bool {
 	}
 }
 
-/// Test-harness event line.
+/// Test-harness event line. A background workspace tab's lines carry its
+/// `ws_tab=<id>` ([`tabs::tag_line`]).
 macro_rules! app_log {
 	($($arg:tt)*) => {{
-		println!($($arg)*);
+		println!("{}", $crate::tabs::tag_line(format!($($arg)*)));
 		let _ = std::io::Write::flush(&mut std::io::stdout());
 	}};
 }
@@ -205,6 +206,7 @@ mod recent;
 pub mod remote;
 mod selector;
 pub mod syntax;
+pub mod tabs;
 mod text_input;
 pub mod theme;
 pub mod tree;
@@ -308,6 +310,18 @@ actions!(
 		HideToolWindow,
 		FocusEditor,
 		OpenTabMenu,
+		// Workspace tabs.
+		PrevWorkspaceTab,
+		NextWorkspaceTab,
+		WorkspaceTab1,
+		WorkspaceTab2,
+		WorkspaceTab3,
+		WorkspaceTab4,
+		WorkspaceTab5,
+		WorkspaceTab6,
+		WorkspaceTab7,
+		WorkspaceTab8,
+		WorkspaceTab9,
 	]
 );
 
@@ -896,7 +910,16 @@ pub struct WorkbenchModel {
 	/// Remote workspaces: ssh hosts and an open remote workspace.
 	pub remote: remote::MasterState,
 	pub remote_path_input: Entity<TextInput>,
+	/// The workspace tab this model is; None for a model that is the
+	/// window itself (tests).
+	pub ws_tab: Option<u32>,
+	/// Window height above the model: the tab bar.
+	pub top_inset: f32,
+	/// The control that had the keyboard when the tab was left.
+	pub resume_focus: Option<FocusHandle>,
 }
+
+impl gpui::EventEmitter<tabs::TabEvent> for WorkbenchModel {}
 
 /// Identity of a shown preview's text, as `reader.rs` compares it.
 pub(crate) fn preview_identity(p: &Preview) -> usize {
@@ -981,6 +1004,35 @@ impl WorkbenchModel {
 		mode: String,
 		cx: &mut Context<Self>,
 	) -> Self {
+		Self::build(workspace, restore_dir, mode, None, cx)
+	}
+
+	/// A workspace tab of [`tabs::TabsRoot`]; `probes` is the window's one
+	/// frame, so a tab switch reports the controls that left.
+	pub fn new_tab(
+		workspace: Option<PathBuf>,
+		restore_dir: Option<PathBuf>,
+		mode: String,
+		id: u32,
+		probes: Option<ui::Probes>,
+		cx: &mut Context<Self>,
+	) -> Self {
+		Self::build(workspace, restore_dir, mode, Some((id, probes)), cx)
+	}
+
+	fn build(
+		workspace: Option<PathBuf>,
+		restore_dir: Option<PathBuf>,
+		mode: String,
+		tab: Option<(u32, Option<ui::Probes>)>,
+		cx: &mut Context<Self>,
+	) -> Self {
+		let ws_tab = tab.as_ref().map(|t| t.0);
+		let top_inset = if tab.is_some() { tabs::TAB_BAR_H } else { 0. };
+		let probes = match tab {
+			Some((_, probes)) => probes,
+			None => ui::Probes::from_env(),
+		};
 		let loc = Locale::ZhTw;
 		let find_input = cx
 			.new(|cx| TextInput::new(i18n::t("find_placeholder", loc), 30, cx));
@@ -1150,10 +1202,13 @@ impl WorkbenchModel {
 		cx.on_release(|this, _| {
 			this.lifecycle.cancel_cancellable();
 			if e2e_on() {
-				app_log!(
-					"[APP:LIFECYCLE: phase=released reason=on_release jobs={}]",
-					this.lifecycle.unfinished()
-				);
+				// A closed tab is never the shown one again.
+				tabs::with_log_tab(this.ws_tab, || {
+					app_log!(
+						"[APP:LIFECYCLE: phase=released reason=on_release jobs={}]",
+						this.lifecycle.unfinished()
+					)
+				});
 			}
 		})
 		.detach();
@@ -1307,7 +1362,7 @@ impl WorkbenchModel {
 			dragging: None,
 			last_viewport: (0, 0),
 			viewport_h: 0.,
-			probes: ui::Probes::from_env(),
+			probes,
 			pending_focus: None,
 			focus_lost_guard: None,
 			e2e_read_delay: ui::e2e_read_delay(),
@@ -1346,6 +1401,9 @@ impl WorkbenchModel {
 				..Default::default()
 			},
 			remote_path_input,
+			ws_tab,
+			top_inset,
+			resume_focus: None,
 		};
 		if let Some(path) = workspace {
 			recent::remember(&mut model.recent_workspaces, &path);
@@ -1786,16 +1844,24 @@ impl WorkbenchModel {
 		let id = self.toast_seq;
 		app_log!("[APP:TOAST: ok={ok}]");
 		self.toast = Some((id, ok, msg));
+		let tab = self.ws_tab;
 		cx.spawn(async move |this, cx| {
-			cx.background_executor()
-				.timer(std::time::Duration::from_secs(if ok { 4 } else { 12 }))
-				.await;
-			let _ = this.update(cx, |model, cx| {
-				if model.toast.as_ref().is_some_and(|t| t.0 == id) {
-					model.toast = None;
-					cx.notify();
-				}
-			});
+			tabs::tagged(tab, async move {
+				cx.background_executor()
+					.timer(std::time::Duration::from_secs(if ok {
+						4
+					} else {
+						12
+					}))
+					.await;
+				let _ = this.update(cx, |model, cx| {
+					if model.toast.as_ref().is_some_and(|t| t.0 == id) {
+						model.toast = None;
+						cx.notify();
+					}
+				});
+			})
+			.await
 		})
 		.detach();
 	}
@@ -2036,26 +2102,32 @@ impl WorkbenchModel {
 			return;
 		}
 		self.watch_running = true;
-		cx.spawn(async move |this, cx| loop {
-			cx.background_executor()
-				.timer(std::time::Duration::from_millis(40))
-				.await;
-			let keep = this.update(cx, |model, cx| {
-				model.poll_paste(cx);
-				model.poll_lifecycle(cx);
-				if model.needs_watch() {
-					return true;
+		let tab = self.ws_tab;
+		cx.spawn(async move |this, cx| {
+			tabs::tagged(tab, async move {
+				loop {
+					cx.background_executor()
+						.timer(std::time::Duration::from_millis(40))
+						.await;
+					let keep = this.update(cx, |model, cx| {
+						model.poll_paste(cx);
+						model.poll_lifecycle(cx);
+						if model.needs_watch() {
+							return true;
+						}
+						model.watch_running = false;
+						if model.needs_watch() {
+							model.arm_watch(cx);
+						}
+						false
+					});
+					match keep {
+						Ok(true) => continue,
+						Ok(false) | Err(_) => break,
+					}
 				}
-				model.watch_running = false;
-				if model.needs_watch() {
-					model.arm_watch(cx);
-				}
-				false
-			});
-			match keep {
-				Ok(true) => continue,
-				Ok(false) | Err(_) => break,
-			}
+			})
+			.await
 		})
 		.detach();
 	}
@@ -2068,6 +2140,7 @@ impl WorkbenchModel {
 		fut: impl std::future::Future<Output = ()> + 'static,
 	) -> u64 {
 		let (id, flag) = self.lifecycle.register(kind, cancel);
+		let fut = tabs::tagged(self.ws_tab, fut);
 		let task = cx.foreground_executor().spawn(async move {
 			fut.await;
 			drop(flag);
@@ -2097,8 +2170,13 @@ impl WorkbenchModel {
 		}
 	}
 
-	/// Ctrl/Cmd-Q and the OS close button. Does not call `cx.quit`.
+	/// Ctrl/Cmd-Q and the OS close button. Does not call `cx.quit`. A tab
+	/// hands it to the root, which drains every tab.
 	pub fn begin_quit(&mut self, cx: &mut Context<Self>) {
+		if self.ws_tab.is_some() {
+			cx.emit(tabs::TabEvent::QuitRequested);
+			return;
+		}
 		if e2e_on() {
 			app_log!("[APP:QUIT: deferred]");
 		}
@@ -2121,8 +2199,15 @@ impl WorkbenchModel {
 			return;
 		}
 		if !self.workspace_open
+			&& !self.lifecycle.is_draining()
+			&& self.lifecycle.unfinished() == 0
 			&& matches!(intent, lifecycle::Intent::CloseWorkspace)
 		{
+			// An empty tab with no job has nothing to drain.
+			if self.ws_tab.is_some() {
+				self.paste.invalidate_job();
+				cx.emit(tabs::TabEvent::Closed);
+			}
 			return;
 		}
 		match self
@@ -2178,9 +2263,23 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// The Git load a drain into `intent` waits on: a tab's own close or
+	/// open waits for its own jobs only; Quit waits for every Git child.
+	fn drain_load(
+		&self,
+		intent: Option<&lifecycle::Intent>,
+	) -> lifecycle::GitLoad {
+		match intent {
+			Some(lifecycle::Intent::Quit) | None => {
+				lifecycle::GitLoad::current()
+			}
+			Some(_) => lifecycle::GitLoad::own_tab(),
+		}
+	}
+
 	fn poll_lifecycle(&mut self, cx: &mut Context<Self>) {
 		let now = std::time::Instant::now();
-		let git = lifecycle::GitLoad::current();
+		let git = self.drain_load(self.lifecycle.pending_intent());
 		match self.lifecycle.poll_at(now, git) {
 			lifecycle::Step::Idle | lifecycle::Step::Draining => {
 				if self.lifecycle.is_draining() {
@@ -2189,7 +2288,7 @@ impl WorkbenchModel {
 				}
 			}
 			lifecycle::Step::Ready(intent) => {
-				let git = lifecycle::GitLoad::current();
+				let git = self.drain_load(Some(&intent));
 				if self.lifecycle.unfinished() > 0 || !git.is_clear() {
 					self.lifecycle.resume(intent, now);
 					let intent = self.lifecycle.intent_name();
@@ -2205,35 +2304,40 @@ impl WorkbenchModel {
 				};
 				let name = intent.name();
 				self.emit_life("failed", name, Some(reason));
+				self.resume_after_drain(cx);
 				self.set_status(key, []);
-				self.preview_loading = false;
-				self.tree_cancel = None;
-				self.rev_tree_cancel = None;
-				self.tree_queue.clear();
-				self.tree_worker = self.tree_worker.wrapping_add(1);
-				self.tree_worker_alive = false;
-				if let Some(tree) = self.file_tree.as_mut() {
-					tree.clear_loading();
+				if self.ws_tab.is_some() {
+					cx.emit(tabs::TabEvent::DrainFailed);
 				}
-				self.resume_ws_tree(cx);
-				// The drain cancelled and outdated the open repo's reads, and
-				// the workspace stays open: fetch what never landed.
-				if let (Some(idx), Some(_)) =
-					(self.selected_repo_idx, self.repo())
-				{
-					if !self.changes_loaded {
-						self.select_repo_internal(idx, true, cx);
-						self.set_status(key, []);
-					} else if self.commits.is_empty()
-						&& self.history_error.is_none()
-					{
-						self.load_history(cx);
-					}
-				}
-				self.start_changes_queue(true, cx);
-				cx.notify();
 			}
 		}
+	}
+
+	/// A drain that did not finish cancelled and outdated the open repo's
+	/// reads and the workspace stays open: fetch what never landed. Also
+	/// run for a tab whose quit drained when the quit stopped elsewhere.
+	pub(crate) fn resume_after_drain(&mut self, cx: &mut Context<Self>) {
+		self.preview_loading = false;
+		self.tree_cancel = None;
+		self.rev_tree_cancel = None;
+		self.tree_queue.clear();
+		self.tree_worker = self.tree_worker.wrapping_add(1);
+		self.tree_worker_alive = false;
+		if let Some(tree) = self.file_tree.as_mut() {
+			tree.clear_loading();
+		}
+		self.resume_ws_tree(cx);
+		// The drain cancelled and outdated the open repo's reads, and
+		// the workspace stays open: fetch what never landed.
+		if let (Some(idx), Some(_)) = (self.selected_repo_idx, self.repo()) {
+			if !self.changes_loaded {
+				self.select_repo_internal(idx, true, cx);
+			} else if self.commits.is_empty() && self.history_error.is_none() {
+				self.load_history(cx);
+			}
+		}
+		self.start_changes_queue(true, cx);
+		cx.notify();
 	}
 
 	fn finish_intent(
@@ -2241,7 +2345,7 @@ impl WorkbenchModel {
 		intent: lifecycle::Intent,
 		cx: &mut Context<Self>,
 	) {
-		let git = lifecycle::GitLoad::current();
+		let git = self.drain_load(Some(&intent));
 		if self.lifecycle.unfinished() > 0 || !git.is_clear() {
 			if e2e_on() {
 				app_log!(
@@ -2258,6 +2362,9 @@ impl WorkbenchModel {
 		let name = intent.name();
 		self.emit_life("drained", name, None);
 		match intent {
+			lifecycle::Intent::Quit if self.ws_tab.is_some() => {
+				cx.emit(tabs::TabEvent::QuitDrained)
+			}
 			lifecycle::Intent::Quit => cx.quit(),
 			lifecycle::Intent::CloseWorkspace => self.finish_close(cx),
 			lifecycle::Intent::OpenWorkspace(path) => {
@@ -2422,6 +2529,17 @@ impl WorkbenchModel {
 	fn finish_close(&mut self, cx: &mut Context<Self>) {
 		self.release_workspace_state(cx);
 		self.workspace_open = false;
+		if self.ws_tab.is_some() {
+			// The root drops the tab.
+			if e2e_on() {
+				app_log!(
+					"[APP:WORKSPACE: state=closed generation={}]",
+					self.lifecycle.generation()
+				);
+			}
+			cx.emit(tabs::TabEvent::Closed);
+			return;
+		}
 		self.workspace_menu = true;
 		self.workspace_picker = false;
 		if e2e_on() {
@@ -2467,7 +2585,11 @@ impl WorkbenchModel {
 
 	pub fn toggle_workspace_menu(&mut self, cx: &mut Context<Self>) {
 		self.workspace_menu = !self.workspace_menu;
-		if !self.workspace_menu {
+		if self.workspace_menu && recent::config_dir().is_some() {
+			// Another workspace tab may have opened something since.
+			self.recent_workspaces = recent::load();
+			self.remote.recent = remote::load_recent();
+		} else if !self.workspace_menu {
 			self.workspace_picker = false;
 		}
 		cx.notify();
@@ -2485,17 +2607,21 @@ impl WorkbenchModel {
 			multiple: false,
 			prompt: Some(i18n::t("workspace_open_confirm", self.locale).into()),
 		});
+		let tab = self.ws_tab;
 		cx.spawn(async move |this, cx| {
-			let picked = picked.await;
-			let _ = this.update(cx, |this, cx| match picked {
-				Ok(Ok(Some(paths))) => {
-					if let Some(path) = paths.into_iter().next() {
-						this.open_workspace_path(path, cx);
+			tabs::tagged(tab, async move {
+				let picked = picked.await;
+				let _ = this.update(cx, |this, cx| match picked {
+					Ok(Ok(Some(paths))) => {
+						if let Some(path) = paths.into_iter().next() {
+							this.open_workspace_path(path, cx);
+						}
 					}
-				}
-				Ok(Ok(None)) => {}
-				_ => this.show_workspace_picker(cx),
-			});
+					Ok(Ok(None)) => {}
+					_ => this.show_workspace_picker(cx),
+				});
+			})
+			.await
 		})
 		.detach();
 	}
@@ -2533,7 +2659,119 @@ impl WorkbenchModel {
 		let path = dunce::canonicalize(&path).unwrap_or(path);
 		self.workspace_path_input
 			.update(cx, |input, _| input.clear_retained());
-		self.request_user_close(lifecycle::Intent::OpenWorkspace(path), cx);
+		self.route_open(tabs::OpenTarget::Local(path), cx);
+	}
+
+	/// A tab asks the root, which opens a new tab, switches to the tab that
+	/// already shows the workspace, or fills this tab when it is empty.
+	pub(crate) fn route_open(
+		&mut self,
+		target: tabs::OpenTarget,
+		cx: &mut Context<Self>,
+	) {
+		if self.ws_tab.is_some() {
+			self.workspace_menu = false;
+			self.workspace_picker = false;
+			cx.emit(tabs::TabEvent::Open(target));
+			cx.notify();
+		} else {
+			self.open_in_place(target, cx);
+		}
+	}
+
+	/// Opens `target` in this model after the usual close checks.
+	pub(crate) fn open_in_place(
+		&mut self,
+		target: tabs::OpenTarget,
+		cx: &mut Context<Self>,
+	) {
+		self.request_user_close(target.into_intent(), cx);
+	}
+
+	/// The workspace this tab shows, or the one its drain is opening.
+	pub fn ws_identity(&self) -> Option<tabs::WsIdentity> {
+		if let Some(intent) = self.lifecycle.pending_intent() {
+			if let Some(id) = tabs::WsIdentity::of_intent(intent) {
+				return Some(id);
+			}
+		}
+		if !self.workspace_open {
+			return None;
+		}
+		Some(match &self.remote.session {
+			Some(session) => tabs::WsIdentity::Remote {
+				host: session.host().to_string(),
+				path: session.workspace.id.clone(),
+			},
+			None => tabs::WsIdentity::Local(self.workspace_root.clone()),
+		})
+	}
+
+	/// The tab's close (or a quit) is draining: it is about to go away.
+	pub fn is_closing(&self) -> bool {
+		matches!(
+			self.lifecycle.pending_intent(),
+			Some(lifecycle::Intent::CloseWorkspace | lifecycle::Intent::Quit)
+		)
+	}
+
+	/// No workspace, none opening, no paste: an open may fill this tab.
+	pub fn is_empty_tab(&self) -> bool {
+		!self.workspace_open
+			&& !self.lifecycle.is_draining()
+			&& !self.paste.is_open()
+	}
+
+	/// A confirmed paste or replay is being written.
+	pub fn blocks_close(&self) -> bool {
+		self.paste_busy() || self.lifecycle.has_mutating()
+	}
+
+	/// What the tab bar shows for this tab.
+	pub fn tab_info(&self) -> tabs::TabInfo {
+		let identity = self.ws_identity();
+		let opening = self.lifecycle.pending_intent().is_some_and(|i| {
+			matches!(i, lifecycle::Intent::OpenRemoteWorkspace(_))
+		});
+		let (full, conn) = match (&identity, &self.remote.session) {
+			(Some(tabs::WsIdentity::Remote { host, path }), session) => {
+				let conn = if opening || session.is_none() {
+					tabs::Conn::Connecting
+				} else if self.remote.scan_error.is_some() {
+					tabs::Conn::Failed
+				} else {
+					tabs::Conn::Connected
+				};
+				(format!("{host}:{path}"), Some(conn))
+			}
+			(Some(tabs::WsIdentity::Local(path)), _) => {
+				(path.display().to_string(), None)
+			}
+			(None, _) if self.remote.busy => {
+				(String::new(), Some(tabs::Conn::Connecting))
+			}
+			(None, _) => (String::new(), None),
+		};
+		tabs::TabInfo {
+			identity,
+			full,
+			conn,
+			pasting: self.blocks_close(),
+		}
+	}
+
+	/// The root shows another tab: this one keeps its state, but its focus
+	/// guard must not pull the keyboard back to a handle nothing draws.
+	pub(crate) fn leave_tab(
+		&mut self,
+		keep: Option<FocusHandle>,
+		cx: &mut Context<Self>,
+	) {
+		self.resume_focus = keep;
+		self.focus_lost_guard = None;
+		self.chrome.menu = None;
+		self.dragging = None;
+		cx.notify();
 	}
 
 	/// True when this copy may write the clipboard. A cancelled token or a
@@ -5731,8 +5969,38 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("shift-escape", HideToolWindow, None),
 		KeyBinding::new("f7", NextDiff, None),
 		KeyBinding::new("shift-f7", PrevDiff, None),
+		// Both close the workspace tab.
+		KeyBinding::new("ctrl-w", CloseWorkspace, None),
+		KeyBinding::new("cmd-w", CloseWorkspace, None),
 		KeyBinding::new("ctrl-shift-w", CloseWorkspace, None),
 		KeyBinding::new("cmd-shift-w", CloseWorkspace, None),
+		// Workspace tabs; a shifted bracket may arrive as the brace.
+		KeyBinding::new("ctrl-shift-[", PrevWorkspaceTab, None),
+		KeyBinding::new("cmd-shift-[", PrevWorkspaceTab, None),
+		KeyBinding::new("ctrl-{", PrevWorkspaceTab, None),
+		KeyBinding::new("cmd-{", PrevWorkspaceTab, None),
+		KeyBinding::new("ctrl-shift-]", NextWorkspaceTab, None),
+		KeyBinding::new("cmd-shift-]", NextWorkspaceTab, None),
+		KeyBinding::new("ctrl-}", NextWorkspaceTab, None),
+		KeyBinding::new("cmd-}", NextWorkspaceTab, None),
+		KeyBinding::new("ctrl-1", WorkspaceTab1, None),
+		KeyBinding::new("cmd-1", WorkspaceTab1, None),
+		KeyBinding::new("ctrl-2", WorkspaceTab2, None),
+		KeyBinding::new("cmd-2", WorkspaceTab2, None),
+		KeyBinding::new("ctrl-3", WorkspaceTab3, None),
+		KeyBinding::new("cmd-3", WorkspaceTab3, None),
+		KeyBinding::new("ctrl-4", WorkspaceTab4, None),
+		KeyBinding::new("cmd-4", WorkspaceTab4, None),
+		KeyBinding::new("ctrl-5", WorkspaceTab5, None),
+		KeyBinding::new("cmd-5", WorkspaceTab5, None),
+		KeyBinding::new("ctrl-6", WorkspaceTab6, None),
+		KeyBinding::new("cmd-6", WorkspaceTab6, None),
+		KeyBinding::new("ctrl-7", WorkspaceTab7, None),
+		KeyBinding::new("cmd-7", WorkspaceTab7, None),
+		KeyBinding::new("ctrl-8", WorkspaceTab8, None),
+		KeyBinding::new("cmd-8", WorkspaceTab8, None),
+		KeyBinding::new("ctrl-9", WorkspaceTab9, None),
+		KeyBinding::new("cmd-9", WorkspaceTab9, None),
 		KeyBinding::new("ctrl-shift-o", OpenWorkspace, None),
 		KeyBinding::new("cmd-shift-o", OpenWorkspace, None),
 		KeyBinding::new("alt-l", ToggleLocale, None),
@@ -5837,20 +6105,29 @@ fn main() {
 				if app_mode == "idle" {
 					ready_marker("IDLE");
 				}
-				let model = cx
-					.new(|cx| WorkbenchModel::new(ws, paste_dir, app_mode, cx));
-				if let Some(last) = last_remote {
-					model.update(cx, |m, cx| m.reopen_last_remote(last, cx));
-				}
-				let fh = model.read(cx).focus_handle.clone();
-				window.focus(&fh);
-				let close_target = model.clone();
-				window.on_window_should_close(cx, move |_window, cx| {
-					close_target.update(cx, |model, cx| model.begin_quit(cx));
+				let first = match (ws, last_remote) {
+					(Some(path), _) => tabs::FirstTab::Local(path),
+					(None, Some(last)) => tabs::FirstTab::Remote(last),
+					(None, None) => tabs::FirstTab::Empty,
+				};
+				let root = cx.new(|cx| {
+					tabs::TabsRoot::new(
+						first,
+						paste_dir,
+						app_mode,
+						ui::Probes::from_env(),
+						window,
+						cx,
+					)
+				});
+				let close_target = root.clone();
+				window.on_window_should_close(cx, move |window, cx| {
+					close_target
+						.update(cx, |root, cx| root.begin_quit(window, cx));
 					false
 				});
 				app_log!("[APP:WINDOW_READY]");
-				model
+				root
 			},
 		);
 
@@ -14092,6 +14369,929 @@ mod tests {
 					"user's next action allows status update"
 				);
 			});
+		}
+
+		/// Workspace tabs (#136): every gesture is a real click or key.
+		mod workspace_tabs {
+			use super::*;
+			use crate::lifecycle::JobKind;
+			use crate::tabs::{FirstTab, TabEvent, TabsRoot, WsIdentity};
+			use std::cell::Cell;
+			use std::rc::Rc;
+
+			fn open_tabs(
+				cx: &mut TestAppContext,
+				first: FirstTab,
+				restore_dir: Option<PathBuf>,
+			) -> (Entity<TabsRoot>, &mut VisualTestContext) {
+				cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+				let (root, cx) = cx.add_window_view(|window, cx| {
+					TabsRoot::new(
+						first,
+						restore_dir,
+						"normal".into(),
+						None,
+						window,
+						cx,
+					)
+				});
+				settle(cx);
+				(root, cx)
+			}
+
+			fn tab(
+				root: &Entity<TabsRoot>,
+				cx: &mut VisualTestContext,
+				ix: usize,
+			) -> Entity<WorkbenchModel> {
+				root.read_with(cx, |r, _| r.tabs[ix].model.clone())
+			}
+
+			fn count(
+				root: &Entity<TabsRoot>,
+				cx: &mut VisualTestContext,
+			) -> usize {
+				root.read_with(cx, |r, _| r.tabs.len())
+			}
+
+			fn active(
+				root: &Entity<TabsRoot>,
+				cx: &mut VisualTestContext,
+			) -> Option<usize> {
+				root.read_with(cx, |r, _| r.active)
+			}
+
+			fn labels(
+				root: &Entity<TabsRoot>,
+				cx: &mut VisualTestContext,
+			) -> Vec<String> {
+				root.read_with(cx, |r, cx| {
+					r.tab_views(cx).into_iter().map(|(l, _)| l).collect()
+				})
+			}
+
+			/// Settles until `ready`, failing with `what` after a bound.
+			fn wait(
+				cx: &mut VisualTestContext,
+				what: &str,
+				mut ready: impl FnMut(&mut VisualTestContext) -> bool,
+			) {
+				for _ in 0..80 {
+					settle(cx);
+					if ready(cx) {
+						return;
+					}
+				}
+				panic!("timed out waiting for {what}");
+			}
+
+			fn sel(id: String) -> &'static str {
+				Box::leak(id.into_boxed_str())
+			}
+
+			fn click_id(cx: &mut VisualTestContext, id: String) {
+				cx.run_until_parked();
+				let id = sel(id);
+				let bounds = cx
+					.debug_bounds(id)
+					.unwrap_or_else(|| panic!("no rendered control {id}"));
+				cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+				settle(cx);
+			}
+
+			fn drawn(cx: &mut VisualTestContext, id: &str) -> bool {
+				cx.run_until_parked();
+				cx.debug_bounds(sel(id.to_string())).is_some()
+			}
+
+			/// The typed-path field of the active tab's workspace menu,
+			/// filled and submitted with the keyboard.
+			fn open_typed(
+				root: &Entity<TabsRoot>,
+				cx: &mut VisualTestContext,
+				path: &Path,
+			) {
+				let ix = active(root, cx).expect("a tab is shown");
+				let m = tab(root, cx, ix);
+				m.update(cx, |m, cx| m.show_workspace_picker(cx));
+				settle(cx);
+				cx.simulate_input(&path.display().to_string());
+				cx.simulate_keystrokes("enter");
+				settle(cx);
+			}
+
+			fn workspace_ready(
+				m: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> bool {
+				m.read_with(cx, |m, _| {
+					m.workspace_open
+						&& !m.lifecycle.is_draining()
+						&& !m.is_loading
+				})
+			}
+
+			fn focused_in(
+				m: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+			) -> bool {
+				cx.update(|window, cx| {
+					m.read(cx).focus_handle.contains_focused(window, cx)
+				})
+			}
+
+			/// An owned job of `kind` that stays live until the returned
+			/// flag is set: a load, or a confirmed paste, the test controls.
+			fn hold_job(
+				m: &Entity<WorkbenchModel>,
+				cx: &mut VisualTestContext,
+				kind: JobKind,
+			) -> Rc<Cell<bool>> {
+				let release = Rc::new(Cell::new(false));
+				let flag = release.clone();
+				m.update(cx, |m, cx| {
+					let bg = cx.background_executor().clone();
+					m.spawn_owned(cx, kind, None, async move {
+						while !flag.get() {
+							bg.timer(Duration::from_millis(20)).await;
+						}
+					});
+					// What a confirmed paste does: the tab bar shows it.
+					cx.notify();
+				});
+				release
+			}
+
+			/// Two local workspaces, one repo each with an untracked file.
+			fn two_workspaces() -> (tempfile::TempDir, PathBuf, PathBuf) {
+				let tmp = tempfile::tempdir().unwrap();
+				let root = dunce::canonicalize(tmp.path()).unwrap();
+				let a = root.join("ws-a");
+				let b = root.join("ws-b");
+				fs::create_dir(&a).unwrap();
+				fs::create_dir(&b).unwrap();
+				repo(&a, "alpha", &[("only-in-a.txt", "from a\n")]);
+				repo(&b, "beta", &[("only-in-b.txt", "from b\n")]);
+				(tmp, a, b)
+			}
+
+			fn two_tabs(
+				cx: &mut TestAppContext,
+			) -> (
+				tempfile::TempDir,
+				PathBuf,
+				PathBuf,
+				Entity<TabsRoot>,
+				&mut VisualTestContext,
+			) {
+				let (tmp, a, b) = two_workspaces();
+				let (root, cx) =
+					open_tabs(cx, FirstTab::Local(a.clone()), None);
+				let ta = tab(&root, cx, 0);
+				wait(cx, "tab A loaded", |cx| workspace_ready(&ta, cx));
+				open_typed(&root, cx, &b);
+				wait(cx, "tab B opened", |cx| {
+					count(&root, cx) == 2 && {
+						let tb = tab(&root, cx, 1);
+						workspace_ready(&tb, cx)
+					}
+				});
+				(tmp, a, b, root, cx)
+			}
+
+			#[gpui::test]
+			fn opening_another_workspace_adds_a_tab_and_an_open_one_is_switched_to(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, b, root, cx) = two_tabs(cx);
+				assert_eq!(active(&root, cx), Some(1));
+				assert_eq!(labels(&root, cx), ["ws-a", "ws-b"]);
+				let tb = tab(&root, cx, 1);
+				assert_eq!(
+					tb.read_with(cx, |m, _| m.ws_identity()),
+					Some(WsIdentity::Local(b.clone()))
+				);
+
+				// The same folder again, from tab B: tab A is shown.
+				open_typed(&root, cx, &a);
+				assert_eq!(count(&root, cx), 2);
+				assert_eq!(active(&root, cx), Some(0));
+
+				// Spelled through a symlink it is still the same workspace.
+				#[cfg(unix)]
+				{
+					let link = _tmp.path().join("link-to-b");
+					std::os::unix::fs::symlink(&b, &link).unwrap();
+					open_typed(&root, cx, &link);
+					assert_eq!(count(&root, cx), 2);
+					assert_eq!(active(&root, cx), Some(1));
+				}
+
+				// A nested folder is a workspace of its own.
+				let nested = a.join("alpha");
+				open_typed(&root, cx, &nested);
+				wait(cx, "nested tab", |cx| count(&root, cx) == 3);
+				assert_eq!(active(&root, cx), Some(2));
+				assert_eq!(labels(&root, cx), ["ws-a", "ws-b", "alpha"]);
+			}
+
+			#[gpui::test]
+			fn an_empty_tab_is_filled_and_an_empty_tab_for_an_open_workspace_goes_away(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, b) = two_workspaces();
+				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
+				assert_eq!(count(&root, cx), 1);
+				assert_eq!(labels(&root, cx), ["新分頁"]);
+				open_typed(&root, cx, &a);
+				let ta = tab(&root, cx, 0);
+				wait(cx, "A in the first tab", |cx| workspace_ready(&ta, cx));
+				assert_eq!(count(&root, cx), 1, "the empty tab was filled");
+
+				// "+" opens an empty tab with the workspace menu open.
+				click_id(cx, "ws-tab-new".into());
+				assert_eq!(count(&root, cx), 2);
+				assert_eq!(active(&root, cx), Some(1));
+				let empty = tab(&root, cx, 1);
+				assert!(empty.read_with(cx, |m, _| m.workspace_menu));
+				assert!(focused_in(&empty, cx));
+
+				// Asking it for A shows tab A and drops the empty tab.
+				open_typed(&root, cx, &a);
+				wait(cx, "empty tab dropped", |cx| count(&root, cx) == 1);
+				assert_eq!(active(&root, cx), Some(0));
+
+				// Asking a fresh empty tab for B fills it.
+				click_id(cx, "ws-tab-new".into());
+				open_typed(&root, cx, &b);
+				let tb = tab(&root, cx, 1);
+				wait(cx, "B in the second tab", |cx| workspace_ready(&tb, cx));
+				assert_eq!(count(&root, cx), 2);
+			}
+
+			/// The first Cmd+C and Cmd+V after a tab is clicked reach that
+			/// tab only.
+			#[gpui::test]
+			fn the_first_copy_and_paste_after_clicking_a_tab_reach_only_that_tab(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let (ta, tb) = (tab(&root, cx, 0), tab(&root, cx, 1));
+				wait(cx, "both trees", |cx| {
+					ta.read_with(cx, |m, _| !m.files.is_empty())
+						&& tb.read_with(cx, |m, _| !m.files.is_empty())
+				});
+
+				click_id(cx, "ws-tab:0".into());
+				assert_eq!(active(&root, cx), Some(0));
+				assert!(focused_in(&ta, cx), "tab A holds the keyboard");
+				assert!(!focused_in(&tb, cx));
+				clip::write_text("before").unwrap();
+				cx.simulate_keystrokes("cmd-c");
+				wait(cx, "A's copy", |cx| {
+					ta.read_with(cx, |m, _| !m.is_copying)
+						&& clip::read_text().unwrap() != "before"
+				});
+				let copied = clip::read_text().unwrap();
+				assert!(copied.contains("only-in-a.txt"), "{copied}");
+				assert!(!copied.contains("only-in-b.txt"), "{copied}");
+				assert!(tb.read_with(cx, |m, _| m.toast.is_none()));
+
+				click_id(cx, "ws-tab:1".into());
+				assert!(focused_in(&tb, cx), "tab B holds the keyboard");
+				clip::write_text("// FILE: beta/pasted.txt\nhello\n").unwrap();
+				cx.simulate_keystrokes("cmd-v");
+				settle(cx);
+				assert!(
+					tb.read_with(cx, |m, _| m.paste.is_open()),
+					"B previews the paste: {}",
+					tb.read_with(cx, |m, _| m.status.clone())
+				);
+				assert!(!ta.read_with(cx, |m, _| m.paste.is_open()));
+
+				// Back to A by keyboard: its Cmd+V is its own.
+				cx.simulate_keystrokes("cmd-1");
+				assert!(focused_in(&ta, cx));
+				cx.simulate_keystrokes("cmd-v");
+				settle(cx);
+				assert!(ta.read_with(cx, |m, _| m.paste.is_open()));
+				assert!(
+					tb.read_with(cx, |m, _| m.paste.is_open()),
+					"B keeps its preview"
+				);
+			}
+
+			#[gpui::test]
+			fn tab_shortcuts_switch_wrap_and_jump_and_ctrl_tab_still_moves_focus(
+				cx: &mut TestAppContext,
+			) {
+				let tmp = tempfile::tempdir().unwrap();
+				let root_dir = dunce::canonicalize(tmp.path()).unwrap();
+				let dirs: Vec<PathBuf> = ["one", "two", "three"]
+					.iter()
+					.map(|n| {
+						let d = root_dir.join(n);
+						fs::create_dir(&d).unwrap();
+						d
+					})
+					.collect();
+				let (root, cx) =
+					open_tabs(cx, FirstTab::Local(dirs[0].clone()), None);
+				open_typed(&root, cx, &dirs[1]);
+				open_typed(&root, cx, &dirs[2]);
+				wait(cx, "three tabs", |cx| count(&root, cx) == 3);
+				assert_eq!(active(&root, cx), Some(2));
+				let steps = [
+					("cmd-shift-]", 0),
+					("cmd-shift-[", 2),
+					("cmd-{", 1),
+					("cmd-}", 2),
+					("ctrl-shift-[", 1),
+					("cmd-1", 0),
+					("cmd-3", 2),
+					("cmd-9", 2),
+					("ctrl-2", 1),
+				];
+				for (keys, want) in steps {
+					cx.simulate_keystrokes(keys);
+					settle(cx);
+					assert_eq!(active(&root, cx), Some(want), "after {keys}");
+					let m = tab(&root, cx, want);
+					assert!(focused_in(&m, cx), "focus follows {keys}");
+				}
+				cx.simulate_keystrokes("ctrl-tab");
+				settle(cx);
+				assert_eq!(
+					active(&root, cx),
+					Some(1),
+					"Ctrl+Tab is not a tab switch"
+				);
+			}
+
+			#[gpui::test]
+			fn close_keys_and_the_close_button_drop_tabs_down_to_the_plus_alone(
+				cx: &mut TestAppContext,
+			) {
+				let tmp = tempfile::tempdir().unwrap();
+				let root_dir = dunce::canonicalize(tmp.path()).unwrap();
+				let dirs: Vec<PathBuf> = ["one", "two", "three", "four"]
+					.iter()
+					.map(|n| {
+						let d = root_dir.join(n);
+						fs::create_dir(&d).unwrap();
+						d
+					})
+					.collect();
+				let (root, cx) =
+					open_tabs(cx, FirstTab::Local(dirs[0].clone()), None);
+				for d in &dirs[1..] {
+					open_typed(&root, cx, d);
+				}
+				wait(cx, "four tabs", |cx| count(&root, cx) == 4);
+				cx.simulate_keystrokes("cmd-2");
+				settle(cx);
+				assert_eq!(labels(&root, cx), ["one", "two", "three", "four"]);
+
+				cx.simulate_keystrokes("cmd-w");
+				wait(cx, "cmd-w", |cx| count(&root, cx) == 3);
+				assert_eq!(labels(&root, cx), ["one", "three", "four"]);
+				assert_eq!(active(&root, cx), Some(1), "the right neighbour");
+				let shown = tab(&root, cx, 1);
+				assert!(focused_in(&shown, cx));
+
+				// The × of a background tab closes it; the shown tab stays.
+				click_id(cx, "ws-tab-close:0".into());
+				wait(cx, "close button", |cx| count(&root, cx) == 2);
+				assert_eq!(labels(&root, cx), ["three", "four"]);
+				assert_eq!(active(&root, cx), Some(0));
+				assert!(focused_in(&shown, cx));
+
+				cx.simulate_keystrokes("cmd-shift-w");
+				wait(cx, "cmd-shift-w", |cx| count(&root, cx) == 1);
+				cx.simulate_keystrokes("ctrl-w");
+				wait(cx, "last tab", |cx| count(&root, cx) == 0);
+				assert_eq!(active(&root, cx), None);
+				// (debug_bounds keeps ids of earlier frames, so only what is
+				// drawn is checked.)
+				assert!(drawn(cx, "ws-tab-new"), "only + is left");
+				assert!(
+					!root.read_with(cx, |r, _| r.quit_sent),
+					"the app stays"
+				);
+				let title = root.read_with(cx, |r, _| r.title.clone());
+				assert_eq!(title, "snip-sync");
+
+				// Keys still work on the empty window.
+				cx.simulate_keystrokes("cmd-w");
+				settle(cx);
+				assert_eq!(count(&root, cx), 0);
+				click_id(cx, "ws-tab-new".into());
+				assert_eq!(count(&root, cx), 1);
+				cx.simulate_keystrokes("cmd-w");
+				wait(cx, "empty again", |cx| count(&root, cx) == 0);
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				assert!(
+					root.read_with(cx, |r, _| r.quit_sent),
+					"Cmd+Q with no tab quits"
+				);
+			}
+
+			#[gpui::test]
+			fn a_closing_tab_waits_only_for_its_own_jobs(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let tb = tab(&root, cx, 1);
+				let b_load = hold_job(&tb, cx, JobKind::UncancellableRead);
+
+				// Tab A closes while tab B is still loading.
+				click_id(cx, "ws-tab:0".into());
+				cx.simulate_keystrokes("cmd-w");
+				wait(cx, "A closed", |cx| count(&root, cx) == 1);
+				assert_eq!(tab(&root, cx, 0), tb);
+				assert!(tb.read_with(cx, |m, _| m.lifecycle.live_jobs() > 0));
+
+				// Tab B's own close waits for its load.
+				cx.simulate_keystrokes("cmd-w");
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert_eq!(count(&root, cx), 1, "B drains its own load first");
+				assert!(tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+				b_load.set(true);
+				wait(cx, "B closed", |cx| count(&root, cx) == 0);
+			}
+
+			/// A real Local-pool Git child holds a slot of the shared
+			/// budget: a tab closing elsewhere does not wait for it, and
+			/// Quit does.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn a_closing_tab_does_not_wait_for_git_another_tab_runs(
+				cx: &mut TestAppContext,
+			) {
+				if !crate::run_isolated(
+					"tests::in_process::workspace_tabs::a_closing_tab_does_not_wait_for_git_another_tab_runs",
+				) {
+					return;
+				}
+				use snip_core::gitrun::{in_flight, RunOptions};
+				use snip_core::gitsrc::Git;
+
+				let (_tmp, _a, b, root, cx) = two_tabs(cx);
+				// Both tabs' own loads finish first (bounded): the counter is
+				// process-wide.
+				wait(cx, "both tabs idle", |_| in_flight() == 0);
+				let base = in_flight();
+				let git = Git::open(&b.join("beta")).unwrap();
+				let release = b.join("release");
+				let wait_for = release.display().to_string();
+				let handle = std::thread::spawn(move || {
+					let opts = RunOptions {
+						timeout: Duration::from_secs(30),
+						..Default::default()
+					};
+					let alias = format!(
+						"alias.hold=!f() {{ while [ ! -e '{wait_for}' ]; do sleep 0.05; done; }}; f"
+					);
+					git.run_with(&["-c", &alias, "hold"], &opts)
+				});
+				let deadline =
+					std::time::Instant::now() + Duration::from_secs(10);
+				while in_flight() < base + 1 {
+					assert!(
+						std::time::Instant::now() < deadline,
+						"git never started"
+					);
+					std::thread::sleep(Duration::from_millis(10));
+				}
+
+				// Tab A closes while the shared budget has a Git child.
+				click_id(cx, "ws-tab:0".into());
+				cx.simulate_keystrokes("cmd-w");
+				wait(cx, "A closed", |cx| count(&root, cx) == 1);
+				assert!(!handle.is_finished(), "the Git child still runs");
+
+				// Quit waits for every Git child.
+				cx.simulate_keystrokes("cmd-q");
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert!(!root.read_with(cx, |r, _| r.quit_sent));
+				fs::write(&release, "").unwrap();
+				handle.join().unwrap().unwrap();
+				wait(cx, "quit", |cx| root.read_with(cx, |r, _| r.quit_sent));
+			}
+
+			#[gpui::test]
+			fn quit_drains_every_tab_and_a_paste_anywhere_refuses_it(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let (ta, tb) = (tab(&root, cx, 0), tab(&root, cx, 1));
+
+				// A confirmed paste in background tab A: quit is refused, tab
+				// A is shown, and tab B never started draining.
+				let paste = hold_job(&ta, cx, JobKind::Mutating);
+				settle(cx);
+				let info = root.read_with(cx, |r, cx| r.tab_views(cx));
+				assert!(info[0].1.pasting && !info[1].1.pasting);
+				assert!(drawn(cx, "ws-tab-pasting:0"));
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(0));
+				assert!(!root.read_with(cx, |r, _| r.quit_sent));
+				assert!(!tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+				assert_eq!(
+					ta.read_with(cx, |m, _| m.status.key),
+					"workspace_busy_applying"
+				);
+				// Closing that tab is refused the same way.
+				cx.simulate_keystrokes("cmd-w");
+				settle(cx);
+				assert_eq!(count(&root, cx), 2);
+				paste.set(true);
+				settle(cx);
+
+				// Quit waits for every tab's work, then quits.
+				let b_load = hold_job(&tb, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-q");
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert!(
+					!root.read_with(cx, |r, _| r.quit_sent),
+					"B still loads"
+				);
+				b_load.set(true);
+				wait(cx, "quit", |cx| root.read_with(cx, |r, _| r.quit_sent));
+			}
+
+			/// A tab that drained early and then starts a confirmed paste
+			/// while another tab still drains stops the quit: the write is
+			/// not cut off, and that tab is shown.
+			#[gpui::test]
+			fn a_paste_started_during_the_quit_stops_it(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let (ta, tb) = (tab(&root, cx, 0), tab(&root, cx, 1));
+				let b_load = hold_job(&tb, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				assert!(
+					!ta.read_with(cx, |m, _| m.lifecycle.is_draining()),
+					"A drained"
+				);
+				assert!(tb.read_with(cx, |m, _| m.lifecycle.is_draining()));
+				let paste = hold_job(&ta, cx, JobKind::Mutating);
+				b_load.set(true);
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert!(
+					!root.read_with(cx, |r, _| r.quit_sent),
+					"the write is not cut off"
+				);
+				assert_eq!(active(&root, cx), Some(0));
+				assert_eq!(
+					ta.read_with(cx, |m, _| m.status.key),
+					"workspace_busy_applying"
+				);
+				assert_eq!(count(&root, cx), 2);
+				// Once written, Quit quits.
+				paste.set(true);
+				settle(cx);
+				cx.simulate_keystrokes("cmd-q");
+				wait(cx, "quit", |cx| root.read_with(cx, |r, _| r.quit_sent));
+			}
+
+			/// Reopening a folder whose tab is still draining its close
+			/// opens it again in a new tab.
+			#[gpui::test]
+			fn reopening_a_closing_workspace_opens_a_new_tab(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b, root, cx) = two_tabs(cx);
+				click_id(cx, "ws-tab:0".into());
+				let ta = tab(&root, cx, 0);
+				let a_load = hold_job(&ta, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-w");
+				settle(cx);
+				assert!(ta.read_with(cx, |m, _| m.is_closing()));
+				open_typed(&root, cx, &a);
+				wait(cx, "a new tab for A", |cx| count(&root, cx) == 3);
+				a_load.set(true);
+				wait(cx, "the old A closed", |cx| count(&root, cx) == 2);
+				let reopened = tab(&root, cx, 1);
+				assert_ne!(reopened, ta);
+				wait(cx, "A open again", |cx| workspace_ready(&reopened, cx));
+				assert_eq!(
+					reopened.read_with(cx, |m, _| m.ws_identity()),
+					Some(WsIdentity::Local(a.clone()))
+				);
+			}
+
+			/// An empty tab with a job still running drains it before it goes.
+			#[gpui::test]
+			fn an_empty_tab_with_a_job_drains_before_closing(
+				cx: &mut TestAppContext,
+			) {
+				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
+				click_id(cx, "ws-tab-new".into());
+				let empty = tab(&root, cx, 1);
+				let job = hold_job(&empty, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-w");
+				for _ in 0..5 {
+					settle(cx);
+				}
+				assert_eq!(count(&root, cx), 2, "its job drains first");
+				job.set(true);
+				wait(cx, "closed", |cx| count(&root, cx) == 1);
+			}
+
+			/// A drain that gives up stops the quit; the tabs that already
+			/// drained reload what the quit cancelled.
+			#[gpui::test]
+			fn a_failed_drain_stops_the_quit_and_shows_that_tab(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let (ta, tb) = (tab(&root, cx, 0), tab(&root, cx, 1));
+				let b_load = hold_job(&tb, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				assert!(!ta.read_with(cx, |m, _| m.lifecycle.is_draining()));
+				// Tab B gives up (as on its 8 s deadline).
+				click_id(cx, "ws-tab:0".into());
+				tb.update(cx, |_, cx| cx.emit(TabEvent::DrainFailed));
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(1));
+				b_load.set(true);
+				settle(cx);
+				assert!(!root.read_with(cx, |r, _| r.quit_sent));
+				assert_eq!(count(&root, cx), 2);
+				wait(cx, "A reloaded", |cx| {
+					ta.read_with(cx, |m, _| {
+						!m.files.is_empty() && !m.is_loading
+					})
+				});
+			}
+
+			#[gpui::test]
+			fn a_background_tab_keeps_its_state_and_is_not_reloaded(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let ta = tab(&root, cx, 0);
+				wait(cx, "A's files", |cx| {
+					ta.read_with(cx, |m, _| !m.files.is_empty())
+				});
+				ta.update(cx, |m, _| m.left_w = 333.);
+				let before = ta.read_with(cx, |m, _| {
+					(
+						m.lifecycle.generation(),
+						m.history_generation,
+						m.tree_generation,
+						m.files.len(),
+						m.selected_repo_idx,
+					)
+				});
+				click_id(cx, "ws-tab:1".into());
+				click_id(cx, "ws-tab:0".into());
+				let after = ta.read_with(cx, |m, _| {
+					(
+						m.lifecycle.generation(),
+						m.history_generation,
+						m.tree_generation,
+						m.files.len(),
+						m.selected_repo_idx,
+					)
+				});
+				assert_eq!(before, after);
+				assert_eq!(ta.read_with(cx, |m, _| m.left_w), 333.);
+				let tb = tab(&root, cx, 1);
+				assert_ne!(tb.read_with(cx, |m, _| m.left_w), 333.);
+			}
+
+			#[gpui::test]
+			fn labels_add_parent_folders_on_a_clash_and_hover_shows_the_full_path(
+				cx: &mut TestAppContext,
+			) {
+				let tmp = tempfile::tempdir().unwrap();
+				let base = dunce::canonicalize(tmp.path()).unwrap();
+				let one = base.join("one").join("app");
+				let two = base.join("two").join("app");
+				fs::create_dir_all(&one).unwrap();
+				fs::create_dir_all(&two).unwrap();
+				let (root, cx) =
+					open_tabs(cx, FirstTab::Local(one.clone()), None);
+				assert_eq!(labels(&root, cx), ["app"]);
+				assert_eq!(
+					root.read_with(cx, |r, _| r.title.clone()),
+					"app — snip-sync"
+				);
+				open_typed(&root, cx, &two);
+				wait(cx, "second app", |cx| count(&root, cx) == 2);
+				settle(cx);
+				assert_eq!(labels(&root, cx), ["one/app", "two/app"]);
+				let views = root.read_with(cx, |r, cx| r.tab_views(cx));
+				assert_eq!(views[0].1.full, one.display().to_string());
+				assert_eq!(views[1].1.full, two.display().to_string());
+				assert_eq!(
+					root.read_with(cx, |r, _| r.title.clone()),
+					"two/app — snip-sync"
+				);
+				click_id(cx, "ws-tab-close:1".into());
+				wait(cx, "one tab", |cx| count(&root, cx) == 1);
+				assert_eq!(labels(&root, cx), ["app"]);
+			}
+
+			#[gpui::test]
+			fn remote_tabs_are_one_per_host_and_real_path_beside_local_ones(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let (_tmp, a, _b) = two_workspaces();
+				let shared_tmp = tempfile::tempdir().unwrap();
+				let shared = dunce::canonicalize(shared_tmp.path()).unwrap();
+				repo(&shared, "proj", &[("remote.txt", "r\n")]);
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				let host = snip_remote::RemoteHost::in_process(worker.clone());
+				let host_name = host.name.clone();
+				let (root, cx) =
+					open_tabs(cx, FirstTab::Local(a.clone()), None);
+				let open_remote_from_active =
+					|root: &Entity<TabsRoot>,
+					 cx: &mut VisualTestContext,
+					 path: String| {
+						let ix = active(root, cx).unwrap();
+						let m = tab(root, cx, ix);
+						let host = host.clone();
+						m.update(cx, |m, cx| {
+							m.workspace_menu = true;
+							m.remote.hosts = vec![host];
+							m.browse_remote_host(0, cx);
+							m.open_remote_path(0, path, cx);
+						});
+						settle(cx);
+					};
+				open_remote_from_active(
+					&root,
+					cx,
+					shared.display().to_string(),
+				);
+				wait(cx, "remote tab", |cx| {
+					count(&root, cx) == 2 && {
+						let m = tab(&root, cx, 1);
+						m.read_with(cx, |m, _| m.remote.session.is_some())
+					}
+				});
+				assert_eq!(active(&root, cx), Some(1));
+				let name =
+					shared.file_name().unwrap().to_string_lossy().into_owned();
+				assert_eq!(
+					labels(&root, cx),
+					["ws-a".to_string(), format!("{host_name} ▸ {name}")]
+				);
+				let views = root.read_with(cx, |r, cx| r.tab_views(cx));
+				assert_eq!(views[1].1.conn, Some(crate::tabs::Conn::Connected));
+				assert_eq!(views[0].1.conn, None);
+
+				// The same folder from the local tab, spelled with a trailing
+				// slash: the worker resolves it, and the remote tab is shown.
+				click_id(cx, "ws-tab:0".into());
+				open_remote_from_active(
+					&root,
+					cx,
+					format!("{}/", shared.display()),
+				);
+				wait(cx, "switched to the remote tab", |cx| {
+					active(&root, cx) == Some(1)
+				});
+				assert_eq!(count(&root, cx), 2);
+				drop(worker);
+			}
+
+			/// Back on a tab, the keyboard is in the pane it was in: Cmd+C
+			/// in a Git Log that had focus copies the commit.
+			#[gpui::test]
+			fn a_tab_shown_again_gives_the_keyboard_back_to_its_pane(
+				cx: &mut TestAppContext,
+			) {
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, a, _b) = two_workspaces();
+				let r = a.join("alpha");
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "c1.txt"]);
+				git(&r, &["commit", "-q", "-m", "commit c1"]);
+				let (_tmp2, _a2, b) = two_workspaces();
+				let (root, cx) = open_tabs(cx, FirstTab::Local(a), None);
+				let ta = tab(&root, cx, 0);
+				wait(cx, "A loaded", |cx| workspace_ready(&ta, cx));
+				open_typed(&root, cx, &b);
+				wait(cx, "tab B", |cx| count(&root, cx) == 2);
+				click_id(cx, "ws-tab:0".into());
+				wait(cx, "A's log", |cx| {
+					ta.read_with(cx, |m, _| m.display_commits().len() >= 2)
+				});
+				let row = cx.debug_bounds("log-subject:0").expect("commit row");
+				cx.simulate_click(row.center(), gpui::Modifiers::none());
+				settle(cx);
+				let log_focused = |cx: &mut VisualTestContext| {
+					cx.update(|w, cx| {
+						ta.read(cx).log_focus.contains_focused(w, cx)
+					})
+				};
+				assert!(log_focused(cx));
+				click_id(cx, "ws-tab:1".into());
+				assert!(!log_focused(cx));
+				click_id(cx, "ws-tab:0".into());
+				assert!(log_focused(cx), "the Git Log has the keyboard again");
+				clip::write_text("before").unwrap();
+				cx.simulate_keystrokes("cmd-c");
+				wait(cx, "commit copy", |_| {
+					clip::read_text().unwrap() != "before"
+				});
+				let text = clip::read_text().unwrap();
+				assert!(text.starts_with("// snip-sync commits v1"), "{text}");
+			}
+
+			#[gpui::test]
+			fn a_remote_tab_shows_connecting_connected_and_failed(
+				cx: &mut TestAppContext,
+			) {
+				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
+				let m = tab(&root, cx, 0);
+				let conn = |cx: &mut VisualTestContext| {
+					root.read_with(cx, |r, cx| r.tab_views(cx)[0].1.conn)
+				};
+				assert_eq!(conn(cx), None);
+				m.update(cx, |m, cx| {
+					m.remote.busy = true;
+					cx.notify();
+				});
+				settle(cx);
+				assert_eq!(conn(cx), Some(crate::tabs::Conn::Connecting));
+				assert!(drawn(cx, "ws-tab-state:0:connecting"));
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				let host = snip_remote::RemoteHost::in_process(worker);
+				let ws = snip_remote::RemoteWorkspace {
+					id: "/srv/proj".into(),
+					name: "proj".into(),
+					path: "/srv/proj".into(),
+				};
+				m.update(cx, |m, cx| {
+					m.remote.busy = false;
+					m.remote.session =
+						Some(crate::remote::RemoteSession::new(host, ws));
+					m.workspace_open = true;
+					cx.notify();
+				});
+				settle(cx);
+				assert_eq!(conn(cx), Some(crate::tabs::Conn::Connected));
+				m.update(cx, |m, cx| {
+					m.remote.scan_error = Some(crate::i18n::Msg::new(
+						"remote_scan_failed",
+						["x".to_string()],
+					));
+					cx.notify();
+				});
+				settle(cx);
+				assert_eq!(conn(cx), Some(crate::tabs::Conn::Failed));
+				assert!(drawn(cx, "ws-tab-state:0:failed"));
+				let full = root
+					.read_with(cx, |r, cx| r.tab_views(cx)[0].1.full.clone());
+				assert!(full.ends_with(":/srv/proj"), "{full}");
+			}
+
+			#[gpui::test]
+			fn the_tab_bar_sits_above_the_workbench_header(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b) = two_workspaces();
+				let (root, cx) = open_tabs(cx, FirstTab::Local(a), None);
+				let m = tab(&root, cx, 0);
+				wait(cx, "loaded", |cx| workspace_ready(&m, cx));
+				let bar = cx.debug_bounds("ws-tab:0").expect("tab drawn");
+				let menu = cx
+					.debug_bounds("btn-workspace-menu")
+					.expect("workbench header drawn");
+				assert!(
+					f32::from(bar.bottom()) <= f32::from(menu.top()),
+					"tab bar {bar:?} above the header {menu:?}"
+				);
+				assert_eq!(
+					m.read_with(cx, |m, _| m.top_inset),
+					crate::tabs::TAB_BAR_H
+				);
+			}
 		}
 	}
 
