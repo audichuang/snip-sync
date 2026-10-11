@@ -225,7 +225,7 @@ impl Connection {
 	/// [`Self::open`] that `cancel` ends: an ssh that is still connecting
 	/// or waiting for the hello is killed (on drop) and the open fails
 	/// with [`RemoteError::Cancelled`], instead of sitting out ssh's
-	/// connect timeout and [`CONNECT_TIMEOUT`].
+	/// connect timeout and the hello's.
 	pub fn open_with(
 		transport: &Transport,
 		my_name: &str,
