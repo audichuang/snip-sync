@@ -150,6 +150,9 @@ pub struct Browse {
 	seq: u64,
 	/// Kept across hops on one host, so a click does not start ssh again.
 	client: Option<Arc<Client>>,
+	/// Ends this listing's connect and calls once another listing, a
+	/// close or a quit replaces it.
+	cancel: snip_core::gitrun::CancelToken,
 }
 
 impl std::fmt::Debug for Browse {
@@ -574,6 +577,9 @@ impl WorkbenchModel {
 		let Some(host) = self.remote.hosts.get(idx).cloned() else {
 			return;
 		};
+		if self.lifecycle.is_draining() {
+			return;
+		}
 		let client = self
 			.remote
 			.browse
@@ -584,24 +590,45 @@ impl WorkbenchModel {
 			.unwrap_or_else(|| Arc::new(Client::new(host, device_name())));
 		self.remote.browse_seq = self.remote.browse_seq.wrapping_add(1);
 		let seq = self.remote.browse_seq;
-		self.remote.browse = Some(Browse {
+		let cancel = snip_core::gitrun::CancelToken::new();
+		let previous = self.remote.browse.replace(Browse {
 			host: idx,
 			path: path.clone(),
 			listing: None,
 			seq,
 			client: Some(client.clone()),
+			cancel: cancel.clone(),
 		});
+		if let Some(previous) = previous {
+			// Its listing would be dropped anyway (another seq).
+			previous.cancel.cancel();
+		}
 		self.remote.message = None;
 		self.pending_focus = Some(self.remote_path_input.read(cx).handle());
 		cx.notify();
 		let bg = cx.background_executor().clone();
-		let tab = self.ws_tab;
-		cx.spawn(async move |this, cx| {
-			crate::tabs::tagged(tab, async move {
+		let this = cx.weak_entity();
+		let mut async_app = cx.to_async();
+		let token = cancel.clone();
+		#[cfg(test)]
+		let open_delay = self.e2e_remote_open_delay;
+		// Like an open, the listing's ssh belongs to this tab: a close or
+		// quit cancels it and waits for the connection to go.
+		self.spawn_owned(
+			cx,
+			lifecycle::JobKind::CancellableRead,
+			Some(cancel),
+			async move {
+				#[cfg(test)]
+				if let Some(delay) = open_delay {
+					hold_open(&mut async_app, delay, &token).await;
+				}
 				let result = bg
 					.spawn(async move {
-						let ws = client.open_workspace(&path)?;
-						let (entries, _) = client.list_dir(&ws.id, "", None)?;
+						let cancel = Some(&token);
+						let ws = client.open_workspace_with(&path, cancel)?;
+						let (entries, _) =
+							client.list_dir(&ws.id, "", cancel)?;
 						let folders = entries
 							.into_iter()
 							.filter(|e| {
@@ -617,13 +644,11 @@ impl WorkbenchModel {
 					})
 					.await
 					.map_err(describe);
-				let _ = this.update(cx, |this, cx| {
+				let _ = this.update(&mut async_app, |this, cx| {
 					this.remote_listing_landed(seq, result, cx);
 				});
-			})
-			.await
-		})
-		.detach();
+			},
+		);
 	}
 
 	/// A folder listing lands; dropped when another folder or host is
@@ -711,7 +736,7 @@ impl WorkbenchModel {
 		let Some(host) = self.remote.hosts.get(idx).cloned() else {
 			return;
 		};
-		if self.remote.busy {
+		if self.remote.busy || self.lifecycle.is_draining() {
 			return;
 		}
 		if path.trim().is_empty() {
@@ -727,24 +752,35 @@ impl WorkbenchModel {
 		let open_delay = self.e2e_remote_open_delay;
 		cx.notify();
 		let bg = cx.background_executor().clone();
-		let tab = self.ws_tab;
-		cx.spawn(async move |this, cx| {
-			crate::tabs::tagged(tab, async move {
+		let this = cx.weak_entity();
+		let mut async_app = cx.to_async();
+		// The tab owns the open until its connection is dropped (SSH kill +
+		// wait). A close or quit cancels it, which kills an ssh that is
+		// still connecting, so the drain does not wait out ssh's connect
+		// timeout and the hello's.
+		let cancel = snip_core::gitrun::CancelToken::new();
+		let token = cancel.clone();
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel),
+			async move {
 				// Tests hold the open at the test clock so a user action can
-				// land while it is in flight.
+				// land while it is in flight; a cancel ends the hold as it
+				// ends a real connect.
 				#[cfg(test)]
 				if let Some(delay) = open_delay {
-					cx.background_executor().timer(delay).await;
+					hold_open(&mut async_app, delay, &token).await;
 				}
 				let probe = host.clone();
 				let result = bg
 					.spawn(async move {
 						Client::new(probe, device_name())
-							.open_workspace(path.trim())
+							.open_workspace_with(path.trim(), Some(&token))
 							.map_err(describe)
 					})
 					.await;
-				let _ = this.update(cx, |this, cx| {
+				let _ = this.update(&mut async_app, |this, cx| {
 					this.remote.busy = false;
 					if this.remote.open_seq != open_seq {
 						// The user opened a local workspace, closed the
@@ -754,6 +790,7 @@ impl WorkbenchModel {
 							"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
 							this.remote.open_seq
 						);
+						this.resume_remote_restore(cx);
 						return;
 					}
 					let restore = this
@@ -789,10 +826,8 @@ impl WorkbenchModel {
 						}
 					}
 				});
-			})
-			.await
-		})
-		.detach();
+			},
+		);
 	}
 
 	/// Opens the path typed into the menu, on the host being browsed.
@@ -839,6 +874,23 @@ impl WorkbenchModel {
 			id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
 		});
 		self.attempt_restore(cx);
+	}
+
+	/// A stopped drain invalidated an in-flight restore. Its old transport
+	/// must finish before retrying; either the result or drain may land first.
+	pub(crate) fn resume_remote_restore(&mut self, cx: &mut Context<Self>) {
+		if self.remote.busy || self.lifecycle.is_draining() {
+			return;
+		}
+		let interrupted = self.remote.restoring.as_ref().is_some_and(|r| {
+			r.open_seq.is_some_and(|seq| seq != self.remote.open_seq)
+		});
+		if interrupted {
+			let r = self.remote.restoring.as_mut().unwrap();
+			r.open_seq = None;
+			app_log!("[APP:REMOTE_RETRY: attempt={}]", r.attempts + 1);
+			self.attempt_restore(cx);
+		}
 	}
 
 	fn attempt_restore(&mut self, cx: &mut Context<Self>) {
@@ -1125,6 +1177,22 @@ impl WorkbenchModel {
 				});
 			},
 		);
+	}
+}
+
+/// Tests hold a connect at the test clock so a user action can land while
+/// it is in flight; a cancel ends the hold as it ends a real connect.
+#[cfg(test)]
+async fn hold_open(
+	cx: &mut gpui::AsyncApp,
+	delay: std::time::Duration,
+	cancel: &snip_core::gitrun::CancelToken,
+) {
+	let slice = std::time::Duration::from_millis(50);
+	let mut held = std::time::Duration::ZERO;
+	while held < delay && !cancel.is_cancelled() {
+		cx.background_executor().timer(slice).await;
+		held += slice;
 	}
 }
 

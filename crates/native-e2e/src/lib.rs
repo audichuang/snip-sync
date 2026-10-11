@@ -30,6 +30,32 @@ pub fn scaled(d: Duration) -> Duration {
 	}))
 }
 
+/// Wait for the clipboard to become readable and match the completed copy.
+/// Callers that expect no change must first observe the completed refusal,
+/// accept any readable text here, and compare it once outside this helper.
+pub fn wait_for_clipboard<E: std::fmt::Debug>(
+	mut read: impl FnMut() -> Result<String, E>,
+	mut matches: impl FnMut(&str) -> bool,
+	timeout: Duration,
+) -> Result<String, String> {
+	let deadline = std::time::Instant::now() + scaled(timeout);
+	loop {
+		let value = read();
+		if let Ok(text) = &value {
+			if matches(text) {
+				return Ok(text.clone());
+			}
+		}
+		let now = std::time::Instant::now();
+		if now >= deadline {
+			return Err(format!(
+				"clipboard did not match before timeout; last read: {value:?}"
+			));
+		}
+		std::thread::sleep(Duration::from_millis(40).min(deadline - now));
+	}
+}
+
 /// Splits a paste row control id `paste-<kind>:<ix>:<path>` into its plan
 /// index and path (the path may itself contain `:`).
 pub fn parse_paste_id<'a>(id: &'a str, kind: &str) -> Option<(usize, &'a str)> {
@@ -96,6 +122,60 @@ pub fn parse_covered(line: &str) -> Option<(String, String)> {
 mod tests {
 	use super::*;
 	use std::collections::HashMap;
+
+	#[test]
+	fn clipboard_wait_retries_unavailable_and_stale_values() {
+		let mut values = [
+			Err("ContentNotAvailable"),
+			Ok("old".into()),
+			Ok("expected".into()),
+		]
+		.into_iter();
+		assert_eq!(
+			wait_for_clipboard(
+				|| values.next().expect("too many reads"),
+				|s| s == "expected",
+				Duration::from_secs(1)
+			)
+			.unwrap(),
+			"expected"
+		);
+	}
+
+	#[test]
+	fn clipboard_timeout_reports_last_value_or_error() {
+		for value in [Ok("wrong".into()), Err("unavailable")] {
+			let err =
+				wait_for_clipboard(|| value.clone(), |_| false, Duration::ZERO)
+					.unwrap_err();
+			assert!(
+				err.contains(if value.is_ok() {
+					"wrong"
+				} else {
+					"unavailable"
+				}),
+				"{err}"
+			);
+		}
+	}
+
+	#[test]
+	fn unchanged_clipboard_reads_do_not_hide_a_wrong_value() {
+		let mut values = [
+			Err("unavailable"),
+			Ok("unexpected change".into()),
+			Ok("old".into()),
+		]
+		.into_iter();
+		let actual = wait_for_clipboard(
+			|| values.next().unwrap(),
+			|_| true,
+			Duration::from_secs(1),
+		)
+		.unwrap();
+		assert_eq!(actual, "unexpected change");
+		assert_eq!(values.next(), Some(Ok("old".into())));
+	}
 
 	#[test]
 	fn paste_ids_resolve_by_path_and_keep_plan_order() {

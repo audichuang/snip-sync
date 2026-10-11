@@ -268,6 +268,94 @@ fn nested_read(
 	std::env::remove_var("SNIP_READ_PHASE");
 }
 
+// The empty payload still takes the same layout/index initialization path as
+// a real paste, without unrelated reads obscuring which Git call is bounded.
+fn replay_index_options(shim: &Shim, repo: &Path) {
+	use snip_core::commits::{
+		plan_commit_replay_with, CommitError, CommitsPayload,
+	};
+	let git = Git::open(repo).unwrap();
+	let payload = CommitsPayload { commits: vec![] };
+	fs::write(repo.join("CaseProbe"), "probe").unwrap();
+	let folds_case = repo.join("caseprobe").exists();
+	fs::remove_file(repo.join("CaseProbe")).unwrap();
+	if !folds_case {
+		// Case-sensitive filesystems must not read the spelling index at all.
+		let (ready, _) = shim.arm("ls-files", true);
+		plan_commit_replay_with(&git, &payload, &RunOptions::default())
+			.unwrap();
+		assert!(!ready.exists());
+		std::env::remove_var("SNIP_READ_PHASE");
+		return;
+	}
+	for timeout in [false, true] {
+		let (ready, release) = shim.arm("ls-files", false);
+		let cancel = CancelToken::new();
+		let opts = RunOptions {
+			cancel: Some(cancel.clone()),
+			timeout: Duration::from_secs(if timeout { 1 } else { 20 }),
+			..RunOptions::default()
+		};
+		let git = git.clone();
+		let payload = payload.clone();
+		let (tx, rx) = mpsc::channel();
+		let worker = thread::spawn(move || {
+			let _ = tx.send(plan_commit_replay_with(&git, &payload, &opts));
+		});
+		let owned = ReadThread {
+			cancel: cancel.clone(),
+			release,
+			thread: Some(worker),
+		};
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while !ready.exists() {
+			assert!(
+				Instant::now() < deadline,
+				"replay never reached ls-files: {:?}",
+				rx.try_recv()
+			);
+			thread::sleep(Duration::from_millis(10));
+		}
+		if !timeout {
+			cancel.cancel();
+		}
+		let err = rx
+			.recv_timeout(Duration::from_secs(3))
+			.expect("replay ls-files ignored cancellation/deadline")
+			.unwrap_err();
+		assert!(
+			matches!(err, CommitError::Git(GitError::Timeout { .. }))
+				&& timeout || matches!(
+				err,
+				CommitError::Git(GitError::Cancelled { .. })
+			) && !timeout,
+			"{err}"
+		);
+		assert!(!owned.release.exists());
+		assert_idle();
+		drop(owned);
+	}
+	shim.arm("ls-files", true);
+	assert!(matches!(
+		plan_commit_replay_with(&git, &payload, &RunOptions::default()),
+		Err(CommitError::Git(GitError::Failed { code: Some(42), .. }))
+	));
+	std::env::remove_var("SNIP_READ_PHASE");
+	// A truncated spelling index could miss an alias and permit an unsafe write.
+	for overflow in [Overflow::Truncate, Overflow::Error] {
+		let opts = RunOptions {
+			max_stdout: 1,
+			overflow,
+			..RunOptions::default()
+		};
+		assert!(matches!(
+			plan_commit_replay_with(&git, &payload, &opts),
+			Err(CommitError::Git(GitError::OutputLimit { limit: 1, .. }))
+		));
+	}
+	assert_idle();
+}
+
 #[test]
 fn nested_preview_options_and_source_fidelity() {
 	assert_idle();
@@ -283,6 +371,7 @@ fn nested_preview_options_and_source_fidelity() {
 	fs::write(repo.join("a.txt"), "WORKING_B\n").unwrap();
 	let git_repo = Git::open(&repo).unwrap();
 	let shim = Shim::new();
+	replay_index_options(&shim, &repo);
 	for (source, phase) in [
 		(GitSource::Staged, "--raw"),
 		(GitSource::Staged, "--batch"),

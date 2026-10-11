@@ -2324,6 +2324,7 @@ impl WorkbenchModel {
 	/// reads and the workspace stays open: fetch what never landed. Also
 	/// run for a tab whose quit drained when the quit stopped elsewhere.
 	pub(crate) fn resume_after_drain(&mut self, cx: &mut Context<Self>) {
+		self.resume_remote_restore(cx);
 		self.preview_loading = false;
 		self.tree_cancel = None;
 		self.rev_tree_cancel = None;
@@ -2535,6 +2536,8 @@ impl WorkbenchModel {
 
 	fn finish_close(&mut self, cx: &mut Context<Self>) {
 		self.release_workspace_state(cx);
+		// A closed folder is not reconnected by a later stopped drain.
+		self.remote.restoring = None;
 		self.workspace_open = false;
 		if self.ws_tab.is_some() {
 			// The root drops the tab.
@@ -15428,6 +15431,88 @@ mod tests {
 				);
 			}
 
+			/// An open owns its transport until the handshake and connection
+			/// cleanup return, even when this tab has no workspace yet. The
+			/// close cancels it: a host that does not answer (ssh's connect
+			/// timeout and the hello's outlast the drain deadline) must not
+			/// keep the tab open.
+			#[gpui::test]
+			fn closing_a_connecting_empty_tab_cancels_the_remote_open(
+				cx: &mut TestAppContext,
+			) {
+				let tmp = tempfile::tempdir().unwrap();
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
+				click_id(cx, "ws-tab-new".into());
+				let empty = tab(&root, cx, 1);
+				let hold = crate::lifecycle::DRAIN_DEADLINE * 4;
+				empty.update(cx, |m, cx| {
+					m.remote.hosts = vec![snip_remote::RemoteHost::in_process(
+						worker.clone(),
+					)];
+					m.e2e_remote_open_delay = Some(hold);
+					m.open_remote_path(0, tmp.path().display().to_string(), cx);
+				});
+				cx.run_until_parked();
+				assert!(empty.read_with(cx, |m, _| m.remote.busy));
+				assert_eq!(
+					empty.update(cx, |m, _| m.lifecycle.unfinished()),
+					1
+				);
+				cx.simulate_keystrokes("cmd-w");
+				// One hold slice: the cancel lands well inside the deadline.
+				cx.executor().advance_clock(Duration::from_millis(100));
+				wait(
+					cx,
+					"open cancelled, connection cleaned, tab closed",
+					|cx| count(&root, cx) == 1,
+				);
+				assert!(!empty.read_with(cx, |m, _| m.remote.busy));
+				assert_eq!(
+					empty.update(cx, |m, _| m.lifecycle.unfinished()),
+					0
+				);
+			}
+
+			/// Browsing a host's folders in the menu also starts ssh: the
+			/// listing belongs to the tab, and a close cancels it rather than
+			/// leaving it to run on after the tab is gone.
+			#[gpui::test]
+			fn closing_a_tab_while_browsing_a_host_cancels_the_listing(
+				cx: &mut TestAppContext,
+			) {
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
+				click_id(cx, "ws-tab-new".into());
+				let empty = tab(&root, cx, 1);
+				empty.update(cx, |m, cx| {
+					m.remote.hosts = vec![snip_remote::RemoteHost::in_process(
+						worker.clone(),
+					)];
+					m.e2e_remote_open_delay =
+						Some(crate::lifecycle::DRAIN_DEADLINE * 4);
+					m.browse_remote_host(0, cx);
+				});
+				cx.run_until_parked();
+				assert_eq!(
+					empty.update(cx, |m, _| m.lifecycle.unfinished()),
+					1
+				);
+				cx.simulate_keystrokes("cmd-w");
+				cx.executor().advance_clock(Duration::from_millis(100));
+				wait(cx, "listing cancelled and tab closed", |cx| {
+					count(&root, cx) == 1
+				});
+				assert_eq!(
+					empty.update(cx, |m, _| m.lifecycle.unfinished()),
+					0
+				);
+			}
+
 			/// An empty tab with a job still running drains it before it goes.
 			#[gpui::test]
 			fn an_empty_tab_with_a_job_drains_before_closing(
@@ -16277,6 +16362,112 @@ mod tests {
 					}
 				);
 			}
+			fn interrupted_restore(
+				cx: &mut TestAppContext,
+				answer_before_abort: bool,
+				first_fails: bool,
+			) {
+				let tmp = tempfile::tempdir().unwrap();
+				let path = tmp.path().join("restored");
+				if !first_fails {
+					fs::create_dir(&path).unwrap();
+				}
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
+				let blocker = tab(&root, cx, 0);
+				click_id(cx, "ws-tab-new".into());
+				let restoring = tab(&root, cx, 1);
+				let held = hold_job(&blocker, cx, JobKind::UncancellableRead);
+				restoring.update(cx, |m, cx| {
+					let host =
+						snip_remote::RemoteHost::in_process(worker.clone());
+					let name = host.name.clone();
+					m.remote.hosts = vec![host];
+					m.e2e_remote_open_delay = Some(Duration::from_secs(2));
+					m.restore_remote(
+						crate::remote::RecentRemote {
+							host: name,
+							path: path.display().to_string(),
+						},
+						cx,
+					);
+				});
+				cx.run_until_parked();
+				assert!(restoring.read_with(cx, |m, _| m.remote.busy));
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				if answer_before_abort {
+					cx.executor().advance_clock(Duration::from_secs(2));
+					wait(cx, "first restore finished", |cx| {
+						!restoring.read_with(cx, |m, _| m.remote.busy)
+					});
+				}
+				// The other tab's real Lifecycle reports the same deadline
+				// failure as poll_lifecycle, without sleeping eight seconds.
+				blocker.update(cx, |m, cx| {
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now()
+							+ crate::lifecycle::DRAIN_DEADLINE,
+						crate::lifecycle::GitLoad::idle(),
+					);
+					assert!(matches!(
+						step,
+						crate::lifecycle::Step::Failed { .. }
+					));
+					m.resume_after_drain(cx);
+					cx.emit(TabEvent::DrainFailed);
+				});
+				held.set(true);
+				settle(cx);
+				if !answer_before_abort {
+					cx.executor().advance_clock(Duration::from_secs(2));
+					wait(cx, "first restore finished", |cx| {
+						!restoring.read_with(cx, |m, _| m.remote.busy)
+							|| restoring.read_with(cx, |m, _| {
+								m.remote
+									.restoring
+									.as_ref()
+									.is_some_and(|r| r.attempts > 1)
+							})
+					});
+				}
+				if first_fails {
+					fs::create_dir(&path).unwrap();
+				}
+				cx.executor().advance_clock(Duration::from_secs(2));
+				wait(
+					cx,
+					"restore resumed in the same tab after stopped quit",
+					|cx| workspace_ready(&restoring, cx),
+				);
+				assert_eq!(count(&root, cx), 2);
+				assert_eq!(tab(&root, cx, 1), restoring);
+				assert!(restoring.read_with(cx, |m, _| m
+					.remote
+					.restoring
+					.is_none() && m
+					.remote
+					.session
+					.is_some()));
+				assert!(!root.read_with(cx, |r, _| r.quit_sent));
+			}
+
+			#[gpui::test]
+			fn completed_restore_resumes_after_quit_is_aborted(
+				cx: &mut TestAppContext,
+			) {
+				interrupted_restore(cx, true, false);
+			}
+
+			#[gpui::test]
+			fn late_failed_restore_resumes_after_quit_is_aborted(
+				cx: &mut TestAppContext,
+			) {
+				interrupted_restore(cx, false, true);
+			}
+
 			/// A retry that falls while the tab drains for a quit that is
 			/// then stopped is put off, not dropped: the tab keeps trying.
 			#[gpui::test]
