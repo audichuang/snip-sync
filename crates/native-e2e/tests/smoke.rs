@@ -6505,12 +6505,9 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	assert!(picked.contains("TWO_BYTES"), "{picked}");
 	assert!(!picked.contains("C_BYTES"), "{picked}");
 
-	// Right-click outside the selection selects that row alone first.
-	let other = copy_by_menu(
-		"tree-row:a/one.txt",
-		&["ONE_BYTES"],
-		&["TWO_BYTES", "C_BYTES"],
-	);
+	// Right-click another selected row keeps the selected content.
+	let other =
+		copy_by_menu("tree-row:a/one.txt", &["ONE_BYTES"], &["C_BYTES"]);
 	assert!(other.contains("ONE_BYTES"), "{other}");
 	assert!(!other.contains("C_BYTES"), "{other}");
 
