@@ -2260,10 +2260,14 @@ def open_workspace_tab(s: NativeSession, win: dict[str, Any], workspace: str) ->
 
 def close_shown_tab(s: NativeSession, win: dict[str, Any], tab: int) -> dict[str, Any]:
     """Cmd/Ctrl+W on the shown tab `tab`; returns the close line, the count after it, and
-    whether its own close drain reported nothing left."""
+    whether its own close drain reported nothing left.
+
+    A closed tab moves "+" left, and the app reports its new bounds a frame after the close
+    line. Return only once they are in: a "+" clicked at once hit the old, empty spot."""
     start = len(s.lines)
     s.key(win["wid"], "ctrl+w")
-    _, _, closed = s.wait_line(lambda line: f"[APP:WS_TAB_CLOSED: id={tab} count=" in line, start=start, timeout=e2e_scaled(30.0))
+    at, _, closed = s.wait_line(lambda line: f"[APP:WS_TAB_CLOSED: id={tab} count=" in line, start=start, timeout=e2e_scaled(30.0))
+    s.wait_line(lambda line: "[APP:CTRL_BOUNDS: id=ws-tab-new " in line, start=at + 1, timeout=e2e_scaled(10.0))
     count = int(re.search(r"count=(\d+)", closed)[1])
     drained = any(
         "phase=drained intent=close-workspace" in line and all(f in line for f in ("jobs=0", "inflight=0", "queued=0", "leaked=0"))
