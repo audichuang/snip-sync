@@ -70,7 +70,7 @@ python3 "$REPO/scripts/real_ui_round.py" finish --run "$RUN"                  # 
 
 ### 1.3 殘留、設定快照
 
-照本機規程第 2 節第 3、4 步：每次啟動前 `pgrep -fl snip-desktop-native` 必須沒有輸出，否則停；第一次啟動前拍真實設定資料夾快照，最後 `finish` 後比對（I-config，見第 5 節）。`prepare` 已經做了其中大部分，腳本與本節不符時以本節為準並寫出差異。
+每次啟動前執行 `ps -A -o pid=,comm= | awk '$0 ~ /(^|\/)snip-desktop-native$/ {print}'`，必須沒有輸出，否則停。`comm` 是實際執行檔路徑，不含參數；不要用 `pgrep -fl` 的指令列子字串比對，其他 session 的 cargo 或 shell 可能只是提到這個名稱。`scripts/real_ui_round.py prepare` 也使用 `comm`；`finish` 只比對本輪 `$RUN` 的 App bundle 內 `Contents/MacOS/snip-desktop-native` 完整路徑。第一次啟動前拍真實設定資料夾快照，最後 `finish` 後比對（I-config，見第 5 節），沿用本機規程第 2 節第 4 步。
 
 ### 1.4 分頁用的 fixture
 
@@ -462,14 +462,29 @@ PY
 
 ### 4.6 遠端分頁（WT40–WT46）
 
-這一節需要遠端規程的 Ubuntu 準備（見 1.4）。主機別名是 `ubuntu`，`$W` 是 Ubuntu 上本輪的目錄（含 `$SHA`）。每一格開始前 `ssh ubuntu "ls '$W/pids' | wc -l"` 記下 worker 數 `K0`。
+這一節需要遠端規程的 Ubuntu 準備（見 1.4）。主機別名是 `ubuntu`，`$W` 是 Ubuntu 上本輪的目錄（含 `$SHA`）。`$W/pids` 是歷史紀錄：瀏覽資料夾、解析路徑的短命連線也會留下檔案，檔案數不代表存活 worker 數。每格開始前可保存歷史紀錄作診斷，但 WT40 只判斷仍存活且執行本輪 binary 的 worker。定義以下唯讀查核函式，輸出保存到該格證據目錄：
+
+```bash
+live_workers() {
+  ssh ubuntu bash -s -- "$W" <<'SH'
+W=$1
+for record in "$W"/pids/*; do
+  [ -f "$record" ] || continue
+  pid=$(cat "$record")
+  case "$pid" in ''|0*|*[!0-9]*) echo "invalid PID record: $record" >&2; exit 1 ;; esac
+  args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+  [ "$args" != "$W/src/target/release/snip serve --stdio" ] || printf '%s\t%s\n' "$pid" "$args"
+done
+SH
+}
+```
 
 #### WT40 遠端分頁：標籤 `host ▸ name`、已連線圖示
 
 - **前置狀態**：S1，目前 `ws-src`。
 - **操作**：`btn-workspace-menu`，點 `ubuntu` 那一列的 `remote-host:<ix>`（先看截圖確認名稱），依序點進 `snip-ui-run`、`<SHA>`、`gitws`（每一層的 `remote-folder:<n>` 以 `CTRL_BOUNDS` 為準），點 `btn-remote-open-here`。等載入完成。`shot after`。`hv` 到 `ws-tab:1` 停 2 秒 `shot hover-tab`。`wtitle`。
 - **預期畫面**：兩個分頁，第二個標籤 `ubuntu ▸ gitws`，圖示是「遠端分支」圖示（強調色，不是資料夾），是目前分頁。標題 `ubuntu ▸ gitws — snip-sync`。`hover-tab` 的 tooltip 是 `ubuntu:/home/audichuang/snip-ui-run/<SHA>/gitws`（轉錄）。`ws-src` 的圖示仍是資料夾。
-- **比對**：`L:` `[APP:WS_TAB_OPENED: id=2 count=2`、`[APP:WS_TAB_ACTIVE: id=2 ix=1`、`[APP:REMOTE_OPENED: ubuntu ▸ gitws generation=`（順序：worker 先在發出請求的分頁解析路徑，之後 root 開新分頁，新分頁排空並開啟，所以依序是這三行；用行號確認，三行都出現且順序對才算過）。最新的狀態探針是 `ws-tab-state:1:connected`（`ws-tab-state:0:local` 仍在）。`wtitle` = `ubuntu ▸ gitws — snip-sync`。`ssh ubuntu "ls '$W/pids' | wc -l"` 比 `K0` 多 1。
+- **比對**：`L:` `[APP:WS_TAB_OPENED: id=2 count=2`、`[APP:WS_TAB_ACTIVE: id=2 ix=1`、`[APP:REMOTE_OPENED: ubuntu ▸ gitws generation=`（順序：worker 先在發出請求的分頁解析路徑，之後 root 開新分頁，新分頁排空並開啟，所以依序是這三行；用行號確認，三行都出現且順序對才算過）。最新的狀態探針是 `ws-tab-state:1:connected`（`ws-tab-state:0:local` 仍在）。`wtitle` = `ubuntu ▸ gitws — snip-sync`。`live_workers > "$CASE/live-workers-after-open.txt"` 必須成功，且輸出至少一個本輪 worker；搭配該分頁的 `REMOTE_OPENED` 與 connected 探針確認連線。不要求歷史 PID 紀錄恰好多 1，也不把仍由來源分頁保留的瀏覽連線當成多開遠端分頁。
 - **截圖**：`before.png`、`after.png`、`hover-tab.png`。
 
 #### WT41 連線中的圖示
@@ -593,9 +608,9 @@ clip > "$RUN/p-busy.sha"
 #### WT60 目前分頁寫入中：Cmd+W 與 × 都被拒絕
 
 - **前置狀態**：「寫入中」，目前是遠端分頁（`ix=2`）。
-- **操作**：(1) `mark`，`Cmd+W`，等 1 秒，`shot refused-cmdw`。(2) `mark`，`pt ws-tab-close:2`，點，等 1 秒，`shot refused-x`。(3) `hv` 到 `ws-tab:2` 停 2 秒，`shot hover-pasting`。(4) 放開 hold，等 `PASTE_DONE`，`shot after-done`。
+- **操作**：先執行 `WT60_L0=$(wc -l < "$LOG")`（兩次拒絕共用的起點）。(1) `mark`，`Cmd+W`，等 1 秒，`shot refused-cmdw`，保存本段 `newlog`。(2) `mark`，`pt ws-tab-close:2`，點，等 1 秒，`shot refused-x`，保存本段 `newlog`。(3) `hv` 到 `ws-tab:2` 停 2 秒，`shot hover-pasting`。(4) 放開 hold，等 `PASTE_DONE`，`shot after-done`。
 - **預期畫面**：(1)(2) 分頁還在，沒有關；狀態列是「正在套用變更，已拒絕關閉、開啟與結束，以免寫入中斷。」（轉錄；不得是原始 key `workspace_busy_applying`）。分頁標籤右邊有「貼上」圖示（強調色）。(3) tooltip 是 `ubuntu:<路徑> · 貼上中`。(4) 貼上圖示消失。
-- **比對**：(1)(2) 各 `L:` `[APP:PASTE_BUSY: refused=close-workspace]`、`[APP:LIFECYCLE: phase=refused intent=close-workspace reason=applying`；`NOT:` `WS_TAB_CLOSED`、`[APP:WORKSPACE: state=closed`。(3) 寫入中 `ws-tab-pasting:2` 有 `CTRL_BOUNDS`。(4) `L:` `[APP:PASTE_DONE: created=2 overwritten=0 skipped=0 deleted=0 errors=0`；之後 `CTRL_GONE: id=ws-tab-pasting:2`。磁碟：`ssh ubuntu "cd '$W/pastews/cut-dst' && sha256sum new.txt new2.txt"` 與「`ssh ubuntu "cd '$W/oracle/cut-dst' && snip paste --apply --stdin" < "$RUN/p-busy.txt"`（先 `mkdir -p '$W/oracle/cut-dst'`）之後同樣兩個檔的 `sha256sum`」相同。
+- **比對**：(1)(2) **每次**各有 `L:` `[APP:PASTE_BUSY: refused=close-workspace]`；各段 `NOT:` `WS_TAB_CLOSED`、`[APP:WORKSPACE: state=closed`。從 `WT60_L0` 起的兩次拒絕合併日誌，`[APP:LIFECYCLE: phase=refused intent=close-workspace reason=applying` **至少一次**即可；`WorkbenchModel::emit_life` 比對完整的 `last_life_log`，相同字串會去重，所以第二次拒絕可能沒有新 lifecycle 行。(3) 寫入中 `ws-tab-pasting:2` 有 `CTRL_BOUNDS`。(4) `L:` `[APP:PASTE_DONE: created=2 overwritten=0 skipped=0 deleted=0 errors=0`；之後 `CTRL_GONE: id=ws-tab-pasting:2`。磁碟：`ssh ubuntu "cd '$W/pastews/cut-dst' && sha256sum new.txt new2.txt"` 與「`ssh ubuntu "cd '$W/oracle/cut-dst' && snip paste --apply --stdin" < "$RUN/p-busy.txt"`（先 `mkdir -p '$W/oracle/cut-dst'`）之後同樣兩個檔的 `sha256sum`」相同。
 - **截圖**：`before.png`、`refused-cmdw.png`、`refused-x.png`、`hover-pasting.png`、`after-done.png`。
 
 #### WT61 背景分頁寫入中：標記、圖示，以及對它按 ×
@@ -641,7 +656,7 @@ clip > "$RUN/p-busy.sha"
 - **前置狀態**：S4（四個分頁），目前 `gamma`（`ix=3`）。沒有貼上進行中。
 - **操作**：`mark`。`Cmd+Q`。等程序結束（最多 15 秒）。所以視窗關閉後無法再截圖，所以按之前先 `shot before-quit`，按之後只讀日誌與 exit code。
 - **預期畫面**：視窗關閉，程序結束。
-- **比對**：`L:` `[APP:QUIT: deferred`；四個分頁各有一行 `[APP:LIFECYCLE: phase=drained intent=quit jobs=0`，其中**三行**（背景分頁 `id=1`、`id=2`、`id=3`）結尾 `]` 前帶 ` ws_tab=<id>`，目前分頁 `gamma`（`id=4`）那一行沒有（`newlog | grep 'phase=drained intent=quit' | wc -l` 是 4，`grep -c ' ws_tab='` 在這幾行裡是 3）。`NOT:` `PASTE_BUSY`。程序結束：`kill -0 "$PID"` 失敗；`$RUN/app-gate-b-exit.json` 的 `exit_code` 是 0；10 秒內結束。`pgrep -fl snip-desktop-native` 沒有輸出，這一輪出現過的 git 子程序都不在。`QUIT: deferred` 恰好一行，且不帶 ` ws_tab=`。
+- **比對**：`L:` `[APP:QUIT: deferred`；四個分頁各有一行 `[APP:LIFECYCLE: phase=drained intent=quit jobs=0`，其中**三行**（背景分頁 `id=1`、`id=2`、`id=3`）結尾 `]` 前帶 ` ws_tab=<id>`，目前分頁 `gamma`（`id=4`）那一行沒有（`newlog | grep 'phase=drained intent=quit' | wc -l` 是 4，`grep -c ' ws_tab='` 在這幾行裡是 3）。`NOT:` `PASTE_BUSY`。程序結束：`kill -0 "$PID"` 失敗；`$RUN/app-gate-b-exit.json` 的 `exit_code` 是 0；10 秒內結束。1.3 的 `ps comm` 執行檔查核沒有 desktop 行程，這一輪出現過的 git 子程序都不在。`QUIT: deferred` 恰好一行，且不帶 ` ws_tab=`。
 - **截圖**：`before-quit.png`。
 
 #### WT71 視窗關閉鈕與 Cmd+Q 相同
@@ -819,7 +834,7 @@ PY
 |---|---|---|
 | I-config | 同本機規程 I-config：第一次啟動前與最後一個 App 結束後，真實設定資料夾的檔案數、SHA-256、mtime、大小全部相同 | `diff` 兩個 `.sha` 與兩個 `.mtime` 沒有輸出；`$RUN/config/recent-workspaces.json` 與 `open-tabs.json` 存在（`open-tabs.json` 只寫進 `$RUN/config`，真實設定資料夾不得多出檔案） |
 | I-clip | 最後一次 `finish` 之後剪貼簿還原成開跑前的內容 | `finish` 的輸出說明剪貼簿雜湊相同 |
-| I-leftover | 每一次啟動前 `pgrep -fl snip-desktop-native` 沒有輸出；遠端格結束後 Ubuntu 沒有本輪殘留（遠端規程 I03、第 6 節收尾，且 `~/.local/bin/snip` 的 wrapper 雜湊比對用 WT41 之後的那一份） | 全部成立 |
+| I-leftover | 每一次啟動前，1.3 的 `ps comm` 執行檔查核沒有 desktop 行程；`finish` 後本輪 App bundle 的執行檔沒有存活行程。cargo／shell 指令列中提到名稱或 bundle 路徑不算殘留。遠端格結束後 Ubuntu 沒有本輪殘留（遠端規程 I03、第 6 節收尾，且 `~/.local/bin/snip` 的 wrapper 雜湊比對用 WT41 之後的那一份） | 全部成立 |
 | I-fixture | `$T` 下每個 repo 的 `git status --porcelain` 在整輪結束時只有這份規程自己做過的改動（WT54 的 `readme.txt`、WT50 貼進的檔案）；`$B` 的 fixture 沒有被改 | 與預期相同 |
 | I-rtk | 遠端格有碰 Ubuntu 時，`rtk_snapshot` 的 before 與 after 相同（遠端規程 I01） | 相同 |
 

@@ -149,7 +149,9 @@ class SystemOperations:
     def list_processes(self) -> List[ProcessRecord]:
         try:
             res = subprocess.run(
-                ["ps", "-A", "-o", "pid=,command="],
+                # comm is the executable path, without cargo/shell arguments
+                # that happen to mention the desktop binary or QA bundle.
+                ["ps", "-A", "-o", "pid=,comm="],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -356,20 +358,8 @@ class LeftoverItem:
 
 
 def is_snip_desktop_process(cmd: str) -> bool:
-    """Check if the process executable is snip-desktop-native, handling paths with spaces."""
-    cmd_clean = cmd.strip()
-    if not cmd_clean:
-        return False
-
-    # Exclude common tools/interpreters that might pass snip-desktop-native in argument strings
-    first_token = cmd_clean.split()[0]
-    base_name = Path(first_token).name.lower()
-    if base_name in ("agy", "node", "python", "python3", "grep", "git", "tail", "vim", "vi", "cargo"):
-        return False
-
-    # Match snip-desktop-native as an executable token (at start or after slash/space, followed by space or end)
-    pattern = r"(?:^|[/\s])snip-desktop-native(?:\s|$)"
-    return bool(re.search(pattern, cmd_clean))
+    """Match ps comm's executable basename, including bundle paths with spaces."""
+    return Path(cmd.strip()).name == "snip-desktop-native"
 
 
 def is_earlier_round_desktop_process(cmd: str) -> bool:
@@ -1512,7 +1502,7 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     app_bundle_path = Path(env_data["app_bundle"])
     remaining = [
         p for p in sys_ops.list_processes()
-        if str(app_bundle_path) in p.command
+        if p.command == str(app_bundle_path / "Contents/MacOS/snip-desktop-native")
     ]
     if remaining:
         print(f"ERROR: Remaining processes found from this round: {remaining}", file=sys.stderr)

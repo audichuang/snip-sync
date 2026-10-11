@@ -37,9 +37,11 @@ impl WorkbenchModel {
 		let browse = self.remote.browse.as_ref();
 		for (ix, host) in self.remote.hosts.iter().enumerate() {
 			let id = format!("remote-host:{ix}");
+			let selector = id.clone();
 			let open = browse.is_some_and(|b| b.host == ix);
 			out.push(
 				menu_row(SharedString::from(id.clone()), 82)
+					.debug_selector(move || selector)
 					.tooltip(tip(host.name.clone()))
 					.when(open, |d| d.bg(rgb(pal().hover_bg)))
 					.on_click(cx.listener(move |this, _, _, cx| {

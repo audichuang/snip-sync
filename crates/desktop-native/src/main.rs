@@ -5475,6 +5475,10 @@ impl WorkbenchModel {
 							model.restore_log_after_paste();
 							model.pending_focus =
 								Some(model.focus_handle.clone());
+							// A background paste removed its PastePanel. Do not
+							// restore that saved handle when the tab is shown:
+							// it has no element to receive the next shortcut.
+							model.resume_focus = None;
 							// A rescan refreshes the destination's summary too,
 							// then reloads the open repo keeping its anchors.
 							model.reload_repos(cx);
@@ -14771,6 +14775,222 @@ mod tests {
 					}
 				});
 				(tmp, a, b, root, cx)
+			}
+
+			fn wait_scaled(
+				cx: &mut VisualTestContext,
+				what: &str,
+				mut ready: impl FnMut(&mut VisualTestContext) -> bool,
+			) {
+				let deadline = std::time::Instant::now()
+					+ snip_native_e2e::scaled(Duration::from_secs(10));
+				loop {
+					cx.run_until_parked();
+					cx.executor().advance_clock(snip_native_e2e::scaled(
+						Duration::from_millis(50),
+					));
+					cx.run_until_parked();
+					if ready(cx) {
+						return;
+					}
+					assert!(
+						std::time::Instant::now() < deadline,
+						"timed out waiting for {what}"
+					);
+					std::thread::sleep(snip_native_e2e::scaled(
+						Duration::from_millis(10),
+					));
+				}
+			}
+
+			/// Two local tabs and a third remote tab opened with the menu's
+			/// actual controls. Only the transport is replaced by a worker
+			/// on this machine; opening, focus and tab routing are unchanged.
+			fn three_tabs_with_remote(
+				cx: &mut TestAppContext,
+			) -> (
+				tempfile::TempDir,
+				PathBuf,
+				Entity<TabsRoot>,
+				&mut VisualTestContext,
+			) {
+				let (tmp, _a, _b, root, cx) = two_tabs(cx);
+				let shared =
+					dunce::canonicalize(tmp.path()).unwrap().join("remote");
+				fs::create_dir(&shared).unwrap();
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				click_id(cx, "ws-tab-new".into());
+				let remote = tab(&root, cx, 2);
+				remote.update(cx, |m, cx| {
+					m.remote.hosts =
+						vec![snip_remote::RemoteHost::in_process(worker)];
+					m.remote.recent.clear();
+					cx.notify();
+				});
+				click_id(cx, "remote-host:0".into());
+				wait_scaled(cx, "remote host listed", |cx| {
+					remote.read_with(cx, |m, _| !m.remote.busy)
+				});
+				click_id(cx, "remote-path-input".into());
+				cx.simulate_keystrokes("cmd-a");
+				cx.simulate_input(&shared.display().to_string());
+				click_id(cx, "btn-remote-open".into());
+				wait_scaled(cx, "third remote tab loaded", |cx| {
+					remote.read_with(cx, |m, _| {
+						m.remote.session.is_some() && !m.is_loading
+					})
+				});
+				assert_eq!(active(&root, cx), Some(2));
+				(tmp, shared, root, cx)
+			}
+
+			#[gpui::test]
+			fn closing_a_remote_tab_drops_its_connection(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let (_tmp, _shared, root, cx) = three_tabs_with_remote(cx);
+				let remote = tab(&root, cx, 2);
+				let client = remote.read_with(cx, |m, _| {
+					std::sync::Arc::downgrade(
+						&m.remote.session.as_ref().unwrap().client,
+					)
+				});
+				assert!(
+					client.upgrade().is_some(),
+					"the tab owns a live connection"
+				);
+				click_id(cx, "ws-tab-close:2".into());
+				wait_scaled(
+					cx,
+					"remote tab closed and its connection dropped",
+					|cx| count(&root, cx) == 2 && client.upgrade().is_none(),
+				);
+				assert!(remote.read_with(cx, |m, _| m.remote.session.is_none()));
+				assert_eq!(active(&root, cx), Some(1));
+			}
+
+			/// Enter confirms the real remote paste, then Cmd+1 switches
+			/// away before GPUI runs its background task. Completion clears
+			/// the PastePanel while the tab is hidden, as in WT61.
+			fn complete_remote_paste_in_background(
+				root: &Entity<TabsRoot>,
+				cx: &mut VisualTestContext,
+				shared: &Path,
+			) -> Entity<WorkbenchModel> {
+				let remote = tab(root, cx, 2);
+				clip::write_text("// FILE: new.txt\nbackground paste\n")
+					.unwrap();
+				cx.simulate_keystrokes("cmd-v");
+				wait_scaled(cx, "remote paste preview", |cx| {
+					remote.read_with(cx, |m, _| {
+						m.paste.plan().is_some() && !m.paste.is_loading()
+					})
+				});
+				assert!(
+					cx.update(|w, cx| remote
+						.read(cx)
+						.paste_focus
+						.is_focused(w)),
+					"Enter confirms the focused paste panel"
+				);
+				cx.simulate_keystrokes("enter cmd-1");
+				assert_eq!(active(root, cx), Some(0));
+				wait_scaled(cx, "remote paste completed in background", |cx| {
+					remote.read_with(cx, |m, _| {
+						m.paste.plan().is_none()
+							&& !m.paste_busy() && !m.is_loading
+					}) && shared.join("new.txt").is_file()
+				});
+				assert_eq!(
+					fs::read_to_string(shared.join("new.txt")).unwrap(),
+					"background paste"
+				);
+				assert_eq!(
+					active(root, cx),
+					Some(0),
+					"completion does not switch tabs"
+				);
+				remote
+			}
+
+			#[gpui::test]
+			fn background_remote_paste_then_cmd_3_refreshes_and_focuses_the_tab(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, shared, root, cx) = three_tabs_with_remote(cx);
+				let remote =
+					complete_remote_paste_in_background(&root, cx, &shared);
+				let before =
+					remote.read_with(cx, |m, _| m.discovery_generation);
+				// Consecutive real key events, with GPUI's normal event-loop
+				// turn between them; no click or test-only redraw.
+				cx.simulate_keystrokes("cmd-3");
+				assert!(cx.update(|w, cx| remote.read(cx).focus_handle.is_focused(w)), "Cmd+3 must restore the workbench focus after its PastePanel closed in background");
+				cx.simulate_keystrokes("cmd-r");
+				assert_eq!(
+					active(&root, cx),
+					Some(2),
+					"Cmd+3 reached TabsRoot"
+				);
+				wait_scaled(cx, "Cmd+R refresh on the remote tab", |cx| {
+					remote.read_with(cx, |m, _| {
+						m.discovery_generation > before && !m.is_loading
+					})
+				});
+				assert_eq!(active(&root, cx), Some(2));
+				assert!(
+					cx.update(|w, cx| remote
+						.read(cx)
+						.focus_handle
+						.is_focused(w)),
+					"the completed tab holds its workbench focus"
+				);
+			}
+
+			#[gpui::test]
+			fn background_remote_paste_then_cmd_3_opens_the_next_paste_preview(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let Some(_clip) = clipboard() else { return };
+				let (_tmp, shared, root, cx) = three_tabs_with_remote(cx);
+				let remote =
+					complete_remote_paste_in_background(&root, cx, &shared);
+				clip::write_text("// FILE: next.txt\nnext paste\n").unwrap();
+				cx.simulate_keystrokes("cmd-3");
+				assert!(cx.update(|w, cx| remote.read(cx).focus_handle.is_focused(w)), "Cmd+3 must restore the workbench focus after its PastePanel closed in background");
+				cx.simulate_keystrokes("cmd-v");
+				assert_eq!(
+					active(&root, cx),
+					Some(2),
+					"Cmd+3 reached TabsRoot"
+				);
+				wait_scaled(cx, "Cmd+V preview on the remote tab", |cx| {
+					remote.read_with(cx, |m, _| {
+						m.paste.plan().is_some() && !m.paste.is_loading()
+					})
+				});
+				assert_eq!(active(&root, cx), Some(2));
+				assert!(
+					focused_in(&remote, cx),
+					"the remote tab contains the preview focus"
+				);
+				assert!(
+					cx.update(|w, cx| remote
+						.read(cx)
+						.paste_focus
+						.is_focused(w)),
+					"the new paste panel holds the keyboard"
+				);
+				assert!(
+					!shared.join("next.txt").exists(),
+					"preview does not apply"
+				);
 			}
 
 			#[gpui::test]
