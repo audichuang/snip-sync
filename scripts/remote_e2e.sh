@@ -123,7 +123,10 @@ else
 fi
 
 # Record only the worker owned by the held master below, not every
-# short-lived browsing connection. exec keeps the wrapper's PID.
+# short-lived browsing connection. exec keeps the wrapper's PID. The master
+# spawns SNIP_REMOTE_EXEC's first word directly, and on Windows a bare
+# `bash` can resolve to System32's WSL bash, which cannot read this MSYS
+# path; `env` resolves bash as the old `env SNIP_E2E_PASTE_HOLD=...` did.
 w <<EOF || { echo "cannot make the worker lifetime wrapper" >&2; exit 1; }
 cat > '$WD/lifetime-worker.sh' <<'WORKER'
 #!/usr/bin/env bash
@@ -132,7 +135,7 @@ export SNIP_E2E_PASTE_HOLD='$WD/paste-hold'
 exec '$RSNIP' serve --stdio
 WORKER
 EOF
-LIFETIME_HOLD_EXEC="bash $WD/lifetime-worker.sh"
+LIFETIME_HOLD_EXEC="env bash $WD/lifetime-worker.sh"
 [ -z "$HOST" ] || LIFETIME_HOLD_EXEC="ssh -T -o BatchMode=yes -o ConnectTimeout=10 $HOST $LIFETIME_HOLD_EXEC"
 
 # Fixtures, made on the worker. `secret.txt` sits outside every workspace.
