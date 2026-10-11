@@ -1347,6 +1347,84 @@ class _FlowSession(_Session):
         return self.clipboard
 
 
+class SelectorFilterTests(unittest.TestCase):
+    """The repo selector is read once the frame for the typed query is drawn, not after a fixed wait."""
+
+    WIN = {"wid": "0x1", "x": 0, "y": 0, "width": 800, "height": 700}
+
+    @staticmethod
+    def bounds(control: str, y: int) -> str:
+        return f"[APP:CTRL_BOUNDS: id={control} x=10 y={y} w=200 h=24]"
+
+    def test_rust_debug_quoting(self):
+        self.assertEqual(driver.rust_debug_str("accounts"), '"accounts"')
+        self.assertEqual(driver.rust_debug_str('a"b\\c'), '"a\\"b\\\\c"')
+        self.assertEqual(driver.rust_debug_str("a\nb\tc\x07"), '"a\\nb\\tc\\u{7}"')
+        self.assertEqual(driver.rust_debug_str("帳務 it's"), '"帳務 it\'s"')
+
+    def test_only_the_line_for_the_whole_query_counts(self):
+        line = '[APP:SELECTOR_FILTER: query="accounts" items=2]'
+        self.assertEqual(driver.selector_filter_items(line, "accounts"), 2)
+        self.assertIsNone(driver.selector_filter_items('[APP:SELECTOR_FILTER: query="account" items=3]', "accounts"))
+        self.assertIsNone(driver.selector_filter_items(line, "account"))
+        self.assertIsNone(driver.selector_filter_items("[APP:SELECTOR_FILTER: items=2]", "accounts"))
+        self.assertEqual(driver.selector_filter_items('[APP:SELECTOR_FILTER: query="a\\"b" items=0]', 'a"b'), 0)
+
+    def test_settles_on_the_frame_that_draws_the_query(self):
+        import bench_native_memory as native
+
+        session = _Session([
+            self.bounds("pick-repo:accounts-old", 100),
+            self.bounds("pick-repo:0:accounts", 124),
+            self.bounds("pick-repo:1:accounts", 148),
+            '[APP:SELECTOR_FILTER: query="accoun" items=3]',
+            '[APP:SELECTOR_FILTER: query="accounts" items=2]',
+        ])
+        frame = [
+            self.bounds("pick-repo:0:accounts", 100),
+            self.bounds("pick-repo:1:accounts", 124),
+            "[APP:CTRL_GONE: id=pick-repo:accounts-old]",
+        ]
+        reads = []
+        texts = session.texts
+
+        def drawing_texts(start=0):
+            # The frame lands after the keystroke's line has been read twice.
+            reads.append(start)
+            if len(reads) == 3:
+                session.lines.extend((float(len(session.lines)), line) for line in frame)
+            return texts(start)
+
+        session.texts = drawing_texts
+        line = driver._settle_filter(native, session, "accounts", 0, 5.0)
+        self.assertEqual(line, '[APP:SELECTOR_FILTER: query="accounts" items=2]')
+        self.assertEqual(native.parse_bounds(texts())["pick-repo:0:accounts"], (10, 100, 200, 24))
+
+    def test_a_query_never_logged_or_drawn_fails_with_its_text(self):
+        import bench_native_memory as native
+
+        session = _Session(['[APP:SELECTOR_FILTER: query="accoun" items=3]'])
+        with self.assertRaisesRegex(driver.OperationTimeout, '"accounts"'):
+            driver._settle_filter(native, session, "accounts", 0, 0.01)
+        session = _Session(['[APP:SELECTOR_FILTER: query="accounts" items=1]', self.bounds("pick-repo:a", 100), self.bounds("pick-repo:accounts", 124)])
+        with self.assertRaisesRegex(driver.OperationTimeout, "2 pick-repo rows are drawn"):
+            driver._settle_filter(native, session, "accounts", 0, 0.01)
+
+    def test_open_waits_for_the_opened_popup_input(self):
+        import bench_native_memory as native
+
+        session = _FlowSession([self.bounds("btn-repo-selector", 10), self.bounds("selector-input", 40), "[APP:SELECTOR_CLOSED]", "[APP:CTRL_GONE: id=selector-input]"])
+        session.click_result = "[APP:SELECTOR_OPEN: Repo items=3]"
+        # The input drawn by an earlier popup is not this popup's.
+        with self.assertRaisesRegex(driver.OperationTimeout, "did not open"):
+            driver._open_selector(native, session, self.WIN, 0.01)
+        session.click_result = None
+        session.lines.clear()
+        session.add(self.bounds("btn-repo-selector", 10))
+        session.click = lambda win, box: [session.add("[APP:SELECTOR_OPEN: Repo items=3]"), session.add(self.bounds("selector-input", 40))]
+        driver._open_selector(native, session, self.WIN, 1.0)
+
+
 class ExpandOpenRepoChangesTests(unittest.TestCase):
     """Changes rows start collapsed: the repo row, then each folder above the file."""
 

@@ -57,6 +57,7 @@ from bench_native_memory import (  # noqa: E402
     open_repo_name,
     open_workspace_tab,
     change_row_group,
+    changes_list_at_top,
     choose_copy_target,
     copy_explicit_selection,
     expand_change_dirs,
@@ -74,6 +75,7 @@ from bench_native_memory import (  # noqa: E402
     select_native_matched,
     shown_tab_line,
     scroll_into_view,
+    scroll_to_change_dirs,
     source_file_bytes,
     source_rows,
     three_tab_repos,
@@ -839,6 +841,70 @@ class TestChangeDirectoryExpansion(unittest.TestCase):
         session = ChangeTreeSession([], {})
         self.assertEqual(expand_change_dirs(session, self.WIN, "change-row:staged:a.txt", "repo", timeout=1), [])
         self.assertEqual(session.clicked, [])
+
+
+class TestChangesSweep(unittest.TestCase):
+    """The Changes sweep stops at the first row's marker instead of waiting out two still wheels."""
+
+    WIN = {"wid": "0x1", "x": 0, "y": 0, "width": 800, "height": 700}
+    TARGET = "change-dir:unstaged:repo:src"
+
+    @staticmethod
+    def top(y: int = 40, h: int = 22) -> str:
+        return f"[APP:CTRL_BOUNDS: id=change-list-top x=8 y={y} w=280 h={h}]"
+
+    def sweep(self, session: ChangeTreeSession) -> tuple[list[str] | None, list[str]]:
+        directions: list[str] = []
+        wheel = session.x
+
+        def x(*args: str, timeout: float = 20.0) -> str:
+            if "click" in args:
+                directions.append("down" if args[-1] == "5" else "up")
+            return wheel(*args, timeout=timeout)
+
+        session.x = x  # type: ignore[method-assign]
+
+        def candidates() -> list[str]:
+            return [self.TARGET] if self.TARGET in parse_bounds(session.texts()) else []
+
+        return scroll_to_change_dirs(session, self.WIN, candidates), directions
+
+    def test_top_is_the_whole_first_row_at_the_top_of_the_list(self) -> None:
+        header = _bounds("change-header:staged", 40)
+        self.assertTrue(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(), header]))
+        # A first row cut by the list's top edge reports only its visible part.
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(h=9), header]))
+        # A header lined up with the top is a later group's whenever the offset is whole rows.
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", _bounds("change-header:unstaged", 40)]))
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(y=64)]))
+        self.assertFalse(changes_list_at_top([
+            "[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(), "[APP:CTRL_GONE: id=change-list-top]",
+        ]))
+        self.assertFalse(changes_list_at_top([self.top()]))
+
+    def test_a_visible_target_needs_no_wheel(self) -> None:
+        session = ChangeTreeSession([_bounds(self.TARGET, 300)], {})
+        self.assertEqual(self.sweep(session), ([self.TARGET], []))
+
+    def test_at_the_top_the_sweep_goes_straight_down(self) -> None:
+        session = ChangeTreeSession([self.top(), _bounds("change-header:unstaged", 64)], {}, on_wheel=[[_bounds(self.TARGET, 500)]])
+        self.assertEqual(self.sweep(session), ([self.TARGET], ["down"]))
+
+    def test_the_top_ends_the_upward_sweep_without_still_wheels(self) -> None:
+        session = ChangeTreeSession(
+            [_bounds("change-row:unstaged:z.txt", 64)],
+            {},
+            on_wheel=[[self.top(), "[APP:CTRL_GONE: id=change-row:unstaged:z.txt]"], [_bounds("change-row:unstaged:b.txt", 64)], [_bounds(self.TARGET, 500)]],
+        )
+        self.assertEqual(self.sweep(session), ([self.TARGET], ["up", "down", "down"]))
+
+    def test_a_target_passed_on_the_way_up_is_taken(self) -> None:
+        session = ChangeTreeSession([_bounds("change-row:unstaged:z.txt", 64)], {}, on_wheel=[[_bounds(self.TARGET, 80)]])
+        self.assertEqual(self.sweep(session), ([self.TARGET], ["up"]))
+
+    def test_without_the_marker_two_still_wheels_find_the_top(self) -> None:
+        session = ChangeTreeSession([_bounds("change-row:unstaged:z.txt", 64)], {}, on_wheel=[[], [], [_bounds(self.TARGET, 500)]])
+        self.assertEqual(self.sweep(session), ([self.TARGET], ["up", "up", "down"]))
 
 
 class _ScriptedCopySession:

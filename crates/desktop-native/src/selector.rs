@@ -289,8 +289,11 @@ impl WorkbenchModel {
 		match ev {
 			InputEvent::Changed => {
 				self.popover_cursor = 0;
+				// The quoted query tells a driver which keystroke this
+				// filter answers.
 				app_log!(
-					"[APP:SELECTOR_FILTER: items={}]",
+					"[APP:SELECTOR_FILTER: query={:?} items={}]",
+					q,
 					self.selector_candidates(&q).count()
 				);
 			}

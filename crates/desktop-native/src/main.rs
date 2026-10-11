@@ -13149,6 +13149,62 @@ mod tests {
 		}
 
 		#[gpui::test]
+		fn change_list_top_is_drawn_only_at_the_start_of_the_list(
+			cx: &mut TestAppContext,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) =
+				open_sized(cx, tmp.path().to_path_buf(), None, 900., 400.);
+			for _ in 0..50 {
+				if model.read_with(cx, |m, _| m.discovery_status.is_some()) {
+					break;
+				}
+				settle(cx);
+			}
+			let n = 200;
+			model.update(cx, |m, cx| {
+				m.probes = Some(crate::ui::Probes::for_test());
+				m.repos =
+					vec![make_test_repo(tmp.path().to_path_buf(), "repo")];
+				m.change_repos = vec![crate::ChangeRepo {
+					root: tmp.path().to_path_buf(),
+					name: "repo".into(),
+					state: crate::ChangeRepoState::Loaded,
+					total: n,
+				}];
+				m.files = (0..n)
+					.map(|i| make_test_file(&format!("f{i:03}.txt"), 0))
+					.collect();
+				m.is_loading = false;
+				cx.notify();
+			});
+			settle(cx);
+			let drawn = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| m.probes.as_ref().unwrap().drawn())
+			};
+			let top = "change-list-top".to_string();
+			let ids = drawn(cx);
+			assert!(
+				ids.contains(&"change-header:unstaged".to_string())
+					&& ids.contains(&top),
+				"the first row carries the top marker: {ids:?}"
+			);
+			model.update(cx, |m, cx| {
+				m.chrome
+					.left_scroll
+					.scroll_to_item(n, gpui::ScrollStrategy::Top);
+				cx.notify();
+			});
+			settle(cx);
+			let ids = drawn(cx);
+			assert!(
+				!ids.contains(&top)
+					&& !ids.contains(&"change-header:unstaged".to_string()),
+				"a list scrolled to its end has no top marker: {ids:?}"
+			);
+		}
+
+		#[gpui::test]
 		fn log_while_loading_is_not_empty_log_empty(cx: &mut TestAppContext) {
 			let tmp = tempfile::tempdir().unwrap();
 			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
