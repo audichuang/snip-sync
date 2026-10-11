@@ -7212,6 +7212,81 @@ mod tests {
 			}
 		}
 
+		/// Ten recent workspaces and a browsed host in a 1080×720 window
+		/// (WT40, #147): the recent rows keep their full height, so name
+		/// and path do not overlap, and the host's folder list is not
+		/// squeezed to nothing, its first folder visible and clickable.
+		#[gpui::test]
+		fn many_recents_leave_room_for_the_remote_folder_list(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("home");
+			for i in 0..43 {
+				fs::create_dir_all(base.join(format!("folder-{i:02}")))
+					.unwrap();
+			}
+			let recents: Vec<PathBuf> = (0..10)
+				.map(|i| {
+					let d = tmp.path().join(format!("recent-{i:02}"));
+					fs::create_dir_all(&d).unwrap();
+					d
+				})
+				.collect();
+			let (model, cx) = remote_menu(cx);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+			model.update(cx, |m, cx| {
+				m.recent_workspaces = recents;
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+				cx.notify();
+			});
+			settle(cx);
+			assert_eq!(shown_folder(&model, cx).1.len(), 43);
+			let bottom = |b: gpui::Bounds<gpui::Pixels>| {
+				f32::from(b.origin.y) + f32::from(b.size.height)
+			};
+			let menu = cx.debug_bounds("workspace-menu").expect("menu drawn");
+			for ix in 0..10 {
+				let id: &'static str = Box::leak(
+					format!("workspace-recent:{ix}").into_boxed_str(),
+				);
+				let row = cx
+					.debug_bounds(id)
+					.unwrap_or_else(|| panic!("{id} not drawn"));
+				assert!(
+					f32::from(row.size.height) >= 38.,
+					"{id} squeezed to {row:?}: name and path overlap"
+				);
+			}
+			let first = cx
+				.debug_bounds("remote-folder:0")
+				.expect("remote-folder:0 drawn");
+			assert!(
+				f32::from(first.size.height) >= 24.,
+				"remote-folder:0 squeezed to {first:?}"
+			);
+			assert!(
+				f32::from(first.origin.y) >= f32::from(menu.origin.y)
+					&& bottom(first) <= bottom(menu)
+					&& bottom(menu) <= 720.,
+				"remote-folder:0 {first:?} outside the menu {menu:?}"
+			);
+			let list = cx
+				.debug_bounds("remote-folders")
+				.expect("remote folder list drawn");
+			assert!(
+				f32::from(list.size.height) >= 3. * 28.,
+				"the folder list keeps at least three rows: {list:?}"
+			);
+			click_remote_folder(&model, cx, "folder-00");
+			settle(cx);
+			assert!(
+				shown_folder(&model, cx).0.ends_with("folder-00"),
+				"clicking remote-folder:0 opens it"
+			);
+		}
+
 		/// A listing that lands for a folder or host no longer shown is
 		/// dropped.
 		#[gpui::test]
@@ -15374,6 +15449,167 @@ mod tests {
 					m.read_with(cx, |m, _| m.top_inset),
 					crate::tabs::TAB_BAR_H
 				);
+			}
+
+			/// Rests the mouse on control `id` until its tooltip is up.
+			fn hover_id(
+				cx: &mut VisualTestContext,
+				id: &str,
+			) -> gpui::Point<gpui::Pixels> {
+				cx.run_until_parked();
+				let at = cx
+					.debug_bounds(sel(id.to_string()))
+					.unwrap_or_else(|| panic!("no rendered control {id}"))
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+				at
+			}
+
+			fn tooltip_shown(cx: &mut VisualTestContext, text: &str) -> bool {
+				drawn(cx, &format!("tooltip:{text}"))
+			}
+
+			/// `n` local workspaces named `workspace-number-NN`, all open
+			/// in tabs, the last one shown.
+			fn many_tabs(
+				cx: &mut TestAppContext,
+				n: usize,
+			) -> (
+				tempfile::TempDir,
+				Vec<PathBuf>,
+				Entity<TabsRoot>,
+				&mut VisualTestContext,
+			) {
+				let tmp = tempfile::tempdir().unwrap();
+				let base = dunce::canonicalize(tmp.path()).unwrap();
+				let dirs: Vec<PathBuf> = (0..n)
+					.map(|i| {
+						let d = base.join(format!("workspace-number-{i:02}"));
+						fs::create_dir(&d).unwrap();
+						d
+					})
+					.collect();
+				let (root, cx) =
+					open_tabs(cx, FirstTab::Local(dirs[0].clone()), None);
+				for d in &dirs[1..] {
+					open_typed(&root, cx, d);
+				}
+				wait(cx, "all tabs open", |cx| count(&root, cx) == n);
+				assert_eq!(active(&root, cx), Some(n - 1));
+				(tmp, dirs, root, cx)
+			}
+
+			/// A tooltip that is up follows the tab switch under it (WT33,
+			/// #148): the "+" of a tab in another language shows that
+			/// language's text, without hovering again.
+			#[gpui::test]
+			fn a_shown_tooltip_follows_the_tab_switch(cx: &mut TestAppContext) {
+				let (_tmp, _a, _b, root, cx) = two_tabs(cx);
+				let first = tab(&root, cx, 0).read_with(cx, |m, _| m.locale);
+				cx.simulate_keystrokes("alt-l");
+				settle(cx);
+				let second = tab(&root, cx, 1).read_with(cx, |m, _| m.locale);
+				assert_ne!(first, second, "alt-l switched tab B's language");
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(0));
+				let old = crate::i18n::t("tip_ws_tab_new", first).to_string();
+				let new = crate::i18n::t("tip_ws_tab_new", second).to_string();
+				hover_id(cx, "ws-tab-new");
+				assert!(tooltip_shown(cx, &old), "the + tooltip is up");
+
+				cx.simulate_keystrokes("cmd-2");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(1));
+				assert!(
+					tooltip_shown(cx, &new),
+					"the + tooltip is in tab B's language"
+				);
+				assert!(!tooltip_shown(cx, &old), "no stale + tooltip");
+			}
+
+			/// A tab's tooltip goes when the strip scrolls it away from the
+			/// still mouse (WT31, #148): after cmd-1 scrolls to the first
+			/// tab, the tab now under the mouse does not show the path of
+			/// the one that was there.
+			#[gpui::test]
+			fn a_tab_tooltip_goes_when_the_strip_scrolls_it_away(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, dirs, root, cx) = many_tabs(cx, 8);
+				cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(500.)));
+				settle(cx);
+				let plus = cx.debug_bounds("ws-tab-new").expect("+ drawn");
+				// The leftmost tab wholly inside the strip, which the
+				// shown last tab scrolled to its end.
+				let k = (0..8)
+					.find(|ix| {
+						cx.debug_bounds(sel(format!("ws-tab:{ix}")))
+							.is_some_and(|b| {
+								f32::from(b.left()) >= 0.
+									&& f32::from(b.right())
+										<= f32::from(plus.left())
+							})
+					})
+					.expect("a tab wholly visible");
+				assert!(k > 0, "the strip is scrolled to its end");
+				let at = hover_id(cx, &format!("ws-tab:{k}"));
+				let path = dirs[k].display().to_string();
+				assert!(tooltip_shown(cx, &path), "tab {k}'s tooltip is up");
+
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(0));
+				let moved = cx
+					.debug_bounds(sel(format!("ws-tab:{k}")))
+					.expect("tab drawn");
+				assert!(
+					!moved.contains(&at),
+					"tab {k} scrolled away: {moved:?}"
+				);
+				assert!(
+					!tooltip_shown(cx, &path),
+					"tab {k}'s tooltip stays over another tab"
+				);
+			}
+
+			/// Narrowing the window keeps the shown tab in view (WT91,
+			/// #148): it is scrolled back inside the strip at once, not
+			/// only at the next switch.
+			#[gpui::test]
+			fn narrowing_the_window_keeps_the_shown_tab_in_view(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _dirs, root, cx) = many_tabs(cx, 7);
+				let in_view = |cx: &mut VisualTestContext, w: f32| {
+					cx.run_until_parked();
+					let tab = cx.debug_bounds("ws-tab:6").expect("tab drawn");
+					let plus = cx.debug_bounds("ws-tab-new").expect("+ drawn");
+					let strip =
+						cx.debug_bounds("ws-tabs").expect("strip drawn");
+					assert!(
+						f32::from(tab.left()) >= f32::from(strip.left()) - 0.5
+							&& f32::from(tab.right())
+								<= f32::from(plus.left()) + 0.5,
+						"at {w}: the shown tab {tab:?} is outside the strip \
+						 {strip:?} (+ at {plus:?})"
+					);
+				};
+				cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
+				settle(cx);
+				// Shown again by key at 900, which scrolls it into view.
+				cx.simulate_keystrokes("cmd-{");
+				settle(cx);
+				cx.simulate_keystrokes("cmd-}");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(6));
+				in_view(cx, 900.);
+				cx.simulate_resize(gpui::size(gpui::px(700.), gpui::px(600.)));
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(6));
+				in_view(cx, 700.);
 			}
 			fn saved(store: &Path) -> crate::open_tabs::OpenTabs {
 				crate::open_tabs::load_from(store).expect("tabs saved")

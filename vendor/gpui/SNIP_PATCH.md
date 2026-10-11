@@ -51,6 +51,23 @@ bug fail on Linux debug builds, where cosmic-text does not slice. The smoke
 test `native_cjk_truncation_survives_resize` resizes a window showing
 truncated CJK paths. It fails on the upstream code and passes with the patch.
 
+`src/elements/div.rs`, tooltips: `InteractiveElementState` keeps the
+element's bounds in a `tooltip_source_bounds` cell. Paint and prepaint both
+update that cell, and the hover check of a shown tooltip reads it. Upstream
+copied `hitbox.bounds` into the check when the tooltip was scheduled. A
+shown tooltip keeps that check, so it still tested the bounds of that old
+frame. When a scroll moved the element away from a still mouse, the
+tooltip stayed: after a tab switch scrolled the workspace tab strip, the
+tab now under the mouse showed the previous tab's path (#148, real-UI cell
+WT31). The `#[gpui::test]`
+`a_tab_tooltip_goes_when_the_strip_scrolls_it_away` fails without this
+patch.
+
+`src/window.rs`, `Frame::clear`: under `test-support`, also clear
+`debug_bounds`. Upstream never cleared it, so `VisualTestContext::debug_bounds`
+kept every selector any earlier frame had painted. A test could not see that
+a control, such as a tooltip, was no longer drawn.
+
 `src/gpui.rs`: `#![allow(warnings)]`. As a path dependency the crate is built
 without `--cap-lints`, so the workspace's `RUSTFLAGS="-D warnings"` would turn
 upstream warnings (e.g. `float_literal_f32_fallback` in `taffy.rs`) into
@@ -58,7 +75,7 @@ errors on every CI platform. The in-source allow restores registry behaviour.
 
 ## Upgrading gpui
 
-Re-copy the new version's crate, re-apply the patches above, and rerun
+Re-copy the new version's crate, re-apply the patches above, and rerun the desktop `#[gpui::test]`s,
 `scripts/check_native_ime.py` and `just native-lifecycle`. Drop the vendor
 copy once upstream resets the IC without relying on `composing`, stops the
-event loop when the X connection dies, and truncates a copy of the text runs.
+event loop when the X connection dies, truncates a copy of the text runs, and checks a shown tooltip against its element's current bounds.
