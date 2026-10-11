@@ -15476,6 +15476,43 @@ mod tests {
 				);
 			}
 
+			/// Browsing a host's folders in the menu also starts ssh: the
+			/// listing belongs to the tab, and a close cancels it rather than
+			/// leaving it to run on after the tab is gone.
+			#[gpui::test]
+			fn closing_a_tab_while_browsing_a_host_cancels_the_listing(
+				cx: &mut TestAppContext,
+			) {
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
+				click_id(cx, "ws-tab-new".into());
+				let empty = tab(&root, cx, 1);
+				empty.update(cx, |m, cx| {
+					m.remote.hosts = vec![snip_remote::RemoteHost::in_process(
+						worker.clone(),
+					)];
+					m.e2e_remote_open_delay =
+						Some(crate::lifecycle::DRAIN_DEADLINE * 4);
+					m.browse_remote_host(0, cx);
+				});
+				cx.run_until_parked();
+				assert_eq!(
+					empty.update(cx, |m, _| m.lifecycle.unfinished()),
+					1
+				);
+				cx.simulate_keystrokes("cmd-w");
+				cx.executor().advance_clock(Duration::from_millis(100));
+				wait(cx, "listing cancelled and tab closed", |cx| {
+					count(&root, cx) == 1
+				});
+				assert_eq!(
+					empty.update(cx, |m, _| m.lifecycle.unfinished()),
+					0
+				);
+			}
+
 			/// An empty tab with a job still running drains it before it goes.
 			#[gpui::test]
 			fn an_empty_tab_with_a_job_drains_before_closing(
