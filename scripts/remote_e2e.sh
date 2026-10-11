@@ -51,6 +51,13 @@ hash_of() { # stdin -> sha256 hex
 	if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -c1-64
 }
 
+scaled() { # seconds; same >= 1 timeout scale as the native e2e drivers
+	awk -v seconds="$1" -v scale="${SNIP_E2E_TIMEOUT_SCALE:-1}" 'BEGIN {
+		if (scale !~ /^[0-9]+([.][0-9]+)?$/ || scale < 1) scale = 1;
+		printf "%.3f", seconds * scale;
+	}'
+}
+
 pass=0
 fail=0
 ok() { pass=$((pass + 1)); echo "PASS  $*"; }
@@ -111,12 +118,25 @@ fi
 # a master does. The host argument `h` is then only a label.
 if [ -z "$HOST" ]; then
 	export SNIP_REMOTE_EXEC="$RSNIP serve --stdio"
-	# A worker whose Apply pauses after its first write while $WD/paste-hold exists.
-	HOLD_EXEC="env SNIP_E2E_PASTE_HOLD=$WD/paste-hold $RSNIP serve --stdio"
 else
 	export SNIP_REMOTE_EXEC="ssh -T -o BatchMode=yes -o ConnectTimeout=10 $HOST $RSNIP serve --stdio"
-	HOLD_EXEC="ssh -T -o BatchMode=yes -o ConnectTimeout=10 $HOST env SNIP_E2E_PASTE_HOLD=$WD/paste-hold $RSNIP serve --stdio"
 fi
+
+# Record only the worker owned by the held master below, not every
+# short-lived browsing connection. exec keeps the wrapper's PID. The master
+# spawns SNIP_REMOTE_EXEC's first word directly, and on Windows a bare
+# `bash` can resolve to System32's WSL bash, which cannot read this MSYS
+# path; `env` resolves bash as the old `env SNIP_E2E_PASTE_HOLD=...` did.
+w <<EOF || { echo "cannot make the worker lifetime wrapper" >&2; exit 1; }
+cat > '$WD/lifetime-worker.sh' <<'WORKER'
+#!/usr/bin/env bash
+echo \$\$ > '$WD/lifetime-worker.pid'
+export SNIP_E2E_PASTE_HOLD='$WD/paste-hold'
+exec '$RSNIP' serve --stdio
+WORKER
+EOF
+LIFETIME_HOLD_EXEC="env bash $WD/lifetime-worker.sh"
+[ -z "$HOST" ] || LIFETIME_HOLD_EXEC="ssh -T -o BatchMode=yes -o ConnectTimeout=10 $HOST $LIFETIME_HOLD_EXEC"
 
 # Fixtures, made on the worker. `secret.txt` sits outside every workspace.
 w <<EOF || { echo "cannot make the fixtures" >&2; exit 1; }
@@ -428,17 +448,29 @@ fi
 # Two connections paste into one repository: the one that holds it (paused
 # after its first write) makes the other refuse at once, writing nothing.
 w <<<"cd '$WD/pastews' && git init -q lockrepo && touch '$WD/paste-hold'"
-SNIP_REMOTE_EXEC="$HOLD_EXEC" "$SNIP" remote paste h "$WD/pastews" --in lockrepo --apply --stdin <"$MASTER/payload.txt" >"$MASTER/hold.out" 2>&1 &
+SNIP_REMOTE_EXEC="$LIFETIME_HOLD_EXEC" "$SNIP" remote paste h "$WD/pastews" --in lockrepo --apply --stdin <"$MASTER/payload.txt" >"$MASTER/hold.out" 2>&1 &
 holder=$!
 for _ in $(seq 1 200); do
 	w <<<"test -e '$WD/pastews/lockrepo/.git/snip-paste.lock' && ls '$WD/pastews/lockrepo' | grep -q ." && break
-	sleep 0.1
+	sleep "$(scaled 0.1)"
 done
 before=$(w <<<"cd '$WD/pastews/lockrepo' && find . -path ./.git -prune -o -type f -print | LC_ALL=C sort | wc -l | tr -d ' '")
+worker_pid=$(w <<<"cat '$WD/lifetime-worker.pid'")
+check "the held master's own worker is alive (PID $worker_pid)" w <<<"kill -0 '$worker_pid'"
 err=$("$SNIP" remote paste h "$WD/pastews" --in lockrepo --apply --overwrite --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
 rc=$?
 after=$(w <<<"cd '$WD/pastews/lockrepo' && find . -path ./.git -prune -o -type f -print | LC_ALL=C sort | wc -l | tr -d ' '")
 w <<<"rm -f '$WD/paste-hold'"
+# Bound the master's normal completion too, before reaping its exit code.
+master_deadline=$((SECONDS + $(awk "BEGIN { print int($(scaled 10) + 1) }")))
+while kill -0 "$holder" 2>/dev/null; do
+	if [ "$SECONDS" -ge "$master_deadline" ]; then
+		bad "held master PID $holder did not finish within scaled 10 s after release"
+		kill -9 "$holder" 2>/dev/null || true
+		break
+	fi
+	sleep "$(scaled 0.1)"
+done
 wait "$holder"
 holder_rc=$?
 if [ "$rc" = 1 ] && [[ "$err" == *"another paste is writing to this repository"* ]] && [ "$before" = "$after" ]; then
@@ -448,6 +480,28 @@ else
 fi
 check "the holding paste finishes once released ($(cat "$MASTER/hold.out"))" test "$holder_rc" = 0
 check "the holding paste wrote every file" w <<<"test -e '$WD/pastews/lockrepo/sub/noeol.txt' && test -e '$WD/pastews/lockrepo/long.txt'"
+
+# Normal master completion must close its own connection. Poll on the
+# worker machine (also over SSH), with a scaled bound and useful failure.
+if w <<EOF
+pid='$worker_pid'
+[[ "\$pid" =~ ^[0-9]+$ ]] || { echo "invalid worker PID: \$pid" >&2; exit 1; }
+deadline=\$(awk 'BEGIN { print int($(scaled 10) + 1) }')
+SECONDS=0
+while kill -0 "\$pid" 2>/dev/null; do
+	if [ "\$SECONDS" -ge "\$deadline" ]; then
+		echo "worker PID \$pid still alive after master closed (scaled 10 s deadline)" >&2
+		ps -p "\$pid" -f >&2 || true
+		exit 1
+	fi
+	sleep $(scaled 0.1)
+done
+EOF
+then
+	ok "normal_master_close_reaps_its_worker (PID $worker_pid)"
+else
+	bad "normal_master_close_reaps_its_worker (PID $worker_pid outlived its connection)"
+fi
 
 # Commit mode: the worker replays the commits as a local replay does.
 CSRC="$MASTER/commit-src"

@@ -24,6 +24,7 @@ import threading
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from typing import Any, Dict, List, Optional
 
 SCRIPTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -297,6 +298,22 @@ class TestLeftoversDetectionAndCleaning(unittest.TestCase):
         leftovers = rur.detect_leftovers(self.run_dir, sys_ops=sys_ops)
         self.assertEqual(leftovers, [])
 
+    def test_process_inventory_reads_executables_without_command_arguments(self):
+        bundle = "/Users/user/snip-sync-ui-runs/run/snip-sync QA.app/Contents/MacOS/snip-desktop-native"
+        output = f"  12 /bin/zsh\n  13 /opt/bin/cargo\n  14 {bundle}\n"
+        with mock.patch.object(rur.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output)) as run:
+            records = rur.SystemOperations().list_processes()
+        self.assertEqual(run.call_args.args[0], ["ps", "-A", "-o", "pid=,comm="])
+        self.assertEqual([p.pid for p in records if rur.is_snip_desktop_process(p.command)], [14])
+
+    def test_leftovers_do_not_match_shell_or_cargo_command_text(self):
+        sys_ops = FakeSystemOperations()
+        sys_ops.processes = [
+            rur.ProcessRecord(12, '/bin/zsh -c "pgrep -fl snip-desktop-native"'),
+            rur.ProcessRecord(13, "cargo clippy -p snip-desktop-native"),
+        ]
+        self.assertEqual(rur.detect_leftovers(self.run_dir, sys_ops=sys_ops), [])
+
     def test_detect_leftovers_ignores_interpreters_with_snip_args(self):
         sys_ops = FakeSystemOperations()
         sys_ops.processes = [
@@ -330,7 +347,7 @@ class TestLeftoversDetectionAndCleaning(unittest.TestCase):
         sys_ops.processes = [
             rur.ProcessRecord(
                 pid=5678,
-                command="target/debug/snip-desktop-native --workspace /some/custom/dir",
+                command="target/debug/snip-desktop-native",
             )
         ]
         leftovers = rur.detect_leftovers(self.run_dir, sys_ops=sys_ops)
@@ -565,6 +582,8 @@ class TestLaunchSupervisorAndExitFile(RoundDirTestCase):
         # Setup dummy bundle path so finish does not fail on leftover process or unregister
         app_bundle = Path(self.env_data["app_bundle"])
         app_bundle.mkdir(parents=True, exist_ok=True)
+        # A different session merely mentioning this bundle is not its executable.
+        self.sys_ops.processes = [rur.ProcessRecord(12, f'/bin/zsh -c "ls {app_bundle}"')]
 
         args = argparse.Namespace(run=str(self.run_dir))
         rc = rur.cmd_finish(args, sys_ops=self.sys_ops)
