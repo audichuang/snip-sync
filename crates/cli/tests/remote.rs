@@ -300,8 +300,17 @@ fn cli_master_says_when_the_shell_prints_too_much_before_snip() {
 
 	let tmp = tempfile::tempdir().unwrap();
 	let script = tmp.path().join("banner.sh");
-	std::fs::write(&script, "#!/bin/sh\nyes 'login banner' | head -c 200000\n")
-		.unwrap();
+	// Keep stdin open for the master's hello, as a login shell that goes
+	// on to start the worker does. Exiting immediately races the writer:
+	// BrokenPipe then correctly reports an ended connection, not bad data.
+	std::fs::write(
+		&script,
+		format!(
+			"#!/bin/sh\nyes 'login banner' | head -c 200000\nexec {}\n",
+			serve_exec("")
+		),
+	)
+	.unwrap();
 	std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
 		.unwrap();
 	let m = Master::with_exec(tmp.path(), s(&script).to_string());
