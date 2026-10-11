@@ -669,7 +669,7 @@ clip > "$RUN/p-busy.sha"
 | 分頁列底色（`header_bg`） | `#26282c` | `#e9eaee` |
 | 分頁列下緣分隔線（`divider`） | `#33353b` | `#dddfe4` |
 | 目前分頁底色（`range_bg`） | `#233558` | `#e3ebfe` |
-| 分頁 hover 底色（`hover_bg`） | `#2e2f30` | `#ededed` |
+| 分頁 hover 底色（`tab_hover_bg`） | `#2e2f30` | `#d8d9dd` |
 | 非目前分頁文字（`text_muted`） | `#9fa2a8` | `#5f6269` |
 | 已連線圖示（`accent`） | `#3871e1` | `#3871e1` |
 | 失敗圖示（`error`） | `#f57e84` | `#c54e58` |
@@ -718,7 +718,7 @@ PY
   ```
   然後照 1.2 重新 `launch`（含刪 `open-tabs.json` 的重置）、`resize 1080 720`，S3，目前 `alpha`。本格結束後把 `SNIP_THEME` 改回 `dark`（若後面還有格子）。
 - **操作**：同 WT80，截圖名稱換成 `light-*`。
-- **預期畫面**：淺色調色盤下，分頁列底色 `#e9eaee`、目前分頁 `#e3ebfe`、hover `#ededed`、非目前文字 `#5f6269`。目前分頁與分頁列的底色差異很小（紅綠通道只差 6 與 1，藍色差 16）：以截圖用肉眼判斷看得出哪個是目前分頁，文字顏色的差異（目前分頁用主要文字色、其他用 `#5f6269`）一併計入；hover 底色 `#ededed` 與分頁列 `#e9eaee` 幾乎一樣，hover 時是否看得出變化：如實記錄，`TODO(verify)`（對比不足時記為 `ui-defect`，附取樣值）。
+- **預期畫面**：淺色調色盤下，分頁列底色 `#e9eaee`、目前分頁 `#e3ebfe`、hover `#d8d9dd`、非目前文字 `#5f6269`。目前分頁與分頁列的底色差異很小（紅綠通道只差 6 與 1，藍色差 16）：以截圖用肉眼判斷看得出哪個是目前分頁，文字顏色的差異（目前分頁用主要文字色、其他用 `#5f6269`）一併計入；hover 底色 `#d8d9dd` 比分頁列 `#e9eaee` 每個通道暗 17：hover 非目前分頁時要看得出變化，看不出來記為 `ui-defect`，附取樣值。
 - **比對**：取樣值與上表相符（每個通道誤差 ≤ 2），寫進 `action.json`。其他同 WT80。
 - **截圖**：`before.png`、`light-base.png`、`light-hover-tab.png`、`light-hover-close.png`、`light-hover-plus.png`。
 
