@@ -12,7 +12,7 @@
 //! rejected before `open`. Confirmed `TransferImportPlan::apply` and
 //! `CommitReplayPreview::apply_with` do not poll a cancel token during replay.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -849,7 +849,26 @@ impl TransferImportPlan {
 	) -> Result<RestoreExecutionResult, TransferError> {
 		// Lock before revalidating: a check made before the lock leaves a
 		// gap another paste could write into.
-		let _locks = lock_destination_repos(&self.roots)?;
+		let creates =
+			self.create_operations()
+				.iter()
+				.enumerate()
+				.filter(|(i, op)| {
+					!selection.unchecked_creates.contains(i)
+						&& (!op.existed
+							|| (selection.overwrite_existing
+								&& !selection.skip_existing))
+				});
+		let deletes = self
+			.delete_operations()
+			.iter()
+			.enumerate()
+			.filter(|(i, _)| !selection.unchecked_deletes.contains(i));
+		let directories = creates
+			.map(|(_, op)| op.absolute_path.parent().unwrap())
+			.chain(deletes.map(|(_, op)| op.absolute_path.parent().unwrap()));
+		let _locks =
+			lock_destination_repos(directories, &RunOptions::default())?;
 		self.destination_freshness.revalidate()?;
 		let result = restore::execute_restore_plan_observed(
 			&self.restore_plan,
@@ -864,21 +883,36 @@ impl TransferImportPlan {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// The write lock of every repository the roots sit in, all or none.
-/// A root outside any repository takes no lock: the lock lives in a git
-/// dir, and a lock file in a plain folder would show up in its tree.
-fn lock_destination_repos(
-	roots: &[PathBuf],
+/// Lock every repository containing a destination directory, all or none.
+/// Discover candidate roots through the filesystem first, caching ancestor
+/// lookups; Git processes scale with repositories, not existing directories.
+/// Resolve aliases before discovering roots and deduplicate canonical git
+/// dirs before locking, including worktrees/submodules with a `.git` file.
+fn lock_destination_repos<'a>(
+	directories: impl IntoIterator<Item = &'a Path>,
+	opts: &RunOptions,
 ) -> Result<Vec<HeavyGuard>, TransferError> {
-	let opts = RunOptions::default();
-	let mut repos = Vec::with_capacity(roots.len());
-	for root in roots {
-		let git = match Git::open_with(root, &opts) {
+	let mut existing_cache = HashMap::new();
+	let mut repo_cache = HashMap::new();
+	let mut candidates = BTreeSet::new();
+	for directory in directories {
+		cancelled_err(opts, "paste-lock")?;
+		let existing =
+			existing_destination_directory(directory, &mut existing_cache)?;
+		if let Some(root) =
+			destination_repo_candidate(&existing, &mut repo_cache)?
+		{
+			candidates.insert(root);
+		}
+	}
+	let mut repos = Vec::with_capacity(candidates.len());
+	for root in candidates {
+		let git = match Git::open_with(&root, opts) {
 			Ok(g) => g,
 			Err(GitError::NotARepository(_)) => continue,
 			Err(e) => return Err(e.into()),
 		};
-		repos.push(RepoIdentity::resolve(&git, &opts)?);
+		repos.push(RepoIdentity::resolve(&git, opts)?);
 	}
 	repos.sort_by(|a, b| a.git_dir.cmp(&b.git_dir));
 	repos.dedup_by(|a, b| a.git_dir == b.git_dir);
@@ -887,6 +921,80 @@ fn lock_destination_repos(
 		held.push(lock_heavy(repo)?);
 	}
 	Ok(held)
+}
+
+/// New folders (or files a replay will replace with folders) resolve to the
+/// nearest existing directory. Canonicalize before walking repo ancestors:
+/// lexical ancestors of a symlink alias may belong to a different repo.
+fn existing_destination_directory(
+	directory: &Path,
+	cache: &mut HashMap<PathBuf, PathBuf>,
+) -> io::Result<PathBuf> {
+	let mut visited = Vec::new();
+	let mut existing = None;
+	for ancestor in directory.ancestors() {
+		if let Some(found) = cache.get(ancestor) {
+			existing = Some(found.clone());
+			break;
+		}
+		visited.push(ancestor.to_path_buf());
+		match fs::metadata(ancestor) {
+			Ok(meta) if meta.is_dir() => {
+				existing = Some(dunce::canonicalize(ancestor)?);
+				break;
+			}
+			Ok(_) => continue,
+			Err(e)
+				if matches!(
+					e.kind(),
+					io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+				) =>
+			{
+				continue
+			}
+			Err(e) => return Err(e),
+		}
+	}
+	let existing = existing.ok_or_else(|| {
+		io::Error::new(
+			io::ErrorKind::NotFound,
+			"no existing destination directory",
+		)
+	})?;
+	for path in visited {
+		cache.insert(path, existing.clone());
+	}
+	Ok(existing)
+}
+
+/// Cache both repo and non-repo ancestors, stopping at the nearest `.git`
+/// item. Git validates the candidate, including gitdir files and symlinks;
+/// an unreadable marker must fail rather than silently select an outer repo.
+fn destination_repo_candidate(
+	directory: &Path,
+	cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+) -> io::Result<Option<PathBuf>> {
+	let mut visited = Vec::new();
+	let mut candidate = None;
+	for ancestor in directory.ancestors() {
+		if let Some(found) = cache.get(ancestor) {
+			candidate = found.clone();
+			break;
+		}
+		visited.push(ancestor.to_path_buf());
+		match fs::symlink_metadata(ancestor.join(".git")) {
+			Ok(_) => {
+				candidate = Some(ancestor.to_path_buf());
+				break;
+			}
+			Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+			Err(e) => return Err(e),
+		}
+	}
+	for path in visited {
+		cache.insert(path, candidate.clone());
+	}
+	Ok(candidate)
 }
 
 /// Conservative requested table bytes for std's current SwissTable, for
@@ -3364,9 +3472,26 @@ impl CommitReplayPreview {
 	) -> Result<commits::ReplayResult, TransferError> {
 		cancelled_err(opts, "replay-apply")?;
 		let git = Git::open_with(&self.destination, opts)?;
-		let guard = match commits::ReplaySession::lock(&git, opts) {
+		let target_dirs = self.replay.commits.iter().flat_map(|commit| {
+			commit
+				.files
+				.iter()
+				.filter(|file| file.action != commits::ReplayAction::Skip)
+				.flat_map(|file| {
+					file.absolute_path
+						.iter()
+						.chain(file.old_absolute_path.iter())
+				})
+				.filter_map(|path| path.parent())
+		});
+		// The replay also writes HEAD/index, even for an empty commit. Take
+		// that repo and every file destination in one sorted, deduplicated set.
+		let directories = std::iter::once(git.root()).chain(target_dirs);
+		let guards = match lock_destination_repos(directories, opts) {
 			Ok(g) => g,
-			Err(e @ GitError::WorktreeBusy { .. }) => return Err(e.into()),
+			Err(e @ TransferError::Git(GitError::WorktreeBusy { .. })) => {
+				return Err(e)
+			}
 			Err(e) => {
 				cancelled_err(opts, "replay-apply")?;
 				return Ok(commits::ReplaySession::refused(
@@ -3378,7 +3503,7 @@ impl CommitReplayPreview {
 		let session = match commits::ReplaySession::begin_in(
 			&self.scope,
 			&self.payload,
-			guard,
+			guards,
 		) {
 			Ok(s) => s,
 			Err(refused) => {

@@ -26,6 +26,7 @@ fn unsafe_replay_target(scope: &Path, abs: &Path) -> bool {
 	escapes_all_roots(&[scope], abs)
 		|| abs.parent().is_none_or(lands_in_git_dir)
 }
+#[cfg(test)]
 use crate::workspace::{lock_heavy, RepoIdentity};
 
 /// First line of a commit-mode payload; the rest is JSON.
@@ -1994,13 +1995,14 @@ pub(crate) struct ReplaySession {
 	no_hooks: NoHooks,
 	/// The write scope: every target is held to it, as the preview was.
 	scope: PathBuf,
-	_guard: crate::workspace::HeavyGuard,
+	_guards: Vec<crate::workspace::HeavyGuard>,
 }
 
 impl ReplaySession {
 	/// The worktree's write lock for a replay. `WorktreeBusy` means another
 	/// paste holds it; callers refuse that outright rather than as a
 	/// failed commit.
+	#[cfg(test)]
 	pub(crate) fn lock(
 		git: &Git,
 		opts: &RunOptions,
@@ -2032,7 +2034,7 @@ impl ReplaySession {
 	pub(crate) fn begin_in(
 		scope: &Path,
 		payload: &CommitsPayload,
-		_guard: crate::workspace::HeavyGuard,
+		_guards: Vec<crate::workspace::HeavyGuard>,
 	) -> Result<Self, ReplayResult> {
 		let no_hooks = match NoHooks::create() {
 			Ok(h) => h,
@@ -2046,7 +2048,7 @@ impl ReplaySession {
 		Ok(Self {
 			no_hooks,
 			scope: scope.to_path_buf(),
-			_guard,
+			_guards,
 		})
 	}
 
@@ -2083,7 +2085,7 @@ pub(crate) fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
 		Ok(g) => g,
 		Err(e) => return ReplaySession::refused(payload, e.to_string()),
 	};
-	match ReplaySession::begin_in(git.root(), payload, guard) {
+	match ReplaySession::begin_in(git.root(), payload, vec![guard]) {
 		Ok(session) => session.run(git, payload),
 		Err(refused) => refused,
 	}
@@ -4645,7 +4647,7 @@ mod tests {
 		let payload = deleting("parent/sub/last.txt");
 		let git = repo.open();
 		let guard = ReplaySession::lock(&git, &RunOptions::default()).unwrap();
-		let session = ReplaySession::begin_in(&spelled, &payload, guard)
+		let session = ReplaySession::begin_in(&spelled, &payload, vec![guard])
 			.map_err(|refused| {
 				refused
 					.failure

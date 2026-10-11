@@ -228,6 +228,80 @@ fn paste_is_refused_while_another_paste_holds_the_repository() {
 }
 
 #[test]
+fn paste_from_parent_is_refused_while_nested_repository_is_locked() {
+	use snip_core::gitrun::RunOptions;
+	use snip_core::gitsrc::Git;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	for parent_is_repo in [false, true] {
+		let tmp = tempfile::tempdir().unwrap();
+		let parent = tmp.path().join("parent");
+		let child = parent.join("child");
+		fs::create_dir_all(&child).unwrap();
+		if parent_is_repo {
+			init_repo(&parent);
+		}
+		init_repo(&child);
+		fs::write(child.join("keep.txt"), "original\n").unwrap();
+		fs::write(child.join("delete.txt"), "keep until applied\n").unwrap();
+		commit(&child, "base", "2026-01-01T00:00:00+00:00");
+		let payload = b"// file: outside.txt\nouter content\n\
+// file: child/new/deep.txt\nnew content\n\
+// file: child/keep.txt\nreplacement\n\
+// file: [DELETED] child/delete.txt\n";
+		let args = [
+			"--repo",
+			parent.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		];
+		let id = RepoIdentity::resolve(
+			&Git::open(&child).unwrap(),
+			&RunOptions::default(),
+		)
+		.unwrap();
+		let held = lock_heavy(&id).unwrap();
+		let out = snip(&args, Some(payload));
+		assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+		assert!(
+			text(&out.stderr)
+				.contains("another paste is writing to this repository"),
+			"{}",
+			text(&out.stderr)
+		);
+		assert!(!parent.join("outside.txt").exists());
+		assert!(!child.join("new").exists());
+		assert_eq!(
+			fs::read_to_string(child.join("keep.txt")).unwrap(),
+			"original\n"
+		);
+		assert_eq!(
+			fs::read_to_string(child.join("delete.txt")).unwrap(),
+			"keep until applied\n"
+		);
+
+		drop(held);
+		let out = snip(&args, Some(payload));
+		assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+		assert_eq!(
+			fs::read_to_string(parent.join("outside.txt")).unwrap(),
+			"outer content"
+		);
+		assert_eq!(
+			fs::read_to_string(child.join("new/deep.txt")).unwrap(),
+			"new content"
+		);
+		assert_eq!(
+			fs::read_to_string(child.join("keep.txt")).unwrap(),
+			"replacement"
+		);
+		assert!(!child.join("delete.txt").exists());
+	}
+}
+
+#[test]
 fn commit_mode_round_trip() {
 	let tmp = tempfile::tempdir().unwrap();
 	let a = tmp.path().join("a");
