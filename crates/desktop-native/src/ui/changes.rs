@@ -521,6 +521,13 @@ impl WorkbenchModel {
 					.child(count.to_string()),
 			)
 			.children(probe(log, id))
+			// Drawn whole at the list's top only when the list is scrolled
+			// to its start: a wheel sweep reads it as the top.
+			.children(
+				(row_idx == 0)
+					.then(|| probe(log, "change-list-top"))
+					.flatten(),
+			)
 			.into_any_element()
 	}
 

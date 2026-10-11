@@ -911,7 +911,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		control(excluded_row);
 		xdo(&["type", "--window", &wid, query]);
 		wait_for_pattern(
-			"[APP:SELECTOR_FILTER: items=1]",
+			&format!("[APP:SELECTOR_FILTER: query={query:?} items=1]"),
 			Duration::from_secs(3),
 		)
 		.expect("repo filter must finish with one candidate");

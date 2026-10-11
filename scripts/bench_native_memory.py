@@ -1971,25 +1971,47 @@ def _wheel_left_list(s: NativeSession, win: dict[str, Any], down: bool) -> bool:
     return _change_rows_snapshot(s) != snap
 
 
+def changes_list_at_top(lines: list[str]) -> bool:
+    """True when the Changes list is scrolled to its start.
+
+    `change-list-top` is the first row's marker, drawn only while that row is
+    painted. A probe reports its visible part, so the row is whole (not cut at
+    the list's top edge) when it starts at `left-list` and is as tall as the
+    tallest Changes row. A group header aligned with the top is not enough: a
+    later group's header lands there whenever the scroll offset is a whole
+    number of rows. A first row that is a note carries no marker, and the
+    caller falls back to watching the list stop moving.
+    """
+    bounds = parse_bounds(lines)
+    top = bounds.get("change-list-top")
+    viewport = bounds.get("left-list")
+    if top is None or viewport is None:
+        return False
+    tallest = max(box[3] for key, box in bounds.items() if key.startswith("change-"))
+    return top[1] == viewport[1] and top[3] >= tallest
+
+
 def scroll_to_change_dirs(
     s: NativeSession,
     win: dict[str, Any],
     candidates: Callable[[], list[str] | None],
     max_steps: int = 60,
 ) -> list[str] | None:
-    """Sweep the Changes list from its top down until `candidates` finds something.
+    """Sweep the Changes list up to its top, then down, until `candidates` finds something.
 
     A workspace of many dirty repos puts a repo's folders out of view, above or
-    below, and bounds of unpainted rows are unknown; a list that stops moving for
-    two wheel steps is at its end.
+    below, and bounds of unpainted rows are unknown. `candidates` is asked before
+    each step either way. The top is the first row's marker; without it, and at
+    the bottom, a list that stops moving for two wheel steps is at its end.
     """
     for down in (False, True):
         still = 0
         for _ in range(max_steps):
-            if down:
-                found = candidates()
-                if found != []:
-                    return found
+            found = candidates()
+            if found != []:
+                return found
+            if not down and changes_list_at_top(s.texts()):
+                break
             if _wheel_left_list(s, win, down):
                 still = 0
             else:

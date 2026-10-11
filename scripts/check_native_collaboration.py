@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import uuid
 import warnings
 from collections import Counter
@@ -1148,17 +1149,69 @@ def _current_root(session: Any) -> str | None:
     return os.path.realpath(root)
 
 
-def _settle_filter(session: Any, start: int, timeout: float) -> str:
-    line = wait_substr(session, "[APP:SELECTOR_FILTER:", start, timeout)
-    absorb = time.monotonic() + 0.7
-    while time.monotonic() < absorb:
+def rust_debug_str(text: str) -> str:
+    """`text` as Rust's `{:?}` prints a `&str`: quoted, `"` and `\\` escaped, control characters as escapes."""
+    out = []
+    for ch in text:
+        if ch in "\"\\":
+            out.append("\\" + ch)
+        elif ch in SHORT_ESCAPES:
+            out.append(SHORT_ESCAPES[ch])
+        elif unicodedata.category(ch).startswith("C"):
+            out.append(f"\\u{{{ord(ch):x}}}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+SHORT_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\0": "\\0"}
+
+
+def selector_filter_items(line: str, query: str) -> int | None:
+    """Candidate count of a `[APP:SELECTOR_FILTER: query=".." items=N]` line for exactly `query`, else None.
+
+    The app logs one line per keystroke, so a line for a prefix of the typed text is not the answer.
+    """
+    match = re.search(r"\[APP:SELECTOR_FILTER: query=(.*) items=(\d+)\]", line)
+    if match is None or match[1] != rust_debug_str(query):
+        return None
+    return int(match[2])
+
+
+def _settle_filter(native: Any, session: Any, query: str, start: int, timeout: float) -> str:
+    """The filter line for `query`, once a frame has drawn its candidates.
+
+    The line is logged on the keystroke, before the frame that draws it. The
+    filter keeps the order and only narrows as letters are added, so when the
+    drawn `pick-repo:` rows number its `items`, the rows on screen are the
+    rows of this query and stand where they will be clicked.
+    """
+    bound = native.e2e_scaled(timeout)
+    try:
+        _index, _stamp, line = session.wait_line(lambda item: selector_filter_items(item, query) is not None, start=start, timeout=bound)
+    except Exception as exc:
+        raise OperationTimeout(f"no SELECTOR_FILTER for query {rust_debug_str(query)}: {exc}") from exc
+    items = selector_filter_items(line, query)
+    deadline = time.monotonic() + bound
+    while True:
+        drawn = sorted(control for control in native.parse_bounds(session.texts()) if control.startswith("pick-repo:"))
+        if len(drawn) == items:
+            return line
+        if time.monotonic() >= deadline:
+            raise OperationTimeout(f"{line} but {len(drawn)} pick-repo rows are drawn after {bound}s: {drawn}")
         time.sleep(0.05)
-        fresh = [item for item in session.texts(start) if "SELECTOR_FILTER:" in item]
-        if fresh:
-            line = fresh[-1]
-    # Bounds are logged before the popup pixels. A non-black frame can still be the previous one.
-    time.sleep(1.2)
-    return line
+
+
+def _open_selector(native: Any, session: Any, win: dict[str, Any], timeout: float) -> None:
+    """Open the repo selector; its input is clickable once the opened popup has drawn it."""
+    before = len(session.lines)
+    click_control(native, session, win, "btn-repo-selector", timeout)
+    bound = native.e2e_scaled(timeout)
+    try:
+        index, _stamp, _line = session.wait_line(lambda item: "[APP:SELECTOR_OPEN: Repo" in item, start=before, timeout=bound)
+        session.wait_line(lambda item: "id=selector-input " in item, start=index, timeout=bound)
+    except Exception as exc:
+        raise OperationTimeout(f"repo selector did not open and draw its input: {exc}") from exc
 
 
 def _type_filter(session: Any, win: dict[str, Any], text: str) -> None:
@@ -1204,12 +1257,11 @@ def select_repo(native: Any, session: Any, win: dict[str, Any], basename: str, r
     tried: list[str] = []
     for _attempt in range(6):
         before = len(session.lines)
-        click_control(native, session, win, "btn-repo-selector", timeout)
-        _settle_filter(session, before, timeout)
+        _open_selector(native, session, win, timeout)
         click_control(native, session, win, "selector-input", timeout)
         typed = len(session.lines)
         _type_filter(session, win, basename)
-        filter_line = _settle_filter(session, typed, timeout)
+        filter_line = _settle_filter(native, session, basename, typed, timeout)
         bounds = native.parse_bounds(session.texts())
         candidates = [
             control
