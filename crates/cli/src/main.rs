@@ -1041,6 +1041,11 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 				"{would_create} commit(s) would be created; replay stops at commit #{} (refused); {not_reached} not reached.",
 				first_idx + 1
 			);
+			let hint =
+				plan.commits[first_idx].refused_by().and_then(|c| c.hint());
+			if let Some(hint) = hint {
+				eprintln!("hint: {hint}");
+			}
 		} else {
 			eprintln!("{total} commit(s) would be created.");
 		}
@@ -1071,11 +1076,14 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 	match result.failure {
 		None => Ok(()),
 		Some(f) => Err(format!(
-			"Commit {} of {} failed ({}): {}",
+			"Commit {} of {} failed ({}): {}{}",
 			f.index + 1,
 			payload.commits.len(),
 			f.message.lines().next().unwrap_or(""),
-			f.error
+			f.error,
+			f.layout_conflict
+				.and_then(|c| c.hint())
+				.map_or(String::new(), |h| format!("\nhint: {h}"))
 		)),
 	}
 }

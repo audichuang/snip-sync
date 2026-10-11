@@ -671,6 +671,80 @@ fn paste_commits_dry_run_plans_each_commit_after_the_earlier_ones() {
 }
 
 #[test]
+fn paste_commits_refuses_a_case_alias_in_dry_run_and_apply() {
+	// Issue #140: `newdir/x.txt` into a destination tracking `NEWDIR/a.txt`.
+	// A case-insensitive filesystem refuses the commit in both, before
+	// anything is written; a case-sensitive one writes `newdir/` beside it.
+	let tmp = tempfile::tempdir().unwrap();
+	let probe = tmp.path().join("probe_x");
+	fs::write(&probe, "x").unwrap();
+	let case_insensitive = tmp.path().join("PROBE_X").exists();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&dst);
+	fs::create_dir_all(dst.join("NEWDIR")).unwrap();
+	fs::write(dst.join("NEWDIR/a.txt"), "a\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = commits_payload(&[(
+		"add under alias",
+		&[("newdir/x.txt", "ADDED", Some("x\n"))],
+	)]);
+	let dry = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	let (stdout, stderr) = (text(&dry.stdout), text(&dry.stderr));
+	let apply = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	let all = format!("{}{}", text(&apply.stdout), text(&apply.stderr));
+	let reason = "the path differs only in letter case from another one in the destination or the commit";
+	let hint = "hint: paste the files in file mode instead, or first rename the path to match the existing case";
+	let status = Command::new("git")
+		.args(["status", "--porcelain"])
+		.current_dir(&dst)
+		.output()
+		.unwrap();
+	if case_insensitive {
+		assert!(
+			stdout.contains(&format!(
+				"[1/1] add under alias (refused: {reason})"
+			)),
+			"{stdout}"
+		);
+		assert!(
+			stderr.contains(
+				"0 commit(s) would be created; replay stops at commit #1 (refused); 0 not reached."
+			),
+			"{stderr}"
+		);
+		assert!(stderr.contains(hint), "{stderr}");
+		assert_eq!(code(&apply), 1, "{all}");
+		assert!(all.contains("Created 0 commit(s)."), "{all}");
+		assert!(
+			all.contains(&format!(
+				"Commit 1 of 1 failed (add under alias): newdir/x.txt: {reason}"
+			)),
+			"{all}"
+		);
+		assert!(all.contains(hint), "{all}");
+		assert!(!dst.join("NEWDIR/x.txt").exists());
+		assert_eq!(text(&status.stdout), "");
+	} else {
+		assert!(stdout.contains("[1/1] add under alias\n"), "{stdout}");
+		assert!(!stdout.contains("refused"), "{stdout}");
+		assert!(!stderr.contains("hint:"), "{stderr}");
+		assert_eq!(code(&apply), 0, "{all}");
+		assert!(all.contains("Created 1 commit(s)."), "{all}");
+		assert!(dst.join("newdir/x.txt").is_file());
+		assert_eq!(text(&status.stdout), "");
+	}
+}
+
+#[test]
 fn paste_commits_apply_replays_over_a_directory_an_earlier_commit_empties() {
 	// Commit 1 deletes d/f.txt (leaving `d` empty and so removed), commit 2
 	// writes a file at `d`: dry-run and Apply both create 2 commits.

@@ -126,6 +126,14 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
     內容在來源端已經 commit 過,避免本機的 hook 修改、擋下或改寫重播的內容。
   - 重播前先檢查整個 commit 的目標:寫入或刪除的位置是目錄、父目錄被一般檔案佔住時,
     整個 commit 拒絕且不動任何檔案(預覽標為 `UNSAFE_PATH`)。來源 message 為空也照樣建立。
+  - 在不分大小寫的檔案系統(macOS、Windows 預設)上,路徑或其中任何一層資料夾和目的地磁碟上、
+    index 裡的既有項目(以較早的 commit 處理後為準)或同一個 commit 的另一個路徑只差大小寫時,
+    整個 commit 同樣在預覽與 Apply 都拒絕(`CaseAlias`)。磁碟會把它當成既有的項目,`git commit --only`
+    卻區分大小寫比對 index,寫入後才失敗(#140)。只改大小寫的改名(`Foo.txt` → `foo.txt`)也算。
+    拒絕訊息提示改用檔案模式貼上(寫進磁碟上既有的拼法,不建立 commit),或先把名稱改成一致。
+    分大小寫的檔案系統(Linux)兩種拼法照常各自寫入。已知限制:較早的 commit 刪除的若是只在 index
+    (未進 HEAD)的檔案,預覽當它已離開 index,Apply 時它仍在 index,所以較晚的 commit 寫入它的
+    大小寫別名時,預覽說會寫、Apply 拒絕;這個方向不會留下半套狀態。
 
 ### 4.4 剪貼簿格式
 
