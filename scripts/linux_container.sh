@@ -145,6 +145,9 @@ if [ ! -f "$kernel" ]; then
 		cp arch/arm64/boot/Image "/out/$1.tmp" && mv "/out/$1.tmp" "/out/$1"' _ "$(basename "$kernel")" "$(basename "$base")" "${kernel_options[@]}"
 fi
 
+# The volume mounts over target/ inside the read-only checkout, which cannot create the
+# mount point: a fresh clone has no target/ until a host cargo command makes one.
+mkdir -p "$ROOT/target"
 container volume inspect "$target_volume" >/dev/null 2>&1 ||
 	container volume create --label "snip-root=$ROOT" "$target_volume" >/dev/null
 for name in snip-preflight-cargo-registry snip-preflight-cargo-git; do
