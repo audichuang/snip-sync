@@ -219,6 +219,21 @@ impl Connection {
 		transport: &Transport,
 		my_name: &str,
 	) -> Result<Self, RemoteError> {
+		Self::open_with(transport, my_name, None)
+	}
+
+	/// [`Self::open`] that `cancel` ends: an ssh that is still connecting
+	/// or waiting for the hello is killed (on drop) and the open fails
+	/// with [`RemoteError::Cancelled`], instead of sitting out ssh's
+	/// connect timeout and [`CONNECT_TIMEOUT`].
+	pub fn open_with(
+		transport: &Transport,
+		my_name: &str,
+		cancel: Option<&CancelToken>,
+	) -> Result<Self, RemoteError> {
+		if cancel.is_some_and(|c| c.is_cancelled()) {
+			return Err(RemoteError::Cancelled);
+		}
 		let (writer, frames, child, stderr, retained, in_flight, last_byte) =
 			match transport {
 				Transport::Command(argv) => spawn(argv)?,
@@ -261,8 +276,8 @@ impl Connection {
 		// master waits for it, so the pump must see it as in flight.
 		conn.in_flight.store(true, Ordering::SeqCst);
 		let reply = conn
-			.send_guarded(&hello, None, Instant::now() + CONNECT_TIMEOUT)
-			.and_then(|()| conn.recv(CONNECT_TIMEOUT));
+			.send_guarded(&hello, cancel, Instant::now() + CONNECT_TIMEOUT)
+			.and_then(|()| conn.recv_hello(CONNECT_TIMEOUT, cancel));
 		conn.in_flight.store(false, Ordering::SeqCst);
 		match reply {
 			Ok(Some(Response::Hello {
@@ -293,6 +308,33 @@ impl Connection {
 				Err(conn.start_error(cause))
 			}
 			Err(err) => Err(err),
+		}
+	}
+
+	/// The hello reply within `timeout`, polling `cancel` meanwhile.
+	fn recv_hello(
+		&mut self,
+		timeout: Duration,
+		cancel: Option<&CancelToken>,
+	) -> Result<Option<Response>, RemoteError> {
+		let deadline = Instant::now() + timeout;
+		loop {
+			let now = Instant::now();
+			if now >= deadline {
+				return Err(RemoteError::TimedOut);
+			}
+			match self.frames.recv_timeout(WAIT_SLICE.min(deadline - now)) {
+				Ok(frame) => {
+					// The frame left the queue; the pump may read on.
+					self.retained.fetch_sub(1, Ordering::Relaxed);
+					return Ok(frame?);
+				}
+				Err(RecvTimeoutError::Disconnected) => return Ok(None),
+				Err(RecvTimeoutError::Timeout) => {}
+			}
+			if cancel.is_some_and(|c| c.is_cancelled()) {
+				return Err(RemoteError::Cancelled);
+			}
 		}
 	}
 
@@ -923,14 +965,25 @@ impl Client {
 	}
 
 	fn connect(&self) -> Result<Connection, RemoteError> {
-		Connection::open(&self.host.transport, &self.my_name)
+		self.connect_with(None)
+	}
+
+	fn connect_with(
+		&self,
+		cancel: Option<&CancelToken>,
+	) -> Result<Connection, RemoteError> {
+		Connection::open_with(&self.host.transport, &self.my_name, cancel)
 	}
 
 	/// A fresh connection whose worker speaks at least `need`, or
 	/// [`RemoteError::WorkerTooOld`]. A too-old worker is kept in the pool
 	/// for the requests it can still serve.
-	fn connect_at_least(&self, need: u32) -> Result<Connection, RemoteError> {
-		let fresh = self.connect()?;
+	fn connect_at_least(
+		&self,
+		need: u32,
+		cancel: Option<&CancelToken>,
+	) -> Result<Connection, RemoteError> {
+		let fresh = self.connect_with(cancel)?;
 		if fresh.version() < need {
 			let err = too_old_error(&fresh, need);
 			self.keep(fresh);
@@ -1001,11 +1054,11 @@ impl Client {
 				// reason, its stream is out of step with the protocol:
 				// drop the connection (killing its process) and start a
 				// clean one — which must speak a new enough protocol too.
-				(self.connect_at_least(need)?, false)
+				(self.connect_at_least(need, cancel)?, false)
 			}
 			Some(conn) if conn.version() >= need => (conn, true),
 			Some(conn) => return Err(too_old(conn)),
-			None => (self.connect_at_least(need)?, false),
+			None => (self.connect_at_least(need, cancel)?, false),
 		};
 
 		let remaining = limit.saturating_sub(start.elapsed());
@@ -1020,7 +1073,7 @@ impl Client {
 				if remaining_retry.is_zero() {
 					return Err(RemoteError::TimedOut);
 				}
-				match self.connect_at_least(need) {
+				match self.connect_at_least(need, cancel) {
 					Ok(mut fresh) => {
 						result = fresh.call(request, cancel, remaining_retry);
 						conn = fresh;
@@ -1221,7 +1274,17 @@ impl Client {
 		&self,
 		path: &str,
 	) -> Result<RemoteWorkspace, RemoteError> {
-		match self.call(&Request::OpenWorkspace { path: path.into() })? {
+		self.open_workspace_with(path, None)
+	}
+
+	/// [`Self::open_workspace`] that `cancel` ends, the connect included.
+	pub fn open_workspace_with(
+		&self,
+		path: &str,
+		cancel: Option<&CancelToken>,
+	) -> Result<RemoteWorkspace, RemoteError> {
+		let request = Request::OpenWorkspace { path: path.into() };
+		match self.call_with(&request, cancel, GIT_CALL_LIMIT)? {
 			Response::Workspace(ws) => Ok(ws),
 			_ => Err(unexpected()),
 		}
@@ -2462,6 +2525,67 @@ mod tests {
 		);
 		drop(w);
 		canceller.join().unwrap();
+	}
+
+	/// A cancel ends an open whose transport never says hello (ssh still
+	/// connecting to a host that does not answer): the open returns at
+	/// once and the transport process is gone, instead of holding a tab's
+	/// close past its drain deadline for ssh's and the hello's timeouts.
+	#[cfg(unix)]
+	#[test]
+	fn a_cancel_ends_an_open_that_never_says_hello() {
+		let tmp = tempfile::tempdir().unwrap();
+		let pid_file = tmp.path().join("pid");
+		let script =
+			format!("echo $$ > '{}'; exec sleep 60", pid_file.display());
+		let transport = Transport::Command(vec![
+			"/bin/sh".into(),
+			"-c".into(),
+			script.into(),
+		]);
+		let token = CancelToken::new();
+		let canceller = {
+			let (token, pid_file) = (token.clone(), pid_file.clone());
+			std::thread::spawn(move || {
+				let limit = Instant::now() + scaled(Duration::from_secs(5));
+				while !pid_file.exists() {
+					assert!(
+						Instant::now() < limit,
+						"the transport never started"
+					);
+					std::thread::sleep(Duration::from_millis(10));
+				}
+				token.cancel();
+			})
+		};
+		let started = Instant::now();
+		let err = Connection::open_with(&transport, "test", Some(&token))
+			.err()
+			.expect("a cancelled open must fail");
+		assert!(matches!(err, RemoteError::Cancelled), "{err:?}");
+		assert!(
+			started.elapsed() < scaled(Duration::from_secs(5)),
+			"the cancel must end the open promptly, took {:?}",
+			started.elapsed()
+		);
+		canceller.join().unwrap();
+		let pid = std::fs::read_to_string(&pid_file).unwrap();
+		let alive = std::process::Command::new("kill")
+			.args(["-0", pid.trim()])
+			.status()
+			.unwrap()
+			.success();
+		assert!(
+			!alive,
+			"the transport {} must be killed and reaped",
+			pid.trim()
+		);
+
+		// Already cancelled: nothing is started.
+		let err = Connection::open_with(&transport, "test", Some(&token))
+			.err()
+			.expect("a cancelled open must fail");
+		assert!(matches!(err, RemoteError::Cancelled), "{err:?}");
 	}
 
 	/// A connection whose idle timer has expired while sitting idle must

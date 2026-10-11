@@ -2536,6 +2536,8 @@ impl WorkbenchModel {
 
 	fn finish_close(&mut self, cx: &mut Context<Self>) {
 		self.release_workspace_state(cx);
+		// A closed folder is not reconnected by a later stopped drain.
+		self.remote.restoring = None;
 		self.workspace_open = false;
 		if self.ws_tab.is_some() {
 			// The root drops the tab.
@@ -15430,9 +15432,12 @@ mod tests {
 			}
 
 			/// An open owns its transport until the handshake and connection
-			/// cleanup return, even when this tab has no workspace yet.
+			/// cleanup return, even when this tab has no workspace yet. The
+			/// close cancels it: a host that does not answer (ssh's connect
+			/// timeout and the hello's outlast the drain deadline) must not
+			/// keep the tab open.
 			#[gpui::test]
-			fn closing_a_connecting_empty_tab_waits_for_remote_open(
+			fn closing_a_connecting_empty_tab_cancels_the_remote_open(
 				cx: &mut TestAppContext,
 			) {
 				let tmp = tempfile::tempdir().unwrap();
@@ -15442,26 +15447,28 @@ mod tests {
 				let (root, cx) = open_tabs(cx, FirstTab::Empty, None);
 				click_id(cx, "ws-tab-new".into());
 				let empty = tab(&root, cx, 1);
+				let hold = crate::lifecycle::DRAIN_DEADLINE * 4;
 				empty.update(cx, |m, cx| {
 					m.remote.hosts = vec![snip_remote::RemoteHost::in_process(
 						worker.clone(),
 					)];
-					m.e2e_remote_open_delay = Some(Duration::from_secs(2));
+					m.e2e_remote_open_delay = Some(hold);
 					m.open_remote_path(0, tmp.path().display().to_string(), cx);
 				});
 				cx.run_until_parked();
-				cx.simulate_keystrokes("cmd-w");
-				settle(cx);
+				assert!(empty.read_with(cx, |m, _| m.remote.busy));
 				assert_eq!(
-					count(&root, cx),
-					2,
-					"the connecting tab must wait for its SSH job"
+					empty.update(cx, |m, _| m.lifecycle.unfinished()),
+					1
 				);
-				assert!(empty.read_with(cx, |m, _| m.lifecycle.is_draining()));
-				cx.executor().advance_clock(Duration::from_secs(2));
-				wait(cx, "connection cleaned and tab closed", |cx| {
-					count(&root, cx) == 1
-				});
+				cx.simulate_keystrokes("cmd-w");
+				// One hold slice: the cancel lands well inside the deadline.
+				cx.executor().advance_clock(Duration::from_millis(100));
+				wait(
+					cx,
+					"open cancelled, connection cleaned, tab closed",
+					|cx| count(&root, cx) == 1,
+				);
 				assert!(!empty.read_with(cx, |m, _| m.remote.busy));
 				assert_eq!(
 					empty.update(cx, |m, _| m.lifecycle.unfinished()),

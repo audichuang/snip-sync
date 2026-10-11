@@ -729,24 +729,34 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let this = cx.weak_entity();
 		let mut async_app = cx.to_async();
-		// The open has no cancellation API. Own the whole future, including
-		// Client/Connection drop (SSH kill + wait), before a tab may close.
+		// The tab owns the open until its connection is dropped (SSH kill +
+		// wait). A close or quit cancels it, which kills an ssh that is
+		// still connecting, so the drain does not wait out ssh's connect
+		// timeout and the hello's.
+		let cancel = snip_core::gitrun::CancelToken::new();
+		let token = cancel.clone();
 		self.spawn_owned(
 			cx,
-			crate::lifecycle::JobKind::UncancellableRead,
-			None,
+			crate::lifecycle::JobKind::CancellableRead,
+			Some(cancel),
 			async move {
 				// Tests hold the open at the test clock so a user action can
-				// land while it is in flight.
+				// land while it is in flight; a cancel ends the hold as it
+				// ends a real connect.
 				#[cfg(test)]
 				if let Some(delay) = open_delay {
-					async_app.background_executor().timer(delay).await;
+					let slice = std::time::Duration::from_millis(50);
+					let mut held = std::time::Duration::ZERO;
+					while held < delay && !token.is_cancelled() {
+						async_app.background_executor().timer(slice).await;
+						held += slice;
+					}
 				}
 				let probe = host.clone();
 				let result = bg
 					.spawn(async move {
 						Client::new(probe, device_name())
-							.open_workspace(path.trim())
+							.open_workspace_with(path.trim(), Some(&token))
 							.map_err(describe)
 					})
 					.await;
