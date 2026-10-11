@@ -1779,7 +1779,7 @@ class TestWorkspaceTabDriver(unittest.TestCase):
 
     def test_close_reports_drained_when_the_close_drain_left_nothing(self) -> None:
         lifecycle = "[APP:LIFECYCLE: phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0 tab=7]"
-        s = _TabSession([], on_key={"ctrl+w": ["[APP:WS_TAB_CLOSED: id=7 count=1]", lifecycle]})
+        s = _TabSession([], on_key={"ctrl+w": ["[APP:WS_TAB_CLOSED: id=7 count=1]", lifecycle, _bounds("ws-tab-new", 10)]})
         result = close_shown_tab(s, WIN, 7)
         self.assertTrue(result["drained"])
         self.assertEqual(result["count"], 1)
@@ -1796,8 +1796,24 @@ class TestWorkspaceTabDriver(unittest.TestCase):
         )
         for name, lines, replies in cases:
             with self.subTest(name):
-                s = _TabSession(lines, on_key={"ctrl+w": replies})
+                s = _TabSession(lines, on_key={"ctrl+w": replies + [_bounds("ws-tab-new", 10)]})
                 self.assertFalse(close_shown_tab(s, WIN, 7)["drained"])
+
+    def test_close_waits_for_plus_bounds_reported_after_the_close(self) -> None:
+        # CI lost the next "+" click: it went to the bounds "+" had beside the closed tab.
+        closed = "[APP:WS_TAB_CLOSED: id=7 count=1]"
+        cases = (
+            ("no bounds after the close", [_bounds("ws-tab-new", 40)], [closed]),
+            ("bounds only before the close", [], [_bounds("ws-tab-new", 40), closed]),
+        )
+        for name, lines, replies in cases:
+            with self.subTest(name):
+                s = _TabSession(lines, on_key={"ctrl+w": replies})
+                with self.assertRaisesRegex(NativeBenchError, "timed out"):
+                    close_shown_tab(s, WIN, 7)
+        s = _TabSession([_bounds("ws-tab-new", 40)], on_key={"ctrl+w": [closed, _bounds("ws-tab-new", 10)]})
+        self.assertEqual(close_shown_tab(s, WIN, 7)["count"], 1)
+        self.assertEqual(s.timeouts[-1], e2e_scaled(10.0))
 
     def test_click_control_fails_after_the_scaled_deadline(self) -> None:
         s = _TabSession([])
