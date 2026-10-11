@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blob::{BlobRead, BlobReader, NotText};
 use crate::fsutil::{must_not_overwrite, write_text_file};
-use crate::gitrun::{CancelToken, RunOptions};
+use crate::gitrun::{CancelToken, Overflow, RunOptions};
 use crate::gitsrc::{Git, GitError, RawZ};
 use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
 
@@ -1460,17 +1460,17 @@ struct PlannedLayout {
 
 impl PlannedLayout {
 	/// A layout for planning or replaying in `git`'s worktree.
-	fn new(git: &Git) -> Self {
+	fn new(git: &Git, opts: &RunOptions) -> Result<Self, GitError> {
 		let fold_case = crate::transfer::fs_is_case_insensitive(git.root());
-		Self {
+		Ok(Self {
 			fold_case,
 			tracked: if fold_case {
-				TrackedSpellings::read(git)
+				TrackedSpellings::read(git, opts)?
 			} else {
 				TrackedSpellings::default()
 			},
 			..Self::default()
-		}
+		})
 	}
 
 	fn key(&self, path: &Path) -> PathBuf {
@@ -1675,15 +1675,19 @@ struct TrackedSpellings(
 );
 
 impl TrackedSpellings {
-	/// `git ls-files`; an unreadable index leaves only the disk to compare.
-	fn read(git: &Git) -> Self {
+	/// Read the complete index: a partial or failed read cannot safely rule
+	/// out a case alias. Keep the caller's deadline, queue and cancel token.
+	fn read(git: &Git, opts: &RunOptions) -> Result<Self, GitError> {
+		let opts = RunOptions {
+			overflow: Overflow::Error,
+			..opts.clone()
+		};
+		let list = git.run_with(&["ls-files", "-z"], &opts)?;
 		let mut out = Self::default();
-		if let Ok(list) = git.run(&["ls-files", "-z"]) {
-			for path in list.split(|&b| b == 0).filter(|p| !p.is_empty()) {
-				out.insert(&String::from_utf8_lossy(path));
-			}
+		for path in list.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+			out.insert(&String::from_utf8_lossy(path));
 		}
-		out
+		Ok(out)
 	}
 
 	/// `rel` and each folder above it, shortest first.
@@ -1931,7 +1935,7 @@ pub fn plan_commit_replay_in(
 	let root = git.root().to_path_buf();
 	let mut commits = Vec::new();
 	// Each commit is planned after the earlier ones, as replay writes them.
-	let mut layout = PlannedLayout::new(git);
+	let mut layout = PlannedLayout::new(git, opts)?;
 	for commit in &payload.commits {
 		refuse_if_cancelled(opts, "replay-plan")?;
 		let mut files = Vec::new();
@@ -2150,7 +2154,8 @@ fn replay_commit(
 	let root = git.root();
 	// Replay plans against the disk and index as the earlier commits left
 	// them.
-	let layout = PlannedLayout::new(git);
+	let layout = PlannedLayout::new(git, &RunOptions::default())
+		.map_err(|e| e.to_string())?;
 	let plan = plan_commit(root, commit, &layout);
 	// The preview skips these; replay refuses the commit before touching
 	// anything rather than stop halfway with a half-staged worktree.

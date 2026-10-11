@@ -26,6 +26,15 @@ use snip_core::commits;
 
 use snip_native_e2e::{native_bin, parse_covered, parse_duplicate, scaled};
 
+fn clipboard_matching(what: &str, matches: impl FnMut(&str) -> bool) -> String {
+	snip_native_e2e::wait_for_clipboard(
+		clip::read_text,
+		matches,
+		Duration::from_secs(3),
+	)
+	.unwrap_or_else(|err| panic!("{what}: {err}"))
+}
+
 fn clip_set(text: &str) {
 	let mut child = Command::new("xclip")
 		.args(["-selection", "clipboard"])
@@ -1227,7 +1236,6 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	click("btn-copy-view");
 	wait_for_pattern("[APP:PREVIEW_COPIED:", Duration::from_secs(3))
 		.expect("preview must be copied");
-	let copied_hist = clip::read_text().expect("must read clipboard");
 	let git_oracle_raw = Command::new("git")
 		.current_dir(&r1)
 		.args(["show", &format!("{base_commit_sha}:deleted_later.txt")])
@@ -1235,6 +1243,8 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		.expect("git show oracle must run");
 	let git_oracle_text =
 		String::from_utf8(git_oracle_raw.stdout).expect("utf-8 oracle");
+	let copied_hist =
+		clipboard_matching("historical file", |s| s == git_oracle_text);
 	assert_eq!(
 		copied_hist, git_oracle_text,
 		"copied historical file must match Git oracle byte-for-byte"
@@ -1272,7 +1282,9 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	send_key("ctrl+c");
 	wait_for_pattern("[APP:SELECTION_COPIED:", Duration::from_secs(3))
 		.expect("selection must be copied from reader");
-	let reader_copied = clip::read_text().expect("clipboard must have text");
+	let reader_copied = clipboard_matching("reader copy", |s| {
+		s.contains("nested directory file")
+	});
 	assert!(
 		reader_copied.contains("nested directory file"),
 		"reader copy must contain nested file content"
@@ -1460,7 +1472,9 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		Duration::from_secs(5),
 	)
 	.expect("first-parent range must be copied");
-	let commit_clip = clip::read_text().expect("clipboard after commit copy");
+	let commit_clip = clipboard_matching("two commits", |s| {
+		commits::parse_commit_payload(s).is_ok_and(|p| p.commits.len() == 2)
+	});
 	assert!(
 		commits::is_commit_payload(&commit_clip),
 		"copy must produce a commit payload"
@@ -1542,7 +1556,10 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		.expect("copy selection from tree must report copied=1");
 
 	// Verify clipboard contains exact bytes of unchanged.txt and excludes dirty/staged files
-	let clip_text = clip::read_text().expect("must read clipboard text");
+	let clip_text = clipboard_matching("unchanged.txt", |s| {
+		s.contains("unchanged.txt")
+			&& s.contains("this is unchanged tracked file content")
+	});
 	assert!(
 		clip_text.contains("unchanged.txt"),
 		"clipboard must contain unchanged.txt"
@@ -2593,7 +2610,9 @@ fn native_d3_copy_mapping_and_replay() {
 	assert!(staged_preview.contains("path=both.txt"));
 	click("btn-copy-view");
 	wait_for("[APP:PREVIEW_COPIED:", Duration::from_secs(3));
-	let staged_view = clip::read_text().unwrap();
+	let staged_view = clipboard_matching("staged_view", |s| {
+		s.contains("INDEX_A") && !s.contains("WORK_B")
+	});
 	assert!(
 		staged_view.contains("INDEX_A"),
 		"staged preview must show index bytes: {staged_view}"
@@ -2606,7 +2625,9 @@ fn native_d3_copy_mapping_and_replay() {
 	// Ctrl+C copies the Changes row under the cursor: the staged row.
 	send_key("ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
-	let staged_copy = clip::read_text().unwrap();
+	let staged_copy = clipboard_matching("staged_copy", |s| {
+		s.contains("INDEX_A\n") && !s.contains("WORK_B")
+	});
 	assert!(staged_copy.contains("INDEX_A\n"), "{staged_copy}");
 	assert!(!staged_copy.contains("WORK_B"), "{staged_copy}");
 	assert!(!staged_copy.contains("UNSELECTED"), "{staged_copy}");
@@ -2619,14 +2640,17 @@ fn native_d3_copy_mapping_and_replay() {
 	assert!(unstaged_preview.contains("path=both.txt"));
 	click("btn-copy-view");
 	wait_for("[APP:PREVIEW_COPIED:", Duration::from_secs(3));
-	let unstaged_view = clip::read_text().unwrap();
+	let unstaged_view =
+		clipboard_matching("unstaged_view", |s| s.contains("WORK_B"));
 	assert!(
 		unstaged_view.contains("WORK_B"),
 		"unstaged preview must show worktree bytes: {unstaged_view}"
 	);
 	copy_node("change-row:unstaged:both.txt");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
-	let unstaged_copy = clip::read_text().unwrap();
+	let unstaged_copy = clipboard_matching("unstaged_copy", |s| {
+		s.contains("WORK_B\n") && !s.contains("INDEX_A")
+	});
 	assert!(unstaged_copy.contains("WORK_B\n"), "{unstaged_copy}");
 	assert!(!unstaged_copy.contains("INDEX_A"), "{unstaged_copy}");
 
@@ -2638,7 +2662,9 @@ fn native_d3_copy_mapping_and_replay() {
 	copy_node("change-header:unstaged");
 	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
 	capture_window(&wid, &out_dir.join("d3_copy_1080x720.png"));
-	let exported = clip::read_text().unwrap();
+	let exported = clipboard_matching("exported", |s| {
+		s.contains("KEEP_BYTES\n") && s.contains("MOVED_BYTES\n")
+	});
 	assert!(exported.contains("KEEP_BYTES\n"), "{exported}");
 	assert!(exported.contains("MOVED_BYTES\n"), "{exported}");
 	assert!(exported.contains("lib/moved.txt"), "{exported}");
@@ -2757,7 +2783,9 @@ fn native_d3_copy_mapping_and_replay() {
 	);
 	click("btn-copy-commits");
 	wait_for("[APP:COPY_COMMITS_DONE: commits=2]", Duration::from_secs(6));
-	let commit_clip = clip::read_text().unwrap();
+	let commit_clip = clipboard_matching("commit_clip", |s| {
+		commits::parse_commit_payload(s).is_ok_and(|p| p.commits.len() == 2)
+	});
 	assert!(commits::is_commit_payload(&commit_clip));
 	let payload = commits::parse_commit_payload(&commit_clip).unwrap();
 	assert_eq!(payload.commits.len(), 2);
@@ -2800,7 +2828,12 @@ fn native_d3_copy_mapping_and_replay() {
 	assert!(range.contains("chain=visual"), "{range}");
 	click("btn-copy-commits");
 	wait_for("[APP:COPY_COMMITS_ERR:", Duration::from_secs(6));
-	assert_eq!(clip::read_text().unwrap(), commit_clip);
+	// The error event above proves the operation finished. Retry only read
+	// errors; a wrong readable value must fail immediately.
+	assert_eq!(
+		clipboard_matching("refused commit copy", |_| true),
+		commit_clip
+	);
 
 	let head_before = git_rev(&dest_app);
 	send_key("ctrl+v");
@@ -3026,7 +3059,9 @@ fn native_d3_files_and_replay_skip_oracles() {
 	click("menu-item:copy-files");
 	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
 	wait_for("[APP:COPY_IDLE]", Duration::from_secs(3));
-	let copied = clip::read_text().unwrap();
+	let copied = clipboard_matching("copy payload", |s| {
+		s.contains("ONE_BYTES\n") && s.contains("TWO_BYTES\n")
+	});
 	assert!(copied.contains("ONE_BYTES\n"), "{copied}");
 	assert!(copied.contains("TWO_BYTES\n"), "{copied}");
 
@@ -3042,7 +3077,7 @@ fn native_d3_files_and_replay_skip_oracles() {
 	send_key("ctrl+c");
 	let refusal = wait_for("[APP:COPY_REFUSED:", Duration::from_secs(3));
 	assert!(refusal.contains("empty_selection"), "{refusal}");
-	assert_eq!(clip::read_text().unwrap(), sentinel);
+	assert_eq!(clipboard_matching("refused empty copy", |_| true), sentinel);
 
 	fs::write(dest.join("a.txt"), [0xff, 0xfe, 0x01]).unwrap();
 	let head = git_rev(&dest);
@@ -5932,7 +5967,9 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	);
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
-	let copied = clip::read_text().unwrap();
+	let copied = clipboard_matching("copy payload", |s| {
+		s.contains("PLAIN_NOTE_BYTES") && s.contains("notes/readme.txt")
+	});
 	assert!(copied.contains("PLAIN_NOTE_BYTES"), "{copied}");
 	assert!(copied.contains("notes/readme.txt"), "{copied}");
 	assert!(!copied.contains("TOP_BYTES"), "{copied}");
@@ -5943,7 +5980,9 @@ fn native_project_view_lists_and_copies_non_git_files() {
 	wait_for("[APP:TREE_TOGGLED: main.rs]", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=2]", Duration::from_secs(6));
-	let both = clip::read_text().unwrap();
+	let both = clipboard_matching("both", |s| {
+		s.contains("PLAIN_NOTE_BYTES") && s.contains("fn main() {}")
+	});
 	assert!(both.contains("PLAIN_NOTE_BYTES"), "{both}");
 	assert!(both.contains("fn main() {}"), "{both}");
 	for line in both
@@ -6088,7 +6127,9 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 	wait_for("[APP:TREE_SELECTED: plain/x.txt]", Duration::from_secs(3));
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
-	let copied = clip::read_text().unwrap();
+	let copied = clipboard_matching("copy payload", |s| {
+		s.contains("PLAIN_X_BYTES") && s.contains("plain/x.txt")
+	});
 	assert!(copied.contains("PLAIN_X_BYTES"), "{copied}");
 	assert!(copied.contains("plain/x.txt"), "{copied}");
 	assert!(!copied.contains("ROOT_BYTES"), "{copied}");
@@ -6100,7 +6141,7 @@ fn native_project_view_nests_repos_inside_a_workspace_repo() {
 	control("tree-row:plain/x.txt");
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
-	assert!(clip::read_text().unwrap().contains("PLAIN_X_BYTES"));
+	clipboard_matching("selected plain file", |s| s.contains("PLAIN_X_BYTES"));
 	quit_cleanly(&mut app, &wid);
 }
 
@@ -6270,7 +6311,8 @@ fn native_project_view_plain_click_selects_one_row() {
 	only("src/main/java/TextResource.java", "");
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
-	let copied = clip::read_text().unwrap();
+	let copied =
+		clipboard_matching("copy payload", |s| s.contains("class T {}"));
 	assert!(copied.contains("class T {}"), "{copied}");
 	click("rail-changes");
 	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
@@ -6282,7 +6324,9 @@ fn native_project_view_plain_click_selects_one_row() {
 	assert!(preview.contains("path=staged.txt"), "{preview}");
 	key(&wid, "ctrl+c");
 	wait_for("[APP:COPY_DONE: copied=1]", Duration::from_secs(6));
-	let copied = clip::read_text().unwrap();
+	let copied = clipboard_matching("copy payload", |s| {
+		s.contains("STAGED_BYTES") && !s.contains("WORKING_BYTES")
+	});
 	assert!(copied.contains("STAGED_BYTES"), "{copied}");
 	assert!(!copied.contains("WORKING_BYTES"), "{copied}");
 	key(&wid, "ctrl+v");
@@ -6384,16 +6428,20 @@ fn native_project_view_multiselect_and_right_click_copy() {
 		|id: &str| press(id, &["keydown", "ctrl"], "1", &["keyup", "ctrl"]);
 	let shift_click =
 		|id: &str| press(id, &["keydown", "shift"], "1", &["keyup", "shift"]);
-	let copy_by_menu = |row: &str| -> String {
-		press(row, &[], "3", &[]);
-		wait_for(
-			"[APP:MENU_OPEN: Left items=copy-files",
-			Duration::from_secs(3),
-		);
-		click("menu-item:copy-files");
-		wait_for("[APP:COPY_DONE:", Duration::from_secs(6));
-		clip::read_text().unwrap()
-	};
+	let copy_by_menu =
+		|row: &str, expected: &[&str], absent: &[&str]| -> String {
+			press(row, &[], "3", &[]);
+			wait_for(
+				"[APP:MENU_OPEN: Left items=copy-files",
+				Duration::from_secs(3),
+			);
+			click("menu-item:copy-files");
+			wait_for("[APP:COPY_DONE:", Duration::from_secs(6));
+			clipboard_matching("menu copy", |s| {
+				expected.iter().all(|v| s.contains(v))
+					&& absent.iter().all(|v| !s.contains(v))
+			})
+		};
 
 	click("rail-project");
 	wait_for("[APP:TAB_SWITCHED: FileExplorer", Duration::from_secs(3));
@@ -6410,7 +6458,11 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	wait_for("[APP:TREE_SELECTED: a/one.txt]", Duration::from_secs(3));
 	ctrl_click("tree-row:b/two.txt");
 	wait_for("[APP:TREE_TOGGLED: b/two.txt]", Duration::from_secs(3));
-	let both = copy_by_menu("tree-row:b/two.txt");
+	let both = copy_by_menu(
+		"tree-row:b/two.txt",
+		&["ONE_BYTES", "TWO_BYTES"],
+		&["C_BYTES"],
+	);
 	assert!(both.contains("ONE_BYTES"), "{both}");
 	assert!(both.contains("TWO_BYTES"), "{both}");
 	assert!(!both.contains("C_BYTES"), "{both}");
@@ -6424,14 +6476,18 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	);
 	key(&wid, "Escape");
 	wait_for("[APP:MENU_CLOSED]", Duration::from_secs(3));
-	let kept = copy_by_menu("tree-row:b/two.txt");
+	let kept = copy_by_menu(
+		"tree-row:b/two.txt",
+		&["ONE_BYTES", "TWO_BYTES"],
+		&["C_BYTES"],
+	);
 	assert!(kept.contains("ONE_BYTES"), "{kept}");
 	assert!(kept.contains("TWO_BYTES"), "{kept}");
 
 	// A plain click selects that file alone.
 	click("tree-row:c.txt");
 	wait_for("[APP:TREE_SELECTED: c.txt]", Duration::from_secs(3));
-	let alone = copy_by_menu("tree-row:c.txt");
+	let alone = copy_by_menu("tree-row:c.txt", &["C_BYTES"], &["ONE_BYTES"]);
 	assert!(alone.contains("C_BYTES"), "{alone}");
 	assert!(!alone.contains("ONE_BYTES"), "{alone}");
 
@@ -6440,14 +6496,23 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	wait_for("[APP:TREE_SELECTED: a/one.txt]", Duration::from_secs(3));
 	ctrl_click("tree-row:b/two.txt");
 	wait_for("[APP:TREE_TOGGLED: b/two.txt]", Duration::from_secs(3));
-	let picked = copy_by_menu("tree-row:b/two.txt");
+	let picked = copy_by_menu(
+		"tree-row:b/two.txt",
+		&["ONE_BYTES", "TWO_BYTES"],
+		&["C_BYTES"],
+	);
 	assert!(picked.contains("ONE_BYTES"), "{picked}");
 	assert!(picked.contains("TWO_BYTES"), "{picked}");
 	assert!(!picked.contains("C_BYTES"), "{picked}");
 
-	// Right-click outside the selection selects that row alone first.
-	let other = copy_by_menu("tree-row:a/one.txt");
+	// Right-click another selected row copies the whole selection.
+	let other = copy_by_menu(
+		"tree-row:a/one.txt",
+		&["ONE_BYTES", "TWO_BYTES"],
+		&["C_BYTES"],
+	);
 	assert!(other.contains("ONE_BYTES"), "{other}");
+	assert!(other.contains("TWO_BYTES"), "{other}");
 	assert!(!other.contains("C_BYTES"), "{other}");
 
 	// Shift-click selects the rows between the cursor and the click.
@@ -6461,7 +6526,11 @@ fn native_project_view_multiselect_and_right_click_copy() {
 		"[APP:TREE_SELECTED: a/one.txt,b,b/two.txt]",
 		Duration::from_secs(3),
 	);
-	let range = copy_by_menu("tree-row:b/two.txt");
+	let range = copy_by_menu(
+		"tree-row:b/two.txt",
+		&["ONE_BYTES", "TWO_BYTES"],
+		&["C_BYTES"],
+	);
 	assert!(range.contains("ONE_BYTES"), "{range}");
 	assert!(range.contains("TWO_BYTES"), "{range}");
 	assert!(!range.contains("C_BYTES"), "{range}");
@@ -6469,7 +6538,11 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	// A folder never opened copies every file under it.
 	ctrl_click("tree-row:d");
 	wait_for("[APP:TREE_TOGGLED: d]", Duration::from_secs(3));
-	let folder = copy_by_menu("tree-row:d");
+	let folder = copy_by_menu(
+		"tree-row:d",
+		&["DEEP_BYTES", "MORE_BYTES", "TWO_BYTES"],
+		&["C_BYTES"],
+	);
 	assert!(folder.contains("DEEP_BYTES"), "{folder}");
 	assert!(folder.contains("MORE_BYTES"), "{folder}");
 	assert!(folder.contains("TWO_BYTES"), "{folder}");
@@ -6478,7 +6551,11 @@ fn native_project_view_multiselect_and_right_click_copy() {
 	// selection holds.
 	click("rail-changes");
 	wait_for("[APP:TAB_SWITCHED: GitChanges", Duration::from_secs(3));
-	let change = copy_by_menu("change-row:e.txt");
+	let change = copy_by_menu(
+		"change-row:e.txt",
+		&["E_DIRTY"],
+		&["C_BYTES", "DEEP_BYTES"],
+	);
 	assert_eq!(change.matches("E_DIRTY").count(), 1, "{change}");
 	assert!(!change.contains("C_BYTES"), "{change}");
 	assert!(!change.contains("DEEP_BYTES"), "{change}");
