@@ -836,13 +836,7 @@ mod tree {
 				// before treating EPERM as clean. Any live member or inspection error
 				// must fail closed.
 				#[cfg(any(target_os = "macos", target_os = "ios", test))]
-				Err(Errno::EPERM) => match check_group_liveness(pgid) {
-					Ok(false) => Ok(()),
-					Ok(true) => Err(io::Error::from(Errno::EPERM)),
-					Err(e) => Err(io::Error::other(format!(
-						"failed to inspect process group {pgid} members after EPERM: {e}"
-					))),
-				},
+				Err(Errno::EPERM) => eperm_group_is_clean(pgid),
 				Err(e) => Err(e.into()),
 			}
 		}
@@ -853,6 +847,40 @@ mod tree {
 
 		pub(super) fn try_reap(&mut self) -> io::Result<Option<ExitStatus>> {
 			self.child.try_wait()
+		}
+	}
+
+	/// Darwin's `ps` shows `?` for a member caught between running and
+	/// zombie (it exited, but is not yet `Z`): exactly what an EPERM from a
+	/// group whose last process just exited finds. Look again, a bounded
+	/// number of times, before failing closed: a git that exited cleanly
+	/// failed its run and leaked its slot when this was read once.
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	pub(super) const SETTLE_CHECKS: usize = 10;
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	const SETTLE_PAUSE: std::time::Duration =
+		std::time::Duration::from_millis(20);
+
+	/// After EPERM: clean only when no live member remains. Fails closed on
+	/// a live member, an inspection error, or a member still settling after
+	/// [`SETTLE_CHECKS`] looks.
+	#[cfg(any(target_os = "macos", target_os = "ios", test))]
+	fn eperm_group_is_clean(pgid: i32) -> io::Result<()> {
+		let mut checks = 0;
+		loop {
+			checks += 1;
+			match check_group_liveness(pgid) {
+				Ok(false) => return Ok(()),
+				Ok(true) => return Err(io::Error::from(Errno::EPERM)),
+				Err(e) if super::is_settling(&e) && checks < SETTLE_CHECKS => {
+					std::thread::sleep(SETTLE_PAUSE);
+				}
+				Err(e) => {
+					return Err(io::Error::other(format!(
+						"failed to inspect process group {pgid} members after EPERM: {e}"
+					)))
+				}
+			}
 		}
 	}
 
@@ -965,6 +993,13 @@ mod tree {
 			super::InjectGroupKillEperm::UnknownError => {
 				let mock = b"invalid output\n";
 				return super::parse_ps_group_liveness(mock, pgid);
+			}
+			super::InjectGroupKillEperm::SettlingThenZombie(n) => {
+				let looked = super::INJECT_SETTLING_LOOKS.get();
+				super::INJECT_SETTLING_LOOKS.set(looked + 1);
+				let state = if looked < n { "?" } else { "Z" };
+				let mock = format!("Ss 1\n{state} {pgid}\n");
+				return super::parse_ps_group_liveness(mock.as_bytes(), pgid);
 			}
 		}
 
@@ -1165,6 +1200,8 @@ pub(crate) enum InjectGroupKillEperm {
 	ZeroLive,
 	LiveRemaining,
 	UnknownError,
+	/// The first `n` looks find a member in `?`, the rest a zombie.
+	SettlingThenZombie(usize),
 }
 
 #[cfg(all(unix, test))]
@@ -1174,11 +1211,13 @@ thread_local! {
 	static TEST_PS_HELPER_OVERRIDE: std::cell::RefCell<Option<Vec<String>>> =
 		const { std::cell::RefCell::new(None) };
 	static TEST_LAST_HELPER_PID: Cell<Option<u32>> = const { Cell::new(None) };
+	static INJECT_SETTLING_LOOKS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(all(unix, test))]
 pub(crate) fn test_inject_group_kill_eperm(mode: InjectGroupKillEperm) {
 	INJECT_GROUP_KILL_EPERM.set(mode);
+	INJECT_SETTLING_LOOKS.set(0);
 }
 
 #[cfg(all(unix, test))]
@@ -1191,6 +1230,33 @@ pub(crate) fn test_last_helper_pid() -> Option<u32> {
 	TEST_LAST_HELPER_PID.get()
 }
 
+/// A member of the target group in Darwin's `?` state: not proven dead.
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+#[derive(Debug)]
+struct Settling {
+	target_pgid: i32,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+impl std::fmt::Display for Settling {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"unknown primary process state '?' for target process group {} (still settling)",
+			self.target_pgid
+		)
+	}
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+impl std::error::Error for Settling {}
+
+/// The liveness check found a member still settling (`?`), nothing worse.
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios", test)))]
+fn is_settling(err: &io::Error) -> bool {
+	err.get_ref().is_some_and(|e| e.is::<Settling>())
+}
+
 /// Strictly inspects `ps -ax -o stat=,pgid=` output to determine if any live
 /// (non-zombie) processes belong to `target_pgid`.
 ///
@@ -1199,6 +1265,8 @@ pub(crate) fn test_last_helper_pid() -> Option<u32> {
 ///   (either all records for `target_pgid` are in zombie state `'Z'`, or
 ///   `target_pgid` is absent).
 /// - `Ok(true)`: At least one member of `target_pgid` is in a live (non-`'Z'`) state.
+/// - `Err(...)` that [`is_settling`]: a target member is in `'?'`, not yet a
+///   zombie. Not proof of anything; the caller may look again.
 /// - `Err(...)`: Parse failure, non-UTF-8, truncated output, invalid primary stat,
 ///   unbounded/non-ASCII stat, or malformed columns. Must fail closed.
 #[cfg(any(target_os = "macos", target_os = "ios", test))]
@@ -1277,8 +1345,13 @@ pub(crate) fn parse_ps_group_liveness(
 				| b'X' => {
 					has_live = true;
 				}
-				// Any unknown state (including '?') for the target group must stay fail-closed
-				// and must never count as dead.
+				// '?': between running and zombie. Not dead yet; the
+				// caller may look again (see `is_settling`).
+				b'?' => {
+					return Err(io::Error::other(Settling { target_pgid }));
+				}
+				// Any other unknown state for the target group must stay
+				// fail-closed and must never count as dead.
 				_ => {
 					return Err(io::Error::other(format!(
 						"unknown primary process state {:?} for target process group {target_pgid} in line {line_idx}",
@@ -2197,6 +2270,74 @@ mod tests {
 				"unknown inspection error must fail closed and leak slot"
 			);
 			assert_eq!(in_flight(), 2);
+		}
+	}
+
+	/// A member Darwin shows as `?` (exited, not yet a zombie) settles: a
+	/// later look finds `Z` and the run is clean. One that never settles
+	/// still fails closed and keeps its slot.
+	#[cfg(unix)]
+	#[test]
+	fn darwin_eperm_settling_member_is_looked_at_again() {
+		let _s = serial();
+		if std::env::var_os("SNIP_TEST_ISOLATED").is_none() {
+			let exe = std::env::current_exe().expect("current test exe");
+			let status = Command::new(exe)
+				.env("SNIP_TEST_ISOLATED", "1")
+				.args([
+					"--exact",
+					"gitrun::tests::darwin_eperm_settling_member_is_looked_at_again",
+					"--nocapture",
+				])
+				.status()
+				.expect("spawn isolated test subprocess");
+			assert!(status.success(), "isolated subprocess test failed");
+			return;
+		}
+
+		assert_eq!(leaked_slots(), 0);
+		assert_eq!(in_flight(), 0);
+		{
+			let mut proc = ManagedChild::spawn(
+				test_exit_command(),
+				"test-settling",
+				false,
+				&RunOptions::default(),
+			)
+			.unwrap();
+			let _inj = InjectionGuard;
+			test_inject_group_kill_eperm(
+				InjectGroupKillEperm::SettlingThenZombie(3),
+			);
+			let res = proc.finish();
+			assert_eq!(INJECT_SETTLING_LOOKS.get(), 4);
+			test_inject_group_kill_eperm(InjectGroupKillEperm::None);
+			assert!(res.is_ok(), "a settled member must be clean: {res:?}");
+			assert!(proc.clean);
+			drop(proc);
+			assert_eq!(leaked_slots(), 0);
+			assert_eq!(in_flight(), 0);
+		}
+		{
+			let mut proc = ManagedChild::spawn(
+				test_long_running_command(),
+				"test-never-settles",
+				false,
+				&RunOptions::default(),
+			)
+			.unwrap();
+			let _inj = InjectionGuard;
+			test_inject_group_kill_eperm(
+				InjectGroupKillEperm::SettlingThenZombie(usize::MAX),
+			);
+			let err = proc.finish().unwrap_err();
+			assert_eq!(INJECT_SETTLING_LOOKS.get(), tree::SETTLE_CHECKS);
+			test_inject_group_kill_eperm(InjectGroupKillEperm::None);
+			assert!(matches!(err, GitError::Cleanup { .. }), "{err:?}");
+			assert!(err.to_string().contains("still settling"), "{err}");
+			assert!(!proc.clean);
+			drop(proc);
+			assert_eq!(leaked_slots(), 1);
 		}
 	}
 
