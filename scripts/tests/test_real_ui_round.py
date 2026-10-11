@@ -930,7 +930,7 @@ class TestFinishWithRemote(RoundDirTestCase):
         fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER + "# edited\n"})
         rc, err, recorded = self.finish(fake, remote_host="ubuntu", sha=TestRemoteCleanup.SHA)
         self.assertEqual(rc, 1)
-        self.assertIn("a kept wrapper still runs it", err)
+        self.assertIn(f"kept for {rur.REMOTE_WRAPPER}: still runs it", err)
         self.assertFalse(recorded["finish_results"]["remote_cleanup"]["remote_dir_removed"])
 
     def test_finish_with_another_script_copy_warns_and_still_tears_down(self):

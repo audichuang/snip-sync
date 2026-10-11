@@ -1564,7 +1564,10 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
         if not remote_cleanup.get("remote_dir_removed"):
             env_data["finish_results"] = {"remote_cleanup": remote_cleanup}
             env_file.write_text(json.dumps(env_data, indent=2), encoding="utf-8")
-            why = "worker cleanup failed" if not remote_cleanup["workers_stopped"] else "a kept wrapper still runs it"
+            if not remote_cleanup["workers_stopped"]:
+                why = "worker cleanup failed"
+            else:
+                why = f"kept for {', '.join(remote_cleanup['remote_dir_kept_for'])}: still runs it or could not be checked"
             print(f"ERROR: Remote cleanup incomplete ({why}); {remote_cleanup['remote_dir']} kept.", file=sys.stderr)
             return 1
         print("[OK] Remote host cleaned.")
