@@ -429,14 +429,16 @@ fn focus_ring<E: Styled + InteractiveElement>(el: E) -> E {
 	}
 }
 
-struct Tip(SharedString);
+/// A tooltip's text, read again on every frame it is shown.
+struct Tip(Rc<dyn Fn(&App) -> SharedString>);
 
 impl Render for Tip {
 	fn render(
 		&mut self,
 		_: &mut Window,
-		_: &mut Context<Self>,
+		cx: &mut Context<Self>,
 	) -> impl IntoElement {
+		let text = (self.0)(cx);
 		div()
 			.px_2()
 			.py_1()
@@ -448,7 +450,11 @@ impl Render for Tip {
 			.border_color(rgb(pal().divider))
 			.text_size(px(SMALL_TEXT))
 			.text_color(rgb(pal().text))
-			.child(self.0.clone())
+			.debug_selector({
+				let text = text.clone();
+				move || format!("tooltip:{text}")
+			})
+			.child(text)
 	}
 }
 
@@ -456,6 +462,16 @@ pub(crate) fn tip(
 	text: impl Into<SharedString>,
 ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
 	let text = text.into();
+	live_tip(move |_| text.clone())
+}
+
+/// A tooltip whose text follows the state it reads (#148): GPUI keeps a
+/// shown tooltip's view while the mouse stays, so text fixed when it opened
+/// goes stale when, say, a tab switch changes the language under it.
+pub(crate) fn live_tip(
+	text: impl Fn(&App) -> SharedString + 'static,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+	let text: Rc<dyn Fn(&App) -> SharedString> = Rc::new(text);
 	move |_, cx| cx.new(|_| Tip(text.clone())).into()
 }
 

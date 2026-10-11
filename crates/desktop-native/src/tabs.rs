@@ -20,7 +20,7 @@ use std::task::{Context as TaskContext, Poll};
 
 use gpui::{
 	div, prelude::*, px, rgb, AnyElement, App, Context, Entity, FocusHandle,
-	MouseButton, ScrollHandle, SharedString, Subscription, Window,
+	MouseButton, Pixels, ScrollHandle, SharedString, Subscription, Window,
 };
 use snip_remote::{RemoteHost, RemoteWorkspace};
 
@@ -28,7 +28,7 @@ use crate::i18n::{t, Locale};
 use crate::icons::{icon_tinted, Icon};
 use crate::open_tabs::{OpenTabs, SavedTab};
 use crate::theme::*;
-use crate::ui::{clip_text, probe, probe_frame_end, tip, Probes};
+use crate::ui::{clip_text, live_tip, probe, probe_frame_end, Probes};
 use crate::{
 	lifecycle, CloseWorkspace, NextWorkspaceTab, OpenWorkspace,
 	PrevWorkspaceTab, Quit, WorkbenchModel, WorkspaceTab1, WorkspaceTab2,
@@ -313,6 +313,8 @@ pub struct TabsRoot {
 	pub quit_sent: bool,
 	/// The window's physical size last reported as `[APP:VIEWPORT]`.
 	last_viewport: (i32, i32),
+	/// The window width the tab strip was last laid out for.
+	strip_width: Pixels,
 	/// Where the tabs are saved for the next launch; none in a test mode,
 	/// a test, or an e2e run without `SNIP_CONFIG_DIR`.
 	store: Option<PathBuf>,
@@ -374,6 +376,7 @@ impl TabsRoot {
 			scroll: ScrollHandle::new(),
 			quit_sent: false,
 			last_viewport: (0, 0),
+			strip_width: px(0.),
 			store: None,
 			saved: None,
 		};
@@ -905,11 +908,21 @@ impl TabsRoot {
 		labels.into_iter().zip(infos).collect()
 	}
 
-	fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+	/// The tooltip of the tab at `ix` as things are now.
+	fn tab_tip(&self, ix: usize, cx: &App) -> SharedString {
 		let loc = self.locale(cx);
+		self.tab_views(cx)
+			.get(ix)
+			.map(|(label, info)| tab_hover(label, info, loc))
+			.unwrap_or_default()
+			.into()
+	}
+
+	fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
 		let views = self.tab_views(cx);
 		let mut strip = div()
 			.id("ws-tabs")
+			.debug_selector(|| "ws-tabs".into())
 			.flex()
 			.flex_row()
 			.items_center()
@@ -919,7 +932,7 @@ impl TabsRoot {
 			.overflow_x_scroll()
 			.track_scroll(&self.scroll);
 		for (ix, (label, info)) in views.into_iter().enumerate() {
-			strip = strip.child(self.render_tab(ix, label, info, loc, cx));
+			strip = strip.child(self.render_tab(ix, label, info, cx));
 		}
 		div()
 			.flex()
@@ -944,9 +957,18 @@ impl TabsRoot {
 					.size(px(24.))
 					.rounded(px(4.))
 					.cursor_pointer()
-					.hover(|s| s.bg(rgb(pal().hover_bg)))
+					.hover(|s| s.bg(rgb(pal().tab_hover_bg)))
 					.child(icon_tinted(Icon::Plus, 16., pal().text_muted))
-					.tooltip(tip(t("tip_ws_tab_new", loc)))
+					.tooltip({
+						let root = cx.weak_entity();
+						live_tip(move |cx| {
+							let loc = root
+								.upgrade()
+								.map(|r| r.read(cx).locale(cx))
+								.unwrap_or_default();
+							t("tip_ws_tab_new", loc).into()
+						})
+					})
 					.debug_selector(|| "ws-tab-new".into())
 					.on_click(cx.listener(|this, _, window, cx| {
 						this.new_tab(window, cx)
@@ -961,7 +983,6 @@ impl TabsRoot {
 		ix: usize,
 		label: String,
 		info: TabInfo,
-		loc: Locale,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let active = self.active == Some(ix);
@@ -977,32 +998,6 @@ impl TabsRoot {
 			Some(Conn::Connected) => "connected",
 			Some(Conn::Failed) => "failed",
 			None => "local",
-		};
-		let hover = match info.conn {
-			Some(Conn::Connecting) | Some(Conn::Failed) => {
-				let what = match (&info.failed, info.conn) {
-					(Some(why), Some(Conn::Failed)) => {
-						crate::i18n::tf("ws_tab_failed_why", loc, &[why])
-					}
-					(_, Some(Conn::Failed)) => {
-						t("ws_tab_failed", loc).to_string()
-					}
-					_ => t("ws_tab_connecting", loc).to_string(),
-				};
-				let base = if info.full.is_empty() {
-					&label
-				} else {
-					&info.full
-				};
-				format!("{base} · {what}")
-			}
-			_ if info.full.is_empty() => label.clone(),
-			_ => info.full.clone(),
-		};
-		let hover = if info.pasting {
-			format!("{hover} · {}", t("ws_tab_pasting", loc))
-		} else {
-			hover
 		};
 		let tab_id = format!("ws-tab:{ix}");
 		let close_id = format!("ws-tab-close:{ix}");
@@ -1027,7 +1022,7 @@ impl TabsRoot {
 			.when(active, |d| d.bg(rgb(p.range_bg)).text_color(rgb(p.text)))
 			.when(!active, |d| {
 				d.text_color(rgb(p.text_muted))
-					.hover(|s| s.bg(rgb(p.hover_bg)))
+					.hover(|s| s.bg(rgb(p.tab_hover_bg)))
 			})
 			.child(
 				div()
@@ -1066,10 +1061,17 @@ impl TabsRoot {
 					.rounded(px(3.))
 					.hover(|s| s.bg(rgb(p.hover_bg)))
 					.child(icon_tinted(Icon::Close, 12., p.text_muted))
-					.tooltip(tip(crate::ui::mac_keys(t(
-						"tip_ws_tab_close",
-						loc,
-					))))
+					.tooltip({
+						let root = cx.weak_entity();
+						live_tip(move |cx| {
+							let loc = root
+								.upgrade()
+								.map(|r| r.read(cx).locale(cx))
+								.unwrap_or_default();
+							crate::ui::mac_keys(t("tip_ws_tab_close", loc))
+								.into()
+						})
+					})
 					.debug_selector(move || close_selector)
 					.on_mouse_down(MouseButton::Left, |_, _, cx| {
 						cx.stop_propagation()
@@ -1080,7 +1082,14 @@ impl TabsRoot {
 					}))
 					.children(probe(&self.probes, close_id)),
 			)
-			.tooltip(tip(hover))
+			.tooltip({
+				let root = cx.weak_entity();
+				live_tip(move |cx| {
+					root.upgrade()
+						.map(|r| r.read(cx).tab_tip(ix, cx))
+						.unwrap_or_default()
+				})
+			})
 			.debug_selector(move || selector)
 			.on_mouse_down(
 				MouseButton::Left,
@@ -1106,6 +1115,34 @@ impl TabsRoot {
 	}
 }
 
+/// A tab's tooltip: its full path, and what it is doing if not ready.
+fn tab_hover(label: &str, info: &TabInfo, loc: Locale) -> String {
+	let hover = match info.conn {
+		Some(Conn::Connecting) | Some(Conn::Failed) => {
+			let what = match (&info.failed, info.conn) {
+				(Some(why), Some(Conn::Failed)) => {
+					crate::i18n::tf("ws_tab_failed_why", loc, &[why])
+				}
+				(_, Some(Conn::Failed)) => t("ws_tab_failed", loc).to_string(),
+				_ => t("ws_tab_connecting", loc).to_string(),
+			};
+			let base = if info.full.is_empty() {
+				label
+			} else {
+				&info.full
+			};
+			format!("{base} · {what}")
+		}
+		_ if info.full.is_empty() => label.to_string(),
+		_ => info.full.clone(),
+	};
+	if info.pasting {
+		format!("{hover} · {}", t("ws_tab_pasting", loc))
+	} else {
+		hover
+	}
+}
+
 impl Render for TabsRoot {
 	fn render(
 		&mut self,
@@ -1123,6 +1160,19 @@ impl Render for TabsRoot {
 			(f32::from(vp.width) * sf).round() as i32,
 			(f32::from(vp.height) * sf).round() as i32,
 		);
+		// The strip scrolls the shown tab into view only when it is
+		// shown; a narrower window would otherwise leave it clipped until
+		// the next switch (WT91, #148). The scroll measures the strip as
+		// last laid out, so it waits for the frame at the new width.
+		if vp.width != self.strip_width {
+			self.strip_width = vp.width;
+			cx.defer_in(window, |this, _, cx| {
+				if let Some(ix) = this.active {
+					this.scroll.scroll_to_item(ix);
+					cx.notify();
+				}
+			});
+		}
 		if self.probes.is_some() && phys != self.last_viewport {
 			self.last_viewport = phys;
 			root_log!("[APP:VIEWPORT: {}x{}]", phys.0, phys.1);
