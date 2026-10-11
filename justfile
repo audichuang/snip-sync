@@ -28,17 +28,31 @@ clean:
 		scripts/linux_container.sh --prune-all
 	fi
 
-# On Linux this is preflight-linux. Elsewhere this OS's checks run on the host, then the
+# On Linux this is preflight-linux. Elsewhere this OS's checks run on the host while the
 # Linux jobs run in a container (scripts/linux_container.sh), native acceptance included.
+# They share nothing (the host clipboard vs Xvfb in the VM, target/ vs a volume), and the
+# VM leaves most host CPUs idle; the host's output is held back and printed if it fails.
 # Everything CI runs that a machine can run (see .github/workflows/ci.yml for the rest).
 preflight:
 	#!/usr/bin/env bash
-	set -euo pipefail
+	set -uo pipefail
 	if [ "$(uname -s)" = Linux ]; then
 		exec {{just_executable()}} native_python="{{native_python}}" preflight-linux
 	fi
-	{{just_executable()}} preflight-host
-	scripts/linux_container.sh just preflight-linux
+	log="$(mktemp)"
+	trap 'rm -f "$log"' EXIT
+	{{just_executable()}} preflight-host >"$log" 2>&1 &
+	host=$!
+	rc=0
+	scripts/linux_container.sh just preflight-linux || rc=$?
+	if wait "$host"; then
+		echo "preflight-host: passed"
+	else
+		rc=$?
+		cat "$log"
+		echo "preflight-host: failed (exit $rc)" >&2
+	fi
+	[ "$rc" -eq 0 ] || exit "$rc"
 	# A pass drops this checkout's target/ volume (12-25 GB): each task uses a fresh
 	# clone, so it would only serve a rerun. A failure keeps it for an incremental rerun.
 	scripts/linux_container.sh --prune-all

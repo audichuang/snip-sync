@@ -210,7 +210,9 @@ class AcceptanceTests(unittest.TestCase):
                 mock.patch.object(acceptance, "run_gate") as gate:
             self.assertEqual(acceptance.main(["--output", str(output)]), 0)
         build.assert_called_once()
-        self.assertEqual([call.args[0] for call in gate.call_args_list], list(acceptance.GATES))
+        resource = [name for name in acceptance.GATES if name.startswith("resource-")]
+        self.assertEqual([call.args[0] for call in gate.call_args_list],
+                         [name for name in acceptance.GATES if name not in resource] + resource)
         self.assertEqual(verify.call_count, 2 * len(acceptance.GATES) + 2)
         failed = self.root / "failed"
         with mock.patch.object(acceptance, "prerequisites"), \
@@ -235,6 +237,32 @@ class AcceptanceTests(unittest.TestCase):
                                               "--build-receipt", str(self.receipt)]), 0)
         report = json.loads((output / "acceptance.json").read_text())
         self.assertEqual([c["command"][0] for c in report["commands"]], list(acceptance.GATES))
+
+    def test_resource_gates_run_alone_after_the_others(self):
+        import threading
+        import time
+        lock, running, overlaps = threading.Lock(), set(), []
+
+        def gate(name, *_):
+            with lock:
+                overlaps.append((name, frozenset(running)))
+                running.add(name)
+            time.sleep(0.05)
+            with lock:
+                running.discard(name)
+
+        output = self.root / "resource-alone"
+        with mock.patch.object(acceptance, "prerequisites"), \
+                mock.patch.object(acceptance, "verify_build", return_value=self.data), \
+                mock.patch.object(acceptance, "run_gate", side_effect=gate):
+            self.assertEqual(acceptance.main(["--output", str(output), "--jobs", "5",
+                                              "--build-receipt", str(self.receipt)]), 0)
+        started = dict(overlaps)
+        self.assertEqual(started["resource-short"], frozenset())
+        self.assertEqual(overlaps[-1][0], "resource-short")
+        self.assertTrue(any(others for name, others in overlaps if name != "resource-short"))
+        report = json.loads((output / "acceptance.json").read_text())
+        self.assertEqual(report["gates"], list(acceptance.GATES))
 
     def test_real_child_exit_status_and_stderr_are_preserved_in_log(self):
         commands = []
