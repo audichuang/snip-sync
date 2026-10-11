@@ -406,15 +406,24 @@ def main(argv: list[str] | None = None) -> int:
                 verify_build(receipt)
             return records
 
-        # Every gate has a private display, HOME and D-Bus, so they can overlap.
+        # Every gate has a private display, HOME and D-Bus, so they can overlap. A resource
+        # gate measures memory trends, which other gates' load skews into a false leak
+        # (memory-trend with two gates in the preflight VM), so it runs alone, after them.
+        records: dict[str, list[dict]] = {}
+        shared = [gate for gate in gates if not gate.startswith("resource-")]
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-            futures = [pool.submit(one, gate) for gate in gates]
+            futures = {gate: pool.submit(one, gate) for gate in shared}
             try:
-                for future in futures:
-                    summary["commands"] += future.result()
+                for gate, future in futures.items():
+                    records[gate] = future.result()
             finally:
-                for future in futures:
+                for future in futures.values():
                     future.cancel()
+        for gate in gates:
+            if gate not in records:
+                records[gate] = one(gate)
+        for gate in gates:
+            summary["commands"] += records[gate]
         verify_build(receipt)
         summary["status"] = "PASSED"
         return 0

@@ -145,6 +145,9 @@ if [ ! -f "$kernel" ]; then
 		cp arch/arm64/boot/Image "/out/$1.tmp" && mv "/out/$1.tmp" "/out/$1"' _ "$(basename "$kernel")" "$(basename "$base")" "${kernel_options[@]}"
 fi
 
+# The volume mounts over target/ inside the read-only checkout, which cannot create the
+# mount point: a fresh clone has no target/ until a host cargo command makes one.
+mkdir -p "$ROOT/target"
 container volume inspect "$target_volume" >/dev/null 2>&1 ||
 	container volume create --label "snip-root=$ROOT" "$target_volume" >/dev/null
 for name in snip-preflight-cargo-registry snip-preflight-cargo-git; do
@@ -153,9 +156,11 @@ done
 
 # native-acceptance runs five gates at once by default, each with its own Xvfb and
 # CPU-rendered apps. CI gives every gate its own runner and runs one collaboration step
-# at a time. In one VM, whose CPU quota throttles all of them together, five gates and
-# even two missed fixed waits (Xvfb startup, app log lines); one of each, as in CI, holds.
-export SNIP_ACCEPTANCE_ARGS="${SNIP_ACCEPTANCE_ARGS---jobs 1 --collaboration-jobs 1}"
+# at a time. In one VM, whose CPU quota throttles all of them together, five gates missed
+# fixed waits (Xvfb startup, app log lines). Two hold: collaboration (10 min, one step at
+# a time as in CI) beside the other gates, with the resource gate always run alone at the
+# end, takes acceptance from ~20 to ~12 min. The VM sat at ~3 of 8 CPUs one gate at a time.
+export SNIP_ACCEPTANCE_ARGS="${SNIP_ACCEPTANCE_ARGS---jobs 2 --collaboration-jobs 1}"
 
 # Only settings that mean the same inside; host paths (SNIP_NATIVE_PYTHON, SNIP_NATIVE_BIN) do not.
 envs=()
