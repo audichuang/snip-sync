@@ -4470,6 +4470,86 @@ fn file_paste_from_case_alias_respects_nested_repo_lock() {
 	assert_file_paste_respects_nested_repo_lock(&child, root, false);
 }
 
+fn assert_parent_paste_respects_nested_gitfile(parent: &Path, child: &Path) {
+	use snip_core::gitsrc::GitError;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	assert!(child.join(".git").is_file());
+	let mapping =
+		ImportMapping::with_primary(CanonicalRootId::new(parent).unwrap());
+	let plan = plan_import(
+		"// file: outside.txt\nouter\n// file: child/deep/new.txt\ninner\n",
+		"// file: $FILE_PATH",
+		&[parent.to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+	let id = RepoIdentity::resolve(
+		&Git::open(child).unwrap(),
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let held = lock_heavy(&id).unwrap();
+	let result = plan.apply(&RestoreSelection::default());
+	assert!(
+		matches!(
+			result,
+			Err(TransferError::Git(GitError::WorktreeBusy { .. }))
+		),
+		"{result:?}"
+	);
+	assert!(!parent.join("outside.txt").exists());
+	assert!(!child.join("deep").exists());
+	drop(held);
+	let result = plan.apply(&RestoreSelection::default()).unwrap();
+	assert!(result.errors.is_empty(), "{:?}", result.errors);
+	assert_eq!(result.created_count, 2);
+	assert_eq!(
+		fs::read_to_string(child.join("deep/new.txt")).unwrap(),
+		"inner"
+	);
+}
+
+#[test]
+fn file_paste_from_parent_respects_nested_worktree_lock() {
+	let source = TestRepo::new("source");
+	source.write("base.txt", "base\n");
+	source.commit("base");
+	let parent = source.path().parent().unwrap().join("workspace");
+	fs::create_dir(&parent).unwrap();
+	let child = parent.join("child");
+	source.git(&[
+		"worktree",
+		"add",
+		"--detach",
+		child.to_str().unwrap(),
+		"HEAD",
+	]);
+	assert_parent_paste_respects_nested_gitfile(&parent, &child);
+}
+
+#[test]
+fn file_paste_from_parent_respects_nested_submodule_lock() {
+	let source = TestRepo::new("source");
+	source.write("base.txt", "base\n");
+	source.commit("base");
+	let parent = TestRepo::new("workspace");
+	parent.git(&[
+		"-c",
+		"protocol.file.allow=always",
+		"submodule",
+		"add",
+		"-q",
+		source.path().to_str().unwrap(),
+		"child",
+	]);
+	parent.commit("add submodule");
+	assert_parent_paste_respects_nested_gitfile(
+		parent.path(),
+		&parent.path().join("child"),
+	);
+}
+
 fn assert_commit_replay_respects_nested_repo_lock(
 	only_change: Option<snip_core::commits::FileChange>,
 ) {
