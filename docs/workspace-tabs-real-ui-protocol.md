@@ -44,7 +44,7 @@
 下面的命令區塊用 bash 執行（這台 Mac 的預設 shell 是 fish；先執行 `bash`）。cargo 在 `$HOME/.cargo/bin`。
 
 ```bash
-export REPO=/path/to/受測的乾淨 checkout        # 腳本在 $REPO/scripts
+export REPO=/path/to/受測的乾淨 checkout        # 腳本在 $REPO/scripts；HEAD 必須是受測 SHA，prepare 會比對腳本本身
 export SHA=$(git -C "$REPO" rev-parse --short HEAD)
 export RUN="$HOME/snip-sync-ui-runs/$(date +%Y-%m-%d)-$SHA-tabs"
 python3 "$REPO/scripts/real_ui_round.py" prepare --sha "$SHA" --run "$RUN"      # 遠端格再加 --remote ubuntu
@@ -123,7 +123,7 @@ mark()    { export L0=$(wc -l < "$LOG"); }                         # 一個動�
 expect()  { newlog | grep -F -e "$1" > /dev/null && echo "ok      : $1" || echo "MISSING : $1"; }
 forbid()  { newlog | grep -F -e "$1" > /dev/null && echo "UNEXPECTED: $1" || echo "ok-absent: $1"; }
 shot()    { sleep 0.5; screencapture -x "$CASE/$1.png" && echo "$CASE/$1.png"; }   # 整個主螢幕；視窗要在主螢幕
-wtitle()  { osascript -e "tell application \"System Events\" to get name of first window of (first application process whose unix id is $PID)"; }
+wtitle()  { python3 "$REPO/scripts/real_ui_round.py" title --run "$RUN"; }   # 主視窗的完整標題；System Events 的 first window 可能是叫 Window 的輔助視窗
 clip()    { pbpaste | shasum -a 256 | cut -d' ' -f1; }
 ```
 
@@ -256,7 +256,7 @@ PY
 - **前置狀態**：S1（`[ws-src]`，`id=1`，目前 `ix=0`），1080×720（`resize 1080 720`），`SNIP_THEME=dark`。
 - **操作**：(1) `case_start WT00`，`shot before`。(2) `wtitle`。(3) `pt ws-tab:0`，記下螢幕點；`hv` 到該點停 2 秒，`shot hover-tab`。(4) 點一下 `ws-tab:0`（目前分頁）。(5) `pt ws-tab-new`，`hv` 到該點停 2 秒，`shot hover-plus`。把 `scale` 寫進 `environment.json` 的 `notes`。
 - **預期畫面**：分頁列在原生標題列正下方、高 34 邏輯 px，一個分頁 `ws-src`：資料夾圖示、標籤 `ws-src`、右邊 ×；目前分頁底色明顯（dark `#233558`）、文字比非目前分頁亮；最右邊一個「+」。分頁列下面是工作台自己的 header（有 `btn-workspace-menu`）。`hover-tab` 的 tooltip 是完整路徑 `$B/ws-src`；`hover-plus` 的 tooltip 是「開新的工作區分頁」。標題列文字 `ws-src — snip-sync`。
-- **比對**：`grep -F` 整份日誌有 `[APP:WS_TAB_OPENED: id=1 count=1`、`[APP:WS_TAB_ACTIVE: id=1 ix=0`、`[APP:WORKSPACE: state=open path=$B/ws-src generation=`。最新 `CTRL_BOUNDS` 有 `ws-tab:0`、`ws-tab-close:0`、`ws-tab-new`、`ws-tab-state:0:local`。`ws-tab:0` 的 `y ≥ 0` 且 `y + h ≤ 34 × scale`；`btn-workspace-menu` 的 `y ≥ 34 × scale`。`[APP:VIEWPORT:]` 是 `1080×scale` 乘 `720×scale`。`wtitle` 等於 `ws-src — snip-sync`（比對含 em dash 的完整字串）。步驟 (4) 之後 `newlog` 沒有任何新行（`NOT:` 任何 `WS_TAB_`）。
+- **比對**：`grep -F` 整份日誌有 `[APP:WS_TAB_OPENED: id=1 count=1`、`[APP:WS_TAB_ACTIVE: id=1 ix=0`、`[APP:READY_REPOS: 15]`。啟動時開的分頁不印 `[APP:WORKSPACE: state=open`（那一行只在開啟動作完成時印，同 WT100），這一格不要求它。最新 `CTRL_BOUNDS` 有 `ws-tab:0`、`ws-tab-close:0`、`ws-tab-new`、`ws-tab-state:0:local`。`ws-tab:0` 的 `y ≥ 0` 且 `y + h ≤ 34 × scale`；`btn-workspace-menu` 的 `y ≥ 34 × scale`。`[APP:VIEWPORT:]` 是 `1080×scale` 乘 `720×scale`。`wtitle` 等於 `ws-src — snip-sync`（比對含 em dash 的完整字串）。步驟 (4) 之後 `newlog` 沒有任何新行（`NOT:` 任何 `WS_TAB_`）。
 - **截圖**：`$RUN/WT00/before.png`、`hover-tab.png`、`hover-plus.png`。
 
 ### 4.1 開啟與切換（WT01–WT04）
@@ -329,10 +329,10 @@ PY
 #### WT08 兩個空分頁；切走再回來
 
 - **前置狀態**：S3，目前 `beta`。
-- **操作**：(1) 點「+」兩次（空分頁 `id=4 ix=3`、`id=5 ix=4`）。(2) `Cmd+1` 切到 `ws-src`，再 `Cmd+4` 切回第一個空分頁。(3) 在第一個空分頁 `OPEN($T/gamma)` 填入。
-- **預期畫面**：(1) 兩個「新分頁」，各有 ×。(2) 切走再切回，空分頁的工作區選單仍然開著（分頁的所有狀態都保留；`leave_tab` 只收掉右鍵選單與拖曳），`btn-open-workspace` 有新的 `CTRL_BOUNDS`。(3) `ix=3` 變成 `gamma`，`ix=4` 仍是「新分頁」。
-- **比對**：(1) `WS_TAB_OPENED: id=4 count=4`、`id=5 count=5`，各有 `WS_TAB_ACTIVE`。(2) `WS_TAB_ACTIVE: id=1 ix=0`、`id=4 ix=3`。(3) 只有 `WORKSPACE: state=open path=$T/gamma`，`NOT:` `WS_TAB_OPENED`。標題：空分頁是 `snip-sync`，填入後 `gamma — snip-sync`。
-- **截圖**：`before.png`、`two-empty.png`、`switch-back-empty.png`、`filled.png`。
+- **操作**：(1) 點「+」兩次（空分頁 `id=4 ix=3`、`id=5 ix=4`）。`shot two-empty`。(2) `Cmd+4` 切到第一個空分頁，點 `btn-workspace-menu` 重新打開它的選單：滑鼠點第二個「+」時，第一個空分頁的選單已經因為點到選單外面而收掉，這是預期的。`shot menu-reopened`。(3) 只用鍵盤：`Cmd+1` 切到 `ws-src`，再 `Cmd+4` 切回第一個空分頁。`shot switch-back-empty`。(4) 在第一個空分頁 `OPEN($T/gamma)` 填入（選單已開，從 `btn-open-workspace` 開始）。`shot filled`。
+- **預期畫面**：(1) 兩個「新分頁」，各有 ×。(2) 第一個空分頁的選單打開。(3) 切走再切回，選單仍然開著（分頁的所有狀態都保留；`leave_tab` 只收掉右鍵選單與拖曳）。(4) `ix=3` 變成 `gamma`，`ix=4` 仍是「新分頁」。
+- **比對**：(1) `WS_TAB_OPENED: id=4 count=4`、`id=5 count=5`，各有 `WS_TAB_ACTIVE`。(2) `WS_TAB_ACTIVE: id=4 ix=3` 之後，點了 `btn-workspace-menu` 才有新的 `btn-open-workspace` 的 `CTRL_BOUNDS`。(3) `WS_TAB_ACTIVE: id=1 ix=0` 之後有 `CTRL_GONE: id=btn-open-workspace`；`WS_TAB_ACTIVE: id=4 ix=3` 之後又有 `btn-open-workspace` 的 `CTRL_BOUNDS`，中間沒有點擊。(4) 只有 `WORKSPACE: state=open path=$T/gamma`，`NOT:` `WS_TAB_OPENED`。標題：空分頁是 `snip-sync`，填入後 `gamma — snip-sync`。
+- **截圖**：`before.png`、`two-empty.png`、`menu-reopened.png`、`switch-back-empty.png`、`filled.png`。
 
 ### 4.3 快捷鍵（WT10–WT16）
 
@@ -475,22 +475,28 @@ PY
 #### WT41 連線中的圖示
 
 - **前置狀態**：S1，目前 `ws-src`。`ssh ubuntu "rm -f '$W/connect-delay'"` 確認沒有延遲檔。
-- **操作**：(1) 點「+」（空分頁 `id=2 ix=1`，選單已開）。(2) 點 `remote-host:<ix>`（`ubuntu`）。**列出資料夾的這段時間**，空分頁就會顯示連線中（`tab_info` 對「沒有工作區、遠端忙碌」的分頁回報 `Connecting`），所以立刻連續 `shot browsing-1`、`browsing-2`（間隔約 1 秒）。(3) 逐層點進 `snip-ui-run/<SHA>/gitws`，點 `btn-remote-open-here`，立刻 `shot opening-1`。(4) 等載入完成，`shot connected`。(5) 退路（(2) 與 (3) 都沒抓到暫態，才做）：把 Ubuntu 的 wrapper 換成會延遲的版本（遠端規程 2.3 的 wrapper 多一行，`$W/connect-delay` 存在時先睡 6 秒），重做 (1) 到 (4)。這一格結束前一定 `ssh ubuntu "rm -f '$W/connect-delay'"`，並把 wrapper 還原：
+- **操作**：(1) 點「+」（空分頁 `id=2 ix=1`，選單已開）。(2) 點 `remote-host:<ix>`（`ubuntu`）。**列出資料夾的這段時間**，空分頁就會顯示連線中（`tab_info` 對「沒有工作區、遠端忙碌」的分頁回報 `Connecting`），所以立刻連續 `shot browsing-1`、`browsing-2`（間隔約 1 秒）。(3) 逐層點進 `snip-ui-run/<SHA>/gitws`，點 `btn-remote-open-here`，立刻 `shot opening-1`。(4) 等載入完成，`shot connected`。(5) 退路（(2) 與 (3) 都沒抓到暫態，才做）：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker），把 Ubuntu 的 wrapper 換成會延遲的版本（遠端規程 2.3 的 wrapper 多一行，`$W/connect-delay` 存在時先睡 6 秒），建立延遲旗標，照 1.2 重置並 `launch`，重做 (1) 到 (4)：
   ```bash
   printf '#!/bin/sh\necho $$ > "%s/pids/$$"\n[ -f "%s/connect-delay" ] && sleep 6\nexport SNIP_E2E_PASTE_HOLD="%s/paste-hold"\nexec "%s/src/target/release/snip" "$@"\n' "$W" "$W" "$W" "$W" | ssh ubuntu 'cat > ~/.local/bin/snip && chmod +x ~/.local/bin/snip'
-  ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"     # 收尾比對用：覆寫成新的 wrapper 的雜湊（用完不還原也行，收尾只刪雜湊相同的那份）
+  ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"     # 收尾只刪雜湊與這個檔案相同的 wrapper
+  ssh ubuntu "touch '$W/connect-delay'"                                    # 沒有這個旗標，延遲版 wrapper 不會等
   ```
+  旗標存在時每一次啟動 worker 都會等 6 秒，所以 (4) 之後立刻 `ssh ubuntu "rm -f '$W/connect-delay'"`。延遲版 wrapper 留著、不換回：沒有旗標時它和原本的一樣，而 `snip-installed.sha` 已經是它的雜湊。
 - **預期畫面**：連線中：空分頁的標籤是「新分頁」，圖示是「重新整理」圖示（灰），tooltip 是「新分頁 · 連線中」（沒有路徑時用的標籤）。連線完成後，空分頁被填入，變成 `ubuntu ▸ gitws` 與「遠端分支」圖示。
 - **比對**：`ws-tab-state:1:connecting` 在日誌裡有過 `CTRL_BOUNDS`，之後才出現 `ws-tab-state:1:connected` 的 `CTRL_BOUNDS`（用行號確認先後），並且 `connecting` 那個 ID 有 `CTRL_GONE`（`TODO(verify)`：連線中的暫態可能是 `local`→`connecting`→`connected`，也可能中間還有 `local`，如實記錄整條序列）。`L:` `[APP:REMOTE_OPENED: ubuntu ▸ gitws generation=`；空分頁被填入，所以 `NOT:` 第二次 `WS_TAB_OPENED`。最後 `wtitle` = `ubuntu ▸ gitws — snip-sync`。`ssh ubuntu "test ! -e '$W/connect-delay'"` 成立。整條路都沒有抓到 `connecting`：這一格寫 `not-run`，證據寫「暫態沒抓到」。
 - **截圖**：`before.png`、`browsing-1.png`、`browsing-2.png`、`opening-1.png`、`connected.png`。
 
 #### WT42 連線失敗的圖示
 
-- **前置狀態**：S1，目前 `ws-src`。`TODO(verify)`：「失敗」狀態要 worker 連上、但倉庫掃描失敗（`remote.scan_error`）。寫這份規程時沒有確定的觸發方式。建議的觸發：`ssh ubuntu "mkdir -p '$W/scanfail/r1' && git init -q '$W/scanfail/r1' && chmod 000 '$W/scanfail/r1/.git'"`，開 `$W/scanfail`。
-- **操作**：在 `scanfail` 上做 WT40 的流程。等 60 秒。`shot after`、`hv` 到 `ws-tab:1` 停 2 秒 `shot hover-failed`。結束後 `ssh ubuntu "chmod -R u+rwx '$W/scanfail'; rm -rf '$W/scanfail'"`。
-- **預期畫面**：遠端分頁圖示是警告圖示（錯誤色），tooltip 以完整路徑開頭、尾巴 ` · 連線失敗`。
-- **比對**：最新的狀態探針是 `ws-tab-state:1:failed`（它的 `CTRL_BOUNDS`），`L:` `[APP:REMOTE_SCAN_FAILED: `（日誌行以 binary 為準）。60 秒內沒有出現 `failed` 狀態時：這一格寫 `not-run`，證據欄寫「無可靠觸發」，並附上實際看到的狀態探針與日誌；不要判 `fail`。
-- **截圖**：`before.png`、`after.png`、`hover-failed.png`。
+- **前置狀態**：S1，目前 `ws-src`。遠端分頁只有在**啟動時恢復**連不上時才進入 failed（`tab_info` 看 `remote.restoring.failed`）；從選單開啟失敗只印 `REMOTE_OPEN_FAILED`，空分頁回到 `local`，不會是 failed。另一條路是整個倉庫掃描失敗（`REMOTE_SCAN_FAILED`），這一格不用：權限不足的目錄（例如 `chmod 000`）只會變成個別 repo 的讀取錯誤，掃描本身成功，分頁維持 `connected`。所以做法是：存一個遠端分頁，App 結束後刪掉那個資料夾，再啟動。
+  ```bash
+  ssh ubuntu "mkdir -p '$W/tabfail'"
+  export WREAL=$(ssh ubuntu "realpath '$W/tabfail'")    # worker 回報與存檔用的真實路徑
+  ```
+- **操作**：(1) `case_start WT42`，`shot before`。(2) 在 `$W/tabfail` 上做 WT40 的流程（`id=2 ix=1`），等到 `ws-tab-state:1:connected`。等 2 秒，`cp "$RUN/config/open-tabs.json" "$CASE/open-tabs-before.json"`。(3) `Cmd+Q`，等 exit code 0，日誌改名，**不刪** `open-tabs.json`。(4) App 結束之後才 `ssh ubuntu "rm -rf '$W/tabfail'"`（App 開著時，已連線的 worker 還握著這個路徑）。(5) `launch --gate b`，`export PID=…`，`mark`，`resize 1080 720`。(6) 等日誌出現 `[APP:REMOTE_OPEN_FAILED: `（最多 15 秒）。在下一行 `[APP:REMOTE_RETRY: attempt=` 之前（重試間隔 5、10、20、40 秒，之後每 60 秒）`shot after`，`hv` 到 `ws-tab:1` 停 2 秒，`shot hover-failed`。(7) `Cmd+2` 切到失敗的分頁，`shot status`，轉錄狀態列。(8) 等到至少一行 `REMOTE_RETRY` 之後又有 `REMOTE_OPEN_FAILED`，`shot after-retry`。(9) 照 1.2 重置（Cmd+Q、日誌改名、`rm -f "$RUN/config/open-tabs.json"`、`launch`），後面的格子才不會帶著這個分頁。
+- **預期畫面**：重新啟動後分頁列是 `ws-src`、`ubuntu ▸ tabfail`，順序不變，目前是 `ws-src`。第二個分頁的圖示是警告圖示（錯誤色），tooltip 是 `ubuntu:$WREAL · 連線失敗：<原因>`（`<原因>` 是 worker 回的錯誤，照抄轉錄）。重試進行中的那一下圖示是連線中（灰色的重新整理圖示），重試失敗後回到警告圖示。切過去後狀態列是「無法開啟遠端工作區：<原因>」。分頁不會消失，`ws-src` 不受影響。
+- **比對**：(2) `$CASE/open-tabs-before.json` 的第二個分頁是 `{"kind":"remote","host":"ubuntu","path":"$WREAL"}`。(5) 之後 `L:` `[APP:REMOTE_REOPEN: host=ubuntu path=$WREAL`、`[APP:REMOTE_OPEN_FAILED: `（背景分頁印的行，結尾帶 ` ws_tab=2`），之後有 `ws-tab-state:1:failed` 的 `CTRL_BOUNDS`。重試時探針會短暫換成 `ws-tab-state:1:connecting`，所以判的是「`REMOTE_OPEN_FAILED` 之後出現過 failed 的 `CTRL_BOUNDS`」，不是「最新的一個是 failed」。(8) 一行 `REMOTE_RETRY: attempt=` 之後，又有 `REMOTE_OPEN_FAILED` 與新的 `ws-tab-state:1:failed` 的 `CTRL_BOUNDS`。`NOT:` `[APP:REMOTE_OPENED:`（這次啟動之後）。15 秒內沒有 `REMOTE_OPEN_FAILED`，或有它卻沒有 `ws-tab-state:1:failed`：判 `fail`，附上實際的狀態探針與日誌。`TODO(verify)`：`<原因>` 的實際文字。
+- **截圖**：`before.png`、`after.png`、`hover-failed.png`、`status.png`、`after-retry.png`。
 
 #### WT43 本機與遠端混合
 
@@ -615,14 +621,14 @@ clip > "$RUN/p-busy.sha"
 #### WT63 Cmd+Q 與視窗關閉鈕：目前分頁寫入中
 
 - **前置狀態**：「寫入中」，目前是遠端分頁（`ix=2`）。
-- **操作**：(1) `mark`，`Cmd+Q`，等 2 秒，`shot refused-quit`。(2) `mark`，按視窗左上角的關閉鈕（紅色，`TODO(verify)`：以工具點螢幕座標，位置約在視窗框左上角往右 14、往下 14 邏輯點；或 `osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $PID) to click button 1 of first window"`），等 2 秒，`shot refused-window-close`。(3) 放開 hold，等 `PASTE_DONE`；`mark`；再 `Cmd+W`（現在可以關）。`shot after-close`。
+- **操作**：(1) `mark`，`Cmd+Q`，等 2 秒，`shot refused-quit`。(2) `mark`，按視窗左上角的關閉鈕（紅色，`TODO(verify)`：以工具點螢幕座標，位置約在視窗框左上角往右 14、往下 14 邏輯點；或 `osascript -e "tell application \"System Events\" to tell (first application process whose unix id is $PID) to click button 1 of window \"$(wtitle)\""`（不要用 `first window`，它可能是輔助視窗）），等 2 秒，`shot refused-window-close`。(3) 放開 hold，等 `PASTE_DONE`；`mark`；再 `Cmd+W`（現在可以關）。`shot after-close`。
 - **預期畫面**：(1)(2) App 沒有結束，視窗還在，狀態列同 WT60。(3) 貼上完成後 `Cmd+W` 關掉遠端分頁，目前變成左鄰 `alpha`。
 - **比對**：(1)(2) 各 `L:` `[APP:QUIT: deferred`、`[APP:PASTE_BUSY: refused=quit]`（各恰好一行，同 WT62）；`NOT:` `WS_TAB_ACTIVE`（它已經是目前分頁）、`phase=drained intent=quit`、`WS_TAB_CLOSED`；`kill -0` 結束碼 0。(3) `L:` `[APP:WORKSPACE: state=closed generation=`、`[APP:WS_TAB_CLOSED: id=3 count=2`、`[APP:WS_TAB_ACTIVE: id=2 ix=1`。
 - **截圖**：`before.png`、`refused-quit.png`、`refused-window-close.png`、`after-close.png`。
 
 #### WT65 本機貼上寫入中（盡力而為，不納入閘門）
 
-- **前置狀態**：S1 之後 `OPEN($T/alpha)`，目前 `alpha`。`TODO(verify)`：本機沒有貼上暫停點，寫入視窗只有毫秒。為了拉長，建 `$RUN/big-src` 並放 3000 個小檔（`mkdir -p "$RUN/big-src"; for i in $(seq 1 3000); do printf 'x' > "$RUN/big-src/f$i.txt"; done`），複製成 payload（`(cd "$RUN/big-src" && "$SNIP" copy . --stdout) | pbcopy`，總量遠低於 32 MiB），貼進 `$T/alpha`。
+- **前置狀態**：S1 之後 `OPEN($T/alpha)`，目前 `alpha`。`TODO(verify)`：本機沒有貼上暫停點，寫入視窗只有毫秒。為了拉長，建 `$RUN/big-src` 並放 3000 個小檔（`mkdir -p "$RUN/big-src"; for i in $(seq 1 3000); do printf 'x' > "$RUN/big-src/f$i.txt"; done`），複製成 payload（`(cd "$RUN/big-src" && "$SNIP" --settings '{"setMaxFileCount":false}' copy . --stdout) | pbcopy`，總量遠低於 32 MiB；不加 `--settings` 時預設的檔案數上限只會複製 30 個），貼進 `$T/alpha`。預覽要列出 3000 個檔案，不是就重做複製。結束後刪掉貼進 `$T/alpha` 的檔案，`git -C "$T/alpha" status --porcelain` 回到空。
 - **操作**：預覽之後點 `btn-apply`，立刻按 `Cmd+W`，立刻再按 `Cmd+Q`。
 - **預期畫面**：`TODO(verify)`：寫入太快時兩個按鍵都在貼上完成之後才到，分頁會被關掉或程式退出。
 - **比對**：只有觀察到 `[APP:PASTE_APPLYING]` 之後、`[APP:PASTE_DONE:` 之前出現 `[APP:PASTE_BUSY: refused=close-workspace]` 或 `refused=quit` 時，這一格才有意義，判 `pass`。沒有抓到時間窗：寫 `not-run`，證據欄寫「本機寫入太快，沒有暫停點」。**不要**判 `fail`。
@@ -670,26 +676,38 @@ clip > "$RUN/p-busy.sha"
 
 取樣用 Pillow：`prepare` 需要 `SNIP_NATIVE_PYTHON` 有 Pillow 才能跑 native 驗收，這裡沿用同一個 Python（`$SNIP_NATIVE_PYTHON` 或 `python3`）。
 
+只從 `shot` 的截圖取樣：`screencapture -x` 拍整個主螢幕、存成無損 PNG，像素座標是螢幕點乘 `scale`，和 `point` 的螢幕點同一套座標，所以視窗要在主螢幕上。computer use 回傳的截圖不能拿來取色：它只拍視窗、原點不同，而且是 JPEG，壓縮誤差有 3–4，比 ±2 的容許值大。`shot` 的 PNG 帶著螢幕的 ICC 色彩描述檔，像素是螢幕色彩空間的值，不是調色盤的 sRGB；`pix` 先依那份 ICC 換成 sRGB 再印。
+
 ```bash
-pix() {   # pix <png> <螢幕點 x> <螢幕點 y> <scale>：印該點的 RGB 十六進位（螢幕點，截圖是整個主螢幕）
+pix() {   # pix <shot 的 png> <螢幕點 x> <螢幕點 y> <scale>：印該點換成 sRGB 的十六進位，與原始值
   "${SNIP_NATIVE_PYTHON:-python3}" -I - "$1" "$2" "$3" "$4" <<'PY'
-from PIL import Image
-import sys
-im = Image.open(sys.argv[1]).convert("RGB")
+import io, sys
+from PIL import Image, ImageCms
+im = Image.open(sys.argv[1])
+icc = im.info.get("icc_profile")
 s = float(sys.argv[4])
-print("%02x%02x%02x" % im.getpixel((int(float(sys.argv[2]) * s), int(float(sys.argv[3]) * s))))
+x, y = int(float(sys.argv[2]) * s), int(float(sys.argv[3]) * s)
+if not (0 <= x < im.width and 0 <= y < im.height):
+    sys.exit(f"({x}, {y}) is outside the {im.width}x{im.height} screenshot")
+dot = im.convert("RGB").crop((x, y, x + 1, y + 1))
+raw = dot.getpixel((0, 0))
+srgb = raw
+if icc:
+    src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+    srgb = ImageCms.profileToProfile(dot, src, ImageCms.createProfile("sRGB")).getpixel((0, 0))
+print("%02x%02x%02x raw=%02x%02x%02x icc=%s" % (*srgb, *raw, "yes" if icc else "no"))
 PY
 }
 ```
 
-取樣點：分頁底色取分頁左緣往右 3 邏輯 px、垂直置中；分頁列底色取視窗左緣往右 2 邏輯 px、同一個 y；hover 底色在 `hv` 之後取同一個分頁的同一個點。`TODO(verify)`：視窗必須在主螢幕上且 `screencapture` 的原點與螢幕點一致，否則先用 `hover-tab` 的游標位置校準。
+`icc=no` 時 PNG 沒有描述檔，印的就是原始值，在 `action.json` 註明。取樣點：分頁底色取分頁左緣往右 3 邏輯 px、垂直置中；分頁列底色取視窗左緣往右 2 邏輯 px、同一個 y；hover 底色在 `hv` 之後取同一個分頁的同一個點。
 
 #### WT80 dark：分頁列對比、目前與非目前、hover
 
 - **前置狀態**：S3，目前 `alpha`（`ix=1`），`SNIP_THEME=dark`（預設），1080×720。
 - **操作**：(1) `shot dark-base`。(2) 對 `ws-tab:1`（目前）、`ws-tab:0`（非目前）各取一點的底色，以及分頁列底色。(3) `hv` 到 `ws-tab:0` 停 2 秒，`shot dark-hover-tab`，取它的底色；`hv` 到 `ws-tab-close:0` 停 2 秒，`shot dark-hover-close`；`hv` 到 `ws-tab-new` 停 2 秒，`shot dark-hover-plus`。
 - **預期畫面**：分頁列底色與工作台的 header 同色，下緣有一條分隔線。目前分頁有明顯的藍色底（`#233558`），文字比非目前分頁亮；非目前分頁文字偏灰（`#9fa2a8`）。hover 非目前分頁時底色變成 `#2e2f30`，× 與「+」hover 時有底色。標籤、圖示、× 都清楚可讀，沒有被截成看不見。
-- **比對**：取樣值與上表相符（每個通道誤差 ≤ 2）：目前分頁 `#233558`、分頁列 `#26282c`、hover `#2e2f30`；寫進 `action.json`。目前與分頁列的底色不同，非目前分頁在非 hover 時與分頁列底色相同（沒有 hover 底）。另外用肉眼判斷「看得出哪個是目前分頁」，看不出來判 `ui-defect`，證據寫截圖。`L:` 無日誌要求。
+- **比對**：`pix` 印的 sRGB 值與上表相符（每個通道誤差 ≤ 2）：目前分頁 `#233558`、分頁列 `#26282c`、hover `#2e2f30`；sRGB 值與 `raw=` 原始值都寫進 `action.json`。目前與分頁列的底色不同，非目前分頁在非 hover 時與分頁列底色相同（沒有 hover 底）。另外用肉眼判斷「看得出哪個是目前分頁」，看不出來判 `ui-defect`，證據寫截圖。`L:` 無日誌要求。
 - **截圖**：`before.png`、`dark-base.png`、`dark-hover-tab.png`、`dark-hover-close.png`、`dark-hover-plus.png`。
 
 #### WT81 light：同樣檢查
@@ -734,7 +752,7 @@ PY
 
 ### 4.14 恢復分頁（WT100–WT103）
 
-這一節測 #137：正常啟動會重開上次的分頁。`launch` 永遠帶 `--workspace $B/ws-src`，所以每一格的重新啟動都是「恢復存檔的分頁，再處理 `--workspace`」；沒帶 `--workspace`、顯示存檔目前分頁的那條路徑，腳本驅動不到，由 native-e2e 的 `tabs_open_at_quit_come_back_on_the_next_launch` 涵蓋，這裡不重測。遠端分頁的恢復與重試（`REMOTE_REOPEN`、`REMOTE_RETRY`、失敗圖示）需要 Ubuntu 準備與可靠的失敗觸發，由遠端規程與 native-e2e 負責，不在這一節。
+這一節測 #137：正常啟動會重開上次的分頁。`launch` 永遠帶 `--workspace $B/ws-src`，所以每一格的重新啟動都是「恢復存檔的分頁，再處理 `--workspace`」；沒帶 `--workspace`、顯示存檔目前分頁的那條路徑，腳本驅動不到，由 native-e2e 的 `tabs_open_at_quit_come_back_on_the_next_launch` 涵蓋，這裡不重測。遠端分頁的恢復失敗與重試（`REMOTE_REOPEN`、`REMOTE_OPEN_FAILED`、`REMOTE_RETRY`、失敗圖示）在 WT42 測。
 
 共同規則：
 
@@ -820,7 +838,7 @@ PY
 判定只有 `pass`、`ui-defect`、`fail`、`not-run`（意義同本機規程第 1 節）。
 
 - **閘門**：WT00、WT01 到 WT08、WT10 到 WT16、WT20 到 WT23、WT30 到 WT33、WT40、WT43、WT44、WT46、WT50 到 WT54、WT60 到 WT63、WT70 到 WT72、WT80、WT81、WT90、WT91、WT95、WT100 到 WT103、I-config、I-clip、I-leftover 全部是 `pass`，才寫「分頁閘門關閉」。
-- **不納入閘門**：WT41（連線中，抓不到暫態時 `not-run`）、WT42（失敗圖示沒有可靠觸發時 `not-run`）、WT45（沒有第二個別名時 `not-run`）、WT65（本機沒有暫停點）。這四格要填，但 `not-run` 不使閘門打開；判成 `fail` 或 `ui-defect` 時閘門打開。
+- **不納入閘門**：WT41（連線中，抓不到暫態時 `not-run`）、WT42（要重新啟動 App 並刪掉 Ubuntu 上的資料夾；缺 Ubuntu 準備時 `not-run`）、WT45（沒有第二個別名時 `not-run`）、WT65（本機沒有暫停點）。這四格要填，但 `not-run` 不使閘門打開；判成 `fail` 或 `ui-defect` 時閘門打開。
 - 遠端格（WT40、WT43、WT44、WT46、WT60 到 WT63）缺 Ubuntu 準備時整組 `not-run`，證據寫「缺 Ubuntu 準備」，閘門打開。
 - 有任何 `ui-defect`、`fail` 或 `not-run`（上面的例外除外），第一句就寫「分頁閘門打開」，並列出那些 ID。
 - 每個不是 `pass` 的格子先分清楚是規程錯、工具做不到，還是產品缺陷（同遠端規程第 7 節）：規程錯就修這份規程；工具做不到就維持 `not-run` 並寫下可行的做法；產品缺陷先寫會失敗的測試再修產品。
@@ -900,7 +918,7 @@ PY
 
 1. 橫向捲動工具是否做得到（WT31）。
 2. `Cmd+{` 與 `Cmd+}` 與 `Cmd+Shift+[`、`Cmd+Shift+]` 在工具上是否可區分（WT14）。
-3. 連線中的 wrapper 延遲是否落在握手之前（WT41）；失敗狀態的可靠觸發方式（WT42）。
+3. 連線中的 wrapper 延遲是否落在握手之前（WT41）；失敗原因的實際文字（WT42）。
 4. 本機貼上沒有暫停點（WT65）。
 5. 視窗關閉鈕的點法（System Events 或座標）（WT63、WT71）。
 6. light 主題下目前分頁與 hover 的對比是否足夠（WT81）。

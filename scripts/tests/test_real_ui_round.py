@@ -16,7 +16,11 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import signal
+import subprocess
+import threading
 import sys
 import tempfile
 import unittest
@@ -439,7 +443,9 @@ class TestPasteIdDetection(unittest.TestCase):
         self.assertEqual(rur.detect_paste_id_format(self.root), "paste-row:<path>")
 
 
-class TestLaunchSupervisorAndExitFile(unittest.TestCase):
+class RoundDirTestCase(unittest.TestCase):
+    """A prepared run directory whose app binary exits at once."""
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.run_dir = Path(self.temp_dir.name)
@@ -486,12 +492,15 @@ exit 0
             "launch_gate_a": "launch",
             "prepared_by": "test",
             "viewport_measured": {},
+            "round_script_sha256": rur.script_sha256(),
         }
         (self.run_dir / "environment.json").write_text(json.dumps(self.env_data, indent=2))
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
+
+class TestLaunchSupervisorAndExitFile(RoundDirTestCase):
     def test_supervisor_records_exit_code_and_times(self):
         args = argparse.Namespace(gate="b", run=str(self.run_dir))
         rc = rur.cmd_supervisor(args)
@@ -639,6 +648,383 @@ exec "{dest_bin}" "$@" >> "$LOG_FILE" 2>&1
             self.assertIn("<key>CFBundleExecutable</key>\n\t<string>snip-desktop-launcher</string>", plist_text)
             self.assertIn("<key>LSEnvironment</key>", plist_text)
             self.assertIn(f"<string>{isolated_config}</string>", plist_text)
+
+
+HELPER = {"kCGWindowName": "Window", "kCGWindowLayer": 0, "kCGWindowOwnerPID": 42,
+          "kCGWindowBounds": {"X": 0, "Y": 0, "Width": 10, "Height": 10}}
+
+
+def main_window(title: str) -> Dict[str, Any]:
+    return {"kCGWindowName": title, "kCGWindowLayer": 0, "kCGWindowOwnerPID": 42,
+            "kCGWindowBounds": {"X": 100, "Y": 50, "Width": 1080, "Height": 752}}
+
+
+class TestFindMainWindow(unittest.TestCase):
+    def test_skips_the_helper_window_listed_first(self):
+        info = {"windows": [HELPER, main_window("ws-src — snip-sync")]}
+        self.assertEqual(rur.find_main_window(info, 42)["kCGWindowName"], "ws-src — snip-sync")
+
+    def test_bare_title_without_tabs(self):
+        info = {"windows": [main_window("snip-sync"), HELPER]}
+        self.assertEqual(rur.find_main_window(info, 42)["kCGWindowName"], "snip-sync")
+
+    def test_ignores_other_pids_and_other_layers(self):
+        other = dict(main_window("ws-src — snip-sync"), kCGWindowOwnerPID=7)
+        overlay = dict(main_window("x — snip-sync"), kCGWindowLayer=3)
+        info = {"windows": [other, overlay, main_window("alpha — snip-sync")]}
+        self.assertEqual(rur.find_main_window(info, 42)["kCGWindowName"], "alpha — snip-sync")
+
+    def test_no_match_lists_every_title_of_the_pid(self):
+        info = {"windows": [HELPER, main_window("alpha - snip-sync")]}
+        with self.assertRaises(rur.MainWindowError) as ctx:
+            rur.find_main_window(info, 42)
+        self.assertIn("'Window'", str(ctx.exception))
+        self.assertIn("'alpha - snip-sync'", str(ctx.exception))
+
+    def test_nameless_windows_point_at_screen_recording(self):
+        nameless = {k: v for k, v in main_window("x").items() if k != "kCGWindowName"}
+        with self.assertRaises(rur.MainWindowError) as ctx:
+            rur.find_main_window({"windows": [nameless]}, 42)
+        self.assertIn("Screen Recording", str(ctx.exception))
+
+    def test_two_main_windows_are_an_error(self):
+        info = {"windows": [main_window("a — snip-sync"), main_window("b — snip-sync")]}
+        with self.assertRaises(rur.MainWindowError):
+            rur.find_main_window(info, 42)
+
+    def test_applescript_string_escapes_quotes_and_backslashes(self):
+        self.assertEqual(rur.applescript_string('a "b" \\ c'), '"a \\"b\\" \\\\ c"')
+
+
+class WindowFakeSystemOperations(FakeSystemOperations):
+    def __init__(self, windows: List[Dict[str, Any]]):
+        super().__init__()
+        self.windows = windows
+        self.processes = [rur.ProcessRecord(pid=42, command="snip-desktop-native")]
+
+    def get_window_info(self, pid: int, helper_binary: Optional[Path] = None) -> Dict[str, Any]:
+        return {"screens": [{"frame": [0, 0, 1920, 1080], "scale": 1.0}], "windows": list(self.windows)}
+
+
+class TestWindowCommands(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.run_dir = Path(self.temp_dir.name)
+        self.log = self.run_dir / "app-gate-b.log"
+        self.log.write_text(
+            "[APP:VIEWPORT: 1080x720]\n[APP:CTRL_BOUNDS: id=ws-tab:0 x=10 y=4 w=100 h=26]\n", encoding="utf-8"
+        )
+        (self.run_dir / "app-process.json").write_text(json.dumps({"pid": 42, "gate": "b", "log": str(self.log)}))
+        self.write_env(rur.script_sha256())
+        self.sys_ops = WindowFakeSystemOperations([HELPER, main_window('say "hi" — snip-sync')])
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def write_env(self, script_sha: Optional[str]) -> None:
+        env = {"sha": "516cb1c" + "0" * 33}
+        if script_sha is not None:
+            env["round_script_sha256"] = script_sha
+        (self.run_dir / "environment.json").write_text(json.dumps(env))
+
+    def run_quiet(self, fn, args):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = fn(args, sys_ops=self.sys_ops)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_title_prints_the_main_window_not_the_helper(self):
+        rc, out, _ = self.run_quiet(rur.cmd_title, argparse.Namespace(run=str(self.run_dir)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, 'say "hi" — snip-sync\n')
+
+    def test_point_finds_a_window_titled_with_the_tab_label(self):
+        rc, out, err = self.run_quiet(
+            rur.cmd_point, argparse.Namespace(run=str(self.run_dir), control_id="ws-tab:0", hover=None)
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Screen Point", out)
+
+    def test_resize_targets_the_exact_main_window_title(self):
+        rc, _, err = self.run_quiet(rur.cmd_resize, argparse.Namespace(run=str(self.run_dir), width=1080, height=720))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.sys_ops.applescripts_run), 1)
+        self.assertIn('set size of window "say \\"hi\\" — snip-sync" to', self.sys_ops.applescripts_run[0])
+
+    def test_point_and_title_refuse_a_script_other_than_the_prepared_one(self):
+        for sha in (None, "0" * 64):
+            self.write_env(sha)
+            rc, _, err = self.run_quiet(rur.cmd_title, argparse.Namespace(run=str(self.run_dir)))
+            self.assertEqual(rc, 1)
+            self.assertIn("not the script this round was prepared with", err)
+            rc, _, _ = self.run_quiet(
+                rur.cmd_point, argparse.Namespace(run=str(self.run_dir), control_id="ws-tab:0", hover=None)
+            )
+            self.assertEqual(rc, 1)
+
+
+WRAPPER = '#!/bin/sh\necho $$ > "/home/audichuang/snip-ui-run/516cb1c/pids/$$"\nexec x "$@"\n'
+
+
+class RemoteFake(FakeSystemOperations):
+    """A remote host with files and a scripted stop_run_workers result."""
+
+    def __init__(self, files: Dict[str, str], stop_rc: int = 0, ssh_hangs_on: str = ""):
+        super().__init__()
+        self.files = dict(files)
+        self.stop_rc = stop_rc
+        self.ssh_hangs_on = ssh_hangs_on
+        self.commands: List[str] = []
+
+    def remote_exec(self, host: str, command: str, check: bool = True):
+        self.commands.append(command)
+        rc, out = 0, ""
+        if self.ssh_hangs_on and command.startswith(self.ssh_hangs_on):
+            rc = 124
+        elif command.startswith("W=") and "bash -c" in command:
+            rc = self.stop_rc
+        elif command.startswith("cat '"):
+            out = "111\n"
+        elif command.startswith("sha256sum "):
+            path = command.split()[1]
+            if path in self.files:
+                out = f"{rur.hashlib.sha256(self.files[path].encode()).hexdigest()}  {path}\n"
+        elif command.startswith("rm -f "):
+            self.files.pop(command.split()[2], None)
+        elif command.startswith("if [ -e "):
+            backup = command.split()[3]
+            if backup in self.files and rur.REMOTE_WRAPPER not in self.files:
+                self.files[rur.REMOTE_WRAPPER] = self.files.pop(backup)
+        elif command.startswith("[ -e "):
+            rc = 0 if command.split()[2] in self.files else 1
+        elif command.startswith("cat ") and command.split()[1] in self.files:
+            out = self.files[command.split()[1]]
+        return subprocess.CompletedProcess(args=["ssh", host, command], returncode=rc, stdout=out, stderr="")
+
+
+class TestRemoteCleanup(unittest.TestCase):
+    SHA = "516cb1c" + "0" * 33
+    BACKUP = "~/.local/bin/snip.uirun-516cb1c"
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.run_dir = Path(self.temp_dir.name)
+        digest = rur.hashlib.sha256(WRAPPER.encode()).hexdigest()
+        (self.run_dir / "snip-installed.sha").write_text(f"{digest}  /home/audichuang/.local/bin/snip\n")
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def clean(self, fake: RemoteFake) -> Dict[str, Any]:
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            return rur.clean_remote_round("ubuntu", self.SHA, self.run_dir, fake)
+
+    def assert_no_glob(self, fake: RemoteFake) -> None:
+        for command in fake.commands:
+            self.assertNotIn("uirun-*", command)
+
+    def test_removes_only_this_rounds_wrapper_backup_and_dir(self):
+        other = "~/.local/bin/snip.uirun-1234567"
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER, other: "user backup"})
+        result = self.clean(fake)
+        self.assertTrue(result["workers_stopped"])
+        self.assertEqual(result["wrapper"], "removed")
+        self.assertEqual(fake.files, {other: "user backup"})
+        self.assertIn("rm -rf '/home/audichuang/snip-ui-run/516cb1c'", fake.commands)
+        self.assertEqual((self.run_dir / "workers-at-cleanup.txt").read_text(), "111\n")
+        self.assert_no_glob(fake)
+
+    def test_a_replaced_wrapper_is_kept(self):
+        fake = RemoteFake({rur.REMOTE_WRAPPER: "#!/bin/sh\nexec /usr/bin/snip \"$@\"\n"})
+        result = self.clean(fake)
+        self.assertIn(rur.REMOTE_WRAPPER, fake.files)
+        self.assertTrue(result["wrapper"].startswith("kept"))
+        self.assertNotIn(f"rm -f {rur.REMOTE_WRAPPER}", fake.commands)
+        # It does not run $W, so $W can go.
+        self.assertTrue(result["remote_dir_removed"])
+
+    def test_a_kept_wrapper_that_still_runs_this_rounds_dir_keeps_the_dir(self):
+        edited = WRAPPER + "# edited during the round\n"
+        fake = RemoteFake({rur.REMOTE_WRAPPER: edited})
+        result = self.clean(fake)
+        self.assertEqual(fake.files, {rur.REMOTE_WRAPPER: edited})
+        self.assertFalse(result["remote_dir_removed"])
+        self.assertEqual(result["remote_dir_kept_for"], [rur.REMOTE_WRAPPER])
+        self.assertFalse(any(c.startswith("rm -rf") for c in fake.commands))
+
+    def test_without_the_installed_hash_the_rounds_wrapper_keeps_the_dir(self):
+        (self.run_dir / "snip-installed.sha").unlink()
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER})
+        result = self.clean(fake)
+        self.assertIn(rur.REMOTE_WRAPPER, fake.files)
+        self.assertFalse(result["remote_dir_removed"])
+
+    def test_an_ssh_failure_while_hashing_keeps_the_dir(self):
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER}, ssh_hangs_on="sha256sum ")
+        result = self.clean(fake)
+        self.assertEqual(result["wrapper"], "unknown (ssh failed)")
+        self.assertFalse(result["remote_dir_removed"])
+        self.assertFalse(any(c.startswith("rm ") for c in fake.commands))
+
+    def test_an_interrupted_s11_backup_is_restored_then_removed(self):
+        fake = RemoteFake({self.BACKUP: WRAPPER})
+        result = self.clean(fake)
+        self.assertEqual(fake.files, {})
+        self.assertEqual(result["wrapper"], "removed")
+        self.assertEqual(result["backup"], "absent")
+
+    def test_a_backup_with_other_content_is_kept(self):
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER, self.BACKUP: "something else"})
+        self.clean(fake)
+        self.assertEqual(fake.files, {self.BACKUP: "something else"})
+
+    def test_failed_worker_stop_keeps_everything(self):
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER}, stop_rc=1)
+        result = self.clean(fake)
+        self.assertFalse(result["workers_stopped"])
+        self.assertEqual(fake.files, {rur.REMOTE_WRAPPER: WRAPPER})
+        self.assertFalse(any(c.startswith(("rm ", "if ")) for c in fake.commands))
+
+    def test_stop_command_passes_the_run_dir(self):
+        command = rur.stop_run_workers_command("/home/audichuang/snip-ui-run/516cb1c")
+        self.assertTrue(command.startswith("W=/home/audichuang/snip-ui-run/516cb1c bash -c '"))
+
+    def test_leftover_check_looks_only_at_this_shas_backup(self):
+        other = "~/.local/bin/snip.uirun-1234567"
+        fake = RemoteFake({other: WRAPPER, self.BACKUP: WRAPPER})
+        leftovers = rur.detect_leftovers(self.run_dir, remote_host="ubuntu", sys_ops=fake, short_sha="516cb1c")
+        self.assertEqual([item.clean_target for item in leftovers], [self.BACKUP])
+        self.assertTrue(leftovers[0].provably_earlier_round)
+        rur.clean_provable_leftovers(leftovers, remote_host="ubuntu", sys_ops=fake)
+        self.assertEqual(fake.files, {other: WRAPPER})
+        self.assert_no_glob(fake)
+
+
+class TestFinishWithRemote(RoundDirTestCase):
+    def finish(self, fake: FakeSystemOperations, **env_changes: Any):
+        import contextlib
+        import io
+        env = json.loads((self.run_dir / "environment.json").read_text())
+        env.update(env_changes)
+        (self.run_dir / "environment.json").write_text(json.dumps(env))
+        Path(self.env_data["app_bundle"]).mkdir(parents=True, exist_ok=True)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = rur.cmd_finish(argparse.Namespace(run=str(self.run_dir)), sys_ops=fake)
+        return rc, err.getvalue(), json.loads((self.run_dir / "environment.json").read_text())
+
+    def test_finish_fails_and_keeps_the_remote_dir_when_workers_do_not_stop(self):
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER}, stop_rc=1)
+        rc, _, recorded = self.finish(fake, remote_host="ubuntu")
+        self.assertEqual(rc, 1)
+        self.assertFalse(any(c.startswith("rm -rf") for c in fake.commands))
+        self.assertFalse(recorded["finish_results"]["remote_cleanup"]["workers_stopped"])
+
+    def test_finish_fails_when_a_kept_wrapper_still_runs_the_remote_dir(self):
+        digest = rur.hashlib.sha256(WRAPPER.encode()).hexdigest()
+        (self.run_dir / "snip-installed.sha").write_text(f"{digest}  /home/audichuang/.local/bin/snip\n")
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER + "# edited\n"})
+        rc, err, recorded = self.finish(fake, remote_host="ubuntu", sha=TestRemoteCleanup.SHA)
+        self.assertEqual(rc, 1)
+        self.assertIn(f"kept for {rur.REMOTE_WRAPPER}: still runs it", err)
+        self.assertFalse(recorded["finish_results"]["remote_cleanup"]["remote_dir_removed"])
+
+    def test_finish_with_another_script_copy_warns_and_still_tears_down(self):
+        rc, err, recorded = self.finish(self.sys_ops, round_script_sha256="0" * 64)
+        self.assertEqual(rc, 0)
+        self.assertIn("Tearing down anyway", err)
+        self.assertIn(f"{self.run_dir / 'worktree'}/scripts/real_ui_round.py", err)
+        self.assertIn(Path(self.env_data["app_bundle"]), self.sys_ops.unregistered_apps)
+        self.assertIn("finish_results", recorded)
+
+
+class TestRemoteExecTimeout(unittest.TestCase):
+    def test_a_hung_ssh_returns_124_instead_of_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_ssh = Path(tmp) / "ssh"
+            fake_ssh.write_text("#!/bin/sh\nexec sleep 30\n")
+            fake_ssh.chmod(0o755)
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = f"{tmp}{os.pathsep}{old_path}"
+            try:
+                res = rur.SystemOperations().remote_exec("ubuntu", "true", check=False, timeout=0.5)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    rur.SystemOperations().remote_exec("ubuntu", "true", check=True, timeout=0.5)
+            finally:
+                os.environ["PATH"] = old_path
+        self.assertEqual(res.returncode, 124)
+        self.assertIn("timed out", res.stderr)
+
+
+@unittest.skipIf(os.name == "nt", "the worker cleanup runs in bash on the Linux worker")
+class TestStopRunWorkersScript(unittest.TestCase):
+    """Runs section 2.3's stop_run_workers against real processes; a fake `ps`
+    reports the worker command line for PIDs listed in $FAKE_ARGS."""
+
+    def setUp(self):
+        assert shutil.which("bash"), "bash is required"
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.w = root / "W"
+        (self.w / "pids").mkdir(parents=True)
+        self.args_dir = root / "args"
+        self.args_dir.mkdir()
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        fake_ps = bin_dir / "ps"
+        fake_ps.write_text(
+            '#!/bin/sh\npid="$4"\nkill -0 "$pid" 2>/dev/null || exit 1\n'
+            '[ -f "$FAKE_ARGS/$pid" ] && cat "$FAKE_ARGS/$pid" || echo "sleep 60"\n'
+        )
+        fake_ps.chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", FAKE_ARGS=str(self.args_dir))
+        self.procs: List[subprocess.Popen] = []
+
+    def tearDown(self):
+        for proc in self.procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+        self.temp_dir.cleanup()
+
+    def worker(self, args: Optional[str]) -> int:
+        proc = subprocess.Popen(["sleep", "60"])
+        self.procs.append(proc)
+        # Reap it as sshd reaps a worker, or a killed one lingers as a zombie.
+        threading.Thread(target=proc.wait, daemon=True).start()
+        (self.w / "pids" / str(proc.pid)).write_text(f"{proc.pid}\n")
+        if args is not None:
+            (self.args_dir / str(proc.pid)).write_text(args + "\n")
+        return proc.pid
+
+    def run_stop(self) -> subprocess.CompletedProcess:
+        command = rur.stop_run_workers_command(str(self.w))
+        return subprocess.run(["sh", "-c", command], env=self.env, capture_output=True, text=True, timeout=60)
+
+    def test_stops_recorded_workers_and_skips_exited_ones(self):
+        pid = self.worker(f"{self.w}/src/target/release/snip serve --stdio")
+        (self.w / "pids" / "999999").write_text("999999\n")
+        result = self.run_stop()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"stopped {pid}", result.stdout)
+        self.assertIsNotNone(self.procs[0].wait(timeout=10))
+
+    def test_a_reused_pid_is_a_stale_record_and_is_not_killed(self):
+        pid = self.worker(None)
+        result = self.run_stop()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"PID {pid} is no longer this round's worker", result.stderr)
+        self.assertIsNone(self.procs[0].poll())
+
+    def test_rejects_an_invalid_record(self):
+        (self.w / "pids" / "bad").write_text("12; rm -rf /\n")
+        result = self.run_stop()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("invalid PID record", result.stderr)
 
 
 if __name__ == "__main__":
