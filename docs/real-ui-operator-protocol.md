@@ -66,7 +66,7 @@ python3 scripts/real_ui_round.py title --run "$RUN"                 # 主視窗�
 python3 scripts/real_ui_round.py finish --run "$RUN"                # Cmd+Q、exit code、殘留、剪貼簿還原、真實設定比對（I-config）、移除 worktree
 ```
 
-腳本要用受測 SHA 那一份：在受測 SHA 的乾淨 checkout 裡執行。`prepare` 發現自己和 `git show <SHA>:scripts/real_ui_round.py` 不同就拒絕開跑，之後的指令發現自己不是 `prepare` 時那一份也拒絕。曾經有一輪用了另一個 checkout 裡較舊的腳本，它的 `point`／`resize` 還不認得帶分頁標籤的標題，整輪都要手動補座標。
+腳本要用受測 SHA 那一份：在受測 SHA 的乾淨 checkout 裡執行。`prepare` 發現自己和 `git show <SHA>:scripts/real_ui_round.py` 不同就拒絕開跑；`launch`、`resize`、`point`、`title` 發現自己不是 `prepare` 時那一份也拒絕，這時改用 `$RUN/worktree/scripts/real_ui_round.py`（就是受測 SHA 那一份）。`finish` 只警告、照樣收尾，免得 App、剪貼簿與 worktree 留著；它會移除 `$RUN/worktree`。曾經有一輪用了另一個 checkout 裡較舊的腳本，它的 `point`／`resize` 還不認得帶分頁標籤的標題，整輪都要手動補座標。
 
 視窗標題：主視窗的標題是 `snip-sync`；開了工作區分頁後，標題會變成 `<目前分頁的標籤> — snip-sync`（中間是 em dash）。腳本在 App 的 PID 擁有的視窗裡，找恰好一個標題「等於 `snip-sync` 或以 ` — snip-sync` 結尾」的視窗（見 `find_main_window`）。App 還有一個標題是 `Window` 的小輔助視窗，所以 System Events 的 `first window` 不一定是主視窗，不能拿來讀標題或點關閉鈕；標題用 `title` 讀。
 

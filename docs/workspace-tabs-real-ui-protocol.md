@@ -752,7 +752,7 @@ PY
 
 ### 4.14 恢復分頁（WT100–WT103）
 
-這一節測 #137：正常啟動會重開上次的分頁。`launch` 永遠帶 `--workspace $B/ws-src`，所以每一格的重新啟動都是「恢復存檔的分頁，再處理 `--workspace`」；沒帶 `--workspace`、顯示存檔目前分頁的那條路徑，腳本驅動不到，由 native-e2e 的 `tabs_open_at_quit_come_back_on_the_next_launch` 涵蓋，這裡不重測。遠端分頁的恢復與重試（`REMOTE_REOPEN`、`REMOTE_RETRY`、失敗圖示）需要 Ubuntu 準備與可靠的失敗觸發，由遠端規程與 native-e2e 負責，不在這一節。
+這一節測 #137：正常啟動會重開上次的分頁。`launch` 永遠帶 `--workspace $B/ws-src`，所以每一格的重新啟動都是「恢復存檔的分頁，再處理 `--workspace`」；沒帶 `--workspace`、顯示存檔目前分頁的那條路徑，腳本驅動不到，由 native-e2e 的 `tabs_open_at_quit_come_back_on_the_next_launch` 涵蓋，這裡不重測。遠端分頁的恢復失敗與重試（`REMOTE_REOPEN`、`REMOTE_OPEN_FAILED`、`REMOTE_RETRY`、失敗圖示）在 WT42 測。
 
 共同規則：
 

@@ -771,16 +771,19 @@ WRAPPER = '#!/bin/sh\necho $$ > "/home/audichuang/snip-ui-run/516cb1c/pids/$$"\n
 class RemoteFake(FakeSystemOperations):
     """A remote host with files and a scripted stop_run_workers result."""
 
-    def __init__(self, files: Dict[str, str], stop_rc: int = 0):
+    def __init__(self, files: Dict[str, str], stop_rc: int = 0, ssh_hangs_on: str = ""):
         super().__init__()
         self.files = dict(files)
         self.stop_rc = stop_rc
+        self.ssh_hangs_on = ssh_hangs_on
         self.commands: List[str] = []
 
     def remote_exec(self, host: str, command: str, check: bool = True):
         self.commands.append(command)
         rc, out = 0, ""
-        if command.startswith("W=") and "bash -c" in command:
+        if self.ssh_hangs_on and command.startswith(self.ssh_hangs_on):
+            rc = 124
+        elif command.startswith("W=") and "bash -c" in command:
             rc = self.stop_rc
         elif command.startswith("cat '"):
             out = "111\n"
@@ -841,6 +844,31 @@ class TestRemoteCleanup(unittest.TestCase):
         self.assertIn(rur.REMOTE_WRAPPER, fake.files)
         self.assertTrue(result["wrapper"].startswith("kept"))
         self.assertNotIn(f"rm -f {rur.REMOTE_WRAPPER}", fake.commands)
+        # It does not run $W, so $W can go.
+        self.assertTrue(result["remote_dir_removed"])
+
+    def test_a_kept_wrapper_that_still_runs_this_rounds_dir_keeps_the_dir(self):
+        edited = WRAPPER + "# edited during the round\n"
+        fake = RemoteFake({rur.REMOTE_WRAPPER: edited})
+        result = self.clean(fake)
+        self.assertEqual(fake.files, {rur.REMOTE_WRAPPER: edited})
+        self.assertFalse(result["remote_dir_removed"])
+        self.assertEqual(result["remote_dir_kept_for"], [rur.REMOTE_WRAPPER])
+        self.assertFalse(any(c.startswith("rm -rf") for c in fake.commands))
+
+    def test_without_the_installed_hash_the_rounds_wrapper_keeps_the_dir(self):
+        (self.run_dir / "snip-installed.sha").unlink()
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER})
+        result = self.clean(fake)
+        self.assertIn(rur.REMOTE_WRAPPER, fake.files)
+        self.assertFalse(result["remote_dir_removed"])
+
+    def test_an_ssh_failure_while_hashing_keeps_the_dir(self):
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER}, ssh_hangs_on="sha256sum ")
+        result = self.clean(fake)
+        self.assertEqual(result["wrapper"], "unknown (ssh failed)")
+        self.assertFalse(result["remote_dir_removed"])
+        self.assertFalse(any(c.startswith("rm ") for c in fake.commands))
 
     def test_an_interrupted_s11_backup_is_restored_then_removed(self):
         fake = RemoteFake({self.BACKUP: WRAPPER})
@@ -877,20 +905,59 @@ class TestRemoteCleanup(unittest.TestCase):
 
 
 class TestFinishWithRemote(RoundDirTestCase):
-    def test_finish_fails_and_keeps_the_remote_dir_when_workers_do_not_stop(self):
-        env = json.loads((self.run_dir / "environment.json").read_text())
-        env["remote_host"] = "ubuntu"
-        (self.run_dir / "environment.json").write_text(json.dumps(env))
-        Path(self.env_data["app_bundle"]).mkdir(parents=True, exist_ok=True)
-        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER}, stop_rc=1)
+    def finish(self, fake: FakeSystemOperations, **env_changes: Any):
         import contextlib
         import io
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        env = json.loads((self.run_dir / "environment.json").read_text())
+        env.update(env_changes)
+        (self.run_dir / "environment.json").write_text(json.dumps(env))
+        Path(self.env_data["app_bundle"]).mkdir(parents=True, exist_ok=True)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             rc = rur.cmd_finish(argparse.Namespace(run=str(self.run_dir)), sys_ops=fake)
+        return rc, err.getvalue(), json.loads((self.run_dir / "environment.json").read_text())
+
+    def test_finish_fails_and_keeps_the_remote_dir_when_workers_do_not_stop(self):
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER}, stop_rc=1)
+        rc, _, recorded = self.finish(fake, remote_host="ubuntu")
         self.assertEqual(rc, 1)
         self.assertFalse(any(c.startswith("rm -rf") for c in fake.commands))
-        recorded = json.loads((self.run_dir / "environment.json").read_text())
         self.assertFalse(recorded["finish_results"]["remote_cleanup"]["workers_stopped"])
+
+    def test_finish_fails_when_a_kept_wrapper_still_runs_the_remote_dir(self):
+        digest = rur.hashlib.sha256(WRAPPER.encode()).hexdigest()
+        (self.run_dir / "snip-installed.sha").write_text(f"{digest}  /home/audichuang/.local/bin/snip\n")
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER + "# edited\n"})
+        rc, err, recorded = self.finish(fake, remote_host="ubuntu", sha=TestRemoteCleanup.SHA)
+        self.assertEqual(rc, 1)
+        self.assertIn("a kept wrapper still runs it", err)
+        self.assertFalse(recorded["finish_results"]["remote_cleanup"]["remote_dir_removed"])
+
+    def test_finish_with_another_script_copy_warns_and_still_tears_down(self):
+        rc, err, recorded = self.finish(self.sys_ops, round_script_sha256="0" * 64)
+        self.assertEqual(rc, 0)
+        self.assertIn("Tearing down anyway", err)
+        self.assertIn(f"{self.run_dir / 'worktree'}/scripts/real_ui_round.py", err)
+        self.assertIn(Path(self.env_data["app_bundle"]), self.sys_ops.unregistered_apps)
+        self.assertIn("finish_results", recorded)
+
+
+class TestRemoteExecTimeout(unittest.TestCase):
+    def test_a_hung_ssh_returns_124_instead_of_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_ssh = Path(tmp) / "ssh"
+            fake_ssh.write_text("#!/bin/sh\nexec sleep 30\n")
+            fake_ssh.chmod(0o755)
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = f"{tmp}{os.pathsep}{old_path}"
+            try:
+                res = rur.SystemOperations().remote_exec("ubuntu", "true", check=False, timeout=0.5)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    rur.SystemOperations().remote_exec("ubuntu", "true", check=True, timeout=0.5)
+            finally:
+                os.environ["PATH"] = old_path
+        self.assertEqual(res.returncode, 124)
+        self.assertIn("timed out", res.stderr)
 
 
 @unittest.skipIf(os.name == "nt", "the worker cleanup runs in bash on the Linux worker")
@@ -946,11 +1013,11 @@ class TestStopRunWorkersScript(unittest.TestCase):
         self.assertIn(f"stopped {pid}", result.stdout)
         self.assertIsNotNone(self.procs[0].wait(timeout=10))
 
-    def test_refuses_a_pid_whose_arguments_differ(self):
+    def test_a_reused_pid_is_a_stale_record_and_is_not_killed(self):
         pid = self.worker(None)
         result = self.run_stop()
-        self.assertEqual(result.returncode, 1)
-        self.assertIn(f"PID {pid} arguments differ", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"PID {pid} is no longer this round's worker", result.stderr)
         self.assertIsNone(self.procs[0].poll())
 
     def test_rejects_an_invalid_record(self):

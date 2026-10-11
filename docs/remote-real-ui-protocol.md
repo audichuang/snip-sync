@@ -111,7 +111,7 @@ ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"   # 收尾�
 
 最後一行必須印出 `/home/audichuang/.local/bin/snip` 和受測版本。印出 linuxbrew 的路徑就停下：產品不會選到受測 binary。
 
-L04、L05 與收尾共用下面的函式，在 Mac 的同一個 bash 定義一次。wrapper `exec` 的是絕對路徑，所以 `ps` 必須精確等於 `$W/src/target/release/snip serve --stdio`。已退出的 PID 略過；仍存活但參數不符的 PID 不殺且判 fail。每個受測 worker 最多等 10 秒，未退出就判 fail；PID 紀錄保留作證據。
+L04、L05 與收尾共用下面的函式，在 Mac 的同一個 bash 定義一次。wrapper `exec` 的是絕對路徑，所以 `ps` 必須精確等於 `$W/src/target/release/snip serve --stdio`。已退出的 PID 略過；仍存活但參數不符的 PID 是 worker 退出後被別的行程重用的過期紀錄：印出警告、不殺，也不算失敗。每個受測 worker 最多等 10 秒，未退出就判 fail；PID 紀錄保留作證據。
 
 ```bash
 stop_run_workers() {
@@ -128,7 +128,7 @@ for record in "$W"/pids/*; do
   args=$(ps -o args= -p "$pid" || true)
   [ -n "$args" ] || continue
   if [ "$args" != "$W/src/target/release/snip serve --stdio" ]; then
-    echo "PID $pid 參數不符，拒絕終止：$args" >&2; failed=1; continue
+    echo "PID $pid 已不是本輪的 worker（過期紀錄），不終止：$args" >&2; continue
   fi
   kill "$pid" 2>/dev/null || true
   deadline=$((SECONDS + 10))
@@ -534,7 +534,7 @@ snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>s
 | L01 | 在 `edge`：`ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 出現 `ws-tree-row:new.txt`，預覽是 `fresh-1` |
 | L02 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2` |
 | L03 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄沒有 `new.txt` |
-| L04 | 中斷連線：執行第 2.3 節的 `stop_run_workers`，必須結束碼 0（只殺本輪記錄、且參數精確符合絕對 binary 路徑的 worker，並確認已退出；任何不符或逾時就判 fail）。不用 `pkill`／`pgrep -u`。在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh，新的 PID 又記進 `$W/pids/`）；絕不顯示成空白或上一個檔案 |
+| L04 | 中斷連線：執行第 2.3 節的 `stop_run_workers`，必須結束碼 0（只殺本輪記錄、且參數精確符合絕對 binary 路徑的 worker，並確認已退出；逾時或無效的 PID 紀錄就判 fail，參數不符的過期紀錄只警告）。不用 `pkill`／`pgrep -u`。在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh，新的 PID 又記進 `$W/pids/`）；絕不顯示成空白或上一個檔案 |
 | L05 | 貼上中斷（寫入途中斷線；wrapper 的 `SNIP_E2E_PASTE_HOLD` 是絕對路徑）。順序：(1) `ssh ubuntu "rm -f '$W/paste-hold'; rm -rf '$W/pastews/cut-dst' '$W/oracle/cut-dst'; mkdir -p '$W/pastews/cut-dst' '$W/oracle/cut-dst'"`；先在 hold 不存在時執行 `ssh ubuntu "cd '$W/oracle/cut-dst' && snip paste --apply --stdin" < "$RUN/p-files.txt"`，完成 P01 payload 的獨立 CLI oracle。(2) `ssh ubuntu "touch '$W/paste-hold'"`；App 打開 `pastews/cut-dst`，對 P01 payload 按 Cmd+V，`PASTE_PREVIEW` 後點 `btn-apply`。(3) `ssh ubuntu "for i in \$(seq 1 100); do [ -f '$W/pastews/cut-dst/a.txt' ] && exit 0; sleep 0.1; done; exit 1"`，必須結束碼 0；逾時判 fail。(4) 執行 `stop_run_workers`，必須結束碼 0，確認 worker 已退出，**先不移除 hold**。(5) `ssh ubuntu "test -f '$W/paste-hold' && test -f '$W/pastews/cut-dst/a.txt' && test ! -e '$W/pastews/cut-dst/new.txt' && test ! -e '$W/pastews/cut-dst/sub/crlf.txt' && test ! -e '$W/pastews/cut-dst/sub/noeol.txt' && cmp '$W/pastews/cut-dst/a.txt' '$W/oracle/cut-dst/a.txt'"`，必須結束碼 0；保存 `ssh ubuntu "find '$W/pastews/cut-dst' -type f"` 的輸出，只能有 `a.txt`。(6) 完成部分寫入檢查後，才 `ssh ubuntu "rm -f '$W/paste-hold'"`，在 App 點 `btn-refresh` | UI 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」（`paste_outcome_unknown`）；確認只有 `a.txt` 已寫入且與 CLI oracle 一致，其餘三個檔案不存在；重新整理後專案樹與 worker 上的實際檔案一致；之後 App 的下一次操作一定有回應（自動重連）。任何步驟失敗都記 fail，再移除 hold 收尾，不當作通過 |
 
 ### 4.10 CLI master 交叉驗證（C01–C04）
@@ -588,7 +588,9 @@ ssh ubuntu "rm -rf '$W'"
 只刪 `$W`（含 `pids/` 與 `paste-hold`）、本輪放的 `~/.local/bin/snip`
 wrapper 與本輪備份名 `~/.local/bin/snip.uirun-$SHA`（兩者都要 hash 一致才刪）。
 `real_ui_round.py finish` 對 `prepare --remote` 的回合照同樣的順序做這一節，
-`stop_run_workers` 失敗就停下、保留 `$W`，並以非 0 結束。
+`stop_run_workers` 失敗就停下、保留 `$W`，並以非 0 結束。保留下來（hash 不一致）的
+wrapper 或備份若仍 `exec` 進 `$W`，也保留 `$W` 並以非 0 結束：刪掉 `$W` 會讓 Ubuntu 上的
+`snip` 變成壞掉的 wrapper。手動收尾時同樣檢查（`grep -F "$W" ~/.local/bin/snip`）。
 `snip.away` 或使用者自己的任何備份、`~/research/rtk`、linuxbrew 的
 `snip`、`snip-worker.service`、`~/.ssh/config` 都不動。Mac 上的
 `$RUN` 保留，裡面是證據。

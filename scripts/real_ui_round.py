@@ -89,10 +89,11 @@ def check_round_script(env_data: Dict[str, Any]) -> Optional[str]:
     want = env_data.get("round_script_sha256")
     if want == script_sha256():
         return None
+    worktree = env_data.get("source_worktree")
+    copy = f"{worktree}/scripts/real_ui_round.py" if worktree else "scripts/real_ui_round.py in a checkout at the tested SHA"
     return (
         f"{Path(__file__).resolve()} is not the script this round was prepared with "
-        f"(prepared: {want or 'unknown'}). Run scripts/real_ui_round.py from a checkout at the tested SHA "
-        f"{env_data.get('sha', '?')}."
+        f"(prepared: {want or 'unknown'}). Use {copy}, the copy at the tested SHA {env_data.get('sha', '?')}."
     )
 
 
@@ -102,6 +103,12 @@ def load_round_env(run_dir: Path) -> Tuple[Optional[Dict[str, Any]], Optional[st
         return None, f"environment.json not found in {run_dir}"
     env_data = json.loads(env_file.read_text(encoding="utf-8"))
     return env_data, check_round_script(env_data)
+
+
+# Bounds every ssh call except the remote build. stop_run_workers waits up to
+# 10 s per worker, so this leaves room for several.
+REMOTE_TIMEOUT_SECONDS = 120.0
+REMOTE_BUILD_TIMEOUT_SECONDS = 3600.0
 
 
 # Ensure ~/.cargo/bin is on PATH if present
@@ -260,8 +267,18 @@ print(String(data: data, encoding: .utf8)!)
 
         return {"screens": [{"frame": [0, 0, 1920, 1080], "scale": 1.0}], "windows": []}
 
-    def remote_exec(self, host: str, command: str, check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(["ssh", host, command], capture_output=True, text=True, check=check)
+    def remote_exec(
+        self, host: str, command: str, check: bool = True, timeout: Optional[float] = REMOTE_TIMEOUT_SECONDS
+    ) -> subprocess.CompletedProcess:
+        """A hung ssh comes back as exit 124 instead of stalling the round (raises when `check`)."""
+        try:
+            return subprocess.run(["ssh", host, command], capture_output=True, text=True, check=check, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if check:
+                raise
+            return subprocess.CompletedProcess(
+                args=["ssh", host, command], returncode=124, stdout="", stderr=f"ssh timed out after {timeout} s"
+            )
 
 
 DEFAULT_SYS_OPS = SystemOperations()
@@ -385,6 +402,7 @@ def is_round_wrapper(content: str) -> bool:
 
 # Section 2.3's stop_run_workers: kill only the PIDs this round's wrapper
 # recorded whose arguments are exactly its worker command, and wait for each.
+# A recorded PID with other arguments was reused after the worker exited.
 STOP_RUN_WORKERS = r'''
 failed=0
 for record in "$W"/pids/*; do
@@ -396,7 +414,8 @@ for record in "$W"/pids/*; do
   args=$(ps -o args= -p "$pid" 2>/dev/null || true)
   [ -n "$args" ] || continue
   if [ "$args" != "$W/src/target/release/snip serve --stdio" ]; then
-    echo "PID $pid arguments differ, not killed: $args" >&2; failed=1; continue
+    # The worker exited and its PID now belongs to another process: a stale record.
+    echo "PID $pid is no longer this round's worker, not killed: $args" >&2; continue
   fi
   kill "$pid" 2>/dev/null || true
   deadline=$((SECONDS + 10))
@@ -417,8 +436,12 @@ def stop_run_workers_command(w_remote: str) -> str:
     return f"W={shlex.quote(w_remote)} bash -c {shlex.quote(STOP_RUN_WORKERS)}"
 
 
-def remote_sha256(host: str, path: str, sys_ops: SystemOperations) -> str:
-    out = sys_ops.remote_exec(host, f"sha256sum {path} 2>/dev/null || true", check=False).stdout.split()
+def remote_sha256(host: str, path: str, sys_ops: SystemOperations) -> Optional[str]:
+    """The file's sha256, "" when it is absent, None when ssh failed."""
+    res = sys_ops.remote_exec(host, f"sha256sum {path} 2>/dev/null || true", check=False)
+    if res.returncode != 0:
+        return None
+    out = res.stdout.split()
     return out[0] if out else ""
 
 
@@ -444,16 +467,31 @@ def clean_remote_round(host: str, sha: str, run_dir: Path, sys_ops: SystemOperat
     )
     installed_sha_file = run_dir / "snip-installed.sha"
     want = installed_sha_file.read_text(encoding="utf-8").split()[0] if installed_sha_file.is_file() else ""
+    # A wrapper kept below that still execs into $W would turn into a broken
+    # `snip` once $W is gone, so $W stays and the cleanup fails.
+    blockers: List[str] = []
     for name, path in (("wrapper", REMOTE_WRAPPER), ("backup", backup)):
         got = remote_sha256(host, path, sys_ops)
-        if not got:
+        if got is None:
+            result[name] = "unknown (ssh failed)"
+            blockers.append(path)
+        elif not got:
             result[name] = "absent"
         elif want and got == want:
             sys_ops.remote_exec(host, f"rm -f {path}", check=False)
             result[name] = "removed"
         else:
-            print(f"WARNING: {host}:{path} is not the wrapper this round installed; kept.", file=sys.stderr)
             result[name] = f"kept (sha256 {got})"
+            content = sys_ops.remote_exec(host, f"cat {path} 2>/dev/null", check=False)
+            if content.returncode != 0 or w_remote in content.stdout:
+                print(f"ERROR: {host}:{path} still runs {w_remote} but its hash is not the recorded one.", file=sys.stderr)
+                blockers.append(path)
+            else:
+                print(f"WARNING: {host}:{path} is not the wrapper this round installed; kept.", file=sys.stderr)
+    if blockers:
+        result["remote_dir_removed"] = False
+        result["remote_dir_kept_for"] = blockers
+        return result
     sys_ops.remote_exec(host, f"rm -rf '{w_remote}'", check=False)
     result["remote_dir_removed"] = True
     return result
@@ -1020,6 +1058,7 @@ print(String(data: data, encoding: .utf8)!)
             remote_host,
             f"cd '{w_remote}/src' && export PATH=$HOME/.cargo/bin:$PATH && cargo build --release -p snip-cli --locked",
             check=True,
+            timeout=REMOTE_BUILD_TIMEOUT_SECONDS,
         )
         wrapper_sh = f"""#!/bin/sh
 echo $$ > "{w_remote}/pids/$$"
@@ -1412,10 +1451,11 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     if not env_file.is_file():
         print(f"ERROR: environment.json not found in {run_dir}", file=sys.stderr)
         return 1
+    # Teardown must still run with another copy of the script: refusing here
+    # would leave the app, the clipboard and the worktree behind.
     script_err = check_round_script(json.loads(env_file.read_text(encoding="utf-8")))
     if script_err:
-        print(f"ERROR: {script_err}", file=sys.stderr)
-        return 1
+        print(f"WARNING: {script_err} Tearing down anyway.", file=sys.stderr)
 
     env_data = json.loads(env_file.read_text(encoding="utf-8"))
     proc_file = run_dir / "app-process.json"
@@ -1521,10 +1561,11 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     if remote_host:
         print(f"Cleaning remote host {remote_host}...")
         remote_cleanup = clean_remote_round(remote_host, env_data["sha"], run_dir, sys_ops)
-        if not remote_cleanup["workers_stopped"]:
+        if not remote_cleanup.get("remote_dir_removed"):
             env_data["finish_results"] = {"remote_cleanup": remote_cleanup}
             env_file.write_text(json.dumps(env_data, indent=2), encoding="utf-8")
-            print(f"ERROR: Remote worker cleanup failed; {remote_cleanup['remote_dir']} kept.", file=sys.stderr)
+            why = "worker cleanup failed" if not remote_cleanup["workers_stopped"] else "a kept wrapper still runs it"
+            print(f"ERROR: Remote cleanup incomplete ({why}); {remote_cleanup['remote_dir']} kept.", file=sys.stderr)
             return 1
         print("[OK] Remote host cleaned.")
 
