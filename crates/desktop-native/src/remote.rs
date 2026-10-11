@@ -711,7 +711,7 @@ impl WorkbenchModel {
 		let Some(host) = self.remote.hosts.get(idx).cloned() else {
 			return;
 		};
-		if self.remote.busy {
+		if self.remote.busy || self.lifecycle.is_draining() {
 			return;
 		}
 		if path.trim().is_empty() {
@@ -727,14 +727,20 @@ impl WorkbenchModel {
 		let open_delay = self.e2e_remote_open_delay;
 		cx.notify();
 		let bg = cx.background_executor().clone();
-		let tab = self.ws_tab;
-		cx.spawn(async move |this, cx| {
-			crate::tabs::tagged(tab, async move {
+		let this = cx.weak_entity();
+		let mut async_app = cx.to_async();
+		// The open has no cancellation API. Own the whole future, including
+		// Client/Connection drop (SSH kill + wait), before a tab may close.
+		self.spawn_owned(
+			cx,
+			crate::lifecycle::JobKind::UncancellableRead,
+			None,
+			async move {
 				// Tests hold the open at the test clock so a user action can
 				// land while it is in flight.
 				#[cfg(test)]
 				if let Some(delay) = open_delay {
-					cx.background_executor().timer(delay).await;
+					async_app.background_executor().timer(delay).await;
 				}
 				let probe = host.clone();
 				let result = bg
@@ -744,7 +750,7 @@ impl WorkbenchModel {
 							.map_err(describe)
 					})
 					.await;
-				let _ = this.update(cx, |this, cx| {
+				let _ = this.update(&mut async_app, |this, cx| {
 					this.remote.busy = false;
 					if this.remote.open_seq != open_seq {
 						// The user opened a local workspace, closed the
@@ -754,6 +760,7 @@ impl WorkbenchModel {
 							"[APP:REMOTE_OPEN_STALE: seq={open_seq} now={}]",
 							this.remote.open_seq
 						);
+						this.resume_remote_restore(cx);
 						return;
 					}
 					let restore = this
@@ -789,10 +796,8 @@ impl WorkbenchModel {
 						}
 					}
 				});
-			})
-			.await
-		})
-		.detach();
+			},
+		);
 	}
 
 	/// Opens the path typed into the menu, on the host being browsed.
@@ -839,6 +844,23 @@ impl WorkbenchModel {
 			id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
 		});
 		self.attempt_restore(cx);
+	}
+
+	/// A stopped drain invalidated an in-flight restore. Its old transport
+	/// must finish before retrying; either the result or drain may land first.
+	pub(crate) fn resume_remote_restore(&mut self, cx: &mut Context<Self>) {
+		if self.remote.busy || self.lifecycle.is_draining() {
+			return;
+		}
+		let interrupted = self.remote.restoring.as_ref().is_some_and(|r| {
+			r.open_seq.is_some_and(|seq| seq != self.remote.open_seq)
+		});
+		if interrupted {
+			let r = self.remote.restoring.as_mut().unwrap();
+			r.open_seq = None;
+			app_log!("[APP:REMOTE_RETRY: attempt={}]", r.attempts + 1);
+			self.attempt_restore(cx);
+		}
 	}
 
 	fn attempt_restore(&mut self, cx: &mut Context<Self>) {
