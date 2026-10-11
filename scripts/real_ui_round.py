@@ -7,6 +7,7 @@ Subcommands:
   launch   - Start desktop app with isolated environment for gate a or b.
   resize   - Resize the round's main window (title "snip-sync", or "<tab label> — snip-sync") to logical WxH via System Events.
   point    - Compute logical window and screen coordinates from CTRL_BOUNDS probe for action.json.
+  title    - Print the exact title of the round's main window (the title oracle).
   finish   - Quit app via Cmd+Q, verify termination, restore clipboard, check config, clean up.
 """
 
@@ -20,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -40,6 +42,66 @@ def is_app_window_title(name: Any) -> bool:
     if not isinstance(name, str):
         return False
     return name == APP_WINDOW_TITLE or name.endswith(APP_WINDOW_TITLE_SEPARATOR + APP_WINDOW_TITLE)
+
+
+class MainWindowError(Exception):
+    pass
+
+
+def find_main_window(info: Dict[str, Any], pid: int) -> Dict[str, Any]:
+    """The round's main window among the windows `pid` owns.
+
+    The app also owns small helper windows (one is titled "Window"), so neither
+    the first window nor any window will do: exactly one normal-layer window
+    must carry the main title.
+    """
+    owned = [w for w in info.get("windows", []) if w.get("kCGWindowOwnerPID", pid) == pid]
+    matching = [
+        w for w in owned
+        if w.get("kCGWindowLayer", 0) == 0 and is_app_window_title(w.get("kCGWindowName"))
+    ]
+    if len(matching) == 1:
+        return matching[0]
+    titles = [w.get("kCGWindowName") for w in owned]
+    if not matching:
+        hint = ""
+        if owned and all(t is None for t in titles):
+            hint = " No window has a name: grant Screen Recording to the terminal that runs this script."
+        raise MainWindowError(
+            f"No window titled '{APP_WINDOW_TITLE}' or '<label>{APP_WINDOW_TITLE_SEPARATOR}{APP_WINDOW_TITLE}' "
+            f"for PID {pid}. Windows of this PID: {titles!r}.{hint}"
+        )
+    raise MainWindowError(f"{len(matching)} main windows for PID {pid}: {[w.get('kCGWindowName') for w in matching]!r}")
+
+
+def applescript_string(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# The script that drives a round must be the one at the tested SHA: a round
+# once ran an older checkout's copy, whose point/resize predated tab titles.
+def script_sha256() -> str:
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def check_round_script(env_data: Dict[str, Any]) -> Optional[str]:
+    """An error when this script is not the copy `prepare` ran as."""
+    want = env_data.get("round_script_sha256")
+    if want == script_sha256():
+        return None
+    return (
+        f"{Path(__file__).resolve()} is not the script this round was prepared with "
+        f"(prepared: {want or 'unknown'}). Run scripts/real_ui_round.py from a checkout at the tested SHA "
+        f"{env_data.get('sha', '?')}."
+    )
+
+
+def load_round_env(run_dir: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    env_file = run_dir / "environment.json"
+    if not env_file.is_file():
+        return None, f"environment.json not found in {run_dir}"
+    env_data = json.loads(env_file.read_text(encoding="utf-8"))
+    return env_data, check_round_script(env_data)
 
 
 # Ensure ~/.cargo/bin is on PATH if present
@@ -304,10 +366,104 @@ def is_earlier_round_desktop_process(cmd: str) -> bool:
     return any(m in cmd for m in markers)
 
 
+REMOTE_ROOT = "/home/audichuang/snip-ui-run"
+REMOTE_WRAPPER = "~/.local/bin/snip"
+
+
+def remote_run_dir(short_sha: str) -> str:
+    return f"{REMOTE_ROOT}/{short_sha[:7]}"
+
+
+def remote_backup_path(short_sha: str) -> str:
+    """The wrapper's backup name while S11 of the remote protocol runs."""
+    return f"{REMOTE_WRAPPER}.uirun-{short_sha[:7]}"
+
+
+def is_round_wrapper(content: str) -> bool:
+    return "snip-ui-run" in content or "SNIP_E2E_PASTE_HOLD" in content or "pids/$$" in content
+
+
+# Section 2.3's stop_run_workers: kill only the PIDs this round's wrapper
+# recorded whose arguments are exactly its worker command, and wait for each.
+STOP_RUN_WORKERS = r'''
+failed=0
+for record in "$W"/pids/*; do
+  [ -f "$record" ] || continue
+  pid=$(cat "$record")
+  case "$pid" in
+    ''|0*|*[!0-9]*) echo "invalid PID record: $record" >&2; failed=1; continue ;;
+  esac
+  args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+  [ -n "$args" ] || continue
+  if [ "$args" != "$W/src/target/release/snip serve --stdio" ]; then
+    echo "PID $pid arguments differ, not killed: $args" >&2; failed=1; continue
+  fi
+  kill "$pid" 2>/dev/null || true
+  deadline=$((SECONDS + 10))
+  while [ "$SECONDS" -lt "$deadline" ] && [ -n "$(ps -o args= -p "$pid" 2>/dev/null || true)" ]; do
+    sleep 0.1
+  done
+  if [ -n "$(ps -o args= -p "$pid" 2>/dev/null || true)" ]; then
+    echo "worker $pid did not exit within 10 s" >&2; failed=1
+  else
+    echo "stopped $pid"
+  fi
+done
+exit "$failed"
+'''
+
+
+def stop_run_workers_command(w_remote: str) -> str:
+    return f"W={shlex.quote(w_remote)} bash -c {shlex.quote(STOP_RUN_WORKERS)}"
+
+
+def remote_sha256(host: str, path: str, sys_ops: SystemOperations) -> str:
+    out = sys_ops.remote_exec(host, f"sha256sum {path} 2>/dev/null || true", check=False).stdout.split()
+    return out[0] if out else ""
+
+
+def clean_remote_round(host: str, sha: str, run_dir: Path, sys_ops: SystemOperations) -> Dict[str, Any]:
+    """Section 6 of the remote protocol: this round's workers, wrapper, backup and $W, nothing else."""
+    w_remote = remote_run_dir(sha)
+    backup = remote_backup_path(sha)
+    result: Dict[str, Any] = {"remote_dir": w_remote, "workers_stopped": False}
+
+    records = sys_ops.remote_exec(host, f"cat '{w_remote}'/pids/* 2>/dev/null || true", check=False).stdout
+    (run_dir / "workers-at-cleanup.txt").write_text(records, encoding="utf-8")
+    stop = sys_ops.remote_exec(host, stop_run_workers_command(w_remote), check=False)
+    result["stop_run_workers"] = {"exit": stop.returncode, "stdout": stop.stdout, "stderr": stop.stderr}
+    if stop.returncode != 0:
+        return result
+    result["workers_stopped"] = True
+
+    # S11 interrupted half way: put the wrapper back before checking it.
+    sys_ops.remote_exec(
+        host,
+        f"if [ -e {backup} ] && [ ! -e {REMOTE_WRAPPER} ] && [ ! -L {REMOTE_WRAPPER} ]; then mv {backup} {REMOTE_WRAPPER}; fi",
+        check=False,
+    )
+    installed_sha_file = run_dir / "snip-installed.sha"
+    want = installed_sha_file.read_text(encoding="utf-8").split()[0] if installed_sha_file.is_file() else ""
+    for name, path in (("wrapper", REMOTE_WRAPPER), ("backup", backup)):
+        got = remote_sha256(host, path, sys_ops)
+        if not got:
+            result[name] = "absent"
+        elif want and got == want:
+            sys_ops.remote_exec(host, f"rm -f {path}", check=False)
+            result[name] = "removed"
+        else:
+            print(f"WARNING: {host}:{path} is not the wrapper this round installed; kept.", file=sys.stderr)
+            result[name] = f"kept (sha256 {got})"
+    sys_ops.remote_exec(host, f"rm -rf '{w_remote}'", check=False)
+    result["remote_dir_removed"] = True
+    return result
+
+
 def detect_leftovers(
     run_dir: Path,
     remote_host: Optional[str] = None,
     sys_ops: SystemOperations = DEFAULT_SYS_OPS,
+    short_sha: Optional[str] = None,
 ) -> List[LeftoverItem]:
     """Identify leftover processes, files, and remote artifacts."""
     leftovers: List[LeftoverItem] = []
@@ -345,11 +501,7 @@ def detect_leftovers(
             content = sys_ops.remote_exec(
                 remote_host, "cat ~/.local/bin/snip 2>/dev/null || true", check=False
             ).stdout
-            provable = (
-                "snip-ui-run" in content
-                or "SNIP_E2E_PASTE_HOLD" in content
-                or "pids/$$" in content
-            )
+            provable = is_round_wrapper(content)
             leftovers.append(
                 LeftoverItem(
                     kind="remote-wrapper",
@@ -359,18 +511,20 @@ def detect_leftovers(
                 )
             )
 
-        # Check backup wrapper
-        check_bak = "ls ~/.local/bin/snip.uirun-* 2>/dev/null || true"
-        bak_res = sys_ops.remote_exec(remote_host, check_bak, check=False).stdout.strip()
-        if bak_res:
-            leftovers.append(
-                LeftoverItem(
-                    kind="remote-wrapper",
-                    description=f"Remote backup wrapper on {remote_host} at {bak_res}",
-                    provably_earlier_round=True,
-                    clean_target=bak_res,
+        # This SHA's backup name only: other snip.uirun-* files belong to
+        # other rounds or to the user, and are never touched.
+        if short_sha:
+            backup = remote_backup_path(short_sha)
+            if sys_ops.remote_exec(remote_host, f"[ -e {backup} ] || [ -L {backup} ]", check=False).returncode == 0:
+                content = sys_ops.remote_exec(remote_host, f"cat {backup} 2>/dev/null || true", check=False).stdout
+                leftovers.append(
+                    LeftoverItem(
+                        kind="remote-wrapper",
+                        description=f"Remote backup wrapper on {remote_host} at {backup}",
+                        provably_earlier_round=is_round_wrapper(content),
+                        clean_target=backup,
+                    )
                 )
-            )
 
     return leftovers
 
@@ -631,6 +785,17 @@ def cmd_prepare(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SY
     full_sha = subprocess.check_output(["git", "rev-parse", rev], text=True).strip()
     short_sha = full_sha[:7]
 
+    tested_script = subprocess.run(
+        ["git", "show", f"{full_sha}:scripts/real_ui_round.py"], capture_output=True
+    )
+    if tested_script.returncode != 0 or hashlib.sha256(tested_script.stdout).hexdigest() != script_sha256():
+        print(
+            f"ERROR: {Path(__file__).resolve()} differs from scripts/real_ui_round.py at {short_sha}. "
+            "Run the copy in a checkout at the tested SHA.",
+            file=sys.stderr,
+        )
+        return 1
+
     # Branch name
     try:
         branch = subprocess.check_output(
@@ -653,7 +818,7 @@ def cmd_prepare(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SY
         print(f"Remote:  {remote_host}")
 
     # 2. Check for leftovers
-    leftovers = detect_leftovers(run_dir, remote_host=remote_host, sys_ops=sys_ops)
+    leftovers = detect_leftovers(run_dir, remote_host=remote_host, sys_ops=sys_ops, short_sha=short_sha)
     if leftovers:
         if clean_leftovers:
             print("Cleaning provable earlier round leftovers...")
@@ -833,7 +998,7 @@ print(String(data: data, encoding: .utf8)!)
     # 9. Handle --remote setup if requested
     if remote_host:
         print(f"Setting up remote fixtures on {remote_host}...")
-        w_remote = f"/home/audichuang/snip-ui-run/{short_sha}"
+        w_remote = remote_run_dir(short_sha)
         # Build snip-cli for cross checks
         subprocess.run(["cargo", "build", "-p", "snip-cli", "--locked"], cwd=worktree_dir, check=True)
         # Setup local ws
@@ -906,6 +1071,7 @@ exec "{w_remote}/src/target/release/snip" "$@"
         "viewport_measured": "(to be filled by the operator)",
         "clipboard_snapshot_sha256": clip_sha,
         "remote_host": remote_host,
+        "round_script_sha256": script_sha256(),
     }
 
     errs = validate_environment_schema(env_data)
@@ -926,6 +1092,10 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     env_file = run_dir / "environment.json"
     if not env_file.is_file():
         print(f"ERROR: environment.json not found in {run_dir}", file=sys.stderr)
+        return 1
+    script_err = check_round_script(json.loads(env_file.read_text(encoding="utf-8")))
+    if script_err:
+        print(f"ERROR: {script_err}", file=sys.stderr)
         return 1
 
     env_data = json.loads(env_file.read_text(encoding="utf-8"))
@@ -996,6 +1166,10 @@ def cmd_launch(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     env_file = run_dir / "environment.json"
     if not env_file.is_file():
         print(f"ERROR: environment.json not found in {run_dir}", file=sys.stderr)
+        return 1
+    script_err = check_round_script(json.loads(env_file.read_text(encoding="utf-8")))
+    if script_err:
+        print(f"ERROR: {script_err}", file=sys.stderr)
         return 1
 
     env_data = json.loads(env_file.read_text(encoding="utf-8"))
@@ -1075,6 +1249,10 @@ def cmd_resize(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     width = int(args.width)
     height = int(args.height)
     run_dir = resolve_run_dir(args.run)
+    _, env_err = load_round_env(run_dir)
+    if env_err:
+        print(f"ERROR: {env_err}", file=sys.stderr)
+        return 1
 
     proc_file = run_dir / "app-process.json"
     if not proc_file.is_file():
@@ -1092,13 +1270,11 @@ def cmd_resize(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     # Query window info
     helper_bin = run_dir / "window-info"
     info = sys_ops.get_window_info(pid, helper_binary=helper_bin)
-    matching_windows = [w for w in info.get("windows", []) if is_app_window_title(w.get("kCGWindowName"))]
-
-    if not matching_windows:
-        print(f"ERROR: Window titled '{APP_WINDOW_TITLE}' not found for PID {pid}.", file=sys.stderr)
+    try:
+        win = find_main_window(info, pid)
+    except MainWindowError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    win = matching_windows[0]
     frame = win.get("kCGWindowBounds", {})
     scale = info.get("screens", [{}])[0].get("scale", 1.0)
 
@@ -1115,8 +1291,9 @@ def cmd_resize(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     target_win_w = width
     target_win_h = height + int(round(titlebar))
 
-    print(f"Resizing '{APP_WINDOW_TITLE}' (PID {pid}) to logical content {width}x{height} (window: {target_win_w}x{target_win_h})...")
-    script = f'tell application "System Events" to tell first application process whose unix id is {pid}\nset size of (first window whose (name is "{APP_WINDOW_TITLE}" or name ends with "{APP_WINDOW_TITLE_SEPARATOR}{APP_WINDOW_TITLE}")) to {{{target_win_w}, {target_win_h}}}\nend tell'
+    title = win["kCGWindowName"]
+    print(f"Resizing '{title}' (PID {pid}) to logical content {width}x{height} (window: {target_win_w}x{target_win_h})...")
+    script = f'tell application "System Events" to tell first application process whose unix id is {pid}\nset size of window {applescript_string(title)} to {{{target_win_w}, {target_win_h}}}\nend tell'
     sys_ops.run_applescript(script)
 
     # Bounded wait for latest VIEWPORT matching expected physical size
@@ -1153,6 +1330,10 @@ def cmd_resize(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
 def cmd_point(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_OPS) -> int:
     control_id = args.control_id
     run_dir = resolve_run_dir(args.run)
+    _, env_err = load_round_env(run_dir)
+    if env_err:
+        print(f"ERROR: {env_err}", file=sys.stderr)
+        return 1
 
     proc_file = run_dir / "app-process.json"
     if not proc_file.is_file():
@@ -1167,19 +1348,21 @@ def cmd_point(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_
         print(f"ERROR: Log file not found at {log_file}", file=sys.stderr)
         return 1
 
+    if not sys_ops.is_pid_alive(pid):
+        print(f"ERROR: Process PID {pid} is not running.", file=sys.stderr)
+        return 1
+
     lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
     bounds = parse_control_bounds_from_lines(lines, control_id)
     viewport = parse_latest_viewport(lines)
 
     helper_bin = run_dir / "window-info"
     info = sys_ops.get_window_info(pid, helper_binary=helper_bin)
-    matching_windows = [w for w in info.get("windows", []) if is_app_window_title(w.get("kCGWindowName"))]
-
-    if not matching_windows:
-        print(f"ERROR: Window titled '{APP_WINDOW_TITLE}' not found for PID {pid}.", file=sys.stderr)
+    try:
+        win = find_main_window(info, pid)
+    except MainWindowError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    win = matching_windows[0]
     frame = win["kCGWindowBounds"]
     scale = info.get("screens", [{}])[0].get("scale", 1.0)
 
@@ -1199,11 +1382,39 @@ def cmd_point(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_
     return 0
 
 
+def cmd_title(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_OPS) -> int:
+    run_dir = resolve_run_dir(args.run)
+    _, env_err = load_round_env(run_dir)
+    if env_err:
+        print(f"ERROR: {env_err}", file=sys.stderr)
+        return 1
+    proc_file = run_dir / "app-process.json"
+    if not proc_file.is_file():
+        print(f"ERROR: app-process.json not found in {run_dir}. Launch app first.", file=sys.stderr)
+        return 1
+    pid = json.loads(proc_file.read_text(encoding="utf-8"))["pid"]
+    if not sys_ops.is_pid_alive(pid):
+        print(f"ERROR: Process PID {pid} is not running.", file=sys.stderr)
+        return 1
+    info = sys_ops.get_window_info(pid, helper_binary=run_dir / "window-info")
+    try:
+        win = find_main_window(info, pid)
+    except MainWindowError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(win["kCGWindowName"])
+    return 0
+
+
 def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_OPS) -> int:
     run_dir = resolve_run_dir(args.run)
     env_file = run_dir / "environment.json"
     if not env_file.is_file():
         print(f"ERROR: environment.json not found in {run_dir}", file=sys.stderr)
+        return 1
+    script_err = check_round_script(json.loads(env_file.read_text(encoding="utf-8")))
+    if script_err:
+        print(f"ERROR: {script_err}", file=sys.stderr)
         return 1
 
     env_data = json.loads(env_file.read_text(encoding="utf-8"))
@@ -1304,19 +1515,17 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
         print(f"Removing detached worktree at {worktree_path}...")
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree_path)], check=False)
 
-    # 7. Clean remote host if applicable
+    # 7. Clean remote host if applicable: only what this round put there
     remote_host = env_data.get("remote_host")
+    remote_cleanup: Optional[Dict[str, Any]] = None
     if remote_host:
         print(f"Cleaning remote host {remote_host}...")
-        w_remote = f"/home/audichuang/snip-ui-run/{env_data['sha'][:7]}"
-        installed_sha_file = run_dir / "snip-installed.sha"
-        want_sha = installed_sha_file.read_text(encoding="utf-8").split()[0] if installed_sha_file.is_file() else ""
-        got_sha = sys_ops.remote_exec(remote_host, "sha256sum ~/.local/bin/snip 2>/dev/null || true", check=False).stdout.split()
-        got_sha = got_sha[0] if got_sha else ""
-
-        if want_sha and got_sha == want_sha:
-            sys_ops.remote_exec(remote_host, "rm -f ~/.local/bin/snip", check=False)
-        sys_ops.remote_exec(remote_host, f"rm -rf '{w_remote}' ~/.local/bin/snip.uirun-*", check=False)
+        remote_cleanup = clean_remote_round(remote_host, env_data["sha"], run_dir, sys_ops)
+        if not remote_cleanup["workers_stopped"]:
+            env_data["finish_results"] = {"remote_cleanup": remote_cleanup}
+            env_file.write_text(json.dumps(env_data, indent=2), encoding="utf-8")
+            print(f"ERROR: Remote worker cleanup failed; {remote_cleanup['remote_dir']} kept.", file=sys.stderr)
+            return 1
         print("[OK] Remote host cleaned.")
 
     # 8. Record finish results in environment.json
@@ -1327,6 +1536,7 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
         "clipboard_restored": clipboard_restored,
         "real_config_verified": True,
         "worktree_removed": True,
+        "remote_cleanup": remote_cleanup,
     }
     env_file.write_text(json.dumps(env_data, indent=2), encoding="utf-8")
     print(f"\n[OK] Round teardown completed. Results written to {env_file}.")
@@ -1379,6 +1589,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also move the pointer to the control's centre and stay there (tooltips); never clicks",
     )
 
+    # title
+    p_title = subparsers.add_parser("title", help="Print the exact title of the round's main window")
+    p_title.add_argument("--run", help="Run directory path")
+
     # finish
     p_finish = subparsers.add_parser("finish", help="Tear down the round and verify cleanliness")
     p_finish.add_argument("--run", help="Run directory path")
@@ -1405,6 +1619,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_resize(args)
     elif args.subcommand == "point":
         return cmd_point(args)
+    elif args.subcommand == "title":
+        return cmd_title(args)
     elif args.subcommand == "finish":
         return cmd_finish(args)
     else:

@@ -574,14 +574,21 @@ if [ -n "$got" ] && [ "$got" = "$want" ]; then
 else
   echo "~/.local/bin/snip 已非本輪安裝的 wrapper，保留不刪" >&2
 fi
-ssh ubuntu "rm -f ~/.local/bin/snip.uirun-$SHA"
+got=$(ssh ubuntu "sha256sum ~/.local/bin/snip.uirun-$SHA 2>/dev/null" | cut -d' ' -f1)
+if [ -n "$got" ] && [ "$got" = "$want" ]; then
+  ssh ubuntu "rm -f ~/.local/bin/snip.uirun-$SHA"
+elif [ -n "$got" ]; then
+  echo "~/.local/bin/snip.uirun-$SHA 不是本輪的 wrapper，保留不刪" >&2
+fi
 
 # 4) 本輪目錄。
 ssh ubuntu "rm -rf '$W'"
 ```
 
 只刪 `$W`（含 `pids/` 與 `paste-hold`）、本輪放的 `~/.local/bin/snip`
-wrapper（hash 一致才刪）與本輪備份名 `~/.local/bin/snip.uirun-$SHA`。
+wrapper 與本輪備份名 `~/.local/bin/snip.uirun-$SHA`（兩者都要 hash 一致才刪）。
+`real_ui_round.py finish` 對 `prepare --remote` 的回合照同樣的順序做這一節，
+`stop_run_workers` 失敗就停下、保留 `$W`，並以非 0 結束。
 `snip.away` 或使用者自己的任何備份、`~/research/rtk`、linuxbrew 的
 `snip`、`snip-worker.service`、`~/.ssh/config` 都不動。Mac 上的
 `$RUN` 保留，裡面是證據。
