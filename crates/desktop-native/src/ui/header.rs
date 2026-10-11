@@ -4,6 +4,9 @@ use super::*;
 
 /// Window space above the workspace menu (header and button) plus a margin.
 const WORKSPACE_MENU_TOP: f32 = 80.;
+/// A recent workspace row: its name over its path.
+const RECENT_ROW_H: f32 = 38.;
+
 impl WorkbenchModel {
 	// ───────────────────────── header ─────────────────────────
 
@@ -50,7 +53,8 @@ impl WorkbenchModel {
 					70 + ix as isize,
 				)
 				.debug_selector(move || format!("workspace-recent:{ix}"))
-				.h(px(38.))
+				.h(px(RECENT_ROW_H))
+				.flex_shrink_0()
 				// The row clips a long path; hover shows all of it.
 				.tooltip(tip(path.display().to_string()))
 				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
@@ -97,7 +101,8 @@ impl WorkbenchModel {
 			let selector = id.clone();
 			menu_row(SharedString::from(id.clone()), 87)
 				.debug_selector(move || selector)
-				.h(px(38.))
+				.h(px(RECENT_ROW_H))
+				.flex_shrink_0()
 				.tooltip(tip(format!("{}:{}", r.host, r.path)))
 				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
 				.on_click(cx.listener(move |this, _, _, cx| {
@@ -126,6 +131,7 @@ impl WorkbenchModel {
 		}));
 		let sep = || {
 			div()
+				.flex_shrink_0()
 				.h(px(1.))
 				.mx(px(8.))
 				.my(px(4.))
@@ -134,6 +140,9 @@ impl WorkbenchModel {
 		// The menu sits under the header; past the window's height it
 		// scrolls instead of running off screen.
 		let max_h = (self.viewport_h - WORKSPACE_MENU_TOP).max(200.);
+		// A long recent list scrolls on its own and gives way, down to two
+		// rows, so a browsed host's folder list keeps its room (#147).
+		let recent_min_h = recent.len().min(2) as f32 * RECENT_ROW_H;
 		let panel = div()
 			.id("workspace-menu")
 			.debug_selector(|| "workspace-menu".into())
@@ -236,7 +245,16 @@ impl WorkbenchModel {
 							.text_color(rgb(pal().text_muted))
 							.child(t("workspace_recent", loc)),
 					)
-					.children(recent)
+					.child(
+						div()
+							.id("workspace-recents")
+							.debug_selector(|| "workspace-recents".into())
+							.flex()
+							.flex_col()
+							.min_h(px(recent_min_h))
+							.overflow_y_scroll()
+							.children(recent),
+					)
 			})
 			.child(sep())
 			.children(self.render_remote_section(cx))

@@ -4209,20 +4209,17 @@ fn commit_replay_apply_leaves_a_not_copied_target_alone() {
 }
 
 #[test]
-fn commit_replay_apply_waits_for_the_worktree_lock() {
+fn commit_replay_apply_is_refused_while_the_worktree_lock_is_held() {
 	use snip_core::commits::{
 		CommitFile, CommitRecord, CommitsPayload, FileChange,
 	};
 	use snip_core::gitrun::RunOptions;
-	use snip_core::gitsrc::Git;
+	use snip_core::gitsrc::{Git, GitError};
 	use snip_core::workspace::{lock_heavy, RepoIdentity};
-	use std::sync::mpsc;
-	use std::time::Duration;
 
 	let repo = TestRepo::new("worktree-lock");
 	repo.write("base.txt", "base\n");
 	let head_before = repo.commit("base");
-	let count_before = repo.git(&["rev-list", "--count", "HEAD"]);
 	let index_before = repo.git(&["ls-files", "-s"]);
 
 	let payload = CommitsPayload {
@@ -4231,62 +4228,461 @@ fn commit_replay_apply_waits_for_the_worktree_lock() {
 			author_name: "Author".into(),
 			author_email: "author@example.invalid".into(),
 			author_date: "2026-09-25T12:00:00+00:00".into(),
-			files: vec![
-				CommitFile {
-					path: "base.txt".into(),
-					old_path: None,
-					change: FileChange::Modified,
-					content: Some("incoming base\n".into()),
-					not_copied: None,
-				},
-				CommitFile {
-					path: "new.txt".into(),
-					old_path: None,
-					change: FileChange::Added,
-					content: Some("new content\n".into()),
-					not_copied: None,
-				},
-			],
+			files: vec![CommitFile {
+				path: "new.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("new content\n".into()),
+				not_copied: None,
+			}],
 		}],
 	};
 	let preview = CommitReplayPreview::capture(repo.path(), &payload).unwrap();
 
 	let git = Git::open(repo.path()).unwrap();
 	let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
-	let guard = lock_heavy(&id, &RunOptions::default()).unwrap();
+	let guard = lock_heavy(&id).unwrap();
 
-	let opts = RunOptions {
-		queue_timeout: Duration::from_secs(30),
-		..RunOptions::default()
-	};
-
-	let (tx, rx) = mpsc::channel();
-	let res = std::thread::scope(|s| {
-		s.spawn(|| {
-			let res = preview.apply_with(&opts);
-			let _ = tx.send(res);
-		});
-
-		std::thread::sleep(Duration::from_millis(300));
-		assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
-
-		repo.write("base.txt", "modified base\n");
-
-		drop(guard);
-
-		rx.recv_timeout(Duration::from_secs(30))
-			.expect("apply_with did not return after worktree lock released")
-	});
-
+	// Refused at once, not queued: nothing was written.
+	let res = preview.apply();
 	assert!(
-		matches!(res, Err(TransferError::StaleDestination { .. })),
-		"expected StaleDestination, got {res:?}"
+		matches!(res, Err(TransferError::Git(GitError::WorktreeBusy { .. }))),
+		"{res:?}"
 	);
 	assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
-	assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), count_before);
 	assert_eq!(repo.git(&["ls-files", "-s"]), index_before);
-	assert_eq!(repo.read("base.txt"), "modified base\n");
 	assert!(!repo.exists("new.txt"));
+
+	drop(guard);
+	let res = preview.apply().unwrap();
+	assert!(res.failure.is_none(), "{:?}", res.failure);
+	assert_eq!(res.created.len(), 1);
+	assert_eq!(repo.read("new.txt"), "new content\n");
+}
+
+#[test]
+fn file_paste_apply_is_refused_while_the_worktree_lock_is_held() {
+	use snip_core::gitrun::RunOptions;
+	use snip_core::gitsrc::{Git, GitError};
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	let dst = TestRepo::new("paste-lock");
+	dst.write("keep.txt", "keep\n");
+	dst.commit("base");
+	let clipboard_text = "\
+// file: pkg/new.txt
+new content
+";
+	let mut mapping = ImportMapping::new();
+	mapping.map_prefix("pkg", dst.canonical_id());
+	let import_plan = plan_import(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		&[dst.path().to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+
+	let git = Git::open(dst.path()).unwrap();
+	let id = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
+	let guard = lock_heavy(&id).unwrap();
+	let res = import_plan.apply(&RestoreSelection::default());
+	assert!(
+		matches!(res, Err(TransferError::Git(GitError::WorktreeBusy { .. }))),
+		"{res:?}"
+	);
+	assert!(!dst.exists("new.txt"));
+
+	drop(guard);
+	let res = import_plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	assert_eq!(dst.read("new.txt"), "new content");
+}
+
+#[test]
+fn file_paste_into_a_plain_folder_takes_no_lock() {
+	let dst = tempfile::tempdir().unwrap();
+	let root = dunce::canonicalize(dst.path()).unwrap();
+	let clipboard_text = "\
+// file: pkg/new.txt
+plain
+";
+	let mut mapping = ImportMapping::new();
+	mapping.map_prefix("pkg", CanonicalRootId::new(&root).unwrap());
+	let import_plan = plan_import(
+		clipboard_text,
+		"// file: $FILE_PATH",
+		std::slice::from_ref(&root),
+		&mapping,
+	)
+	.unwrap();
+	let res = import_plan.apply(&RestoreSelection::default()).unwrap();
+	assert_eq!(res.created_count, 1);
+	let names: Vec<_> = std::fs::read_dir(&root)
+		.unwrap()
+		.map(|e| e.unwrap().file_name())
+		.collect();
+	assert_eq!(names, ["new.txt"], "no lock file in a plain folder");
+}
+
+fn nested_destination(parent_is_repo: bool) -> TestRepo {
+	let child = TestRepo::new("parent/child");
+	if parent_is_repo {
+		let out = Command::new("git")
+			.args(["init", "-q", "-b", "main"])
+			.arg(child.path().parent().unwrap())
+			.output()
+			.unwrap();
+		assert!(out.status.success(), "{:?}", out);
+	}
+	child
+}
+
+fn assert_file_paste_respects_nested_repo_lock(
+	child: &TestRepo,
+	parent: &Path,
+	delete_only: bool,
+) {
+	use snip_core::gitsrc::GitError;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	child.write("keep.txt", "original\n");
+	child.write("delete.txt", "keep until applied\n");
+	child.write("existing/stable.txt", "unchanged\n");
+	let head_before = child.commit("base");
+	let index_before = child.git(&["ls-files", "-s"]);
+	let mapping =
+		ImportMapping::with_primary(CanonicalRootId::new(parent).unwrap());
+	let text = if delete_only {
+		"// file: outside.txt\nouter content\n\
+// file: [DELETED] child/delete.txt\n"
+	} else {
+		"// file: outside.txt\nouter content\n\
+// file: child/new/deep.txt\nnew content\n\
+// file: child/existing/another.txt\nanother\n\
+// file: child/keep.txt\nreplacement\n\
+// file: [DELETED] child/delete.txt\n"
+	};
+	let plan = plan_import(
+		text,
+		"// file: $FILE_PATH",
+		&[parent.to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+	let selection = RestoreSelection {
+		overwrite_existing: true,
+		..Default::default()
+	};
+	let id =
+		RepoIdentity::resolve(&child.open(), &RunOptions::default()).unwrap();
+	let held = lock_heavy(&id).unwrap();
+	let result = plan.apply(&selection);
+	assert!(
+		matches!(
+			result,
+			Err(TransferError::Git(GitError::WorktreeBusy { .. }))
+		),
+		"{result:?}"
+	);
+	assert!(!parent.join("outside.txt").exists());
+	assert!(!child.exists("new"));
+	assert!(!child.exists("existing/another.txt"));
+	assert_eq!(child.read("keep.txt"), "original\n");
+	assert_eq!(child.read("delete.txt"), "keep until applied\n");
+	assert_eq!(child.git(&["rev-parse", "HEAD"]), head_before);
+	assert_eq!(child.git(&["ls-files", "-s"]), index_before);
+
+	drop(held);
+	let result = plan.apply(&selection).unwrap();
+	assert!(result.errors.is_empty(), "{:?}", result.errors);
+	assert_eq!(result.created_count, if delete_only { 1 } else { 3 });
+	assert_eq!(result.overwritten_count, usize::from(!delete_only));
+	assert_eq!(result.deleted_count, 1);
+	assert_eq!(
+		fs::read_to_string(parent.join("outside.txt")).unwrap(),
+		"outer content"
+	);
+	if !delete_only {
+		assert_eq!(child.read("new/deep.txt"), "new content");
+		assert_eq!(child.read("existing/another.txt"), "another");
+		assert_eq!(child.read("keep.txt"), "replacement");
+	}
+	assert!(!child.exists("delete.txt"));
+}
+
+#[test]
+fn file_paste_from_plain_parent_respects_nested_repo_lock() {
+	let child = nested_destination(false);
+	assert_file_paste_respects_nested_repo_lock(
+		&child,
+		child.path().parent().unwrap(),
+		false,
+	);
+}
+
+#[test]
+fn file_paste_from_repository_parent_respects_nested_repo_lock() {
+	let child = nested_destination(true);
+	assert_file_paste_respects_nested_repo_lock(
+		&child,
+		child.path().parent().unwrap(),
+		false,
+	);
+}
+
+#[test]
+fn file_paste_deletion_respects_nested_repo_lock() {
+	for parent_is_repo in [false, true] {
+		let child = nested_destination(parent_is_repo);
+		assert_file_paste_respects_nested_repo_lock(
+			&child,
+			child.path().parent().unwrap(),
+			true,
+		);
+	}
+}
+
+#[cfg(unix)]
+#[test]
+fn file_paste_from_symlinked_parent_respects_nested_repo_lock() {
+	for parent_is_repo in [false, true] {
+		let child = nested_destination(parent_is_repo);
+		let alias_dir = tempfile::tempdir().unwrap();
+		let alias = alias_dir.path().join("parent-link");
+		std::os::unix::fs::symlink(child.path().parent().unwrap(), &alias)
+			.unwrap();
+		assert_file_paste_respects_nested_repo_lock(&child, &alias, false);
+	}
+}
+
+#[test]
+fn file_paste_from_case_alias_respects_nested_repo_lock() {
+	let child = nested_destination(true);
+	let parent = child.path().parent().unwrap();
+	let alias = parent.with_file_name("PARENT");
+	// On a case-sensitive filesystem the exact spelling remains the root.
+	let root = if alias.is_dir() {
+		alias.as_path()
+	} else {
+		parent
+	};
+	assert_file_paste_respects_nested_repo_lock(&child, root, false);
+}
+
+fn assert_parent_paste_respects_nested_gitfile(parent: &Path, child: &Path) {
+	use snip_core::gitsrc::GitError;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	assert!(child.join(".git").is_file());
+	let mapping =
+		ImportMapping::with_primary(CanonicalRootId::new(parent).unwrap());
+	let plan = plan_import(
+		"// file: outside.txt\nouter\n// file: child/deep/new.txt\ninner\n",
+		"// file: $FILE_PATH",
+		&[parent.to_path_buf()],
+		&mapping,
+	)
+	.unwrap();
+	let id = RepoIdentity::resolve(
+		&Git::open(child).unwrap(),
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let held = lock_heavy(&id).unwrap();
+	let result = plan.apply(&RestoreSelection::default());
+	assert!(
+		matches!(
+			result,
+			Err(TransferError::Git(GitError::WorktreeBusy { .. }))
+		),
+		"{result:?}"
+	);
+	assert!(!parent.join("outside.txt").exists());
+	assert!(!child.join("deep").exists());
+	drop(held);
+	let result = plan.apply(&RestoreSelection::default()).unwrap();
+	assert!(result.errors.is_empty(), "{:?}", result.errors);
+	assert_eq!(result.created_count, 2);
+	assert_eq!(
+		fs::read_to_string(child.join("deep/new.txt")).unwrap(),
+		"inner"
+	);
+}
+
+#[test]
+fn file_paste_from_parent_respects_nested_worktree_lock() {
+	let source = TestRepo::new("source");
+	source.write("base.txt", "base\n");
+	source.commit("base");
+	let parent = source.path().parent().unwrap().join("workspace");
+	fs::create_dir(&parent).unwrap();
+	let child = parent.join("child");
+	source.git(&[
+		"worktree",
+		"add",
+		"--detach",
+		child.to_str().unwrap(),
+		"HEAD",
+	]);
+	assert_parent_paste_respects_nested_gitfile(&parent, &child);
+}
+
+#[test]
+fn file_paste_from_parent_respects_nested_submodule_lock() {
+	let source = TestRepo::new("source");
+	source.write("base.txt", "base\n");
+	source.commit("base");
+	let parent = TestRepo::new("workspace");
+	parent.git(&[
+		"-c",
+		"protocol.file.allow=always",
+		"submodule",
+		"add",
+		"-q",
+		source.path().to_str().unwrap(),
+		"child",
+	]);
+	parent.commit("add submodule");
+	assert_parent_paste_respects_nested_gitfile(
+		parent.path(),
+		&parent.path().join("child"),
+	);
+}
+
+fn assert_commit_replay_respects_nested_repo_lock(
+	only_change: Option<snip_core::commits::FileChange>,
+) {
+	use snip_core::commits::{
+		CommitFile, CommitRecord, CommitsPayload, FileChange,
+	};
+	use snip_core::gitsrc::GitError;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	// The parent already tracks these files before the child becomes a repo.
+	let parent = TestRepo::new("parent");
+	parent.write("child/keep.txt", "original\n");
+	parent.write("child/delete.txt", "keep until applied\n");
+	parent.write("child/old.txt", "rename me\n");
+	let head_before = parent.commit("base");
+	let child = parent.path().join("child");
+	let out = Command::new("git")
+		.args(["init", "-q", "-b", "main"])
+		.arg(&child)
+		.output()
+		.unwrap();
+	assert!(out.status.success(), "{:?}", out);
+	let index_before = parent.git(&["ls-files", "-s"]);
+	let mut payload = CommitsPayload {
+		commits: vec![CommitRecord {
+			message: "write and delete nested files\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-25T12:00:00+00:00".into(),
+			files: vec![
+				CommitFile {
+					path: "outside.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("outer content\n".into()),
+					not_copied: None,
+				},
+				CommitFile {
+					path: "child/new/deep.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("new content\n".into()),
+					not_copied: None,
+				},
+				CommitFile {
+					path: "child/keep.txt".into(),
+					old_path: None,
+					change: FileChange::Modified,
+					content: Some("replacement\n".into()),
+					not_copied: None,
+				},
+				CommitFile {
+					path: "child/delete.txt".into(),
+					old_path: None,
+					change: FileChange::Deleted,
+					content: None,
+					not_copied: None,
+				},
+				CommitFile {
+					path: "moved.txt".into(),
+					old_path: Some("child/old.txt".into()),
+					change: FileChange::Renamed,
+					content: Some("rename me\n".into()),
+					not_copied: None,
+				},
+			],
+		}],
+	};
+	if let Some(change) = only_change {
+		payload.commits[0]
+			.files
+			.retain(|file| file.path == "outside.txt" || file.change == change);
+	}
+	let preview =
+		CommitReplayPreview::capture(parent.path(), &payload).unwrap();
+	let id = RepoIdentity::resolve(
+		&Git::open(&child).unwrap(),
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let held = lock_heavy(&id).unwrap();
+	let result = preview.apply();
+	assert!(
+		matches!(
+			result,
+			Err(TransferError::Git(GitError::WorktreeBusy { .. }))
+		),
+		"{result:?}"
+	);
+	assert!(!parent.exists("outside.txt"));
+	assert!(!parent.exists("child/new"));
+	assert!(!parent.exists("moved.txt"));
+	assert_eq!(parent.read("child/keep.txt"), "original\n");
+	assert_eq!(parent.read("child/delete.txt"), "keep until applied\n");
+	assert_eq!(parent.read("child/old.txt"), "rename me\n");
+	assert_eq!(parent.git(&["rev-parse", "HEAD"]), head_before);
+	assert_eq!(parent.git(&["ls-files", "-s"]), index_before);
+
+	drop(held);
+	let result = preview.apply().unwrap();
+	assert!(result.failure.is_none(), "{:?}", result.failure);
+	assert_eq!(result.created.len(), 1);
+	assert_eq!(parent.read("outside.txt"), "outer content\n");
+	if only_change.is_none() {
+		assert_eq!(parent.read("child/new/deep.txt"), "new content\n");
+		assert_eq!(parent.read("child/keep.txt"), "replacement\n");
+	}
+	if only_change != Some(FileChange::Deleted) {
+		assert_eq!(parent.read("moved.txt"), "rename me\n");
+		assert!(!parent.exists("child/old.txt"));
+	}
+	if only_change != Some(FileChange::Renamed) {
+		assert!(!parent.exists("child/delete.txt"));
+	}
+}
+
+#[test]
+fn commit_replay_from_parent_respects_nested_repo_lock() {
+	assert_commit_replay_respects_nested_repo_lock(None);
+}
+
+#[test]
+fn commit_replay_deletion_respects_nested_repo_lock() {
+	assert_commit_replay_respects_nested_repo_lock(Some(
+		snip_core::commits::FileChange::Deleted,
+	));
+}
+
+#[test]
+fn commit_replay_rename_old_path_respects_nested_repo_lock() {
+	assert_commit_replay_respects_nested_repo_lock(Some(
+		snip_core::commits::FileChange::Renamed,
+	));
 }
 
 // ---------------------------------------------------------------------------

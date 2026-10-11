@@ -62,8 +62,13 @@ python3 scripts/real_ui_round.py prepare --sha <SHA> --run "$RUN"   # 殘留檢�
 python3 scripts/real_ui_round.py launch --gate b --run "$RUN"       # 帶隔離環境變數啟動，日誌寫進 $RUN/app-gate-b.log
 python3 scripts/real_ui_round.py resize 900 600 --run "$RUN"        # 依程序與視窗標題縮放，等到 VIEWPORT 相符；不符就失敗
 python3 scripts/real_ui_round.py point <控制項 ID> --run "$RUN"      # 第 3 節第 1–4 步：最新 CTRL_BOUNDS、換算螢幕點、action.json 草稿
+python3 scripts/real_ui_round.py title --run "$RUN"                 # 主視窗的完整標題（標題 oracle）
 python3 scripts/real_ui_round.py finish --run "$RUN"                # Cmd+Q、exit code、殘留、剪貼簿還原、真實設定比對（I-config）、移除 worktree
 ```
+
+腳本要用受測 SHA 那一份：在受測 SHA 的乾淨 checkout 裡執行。`prepare` 發現自己和 `git show <SHA>:scripts/real_ui_round.py` 不同就拒絕開跑；`launch`、`resize`、`point`、`title` 發現自己不是 `prepare` 時那一份也拒絕，這時改用 `$RUN/worktree/scripts/real_ui_round.py`（就是受測 SHA 那一份）。`finish` 只警告、照樣收尾，免得 App、剪貼簿與 worktree 留著；它會移除 `$RUN/worktree`。曾經有一輪用了另一個 checkout 裡較舊的腳本，它的 `point`／`resize` 還不認得帶分頁標籤的標題，整輪都要手動補座標。
+
+視窗標題：主視窗的標題是 `snip-sync`；開了工作區分頁後，標題會變成 `<目前分頁的標籤> — snip-sync`（中間是 em dash）。腳本在 App 的 PID 擁有的視窗裡，找恰好一個標題「等於 `snip-sync` 或以 ` — snip-sync` 結尾」的視窗（見 `find_main_window`）。App 還有一個標題是 `Window` 的小輔助視窗，所以 System Events 的 `first window` 不一定是主視窗，不能拿來讀標題或點關閉鈕；標題用 `title` 讀。
 
 `prepare` 發現殘留時拒絕開跑並列出來；`--clean-leftovers` 只清能證明屬於先前回合的東西。腳本做不到的步驟照下面的手動流程做，並在證據裡寫明。下面的手動流程也是腳本的規格。
 
@@ -83,7 +88,7 @@ shasum -a 256 target/debug/snip-desktop-native
 
 後面的命令都用這個 `$RUN`。`export-hold` 先不要建立；檔案不存在時，複製不會停住。
 
-`$RUN/config` 是這一輪的設定資料夾。`ls -A` 必須沒有輸出；不是空的就換一個新的 `$RUN`。每一次啟動都帶 `SNIP_CONFIG_DIR="$RUN/config"`，最近開啟的工作區與遠端紀錄只寫進這裡。空資料夾也代表設定全是預設值。少了這個變數，E2E 模式下最近開啟的工作區不會存（`recent::config_dir` 回傳空），B-nav 的 `workspace-recent:` 會缺。
+`$RUN/config` 是這一輪的設定資料夾。`ls -A` 必須沒有輸出；不是空的就換一個新的 `$RUN`。每一次啟動都帶 `SNIP_CONFIG_DIR="$RUN/config"`，最近開啟的工作區與開啟中的分頁（`open-tabs.json`）只寫進這裡。空資料夾也代表設定全是預設值。少了這個變數，E2E 模式下最近開啟的工作區不會存（`recent::config_dir` 回傳空），B-nav 的 `workspace-recent:` 會缺。
 
 3. 殘留檢查。第一次啟動前做一次，之後每一次啟動前再做一次：
 
@@ -127,7 +132,7 @@ python3 scripts/collaboration_fixture.py verify --fixture "$RUN/gate-a"
 6. 讀受測 SHA 的 `crates/desktop-native/src/paste.rs` 的 `control_id`，把格式 `paste-<row|include|overwrite>:<ix>:<path>` 抄進 `environment.json`。`ix` 是計畫內的項目索引，從 `CTRL_BOUNDS` 讀，不要自己算。若受測 SHA 的格式仍是只有路徑（`paste-row:<path>`），代表缺 #56。第 1 節只擋缺 `f5247ab`，缺 #56 時不擋：T03、T18 不適用，證據欄寫「缺 #56」，閘門打開；其餘格子的 ID 改照該 SHA 印出的格式。
 7. 啟動 App。探針只有在 `SNIP_NATIVE_E2E=1` 時才會印。`SNIP_NATIVE_E2E_EXPORT_HOLD_FILE` 在 `WorkbenchModel::new` 讀一次，所以必須寫在啟動命令裡。`SNIP_CONFIG_DIR` 寫在每一行啟動命令前面，不靠 shell 裡的 export。不要加 `--restore-dir`，貼上目的地由畫面決定。每一次啟動的 stdout 與 stderr 寫進該次自己的日誌，否則讀不到 `CTRL_BOUNDS`。
 
-同一時間只開一個 App。閘門 A 與閘門 B 各啟動一次，各寫一份日誌。先做哪一個都可以。換下一個之前，對目前這個按 Cmd+Q，等到 exit code 0，再啟動。第二次若用 `>` 寫進第一次的檔，會把 `CTRL_BOUNDS` 與 `PASTE_DONE` 截掉。
+同一時間只開一個 App。閘門 A 與閘門 B 各啟動一次，各寫一份日誌。先做哪一個都可以。換下一個之前，對目前這個按 Cmd+Q，等到 exit code 0，再 `rm -f "$RUN/config/open-tabs.json"`，然後啟動：兩個閘門共用 `$RUN/config`，不刪的話第二次啟動會先恢復第一個閘門的分頁，分頁 id 與數量都會跟著位移。第二次若用 `>` 寫進第一次的檔，會把 `CTRL_BOUNDS` 與 `PASTE_DONE` 截掉。
 
 同一個 shell 裡，下面三個 export 做一次即可。新開 shell 要再 export。
 
@@ -383,7 +388,7 @@ C1 的 message 是 `多行中文`、空行、`第二段`。C2 改 `common.txt`�
 
 預設單檔上限是 500 KiB（`Settings::max_file_size_kb`）。`large.txt` 是 1,360,000 byte，複製時應被略過。
 
-目的地就是目前選取的 repo（`current_restore_destination`：有選 repo 取它的 root，沒有 repo 取工作區根目錄）。`commits-dst-*`、`nonutf8-dst` 各自用 `btn-workspace-menu` → `btn-open-workspace`，輸入路徑後按 `btn-workspace-open-confirm` 開啟，等 `[APP:WORKSPACE: state=open path=<該路徑> ...]` 與 `[APP:READY_REPOS: 1]`。`repo04` 是開 `ws-dst` 後點 `pick-repo:repo04`。`nongit-dst` 開啟後 `READY_REPOS` 是 0，目的地是工作區根目錄。`PASTE_PREVIEW` 的 `dest=` 必須等於這個路徑。
+目的地就是目前選取的 repo（`current_restore_destination`：有選 repo 取它的 root，沒有 repo 取工作區根目錄）。`commits-dst-*`、`nonutf8-dst` 各自用 `btn-workspace-menu` → `btn-open-workspace`，輸入路徑後按 `btn-workspace-open-confirm` 開啟（每個工作區開在自己的工作區分頁，已經開著就切過去；貼上作用在目前的分頁），等 `[APP:WORKSPACE: state=open path=<該路徑> ...]` 與 `[APP:READY_REPOS: 1]`。`repo04` 是開 `ws-dst` 後點 `pick-repo:repo04`。`nongit-dst` 開啟後 `READY_REPOS` 是 0，目的地是工作區根目錄。`PASTE_PREVIEW` 的 `dest=` 必須等於這個路徑。
 
 複製 commit 的來源是先開 `commits-src`（或該格指定的來源）工作區，`rail-log`，選 commit，`btn-copy-commits`，等 `COPY_COMMITS_DONE`，再換工作區貼上。
 
@@ -433,7 +438,7 @@ T19 即使通過，也不清除 T18。目的端一開始沒有 `common.txt` 時�
 | T36 | `perf15`、全部 repo。1080×752、1080×720、900×600 三種尺寸，各分 hash 欄關（預設）與開（`btn-log-more` → `log-more:hash`，日誌 `[APP:LOG_VIEW: hash]`）兩種，各看前 50 列。先從任一 `commit-row:` 的 `w÷scale` 抄下列表寬，1080 應約 574、900 應約 433；偏差超過 10px 時寫下實際值並說明側欄狀態 | 每列的 subject 至少有 1 個可辨識字元；被截斷時結尾是省略號，hover 可看到完整 subject（點擊工具沒有單純 hover 時，用 `real_ui_round.py point <commit-row ID> --hover 2` 把游標移到列中央停留，不點擊，再截圖）。只有右側詳情有 message、列上是空白，就是 `fail`。各狀態的預期：1080、hash 關：ref 標籤未被捨棄（寬度 ≥ min(自然寬度, 80)，短的 ref 如 `main` 會比 80px 窄）、subject 至少 160px，兩者同時可見；1080、hash 開：graph 欄寬超過 64px 時標籤被捨棄；64px 以下時標籤保留，寬度為 min(自然寬度, 80)（欄寬本身上限 72px），兩種都算對，subject 至少 160px；900、hash 關：標籤依設計一律捨棄（與 graph 欄寬無關，#59 的 `a_narrow_list_squeezes_date_then_author_after_the_gutter` 也是 `labels == 0`），subject 至少 160px；900、hash 開：graph 欄寬 72px 時 subject 約 97px（#59 已記錄的下限），欄較窄時會更寬（例如 40px 欄約 129px），數值不當作判準，只要有可辨識前綴就算 `pass`，空白是 `fail`。graph 欄與 subject 儲存格、ref 標籤都沒有 probe（`log-gutter:` 只是 debug selector，不進 `CTRL_BOUNDS`），所以寬度只能從截圖量：graph 欄寬是列的左緣到 subject 文字起點的距離，再減 8px 間距。`collapse:<key>` 的位置是節點所在車道，不是欄的右緣，不能拿來算欄寬。graph 欄寬、subject 寬度與標籤有無量測後寫進 `screen_text`。文字 oracle 見第 4 節 |
 | T37 | `btn-repo-selector` 實際切換 100 次，涵蓋 15 個 repo（`pick-repo:<名稱>`，名稱從 `CTRL_BOUNDS` 讀） | 100 次都有新的選取日誌；最後停在指定的 repo；程序還在。耗時含觀察，不當回應時間 |
 | T38 | 沿用 [memory-measurement-protocol.md](memory-measurement-protocol.md) 的取樣時才記 RSS | 本規程不判記憶體。這格固定 `not-run`，原因寫「改走記憶體規程」 |
-| T39 | Cmd+Shift+W 關掉，再 Cmd+Shift+O 打開一個 repo | 關閉後出現 `[APP:WORKSPACE: state=closed generation=N]`；重開後出現 `[APP:WORKSPACE: state=open path=<該 repo> generation=N+1]`，接著 `[APP:READY_REPOS: 1]`；前後剪貼簿 SHA-256 相同 |
+| T39 | Cmd+Shift+W 關掉，再 Cmd+Shift+O 打開一個 repo | 關閉後出現 `[APP:WORKSPACE: state=closed generation=N]` 與 `[APP:WS_TAB_CLOSED: id=<id> count=0]`，視窗只剩分頁列的「+」；Cmd+Shift+O 先開一個空的工作區分頁（`WS_TAB_OPENED`、`WS_TAB_ACTIVE`）再開資料夾對話框；重開後出現 `[APP:WORKSPACE: state=open path=<該 repo> generation=M]`（M 是新分頁自己的計數，不和 N 比），接著 `[APP:READY_REPOS: 1]`；前後剪貼簿 SHA-256 相同 |
 | T40 | Cmd+Q | 程序消失，exit code 0；這輪出現過的 git 子程序都不在 |
 
 T03 與 T18 的身份規則：`action.json` 要寫兩欄，尾段路徑相同的相異 ID 數，以及畫面上同路徑的列數。相異 ID 數要等於列數；而且每次點擊後 `PASTE_TOGGLED` 的 idx 等於所點 ID 的 `ix` 段。任一條不成立：`fail`，證據欄寫 `identity-fail`。
@@ -443,7 +448,7 @@ T03 與 T18 的身份規則：`action.json` 要寫兩欄，尾段路徑相同的
 - 預覽：`paste-commit:0` 標頭是「#1 C4 text and binary (整個 commit 會被拒絕) … 2 個檔案，1 個不寫入」（只有 `new-binary.bin` 算不寫入；`newdir/content.txt` 是「拒絕」列，不算「不寫入」）；摘要「1 個 commit（1 個被拒絕）」，建立 0、覆寫 0/0、刪除 0、跳過 1。預覽一開就有紅色橫幅「第 1 個 commit「C4 text and binary」會被拒絕，重播將在此停止」（`commit_will_be_refused`）。點 `paste-row:1:newdir/content.txt` 得到 `[APP:PASTE_NAV: idx=1]`，詳情列是「整個 commit 會被拒絕：父目錄被檔案佔住」。點 `paste-row:0:new-binary.bin`，詳情列是「未複製：二進位檔，不寫入也不刪除」。
 - Apply：按 `btn-apply` 得到新的一行 `[APP:PASTE_STALE_DETECTED: commit_replay_refused]`，沒有 `PASTE_DONE`，預覽仍開著，紅色橫幅是「沒有建立任何 commit；第 1 個 commit「C4 text and binary」被拒絕：父目錄被檔案佔住」。英文介面是「No commit was created; commit #1 "C4 text and binary" was refused: a file is in the way of its parent directory」。
 - Git：HEAD、status 雜湊、`newdir` 位元組（`not-a-directory` 加換行）都不變。有任何寫入，或出現 `PASTE_DONE`，判 `fail`。
-- 設計：core 的 `replay_commit` 在動任何檔案之前，先用 `layout_conflicts` 發現父目錄被一般檔佔住，整個 commit 拒絕。這符合規格 4.3（「父目錄被一般檔案佔住時，整個 commit 拒絕且不動任何檔案（預覽標為 UNSAFE_PATH）」）。重播依序進行、停在失敗的 commit，之前已建立的 commit 保留，所以只有「沒建立任何 commit」時才用 `commit_replay_refused`，已建立過才用 `commit_replay_partial_refused`（若為版面衝突）或 `commit_replay_partial`（若為非版面衝突錯誤）。預覽與 dry-run 依序規劃：每個 commit 都以「前面未被拒絕的 commit 已寫入」的模擬版面為準（新增、刪除、清空的父目錄都算），所以較早的 commit 移除擋路檔案時，較晚的 commit 不會被標成拒絕；較早的 commit 建出擋路檔案時，較晚的 commit 會在預覽就標為拒絕，與 Apply 一致。覆寫確認（寫入列的 existed）仍看真實磁碟，因為它保護的是重播前就存在的檔案；刪除列與改名舊路徑（old_existed）看模擬版面。符號連結與非 UTF-8 檢查看真實磁碟，但只認「完全相同路徑」的覆蓋：較早的 commit 刪掉某個符號連結或非 UTF-8 檔後，較晚的 commit 再寫同一個路徑，預覽與 Apply 一致。已知限制（預覽與 dry-run 可能與 Apply 不一致；Apply 本身依規格 4.3 執行，在已重現的情境中未觀察到既有檔案被破壞，但這不是對所有配置的保證）：(a) 較早的 commit 刪掉符號連結目錄後，較晚的 commit 寫入其下的路徑（例如先刪 `link`、再寫 `link/x.txt`），預覽仍會穿過舊連結看真實磁碟，可能誤報拒絕或跳過；(b) 在不分大小寫的檔案系統（macOS、Windows 預設）上，與較早 commit 的路徑只差大小寫時，可能誤報筆數與停止點。追蹤於 https://github.com/audichuang/snip-sync/issues/76。
+- 設計：core 的 `replay_commit` 在動任何檔案之前，先用 `layout_conflicts` 發現父目錄被一般檔佔住，整個 commit 拒絕。這符合規格 4.3（「父目錄被一般檔案佔住時，整個 commit 拒絕且不動任何檔案（預覽標為 UNSAFE_PATH）」）。重播依序進行、停在失敗的 commit，之前已建立的 commit 保留，所以只有「沒建立任何 commit」時才用 `commit_replay_refused`，已建立過才用 `commit_replay_partial_refused`（若為版面衝突）或 `commit_replay_partial`（若為非版面衝突錯誤）。預覽與 dry-run 依序規劃：每個 commit 都以「前面未被拒絕的 commit 已寫入」的模擬版面為準（新增、刪除、清空的父目錄都算），所以較早的 commit 移除擋路檔案時，較晚的 commit 不會被標成拒絕；較早的 commit 建出擋路檔案時，較晚的 commit 會在預覽就標為拒絕，與 Apply 一致。覆寫確認（寫入列的 existed）仍看真實磁碟，因為它保護的是重播前就存在的檔案；刪除列與改名舊路徑（old_existed）看模擬版面。符號連結與非 UTF-8 檢查看真實磁碟，但較早的 commit 刪除或改寫過的路徑，以及這類路徑底下的一切，只看模擬版面：先刪 `link`、再寫 `link/x.txt` 時，預覽不會穿過舊連結去看它指向的地方。在不分大小寫的檔案系統（macOS、Windows 預設）上，模擬版面依 root 的探測結果不分大小寫比對路徑，`newdir` 會對到較早 commit 處理過的 `NEWDIR`（#76）。已知限制：被刪的連結若指向 repo 自己的 `.git`，連結底下的路徑仍會被預覽為 unsafe，Apply 則會寫入。路徑和磁碟上、index 裡既有的項目只差大小寫時（例如已有 `NEWDIR/a.txt`，貼上 `newdir/x.txt`），預覽與 Apply 都拒絕整個 commit（`CaseAlias`，規格 4.3，#140）。
 - 判定規則：Git 與日誌都對，但符合下列任一項，就判 `ui-defect`，並把三項各自的真假寫進證據欄：(a) 橫幅含英文 core 原因（zh-TW 介面）或 `(none)`；(b) 預覽（標頭、摘要、詳情、紅色橫幅或 `btn-apply` 狀態）沒有標出整個 commit 會被拒；(c) 橫幅說「重放中途失敗」而 `rev-list --count` 為 0。三項都不成立才是 `pass`。
 - 附註：#57 的 commit 說明寫「同一個 commit 的其他有效檔案照常貼上」，與實際行為不符，以規格為準。CLI 的 `--dry-run` 現在在被拒的 commit 標題後印「(refused: …)」，結尾印「N commit(s) would be created; replay stops at commit #M (refused); K not reached.」。
 

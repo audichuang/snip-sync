@@ -111,7 +111,7 @@ ssh ubuntu 'sha256sum ~/.local/bin/snip' > "$RUN/snip-installed.sha"   # 收尾�
 
 最後一行必須印出 `/home/audichuang/.local/bin/snip` 和受測版本。印出 linuxbrew 的路徑就停下：產品不會選到受測 binary。
 
-L04、L05 與收尾共用下面的函式，在 Mac 的同一個 bash 定義一次。wrapper `exec` 的是絕對路徑，所以 `ps` 必須精確等於 `$W/src/target/release/snip serve --stdio`。已退出的 PID 略過；仍存活但參數不符的 PID 不殺且判 fail。每個受測 worker 最多等 10 秒，未退出就判 fail；PID 紀錄保留作證據。
+L04、L05 與收尾共用下面的函式，在 Mac 的同一個 bash 定義一次。wrapper `exec` 的是絕對路徑，所以 `ps` 必須精確等於 `$W/src/target/release/snip serve --stdio`。已退出的 PID 略過；仍存活但參數不符的 PID 是 worker 退出後被別的行程重用的過期紀錄：印出警告、不殺，也不算失敗。每個受測 worker 最多等 10 秒，未退出就判 fail；PID 紀錄保留作證據。
 
 ```bash
 stop_run_workers() {
@@ -128,7 +128,7 @@ for record in "$W"/pids/*; do
   args=$(ps -o args= -p "$pid" || true)
   [ -n "$args" ] || continue
   if [ "$args" != "$W/src/target/release/snip serve --stdio" ]; then
-    echo "PID $pid 參數不符，拒絕終止：$args" >&2; failed=1; continue
+    echo "PID $pid 已不是本輪的 worker（過期紀錄），不終止：$args" >&2; continue
   fi
   kill "$pid" 2>/dev/null || true
   deadline=$((SECONDS + 10))
@@ -319,7 +319,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | `[APP:REMOTE_HOST_LISTED: host=<主機> folders=N path=<路徑>]` | 列出主機上某個資料夾的子資料夾 |
 | `[APP:REMOTE_HOST_FAILED: host=<主機> <訊息>]` | 連不上或列不出 |
 | `[APP:REMOTE_OPENED: <主機> ▸ <名稱> generation=N]` | 開啟遠端工作區 |
-| `[APP:REMOTE_OPEN_FAILED: …]`、`[APP:REMOTE_REOPEN: …]` | 開啟失敗；啟動時重新連線 |
+| `[APP:REMOTE_OPEN_FAILED: …]`、`[APP:REMOTE_REOPEN: host=<主機> path=<路徑>]`、`[APP:REMOTE_RETRY: attempt=N]` | 開啟失敗；啟動時從 `open-tabs.json` 還原遠端分頁並在背景連線；還原失敗後的背景重試（5、10、20、40 秒，之後每 60 秒） |
+| `[APP:WS_TABS_RESTORED: count=N skipped=N]` | 啟動時讀到 `open-tabs.json`：還原後的分頁數、略過的（找不到的本機資料夾）數 |
 | `[APP:REMOTE_SCAN_FAILED: …]` | 掃描儲存庫失敗 |
 | `[APP:CHANGES_EMPTY: state=…]`、`[APP:LOG_EMPTY: state=…]` | 空狀態（`clean`、`clean_partial`、`no_repository`、`scan_failed`、`failed` 等） |
 | `[APP:E2E_REPO: name=<名稱> ok=true/false …]` | 儲存庫掃描結果 |
@@ -345,8 +346,8 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | S07 | 從最近開啟點 `local-ws`，再點 `remote-recent:<n>`（gitws） | 先回到本機（麵包屑沒有 `ubuntu ▸`），再一次點擊就回到 `ubuntu ▸ gitws`，不用重新逐層選 |
 | S08 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/edge`，點 `btn-remote-open` | `REMOTE_OPENED: ubuntu ▸ edge`；`~` 展開成對方的家目錄 |
 | S09 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/no-such`，點 `btn-remote-open` | 失敗格：選單裡紅字說資料夾不存在；目前的工作區不變（仍是 edge） |
-| S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `REMOTE_REOPEN` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`；啟動過程畫面不卡（重新連線在背景） |
-| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
+| S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `WS_TABS_RESTORED` 與每個還原分頁的 `WS_TAB_OPENED`；`REMOTE_REOPEN: host=ubuntu path=…/edge` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`，顯示的是離開前的分頁（`open-tabs.json` 的 `active`）；遠端分頁一開始就在，標籤 `ubuntu ▸ edge`，連線在背景（狀態列「正在重新連線 …」），啟動過程畫面不卡 |
+| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`；`open-tabs.json` 裡的 `ubuntu ▸ edge` 也會還原，是 `local-ws` 之前的另一個分頁，`local-ws` 若已在還原的分頁裡就切過去），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。還原的 `ubuntu ▸ edge` 分頁若連線失敗，會保持 failed 狀態（`ws-tab-state:<ix>:failed`，tooltip 結尾「連線失敗：<原因>」，狀態列「無法開啟遠端工作區：<原因>」）並照 `REMOTE_RETRY` 重試，不是這格的失敗，也不會讓 `local-ws` 消失。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
 | S12 | 把視窗調成 900×600（System Events 設成 900×632），開選單並點進一層資料夾 | `remote-path`、`remote-up`、`btn-remote-open-here`、`remote-path-input`、`btn-remote-open` 的 bounds 都 `w,h ≥ 1` 且在內容區裡（tooltip 文字就是 `remote-path` 顯示的同一個字串，見 `crates/desktop-native/src/ui/remote.rs` 的 `tip(browse.path.clone())`，不在真實 UI 驗）；做完調回 1080×720 |
 
 ### 4.2 瀏覽真實專案 rtk（R01–R08）
@@ -533,7 +534,7 @@ snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>s
 | L01 | 在 `edge`：`ssh ubuntu "echo fresh-1 > '$W/edge/new.txt'"`，點 `btn-refresh` | 出現 `ws-tree-row:new.txt`，預覽是 `fresh-1` |
 | L02 | `ssh ubuntu "echo fresh-2 > '$W/edge/new.txt'"`，點別的檔案再點回 `new.txt` | 顯示 `fresh-2` |
 | L03 | `ssh ubuntu "rm '$W/edge/new.txt'"`，點 `btn-refresh` | 重建後的根目錄沒有 `new.txt` |
-| L04 | 中斷連線：執行第 2.3 節的 `stop_run_workers`，必須結束碼 0（只殺本輪記錄、且參數精確符合絕對 binary 路徑的 worker，並確認已退出；任何不符或逾時就判 fail）。不用 `pkill`／`pgrep -u`。在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh，新的 PID 又記進 `$W/pids/`）；絕不顯示成空白或上一個檔案 |
+| L04 | 中斷連線：執行第 2.3 節的 `stop_run_workers`，必須結束碼 0（只殺本輪記錄、且參數精確符合絕對 binary 路徑的 worker，並確認已退出；逾時或無效的 PID 紀錄就判 fail，參數不符的過期紀錄只警告）。不用 `pkill`／`pgrep -u`。在 App 點一個沒預覽過的檔案 | 這一次失敗或自動重連都可以，但 10 秒內一定有結果：錯誤文字，或 `PREVIEW_LOADED`；之後再點一次一定成功（App 會重新 ssh，新的 PID 又記進 `$W/pids/`）；絕不顯示成空白或上一個檔案 |
 | L05 | 貼上中斷（寫入途中斷線；wrapper 的 `SNIP_E2E_PASTE_HOLD` 是絕對路徑）。順序：(1) `ssh ubuntu "rm -f '$W/paste-hold'; rm -rf '$W/pastews/cut-dst' '$W/oracle/cut-dst'; mkdir -p '$W/pastews/cut-dst' '$W/oracle/cut-dst'"`；先在 hold 不存在時執行 `ssh ubuntu "cd '$W/oracle/cut-dst' && snip paste --apply --stdin" < "$RUN/p-files.txt"`，完成 P01 payload 的獨立 CLI oracle。(2) `ssh ubuntu "touch '$W/paste-hold'"`；App 打開 `pastews/cut-dst`，對 P01 payload 按 Cmd+V，`PASTE_PREVIEW` 後點 `btn-apply`。(3) `ssh ubuntu "for i in \$(seq 1 100); do [ -f '$W/pastews/cut-dst/a.txt' ] && exit 0; sleep 0.1; done; exit 1"`，必須結束碼 0；逾時判 fail。(4) 執行 `stop_run_workers`，必須結束碼 0，確認 worker 已退出，**先不移除 hold**。(5) `ssh ubuntu "test -f '$W/paste-hold' && test -f '$W/pastews/cut-dst/a.txt' && test ! -e '$W/pastews/cut-dst/new.txt' && test ! -e '$W/pastews/cut-dst/sub/crlf.txt' && test ! -e '$W/pastews/cut-dst/sub/noeol.txt' && cmp '$W/pastews/cut-dst/a.txt' '$W/oracle/cut-dst/a.txt'"`，必須結束碼 0；保存 `ssh ubuntu "find '$W/pastews/cut-dst' -type f"` 的輸出，只能有 `a.txt`。(6) 完成部分寫入檢查後，才 `ssh ubuntu "rm -f '$W/paste-hold'"`，在 App 點 `btn-refresh` | UI 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」（`paste_outcome_unknown`）；確認只有 `a.txt` 已寫入且與 CLI oracle 一致，其餘三個檔案不存在；重新整理後專案樹與 worker 上的實際檔案一致；之後 App 的下一次操作一定有回應（自動重連）。任何步驟失敗都記 fail，再移除 hold 收尾，不當作通過 |
 
 ### 4.10 CLI master 交叉驗證（C01–C04）
@@ -573,14 +574,23 @@ if [ -n "$got" ] && [ "$got" = "$want" ]; then
 else
   echo "~/.local/bin/snip 已非本輪安裝的 wrapper，保留不刪" >&2
 fi
-ssh ubuntu "rm -f ~/.local/bin/snip.uirun-$SHA"
+got=$(ssh ubuntu "sha256sum ~/.local/bin/snip.uirun-$SHA 2>/dev/null" | cut -d' ' -f1)
+if [ -n "$got" ] && [ "$got" = "$want" ]; then
+  ssh ubuntu "rm -f ~/.local/bin/snip.uirun-$SHA"
+elif [ -n "$got" ]; then
+  echo "~/.local/bin/snip.uirun-$SHA 不是本輪的 wrapper，保留不刪" >&2
+fi
 
 # 4) 本輪目錄。
 ssh ubuntu "rm -rf '$W'"
 ```
 
 只刪 `$W`（含 `pids/` 與 `paste-hold`）、本輪放的 `~/.local/bin/snip`
-wrapper（hash 一致才刪）與本輪備份名 `~/.local/bin/snip.uirun-$SHA`。
+wrapper 與本輪備份名 `~/.local/bin/snip.uirun-$SHA`（兩者都要 hash 一致才刪）。
+`real_ui_round.py finish` 對 `prepare --remote` 的回合照同樣的順序做這一節，
+`stop_run_workers` 失敗就停下、保留 `$W`，並以非 0 結束。保留下來（hash 不一致）的
+wrapper 或備份若仍 `exec` 進 `$W`，也保留 `$W` 並以非 0 結束：刪掉 `$W` 會讓 Ubuntu 上的
+`snip` 變成壞掉的 wrapper。手動收尾時同樣檢查（`grep -F "$W" ~/.local/bin/snip`）。
 `snip.away` 或使用者自己的任何備份、`~/research/rtk`、linuxbrew 的
 `snip`、`snip-worker.service`、`~/.ssh/config` 都不動。Mac 上的
 `$RUN` 保留，裡面是證據。

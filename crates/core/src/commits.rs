@@ -26,6 +26,7 @@ fn unsafe_replay_target(scope: &Path, abs: &Path) -> bool {
 	escapes_all_roots(&[scope], abs)
 		|| abs.parent().is_none_or(lands_in_git_dir)
 }
+#[cfg(test)]
 use crate::workspace::{lock_heavy, RepoIdentity};
 
 /// First line of a commit-mode payload; the rest is JSON.
@@ -1144,6 +1145,12 @@ pub enum LayoutConflict {
 	DeleteTargetIsDirectory,
 	DirectoryInTheWay,
 	FileInTheWayOfParent,
+	/// On a case-insensitive filesystem, the path or one of its folders
+	/// differs only in case from an entry on disk or in the index, or from
+	/// another path of the same commit. The disk
+	/// takes it for that entry, while `commit --only` matches the index
+	/// case-sensitively and would fail after the writes (#140).
+	CaseAlias,
 }
 
 impl LayoutConflict {
@@ -1159,7 +1166,20 @@ impl LayoutConflict {
 			Self::FileInTheWayOfParent => {
 				"a file is in the way of its parent directory"
 			}
+			Self::CaseAlias => {
+				"the path differs only in letter case from another one in the destination or the commit"
+			}
 		}
+	}
+}
+
+impl LayoutConflict {
+	/// What the user can do instead, when there is something.
+	pub fn hint(self) -> Option<&'static str> {
+		// File mode writes through the disk's spelling and commits nothing.
+		(self == Self::CaseAlias).then_some(
+			"paste the files in file mode instead, or first rename the path to match the existing case",
+		)
 	}
 }
 
@@ -1277,8 +1297,12 @@ impl CommitReplayPlan {
 /// resolver would rewrite (absolute, root-labelled, `./`) is refused: git
 /// only ever produces plain relative paths.
 ///
-/// A parent the batch's earlier commits already replaced (`layout` holds an
-/// override for it) is no longer the symlink the disk may still show.
+/// A parent the batch's earlier commits already replaced (see
+/// [`PlannedLayout::replaced`]) is no longer the symlink the disk may still
+/// show. Known limit: the containment and Git directory checks below still
+/// resolve the real disk, so a path under a deleted link into the repo's own
+/// `.git` is previewed as unsafe although Apply, which finds the link gone,
+/// writes it.
 fn target(root: &Path, path: &str, layout: &PlannedLayout) -> Option<PathBuf> {
 	// Like git ("beyond a symbolic link"), refuse paths whose parent
 	// directories go through a symlink: containment alone would let the
@@ -1287,7 +1311,7 @@ fn target(root: &Path, path: &str, layout: &PlannedLayout) -> Option<PathBuf> {
 	let parents = path.split('/').collect::<Vec<_>>();
 	for segment in &parents[..parents.len().saturating_sub(1)] {
 		dir.push(segment);
-		if !layout.overrides.contains_key(&dir) && is_symlink(&dir) {
+		if !layout.replaced(&dir) && is_symlink(&dir) {
 			return None;
 		}
 	}
@@ -1330,16 +1354,13 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 	// A symlink is replaced, not written through: its target is irrelevant.
 	// Keep the path on a non-UTF-8 skip so freshness can see that exact file
 	// without inventing a second planner. An earlier commit of the batch may
-	// have deleted a symlink or non-UTF-8 file at this exact path (the layout
-	// holds an override for it), so only an untouched path is checked on disk.
-	// Known limit (issue #76): overrides match the exact path only, so a
-	// deleted symlink ancestor, or a case-only alias on a case-insensitive
-	// filesystem, still reads the real disk and the preview may disagree
-	// with Apply.
+	// have deleted a symlink or non-UTF-8 file at this path or above it (its
+	// case-only alias included), so only a path the layout did not replace is
+	// checked on disk.
 	// A hard link needs no check of its own: the write replaces this entry,
 	// never the shared file (see `fsutil::write_text_file`).
 	if !deleted
-		&& !layout.overrides.contains_key(&abs)
+		&& !layout.replaced(&abs)
 		&& !is_symlink(&abs)
 		&& must_not_overwrite(&abs)
 	{
@@ -1355,11 +1376,13 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 	};
 	// A delete asks the simulated layout (an earlier commit of the batch may
 	// have added or removed the file). A write keeps the real disk: overwrite
-	// consent protects a file that exists before the replay starts.
+	// consent protects a file that exists before the replay starts. A file
+	// the disk shows only through a symlink parent an earlier commit deletes
+	// is that link's target, which the write never reaches.
 	plan.existed = if deleted {
 		layout.exists(&abs)
 	} else {
-		abs.exists()
+		abs.exists() && !(layout.shadowed(&abs) && beyond_symlink(root, &abs))
 	};
 	plan.absolute_path = Some(abs);
 	plan.old_absolute_path = old.flatten();
@@ -1368,6 +1391,14 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 		.as_deref()
 		.is_some_and(|o| layout.exists(o));
 	plan
+}
+
+/// Whether a directory between `root` and `abs` is a symlink on disk.
+fn beyond_symlink(root: &Path, abs: &Path) -> bool {
+	abs.ancestors()
+		.skip(1)
+		.take_while(|a| *a != root && a.starts_with(root))
+		.any(is_symlink)
 }
 
 fn plan_commit(
@@ -1397,28 +1428,94 @@ enum Node {
 /// otherwise. Empty, it is the plain disk (what `replay_commit` plans against).
 ///
 /// Only the layout is simulated. Symlink checks in `target` and
-/// `must_not_overwrite` stay on the real disk, except for a path with an
-/// override: a payload creates neither symlinks nor non-UTF-8 files, but an
-/// earlier commit can delete one, and what is left there is then a regular
-/// file or nothing.
+/// `must_not_overwrite` stay on the real disk, except for a path the layout
+/// [`replaced`](Self::replaced): a payload creates neither symlinks nor
+/// non-UTF-8 files, but an earlier commit can delete one, and what is left
+/// there is then a regular file or nothing.
 ///
-/// An override applies to the exact path only. Known limits (issue #76), where
-/// the preview and dry-run may disagree with Apply: a symlink ancestor deleted
-/// by an earlier commit is still looked through on the real disk, and on a
-/// case-insensitive filesystem a path differing only by case from an earlier
-/// commit's path is a different key.
+/// A path an earlier commit deleted or wrote as a file is `cut`: whatever the
+/// disk shows below it (the old symlink's target included) is gone, so its
+/// descendants answer from `overrides` alone, even once a later write makes
+/// it a directory again.
+///
+/// On a case-insensitive filesystem (probed once, at the root) keys fold
+/// case as the disk does, so `newdir` finds what an earlier commit did to
+/// `NEWDIR`.
 #[derive(Debug, Default)]
 struct PlannedLayout {
+	/// Fold keys to lower case, as `transfer`'s D10 collision check does.
+	fold_case: bool,
 	overrides: std::collections::HashMap<PathBuf, Node>,
-	/// The non-absent overrides, by parent directory.
-	added:
-		std::collections::HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
+	/// The non-absent overrides, by parent key: child key to the path as
+	/// first spelled.
+	added: std::collections::HashMap<
+		PathBuf,
+		std::collections::HashMap<PathBuf, PathBuf>,
+	>,
+	/// Keys of paths whose disk contents an earlier commit removed.
+	cut: std::collections::HashSet<PathBuf>,
+	/// The index's spellings, read only when `fold_case`.
+	tracked: TrackedSpellings,
 }
 
 impl PlannedLayout {
+	/// A layout for planning or replaying in `git`'s worktree.
+	fn new(git: &Git) -> Self {
+		let fold_case = crate::transfer::fs_is_case_insensitive(git.root());
+		Self {
+			fold_case,
+			tracked: if fold_case {
+				TrackedSpellings::read(git)
+			} else {
+				TrackedSpellings::default()
+			},
+			..Self::default()
+		}
+	}
+
+	fn key(&self, path: &Path) -> PathBuf {
+		if self.fold_case {
+			PathBuf::from(path.to_string_lossy().to_lowercase())
+		} else {
+			path.to_path_buf()
+		}
+	}
+
+	fn get(&self, path: &Path) -> Option<Node> {
+		if self.overrides.is_empty() {
+			return None;
+		}
+		self.overrides.get(&self.key(path)).copied()
+	}
+
+	/// Whether an ancestor of `path` is cut, so the disk below it is gone.
+	fn shadowed(&self, path: &Path) -> bool {
+		!self.cut.is_empty()
+			&& self
+				.key(path)
+				.ancestors()
+				.skip(1)
+				.any(|a| self.cut.contains(a))
+	}
+
+	/// Whether the disk no longer decides what `path` is: an earlier commit
+	/// changed it, or removed what the disk shows above it.
+	fn replaced(&self, path: &Path) -> bool {
+		self.get(path).is_some() || self.shadowed(path)
+	}
+
+	/// Whether the disk's entries inside `dir` are still there.
+	fn disk_children_live(&self, dir: &Path) -> bool {
+		self.cut.is_empty()
+			|| !(self.cut.contains(&self.key(dir)) || self.shadowed(dir))
+	}
+
 	fn node(&self, path: &Path) -> Node {
-		if let Some(&n) = self.overrides.get(path) {
+		if let Some(n) = self.get(path) {
 			return n;
+		}
+		if self.shadowed(path) {
+			return Node::Absent;
 		}
 		match fs::symlink_metadata(path) {
 			Ok(m) if m.is_dir() => Node::Dir,
@@ -1433,68 +1530,81 @@ impl PlannedLayout {
 
 	/// Like `Path::exists`: a symlink counts by its target on disk.
 	fn exists(&self, path: &Path) -> bool {
-		match self.overrides.get(path) {
-			Some(&n) => n != Node::Absent,
-			None => path.exists(),
+		match self.get(path) {
+			Some(n) => n != Node::Absent,
+			None => !self.shadowed(path) && path.exists(),
 		}
 	}
 
 	fn set(&mut self, path: &Path, node: Node) {
-		self.overrides.insert(path.to_path_buf(), node);
-		let Some(parent) = path.parent() else {
+		let key = self.key(path);
+		if node != Node::Dir {
+			self.cut.insert(key.clone());
+		}
+		self.overrides.insert(key.clone(), node);
+		let Some(parent) = key.parent().map(Path::to_path_buf) else {
 			return;
 		};
 		if node == Node::Absent {
-			if let Some(set) = self.added.get_mut(parent) {
-				set.remove(path);
+			if let Some(set) = self.added.get_mut(&parent) {
+				set.remove(&key);
 			}
 		} else {
 			self.added
-				.entry(parent.to_path_buf())
+				.entry(parent)
 				.or_default()
-				.insert(path.to_path_buf());
+				.entry(key)
+				.or_insert_with(|| path.to_path_buf());
 		}
 	}
 
 	/// The entries of `dir`: disk entries minus those overridden as absent,
 	/// plus overridden entries directly inside it.
 	fn children(&self, dir: &Path) -> Vec<(PathBuf, Node)> {
-		let mut out: std::collections::HashMap<PathBuf, Node> =
+		let mut out: std::collections::HashMap<PathBuf, (PathBuf, Node)> =
 			std::collections::HashMap::new();
-		if let Ok(entries) = fs::read_dir(dir) {
+		let entries = self.disk_children_live(dir).then(|| fs::read_dir(dir));
+		if let Some(Ok(entries)) = entries {
 			for entry in entries {
 				let Ok(entry) = entry else {
 					// An unreadable entry counts as a live file nobody deletes,
 					// so `dir` is never taken for empty.
-					out.insert(dir.join("<unreadable entry>"), Node::File);
+					let path = dir.join("<unreadable entry>");
+					out.insert(self.key(&path), (path, Node::File));
 					continue;
 				};
 				let node = match entry.file_type() {
 					Ok(t) if t.is_dir() => Node::Dir,
 					_ => Node::File,
 				};
-				out.insert(entry.path(), node);
+				out.insert(self.key(&entry.path()), (entry.path(), node));
 			}
 		}
-		out.retain(|path, _| self.overrides.get(path) != Some(&Node::Absent));
-		for path in self.added.get(dir).into_iter().flatten() {
-			out.insert(path.clone(), self.overrides[path]);
+		out.retain(|key, _| self.overrides.get(key) != Some(&Node::Absent));
+		for (key, path) in self.added.get(&self.key(dir)).into_iter().flatten()
+		{
+			out.insert(key.clone(), (path.clone(), self.overrides[key]));
 		}
-		out.into_iter().collect()
+		out.into_values().collect()
 	}
 
 	/// Whether `dir` still holds an entry. Stops at the first live one.
 	fn has_children(&self, dir: &Path) -> bool {
-		if self.added.get(dir).is_some_and(|set| !set.is_empty()) {
+		if self
+			.added
+			.get(&self.key(dir))
+			.is_some_and(|set| !set.is_empty())
+		{
 			return true;
+		}
+		if !self.disk_children_live(dir) {
+			return false;
 		}
 		let Ok(entries) = fs::read_dir(dir) else {
 			return false;
 		};
 		entries.into_iter().any(|entry| match entry {
-			Ok(entry) => {
-				self.overrides.get(&entry.path()) != Some(&Node::Absent)
-			}
+			Ok(entry) => self.get(&entry.path()) != Some(Node::Absent),
 			Err(_) => true,
 		})
 	}
@@ -1518,6 +1628,10 @@ impl PlannedLayout {
 					parents.extend(abs.parent());
 				}
 			}
+			let del = (f.action == ReplayAction::Delete).then_some(&f.path);
+			for rel in f.old_path.iter().chain(del) {
+				self.tracked.remove(rel);
+			}
 		}
 		parents.sort_unstable();
 		parents.dedup();
@@ -1528,6 +1642,7 @@ impl PlannedLayout {
 			let Some(abs) = f.absolute_path.as_deref() else {
 				continue;
 			};
+			self.tracked.insert(&f.path);
 			self.set(abs, Node::File);
 			for a in abs.ancestors().skip(1) {
 				if a == root || !a.starts_with(root) {
@@ -1552,11 +1667,122 @@ impl PlannedLayout {
 	}
 }
 
+/// The index's paths and their folders by case-folded spelling, each
+/// spelling with the number of tracked files at or below it.
+#[derive(Debug, Default)]
+struct TrackedSpellings(
+	std::collections::HashMap<String, std::collections::HashMap<String, usize>>,
+);
+
+impl TrackedSpellings {
+	/// `git ls-files`; an unreadable index leaves only the disk to compare.
+	fn read(git: &Git) -> Self {
+		let mut out = Self::default();
+		if let Ok(list) = git.run(&["ls-files", "-z"]) {
+			for path in list.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+				out.insert(&String::from_utf8_lossy(path));
+			}
+		}
+		out
+	}
+
+	/// `rel` and each folder above it, shortest first.
+	fn prefixes(rel: &str) -> impl Iterator<Item = &str> {
+		rel.match_indices('/')
+			.map(|(i, _)| &rel[..i])
+			.chain(std::iter::once(rel))
+	}
+
+	fn has(&self, rel: &str) -> bool {
+		self.0
+			.get(&rel.to_lowercase())
+			.is_some_and(|s| s.contains_key(rel))
+	}
+
+	fn insert(&mut self, rel: &str) {
+		if self.has(rel) {
+			return;
+		}
+		for p in Self::prefixes(rel) {
+			*self
+				.0
+				.entry(p.to_lowercase())
+				.or_default()
+				.entry(p.to_string())
+				.or_default() += 1;
+		}
+	}
+
+	fn remove(&mut self, rel: &str) {
+		if !self.has(rel) {
+			return;
+		}
+		for p in Self::prefixes(rel) {
+			let key = p.to_lowercase();
+			let Some(set) = self.0.get_mut(&key) else {
+				continue;
+			};
+			if let Some(n) = set.get_mut(p) {
+				*n -= 1;
+				if *n == 0 {
+					set.remove(p);
+				}
+			}
+			if set.is_empty() {
+				self.0.remove(&key);
+			}
+		}
+	}
+
+	/// Whether the index holds `rel` or a folder of it under another case
+	/// only.
+	fn aliases(&self, rel: &str) -> bool {
+		Self::prefixes(rel).any(|p| {
+			self.0
+				.get(&p.to_lowercase())
+				.is_some_and(|set| !set.contains_key(p))
+		})
+	}
+}
+
+/// Whether `abs` (repo-relative `rel`) or one of its folders differs only in
+/// case from an entry on disk or in the index, as the batch's earlier commits
+/// left them. An entry spelled exactly as `rel` wins. This commit's own
+/// deletions do not clear an alias: `commit --only` given both spellings
+/// leaves a case rename staged and uncommitted. Only asked on a
+/// case-insensitive filesystem.
+fn case_alias(
+	root: &Path,
+	abs: &Path,
+	rel: &str,
+	layout: &PlannedLayout,
+	children: &mut std::collections::HashMap<PathBuf, Vec<(PathBuf, Node)>>,
+) -> bool {
+	let on_disk = abs
+		.ancestors()
+		.take_while(|a| *a != root && a.starts_with(root))
+		.filter(|a| layout.node(a) != Node::Absent)
+		.any(|a| {
+			let Some(parent) = a.parent() else {
+				return false;
+			};
+			let entries = children
+				.entry(parent.to_path_buf())
+				.or_insert_with(|| layout.children(parent));
+			let key = layout.key(a);
+			!entries.iter().any(|(p, _)| p == a)
+				&& entries.iter().any(|(p, _)| layout.key(p) == key)
+		});
+	on_disk || layout.tracked.aliases(rel)
+}
+
 /// Planned writes and deletes the layout would make fail halfway
 /// through a commit, as `(file index, reason)`: a directory where a file is
 /// deleted, a directory where a file is written (unless this commit's own
 /// deletions empty it, as `delete` removes emptied parents), or a file where
-/// a write needs a directory (unless this commit deletes that file).
+/// a write needs a directory (unless this commit deletes that file), or, on
+/// a case-insensitive filesystem, a path whose spelling differs only in case
+/// from another path of this commit or from a [`case_alias`].
 fn layout_conflicts(
 	root: &Path,
 	files: &[FilePlan],
@@ -1583,6 +1809,22 @@ fn layout_conflicts(
 				_ => deleted.contains(path.as_path()),
 			})
 	}
+	let mut children = std::collections::HashMap::new();
+	// This commit's own spellings: two that differ only in case are one
+	// entry on disk and two in `commit --only`.
+	let mut spellings: std::collections::HashMap<
+		String,
+		std::collections::HashSet<&str>,
+	> = std::collections::HashMap::new();
+	if layout.fold_case {
+		for f in files.iter().filter(|f| f.action != ReplayAction::Skip) {
+			for rel in std::iter::once(&f.path).chain(&f.old_path) {
+				for p in TrackedSpellings::prefixes(rel) {
+					spellings.entry(p.to_lowercase()).or_default().insert(p);
+				}
+			}
+		}
+	}
 	let mut out = Vec::new();
 	for (i, f) in files.iter().enumerate() {
 		let Some(abs) = f.absolute_path.as_deref() else {
@@ -1606,6 +1848,21 @@ fn layout_conflicts(
 				.find(|a| layout.node(a) == Node::File && !deleted.contains(a))
 				.map(|_| LayoutConflict::FileInTheWayOfParent),
 		};
+		let conflict = conflict.or_else(|| {
+			let old = f.old_absolute_path.as_deref().zip(f.old_path.as_deref());
+			let alias = layout.fold_case
+				&& f.action != ReplayAction::Skip
+				&& std::iter::once((abs, f.path.as_str())).chain(old).any(
+					|(abs, rel)| {
+						TrackedSpellings::prefixes(rel).any(|p| {
+							spellings
+								.get(&p.to_lowercase())
+								.is_some_and(|s| s.len() > 1)
+						}) || case_alias(root, abs, rel, layout, &mut children)
+					},
+				);
+			alias.then_some(LayoutConflict::CaseAlias)
+		});
 		if let Some(reason) = conflict {
 			out.push((i, reason));
 		}
@@ -1674,7 +1931,7 @@ pub fn plan_commit_replay_in(
 	let root = git.root().to_path_buf();
 	let mut commits = Vec::new();
 	// Each commit is planned after the earlier ones, as replay writes them.
-	let mut layout = PlannedLayout::default();
+	let mut layout = PlannedLayout::new(git);
 	for commit in &payload.commits {
 		refuse_if_cancelled(opts, "replay-plan")?;
 		let mut files = Vec::new();
@@ -1738,57 +1995,60 @@ pub(crate) struct ReplaySession {
 	no_hooks: NoHooks,
 	/// The write scope: every target is held to it, as the preview was.
 	scope: PathBuf,
-	_guard: crate::workspace::HeavyGuard,
+	_guards: Vec<crate::workspace::HeavyGuard>,
 }
 
 impl ReplaySession {
-	/// Heavy lock + empty hooks dir, taken before any write, with the
-	/// replay's write scope ([`plan_commit_replay_in`]). Err is the
-	/// ReplayResult the old replay returned for that failure (failure at
-	/// index 0, or none for an empty payload).
-	pub(crate) fn begin_in(
+	/// The worktree's write lock for a replay. `WorktreeBusy` means another
+	/// paste holds it; callers refuse that outright rather than as a
+	/// failed commit.
+	#[cfg(test)]
+	pub(crate) fn lock(
 		git: &Git,
+		opts: &RunOptions,
+	) -> Result<crate::workspace::HeavyGuard, GitError> {
+		RepoIdentity::resolve(git, opts).and_then(|id| lock_heavy(&id))
+	}
+
+	/// What the old replay returned when it could not start: failure at
+	/// index 0, or none for an empty payload.
+	pub(crate) fn refused(
+		payload: &CommitsPayload,
+		error: String,
+	) -> ReplayResult {
+		ReplayResult {
+			created: Vec::new(),
+			failure: payload.commits.first().map(|c| ReplayFailure {
+				index: 0,
+				message: c.message.clone(),
+				error,
+				layout_conflict: None,
+				conflict_path: None,
+			}),
+		}
+	}
+
+	/// Empty hooks dir under the held write lock, taken before any write,
+	/// with the replay's write scope ([`plan_commit_replay_in`]). Err is
+	/// the ReplayResult the old replay returned for that failure.
+	pub(crate) fn begin_in(
 		scope: &Path,
 		payload: &CommitsPayload,
-		opts: &RunOptions,
+		_guards: Vec<crate::workspace::HeavyGuard>,
 	) -> Result<Self, ReplayResult> {
-		let mut result = ReplayResult::default();
-		let guard = RepoIdentity::resolve(git, opts)
-			.and_then(|id| lock_heavy(&id, opts));
-		let _guard = match guard {
-			Ok(g) => g,
-			Err(e) => {
-				result.failure =
-					payload.commits.first().map(|c| ReplayFailure {
-						index: 0,
-						message: c.message.clone(),
-						error: e.to_string(),
-						layout_conflict: None,
-						conflict_path: None,
-					});
-				return Err(result);
-			}
-		};
 		let no_hooks = match NoHooks::create() {
 			Ok(h) => h,
 			Err(e) => {
-				result.failure =
-					payload.commits.first().map(|c| ReplayFailure {
-						index: 0,
-						message: c.message.clone(),
-						error: format!(
-							"cannot create an empty hooks directory: {e}"
-						),
-						layout_conflict: None,
-						conflict_path: None,
-					});
-				return Err(result);
+				return Err(Self::refused(
+					payload,
+					format!("cannot create an empty hooks directory: {e}"),
+				));
 			}
 		};
 		Ok(Self {
 			no_hooks,
 			scope: scope.to_path_buf(),
-			_guard,
+			_guards,
 		})
 	}
 
@@ -1821,12 +2081,11 @@ impl ReplaySession {
 
 #[cfg(test)]
 pub(crate) fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
-	match ReplaySession::begin_in(
-		git,
-		git.root(),
-		payload,
-		&RunOptions::default(),
-	) {
+	let guard = match ReplaySession::lock(git, &RunOptions::default()) {
+		Ok(g) => g,
+		Err(e) => return ReplaySession::refused(payload, e.to_string()),
+	};
+	match ReplaySession::begin_in(git.root(), payload, vec![guard]) {
 		Ok(session) => session.run(git, payload),
 		Err(refused) => refused,
 	}
@@ -1889,8 +2148,9 @@ fn replay_commit(
 	no_hooks: &str,
 ) -> Result<String, ReplayCommitError> {
 	let root = git.root();
-	// Replay plans against the disk as the earlier commits left it.
-	let layout = PlannedLayout::default();
+	// Replay plans against the disk and index as the earlier commits left
+	// them.
+	let layout = PlannedLayout::new(git);
 	let plan = plan_commit(root, commit, &layout);
 	// The preview skips these; replay refuses the commit before touching
 	// anything rather than stop halfway with a half-staged worktree.
@@ -3038,6 +3298,400 @@ mod tests {
 		assert!(!dst.path().join("other/x.txt").exists());
 	}
 
+	fn two_commits(first: CommitFile, second: CommitFile) -> CommitsPayload {
+		CommitsPayload {
+			commits: vec![
+				batch_commit("first", vec![first]),
+				batch_commit("second", vec![second]),
+			],
+		}
+	}
+
+	/// `link -> other`, committed, with `make` building `other`'s contents.
+	#[cfg(unix)]
+	fn repo_with_link(make: impl FnOnce(&Repo)) -> Repo {
+		let dst = Repo::new("main");
+		make(&dst);
+		std::os::unix::fs::symlink("other", dst.path().join("link")).unwrap();
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		dst
+	}
+
+	// Issue #76: a deleted symlink ancestor is not looked through.
+	#[cfg(unix)]
+	#[test]
+	fn batch_plan_ignores_a_directory_behind_a_deleted_symlink_ancestor() {
+		let dst = repo_with_link(|r| r.write("other/x.txt/inner.txt", b"in\n"));
+		let payload = two_commits(
+			batch_file("link", FileChange::Deleted),
+			batch_file("link/x.txt", FileChange::Added),
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		let f = &plan.commits[1].files[0];
+		assert_eq!(f.layout_conflict, None);
+		assert_eq!(f.action, ReplayAction::Write);
+		assert!(!f.existed);
+		let result = replay(&g, &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 2);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn batch_plan_ignores_a_non_utf8_file_behind_a_deleted_symlink_ancestor() {
+		let dst = repo_with_link(|r| r.write("other/x.txt", &[0xff, 0xfe]));
+		let payload = two_commits(
+			batch_file("link", FileChange::Deleted),
+			batch_file("link/x.txt", FileChange::Added),
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		let f = &plan.commits[1].files[0];
+		assert_eq!(f.skip_reason, None);
+		assert_eq!(f.action, ReplayAction::Write);
+		assert!(!f.existed);
+		let result = replay(&g, &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 2);
+		assert_eq!(
+			fs::read(dst.path().join("other/x.txt")).unwrap(),
+			[0xff, 0xfe]
+		);
+	}
+
+	/// A directory a later write puts where the deleted link was is new:
+	/// what the old link pointed at is not inside it.
+	#[cfg(unix)]
+	#[test]
+	fn batch_plan_ignores_the_old_link_target_under_a_recreated_directory() {
+		let dst = repo_with_link(|r| r.write("other/y.txt", &[0xff, 0xfe]));
+		let payload = CommitsPayload {
+			commits: vec![
+				batch_commit(
+					"delete the link",
+					vec![batch_file("link", FileChange::Deleted)],
+				),
+				batch_commit(
+					"make a directory there",
+					vec![batch_file("link/x.txt", FileChange::Added)],
+				),
+				batch_commit(
+					"write a second file",
+					vec![batch_file("link/y.txt", FileChange::Added)],
+				),
+			],
+		};
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		let f = &plan.commits[2].files[0];
+		assert_eq!(f.skip_reason, None);
+		assert_eq!(f.action, ReplayAction::Write);
+		assert!(!f.existed);
+		let result = replay(&g, &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 3);
+	}
+
+	// Issue #76: on a case-insensitive filesystem, a path spelled with
+	// another case is the same entry as the one an earlier commit touched.
+	// A case-sensitive one keeps them apart; both must match Apply.
+	#[test]
+	fn batch_plan_sees_a_file_an_earlier_commit_created_under_another_case() {
+		let dst = Repo::new("main");
+		dst.write("keep.txt", b"keep\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let insensitive = crate::transfer::fs_is_case_insensitive(&dst.path());
+		let payload = two_commits(
+			batch_file("NEWDIR", FileChange::Added),
+			batch_file("newdir/x.txt", FileChange::Added),
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		let result = replay(&g, &payload);
+		let f = &plan.commits[1].files[0];
+		if insensitive {
+			assert_eq!(
+				f.layout_conflict,
+				Some(LayoutConflict::FileInTheWayOfParent)
+			);
+			assert_eq!(result.created.len(), 1);
+			assert_eq!(
+				result.failure.map(|f| f.layout_conflict),
+				Some(Some(LayoutConflict::FileInTheWayOfParent))
+			);
+		} else {
+			assert_eq!(f.layout_conflict, None);
+			assert_eq!(f.action, ReplayAction::Write);
+			assert_eq!(result.failure, None);
+			assert_eq!(result.created.len(), 2);
+		}
+	}
+
+	#[test]
+	fn batch_plan_sees_a_file_an_earlier_commit_deleted_under_another_case() {
+		let dst = Repo::new("main");
+		dst.write("NEWDIR", b"file\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let insensitive = crate::transfer::fs_is_case_insensitive(&dst.path());
+		let payload = two_commits(
+			batch_file("NEWDIR", FileChange::Deleted),
+			batch_file("newdir/x.txt", FileChange::Added),
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		let f = &plan.commits[1].files[0];
+		assert_eq!(f.layout_conflict, None, "insensitive: {insensitive}");
+		assert_eq!(f.action, ReplayAction::Write);
+		let result = replay(&g, &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 2);
+	}
+
+	#[test]
+	fn batch_plan_sees_a_directory_an_earlier_commit_emptied_under_another_case(
+	) {
+		let dst = Repo::new("main");
+		dst.write("NEWDIR/a.txt", b"a\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let insensitive = crate::transfer::fs_is_case_insensitive(&dst.path());
+		let payload = two_commits(
+			batch_file("NEWDIR/a.txt", FileChange::Deleted),
+			batch_file("newdir", FileChange::Added),
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		let f = &plan.commits[1].files[0];
+		assert_eq!(f.layout_conflict, None, "insensitive: {insensitive}");
+		assert_eq!(f.action, ReplayAction::Write);
+		let result = replay(&g, &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 2);
+	}
+
+	// Issue #140: on a case-insensitive filesystem, a path that differs only
+	// in case from an existing entry is the same entry to the disk, while
+	// `commit --only` matches the index case-sensitively. Preview and Apply
+	// both refuse the commit, before anything is written or staged. A
+	// case-sensitive filesystem writes both spellings, as before.
+	fn case_alias_replay(
+		dst: &Repo,
+		payload: &CommitsPayload,
+	) -> (CommitReplayPlan, ReplayResult, bool) {
+		let insensitive = crate::transfer::fs_is_case_insensitive(&dst.path());
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, payload);
+		let head = dst.git(&["rev-parse", "HEAD"]);
+		let status = dst.git(&["status", "--porcelain"]);
+		let result = replay(&g, payload);
+		if insensitive {
+			let refused = plan.commits.last().unwrap();
+			assert_eq!(
+				refused.refused_by(),
+				Some(LayoutConflict::CaseAlias),
+				"{plan:?}"
+			);
+			let failure = result.failure.clone().expect("refused");
+			assert_eq!(failure.index, plan.commits.len() - 1);
+			assert_eq!(
+				failure.layout_conflict,
+				Some(LayoutConflict::CaseAlias)
+			);
+			assert_eq!(result.created.len(), plan.commits.len() - 1);
+			if result.created.is_empty() {
+				assert_eq!(dst.git(&["rev-parse", "HEAD"]), head);
+			}
+			assert_eq!(dst.git(&["status", "--porcelain"]), status);
+		} else {
+			assert_eq!(
+				plan.commits.iter().find_map(CommitPlan::refused_by),
+				None
+			);
+			assert_eq!(result.failure, None);
+			assert_eq!(result.created.len(), plan.commits.len());
+		}
+		(plan, result, insensitive)
+	}
+
+	#[test]
+	fn case_alias_new_file_under_an_existing_directory() {
+		let dst = Repo::new("main");
+		dst.write("NEWDIR/a.txt", b"a\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"add\n",
+			vec![change("newdir/x.txt", FileChange::Added, Some("x\n"))],
+		);
+		let (plan, _, insensitive) = case_alias_replay(&dst, &payload);
+		let f = &plan.commits[0].files[0];
+		if insensitive {
+			assert_eq!(f.action, ReplayAction::Skip);
+			assert_eq!(f.skip_reason, Some(ReplaySkipReason::UnsafePath));
+			assert!(!dst.path().join("NEWDIR/x.txt").exists());
+		} else {
+			assert_eq!(f.action, ReplayAction::Write);
+			assert_eq!(dst.git(&["ls-files"]), "NEWDIR/a.txt\nnewdir/x.txt");
+		}
+	}
+
+	#[test]
+	fn case_alias_modifies_a_tracked_file() {
+		let dst = Repo::new("main");
+		dst.write("Foo.txt", b"old\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"edit\n",
+			vec![change("foo.txt", FileChange::Modified, Some("new\n"))],
+		);
+		let (_, _, insensitive) = case_alias_replay(&dst, &payload);
+		if insensitive {
+			assert_eq!(
+				fs::read_to_string(dst.path().join("Foo.txt")).unwrap(),
+				"old\n"
+			);
+		} else {
+			assert_eq!(dst.git(&["ls-files"]), "Foo.txt\nfoo.txt");
+		}
+	}
+
+	#[test]
+	fn case_alias_in_a_nested_directory() {
+		let dst = Repo::new("main");
+		dst.write("A/B/c.txt", b"c\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"add\n",
+			vec![change("A/b/x.txt", FileChange::Added, Some("x\n"))],
+		);
+		let (_, _, insensitive) = case_alias_replay(&dst, &payload);
+		if insensitive {
+			assert!(!dst.path().join("A/B/x.txt").exists());
+		} else {
+			assert_eq!(dst.git(&["ls-files"]), "A/B/c.txt\nA/b/x.txt");
+		}
+	}
+
+	#[test]
+	fn case_alias_deletes_a_tracked_file() {
+		let dst = Repo::new("main");
+		dst.write("Foo.txt", b"old\n");
+		dst.write("keep.txt", b"keep\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"delete\n",
+			vec![change("foo.txt", FileChange::Deleted, None)],
+		);
+		let (_, _, insensitive) = case_alias_replay(&dst, &payload);
+		assert!(
+			dst.path().join("Foo.txt").is_file(),
+			"insensitive: {insensitive}"
+		);
+	}
+
+	#[test]
+	fn case_alias_renames_from_a_tracked_file() {
+		let dst = Repo::new("main");
+		dst.write("Foo.txt", b"old\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let mut file = change("bar.txt", FileChange::Renamed, Some("old\n"));
+		file.old_path = Some("foo.txt".into());
+		let payload = bob("rename\n", vec![file]);
+		let (_, _, insensitive) = case_alias_replay(&dst, &payload);
+		if insensitive {
+			assert!(dst.path().join("Foo.txt").is_file());
+			assert!(!dst.path().join("bar.txt").exists());
+		}
+	}
+
+	#[test]
+	fn case_alias_of_a_file_only_the_index_still_tracks() {
+		let dst = Repo::new("main");
+		dst.write("Foo.txt", b"old\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		fs::remove_file(dst.path().join("Foo.txt")).unwrap();
+		let payload = bob(
+			"add\n",
+			vec![change("foo.txt", FileChange::Added, Some("x\n"))],
+		);
+		let (_, _, insensitive) = case_alias_replay(&dst, &payload);
+		if insensitive {
+			assert!(!dst.path().join("foo.txt").exists());
+		}
+	}
+
+	#[test]
+	fn case_alias_of_a_directory_an_earlier_commit_created() {
+		let dst = Repo::new("main");
+		dst.write("keep.txt", b"keep\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = two_commits(
+			batch_file("NEWDIR/a.txt", FileChange::Added),
+			batch_file("newdir/x.txt", FileChange::Added),
+		);
+		let (_, result, insensitive) = case_alias_replay(&dst, &payload);
+		if insensitive {
+			assert_eq!(result.created.len(), 1);
+			assert!(!dst.path().join("NEWDIR/x.txt").exists());
+		}
+	}
+
+	#[test]
+	fn case_alias_between_two_paths_of_one_commit() {
+		let dst = Repo::new("main");
+		dst.write("keep.txt", b"keep\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = bob(
+			"add\n",
+			vec![
+				change("Dir/a.txt", FileChange::Added, Some("a\n")),
+				change("dir/b.txt", FileChange::Added, Some("b\n")),
+			],
+		);
+		let (_, _, insensitive) = case_alias_replay(&dst, &payload);
+		let expect = if insensitive {
+			"keep.txt"
+		} else {
+			"Dir/a.txt\ndir/b.txt\nkeep.txt"
+		};
+		assert_eq!(dst.git(&["ls-files"]), expect);
+	}
+
+	// Not an alias: an earlier commit removed the old spelling, from the disk
+	// and the index, before this one writes the new one.
+	#[test]
+	fn case_alias_after_an_earlier_commit_deleted_the_old_spelling() {
+		let dst = Repo::new("main");
+		dst.write("Foo.txt", b"old\n");
+		dst.commit("base", "2019-01-01T00:00:00+00:00");
+		let payload = two_commits(
+			batch_file("Foo.txt", FileChange::Deleted),
+			batch_file("foo.txt", FileChange::Added),
+		);
+		let g = dst.open();
+		let plan = plan_commit_replay(&g, &payload);
+		assert_eq!(plan.commits[1].refused_by(), None);
+		let result = replay(&g, &payload);
+		assert_eq!(result.failure, None);
+		assert_eq!(result.created.len(), 2);
+		assert_eq!(dst.git(&["ls-files"]), "foo.txt");
+		assert_eq!(dst.git(&["status", "--porcelain"]), "");
+	}
+
+	#[test]
+	fn case_rename_in_one_commit_is_refused() {
+		for (old, new) in [("Foo.txt", "foo.txt"), ("DIR/a.txt", "dir/a.txt")] {
+			let dst = Repo::new("main");
+			dst.write(old, b"old\n");
+			dst.commit("base", "2019-01-01T00:00:00+00:00");
+			let mut file = change(new, FileChange::Renamed, Some("old\n"));
+			file.old_path = Some(old.into());
+			let payload = bob("rename\n", vec![file]);
+			let (_, _, insensitive) = case_alias_replay(&dst, &payload);
+			let expect = if insensitive { old } else { new };
+			assert_eq!(dst.git(&["ls-files"]), expect);
+		}
+	}
+
 	#[test]
 	fn batch_plan_walks_a_large_deletion_in_linear_time() {
 		let dst = Repo::new("main");
@@ -3992,20 +4646,16 @@ mod tests {
 			.unwrap();
 		let payload = deleting("parent/sub/last.txt");
 		let git = repo.open();
-		let session = ReplaySession::begin_in(
-			&git,
-			&spelled,
-			&payload,
-			&RunOptions::default(),
-		)
-		.map_err(|refused| {
-			refused
-				.failure
-				.as_ref()
-				.map(|f| f.error.clone())
-				.unwrap_or_default()
-		})
-		.unwrap();
+		let guard = ReplaySession::lock(&git, &RunOptions::default()).unwrap();
+		let session = ReplaySession::begin_in(&spelled, &payload, vec![guard])
+			.map_err(|refused| {
+				refused
+					.failure
+					.as_ref()
+					.map(|f| f.error.clone())
+					.unwrap_or_default()
+			})
+			.unwrap();
 		let result = session.run(&git, &payload);
 		assert_eq!(result.failure, None);
 		assert!(!repo.path().join("parent/sub/last.txt").exists());

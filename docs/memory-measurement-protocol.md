@@ -95,6 +95,7 @@ Rust 具備編譯期記憶體安全，但無法阻止無界集合、快取未淘
 | **GPUI 15 Repos Overview** | `--workspace <15_repo_dir> --mode overview` | `[READY:OVERVIEW]` | 穩態 ≤ 256 MiB（較 1 repo 增量 ≤ 96 MiB） |
 | **GPUI 15 Repos Preview** | `--workspace <15_repo_dir> --mode preview` | `[READY:PREVIEW]` | 穩態 ≤ 384 MiB（瞬間峰值 ≤ 512 MiB） |
 | **100-Switch Soak** | *需原生 UI 驅動程式* | *UI Driver* | 標記為 `PENDING`，不虛構切換資料 |
+| **3 Workspace Tabs**（`bench_native_memory.py --profile 3tabs`） | `--workspace <1_repo_dir> --mode normal`，再以「+」加輸入路徑開資料集另外兩個 repo，各一個工作區分頁 | 三個分頁的 repo 都載入、點回第一個分頁並完成與 1repo 相同的一次複製後的 nonce 就緒檔 | 第一版只量測、不設門檻；拿到數字後再訂 |
 | **Tauri Baseline**（driver 已移除，僅存歷史紀錄） | `scripts/measure_tauri.sh`（WebDriver 驅動真 app，attach 模式取樣） | 隨機 nonce 就緒檔 | idle／1 repo 已量測；15 repo `UNSUPPORTED`（Tauri 只有單一 repo）。見 [`tauri-baseline-measurement.md`](tauri-baseline-measurement.md)，不宣稱節省比例 |
 
 ---
@@ -166,6 +167,7 @@ python3 scripts/bench_native_memory.py \
 
 - 原生 driver 的 launcher 會等取樣閘道再 `execv`。launch 樣本只存在於觀察到 exe 轉換之後；轉換前的 launcher 記憶體是 `launcher-setup`，不計入目標峰值。
 - `--compare-baseline` 會以狀態 2 結束並印出 `UNSUPPORTED`。
+- `3tabs` 不在預設輪廓裡，要用 `--profile 3tabs` 指定（可與其他 `--profile` 並用），並且 `--workspace` 要是資料集：第一個分頁是 `--repo`（預設資料集的 `repo-01-core`），另外兩個是資料集裡排在前面的其他 repo。等待一律經過 `e2e_scaled`，慢的機器設 `SNIP_E2E_TIMEOUT_SCALE`。
 
 ### 自動化合約測試
 

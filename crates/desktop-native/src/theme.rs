@@ -69,6 +69,8 @@ pub struct Palette {
 	pub border: u32,
 	pub divider: u32,
 	pub hover_bg: u32,
+	/// Hover on the workspace tab bar, which sits on `header_bg`.
+	pub tab_hover_bg: u32,
 	pub selection_bg: u32,
 	pub selection_inactive_bg: u32,
 	pub range_bg: u32,
@@ -153,6 +155,7 @@ pub static DARK: Palette = Palette {
 	border: 0x26282c,                // tool-window-border
 	divider: 0x33353b,               // Separator.separatorColor = popup-border
 	hover_bg: 0x2e2f30,              // toolbar-bg-hovered #FFFFFF17 over #191A1C
+	tab_hover_bg: 0x2e2f30,          // hover_bg
 	selection_bg: 0x2a4371,          // selection-bg-active
 	selection_inactive_bg: 0x33353b, // selection-bg-inactive
 	range_bg: 0x233558,              // selection-bg-active-muted
@@ -224,6 +227,7 @@ pub static LIGHT: Palette = Palette {
 	border: 0xe9eaee,                // tool-window-border
 	divider: 0xdddfe4,               // layer-1-border
 	hover_bg: 0xededed,              // toolbar-bg-hovered #00000012 over #FFFFFF
+	tab_hover_bg: 0xd8d9dd,          // toolbar-bg-hovered #00000012 over #E9EAEE
 	selection_bg: 0xd0dffe,          // selection-bg-active
 	selection_inactive_bg: 0xe9eaee, // selection-bg-inactive
 	range_bg: 0xe3ebfe,              // selection-bg-active-muted
@@ -371,6 +375,7 @@ mod tests {
 			("border", d.border, l.border),
 			("divider", d.divider, l.divider),
 			("hover_bg", d.hover_bg, l.hover_bg),
+			("tab_hover_bg", d.tab_hover_bg, l.tab_hover_bg),
 			("selection_bg", d.selection_bg, l.selection_bg),
 			(
 				"selection_inactive_bg",
@@ -458,6 +463,31 @@ mod tests {
 		};
 		assert!(luma(d.editor_bg) < 64 && luma(l.editor_bg) > 192);
 		assert!(luma(d.text) > 192 && luma(l.text) < 64);
+	}
+
+	/// Hovering a tab that is not shown visibly changes its background
+	/// against the tab bar, and stays apart from the shown tab (WT81,
+	/// #148: the light hover `#ededed` on `#e9eaee` could not be seen).
+	#[test]
+	fn tab_hover_stands_out_on_the_tab_bar() {
+		let gap = |a: u32, b: u32| {
+			let (a, b) = (a.to_be_bytes(), b.to_be_bytes());
+			(1..4).map(|i| a[i].abs_diff(b[i])).max().unwrap()
+		};
+		for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+			assert!(
+				gap(p.tab_hover_bg, p.header_bg) >= 8,
+				"{name}: tab hover {:06x} on tab bar {:06x}",
+				p.tab_hover_bg,
+				p.header_bg
+			);
+			assert!(
+				gap(p.tab_hover_bg, p.range_bg) >= 8,
+				"{name}: tab hover {:06x} vs shown tab {:06x}",
+				p.tab_hover_bg,
+				p.range_bg
+			);
+		}
 	}
 
 	#[test]

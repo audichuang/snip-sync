@@ -22,7 +22,7 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 
 ## Before you call a change done
 
-- Before pushing a change that can alter a gate's result (code, scripts, CI config, Cargo files, fixtures), run `just preflight`. A failure CI finds that preflight would have caught is a process bug. On Linux it runs CI's Linux jobs. On macOS it runs CI's macOS checks, then the Linux jobs, native acceptance included, in an Apple `container` VM (`scripts/linux_container.sh`). Windows has no container path: run `just preflight-host`. Run it from a full clone (`git clone --no-local`), not a `git worktree`: the container mounts only the checkout, so native acceptance cannot reach a worktree's git dir, nor the main checkout's gitignored `.ts-ref/`; copy that into the clone, or the cross-tool tests fail. Set `SNIP_REQUIRE_ALL_TESTS=1` as CI does: preflight does not, so a test that skips on your machine passes preflight and fails CI.
+- Before pushing a change that can alter a gate's result (code, scripts, CI config, Cargo files, fixtures), run `just preflight`. A failure CI finds that preflight would have caught is a process bug. On Linux it runs CI's Linux jobs. On macOS it runs the Linux jobs, native acceptance included, in an Apple `container` VM (`scripts/linux_container.sh`), and CI's macOS checks on the host while acceptance runs. Only one preflight container runs per Mac: every checkout's shares the cargo registry volumes, and a second one fails to start with "The storage device attachment is invalid". Windows has no container path: run `just preflight-host`. Run it from a full clone (`git clone --no-local`), not a `git worktree`: the container mounts only the checkout, so native acceptance cannot reach a worktree's git dir, nor the main checkout's gitignored `.ts-ref/`; copy that into the clone, or the cross-tool tests fail. Set `SNIP_REQUIRE_ALL_TESTS=1` as CI does: preflight does not, so a test that skips on your machine passes preflight and fails CI.
 - Each checkout's container target/ volume takes 12-25 GB. A passing preflight drops its own; a failed one keeps it for the rerun, and a deleted clone's stays until some checkout's next preflight. Deleting a clone or worktree is not cleanup: run `just clean` from a checkout that remains (it also clears that checkout's target/ and its worktrees'). Once only cargo's target/ was cleaned and 74 GB of volumes stayed.
 - A push that cannot change any gate's result skips preflight: only `.md` files, or a `.gitignore` entry. CI still runs every job. A script under `docs/` is not Markdown; run the script itself.
 - Remote workspaces have their own end-to-end gate, apart from the GUI gates: `scripts/remote_e2e.sh` has a real `snip remote` master start real `snip serve --stdio` workers. Preflight and CI run it on this machine (`just remote-e2e`), on every OS. A change to `crates/remote`, to the CLI's `serve` or `remote` commands, or to anything they call is not done until `just remote-e2e-ssh <host>` also passed against a second machine, where the worker is started over ssh.
@@ -30,8 +30,10 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 - Where a test goes: pure logic → a unit test in `crates/core` or the native crate; UI state and interaction → `#[gpui::test]` in `crates/desktop-native/src/main.rs` `tests::in_process` (no display, all OSes); real input, clipboard or pixels → `crates/native-e2e/tests/smoke.rs` / `lifecycle.rs` (Xvfb; on macOS inside the preflight container); CLI behaviour and output → `crates/cli/tests/cli.rs`; byte round trips and TS compatibility → `crates/cli/tests/e2e.rs`; cross-machine file/commit semantics → a collaboration manifest step; remote connection behaviour → a check in `scripts/remote_e2e.sh`. macOS and Windows have no real-input GUI test.
 - A `#[gpui::test]` about focus or keys after a UI flow drives that flow with the user's gesture (`simulate_click` on `debug_bounds`, `simulate_keystrokes`), not the model method it ends in: a clicked control takes the focus. A test that called `open_remote_path` passed while the first Cmd+V after opening from the menu did nothing.
 - A control a test drives gets a `probe(...)` id; drivers read it from `[APP:CTRL_BOUNDS]`.
+- `cx.quit()` must not run inside a platform callback such as `on_window_should_close`: on X11 the client is still borrowed there and the app panics, and `cx.defer` runs inside the same callback. Quit from a spawned task, on the next turn of the event loop.
 - Test code must not call `window.refresh()` to make a layout show up: `refresh()` is a no-op while GPUI draws, and a test that refreshes for itself hid a layout that never redrew after a resize. `scripts/check_test_refresh.sh` (preflight and CI) rejects any test `.refresh()` without a `// ALLOWED-TEST-REFRESH: <reason>`.
 - Real-UI rounds (`docs/real-ui-operator-protocol.md`, `docs/remote-real-ui-protocol.md`) are set up and torn down with `scripts/real_ui_round.py`; hand-built rounds were invalidated by unisolated config, leftovers and failed resizes.
+- While a real-UI round runs, nothing else on that Mac may write the clipboard: the cells compare it, and host tests and preflight write it. One test run during a round turned a remote cell `not-run`.
 - Tests run under cargo-nextest, one process per test, so a `static` `Mutex` serializes nothing across tests. A test that touches the OS clipboard takes the file lock the existing helpers take (desktop `clipboard()`, core `lock_test_clipboard`).
 - Every file the desktop app persists resolves its folder through `recent::config_dir()`, which returns nothing under `cfg(test)` and in an e2e run without `SNIP_CONFIG_DIR`. A store that took another path let `cargo test` overwrite the user's real `recent-workspaces.json`.
 - Real-app waits go through `snip_native_e2e::scaled(...)`, or `bench_native_memory.e2e_scaled(...)` in the Python harness. On a slow machine set `SNIP_E2E_TIMEOUT_SCALE` (CI uses 2) instead of raising a deadline or rerunning; when the gates share one machine, as in the macOS container, lower their parallelism with `SNIP_ACCEPTANCE_ARGS`.
@@ -52,3 +54,13 @@ Behaviour is defined in `docs/spec.md` (what), `docs/plan.md` (how) and `docs/po
 ## GitHub Actions
 
 The repo is private: an action that reads the GitHub API (PR files, merged PRs) needs the permission in the job's `permissions:`, e.g. `pull-requests: read`. This has failed CI twice.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues, through the `gh` CLI; the older `docs/tickets/T-*.md` are history. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

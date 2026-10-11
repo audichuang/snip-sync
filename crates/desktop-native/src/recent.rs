@@ -45,13 +45,22 @@ pub fn load() -> Vec<PathBuf> {
 	file().map(|f| load_from(&f)).unwrap_or_default()
 }
 
-/// Moves `path` to the front of `list` and saves it. A failed write only
-/// loses the list, never the workspace.
+/// Moves `path` to the front of the saved list, refreshes `list` from it
+/// and saves it. Every workspace tab keeps its own copy, so the file is
+/// read first: another tab's entry is not written over. A failed write
+/// only loses the list, never the workspace.
 pub fn remember(list: &mut Vec<PathBuf>, path: &Path) {
+	let Some(f) = file() else {
+		push_front(list, path);
+		return;
+	};
+	remember_in(&f, list, path);
+}
+
+fn remember_in(f: &Path, list: &mut Vec<PathBuf>, path: &Path) {
+	*list = load_from(f);
 	push_front(list, path);
-	if let Some(f) = file() {
-		save_to(&f, list);
-	}
+	save_to(f, list);
 }
 
 /// Drops folders that no longer exist.
@@ -118,5 +127,23 @@ mod tests {
 		assert!(!loaded.contains(&dirs[11]));
 		assert_eq!(loaded.len(), CAP - 1);
 		assert!(load_from(&tmp.path().join("missing.json")).is_empty());
+	}
+
+	/// Two workspace tabs each hold a copy of the list; the second open
+	/// must keep the first one's entry.
+	#[test]
+	fn a_second_tab_keeps_the_first_tabs_entry() {
+		let tmp = tempfile::tempdir().unwrap();
+		let a = tmp.path().join("a");
+		let b = tmp.path().join("b");
+		std::fs::create_dir(&a).unwrap();
+		std::fs::create_dir(&b).unwrap();
+		let f = tmp.path().join("recent-workspaces.json");
+		let mut tab_one = Vec::new();
+		let mut tab_two = Vec::new();
+		remember_in(&f, &mut tab_one, &a);
+		remember_in(&f, &mut tab_two, &b);
+		assert_eq!(load_from(&f), vec![b.clone(), a.clone()]);
+		assert_eq!(tab_two, vec![b, a]);
 	}
 }

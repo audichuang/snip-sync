@@ -5,6 +5,9 @@ use super::*;
 
 /// Height of the folder list before it scrolls: about eight rows.
 const REMOTE_FOLDERS_MAX_H: f32 = 240.;
+/// What the folder list keeps when the menu runs out of height: three rows
+/// (a scroller would otherwise give up all of it first, #147).
+const REMOTE_FOLDERS_MIN_ROWS: usize = 3;
 
 impl WorkbenchModel {
 	pub(super) fn render_remote_section(
@@ -34,9 +37,11 @@ impl WorkbenchModel {
 		let browse = self.remote.browse.as_ref();
 		for (ix, host) in self.remote.hosts.iter().enumerate() {
 			let id = format!("remote-host:{ix}");
+			let selector = id.clone();
 			let open = browse.is_some_and(|b| b.host == ix);
 			out.push(
 				menu_row(SharedString::from(id.clone()), 82)
+					.debug_selector(move || selector)
 					.tooltip(tip(host.name.clone()))
 					.when(open, |d| d.bg(rgb(pal().hover_bg)))
 					.on_click(cx.listener(move |this, _, _, cx| {
@@ -207,9 +212,15 @@ impl WorkbenchModel {
 					out.push(
 						div()
 							.id("remote-folders")
+							.debug_selector(|| "remote-folders".into())
 							.flex()
 							.flex_col()
 							.max_h(px(REMOTE_FOLDERS_MAX_H))
+							.min_h(px(listing
+								.folders
+								.len()
+								.min(REMOTE_FOLDERS_MIN_ROWS)
+								as f32 * (ROW_H + 4.)))
 							.overflow_y_scroll()
 							.children(rows)
 							.into_any_element(),

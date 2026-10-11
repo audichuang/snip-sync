@@ -228,7 +228,13 @@ def verify_launch(bin_path: Path, timeout_sec: float = 60.0) -> None:
     # A file, not a pipe: a child the app spawns inherits the handle and can
     # outlive the kill, and reading or closing a pipe it holds never returns.
     log_path = work / "app.log"
-    kwargs = {"stderr": subprocess.STDOUT, "env": dict(os.environ, SNIP_NATIVE_E2E="1")}
+    # A config folder of its own: the launch neither restores nor saves the
+    # user's workspace tabs.
+    config = work / "config"
+    kwargs = {
+        "stderr": subprocess.STDOUT,
+        "env": dict(os.environ, SNIP_NATIVE_E2E="1", SNIP_CONFIG_DIR=str(config)),
+    }
     if os.name == "posix":
         kwargs["start_new_session"] = True
     proc = None

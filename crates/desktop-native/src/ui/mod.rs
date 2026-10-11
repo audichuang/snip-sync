@@ -377,7 +377,7 @@ pub fn probe(
 /// E2E only: last child of the root, deferred above every popup and menu,
 /// so its prepaint runs after every probe of the frame; announces controls
 /// that are no longer drawn and covered controls.
-fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
+pub(crate) fn probe_frame_end(probes: &Option<Probes>) -> Option<AnyElement> {
 	let frame = probes.as_ref()?.0.clone();
 	Some(
 		deferred(
@@ -429,14 +429,16 @@ fn focus_ring<E: Styled + InteractiveElement>(el: E) -> E {
 	}
 }
 
-struct Tip(SharedString);
+/// A tooltip's text, read again on every frame it is shown.
+struct Tip(Rc<dyn Fn(&App) -> SharedString>);
 
 impl Render for Tip {
 	fn render(
 		&mut self,
 		_: &mut Window,
-		_: &mut Context<Self>,
+		cx: &mut Context<Self>,
 	) -> impl IntoElement {
+		let text = (self.0)(cx);
 		div()
 			.px_2()
 			.py_1()
@@ -448,14 +450,28 @@ impl Render for Tip {
 			.border_color(rgb(pal().divider))
 			.text_size(px(SMALL_TEXT))
 			.text_color(rgb(pal().text))
-			.child(self.0.clone())
+			.debug_selector({
+				let text = text.clone();
+				move || format!("tooltip:{text}")
+			})
+			.child(text)
 	}
 }
 
-fn tip(
+pub(crate) fn tip(
 	text: impl Into<SharedString>,
 ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
 	let text = text.into();
+	live_tip(move |_| text.clone())
+}
+
+/// A tooltip whose text follows the state it reads (#148): GPUI keeps a
+/// shown tooltip's view while the mouse stays, so text fixed when it opened
+/// goes stale when, say, a tab switch changes the language under it.
+pub(crate) fn live_tip(
+	text: impl Fn(&App) -> SharedString + 'static,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+	let text: Rc<dyn Fn(&App) -> SharedString> = Rc::new(text);
 	move |_, cx| cx.new(|_| Tip(text.clone())).into()
 }
 
@@ -520,9 +536,9 @@ fn button(
 }
 
 /// `Ctrl+Shift+X` as macOS prints it (`⇧⌘X`); unchanged elsewhere.
-fn mac_keys(text: &str) -> String {
+pub(crate) fn mac_keys(text: &str) -> String {
 	if cfg!(target_os = "macos") {
-		text.replace("Ctrl+Shift+", "⇧⌘")
+		text.replace("Ctrl+Shift+", "⇧⌘").replace("Ctrl+", "⌘")
 	} else {
 		text.to_string()
 	}
@@ -559,7 +575,7 @@ fn fill_text(text: impl Into<SharedString>) -> Div {
 		.child(text.into())
 }
 
-fn clip_text(text: impl Into<SharedString>) -> Div {
+pub(crate) fn clip_text(text: impl Into<SharedString>) -> Div {
 	div()
 		.min_w_0()
 		.overflow_hidden()
@@ -824,6 +840,15 @@ impl WorkbenchModel {
 		cx.notify();
 	}
 
+	/// The window's logical size less the tab bar above the model.
+	fn body_size(&self, window: &Window) -> (f32, f32) {
+		let vp = window.viewport_size();
+		(
+			f32::from(vp.width),
+			(f32::from(vp.height) - self.top_inset).max(0.),
+		)
+	}
+
 	fn effective_left_w(&self, vw: f32) -> f32 {
 		self.left_w.min((vw - RAIL_W) * 0.45)
 	}
@@ -845,15 +870,16 @@ impl WorkbenchModel {
 			self.end_drag(cx);
 			return;
 		}
-		let vp = window.viewport_size();
-		let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
+		let (vw, vh) = self.body_size(window);
+		// Pointer y in the model's own coordinates (under the tab bar).
+		let y = f32::from(ev.position.y) - self.top_inset;
 		match which {
 			Splitter::Left => {
 				let want = f32::from(ev.position.x) - RAIL_W;
 				self.left_w = want.min((vw - RAIL_W) * 0.45).max(LEFT_W_MIN);
 			}
 			Splitter::Bottom => {
-				let want = vh - STATUS_H - f32::from(ev.position.y);
+				let want = vh - STATUS_H - y;
 				self.bottom_h = want
 					.min((vh - HEADER_H - STATUS_H) * 0.55)
 					.max(BOTTOM_H_MIN);
@@ -864,7 +890,7 @@ impl WorkbenchModel {
 			}
 			Splitter::LogFiles => {
 				// The log island ends at the status bar.
-				let want = vh - STATUS_H - f32::from(ev.position.y);
+				let want = vh - STATUS_H - y;
 				self.log_details_h = Some(
 					want.min(self.effective_bottom_h(vh) * 0.8)
 						.max(LOG_DETAILS_H_MIN),
@@ -1087,7 +1113,7 @@ impl WorkbenchModel {
 
 	/// Rows one PageUp/PageDown moves in the left tool window.
 	fn tool_page_rows(&self, window: &Window) -> isize {
-		let h = f32::from(window.viewport_size().height);
+		let h = self.body_size(window).1;
 		((h - HEADER_H - STATUS_H - PANEL_HEADER_H) / ROW_H) as isize - 2
 	}
 
@@ -1474,6 +1500,10 @@ impl Render for WorkbenchModel {
 		if self.focus_lost_guard.is_none() {
 			self.focus_lost_guard =
 				Some(cx.on_focus_lost(window, |this, window, cx| {
+					// A background workspace tab draws nothing to focus.
+					if !crate::tabs::is_shown(this.ws_tab) {
+						return;
+					}
 					window.focus(&this.focus_handle);
 					app_log!("[APP:FOCUS: workbench (stale handle)]");
 					cx.notify();
@@ -1482,15 +1512,18 @@ impl Render for WorkbenchModel {
 		if window.focused(cx).is_none() {
 			window.focus(&self.focus_handle);
 		}
-		let vp = window.viewport_size();
-		let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
+		let (vw, vh) = self.body_size(window);
 		if self.log_width.get() == 0.0 && vw > 0.0 {
 			self.log_width.set((vw - 32.0).max(0.0));
 		}
 		let s = window.scale_factor();
 		let phys = ((vw * s).round() as i32, (vh * s).round() as i32);
 		self.viewport_h = vh;
-		if self.probes.is_some() && phys != self.last_viewport {
+		// A workspace tab's window size is the root's to report.
+		if self.ws_tab.is_none()
+			&& self.probes.is_some()
+			&& phys != self.last_viewport
+		{
 			self.last_viewport = phys;
 			app_log!("[APP:VIEWPORT: {}x{}]", phys.0, phys.1);
 		}
@@ -2361,6 +2394,10 @@ mod tests {
 			)),
 			("op_refused", pal.error, "reason_refused_file_in_way")
 		);
+		assert_eq!(
+			paste_style(RowAction::CommitRefused(LayoutConflict::CaseAlias)),
+			("op_refused", pal.error, "reason_refused_case_alias")
+		);
 
 		fn all_skip_causes() -> Vec<SkipCause> {
 			// 每個變體各放一個代表值；新增變體時一併加入 seed，否則下方分支不會執行
@@ -2445,6 +2482,9 @@ mod tests {
 						));
 						out.push(RowAction::CommitRefused(
 							LayoutConflict::FileInTheWayOfParent,
+						));
+						out.push(RowAction::CommitRefused(
+							LayoutConflict::CaseAlias,
 						));
 					}
 				}

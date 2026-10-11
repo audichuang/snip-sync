@@ -751,6 +751,9 @@ impl Frame {
         self.deferred_draws.clear();
         self.tab_stops.clear();
         self.focus = None;
+        // SNIP PATCH: a test sees only what the last frame painted.
+        #[cfg(any(feature = "test-support", test))]
+        self.debug_bounds.clear();
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         {

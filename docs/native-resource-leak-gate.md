@@ -36,6 +36,7 @@ python3 -B scripts/check_native_leaks.py \
 - RSS 與 PSS：後三分之一中位數減前三分之一 `<= max(32 MiB, 基線 10%)`，而且斜率 `<= 0.25 MiB／次`。
 - fd `<= 2`，thread `<= 4`。
 - inotify watch 成長 `<= 0`，而且只在同一組靜止的 repo／view／開關狀態上比較。不同的合法 watch 集合不是洩漏。讀不到 fdinfo 是 null，不是 0。
+- 工作區分頁序列：同一個 repo 用「+」加輸入路徑開進新分頁、等它載入、Ctrl+W 關掉，反覆 N 次（short 與 long 都是暖機 5 次、實測 30 次，每 5 次一個終點，`--warmup-tab-cycles`／`--measured-tab-cycles` 只能往上調）。每批結束回到同一個 canonical repo／GitChanges 再 settle。這條序列另外判，不混進 repo 切換的趨勢：RSS／PSS、fd、thread、inotify watch 用上面同樣的門檻，斜率改成每開關一次。每次開關都要回到一個分頁，關掉的分頁自己的收尾要排空。
 - GPU 不估計，也不加進 RSS／PSS。`vramBytes` 維持 null。內部 task 讀不到就維持 null，不可以填 0。
 
 根身分是 pid + starttime + 執行檔 realpath，而且必須等於這次選中的 binary realpath。product run 的報告一定要有 app pid、starttime、exe。每個 action、樣本、基線窗與結尾窗都對這組身分。`/proc/<pid>/exe` 出現 ` (deleted)` 是失敗。子程序的 task／children 讀不到時，Git 子程序是 null，不是 0，這筆資源樣本不完整。fd／thread／watch 讀完才再讀身分，根程序也要再讀一次。
@@ -44,13 +45,13 @@ long 還要：實測至少 500、暖機 20、至少 10 個檢查點、每次 set
 
 ## 覆蓋
 
-short 子閘要求 8 項互動的完整覆蓋：repo 切換與 history 的新鮮日誌（`REPO_SELECTING`、`REPO_LOADED` 檔案數等於 source-row oracle、`GRAPH_LOADED`），加上 tree（`TREE_FILE_SELECTED`、`TREE_EXPANDED` 或 `TREE_TOGGLED`）、copy（`copy_explicit_selection` 驗證 oracle）、paste（`PASTE_PREVIEW`）、cancel（`PASTE_CANCELLED`）、workspace 關閉再開啟（`btn-workspace-menu`、`btn-close-workspace`、`[APP:WORKSPACE: state=closed]`、drained 驗證、`btn-open-workspace`、`workspace-path-input`、`btn-workspace-open-confirm`、`[APP:WORKSPACE: state=open]`、`READY_REPOS` 相符、PID+starttime 同一程序、剪貼簿 sentinel 保留、Git 子程序排空）與 graceful quit（`ctrl+q` 觸發 `[APP:QUIT: deferred]`、退出碼 0、無存活 app 子程序）。任何嘗試的操作失敗或缺漏皆拒絕（`missing-coverage`）。
+short 子閘要求 9 項互動的完整覆蓋：repo 切換與 history 的新鮮日誌（`REPO_SELECTING`、`REPO_LOADED` 檔案數等於 source-row oracle、`GRAPH_LOADED`），加上 tree（`TREE_FILE_SELECTED`、`TREE_EXPANDED` 或 `TREE_TOGGLED`）、copy（`copy_explicit_selection` 驗證 oracle）、paste（`PASTE_PREVIEW`）、cancel（`PASTE_CANCELLED`）、workspace 關閉再開啟（`btn-workspace-menu`、`btn-close-workspace`、`[APP:WORKSPACE: state=closed]`、drained 驗證、`btn-open-workspace`、`workspace-path-input`、`btn-workspace-open-confirm`、`[APP:WORKSPACE: state=open]`、`READY_REPOS` 相符、PID+starttime 同一程序、剪貼簿 sentinel 保留、Git 子程序排空）、工作區分頁開關（`ws-tab-new`、`[APP:WS_TAB_OPENED: … count=2]`、輸入路徑開啟、`Ctrl+W`、`[APP:WS_TAB_CLOSED: … count=1]`、該分頁的 close drained，次數等於暖機加實測）與 graceful quit（`ctrl+q` 觸發 `[APP:QUIT: deferred]`、退出碼 0、無存活 app 子程序）。任何嘗試的操作失敗或缺漏皆拒絕（`missing-coverage`）。
 
 隔離顯示上的剪貼簿在取樣前放進固定 payload。收尾要嘛仍是同一份內容，要嘛明文標出 copy 留下的 payload。不可以把剪貼簿清成空的來過記憶體預算。workspace close 與 reopen 必須保留剪貼簿。
 
-tree、copy（右鍵「複製」一個變更列）、paste、cancel 與 workspace close/reopen 都在終點資源窗之前完成。清完回到同一個 canonical repo／GitChanges，settle 之後才寫終點樣本。長閘的 30 秒結尾窗也在這些操作之後，並且落在觀察的最後 30 秒。終點資源取樣完成後才送出 graceful quit。
+分頁開關序列接在 repo 切換的實測之後；tree、copy（右鍵「複製」一個變更列）、paste、cancel 與 workspace close/reopen 都在終點資源窗之前完成。清完回到同一個 canonical repo／GitChanges，settle 之後才寫終點樣本。長閘的 30 秒結尾窗也在這些操作之後，並且落在觀察的最後 30 秒。終點資源取樣完成後才送出 graceful quit。
 
-long 仍要求 600 秒浸泡、500 次切換、30 秒基線與結尾窗，以及包含 hide 與 tray 的完整 release 覆蓋（10 項）。在 hide 與 tray 產品契約尚未就緒前，long 誠實回傳 `NOT_ACCEPTED`（exit code 1，`missing-coverage`），不跳過也不做整體產品或 D4 認證。
+long 仍要求 600 秒浸泡、500 次切換、30 秒基線與結尾窗，以及包含 hide 與 tray 的完整 release 覆蓋（11 項）。在 hide 與 tray 產品契約尚未就緒前，long 誠實回傳 `NOT_ACCEPTED`（exit code 1，`missing-coverage`），不跳過也不做整體產品或 D4 認證。
 
 ## 測試
 

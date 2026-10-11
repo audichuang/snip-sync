@@ -18,7 +18,7 @@ use snip_core::commits::{
 use snip_core::copy::CopyResult;
 use snip_core::format::{extract_source_root, parse_clipboard};
 use snip_core::gitrun::{CancelToken, RunOptions};
-use snip_core::gitsrc::{Git, GitSource};
+use snip_core::gitsrc::{Git, GitError, GitSource};
 use snip_core::restore::{
 	apply_restore_base, is_relative, suggest_restore_base, FsProbe,
 	RestorePlan, RestoreSelection,
@@ -672,6 +672,9 @@ fn format_transfer_error(err: TransferError) -> String {
 		}
 		TransferError::SpecialFile(_)
 		| TransferError::DestinationNotRegular(_) => err.paste_message(),
+		TransferError::Git(GitError::WorktreeBusy { .. }) => format!(
+			"Snipcode refused to paste: {err}; try again when the other paste finishes"
+		),
 		other => other.to_string(),
 	}
 }
@@ -690,6 +693,12 @@ fn format_remote_error(err: snip_remote::RemoteError) -> String {
 			message,
 		} => format!(
 			"Snipcode refused to paste: {message}; re-run to inspect updated destinations"
+		),
+		RemoteError::Refused {
+			code: ErrorCode::Busy,
+			message,
+		} if message.contains("another paste is writing") => format!(
+			"Snipcode refused to paste: {message}; try again when the other paste finishes"
 		),
 		other => other.to_string(),
 	}
@@ -1032,6 +1041,11 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 				"{would_create} commit(s) would be created; replay stops at commit #{} (refused); {not_reached} not reached.",
 				first_idx + 1
 			);
+			let hint =
+				plan.commits[first_idx].refused_by().and_then(|c| c.hint());
+			if let Some(hint) = hint {
+				eprintln!("hint: {hint}");
+			}
 		} else {
 			eprintln!("{total} commit(s) would be created.");
 		}
@@ -1062,11 +1076,14 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 	match result.failure {
 		None => Ok(()),
 		Some(f) => Err(format!(
-			"Commit {} of {} failed ({}): {}",
+			"Commit {} of {} failed ({}): {}{}",
 			f.index + 1,
 			payload.commits.len(),
 			f.message.lines().next().unwrap_or(""),
-			f.error
+			f.error,
+			f.layout_conflict
+				.and_then(|c| c.hint())
+				.map_or(String::new(), |h| format!("\nhint: {h}"))
 		)),
 	}
 }

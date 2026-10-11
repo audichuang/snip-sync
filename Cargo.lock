@@ -5323,6 +5323,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snip-core",
+ "snip-native-e2e",
  "snip-remote",
  "tempfile",
  "unicode-segmentation",
@@ -5332,6 +5333,7 @@ dependencies = [
 name = "snip-native-e2e"
 version = "0.9.0"
 dependencies = [
+ "serde_json",
  "snip-core",
  "tempfile",
 ]

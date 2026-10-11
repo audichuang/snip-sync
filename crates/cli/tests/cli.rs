@@ -182,6 +182,126 @@ fn file_mode_round_trip() {
 }
 
 #[test]
+fn paste_is_refused_while_another_paste_holds_the_repository() {
+	use snip_core::gitrun::RunOptions;
+	use snip_core::gitsrc::Git;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&dst);
+	fs::write(dst.join("keep.txt"), "keep\n").unwrap();
+	commit(&dst, "base", "2026-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = b"// file: new.txt\nnew content\n";
+
+	let id = RepoIdentity::resolve(
+		&Git::open(&dst).unwrap(),
+		&RunOptions::default(),
+	)
+	.unwrap();
+	let held = lock_heavy(&id).unwrap();
+	let out = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload),
+	);
+	assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+	assert!(
+		text(&out.stderr)
+			.contains("another paste is writing to this repository"),
+		"{}",
+		text(&out.stderr)
+	);
+	assert!(!dst.join("new.txt").exists());
+
+	drop(held);
+	let out = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload),
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	assert_eq!(
+		fs::read_to_string(dst.join("new.txt")).unwrap(),
+		"new content"
+	);
+}
+
+#[test]
+fn paste_from_parent_is_refused_while_nested_repository_is_locked() {
+	use snip_core::gitrun::RunOptions;
+	use snip_core::gitsrc::Git;
+	use snip_core::workspace::{lock_heavy, RepoIdentity};
+
+	for parent_is_repo in [false, true] {
+		let tmp = tempfile::tempdir().unwrap();
+		let parent = tmp.path().join("parent");
+		let child = parent.join("child");
+		fs::create_dir_all(&child).unwrap();
+		if parent_is_repo {
+			init_repo(&parent);
+		}
+		init_repo(&child);
+		fs::write(child.join("keep.txt"), "original\n").unwrap();
+		fs::write(child.join("delete.txt"), "keep until applied\n").unwrap();
+		commit(&child, "base", "2026-01-01T00:00:00+00:00");
+		let payload = b"// file: outside.txt\nouter content\n\
+// file: child/new/deep.txt\nnew content\n\
+// file: child/keep.txt\nreplacement\n\
+// file: [DELETED] child/delete.txt\n";
+		let args = [
+			"--repo",
+			parent.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--overwrite",
+			"--stdin",
+		];
+		let id = RepoIdentity::resolve(
+			&Git::open(&child).unwrap(),
+			&RunOptions::default(),
+		)
+		.unwrap();
+		let held = lock_heavy(&id).unwrap();
+		let out = snip(&args, Some(payload));
+		assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+		assert!(
+			text(&out.stderr)
+				.contains("another paste is writing to this repository"),
+			"{}",
+			text(&out.stderr)
+		);
+		assert!(!parent.join("outside.txt").exists());
+		assert!(!child.join("new").exists());
+		assert_eq!(
+			fs::read_to_string(child.join("keep.txt")).unwrap(),
+			"original\n"
+		);
+		assert_eq!(
+			fs::read_to_string(child.join("delete.txt")).unwrap(),
+			"keep until applied\n"
+		);
+
+		drop(held);
+		let out = snip(&args, Some(payload));
+		assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+		assert_eq!(
+			fs::read_to_string(parent.join("outside.txt")).unwrap(),
+			"outer content"
+		);
+		assert_eq!(
+			fs::read_to_string(child.join("new/deep.txt")).unwrap(),
+			"new content"
+		);
+		assert_eq!(
+			fs::read_to_string(child.join("keep.txt")).unwrap(),
+			"replacement"
+		);
+		assert!(!child.join("delete.txt").exists());
+	}
+}
+
+#[test]
 fn commit_mode_round_trip() {
 	let tmp = tempfile::tempdir().unwrap();
 	let a = tmp.path().join("a");
@@ -622,6 +742,80 @@ fn paste_commits_dry_run_plans_each_commit_after_the_earlier_ones() {
 		all.contains("a file is in the way of its parent directory"),
 		"{all}"
 	);
+}
+
+#[test]
+fn paste_commits_refuses_a_case_alias_in_dry_run_and_apply() {
+	// Issue #140: `newdir/x.txt` into a destination tracking `NEWDIR/a.txt`.
+	// A case-insensitive filesystem refuses the commit in both, before
+	// anything is written; a case-sensitive one writes `newdir/` beside it.
+	let tmp = tempfile::tempdir().unwrap();
+	let probe = tmp.path().join("probe_x");
+	fs::write(&probe, "x").unwrap();
+	let case_insensitive = tmp.path().join("PROBE_X").exists();
+	let dst = tmp.path().join("dst");
+	fs::create_dir_all(&dst).unwrap();
+	init_repo(&dst);
+	fs::create_dir_all(dst.join("NEWDIR")).unwrap();
+	fs::write(dst.join("NEWDIR/a.txt"), "a\n").unwrap();
+	commit(&dst, "initial", "2024-01-01T00:00:00+00:00");
+	let dst_s = dst.to_str().unwrap();
+	let payload = commits_payload(&[(
+		"add under alias",
+		&[("newdir/x.txt", "ADDED", Some("x\n"))],
+	)]);
+	let dry = snip(
+		&["--repo", dst_s, "paste", "--dry-run", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	let (stdout, stderr) = (text(&dry.stdout), text(&dry.stderr));
+	let apply = snip(
+		&["--repo", dst_s, "paste", "--apply", "--stdin"],
+		Some(payload.as_bytes()),
+	);
+	let all = format!("{}{}", text(&apply.stdout), text(&apply.stderr));
+	let reason = "the path differs only in letter case from another one in the destination or the commit";
+	let hint = "hint: paste the files in file mode instead, or first rename the path to match the existing case";
+	let status = Command::new("git")
+		.args(["status", "--porcelain"])
+		.current_dir(&dst)
+		.output()
+		.unwrap();
+	if case_insensitive {
+		assert!(
+			stdout.contains(&format!(
+				"[1/1] add under alias (refused: {reason})"
+			)),
+			"{stdout}"
+		);
+		assert!(
+			stderr.contains(
+				"0 commit(s) would be created; replay stops at commit #1 (refused); 0 not reached."
+			),
+			"{stderr}"
+		);
+		assert!(stderr.contains(hint), "{stderr}");
+		assert_eq!(code(&apply), 1, "{all}");
+		assert!(all.contains("Created 0 commit(s)."), "{all}");
+		assert!(
+			all.contains(&format!(
+				"Commit 1 of 1 failed (add under alias): newdir/x.txt: {reason}"
+			)),
+			"{all}"
+		);
+		assert!(all.contains(hint), "{all}");
+		assert!(!dst.join("NEWDIR/x.txt").exists());
+		assert_eq!(text(&status.stdout), "");
+	} else {
+		assert!(stdout.contains("[1/1] add under alias\n"), "{stdout}");
+		assert!(!stdout.contains("refused"), "{stdout}");
+		assert!(!stderr.contains("hint:"), "{stderr}");
+		assert_eq!(code(&apply), 0, "{all}");
+		assert!(all.contains("Created 1 commit(s)."), "{all}");
+		assert!(dst.join("newdir/x.txt").is_file());
+		assert_eq!(text(&status.stdout), "");
+	}
 }
 
 #[test]

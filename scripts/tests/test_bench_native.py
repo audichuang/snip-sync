@@ -43,15 +43,21 @@ from bench_native_memory import (  # noqa: E402
     APPLICATION_HISTORY_PAGE_LENGTH,
     DEFAULT_PROFILES,
     NativeBenchError,
+    PROFILES,
+    PROFILE_SETUP,
     NativeSession,
     assert_copied_payload,
     assert_nothing_copied,
     check_repo_state,
     check_native_matched,
     e2e_scaled,
+    click_control,
     click_repo,
+    close_shown_tab,
     open_repo_name,
+    open_workspace_tab,
     change_row_group,
+    changes_list_at_top,
     choose_copy_target,
     copy_explicit_selection,
     expand_change_dirs,
@@ -67,9 +73,12 @@ from bench_native_memory import (  # noqa: E402
     require_control,
     run_profile,
     select_native_matched,
+    shown_tab_line,
     scroll_into_view,
+    scroll_to_change_dirs,
     source_file_bytes,
     source_rows,
+    three_tab_repos,
     visible_in,
     write_preexec_launcher,
 )
@@ -143,6 +152,22 @@ class TestOpenRepoName(unittest.TestCase):
         self.assertEqual(open_repo_name([a, b]), "repo-02")
         self.assertEqual(open_repo_name([a, b, "[APP:WORKSPACE: state=closed generation=2]"]), None)
         self.assertIsNone(open_repo_name([]))
+
+    def test_each_workspace_tab_keeps_its_own_selection(self) -> None:
+        """A tab opened, shown and closed leaves the first tab's repo open: its lines,
+        untagged while it was shown, belong to it and not to the tab shown again."""
+        lines = [
+            "[APP:WS_TAB_ACTIVE: id=1 ix=0]",
+            "[APP:REPO_SELECTING: 0 (repo-01) root=/w/repo-01]",
+            "[APP:WS_TAB_ACTIVE: id=2 ix=1]",
+            "[APP:WORKSPACE: state=open path=/w/repo-02 generation=2]",
+            "[APP:REPO_SELECTING: 0 (repo-02) root=/w/repo-02]",
+        ]
+        self.assertEqual(open_repo_name(lines), "repo-02")
+        closed = [*lines, "[APP:WORKSPACE: state=closed generation=3]", "[APP:WS_TAB_ACTIVE: id=1 ix=0]"]
+        self.assertEqual(open_repo_name(closed), "repo-01")
+        background = [*closed, "[APP:REPO_SELECTING: 3 (repo-04) root=/w/repo-04 ws_tab=2]"]
+        self.assertEqual(open_repo_name(background), "repo-01")
 
 
 class TestBoundsAndGone(unittest.TestCase):
@@ -816,6 +841,70 @@ class TestChangeDirectoryExpansion(unittest.TestCase):
         session = ChangeTreeSession([], {})
         self.assertEqual(expand_change_dirs(session, self.WIN, "change-row:staged:a.txt", "repo", timeout=1), [])
         self.assertEqual(session.clicked, [])
+
+
+class TestChangesSweep(unittest.TestCase):
+    """The Changes sweep stops at the first row's marker instead of waiting out two still wheels."""
+
+    WIN = {"wid": "0x1", "x": 0, "y": 0, "width": 800, "height": 700}
+    TARGET = "change-dir:unstaged:repo:src"
+
+    @staticmethod
+    def top(y: int = 40, h: int = 22) -> str:
+        return f"[APP:CTRL_BOUNDS: id=change-list-top x=8 y={y} w=280 h={h}]"
+
+    def sweep(self, session: ChangeTreeSession) -> tuple[list[str] | None, list[str]]:
+        directions: list[str] = []
+        wheel = session.x
+
+        def x(*args: str, timeout: float = 20.0) -> str:
+            if "click" in args:
+                directions.append("down" if args[-1] == "5" else "up")
+            return wheel(*args, timeout=timeout)
+
+        session.x = x  # type: ignore[method-assign]
+
+        def candidates() -> list[str]:
+            return [self.TARGET] if self.TARGET in parse_bounds(session.texts()) else []
+
+        return scroll_to_change_dirs(session, self.WIN, candidates), directions
+
+    def test_top_is_the_whole_first_row_at_the_top_of_the_list(self) -> None:
+        header = _bounds("change-header:staged", 40)
+        self.assertTrue(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(), header]))
+        # A first row cut by the list's top edge reports only its visible part.
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(h=9), header]))
+        # A header lined up with the top is a later group's whenever the offset is whole rows.
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", _bounds("change-header:unstaged", 40)]))
+        self.assertFalse(changes_list_at_top(["[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(y=64)]))
+        self.assertFalse(changes_list_at_top([
+            "[APP:CTRL_BOUNDS: id=left-list x=0 y=40 w=320 h=600]", self.top(), "[APP:CTRL_GONE: id=change-list-top]",
+        ]))
+        self.assertFalse(changes_list_at_top([self.top()]))
+
+    def test_a_visible_target_needs_no_wheel(self) -> None:
+        session = ChangeTreeSession([_bounds(self.TARGET, 300)], {})
+        self.assertEqual(self.sweep(session), ([self.TARGET], []))
+
+    def test_at_the_top_the_sweep_goes_straight_down(self) -> None:
+        session = ChangeTreeSession([self.top(), _bounds("change-header:unstaged", 64)], {}, on_wheel=[[_bounds(self.TARGET, 500)]])
+        self.assertEqual(self.sweep(session), ([self.TARGET], ["down"]))
+
+    def test_the_top_ends_the_upward_sweep_without_still_wheels(self) -> None:
+        session = ChangeTreeSession(
+            [_bounds("change-row:unstaged:z.txt", 64)],
+            {},
+            on_wheel=[[self.top(), "[APP:CTRL_GONE: id=change-row:unstaged:z.txt]"], [_bounds("change-row:unstaged:b.txt", 64)], [_bounds(self.TARGET, 500)]],
+        )
+        self.assertEqual(self.sweep(session), ([self.TARGET], ["up", "down", "down"]))
+
+    def test_a_target_passed_on_the_way_up_is_taken(self) -> None:
+        session = ChangeTreeSession([_bounds("change-row:unstaged:z.txt", 64)], {}, on_wheel=[[_bounds(self.TARGET, 80)]])
+        self.assertEqual(self.sweep(session), ([self.TARGET], ["up"]))
+
+    def test_without_the_marker_two_still_wheels_find_the_top(self) -> None:
+        session = ChangeTreeSession([_bounds("change-row:unstaged:z.txt", 64)], {}, on_wheel=[[], [], [_bounds(self.TARGET, 500)]])
+        self.assertEqual(self.sweep(session), ([self.TARGET], ["up", "up", "down"]))
 
 
 class _ScriptedCopySession:
@@ -1545,6 +1634,181 @@ class TestForegroundClipboardOwner(unittest.TestCase):
             xvfb.wait(timeout=2)
             xvfb_log.close()
             shutil.rmtree(log_dir, ignore_errors=True)
+
+
+class TestThreeTabProfile(unittest.TestCase):
+    """3tabs is measured on request only; its second and third repositories come from the dataset."""
+
+    def test_profile_is_opt_in_with_repo_setup(self) -> None:
+        self.assertIn("3tabs", PROFILES)
+        self.assertNotIn("3tabs", DEFAULT_PROFILES)
+        self.assertEqual(PROFILE_SETUP["3tabs"], ("repo", "normal", True))
+
+    def _dataset(self, names: list[str]) -> str:
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        dataset = os.path.join(root.name, "dataset")
+        for name in names:
+            os.makedirs(os.path.join(dataset, name, ".git"))
+        return dataset
+
+    def test_takes_the_first_two_dataset_repos_besides_the_launch_repo(self) -> None:
+        dataset = self._dataset(["repo-01-core", "repo-02", "repo-03", "repo-04"])
+        self.assertEqual(
+            three_tab_repos(dataset, os.path.join(dataset, "repo-01-core")),
+            [os.path.join(dataset, "repo-02"), os.path.join(dataset, "repo-03")],
+        )
+
+    def test_launch_repo_spelled_through_a_symlink_is_excluded(self) -> None:
+        require_or_skip(os.name == "posix", "needs POSIX symlinks")
+        dataset = self._dataset(["repo-01-core", "repo-02", "repo-03"])
+        link = os.path.join(os.path.dirname(dataset), "launch-link")
+        os.symlink(os.path.join(dataset, "repo-01-core"), link)
+        self.assertEqual(
+            three_tab_repos(dataset, link),
+            [os.path.join(dataset, "repo-02"), os.path.join(dataset, "repo-03")],
+        )
+
+    def test_fewer_than_two_other_repos_raises(self) -> None:
+        dataset = self._dataset(["repo-01-core", "repo-02"])
+        with self.assertRaisesRegex(NativeBenchError, "3tabs needs 2 dataset repositories"):
+            three_tab_repos(dataset, os.path.join(dataset, "repo-01-core"))
+
+
+class _TabSession:
+    """Enough of NativeSession to drive the workspace-tab helpers without X11.
+
+    A click or key press appends the lines the app logs in reply. `wait_line` returns the
+    first matching line from `start` and records the timeout it was given.
+    """
+
+    def __init__(self, lines: list[str], on_click: dict[str, list[str]] | None = None,
+                 on_key: dict[str, list[str]] | None = None) -> None:
+        self.lines = list(lines)
+        self.on_click = dict(on_click or {})
+        self.on_key = dict(on_key or {})
+        self.clicked: list[str] = []
+        self.keys: list[str] = []
+        self.typed: list[tuple[str, ...]] = []
+        self.timeouts: list[float] = []
+        self.preds: list[Any] = []
+
+    def texts(self, start: int = 0) -> list[str]:
+        return self.lines[start:]
+
+    def click(self, win: dict[str, Any], bounds: tuple[int, int, int, int], button: str = "1") -> float:
+        control = next(key for key, box in parse_bounds(self.lines).items() if box == bounds)
+        self.clicked.append(control)
+        self.lines.extend(self.on_click.get(control, []))
+        return 1.0
+
+    def key(self, wid: str, keys: str) -> float:
+        self.keys.append(keys)
+        self.lines.extend(self.on_key.get(keys, []))
+        return 1.0
+
+    def focus(self, wid: str) -> None:
+        return None
+
+    def x(self, *args: str, timeout: float = 20.0) -> str:
+        self.typed.append(args)
+        return ""
+
+    def wait_line(self, pred: Any, start: int = 0, timeout: float = 60.0) -> tuple[int, float, str]:
+        self.timeouts.append(timeout)
+        self.preds.append(pred)
+        for i, line in enumerate(self.lines[start:], start=start):
+            if pred(line):
+                return i, 1.0, line
+        raise NativeBenchError(f"timed out after {timeout}s waiting for app log line")
+
+
+WIN = {"wid": "0x1", "x": 0, "y": 0, "width": 800, "height": 600}
+
+
+class TestWorkspaceTabDriver(unittest.TestCase):
+    """Driving the Workspace tab "+", the path typing and Cmd/Ctrl+W without a display."""
+
+    def setUp(self) -> None:
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        self.workspace = os.path.join(root.name, "repo-02")
+        os.makedirs(self.workspace)
+
+    def open_session(self) -> _TabSession:
+        real = os.path.realpath(self.workspace)
+        return _TabSession(
+            lines=[_bounds("ws-tab-new", 10), _bounds("btn-open-workspace", 40),
+                   _bounds("workspace-path-input", 70), _bounds("btn-workspace-open-confirm", 100)],
+            on_click={
+                "ws-tab-new": ["[APP:WS_TAB_OPENED: id=7 count=2]"],
+                "btn-workspace-open-confirm": [
+                    f"[APP:WORKSPACE: state=open path={real} repos=1]",
+                    "[APP:READY_REPOS: n=1 ws_tab=3]",
+                    "[APP:READY_REPOS: n=1]",
+                ],
+            },
+        )
+
+    def test_shown_tab_line_rejects_background_tab_tags(self) -> None:
+        self.assertFalse(shown_tab_line("[APP:READY_REPOS: n=2 ws_tab=3]"))
+        self.assertTrue(shown_tab_line("[APP:READY_REPOS: n=2]"))
+
+    def test_open_clicks_each_control_in_order_and_returns_tab_and_count(self) -> None:
+        s = self.open_session()
+        result = open_workspace_tab(s, WIN, self.workspace)
+        self.assertEqual(s.clicked, ["ws-tab-new", "btn-open-workspace", "workspace-path-input", "btn-workspace-open-confirm"])
+        self.assertEqual(s.typed, [("xdotool", "type", "--delay", "15", "--window", "0x1", self.workspace)])
+        self.assertEqual((result["tab"], result["count"]), (7, 2))
+        self.assertEqual(result["readyLine"], "[APP:READY_REPOS: n=1]")
+
+    def test_open_waits_use_deadlines_scaled_by_the_e2e_scale(self) -> None:
+        unscaled = (10.0, 30.0, 60.0)
+        for scale, expected in (("1", unscaled), ("3", tuple(3 * t for t in unscaled))):
+            with self.subTest(scale=scale), mock.patch.dict(os.environ, {"SNIP_E2E_TIMEOUT_SCALE": scale}):
+                s = self.open_session()
+                open_workspace_tab(s, WIN, self.workspace)
+                self.assertEqual(tuple(s.timeouts), expected)
+
+    def test_ready_wait_rejects_a_background_tabs_ready_line(self) -> None:
+        s = self.open_session()
+        open_workspace_tab(s, WIN, self.workspace)
+        ready_preds = [pred for pred in s.preds if pred("[APP:READY_REPOS: n=1]")]
+        self.assertEqual(len(ready_preds), 1)
+        self.assertFalse(ready_preds[0]("[APP:READY_REPOS: n=1 ws_tab=3]"))
+
+    def test_close_reports_drained_when_the_close_drain_left_nothing(self) -> None:
+        lifecycle = "[APP:LIFECYCLE: phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0 tab=7]"
+        s = _TabSession([], on_key={"ctrl+w": ["[APP:WS_TAB_CLOSED: id=7 count=1]", lifecycle]})
+        result = close_shown_tab(s, WIN, 7)
+        self.assertTrue(result["drained"])
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(s.keys, ["ctrl+w"])
+
+    def test_close_is_not_drained_without_a_clean_fresh_lifecycle_line(self) -> None:
+        closed = "[APP:WS_TAB_CLOSED: id=7 count=1]"
+        stale = "[APP:LIFECYCLE: phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0]"
+        busy = "[APP:LIFECYCLE: phase=drained intent=close-workspace jobs=1 inflight=0 queued=0 leaked=0]"
+        cases = (
+            ("no lifecycle line", [], [closed]),
+            ("drain left a job", [], [closed, busy]),
+            ("drain line from before the close", [stale], [closed]),
+        )
+        for name, lines, replies in cases:
+            with self.subTest(name):
+                s = _TabSession(lines, on_key={"ctrl+w": replies})
+                self.assertFalse(close_shown_tab(s, WIN, 7)["drained"])
+
+    def test_click_control_fails_after_the_scaled_deadline(self) -> None:
+        s = _TabSession([])
+        clock = [0.0]
+        fake_time = mock.MagicMock()
+        fake_time.monotonic.side_effect = lambda: clock[0]
+        fake_time.sleep.side_effect = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+        with mock.patch.dict(os.environ, {"SNIP_E2E_TIMEOUT_SCALE": "3"}), mock.patch("bench_native_memory.time", fake_time):
+            with self.assertRaisesRegex(NativeBenchError, "control missing-control not reported within 6.0s"):
+                click_control(s, WIN, "missing-control", timeout=6.0)
+        self.assertAlmostEqual(clock[0], 18.0, delta=0.2)
 
 
 if __name__ == "__main__":

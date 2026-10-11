@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
@@ -1678,6 +1678,15 @@ impl Interactivity {
                             } else {
                                 None
                             };
+                            // SNIP PATCH: a shown tooltip checks the hover
+                            // against where its element is now, before the
+                            // window prepaints the tooltip.
+                            if let Some(source_bounds) = element_state
+                                .as_ref()
+                                .and_then(|s| s.tooltip_source_bounds.as_ref())
+                            {
+                                source_bounds.set(bounds);
+                            }
 
                             let scroll_offset =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
@@ -2291,12 +2300,19 @@ impl Interactivity {
                     Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
                 });
                 // Use bounds instead of testing hitbox since this is called during prepaint.
+                // SNIP PATCH: the bounds live in a cell that each prepaint
+                // updates. A shown tooltip keeps the check it was built with,
+                // so it must not keep the bounds of that frame.
+                let source_bounds = element_state
+                    .tooltip_source_bounds
+                    .get_or_insert_with(Default::default)
+                    .clone();
+                source_bounds.set(hitbox.bounds);
                 let check_is_hovered_during_prepaint = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
-                    let source_bounds = hitbox.bounds;
                     move |window: &Window| {
                         pending_mouse_down.borrow().is_none()
-                            && source_bounds.contains(&window.mouse_position())
+                            && source_bounds.get().contains(&window.mouse_position())
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -2572,6 +2588,8 @@ pub struct InteractiveElementState {
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+    // SNIP PATCH: this frame's bounds, read by a shown tooltip's hover check.
+    pub(crate) tooltip_source_bounds: Option<Rc<Cell<Bounds<Pixels>>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.

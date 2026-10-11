@@ -28,25 +28,44 @@ clean:
 		scripts/linux_container.sh --prune-all
 	fi
 
-# On Linux this is preflight-linux. Elsewhere this OS's checks run on the host, then the
-# Linux jobs run in a container (scripts/linux_container.sh), native acceptance included.
+# On Linux this is preflight-linux. Elsewhere the Linux jobs run in a container
+# (scripts/linux_container.sh), native acceptance included, and this OS's checks run on
+# the host during acceptance: they share nothing (the host clipboard vs Xvfb in the VM,
+# target/ vs a volume), and acceptance leaves most host CPUs idle. Started beside the
+# container's own cold build instead, the two builds slowed each other by minutes.
+# The host's output is held back and printed if it fails.
 # Everything CI runs that a machine can run (see .github/workflows/ci.yml for the rest).
 preflight:
 	#!/usr/bin/env bash
-	set -euo pipefail
+	set -uo pipefail
 	if [ "$(uname -s)" = Linux ]; then
 		exec {{just_executable()}} native_python="{{native_python}}" preflight-linux
 	fi
-	{{just_executable()}} preflight-host
-	scripts/linux_container.sh just preflight-linux
+	scripts/linux_container.sh just preflight-linux-checks || exit
+	log="$(mktemp)"
+	trap 'rm -f "$log"' EXIT
+	{{just_executable()}} preflight-host >"$log" 2>&1 &
+	host=$!
+	rc=0
+	scripts/linux_container.sh just preflight-acceptance || rc=$?
+	if wait "$host"; then
+		echo "preflight-host: passed"
+	else
+		rc=$?
+		cat "$log"
+		echo "preflight-host: failed (exit $rc)" >&2
+	fi
+	[ "$rc" -eq 0 ] || exit "$rc"
 	# A pass drops this checkout's target/ volume (12-25 GB): each task uses a fresh
 	# clone, so it would only serve a rerun. A failure keeps it for an incremental rerun.
 	scripts/linux_container.sh --prune-all
 
+# CI's Linux jobs, run directly (Linux) or through scripts/linux_container.sh.
+preflight-linux: preflight-linux-checks preflight-acceptance
+
 # The Python harness tests are light, so they overlap the Rust checks; their output
 # is held back and printed after, so a failure is not buried in cargo's.
-# CI's Linux jobs, run directly (Linux) or through scripts/linux_container.sh.
-preflight-linux: preflight-workflows
+preflight-linux-checks: preflight-workflows
 	#!/usr/bin/env bash
 	set -uo pipefail
 	log="$(mktemp)"
@@ -58,7 +77,9 @@ preflight-linux: preflight-workflows
 	wait "$harness" || { rc=$?; cat "$log"; }
 	[ "$rc" -eq 0 ] || exit "$rc"
 	{{just_executable()}} remote-e2e
-	# Extra acceptance flags, e.g. less parallelism where the machine is small.
+
+# Extra acceptance flags, e.g. less parallelism where the machine is small.
+preflight-acceptance:
 	{{just_executable()}} native_python="{{native_python}}" native-acceptance ${SNIP_ACCEPTANCE_ARGS:-}
 
 # Same as CI's Lint Workflows job; needs actionlint and shellcheck on PATH.
