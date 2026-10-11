@@ -435,6 +435,13 @@ def remote_sha256(host: str, path: str, sys_ops: SystemOperations) -> Optional[s
     return out[0] if out else ""
 
 
+def remote_path_absent(host: str, path: str, sys_ops: SystemOperations) -> bool:
+    """Only a successful check proves absence, including dangling symlinks."""
+    return sys_ops.remote_exec(
+        host, f"[ ! -e {path} ] && [ ! -L {path} ]", check=False
+    ).returncode == 0
+
+
 def clean_remote_round(host: str, sha: str, run_dir: Path, sys_ops: SystemOperations) -> Dict[str, Any]:
     """Section 6 of the remote protocol: this round's workers, wrapper, backup and $W, nothing else."""
     w_remote = remote_run_dir(sha)
@@ -466,10 +473,18 @@ def clean_remote_round(host: str, sha: str, run_dir: Path, sys_ops: SystemOperat
             result[name] = "unknown (ssh failed)"
             blockers.append(path)
         elif not got:
-            result[name] = "absent"
+            if remote_path_absent(host, path, sys_ops):
+                result[name] = "absent"
+            else:
+                result[name] = "kept (unreadable file, symlink or failed absence check)"
+                blockers.append(path)
         elif want and got == want:
-            sys_ops.remote_exec(host, f"rm -f {path}", check=False)
-            result[name] = "removed"
+            removed = sys_ops.remote_exec(host, f"rm -f {path}", check=False)
+            if removed.returncode == 0 and remote_path_absent(host, path, sys_ops):
+                result[name] = "removed"
+            else:
+                result[name] = "removal failed or could not be verified"
+                blockers.append(path)
         else:
             result[name] = f"kept (sha256 {got})"
             content = sys_ops.remote_exec(host, f"cat {path} 2>/dev/null", check=False)
@@ -482,8 +497,13 @@ def clean_remote_round(host: str, sha: str, run_dir: Path, sys_ops: SystemOperat
         result["remote_dir_removed"] = False
         result["remote_dir_kept_for"] = blockers
         return result
-    sys_ops.remote_exec(host, f"rm -rf '{w_remote}'", check=False)
-    result["remote_dir_removed"] = True
+    removed = sys_ops.remote_exec(host, f"rm -rf '{w_remote}'", check=False)
+    result["remote_dir_remove_exit"] = removed.returncode
+    result["remote_dir_removed"] = (
+        removed.returncode == 0 and remote_path_absent(host, shlex.quote(w_remote), sys_ops)
+    )
+    if not result["remote_dir_removed"]:
+        result["remote_dir_error"] = "directory removal failed or could not be verified"
     return result
 
 
@@ -1556,9 +1576,11 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
             env_file.write_text(json.dumps(env_data, indent=2), encoding="utf-8")
             if not remote_cleanup["workers_stopped"]:
                 why = "worker cleanup failed"
-            else:
+            elif remote_cleanup.get("remote_dir_kept_for"):
                 why = f"kept for {', '.join(remote_cleanup['remote_dir_kept_for'])}: still runs it or could not be checked"
-            print(f"ERROR: Remote cleanup incomplete ({why}); {remote_cleanup['remote_dir']} kept.", file=sys.stderr)
+            else:
+                why = remote_cleanup["remote_dir_error"]
+            print(f"ERROR: Remote cleanup incomplete ({why}); {remote_cleanup['remote_dir']} removal not confirmed.", file=sys.stderr)
             return 1
         print("[OK] Remote host cleaned.")
 

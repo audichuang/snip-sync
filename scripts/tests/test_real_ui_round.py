@@ -796,6 +796,11 @@ class RemoteFake(FakeSystemOperations):
         self.stop_rc = stop_rc
         self.ssh_hangs_on = ssh_hangs_on
         self.commands: List[str] = []
+        self.dangling: set[str] = set()
+        self.remove_rc = 0
+        self.keep_after_remove = False
+        self.dir_remove_rc = 0
+        self.remote_dir_exists = True
 
     def remote_exec(self, host: str, command: str, check: bool = True):
         self.commands.append(command)
@@ -810,8 +815,20 @@ class RemoteFake(FakeSystemOperations):
             path = command.split()[1]
             if path in self.files:
                 out = f"{rur.hashlib.sha256(self.files[path].encode()).hexdigest()}  {path}\n"
+        elif command.startswith("[ ! -e "):
+            path = command.split()[3].strip("'")
+            exists = path in self.files or path in self.dangling
+            if path == rur.remote_run_dir(TestRemoteCleanup.SHA):
+                exists = self.remote_dir_exists
+            rc = 1 if exists else 0
+        elif command.startswith("rm -rf "):
+            rc = self.dir_remove_rc
+            if rc == 0 and not self.keep_after_remove:
+                self.remote_dir_exists = False
         elif command.startswith("rm -f "):
-            self.files.pop(command.split()[2], None)
+            rc = self.remove_rc
+            if rc == 0 and not self.keep_after_remove:
+                self.files.pop(command.split()[2], None)
         elif command.startswith("if [ -e "):
             backup = command.split()[3]
             if backup in self.files and rur.REMOTE_WRAPPER not in self.files:
@@ -856,6 +873,40 @@ class TestRemoteCleanup(unittest.TestCase):
         self.assertIn("rm -rf '/home/audichuang/snip-ui-run/516cb1c'", fake.commands)
         self.assertEqual((self.run_dir / "workers-at-cleanup.txt").read_text(), "111\n")
         self.assert_no_glob(fake)
+
+    def test_failed_wrapper_removal_keeps_the_directory(self):
+        for rc in (1, 124):
+            with self.subTest(rc=rc):
+                fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER})
+                fake.remove_rc = rc
+                result = self.clean(fake)
+                self.assertFalse(result["remote_dir_removed"])
+                self.assertNotEqual(result["wrapper"], "removed")
+                self.assertFalse(any(c.startswith("rm -rf") for c in fake.commands))
+
+    def test_removal_must_be_verified_even_after_zero_exit(self):
+        fake = RemoteFake({rur.REMOTE_WRAPPER: WRAPPER})
+        fake.keep_after_remove = True
+        result = self.clean(fake)
+        self.assertFalse(result["remote_dir_removed"])
+        self.assertFalse(any(c.startswith("rm -rf") for c in fake.commands))
+
+    def test_dangling_link_is_not_absent_or_safe_to_remove(self):
+        for path in (rur.REMOTE_WRAPPER, self.BACKUP):
+            with self.subTest(path=path):
+                fake = RemoteFake({})
+                fake.dangling.add(path)
+                result = self.clean(fake)
+                self.assertFalse(result["remote_dir_removed"])
+                self.assertIn(path, result["remote_dir_kept_for"])
+
+    def test_failed_or_unverified_directory_removal_is_not_success(self):
+        for rc, kept in ((1, False), (124, False), (0, True)):
+            with self.subTest(rc=rc, kept=kept):
+                fake = RemoteFake({})
+                fake.dir_remove_rc = rc
+                fake.keep_after_remove = kept
+                self.assertFalse(self.clean(fake)["remote_dir_removed"])
 
     def test_a_replaced_wrapper_is_kept(self):
         fake = RemoteFake({rur.REMOTE_WRAPPER: "#!/bin/sh\nexec /usr/bin/snip \"$@\"\n"})
@@ -950,6 +1001,14 @@ class TestFinishWithRemote(RoundDirTestCase):
         rc, err, recorded = self.finish(fake, remote_host="ubuntu", sha=TestRemoteCleanup.SHA)
         self.assertEqual(rc, 1)
         self.assertIn(f"kept for {rur.REMOTE_WRAPPER}: still runs it", err)
+        self.assertFalse(recorded["finish_results"]["remote_cleanup"]["remote_dir_removed"])
+
+    def test_finish_returns_failure_when_directory_removal_fails(self):
+        fake = RemoteFake({})
+        fake.dir_remove_rc = 1
+        rc, err, recorded = self.finish(fake, remote_host="ubuntu", sha=TestRemoteCleanup.SHA)
+        self.assertEqual(rc, 1)
+        self.assertIn("directory removal failed", err)
         self.assertFalse(recorded["finish_results"]["remote_cleanup"]["remote_dir_removed"])
 
     def test_finish_with_another_script_copy_warns_and_still_tears_down(self):
