@@ -947,7 +947,10 @@ mod tests {
 		use snip_core::gitsrc::GitError;
 		use snip_remote::{ErrorCode, RemoteError};
 		fn missing(path: &Path, e: io::Error) -> String {
-			format_paste_error(PasteError::Destination { path: path.to_path_buf(), source: e })
+			format_paste_error(PasteError::Destination {
+				path: path.to_path_buf(),
+				source: e,
+			})
 		}
 		fn local(e: TransferError) -> String {
 			format_paste_error(PasteError::Local(e))
@@ -974,11 +977,17 @@ mod tests {
 			"paste refused: another paste is writing to this repository";
 
 		assert_eq!(
-			missing(Path::new("/nope"), io::Error::new(io::ErrorKind::NotFound, "gone")),
+			missing(
+				Path::new("/nope"),
+				io::Error::new(io::ErrorKind::NotFound, "gone")
+			),
 			"--repo /nope does not exist or cannot be resolved: gone"
 		);
 		assert_eq!(
-			local(TransferError::TargetCollision { path: "a.txt".into(), msg: "two entries".into() }),
+			local(TransferError::TargetCollision {
+				path: "a.txt".into(),
+				msg: "two entries".into()
+			}),
 			format!("Snipcode refused to paste: {COLLISION}")
 		);
 		assert_eq!(
@@ -989,7 +998,10 @@ mod tests {
 			local(TransferError::Git(GitError::WorktreeBusy { args: "paste".into() })),
 			format!("Snipcode refused to paste: {BUSY}; try again when the other paste finishes")
 		);
-		for e in [TransferError::SpecialFile("p".into()), TransferError::DestinationNotRegular("p".into())] {
+		for e in [
+			TransferError::SpecialFile("p".into()),
+			TransferError::DestinationNotRegular("p".into()),
+		] {
 			assert_eq!(local(e), "'p' exists and is not a regular file; paste refuses to overwrite it");
 		}
 		assert_eq!(
@@ -1006,8 +1018,14 @@ mod tests {
 			remote(refused(ErrorCode::Busy, BUSY)),
 			format!("Snipcode refused to paste: {BUSY}; try again when the other paste finishes")
 		);
-		assert_eq!(remote(refused(ErrorCode::Busy, "too many callers")), "too many callers");
-		assert_eq!(remote(RemoteError::Connect("ssh: no route".into())), "ssh: no route");
+		assert_eq!(
+			remote(refused(ErrorCode::Busy, "too many callers")),
+			"too many callers"
+		);
+		assert_eq!(
+			remote(RemoteError::Connect("ssh: no route".into())),
+			"ssh: no route"
+		);
 		assert_eq!(
 			apply(RemoteError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"))),
 			"The connection was lost; whether the paste finished is unknown (pipe closed). Check the destination (snip remote changes / ls) before pasting again."
