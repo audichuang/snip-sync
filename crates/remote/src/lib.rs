@@ -20,6 +20,7 @@ pub(crate) mod copyserve;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;
 pub(crate) mod pasteserve;
+pub mod pastetarget;
 pub mod proto;
 pub mod ssh;
 pub mod worker;
