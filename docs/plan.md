@@ -52,9 +52,9 @@ CLI 與桌面 App 均統一呼叫核心傳輸引擎與遠端模組,實作參考 
 | 複製檔案／資料夾 | `transfer::plan_export_expanding` (`selection_from_paths`, `expand_folder_items`) / `transfer::plan_export_with` | `snip copy <路徑…>` | 專案樹選取檔案／資料夾後右鍵「複製」,展開走訪後匯出 |
 | 複製 Git 來源 | `transfer::changed_items` + `transfer::plan_export_with` 搭配 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` | `snip copy --working` / `--staged` / `--commit` / `--range` | Git 檢視對變更節點(檔案、資料夾、repo、群組)右鍵「複製」,匯出該節點的項目 |
 | 複製 commits | `transfer::plan_commit_export_with` | `snip copy --commits -n <N>` / `<a>..<b>` | 時間軸選取連續 commit 複製 |
-| 貼上檔案 | `transfer::plan_import_with` + `TransferImportPlan::apply` 搭配 `ImportMapping` | `snip paste [--dry-run \| --apply]` | 貼上預覽視窗、衝突與新鮮度檢驗後確認套用 |
-| 貼上 commits | `transfer::CommitReplayPreview` (`capture` / `plan` / `revalidate` / `apply`) | `snip paste` (`--overwrite` 門禁) | commit 貼上預覽視窗、覆寫開關後確認重播 |
-| 路徑重定位 | `restore::suggest_restore_base`、`transfer::ImportMapping::from_restore_base` | 一組建議,由 `--adjust-paths` 全域套用 | 貼上預覽中逐 prefix 選擇(D4) |
+| 貼上檔案 | `snip_remote::PasteTarget` → `transfer::plan_import_with` + `TransferImportPlan::apply` 搭配 `ImportMapping` | `snip paste [--dry-run \| --apply]` | 貼上預覽視窗、衝突與新鮮度檢驗後確認套用 |
+| 貼上 commits | `snip_remote::PasteTarget` → `transfer::CommitReplayPreview` (`capture` / `plan` / `revalidate` / `apply`) | `snip paste` (`--overwrite` 門禁) | commit 貼上預覽視窗、覆寫開關後確認重播 |
+| 路徑重定位 | `restore::suggest_restore_base`、`transfer::ImportMapping::from_restore_base`、`pastetarget::import_mapping` | 一組建議,由 `--adjust-paths` 全域套用 | 貼上預覽中逐 prefix 選擇(D4) |
 | 配對清單 | `snip_remote::WorkerStore` / `snip_remote::TrustedMasterStore` | `snip remote` / `snip worker` | 工作區選單「遠端節點」 |
 
 ### Repo 結構(比照 aghub)
