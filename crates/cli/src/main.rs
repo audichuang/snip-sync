@@ -716,6 +716,14 @@ fn format_remote_apply_error(err: snip_remote::RemoteError) -> String {
 	format_remote_error(err)
 }
 
+/// A `--repo` that does not resolve, named as the user gave it.
+fn missing_repo(repo: &Path, e: &io::Error) -> String {
+	format!(
+		"--repo {} does not exist or cannot be resolved: {e}",
+		repo.display()
+	)
+}
+
 /// Says what `--adjust-paths` would do, or does.
 fn note_suggestion(
 	suggestion: &snip_core::restore::RestoreBaseSuggestion,
@@ -817,12 +825,7 @@ fn paste_files(
 			if let Some(ref s) = suggestion {
 				note_suggestion(s, &paths, opts.adjust_paths);
 			}
-			let root_id = CanonicalRootId::new(repo).map_err(|e| {
-				format!(
-					"--repo {} does not exist or cannot be resolved: {e}",
-					repo.display()
-				)
-			})?;
+			let root_id = CanonicalRootId::new(repo).map_err(|e| missing_repo(repo, &e))?;
 			let mapping = match (&suggestion, opts.adjust_paths) {
 				(Some(s), true) => ImportMapping::from_restore_base(s, root_id),
 				_ => ImportMapping::with_primary(root_id),
@@ -1112,5 +1115,79 @@ mod tests {
 		assert_eq!(grouped(999), "999");
 		assert_eq!(grouped(1000), "1,000");
 		assert_eq!(grouped(1234567), "1,234,567");
+	}
+
+	/// The words `snip paste` refuses or fails with, captured from the
+	/// formatters before the paste seam. A changed literal is a changed CLI.
+	#[test]
+	fn paste_error_texts_are_unchanged() {
+		use snip_remote::{ErrorCode, RemoteError};
+		fn missing(path: &Path, e: io::Error) -> String {
+			missing_repo(path, &e)
+		}
+		fn local(e: TransferError) -> String {
+			format_transfer_error(e)
+		}
+		fn remote(e: RemoteError) -> String {
+			format_remote_error(e)
+		}
+		fn apply(e: RemoteError) -> String {
+			format_remote_apply_error(e)
+		}
+		let refused = |code, message: &str| RemoteError::Refused {
+			code,
+			message: message.into(),
+		};
+		const COLLISION: &str =
+			"target collision: multiple operations target 'a.txt': two entries";
+		const STALE: &str = "stale destination in '/w': target file 'a' was created externally after preview";
+		const BUSY: &str =
+			"paste refused: another paste is writing to this repository";
+
+		assert_eq!(
+			missing(Path::new("/nope"), io::Error::new(io::ErrorKind::NotFound, "gone")),
+			"--repo /nope does not exist or cannot be resolved: gone"
+		);
+		assert_eq!(
+			local(TransferError::TargetCollision { path: "a.txt".into(), msg: "two entries".into() }),
+			format!("Snipcode refused to paste: {COLLISION}")
+		);
+		assert_eq!(
+			local(TransferError::StaleDestination { root: "/r".into(), reason: "target file 'a' was modified externally after preview".into() }),
+			"Snipcode refused to paste: stale destination in '/r': target file 'a' was modified externally after preview; re-run to inspect updated destinations"
+		);
+		assert_eq!(
+			local(TransferError::Git(GitError::WorktreeBusy { args: "paste".into() })),
+			format!("Snipcode refused to paste: {BUSY}; try again when the other paste finishes")
+		);
+		for e in [TransferError::SpecialFile("p".into()), TransferError::DestinationNotRegular("p".into())] {
+			assert_eq!(local(e), "'p' exists and is not a regular file; paste refuses to overwrite it");
+		}
+		assert_eq!(
+			local(TransferError::UnsafePath("../x".into())),
+			"unsafe path: '../x' escapes root boundaries or contains invalid characters"
+		);
+		assert_eq!(
+			remote(refused(ErrorCode::Collision, COLLISION)),
+			format!("Snipcode refused to paste: {COLLISION}")
+		);
+		let stale_text = format!("Snipcode refused to paste: {STALE}; re-run to inspect updated destinations");
+		assert_eq!(remote(refused(ErrorCode::Stale, STALE)), stale_text);
+		assert_eq!(
+			remote(refused(ErrorCode::Busy, BUSY)),
+			format!("Snipcode refused to paste: {BUSY}; try again when the other paste finishes")
+		);
+		assert_eq!(remote(refused(ErrorCode::Busy, "too many callers")), "too many callers");
+		assert_eq!(remote(RemoteError::Connect("ssh: no route".into())), "ssh: no route");
+		assert_eq!(
+			apply(RemoteError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"))),
+			"The connection was lost; whether the paste finished is unknown (pipe closed). Check the destination (snip remote changes / ls) before pasting again."
+		);
+		assert_eq!(
+			apply(RemoteError::TimedOut),
+			"The connection was lost; whether the paste finished is unknown (the worker did not answer in time). Check the destination (snip remote changes / ls) before pasting again."
+		);
+		// A refused Apply is a refusal, not a lost answer.
+		assert_eq!(apply(refused(ErrorCode::Stale, STALE)), stale_text);
 	}
 }

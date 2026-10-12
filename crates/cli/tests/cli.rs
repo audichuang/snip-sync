@@ -2981,6 +2981,11 @@ fn paste_into_missing_repo_exits_one_naming_the_path() {
 	assert_eq!(code(&apply), 1);
 	let apply_err = text(&apply.stderr);
 	assert!(apply_err.contains("nope"), "stderr was: {apply_err}");
+	let want = format!(
+		"--repo {} does not exist or cannot be resolved: ",
+		nope.display()
+	);
+	assert!(apply_err.contains(&want), "stderr was: {apply_err}");
 	assert!(!nope.exists());
 
 	let dry = snip(
@@ -2990,6 +2995,7 @@ fn paste_into_missing_repo_exits_one_naming_the_path() {
 	assert_eq!(code(&dry), 1);
 	let dry_err = text(&dry.stderr);
 	assert!(dry_err.contains("nope"), "stderr was: {dry_err}");
+	assert!(dry_err.contains(&want), "stderr was: {dry_err}");
 	assert!(!nope.exists());
 }
 
