@@ -27,7 +27,9 @@ use snip_core::transfer::{
 	detect_clipboard_prefixes, CanonicalRootId, CommitReplayPreview,
 	TransferError,
 };
-use snip_remote::{FilePastePlan, PasteError, PasteRoute, PasteTarget};
+use snip_remote::{
+	FilePastePlan, PasteError, PasteRoute, PasteTarget, RemoteError,
+};
 
 use crate::i18n::{tf, Locale, Msg};
 use crate::reader::{Preview, PreviewSource};
@@ -679,8 +681,9 @@ impl PasteApplyResult {
 	}
 }
 
-/// A paste into a remote workspace: its worker plans and writes with the
-/// same engine, on its own disk, and re-checks freshness at Apply.
+/// A paste into a remote workspace: its worker plans and writes through
+/// [`PasteTarget::Remote`] with the same engine, on its own disk. Here only
+/// the tree path's spelling and display live.
 #[derive(Clone)]
 pub struct RemotePaste {
 	pub session: crate::remote::RemoteSession,
@@ -708,26 +711,6 @@ impl RemotePaste {
 	/// A tree path as the user knows it: `host:/folder/…`.
 	pub fn shown(&self, path: &Path) -> String {
 		crate::remote::display_path(Some(&self.session), path)
-	}
-
-	fn client(&self) -> &snip_remote::Client {
-		&self.session.client
-	}
-
-	fn workspace(&self) -> &str {
-		&self.session.workspace.id
-	}
-
-	/// A worker that could not be reached, or refused the destination.
-	fn destination_error(
-		&self,
-		dest: &Path,
-		err: snip_remote::RemoteError,
-	) -> Msg {
-		Msg::new(
-			"paste_err_destination",
-			[self.shown(dest), crate::remote::describe(err)],
-		)
 	}
 }
 
@@ -809,17 +792,32 @@ fn file_apply_msg(
 	}
 }
 
-/// A worker's stale refusal (the local error's text) as [`stale_msg`].
-fn remote_stale_msg(message: &str) -> Msg {
-	// "stale destination in '<root>': <reason>", as TransferError prints it.
-	let reason = message
-		.strip_prefix("stale destination in '")
-		.and_then(|rest| rest.split_once("': "))
-		.map_or(message, |(_, reason)| reason);
-	stale_msg(TransferError::StaleDestination {
-		root: PathBuf::new(),
-		reason: reason.to_string(),
-	})
+/// A commit check's (`applying` false) or replay's failure, worded as before.
+fn commit_msg(
+	remote: Option<&RemotePaste>,
+	dest: &Path,
+	err: PasteError,
+	applying: bool,
+) -> Msg {
+	if let Some(reason) = err.stale_reason() {
+		return stale_reason_msg(reason);
+	}
+	match err {
+		PasteError::Local(TransferError::Git(GitError::WorktreeBusy {
+			..
+		})) => repo_busy(),
+		PasteError::Local(TransferError::Git(e)) if applying => {
+			Msg::new("error_open_repo", [e.to_string()])
+		}
+		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
+		// Kept as before: any other worker refusal of a replay, Busy
+		// included, reads as a repository error (see Risks).
+		PasteError::Remote(RemoteError::Refused { message, .. }) => {
+			Msg::new("error_open_repo", [message])
+		}
+		PasteError::OutcomeUnknown(_) => outcome_unknown(),
+		other => destination_msg(remote, dest, other),
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -969,22 +967,6 @@ fn destination_error(dest: &Path, err: &dyn std::fmt::Display) -> Msg {
 		"paste_err_destination",
 		[dest.display().to_string(), err.to_string()],
 	)
-}
-
-fn stale_msg(err: TransferError) -> Msg {
-	match err {
-		TransferError::Git(GitError::WorktreeBusy { .. }) => repo_busy(),
-		TransferError::StaleDestination { reason, .. } => {
-			if reason.contains("created") {
-				Msg::new("stale_created", [reason])
-			} else if reason.contains("deleted") {
-				Msg::new("stale_deleted", [reason])
-			} else {
-				Msg::new("stale_modified", [reason])
-			}
-		}
-		other => Msg::new("stale_modified", [other.to_string()]),
-	}
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1249,22 +1231,12 @@ impl PastePreviewPlan {
 	) -> Result<Self, Msg> {
 		let payload = commits::parse_commit_payload(raw_text)
 			.map_err(|e| Msg::new("paste_err_plan", [e.to_string()]))?;
-		let preview = match &remote {
-			// The write scope is the folder the user pasted into: the
-			// worker holds the replay to it the same way.
-			None => CommitReplayPreview::capture_in(dest, dest, &payload, opts)
-				.map_err(|e| destination_error(dest, &e))?,
-			Some(r) => r
-				.client()
-				.replay_plan(
-					r.workspace(),
-					&r.rel(dest)?,
-					raw_text,
-					payload,
-					opts.cancel.as_ref(),
-				)
-				.map_err(|e| r.destination_error(dest, e))?,
-		};
+		// The write scope is the folder the user pasted into: the worker
+		// holds the replay to it the same way.
+		let target = paste_target(remote.as_ref(), dest)?;
+		let preview = target
+			.plan_commits(raw_text, payload, opts)
+			.map_err(|e| destination_msg(remote.as_ref(), dest, e))?;
 		let preview = Arc::new(preview);
 		// Rows name the worker's repository in a remote workspace; the plan
 		// keeps the tree path the user pasted into.
@@ -1960,16 +1932,20 @@ impl PastePreviewPlan {
 
 	/// Checks whether destination files on disk have changed since preview generation.
 	pub fn check_stale_destination(&self) -> Result<(), Msg> {
-		if let Some(remote) = &self.remote {
-			// The worker's paths: only the worker can re-read them.
-			if let Some(preview) = &self.commit_preview {
-				self.remote_replay(remote, preview, true)?;
-			}
-		} else if let Some(preview) = &self.commit_preview {
-			preview.revalidate().map_err(stale_msg)?;
+		let target = paste_target(self.remote.as_ref(), &self.destination)?;
+		if let Some(preview) = &self.commit_preview {
+			target
+				.check_commits(&self.raw_payload, preview)
+				.map_err(|e| {
+					commit_msg(
+						self.remote.as_ref(),
+						&self.destination,
+						e,
+						false,
+					)
+				})?;
 		}
 		if let Some(plan) = &self.import_plan {
-			let target = paste_target(self.remote.as_ref(), &self.destination)?;
 			target.check_files(plan).map_err(|e| {
 				file_apply_msg(self.remote.as_ref(), &self.destination, e)
 			})?;
@@ -2041,37 +2017,26 @@ impl PastePreviewPlan {
 		if self.items.iter().any(|item| !item.selected) {
 			return Err(Msg::new("commit_subset_rejected", []));
 		}
+		let target = paste_target(self.remote.as_ref(), &self.destination)?;
 		// Core overwrites (spec 4.3); asking first is this session's rule. Stale still wins over the prompt, as before.
 		if self.overwrite_missing() {
-			match &self.remote {
-				None => preview.revalidate().map_err(stale_msg)?,
-				Some(remote) => {
-					self.remote_replay(remote, preview, true)?;
-				}
-			}
+			target
+				.check_commits(&self.raw_payload, preview)
+				.map_err(|e| {
+					commit_msg(
+						self.remote.as_ref(),
+						&self.destination,
+						e,
+						false,
+					)
+				})?;
 			return Err(Msg::new("commit_overwrite_required", []));
 		}
-		let replay_res = match &self.remote {
-			None => preview.apply().map_err(|e| match e {
-				TransferError::Git(GitError::WorktreeBusy { .. }) => {
-					repo_busy()
-				}
-				TransferError::Git(e) => {
-					Msg::new("error_open_repo", [e.to_string()])
-				}
-				other => stale_msg(other),
-			})?,
-			Some(remote) => self
-				.remote_replay(remote, preview, false)?
-				.ok_or_else(|| {
-					remote.destination_error(
-						&self.destination,
-						snip_remote::RemoteError::Protocol(
-							"the replay returned no result".into(),
-						),
-					)
-				})?,
-		};
+		let replay_res = target
+			.apply_commits(&self.raw_payload, preview)
+			.map_err(|e| {
+				commit_msg(self.remote.as_ref(), &self.destination, e, true)
+			})?;
 		if let Some(fail) = replay_res.failure {
 			if replay_res.created.is_empty() {
 				let subject = fail.message.lines().next().unwrap_or("").trim();
@@ -2148,40 +2113,6 @@ impl PastePreviewPlan {
 			},
 			created_commits: replay_res.created,
 		})
-	}
-
-	/// Re-checks (`check_only`) or replays `preview` on the worker, worded
-	/// as the local replay: stale, a repository error, or the worker lost.
-	fn remote_replay(
-		&self,
-		remote: &RemotePaste,
-		preview: &CommitReplayPreview,
-		check_only: bool,
-	) -> Result<Option<commits::ReplayResult>, Msg> {
-		let dest = remote.rel(&self.destination)?;
-		remote
-			.client()
-			.replay_apply(
-				remote.workspace(),
-				&dest,
-				&self.raw_payload,
-				preview,
-				check_only,
-				None,
-			)
-			.map_err(|e| match e {
-				snip_remote::RemoteError::Refused {
-					code: snip_remote::ErrorCode::Stale,
-					message,
-				} => remote_stale_msg(&message),
-				snip_remote::RemoteError::Refused { message, .. } => {
-					Msg::new("error_open_repo", [message])
-				}
-				other if !check_only && other.outcome_unknown() => {
-					outcome_unknown()
-				}
-				other => remote.destination_error(&self.destination, other),
-			})
 	}
 }
 
@@ -2401,6 +2332,93 @@ pub(crate) mod tests {
 			special.args[0],
 			TransferError::SpecialFile("p".into()).to_string()
 		);
+	}
+
+	#[test]
+	fn commit_failures_keep_their_messages() {
+		use snip_remote::{ErrorCode, RemoteError};
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: "/w".into(),
+					name: "w".into(),
+					path: "/w".into(),
+				},
+			),
+		};
+		let dest = remote.session.root.clone();
+		let busy_git =
+			|| TransferError::Git(GitError::WorktreeBusy { args: "x".into() });
+		let key = |r: Option<&RemotePaste>, e, applying| {
+			commit_msg(r, &dest, e, applying).key
+		};
+		let refused = |code, message: String| {
+			PasteError::Remote(RemoteError::Refused { code, message })
+		};
+		// Kept on purpose (design Risk 1): a worker's Busy refusal of a replay
+		// reads as a repository error, not as paste_repo_busy. Changing this
+		// is a decision, not a fix.
+		assert_eq!(
+			key(
+				Some(&remote),
+				refused(ErrorCode::Busy, busy_git().paste_message()),
+				true
+			),
+			"error_open_repo"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				refused(
+					ErrorCode::Stale,
+					"stale destination in '/w': target file 'a' was created externally after preview"
+						.into()
+				),
+				false
+			),
+			"stale_created"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::OutcomeUnknown(RemoteError::TimedOut),
+				true
+			),
+			"paste_outcome_unknown"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Connect("no route".into())),
+				false
+			),
+			"paste_err_destination"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Protocol(
+					"the replay returned no result".into()
+				)),
+				true
+			),
+			"paste_err_destination"
+		);
+		for applying in [false, true] {
+			assert_eq!(
+				key(None, PasteError::Local(busy_git()), applying),
+				"paste_repo_busy"
+			);
+		}
+		let cancelled = || {
+			PasteError::Local(TransferError::Git(GitError::Cancelled {
+				args: "x".into(),
+			}))
+		};
+		assert_eq!(key(None, cancelled(), true), "error_open_repo");
+		assert_eq!(key(None, cancelled(), false), "stale_modified");
 	}
 
 	fn captured(text: String, dest: &Path) -> PasteRequest {
