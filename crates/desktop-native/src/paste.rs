@@ -24,9 +24,10 @@ use snip_core::restore::{
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
 };
 use snip_core::transfer::{
-	detect_clipboard_prefixes, plan_import_with, CanonicalRootId,
-	CommitReplayPreview, ImportMapping, TransferError, TransferImportPlan,
+	detect_clipboard_prefixes, CanonicalRootId, CommitReplayPreview,
+	TransferError,
 };
+use snip_remote::{FilePastePlan, PasteError, PasteRoute, PasteTarget};
 
 use crate::i18n::{tf, Locale, Msg};
 use crate::reader::{Preview, PreviewSource};
@@ -728,27 +729,7 @@ impl RemotePaste {
 			[self.shown(dest), crate::remote::describe(err)],
 		)
 	}
-
-	/// An Apply's failure, worded as a local Apply words it. A lost answer
-	/// says the write may or may not have happened.
-	fn apply_error(&self, dest: &Path, err: snip_remote::RemoteError) -> Msg {
-		match err {
-			snip_remote::RemoteError::Refused {
-				code: snip_remote::ErrorCode::Stale,
-				message,
-			} => remote_stale_msg(&message),
-			snip_remote::RemoteError::Refused {
-				code: snip_remote::ErrorCode::Busy,
-				message,
-			} if message.contains(REPO_BUSY_TEXT) => repo_busy(),
-			other if other.outcome_unknown() => outcome_unknown(),
-			other => self.destination_error(dest, other),
-		}
-	}
 }
-
-/// How `GitError::WorktreeBusy` prints, so a worker's refusal is known.
-const REPO_BUSY_TEXT: &str = "another paste is writing to this repository";
 
 /// Another tab, process or worker holds the repository's write lock.
 fn repo_busy() -> Msg {
@@ -759,6 +740,73 @@ fn repo_busy() -> Msg {
 /// written it. Refresh shows what landed.
 fn outcome_unknown() -> Msg {
 	Msg::new("paste_outcome_unknown", [])
+}
+
+/// The paste target for `dest` (a tree path): this machine, or the remote
+/// workspace's worker.
+fn paste_target(
+	remote: Option<&RemotePaste>,
+	dest: &Path,
+) -> Result<PasteTarget, Msg> {
+	Ok(match remote {
+		None => PasteTarget::Local {
+			dest: dest.to_path_buf(),
+		},
+		Some(r) => PasteTarget::Remote {
+			client: r.session.client.clone(),
+			workspace: r.session.workspace.id.clone(),
+			dest: r.rel(dest)?,
+		},
+	})
+}
+
+/// A destination the paste could not resolve or reach, named as the user
+/// knows it.
+fn destination_msg(
+	remote: Option<&RemotePaste>,
+	path: &Path,
+	err: PasteError,
+) -> Msg {
+	let shown =
+		remote.map_or_else(|| path.display().to_string(), |r| r.shown(path));
+	let why = match err {
+		PasteError::Remote(e) | PasteError::OutcomeUnknown(e) => {
+			crate::remote::describe(e)
+		}
+		PasteError::Local(e) => e.to_string(),
+		PasteError::Destination { source, .. } => source.to_string(),
+	};
+	Msg::new("paste_err_destination", [shown, why])
+}
+
+/// A stale destination's reason as the message the app shows.
+fn stale_reason_msg(reason: String) -> Msg {
+	if reason.contains("created") {
+		Msg::new("stale_created", [reason])
+	} else if reason.contains("deleted") {
+		Msg::new("stale_deleted", [reason])
+	} else {
+		Msg::new("stale_modified", [reason])
+	}
+}
+
+/// A file Apply's failure, worded as before for each target.
+fn file_apply_msg(
+	remote: Option<&RemotePaste>,
+	dest: &Path,
+	err: PasteError,
+) -> Msg {
+	if err.is_repo_busy() {
+		return repo_busy();
+	}
+	if let Some(reason) = err.stale_reason() {
+		return stale_reason_msg(reason);
+	}
+	match err {
+		PasteError::OutcomeUnknown(_) => outcome_unknown(),
+		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
+		other => destination_msg(remote, dest, other),
+	}
 }
 
 /// A worker's stale refusal (the local error's text) as [`stale_msg`].
@@ -778,8 +826,8 @@ fn remote_stale_msg(message: &str) -> Msg {
 pub struct PastePreviewPlan {
 	/// In a remote workspace, the tree path the user pasted into.
 	pub destination: PathBuf,
-	/// Shared import plan containing restore plan and destination freshness.
-	pub import_plan: Option<Arc<TransferImportPlan>>,
+	/// Shared file plan: the engine's plan, plus the worker's digest in a remote workspace.
+	pub import_plan: Option<Arc<FilePastePlan>>,
 	/// Whole-commit replay. File checkboxes do not rewrite a subset.
 	pub commit_preview: Option<Arc<CommitReplayPreview>>,
 	pub whole_commit: bool,
@@ -798,8 +846,6 @@ pub struct PastePreviewPlan {
 	/// Set in a remote workspace. `import_plan` and `commit_preview` then
 	/// hold the worker's plan, with the worker's paths.
 	pub remote: Option<RemotePaste>,
-	/// The worker's digest of `import_plan`, sent back at Apply.
-	remote_digest: String,
 }
 
 fn empty_plan() -> Arc<RestorePlan> {
@@ -972,7 +1018,6 @@ impl PastePreviewPlan {
 	pub fn retained_bytes(&self) -> usize {
 		let mut bytes = size_of::<Self>()
 			.saturating_add(self.destination.capacity())
-			.saturating_add(self.remote_digest.capacity())
 			.saturating_add(self.raw_payload.len())
 			.saturating_add(ARC_ALLOWANCE)
 			.saturating_add(
@@ -989,7 +1034,7 @@ impl PastePreviewPlan {
 		}
 		if let Some(plan) = &self.import_plan {
 			bytes = bytes
-				.saturating_add(size_of::<TransferImportPlan>() + ARC_ALLOWANCE)
+				.saturating_add(size_of::<FilePastePlan>() + ARC_ALLOWANCE)
 				.saturating_add(plan.retained_heap_bytes());
 		}
 		if let Some(plan) = &self.commit_preview {
@@ -1012,7 +1057,6 @@ impl PastePreviewPlan {
 	fn apply_clone_bytes(&self) -> usize {
 		let mut bytes = size_of::<Self>()
 			.saturating_add(self.destination.capacity())
-			.saturating_add(self.remote_digest.capacity())
 			.saturating_add(
 				self.prefix_choices.capacity() * size_of::<PrefixChoice>(),
 			)
@@ -1166,7 +1210,6 @@ impl PastePreviewPlan {
 			error: None,
 			raw_payload: raw_text.into(),
 			remote,
-			remote_digest: String::new(),
 		};
 		let base = plan.retained_bytes();
 		let mut choices_heap = 0usize;
@@ -1248,7 +1291,6 @@ impl PastePreviewPlan {
 			error: None,
 			raw_payload: raw_text.into(),
 			remote,
-			remote_digest: String::new(),
 		};
 		let base = plan.retained_bytes();
 		check_budget(base, limit)?;
@@ -1453,7 +1495,6 @@ impl PastePreviewPlan {
 		self.items = Vec::new();
 		self.selected_item_idx = 0;
 		self.import_plan = None;
-		self.remote_digest = String::new();
 		self.plan = empty_plan();
 	}
 
@@ -1498,57 +1539,42 @@ impl PastePreviewPlan {
 			self.error = Some(Msg::new("mapping_required", []));
 			return Ok(());
 		}
-		if let Some(remote) = self.remote.clone() {
-			return self.rebuild_remote(&remote, opts, limit);
-		}
-		let primary = CanonicalRootId::new(&self.destination)
-			.map_err(|e| destination_error(&self.destination, &e))?;
-		let mut dest_roots = vec![self.destination.clone()];
-		let mut mapping = ImportMapping::with_primary(primary);
-		for choice in &self.prefix_choices {
-			if choice.keep_relative {
-				continue;
-			}
-			let Some(dest) = choice.destination.clone() else {
-				continue;
-			};
-			if !dest_roots.iter().any(|r| r == &dest) {
-				dest_roots.push(dest.clone());
-			}
-			let id = CanonicalRootId::new(&dest)
-				.map_err(|e| destination_error(&dest, &e))?;
-			mapping.map_prefix(&choice.prefix, id);
-		}
-		let import_plan = match plan_import_with(
-			&self.raw_payload,
-			"",
-			&dest_roots,
-			&mapping,
-			opts,
-		) {
-			Ok(plan) => plan,
-			Err(e) => {
-				if crate::e2e_on() {
-					if let TransferError::TargetCollision { .. } = &e {
-						app_log!(
-							"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
-						);
-					}
+		let (target, route) = self.target_route()?;
+		let file_plan =
+			match target.plan_files(&self.raw_payload, &route, opts, None) {
+				Ok(plan) => plan,
+				Err(PasteError::Destination { path, source }) => {
+					return Err(destination_error(&path, &source));
 				}
-				self.error =
-					Some(Msg::new("paste_err_plan", [e.paste_message()]));
-				return Ok(());
-			}
-		};
+				Err(err) => match err.refusal() {
+					Some(message) => {
+						if crate::e2e_on() && err.is_collision() {
+							app_log!(
+								"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
+							);
+						}
+						self.error =
+							Some(Msg::new("paste_err_plan", [message]));
+						return Ok(());
+					}
+					None => {
+						return Err(destination_msg(
+							self.remote.as_ref(),
+							&self.destination,
+							err,
+						));
+					}
+				},
+			};
 		let base = self
 			.retained_bytes()
-			.saturating_add(size_of::<TransferImportPlan>() + ARC_ALLOWANCE)
-			.saturating_add(import_plan.retained_heap_bytes())
-			.saturating_add(import_plan.restore_plan().retained_heap_bytes());
+			.saturating_add(size_of::<FilePastePlan>() + ARC_ALLOWANCE)
+			.saturating_add(file_plan.retained_heap_bytes())
+			.saturating_add(file_plan.restore_plan().retained_heap_bytes());
 		// The existing empty Arc<RestorePlan> charge covers its replacement.
 		// Check before making the second full restore-plan copy.
 		check_budget(base, limit)?;
-		let planned = import_plan.restore_plan().clone();
+		let planned = file_plan.restore_plan().clone();
 		if planned.create_operations.is_empty()
 			&& planned.delete_operations.is_empty()
 			&& planned.skipped_operations.is_empty()
@@ -1556,104 +1582,38 @@ impl PastePreviewPlan {
 			self.error = Some(Msg::new("paste_err_nothing", []));
 			return Ok(());
 		}
-		let items = self.fill_items(&planned, &dest_roots, base, limit)?;
+		let items = self.fill_items(&file_plan, &planned, base, limit)?;
 		self.plan = Arc::new(planned);
-		self.import_plan = Some(Arc::new(import_plan));
+		self.import_plan = Some(Arc::new(file_plan));
 		self.items = items;
 		self.error = None;
 		Ok(())
 	}
 
-	/// The routing the worker plans with: the destination and each chosen
-	/// prefix folder as workspace-relative paths.
-	fn remote_mapping(
-		&self,
-		remote: &RemotePaste,
-	) -> Result<(String, snip_remote::PasteMapping), Msg> {
-		let dest = remote.rel(&self.destination)?;
-		let mut mapping = snip_remote::PasteMapping::default();
+	/// This plan's target and the chosen prefix folders, spelled for it.
+	fn target_route(&self) -> Result<(PasteTarget, PasteRoute), Msg> {
+		let target = paste_target(self.remote.as_ref(), &self.destination)?;
+		let mut route = PasteRoute::default();
 		for choice in &self.prefix_choices {
 			if choice.keep_relative {
 				continue;
 			}
-			if let Some(folder) = &choice.destination {
-				mapping
-					.prefixes
-					.push((choice.prefix.clone(), remote.rel(folder)?));
-			}
+			let Some(folder) = &choice.destination else {
+				continue;
+			};
+			let folder = match &self.remote {
+				None => folder.clone(),
+				Some(r) => PathBuf::from(r.rel(folder)?),
+			};
+			route.prefixes.push((choice.prefix.clone(), folder));
 		}
-		Ok((dest, mapping))
-	}
-
-	/// [`Self::rebuild_inner`] in a remote workspace: the worker plans with
-	/// `plan_import_with` on its own disk and sends the plan back.
-	fn rebuild_remote(
-		&mut self,
-		remote: &RemotePaste,
-		opts: &RunOptions,
-		limit: usize,
-	) -> Result<(), Msg> {
-		let (dest, mapping) = self.remote_mapping(remote)?;
-		let planned = match remote.client().import_plan(
-			remote.workspace(),
-			&dest,
-			&self.raw_payload,
-			&mapping,
-			opts.cancel.as_ref(),
-		) {
-			Ok(planned) => planned,
-			Err(snip_remote::RemoteError::Refused { code, message }) => {
-				if crate::e2e_on() && code == snip_remote::ErrorCode::Collision
-				{
-					app_log!(
-						"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
-					);
-				}
-				self.error = Some(Msg::new("paste_err_plan", [message]));
-				return Ok(());
-			}
-			Err(err) => {
-				return Err(remote.destination_error(&self.destination, err))
-			}
-		};
-		let import_plan = planned.plan;
-		let base = self
-			.retained_bytes()
-			.saturating_add(planned.digest.capacity())
-			.saturating_add(size_of::<TransferImportPlan>() + ARC_ALLOWANCE)
-			.saturating_add(import_plan.retained_heap_bytes())
-			.saturating_add(import_plan.restore_plan().retained_heap_bytes());
-		check_budget(base, limit)?;
-		let planned_ops = import_plan.restore_plan().clone();
-		if planned_ops.create_operations.is_empty()
-			&& planned_ops.delete_operations.is_empty()
-			&& planned_ops.skipped_operations.is_empty()
-		{
-			self.error = Some(Msg::new("paste_err_nothing", []));
-			return Ok(());
-		}
-		let roots = import_plan.roots().to_vec();
-		let mut items = self.fill_items(&planned_ops, &roots, base, limit)?;
-		// A delete row's "exists" is the worker's answer, never a local stat.
-		let fresh = import_plan.destination_freshness();
-		for item in items.iter_mut().filter(|i| i.is_delete()) {
-			item.dest_exists = fresh
-				.target_files
-				.get(&item.dest_path)
-				.is_some_and(|t| t.file_state.is_some());
-		}
-		self.plan = Arc::new(planned_ops);
-		self.import_plan = Some(Arc::new(import_plan));
-		self.remote_digest = planned.digest;
-		self.items = items;
-		self.error = None;
-		Ok(())
+		Ok((target, route))
 	}
 
 	fn fill_items(
 		&self,
+		file_plan: &FilePastePlan,
 		plan: &RestorePlan,
-		dest_roots: &[PathBuf],
 		base: usize,
 		limit: usize,
 	) -> Result<Vec<PasteItem>, Msg> {
@@ -1693,7 +1653,8 @@ impl PastePreviewPlan {
 			)?;
 		}
 		for (op_idx, op) in plan.delete_operations.iter().enumerate() {
-			let dest_root = dest_roots
+			let dest_root = file_plan
+				.roots()
 				.iter()
 				.find(|r| op.absolute_path.starts_with(r))
 				.cloned()
@@ -1702,9 +1663,8 @@ impl PastePreviewPlan {
 				path: op.relative_path.clone(),
 				dest_root_name: root_name(&dest_root),
 				dest_path: op.absolute_path.clone(),
-				// A remote plan's paths are the worker's: its caller fills
-				// this from the worker's snapshot instead.
-				dest_exists: self.remote.is_none() && op.absolute_path.exists(),
+				// A worker's paths are not this machine's: its snapshot answers.
+				dest_exists: file_plan.delete_target_exists(op_idx),
 				op: PlannedOp::Delete,
 				overwrite_allowed: true,
 				selected: true,
@@ -2005,16 +1965,14 @@ impl PastePreviewPlan {
 			if let Some(preview) = &self.commit_preview {
 				self.remote_replay(remote, preview, true)?;
 			}
-			return Ok(());
-		}
-		if let Some(preview) = &self.commit_preview {
+		} else if let Some(preview) = &self.commit_preview {
 			preview.revalidate().map_err(stale_msg)?;
 		}
-		if let Some(import_plan) = &self.import_plan {
-			import_plan
-				.destination_freshness()
-				.revalidate()
-				.map_err(stale_msg)?;
+		if let Some(plan) = &self.import_plan {
+			let target = paste_target(self.remote.as_ref(), &self.destination)?;
+			target.check_files(plan).map_err(|e| {
+				file_apply_msg(self.remote.as_ref(), &self.destination, e)
+			})?;
 		}
 		Ok(())
 	}
@@ -2063,28 +2021,12 @@ impl PastePreviewPlan {
 		};
 
 		// Run confirmed plan directly through shared transfer engine with freshness check
-		let mut result = match &self.remote {
-			None => import_plan.apply(&selection).map_err(stale_msg)?,
-			Some(remote) => {
-				let (dest, mapping) = self.remote_mapping(remote)?;
-				let expect = snip_remote::ImportExpect {
-					digest: self.remote_digest.clone(),
-					freshness: import_plan.destination_freshness().clone(),
-				};
-				remote
-					.client()
-					.import_apply(
-						remote.workspace(),
-						&dest,
-						&self.raw_payload,
-						&mapping,
-						&selection,
-						&expect,
-						None,
-					)
-					.map_err(|e| remote.apply_error(&self.destination, e))?
-			}
-		};
+		let (target, route) = self.target_route()?;
+		let mut result = target
+			.apply_files(&self.raw_payload, &route, import_plan, &selection)
+			.map_err(|e| {
+				file_apply_msg(self.remote.as_ref(), &self.destination, e)
+			})?;
 		result.skipped_existing_count += skipped_existing;
 		Ok(PasteApplyResult {
 			files: result,
@@ -2358,11 +2300,21 @@ pub(crate) mod tests {
 			))
 		};
 		assert_eq!(
-			remote.apply_error(&dest, lost()).key,
+			file_apply_msg(
+				Some(&remote),
+				&dest,
+				PasteError::OutcomeUnknown(lost())
+			)
+			.key,
 			"paste_outcome_unknown"
 		);
 		assert_eq!(
-			remote.apply_error(&dest, RemoteError::TimedOut).key,
+			file_apply_msg(
+				Some(&remote),
+				&dest,
+				PasteError::OutcomeUnknown(RemoteError::TimedOut)
+			)
+			.key,
 			"paste_outcome_unknown"
 		);
 		let stale = RemoteError::Refused {
@@ -2371,13 +2323,83 @@ pub(crate) mod tests {
 			          externally after preview"
 				.into(),
 		};
-		assert_eq!(remote.apply_error(&dest, stale).key, "stale_created");
+		assert_eq!(
+			file_apply_msg(Some(&remote), &dest, PasteError::Remote(stale)).key,
+			"stale_created"
+		);
 		// Never reached the worker: nothing can have been written.
 		assert_eq!(
-			remote
-				.apply_error(&dest, RemoteError::Connect("no route".into()))
-				.key,
+			file_apply_msg(
+				Some(&remote),
+				&dest,
+				PasteError::Remote(RemoteError::Connect("no route".into()))
+			)
+			.key,
 			"paste_err_destination"
+		);
+	}
+
+	#[test]
+	fn file_apply_failures_keep_their_messages() {
+		use snip_remote::{ErrorCode, RemoteError};
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: "/w".into(),
+					name: "w".into(),
+					path: "/w".into(),
+				},
+			),
+		};
+		let dest = remote.session.root.clone();
+		let busy_git =
+			|| TransferError::Git(GitError::WorktreeBusy { args: "x".into() });
+		let key = |r: Option<&RemotePaste>, e| file_apply_msg(r, &dest, e).key;
+		assert_eq!(key(None, PasteError::Local(busy_git())), "paste_repo_busy");
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Refused {
+					code: ErrorCode::Busy,
+					message: busy_git().paste_message()
+				})
+			),
+			"paste_repo_busy"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Refused {
+					code: ErrorCode::Busy,
+					message: "too many callers".into()
+				})
+			),
+			"paste_err_destination"
+		);
+		assert_eq!(
+			key(
+				None,
+				PasteError::Local(TransferError::StaleDestination {
+					root: "/r".into(),
+					reason:
+						"target file 'a' was deleted externally after preview"
+							.into()
+				})
+			),
+			"stale_deleted"
+		);
+		// The old `stale_msg` other arm: the error's Display, not paste_message.
+		let special = file_apply_msg(
+			None,
+			&dest,
+			PasteError::Local(TransferError::SpecialFile("p".into())),
+		);
+		assert_eq!(special.key, "stale_modified");
+		assert_eq!(
+			special.args[0],
+			TransferError::SpecialFile("p".into()).to_string()
 		);
 	}
 
