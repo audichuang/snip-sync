@@ -1270,7 +1270,7 @@ impl PastePreviewPlan {
 				} else {
 					match file.action {
 						ReplayAction::Delete => PlannedOp::Delete,
-						ReplayAction::Write if file.existed => {
+						ReplayAction::Write if file.overwrites_existing() => {
 							PlannedOp::Overwrite
 						}
 						ReplayAction::Write => PlannedOp::Create,
@@ -4127,6 +4127,35 @@ pub(crate) mod tests {
 		assert_eq!(fs::read_to_string(want.join("a.txt")).unwrap(), "body");
 		assert!(!trap.join("a.txt").exists());
 		assert!(!dest.join("lib/a.txt").exists());
+	}
+
+	#[test]
+	fn commit_rows_ask_to_overwrite_exactly_the_existing_writes() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
+		let text = commit_payload_modifying_a();
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &path, &[], 1)
+				.unwrap();
+
+		let asked: BTreeSet<&str> = plan
+			.items
+			.iter()
+			.filter(|i| i.overwritable())
+			.map(|i| i.path.as_str())
+			.collect();
+		let existing = plan
+			.commit_preview
+			.as_ref()
+			.unwrap()
+			.plan()
+			.existing_writes();
+		assert!(!existing.is_empty());
+		assert_eq!(asked, existing);
 	}
 
 	#[test]

@@ -12,9 +12,7 @@ use std::process::ExitCode;
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use snip_core::clip::{self, Mode};
-use snip_core::commits::{
-	self, CommitCopySummary, CommitsPayload, ReplayAction,
-};
+use snip_core::commits::{self, CommitCopySummary, CommitsPayload};
 use snip_core::copy::CopyResult;
 use snip_core::format::{extract_source_root, parse_clipboard};
 use snip_core::gitrun::{CancelToken, RunOptions};
@@ -884,7 +882,7 @@ fn paste_files(
 		return Ok(());
 	}
 
-	let existing = plan.create_operations.iter().filter(|o| o.existed).count();
+	let existing = plan.existing_targets();
 	if existing > 0 && !opts.overwrite && !opts.skip_existing {
 		usage(format!(
 			"{existing} file(s) already exist; pass --overwrite or --skip-existing"
@@ -940,7 +938,7 @@ fn print_plan(plan: &RestorePlan) -> Outcome {
 
 /// `confirmationSummary`.
 fn confirmation_summary(plan: &RestorePlan) -> String {
-	let overwrite = plan.create_operations.iter().filter(|o| o.existed).count();
+	let overwrite = plan.existing_targets();
 	format!(
 		"Snipcode will create {}, overwrite {overwrite}, delete {}, and skip {} operation(s).",
 		plan.create_operations.len() - overwrite,
@@ -1053,7 +1051,7 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 			eprintln!("{total} commit(s) would be created.");
 		}
 		if !opts.overwrite {
-			let existing = distinct_existing_paths(plan);
+			let existing = plan.existing_writes().len();
 			if existing > 0 {
 				eprintln!(
 					"{existing} destination file(s) already exist; --apply will need --overwrite."
@@ -1063,7 +1061,7 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 		return Ok(());
 	}
 
-	let existing = distinct_existing_paths(preview.plan());
+	let existing = preview.plan().existing_writes().len();
 	if existing > 0 && !opts.overwrite {
 		replay(true)?;
 		usage(format!(
@@ -1089,20 +1087,6 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 				.map_or(String::new(), |h| format!("\nhint: {h}"))
 		)),
 	}
-}
-
-fn is_existing_write(f: &commits::FilePlan) -> bool {
-	f.layout_conflict.is_none() && f.action == ReplayAction::Write && f.existed
-}
-
-fn distinct_existing_paths(plan: &commits::CommitReplayPlan) -> usize {
-	plan.commits
-		.iter()
-		.flat_map(|c| &c.files)
-		.filter(|f| is_existing_write(f))
-		.map(|f| &f.path)
-		.collect::<std::collections::BTreeSet<_>>()
-		.len()
 }
 
 #[cfg(test)]
