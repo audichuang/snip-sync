@@ -562,9 +562,45 @@ class TestLaunchSupervisorAndExitFile(RoundDirTestCase):
         }
         (self.run_dir / "app-gate-b-exit.json").write_text(json.dumps(exit_data))
 
+        (self.run_dir / "clipboard-initial.bin").write_bytes(b"before the round")
+        self.sys_ops.clipboard_data = b"left by a cell"
+        app_bundle = Path(self.env_data["app_bundle"])
+        app_bundle.mkdir(parents=True, exist_ok=True)
+
         args = argparse.Namespace(run=str(self.run_dir))
         rc = rur.cmd_finish(args, sys_ops=self.sys_ops)
         self.assertEqual(rc, 1)
+        # A failed quit must not leave the rest of the round behind.
+        self.assertEqual(self.sys_ops.clipboard_data, b"before the round")
+        self.assertIn(app_bundle, self.sys_ops.unregistered_apps)
+        results = json.loads((self.run_dir / "environment.json").read_text())["finish_results"]
+        self.assertEqual(results["exit_code"], 1)
+        self.assertTrue(results["clipboard_restored"])
+        self.assertEqual(results["failures"], ["App exited with non-zero exit code 1."])
+
+    def test_finish_raises_the_app_before_cmd_q_and_kills_it_only_when_that_fails(self):
+        class StuckApp(FakeSystemOperations):
+            def wait_process_exit(self, pid, timeout_seconds=10.0):
+                return None
+
+        fake = StuckApp()
+        fake.processes = [rur.ProcessRecord(4125, "snip-desktop-native")]
+        proc_data = {"pid": 4125, "gate": "b", "log": str(self.run_dir / "app-gate-b.log")}
+        (self.run_dir / "app-process.json").write_text(json.dumps(proc_data))
+        (self.run_dir / "app-gate-b-exit.json").write_text(json.dumps({"pid": 4125, "exit_code": -9, "signal": 9}))
+        (self.run_dir / "clipboard-initial.bin").write_bytes(b"before the round")
+
+        rc = rur.cmd_finish(argparse.Namespace(run=str(self.run_dir)), sys_ops=fake)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(fake.applescripts_run), 1)
+        script = fake.applescripts_run[0]
+        self.assertIn("unix id is 4125", script)
+        self.assertLess(script.index("set frontmost to true"), script.index('keystroke "q" using command down'))
+        self.assertEqual(fake.killed_pids, [4125])
+        self.assertEqual(fake.clipboard_data, b"before the round")
+        results = json.loads((self.run_dir / "environment.json").read_text())["finish_results"]
+        self.assertEqual(results["quit_gesture"], "SIGKILL")
+        self.assertEqual(len(results["failures"]), 2)
 
     def test_finish_succeeds_when_exit_receipt_is_zero(self):
         proc_data = {"pid": 99999, "gate": "b", "log": str(self.run_dir / "app-gate-b.log")}
@@ -593,6 +629,17 @@ class TestLaunchSupervisorAndExitFile(RoundDirTestCase):
         # Check recorded finish_results
         env_res = json.loads((self.run_dir / "environment.json").read_text(encoding="utf-8"))
         self.assertEqual(env_res["finish_results"]["exit_code"], 0)
+        self.assertEqual(env_res["finish_results"]["failures"], [])
+
+    def test_relaunch_keeps_the_previous_log_and_receipt_numbered(self):
+        (self.run_dir / "app-gate-b.log").write_text("first\n")
+        (self.run_dir / "app-gate-b-exit.json").write_text('{"exit_code": -9}')
+        (self.run_dir / "app-gate-b.1.log").write_text("older\n")
+        rotated = rur.rotate_launch_evidence(self.run_dir, "b")
+        self.assertEqual([new.name for _, new in rotated], ["app-gate-b.2.log", "app-gate-b-exit.2.json"])
+        self.assertEqual((self.run_dir / "app-gate-b.2.log").read_text(), "first\n")
+        self.assertFalse((self.run_dir / "app-gate-b.log").exists())
+        self.assertEqual(rur.rotate_launch_evidence(self.run_dir, "b"), [])
 
 
 class TestBundleIsolation(unittest.TestCase):
@@ -713,6 +760,77 @@ class TestFindMainWindow(unittest.TestCase):
 
     def test_applescript_string_escapes_quotes_and_backslashes(self):
         self.assertEqual(rur.applescript_string('a "b" \\ c'), '"a \\"b\\" \\\\ c"')
+
+
+class TestScreenScale(unittest.TestCase):
+    # Primary 1920x1080 at scale 2; an external 2560x1440 at scale 1 to its right,
+    # top-aligned (AppKit y of its origin = 1080 - 1440 = -360).
+    INFO = {
+        "screens": [
+            {"frame": [0, 0, 1920, 1080], "scale": 2.0},
+            {"frame": [1920, -360, 2560, 1440], "scale": 1.0},
+        ]
+    }
+
+    def test_a_window_on_the_external_screen_uses_its_scale(self):
+        frame = {"X": 2200, "Y": 100, "Width": 1080, "Height": 752}
+        self.assertEqual(rur.screen_scale_for_window(self.INFO, frame), 1.0)
+
+    def test_a_window_on_the_primary_screen_uses_its_scale(self):
+        frame = {"X": 100, "Y": 100, "Width": 1080, "Height": 752}
+        self.assertEqual(rur.screen_scale_for_window(self.INFO, frame), 2.0)
+
+    def test_a_window_below_the_primary_on_the_taller_external_screen(self):
+        # CG y 1200 lies under the primary's bottom edge but inside the external screen.
+        frame = {"X": 2000, "Y": 1100, "Width": 400, "Height": 200}
+        self.assertEqual(rur.screen_scale_for_window(self.INFO, frame), 1.0)
+
+    def test_a_window_off_every_screen_falls_back_to_the_first(self):
+        frame = {"X": -5000, "Y": 0, "Width": 100, "Height": 100}
+        self.assertEqual(rur.screen_scale_for_window(self.INFO, frame), 2.0)
+
+
+class TestLaunchWaitsForTheWindow(RoundDirTestCase):
+    def launch(self, window_after: Optional[int], timeout: float = 5.0):
+        """Launch with a fake supervisor; the main window shows up on query `window_after`."""
+        import contextlib
+        import io
+
+        class SlowWindow(FakeSystemOperations):
+            def __init__(self):
+                super().__init__()
+                self.processes = [rur.ProcessRecord(77, "snip-desktop-native")]
+                self.queries = 0
+
+            def get_window_info(self, pid, helper_binary=None):
+                self.queries += 1
+                shown = window_after is not None and self.queries >= window_after
+                window = main_window("ws-src — snip-sync") if shown else HELPER
+                return {"screens": [], "windows": [dict(window, kCGWindowOwnerPID=77)]}
+
+        fake = SlowWindow()
+        run_dir = self.run_dir
+
+        def fake_popen(cmd, **kwargs):
+            (run_dir / "app-process.json").write_text(json.dumps({"pid": 77, "gate": "b", "supervisor_pid": 1}))
+            return mock.Mock()
+
+        err = io.StringIO()
+        with mock.patch.object(rur.subprocess, "Popen", side_effect=fake_popen), \
+                mock.patch.object(rur, "WINDOW_TIMEOUT_SECONDS", timeout), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = rur.cmd_launch(argparse.Namespace(gate="b", run=str(run_dir)), sys_ops=fake)
+        return rc, fake, err.getvalue()
+
+    def test_launch_returns_once_the_main_window_is_open(self):
+        rc, fake, err = self.launch(window_after=3)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.queries, 3)
+
+    def test_launch_fails_when_the_window_never_opens(self):
+        rc, _, err = self.launch(window_after=None, timeout=0.5)
+        self.assertEqual(rc, 1)
+        self.assertIn("Main window did not open", err)
 
 
 class WindowFakeSystemOperations(FakeSystemOperations):

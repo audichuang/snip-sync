@@ -29,6 +29,8 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from bench_native_memory import e2e_scaled
+
 
 REQUIRED_PROTOCOL_ANCESTOR = "f5247ab"
 APP_WINDOW_TITLE = "snip-sync"
@@ -72,6 +74,43 @@ def find_main_window(info: Dict[str, Any], pid: int) -> Dict[str, Any]:
             f"for PID {pid}. Windows of this PID: {titles!r}.{hint}"
         )
     raise MainWindowError(f"{len(matching)} main windows for PID {pid}: {[w.get('kCGWindowName') for w in matching]!r}")
+
+
+# How long Cmd+Q may take: quitting drains every workspace tab first.
+QUIT_TIMEOUT_SECONDS = 10.0
+# How long `launch` waits for the main window after the process is up.
+WINDOW_TIMEOUT_SECONDS = 15.0
+
+
+def quit_app_script(pid: int) -> str:
+    """Cmd+Q for `pid`. System Events types into the frontmost process only, so
+    the app is raised first: an operator that drives it in the background (lcu)
+    leaves another app in front, and the keystroke went there instead."""
+    return (
+        f"tell application \"System Events\" to tell first application process whose unix id is {pid}\n"
+        "set frontmost to true\n"
+        "keystroke \"q\" using command down\n"
+        "end tell"
+    )
+
+
+def screen_scale_for_window(info: Dict[str, Any], frame: Dict[str, float]) -> float:
+    """`backingScaleFactor` of the screen holding the window frame's centre.
+
+    `frame` is a CGWindow bound (origin top-left of the primary screen, y down);
+    screen frames are AppKit's (origin bottom-left of the primary screen, y up).
+    The first screen's scale is wrong for a window on an external display with
+    another scale.
+    """
+    screens = info.get("screens") or [{}]
+    primary = screens[0].get("frame") or [0, 0, 0, 0]
+    cx = frame["X"] + frame["Width"] / 2.0
+    cy = primary[3] - (frame["Y"] + frame["Height"] / 2.0)
+    for screen in screens:
+        sx, sy, sw, sh = screen.get("frame") or [0, 0, 0, 0]
+        if sx <= cx < sx + sw and sy <= cy < sy + sh:
+            return float(screen.get("scale", 1.0))
+    return float(screens[0].get("scale", 1.0))
 
 
 def applescript_string(text: str) -> str:
@@ -1205,6 +1244,26 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     return 0
 
 
+def rotate_launch_evidence(run_dir: Path, gate: str) -> List[Tuple[Path, Path]]:
+    """Rename a previous launch's log and exit receipt to `.<n>` (n = 1, 2, ...)."""
+    log_file = run_dir / f"app-gate-{gate}.log"
+    exit_file = run_dir / f"app-gate-{gate}-exit.json"
+    if not log_file.exists() and not exit_file.exists():
+        return []
+    n = 1
+    while (run_dir / f"app-gate-{gate}.{n}.log").exists() or (run_dir / f"app-gate-{gate}-exit.{n}.json").exists():
+        n += 1
+    rotated = []
+    for path, target in (
+        (log_file, run_dir / f"app-gate-{gate}.{n}.log"),
+        (exit_file, run_dir / f"app-gate-{gate}-exit.{n}.json"),
+    ):
+        if path.exists():
+            path.rename(target)
+            rotated.append((path, target))
+    return rotated
+
+
 def cmd_launch(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_OPS) -> int:
     gate = args.gate.lower()
     if gate not in ("a", "b"):
@@ -1237,9 +1296,12 @@ def cmd_launch(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     exit_file = run_dir / f"app-gate-{gate}-exit.json"
     proc_file = run_dir / "app-process.json"
 
-    # Remove any stale exit or process file from previous attempts
-    if exit_file.exists():
-        exit_file.unlink()
+    # A relaunch keeps the previous attempt's log and exit receipt as evidence,
+    # numbered, and starts a fresh log: `point` reads the latest CTRL_BOUNDS,
+    # and a control the new process has not drawn yet would match the old one.
+    rotated = rotate_launch_evidence(run_dir, gate)
+    for old_path, new_path in rotated:
+        print(f"  Kept {old_path.name} from the previous launch as {new_path.name}")
     if proc_file.exists():
         proc_file.unlink()
 
@@ -1291,7 +1353,27 @@ def cmd_launch(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
         return 1
 
     print(f"[OK] Started PID {app_pid} (supervisor PID {proc_state.get('supervisor_pid')}). Recorded to app-process.json.")
-    return 0
+
+    # `resize`, `point` and `title` need the main window; the process is up well
+    # before GPUI opens it.
+    helper_bin = run_dir / "window-info"
+    deadline = time.time() + e2e_scaled(WINDOW_TIMEOUT_SECONDS)
+    last_err = "no window yet"
+    while time.time() < deadline:
+        if not sys_ops.is_pid_alive(app_pid):
+            print(f"ERROR: App PID {app_pid} exited before its main window opened.", file=sys.stderr)
+            return 1
+        try:
+            win = find_main_window(sys_ops.get_window_info(app_pid, helper_binary=helper_bin), app_pid)
+            print(f"[OK] Main window open: '{win['kCGWindowName']}'.")
+            return 0
+        except MainWindowError as exc:
+            last_err = str(exc)
+        except Exception as exc:
+            last_err = f"window query failed: {exc}"
+        time.sleep(0.2)
+    print(f"ERROR: Main window did not open within {e2e_scaled(WINDOW_TIMEOUT_SECONDS):.0f} s: {last_err}", file=sys.stderr)
+    return 1
 
 
 def cmd_resize(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_OPS) -> int:
@@ -1325,7 +1407,7 @@ def cmd_resize(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     frame = win.get("kCGWindowBounds", {})
-    scale = info.get("screens", [{}])[0].get("scale", 1.0)
+    scale = screen_scale_for_window(info, frame)
 
     # Determine titlebar height from previous viewport if available, else standard 32
     titlebar = 32.0
@@ -1413,7 +1495,7 @@ def cmd_point(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     frame = win["kCGWindowBounds"]
-    scale = info.get("screens", [{}])[0].get("scale", 1.0)
+    scale = screen_scale_for_window(info, frame)
 
     res = calculate_point_coordinates(bounds, viewport, frame, scale)
 
@@ -1470,10 +1552,19 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
     env_data = json.loads(env_file.read_text(encoding="utf-8"))
     proc_file = run_dir / "app-process.json"
 
-    exit_code = 0
-    app_was_running = False
+    # Every step runs even when an earlier one fails: stopping at the first
+    # failure left the clipboard, the worktree and the remote host behind.
+    failures: List[str] = []
 
-    # 1. Quit app with Cmd+Q if running, and read exit receipt from supervisor
+    def fail(message: str) -> None:
+        failures.append(message)
+        print(f"ERROR: {message}", file=sys.stderr)
+
+    exit_code: Optional[int] = None
+    app_was_running = False
+    quit_gesture: Optional[str] = None
+
+    # 1. Quit the app with Cmd+Q if it runs, then read the supervisor's exit receipt
     if proc_file.is_file():
         proc_state = json.loads(proc_file.read_text(encoding="utf-8"))
         pid = proc_state.get("pid")
@@ -1482,119 +1573,122 @@ def cmd_finish(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
 
         if pid and sys_ops.is_pid_alive(pid):
             app_was_running = True
+            quit_gesture = "Cmd+Q"
             print(f"Quitting app PID {pid} via Cmd+Q...")
             try:
-                sys_ops.run_applescript(
-                    f'tell application "System Events" to tell first application process whose unix id is {pid}\nkeystroke "q" using command down\nend tell'
-                )
-            except Exception:
-                pass
+                sys_ops.run_applescript(quit_app_script(pid))
+            except Exception as exc:
+                print(f"WARNING: Cmd+Q could not be sent: {exc}", file=sys.stderr)
 
-            ec = sys_ops.wait_process_exit(pid, timeout_seconds=10.0)
-            if ec is None:
-                print(f"Process {pid} did not terminate within 10s. Force killing...", file=sys.stderr)
+            if sys_ops.wait_process_exit(pid, timeout_seconds=e2e_scaled(QUIT_TIMEOUT_SECONDS)) is None:
+                quit_gesture = "SIGKILL"
+                fail(f"App PID {pid} did not quit on Cmd+Q; killed it.")
                 sys_ops.kill_process(pid, signal.SIGKILL)
 
-        # Bounded wait for supervisor to write exit receipt file
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            if exit_file.is_file():
-                break
+        # Bounded wait for the supervisor to write the exit receipt
+        deadline = time.time() + e2e_scaled(5.0)
+        while time.time() < deadline and not exit_file.is_file():
             time.sleep(0.1)
 
         if not exit_file.is_file():
-            print(f"ERROR: Missing exit receipt {exit_file.name} for PID {pid}!", file=sys.stderr)
-            return 1
+            fail(f"Missing exit receipt {exit_file.name} for PID {pid}.")
+        else:
+            try:
+                exit_data = json.loads(exit_file.read_text(encoding="utf-8"))
+                exit_code = exit_data["exit_code"]
+                print(f"[OK] Read {exit_file.name}: pid={exit_data.get('pid')} exit_code={exit_code}")
+            except Exception as exc:
+                fail(f"Failed to read {exit_file.name}: {exc}")
+            if exit_code not in (None, 0):
+                fail(f"App exited with non-zero exit code {exit_code}.")
 
-        try:
-            exit_data = json.loads(exit_file.read_text(encoding="utf-8"))
-            exit_code = exit_data["exit_code"]
-            print(f"[OK] Read {exit_file.name}: pid={exit_data.get('pid')} exit_code={exit_code}")
-        except Exception as exc:
-            print(f"ERROR: Failed to read {exit_file.name}: {exc}", file=sys.stderr)
-            return 1
-
-        if exit_code != 0:
-            print(f"ERROR: App exited with non-zero exit code {exit_code}", file=sys.stderr)
-            return 1
-
-    # 2. Verify no snip desktop process for this round remains
+    # 2. No snip desktop process of this round may remain
     app_bundle_path = Path(env_data["app_bundle"])
     remaining = [
         p for p in sys_ops.list_processes()
         if p.command == str(app_bundle_path / "Contents/MacOS/snip-desktop-native")
     ]
     if remaining:
-        print(f"ERROR: Remaining processes found from this round: {remaining}", file=sys.stderr)
-        return 1
+        fail(f"Remaining processes found from this round: {remaining}")
 
-    # 3. Restore clipboard
+    # 3. Restore the clipboard
     clip_file = run_dir / "clipboard-initial.bin"
     clipboard_restored = False
     if clip_file.is_file():
         saved_bytes = clip_file.read_bytes()
-        sys_ops.set_clipboard_bytes(saved_bytes)
-        restored = sys_ops.get_clipboard_bytes()
-        if hashlib.sha256(restored).hexdigest() != hashlib.sha256(saved_bytes).hexdigest():
-            print("ERROR: Clipboard restore hash mismatch!", file=sys.stderr)
-            return 1
-        clipboard_restored = True
-        print("[OK] Clipboard successfully restored and verified.")
+        try:
+            sys_ops.set_clipboard_bytes(saved_bytes)
+            restored = sys_ops.get_clipboard_bytes()
+        except Exception as exc:
+            fail(f"Clipboard restore failed: {exc}")
+        else:
+            if hashlib.sha256(restored).digest() != hashlib.sha256(saved_bytes).digest():
+                fail("Clipboard restore hash mismatch.")
+            else:
+                clipboard_restored = True
+                print("[OK] Clipboard successfully restored and verified.")
 
-    # 4. Compare real config snapshot
-    real_config_dir = get_real_config_dir()
+    # 4. Compare the real config snapshot
+    real_config_verified: Optional[bool] = None
     snap_file = run_dir / "real-config-snapshot.json"
     if snap_file.is_file():
         expected_snap = json.loads(snap_file.read_text(encoding="utf-8"))
-        diffs = verify_config_snapshot(real_config_dir, expected_snap)
+        diffs = verify_config_snapshot(get_real_config_dir(), expected_snap)
+        real_config_verified = not diffs
         if diffs:
-            print("ERROR: Real user config directory was modified during the round!", file=sys.stderr)
+            fail("Real user config directory was modified during the round!")
             for d in diffs:
                 print(f"  - {d}", file=sys.stderr)
-            return 1
-        print("[OK] Real user config directory snapshot verified unchanged.")
+        else:
+            print("[OK] Real user config directory snapshot verified unchanged.")
 
-    # 5. Unregister .app from LaunchServices
+    # 5. Unregister the .app from LaunchServices
     if app_bundle_path.exists():
         sys_ops.unregister_app(app_bundle_path)
         print("[OK] Unregistered .app from LaunchServices.")
 
-    # 6. Remove worktree
+    # 6. Remove the worktree
     worktree_path = Path(env_data["source_worktree"])
     if worktree_path.is_dir():
         print(f"Removing detached worktree at {worktree_path}...")
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree_path)], check=False)
+        if worktree_path.exists():
+            fail(f"Worktree {worktree_path} is still there after 'git worktree remove'.")
+    worktree_removed = not worktree_path.exists()
 
-    # 7. Clean remote host if applicable: only what this round put there
+    # 7. Clean the remote host if applicable: only what this round put there
     remote_host = env_data.get("remote_host")
     remote_cleanup: Optional[Dict[str, Any]] = None
     if remote_host:
         print(f"Cleaning remote host {remote_host}...")
         remote_cleanup = clean_remote_round(remote_host, env_data["sha"], run_dir, sys_ops)
         if not remote_cleanup.get("remote_dir_removed"):
-            env_data["finish_results"] = {"remote_cleanup": remote_cleanup}
-            env_file.write_text(json.dumps(env_data, indent=2), encoding="utf-8")
             if not remote_cleanup["workers_stopped"]:
                 why = "worker cleanup failed"
             elif remote_cleanup.get("remote_dir_kept_for"):
                 why = f"kept for {', '.join(remote_cleanup['remote_dir_kept_for'])}: still runs it or could not be checked"
             else:
                 why = remote_cleanup["remote_dir_error"]
-            print(f"ERROR: Remote cleanup incomplete ({why}); {remote_cleanup['remote_dir']} removal not confirmed.", file=sys.stderr)
-            return 1
-        print("[OK] Remote host cleaned.")
+            fail(f"Remote cleanup incomplete ({why}); {remote_cleanup['remote_dir']} removal not confirmed.")
+        else:
+            print("[OK] Remote host cleaned.")
 
-    # 8. Record finish results in environment.json
+    # 8. Record the results in environment.json
     env_data["finish_results"] = {
         "finish_time": datetime.datetime.now().isoformat(),
         "app_was_running": app_was_running,
+        "quit_gesture": quit_gesture,
         "exit_code": exit_code,
         "clipboard_restored": clipboard_restored,
-        "real_config_verified": True,
-        "worktree_removed": True,
+        "real_config_verified": real_config_verified,
+        "worktree_removed": worktree_removed,
         "remote_cleanup": remote_cleanup,
+        "failures": failures,
     }
     env_file.write_text(json.dumps(env_data, indent=2), encoding="utf-8")
+    if failures:
+        print(f"\nERROR: Round teardown finished with {len(failures)} failure(s); see finish_results in {env_file}.", file=sys.stderr)
+        return 1
     print(f"\n[OK] Round teardown completed. Results written to {env_file}.")
     return 0
 
@@ -1662,6 +1756,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Errors go to stderr and progress to stdout; line buffering keeps their
+    # order when both are piped into one log.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except AttributeError:
+            pass
     parser = build_parser()
     args = parser.parse_args(argv)
 
