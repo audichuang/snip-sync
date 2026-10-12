@@ -199,8 +199,8 @@ pub enum PasteError {
 }
 
 impl PasteError {
-	/// A stale destination's reason, without the "stale destination in
-	/// '<root>': " the worker's message starts with.
+	/// A stale destination's reason, without the `stale destination in
+	/// '<root>': ` prefix the worker's message starts with.
 	pub fn stale_reason(&self) -> Option<String> {
 		match self {
 			Self::Local(TransferError::StaleDestination { reason, .. }) => {
