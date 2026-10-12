@@ -17,8 +17,8 @@ use snip_core::transfer::{
 };
 use snip_remote::proto::MAX_FRAME;
 use snip_remote::{
-	Client, ErrorCode, FilePastePlan, PasteMapping, PasteRoute, PasteTarget,
-	RemoteError, RemoteHost, Worker, WorkerOptions,
+	Client, ErrorCode, FilePastePlan, PasteError, PasteMapping, PasteRoute,
+	PasteTarget, RemoteError, RemoteHost, Worker, WorkerOptions,
 };
 
 /// The worker's Git pool is one per process: tests that each run dozens
@@ -1021,4 +1021,104 @@ fn a_local_target_never_applies_a_workers_plan() {
 		.expect_err("a local target applied a worker's plan");
 	assert!(err.stale_reason().is_some(), "{err:?}");
 	assert!(!ws.join("n.txt").exists());
+}
+
+/// A worker that hangs up on its next request, as a dead process would: a
+/// call on the connection the master already holds sends its request and
+/// hears no answer.
+fn lose_the_answer(w: &Worker) {
+	w.stop();
+}
+
+/// A commit payload from one repository, planned into another through a
+/// `PasteTarget::Remote`: what the destination preview and Apply start from.
+fn planned_replay(
+	tmp: &Path,
+	w: &Arc<Worker>,
+) -> (PasteTarget, String, CommitReplayPreview) {
+	let ws = tmp.join("ws");
+	let src = ws.join("src");
+	init_repo(&src);
+	fs::write(src.join("a.txt"), "one\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "add a"]);
+	let tip = git_out(&src, &["rev-parse", "HEAD"]);
+	init_repo(&ws.join("dst"));
+	let (client, id) = open(w, &ws);
+	let text = client
+		.export_commits(&id, "src", &tip, vec![tip.clone()], None)
+		.unwrap()
+		.text;
+	let payload = snip_core::commits::parse_commit_payload(&text).unwrap();
+	let target = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: "dst".into(),
+	};
+	let preview = target
+		.plan_commits(&text, payload, &RunOptions::default())
+		.unwrap();
+	(target, text, preview)
+}
+
+/// #167: a remote file Apply whose answer is lost may have written, so
+/// `PasteTarget` reports it as outcome unknown and not as a plain failure.
+#[test]
+fn a_lost_file_apply_answer_through_a_paste_target_is_outcome_unknown() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: String::new(),
+	};
+	let text = entry("a.txt", "new");
+	let route = PasteRoute::default();
+	let plan = remote
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+
+	lose_the_answer(&w);
+	let err = remote
+		.apply_files(&text, &route, &plan, &unchecked(&[]))
+		.expect_err("a hung-up worker cannot answer an Apply");
+	assert!(matches!(err, PasteError::OutcomeUnknown(_)), "{err:?}");
+}
+
+/// The same for a commit replay's Apply.
+#[test]
+fn a_lost_replay_apply_answer_through_a_paste_target_is_outcome_unknown() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let w = worker(None);
+	let (remote, text, preview) = planned_replay(tmp.path(), &w);
+
+	lose_the_answer(&w);
+	let err = remote
+		.apply_commits(&text, &preview)
+		.expect_err("a hung-up worker cannot answer an Apply");
+	assert!(matches!(err, PasteError::OutcomeUnknown(_)), "{err:?}");
+}
+
+/// A check writes nothing, so a lost answer to it is a plain failure: only
+/// an Apply reports outcome unknown.
+#[test]
+fn a_lost_replay_check_answer_through_a_paste_target_is_a_plain_failure() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let w = worker(None);
+	let (remote, text, preview) = planned_replay(tmp.path(), &w);
+
+	lose_the_answer(&w);
+	let err = remote
+		.check_commits(&text, &preview)
+		.expect_err("a hung-up worker cannot answer a check");
+	assert!(
+		matches!(&err, PasteError::Remote(e) if e.outcome_unknown()),
+		"{err:?}"
+	);
 }

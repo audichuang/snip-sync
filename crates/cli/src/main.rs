@@ -1036,5 +1036,10 @@ mod tests {
 		);
 		// A refused Apply is a refusal, not a lost answer.
 		assert_eq!(apply(refused(ErrorCode::Stale, STALE)), stale_text);
+		// A replay answered without its result keeps its bare words.
+		assert_eq!(
+			format_paste_error(PasteError::NoReplayResult),
+			"the replay returned no result"
+		);
 	}
 }

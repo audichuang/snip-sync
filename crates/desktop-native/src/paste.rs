@@ -758,6 +758,10 @@ fn destination_msg(
 		}
 		PasteError::Local(e) => e.to_string(),
 		PasteError::Destination { source, .. } => source.to_string(),
+		// Worded as the app always did: a protocol error of the worker.
+		PasteError::NoReplayResult => crate::remote::describe(
+			RemoteError::Protocol(PasteError::NoReplayResult.to_string()),
+		),
 	};
 	Msg::new("paste_err_destination", [shown, why])
 }
@@ -2397,13 +2401,7 @@ pub(crate) mod tests {
 			"paste_err_destination"
 		);
 		assert_eq!(
-			key(
-				Some(&remote),
-				PasteError::Remote(RemoteError::Protocol(
-					"the replay returned no result".into()
-				)),
-				true
-			),
+			key(Some(&remote), PasteError::NoReplayResult, true),
 			"paste_err_destination"
 		);
 		for applying in [false, true] {

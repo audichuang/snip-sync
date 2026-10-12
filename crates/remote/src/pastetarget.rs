@@ -191,6 +191,11 @@ pub enum PasteError {
 	/// Only `apply_files` and `apply_commits` return it.
 	#[error(transparent)]
 	OutcomeUnknown(RemoteError),
+	/// A replay Apply came back without its result: the worker answered,
+	/// so this is no lost answer. Only `apply_commits` returns it. It
+	/// prints as the bare words the CLI always used.
+	#[error("the replay returned no result")]
+	NoReplayResult,
 }
 
 impl PasteError {
@@ -490,11 +495,7 @@ impl PasteTarget {
 			} => client
 				.replay_apply(workspace, dest, text, preview, false, None)
 				.map_err(apply_failure)?
-				.ok_or_else(|| {
-					PasteError::Remote(RemoteError::Protocol(
-						"the replay returned no result".into(),
-					))
-				}),
+				.ok_or(PasteError::NoReplayResult),
 		}
 	}
 }
