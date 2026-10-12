@@ -20,11 +20,15 @@ pub(crate) mod copyserve;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;
 pub(crate) mod pasteserve;
+pub mod pastetarget;
 pub mod proto;
 pub mod ssh;
 pub mod worker;
 
 pub use client::{Client, Connection, RemoteHost, RemoteRepo, Transport};
+pub use pastetarget::{
+	FilePastePlan, PasteError, PasteRoute, PasteTarget, REPO_BUSY_TEXT,
+};
 pub use proto::{
 	DirEntry, ErrorCode, ExportTarget, GitQuery, GitReply, ImportExpect,
 	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,

@@ -114,6 +114,12 @@ impl RestorePlan {
 		}
 		bytes
 	}
+
+	/// Create operations whose target exists now: the overwrites a paste needs
+	/// permission for.
+	pub fn existing_targets(&self) -> usize {
+		self.create_operations.iter().filter(|o| o.existed).count()
+	}
 }
 
 /// What the user confirmed. Unchecked operations are indices into the
@@ -1471,5 +1477,27 @@ mod tests {
 		assert_eq!(result.errors.len(), 2);
 		assert!(result.errors[0].contains(".git/config: unsafe path"));
 		assert!(result.errors[1].contains(".git/config: unsafe path"));
+	}
+
+	#[test]
+	fn existing_targets_counts_creates_onto_existing_files() {
+		let create = |path: &str, existed: bool| CreateOperation {
+			relative_path: path.into(),
+			absolute_path: PathBuf::from(path),
+			content: String::new(),
+			existed,
+			root_path: PathBuf::new(),
+		};
+		let plan = RestorePlan {
+			roots: Vec::new(),
+			create_operations: vec![
+				create("a.txt", true),
+				create("b.txt", false),
+				create("c.txt", true),
+			],
+			delete_operations: Vec::new(),
+			skipped_operations: Vec::new(),
+		};
+		assert_eq!(plan.existing_targets(), 2);
 	}
 }

@@ -1230,6 +1230,15 @@ impl FilePlan {
 			.flatten();
 		[target, old].into_iter().flatten()
 	}
+
+	/// A write onto a target that exists now: what the overwrite gate asks
+	/// permission for (spec 4.3, D9). A file a layout conflict refuses is never
+	/// written, so it never asks.
+	pub fn overwrites_existing(&self) -> bool {
+		self.layout_conflict.is_none()
+			&& self.action == ReplayAction::Write
+			&& self.existed
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1290,6 +1299,18 @@ impl CommitReplayPlan {
 			}
 		}
 		bytes
+	}
+
+	/// The distinct target paths a replay would overwrite: a path that several
+	/// commits write counts once (the CLI's `--overwrite` gate and its dry-run
+	/// warning count these).
+	pub fn existing_writes(&self) -> std::collections::BTreeSet<&str> {
+		self.commits
+			.iter()
+			.flat_map(|c| &c.files)
+			.filter(|f| f.overwrites_existing())
+			.map(|f| f.path.as_str())
+			.collect()
 	}
 }
 
@@ -4861,5 +4882,76 @@ mod tests {
 			);
 			assert_eq!(planned_files[4].freshness_targets().count(), 0);
 		}
+	}
+
+	fn file_plan(
+		path: &str,
+		action: ReplayAction,
+		existed: bool,
+		conflict: Option<LayoutConflict>,
+	) -> FilePlan {
+		FilePlan {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Modified,
+			action,
+			existed,
+			old_existed: false,
+			not_copied: None,
+			skip_reason: None,
+			layout_conflict: conflict,
+			absolute_path: None,
+			old_absolute_path: None,
+		}
+	}
+
+	#[test]
+	fn overwrites_existing_is_a_write_onto_an_existing_target_without_a_conflict(
+	) {
+		assert!(file_plan("a.txt", ReplayAction::Write, true, None)
+			.overwrites_existing());
+		assert!(!file_plan("a.txt", ReplayAction::Write, false, None)
+			.overwrites_existing());
+		assert!(!file_plan("a.txt", ReplayAction::Delete, true, None)
+			.overwrites_existing());
+		assert!(!file_plan("a.txt", ReplayAction::Skip, true, None)
+			.overwrites_existing());
+		assert!(!file_plan(
+			"a.txt",
+			ReplayAction::Write,
+			true,
+			Some(LayoutConflict::CaseAlias)
+		)
+		.overwrites_existing());
+	}
+
+	#[test]
+	fn existing_writes_counts_a_path_once_across_commits() {
+		let commit = |files: Vec<FilePlan>| CommitPlan {
+			message: String::new(),
+			author_name: String::new(),
+			author_email: String::new(),
+			author_date: String::new(),
+			files,
+		};
+		let plan = CommitReplayPlan {
+			root: PathBuf::new(),
+			commits: vec![
+				commit(vec![
+					file_plan("a.txt", ReplayAction::Write, true, None),
+					file_plan("b.txt", ReplayAction::Write, false, None),
+				]),
+				commit(vec![file_plan(
+					"a.txt",
+					ReplayAction::Write,
+					true,
+					None,
+				)]),
+			],
+		};
+		assert_eq!(
+			plan.existing_writes(),
+			std::collections::BTreeSet::from(["a.txt"])
+		);
 	}
 }

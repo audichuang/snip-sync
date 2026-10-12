@@ -116,7 +116,7 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 3. 疊在**目前分支的 HEAD** 上,不需要與來源有共同的起點,也不檢查是否 fast-forward。
 4. 結果:建立了幾個 commit。
 
-- 此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,**預設不套用**,需明確允許覆寫(GUI:允許覆寫的開關,i18n `commit_overwrite_required`,paste.rs `execute_commit` 先 `preview.revalidate()` 再回此錯誤;CLI 判定與 GUI 相同[已決 D9],以 `FilePlan.existed` 判定,需 `--overwrite`,沒給則 exit 2)。覆寫門禁與 dry-run 提示皆以相異目標路徑（distinct paths）計算（多個 commit 變更同一既有路徑僅計為 1 個）。CLI commit 貼上在 `--dry-run`（未指定 `--apply` 與 `--overwrite`）且目標已有檔案存在時，會在 stderr 提示「N destination file(s) already exist; --apply will need --overwrite.」（退出碼維持 0）。CLI 貼 commit payload 時 `--skip-existing`、`--adjust-paths` 不支援,exit 2。這與 TS/原規格「直接覆蓋」不同,見 porting-notes「已知且接受的差異」。
+- 此 commit 會寫入的目標檔在重播前已存在(`FilePlan.existed`),不論是否有未 commit 的修改,**預設不套用**,需明確允許覆寫(GUI:允許覆寫的開關,i18n `commit_overwrite_required`,paste.rs `execute_commit` 先 `PasteTarget::check_commits`(本機為 `preview.revalidate()`)再回此錯誤;CLI 判定與 GUI 相同[已決 D9],以 `FilePlan::overwrites_existing`(目標存在、動作為寫入、無 layout conflict)判定,需 `--overwrite`,沒給則 exit 2)。覆寫門禁與 dry-run 提示皆以相異目標路徑（distinct paths）計算（多個 commit 變更同一既有路徑僅計為 1 個）。CLI commit 貼上在 `--dry-run`（未指定 `--apply` 與 `--overwrite`）且目標已有檔案存在時，會在 stderr 提示「N destination file(s) already exist; --apply will need --overwrite.」（退出碼維持 0）。CLI 貼 commit payload 時 `--skip-existing`、`--adjust-paths` 不支援,exit 2。這與 TS/原規格「直接覆蓋」不同,見 porting-notes「已知且接受的差異」。
 - 中途某個 commit 建立失敗:**停下來**,回報已建立的前幾個、失敗的是哪一個與 git 的錯誤訊息。已建立的不回滾。
 - 路徑安全規則與檔案模式相同。
 - 預設值(規格階段未逐題確認,實作時照此,有意見再改):
@@ -187,15 +187,16 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 複製檔案／資料夾:兩邊都用 `transfer::expand_folder_items` 展開資料夾(過濾 `.git`、巢狀 repo、特殊檔、指出 root 的 symlink),再由 `transfer::plan_export_with` 產出 payload。CLI 另以 `selection_from_paths` 把命令列路徑轉成選取項目,並以 `plan_export_expanding` 分批展開(結果與一次展開相同,只是不必走完整棵樹);GUI 的選取來自檔案樹。
 - 複製 Git 變更:兩邊都以 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` 交給 `plan_export_with`。CLI 以 `transfer::changed_items` 列出變更,GUI 的項目來自 Changes 面板。
 - 複製 commits:兩邊都經 `commits::copy_commits_with`。CLI 以範圍或 `-n` 選取(`transfer::plan_commit_export_with`),GUI 以時間軸選取的精確 chain(`plan_commit_export_exact_with`)。
-- 貼上檔案:兩邊都以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。
-- 貼上 commits:兩邊都經 `transfer::CommitReplayPreview`(`capture` / `revalidate` / `apply`)。
+- 貼上檔案:兩邊都經 `snip_remote::PasteTarget`(`plan_files` / `apply_files`);本機目標以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。路由(目的地與各 prefix 資料夾、`--adjust-paths`)只由 `pastetarget::import_mapping` 建成 `ImportMapping`,本機目標與 worker 共用。
+- 貼上 commits:兩邊都經 `PasteTarget`(`plan_commits` / `check_commits` / `apply_commits`);本機目標用 `transfer::CommitReplayPreview`(`capture_in` / `revalidate` / `apply`)。
 - 遠端連線:兩邊都經 `snip_remote::Client`(`RemoteHost::ssh`,主機來自 `ssh::config_hosts`)。
 - 遠端 Git 檢視：兩邊都經 `snip_core::gitview::RepoView`（`snip_remote::RemoteRepo`）；worker 以 served `LocalRepo` 回答。
-- 遠端複製與貼上:兩邊都經 `snip_remote::Client`(`export_files`／`export_commits`、`import_plan`／`import_apply`、`replay_plan`／`replay_apply`),worker 跑上面同一組函式(§8「貼上」)。
+- 貼上目標:兩邊都經 `snip_remote::PasteTarget`(`Local` 在本機跑上面的函式,`Remote` 經 `Client` 交給 worker);錯誤統一為 `PasteError`(`stale_reason`、`is_repo_busy`、`is_collision`,遠端 Apply 失聯為 `OutcomeUnknown`)。新鮮度各自檢查:本機 Apply 套用保留的計畫並在寫入鎖內重驗;worker 不留狀態,Apply 重新規劃並比對 digest。覆寫門禁的判定在核心:`FilePlan::overwrites_existing`、`CommitReplayPlan::existing_writes`、`RestorePlan::existing_targets`。
+- 遠端複製:兩邊都經 `snip_remote::Client`(`export_files`／`export_commits`);遠端貼上經 `PasteTarget::Remote`,它送出 `import_plan`／`import_apply`、`replay_plan`／`replay_apply`,worker 跑上面同一組函式(§8「貼上」)。
 - 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 
 兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是右鍵複製、貼上預覽的逐檔勾選與時間軸),以及下列例外:
-1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 套用全部檔案(經 `ImportMapping::from_restore_base`);GUI 維持逐 prefix 選擇(D4)。兩者最後都是同一個 `ImportMapping`。
+1. 路徑重定位:CLI 偵測單一 restore-base 建議並以 `--adjust-paths` 套用全部檔案(經 `ImportMapping::from_restore_base`);GUI 維持逐 prefix 選擇(D4)。兩者最後都是同一個 `ImportMapping`,都由 `pastetarget::import_mapping` 建成。
 2. 沒有選到任何檔案:CLI 顯示 `No files selected.` 並以 exit 1 結束、不碰剪貼簿;GUI 顯示提示、同樣不寫剪貼簿。
 
 舊的整體引擎 `copy::collect_copy_files` 與 `gitsrc::collect_payload` 已降級為測試 oracle,產品程式碼不再呼叫。`restore::plan_restore` 仍是 `plan_import_with` 內部每筆 entry 的規劃器(contract fixture 測的就是它),`restore::execute_restore_plan` 仍是檔案貼上的執行器。

@@ -5,9 +5,10 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use snip_core::gitrun::RunOptions;
 use snip_core::restore::{
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
 };
@@ -16,8 +17,8 @@ use snip_core::transfer::{
 };
 use snip_remote::proto::MAX_FRAME;
 use snip_remote::{
-	Client, ErrorCode, PasteMapping, RemoteError, RemoteHost, Worker,
-	WorkerOptions,
+	Client, ErrorCode, FilePastePlan, PasteError, PasteMapping, PasteRoute,
+	PasteTarget, RemoteError, RemoteHost, Worker, WorkerOptions,
 };
 
 /// The worker's Git pool is one per process: tests that each run dozens
@@ -815,5 +816,309 @@ fn a_cut_apply_reports_outcome_unknown_and_keeps_its_first_write() {
 	assert!(
 		ws.join("b.txt").exists(),
 		"the worker finishes after the hold lifts"
+	);
+}
+
+/// `real` spelled through a symlink where the OS has them: a paste must
+/// not depend on the spelling the user gave (AGENTS.md, cross-platform).
+#[cfg(unix)]
+fn spelled(tmp: &Path, real: &Path, name: &str) -> PathBuf {
+	let link = tmp.join(name);
+	std::os::unix::fs::symlink(real, &link).unwrap();
+	link
+}
+
+#[cfg(not(unix))]
+fn spelled(_tmp: &Path, real: &Path, _name: &str) -> PathBuf {
+	real.to_path_buf()
+}
+
+#[test]
+fn a_paste_target_writes_the_same_files_locally_and_on_a_worker() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let local_real = tmp.path().join("local_real");
+	for dir in [&ws, &local_real] {
+		fs::create_dir_all(dir.join("other")).unwrap();
+		fs::create_dir_all(dir.join("src")).unwrap();
+		fs::write(dir.join("a.txt"), "old\n").unwrap();
+	}
+	let local_dest = spelled(tmp.path(), &local_real, "local");
+	let text = [
+		entry("a.txt", "new"),
+		entry("src/b.rs", "fn main() {}"),
+		entry("lib/c.txt", "c"),
+	]
+	.concat();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let local = PasteTarget::Local {
+		dest: local_dest.clone(),
+	};
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: String::new(),
+	};
+	let local_route = PasteRoute {
+		prefixes: vec![("lib".into(), local_dest.join("other"))],
+		..Default::default()
+	};
+	let remote_route = PasteRoute {
+		prefixes: vec![("lib".into(), PathBuf::from("other"))],
+		..Default::default()
+	};
+	let opts = RunOptions::default();
+	let lp = local.plan_files(&text, &local_route, &opts, None).unwrap();
+	let rp = remote
+		.plan_files(&text, &remote_route, &opts, None)
+		.unwrap();
+	let creates = |p: &FilePastePlan| {
+		p.restore_plan()
+			.create_operations
+			.iter()
+			.map(|o| o.relative_path.clone())
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(creates(&lp), creates(&rp));
+	assert!(!creates(&lp).is_empty());
+
+	let sel = unchecked(&[]);
+	let lres = local.apply_files(&text, &local_route, &lp, &sel).unwrap();
+	let rres = remote.apply_files(&text, &remote_route, &rp, &sel).unwrap();
+	assert_eq!(lres, rres);
+	for rel in ["a.txt", "src/b.rs", "other/c.txt"] {
+		assert_eq!(
+			fs::read(ws.join(rel)).unwrap(),
+			fs::read(local_real.join(rel)).unwrap(),
+			"{rel} differs between the local paste and the worker's"
+		);
+	}
+}
+
+#[test]
+fn a_paste_target_replays_the_same_commits_locally_and_on_a_worker() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let src = ws.join("src");
+	init_repo(&src);
+	fs::write(src.join("a.txt"), "one\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "add a"]);
+	let first = git_out(&src, &["rev-parse", "HEAD"]);
+	fs::write(src.join("a.txt"), "two\n").unwrap();
+	fs::create_dir_all(src.join("d")).unwrap();
+	fs::write(src.join("d/b.txt"), "b\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "change a, add b"]);
+	let tip = git_out(&src, &["rev-parse", "HEAD"]);
+
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let text = client
+		.export_commits(&id, "src", &tip, vec![tip.clone(), first], None)
+		.unwrap()
+		.text;
+	let payload = snip_core::commits::parse_commit_payload(&text).unwrap();
+
+	let dst = ws.join("dst");
+	let local = tmp.path().join("local");
+	init_repo(&dst);
+	init_repo(&local);
+	let local_target = PasteTarget::Local {
+		dest: local.clone(),
+	};
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: "dst".into(),
+	};
+	for target in [&local_target, &remote] {
+		let preview = target
+			.plan_commits(&text, payload.clone(), &RunOptions::default())
+			.unwrap();
+		target.check_commits(&text, &preview).unwrap();
+		let result = target.apply_commits(&text, &preview).unwrap();
+		assert_eq!(result.created.len(), 2, "{result:?}");
+		assert!(result.failure.is_none(), "{result:?}");
+	}
+	assert_eq!(history(&dst), history(&local));
+	assert_eq!(fs::read(dst.join("d/b.txt")).unwrap(), b"b\n");
+	assert_eq!(fs::read(local.join("d/b.txt")).unwrap(), b"b\n");
+}
+
+#[test]
+fn a_paste_target_refuses_a_changed_destination_as_stale_on_both_sides() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let local_real = tmp.path().join("local_real");
+	for dir in [&ws, &local_real] {
+		fs::create_dir_all(dir).unwrap();
+		fs::write(dir.join("a.txt"), "old\n").unwrap();
+	}
+	let local_dest = spelled(tmp.path(), &local_real, "local");
+	let text = entry("a.txt", "new");
+	let route = PasteRoute::default();
+	let opts = RunOptions::default();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let local = PasteTarget::Local {
+		dest: local_dest.clone(),
+	};
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: String::new(),
+	};
+	let lp = local.plan_files(&text, &route, &opts, None).unwrap();
+	let rp = remote.plan_files(&text, &route, &opts, None).unwrap();
+	for dir in [&ws, &local_real] {
+		fs::write(dir.join("a.txt"), "external\n").unwrap();
+	}
+	let sel = unchecked(&[]);
+	for (name, target, plan) in
+		[("local", &local, &lp), ("remote", &remote, &rp)]
+	{
+		let err = target
+			.apply_files(&text, &route, plan, &sel)
+			.err()
+			.unwrap_or_else(|| {
+				panic!("the {name} target wrote over a changed destination")
+			});
+		assert!(err.stale_reason().is_some(), "{name}: {err:?}");
+	}
+	assert_eq!(fs::read_to_string(ws.join("a.txt")).unwrap(), "external\n");
+	assert_eq!(
+		fs::read_to_string(local_real.join("a.txt")).unwrap(),
+		"external\n"
+	);
+}
+
+#[test]
+fn a_local_target_never_applies_a_workers_plan() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: String::new(),
+	};
+	let route = PasteRoute::default();
+	let text = entry("n.txt", "x");
+	let plan = remote
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+	let local = PasteTarget::Local { dest: ws.clone() };
+	let err = local
+		.apply_files(&text, &route, &plan, &unchecked(&[]))
+		.expect_err("a local target applied a worker's plan");
+	assert!(err.stale_reason().is_some(), "{err:?}");
+	assert!(!ws.join("n.txt").exists());
+}
+
+/// A worker that hangs up on its next request, as a dead process would: a
+/// call on the connection the master already holds sends its request and
+/// hears no answer.
+fn lose_the_answer(w: &Worker) {
+	w.stop();
+}
+
+/// A commit payload from one repository, planned into another through a
+/// `PasteTarget::Remote`: what the destination preview and Apply start from.
+fn planned_replay(
+	tmp: &Path,
+	w: &Arc<Worker>,
+) -> (PasteTarget, String, CommitReplayPreview) {
+	let ws = tmp.join("ws");
+	let src = ws.join("src");
+	init_repo(&src);
+	fs::write(src.join("a.txt"), "one\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "add a"]);
+	let tip = git_out(&src, &["rev-parse", "HEAD"]);
+	init_repo(&ws.join("dst"));
+	let (client, id) = open(w, &ws);
+	let text = client
+		.export_commits(&id, "src", &tip, vec![tip.clone()], None)
+		.unwrap()
+		.text;
+	let payload = snip_core::commits::parse_commit_payload(&text).unwrap();
+	let target = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: "dst".into(),
+	};
+	let preview = target
+		.plan_commits(&text, payload, &RunOptions::default())
+		.unwrap();
+	(target, text, preview)
+}
+
+/// #167: a remote file Apply whose answer is lost may have written, so
+/// `PasteTarget` reports it as outcome unknown and not as a plain failure.
+#[test]
+fn a_lost_file_apply_answer_through_a_paste_target_is_outcome_unknown() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let remote = PasteTarget::Remote {
+		client: Arc::new(client),
+		workspace: id,
+		dest: String::new(),
+	};
+	let text = entry("a.txt", "new");
+	let route = PasteRoute::default();
+	let plan = remote
+		.plan_files(&text, &route, &RunOptions::default(), None)
+		.unwrap();
+
+	lose_the_answer(&w);
+	let err = remote
+		.apply_files(&text, &route, &plan, &unchecked(&[]))
+		.expect_err("a hung-up worker cannot answer an Apply");
+	assert!(matches!(err, PasteError::OutcomeUnknown(_)), "{err:?}");
+}
+
+/// The same for a commit replay's Apply.
+#[test]
+fn a_lost_replay_apply_answer_through_a_paste_target_is_outcome_unknown() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let w = worker(None);
+	let (remote, text, preview) = planned_replay(tmp.path(), &w);
+
+	lose_the_answer(&w);
+	let err = remote
+		.apply_commits(&text, &preview)
+		.expect_err("a hung-up worker cannot answer an Apply");
+	assert!(matches!(err, PasteError::OutcomeUnknown(_)), "{err:?}");
+}
+
+/// A check writes nothing, so a lost answer to it is a plain failure: only
+/// an Apply reports outcome unknown.
+#[test]
+fn a_lost_replay_check_answer_through_a_paste_target_is_a_plain_failure() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let w = worker(None);
+	let (remote, text, preview) = planned_replay(tmp.path(), &w);
+
+	lose_the_answer(&w);
+	let err = remote
+		.check_commits(&text, &preview)
+		.expect_err("a hung-up worker cannot answer a check");
+	assert!(
+		matches!(&err, PasteError::Remote(e) if e.outcome_unknown()),
+		"{err:?}"
 	);
 }

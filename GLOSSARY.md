@@ -15,3 +15,9 @@ _Avoid_: 分頁（單獨使用，易與工具視窗混淆）、視窗
 **工具視窗**（tool window）:
 工作區分頁內的 Project、Changes、Log 等面板。
 _Avoid_: tab、分頁
+
+## 貼上
+
+**貼上目標**（paste target）:
+貼上規劃與寫入的地方：本機的一個資料夾，或遠端工作區 worker 上的一個資料夾。CLI 與桌面 App 都只經它規劃、重驗與套用；本機目標套用保留下來的計畫，遠端目標由 worker 在自己的磁碟上重新規劃後寫入。
+_Avoid_: 貼上目的地（單獨使用，易與目的資料夾混淆）、paste destination

@@ -14,13 +14,10 @@ use snip_core::commits;
 use snip_core::gitrun::{CancelToken, GitPool, RunOptions};
 use snip_core::gitsrc::Git;
 use snip_core::gitview::ReadProfile;
-use snip_core::restore::{
-	suggest_restore_base, FsProbe, RestorePlan, RestoreSelection,
-};
+use snip_core::restore::{RestorePlan, RestoreSelection};
 use snip_core::transfer::{
 	plan_import_with, CanonicalRootId, CommitReplayPreview,
-	DestinationFreshnessSnapshot, ImportMapping, TransferError,
-	TransferImportPlan,
+	DestinationFreshnessSnapshot, TransferError, TransferImportPlan,
 };
 
 use crate::proto::{
@@ -160,29 +157,21 @@ fn plan(
 		));
 	}
 	let paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
-	let suggestion = suggest_restore_base(
-		&primary.to_string_lossy(),
-		&paths,
-		&FsProbe,
-		snip_core::format::extract_source_root(text).as_deref(),
-	);
-	let mut import = match (&suggestion, mapping.adjust_paths) {
-		(Some(s), true) => ImportMapping::from_restore_base(s, primary_id),
-		_ => ImportMapping::with_primary(primary_id),
-	};
-	let mut roots = vec![primary];
-	for (prefix, rel) in &mapping.prefixes {
-		if prefix.is_empty() || prefix.contains(['/', '\\']) {
-			return Err(refused(ErrorCode::BadRequest, "invalid prefix"));
-		}
-		let folder = destination(root, rel)?;
-		let id =
-			CanonicalRootId::new(&folder).map_err(|e| Box::new(io_error(e)))?;
-		if !roots.contains(&folder) {
-			roots.push(folder);
-		}
-		import.map_prefix(prefix.clone(), id);
-	}
+	let suggestion = crate::pastetarget::suggest(&primary, &paths, text);
+	let (import, roots) = crate::pastetarget::import_mapping(
+		primary,
+		primary_id,
+		suggestion.as_ref().filter(|_| mapping.adjust_paths),
+		mapping.prefixes.iter().map(|(prefix, rel)| {
+			if prefix.is_empty() || prefix.contains(['/', '\\']) {
+				return Err(refused(ErrorCode::BadRequest, "invalid prefix"));
+			}
+			Ok::<_, Refusal>((prefix.clone(), destination(root, rel)?))
+		}),
+		|folder| {
+			CanonicalRootId::new(folder).map_err(|e| Box::new(io_error(e)))
+		},
+	)?;
 	let plan =
 		plan_import_with(text, header, &roots, &import, &options(cancel))
 			.map_err(|e| transfer_refusal(e, cancel))?;
