@@ -17281,7 +17281,10 @@ mod tests {
 			) {
 				let _remote = remote_lock();
 				let mut fixture = ScanRestoreFixture::new(0, None);
-				let missing = format!("{}/missing", fixture.paths[1]);
+				let missing = Path::new(&fixture.paths[1])
+					.join("missing")
+					.to_string_lossy()
+					.into_owned();
 				fixture.saved.tabs[2] = crate::open_tabs::SavedTab::Remote {
 					host: fixture.host.name.clone(),
 					path: missing,
