@@ -156,8 +156,10 @@ pub struct PastePending {
 	apply_active: usize,
 	/// Captured replay plans still held by selected-row reads, including
 	/// cancelled reads that have not returned from their worker yet.
-	detail_active: usize,
+	detail_reads: Vec<DetailRead>,
+	next_detail_read: u64,
 	ui_raw: Option<Weak<str>>,
+	ui_commit: Option<Weak<CommitReplayPreview>>,
 	seq: u64,
 	input: Option<(u64, usize, Option<Weak<str>>)>,
 	latest: Option<PasteRequest>,
@@ -194,11 +196,24 @@ impl PastePending {
 		}
 	}
 
+	/// Detail reads not already counted in the UI's bytes. A read of the
+	/// UI's own commit preview costs nothing until the UI lets it go.
+	fn detail_bytes(
+		&self,
+		ui_commit: Option<&Weak<CommitReplayPreview>>,
+	) -> usize {
+		self.detail_reads
+			.iter()
+			.filter(|read| !ui_holds(ui_commit, &read.preview))
+			.fold(0, |n, read| n.saturating_add(read.bytes))
+	}
+
 	fn total_with_ui(
 		&self,
 		ui_bytes: usize,
 		allowance: usize,
 		raw: Option<&Weak<str>>,
+		commit: Option<&Weak<CommitReplayPreview>>,
 	) -> usize {
 		let held = self
 			.input
@@ -218,7 +233,7 @@ impl PastePending {
 			.saturating_add(held)
 			.saturating_add(self.latest.as_ref().map_or(0, PasteRequest::bytes))
 			.saturating_add(allowance.max(self.apply_active))
-			.saturating_add(self.detail_active)
+			.saturating_add(self.detail_bytes(commit))
 	}
 
 	pub fn admit_ui(
@@ -232,13 +247,17 @@ impl PastePending {
 			.filter(|p| p.executable())
 			.map_or(0, PastePreviewPlan::apply_clone_bytes);
 		let raw = plan.map(|p| Arc::downgrade(&p.raw_payload));
+		let commit = plan
+			.and_then(|p| p.commit_preview.as_ref())
+			.map(Arc::downgrade);
 		check_budget(
-			self.total_with_ui(bytes, allowance, raw.as_ref()),
+			self.total_with_ui(bytes, allowance, raw.as_ref(), commit.as_ref()),
 			MAX_RETAINED_PREVIEW_BYTES,
 		)?;
 		self.ui_bytes = bytes;
 		self.apply_allowance = allowance;
 		self.ui_raw = raw;
+		self.ui_commit = commit;
 		Ok(())
 	}
 
@@ -255,6 +274,7 @@ impl PastePending {
 				self.ui_bytes,
 				self.apply_allowance,
 				self.ui_raw.as_ref(),
+				self.ui_commit.as_ref(),
 			),
 			MAX_RETAINED_PREVIEW_BYTES,
 		)
@@ -304,6 +324,7 @@ impl PastePending {
 				state.ui_bytes,
 				state.apply_allowance,
 				state.ui_raw.as_ref(),
+				state.ui_commit.as_ref(),
 			),
 			MAX_RETAINED_PREVIEW_BYTES,
 		)
@@ -395,6 +416,7 @@ impl PasteWorker {
 			state.ui_bytes,
 			state.apply_allowance,
 			state.ui_raw.as_ref(),
+			state.ui_commit.as_ref(),
 		) > MAX_RETAINED_PREVIEW_BYTES
 		{
 			outcome = state.ready.take().unwrap();
@@ -1019,31 +1041,66 @@ pub(crate) struct CommitDiffRequest {
 	_charge: DetailReadCharge,
 }
 
+/// A live detail read of a captured replay preview. Its bytes are charged in
+/// full unless the UI holds the same Arc, which the UI's bytes already count.
+struct DetailRead {
+	id: u64,
+	preview: Weak<CommitReplayPreview>,
+	bytes: usize,
+}
+
+/// True when the UI's live commit preview is this exact Arc.
+fn ui_holds(
+	ui: Option<&Weak<CommitReplayPreview>>,
+	preview: &Weak<CommitReplayPreview>,
+) -> bool {
+	match (ui.and_then(Weak::upgrade), preview.upgrade()) {
+		(Some(ui), Some(held)) => Arc::ptr_eq(&ui, &held),
+		_ => false,
+	}
+}
+
 struct DetailReadCharge {
 	pool: Arc<Mutex<PastePending>>,
-	bytes: usize,
+	id: u64,
 }
 
 impl DetailReadCharge {
 	fn admit(
 		pool: &Arc<Mutex<PastePending>>,
-		bytes: usize,
+		preview: &Arc<CommitReplayPreview>,
 	) -> Result<Self, Msg> {
+		let bytes = size_of::<CommitReplayPreview>()
+			.saturating_add(ARC_ALLOWANCE)
+			.saturating_add(preview.retained_heap_bytes());
+		let weak = Arc::downgrade(preview);
 		let mut state = lock_pending(pool);
+		let extra = if ui_holds(state.ui_commit.as_ref(), &weak) {
+			0
+		} else {
+			bytes
+		};
 		check_budget(
 			state
 				.total_with_ui(
 					state.ui_bytes,
 					state.apply_allowance,
 					state.ui_raw.as_ref(),
+					state.ui_commit.as_ref(),
 				)
-				.saturating_add(bytes),
+				.saturating_add(extra),
 			MAX_RETAINED_PREVIEW_BYTES,
 		)?;
-		state.detail_active = state.detail_active.saturating_add(bytes);
+		let id = state.next_detail_read;
+		state.next_detail_read = id.wrapping_add(1);
+		state.detail_reads.push(DetailRead {
+			id,
+			preview: weak,
+			bytes,
+		});
 		Ok(Self {
 			pool: pool.clone(),
-			bytes,
+			id,
 		})
 	}
 }
@@ -1051,10 +1108,12 @@ impl DetailReadCharge {
 impl Drop for DetailReadCharge {
 	fn drop(&mut self) {
 		let mut state = lock_pending(&self.pool);
-		state.detail_active = state
-			.detail_active
-			.checked_sub(self.bytes)
+		let at = state
+			.detail_reads
+			.iter()
+			.position(|read| read.id == self.id)
 			.expect("detail read charge released once");
+		state.detail_reads.swap_remove(at);
 	}
 }
 
@@ -1073,12 +1132,7 @@ impl PastePreviewPlan {
 		let Some(preview) = self.commit_preview.as_ref() else {
 			return Ok(None);
 		};
-		let charge = DetailReadCharge::admit(
-			pool,
-			size_of::<CommitReplayPreview>()
-				.saturating_add(ARC_ALLOWANCE)
-				.saturating_add(preview.retained_heap_bytes()),
-		)?;
+		let charge = DetailReadCharge::admit(pool, preview)?;
 		let side = if item.is_delete() && item.rename_note.is_some() {
 			snip_core::transfer::ReplayFileSide::RenamedFrom
 		} else {
@@ -2602,7 +2656,8 @@ pub(crate) mod tests {
 				pending.total_with_ui(
 					pending.ui_bytes,
 					pending.apply_allowance,
-					pending.ui_raw.as_ref()
+					pending.ui_raw.as_ref(),
+					pending.ui_commit.as_ref()
 				) <= MAX_RETAINED_PREVIEW_BYTES
 			);
 			assert!(life.is_live(id));
@@ -2757,6 +2812,7 @@ pub(crate) mod tests {
 				state.ui_bytes,
 				state.apply_allowance,
 				state.ui_raw.as_ref(),
+				state.ui_commit.as_ref(),
 			);
 			ordinary.source = PreviewSource::CommitFile {
 				sha: String::with_capacity(MAX_RETAINED_PREVIEW_BYTES - used),
@@ -2768,7 +2824,8 @@ pub(crate) mod tests {
 				state.total_with_ui(
 					state.ui_bytes,
 					state.apply_allowance,
-					state.ui_raw.as_ref()
+					state.ui_raw.as_ref(),
+					state.ui_commit.as_ref()
 				),
 				MAX_RETAINED_PREVIEW_BYTES
 			);
@@ -2808,7 +2865,8 @@ pub(crate) mod tests {
 				state.total_with_ui(
 					state.ui_bytes,
 					state.apply_allowance,
-					state.ui_raw.as_ref()
+					state.ui_raw.as_ref(),
+					state.ui_commit.as_ref()
 				),
 				MAX_RETAINED_PREVIEW_BYTES
 			);

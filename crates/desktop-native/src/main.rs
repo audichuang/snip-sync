@@ -12977,6 +12977,77 @@ mod tests {
 			);
 		}
 
+		/// A ~9 MiB commit opens, and a small row's detail read must fit: the
+		/// UI already counts the commit preview the read shares, so the read
+		/// is not charged for it again. Each big file stays under the 1 MiB
+		/// per-file diff limit.
+		#[gpui::test]
+		fn large_commit_paste_row_click_shows_diff(cx: &mut TestAppContext) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let dest = repo(ws.path(), "dest", &[]);
+			let line = "0123456789abcdef\n";
+			let text = line.repeat(1000 * 1024 / line.len());
+			let mut files: Vec<CommitFile> = (0..9)
+				.map(|i| CommitFile {
+					path: format!("big{i}.txt"),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some(text.clone()),
+					not_copied: None,
+				})
+				.collect();
+			files.push(CommitFile {
+				path: "small.txt".into(),
+				old_path: None,
+				change: FileChange::Added,
+				content: Some("hello\n".into()),
+				not_copied: None,
+			});
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "large".into(),
+						author_name: "Ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-10-13T12:00:00+00:00".into(),
+						files,
+					}],
+				});
+			let (model, cx) = open_sized(
+				cx,
+				ws.path().to_path_buf(),
+				Some(dest.clone()),
+				1440.,
+				1100.,
+			);
+			paste(&model, cx, &payload);
+			assert!(
+				model.read_with(cx, |m, _| m
+					.paste
+					.plan()
+					.is_some_and(|p| { p.commit_preview.is_some() })),
+				"commit preview did not open"
+			);
+			click(cx, "paste-row:9:small.txt");
+			wait_paste_detail(&model, cx);
+			model.read_with(cx, |m, _| {
+				let detail = m.paste.detail().expect("selected preview");
+				assert!(
+					detail.is_diff,
+					"row click shows no diff: {:?} status={}",
+					detail.notice, m.status
+				);
+				assert!(
+					detail.text.contains("+hello"),
+					"diff lacks the added line"
+				);
+			});
+		}
+
 		fn wait_paste_detail(
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,

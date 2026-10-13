@@ -576,6 +576,51 @@ mod tests {
 		assert!(session.enqueue(next()).is_ok());
 	}
 
+	#[test]
+	fn a_detail_read_of_the_ui_preview_is_charged_only_once() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		let dir = tempfile::tempdir().unwrap();
+		crate::paste::tests::git_init(dir.path());
+		let payload = snip_core::commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "shared commit".into(),
+				author_name: "Ann".into(),
+				author_email: "ann@example.invalid".into(),
+				author_date: "2026-10-13T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "shared.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("x".repeat(2 * 1024 * 1024)),
+					not_copied: None,
+				}],
+			}],
+		});
+		let mut session = landed(&payload, dir.path(), None);
+		let used = |s: &PastePreview| {
+			let st = lock_pending(&s.pending);
+			st.total_with_ui(
+				st.ui_bytes,
+				st.apply_allowance,
+				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
+			)
+		};
+		let ui_only = used(&session);
+		// The read shares the UI's commit preview, which the UI already counts.
+		let read = session.commit_diff_request(0).unwrap().unwrap();
+		assert_eq!(used(&session), ui_only);
+		// Once the UI lets the preview go, the held read is the only owner
+		// and must be charged in full.
+		session.clear(None);
+		assert!(Arc::downgrade(&read.preview).upgrade().is_some());
+		assert!(used(&session) >= 2 * 1024 * 1024);
+		drop(read);
+		assert!(used(&session) < 2 * 1024 * 1024);
+	}
+
 	/// Grows `ordinary` so the admitted state sits exactly at the 32 MiB cap.
 	fn fill_budget(s: &PastePreview, ordinary: &mut Preview) {
 		let used = {
@@ -584,6 +629,7 @@ mod tests {
 				st.ui_bytes,
 				st.apply_allowance,
 				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
 			)
 		};
 		ordinary.source = PreviewSource::CommitFile {
@@ -729,6 +775,7 @@ mod tests {
 				st.ui_bytes,
 				st.apply_allowance,
 				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
 			)
 		};
 
@@ -821,6 +868,7 @@ mod tests {
 				st.ui_bytes,
 				st.apply_allowance,
 				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
 			)
 		};
 		// 以捏造（從未 admit）的狀態觸發防禦性 rollback 分支；
