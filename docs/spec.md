@@ -193,12 +193,12 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 複製檔案／資料夾:兩邊都用 `transfer::expand_folder_items` 展開資料夾(過濾 `.git`、巢狀 repo、特殊檔、指出 root 的 symlink),再由 `transfer::plan_export_with` 產出 payload。CLI 另以 `selection_from_paths` 把命令列路徑轉成選取項目,並以 `plan_export_expanding` 分批展開(結果與一次展開相同,只是不必走完整棵樹);GUI 的選取來自檔案樹。
 - 複製 Git 變更:兩邊都以 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` 交給 `plan_export_with`。CLI 以 `transfer::changed_items` 列出變更,GUI 的項目來自 Changes 面板。
 - 複製 commits:兩邊都經 `commits::copy_commits_with`。CLI 以範圍或 `-n` 選取(`transfer::plan_commit_export_with`),GUI 以時間軸選取的精確 chain(`plan_commit_export_exact_with`)。
-- 貼上檔案:兩邊都經 `snip_remote::PasteTarget`(`plan_files` / `apply_files`);本機目標以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。路由(目的地與各 prefix 資料夾、`--adjust-paths`)只由 `pastetarget::import_mapping` 建成 `ImportMapping`,本機目標與 worker 共用。
+- 貼上檔案:兩邊都經 `snip_remote::PasteTarget`(`plan_files` / `apply_files`);本機目標以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查；worker 以 `plan_import_parsed_with` 重用已解析的 entries，仍走同一引擎),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。路由(目的地與各 prefix 資料夾、`--adjust-paths`)只由 `pastetarget::import_mapping` 建成 `ImportMapping`,本機目標與 worker 共用。
 - 貼上 commits:兩邊都經 `PasteTarget`(`plan_commits` / `check_commits` / `apply_commits`);本機目標用 `transfer::CommitReplayPreview`(`capture_in` / `revalidate` / `apply`)。
 - 遠端連線:兩邊都經 `snip_remote::Client`(`RemoteHost::ssh`,主機來自 `ssh::config_hosts`)。
 - 遠端 Git 檢視：兩邊都經 `snip_core::gitview::RepoView`（`snip_remote::RemoteRepo`）；worker 以 served `LocalRepo` 回答。
-- 貼上目標:兩邊都經 `snip_remote::PasteTarget`(`Local` 在本機跑上面的函式,`Remote` 經 `Client` 交給 worker);錯誤統一為 `PasteError`(`stale_reason`、`is_repo_busy`、`is_collision`,遠端 Apply 失聯為 `OutcomeUnknown`)。新鮮度各自檢查:本機 Apply 套用保留的計畫並在寫入鎖內重驗;worker 不留狀態,Apply 重新規劃並比對 digest。覆寫門禁的判定在核心:`FilePlan::overwrites_existing`、`CommitReplayPlan::existing_writes`、`RestorePlan::existing_targets`。
-- 遠端複製:兩邊都經 `snip_remote::Client`(`export_files`／`export_commits`);遠端貼上經 `PasteTarget::Remote`,它送出 `import_plan`／`import_apply`、`replay_plan`／`replay_apply`,worker 跑上面同一組函式(§8「貼上」)。
+- 貼上目標:兩邊都經 `snip_remote::PasteTarget`(`Local` 在本機跑上面的函式,`Remote` 經 `Client` 交給 worker);錯誤統一為 `PasteError`(`stale_reason`、`is_repo_busy`、`is_collision`,遠端 Apply 失聯為 `OutcomeUnknown`)。新鮮度各自檢查:本機 Apply 套用保留的計畫並在寫入鎖內重驗;worker 可短期保留原始檔案 payload，但 Apply 仍重新規劃並比對 digest。覆寫門禁的判定在核心:`FilePlan::overwrites_existing`、`CommitReplayPlan::existing_writes`、`RestorePlan::existing_targets`。
+- 遠端複製:兩邊都經 `snip_remote::Client`(`export_files`／`export_commits`);遠端貼上經 `PasteTarget::Remote`,它依協商版本送出檔案預覽／套用或 `replay_plan`／`replay_apply`,worker 跑上面同一組函式(§8「貼上」)。
 - 大小上限:兩邊的複製都以 `transfer::CLIPBOARD_PAYLOAD_MAX`(32 MiB)為上限,GUI 貼上預覽也用同一個值。
 
 兩邊行為的差異只在 UI(CLI 是旗標與文字輸出,App 是右鍵複製、貼上預覽的逐檔勾選與時間軸),以及下列例外:
@@ -254,7 +254,10 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - **貼上**(協定 4):
   - 檔案模式與 commit 模式都和本機同一個預覽面板與流程:同樣的列、勾選、覆寫預設關閉、前綴對應選擇(候選是遠端工作區的 repo 與資料夾,顯示成 `主機:路徑`)、新鮮度與碰撞檢查,結果也相同。目的地是目前的 repo,沒有 repo 時是工作區資料夾。
   - worker 在自己的磁碟上跑本機貼上同一套引擎(`transfer::plan_import_with`、`CommitReplayPreview`),不是逐檔寫入的 RPC。`ImportPlan`／`ReplayPlan` 只規劃、不寫入,回傳計畫與新鮮度快照(路徑是 worker 的)。
-  - Apply 不留狀態:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,取得寫入鎖(見 3.2 (c),被占用時以 `Busy` 拒絕)後重新驗證再重放;`ImportApply` 同樣在寫入鎖底下重新驗證;「先允許覆寫」的提示之前,同樣先檢查是否過期。
+  - Apply 不信任保留的舊計畫:`ImportApply` 先用預覽時的快照重新驗證(和本機 Apply 一樣的「已在外部建立／修改／刪除」),再重新規劃並比對計畫摘要,有任何變動就以 `Stale` 拒絕、什麼都不寫,然後依使用者的勾選寫入。`ReplayApply` 把預覽和 payload 接回去,取得寫入鎖(見 3.2 (c),被占用時以 `Busy` 拒絕)後重新驗證再重放;`ImportApply` 同樣在寫入鎖底下重新驗證;「先允許覆寫」的提示之前,同樣先檢查是否過期。
+  - 協定 7 的檔案預覽以 `PrepareImport` 上傳 payload，回覆路徑、動作、略過原因、新鮮度、摘要與來源 entry 序號，不回傳檔案全文。master 從同一份 payload 還原內容，核對完整計畫 digest；目的端 diff 仍按需求讀取。commit 重放流程不變。
+  - worker 可保留原始 payload、mapping、canonical workspace／目的地與 digest，發出單次使用的 token；不快取可直接執行的計畫。每個 worker 的保留上限為 128 MiB、8 筆、5 分鐘；記憶體計入字串／路由配置容量與正在套用的 payload。容量不足或 master 未要求保留時，仍回傳精簡預覽但不給 token，套用沿用 `ImportApply` 上傳全文。
+  - 有 token 的 `FilePastePlan` 固定使用產生它的連線，每個 Client 最多保留 2 份連線租約。`ApplyPrepared` 只送 token、scope、選取與預覽快照；worker 取出原始 payload 後，仍走 `ImportApply` 的快照檢查、重新規劃、digest／選取驗證與寫入鎖內 freshness 重驗。token 過期、已使用或 scope 不符時拒絕並要求重新預覽；原連線失效時不會改用另一個 worker 的連線。Apply 可能已送出後的失聯維持 `OutcomeUnknown`，不重連重送或改送全文。
   - CLI `snip remote paste <host> <資料夾> [--in 資料夾] --dry-run|--apply [--overwrite|--skip-existing] [--adjust-paths] [--stdin]` 的旗標、輸出與結束碼和 `snip paste` 相同;路徑調整建議由 worker 依它的資料夾提出。
   - payload 可達剪貼簿上限(32 MiB),大於一個 frame:請求的貼上文字以 `Chunk` frame 先送(worker 端上限為剪貼簿上限),回覆的計畫以 `Chunk` + `Joined` 分段;整個請求(含 Apply 的新鮮度快照)超過一個 chunk 時,以 `FrameChunk` + `FrameJoin` 有上限地分段(協定 5)。寫入中的 Apply 不能中途取消,所以期限較長(30 分鐘),master 也不會重送寫入請求;超過 worker 期限時,寫入工作自己的回應(成功或它自己的錯誤)不會被丟掉換成 `Timeout`,worker 以 heartbeat 撐住並送出實際結果,master 的期限(31 分鐘)較長,若 master 先放棄則結果未知:App 顯示「連線中斷，無法確認貼上是否完成；請重新整理確認」(`paste_outcome_unknown`),CLI 在 stderr 說明並以非零結束。
 
@@ -286,7 +289,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 初次或 Refresh 的唯讀掃描遇到暫時性斷線、timeout 或 busy 時，在同一分頁／session 以 1、2、4 秒 backoff 最多重試 3 次；作用中與背景分頁相同。權限、版本、路徑或協定等永久拒絕不自動重試。成功後恢復 repo 清單並清除掃描錯誤；耗盡次數保留可見錯誤供手動 Refresh。Refresh 取代舊 scan/timer，關分頁或退出會取消；取消退出後會恢復尚未完成的初次掃描，即使尚無 repo。
   - 每條連線是一個 ssh 程序；每個 Client 最多留 2 條閒置連線。同一 RemoteHost 連線設定的握手（connect＋Hello）跨 Client 最多同時 2 個，排隊有期限且可取消；不同主機互不阻塞。這是新握手上限，不是整個 App 的存活 SSH 連線上限。worker 的 job 與 `Served` 名額限制仍以單一程序計。
 - **版本相容**:
-  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 6:`GIT_VIEWS_VERSION = 2`、`TRANSFER_VERSION = 3` 複製、`PASTE_VERSION = 4` 貼上、`EXPORT_CHANGES_VERSION = 5` 由 worker 解析變更選取與整個資料夾匯出、`REQUEST_CHUNKS_VERSION = 5` 分段請求、`REPLAY_PREVIEW_VERSION = 6` commit 貼上目的端的有界文字／檔案種類讀取）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）;複製與貼上回報「那台的 snip-sync 太舊」。舊 worker 缺少 commit 預覽基準資訊時，詳情明示無法比較，不能把每筆都與初始磁碟相比或冒充新增；既有貼上套用協定與安全門禁維持相容。
+  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 7:`GIT_VIEWS_VERSION = 2`、`TRANSFER_VERSION = 3` 複製、`PASTE_VERSION = 4` 貼上、`EXPORT_CHANGES_VERSION = 5` 由 worker 解析變更選取與整個資料夾匯出、`REQUEST_CHUNKS_VERSION = 5` 分段請求、`REPLAY_PREVIEW_VERSION = 6` commit 貼上目的端的有界文字／檔案種類讀取、`PREPARED_IMPORT_VERSION = 7` 精簡檔案預覽與單次 payload token）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）;複製與貼上回報「那台的 snip-sync 太舊」。舊 worker 缺少 commit 預覽基準資訊時，詳情明示無法比較，不能把每筆都與初始磁碟相比或冒充新增；檔案貼上對協定 4–6 沿用 `ImportPlan`／`ImportApply`，協定低於 4 明確拒絕；既有安全門禁維持相容。
   - 0.6.x 以前的 TLS worker(`snip worker`)不支援 `serve --stdio`,連不上時顯示「沒有安裝 snip,或版本太舊」。
 - **寫入不變式**:
   - 能寫進 `.git` 就能寫 `.git/config`、hooks 或 filter,等於讓 master 在 worker 執行程式。這條守門在 snip-core 的貼上引擎裡(§3.2 安全規則),本機與遠端是同一段程式:payload 路徑含 `.git` 片段,或目標經 symlink 解析後落在 Git 目錄裡的,都是略過列、不寫入,其餘照寫。worker 另外只要求目的地與每個前綴對應的資料夾在工作區內(遠端的存取範圍);commit 重放和本機一樣進到目的地所在的 repo,即使它的頂層在工作區之上。

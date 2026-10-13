@@ -133,6 +133,8 @@ pub struct FilePastePlan {
 	plan: TransferImportPlan,
 	/// Remote only: the worker's digest of `plan`, sent back with the Apply.
 	digest: Option<String>,
+	/// The optional protocol-7 worker lease is shared by all plan clones.
+	prepared: Option<Arc<crate::client::PreparedImportLease>>,
 }
 
 impl FilePastePlan {
@@ -154,6 +156,16 @@ impl FilePastePlan {
 		self.plan
 			.retained_heap_bytes()
 			.saturating_add(self.digest.as_ref().map_or(0, String::capacity))
+			.saturating_add(
+				self.prepared
+					.as_ref()
+					.map_or(0, |lease| lease.retained_heap_bytes()),
+			)
+	}
+
+	#[doc(hidden)]
+	pub fn uses_prepared_import(&self) -> bool {
+		self.prepared.is_some()
 	}
 	/// Whether the target of delete `index` exists. Locally this is a stat
 	/// made now. A worker's paths are not this machine's, so for a remote
@@ -377,15 +389,19 @@ impl PasteTarget {
 					opts,
 				)
 				.map_err(PasteError::Local)?;
-				Ok(FilePastePlan { plan, digest: None })
+				Ok(FilePastePlan {
+					plan,
+					digest: None,
+					prepared: None,
+				})
 			}
 			PasteTarget::Remote {
 				client,
 				workspace,
 				dest,
 			} => {
-				let planned = client
-					.import_plan(
+				let (planned, prepared) = client
+					.prepare_import(
 						workspace,
 						dest,
 						text,
@@ -401,6 +417,7 @@ impl PasteTarget {
 				Ok(FilePastePlan {
 					plan: planned.plan,
 					digest: Some(planned.digest),
+					prepared,
 				})
 			}
 		}
@@ -443,17 +460,18 @@ impl PasteTarget {
 					digest: plan.digest.clone().unwrap_or_default(),
 					freshness: plan.plan.destination_freshness().clone(),
 				};
-				let mut result = client
-					.import_apply(
-						workspace,
-						dest,
-						text,
-						&route.mapping(),
-						selection,
+				let mapping = route.mapping();
+				let mut result = match &plan.prepared {
+					Some(lease) => client.apply_prepared_import(
+						lease, workspace, dest, text, &mapping, selection,
 						&expect,
+					),
+					None => client.import_apply(
+						workspace, dest, text, &mapping, selection, &expect,
 						None,
-					)
-					.map_err(apply_failure)?;
+					),
+				}
+				.map_err(apply_failure)?;
 				// Older workers omit this additive result field. The worker
 				// already checked the exact preview digest before writing, so
 				// its admitted plan has this same number of planning refusals.
@@ -803,10 +821,12 @@ mod tests {
 		let local = FilePastePlan {
 			plan: plan.clone(),
 			digest: None,
+			prepared: None,
 		};
 		let remote = FilePastePlan {
 			plan,
 			digest: Some("d".into()),
+			prepared: None,
 		};
 		assert!(local.delete_target_exists(0));
 		assert!(remote.delete_target_exists(0));

@@ -24,8 +24,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Newest protocol this build speaks. 2 = Git views, 3 = copy, 4 = paste,
 /// 5 = worker-side change selection ([`Request::ExportChanges`]), whole-folder
 /// export (an empty [`ExportTarget::path`]), and chunked requests;
-/// 6 = typed, bounded destination reads for commit paste previews.
-pub const PROTOCOL_MAX: u32 = 6;
+/// 6 = typed, bounded destination reads for commit paste previews;
+/// 7 = compact file previews and one-use prepared file payloads.
+pub const PROTOCOL_MAX: u32 = 7;
+pub const PREPARED_IMPORT_VERSION: u32 = 7;
 /// The first protocol with Git views.
 pub const GIT_VIEWS_VERSION: u32 = 2;
 /// The first protocol with copy ([`Request::Export`]).
@@ -159,6 +161,24 @@ pub enum Request {
 		text: String,
 		mapping: PasteMapping,
 	},
+	/// File preview without echoing source bodies. `retain` asks this worker
+	/// to retain the source payload for one later Apply on this connection.
+	PrepareImport {
+		workspace: String,
+		dest: String,
+		text: String,
+		mapping: PasteMapping,
+		retain: bool,
+	},
+	/// Consumes the prepared payload, then runs the ordinary re-plan,
+	/// digest/freshness checks and locked Apply. Never automatically retried.
+	ApplyPrepared {
+		workspace: String,
+		dest: String,
+		token: String,
+		selection: snip_core::restore::RestoreSelection,
+		expect: ImportExpect,
+	},
 	/// Plans again and writes what the master previewed and the user
 	/// confirmed, or refuses as stale what changed since that preview.
 	ImportApply {
@@ -243,6 +263,227 @@ impl ImportPlanned {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportCreateMetadata {
+	pub relative_path: String,
+	pub absolute_path: std::path::PathBuf,
+	pub existed: bool,
+	pub root_path: std::path::PathBuf,
+	/// Index into the original parse_clipboard(text, header_format) order.
+	/// Multiple creates may reference one entry when equal bodies are shared;
+	/// mapping and duplicate paths never determine the content reference.
+	pub entry: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportMetadata {
+	pub roots: Vec<std::path::PathBuf>,
+	pub restore_roots: Vec<std::path::PathBuf>,
+	pub creates: Vec<ImportCreateMetadata>,
+	pub deletes: Vec<snip_core::restore::DeleteOperation>,
+	pub skips: Vec<snip_core::restore::SkippedOperation>,
+	pub freshness: snip_core::transfer::DestinationFreshnessSnapshot,
+}
+
+impl ImportMetadata {
+	#[cfg(test)]
+	pub(crate) fn of(
+		plan: &snip_core::transfer::TransferImportPlan,
+		text: &str,
+		header_format: &str,
+	) -> Result<Self, String> {
+		let entries = snip_core::format::parse_clipboard(text, header_format);
+		Self::of_entries(plan, &entries)
+	}
+
+	/// Compatibility encoder for shared-body references. Product planning
+	/// supplies original ordinals while consuming the parsed entries.
+	#[cfg(test)]
+	pub(crate) fn of_entries(
+		plan: &snip_core::transfer::TransferImportPlan,
+		entries: &[snip_core::format::ParsedEntry],
+	) -> Result<Self, String> {
+		let mut contents = std::collections::HashMap::new();
+		for (index, entry) in entries.iter().enumerate() {
+			contents.entry(entry.content.as_str()).or_insert(index);
+		}
+		let entry_indices = plan
+			.create_operations()
+			.iter()
+			.map(|op| {
+				contents.get(op.content.as_str()).copied().ok_or(
+					"planned content is absent from the source payload"
+						.to_string(),
+				)
+			})
+			.collect::<Result<Vec<_>, String>>()?;
+		Self::of_entry_indices(plan, &entry_indices)
+	}
+
+	/// The planner carries each admitted create's original parse ordinal
+	/// while consuming its contents, so metadata needs no second body copy.
+	pub(crate) fn of_entry_indices(
+		plan: &snip_core::transfer::TransferImportPlan,
+		entries: &[usize],
+	) -> Result<Self, String> {
+		if entries.len() != plan.create_operations().len() {
+			return Err(
+				"prepared content references do not match create operations"
+					.into(),
+			);
+		}
+		let creates = plan
+			.create_operations()
+			.iter()
+			.zip(entries)
+			.map(|(op, &entry)| ImportCreateMetadata {
+				relative_path: op.relative_path.clone(),
+				absolute_path: op.absolute_path.clone(),
+				existed: op.existed,
+				root_path: op.root_path.clone(),
+				entry,
+			})
+			.collect();
+		Ok(Self {
+			roots: plan.roots().to_vec(),
+			restore_roots: plan.restore_plan().roots.clone(),
+			creates,
+			deletes: plan.delete_operations().to_vec(),
+			skips: plan.skipped_operations().to_vec(),
+			freshness: plan.destination_freshness().clone(),
+		})
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportPrepared {
+	pub metadata: ImportMetadata,
+	pub digest: String,
+	pub suggestion: Option<snip_core::restore::RestoreBaseSuggestion>,
+	/// Absent when the caller declined retention or cache admission failed.
+	pub token: Option<String>,
+}
+
+impl ImportPrepared {
+	/// Hydrates only from the caller's exact payload, then verifies every
+	/// path, action and body against the worker's complete plan digest.
+	pub fn hydrate(
+		&self,
+		text: &str,
+		header_format: &str,
+	) -> Result<ImportPlanned, String> {
+		self.hydrate_entries(snip_core::format::parse_clipboard(
+			text,
+			header_format,
+		))
+	}
+
+	fn hydrate_entries(
+		&self,
+		mut entries: Vec<snip_core::format::ParsedEntry>,
+	) -> Result<ImportPlanned, String> {
+		use snip_core::restore::{CreateOperation, RestorePlan};
+		let source_bytes = entries.iter().try_fold(0usize, |sum, entry| {
+			sum.checked_add(entry.content.len())
+				.ok_or("prepared source content byte count overflow")
+		})?;
+		let mut references = vec![0usize; entries.len()];
+		let mut hydrated_bytes = 0usize;
+		for op in &self.metadata.creates {
+			let entry = entries
+				.get(op.entry)
+				.ok_or("invalid prepared content reference")?;
+			hydrated_bytes =
+				hydrated_bytes.checked_add(entry.content.len()).ok_or(
+					"prepared content references exceed the source payload",
+				)?;
+			if hydrated_bytes > source_bytes {
+				return Err(
+					"prepared content references exceed the source payload"
+						.into(),
+				);
+			}
+			references[op.entry] += 1;
+		}
+		// Equal bodies may all point at one parse entry. Release the other
+		// parsed copies before materializing any repeated create contents.
+		for (entry, &count) in entries.iter_mut().zip(&references) {
+			if count == 0 {
+				entry.content = String::new();
+			}
+		}
+		let creates = self
+			.metadata
+			.creates
+			.iter()
+			.map(|op| {
+				let entry = entries
+					.get_mut(op.entry)
+					.ok_or("invalid prepared content reference")?;
+				references[op.entry] -= 1;
+				let content = if references[op.entry] == 0 {
+					std::mem::take(&mut entry.content)
+				} else {
+					entry.content.clone()
+				};
+				Ok(CreateOperation {
+					relative_path: op.relative_path.clone(),
+					absolute_path: op.absolute_path.clone(),
+					content,
+					existed: op.existed,
+					root_path: op.root_path.clone(),
+				})
+			})
+			.collect::<Result<Vec<_>, String>>()?;
+		drop(entries);
+		drop(references);
+		let restore_plan = RestorePlan {
+			roots: self.metadata.restore_roots.clone(),
+			create_operations: creates,
+			delete_operations: self.metadata.deletes.clone(),
+			skipped_operations: self.metadata.skips.clone(),
+		};
+		if restore_plan_digest(&restore_plan)? != self.digest {
+			return Err(
+				"prepared preview digest does not match the source payload"
+					.into(),
+			);
+		}
+		Ok(ImportPlanned {
+			plan: snip_core::transfer::TransferImportPlan::from_parts(
+				self.metadata.roots.clone(),
+				restore_plan,
+				self.metadata.freshness.clone(),
+			),
+			digest: self.digest.clone(),
+			suggestion: self.suggestion.clone(),
+		})
+	}
+}
+
+pub(crate) fn restore_plan_digest(
+	plan: &snip_core::restore::RestorePlan,
+) -> Result<String, String> {
+	use sha2::{Digest, Sha256};
+	struct DigestSink(Sha256);
+	impl Write for DigestSink {
+		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+			self.0.update(bytes);
+			Ok(bytes.len())
+		}
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+	// serde emits many tiny writes around escaped characters. Buffer them
+	// before hashing, without allocating a second payload-sized JSON body.
+	let mut writer =
+		io::BufWriter::with_capacity(64 * 1024, DigestSink(Sha256::new()));
+	serde_json::to_writer(&mut writer, plan).map_err(|e| e.to_string())?;
+	let digest = writer.into_inner().map_err(|e| e.to_string())?.0.finalize();
+	Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// A commit replay preview without its payload, which the master has:
 /// [`snip_core::transfer::CommitReplayPreview::from_parts`] joins them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +520,7 @@ impl Request {
 	pub fn text(&self) -> Option<&str> {
 		match self {
 			Self::ImportPlan { text, .. }
+			| Self::PrepareImport { text, .. }
 			| Self::ImportApply { text, .. }
 			| Self::ReplayPlan { text, .. }
 			| Self::ReplayApply { text, .. } => Some(text),
@@ -289,6 +531,7 @@ impl Request {
 	pub fn text_mut(&mut self) -> Option<&mut String> {
 		match self {
 			Self::ImportPlan { text, .. }
+			| Self::PrepareImport { text, .. }
 			| Self::ImportApply { text, .. }
 			| Self::ReplayPlan { text, .. }
 			| Self::ReplayApply { text, .. } => Some(text),
@@ -298,6 +541,9 @@ impl Request {
 
 	pub fn needs_version(&self) -> u32 {
 		match self {
+			Self::PrepareImport { .. } | Self::ApplyPrepared { .. } => {
+				PREPARED_IMPORT_VERSION
+			}
 			Self::ReplayRead { .. } => REPLAY_PREVIEW_VERSION,
 			Self::ScanRepos { .. } | Self::GitView { .. } => GIT_VIEWS_VERSION,
 			Self::Export { items, .. }
@@ -408,6 +654,7 @@ pub enum Response {
 	/// The chunks since the last reply are one reply's JSON.
 	Joined,
 	ImportPlanned(ImportPlanned),
+	ImportPrepared(ImportPrepared),
 	Imported(snip_core::restore::RestoreExecutionResult),
 	ReplayPlanned(ReplayExpect),
 	ReplayRead(snip_core::transfer::ReplayPreviewRead),
@@ -1419,5 +1666,252 @@ mod tests {
 		let too_many: Vec<String> =
 			(0..=REMOTE_MAX_TIPS).map(|_| "abcd".into()).collect();
 		assert!(!valid_tips(&too_many));
+	}
+}
+
+#[cfg(test)]
+mod prepared_metadata_tests {
+	use super::*;
+	use snip_core::transfer::{plan_import, CanonicalRootId, ImportMapping};
+
+	fn prepared(
+		text: &str,
+	) -> (
+		tempfile::TempDir,
+		ImportPrepared,
+		snip_core::transfer::TransferImportPlan,
+	) {
+		let temp = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(temp.path()).unwrap();
+		let plan = plan_import(
+			text,
+			"",
+			std::slice::from_ref(&root),
+			&ImportMapping::with_primary(CanonicalRootId::new(&root).unwrap()),
+		)
+		.unwrap();
+		let reply = ImportPrepared {
+			metadata: ImportMetadata::of(&plan, text, "").unwrap(),
+			digest: restore_plan_digest(plan.restore_plan()).unwrap(),
+			suggestion: None,
+			token: Some("token".into()),
+		};
+		(temp, reply, plan)
+	}
+
+	#[test]
+	fn hydrated_last_references_reuse_parsed_body_allocations() {
+		let body = "shared body\n".repeat(8192);
+		let unique = "unique body\n".repeat(8192);
+		let text = format!("// FILE: first.txt\n{body}// FILE: second.txt\n{body}// FILE: third.txt\n{unique}// FILE: .git/config\nignored\n");
+		let (_temp, reply, plan) = prepared(&text);
+		let entries = snip_core::format::parse_clipboard(&text, "");
+		assert_eq!(
+			reply
+				.metadata
+				.creates
+				.iter()
+				.map(|op| op.entry)
+				.collect::<Vec<_>>(),
+			[0, 0, 2]
+		);
+		let shared_allocation = entries[0].content.as_ptr();
+		let unique_allocation = entries[2].content.as_ptr();
+		let hydrated = reply.hydrate_entries(entries).unwrap();
+		assert_eq!(hydrated.plan, plan);
+		let creates = hydrated.plan.create_operations();
+		assert_eq!(
+			creates[1].content.as_ptr(),
+			shared_allocation,
+			"last shared reference moves the parsed allocation"
+		);
+		assert_eq!(
+			creates[2].content.as_ptr(),
+			unique_allocation,
+			"unique reference needs no body clone"
+		);
+		assert_ne!(
+			creates[0].content.as_ptr(),
+			creates[1].content.as_ptr(),
+			"repeated creates still own independent strings"
+		);
+	}
+
+	#[test]
+	fn planner_ordinals_hydrate_without_body_matching() {
+		let text = "// FILE: first.txt\nsame\n// FILE: .git/config\nignored\n// FILE: second.txt\nsame\n// FILE: third.txt\nunique\n";
+		let (_temp, mut reply, plan) = prepared(text);
+		reply.metadata =
+			ImportMetadata::of_entry_indices(&plan, &[0, 2, 3]).unwrap();
+		assert_eq!(reply.hydrate(text, "").unwrap().plan, plan);
+		assert!(ImportMetadata::of_entry_indices(&plan, &[0, 2]).is_err());
+	}
+
+	#[test]
+	fn hydration_rejects_content_amplification_before_cloning() {
+		let text =
+			"// FILE: first.txt\nsame body\n// FILE: second.txt\nsame body\n";
+		let (_temp, mut reply, plan) = prepared(text);
+		// Older protocol-7 workers deduplicated equal bodies to the first
+		// entry. Two equal source bodies still authorize two create bodies.
+		assert_eq!(
+			reply
+				.metadata
+				.creates
+				.iter()
+				.map(|op| op.entry)
+				.collect::<Vec<_>>(),
+			[0, 0]
+		);
+		assert_eq!(reply.hydrate(text, "").unwrap().plan, plan);
+		let mut extra = reply.metadata.creates[0].clone();
+		extra.relative_path = "third.txt".into();
+		extra.absolute_path = extra.root_path.join("third.txt");
+		reply.metadata.creates.push(extra);
+		// No new digest is provided: size validation must win before the
+		// extra body is materialized or the digest can report a mismatch.
+		assert_eq!(
+			reply.hydrate(text, "").unwrap_err(),
+			"prepared content references exceed the source payload"
+		);
+	}
+
+	#[test]
+	fn streamed_restore_digest_matches_complete_json_bytes() {
+		use sha2::{Digest, Sha256};
+		use snip_core::restore::{
+			CreateOperation, DeleteOperation, RestorePlan, SkipDetail,
+			SkipReason, SkippedOperation,
+		};
+		let root = std::path::PathBuf::from("workspace");
+		for body in [
+			String::new(),
+			"plain\nsecond line\r\n".into(),
+			"quote=\" slash=\\ tab=\t nul=\0 backspace=\u{8} formfeed=\u{c}"
+				.into(),
+			"中文 🦀 café \u{2028} \u{2029}\n".repeat(8192),
+			"x".repeat(64 * 1024 - 1),
+			"x".repeat(64 * 1024),
+			"x".repeat(64 * 1024 + 1),
+			"\"\\\t\r\n中文".repeat(100_000),
+		] {
+			let plan = RestorePlan {
+				roots: vec![root.clone()],
+				create_operations: vec![CreateOperation {
+					relative_path: "引號\"路徑.txt".into(),
+					absolute_path: root.join("quoted\"name.txt"),
+					content: body,
+					existed: true,
+					root_path: root.clone(),
+				}],
+				delete_operations: vec![DeleteOperation {
+					relative_path: "gone.txt".into(),
+					absolute_path: root.join("gone.txt"),
+				}],
+				skipped_operations: vec![SkippedOperation {
+					raw_path: ".git/config".into(),
+					relative_path: None,
+					reason: SkipReason::UnresolvedPath,
+					detail: Some(SkipDetail::ProtectedGitMetadata),
+				}],
+			};
+			let expected: String =
+				Sha256::digest(serde_json::to_vec(&plan).unwrap())
+					.iter()
+					.map(|byte| format!("{byte:02x}"))
+					.collect();
+			assert_eq!(restore_plan_digest(&plan).unwrap(), expected, "streaming must preserve the previous digest for {} content bytes", plan.create_operations[0].content.len());
+		}
+	}
+
+	#[test]
+	fn prepared_preview_omits_large_source_body_and_hydrates_exactly() {
+		let body = "SOURCE_CONTENT_MUST_NOT_BE_ECHOED\n".repeat(32768);
+		let text = format!("// FILE: a.rs\n{body}");
+		let (_temp, reply, plan) = prepared(&text);
+		let wire = serde_json::to_vec(&reply).unwrap();
+		assert!(
+			wire.len() < 4096,
+			"metadata should not scale with the file body: {}",
+			wire.len()
+		);
+		assert!(!String::from_utf8(wire)
+			.unwrap()
+			.contains("SOURCE_CONTENT_MUST_NOT_BE_ECHOED"));
+		assert_eq!(reply.hydrate(&text, "").unwrap().plan, plan);
+	}
+
+	#[test]
+	fn prepared_content_references_use_exact_bodies_not_paths() {
+		let text="// FILE: first.txt\nsame\n// FILE: second.txt\nsame\n// FILE: third.txt\ndifferent\n";
+		let (_temp, mut reply, plan) = prepared(text);
+		assert_eq!(
+			reply
+				.metadata
+				.creates
+				.iter()
+				.map(|c| c.entry)
+				.collect::<Vec<_>>(),
+			[0, 0, 2]
+		);
+		assert_eq!(reply.hydrate(text, "").unwrap().plan, plan);
+		reply.metadata.creates[2].entry = 0;
+		assert!(reply.hydrate(text, "").unwrap_err().contains("digest"));
+		reply.metadata.creates[2].entry = 1000;
+		assert!(reply.hydrate(text, "").unwrap_err().contains("reference"));
+	}
+
+	#[test]
+	fn prepared_many_small_files_avoid_per_body_hash_overhead() {
+		let text = (0..400)
+			.map(|i| format!("// FILE: f{i}.txt\nx\n"))
+			.collect::<String>();
+		let (_temp, reply, plan) = prepared(&text);
+		let legacy = ImportPlanned {
+			plan: plan.clone(),
+			digest: reply.digest.clone(),
+			suggestion: None,
+		};
+		let compact = serde_json::to_vec(&reply).unwrap();
+		let full = serde_json::to_vec(&legacy).unwrap();
+		assert!(
+			compact.len() <= full.len() + 1024,
+			"compact={} legacy={}",
+			compact.len(),
+			full.len()
+		);
+		assert_eq!(reply.hydrate(&text, "").unwrap().plan, plan);
+	}
+
+	#[test]
+	fn prepared_metadata_larger_than_a_frame_is_sent_as_joined_chunks() {
+		let (_temp, mut prepared, _plan) = prepared("// FILE: a\nx\n");
+		prepared
+			.metadata
+			.skips
+			.push(snip_core::restore::SkippedOperation {
+				raw_path: "x".repeat(MAX_FRAME + 1),
+				relative_path: None,
+				reason: snip_core::restore::SkipReason::UnresolvedPath,
+				detail: None,
+			});
+		let expected = Response::ImportPrepared(prepared);
+		let mut bytes = Vec::new();
+		crate::jobs::write_response(&mut bytes, &expected).unwrap();
+		let mut reader = std::io::Cursor::new(bytes);
+		let mut json = String::new();
+		let mut count = 0;
+		loop {
+			match read_frame::<Response>(&mut reader).unwrap().unwrap() {
+				Response::Chunk { data } => {
+					json.push_str(&data);
+					count += 1;
+				}
+				Response::Joined => break,
+				other => panic!("unexpected reply {other:?}"),
+			}
+		}
+		assert!(count > 1);
+		assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), expected);
 	}
 }

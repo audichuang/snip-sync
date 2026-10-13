@@ -107,6 +107,7 @@ struct State {
 	dir_cap: AtomicUsize,
 	jobs: crate::jobs::Jobs,
 	repo_cache: Mutex<crate::gitserve::RepoCache>,
+	prepared: crate::prepared::PreparedCache,
 	stop: AtomicBool,
 	scan_faults: Mutex<std::collections::HashMap<String, ScanFault>>,
 	connections: AtomicUsize,
@@ -135,6 +136,7 @@ impl Worker {
 		Self {
 			state: Arc::new(State {
 				name: opts.name,
+				prepared: crate::prepared::PreparedCache::new(),
 				max_protocol: opts.max_protocol,
 				git_requests: AtomicUsize::new(0),
 				deadlines: Mutex::new((
@@ -186,6 +188,26 @@ impl Worker {
 	/// Counts GitView/ScanRepos requests received, for tests and diagnostics.
 	pub fn git_requests_seen(&self) -> usize {
 		self.state.git_requests.load(Ordering::SeqCst)
+	}
+
+	#[doc(hidden)]
+	pub fn set_prepared_cache_limits_for_tests(
+		&self,
+		bytes: usize,
+		entries: usize,
+		ttl: Duration,
+	) {
+		self.state
+			.prepared
+			.set_limits_for_tests(bytes, entries, ttl);
+	}
+	#[doc(hidden)]
+	pub fn expire_prepared_for_tests(&self) {
+		self.state.prepared.expire_for_tests();
+	}
+	#[doc(hidden)]
+	pub fn prepared_cache_usage_for_tests(&self) -> (usize, usize) {
+		self.state.prepared.usage_for_tests()
 	}
 
 	#[doc(hidden)]
@@ -669,6 +691,60 @@ fn serve(
 					},
 				)?;
 			}
+			Request::PrepareImport {
+				workspace,
+				dest,
+				text,
+				mapping,
+				retain,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					crate::proto::PREPARED_IMPORT_VERSION,
+					|root, cancel| {
+						crate::pasteserve::prepare_import(
+							root,
+							&dest,
+							text,
+							mapping,
+							retain,
+							&state.prepared,
+							cancel,
+						)
+					},
+				)?;
+			}
+			Request::ApplyPrepared {
+				workspace,
+				dest,
+				token,
+				selection,
+				expect,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PasteApply,
+					crate::proto::PREPARED_IMPORT_VERSION,
+					|root, cancel| {
+						crate::pasteserve::apply_prepared(
+							root,
+							&dest,
+							&token,
+							&selection,
+							&expect,
+							&state.prepared,
+							cancel,
+						)
+					},
+				)?;
+			}
 			Request::ImportPlan {
 				workspace,
 				dest,
@@ -983,6 +1059,8 @@ impl State {
 			| Request::ExportCommits { .. }
 			| Request::ExportChanges { .. }
 			| Request::ImportPlan { .. }
+			| Request::PrepareImport { .. }
+			| Request::ApplyPrepared { .. }
 			| Request::ImportApply { .. }
 			| Request::ReplayRead { .. }
 			| Request::ReplayPlan { .. }

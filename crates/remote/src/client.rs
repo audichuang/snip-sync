@@ -21,6 +21,7 @@ use snip_core::gitview::{
 	ChangeList, ChangedPathList, CommitDetails, Read, ReadProfile, RepoView,
 };
 
+use sha2::{Digest, Sha256};
 use snip_core::commits::CommitCopyOutcome;
 use snip_core::transfer::CopyOutcome;
 
@@ -51,6 +52,7 @@ const MAX_BANNER: usize = 64 * 1024;
 const MAX_STDERR: usize = 8 * 1024;
 /// Idle connections kept per worker: each is an ssh process.
 const POOL: usize = 2;
+const PREPARED_IMPORT_LEASES: usize = 2;
 /// In-flight starts, shared across Clients for the same host. Established
 /// workers and idle connections do not hold a handshake slot.
 const HANDSHAKES_PER_HOST: usize = 2;
@@ -1108,6 +1110,221 @@ impl<'a> Drop for GitLimiterGuard<'a> {
 	}
 }
 
+#[derive(Default)]
+struct PreparedImports {
+	active: AtomicUsize,
+}
+
+impl PreparedImports {
+	fn reserve(self: &Arc<Self>) -> Option<PreparedImportPermit> {
+		let cleanup = prepared_cleanup_sender()?;
+		let mut active = self.active.load(Ordering::SeqCst);
+		loop {
+			if active >= PREPARED_IMPORT_LEASES {
+				return None;
+			}
+			match self.active.compare_exchange_weak(
+				active,
+				active + 1,
+				Ordering::SeqCst,
+				Ordering::SeqCst,
+			) {
+				Ok(_) => {
+					return Some(PreparedImportPermit {
+						owner: self.clone(),
+						cleanup,
+					})
+				}
+				Err(now) => active = now,
+			}
+		}
+	}
+}
+
+struct PreparedImportPermit {
+	owner: Arc<PreparedImports>,
+	cleanup: mpsc::Sender<PreparedCleanup>,
+}
+
+impl Drop for PreparedImportPermit {
+	fn drop(&mut self) {
+		self.owner.active.fetch_sub(1, Ordering::SeqCst);
+	}
+}
+
+struct PreparedConnection {
+	connection: Connection,
+	token: String,
+	_permit: PreparedImportPermit,
+}
+
+struct PreparedCleanup {
+	connection: Connection,
+	permit: PreparedImportPermit,
+}
+
+struct PendingPreparedChild {
+	child: Child,
+	_permit: PreparedImportPermit,
+	started: Instant,
+	warned: bool,
+}
+
+/// A dropped preview can originate on the UI thread. Reap its worker on
+/// one cleanup thread, polling every child without a blocking wait. A
+/// child that cannot yet be reaped continues to occupy its client's slot.
+fn prepared_cleanup_sender() -> Option<mpsc::Sender<PreparedCleanup>> {
+	static CLEANUP: OnceLock<Option<mpsc::Sender<PreparedCleanup>>> =
+		OnceLock::new();
+	CLEANUP.get_or_init(|| {
+		let (sender, receiver) = mpsc::channel::<PreparedCleanup>();
+		std::thread::Builder::new().name("snip-prepared-cleanup".into()).spawn(move || {
+			let mut pending: Vec<PendingPreparedChild> = Vec::new();
+			loop {
+				match receiver.recv_timeout(Duration::from_millis(50)) {
+					Ok(PreparedCleanup { mut connection, permit }) => {
+						let child = connection.child.take();
+						// Closing the pipes ends the worker's read. Remove the
+						// child first so Connection::drop cannot call wait().
+						drop(connection);
+						if let Some(mut child) = child {
+							let _ = child.kill();
+							pending.push(PendingPreparedChild { child, _permit: permit, started: Instant::now(), warned: false });
+						}
+					}
+					Err(RecvTimeoutError::Disconnected) if pending.is_empty() => break,
+					Err(_) => {}
+				}
+				pending.retain_mut(|pending| {
+					if matches!(pending.child.try_wait(), Ok(Some(_))) { return false; }
+					if !pending.warned && pending.started.elapsed() >= Duration::from_secs(30) {
+						eprintln!("[prepared paste] worker cleanup is still pending; its lease slot remains reserved");
+						pending.warned = true;
+					}
+					true
+				});
+			}
+		}).ok()?;
+		Some(sender)
+	}).clone()
+}
+
+impl Drop for PreparedImportLease {
+	fn drop(&mut self) {
+		let state =
+			self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+		if let PreparedImportState::Ready(ready) =
+			std::mem::replace(state, PreparedImportState::Used)
+		{
+			let PreparedConnection {
+				connection,
+				token: _,
+				_permit: permit,
+			} = *ready;
+			let sender = permit.cleanup.clone();
+			if let Err(failed) =
+				sender.send(PreparedCleanup { connection, permit })
+			{
+				// The reaper must never panic, but even a disconnected sender
+				// must not route an unbounded child wait onto the UI thread.
+				let PreparedCleanup {
+					mut connection,
+					permit,
+				} = failed.0;
+				let child = connection.child.take();
+				drop(connection);
+				if let Some(mut child) = child {
+					let _ = child.kill();
+					if !matches!(child.try_wait(), Ok(Some(_))) {
+						// Cleanup is unconfirmed: do not grant another prepared
+						// slot and conceal a potentially still-running worker.
+						std::mem::forget(permit);
+						eprintln!("[prepared paste] cleanup service unavailable; worker cleanup unconfirmed");
+					}
+				}
+			}
+		}
+	}
+}
+
+enum PreparedImportState {
+	Ready(Box<PreparedConnection>),
+	Applying,
+	Used,
+	OutcomeUnknown,
+}
+
+/// The worker connection that owns a preview token. Clones of a file plan
+/// share this one-use state; it never owns the Client itself.
+pub(crate) struct PreparedImportLease {
+	owner: Arc<PreparedImports>,
+	workspace: String,
+	dest: String,
+	text_hash: [u8; 32],
+	mapping: PasteMapping,
+	digest: String,
+	state: Mutex<PreparedImportState>,
+}
+
+impl std::fmt::Debug for PreparedImportLease {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PreparedImportLease")
+			.field("workspace", &self.workspace)
+			.field("dest", &self.dest)
+			.finish_non_exhaustive()
+	}
+}
+
+impl PreparedImportLease {
+	/// Owned metadata and connection strings. No source body is retained
+	/// here; transport frame queues remain separately bounded by FRAME_QUEUE.
+	pub(crate) fn retained_heap_bytes(&self) -> usize {
+		let mut bytes =
+			std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
+		bytes = bytes
+			.saturating_add(self.workspace.capacity())
+			.saturating_add(self.dest.capacity())
+			.saturating_add(self.digest.capacity())
+			.saturating_add(self.mapping.header_format.capacity())
+			.saturating_add(
+				self.mapping.prefixes.capacity()
+					* std::mem::size_of::<(String, String)>(),
+			);
+		for (prefix, folder) in &self.mapping.prefixes {
+			bytes = bytes
+				.saturating_add(prefix.capacity())
+				.saturating_add(folder.capacity());
+		}
+		if let PreparedImportState::Ready(ready) =
+			&*self.state.lock().unwrap_or_else(PoisonError::into_inner)
+		{
+			bytes = bytes
+				.saturating_add(std::mem::size_of::<PreparedConnection>())
+				.saturating_add(ready.token.capacity())
+				.saturating_add(ready.connection.worker_name.capacity())
+				.saturating_add(
+					ready.connection.home.as_ref().map_or(0, String::capacity),
+				)
+				.saturating_add(
+					ready
+						.connection
+						.stderr
+						.lock()
+						.unwrap_or_else(PoisonError::into_inner)
+						.capacity(),
+				);
+		}
+		bytes
+	}
+}
+
+fn prepared_stale(message: &str) -> RemoteError {
+	RemoteError::Refused {
+		code: ErrorCode::Stale,
+		message: message.into(),
+	}
+}
+
 /// Calls to one worker, reusing a few idle connections.
 pub struct Client {
 	host: RemoteHost,
@@ -1115,6 +1332,7 @@ pub struct Client {
 	idle: Mutex<Vec<Connection>>,
 	limiter: GitLimiter,
 	handshakes: Arc<HandshakeGate>,
+	prepared_imports: Arc<PreparedImports>,
 }
 
 impl Client {
@@ -1126,6 +1344,7 @@ impl Client {
 			idle: Mutex::new(Vec::new()),
 			limiter: GitLimiter::new(),
 			handshakes,
+			prepared_imports: Arc::default(),
 		}
 	}
 
@@ -1187,6 +1406,34 @@ impl Client {
 		}
 	}
 
+	fn take_connection(
+		&self,
+		need: u32,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<(Connection, bool), RemoteError> {
+		let pooled = self
+			.idle
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.pop();
+		match pooled {
+			Some(conn) if conn.unsolicited_frames() > 0 => {
+				// Its stream is out of step. This is a new read/plan, never a
+				// token Apply, so the old worker can be discarded here.
+				drop(conn);
+				Ok((self.connect_at_least(need, cancel, deadline)?, false))
+			}
+			Some(conn) if conn.version() >= need => Ok((conn, true)),
+			Some(conn) => {
+				let error = too_old_error(&conn, need);
+				self.keep(conn);
+				Err(error)
+			}
+			None => Ok((self.connect_at_least(need, cancel, deadline)?, false)),
+		}
+	}
+
 	/// Starts the worker and returns its home folder.
 	pub fn home(&self) -> Result<Option<String>, RemoteError> {
 		let conn = self.connect()?;
@@ -1211,6 +1458,7 @@ impl Client {
 		let writes = matches!(
 			request,
 			Request::ImportApply { .. }
+				| Request::ApplyPrepared { .. }
 				| Request::ReplayApply {
 					check_only: false,
 					..
@@ -1223,30 +1471,8 @@ impl Client {
 		};
 
 		let need = request.needs_version();
-		let too_old = |conn: Connection| {
-			let err = too_old_error(&conn, need);
-			self.keep(conn);
-			err
-		};
-		let pooled = self
-			.idle
-			.lock()
-			.unwrap_or_else(PoisonError::into_inner)
-			.pop();
-		let (mut conn, reused) = match pooled {
-			Some(conn) if conn.unsolicited_frames() > 0 => {
-				// The worker spoke while nobody was asking. Whatever the
-				// reason, its stream is out of step with the protocol:
-				// drop the connection (killing its process) and start a
-				// clean one — which must speak a new enough protocol too.
-				(self.connect_at_least(need, cancel, start + limit)?, false)
-			}
-			Some(conn) if conn.version() >= need => (conn, true),
-			Some(conn) => return Err(too_old(conn)),
-			None => {
-				(self.connect_at_least(need, cancel, start + limit)?, false)
-			}
-		};
+		let (mut conn, reused) =
+			self.take_connection(need, cancel, start + limit)?;
 
 		let remaining = limit.saturating_sub(start.elapsed());
 		if remaining.is_zero() {
@@ -1367,6 +1593,217 @@ impl Client {
 			Response::ImportPlanned(planned) => Ok(planned),
 			_ => Err(unexpected()),
 		}
+	}
+
+	/// File-paste facade: use metadata-only previews on protocol 7 and
+	/// reserve the exact worker connection when it retains a payload token.
+	/// A worker or client unable to retain a token chooses legacy Apply now,
+	/// before any write has been sent.
+	pub(crate) fn prepare_import(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		cancel: Option<&CancelToken>,
+	) -> Result<(ImportPlanned, Option<Arc<PreparedImportLease>>), RemoteError>
+	{
+		let start = Instant::now();
+		let _guard = self.limiter.acquire(cancel, GIT_CALL_LIMIT)?;
+		let permit = self.prepared_imports.reserve();
+		let (mut connection, reused) = self.take_connection(
+			crate::proto::PASTE_VERSION,
+			cancel,
+			start + GIT_CALL_LIMIT,
+		)?;
+		let request = |version| {
+			if version >= crate::proto::PREPARED_IMPORT_VERSION {
+				Request::PrepareImport {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text: text.into(),
+					mapping: mapping.clone(),
+					retain: permit.is_some(),
+				}
+			} else {
+				Request::ImportPlan {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text: text.into(),
+					mapping: mapping.clone(),
+				}
+			}
+		};
+		let mut reply = connection.call(
+			&request(connection.version()),
+			cancel,
+			GIT_CALL_LIMIT.saturating_sub(start.elapsed()),
+		);
+		if let Err(error) = &reply {
+			// Planning is read-only. Preserve the existing single retry on a
+			// stale reused connection, selecting the new worker's protocol.
+			if should_resend(reused, connection.frames_seen, error) {
+				match self.connect_at_least(
+					crate::proto::PASTE_VERSION,
+					cancel,
+					start + GIT_CALL_LIMIT,
+				) {
+					Ok(mut fresh) => {
+						reply = fresh.call(
+							&request(fresh.version()),
+							cancel,
+							GIT_CALL_LIMIT.saturating_sub(start.elapsed()),
+						);
+						connection = fresh;
+					}
+					Err(error @ RemoteError::WorkerTooOld { .. }) => {
+						return Err(error)
+					}
+					Err(_) => {}
+				}
+			}
+		}
+		let (planned, token) = match reply {
+			Ok(Response::ImportPrepared(prepared))
+				if connection.version()
+					>= crate::proto::PREPARED_IMPORT_VERSION =>
+			{
+				let planned = prepared
+					.hydrate(text, &mapping.header_format)
+					.map_err(RemoteError::Protocol)?;
+				(planned, prepared.token)
+			}
+			Ok(Response::ImportPlanned(planned))
+				if connection.version()
+					< crate::proto::PREPARED_IMPORT_VERSION =>
+			{
+				(planned, None)
+			}
+			Ok(_) => return Err(unexpected()),
+			Err(error) => {
+				self.keep(connection);
+				return Err(error);
+			}
+		};
+		if cancel.is_some_and(|token| token.is_cancelled()) {
+			return Err(RemoteError::Cancelled);
+		}
+		match (token, permit) {
+			(Some(token), Some(permit)) => {
+				let lease = PreparedImportLease {
+					owner: self.prepared_imports.clone(),
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text_hash: Sha256::digest(text.as_bytes()).into(),
+					mapping: mapping.clone(),
+					digest: planned.digest.clone(),
+					state: Mutex::new(PreparedImportState::Ready(Box::new(
+						PreparedConnection {
+							connection,
+							token,
+							_permit: permit,
+						},
+					))),
+				};
+				Ok((planned, Some(Arc::new(lease))))
+			}
+			(None, _) => {
+				self.keep(connection);
+				Ok((planned, None))
+			}
+			(Some(_), None) => Err(RemoteError::Protocol(
+				"worker retained a paste without a client lease".into(),
+			)),
+		}
+	}
+
+	/// Applies a token once on its original connection. No path here can
+	/// reconnect, obtain another worker, or fall back to sending the payload.
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn apply_prepared_import(
+		&self,
+		lease: &PreparedImportLease,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		selection: &snip_core::restore::RestoreSelection,
+		expect: &ImportExpect,
+	) -> Result<snip_core::restore::RestoreExecutionResult, RemoteError> {
+		let text_hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+		if !Arc::ptr_eq(&self.prepared_imports, &lease.owner)
+			|| workspace != lease.workspace
+			|| dest != lease.dest
+			|| text_hash != lease.text_hash
+			|| mapping != &lease.mapping
+			|| expect.digest != lease.digest
+		{
+			return Err(prepared_stale("the prepared paste belongs to another target or payload; preview again"));
+		}
+		let start = Instant::now();
+		let _guard = self.limiter.acquire(None, APPLY_CALL_LIMIT)?;
+		let ready = {
+			let mut state =
+				lease.state.lock().unwrap_or_else(PoisonError::into_inner);
+			match &*state {
+				PreparedImportState::Ready(_) => {}
+				PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into() }),
+				PreparedImportState::Used => return Err(prepared_stale("the prepared paste has already been used; preview again")),
+				PreparedImportState::OutcomeUnknown => return Err(RemoteError::Protocol("the previous prepared paste has an unknown outcome; inspect the destination before pasting again".into())),
+			}
+			let PreparedImportState::Ready(ready) =
+				std::mem::replace(&mut *state, PreparedImportState::Applying)
+			else {
+				unreachable!()
+			};
+			ready
+		};
+		let PreparedConnection {
+			mut connection,
+			token,
+			_permit,
+		} = *ready;
+		let result = if connection.broken || connection.unsolicited_frames() > 0
+		{
+			Err(prepared_stale(
+				"the prepared paste connection changed; preview again",
+			))
+		} else {
+			let request = Request::ApplyPrepared {
+				workspace: workspace.into(),
+				dest: dest.into(),
+				token,
+				selection: selection.clone(),
+				expect: expect.clone(),
+			};
+			match connection.call(
+				&request,
+				None,
+				APPLY_CALL_LIMIT.saturating_sub(start.elapsed()),
+			) {
+				Ok(Response::Imported(result)) => Ok(result),
+				Ok(_) => Err(unexpected()),
+				Err(error) => Err(error),
+			}
+		};
+		*lease.state.lock().unwrap_or_else(PoisonError::into_inner) =
+			if result.as_ref().is_err_and(RemoteError::outcome_unknown) {
+				PreparedImportState::OutcomeUnknown
+			} else {
+				PreparedImportState::Used
+			};
+		// An out-of-step or unknown outcome is never returned to the pool.
+		if !result.as_ref().is_err_and(RemoteError::outcome_unknown)
+			&& connection.unsolicited_frames() == 0
+		{
+			self.keep(connection);
+		}
+		result
+	}
+
+	#[doc(hidden)]
+	pub fn prepared_imports_for_tests(&self) -> usize {
+		self.prepared_imports.active.load(Ordering::SeqCst)
 	}
 
 	/// Writes what [`Self::import_plan`] previewed, as `selection` confirms,
@@ -1618,7 +2055,9 @@ pub(crate) fn runs_git(request: &Request) -> bool {
 			| Request::ExportCommits { .. }
 			| Request::ExportChanges { .. }
 			| Request::ImportPlan { .. }
+			| Request::PrepareImport { .. }
 			| Request::ImportApply { .. }
+			| Request::ApplyPrepared { .. }
 			| Request::ReplayPlan { .. }
 			| Request::ReplayApply { .. }
 	)
@@ -1948,6 +2387,302 @@ impl From<RemoteError> for GitError {
 mod tests {
 	use super::*;
 	use crate::proto::write_frame;
+
+	struct PreparedWrites(Arc<Mutex<Vec<u8>>>);
+	impl IoWrite for PreparedWrites {
+		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+			self.0.lock().unwrap().extend_from_slice(bytes);
+			Ok(bytes.len())
+		}
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	struct PreparedFixture {
+		client: Arc<Client>,
+		lease: Arc<PreparedImportLease>,
+		expect: ImportExpect,
+		writes: Arc<Mutex<Vec<u8>>>,
+		reply: SyncSender<io::Result<Option<Response>>>,
+		retained: Arc<AtomicUsize>,
+	}
+
+	impl PreparedFixture {
+		fn new() -> Self {
+			let client = Arc::new(Client::new(
+				RemoteHost::in_process(Arc::new(Worker::new(
+					Default::default(),
+				))),
+				"test".into(),
+			));
+			let permit = client.prepared_imports.reserve().unwrap();
+			let (reply, frames) = mpsc::sync_channel(1);
+			let writes = Arc::new(Mutex::new(Vec::new()));
+			let retained = Arc::new(AtomicUsize::new(0));
+			let mut connection = test_conn(
+				Box::new(PreparedWrites(writes.clone())),
+				frames,
+				retained.clone(),
+				Arc::new(AtomicBool::new(false)),
+			);
+			connection.version = crate::proto::PREPARED_IMPORT_VERSION;
+			let expect = ImportExpect {
+				digest: "expected".into(),
+				freshness: snip_core::transfer::DestinationFreshnessSnapshot {
+					roots: Default::default(),
+					target_files: Default::default(),
+				},
+			};
+			let lease = Arc::new(PreparedImportLease {
+				owner: client.prepared_imports.clone(),
+				workspace: "/workspace".into(),
+				dest: String::new(),
+				text_hash: Sha256::digest(b"source").into(),
+				mapping: PasteMapping::default(),
+				digest: expect.digest.clone(),
+				state: Mutex::new(PreparedImportState::Ready(Box::new(
+					PreparedConnection {
+						connection,
+						token: "opaque-token".into(),
+						_permit: permit,
+					},
+				))),
+			});
+			Self {
+				client,
+				lease,
+				expect,
+				writes,
+				reply,
+				retained,
+			}
+		}
+
+		fn apply(
+			&self,
+		) -> Result<snip_core::restore::RestoreExecutionResult, RemoteError> {
+			self.client.apply_prepared_import(
+				&self.lease,
+				"/workspace",
+				"",
+				"source",
+				&PasteMapping::default(),
+				&Default::default(),
+				&self.expect,
+			)
+		}
+
+		fn start(
+			&self,
+		) -> std::thread::JoinHandle<
+			Result<snip_core::restore::RestoreExecutionResult, RemoteError>,
+		> {
+			let client = self.client.clone();
+			let lease = self.lease.clone();
+			let expect = self.expect.clone();
+			std::thread::spawn(move || {
+				client.apply_prepared_import(
+					&lease,
+					"/workspace",
+					"",
+					"source",
+					&PasteMapping::default(),
+					&Default::default(),
+					&expect,
+				)
+			})
+		}
+
+		fn answer(&self, response: Option<Response>) {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			loop {
+				let bytes = self.writes.lock().unwrap();
+				let complete = bytes.len() >= 4
+					&& bytes.len()
+						>= 4 + u32::from_be_bytes(
+							bytes[..4].try_into().unwrap(),
+						) as usize;
+				drop(bytes);
+				if complete {
+					break;
+				}
+				assert!(Instant::now() < end, "prepared request never sent");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			self.retained.fetch_add(1, Ordering::SeqCst);
+			self.reply.send(Ok(response)).unwrap();
+		}
+	}
+
+	fn join_prepared(
+		thread: std::thread::JoinHandle<
+			Result<snip_core::restore::RestoreExecutionResult, RemoteError>,
+		>,
+	) -> Result<snip_core::restore::RestoreExecutionResult, RemoteError> {
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while !thread.is_finished() {
+			assert!(Instant::now() < end, "prepared apply did not finish");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		thread.join().unwrap()
+	}
+
+	#[test]
+	fn prepared_lease_checks_binding_and_clones_share_one_use() {
+		let fixture = PreparedFixture::new();
+		let other = Client::new(fixture.client.host.clone(), "other".into());
+		for (client, workspace, dest, text, mapping) in [
+			(&other, "/workspace", "", "source", PasteMapping::default()),
+			(
+				fixture.client.as_ref(),
+				"/other",
+				"",
+				"source",
+				PasteMapping::default(),
+			),
+			(
+				fixture.client.as_ref(),
+				"/workspace",
+				"other",
+				"source",
+				PasteMapping::default(),
+			),
+			(
+				fixture.client.as_ref(),
+				"/workspace",
+				"",
+				"changed",
+				PasteMapping::default(),
+			),
+			(
+				fixture.client.as_ref(),
+				"/workspace",
+				"",
+				"source",
+				PasteMapping {
+					adjust_paths: true,
+					..Default::default()
+				},
+			),
+		] {
+			assert!(matches!(
+				client.apply_prepared_import(
+					&fixture.lease,
+					workspace,
+					dest,
+					text,
+					&mapping,
+					&Default::default(),
+					&fixture.expect
+				),
+				Err(RemoteError::Refused {
+					code: ErrorCode::Stale,
+					..
+				})
+			));
+		}
+		assert!(fixture.writes.lock().unwrap().is_empty());
+		assert_eq!(fixture.client.prepared_imports_for_tests(), 1);
+		let first = fixture.start();
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while fixture.writes.lock().unwrap().is_empty() {
+			assert!(Instant::now() < end, "first clone did not start");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert!(matches!(
+			fixture.apply(),
+			Err(RemoteError::Refused {
+				code: ErrorCode::Busy,
+				..
+			})
+		));
+		fixture.answer(Some(Response::Imported(Default::default())));
+		join_prepared(first).unwrap();
+		let before = fixture.writes.lock().unwrap().len();
+		assert!(matches!(
+			fixture.apply(),
+			Err(RemoteError::Refused {
+				code: ErrorCode::Stale,
+				..
+			})
+		));
+		assert_eq!(fixture.writes.lock().unwrap().len(), before);
+		let bytes = fixture.writes.lock().unwrap();
+		let mut reader = bytes.as_slice();
+		assert!(matches!(
+			read_frame::<Request>(&mut reader).unwrap(),
+			Some(Request::ApplyPrepared { .. })
+		));
+		assert!(reader.is_empty(), "exactly one write request");
+		assert_eq!(fixture.client.prepared_imports_for_tests(), 0);
+	}
+
+	#[test]
+	fn prepared_unknown_and_known_refusal_are_one_use_without_resend() {
+		for response in [
+			None,
+			Some(Response::Error {
+				code: ErrorCode::Stale,
+				message: "expired; preview again".into(),
+			}),
+		] {
+			let unknown = response.is_none();
+			let fixture = PreparedFixture::new();
+			let first = fixture.start();
+			fixture.answer(response);
+			let error = join_prepared(first).unwrap_err();
+			assert_eq!(error.outcome_unknown(), unknown, "{error:?}");
+			let before = fixture.writes.lock().unwrap().len();
+			let error = fixture.apply().unwrap_err();
+			assert_eq!(error.outcome_unknown(), unknown, "{error:?}");
+			assert_eq!(
+				fixture.writes.lock().unwrap().len(),
+				before,
+				"no token resend or legacy fallback"
+			);
+			assert_eq!(fixture.client.prepared_imports_for_tests(), 0);
+		}
+	}
+
+	#[test]
+	fn prepared_cap_and_last_clone_drop_release_slots() {
+		let fixture = PreparedFixture::new();
+		let extra = fixture.client.prepared_imports.reserve().unwrap();
+		assert!(fixture.client.prepared_imports.reserve().is_none());
+		drop(extra);
+		assert_eq!(fixture.client.prepared_imports_for_tests(), 1);
+		let client = fixture.client.clone();
+		let last = fixture.lease.clone();
+		drop(fixture);
+		assert_eq!(
+			client.prepared_imports_for_tests(),
+			1,
+			"another plan clone keeps its lease"
+		);
+		drop(last);
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while client.prepared_imports_for_tests() != 0 {
+			assert!(
+				Instant::now() < end,
+				"last clone did not release its lease"
+			);
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let canceled = CancelToken::new();
+		canceled.cancel();
+		assert!(matches!(
+			client.prepare_import(
+				"/workspace",
+				"",
+				"source",
+				&PasteMapping::default(),
+				Some(&canceled)
+			),
+			Err(RemoteError::Cancelled)
+		));
+		assert_eq!(client.prepared_imports_for_tests(), 0);
+	}
 
 	#[test]
 	fn same_host_clients_bound_real_handshakes() {
@@ -3259,6 +3994,26 @@ mod tests {
 					mapping: PasteMapping::default(),
 				},
 				true, // its freshness snapshot reads HEAD and the index
+			),
+			(
+				Request::PrepareImport {
+					workspace: "w".into(),
+					dest: String::new(),
+					text: String::new(),
+					mapping: PasteMapping::default(),
+					retain: true,
+				},
+				true,
+			),
+			(
+				Request::ApplyPrepared {
+					workspace: "w".into(),
+					dest: String::new(),
+					token: "token".into(),
+					selection: Default::default(),
+					expect: expect.clone(),
+				},
+				true,
 			),
 			(
 				Request::ImportApply {

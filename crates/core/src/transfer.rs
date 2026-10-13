@@ -880,6 +880,21 @@ pub struct TransferImportPlan {
 }
 
 impl TransferImportPlan {
+	/// Reconstitutes a worker's preview without reading its paths on this
+	/// machine. The transport verifies its restore-plan digest before showing
+	/// it; Apply still revalidates freshness (and a worker re-plans entirely).
+	pub fn from_parts(
+		roots: Vec<PathBuf>,
+		restore_plan: RestorePlan,
+		destination_freshness: DestinationFreshnessSnapshot,
+	) -> Self {
+		Self {
+			roots,
+			restore_plan,
+			destination_freshness,
+		}
+	}
+
 	/// Owned buffer capacities, excluding this inline struct and allocator
 	/// bookkeeping. The private snapshot is captured into fresh insertion-only
 	/// maps and is never mutated, as required by its table-size estimate.
@@ -2889,6 +2904,24 @@ pub fn plan_import_with(
 	opts: &RunOptions,
 ) -> Result<TransferImportPlan, TransferError> {
 	cancelled_err(opts, "plan-import")?;
+	let entries = format::parse_clipboard(clipboard_text, header_format);
+	cancelled_err(opts, "plan-import")?;
+	plan_import_parsed_with(entries, destination_roots, mapping, opts)
+		.map(|(plan, _)| plan)
+}
+
+/// The same import engine, consuming entries already parsed with
+/// [`format::parse_clipboard`]. Returned ordinals align with create_operations
+/// and name each create's original parsed entry, before path routing or skips.
+/// Consuming entries lets the worker reuse its parse without retaining a
+/// second body table while it serializes a compact preview.
+pub fn plan_import_parsed_with(
+	entries: Vec<ParsedEntry>,
+	destination_roots: &[PathBuf],
+	mapping: &ImportMapping,
+	opts: &RunOptions,
+) -> Result<(TransferImportPlan, Vec<usize>), TransferError> {
+	cancelled_err(opts, "plan-import")?;
 	let mut canonical_dest_roots = Vec::new();
 	for r in destination_roots {
 		cancelled_err(opts, "plan-import")?;
@@ -2934,15 +2967,15 @@ pub fn plan_import_with(
 	let primary_dest_path =
 		mapping.primary_destination.as_ref().map(|id| id.path());
 
-	cancelled_err(opts, "plan-import")?;
-	let entries = format::parse_clipboard(clipboard_text, header_format);
-	cancelled_err(opts, "plan-import")?;
-
-	let mut planned_entries: Vec<(CanonicalRootId, ParsedEntry, String)> =
-		Vec::new();
+	let mut planned_entries: Vec<(
+		CanonicalRootId,
+		ParsedEntry,
+		String,
+		usize,
+	)> = Vec::new();
 	let mut skipped_operations = Vec::new();
 
-	for entry in entries {
+	for (entry_index, entry) in entries.into_iter().enumerate() {
 		cancelled_err(opts, "plan-import")?;
 		let (target_root, rel_path) = if let Some(em) =
 			mapping.entry_destinations.get(&entry.path)
@@ -3103,26 +3136,32 @@ pub fn plan_import_with(
 				change_types: entry.change_types,
 			},
 			entry.path,
+			entry_index,
 		));
 	}
 
 	let mut combined_creates = Vec::new();
+	let mut create_entry_indices = Vec::new();
 	let mut combined_deletes = Vec::new();
 	let mut all_skipped = skipped_operations;
 
 	// Same `plan_restore` as before, one entry at a time so a cancel is
 	// observed before the next file's encoding read.
-	for (root_id, entry, raw_path) in &planned_entries {
+	for (root_id, entry, raw_path, entry_index) in planned_entries {
 		cancelled_err(opts, "plan-import")?;
 		let sub_plan = restore::plan_restore(
 			&[root_id.path()],
-			std::slice::from_ref(entry),
+			std::slice::from_ref(&entry),
 		);
+		create_entry_indices.extend(std::iter::repeat_n(
+			entry_index,
+			sub_plan.create_operations.len(),
+		));
 		combined_creates.extend(sub_plan.create_operations);
 		combined_deletes.extend(sub_plan.delete_operations);
 		all_skipped.extend(sub_plan.skipped_operations.into_iter().map(
 			|mut op| {
-				op.raw_path.clone_from(raw_path);
+				op.raw_path.clone_from(&raw_path);
 				op
 			},
 		));
@@ -3195,11 +3234,14 @@ pub fn plan_import_with(
 		opts,
 	)?;
 
-	Ok(TransferImportPlan {
-		roots: destination_roots.to_vec(),
-		restore_plan,
-		destination_freshness,
-	})
+	Ok((
+		TransferImportPlan {
+			roots: destination_roots.to_vec(),
+			restore_plan,
+			destination_freshness,
+		},
+		create_entry_indices,
+	))
 }
 
 /// Validates that a commit selection stays strictly within one repository.
@@ -4977,5 +5019,125 @@ mod wire_tests {
 			serde_json::from_str(&serde_json::to_string(&sel).unwrap())
 				.unwrap();
 		assert_eq!(back, sel);
+	}
+}
+
+#[cfg(test)]
+mod parsed_import_tests {
+	use super::*;
+
+	#[test]
+	fn parsed_import_indices_follow_entries_through_routing_skips_and_deletes()
+	{
+		let temp = tempfile::tempdir().unwrap();
+		let base = dunce::canonicalize(temp.path()).unwrap();
+		let a = base.join("one");
+		let b = base.join("two");
+		fs::create_dir(&a).unwrap();
+		fs::create_dir(&b).unwrap();
+		fs::write(a.join("gone.txt"), "delete me").unwrap();
+		fs::write(a.join("binary.txt"), [0xff]).unwrap();
+		let mut mapping =
+			ImportMapping::with_primary(CanonicalRootId::new(&a).unwrap());
+		mapping.map_prefix("moved", CanonicalRootId::new(&b).unwrap());
+		mapping.map_entry(
+			"explicit.txt",
+			CanonicalRootId::new(&a).unwrap(),
+			Some("renamed.txt".into()),
+		);
+		mapping.block_prefix("blocked");
+		let text = format!("// FILE: .git/config\nunsafe\n// FILE: same.txt\nsame\n// FILE: [DELETED] gone.txt\n{}\n// FILE: moved/same2.txt\nsame\n// FILE: binary.txt\ntext\n// FILE: {}\nabsolute\n// FILE: blocked/no.txt\nblocked\n// FILE: explicit.txt\nexplicit\n// FILE: placeholder.txt\n// File skipped: size exceeds limit (1000 bytes)\n// FILE: tail.txt\ntail\n", DELETED_FILE_MARKER, b.join("absolute.txt").display());
+		let entries = format::parse_clipboard(&text, "");
+		assert_eq!(entries.len(), 10);
+		let roots = [a.clone(), b.clone()];
+		let (parsed, indices) = plan_import_parsed_with(
+			entries.clone(),
+			&roots,
+			&mapping,
+			&RunOptions::default(),
+		)
+		.unwrap();
+		assert_eq!(indices, [1, 3, 5, 7, 9]);
+		assert_eq!(parsed.delete_operations().len(), 1);
+		assert_eq!(parsed.skipped_operations().len(), 4);
+		assert_eq!(
+			parsed
+				.create_operations()
+				.iter()
+				.map(|op| op.absolute_path.clone())
+				.collect::<Vec<_>>(),
+			[
+				a.join("same.txt"),
+				b.join("same2.txt"),
+				b.join("absolute.txt"),
+				a.join("renamed.txt"),
+				a.join("tail.txt")
+			]
+		);
+		for (op, index) in parsed.create_operations().iter().zip(&indices) {
+			assert_eq!(op.content, entries[*index].content);
+		}
+		assert_eq!(
+			parsed,
+			plan_import_with(
+				&text,
+				"",
+				&roots,
+				&mapping,
+				&RunOptions::default()
+			)
+			.unwrap()
+		);
+		let reordered: Vec<_> = [9, 0, 5, 1, 8, 2, 3, 7, 4, 6]
+			.into_iter()
+			.map(|i| entries[i].clone())
+			.collect();
+		let (plan, indices) = plan_import_parsed_with(
+			reordered.clone(),
+			&roots,
+			&mapping,
+			&RunOptions::default(),
+		)
+		.unwrap();
+		assert_eq!(indices, [0, 2, 3, 6, 7]);
+		for (op, index) in plan.create_operations().iter().zip(indices) {
+			assert_eq!(op.content, reordered[index].content);
+		}
+		assert!(!a.join("same.txt").exists());
+		assert_eq!(fs::read(a.join("gone.txt")).unwrap(), b"delete me");
+	}
+
+	#[test]
+	fn parsed_import_keeps_cancellation_and_explicit_root_validation() {
+		let temp = tempfile::tempdir().unwrap();
+		let root = dunce::canonicalize(temp.path()).unwrap();
+		let entries = format::parse_clipboard("// FILE: a\nbody\n", "");
+		let mapping =
+			ImportMapping::with_primary(CanonicalRootId::new(&root).unwrap());
+		let token = CancelToken::new();
+		token.cancel();
+		let options = RunOptions {
+			cancel: Some(token),
+			..RunOptions::default()
+		};
+		assert!(matches!(
+			plan_import_parsed_with(
+				entries.clone(),
+				std::slice::from_ref(&root),
+				&mapping,
+				&options
+			),
+			Err(TransferError::Git(GitError::Cancelled { .. }))
+		));
+		assert!(matches!(
+			plan_import_parsed_with(
+				entries,
+				&[],
+				&mapping,
+				&RunOptions::default()
+			),
+			Err(TransferError::UnknownRoot(_))
+		));
+		assert!(!root.join("a").exists());
 	}
 }
