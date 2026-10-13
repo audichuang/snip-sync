@@ -810,7 +810,9 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 	let stdin: ChildStdin = child.stdin.take().expect("piped stdin");
 	let stdout = child.stdout.take().expect("piped stdout");
 	let stderr_pipe = child.stderr.take().expect("piped stderr");
-	let stderr = Arc::new(Mutex::new(Vec::new()));
+	// Preallocated to its ceiling: the reader never writes past MAX_STDERR,
+	// so the capacity (and any charge for it) never changes.
+	let stderr = Arc::new(Mutex::new(Vec::with_capacity(MAX_STDERR)));
 	let keep = stderr.clone();
 	std::thread::Builder::new()
 		.name("snip-remote-stderr".into())
@@ -1267,7 +1269,25 @@ pub(crate) struct PreparedImportLease {
 	text_hash: [u8; 32],
 	mapping: PasteMapping,
 	digest: String,
+	/// The connection's owned buffers, charged while the lease holds it
+	/// (Ready and Applying). Fixed when the lease is made, so no transition
+	/// between those states can raise an admitted charge.
+	connection_bytes: usize,
 	state: Mutex<PreparedImportState>,
+}
+
+/// Upper bound of what a lease owns through its connection: the boxed
+/// `PreparedConnection`, its strings, and the stderr buffer at its
+/// preallocated ceiling. Read once, when the lease is made.
+fn connection_footprint(
+	connection: &Connection,
+	token_capacity: usize,
+) -> usize {
+	std::mem::size_of::<PreparedConnection>()
+		.saturating_add(token_capacity)
+		.saturating_add(connection.worker_name.capacity())
+		.saturating_add(connection.home.as_ref().map_or(0, String::capacity))
+		.saturating_add(MAX_STDERR)
 }
 
 impl std::fmt::Debug for PreparedImportLease {
@@ -1299,26 +1319,100 @@ impl PreparedImportLease {
 				.saturating_add(prefix.capacity())
 				.saturating_add(folder.capacity());
 		}
-		if let PreparedImportState::Ready(ready) =
-			&*self.state.lock().unwrap_or_else(PoisonError::into_inner)
-		{
-			bytes = bytes
-				.saturating_add(std::mem::size_of::<PreparedConnection>())
-				.saturating_add(ready.token.capacity())
-				.saturating_add(ready.connection.worker_name.capacity())
-				.saturating_add(
-					ready.connection.home.as_ref().map_or(0, String::capacity),
-				)
-				.saturating_add(
-					ready
-						.connection
-						.stderr
-						.lock()
-						.unwrap_or_else(PoisonError::into_inner)
-						.capacity(),
-				);
+		// Ready and Applying hold the same charge: an Apply that is refused
+		// before any write restores Ready, and must not grow an admitted state.
+		let holds_connection = matches!(
+			&*self.state.lock().unwrap_or_else(PoisonError::into_inner),
+			PreparedImportState::Ready(_) | PreparedImportState::Applying
+		);
+		if holds_connection {
+			bytes = bytes.saturating_add(self.connection_bytes);
 		}
 		bytes
+	}
+}
+
+impl PreparedImportLease {
+	/// Ready → Applying. The one connection the lease reserved goes to this
+	/// Apply; any other state refuses without touching the connection.
+	fn begin_apply(&self) -> Result<Box<PreparedConnection>, RemoteError> {
+		let mut state =
+			self.state.lock().unwrap_or_else(PoisonError::into_inner);
+		match &*state {
+			PreparedImportState::Ready(_) => {}
+			PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into() }),
+			PreparedImportState::Used => return Err(prepared_stale("the prepared paste has already been used; preview again")),
+			PreparedImportState::OutcomeUnknown => return Err(RemoteError::Protocol("the previous prepared paste has an unknown outcome; inspect the destination before pasting again".into())),
+		}
+		let PreparedImportState::Ready(ready) =
+			std::mem::replace(&mut *state, PreparedImportState::Applying)
+		else {
+			unreachable!()
+		};
+		Ok(ready)
+	}
+
+	/// Applying → Ready after a refusal from before the worker's first write
+	/// (Busy, Timeout) on a clean connection, so the same preview can apply
+	/// again. Otherwise Used, or OutcomeUnknown when the outcome is unknown;
+	/// a clean connection goes back through `keep`, never an unknown one.
+	fn finish_apply<R>(
+		&self,
+		connection: Connection,
+		token: String,
+		permit: PreparedImportPermit,
+		result: &Result<R, RemoteError>,
+		keep: impl FnOnce(Connection),
+	) {
+		let unknown = result.as_ref().is_err_and(RemoteError::outcome_unknown);
+		let clean = !unknown && connection.unsolicited_frames() == 0;
+		let retry = clean
+			&& !connection.broken
+			&& matches!(
+				result,
+				Err(RemoteError::Refused { code, .. })
+					if crate::prepared::refused_before_write(*code)
+			);
+		let next = if retry {
+			PreparedImportState::Ready(Box::new(PreparedConnection {
+				connection,
+				token,
+				_permit: permit,
+			}))
+		} else {
+			// An out-of-step or unknown outcome is never returned to the pool.
+			if clean {
+				keep(connection);
+			}
+			if unknown {
+				PreparedImportState::OutcomeUnknown
+			} else {
+				PreparedImportState::Used
+			}
+		};
+		*self.state.lock().unwrap_or_else(PoisonError::into_inner) = next;
+	}
+
+	/// Runs one Apply's state changes with `refusal` as the worker's answer.
+	/// `during` runs while the lease is Applying, before the answer.
+	#[doc(hidden)]
+	pub fn refuse_apply_for_tests(
+		&self,
+		refusal: RemoteError,
+		during: impl FnOnce(),
+	) -> Result<(), RemoteError> {
+		let ready = self.begin_apply()?;
+		let PreparedConnection {
+			connection,
+			token,
+			_permit,
+		} = *ready;
+		during();
+		let result: Result<(), RemoteError> = Err(refusal);
+		self.finish_apply(connection, token, _permit, &result, |connection| {
+			drop(connection)
+		});
+		result
 	}
 }
 
@@ -1712,6 +1806,10 @@ impl Client {
 					text_hash: Sha256::digest(text.as_bytes()).into(),
 					mapping: mapping.clone(),
 					digest: planned.digest.clone(),
+					connection_bytes: connection_footprint(
+						&connection,
+						token.capacity(),
+					),
 					state: Mutex::new(PreparedImportState::Ready(Box::new(
 						PreparedConnection {
 							connection,
@@ -1762,22 +1860,7 @@ impl Client {
 		}
 		let start = Instant::now();
 		let _guard = self.limiter.acquire(None, APPLY_CALL_LIMIT)?;
-		let ready = {
-			let mut state =
-				lease.state.lock().unwrap_or_else(PoisonError::into_inner);
-			match &*state {
-				PreparedImportState::Ready(_) => {}
-				PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into() }),
-				PreparedImportState::Used => return Err(prepared_stale("the prepared paste has already been used; preview again")),
-				PreparedImportState::OutcomeUnknown => return Err(RemoteError::Protocol("the previous prepared paste has an unknown outcome; inspect the destination before pasting again".into())),
-			}
-			let PreparedImportState::Ready(ready) =
-				std::mem::replace(&mut *state, PreparedImportState::Applying)
-			else {
-				unreachable!()
-			};
-			ready
-		};
+		let ready = lease.begin_apply()?;
 		let PreparedConnection {
 			mut connection,
 			token,
@@ -1830,33 +1913,9 @@ impl Client {
 				other => other,
 			}
 		};
-		let unknown = result.as_ref().is_err_and(RemoteError::outcome_unknown);
-		let clean = !unknown && connection.unsolicited_frames() == 0;
-		let retry = clean
-			&& !connection.broken
-			&& matches!(
-				&result,
-				Err(RemoteError::Refused { code, .. })
-					if crate::prepared::refused_before_write(*code)
-			);
-		let next = if retry {
-			PreparedImportState::Ready(Box::new(PreparedConnection {
-				connection,
-				token,
-				_permit,
-			}))
-		} else {
-			// An out-of-step or unknown outcome is never returned to the pool.
-			if clean {
-				self.keep(connection);
-			}
-			if unknown {
-				PreparedImportState::OutcomeUnknown
-			} else {
-				PreparedImportState::Used
-			}
-		};
-		*lease.state.lock().unwrap_or_else(PoisonError::into_inner) = next;
+		lease.finish_apply(connection, token, _permit, &result, |connection| {
+			self.keep(connection)
+		});
 		result
 	}
 
@@ -2493,6 +2552,9 @@ mod tests {
 					target_files: Default::default(),
 				},
 			};
+			let token: String = "opaque-token".into();
+			let connection_bytes =
+				connection_footprint(&connection, token.capacity());
 			let lease = Arc::new(PreparedImportLease {
 				owner: client.prepared_imports.clone(),
 				workspace: "/workspace".into(),
@@ -2500,10 +2562,11 @@ mod tests {
 				text_hash: Sha256::digest(b"source").into(),
 				mapping: PasteMapping::default(),
 				digest: expect.digest.clone(),
+				connection_bytes,
 				state: Mutex::new(PreparedImportState::Ready(Box::new(
 					PreparedConnection {
 						connection,
-						token: "opaque-token".into(),
+						token,
 						_permit: permit,
 					},
 				))),
@@ -2702,6 +2765,47 @@ mod tests {
 			);
 			assert_eq!(fixture.client.prepared_imports_for_tests(), 0);
 		}
+	}
+
+	#[test]
+	fn restoring_ready_after_a_refused_apply_never_grows_the_charge() {
+		let fixture = PreparedFixture::new();
+		let ready = fixture.lease.retained_heap_bytes();
+		let wait_for_request = |before: usize| {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while fixture.writes.lock().unwrap().len() == before {
+				assert!(Instant::now() < end, "apply request was never sent");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+		};
+		let first = fixture.start();
+		wait_for_request(0);
+		let applying = fixture.lease.retained_heap_bytes();
+		fixture.answer(Some(Response::Error {
+			code: ErrorCode::Busy,
+			message: "busy".into(),
+		}));
+		assert!(matches!(
+			join_prepared(first),
+			Err(RemoteError::Refused {
+				code: ErrorCode::Busy,
+				..
+			})
+		));
+		let restored = fixture.lease.retained_heap_bytes();
+		assert_eq!(applying, ready, "Applying keeps the connection charged");
+		assert!(
+			restored <= ready,
+			"Ready never costs more than before: {restored} > {ready}"
+		);
+
+		// The Busy refusal left the lease Ready: the same preview applies again.
+		let before = fixture.writes.lock().unwrap().len();
+		let second = fixture.start();
+		wait_for_request(before);
+		fixture.answer(Some(Response::Imported(Default::default())));
+		join_prepared(second).unwrap();
+		assert!(fixture.lease.retained_heap_bytes() <= ready);
 	}
 
 	#[test]

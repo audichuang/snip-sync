@@ -764,6 +764,100 @@ mod tests {
 		);
 	}
 
+	/// A remote paste whose in-process worker kept its payload, so the
+	/// preview holds a live prepared lease.
+	fn landed_remote(
+		text: &str,
+		ws: &Path,
+		ordinary: Option<&Preview>,
+	) -> PastePreview {
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: ws.display().to_string(),
+					name: "w".into(),
+					path: ws.display().to_string(),
+				},
+			),
+		};
+		let dest = remote.session.root.clone();
+		let mut s = PastePreview::new(None);
+		s.enqueue(PasteRequest::Clipboard {
+			text: text.into(),
+			dest,
+			roots: Vec::new(),
+			generation: 1,
+			remote: Some(remote),
+		})
+		.unwrap();
+		let (work, cancel) = s.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		s.bind_job(1, cancel);
+		assert!(matches!(
+			s.poll(false, ordinary),
+			Polled::Settled {
+				landed: Some(Landed::Shown { .. }),
+				..
+			}
+		));
+		s
+	}
+
+	/// Row navigation while a remote Apply is pending, then a Busy refusal
+	/// that restores the lease to Ready, must not panic: the Applying state
+	/// may not free charge the restored connection takes back.
+	#[test]
+	fn navigation_during_a_refused_remote_apply_is_admitted_once() {
+		use snip_remote::{ErrorCode, RemoteError};
+		let ws = tempfile::tempdir().unwrap();
+		// Row 1 is a few hundred bytes larger than row 0: far below the
+		// connection's charge, far above the zero slack left at the limit.
+		let payload = format!(
+			"// FILE: small.txt\nx\n// FILE: large.txt\n{}\n",
+			"z\n".repeat(20)
+		);
+		let mut o = small_ordinary();
+		let mut s = landed_remote(&payload, ws.path(), Some(&o));
+		let file = s
+			.plan()
+			.unwrap()
+			.import_plan
+			.clone()
+			.expect("a remote file plan");
+		assert!(file.uses_prepared_import(), "the worker kept the payload");
+		// Near the limit with the lease Ready: no slack beyond this state.
+		fill_budget(&s, &mut o);
+		let worker = s.begin_apply().expect("begin_apply succeeds");
+		let mut nav = None;
+		let refusal = file.refuse_prepared_apply_for_tests(
+			RemoteError::Refused {
+				code: ErrorCode::Busy,
+				message: "the worker is busy".into(),
+			},
+			|| nav = Some(s.select(1, Some(&o))),
+		);
+		assert!(matches!(
+			refusal,
+			Err(RemoteError::Refused {
+				code: ErrorCode::Busy,
+				..
+			})
+		));
+		drop(worker);
+		s.apply_failed(Msg::new("paste_err_destination", []), Some(&o));
+		assert!(!s.is_applying());
+		assert!(
+			matches!(nav, Some(Nav::Refused(ref e)) if e.key == "preview_memory_limit"),
+			"navigation during Apply spent charge the lease holds"
+		);
+		assert_eq!(
+			s.plan().unwrap().error.as_ref().map(|e| e.key),
+			Some("paste_err_destination")
+		);
+	}
+
 	#[test]
 	fn refused_fold_reselect_keeps_the_hidden_row_with_its_detail() {
 		use snip_core::commits::{
