@@ -1377,6 +1377,26 @@ impl Client {
 			_ => Err(unexpected()),
 		}
 	}
+
+	/// Reads a bounded, typed original destination for the shared commit
+	/// preview engine. No source payload or replay plan crosses the wire.
+	pub fn read_replay_preview(
+		&self,
+		workspace: &str,
+		path: &std::path::Path,
+		limit: usize,
+		cancel: Option<&CancelToken>,
+	) -> Result<snip_core::transfer::ReplayPreviewRead, RemoteError> {
+		let request = Request::ReplayRead {
+			workspace: workspace.into(),
+			path: path.into(),
+			limit,
+		};
+		match self.call_with(&request, cancel, GIT_CALL_LIMIT)? {
+			Response::ReplayRead(read) => Ok(read),
+			_ => Err(unexpected()),
+		}
+	}
 }
 
 fn unexpected() -> RemoteError {
@@ -1392,16 +1412,20 @@ fn too_old_error(conn: &Connection, need: u32) -> RemoteError {
 	}
 }
 
-/// Requests whose worker side runs git: bounded by
+/// Requests sharing worker job admission, including Git and paste previews:
+/// bounded by
 /// [`MAX_GIT_CALLS_IN_FLIGHT`] per client, so one master cannot stack more
 /// git work on a worker than the worker can serve. That includes the
 /// pastes into a repository: their freshness snapshot and re-check read
 /// HEAD and the index with git (`capture_repo_freshness`). Listing,
-/// reading and stating are plain fs work.
+/// ordinary reading and stating are plain fs work. Typed replay reads use
+/// paste-job admission so their bounded reads and cancellation have the
+/// same lifecycle as the other paste preview operations.
 pub(crate) fn runs_git(request: &Request) -> bool {
 	matches!(
 		request,
 		Request::ScanRepos { .. }
+			| Request::ReplayRead { .. }
 			| Request::GitView { .. }
 			| Request::Export { .. }
 			| Request::ExportCommits { .. }
@@ -2730,6 +2754,14 @@ mod tests {
 					path: "p".into(),
 				},
 				false,
+			),
+			(
+				Request::ReplayRead {
+					workspace: "w".into(),
+					path: "p".into(),
+					limit: 1024,
+				},
+				true, // bounded by the same worker job admission as paste plans
 			),
 			(
 				Request::Write {

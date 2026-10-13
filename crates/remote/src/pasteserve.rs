@@ -291,6 +291,47 @@ fn payload(text: &str) -> Result<commits::CommitsPayload, Refusal> {
 		.map_err(|e| refused(ErrorCode::BadRequest, e.to_string()))
 }
 
+/// A selected preview's original destination. The shared reader preserves
+/// file kind (especially symlinks) instead of presenting their targets as
+/// the regular file that replay would replace.
+pub(crate) fn replay_read(
+	root: &SharedRoot,
+	path: &Path,
+	limit: usize,
+	cancel: &CancelToken,
+) -> Response {
+	let run = || -> Result<Response, Refusal> {
+		let rel = path
+			.strip_prefix(&root.path)
+			.ok()
+			.and_then(|p| p.to_str())
+			.map(|p| {
+				if cfg!(windows) {
+					p.replace('\\', "/")
+				} else {
+					p.to_string()
+				}
+			});
+		let Some(rel) = rel.filter(|p| valid_rel_path(p, false)) else {
+			return Err(refused(ErrorCode::BadRequest, "invalid preview path"));
+		};
+		// Validate the resolved boundary, but retain the lexical path for
+		// the reader's symlink_metadata check.
+		snip_core::browser::inside(&root.path, &rel)
+			.map_err(|e| Box::new(io_error(e)))?;
+		let read = snip_core::transfer::read_replay_preview_with(
+			path,
+			limit.min(snip_core::browser::PREVIEW_LIMIT),
+			&options(cancel),
+		)
+		.map_err(|e| transfer_refusal(e, cancel))?;
+		snip_core::browser::inside(&root.path, &rel)
+			.map_err(|e| Box::new(io_error(e)))?;
+		Ok(Response::ReplayRead(read))
+	};
+	run().unwrap_or_else(|resp| *resp)
+}
+
 /// Answers [`crate::proto::Request::ReplayPlan`].
 pub(crate) fn replay_plan(
 	root: &SharedRoot,

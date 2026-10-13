@@ -118,6 +118,61 @@ fn commit(dir: &Path, message: &str, date: &str) {
 }
 
 #[test]
+fn protected_only_file_paste_reports_the_path_reason_and_no_changes() {
+	let tmp = tempfile::tempdir().unwrap();
+	init_repo(tmp.path());
+	let payload = b"// File: .git/hooks/snip-test-blocked\nblocked\n";
+	let root = tmp.path().to_str().unwrap();
+	let dry = snip(
+		&["--repo", root, "paste", "--dry-run", "--stdin"],
+		Some(payload),
+	);
+	assert_eq!(code(&dry), 0, "{}", text(&dry.stderr));
+	assert_eq!(text(&dry.stdout).trim(), "skip\t.git/hooks/snip-test-blocked\tUNRESOLVED_PATH\tprotected Git metadata");
+	assert!(text(&dry.stderr).contains("No actionable files found. Skipped 1."));
+	let applied = snip(
+		&["--repo", root, "paste", "--apply", "--stdin"],
+		Some(payload),
+	);
+	assert_eq!(code(&applied), 0, "{}", text(&applied.stderr));
+	assert!(
+		text(&applied.stderr).contains("No actionable files found. Skipped 1.")
+	);
+	assert!(!tmp.path().join(".git/hooks/snip-test-blocked").exists());
+}
+
+#[test]
+fn file_paste_counts_planned_and_existing_skips_once() {
+	let tmp = tempfile::tempdir().unwrap();
+	let dst = tmp.path();
+	init_repo(dst);
+	fs::write(dst.join("existing.txt"), "keep destination").unwrap();
+	let payload = b"// File: .git/hooks/snip-test-blocked\nblocked\n\n// File: created.txt\ncreated\n\n// File: existing.txt\nincoming\n";
+	let out = snip(
+		&[
+			"--repo",
+			dst.to_str().unwrap(),
+			"paste",
+			"--apply",
+			"--skip-existing",
+			"--stdin",
+		],
+		Some(payload),
+	);
+	assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+	assert_eq!(text(&out.stdout).trim(), "Created 1, Skipped 2");
+	assert_eq!(
+		fs::read_to_string(dst.join("created.txt")).unwrap(),
+		"created"
+	);
+	assert_eq!(
+		fs::read_to_string(dst.join("existing.txt")).unwrap(),
+		"keep destination"
+	);
+	assert!(!dst.join(".git/hooks/snip-test-blocked").exists());
+}
+
+#[test]
 fn file_mode_round_trip() {
 	let tmp = tempfile::tempdir().unwrap();
 	let src = tmp.path().join("src");

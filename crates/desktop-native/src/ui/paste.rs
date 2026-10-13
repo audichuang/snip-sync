@@ -431,6 +431,7 @@ impl WorkbenchModel {
 			let inc_id = RowControl::Include.id(ix, &path);
 			let ow_id = RowControl::Overwrite.id(ix, &path);
 			let can_overwrite = item.overwritable();
+			let planned_skip = item.planned_skip();
 			let by_commit = item.commit.is_some();
 			let ow_on = item.overwrite_allowed;
 			// A commit's rows are in replay order, so they keep the full path.
@@ -443,7 +444,11 @@ impl WorkbenchModel {
 				.cursor_pointer()
 				.when(is_sel, |d| d.bg(rgb(pal().selection_bg)))
 				.when(!is_sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-				.tooltip(tip(format!("{path}\n→ {}", item.dest_path.display())))
+				.tooltip(tip(if planned_skip {
+					format!("{path}\n{}", t(paste_op(item).2, loc))
+				} else {
+					format!("{path}\n→ {}", item.dest_path.display())
+				}))
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.select_paste_item(ix, cx)
 				}))
@@ -463,10 +468,13 @@ impl WorkbenchModel {
 						})
 						// Still routed to the model while applying so the refusal
 						// is explicit (it logs and explains).
-						.on_click(cx.listener(move |this, _, _, cx| {
-							cx.stop_propagation();
-							this.toggle_paste_selected(ix, cx);
-						}))
+						.when(!planned_skip, |d| {
+							d.on_click(cx.listener(move |this, _, _, cx| {
+								cx.stop_propagation();
+								this.toggle_paste_selected(ix, cx);
+							}))
+						})
+						.when(planned_skip, |d| d.opacity(0.4))
 						.child(checkbox(item.selected))
 						.children(probe(log, inc_id)),
 				)
@@ -482,6 +490,19 @@ impl WorkbenchModel {
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
 				}))
+				.when(planned_skip, |d| {
+					let id = format!("paste-skip-reason:{ix}:{path}");
+					d.child(
+						div()
+							.id(SharedString::from(id.clone()))
+							.debug_selector(|| id.clone())
+							.relative()
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().text_muted))
+							.child(t(paste_op(item).2, loc))
+							.children(probe(log, id)),
+					)
+				})
 				.when(by_commit, |d| {
 					d.child(
 						div()
@@ -550,6 +571,9 @@ impl WorkbenchModel {
 		});
 
 		let (detail_title, reason) = match selected {
+			Some(it) if it.planned_skip() => {
+				(it.path.clone(), t(paste_op(it).2, loc))
+			}
 			Some(it) => (
 				format!("{} → {}", it.path, it.dest_path.display()),
 				t(paste_op(it).2, loc),
@@ -642,6 +666,7 @@ impl WorkbenchModel {
 									!applying,
 									70 + idx as isize,
 								)
+								.debug_selector(|| id.clone())
 								.tooltip(tip(full))
 								.when(!applying, |b| {
 									b.on_click(cx.listener(
@@ -824,6 +849,31 @@ impl WorkbenchModel {
 				)
 			})
 			.when_some(
+				selected.and_then(|i| i.commit).and_then(|c| {
+					plan.commit_preview.as_ref()?.plan().commits.get(c)
+				}),
+				|d, commit| {
+					let (subject, author, date) =
+						commit_header_labels(commit, loc);
+					let metadata = format!("{subject} · {author} · {date}");
+					d.child(
+						div()
+							.id("paste-commit-metadata")
+							.debug_selector(|| "paste-commit-metadata".into())
+							.relative()
+							.flex_shrink_0()
+							.min_w_0()
+							.px(px(12.))
+							.py(px(4.))
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().text_muted))
+							.tooltip(tip(metadata.clone()))
+							.child(clip_text(metadata))
+							.children(probe(log, "paste-commit-metadata")),
+					)
+				},
+			)
+			.when_some(
 				// `Preview::new` flags a cut with the bare word "truncated".
 				self.paste.detail().and_then(|p| p.notice.clone()).map(|n| {
 					if n == "truncated" {
@@ -865,9 +915,10 @@ impl WorkbenchModel {
 						.children(probe(log, "paste-delete-notice")),
 				)
 			})
-			.when(selected.is_some_and(|i| !i.is_delete()), |d| {
-				d.child(self.render_code_view(true, cx))
-			})
+			.when(
+				selected.is_some_and(|i| i.commit.is_some() || !i.is_delete()),
+				|d| d.child(self.render_code_view(true, cx)),
+			)
 			.into_any_element()
 	}
 }
