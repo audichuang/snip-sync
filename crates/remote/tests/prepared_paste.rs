@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use snip_core::gitrun::RunOptions;
+use snip_core::gitsrc::Git;
 use snip_core::restore::RestoreSelection;
+use snip_core::workspace::{lock_heavy, RepoIdentity};
 use snip_remote::{
 	Client, PasteError, PasteRoute, PasteTarget, RemoteHost, Transport, Worker,
 	WorkerOptions,
@@ -537,8 +539,68 @@ fn metadata_without_a_retained_token_uses_the_explicit_legacy_apply_path() {
 	);
 }
 
+/// Expires the worker's token for `plan`'s preview, as the 5 minute TTL does.
+fn expire_prepared_token(fixture: &Fixture) {
+	let events = fixture.after_replies("import_prepared", 1);
+	let pid = events
+		.iter()
+		.find(|e| e["logical_kind"] == "prepare_import")
+		.unwrap()["pid"]
+		.as_u64()
+		.unwrap();
+	fs::write(fixture.dir.path().join(format!("expire-{pid}")), "expire")
+		.unwrap();
+	wait("the worker advances its cache clock", || {
+		fixture.dir.path().join(format!("expired-{pid}")).exists()
+	});
+}
+
 #[test]
-fn expired_prepared_token_is_a_refusal_without_legacy_fallback() {
+fn expired_prepared_token_falls_back_once_when_the_destination_is_unchanged() {
+	let _serial = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+	let fixture = Fixture::new(None, false);
+	let workspace = tempfile::tempdir().unwrap();
+	let client = fixture.client();
+	let ws = client
+		.open_workspace(workspace.path().to_str().unwrap())
+		.unwrap();
+	let target = fixture.target(client, &ws.id, "");
+	let text = "// FILE: result.txt\nfallback applied\n";
+	let route = PasteRoute::default();
+	let plan = target
+		.plan_files(text, &route, &RunOptions::default(), None)
+		.unwrap();
+	expire_prepared_token(&fixture);
+	target
+		.apply_files(text, &route, &plan, &selection())
+		.expect(
+		"a token the worker dropped must not refuse an unchanged destination",
+	);
+	assert_eq!(
+		fs::read_to_string(workspace.path().join("result.txt")).unwrap(),
+		"fallback applied"
+	);
+	let events = fixture.after_replies("imported", 1);
+	assert_eq!(
+		events
+			.iter()
+			.filter(|e| e["logical_kind"] == "apply_prepared")
+			.count(),
+		1,
+		"the expired token is tried once"
+	);
+	assert_eq!(
+		events
+			.iter()
+			.filter(|e| e["logical_kind"] == "import_apply")
+			.count(),
+		1,
+		"the full text is sent once, on the same connection"
+	);
+}
+
+#[test]
+fn expired_prepared_token_with_a_changed_destination_refuses_as_stale() {
 	let _serial = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
 	let fixture = Fixture::new(None, false);
 	let workspace = tempfile::tempdir().unwrap();
@@ -552,36 +614,98 @@ fn expired_prepared_token_is_a_refusal_without_legacy_fallback() {
 	let plan = target
 		.plan_files(text, &route, &RunOptions::default(), None)
 		.unwrap();
-	let events = fixture.after_replies("import_prepared", 1);
-	let pid = events
-		.iter()
-		.find(|e| e["logical_kind"] == "prepare_import")
-		.unwrap()["pid"]
-		.as_u64()
-		.unwrap();
-	fs::write(fixture.dir.path().join(format!("expire-{pid}")), "expire")
-		.unwrap();
-	wait("the worker advances its cache clock", || {
-		fixture.dir.path().join(format!("expired-{pid}")).exists()
-	});
+	expire_prepared_token(&fixture);
+	fs::write(workspace.path().join("result.txt"), "edited outside").unwrap();
 	let error = target
+		.apply_files(text, &route, &plan, &selection())
+		.unwrap_err();
+	let PasteError::Remote(snip_remote::RemoteError::Refused {
+		code: snip_remote::ErrorCode::Stale,
+		message,
+	}) = &error
+	else {
+		panic!("expected a stale refusal, got {error:?}");
+	};
+	assert!(
+		!message.contains("expired") && !message.contains("preview again"),
+		"the reason must be the real destination change: {message}"
+	);
+	assert!(
+		!message.contains("prepared paste"),
+		"the worker's token wording must never reach the user: {message}"
+	);
+	assert_eq!(
+		fs::read_to_string(workspace.path().join("result.txt")).unwrap(),
+		"edited outside",
+		"a refused Apply writes nothing"
+	);
+}
+
+#[test]
+fn busy_refusal_before_the_write_lock_keeps_the_preview_retryable() {
+	let _serial = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+	let fixture = Fixture::new(None, false);
+	let workspace = tempfile::tempdir().unwrap();
+	let status = std::process::Command::new("git")
+		.arg("init")
+		.arg("-q")
+		.current_dir(workspace.path())
+		.status()
+		.unwrap();
+	assert!(status.success());
+	let client = fixture.client();
+	let ws = client
+		.open_workspace(workspace.path().to_str().unwrap())
+		.unwrap();
+	let target = fixture.target(client, &ws.id, "");
+	let text = "// FILE: result.txt\nretried\n";
+	let route = PasteRoute::default();
+	let plan = target
+		.plan_files(text, &route, &RunOptions::default(), None)
+		.unwrap();
+	// Another paste holds this repository's write lock.
+	let git = Git::open(workspace.path()).unwrap();
+	let identity = RepoIdentity::resolve(&git, &RunOptions::default()).unwrap();
+	let held = lock_heavy(&identity).unwrap();
+	let busy = target
+		.apply_files(text, &route, &plan, &selection())
+		.unwrap_err();
+	assert!(busy.is_repo_busy(), "{busy:?}");
+	assert!(!workspace.path().join("result.txt").exists());
+	drop(held);
+	target
+		.apply_files(text, &route, &plan, &selection())
+		.expect("the same preview must apply once the lock is free");
+	assert_eq!(
+		fs::read_to_string(workspace.path().join("result.txt")).unwrap(),
+		"retried"
+	);
+	let events = fixture.after_replies("imported", 1);
+	assert_eq!(
+		events
+			.iter()
+			.filter(|e| e["logical_kind"] == "apply_prepared")
+			.count(),
+		2,
+		"the retry reuses the retained token"
+	);
+	assert!(
+		!events.iter().any(|e| e["logical_kind"] == "import_apply"),
+		"a Busy refusal needs no full-text fallback"
+	);
+	let again = target
 		.apply_files(text, &route, &plan, &selection())
 		.unwrap_err();
 	assert!(
 		matches!(
-			error,
+			again,
 			PasteError::Remote(snip_remote::RemoteError::Refused {
 				code: snip_remote::ErrorCode::Stale,
 				..
 			})
 		),
-		"{error:?}"
+		"an applied preview is used up: {again:?}"
 	);
-	assert!(!workspace.path().join("result.txt").exists());
-	assert!(!fixture
-		.events()
-		.iter()
-		.any(|e| e["logical_kind"] == "import_apply"));
 }
 
 #[test]

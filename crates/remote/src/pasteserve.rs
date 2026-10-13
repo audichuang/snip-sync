@@ -19,7 +19,7 @@ use snip_core::transfer::{
 	DestinationFreshnessSnapshot, TransferError, TransferImportPlan,
 };
 
-use crate::prepared::{CacheError, CachedImport, PreparedCache};
+use crate::prepared::{self, CacheError, CachedImport, PreparedCache};
 use crate::proto::{
 	valid_rel_path, ErrorCode, ImportExpect, ImportPlanned, PasteMapping,
 	ReplayExpect, Response,
@@ -280,7 +280,7 @@ pub(crate) fn apply_prepared(
 		Err(why) => return *refused(
 			if why == CacheError::Scope { ErrorCode::Forbidden } else { ErrorCode::Stale },
 			match why {
-				CacheError::Missing => "prepared paste expired, was consumed, or belongs to another worker; preview again",
+				CacheError::Missing => prepared::TOKEN_GONE,
 				CacheError::Scope => "prepared paste belongs to another workspace or destination; preview again",
 				CacheError::Digest => "prepared paste does not match the preview; preview again",
 			}),
@@ -288,7 +288,7 @@ pub(crate) fn apply_prepared(
 	let payload = lease.payload();
 	// The raw input is retained, never an executable plan. Keep exactly the
 	// legacy re-plan/digest/freshness/selection and locked-write checks.
-	import_apply(
+	let response = import_apply(
 		root,
 		dest,
 		&payload.text,
@@ -296,7 +296,15 @@ pub(crate) fn apply_prepared(
 		selection,
 		expect,
 		cancel,
-	)
+	);
+	// A refusal from before the first write keeps the payload for a retry.
+	if matches!(
+		&response,
+		Response::Error { code, .. } if prepared::refused_before_write(*code)
+	) {
+		lease.restore();
+	}
+	response
 }
 
 /// `SNIP_E2E_PASTE_HOLD` names an absolute path: when set and the

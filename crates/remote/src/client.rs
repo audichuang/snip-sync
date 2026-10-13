@@ -1732,8 +1732,13 @@ impl Client {
 		}
 	}
 
-	/// Applies a token once on its original connection. No path here can
-	/// reconnect, obtain another worker, or fall back to sending the payload.
+	/// Applies a token on its original connection. The lease returns to
+	/// Ready after a refusal from before the worker's first write (Busy,
+	/// Timeout), so the same preview can apply again. When the worker no
+	/// longer holds the token and wrote nothing, the full text goes once on
+	/// that same connection as `ImportApply`, which the worker re-plans and
+	/// checks against the digest. An unknown outcome is never resent or
+	/// retried; no path reconnects or obtains another worker.
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn apply_prepared_import(
 		&self,
@@ -1778,41 +1783,80 @@ impl Client {
 			token,
 			_permit,
 		} = *ready;
+		let call =
+			|connection: &mut Connection, request: &Request| match connection
+				.call(
+					request,
+					None,
+					APPLY_CALL_LIMIT.saturating_sub(start.elapsed()),
+				) {
+				Ok(Response::Imported(result)) => Ok(result),
+				Ok(_) => Err(unexpected()),
+				Err(error) => Err(error),
+			};
 		let result = if connection.broken || connection.unsolicited_frames() > 0
 		{
 			Err(prepared_stale(
 				"the prepared paste connection changed; preview again",
 			))
 		} else {
-			let request = Request::ApplyPrepared {
-				workspace: workspace.into(),
-				dest: dest.into(),
-				token,
-				selection: selection.clone(),
-				expect: expect.clone(),
-			};
-			match connection.call(
-				&request,
-				None,
-				APPLY_CALL_LIMIT.saturating_sub(start.elapsed()),
-			) {
-				Ok(Response::Imported(result)) => Ok(result),
-				Ok(_) => Err(unexpected()),
-				Err(error) => Err(error),
+			let applied = call(
+				&mut connection,
+				&Request::ApplyPrepared {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					token: token.clone(),
+					selection: selection.clone(),
+					expect: expect.clone(),
+				},
+			);
+			match applied {
+				// The worker dropped the payload before writing anything:
+				// the full text, once, re-planned and digest-checked there.
+				Err(RemoteError::Refused {
+					code: ErrorCode::Stale,
+					message,
+				}) if message == crate::prepared::TOKEN_GONE => call(
+					&mut connection,
+					&Request::ImportApply {
+						workspace: workspace.into(),
+						dest: dest.into(),
+						text: text.into(),
+						mapping: mapping.clone(),
+						selection: selection.clone(),
+						expect: expect.clone(),
+					},
+				),
+				other => other,
 			}
 		};
-		*lease.state.lock().unwrap_or_else(PoisonError::into_inner) =
-			if result.as_ref().is_err_and(RemoteError::outcome_unknown) {
+		let unknown = result.as_ref().is_err_and(RemoteError::outcome_unknown);
+		let clean = !unknown && connection.unsolicited_frames() == 0;
+		let retry = clean
+			&& !connection.broken
+			&& matches!(
+				&result,
+				Err(RemoteError::Refused { code, .. })
+					if crate::prepared::refused_before_write(*code)
+			);
+		let next = if retry {
+			PreparedImportState::Ready(Box::new(PreparedConnection {
+				connection,
+				token,
+				_permit,
+			}))
+		} else {
+			// An out-of-step or unknown outcome is never returned to the pool.
+			if clean {
+				self.keep(connection);
+			}
+			if unknown {
 				PreparedImportState::OutcomeUnknown
 			} else {
 				PreparedImportState::Used
-			};
-		// An out-of-step or unknown outcome is never returned to the pool.
-		if !result.as_ref().is_err_and(RemoteError::outcome_unknown)
-			&& connection.unsolicited_frames() == 0
-		{
-			self.keep(connection);
-		}
+			}
+		};
+		*lease.state.lock().unwrap_or_else(PoisonError::into_inner) = next;
 		result
 	}
 
