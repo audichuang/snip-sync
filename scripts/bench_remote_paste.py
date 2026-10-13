@@ -5,6 +5,8 @@ Build the same source's `snip` and `bench_paste` Cargo example first. This
 measures the library paste path, not CLI argument parsing or clipboard access.
 Framed bytes exclude the preamble and SSH encryption/handshake overhead.
 RSS is a per-PID sampled peak, not a cumulative RUSAGE_CHILDREN high-water mark.
+Corpora use the product formatter; parsed entries and output files must match
+an independent normalized source manifest before measurements are accepted.
 """
 from __future__ import annotations
 
@@ -372,6 +374,22 @@ def wait_file(path: Path, process=None, seconds=180):
         time.sleep(0.005)
 
 
+def normalized_source_content(text: str) -> bytes:
+    """Independent source oracle, not a clipboard parser.
+
+    The formatter envelope terminates each source line with LF; restore drops
+    one CR before LF and structural ASCII-blank lines at the body's edges.
+    Interior whitespace, Unicode whitespace, markers and header-shaped source
+    remain literal content. No FILE recognition or unescaping happens here.
+    """
+    lines = [line.removesuffix("\r") for line in text.split("\n")]
+    while lines and not lines[0].strip(" \t\v\f\r"):
+        lines.pop(0)
+    while lines and not lines[-1].strip(" \t\v\f\r"):
+        lines.pop()
+    return "\n".join(lines).encode("utf-8")
+
+
 def corpus(repo: Path, case: str, scale: float):
     mib = 1024 * 1024
     entries = []
@@ -379,12 +397,15 @@ def corpus(repo: Path, case: str, scale: float):
     if case == "rust":
         remaining = max(1024, int(mib * scale))
         for path in sorted((repo / "crates").rglob("*.rs")):
-            raw = path.read_text()[:remaining]
-            # A FILE marker inside a Rust fixture would become a new entry.
-            if re.search(r"(?m)^\s*//\s*(?:FILE|File):", raw):
-                continue
-            entries.append((f"source{len(entries):04}.rs", raw))
-            source.append({"path": str(path.relative_to(repo)), "sha256": sha(path)})
+            original = path.read_bytes()
+            # Keep original line endings and limit by UTF-8 bytes, not chars.
+            original.decode("utf-8")
+            raw = original[:remaining].decode("utf-8", errors="ignore")
+            name = f"source{len(entries):04}.rs"
+            entries.append((name, raw))
+            source.append({"path": str(path.relative_to(repo)), "sha256": hashlib.sha256(original).hexdigest(),
+                           "payload_path": name, "fragment_bytes": len(raw.encode()),
+                           "fragment_sha256": hashlib.sha256(raw.encode()).hexdigest()})
             remaining -= len(raw.encode())
             if remaining <= 0:
                 break
@@ -401,11 +422,36 @@ def corpus(repo: Path, case: str, scale: float):
         entries = [("entropy.txt", text)]
     else:
         raise ValueError(case)
-    payload = "".join(f"// FILE: {name}\n{body}\n" for name, body in entries).encode()
-    return payload, {"case": case, "entries": len(entries), "payload_bytes": len(payload),
-                     "payload_sha256": hashlib.sha256(payload).hexdigest(),
-                     "zlib_ratio_description_only": len(zlib.compress(payload)) / len(payload),
-                     "source": source}
+    if not entries:
+        raise ValueError(f"empty {case} corpus")
+    expected = []
+    for name, body in entries:
+        content = normalized_source_content(body)
+        expected.append({"path": name, "content_bytes": len(content),
+                         "content_sha256": hashlib.sha256(content).hexdigest()})
+    return [{"path": name, "content": body} for name, body in entries], {
+        "case": case, "entries": len(entries), "source_bytes": sum(len(body.encode()) for _, body in entries),
+        "expected_entries": expected, "source": source}
+
+
+def validate_applied_counts(description, result):
+    if result.get("createdCount") != description["entries"] or any(result.get(key, 0) for key in
+            ("overwrittenCount", "deletedCount", "skippedExistingCount", "plannedSkippedCount")) or result.get("errors") != []:
+        raise ValueError("source semantic oracle mismatch: source entries were skipped or changed")
+
+
+def validate_source_oracle(description, oracle_result, actual_hashes):
+    """Reject correlated parser/restore mistakes before timing any sample."""
+    expected = description["expected_entries"]
+    if len(expected) != description["entries"] or len({entry["path"] for entry in expected}) != len(expected):
+        raise ValueError("source manifest has missing or duplicate paths")
+    if oracle_result.get("parsed_entries") != expected:
+        raise ValueError("source semantic oracle mismatch: parsed paths/count/content differ from declared source")
+    validate_applied_counts(description, oracle_result.get("result", {}))
+    expected_hashes = {entry["path"]: entry["content_sha256"] for entry in expected}
+    if actual_hashes != expected_hashes:
+        raise ValueError("source semantic oracle mismatch: restored files differ from normalized original source")
+    return expected_hashes
 
 
 def ssh_argv(host):
@@ -443,7 +489,7 @@ def run(args):
     out.mkdir(parents=True, exist_ok=False)
     script = Path(__file__).resolve()
     remote_root = None
-    report = {"schema": 1, "samples": []}
+    report = {"schema": 2, "samples": []}
     try:
         if args.ssh:
             remote_root = remote_call(args.ssh, ["mktemp", "-d", "/tmp/snip-paste-bench-XXXXXXXX"]).decode().strip()
@@ -457,7 +503,8 @@ def run(args):
                            "sha256": json.loads(remote_call(args.ssh, ["python3", remote_script, "binary-hash", args.remote_snip])),
                            "source_head": args.worker_source_sha,
                            "source_provenance": "worker source SHA asserted by caller; binary SHA measured remotely"}
-        report = {"schema": 1, "measurement": "same-binary PasteTarget plan/apply via framed bridge",
+        report = {"schema": 2, "measurement": "same-binary PasteTarget plan/apply via framed bridge",
+                  "source_oracle": "core formatter plus independent normalized source paths/content hashes; native parsed-entry and local/remote applied-count checks",
                   "rounds": args.rounds, "exploratory": args.rounds < 10 or args.scale != 1,
                   "driver": {"path": str(args.driver.resolve()), "sha256": sha(args.driver)},
                   "worker": worker_info, "source_head": source_head, "source_tree_dirty": source_dirty,
@@ -468,12 +515,22 @@ def run(args):
                   "cpu": "own process CPU at readiness/completion barriers; Linux clock ticks / CLK_TCK, Darwin Mach ticks * runtime mach_timebase_info; excludes bridge/ssh CPU (bridge separately retained)",
                   "datasets": [], "samples": [], "process_cleanup": []}
         for case in args.cases.split(","):
-            payload, description = corpus(args.repo, case, args.scale)
+            entries, description = corpus(args.repo, case, args.scale)
             report["datasets"].append(description)
             case_dir = out / case
             case_dir.mkdir()
             payload_path = case_dir / "payload.txt"
-            payload_path.write_bytes(payload)
+            manifest_path = case_dir / "source-manifest.json"
+            atomic_json(manifest_path, entries)
+            del entries
+            subprocess.run([str(args.driver.resolve()), "--format-corpus", str(manifest_path), str(payload_path)], check=True, timeout=180)
+            payload = payload_path.read_bytes()
+            if not 0 < len(payload) <= 32 * 1024 * 1024:
+                raise ValueError("formatted corpus must fit the 32 MiB payload budget")
+            description.update(payload_bytes=len(payload), payload_sha256=hashlib.sha256(payload).hexdigest(),
+                               zlib_ratio_description_only=len(zlib.compress(payload)) / len(payload),
+                               formatter="snip_core::format::build_payload")
+            del payload
             oracle = case_dir / "oracle"
             oracle.mkdir()
             oracle_control = case_dir / "oracle-control"
@@ -482,8 +539,11 @@ def run(args):
                       "control": str(oracle_control), "warm": False, "oracle": True}
             atomic_json(case_dir / "oracle.json", config)
             subprocess.run([str(args.driver.resolve()), str(case_dir / "oracle.json")], check=True, timeout=180)
-            expected = hashes(oracle)
+            oracle_result = json.loads((oracle_control / "done.json").read_text())
+            expected = validate_source_oracle(description, oracle_result, hashes(oracle))
+            description["semantic_oracle_verified"] = True
             atomic_json(case_dir / "expected-hashes.json", expected)
+            atomic_json(case_dir / "source-oracle.json", {"verified": True, "expected_entries": description["expected_entries"], "parsed_entries": oracle_result["parsed_entries"], "local_result": oracle_result["result"]})
             for round_no in range(args.rounds):
                 for connection in ("cold", "warm"):
                     for version in ([6, 7] if round_no % 2 == 0 else [7, 6]):
@@ -527,6 +587,7 @@ def run(args):
                                 operation = json.loads((sample_dir / "done.json").read_text())
                                 if "error" in operation:
                                     raise RuntimeError(operation["error"])
+                                validate_applied_counts(description, operation.get("result", {}))
                                 if operation["prepared"] != (version == 7):
                                     raise RuntimeError(f"unexpected prepared path for v{version}: {operation}")
                                 local_metrics = [json.loads(p.read_text()) for p in metrics_dir.glob("*.json") if p.name.startswith(("worker-", "bridge-"))]

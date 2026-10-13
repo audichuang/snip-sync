@@ -193,7 +193,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
 - 複製檔案／資料夾:兩邊都用 `transfer::expand_folder_items` 展開資料夾(過濾 `.git`、巢狀 repo、特殊檔、指出 root 的 symlink),再由 `transfer::plan_export_with` 產出 payload。CLI 另以 `selection_from_paths` 把命令列路徑轉成選取項目,並以 `plan_export_expanding` 分批展開(結果與一次展開相同,只是不必走完整棵樹);GUI 的選取來自檔案樹。
 - 複製 Git 變更:兩邊都以 `SourceKind::{Working,Unstaged,Staged,Commit,Range}` 交給 `plan_export_with`。CLI 以 `transfer::changed_items` 列出變更,GUI 的項目來自 Changes 面板。
 - 複製 commits:兩邊都經 `commits::copy_commits_with`。CLI 以範圍或 `-n` 選取(`transfer::plan_commit_export_with`),GUI 以時間軸選取的精確 chain(`plan_commit_export_exact_with`)。
-- 貼上檔案:兩邊都經 `snip_remote::PasteTarget`(`plan_files` / `apply_files`);本機目標以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。路由(目的地與各 prefix 資料夾、`--adjust-paths`)只由 `pastetarget::import_mapping` 建成 `ImportMapping`,本機目標與 worker 共用。
+- 貼上檔案:兩邊都經 `snip_remote::PasteTarget`(`plan_files` / `apply_files`);本機目標以 `transfer::plan_import_with` 規劃(含碰撞與新鮮度檢查；worker 以 `plan_import_parsed_with` 重用已解析的 entries，仍走同一引擎),再以 `TransferImportPlan::apply` 套用,底層執行器是 `restore::execute_restore_plan`。路由(目的地與各 prefix 資料夾、`--adjust-paths`)只由 `pastetarget::import_mapping` 建成 `ImportMapping`,本機目標與 worker 共用。
 - 貼上 commits:兩邊都經 `PasteTarget`(`plan_commits` / `check_commits` / `apply_commits`);本機目標用 `transfer::CommitReplayPreview`(`capture_in` / `revalidate` / `apply`)。
 - 遠端連線:兩邊都經 `snip_remote::Client`(`RemoteHost::ssh`,主機來自 `ssh::config_hosts`)。
 - 遠端 Git 檢視：兩邊都經 `snip_core::gitview::RepoView`（`snip_remote::RemoteRepo`）；worker 以 served `LocalRepo` 回答。

@@ -1,6 +1,6 @@
 //! Paste on the worker: the master sends the payload and the user's
 //! choices, and the worker plans and writes with the engine a local paste
-//! runs ([`plan_import_with`], [`CommitReplayPreview`]) on its own disk.
+//! runs ([`plan_import_parsed_with`], [`CommitReplayPreview`]) on its own disk.
 //!
 //! An Apply plans again and refuses as stale whatever changed
 //! since the preview the master showed. Destinations stay inside the
@@ -15,7 +15,7 @@ use snip_core::gitsrc::Git;
 use snip_core::gitview::ReadProfile;
 use snip_core::restore::{RestorePlan, RestoreSelection};
 use snip_core::transfer::{
-	plan_import_with, CanonicalRootId, CommitReplayPreview,
+	plan_import_parsed_with, CanonicalRootId, CommitReplayPreview,
 	DestinationFreshnessSnapshot, TransferError, TransferImportPlan,
 };
 
@@ -131,6 +131,7 @@ fn digest(plan: &RestorePlan) -> Result<String, Refusal> {
 struct Planned {
 	plan: TransferImportPlan,
 	suggestion: Option<snip_core::restore::RestoreBaseSuggestion>,
+	create_entries: Vec<usize>,
 }
 
 /// Plans exactly as `snip paste` and the app do, with the destination and
@@ -142,18 +143,24 @@ fn plan(
 	mapping: &PasteMapping,
 	cancel: &CancelToken,
 ) -> Result<Planned, Refusal> {
+	if cancel.is_cancelled() {
+		return Err(refused(ErrorCode::Cancelled, "cancelled"));
+	}
 	let primary = destination(root, dest)?;
 	let primary_id =
 		CanonicalRootId::new(&primary).map_err(|e| Box::new(io_error(e)))?;
 	let header = mapping.header_format.as_str();
 	let entries = snip_core::format::parse_clipboard(text, header);
+	if cancel.is_cancelled() {
+		return Err(refused(ErrorCode::Cancelled, "cancelled"));
+	}
 	if entries.is_empty() {
 		return Err(refused(
 			ErrorCode::BadRequest,
 			"No Snipcode file headers found in clipboard.",
 		));
 	}
-	let paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
+	let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
 	let suggestion = crate::pastetarget::suggest(&primary, &paths, text);
 	let (import, roots) = crate::pastetarget::import_mapping(
 		primary,
@@ -169,10 +176,14 @@ fn plan(
 			CanonicalRootId::new(folder).map_err(|e| Box::new(io_error(e)))
 		},
 	)?;
-	let plan =
-		plan_import_with(text, header, &roots, &import, &options(cancel))
+	let (plan, create_entries) =
+		plan_import_parsed_with(entries, &roots, &import, &options(cancel))
 			.map_err(|e| transfer_refusal(e, cancel))?;
-	Ok(Planned { plan, suggestion })
+	Ok(Planned {
+		plan,
+		suggestion,
+		create_entries,
+	})
 }
 
 /// Answers [`crate::proto::Request::ImportPlan`].
@@ -184,8 +195,9 @@ pub(crate) fn import_plan(
 	cancel: &CancelToken,
 ) -> Response {
 	let run = || -> Result<Response, Refusal> {
-		let Planned { plan, suggestion } =
-			plan(root, dest, text, mapping, cancel)?;
+		let Planned {
+			plan, suggestion, ..
+		} = plan(root, dest, text, mapping, cancel)?;
 		Ok(Response::ImportPlanned(ImportPlanned {
 			digest: digest(plan.restore_plan())?,
 			plan,
@@ -211,12 +223,14 @@ pub(crate) fn prepare_import(
 				"the pasted text is over the clipboard limit",
 			));
 		}
-		let Planned { plan, suggestion } =
-			plan(root, dest, &text, &mapping, cancel)?;
-		let metadata = crate::proto::ImportMetadata::of(
+		let Planned {
+			plan,
+			suggestion,
+			create_entries,
+		} = plan(root, dest, &text, &mapping, cancel)?;
+		let metadata = crate::proto::ImportMetadata::of_entry_indices(
 			&plan,
-			&text,
-			&mapping.header_format,
+			&create_entries,
 		)
 		.map_err(|message| refused(ErrorCode::BadRequest, message))?;
 		let digest = digest(plan.restore_plan())?;

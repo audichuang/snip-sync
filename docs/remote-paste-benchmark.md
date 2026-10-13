@@ -17,7 +17,7 @@ python3 scripts/bench_remote_paste.py \
 
 正式量測預設四組資料：真實 Rust source、1,200 個小檔案、接近 32 MiB 的 payload、固定 seed 的低壓縮 UTF-8。
 每組冷連線／既有連線各跑 10 輪，協定 6／7 逐輪交換先後順序。
-每次使用全新目的資料夾，以同一 payload 的本機貼上結果為 oracle，核對所有檔案 SHA-256。
+payload 由產品 formatter 產生，保留來源中的大小寫混合標頭、escape 與結束標記。量測前，先用原始來源獨立計算預期路徑、內容 hash 與筆數，檢查 parser 與本機貼上都符合、沒有意外略過或額外檔案；每次再使用全新目的資料夾，核對所有遠端檔案 SHA-256。
 `--rounds 1 --scale 0.01` 只適合檢查工具可運作，報告會標成 exploratory。
 
 跨機器時，先把**相同 commit** 的 worker 建置在遠端獨立暫存資料夾，不覆寫已安裝的 `snip`，然後加上：

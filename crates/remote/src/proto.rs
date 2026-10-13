@@ -269,8 +269,9 @@ pub struct ImportCreateMetadata {
 	pub absolute_path: std::path::PathBuf,
 	pub existed: bool,
 	pub root_path: std::path::PathBuf,
-	/// Index into parse_clipboard(text, header_format). Equal bodies share
-	/// the first entry, so mapping and duplicate paths cannot mis-pair text.
+	/// Index into the original parse_clipboard(text, header_format) order.
+	/// Multiple creates may reference one entry when equal bodies are shared;
+	/// mapping and duplicate paths never determine the content reference.
 	pub entry: usize,
 }
 
@@ -285,32 +286,64 @@ pub struct ImportMetadata {
 }
 
 impl ImportMetadata {
+	#[cfg(test)]
 	pub(crate) fn of(
 		plan: &snip_core::transfer::TransferImportPlan,
 		text: &str,
 		header_format: &str,
 	) -> Result<Self, String> {
 		let entries = snip_core::format::parse_clipboard(text, header_format);
+		Self::of_entries(plan, &entries)
+	}
+
+	/// Compatibility encoder for shared-body references. Product planning
+	/// supplies original ordinals while consuming the parsed entries.
+	#[cfg(test)]
+	pub(crate) fn of_entries(
+		plan: &snip_core::transfer::TransferImportPlan,
+		entries: &[snip_core::format::ParsedEntry],
+	) -> Result<Self, String> {
 		let mut contents = std::collections::HashMap::new();
 		for (index, entry) in entries.iter().enumerate() {
 			contents.entry(entry.content.as_str()).or_insert(index);
 		}
-		let creates = plan
+		let entry_indices = plan
 			.create_operations()
 			.iter()
 			.map(|op| {
-				let entry = contents.get(op.content.as_str()).copied().ok_or(
-					"planned content is absent from the source payload",
-				)?;
-				Ok(ImportCreateMetadata {
-					relative_path: op.relative_path.clone(),
-					absolute_path: op.absolute_path.clone(),
-					existed: op.existed,
-					root_path: op.root_path.clone(),
-					entry,
-				})
+				contents.get(op.content.as_str()).copied().ok_or(
+					"planned content is absent from the source payload"
+						.to_string(),
+				)
 			})
 			.collect::<Result<Vec<_>, String>>()?;
+		Self::of_entry_indices(plan, &entry_indices)
+	}
+
+	/// The planner carries each admitted create's original parse ordinal
+	/// while consuming its contents, so metadata needs no second body copy.
+	pub(crate) fn of_entry_indices(
+		plan: &snip_core::transfer::TransferImportPlan,
+		entries: &[usize],
+	) -> Result<Self, String> {
+		if entries.len() != plan.create_operations().len() {
+			return Err(
+				"prepared content references do not match create operations"
+					.into(),
+			);
+		}
+		let creates = plan
+			.create_operations()
+			.iter()
+			.zip(entries)
+			.map(|(op, &entry)| ImportCreateMetadata {
+				relative_path: op.relative_path.clone(),
+				absolute_path: op.absolute_path.clone(),
+				existed: op.existed,
+				root_path: op.root_path.clone(),
+				entry,
+			})
+			.collect();
 		Ok(Self {
 			roots: plan.roots().to_vec(),
 			restore_roots: plan.restore_plan().roots.clone(),
@@ -339,25 +372,71 @@ impl ImportPrepared {
 		text: &str,
 		header_format: &str,
 	) -> Result<ImportPlanned, String> {
+		self.hydrate_entries(snip_core::format::parse_clipboard(
+			text,
+			header_format,
+		))
+	}
+
+	fn hydrate_entries(
+		&self,
+		mut entries: Vec<snip_core::format::ParsedEntry>,
+	) -> Result<ImportPlanned, String> {
 		use snip_core::restore::{CreateOperation, RestorePlan};
-		let entries = snip_core::format::parse_clipboard(text, header_format);
+		let source_bytes = entries.iter().try_fold(0usize, |sum, entry| {
+			sum.checked_add(entry.content.len())
+				.ok_or("prepared source content byte count overflow")
+		})?;
+		let mut references = vec![0usize; entries.len()];
+		let mut hydrated_bytes = 0usize;
+		for op in &self.metadata.creates {
+			let entry = entries
+				.get(op.entry)
+				.ok_or("invalid prepared content reference")?;
+			hydrated_bytes =
+				hydrated_bytes.checked_add(entry.content.len()).ok_or(
+					"prepared content references exceed the source payload",
+				)?;
+			if hydrated_bytes > source_bytes {
+				return Err(
+					"prepared content references exceed the source payload"
+						.into(),
+				);
+			}
+			references[op.entry] += 1;
+		}
+		// Equal bodies may all point at one parse entry. Release the other
+		// parsed copies before materializing any repeated create contents.
+		for (entry, &count) in entries.iter_mut().zip(&references) {
+			if count == 0 {
+				entry.content = String::new();
+			}
+		}
 		let creates = self
 			.metadata
 			.creates
 			.iter()
 			.map(|op| {
 				let entry = entries
-					.get(op.entry)
+					.get_mut(op.entry)
 					.ok_or("invalid prepared content reference")?;
+				references[op.entry] -= 1;
+				let content = if references[op.entry] == 0 {
+					std::mem::take(&mut entry.content)
+				} else {
+					entry.content.clone()
+				};
 				Ok(CreateOperation {
 					relative_path: op.relative_path.clone(),
 					absolute_path: op.absolute_path.clone(),
-					content: entry.content.clone(),
+					content,
 					existed: op.existed,
 					root_path: op.root_path.clone(),
 				})
 			})
 			.collect::<Result<Vec<_>, String>>()?;
+		drop(entries);
+		drop(references);
 		let restore_plan = RestorePlan {
 			roots: self.metadata.restore_roots.clone(),
 			create_operations: creates,
@@ -386,11 +465,23 @@ pub(crate) fn restore_plan_digest(
 	plan: &snip_core::restore::RestorePlan,
 ) -> Result<String, String> {
 	use sha2::{Digest, Sha256};
-	let json = serde_json::to_vec(plan).map_err(|e| e.to_string())?;
-	Ok(Sha256::digest(json)
-		.iter()
-		.map(|b| format!("{b:02x}"))
-		.collect())
+	struct DigestSink(Sha256);
+	impl Write for DigestSink {
+		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+			self.0.update(bytes);
+			Ok(bytes.len())
+		}
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+	// serde emits many tiny writes around escaped characters. Buffer them
+	// before hashing, without allocating a second payload-sized JSON body.
+	let mut writer =
+		io::BufWriter::with_capacity(64 * 1024, DigestSink(Sha256::new()));
+	serde_json::to_writer(&mut writer, plan).map_err(|e| e.to_string())?;
+	let digest = writer.into_inner().map_err(|e| e.to_string())?.0.finalize();
+	Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// A commit replay preview without its payload, which the master has:
@@ -1606,6 +1697,131 @@ mod prepared_metadata_tests {
 			token: Some("token".into()),
 		};
 		(temp, reply, plan)
+	}
+
+	#[test]
+	fn hydrated_last_references_reuse_parsed_body_allocations() {
+		let body = "shared body\n".repeat(8192);
+		let unique = "unique body\n".repeat(8192);
+		let text = format!("// FILE: first.txt\n{body}// FILE: second.txt\n{body}// FILE: third.txt\n{unique}// FILE: .git/config\nignored\n");
+		let (_temp, reply, plan) = prepared(&text);
+		let entries = snip_core::format::parse_clipboard(&text, "");
+		assert_eq!(
+			reply
+				.metadata
+				.creates
+				.iter()
+				.map(|op| op.entry)
+				.collect::<Vec<_>>(),
+			[0, 0, 2]
+		);
+		let shared_allocation = entries[0].content.as_ptr();
+		let unique_allocation = entries[2].content.as_ptr();
+		let hydrated = reply.hydrate_entries(entries).unwrap();
+		assert_eq!(hydrated.plan, plan);
+		let creates = hydrated.plan.create_operations();
+		assert_eq!(
+			creates[1].content.as_ptr(),
+			shared_allocation,
+			"last shared reference moves the parsed allocation"
+		);
+		assert_eq!(
+			creates[2].content.as_ptr(),
+			unique_allocation,
+			"unique reference needs no body clone"
+		);
+		assert_ne!(
+			creates[0].content.as_ptr(),
+			creates[1].content.as_ptr(),
+			"repeated creates still own independent strings"
+		);
+	}
+
+	#[test]
+	fn planner_ordinals_hydrate_without_body_matching() {
+		let text = "// FILE: first.txt\nsame\n// FILE: .git/config\nignored\n// FILE: second.txt\nsame\n// FILE: third.txt\nunique\n";
+		let (_temp, mut reply, plan) = prepared(text);
+		reply.metadata =
+			ImportMetadata::of_entry_indices(&plan, &[0, 2, 3]).unwrap();
+		assert_eq!(reply.hydrate(text, "").unwrap().plan, plan);
+		assert!(ImportMetadata::of_entry_indices(&plan, &[0, 2]).is_err());
+	}
+
+	#[test]
+	fn hydration_rejects_content_amplification_before_cloning() {
+		let text =
+			"// FILE: first.txt\nsame body\n// FILE: second.txt\nsame body\n";
+		let (_temp, mut reply, plan) = prepared(text);
+		// Older protocol-7 workers deduplicated equal bodies to the first
+		// entry. Two equal source bodies still authorize two create bodies.
+		assert_eq!(
+			reply
+				.metadata
+				.creates
+				.iter()
+				.map(|op| op.entry)
+				.collect::<Vec<_>>(),
+			[0, 0]
+		);
+		assert_eq!(reply.hydrate(text, "").unwrap().plan, plan);
+		let mut extra = reply.metadata.creates[0].clone();
+		extra.relative_path = "third.txt".into();
+		extra.absolute_path = extra.root_path.join("third.txt");
+		reply.metadata.creates.push(extra);
+		// No new digest is provided: size validation must win before the
+		// extra body is materialized or the digest can report a mismatch.
+		assert_eq!(
+			reply.hydrate(text, "").unwrap_err(),
+			"prepared content references exceed the source payload"
+		);
+	}
+
+	#[test]
+	fn streamed_restore_digest_matches_complete_json_bytes() {
+		use sha2::{Digest, Sha256};
+		use snip_core::restore::{
+			CreateOperation, DeleteOperation, RestorePlan, SkipDetail,
+			SkipReason, SkippedOperation,
+		};
+		let root = std::path::PathBuf::from("workspace");
+		for body in [
+			String::new(),
+			"plain\nsecond line\r\n".into(),
+			"quote=\" slash=\\ tab=\t nul=\0 backspace=\u{8} formfeed=\u{c}"
+				.into(),
+			"中文 🦀 café \u{2028} \u{2029}\n".repeat(8192),
+			"x".repeat(64 * 1024 - 1),
+			"x".repeat(64 * 1024),
+			"x".repeat(64 * 1024 + 1),
+			"\"\\\t\r\n中文".repeat(100_000),
+		] {
+			let plan = RestorePlan {
+				roots: vec![root.clone()],
+				create_operations: vec![CreateOperation {
+					relative_path: "引號\"路徑.txt".into(),
+					absolute_path: root.join("quoted\"name.txt"),
+					content: body,
+					existed: true,
+					root_path: root.clone(),
+				}],
+				delete_operations: vec![DeleteOperation {
+					relative_path: "gone.txt".into(),
+					absolute_path: root.join("gone.txt"),
+				}],
+				skipped_operations: vec![SkippedOperation {
+					raw_path: ".git/config".into(),
+					relative_path: None,
+					reason: SkipReason::UnresolvedPath,
+					detail: Some(SkipDetail::ProtectedGitMetadata),
+				}],
+			};
+			let expected: String =
+				Sha256::digest(serde_json::to_vec(&plan).unwrap())
+					.iter()
+					.map(|byte| format!("{byte:02x}"))
+					.collect();
+			assert_eq!(restore_plan_digest(&plan).unwrap(), expected, "streaming must preserve the previous digest for {} content bytes", plan.create_operations[0].content.len());
+		}
 	}
 
 	#[test]

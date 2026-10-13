@@ -51,7 +51,7 @@ class Frames(unittest.TestCase):
 
 
 class Corpus(unittest.TestCase):
-    def test_all_full_scale_cases_are_bounded_and_identified(self):
+    def test_all_full_scale_sources_are_bounded_and_identified(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "crates").mkdir()
@@ -59,37 +59,74 @@ class Corpus(unittest.TestCase):
             rust.write_text("pub fn sample() {}\n" * 62000)
             for case in ["rust", "many", "large", "utf8"]:
                 with self.subTest(case=case):
-                    payload, metadata = bench.corpus(root, case, 1)
-                    self.assertLessEqual(len(payload), 32 * 1024 * 1024)
-                    self.assertGreater(len(payload), 0)
-                    payload.decode("utf-8")
-                    self.assertEqual(metadata["payload_bytes"], len(payload))
-                    self.assertEqual(metadata["payload_sha256"], hashlib.sha256(payload).hexdigest())
-                    self.assertGreater(metadata["entries"], 0)
+                    entries, metadata = bench.corpus(root, case, 1)
+                    source_bytes = sum(len(entry["content"].encode()) for entry in entries)
+                    self.assertLessEqual(source_bytes, 32 * 1024 * 1024)
+                    self.assertGreater(source_bytes, 0)
+                    self.assertEqual(metadata["source_bytes"], source_bytes)
+                    self.assertEqual(metadata["entries"], len(entries))
+                    self.assertEqual([entry["path"] for entry in metadata["expected_entries"]],
+                                     [entry["path"] for entry in entries])
                     if case == "rust":
                         self.assertEqual(metadata["source"][0]["sha256"], bench.sha(rust))
                     if case == "many":
                         self.assertEqual(metadata["entries"], 1200)
                     if case == "large":
-                        self.assertGreater(len(payload), 31 * 1024 * 1024)
+                        self.assertGreater(source_bytes, 31 * 1024 * 1024)
                     if case == "utf8":
-                        self.assertGreater(metadata["zlib_ratio_description_only"], 0.6)
+                        raw = entries[0]["content"].encode()
+                        self.assertGreater(len(bench.zlib.compress(raw)) / len(raw), 0.6)
 
     def test_low_compression_utf8_uses_a_reproducible_seed(self):
         first, metadata = bench.corpus(Path("unused"), "utf8", 0.01)
         second, repeated = bench.corpus(Path("unused"), "utf8", 0.01)
         self.assertEqual((first, metadata), (second, repeated))
 
-    def test_rust_fixture_headers_do_not_create_extra_payload_entries(self):
+    def test_header_shaped_rust_is_retained_for_the_product_formatter(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "crates").mkdir()
-            (root / "crates" / "a.rs").write_text('// FILE: unintended.rs\nfixture\n')
+            original = '// file: child/keep.txt\r\n// FiLe: replacement.rs\r\n//clipcode-esc: literal\r\n// clipcode-end\r\nlast\r\n'
+            (root / "crates" / "a.rs").write_bytes(original.encode())
             (root / "crates" / "b.rs").write_text('fn real_source() {}\n')
-            payload, metadata = bench.corpus(root, "rust", 0.01)
-            self.assertNotIn(b"unintended.rs", payload)
-            self.assertIn(b"fn real_source()", payload)
-            self.assertEqual(metadata["entries"], 1)
+            entries, metadata = bench.corpus(root, "rust", 0.01)
+            self.assertEqual(entries[0]["content"], original)
+            self.assertEqual(metadata["entries"], 2)
+            normalized = b'// file: child/keep.txt\n// FiLe: replacement.rs\n//clipcode-esc: literal\n// clipcode-end\nlast'
+            self.assertEqual(metadata["expected_entries"][0], {
+                "path": "source0000.rs", "content_bytes": len(normalized),
+                "content_sha256": hashlib.sha256(normalized).hexdigest()})
+
+    def test_normalization_is_ascii_boundary_lines_not_header_parsing(self):
+        for raw, expected in [
+            (" \r\n\t\n  keep  \r\n\v\f\r\n", b"  keep  "),
+            ("// file: x.rs\nbody\n", b"// file: x.rs\nbody"),
+            ("//clipcode-esc: literal\n// clipcode-end\n", b"//clipcode-esc: literal\n// clipcode-end"),
+            ("x\ry\r", b"x\ry"),
+            ("\u3000\n\u00a0\n", "\u3000\n\u00a0".encode()),
+            (" \r\n\t", b""),
+        ]:
+            with self.subTest(raw=raw):
+                self.assertEqual(bench.normalized_source_content(raw), expected)
+
+    def test_semantic_oracle_rejects_phantom_files_even_when_local_paste_agrees(self):
+        body = b"fn real_source() {}\n// file: child/keep.txt\nreplacement"
+        expected = [{"path": "source0000.rs", "content_bytes": len(body),
+                     "content_sha256": hashlib.sha256(body).hexdigest()}]
+        first = b"fn real_source() {}"
+        parsed = [{"path": "source0000.rs", "content_bytes": len(first), "content_sha256": hashlib.sha256(first).hexdigest()},
+                  {"path": "child/keep.txt", "content_bytes": 11, "content_sha256": hashlib.sha256(b"replacement").hexdigest()}]
+        wrong_local_files = {entry["path"]: entry["content_sha256"] for entry in parsed}
+        result = {"createdCount": 2, "errors": [], "plannedSkippedCount": 0}
+        with self.assertRaisesRegex(ValueError, "parsed paths/count/content"):
+            bench.validate_source_oracle({"entries": 1, "expected_entries": expected},
+                                         {"parsed_entries": parsed, "result": result}, wrong_local_files)
+        good = {"parsed_entries": expected, "result": {"createdCount": 1, "errors": []}}
+        hashes = {expected[0]["path"]: expected[0]["content_sha256"]}
+        self.assertEqual(bench.validate_source_oracle({"entries": 1, "expected_entries": expected}, good, hashes), hashes)
+        good["result"]["plannedSkippedCount"] = 1
+        with self.assertRaisesRegex(ValueError, "skipped or changed"):
+            bench.validate_source_oracle({"entries": 1, "expected_entries": expected}, good, hashes)
 
 
 class Metrics(unittest.TestCase):
