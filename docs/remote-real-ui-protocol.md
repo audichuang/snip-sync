@@ -24,7 +24,7 @@
 | master | Mac mini `AudideMac-mini` | 本機 |
 | worker | Ubuntu `audichuang-desktop`（x86_64） | `ssh ubuntu`（`~/.ssh/config` 的 `Host ubuntu`，金鑰登入） |
 
-- 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上與 worker 端變更選取（協定 5）：`grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs`，不符就不開跑。
+- 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上與 worker 端變更選取（協定 5）：確認 `PROTOCOL_MAX >= 5`（新版亦適用），不符就不開跑。
 - **受測的 worker binary 怎麼被選到**：產品在對方執行 `snip serve --stdio` 時，依序找 PATH 上的 `snip`、`~/.local/bin/snip`…。Ubuntu 的非互動 ssh PATH 第一項是 `~/.local/bin`，所以本輪在 `~/.local/bin/snip` 放一個**wrapper**（把執行時的 PID 記到 `$W/pids/`，再 `exec` 受測 SHA 編出的 binary），產品就會走真實的 ssh 路徑選到它，而 L04、L05 與收尾只殺本輪記下的 PID（2.3 安裝）。開跑前那個位置必須不存在（2.3 會檢查），收尾一定要刪掉（第 6 節，I03 驗證）。**不要用 `SNIP_REMOTE_EXEC`**，那會繞過要測的 ssh 路徑。
 - 受測專案：Ubuntu 上的 `~/research/rtk`。真實的 Rust 專案，有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs`）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**。
 - 其他情境放在 fixture（第 2.3 節），全部在 Ubuntu 的 `$W` 底下。
@@ -39,7 +39,8 @@
 
 ```bash
 export PATH=$HOME/.cargo/bin:$PATH
-grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs
+protocol_max=$(sed -n 's/^pub const PROTOCOL_MAX: u32 = \([0-9][0-9]*\);$/\1/p' crates/remote/src/proto.rs)
+test "${protocol_max:-0}" -ge 5
 cargo build --release -p snip-cli --locked
 just remote-e2e-ssh ubuntu
 ```
@@ -346,9 +347,11 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | S07 | 從最近開啟點 `local-ws`，再點 `remote-recent:<n>`（gitws） | 先回到本機（麵包屑沒有 `ubuntu ▸`），再一次點擊就回到 `ubuntu ▸ gitws`，不用重新逐層選 |
 | S08 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/edge`，點 `btn-remote-open` | `REMOTE_OPENED: ubuntu ▸ edge`；`~` 展開成對方的家目錄 |
 | S09 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/no-such`，點 `btn-remote-open` | 失敗格：選單裡紅字說資料夾不存在；目前的工作區不變（仍是 edge） |
-| S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `WS_TABS_RESTORED` 與每個還原分頁的 `WS_TAB_OPENED`；`REMOTE_REOPEN: host=ubuntu path=…/edge` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`，顯示的是離開前的分頁（`open-tabs.json` 的 `active`）；遠端分頁一開始就在，標籤 `ubuntu ▸ edge`，連線在背景（狀態列「正在重新連線 …」），啟動過程畫面不卡 |
-| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`；`open-tabs.json` 裡的 `ubuntu ▸ edge` 也會還原，是 `local-ws` 之前的另一個分頁，`local-ws` 若已在還原的分頁裡就切過去），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。還原的 `ubuntu ▸ edge` 分頁若連線失敗，會保持 failed 狀態（`ws-tab-state:<ix>:failed`，tooltip 結尾「連線失敗：<原因>」，狀態列「無法開啟遠端工作區：<原因>」）並照 `REMOTE_RETRY` 重試，不是這格的失敗，也不會讓 `local-ws` 消失。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
+| S10 | Cmd+Q，等 exit code 0，執行 `python3 scripts/real_ui_round.py launch --gate b --saved-tabs --run "$RUN"`，以同一個隔離設定、**不帶 `--workspace`** 重新啟動（舊日誌與 exit 收據自動編號保存） | `WS_TABS_RESTORED` 與每個還原分頁的 `WS_TAB_OPENED`；`REMOTE_REOPEN: host=ubuntu path=…/edge` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`，顯示的是離開前的分頁（`open-tabs.json` 的 `active`）；遠端分頁一開始就在，標籤 `ubuntu ▸ edge`，連線在背景（狀態列「正在重新連線 …」），啟動過程畫面不卡 |
+| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`；`open-tabs.json` 裡的 `ubuntu ▸ edge` 也會還原，是 `local-ws` 之前的另一個分頁，`local-ws` 若已在還原的分頁裡就切過去），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。還原的 `ubuntu ▸ edge` 分頁若連線失敗，會保持 failed 狀態（`ws-tab-state:<ix>:failed`，tooltip 結尾「連線失敗：<原因>」，狀態列「無法開啟遠端工作區：<原因>」）；暫時斷線才照 `REMOTE_RETRY` backoff；缺少 worker、權限或版本等永久拒絕停止自動重試，不會讓 `local-ws` 消失。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
 | S12 | 把視窗調成 900×600（System Events 設成 900×632），開選單並點進一層資料夾 | `remote-path`、`remote-up`、`btn-remote-open-here`、`remote-path-input`、`btn-remote-open` 的 bounds 都 `w,h ≥ 1` 且在內容區裡（tooltip 文字就是 `remote-path` 顯示的同一個字串，見 `crates/desktop-native/src/ui/remote.rs` 的 `tip(browse.path.clone())`，不在真實 UI 驗）；做完調回 1080×720 |
+
+重驗 #176 時，S10 使用 4 個本機與 12 個同 Host 遠端分頁、最後一個遠端分頁為作用中，正常退出後連續重開兩次。各次保存 `open-tabs.json` 前後、各分頁 open／scan／失敗／retry／recovered 的日誌時間及本輪 worker 啟動數；不按 Refresh，確認分頁數、順序、作用中 identity 與 repo 清單正確。自然 SSH 回合沒有發生斷線時如實記為零，故障後恢復另由真實 Worker EOF 的 GPUI 注入測試驗證。同 Host 握手峰值由計數 transport 測試量測；存活 worker 數不等於同時握手數。
 
 ### 4.2 瀏覽真實專案 rtk（R01–R08）
 

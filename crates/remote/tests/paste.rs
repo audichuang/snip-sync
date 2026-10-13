@@ -1379,10 +1379,16 @@ fn a_lost_file_apply_answer_through_a_paste_target_is_outcome_unknown() {
 		.unwrap();
 
 	lose_the_answer(&w);
+	let connections = w.started_connections_for_tests();
 	let err = remote
 		.apply_files(&text, &route, &plan, &unchecked(&[]))
 		.expect_err("a hung-up worker cannot answer an Apply");
 	assert!(matches!(err, PasteError::OutcomeUnknown(_)), "{err:?}");
+	assert_eq!(
+		w.started_connections_for_tests(),
+		connections,
+		"a lost Apply must not reconnect or resend"
+	);
 }
 
 /// The same for a commit replay's Apply.
@@ -1394,10 +1400,16 @@ fn a_lost_replay_apply_answer_through_a_paste_target_is_outcome_unknown() {
 	let (remote, text, preview) = planned_replay(tmp.path(), &w);
 
 	lose_the_answer(&w);
+	let connections = w.started_connections_for_tests();
 	let err = remote
 		.apply_commits(&text, &preview)
 		.expect_err("a hung-up worker cannot answer an Apply");
 	assert!(matches!(err, PasteError::OutcomeUnknown(_)), "{err:?}");
+	assert_eq!(
+		w.started_connections_for_tests(),
+		connections,
+		"a lost replay Apply must not reconnect or resend"
+	);
 }
 
 /// A check writes nothing, so a lost answer to it is a plain failure: only

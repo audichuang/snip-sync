@@ -2375,6 +2375,7 @@ impl WorkbenchModel {
 	/// run for a tab whose quit drained when the quit stopped elsewhere.
 	pub(crate) fn resume_after_drain(&mut self, cx: &mut Context<Self>) {
 		self.resume_remote_restore(cx);
+		self.resume_remote_scan(cx);
 		self.preview_loading = false;
 		self.tree_cancel = None;
 		self.rev_tree_cancel = None;
@@ -2429,8 +2430,7 @@ impl WorkbenchModel {
 				self.finish_open(path, cx)
 			}
 			lifecycle::Intent::OpenRemoteWorkspace(target) => {
-				let (host, workspace) = *target;
-				self.finish_open_remote(host, workspace, cx)
+				self.finish_open_remote(*target, cx)
 			}
 		}
 	}
@@ -2477,6 +2477,7 @@ impl WorkbenchModel {
 		release_path(&mut self.workspace_root);
 		self.remote.session = None;
 		self.remote.scan_error = None;
+		self.remote.scan_recovery = None;
 		self.selected_file_root = None;
 		self.clear_workspace_inputs(cx);
 	}
@@ -6649,8 +6650,7 @@ mod tests {
 						panic!("drain not ready: {step:?}");
 					};
 					// finish_intent would check the real GitLoad again.
-					let (host, ws) = *target;
-					m.finish_open_remote(host, ws, cx);
+					m.finish_open_remote(*target, cx);
 				}
 			});
 		}
@@ -16584,6 +16584,853 @@ mod tests {
 				}
 			}
 
+			/// Let real worker/Git threads finish without advancing the test
+			/// clock: assertions about retry deadlines must not consume time.
+			fn pump_scan_until(
+				cx: &mut VisualTestContext,
+				what: &str,
+				mut ready: impl FnMut(&mut VisualTestContext) -> bool,
+			) {
+				let deadline = std::time::Instant::now()
+					+ snip_native_e2e::scaled(Duration::from_secs(10));
+				loop {
+					cx.run_until_parked();
+					if ready(cx) {
+						return;
+					}
+					assert!(
+						std::time::Instant::now() < deadline,
+						"timed out waiting for {what}"
+					);
+					std::thread::sleep(Duration::from_millis(2));
+				}
+			}
+
+			struct ScanRestoreFixture {
+				_tmp: tempfile::TempDir,
+				store: tempfile::TempDir,
+				worker: std::sync::Arc<snip_remote::Worker>,
+				host: snip_remote::RemoteHost,
+				paths: [String; 2],
+				saved: crate::open_tabs::OpenTabs,
+			}
+
+			impl ScanRestoreFixture {
+				fn new(
+					eofs: usize,
+					refusal: Option<snip_remote::proto::ErrorCode>,
+				) -> Self {
+					Self::with_options(
+						eofs,
+						refusal,
+						snip_remote::WorkerOptions::default(),
+					)
+				}
+
+				fn with_options(
+					eofs: usize,
+					refusal: Option<snip_remote::proto::ErrorCode>,
+					options: snip_remote::WorkerOptions,
+				) -> Self {
+					use crate::open_tabs::{OpenTabs, SavedTab};
+					let tmp = tempfile::tempdir().unwrap();
+					let base = dunce::canonicalize(tmp.path()).unwrap();
+					let local = base.join("local");
+					fs::create_dir(&local).unwrap();
+					let paths = ["background", "active"].map(|name| {
+						let path = base.join(name);
+						fs::create_dir(&path).unwrap();
+						repo(&path, name, &[("kept.txt", "unchanged\n")]);
+						path.display().to_string()
+					});
+					let worker =
+						std::sync::Arc::new(snip_remote::Worker::new(options));
+					for path in &paths {
+						worker.set_scan_failures_for_tests(path, eofs, refusal);
+					}
+					let host =
+						snip_remote::RemoteHost::in_process(worker.clone());
+					let saved = OpenTabs {
+						tabs: vec![
+							local_tab(&local),
+							SavedTab::Remote {
+								host: host.name.clone(),
+								path: paths[0].clone(),
+							},
+							SavedTab::Remote {
+								host: host.name.clone(),
+								path: paths[1].clone(),
+							},
+						],
+						active: Some(2),
+					};
+					Self {
+						_tmp: tmp,
+						store: tempfile::tempdir().unwrap(),
+						worker,
+						host,
+						paths,
+						saved,
+					}
+				}
+
+				fn launch<'a>(
+					&self,
+					cx: &'a mut TestAppContext,
+				) -> (Entity<TabsRoot>, &'a mut VisualTestContext) {
+					self.launch_with_hosts(cx, vec![self.host.clone()])
+				}
+
+				fn launch_with_hosts<'a>(
+					&self,
+					cx: &'a mut TestAppContext,
+					hosts: Vec<snip_remote::RemoteHost>,
+				) -> (Entity<TabsRoot>, &'a mut VisualTestContext) {
+					cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+					let launch = Launch {
+						restore: Some(self.saved.clone()),
+						first: FirstTab::Empty,
+						restore_dir: None,
+						store: Some(self.store.path().to_path_buf()),
+					};
+					crate::remote::with_test_hosts(hosts, || {
+						cx.add_window_view(|window, cx| {
+							TabsRoot::new(
+								launch,
+								"normal".into(),
+								None,
+								window,
+								cx,
+							)
+						})
+					})
+				}
+			}
+
+			fn initial_scan_failures(
+				root: &Entity<TabsRoot>,
+				cx: &mut VisualTestContext,
+			) -> [Entity<WorkbenchModel>; 2] {
+				let models = [tab(root, cx, 1), tab(root, cx, 2)];
+				pump_scan_until(
+					cx,
+					"successful opens followed by initial scan failures",
+					|cx| {
+						// Tick the ordinary open/close-drain watcher only. Once
+						// open has landed, leave the retry clock under test control.
+						if models.iter().any(|model| {
+							model.read_with(cx, |m, _| {
+								m.lifecycle.is_draining()
+									|| (m.remote.busy
+										&& m.remote.session.is_none())
+							})
+						}) {
+							cx.executor()
+								.advance_clock(Duration::from_millis(50));
+						}
+						models.iter().all(|model| {
+							model.read_with(cx, |m, _| {
+								m.remote.session.is_some()
+									&& m.remote.scan_error.is_some()
+									&& !m.is_loading
+							})
+						})
+					},
+				);
+				models
+			}
+
+			#[gpui::test]
+			fn restored_remote_scans_recover_in_active_and_background_tabs(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(2, None);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				let identities = root.read_with(cx, |r, _| {
+					r.tabs.iter().map(|t| t.id).collect::<Vec<_>>()
+				});
+				assert_eq!(active(&root, cx), Some(2));
+				assert_eq!(saved(fixture.store.path()), fixture.saved);
+				for seconds in [1, 2, 4] {
+					cx.executor().advance_clock(Duration::from_secs(seconds));
+					cx.run_until_parked();
+					pump_scan_until(
+						cx,
+						"the scheduled scan attempt finishes",
+						|cx| {
+							models.iter().all(|model| {
+								model.read_with(cx, |m, _| !m.is_loading)
+							})
+						},
+					);
+				}
+				pump_scan_until(
+					cx,
+					"scan recovery without Refresh in both restored tabs",
+					|cx| {
+						models.iter().all(|model| {
+							model.read_with(cx, |m, _| {
+								!m.is_loading
+									&& m.remote.scan_error.is_none()
+									&& m.repos.len() == 1
+							})
+						})
+					},
+				);
+				assert_eq!(count(&root, cx), 3);
+				assert_eq!(
+					active(&root, cx),
+					Some(2),
+					"background recovery must not activate its tab"
+				);
+				assert_eq!(
+					root.read_with(cx, |r, _| r
+						.tabs
+						.iter()
+						.map(|t| t.id)
+						.collect::<Vec<_>>()),
+					identities
+				);
+				assert_eq!(saved(fixture.store.path()), fixture.saved);
+				for path in &fixture.paths {
+					assert_eq!(fixture.worker.scan_requests_for_tests(path), 3);
+				}
+				click_id(cx, "ws-tab:1".into());
+				assert!(drawn(cx, "ws-tab-state:1:connected"));
+				assert!(models[0].read_with(cx, |m, _| m
+					.remote
+					.scan_error
+					.is_none() && m
+					.repos
+					.len()
+					== 1));
+			}
+
+			#[gpui::test]
+			fn restored_remote_scan_retry_is_bounded_and_uses_backoff(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(usize::MAX, None);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				let counts = || {
+					fixture
+						.paths
+						.each_ref()
+						.map(|p| fixture.worker.scan_requests_for_tests(p))
+				};
+				for seconds in [1, 2, 4] {
+					let before = counts();
+					cx.executor()
+						.advance_clock(Duration::from_millis(seconds * 500));
+					cx.run_until_parked();
+					assert_eq!(
+						counts(),
+						before,
+						"must wait the {seconds}s backoff"
+					);
+					cx.executor().advance_clock(Duration::from_millis(
+						seconds * 500 + 100,
+					));
+					pump_scan_until(cx, "one failed retry finishes", |cx| {
+						counts().iter().zip(before).all(|(now, old)| *now > old)
+							&& models.iter().all(|m| {
+								m.read_with(cx, |m, _| {
+									!m.is_loading
+										&& m.remote.scan_error.is_some()
+								})
+							})
+					});
+					for (now, old) in counts().into_iter().zip(before) {
+						assert!(
+							(1..=2).contains(&(now - old)),
+							"one job, at most one connection retry"
+						);
+					}
+				}
+				let exhausted = counts();
+				assert!(exhausted.iter().all(|n| (4..=8).contains(n)));
+				cx.executor().advance_clock(Duration::from_secs(60));
+				cx.run_until_parked();
+				assert_eq!(counts(), exhausted, "no unbounded retry loop");
+				for model in &models {
+					model.read_with(cx, |m, _| {
+						assert!(
+							m.remote.scan_error.is_some()
+								&& m.remote.scan_recovery.is_none()
+						)
+					});
+				}
+				assert_eq!(saved(fixture.store.path()), fixture.saved);
+			}
+
+			#[gpui::test]
+			fn restored_remote_scan_recovers_after_a_single_closed_read(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(1, None);
+				let (root, cx) = fixture.launch(cx);
+				let models = [tab(&root, cx, 1), tab(&root, cx, 2)];
+				wait_scaled(
+					cx,
+					"one closed read recovers without Refresh",
+					|cx| {
+						models.iter().all(|model| {
+							model.read_with(cx, |m, _| {
+								m.remote.session.is_some()
+									&& !m.is_loading && m
+									.remote
+									.scan_error
+									.is_none() && m.repos.len() == 1
+							})
+						})
+					},
+				);
+				for path in &fixture.paths {
+					assert_eq!(fixture.worker.scan_requests_for_tests(path), 2);
+				}
+				assert_eq!(saved(fixture.store.path()), fixture.saved);
+			}
+
+			#[gpui::test]
+			fn restored_remote_scan_and_tree_reuse_the_successful_open_client(
+				cx: &mut TestAppContext,
+			) {
+				use crate::open_tabs::{OpenTabs, SavedTab};
+				let _remote = remote_lock();
+				let tmp = tempfile::tempdir().unwrap();
+				let path = dunce::canonicalize(tmp.path())
+					.unwrap()
+					.display()
+					.to_string();
+				let worker = std::sync::Arc::new(snip_remote::Worker::new(
+					snip_remote::WorkerOptions::default(),
+				));
+				worker.set_scan_failures_for_tests(&path, 0, None);
+				let host = snip_remote::RemoteHost::in_process(worker.clone());
+				let saved = OpenTabs {
+					tabs: vec![SavedTab::Remote {
+						host: host.name.clone(),
+						path: path.clone(),
+					}],
+					active: Some(0),
+				};
+				let (root, cx) =
+					crate::remote::with_test_hosts(vec![host], || {
+						launch_tabs(
+							cx,
+							Launch {
+								restore: Some(saved),
+								first: FirstTab::Empty,
+								restore_dir: None,
+								store: None,
+							},
+						)
+					});
+				let model = tab(&root, cx, 0);
+				wait_scaled(cx, "empty remote scan and tree complete", |cx| {
+					model.read_with(cx, |m, _| {
+						m.remote.session.is_some()
+							&& !m.is_loading && m.remote.scan_error.is_none()
+							&& m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
+					})
+				});
+				assert_eq!(worker.scan_requests_for_tests(&path), 1);
+				assert_eq!(worker.started_connections_for_tests(), 1,
+					"the test executor's sequential scan/tree must reuse the probed connection");
+			}
+
+			#[gpui::test]
+			fn restored_remote_scan_forbidden_is_not_retried(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(
+					0,
+					Some(snip_remote::proto::ErrorCode::Forbidden),
+				);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				let generations = models
+					.each_ref()
+					.map(|m| m.read_with(cx, |m, _| m.discovery_generation));
+				cx.executor().advance_clock(Duration::from_secs(60));
+				cx.run_until_parked();
+				for (ix, model) in models.iter().enumerate() {
+					assert_eq!(
+						fixture
+							.worker
+							.scan_requests_for_tests(&fixture.paths[ix]),
+						1
+					);
+					model.read_with(cx, |m, _| {
+						assert_eq!(m.discovery_generation, generations[ix]);
+						assert!(
+							m.remote.scan_error.is_some()
+								&& m.remote.scan_recovery.is_none()
+						);
+					});
+				}
+			}
+
+			#[gpui::test]
+			fn restored_remote_scan_old_worker_is_not_retried(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::with_options(
+					0,
+					None,
+					snip_remote::WorkerOptions {
+						name: "ancient".into(),
+						max_protocol: Some(1),
+					},
+				);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				let generations = models
+					.each_ref()
+					.map(|m| m.read_with(cx, |m, _| m.discovery_generation));
+				let connections =
+					fixture.worker.started_connections_for_tests();
+				cx.executor().advance_clock(Duration::from_secs(60));
+				cx.run_until_parked();
+				assert_eq!(
+					fixture.worker.started_connections_for_tests(),
+					connections
+				);
+				for (ix, model) in models.iter().enumerate() {
+					model.read_with(cx, |m, _| {
+						assert_eq!(m.discovery_generation, generations[ix]);
+						assert_eq!(
+							m.remote.scan_error.as_ref().unwrap().key,
+							"remote_worker_too_old"
+						);
+						assert!(m.remote.scan_recovery.is_none());
+					});
+				}
+			}
+
+			#[gpui::test]
+			fn restored_remote_scan_retry_is_cancelled_by_close_and_quit_gestures(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(usize::MAX, None);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				let background_client = models[0].read_with(cx, |m, _| {
+					std::sync::Arc::downgrade(
+						&m.remote.session.as_ref().unwrap().client,
+					)
+				});
+				let before =
+					fixture.worker.scan_requests_for_tests(&fixture.paths[0]);
+				click_id(cx, "ws-tab-close:1".into());
+				wait(cx, "background retry cancelled and tab closed", |cx| {
+					count(&root, cx) == 2
+						&& background_client.upgrade().is_none()
+				});
+				assert_eq!(
+					fixture.worker.scan_requests_for_tests(&fixture.paths[0]),
+					before
+				);
+				assert_eq!(tab(&root, cx, 1), models[1]);
+				let active_before =
+					fixture.worker.scan_requests_for_tests(&fixture.paths[1]);
+				cx.simulate_keystrokes("cmd-q");
+				wait(cx, "quit cancels pending retry", |cx| {
+					root.read_with(cx, |r, _| r.quit_sent)
+				});
+				cx.executor().advance_clock(Duration::from_secs(60));
+				cx.run_until_parked();
+				assert_eq!(
+					fixture.worker.scan_requests_for_tests(&fixture.paths[0]),
+					before
+				);
+				assert_eq!(
+					fixture.worker.scan_requests_for_tests(&fixture.paths[1]),
+					active_before
+				);
+			}
+
+			#[gpui::test]
+			fn restored_remote_scan_refresh_replaces_the_pending_retry(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(usize::MAX, None);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				for path in &fixture.paths {
+					fixture.worker.set_scan_failures_for_tests(path, 0, None);
+				}
+				let before =
+					fixture.worker.scan_requests_for_tests(&fixture.paths[1]);
+				click_id(cx, "btn-refresh".into());
+				pump_scan_until(cx, "Refresh recovers the active tab", |cx| {
+					models[1].read_with(cx, |m, _| {
+						!m.is_loading
+							&& m.remote.scan_error.is_none()
+							&& m.repos.len() == 1
+					})
+				});
+				let refreshed =
+					fixture.worker.scan_requests_for_tests(&fixture.paths[1]);
+				assert_eq!(refreshed, before + 1);
+				cx.executor().advance_clock(Duration::from_secs(30));
+				cx.run_until_parked();
+				assert_eq!(
+					fixture.worker.scan_requests_for_tests(&fixture.paths[1]),
+					refreshed,
+					"old timer must not launch a second scan"
+				);
+				assert_eq!(active(&root, cx), Some(2));
+			}
+
+			#[gpui::test]
+			fn restored_initial_remote_scan_resumes_after_quit_is_aborted(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(usize::MAX, None);
+				let (root, cx) = fixture.launch(cx);
+				let models = initial_scan_failures(&root, cx);
+				let local = tab(&root, cx, 0);
+				let held = hold_job(&local, cx, JobKind::UncancellableRead);
+				cx.simulate_keystrokes("cmd-q");
+				settle(cx);
+				assert!(!root.read_with(cx, |r, _| r.quit_sent));
+				for path in &fixture.paths {
+					fixture.worker.set_scan_failures_for_tests(path, 0, None);
+				}
+				local.update(cx, |m, cx| {
+					let step = m.lifecycle.poll_at(
+						std::time::Instant::now()
+							+ crate::lifecycle::DRAIN_DEADLINE,
+						crate::lifecycle::GitLoad::idle(),
+					);
+					assert!(matches!(
+						step,
+						crate::lifecycle::Step::Failed { .. }
+					));
+					m.resume_after_drain(cx);
+					cx.emit(TabEvent::DrainFailed);
+				});
+				held.set(true);
+				wait(cx, "initial scans resume after stopped quit", |cx| {
+					models.iter().all(|model| {
+						model.read_with(cx, |m, _| {
+							m.remote.session.is_some()
+								&& !m.is_loading && m.remote.scan_error.is_none()
+								&& m.repos.len() == 1
+						})
+					})
+				});
+				assert_eq!(count(&root, cx), 3);
+				assert_eq!(tab(&root, cx, 1), models[0]);
+				assert_eq!(tab(&root, cx, 2), models[1]);
+				assert!(!root.read_with(cx, |r, _| r.quit_sent));
+			}
+
+			#[gpui::test]
+			fn restored_remote_open_missing_workspace_is_not_retried(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let mut fixture = ScanRestoreFixture::new(0, None);
+				let missing = format!("{}/missing", fixture.paths[1]);
+				fixture.saved.tabs[2] = crate::open_tabs::SavedTab::Remote {
+					host: fixture.host.name.clone(),
+					path: missing,
+				};
+				let (root, cx) = fixture.launch(cx);
+				let model = tab(&root, cx, 2);
+				pump_scan_until(cx, "missing workspace open fails", |cx| {
+					model.read_with(cx, |m, _| {
+						!m.remote.busy
+							&& m.remote
+								.restoring
+								.as_ref()
+								.is_some_and(|r| r.failed.is_some())
+					})
+				});
+				wait_scaled(
+					cx,
+					"background opens after the active permanent failure",
+					|cx| {
+						tab(&root, cx, 1).read_with(cx, |m, _| {
+							m.remote.session.is_some()
+								&& !m.is_loading && m.repos.len() == 1
+						})
+					},
+				);
+				model.read_with(cx, |m, _| {
+					assert_eq!(
+						m.remote.restoring.as_ref().unwrap().attempts,
+						1
+					);
+					assert!(m.remote.session.is_none());
+				});
+				cx.executor().advance_clock(Duration::from_secs(60));
+				cx.run_until_parked();
+				model.read_with(cx, |m, _| {
+					assert_eq!(
+						m.remote.restoring.as_ref().unwrap().attempts,
+						1,
+						"permanent refusal must not be retried"
+					);
+					assert_eq!(m.status.key, "remote_open_failed");
+				});
+				assert_eq!(saved(fixture.store.path()), fixture.saved);
+			}
+
+			#[gpui::test]
+			fn restored_active_remote_workspace_is_opened_before_background(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(0, None);
+				let (root, cx) = fixture.launch(cx);
+				wait_scaled(
+					cx,
+					"both remote workspaces finish opening",
+					|cx| {
+						[1, 2].into_iter().all(|ix| {
+							tab(&root, cx, ix).read_with(cx, |m, _| {
+								m.remote.session.is_some() && !m.is_loading
+							})
+						})
+					},
+				);
+				assert_eq!(
+					fixture.worker.opened_workspaces_for_tests(),
+					[fixture.paths[1].clone(), fixture.paths[0].clone()]
+				);
+				assert_eq!(saved(fixture.store.path()), fixture.saved);
+			}
+
+			#[gpui::test]
+			fn restored_remote_scan_continuation_retry_keeps_its_scope_and_existing_repos(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(0, None);
+				let deep_parent = Path::new(&fixture.paths[1])
+					.join("d1/d2/d3/d4/d5/d6/d7/d8/d9");
+				fs::create_dir_all(&deep_parent).unwrap();
+				repo(&deep_parent, "deep", &[]);
+				let (root, cx) = fixture.launch(cx);
+				let model = tab(&root, cx, 2);
+				wait_scaled(
+					cx,
+					"initial scan finds one repo and the depth boundary",
+					|cx| {
+						model.read_with(cx, |m, _| {
+							m.remote.session.is_some()
+								&& !m.is_loading && m.repos.len() == 1
+								&& !m.discovery_depth_limited.is_empty()
+						})
+					},
+				);
+				let continued = model
+					.read_with(cx, |m, _| m.discovery_depth_limited[0].clone());
+				cx.simulate_keystrokes("alt-1");
+				settle(cx);
+				fixture.worker.set_scan_failures_for_tests(
+					&fixture.paths[1],
+					2,
+					None,
+				);
+				click_id(cx, "btn-discovery-continue".into());
+				pump_scan_until(
+					cx,
+					"continuation hits the injected scan failure",
+					|cx| {
+						model.read_with(cx, |m, _| {
+							!m.is_loading && m.remote.scan_error.is_some()
+						})
+					},
+				);
+				model.read_with(cx, |m, _| {
+					let retry = m
+						.remote
+						.scan_recovery
+						.as_ref()
+						.expect("continuation retry retained");
+					assert_eq!(retry.under.as_ref(), Some(&continued));
+					assert!(!retry.wipe);
+					assert_eq!(
+						m.repos.len(),
+						1,
+						"partial scan failure must not erase the earlier repo"
+					);
+				});
+				for seconds in [1, 2, 4] {
+					cx.executor().advance_clock(Duration::from_secs(seconds));
+					cx.run_until_parked();
+					pump_scan_until(
+						cx,
+						"continuation attempt finishes",
+						|cx| model.read_with(cx, |m, _| !m.is_loading),
+					);
+				}
+				model.read_with(cx, |m, _| {
+					assert!(m.remote.scan_error.is_none());
+					let mut names: Vec<_> =
+						m.repos.iter().map(|r| r.name.as_str()).collect();
+					names.sort_unstable();
+					assert_eq!(names, ["active", "deep"]);
+				});
+			}
+
+			#[gpui::test]
+			fn closing_the_prioritized_restore_releases_background_workspaces(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(0, None);
+				let (root, cx) = crate::remote::with_test_restore_delay(
+					&fixture.paths[1],
+					crate::remote::RESTORE_PRIORITY_LIMIT * 4,
+					|| fixture.launch(cx),
+				);
+				cx.run_until_parked();
+				assert!(tab(&root, cx, 2).read_with(cx, |m, _| m.remote.busy));
+				assert_eq!(fixture.worker.started_connections_for_tests(), 0);
+				let bounds = cx
+					.debug_bounds("ws-tab-close:2")
+					.expect("active restore close button drawn");
+				cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+				wait_scaled(
+					cx,
+					"active restore closes and background finishes",
+					|cx| {
+						count(&root, cx) == 2
+							&& tab(&root, cx, 1).read_with(cx, |m, _| {
+								m.remote.session.is_some()
+									&& !m.is_loading && m.repos.len() == 1
+							})
+					},
+				);
+				assert_eq!(
+					saved(fixture.store.path()).tabs,
+					fixture.saved.tabs[..2]
+				);
+				assert_eq!(
+					fixture.worker.opened_workspaces_for_tests(),
+					[fixture.paths[0].clone()]
+				);
+			}
+
+			#[gpui::test]
+			fn prioritized_remote_restore_wait_has_a_deadline(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let fixture = ScanRestoreFixture::new(0, None);
+				let limit = crate::remote::RESTORE_PRIORITY_LIMIT;
+				let (root, cx) = crate::remote::with_test_restore_delay(
+					&fixture.paths[1],
+					limit * 4,
+					|| fixture.launch(cx),
+				);
+				cx.run_until_parked();
+				cx.executor()
+					.advance_clock(limit - Duration::from_millis(100));
+				cx.run_until_parked();
+				assert_eq!(
+					fixture.worker.started_connections_for_tests(),
+					0,
+					"same-host background waits before priority deadline"
+				);
+				cx.executor().advance_clock(Duration::from_millis(150));
+				wait_scaled(
+					cx,
+					"background opens after bounded priority wait",
+					|cx| {
+						tab(&root, cx, 1).read_with(cx, |m, _| {
+							m.remote.session.is_some()
+								&& !m.is_loading && m.repos.len() == 1
+						})
+					},
+				);
+				assert_eq!(
+					fixture.worker.opened_workspaces_for_tests(),
+					[fixture.paths[0].clone()]
+				);
+				assert!(tab(&root, cx, 2).read_with(cx, |m, _| m.remote.busy
+					&& m.remote.session.is_none()));
+				assert_eq!(active(&root, cx), Some(2));
+				cx.simulate_keystrokes("cmd-q");
+				wait(cx, "quit cancels delayed priority leader", |cx| {
+					root.read_with(cx, |r, _| r.quit_sent)
+				});
+			}
+
+			#[gpui::test]
+			fn prioritized_remote_restore_does_not_block_another_host(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let mut fixture = ScanRestoreFixture::new(0, None);
+				let other_worker =
+					std::sync::Arc::new(snip_remote::Worker::new(
+						snip_remote::WorkerOptions::default(),
+					));
+				other_worker.set_scan_failures_for_tests(
+					&fixture.paths[0],
+					0,
+					None,
+				);
+				let mut other_host =
+					snip_remote::RemoteHost::in_process(other_worker.clone());
+				other_host.name = "other-worker".into();
+				fixture.saved.tabs[1] = crate::open_tabs::SavedTab::Remote {
+					host: other_host.name.clone(),
+					path: fixture.paths[0].clone(),
+				};
+				let (root, cx) = crate::remote::with_test_restore_delay(
+					&fixture.paths[1],
+					crate::remote::RESTORE_PRIORITY_LIMIT * 4,
+					|| {
+						fixture.launch_with_hosts(
+							cx,
+							vec![fixture.host.clone(), other_host],
+						)
+					},
+				);
+				let other = tab(&root, cx, 1);
+				pump_scan_until(
+					cx,
+					"another host opens without waiting for the leader",
+					|cx| {
+						if other.read_with(cx, |m, _| m.lifecycle.is_draining())
+						{
+							cx.executor()
+								.advance_clock(Duration::from_millis(50));
+						}
+						other.read_with(cx, |m, _| {
+							m.remote.session.is_some()
+								&& !m.is_loading && m.repos.len() == 1
+						})
+					},
+				);
+				assert_eq!(fixture.worker.started_connections_for_tests(), 0);
+				assert_eq!(
+					other_worker.opened_workspaces_for_tests(),
+					[fixture.paths[0].clone()]
+				);
+				cx.simulate_keystrokes("cmd-q");
+				wait(cx, "quit cancels delayed other host", |cx| {
+					root.read_with(cx, |r, _| r.quit_sent)
+				});
+			}
+
 			/// A launch reopens the saved tabs in order and shows the one
 			/// that was shown. A remote tab whose host cannot be reached
 			/// keeps its place and says why, and connects on a later try.
@@ -17006,6 +17853,12 @@ mod tests {
 						!restoring.read_with(cx, |m, _| m.remote.busy)
 					});
 				}
+				if first_fails {
+					// The first cancelled open may still answer late. Make
+					// the folder available before the genuine resumed open;
+					// a new NotFound refusal is permanent, not a retry signal.
+					fs::create_dir(&path).unwrap();
+				}
 				// The other tab's real Lifecycle reports the same deadline
 				// failure as poll_lifecycle, without sleeping eight seconds.
 				blocker.update(cx, |m, cx| {
@@ -17034,9 +17887,6 @@ mod tests {
 									.is_some_and(|r| r.attempts > 1)
 							})
 					});
-				}
-				if first_fails {
-					fs::create_dir(&path).unwrap();
 				}
 				cx.executor().advance_clock(Duration::from_secs(2));
 				wait(
