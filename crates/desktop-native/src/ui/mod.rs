@@ -711,6 +711,24 @@ fn skip_reason_key(cause: SkipCause) -> &'static str {
 		Unreadable => "reason_nc_unreadable",
 		UnsafePath => "reason_skip_unsafe_path",
 		NonUtf8Target => "reason_skip_non_utf8_target",
+		ProtectedGitMetadata => "reason_skip_git_metadata",
+		Restore(reason) => match reason {
+			snip_core::restore::SkipReason::AlreadyAbsent => {
+				"reason_delete_missing"
+			}
+			snip_core::restore::SkipReason::UnresolvedPath => {
+				"reason_skip_unresolved"
+			}
+			snip_core::restore::SkipReason::AmbiguousPath => {
+				"reason_skip_ambiguous"
+			}
+			snip_core::restore::SkipReason::PlaceholderBody => {
+				"reason_skip_placeholder"
+			}
+			snip_core::restore::SkipReason::NonUtf8Target => {
+				"reason_skip_non_utf8_target"
+			}
+		},
 		Other => "reason_skip_generic",
 	}
 }
@@ -2409,6 +2427,10 @@ mod tests {
 				SkipCause::Unreadable,
 				SkipCause::UnsafePath,
 				SkipCause::NonUtf8Target,
+				SkipCause::ProtectedGitMetadata,
+				SkipCause::Restore(
+					snip_core::restore::SkipReason::UnresolvedPath,
+				),
 				SkipCause::Other,
 			];
 			let mut out = Vec::new();
@@ -2426,6 +2448,8 @@ mod tests {
 						out.push(SkipCause::NonUtf8Target)
 					}
 					SkipCause::Other => out.push(SkipCause::Other),
+					SkipCause::ProtectedGitMetadata => out.push(cause),
+					SkipCause::Restore(_) => out.push(cause),
 				}
 			}
 			out

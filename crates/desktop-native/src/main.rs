@@ -641,6 +641,56 @@ enum PasteDiffOutcome {
 	Binary,
 	TooLarge,
 	Unreadable,
+	Notice(Msg),
+}
+
+impl PasteDiffOutcome {
+	fn commit(
+		request: paste::CommitDiffRequest,
+		cancel: CancelToken,
+		skip_notice: &'static str,
+	) -> Self {
+		use snip_core::transfer::ReplayPreviewUnavailable as Why;
+		let opts = snip_core::gitrun::RunOptions::preview(Some(cancel.clone()));
+		match request.target.preview_commit_file(
+			&request.preview,
+			request.commit,
+			request.file,
+			request.side,
+			snip_core::browser::PREVIEW_LIMIT,
+			&opts,
+		) {
+			Ok(preview) => match preview.unavailable {
+				Some(why) => PasteDiffOutcome::Notice(Msg::new(
+					match why {
+						Why::Skipped => skip_notice,
+						Why::Binary => "paste_diff_binary",
+						Why::TooLarge => "paste_diff_too_large",
+						Why::Symlink => "paste_diff_symlink",
+						Why::Directory => "paste_diff_directory",
+						Why::Unreadable => "paste_diff_unreadable",
+					},
+					[],
+				)),
+				None if preview.before == preview.after => {
+					PasteDiffOutcome::Same
+				}
+				None => {
+					let (patch, truncated) = snip_core::textdiff::unified(
+						&preview.path,
+						&preview.before,
+						&preview.after,
+						snip_core::browser::PREVIEW_LIMIT,
+					);
+					PasteDiffOutcome::Diff(patch, truncated)
+				}
+			},
+			Err(err) => PasteDiffOutcome::Notice(Msg::new(
+				"paste_diff_failed",
+				[err.to_string()],
+			)),
+		}
+	}
 }
 
 pub struct WorkbenchModel {
@@ -5165,24 +5215,47 @@ impl WorkbenchModel {
 		let Some(item) = plan.items.get(idx) else {
 			return;
 		};
-		if item.commit.is_some() || !item.overwritable() {
+		if item.commit.is_none() && !item.overwritable() {
 			return;
 		}
+		let commit_request = match self.paste.commit_diff_request(idx) {
+			Ok(request) => request,
+			Err(msg) => {
+				self.set_status_msg(msg);
+				cx.notify();
+				return;
+			}
+		};
+		let skip_notice = if matches!(
+			item.op,
+			paste::PlannedOp::Skip(_) | paste::PlannedOp::CommitRefused(_)
+		) {
+			crate::ui::paste_op(item).2
+		} else {
+			"paste_diff_not_applied"
+		};
 
 		let cancel = arm_cancel(&mut self.paste_diff_cancel);
 		let task_gen = self.paste_diff_generation;
 		let selected_idx = idx;
 		let item_path = item.path.clone();
-		let item_content = item.content.clone();
+		// Commit reads already own a charged core preview. Their unused UI
+		// body must not survive cancel/clear as an uncharged second copy.
+		let item_content = if commit_request.is_some() {
+			Arc::from("")
+		} else {
+			item.content.clone()
+		};
 		let dest_root = item.dest_root.clone();
 		let dest_path = item.dest_path.clone();
 		let remote = plan.remote.clone();
-		let kind = if remote.is_some() {
+		let cancellable = remote.is_some() || commit_request.is_some();
+		let kind = if cancellable {
 			lifecycle::JobKind::CancellableRead
 		} else {
 			lifecycle::JobKind::UncancellableRead
 		};
-		let job_cancel = remote.is_some().then(|| cancel.clone());
+		let job_cancel = cancellable.then(|| cancel.clone());
 		let delay = self.e2e_read_delay;
 
 		let mut async_app = cx.to_async();
@@ -5193,7 +5266,13 @@ impl WorkbenchModel {
 			let for_bg_path = item_path.clone();
 			let outcome = bg
 				.spawn(async move {
-					let outcome = if let Some(ref rem) = remote {
+					let outcome = if let Some(request) = commit_request {
+						PasteDiffOutcome::commit(
+							request,
+							cancel.clone(),
+							skip_notice,
+						)
+					} else if let Some(ref rem) = remote {
 						// The worker plans under its workspace's real path, which
 						// is also the workspace id; never resolve it on this machine.
 						let rel = remote::worker_rel(
@@ -5303,6 +5382,17 @@ impl WorkbenchModel {
 				}
 
 				let (preview, state) = match outcome {
+					PasteDiffOutcome::Notice(notice) => {
+						let mut p = Preview::new(
+							PreviewSource::PasteItem,
+							Some(item.path.clone()),
+							item.content.to_string(),
+							false,
+							Language::from_path_or_ext(&item.path, false),
+						);
+						p.notice = Some(notice.render(model.locale));
+						(p, "unavailable")
+					}
 					PasteDiffOutcome::Same => {
 						let mut p = Preview::new(
 							PreviewSource::PasteItem,
@@ -5463,7 +5553,7 @@ impl WorkbenchModel {
 								"[APP:PASTE_DONE: created={} overwritten={} skipped={} deleted={} errors={} commits={}]",
 								result.files.created_count,
 								result.files.overwritten_count,
-								result.files.skipped_existing_count,
+								result.files.total_skipped(),
 								result.files.deleted_count,
 								result.files.errors.len(),
 								result.created_commits.len()
@@ -9308,7 +9398,12 @@ mod tests {
 				let plan = m.paste.plan().unwrap();
 				let paths: Vec<_> =
 					plan.items.iter().map(|i| i.path.as_str()).collect();
-				assert_eq!(paths, ["d.txt"]);
+				assert_eq!(paths, ["d.txt", ".git/hooks/pre-commit"]);
+				assert!(plan.items[1].planned_skip());
+				assert_eq!(
+					crate::ui::paste_op(&plan.items[1]).2,
+					"reason_skip_git_metadata"
+				);
 				assert_eq!(plan.counts().skips, 1);
 			});
 			remote_paste_apply(&model, cx);
@@ -12699,6 +12794,389 @@ mod tests {
 				fs::read_to_string(beta.join("unrelated.txt")).unwrap(),
 				"beta new"
 			);
+		}
+
+		#[gpui::test]
+		fn commit_paste_clicks_show_sequential_destination_diffs(
+			cx: &mut TestAppContext,
+		) {
+			assert_commit_paste_diffs(cx, false);
+		}
+
+		#[gpui::test]
+		fn remote_commit_paste_clicks_show_sequential_destination_diffs(
+			cx: &mut TestAppContext,
+		) {
+			let _remote = remote_lock();
+			assert_commit_paste_diffs(cx, true);
+		}
+
+		fn assert_commit_paste_diffs(cx: &mut TestAppContext, remote: bool) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+				NotCopiedReason,
+			};
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let dest = repo(ws.path(), "dest", &[]);
+			for (path, text) in [
+				("common.txt", "already\n"),
+				("delete.txt", "delete me\n"),
+				("old.txt", "old name\n"),
+			] {
+				fs::write(dest.join(path), text).unwrap();
+			}
+			git(&dest, &["add", "."]);
+			git(&dest, &["commit", "-qm", "destination"]);
+			let file = |path: &str, change, content: Option<&str>| CommitFile {
+				path: path.into(),
+				old_path: None,
+				change,
+				content: content.map(Into::into),
+				not_copied: None,
+			};
+			let record = |message: &str, files| CommitRecord {
+				message: message.into(),
+				author_name: "Ann".into(),
+				author_email: "ann@example.invalid".into(),
+				author_date: "2026-10-13T12:00:00+00:00".into(),
+				files,
+			};
+			let mut renamed =
+				file("new.txt", FileChange::Renamed, Some("renamed\n"));
+			renamed.old_path = Some("old.txt".into());
+			let mut binary = file("img.bin", FileChange::Added, None);
+			binary.not_copied = Some(NotCopiedReason::Binary);
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![
+						record(
+							"C1",
+							vec![
+								file(
+									"common.txt",
+									FileChange::Modified,
+									Some("c1\n"),
+								),
+								file("delete.txt", FileChange::Deleted, None),
+								renamed,
+								binary,
+							],
+						),
+						record(
+							"C2",
+							vec![file(
+								"common.txt",
+								FileChange::Modified,
+								Some("c2\n"),
+							)],
+						),
+					],
+				});
+			let before_index = fs::read(dest.join(".git/index")).unwrap();
+			let before_head =
+				fs::read(dest.join(".git/refs/heads/main")).unwrap();
+			let (model, cx) = if remote {
+				let (model, cx, _worker) = open_remote(
+					cx,
+					ws.path(),
+					snip_remote::WorkerOptions::default(),
+				);
+				cx.simulate_resize(gpui::size(
+					gpui::px(1440.),
+					gpui::px(1100.),
+				));
+				remote_paste_preview(&model, cx, &payload);
+				(model, cx)
+			} else {
+				let (model, cx) = open_sized(
+					cx,
+					ws.path().to_path_buf(),
+					Some(dest.clone()),
+					1440.,
+					1100.,
+				);
+				paste(&model, cx, &payload);
+				(model, cx)
+			};
+			for (row, removed, added) in [
+				("paste-row:0:common.txt", "-already\n", "+c1\n"),
+				("paste-row:5:common.txt", "-c1\n", "+c2\n"),
+				("paste-row:1:delete.txt", "-delete me\n", ""),
+				("paste-row:2:old.txt", "-old name\n", ""),
+				("paste-row:3:new.txt", "", "+renamed\n"),
+			] {
+				click(cx, row);
+				wait_paste_detail(&model, cx);
+				assert!(cx.debug_bounds("paste-commit-metadata").is_some());
+				model.read_with(cx, |m, _| {
+					let detail = m.paste.detail().expect("selected preview");
+					assert!(detail.is_diff, "{row}: {}", detail.text);
+					assert!(
+						detail.text.contains(removed),
+						"{row}: {}",
+						detail.text
+					);
+					assert!(
+						detail.text.contains(added),
+						"{row}: {}",
+						detail.text
+					);
+					assert!(
+						!detail.text.contains("author:"),
+						"metadata is not file content"
+					);
+				});
+				click(cx, "btn-diff-mode");
+				assert_eq!(
+					model.read_with(cx, |m, _| m.reader.diff_mode),
+					crate::reader::DiffMode::SideBySide
+				);
+				click(cx, "btn-diff-mode");
+			}
+			click(cx, "paste-row:4:img.bin");
+			wait_paste_detail(&model, cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(
+					m.paste.detail().unwrap().notice.as_deref(),
+					Some(crate::i18n::t("reason_nc_binary", m.locale))
+				);
+				assert!(m.paste.plan().unwrap().overwrite_missing());
+			});
+			// A narrow window must still expose both metadata and the diff
+			// switch; debug ids alone could exist outside the clipped panel.
+			cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
+			click(cx, "paste-row:0:common.txt");
+			wait_paste_detail(&model, cx);
+			assert_paste_control_in_view(cx, "paste-commit-metadata");
+			assert_paste_control_in_view(cx, "btn-diff-mode");
+			click(cx, "btn-diff-mode");
+			assert_eq!(
+				model.read_with(cx, |m, _| m.reader.diff_mode),
+				crate::reader::DiffMode::SideBySide
+			);
+			for (path, text) in [
+				("common.txt", "already\n"),
+				("delete.txt", "delete me\n"),
+				("old.txt", "old name\n"),
+			] {
+				assert_eq!(fs::read_to_string(dest.join(path)).unwrap(), text);
+			}
+			assert!(!dest.join("new.txt").exists());
+			assert!(!dest.join("img.bin").exists());
+			assert_eq!(
+				fs::read(dest.join(".git/index")).unwrap(),
+				before_index
+			);
+			assert_eq!(
+				fs::read(dest.join(".git/refs/heads/main")).unwrap(),
+				before_head
+			);
+		}
+
+		fn wait_paste_detail(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			for _ in 0..100 {
+				settle(cx);
+				if model.read_with(cx, |m, _| {
+					m.paste
+						.detail()
+						.is_some_and(|p| p.is_diff || p.notice.is_some())
+				}) {
+					return;
+				}
+				std::thread::sleep(snip_native_e2e::scaled(
+					Duration::from_millis(10),
+				));
+			}
+			panic!("selected paste diff did not finish");
+		}
+
+		fn assert_paste_control_in_view(
+			cx: &mut VisualTestContext,
+			id: &'static str,
+		) {
+			let bounds = cx
+				.debug_bounds(id)
+				.unwrap_or_else(|| panic!("missing {id}"));
+			assert!(
+				f32::from(bounds.origin.x) >= 0.
+					&& f32::from(bounds.origin.y) >= 0.
+					&& f32::from(bounds.origin.x + bounds.size.width) <= 900.
+					&& f32::from(bounds.origin.y + bounds.size.height) <= 600.,
+				"{id} is outside the visible 900x600 window: {bounds:?}"
+			);
+		}
+
+		#[gpui::test]
+		fn protected_paste_mapping_shows_rejection_and_counts_without_writing(
+			cx: &mut TestAppContext,
+		) {
+			assert_protected_paste_mapping(cx, false);
+		}
+
+		#[gpui::test]
+		fn remote_protected_paste_mapping_shows_rejection_and_counts_without_writing(
+			cx: &mut TestAppContext,
+		) {
+			let _remote = remote_lock();
+			assert_protected_paste_mapping(cx, true);
+		}
+
+		fn assert_protected_paste_mapping(
+			cx: &mut TestAppContext,
+			remote: bool,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let dest =
+				repo(ws.path(), "target", &[("keep.txt", "keep original")]);
+			let (model, cx) = if remote {
+				let (model, cx, _worker) = open_remote(
+					cx,
+					ws.path(),
+					snip_remote::WorkerOptions::default(),
+				);
+				cx.simulate_resize(gpui::size(gpui::px(1440.), gpui::px(900.)));
+				(model, cx)
+			} else {
+				open_sized(
+					cx,
+					ws.path().to_path_buf(),
+					Some(dest.clone()),
+					1440.,
+					900.,
+				)
+			};
+			for mixed in [false, true] {
+				cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(600.)));
+				let mut payload = "// FILE: target/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n".to_string();
+				if mixed {
+					payload.push_str("// FILE: target/good.txt\ngood\n// FILE: target/keep.txt\nincoming\n");
+				}
+				if remote {
+					remote_paste_preview(&model, cx, &payload);
+				} else {
+					paste(&model, cx, &payload);
+				}
+				let pick = model.read_with(cx, |m, _| {
+					let choice = &m.paste.plan().unwrap().prefix_choices[0];
+					let wanted = if remote {
+						m.repo_root().unwrap()
+					} else {
+						dunce::canonicalize(&dest).unwrap()
+					};
+					choice.candidates.iter().position(|p| p == &wanted).unwrap()
+				});
+				click(
+					cx,
+					Box::leak(
+						format!("paste-map-pick:target:{pick}")
+							.into_boxed_str(),
+					),
+				);
+				for _ in 0..100 {
+					settle(cx);
+					if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+						break;
+					}
+					std::thread::sleep(snip_native_e2e::scaled(
+						Duration::from_millis(10),
+					));
+				}
+				let ix = model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					assert_eq!(
+						plan.items.len(),
+						if mixed { 3 } else { 1 },
+						"protected paths remain visible"
+					);
+					let ix = plan
+						.items
+						.iter()
+						.position(|i| i.path == "target/.git/hooks/pre-commit")
+						.unwrap();
+					assert!(matches!(
+						plan.items[ix].op,
+						crate::paste::PlannedOp::Skip(_)
+					));
+					assert_eq!(
+						crate::ui::paste_op(&plan.items[ix]).2,
+						"reason_skip_git_metadata"
+					);
+					assert_eq!(plan.counts().skips, if mixed { 2 } else { 1 });
+					ix
+				});
+				assert_paste_control_in_view(cx, Box::leak(format!("paste-skip-reason:{ix}:target/.git/hooks/pre-commit").into_boxed_str()));
+				click(
+					cx,
+					Box::leak(
+						format!("paste-row:{ix}:target/.git/hooks/pre-commit")
+							.into_boxed_str(),
+					),
+				);
+				click(
+					cx,
+					Box::leak(
+						format!(
+							"paste-include:{ix}:target/.git/hooks/pre-commit"
+						)
+						.into_boxed_str(),
+					),
+				);
+				model.read_with(cx, |m, _| {
+					assert!(
+						!m.paste.plan().unwrap().items[ix].selected,
+						"protected row cannot be enabled"
+					)
+				});
+				assert!(
+					!dest.join(".git/hooks/pre-commit").exists(),
+					"preview must not write hook"
+				);
+				cx.simulate_keystrokes("enter");
+				for _ in 0..100 {
+					settle(cx);
+					if model.read_with(cx, |m, _| m.paste.plan().is_none()) {
+						break;
+					}
+					std::thread::sleep(snip_native_e2e::scaled(
+						Duration::from_millis(10),
+					));
+				}
+				model.read_with(cx, |m, _| {
+					assert!(
+						m.paste.plan().is_none(),
+						"apply finished: {}",
+						m.status
+					);
+					let result =
+						&m.toast.as_ref().expect("completion notice").2;
+					if mixed {
+						assert_eq!(result.key, "status_paste_done");
+						assert_eq!(result.args, ["1", "0", "2", "0", "0"]);
+					} else {
+						assert_eq!(result.key, "status_paste_skipped");
+						assert_eq!(result.args, ["1"]);
+					}
+				});
+				assert!(
+					!dest.join(".git/hooks/pre-commit").exists(),
+					"apply must not write hook"
+				);
+				assert_eq!(
+					fs::read_to_string(dest.join("keep.txt")).unwrap(),
+					"keep original"
+				);
+				if mixed {
+					assert_eq!(
+						fs::read_to_string(dest.join("good.txt")).unwrap(),
+						"good"
+					);
+				}
+			}
 		}
 
 		#[gpui::test]

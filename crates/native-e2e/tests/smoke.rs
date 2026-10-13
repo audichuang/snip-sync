@@ -1843,7 +1843,8 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	capture_artifact("workbench_900x600.png");
 
 	// The long directory is an ambiguous prefix. Keep it under the primary
-	// root before the two remaining files (the delete target is gone) appear.
+	// root before the two remaining files and the already-absent deletion
+	// appear. Planning skips stay visible with their reason.
 	send_key("ctrl+v");
 	wait_for_pattern("[APP:PASTE_PREVIEW:", Duration::from_secs(5))
 		.expect("small-window paste preview must open");
@@ -1851,8 +1852,8 @@ fn native_desktop_smoke_and_clipboard_verification() {
 	let mapped = wait_for_pattern("[APP:PASTE_MAPPED:", Duration::from_secs(3))
 		.expect("nested directory must be kept under the primary root");
 	assert!(
-		mapped.contains("items=2"),
-		"confirmed small-window plan must list the two remaining files: {mapped}"
+		mapped.contains("items=3"),
+		"small-window plan must retain the two files and the skipped deletion: {mapped}"
 	);
 	std::thread::sleep(Duration::from_millis(300));
 	for id in [
@@ -1860,6 +1861,7 @@ fn native_desktop_smoke_and_clipboard_verification() {
 		"btn-cancel",
 		"paste-overwrite:existing.txt",
 		&format!("paste-overwrite:{new_rel}"),
+		"paste-skip-reason:2:to_delete.txt",
 	] {
 		control(id);
 	}

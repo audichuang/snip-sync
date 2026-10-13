@@ -23,8 +23,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Newest protocol this build speaks. 2 = Git views, 3 = copy, 4 = paste,
 /// 5 = worker-side change selection ([`Request::ExportChanges`]), whole-folder
-/// export (an empty [`ExportTarget::path`]), and chunked requests.
-pub const PROTOCOL_MAX: u32 = 5;
+/// export (an empty [`ExportTarget::path`]), and chunked requests;
+/// 6 = typed, bounded destination reads for commit paste previews.
+pub const PROTOCOL_MAX: u32 = 6;
 /// The first protocol with Git views.
 pub const GIT_VIEWS_VERSION: u32 = 2;
 /// The first protocol with copy ([`Request::Export`]).
@@ -37,6 +38,8 @@ pub const EXPORT_CHANGES_VERSION: u32 = 5;
 /// The first protocol with a request sent as joined JSON pieces
 /// ([`Request::FrameChunk`]).
 pub const REQUEST_CHUNKS_VERSION: u32 = 5;
+/// The first protocol with a typed commit-paste baseline read.
+pub const REPLAY_PREVIEW_VERSION: u32 = 6;
 /// Payload bytes one [`Response::Chunk`] carries: JSON escaping can grow
 /// text several times and must stay under [`MAX_FRAME`].
 pub const CHUNK_BYTES: usize = 1024 * 1024;
@@ -87,6 +90,14 @@ pub enum Request {
 	Read {
 		workspace: String,
 		path: String,
+	},
+	/// Reads only the original destination file needed by a commit-paste
+	/// preview. Virtual content from preceding commits stays on the master.
+	ReplayRead {
+		workspace: String,
+		/// Worker spelling, interpreted only on the worker's platform.
+		path: std::path::PathBuf,
+		limit: usize,
 	},
 	/// Never served: a paste plans and writes on the worker as a whole
 	/// ([`Request::ImportApply`]); a worker answers `Unsupported`.
@@ -287,6 +298,7 @@ impl Request {
 
 	pub fn needs_version(&self) -> u32 {
 		match self {
+			Self::ReplayRead { .. } => REPLAY_PREVIEW_VERSION,
 			Self::ScanRepos { .. } | Self::GitView { .. } => GIT_VIEWS_VERSION,
 			Self::Export { items, .. }
 				if items.iter().any(|item| item.path.is_empty()) =>
@@ -398,6 +410,7 @@ pub enum Response {
 	ImportPlanned(ImportPlanned),
 	Imported(snip_core::restore::RestoreExecutionResult),
 	ReplayPlanned(ReplayExpect),
+	ReplayRead(snip_core::transfer::ReplayPreviewRead),
 	Replayed(snip_core::commits::ReplayResult),
 	/// A `check_only` replay found nothing changed.
 	Fresh,
@@ -1162,6 +1175,33 @@ mod tests {
 			Some(&request)
 		);
 		assert_eq!(read_frame::<Request>(&mut reader).unwrap(), None);
+	}
+
+	#[test]
+	fn typed_replay_reads_carry_no_payload_and_legacy_results_still_decode() {
+		use snip_core::transfer::{
+			ReplayPreviewRead, ReplayPreviewUnavailable,
+		};
+		let request = Request::ReplayRead {
+			workspace: "workspace".into(),
+			path: "/worker/workspace/file".into(),
+			limit: 1024,
+		};
+		assert_eq!(request.needs_version(), REPLAY_PREVIEW_VERSION);
+		assert!(request.text().is_none());
+		round_trip_check(&request);
+		round_trip_check(&Response::ReplayRead(ReplayPreviewRead::Text(
+			"old\n".into(),
+		)));
+		round_trip_check(&Response::ReplayRead(
+			ReplayPreviewRead::Unavailable(ReplayPreviewUnavailable::Symlink),
+		));
+		let old: Response = serde_json::from_str(r#"{"reply":"imported","createdCount":1,"overwrittenCount":0,"skippedExistingCount":2,"deletedCount":0,"errors":[]}"#).unwrap();
+		let Response::Imported(result) = old else {
+			panic!("wrong result")
+		};
+		assert_eq!(result.planned_skipped_count, 0);
+		assert_eq!(result.total_skipped(), 2);
 	}
 
 	#[test]

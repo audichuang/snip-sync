@@ -248,8 +248,8 @@ ID 以受測 binary 印出的 `CTRL_BOUNDS` 為準。下面是寫這份規程時
 | 篩選選單項目 | 使用者 `log-user:me`、`log-user:<名稱>`，選了印 `[APP:LOG_SEARCH: active=… author=true]`；分支選單打開時群組全收合，先點 `log-branch-group:<key>` 展開（本機分支是 `refs_local`，沒有日誌），再點 `log-branch:<完整 ref>`（如 `log-branch:refs/heads/side`），日誌 `[APP:REF_FILTER: <完整 ref>]`，清除後是 `[APP:REF_FILTER: all]` |
 | 歷史檔案 | `btn-browse-tree:<完整 SHA>`、`rev-row:<path>`、`btn-leave-tree`。檔案列右鍵「複製」複製該檔在這個 commit 的內容；資料夾列的「複製」是停用的 |
 | Git log 變更檔案 | `commit-file:<path>`、`commit-dir:<path>`。資料夾列的選取 key 是 `<path>/`。左鍵資料夾是展開或收合；複製用右鍵 |
-| 貼上 | `btn-apply`、`btn-cancel`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`（`ix` 是計畫內的項目索引，由 `crate::paste::control_id` 產生）、`paste-items` |
-| commit 預覽 | `paste-commit:<c>`（`c` 從 0 起算，是該 commit 的標頭，點擊收合或展開）、`paste-commit-count`、`paste-commit-whole` |
+| 貼上 | `btn-apply`、`btn-cancel`、`paste-row:<ix>:<path>`、`paste-include:<ix>:<path>`、`paste-overwrite:<ix>:<path>`（`ix` 是計畫內的項目索引，由 `crate::paste::control_id` 產生）、`paste-items`、`paste-skip-reason:<ix>:<path>`（規劃略過原因） |
+| commit 預覽 | `paste-commit:<c>`（`c` 從 0 起算，是該 commit 的標頭，點擊收合或展開）、`paste-commit-count`、`paste-commit-whole`、`paste-commit-metadata`（詳情區的 message／作者／時間） |
 | 多 repo 對應 | `paste-mappings`、`paste-map:<prefix>`、`paste-map-target:<prefix>`、`paste-map-pick:<prefix>:<idx>`、`paste-map-keep:<prefix>` |
 | 閱讀器 | `reader`（內文）、`reader-truncated-notice`（截斷提示）、`editor-error`（讀不到或超過 1 MiB）、`find-bar`、`find-input`、`goto-input`、`btn-find-next`、`btn-find-prev`、`btn-diff-mode`（diff 的整合／並排切換，日誌 `[APP:DIFF_MODE: Inline\|SideBySide]`；貼上預覽開著時它在預覽的詳情區，兩處不會同時畫出） |
 | 通知 | `copy-toast`：複製結果的卡片。成功約 4 秒、失敗約 12 秒後消失 |
@@ -258,7 +258,7 @@ Apply 被拒時，日誌一律是 `[APP:PASTE_STALE_DETECTED: <i18n key>]`，連
 
 其他會用到的日誌 tag：`PASTE_SEL_TOGGLED: idx= state=`（勾選是否納入）、`PASTE_TOGGLED: idx= state=`（允許覆寫）、`PASTE_COMMIT_TOGGLED: idx=<c>`、`PASTE_NAV: idx=`、`PASTE_PLAN_CLEARED`、`COPY_COMMITS_DONE: commits=N`、`TOAST: ok=`、`LOG_VIEW: hash`、`WORKSPACE: state=`、`APPLY_IGNORED:`。
 
-第 6 節最後一張表另外用到：`PASTE_DIFF: idx= state=`（檔案模式可覆寫列的 diff；`state` 是 `diff`、`same` 或 `unavailable`）、`DIFF_MODE:`、`COPY_PREP: files=`、`COPY_DONE: copied=N`、`COPY_COMMITS_ERR:`、`RANGE: commits=N chain=`、`COMPARE: from= to=`、`E2E_CHANGES: files=N`（commit 或比較的變更檔案清單載入完成）、`COMMIT_SELECTED:`、`HEAD_LOCATED: row=`、`REF_FILTER:`、`LOG_MENU:`、`LOG_CHIPS:`、`LOG_SEARCH: active= author=`、`LOG_REGEX:`、`LOG_REFRESH`、`TREE_TOGGLED:`、`TREE_SELECTED:`、`SELECTION_COPIED: chars= fnv=`、`FIND_BAR: open`、`FIND: matches= first_line=`、`FIND_AT:`、`GOTO: line=`、`CHANGES_EMPTY: state=`、`LOG_EMPTY: state=`、`DISCOVERY_PROGRESS:`、`READY_REPOS:`。
+第 6 節最後一張表另外用到：`PASTE_DIFF: idx= state=`（檔案模式可覆寫列與 commit 列的 diff；`state` 是 `diff`、`same` 或 `unavailable`）、`DIFF_MODE:`、`COPY_PREP: files=`、`COPY_DONE: copied=N`、`COPY_COMMITS_ERR:`、`RANGE: commits=N chain=`、`COMPARE: from= to=`、`E2E_CHANGES: files=N`（commit 或比較的變更檔案清單載入完成）、`COMMIT_SELECTED:`、`HEAD_LOCATED: row=`、`REF_FILTER:`、`LOG_MENU:`、`LOG_CHIPS:`、`LOG_SEARCH: active= author=`、`LOG_REGEX:`、`LOG_REFRESH`、`TREE_TOGGLED:`、`TREE_SELECTED:`、`SELECTION_COPIED: chars= fnv=`、`FIND_BAR: open`、`FIND: matches= first_line=`、`FIND_AT:`、`GOTO: line=`、`CHANGES_EMPTY: state=`、`LOG_EMPTY: state=`、`DISCOVERY_PROGRESS:`、`READY_REPOS:`。
 
 `[APP:CTRL_GONE: id=<ID>]`：控制項這一幀沒有畫出來（收合、關閉、換頁）。`CTRL_BOUNDS` 只在控制項是新的或位置變了才印，所以「沒有新的 `CTRL_BOUNDS`」不能證明控制項消失，要看 `CTRL_GONE`。控制項再出現時會重新印 `CTRL_BOUNDS`。
 
@@ -468,7 +468,7 @@ commit 預覽與鍵盤的格子，對應 #58 與 #57。除非該格另有說明�
 | ID | 點什麼 | 通過線 |
 |---|---|---|
 | C-group | 開 T19 的預覽（`commits-dst-clean`） | `paste-commit-count` 是「3 個 commit」；`paste-commit:0`、`paste-commit:1`、`paste-commit:2` 依重播順序，文字依序是「#1 多行中文 QA Operator <qa@example.com> 2026-03-02 09:00 1 個檔案，0 個不寫入」、「#2 C2 rename delete emoji … 2026-03-03 09:00 6 個檔案，3 個不寫入」、「#3 C3 merge … 2026-03-05 09:00 1 個檔案，0 個不寫入」。標頭 tooltip 是完整 message 加作者加 ISO 時間（hover 同 B43）。點 `paste-commit:1` 後出現 `[APP:PASTE_COMMIT_TOGGLED: idx=1]`，畫面上 C2 的 6 列消失，日誌有 6 行 `[APP:CTRL_GONE: id=paste-row:1:binary.dat]` … `[APP:CTRL_GONE: id=paste-row:6:new.txt]`，以及對應的 `paste-include:1:…`–`paste-include:6:…` 的 `CTRL_GONE`（`paste-row` 的完整 ID 抄自 `CTRL_BOUNDS`）；再點一次列回來，這 6 個 ID 各有新的 `CTRL_BOUNDS`。只有「沒有新的 `CTRL_BOUNDS`」不算證據。摘要是建立 5、覆寫 0/0、刪除 0、跳過 3。T18 在 `commits-dst-overwrite` 上的 C2 標頭同樣是「6 個檔案，3 個不寫入」 |
-| C-detail | T18 的預覽，點 `paste-row:0:common.txt` | `[APP:PASTE_NAV: idx=0]`；詳情標題是「common.txt → <目的端絕對路徑>」，內容以「commit: 多行中文」開頭。commit 重播列目前維持來源內容檢視，規格 4.3 的 commit 模式 diff 維持記為規格落差（第 9 節），不判這格 `fail`。檔案還原模式之覆寫列（規格 3.2）則必須顯示 diff（見 T05） |
+| C-detail | T18 的預覽，點 `paste-row:0:common.txt`，再點 `btn-diff-mode` 兩次；另以連續兩個 commit 改同一個文字檔的 payload，依序點兩筆列 | 詳情標題是「common.txt → <目的端絕對路徑>」，commit message、作者、時間仍可見。第一筆 diff 必須含目的端原文的刪除行及來源新增行；第二筆以第一筆重播後的虛擬內容為基準，不能仍與初始磁碟比較。選列有 `PASTE_NAV`／`PASTE_DIFF`，兩次切換有不同的 `DIFF_MODE: Inline\|SideBySide`，兩種畫面均可讀到差異（轉錄 `screen_text`）。預覽前後目的端檔案、HEAD、index 不變。缺 diff 判 `fail`，不再列為規格落差 |
 | C-reason | 在 T19／T22（`commits-dst-clean`）、T26、T31、T25 的預覽裡，逐列點 `paste-row:<ix>:<path>` | 每次出現 `[APP:PASTE_NAV: idx=<ix>]`，詳情列依序是：二進位（T26 的 `new-binary.bin`、T25 的 `binary.dat`）「未複製：二進位檔，不寫入也不刪除」；版面衝突拒絕（T31 的 `newdir/content.txt`）「整個 commit 會被拒絕：父目錄被檔案佔住」；目的端不存在的刪除（只在 T19／T22 的預覽有，`commits-dst-clean` 的 `old.txt`、`gone.txt`；T25 在 `commits-dst-present` 上同一列是「刪除」）「目的地不存在，無需刪除」。每一列的詳情都不是「此檔案不會寫入」（`reason_skip_generic`）這句泛用話。目的端不存在的刪除列被選取時，下方不顯示紅色區塊「將刪除目的地檔案，不寫入內容」（`reason_delete`）；若出現紅色區塊則視為回歸，判 `ui-defect` |
 | C-nonutf8 | 開 `nonutf8-src`，選 N1、N2 複製，貼到 `nonutf8-dst`（先做這段）。再用 `commits-src` 的 C1，貼到 `nonutf8-dst`，只看預覽，Escape 取消（後做這段） | 前段預覽：N1 標頭「2 個檔案，1 個不寫入」、N2 標頭「1 個檔案，1 個不寫入」；`latin1.txt` 兩列的詳情是「未複製：非 UTF-8 編碼，不寫入也不刪除」，`ok.txt` 是「建立」。複製通知含「2 個檔案未複製」，並列出「#1 latin1.txt」與「#2 latin1.txt」。Apply：`PASTE_DONE created=2 … commits=2`；`latin1.txt` 位元組仍是 `caf` `e9` 換行；`ok.txt` 已建立。後段預覽：`common.txt` 列是「跳過」，詳情「目的地現有檔案不是 UTF-8，不覆寫」；Escape 得到 `[APP:PASTE_CANCELLED]`，`common.txt` 位元組不變、HEAD 不變 |
 | C-blocked | 開 `blocked-src`，複製 `B1 blocked dir and fresh`，貼到 `ws-dst/repo04` | 預覽：標頭帶「 (整個 commit 會被拒絕)」，「2 個檔案，0 個不寫入」；摘要「1 個 commit（1 個被拒絕）」；紅色橫幅「第 1 個 commit「B1 blocked dir and fresh」會被拒絕，重播將在此停止」；`fresh.txt`「建立」，`newdir/x.txt`「拒絕」，詳情「整個 commit 會被拒絕：父目錄被檔案佔住」。Apply：`[APP:PASTE_STALE_DETECTED: commit_replay_refused]`，沒有 `PASTE_DONE`，橫幅「沒有建立任何 commit；第 1 個 commit「B1 blocked dir and fresh」被拒絕：父目錄被檔案佔住」；`fresh.txt` 不存在；HEAD、status 不變。整筆拒絕是規格 4.3 的要求，也證明 #57 commit 說明的「其他檔照常貼上」不成立。判定規則同 T31 的 (a)(b)(c)。T31 與這格都不寫入，`repo04` 可連續做 |
@@ -532,7 +532,6 @@ Windows 與 Linux 的真實輸入、IME、跨機剪貼簿、與 ClipCode 的實�
 
 規格落差另外記在 `scorecard.md` 末尾，不算判定：
 
-- 規格 4.3 的 commit 模式 diff：「每個 commit 可展開看檔案清單與 diff」，但 commit 重播列目前只顯示來源內容，沒有 diff。記在這裡；C-detail 不因此判 `fail`（規格 3.2 的檔案模式覆寫 diff 已支援並由 T05 檢核）。
 - T13b 的拒絕文字：HEAD 移動被 `paste.rs` 的 `stale_reason_msg`(經 `commit_msg`)歸到 `stale_modified`，畫面是「目的地檔案已在外部修改: destination HEAD commit changed from … to …」。前半句說檔案被改，與實際原因不符。記在這裡；T13b 不因此判 `ui-defect`。
 - 預覽的版面衝突列（父目錄被檔案佔住等）現在標為「拒絕」並說整個 commit 會被拒；路徑規則不安全（如 `../x`）仍是一般「跳過」。CLI 的 `--dry-run` 對被拒的 commit 不計入「would be created」。
 

@@ -765,7 +765,7 @@ fn paste_files(
 	let parts: Vec<String> = [
 		("Created", result.created_count),
 		("Overwritten", result.overwritten_count),
-		("Skipped", result.skipped_existing_count),
+		("Skipped", result.total_skipped()),
 		("Deleted", result.deleted_count),
 	]
 	.iter()
@@ -796,7 +796,17 @@ fn print_plan(plan: &RestorePlan) -> Outcome {
 		stdout_line(&format!("delete\t{}", op.relative_path))?;
 	}
 	for op in &plan.skipped_operations {
-		stdout_line(&format!("skip\t{}\t{}", op.raw_path, op.reason.as_str()))?;
+		let detail = match op.detail {
+			Some(snip_core::restore::SkipDetail::ProtectedGitMetadata) => {
+				"\tprotected Git metadata"
+			}
+			None => "",
+		};
+		stdout_line(&format!(
+			"skip\t{}\t{}{detail}",
+			op.raw_path,
+			op.reason.as_str()
+		))?;
 	}
 	Ok(())
 }

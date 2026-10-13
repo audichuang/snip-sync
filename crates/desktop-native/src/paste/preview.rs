@@ -100,6 +100,16 @@ fn release(
 }
 
 impl PastePreview {
+	pub(crate) fn commit_diff_request(
+		&self,
+		idx: usize,
+	) -> Result<Option<CommitDiffRequest>, Msg> {
+		match self.plan.as_ref() {
+			Some(plan) => plan.commit_diff_request(idx, &self.pending),
+			None => Ok(None),
+		}
+	}
+
 	pub fn new(apply_delay: Option<std::time::Duration>) -> Self {
 		Self {
 			plan: None,
@@ -516,6 +526,54 @@ mod tests {
 			false,
 			Language::Plain,
 		)
+	}
+
+	#[test]
+	fn cancelling_a_preview_keeps_a_held_replay_read_in_repaste_admission() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		let dir = tempfile::tempdir().unwrap();
+		crate::paste::tests::git_init(dir.path());
+		let payload = snip_core::commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "large captured commit".into(),
+				author_name: "Ann".into(),
+				author_email: "ann@example.invalid".into(),
+				author_date: "2026-10-13T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "large.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("x".repeat(2 * 1024 * 1024)),
+					not_copied: None,
+				}],
+			}],
+		});
+		let mut session = landed(&payload, dir.path(), None);
+		drop(payload);
+		let read = session.commit_diff_request(0).unwrap().unwrap();
+		let held = Arc::downgrade(&read.preview);
+		// Cancel removes the UI, while the queued reader still owns the old
+		// captured plan. A rapid paste must account for that retained payload.
+		session.invalidate_job();
+		session.clear(None);
+		assert!(held.upgrade().is_some());
+		let next = || PasteRequest::Clipboard {
+			text: "n".repeat(MAX_RETAINED_PREVIEW_BYTES - 1024 * 1024),
+			dest: dir.path().into(),
+			roots: Vec::new(),
+			generation: 2,
+			remote: None,
+		};
+		assert_eq!(
+			session.enqueue(next()).unwrap_err().key,
+			"preview_memory_limit"
+		);
+		// Once an unpolled/cancelled read is dropped, the same paste fits.
+		drop(read);
+		assert!(held.upgrade().is_none());
+		assert!(session.enqueue(next()).is_ok());
 	}
 
 	/// Grows `ordinary` so the admitted state sits exactly at the 32 MiB cap.

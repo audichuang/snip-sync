@@ -64,6 +64,8 @@
 3. 確認後執行。執行前**重新檢查**一次路徑與編碼(預覽期間檔案系統可能已經變了)。
 4. 結果:成功 / 跳過 / 失敗各幾個,失敗的列出原因。
 
+- 規劃時已略過的項目仍在預覽逐筆列出原路徑與原因，不能勾選成寫入；Git metadata 保護明確說明原因。結果的跳過總數包含規劃略過與執行時保留既有檔案，各計一次；使用者取消勾選的操作不列入跳過。全部項目略過時顯示「未套用任何檔案；略過 N 項」。
+
 - 預設仍是覆蓋已存在的檔案(使用者確認後),但新增兩道防護(transfer / `plan_import_with`,GUI 與 CLI 於階段 6 皆已採用):
   (a) `TransferError::TargetCollision`:計畫中兩筆 entry 指向同一個實體檔(大小寫差異片段若位於已存在路徑部分,如檔案或目錄已存在,會由 realpath 解析偵測;偵測目的端是否不分大小寫,不分大小寫則新目標也摺疊大小寫(D10,階段 5b 已實作);以及 symlink 別名、同一路徑出現兩次)就整批拒絕;錯誤訊息格式呈現為單一目標路徑並列出衝突的操作名稱（如 `target collision: multiple operations target '<p>': previous was 'create a', current is 'create b'`，不重複輸出路徑亦不暴露內部大小寫摺疊字串）;
   (b) freshness:預覽後目標檔或 repo 的 HEAD/index 有變,套用時拒絕(`TransferError::StaleDestination`),需重新預覽。
@@ -110,6 +112,7 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 
 1. 讀剪貼簿 → 解析 → **預覽**:列出即將建立的 N 個 commit(message、作者、時間),
    每個 commit 可展開看檔案清單與 diff;「未複製」的檔案要標出來。
+   diff 以目的端及前序重播後的虛擬內容為基準：例如原檔 `already`、第一筆寫 `c1`、第二筆寫 `c2`，依序顯示 `already → c1`、`c1 → c2`。新增、刪除與 rename 同樣更新後續基準，略過項目不更新；預覽不修改目的端。二進位、未複製、連結或無法安全讀取的基準須顯示原因，不能冒充空檔 diff。本機與遠端採同一套核心規劃。
 2. 確認後,**依原本順序**對每個 commit:
    1. 寫入新增 / 修改的檔案、刪除被刪除的檔案;rename = 刪舊路徑 + 寫新路徑。
    2. 只 stage 這個 commit 涉及的路徑。
@@ -283,7 +286,7 @@ CLI 與 App 共用同一組核心函式,各自只多一層 UI 用的前端:
   - 初次或 Refresh 的唯讀掃描遇到暫時性斷線、timeout 或 busy 時，在同一分頁／session 以 1、2、4 秒 backoff 最多重試 3 次；作用中與背景分頁相同。權限、版本、路徑或協定等永久拒絕不自動重試。成功後恢復 repo 清單並清除掃描錯誤；耗盡次數保留可見錯誤供手動 Refresh。Refresh 取代舊 scan/timer，關分頁或退出會取消；取消退出後會恢復尚未完成的初次掃描，即使尚無 repo。
   - 每條連線是一個 ssh 程序；每個 Client 最多留 2 條閒置連線。同一 RemoteHost 連線設定的握手（connect＋Hello）跨 Client 最多同時 2 個，排隊有期限且可取消；不同主機互不阻塞。這是新握手上限，不是整個 App 的存活 SSH 連線上限。worker 的 job 與 `Served` 名額限制仍以單一程序計。
 - **版本相容**:
-  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 5:`GIT_VIEWS_VERSION = 2`、`TRANSFER_VERSION = 3` 複製、`PASTE_VERSION = 4` 貼上、`EXPORT_CHANGES_VERSION = 5` 由 worker 解析變更選取與整個資料夾匯出、`REQUEST_CHUNKS_VERSION = 5` 分段請求）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）;複製與貼上回報「那台的 snip-sync 太舊」。
+  - 協定透過 `hello` 握手以 `max_version` 協商（目前最高版本 6:`GIT_VIEWS_VERSION = 2`、`TRANSFER_VERSION = 3` 複製、`PASTE_VERSION = 4` 貼上、`EXPORT_CHANGES_VERSION = 5` 由 worker 解析變更選取與整個資料夾匯出、`REQUEST_CHUNKS_VERSION = 5` 分段請求、`REPLAY_PREVIEW_VERSION = 6` commit 貼上目的端的有界文字／檔案種類讀取）。worker 協商出的版本低於請求所需時,Changes 與 Log 明確顯示「{0} 上的 snip-sync 版本太舊（協定 {1}），不支援 Git 檢視；請在那台機器更新」（`remote_worker_too_old`）;複製與貼上回報「那台的 snip-sync 太舊」。舊 worker 缺少 commit 預覽基準資訊時，詳情明示無法比較，不能把每筆都與初始磁碟相比或冒充新增；既有貼上套用協定與安全門禁維持相容。
   - 0.6.x 以前的 TLS worker(`snip worker`)不支援 `serve --stdio`,連不上時顯示「沒有安裝 snip,或版本太舊」。
 - **寫入不變式**:
   - 能寫進 `.git` 就能寫 `.git/config`、hooks 或 filter,等於讓 master 在 worker 執行程式。這條守門在 snip-core 的貼上引擎裡(§3.2 安全規則),本機與遠端是同一段程式:payload 路徑含 `.git` 片段,或目標經 symlink 解析後落在 Git 目錄裡的,都是略過列、不寫入,其餘照寫。worker 另外只要求目的地與每個前綴對應的資料夾在工作區內(遠端的存取範圍);commit 重放和本機一樣進到目的地所在的 repo,即使它的頂層在工作區之上。
