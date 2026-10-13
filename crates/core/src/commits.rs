@@ -1189,6 +1189,36 @@ impl std::fmt::Display for LayoutConflict {
 	}
 }
 
+/// Why a replay row cannot be compared as regular text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayPreviewUnavailable {
+	Skipped,
+	Symlink,
+	Directory,
+	Binary,
+	TooLarge,
+	Unreadable,
+}
+
+/// The bytes before a replay row. Payload references avoid duplicating text
+/// in the plan (and in remote preview/check/apply messages).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayContentSource {
+	Absent,
+	Destination,
+	Payload {
+		commit_index: usize,
+		file_index: usize,
+	},
+	Unavailable(ReplayPreviewUnavailable),
+}
+
+impl Default for ReplayContentSource {
+	fn default() -> Self {
+		Self::Unavailable(ReplayPreviewUnavailable::Unreadable)
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FilePlan {
@@ -1206,6 +1236,11 @@ pub struct FilePlan {
 	pub layout_conflict: Option<LayoutConflict>,
 	pub absolute_path: Option<PathBuf>,
 	pub old_absolute_path: Option<PathBuf>,
+	/// Display only; never changes overwrite consent or replay eligibility.
+	#[serde(default)]
+	pub before: ReplayContentSource,
+	#[serde(default)]
+	pub old_before: ReplayContentSource,
 }
 
 impl FilePlan {
@@ -1229,6 +1264,15 @@ impl FilePlan {
 			})
 			.flatten();
 		[target, old].into_iter().flatten()
+	}
+
+	/// A write onto a target that exists now: what the overwrite gate asks
+	/// permission for (spec 4.3, D9). A file a layout conflict refuses is never
+	/// written, so it never asks.
+	pub fn overwrites_existing(&self) -> bool {
+		self.layout_conflict.is_none()
+			&& self.action == ReplayAction::Write
+			&& self.existed
 	}
 }
 
@@ -1257,6 +1301,54 @@ pub struct CommitReplayPlan {
 }
 
 impl CommitReplayPlan {
+	/// Display metadata can be absent on an older master. It never grants
+	/// write permission, so compare only the actual replay operations when
+	/// revalidating an Apply sent back by that master.
+	pub fn same_operations(&self, other: &Self) -> bool {
+		self.root == other.root
+			&& self.commits.len() == other.commits.len()
+			&& self.commits.iter().zip(&other.commits).all(|(a, b)| {
+				(
+					a.message.as_str(),
+					a.author_name.as_str(),
+					a.author_email.as_str(),
+					a.author_date.as_str(),
+				) == (
+					b.message.as_str(),
+					b.author_name.as_str(),
+					b.author_email.as_str(),
+					b.author_date.as_str(),
+				) && a.files.len() == b.files.len()
+					&& a.files.iter().zip(&b.files).all(|(a, b)| {
+						(
+							&a.path,
+							&a.old_path,
+							a.change,
+							a.action,
+							a.existed,
+							a.old_existed,
+							a.not_copied,
+							a.skip_reason,
+							a.layout_conflict,
+							&a.absolute_path,
+							&a.old_absolute_path,
+						) == (
+							&b.path,
+							&b.old_path,
+							b.change,
+							b.action,
+							b.existed,
+							b.old_existed,
+							b.not_copied,
+							b.skip_reason,
+							b.layout_conflict,
+							&b.absolute_path,
+							&b.old_absolute_path,
+						)
+					})
+			})
+	}
+
 	/// Owned buffer capacities, excluding this inline struct and allocator
 	/// bookkeeping. Includes every replay path and repeated commit metadata.
 	pub fn retained_heap_bytes(&self) -> usize {
@@ -1290,6 +1382,18 @@ impl CommitReplayPlan {
 			}
 		}
 		bytes
+	}
+
+	/// The distinct target paths a replay would overwrite: a path that several
+	/// commits write counts once (the CLI's `--overwrite` gate and its dry-run
+	/// warning count these).
+	pub fn existing_writes(&self) -> std::collections::BTreeSet<&str> {
+		self.commits
+			.iter()
+			.flat_map(|c| &c.files)
+			.filter(|f| f.overwrites_existing())
+			.map(|f| f.path.as_str())
+			.collect()
 	}
 }
 
@@ -1335,6 +1439,8 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 		layout_conflict: None,
 		absolute_path: None,
 		old_absolute_path: None,
+		before: ReplayContentSource::default(),
+		old_before: ReplayContentSource::default(),
 	};
 	let deleted = f.change == FileChange::Deleted;
 	if !deleted && f.content.is_none() && plan.not_copied.is_none() {
@@ -1390,6 +1496,12 @@ fn plan_file(root: &Path, f: &CommitFile, layout: &PlannedLayout) -> FilePlan {
 		.old_absolute_path
 		.as_deref()
 		.is_some_and(|o| layout.exists(o));
+	plan.before = layout.content_source(plan.absolute_path.as_deref().unwrap());
+	plan.old_before = plan
+		.old_absolute_path
+		.as_deref()
+		.map(|p| layout.content_source(p))
+		.unwrap_or(ReplayContentSource::Absent);
 	plan
 }
 
@@ -1446,6 +1558,9 @@ struct PlannedLayout {
 	/// Fold keys to lower case, as `transfer`'s D10 collision check does.
 	fold_case: bool,
 	overrides: std::collections::HashMap<PathBuf, Node>,
+	/// Bytes of a virtual file come from an earlier payload entry. Initial
+	/// disk contents remain lazy reads; never duplicate payload text here.
+	contents: std::collections::HashMap<PathBuf, ReplayContentSource>,
 	/// The non-absent overrides, by parent key: child key to the path as
 	/// first spelled.
 	added: std::collections::HashMap<
@@ -1524,6 +1639,45 @@ impl PlannedLayout {
 		}
 	}
 
+	fn content_source(&self, path: &Path) -> ReplayContentSource {
+		use ReplayContentSource as Source;
+		use ReplayPreviewUnavailable as Why;
+		match self.get(path) {
+			Some(Node::Absent) => return Source::Absent,
+			// A directory has no file bytes. Only a write whose commit
+			// removes its children is eligible; conflicting rows are refused.
+			Some(Node::Dir) => return Source::Absent,
+			Some(Node::File) => {
+				return self
+					.contents
+					.get(&self.key(path))
+					.copied()
+					.unwrap_or_default()
+			}
+			None => {}
+		}
+		if self.shadowed(path) {
+			return Source::Absent;
+		}
+		match fs::symlink_metadata(path) {
+			Ok(m) if m.file_type().is_symlink() => {
+				Source::Unavailable(Why::Symlink)
+			}
+			Ok(m) if m.is_file() => Source::Destination,
+			Ok(m) if m.is_dir() => Source::Absent,
+			Err(e)
+				if matches!(
+					e.kind(),
+					std::io::ErrorKind::NotFound
+						| std::io::ErrorKind::NotADirectory
+				) =>
+			{
+				Source::Absent
+			}
+			_ => Source::Unavailable(Why::Unreadable),
+		}
+	}
+
 	fn is_dir(&self, path: &Path) -> bool {
 		self.node(path) == Node::Dir
 	}
@@ -1538,6 +1692,7 @@ impl PlannedLayout {
 
 	fn set(&mut self, path: &Path, node: Node) {
 		let key = self.key(path);
+		self.contents.remove(&key);
 		if node != Node::Dir {
 			self.cut.insert(key.clone());
 		}
@@ -1612,7 +1767,7 @@ impl PlannedLayout {
 	/// Records what replaying `files` leaves behind, in replay's order:
 	/// deletions (a rename's old path included) first, removing the parents
 	/// they empty, then the writes with their parent directories.
-	fn apply(&mut self, root: &Path, files: &[FilePlan]) {
+	fn apply(&mut self, root: &Path, files: &[FilePlan], commit_index: usize) {
 		let live = files.iter().filter(|f| f.action != ReplayAction::Skip);
 		// All files go first and the emptied parents are walked afterwards:
 		// the final set does not depend on the order, and each directory is
@@ -1638,12 +1793,23 @@ impl PlannedLayout {
 		for parent in parents {
 			self.prune_empty(root, parent);
 		}
-		for f in live.filter(|f| f.action == ReplayAction::Write) {
+		for (file_index, f) in files
+			.iter()
+			.enumerate()
+			.filter(|(_, f)| f.action == ReplayAction::Write)
+		{
 			let Some(abs) = f.absolute_path.as_deref() else {
 				continue;
 			};
 			self.tracked.insert(&f.path);
 			self.set(abs, Node::File);
+			self.contents.insert(
+				self.key(abs),
+				ReplayContentSource::Payload {
+					commit_index,
+					file_index,
+				},
+			);
 			for a in abs.ancestors().skip(1) {
 				if a == root || !a.starts_with(root) {
 					break;
@@ -1936,7 +2102,7 @@ pub fn plan_commit_replay_in(
 	let mut commits = Vec::new();
 	// Each commit is planned after the earlier ones, as replay writes them.
 	let mut layout = PlannedLayout::new(git, opts)?;
-	for commit in &payload.commits {
+	for (commit_index, commit) in payload.commits.iter().enumerate() {
 		refuse_if_cancelled(opts, "replay-plan")?;
 		let mut files = Vec::new();
 		for file in &commit.files {
@@ -1953,7 +2119,7 @@ pub fn plan_commit_replay_in(
 		};
 		// A refused commit writes nothing, and replay stops there.
 		if plan.refused_by().is_none() {
-			layout.apply(&root, &plan.files);
+			layout.apply(&root, &plan.files, commit_index);
 		}
 		commits.push(plan);
 	}
@@ -4861,5 +5027,78 @@ mod tests {
 			);
 			assert_eq!(planned_files[4].freshness_targets().count(), 0);
 		}
+	}
+
+	fn file_plan(
+		path: &str,
+		action: ReplayAction,
+		existed: bool,
+		conflict: Option<LayoutConflict>,
+	) -> FilePlan {
+		FilePlan {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Modified,
+			action,
+			existed,
+			old_existed: false,
+			not_copied: None,
+			skip_reason: None,
+			layout_conflict: conflict,
+			absolute_path: None,
+			old_absolute_path: None,
+			before: ReplayContentSource::default(),
+			old_before: ReplayContentSource::default(),
+		}
+	}
+
+	#[test]
+	fn overwrites_existing_is_a_write_onto_an_existing_target_without_a_conflict(
+	) {
+		assert!(file_plan("a.txt", ReplayAction::Write, true, None)
+			.overwrites_existing());
+		assert!(!file_plan("a.txt", ReplayAction::Write, false, None)
+			.overwrites_existing());
+		assert!(!file_plan("a.txt", ReplayAction::Delete, true, None)
+			.overwrites_existing());
+		assert!(!file_plan("a.txt", ReplayAction::Skip, true, None)
+			.overwrites_existing());
+		assert!(!file_plan(
+			"a.txt",
+			ReplayAction::Write,
+			true,
+			Some(LayoutConflict::CaseAlias)
+		)
+		.overwrites_existing());
+	}
+
+	#[test]
+	fn existing_writes_counts_a_path_once_across_commits() {
+		let commit = |files: Vec<FilePlan>| CommitPlan {
+			message: String::new(),
+			author_name: String::new(),
+			author_email: String::new(),
+			author_date: String::new(),
+			files,
+		};
+		let plan = CommitReplayPlan {
+			root: PathBuf::new(),
+			commits: vec![
+				commit(vec![
+					file_plan("a.txt", ReplayAction::Write, true, None),
+					file_plan("b.txt", ReplayAction::Write, false, None),
+				]),
+				commit(vec![file_plan(
+					"a.txt",
+					ReplayAction::Write,
+					true,
+					None,
+				)]),
+			],
+		};
+		assert_eq!(
+			plan.existing_writes(),
+			std::collections::BTreeSet::from(["a.txt"])
+		);
 	}
 }

@@ -1211,10 +1211,12 @@ impl WorkbenchModel {
 							!all && scope.iter().any(|(r, _)| *r == repo.root);
 						let root = repo.root.clone();
 						let id = format!("log-repo:{}", repo.name);
+						let selector = id.clone();
 						let check_id = format!("log-repo-check:{}", repo.name);
 						items.push(
 							div()
 								.id(SharedString::from(id.clone()))
+								.debug_selector(move || selector)
 								.relative()
 								.h(px(24.))
 								.px(px(8.))
@@ -1842,10 +1844,7 @@ impl WorkbenchModel {
 			.text()
 			.trim()
 			.to_lowercase();
-		let current = self
-			.repo()
-			.and_then(|r| r.summary.as_ref().ok())
-			.and_then(|s| s.branch.clone());
+		let current = self.log_branch_list_current();
 		let mut rows: Vec<AnyElement> = Vec::new();
 		let entry = |id: String,
 		             label: String,
@@ -1856,6 +1855,7 @@ impl WorkbenchModel {
 		             cx: &mut Context<Self>| {
 			div()
 				.id(SharedString::from(id.clone()))
+				.debug_selector(|| id.clone())
 				.relative()
 				.flex_shrink_0()
 				.h(px(24.))
@@ -1902,9 +1902,11 @@ impl WorkbenchModel {
 					collapsed,
 				} => {
 					let gid = format!("branch-group:{key}");
+					let selector = gid.clone();
 					rows.push(
 						div()
 							.id(SharedString::from(gid.clone()))
+							.debug_selector(move || selector)
 							.relative()
 							.flex_shrink_0()
 							.h(px(24.))
@@ -1951,7 +1953,14 @@ impl WorkbenchModel {
 						icon_tinted(Icon::Tag, 14., pal().ref_tag)
 							.into_any_element()
 					} else if is_current {
-						icon_tinted(Icon::Head, 14., pal().ref_head)
+						div()
+							.id(SharedString::from(format!("ref-head:{name}")))
+							.debug_selector(|| format!("ref-head:{name}"))
+							.relative()
+							.flex_shrink_0()
+							.size(px(14.))
+							.child(icon_tinted(Icon::Head, 14., pal().ref_head))
+							.children(probe(log, format!("ref-head:{name}")))
 							.into_any_element()
 					} else {
 						icon(Icon::Branch, 14.).into_any_element()

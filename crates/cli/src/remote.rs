@@ -556,12 +556,12 @@ pub fn run(
 				skip_existing,
 				adjust_paths,
 			};
-			let at = crate::PasteAt::Remote {
-				client: &c,
-				workspace: &ws.id,
-				dest: &repo,
+			let target = snip_remote::PasteTarget::Remote {
+				client: Arc::new(c),
+				workspace: ws.id,
+				dest: repo,
 			};
-			crate::paste(at, &text, settings, &opts)
+			crate::paste(&target, &text, settings, &opts)
 		}
 		RemoteCommand::Diff {
 			host,

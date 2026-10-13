@@ -8,7 +8,7 @@ use std::io::{self, BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use snip_core::browser::{
@@ -21,6 +21,7 @@ use snip_core::gitview::{
 	ChangeList, ChangedPathList, CommitDetails, Read, ReadProfile, RepoView,
 };
 
+use sha2::{Digest, Sha256};
 use snip_core::commits::CommitCopyOutcome;
 use snip_core::transfer::CopyOutcome;
 
@@ -31,7 +32,7 @@ use crate::proto::{
 	JOINED_MAX, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::worker::{Worker, PREAMBLE};
-use crate::RemoteError;
+use crate::{ConnectFailureKind, RemoteError};
 
 /// How long a new connection may take to reach the worker's hello: ssh
 /// resolves, authenticates and starts a shell first.
@@ -51,6 +52,10 @@ const MAX_BANNER: usize = 64 * 1024;
 const MAX_STDERR: usize = 8 * 1024;
 /// Idle connections kept per worker: each is an ssh process.
 const POOL: usize = 2;
+const PREPARED_IMPORT_LEASES: usize = 2;
+/// In-flight starts, shared across Clients for the same host. Established
+/// workers and idle connections do not hold a handshake slot.
+const HANDSHAKES_PER_HOST: usize = 2;
 /// Frames buffered between the worker's stdout and the caller. During a
 /// call a full queue BLOCKS the pump on `send` — backpressure, so a reply
 /// larger than the queue still reaches a slow consumer whole. While the
@@ -120,6 +125,103 @@ impl RemoteHost {
 			name: host.to_string(),
 			transport: Transport::Command(crate::ssh::command(host)),
 		}
+	}
+}
+
+#[derive(PartialEq, Eq)]
+enum TransportIdentity {
+	Command(Vec<OsString>),
+	InProcess(usize),
+}
+
+#[derive(PartialEq, Eq)]
+struct HandshakeKey(String, TransportIdentity);
+
+type HandshakeRegistry = Mutex<Vec<(HandshakeKey, Weak<HandshakeGate>)>>;
+
+#[derive(Default)]
+struct HandshakeGate {
+	active: Mutex<usize>,
+	waiting: AtomicUsize,
+	changed: Condvar,
+}
+
+impl HandshakeGate {
+	fn for_host(host: &RemoteHost) -> Arc<Self> {
+		static GATES: OnceLock<HandshakeRegistry> = OnceLock::new();
+		let key = HandshakeKey(
+			host.name.clone(),
+			match &host.transport {
+				Transport::Command(args) => {
+					TransportIdentity::Command(args.clone())
+				}
+				Transport::InProcess(worker) => {
+					TransportIdentity::InProcess(Arc::as_ptr(worker) as usize)
+				}
+			},
+		);
+		let mut gates = GATES
+			.get_or_init(Mutex::default)
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		gates.retain(|(_, gate)| gate.strong_count() > 0);
+		if let Some(gate) = gates
+			.iter()
+			.find(|(stored, _)| *stored == key)
+			.and_then(|(_, gate)| gate.upgrade())
+		{
+			return gate;
+		}
+		let gate = Arc::new(Self::default());
+		gates.push((key, Arc::downgrade(&gate)));
+		gate
+	}
+
+	fn acquire(
+		self: &Arc<Self>,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<HandshakeGuard, RemoteError> {
+		let mut active =
+			self.active.lock().unwrap_or_else(PoisonError::into_inner);
+		loop {
+			if cancel.is_some_and(|token| token.is_cancelled()) {
+				return Err(RemoteError::Cancelled);
+			}
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			if remaining.is_zero() {
+				// Nothing was sent: the wait was for a slot, not the worker.
+				return Err(RemoteError::Start {
+					kind: ConnectFailureKind::TimedOut,
+					message: "timed out waiting for a connection slot to that \
+					          machine: other connections there are still \
+					          starting; try again"
+						.into(),
+				});
+			}
+			if *active < HANDSHAKES_PER_HOST {
+				*active += 1;
+				return Ok(HandshakeGuard(self.clone()));
+			}
+			self.waiting.fetch_add(1, Ordering::SeqCst);
+			active = self
+				.changed
+				.wait_timeout(active, remaining.min(WAIT_SLICE))
+				.unwrap_or_else(PoisonError::into_inner)
+				.0;
+			self.waiting.fetch_sub(1, Ordering::SeqCst);
+		}
+	}
+}
+
+struct HandshakeGuard(Arc<HandshakeGate>);
+
+impl Drop for HandshakeGuard {
+	fn drop(&mut self) {
+		let mut active =
+			self.0.active.lock().unwrap_or_else(PoisonError::into_inner);
+		*active -= 1;
+		self.0.changed.notify_one();
 	}
 }
 
@@ -231,6 +333,20 @@ impl Connection {
 		my_name: &str,
 		cancel: Option<&CancelToken>,
 	) -> Result<Self, RemoteError> {
+		Self::open_until(
+			transport,
+			my_name,
+			cancel,
+			Instant::now() + CONNECT_TIMEOUT,
+		)
+	}
+
+	fn open_until(
+		transport: &Transport,
+		my_name: &str,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<Self, RemoteError> {
 		if cancel.is_some_and(|c| c.is_cancelled()) {
 			return Err(RemoteError::Cancelled);
 		}
@@ -275,9 +391,13 @@ impl Connection {
 		// The hello exchange is a call: its reply may arrive before the
 		// master waits for it, so the pump must see it as in flight.
 		conn.in_flight.store(true, Ordering::SeqCst);
-		let reply = conn
-			.send_guarded(&hello, cancel, Instant::now() + CONNECT_TIMEOUT)
-			.and_then(|()| conn.recv_hello(CONNECT_TIMEOUT, cancel));
+		let reply =
+			conn.send_guarded(&hello, cancel, deadline).and_then(|()| {
+				conn.recv_hello(
+					deadline.saturating_duration_since(Instant::now()),
+					cancel,
+				)
+			});
 		conn.in_flight.store(false, Ordering::SeqCst);
 		match reply {
 			Ok(Some(Response::Hello {
@@ -303,9 +423,10 @@ impl Connection {
 					{
 						StartCause::BadData(err.to_string())
 					}
+					Err(RemoteError::Io(err)) => StartCause::Io(err.kind()),
 					_ => StartCause::Ended,
 				};
-				Err(conn.start_error(cause))
+				Err(conn.start_error(cause, deadline))
 			}
 			Err(err) => Err(err),
 		}
@@ -340,9 +461,14 @@ impl Connection {
 
 	/// Why the worker never said hello, from the transport's exit status
 	/// and stderr: ssh's own message, or that the far end has no snip.
-	fn start_error(&mut self, cause: StartCause) -> RemoteError {
+	fn start_error(
+		&mut self,
+		cause: StartCause,
+		handshake_deadline: Instant,
+	) -> RemoteError {
 		let status = self.child.as_mut().and_then(|c| {
-			let deadline = Instant::now() + Duration::from_secs(2);
+			let deadline = (Instant::now() + Duration::from_secs(2))
+				.min(handshake_deadline);
 			loop {
 				match c.try_wait() {
 					Ok(Some(status)) => return Some(status),
@@ -355,7 +481,8 @@ impl Connection {
 		});
 		// The stderr reader holds the other reference until the pipe closes:
 		// wait for it, or a fast exit is classified before its message lands.
-		let deadline = Instant::now() + Duration::from_secs(2);
+		let deadline =
+			(Instant::now() + Duration::from_secs(2)).min(handshake_deadline);
 		while status.is_some()
 			&& Arc::strong_count(&self.stderr) > 1
 			&& Instant::now() < deadline
@@ -367,11 +494,11 @@ impl Connection {
 		)
 		.trim()
 		.to_string();
-		RemoteError::Connect(start_message(
-			cause,
-			status.and_then(|s| s.code()),
-			&stderr,
-		))
+		let code = status.and_then(|s| s.code());
+		RemoteError::Start {
+			kind: start_failure_kind(&cause, code, &stderr),
+			message: start_message(cause, code, &stderr),
+		}
 	}
 
 	pub fn worker_name(&self) -> &str {
@@ -557,6 +684,7 @@ impl Drop for Connection {
 /// What the transport did while the master waited for the hello.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartCause {
+	Io(io::ErrorKind),
 	/// The hello never arrived and the transport still runs: it hung, or
 	/// the far machine is too busy to answer.
 	NoAnswer,
@@ -584,7 +712,7 @@ pub(crate) fn start_message(
 		StartCause::NoAnswer => stderr.to_string(),
 		// The stream's own message: a banner, an out-of-step frame.
 		StartCause::BadData(message) => message,
-		StartCause::Ended => {
+		StartCause::Ended | StartCause::Io(_) => {
 			if code == Some(127) || stderr.contains("unrecognized subcommand") {
 				return "snip is not installed on that machine, or is too old for \
 				        ssh connections; install snip-sync there"
@@ -602,6 +730,50 @@ pub(crate) fn start_message(
 			}
 			stderr.to_string()
 		}
+	}
+}
+
+/// Classify at the transport boundary, while exit status and the original
+/// failure still exist; consumers receive the type and unchanged message.
+fn start_failure_kind(
+	cause: &StartCause,
+	code: Option<i32>,
+	stderr: &str,
+) -> ConnectFailureKind {
+	let lower = stderr.to_ascii_lowercase();
+	if lower.contains("permission denied")
+		|| lower.contains("host key verification failed")
+		|| lower.contains("remote host identification has changed")
+	{
+		return ConnectFailureKind::Authentication;
+	}
+	if code == Some(127) || lower.contains("unrecognized subcommand") {
+		return ConnectFailureKind::WorkerUnavailable;
+	}
+	match cause {
+		StartCause::NoAnswer => ConnectFailureKind::TimedOut,
+		StartCause::BadData(_) => ConnectFailureKind::Protocol,
+		StartCause::Io(kind) if stderr.is_empty() => {
+			ConnectFailureKind::Io(*kind)
+		}
+		StartCause::Ended | StartCause::Io(_)
+			if stderr.is_empty()
+				|| [
+					"connection reset",
+					"connection closed",
+					"connection timed out",
+					"operation timed out",
+					"connection refused",
+					"no route to host",
+					"broken pipe",
+					"connection aborted",
+				]
+				.iter()
+				.any(|message| lower.contains(message)) =>
+		{
+			ConnectFailureKind::TransportClosed
+		}
+		StartCause::Ended | StartCause::Io(_) => ConnectFailureKind::Other,
 	}
 }
 
@@ -638,7 +810,9 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 	let stdin: ChildStdin = child.stdin.take().expect("piped stdin");
 	let stdout = child.stdout.take().expect("piped stdout");
 	let stderr_pipe = child.stderr.take().expect("piped stderr");
-	let stderr = Arc::new(Mutex::new(Vec::new()));
+	// Preallocated to its ceiling: the reader never writes past MAX_STDERR,
+	// so the capacity (and any charge for it) never changes.
+	let stderr = Arc::new(Mutex::new(Vec::with_capacity(MAX_STDERR)));
 	let keep = stderr.clone();
 	std::thread::Builder::new()
 		.name("snip-remote-stderr".into())
@@ -942,21 +1116,333 @@ impl<'a> Drop for GitLimiterGuard<'a> {
 	}
 }
 
+#[derive(Default)]
+struct PreparedImports {
+	active: AtomicUsize,
+}
+
+impl PreparedImports {
+	fn reserve(self: &Arc<Self>) -> Option<PreparedImportPermit> {
+		let cleanup = prepared_cleanup_sender()?;
+		let mut active = self.active.load(Ordering::SeqCst);
+		loop {
+			if active >= PREPARED_IMPORT_LEASES {
+				return None;
+			}
+			match self.active.compare_exchange_weak(
+				active,
+				active + 1,
+				Ordering::SeqCst,
+				Ordering::SeqCst,
+			) {
+				Ok(_) => {
+					return Some(PreparedImportPermit {
+						owner: self.clone(),
+						cleanup,
+					})
+				}
+				Err(now) => active = now,
+			}
+		}
+	}
+}
+
+struct PreparedImportPermit {
+	owner: Arc<PreparedImports>,
+	cleanup: mpsc::Sender<PreparedCleanup>,
+}
+
+impl Drop for PreparedImportPermit {
+	fn drop(&mut self) {
+		self.owner.active.fetch_sub(1, Ordering::SeqCst);
+	}
+}
+
+struct PreparedConnection {
+	connection: Connection,
+	token: String,
+	_permit: PreparedImportPermit,
+}
+
+struct PreparedCleanup {
+	connection: Connection,
+	permit: PreparedImportPermit,
+}
+
+struct PendingPreparedChild {
+	child: Child,
+	_permit: PreparedImportPermit,
+	started: Instant,
+	warned: bool,
+}
+
+/// A dropped preview can originate on the UI thread. Reap its worker on
+/// one cleanup thread, polling every child without a blocking wait. A
+/// child that cannot yet be reaped continues to occupy its client's slot.
+fn prepared_cleanup_sender() -> Option<mpsc::Sender<PreparedCleanup>> {
+	static CLEANUP: OnceLock<Option<mpsc::Sender<PreparedCleanup>>> =
+		OnceLock::new();
+	CLEANUP.get_or_init(|| {
+		let (sender, receiver) = mpsc::channel::<PreparedCleanup>();
+		std::thread::Builder::new().name("snip-prepared-cleanup".into()).spawn(move || {
+			let mut pending: Vec<PendingPreparedChild> = Vec::new();
+			loop {
+				match receiver.recv_timeout(Duration::from_millis(50)) {
+					Ok(PreparedCleanup { mut connection, permit }) => {
+						let child = connection.child.take();
+						// Closing the pipes ends the worker's read. Remove the
+						// child first so Connection::drop cannot call wait().
+						drop(connection);
+						if let Some(mut child) = child {
+							let _ = child.kill();
+							pending.push(PendingPreparedChild { child, _permit: permit, started: Instant::now(), warned: false });
+						}
+					}
+					Err(RecvTimeoutError::Disconnected) if pending.is_empty() => break,
+					Err(_) => {}
+				}
+				pending.retain_mut(|pending| {
+					if matches!(pending.child.try_wait(), Ok(Some(_))) { return false; }
+					if !pending.warned && pending.started.elapsed() >= Duration::from_secs(30) {
+						eprintln!("[prepared paste] worker cleanup is still pending; its lease slot remains reserved");
+						pending.warned = true;
+					}
+					true
+				});
+			}
+		}).ok()?;
+		Some(sender)
+	}).clone()
+}
+
+impl Drop for PreparedImportLease {
+	fn drop(&mut self) {
+		let state =
+			self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+		if let PreparedImportState::Ready(ready) =
+			std::mem::replace(state, PreparedImportState::Used)
+		{
+			let PreparedConnection {
+				connection,
+				token: _,
+				_permit: permit,
+			} = *ready;
+			let sender = permit.cleanup.clone();
+			if let Err(failed) =
+				sender.send(PreparedCleanup { connection, permit })
+			{
+				// The reaper must never panic, but even a disconnected sender
+				// must not route an unbounded child wait onto the UI thread.
+				let PreparedCleanup {
+					mut connection,
+					permit,
+				} = failed.0;
+				let child = connection.child.take();
+				drop(connection);
+				if let Some(mut child) = child {
+					let _ = child.kill();
+					if !matches!(child.try_wait(), Ok(Some(_))) {
+						// Cleanup is unconfirmed: do not grant another prepared
+						// slot and conceal a potentially still-running worker.
+						std::mem::forget(permit);
+						eprintln!("[prepared paste] cleanup service unavailable; worker cleanup unconfirmed");
+					}
+				}
+			}
+		}
+	}
+}
+
+enum PreparedImportState {
+	Ready(Box<PreparedConnection>),
+	Applying,
+	Used,
+	OutcomeUnknown,
+}
+
+/// The worker connection that owns a preview token. Clones of a file plan
+/// share this one-use state; it never owns the Client itself.
+pub(crate) struct PreparedImportLease {
+	owner: Arc<PreparedImports>,
+	workspace: String,
+	dest: String,
+	text_hash: [u8; 32],
+	mapping: PasteMapping,
+	digest: String,
+	/// The connection's owned buffers, charged while the lease holds it
+	/// (Ready and Applying). Fixed when the lease is made, so no transition
+	/// between those states can raise an admitted charge.
+	connection_bytes: usize,
+	state: Mutex<PreparedImportState>,
+}
+
+/// Upper bound of what a lease owns through its connection: the boxed
+/// `PreparedConnection`, its strings, and the stderr buffer at its
+/// preallocated ceiling. Read once, when the lease is made.
+fn connection_footprint(
+	connection: &Connection,
+	token_capacity: usize,
+) -> usize {
+	std::mem::size_of::<PreparedConnection>()
+		.saturating_add(token_capacity)
+		.saturating_add(connection.worker_name.capacity())
+		.saturating_add(connection.home.as_ref().map_or(0, String::capacity))
+		.saturating_add(MAX_STDERR)
+}
+
+impl std::fmt::Debug for PreparedImportLease {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PreparedImportLease")
+			.field("workspace", &self.workspace)
+			.field("dest", &self.dest)
+			.finish_non_exhaustive()
+	}
+}
+
+impl PreparedImportLease {
+	/// Owned metadata and connection strings. No source body is retained
+	/// here; transport frame queues remain separately bounded by FRAME_QUEUE.
+	pub(crate) fn retained_heap_bytes(&self) -> usize {
+		let mut bytes =
+			std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
+		bytes = bytes
+			.saturating_add(self.workspace.capacity())
+			.saturating_add(self.dest.capacity())
+			.saturating_add(self.digest.capacity())
+			.saturating_add(self.mapping.header_format.capacity())
+			.saturating_add(
+				self.mapping.prefixes.capacity()
+					* std::mem::size_of::<(String, String)>(),
+			);
+		for (prefix, folder) in &self.mapping.prefixes {
+			bytes = bytes
+				.saturating_add(prefix.capacity())
+				.saturating_add(folder.capacity());
+		}
+		// Ready and Applying hold the same charge: an Apply that is refused
+		// before any write restores Ready, and must not grow an admitted state.
+		let holds_connection = matches!(
+			&*self.state.lock().unwrap_or_else(PoisonError::into_inner),
+			PreparedImportState::Ready(_) | PreparedImportState::Applying
+		);
+		if holds_connection {
+			bytes = bytes.saturating_add(self.connection_bytes);
+		}
+		bytes
+	}
+}
+
+impl PreparedImportLease {
+	/// Ready → Applying. The one connection the lease reserved goes to this
+	/// Apply; any other state refuses without touching the connection.
+	fn begin_apply(&self) -> Result<Box<PreparedConnection>, RemoteError> {
+		let mut state =
+			self.state.lock().unwrap_or_else(PoisonError::into_inner);
+		match &*state {
+			PreparedImportState::Ready(_) => {}
+			PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into() }),
+			PreparedImportState::Used => return Err(prepared_stale("the prepared paste has already been used; preview again")),
+			PreparedImportState::OutcomeUnknown => return Err(RemoteError::Protocol("the previous prepared paste has an unknown outcome; inspect the destination before pasting again".into())),
+		}
+		let PreparedImportState::Ready(ready) =
+			std::mem::replace(&mut *state, PreparedImportState::Applying)
+		else {
+			unreachable!()
+		};
+		Ok(ready)
+	}
+
+	/// Applying → Ready after a refusal from before the worker's first write
+	/// (Busy, Timeout) on a clean connection, so the same preview can apply
+	/// again. Otherwise Used, or OutcomeUnknown when the outcome is unknown;
+	/// a clean connection goes back through `keep`, never an unknown one.
+	fn finish_apply<R>(
+		&self,
+		connection: Connection,
+		token: String,
+		permit: PreparedImportPermit,
+		result: &Result<R, RemoteError>,
+		keep: impl FnOnce(Connection),
+	) {
+		let unknown = result.as_ref().is_err_and(RemoteError::outcome_unknown);
+		let clean = !unknown && connection.unsolicited_frames() == 0;
+		let retry = clean
+			&& !connection.broken
+			&& matches!(
+				result,
+				Err(RemoteError::Refused { code, .. })
+					if crate::prepared::refused_before_write(*code)
+			);
+		let next = if retry {
+			PreparedImportState::Ready(Box::new(PreparedConnection {
+				connection,
+				token,
+				_permit: permit,
+			}))
+		} else {
+			// An out-of-step or unknown outcome is never returned to the pool.
+			if clean {
+				keep(connection);
+			}
+			if unknown {
+				PreparedImportState::OutcomeUnknown
+			} else {
+				PreparedImportState::Used
+			}
+		};
+		*self.state.lock().unwrap_or_else(PoisonError::into_inner) = next;
+	}
+
+	/// Runs one Apply's state changes with `refusal` as the worker's answer.
+	/// `during` runs while the lease is Applying, before the answer.
+	#[doc(hidden)]
+	pub fn refuse_apply_for_tests(
+		&self,
+		refusal: RemoteError,
+		during: impl FnOnce(),
+	) -> Result<(), RemoteError> {
+		let ready = self.begin_apply()?;
+		let PreparedConnection {
+			connection,
+			token,
+			_permit,
+		} = *ready;
+		during();
+		let result: Result<(), RemoteError> = Err(refusal);
+		self.finish_apply(connection, token, _permit, &result, |connection| {
+			drop(connection)
+		});
+		result
+	}
+}
+
+fn prepared_stale(message: &str) -> RemoteError {
+	RemoteError::Refused {
+		code: ErrorCode::Stale,
+		message: message.into(),
+	}
+}
+
 /// Calls to one worker, reusing a few idle connections.
 pub struct Client {
 	host: RemoteHost,
 	my_name: String,
 	idle: Mutex<Vec<Connection>>,
 	limiter: GitLimiter,
+	handshakes: Arc<HandshakeGate>,
+	prepared_imports: Arc<PreparedImports>,
 }
 
 impl Client {
 	pub fn new(host: RemoteHost, my_name: String) -> Self {
+		let handshakes = HandshakeGate::for_host(&host);
 		Self {
 			host,
 			my_name,
 			idle: Mutex::new(Vec::new()),
 			limiter: GitLimiter::new(),
+			handshakes,
+			prepared_imports: Arc::default(),
 		}
 	}
 
@@ -972,7 +1458,33 @@ impl Client {
 		&self,
 		cancel: Option<&CancelToken>,
 	) -> Result<Connection, RemoteError> {
-		Connection::open_with(&self.host.transport, &self.my_name, cancel)
+		self.connect_until(cancel, Instant::now() + CONNECT_TIMEOUT)
+	}
+
+	fn connect_until(
+		&self,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<Connection, RemoteError> {
+		self.connect_queued(cancel, deadline, CONNECT_TIMEOUT)
+	}
+
+	/// Waits for a handshake slot until `deadline` (the caller's limit), then
+	/// gives the hello `hello` counted from the moment the slot is taken, and
+	/// never past `deadline`. Time spent queued does not shorten the hello.
+	fn connect_queued(
+		&self,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+		hello: Duration,
+	) -> Result<Connection, RemoteError> {
+		let _guard = self.handshakes.acquire(cancel, deadline)?;
+		Connection::open_until(
+			&self.host.transport,
+			&self.my_name,
+			cancel,
+			deadline.min(Instant::now() + hello),
+		)
 	}
 
 	/// A fresh connection whose worker speaks at least `need`, or
@@ -982,8 +1494,9 @@ impl Client {
 		&self,
 		need: u32,
 		cancel: Option<&CancelToken>,
+		deadline: Instant,
 	) -> Result<Connection, RemoteError> {
-		let fresh = self.connect_with(cancel)?;
+		let fresh = self.connect_until(cancel, deadline)?;
 		if fresh.version() < need {
 			let err = too_old_error(&fresh, need);
 			self.keep(fresh);
@@ -999,6 +1512,34 @@ impl Client {
 		let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
 		if idle.len() < POOL {
 			idle.push(conn);
+		}
+	}
+
+	fn take_connection(
+		&self,
+		need: u32,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<(Connection, bool), RemoteError> {
+		let pooled = self
+			.idle
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.pop();
+		match pooled {
+			Some(conn) if conn.unsolicited_frames() > 0 => {
+				// Its stream is out of step. This is a new read/plan, never a
+				// token Apply, so the old worker can be discarded here.
+				drop(conn);
+				Ok((self.connect_at_least(need, cancel, deadline)?, false))
+			}
+			Some(conn) if conn.version() >= need => Ok((conn, true)),
+			Some(conn) => {
+				let error = too_old_error(&conn, need);
+				self.keep(conn);
+				Err(error)
+			}
+			None => Ok((self.connect_at_least(need, cancel, deadline)?, false)),
 		}
 	}
 
@@ -1026,6 +1567,7 @@ impl Client {
 		let writes = matches!(
 			request,
 			Request::ImportApply { .. }
+				| Request::ApplyPrepared { .. }
 				| Request::ReplayApply {
 					check_only: false,
 					..
@@ -1038,28 +1580,8 @@ impl Client {
 		};
 
 		let need = request.needs_version();
-		let too_old = |conn: Connection| {
-			let err = too_old_error(&conn, need);
-			self.keep(conn);
-			err
-		};
-		let pooled = self
-			.idle
-			.lock()
-			.unwrap_or_else(PoisonError::into_inner)
-			.pop();
-		let (mut conn, reused) = match pooled {
-			Some(conn) if conn.unsolicited_frames() > 0 => {
-				// The worker spoke while nobody was asking. Whatever the
-				// reason, its stream is out of step with the protocol:
-				// drop the connection (killing its process) and start a
-				// clean one — which must speak a new enough protocol too.
-				(self.connect_at_least(need, cancel)?, false)
-			}
-			Some(conn) if conn.version() >= need => (conn, true),
-			Some(conn) => return Err(too_old(conn)),
-			None => (self.connect_at_least(need, cancel)?, false),
-		};
+		let (mut conn, reused) =
+			self.take_connection(need, cancel, start + limit)?;
 
 		let remaining = limit.saturating_sub(start.elapsed());
 		if remaining.is_zero() {
@@ -1073,7 +1595,7 @@ impl Client {
 				if remaining_retry.is_zero() {
 					return Err(RemoteError::TimedOut);
 				}
-				match self.connect_at_least(need, cancel) {
+				match self.connect_at_least(need, cancel, start + limit) {
 					Ok(mut fresh) => {
 						result = fresh.call(request, cancel, remaining_retry);
 						conn = fresh;
@@ -1180,6 +1702,226 @@ impl Client {
 			Response::ImportPlanned(planned) => Ok(planned),
 			_ => Err(unexpected()),
 		}
+	}
+
+	/// File-paste facade: use metadata-only previews on protocol 7 and
+	/// reserve the exact worker connection when it retains a payload token.
+	/// A worker or client unable to retain a token chooses legacy Apply now,
+	/// before any write has been sent.
+	pub(crate) fn prepare_import(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		cancel: Option<&CancelToken>,
+	) -> Result<(ImportPlanned, Option<Arc<PreparedImportLease>>), RemoteError>
+	{
+		let start = Instant::now();
+		let _guard = self.limiter.acquire(cancel, GIT_CALL_LIMIT)?;
+		let permit = self.prepared_imports.reserve();
+		let (mut connection, reused) = self.take_connection(
+			crate::proto::PASTE_VERSION,
+			cancel,
+			start + GIT_CALL_LIMIT,
+		)?;
+		let request = |version| {
+			if version >= crate::proto::PREPARED_IMPORT_VERSION {
+				Request::PrepareImport {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text: text.into(),
+					mapping: mapping.clone(),
+					retain: permit.is_some(),
+				}
+			} else {
+				Request::ImportPlan {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text: text.into(),
+					mapping: mapping.clone(),
+				}
+			}
+		};
+		let mut reply = connection.call(
+			&request(connection.version()),
+			cancel,
+			GIT_CALL_LIMIT.saturating_sub(start.elapsed()),
+		);
+		if let Err(error) = &reply {
+			// Planning is read-only. Preserve the existing single retry on a
+			// stale reused connection, selecting the new worker's protocol.
+			if should_resend(reused, connection.frames_seen, error) {
+				match self.connect_at_least(
+					crate::proto::PASTE_VERSION,
+					cancel,
+					start + GIT_CALL_LIMIT,
+				) {
+					Ok(mut fresh) => {
+						reply = fresh.call(
+							&request(fresh.version()),
+							cancel,
+							GIT_CALL_LIMIT.saturating_sub(start.elapsed()),
+						);
+						connection = fresh;
+					}
+					Err(error @ RemoteError::WorkerTooOld { .. }) => {
+						return Err(error)
+					}
+					Err(_) => {}
+				}
+			}
+		}
+		let (planned, token) = match reply {
+			Ok(Response::ImportPrepared(prepared))
+				if connection.version()
+					>= crate::proto::PREPARED_IMPORT_VERSION =>
+			{
+				let planned = prepared
+					.hydrate(text, &mapping.header_format)
+					.map_err(RemoteError::Protocol)?;
+				(planned, prepared.token)
+			}
+			Ok(Response::ImportPlanned(planned))
+				if connection.version()
+					< crate::proto::PREPARED_IMPORT_VERSION =>
+			{
+				(planned, None)
+			}
+			Ok(_) => return Err(unexpected()),
+			Err(error) => {
+				self.keep(connection);
+				return Err(error);
+			}
+		};
+		if cancel.is_some_and(|token| token.is_cancelled()) {
+			return Err(RemoteError::Cancelled);
+		}
+		match (token, permit) {
+			(Some(token), Some(permit)) => {
+				let lease = PreparedImportLease {
+					owner: self.prepared_imports.clone(),
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text_hash: Sha256::digest(text.as_bytes()).into(),
+					mapping: mapping.clone(),
+					digest: planned.digest.clone(),
+					connection_bytes: connection_footprint(
+						&connection,
+						token.capacity(),
+					),
+					state: Mutex::new(PreparedImportState::Ready(Box::new(
+						PreparedConnection {
+							connection,
+							token,
+							_permit: permit,
+						},
+					))),
+				};
+				Ok((planned, Some(Arc::new(lease))))
+			}
+			(None, _) => {
+				self.keep(connection);
+				Ok((planned, None))
+			}
+			(Some(_), None) => Err(RemoteError::Protocol(
+				"worker retained a paste without a client lease".into(),
+			)),
+		}
+	}
+
+	/// Applies a token on its original connection. The lease returns to
+	/// Ready after a refusal from before the worker's first write (Busy,
+	/// Timeout), so the same preview can apply again. When the worker no
+	/// longer holds the token and wrote nothing, the full text goes once on
+	/// that same connection as `ImportApply`, which the worker re-plans and
+	/// checks against the digest. An unknown outcome is never resent or
+	/// retried; no path reconnects or obtains another worker.
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn apply_prepared_import(
+		&self,
+		lease: &PreparedImportLease,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		selection: &snip_core::restore::RestoreSelection,
+		expect: &ImportExpect,
+	) -> Result<snip_core::restore::RestoreExecutionResult, RemoteError> {
+		let text_hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+		if !Arc::ptr_eq(&self.prepared_imports, &lease.owner)
+			|| workspace != lease.workspace
+			|| dest != lease.dest
+			|| text_hash != lease.text_hash
+			|| mapping != &lease.mapping
+			|| expect.digest != lease.digest
+		{
+			return Err(prepared_stale("the prepared paste belongs to another target or payload; preview again"));
+		}
+		let start = Instant::now();
+		let _guard = self.limiter.acquire(None, APPLY_CALL_LIMIT)?;
+		let ready = lease.begin_apply()?;
+		let PreparedConnection {
+			mut connection,
+			token,
+			_permit,
+		} = *ready;
+		let call =
+			|connection: &mut Connection, request: &Request| match connection
+				.call(
+					request,
+					None,
+					APPLY_CALL_LIMIT.saturating_sub(start.elapsed()),
+				) {
+				Ok(Response::Imported(result)) => Ok(result),
+				Ok(_) => Err(unexpected()),
+				Err(error) => Err(error),
+			};
+		let result = if connection.broken || connection.unsolicited_frames() > 0
+		{
+			Err(prepared_stale(
+				"the prepared paste connection changed; preview again",
+			))
+		} else {
+			let applied = call(
+				&mut connection,
+				&Request::ApplyPrepared {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					token: token.clone(),
+					selection: selection.clone(),
+					expect: expect.clone(),
+				},
+			);
+			match applied {
+				// The worker dropped the payload before writing anything:
+				// the full text, once, re-planned and digest-checked there.
+				Err(RemoteError::Refused {
+					code: ErrorCode::Stale,
+					message,
+				}) if message == crate::prepared::TOKEN_GONE => call(
+					&mut connection,
+					&Request::ImportApply {
+						workspace: workspace.into(),
+						dest: dest.into(),
+						text: text.into(),
+						mapping: mapping.clone(),
+						selection: selection.clone(),
+						expect: expect.clone(),
+					},
+				),
+				other => other,
+			}
+		};
+		lease.finish_apply(connection, token, _permit, &result, |connection| {
+			self.keep(connection)
+		});
+		result
+	}
+
+	#[doc(hidden)]
+	pub fn prepared_imports_for_tests(&self) -> usize {
+		self.prepared_imports.active.load(Ordering::SeqCst)
 	}
 
 	/// Writes what [`Self::import_plan`] previewed, as `selection` confirms,
@@ -1377,6 +2119,26 @@ impl Client {
 			_ => Err(unexpected()),
 		}
 	}
+
+	/// Reads a bounded, typed original destination for the shared commit
+	/// preview engine. No source payload or replay plan crosses the wire.
+	pub fn read_replay_preview(
+		&self,
+		workspace: &str,
+		path: &std::path::Path,
+		limit: usize,
+		cancel: Option<&CancelToken>,
+	) -> Result<snip_core::transfer::ReplayPreviewRead, RemoteError> {
+		let request = Request::ReplayRead {
+			workspace: workspace.into(),
+			path: path.into(),
+			limit,
+		};
+		match self.call_with(&request, cancel, GIT_CALL_LIMIT)? {
+			Response::ReplayRead(read) => Ok(read),
+			_ => Err(unexpected()),
+		}
+	}
 }
 
 fn unexpected() -> RemoteError {
@@ -1392,22 +2154,28 @@ fn too_old_error(conn: &Connection, need: u32) -> RemoteError {
 	}
 }
 
-/// Requests whose worker side runs git: bounded by
+/// Requests sharing worker job admission, including Git and paste previews:
+/// bounded by
 /// [`MAX_GIT_CALLS_IN_FLIGHT`] per client, so one master cannot stack more
 /// git work on a worker than the worker can serve. That includes the
 /// pastes into a repository: their freshness snapshot and re-check read
 /// HEAD and the index with git (`capture_repo_freshness`). Listing,
-/// reading and stating are plain fs work.
+/// ordinary reading and stating are plain fs work. Typed replay reads use
+/// paste-job admission so their bounded reads and cancellation have the
+/// same lifecycle as the other paste preview operations.
 pub(crate) fn runs_git(request: &Request) -> bool {
 	matches!(
 		request,
 		Request::ScanRepos { .. }
+			| Request::ReplayRead { .. }
 			| Request::GitView { .. }
 			| Request::Export { .. }
 			| Request::ExportCommits { .. }
 			| Request::ExportChanges { .. }
 			| Request::ImportPlan { .. }
+			| Request::PrepareImport { .. }
 			| Request::ImportApply { .. }
+			| Request::ApplyPrepared { .. }
 			| Request::ReplayPlan { .. }
 			| Request::ReplayApply { .. }
 	)
@@ -1737,6 +2505,783 @@ impl From<RemoteError> for GitError {
 mod tests {
 	use super::*;
 	use crate::proto::write_frame;
+
+	struct PreparedWrites(Arc<Mutex<Vec<u8>>>);
+	impl IoWrite for PreparedWrites {
+		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+			self.0.lock().unwrap().extend_from_slice(bytes);
+			Ok(bytes.len())
+		}
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	struct PreparedFixture {
+		client: Arc<Client>,
+		lease: Arc<PreparedImportLease>,
+		expect: ImportExpect,
+		writes: Arc<Mutex<Vec<u8>>>,
+		reply: SyncSender<io::Result<Option<Response>>>,
+		retained: Arc<AtomicUsize>,
+	}
+
+	impl PreparedFixture {
+		fn new() -> Self {
+			let client = Arc::new(Client::new(
+				RemoteHost::in_process(Arc::new(Worker::new(
+					Default::default(),
+				))),
+				"test".into(),
+			));
+			let permit = client.prepared_imports.reserve().unwrap();
+			let (reply, frames) = mpsc::sync_channel(1);
+			let writes = Arc::new(Mutex::new(Vec::new()));
+			let retained = Arc::new(AtomicUsize::new(0));
+			let mut connection = test_conn(
+				Box::new(PreparedWrites(writes.clone())),
+				frames,
+				retained.clone(),
+				Arc::new(AtomicBool::new(false)),
+			);
+			connection.version = crate::proto::PREPARED_IMPORT_VERSION;
+			let expect = ImportExpect {
+				digest: "expected".into(),
+				freshness: snip_core::transfer::DestinationFreshnessSnapshot {
+					roots: Default::default(),
+					target_files: Default::default(),
+				},
+			};
+			let token: String = "opaque-token".into();
+			let connection_bytes =
+				connection_footprint(&connection, token.capacity());
+			let lease = Arc::new(PreparedImportLease {
+				owner: client.prepared_imports.clone(),
+				workspace: "/workspace".into(),
+				dest: String::new(),
+				text_hash: Sha256::digest(b"source").into(),
+				mapping: PasteMapping::default(),
+				digest: expect.digest.clone(),
+				connection_bytes,
+				state: Mutex::new(PreparedImportState::Ready(Box::new(
+					PreparedConnection {
+						connection,
+						token,
+						_permit: permit,
+					},
+				))),
+			});
+			Self {
+				client,
+				lease,
+				expect,
+				writes,
+				reply,
+				retained,
+			}
+		}
+
+		fn apply(
+			&self,
+		) -> Result<snip_core::restore::RestoreExecutionResult, RemoteError> {
+			self.client.apply_prepared_import(
+				&self.lease,
+				"/workspace",
+				"",
+				"source",
+				&PasteMapping::default(),
+				&Default::default(),
+				&self.expect,
+			)
+		}
+
+		fn start(
+			&self,
+		) -> std::thread::JoinHandle<
+			Result<snip_core::restore::RestoreExecutionResult, RemoteError>,
+		> {
+			let client = self.client.clone();
+			let lease = self.lease.clone();
+			let expect = self.expect.clone();
+			std::thread::spawn(move || {
+				client.apply_prepared_import(
+					&lease,
+					"/workspace",
+					"",
+					"source",
+					&PasteMapping::default(),
+					&Default::default(),
+					&expect,
+				)
+			})
+		}
+
+		fn answer(&self, response: Option<Response>) {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			loop {
+				let bytes = self.writes.lock().unwrap();
+				let complete = bytes.len() >= 4
+					&& bytes.len()
+						>= 4 + u32::from_be_bytes(
+							bytes[..4].try_into().unwrap(),
+						) as usize;
+				drop(bytes);
+				if complete {
+					break;
+				}
+				assert!(Instant::now() < end, "prepared request never sent");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			self.retained.fetch_add(1, Ordering::SeqCst);
+			self.reply.send(Ok(response)).unwrap();
+		}
+	}
+
+	fn join_prepared(
+		thread: std::thread::JoinHandle<
+			Result<snip_core::restore::RestoreExecutionResult, RemoteError>,
+		>,
+	) -> Result<snip_core::restore::RestoreExecutionResult, RemoteError> {
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while !thread.is_finished() {
+			assert!(Instant::now() < end, "prepared apply did not finish");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		thread.join().unwrap()
+	}
+
+	#[test]
+	fn prepared_lease_checks_binding_and_clones_share_one_use() {
+		let fixture = PreparedFixture::new();
+		let other = Client::new(fixture.client.host.clone(), "other".into());
+		for (client, workspace, dest, text, mapping) in [
+			(&other, "/workspace", "", "source", PasteMapping::default()),
+			(
+				fixture.client.as_ref(),
+				"/other",
+				"",
+				"source",
+				PasteMapping::default(),
+			),
+			(
+				fixture.client.as_ref(),
+				"/workspace",
+				"other",
+				"source",
+				PasteMapping::default(),
+			),
+			(
+				fixture.client.as_ref(),
+				"/workspace",
+				"",
+				"changed",
+				PasteMapping::default(),
+			),
+			(
+				fixture.client.as_ref(),
+				"/workspace",
+				"",
+				"source",
+				PasteMapping {
+					adjust_paths: true,
+					..Default::default()
+				},
+			),
+		] {
+			assert!(matches!(
+				client.apply_prepared_import(
+					&fixture.lease,
+					workspace,
+					dest,
+					text,
+					&mapping,
+					&Default::default(),
+					&fixture.expect
+				),
+				Err(RemoteError::Refused {
+					code: ErrorCode::Stale,
+					..
+				})
+			));
+		}
+		assert!(fixture.writes.lock().unwrap().is_empty());
+		assert_eq!(fixture.client.prepared_imports_for_tests(), 1);
+		let first = fixture.start();
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while fixture.writes.lock().unwrap().is_empty() {
+			assert!(Instant::now() < end, "first clone did not start");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert!(matches!(
+			fixture.apply(),
+			Err(RemoteError::Refused {
+				code: ErrorCode::Busy,
+				..
+			})
+		));
+		fixture.answer(Some(Response::Imported(Default::default())));
+		join_prepared(first).unwrap();
+		let before = fixture.writes.lock().unwrap().len();
+		assert!(matches!(
+			fixture.apply(),
+			Err(RemoteError::Refused {
+				code: ErrorCode::Stale,
+				..
+			})
+		));
+		assert_eq!(fixture.writes.lock().unwrap().len(), before);
+		let bytes = fixture.writes.lock().unwrap();
+		let mut reader = bytes.as_slice();
+		assert!(matches!(
+			read_frame::<Request>(&mut reader).unwrap(),
+			Some(Request::ApplyPrepared { .. })
+		));
+		assert!(reader.is_empty(), "exactly one write request");
+		assert_eq!(fixture.client.prepared_imports_for_tests(), 0);
+	}
+
+	#[test]
+	fn prepared_unknown_and_known_refusal_are_one_use_without_resend() {
+		for response in [
+			None,
+			Some(Response::Error {
+				code: ErrorCode::Stale,
+				message: "expired; preview again".into(),
+			}),
+		] {
+			let unknown = response.is_none();
+			let fixture = PreparedFixture::new();
+			let first = fixture.start();
+			fixture.answer(response);
+			let error = join_prepared(first).unwrap_err();
+			assert_eq!(error.outcome_unknown(), unknown, "{error:?}");
+			let before = fixture.writes.lock().unwrap().len();
+			let error = fixture.apply().unwrap_err();
+			assert_eq!(error.outcome_unknown(), unknown, "{error:?}");
+			assert_eq!(
+				fixture.writes.lock().unwrap().len(),
+				before,
+				"no token resend or legacy fallback"
+			);
+			assert_eq!(fixture.client.prepared_imports_for_tests(), 0);
+		}
+	}
+
+	#[test]
+	fn restoring_ready_after_a_refused_apply_never_grows_the_charge() {
+		let fixture = PreparedFixture::new();
+		let ready = fixture.lease.retained_heap_bytes();
+		let wait_for_request = |before: usize| {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while fixture.writes.lock().unwrap().len() == before {
+				assert!(Instant::now() < end, "apply request was never sent");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+		};
+		let first = fixture.start();
+		wait_for_request(0);
+		let applying = fixture.lease.retained_heap_bytes();
+		fixture.answer(Some(Response::Error {
+			code: ErrorCode::Busy,
+			message: "busy".into(),
+		}));
+		assert!(matches!(
+			join_prepared(first),
+			Err(RemoteError::Refused {
+				code: ErrorCode::Busy,
+				..
+			})
+		));
+		let restored = fixture.lease.retained_heap_bytes();
+		assert_eq!(applying, ready, "Applying keeps the connection charged");
+		assert!(
+			restored <= ready,
+			"Ready never costs more than before: {restored} > {ready}"
+		);
+
+		// The Busy refusal left the lease Ready: the same preview applies again.
+		let before = fixture.writes.lock().unwrap().len();
+		let second = fixture.start();
+		wait_for_request(before);
+		fixture.answer(Some(Response::Imported(Default::default())));
+		join_prepared(second).unwrap();
+		assert!(fixture.lease.retained_heap_bytes() <= ready);
+	}
+
+	#[test]
+	fn prepared_cap_and_last_clone_drop_release_slots() {
+		let fixture = PreparedFixture::new();
+		let extra = fixture.client.prepared_imports.reserve().unwrap();
+		assert!(fixture.client.prepared_imports.reserve().is_none());
+		drop(extra);
+		assert_eq!(fixture.client.prepared_imports_for_tests(), 1);
+		let client = fixture.client.clone();
+		let last = fixture.lease.clone();
+		drop(fixture);
+		assert_eq!(
+			client.prepared_imports_for_tests(),
+			1,
+			"another plan clone keeps its lease"
+		);
+		drop(last);
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while client.prepared_imports_for_tests() != 0 {
+			assert!(
+				Instant::now() < end,
+				"last clone did not release its lease"
+			);
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let canceled = CancelToken::new();
+		canceled.cancel();
+		assert!(matches!(
+			client.prepare_import(
+				"/workspace",
+				"",
+				"source",
+				&PasteMapping::default(),
+				Some(&canceled)
+			),
+			Err(RemoteError::Cancelled)
+		));
+		assert_eq!(client.prepared_imports_for_tests(), 0);
+	}
+
+	#[test]
+	fn same_host_clients_bound_real_handshakes() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		worker.hold_hellos_for_tests(true);
+		let mut threads = Vec::new();
+		for _ in 0..6 {
+			let worker = worker.clone();
+			threads.push(std::thread::spawn(move || {
+				let client =
+					Client::new(RemoteHost::in_process(worker), "test".into());
+				client.home()
+			}));
+		}
+		// Observe actual worker hellos while they are deliberately held. The
+		// bound also lets a correct two-at-a-time implementation finish.
+		let end = Instant::now() + scaled(Duration::from_millis(500));
+		while worker.active_hellos_for_tests() < 6 && Instant::now() < end {
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		worker.hold_hellos_for_tests(false);
+		for thread in threads {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while !thread.is_finished() {
+				assert!(
+					Instant::now() < end,
+					"handshake thread did not finish"
+				);
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			thread.join().unwrap().unwrap();
+		}
+		assert_eq!(worker.started_connections_for_tests(), 6);
+		assert!(
+			worker.max_hellos_for_tests() <= 2,
+			"{} simultaneous hellos",
+			worker.max_hellos_for_tests()
+		);
+	}
+
+	#[test]
+	fn handshake_queue_cancels_times_out_and_does_not_block_another_host() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		worker.hold_hellos_for_tests(true);
+		struct Release(Arc<Worker>);
+		impl Drop for Release {
+			fn drop(&mut self) {
+				self.0.hold_hellos_for_tests(false);
+			}
+		}
+		let release = Release(worker.clone());
+		let host = RemoteHost::in_process(worker.clone());
+		let first = Arc::new(Client::new(host.clone(), "first".into()));
+		let second = Arc::new(Client::new(host.clone(), "second".into()));
+		let mut holders = Vec::new();
+		for client in [first.clone(), second.clone()] {
+			holders.push(std::thread::spawn(move || client.home()));
+		}
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while worker.active_hellos_for_tests() < 2 {
+			assert!(Instant::now() < end, "two hellos never started");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let queued = Arc::new(Client::new(host.clone(), "queued".into()));
+		let token = CancelToken::new();
+		let (started, entered) = mpsc::channel();
+		let waiter = {
+			let queued = queued.clone();
+			let token = token.clone();
+			std::thread::spawn(move || {
+				started.send(()).unwrap();
+				queued.connect_with(Some(&token)).err().unwrap()
+			})
+		};
+		entered
+			.recv_timeout(scaled(Duration::from_secs(5)))
+			.unwrap();
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while queued.handshakes.waiting.load(Ordering::SeqCst) == 0 {
+			assert!(
+				Instant::now() < end,
+				"third client never entered the handshake queue"
+			);
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		token.cancel();
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while !waiter.is_finished() {
+			assert!(Instant::now() < end, "queued cancel did not finish");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert!(matches!(waiter.join().unwrap(), RemoteError::Cancelled));
+		let started = Instant::now();
+		let error = queued
+			.connect_until(None, started + scaled(Duration::from_millis(100)))
+			.err()
+			.unwrap();
+		assert!(error.is_transient_read_failure());
+		assert!(!error.outcome_unknown(), "queued connect sent no write");
+		assert!(started.elapsed() < scaled(Duration::from_secs(2)));
+		assert_eq!(
+			worker.started_connections_for_tests(),
+			2,
+			"queued calls must not spawn transports"
+		);
+		let other = Arc::new(Worker::new(Default::default()));
+		let other_client = Client::new(
+			RemoteHost {
+				name: "another-host".into(),
+				transport: Transport::InProcess(other.clone()),
+			},
+			"other".into(),
+		);
+		other_client
+			.connect_until(
+				None,
+				Instant::now() + scaled(Duration::from_secs(2)),
+			)
+			.unwrap();
+		assert_eq!(other.started_connections_for_tests(), 1);
+		drop(release);
+		for holder in holders {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while !holder.is_finished() {
+				assert!(Instant::now() < end, "held connection did not finish");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			holder.join().unwrap().unwrap();
+		}
+		assert_eq!(
+			*first.handshakes.active.lock().unwrap(),
+			0,
+			"established idle connections must not hold handshake permits"
+		);
+		queued.home().unwrap();
+		assert_eq!(worker.started_connections_for_tests(), 3);
+	}
+
+	/// Holds every hello of `worker` until dropped, so two started
+	/// connections keep both handshake slots busy.
+	struct HoldHellos(Arc<Worker>);
+
+	impl HoldHellos {
+		fn new(worker: &Arc<Worker>) -> Self {
+			worker.hold_hellos_for_tests(true);
+			Self(worker.clone())
+		}
+	}
+
+	impl Drop for HoldHellos {
+		fn drop(&mut self) {
+			self.0.hold_hellos_for_tests(false);
+		}
+	}
+
+	#[test]
+	fn a_connect_queued_past_the_hello_budget_still_connects() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		let hold = HoldHellos::new(&worker);
+		let host = RemoteHost::in_process(worker.clone());
+		let mut holders = Vec::new();
+		for name in ["first", "second"] {
+			let client = Client::new(host.clone(), name.into());
+			holders.push(std::thread::spawn(move || client.home()));
+		}
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while worker.active_hellos_for_tests() < 2 {
+			assert!(Instant::now() < end, "two hellos never started");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		// A hello budget far shorter than the queue wait below: were the
+		// budget counted from before the queue, the connect would time out.
+		let hello = scaled(Duration::from_millis(200));
+		let queued = Arc::new(Client::new(host.clone(), "queued".into()));
+		let waiter = {
+			let queued = queued.clone();
+			std::thread::spawn(move || {
+				queued.connect_queued(
+					None,
+					Instant::now() + scaled(Duration::from_secs(10)),
+					hello,
+				)
+			})
+		};
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while queued.handshakes.waiting.load(Ordering::SeqCst) == 0 {
+			assert!(Instant::now() < end, "queued connect never waited");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let queued_at = Instant::now();
+		let queued_for = scaled(Duration::from_millis(600));
+		while queued_at.elapsed() < queued_for {
+			assert!(!waiter.is_finished(), "queued connect ended in the queue");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		drop(hold);
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while !waiter.is_finished() {
+			assert!(Instant::now() < end, "queued connect did not finish");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		waiter
+			.join()
+			.unwrap()
+			.expect("a queue wait past the hello budget must still connect");
+		for holder in holders {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while !holder.is_finished() {
+				assert!(Instant::now() < end, "held connection did not finish");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			holder.join().unwrap().unwrap();
+		}
+		assert_eq!(worker.started_connections_for_tests(), 3);
+	}
+
+	#[test]
+	fn a_handshake_slot_timeout_does_not_blame_the_worker() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		let hold = HoldHellos::new(&worker);
+		let host = RemoteHost::in_process(worker.clone());
+		let mut holders = Vec::new();
+		for name in ["first", "second"] {
+			let client = Client::new(host.clone(), name.into());
+			holders.push(std::thread::spawn(move || client.home()));
+		}
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while worker.active_hellos_for_tests() < 2 {
+			assert!(Instant::now() < end, "two hellos never started");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let queued = Client::new(host.clone(), "queued".into());
+		let error = queued
+			.connect_until(
+				None,
+				Instant::now() + scaled(Duration::from_millis(100)),
+			)
+			.err()
+			.unwrap();
+		let message = error.to_string();
+		assert!(
+			matches!(
+				error,
+				RemoteError::Start {
+					kind: ConnectFailureKind::TimedOut,
+					..
+				}
+			),
+			"{message}"
+		);
+		assert!(error.is_transient_read_failure());
+		assert!(!error.outcome_unknown(), "queued connect sent no write");
+		assert!(message.contains("connection slot"), "{message}");
+		assert!(!message.contains("did not answer"), "{message}");
+		drop(hold);
+		for holder in holders {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while !holder.is_finished() {
+				assert!(Instant::now() < end, "held connection did not finish");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			holder.join().unwrap().unwrap();
+		}
+		assert_eq!(worker.started_connections_for_tests(), 2);
+	}
+
+	#[test]
+	fn a_worker_closed_before_hello_keeps_a_typed_transport_failure() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		worker.stop();
+		let error = Connection::open(&Transport::InProcess(worker), "test")
+			.err()
+			.unwrap();
+		assert!(matches!(error, RemoteError::Start { .. }), "{error:?}");
+		assert!(error.is_transient_read_failure(), "{error:?}");
+		assert!(!error.outcome_unknown());
+		assert_eq!(
+			error.to_string(),
+			"the remote end closed the connection before snip started"
+		);
+	}
+
+	#[test]
+	fn startup_errors_preserve_typed_transience_and_existing_messages() {
+		for (cause, code, stderr, transient) in [
+			(StartCause::Ended, None, "", true),
+			(
+				StartCause::Io(io::ErrorKind::ConnectionReset),
+				None,
+				"",
+				true,
+			),
+			(StartCause::NoAnswer, None, "", true),
+			(
+				StartCause::Ended,
+				Some(255),
+				"kex_exchange_identification: read: Connection reset by peer",
+				true,
+			),
+			(
+				StartCause::Ended,
+				Some(255),
+				"Permission denied (publickey)",
+				false,
+			),
+			(
+				StartCause::Ended,
+				Some(255),
+				"Host key verification failed",
+				false,
+			),
+			(StartCause::Ended, Some(127), "snip: not found", false),
+			(StartCause::BadData("invalid frame".into()), None, "", false),
+			(
+				StartCause::Io(io::ErrorKind::PermissionDenied),
+				None,
+				"",
+				false,
+			),
+		] {
+			let error = RemoteError::Start {
+				kind: start_failure_kind(&cause, code, stderr),
+				message: start_message(cause.clone(), code, stderr),
+			};
+			assert_eq!(
+				error.is_transient_read_failure(),
+				transient,
+				"{error:?}"
+			);
+			assert_eq!(error.to_string(), start_message(cause, code, stderr));
+			assert!(!error.outcome_unknown(), "no request ran before hello");
+		}
+		for kind in [
+			io::ErrorKind::UnexpectedEof,
+			io::ErrorKind::ConnectionReset,
+			io::ErrorKind::BrokenPipe,
+			io::ErrorKind::TimedOut,
+		] {
+			assert!(RemoteError::Io(io::Error::from(kind))
+				.is_transient_read_failure());
+		}
+		for code in [ErrorCode::Busy, ErrorCode::Timeout] {
+			assert!(RemoteError::Refused {
+				code,
+				message: "irrelevant".into()
+			}
+			.is_transient_read_failure());
+		}
+		for error in [
+			RemoteError::Cancelled,
+			RemoteError::Connect("Connection reset by peer".into()),
+			RemoteError::Protocol("bad frame".into()),
+			RemoteError::WorkerTooOld {
+				worker: "old".into(),
+				have: 1,
+				need: 2,
+			},
+			RemoteError::Refused {
+				code: ErrorCode::Forbidden,
+				message: "Connection reset".into(),
+			},
+			RemoteError::Refused {
+				code: ErrorCode::BadRequest,
+				message: "bad".into(),
+			},
+		] {
+			assert!(!error.is_transient_read_failure(), "{error:?}");
+		}
+	}
+
+	/// A restore retries a start that ssh failed for a reason nobody
+	/// classified, while a permission refusal and the other known permanent
+	/// starts stay permanent.
+	#[test]
+	fn restore_retries_unclassified_starts_and_not_known_permanent_ones() {
+		for stderr in [
+			"ssh: Could not resolve hostname box: nodename nor servname provided, or not known",
+			"ssh: Could not resolve hostname box: Name or service not known",
+			"ssh: connect to host box port 22: Network is unreachable",
+		] {
+			let kind = start_failure_kind(&StartCause::Ended, Some(255), stderr);
+			assert_eq!(kind, ConnectFailureKind::Other, "{stderr}");
+			let error = RemoteError::Start {
+				kind,
+				message: start_message(StartCause::Ended, Some(255), stderr),
+			};
+			assert!(error.is_restore_retryable(), "{stderr}");
+			assert!(!error.outcome_unknown(), "no request ran before hello");
+		}
+		let denied = RemoteError::Start {
+			kind: start_failure_kind(
+				&StartCause::Ended,
+				Some(255),
+				"user@box: Permission denied (publickey).",
+			),
+			message: String::new(),
+		};
+		assert!(!denied.is_restore_retryable(), "{denied:?}");
+		assert!(!denied.is_transient_read_failure(), "{denied:?}");
+		for kind in [
+			ConnectFailureKind::Authentication,
+			ConnectFailureKind::WorkerUnavailable,
+			ConnectFailureKind::Protocol,
+		] {
+			let error = RemoteError::Start {
+				kind,
+				message: String::new(),
+			};
+			assert!(!error.is_restore_retryable(), "{error:?}");
+		}
+		for code in [ErrorCode::Busy, ErrorCode::Timeout, ErrorCode::NotFound] {
+			let error = RemoteError::Refused {
+				code,
+				message: String::new(),
+			};
+			assert!(error.is_restore_retryable(), "{error:?}");
+		}
+		for code in [ErrorCode::Forbidden, ErrorCode::Unsupported] {
+			let error = RemoteError::Refused {
+				code,
+				message: String::new(),
+			};
+			assert!(!error.is_restore_retryable(), "{error:?}");
+		}
+		for error in [
+			RemoteError::WorkerTooOld {
+				worker: "old".into(),
+				have: 1,
+				need: 2,
+			},
+			RemoteError::Protocol("bad frame".into()),
+			RemoteError::Cancelled,
+		] {
+			assert!(!error.is_restore_retryable(), "{error:?}");
+		}
+	}
 
 	fn timeout_scale() -> u32 {
 		std::env::var("SNIP_E2E_TIMEOUT_SCALE")
@@ -2732,6 +4277,14 @@ mod tests {
 				false,
 			),
 			(
+				Request::ReplayRead {
+					workspace: "w".into(),
+					path: "p".into(),
+					limit: 1024,
+				},
+				true, // bounded by the same worker job admission as paste plans
+			),
+			(
 				Request::Write {
 					workspace: "w".into(),
 					path: "p".into(),
@@ -2799,6 +4352,26 @@ mod tests {
 					mapping: PasteMapping::default(),
 				},
 				true, // its freshness snapshot reads HEAD and the index
+			),
+			(
+				Request::PrepareImport {
+					workspace: "w".into(),
+					dest: String::new(),
+					text: String::new(),
+					mapping: PasteMapping::default(),
+					retain: true,
+				},
+				true,
+			),
+			(
+				Request::ApplyPrepared {
+					workspace: "w".into(),
+					dest: String::new(),
+					token: "token".into(),
+					selection: Default::default(),
+					expect: expect.clone(),
+				},
+				true,
 			),
 			(
 				Request::ImportApply {

@@ -12,24 +12,22 @@ use std::process::ExitCode;
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use snip_core::clip::{self, Mode};
-use snip_core::commits::{
-	self, CommitCopySummary, CommitsPayload, ReplayAction,
-};
+use snip_core::commits::{self, CommitCopySummary, CommitsPayload};
 use snip_core::copy::CopyResult;
-use snip_core::format::{extract_source_root, parse_clipboard};
+use snip_core::format::parse_clipboard;
 use snip_core::gitrun::{CancelToken, RunOptions};
-use snip_core::gitsrc::{Git, GitError, GitSource};
+use snip_core::gitsrc::{Git, GitSource};
 use snip_core::restore::{
-	apply_restore_base, is_relative, suggest_restore_base, FsProbe,
-	RestorePlan, RestoreSelection,
+	apply_restore_base, is_relative, RestoreBaseSuggestion, RestorePlan,
+	RestoreSelection,
 };
 use snip_core::settings::Settings;
 use snip_core::transfer::{
 	changed_items, copy_selection_detailed, plan_commit_export_with,
-	plan_export_with, plan_import_with, selection_from_paths, CanonicalRootId,
-	CommitReplayPreview, ExportSelection, ImportMapping, TransferError,
-	CLIPBOARD_PAYLOAD_MAX,
+	plan_export_with, selection_from_paths, CanonicalRootId, ExportSelection,
+	TransferError, CLIPBOARD_PAYLOAD_MAX,
 };
+use snip_remote::{PasteError, PasteRoute, PasteTarget};
 
 mod remote;
 
@@ -198,7 +196,12 @@ fn main() -> ExitCode {
 				adjust_paths,
 			};
 			read_paste_text(stdin).and_then(|text| {
-				paste(PasteAt::Local(&repo), &text, &settings, &opts)
+				paste(
+					&PasteTarget::Local { dest: repo.clone() },
+					&text,
+					&settings,
+					&opts,
+				)
 			})
 		}
 		Command::Remote(cmd) => remote::run(cmd, &settings),
@@ -617,19 +620,6 @@ pub(crate) struct PasteOptions {
 	pub adjust_paths: bool,
 }
 
-/// Where a paste plans and writes: this machine, or a folder of a worker
-/// that plans and writes on its own disk with the same engine.
-#[derive(Clone, Copy)]
-pub(crate) enum PasteAt<'a> {
-	Local(&'a Path),
-	Remote {
-		client: &'a snip_remote::Client,
-		workspace: &'a str,
-		/// Relative to the workspace; "" is the workspace itself.
-		dest: &'a str,
-	},
-}
-
 /// The payload: stdin, or the clipboard.
 pub(crate) fn read_paste_text(stdin: bool) -> Result<String, String> {
 	if stdin {
@@ -644,7 +634,7 @@ pub(crate) fn read_paste_text(stdin: bool) -> Result<String, String> {
 }
 
 pub(crate) fn paste(
-	at: PasteAt<'_>,
+	target: &PasteTarget,
 	text: &str,
 	settings: &Settings,
 	opts: &PasteOptions,
@@ -657,63 +647,32 @@ pub(crate) fn paste(
 		return Err("Clipboard is empty or does not contain text.".into());
 	}
 	match clip::detect_mode(text) {
-		Mode::Commits => paste_commits(at, text, opts),
-		Mode::Files => paste_files(at, text, settings, opts),
+		Mode::Commits => paste_commits(target, text, opts),
+		Mode::Files => paste_files(target, text, settings, opts),
 	}
 }
 
-fn format_transfer_error(err: TransferError) -> String {
+/// A paste that did not plan, check or write, in the words `snip paste`
+/// has always used.
+fn format_paste_error(err: PasteError) -> String {
 	match err {
-		TransferError::TargetCollision { .. } => {
-			format!("Snipcode refused to paste: {err}")
-		}
-		TransferError::StaleDestination { .. } => {
-			format!("Snipcode refused to paste: {err}; re-run to inspect updated destinations")
-		}
-		TransferError::SpecialFile(_)
-		| TransferError::DestinationNotRegular(_) => err.paste_message(),
-		TransferError::Git(GitError::WorktreeBusy { .. }) => format!(
-			"Snipcode refused to paste: {err}; try again when the other paste finishes"
+		PasteError::Destination { path, source } => format!(
+			"--repo {} does not exist or cannot be resolved: {source}",
+			path.display()
 		),
-		other => other.to_string(),
-	}
-}
-
-/// A worker's refusal in the words [`format_transfer_error`] gives the
-/// same refusal here: the worker sends the local paste message.
-fn format_remote_error(err: snip_remote::RemoteError) -> String {
-	use snip_remote::{ErrorCode, RemoteError};
-	match err {
-		RemoteError::Refused {
-			code: ErrorCode::Collision,
-			message,
-		} => format!("Snipcode refused to paste: {message}"),
-		RemoteError::Refused {
-			code: ErrorCode::Stale,
-			message,
-		} => format!(
-			"Snipcode refused to paste: {message}; re-run to inspect updated destinations"
-		),
-		RemoteError::Refused {
-			code: ErrorCode::Busy,
-			message,
-		} if message.contains("another paste is writing") => format!(
-			"Snipcode refused to paste: {message}; try again when the other paste finishes"
-		),
-		other => other.to_string(),
-	}
-}
-
-/// A worker's answer to a write: a lost connection means the write may or
-/// may not have happened, never "refused".
-fn format_remote_apply_error(err: snip_remote::RemoteError) -> String {
-	if err.outcome_unknown() {
-		return format!(
-			"The connection was lost; whether the paste finished is unknown ({err}). \
+		PasteError::OutcomeUnknown(e) => format!(
+			"The connection was lost; whether the paste finished is unknown ({e}). \
 			 Check the destination (snip remote changes / ls) before pasting again."
-		);
+		),
+		e if e.is_collision() => format!("Snipcode refused to paste: {e}"),
+		e if e.stale_reason().is_some() => format!(
+			"Snipcode refused to paste: {e}; re-run to inspect updated destinations"
+		),
+		e if e.is_repo_busy() => format!(
+			"Snipcode refused to paste: {e}; try again when the other paste finishes"
+		),
+		e => e.to_string(),
 	}
-	format_remote_error(err)
 }
 
 /// Says what `--adjust-paths` would do, or does.
@@ -742,58 +701,8 @@ fn note_suggestion(
 	}
 }
 
-/// A planned file paste, applied where it was planned.
-enum FilePaste<'a> {
-	Local(snip_core::transfer::TransferImportPlan),
-	Remote {
-		client: &'a snip_remote::Client,
-		workspace: &'a str,
-		dest: &'a str,
-		mapping: snip_remote::PasteMapping,
-		planned: snip_remote::ImportPlanned,
-	},
-}
-
-impl FilePaste<'_> {
-	fn restore_plan(&self) -> &RestorePlan {
-		match self {
-			Self::Local(plan) => plan.restore_plan(),
-			Self::Remote { planned, .. } => planned.plan.restore_plan(),
-		}
-	}
-
-	fn apply(
-		&self,
-		text: &str,
-		selection: &RestoreSelection,
-	) -> Result<snip_core::restore::RestoreExecutionResult, String> {
-		match self {
-			Self::Local(plan) => {
-				plan.apply(selection).map_err(format_transfer_error)
-			}
-			Self::Remote {
-				client,
-				workspace,
-				dest,
-				mapping,
-				planned,
-			} => client
-				.import_apply(
-					workspace,
-					dest,
-					text,
-					mapping,
-					selection,
-					&planned.expect(),
-					None,
-				)
-				.map_err(format_remote_apply_error),
-		}
-	}
-}
-
 fn paste_files(
-	at: PasteAt<'_>,
+	target: &PasteTarget,
 	text: &str,
 	settings: &Settings,
 	opts: &PasteOptions,
@@ -804,66 +713,19 @@ fn paste_files(
 	}
 
 	// TS asks in a modal; here the suggestion is printed and applied only
-	// with --adjust-paths.
+	// with --adjust-paths. A worker suggests against its own folders.
 	let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
-	let import = match at {
-		PasteAt::Local(repo) => {
-			let suggestion = suggest_restore_base(
-				&repo.to_string_lossy(),
-				&paths,
-				&FsProbe,
-				extract_source_root(text).as_deref(),
-			);
-			if let Some(ref s) = suggestion {
-				note_suggestion(s, &paths, opts.adjust_paths);
-			}
-			let root_id = CanonicalRootId::new(repo).map_err(|e| {
-				format!(
-					"--repo {} does not exist or cannot be resolved: {e}",
-					repo.display()
-				)
-			})?;
-			let mapping = match (&suggestion, opts.adjust_paths) {
-				(Some(s), true) => ImportMapping::from_restore_base(s, root_id),
-				_ => ImportMapping::with_primary(root_id),
-			};
-			let plan = plan_import_with(
-				text,
-				&settings.header_format,
-				&[repo.to_path_buf()],
-				&mapping,
-				&RunOptions::default(),
-			)
-			.map_err(format_transfer_error)?;
-			FilePaste::Local(plan)
-		}
-		PasteAt::Remote {
-			client,
-			workspace,
-			dest,
-		} => {
-			// The worker suggests against its own folders, as `--repo`
-			// would be probed here.
-			let mapping = snip_remote::PasteMapping {
-				prefixes: Vec::new(),
-				adjust_paths: opts.adjust_paths,
-				header_format: settings.header_format.clone(),
-			};
-			let planned = client
-				.import_plan(workspace, dest, text, &mapping, None)
-				.map_err(format_remote_error)?;
-			if let Some(ref s) = planned.suggestion {
-				note_suggestion(s, &paths, opts.adjust_paths);
-			}
-			FilePaste::Remote {
-				client,
-				workspace,
-				dest,
-				mapping,
-				planned,
-			}
-		}
+	let route = PasteRoute {
+		prefixes: Vec::new(),
+		adjust_paths: opts.adjust_paths,
+		header_format: settings.header_format.clone(),
 	};
+	let mut note = |s: &RestoreBaseSuggestion| {
+		note_suggestion(s, &paths, opts.adjust_paths)
+	};
+	let import = target
+		.plan_files(text, &route, &RunOptions::default(), Some(&mut note))
+		.map_err(format_paste_error)?;
 
 	let plan = import.restore_plan();
 	if !opts.apply {
@@ -881,25 +743,29 @@ fn paste_files(
 		return Ok(());
 	}
 
-	let existing = plan.create_operations.iter().filter(|o| o.existed).count();
+	let existing = plan.existing_targets();
 	if existing > 0 && !opts.overwrite && !opts.skip_existing {
 		usage(format!(
 			"{existing} file(s) already exist; pass --overwrite or --skip-existing"
 		));
 	}
-	let result = import.apply(
-		text,
-		&RestoreSelection {
-			overwrite_existing: opts.overwrite,
-			skip_existing: opts.skip_existing,
-			..Default::default()
-		},
-	)?;
+	let result = target
+		.apply_files(
+			text,
+			&route,
+			&import,
+			&RestoreSelection {
+				overwrite_existing: opts.overwrite,
+				skip_existing: opts.skip_existing,
+				..Default::default()
+			},
+		)
+		.map_err(format_paste_error)?;
 
 	let parts: Vec<String> = [
 		("Created", result.created_count),
 		("Overwritten", result.overwritten_count),
-		("Skipped", result.skipped_existing_count),
+		("Skipped", result.total_skipped()),
 		("Deleted", result.deleted_count),
 	]
 	.iter()
@@ -930,14 +796,24 @@ fn print_plan(plan: &RestorePlan) -> Outcome {
 		stdout_line(&format!("delete\t{}", op.relative_path))?;
 	}
 	for op in &plan.skipped_operations {
-		stdout_line(&format!("skip\t{}\t{}", op.raw_path, op.reason.as_str()))?;
+		let detail = match op.detail {
+			Some(snip_core::restore::SkipDetail::ProtectedGitMetadata) => {
+				"\tprotected Git metadata"
+			}
+			None => "",
+		};
+		stdout_line(&format!(
+			"skip\t{}\t{}{detail}",
+			op.raw_path,
+			op.reason.as_str()
+		))?;
 	}
 	Ok(())
 }
 
 /// `confirmationSummary`.
 fn confirmation_summary(plan: &RestorePlan) -> String {
-	let overwrite = plan.create_operations.iter().filter(|o| o.existed).count();
+	let overwrite = plan.existing_targets();
 	format!(
 		"Snipcode will create {}, overwrite {overwrite}, delete {}, and skip {} operation(s).",
 		plan.create_operations.len() - overwrite,
@@ -946,7 +822,11 @@ fn confirmation_summary(plan: &RestorePlan) -> String {
 	)
 }
 
-fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
+fn paste_commits(
+	target: &PasteTarget,
+	text: &str,
+	opts: &PasteOptions,
+) -> Outcome {
 	if opts.skip_existing {
 		usage("commit payloads do not support --skip-existing");
 	}
@@ -956,45 +836,11 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 	let payload =
 		commits::parse_commit_payload(text).map_err(|e| e.to_string())?;
 
-	let preview = match at {
-		// The write scope is the folder `--repo` names: targets outside it
-		// are refused, and a whole-repo replay opens the repo root.
-		PasteAt::Local(repo) => CommitReplayPreview::capture_in(
-			repo,
-			repo,
-			&payload,
-			&RunOptions::default(),
-		)
-		.map_err(format_transfer_error)?,
-		PasteAt::Remote {
-			client,
-			workspace,
-			dest,
-		} => client
-			.replay_plan(workspace, dest, text, payload.clone(), None)
-			.map_err(format_remote_error)?,
-	};
-	// Re-checks, or replays, where the preview was made.
-	let replay = |check_only: bool| match at {
-		PasteAt::Local(_) if check_only => preview
-			.revalidate()
-			.map(|()| None)
-			.map_err(format_transfer_error),
-		PasteAt::Local(_) => {
-			preview.apply().map(Some).map_err(format_transfer_error)
-		}
-		PasteAt::Remote {
-			client,
-			workspace,
-			dest,
-		} => client
-			.replay_apply(workspace, dest, text, &preview, check_only, None)
-			.map_err(if check_only {
-				format_remote_error
-			} else {
-				format_remote_apply_error
-			}),
-	};
+	// The write scope is the folder pasted into: targets outside it are
+	// refused, and a whole-repo replay opens the repo root.
+	let preview = target
+		.plan_commits(text, payload.clone(), &RunOptions::default())
+		.map_err(format_paste_error)?;
 
 	if !opts.apply {
 		let plan = preview.plan();
@@ -1050,7 +896,7 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 			eprintln!("{total} commit(s) would be created.");
 		}
 		if !opts.overwrite {
-			let existing = distinct_existing_paths(plan);
+			let existing = plan.existing_writes().len();
 			if existing > 0 {
 				eprintln!(
 					"{existing} destination file(s) already exist; --apply will need --overwrite."
@@ -1060,15 +906,19 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 		return Ok(());
 	}
 
-	let existing = distinct_existing_paths(preview.plan());
+	let existing = preview.plan().existing_writes().len();
 	if existing > 0 && !opts.overwrite {
-		replay(true)?;
+		target
+			.check_commits(text, &preview)
+			.map_err(format_paste_error)?;
 		usage(format!(
 			"{existing} destination file(s) already exist; commit payloads need --overwrite"
 		));
 	}
 
-	let result = replay(false)?.ok_or("the replay returned no result")?;
+	let result = target
+		.apply_commits(text, &preview)
+		.map_err(format_paste_error)?;
 	stdout_line(&format!("Created {} commit(s).", result.created.len()))?;
 	for sha in &result.created {
 		stdout_line(&format!("  {sha}"))?;
@@ -1088,20 +938,6 @@ fn paste_commits(at: PasteAt<'_>, text: &str, opts: &PasteOptions) -> Outcome {
 	}
 }
 
-fn is_existing_write(f: &commits::FilePlan) -> bool {
-	f.layout_conflict.is_none() && f.action == ReplayAction::Write && f.existed
-}
-
-fn distinct_existing_paths(plan: &commits::CommitReplayPlan) -> usize {
-	plan.commits
-		.iter()
-		.flat_map(|c| &c.files)
-		.filter(|f| is_existing_write(f))
-		.map(|f| &f.path)
-		.collect::<std::collections::BTreeSet<_>>()
-		.len()
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1112,5 +948,108 @@ mod tests {
 		assert_eq!(grouped(999), "999");
 		assert_eq!(grouped(1000), "1,000");
 		assert_eq!(grouped(1234567), "1,234,567");
+	}
+
+	/// The words `snip paste` refuses or fails with, captured from the
+	/// formatters before the paste seam. A changed literal is a changed CLI.
+	#[test]
+	fn paste_error_texts_are_unchanged() {
+		use snip_core::gitsrc::GitError;
+		use snip_remote::{ErrorCode, RemoteError};
+		fn missing(path: &Path, e: io::Error) -> String {
+			format_paste_error(PasteError::Destination {
+				path: path.to_path_buf(),
+				source: e,
+			})
+		}
+		fn local(e: TransferError) -> String {
+			format_paste_error(PasteError::Local(e))
+		}
+		fn remote(e: RemoteError) -> String {
+			format_paste_error(PasteError::Remote(e))
+		}
+		// What `apply_failure` does to an Apply's error.
+		fn apply(e: RemoteError) -> String {
+			format_paste_error(if e.outcome_unknown() {
+				PasteError::OutcomeUnknown(e)
+			} else {
+				PasteError::Remote(e)
+			})
+		}
+		let refused = |code, message: &str| RemoteError::Refused {
+			code,
+			message: message.into(),
+		};
+		const COLLISION: &str =
+			"target collision: multiple operations target 'a.txt': two entries";
+		const STALE: &str = "stale destination in '/w': target file 'a' was created externally after preview";
+		const BUSY: &str =
+			"paste refused: another paste is writing to this repository";
+
+		assert_eq!(
+			missing(
+				Path::new("/nope"),
+				io::Error::new(io::ErrorKind::NotFound, "gone")
+			),
+			"--repo /nope does not exist or cannot be resolved: gone"
+		);
+		assert_eq!(
+			local(TransferError::TargetCollision {
+				path: "a.txt".into(),
+				msg: "two entries".into()
+			}),
+			format!("Snipcode refused to paste: {COLLISION}")
+		);
+		assert_eq!(
+			local(TransferError::StaleDestination { root: "/r".into(), reason: "target file 'a' was modified externally after preview".into() }),
+			"Snipcode refused to paste: stale destination in '/r': target file 'a' was modified externally after preview; re-run to inspect updated destinations"
+		);
+		assert_eq!(
+			local(TransferError::Git(GitError::WorktreeBusy { args: "paste".into() })),
+			format!("Snipcode refused to paste: {BUSY}; try again when the other paste finishes")
+		);
+		for e in [
+			TransferError::SpecialFile("p".into()),
+			TransferError::DestinationNotRegular("p".into()),
+		] {
+			assert_eq!(local(e), "'p' exists and is not a regular file; paste refuses to overwrite it");
+		}
+		assert_eq!(
+			local(TransferError::UnsafePath("../x".into())),
+			"unsafe path: '../x' escapes root boundaries or contains invalid characters"
+		);
+		assert_eq!(
+			remote(refused(ErrorCode::Collision, COLLISION)),
+			format!("Snipcode refused to paste: {COLLISION}")
+		);
+		let stale_text = format!("Snipcode refused to paste: {STALE}; re-run to inspect updated destinations");
+		assert_eq!(remote(refused(ErrorCode::Stale, STALE)), stale_text);
+		assert_eq!(
+			remote(refused(ErrorCode::Busy, BUSY)),
+			format!("Snipcode refused to paste: {BUSY}; try again when the other paste finishes")
+		);
+		assert_eq!(
+			remote(refused(ErrorCode::Busy, "too many callers")),
+			"too many callers"
+		);
+		assert_eq!(
+			remote(RemoteError::Connect("ssh: no route".into())),
+			"ssh: no route"
+		);
+		assert_eq!(
+			apply(RemoteError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"))),
+			"The connection was lost; whether the paste finished is unknown (pipe closed). Check the destination (snip remote changes / ls) before pasting again."
+		);
+		assert_eq!(
+			apply(RemoteError::TimedOut),
+			"The connection was lost; whether the paste finished is unknown (the worker did not answer in time). Check the destination (snip remote changes / ls) before pasting again."
+		);
+		// A refused Apply is a refusal, not a lost answer.
+		assert_eq!(apply(refused(ErrorCode::Stale, STALE)), stale_text);
+		// A replay answered without its result keeps its bare words.
+		assert_eq!(
+			format_paste_error(PasteError::NoReplayResult),
+			"the replay returned no result"
+		);
 	}
 }

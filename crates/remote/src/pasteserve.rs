@@ -1,28 +1,25 @@
 //! Paste on the worker: the master sends the payload and the user's
 //! choices, and the worker plans and writes with the engine a local paste
-//! runs ([`plan_import_with`], [`CommitReplayPreview`]) on its own disk.
+//! runs ([`plan_import_parsed_with`], [`CommitReplayPreview`]) on its own disk.
 //!
-//! Stateless: an Apply plans again and refuses as stale whatever changed
+//! An Apply plans again and refuses as stale whatever changed
 //! since the preview the master showed. Destinations stay inside the
 //! workspace (the remote access scope); every other rule, the Git-directory
 //! write guard included, is the core engine's and the same as locally.
 
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use snip_core::commits;
 use snip_core::gitrun::{CancelToken, GitPool, RunOptions};
 use snip_core::gitsrc::Git;
 use snip_core::gitview::ReadProfile;
-use snip_core::restore::{
-	suggest_restore_base, FsProbe, RestorePlan, RestoreSelection,
-};
+use snip_core::restore::{RestorePlan, RestoreSelection};
 use snip_core::transfer::{
-	plan_import_with, CanonicalRootId, CommitReplayPreview,
-	DestinationFreshnessSnapshot, ImportMapping, TransferError,
-	TransferImportPlan,
+	plan_import_parsed_with, CanonicalRootId, CommitReplayPreview,
+	DestinationFreshnessSnapshot, TransferError, TransferImportPlan,
 };
 
+use crate::prepared::{self, CacheError, CachedImport, PreparedCache};
 use crate::proto::{
 	valid_rel_path, ErrorCode, ImportExpect, ImportPlanned, PasteMapping,
 	ReplayExpect, Response,
@@ -126,17 +123,15 @@ fn check_snapshot(
 	}
 }
 
-fn digest(plan: &RestorePlan) -> String {
-	let json = serde_json::to_vec(plan).unwrap_or_default();
-	Sha256::digest(&json)
-		.iter()
-		.map(|b| format!("{b:02x}"))
-		.collect()
+fn digest(plan: &RestorePlan) -> Result<String, Refusal> {
+	crate::proto::restore_plan_digest(plan)
+		.map_err(|message| refused(ErrorCode::BadRequest, message))
 }
 
 struct Planned {
 	plan: TransferImportPlan,
 	suggestion: Option<snip_core::restore::RestoreBaseSuggestion>,
+	create_entries: Vec<usize>,
 }
 
 /// Plans exactly as `snip paste` and the app do, with the destination and
@@ -148,45 +143,47 @@ fn plan(
 	mapping: &PasteMapping,
 	cancel: &CancelToken,
 ) -> Result<Planned, Refusal> {
+	if cancel.is_cancelled() {
+		return Err(refused(ErrorCode::Cancelled, "cancelled"));
+	}
 	let primary = destination(root, dest)?;
 	let primary_id =
 		CanonicalRootId::new(&primary).map_err(|e| Box::new(io_error(e)))?;
 	let header = mapping.header_format.as_str();
 	let entries = snip_core::format::parse_clipboard(text, header);
+	if cancel.is_cancelled() {
+		return Err(refused(ErrorCode::Cancelled, "cancelled"));
+	}
 	if entries.is_empty() {
 		return Err(refused(
 			ErrorCode::BadRequest,
 			"No Snipcode file headers found in clipboard.",
 		));
 	}
-	let paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
-	let suggestion = suggest_restore_base(
-		&primary.to_string_lossy(),
-		&paths,
-		&FsProbe,
-		snip_core::format::extract_source_root(text).as_deref(),
-	);
-	let mut import = match (&suggestion, mapping.adjust_paths) {
-		(Some(s), true) => ImportMapping::from_restore_base(s, primary_id),
-		_ => ImportMapping::with_primary(primary_id),
-	};
-	let mut roots = vec![primary];
-	for (prefix, rel) in &mapping.prefixes {
-		if prefix.is_empty() || prefix.contains(['/', '\\']) {
-			return Err(refused(ErrorCode::BadRequest, "invalid prefix"));
-		}
-		let folder = destination(root, rel)?;
-		let id =
-			CanonicalRootId::new(&folder).map_err(|e| Box::new(io_error(e)))?;
-		if !roots.contains(&folder) {
-			roots.push(folder);
-		}
-		import.map_prefix(prefix.clone(), id);
-	}
-	let plan =
-		plan_import_with(text, header, &roots, &import, &options(cancel))
+	let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+	let suggestion = crate::pastetarget::suggest(&primary, &paths, text);
+	let (import, roots) = crate::pastetarget::import_mapping(
+		primary,
+		primary_id,
+		suggestion.as_ref().filter(|_| mapping.adjust_paths),
+		mapping.prefixes.iter().map(|(prefix, rel)| {
+			if prefix.is_empty() || prefix.contains(['/', '\\']) {
+				return Err(refused(ErrorCode::BadRequest, "invalid prefix"));
+			}
+			Ok::<_, Refusal>((prefix.clone(), destination(root, rel)?))
+		}),
+		|folder| {
+			CanonicalRootId::new(folder).map_err(|e| Box::new(io_error(e)))
+		},
+	)?;
+	let (plan, create_entries) =
+		plan_import_parsed_with(entries, &roots, &import, &options(cancel))
 			.map_err(|e| transfer_refusal(e, cancel))?;
-	Ok(Planned { plan, suggestion })
+	Ok(Planned {
+		plan,
+		suggestion,
+		create_entries,
+	})
 }
 
 /// Answers [`crate::proto::Request::ImportPlan`].
@@ -197,16 +194,117 @@ pub(crate) fn import_plan(
 	mapping: &PasteMapping,
 	cancel: &CancelToken,
 ) -> Response {
-	match plan(root, dest, text, mapping, cancel) {
-		Ok(Planned { plan, suggestion }) => {
-			Response::ImportPlanned(ImportPlanned {
-				digest: digest(plan.restore_plan()),
-				plan,
-				suggestion,
-			})
+	let run = || -> Result<Response, Refusal> {
+		let Planned {
+			plan, suggestion, ..
+		} = plan(root, dest, text, mapping, cancel)?;
+		Ok(Response::ImportPlanned(ImportPlanned {
+			digest: digest(plan.restore_plan())?,
+			plan,
+			suggestion,
+		}))
+	};
+	run().unwrap_or_else(|reply| *reply)
+}
+
+pub(crate) fn prepare_import(
+	root: &SharedRoot,
+	dest: &str,
+	text: String,
+	mapping: PasteMapping,
+	retain: bool,
+	cache: &PreparedCache,
+	cancel: &CancelToken,
+) -> Response {
+	let run = || -> Result<Response, Refusal> {
+		if text.len() > snip_core::transfer::CLIPBOARD_PAYLOAD_MAX {
+			return Err(refused(
+				ErrorCode::TooLarge,
+				"the pasted text is over the clipboard limit",
+			));
 		}
-		Err(resp) => *resp,
+		let Planned {
+			plan,
+			suggestion,
+			create_entries,
+		} = plan(root, dest, &text, &mapping, cancel)?;
+		let metadata = crate::proto::ImportMetadata::of_entry_indices(
+			&plan,
+			&create_entries,
+		)
+		.map_err(|message| refused(ErrorCode::BadRequest, message))?;
+		let digest = digest(plan.restore_plan())?;
+		let destination = plan.roots().first().cloned().ok_or_else(|| {
+			refused(ErrorCode::BadRequest, "no paste destination")
+		})?;
+		drop(plan);
+		if cancel.is_cancelled() {
+			return Err(refused(ErrorCode::Cancelled, "cancelled"));
+		}
+		let token = retain
+			.then(|| {
+				cache.insert(CachedImport {
+					text,
+					mapping,
+					workspace: root.path.clone(),
+					destination,
+					digest: digest.clone(),
+				})
+			})
+			.flatten();
+		Ok(Response::ImportPrepared(crate::proto::ImportPrepared {
+			metadata,
+			digest,
+			suggestion,
+			token,
+		}))
+	};
+	run().unwrap_or_else(|reply| *reply)
+}
+
+pub(crate) fn apply_prepared(
+	root: &SharedRoot,
+	dest: &str,
+	token: &str,
+	selection: &RestoreSelection,
+	expect: &ImportExpect,
+	cache: &PreparedCache,
+	cancel: &CancelToken,
+) -> Response {
+	let at = match destination(root, dest) {
+		Ok(at) => at,
+		Err(reply) => return *reply,
+	};
+	let lease = match cache.take(token, &root.path, &at, &expect.digest) {
+		Ok(lease) => lease,
+		Err(why) => return *refused(
+			if why == CacheError::Scope { ErrorCode::Forbidden } else { ErrorCode::Stale },
+			match why {
+				CacheError::Missing => prepared::TOKEN_GONE,
+				CacheError::Scope => "prepared paste belongs to another workspace or destination; preview again",
+				CacheError::Digest => "prepared paste does not match the preview; preview again",
+			}),
+	};
+	let payload = lease.payload();
+	// The raw input is retained, never an executable plan. Keep exactly the
+	// legacy re-plan/digest/freshness/selection and locked-write checks.
+	let response = import_apply(
+		root,
+		dest,
+		&payload.text,
+		&payload.mapping,
+		selection,
+		expect,
+		cancel,
+	);
+	// A refusal from before the first write keeps the payload for a retry.
+	if matches!(
+		&response,
+		Response::Error { code, .. } if prepared::refused_before_write(*code)
+	) {
+		lease.restore();
 	}
+	response
 }
 
 /// `SNIP_E2E_PASTE_HOLD` names an absolute path: when set and the
@@ -248,7 +346,7 @@ pub(crate) fn import_apply(
 			.revalidate()
 			.map_err(|e| transfer_refusal(e, cancel))?;
 		let Planned { plan, .. } = plan(root, dest, text, mapping, cancel)?;
-		if digest(plan.restore_plan()) != expect.digest
+		if digest(plan.restore_plan())? != expect.digest
 			|| plan.destination_freshness() != &expect.freshness
 		{
 			let at = plan.roots().first().cloned().unwrap_or_default();
@@ -300,6 +398,47 @@ fn replay_root(
 fn payload(text: &str) -> Result<commits::CommitsPayload, Refusal> {
 	commits::parse_commit_payload(text)
 		.map_err(|e| refused(ErrorCode::BadRequest, e.to_string()))
+}
+
+/// A selected preview's original destination. The shared reader preserves
+/// file kind (especially symlinks) instead of presenting their targets as
+/// the regular file that replay would replace.
+pub(crate) fn replay_read(
+	root: &SharedRoot,
+	path: &Path,
+	limit: usize,
+	cancel: &CancelToken,
+) -> Response {
+	let run = || -> Result<Response, Refusal> {
+		let rel = path
+			.strip_prefix(&root.path)
+			.ok()
+			.and_then(|p| p.to_str())
+			.map(|p| {
+				if cfg!(windows) {
+					p.replace('\\', "/")
+				} else {
+					p.to_string()
+				}
+			});
+		let Some(rel) = rel.filter(|p| valid_rel_path(p, false)) else {
+			return Err(refused(ErrorCode::BadRequest, "invalid preview path"));
+		};
+		// Validate the resolved boundary, but retain the lexical path for
+		// the reader's symlink_metadata check.
+		snip_core::browser::inside(&root.path, &rel)
+			.map_err(|e| Box::new(io_error(e)))?;
+		let read = snip_core::transfer::read_replay_preview_with(
+			path,
+			limit.min(snip_core::browser::PREVIEW_LIMIT),
+			&options(cancel),
+		)
+		.map_err(|e| transfer_refusal(e, cancel))?;
+		snip_core::browser::inside(&root.path, &rel)
+			.map_err(|e| Box::new(io_error(e)))?;
+		Ok(Response::ReplayRead(read))
+	};
+	run().unwrap_or_else(|resp| *resp)
 }
 
 /// Answers [`crate::proto::Request::ReplayPlan`].
@@ -371,4 +510,240 @@ pub(crate) fn replay_apply(
 		Ok(Response::Replayed(result))
 	};
 	run().unwrap_or_else(|resp| *resp)
+}
+
+#[cfg(test)]
+mod prepared_import_tests {
+	use super::*;
+	use std::fs;
+	use std::time::Duration;
+
+	fn preview(
+		root: &SharedRoot,
+		text: &str,
+		mapping: &PasteMapping,
+		cache: &PreparedCache,
+	) -> crate::proto::ImportPrepared {
+		match prepare_import(
+			root,
+			"",
+			text.into(),
+			mapping.clone(),
+			true,
+			cache,
+			&CancelToken::new(),
+		) {
+			Response::ImportPrepared(reply) => reply,
+			other => panic!("failed to prepare: {other:?}"),
+		}
+	}
+	fn apply(
+		root: &SharedRoot,
+		dest: &str,
+		text: &str,
+		mapping: &PasteMapping,
+		reply: &crate::proto::ImportPrepared,
+		cache: &PreparedCache,
+		selection: RestoreSelection,
+	) -> Response {
+		apply_prepared(
+			root,
+			dest,
+			reply.token.as_ref().unwrap(),
+			&selection,
+			&reply
+				.hydrate(text, &mapping.header_format)
+				.unwrap()
+				.expect(),
+			cache,
+			&CancelToken::new(),
+		)
+	}
+	fn fixture() -> (tempfile::TempDir, SharedRoot, PreparedCache) {
+		let dir = tempfile::tempdir().unwrap();
+		let root = SharedRoot::new(dir.path()).unwrap();
+		(dir, root, PreparedCache::new())
+	}
+
+	#[test]
+	fn prepared_apply_replans_and_consumes_the_token_once() {
+		let (_dir, root, cache) = fixture();
+		let text = "// FILE: new.txt\ncreated\n";
+		let mapping = PasteMapping::default();
+		let reply = preview(&root, text, &mapping, &cache);
+		assert!(
+			matches!(apply(&root,"",text,&mapping,&reply,&cache,RestoreSelection::default()),Response::Imported(r) if r.created_count==1)
+		);
+		let bytes = fs::read(root.path.join("new.txt")).unwrap();
+		assert!(matches!(
+			apply(
+				&root,
+				"",
+				text,
+				&mapping,
+				&reply,
+				&cache,
+				RestoreSelection::default()
+			),
+			Response::Error {
+				code: ErrorCode::Stale,
+				..
+			}
+		));
+		assert_eq!(fs::read(root.path.join("new.txt")).unwrap(), bytes);
+		assert_eq!(cache.usage_for_tests(), (0, 0));
+	}
+
+	#[test]
+	fn prepared_wrong_scope_expiry_selection_and_staleness_never_write() {
+		let (_dir, root, cache) = fixture();
+		let text = "// FILE: file.txt\nreplacement\n";
+		let mapping = PasteMapping::default();
+		fs::create_dir(root.path.join("other")).unwrap();
+		let reply = preview(&root, text, &mapping, &cache);
+		assert!(matches!(
+			apply(
+				&root,
+				"other",
+				text,
+				&mapping,
+				&reply,
+				&cache,
+				RestoreSelection::default()
+			),
+			Response::Error {
+				code: ErrorCode::Forbidden,
+				..
+			}
+		));
+		assert!(!root.path.join("other/file.txt").exists());
+		assert!(!root.path.join("file.txt").exists());
+		let reply = preview(&root, text, &mapping, &cache);
+		cache.expire_for_tests();
+		assert!(matches!(
+			apply(
+				&root,
+				"",
+				text,
+				&mapping,
+				&reply,
+				&cache,
+				RestoreSelection::default()
+			),
+			Response::Error {
+				code: ErrorCode::Stale,
+				..
+			}
+		));
+		let reply = preview(&root, text, &mapping, &cache);
+		assert!(matches!(
+			apply(
+				&root,
+				"",
+				text,
+				&mapping,
+				&reply,
+				&cache,
+				RestoreSelection {
+					unchecked_creates: [99].into_iter().collect(),
+					..Default::default()
+				}
+			),
+			Response::Error {
+				code: ErrorCode::BadRequest,
+				..
+			}
+		));
+		assert!(!root.path.join("file.txt").exists());
+		fs::write(root.path.join("file.txt"), "before").unwrap();
+		let reply = preview(&root, text, &mapping, &cache);
+		fs::write(root.path.join("file.txt"), "external").unwrap();
+		assert!(matches!(
+			apply(
+				&root,
+				"",
+				text,
+				&mapping,
+				&reply,
+				&cache,
+				RestoreSelection {
+					overwrite_existing: true,
+					..Default::default()
+				}
+			),
+			Response::Error {
+				code: ErrorCode::Stale,
+				..
+			}
+		));
+		assert_eq!(fs::read(root.path.join("file.txt")).unwrap(), b"external");
+		assert_eq!(cache.usage_for_tests(), (0, 0));
+	}
+
+	#[test]
+	fn prepared_capacity_refusal_keeps_metadata_and_legacy_apply_available() {
+		let (_dir, root, cache) = fixture();
+		let text = "// FILE: file.txt\nbody\n";
+		let mapping = PasteMapping::default();
+		cache.set_limits_for_tests(0, 8, Duration::from_secs(300));
+		let reply = preview(&root, text, &mapping, &cache);
+		assert!(reply.token.is_none());
+		let full = reply.hydrate(text, "").unwrap();
+		assert!(
+			matches!(import_apply(&root,"",text,&mapping,&RestoreSelection::default(),&full.expect(),&CancelToken::new()),Response::Imported(r) if r.created_count==1)
+		);
+		assert_eq!(cache.usage_for_tests(), (0, 0));
+	}
+
+	#[test]
+	fn prepared_payload_keeps_prefix_mapping_and_adjusted_restore_base() {
+		let (_dir, root, cache) = fixture();
+		fs::create_dir(root.path.join("mapped")).unwrap();
+		let mapping = PasteMapping {
+			prefixes: vec![("incoming".into(), "mapped".into())],
+			..Default::default()
+		};
+		let text = "// FILE: incoming/a.txt\nprefix body\n";
+		let reply = preview(&root, text, &mapping, &cache);
+		assert!(
+			matches!(apply(&root,"",text,&mapping,&reply,&cache,RestoreSelection::default()),Response::Imported(r) if r.created_count==1)
+		);
+		assert!(root.path.join("mapped/a.txt").is_file());
+		assert!(!root.path.join("incoming/a.txt").exists());
+		let (_dir, root, cache) = fixture();
+		fs::create_dir_all(root.path.join("project/src")).unwrap();
+		fs::create_dir_all(root.path.join("project/lib")).unwrap();
+		let text = "// FILE: src/a.txt\nA\n// FILE: lib/b.txt\nB\n";
+		let mapping = PasteMapping {
+			adjust_paths: true,
+			..Default::default()
+		};
+		let reply = preview(&root, text, &mapping, &cache);
+		assert!(reply.suggestion.is_some());
+		assert!(
+			matches!(apply(&root,"",text,&mapping,&reply,&cache,RestoreSelection::default()),Response::Imported(r) if r.created_count==2)
+		);
+		assert!(root.path.join("project/src/a.txt").is_file());
+		assert!(root.path.join("project/lib/b.txt").is_file());
+		assert!(!root.path.join("src/a.txt").exists());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn prepared_scope_uses_the_canonical_workspace_not_its_symlink_spelling() {
+		let dir = tempfile::tempdir().unwrap();
+		let actual = dir.path().join("actual");
+		fs::create_dir(&actual).unwrap();
+		let alias = dir.path().join("alias");
+		std::os::unix::fs::symlink(&actual, &alias).unwrap();
+		let root = SharedRoot::new(&alias).unwrap();
+		let cache = PreparedCache::new();
+		let text = "// FILE: a.txt\nA\n";
+		let mapping = PasteMapping::default();
+		let reply = preview(&root, text, &mapping, &cache);
+		assert!(
+			matches!(apply(&SharedRoot::new(&actual).unwrap(),"",text,&mapping,&reply,&cache,RestoreSelection::default()),Response::Imported(r) if r.created_count==1)
+		);
+		assert!(actual.join("a.txt").is_file());
+	}
 }

@@ -166,6 +166,7 @@ impl WorkbenchModel {
 								true,
 								10,
 							)
+							.debug_selector(|| "btn-discovery-continue".into())
 							.on_click(cx.listener(|this, _, _, cx| {
 								this.continue_discovery(cx);
 							}))

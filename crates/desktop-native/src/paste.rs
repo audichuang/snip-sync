@@ -24,8 +24,11 @@ use snip_core::restore::{
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
 };
 use snip_core::transfer::{
-	detect_clipboard_prefixes, plan_import_with, CanonicalRootId,
-	CommitReplayPreview, ImportMapping, TransferError, TransferImportPlan,
+	detect_clipboard_prefixes, CanonicalRootId, CommitReplayPreview,
+	TransferError,
+};
+use snip_remote::{
+	FilePastePlan, PasteError, PasteRoute, PasteTarget, RemoteError,
 };
 
 use crate::i18n::{tf, Locale, Msg};
@@ -151,7 +154,12 @@ pub struct PastePending {
 	ui_bytes: usize,
 	apply_allowance: usize,
 	apply_active: usize,
+	/// Captured replay plans still held by selected-row reads, including
+	/// cancelled reads that have not returned from their worker yet.
+	detail_reads: Vec<DetailRead>,
+	next_detail_read: u64,
 	ui_raw: Option<Weak<str>>,
+	ui_commit: Option<Weak<CommitReplayPreview>>,
 	seq: u64,
 	input: Option<(u64, usize, Option<Weak<str>>)>,
 	latest: Option<PasteRequest>,
@@ -188,11 +196,34 @@ impl PastePending {
 		}
 	}
 
+	/// Detail reads not already counted in the UI's bytes. A read of the
+	/// UI's own commit preview costs nothing until the UI lets it go. Reads
+	/// of one shared preview are charged once, so the total cannot grow when
+	/// the UI drops its hold and the reads become the only owners.
+	fn detail_bytes(
+		&self,
+		ui_commit: Option<&Weak<CommitReplayPreview>>,
+	) -> usize {
+		let mut counted: Vec<&Weak<CommitReplayPreview>> = Vec::new();
+		let mut total = 0usize;
+		for read in &self.detail_reads {
+			if ui_holds(ui_commit, &read.preview)
+				|| counted.iter().any(|seen| Weak::ptr_eq(seen, &read.preview))
+			{
+				continue;
+			}
+			counted.push(&read.preview);
+			total = total.saturating_add(read.bytes);
+		}
+		total
+	}
+
 	fn total_with_ui(
 		&self,
 		ui_bytes: usize,
 		allowance: usize,
 		raw: Option<&Weak<str>>,
+		commit: Option<&Weak<CommitReplayPreview>>,
 	) -> usize {
 		let held = self
 			.input
@@ -212,6 +243,7 @@ impl PastePending {
 			.saturating_add(held)
 			.saturating_add(self.latest.as_ref().map_or(0, PasteRequest::bytes))
 			.saturating_add(allowance.max(self.apply_active))
+			.saturating_add(self.detail_bytes(commit))
 	}
 
 	pub fn admit_ui(
@@ -225,13 +257,17 @@ impl PastePending {
 			.filter(|p| p.executable())
 			.map_or(0, PastePreviewPlan::apply_clone_bytes);
 		let raw = plan.map(|p| Arc::downgrade(&p.raw_payload));
+		let commit = plan
+			.and_then(|p| p.commit_preview.as_ref())
+			.map(Arc::downgrade);
 		check_budget(
-			self.total_with_ui(bytes, allowance, raw.as_ref()),
+			self.total_with_ui(bytes, allowance, raw.as_ref(), commit.as_ref()),
 			MAX_RETAINED_PREVIEW_BYTES,
 		)?;
 		self.ui_bytes = bytes;
 		self.apply_allowance = allowance;
 		self.ui_raw = raw;
+		self.ui_commit = commit;
 		Ok(())
 	}
 
@@ -248,6 +284,7 @@ impl PastePending {
 				self.ui_bytes,
 				self.apply_allowance,
 				self.ui_raw.as_ref(),
+				self.ui_commit.as_ref(),
 			),
 			MAX_RETAINED_PREVIEW_BYTES,
 		)
@@ -297,6 +334,7 @@ impl PastePending {
 				state.ui_bytes,
 				state.apply_allowance,
 				state.ui_raw.as_ref(),
+				state.ui_commit.as_ref(),
 			),
 			MAX_RETAINED_PREVIEW_BYTES,
 		)
@@ -388,6 +426,7 @@ impl PasteWorker {
 			state.ui_bytes,
 			state.apply_allowance,
 			state.ui_raw.as_ref(),
+			state.ui_commit.as_ref(),
 		) > MAX_RETAINED_PREVIEW_BYTES
 		{
 			outcome = state.ready.take().unwrap();
@@ -468,6 +507,8 @@ pub enum SkipCause {
 	Unreadable,
 	UnsafePath,
 	NonUtf8Target,
+	Restore(snip_core::restore::SkipReason),
+	ProtectedGitMetadata,
 	Other,
 }
 
@@ -524,6 +565,7 @@ pub struct PasteItem {
 	pub content: Arc<str>,
 	pub bytes: usize,
 	pub lines: usize,
+	/// Create/delete operation index, or payload file index for a commit row.
 	pub op_index: usize,
 	/// Commit replay only: the commit (index into the payload) this row
 	/// belongs to. `None` for file restores.
@@ -549,7 +591,16 @@ impl PasteItem {
 			&& matches!(self.op, PlannedOp::Create | PlannedOp::Overwrite)
 	}
 
+	pub fn planned_skip(&self) -> bool {
+		self.commit.is_none() && matches!(self.op, PlannedOp::Skip(_))
+	}
+
 	pub fn action(&self) -> RowAction {
+		if self.planned_skip() {
+			if let PlannedOp::Skip(reason) = self.op {
+				return RowAction::Skip(reason);
+			}
+		}
 		if !self.selected {
 			return RowAction::Excluded {
 				by_commit: self.commit.is_some(),
@@ -664,12 +715,20 @@ impl PasteApplyResult {
 		let counts = [
 			f.created_count,
 			f.overwritten_count,
-			f.skipped_existing_count,
+			f.total_skipped(),
 			f.deleted_count,
 			f.errors.len(),
 		]
 		.map(|n| n.to_string());
 		if f.errors.is_empty() {
+			if f.created_count + f.overwritten_count + f.deleted_count == 0
+				&& f.total_skipped() > 0
+			{
+				return Msg::new(
+					"status_paste_skipped",
+					[f.total_skipped().to_string()],
+				);
+			}
 			return Msg::new("status_paste_done", counts);
 		}
 		let mut args = counts.to_vec();
@@ -678,8 +737,9 @@ impl PasteApplyResult {
 	}
 }
 
-/// A paste into a remote workspace: its worker plans and writes with the
-/// same engine, on its own disk, and re-checks freshness at Apply.
+/// A paste into a remote workspace: its worker plans and writes through
+/// [`PasteTarget::Remote`] with the same engine, on its own disk. Here only
+/// the tree path's spelling and display live.
 #[derive(Clone)]
 pub struct RemotePaste {
 	pub session: crate::remote::RemoteSession,
@@ -708,47 +768,7 @@ impl RemotePaste {
 	pub fn shown(&self, path: &Path) -> String {
 		crate::remote::display_path(Some(&self.session), path)
 	}
-
-	fn client(&self) -> &snip_remote::Client {
-		&self.session.client
-	}
-
-	fn workspace(&self) -> &str {
-		&self.session.workspace.id
-	}
-
-	/// A worker that could not be reached, or refused the destination.
-	fn destination_error(
-		&self,
-		dest: &Path,
-		err: snip_remote::RemoteError,
-	) -> Msg {
-		Msg::new(
-			"paste_err_destination",
-			[self.shown(dest), crate::remote::describe(err)],
-		)
-	}
-
-	/// An Apply's failure, worded as a local Apply words it. A lost answer
-	/// says the write may or may not have happened.
-	fn apply_error(&self, dest: &Path, err: snip_remote::RemoteError) -> Msg {
-		match err {
-			snip_remote::RemoteError::Refused {
-				code: snip_remote::ErrorCode::Stale,
-				message,
-			} => remote_stale_msg(&message),
-			snip_remote::RemoteError::Refused {
-				code: snip_remote::ErrorCode::Busy,
-				message,
-			} if message.contains(REPO_BUSY_TEXT) => repo_busy(),
-			other if other.outcome_unknown() => outcome_unknown(),
-			other => self.destination_error(dest, other),
-		}
-	}
 }
-
-/// How `GitError::WorktreeBusy` prints, so a worker's refusal is known.
-const REPO_BUSY_TEXT: &str = "another paste is writing to this repository";
 
 /// Another tab, process or worker holds the repository's write lock.
 fn repo_busy() -> Msg {
@@ -761,25 +781,111 @@ fn outcome_unknown() -> Msg {
 	Msg::new("paste_outcome_unknown", [])
 }
 
-/// A worker's stale refusal (the local error's text) as [`stale_msg`].
-fn remote_stale_msg(message: &str) -> Msg {
-	// "stale destination in '<root>': <reason>", as TransferError prints it.
-	let reason = message
-		.strip_prefix("stale destination in '")
-		.and_then(|rest| rest.split_once("': "))
-		.map_or(message, |(_, reason)| reason);
-	stale_msg(TransferError::StaleDestination {
-		root: PathBuf::new(),
-		reason: reason.to_string(),
+/// The paste target for `dest` (a tree path): this machine, or the remote
+/// workspace's worker.
+fn paste_target(
+	remote: Option<&RemotePaste>,
+	dest: &Path,
+) -> Result<PasteTarget, Msg> {
+	Ok(match remote {
+		None => PasteTarget::Local {
+			dest: dest.to_path_buf(),
+		},
+		Some(r) => PasteTarget::Remote {
+			client: r.session.client.clone(),
+			workspace: r.session.workspace.id.clone(),
+			dest: r.rel(dest)?,
+		},
 	})
+}
+
+/// A destination the paste could not resolve or reach, named as the user
+/// knows it.
+fn destination_msg(
+	remote: Option<&RemotePaste>,
+	path: &Path,
+	err: PasteError,
+) -> Msg {
+	let shown =
+		remote.map_or_else(|| path.display().to_string(), |r| r.shown(path));
+	let why = match err {
+		PasteError::Remote(e) | PasteError::OutcomeUnknown(e) => {
+			crate::remote::describe(e)
+		}
+		PasteError::Local(e) => e.to_string(),
+		PasteError::Destination { source, .. } => source.to_string(),
+		// Worded as the app always did: a protocol error of the worker.
+		PasteError::NoReplayResult => crate::remote::describe(
+			RemoteError::Protocol(PasteError::NoReplayResult.to_string()),
+		),
+	};
+	Msg::new("paste_err_destination", [shown, why])
+}
+
+/// A stale destination's reason as the message the app shows.
+fn stale_reason_msg(reason: String) -> Msg {
+	if reason.contains("created") {
+		Msg::new("stale_created", [reason])
+	} else if reason.contains("deleted") {
+		Msg::new("stale_deleted", [reason])
+	} else {
+		Msg::new("stale_modified", [reason])
+	}
+}
+
+/// A file Apply's failure, worded as before for each target.
+fn file_apply_msg(
+	remote: Option<&RemotePaste>,
+	dest: &Path,
+	err: PasteError,
+) -> Msg {
+	if err.is_repo_busy() {
+		return repo_busy();
+	}
+	if let Some(reason) = err.stale_reason() {
+		return stale_reason_msg(reason);
+	}
+	match err {
+		PasteError::OutcomeUnknown(_) => outcome_unknown(),
+		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
+		other => destination_msg(remote, dest, other),
+	}
+}
+
+/// A commit check's (`applying` false) or replay's failure, worded as before.
+fn commit_msg(
+	remote: Option<&RemotePaste>,
+	dest: &Path,
+	err: PasteError,
+	applying: bool,
+) -> Msg {
+	if let Some(reason) = err.stale_reason() {
+		return stale_reason_msg(reason);
+	}
+	match err {
+		PasteError::Local(TransferError::Git(GitError::WorktreeBusy {
+			..
+		})) => repo_busy(),
+		PasteError::Local(TransferError::Git(e)) if applying => {
+			Msg::new("error_open_repo", [e.to_string()])
+		}
+		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
+		// Kept as before: any other worker refusal of a replay, Busy
+		// included, reads as a repository error (see Risks).
+		PasteError::Remote(RemoteError::Refused { message, .. }) => {
+			Msg::new("error_open_repo", [message])
+		}
+		PasteError::OutcomeUnknown(_) => outcome_unknown(),
+		other => destination_msg(remote, dest, other),
+	}
 }
 
 #[derive(Debug, Clone)]
 pub struct PastePreviewPlan {
 	/// In a remote workspace, the tree path the user pasted into.
 	pub destination: PathBuf,
-	/// Shared import plan containing restore plan and destination freshness.
-	pub import_plan: Option<Arc<TransferImportPlan>>,
+	/// Shared file plan: the engine's plan, plus the worker's digest in a remote workspace.
+	pub import_plan: Option<Arc<FilePastePlan>>,
 	/// Whole-commit replay. File checkboxes do not rewrite a subset.
 	pub commit_preview: Option<Arc<CommitReplayPreview>>,
 	pub whole_commit: bool,
@@ -798,8 +904,6 @@ pub struct PastePreviewPlan {
 	/// Set in a remote workspace. `import_plan` and `commit_preview` then
 	/// hold the worker's plan, with the worker's paths.
 	pub remote: Option<RemotePaste>,
-	/// The worker's digest of `import_plan`, sent back at Apply.
-	remote_digest: String,
 }
 
 fn empty_plan() -> Arc<RestorePlan> {
@@ -900,6 +1004,7 @@ pub(crate) fn layout_conflict_cause_key(
 	}
 }
 
+#[cfg(test)]
 fn header_label(op: PlannedOp) -> &'static str {
 	match op {
 		PlannedOp::Create => "CREATE",
@@ -925,22 +1030,6 @@ fn destination_error(dest: &Path, err: &dyn std::fmt::Display) -> Msg {
 	)
 }
 
-fn stale_msg(err: TransferError) -> Msg {
-	match err {
-		TransferError::Git(GitError::WorktreeBusy { .. }) => repo_busy(),
-		TransferError::StaleDestination { reason, .. } => {
-			if reason.contains("created") {
-				Msg::new("stale_created", [reason])
-			} else if reason.contains("deleted") {
-				Msg::new("stale_deleted", [reason])
-			} else {
-				Msg::new("stale_modified", [reason])
-			}
-		}
-		other => Msg::new("stale_modified", [other.to_string()]),
-	}
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PasteCounts {
 	pub creates: usize,
@@ -950,21 +1039,146 @@ pub struct PasteCounts {
 	pub skips: usize,
 }
 
+/// A selected replay row shares its captured plan; it never clones payload
+/// text or computes replay state in the desktop front end.
+pub(crate) struct CommitDiffRequest {
+	pub target: PasteTarget,
+	pub preview: Arc<CommitReplayPreview>,
+	pub commit: usize,
+	pub file: usize,
+	pub side: snip_core::transfer::ReplayFileSide,
+	// Declared last: the retained preview drops before its charge.
+	_charge: DetailReadCharge,
+}
+
+/// A live detail read of a captured replay preview. Its bytes are charged once
+/// per distinct preview, unless the UI holds that Arc, which the UI's bytes
+/// already count.
+struct DetailRead {
+	id: u64,
+	preview: Weak<CommitReplayPreview>,
+	bytes: usize,
+}
+
+/// True when the UI's live commit preview is this exact Arc.
+fn ui_holds(
+	ui: Option<&Weak<CommitReplayPreview>>,
+	preview: &Weak<CommitReplayPreview>,
+) -> bool {
+	match (ui.and_then(Weak::upgrade), preview.upgrade()) {
+		(Some(ui), Some(held)) => Arc::ptr_eq(&ui, &held),
+		_ => false,
+	}
+}
+
+struct DetailReadCharge {
+	pool: Arc<Mutex<PastePending>>,
+	id: u64,
+}
+
+impl DetailReadCharge {
+	fn admit(
+		pool: &Arc<Mutex<PastePending>>,
+		preview: &Arc<CommitReplayPreview>,
+	) -> Result<Self, Msg> {
+		let bytes = size_of::<CommitReplayPreview>()
+			.saturating_add(ARC_ALLOWANCE)
+			.saturating_add(preview.retained_heap_bytes());
+		let weak = Arc::downgrade(preview);
+		let mut state = lock_pending(pool);
+		// A read of a preview that is already charged (by the UI or by an
+		// earlier read) adds nothing to the total.
+		let charged = ui_holds(state.ui_commit.as_ref(), &weak)
+			|| state
+				.detail_reads
+				.iter()
+				.any(|read| Weak::ptr_eq(&read.preview, &weak));
+		let extra = if charged { 0 } else { bytes };
+		check_budget(
+			state
+				.total_with_ui(
+					state.ui_bytes,
+					state.apply_allowance,
+					state.ui_raw.as_ref(),
+					state.ui_commit.as_ref(),
+				)
+				.saturating_add(extra),
+			MAX_RETAINED_PREVIEW_BYTES,
+		)?;
+		let id = state.next_detail_read;
+		state.next_detail_read = id.wrapping_add(1);
+		state.detail_reads.push(DetailRead {
+			id,
+			preview: weak,
+			bytes,
+		});
+		Ok(Self {
+			pool: pool.clone(),
+			id,
+		})
+	}
+}
+
+impl Drop for DetailReadCharge {
+	fn drop(&mut self) {
+		let mut state = lock_pending(&self.pool);
+		let at = state
+			.detail_reads
+			.iter()
+			.position(|read| read.id == self.id)
+			.expect("detail read charge released once");
+		state.detail_reads.swap_remove(at);
+	}
+}
+
 impl PastePreviewPlan {
+	pub(crate) fn commit_diff_request(
+		&self,
+		idx: usize,
+		pool: &Arc<Mutex<PastePending>>,
+	) -> Result<Option<CommitDiffRequest>, Msg> {
+		let Some(item) = self.items.get(idx) else {
+			return Ok(None);
+		};
+		let Some(commit) = item.commit else {
+			return Ok(None);
+		};
+		let Some(preview) = self.commit_preview.as_ref() else {
+			return Ok(None);
+		};
+		let charge = DetailReadCharge::admit(pool, preview)?;
+		let side = if item.is_delete() && item.rename_note.is_some() {
+			snip_core::transfer::ReplayFileSide::RenamedFrom
+		} else {
+			snip_core::transfer::ReplayFileSide::Target
+		};
+		Ok(Some(CommitDiffRequest {
+			target: paste_target(self.remote.as_ref(), &self.destination)?,
+			preview: preview.clone(),
+			commit,
+			file: item.op_index,
+			side,
+			_charge: charge,
+		}))
+	}
+
 	pub fn detail_preview(&self) -> Option<Preview> {
 		self.detail_at(self.selected_item_idx)
 	}
 
 	pub(crate) fn detail_at(&self, idx: usize) -> Option<Preview> {
-		self.items.get(idx).filter(|i| !i.is_delete()).map(|i| {
-			Preview::new(
-				PreviewSource::PasteItem,
-				Some(i.path.clone()),
-				i.content.to_string(),
-				false,
-				Language::from_path_or_ext(&i.path, false),
-			)
-		})
+		self.items
+			.get(idx)
+			.filter(|i| i.commit.is_some() || !i.is_delete())
+			.map(|i| {
+				Preview::new(
+					PreviewSource::PasteItem,
+					Some(i.path.clone()),
+					i.content.to_string(),
+					false,
+					Language::from_path_or_ext(&i.path, false),
+				)
+			})
 	}
 
 	/// Conservative retained UI bytes. Arc referents are charged in full,
@@ -972,7 +1186,6 @@ impl PastePreviewPlan {
 	pub fn retained_bytes(&self) -> usize {
 		let mut bytes = size_of::<Self>()
 			.saturating_add(self.destination.capacity())
-			.saturating_add(self.remote_digest.capacity())
 			.saturating_add(self.raw_payload.len())
 			.saturating_add(ARC_ALLOWANCE)
 			.saturating_add(
@@ -989,7 +1202,7 @@ impl PastePreviewPlan {
 		}
 		if let Some(plan) = &self.import_plan {
 			bytes = bytes
-				.saturating_add(size_of::<TransferImportPlan>() + ARC_ALLOWANCE)
+				.saturating_add(size_of::<FilePastePlan>() + ARC_ALLOWANCE)
 				.saturating_add(plan.retained_heap_bytes());
 		}
 		if let Some(plan) = &self.commit_preview {
@@ -1012,7 +1225,6 @@ impl PastePreviewPlan {
 	fn apply_clone_bytes(&self) -> usize {
 		let mut bytes = size_of::<Self>()
 			.saturating_add(self.destination.capacity())
-			.saturating_add(self.remote_digest.capacity())
 			.saturating_add(
 				self.prefix_choices.capacity() * size_of::<PrefixChoice>(),
 			)
@@ -1166,7 +1378,6 @@ impl PastePreviewPlan {
 			error: None,
 			raw_payload: raw_text.into(),
 			remote,
-			remote_digest: String::new(),
 		};
 		let base = plan.retained_bytes();
 		let mut choices_heap = 0usize;
@@ -1206,22 +1417,12 @@ impl PastePreviewPlan {
 	) -> Result<Self, Msg> {
 		let payload = commits::parse_commit_payload(raw_text)
 			.map_err(|e| Msg::new("paste_err_plan", [e.to_string()]))?;
-		let preview = match &remote {
-			// The write scope is the folder the user pasted into: the
-			// worker holds the replay to it the same way.
-			None => CommitReplayPreview::capture_in(dest, dest, &payload, opts)
-				.map_err(|e| destination_error(dest, &e))?,
-			Some(r) => r
-				.client()
-				.replay_plan(
-					r.workspace(),
-					&r.rel(dest)?,
-					raw_text,
-					payload,
-					opts.cancel.as_ref(),
-				)
-				.map_err(|e| r.destination_error(dest, e))?,
-		};
+		// The write scope is the folder the user pasted into: the worker
+		// holds the replay to it the same way.
+		let target = paste_target(remote.as_ref(), dest)?;
+		let preview = target
+			.plan_commits(raw_text, payload, opts)
+			.map_err(|e| destination_msg(remote.as_ref(), dest, e))?;
 		let preview = Arc::new(preview);
 		// Rows name the worker's repository in a remote workspace; the plan
 		// keeps the tree path the user pasted into.
@@ -1248,7 +1449,6 @@ impl PastePreviewPlan {
 			error: None,
 			raw_payload: raw_text.into(),
 			remote,
-			remote_digest: String::new(),
 		};
 		let base = plan.retained_bytes();
 		check_budget(base, limit)?;
@@ -1270,7 +1470,7 @@ impl PastePreviewPlan {
 				} else {
 					match file.action {
 						ReplayAction::Delete => PlannedOp::Delete,
-						ReplayAction::Write if file.existed => {
+						ReplayAction::Write if file.overwrites_existing() => {
 							PlannedOp::Overwrite
 						}
 						ReplayAction::Write => PlannedOp::Create,
@@ -1278,16 +1478,6 @@ impl PastePreviewPlan {
 					}
 				};
 				let body = src.content.as_deref().unwrap_or_default();
-				let head = |op: PlannedOp| {
-					let label = header_label(op);
-					format!(
-						"commit: {}\nauthor: {} <{}>\ndate: {}\naction: {label}\n",
-						commit.message.trim_end(),
-						commit.author_name,
-						commit.author_email,
-						commit.author_date,
-					)
-				};
 				let dest_path = file
 					.absolute_path
 					.clone()
@@ -1312,7 +1502,7 @@ impl PastePreviewPlan {
 						content: Arc::from(text),
 						bytes: body_len,
 						lines,
-						op_index: c_idx * 1000 + f_idx,
+						op_index: f_idx,
 						commit: Some(c_idx),
 						rename_note,
 					}
@@ -1332,11 +1522,7 @@ impl PastePreviewPlan {
 						old_abs.clone(),
 						file.old_existed,
 						PlannedOp::Delete,
-						format!(
-							"{}path: {old}\nrenamed to: {}\n",
-							head(PlannedOp::Delete),
-							file.path
-						),
+						String::new(),
 						0,
 						0,
 						Some(format!("→ {}", file.path)),
@@ -1347,7 +1533,7 @@ impl PastePreviewPlan {
 					dest_path,
 					file.existed,
 					op,
-					format!("{}path: {}\n\n{body}", head(op), file.path),
+					body.to_string(),
 					body.len(),
 					body.lines().count(),
 					file.old_path
@@ -1453,7 +1639,6 @@ impl PastePreviewPlan {
 		self.items = Vec::new();
 		self.selected_item_idx = 0;
 		self.import_plan = None;
-		self.remote_digest = String::new();
 		self.plan = empty_plan();
 	}
 
@@ -1498,57 +1683,42 @@ impl PastePreviewPlan {
 			self.error = Some(Msg::new("mapping_required", []));
 			return Ok(());
 		}
-		if let Some(remote) = self.remote.clone() {
-			return self.rebuild_remote(&remote, opts, limit);
-		}
-		let primary = CanonicalRootId::new(&self.destination)
-			.map_err(|e| destination_error(&self.destination, &e))?;
-		let mut dest_roots = vec![self.destination.clone()];
-		let mut mapping = ImportMapping::with_primary(primary);
-		for choice in &self.prefix_choices {
-			if choice.keep_relative {
-				continue;
-			}
-			let Some(dest) = choice.destination.clone() else {
-				continue;
-			};
-			if !dest_roots.iter().any(|r| r == &dest) {
-				dest_roots.push(dest.clone());
-			}
-			let id = CanonicalRootId::new(&dest)
-				.map_err(|e| destination_error(&dest, &e))?;
-			mapping.map_prefix(&choice.prefix, id);
-		}
-		let import_plan = match plan_import_with(
-			&self.raw_payload,
-			"",
-			&dest_roots,
-			&mapping,
-			opts,
-		) {
-			Ok(plan) => plan,
-			Err(e) => {
-				if crate::e2e_on() {
-					if let TransferError::TargetCollision { .. } = &e {
-						app_log!(
-							"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
-						);
-					}
+		let (target, route) = self.target_route()?;
+		let file_plan =
+			match target.plan_files(&self.raw_payload, &route, opts, None) {
+				Ok(plan) => plan,
+				Err(PasteError::Destination { path, source }) => {
+					return Err(destination_error(&path, &source));
 				}
-				self.error =
-					Some(Msg::new("paste_err_plan", [e.paste_message()]));
-				return Ok(());
-			}
-		};
+				Err(err) => match err.refusal() {
+					Some(message) => {
+						if crate::e2e_on() && err.is_collision() {
+							app_log!(
+								"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
+							);
+						}
+						self.error =
+							Some(Msg::new("paste_err_plan", [message]));
+						return Ok(());
+					}
+					None => {
+						return Err(destination_msg(
+							self.remote.as_ref(),
+							&self.destination,
+							err,
+						));
+					}
+				},
+			};
 		let base = self
 			.retained_bytes()
-			.saturating_add(size_of::<TransferImportPlan>() + ARC_ALLOWANCE)
-			.saturating_add(import_plan.retained_heap_bytes())
-			.saturating_add(import_plan.restore_plan().retained_heap_bytes());
+			.saturating_add(size_of::<FilePastePlan>() + ARC_ALLOWANCE)
+			.saturating_add(file_plan.retained_heap_bytes())
+			.saturating_add(file_plan.restore_plan().retained_heap_bytes());
 		// The existing empty Arc<RestorePlan> charge covers its replacement.
 		// Check before making the second full restore-plan copy.
 		check_budget(base, limit)?;
-		let planned = import_plan.restore_plan().clone();
+		let planned = file_plan.restore_plan().clone();
 		if planned.create_operations.is_empty()
 			&& planned.delete_operations.is_empty()
 			&& planned.skipped_operations.is_empty()
@@ -1556,104 +1726,38 @@ impl PastePreviewPlan {
 			self.error = Some(Msg::new("paste_err_nothing", []));
 			return Ok(());
 		}
-		let items = self.fill_items(&planned, &dest_roots, base, limit)?;
+		let items = self.fill_items(&file_plan, &planned, base, limit)?;
 		self.plan = Arc::new(planned);
-		self.import_plan = Some(Arc::new(import_plan));
+		self.import_plan = Some(Arc::new(file_plan));
 		self.items = items;
 		self.error = None;
 		Ok(())
 	}
 
-	/// The routing the worker plans with: the destination and each chosen
-	/// prefix folder as workspace-relative paths.
-	fn remote_mapping(
-		&self,
-		remote: &RemotePaste,
-	) -> Result<(String, snip_remote::PasteMapping), Msg> {
-		let dest = remote.rel(&self.destination)?;
-		let mut mapping = snip_remote::PasteMapping::default();
+	/// This plan's target and the chosen prefix folders, spelled for it.
+	fn target_route(&self) -> Result<(PasteTarget, PasteRoute), Msg> {
+		let target = paste_target(self.remote.as_ref(), &self.destination)?;
+		let mut route = PasteRoute::default();
 		for choice in &self.prefix_choices {
 			if choice.keep_relative {
 				continue;
 			}
-			if let Some(folder) = &choice.destination {
-				mapping
-					.prefixes
-					.push((choice.prefix.clone(), remote.rel(folder)?));
-			}
+			let Some(folder) = &choice.destination else {
+				continue;
+			};
+			let folder = match &self.remote {
+				None => folder.clone(),
+				Some(r) => PathBuf::from(r.rel(folder)?),
+			};
+			route.prefixes.push((choice.prefix.clone(), folder));
 		}
-		Ok((dest, mapping))
-	}
-
-	/// [`Self::rebuild_inner`] in a remote workspace: the worker plans with
-	/// `plan_import_with` on its own disk and sends the plan back.
-	fn rebuild_remote(
-		&mut self,
-		remote: &RemotePaste,
-		opts: &RunOptions,
-		limit: usize,
-	) -> Result<(), Msg> {
-		let (dest, mapping) = self.remote_mapping(remote)?;
-		let planned = match remote.client().import_plan(
-			remote.workspace(),
-			&dest,
-			&self.raw_payload,
-			&mapping,
-			opts.cancel.as_ref(),
-		) {
-			Ok(planned) => planned,
-			Err(snip_remote::RemoteError::Refused { code, message }) => {
-				if crate::e2e_on() && code == snip_remote::ErrorCode::Collision
-				{
-					app_log!(
-						"[APP:PASTE_PLAN_REFUSED: reason=target_collision]"
-					);
-				}
-				self.error = Some(Msg::new("paste_err_plan", [message]));
-				return Ok(());
-			}
-			Err(err) => {
-				return Err(remote.destination_error(&self.destination, err))
-			}
-		};
-		let import_plan = planned.plan;
-		let base = self
-			.retained_bytes()
-			.saturating_add(planned.digest.capacity())
-			.saturating_add(size_of::<TransferImportPlan>() + ARC_ALLOWANCE)
-			.saturating_add(import_plan.retained_heap_bytes())
-			.saturating_add(import_plan.restore_plan().retained_heap_bytes());
-		check_budget(base, limit)?;
-		let planned_ops = import_plan.restore_plan().clone();
-		if planned_ops.create_operations.is_empty()
-			&& planned_ops.delete_operations.is_empty()
-			&& planned_ops.skipped_operations.is_empty()
-		{
-			self.error = Some(Msg::new("paste_err_nothing", []));
-			return Ok(());
-		}
-		let roots = import_plan.roots().to_vec();
-		let mut items = self.fill_items(&planned_ops, &roots, base, limit)?;
-		// A delete row's "exists" is the worker's answer, never a local stat.
-		let fresh = import_plan.destination_freshness();
-		for item in items.iter_mut().filter(|i| i.is_delete()) {
-			item.dest_exists = fresh
-				.target_files
-				.get(&item.dest_path)
-				.is_some_and(|t| t.file_state.is_some());
-		}
-		self.plan = Arc::new(planned_ops);
-		self.import_plan = Some(Arc::new(import_plan));
-		self.remote_digest = planned.digest;
-		self.items = items;
-		self.error = None;
-		Ok(())
+		Ok((target, route))
 	}
 
 	fn fill_items(
 		&self,
+		file_plan: &FilePastePlan,
 		plan: &RestorePlan,
-		dest_roots: &[PathBuf],
 		base: usize,
 		limit: usize,
 	) -> Result<Vec<PasteItem>, Msg> {
@@ -1693,7 +1797,8 @@ impl PastePreviewPlan {
 			)?;
 		}
 		for (op_idx, op) in plan.delete_operations.iter().enumerate() {
-			let dest_root = dest_roots
+			let dest_root = file_plan
+				.roots()
 				.iter()
 				.find(|r| op.absolute_path.starts_with(r))
 				.cloned()
@@ -1702,9 +1807,8 @@ impl PastePreviewPlan {
 				path: op.relative_path.clone(),
 				dest_root_name: root_name(&dest_root),
 				dest_path: op.absolute_path.clone(),
-				// A remote plan's paths are the worker's: its caller fills
-				// this from the worker's snapshot instead.
-				dest_exists: self.remote.is_none() && op.absolute_path.exists(),
+				// A worker's paths are not this machine's: its snapshot answers.
+				dest_exists: file_plan.delete_target_exists(op_idx),
 				op: PlannedOp::Delete,
 				overwrite_allowed: true,
 				selected: true,
@@ -1724,12 +1828,47 @@ impl PastePreviewPlan {
 				limit,
 			)?;
 		}
+		for (op_idx, op) in plan.skipped_operations.iter().enumerate() {
+			let reason = if op.detail
+				== Some(snip_core::restore::SkipDetail::ProtectedGitMetadata)
+			{
+				SkipCause::ProtectedGitMetadata
+			} else {
+				SkipCause::Restore(op.reason)
+			};
+			let item = PasteItem {
+				path: op.raw_path.clone(),
+				dest_root: self.destination.clone(),
+				dest_root_name: root_name(&self.destination),
+				// There is no admitted destination for a skipped operation.
+				dest_path: self.destination.clone(),
+				dest_exists: false,
+				op: PlannedOp::Skip(reason),
+				overwrite_allowed: false,
+				selected: false,
+				content: Arc::from(""),
+				bytes: 0,
+				lines: 0,
+				op_index: op_idx,
+				commit: None,
+				rename_note: None,
+			};
+			items_heap = items_heap.saturating_add(item.retained_heap_bytes());
+			items.push(item);
+			check_budget(
+				base.saturating_add(items_heap)
+					.saturating_add(items.capacity() * size_of::<PasteItem>()),
+				limit,
+			)?;
+		}
 		Ok(items)
 	}
 
 	pub fn toggle_overwrite(&mut self, idx: usize) {
 		if let Some(item) = self.items.get_mut(idx) {
-			item.overwrite_allowed = !item.overwrite_allowed;
+			if item.overwritable() {
+				item.overwrite_allowed = !item.overwrite_allowed;
+			}
 		}
 	}
 
@@ -1739,7 +1878,9 @@ impl PastePreviewPlan {
 
 	pub fn toggle_selected(&mut self, idx: usize) {
 		if let Some(item) = self.items.get_mut(idx) {
-			item.selected = !item.selected;
+			if !item.planned_skip() {
+				item.selected = !item.selected;
+			}
 		}
 		if self.whole_commit {
 			if !self.all_selected() {
@@ -1948,10 +2089,7 @@ impl PastePreviewPlan {
 	}
 
 	pub fn counts(&self) -> PasteCounts {
-		let mut c = PasteCounts {
-			skips: self.plan.skipped_operations.len(),
-			..PasteCounts::default()
-		};
+		let mut c = PasteCounts::default();
 		for it in &self.items {
 			if it.overwritable() {
 				c.existing += 1;
@@ -2000,21 +2138,23 @@ impl PastePreviewPlan {
 
 	/// Checks whether destination files on disk have changed since preview generation.
 	pub fn check_stale_destination(&self) -> Result<(), Msg> {
-		if let Some(remote) = &self.remote {
-			// The worker's paths: only the worker can re-read them.
-			if let Some(preview) = &self.commit_preview {
-				self.remote_replay(remote, preview, true)?;
-			}
-			return Ok(());
-		}
+		let target = paste_target(self.remote.as_ref(), &self.destination)?;
 		if let Some(preview) = &self.commit_preview {
-			preview.revalidate().map_err(stale_msg)?;
+			target
+				.check_commits(&self.raw_payload, preview)
+				.map_err(|e| {
+					commit_msg(
+						self.remote.as_ref(),
+						&self.destination,
+						e,
+						false,
+					)
+				})?;
 		}
-		if let Some(import_plan) = &self.import_plan {
-			import_plan
-				.destination_freshness()
-				.revalidate()
-				.map_err(stale_msg)?;
+		if let Some(plan) = &self.import_plan {
+			target.check_files(plan).map_err(|e| {
+				file_apply_msg(self.remote.as_ref(), &self.destination, e)
+			})?;
 		}
 		Ok(())
 	}
@@ -2039,6 +2179,9 @@ impl PastePreviewPlan {
 		let mut skipped_existing = 0;
 
 		for item in &self.items {
+			if item.planned_skip() {
+				continue;
+			}
 			if !item.selected {
 				if item.is_delete() {
 					unchecked_deletes.insert(item.op_index);
@@ -2063,28 +2206,12 @@ impl PastePreviewPlan {
 		};
 
 		// Run confirmed plan directly through shared transfer engine with freshness check
-		let mut result = match &self.remote {
-			None => import_plan.apply(&selection).map_err(stale_msg)?,
-			Some(remote) => {
-				let (dest, mapping) = self.remote_mapping(remote)?;
-				let expect = snip_remote::ImportExpect {
-					digest: self.remote_digest.clone(),
-					freshness: import_plan.destination_freshness().clone(),
-				};
-				remote
-					.client()
-					.import_apply(
-						remote.workspace(),
-						&dest,
-						&self.raw_payload,
-						&mapping,
-						&selection,
-						&expect,
-						None,
-					)
-					.map_err(|e| remote.apply_error(&self.destination, e))?
-			}
-		};
+		let (target, route) = self.target_route()?;
+		let mut result = target
+			.apply_files(&self.raw_payload, &route, import_plan, &selection)
+			.map_err(|e| {
+				file_apply_msg(self.remote.as_ref(), &self.destination, e)
+			})?;
 		result.skipped_existing_count += skipped_existing;
 		Ok(PasteApplyResult {
 			files: result,
@@ -2099,37 +2226,26 @@ impl PastePreviewPlan {
 		if self.items.iter().any(|item| !item.selected) {
 			return Err(Msg::new("commit_subset_rejected", []));
 		}
+		let target = paste_target(self.remote.as_ref(), &self.destination)?;
 		// Core overwrites (spec 4.3); asking first is this session's rule. Stale still wins over the prompt, as before.
 		if self.overwrite_missing() {
-			match &self.remote {
-				None => preview.revalidate().map_err(stale_msg)?,
-				Some(remote) => {
-					self.remote_replay(remote, preview, true)?;
-				}
-			}
+			target
+				.check_commits(&self.raw_payload, preview)
+				.map_err(|e| {
+					commit_msg(
+						self.remote.as_ref(),
+						&self.destination,
+						e,
+						false,
+					)
+				})?;
 			return Err(Msg::new("commit_overwrite_required", []));
 		}
-		let replay_res = match &self.remote {
-			None => preview.apply().map_err(|e| match e {
-				TransferError::Git(GitError::WorktreeBusy { .. }) => {
-					repo_busy()
-				}
-				TransferError::Git(e) => {
-					Msg::new("error_open_repo", [e.to_string()])
-				}
-				other => stale_msg(other),
-			})?,
-			Some(remote) => self
-				.remote_replay(remote, preview, false)?
-				.ok_or_else(|| {
-					remote.destination_error(
-						&self.destination,
-						snip_remote::RemoteError::Protocol(
-							"the replay returned no result".into(),
-						),
-					)
-				})?,
-		};
+		let replay_res = target
+			.apply_commits(&self.raw_payload, preview)
+			.map_err(|e| {
+				commit_msg(self.remote.as_ref(), &self.destination, e, true)
+			})?;
 		if let Some(fail) = replay_res.failure {
 			if replay_res.created.is_empty() {
 				let subject = fail.message.lines().next().unwrap_or("").trim();
@@ -2202,44 +2318,11 @@ impl PastePreviewPlan {
 				overwritten_count: 0,
 				deleted_count: 0,
 				skipped_existing_count: 0,
+				planned_skipped_count: 0,
 				errors: Vec::new(),
 			},
 			created_commits: replay_res.created,
 		})
-	}
-
-	/// Re-checks (`check_only`) or replays `preview` on the worker, worded
-	/// as the local replay: stale, a repository error, or the worker lost.
-	fn remote_replay(
-		&self,
-		remote: &RemotePaste,
-		preview: &CommitReplayPreview,
-		check_only: bool,
-	) -> Result<Option<commits::ReplayResult>, Msg> {
-		let dest = remote.rel(&self.destination)?;
-		remote
-			.client()
-			.replay_apply(
-				remote.workspace(),
-				&dest,
-				&self.raw_payload,
-				preview,
-				check_only,
-				None,
-			)
-			.map_err(|e| match e {
-				snip_remote::RemoteError::Refused {
-					code: snip_remote::ErrorCode::Stale,
-					message,
-				} => remote_stale_msg(&message),
-				snip_remote::RemoteError::Refused { message, .. } => {
-					Msg::new("error_open_repo", [message])
-				}
-				other if !check_only && other.outcome_unknown() => {
-					outcome_unknown()
-				}
-				other => remote.destination_error(&self.destination, other),
-			})
 	}
 }
 
@@ -2254,6 +2337,7 @@ pub(crate) mod tests {
 				created_count: 2,
 				overwritten_count: 1,
 				skipped_existing_count: 0,
+				planned_skipped_count: 0,
 				deleted_count: 0,
 				errors,
 			},
@@ -2358,11 +2442,21 @@ pub(crate) mod tests {
 			))
 		};
 		assert_eq!(
-			remote.apply_error(&dest, lost()).key,
+			file_apply_msg(
+				Some(&remote),
+				&dest,
+				PasteError::OutcomeUnknown(lost())
+			)
+			.key,
 			"paste_outcome_unknown"
 		);
 		assert_eq!(
-			remote.apply_error(&dest, RemoteError::TimedOut).key,
+			file_apply_msg(
+				Some(&remote),
+				&dest,
+				PasteError::OutcomeUnknown(RemoteError::TimedOut)
+			)
+			.key,
 			"paste_outcome_unknown"
 		);
 		let stale = RemoteError::Refused {
@@ -2371,14 +2465,165 @@ pub(crate) mod tests {
 			          externally after preview"
 				.into(),
 		};
-		assert_eq!(remote.apply_error(&dest, stale).key, "stale_created");
+		assert_eq!(
+			file_apply_msg(Some(&remote), &dest, PasteError::Remote(stale)).key,
+			"stale_created"
+		);
 		// Never reached the worker: nothing can have been written.
 		assert_eq!(
-			remote
-				.apply_error(&dest, RemoteError::Connect("no route".into()))
-				.key,
+			file_apply_msg(
+				Some(&remote),
+				&dest,
+				PasteError::Remote(RemoteError::Connect("no route".into()))
+			)
+			.key,
 			"paste_err_destination"
 		);
+	}
+
+	#[test]
+	fn file_apply_failures_keep_their_messages() {
+		use snip_remote::{ErrorCode, RemoteError};
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: "/w".into(),
+					name: "w".into(),
+					path: "/w".into(),
+				},
+			),
+		};
+		let dest = remote.session.root.clone();
+		let busy_git =
+			|| TransferError::Git(GitError::WorktreeBusy { args: "x".into() });
+		let key = |r: Option<&RemotePaste>, e| file_apply_msg(r, &dest, e).key;
+		assert_eq!(key(None, PasteError::Local(busy_git())), "paste_repo_busy");
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Refused {
+					code: ErrorCode::Busy,
+					message: busy_git().paste_message()
+				})
+			),
+			"paste_repo_busy"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Refused {
+					code: ErrorCode::Busy,
+					message: "too many callers".into()
+				})
+			),
+			"paste_err_destination"
+		);
+		assert_eq!(
+			key(
+				None,
+				PasteError::Local(TransferError::StaleDestination {
+					root: "/r".into(),
+					reason:
+						"target file 'a' was deleted externally after preview"
+							.into()
+				})
+			),
+			"stale_deleted"
+		);
+		// The old `stale_msg` other arm: the error's Display, not paste_message.
+		let special = file_apply_msg(
+			None,
+			&dest,
+			PasteError::Local(TransferError::SpecialFile("p".into())),
+		);
+		assert_eq!(special.key, "stale_modified");
+		assert_eq!(
+			special.args[0],
+			TransferError::SpecialFile("p".into()).to_string()
+		);
+	}
+
+	#[test]
+	fn commit_failures_keep_their_messages() {
+		use snip_remote::{ErrorCode, RemoteError};
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: "/w".into(),
+					name: "w".into(),
+					path: "/w".into(),
+				},
+			),
+		};
+		let dest = remote.session.root.clone();
+		let busy_git =
+			|| TransferError::Git(GitError::WorktreeBusy { args: "x".into() });
+		let key = |r: Option<&RemotePaste>, e, applying| {
+			commit_msg(r, &dest, e, applying).key
+		};
+		let refused = |code, message: String| {
+			PasteError::Remote(RemoteError::Refused { code, message })
+		};
+		// Kept on purpose (design Risk 1): a worker's Busy refusal of a replay
+		// reads as a repository error, not as paste_repo_busy. Changing this
+		// is a decision, not a fix.
+		assert_eq!(
+			key(
+				Some(&remote),
+				refused(ErrorCode::Busy, busy_git().paste_message()),
+				true
+			),
+			"error_open_repo"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				refused(
+					ErrorCode::Stale,
+					"stale destination in '/w': target file 'a' was created externally after preview"
+						.into()
+				),
+				false
+			),
+			"stale_created"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::OutcomeUnknown(RemoteError::TimedOut),
+				true
+			),
+			"paste_outcome_unknown"
+		);
+		assert_eq!(
+			key(
+				Some(&remote),
+				PasteError::Remote(RemoteError::Connect("no route".into())),
+				false
+			),
+			"paste_err_destination"
+		);
+		assert_eq!(
+			key(Some(&remote), PasteError::NoReplayResult, true),
+			"paste_err_destination"
+		);
+		for applying in [false, true] {
+			assert_eq!(
+				key(None, PasteError::Local(busy_git()), applying),
+				"paste_repo_busy"
+			);
+		}
+		let cancelled = || {
+			PasteError::Local(TransferError::Git(GitError::Cancelled {
+				args: "x".into(),
+			}))
+		};
+		assert_eq!(key(None, cancelled(), true), "error_open_repo");
+		assert_eq!(key(None, cancelled(), false), "stale_modified");
 	}
 
 	fn captured(text: String, dest: &Path) -> PasteRequest {
@@ -2425,7 +2670,8 @@ pub(crate) mod tests {
 				pending.total_with_ui(
 					pending.ui_bytes,
 					pending.apply_allowance,
-					pending.ui_raw.as_ref()
+					pending.ui_raw.as_ref(),
+					pending.ui_commit.as_ref()
 				) <= MAX_RETAINED_PREVIEW_BYTES
 			);
 			assert!(life.is_live(id));
@@ -2580,6 +2826,7 @@ pub(crate) mod tests {
 				state.ui_bytes,
 				state.apply_allowance,
 				state.ui_raw.as_ref(),
+				state.ui_commit.as_ref(),
 			);
 			ordinary.source = PreviewSource::CommitFile {
 				sha: String::with_capacity(MAX_RETAINED_PREVIEW_BYTES - used),
@@ -2591,7 +2838,8 @@ pub(crate) mod tests {
 				state.total_with_ui(
 					state.ui_bytes,
 					state.apply_allowance,
-					state.ui_raw.as_ref()
+					state.ui_raw.as_ref(),
+					state.ui_commit.as_ref()
 				),
 				MAX_RETAINED_PREVIEW_BYTES
 			);
@@ -2631,7 +2879,8 @@ pub(crate) mod tests {
 				state.total_with_ui(
 					state.ui_bytes,
 					state.apply_allowance,
-					state.ui_raw.as_ref()
+					state.ui_raw.as_ref(),
+					state.ui_commit.as_ref()
 				),
 				MAX_RETAINED_PREVIEW_BYTES
 			);
@@ -4130,6 +4379,35 @@ pub(crate) mod tests {
 	}
 
 	#[test]
+	fn commit_rows_ask_to_overwrite_exactly_the_existing_writes() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		git_run(&path, &["add", "."]);
+		git_run(&path, &["commit", "-qm", "base"]);
+		let text = commit_payload_modifying_a();
+		let plan =
+			PastePreviewPlan::build_from_clipboard_text(&text, &path, &[], 1)
+				.unwrap();
+
+		let asked: BTreeSet<&str> = plan
+			.items
+			.iter()
+			.filter(|i| i.overwritable())
+			.map(|i| i.path.as_str())
+			.collect();
+		let existing = plan
+			.commit_preview
+			.as_ref()
+			.unwrap()
+			.plan()
+			.existing_writes();
+		assert!(!existing.is_empty());
+		assert_eq!(asked, existing);
+	}
+
+	#[test]
 	fn commit_replay_blocks_unchecked_overwrite_and_stale_bytes() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().to_path_buf();
@@ -4143,7 +4421,12 @@ pub(crate) mod tests {
 			PastePreviewPlan::build_from_clipboard_text(&text, &path, &[], 1)
 				.unwrap();
 		assert!(unchecked.items[0].content.contains("incoming"));
-		assert!(unchecked.items[0].content.contains("Author"));
+		assert!(!unchecked.items[0].content.contains("Author"));
+		assert_eq!(
+			unchecked.commit_preview.as_ref().unwrap().plan().commits[0]
+				.author_name,
+			"Author"
+		);
 		assert!(!unchecked.items[0].overwrite_allowed);
 		unchecked.items[0].selected = false;
 		unchecked.items[0].overwrite_allowed = false;

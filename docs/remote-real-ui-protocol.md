@@ -24,7 +24,7 @@
 | master | Mac mini `AudideMac-mini` | 本機 |
 | worker | Ubuntu `audichuang-desktop`（x86_64） | `ssh ubuntu`（`~/.ssh/config` 的 `Host ubuntu`，金鑰登入） |
 
-- 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上與 worker 端變更選取（協定 5）：`grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs`，不符就不開跑。
+- 受測 SHA 沒有另外指定時，用 `origin/develop`。它必須包含遠端貼上與 worker 端變更選取（協定 5）：確認 `PROTOCOL_MAX >= 5`（新版亦適用），不符就不開跑。
 - **受測的 worker binary 怎麼被選到**：產品在對方執行 `snip serve --stdio` 時，依序找 PATH 上的 `snip`、`~/.local/bin/snip`…。Ubuntu 的非互動 ssh PATH 第一項是 `~/.local/bin`，所以本輪在 `~/.local/bin/snip` 放一個**wrapper**（把執行時的 PID 記到 `$W/pids/`，再 `exec` 受測 SHA 編出的 binary），產品就會走真實的 ssh 路徑選到它，而 L04、L05 與收尾只殺本輪記下的 PID（2.3 安裝）。開跑前那個位置必須不存在（2.3 會檢查），收尾一定要刪掉（第 6 節，I03 驗證）。**不要用 `SNIP_REMOTE_EXEC`**，那會繞過要測的 ssh 路徑。
 - 受測專案：Ubuntu 上的 `~/research/rtk`。真實的 Rust 專案，有中文 README（`README_zh.md`）、200 KB 以上的原始碼（`src/hooks/init.rs`）、`.git/`、`target/`，還有 8 MB 的二進位檔 `target/release/rtk`。**它只讀不寫**。
 - 其他情境放在 fixture（第 2.3 節），全部在 Ubuntu 的 `$W` 底下。
@@ -39,7 +39,8 @@
 
 ```bash
 export PATH=$HOME/.cargo/bin:$PATH
-grep -q 'PROTOCOL_MAX: u32 = 5' crates/remote/src/proto.rs
+protocol_max=$(sed -n 's/^pub const PROTOCOL_MAX: u32 = \([0-9][0-9]*\);$/\1/p' crates/remote/src/proto.rs)
+test "${protocol_max:-0}" -ge 5
 cargo build --release -p snip-cli --locked
 just remote-e2e-ssh ubuntu
 ```
@@ -346,9 +347,11 @@ export SNIP_NATIVE_E2E=1 SNIP_THEME=dark
 | S07 | 從最近開啟點 `local-ws`，再點 `remote-recent:<n>`（gitws） | 先回到本機（麵包屑沒有 `ubuntu ▸`），再一次點擊就回到 `ubuntu ▸ gitws`，不用重新逐層選 |
 | S08 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/edge`，點 `btn-remote-open` | `REMOTE_OPENED: ubuntu ▸ edge`；`~` 展開成對方的家目錄 |
 | S09 | 在 `remote-path-input` 輸入 `~/snip-ui-run/<SHA>/no-such`，點 `btn-remote-open` | 失敗格：選單裡紅字說資料夾不存在；目前的工作區不變（仍是 edge） |
-| S10 | Cmd+Q，等 exit code 0，用同一個 `SNIP_CONFIG_DIR` **不帶 `--workspace`** 重新啟動（寫進新的 `app-N.log`） | `WS_TABS_RESTORED` 與每個還原分頁的 `WS_TAB_OPENED`；`REMOTE_REOPEN: host=ubuntu path=…/edge` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`，顯示的是離開前的分頁（`open-tabs.json` 的 `active`）；遠端分頁一開始就在，標籤 `ubuntu ▸ edge`，連線在背景（狀態列「正在重新連線 …」），啟動過程畫面不卡 |
-| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`；`open-tabs.json` 裡的 `ubuntu ▸ edge` 也會還原，是 `local-ws` 之前的另一個分頁，`local-ws` 若已在還原的分頁裡就切過去），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。還原的 `ubuntu ▸ edge` 分頁若連線失敗，會保持 failed 狀態（`ws-tab-state:<ix>:failed`，tooltip 結尾「連線失敗：<原因>」，狀態列「無法開啟遠端工作區：<原因>」）並照 `REMOTE_RETRY` 重試，不是這格的失敗，也不會讓 `local-ws` 消失。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
+| S10 | Cmd+Q，等 exit code 0，執行 `python3 scripts/real_ui_round.py launch --gate b --saved-tabs --run "$RUN"`，以同一個隔離設定、**不帶 `--workspace`** 重新啟動（舊日誌與 exit 收據自動編號保存） | `WS_TABS_RESTORED` 與每個還原分頁的 `WS_TAB_OPENED`；`REMOTE_REOPEN: host=ubuntu path=…/edge` 之後是 `REMOTE_OPENED: ubuntu ▸ edge`，顯示的是離開前的分頁（`open-tabs.json` 的 `active`）；遠端分頁一開始就在，標籤 `ubuntu ▸ edge`，連線在背景（狀態列「正在重新連線 …」），啟動過程畫面不卡 |
+| S11 | 對方沒有受測版本。先關掉現有的遠端連線：Cmd+Q 結束 App（已開的 ssh 連線會沿用舊的 worker，不關就測不到），確認本輪 `$W/pids/` 記錄的 worker 都已結束。再 `ssh ubuntu "mv ~/.local/bin/snip ~/.local/bin/snip.uirun-$SHA"`（本輪專屬備份名，不碰使用者既有的任何備份），用同一個 `SNIP_CONFIG_DIR` 帶 `--workspace "$RUN/local-ws"` 重新啟動 App（新的 `app-N.log`；`open-tabs.json` 裡的 `ubuntu ▸ edge` 也會還原，是 `local-ws` 之前的另一個分頁，`local-ws` 若已在還原的分頁裡就切過去），在選單點 `ubuntu`，打開 `pastews/plain`，按 Cmd+V 貼上任一 payload；做完立刻 `ssh ubuntu "mv ~/.local/bin/snip.uirun-$SHA ~/.local/bin/snip"`，並確認還原成功 | 這時產品會選到 linuxbrew 上較舊的 `snip`：瀏覽仍可用；貼上顯示「對方的 snip 版本太舊」之類的明確訊息（不是連線錯誤、不是空白），worker 上沒有新檔案。還原的 `ubuntu ▸ edge` 分頁若連線失敗，會保持 failed 狀態（`ws-tab-state:<ix>:failed`，tooltip 結尾「連線失敗：<原因>」，狀態列「無法開啟遠端工作區：<原因>」）；暫時斷線才照 `REMOTE_RETRY` backoff；缺少 worker、權限或版本等永久拒絕停止自動重試，不會讓 `local-ws` 消失。若 linuxbrew 沒有 `snip`，訊息要說對方沒有安裝 snip |
 | S12 | 把視窗調成 900×600（System Events 設成 900×632），開選單並點進一層資料夾 | `remote-path`、`remote-up`、`btn-remote-open-here`、`remote-path-input`、`btn-remote-open` 的 bounds 都 `w,h ≥ 1` 且在內容區裡（tooltip 文字就是 `remote-path` 顯示的同一個字串，見 `crates/desktop-native/src/ui/remote.rs` 的 `tip(browse.path.clone())`，不在真實 UI 驗）；做完調回 1080×720 |
+
+重驗 #176 時，S10 使用 4 個本機與 12 個同 Host 遠端分頁、最後一個遠端分頁為作用中，正常退出後連續重開兩次。各次保存 `open-tabs.json` 前後、各分頁 open／scan／失敗／retry／recovered 的日誌時間及本輪 worker 啟動數；不按 Refresh，確認分頁數、順序、作用中 identity 與 repo 清單正確。自然 SSH 回合沒有發生斷線時如實記為零，故障後恢復另由真實 Worker EOF 的 GPUI 注入測試驗證。同 Host 握手峰值由計數 transport 測試量測；存活 worker 數不等於同時握手數。
 
 ### 4.2 瀏覽真實專案 rtk（R01–R08）
 
@@ -512,7 +515,7 @@ snip_file_digest() {    # $1=path；stdin：該檔的原始內容 → path<TAB>s
 | P04 | 取消勾選 `new.txt`（`paste-include`），勾選 `a.txt` 的覆寫，點 `btn-apply` | `a.txt` 被覆寫、`new.txt` 不存在、`keep.txt` 不變；與 oracle（`--overwrite`，事後刪掉 oracle 的 new.txt）相同 |
 | P05 | 再按一次 Cmd+V，預覽出現後執行 `ssh ubuntu "echo changed-outside > '$W/pastews/target/a.txt'"`，再勾選覆寫、點 `btn-apply` | 拒絕：`PASTE_STALE_DETECTED` 或畫面說目的地已在外部修改；worker 上 `a.txt` 是 `changed-outside` |
 | P06 | 做一個會產生前綴選擇的 payload（P01 的 payload 帶 `clipcode-root`，單一根，不會有前綴選項）：`sed -e '/^\/\/ clipcode-root:/d' -e 's|^// file: |// file: src/|' "$RUN/p-files.txt" > "$RUN/p-prefixed.txt" && pbcopy < "$RUN/p-prefixed.txt"`——沒有 `clipcode-root` 中繼資料、每個路徑都帶 `src/`，面板才會出現 `paste-map:src`。打開遠端工作區 `prefixws`，不選任何 repo，Cmd+V。開跑前建 oracle：`ssh ubuntu "rm -rf '$W/oracle-prefix' && cp -a '$W/prefixws' '$W/oracle-prefix'"`。記下 `PASTE_PREVIEW` 那行的 `dest=`，去掉開頭的 `ubuntu:` 主機前綴後寫成 `$DEST`（worker 上的絕對路徑；oracle 用同一個相對位置換到 `oracle-prefix` 下）。兩種選擇各做一次：(a) 在 `paste-map:src` 選 `two`（剝掉前綴），點 `btn-apply`。(b) 再按一次 Cmd+V，選保持 `src/` 於原位（`paste-map-keep:src`），點 `btn-apply` | `PASTE_PREVIEW`；面板出現 `paste-map:src` 要求為前綴選目的地。(a) 寫入 `prefixws/two/a.txt`、`two/sub/crlf.txt` 等；oracle 是 `sed 's|^// file: src/|// file: |' p-prefixed.txt` 後 `snip paste --apply --stdin` 貼進 `oracle-prefix/two`（遠端執行，`cd` 進該資料夾）。(b) 寫入 `$DEST/src/…`；oracle 是 p-prefixed.txt 原樣貼進 oracle 裡對應 `$DEST` 的資料夾（若 `$DEST` 是 `two`，(a) 寫的是 `two/a.txt`、(b) 寫的是 `two/src/a.txt`，路徑不衝突，不需覆寫旗標）。(a)(b) 各自 `PASTE_DONE` 且 `skipped=0`；檔案逐一與 oracle 相同（正規化照 spec 第 1 節，同 P02 的說明） |
-| P07 | `pbcopy < "$RUN/git-payload.txt"`；打開 `pastews`，Cmd+V，若可套用就點 `btn-apply` | `target/.git/hooks/pre-commit` 那一列被拒絕或標成不可寫；`ssh ubuntu "test ! -e '$W/pastews/target/.git/hooks/pre-commit'"` 成立 |
+| P07 | `pbcopy < "$RUN/git-payload.txt"`；打開 `pastews`，Cmd+V，完成前綴 mapping，若可套用就點 `btn-apply`；再以一個合法文字檔加同一保護路徑的混合 payload 重做 | 必須分別斷言：預覽列出 `target/.git/hooks/pre-commit` 與 Git metadata 受保護的原因，不能勾選寫入；`ssh ubuntu "test ! -e '$W/pastews/target/.git/hooks/pre-commit'"` 成立。全部略過顯示「未套用任何檔案；略過 1 項」，`PASTE_DONE` 的 skipped=1；混合 payload 合法檔案正確寫入，skipped 仍為 1，不重複計算。只驗零寫入不能判 UI 通過 |
 | P08 | X10 的方式從遠端 `pastews/commit-src` 複製兩個 commit；打開 `pastews/commit-dst`，Cmd+V，`btn-apply` | `PASTE_DONE`；`git -C commit-dst log -2 --format=%s` 是 `replay two`、`replay one`，樹與 oracle（在 oracle 副本的 commit-dst 執行 `snip paste --apply --stdin`）相同 |
 | P09 | `"$SNIP" copy --repo "$RUN/commit-local" --commits -n 1 --stdout \| pbcopy`；打開一份新的 `commit-dst` 副本（`ssh ubuntu "cd '$W/pastews' && rm -rf commit-dst2 && git clone -q commit-src commit-dst2 && git -C commit-dst2 reset -q --hard HEAD~2"`），Cmd+V，`btn-apply` | 本機的 commit 重播到遠端：`git -C commit-dst2 log -1 --format=%s` 是 `from mac`，`mac.txt` 內容是 `from mac` |
 | P10 | 遠端貼回本機：在 `edge` 對 `src` 資料夾右鍵 →「複製」；打開本機 `local-ws`，Cmd+V，`btn-apply` | `local-ws/src/main.rs` 與 `local-ws/src/deep/中文 有空白.txt` 的 SHA-256 等於「Ubuntu 上 `cd '$W/edge' && snip copy src --stdout` 再 `snip paste --apply --stdin` 貼進一份副本」的結果（與 worker 上的原檔比會差正規化：檔尾換行不保留，spec 第 1 節） |

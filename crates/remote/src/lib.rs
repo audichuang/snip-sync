@@ -20,17 +20,35 @@ pub(crate) mod copyserve;
 pub(crate) mod gitserve;
 pub(crate) mod jobs;
 pub(crate) mod pasteserve;
+pub mod pastetarget;
+pub(crate) mod prepared;
 pub mod proto;
 pub mod ssh;
 pub mod worker;
 
 pub use client::{Client, Connection, RemoteHost, RemoteRepo, Transport};
+pub use pastetarget::{
+	FilePastePlan, PasteError, PasteRoute, PasteTarget, REPO_BUSY_TEXT,
+};
 pub use proto::{
 	DirEntry, ErrorCode, ExportTarget, GitQuery, GitReply, ImportExpect,
 	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,
 	Request, Response, ScannedRepo, PROTOCOL_MAX,
 };
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
+
+/// Typed reason a transport ended before the worker's hello. Keep this
+/// apart from its human-facing message so callers never parse SSH text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectFailureKind {
+	Io(io::ErrorKind),
+	TransportClosed,
+	TimedOut,
+	Authentication,
+	WorkerUnavailable,
+	Protocol,
+	Other,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
@@ -39,6 +57,11 @@ pub enum RemoteError {
 	/// The worker did not start: ssh's message, or a missing snip.
 	#[error("{0}")]
 	Connect(String),
+	#[error("{message}")]
+	Start {
+		kind: ConnectFailureKind,
+		message: String,
+	},
 	/// The worker answered with an error.
 	#[error("{message}")]
 	Refused { code: ErrorCode, message: String },
@@ -59,6 +82,54 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
+	/// Whether a caller may schedule another *read* attempt. This does
+	/// not authorize retrying a write whose outcome may be unknown.
+	pub fn is_transient_read_failure(&self) -> bool {
+		match self {
+			Self::Io(error) => transient_io(error.kind()),
+			Self::Start {
+				kind: ConnectFailureKind::Io(kind),
+				..
+			} => transient_io(*kind),
+			Self::TimedOut
+			| Self::Start {
+				kind:
+					ConnectFailureKind::TransportClosed
+					| ConnectFailureKind::TimedOut,
+				..
+			} => true,
+			Self::Refused {
+				code: ErrorCode::Busy | ErrorCode::Timeout,
+				..
+			} => true,
+			_ => false,
+		}
+	}
+
+	/// Whether restoring a remote tab may try the open again. Wider than
+	/// [`Self::is_transient_read_failure`], which the scan and paste paths
+	/// keep: a start failure nobody classified (a network or a folder not
+	/// up yet, ssh's own words) retries, and so does a folder that is not
+	/// there yet. The known permanent ones stop: a refused permission, a
+	/// worker that is missing, too old or speaks another protocol. Only
+	/// a folder open reaches this, never a write: an outcome-unknown write
+	/// is not retried through it.
+	pub fn is_restore_retryable(&self) -> bool {
+		match self {
+			Self::Start { kind, .. } => !matches!(
+				kind,
+				ConnectFailureKind::Authentication
+					| ConnectFailureKind::WorkerUnavailable
+					| ConnectFailureKind::Protocol
+			),
+			Self::Refused {
+				code: ErrorCode::NotFound | ErrorCode::Busy | ErrorCode::Timeout,
+				..
+			} => true,
+			_ => self.is_transient_read_failure(),
+		}
+	}
+
 	/// The request may have reached the worker and run there, but no answer
 	/// came back: after a write, whether it happened is unknown. A refusal,
 	/// a worker that never started, or one too old answered (or never got
@@ -76,6 +147,20 @@ impl RemoteError {
 			_ => None,
 		}
 	}
+}
+
+fn transient_io(kind: io::ErrorKind) -> bool {
+	matches!(
+		kind,
+		io::ErrorKind::UnexpectedEof
+			| io::ErrorKind::ConnectionReset
+			| io::ErrorKind::ConnectionAborted
+			| io::ErrorKind::BrokenPipe
+			| io::ErrorKind::TimedOut
+			| io::ErrorKind::WouldBlock
+			| io::ErrorKind::ConnectionRefused
+			| io::ErrorKind::NotConnected
+	)
 }
 
 /// The app's config folder, shared by the desktop app and the CLI.

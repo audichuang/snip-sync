@@ -214,6 +214,15 @@ printf 'outer committed\n' > outer/committed.txt
 (cd outer && \$G add committed.txt && \$G commit -q -m "outer commit")
 printf 'outer dirty\n' > outer/outer-dirty.txt
 printf 'inner file\n' > outer/inner/file.txt
+
+# A merge's all-parent union includes alpha, although the first parent
+# already contains it. The preview must not invent an addition for alpha.
+g_init merge-preview
+(cd merge-preview && \$G commit -q --allow-empty -m base && \$G branch side)
+printf 'first-parent content\n' > merge-preview/alpha.txt
+(cd merge-preview && \$G add alpha.txt && \$G commit -q -m alpha && \$G checkout -q side)
+printf 'side content\n' > merge-preview/beta.txt
+(cd merge-preview && \$G add beta.txt && \$G commit -q -m beta && \$G checkout -q main && \$G merge -q --no-ff side -m merge)
 EOF
 
 echo "== connect"
@@ -280,6 +289,23 @@ if w <<<"[ -L '$WD/edge/inner-link' ]"; then
 	check "a folder symlink inside the workspace lists as a folder" bash -c "'$SNIP' remote ls h $WD/edge | grep -qx inner-link/"
 else
 	skip "a symlink inside the workspace is followed" "no symlinks on the worker"
+fi
+
+echo "== merge preview"
+merge_tip=$(w <<<"git -C '$WD/merge-preview' rev-parse HEAD")
+merge_union=$("$SNIP" remote show h "$WD/merge-preview" "$merge_tip")
+check "merge union retains unchanged first-parent path" grep -q 'alpha.txt' <<<"$merge_union"
+check "merge union retains added first-parent path" grep -q 'beta.txt' <<<"$merge_union"
+merge_alpha=$("$SNIP" remote diff h "$WD/merge-preview" alpha.txt --commit "$merge_tip")
+check "unchanged merge preview is plain content, without invented addition" test "$merge_alpha" = 'first-parent content'
+merge_beta=$("$SNIP" remote diff h "$WD/merge-preview" beta.txt --commit "$merge_tip")
+check "merge preview still shows actual first-parent addition" grep -qx '+side content' <<<"$merge_beta"
+merge_payload=$("$SNIP" remote copy-commits h "$WD/merge-preview" "$merge_tip" --stdout)
+check "merge replay exports actual first-parent delta" grep -q '"path":"beta.txt"' <<<"$merge_payload"
+if [[ "$merge_payload" == *'"path":"alpha.txt"'* ]]; then
+	bad "merge replay exports unchanged first-parent path"
+else
+	ok "merge replay omits unchanged first-parent path"
 fi
 
 echo "== byte for byte"
@@ -428,8 +454,23 @@ check "$pasted pasted files on the worker identical to a local paste" test "$dif
 
 w <<<"cd '$WD/pastews' && git init -q repo"
 printf '// FILE: repo/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n' >"$MASTER/git-payload.txt"
-"$SNIP" remote paste h "$WD/pastews" --apply --stdin <"$MASTER/git-payload.txt" >/dev/null 2>&1
+protected_plan=$("$SNIP" remote paste h "$WD/pastews" --dry-run --stdin <"$MASTER/git-payload.txt" 2>/dev/null)
+check "protected preview names the rejected path" grep -Fq 'repo/.git/hooks/pre-commit' <<<"$protected_plan"
+check "protected preview retains the contract reason" grep -Fq 'UNRESOLVED_PATH' <<<"$protected_plan"
+check "protected preview explains Git metadata protection" grep -Fiq 'protected Git metadata' <<<"$protected_plan"
+protected_result=$("$SNIP" remote paste h "$WD/pastews" --apply --stdin <"$MASTER/git-payload.txt" 2>&1)
+check "all-skipped paste reports one planned skip" grep -Fq 'No actionable files found. Skipped 1.' <<<"$protected_result"
 check "a payload entry inside .git is skipped" w <<<"test ! -e '$WD/pastews/repo/.git/hooks/pre-commit'"
+
+# Planning skips and the user's keep-existing choice contribute once each.
+cat "$MASTER/git-payload.txt" >"$MASTER/mixed-skips-payload.txt"
+printf '\n// FILE: repo/skipped-feedback.txt\nallowed\n' >>"$MASTER/mixed-skips-payload.txt"
+mixed_result=$("$SNIP" remote paste h "$WD/pastews" --apply --stdin <"$MASTER/mixed-skips-payload.txt" 2>/dev/null)
+check "mixed paste counts one create and one planned skip" test "$mixed_result" = 'Created 1, Skipped 1'
+kept_result=$("$SNIP" remote paste h "$WD/pastews" --apply --skip-existing --stdin <"$MASTER/mixed-skips-payload.txt" 2>/dev/null)
+check "planned and existing skips are counted once each" test "$kept_result" = 'Skipped 2'
+check "mixed paste writes the legal file" w <<<"test \"\$(cat '$WD/pastews/repo/skipped-feedback.txt')\" = allowed"
+check "mixed paste still protects Git metadata" w <<<"test ! -e '$WD/pastews/repo/.git/hooks/pre-commit'"
 err=$("$SNIP" remote paste h "$WD/pastews" --in repo/.git --apply --overwrite --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
 rc=$?
 if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/pastews/repo/.git/a.txt'"; then

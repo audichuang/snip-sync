@@ -387,6 +387,31 @@ impl WorkbenchModel {
 							&self.probes,
 							"btn-welcome-open-folder",
 						)),
+					)
+					// A restored remote folder that failed: Refresh tries it
+					// now, without waiting out its backoff.
+					.when(
+						self.remote
+							.restoring
+							.as_ref()
+							.is_some_and(|r| r.failed.is_some())
+							&& !self.remote.busy,
+						|d| {
+							d.child(
+								icon_button(
+									"btn-refresh",
+									Icon::Refresh,
+									t("btn_refresh", loc),
+									true,
+									65,
+								)
+								.debug_selector(|| "btn-refresh".into())
+								.on_click(cx.listener(|this, _, _, cx| {
+									this.reload_repos(cx)
+								}))
+								.children(probe(&self.probes, "btn-refresh")),
+							)
+						},
 					),
 			)
 			.children(probe(&self.probes, "workspace-closed"))
@@ -416,6 +441,7 @@ impl WorkbenchModel {
 		                tooltip: String| {
 			div()
 				.id(id)
+				.debug_selector(move || id.into())
 				.relative()
 				.flex()
 				.items_center()
@@ -558,6 +584,7 @@ impl WorkbenchModel {
 							true,
 							5,
 						)
+						.debug_selector(|| "btn-refresh".into())
 						.on_click(
 							cx.listener(|this, _, _, cx| this.reload_repos(cx)),
 						)
@@ -743,6 +770,7 @@ impl WorkbenchModel {
 					};
 					div()
 						.id(SharedString::from(it.id.clone()))
+						.debug_selector(|| it.id.clone())
 						.relative()
 						.w_full()
 						.flex()

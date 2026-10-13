@@ -8,8 +8,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use snip_core::workspace::{DirectoryScan, ScanBudget, ScanError, ScanStatus};
 
@@ -107,7 +107,22 @@ struct State {
 	dir_cap: AtomicUsize,
 	jobs: crate::jobs::Jobs,
 	repo_cache: Mutex<crate::gitserve::RepoCache>,
+	prepared: crate::prepared::PreparedCache,
 	stop: AtomicBool,
+	scan_faults: Mutex<std::collections::HashMap<String, ScanFault>>,
+	connections: AtomicUsize,
+	open_sequence: AtomicUsize,
+	hello_hold: (Mutex<bool>, Condvar),
+	active_hellos: AtomicUsize,
+	max_hellos: AtomicUsize,
+}
+
+#[derive(Default)]
+struct ScanFault {
+	eofs: usize,
+	refusal: Option<ErrorCode>,
+	requests: usize,
+	first_open: Option<usize>,
 }
 
 /// One worker's state. `snip serve --stdio` serves a single connection;
@@ -121,6 +136,7 @@ impl Worker {
 		Self {
 			state: Arc::new(State {
 				name: opts.name,
+				prepared: crate::prepared::PreparedCache::new(),
 				max_protocol: opts.max_protocol,
 				git_requests: AtomicUsize::new(0),
 				deadlines: Mutex::new((
@@ -131,6 +147,12 @@ impl Worker {
 				jobs: crate::jobs::Jobs::new(),
 				repo_cache: Mutex::new(crate::gitserve::RepoCache::new()),
 				stop: AtomicBool::new(false),
+				scan_faults: Mutex::default(),
+				connections: AtomicUsize::new(0),
+				open_sequence: AtomicUsize::new(0),
+				hello_hold: (Mutex::new(false), Condvar::new()),
+				active_hellos: AtomicUsize::new(0),
+				max_hellos: AtomicUsize::new(0),
 			}),
 		}
 	}
@@ -141,6 +163,7 @@ impl Worker {
 		reader: impl Read,
 		writer: impl Write,
 	) -> Result<(), RemoteError> {
+		self.state.connections.fetch_add(1, Ordering::SeqCst);
 		serve(reader, writer, &self.state)
 	}
 
@@ -168,8 +191,91 @@ impl Worker {
 	}
 
 	#[doc(hidden)]
+	pub fn set_prepared_cache_limits_for_tests(
+		&self,
+		bytes: usize,
+		entries: usize,
+		ttl: Duration,
+	) {
+		self.state
+			.prepared
+			.set_limits_for_tests(bytes, entries, ttl);
+	}
+	#[doc(hidden)]
+	pub fn expire_prepared_for_tests(&self) {
+		self.state.prepared.expire_for_tests();
+	}
+	#[doc(hidden)]
+	pub fn prepared_cache_usage_for_tests(&self) -> (usize, usize) {
+		self.state.prepared.usage_for_tests()
+	}
+
+	#[doc(hidden)]
 	pub fn set_deadlines_for_tests(&self, view: Duration, scan: Duration) {
 		*lock(&self.state.deadlines) = (view, scan);
+	}
+
+	/// Inject only scan failures, after a normal hello/open/list. EOF closes
+	/// the actual stream. No failure is enabled unless a test calls this.
+	#[doc(hidden)]
+	pub fn set_scan_failures_for_tests(
+		&self,
+		workspace: &str,
+		eofs: usize,
+		refusal: Option<ErrorCode>,
+	) {
+		lock(&self.state.scan_faults).insert(
+			workspace.into(),
+			ScanFault {
+				eofs,
+				refusal,
+				requests: 0,
+				first_open: None,
+			},
+		);
+	}
+
+	#[doc(hidden)]
+	pub fn scan_requests_for_tests(&self, workspace: &str) -> usize {
+		lock(&self.state.scan_faults)
+			.get(workspace)
+			.map_or(0, |f| f.requests)
+	}
+
+	#[doc(hidden)]
+	pub fn started_connections_for_tests(&self) -> usize {
+		self.state.connections.load(Ordering::SeqCst)
+	}
+
+	/// First successful opens, only for explicitly fault-configured test
+	/// workspaces. Storage stays bounded by those configured entries.
+	#[doc(hidden)]
+	pub fn opened_workspaces_for_tests(&self) -> Vec<String> {
+		let mut opened: Vec<_> = lock(&self.state.scan_faults)
+			.iter()
+			.filter_map(|(path, fault)| {
+				fault.first_open.map(|order| (order, path.clone()))
+			})
+			.collect();
+		opened.sort_by_key(|(order, _)| *order);
+		opened.into_iter().map(|(_, path)| path).collect()
+	}
+
+	/// Holds real hello responses for bounded handshake-admission tests.
+	#[doc(hidden)]
+	pub fn hold_hellos_for_tests(&self, hold: bool) {
+		*lock(&self.state.hello_hold.0) = hold;
+		self.state.hello_hold.1.notify_all();
+	}
+
+	#[doc(hidden)]
+	pub fn active_hellos_for_tests(&self) -> usize {
+		self.state.active_hellos.load(Ordering::SeqCst)
+	}
+
+	#[doc(hidden)]
+	pub fn max_hellos_for_tests(&self) -> usize {
+		self.state.max_hellos.load(Ordering::SeqCst)
 	}
 
 	/// Shrinks a ListDir reply's entry cap, so the truncation path is
@@ -192,6 +298,7 @@ impl Worker {
 	/// Cancels every job; each connection ends at its next request.
 	pub fn stop(&self) {
 		self.state.stop.store(true, Ordering::SeqCst);
+		self.hold_hellos_for_tests(false);
 		self.state.jobs.cancel_all();
 	}
 }
@@ -259,6 +366,28 @@ fn serve(
 			return Ok(());
 		}
 	};
+	let active = state.active_hellos.fetch_add(1, Ordering::SeqCst) + 1;
+	state.max_hellos.fetch_max(active, Ordering::SeqCst);
+	let held = || -> Result<(), RemoteError> {
+		let end = Instant::now() + Duration::from_secs(15);
+		let mut hold = lock(&state.hello_hold.0);
+		while *hold {
+			let remaining = end.saturating_duration_since(Instant::now());
+			if remaining.is_zero() {
+				return Err(RemoteError::TimedOut);
+			}
+			hold = state
+				.hello_hold
+				.1
+				.wait_timeout(hold, remaining)
+				.unwrap_or_else(PoisonError::into_inner)
+				.0;
+		}
+		Ok(())
+	};
+	let held = held();
+	state.active_hellos.fetch_sub(1, Ordering::SeqCst);
+	held?;
 	write_frame(
 		&mut writer,
 		&Response::Hello {
@@ -368,6 +497,29 @@ fn serve(
 		match request {
 			Request::ScanRepos { workspace, under } => {
 				state.git_requests.fetch_add(1, Ordering::SeqCst);
+				let fault = {
+					let mut faults = lock(&state.scan_faults);
+					faults.get_mut(&workspace).map(|fault| {
+						fault.requests = fault.requests.saturating_add(1);
+						if fault.eofs > 0 {
+							fault.eofs -= 1;
+							Err(())
+						} else {
+							Ok(fault.refusal)
+						}
+					})
+				};
+				match fault {
+					Some(Err(())) => return Ok(()),
+					Some(Ok(Some(code))) => {
+						crate::jobs::write_response(
+							&mut writer,
+							&error(code, "injected scan refusal".into()),
+						)?;
+						continue;
+					}
+					_ => {}
+				}
 				if negotiated < crate::proto::GIT_VIEWS_VERSION {
 					crate::jobs::write_response(
 						&mut writer,
@@ -539,6 +691,60 @@ fn serve(
 					},
 				)?;
 			}
+			Request::PrepareImport {
+				workspace,
+				dest,
+				text,
+				mapping,
+				retain,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					crate::proto::PREPARED_IMPORT_VERSION,
+					|root, cancel| {
+						crate::pasteserve::prepare_import(
+							root,
+							&dest,
+							text,
+							mapping,
+							retain,
+							&state.prepared,
+							cancel,
+						)
+					},
+				)?;
+			}
+			Request::ApplyPrepared {
+				workspace,
+				dest,
+				token,
+				selection,
+				expect,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PasteApply,
+					crate::proto::PREPARED_IMPORT_VERSION,
+					|root, cancel| {
+						crate::pasteserve::apply_prepared(
+							root,
+							&dest,
+							&token,
+							&selection,
+							&expect,
+							&state.prepared,
+							cancel,
+						)
+					},
+				)?;
+			}
 			Request::ImportPlan {
 				workspace,
 				dest,
@@ -578,6 +784,25 @@ fn serve(
 						crate::pasteserve::import_apply(
 							root, &dest, &text, &mapping, &selection, &expect,
 							cancel,
+						)
+					},
+				)?;
+			}
+			Request::ReplayRead {
+				workspace,
+				path,
+				limit,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					crate::proto::REPLAY_PREVIEW_VERSION,
+					|root, cancel| {
+						crate::pasteserve::replay_read(
+							root, &path, limit, cancel,
 						)
 					},
 				)?;
@@ -787,11 +1012,20 @@ impl State {
 				error(ErrorCode::BadRequest, "hello was already sent".into())
 			}
 			Request::OpenWorkspace { path } => match SharedRoot::open(&path) {
-				Ok(root) => Response::Workspace(RemoteWorkspace {
-					id: root.id,
-					name: root.name,
-					path: root.path.display().to_string(),
-				}),
+				Ok(root) => {
+					if let Some(fault) =
+						lock(&self.scan_faults).get_mut(&root.id)
+					{
+						fault.first_open.get_or_insert_with(|| {
+							self.open_sequence.fetch_add(1, Ordering::SeqCst)
+						});
+					}
+					Response::Workspace(RemoteWorkspace {
+						id: root.id,
+						name: root.name,
+						path: root.path.display().to_string(),
+					})
+				}
 				Err(err) => io_error(err),
 			},
 			Request::ListDir { workspace, path } => self
@@ -825,7 +1059,10 @@ impl State {
 			| Request::ExportCommits { .. }
 			| Request::ExportChanges { .. }
 			| Request::ImportPlan { .. }
+			| Request::PrepareImport { .. }
+			| Request::ApplyPrepared { .. }
 			| Request::ImportApply { .. }
+			| Request::ReplayRead { .. }
 			| Request::ReplayPlan { .. }
 			| Request::ReplayApply { .. }
 			| Request::Chunk { .. }

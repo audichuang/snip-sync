@@ -805,8 +805,9 @@ pub fn git_preview_with(
 /// [`git_preview_with`] for a change the caller listed itself (`path` and
 /// `change` from [`gitsrc::list_changed_paths_with`]): nothing is listed or,
 /// for a commit whose `parents` are known (a log row), resolved again; one
-/// `cat-file` and one `diff`. Only for paths from such a listing, never an
-/// untrusted path.
+/// `cat-file` and one `diff`. An empty new-file patch also checks whether
+/// the path exists in the diff base. Only for paths from such a listing,
+/// never an untrusted path.
 pub fn git_preview_for(
 	git: &Git,
 	source: &GitSource,
@@ -869,7 +870,8 @@ fn diff_revs(
 }
 
 /// Runs the path's `diff` for `revs` and builds the preview around
-/// `content`; a new file with no diff text gets a synthesized patch.
+/// `content`; a file absent from the base with no diff text gets a
+/// synthesized addition patch.
 fn finish_preview(
 	git: &Git,
 	revs: Vec<String>,
@@ -885,7 +887,7 @@ fn finish_preview(
 		"--no-textconv".into(),
 		"--no-color".into(),
 	];
-	args.extend(revs);
+	args.extend(revs.iter().cloned());
 	args.extend(["--".into(), format!(":(literal){path}")]);
 	let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
 	let diff = git.run_diff_with(&str_args, opts)?;
@@ -894,7 +896,10 @@ fn finish_preview(
 	} else {
 		(diff.stdout, false)
 	};
-	if patch.is_empty() && change == Some(crate::format::ChangeType::New) {
+	if patch.is_empty()
+		&& change == Some(crate::format::ChangeType::New)
+		&& !preview_base_contains(git, &revs, path, opts)?
+	{
 		if let Some(content) = &content {
 			let (synth, cut) = new_file_patch(path, content, max);
 			if cut && opts.overflow == Overflow::Error {
@@ -914,6 +919,44 @@ fn finish_preview(
 		patch: String::from_utf8_lossy(&patch).into_owned(),
 		patch_truncated,
 	})
+}
+
+/// A merge's all-parent union may label a path new even though it already
+/// exists unchanged in the first parent used for this preview. Git's empty
+/// diff is authoritative in that case. Only a truly absent base path (such
+/// as an untracked file) may fall back to a synthetic addition.
+fn preview_base_contains(
+	git: &Git,
+	revs: &[String],
+	path: &str,
+	opts: &RunOptions,
+) -> Result<bool, GitError> {
+	let base = if revs[0] == "--cached" {
+		let Some(head) = git.head_with(opts)? else {
+			return Ok(false);
+		};
+		head
+	} else {
+		revs[0].clone()
+	};
+	// Metadata must be complete even when the patch may be truncated.
+	let strict = RunOptions {
+		overflow: Overflow::Error,
+		..opts.clone()
+	};
+	let out = git.run_with(
+		&[
+			"--literal-pathspecs",
+			"ls-tree",
+			"-z",
+			"--name-only",
+			&base,
+			"--",
+			path,
+		],
+		&strict,
+	)?;
+	Ok(!out.stdout.is_empty())
 }
 
 /// Drops the hunk the cut went through: the last one started.
@@ -1217,6 +1260,18 @@ mod tests {
 			&RunOptions::preview(None),
 		)
 		.unwrap();
+		assert_eq!(
+			cut,
+			git_preview_for(
+				&git,
+				&GitSource::Working,
+				"new.txt",
+				crate::format::ChangeType::New,
+				None,
+				&RunOptions::preview(None),
+			)
+			.unwrap()
+		);
 		assert!(cut.patch_truncated);
 		assert!(cut.patch.len() <= PREVIEW_LIMIT);
 		assert_hunks_consistent(&cut.patch);
@@ -1226,6 +1281,15 @@ mod tests {
 			&GitSource::Working,
 			"new.txt",
 			&strict_preview()
+		)
+		.is_err());
+		assert!(git_preview_for(
+			&git,
+			&GitSource::Working,
+			"new.txt",
+			crate::format::ChangeType::New,
+			None,
+			&strict_preview(),
 		)
 		.is_err());
 
@@ -2135,6 +2199,202 @@ mod tests {
 		let shallow = Git::open(&clone.path().join("c")).unwrap();
 		let snap = refs_with(&shallow, &opts).unwrap();
 		assert_eq!(snap.shallow, vec![snap.head.clone().unwrap()]);
+	}
+
+	#[test]
+	fn merge_preview_with_preserves_unchanged_first_parent_content() {
+		assert_merge_preview_first_parent(false);
+	}
+
+	#[test]
+	fn merge_preview_for_preserves_unchanged_first_parent_content() {
+		assert_merge_preview_first_parent(true);
+	}
+
+	fn assert_merge_preview_first_parent(known_change: bool) {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		fs::write(root.join("base.txt"), "base\n").unwrap();
+		commit(root, "base");
+		run(root, &["branch", "side"]);
+		fs::create_dir(root.join("alpha")).unwrap();
+		fs::write(root.join("alpha/feature.txt"), "feature branch content\n")
+			.unwrap();
+		let first = commit(root, "main feature");
+		run(root, &["checkout", "-q", "side"]);
+		fs::create_dir(root.join("beta")).unwrap();
+		fs::write(root.join("beta/fix.txt"), "fix branch content\n").unwrap();
+		let second = commit(root, "side fix");
+		run(root, &["checkout", "-q", "main"]);
+		run(
+			root,
+			&[
+				"-c",
+				"user.name=A",
+				"-c",
+				"user.email=a@x",
+				"merge",
+				"-q",
+				"--no-ff",
+				"-m",
+				"merge side",
+				"side",
+			],
+		);
+		let merge = run(root, &["rev-parse", "HEAD"]);
+		let parents = [first.clone(), second];
+		let git = Git::open(root).unwrap();
+		let source = GitSource::Commit(merge.clone());
+		let opts = RunOptions::default();
+		let mut files =
+			gitsrc::list_changed_paths_with(&git, &source, &opts).unwrap();
+		files.sort_by(|a, b| a.0.cmp(&b.0));
+		assert_eq!(
+			files,
+			[
+				(
+					"alpha/feature.txt".into(),
+					Some(crate::format::ChangeType::New)
+				),
+				("beta/fix.txt".into(), Some(crate::format::ChangeType::New)),
+			],
+			"the all-parent union must retain both files"
+		);
+		let export = crate::transfer::plan_commit_export_exact_with(
+			&git,
+			&merge,
+			std::slice::from_ref(&merge),
+			&opts,
+			crate::transfer::CLIPBOARD_PAYLOAD_MAX,
+		)
+		.unwrap();
+		assert_eq!(export.payload.commits[0].files.len(), 1);
+		assert_eq!(export.payload.commits[0].files[0].path, "beta/fix.txt");
+		assert_eq!(
+			export.payload.commits[0].files[0].change,
+			crate::commits::FileChange::Added
+		);
+		let preview = |path: &str| {
+			if known_change {
+				let change =
+					files.iter().find(|f| f.0 == path).unwrap().1.unwrap();
+				git_preview_for(
+					&git,
+					&source,
+					path,
+					change,
+					Some(&parents),
+					&opts,
+				)
+			} else {
+				git_preview_with(&git, &source, path, &opts)
+			}
+			.unwrap()
+		};
+		let added = preview("beta/fix.txt");
+		assert_eq!(added.content.as_deref(), Some("fix branch content\n"));
+		assert!(added.patch.contains("+fix branch content\n"));
+		assert!(!added.patch_truncated);
+		assert_hunks_consistent(&added.patch);
+		assert!(run(
+			root,
+			&["diff", &first, &merge, "--", "alpha/feature.txt"]
+		)
+		.is_empty());
+		let unchanged = preview("alpha/feature.txt");
+		assert_eq!(
+			unchanged.content.as_deref(),
+			Some("feature branch content\n")
+		);
+		assert_eq!(
+			unchanged.patch, "",
+			"unchanged first-parent file has no hunks"
+		);
+		assert!(!unchanged.patch_truncated);
+		// Replaying the same merge on its first parent still writes only
+		// beta and reaches the merge's tree without touching alpha.
+		run(root, &["reset", "-q", "--hard", &first]);
+		run(root, &["config", "user.name", "Replay"]);
+		run(root, &["config", "user.email", "replay@example.com"]);
+		let result = crate::transfer::CommitReplayPreview::capture(
+			root,
+			&export.payload,
+		)
+		.unwrap()
+		.apply()
+		.unwrap();
+		assert!(result.failure.is_none(), "{:?}", result.failure);
+		assert_eq!(result.created.len(), 1);
+		assert_eq!(
+			run(root, &["diff", "--name-only", &first, "HEAD"]),
+			"beta/fix.txt"
+		);
+		assert_eq!(
+			run(root, &["rev-parse", "HEAD^{tree}"]),
+			run(root, &["rev-parse", &format!("{merge}^{{tree}}")])
+		);
+	}
+
+	#[test]
+	fn new_file_previews_cover_untracked_staged_root_and_later_commits() {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path();
+		run(root, &["init", "-q", "-b", "main"]);
+		let git = Git::open(root).unwrap();
+		let opts = RunOptions::default();
+		let check = |source: &GitSource,
+		             parents: Option<&[String]>,
+		             paths: [&str; 2]| {
+			let files =
+				gitsrc::list_changed_paths_with(&git, source, &opts).unwrap();
+			for (path, content) in paths.into_iter().zip(["fresh\n", ""]) {
+				let change =
+					files.iter().find(|f| f.0 == path).unwrap().1.unwrap();
+				assert_eq!(change, crate::format::ChangeType::New);
+				let listed =
+					git_preview_with(&git, source, path, &opts).unwrap();
+				let known =
+					git_preview_for(&git, source, path, change, parents, &opts)
+						.unwrap();
+				assert_eq!(listed, known, "{source:?}: {path}");
+				assert_eq!(listed.content.as_deref(), Some(content));
+				assert!(!listed.patch_truncated);
+				if content.is_empty() {
+					assert!(
+						!listed.patch.contains("@@"),
+						"empty file has no hunks"
+					);
+				} else {
+					assert!(
+						listed.patch.contains("+fresh\n"),
+						"{source:?}: {path}"
+					);
+					assert_hunks_consistent(&listed.patch);
+				}
+			}
+		};
+		let paths = ["[new].txt", "empty.txt"];
+		fs::write(root.join(paths[0]), "fresh\n").unwrap();
+		fs::write(root.join(paths[1]), "").unwrap();
+		check(&GitSource::Working, None, paths);
+		run(root, &["add", "."]);
+		check(&GitSource::Staged, None, paths);
+		let first = commit(root, "root");
+		check(&GitSource::Commit(first.clone()), Some(&[]), paths);
+		let added = ["[added].txt", "empty-added.txt"];
+		fs::write(root.join(added[0]), "fresh\n").unwrap();
+		fs::write(root.join(added[1]), "").unwrap();
+		check(&GitSource::Working, None, added);
+		run(root, &["add", "."]);
+		check(&GitSource::Staged, None, added);
+		let second = commit(root, "add files");
+		check(
+			&GitSource::Commit(second.clone()),
+			Some(std::slice::from_ref(&first)),
+			added,
+		);
+		check(&GitSource::Range(first, second), None, added);
 	}
 
 	#[test]

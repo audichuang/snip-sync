@@ -68,13 +68,83 @@ pub(crate) fn remember_recent(
 
 /// The hosts of `~/.ssh/config`, reached through ssh.
 pub fn load_hosts() -> Vec<RemoteHost> {
+	#[cfg(test)]
+	if let Some(hosts) = TEST_HOSTS.with(|hosts| hosts.borrow().clone()) {
+		return hosts;
+	}
 	snip_remote::ssh::config_hosts()
 		.iter()
 		.map(|h| RemoteHost::ssh(h))
 		.collect()
 }
 
-/// The remote workspace open in place of a local one.
+#[cfg(test)]
+thread_local! {
+	static TEST_HOSTS: std::cell::RefCell<Option<Vec<RemoteHost>>> = const { std::cell::RefCell::new(None) };
+	static TEST_RESTORE_DELAY: std::cell::RefCell<Option<(String, std::time::Duration)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test-scoped host discovery without changing the user's SSH config.
+#[cfg(test)]
+pub(crate) fn with_test_hosts<R>(
+	hosts: Vec<RemoteHost>,
+	f: impl FnOnce() -> R,
+) -> R {
+	struct Reset(Option<Vec<RemoteHost>>);
+	impl Drop for Reset {
+		fn drop(&mut self) {
+			TEST_HOSTS.with(|hosts| *hosts.borrow_mut() = self.0.take());
+		}
+	}
+	let _reset = Reset(TEST_HOSTS.with(|slot| slot.replace(Some(hosts))));
+	f()
+}
+
+/// Holds only a selected saved tab at the existing async pre-probe seam.
+#[cfg(test)]
+pub(crate) fn with_test_restore_delay<R>(
+	path: &str,
+	delay: std::time::Duration,
+	f: impl FnOnce() -> R,
+) -> R {
+	struct Reset(Option<(String, std::time::Duration)>);
+	impl Drop for Reset {
+		fn drop(&mut self) {
+			TEST_RESTORE_DELAY.with(|slot| *slot.borrow_mut() = self.0.take());
+		}
+	}
+	let _reset = Reset(
+		TEST_RESTORE_DELAY
+			.with(|slot| slot.replace(Some((path.into(), delay)))),
+	);
+	f()
+}
+
+/// A validated remote folder and its live client awaiting workspace handoff.
+#[derive(Clone)]
+pub struct OpenedRemote {
+	pub client: Arc<Client>,
+	pub workspace: RemoteWorkspace,
+}
+
+impl std::fmt::Debug for OpenedRemote {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("OpenedRemote")
+			.field("host", self.client.host())
+			.field("workspace", &self.workspace)
+			.finish()
+	}
+}
+
+impl PartialEq for OpenedRemote {
+	fn eq(&self, other: &Self) -> bool {
+		self.client.host() == other.client.host()
+			&& self.workspace == other.workspace
+	}
+}
+impl Eq for OpenedRemote {}
+
+/// The successfully probed client is carried into the workspace session.
 #[derive(Clone)]
 pub struct RemoteSession {
 	pub client: Arc<Client>,
@@ -84,17 +154,26 @@ pub struct RemoteSession {
 }
 
 impl RemoteSession {
+	#[cfg(test)]
 	pub fn new(host: RemoteHost, workspace: RemoteWorkspace) -> Self {
+		Self::from_opened(OpenedRemote {
+			client: Arc::new(Client::new(host, device_name())),
+			workspace,
+		})
+	}
+
+	fn from_opened(opened: OpenedRemote) -> Self {
+		let OpenedRemote { client, workspace } = opened;
 		use std::hash::{Hash, Hasher};
 		let mut h = std::collections::hash_map::DefaultHasher::new();
 		workspace.id.hash(&mut h);
 		let root = PathBuf::from(format!(
 			"snip-remote://{}/{:016x}",
-			host.name,
+			client.host().name,
 			h.finish()
 		));
 		Self {
-			client: Arc::new(Client::new(host, device_name())),
+			client,
 			workspace,
 			root,
 		}
@@ -202,9 +281,46 @@ pub struct MasterState {
 	pub browse: Option<Browse>,
 	pub(crate) browse_seq: u64,
 	pub scan_error: Option<Msg>,
+	/// A scan still in flight or waiting to retry. Kept across a cancelled
+	/// drain so an initial scan with no selected repository can resume.
+	pub(crate) scan_recovery: Option<ScanRecovery>,
+	pub(crate) restore_priority: Option<RestorePriority>,
 	/// The remote folder this tab was reopened for at launch, until it
 	/// opens: the tab shows and saves it meanwhile, and after a failure.
 	pub restoring: Option<Restoring>,
+}
+
+/// Only the first probe of saved tabs on the active tab's host is ordered.
+/// Other hosts, later retries and established-session reads are independent.
+pub(crate) enum RestorePriority {
+	First(Arc<std::sync::atomic::AtomicBool>),
+	After(Arc<std::sync::atomic::AtomicBool>),
+}
+
+pub(crate) const RESTORE_PRIORITY_LIMIT: std::time::Duration =
+	std::time::Duration::from_secs(30);
+
+struct ReleaseRestorePriority(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ReleaseRestorePriority {
+	fn drop(&mut self) {
+		self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+	}
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScanRecovery {
+	pub under: Option<PathBuf>,
+	pub wipe: bool,
+	pub retries: u8,
+}
+
+/// Three additional attempts, then leave the visible error for Refresh.
+pub(crate) fn scan_retry_delay(retries: u8) -> Option<std::time::Duration> {
+	match retries {
+		0..=2 => Some(std::time::Duration::from_secs(1 << retries)),
+		_ => None,
+	}
 }
 
 /// A remote tab of the last session, being reconnected.
@@ -760,11 +876,41 @@ impl WorkbenchModel {
 		// timeout and the hello's.
 		let cancel = snip_core::gitrun::CancelToken::new();
 		let token = cancel.clone();
+		// Construct the release guard before spawning: dropping an unpolled
+		// active open must also release its background restores.
+		let (priority_wait, priority_release) =
+			match self.remote.restore_priority.take() {
+				Some(RestorePriority::First(gate)) => {
+					(None, Some(ReleaseRestorePriority(gate)))
+				}
+				Some(RestorePriority::After(gate)) => (Some(gate), None),
+				None => (None, None),
+			};
 		self.spawn_owned(
 			cx,
 			crate::lifecycle::JobKind::CancellableRead,
 			Some(cancel),
 			async move {
+				let _priority_release = priority_release;
+				if let Some(gate) = priority_wait {
+					let executor = async_app.background_executor().clone();
+					let deadline = executor.now() + RESTORE_PRIORITY_LIMIT;
+					while !gate.load(std::sync::atomic::Ordering::SeqCst)
+						&& !token.is_cancelled()
+					{
+						let remaining =
+							deadline.saturating_duration_since(executor.now());
+						if remaining.is_zero() {
+							break;
+						}
+						executor
+							.timer(
+								remaining
+									.min(std::time::Duration::from_millis(50)),
+							)
+							.await;
+					}
+				}
 				// Tests hold the open at the test clock so a user action can
 				// land while it is in flight; a cancel ends the hold as it
 				// ends a real connect.
@@ -772,12 +918,12 @@ impl WorkbenchModel {
 				if let Some(delay) = open_delay {
 					hold_open(&mut async_app, delay, &token).await;
 				}
-				let probe = host.clone();
 				let result = bg
 					.spawn(async move {
-						Client::new(probe, device_name())
-							.open_workspace_with(path.trim(), Some(&token))
-							.map_err(describe)
+						let client = Arc::new(Client::new(host, device_name()));
+						let workspace = client
+							.open_workspace_with(path.trim(), Some(&token))?;
+						Ok::<_, RemoteError>(OpenedRemote { client, workspace })
 					})
 					.await;
 				let _ = this.update(&mut async_app, |this, cx| {
@@ -799,10 +945,10 @@ impl WorkbenchModel {
 						.as_ref()
 						.is_some_and(|r| r.open_seq == Some(open_seq));
 					match result {
-						Ok(ws) => {
+						Ok(opened) => {
 							this.workspace_menu = false;
 							let target = crate::tabs::OpenTarget::Remote(
-								Box::new((host, ws)),
+								Box::new(opened),
 							);
 							if restore {
 								// The tab already stands for this folder.
@@ -812,6 +958,8 @@ impl WorkbenchModel {
 							}
 						}
 						Err(err) => {
+							let retryable = err.is_restore_retryable();
+							let err = describe(err);
 							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
 							// Also on the status bar: a reconnect on launch runs
 							// with the menu closed.
@@ -821,7 +969,7 @@ impl WorkbenchModel {
 							);
 							this.remote_note(false, err.clone(), cx);
 							if restore {
-								this.restore_failed(err, cx);
+								this.restore_failed(err, retryable, cx);
 							}
 						}
 					}
@@ -850,11 +998,31 @@ impl WorkbenchModel {
 	/// A remote tab of the last session: shown and saved as that folder
 	/// at once, connected in the background. A failure keeps the tab, says
 	/// why and tries again later.
+	#[cfg(test)]
 	pub fn restore_remote(
 		&mut self,
 		folder: RecentRemote,
 		cx: &mut Context<Self>,
 	) {
+		self.prepare_remote_restore(folder, cx);
+		self.start_remote_restore(None, cx);
+	}
+
+	/// Establish identity before starting any saved tab's background open.
+	pub(crate) fn prepare_remote_restore(
+		&mut self,
+		folder: RecentRemote,
+		cx: &mut Context<Self>,
+	) {
+		#[cfg(test)]
+		if let Some(delay) = TEST_RESTORE_DELAY.with(|slot| {
+			slot.borrow()
+				.as_ref()
+				.filter(|(path, _)| *path == folder.path)
+				.map(|(_, delay)| *delay)
+		}) {
+			self.e2e_remote_open_delay = Some(delay);
+		}
 		app_log!(
 			"[APP:REMOTE_REOPEN: host={} path={}]",
 			folder.host,
@@ -873,7 +1041,40 @@ impl WorkbenchModel {
 			attempts: 0,
 			id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
 		});
+		self.remote.restore_priority = None;
+		cx.notify();
+	}
+
+	pub(crate) fn start_remote_restore(
+		&mut self,
+		priority: Option<RestorePriority>,
+		cx: &mut Context<Self>,
+	) {
+		self.remote.restore_priority = priority;
 		self.attempt_restore(cx);
+	}
+
+	/// Refresh on a restored tab whose reconnect failed: tries it now instead
+	/// of when its backoff timer fires. Returns false when there is no failed
+	/// restore to retry (none, still in flight, or a drain is under way).
+	pub(crate) fn refresh_failed_restore(
+		&mut self,
+		cx: &mut Context<Self>,
+	) -> bool {
+		let Some(r) = self.remote.restoring.as_ref() else {
+			return false;
+		};
+		if r.failed.is_none()
+			|| r.open_seq.is_some()
+			|| self.remote.busy
+			|| self.lifecycle.is_draining()
+		{
+			return false;
+		}
+		// The attempt makes the armed timer stale: it checks `attempts`.
+		app_log!("[APP:REMOTE_RETRY: attempt={}]", r.attempts + 1);
+		self.attempt_restore(cx);
+		true
 	}
 
 	/// A stopped drain invalidated an in-flight restore. Its old transport
@@ -915,7 +1116,7 @@ impl WorkbenchModel {
 		if !self.remote.hosts.iter().any(|h| h.name == host) {
 			let why =
 				crate::i18n::tf("remote_host_missing", self.locale, &[&host]);
-			return self.restore_failed(why, cx);
+			return self.restore_failed(why, true, cx);
 		}
 		if self.remote.busy {
 			let seq = self.remote.open_seq;
@@ -925,15 +1126,23 @@ impl WorkbenchModel {
 		}
 	}
 
-	/// The reconnect failed: the tab keeps the folder and shows why, and
-	/// tries again after [`retry_delay`] unless it opened or closed
-	/// meanwhile; a try that falls in a drain waits for the next one.
-	fn restore_failed(&mut self, why: String, cx: &mut Context<Self>) {
+	/// A failure keeps the tab and its reason. A failure that may clear
+	/// (see `RemoteError::is_restore_retryable`) retries after
+	/// [`retry_delay`]; a try during a drain waits until later.
+	fn restore_failed(
+		&mut self,
+		why: String,
+		retryable: bool,
+		cx: &mut Context<Self>,
+	) {
 		let Some(r) = self.remote.restoring.as_mut() else {
 			return;
 		};
 		r.failed = Some(why);
 		r.open_seq = None;
+		if !retryable {
+			return;
+		}
 		let (attempts, id) = (r.attempts, r.id);
 		let delay = retry_delay(attempts);
 		let tab = self.ws_tab;
@@ -959,6 +1168,7 @@ impl WorkbenchModel {
 								.as_ref()
 								.and_then(|r| r.failed.clone())
 								.unwrap_or_default(),
+							true,
 							cx,
 						);
 					}
@@ -996,14 +1206,17 @@ impl WorkbenchModel {
 
 	pub(crate) fn finish_open_remote(
 		&mut self,
-		host: RemoteHost,
-		workspace: RemoteWorkspace,
+		opened: OpenedRemote,
 		cx: &mut Context<Self>,
 	) {
 		self.release_workspace_state(cx);
-		remember_recent(&mut self.remote.recent, &host.name, &workspace.id);
+		remember_recent(
+			&mut self.remote.recent,
+			&opened.client.host().name,
+			&opened.workspace.id,
+		);
 		self.remote.restoring = None;
-		let session = RemoteSession::new(host, workspace);
+		let session = RemoteSession::from_opened(opened);
 		let root = session.root.clone();
 		let label = session.label();
 		self.workspace_root = root.clone();
@@ -1029,6 +1242,32 @@ impl WorkbenchModel {
 		wipe: bool,
 		cx: &mut Context<Self>,
 	) {
+		self.launch_remote_scan_attempt(under, wipe, 0, cx);
+	}
+
+	pub(crate) fn resume_remote_scan(&mut self, cx: &mut Context<Self>) {
+		if !self.accepting_work()
+			|| !self.scan_cancel.as_ref().is_some_and(|c| c.is_cancelled())
+		{
+			return;
+		}
+		if let Some(recovery) = self.remote.scan_recovery.clone() {
+			self.launch_remote_scan_attempt(
+				recovery.under,
+				recovery.wipe,
+				recovery.retries,
+				cx,
+			);
+		}
+	}
+
+	fn launch_remote_scan_attempt(
+		&mut self,
+		under: Option<PathBuf>,
+		wipe: bool,
+		retries: u8,
+		cx: &mut Context<Self>,
+	) {
 		if !self.accepting_work() {
 			return;
 		}
@@ -1038,8 +1277,8 @@ impl WorkbenchModel {
 			}
 			None => return,
 		};
-		let under_rel = match under {
-			Some(p) => match remote_rel(&session_root, &p) {
+		let under_rel = match under.as_ref() {
+			Some(p) => match remote_rel(&session_root, p) {
 				Some(rel) => Some(rel),
 				None => return,
 			},
@@ -1051,6 +1290,11 @@ impl WorkbenchModel {
 		self.discovery_generation = self.discovery_generation.wrapping_add(1);
 		let generation = self.discovery_generation;
 		let cancel = arm_cancel(&mut self.scan_cancel);
+		self.remote.scan_recovery = Some(ScanRecovery {
+			under: under.clone(),
+			wipe,
+			retries,
+		});
 		self.is_loading = true;
 		self.set_status("status_scanning", []);
 		let lifecycle_generation = self.lifecycle.generation();
@@ -1077,15 +1321,23 @@ impl WorkbenchModel {
 						)
 					})
 					.await;
-				let _ = this.update(&mut async_app, |model, cx| {
+				let retry_delay = result.as_ref().err()
+					.filter(|err| err.is_transient_read_failure())
+					.and_then(|_| scan_retry_delay(retries));
+				let landed = this.update(&mut async_app, |model, cx| {
 					if model.discovery_generation != generation
 						|| model.lifecycle.generation() != lifecycle_generation
 					{
-						return;
+						return false;
 					}
 					match result {
 						Ok(scan) => {
+							model.remote.scan_recovery = None;
+							model.remote.scan_error = None;
 							let e = remote_scan_entries(&session_root, scan);
+							if retries > 0 {
+								app_log!("[APP:REMOTE_SCAN_RECOVERED: retries={retries} repos={}]", e.repos.len());
+							}
 							if wipe {
 								model.begin_rescan();
 							}
@@ -1118,6 +1370,9 @@ impl WorkbenchModel {
 						}
 						Err(RemoteError::Cancelled) => {}
 						Err(err) => {
+							if retry_delay.is_none() {
+								model.remote.scan_recovery = None;
+							}
 							let (msg, text) = match err {
 								RemoteError::WorkerTooOld {
 									worker,
@@ -1150,6 +1405,9 @@ impl WorkbenchModel {
 								}
 							};
 							app_log!("[APP:REMOTE_SCAN_FAILED: {text}]");
+							if let Some(delay) = retry_delay {
+								app_log!("[APP:REMOTE_SCAN_RETRY: attempt={} delay_ms={}]", retries + 1, delay.as_millis());
+							}
 							model.status = msg.clone();
 							model.remote.scan_error = Some(msg);
 							model.discovery_status =
@@ -1174,9 +1432,41 @@ impl WorkbenchModel {
 							cx.notify();
 						}
 					}
+					true
+				}).unwrap_or(false);
+				if !landed { return; }
+				let Some(delay) = retry_delay else { return; };
+				// The scan owns this cancellable wait. Close/Quit do not wait
+				// for a full backoff, and Refresh cancels the old timer too.
+				wait_cancelled(&mut async_app, delay, &cancel).await;
+				if cancel.is_cancelled() { return; }
+				let _ = this.update(&mut async_app, |model, cx| {
+					if model.discovery_generation == generation
+						&& model.lifecycle.generation() == lifecycle_generation
+						&& model.accepting_work()
+					{
+						model.launch_remote_scan_attempt(under, wipe, retries + 1, cx);
+					}
 				});
 			},
 		);
+	}
+}
+
+async fn wait_cancelled(
+	cx: &mut gpui::AsyncApp,
+	delay: std::time::Duration,
+	cancel: &snip_core::gitrun::CancelToken,
+) {
+	let slice = std::time::Duration::from_millis(50);
+	let executor = cx.background_executor().clone();
+	let deadline = executor.now() + delay;
+	while !cancel.is_cancelled() {
+		let remaining = deadline.saturating_duration_since(executor.now());
+		if remaining.is_zero() {
+			break;
+		}
+		executor.timer(slice.min(remaining)).await;
 	}
 }
 
@@ -1188,12 +1478,7 @@ async fn hold_open(
 	delay: std::time::Duration,
 	cancel: &snip_core::gitrun::CancelToken,
 ) {
-	let slice = std::time::Duration::from_millis(50);
-	let mut held = std::time::Duration::ZERO;
-	while held < delay && !cancel.is_cancelled() {
-		cx.background_executor().timer(slice).await;
-		held += slice;
-	}
+	wait_cancelled(cx, delay, cancel).await;
 }
 
 #[cfg(test)]

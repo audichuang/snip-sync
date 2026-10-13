@@ -22,7 +22,6 @@ use gpui::{
 	div, prelude::*, px, rgb, AnyElement, App, Context, Entity, FocusHandle,
 	MouseButton, Pixels, ScrollHandle, SharedString, Subscription, Window,
 };
-use snip_remote::{RemoteHost, RemoteWorkspace};
 
 use crate::i18n::{t, Locale};
 use crate::icons::{icon_tinted, Icon};
@@ -147,7 +146,7 @@ pub enum OpenTarget {
 	/// A canonical local folder.
 	Local(PathBuf),
 	/// A worker folder, after the worker resolved its real path.
-	Remote(Box<(RemoteHost, RemoteWorkspace)>),
+	Remote(Box<crate::remote::OpenedRemote>),
 }
 
 /// Which workspace a tab shows: a local canonical path, or an ssh Host
@@ -164,8 +163,8 @@ impl OpenTarget {
 		match self {
 			OpenTarget::Local(path) => WsIdentity::Local(path.clone()),
 			OpenTarget::Remote(target) => WsIdentity::Remote {
-				host: target.0.name.clone(),
-				path: target.1.id.clone(),
+				host: target.client.host().name.clone(),
+				path: target.workspace.id.clone(),
 			},
 		}
 	}
@@ -189,8 +188,8 @@ impl WsIdentity {
 			}
 			lifecycle::Intent::OpenRemoteWorkspace(target) => {
 				Some(WsIdentity::Remote {
-					host: target.0.name.clone(),
-					path: target.1.id.clone(),
+					host: target.client.host().name.clone(),
+					path: target.workspace.id.clone(),
 				})
 			}
 			_ => None,
@@ -388,6 +387,7 @@ impl TabsRoot {
 		} = launch;
 		let restoring = restore.is_some();
 		let (mut shown, mut skipped) = (None, 0);
+		let mut remote_starts = Vec::new();
 		if let Some(saved) = restore {
 			for (i, tab) in saved.tabs.into_iter().enumerate() {
 				let ix = match tab {
@@ -419,7 +419,7 @@ impl TabsRoot {
 							let tab = &root.tabs[ix];
 							with_log_tab(Some(tab.id), || {
 								tab.model.update(cx, |m, cx| {
-									m.restore_remote(
+									m.prepare_remote_restore(
 										crate::remote::RecentRemote {
 											host,
 											path,
@@ -428,6 +428,7 @@ impl TabsRoot {
 									)
 								})
 							});
+							remote_starts.push(ix);
 							ix
 						}
 					}
@@ -459,6 +460,40 @@ impl TabsRoot {
 			);
 		}
 		root.activate(ix, window, cx);
+		// Build every tab in saved order first. Start the active remote's
+		// probe before restores on the same host contend for handshake slots.
+		let restore_host = |index: usize, cx: &App| {
+			let model = root.tabs[index].model.read(cx);
+			let folder = &model.remote.restoring.as_ref()?.folder;
+			model
+				.remote
+				.hosts
+				.iter()
+				.find(|h| h.name == folder.host)
+				.cloned()
+		};
+		let active_host = restore_host(ix, cx);
+		let gate =
+			std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		remote_starts.sort_by_key(|start| *start != ix);
+		for start in remote_starts {
+			let priority = if active_host.is_some()
+				&& restore_host(start, cx) == active_host
+			{
+				Some(if start == ix {
+					crate::remote::RestorePriority::First(gate.clone())
+				} else {
+					crate::remote::RestorePriority::After(gate.clone())
+				})
+			} else {
+				None
+			};
+			let tab = &root.tabs[start];
+			with_log_tab(Some(tab.id), || {
+				tab.model
+					.update(cx, |m, cx| m.start_remote_restore(priority, cx));
+			});
+		}
 		if let Some(dir) = restore_dir {
 			root.tabs[ix]
 				.model
