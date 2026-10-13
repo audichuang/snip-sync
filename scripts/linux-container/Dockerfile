@@ -4,6 +4,10 @@
 FROM ubuntu:24.04
 
 ARG ACTIONLINT_VERSION=1.7.12
+# Pinned: without --tag, just's install.sh reads the latest tag from the
+# anonymous GitHub API (60 calls an hour per IP) and, when the reply comes back
+# on one line, takes the release URL for the tag and fetches a 404.
+ARG JUST_VERSION=1.58.0
 # CI's setup-node major; the TS reference needs node:module registerHooks.
 ARG NODE_MAJOR=24
 ENV DEBIAN_FRONTEND=noninteractive
@@ -31,7 +35,7 @@ RUN arch="$(dpkg --print-architecture)" \
     && ver="$(curl -sSfL https://nodejs.org/dist/index.json | python3 -c 'import json, sys; print(next(r["version"] for r in json.load(sys.stdin) if r["version"].startswith(f"v{sys.argv[1]}.")))' "$NODE_MAJOR")" \
     && curl -sSfL "https://nodejs.org/dist/${ver}/node-${ver}-linux-${node_arch}.tar.xz" \
         | tar -xJ -C /usr/local/bin --strip-components=2 "node-${ver}-linux-${node_arch}/bin/node" \
-    && curl -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin \
+    && curl -sSf https://just.systems/install.sh | bash -s -- --tag "${JUST_VERSION}" --to /usr/local/bin \
     && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
         --default-toolchain stable --component rustfmt,clippy \
     && cargo install cargo-nextest --locked \
