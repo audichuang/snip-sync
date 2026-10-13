@@ -559,6 +559,7 @@ impl WorkbenchModel {
 							true,
 							5,
 						)
+						.debug_selector(|| "btn-refresh".into())
 						.on_click(
 							cx.listener(|this, _, _, cx| this.reload_repos(cx)),
 						)

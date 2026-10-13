@@ -60,6 +60,7 @@ T31 與 C-blocked 照各自的通過線判定，沒有「預期 `ui-defect`」�
 ```text
 python3 scripts/real_ui_round.py prepare --sha <SHA> --run "$RUN"   # 殘留檢查、worktree 建置、.app、三組 fixture、空的 config、真實設定快照、存剪貼簿、environment.json
 python3 scripts/real_ui_round.py launch --gate b --run "$RUN"       # 帶隔離環境變數啟動，日誌寫進 $RUN/app-gate-b.log；等主視窗出現才返回
+python3 scripts/real_ui_round.py launch --gate b --saved-tabs --run "$RUN" # 重開已保存分頁，保留 active，不另帶 --workspace
 python3 scripts/real_ui_round.py resize 900 600 --run "$RUN"        # 依程序與視窗標題縮放，等到 VIEWPORT 相符；不符就失敗
 python3 scripts/real_ui_round.py point <控制項 ID> --run "$RUN"      # 第 3 節第 1–4 步：最新 CTRL_BOUNDS、換算螢幕點、action.json 草稿
 python3 scripts/real_ui_round.py title --run "$RUN"                 # 主視窗的完整標題（標題 oracle）

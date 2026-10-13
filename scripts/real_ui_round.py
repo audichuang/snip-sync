@@ -1176,6 +1176,8 @@ exec "{w_remote}/src/target/release/snip" "$@"
 
 def cmd_supervisor(args: argparse.Namespace) -> int:
     gate = args.gate.lower()
+    saved_tabs = getattr(args, "saved_tabs", False)
+    launch_mode = "saved-tabs" if saved_tabs else "workspace"
     run_dir = resolve_run_dir(args.run)
     env_file = run_dir / "environment.json"
     if not env_file.is_file():
@@ -1206,8 +1208,13 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     started_at = datetime.datetime.now().astimezone().isoformat()
     log_fp = open(log_file, "a", encoding="utf-8")
 
+    # S10 must restore the saved active tab. An explicit --workspace would
+    # select that workspace after restoring and hide an active-tab regression.
+    command = [str(binary)]
+    if not saved_tabs:
+        command.extend(["--workspace", str(workspace)])
     app_proc = subprocess.Popen(
-        [str(binary), "--workspace", str(workspace)],
+        command,
         env=proc_env,
         stdout=log_fp,
         stderr=subprocess.STDOUT,
@@ -1219,6 +1226,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         "gate": gate,
         "log": str(log_file),
         "launch_time": time.time(),
+        "launch_mode": launch_mode,
         "started_at": started_at,
     }
     (run_dir / "app-process.json").write_text(json.dumps(proc_state, indent=2), encoding="utf-8")
@@ -1238,6 +1246,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         "signal": sig,
         "started_at": started_at,
         "finished_at": finished_at,
+        "launch_mode": launch_mode,
     }
     exit_file = run_dir / f"app-gate-{gate}-exit.json"
     exit_file.write_text(json.dumps(exit_data, indent=2), encoding="utf-8")
@@ -1266,6 +1275,7 @@ def rotate_launch_evidence(run_dir: Path, gate: str) -> List[Tuple[Path, Path]]:
 
 def cmd_launch(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS_OPS) -> int:
     gate = args.gate.lower()
+    saved_tabs = getattr(args, "saved_tabs", False)
     if gate not in ("a", "b"):
         print("ERROR: --gate must be 'a' or 'b'", file=sys.stderr)
         return 1
@@ -1307,7 +1317,7 @@ def cmd_launch(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
 
     print(f"Launching snip-desktop-native supervisor for Gate {gate.upper()}...")
     print(f"  Binary:    {binary}")
-    print(f"  Workspace: {workspace}")
+    print(f"  Workspace: {'restore saved tabs and active workspace' if saved_tabs else workspace}")
     print(f"  Log file:  {log_file}")
 
     supervisor_cmd = [
@@ -1317,6 +1327,8 @@ def cmd_launch(args: argparse.Namespace, sys_ops: SystemOperations = DEFAULT_SYS
         "--gate", gate,
         "--run", str(run_dir),
     ]
+    if saved_tabs:
+        supervisor_cmd.append("--saved-tabs")
 
     kwargs: Dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
@@ -1721,6 +1733,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch = subparsers.add_parser("launch", help="Launch the bundled app with isolated environment")
     p_launch.add_argument("--gate", required=True, choices=["a", "b"], help="Gate to launch for")
     p_launch.add_argument("--run", help="Run directory path")
+    p_launch.add_argument("--saved-tabs", action="store_true", help="Launch without --workspace to verify saved tabs and their active workspace")
 
     # resize
     p_resize = subparsers.add_parser("resize", help="Resize the main window to logical WxH")
@@ -1751,6 +1764,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sup = subparsers.add_parser("_supervisor", help=argparse.SUPPRESS)
     p_sup.add_argument("--gate", required=True, choices=["a", "b"], help="Gate to supervise")
     p_sup.add_argument("--run", help="Run directory path")
+    p_sup.add_argument("--saved-tabs", action="store_true", help=argparse.SUPPRESS)
 
     return parser
 

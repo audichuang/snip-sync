@@ -518,6 +518,19 @@ exit 0
 
 
 class TestLaunchSupervisorAndExitFile(RoundDirTestCase):
+    def test_saved_tabs_launch_does_not_override_the_restored_active_workspace(self):
+        args = argparse.Namespace(gate="b", run=str(self.run_dir), saved_tabs=True)
+        child = mock.Mock(pid=77)
+        child.wait.return_value = 0
+        with mock.patch.object(rur.subprocess, "Popen", return_value=child) as start:
+            self.assertEqual(rur.cmd_supervisor(args), 0)
+        self.assertEqual(start.call_args.args[0], [str(self.mock_bin)])
+        self.assertEqual(start.call_args.kwargs["env"]["SNIP_CONFIG_DIR"], str(self.run_dir / "config"))
+        process = json.loads((self.run_dir / "app-process.json").read_text())
+        receipt = json.loads((self.run_dir / "app-gate-b-exit.json").read_text())
+        self.assertEqual(process["launch_mode"], "saved-tabs")
+        self.assertEqual(receipt["launch_mode"], "saved-tabs")
+
     def test_supervisor_records_exit_code_and_times(self):
         args = argparse.Namespace(gate="b", run=str(self.run_dir))
         rc = rur.cmd_supervisor(args)
@@ -791,7 +804,7 @@ class TestScreenScale(unittest.TestCase):
 
 
 class TestLaunchWaitsForTheWindow(RoundDirTestCase):
-    def launch(self, window_after: Optional[int], timeout: float = 5.0):
+    def launch(self, window_after: Optional[int], timeout: float = 5.0, saved_tabs: bool = False):
         """Launch with a fake supervisor; the main window shows up on query `window_after`."""
         import contextlib
         import io
@@ -812,6 +825,7 @@ class TestLaunchWaitsForTheWindow(RoundDirTestCase):
         run_dir = self.run_dir
 
         def fake_popen(cmd, **kwargs):
+            self.supervisor_command = cmd
             (run_dir / "app-process.json").write_text(json.dumps({"pid": 77, "gate": "b", "supervisor_pid": 1}))
             return mock.Mock()
 
@@ -819,13 +833,19 @@ class TestLaunchWaitsForTheWindow(RoundDirTestCase):
         with mock.patch.object(rur.subprocess, "Popen", side_effect=fake_popen), \
                 mock.patch.object(rur, "WINDOW_TIMEOUT_SECONDS", timeout), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
-            rc = rur.cmd_launch(argparse.Namespace(gate="b", run=str(run_dir)), sys_ops=fake)
+            rc = rur.cmd_launch(argparse.Namespace(gate="b", run=str(run_dir), saved_tabs=saved_tabs), sys_ops=fake)
         return rc, fake, err.getvalue()
 
     def test_launch_returns_once_the_main_window_is_open(self):
         rc, fake, err = self.launch(window_after=3)
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.queries, 3)
+        self.assertNotIn("--saved-tabs", self.supervisor_command)
+
+    def test_saved_tabs_mode_reaches_the_detached_supervisor(self):
+        rc, _, err = self.launch(window_after=1, saved_tabs=True)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("--saved-tabs", self.supervisor_command)
 
     def test_launch_fails_when_the_window_never_opens(self):
         rc, _, err = self.launch(window_after=None, timeout=0.5)

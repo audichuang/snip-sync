@@ -68,9 +68,7 @@ pub enum Intent {
 	CloseWorkspace,
 	OpenWorkspace(std::path::PathBuf),
 	/// A folder of an ssh host (remote workspace).
-	OpenRemoteWorkspace(
-		Box<(snip_remote::RemoteHost, snip_remote::RemoteWorkspace)>,
-	),
+	OpenRemoteWorkspace(Box<crate::remote::OpenedRemote>),
 }
 
 impl Intent {

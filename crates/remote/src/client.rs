@@ -8,7 +8,7 @@ use std::io::{self, BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use snip_core::browser::{
@@ -31,7 +31,7 @@ use crate::proto::{
 	JOINED_MAX, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::worker::{Worker, PREAMBLE};
-use crate::RemoteError;
+use crate::{ConnectFailureKind, RemoteError};
 
 /// How long a new connection may take to reach the worker's hello: ssh
 /// resolves, authenticates and starts a shell first.
@@ -51,6 +51,9 @@ const MAX_BANNER: usize = 64 * 1024;
 const MAX_STDERR: usize = 8 * 1024;
 /// Idle connections kept per worker: each is an ssh process.
 const POOL: usize = 2;
+/// In-flight starts, shared across Clients for the same host. Established
+/// workers and idle connections do not hold a handshake slot.
+const HANDSHAKES_PER_HOST: usize = 2;
 /// Frames buffered between the worker's stdout and the caller. During a
 /// call a full queue BLOCKS the pump on `send` — backpressure, so a reply
 /// larger than the queue still reaches a slow consumer whole. While the
@@ -120,6 +123,99 @@ impl RemoteHost {
 			name: host.to_string(),
 			transport: Transport::Command(crate::ssh::command(host)),
 		}
+	}
+}
+
+#[derive(PartialEq, Eq)]
+enum TransportIdentity {
+	Command(Vec<OsString>),
+	InProcess(usize),
+}
+
+#[derive(PartialEq, Eq)]
+struct HandshakeKey(String, TransportIdentity);
+
+type HandshakeRegistry = Mutex<Vec<(HandshakeKey, Weak<HandshakeGate>)>>;
+
+#[derive(Default)]
+struct HandshakeGate {
+	active: Mutex<usize>,
+	waiting: AtomicUsize,
+	changed: Condvar,
+}
+
+impl HandshakeGate {
+	fn for_host(host: &RemoteHost) -> Arc<Self> {
+		static GATES: OnceLock<HandshakeRegistry> = OnceLock::new();
+		let key = HandshakeKey(
+			host.name.clone(),
+			match &host.transport {
+				Transport::Command(args) => {
+					TransportIdentity::Command(args.clone())
+				}
+				Transport::InProcess(worker) => {
+					TransportIdentity::InProcess(Arc::as_ptr(worker) as usize)
+				}
+			},
+		);
+		let mut gates = GATES
+			.get_or_init(Mutex::default)
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		gates.retain(|(_, gate)| gate.strong_count() > 0);
+		if let Some(gate) = gates
+			.iter()
+			.find(|(stored, _)| *stored == key)
+			.and_then(|(_, gate)| gate.upgrade())
+		{
+			return gate;
+		}
+		let gate = Arc::new(Self::default());
+		gates.push((key, Arc::downgrade(&gate)));
+		gate
+	}
+
+	fn acquire(
+		self: &Arc<Self>,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<HandshakeGuard, RemoteError> {
+		let mut active =
+			self.active.lock().unwrap_or_else(PoisonError::into_inner);
+		loop {
+			if cancel.is_some_and(|token| token.is_cancelled()) {
+				return Err(RemoteError::Cancelled);
+			}
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			if remaining.is_zero() {
+				return Err(RemoteError::Start {
+					kind: ConnectFailureKind::TimedOut,
+					message: start_message(StartCause::NoAnswer, None, ""),
+				});
+			}
+			if *active < HANDSHAKES_PER_HOST {
+				*active += 1;
+				return Ok(HandshakeGuard(self.clone()));
+			}
+			self.waiting.fetch_add(1, Ordering::SeqCst);
+			active = self
+				.changed
+				.wait_timeout(active, remaining.min(WAIT_SLICE))
+				.unwrap_or_else(PoisonError::into_inner)
+				.0;
+			self.waiting.fetch_sub(1, Ordering::SeqCst);
+		}
+	}
+}
+
+struct HandshakeGuard(Arc<HandshakeGate>);
+
+impl Drop for HandshakeGuard {
+	fn drop(&mut self) {
+		let mut active =
+			self.0.active.lock().unwrap_or_else(PoisonError::into_inner);
+		*active -= 1;
+		self.0.changed.notify_one();
 	}
 }
 
@@ -231,6 +327,20 @@ impl Connection {
 		my_name: &str,
 		cancel: Option<&CancelToken>,
 	) -> Result<Self, RemoteError> {
+		Self::open_until(
+			transport,
+			my_name,
+			cancel,
+			Instant::now() + CONNECT_TIMEOUT,
+		)
+	}
+
+	fn open_until(
+		transport: &Transport,
+		my_name: &str,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<Self, RemoteError> {
 		if cancel.is_some_and(|c| c.is_cancelled()) {
 			return Err(RemoteError::Cancelled);
 		}
@@ -275,9 +385,13 @@ impl Connection {
 		// The hello exchange is a call: its reply may arrive before the
 		// master waits for it, so the pump must see it as in flight.
 		conn.in_flight.store(true, Ordering::SeqCst);
-		let reply = conn
-			.send_guarded(&hello, cancel, Instant::now() + CONNECT_TIMEOUT)
-			.and_then(|()| conn.recv_hello(CONNECT_TIMEOUT, cancel));
+		let reply =
+			conn.send_guarded(&hello, cancel, deadline).and_then(|()| {
+				conn.recv_hello(
+					deadline.saturating_duration_since(Instant::now()),
+					cancel,
+				)
+			});
 		conn.in_flight.store(false, Ordering::SeqCst);
 		match reply {
 			Ok(Some(Response::Hello {
@@ -303,9 +417,10 @@ impl Connection {
 					{
 						StartCause::BadData(err.to_string())
 					}
+					Err(RemoteError::Io(err)) => StartCause::Io(err.kind()),
 					_ => StartCause::Ended,
 				};
-				Err(conn.start_error(cause))
+				Err(conn.start_error(cause, deadline))
 			}
 			Err(err) => Err(err),
 		}
@@ -340,9 +455,14 @@ impl Connection {
 
 	/// Why the worker never said hello, from the transport's exit status
 	/// and stderr: ssh's own message, or that the far end has no snip.
-	fn start_error(&mut self, cause: StartCause) -> RemoteError {
+	fn start_error(
+		&mut self,
+		cause: StartCause,
+		handshake_deadline: Instant,
+	) -> RemoteError {
 		let status = self.child.as_mut().and_then(|c| {
-			let deadline = Instant::now() + Duration::from_secs(2);
+			let deadline = (Instant::now() + Duration::from_secs(2))
+				.min(handshake_deadline);
 			loop {
 				match c.try_wait() {
 					Ok(Some(status)) => return Some(status),
@@ -355,7 +475,8 @@ impl Connection {
 		});
 		// The stderr reader holds the other reference until the pipe closes:
 		// wait for it, or a fast exit is classified before its message lands.
-		let deadline = Instant::now() + Duration::from_secs(2);
+		let deadline =
+			(Instant::now() + Duration::from_secs(2)).min(handshake_deadline);
 		while status.is_some()
 			&& Arc::strong_count(&self.stderr) > 1
 			&& Instant::now() < deadline
@@ -367,11 +488,11 @@ impl Connection {
 		)
 		.trim()
 		.to_string();
-		RemoteError::Connect(start_message(
-			cause,
-			status.and_then(|s| s.code()),
-			&stderr,
-		))
+		let code = status.and_then(|s| s.code());
+		RemoteError::Start {
+			kind: start_failure_kind(&cause, code, &stderr),
+			message: start_message(cause, code, &stderr),
+		}
 	}
 
 	pub fn worker_name(&self) -> &str {
@@ -557,6 +678,7 @@ impl Drop for Connection {
 /// What the transport did while the master waited for the hello.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartCause {
+	Io(io::ErrorKind),
 	/// The hello never arrived and the transport still runs: it hung, or
 	/// the far machine is too busy to answer.
 	NoAnswer,
@@ -584,7 +706,7 @@ pub(crate) fn start_message(
 		StartCause::NoAnswer => stderr.to_string(),
 		// The stream's own message: a banner, an out-of-step frame.
 		StartCause::BadData(message) => message,
-		StartCause::Ended => {
+		StartCause::Ended | StartCause::Io(_) => {
 			if code == Some(127) || stderr.contains("unrecognized subcommand") {
 				return "snip is not installed on that machine, or is too old for \
 				        ssh connections; install snip-sync there"
@@ -602,6 +724,50 @@ pub(crate) fn start_message(
 			}
 			stderr.to_string()
 		}
+	}
+}
+
+/// Classify at the transport boundary, while exit status and the original
+/// failure still exist; consumers receive the type and unchanged message.
+fn start_failure_kind(
+	cause: &StartCause,
+	code: Option<i32>,
+	stderr: &str,
+) -> ConnectFailureKind {
+	let lower = stderr.to_ascii_lowercase();
+	if lower.contains("permission denied")
+		|| lower.contains("host key verification failed")
+		|| lower.contains("remote host identification has changed")
+	{
+		return ConnectFailureKind::Authentication;
+	}
+	if code == Some(127) || lower.contains("unrecognized subcommand") {
+		return ConnectFailureKind::WorkerUnavailable;
+	}
+	match cause {
+		StartCause::NoAnswer => ConnectFailureKind::TimedOut,
+		StartCause::BadData(_) => ConnectFailureKind::Protocol,
+		StartCause::Io(kind) if stderr.is_empty() => {
+			ConnectFailureKind::Io(*kind)
+		}
+		StartCause::Ended | StartCause::Io(_)
+			if stderr.is_empty()
+				|| [
+					"connection reset",
+					"connection closed",
+					"connection timed out",
+					"operation timed out",
+					"connection refused",
+					"no route to host",
+					"broken pipe",
+					"connection aborted",
+				]
+				.iter()
+				.any(|message| lower.contains(message)) =>
+		{
+			ConnectFailureKind::TransportClosed
+		}
+		StartCause::Ended | StartCause::Io(_) => ConnectFailureKind::Other,
 	}
 }
 
@@ -948,15 +1114,18 @@ pub struct Client {
 	my_name: String,
 	idle: Mutex<Vec<Connection>>,
 	limiter: GitLimiter,
+	handshakes: Arc<HandshakeGate>,
 }
 
 impl Client {
 	pub fn new(host: RemoteHost, my_name: String) -> Self {
+		let handshakes = HandshakeGate::for_host(&host);
 		Self {
 			host,
 			my_name,
 			idle: Mutex::new(Vec::new()),
 			limiter: GitLimiter::new(),
+			handshakes,
 		}
 	}
 
@@ -972,7 +1141,22 @@ impl Client {
 		&self,
 		cancel: Option<&CancelToken>,
 	) -> Result<Connection, RemoteError> {
-		Connection::open_with(&self.host.transport, &self.my_name, cancel)
+		self.connect_until(cancel, Instant::now() + CONNECT_TIMEOUT)
+	}
+
+	fn connect_until(
+		&self,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+	) -> Result<Connection, RemoteError> {
+		let deadline = deadline.min(Instant::now() + CONNECT_TIMEOUT);
+		let _guard = self.handshakes.acquire(cancel, deadline)?;
+		Connection::open_until(
+			&self.host.transport,
+			&self.my_name,
+			cancel,
+			deadline,
+		)
 	}
 
 	/// A fresh connection whose worker speaks at least `need`, or
@@ -982,8 +1166,9 @@ impl Client {
 		&self,
 		need: u32,
 		cancel: Option<&CancelToken>,
+		deadline: Instant,
 	) -> Result<Connection, RemoteError> {
-		let fresh = self.connect_with(cancel)?;
+		let fresh = self.connect_until(cancel, deadline)?;
 		if fresh.version() < need {
 			let err = too_old_error(&fresh, need);
 			self.keep(fresh);
@@ -1054,11 +1239,13 @@ impl Client {
 				// reason, its stream is out of step with the protocol:
 				// drop the connection (killing its process) and start a
 				// clean one — which must speak a new enough protocol too.
-				(self.connect_at_least(need, cancel)?, false)
+				(self.connect_at_least(need, cancel, start + limit)?, false)
 			}
 			Some(conn) if conn.version() >= need => (conn, true),
 			Some(conn) => return Err(too_old(conn)),
-			None => (self.connect_at_least(need, cancel)?, false),
+			None => {
+				(self.connect_at_least(need, cancel, start + limit)?, false)
+			}
 		};
 
 		let remaining = limit.saturating_sub(start.elapsed());
@@ -1073,7 +1260,7 @@ impl Client {
 				if remaining_retry.is_zero() {
 					return Err(RemoteError::TimedOut);
 				}
-				match self.connect_at_least(need, cancel) {
+				match self.connect_at_least(need, cancel, start + limit) {
 					Ok(mut fresh) => {
 						result = fresh.call(request, cancel, remaining_retry);
 						conn = fresh;
@@ -1737,6 +1924,247 @@ impl From<RemoteError> for GitError {
 mod tests {
 	use super::*;
 	use crate::proto::write_frame;
+
+	#[test]
+	fn same_host_clients_bound_real_handshakes() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		worker.hold_hellos_for_tests(true);
+		let mut threads = Vec::new();
+		for _ in 0..6 {
+			let worker = worker.clone();
+			threads.push(std::thread::spawn(move || {
+				let client =
+					Client::new(RemoteHost::in_process(worker), "test".into());
+				client.home()
+			}));
+		}
+		// Observe actual worker hellos while they are deliberately held. The
+		// bound also lets a correct two-at-a-time implementation finish.
+		let end = Instant::now() + scaled(Duration::from_millis(500));
+		while worker.active_hellos_for_tests() < 6 && Instant::now() < end {
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		worker.hold_hellos_for_tests(false);
+		for thread in threads {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while !thread.is_finished() {
+				assert!(
+					Instant::now() < end,
+					"handshake thread did not finish"
+				);
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			thread.join().unwrap().unwrap();
+		}
+		assert_eq!(worker.started_connections_for_tests(), 6);
+		assert!(
+			worker.max_hellos_for_tests() <= 2,
+			"{} simultaneous hellos",
+			worker.max_hellos_for_tests()
+		);
+	}
+
+	#[test]
+	fn handshake_queue_cancels_times_out_and_does_not_block_another_host() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		worker.hold_hellos_for_tests(true);
+		struct Release(Arc<Worker>);
+		impl Drop for Release {
+			fn drop(&mut self) {
+				self.0.hold_hellos_for_tests(false);
+			}
+		}
+		let release = Release(worker.clone());
+		let host = RemoteHost::in_process(worker.clone());
+		let first = Arc::new(Client::new(host.clone(), "first".into()));
+		let second = Arc::new(Client::new(host.clone(), "second".into()));
+		let mut holders = Vec::new();
+		for client in [first.clone(), second.clone()] {
+			holders.push(std::thread::spawn(move || client.home()));
+		}
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while worker.active_hellos_for_tests() < 2 {
+			assert!(Instant::now() < end, "two hellos never started");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let queued = Arc::new(Client::new(host.clone(), "queued".into()));
+		let token = CancelToken::new();
+		let (started, entered) = mpsc::channel();
+		let waiter = {
+			let queued = queued.clone();
+			let token = token.clone();
+			std::thread::spawn(move || {
+				started.send(()).unwrap();
+				queued.connect_with(Some(&token)).err().unwrap()
+			})
+		};
+		entered
+			.recv_timeout(scaled(Duration::from_secs(5)))
+			.unwrap();
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while queued.handshakes.waiting.load(Ordering::SeqCst) == 0 {
+			assert!(
+				Instant::now() < end,
+				"third client never entered the handshake queue"
+			);
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		token.cancel();
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while !waiter.is_finished() {
+			assert!(Instant::now() < end, "queued cancel did not finish");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert!(matches!(waiter.join().unwrap(), RemoteError::Cancelled));
+		let started = Instant::now();
+		let error = queued
+			.connect_until(None, started + scaled(Duration::from_millis(100)))
+			.err()
+			.unwrap();
+		assert!(error.is_transient_read_failure());
+		assert!(!error.outcome_unknown(), "queued connect sent no write");
+		assert!(started.elapsed() < scaled(Duration::from_secs(2)));
+		assert_eq!(
+			worker.started_connections_for_tests(),
+			2,
+			"queued calls must not spawn transports"
+		);
+		let other = Arc::new(Worker::new(Default::default()));
+		let other_client = Client::new(
+			RemoteHost {
+				name: "another-host".into(),
+				transport: Transport::InProcess(other.clone()),
+			},
+			"other".into(),
+		);
+		other_client
+			.connect_until(
+				None,
+				Instant::now() + scaled(Duration::from_secs(2)),
+			)
+			.unwrap();
+		assert_eq!(other.started_connections_for_tests(), 1);
+		drop(release);
+		for holder in holders {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while !holder.is_finished() {
+				assert!(Instant::now() < end, "held connection did not finish");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			holder.join().unwrap().unwrap();
+		}
+		assert_eq!(
+			*first.handshakes.active.lock().unwrap(),
+			0,
+			"established idle connections must not hold handshake permits"
+		);
+		queued.home().unwrap();
+		assert_eq!(worker.started_connections_for_tests(), 3);
+	}
+
+	#[test]
+	fn a_worker_closed_before_hello_keeps_a_typed_transport_failure() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		worker.stop();
+		let error = Connection::open(&Transport::InProcess(worker), "test")
+			.err()
+			.unwrap();
+		assert!(matches!(error, RemoteError::Start { .. }), "{error:?}");
+		assert!(error.is_transient_read_failure(), "{error:?}");
+		assert!(!error.outcome_unknown());
+		assert_eq!(
+			error.to_string(),
+			"the remote end closed the connection before snip started"
+		);
+	}
+
+	#[test]
+	fn startup_errors_preserve_typed_transience_and_existing_messages() {
+		for (cause, code, stderr, transient) in [
+			(StartCause::Ended, None, "", true),
+			(
+				StartCause::Io(io::ErrorKind::ConnectionReset),
+				None,
+				"",
+				true,
+			),
+			(StartCause::NoAnswer, None, "", true),
+			(
+				StartCause::Ended,
+				Some(255),
+				"kex_exchange_identification: read: Connection reset by peer",
+				true,
+			),
+			(
+				StartCause::Ended,
+				Some(255),
+				"Permission denied (publickey)",
+				false,
+			),
+			(
+				StartCause::Ended,
+				Some(255),
+				"Host key verification failed",
+				false,
+			),
+			(StartCause::Ended, Some(127), "snip: not found", false),
+			(StartCause::BadData("invalid frame".into()), None, "", false),
+			(
+				StartCause::Io(io::ErrorKind::PermissionDenied),
+				None,
+				"",
+				false,
+			),
+		] {
+			let error = RemoteError::Start {
+				kind: start_failure_kind(&cause, code, stderr),
+				message: start_message(cause.clone(), code, stderr),
+			};
+			assert_eq!(
+				error.is_transient_read_failure(),
+				transient,
+				"{error:?}"
+			);
+			assert_eq!(error.to_string(), start_message(cause, code, stderr));
+			assert!(!error.outcome_unknown(), "no request ran before hello");
+		}
+		for kind in [
+			io::ErrorKind::UnexpectedEof,
+			io::ErrorKind::ConnectionReset,
+			io::ErrorKind::BrokenPipe,
+			io::ErrorKind::TimedOut,
+		] {
+			assert!(RemoteError::Io(io::Error::from(kind))
+				.is_transient_read_failure());
+		}
+		for code in [ErrorCode::Busy, ErrorCode::Timeout] {
+			assert!(RemoteError::Refused {
+				code,
+				message: "irrelevant".into()
+			}
+			.is_transient_read_failure());
+		}
+		for error in [
+			RemoteError::Cancelled,
+			RemoteError::Connect("Connection reset by peer".into()),
+			RemoteError::Protocol("bad frame".into()),
+			RemoteError::WorkerTooOld {
+				worker: "old".into(),
+				have: 1,
+				need: 2,
+			},
+			RemoteError::Refused {
+				code: ErrorCode::Forbidden,
+				message: "Connection reset".into(),
+			},
+			RemoteError::Refused {
+				code: ErrorCode::BadRequest,
+				message: "bad".into(),
+			},
+		] {
+			assert!(!error.is_transient_read_failure(), "{error:?}");
+		}
+	}
 
 	fn timeout_scale() -> u32 {
 		std::env::var("SNIP_E2E_TIMEOUT_SCALE")

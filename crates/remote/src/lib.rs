@@ -36,6 +36,19 @@ pub use proto::{
 };
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
 
+/// Typed reason a transport ended before the worker's hello. Keep this
+/// apart from its human-facing message so callers never parse SSH text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectFailureKind {
+	Io(io::ErrorKind),
+	TransportClosed,
+	TimedOut,
+	Authentication,
+	WorkerUnavailable,
+	Protocol,
+	Other,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
 	#[error(transparent)]
@@ -43,6 +56,11 @@ pub enum RemoteError {
 	/// The worker did not start: ssh's message, or a missing snip.
 	#[error("{0}")]
 	Connect(String),
+	#[error("{message}")]
+	Start {
+		kind: ConnectFailureKind,
+		message: String,
+	},
 	/// The worker answered with an error.
 	#[error("{message}")]
 	Refused { code: ErrorCode, message: String },
@@ -63,6 +81,30 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
+	/// Whether a caller may schedule another *read* attempt. This does
+	/// not authorize retrying a write whose outcome may be unknown.
+	pub fn is_transient_read_failure(&self) -> bool {
+		match self {
+			Self::Io(error) => transient_io(error.kind()),
+			Self::Start {
+				kind: ConnectFailureKind::Io(kind),
+				..
+			} => transient_io(*kind),
+			Self::TimedOut
+			| Self::Start {
+				kind:
+					ConnectFailureKind::TransportClosed
+					| ConnectFailureKind::TimedOut,
+				..
+			} => true,
+			Self::Refused {
+				code: ErrorCode::Busy | ErrorCode::Timeout,
+				..
+			} => true,
+			_ => false,
+		}
+	}
+
 	/// The request may have reached the worker and run there, but no answer
 	/// came back: after a write, whether it happened is unknown. A refusal,
 	/// a worker that never started, or one too old answered (or never got
@@ -80,6 +122,20 @@ impl RemoteError {
 			_ => None,
 		}
 	}
+}
+
+fn transient_io(kind: io::ErrorKind) -> bool {
+	matches!(
+		kind,
+		io::ErrorKind::UnexpectedEof
+			| io::ErrorKind::ConnectionReset
+			| io::ErrorKind::ConnectionAborted
+			| io::ErrorKind::BrokenPipe
+			| io::ErrorKind::TimedOut
+			| io::ErrorKind::WouldBlock
+			| io::ErrorKind::ConnectionRefused
+			| io::ErrorKind::NotConnected
+	)
 }
 
 /// The app's config folder, shared by the desktop app and the CLI.
