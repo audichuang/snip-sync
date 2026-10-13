@@ -621,6 +621,58 @@ mod tests {
 		assert!(used(&session) < 2 * 1024 * 1024);
 	}
 
+	#[test]
+	fn repeated_detail_reads_of_a_dropped_ui_preview_cannot_grow_release() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		let dir = tempfile::tempdir().unwrap();
+		crate::paste::tests::git_init(dir.path());
+		let payload = snip_core::commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "repeatedly read commit".into(),
+				author_name: "Ann".into(),
+				author_email: "ann@example.invalid".into(),
+				author_date: "2026-10-13T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "repeated.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("x".repeat(2 * 1024 * 1024)),
+					not_copied: None,
+				}],
+			}],
+		});
+		let mut session = landed(&payload, dir.path(), None);
+		drop(payload);
+		let used = |s: &PastePreview| {
+			let st = lock_pending(&s.pending);
+			st.total_with_ui(
+				st.ui_bytes,
+				st.apply_allowance,
+				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
+			)
+		};
+		let ui_only = used(&session);
+		// Twenty reads of one 2 MiB preview would be 40 MiB if each were
+		// charged in full after the UI lets go. Each read is free while the
+		// UI holds the Arc, so all of them are admitted.
+		let reads: Vec<_> = (0..20)
+			.map(|_| session.commit_diff_request(0).unwrap().unwrap())
+			.collect();
+		assert_eq!(used(&session), ui_only);
+		// Dropping the UI's preview must not panic in `release`, and the
+		// shared preview is charged once, not once per read.
+		session.clear(None);
+		let after = used(&session);
+		assert!(after <= ui_only);
+		assert!(after >= 2 * 1024 * 1024);
+		assert!(after < 4 * 1024 * 1024);
+		drop(reads);
+		assert!(used(&session) < 2 * 1024 * 1024);
+	}
+
 	/// Grows `ordinary` so the admitted state sits exactly at the 32 MiB cap.
 	fn fill_budget(s: &PastePreview, ordinary: &mut Preview) {
 		let used = {

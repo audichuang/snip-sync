@@ -197,15 +197,25 @@ impl PastePending {
 	}
 
 	/// Detail reads not already counted in the UI's bytes. A read of the
-	/// UI's own commit preview costs nothing until the UI lets it go.
+	/// UI's own commit preview costs nothing until the UI lets it go. Reads
+	/// of one shared preview are charged once, so the total cannot grow when
+	/// the UI drops its hold and the reads become the only owners.
 	fn detail_bytes(
 		&self,
 		ui_commit: Option<&Weak<CommitReplayPreview>>,
 	) -> usize {
-		self.detail_reads
-			.iter()
-			.filter(|read| !ui_holds(ui_commit, &read.preview))
-			.fold(0, |n, read| n.saturating_add(read.bytes))
+		let mut counted: Vec<&Weak<CommitReplayPreview>> = Vec::new();
+		let mut total = 0usize;
+		for read in &self.detail_reads {
+			if ui_holds(ui_commit, &read.preview)
+				|| counted.iter().any(|seen| Weak::ptr_eq(seen, &read.preview))
+			{
+				continue;
+			}
+			counted.push(&read.preview);
+			total = total.saturating_add(read.bytes);
+		}
+		total
 	}
 
 	fn total_with_ui(
@@ -1041,8 +1051,9 @@ pub(crate) struct CommitDiffRequest {
 	_charge: DetailReadCharge,
 }
 
-/// A live detail read of a captured replay preview. Its bytes are charged in
-/// full unless the UI holds the same Arc, which the UI's bytes already count.
+/// A live detail read of a captured replay preview. Its bytes are charged once
+/// per distinct preview, unless the UI holds that Arc, which the UI's bytes
+/// already count.
 struct DetailRead {
 	id: u64,
 	preview: Weak<CommitReplayPreview>,
@@ -1075,11 +1086,14 @@ impl DetailReadCharge {
 			.saturating_add(preview.retained_heap_bytes());
 		let weak = Arc::downgrade(preview);
 		let mut state = lock_pending(pool);
-		let extra = if ui_holds(state.ui_commit.as_ref(), &weak) {
-			0
-		} else {
-			bytes
-		};
+		// A read of a preview that is already charged (by the UI or by an
+		// earlier read) adds nothing to the total.
+		let charged = ui_holds(state.ui_commit.as_ref(), &weak)
+			|| state
+				.detail_reads
+				.iter()
+				.any(|read| Weak::ptr_eq(&read.preview, &weak));
+		let extra = if charged { 0 } else { bytes };
 		check_budget(
 			state
 				.total_with_ui(
