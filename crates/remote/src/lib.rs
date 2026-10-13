@@ -21,6 +21,7 @@ pub(crate) mod gitserve;
 pub(crate) mod jobs;
 pub(crate) mod pasteserve;
 pub mod pastetarget;
+pub(crate) mod prepared;
 pub mod proto;
 pub mod ssh;
 pub mod worker;

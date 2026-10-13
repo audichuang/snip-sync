@@ -245,10 +245,12 @@ pub(crate) fn write_response<W: Write>(
 	w: &mut W,
 	response: &Response,
 ) -> io::Result<()> {
-	// A paste plan carries file bodies: its whole JSON goes in chunks.
+	// A paste plan or many-file metadata may exceed a frame; join its JSON.
 	if matches!(
 		response,
-		Response::ImportPlanned(_) | Response::ReplayPlanned(_)
+		Response::ImportPlanned(_)
+			| Response::ImportPrepared(_)
+			| Response::ReplayPlanned(_)
 	) {
 		let json = serde_json::to_string(response).map_err(io::Error::other)?;
 		if json.len() > CHUNK_BYTES {

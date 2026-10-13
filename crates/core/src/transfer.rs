@@ -880,6 +880,21 @@ pub struct TransferImportPlan {
 }
 
 impl TransferImportPlan {
+	/// Reconstitutes a worker's preview without reading its paths on this
+	/// machine. The transport verifies its restore-plan digest before showing
+	/// it; Apply still revalidates freshness (and a worker re-plans entirely).
+	pub fn from_parts(
+		roots: Vec<PathBuf>,
+		restore_plan: RestorePlan,
+		destination_freshness: DestinationFreshnessSnapshot,
+	) -> Self {
+		Self {
+			roots,
+			restore_plan,
+			destination_freshness,
+		}
+	}
+
 	/// Owned buffer capacities, excluding this inline struct and allocator
 	/// bookkeeping. The private snapshot is captured into fresh insertion-only
 	/// maps and is never mutated, as required by its table-size estimate.
