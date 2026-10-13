@@ -416,6 +416,7 @@ impl WorkbenchModel {
 		                tooltip: String| {
 			div()
 				.id(id)
+				.debug_selector(move || id.into())
 				.relative()
 				.flex()
 				.items_center()
@@ -743,6 +744,7 @@ impl WorkbenchModel {
 					};
 					div()
 						.id(SharedString::from(it.id.clone()))
+						.debug_selector(|| it.id.clone())
 						.relative()
 						.w_full()
 						.flex()

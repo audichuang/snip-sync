@@ -10843,6 +10843,130 @@ mod tests {
 			);
 		}
 
+		/// The Repository menu changes only the Log scope. Its branch list
+		/// and graph must agree even when the Project selector names another
+		/// repository, or when there is no single checked-out branch.
+		#[gpui::test]
+		fn log_branch_head_glyph_follows_the_clicked_repository_scope(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			let beta = repo(ws.path(), "beta", &[]);
+			let detached = repo(ws.path(), "detached", &[]);
+			for root in [&alpha, &beta, &detached] {
+				git(root, &["branch", "feature"]);
+			}
+			git(&beta, &["checkout", "-q", "feature"]);
+			git(&detached, &["checkout", "-q", "--detach"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.repos.len(), 3);
+				assert!(!m.refs.is_empty(), "branch refs must be loaded");
+			});
+
+			let assert_scope =
+				|cx: &mut VisualTestContext,
+				 project: &str,
+				 log: Option<(&Path, Option<&str>)>| {
+					settle(cx);
+					model.read_with(cx, |m, _| {
+						assert_eq!(m.repo().unwrap().name, project);
+						if let Some((root, branch)) = log {
+							assert_eq!(
+								m.log_scope_key,
+								[dunce::canonicalize(root).unwrap()]
+							);
+							let commit = m
+								.display_commits()
+								.into_iter()
+								.next()
+								.expect("loaded log");
+							let current = m.log_current_branch(&commit.sha);
+							assert_eq!(
+								current.as_deref(),
+								branch,
+								"graph repository"
+							);
+							let graph =
+								m.graph_layout.as_ref().expect("loaded graph");
+							let (badges, _) = crate::graph_view::visible_refs(
+								&graph.rows[0].refs,
+								current.as_deref(),
+							);
+							let label = crate::graph_view::combined_label(
+								&badges,
+								current.as_deref(),
+							)
+							.expect("HEAD graph label");
+							assert!(
+								label.current,
+								"graph must mark HEAD, including detached"
+							);
+						} else {
+							assert!(m.log_is_merged());
+						}
+					});
+					let expected = log.and_then(|(_, branch)| branch);
+					for (branch, row, head) in [
+						(
+							"main",
+							"ref:refs/heads/main",
+							"ref-head:refs/heads/main",
+						),
+						(
+							"feature",
+							"ref:refs/heads/feature",
+							"ref-head:refs/heads/feature",
+						),
+					] {
+						assert!(
+							cx.debug_bounds(row).is_some(),
+							"visible branch {row}"
+						);
+						assert_eq!(
+							cx.debug_bounds(head).is_some(),
+						expected == Some(branch),
+						"Project={project}, Log={log:?}: {branch} HEAD glyph",
+					);
+					}
+				};
+
+			// Project A / Log B, using the repository text row, not its checkbox.
+			click(cx, "btn-repo-selector");
+			click(cx, "pick-repo:alpha");
+			click(cx, "branch-group:refs_local");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			settle(cx);
+			click(cx, "branch-group:refs_local");
+			assert_scope(cx, "alpha", Some((&beta, Some("feature"))));
+
+			// A Project switch preserves the fixed Log scope; same-repo control.
+			click(cx, "btn-repo-selector");
+			click(cx, "pick-repo:beta");
+			assert_scope(cx, "beta", Some((&beta, Some("feature"))));
+
+			// Reverse branches: Project feature / Log main.
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:alpha");
+			assert_scope(cx, "beta", Some((&alpha, Some("main"))));
+			click(cx, "btn-repo-selector");
+			click(cx, "pick-repo:alpha");
+			assert_scope(cx, "alpha", Some((&alpha, Some("main"))));
+
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:detached");
+			assert_scope(cx, "alpha", Some((&detached, None)));
+
+			// Merged branch names belong to several repos: no single HEAD glyph.
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:all");
+			assert_scope(cx, "alpha", None);
+		}
+
 		/// Picking a branch in the Branch menu used to close the menu and
 		/// strand the keyboard on the closed menu's field: Up/Down and
 		/// Cmd+C stopped working. The log keeps the keyboard, as it does
