@@ -576,6 +576,103 @@ mod tests {
 		assert!(session.enqueue(next()).is_ok());
 	}
 
+	#[test]
+	fn a_detail_read_of_the_ui_preview_is_charged_only_once() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		let dir = tempfile::tempdir().unwrap();
+		crate::paste::tests::git_init(dir.path());
+		let payload = snip_core::commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "shared commit".into(),
+				author_name: "Ann".into(),
+				author_email: "ann@example.invalid".into(),
+				author_date: "2026-10-13T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "shared.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("x".repeat(2 * 1024 * 1024)),
+					not_copied: None,
+				}],
+			}],
+		});
+		let mut session = landed(&payload, dir.path(), None);
+		let used = |s: &PastePreview| {
+			let st = lock_pending(&s.pending);
+			st.total_with_ui(
+				st.ui_bytes,
+				st.apply_allowance,
+				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
+			)
+		};
+		let ui_only = used(&session);
+		// The read shares the UI's commit preview, which the UI already counts.
+		let read = session.commit_diff_request(0).unwrap().unwrap();
+		assert_eq!(used(&session), ui_only);
+		// Once the UI lets the preview go, the held read is the only owner
+		// and must be charged in full.
+		session.clear(None);
+		assert!(Arc::downgrade(&read.preview).upgrade().is_some());
+		assert!(used(&session) >= 2 * 1024 * 1024);
+		drop(read);
+		assert!(used(&session) < 2 * 1024 * 1024);
+	}
+
+	#[test]
+	fn repeated_detail_reads_of_a_dropped_ui_preview_cannot_grow_release() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		let dir = tempfile::tempdir().unwrap();
+		crate::paste::tests::git_init(dir.path());
+		let payload = snip_core::commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "repeatedly read commit".into(),
+				author_name: "Ann".into(),
+				author_email: "ann@example.invalid".into(),
+				author_date: "2026-10-13T12:00:00+00:00".into(),
+				files: vec![CommitFile {
+					path: "repeated.txt".into(),
+					old_path: None,
+					change: FileChange::Added,
+					content: Some("x".repeat(2 * 1024 * 1024)),
+					not_copied: None,
+				}],
+			}],
+		});
+		let mut session = landed(&payload, dir.path(), None);
+		drop(payload);
+		let used = |s: &PastePreview| {
+			let st = lock_pending(&s.pending);
+			st.total_with_ui(
+				st.ui_bytes,
+				st.apply_allowance,
+				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
+			)
+		};
+		let ui_only = used(&session);
+		// Twenty reads of one 2 MiB preview would be 40 MiB if each were
+		// charged in full after the UI lets go. Each read is free while the
+		// UI holds the Arc, so all of them are admitted.
+		let reads: Vec<_> = (0..20)
+			.map(|_| session.commit_diff_request(0).unwrap().unwrap())
+			.collect();
+		assert_eq!(used(&session), ui_only);
+		// Dropping the UI's preview must not panic in `release`, and the
+		// shared preview is charged once, not once per read.
+		session.clear(None);
+		let after = used(&session);
+		assert!(after <= ui_only);
+		assert!(after >= 2 * 1024 * 1024);
+		assert!(after < 4 * 1024 * 1024);
+		drop(reads);
+		assert!(used(&session) < 2 * 1024 * 1024);
+	}
+
 	/// Grows `ordinary` so the admitted state sits exactly at the 32 MiB cap.
 	fn fill_budget(s: &PastePreview, ordinary: &mut Preview) {
 		let used = {
@@ -584,6 +681,7 @@ mod tests {
 				st.ui_bytes,
 				st.apply_allowance,
 				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
 			)
 		};
 		ordinary.source = PreviewSource::CommitFile {
@@ -666,6 +764,100 @@ mod tests {
 		);
 	}
 
+	/// A remote paste whose in-process worker kept its payload, so the
+	/// preview holds a live prepared lease.
+	fn landed_remote(
+		text: &str,
+		ws: &Path,
+		ordinary: Option<&Preview>,
+	) -> PastePreview {
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: ws.display().to_string(),
+					name: "w".into(),
+					path: ws.display().to_string(),
+				},
+			),
+		};
+		let dest = remote.session.root.clone();
+		let mut s = PastePreview::new(None);
+		s.enqueue(PasteRequest::Clipboard {
+			text: text.into(),
+			dest,
+			roots: Vec::new(),
+			generation: 1,
+			remote: Some(remote),
+		})
+		.unwrap();
+		let (work, cancel) = s.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		s.bind_job(1, cancel);
+		assert!(matches!(
+			s.poll(false, ordinary),
+			Polled::Settled {
+				landed: Some(Landed::Shown { .. }),
+				..
+			}
+		));
+		s
+	}
+
+	/// Row navigation while a remote Apply is pending, then a Busy refusal
+	/// that restores the lease to Ready, must not panic: the Applying state
+	/// may not free charge the restored connection takes back.
+	#[test]
+	fn navigation_during_a_refused_remote_apply_is_admitted_once() {
+		use snip_remote::{ErrorCode, RemoteError};
+		let ws = tempfile::tempdir().unwrap();
+		// Row 1 is a few hundred bytes larger than row 0: far below the
+		// connection's charge, far above the zero slack left at the limit.
+		let payload = format!(
+			"// FILE: small.txt\nx\n// FILE: large.txt\n{}\n",
+			"z\n".repeat(20)
+		);
+		let mut o = small_ordinary();
+		let mut s = landed_remote(&payload, ws.path(), Some(&o));
+		let file = s
+			.plan()
+			.unwrap()
+			.import_plan
+			.clone()
+			.expect("a remote file plan");
+		assert!(file.uses_prepared_import(), "the worker kept the payload");
+		// Near the limit with the lease Ready: no slack beyond this state.
+		fill_budget(&s, &mut o);
+		let worker = s.begin_apply().expect("begin_apply succeeds");
+		let mut nav = None;
+		let refusal = file.refuse_prepared_apply_for_tests(
+			RemoteError::Refused {
+				code: ErrorCode::Busy,
+				message: "the worker is busy".into(),
+			},
+			|| nav = Some(s.select(1, Some(&o))),
+		);
+		assert!(matches!(
+			refusal,
+			Err(RemoteError::Refused {
+				code: ErrorCode::Busy,
+				..
+			})
+		));
+		drop(worker);
+		s.apply_failed(Msg::new("paste_err_destination", []), Some(&o));
+		assert!(!s.is_applying());
+		assert!(
+			matches!(nav, Some(Nav::Refused(ref e)) if e.key == "preview_memory_limit"),
+			"navigation during Apply spent charge the lease holds"
+		);
+		assert_eq!(
+			s.plan().unwrap().error.as_ref().map(|e| e.key),
+			Some("paste_err_destination")
+		);
+	}
+
 	#[test]
 	fn refused_fold_reselect_keeps_the_hidden_row_with_its_detail() {
 		use snip_core::commits::{
@@ -729,6 +921,7 @@ mod tests {
 				st.ui_bytes,
 				st.apply_allowance,
 				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
 			)
 		};
 
@@ -821,6 +1014,7 @@ mod tests {
 				st.ui_bytes,
 				st.apply_allowance,
 				st.ui_raw.as_ref(),
+				st.ui_commit.as_ref(),
 			)
 		};
 		// 以捏造（從未 admit）的狀態觸發防禦性 rollback 分支；

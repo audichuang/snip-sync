@@ -167,6 +167,19 @@ impl FilePastePlan {
 	pub fn uses_prepared_import(&self) -> bool {
 		self.prepared.is_some()
 	}
+	/// Test seam: this plan's Apply refused with `refusal` after the lease
+	/// went Applying, and `during` ran in that window. Panics without a lease.
+	#[doc(hidden)]
+	pub fn refuse_prepared_apply_for_tests(
+		&self,
+		refusal: RemoteError,
+		during: impl FnOnce(),
+	) -> Result<(), RemoteError> {
+		self.prepared
+			.as_ref()
+			.expect("a prepared lease")
+			.refuse_apply_for_tests(refusal, during)
+	}
 	/// Whether the target of delete `index` exists. Locally this is a stat
 	/// made now. A worker's paths are not this machine's, so for a remote
 	/// plan it is the worker's snapshot.

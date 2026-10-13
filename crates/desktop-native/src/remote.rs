@@ -958,7 +958,7 @@ impl WorkbenchModel {
 							}
 						}
 						Err(err) => {
-							let retryable = err.is_transient_read_failure();
+							let retryable = err.is_restore_retryable();
 							let err = describe(err);
 							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
 							// Also on the status bar: a reconnect on launch runs
@@ -1054,6 +1054,29 @@ impl WorkbenchModel {
 		self.attempt_restore(cx);
 	}
 
+	/// Refresh on a restored tab whose reconnect failed: tries it now instead
+	/// of when its backoff timer fires. Returns false when there is no failed
+	/// restore to retry (none, still in flight, or a drain is under way).
+	pub(crate) fn refresh_failed_restore(
+		&mut self,
+		cx: &mut Context<Self>,
+	) -> bool {
+		let Some(r) = self.remote.restoring.as_ref() else {
+			return false;
+		};
+		if r.failed.is_none()
+			|| r.open_seq.is_some()
+			|| self.remote.busy
+			|| self.lifecycle.is_draining()
+		{
+			return false;
+		}
+		// The attempt makes the armed timer stale: it checks `attempts`.
+		app_log!("[APP:REMOTE_RETRY: attempt={}]", r.attempts + 1);
+		self.attempt_restore(cx);
+		true
+	}
+
 	/// A stopped drain invalidated an in-flight restore. Its old transport
 	/// must finish before retrying; either the result or drain may land first.
 	pub(crate) fn resume_remote_restore(&mut self, cx: &mut Context<Self>) {
@@ -1103,8 +1126,9 @@ impl WorkbenchModel {
 		}
 	}
 
-	/// A failure keeps the tab and its reason. Only a transient failure
-	/// retries after [`retry_delay`]; a try during a drain waits until later.
+	/// A failure keeps the tab and its reason. A failure that may clear
+	/// (see `RemoteError::is_restore_retryable`) retries after
+	/// [`retry_delay`]; a try during a drain waits until later.
 	fn restore_failed(
 		&mut self,
 		why: String,

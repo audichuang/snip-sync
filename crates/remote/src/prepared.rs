@@ -7,7 +7,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::proto::PasteMapping;
+use crate::proto::{ErrorCode, PasteMapping};
+
+/// The worker's refusal for a token it does not hold (expired, already
+/// consumed, or issued by another worker). Nothing was written, so the
+/// client may send the full text once through `ImportApply`.
+pub(crate) const TOKEN_GONE: &str = "prepared paste expired, was consumed, or belongs to another worker; preview again";
+
+/// A refusal from before the first write of an Apply: lock acquisition,
+/// freshness re-validation and re-planning. Busy and Timeout come only
+/// from there, so the payload stays retained and the preview can apply
+/// again. Stale, Io and the rest are not retryable here.
+pub(crate) fn refused_before_write(code: ErrorCode) -> bool {
+	matches!(code, ErrorCode::Busy | ErrorCode::Timeout)
+}
 
 const MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_ENTRIES: usize = 8;
@@ -99,6 +112,8 @@ pub(crate) enum CacheError {
 /// released after its buffers, including on errors or an unwinding job.
 pub(crate) struct PayloadLease {
 	payload: Option<CachedImport>,
+	token: String,
+	expires: Duration,
 	bytes: usize,
 	shared: Arc<Mutex<State>>,
 }
@@ -107,11 +122,35 @@ impl PayloadLease {
 	pub fn payload(&self) -> &CachedImport {
 		self.payload.as_ref().unwrap()
 	}
+
+	/// Puts the payload back under its token, unexpired, for a refusal
+	/// that wrote nothing: the same preview may apply again. Its charge
+	/// stays in place. Past the expiry it is released as a plain drop.
+	pub fn restore(mut self) {
+		{
+			let mut state =
+				self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+			if state.now() < self.expires {
+				if let Some(payload) = self.payload.take() {
+					state.entries.push(Stored {
+						token: std::mem::take(&mut self.token),
+						expires: self.expires,
+						bytes: self.bytes,
+						payload,
+					});
+				}
+			}
+		}
+	}
 }
 
 impl Drop for PayloadLease {
 	fn drop(&mut self) {
-		drop(self.payload.take());
+		// Restored leases have no payload left and keep their charge.
+		let Some(payload) = self.payload.take() else {
+			return;
+		};
+		drop(payload);
 		let mut state =
 			self.shared.lock().unwrap_or_else(PoisonError::into_inner);
 		state.bytes -= self.bytes;
@@ -188,6 +227,8 @@ impl PreparedCache {
 		drop(state);
 		let lease = PayloadLease {
 			payload: Some(entry.payload),
+			token: entry.token,
+			expires: entry.expires,
 			bytes: entry.bytes,
 			shared: self.shared.clone(),
 		};
@@ -338,5 +379,63 @@ mod tests {
 			Err(CacheError::Missing)
 		));
 		assert_eq!(cache.usage_for_tests(), (0, 0));
+	}
+
+	#[test]
+	fn a_restored_payload_applies_again_under_its_token_until_it_expires() {
+		let cache = PreparedCache::new();
+		let token = cache.insert(payload()).unwrap();
+		let charged = cache.usage_for_tests();
+		let lease = cache
+			.take(
+				&token,
+				Path::new("/workspace"),
+				Path::new("/workspace/dest"),
+				"digest",
+			)
+			.unwrap();
+		assert_eq!(lease.payload().text, payload().text);
+		lease.restore();
+		assert_eq!(
+			cache.usage_for_tests(),
+			charged,
+			"a restored payload keeps its charge"
+		);
+		let again = cache
+			.take(
+				&token,
+				Path::new("/workspace"),
+				Path::new("/workspace/dest"),
+				"digest",
+			)
+			.unwrap();
+		drop(again);
+		assert_eq!(cache.usage_for_tests(), (0, 0));
+
+		let token = cache.insert(payload()).unwrap();
+		let lease = cache
+			.take(
+				&token,
+				Path::new("/workspace"),
+				Path::new("/workspace/dest"),
+				"digest",
+			)
+			.unwrap();
+		cache.expire_for_tests();
+		lease.restore();
+		assert_eq!(
+			cache.usage_for_tests(),
+			(0, 0),
+			"an expired payload is released, not restored"
+		);
+		assert!(matches!(
+			cache.take(
+				&token,
+				Path::new("/workspace"),
+				Path::new("/workspace/dest"),
+				"digest"
+			),
+			Err(CacheError::Missing)
+		));
 	}
 }
