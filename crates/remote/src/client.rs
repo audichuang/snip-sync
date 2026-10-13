@@ -190,9 +190,13 @@ impl HandshakeGate {
 			}
 			let remaining = deadline.saturating_duration_since(Instant::now());
 			if remaining.is_zero() {
+				// Nothing was sent: the wait was for a slot, not the worker.
 				return Err(RemoteError::Start {
 					kind: ConnectFailureKind::TimedOut,
-					message: start_message(StartCause::NoAnswer, None, ""),
+					message: "timed out waiting for a connection slot to that \
+					          machine: other connections there are still \
+					          starting; try again"
+						.into(),
 				});
 			}
 			if *active < HANDSHAKES_PER_HOST {
@@ -1368,13 +1372,24 @@ impl Client {
 		cancel: Option<&CancelToken>,
 		deadline: Instant,
 	) -> Result<Connection, RemoteError> {
-		let deadline = deadline.min(Instant::now() + CONNECT_TIMEOUT);
+		self.connect_queued(cancel, deadline, CONNECT_TIMEOUT)
+	}
+
+	/// Waits for a handshake slot until `deadline` (the caller's limit), then
+	/// gives the hello `hello` counted from the moment the slot is taken, and
+	/// never past `deadline`. Time spent queued does not shorten the hello.
+	fn connect_queued(
+		&self,
+		cancel: Option<&CancelToken>,
+		deadline: Instant,
+		hello: Duration,
+	) -> Result<Connection, RemoteError> {
 		let _guard = self.handshakes.acquire(cancel, deadline)?;
 		Connection::open_until(
 			&self.host.transport,
 			&self.my_name,
 			cancel,
-			deadline,
+			deadline.min(Instant::now() + hello),
 		)
 	}
 
@@ -2819,6 +2834,134 @@ mod tests {
 		);
 		queued.home().unwrap();
 		assert_eq!(worker.started_connections_for_tests(), 3);
+	}
+
+	/// Holds every hello of `worker` until dropped, so two started
+	/// connections keep both handshake slots busy.
+	struct HoldHellos(Arc<Worker>);
+
+	impl HoldHellos {
+		fn new(worker: &Arc<Worker>) -> Self {
+			worker.hold_hellos_for_tests(true);
+			Self(worker.clone())
+		}
+	}
+
+	impl Drop for HoldHellos {
+		fn drop(&mut self) {
+			self.0.hold_hellos_for_tests(false);
+		}
+	}
+
+	#[test]
+	fn a_connect_queued_past_the_hello_budget_still_connects() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		let hold = HoldHellos::new(&worker);
+		let host = RemoteHost::in_process(worker.clone());
+		let mut holders = Vec::new();
+		for name in ["first", "second"] {
+			let client = Client::new(host.clone(), name.into());
+			holders.push(std::thread::spawn(move || client.home()));
+		}
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while worker.active_hellos_for_tests() < 2 {
+			assert!(Instant::now() < end, "two hellos never started");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		// A hello budget far shorter than the queue wait below: were the
+		// budget counted from before the queue, the connect would time out.
+		let hello = scaled(Duration::from_millis(200));
+		let queued = Arc::new(Client::new(host.clone(), "queued".into()));
+		let waiter = {
+			let queued = queued.clone();
+			std::thread::spawn(move || {
+				queued.connect_queued(
+					None,
+					Instant::now() + scaled(Duration::from_secs(10)),
+					hello,
+				)
+			})
+		};
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while queued.handshakes.waiting.load(Ordering::SeqCst) == 0 {
+			assert!(Instant::now() < end, "queued connect never waited");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let queued_at = Instant::now();
+		let queued_for = scaled(Duration::from_millis(600));
+		while queued_at.elapsed() < queued_for {
+			assert!(!waiter.is_finished(), "queued connect ended in the queue");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		drop(hold);
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while !waiter.is_finished() {
+			assert!(Instant::now() < end, "queued connect did not finish");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		waiter
+			.join()
+			.unwrap()
+			.expect("a queue wait past the hello budget must still connect");
+		for holder in holders {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while !holder.is_finished() {
+				assert!(Instant::now() < end, "held connection did not finish");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			holder.join().unwrap().unwrap();
+		}
+		assert_eq!(worker.started_connections_for_tests(), 3);
+	}
+
+	#[test]
+	fn a_handshake_slot_timeout_does_not_blame_the_worker() {
+		let worker = Arc::new(Worker::new(Default::default()));
+		let hold = HoldHellos::new(&worker);
+		let host = RemoteHost::in_process(worker.clone());
+		let mut holders = Vec::new();
+		for name in ["first", "second"] {
+			let client = Client::new(host.clone(), name.into());
+			holders.push(std::thread::spawn(move || client.home()));
+		}
+		let end = Instant::now() + scaled(Duration::from_secs(5));
+		while worker.active_hellos_for_tests() < 2 {
+			assert!(Instant::now() < end, "two hellos never started");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		let queued = Client::new(host.clone(), "queued".into());
+		let error = queued
+			.connect_until(
+				None,
+				Instant::now() + scaled(Duration::from_millis(100)),
+			)
+			.err()
+			.unwrap();
+		let message = error.to_string();
+		assert!(
+			matches!(
+				error,
+				RemoteError::Start {
+					kind: ConnectFailureKind::TimedOut,
+					..
+				}
+			),
+			"{message}"
+		);
+		assert!(error.is_transient_read_failure());
+		assert!(!error.outcome_unknown(), "queued connect sent no write");
+		assert!(message.contains("connection slot"), "{message}");
+		assert!(!message.contains("did not answer"), "{message}");
+		drop(hold);
+		for holder in holders {
+			let end = Instant::now() + scaled(Duration::from_secs(5));
+			while !holder.is_finished() {
+				assert!(Instant::now() < end, "held connection did not finish");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			holder.join().unwrap().unwrap();
+		}
+		assert_eq!(worker.started_connections_for_tests(), 2);
 	}
 
 	#[test]
