@@ -82,7 +82,9 @@ CLI:`snip paste --dry-run`(只列計畫)、`snip paste --apply [--overwrite | --
 
 - GUI:在**歷史時間軸**(commit graph)上選一段:點起點,Shift + 點終點（在兩端點間沿著 first-parent 鏈選取，自動略過分支上的 side commit；若無法構成 first-parent 鏈則退回可見列選取並在複製時拒絕；沿鏈只走目前顯示的 commit，若搜尋、ref 或路徑篩選隱藏了鏈中間的 commit（例如搜尋 `多行中文|C3 merge` 會隱藏 C2），選取就退回可見列範圍，複製時拒絕；清除篩選，或在隱藏的 commit 顯示時再選取，才能複製整條鏈）。
 - 顯示本機所有分支、遠端追蹤分支、標籤與 HEAD 的拓撲圖;可依 ref 篩選、搜尋 message / SHA,每頁 50 筆並能繼續載入（單一 repo 與多 repo 合併的 log 相同）。瀏覽不切換分支、不自動 fetch。
+- Log 的 Repository 篩選獨立於 Project 選取；單一 repo 的分支清單與 graph 都以該 Log repo 的 HEAD 標示目前位置。detached HEAD 不標任何分支為目前分支；多 repo 合併清單不顯示單一目前分支圖示，graph 仍依各列所屬 repo 判斷。
 - 點 commit 顯示它的檔案樹、內容與 diff;包含 root 的選取固定從所選 tip 回溯,也支援尚未合併的其他分支。
+- merge commit 的檔案清單保留 all-parent union，預覽 diff 比較 first parent；只相對其他 parent 改動、相對 first parent 不變的檔案顯示原文，不合成新增 diff。
 - CLI:`snip copy --commits -n <N>`(從 HEAD 往回 N 個)、`snip copy --commits <a>..<b>`。
 - **必須連續**:選取的 commit 必須能從起點沿著 **first parent** 一路走到終點。
   不連續就在複製時拒絕,並說明哪裡斷開。

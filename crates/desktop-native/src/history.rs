@@ -3405,6 +3405,16 @@ impl WorkbenchModel {
 	/// The checked-out branch of the repository a log row belongs to.
 	pub fn log_current_branch(&self, id: &str) -> Option<String> {
 		let (root, _) = self.log_root_for(id)?;
+		self.current_branch_at(&root)
+	}
+
+	/// The branch pane has one current branch only for a single-repo log.
+	/// Merged refs may share names across repos with different HEADs.
+	pub fn log_branch_list_current(&self) -> Option<String> {
+		self.current_branch_at(&self.log_root()?)
+	}
+
+	fn current_branch_at(&self, root: &Path) -> Option<String> {
 		self.repos
 			.iter()
 			.find(|r| r.root == root)?
