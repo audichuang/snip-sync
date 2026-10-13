@@ -21,8 +21,8 @@ use snip_core::restore::{
 };
 use snip_core::transfer::{
 	plan_import_with, CanonicalRootId, CommitReplayPreview,
-	DestinationFreshnessSnapshot, ImportMapping, TransferError,
-	TransferImportPlan,
+	DestinationFreshnessSnapshot, ImportMapping, ReplayFilePreview,
+	ReplayFileSide, TransferError, TransferImportPlan,
 };
 
 use crate::proto::{ErrorCode, ImportExpect, PasteMapping};
@@ -270,7 +270,54 @@ pub(crate) fn apply_failure(err: RemoteError) -> PasteError {
 	}
 }
 
+impl From<TransferError> for PasteError {
+	fn from(error: TransferError) -> Self {
+		Self::Local(error)
+	}
+}
+
 impl PasteTarget {
+	/// The selected commit file against its virtual destination before
+	/// replay. Only original destination bytes are read on the worker;
+	/// preceding payload contents are resolved by the common core engine.
+	#[allow(clippy::too_many_arguments)]
+	pub fn preview_commit_file(
+		&self,
+		preview: &CommitReplayPreview,
+		commit_index: usize,
+		file_index: usize,
+		side: ReplayFileSide,
+		limit: usize,
+		opts: &RunOptions,
+	) -> Result<ReplayFilePreview, PasteError> {
+		let limit = limit.min(snip_core::browser::PREVIEW_LIMIT);
+		preview.file_preview_with(
+			commit_index,
+			file_index,
+			side,
+			limit,
+			opts,
+			|path, opts| match self {
+				Self::Local { .. } => {
+					snip_core::transfer::read_replay_preview_with(
+						path, limit, opts,
+					)
+					.map_err(PasteError::Local)
+				}
+				Self::Remote {
+					client, workspace, ..
+				} => client
+					.read_replay_preview(
+						workspace,
+						path,
+						limit,
+						opts.cancel.as_ref(),
+					)
+					.map_err(PasteError::Remote),
+			},
+		)
+	}
+
 	/// Plans pasting the file payload `text`. Nothing is written. `opts`
 	/// carries the preview's cancel token and read limits; a worker uses
 	/// only the cancel token.
@@ -396,7 +443,7 @@ impl PasteTarget {
 					digest: plan.digest.clone().unwrap_or_default(),
 					freshness: plan.plan.destination_freshness().clone(),
 				};
-				client
+				let mut result = client
 					.import_apply(
 						workspace,
 						dest,
@@ -406,7 +453,14 @@ impl PasteTarget {
 						&expect,
 						None,
 					)
-					.map_err(apply_failure)
+					.map_err(apply_failure)?;
+				// Older workers omit this additive result field. The worker
+				// already checked the exact preview digest before writing, so
+				// its admitted plan has this same number of planning refusals.
+				// Assign, rather than add, to avoid counting a new worker twice.
+				result.planned_skipped_count =
+					plan.restore_plan().skipped_operations.len();
+				Ok(result)
 			}
 		}
 	}

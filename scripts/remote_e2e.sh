@@ -428,8 +428,23 @@ check "$pasted pasted files on the worker identical to a local paste" test "$dif
 
 w <<<"cd '$WD/pastews' && git init -q repo"
 printf '// FILE: repo/.git/hooks/pre-commit\n#!/bin/sh\necho owned\n' >"$MASTER/git-payload.txt"
-"$SNIP" remote paste h "$WD/pastews" --apply --stdin <"$MASTER/git-payload.txt" >/dev/null 2>&1
+protected_plan=$("$SNIP" remote paste h "$WD/pastews" --dry-run --stdin <"$MASTER/git-payload.txt" 2>/dev/null)
+check "protected preview names the rejected path" grep -Fq 'repo/.git/hooks/pre-commit' <<<"$protected_plan"
+check "protected preview retains the contract reason" grep -Fq 'UNRESOLVED_PATH' <<<"$protected_plan"
+check "protected preview explains Git metadata protection" grep -Fiq 'protected Git metadata' <<<"$protected_plan"
+protected_result=$("$SNIP" remote paste h "$WD/pastews" --apply --stdin <"$MASTER/git-payload.txt" 2>&1)
+check "all-skipped paste reports one planned skip" grep -Fq 'No actionable files found. Skipped 1.' <<<"$protected_result"
 check "a payload entry inside .git is skipped" w <<<"test ! -e '$WD/pastews/repo/.git/hooks/pre-commit'"
+
+# Planning skips and the user's keep-existing choice contribute once each.
+cat "$MASTER/git-payload.txt" >"$MASTER/mixed-skips-payload.txt"
+printf '\n// FILE: repo/skipped-feedback.txt\nallowed\n' >>"$MASTER/mixed-skips-payload.txt"
+mixed_result=$("$SNIP" remote paste h "$WD/pastews" --apply --stdin <"$MASTER/mixed-skips-payload.txt" 2>/dev/null)
+check "mixed paste counts one create and one planned skip" test "$mixed_result" = 'Created 1, Skipped 1'
+kept_result=$("$SNIP" remote paste h "$WD/pastews" --apply --skip-existing --stdin <"$MASTER/mixed-skips-payload.txt" 2>/dev/null)
+check "planned and existing skips are counted once each" test "$kept_result" = 'Skipped 2'
+check "mixed paste writes the legal file" w <<<"test \"\$(cat '$WD/pastews/repo/skipped-feedback.txt')\" = allowed"
+check "mixed paste still protects Git metadata" w <<<"test ! -e '$WD/pastews/repo/.git/hooks/pre-commit'"
 err=$("$SNIP" remote paste h "$WD/pastews" --in repo/.git --apply --overwrite --stdin <"$MASTER/payload.txt" 2>&1 >/dev/null)
 rc=$?
 if [ "$rc" = 1 ] && w <<<"test ! -e '$WD/pastews/repo/.git/a.txt'"; then

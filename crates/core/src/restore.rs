@@ -69,6 +69,14 @@ pub struct SkippedOperation {
 	pub raw_path: String,
 	pub relative_path: Option<String>,
 	pub reason: SkipReason,
+	/// Additional explanation without changing the TS-compatible reason code.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub detail: Option<SkipDetail>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkipDetail {
+	ProtectedGitMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,8 +147,18 @@ pub struct RestoreExecutionResult {
 	pub created_count: usize,
 	pub overwritten_count: usize,
 	pub skipped_existing_count: usize,
+	/// Entries refused during planning, separate from keeping existing files.
+	#[serde(default)]
+	pub planned_skipped_count: usize,
 	pub deleted_count: usize,
 	pub errors: Vec<String>,
+}
+
+impl RestoreExecutionResult {
+	pub fn total_skipped(&self) -> usize {
+		self.planned_skipped_count
+			.saturating_add(self.skipped_existing_count)
+	}
 }
 
 pub fn plan_restore<P: AsRef<Path>>(
@@ -159,19 +177,22 @@ pub fn plan_restore<P: AsRef<Path>>(
 			raw_path: entry.path.clone(),
 			relative_path,
 			reason,
+			detail: None,
+		};
+		let protected = || SkippedOperation {
+			detail: Some(SkipDetail::ProtectedGitMetadata),
+			..skip(None, SkipReason::UnresolvedPath)
 		};
 
 		if has_git_segment(&entry.path) {
-			plan.skipped_operations
-				.push(skip(None, SkipReason::UnresolvedPath));
+			plan.skipped_operations.push(protected());
 			continue;
 		}
 
 		if entry.change_types.contains(&ChangeType::Deleted) {
 			match resolve_delete_target(roots, &entry.path) {
 				Ok(t) if lands_in_git_dir(&t.absolute_path) => {
-					plan.skipped_operations
-						.push(skip(None, SkipReason::UnresolvedPath));
+					plan.skipped_operations.push(protected());
 				}
 				Ok(t) => plan.delete_operations.push(DeleteOperation {
 					relative_path: t.relative_path,
@@ -222,8 +243,7 @@ pub fn plan_restore<P: AsRef<Path>>(
 		if has_git_segment(&t.relative_path)
 			|| lands_in_git_dir(&t.absolute_path)
 		{
-			plan.skipped_operations
-				.push(skip(None, SkipReason::UnresolvedPath));
+			plan.skipped_operations.push(protected());
 			continue;
 		}
 
@@ -279,7 +299,10 @@ pub fn execute_restore_plan_observed(
 	selection: &RestoreSelection,
 	after_write: &mut dyn FnMut(&CreateOperation, &CreateOutcome),
 ) -> RestoreExecutionResult {
-	let mut result = RestoreExecutionResult::default();
+	let mut result = RestoreExecutionResult {
+		planned_skipped_count: plan.skipped_operations.len(),
+		..Default::default()
+	};
 
 	for (i, op) in plan.create_operations.iter().enumerate() {
 		if selection.unchecked_creates.contains(&i) {
@@ -1432,6 +1455,81 @@ mod tests {
 			".github/workflow.yml"
 		);
 		assert_eq!(plan.create_operations[2].relative_path, "foo.git/file");
+		assert!(plan
+			.skipped_operations
+			.iter()
+			.all(|op| op.detail == Some(SkipDetail::ProtectedGitMetadata)));
+	}
+
+	#[test]
+	fn planned_skips_and_kept_existing_files_are_counted_once() {
+		let (_d, root) = tmp();
+		fs::write(root.join("existing.txt"), "keep").unwrap();
+		let plan = plan_restore(
+			&[&root],
+			&[
+				entry(".git/hooks/pre-commit", "unsafe"),
+				entry("new.txt", "new"),
+				entry("existing.txt", "replace"),
+				entry("unchecked.txt", "unchecked"),
+			],
+		);
+		let unchecked = plan
+			.create_operations
+			.iter()
+			.position(|op| op.relative_path == "unchecked.txt")
+			.unwrap();
+		let result = execute_restore_plan(
+			&plan,
+			&RestoreSelection {
+				skip_existing: true,
+				unchecked_creates: [unchecked].into_iter().collect(),
+				..Default::default()
+			},
+		);
+		assert_eq!(result.planned_skipped_count, 1);
+		assert_eq!(result.skipped_existing_count, 1);
+		assert_eq!(result.total_skipped(), 2);
+		assert_eq!(result.created_count, 1);
+		assert!(result.errors.is_empty());
+		assert!(!root.join(".git/hooks/pre-commit").exists());
+		assert!(!root.join("unchecked.txt").exists());
+		assert_eq!(read(root.join("existing.txt")), "keep");
+		let only_skips =
+			plan_restore(&[&root], &[entry(".git/config", "unsafe")]);
+		let result =
+			execute_restore_plan(&only_skips, &RestoreSelection::default());
+		assert_eq!(result.total_skipped(), 1);
+		assert_eq!(
+			result.created_count
+				+ result.overwritten_count
+				+ result.deleted_count,
+			0
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn protected_skip_detail_survives_symlinks_and_metadata_destinations() {
+		let (_d, root) = tmp();
+		fake_git_dir(&root.join(".git"));
+		fs::write(root.join(".git/config"), "safe").unwrap();
+		std::os::unix::fs::symlink(".git", root.join("metadata")).unwrap();
+		for (base, path) in
+			[(&root, "metadata/config"), (&root.join(".git"), "config")]
+		{
+			let plan = plan_restore(&[base], &[entry(path, "unsafe")]);
+			assert_eq!(plan.skipped_operations.len(), 1);
+			assert_eq!(
+				plan.skipped_operations[0].reason,
+				SkipReason::UnresolvedPath
+			);
+			assert_eq!(
+				plan.skipped_operations[0].detail,
+				Some(SkipDetail::ProtectedGitMetadata)
+			);
+		}
+		assert_eq!(read(root.join(".git/config")), "safe");
 	}
 
 	#[test]

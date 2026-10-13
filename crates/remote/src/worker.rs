@@ -582,6 +582,25 @@ fn serve(
 					},
 				)?;
 			}
+			Request::ReplayRead {
+				workspace,
+				path,
+				limit,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					crate::proto::REPLAY_PREVIEW_VERSION,
+					|root, cancel| {
+						crate::pasteserve::replay_read(
+							root, &path, limit, cancel,
+						)
+					},
+				)?;
+			}
 			Request::ReplayPlan {
 				workspace,
 				dest,
@@ -826,6 +845,7 @@ impl State {
 			| Request::ExportChanges { .. }
 			| Request::ImportPlan { .. }
 			| Request::ImportApply { .. }
+			| Request::ReplayRead { .. }
 			| Request::ReplayPlan { .. }
 			| Request::ReplayApply { .. }
 			| Request::Chunk { .. }

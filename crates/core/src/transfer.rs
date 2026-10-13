@@ -44,6 +44,7 @@ use crate::workspace::{lock_heavy, HeavyGuard, RepoIdentity};
 mod changes;
 mod select;
 
+pub use crate::commits::ReplayPreviewUnavailable;
 pub use changes::{changed_items, ChangedItems};
 pub use select::{
 	copy_selection, copy_selection_detailed, expand_folder_items,
@@ -51,6 +52,97 @@ pub use select::{
 	plan_export_expanding, selection_from_paths, CopyOutcome, CopyReport,
 	FolderExpansion, PathSelection,
 };
+
+/// A rename has two visible rows: deleting the source and writing the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayFileSide {
+	Target,
+	RenamedFrom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayPreviewRead {
+	Text(String),
+	Unavailable(ReplayPreviewUnavailable),
+}
+
+/// Plain file contents, excluding commit metadata. An unavailable comparison
+/// is explicit; callers must not render its empty before as an added file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayFilePreview {
+	pub path: String,
+	pub before: String,
+	pub after: String,
+	pub unavailable: Option<ReplayPreviewUnavailable>,
+}
+
+/// Bounded, cancellable reader shared by local paste and the remote worker.
+/// Replay replaces symlinks, so their targets must never become its baseline.
+pub fn read_replay_preview_with(
+	path: &Path,
+	limit: usize,
+	opts: &RunOptions,
+) -> Result<ReplayPreviewRead, TransferError> {
+	use ReplayPreviewUnavailable as Why;
+	let unavailable = |why| Ok(ReplayPreviewRead::Unavailable(why));
+	cancelled_err(opts, "replay-preview-read")?;
+	let meta = match fs::symlink_metadata(path) {
+		Ok(meta) => meta,
+		Err(_) => return unavailable(Why::Unreadable),
+	};
+	if meta.file_type().is_symlink() {
+		return unavailable(Why::Symlink);
+	}
+	if meta.is_dir() {
+		return unavailable(Why::Directory);
+	}
+	if !meta.is_file() {
+		return unavailable(Why::Unreadable);
+	}
+	let limit = limit.min(crate::browser::PREVIEW_LIMIT);
+	if meta.len() > limit as u64 {
+		return unavailable(Why::TooLarge);
+	}
+	let mut open = fs::OpenOptions::new();
+	open.read(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+	}
+	#[cfg(windows)]
+	{
+		use std::os::windows::fs::OpenOptionsExt;
+		// FILE_FLAG_OPEN_REPARSE_POINT: open the link, not its target.
+		open.custom_flags(0x00200000);
+	}
+	let mut file = match open.open(path) {
+		Ok(file) => file,
+		Err(_) => return unavailable(Why::Unreadable),
+	};
+	if !file.metadata()?.file_type().is_file() {
+		return unavailable(Why::Unreadable);
+	}
+	let mut bytes = Vec::new();
+	let mut chunk = [0u8; FILE_IO_CHUNK];
+	loop {
+		cancelled_err(opts, "replay-preview-read")?;
+		let cap = chunk.len().min(limit.saturating_add(1) - bytes.len());
+		let n = file.read(&mut chunk[..cap])?;
+		if n == 0 {
+			break;
+		}
+		bytes.extend_from_slice(&chunk[..n]);
+		if bytes.len() > limit {
+			return unavailable(Why::TooLarge);
+		}
+	}
+	cancelled_err(opts, "replay-preview-read")?;
+	Ok(match decode_utf8_or_skip(bytes) {
+		Some(text) => ReplayPreviewRead::Text(text),
+		None => ReplayPreviewRead::Unavailable(Why::Binary),
+	})
+}
 
 /// A stable canonical identifier for an existing, resolved workspace or repository root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2846,7 +2938,8 @@ pub fn plan_import_with(
 	let entries = format::parse_clipboard(clipboard_text, header_format);
 	cancelled_err(opts, "plan-import")?;
 
-	let mut planned_entries: Vec<(CanonicalRootId, ParsedEntry)> = Vec::new();
+	let mut planned_entries: Vec<(CanonicalRootId, ParsedEntry, String)> =
+		Vec::new();
 	let mut skipped_operations = Vec::new();
 
 	for entry in entries {
@@ -2871,6 +2964,7 @@ pub fn plan_import_with(
 							raw_path: entry.path.clone(),
 							relative_path: None,
 							reason: SkipReason::UnresolvedPath,
+							detail: None,
 						});
 						continue;
 					}
@@ -2893,6 +2987,7 @@ pub fn plan_import_with(
 								raw_path: entry.path.clone(),
 								relative_path: None,
 								reason: SkipReason::UnresolvedPath,
+								detail: None,
 							});
 							continue;
 						}
@@ -2902,6 +2997,7 @@ pub fn plan_import_with(
 						raw_path: entry.path.clone(),
 						relative_path: None,
 						reason: SkipReason::UnresolvedPath,
+						detail: None,
 					});
 					continue;
 				} else if let Some(ref primary) = mapping.primary_destination {
@@ -2911,6 +3007,7 @@ pub fn plan_import_with(
 						raw_path: entry.path.clone(),
 						relative_path: None,
 						reason: SkipReason::UnresolvedPath,
+						detail: None,
 					});
 					continue;
 				}
@@ -2920,6 +3017,7 @@ pub fn plan_import_with(
 						raw_path: entry.path.clone(),
 						relative_path: None,
 						reason: SkipReason::UnresolvedPath,
+						detail: None,
 					});
 					continue;
 				}
@@ -2942,6 +3040,7 @@ pub fn plan_import_with(
 						raw_path: entry.path.clone(),
 						relative_path: None,
 						reason: SkipReason::UnresolvedPath,
+						detail: None,
 					});
 					continue;
 				}
@@ -2958,6 +3057,7 @@ pub fn plan_import_with(
 					raw_path: entry.path.clone(),
 					relative_path: None,
 					reason: SkipReason::UnresolvedPath,
+					detail: None,
 				});
 				continue;
 			}
@@ -2970,6 +3070,7 @@ pub fn plan_import_with(
 				raw_path: entry.path.clone(),
 				relative_path: None,
 				reason: SkipReason::UnresolvedPath,
+				detail: Some(restore::SkipDetail::ProtectedGitMetadata),
 			});
 			continue;
 		}
@@ -2979,6 +3080,7 @@ pub fn plan_import_with(
 				raw_path: entry.path.clone(),
 				relative_path: None,
 				reason: SkipReason::UnresolvedPath,
+				detail: None,
 			});
 			continue;
 		};
@@ -2988,6 +3090,7 @@ pub fn plan_import_with(
 				raw_path: entry.path.clone(),
 				relative_path: None,
 				reason: SkipReason::UnresolvedPath,
+				detail: Some(restore::SkipDetail::ProtectedGitMetadata),
 			});
 			continue;
 		}
@@ -2999,6 +3102,7 @@ pub fn plan_import_with(
 				content: entry.content,
 				change_types: entry.change_types,
 			},
+			entry.path,
 		));
 	}
 
@@ -3008,7 +3112,7 @@ pub fn plan_import_with(
 
 	// Same `plan_restore` as before, one entry at a time so a cancel is
 	// observed before the next file's encoding read.
-	for (root_id, entry) in &planned_entries {
+	for (root_id, entry, raw_path) in &planned_entries {
 		cancelled_err(opts, "plan-import")?;
 		let sub_plan = restore::plan_restore(
 			&[root_id.path()],
@@ -3016,7 +3120,12 @@ pub fn plan_import_with(
 		);
 		combined_creates.extend(sub_plan.create_operations);
 		combined_deletes.extend(sub_plan.delete_operations);
-		all_skipped.extend(sub_plan.skipped_operations);
+		all_skipped.extend(sub_plan.skipped_operations.into_iter().map(
+			|mut op| {
+				op.raw_path.clone_from(raw_path);
+				op
+			},
+		));
 	}
 
 	// Reject if two entries map to the same target file (including symlinks and case aliases)
@@ -3322,6 +3431,144 @@ pub struct CommitReplayPreview {
 }
 
 impl CommitReplayPreview {
+	/// Compare one row against the destination after the preceding commits.
+	/// Only original destination text needs I/O; the engine resolves prior
+	/// payload contents and absence itself. Readers must honor `opts` and the
+	/// supplied `limit`, as [`read_replay_preview_with`] does.
+	pub fn file_preview_with<E: From<TransferError>>(
+		&self,
+		commit_index: usize,
+		file_index: usize,
+		side: ReplayFileSide,
+		limit: usize,
+		opts: &RunOptions,
+		mut read: impl FnMut(&Path, &RunOptions) -> Result<ReplayPreviewRead, E>,
+	) -> Result<ReplayFilePreview, E> {
+		use commits::{ReplayAction, ReplayContentSource};
+		cancelled_err(opts, "replay-file-preview")?;
+		let invalid = || {
+			TransferError::Commit(CommitError::InvalidPayload(
+				"invalid replay preview row".into(),
+			))
+		};
+		let file = self
+			.replay
+			.commits
+			.get(commit_index)
+			.and_then(|c| c.files.get(file_index))
+			.ok_or_else(invalid)?;
+		let incoming = self
+			.payload
+			.commits
+			.get(commit_index)
+			.and_then(|c| c.files.get(file_index))
+			.ok_or_else(invalid)?;
+		let (path, absolute, source, after) = match side {
+			ReplayFileSide::Target => (
+				file.path.as_str(),
+				file.absolute_path.as_deref(),
+				file.before,
+				if file.action == ReplayAction::Write {
+					incoming.content.as_deref().unwrap_or("")
+				} else {
+					""
+				},
+			),
+			ReplayFileSide::RenamedFrom => (
+				file.old_path.as_deref().ok_or_else(invalid)?,
+				file.old_absolute_path.as_deref(),
+				file.old_before,
+				"",
+			),
+		};
+		let mut preview = ReplayFilePreview {
+			path: path.into(),
+			before: String::new(),
+			after: String::new(),
+			unavailable: None,
+		};
+		if file.action == ReplayAction::Skip
+			|| file.layout_conflict.is_some()
+			|| self.replay.commits[..=commit_index]
+				.iter()
+				.any(|c| c.refused_by().is_some())
+		{
+			preview.unavailable = Some(ReplayPreviewUnavailable::Skipped);
+			return Ok(preview);
+		}
+		let limit = limit.min(crate::browser::PREVIEW_LIMIT);
+		if after.len() > limit {
+			preview.unavailable = Some(ReplayPreviewUnavailable::TooLarge);
+			return Ok(preview);
+		}
+		preview.after = after.into();
+		let before = match source {
+			ReplayContentSource::Absent => {
+				ReplayPreviewRead::Text(String::new())
+			}
+			ReplayContentSource::Unavailable(why) => {
+				ReplayPreviewRead::Unavailable(why)
+			}
+			ReplayContentSource::Payload {
+				commit_index: c,
+				file_index: f,
+			} => {
+				if c >= commit_index {
+					return Err(invalid().into());
+				}
+				let text = self
+					.payload
+					.commits
+					.get(c)
+					.and_then(|c| c.files.get(f))
+					.and_then(|f| f.content.as_deref())
+					.ok_or_else(invalid)?;
+				if text.len() > limit {
+					ReplayPreviewRead::Unavailable(
+						ReplayPreviewUnavailable::TooLarge,
+					)
+				} else {
+					ReplayPreviewRead::Text(text.into())
+				}
+			}
+			ReplayContentSource::Destination => {
+				let absolute = absolute.ok_or_else(invalid)?;
+				let expected = self
+					.freshness
+					.target_files
+					.get(absolute)
+					.and_then(|t| t.file_state.as_ref())
+					.ok_or_else(invalid)?;
+				let value = read(absolute, opts)?;
+				cancelled_err(opts, "replay-file-preview")?;
+				if let ReplayPreviewRead::Text(text) = &value {
+					let hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+					if text.len() as u64 != expected.size
+						|| hash != expected.content_hash
+					{
+						return Err(TransferError::StaleDestination {
+							root: self.destination.clone(), reason: format!("target file '{path}' was modified externally after preview"),
+						}.into());
+					}
+				}
+				value
+			}
+		};
+		match before {
+			ReplayPreviewRead::Text(text) if text.len() <= limit => {
+				preview.before = text
+			}
+			ReplayPreviewRead::Text(_) => {
+				preview.unavailable = Some(ReplayPreviewUnavailable::TooLarge)
+			}
+			ReplayPreviewRead::Unavailable(why) => {
+				preview.unavailable = Some(why)
+			}
+		}
+		cancelled_err(opts, "replay-file-preview")?;
+		Ok(preview)
+	}
+
 	pub fn destination(&self) -> &Path {
 		&self.destination
 	}
@@ -3536,7 +3783,7 @@ impl CommitReplayPreview {
 		revalidate_replay_freshness(&self.freshness, opts)?;
 		let git = Git::open_with(&self.destination, opts)?;
 		let now = replay_plan_in(&git, &self.scope, &self.payload, opts)?;
-		if now != self.replay {
+		if !now.same_operations(&self.replay) {
 			return Err(TransferError::StaleDestination {
 				root: self.destination.clone(),
 				reason: "replay eligibility changed after preview".into(),
@@ -3896,6 +4143,386 @@ mod preview_target_hash_cancel {
 		assert_eq!(after.index, before.index);
 		assert_eq!(after.first, before.first);
 		assert_eq!(after.second, before.second);
+	}
+
+	fn replay_record(files: Vec<CommitFile>) -> CommitRecord {
+		CommitRecord {
+			message: "incoming\n".into(),
+			author_name: "Author".into(),
+			author_email: "author@example.invalid".into(),
+			author_date: "2026-09-26T00:00:00+00:00".into(),
+			files,
+		}
+	}
+
+	#[test]
+	fn mapped_protected_skip_keeps_the_original_payload_path_and_counts_once() {
+		let repo = Repo::new();
+		let id = CanonicalRootId::new(&repo.path).unwrap();
+		let mut mapping = ImportMapping::with_primary(id.clone());
+		mapping.map_prefix("target", id);
+		repo.write("binary", &[0xff]);
+		let plan = super::plan_import_with("// FILE: target/.git/hooks/pre-commit\nowned\n// FILE: target/binary\nreplacement\n", "", std::slice::from_ref(&repo.path), &mapping, &RunOptions::default()).unwrap();
+		assert_eq!(plan.skipped_operations().len(), 2);
+		let skipped = &plan.skipped_operations()[0];
+		assert_eq!(skipped.raw_path, "target/.git/hooks/pre-commit");
+		assert_eq!(skipped.reason, crate::restore::SkipReason::UnresolvedPath);
+		assert_eq!(
+			skipped.detail,
+			Some(crate::restore::SkipDetail::ProtectedGitMetadata)
+		);
+		assert_eq!(plan.skipped_operations()[1].raw_path, "target/binary");
+		let result = plan
+			.apply(&crate::restore::RestoreSelection::default())
+			.unwrap();
+		assert_eq!(result.total_skipped(), 2);
+		assert_eq!(result.planned_skipped_count, 2);
+		assert!(!repo.path.join(".git/hooks/pre-commit").exists());
+		assert_eq!(fs::read(repo.path.join("binary")).unwrap(), [0xff]);
+	}
+
+	fn replay_file(path: &str, content: Option<&str>) -> CommitFile {
+		CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: if content.is_some() {
+				FileChange::Modified
+			} else {
+				FileChange::Deleted
+			},
+			content: content.map(str::to_string),
+			not_copied: None,
+		}
+	}
+
+	fn row_preview(
+		preview: &CommitReplayPreview,
+		c: usize,
+		f: usize,
+		side: super::ReplayFileSide,
+	) -> super::ReplayFilePreview {
+		preview
+			.file_preview_with(
+				c,
+				f,
+				side,
+				crate::browser::PREVIEW_LIMIT,
+				&RunOptions::default(),
+				|path, opts| {
+					super::read_replay_preview_with(
+						path,
+						crate::browser::PREVIEW_LIMIT,
+						opts,
+					)
+				},
+			)
+			.unwrap()
+	}
+
+	#[test]
+	fn commit_row_preview_uses_the_preceding_commit_without_writing() {
+		use super::ReplayFileSide::Target;
+		let repo = Repo::new();
+		repo.write("common.txt", b"already\n");
+		repo.write("untouched.txt", b"keep\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let before = disk(&repo, "common.txt", "untouched.txt");
+		let payload = CommitsPayload {
+			commits: vec![
+				replay_record(vec![replay_file("common.txt", Some("c1\n"))]),
+				replay_record(vec![replay_file("common.txt", Some("c2\n"))]),
+			],
+		};
+		let preview =
+			CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+		let first = row_preview(&preview, 0, 0, Target);
+		let second = row_preview(&preview, 1, 0, Target);
+		assert_eq!(
+			(first.before.as_str(), first.after.as_str()),
+			("already\n", "c1\n")
+		);
+		assert_eq!(
+			(second.before.as_str(), second.after.as_str()),
+			("c1\n", "c2\n")
+		);
+		assert!(first.unavailable.is_none() && second.unavailable.is_none());
+		assert!(preview.plan().commits.iter().all(|c| c.files[0].existed));
+		assert_same(&before, &disk(&repo, "common.txt", "untouched.txt"));
+	}
+
+	#[test]
+	fn commit_row_preview_tracks_rename_deletion_and_skipped_content() {
+		use super::ReplayFileSide::{RenamedFrom, Target};
+		let repo = Repo::new();
+		repo.write("old.txt", b"old\n");
+		repo.write("kept.txt", b"kept\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let before = disk(&repo, "old.txt", "kept.txt");
+		let mut rename = replay_file("moved.txt", Some("second\n"));
+		rename.old_path = Some("new.txt".into());
+		rename.change = FileChange::Renamed;
+		let mut skipped = replay_file("kept.txt", None);
+		skipped.not_copied = Some(crate::commits::NotCopiedReason::Binary);
+		let payload = CommitsPayload {
+			commits: vec![
+				replay_record(vec![replay_file("new.txt", Some("first\n"))]),
+				replay_record(vec![
+					rename,
+					replay_file("old.txt", None),
+					skipped,
+				]),
+				replay_record(vec![
+					replay_file("moved.txt", Some("third\n")),
+					replay_file("old.txt", Some("again\n")),
+					replay_file("kept.txt", Some("changed\n")),
+				]),
+			],
+		};
+		let preview =
+			CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+		let cases = [
+			(0, 0, Target, "", "first\n"),
+			(1, 0, RenamedFrom, "first\n", ""),
+			(1, 0, Target, "", "second\n"),
+			(1, 1, Target, "old\n", ""),
+			(2, 0, Target, "second\n", "third\n"),
+			(2, 1, Target, "", "again\n"),
+			(2, 2, Target, "kept\n", "changed\n"),
+		];
+		for (c, f, side, old, new) in cases {
+			let row = row_preview(&preview, c, f, side);
+			assert_eq!(row.unavailable, None, "{c}/{f}/{side:?}");
+			assert_eq!(
+				(row.before.as_str(), row.after.as_str()),
+				(old, new),
+				"{c}/{f}/{side:?}"
+			);
+		}
+		assert_eq!(
+			row_preview(&preview, 1, 2, Target).unavailable,
+			Some(super::ReplayPreviewUnavailable::Skipped)
+		);
+		assert_same(&before, &disk(&repo, "old.txt", "kept.txt"));
+		assert!(!repo.path.join("new.txt").exists());
+		assert!(!repo.path.join("moved.txt").exists());
+		let applied = preview.apply().unwrap();
+		assert!(applied.failure.is_none(), "{applied:?}");
+		assert_eq!(applied.created.len(), 3);
+		assert_eq!(fs::read(repo.path.join("moved.txt")).unwrap(), b"third\n");
+		assert!(!repo.path.join("new.txt").exists());
+	}
+
+	#[test]
+	fn commit_row_preview_applies_all_rename_deletions_before_writes() {
+		use super::ReplayFileSide::{RenamedFrom, Target};
+		let repo = Repo::new();
+		repo.write("a", b"a\n");
+		repo.write("b", b"b\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let rename = |old: &str, new: &str, text: &str| CommitFile {
+			old_path: Some(old.into()),
+			change: FileChange::Renamed,
+			..replay_file(new, Some(text))
+		};
+		let payload = CommitsPayload {
+			commits: vec![
+				replay_record(vec![
+					rename("a", "b", "from-a\n"),
+					rename("b", "c", "from-b\n"),
+				]),
+				replay_record(vec![
+					replay_file("b", Some("next-b\n")),
+					replay_file("c", Some("next-c\n")),
+				]),
+			],
+		};
+		let preview =
+			CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+		assert_eq!(row_preview(&preview, 0, 1, RenamedFrom).before, "b\n");
+		assert_eq!(row_preview(&preview, 1, 0, Target).before, "from-a\n");
+		assert_eq!(row_preview(&preview, 1, 1, Target).before, "from-b\n");
+	}
+
+	#[test]
+	fn commit_row_preview_file_directory_transitions_have_absent_file_baselines(
+	) {
+		use super::ReplayFileSide::Target;
+		for file_to_directory in [true, false] {
+			let repo = Repo::new();
+			let (removed, added) = if file_to_directory {
+				repo.write("a", b"old file\n");
+				("a", "a/b")
+			} else {
+				fs::create_dir(repo.path.join("a")).unwrap();
+				repo.write("a/b", b"old child\n");
+				("a/b", "a")
+			};
+			repo.git(&["add", "-A"]);
+			repo.git(&["commit", "-q", "-m", "base"]);
+			let before_head = repo.git(&["rev-parse", "HEAD"]);
+			let before_index = fs::read(repo.path.join(".git/index")).unwrap();
+			let before_file = fs::read(repo.path.join(removed)).unwrap();
+			let payload = CommitsPayload {
+				commits: vec![
+					replay_record(vec![
+						replay_file(removed, None),
+						replay_file(added, Some("new\n")),
+					]),
+					replay_record(vec![replay_file(added, Some("next\n"))]),
+				],
+			};
+			let preview =
+				CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+			let row = row_preview(&preview, 0, 1, Target);
+			assert_eq!(
+				row.unavailable, None,
+				"file_to_directory={file_to_directory}"
+			);
+			assert_eq!(
+				(row.before.as_str(), row.after.as_str()),
+				("", "new\n")
+			);
+			assert_eq!(row_preview(&preview, 1, 0, Target).before, "new\n");
+			assert_eq!(repo.git(&["rev-parse", "HEAD"]), before_head);
+			assert_eq!(
+				fs::read(repo.path.join(".git/index")).unwrap(),
+				before_index
+			);
+			assert_eq!(fs::read(repo.path.join(removed)).unwrap(), before_file);
+		}
+	}
+
+	#[test]
+	fn commit_row_preview_refuses_stale_bytes_and_honors_cancel_and_limit() {
+		use super::{
+			ReplayFileSide::Target, ReplayPreviewUnavailable::TooLarge,
+		};
+		let repo = Repo::new();
+		repo.write("a", b"before\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let payload = CommitsPayload {
+			commits: vec![replay_record(vec![replay_file(
+				"a",
+				Some("after\n"),
+			)])],
+		};
+		let preview =
+			CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+		let limited = preview
+			.file_preview_with::<TransferError>(
+				0,
+				0,
+				Target,
+				2,
+				&RunOptions::default(),
+				|_, _| panic!("oversized incoming must not read"),
+			)
+			.unwrap();
+		assert_eq!(limited.unavailable, Some(TooLarge));
+		let token = CancelToken::new();
+		token.cancel();
+		let opts = RunOptions {
+			cancel: Some(token),
+			..RunOptions::default()
+		};
+		assert!(matches!(
+			preview.file_preview_with::<TransferError>(
+				0,
+				0,
+				Target,
+				1024,
+				&opts,
+				|_, _| panic!("cancelled read")
+			),
+			Err(TransferError::Git(GitError::Cancelled { .. }))
+		));
+		repo.write("a", b"externally changed\n");
+		assert!(matches!(
+			preview.file_preview_with(
+				0,
+				0,
+				Target,
+				1024,
+				&RunOptions::default(),
+				|path, opts| super::read_replay_preview_with(path, 1024, opts)
+			),
+			Err(TransferError::StaleDestination { .. })
+		));
+	}
+
+	#[test]
+	fn commit_row_preview_legacy_metadata_does_not_change_apply_eligibility() {
+		let repo = Repo::new();
+		repo.write("a", b"before\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let payload = CommitsPayload {
+			commits: vec![replay_record(vec![replay_file(
+				"a",
+				Some("after\n"),
+			)])],
+		};
+		let mut preview =
+			CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+		for commit in &mut preview.replay.commits {
+			for file in &mut commit.files {
+				file.before = Default::default();
+				file.old_before = Default::default();
+			}
+		}
+		preview.revalidate().unwrap();
+		assert_eq!(
+			row_preview(&preview, 0, 0, super::ReplayFileSide::Target)
+				.unavailable,
+			Some(super::ReplayPreviewUnavailable::Unreadable)
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn commit_row_preview_never_reads_a_symlink_and_tracks_its_replacement() {
+		use super::{
+			ReplayFileSide::Target, ReplayPreviewUnavailable::Symlink,
+		};
+		let repo = Repo::new();
+		repo.write("sentinel", b"secret\n");
+		std::os::unix::fs::symlink("sentinel", repo.path.join("link")).unwrap();
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let payload = CommitsPayload {
+			commits: vec![
+				replay_record(vec![replay_file("link", Some("replacement\n"))]),
+				replay_record(vec![replay_file("link", Some("next\n"))]),
+			],
+		};
+		let preview =
+			CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+		let first = preview
+			.file_preview_with::<TransferError>(
+				0,
+				0,
+				Target,
+				1024,
+				&RunOptions::default(),
+				|_, _| panic!("must not follow a link"),
+			)
+			.unwrap();
+		assert_eq!(first.unavailable, Some(Symlink));
+		assert_eq!(row_preview(&preview, 1, 0, Target).before, "replacement\n");
+		assert_eq!(
+			super::read_replay_preview_with(
+				&repo.path.join("link"),
+				1024,
+				&RunOptions::default()
+			)
+			.unwrap(),
+			super::ReplayPreviewRead::Unavailable(Symlink)
+		);
+		assert_eq!(fs::read(repo.path.join("sentinel")).unwrap(), b"secret\n");
 	}
 
 	fn assert_stopped_on_first_target(

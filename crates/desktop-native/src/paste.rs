@@ -154,6 +154,9 @@ pub struct PastePending {
 	ui_bytes: usize,
 	apply_allowance: usize,
 	apply_active: usize,
+	/// Captured replay plans still held by selected-row reads, including
+	/// cancelled reads that have not returned from their worker yet.
+	detail_active: usize,
 	ui_raw: Option<Weak<str>>,
 	seq: u64,
 	input: Option<(u64, usize, Option<Weak<str>>)>,
@@ -215,6 +218,7 @@ impl PastePending {
 			.saturating_add(held)
 			.saturating_add(self.latest.as_ref().map_or(0, PasteRequest::bytes))
 			.saturating_add(allowance.max(self.apply_active))
+			.saturating_add(self.detail_active)
 	}
 
 	pub fn admit_ui(
@@ -471,6 +475,8 @@ pub enum SkipCause {
 	Unreadable,
 	UnsafePath,
 	NonUtf8Target,
+	Restore(snip_core::restore::SkipReason),
+	ProtectedGitMetadata,
 	Other,
 }
 
@@ -527,6 +533,7 @@ pub struct PasteItem {
 	pub content: Arc<str>,
 	pub bytes: usize,
 	pub lines: usize,
+	/// Create/delete operation index, or payload file index for a commit row.
 	pub op_index: usize,
 	/// Commit replay only: the commit (index into the payload) this row
 	/// belongs to. `None` for file restores.
@@ -552,7 +559,16 @@ impl PasteItem {
 			&& matches!(self.op, PlannedOp::Create | PlannedOp::Overwrite)
 	}
 
+	pub fn planned_skip(&self) -> bool {
+		self.commit.is_none() && matches!(self.op, PlannedOp::Skip(_))
+	}
+
 	pub fn action(&self) -> RowAction {
+		if self.planned_skip() {
+			if let PlannedOp::Skip(reason) = self.op {
+				return RowAction::Skip(reason);
+			}
+		}
 		if !self.selected {
 			return RowAction::Excluded {
 				by_commit: self.commit.is_some(),
@@ -667,12 +683,20 @@ impl PasteApplyResult {
 		let counts = [
 			f.created_count,
 			f.overwritten_count,
-			f.skipped_existing_count,
+			f.total_skipped(),
 			f.deleted_count,
 			f.errors.len(),
 		]
 		.map(|n| n.to_string());
 		if f.errors.is_empty() {
+			if f.created_count + f.overwritten_count + f.deleted_count == 0
+				&& f.total_skipped() > 0
+			{
+				return Msg::new(
+					"status_paste_skipped",
+					[f.total_skipped().to_string()],
+				);
+			}
 			return Msg::new("status_paste_done", counts);
 		}
 		let mut args = counts.to_vec();
@@ -948,6 +972,7 @@ pub(crate) fn layout_conflict_cause_key(
 	}
 }
 
+#[cfg(test)]
 fn header_label(op: PlannedOp) -> &'static str {
 	match op {
 		PlannedOp::Create => "CREATE",
@@ -982,21 +1007,110 @@ pub struct PasteCounts {
 	pub skips: usize,
 }
 
+/// A selected replay row shares its captured plan; it never clones payload
+/// text or computes replay state in the desktop front end.
+pub(crate) struct CommitDiffRequest {
+	pub target: PasteTarget,
+	pub preview: Arc<CommitReplayPreview>,
+	pub commit: usize,
+	pub file: usize,
+	pub side: snip_core::transfer::ReplayFileSide,
+	// Declared last: the retained preview drops before its charge.
+	_charge: DetailReadCharge,
+}
+
+struct DetailReadCharge {
+	pool: Arc<Mutex<PastePending>>,
+	bytes: usize,
+}
+
+impl DetailReadCharge {
+	fn admit(
+		pool: &Arc<Mutex<PastePending>>,
+		bytes: usize,
+	) -> Result<Self, Msg> {
+		let mut state = lock_pending(pool);
+		check_budget(
+			state
+				.total_with_ui(
+					state.ui_bytes,
+					state.apply_allowance,
+					state.ui_raw.as_ref(),
+				)
+				.saturating_add(bytes),
+			MAX_RETAINED_PREVIEW_BYTES,
+		)?;
+		state.detail_active = state.detail_active.saturating_add(bytes);
+		Ok(Self {
+			pool: pool.clone(),
+			bytes,
+		})
+	}
+}
+
+impl Drop for DetailReadCharge {
+	fn drop(&mut self) {
+		let mut state = lock_pending(&self.pool);
+		state.detail_active = state
+			.detail_active
+			.checked_sub(self.bytes)
+			.expect("detail read charge released once");
+	}
+}
+
 impl PastePreviewPlan {
+	pub(crate) fn commit_diff_request(
+		&self,
+		idx: usize,
+		pool: &Arc<Mutex<PastePending>>,
+	) -> Result<Option<CommitDiffRequest>, Msg> {
+		let Some(item) = self.items.get(idx) else {
+			return Ok(None);
+		};
+		let Some(commit) = item.commit else {
+			return Ok(None);
+		};
+		let Some(preview) = self.commit_preview.as_ref() else {
+			return Ok(None);
+		};
+		let charge = DetailReadCharge::admit(
+			pool,
+			size_of::<CommitReplayPreview>()
+				.saturating_add(ARC_ALLOWANCE)
+				.saturating_add(preview.retained_heap_bytes()),
+		)?;
+		let side = if item.is_delete() && item.rename_note.is_some() {
+			snip_core::transfer::ReplayFileSide::RenamedFrom
+		} else {
+			snip_core::transfer::ReplayFileSide::Target
+		};
+		Ok(Some(CommitDiffRequest {
+			target: paste_target(self.remote.as_ref(), &self.destination)?,
+			preview: preview.clone(),
+			commit,
+			file: item.op_index,
+			side,
+			_charge: charge,
+		}))
+	}
+
 	pub fn detail_preview(&self) -> Option<Preview> {
 		self.detail_at(self.selected_item_idx)
 	}
 
 	pub(crate) fn detail_at(&self, idx: usize) -> Option<Preview> {
-		self.items.get(idx).filter(|i| !i.is_delete()).map(|i| {
-			Preview::new(
-				PreviewSource::PasteItem,
-				Some(i.path.clone()),
-				i.content.to_string(),
-				false,
-				Language::from_path_or_ext(&i.path, false),
-			)
-		})
+		self.items
+			.get(idx)
+			.filter(|i| i.commit.is_some() || !i.is_delete())
+			.map(|i| {
+				Preview::new(
+					PreviewSource::PasteItem,
+					Some(i.path.clone()),
+					i.content.to_string(),
+					false,
+					Language::from_path_or_ext(&i.path, false),
+				)
+			})
 	}
 
 	/// Conservative retained UI bytes. Arc referents are charged in full,
@@ -1296,16 +1410,6 @@ impl PastePreviewPlan {
 					}
 				};
 				let body = src.content.as_deref().unwrap_or_default();
-				let head = |op: PlannedOp| {
-					let label = header_label(op);
-					format!(
-						"commit: {}\nauthor: {} <{}>\ndate: {}\naction: {label}\n",
-						commit.message.trim_end(),
-						commit.author_name,
-						commit.author_email,
-						commit.author_date,
-					)
-				};
 				let dest_path = file
 					.absolute_path
 					.clone()
@@ -1330,7 +1434,7 @@ impl PastePreviewPlan {
 						content: Arc::from(text),
 						bytes: body_len,
 						lines,
-						op_index: c_idx * 1000 + f_idx,
+						op_index: f_idx,
 						commit: Some(c_idx),
 						rename_note,
 					}
@@ -1350,11 +1454,7 @@ impl PastePreviewPlan {
 						old_abs.clone(),
 						file.old_existed,
 						PlannedOp::Delete,
-						format!(
-							"{}path: {old}\nrenamed to: {}\n",
-							head(PlannedOp::Delete),
-							file.path
-						),
+						String::new(),
 						0,
 						0,
 						Some(format!("→ {}", file.path)),
@@ -1365,7 +1465,7 @@ impl PastePreviewPlan {
 					dest_path,
 					file.existed,
 					op,
-					format!("{}path: {}\n\n{body}", head(op), file.path),
+					body.to_string(),
 					body.len(),
 					body.lines().count(),
 					file.old_path
@@ -1660,12 +1760,47 @@ impl PastePreviewPlan {
 				limit,
 			)?;
 		}
+		for (op_idx, op) in plan.skipped_operations.iter().enumerate() {
+			let reason = if op.detail
+				== Some(snip_core::restore::SkipDetail::ProtectedGitMetadata)
+			{
+				SkipCause::ProtectedGitMetadata
+			} else {
+				SkipCause::Restore(op.reason)
+			};
+			let item = PasteItem {
+				path: op.raw_path.clone(),
+				dest_root: self.destination.clone(),
+				dest_root_name: root_name(&self.destination),
+				// There is no admitted destination for a skipped operation.
+				dest_path: self.destination.clone(),
+				dest_exists: false,
+				op: PlannedOp::Skip(reason),
+				overwrite_allowed: false,
+				selected: false,
+				content: Arc::from(""),
+				bytes: 0,
+				lines: 0,
+				op_index: op_idx,
+				commit: None,
+				rename_note: None,
+			};
+			items_heap = items_heap.saturating_add(item.retained_heap_bytes());
+			items.push(item);
+			check_budget(
+				base.saturating_add(items_heap)
+					.saturating_add(items.capacity() * size_of::<PasteItem>()),
+				limit,
+			)?;
+		}
 		Ok(items)
 	}
 
 	pub fn toggle_overwrite(&mut self, idx: usize) {
 		if let Some(item) = self.items.get_mut(idx) {
-			item.overwrite_allowed = !item.overwrite_allowed;
+			if item.overwritable() {
+				item.overwrite_allowed = !item.overwrite_allowed;
+			}
 		}
 	}
 
@@ -1675,7 +1810,9 @@ impl PastePreviewPlan {
 
 	pub fn toggle_selected(&mut self, idx: usize) {
 		if let Some(item) = self.items.get_mut(idx) {
-			item.selected = !item.selected;
+			if !item.planned_skip() {
+				item.selected = !item.selected;
+			}
 		}
 		if self.whole_commit {
 			if !self.all_selected() {
@@ -1884,10 +2021,7 @@ impl PastePreviewPlan {
 	}
 
 	pub fn counts(&self) -> PasteCounts {
-		let mut c = PasteCounts {
-			skips: self.plan.skipped_operations.len(),
-			..PasteCounts::default()
-		};
+		let mut c = PasteCounts::default();
 		for it in &self.items {
 			if it.overwritable() {
 				c.existing += 1;
@@ -1977,6 +2111,9 @@ impl PastePreviewPlan {
 		let mut skipped_existing = 0;
 
 		for item in &self.items {
+			if item.planned_skip() {
+				continue;
+			}
 			if !item.selected {
 				if item.is_delete() {
 					unchecked_deletes.insert(item.op_index);
@@ -2113,6 +2250,7 @@ impl PastePreviewPlan {
 				overwritten_count: 0,
 				deleted_count: 0,
 				skipped_existing_count: 0,
+				planned_skipped_count: 0,
 				errors: Vec::new(),
 			},
 			created_commits: replay_res.created,
@@ -2131,6 +2269,7 @@ pub(crate) mod tests {
 				created_count: 2,
 				overwritten_count: 1,
 				skipped_existing_count: 0,
+				planned_skipped_count: 0,
 				deleted_count: 0,
 				errors,
 			},
@@ -4210,7 +4349,12 @@ pub(crate) mod tests {
 			PastePreviewPlan::build_from_clipboard_text(&text, &path, &[], 1)
 				.unwrap();
 		assert!(unchecked.items[0].content.contains("incoming"));
-		assert!(unchecked.items[0].content.contains("Author"));
+		assert!(!unchecked.items[0].content.contains("Author"));
+		assert_eq!(
+			unchecked.commit_preview.as_ref().unwrap().plan().commits[0]
+				.author_name,
+			"Author"
+		);
 		assert!(!unchecked.items[0].overwrite_allowed);
 		unchecked.items[0].selected = false;
 		unchecked.items[0].overwrite_allowed = false;
