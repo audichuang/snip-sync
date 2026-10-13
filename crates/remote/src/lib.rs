@@ -106,6 +106,30 @@ impl RemoteError {
 		}
 	}
 
+	/// Whether restoring a remote tab may try the open again. Wider than
+	/// [`Self::is_transient_read_failure`], which the scan and paste paths
+	/// keep: a start failure nobody classified (a network or a folder not
+	/// up yet, ssh's own words) retries, and so does a folder that is not
+	/// there yet. The known permanent ones stop: a refused permission, a
+	/// worker that is missing, too old or speaks another protocol. Only
+	/// a folder open reaches this, never a write: an outcome-unknown write
+	/// is not retried through it.
+	pub fn is_restore_retryable(&self) -> bool {
+		match self {
+			Self::Start { kind, .. } => !matches!(
+				kind,
+				ConnectFailureKind::Authentication
+					| ConnectFailureKind::WorkerUnavailable
+					| ConnectFailureKind::Protocol
+			),
+			Self::Refused {
+				code: ErrorCode::NotFound | ErrorCode::Busy | ErrorCode::Timeout,
+				..
+			} => true,
+			_ => self.is_transient_read_failure(),
+		}
+	}
+
 	/// The request may have reached the worker and run there, but no answer
 	/// came back: after a write, whether it happened is unknown. A refusal,
 	/// a worker that never started, or one too old answered (or never got

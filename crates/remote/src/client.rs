@@ -2925,6 +2925,73 @@ mod tests {
 		}
 	}
 
+	/// A restore retries a start that ssh failed for a reason nobody
+	/// classified, while a permission refusal and the other known permanent
+	/// starts stay permanent.
+	#[test]
+	fn restore_retries_unclassified_starts_and_not_known_permanent_ones() {
+		for stderr in [
+			"ssh: Could not resolve hostname box: nodename nor servname provided, or not known",
+			"ssh: Could not resolve hostname box: Name or service not known",
+			"ssh: connect to host box port 22: Network is unreachable",
+		] {
+			let kind = start_failure_kind(&StartCause::Ended, Some(255), stderr);
+			assert_eq!(kind, ConnectFailureKind::Other, "{stderr}");
+			let error = RemoteError::Start {
+				kind,
+				message: start_message(StartCause::Ended, Some(255), stderr),
+			};
+			assert!(error.is_restore_retryable(), "{stderr}");
+			assert!(!error.outcome_unknown(), "no request ran before hello");
+		}
+		let denied = RemoteError::Start {
+			kind: start_failure_kind(
+				&StartCause::Ended,
+				Some(255),
+				"user@box: Permission denied (publickey).",
+			),
+			message: String::new(),
+		};
+		assert!(!denied.is_restore_retryable(), "{denied:?}");
+		assert!(!denied.is_transient_read_failure(), "{denied:?}");
+		for kind in [
+			ConnectFailureKind::Authentication,
+			ConnectFailureKind::WorkerUnavailable,
+			ConnectFailureKind::Protocol,
+		] {
+			let error = RemoteError::Start {
+				kind,
+				message: String::new(),
+			};
+			assert!(!error.is_restore_retryable(), "{error:?}");
+		}
+		for code in [ErrorCode::Busy, ErrorCode::Timeout, ErrorCode::NotFound] {
+			let error = RemoteError::Refused {
+				code,
+				message: String::new(),
+			};
+			assert!(error.is_restore_retryable(), "{error:?}");
+		}
+		for code in [ErrorCode::Forbidden, ErrorCode::Unsupported] {
+			let error = RemoteError::Refused {
+				code,
+				message: String::new(),
+			};
+			assert!(!error.is_restore_retryable(), "{error:?}");
+		}
+		for error in [
+			RemoteError::WorkerTooOld {
+				worker: "old".into(),
+				have: 1,
+				need: 2,
+			},
+			RemoteError::Protocol("bad frame".into()),
+			RemoteError::Cancelled,
+		] {
+			assert!(!error.is_restore_retryable(), "{error:?}");
+		}
+	}
+
 	fn timeout_scale() -> u32 {
 		std::env::var("SNIP_E2E_TIMEOUT_SCALE")
 			.ok()

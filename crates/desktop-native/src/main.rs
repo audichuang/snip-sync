@@ -2889,6 +2889,9 @@ impl WorkbenchModel {
 
 	pub fn reload_repos(&mut self, cx: &mut Context<Self>) {
 		self.user_action();
+		if self.refresh_failed_restore(cx) {
+			return;
+		}
 		if !self.accepting_work() {
 			return;
 		}
@@ -16707,6 +16710,70 @@ mod tests {
 				}
 			}
 
+			/// A saved remote tab whose host is an ssh that is down: its stderr
+			/// is a network message no classifier knows. Returns the down host,
+			/// the same host once up, the saved tabs, the store and the folder.
+			#[cfg(unix)]
+			fn unreachable_host_restore() -> (
+				snip_remote::RemoteHost,
+				snip_remote::RemoteHost,
+				crate::open_tabs::OpenTabs,
+				tempfile::TempDir,
+				tempfile::TempDir,
+			) {
+				use crate::open_tabs::{OpenTabs, SavedTab};
+				let shared_tmp = tempfile::tempdir().unwrap();
+				let shared = dunce::canonicalize(shared_tmp.path()).unwrap();
+				repo(&shared, "proj", &[("remote.txt", "r\n")]);
+				let name = "flaky-host";
+				let down = snip_remote::RemoteHost {
+					name: name.into(),
+					transport: snip_remote::Transport::Command(vec![
+						"sh".into(),
+						"-c".into(),
+						"echo 'ssh: connect to host flaky-host port 22: Network is unreachable' >&2; exit 255".into(),
+					]),
+				};
+				let mut up = snip_remote::RemoteHost::in_process(
+					std::sync::Arc::new(snip_remote::Worker::new(
+						snip_remote::WorkerOptions::default(),
+					)),
+				);
+				up.name = name.into();
+				let tabs = OpenTabs {
+					tabs: vec![SavedTab::Remote {
+						host: name.into(),
+						path: shared.display().to_string(),
+					}],
+					active: Some(0),
+				};
+				(down, up, tabs, tempfile::tempdir().unwrap(), shared_tmp)
+			}
+
+			/// Launches `tabs` with `hosts` as the ssh hosts on offer.
+			#[cfg(unix)]
+			fn launch_with_test_hosts<'a>(
+				cx: &'a mut TestAppContext,
+				tabs: &crate::open_tabs::OpenTabs,
+				store: &tempfile::TempDir,
+				hosts: Vec<snip_remote::RemoteHost>,
+			) -> (Entity<TabsRoot>, &'a mut VisualTestContext) {
+				cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+				let launch = Launch {
+					restore: Some(tabs.clone()),
+					first: FirstTab::Empty,
+					restore_dir: None,
+					store: Some(store.path().to_path_buf()),
+				};
+				let (root, cx) = crate::remote::with_test_hosts(hosts, || {
+					cx.add_window_view(|window, cx| {
+						TabsRoot::new(launch, "normal".into(), None, window, cx)
+					})
+				});
+				settle(cx);
+				(root, cx)
+			}
+
 			fn initial_scan_failures(
 				root: &Entity<TabsRoot>,
 				cx: &mut VisualTestContext,
@@ -17138,7 +17205,7 @@ mod tests {
 			}
 
 			#[gpui::test]
-			fn restored_remote_open_missing_workspace_is_not_retried(
+			fn restored_remote_open_missing_workspace_is_retried_until_it_exists(
 				cx: &mut TestAppContext,
 			) {
 				let _remote = remote_lock();
@@ -17176,17 +17243,105 @@ mod tests {
 					);
 					assert!(m.remote.session.is_none());
 				});
-				cx.executor().advance_clock(Duration::from_secs(60));
-				cx.run_until_parked();
+				// A folder that is not there yet is a start that may clear:
+				// it is tried again on the backoff, and connects once it exists.
+				cx.executor().advance_clock(crate::remote::retry_delay(1));
+				pump_scan_until(cx, "the second try fails too", |cx| {
+					model.read_with(cx, |m, _| {
+						!m.remote.busy
+							&& m.remote.restoring.as_ref().is_some_and(|r| {
+								r.attempts == 2 && r.failed.is_some()
+							})
+					})
+				});
+				repo(
+					Path::new(&fixture.paths[1]),
+					"missing",
+					&[("kept.txt", "unchanged\n")],
+				);
+				cx.executor().advance_clock(crate::remote::retry_delay(2));
+				pump_scan_until(
+					cx,
+					"the folder appears and the tab connects",
+					|cx| model.read_with(cx, |m, _| m.remote.session.is_some()),
+				);
 				model.read_with(cx, |m, _| {
-					assert_eq!(
-						m.remote.restoring.as_ref().unwrap().attempts,
-						1,
-						"permanent refusal must not be retried"
-					);
-					assert_eq!(m.status.key, "remote_open_failed");
+					assert!(m.remote.restoring.is_none())
 				});
 				assert_eq!(saved(fixture.store.path()), fixture.saved);
+			}
+
+			/// A start that ssh failed for a reason nobody classified (the
+			/// network not up yet after login) keeps the tab and retries on
+			/// the backoff; the tab connects once the host answers.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn restored_remote_unclassified_start_failure_is_retried(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let (down, up, tabs, store, _shared) =
+					unreachable_host_restore();
+				let (root, cx) =
+					launch_with_test_hosts(cx, &tabs, &store, vec![down]);
+				let remote = tab(&root, cx, 0);
+				pump_scan_until(cx, "the first start fails", |cx| {
+					remote.read_with(cx, |m, _| {
+						!m.remote.busy
+							&& m.remote
+								.restoring
+								.as_ref()
+								.is_some_and(|r| r.failed.is_some())
+					})
+				});
+				assert!(drawn(cx, "ws-tab-state:0:failed"));
+				remote.read_with(cx, |m, _| {
+					assert_eq!(
+						m.remote.restoring.as_ref().unwrap().attempts,
+						1
+					);
+				});
+
+				// The network is up: the next scheduled try connects the same tab.
+				remote.update(cx, |m, _| m.remote.hosts = vec![up]);
+				cx.executor().advance_clock(crate::remote::retry_delay(1));
+				pump_scan_until(cx, "the retry connects", |cx| {
+					remote.read_with(cx, |m, _| m.remote.session.is_some())
+				});
+				assert_eq!(count(&root, cx), 1, "no new tab");
+				assert_eq!(saved(store.path()).tabs, tabs.tabs);
+			}
+
+			/// Refresh on a failed restored tab tries the reconnect at once,
+			/// without waiting for its backoff timer.
+			#[cfg(unix)]
+			#[gpui::test]
+			fn refresh_retries_a_failed_restore_at_once(
+				cx: &mut TestAppContext,
+			) {
+				let _remote = remote_lock();
+				let (down, up, tabs, store, _shared) =
+					unreachable_host_restore();
+				let (root, cx) =
+					launch_with_test_hosts(cx, &tabs, &store, vec![down]);
+				let remote = tab(&root, cx, 0);
+				pump_scan_until(cx, "the first start fails", |cx| {
+					remote.read_with(cx, |m, _| {
+						!m.remote.busy
+							&& m.remote
+								.restoring
+								.as_ref()
+								.is_some_and(|r| r.failed.is_some())
+					})
+				});
+				// The host is back, but the clock stays put: only Refresh can
+				// try now, the backoff timer is 5 s away.
+				remote.update(cx, |m, _| m.remote.hosts = vec![up]);
+				click_id(cx, "btn-refresh".into());
+				pump_scan_until(cx, "Refresh connects the tab", |cx| {
+					remote.read_with(cx, |m, _| m.remote.session.is_some())
+				});
+				assert_eq!(count(&root, cx), 1, "no new tab");
 			}
 
 			#[gpui::test]
