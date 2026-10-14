@@ -39,6 +39,10 @@ pub struct LogFilterLayout {
 	pub more_w: std::rc::Rc<std::cell::Cell<f32>>,
 	pub last_mask: std::rc::Rc<std::cell::Cell<u8>>,
 	pub refresh_count: std::rc::Rc<std::cell::Cell<u8>>,
+	/// The widest text an active chip draws (0 until first measured: the
+	/// 180px default). Active chips share the bar, so a long value is
+	/// truncated before it pushes another active chip into the overflow.
+	pub text_cap: std::rc::Rc<std::cell::Cell<f32>>,
 	/// Each chip's last drawn text and its measured width. A chip whose
 	/// text is unchanged keeps that width while hidden, so a text estimate
 	/// cannot reveal it again and again (estimates run a few px short or
@@ -52,8 +56,43 @@ pub(crate) const LOG_FILTER_GAP: f32 = 4.0;
 pub(crate) const CONSERVATIVE_CHIP_W_EMPTY: f32 = 75.0;
 pub(crate) const CONSERVATIVE_CHIP_W_ACTIVE: f32 = 180.0;
 pub(crate) const CONSERVATIVE_MORE_W: f32 = 42.0;
+/// The widest chip text, and the narrowest an active chip's text is
+/// truncated to before the split gives up on showing it.
+pub(crate) const CHIP_TEXT_MAX_W: f32 = 180.0;
+pub(crate) const CHIP_TEXT_MIN_W: f32 = 64.0;
+/// A chip's padding, gap and icon around its text (with 1px slack).
+pub(crate) const CHIP_CHROME_W: f32 = 28.0;
+
+/// The text cap that lets active chips with these natural text widths
+/// share `room` px: short values keep their width, long ones split what
+/// is left.
+pub(crate) fn chip_text_cap(natural: &[f32], room: f32) -> f32 {
+	let mut sorted: Vec<f32> =
+		natural.iter().map(|w| w.min(CHIP_TEXT_MAX_W)).collect();
+	sorted.sort_by(f32::total_cmp);
+	let mut left = room;
+	let mut count = sorted.len();
+	for w in sorted {
+		if w * count as f32 > left {
+			break;
+		}
+		left -= w;
+		count -= 1;
+	}
+	if count == 0 {
+		return CHIP_TEXT_MAX_W;
+	}
+	(left / count as f32).clamp(CHIP_TEXT_MIN_W, CHIP_TEXT_MAX_W)
+}
 
 impl LogFilterLayout {
+	pub fn text_cap(&self) -> f32 {
+		match self.text_cap.get() {
+			c if c > 0.0 => c,
+			_ => CHIP_TEXT_MAX_W,
+		}
+	}
+
 	pub fn chip_width_cell(
 		&self,
 		menu: LogMenu,
@@ -836,9 +875,11 @@ impl WorkbenchModel {
 		let selector = id.clone();
 		let open = self.log_menu == Some(menu);
 		let active = value.is_some();
+		let text_cap = self.log_filter_layout.text_cap();
+		// The drawn width depends on the text and on its cap.
 		let text = match &value {
-			Some(v) => format!("{label}: {v}"),
-			None => label.to_string(),
+			Some(v) => format!("{label}: {v}\u{0}{text_cap:.0}"),
+			None => format!("{label}\u{0}{text_cap:.0}"),
 		};
 		div()
 			.id(SharedString::from(id.clone()))
@@ -862,7 +903,7 @@ impl WorkbenchModel {
 			)
 			.child(
 				div()
-					.max_w(px(180.))
+					.max_w(px(text_cap))
 					.overflow_hidden()
 					.line_clamp(1)
 					.text_ellipsis()
@@ -984,24 +1025,47 @@ impl WorkbenchModel {
 	pub(super) fn measure_log_chips(&self, window: &Window) {
 		let loc = self.locale;
 		let layout = &self.log_filter_layout;
-		let measured = layout.measured.borrow();
-		for (i, menu) in ALL_LOG_FILTER_MENUS.into_iter().enumerate() {
-			let (label, value) = self.log_menu_value(menu, loc);
-			let text = match &value {
-				Some(v) => format!("{label}: {v}"),
-				None => label,
-			};
-			let w = match &measured[i] {
-				(drawn, w) if *drawn == text && *w > 0. => *w,
-				// Padding 6+6, label (max 180), gap 3, 12px icon, 1px slack.
-				_ => 12. + text_width(window, &text, UI_TEXT).min(180.) + 16.,
-			};
-			layout.chip_width_cell(menu).set(w);
-		}
+		let texts: Vec<(String, bool)> = ALL_LOG_FILTER_MENUS
+			.into_iter()
+			.map(|menu| {
+				let (label, value) = self.log_menu_value(menu, loc);
+				match value {
+					Some(v) => (format!("{label}: {v}"), true),
+					None => (label, false),
+				}
+			})
+			.collect();
 		// Padding 4+4, gap 2, 10px icon, 1px slack. Without the active dot:
 		// `compute_split_count` adds it when a hidden chip has a value.
 		let more =
 			8. + text_width(window, t("log_chip_more", loc), UI_TEXT) + 13.;
+		let natural: Vec<f32> = texts
+			.iter()
+			.filter(|(_, active)| *active)
+			.map(|(text, _)| text_width(window, text, UI_TEXT))
+			.collect();
+		let cap = match (natural.len(), self.log_chips_available_width()) {
+			(0, _) => CHIP_TEXT_MAX_W,
+			(_, avail) if avail <= 0.0 => CHIP_TEXT_MAX_W,
+			(n, avail) => chip_text_cap(
+				&natural,
+				avail - more - n as f32 * (LOG_FILTER_GAP + CHIP_CHROME_W),
+			),
+		};
+		layout.text_cap.set(cap);
+		let measured = layout.measured.borrow();
+		for (i, menu) in ALL_LOG_FILTER_MENUS.into_iter().enumerate() {
+			let key = format!("{}\u{0}{cap:.0}", texts[i].0);
+			let w = match &measured[i] {
+				(drawn, w) if *drawn == key && *w > 0. => *w,
+				// Padding 6+6, label (capped), gap 3, 12px icon, 1px slack.
+				_ => {
+					CHIP_CHROME_W
+						+ text_width(window, &texts[i].0, UI_TEXT).min(cap)
+				}
+			};
+			layout.chip_width_cell(menu).set(w);
+		}
 		layout.more_w.set(more);
 	}
 
@@ -1041,14 +1105,17 @@ impl WorkbenchModel {
 		}
 	}
 
-	pub(super) fn log_scope_value(&self) -> Option<String> {
+	pub(crate) fn log_scope_value(&self) -> Option<String> {
 		let repo_value = match self.log_repo_filter.as_slice() {
 			[] => None,
 			_ => {
 				let scope = self.log_scope();
-				scope.first().map(|(_, name)| match scope.len() {
-					1 => name.clone(),
-					n => format!("{name} +{}", n - 1),
+				scope.first().map(|(root, _)| {
+					let name = self.log_repo_chip_name(root);
+					match scope.len() {
+						1 => name,
+						n => format!("{name} +{}", n - 1),
+					}
 				})
 			}
 		};
@@ -2435,6 +2502,27 @@ mod filter_split_tests {
 		// Nothing active: plain prefix order.
 		let prefix = 100. + 50. + 46. + 2. * LOG_FILTER_GAP;
 		assert_eq!(l.compute_split(prefix, [false; 4]), 0b0011);
+	}
+}
+
+#[cfg(test)]
+mod chip_text_cap_tests {
+	use super::*;
+
+	/// Values that fit keep their width; long ones share what is left;
+	/// the cap never goes below the floor or above the old 180.
+	#[test]
+	fn long_values_share_the_room_short_ones_keep_theirs() {
+		// Everything fits: no cap below the old 180.
+		assert_eq!(chip_text_cap(&[117., 87.], 400.), CHIP_TEXT_MAX_W);
+		// Neither fits twice over: both get half.
+		assert_eq!(chip_text_cap(&[117., 87.], 140.), 70.);
+		// The short one keeps its 87; the long one gets the rest.
+		assert_eq!(chip_text_cap(&[117., 87.], 200.), 113.);
+		assert_eq!(chip_text_cap(&[200., 200.], 300.), 150.);
+		assert_eq!(chip_text_cap(&[200., 200.], 20.), CHIP_TEXT_MIN_W);
+		assert_eq!(chip_text_cap(&[300.], 1000.), CHIP_TEXT_MAX_W);
+		assert_eq!(chip_text_cap(&[], 100.), CHIP_TEXT_MAX_W);
 	}
 }
 

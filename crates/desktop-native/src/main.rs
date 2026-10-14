@@ -7287,6 +7287,8 @@ mod tests {
 				// The breadcrumb names the host, never the internal root.
 				let root = m.ws_root().unwrap();
 				assert_eq!(m.log_repo_name(&root), "test-worker ▸ shared");
+				// The Repository chip drops the host prefix.
+				assert_eq!(m.log_repo_chip_name(&root), "shared");
 			});
 
 			// Refresh re-reads the open file: deleted on the worker, it shows
@@ -15734,6 +15736,65 @@ mod tests {
 			});
 			assert_ne!(wanted, 0b1111, "700 wide must not fit every chip");
 			assert_eq!(drawn, wanted, "the drawn split follows the new width");
+		}
+
+		/// At the default 1080x720 window with the details pane open, an
+		/// active repository and an active branch both stay on the bar:
+		/// their values are truncated before either goes into the overflow
+		/// chip (#205).
+		#[gpui::test]
+		fn two_active_log_chips_stay_on_the_bar_at_the_default_window(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 752.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.refs.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let (visible, hidden, repo_value) = model.read_with(cx, |m, _| {
+				let (on, off) = m.log_filter_split();
+				(on, off, m.log_scope_value())
+			});
+			assert_eq!(
+				repo_value.as_deref(),
+				Some("repo-01-core"),
+				"the repo chip shows the repo name"
+			);
+			assert!(
+				visible.contains(&crate::ui::LogMenu::Repo)
+					&& visible.contains(&crate::ui::LogMenu::Branch),
+				"both active chips stay on the bar: shown {visible:?}, \
+				 overflow {hidden:?}"
+			);
+			for id in ["log-filter-repo", "log-filter-branch"] {
+				assert!(cx.debug_bounds(id).is_some(), "{id} drawn");
+			}
 		}
 
 		/// At a narrow window width with widened details pane and an active long user filter,
