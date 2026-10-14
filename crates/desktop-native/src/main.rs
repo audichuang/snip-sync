@@ -16029,13 +16029,14 @@ mod tests {
 			});
 		}
 
-		/// True while the preview is a diff or file of a commit.
+		/// True while the preview is a diff, file or compare from the Log.
 		fn commit_preview_shown(m: &WorkbenchModel) -> bool {
 			use crate::reader::PreviewSource;
 			matches!(
 				m.preview.as_ref().map(|p| &p.source),
 				Some(PreviewSource::CommitDiff { .. })
 					| Some(PreviewSource::CommitFile { .. })
+					| Some(PreviewSource::Compare { .. })
 			)
 		}
 
@@ -16099,6 +16100,86 @@ mod tests {
 				assert!(
 					!commit_preview_shown(m),
 					"stale commit diff kept after the repository filter",
+				);
+			});
+		}
+
+		/// A Shift-range selection previews a Compare; a repository filter
+		/// change drops it with the selection and the compare state (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_clears_a_shift_range_compare(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			for n in ["one", "two"] {
+				fs::write(alpha.join(format!("{n}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {n}")]);
+			}
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix_of = |subject: &str| {
+				model
+					.read_with(cx, |m, _| {
+						m.display_commits()
+							.iter()
+							.position(|c| c.subject == subject)
+					})
+					.expect("commit listed")
+			};
+			let newer = ix_of("alpha two");
+			let older = ix_of("alpha one");
+			let newer_id: &'static str =
+				Box::leak(format!("log-subject:{newer}").into_boxed_str());
+			let older_id: &'static str =
+				Box::leak(format!("log-subject:{older}").into_boxed_str());
+			click(cx, newer_id);
+			let bounds = cx.debug_bounds(older_id).expect("older row");
+			cx.simulate_click(
+				bounds.center(),
+				gpui::Modifiers {
+					shift: true,
+					..Default::default()
+				},
+			);
+			cx.run_until_parked();
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| commit_preview_shown(m)) {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "range must be selected");
+				assert!(
+					matches!(
+						m.preview.as_ref().map(|p| &p.source),
+						Some(crate::reader::PreviewSource::Compare { .. })
+					),
+					"the range must preview a compare first",
+				);
+			});
+
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.selected_commit.is_none()) {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.log_selected.is_empty(), "range kept");
+				assert!(m.compare.is_none(), "compare state kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale compare kept after the repository filter",
 				);
 			});
 		}

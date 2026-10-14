@@ -1511,16 +1511,20 @@ impl WorkbenchModel {
 		self.selected_commit_file = None;
 		self.commit_file_sel.clear();
 		self.preview_loading = false;
+		self.compare = None;
 		self.clear_commit_preview();
 	}
 
-	/// Releases the preview only when it is a diff or file of a commit, so
-	/// a working-tree file or compare the user opened elsewhere stays (#202).
+	/// Releases the preview only when it came from the Log selection: a
+	/// commit diff or file, or a compare of a range or an endpoint diff.
+	/// Working-tree and paste previews stay (#202). A file opened from the
+	/// commit tree is a `CommitFile` too and counts as Log-derived.
 	fn clear_commit_preview(&mut self) {
 		let from_commit = matches!(
 			self.preview.as_ref().map(|p| &p.source),
 			Some(PreviewSource::CommitDiff { .. })
 				| Some(PreviewSource::CommitFile { .. })
+				| Some(PreviewSource::Compare { .. })
 		);
 		if from_commit {
 			self.clear_preview();
