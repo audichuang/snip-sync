@@ -15991,14 +15991,16 @@ mod tests {
 			cx.simulate_click(row.center(), gpui::Modifiers::none());
 			for _ in 0..50 {
 				settle(cx);
-				let loaded =
-					model.read_with(cx, |m, _| !m.commit_files.is_empty());
+				let loaded = model.read_with(cx, |m, _| {
+					!m.commit_files.is_empty() && m.preview.is_some()
+				});
 				if loaded {
 					break;
 				}
 			}
 			model.read_with(cx, |m, _| {
 				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(m.preview.is_some(), "the diff must load first");
 			});
 
 			model.update(cx, |m, cx| {
@@ -16020,6 +16022,84 @@ mod tests {
 				assert!(m.selected_commit.is_none(), "selection kept");
 				assert!(m.commit_files.is_empty(), "stale files kept");
 				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale commit diff kept after the branch filter",
+				);
+			});
+		}
+
+		/// True while the preview is a diff or file of a commit.
+		fn commit_preview_shown(m: &WorkbenchModel) -> bool {
+			use crate::reader::PreviewSource;
+			matches!(
+				m.preview.as_ref().map(|p| &p.source),
+				Some(PreviewSource::CommitDiff { .. })
+					| Some(PreviewSource::CommitFile { .. })
+			)
+		}
+
+		/// Changing the Log's repository scope drops the selected commit with
+		/// its files and diff, as a branch filter does (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_clears_the_selected_commit_and_its_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix = model
+				.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == "alpha commit")
+				})
+				.expect("alpha commit listed");
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			for _ in 0..50 {
+				settle(cx);
+				let loaded = model.read_with(cx, |m, _| {
+					!m.commit_files.is_empty() && commit_preview_shown(m)
+				});
+				if loaded {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(commit_preview_shown(m), "the diff must load first");
+			});
+
+			// The user's gestures: the repository chip, then beta.
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				let cleared =
+					model.read_with(cx, |m, _| m.selected_commit.is_none());
+				if cleared {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(m.commit_files.is_empty(), "stale files kept");
+				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale commit diff kept after the repository filter",
+				);
 			});
 		}
 
