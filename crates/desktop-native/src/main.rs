@@ -17651,6 +17651,106 @@ mod tests {
 					!tooltip_shown(cx, &text),
 					"the tooltip stays over the opened menu"
 				);
+				let row = workspace_menu_first_row(cx);
+				assert!(!covered_by_tooltip(cx, row, &text));
+			}
+
+			/// The tooltip `text` is drawn over the point `at`.
+			fn covered_by_tooltip(
+				cx: &mut VisualTestContext,
+				at: gpui::Point<gpui::Pixels>,
+				text: &str,
+			) -> bool {
+				cx.run_until_parked();
+				cx.debug_bounds(sel(format!("tooltip:{text}")))
+					.is_some_and(|b| b.contains(&at))
+			}
+
+			/// The first row of the open workspace menu.
+			fn workspace_menu_first_row(
+				cx: &mut VisualTestContext,
+			) -> gpui::Point<gpui::Pixels> {
+				let panel = cx
+					.debug_bounds("workspace-menu")
+					.expect("the workspace menu is drawn");
+				gpui::point(panel.center().x, panel.origin.y + gpui::px(20.))
+			}
+
+			/// Hovered until its tooltip is up, then clicked: the click
+			/// drops the shown tooltip too (#203).
+			#[gpui::test]
+			fn clicking_the_workspace_button_drops_its_shown_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				let loc = tab(&root, cx, 0).read_with(cx, |m, _| m.locale);
+				let text = format!(
+					"{} · {}",
+					a.display(),
+					crate::ui::mac_keys(crate::i18n::t(
+						"tip_workspace_menu",
+						loc
+					))
+				);
+				hover_id(cx, "btn-workspace-menu");
+				assert!(tooltip_shown(cx, &text), "the tooltip is up");
+				click_id(cx, "btn-workspace-menu".into());
+				assert!(
+					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					"the menu is open"
+				);
+				assert!(!tooltip_shown(cx, &text), "the tooltip stays");
+				let row = workspace_menu_first_row(cx);
+				assert!(!covered_by_tooltip(cx, row, &text));
+			}
+
+			/// The Log toolbar's More button opens a menu below itself:
+			/// its tooltip must not cover the first item (#203).
+			#[gpui::test]
+			fn opening_the_log_more_menu_hides_its_buttons_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				let r = repo(ws.path(), "my-repo", &[]);
+				fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "commit c1"]);
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+				for _ in 0..50 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.commits.is_empty()) {
+						break;
+					}
+				}
+				settle(cx);
+				let loc = model.read_with(cx, |m, _| m.locale);
+				let text = crate::i18n::t("tip_log_more", loc).to_string();
+				// Clicked while the tooltip still waits to show.
+				let at = cx
+					.debug_bounds("btn-log-more")
+					.expect("More drawn")
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+				click_id(cx, "btn-log-more".into());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+				assert_eq!(
+					model.read_with(cx, |m, _| m.log_menu),
+					Some(crate::ui::LogMenu::More),
+					"the menu is open"
+				);
+				assert!(
+					!tooltip_shown(cx, &text),
+					"the tooltip stays over the opened menu"
+				);
+				let item = cx
+					.debug_bounds("log-more:details")
+					.expect("first item drawn")
+					.center();
+				assert!(!covered_by_tooltip(cx, item, &text));
 			}
 
 			/// A tooltip left up while a native dialog took the pointer

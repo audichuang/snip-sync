@@ -673,6 +673,19 @@ pub(super) fn log_icon_button(
 	enabled: bool,
 	active: bool,
 ) -> Stateful<Div> {
+	log_icon_button_tip(id, ic, Some(tooltip.into()), enabled, active)
+}
+
+/// `log_icon_button` whose tooltip can be left off: a button that opens a
+/// menu below itself passes `None` while the menu is open, or the tooltip
+/// covers the menu's first item (#203).
+pub(super) fn log_icon_button_tip(
+	id: &'static str,
+	ic: Icon,
+	tooltip: Option<SharedString>,
+	enabled: bool,
+	active: bool,
+) -> Stateful<Div> {
 	div()
 		.id(id)
 		.debug_selector(move || id.to_string())
@@ -685,7 +698,7 @@ pub(super) fn log_icon_button(
 		.rounded(px(4.))
 		.border_1()
 		.border_color(transparent_black())
-		.tooltip(tip(tooltip))
+		.when_some(tooltip, |d, t| d.tooltip(tip(t)))
 		.when(active, |d| d.bg(rgb(pal().hover_bg)))
 		.when(enabled, |d| {
 			d.cursor_pointer().hover(|s| s.bg(rgb(pal().hover_bg)))
