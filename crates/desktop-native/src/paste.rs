@@ -693,6 +693,31 @@ impl PrefixChoice {
 	}
 }
 
+/// 1023 B, 1.5 KB, 2.1 MB (binary units, one decimal).
+pub(crate) fn human_bytes(n: u64) -> String {
+	const K: f64 = 1024.0;
+	if n < 1024 {
+		format!("{n} B")
+	} else if (n as f64) < K * K {
+		format!("{:.1} KB", n as f64 / K)
+	} else {
+		format!("{:.1} MB", n as f64 / (K * K))
+	}
+}
+
+/// Eight-character SHAs; past `max`, the rest as "+N".
+pub(crate) fn short_shas(shas: &[String], max: usize) -> String {
+	let mut out: Vec<String> = shas
+		.iter()
+		.take(max)
+		.map(|s| s.chars().take(8).collect())
+		.collect();
+	if shas.len() > max {
+		out.push(format!("+{}", shas.len() - max));
+	}
+	out.join(", ")
+}
+
 /// Result of a confirmed apply. `created_commits` is empty for file restores.
 #[derive(Debug, Clone)]
 pub struct PasteApplyResult {
@@ -708,7 +733,7 @@ impl PasteApplyResult {
 		if !self.created_commits.is_empty() {
 			return Msg::new(
 				"commit_replay_done",
-				[self.created_commits.join(", ")],
+				[short_shas(&self.created_commits, 3)],
 			);
 		}
 		let f = &self.files;
@@ -888,6 +913,8 @@ pub struct PastePreviewPlan {
 	pub import_plan: Option<Arc<FilePastePlan>>,
 	/// Whole-commit replay. File checkboxes do not rewrite a subset.
 	pub commit_preview: Option<Arc<CommitReplayPreview>>,
+	/// The worker's retained commit preview (protocol 8), shared by clones.
+	pub commit_prepared: snip_remote::PreparedReplay,
 	pub whole_commit: bool,
 	/// Commits whose file rows are folded away (commit replay only).
 	pub collapsed_commits: BTreeSet<usize>,
@@ -1210,7 +1237,8 @@ impl PastePreviewPlan {
 				.saturating_add(
 					size_of::<CommitReplayPreview>() + ARC_ALLOWANCE,
 				)
-				.saturating_add(plan.retained_heap_bytes());
+				.saturating_add(plan.retained_heap_bytes())
+				.saturating_add(self.commit_prepared.retained_heap_bytes());
 		}
 		if let Some(error) = &self.error {
 			bytes = bytes
@@ -1367,6 +1395,7 @@ impl PastePreviewPlan {
 			destination: dest.to_path_buf(),
 			import_plan: None,
 			commit_preview: None,
+			commit_prepared: Default::default(),
 			whole_commit: false,
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
@@ -1420,7 +1449,7 @@ impl PastePreviewPlan {
 		// The write scope is the folder the user pasted into: the worker
 		// holds the replay to it the same way.
 		let target = paste_target(remote.as_ref(), dest)?;
-		let preview = target
+		let (preview, prepared) = target
 			.plan_commits(raw_text, payload, opts)
 			.map_err(|e| destination_msg(remote.as_ref(), dest, e))?;
 		let preview = Arc::new(preview);
@@ -1438,6 +1467,7 @@ impl PastePreviewPlan {
 			destination,
 			import_plan: None,
 			commit_preview: Some(preview.clone()),
+			commit_prepared: prepared,
 			whole_commit: true,
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
@@ -1462,9 +1492,19 @@ impl PastePreviewPlan {
 			.zip(&preview.payload().commits)
 			.enumerate()
 		{
-			for (f_idx, (file, src)) in
-				commit.files.iter().zip(&record.files).enumerate()
-			{
+			// Rows follow the Log's natural path order (g1, g2, g10), not replay
+			// order; op_index keeps the replay index (#196). A rename's two rows
+			// stay together under the new path.
+			let n = commit.files.len().min(record.files.len());
+			let mut order: Vec<usize> = (0..n).collect();
+			order.sort_by(|&a, &b| {
+				crate::ui::natural_cmp(
+					&commit.files[a].path,
+					&commit.files[b].path,
+				)
+			});
+			for f_idx in order {
+				let (file, src) = (&commit.files[f_idx], &record.files[f_idx]);
 				let op = if let Some(conflict) = file.layout_conflict {
 					PlannedOp::CommitRefused(conflict)
 				} else {
@@ -1980,8 +2020,9 @@ impl PastePreviewPlan {
 
 	/// Item indices in change-tree order: by destination root, then
 	/// directory (a root's own files first), then name. `items` itself keeps
-	/// the plan's order. A commit replay lists its visible rows in replay
-	/// order instead, exactly as [`Self::commit_rows`] shows them.
+	/// the plan's order. A commit replay lists its visible rows in natural
+	/// path order like the Log instead, exactly as [`Self::commit_rows`]
+	/// shows them.
 	pub fn display_order(&self) -> Vec<usize> {
 		if self.whole_commit {
 			return self
@@ -1993,17 +2034,15 @@ impl PastePreviewPlan {
 				})
 				.collect();
 		}
-		// Case-insensitive like IntelliJ's tree; the raw path breaks ties.
+		// Natural path order like the Log (g2 before g10); the root comes first.
 		let mut order: Vec<usize> = (0..self.items.len()).collect();
-		order.sort_by_cached_key(|&i| {
-			let it = &self.items[i];
-			let (dir, name) = split_dir(&it.path);
-			(
-				it.dest_root_name.clone(),
-				dir.to_lowercase(),
-				name.to_lowercase(),
-				it.path.clone(),
-			)
+		order.sort_by(|&a, &b| {
+			let (x, y) = (&self.items[a], &self.items[b]);
+			let ((dx, nx), (dy, ny)) = (split_dir(&x.path), split_dir(&y.path));
+			x.dest_root_name
+				.cmp(&y.dest_root_name)
+				.then_with(|| crate::ui::natural_cmp(dx, dy))
+				.then_with(|| crate::ui::natural_cmp(nx, ny))
 		});
 		order
 	}
@@ -2044,7 +2083,7 @@ impl PastePreviewPlan {
 	}
 
 	/// The commit replay as the user will see it: each commit's header, in
-	/// replay order, followed by its file rows. An empty commit is a header
+	/// replay order, followed by its file rows in natural path order. An empty commit is a header
 	/// with no rows; a collapsed commit keeps only its header.
 	pub fn commit_rows(&self) -> Vec<PasteNode> {
 		let Some(preview) = &self.commit_preview else {
@@ -2141,7 +2180,11 @@ impl PastePreviewPlan {
 		let target = paste_target(self.remote.as_ref(), &self.destination)?;
 		if let Some(preview) = &self.commit_preview {
 			target
-				.check_commits(&self.raw_payload, preview)
+				.check_commits(
+					&self.raw_payload,
+					preview,
+					&self.commit_prepared,
+				)
 				.map_err(|e| {
 					commit_msg(
 						self.remote.as_ref(),
@@ -2230,7 +2273,11 @@ impl PastePreviewPlan {
 		// Core overwrites (spec 4.3); asking first is this session's rule. Stale still wins over the prompt, as before.
 		if self.overwrite_missing() {
 			target
-				.check_commits(&self.raw_payload, preview)
+				.check_commits(
+					&self.raw_payload,
+					preview,
+					&self.commit_prepared,
+				)
 				.map_err(|e| {
 					commit_msg(
 						self.remote.as_ref(),
@@ -2242,7 +2289,7 @@ impl PastePreviewPlan {
 			return Err(Msg::new("commit_overwrite_required", []));
 		}
 		let replay_res = target
-			.apply_commits(&self.raw_payload, preview)
+			.apply_commits(&self.raw_payload, preview, &self.commit_prepared)
 			.map_err(|e| {
 				commit_msg(self.remote.as_ref(), &self.destination, e, true)
 			})?;
@@ -2289,7 +2336,7 @@ impl PastePreviewPlan {
 				};
 				return Err(msg);
 			}
-			let created = replay_res.created.join(", ");
+			let created = short_shas(&replay_res.created, usize::MAX);
 			return Err(match fail.layout_conflict {
 				Some(conflict) => {
 					let path = fail
@@ -2329,6 +2376,23 @@ impl PastePreviewPlan {
 #[cfg(test)]
 pub(crate) mod tests {
 	use super::*;
+
+	#[test]
+	fn human_bytes_and_short_shas_format_for_toasts() {
+		assert_eq!(human_bytes(0), "0 B");
+		assert_eq!(human_bytes(1023), "1023 B");
+		assert_eq!(human_bytes(1536), "1.5 KB");
+		assert_eq!(human_bytes(2250174), "2.1 MB");
+		let shas: Vec<String> = ["a", "b", "c", "d", "e", "f"]
+			.iter()
+			.map(|c| c.repeat(40))
+			.collect();
+		assert_eq!(short_shas(&shas, 3), "aaaaaaaa, bbbbbbbb, cccccccc, +3");
+		assert_eq!(
+			short_shas(&shas, usize::MAX),
+			"aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee, ffffffff"
+		);
+	}
 
 	#[test]
 	fn apply_status_lists_each_failed_path_not_only_the_count() {
@@ -3491,7 +3555,7 @@ pub(crate) mod tests {
 	}
 
 	#[test]
-	fn commit_preview_lists_skips_renames_and_groups_in_replay_order() {
+	fn commit_preview_lists_skips_renames_and_groups_in_path_order() {
 		let (_dir, plan) = mixed_plan();
 		let shown: Vec<String> = plan
 			.commit_rows()
@@ -3509,10 +3573,10 @@ pub(crate) mod tests {
 			shown,
 			[
 				"C0",
-				"SKIP img.bin",
-				"CREATE fresh.txt",
 				"DELETE old.txt",
 				"CREATE dir/new.txt",
+				"CREATE fresh.txt",
+				"SKIP img.bin",
 				"C1",
 				"C2",
 				"OVERWRITE a.txt",
@@ -3701,15 +3765,21 @@ pub(crate) mod tests {
 		assert_eq!(commit_plan.files[1].layout_conflict, None);
 
 		// Item op and action are CommitRefused, and is_not_written() is false
+		// Rows follow natural path order, so the blocked file is found by path.
+		let blocked = plan
+			.items
+			.iter()
+			.find(|i| i.path == "newdir/x.txt")
+			.expect("the blocked file has a row");
 		assert_eq!(
-			plan.items[0].op,
+			blocked.op,
 			PlannedOp::CommitRefused(LayoutConflict::FileInTheWayOfParent)
 		);
 		assert_eq!(
-			plan.items[0].action(),
+			blocked.action(),
 			RowAction::CommitRefused(LayoutConflict::FileInTheWayOfParent)
 		);
-		assert!(!plan.items[0].action().is_not_written());
+		assert!(!blocked.action().is_not_written());
 
 		// Header not-written count excludes the refused row
 		let (total_rows, not_written) = plan.commit_counts(0);
@@ -4799,10 +4869,10 @@ pub(crate) mod tests {
 			shape,
 			[
 				"C0",
-				"Skip(Binary):img.bin",
-				"Create:fresh.txt",
 				"Delete:old.txt",
 				"Create:dir/new.txt",
+				"Create:fresh.txt",
+				"Skip(Binary):img.bin",
 				"C1",
 				"C2",
 				"OverwritePending:a.txt",
@@ -4821,14 +4891,19 @@ pub(crate) mod tests {
 		assert_eq!(plan.commit_counts(0), (4, 1));
 		assert_eq!(plan.commit_counts(1), (0, 0));
 		assert_eq!(plan.commit_counts(2), (1, 0));
-		let mut excluded = plan.items[0].clone();
+		let mut excluded = plan
+			.items
+			.iter()
+			.find(|i| i.path == "fresh.txt")
+			.unwrap()
+			.clone();
 		excluded.selected = false;
 		assert_eq!(excluded.action(), RowAction::Excluded { by_commit: true });
 		assert!(plan.executable());
 	}
 
 	#[test]
-	fn up_down_walk_commit_rows_in_replay_order() {
+	fn up_down_walk_commit_rows_in_path_order() {
 		let (_dir, mut plan) = mixed_plan();
 		plan.selected_item_idx = 0;
 		let mut seen = vec![plan.items[0].path.clone()];
@@ -4839,13 +4914,85 @@ pub(crate) mod tests {
 		seen.dedup();
 		assert_eq!(
 			seen,
-			["img.bin", "fresh.txt", "old.txt", "dir/new.txt", "a.txt"]
+			["old.txt", "dir/new.txt", "fresh.txt", "img.bin", "a.txt"]
 		);
 		// A folded commit's rows are skipped, and Up re-enters
 		// from a selection that is folded away.
 		plan.toggle_commit_collapsed(0);
 		plan.select_prev();
 		assert_eq!(plan.items[plan.selected_item_idx].path, "a.txt");
+	}
+
+	#[test]
+	fn commit_rows_follow_natural_path_order() {
+		use snip_core::commits::{
+			CommitFile, CommitRecord, CommitsPayload, FileChange,
+		};
+		let file = |path: &str| CommitFile {
+			path: path.into(),
+			old_path: None,
+			change: FileChange::Added,
+			content: Some(format!("{path}\n")),
+			not_copied: None,
+		};
+		let payload = commits::to_clipboard_text(&CommitsPayload {
+			commits: vec![CommitRecord {
+				message: "natural\n".into(),
+				author_name: "Author".into(),
+				author_email: "author@example.invalid".into(),
+				author_date: "2026-09-25T12:00:00+00:00".into(),
+				files: vec![
+					file("g1.txt"),
+					file("g10.txt"),
+					file("g11.txt"),
+					file("g2.txt"),
+				],
+			}],
+		});
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().to_path_buf();
+		git_init(&path);
+		fs::write(path.join("a.txt"), "base\n").unwrap();
+		for args in [&["add", "."][..], &["commit", "-qm", "base"][..]] {
+			git_run(&path, args);
+		}
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			&payload,
+			&path,
+			&[],
+			1,
+		)
+		.unwrap();
+		let shown: Vec<String> = plan
+			.commit_rows()
+			.iter()
+			.filter_map(|r| match r {
+				PasteNode::File(ix, _) => Some(plan.items[*ix].path.clone()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(shown, ["g1.txt", "g2.txt", "g10.txt", "g11.txt"]);
+		assert_eq!(plan.items[0].path, "g1.txt");
+	}
+
+	#[test]
+	fn file_mode_rows_follow_natural_path_order() {
+		let dir = tempfile::tempdir().unwrap();
+		let payload =
+			"// FILE: g10.txt\na\n// FILE: g2.txt\nb\n// FILE: g1.txt\nc\n";
+		let plan = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			dir.path(),
+			&[],
+			1,
+		)
+		.unwrap();
+		let order: Vec<String> = plan
+			.display_order()
+			.into_iter()
+			.map(|ix| plan.items[ix].path.clone())
+			.collect();
+		assert_eq!(order, ["g1.txt", "g2.txt", "g10.txt"]);
 	}
 
 	#[test]

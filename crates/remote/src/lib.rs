@@ -28,7 +28,8 @@ pub mod worker;
 
 pub use client::{Client, Connection, RemoteHost, RemoteRepo, Transport};
 pub use pastetarget::{
-	FilePastePlan, PasteError, PasteRoute, PasteTarget, REPO_BUSY_TEXT,
+	FilePastePlan, PasteError, PasteRoute, PasteTarget, PreparedReplay,
+	REPO_BUSY_TEXT,
 };
 pub use proto::{
 	DirEntry, ErrorCode, ExportTarget, GitQuery, GitReply, ImportExpect,
@@ -71,6 +72,13 @@ pub enum RemoteError {
 	Cancelled,
 	#[error("the worker did not answer in time")]
 	TimedOut,
+	/// The stream went silent mid-call past the idle bound: no byte for `silent` s; `received` bytes of the answer arrived in `elapsed` s since the request.
+	#[error("the worker did not answer in time: no data for {silent:.1} s; {received} bytes of its reply arrived in {elapsed:.1} s")]
+	Stalled {
+		silent: f64,
+		received: u64,
+		elapsed: f64,
+	},
 	#[error(
 		"snip-sync on {worker} is too old for this (it speaks protocol {have}, this needs {need}); update it there"
 	)]
@@ -92,6 +100,7 @@ impl RemoteError {
 				..
 			} => transient_io(*kind),
 			Self::TimedOut
+			| Self::Stalled { .. }
 			| Self::Start {
 				kind:
 					ConnectFailureKind::TransportClosed
@@ -137,7 +146,11 @@ impl RemoteError {
 	pub fn outcome_unknown(&self) -> bool {
 		matches!(
 			self,
-			Self::Io(_) | Self::TimedOut | Self::Protocol(_) | Self::Cancelled
+			Self::Io(_)
+				| Self::TimedOut
+				| Self::Stalled { .. }
+				| Self::Protocol(_)
+				| Self::Cancelled
 		)
 	}
 

@@ -324,15 +324,11 @@ pub(crate) fn commit_file_rows(
 		},
 	};
 	let mut rows = Vec::with_capacity(files.len());
-	push_change_files(
-		&mut rows,
-		files,
-		(0..files.len()).collect(),
-		0,
-		COMMIT_GROUP,
-		0,
-		&layout,
-	);
+	let mut members: Vec<usize> = (0..files.len()).collect();
+	if !by_dir {
+		members.sort_by(|&x, &y| natural_cmp(&files[x].0, &files[y].0));
+	}
+	push_change_files(&mut rows, files, members, 0, COMMIT_GROUP, 0, &layout);
 	rows
 }
 
@@ -347,6 +343,36 @@ pub(crate) fn commit_file_dirs(
 			_ => None,
 		})
 		.collect()
+}
+
+/// Case-insensitive natural order: digit runs compare by value (g2 < g10); ties fall back to byte order.
+pub(crate) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+	use std::cmp::Ordering;
+	fn digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+		let mut out = String::new();
+		while let Some(c) = it.peek().copied().filter(char::is_ascii_digit) {
+			out.push(c);
+			it.next();
+		}
+		out
+	}
+	let (mut ai, mut bi) = (a.chars().peekable(), b.chars().peekable());
+	while let (Some(x), Some(y)) = (ai.peek().copied(), bi.peek().copied()) {
+		let order = if x.is_ascii_digit() && y.is_ascii_digit() {
+			let (da, db) = (digits(&mut ai), digits(&mut bi));
+			let (ta, tb) =
+				(da.trim_start_matches('0'), db.trim_start_matches('0'));
+			(ta.len(), ta).cmp(&(tb.len(), tb))
+		} else {
+			ai.next();
+			bi.next();
+			x.to_lowercase().cmp(y.to_lowercase())
+		};
+		if order != Ordering::Equal {
+			return order;
+		}
+	}
+	ai.count().cmp(&bi.count()).then_with(|| a.cmp(b))
 }
 
 /// Builds IntelliJ's "Group By > Directory" rows from the capped file rows
@@ -385,12 +411,7 @@ impl<T: TreePath, F: Fn(usize, &str, &str) -> bool> DirTree<'_, T, F> {
 		};
 		entries.sort_by(|&a, &b| {
 			let ((la, na), (lb, nb)) = (key(a), key(b));
-			la.cmp(&lb).then_with(|| {
-				na.chars()
-					.flat_map(char::to_lowercase)
-					.cmp(nb.chars().flat_map(char::to_lowercase))
-					.then_with(|| na.cmp(nb))
-			})
+			la.cmp(&lb).then_with(|| natural_cmp(na, nb))
 		});
 		let mut k = 0;
 		while let Some(dir) = entries.get(k).and_then(|&i| self.head(i, start))
@@ -1074,5 +1095,44 @@ impl WorkbenchModel {
 			}
 		}
 		res
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn natural_cmp_orders_numbers_by_value() {
+		let mut names = vec!["g10", "g2", "G1", "g11", "a"];
+		names.sort_by(|a, b| natural_cmp(a, b));
+		assert_eq!(names, ["a", "G1", "g2", "g10", "g11"]);
+	}
+
+	#[test]
+	fn commit_file_rows_flat_and_tree_are_natural() {
+		let files: Vec<(String, Option<ChangeType>)> =
+			["g10/x.rs", "g2/y.rs", "G1/z.rs", "g11.rs", "a.rs"]
+				.iter()
+				.map(|p| (p.to_string(), None))
+				.collect();
+		let flat: Vec<String> = commit_file_rows(&files, false, &[])
+			.into_iter()
+			.filter_map(|r| match r {
+				ChangeItemRow::File { file_idx, .. } => {
+					Some(files[file_idx].0.clone())
+				}
+				_ => None,
+			})
+			.collect();
+		assert_eq!(flat, ["a.rs", "G1/z.rs", "g2/y.rs", "g10/x.rs", "g11.rs"]);
+		let dirs: Vec<String> = commit_file_rows(&files, true, &[])
+			.into_iter()
+			.filter_map(|r| match r {
+				ChangeItemRow::Dir { name, .. } => Some(name),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(dirs, ["G1", "g2", "g10"]);
 	}
 }

@@ -387,6 +387,9 @@ pub struct GraphConfig {
 	/// turns it on: otherwise the next rail can bend into the lane and land
 	/// its commit directly under the other history's root, which reads as
 	/// a join. A held lane is not carried across a page's checkpoint.
+	/// The exception: once every other history has ended, so only held
+	/// lanes are left, a new history starts at the first lane again
+	/// instead of right of the held one (#188).
 	#[serde(default)]
 	pub hold_root_lanes: bool,
 }
@@ -1097,9 +1100,12 @@ pub fn compute_graph_layout(
 		// New branch head if commit had no incoming rail
 		if major_idx.is_none() {
 			if config.hold_root_lanes {
-				// Right of every lane the previous row used: a rail that
-				// moves left on this row must not seem to run into it.
-				if let Some(last) = prev_last_x {
+				if unsolved.is_empty() {
+					// Every earlier history has ended (only held root lanes remain, and they were dropped above): an unrelated history starts at the first lane, not right of the held lane (#188).
+					offset_x = config.offset_x - unit_w;
+				} else if let Some(last) = prev_last_x {
+					// Right of every lane the previous row used: a rail that
+					// moves left on this row must not seem to run into it.
 					offset_x = offset_x.max(last);
 				}
 			}
@@ -3212,5 +3218,31 @@ mod tests {
 		let frontier = top.checkpoint.unwrap().frontier;
 		assert_eq!(frontier.len(), 1);
 		assert_eq!(frontier[0].next_sha, "b2@1");
+	}
+
+	/// Once every earlier history has ended, a later unrelated history starts
+	/// at the first lane, not right of the lane the last root held.
+	#[test]
+	fn a_history_after_every_other_ended_starts_at_the_first_lane() {
+		let merged = vec![
+			make_commit("a2@0", &["a1@0"]),
+			make_commit("a1@0", &[]),
+			make_commit("b2@1", &["b1@1"]),
+			make_commit("b1@1", &[]),
+		];
+		let held = GraphConfig {
+			hold_root_lanes: true,
+			..geometry_config()
+		};
+		let layout =
+			compute_graph_layout(&merged, &[], None, &held, None).unwrap();
+		let lanes: Vec<usize> =
+			layout.rows.iter().map(|r| r.node.lane).collect();
+		assert_eq!(lanes, [0, 0, 0, 0]);
+		assert!(verify_graph_invariants(&layout, &merged).is_ok());
+		let want = true_parents(&merged);
+		for page in 1..=merged.len() {
+			assert_eq!(drawn_parents(&merged, page, &held), want, "{page}");
+		}
 	}
 }

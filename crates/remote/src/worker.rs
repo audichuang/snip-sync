@@ -826,6 +826,63 @@ fn serve(
 					},
 				)?;
 			}
+			Request::PrepareReplay {
+				workspace,
+				dest,
+				text,
+				retain,
+			} => {
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					Job::PastePlan,
+					crate::proto::PREPARED_REPLAY_VERSION,
+					|root, cancel| {
+						crate::pasteserve::prepare_replay(
+							root,
+							&dest,
+							text,
+							retain,
+							&state.prepared,
+							cancel,
+						)
+					},
+				)?;
+			}
+			Request::ApplyPreparedReplay {
+				workspace,
+				dest,
+				token,
+				digest,
+				check_only,
+			} => {
+				let job = if check_only {
+					Job::PastePlan
+				} else {
+					Job::PasteApply
+				};
+				serve_copy(
+					&mut writer,
+					state,
+					negotiated,
+					&workspace,
+					job,
+					crate::proto::PREPARED_REPLAY_VERSION,
+					|root, cancel| {
+						crate::pasteserve::apply_prepared_replay(
+							root,
+							&dest,
+							&token,
+							&digest,
+							check_only,
+							&state.prepared,
+							cancel,
+						)
+					},
+				)?;
+			}
 			Request::ReplayApply {
 				workspace,
 				dest,
@@ -1028,11 +1085,15 @@ impl State {
 				}
 				Err(err) => io_error(err),
 			},
-			Request::ListDir { workspace, path } => self
+			Request::ListDir {
+				workspace,
+				path,
+				folders_only,
+			} => self
 				.resolve(&workspace, &path)
 				.and_then(|(root, dir)| {
 					let cap = self.dir_cap.load(Ordering::SeqCst);
-					list_dir(&root, &dir, cap)
+					list_dir(&root, &dir, cap, folders_only)
 				})
 				.unwrap_or_else(|e| e),
 			Request::Stat { workspace, path } => self
@@ -1065,6 +1126,8 @@ impl State {
 			| Request::ReplayRead { .. }
 			| Request::ReplayPlan { .. }
 			| Request::ReplayApply { .. }
+			| Request::PrepareReplay { .. }
+			| Request::ApplyPreparedReplay { .. }
 			| Request::Chunk { .. }
 			| Request::FrameChunk { .. }
 			| Request::FrameJoin => error(
@@ -1112,7 +1175,12 @@ impl State {
 /// engine treats it; one that leads out of the share (or into `.git`)
 /// stays a plain entry the master cannot open.
 #[allow(clippy::result_large_err)]
-fn list_dir(root: &Path, dir: &Path, cap: usize) -> Result<Response, Response> {
+fn list_dir(
+	root: &Path,
+	dir: &Path,
+	cap: usize,
+	folders_only: bool,
+) -> Result<Response, Response> {
 	let mut scan = DirectoryScan::open(dir).map_err(io_error)?;
 	let mut entries = Vec::new();
 	let mut truncated = false;
@@ -1136,6 +1204,13 @@ fn list_dir(root: &Path, dir: &Path, cap: usize) -> Result<Response, Response> {
 			let directory = entry.directory
 				|| (entry.symlink
 					&& snip_core::transfer::is_safe_dir_symlink(root, &path));
+			// The filter runs before the push, so the cap above counts only
+			// the entries a folder picker is shown.
+			if folders_only
+				&& (!directory || entry.name.to_string_lossy().starts_with('.'))
+			{
+				continue;
+			}
 			let nested_repo =
 				directory && fs::symlink_metadata(path.join(".git")).is_ok();
 			entries.push(DirEntry {

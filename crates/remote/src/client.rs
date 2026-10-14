@@ -41,8 +41,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 // worker must fail a call in time. It bounds the SILENCE between bytes, not
 // a frame's whole transfer: a long job sends a heartbeat every second, and
 // a large reply may take longer than this to arrive whole on a slow link
-// as long as it keeps moving.
+// as long as it keeps moving. Once a reply has started arriving mid-frame,
+// its silence may run to MID_FRAME_IDLE_FACTOR times this bound, still
+// inside the call's absolute deadline (#191).
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How much longer than the idle bound a reply already arriving may pause.
+const MID_FRAME_IDLE_FACTOR: u32 = 6;
 /// How often a wait re-checks its deadline, its cancel token and the
 /// stream's last-byte clock.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
@@ -264,16 +268,49 @@ fn now_millis() -> u64 {
 	BASE_MILLIS + START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// The stream's progress, shared with the read thread: when it last produced
+/// a byte, and how many bytes it produced.
+pub(crate) struct StreamClock {
+	last_byte: AtomicU64,
+	received: AtomicU64,
+}
+
+impl StreamClock {
+	fn new() -> Arc<Self> {
+		Arc::new(Self {
+			last_byte: AtomicU64::new(now_millis()),
+			received: AtomicU64::new(0),
+		})
+	}
+
+	fn touch(&self, n: usize) {
+		self.last_byte.store(now_millis(), Ordering::Relaxed);
+		self.received.fetch_add(n as u64, Ordering::Relaxed);
+	}
+
+	fn restart(&self) {
+		self.last_byte.store(now_millis(), Ordering::Relaxed);
+	}
+
+	fn silent_ms(&self) -> u64 {
+		now_millis().saturating_sub(self.last_byte.load(Ordering::Relaxed))
+	}
+
+	fn received(&self) -> u64 {
+		self.received.load(Ordering::Relaxed)
+	}
+}
+
 /// Records when the stream last produced a byte, so a wait can tell a
 /// frame that is still moving from a worker that went quiet.
 struct Progress<R> {
 	inner: R,
-	last_byte: Arc<AtomicU64>,
+	clock: Arc<StreamClock>,
 }
 
 impl<R> Progress<R> {
-	fn new(inner: R, last_byte: Arc<AtomicU64>) -> Self {
-		Self { inner, last_byte }
+	fn new(inner: R, clock: Arc<StreamClock>) -> Self {
+		Self { inner, clock }
 	}
 }
 
@@ -281,7 +318,7 @@ impl<R: IoRead> IoRead for Progress<R> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		let n = self.inner.read(buf)?;
 		if n > 0 {
-			self.last_byte.store(now_millis(), Ordering::Relaxed);
+			self.clock.touch(n);
 		}
 		Ok(n)
 	}
@@ -309,10 +346,16 @@ pub struct Connection {
 	/// pump applies backpressure instead of hanging up. Shared with the
 	/// read thread.
 	in_flight: Arc<AtomicBool>,
-	/// When the pump last pulled a byte off the stream, as [`now_millis`].
-	/// Shared with the read thread; a wait ends when the stream goes
-	/// silent past [`IO_TIMEOUT`].
-	last_byte: Arc<AtomicU64>,
+	/// When the pump last pulled a byte off the stream, and how many bytes
+	/// it pulled. Shared with the read thread; a wait ends when the stream
+	/// goes silent past [`IO_TIMEOUT`].
+	last_byte: Arc<StreamClock>,
+	/// When the current call started, and the stream's byte count and
+	/// whole-frame count at that point: the call's reply is what arrives
+	/// past them (#191).
+	call_started: Instant,
+	call_base: u64,
+	frame_base: u64,
 }
 
 impl Connection {
@@ -382,6 +425,9 @@ impl Connection {
 			retained,
 			in_flight,
 			last_byte,
+			call_started: Instant::now(),
+			call_base: 0,
+			frame_base: 0,
 		};
 		let hello = Request::Hello {
 			version: PROTOCOL_VERSION,
@@ -534,9 +580,12 @@ impl Connection {
 		// not only the wait for the answer.
 		let deadline = Instant::now() + limit;
 		let mut frames = 0;
+		self.call_started = Instant::now();
+		self.call_base = self.last_byte.received();
+		self.frame_base = self.call_base;
 		self.in_flight.store(true, Ordering::SeqCst);
 		let res = self.send_guarded(request, cancel, deadline).and_then(|()| {
-			self.last_byte.store(now_millis(), Ordering::Relaxed);
+			self.last_byte.restart();
 			exchange(self, cancel, IO_TIMEOUT, deadline, &mut frames)
 		});
 		self.in_flight.store(false, Ordering::SeqCst);
@@ -630,6 +679,7 @@ impl FrameIo for Connection {
 			Ok(frame) => {
 				// The frame left the queue; the pump may read on.
 				self.retained.fetch_sub(1, Ordering::Relaxed);
+				self.frame_base = self.last_byte.received();
 				Ok(frame?)
 			}
 			Err(RecvTimeoutError::Timeout) => Err(RemoteError::TimedOut),
@@ -648,6 +698,7 @@ impl FrameIo for Connection {
 				Ok(frame) => {
 					// The frame left the queue; the pump may read on.
 					self.retained.fetch_sub(1, Ordering::Relaxed);
+					self.frame_base = self.last_byte.received();
 					return Ok(frame?);
 				}
 				Err(RecvTimeoutError::Disconnected) => return Ok(None),
@@ -661,12 +712,25 @@ impl FrameIo for Connection {
 			}
 			// No byte for `idle`: the worker is stuck, whatever it may
 			// still be computing. Bytes still moving (a large frame on a
-			// slow link, a heartbeat) keep the wait alive.
-			if now_millis()
-				.saturating_sub(self.last_byte.load(Ordering::Relaxed))
-				>= idle.as_millis() as u64
-			{
-				return Err(RemoteError::TimedOut);
+			// slow link, a heartbeat) keep the wait alive. A reply that has
+			// started arriving mid-frame may pause longer, still bounded by
+			// `deadline` (#191).
+			let silent = self.last_byte.silent_ms();
+			let mid_frame = self.last_byte.received() > self.frame_base;
+			let limit = if mid_frame {
+				idle.saturating_mul(MID_FRAME_IDLE_FACTOR)
+			} else {
+				idle
+			};
+			if silent >= limit.as_millis() as u64 {
+				return Err(RemoteError::Stalled {
+					silent: silent as f64 / 1000.0,
+					received: self
+						.last_byte
+						.received()
+						.saturating_sub(self.call_base),
+					elapsed: self.call_started.elapsed().as_secs_f64(),
+				});
 			}
 		}
 	}
@@ -788,7 +852,7 @@ type Started = (
 	Arc<Mutex<Vec<u8>>>,
 	Arc<AtomicUsize>,
 	Arc<AtomicBool>,
-	Arc<AtomicU64>,
+	Arc<StreamClock>,
 );
 
 fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
@@ -833,7 +897,7 @@ fn spawn(argv: &[OsString]) -> Result<Started, RemoteError> {
 	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
 	let retained = Arc::new(AtomicUsize::new(0));
 	let in_flight = Arc::new(AtomicBool::new(false));
-	let last_byte = Arc::new(AtomicU64::new(now_millis()));
+	let last_byte = StreamClock::new();
 	let pump_retained = Arc::clone(&retained);
 	let pump_in_flight = Arc::clone(&in_flight);
 	let pump_last_byte = Arc::clone(&last_byte);
@@ -892,11 +956,11 @@ pub(crate) fn skip_banner(r: &mut impl BufRead) -> io::Result<()> {
 
 fn read_frames(
 	r: impl IoRead + Send + 'static,
-) -> (Frames, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<AtomicU64>) {
+) -> (Frames, Arc<AtomicUsize>, Arc<AtomicBool>, Arc<StreamClock>) {
 	let (tx, rx) = mpsc::sync_channel(FRAME_QUEUE);
 	let retained = Arc::new(AtomicUsize::new(0));
 	let in_flight = Arc::new(AtomicBool::new(false));
-	let last_byte = Arc::new(AtomicU64::new(now_millis()));
+	let last_byte = StreamClock::new();
 	let pump_retained = Arc::clone(&retained);
 	let pump_in_flight = Arc::clone(&in_flight);
 	let pump_last_byte = Arc::clone(&last_byte);
@@ -1260,6 +1324,14 @@ enum PreparedImportState {
 	OutcomeUnknown,
 }
 
+/// What a prepared lease's token keeps on the worker: a file import's
+/// preview or a commit replay's preview. A lease applies only its own kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedKind {
+	Import,
+	Replay,
+}
+
 /// The worker connection that owns a preview token. Clones of a file plan
 /// share this one-use state; it never owns the Client itself.
 pub(crate) struct PreparedImportLease {
@@ -1269,6 +1341,7 @@ pub(crate) struct PreparedImportLease {
 	text_hash: [u8; 32],
 	mapping: PasteMapping,
 	digest: String,
+	kind: PreparedKind,
 	/// The connection's owned buffers, charged while the lease holds it
 	/// (Ready and Applying). Fixed when the lease is made, so no transition
 	/// between those states can raise an admitted charge.
@@ -1356,23 +1429,27 @@ impl PreparedImportLease {
 	/// (Busy, Timeout) on a clean connection, so the same preview can apply
 	/// again. Otherwise Used, or OutcomeUnknown when the outcome is unknown;
 	/// a clean connection goes back through `keep`, never an unknown one.
+	/// A check (`check_only`) never writes, so any clean answer keeps the
+	/// token: the apply that follows can still use it.
 	fn finish_apply<R>(
 		&self,
 		connection: Connection,
 		token: String,
 		permit: PreparedImportPermit,
 		result: &Result<R, RemoteError>,
+		check_only: bool,
 		keep: impl FnOnce(Connection),
 	) {
-		let unknown = result.as_ref().is_err_and(RemoteError::outcome_unknown);
-		let clean = !unknown && connection.unsolicited_frames() == 0;
+		let lost = result.as_ref().is_err_and(RemoteError::outcome_unknown);
+		let clean = !lost && connection.unsolicited_frames() == 0;
 		let retry = clean
 			&& !connection.broken
-			&& matches!(
-				result,
-				Err(RemoteError::Refused { code, .. })
-					if crate::prepared::refused_before_write(*code)
-			);
+			&& (check_only
+				|| matches!(
+					result,
+					Err(RemoteError::Refused { code, .. })
+						if crate::prepared::refused_before_write(*code)
+				));
 		let next = if retry {
 			PreparedImportState::Ready(Box::new(PreparedConnection {
 				connection,
@@ -1384,7 +1461,7 @@ impl PreparedImportLease {
 			if clean {
 				keep(connection);
 			}
-			if unknown {
+			if lost && !check_only {
 				PreparedImportState::OutcomeUnknown
 			} else {
 				PreparedImportState::Used
@@ -1409,9 +1486,7 @@ impl PreparedImportLease {
 		} = *ready;
 		during();
 		let result: Result<(), RemoteError> = Err(refusal);
-		self.finish_apply(connection, token, _permit, &result, |connection| {
-			drop(connection)
-		});
+		self.finish_apply(connection, token, _permit, &result, false, drop);
 		result
 	}
 }
@@ -1571,7 +1646,10 @@ impl Client {
 				| Request::ReplayApply {
 					check_only: false,
 					..
-				}
+				} | Request::ApplyPreparedReplay {
+				check_only: false,
+				..
+			}
 		);
 		let _guard = if is_git {
 			Some(self.limiter.acquire(cancel, limit)?)
@@ -1806,6 +1884,7 @@ impl Client {
 					text_hash: Sha256::digest(text.as_bytes()).into(),
 					mapping: mapping.clone(),
 					digest: planned.digest.clone(),
+					kind: PreparedKind::Import,
 					connection_bytes: connection_footprint(
 						&connection,
 						token.capacity(),
@@ -1855,6 +1934,7 @@ impl Client {
 			|| text_hash != lease.text_hash
 			|| mapping != &lease.mapping
 			|| expect.digest != lease.digest
+			|| lease.kind != PreparedKind::Import
 		{
 			return Err(prepared_stale("the prepared paste belongs to another target or payload; preview again"));
 		}
@@ -1913,9 +1993,247 @@ impl Client {
 				other => other,
 			}
 		};
-		lease.finish_apply(connection, token, _permit, &result, |connection| {
-			self.keep(connection)
-		});
+		lease.finish_apply(
+			connection,
+			token,
+			_permit,
+			&result,
+			false,
+			|connection| self.keep(connection),
+		);
+		result
+	}
+
+	/// Commit-replay facade, as [`Self::prepare_import`]: on protocol 8 the
+	/// worker keeps its own preview under a token, and the reply carries the
+	/// plan for display. An older worker answers a plan only and no lease is
+	/// made. A reused connection that went stale is resent once.
+	pub(crate) fn prepare_replay(
+		&self,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		payload: snip_core::commits::CommitsPayload,
+		cancel: Option<&CancelToken>,
+	) -> Result<
+		(
+			snip_core::transfer::CommitReplayPreview,
+			Option<Arc<PreparedImportLease>>,
+		),
+		RemoteError,
+	> {
+		let start = Instant::now();
+		let _guard = self.limiter.acquire(cancel, GIT_CALL_LIMIT)?;
+		let permit = self.prepared_imports.reserve();
+		let (mut connection, reused) = self.take_connection(
+			crate::proto::PASTE_VERSION,
+			cancel,
+			start + GIT_CALL_LIMIT,
+		)?;
+		let request = |version| {
+			if version >= crate::proto::PREPARED_REPLAY_VERSION {
+				Request::PrepareReplay {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text: text.into(),
+					retain: permit.is_some(),
+				}
+			} else {
+				Request::ReplayPlan {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text: text.into(),
+				}
+			}
+		};
+		let mut reply = connection.call(
+			&request(connection.version()),
+			cancel,
+			GIT_CALL_LIMIT.saturating_sub(start.elapsed()),
+		);
+		if let Err(error) = &reply {
+			// Planning is read-only: the same single resend as a file plan.
+			if should_resend(reused, connection.frames_seen, error) {
+				match self.connect_at_least(
+					crate::proto::PASTE_VERSION,
+					cancel,
+					start + GIT_CALL_LIMIT,
+				) {
+					Ok(mut fresh) => {
+						reply = fresh.call(
+							&request(fresh.version()),
+							cancel,
+							GIT_CALL_LIMIT.saturating_sub(start.elapsed()),
+						);
+						connection = fresh;
+					}
+					Err(error @ RemoteError::WorkerTooOld { .. }) => {
+						return Err(error)
+					}
+					Err(_) => {}
+				}
+			}
+		}
+		let (preview, token, digest) = match reply {
+			Ok(Response::ReplayPrepared(prepared))
+				if connection.version()
+					>= crate::proto::PREPARED_REPLAY_VERSION =>
+			{
+				let preview =
+					snip_core::transfer::CommitReplayPreview::from_parts(
+						prepared.expect.destination,
+						payload,
+						prepared.expect.plan,
+						prepared.expect.freshness,
+					);
+				(preview, prepared.token, prepared.digest)
+			}
+			Ok(Response::ReplayPlanned(planned))
+				if connection.version()
+					< crate::proto::PREPARED_REPLAY_VERSION =>
+			{
+				let preview =
+					snip_core::transfer::CommitReplayPreview::from_parts(
+						planned.destination,
+						payload,
+						planned.plan,
+						planned.freshness,
+					);
+				(preview, None, String::new())
+			}
+			Ok(_) => return Err(unexpected()),
+			Err(error) => {
+				self.keep(connection);
+				return Err(error);
+			}
+		};
+		if cancel.is_some_and(|token| token.is_cancelled()) {
+			return Err(RemoteError::Cancelled);
+		}
+		match (token, permit) {
+			(Some(token), Some(permit)) => {
+				let lease = PreparedImportLease {
+					owner: self.prepared_imports.clone(),
+					workspace: workspace.into(),
+					dest: dest.into(),
+					text_hash: Sha256::digest(text.as_bytes()).into(),
+					mapping: PasteMapping::default(),
+					digest,
+					kind: PreparedKind::Replay,
+					connection_bytes: connection_footprint(
+						&connection,
+						token.capacity(),
+					),
+					state: Mutex::new(PreparedImportState::Ready(Box::new(
+						PreparedConnection {
+							connection,
+							token,
+							_permit: permit,
+						},
+					))),
+				};
+				Ok((preview, Some(Arc::new(lease))))
+			}
+			(None, _) => {
+				self.keep(connection);
+				Ok((preview, None))
+			}
+			(Some(_), None) => Err(RemoteError::Protocol(
+				"worker retained a replay without a client lease".into(),
+			)),
+		}
+	}
+
+	/// Applies, or with `check_only` re-checks, the replay `lease` retained.
+	/// Only the token and digest cross the wire. When the worker no longer
+	/// holds the token and wrote nothing, the full text goes once on the same
+	/// connection as `ReplayApply`, expected to `preview`. Lease rules as in
+	/// [`Self::apply_prepared_import`].
+	pub(crate) fn apply_prepared_replay(
+		&self,
+		lease: &PreparedImportLease,
+		workspace: &str,
+		dest: &str,
+		text: &str,
+		preview: &snip_core::transfer::CommitReplayPreview,
+		check_only: bool,
+	) -> Result<Option<snip_core::commits::ReplayResult>, RemoteError> {
+		let text_hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+		if !Arc::ptr_eq(&self.prepared_imports, &lease.owner)
+			|| lease.kind != PreparedKind::Replay
+			|| workspace != lease.workspace
+			|| dest != lease.dest
+			|| text_hash != lease.text_hash
+		{
+			return Err(prepared_stale("the prepared paste belongs to another target or payload; preview again"));
+		}
+		let start = Instant::now();
+		let limit = if check_only {
+			GIT_CALL_LIMIT
+		} else {
+			APPLY_CALL_LIMIT
+		};
+		let _guard = self.limiter.acquire(None, limit)?;
+		let ready = lease.begin_apply()?;
+		let PreparedConnection {
+			mut connection,
+			token,
+			_permit,
+		} = *ready;
+		let call =
+			|connection: &mut Connection, request: &Request| match connection
+				.call(request, None, limit.saturating_sub(start.elapsed()))
+			{
+				Ok(Response::Replayed(result)) if !check_only => {
+					Ok(Some(result))
+				}
+				Ok(Response::Fresh) if check_only => Ok(None),
+				Ok(_) => Err(unexpected()),
+				Err(error) => Err(error),
+			};
+		let result = if connection.broken || connection.unsolicited_frames() > 0
+		{
+			Err(prepared_stale(
+				"the prepared paste connection changed; preview again",
+			))
+		} else {
+			let applied = call(
+				&mut connection,
+				&Request::ApplyPreparedReplay {
+					workspace: workspace.into(),
+					dest: dest.into(),
+					token: token.clone(),
+					digest: lease.digest.clone(),
+					check_only,
+				},
+			);
+			match applied {
+				// The worker dropped the retained preview before writing:
+				// the full text, once, planned and checked there.
+				Err(RemoteError::Refused {
+					code: ErrorCode::Stale,
+					message,
+				}) if message == crate::prepared::TOKEN_GONE => call(
+					&mut connection,
+					&Request::ReplayApply {
+						workspace: workspace.into(),
+						dest: dest.into(),
+						text: text.into(),
+						expect: ReplayExpect::of(preview),
+						check_only,
+					},
+				),
+				other => other,
+			}
+		};
+		lease.finish_apply(
+			connection,
+			token,
+			_permit,
+			&result,
+			check_only,
+			|connection| self.keep(connection),
+		);
 		result
 	}
 
@@ -2080,9 +2398,35 @@ impl Client {
 		let req = Request::ListDir {
 			workspace: workspace.into(),
 			path: path.into(),
+			folders_only: false,
 		};
 		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
 			Response::Dir { entries, truncated } => Ok((entries, truncated)),
+			_ => Err(unexpected()),
+		}
+	}
+
+	/// The folders `path` holds, as a folder picker lists them. Older workers
+	/// send every entry; filtered here as well.
+	pub fn list_folders(
+		&self,
+		workspace: &str,
+		path: &str,
+		cancel: Option<&CancelToken>,
+	) -> Result<(Vec<DirEntry>, bool), RemoteError> {
+		let req = Request::ListDir {
+			workspace: workspace.into(),
+			path: path.into(),
+			folders_only: true,
+		};
+		match self.call_with(&req, cancel, GIT_CALL_LIMIT)? {
+			Response::Dir {
+				mut entries,
+				truncated,
+			} => {
+				entries.retain(|e| e.directory && !e.name.starts_with('.'));
+				Ok((entries, truncated))
+			}
 			_ => Err(unexpected()),
 		}
 	}
@@ -2178,6 +2522,8 @@ pub(crate) fn runs_git(request: &Request) -> bool {
 			| Request::ApplyPrepared { .. }
 			| Request::ReplayPlan { .. }
 			| Request::ReplayApply { .. }
+			| Request::PrepareReplay { .. }
+			| Request::ApplyPreparedReplay { .. }
 	)
 }
 
@@ -2492,7 +2838,8 @@ impl From<RemoteError> for GitError {
 				code: ErrorCode::Timeout,
 				..
 			}
-			| RemoteError::TimedOut => GitError::Timeout {
+			| RemoteError::TimedOut
+			| RemoteError::Stalled { .. } => GitError::Timeout {
 				args: "remote view".into(),
 				secs: GIT_CALL_LIMIT.as_secs(),
 			},
@@ -2562,6 +2909,7 @@ mod tests {
 				text_hash: Sha256::digest(b"source").into(),
 				mapping: PasteMapping::default(),
 				digest: expect.digest.clone(),
+				kind: PreparedKind::Import,
 				connection_bytes,
 				state: Mutex::new(PreparedImportState::Ready(Box::new(
 					PreparedConnection {
@@ -2806,6 +3154,30 @@ mod tests {
 		fixture.answer(Some(Response::Imported(Default::default())));
 		join_prepared(second).unwrap();
 		assert!(fixture.lease.retained_heap_bytes() <= ready);
+	}
+
+	#[test]
+	fn a_check_only_refusal_keeps_the_lease_ready() {
+		let fixture = PreparedFixture::new();
+		let ready = fixture.lease.begin_apply().unwrap();
+		let PreparedConnection {
+			connection,
+			token,
+			_permit,
+		} = *ready;
+		// A check writes nothing, so a refused check leaves the token usable
+		// for the apply that follows, even though Stale is not retryable there.
+		let refusal: Result<(), RemoteError> = Err(RemoteError::Refused {
+			code: ErrorCode::Stale,
+			message: "expired; preview again".into(),
+		});
+		fixture
+			.lease
+			.finish_apply(connection, token, _permit, &refusal, true, drop);
+		assert!(
+			fixture.lease.begin_apply().is_ok(),
+			"a refused check must keep the lease ready for an apply"
+		);
 	}
 
 	#[test]
@@ -3295,8 +3667,8 @@ mod tests {
 		d.saturating_mul(timeout_scale())
 	}
 
-	fn fresh_clock() -> Arc<AtomicU64> {
-		Arc::new(AtomicU64::new(now_millis()))
+	fn fresh_clock() -> Arc<StreamClock> {
+		StreamClock::new()
 	}
 
 	/// A connection over ready-made parts, as the real one is assembled in
@@ -3320,6 +3692,9 @@ mod tests {
 			retained,
 			in_flight,
 			last_byte: fresh_clock(),
+			call_started: Instant::now(),
+			call_base: 0,
+			frame_base: 0,
 		}
 	}
 
@@ -4025,7 +4400,13 @@ mod tests {
 			&mut frames,
 		)
 		.unwrap_err();
-		assert!(matches!(err, RemoteError::TimedOut), "{err:?}");
+		let text = err.to_string();
+		assert!(
+			matches!(err, RemoteError::Stalled { received: 0, .. }),
+			"{err:?}"
+		);
+		assert!(text.contains("did not answer in time"), "{text}");
+		assert!(text.contains("0 bytes"), "{text}");
 		assert!(
 			started.elapsed() < scaled(Duration::from_secs(5)),
 			"the silence must end the call promptly, took {:?}",
@@ -4033,6 +4414,108 @@ mod tests {
 		);
 		// The pipe stays open until here: no end of stream, only silence.
 		drop(w);
+	}
+
+	/// A reply that has started arriving may pause longer than the idle
+	/// bound mid-frame: the worker answered and the link is slow. The pause
+	/// here is under MID_FRAME_IDLE_FACTOR times the bound, so the call
+	/// succeeds (#191).
+	#[test]
+	fn a_reply_paused_mid_frame_outlasts_the_idle_bound() {
+		let (r, mut w) = io::pipe().unwrap();
+		let (frames, retained, in_flight, last_byte) = read_frames(r);
+		let response = Response::Text {
+			content: Some("x".repeat(64 * 1024)),
+		};
+		let mut bytes = Vec::new();
+		write_frame(&mut bytes, &response).unwrap();
+		let rest = bytes.split_off(bytes.len() / 2);
+		let producer = std::thread::spawn(move || {
+			if w.write_all(&bytes).is_err() {
+				return;
+			}
+			std::thread::sleep(scaled(Duration::from_millis(900)));
+			let _ = w.write_all(&rest);
+		});
+		let mut conn =
+			test_conn(Box::new(std::io::sink()), frames, retained, in_flight);
+		conn.last_byte = last_byte;
+		let mut frames = 0;
+		let reply = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_millis(300)),
+			Instant::now() + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.expect("a reply paused mid-frame within the bound must succeed");
+		match reply {
+			Response::Text { content } => {
+				assert_eq!(content.map(|c| c.len()), Some(64 * 1024));
+			}
+			other => panic!("expected Text, got {other:?}"),
+		}
+		assert_eq!(frames, 1);
+		producer.join().unwrap();
+	}
+
+	/// A reply that stops partway through a frame, with the pipe still open,
+	/// ends the call as a stall that says how much arrived and how long the
+	/// call ran (#191).
+	#[test]
+	fn a_reply_stalled_mid_frame_reports_its_bytes_and_time() {
+		let (r, mut w) = io::pipe().unwrap();
+		let (frames, retained, in_flight, last_byte) = read_frames(r);
+		let mut bytes = Vec::new();
+		write_frame(
+			&mut bytes,
+			&Response::Text {
+				content: Some("x".repeat(64 * 1024)),
+			},
+		)
+		.unwrap();
+		assert!(bytes.len() > 10_000, "the frame must outlast the cut");
+		w.write_all(&bytes[..10_000]).unwrap();
+		let mut conn =
+			test_conn(Box::new(std::io::sink()), frames, retained, in_flight);
+		conn.last_byte = last_byte;
+		let mut frames = 0;
+		let started = Instant::now();
+		let err = exchange(
+			&mut conn,
+			None,
+			scaled(Duration::from_millis(200)),
+			started + scaled(Duration::from_secs(30)),
+			&mut frames,
+		)
+		.unwrap_err();
+		assert!(
+			started.elapsed() < scaled(Duration::from_secs(10)),
+			"the stall must end the call promptly, took {:?}",
+			started.elapsed()
+		);
+		match err {
+			RemoteError::Stalled {
+				received, elapsed, ..
+			} => {
+				assert_eq!(received, 10_000);
+				assert!(elapsed > 0.0, "elapsed {elapsed}");
+			}
+			other => panic!("expected Stalled, got {other:?}"),
+		}
+		// The pipe stays open until the assertions have run.
+		drop(w);
+	}
+
+	#[test]
+	fn stalled_is_a_transient_read_failure_with_unknown_outcome() {
+		let error = RemoteError::Stalled {
+			silent: 5.0,
+			received: 1,
+			elapsed: 6.0,
+		};
+		assert!(error.is_transient_read_failure());
+		assert!(error.outcome_unknown());
 	}
 
 	/// A cancel ends a call whose worker never answers: the wait polls the
@@ -4145,6 +4628,7 @@ mod tests {
 		conn.last_byte = last_byte;
 		// The connection sat idle well past IO_TIMEOUT.
 		conn.last_byte
+			.last_byte
 			.store(now_millis().saturating_sub(60_000), Ordering::Relaxed);
 		let worker = std::thread::spawn(move || {
 			// The worker takes about half of idle to compute its answer:
@@ -4259,6 +4743,7 @@ mod tests {
 				Request::ListDir {
 					workspace: "w".into(),
 					path: "p".into(),
+					folders_only: false,
 				},
 				false,
 			),

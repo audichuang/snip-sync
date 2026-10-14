@@ -518,7 +518,7 @@ impl WorkbenchModel {
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().text_muted))
 						.child(if item.writes_content() {
-							format!("{} B", item.bytes)
+							crate::paste::human_bytes(item.bytes as u64)
 						} else {
 							String::new()
 						}),

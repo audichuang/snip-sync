@@ -666,6 +666,7 @@ impl PasteDiffOutcome {
 						Why::Skipped => skip_notice,
 						Why::Binary => "paste_diff_binary",
 						Why::TooLarge => "paste_diff_too_large",
+						Why::ContentTooLarge => "paste_diff_content_too_large",
 						Why::Symlink => "paste_diff_symlink",
 						Why::Directory => "paste_diff_directory",
 						Why::Unreadable => "paste_diff_unreadable",
@@ -795,6 +796,10 @@ pub struct WorkbenchModel {
 	pub commit_file_gitlinks: Vec<String>,
 	/// The listing was cut to `MAX_COMMIT_FILES`.
 	pub commit_files_truncated: bool,
+	/// For the selected merge commit: its files unchanged against the first
+	/// parent (listed only through another parent), keyed by the raw SHA.
+	pub commit_files_first_parent_same:
+		Option<(String, std::collections::HashSet<String>)>,
 	pub selected_commit_file: Option<String>,
 	/// Cmd/Shift multi-selection in the changed files; empty means just
 	/// `selected_commit_file`. Cleared with every change of that one.
@@ -1328,6 +1333,7 @@ impl WorkbenchModel {
 			commit_file_origin: Vec::new(),
 			commit_file_gitlinks: Vec::new(),
 			commit_files_truncated: false,
+			commit_files_first_parent_same: None,
 			selected_commit_file: None,
 			commit_file_sel: Vec::new(),
 			compare: None,
@@ -2522,6 +2528,7 @@ impl WorkbenchModel {
 		release_vec(&mut self.commit_files);
 		release_vec(&mut self.commit_file_origin);
 		release_vec(&mut self.commit_file_gitlinks);
+		self.commit_files_first_parent_same.take();
 		release_vec(&mut self.selection_details);
 		release_vec(&mut self.log_branches_all);
 		self.commit_rows_cache.take();
@@ -2624,7 +2631,7 @@ impl WorkbenchModel {
 		recent::remember(&mut self.recent_workspaces, &path);
 		self.remote.restoring = None;
 		self.workspace_open = true;
-		self.workspace_menu = false;
+		self.hide_workspace_menu();
 		self.workspace_picker = false;
 		if e2e_on() {
 			app_log!(
@@ -2639,9 +2646,15 @@ impl WorkbenchModel {
 
 	/// Escape in one of its fields, or a press outside it.
 	pub fn close_workspace_menu(&mut self, cx: &mut Context<Self>) {
-		self.workspace_menu = false;
+		self.hide_workspace_menu();
 		self.workspace_picker = false;
 		cx.notify();
+	}
+
+	/// Closes the workspace menu; its host browse and that browse's ssh end with it (#187).
+	pub(crate) fn hide_workspace_menu(&mut self) {
+		self.workspace_menu = false;
+		self.remote.end_browse();
 	}
 
 	pub fn toggle_workspace_menu(&mut self, cx: &mut Context<Self>) {
@@ -2652,6 +2665,7 @@ impl WorkbenchModel {
 			self.remote.recent = remote::load_recent();
 		} else if !self.workspace_menu {
 			self.workspace_picker = false;
+			self.remote.end_browse();
 		}
 		cx.notify();
 	}
@@ -2659,7 +2673,7 @@ impl WorkbenchModel {
 	/// The OS folder dialog. Without one (Linux with no portal) the typed
 	/// path field opens instead.
 	pub fn open_folder_dialog(&mut self, cx: &mut Context<Self>) {
-		self.workspace_menu = false;
+		self.hide_workspace_menu();
 		self.workspace_picker = false;
 		cx.notify();
 		let picked = cx.prompt_for_paths(PathPromptOptions {
@@ -2731,7 +2745,7 @@ impl WorkbenchModel {
 		cx: &mut Context<Self>,
 	) {
 		if self.ws_tab.is_some() {
-			self.workspace_menu = false;
+			self.hide_workspace_menu();
 			self.workspace_picker = false;
 			cx.emit(tabs::TabEvent::Open(target));
 			cx.notify();
@@ -2855,6 +2869,8 @@ impl WorkbenchModel {
 		self.focus_lost_guard = None;
 		self.chrome.menu = None;
 		self.dragging = None;
+		// A background tab keeps no browse ssh.
+		self.remote.end_browse();
 		cx.notify();
 	}
 
@@ -4254,9 +4270,9 @@ impl WorkbenchModel {
 									&for_bg,
 									Some(&cancel),
 								),
-								None => {
-									Err("not under the workspace".to_string())
-								}
+								None => Err(PreviewErr::Failed(
+									"not under the workspace".into(),
+								)),
 							}
 						}
 						_ => read_preview(
@@ -4311,7 +4327,7 @@ impl WorkbenchModel {
 	pub fn apply_source_preview(
 		&mut self,
 		path: String,
-		result: Result<(browser::SourcePreview, PreviewSource), String>,
+		result: Result<(browser::SourcePreview, PreviewSource), PreviewErr>,
 	) -> bool {
 		match result {
 			Ok((p, source)) => {
@@ -4338,7 +4354,7 @@ impl WorkbenchModel {
 				}
 			}
 			Err(e) => {
-				self.show_preview_error(Msg::new("error_preview", [path, e]));
+				self.show_preview_error(e.msg(path));
 				false
 			}
 		}
@@ -5874,17 +5890,69 @@ fn resolve_added_repo(
 	)))
 }
 
+/// Why a preview read gave no text (#193).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewErr {
+	/// Over the 1 MiB preview limit, on any host.
+	TooLarge,
+	Failed(String),
+}
+
+impl From<String> for PreviewErr {
+	fn from(s: String) -> Self {
+		Self::Failed(s)
+	}
+}
+
+impl From<snip_core::gitsrc::GitError> for PreviewErr {
+	fn from(e: snip_core::gitsrc::GitError) -> Self {
+		match e {
+			snip_core::gitsrc::GitError::OutputLimit { .. } => Self::TooLarge,
+			other => Self::Failed(other.to_string()),
+		}
+	}
+}
+
+impl From<std::io::Error> for PreviewErr {
+	fn from(e: std::io::Error) -> Self {
+		if e.kind() == std::io::ErrorKind::FileTooLarge {
+			Self::TooLarge
+		} else {
+			Self::Failed(e.to_string())
+		}
+	}
+}
+
+impl std::fmt::Display for PreviewErr {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::TooLarge => f.write_str("over the 1 MiB preview limit"),
+			Self::Failed(s) => f.write_str(s),
+		}
+	}
+}
+
+impl PreviewErr {
+	/// The message shown in the editor for `path`.
+	pub(crate) fn msg(self, path: String) -> Msg {
+		match self {
+			Self::TooLarge => Msg::new("error_preview_too_large", [path]),
+			Self::Failed(e) => Msg::new("error_preview", [path, e]),
+		}
+	}
+}
+
 fn read_preview(
 	host: &crate::githost::GitHost,
 	repo_root: &std::path::Path,
 	path: &str,
 	source: &SourceKind,
 	cancel: CancelToken,
-) -> Result<(browser::SourcePreview, PreviewSource), String> {
+) -> Result<(browser::SourcePreview, PreviewSource), PreviewErr> {
 	if matches!(source, SourceKind::File) {
 		return browser::file_preview(repo_root, path)
 			.map(|p| (p, PreviewSource::WorkingFile))
-			.map_err(|e| e.to_string());
+			.map_err(PreviewErr::from);
 	}
 	let (git_source, preview_source) = match source {
 		SourceKind::Staged => (GitSource::Staged, PreviewSource::StagedChanges),
@@ -5919,7 +5987,7 @@ fn read_preview(
 		)),
 		// A failed/cancelled Git source must never be replaced by current
 		// working-tree bytes. Explicit File/tree sources are handled above.
-		Err(e) => Err(e.to_string()),
+		Err(e) => Err(e.into()),
 	}
 }
 
@@ -6444,6 +6512,48 @@ mod tests {
 		);
 	}
 
+	/// A preview read over the limit is `TooLarge` on every host, and any
+	/// other failure keeps its text (#193).
+	#[test]
+	fn preview_err_says_too_large_for_any_host() {
+		use super::PreviewErr;
+		use snip_core::gitsrc::GitError;
+		assert_eq!(
+			PreviewErr::from(GitError::OutputLimit {
+				args: "cat-file x:big".into(),
+				limit: 1048576,
+			}),
+			PreviewErr::TooLarge
+		);
+		assert_eq!(
+			PreviewErr::from(GitError::from(
+				snip_remote::RemoteError::Refused {
+					code: snip_remote::ErrorCode::TooLarge,
+					message:
+						"the result is too large to send; narrow the request"
+							.into(),
+				}
+			)),
+			PreviewErr::TooLarge
+		);
+		assert_eq!(
+			PreviewErr::from(std::io::Error::new(
+				std::io::ErrorKind::FileTooLarge,
+				"x"
+			)),
+			PreviewErr::TooLarge
+		);
+		assert!(matches!(
+			PreviewErr::from(GitError::Host("boom".into())),
+			PreviewErr::Failed(_)
+		));
+		let text = PreviewErr::TooLarge
+			.msg("big.txt".into())
+			.render(crate::i18n::Locale::ZhTw);
+		assert!(text.contains("big.txt"), "{text}");
+		assert!(!text.contains("bytes") && !text.contains("0 "), "{text}");
+	}
+
 	/// UI state driven in-process: no display, so these also run in the
 	/// Windows and macOS Test jobs, which have no real-app GUI test.
 	mod in_process {
@@ -6663,21 +6773,51 @@ mod tests {
 		fn remote_menu(
 			cx: &mut TestAppContext,
 		) -> (Entity<WorkbenchModel>, &mut VisualTestContext) {
-			let worker = std::sync::Arc::new(snip_remote::Worker::new(
-				snip_remote::WorkerOptions::default(),
-			));
-			let host = snip_remote::RemoteHost::in_process(worker);
+			let (_, model, cx) = remote_menu_hosts(cx, &["test-worker"]);
+			(model, cx)
+		}
+
+		/// A window with its menu open and one in-process worker per name
+		/// as the ssh hosts, in that order.
+		fn remote_menu_hosts<'a>(
+			cx: &'a mut TestAppContext,
+			names: &[&str],
+		) -> (
+			Vec<std::sync::Arc<snip_remote::Worker>>,
+			Entity<WorkbenchModel>,
+			&'a mut VisualTestContext,
+		) {
+			let workers: Vec<_> = names
+				.iter()
+				.map(|_| {
+					std::sync::Arc::new(snip_remote::Worker::new(
+						snip_remote::WorkerOptions::default(),
+					))
+				})
+				.collect();
+			let hosts: Vec<_> = workers
+				.iter()
+				.zip(names)
+				.map(|(worker, name)| {
+					let mut host =
+						snip_remote::RemoteHost::in_process(worker.clone());
+					host.name = (*name).into();
+					host
+				})
+				.collect();
 			cx.update(|cx| cx.bind_keys(crate::key_bindings()));
 			let (model, cx) = cx.add_window_view(|_, cx| {
 				WorkbenchModel::new(None, None, "normal".into(), cx)
 			});
 			cx.run_until_parked();
-			model.update(cx, |m, _| {
+			model.update(cx, |m, cx| {
 				m.workspace_menu = true;
-				m.remote.hosts = vec![host];
+				m.remote.hosts = hosts;
 				m.remote.recent.clear();
+				cx.notify();
 			});
-			(model, cx)
+			cx.run_until_parked();
+			(workers, model, cx)
 		}
 
 		/// Clicks the row of subfolder `name` in the host's block.
@@ -7079,12 +7219,8 @@ mod tests {
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.remote.message, None);
 				assert_eq!(m.remote.hosts.len(), 1);
-				let Some(Some(Ok(listing))) =
-					m.remote.browse.as_ref().map(|b| &b.listing)
-				else {
-					panic!("home not listed: {:?}", m.remote.browse);
-				};
-				assert!(!listing.path.is_empty());
+				// Opening from the menu ends the menu's browse (#187).
+				assert!(m.remote.browse.is_none(), "browse ends with the open");
 				let session = m.remote.session.as_ref().expect("open");
 				assert_eq!(session.workspace.name, "shared");
 				assert_eq!(m.remote.recent[0].path, session.workspace.id);
@@ -7265,6 +7401,178 @@ mod tests {
 			});
 		}
 
+		/// A failed open from the menu keeps the browse's connection (#198).
+		#[gpui::test]
+		fn a_failed_menu_open_keeps_the_browse_connection(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("base");
+			fs::create_dir_all(base.join("a")).unwrap();
+			let (_, model, cx) = remote_menu_hosts(cx, &["test-worker"]);
+			click(cx, "remote-host:0");
+			settle(cx);
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx)
+			});
+			settle(cx);
+			let client_of = |m: &WorkbenchModel| {
+				m.remote.browse.as_ref().and_then(|b| b.client_for_tests())
+			};
+			let c = model
+				.read_with(cx, |m, _| client_of(m))
+				.expect("browse client");
+			let missing =
+				tmp.path().join("no-such-folder").display().to_string();
+			model.update(cx, |m, cx| {
+				m.remote_path_input
+					.update(cx, |f, cx| f.set_text(&missing, cx))
+			});
+			click(cx, "btn-remote-open");
+			settle_until(cx, "the failed open", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.remote.busy
+						&& matches!(m.remote.message, Some((false, _)))
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.remote.session.is_none());
+				assert!(m.workspace_menu, "the menu stays open");
+				let back =
+					client_of(m).expect("the browse got its client back");
+				assert!(std::sync::Arc::ptr_eq(&back, &c), "same connection");
+			});
+			click_remote_folder(&model, cx, "a");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(
+					std::sync::Arc::ptr_eq(&client_of(m).unwrap(), &c),
+					"folder click reuses it"
+				)
+			});
+		}
+
+		/// One browse connection per menu: it is handed to the open of the
+		/// folder shown, and it ends with the menu (#187).
+		#[gpui::test]
+		fn menu_browse_keeps_one_client_hands_it_to_the_open_and_ends_with_the_menu(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("base");
+			for d in ["a", "b"] {
+				fs::create_dir_all(base.join(d)).unwrap();
+			}
+			let (_, model, cx) = remote_menu_hosts(cx, &["test-worker"]);
+
+			click(cx, "remote-host:0");
+			settle(cx);
+			let client_of = |m: &WorkbenchModel| {
+				m.remote
+					.browse
+					.as_ref()
+					.and_then(|b| b.client_for_tests())
+					.expect("the browse keeps its client")
+			};
+			model.read_with(cx, |m, _| {
+				let b = m.remote.browse.as_ref().expect("host browsed");
+				assert!(matches!(b.listing, Some(Ok(_))), "{:?}", b.listing);
+			});
+
+			// Into a subfolder, as a user does: the same connection.
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+			});
+			settle(cx);
+			let c = model.read_with(cx, |m, _| client_of(m));
+			click_remote_folder(&model, cx, "a");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(
+					std::sync::Arc::ptr_eq(&client_of(m), &c),
+					"same connection"
+				);
+			});
+
+			// Opening the folder shown reuses it, and the menu's browse ends.
+			click(cx, "btn-remote-open-here");
+			settle(cx);
+			land_remote_open(&model, cx);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let session = m.remote.session.as_ref().expect("opened");
+				assert!(
+					std::sync::Arc::ptr_eq(&session.client, &c),
+					"open reuses it"
+				);
+				assert!(m.remote.browse.is_none(), "the menu's browse ended");
+			});
+
+			// A new menu browses again; Escape ends it, and its connection
+			// is dropped with it.
+			model.update(cx, |m, cx| m.toggle_workspace_menu(cx));
+			click(cx, "remote-host:0");
+			settle(cx);
+			let weak = model
+				.read_with(cx, |m, _| std::sync::Arc::downgrade(&client_of(m)));
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_menu, "Escape closes the menu");
+				assert!(m.remote.browse.is_none(), "browse ends with the menu");
+			});
+			let mut rounds = 0;
+			while weak.upgrade().is_some() {
+				assert!(rounds < 50, "the browse's client is still alive");
+				settle(cx);
+				rounds += 1;
+			}
+		}
+
+		/// The path field shows the host being browsed, at once; a landing
+		/// listing fills it only while the user has not typed (#190).
+		#[gpui::test]
+		fn remote_path_field_follows_the_host_being_browsed(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_, model, cx) = remote_menu_hosts(cx, &["one", "two"]);
+			let field = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, cx| {
+					m.remote_path_input.read(cx).text().to_string()
+				})
+			};
+
+			click(cx, "remote-host:0");
+			settle(cx);
+			let (home, _) = shown_folder(&model, cx);
+			assert_eq!(field(cx), home, "one's home path");
+
+			cx.simulate_input("/typed");
+			assert!(field(cx).ends_with("/typed"), "typed: {}", field(cx));
+
+			// Host two: the field shows "~" the moment the browse starts, before
+			// any listing can land (a click would drain the test clock first).
+			model.update(cx, |m, cx| m.browse_remote_host(1, cx));
+			assert_eq!(field(cx), "~", "shown at once, before the listing");
+			settle(cx);
+			let (two, _) = shown_folder(&model, cx);
+			assert_eq!(field(cx), two, "two's listing path");
+
+			click(cx, "remote-host:0");
+			settle(cx);
+			let (one_again, _) = shown_folder(&model, cx);
+			assert_eq!(field(cx), one_again, "one's listing path again");
+
+			// Typing while a listing is in flight survives its landing.
+			model.update(cx, |m, cx| m.browse_remote_host(1, cx));
+			cx.simulate_input("x");
+			settle(cx);
+			assert_eq!(field(cx), "~x", "the landing kept the typed text");
+		}
+
 		/// A host with many folders in a small window: the menu stays inside
 		/// the window and the path field and both open buttons stay
 		/// reachable, the folder list scrolling on its own.
@@ -7385,6 +7693,71 @@ mod tests {
 				shown_folder(&model, cx).0.ends_with("folder-00"),
 				"clicking remote-folder:0 opens it"
 			);
+		}
+
+		/// Opening a host's folder list and switching hosts never moves the
+		/// other host rows: the recent box keeps four whole rows (#197).
+		#[gpui::test]
+		fn workspace_menu_host_rows_keep_their_place(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("home");
+			for i in 0..43 {
+				fs::create_dir_all(base.join(format!("folder-{i:02}")))
+					.unwrap();
+			}
+			let recents: Vec<PathBuf> = (0..6)
+				.map(|i| {
+					let d = tmp.path().join(format!("recent-{i:02}"));
+					fs::create_dir_all(&d).unwrap();
+					d
+				})
+				.collect();
+			let (_, model, cx) = remote_menu_hosts(cx, &["one", "two"]);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+			model.update(cx, |m, cx| {
+				m.recent_workspaces = recents;
+				cx.notify();
+			});
+			settle(cx);
+			let y = |cx: &mut VisualTestContext, id: &'static str| {
+				f32::from(
+					cx.debug_bounds(id)
+						.unwrap_or_else(|| panic!("{id} not drawn"))
+						.origin
+						.y,
+				)
+			};
+			let h = |cx: &mut VisualTestContext, id: &'static str| {
+				f32::from(
+					cx.debug_bounds(id)
+						.unwrap_or_else(|| panic!("{id} not drawn"))
+						.size
+						.height,
+				)
+			};
+			let one = y(cx, "remote-host:0");
+			let two = y(cx, "remote-host:1");
+			assert_eq!(h(cx, "workspace-recents"), 4. * 38.);
+
+			click(cx, "remote-host:0");
+			settle(cx);
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+			});
+			settle(cx);
+			assert_eq!(y(cx, "remote-host:0"), one, "host one moved");
+			assert_eq!(h(cx, "workspace-recents"), 4. * 38.);
+			assert!(
+				y(cx, "remote-host:1") > two,
+				"host two should sit below the open block"
+			);
+
+			click(cx, "remote-host:1");
+			settle(cx);
+			assert_eq!(y(cx, "remote-host:0"), one, "host one moved");
+			assert_eq!(y(cx, "remote-host:1"), two, "host two moved");
+			assert_eq!(h(cx, "workspace-recents"), 4. * 38.);
 		}
 
 		/// A listing that lands for a folder or host no longer shown is
@@ -10681,10 +11054,11 @@ mod tests {
 			assert_eq!(got, [("common.txt", false), ("emoji.txt", false)]);
 		}
 
-		/// Flat layout (`log_details_by_dir = false`) copies in `commit_files`
-		/// order, not click order: b.txt is clicked before z.txt, but the flat
-		/// screen shows z.txt first. (In-process tests default to the by-dir
-		/// layout, which sorts dirs and names and hides a click-order bug.)
+		/// Flat layout (`log_details_by_dir = false`) copies in screen order
+		/// (natural path order), not click order: b.txt is clicked before
+		/// z.txt, but the flat screen shows a/x.txt, b.txt, z.txt. (In-process
+		/// tests default to the by-dir layout, which sorts dirs and names and
+		/// hides a click-order bug.)
 		#[gpui::test]
 		fn commit_files_copy_flat_layout_screen_order(cx: &mut TestAppContext) {
 			use crate::menu::{MenuAct, MenuEntry};
@@ -10703,7 +11077,7 @@ mod tests {
 				]
 				.map(|(p, c)| (p.to_string(), Some(c)))
 				.into();
-				// Click order: b.txt, a/x.txt, z.txt (reverse of flat order).
+				// Click order: b.txt, a/x.txt, z.txt.
 				m.selected_commit_file = Some("b.txt".into());
 				m.toggle_commit_file("a/x.txt", cx);
 				m.toggle_commit_file("z.txt", cx);
@@ -10728,9 +11102,10 @@ mod tests {
 					)
 				})
 				.collect();
+			// Flat copy follows the natural screen order.
 			assert_eq!(
 				got,
-				[("z.txt", false), ("a/x.txt", false), ("b.txt", false)]
+				[("a/x.txt", false), ("b.txt", false), ("z.txt", false)]
 			);
 		}
 
@@ -11291,7 +11666,7 @@ mod tests {
 				};
 				if let (Some(g), Some(s)) = (
 					cx.debug_bounds(key("gutter")),
-					cx.debug_bounds(key("subject")),
+					cx.debug_bounds(key("subject-room")),
 				) {
 					rows.push((
 						f32::from(g.size.width),
@@ -11300,6 +11675,67 @@ mod tests {
 				}
 			}
 			LogMeasure { list_w, rows }
+		}
+
+		/// Writes a file over the preview limit and commits it in `r`.
+		fn commit_oversized(r: &Path) {
+			fs::write(
+				r.join("big.txt"),
+				"x".repeat(snip_core::browser::PREVIEW_LIMIT + 10) + "\n",
+			)
+			.unwrap();
+			git(r, &["add", "."]);
+			git(r, &["commit", "-q", "-m", "add big"]);
+		}
+
+		/// Clicks the first log row, then checks the preview says the file
+		/// is over the limit, with no byte count.
+		fn assert_too_large_preview(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			settle_until(cx, "log rows", |cx| {
+				model.read_with(cx, |m, _| !m.display_commits().is_empty())
+			});
+			let row = cx.debug_bounds("log-subject:0").expect("row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			settle_until(cx, "preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| m.preview_error.clone());
+			let err = err.expect("preview error");
+			assert_eq!(err.key, "error_preview_too_large", "{err:?}");
+			let text = err.render(crate::i18n::Locale::ZhTw);
+			assert!(text.contains("big.txt"), "{text}");
+			assert!(!text.contains("bytes"), "{text}");
+		}
+
+		#[gpui::test]
+		fn log_preview_of_a_file_over_the_limit_says_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "big", &[]);
+			commit_oversized(&r);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+			assert_too_large_preview(&model, cx);
+		}
+
+		#[gpui::test]
+		fn remote_log_preview_of_a_file_over_the_limit_says_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let shared = tempfile::tempdir().unwrap();
+			let r = repo(shared.path(), "big", &[]);
+			commit_oversized(&r);
+			let (model, cx, _worker) = open_remote(
+				cx,
+				shared.path(),
+				snip_remote::WorkerOptions::default(),
+			);
+			assert_too_large_preview(&model, cx);
 		}
 
 		/// Every row shares one gutter, and the subject of each row keeps at
@@ -11333,6 +11769,293 @@ mod tests {
 		fn wide_multi_repo_log_keeps_a_subject_at_900(cx: &mut TestAppContext) {
 			let m = measure_wide_log(cx, 900.);
 			assert_log_layout(&m, 160.);
+		}
+
+		/// `git` with both dates fixed, so one repository's commits sort
+		/// before another's in the merged log.
+		fn git_dated(dir: &Path, args: &[&str], date: &str) {
+			let out = Command::new("git")
+				.current_dir(dir)
+				.env("GIT_AUTHOR_DATE", date)
+				.env("GIT_COMMITTER_DATE", date)
+				.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+				.args(args)
+				.output()
+				.expect("git must run");
+			assert!(out.status.success(), "git {args:?}: {out:?}");
+		}
+
+		/// Runs `ready` after each settle, at most 50 times, then fails.
+		fn settle_until(
+			cx: &mut VisualTestContext,
+			what: &str,
+			mut ready: impl FnMut(&mut VisualTestContext) -> bool,
+		) {
+			for _ in 0..50 {
+				settle(cx);
+				if ready(cx) {
+					return;
+				}
+			}
+			panic!("timed out waiting for {what}");
+		}
+
+		/// A HEAD commit with a tag on it: its branch label and its tag
+		/// label sit right after the subject, and the tag is a label of its
+		/// own (#188).
+		#[gpui::test]
+		fn ref_labels_sit_next_to_the_subject_and_tags_are_their_own_label(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "solo", &[]);
+			fs::write(r.join("short.txt"), "s").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "short"]);
+			git(&r, &["tag", "v0.1"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1600., 800.);
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
+			});
+			settle(cx);
+			let subject = cx.debug_bounds("log-subject:0").expect("subject");
+			let branch = cx.debug_bounds("log-ref-label:0:0").expect("branch");
+			assert!(
+				cx.debug_bounds("log-ref-label:0:1").is_some(),
+				"the tag is not a label of its own"
+			);
+			let gap = f32::from(branch.left()) - f32::from(subject.right());
+			assert!((0. ..=16.).contains(&gap), "label gap {gap}");
+		}
+
+		/// A HEAD with a branch and its remote, and a tag (#195). The branch
+		/// and remote merge into `main, origin/main`.
+		fn head_with_labels(dir: &Path) {
+			let r = repo(dir, "solo", &[]);
+			fs::write(r.join("long.txt"), "l").unwrap();
+			git(&r, &["add", "."]);
+			git(
+				&r,
+				&[
+					"commit",
+					"-q",
+					"-m",
+					"a subject long enough to want the whole row for itself and then some more words",
+				],
+			);
+			git(&r, &["tag", "v0.3.0"]);
+			git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+			git(
+				&r,
+				&[
+					"symbolic-ref",
+					"refs/remotes/origin/HEAD",
+					"refs/remotes/origin/main",
+				],
+			);
+		}
+
+		/// The labels the HEAD row shows, by their text.
+		fn head_label_texts(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> Vec<String> {
+			model.read_with(cx, |m, _| {
+				let row = &m.graph_layout.as_ref().unwrap().rows[0];
+				let cur = m.log_current_branch(&m.display_commits()[0].sha);
+				let (shown, _) =
+					crate::graph_view::visible_refs(&row.refs, cur.as_deref());
+				crate::graph_view::kind_labels(&shown, cur.as_deref())
+					.into_iter()
+					.map(|l| l.text)
+					.collect()
+			})
+		}
+
+		/// On a 1160 window the list is 654px: both labels fit whole beside
+		/// a subject of about 96px.
+		#[gpui::test]
+		fn head_row_labels_stay_whole_at_1160(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1160., 720.);
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
+			});
+			settle(cx);
+			let texts = head_label_texts(&model, cx);
+			assert_eq!(texts, ["main, origin/main", "v0.3.0"]);
+			for n in 0..2 {
+				// The label's natural width, capped as `ref_label_elements` caps it.
+				let natural = cx
+					.update(|w, _| {
+						17. + crate::ui::text_width(
+							w,
+							&texts[n],
+							crate::theme::SMALL_TEXT,
+						)
+					})
+					.min(320.);
+				let selector = ["log-ref-label:0:0", "log-ref-label:0:1"][n];
+				let width =
+					cx.debug_bounds(selector).expect("label").size.width;
+				assert!(
+					f32::from(width) >= natural - 1.0,
+					"label {n} {:?} cut: {width:?} < {natural}",
+					texts[n]
+				);
+			}
+			let subject = cx.debug_bounds("log-subject:0").expect("subject");
+			// ui::log::MIN_SUBJECT_BESIDE_LABELS
+			assert!(
+				f32::from(subject.size.width) >= 96. - 1.0,
+				"subject {:?}",
+				subject.size.width
+			);
+			// ui::log::MIN_SUBJECT_W: the subject gave way to keep the labels whole.
+			assert!(
+				f32::from(subject.size.width) < 160.,
+				"subject {:?}",
+				subject.size.width
+			);
+		}
+
+		/// On a 1080 window the list is 574px. The labels cannot both fit whole
+		/// beside the subject there, so the branch label is ellipsized and the
+		/// tag keeps its icon and a few characters, never a bare icon (#195).
+		#[gpui::test]
+		fn head_row_labels_stay_readable_at_1080(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
+			});
+			settle(cx);
+			assert_eq!(
+				head_label_texts(&model, cx),
+				["main, origin/main", "v0.3.0"]
+			);
+			for selector in ["log-ref-label:0:0", "log-ref-label:0:1"] {
+				let width =
+					cx.debug_bounds(selector).expect("label").size.width;
+				// Icon (14px), its gap (3px) and 30px of text: ui::log::LABEL_FLOOR_W.
+				assert!(
+					f32::from(width) >= 47. - 1.0,
+					"{selector} shows only its icon: {width:?}"
+				);
+			}
+			// About 94px here: a little under MIN_SUBJECT_BESIDE_LABELS, which
+			// the labels' floors cannot all be fitted beside at this width.
+			let subject = cx.debug_bounds("log-subject:0").expect("subject");
+			assert!(
+				f32::from(subject.size.width) >= 92.,
+				"subject {:?}",
+				subject.size.width
+			);
+		}
+
+		/// A merge lists the files changed against any parent. Those the
+		/// first parent has as well are marked, and the marked set is keyed
+		/// by the merge (#188).
+		#[gpui::test]
+		fn a_merge_commit_marks_files_unchanged_against_the_first_parent(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "m", &[]);
+			git(&r, &["checkout", "-q", "-b", "side"]);
+			fs::write(r.join("side.txt"), "s").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "side"]);
+			git(&r, &["checkout", "-q", "main"]);
+			fs::write(r.join("main.txt"), "m").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "main"]);
+			git(&r, &["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1600., 800.);
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 4)
+			});
+			let merge = cx.debug_bounds("log-subject:0").expect("merge row");
+			cx.simulate_click(merge.center(), gpui::Modifiers::none());
+			settle_until(cx, "the merge's files", |cx| {
+				model.read_with(cx, |m, _| {
+					m.commit_files.len() == 2
+						&& m.commit_files_first_parent_same.is_some()
+				})
+			});
+			model.read_with(cx, |m, _| {
+				let (_, same) =
+					m.commit_files_first_parent_same.as_ref().expect("marker");
+				assert!(same.contains("main.txt"), "{same:?}");
+				assert!(!same.contains("side.txt"), "{same:?}");
+			});
+		}
+
+		/// Two repositories in one log: the second one (here `branchy`, all
+		/// of whose commits are older) starts on the first lane once the
+		/// first one's history has ended (#188).
+		#[gpui::test]
+		fn a_merged_log_starts_the_second_repo_on_the_first_lane(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let branchy = ws.path().join("branchy");
+			fs::create_dir(&branchy).unwrap();
+			git(&branchy, &["init", "-q", "-b", "main"]);
+			fs::write(branchy.join("base.txt"), "b").unwrap();
+			git(&branchy, &["add", "."]);
+			git_dated(
+				&branchy,
+				&["commit", "-q", "-m", "branchy root"],
+				"2020-01-01T00:00:00Z",
+			);
+			fs::write(branchy.join("two.txt"), "b").unwrap();
+			git(&branchy, &["add", "."]);
+			git_dated(
+				&branchy,
+				&["commit", "-q", "-m", "branchy two"],
+				"2020-01-02T00:00:00Z",
+			);
+			let alpha = repo(ws.path(), "alpha", &[]);
+			fs::write(alpha.join("two.txt"), "a").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha two"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1600., 800.);
+			settle_until(cx, "both repositories", |cx| {
+				model.read_with(cx, |m, _| {
+					m.log_feeds.len() == 2
+						&& m.graph_layout
+							.as_ref()
+							.is_some_and(|l| l.rows.len() >= 4)
+				})
+			});
+			model.read_with(cx, |m, _| {
+				let feed = m
+					.log_feeds
+					.iter()
+					.position(|f| f.name == "branchy")
+					.expect("branchy feed");
+				let layout = m.graph_layout.as_ref().expect("layout");
+				let row = layout
+					.rows
+					.iter()
+					.find(|r| {
+						crate::multi_log::split_id(&r.sha).1 == Some(feed)
+					})
+					.expect("a branchy row");
+				assert_eq!(
+					row.node.lane, 0,
+					"branchy starts at lane {}",
+					row.node.lane
+				);
+			});
 		}
 
 		#[cfg(unix)]
@@ -12155,7 +12878,7 @@ mod tests {
 				"paste-commit:1",
 				"paste-commit:2",
 				"paste-commit-count",
-				"paste-row:0:img.bin",
+				"paste-row:3:img.bin",
 				"paste-row:4:base.txt",
 			] {
 				assert!(ids.contains(&id.to_string()), "{id} in {ids:?}");
@@ -12190,7 +12913,7 @@ mod tests {
 			let ids = drawn(cx);
 			assert!(ids.contains(&"paste-commit:0".to_string()));
 			assert!(
-				!ids.contains(&"paste-row:0:img.bin".to_string()),
+				!ids.contains(&"paste-row:3:img.bin".to_string()),
 				"{ids:?}"
 			);
 			assert!(ids.contains(&"paste-row:4:base.txt".to_string()));
@@ -12327,7 +13050,7 @@ mod tests {
 					)
 				});
 			assert_eq!(initial_idx, order[0]);
-			assert_eq!(initial_path.as_deref(), Some("img.bin"));
+			assert_eq!(initial_path.as_deref(), Some("old.txt"));
 
 			cx.simulate_keystrokes("down");
 			cx.run_until_parked();
@@ -12337,7 +13060,7 @@ mod tests {
 				assert_eq!(plan.selected_item_idx, order[1]);
 				assert_eq!(
 					m.paste.detail().and_then(|d| d.path.as_deref()),
-					Some("fresh.txt")
+					Some("dir/new.txt")
 				);
 			});
 
@@ -12349,7 +13072,7 @@ mod tests {
 				assert_eq!(plan.selected_item_idx, order[0]);
 				assert_eq!(
 					m.paste.detail().and_then(|d| d.path.as_deref()),
-					Some("img.bin")
+					Some("old.txt")
 				);
 			});
 		}
@@ -12720,6 +13443,80 @@ mod tests {
 			cx.run_until_parked();
 		}
 
+		/// The branch name keeps its width before the repo count gives way
+		/// (#194): the `×N` suffix shrinks to nothing first.
+		#[gpui::test]
+		fn branch_name_keeps_its_width_before_the_repo_count(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for i in 0..3 {
+				let r = repo(ws.path(), &format!("r{i}"), &[]);
+				git(
+					&r,
+					&[
+						"branch",
+						"feature/a-very-long-branch-name-every-repo-has",
+					],
+				);
+			}
+			let (_model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+			settle(cx);
+			// The merged log: the user's gestures, not a model method.
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:all");
+			settle(cx);
+			if cx.debug_bounds("ref:refs/heads/main").is_none() {
+				click(cx, "branch-group:refs_local");
+				settle(cx);
+			}
+			let natural = cx.update(|window, _| {
+				crate::ui::text_width(window, "main", crate::theme::UI_TEXT)
+			});
+
+			// A short name fits: the whole name, and the count is drawn.
+			let name_w = cx
+				.debug_bounds("ref-name:refs/heads/main")
+				.expect("main's name is rendered")
+				.size
+				.width;
+			assert!(
+				f32::from(name_w) >= natural - 1.0,
+				"main keeps its width: {name_w:?} vs natural {natural}"
+			);
+			assert!(
+				cx.debug_bounds("ref-repo:refs/heads/main").is_some(),
+				"the ×3 suffix is drawn beside main"
+			);
+
+			// A long name overflows the pane: the suffix gives way first.
+			let long =
+				"refs/heads/feature/a-very-long-branch-name-every-repo-has";
+			let name_sel: &'static str =
+				Box::leak(format!("ref-name:{long}").into_boxed_str());
+			let repo_sel: &'static str =
+				Box::leak(format!("ref-repo:{long}").into_boxed_str());
+			let long_name = cx
+				.debug_bounds(name_sel)
+				.expect("the long name is rendered")
+				.size
+				.width;
+			let long_suffix = cx
+				.debug_bounds(repo_sel)
+				.expect("the long branch's suffix is rendered")
+				.size
+				.width;
+			assert!(
+				f32::from(long_suffix) <= 1.0,
+				"the suffix shrinks to nothing first: {long_suffix:?}"
+			);
+			assert!(
+				f32::from(long_name) > natural,
+				"the name keeps the room the suffix gave up: {long_name:?}"
+			);
+		}
+
 		#[gpui::test]
 		fn one_path_under_two_roots_toggles_and_applies_per_row(
 			cx: &mut TestAppContext,
@@ -12906,8 +13703,8 @@ mod tests {
 				("paste-row:0:common.txt", "-already\n", "+c1\n"),
 				("paste-row:5:common.txt", "-c1\n", "+c2\n"),
 				("paste-row:1:delete.txt", "-delete me\n", ""),
-				("paste-row:2:old.txt", "-old name\n", ""),
-				("paste-row:3:new.txt", "", "+renamed\n"),
+				("paste-row:3:old.txt", "-old name\n", ""),
+				("paste-row:4:new.txt", "", "+renamed\n"),
 			] {
 				click(cx, row);
 				wait_paste_detail(&model, cx);
@@ -12937,7 +13734,7 @@ mod tests {
 				);
 				click(cx, "btn-diff-mode");
 			}
-			click(cx, "paste-row:4:img.bin");
+			click(cx, "paste-row:2:img.bin");
 			wait_paste_detail(&model, cx);
 			model.read_with(cx, |m, _| {
 				assert_eq!(
@@ -15101,6 +15898,131 @@ mod tests {
 			);
 		}
 
+		/// The branch chip shows the selected repo's HEAD while the Log is
+		/// filtered to another branch (#188).
+		#[gpui::test]
+		fn header_branch_chip_keeps_head_while_a_branch_filter_is_active(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			git(&r, &["checkout", "-b", "side"]);
+			fs::write(r.join("side.txt"), "side content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "side commit"]);
+			git(&r, &["checkout", "main"]);
+			fs::write(r.join("main.txt"), "main content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "main head commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1200., 752.);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.display_commits().len() >= 3 && !m.refs.is_empty()
+				});
+				if ready {
+					break;
+				}
+			}
+			model.update(cx, |m, cx| {
+				m.filter_by_ref(Some("side".into()), cx);
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let filtered = model.read_with(cx, |m, _| {
+					m.active_ref_filter.as_deref() == Some("side")
+						&& !m.display_commits().is_empty()
+				});
+				if filtered {
+					break;
+				}
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.active_ref_filter.as_deref(), Some("side"));
+				assert_eq!(m.header_ref_label(), "main");
+			});
+		}
+
+		/// A filter that hides the selected commit drops that commit's files
+		/// and details with the selection (#188).
+		#[gpui::test]
+		fn a_filter_that_hides_the_selected_commit_clears_its_files(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			git(&r, &["checkout", "-b", "side"]);
+			fs::write(r.join("side.txt"), "side content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "side commit"]);
+			git(&r, &["checkout", "main"]);
+			fs::write(r.join("main.txt"), "main content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "main head commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1200., 752.);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.display_commits().len() >= 3 && !m.refs.is_empty()
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+
+			// The HEAD commit is main-only, so the side filter hides it. Same-
+			// second commits can list either first, so find its row by subject.
+			let ix = model
+				.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == "main head commit")
+				})
+				.expect("main head commit listed");
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			let row = cx.debug_bounds(id).expect("commit row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			for _ in 0..50 {
+				settle(cx);
+				let loaded =
+					model.read_with(cx, |m, _| !m.commit_files.is_empty());
+				if loaded {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				assert!(!m.commit_files.is_empty(), "files must load first");
+			});
+
+			model.update(cx, |m, cx| {
+				m.filter_by_ref(Some("side".into()), cx);
+			});
+			// The reload runs on a worker thread: poll in real time, bounded
+			// (a loaded test run can take several seconds to reread the log).
+			for _ in 0..1200 {
+				settle(cx);
+				let cleared =
+					model.read_with(cx, |m, _| m.selected_commit.is_none());
+				if cleared {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(m.commit_files.is_empty(), "stale files kept");
+				assert!(m.commit_details.is_none(), "stale details kept");
+			});
+		}
+
 		/// In the Git log with a branch filter active and a non-HEAD commit
 		/// selected, clicking `btn-head` clears the filter, reloads the full
 		/// graph, scrolls to and selects HEAD.
@@ -16536,6 +17458,57 @@ mod tests {
 				wait(cx, "all tabs open", |cx| count(&root, cx) == n);
 				assert_eq!(active(&root, cx), Some(n - 1));
 				(tmp, dirs, root, cx)
+			}
+
+			/// The Git Log may take more than half the window, and a new tab
+			/// opens with the layout the active tab has (#188).
+			#[gpui::test]
+			fn the_git_panel_drags_past_half_the_window_and_a_new_tab_keeps_it(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, _dirs, root, cx) = many_tabs(cx, 1);
+				cx.simulate_resize(gpui::size(
+					gpui::px(1200.),
+					gpui::px(1000.),
+				));
+				settle(cx);
+				let vh = cx.update(|window, _| {
+					f32::from(window.viewport_size().height)
+				});
+				// The Git panel shows once discovery finds the repo.
+				for _ in 0..50 {
+					settle(cx);
+					if cx
+						.debug_bounds(sel("splitter-bottom".to_string()))
+						.is_some()
+					{
+						break;
+					}
+				}
+				let grip = cx
+					.debug_bounds(sel("splitter-bottom".to_string()))
+					.expect("splitter-bottom drawn")
+					.center();
+				let top = gpui::point(grip.x, gpui::px(150.));
+				let none = gpui::Modifiers::none();
+				cx.simulate_mouse_down(grip, gpui::MouseButton::Left, none);
+				cx.simulate_mouse_move(
+					top,
+					Some(gpui::MouseButton::Left),
+					none,
+				);
+				cx.simulate_mouse_up(top, gpui::MouseButton::Left, none);
+				settle(cx);
+				let first = tab(&root, cx, 0);
+				let before = first.read_with(cx, |m, _| m.bottom_h);
+				assert!(
+					before > 0.55 * vh,
+					"the Git Log stopped at {before} of a {vh} px window"
+				);
+				click_id(cx, "ws-tab-new".into());
+				assert_eq!(active(&root, cx), Some(1), "the new tab is active");
+				let second = tab(&root, cx, 1);
+				assert_eq!(second.read_with(cx, |m, _| m.bottom_h), before);
 			}
 
 			/// A tooltip that is up follows the tab switch under it (WT33,
@@ -18657,7 +19630,8 @@ mod tests {
 			super::CancelToken::new(),
 		);
 		match result {
-			Err(err_msg) => {
+			Err(err) => {
+				let err_msg = err.to_string();
 				assert!(
 					err_msg.contains("Path leaves the workspace"),
 					"expected 'Path leaves the workspace', got: {err_msg}"
@@ -19458,14 +20432,15 @@ mod tests {
 				"F0:README.md",
 			]
 		);
+		// Flat rows are in natural path order, ignoring case.
 		assert_eq!(
 			shape(&ui::commit_file_rows(&files, false, &closed)),
 			[
-				"F0:src/main/java/pkg/B.java",
+				"F0:docs/guide.md",
 				"F0:README.md",
 				"F0:src/main/java/pkg/a.java",
+				"F0:src/main/java/pkg/B.java",
 				"F0:src/test/T.java",
-				"F0:docs/guide.md",
 			]
 		);
 	}

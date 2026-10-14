@@ -540,11 +540,13 @@ fn metadata_without_a_retained_token_uses_the_explicit_legacy_apply_path() {
 }
 
 /// Expires the worker's token for `plan`'s preview, as the 5 minute TTL does.
-fn expire_prepared_token(fixture: &Fixture) {
-	let events = fixture.after_replies("import_prepared", 1);
+/// Expires the token the first `request_kind` call of the fixture's worker
+/// retained, once its reply (`reply_kind`) has been metered.
+fn expire_token(fixture: &Fixture, reply_kind: &str, request_kind: &str) {
+	let events = fixture.after_replies(reply_kind, 1);
 	let pid = events
 		.iter()
-		.find(|e| e["logical_kind"] == "prepare_import")
+		.find(|e| e["logical_kind"] == request_kind)
 		.unwrap()["pid"]
 		.as_u64()
 		.unwrap();
@@ -570,7 +572,7 @@ fn expired_prepared_token_falls_back_once_when_the_destination_is_unchanged() {
 	let plan = target
 		.plan_files(text, &route, &RunOptions::default(), None)
 		.unwrap();
-	expire_prepared_token(&fixture);
+	expire_token(&fixture, "import_prepared", "prepare_import");
 	target
 		.apply_files(text, &route, &plan, &selection())
 		.expect(
@@ -614,7 +616,7 @@ fn expired_prepared_token_with_a_changed_destination_refuses_as_stale() {
 	let plan = target
 		.plan_files(text, &route, &RunOptions::default(), None)
 		.unwrap();
-	expire_prepared_token(&fixture);
+	expire_token(&fixture, "import_prepared", "prepare_import");
 	fs::write(workspace.path().join("result.txt"), "edited outside").unwrap();
 	let error = target
 		.apply_files(text, &route, &plan, &selection())
@@ -760,4 +762,174 @@ fn dropping_the_last_plan_clone_reaps_its_worker_and_releases_its_slot() {
 			.success()
 	});
 	assert!(!workspace.path().join("result.txt").exists());
+}
+
+/// Runs `git` in `dir` with a fixed identity, failing the test on error.
+fn git(dir: &Path, args: &[&str]) -> String {
+	let out = std::process::Command::new("git")
+		.arg("-C")
+		.arg(dir)
+		.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+		.args(args)
+		.output()
+		.unwrap();
+	assert!(
+		out.status.success(),
+		"git {args:?}: {}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A destination repository with one base commit, as the replay expects.
+fn init_dst(dir: &Path) {
+	fs::create_dir_all(dir).unwrap();
+	git(dir, &["init", "-q", "-b", "main"]);
+	fs::write(dir.join("README"), "base\n").unwrap();
+	git(dir, &["add", "."]);
+	git(dir, &["commit", "-q", "-m", "base"]);
+}
+
+/// A commit payload of two commits in `ws/src`, the first adding a file of
+/// about 75 KB. It is exported by an unmetered in-process worker, so only
+/// the paste under test reaches the frame meter.
+fn large_commit_payload(ws: &Path) -> String {
+	let src = ws.join("src");
+	init_dst(&src);
+	let body: String = (0..1500)
+		.map(|i| format!("line {i} {}\n", "y".repeat(40)))
+		.collect();
+	fs::write(src.join("big.txt"), &body).unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "big file"]);
+	let first = git(&src, &["rev-parse", "HEAD"]);
+	fs::write(src.join("b.txt"), "b\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "add b"]);
+	let tip = git(&src, &["rev-parse", "HEAD"]);
+	let client = Client::new(
+		RemoteHost::in_process(Arc::new(Worker::new(WorkerOptions::default()))),
+		"master".into(),
+	);
+	let id = client.open_workspace(ws.to_str().unwrap()).unwrap().id;
+	client
+		.export_commits(&id, "src", &tip, vec![tip.clone(), first], None)
+		.unwrap()
+		.text
+}
+
+fn commit_count(dir: &Path) -> usize {
+	git(dir, &["rev-list", "--count", "HEAD"]).parse().unwrap()
+}
+
+/// Bytes the master sent for one request kind, as the meter counted them.
+fn uploaded_bytes(events: &[Value]) -> u64 {
+	events
+		.iter()
+		.filter(|e| e["direction"] == "up")
+		.map(|e| e["payload_bytes"].as_u64().unwrap())
+		.sum()
+}
+
+fn count_up(events: &[Value], kind: &str) -> usize {
+	events
+		.iter()
+		.filter(|e| e["direction"] == "up" && e["logical_kind"] == kind)
+		.count()
+}
+
+#[test]
+fn prepared_commit_replay_sends_the_payload_once() {
+	let _serial = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+	let fixture = Fixture::new(None, false);
+	let workspace = tempfile::tempdir().unwrap();
+	let text = large_commit_payload(workspace.path());
+	assert!(text.len() >= 64 * 1024, "payload is {} bytes", text.len());
+	let dst = workspace.path().join("dst");
+	init_dst(&dst);
+	let before = commit_count(&dst);
+	let client = fixture.client();
+	let ws = client
+		.open_workspace(workspace.path().to_str().unwrap())
+		.unwrap();
+	let target = fixture.target(client, &ws.id, "dst");
+	let payload = snip_core::commits::parse_commit_payload(&text).unwrap();
+	let (preview, prepared) = target
+		.plan_commits(&text, payload, &RunOptions::default())
+		.unwrap();
+	assert!(
+		prepared.is_prepared(),
+		"a protocol-8 worker keeps its preview"
+	);
+	target.check_commits(&text, &preview, &prepared).unwrap();
+	let result = target.apply_commits(&text, &preview, &prepared).unwrap();
+	assert_eq!(result.created.len(), 2, "{result:?}");
+	assert_eq!(commit_count(&dst), before + 2);
+
+	let events = fixture.after_replies("replayed", 1);
+	assert_eq!(
+		uploaded_bytes(&events),
+		text.len() as u64,
+		"the payload must upload only once"
+	);
+	assert_eq!(count_up(&events, "prepare_replay"), 1);
+	assert_eq!(count_up(&events, "apply_prepared_replay"), 2);
+	assert_eq!(count_up(&events, "replay_plan"), 0);
+	assert_eq!(count_up(&events, "replay_apply"), 0);
+}
+
+#[test]
+fn older_workers_keep_the_legacy_commit_replay_contract() {
+	let _serial = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+	let fixture = Fixture::new(Some(7), false);
+	let workspace = tempfile::tempdir().unwrap();
+	let text = large_commit_payload(workspace.path());
+	let dst = workspace.path().join("dst");
+	init_dst(&dst);
+	let before = commit_count(&dst);
+	let client = fixture.client();
+	let ws = client
+		.open_workspace(workspace.path().to_str().unwrap())
+		.unwrap();
+	let target = fixture.target(client, &ws.id, "dst");
+	let payload = snip_core::commits::parse_commit_payload(&text).unwrap();
+	let (preview, prepared) = target
+		.plan_commits(&text, payload, &RunOptions::default())
+		.unwrap();
+	assert!(!prepared.is_prepared());
+	let result = target.apply_commits(&text, &preview, &prepared).unwrap();
+	assert_eq!(result.created.len(), 2, "{result:?}");
+	assert_eq!(commit_count(&dst), before + 2);
+
+	let events = fixture.after_replies("replayed", 1);
+	assert_eq!(uploaded_bytes(&events), (2 * text.len()) as u64);
+	assert_eq!(count_up(&events, "prepare_replay"), 0);
+}
+
+#[test]
+fn an_expired_replay_token_falls_back_once_to_the_full_text() {
+	let _serial = ENVIRONMENT.lock().unwrap_or_else(|e| e.into_inner());
+	let fixture = Fixture::new(None, false);
+	let workspace = tempfile::tempdir().unwrap();
+	let text = large_commit_payload(workspace.path());
+	let dst = workspace.path().join("dst");
+	init_dst(&dst);
+	let before = commit_count(&dst);
+	let client = fixture.client();
+	let ws = client
+		.open_workspace(workspace.path().to_str().unwrap())
+		.unwrap();
+	let target = fixture.target(client, &ws.id, "dst");
+	let payload = snip_core::commits::parse_commit_payload(&text).unwrap();
+	let (preview, prepared) = target
+		.plan_commits(&text, payload, &RunOptions::default())
+		.unwrap();
+	expire_token(&fixture, "replay_prepared", "prepare_replay");
+	let result = target.apply_commits(&text, &preview, &prepared).unwrap();
+	assert_eq!(result.created.len(), 2, "{result:?}");
+	assert_eq!(commit_count(&dst), before + 2);
+
+	let events = fixture.after_replies("replayed", 1);
+	assert_eq!(count_up(&events, "apply_prepared_replay"), 1);
+	assert_eq!(count_up(&events, "replay_apply"), 1);
 }

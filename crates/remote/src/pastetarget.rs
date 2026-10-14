@@ -4,9 +4,11 @@
 //! same engine on its own disk (`crate::pasteserve`).
 //!
 //! Each keeps its own freshness check. A local Apply writes the plan it
-//! kept, re-checked under the repository write lock. A worker keeps no
-//! state: its Apply plans again and refuses as stale whatever differs from
-//! the preview.
+//! kept, re-checked under the repository write lock. A worker may retain
+//! its own preview under a one-use token (a file plan's or a commit
+//! replay's, on a newer protocol) and apply that; an older worker, or a
+//! token it no longer holds, plans again and refuses as stale whatever
+//! differs from the preview.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -76,6 +78,23 @@ pub(crate) fn import_mapping<E>(
 /// A unit test renders the real `GitError` and checks it still contains
 /// this, so the copy cannot drift from core's `#[error]` unnoticed.
 pub const REPO_BUSY_TEXT: &str = "another paste is writing to this repository";
+
+/// A remote commit preview's retained worker payload (protocol 8). Clones
+/// share one lease; the last drop releases the worker connection. Default:
+/// none (local target, or an older worker).
+#[derive(Clone, Debug, Default)]
+pub struct PreparedReplay(Option<Arc<crate::client::PreparedImportLease>>);
+
+impl PreparedReplay {
+	/// The owned bytes the retained lease holds on the master.
+	pub fn retained_heap_bytes(&self) -> usize {
+		self.0.as_ref().map_or(0, |l| l.retained_heap_bytes())
+	}
+	#[doc(hidden)]
+	pub fn is_prepared(&self) -> bool {
+		self.0.is_some()
+	}
+}
 
 /// Where a paste plans and writes.
 #[derive(Clone)]
@@ -513,16 +532,19 @@ impl PasteTarget {
 	}
 
 	/// Plans replaying a commit payload into the destination's repository,
-	/// with writes held to the destination folder. Nothing is written.
+	/// with writes held to the destination folder. Nothing is written. A
+	/// remote preview may keep the worker's own copy, in the returned
+	/// [`PreparedReplay`].
 	pub fn plan_commits(
 		&self,
 		text: &str,
 		payload: CommitsPayload,
 		opts: &RunOptions,
-	) -> Result<CommitReplayPreview, PasteError> {
+	) -> Result<(CommitReplayPreview, PreparedReplay), PasteError> {
 		match self {
 			PasteTarget::Local { dest } => {
 				CommitReplayPreview::capture_in(dest, dest, &payload, opts)
+					.map(|preview| (preview, PreparedReplay::default()))
 					.map_err(PasteError::Local)
 			}
 			PasteTarget::Remote {
@@ -530,23 +552,26 @@ impl PasteTarget {
 				workspace,
 				dest,
 			} => client
-				.replay_plan(
+				.prepare_replay(
 					workspace,
 					dest,
 					text,
 					payload,
 					opts.cancel.as_ref(),
 				)
+				.map(|(preview, lease)| (preview, PreparedReplay(lease)))
 				.map_err(PasteError::Remote),
 		}
 	}
 
 	/// Re-checks a commit preview without writing. Stale wins over the
-	/// overwrite prompt (spec 4.3), so the gate calls this first.
+	/// overwrite prompt (spec 4.3), so the gate calls this first. A worker
+	/// that retained `prepared` checks its own copy and sends no text.
 	pub fn check_commits(
 		&self,
 		text: &str,
 		preview: &CommitReplayPreview,
+		prepared: &PreparedReplay,
 	) -> Result<(), PasteError> {
 		match self {
 			PasteTarget::Local { .. } => {
@@ -556,18 +581,28 @@ impl PasteTarget {
 				client,
 				workspace,
 				dest,
-			} => client
-				.replay_apply(workspace, dest, text, preview, true, None)
-				.map(|_| ())
-				.map_err(PasteError::Remote),
+			} => match &prepared.0 {
+				Some(lease) => client
+					.apply_prepared_replay(
+						lease, workspace, dest, text, preview, true,
+					)
+					.map(|_| ())
+					.map_err(PasteError::Remote),
+				None => client
+					.replay_apply(workspace, dest, text, preview, true, None)
+					.map(|_| ())
+					.map_err(PasteError::Remote),
+			},
 		}
 	}
 
-	/// Replays `preview`. Never cancelled.
+	/// Replays `preview`. Never cancelled. A worker that retained
+	/// `prepared` applies its own copy, sending only the token.
 	pub fn apply_commits(
 		&self,
 		text: &str,
 		preview: &CommitReplayPreview,
+		prepared: &PreparedReplay,
 	) -> Result<ReplayResult, PasteError> {
 		match self {
 			PasteTarget::Local { .. } => {
@@ -577,10 +612,18 @@ impl PasteTarget {
 				client,
 				workspace,
 				dest,
-			} => client
-				.replay_apply(workspace, dest, text, preview, false, None)
-				.map_err(apply_failure)?
-				.ok_or(PasteError::NoReplayResult),
+			} => match &prepared.0 {
+				Some(lease) => client
+					.apply_prepared_replay(
+						lease, workspace, dest, text, preview, false,
+					)
+					.map_err(apply_failure)?
+					.ok_or(PasteError::NoReplayResult),
+				None => client
+					.replay_apply(workspace, dest, text, preview, false, None)
+					.map_err(apply_failure)?
+					.ok_or(PasteError::NoReplayResult),
+			},
 		}
 	}
 }

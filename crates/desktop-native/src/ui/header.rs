@@ -6,6 +6,8 @@ use super::*;
 const WORKSPACE_MENU_TOP: f32 = 80.;
 /// A recent workspace row: its name over its path.
 const RECENT_ROW_H: f32 = 38.;
+/// Whole recent rows shown before the list scrolls inside itself.
+const RECENT_VISIBLE_ROWS: usize = 4;
 
 impl WorkbenchModel {
 	// ───────────────────────── header ─────────────────────────
@@ -59,7 +61,7 @@ impl WorkbenchModel {
 				.tooltip(tip(path.display().to_string()))
 				.when(is_current, |d| d.bg(rgb(pal().hover_bg)))
 				.on_click(cx.listener(move |this, _, _, cx| {
-					this.workspace_menu = false;
+					this.hide_workspace_menu();
 					this.open_workspace_path(target.clone(), cx);
 				}))
 				.child(div().flex_shrink_0().child(icon(Icon::Folder, 16.)))
@@ -137,12 +139,10 @@ impl WorkbenchModel {
 				.my(px(4.))
 				.bg(rgb(pal().popup_border))
 		};
+		let n_recent = recent.len();
 		// The menu sits under the header; past the window's height it
 		// scrolls instead of running off screen.
 		let max_h = (self.viewport_h - WORKSPACE_MENU_TOP).max(200.);
-		// A long recent list scrolls on its own and gives way, down to two
-		// rows, so a browsed host's folder list keeps its room (#147).
-		let recent_min_h = recent.len().min(2) as f32 * RECENT_ROW_H;
 		let panel = div()
 			.id("workspace-menu")
 			.debug_selector(|| "workspace-menu".into())
@@ -236,6 +236,14 @@ impl WorkbenchModel {
 				)
 			})
 			.when(!recent.is_empty(), |d| {
+				// At most four whole recent rows, scrolling inside; the box
+				// never shrinks, so a browsed host's block cannot cut a row
+				// in half or move the host rows (#197).
+				let label = if n_recent > RECENT_VISIBLE_ROWS {
+					tf("workspace_recent_n", loc, &[n_recent])
+				} else {
+					t("workspace_recent", loc).to_string()
+				};
 				d.child(sep())
 					.child(
 						div()
@@ -243,7 +251,7 @@ impl WorkbenchModel {
 							.py(px(2.))
 							.text_size(px(SMALL_TEXT))
 							.text_color(rgb(pal().text_muted))
-							.child(t("workspace_recent", loc)),
+							.child(label),
 					)
 					.child(
 						div()
@@ -251,7 +259,10 @@ impl WorkbenchModel {
 							.debug_selector(|| "workspace-recents".into())
 							.flex()
 							.flex_col()
-							.min_h(px(recent_min_h))
+							.flex_shrink_0()
+							.max_h(
+								px(RECENT_VISIBLE_ROWS as f32 * RECENT_ROW_H),
+							)
 							.overflow_y_scroll()
 							.children(recent),
 					)
@@ -264,7 +275,7 @@ impl WorkbenchModel {
 					.when(!open, |d| d.text_color(rgb(pal().text_disabled)))
 					.when(open, |d| {
 						d.on_click(cx.listener(|this, _, _, cx| {
-							this.workspace_menu = false;
+							this.hide_workspace_menu();
 							this.request_user_close(
 								crate::lifecycle::Intent::CloseWorkspace,
 								cx,
@@ -418,19 +429,21 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
+	/// The branch chip: the selected repo's HEAD only, never the Log's branch filter (#188).
+	pub(crate) fn header_ref_label(&self) -> String {
+		self.repo()
+			.and_then(|r| r.summary.as_ref().ok())
+			.and_then(|s| s.branch.clone())
+			.unwrap_or_else(|| "-".into())
+	}
+
 	pub(super) fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
 		let loc = self.locale;
 		let log = &self.probes;
 
 		let repo = self.repo();
-		let branch = repo
-			.and_then(|r| r.summary.as_ref().ok())
-			.and_then(|s| s.branch.clone())
-			.unwrap_or_else(|| "-".into());
-		let ref_label = match &self.active_ref_filter {
-			Some(r) => r.trim_start_matches("refs/heads/").to_string(),
-			None => branch.clone(),
-		};
+		let branch = self.header_ref_label();
+		let ref_label = branch.clone();
 		let repo_error = repo.is_some_and(|r| r.summary.is_err());
 
 		let selector = |id: &'static str,

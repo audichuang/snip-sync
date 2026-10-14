@@ -153,11 +153,14 @@ pub(super) enum BranchRow {
 		depth: usize,
 		collapsed: bool,
 	},
-	/// A ref (full name) shown as `label`.
+	/// A ref (full name) shown as `label`, with a muted `repo` suffix when
+	/// the log merges several repositories (the repo name, or the count
+	/// when the same ref exists in several of them).
 	Ref {
 		name: String,
 		label: String,
 		depth: usize,
+		repo: Option<String>,
 	},
 }
 
@@ -166,11 +169,34 @@ pub(super) enum BranchRow {
 /// [`MAX_BRANCH_ROWS`] refs per group; `<remote>/HEAD` is not listed.
 pub(super) fn branch_rows(
 	refs: &[snip_core::browser::GitReference],
+	feeds: &[String],
 	needle: &str,
 	collapsed: &[String],
 	loc: Locale,
 ) -> Vec<BranchRow> {
 	let is_collapsed = |k: &str| collapsed.iter().any(|c| c == k);
+	// Which repositories (feed indices) hold each ref, before the dedup.
+	let mut owners: HashMap<&str, Vec<usize>> = HashMap::new();
+	for r in refs {
+		if let Some(feed) = crate::multi_log::split_id(&r.sha).1 {
+			let v = owners.entry(r.name.as_str()).or_default();
+			if !v.contains(&feed) {
+				v.push(feed);
+			}
+		}
+	}
+	let repo_of = |name: &str| -> Option<String> {
+		if feeds.is_empty() {
+			return None;
+		}
+		match owners.get(name).map(Vec::as_slice) {
+			Some([one]) => feeds.get(*one).cloned(),
+			Some(many) if many.len() > 1 => {
+				Some(tf("branch_repo_count", loc, &[many.len()]))
+			}
+			_ => None,
+		}
+	};
 	// The merged log has a `main` per repository: one row filters them all.
 	let mut seen = HashSet::new();
 	let refs: Vec<&snip_core::browser::GitReference> = refs
@@ -214,6 +240,7 @@ pub(super) fn branch_rows(
 					name: name.to_string(),
 					label: short.to_string(),
 					depth: 1,
+					repo: repo_of(name),
 				},
 			));
 			continue;
@@ -248,6 +275,7 @@ pub(super) fn branch_rows(
 							name: name.to_string(),
 							label: rest.to_string(),
 							depth: 2,
+							repo: repo_of(name),
 						})
 					})
 					.take(MAX_BRANCH_ROWS),
@@ -263,18 +291,20 @@ pub(super) fn branch_rows(
 /// list instead, named `origin/x` for a remote branch.
 pub(super) fn branch_popup_rows(
 	refs: &[snip_core::browser::GitReference],
+	feeds: &[String],
 	needle: &str,
 	open: &[String],
 	loc: Locale,
 ) -> Vec<BranchRow> {
 	if !needle.is_empty() {
-		return branch_rows(refs, needle, &[], loc)
+		return branch_rows(refs, feeds, needle, &[], loc)
 			.into_iter()
 			.filter_map(|r| match r {
-				BranchRow::Ref { name, .. } => Some(BranchRow::Ref {
+				BranchRow::Ref { name, repo, .. } => Some(BranchRow::Ref {
 					label: short_ref(&name).to_string(),
 					name,
 					depth: 0,
+					repo,
 				}),
 				BranchRow::Group { .. } => None,
 			})
@@ -299,7 +329,7 @@ pub(super) fn branch_popup_rows(
 		}
 	}
 	closed.retain(|k| !open.contains(k));
-	branch_rows(refs, "", &closed, loc)
+	branch_rows(refs, feeds, "", &closed, loc)
 		.into_iter()
 		.filter_map(|mut r| {
 			match &mut r {
@@ -448,9 +478,15 @@ pub(super) const DATE_W: f32 = 118.;
 /// The subject width a log row keeps while the gutter, author, date and ref
 /// labels are squeezed, where the window allows.
 pub(super) const MIN_SUBJECT_W: f32 = 160.;
+/// The least a subject keeps beside ref labels that would not fit otherwise;
+/// down to here the subject gives way before a label is cut (#195).
+pub(super) const MIN_SUBJECT_BESIDE_LABELS: f32 = 96.;
 /// The narrowest a ref-label group is squeezed to; below it the labels are
 /// dropped altogether.
 const MIN_LABELS_W: f32 = 80.;
+/// The narrowest a ref label is squeezed to: its icon and a few characters.
+/// Below it the label would show only its icon, which says nothing (#195).
+const LABEL_FLOOR_W: f32 = 14. + 3. + 30.;
 /// The narrowest the graph gutter is clipped to.
 const MIN_GUTTER_W: f32 = 72.;
 
@@ -534,22 +570,27 @@ pub(super) fn list_cols(
 	}
 }
 
-/// Divides a `list_w` wide row laid out with `cols`. The ref labels
-/// (`labels_w`, 0 for none) shrink first, down to [`MIN_LABELS_W`], then go,
-/// so the subject keeps [`MIN_SUBJECT_W`] where the window allows. With room
+/// Divides a `list_w` wide row laid out with `cols`. A subject keeps only
+/// its own text width, up to [`MIN_SUBJECT_W`]. When the ref labels
+/// (`labels_w`, 0 for none) do not fit beside it, the subject gives way to
+/// them down to [`MIN_SUBJECT_BESIDE_LABELS`] before a label is cut; the
+/// labels shrink to [`MIN_LABELS_W`] and are dropped below that. With room
 /// to spare nothing changes.
 pub(super) fn row_widths(
 	list_w: f32,
 	cols: ListCols,
 	labels_w: f32,
+	subject_w: f32,
 	show_hash: bool,
 ) -> RowWidths {
 	let gutter = cols.gutter;
 	let avail = row_base(list_w, show_hash) - cols.author - cols.date - gutter;
 	let mut labels = labels_w;
-	// The 6px before the labels only exists with labels.
-	if labels > 0. && avail - labels - 6. < MIN_SUBJECT_W {
-		let room = avail - 6. - MIN_SUBJECT_W;
+	// A short subject reserves only its own text.
+	if labels > 0. && avail - labels - 6. < subject_w.min(MIN_SUBJECT_W) {
+		// The subject gives way down to its floor before a label is cut;
+		// below MIN_LABELS_W the labels go.
+		let room = avail - 6. - subject_w.min(MIN_SUBJECT_BESIDE_LABELS);
 		labels = if room >= labels_w.min(MIN_LABELS_W) {
 			room.min(labels_w)
 		} else {
@@ -574,7 +615,7 @@ pub(super) fn short_ref(name: &str) -> &str {
 
 /// Width of `s` laid out in the UI font at `size`, from the text system
 /// (shaped lines are cached per frame, so a redraw does not reshape).
-pub(super) fn text_width(window: &Window, s: &str, size: f32) -> f32 {
+pub(crate) fn text_width(window: &Window, s: &str, size: f32) -> f32 {
 	let s = s.replace(['\n', '\r'], " ");
 	let run = gpui::TextRun {
 		len: s.len(),
@@ -658,15 +699,41 @@ pub(super) fn log_icon_button(
 		)
 }
 
-/// The coloured label glyph of a ref.
-pub(super) fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
-	icon_tinted(if l.current { Icon::Head } else { Icon::Tag }, 14., l.color)
+/// The glyph of a ref label: HEAD / the checked-out branch, a tag, or a branch.
+pub(super) fn label_icon_kind(l: &graph_view::RefLabel) -> Icon {
+	if l.current {
+		Icon::Head
+	} else if l.tag {
+		Icon::Tag
+	} else {
+		Icon::Branch
+	}
 }
 
-/// A row's ref labels, right-aligned at the end of the subject: one label
-/// icon plus the names of at most two badges, the rest folded into `+N`. Also returns their
-/// laid-out width (`measure` gives a name's text width).
+/// The coloured label glyph of a ref.
+pub(super) fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
+	icon_tinted(label_icon_kind(l), 14., l.color)
+}
+
+/// A muted suffix after a name (a ref's repository, or `×N` repositories):
+/// it shrinks first, so the name keeps its width as long as it fits (#194).
+pub(super) fn yielding_suffix(text: impl Into<SharedString>) -> Div {
+	let mut d = clip_text(text)
+		.ml(px(6.))
+		.text_size(px(SMALL_TEXT))
+		.text_color(rgb(pal().text_muted));
+	// Flex shrink is weighted by the item's own width; this weight makes
+	// the suffix absorb the overflow before the name loses a pixel.
+	d.style().flex_shrink = Some(1000.);
+	d
+}
+
+/// A row's ref labels, after the subject: one label for its branches and one
+/// for its tags, each with its icon, and the names of at most two badges
+/// per label, the rest folded into `+N`. Also returns their laid-out width
+/// (`measure` gives a name's text width).
 pub(super) fn ref_label_elements(
+	ix: usize,
 	refs: &[snip_core::graph::RefInfo],
 	current_branch: Option<&str>,
 	row: &str,
@@ -674,44 +741,55 @@ pub(super) fn ref_label_elements(
 	measure: &dyn Fn(&str) -> f32,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	// One label for the shown badges: icon (14) + 3 + names, at most 320
-	// (the room two separate labels had).
 	let mut width = 0.;
-	let mut out: Vec<AnyElement> =
-		graph_view::combined_label(&shown, current_branch)
-			.into_iter()
-			.map(|l| {
-				width += (17. + measure(&l.text)).min(320.);
-				let tooltip = shown
-					.iter()
-					.flat_map(|b| {
-						std::iter::once(b.primary)
-							.chain(b.merged.iter().copied())
-					})
-					.map(|i| graph_view::format_ref_badge(i).0)
-					.collect::<Vec<_>>()
-					.join("\n");
-				div()
-					.id(SharedString::from(format!(
-						"ref-badge:{row}:{}",
-						l.text
-					)))
-					.flex()
-					.items_center()
-					.gap(px(3.))
-					.max_w(px(320.))
-					// Squeezed by the labels container, the text ellipsizes.
-					.min_w_0()
-					.when(show_tips, |d| d.tooltip(tip(tooltip)))
-					.child(label_icon(&l))
-					.child(
-						clip_text(l.text.clone())
-							.text_size(px(SMALL_TEXT))
-							.text_color(rgb(pal().log_ref_text)),
-					)
-					.into_any_element()
+	let mut out: Vec<AnyElement> = Vec::new();
+	for (n, l) in graph_view::kind_labels(&shown, current_branch)
+		.into_iter()
+		.enumerate()
+	{
+		if n > 0 {
+			width += 8.;
+		}
+		width += (17. + measure(&l.text)).min(320.);
+		let tooltip = shown
+			.iter()
+			.filter(|b| {
+				matches!(b.primary.kind, snip_core::graph::RefKind::Tag)
+					== l.tag
 			})
-			.collect();
+			.flat_map(|b| {
+				std::iter::once(b.primary).chain(b.merged.iter().copied())
+			})
+			.map(|i| graph_view::format_ref_badge(i).0)
+			.collect::<Vec<_>>()
+			.join("\n");
+		let selector = format!("log-ref-label:{ix}:{n}");
+		let mut el = div()
+			.id(SharedString::from(format!("ref-badge:{row}:{}", l.text)))
+			.debug_selector(move || selector)
+			.flex()
+			.items_center()
+			.gap(px(3.))
+			.max_w(px(320.))
+			// Squeezed by the labels container, the text ellipsizes, but the
+			// label keeps its icon and a few characters (never a bare icon).
+			.min_w(px((17. + measure(&l.text)).min(LABEL_FLOOR_W)))
+			.overflow_hidden()
+			.when(show_tips, |d| d.tooltip(tip(tooltip)))
+			.child(label_icon(&l))
+			.child(
+				clip_text(l.text.clone())
+					.text_size(px(SMALL_TEXT))
+					.text_color(rgb(pal().text)),
+			);
+		// A squeezed group gives the most to the later labels first; each
+		// keeps LABEL_FLOOR_W, so the first (best-ranked) one takes the rest
+		// (#195).
+		if n > 0 {
+			el.style().flex_shrink = Some(1000.);
+		}
+		out.push(el.into_any_element());
+	}
 	if hidden > 0 {
 		width += 8. + measure(&format!("+{hidden}"));
 		let all = refs
@@ -1349,6 +1427,7 @@ impl WorkbenchModel {
 					&& "head".contains(needle.as_str());
 				let rows = branch_popup_rows(
 					&self.refs,
+					&self.log_feed_names(),
 					&needle,
 					&self.log_branch_menu_open,
 					loc,
@@ -1358,6 +1437,7 @@ impl WorkbenchModel {
 						name: "HEAD".into(),
 						label: "HEAD".into(),
 						depth: 0,
+						repo: None,
 					})
 					.into_iter()
 					.chain(rows)
@@ -1416,13 +1496,20 @@ impl WorkbenchModel {
 									.into_any_element(),
 							);
 						}
-						BranchRow::Ref { name, label, depth } => {
+						BranchRow::Ref {
+							name,
+							label,
+							depth,
+							repo,
+						} => {
 							let checked = self.active_ref_filter.as_deref()
 								== Some(&name);
 							let target = name.clone();
 							items.push(
 								div()
 									.pl(px(depth as f32 * 14.))
+									.flex()
+									.items_center()
 									.child(item(
 										format!("log-branch:{name}"),
 										label,
@@ -1436,6 +1523,9 @@ impl WorkbenchModel {
 										}),
 										cx,
 									))
+									.when_some(repo, |d, r| {
+										d.child(yielding_suffix(r))
+									})
 									.into_any_element(),
 							);
 						}
@@ -1852,7 +1942,9 @@ impl WorkbenchModel {
 		             indent: f32,
 		             target: Option<String>,
 		             active: bool,
+		             repo: Option<String>,
 		             cx: &mut Context<Self>| {
+			let name_key = id.trim_start_matches("ref:").to_string();
 			div()
 				.id(SharedString::from(id.clone()))
 				.debug_selector(|| id.clone())
@@ -1869,12 +1961,28 @@ impl WorkbenchModel {
 				.cursor_pointer()
 				.when(active, |d| d.bg(rgb(pal().selection_inactive_bg)))
 				.when(!active, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
-				.tooltip(tip(label.clone()))
+				.tooltip(tip(match &repo {
+					Some(r) => format!("{label} ({r})"),
+					None => label.clone(),
+				}))
 				.on_click(cx.listener(move |this, _, _, cx| {
 					this.filter_by_ref(target.clone(), cx)
 				}))
 				.child(glyph)
-				.child(clip_text(label).text_color(rgb(pal().text)))
+				.child(
+					clip_text(label)
+						.text_color(rgb(pal().text))
+						.debug_selector({
+							let s = format!("ref-name:{name_key}");
+							move || s
+						}),
+				)
+				.when_some(repo.clone(), |d, r| {
+					d.child(yielding_suffix(r).debug_selector({
+						let s = format!("ref-repo:{name_key}");
+						move || s
+					}))
+				})
 				.children(probe(log, id))
 				.into_any_element()
 		};
@@ -1888,12 +1996,17 @@ impl WorkbenchModel {
 				10.,
 				Some("HEAD".into()),
 				self.active_ref_filter.as_deref() == Some("HEAD"),
+				None,
 				cx,
 			));
 		}
-		for row in
-			branch_rows(&self.refs, &needle, &self.branch_groups_collapsed, loc)
-		{
+		for row in branch_rows(
+			&self.refs,
+			&self.log_feed_names(),
+			&needle,
+			&self.branch_groups_collapsed,
+			loc,
+		) {
 			match row {
 				BranchRow::Group {
 					key,
@@ -1945,7 +2058,12 @@ impl WorkbenchModel {
 							.into_any_element(),
 					);
 				}
-				BranchRow::Ref { name, label, depth } => {
+				BranchRow::Ref {
+					name,
+					label,
+					depth,
+					repo,
+				} => {
 					let is_current = name.strip_prefix("refs/heads/").is_some()
 						&& current.as_deref()
 							== name.strip_prefix("refs/heads/");
@@ -1974,6 +2092,7 @@ impl WorkbenchModel {
 						8. + depth as f32 * 16.,
 						Some(name),
 						active,
+						repo,
 						cx,
 					));
 				}
@@ -2128,12 +2247,12 @@ mod row_width_tests {
 				date: DATE_W
 			}
 		);
-		let w = row_widths(1200., c, 100., false);
+		let w = row_widths(1200., c, 100., 400., false);
 		assert_eq!(w.gutter, 40.);
 		assert_eq!(w.labels, 100.);
 		assert_eq!(w.subject, 1200. - 8. - 24. - 40. - 238. - 106.);
 		let c = cols(1200., 40., false, true);
-		let w = row_widths(1200., c, 0., true);
+		let w = row_widths(1200., c, 0., 400., true);
 		assert_eq!(w.subject, 1200. - 8. - 32. - 40. - 238. - 64.);
 	}
 
@@ -2151,15 +2270,29 @@ mod row_width_tests {
 				}
 				for has_labels in [false, true] {
 					let c = cols(list_w, WIDE_GUTTER, has_labels, show_hash);
-					for labels_w in [0., 60., 337.] {
-						let w = row_widths(list_w, c, labels_w, show_hash);
-						assert!(
-							w.subject >= MIN_SUBJECT_W,
-							"{list_w} {show_hash} {labels_w}: {c:?} {w:?}"
-						);
-						assert!(
-							c.gutter <= WIDE_GUTTER && w.labels <= labels_w
-						);
+					for subject_w in [40., 400.] {
+						for labels_w in [0., 60., 337.] {
+							let w = row_widths(
+								list_w, c, labels_w, subject_w, show_hash,
+							);
+							let with_labels =
+								if w.labels > 0. { w.labels + 6. } else { 0. };
+							assert!(
+								w.subject >= subject_w.min(MIN_SUBJECT_BESIDE_LABELS),
+								"{list_w} {show_hash} {subject_w} {labels_w}: {c:?} {w:?}"
+							);
+							assert!(
+								w.subject + with_labels >= MIN_SUBJECT_W,
+								"{list_w} {show_hash} {subject_w} {labels_w}: {c:?} {w:?}"
+							);
+							assert!(
+								w.labels == 0. || w.labels >= labels_w.min(MIN_LABELS_W),
+								"{list_w} {show_hash} {subject_w} {labels_w}: {c:?} {w:?}"
+							);
+							assert!(
+								c.gutter <= WIDE_GUTTER && w.labels <= labels_w
+							);
+						}
 					}
 				}
 			}
@@ -2170,9 +2303,9 @@ mod row_width_tests {
 	fn a_1080_window_keeps_ref_labels_and_a_subject() {
 		// 574px is the list a 1080 window leaves, hash off, long labels.
 		let c = cols(574., WIDE_GUTTER, true, false);
-		let w = row_widths(574., c, 337., false);
+		let w = row_widths(574., c, 337., 400., false);
 		assert!(w.labels >= MIN_LABELS_W, "{c:?} {w:?}");
-		assert!(w.subject >= MIN_SUBJECT_W, "{c:?} {w:?}");
+		assert!(w.subject >= MIN_SUBJECT_BESIDE_LABELS, "{c:?} {w:?}");
 	}
 
 	#[test]
@@ -2186,7 +2319,7 @@ mod row_width_tests {
 		// The labels are dropped here anyway (the deficit is more than the
 		// date and author can give), so the author is not squeezed for them.
 		assert_eq!(c.author, 81.);
-		let w = row_widths(433., c, 337., false);
+		let w = row_widths(433., c, 337., 400., false);
 		assert_eq!(w.labels, 0.);
 		assert!(w.subject >= MIN_SUBJECT_W, "{w:?}");
 		// Only the date gives way while it alone is enough.
@@ -2207,7 +2340,7 @@ mod row_width_tests {
 			(c.gutter, c.author, c.date),
 			(MIN_GUTTER_W, MIN_AUTHOR_W, MIN_DATE_W)
 		);
-		let w = row_widths(300., c, 337., false);
+		let w = row_widths(300., c, 337., 400., false);
 		assert_eq!(w.labels, 0.);
 		assert_eq!(w.subject, 300. - 8. - 24. - 72. - 72. - 88.);
 	}
@@ -2222,31 +2355,45 @@ mod row_width_tests {
 
 	#[test]
 	fn every_row_of_a_list_shares_one_set_of_columns() {
-		// Dropping the labels gives the subject the room, not the gutter.
+		// Labels take room from the subject, never from the gutter.
 		let c = cols(574., WIDE_GUTTER, true, false);
 		let (none, dropped) = (
-			row_widths(560., c, 0., false),
-			row_widths(560., c, 337., false),
+			row_widths(560., c, 0., 400., false),
+			row_widths(560., c, 337., 400., false),
 		);
 		assert_eq!(dropped.gutter, none.gutter);
-		assert_eq!(dropped.labels, 0.);
-		assert_eq!(dropped.subject, none.subject);
+		assert_eq!(dropped.subject + dropped.labels + 6., none.subject);
 	}
 
 	#[test]
 	fn labels_shrink_before_the_gutter() {
 		let c = cols(800., 120., true, false);
 		assert_eq!(c.gutter, 120.);
-		let w = row_widths(800., c, 337., false);
+		let w = row_widths(800., c, 337., 400., false);
 		assert!(w.labels < 337. && w.labels >= 80.);
-		assert_eq!(w.subject, MIN_SUBJECT_W);
+		assert_eq!(w.subject, MIN_SUBJECT_BESIDE_LABELS);
 	}
 
 	#[test]
 	fn tiny_windows_never_go_negative() {
 		let c = cols(100., WIDE_GUTTER, true, true);
-		let w = row_widths(100., c, 337., true);
+		let w = row_widths(100., c, 337., 400., true);
 		assert!(w.subject >= 0. && w.labels == 0.);
+	}
+
+	#[test]
+	fn a_short_subject_leaves_its_room_to_the_labels() {
+		let c = cols(574., 40., true, false);
+		let w = row_widths(574., c, 200., 30., false);
+		assert_eq!(w.labels, 200.);
+	}
+
+	#[test]
+	fn the_subject_gives_way_to_whole_labels_down_to_its_floor() {
+		let c = cols(574., WIDE_GUTTER, true, false);
+		let w = row_widths(574., c, 108., 400., false);
+		assert_eq!(w.labels, 108.);
+		assert!(w.subject >= MIN_SUBJECT_BESIDE_LABELS);
 	}
 }
 
@@ -2288,5 +2435,70 @@ mod filter_split_tests {
 		// Nothing active: plain prefix order.
 		let prefix = 100. + 50. + 46. + 2. * LOG_FILTER_GAP;
 		assert_eq!(l.compute_split(prefix, [false; 4]), 0b0011);
+	}
+}
+
+#[cfg(test)]
+mod repo_label_tests {
+	use super::*;
+	use snip_core::browser::GitReference;
+
+	fn reference(name: &str, sha: &str) -> GitReference {
+		GitReference {
+			name: name.into(),
+			sha: sha.into(),
+		}
+	}
+
+	fn repo_of(rows: &[BranchRow], name: &str) -> Option<Option<String>> {
+		rows.iter().find_map(|r| match r {
+			BranchRow::Ref { name: n, repo, .. } if n == name => {
+				Some(repo.clone())
+			}
+			_ => None,
+		})
+	}
+
+	#[test]
+	fn branch_rows_name_the_repo_or_count_in_a_merged_log() {
+		let refs = vec![
+			reference("refs/heads/main", "aa@0"),
+			reference("refs/heads/main", "bb@1"),
+			reference("refs/heads/feature/x", "cc@1"),
+			reference("refs/tags/v1", "aa@0"),
+		];
+		let feeds = ["alpha".to_string(), "branchy".to_string()];
+		let rows = branch_rows(&refs, &feeds, "", &[], Locale::ZhTw);
+		assert_eq!(
+			repo_of(&rows, "refs/heads/main"),
+			Some(Some("×2".to_string()))
+		);
+		assert_eq!(
+			repo_of(&rows, "refs/heads/feature/x"),
+			Some(Some("branchy".to_string()))
+		);
+		assert_eq!(
+			repo_of(&rows, "refs/tags/v1"),
+			Some(Some("alpha".to_string()))
+		);
+		// A single repository names none.
+		let rows = branch_rows(&refs, &[], "", &[], Locale::ZhTw);
+		assert!(rows.iter().all(|r| match r {
+			BranchRow::Ref { repo, .. } => repo.is_none(),
+			BranchRow::Group { .. } => true,
+		}));
+	}
+
+	#[test]
+	fn label_icon_kind_differs_for_branch_and_tag() {
+		let label = |current: bool, tag: bool| graph_view::RefLabel {
+			text: "x".into(),
+			color: 0,
+			current,
+			tag,
+		};
+		assert_eq!(label_icon_kind(&label(true, false)), Icon::Head);
+		assert_eq!(label_icon_kind(&label(false, true)), Icon::Tag);
+		assert_eq!(label_icon_kind(&label(false, false)), Icon::Branch);
 	}
 }

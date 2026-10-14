@@ -251,6 +251,7 @@ pub(crate) fn write_response<W: Write>(
 		Response::ImportPlanned(_)
 			| Response::ImportPrepared(_)
 			| Response::ReplayPlanned(_)
+			| Response::ReplayPrepared(_)
 	) {
 		let json = serde_json::to_string(response).map_err(io::Error::other)?;
 		if json.len() > CHUNK_BYTES {
