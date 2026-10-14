@@ -7453,6 +7453,68 @@ mod tests {
 			});
 		}
 
+		/// A host without snip, picked from the menu: the listing and the
+		/// failed open both say so in the interface language, not in the
+		/// English text the CLI prints (#204).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn a_host_without_snip_is_reported_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_, model, cx) = remote_menu_hosts(cx, &["bare-host"]);
+			model.update(cx, |m, cx| {
+				m.remote.hosts = vec![snip_remote::RemoteHost {
+					name: "bare-host".into(),
+					transport: snip_remote::Transport::Command(vec![
+						"sh".into(),
+						"-c".into(),
+						"echo 'sh: snip: not found' >&2; exit 127".into(),
+					]),
+				}];
+				cx.notify();
+			});
+			cx.run_until_parked();
+			click(cx, "remote-host:0");
+			settle_until(cx, "the listing to fail", |cx| {
+				model.read_with(cx, |m, _| {
+					m.remote
+						.browse
+						.as_ref()
+						.is_some_and(|b| matches!(b.listing, Some(Err(_))))
+				})
+			});
+			let zh = "那台機器沒有安裝 snip";
+			model.read_with(cx, |m, _| {
+				let Some(Err(text)) =
+					&m.remote.browse.as_ref().unwrap().listing
+				else {
+					panic!("the listing failed");
+				};
+				assert!(text.starts_with(zh), "{text}");
+				assert!(!text.contains("not installed"), "{text}");
+			});
+			// The open of a typed path fails the same way.
+			model.update(cx, |m, cx| {
+				m.remote_path_input.update(cx, |f, cx| f.set_text("/x", cx))
+			});
+			click(cx, "btn-remote-open");
+			settle_until(cx, "the failed open", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.remote.busy
+						&& matches!(m.remote.message, Some((false, _)))
+				})
+			});
+			model.read_with(cx, |m, _| {
+				let Some((_, text)) = &m.remote.message else {
+					panic!("a failure message");
+				};
+				assert!(text.starts_with(zh), "{text}");
+				assert_eq!(m.status.key, "remote_open_failed");
+				assert!(m.status.args[0].starts_with(zh), "{:?}", m.status);
+			});
+		}
+
 		/// One browse connection per menu: it is handed to the open of the
 		/// folder shown, and it ends with the menu (#187).
 		#[gpui::test]
