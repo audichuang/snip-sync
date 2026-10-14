@@ -4258,12 +4258,13 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
+		let hold = bg.clone();
 
 		self.spawn_owned(cx, kind, job_cancel, async move {
 			let for_bg = file_path.clone();
 			let result = bg
 				.spawn(async move {
-					let result = match remote {
+					match remote {
 						Some((client, ws, session_root)) if fs_only => {
 							match remote::remote_rel(&session_root, &repo_root)
 							{
@@ -4282,13 +4283,14 @@ impl WorkbenchModel {
 						_ => read_preview(
 							&host, &repo_root, &for_bg, &source, cancel,
 						),
-					};
-					if let Some(delay) = delay {
-						std::thread::sleep(delay);
 					}
-					result
 				})
 				.await;
+			// The executor's timer, not a thread sleep: a test's clock holds
+			// the finished read without blocking its gestures.
+			if let Some(delay) = delay {
+				hold.timer(delay).await;
+			}
 
 			let _ = this.update(&mut async_app, |model, cx| {
 				if model.preview_generation != task_generation {
@@ -16398,14 +16400,11 @@ mod tests {
 			let (model, cx) =
 				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
 			settle(cx);
-			model.update(cx, |m, _| {
-				m.e2e_read_delay = Some(std::time::Duration::from_millis(400));
-			});
-			// Both steps in one turn: every gesture parks the executor until
-			// the delayed read has finished, so the chip's own handler
-			// (`set_log_repos`) runs while the read is still in flight.
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			// Project-tree and Changes rows have no debug selector, so the
+			// read starts through the model; the chip is a real click.
 			let root = alpha.clone();
-			let beta = ws.path().join("beta");
 			model.update(cx, |m, cx| {
 				m.select_file_in(
 					Some(root),
@@ -16413,16 +16412,23 @@ mod tests {
 					crate::SourceKind::File,
 					cx,
 				);
-				assert!(m.preview_loading, "the read must be in flight");
-				m.set_log_repos(vec![beta], cx);
 			});
-			for _ in 0..1200 {
-				settle(cx);
-				if model.read_with(cx, |m, _| m.preview.is_some()) {
-					break;
-				}
-				std::thread::sleep(std::time::Duration::from_millis(25));
-			}
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| m.preview_loading),
+				"the read must be held in flight",
+			);
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_repo_filter.len(), 1, "the chip applied");
+				assert!(
+					m.preview_loading,
+					"the repo filter dropped the file read in flight",
+				);
+			});
+			cx.executor().advance_clock(delay);
+			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert_eq!(m.selected_file.as_deref(), Some("a.txt"));
 				assert!(
