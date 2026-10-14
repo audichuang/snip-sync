@@ -42,7 +42,12 @@ pub struct LogFilterLayout {
 	/// The widest text an active chip draws (0 until first measured: the
 	/// 180px default). Active chips share the bar, so a long value is
 	/// truncated before it pushes another active chip into the overflow.
+	/// Inactive chips keep `CHIP_TEXT_MAX_W`.
 	pub text_cap: std::rc::Rc<std::cell::Cell<f32>>,
+	/// The active chips' natural text widths of the last frame: the cap for
+	/// any bar width follows from them, so the container canvas can tell
+	/// that a resize left the drawn cap stale.
+	pub cap_natural: std::rc::Rc<std::cell::RefCell<Vec<f32>>>,
 	/// Each chip's last drawn text and its measured width. A chip whose
 	/// text is unchanged keeps that width while hidden, so a text estimate
 	/// cannot reveal it again and again (estimates run a few px short or
@@ -62,6 +67,9 @@ pub(crate) const CHIP_TEXT_MAX_W: f32 = 180.0;
 pub(crate) const CHIP_TEXT_MIN_W: f32 = 64.0;
 /// A chip's padding, gap and icon around its text (with 1px slack).
 pub(crate) const CHIP_CHROME_W: f32 = 28.0;
+/// Extra room per active chip, so a text measured a few px off (font
+/// fallback) does not push a chip into the overflow again.
+pub(crate) const CHIP_SLACK_W: f32 = 3.0;
 
 /// The text cap that lets active chips with these natural text widths
 /// share `room` px: short values keep their width, long ones split what
@@ -86,6 +94,19 @@ pub(crate) fn chip_text_cap(natural: &[f32], room: f32) -> f32 {
 }
 
 impl LogFilterLayout {
+	/// The active chips' text cap for a bar `avail` px wide.
+	pub(crate) fn text_cap_for(&self, avail: f32) -> f32 {
+		let natural = self.cap_natural.borrow();
+		if natural.is_empty() || avail <= 0.0 {
+			return CHIP_TEXT_MAX_W;
+		}
+		let chrome = LOG_FILTER_GAP + CHIP_CHROME_W + CHIP_SLACK_W;
+		chip_text_cap(
+			&natural,
+			avail - self.more_w.get() - natural.len() as f32 * chrome,
+		)
+	}
+
 	pub fn text_cap(&self) -> f32 {
 		match self.text_cap.get() {
 			c if c > 0.0 => c,
@@ -875,7 +896,10 @@ impl WorkbenchModel {
 		let selector = id.clone();
 		let open = self.log_menu == Some(menu);
 		let active = value.is_some();
-		let text_cap = self.log_filter_layout.text_cap();
+		let text_cap = match active {
+			true => self.log_filter_layout.text_cap(),
+			false => CHIP_TEXT_MAX_W,
+		};
 		// The drawn width depends on the text and on its cap.
 		let text = match &value {
 			Some(v) => format!("{label}: {v}\u{0}{text_cap:.0}"),
@@ -1039,22 +1063,17 @@ impl WorkbenchModel {
 		// `compute_split_count` adds it when a hidden chip has a value.
 		let more =
 			8. + text_width(window, t("log_chip_more", loc), UI_TEXT) + 13.;
-		let natural: Vec<f32> = texts
+		*layout.cap_natural.borrow_mut() = texts
 			.iter()
 			.filter(|(_, active)| *active)
 			.map(|(text, _)| text_width(window, text, UI_TEXT))
 			.collect();
-		let cap = match (natural.len(), self.log_chips_available_width()) {
-			(0, _) => CHIP_TEXT_MAX_W,
-			(_, avail) if avail <= 0.0 => CHIP_TEXT_MAX_W,
-			(n, avail) => chip_text_cap(
-				&natural,
-				avail - more - n as f32 * (LOG_FILTER_GAP + CHIP_CHROME_W),
-			),
-		};
+		layout.more_w.set(more);
+		let cap = layout.text_cap_for(self.log_chips_available_width());
 		layout.text_cap.set(cap);
 		let measured = layout.measured.borrow();
 		for (i, menu) in ALL_LOG_FILTER_MENUS.into_iter().enumerate() {
+			let cap = if texts[i].1 { cap } else { CHIP_TEXT_MAX_W };
 			let key = format!("{}\u{0}{cap:.0}", texts[i].0);
 			let w = match &measured[i] {
 				(drawn, w) if *drawn == key && *w > 0. => *w,
@@ -1066,7 +1085,6 @@ impl WorkbenchModel {
 			};
 			layout.chip_width_cell(menu).set(w);
 		}
-		layout.more_w.set(more);
 	}
 
 	pub(super) fn log_branch_value(&self) -> Option<String> {

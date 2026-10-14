@@ -3441,30 +3441,16 @@ impl WorkbenchModel {
 			.unwrap_or_else(|| self.display_repo_path(root))
 	}
 
-	/// The Repository chip's name for a repository: just its own name, like
-	/// a local one, so a long remote prefix (`host ▸ path › `) does not
-	/// crowd the other chips. Two repositories of the workspace with the
-	/// same name keep the full name to tell them apart.
+	/// The Repository chip's name for a repository: its workspace name,
+	/// disambiguated like a local one (a remote entry's `name` is already
+	/// short), so a long remote prefix (`host ▸ path › `) does not crowd
+	/// the other chips.
 	pub fn log_repo_chip_name(&self, root: &std::path::Path) -> String {
-		let short = |r: &std::path::Path| -> Option<String> {
-			let session = self.remote.session.as_ref()?;
-			let rel = crate::remote::remote_rel(&session.root, r)?;
-			match rel.rsplit('/').next().filter(|n| !n.is_empty()) {
-				Some(name) => Some(name.to_string()),
-				None => Some(session.workspace.name.clone()),
-			}
-		};
-		let Some(name) = short(root) else {
-			return self.log_repo_name(root);
-		};
-		let clash = self.repos.iter().any(|r| {
-			r.root != root && short(&r.root).as_deref() == Some(&name)
-		});
-		if clash {
-			self.log_repo_name(root)
-		} else {
-			name
-		}
+		self.repos
+			.iter()
+			.find(|r| r.root == root)
+			.map(|r| r.name.clone())
+			.unwrap_or_else(|| self.log_repo_name(root))
 	}
 
 	/// A repository's root-stripe color: its place in the workspace, so
