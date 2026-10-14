@@ -630,7 +630,7 @@ pub fn read_preview(
 	prefix: &str,
 	path: &str,
 	cancel: Option<&snip_core::gitrun::CancelToken>,
-) -> Result<(SourcePreview, PreviewSource), String> {
+) -> Result<(SourcePreview, PreviewSource), crate::PreviewErr> {
 	let full_path = join_rel(prefix, path);
 	client
 		.read(workspace, &full_path, cancel)
@@ -643,7 +643,13 @@ pub fn read_preview(
 				PreviewSource::WorkingFile,
 			)
 		})
-		.map_err(describe)
+		.map_err(|e| match e {
+			RemoteError::Refused {
+				code: snip_remote::ErrorCode::TooLarge,
+				..
+			} => crate::PreviewErr::TooLarge,
+			other => crate::PreviewErr::Failed(describe(other)),
+		})
 }
 
 pub fn describe(err: RemoteError) -> String {
@@ -696,6 +702,29 @@ impl WorkbenchModel {
 	fn remote_note(&mut self, ok: bool, text: String, cx: &mut Context<Self>) {
 		self.remote.message = Some((ok, text));
 		cx.notify();
+	}
+
+	/// A failed open's Client goes back to the menu's browse of the same host
+	/// when that browse holds none, so the next click in the menu does not
+	/// start ssh again (#198). A refused open leaves the pooled connection
+	/// warm; a broken one left the pool empty and the next call reconnects.
+	fn return_browse_client(&mut self, idx: usize, client: Arc<Client>) {
+		let same_host = self
+			.remote
+			.hosts
+			.get(idx)
+			.is_some_and(|h| h.name == client.host().name);
+		if !same_host {
+			return;
+		}
+		if let Some(b) = self
+			.remote
+			.browse
+			.as_mut()
+			.filter(|b| b.host == idx && b.client.is_none())
+		{
+			b.client = Some(client);
+		}
 	}
 
 	/// Lists host `idx`'s home folder in the menu.
@@ -964,9 +993,14 @@ impl WorkbenchModel {
 						let client = reuse.unwrap_or_else(|| {
 							Arc::new(Client::new(host, device_name()))
 						});
-						let workspace = client
-							.open_workspace_with(path.trim(), Some(&token))?;
-						Ok::<_, RemoteError>(OpenedRemote { client, workspace })
+						match client
+							.open_workspace_with(path.trim(), Some(&token))
+						{
+							Ok(workspace) => {
+								Ok(OpenedRemote { client, workspace })
+							}
+							Err(err) => Err((client, err)),
+						}
 					})
 					.await;
 				let _ = this.update(&mut async_app, |this, cx| {
@@ -1000,7 +1034,8 @@ impl WorkbenchModel {
 								this.route_open(target, cx);
 							}
 						}
-						Err(err) => {
+						Err((client, err)) => {
+							this.return_browse_client(idx, client);
 							let retryable = err.is_restore_retryable();
 							let err = describe(err);
 							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");

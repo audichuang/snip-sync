@@ -56,8 +56,11 @@ mod remote;
 
 use changes::*;
 pub(crate) use changes::{
-	change_rows, commit_file_rows, ChangeItemRow, ChangeLayout, UNREADABLE,
+	change_rows, commit_file_rows, natural_cmp, ChangeItemRow, ChangeLayout,
+	UNREADABLE,
 };
+#[cfg(test)]
+pub(crate) use log::text_width;
 use log::*;
 pub use log::{LogFilterLayout, LogMenu};
 

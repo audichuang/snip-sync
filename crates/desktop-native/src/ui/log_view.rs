@@ -654,10 +654,11 @@ impl WorkbenchModel {
 			.as_deref()
 			.is_some_and(|e| e.eq_ignore_ascii_case(&c.author_email));
 		let hash_w = if self.log_show_hash { 64. } else { 0. };
+		let subject_w = text_width(window, &c.subject, UI_TEXT);
 		// The subject cell is what the row's fixed parts leave; the graph
 		// gutter and the ref labels give way before it vanishes.
 		let widths = if list_w > 0. {
-			row_widths(list_w, cols, labels_w, self.log_show_hash)
+			row_widths(list_w, cols, labels_w, subject_w, self.log_show_hash)
 		} else {
 			// Not laid out yet: no width to divide.
 			RowWidths {
@@ -672,7 +673,7 @@ impl WorkbenchModel {
 		} else {
 			Vec::new()
 		};
-		let truncated = text_width(window, &c.subject, UI_TEXT) > subject_room;
+		let truncated = subject_w > subject_room;
 		let row_id = format!("commit-row:{key}");
 		let col_id = format!("collapse:{key}");
 		let merge_sha = sha.clone();

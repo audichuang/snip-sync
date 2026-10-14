@@ -871,10 +871,10 @@ fn read_preview(
 	change: Option<snip_core::format::ChangeType>,
 	parents: Option<&[String]>,
 	read: &Read,
-) -> Result<browser::SourcePreview, String> {
+) -> Result<browser::SourcePreview, crate::PreviewErr> {
 	let preview = g
 		.preview(source, path, change.map(|c| (c, parents)), read)
-		.map_err(|e| e.to_string())?;
+		.map_err(crate::PreviewErr::from)?;
 	Ok(browser::SourcePreview {
 		content: preview.content,
 		patch: preview.patch,
@@ -3046,7 +3046,7 @@ impl WorkbenchModel {
 							browser::MAX_BLOB_BYTES,
 							&read,
 						)
-						.map_err(|e| e.to_string())
+						.map_err(crate::PreviewErr::from)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -3079,10 +3079,7 @@ impl WorkbenchModel {
 								[path.clone(), n.to_string()],
 							))
 						}
-						Err(e) => model.show_preview_error(Msg::new(
-							"error_preview",
-							[path.clone(), e],
-						)),
+						Err(e) => model.show_preview_error(e.msg(path.clone())),
 					}
 					cx.notify();
 				});

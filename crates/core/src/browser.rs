@@ -764,7 +764,10 @@ pub fn file_preview(root: &Path, path: &str) -> io::Result<SourcePreview> {
 		.take((PREVIEW_LIMIT + 1) as u64)
 		.read_to_end(&mut bytes)?;
 	if bytes.len() > PREVIEW_LIMIT {
-		return Err(io::Error::other("Preview exceeds 1 MiB"));
+		return Err(io::Error::new(
+			io::ErrorKind::FileTooLarge,
+			"Preview exceeds 1 MiB",
+		));
 	}
 	Ok(SourcePreview {
 		content: decode_utf8_or_skip(bytes),
@@ -1135,7 +1138,10 @@ mod tests {
 			.unwrap()
 			.set_len((PREVIEW_LIMIT + 1) as u64)
 			.unwrap();
-		assert!(file_preview(root, "big").is_err());
+		assert_eq!(
+			file_preview(root, "big").unwrap_err().kind(),
+			io::ErrorKind::FileTooLarge
+		);
 	}
 
 	/// Every hunk header counts exactly the lines that follow it.

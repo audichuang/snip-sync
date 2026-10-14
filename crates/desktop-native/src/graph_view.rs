@@ -136,7 +136,7 @@ pub struct RefLabel {
 }
 
 /// Label for a badge. A local branch with same-named remote-tracking refs
-/// reads "origin & main", like IntelliJ.
+/// lists them after it: "main, origin/main" (#195).
 pub fn ref_label(badge: &RefBadge, current_branch: Option<&str>) -> RefLabel {
 	let info = badge.primary;
 	let is_current = match &info.kind {
@@ -151,20 +151,18 @@ pub fn ref_label(badge: &RefBadge, current_branch: Option<&str>) -> RefLabel {
 		RefKind::Tag => pal().ref_tag,
 		_ => pal().text_muted,
 	};
-	let mut remotes: Vec<&str> = Vec::new();
+	let mut names = vec![format_ref_badge(info).0];
 	for r in &badge.merged {
-		if let RefKind::RemoteBranch { remote, .. } = &r.kind {
-			if !remotes.contains(&remote.as_str()) {
-				remotes.push(remote);
-			}
+		if matches!(&r.kind, RefKind::RemoteBranch { name, .. } if name == "HEAD")
+		{
+			continue;
+		}
+		let n = format_ref_badge(r).0;
+		if !names.contains(&n) {
+			names.push(n);
 		}
 	}
-	let name = format_ref_badge(info).0;
-	let text = if remotes.is_empty() {
-		name
-	} else {
-		format!("{} & {name}", remotes.join(", "))
-	};
+	let text = names.join(", ");
 	RefLabel {
 		text,
 		color,
@@ -173,8 +171,8 @@ pub fn ref_label(badge: &RefBadge, current_branch: Option<&str>) -> RefLabel {
 	}
 }
 
-/// One label for all of a row's shown badges, like IntelliJ's
-/// "origin & main, dev": icon and colour of the first (best-ranked) badge.
+/// One label for all of a row's shown badges, like "main, origin/main, dev":
+/// icon and colour of the first (best-ranked) badge.
 pub fn combined_label(
 	badges: &[RefBadge],
 	current_branch: Option<&str>,
@@ -738,6 +736,30 @@ mod tests {
 	}
 
 	#[test]
+	fn merged_label_lists_ref_names_local_first() {
+		let refs = [
+			remote("origin", "HEAD"),
+			local("main"),
+			remote("origin", "main"),
+		];
+		let b = merge_tracking_refs(&refs);
+		assert_eq!(ref_label(&b[0], None).text, "main, origin/main");
+		let refs = [remote("origin", "HEAD"), remote("origin", "x")];
+		let b = merge_tracking_refs(&refs);
+		assert_eq!(ref_label(&b[0], None).text, "origin/x");
+		let refs = [
+			local("main"),
+			remote("origin", "main"),
+			remote("upstream", "main"),
+		];
+		let b = merge_tracking_refs(&refs);
+		assert_eq!(
+			ref_label(&b[0], None).text,
+			"main, origin/main, upstream/main"
+		);
+	}
+
+	#[test]
 	fn shown_badges_join_into_one_label() {
 		let refs = vec![
 			local("fix"),
@@ -747,7 +769,7 @@ mod tests {
 		];
 		let (shown, _) = visible_refs(&refs, Some("release"));
 		let l = combined_label(&shown, Some("release")).unwrap();
-		assert_eq!(l.text, "origin & release, origin & fix");
+		assert_eq!(l.text, "release, origin/release, fix, origin/fix");
 		assert!(l.current);
 		assert!(combined_label(&[], None).is_none());
 	}
