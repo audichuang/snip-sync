@@ -2312,7 +2312,7 @@ impl Interactivity {
                     let pending_mouse_down = pending_mouse_down.clone();
                     move |window: &Window| {
                         pending_mouse_down.borrow().is_none()
-                            && !window.mouse_position_stale
+                            && !window.mouse_position_stale // SNIP PATCH (#203)
                             && source_bounds.get().contains(&window.mouse_position())
                     }
                 });
@@ -2320,7 +2320,7 @@ impl Interactivity {
                     let hitbox = hitbox.clone();
                     move |window: &Window| {
                         pending_mouse_down.borrow().is_none()
-                            && !window.mouse_position_stale
+                            && !window.mouse_position_stale // SNIP PATCH (#203)
                             && hitbox.is_hovered(window)
                     }
                 });

@@ -1499,7 +1499,15 @@ impl WorkbenchModel {
 	/// Drops every commit selection and the details, files and previews that
 	/// came from it, so a selection that left the list leaves nothing stale.
 	fn clear_commit_selection(&mut self) {
-		self.preview_generation += 1;
+		// Only a Log-derived read in flight is dropped: a Project or
+		// Changes preview still loading belongs to a file the user just
+		// picked, and bumping the generation would discard it (#202).
+		let log_read_pending =
+			self.preview_loading && self.preview_pending_from_log;
+		if log_read_pending {
+			self.preview_generation += 1;
+			self.preview_loading = false;
+		}
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.selected_commit = None;
 		self.range_head = None;
@@ -1510,7 +1518,6 @@ impl WorkbenchModel {
 		self.commit_files_first_parent_same = None;
 		self.selected_commit_file = None;
 		self.commit_file_sel.clear();
-		self.preview_loading = false;
 		self.compare = None;
 		self.clear_commit_preview();
 	}
@@ -2006,6 +2013,7 @@ impl WorkbenchModel {
 		self.commit_files.clear();
 		self.clear_preview();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		let id = sha.to_string();
 		let Some((root, sha)) = self.log_root_for(&id) else {
@@ -2300,6 +2308,7 @@ impl WorkbenchModel {
 		self.commit_file_origin.clear();
 		self.clear_preview();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		let Some((root, _)) = self
 			.log_selected
@@ -2478,6 +2487,7 @@ impl WorkbenchModel {
 		self.commit_files.clear();
 		self.clear_preview();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		self.log_commit_root = Some(root.clone());
 		app_log!("[APP:COMPARE: from={} to={}]", &older[..7], &newer[..7]);
@@ -2732,6 +2742,7 @@ impl WorkbenchModel {
 		self.selected_commit_file = Some(path.to_string());
 		self.commit_file_sel.clear();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		self.preview_error_root = None;
 		let path = path.to_string();
@@ -3041,6 +3052,7 @@ impl WorkbenchModel {
 		self.selected_commit_file = Some(path.clone());
 		self.commit_file_sel.clear();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		app_log!("[APP:TREE_FILE_SELECTED: {}]", path);
 		let (sha_bg, path_bg) = (sha.clone(), path.clone());

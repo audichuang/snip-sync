@@ -828,6 +828,8 @@ pub struct WorkbenchModel {
 	// Reader.
 	pub preview: Option<Preview>,
 	pub preview_loading: bool,
+	/// The read in flight came from the Log selection (commit, compare).
+	pub preview_pending_from_log: bool,
 	pub preview_error: Option<Msg>,
 	pub reader: Reader,
 	pub find_input: Entity<TextInput>,
@@ -1351,6 +1353,7 @@ impl WorkbenchModel {
 			selected_list_row: 0,
 			preview: None,
 			preview_loading: false,
+			preview_pending_from_log: false,
 			preview_error: None,
 			reader: Reader::default(),
 			find_input,
@@ -4234,6 +4237,7 @@ impl WorkbenchModel {
 		let shown_root = repo_root.clone();
 		let file_path = path.to_string();
 		self.preview_loading = true;
+		self.preview_pending_from_log = false;
 		self.preview_error = None;
 		self.preview_error_root = None;
 
@@ -16378,6 +16382,56 @@ mod tests {
 			});
 		}
 
+		/// A file preview still loading (a slow read) is not the Log's: the
+		/// repository chip must not discard it (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_keeps_a_file_preview_still_loading(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			model.update(cx, |m, _| {
+				m.e2e_read_delay = Some(std::time::Duration::from_millis(400));
+			});
+			// Both steps in one turn: every gesture parks the executor until
+			// the delayed read has finished, so the chip's own handler
+			// (`set_log_repos`) runs while the read is still in flight.
+			let root = alpha.clone();
+			let beta = ws.path().join("beta");
+			model.update(cx, |m, cx| {
+				m.select_file_in(
+					Some(root),
+					"a.txt",
+					crate::SourceKind::File,
+					cx,
+				);
+				assert!(m.preview_loading, "the read must be in flight");
+				m.set_log_repos(vec![beta], cx);
+			});
+			for _ in 0..1200 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.preview.is_some()) {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_file.as_deref(), Some("a.txt"));
+				assert!(
+					m.preview.is_some() && !m.preview_loading,
+					"the requested preview was dropped by the repo filter",
+				);
+			});
+		}
+
 		/// A Shift-range selection previews a Compare; a repository filter
 		/// change drops it with the selection and the compare state (#202).
 		#[gpui::test]
@@ -16699,11 +16753,11 @@ mod tests {
 				panic!("timed out waiting for {what}");
 			}
 
-			fn sel(id: String) -> &'static str {
+			pub(super) fn sel(id: String) -> &'static str {
 				Box::leak(id.into_boxed_str())
 			}
 
-			fn click_id(cx: &mut VisualTestContext, id: String) {
+			pub(super) fn click_id(cx: &mut VisualTestContext, id: String) {
 				cx.run_until_parked();
 				let id = sel(id);
 				let bounds = cx
@@ -17861,7 +17915,10 @@ mod tests {
 				at
 			}
 
-			fn tooltip_shown(cx: &mut VisualTestContext, text: &str) -> bool {
+			pub(super) fn tooltip_shown(
+				cx: &mut VisualTestContext,
+				text: &str,
+			) -> bool {
 				drawn(cx, &format!("tooltip:{text}"))
 			}
 
@@ -18063,7 +18120,7 @@ mod tests {
 			}
 
 			/// The tooltip `text` is drawn over the point `at`.
-			fn covered_by_tooltip(
+			pub(super) fn covered_by_tooltip(
 				cx: &mut VisualTestContext,
 				at: gpui::Point<gpui::Pixels>,
 				text: &str,
@@ -18083,8 +18140,9 @@ mod tests {
 				gpui::point(panel.center().x, panel.origin.y + gpui::px(20.))
 			}
 
-			/// Hovered until its tooltip is up, then clicked: the click
-			/// drops the shown tooltip too (#203).
+			/// Hovered until its tooltip is up, then clicked: GPUI's own
+			/// MouseDown already drops a shown tooltip, so this guards that
+			/// existing behaviour for the workspace button (not the #203 fix).
 			#[gpui::test]
 			fn clicking_the_workspace_button_drops_its_shown_tooltip(
 				cx: &mut TestAppContext,
@@ -18111,53 +18169,6 @@ mod tests {
 				assert!(!tooltip_shown(cx, &text), "the tooltip stays");
 				let row = workspace_menu_first_row(cx);
 				assert!(!covered_by_tooltip(cx, row, &text));
-			}
-
-			/// The Log toolbar's More button opens a menu below itself:
-			/// its tooltip must not cover the first item (#203).
-			#[gpui::test]
-			fn opening_the_log_more_menu_hides_its_buttons_tooltip(
-				cx: &mut TestAppContext,
-			) {
-				let ws = tempfile::tempdir().unwrap();
-				let r = repo(ws.path(), "my-repo", &[]);
-				fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
-				git(&r, &["add", "."]);
-				git(&r, &["commit", "-q", "-m", "commit c1"]);
-				let (model, cx) =
-					open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
-				for _ in 0..50 {
-					settle(cx);
-					if model.read_with(cx, |m, _| !m.commits.is_empty()) {
-						break;
-					}
-				}
-				settle(cx);
-				let loc = model.read_with(cx, |m, _| m.locale);
-				let text = crate::i18n::t("tip_log_more", loc).to_string();
-				// Clicked while the tooltip still waits to show.
-				let at = cx
-					.debug_bounds("btn-log-more")
-					.expect("More drawn")
-					.center();
-				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
-				click_id(cx, "btn-log-more".into());
-				cx.executor().advance_clock(Duration::from_millis(700));
-				settle(cx);
-				assert_eq!(
-					model.read_with(cx, |m, _| m.log_menu),
-					Some(crate::ui::LogMenu::More),
-					"the menu is open"
-				);
-				assert!(
-					!tooltip_shown(cx, &text),
-					"the tooltip stays over the opened menu"
-				);
-				let item = cx
-					.debug_bounds("log-more:details")
-					.expect("first item drawn")
-					.center();
-				assert!(!covered_by_tooltip(cx, item, &text));
 			}
 
 			/// A tooltip left up while a native dialog took the pointer
@@ -19775,6 +19786,61 @@ mod tests {
 					Some(2),
 					"the retry came after the stop"
 				);
+			}
+		}
+
+		/// Log toolbar tooltips.
+		mod log_tooltips {
+			use super::workspace_tabs::{
+				click_id, covered_by_tooltip, tooltip_shown,
+			};
+			use super::*;
+
+			/// The Log toolbar's More button opens a menu below itself:
+			/// its tooltip must not cover the first item (#203).
+			#[gpui::test]
+			fn opening_the_log_more_menu_hides_its_buttons_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				let r = repo(ws.path(), "my-repo", &[]);
+				fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "commit c1"]);
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+				for _ in 0..50 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.commits.is_empty()) {
+						break;
+					}
+				}
+				settle(cx);
+				let loc = model.read_with(cx, |m, _| m.locale);
+				let text = crate::i18n::t("tip_log_more", loc).to_string();
+				// Clicked while the tooltip still waits to show.
+				let at = cx
+					.debug_bounds("btn-log-more")
+					.expect("More drawn")
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+				click_id(cx, "btn-log-more".into());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+				assert_eq!(
+					model.read_with(cx, |m, _| m.log_menu),
+					Some(crate::ui::LogMenu::More),
+					"the menu is open"
+				);
+				assert!(
+					!tooltip_shown(cx, &text),
+					"the tooltip stays over the opened menu"
+				);
+				let item = cx
+					.debug_bounds("log-more:details")
+					.expect("first item drawn")
+					.center();
+				assert!(!covered_by_tooltip(cx, item, &text));
 			}
 		}
 	}

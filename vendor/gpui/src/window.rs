@@ -1102,7 +1102,7 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
-                        window.mouse_position_stale = true;
+                        window.mouse_position_stale = true; // SNIP PATCH (#203)
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -1251,7 +1251,7 @@ impl Window {
             appearance,
             appearance_observers: SubscriberSet::new(),
             active,
-            mouse_position_stale: false,
+            mouse_position_stale: false, // SNIP PATCH (#203)
             hovered,
             needs_present,
             last_input_timestamp,
@@ -3599,19 +3599,19 @@ impl Window {
             // API for the mouse position can only occur on the main thread.
             PlatformInput::MouseMove(mouse_move) => {
                 self.mouse_position = mouse_move.position;
-                self.mouse_position_stale = false;
+                self.mouse_position_stale = false; // SNIP PATCH (#203)
                 self.modifiers = mouse_move.modifiers;
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
                 self.mouse_position = mouse_down.position;
-                self.mouse_position_stale = false;
+                self.mouse_position_stale = false; // SNIP PATCH (#203)
                 self.modifiers = mouse_down.modifiers;
                 PlatformInput::MouseDown(mouse_down)
             }
             PlatformInput::MouseUp(mouse_up) => {
                 self.mouse_position = mouse_up.position;
-                self.mouse_position_stale = false;
+                self.mouse_position_stale = false; // SNIP PATCH (#203)
                 self.modifiers = mouse_up.modifiers;
                 PlatformInput::MouseUp(mouse_up)
             }
@@ -3626,7 +3626,7 @@ impl Window {
             }
             PlatformInput::ScrollWheel(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
-                self.mouse_position_stale = false;
+                self.mouse_position_stale = false; // SNIP PATCH (#203)
                 self.modifiers = scroll_wheel.modifiers;
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
