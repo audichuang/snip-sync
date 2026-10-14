@@ -4270,9 +4270,9 @@ impl WorkbenchModel {
 									&for_bg,
 									Some(&cancel),
 								),
-								None => {
-									Err("not under the workspace".to_string())
-								}
+								None => Err(PreviewErr::Failed(
+									"not under the workspace".into(),
+								)),
 							}
 						}
 						_ => read_preview(
@@ -4327,7 +4327,7 @@ impl WorkbenchModel {
 	pub fn apply_source_preview(
 		&mut self,
 		path: String,
-		result: Result<(browser::SourcePreview, PreviewSource), String>,
+		result: Result<(browser::SourcePreview, PreviewSource), PreviewErr>,
 	) -> bool {
 		match result {
 			Ok((p, source)) => {
@@ -4354,7 +4354,7 @@ impl WorkbenchModel {
 				}
 			}
 			Err(e) => {
-				self.show_preview_error(Msg::new("error_preview", [path, e]));
+				self.show_preview_error(e.msg(path));
 				false
 			}
 		}
@@ -5890,17 +5890,69 @@ fn resolve_added_repo(
 	)))
 }
 
+/// Why a preview read gave no text (#193).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewErr {
+	/// Over the 1 MiB preview limit, on any host.
+	TooLarge,
+	Failed(String),
+}
+
+impl From<String> for PreviewErr {
+	fn from(s: String) -> Self {
+		Self::Failed(s)
+	}
+}
+
+impl From<snip_core::gitsrc::GitError> for PreviewErr {
+	fn from(e: snip_core::gitsrc::GitError) -> Self {
+		match e {
+			snip_core::gitsrc::GitError::OutputLimit { .. } => Self::TooLarge,
+			other => Self::Failed(other.to_string()),
+		}
+	}
+}
+
+impl From<std::io::Error> for PreviewErr {
+	fn from(e: std::io::Error) -> Self {
+		if e.kind() == std::io::ErrorKind::FileTooLarge {
+			Self::TooLarge
+		} else {
+			Self::Failed(e.to_string())
+		}
+	}
+}
+
+impl std::fmt::Display for PreviewErr {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::TooLarge => f.write_str("over the 1 MiB preview limit"),
+			Self::Failed(s) => f.write_str(s),
+		}
+	}
+}
+
+impl PreviewErr {
+	/// The message shown in the editor for `path`.
+	pub(crate) fn msg(self, path: String) -> Msg {
+		match self {
+			Self::TooLarge => Msg::new("error_preview_too_large", [path]),
+			Self::Failed(e) => Msg::new("error_preview", [path, e]),
+		}
+	}
+}
+
 fn read_preview(
 	host: &crate::githost::GitHost,
 	repo_root: &std::path::Path,
 	path: &str,
 	source: &SourceKind,
 	cancel: CancelToken,
-) -> Result<(browser::SourcePreview, PreviewSource), String> {
+) -> Result<(browser::SourcePreview, PreviewSource), PreviewErr> {
 	if matches!(source, SourceKind::File) {
 		return browser::file_preview(repo_root, path)
 			.map(|p| (p, PreviewSource::WorkingFile))
-			.map_err(|e| e.to_string());
+			.map_err(PreviewErr::from);
 	}
 	let (git_source, preview_source) = match source {
 		SourceKind::Staged => (GitSource::Staged, PreviewSource::StagedChanges),
@@ -5935,7 +5987,7 @@ fn read_preview(
 		)),
 		// A failed/cancelled Git source must never be replaced by current
 		// working-tree bytes. Explicit File/tree sources are handled above.
-		Err(e) => Err(e.to_string()),
+		Err(e) => Err(e.into()),
 	}
 }
 
@@ -6458,6 +6510,48 @@ mod tests {
 			en_lim.contains(&format!("~{} tokens", expected_stats.tokens)),
 			"En limit message '{en_lim}' must contain token count"
 		);
+	}
+
+	/// A preview read over the limit is `TooLarge` on every host, and any
+	/// other failure keeps its text (#193).
+	#[test]
+	fn preview_err_says_too_large_for_any_host() {
+		use super::PreviewErr;
+		use snip_core::gitsrc::GitError;
+		assert_eq!(
+			PreviewErr::from(GitError::OutputLimit {
+				args: "cat-file x:big".into(),
+				limit: 1048576,
+			}),
+			PreviewErr::TooLarge
+		);
+		assert_eq!(
+			PreviewErr::from(GitError::from(
+				snip_remote::RemoteError::Refused {
+					code: snip_remote::ErrorCode::TooLarge,
+					message:
+						"the result is too large to send; narrow the request"
+							.into(),
+				}
+			)),
+			PreviewErr::TooLarge
+		);
+		assert_eq!(
+			PreviewErr::from(std::io::Error::new(
+				std::io::ErrorKind::FileTooLarge,
+				"x"
+			)),
+			PreviewErr::TooLarge
+		);
+		assert!(matches!(
+			PreviewErr::from(GitError::Host("boom".into())),
+			PreviewErr::Failed(_)
+		));
+		let text = PreviewErr::TooLarge
+			.msg("big.txt".into())
+			.render(crate::i18n::Locale::ZhTw);
+		assert!(text.contains("big.txt"), "{text}");
+		assert!(!text.contains("bytes") && !text.contains("0 "), "{text}");
 	}
 
 	/// UI state driven in-process: no display, so these also run in the
@@ -7307,6 +7401,58 @@ mod tests {
 			});
 		}
 
+		/// A failed open from the menu keeps the browse's connection (#198).
+		#[gpui::test]
+		fn a_failed_menu_open_keeps_the_browse_connection(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("base");
+			fs::create_dir_all(base.join("a")).unwrap();
+			let (_, model, cx) = remote_menu_hosts(cx, &["test-worker"]);
+			click(cx, "remote-host:0");
+			settle(cx);
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx)
+			});
+			settle(cx);
+			let client_of = |m: &WorkbenchModel| {
+				m.remote.browse.as_ref().and_then(|b| b.client_for_tests())
+			};
+			let c = model
+				.read_with(cx, |m, _| client_of(m))
+				.expect("browse client");
+			let missing =
+				tmp.path().join("no-such-folder").display().to_string();
+			model.update(cx, |m, cx| {
+				m.remote_path_input
+					.update(cx, |f, cx| f.set_text(&missing, cx))
+			});
+			click(cx, "btn-remote-open");
+			settle_until(cx, "the failed open", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.remote.busy
+						&& matches!(m.remote.message, Some((false, _)))
+				})
+			});
+			model.read_with(cx, |m, _| {
+				assert!(m.remote.session.is_none());
+				assert!(m.workspace_menu, "the menu stays open");
+				let back =
+					client_of(m).expect("the browse got its client back");
+				assert!(std::sync::Arc::ptr_eq(&back, &c), "same connection");
+			});
+			click_remote_folder(&model, cx, "a");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(
+					std::sync::Arc::ptr_eq(&client_of(m).unwrap(), &c),
+					"folder click reuses it"
+				)
+			});
+		}
+
 		/// One browse connection per menu: it is handed to the open of the
 		/// folder shown, and it ends with the menu (#187).
 		#[gpui::test]
@@ -7547,6 +7693,71 @@ mod tests {
 				shown_folder(&model, cx).0.ends_with("folder-00"),
 				"clicking remote-folder:0 opens it"
 			);
+		}
+
+		/// Opening a host's folder list and switching hosts never moves the
+		/// other host rows: the recent box keeps four whole rows (#197).
+		#[gpui::test]
+		fn workspace_menu_host_rows_keep_their_place(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let base = tmp.path().join("home");
+			for i in 0..43 {
+				fs::create_dir_all(base.join(format!("folder-{i:02}")))
+					.unwrap();
+			}
+			let recents: Vec<PathBuf> = (0..6)
+				.map(|i| {
+					let d = tmp.path().join(format!("recent-{i:02}"));
+					fs::create_dir_all(&d).unwrap();
+					d
+				})
+				.collect();
+			let (_, model, cx) = remote_menu_hosts(cx, &["one", "two"]);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+			model.update(cx, |m, cx| {
+				m.recent_workspaces = recents;
+				cx.notify();
+			});
+			settle(cx);
+			let y = |cx: &mut VisualTestContext, id: &'static str| {
+				f32::from(
+					cx.debug_bounds(id)
+						.unwrap_or_else(|| panic!("{id} not drawn"))
+						.origin
+						.y,
+				)
+			};
+			let h = |cx: &mut VisualTestContext, id: &'static str| {
+				f32::from(
+					cx.debug_bounds(id)
+						.unwrap_or_else(|| panic!("{id} not drawn"))
+						.size
+						.height,
+				)
+			};
+			let one = y(cx, "remote-host:0");
+			let two = y(cx, "remote-host:1");
+			assert_eq!(h(cx, "workspace-recents"), 4. * 38.);
+
+			click(cx, "remote-host:0");
+			settle(cx);
+			model.update(cx, |m, cx| {
+				m.browse_remote_folder(0, base.display().to_string(), cx);
+			});
+			settle(cx);
+			assert_eq!(y(cx, "remote-host:0"), one, "host one moved");
+			assert_eq!(h(cx, "workspace-recents"), 4. * 38.);
+			assert!(
+				y(cx, "remote-host:1") > two,
+				"host two should sit below the open block"
+			);
+
+			click(cx, "remote-host:1");
+			settle(cx);
+			assert_eq!(y(cx, "remote-host:0"), one, "host one moved");
+			assert_eq!(y(cx, "remote-host:1"), two, "host two moved");
+			assert_eq!(h(cx, "workspace-recents"), 4. * 38.);
 		}
 
 		/// A listing that lands for a folder or host no longer shown is
@@ -11466,6 +11677,67 @@ mod tests {
 			LogMeasure { list_w, rows }
 		}
 
+		/// Writes a file over the preview limit and commits it in `r`.
+		fn commit_oversized(r: &Path) {
+			fs::write(
+				r.join("big.txt"),
+				"x".repeat(snip_core::browser::PREVIEW_LIMIT + 10) + "\n",
+			)
+			.unwrap();
+			git(r, &["add", "."]);
+			git(r, &["commit", "-q", "-m", "add big"]);
+		}
+
+		/// Clicks the first log row, then checks the preview says the file
+		/// is over the limit, with no byte count.
+		fn assert_too_large_preview(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			settle_until(cx, "log rows", |cx| {
+				model.read_with(cx, |m, _| !m.display_commits().is_empty())
+			});
+			let row = cx.debug_bounds("log-subject:0").expect("row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			settle_until(cx, "preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| m.preview_error.clone());
+			let err = err.expect("preview error");
+			assert_eq!(err.key, "error_preview_too_large", "{err:?}");
+			let text = err.render(crate::i18n::Locale::ZhTw);
+			assert!(text.contains("big.txt"), "{text}");
+			assert!(!text.contains("bytes"), "{text}");
+		}
+
+		#[gpui::test]
+		fn log_preview_of_a_file_over_the_limit_says_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "big", &[]);
+			commit_oversized(&r);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+			assert_too_large_preview(&model, cx);
+		}
+
+		#[gpui::test]
+		fn remote_log_preview_of_a_file_over_the_limit_says_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let shared = tempfile::tempdir().unwrap();
+			let r = repo(shared.path(), "big", &[]);
+			commit_oversized(&r);
+			let (model, cx, _worker) = open_remote(
+				cx,
+				shared.path(),
+				snip_remote::WorkerOptions::default(),
+			);
+			assert_too_large_preview(&model, cx);
+		}
+
 		/// Every row shares one gutter, and the subject of each row keeps at
 		/// least `min` wide.
 		fn assert_log_layout(m: &LogMeasure, min: f32) {
@@ -11555,6 +11827,135 @@ mod tests {
 			);
 			let gap = f32::from(branch.left()) - f32::from(subject.right());
 			assert!((0. ..=16.).contains(&gap), "label gap {gap}");
+		}
+
+		/// A HEAD with a branch and its remote, and a tag (#195). The branch
+		/// and remote merge into `main, origin/main`.
+		fn head_with_labels(dir: &Path) {
+			let r = repo(dir, "solo", &[]);
+			fs::write(r.join("long.txt"), "l").unwrap();
+			git(&r, &["add", "."]);
+			git(
+				&r,
+				&[
+					"commit",
+					"-q",
+					"-m",
+					"a subject long enough to want the whole row for itself and then some more words",
+				],
+			);
+			git(&r, &["tag", "v0.3.0"]);
+			git(&r, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+			git(
+				&r,
+				&[
+					"symbolic-ref",
+					"refs/remotes/origin/HEAD",
+					"refs/remotes/origin/main",
+				],
+			);
+		}
+
+		/// The labels the HEAD row shows, by their text.
+		fn head_label_texts(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> Vec<String> {
+			model.read_with(cx, |m, _| {
+				let row = &m.graph_layout.as_ref().unwrap().rows[0];
+				let cur = m.log_current_branch(&m.display_commits()[0].sha);
+				let (shown, _) =
+					crate::graph_view::visible_refs(&row.refs, cur.as_deref());
+				crate::graph_view::kind_labels(&shown, cur.as_deref())
+					.into_iter()
+					.map(|l| l.text)
+					.collect()
+			})
+		}
+
+		/// On a 1160 window the list is 654px: both labels fit whole beside
+		/// a subject of about 96px.
+		#[gpui::test]
+		fn head_row_labels_stay_whole_at_1160(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1160., 720.);
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
+			});
+			settle(cx);
+			let texts = head_label_texts(&model, cx);
+			assert_eq!(texts, ["main, origin/main", "v0.3.0"]);
+			for n in 0..2 {
+				// The label's natural width, capped as `ref_label_elements` caps it.
+				let natural = cx
+					.update(|w, _| {
+						17. + crate::ui::text_width(
+							w,
+							&texts[n],
+							crate::theme::SMALL_TEXT,
+						)
+					})
+					.min(320.);
+				let selector = ["log-ref-label:0:0", "log-ref-label:0:1"][n];
+				let width =
+					cx.debug_bounds(selector).expect("label").size.width;
+				assert!(
+					f32::from(width) >= natural - 1.0,
+					"label {n} {:?} cut: {width:?} < {natural}",
+					texts[n]
+				);
+			}
+			let subject = cx.debug_bounds("log-subject:0").expect("subject");
+			// ui::log::MIN_SUBJECT_BESIDE_LABELS
+			assert!(
+				f32::from(subject.size.width) >= 96. - 1.0,
+				"subject {:?}",
+				subject.size.width
+			);
+			// ui::log::MIN_SUBJECT_W: the subject gave way to keep the labels whole.
+			assert!(
+				f32::from(subject.size.width) < 160.,
+				"subject {:?}",
+				subject.size.width
+			);
+		}
+
+		/// On a 1080 window the list is 574px. The labels cannot both fit whole
+		/// beside the subject there, so the branch label is ellipsized and the
+		/// tag keeps its icon and a few characters, never a bare icon (#195).
+		#[gpui::test]
+		fn head_row_labels_stay_readable_at_1080(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
+			});
+			settle(cx);
+			assert_eq!(
+				head_label_texts(&model, cx),
+				["main, origin/main", "v0.3.0"]
+			);
+			for selector in ["log-ref-label:0:0", "log-ref-label:0:1"] {
+				let width =
+					cx.debug_bounds(selector).expect("label").size.width;
+				// Icon (14px), its gap (3px) and 30px of text: ui::log::LABEL_FLOOR_W.
+				assert!(
+					f32::from(width) >= 47. - 1.0,
+					"{selector} shows only its icon: {width:?}"
+				);
+			}
+			// About 94px here: a little under MIN_SUBJECT_BESIDE_LABELS, which
+			// the labels' floors cannot all be fitted beside at this width.
+			let subject = cx.debug_bounds("log-subject:0").expect("subject");
+			assert!(
+				f32::from(subject.size.width) >= 92.,
+				"subject {:?}",
+				subject.size.width
+			);
 		}
 
 		/// A merge lists the files changed against any parent. Those the
@@ -12477,7 +12878,7 @@ mod tests {
 				"paste-commit:1",
 				"paste-commit:2",
 				"paste-commit-count",
-				"paste-row:0:img.bin",
+				"paste-row:3:img.bin",
 				"paste-row:4:base.txt",
 			] {
 				assert!(ids.contains(&id.to_string()), "{id} in {ids:?}");
@@ -12512,7 +12913,7 @@ mod tests {
 			let ids = drawn(cx);
 			assert!(ids.contains(&"paste-commit:0".to_string()));
 			assert!(
-				!ids.contains(&"paste-row:0:img.bin".to_string()),
+				!ids.contains(&"paste-row:3:img.bin".to_string()),
 				"{ids:?}"
 			);
 			assert!(ids.contains(&"paste-row:4:base.txt".to_string()));
@@ -12649,7 +13050,7 @@ mod tests {
 					)
 				});
 			assert_eq!(initial_idx, order[0]);
-			assert_eq!(initial_path.as_deref(), Some("img.bin"));
+			assert_eq!(initial_path.as_deref(), Some("old.txt"));
 
 			cx.simulate_keystrokes("down");
 			cx.run_until_parked();
@@ -12659,7 +13060,7 @@ mod tests {
 				assert_eq!(plan.selected_item_idx, order[1]);
 				assert_eq!(
 					m.paste.detail().and_then(|d| d.path.as_deref()),
-					Some("fresh.txt")
+					Some("dir/new.txt")
 				);
 			});
 
@@ -12671,7 +13072,7 @@ mod tests {
 				assert_eq!(plan.selected_item_idx, order[0]);
 				assert_eq!(
 					m.paste.detail().and_then(|d| d.path.as_deref()),
-					Some("img.bin")
+					Some("old.txt")
 				);
 			});
 		}
@@ -13042,6 +13443,80 @@ mod tests {
 			cx.run_until_parked();
 		}
 
+		/// The branch name keeps its width before the repo count gives way
+		/// (#194): the `×N` suffix shrinks to nothing first.
+		#[gpui::test]
+		fn branch_name_keeps_its_width_before_the_repo_count(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for i in 0..3 {
+				let r = repo(ws.path(), &format!("r{i}"), &[]);
+				git(
+					&r,
+					&[
+						"branch",
+						"feature/a-very-long-branch-name-every-repo-has",
+					],
+				);
+			}
+			let (_model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+			settle(cx);
+			// The merged log: the user's gestures, not a model method.
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:all");
+			settle(cx);
+			if cx.debug_bounds("ref:refs/heads/main").is_none() {
+				click(cx, "branch-group:refs_local");
+				settle(cx);
+			}
+			let natural = cx.update(|window, _| {
+				crate::ui::text_width(window, "main", crate::theme::UI_TEXT)
+			});
+
+			// A short name fits: the whole name, and the count is drawn.
+			let name_w = cx
+				.debug_bounds("ref-name:refs/heads/main")
+				.expect("main's name is rendered")
+				.size
+				.width;
+			assert!(
+				f32::from(name_w) >= natural - 1.0,
+				"main keeps its width: {name_w:?} vs natural {natural}"
+			);
+			assert!(
+				cx.debug_bounds("ref-repo:refs/heads/main").is_some(),
+				"the ×3 suffix is drawn beside main"
+			);
+
+			// A long name overflows the pane: the suffix gives way first.
+			let long =
+				"refs/heads/feature/a-very-long-branch-name-every-repo-has";
+			let name_sel: &'static str =
+				Box::leak(format!("ref-name:{long}").into_boxed_str());
+			let repo_sel: &'static str =
+				Box::leak(format!("ref-repo:{long}").into_boxed_str());
+			let long_name = cx
+				.debug_bounds(name_sel)
+				.expect("the long name is rendered")
+				.size
+				.width;
+			let long_suffix = cx
+				.debug_bounds(repo_sel)
+				.expect("the long branch's suffix is rendered")
+				.size
+				.width;
+			assert!(
+				f32::from(long_suffix) <= 1.0,
+				"the suffix shrinks to nothing first: {long_suffix:?}"
+			);
+			assert!(
+				f32::from(long_name) > natural,
+				"the name keeps the room the suffix gave up: {long_name:?}"
+			);
+		}
+
 		#[gpui::test]
 		fn one_path_under_two_roots_toggles_and_applies_per_row(
 			cx: &mut TestAppContext,
@@ -13228,8 +13703,8 @@ mod tests {
 				("paste-row:0:common.txt", "-already\n", "+c1\n"),
 				("paste-row:5:common.txt", "-c1\n", "+c2\n"),
 				("paste-row:1:delete.txt", "-delete me\n", ""),
-				("paste-row:2:old.txt", "-old name\n", ""),
-				("paste-row:3:new.txt", "", "+renamed\n"),
+				("paste-row:3:old.txt", "-old name\n", ""),
+				("paste-row:4:new.txt", "", "+renamed\n"),
 			] {
 				click(cx, row);
 				wait_paste_detail(&model, cx);
@@ -13259,7 +13734,7 @@ mod tests {
 				);
 				click(cx, "btn-diff-mode");
 			}
-			click(cx, "paste-row:4:img.bin");
+			click(cx, "paste-row:2:img.bin");
 			wait_paste_detail(&model, cx);
 			model.read_with(cx, |m, _| {
 				assert_eq!(
@@ -19155,7 +19630,8 @@ mod tests {
 			super::CancelToken::new(),
 		);
 		match result {
-			Err(err_msg) => {
+			Err(err) => {
+				let err_msg = err.to_string();
 				assert!(
 					err_msg.contains("Path leaves the workspace"),
 					"expected 'Path leaves the workspace', got: {err_msg}"
