@@ -53,6 +53,9 @@ pub enum ConnectFailureKind {
 
 /// The known causes of a worker that did not start, for callers that word
 /// them in their own language. The English `message` stays the CLI's text.
+/// It follows `start_message`'s wording classes, so the CLI and the GUI
+/// agree; [`ConnectFailureKind`] (`kind`) drives retry policy instead and
+/// classifies differently, so the two are not interchangeable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartReason {
 	/// snip is missing on that machine or too old for `serve --stdio`.

@@ -4938,8 +4938,8 @@ mod tests {
 		}
 	}
 
-	/// A transport that is alive but silent through the whole hello wait
-	/// says so, instead of the old closed-connection message.
+	/// The known start failures carry a reason for callers that word them
+	/// in their own language, and keep the transport's stderr untouched.
 	#[test]
 	fn start_reason_names_the_known_causes_and_keeps_stderr() {
 		let reason = |cause, code, stderr| start_reason(&cause, code, stderr);
@@ -4977,6 +4977,8 @@ mod tests {
 		assert_eq!(reason(StartCause::BadData("bad".into()), None, ""), None);
 	}
 
+	/// A transport that is alive but silent through the whole hello wait
+	/// says so, instead of the old closed-connection message.
 	#[test]
 	fn a_silent_alive_transport_says_it_did_not_answer() {
 		let msg = start_message(StartCause::NoAnswer, None, "");

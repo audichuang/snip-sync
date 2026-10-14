@@ -664,7 +664,9 @@ pub fn describe(err: RemoteError) -> String {
 }
 
 /// [`describe`] in the interface language: a known start failure gets its
-/// own wording, the transport's stderr appended as the detail.
+/// own wording. The transport's stderr is appended as the detail only where
+/// it is the useful part (ssh's own refusal); a missing or old snip would
+/// drag in clap's usage text or ssh banners.
 pub fn describe_loc(err: RemoteError, loc: crate::i18n::Locale) -> String {
 	let RemoteError::Start {
 		reason: Some(reason),
@@ -681,7 +683,7 @@ pub fn describe_loc(err: RemoteError, loc: crate::i18n::Locale) -> String {
 		StartReason::Closed => "remote_start_closed",
 	};
 	let text = crate::i18n::t(key, loc);
-	if detail.is_empty() {
+	if detail.is_empty() || !matches!(reason, StartReason::KeyLogin) {
 		text.to_string()
 	} else {
 		crate::i18n::tf("remote_start_detail", loc, &[text, detail])
@@ -1500,7 +1502,7 @@ impl WorkbenchModel {
 									)
 								}
 								other => {
-									let text = describe(other);
+									let text = describe_loc(other, model.locale);
 									(
 										Msg::new(
 											"remote_scan_failed",
@@ -1625,9 +1627,9 @@ mod tests {
 			"遠端在 snip 啟動前就關閉了連線"
 		);
 		assert_eq!(
-			en(start(Some(StartReason::NoWorker), "snip: not found")),
+			en(start(Some(StartReason::NoWorker), "usage: snip\n  --help")),
 			"snip is not installed on that machine, or is too old for ssh \
-			 connections; install or update snip-sync there: snip: not found"
+			 connections; install or update snip-sync there"
 		);
 		assert_eq!(zh(start(None, "")), "english text the CLI prints");
 		assert_eq!(zh(RemoteError::Protocol("x".into())), "protocol: x");
