@@ -45,10 +45,11 @@ impl WorkbenchModel {
 			)
 			.child(div().flex_1())
 			.child(
-				log_icon_button(
+				log_icon_button_tip(
 					"btn-log-more",
 					Icon::More,
-					t("tip_log_more", loc),
+					(self.log_menu != Some(LogMenu::More))
+						.then(|| t("tip_log_more", loc).into()),
 					true,
 					self.log_menu == Some(LogMenu::More),
 				)

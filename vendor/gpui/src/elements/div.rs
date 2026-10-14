@@ -2312,13 +2312,16 @@ impl Interactivity {
                     let pending_mouse_down = pending_mouse_down.clone();
                     move |window: &Window| {
                         pending_mouse_down.borrow().is_none()
+                            && !window.mouse_position_stale
                             && source_bounds.get().contains(&window.mouse_position())
                     }
                 });
                 let check_is_hovered = Rc::new({
                     let hitbox = hitbox.clone();
                     move |window: &Window| {
-                        pending_mouse_down.borrow().is_none() && hitbox.is_hovered(window)
+                        pending_mouse_down.borrow().is_none()
+                            && !window.mouse_position_stale
+                            && hitbox.is_hovered(window)
                     }
                 });
                 register_tooltip_mouse_handlers(
