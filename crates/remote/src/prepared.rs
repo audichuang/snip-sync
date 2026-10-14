@@ -32,6 +32,9 @@ pub(crate) struct CachedImport {
 	pub workspace: PathBuf,
 	pub destination: PathBuf,
 	pub digest: String,
+	/// A commit replay keeps the worker's own captured preview, which holds
+	/// the parsed payload, and leaves `text` empty. None for file pastes.
+	pub replay: Option<Box<snip_core::transfer::CommitReplayPreview>>,
 }
 
 impl CachedImport {
@@ -47,7 +50,11 @@ impl CachedImport {
 				+ self.digest.capacity()
 				+ self.mapping.header_format.capacity()
 				+ self.mapping.prefixes.capacity()
-					* size_of::<(String, String)>(),
+					* size_of::<(String, String)>()
+				+ self.replay.as_ref().map_or(0, |p| {
+					size_of::<snip_core::transfer::CommitReplayPreview>()
+						+ p.retained_heap_bytes()
+				}),
 			|sum, (prefix, folder)| {
 				sum.saturating_add(prefix.capacity())
 					.saturating_add(folder.capacity())
@@ -289,6 +296,7 @@ mod tests {
 			workspace: "/workspace".into(),
 			destination: "/workspace/dest".into(),
 			digest: "digest".into(),
+			replay: None,
 		}
 	}
 	#[test]

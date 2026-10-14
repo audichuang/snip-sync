@@ -1481,11 +1481,36 @@ impl WorkbenchModel {
 			self.focus_head(cx);
 		} else if let Some(anchor) = self.selected_commit.clone() {
 			if !self.reselect_after_load(&anchor, cx) {
-				self.selected_commit = None;
-				self.log_selected.clear();
-				self.commit_details = None;
+				self.clear_commit_selection();
 			}
 		}
+	}
+
+	/// Feed (repository) names by index, for the branch rows' repo labels;
+	/// empty for a single repository (#188).
+	pub(crate) fn log_feed_names(&self) -> Vec<String> {
+		if self.log_feeds.len() > 1 {
+			self.log_feeds.iter().map(|f| f.name.clone()).collect()
+		} else {
+			Vec::new()
+		}
+	}
+
+	/// Drops every commit selection and the details, files and previews that
+	/// came from it, so a selection that left the list leaves nothing stale.
+	fn clear_commit_selection(&mut self) {
+		self.preview_generation += 1;
+		self.details_generation = self.details_generation.wrapping_add(1);
+		self.selected_commit = None;
+		self.range_head = None;
+		self.log_selected.clear();
+		self.commit_details = None;
+		self.reset_selection_details();
+		self.commit_files.clear();
+		self.commit_files_first_parent_same = None;
+		self.selected_commit_file = None;
+		self.commit_file_sel.clear();
+		self.preview_loading = false;
 	}
 
 	fn report_graph_error(&mut self, error: GraphAdmissionError) {
@@ -2193,18 +2218,7 @@ impl WorkbenchModel {
 		match next.len() {
 			0 => {
 				// The last selected commit toggled off: nothing selected.
-				self.preview_generation += 1;
-				self.details_generation =
-					self.details_generation.wrapping_add(1);
-				self.selected_commit = None;
-				self.range_head = None;
-				self.log_selected.clear();
-				self.commit_details = None;
-				self.reset_selection_details();
-				self.commit_files.clear();
-				self.selected_commit_file = None;
-				self.commit_file_sel.clear();
-				self.preview_loading = false;
+				self.clear_commit_selection();
 				app_log!("[APP:LOG_SELECTION: n=0 repo=-]");
 			}
 			1 => self.select_commit(&next[0], cx),
@@ -2508,6 +2522,44 @@ impl WorkbenchModel {
 								&listing_read,
 							)
 							.map_err(|e| e.to_string())?;
+						// A merge lists the files changed against any parent.
+						// Those unchanged against the first parent are marked
+						// (#188): the same list as a Range from the first parent.
+						let same = match (&source, parents.as_deref()) {
+							(GitSource::Commit(sha), Some(ps))
+								if ps.len() > 1 =>
+							{
+								g.changed_paths(
+									&GitSource::Range(
+										ps[0].clone(),
+										sha.clone(),
+									),
+									MAX_COMMIT_FILES,
+									&listing_read,
+								)
+								.ok()
+								.filter(|fp| fp.total <= MAX_COMMIT_FILES)
+								.map(|fp| {
+									let changed: std::collections::HashSet<
+										&str,
+									> = fp.paths
+										.iter()
+										.map(|(p, _)| p.as_str())
+										.collect();
+									let unchanged = list
+										.paths
+										.iter()
+										.filter(|(p, _)| {
+											!changed.contains(p.as_str())
+										})
+										.map(|(p, _)| p.clone())
+										.collect::<std::collections::HashSet<String>>(
+										);
+									(sha.clone(), unchanged)
+								})
+							}
+							_ => None,
+						};
 						let first = list.paths.first().map(|(p, change)| {
 							(
 								p.clone(),
@@ -2526,6 +2578,7 @@ impl WorkbenchModel {
 							list.gitlinks,
 							list.total,
 							first,
+							same,
 						))
 					})
 					.await;
@@ -2534,7 +2587,7 @@ impl WorkbenchModel {
 						return;
 					}
 					match res {
-						Ok((mut files, gitlinks, total, first)) => {
+						Ok((mut files, gitlinks, total, first, same)) => {
 							files.shrink_to_fit();
 							app_log!("[APP:E2E_CHANGES: files={}]", total);
 							if total > MAX_COMMIT_FILES {
@@ -2547,6 +2600,7 @@ impl WorkbenchModel {
 								);
 							}
 							model.commit_files = files;
+							model.commit_files_first_parent_same = same;
 							model.commit_file_origin.clear();
 							model.commit_file_gitlinks = gitlinks;
 							model.commit_files_truncated =

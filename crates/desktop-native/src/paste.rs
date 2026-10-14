@@ -693,6 +693,31 @@ impl PrefixChoice {
 	}
 }
 
+/// 1023 B, 1.5 KB, 2.1 MB (binary units, one decimal).
+pub(crate) fn human_bytes(n: u64) -> String {
+	const K: f64 = 1024.0;
+	if n < 1024 {
+		format!("{n} B")
+	} else if (n as f64) < K * K {
+		format!("{:.1} KB", n as f64 / K)
+	} else {
+		format!("{:.1} MB", n as f64 / (K * K))
+	}
+}
+
+/// Eight-character SHAs; past `max`, the rest as "+N".
+pub(crate) fn short_shas(shas: &[String], max: usize) -> String {
+	let mut out: Vec<String> = shas
+		.iter()
+		.take(max)
+		.map(|s| s.chars().take(8).collect())
+		.collect();
+	if shas.len() > max {
+		out.push(format!("+{}", shas.len() - max));
+	}
+	out.join(", ")
+}
+
 /// Result of a confirmed apply. `created_commits` is empty for file restores.
 #[derive(Debug, Clone)]
 pub struct PasteApplyResult {
@@ -708,7 +733,7 @@ impl PasteApplyResult {
 		if !self.created_commits.is_empty() {
 			return Msg::new(
 				"commit_replay_done",
-				[self.created_commits.join(", ")],
+				[short_shas(&self.created_commits, 3)],
 			);
 		}
 		let f = &self.files;
@@ -888,6 +913,8 @@ pub struct PastePreviewPlan {
 	pub import_plan: Option<Arc<FilePastePlan>>,
 	/// Whole-commit replay. File checkboxes do not rewrite a subset.
 	pub commit_preview: Option<Arc<CommitReplayPreview>>,
+	/// The worker's retained commit preview (protocol 8), shared by clones.
+	pub commit_prepared: snip_remote::PreparedReplay,
 	pub whole_commit: bool,
 	/// Commits whose file rows are folded away (commit replay only).
 	pub collapsed_commits: BTreeSet<usize>,
@@ -1210,7 +1237,8 @@ impl PastePreviewPlan {
 				.saturating_add(
 					size_of::<CommitReplayPreview>() + ARC_ALLOWANCE,
 				)
-				.saturating_add(plan.retained_heap_bytes());
+				.saturating_add(plan.retained_heap_bytes())
+				.saturating_add(self.commit_prepared.retained_heap_bytes());
 		}
 		if let Some(error) = &self.error {
 			bytes = bytes
@@ -1367,6 +1395,7 @@ impl PastePreviewPlan {
 			destination: dest.to_path_buf(),
 			import_plan: None,
 			commit_preview: None,
+			commit_prepared: Default::default(),
 			whole_commit: false,
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
@@ -1420,7 +1449,7 @@ impl PastePreviewPlan {
 		// The write scope is the folder the user pasted into: the worker
 		// holds the replay to it the same way.
 		let target = paste_target(remote.as_ref(), dest)?;
-		let preview = target
+		let (preview, prepared) = target
 			.plan_commits(raw_text, payload, opts)
 			.map_err(|e| destination_msg(remote.as_ref(), dest, e))?;
 		let preview = Arc::new(preview);
@@ -1438,6 +1467,7 @@ impl PastePreviewPlan {
 			destination,
 			import_plan: None,
 			commit_preview: Some(preview.clone()),
+			commit_prepared: prepared,
 			whole_commit: true,
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
@@ -2141,7 +2171,11 @@ impl PastePreviewPlan {
 		let target = paste_target(self.remote.as_ref(), &self.destination)?;
 		if let Some(preview) = &self.commit_preview {
 			target
-				.check_commits(&self.raw_payload, preview)
+				.check_commits(
+					&self.raw_payload,
+					preview,
+					&self.commit_prepared,
+				)
 				.map_err(|e| {
 					commit_msg(
 						self.remote.as_ref(),
@@ -2230,7 +2264,11 @@ impl PastePreviewPlan {
 		// Core overwrites (spec 4.3); asking first is this session's rule. Stale still wins over the prompt, as before.
 		if self.overwrite_missing() {
 			target
-				.check_commits(&self.raw_payload, preview)
+				.check_commits(
+					&self.raw_payload,
+					preview,
+					&self.commit_prepared,
+				)
 				.map_err(|e| {
 					commit_msg(
 						self.remote.as_ref(),
@@ -2242,7 +2280,7 @@ impl PastePreviewPlan {
 			return Err(Msg::new("commit_overwrite_required", []));
 		}
 		let replay_res = target
-			.apply_commits(&self.raw_payload, preview)
+			.apply_commits(&self.raw_payload, preview, &self.commit_prepared)
 			.map_err(|e| {
 				commit_msg(self.remote.as_ref(), &self.destination, e, true)
 			})?;
@@ -2289,7 +2327,7 @@ impl PastePreviewPlan {
 				};
 				return Err(msg);
 			}
-			let created = replay_res.created.join(", ");
+			let created = short_shas(&replay_res.created, usize::MAX);
 			return Err(match fail.layout_conflict {
 				Some(conflict) => {
 					let path = fail
@@ -2329,6 +2367,23 @@ impl PastePreviewPlan {
 #[cfg(test)]
 pub(crate) mod tests {
 	use super::*;
+
+	#[test]
+	fn human_bytes_and_short_shas_format_for_toasts() {
+		assert_eq!(human_bytes(0), "0 B");
+		assert_eq!(human_bytes(1023), "1023 B");
+		assert_eq!(human_bytes(1536), "1.5 KB");
+		assert_eq!(human_bytes(2250174), "2.1 MB");
+		let shas: Vec<String> = ["a", "b", "c", "d", "e", "f"]
+			.iter()
+			.map(|c| c.repeat(40))
+			.collect();
+		assert_eq!(short_shas(&shas, 3), "aaaaaaaa, bbbbbbbb, cccccccc, +3");
+		assert_eq!(
+			short_shas(&shas, usize::MAX),
+			"aaaaaaaa, bbbbbbbb, cccccccc, dddddddd, eeeeeeee, ffffffff"
+		);
+	}
 
 	#[test]
 	fn apply_status_lists_each_failed_path_not_only_the_count() {

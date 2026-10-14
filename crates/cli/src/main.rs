@@ -838,7 +838,7 @@ fn paste_commits(
 
 	// The write scope is the folder pasted into: targets outside it are
 	// refused, and a whole-repo replay opens the repo root.
-	let preview = target
+	let (preview, prepared) = target
 		.plan_commits(text, payload.clone(), &RunOptions::default())
 		.map_err(format_paste_error)?;
 
@@ -909,7 +909,7 @@ fn paste_commits(
 	let existing = preview.plan().existing_writes().len();
 	if existing > 0 && !opts.overwrite {
 		target
-			.check_commits(text, &preview)
+			.check_commits(text, &preview, &prepared)
 			.map_err(format_paste_error)?;
 		usage(format!(
 			"{existing} destination file(s) already exist; commit payloads need --overwrite"
@@ -917,7 +917,7 @@ fn paste_commits(
 	}
 
 	let result = target
-		.apply_commits(text, &preview)
+		.apply_commits(text, &preview, &prepared)
 		.map_err(format_paste_error)?;
 	stdout_line(&format!("Created {} commit(s).", result.created.len()))?;
 	for sha in &result.created {

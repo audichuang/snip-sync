@@ -247,3 +247,39 @@ fn a_listing_over_the_cap_reports_truncated_with_no_continuation() {
 	assert_eq!(entries[0].name, "f000");
 	assert_eq!(entries[19].name, "f019");
 }
+
+/// A folder picker lists folders only, visible ones only; `list_dir` still
+/// returns everything.
+#[test]
+fn list_folders_returns_only_visible_folders() {
+	let tmp = tempfile::tempdir().unwrap();
+	let root = tmp.path().join("ws");
+	fs::create_dir_all(root.join("a")).unwrap();
+	fs::create_dir_all(root.join("b")).unwrap();
+	fs::create_dir_all(root.join(".hidden")).unwrap();
+	fs::write(root.join("f.txt"), "f").unwrap();
+	fs::write(root.join(".dot"), "d").unwrap();
+	let w = worker();
+	let client = Client::new(RemoteHost::in_process(w.clone()), "mac".into());
+	let ws = client
+		.open_workspace(&root.display().to_string())
+		.unwrap()
+		.id;
+
+	let (folders, truncated) = client.list_folders(&ws, "", None).unwrap();
+	assert!(!truncated);
+	let names: Vec<_> = folders.iter().map(|e| e.name.as_str()).collect();
+	assert_eq!(names, ["a", "b"]);
+	let (all, _) = client.list_dir(&ws, "", None).unwrap();
+	assert_eq!(all.len(), 5, "list_dir keeps every entry: {all:?}");
+
+	// A symlink to a folder inside the workspace is a folder to the picker.
+	#[cfg(unix)]
+	{
+		std::os::unix::fs::symlink(root.join("a"), root.join("link")).unwrap();
+		let (folders, _) = client.list_folders(&ws, "", None).unwrap();
+		let names: Vec<_> = folders.iter().map(|e| e.name.as_str()).collect();
+		assert_eq!(names, ["a", "b", "link"]);
+		assert!(folders.iter().all(|e| e.directory));
+	}
+}

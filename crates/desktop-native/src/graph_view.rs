@@ -131,6 +131,8 @@ pub struct RefLabel {
 	pub text: String,
 	pub color: u32,
 	pub current: bool,
+	/// A tag: its own label, apart from the branches of the same row (#188).
+	pub tag: bool,
 }
 
 /// Label for a badge. A local branch with same-named remote-tracking refs
@@ -167,6 +169,7 @@ pub fn ref_label(badge: &RefBadge, current_branch: Option<&str>) -> RefLabel {
 		text,
 		color,
 		current: is_current,
+		tag: matches!(info.kind, RefKind::Tag),
 	}
 }
 
@@ -174,6 +177,36 @@ pub fn ref_label(badge: &RefBadge, current_branch: Option<&str>) -> RefLabel {
 /// "origin & main, dev": icon and colour of the first (best-ranked) badge.
 pub fn combined_label(
 	badges: &[RefBadge],
+	current_branch: Option<&str>,
+) -> Option<RefLabel> {
+	let mut labels = badges.iter().map(|b| ref_label(b, current_branch));
+	let first = labels.next()?;
+	let text = std::iter::once(first.text.clone())
+		.chain(labels.map(|l| l.text))
+		.collect::<Vec<_>>()
+		.join(", ");
+	Some(RefLabel { text, ..first })
+}
+
+/// A row's labels: one for its branches (HEAD, local, remote) and one for
+/// its tags, each with its own icon (#188).
+pub fn kind_labels(
+	badges: &[RefBadge],
+	current_branch: Option<&str>,
+) -> Vec<RefLabel> {
+	let (tags, branches): (Vec<&RefBadge>, Vec<&RefBadge>) = badges
+		.iter()
+		.partition(|b| matches!(b.primary.kind, RefKind::Tag));
+	[branches, tags]
+		.into_iter()
+		.filter(|g| !g.is_empty())
+		.filter_map(|g| combined_label_of(&g, current_branch))
+		.collect()
+}
+
+/// [`combined_label`] over borrowed badges.
+fn combined_label_of(
+	badges: &[&RefBadge],
 	current_branch: Option<&str>,
 ) -> Option<RefLabel> {
 	let mut labels = badges.iter().map(|b| ref_label(b, current_branch));
@@ -689,6 +722,19 @@ mod tests {
 		// 4 refs merging to 2 badges fit without `+N`.
 		let (shown, hidden) = visible_refs(&refs[..4], None);
 		assert_eq!((shown.len(), hidden), (2, 0));
+	}
+
+	#[test]
+	fn kind_labels_split_branches_and_tags() {
+		let refs =
+			vec![local("main"), info("refs/tags/v0.1", "v0.1", RefKind::Tag)];
+		let (shown, _) = visible_refs(&refs, Some("main"));
+		let labels = kind_labels(&shown, Some("main"));
+		assert_eq!(labels.len(), 2);
+		assert!(labels[0].current && !labels[0].tag);
+		assert_eq!(labels[0].text, "main");
+		assert!(labels[1].tag);
+		assert_eq!(labels[1].text, "v0.1");
 	}
 
 	#[test]

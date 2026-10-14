@@ -25,9 +25,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 5 = worker-side change selection ([`Request::ExportChanges`]), whole-folder
 /// export (an empty [`ExportTarget::path`]), and chunked requests;
 /// 6 = typed, bounded destination reads for commit paste previews;
-/// 7 = compact file previews and one-use prepared file payloads.
-pub const PROTOCOL_MAX: u32 = 7;
+/// 7 = compact file previews and one-use prepared file payloads;
+/// 8 = prepared commit replays ([`Request::PrepareReplay`]).
+pub const PROTOCOL_MAX: u32 = 8;
 pub const PREPARED_IMPORT_VERSION: u32 = 7;
+/// The first protocol with a retained commit-replay preview.
+pub const PREPARED_REPLAY_VERSION: u32 = 8;
 /// The first protocol with Git views.
 pub const GIT_VIEWS_VERSION: u32 = 2;
 /// The first protocol with copy ([`Request::Export`]).
@@ -84,6 +87,11 @@ pub enum Request {
 	ListDir {
 		workspace: String,
 		path: String,
+		/// Only what a folder picker lists: folders (a safe symlink to one
+		/// included) whose name does not start with '.'. Older workers ignore
+		/// it and send every entry, so the master filters too.
+		#[serde(default)]
+		folders_only: bool,
 	},
 	Stat {
 		workspace: String,
@@ -203,6 +211,22 @@ pub enum Request {
 		dest: String,
 		text: String,
 		expect: ReplayExpect,
+		#[serde(default)]
+		check_only: bool,
+	},
+	/// Commit-replay preview that, with `retain`, keeps the payload and this worker's own preview for one later [`Request::ApplyPreparedReplay`] on this connection.
+	PrepareReplay {
+		workspace: String,
+		dest: String,
+		text: String,
+		retain: bool,
+	},
+	/// Re-checks (`check_only`, token kept) or replays the preview `token` holds. Only the token and the worker's digest cross the wire.
+	ApplyPreparedReplay {
+		workspace: String,
+		dest: String,
+		token: String,
+		digest: String,
 		#[serde(default)]
 		check_only: bool,
 	},
@@ -464,6 +488,12 @@ impl ImportPrepared {
 pub(crate) fn restore_plan_digest(
 	plan: &snip_core::restore::RestorePlan,
 ) -> Result<String, String> {
+	json_digest(plan)
+}
+
+/// SHA-256 of `value`'s JSON, as lowercase hex, streamed without a second
+/// payload-sized buffer.
+pub(crate) fn json_digest<T: Serialize>(value: &T) -> Result<String, String> {
 	use sha2::{Digest, Sha256};
 	struct DigestSink(Sha256);
 	impl Write for DigestSink {
@@ -479,7 +509,7 @@ pub(crate) fn restore_plan_digest(
 	// before hashing, without allocating a second payload-sized JSON body.
 	let mut writer =
 		io::BufWriter::with_capacity(64 * 1024, DigestSink(Sha256::new()));
-	serde_json::to_writer(&mut writer, plan).map_err(|e| e.to_string())?;
+	serde_json::to_writer(&mut writer, value).map_err(|e| e.to_string())?;
 	let digest = writer.into_inner().map_err(|e| e.to_string())?.0.finalize();
 	Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
@@ -504,6 +534,17 @@ impl ReplayExpect {
 	}
 }
 
+/// A commit replay preview as the master needs it, with the worker's
+/// digest of it and the token that keeps the worker's own preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPrepared {
+	pub expect: ReplayExpect,
+	/// The worker's digest of `expect`; echoed back by ApplyPreparedReplay.
+	pub digest: String,
+	/// Absent when the master declined retention or cache admission failed.
+	pub token: Option<String>,
+}
+
 /// One item to copy: `path` under `root`, both relative to the workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportTarget {
@@ -523,6 +564,7 @@ impl Request {
 			| Self::PrepareImport { text, .. }
 			| Self::ImportApply { text, .. }
 			| Self::ReplayPlan { text, .. }
+			| Self::PrepareReplay { text, .. }
 			| Self::ReplayApply { text, .. } => Some(text),
 			_ => None,
 		}
@@ -534,6 +576,7 @@ impl Request {
 			| Self::PrepareImport { text, .. }
 			| Self::ImportApply { text, .. }
 			| Self::ReplayPlan { text, .. }
+			| Self::PrepareReplay { text, .. }
 			| Self::ReplayApply { text, .. } => Some(text),
 			_ => None,
 		}
@@ -561,6 +604,9 @@ impl Request {
 			| Self::ReplayPlan { .. }
 			| Self::ReplayApply { .. }
 			| Self::Chunk { .. } => PASTE_VERSION,
+			Self::PrepareReplay { .. } | Self::ApplyPreparedReplay { .. } => {
+				PREPARED_REPLAY_VERSION
+			}
 			_ => 1,
 		}
 	}
@@ -657,6 +703,7 @@ pub enum Response {
 	ImportPrepared(ImportPrepared),
 	Imported(snip_core::restore::RestoreExecutionResult),
 	ReplayPlanned(ReplayExpect),
+	ReplayPrepared(ReplayPrepared),
 	ReplayRead(snip_core::transfer::ReplayPreviewRead),
 	Replayed(snip_core::commits::ReplayResult),
 	/// A `check_only` replay found nothing changed.
@@ -1007,12 +1054,31 @@ mod tests {
 	};
 	use snip_core::workspace::ChangeCounts;
 
+	/// `folders_only` is an additive field: a request without it (every
+	/// request an older master sends) reads as the whole listing.
+	#[test]
+	fn list_dir_without_folders_only_reads_as_false() {
+		let req: Request = serde_json::from_str(
+			r#"{"op":"list_dir","workspace":"w","path":""}"#,
+		)
+		.unwrap();
+		assert_eq!(
+			req,
+			Request::ListDir {
+				workspace: "w".into(),
+				path: "".into(),
+				folders_only: false,
+			}
+		);
+	}
+
 	#[test]
 	fn frames_round_trip_and_end_cleanly() {
 		let mut buf = Vec::new();
 		let req = Request::ListDir {
 			workspace: "w".into(),
 			path: "src/多行".into(),
+			folders_only: false,
 		};
 		write_frame(&mut buf, &req).unwrap();
 		write_frame(&mut buf, &Request::OpenWorkspace { path: "~".into() })
@@ -1452,6 +1518,58 @@ mod tests {
 	}
 
 	#[test]
+	fn prepared_replay_requests_round_trip_and_need_protocol_8() {
+		let expect = ReplayExpect {
+			destination: "/repo".into(),
+			plan: snip_core::commits::CommitReplayPlan {
+				root: "/repo".into(),
+				commits: Vec::new(),
+			},
+			freshness: DestinationFreshnessSnapshot {
+				roots: Default::default(),
+				target_files: Default::default(),
+			},
+		};
+		let prepare = Request::PrepareReplay {
+			workspace: "w".into(),
+			dest: "".into(),
+			text: "payload".into(),
+			retain: true,
+		};
+		let apply = Request::ApplyPreparedReplay {
+			workspace: "w".into(),
+			dest: "".into(),
+			token: "t".into(),
+			digest: "d".into(),
+			check_only: true,
+		};
+		round_trip_check(&prepare);
+		round_trip_check(&apply);
+		round_trip_check(&Response::ReplayPrepared(ReplayPrepared {
+			expect,
+			digest: "d".into(),
+			token: Some("t".into()),
+		}));
+
+		assert_eq!(prepare.needs_version(), PREPARED_REPLAY_VERSION);
+		assert_eq!(apply.needs_version(), PREPARED_REPLAY_VERSION);
+		assert_eq!(prepare.text(), Some("payload"));
+		assert_eq!(apply.text(), None);
+
+		let legacy: Request = serde_json::from_str(
+			r#"{"op":"apply_prepared_replay","workspace":"w","dest":"","token":"t","digest":"d"}"#,
+		)
+		.unwrap();
+		assert!(matches!(
+			legacy,
+			Request::ApplyPreparedReplay {
+				check_only: false,
+				..
+			}
+		));
+	}
+
+	#[test]
 	fn needs_version_table() {
 		let v2_requests = [
 			Request::ScanRepos {
@@ -1479,6 +1597,7 @@ mod tests {
 			Request::ListDir {
 				workspace: "w".into(),
 				path: "p".into(),
+				folders_only: false,
 			},
 			Request::Stat {
 				workspace: "w".into(),
@@ -1506,6 +1625,7 @@ mod tests {
 		let listing = Request::ListDir {
 			workspace: "w".into(),
 			path: "p".into(),
+			folders_only: false,
 		};
 		assert_eq!(listing.needs_version(), 1);
 

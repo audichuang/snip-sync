@@ -3540,7 +3540,8 @@ impl CommitReplayPreview {
 		}
 		let limit = limit.min(crate::browser::PREVIEW_LIMIT);
 		if after.len() > limit {
-			preview.unavailable = Some(ReplayPreviewUnavailable::TooLarge);
+			preview.unavailable =
+				Some(ReplayPreviewUnavailable::ContentTooLarge);
 			return Ok(preview);
 		}
 		preview.after = after.into();
@@ -3567,7 +3568,7 @@ impl CommitReplayPreview {
 					.ok_or_else(invalid)?;
 				if text.len() > limit {
 					ReplayPreviewRead::Unavailable(
-						ReplayPreviewUnavailable::TooLarge,
+						ReplayPreviewUnavailable::ContentTooLarge,
 					)
 				} else {
 					ReplayPreviewRead::Text(text.into())
@@ -4438,9 +4439,64 @@ mod preview_target_hash_cancel {
 	}
 
 	#[test]
+	fn commit_row_preview_of_a_large_new_file_is_content_too_large_not_destination(
+	) {
+		use super::{
+			ReplayFileSide::Target,
+			ReplayPreviewUnavailable::{ContentTooLarge, TooLarge},
+		};
+		let repo = Repo::new();
+		repo.write("base", b"base\n");
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "base"]);
+		let big = "x".repeat(64);
+		let payload = CommitsPayload {
+			commits: vec![replay_record(vec![replay_file("new", Some(&big))])],
+		};
+		let preview =
+			CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+		let opts = RunOptions::default();
+		let new_file = preview
+			.file_preview_with::<TransferError>(
+				0,
+				0,
+				Target,
+				16,
+				&opts,
+				|_, _| panic!("oversized incoming must not read"),
+			)
+			.unwrap();
+		assert_eq!(new_file.unavailable, Some(ContentTooLarge));
+
+		// An existing destination over the limit is still the destination's fault.
+		repo.write("existing", big.as_bytes());
+		repo.git(&["add", "-A"]);
+		repo.git(&["commit", "-q", "-m", "existing"]);
+		let payload = CommitsPayload {
+			commits: vec![replay_record(vec![replay_file(
+				"existing",
+				Some("tiny\n"),
+			)])],
+		};
+		let preview =
+			CommitReplayPreview::capture(&repo.path, &payload).unwrap();
+		let dest = preview
+			.file_preview_with::<TransferError>(
+				0,
+				0,
+				Target,
+				16,
+				&opts,
+				|path, o| super::read_replay_preview_with(path, 16, o),
+			)
+			.unwrap();
+		assert_eq!(dest.unavailable, Some(TooLarge));
+	}
+
+	#[test]
 	fn commit_row_preview_refuses_stale_bytes_and_honors_cancel_and_limit() {
 		use super::{
-			ReplayFileSide::Target, ReplayPreviewUnavailable::TooLarge,
+			ReplayFileSide::Target, ReplayPreviewUnavailable::ContentTooLarge,
 		};
 		let repo = Repo::new();
 		repo.write("a", b"before\n");
@@ -4464,7 +4520,7 @@ mod preview_target_hash_cancel {
 				|_, _| panic!("oversized incoming must not read"),
 			)
 			.unwrap();
-		assert_eq!(limited.unavailable, Some(TooLarge));
+		assert_eq!(limited.unavailable, Some(ContentTooLarge));
 		let token = CancelToken::new();
 		token.cancel();
 		let opts = RunOptions {

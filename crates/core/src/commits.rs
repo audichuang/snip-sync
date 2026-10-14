@@ -1197,6 +1197,10 @@ pub enum ReplayPreviewUnavailable {
 	Directory,
 	Binary,
 	TooLarge,
+	/// The payload's own text for this row (or an earlier commit's text it
+	/// starts from) is over the preview limit; the destination was not the
+	/// problem.
+	ContentTooLarge,
 	Unreadable,
 }
 
@@ -2272,11 +2276,19 @@ struct NoHooks {
 
 impl NoHooks {
 	fn create() -> io::Result<Self> {
+		// A clock reading alone can repeat for two threads of one process
+		// (coarse clocks), and `create_dir` then fails: a counter makes the
+		// name unique within the process.
+		static SEQ: std::sync::atomic::AtomicU64 =
+			std::sync::atomic::AtomicU64::new(0);
+		let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		let nanos = std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
 			.map_or(0, |d| d.as_nanos());
-		let dir = std::env::temp_dir()
-			.join(format!("snip-no-hooks-{}-{nanos}", std::process::id()));
+		let dir = std::env::temp_dir().join(format!(
+			"snip-no-hooks-{}-{nanos}-{seq}",
+			std::process::id()
+		));
 		// `create_dir`, not `create_dir_all`: an existing directory could
 		// already hold hooks.
 		fs::create_dir(&dir)?;
