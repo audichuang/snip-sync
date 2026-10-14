@@ -249,6 +249,7 @@ pub(crate) fn prepare_import(
 					workspace: root.path.clone(),
 					destination,
 					digest: digest.clone(),
+					replay: None,
 				})
 			})
 			.flatten();
@@ -260,6 +261,22 @@ pub(crate) fn prepare_import(
 		}))
 	};
 	run().unwrap_or_else(|reply| *reply)
+}
+
+/// The refusal for a token the cache would not hand out.
+fn cache_refusal(why: CacheError) -> Response {
+	let (code, message) = match why {
+		CacheError::Missing => (ErrorCode::Stale, prepared::TOKEN_GONE),
+		CacheError::Scope => (
+			ErrorCode::Forbidden,
+			"prepared paste belongs to another workspace or destination; preview again",
+		),
+		CacheError::Digest => (
+			ErrorCode::Stale,
+			"prepared paste does not match the preview; preview again",
+		),
+	};
+	*refused(code, message)
 }
 
 pub(crate) fn apply_prepared(
@@ -277,14 +294,14 @@ pub(crate) fn apply_prepared(
 	};
 	let lease = match cache.take(token, &root.path, &at, &expect.digest) {
 		Ok(lease) => lease,
-		Err(why) => return *refused(
-			if why == CacheError::Scope { ErrorCode::Forbidden } else { ErrorCode::Stale },
-			match why {
-				CacheError::Missing => prepared::TOKEN_GONE,
-				CacheError::Scope => "prepared paste belongs to another workspace or destination; preview again",
-				CacheError::Digest => "prepared paste does not match the preview; preview again",
-			}),
+		Err(why) => return cache_refusal(why),
 	};
+	if lease.payload().replay.is_some() {
+		return *refused(
+			ErrorCode::Forbidden,
+			"prepared paste is not a file paste; preview again",
+		);
+	}
 	let payload = lease.payload();
 	// The raw input is retained, never an executable plan. Keep exactly the
 	// legacy re-plan/digest/freshness/selection and locked-write checks.
@@ -459,6 +476,131 @@ pub(crate) fn replay_plan(
 		)
 		.map_err(|e| transfer_refusal(e, cancel))?;
 		Ok(Response::ReplayPlanned(ReplayExpect::of(&preview)))
+	};
+	run().unwrap_or_else(|resp| *resp)
+}
+
+/// Answers [`crate::proto::Request::PrepareReplay`]: the preview is the
+/// worker's own, and with `retain` it is kept under a token for one later
+/// [`apply_prepared_replay`].
+pub(crate) fn prepare_replay(
+	root: &SharedRoot,
+	dest: &str,
+	text: String,
+	retain: bool,
+	cache: &PreparedCache,
+	cancel: &CancelToken,
+) -> Response {
+	let run = || -> Result<Response, Refusal> {
+		if text.len() > snip_core::transfer::CLIPBOARD_PAYLOAD_MAX {
+			return Err(refused(
+				ErrorCode::TooLarge,
+				"the pasted text is over the clipboard limit",
+			));
+		}
+		let (top, scope) = replay_root(root, dest, cancel)?;
+		let payload = payload(&text)?;
+		let preview = CommitReplayPreview::capture_in(
+			&top,
+			&scope,
+			&payload,
+			&options(cancel),
+		)
+		.map_err(|e| transfer_refusal(e, cancel))?;
+		drop(payload);
+		let expect = ReplayExpect::of(&preview);
+		let digest = crate::proto::json_digest(&expect)
+			.map_err(|m| refused(ErrorCode::BadRequest, m))?;
+		if cancel.is_cancelled() {
+			return Err(refused(ErrorCode::Cancelled, "cancelled"));
+		}
+		let token = retain
+			.then(|| {
+				cache.insert(CachedImport {
+					text: String::new(),
+					mapping: PasteMapping::default(),
+					workspace: root.path.clone(),
+					destination: scope.clone(),
+					digest: digest.clone(),
+					replay: Some(Box::new(preview)),
+				})
+			})
+			.flatten();
+		Ok(Response::ReplayPrepared(crate::proto::ReplayPrepared {
+			expect,
+			digest,
+			token,
+		}))
+	};
+	run().unwrap_or_else(|r| *r)
+}
+
+/// Answers [`crate::proto::Request::ApplyPreparedReplay`] from the preview
+/// the token holds. A check, and a refusal from before the first write,
+/// keep the token.
+pub(crate) fn apply_prepared_replay(
+	root: &SharedRoot,
+	dest: &str,
+	token: &str,
+	digest: &str,
+	check_only: bool,
+	cache: &PreparedCache,
+	cancel: &CancelToken,
+) -> Response {
+	let scope = match destination(root, dest) {
+		Ok(s) => s,
+		Err(r) => return *r,
+	};
+	let lease = match cache.take(token, &root.path, &scope, digest) {
+		Ok(l) => l,
+		Err(why) => return cache_refusal(why),
+	};
+	let Some(preview) = lease.payload().replay.as_deref() else {
+		return *refused(
+			ErrorCode::Forbidden,
+			"prepared paste is not a commit replay; preview again",
+		);
+	};
+	let response = run_prepared_replay(root, dest, preview, check_only, cancel);
+	// A check never writes; a refusal from before the first write keeps the token too.
+	if check_only
+		|| matches!(&response, Response::Error { code, .. } if prepared::refused_before_write(*code))
+	{
+		lease.restore();
+	}
+	response
+}
+
+fn run_prepared_replay(
+	root: &SharedRoot,
+	dest: &str,
+	preview: &CommitReplayPreview,
+	check_only: bool,
+	cancel: &CancelToken,
+) -> Response {
+	let run = || -> Result<Response, Refusal> {
+		let (top, _) = replay_root(root, dest, cancel)?;
+		if preview.destination() != top {
+			return Err(stale(
+				&top,
+				"replay eligibility changed after preview",
+			));
+		}
+		if check_only {
+			preview
+				.revalidate_with(&options(cancel))
+				.map_err(|e| transfer_refusal(e, cancel))?;
+			return Ok(Response::Fresh);
+		}
+		let opts = RunOptions {
+			cancel: Some(cancel.clone()),
+			pool: GitPool::Served,
+			..RunOptions::default()
+		};
+		let result = preview
+			.apply_with(&opts)
+			.map_err(|e| transfer_refusal(e, cancel))?;
+		Ok(Response::Replayed(result))
 	};
 	run().unwrap_or_else(|resp| *resp)
 }

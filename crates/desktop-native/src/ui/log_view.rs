@@ -640,6 +640,7 @@ impl WorkbenchModel {
 			.as_ref()
 			.map(|r| {
 				ref_label_elements(
+					ix,
 					&r.refs,
 					current_branch.as_deref(),
 					&key,
@@ -774,6 +775,7 @@ impl WorkbenchModel {
 			)
 			.child(
 				div()
+					.debug_selector(|| format!("log-subject-room:{ix}"))
 					.flex_1()
 					.min_w_0()
 					.flex()
@@ -785,7 +787,8 @@ impl WorkbenchModel {
 						div()
 							.id(SharedString::from(format!("subject:{key}")))
 							.debug_selector(|| format!("log-subject:{ix}"))
-							.flex_1()
+							// Its text width, so the labels follow it (#188).
+							.flex_shrink()
 							.min_w_0()
 							.overflow_hidden()
 							.line_clamp(1)
@@ -814,7 +817,6 @@ impl WorkbenchModel {
 						d.child(
 							div()
 								.flex_shrink_0()
-								.ml_auto()
 								.flex()
 								.flex_row()
 								.items_center()
@@ -1196,6 +1198,19 @@ impl WorkbenchModel {
 					None => (String::new(), path.clone()),
 				};
 				let p2 = path.clone();
+				// A merge's file that the first parent has as well: it is
+				// listed only because another parent changed it (#188).
+				let same_first = self
+					.commit_files_first_parent_same
+					.as_ref()
+					.is_some_and(|(sha, set)| {
+						self.selected_commit
+							.as_deref()
+							.map(|id| crate::multi_log::split_id(id).0)
+							== Some(sha.as_str()) && set.contains(&path)
+					});
+				let same_note = same_first
+					.then(|| t("merge_file_same_first_parent", self.locale));
 				div()
 					.id(SharedString::from(id.clone()))
 					.relative()
@@ -1212,7 +1227,12 @@ impl WorkbenchModel {
 					.when(sel, |d| d.bg(rgb(pal().selection_bg)))
 					.when(!sel, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 					.when(self.chrome.menu.is_none(), |d| {
-						d.tooltip(tip(format!("{path}  ({letter})")))
+						let mut tip_text = format!("{path}  ({letter})");
+						if let Some(note) = &same_note {
+							tip_text.push('\n');
+							tip_text.push_str(note);
+						}
+						d.tooltip(tip(tip_text))
 					})
 					.on_click(cx.listener(
 						move |this, ev: &gpui::ClickEvent, _, cx| {
@@ -1250,7 +1270,11 @@ impl WorkbenchModel {
 						clip_text(name)
 							.flex_shrink_0()
 							.max_w(gpui::relative(0.7))
-							.text_color(rgb(color))
+							.text_color(rgb(if same_first {
+								pal().text_muted
+							} else {
+								color
+							}))
 							.when(deleted, |d| d.line_through()),
 					)
 					// The flat list names the file's folder after it.

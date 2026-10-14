@@ -571,12 +571,22 @@ impl TabsRoot {
 		self.next_id += 1;
 		let mode = self.mode.clone();
 		let probes = self.probes.clone();
+		// A new tab opens with the layout the active tab has (#188).
+		let layout = self.active.and_then(|i| self.tabs.get(i)).map(|t| {
+			let m = t.model.read(cx);
+			(m.bottom_h, m.left_w, m.log_details_w)
+		});
 		let model = with_log_tab(Some(id), || {
 			cx.new(|cx| {
 				let mut m = WorkbenchModel::new_tab(
 					workspace, None, mode, id, probes, cx,
 				);
 				m.workspace_menu = menu_open;
+				if let Some((b, l, d)) = layout {
+					m.bottom_h = b;
+					m.left_w = l;
+					m.log_details_w = d;
+				}
 				m
 			})
 		});

@@ -649,7 +649,7 @@ impl WorkbenchModel {
 		// A popup closed by this same press queued focus for the root; the
 		// menu must keep it.
 		self.pending_focus = None;
-		self.workspace_menu = false;
+		self.hide_workspace_menu();
 		let ids: Vec<&str> = entries
 			.iter()
 			.filter_map(|e| match e {
@@ -1616,14 +1616,15 @@ mod tests {
 			[("a/x.txt", false), ("b.txt", false), ("z.txt", false),]
 		);
 
-		// With by_dir = false: flat list retains the original commit_files order.
+		// With by_dir = false: the flat list is in natural path order, so the
+		// copy follows the screen, not the commit_files order.
 		assert_eq!(
 			commit_copy_selection(&files, &gitlinks, false, false, &targets),
-			[("z.txt", false), ("a/x.txt", false), ("b.txt", false),]
+			[("a/x.txt", false), ("b.txt", false), ("z.txt", false),]
 		);
 
-		// Flat layout with targets in REVERSE click order still follows
-		// commit_files order (guards a click-order flat branch).
+		// Flat layout with targets in REVERSE click order still follows the
+		// screen order (guards a click-order flat branch).
 		assert_eq!(
 			commit_copy_selection(
 				&files,
@@ -1632,7 +1633,7 @@ mod tests {
 				false,
 				&["b.txt", "a/x.txt", "z.txt"]
 			),
-			[("z.txt", false), ("a/x.txt", false), ("b.txt", false),]
+			[("a/x.txt", false), ("b.txt", false), ("z.txt", false),]
 		);
 	}
 

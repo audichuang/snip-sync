@@ -113,6 +113,14 @@ pub fn e2e_export_hold() -> Option<std::path::PathBuf> {
 
 /// Returns true if control B covering control A's centre is an intended design relationship
 /// rather than an unexpected UI occlusion defect.
+/// The editor keeps at least this much height above the Git Log (#188).
+const EDITOR_MIN_H: f32 = 120.;
+
+/// The tallest the Git Log may be in a window `vh` tall.
+fn bottom_h_max(vh: f32) -> f32 {
+	(vh - HEADER_H - STATUS_H - EDITOR_MIN_H).max(BOTTOM_H_MIN)
+}
+
 fn is_covered_allowed(
 	id_a: &str,
 	id_b: &str,
@@ -872,7 +880,7 @@ impl WorkbenchModel {
 	}
 
 	fn effective_bottom_h(&self, vh: f32) -> f32 {
-		self.bottom_h.min((vh - HEADER_H - STATUS_H) * 0.55)
+		self.bottom_h.min(bottom_h_max(vh))
 	}
 
 	fn drag_move(
@@ -898,9 +906,7 @@ impl WorkbenchModel {
 			}
 			Splitter::Bottom => {
 				let want = vh - STATUS_H - y;
-				self.bottom_h = want
-					.min((vh - HEADER_H - STATUS_H) * 0.55)
-					.max(BOTTOM_H_MIN);
+				self.bottom_h = want.min(bottom_h_max(vh)).max(BOTTOM_H_MIN);
 			}
 			Splitter::LogDetails => {
 				let want = vw - SPLITTER - f32::from(ev.position.x);
@@ -1467,6 +1473,7 @@ impl WorkbenchModel {
 		};
 		let d = div()
 			.id(id)
+			.debug_selector(move || id.into())
 			.relative()
 			.flex_shrink_0()
 			// Transparent: the splitter is the frame gap between islands.
@@ -2177,7 +2184,7 @@ mod tests {
 		};
 		// Closed sections: Local and one per remote, no Remote parent.
 		assert_eq!(
-			shape(branch_popup_rows(&refs, "", &[], Locale::En)),
+			shape(branch_popup_rows(&refs, &[], "", &[], Locale::En)),
 			[
 				"0G refs_local ›",
 				"0G remote:origin ›",
@@ -2186,7 +2193,7 @@ mod tests {
 		);
 		let open = ["refs_local".to_string(), "remote:origin".to_string()];
 		assert_eq!(
-			shape(branch_popup_rows(&refs, "", &open, Locale::En)),
+			shape(branch_popup_rows(&refs, &[], "", &open, Locale::En)),
 			[
 				"0G refs_local",
 				"1 main",
@@ -2199,7 +2206,7 @@ mod tests {
 		);
 		// Typing: every match, local and remote, flat and case-insensitive.
 		assert_eq!(
-			shape(branch_popup_rows(&refs, "login", &[], Locale::En)),
+			shape(branch_popup_rows(&refs, &[], "login", &[], Locale::En)),
 			["0 feat/Login", "0 origin/feat/login"]
 		);
 	}
@@ -2239,7 +2246,7 @@ mod tests {
 				.collect()
 		};
 		assert_eq!(
-			shape(branch_rows(&refs, "", &[], Locale::En)),
+			shape(branch_rows(&refs, &[], "", &[], Locale::En)),
 			[
 				"0G refs_local",
 				"1 main",
@@ -2255,7 +2262,7 @@ mod tests {
 		);
 		let collapsed = ["remote:origin".to_string(), "refs_tags".to_string()];
 		assert_eq!(
-			shape(branch_rows(&refs, "main", &collapsed, Locale::En)),
+			shape(branch_rows(&refs, &[], "main", &collapsed, Locale::En)),
 			[
 				"0G refs_local",
 				"1 main",

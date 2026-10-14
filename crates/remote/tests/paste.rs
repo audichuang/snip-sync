@@ -18,7 +18,8 @@ use snip_core::transfer::{
 use snip_remote::proto::MAX_FRAME;
 use snip_remote::{
 	Client, ErrorCode, FilePastePlan, PasteError, PasteMapping, PasteRoute,
-	PasteTarget, RemoteError, RemoteHost, Worker, WorkerOptions,
+	PasteTarget, PreparedReplay, RemoteError, RemoteHost, Worker,
+	WorkerOptions,
 };
 
 /// The worker's Git pool is one per process: tests that each run dozens
@@ -604,7 +605,7 @@ fn commit_file_previews_match_local_virtual_baselines_without_writing() {
 	];
 	let mut previews = Vec::new();
 	for target in &targets {
-		let plan = target
+		let (plan, _prepared) = target
 			.plan_commits(
 				&export.text,
 				export.payload.clone(),
@@ -838,6 +839,119 @@ fn a_remote_commit_replay_makes_the_commits_a_local_replay_makes() {
 	let res = client.replay_apply(&id, "dst", &text, &preview, false, None);
 	assert_eq!(refused(res), ErrorCode::Stale);
 	assert_eq!(git_out(&dst, &["rev-list", "--count", "HEAD"]), "3");
+}
+
+#[test]
+fn prepared_replay_requests_keep_the_token_through_checks_and_consume_it_on_apply(
+) {
+	use snip_remote::proto::{ReplayPrepared, Request, Response};
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	let src = ws.join("src");
+	init_repo(&src);
+	fs::write(src.join("a.txt"), "one\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "add a"]);
+	let first = git_out(&src, &["rev-parse", "HEAD"]);
+	fs::write(src.join("a.txt"), "two\n").unwrap();
+	git(&src, &["add", "."]);
+	git(&src, &["commit", "-q", "-m", "change a"]);
+	let tip = git_out(&src, &["rev-parse", "HEAD"]);
+
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let text = client
+		.export_commits(&id, "src", &tip, vec![tip.clone(), first], None)
+		.unwrap()
+		.text;
+	let dst = ws.join("dst");
+	init_repo(&dst);
+
+	let prepare = |client: &Client| -> ReplayPrepared {
+		match client
+			.call(&Request::PrepareReplay {
+				workspace: id.clone(),
+				dest: "dst".into(),
+				text: text.clone(),
+				retain: true,
+			})
+			.unwrap()
+		{
+			Response::ReplayPrepared(p) => p,
+			other => panic!("expected a prepared replay, got {other:?}"),
+		}
+	};
+	let check = |client: &Client, token: &str, digest: &str| {
+		client.call(&Request::ApplyPreparedReplay {
+			workspace: id.clone(),
+			dest: "dst".into(),
+			token: token.into(),
+			digest: digest.into(),
+			check_only: true,
+		})
+	};
+	let apply = |client: &Client, token: &str, digest: &str| {
+		client.call(&Request::ApplyPreparedReplay {
+			workspace: id.clone(),
+			dest: "dst".into(),
+			token: token.into(),
+			digest: digest.into(),
+			check_only: false,
+		})
+	};
+
+	let p = prepare(&client);
+	let token = p.token.clone().expect("retained token");
+	// A check keeps the token: two checks in a row both pass, and nothing
+	// is written.
+	assert!(matches!(
+		check(&client, &token, &p.digest),
+		Ok(Response::Fresh)
+	));
+	assert!(matches!(
+		check(&client, &token, &p.digest),
+		Ok(Response::Fresh)
+	));
+	assert_eq!(git_out(&dst, &["rev-list", "--count", "HEAD"]), "1");
+
+	// A wrong digest is refused as stale and consumes the token.
+	assert_eq!(
+		refused(check(&client, &token, "not-the-digest")),
+		ErrorCode::Stale
+	);
+	let p = prepare(&client);
+	let token = p.token.clone().expect("retained token");
+	match apply(&client, &token, &p.digest).unwrap() {
+		Response::Replayed(r) => {
+			assert_eq!(r.created.len(), 2, "{r:?}");
+			assert!(r.failure.is_none());
+		}
+		other => panic!("expected a replay, got {other:?}"),
+	}
+	assert_eq!(git_out(&dst, &["rev-list", "--count", "HEAD"]), "3");
+
+	// The consumed token is gone for good.
+	match apply(&client, &token, &p.digest) {
+		Err(RemoteError::Refused { code, message }) => {
+			assert_eq!(code, ErrorCode::Stale);
+			assert!(message.contains("expired, was consumed"), "{message}");
+		}
+		other => panic!("expected a refusal, got {other:?}"),
+	}
+
+	// A worker older than protocol 8 refuses the prepared replay outright.
+	let old = worker(Some(7));
+	let (old_client, _) = open(&old, &ws);
+	match old_client.call(&Request::PrepareReplay {
+		workspace: id.clone(),
+		dest: "dst".into(),
+		text: text.clone(),
+		retain: true,
+	}) {
+		Err(RemoteError::WorkerTooOld { .. }) => {}
+		other => panic!("expected too old, got {other:?}"),
+	}
 }
 
 #[test]
@@ -1232,11 +1346,11 @@ fn a_paste_target_replays_the_same_commits_locally_and_on_a_worker() {
 		dest: "dst".into(),
 	};
 	for target in [&local_target, &remote] {
-		let preview = target
+		let (preview, prepared) = target
 			.plan_commits(&text, payload.clone(), &RunOptions::default())
 			.unwrap();
-		target.check_commits(&text, &preview).unwrap();
-		let result = target.apply_commits(&text, &preview).unwrap();
+		target.check_commits(&text, &preview, &prepared).unwrap();
+		let result = target.apply_commits(&text, &preview, &prepared).unwrap();
 		assert_eq!(result.created.len(), 2, "{result:?}");
 		assert!(result.failure.is_none(), "{result:?}");
 	}
@@ -1331,7 +1445,7 @@ fn lose_the_answer(w: &Worker) {
 fn planned_replay(
 	tmp: &Path,
 	w: &Arc<Worker>,
-) -> (PasteTarget, String, CommitReplayPreview) {
+) -> (PasteTarget, String, CommitReplayPreview, PreparedReplay) {
 	let ws = tmp.join("ws");
 	let src = ws.join("src");
 	init_repo(&src);
@@ -1351,10 +1465,10 @@ fn planned_replay(
 		workspace: id,
 		dest: "dst".into(),
 	};
-	let preview = target
+	let (preview, prepared) = target
 		.plan_commits(&text, payload, &RunOptions::default())
 		.unwrap();
-	(target, text, preview)
+	(target, text, preview, prepared)
 }
 
 /// #167: a remote file Apply whose answer is lost may have written, so
@@ -1397,12 +1511,12 @@ fn a_lost_replay_apply_answer_through_a_paste_target_is_outcome_unknown() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let w = worker(None);
-	let (remote, text, preview) = planned_replay(tmp.path(), &w);
+	let (remote, text, preview, prepared) = planned_replay(tmp.path(), &w);
 
 	lose_the_answer(&w);
 	let connections = w.started_connections_for_tests();
 	let err = remote
-		.apply_commits(&text, &preview)
+		.apply_commits(&text, &preview, &prepared)
 		.expect_err("a hung-up worker cannot answer an Apply");
 	assert!(matches!(err, PasteError::OutcomeUnknown(_)), "{err:?}");
 	assert_eq!(
@@ -1419,11 +1533,11 @@ fn a_lost_replay_check_answer_through_a_paste_target_is_a_plain_failure() {
 	let _serial = serial();
 	let tmp = tempfile::tempdir().unwrap();
 	let w = worker(None);
-	let (remote, text, preview) = planned_replay(tmp.path(), &w);
+	let (remote, text, preview, prepared) = planned_replay(tmp.path(), &w);
 
 	lose_the_answer(&w);
 	let err = remote
-		.check_commits(&text, &preview)
+		.check_commits(&text, &preview, &prepared)
 		.expect_err("a hung-up worker cannot answer a check");
 	assert!(
 		matches!(&err, PasteError::Remote(e) if e.outcome_unknown()),

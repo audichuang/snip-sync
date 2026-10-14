@@ -565,6 +565,16 @@ check "a remote commit replay exits as a local one" test "$?" = 0
 local_log=$(git -C "$MASTER/commit-local" log -2 --format='%T %an <%ae> %ad %s')
 remote_log=$(w <<<"git -C '$WD/pastews/crepo' log -2 --format='%T %an <%ae> %ad %s'")
 check "the replayed commits match a local replay" test "$remote_log" = "$local_log" -a -n "$local_log"
+# A protocol-7 worker has no retained commit preview: it keeps the stateless
+# ReplayPlan/ReplayApply contract, and must still replay like a local one.
+w <<EOF
+$(declare -f base_repo)
+base_repo '$WD/pastews/crepo7'
+EOF
+SNIP_REMOTE_EXEC="$SNIP_REMOTE_EXEC --max-protocol 7" "$SNIP" remote paste h "$WD/pastews" --in crepo7 --apply --stdin <"$MASTER/commits.txt" >/dev/null 2>&1
+check "a commit replay through a protocol-7 worker exits as a local one" test "$?" = 0
+remote7_log=$(w <<<"git -C '$WD/pastews/crepo7' log -2 --format='%T %an <%ae> %ad %s'")
+check "a protocol-7 worker's replayed commits match a local replay" test "$remote7_log" = "$local_log" -a -n "$local_log"
 
 echo "== git views"
 w <<<"sleep 1 && touch '$WD/gitws/alpha/b.txt'"

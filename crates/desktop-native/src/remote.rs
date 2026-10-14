@@ -232,6 +232,10 @@ pub struct Browse {
 	/// Ends this listing's connect and calls once another listing, a
 	/// close or a quit replaces it.
 	cancel: snip_core::gitrun::CancelToken,
+	/// What this code last wrote into the path field; a listing that lands
+	/// overwrites the field only while it still holds this (the user did not
+	/// type meanwhile).
+	prefill: String,
 }
 
 impl std::fmt::Debug for Browse {
@@ -246,6 +250,12 @@ impl std::fmt::Debug for Browse {
 }
 
 impl Browse {
+	/// The Client this browse keeps, for tests.
+	#[cfg(test)]
+	pub(crate) fn client_for_tests(&self) -> Option<Arc<Client>> {
+		self.client.clone()
+	}
+
 	pub fn seq(&self) -> u64 {
 		self.seq
 	}
@@ -288,6 +298,16 @@ pub struct MasterState {
 	/// The remote folder this tab was reopened for at launch, until it
 	/// opens: the tab shows and saves it meanwhile, and after a failure.
 	pub restoring: Option<Restoring>,
+}
+
+impl MasterState {
+	/// Ends the menu's host browse: its listing is cancelled and its Client
+	/// (and that Client's ssh connections) dropped (#187).
+	pub(crate) fn end_browse(&mut self) {
+		if let Some(b) = self.browse.take() {
+			b.cancel.cancel();
+		}
+	}
 }
 
 /// Only the first probe of saved tabs on the active tab's host is ordered.
@@ -714,11 +734,16 @@ impl WorkbenchModel {
 			seq,
 			client: Some(client.clone()),
 			cancel: cancel.clone(),
+			prefill: path.clone(),
 		});
 		if let Some(previous) = previous {
 			// Its listing would be dropped anyway (another seq).
 			previous.cancel.cancel();
 		}
+		// The field shows the requested folder at once, never the previous
+		// host's path (#190).
+		self.remote_path_input
+			.update(cx, |f, cx| f.set_text(&path, cx));
 		self.remote.message = None;
 		self.pending_focus = Some(self.remote_path_input.read(cx).handle());
 		cx.notify();
@@ -744,7 +769,7 @@ impl WorkbenchModel {
 						let cancel = Some(&token);
 						let ws = client.open_workspace_with(&path, cancel)?;
 						let (entries, _) =
-							client.list_dir(&ws.id, "", cancel)?;
+							client.list_folders(&ws.id, "", cancel)?;
 						let folders = entries
 							.into_iter()
 							.filter(|e| {
@@ -794,8 +819,15 @@ impl WorkbenchModel {
 				);
 				browse.path = listing.path.clone();
 				let path = listing.path.clone();
-				self.remote_path_input
-					.update(cx, |field, cx| field.set_text(&path, cx));
+				// Overwrite the field only while it still holds what this code
+				// wrote; a user who typed meanwhile keeps the text (#190).
+				let untouched =
+					self.remote_path_input.read(cx).text() == browse.prefill;
+				if untouched {
+					browse.prefill = path.clone();
+					self.remote_path_input
+						.update(cx, |field, cx| field.set_text(&path, cx));
+				}
 			}
 			Err(err) => {
 				app_log!("[APP:REMOTE_HOST_FAILED: host={name} {err}]");
@@ -886,6 +918,15 @@ impl WorkbenchModel {
 				Some(RestorePriority::After(gate)) => (Some(gate), None),
 				None => (None, None),
 			};
+		// The workspace opened from the menu keeps the browse's warm
+		// connection instead of starting another ssh.
+		let reuse = self
+			.remote
+			.browse
+			.as_mut()
+			.filter(|b| b.host == idx)
+			.and_then(|b| b.client.take())
+			.filter(|c| c.host().name == host.name);
 		self.spawn_owned(
 			cx,
 			crate::lifecycle::JobKind::CancellableRead,
@@ -920,7 +961,9 @@ impl WorkbenchModel {
 				}
 				let result = bg
 					.spawn(async move {
-						let client = Arc::new(Client::new(host, device_name()));
+						let client = reuse.unwrap_or_else(|| {
+							Arc::new(Client::new(host, device_name()))
+						});
 						let workspace = client
 							.open_workspace_with(path.trim(), Some(&token))?;
 						Ok::<_, RemoteError>(OpenedRemote { client, workspace })
@@ -946,7 +989,7 @@ impl WorkbenchModel {
 						.is_some_and(|r| r.open_seq == Some(open_seq));
 					match result {
 						Ok(opened) => {
-							this.workspace_menu = false;
+							this.hide_workspace_menu();
 							let target = crate::tabs::OpenTarget::Remote(
 								Box::new(opened),
 							);
@@ -1222,7 +1265,7 @@ impl WorkbenchModel {
 		self.workspace_root = root.clone();
 		self.remote.session = Some(session);
 		self.workspace_open = true;
-		self.workspace_menu = false;
+		self.hide_workspace_menu();
 		self.workspace_picker = false;
 		self.ws_home = Some(root.clone());
 		self.ws_tree = Some(FileTreeNode::unloaded_root(&root));

@@ -153,11 +153,14 @@ pub(super) enum BranchRow {
 		depth: usize,
 		collapsed: bool,
 	},
-	/// A ref (full name) shown as `label`.
+	/// A ref (full name) shown as `label`, with a muted `repo` suffix when
+	/// the log merges several repositories (the repo name, or the count
+	/// when the same ref exists in several of them).
 	Ref {
 		name: String,
 		label: String,
 		depth: usize,
+		repo: Option<String>,
 	},
 }
 
@@ -166,11 +169,34 @@ pub(super) enum BranchRow {
 /// [`MAX_BRANCH_ROWS`] refs per group; `<remote>/HEAD` is not listed.
 pub(super) fn branch_rows(
 	refs: &[snip_core::browser::GitReference],
+	feeds: &[String],
 	needle: &str,
 	collapsed: &[String],
 	loc: Locale,
 ) -> Vec<BranchRow> {
 	let is_collapsed = |k: &str| collapsed.iter().any(|c| c == k);
+	// Which repositories (feed indices) hold each ref, before the dedup.
+	let mut owners: HashMap<&str, Vec<usize>> = HashMap::new();
+	for r in refs {
+		if let Some(feed) = crate::multi_log::split_id(&r.sha).1 {
+			let v = owners.entry(r.name.as_str()).or_default();
+			if !v.contains(&feed) {
+				v.push(feed);
+			}
+		}
+	}
+	let repo_of = |name: &str| -> Option<String> {
+		if feeds.is_empty() {
+			return None;
+		}
+		match owners.get(name).map(Vec::as_slice) {
+			Some([one]) => feeds.get(*one).cloned(),
+			Some(many) if many.len() > 1 => {
+				Some(tf("branch_repo_count", loc, &[many.len()]))
+			}
+			_ => None,
+		}
+	};
 	// The merged log has a `main` per repository: one row filters them all.
 	let mut seen = HashSet::new();
 	let refs: Vec<&snip_core::browser::GitReference> = refs
@@ -214,6 +240,7 @@ pub(super) fn branch_rows(
 					name: name.to_string(),
 					label: short.to_string(),
 					depth: 1,
+					repo: repo_of(name),
 				},
 			));
 			continue;
@@ -248,6 +275,7 @@ pub(super) fn branch_rows(
 							name: name.to_string(),
 							label: rest.to_string(),
 							depth: 2,
+							repo: repo_of(name),
 						})
 					})
 					.take(MAX_BRANCH_ROWS),
@@ -263,18 +291,20 @@ pub(super) fn branch_rows(
 /// list instead, named `origin/x` for a remote branch.
 pub(super) fn branch_popup_rows(
 	refs: &[snip_core::browser::GitReference],
+	feeds: &[String],
 	needle: &str,
 	open: &[String],
 	loc: Locale,
 ) -> Vec<BranchRow> {
 	if !needle.is_empty() {
-		return branch_rows(refs, needle, &[], loc)
+		return branch_rows(refs, feeds, needle, &[], loc)
 			.into_iter()
 			.filter_map(|r| match r {
-				BranchRow::Ref { name, .. } => Some(BranchRow::Ref {
+				BranchRow::Ref { name, repo, .. } => Some(BranchRow::Ref {
 					label: short_ref(&name).to_string(),
 					name,
 					depth: 0,
+					repo,
 				}),
 				BranchRow::Group { .. } => None,
 			})
@@ -299,7 +329,7 @@ pub(super) fn branch_popup_rows(
 		}
 	}
 	closed.retain(|k| !open.contains(k));
-	branch_rows(refs, "", &closed, loc)
+	branch_rows(refs, feeds, "", &closed, loc)
 		.into_iter()
 		.filter_map(|mut r| {
 			match &mut r {
@@ -658,15 +688,28 @@ pub(super) fn log_icon_button(
 		)
 }
 
-/// The coloured label glyph of a ref.
-pub(super) fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
-	icon_tinted(if l.current { Icon::Head } else { Icon::Tag }, 14., l.color)
+/// The glyph of a ref label: HEAD / the checked-out branch, a tag, or a branch.
+pub(super) fn label_icon_kind(l: &graph_view::RefLabel) -> Icon {
+	if l.current {
+		Icon::Head
+	} else if l.tag {
+		Icon::Tag
+	} else {
+		Icon::Branch
+	}
 }
 
-/// A row's ref labels, right-aligned at the end of the subject: one label
-/// icon plus the names of at most two badges, the rest folded into `+N`. Also returns their
-/// laid-out width (`measure` gives a name's text width).
+/// The coloured label glyph of a ref.
+pub(super) fn label_icon(l: &graph_view::RefLabel) -> gpui::Svg {
+	icon_tinted(label_icon_kind(l), 14., l.color)
+}
+
+/// A row's ref labels, after the subject: one label for its branches and one
+/// for its tags, each with its icon, and the names of at most two badges
+/// per label, the rest folded into `+N`. Also returns their laid-out width
+/// (`measure` gives a name's text width).
 pub(super) fn ref_label_elements(
+	ix: usize,
 	refs: &[snip_core::graph::RefInfo],
 	current_branch: Option<&str>,
 	row: &str,
@@ -674,44 +717,49 @@ pub(super) fn ref_label_elements(
 	measure: &dyn Fn(&str) -> f32,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	// One label for the shown badges: icon (14) + 3 + names, at most 320
-	// (the room two separate labels had).
 	let mut width = 0.;
-	let mut out: Vec<AnyElement> =
-		graph_view::combined_label(&shown, current_branch)
-			.into_iter()
-			.map(|l| {
-				width += (17. + measure(&l.text)).min(320.);
-				let tooltip = shown
-					.iter()
-					.flat_map(|b| {
-						std::iter::once(b.primary)
-							.chain(b.merged.iter().copied())
-					})
-					.map(|i| graph_view::format_ref_badge(i).0)
-					.collect::<Vec<_>>()
-					.join("\n");
-				div()
-					.id(SharedString::from(format!(
-						"ref-badge:{row}:{}",
-						l.text
-					)))
-					.flex()
-					.items_center()
-					.gap(px(3.))
-					.max_w(px(320.))
-					// Squeezed by the labels container, the text ellipsizes.
-					.min_w_0()
-					.when(show_tips, |d| d.tooltip(tip(tooltip)))
-					.child(label_icon(&l))
-					.child(
-						clip_text(l.text.clone())
-							.text_size(px(SMALL_TEXT))
-							.text_color(rgb(pal().log_ref_text)),
-					)
-					.into_any_element()
+	let mut out: Vec<AnyElement> = Vec::new();
+	for (n, l) in graph_view::kind_labels(&shown, current_branch)
+		.into_iter()
+		.enumerate()
+	{
+		if n > 0 {
+			width += 8.;
+		}
+		width += (17. + measure(&l.text)).min(320.);
+		let tooltip = shown
+			.iter()
+			.filter(|b| {
+				matches!(b.primary.kind, snip_core::graph::RefKind::Tag)
+					== l.tag
 			})
-			.collect();
+			.flat_map(|b| {
+				std::iter::once(b.primary).chain(b.merged.iter().copied())
+			})
+			.map(|i| graph_view::format_ref_badge(i).0)
+			.collect::<Vec<_>>()
+			.join("\n");
+		let selector = format!("log-ref-label:{ix}:{n}");
+		out.push(
+			div()
+				.id(SharedString::from(format!("ref-badge:{row}:{}", l.text)))
+				.debug_selector(move || selector)
+				.flex()
+				.items_center()
+				.gap(px(3.))
+				.max_w(px(320.))
+				// Squeezed by the labels container, the text ellipsizes.
+				.min_w_0()
+				.when(show_tips, |d| d.tooltip(tip(tooltip)))
+				.child(label_icon(&l))
+				.child(
+					clip_text(l.text.clone())
+						.text_size(px(SMALL_TEXT))
+						.text_color(rgb(pal().text)),
+				)
+				.into_any_element(),
+		);
+	}
 	if hidden > 0 {
 		width += 8. + measure(&format!("+{hidden}"));
 		let all = refs
@@ -1349,6 +1397,7 @@ impl WorkbenchModel {
 					&& "head".contains(needle.as_str());
 				let rows = branch_popup_rows(
 					&self.refs,
+					&self.log_feed_names(),
 					&needle,
 					&self.log_branch_menu_open,
 					loc,
@@ -1358,6 +1407,7 @@ impl WorkbenchModel {
 						name: "HEAD".into(),
 						label: "HEAD".into(),
 						depth: 0,
+						repo: None,
 					})
 					.into_iter()
 					.chain(rows)
@@ -1416,13 +1466,20 @@ impl WorkbenchModel {
 									.into_any_element(),
 							);
 						}
-						BranchRow::Ref { name, label, depth } => {
+						BranchRow::Ref {
+							name,
+							label,
+							depth,
+							repo,
+						} => {
 							let checked = self.active_ref_filter.as_deref()
 								== Some(&name);
 							let target = name.clone();
 							items.push(
 								div()
 									.pl(px(depth as f32 * 14.))
+									.flex()
+									.items_center()
 									.child(item(
 										format!("log-branch:{name}"),
 										label,
@@ -1436,6 +1493,18 @@ impl WorkbenchModel {
 										}),
 										cx,
 									))
+									.when_some(repo, |d, r| {
+										d.child(
+											div()
+												.flex_shrink_0()
+												.ml(px(6.))
+												.text_size(px(SMALL_TEXT))
+												.text_color(rgb(
+													pal().text_muted
+												))
+												.child(r),
+										)
+									})
 									.into_any_element(),
 							);
 						}
@@ -1852,6 +1921,7 @@ impl WorkbenchModel {
 		             indent: f32,
 		             target: Option<String>,
 		             active: bool,
+		             repo: Option<String>,
 		             cx: &mut Context<Self>| {
 			div()
 				.id(SharedString::from(id.clone()))
@@ -1875,6 +1945,16 @@ impl WorkbenchModel {
 				}))
 				.child(glyph)
 				.child(clip_text(label).text_color(rgb(pal().text)))
+				.when_some(repo, |d, r| {
+					d.child(
+						div()
+							.flex_shrink_0()
+							.ml(px(6.))
+							.text_size(px(SMALL_TEXT))
+							.text_color(rgb(pal().text_muted))
+							.child(r),
+					)
+				})
 				.children(probe(log, id))
 				.into_any_element()
 		};
@@ -1888,12 +1968,17 @@ impl WorkbenchModel {
 				10.,
 				Some("HEAD".into()),
 				self.active_ref_filter.as_deref() == Some("HEAD"),
+				None,
 				cx,
 			));
 		}
-		for row in
-			branch_rows(&self.refs, &needle, &self.branch_groups_collapsed, loc)
-		{
+		for row in branch_rows(
+			&self.refs,
+			&self.log_feed_names(),
+			&needle,
+			&self.branch_groups_collapsed,
+			loc,
+		) {
 			match row {
 				BranchRow::Group {
 					key,
@@ -1945,7 +2030,12 @@ impl WorkbenchModel {
 							.into_any_element(),
 					);
 				}
-				BranchRow::Ref { name, label, depth } => {
+				BranchRow::Ref {
+					name,
+					label,
+					depth,
+					repo,
+				} => {
 					let is_current = name.strip_prefix("refs/heads/").is_some()
 						&& current.as_deref()
 							== name.strip_prefix("refs/heads/");
@@ -1974,6 +2064,7 @@ impl WorkbenchModel {
 						8. + depth as f32 * 16.,
 						Some(name),
 						active,
+						repo,
 						cx,
 					));
 				}
@@ -2288,5 +2379,70 @@ mod filter_split_tests {
 		// Nothing active: plain prefix order.
 		let prefix = 100. + 50. + 46. + 2. * LOG_FILTER_GAP;
 		assert_eq!(l.compute_split(prefix, [false; 4]), 0b0011);
+	}
+}
+
+#[cfg(test)]
+mod repo_label_tests {
+	use super::*;
+	use snip_core::browser::GitReference;
+
+	fn reference(name: &str, sha: &str) -> GitReference {
+		GitReference {
+			name: name.into(),
+			sha: sha.into(),
+		}
+	}
+
+	fn repo_of(rows: &[BranchRow], name: &str) -> Option<Option<String>> {
+		rows.iter().find_map(|r| match r {
+			BranchRow::Ref { name: n, repo, .. } if n == name => {
+				Some(repo.clone())
+			}
+			_ => None,
+		})
+	}
+
+	#[test]
+	fn branch_rows_name_the_repo_or_count_in_a_merged_log() {
+		let refs = vec![
+			reference("refs/heads/main", "aa@0"),
+			reference("refs/heads/main", "bb@1"),
+			reference("refs/heads/feature/x", "cc@1"),
+			reference("refs/tags/v1", "aa@0"),
+		];
+		let feeds = ["alpha".to_string(), "branchy".to_string()];
+		let rows = branch_rows(&refs, &feeds, "", &[], Locale::ZhTw);
+		assert_eq!(
+			repo_of(&rows, "refs/heads/main"),
+			Some(Some("2 個 repo".to_string()))
+		);
+		assert_eq!(
+			repo_of(&rows, "refs/heads/feature/x"),
+			Some(Some("branchy".to_string()))
+		);
+		assert_eq!(
+			repo_of(&rows, "refs/tags/v1"),
+			Some(Some("alpha".to_string()))
+		);
+		// A single repository names none.
+		let rows = branch_rows(&refs, &[], "", &[], Locale::ZhTw);
+		assert!(rows.iter().all(|r| match r {
+			BranchRow::Ref { repo, .. } => repo.is_none(),
+			BranchRow::Group { .. } => true,
+		}));
+	}
+
+	#[test]
+	fn label_icon_kind_differs_for_branch_and_tag() {
+		let label = |current: bool, tag: bool| graph_view::RefLabel {
+			text: "x".into(),
+			color: 0,
+			current,
+			tag,
+		};
+		assert_eq!(label_icon_kind(&label(true, false)), Icon::Head);
+		assert_eq!(label_icon_kind(&label(false, true)), Icon::Tag);
+		assert_eq!(label_icon_kind(&label(false, false)), Icon::Branch);
 	}
 }
