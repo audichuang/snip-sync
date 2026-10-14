@@ -7695,6 +7695,34 @@ mod tests {
 			);
 		}
 
+		/// An open host row has no tooltip (#203): it would cover the
+		/// open-here button of the folder list below it, even when the click
+		/// came before the tooltip showed.
+		#[gpui::test]
+		fn an_opened_host_row_has_no_tooltip(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let (_, _model, cx) = remote_menu_hosts(cx, &["one", "two"]);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+			settle(cx);
+			let shown = |cx: &mut VisualTestContext| {
+				cx.run_until_parked();
+				cx.debug_bounds("tooltip:one").is_some()
+			};
+			let at = cx
+				.debug_bounds("remote-host:0")
+				.expect("row drawn")
+				.center();
+			cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+			click(cx, "remote-host:0");
+			cx.executor().advance_clock(Duration::from_millis(700));
+			settle(cx);
+			assert!(
+				cx.debug_bounds("btn-remote-open-here").is_some(),
+				"the host's folder block is open"
+			);
+			assert!(!shown(cx), "the opened row keeps no tooltip");
+		}
+
 		/// Opening a host's folder list and switching hosts never moves the
 		/// other host rows: the recent box keeps four whole rows (#197).
 		#[gpui::test]
@@ -17582,6 +17610,69 @@ mod tests {
 				assert!(
 					!tooltip_shown(cx, &path),
 					"tab {k}'s tooltip stays over another tab"
+				);
+			}
+
+			/// Opening the workspace menu takes its button's tooltip away
+			/// (#203): left up, it covers the menu's first item.
+			#[gpui::test]
+			fn opening_the_workspace_menu_hides_its_buttons_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				let loc = tab(&root, cx, 0).read_with(cx, |m, _| m.locale);
+				let text = format!(
+					"{} · {}",
+					a.display(),
+					crate::ui::mac_keys(crate::i18n::t(
+						"tip_workspace_menu",
+						loc
+					))
+				);
+				// Clicked while the tooltip still waits to show: GPUI keeps
+				// that timer running past the mouse-down.
+				cx.run_until_parked();
+				let at = cx
+					.debug_bounds("btn-workspace-menu")
+					.expect("button drawn")
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+
+				click_id(cx, "btn-workspace-menu".into());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+				assert!(
+					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					"the menu is open"
+				);
+				assert!(
+					!tooltip_shown(cx, &text),
+					"the tooltip stays over the opened menu"
+				);
+			}
+
+			/// A tooltip left up while a native dialog took the pointer
+			/// goes when the window gets its focus back (#203), without
+			/// waiting for the next mouse input.
+			#[gpui::test]
+			fn a_tooltip_goes_when_the_window_regains_focus(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, dirs, root, cx) = many_tabs(cx, 2);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(0));
+				hover_id(cx, "ws-tab:0");
+				let path = dirs[0].display().to_string();
+				assert!(tooltip_shown(cx, &path), "the tab tooltip is up");
+
+				cx.update(|window, _| window.activate_window());
+				settle(cx);
+				assert!(
+					!tooltip_shown(cx, &path),
+					"the pointer's place is unknown until it moves"
 				);
 			}
 
