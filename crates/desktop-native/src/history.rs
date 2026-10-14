@@ -3460,6 +3460,18 @@ impl WorkbenchModel {
 			.unwrap_or_else(|| self.display_repo_path(root))
 	}
 
+	/// The Repository chip's name for a repository: its workspace name,
+	/// disambiguated like a local one (a remote entry's `name` is already
+	/// short), so a long remote prefix (`host ▸ path › `) does not crowd
+	/// the other chips.
+	pub fn log_repo_chip_name(&self, root: &std::path::Path) -> String {
+		self.repos
+			.iter()
+			.find(|r| r.root == root)
+			.map(|r| r.name.clone())
+			.unwrap_or_else(|| self.log_repo_name(root))
+	}
+
 	/// A repository's root-stripe color: its place in the workspace, so
 	/// it stays the same whatever the Repository chip shows.
 	pub fn log_repo_color(&self, root: &std::path::Path) -> usize {

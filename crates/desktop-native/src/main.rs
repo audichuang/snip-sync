@@ -15826,6 +15826,190 @@ mod tests {
 			assert_eq!(drawn, wanted, "the drawn split follows the new width");
 		}
 
+		/// At the default 1080x720 window with the details pane open, an
+		/// active repository and an active branch both stay on the bar:
+		/// their values are truncated before either goes into the overflow
+		/// chip (#205).
+		#[gpui::test]
+		fn two_active_log_chips_stay_on_the_bar_at_the_default_window(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 752.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.refs.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let (visible, hidden, repo_value) = model.read_with(cx, |m, _| {
+				let (on, off) = m.log_filter_split();
+				(on, off, m.log_scope_value())
+			});
+			assert_eq!(
+				repo_value.as_deref(),
+				Some("repo-01-core"),
+				"the repo chip shows the repo name"
+			);
+			assert!(
+				visible.contains(&crate::ui::LogMenu::Repo)
+					&& visible.contains(&crate::ui::LogMenu::Branch),
+				"both active chips stay on the bar: shown {visible:?}, \
+				 overflow {hidden:?}"
+			);
+			for id in ["log-filter-repo", "log-filter-branch"] {
+				assert!(cx.debug_bounds(id).is_some(), "{id} drawn");
+			}
+		}
+
+		/// The drawn text cap follows a resize that keeps the split mask: the
+		/// bar widened, so the truncated values get their room back with no
+		/// input (#205).
+		#[gpui::test]
+		fn log_chip_text_cap_follows_a_resize_that_keeps_the_mask(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 752.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.refs.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let before =
+				model.read_with(cx, |m, _| m.log_filter_layout.text_cap());
+			for w in [1110., 1140.] {
+				cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
+				for _ in 0..5 {
+					settle(cx);
+				}
+				let (drawn, wanted, mask) = model.read_with(cx, |m, _| {
+					let l = &m.log_filter_layout;
+					(
+						l.text_cap(),
+						l.text_cap_for(l.container_w.get()),
+						l.last_mask.get(),
+					)
+				});
+				assert_eq!(mask & 0b11, 0b11, "both chips stay on the bar");
+				assert!(
+					(drawn - wanted).abs() < 0.5,
+					"at {w}: drawn cap {drawn} follows the bar ({wanted})"
+				);
+				assert!(drawn >= before, "a wider bar never shrinks the cap");
+			}
+		}
+
+		/// The same as above in a remote workspace (#205): repositories nest
+		/// under the shared folder, and the chip names the repo without the
+		/// `host ▸ path ›` prefix, so both active chips stay on the bar.
+		#[gpui::test]
+		fn two_active_log_chips_stay_on_the_bar_in_a_remote_workspace(
+			cx: &mut TestAppContext,
+		) {
+			let _guard = remote_lock();
+			let ws = tempfile::tempdir().unwrap();
+			let shared = ws.path().join("shared");
+			fs::create_dir(&shared).unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(&shared, name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(752.)));
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.repos.len() >= 2
+						&& !m.refs.is_empty()
+						&& m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let (visible, hidden, repo_value) = model.read_with(cx, |m, _| {
+				let (on, off) = m.log_filter_split();
+				(on, off, m.log_scope_value())
+			});
+			assert_eq!(repo_value.as_deref(), Some("repo-01-core"));
+			assert!(
+				visible.contains(&crate::ui::LogMenu::Repo)
+					&& visible.contains(&crate::ui::LogMenu::Branch),
+				"both active chips stay on the bar: shown {visible:?}, \
+				 overflow {hidden:?}"
+			);
+		}
+
 		/// At a narrow window width with widened details pane and an active long user filter,
 		/// no filter chip intersects action buttons and user filter is reachable.
 		#[gpui::test]
