@@ -917,6 +917,8 @@ pub struct WorkbenchModel {
 	/// no longer drawn returns the keyboard to `focus_handle`.
 	pub(crate) focus_lost_guard: Option<gpui::Subscription>,
 	pub e2e_read_delay: Option<std::time::Duration>,
+	/// Test hook: holds a finished Log commit read before it installs.
+	pub e2e_log_read_delay: Option<std::time::Duration>,
 	/// Test-only hold file for project-tree reads, honoured only in E2E mode.
 	pub e2e_tree_hold: Option<PathBuf>,
 	/// Test-only hold file for copy export revalidation, honoured only in E2E mode.
@@ -1428,6 +1430,7 @@ impl WorkbenchModel {
 			pending_focus: None,
 			focus_lost_guard: None,
 			e2e_read_delay: ui::e2e_read_delay(),
+			e2e_log_read_delay: None,
 			e2e_tree_hold: ui::e2e_tree_hold(),
 			e2e_export_hold: ui::e2e_export_hold(),
 			#[cfg(test)]
@@ -16434,6 +16437,76 @@ mod tests {
 				assert!(
 					m.preview.is_some() && !m.preview_loading,
 					"the requested preview was dropped by the repo filter",
+				);
+			});
+		}
+
+		/// A Log commit read still in flight when an error clears
+		/// `preview_loading` must still be dropped by a repository filter
+		/// change: the Log's read must not reinstall files or a diff for a
+		/// selection that is gone (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_drops_a_log_read_after_an_error_cleared_loading(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix = model
+				.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == "alpha commit")
+				})
+				.expect("alpha commit listed");
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_log_read_delay = Some(delay));
+			click(cx, id);
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| {
+					m.preview_loading && m.commit_files.is_empty()
+				}),
+				"the Log read must be held in flight",
+			);
+			// Another read fails first and clears the loading flag without
+			// touching the generation.
+			model.update(cx, |m, _| {
+				m.show_preview_error(crate::Msg::new(
+					"error_repo_changes",
+					["beta".to_string(), "boom".to_string()],
+				));
+			});
+			assert!(!model.read_with(cx, |m, _| m.preview_loading));
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.selected_commit.is_none()) {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(
+					m.commit_files.is_empty(),
+					"the late Log read reinstalled files",
+				);
+				assert!(
+					!commit_preview_shown(m),
+					"the late Log read reinstalled a commit diff",
 				);
 			});
 		}

@@ -1499,13 +1499,14 @@ impl WorkbenchModel {
 	/// Drops every commit selection and the details, files and previews that
 	/// came from it, so a selection that left the list leaves nothing stale.
 	fn clear_commit_selection(&mut self) {
-		// Only a Log-derived read in flight is dropped: a Project or
-		// Changes preview still loading belongs to a file the user just
-		// picked, and bumping the generation would discard it (#202).
-		let log_read_pending =
-			self.preview_loading && self.preview_pending_from_log;
-		if log_read_pending {
+		// `preview_pending_from_log` names the owner of the latest read and
+		// only a file read resets it, so it is not tied to `preview_loading`:
+		// an error that cleared the loading flag must not leave the Log's
+		// read able to install (#202). A Project or Changes read still
+		// loading has set it false and keeps its generation.
+		if self.preview_pending_from_log {
 			self.preview_generation += 1;
+			self.preview_pending_from_log = false;
 			self.preview_loading = false;
 		}
 		self.details_generation = self.details_generation.wrapping_add(1);
@@ -2523,6 +2524,8 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
+		let hold = bg.clone();
+		let delay = self.e2e_log_read_delay;
 		self.spawn_owned(
 			cx,
 			crate::lifecycle::JobKind::CancellableRead,
@@ -2611,6 +2614,9 @@ impl WorkbenchModel {
 						))
 					})
 					.await;
+				if let Some(delay) = delay {
+					hold.timer(delay).await;
+				}
 				let _ = this.update(&mut async_app, |model, cx| {
 					if model.preview_generation != task_generation {
 						return;
