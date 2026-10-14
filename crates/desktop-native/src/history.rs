@@ -1511,6 +1511,25 @@ impl WorkbenchModel {
 		self.selected_commit_file = None;
 		self.commit_file_sel.clear();
 		self.preview_loading = false;
+		self.compare = None;
+		self.clear_commit_preview();
+	}
+
+	/// Releases the preview only when it came from the Log selection: a
+	/// commit diff or file, or a compare of a range or an endpoint diff.
+	/// Working-tree and paste previews stay (#202). A file opened from the
+	/// commit tree is a `CommitFile` too and counts as Log-derived.
+	fn clear_commit_preview(&mut self) {
+		let from_commit = matches!(
+			self.preview.as_ref().map(|p| &p.source),
+			Some(PreviewSource::CommitDiff { .. })
+				| Some(PreviewSource::CommitFile { .. })
+				| Some(PreviewSource::Compare { .. })
+		);
+		if from_commit {
+			self.clear_preview();
+			self.reader.release_retained();
+		}
 	}
 
 	fn report_graph_error(&mut self, error: GraphAdmissionError) {
@@ -3565,10 +3584,7 @@ impl WorkbenchModel {
 		app_log!("[APP:LOG_REPOS: n={}]", self.log_scope().len());
 		self.log_filter.paths.clear();
 		self.log_paths_expanded.clear();
-		self.selected_commit = None;
-		self.range_head = None;
-		self.log_selected.clear();
-		self.commit_details = None;
+		self.clear_commit_selection();
 		self.apply_log_filter(cx);
 	}
 
@@ -3901,9 +3917,7 @@ impl WorkbenchModel {
 				self.locate_merged_head(cx);
 			} else if let Some(anchor) = self.selected_commit.clone() {
 				if !self.reselect_after_load(&anchor, cx) {
-					self.selected_commit = None;
-					self.log_selected.clear();
-					self.commit_details = None;
+					self.clear_commit_selection();
 				}
 			}
 		}
