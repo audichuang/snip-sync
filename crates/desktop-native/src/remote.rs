@@ -11,7 +11,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use snip_core::browser::SourcePreview;
 use snip_core::workspace::{RepoIdentity, RepoKind, RepoSummary, ScanStatus};
-use snip_remote::{Client, RemoteError, RemoteHost, RemoteWorkspace};
+use snip_remote::{
+	Client, RemoteError, RemoteHost, RemoteWorkspace, StartReason,
+};
 
 use gpui::Context;
 
@@ -661,6 +663,31 @@ pub fn describe(err: RemoteError) -> String {
 	}
 }
 
+/// [`describe`] in the interface language: a known start failure gets its
+/// own wording, the transport's stderr appended as the detail.
+pub fn describe_loc(err: RemoteError, loc: crate::i18n::Locale) -> String {
+	let RemoteError::Start {
+		reason: Some(reason),
+		detail,
+		..
+	} = &err
+	else {
+		return describe(err);
+	};
+	let key = match reason {
+		StartReason::NoWorker => "remote_start_no_worker",
+		StartReason::KeyLogin => "remote_start_key_login",
+		StartReason::NoAnswer => "remote_start_no_answer",
+		StartReason::Closed => "remote_start_closed",
+	};
+	let text = crate::i18n::t(key, loc);
+	if detail.is_empty() {
+		text.to_string()
+	} else {
+		crate::i18n::tf("remote_start_detail", loc, &[text, detail])
+	}
+}
+
 // ───────────────────────── model ─────────────────────────
 
 impl WorkbenchModel {
@@ -780,6 +807,7 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let mut async_app = cx.to_async();
 		let token = cancel.clone();
+		let loc = self.locale;
 		#[cfg(test)]
 		let open_delay = self.e2e_remote_open_delay;
 		// Like an open, the listing's ssh belongs to this tab: a close or
@@ -813,7 +841,7 @@ impl WorkbenchModel {
 						})
 					})
 					.await
-					.map_err(describe);
+					.map_err(|e| describe_loc(e, loc));
 				let _ = this.update(&mut async_app, |this, cx| {
 					this.remote_listing_landed(seq, result, cx);
 				});
@@ -1037,7 +1065,7 @@ impl WorkbenchModel {
 						Err((client, err)) => {
 							this.return_browse_client(idx, client);
 							let retryable = err.is_restore_retryable();
-							let err = describe(err);
+							let err = describe_loc(err, this.locale);
 							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
 							// Also on the status bar: a reconnect on launch runs
 							// with the menu closed.
@@ -1562,6 +1590,48 @@ async fn hold_open(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::i18n::Locale;
+	use snip_remote::ConnectFailureKind;
+
+	fn start(reason: Option<StartReason>, detail: &str) -> RemoteError {
+		RemoteError::Start {
+			kind: ConnectFailureKind::Other,
+			reason,
+			detail: detail.into(),
+			message: "english text the CLI prints".into(),
+		}
+	}
+
+	/// A known start failure is worded in the interface language with the
+	/// transport's stderr as detail; an unknown one stays ssh's own words (#204).
+	#[test]
+	fn known_start_failures_are_worded_in_the_interface_language() {
+		let zh = |e| describe_loc(e, Locale::ZhTw);
+		let en = |e| describe_loc(e, Locale::En);
+		assert_eq!(
+			zh(start(Some(StartReason::NoWorker), "")),
+			"那台機器沒有安裝 snip，或版本太舊而不支援 ssh 連線；請在那台機器安裝或更新 snip-sync"
+		);
+		assert_eq!(
+			zh(start(Some(StartReason::KeyLogin), "u@h: Permission denied")),
+			"ssh 無法免密碼登入；請先設定金鑰登入（ssh-copy-id）：u@h: Permission denied"
+		);
+		assert_eq!(
+			zh(start(Some(StartReason::NoAnswer), "")),
+			"那台機器上的 worker 沒有及時回應；請檢查它的負載與連線後再試一次"
+		);
+		assert_eq!(
+			zh(start(Some(StartReason::Closed), "")),
+			"遠端在 snip 啟動前就關閉了連線"
+		);
+		assert_eq!(
+			en(start(Some(StartReason::NoWorker), "snip: not found")),
+			"snip is not installed on that machine, or is too old for ssh \
+			 connections; install or update snip-sync there: snip: not found"
+		);
+		assert_eq!(zh(start(None, "")), "english text the CLI prints");
+		assert_eq!(zh(RemoteError::Protocol("x".into())), "protocol: x");
+	}
 
 	/// Worker paths resolve by the worker's spelling, on any master OS.
 	#[test]

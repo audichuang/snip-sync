@@ -51,6 +51,20 @@ pub enum ConnectFailureKind {
 	Other,
 }
 
+/// The known causes of a worker that did not start, for callers that word
+/// them in their own language. The English `message` stays the CLI's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartReason {
+	/// snip is missing on that machine or too old for `serve --stdio`.
+	NoWorker,
+	/// ssh was refused and cannot ask for a password.
+	KeyLogin,
+	/// The worker never sent its hello in time.
+	NoAnswer,
+	/// The far end closed before snip started.
+	Closed,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
 	#[error(transparent)]
@@ -61,6 +75,10 @@ pub enum RemoteError {
 	#[error("{message}")]
 	Start {
 		kind: ConnectFailureKind,
+		/// The known cause, when the start failure is one of them.
+		reason: Option<StartReason>,
+		/// The transport's own stderr, unchanged; empty when it said nothing.
+		detail: String,
 		message: String,
 	},
 	/// The worker answered with an error.
