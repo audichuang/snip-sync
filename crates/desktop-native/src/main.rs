@@ -12118,6 +12118,32 @@ mod tests {
 			assert_no_snip_in_zh(&status);
 		}
 
+		/// Previewing a Changes-pane file's diff when the worker cannot
+		/// restart: the editor's error says why in the interface language
+		/// (#206). This reaches `PreviewErr::git`, which also words the
+		/// commit-file diff and a revision-tree file.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_diff_preview_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-0");
+			settle(cx);
+			click_probed(&model, cx, "change-repo-toggle:unstaged:alpha");
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "change-row@alpha:unstaged:long.txt");
+			settle_until(cx, "the preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.preview_error.as_ref().unwrap().render(m.locale)
+			});
+			assert!(err.contains("預覽"), "{err}");
+			assert_no_snip_in_zh(&err);
+		}
+
 		/// Opening a Project tree file when the worker cannot restart: the
 		/// editor's error says why in the interface language (#206).
 		#[cfg(unix)]

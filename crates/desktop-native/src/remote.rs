@@ -1628,6 +1628,30 @@ mod tests {
 		}
 	}
 
+	/// A Git view's lost worker is worded in the interface language; any
+	/// other git error keeps its own text (#206).
+	#[test]
+	fn git_errors_word_a_lost_worker_in_the_interface_language() {
+		use snip_core::gitsrc::GitError;
+		let lost = || GitError::HostStart {
+			reason: StartReason::NoWorker,
+			detail: String::new(),
+			message: "snip is not installed".into(),
+		};
+		assert_eq!(
+			git_error_loc(lost(), Locale::ZhTw),
+			start_text(StartReason::NoWorker, "", Locale::ZhTw)
+		);
+		assert_eq!(
+			git_error_loc(lost(), Locale::En),
+			start_text(StartReason::NoWorker, "", Locale::En)
+		);
+		assert_eq!(
+			git_error_loc(GitError::Host("boom".into()), Locale::ZhTw),
+			"boom"
+		);
+	}
+
 	/// A known start failure is worded in the interface language with the
 	/// transport's stderr as detail; an unknown one stays ssh's own words (#204).
 	#[test]
