@@ -10523,6 +10523,15 @@ mod tests {
 				(note_in(cx, Locale::ZhTw), note_in(cx, Locale::En));
 			assert_ne!(zh_s, en_s);
 			assert_ne!(zh_n, en_n);
+			// The nested reason follows too, not just the wrapper.
+			let reason = crate::remote::start_msg(
+				snip_remote::StartReason::NoWorker,
+				"",
+			);
+			let (zh_r, en_r) =
+				(reason.render(Locale::ZhTw), reason.render(Locale::En));
+			assert!(zh_s.contains(&zh_r) && !zh_s.contains(&en_r), "{zh_s}");
+			assert!(en_s.contains(&en_r) && !en_s.contains(&zh_r), "{en_s}");
 
 			// The status bar, Chinese up, then English with no mouse move.
 			hover(cx, "status-text");
