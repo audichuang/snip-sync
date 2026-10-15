@@ -758,6 +758,19 @@ pub fn git_error_msg(err: snip_core::gitsrc::GitError) -> Msg {
 		snip_core::gitsrc::GitError::HostStart { reason, detail, .. } => {
 			start_msg(reason, &detail)
 		}
+		// A worker refusal keeps its code, so it is worded like
+		// `describe_msg` words it; the worker's own text is not shown.
+		snip_core::gitsrc::GitError::HostRefused { code, message } => {
+			match serde_json::from_value::<snip_remote::ErrorCode>(
+				serde_json::Value::String(code),
+			)
+			.ok()
+			.and_then(refusal_key)
+			{
+				Some(key) => Msg::new(key, []),
+				None => Msg::raw(message),
+			}
+		}
 		other => Msg::raw(other.to_string()),
 	}
 }
@@ -1714,6 +1727,89 @@ mod tests {
 		let boom = git_error_msg(GitError::Host("boom".into()));
 		assert_eq!(boom.render(Locale::ZhTw), "boom");
 		assert_eq!(boom.render(Locale::En), "boom");
+	}
+
+	/// Every worker refusal that reaches a Git view keeps its code: the ones
+	/// with a wording are worded in zh-TW, the rest keep the worker's text
+	/// (#213).
+	#[test]
+	fn git_view_refusals_are_worded_for_every_error_code() {
+		use snip_remote::ErrorCode as C;
+		let all = [
+			C::Forbidden,
+			C::NotFound,
+			C::Unsupported,
+			C::BadRequest,
+			C::TooLarge,
+			C::Io,
+			C::VersionMismatch,
+			C::NotARepository,
+			C::InvalidRevision,
+			C::Timeout,
+			C::Busy,
+			C::Cancelled,
+			C::OutsideShare,
+			C::Stale,
+			C::Collision,
+		];
+		// Exhaustive: a new code fails to compile here until it is listed.
+		for code in all {
+			match code {
+				C::Forbidden
+				| C::NotFound
+				| C::Unsupported
+				| C::BadRequest
+				| C::TooLarge
+				| C::Io
+				| C::VersionMismatch
+				| C::NotARepository
+				| C::InvalidRevision
+				| C::Timeout
+				| C::Busy
+				| C::Cancelled
+				| C::OutsideShare
+				| C::Stale
+				| C::Collision => {}
+			}
+		}
+		// Codes that GitError gives a variant of their own are not this
+		// path; every other code must carry through.
+		let own_variant =
+			[C::TooLarge, C::InvalidRevision, C::Timeout, C::Cancelled];
+		let mut checked = 0;
+		for code in all {
+			if own_variant.contains(&code) {
+				continue;
+			}
+			let err = snip_core::gitsrc::GitError::from(RemoteError::Refused {
+				code,
+				message: "worker English".into(),
+			});
+			assert!(
+				matches!(err, snip_core::gitsrc::GitError::HostRefused { .. }),
+				"{code:?}: {err:?}"
+			);
+			let msg = git_error_msg(err);
+			match refusal_key(code) {
+				Some(key) => {
+					assert_eq!(msg.key, key, "{code:?}");
+					assert_eq!(
+						msg.render(Locale::ZhTw),
+						crate::i18n::t(key, Locale::ZhTw)
+					);
+					assert_ne!(
+						msg.render(Locale::ZhTw),
+						msg.render(Locale::En),
+						"{code:?} has a zh-TW wording"
+					);
+				}
+				None => {
+					assert_eq!(msg.render(Locale::ZhTw), "worker English")
+				}
+			}
+			checked += 1;
+		}
+		assert_eq!(checked, all.len() - own_variant.len());
 	}
 
 	/// A known failure (start reason or refusal) is worded in the interface

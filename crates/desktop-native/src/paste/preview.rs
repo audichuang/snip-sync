@@ -351,6 +351,7 @@ impl PastePreview {
 			.iter()
 			.map(|c| c.candidates.len())
 			.collect();
+		let seen = plan.seen_roots;
 		if !plan.add_candidates(known_roots) {
 			return Ok(false);
 		}
@@ -360,6 +361,8 @@ impl PastePreview {
 			for (choice, n) in plan.prefix_choices.iter_mut().zip(before) {
 				choice.candidates.truncate(n);
 			}
+			// The set was not admitted, so it is still news next time.
+			plan.seen_roots = seen;
 			return Err(err);
 		}
 		Ok(true)
@@ -951,6 +954,33 @@ mod tests {
 
 		let res2 = s.toggle_fold(0, Some(&o));
 		assert!(matches!(res2, Folded::Kept));
+	}
+
+	/// A refused landing of new repos rolls the candidates back, so the same
+	/// repo set must be tried again once there is room (#215).
+	#[test]
+	fn refused_candidates_are_retried_with_the_same_repo_set() {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		let repo = ws.join("repo01");
+		std::fs::create_dir_all(&repo).unwrap();
+		let mut o = small_ordinary();
+		let mut s = landed("// FILE: repo01/a.txt\nbody\n", &ws, Some(&o));
+		assert!(!s.plan().unwrap().prefix_choices.is_empty());
+		let count = |s: &PastePreview| {
+			s.plan().unwrap().prefix_choices[0].candidates.len()
+		};
+		let before = count(&s);
+		fill_budget(&s, &mut o);
+		let roots = [ws.clone(), repo.clone()];
+		let err = s.refresh_candidates(&roots, Some(&o)).unwrap_err();
+		assert_eq!(err.key, "preview_memory_limit");
+		assert_eq!(count(&s), before, "the refused candidates are gone");
+		// Room again: the same set is still news and is admitted.
+		let small = small_ordinary();
+		s.admit_ordinary(Some(&small)).unwrap();
+		assert!(s.refresh_candidates(&roots, Some(&small)).unwrap());
+		assert!(count(&s) > before);
 	}
 
 	#[test]

@@ -2956,6 +2956,13 @@ impl From<RemoteError> for GitError {
 				detail,
 				message,
 			},
+			RemoteError::Refused { code, message } => GitError::HostRefused {
+				code: serde_json::to_value(code)
+					.ok()
+					.and_then(|v| v.as_str().map(str::to_owned))
+					.unwrap_or_default(),
+				message,
+			},
 			other => GitError::Host(other.to_string()),
 		}
 	}
@@ -4098,7 +4105,11 @@ mod tests {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
 		};
-		assert!(matches!(GitError::from(err8), GitError::Host(_)));
+		assert!(matches!(
+			GitError::from(err8),
+			GitError::HostRefused { ref code, ref message }
+				if code == "not_found" && message == "missing"
+		));
 
 		// A worker that did not start keeps its known cause for the GUI, and
 		// the CLI's English text unchanged (#206).
