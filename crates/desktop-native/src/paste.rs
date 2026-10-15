@@ -263,6 +263,30 @@ impl PastePending {
 		Ok(())
 	}
 
+	/// How many more UI bytes `admit_ui` would accept for this state before
+	/// refusing it. Zero when it is already at or over the cap.
+	pub fn ui_headroom(
+		&self,
+		ordinary: Option<&Preview>,
+		plan: &PastePreviewPlan,
+		detail: Option<&Preview>,
+	) -> usize {
+		let bytes = preview_state_bytes(ordinary, Some(plan), detail);
+		let allowance = if plan.executable() {
+			plan.apply_clone_bytes()
+		} else {
+			0
+		};
+		let raw = Arc::downgrade(&plan.raw_payload);
+		let commit = plan.commit_preview.as_ref().map(Arc::downgrade);
+		MAX_RETAINED_PREVIEW_BYTES.saturating_sub(self.total_with_ui(
+			bytes,
+			allowance,
+			Some(&raw),
+			commit.as_ref(),
+		))
+	}
+
 	pub fn invalidate(&mut self, seq: u64) {
 		self.seq = seq;
 		self.latest = None;
@@ -1342,29 +1366,132 @@ impl PastePreviewPlan {
 	/// plan last saw. A preview opened before the scan keeps the workspace
 	/// root as its primary destination (accepted): only candidates grow.
 	pub fn add_candidates(&mut self, known_roots: &[PathBuf]) -> bool {
+		match self.new_roots(known_roots) {
+			Some(found) => self.extend_candidates(&found).is_some(),
+			None => false,
+		}
+	}
+
+	/// The repo roots this plan has not seen, canonical (or as the worker
+	/// reported them, remotely). `None`, with no file system touched, when
+	/// there is no mapping to extend or the set is the one last seen. The
+	/// digest moves on.
+	pub(crate) fn new_roots(
+		&mut self,
+		known_roots: &[PathBuf],
+	) -> Option<Vec<PathBuf>> {
 		if self.prefix_choices.is_empty() {
-			return false;
+			return None;
 		}
 		let digest = roots_digest(known_roots);
 		if digest == self.seen_roots {
-			return false;
+			return None;
 		}
 		self.seen_roots = digest;
-		let found = if self.remote.is_some() {
+		Some(if self.remote.is_some() {
 			known_roots.to_vec()
 		} else {
 			canonical_dirs(known_roots)
-		};
-		let mut added = false;
-		for choice in &mut self.prefix_choices {
-			for root in &found {
-				if !choice.candidates.contains(root) {
-					choice.candidates.push(root.clone());
-					added = true;
+		})
+	}
+
+	/// What [`Self::extend_candidates`] would add to the retained bytes of
+	/// the plan, counted the way [`Self::retained_bytes`] counts, without
+	/// allocating a path. Stops counting once it passes `limit`, so the work
+	/// is bounded by what the budget admits, not by prefixes x roots.
+	pub(crate) fn candidate_growth_bytes(
+		&self,
+		found: &[PathBuf],
+		limit: usize,
+	) -> usize {
+		let mut total = 0usize;
+		for choice in &self.prefix_choices {
+			let have: std::collections::HashSet<&PathBuf> =
+				choice.candidates.iter().collect();
+			let mut seen: std::collections::HashSet<&PathBuf> =
+				std::collections::HashSet::new();
+			let mut added = 0usize;
+			let mut path_bytes = 0usize;
+			for root in found {
+				if !have.contains(root) && seen.insert(root) {
+					added += 1;
+					path_bytes =
+						path_bytes.saturating_add(root.as_os_str().len());
+					// Cheap early exit on a runaway choice.
+					if path_bytes > limit {
+						return usize::MAX;
+					}
 				}
 			}
+			if added == 0 {
+				continue;
+			}
+			let slots =
+				(choice.candidates.len() + added) * size_of::<PathBuf>();
+			let grown = slots
+				.saturating_sub(
+					choice.candidates.capacity() * size_of::<PathBuf>(),
+				)
+				.saturating_add(path_bytes);
+			total = total.saturating_add(grown);
+			if total > limit {
+				return usize::MAX;
+			}
 		}
-		added
+		// An executable plan is charged again in its apply clone.
+		if self.executable() {
+			total = total.saturating_mul(2);
+		}
+		total
+	}
+
+	/// Adds `found` to every choice's candidates, on exact-size copies.
+	/// Returns each grown choice's previous allocation (`None` for one left
+	/// as is), in order, so a refused admission can put exactly that back; `None` when nothing was added
+	/// (and nothing was copied).
+	pub(crate) fn extend_candidates(
+		&mut self,
+		found: &[PathBuf],
+	) -> Option<Vec<Option<Vec<PathBuf>>>> {
+		let mut grown: Vec<Option<Vec<PathBuf>>> =
+			Vec::with_capacity(self.prefix_choices.len());
+		let mut any = false;
+		for choice in &self.prefix_choices {
+			let have: std::collections::HashSet<&PathBuf> =
+				choice.candidates.iter().collect();
+			let mut fresh: Vec<&PathBuf> = Vec::new();
+			let mut seen: std::collections::HashSet<&PathBuf> =
+				std::collections::HashSet::new();
+			for root in found {
+				if !have.contains(root) && seen.insert(root) {
+					fresh.push(root);
+				}
+			}
+			if fresh.is_empty() {
+				grown.push(None);
+				continue;
+			}
+			any = true;
+			let mut next =
+				Vec::with_capacity(choice.candidates.len() + fresh.len());
+			next.extend(choice.candidates.iter().cloned());
+			next.extend(fresh.into_iter().cloned());
+			grown.push(Some(next));
+		}
+		if !any {
+			return None;
+		}
+		Some(
+			self.prefix_choices
+				.iter_mut()
+				.zip(grown)
+				.map(|(choice, next)| {
+					next.map(|next| {
+						std::mem::replace(&mut choice.candidates, next)
+					})
+				})
+				.collect(),
+		)
 	}
 
 	pub fn mapping_ready(&self) -> bool {
