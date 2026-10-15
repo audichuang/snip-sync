@@ -2512,6 +2512,18 @@ mod row_width_tests {
 	}
 
 	#[test]
+	fn a_1080_list_gives_a_usual_ref_group_the_room_the_old_split_denied() {
+		// 574 is the list a 1080 window leaves. `main, origin/main` and
+		// `v0.3.0`, each with its icon allowance, come to about 190: the
+		// old split left 183 (gutter 40) or 165 (gutter 72).
+		for gutter in [40., MIN_GUTTER_W] {
+			let c = cols(574., gutter, true, false);
+			let w = row_widths(574., c, 190., 75., false);
+			assert_eq!(w.labels, 190., "{gutter}: {c:?} {w:?}");
+		}
+	}
+
+	#[test]
 	fn the_subject_gives_way_to_whole_labels_down_to_its_floor() {
 		let c = cols(574., WIDE_GUTTER, true, false);
 		let w = row_widths(574., c, 108., 400., false);
