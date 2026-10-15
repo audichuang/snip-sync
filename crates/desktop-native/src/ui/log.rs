@@ -547,6 +547,10 @@ const MIN_LABELS_W: f32 = 80.;
 /// The narrowest a ref label is squeezed to: its icon and a few characters.
 /// Below it the label would show only its icon, which says nothing (#195).
 const LABEL_FLOOR_W: f32 = 14. + 3. + 30.;
+/// The width the date and author cells make room for beside a short subject
+/// (down to [`MIN_SUBJECT_BESIDE_LABELS`]): a common ref group such as
+/// `main, origin/main` plus a short tag, so they stay readable (#216).
+const LABELS_TARGET_W: f32 = 180.;
 /// The narrowest the graph gutter is clipped to.
 const MIN_GUTTER_W: f32 = 72.;
 
@@ -618,6 +622,16 @@ pub(super) fn list_cols(
 		let give = (DATE_W - MIN_DATE_W) + (AUTHOR_W - MIN_AUTHOR_W);
 		if deficit <= give {
 			lack = lack.max(deficit);
+		}
+		// Date and author also give way, as far as they can, so a usual
+		// ref group fits beside a short subject instead of being cut. Where
+		// even that would leave the labels under MIN_LABELS_W they are
+		// dropped anyway, so nothing is squeezed for them.
+		let have = base - gutter - AUTHOR_W - DATE_W;
+		let give = (DATE_W - MIN_DATE_W) + (AUTHOR_W - MIN_AUTHOR_W);
+		let want = MIN_SUBJECT_BESIDE_LABELS + 6. + LABELS_TARGET_W;
+		if have + give >= MIN_SUBJECT_BESIDE_LABELS + 6. + MIN_LABELS_W {
+			lack = lack.max((want - have).clamp(0., give));
 		}
 	}
 	let date = DATE_W - lack.min(DATE_W - MIN_DATE_W);
@@ -2484,6 +2498,17 @@ mod row_width_tests {
 		let c = cols(574., 40., true, false);
 		let w = row_widths(574., c, 200., 30., false);
 		assert_eq!(w.labels, 200.);
+	}
+
+	#[test]
+	fn date_and_author_give_way_so_a_short_tag_is_not_cut() {
+		// #216: main, origin/main and a tag beside "empty replay" at 1080.
+		let labels_w = 111. + 8. + 50.;
+		for list_w in [500., 540., 574.] {
+			let c = cols(list_w, 40., true, false);
+			let w = row_widths(list_w, c, labels_w, 75., false);
+			assert_eq!(w.labels, labels_w, "{list_w}: {c:?} {w:?}");
+		}
 	}
 
 	#[test]
