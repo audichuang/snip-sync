@@ -396,7 +396,8 @@ impl WorkbenchModel {
 						.bg(rgb(pal().error_bg))
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().error))
-						.child(
+						.child(super::drawn(
+							"log-error",
 							Msg::with_msg_arg(
 								"error_history",
 								[String::new()],
@@ -404,7 +405,7 @@ impl WorkbenchModel {
 								err.clone(),
 							)
 							.render(loc),
-						)
+						))
 						.children(probe(log, "log-error")),
 				)
 			})

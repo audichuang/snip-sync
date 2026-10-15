@@ -46,20 +46,37 @@ pub const MAX_RETAINED_GRAPH_BYTES: usize = 16 * 1024 * 1024;
 // are length-checked and copied into compact strings. TextInput separately
 // retains the typed query as Arc<str> (no spare capacity), bounded by its
 // existing Unicode-character limit; its placeholder is a static translation.
-// Both history_error and the status Msg retain the bounded error. Two Msg
-// argument slots also cover the success status's count/page strings.
+// history_error (an Option<Msg>) and the status Msg both retain the bounded
+// error: the status wraps a nested copy of it (`error_history`, one empty
+// argument, the error as `inner`). A clipped error holds at most
+// MAX_ERROR_MSG_ARGS arguments of MAX_STORED_ERROR_BYTES each, plus one nested
+// message of the same bound; the success status's count/page strings fit the
+// same slots.
 // Framework glyph/layout caches, allocator overhead and temporary candidate
 // copies are outside this application-data accounting. The ref selector
 // borrows this model; its visible GPUI elements belong to the renderer scope.
+const MAX_ERROR_MSG_ARGS: usize = 4;
+/// Heap of one clipped error message: its argument Vec and strings, and one
+/// nested message (its box and its own arguments).
+const CLIPPED_MSG_HEAP: usize = 2
+	* MAX_ERROR_MSG_ARGS
+	* (std::mem::size_of::<String>() + MAX_STORED_ERROR_BYTES)
+	+ std::mem::size_of::<(usize, Msg)>();
+/// Everything the error and the status line retain beyond the model's own
+/// inline fields (`Option<Msg>` and `Msg` are inline there, but a retained
+/// graph counts them with the metadata).
+const ERROR_RETAINED_RESERVE: usize = std::mem::size_of::<Option<Msg>>()
+	+ CLIPPED_MSG_HEAP // history_error
+	+ std::mem::size_of::<Msg>() // status
+	+ std::mem::size_of::<String>() // status's own empty argument
+	+ std::mem::size_of::<(usize, Msg)>() // the box holding the nested copy
+	+ CLIPPED_MSG_HEAP; // the nested copy
 const GRAPH_METADATA_RESERVE: usize = 4
 	* (MAX_SHA_LEN + std::mem::size_of::<Option<String>>())
 	+ 4 * crate::text_input::TextInput::MAX_TOTAL_CHARS
 	+ std::mem::size_of::<crate::text_input::TextInput>()
 	+ 2 * std::mem::size_of::<usize>() // Arc<str> reference counts
-	+ 2 * MAX_STORED_ERROR_BYTES
-	+ std::mem::size_of::<Option<String>>()
-	+ std::mem::size_of::<Msg>()
-	+ 2 * std::mem::size_of::<String>();
+	+ ERROR_RETAINED_RESERVE;
 
 pub use browser::LogQuery;
 
@@ -4014,6 +4031,31 @@ impl WorkbenchModel {
 
 #[cfg(test)]
 mod tests {
+	/// The reserve covers the worst clipped error and the status wrapping it.
+	#[test]
+	fn the_metadata_reserve_covers_a_clipped_error_and_its_status() {
+		let long = "x".repeat(10 * MAX_STORED_ERROR_BYTES);
+		let args = || vec![long.clone(); MAX_ERROR_MSG_ARGS];
+		let mut error = Msg::with_msg_arg(
+			"error_history",
+			args(),
+			0,
+			Msg::new("error_history", args()),
+		);
+		error = clip_msg(error);
+		let status = Msg::with_msg_arg(
+			"error_history",
+			[String::new()],
+			0,
+			error.clone(),
+		);
+		let held = std::mem::size_of::<Option<Msg>>()
+			+ error.heap_bytes()
+			+ std::mem::size_of::<Msg>()
+			+ status.heap_bytes();
+		assert!(held <= ERROR_RETAINED_RESERVE, "{held}");
+	}
+
 	use super::*;
 	use snip_core::gitsrc::Git;
 	use std::process::Command;

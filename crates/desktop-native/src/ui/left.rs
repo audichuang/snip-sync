@@ -770,10 +770,14 @@ impl WorkbenchModel {
 						cx,
 					);
 				}))
-				.child(clip_text(match &row.msg {
-					Some(msg) => msg.render(self.locale),
-					None => row.name,
-				}))
+				.child(clip_text(super::drawn(
+					if row.is_error {
+						"tree-error"
+					} else {
+						"tree-marker"
+					},
+					row.label(self.locale),
+				)))
 				.children(probe(log, marker_id))
 				.into_any_element();
 		}

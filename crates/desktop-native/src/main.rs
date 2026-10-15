@@ -7579,6 +7579,87 @@ mod tests {
 			});
 		}
 
+		/// A restored remote tab whose host has no snip: the status line, the
+		/// menu's note, the restore's reason and the tab's hover all word the
+		/// reason when read, so a switch to English rewords every one (#206
+		/// #208). The reason used to be fixed when the open failed.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn restoring_a_host_without_snip_follows_a_language_switch(
+			cx: &mut TestAppContext,
+		) {
+			use crate::remote::RecentRemote;
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let id = dunce::canonicalize(tmp.path())
+				.unwrap()
+				.display()
+				.to_string();
+			let (_, model, cx) = remote_menu_hosts(cx, &["bare-host"]);
+			model.update(cx, |m, cx| {
+				m.remote.hosts = vec![snip_remote::RemoteHost {
+					name: "bare-host".into(),
+					transport: snip_remote::Transport::Command(vec![
+						"sh".into(),
+						"-c".into(),
+						"echo 'sh: snip: not found' >&2; exit 127".into(),
+					]),
+				}];
+				m.restore_remote(
+					RecentRemote {
+						host: "bare-host".into(),
+						path: id,
+					},
+					cx,
+				);
+			});
+			settle_until(cx, "the restore to fail", |cx| {
+				model.read_with(cx, |m, _| {
+					m.remote
+						.restoring
+						.as_ref()
+						.is_some_and(|r| r.failed.is_some())
+				})
+			});
+			let zh = "那台機器沒有安裝 snip";
+			let en = "is not installed";
+			// Every surface, worded now in the current language.
+			let read = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					let note =
+						m.remote.message.as_ref().expect("a note").1.clone();
+					let failed = m
+						.remote
+						.restoring
+						.as_ref()
+						.and_then(|r| r.failed.clone())
+						.expect("a reason");
+					let hover =
+						crate::tabs::tab_hover("tab", &m.tab_info(), m.locale);
+					[
+						m.status.render(m.locale),
+						note.render(m.locale),
+						failed.render(m.locale),
+						hover,
+					]
+				})
+			};
+			assert_eq!(status_key(&model, cx), "remote_open_failed");
+			for text in read(cx) {
+				assert!(text.contains(zh), "{text}");
+				assert!(!text.contains(en), "{text}");
+			}
+			cx.simulate_keystrokes("alt-l");
+			assert_eq!(locale_now(&model, cx), crate::i18n::Locale::En);
+			for text in read(cx) {
+				assert!(text.contains(en), "{text}");
+				assert!(!text.contains(zh), "{text}");
+			}
+			// What the status bar drew follows too.
+			let drawn = crate::ui::last_drawn("status-text").unwrap();
+			assert!(drawn.contains(en), "{drawn}");
+		}
+
 		/// One browse connection per menu: it is handed to the open of the
 		/// folder shown, and it ends with the menu (#187).
 		#[gpui::test]
@@ -12090,6 +12171,14 @@ mod tests {
 			settle(cx);
 		}
 
+		#[cfg(unix)]
+		fn status_key(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> &'static str {
+			model.read_with(cx, |m, _| m.status.key)
+		}
+
 		/// The status line in the interface language.
 		#[cfg(unix)]
 		fn status_text(
@@ -12346,7 +12435,7 @@ mod tests {
 					.into_iter()
 					.find(|r| r.is_error)
 					.unwrap()
-					.name
+					.label(m.locale)
 			});
 			assert_no_snip_in_zh(&err);
 		}
@@ -12646,21 +12735,19 @@ mod tests {
 			settle_until(cx, "the log error", |cx| {
 				model.read_with(cx, |m, _| m.history_error.is_some())
 			});
-			let banner = |cx: &mut VisualTestContext| {
-				model.read_with(cx, |m, _| {
-					crate::i18n::Msg::with_msg_arg(
-						"error_history",
-						[String::new()],
-						0,
-						m.history_error.clone().unwrap(),
-					)
-					.render(m.locale)
-				})
+			// What the banner and the status bar drew, not a re-rendering
+			// of the model's fields.
+			let banner = |_: &mut VisualTestContext| {
+				crate::ui::last_drawn("log-error").expect("the banner drew")
+			};
+			let bar = |_: &mut VisualTestContext| {
+				crate::ui::last_drawn("status-text").expect("the bar drew")
 			};
 			assert_no_snip_in_zh(&banner(cx));
+			assert_no_snip_in_zh(&bar(cx));
 			to_english(&model, cx);
 			assert_snip_in_en(&banner(cx));
-			assert_snip_in_en(&status_text(&model, cx));
+			assert_snip_in_en(&bar(cx));
 		}
 
 		/// The row a failed Project tree listing leaves follows a switch of
@@ -12684,17 +12771,9 @@ mod tests {
 			});
 			lose_the_worker(&model, cx);
 			click_probed(&model, cx, "ws-tree-row:notes/sub");
-			let row = |cx: &mut VisualTestContext| {
-				model.read_with(cx, |m, _| {
-					m.ws_tree.as_ref().and_then(|t| {
-						t.flatten_visible(300)
-							.into_iter()
-							.find(|r| r.is_error)
-							.and_then(|r| r.msg)
-							.map(|msg| msg.render(m.locale))
-					})
-				})
-			};
+			// The text the tree row drew, not the row's own fields.
+			let row =
+				|_: &mut VisualTestContext| crate::ui::last_drawn("tree-error");
 			settle_until(cx, "the listing error", |cx| row(cx).is_some());
 			assert_no_snip_in_zh(&row(cx).unwrap());
 			to_english(&model, cx);

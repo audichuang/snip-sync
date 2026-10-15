@@ -133,18 +133,10 @@ impl PasteOutcome {
 	fn bytes(&self) -> usize {
 		match &self.result {
 			Ok(plan) => plan.retained_bytes(),
-			Err(err) => msg_heap_bytes(err),
+			Err(err) => err.heap_bytes(),
 		}
 		.saturating_add(self.remap.as_ref().map_or(0, |(p, _)| p.capacity()))
 	}
-}
-
-fn msg_heap_bytes(msg: &Msg) -> usize {
-	msg.args
-		.iter()
-		.fold(msg.args.capacity() * size_of::<String>(), |n, s| {
-			n.saturating_add(s.capacity())
-		})
 }
 
 /// One paste-specific mailbox, not a general job/resource manager. The UI's
@@ -1300,7 +1292,7 @@ impl PastePreviewPlan {
 				.saturating_add(item.dest_root_name.capacity())
 				.saturating_add(item.dest_path.capacity());
 		}
-		bytes.saturating_add(self.error.as_ref().map_or(0, msg_heap_bytes))
+		bytes.saturating_add(self.error.as_ref().map_or(0, Msg::heap_bytes))
 	}
 
 	/// A complete mapping shell alone does not authorize any write.

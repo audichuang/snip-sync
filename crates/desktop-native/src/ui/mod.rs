@@ -30,6 +30,33 @@ use crate::paste::{
 use crate::reader::{DiffMode, PreviewSource};
 use crate::selector::Pick;
 use crate::theme::*;
+/// Text a surface is about to draw. Release builds hand it back; a test
+/// build also remembers it per surface, so a test reads what was drawn
+/// instead of re-rendering the model's fields itself (#206 #208).
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn drawn(_surface: &'static str, text: String) -> String {
+	text
+}
+
+#[cfg(test)]
+thread_local! {
+	static DRAWN: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
+		std::cell::RefCell::default();
+}
+
+#[cfg(test)]
+pub(crate) fn drawn(surface: &'static str, text: String) -> String {
+	DRAWN.with(|d| d.borrow_mut().insert(surface, text.clone()));
+	text
+}
+
+/// What `surface` drew last, if it has drawn at all.
+#[cfg(test)]
+pub(crate) fn last_drawn(surface: &'static str) -> Option<String> {
+	DRAWN.with(|d| d.borrow().get(surface).cloned())
+}
+
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
 	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
@@ -990,7 +1017,7 @@ impl WorkbenchModel {
 				match placed.get(&row.rel_path).filter(|_| row.is_dir) {
 					Some(&idx) => {
 						shown.push(idx);
-						self.push_repo_rows(idx, row.depth, &mut body);
+						self.push_repo_rows(idx, row.depth as usize, &mut body);
 					}
 					None if ws => body.push(ProjRow::Ws(row)),
 					None => body.push(ProjRow::Work(row)),
@@ -1057,7 +1084,7 @@ impl WorkbenchModel {
 				out.extend(
 					t.flatten_visible(t.visible_limit()).into_iter().map(
 						|mut row| {
-							row.depth += depth;
+							row.depth = row.depth.saturating_add(depth as u32);
 							ProjRow::Work(row)
 						},
 					),
@@ -1184,7 +1211,7 @@ impl WorkbenchModel {
 				.into_iter()
 				.map(|r| match r {
 					ProjRow::Repo(i, _) => self.repos[i].name.clone(),
-					ProjRow::Work(w) | ProjRow::Ws(w) => w.name,
+					ProjRow::Work(w) | ProjRow::Ws(w) => w.label(self.locale),
 					ProjRow::Rev(r) => r.name,
 				})
 				.collect()

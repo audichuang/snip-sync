@@ -878,7 +878,8 @@ impl WorkbenchModel {
 			// The line clamps; a long status (per-file paste failures) shows
 			// in full on hover.
 			.child({
-				let status = self.status.render(loc);
+				let status =
+					super::drawn("status-text", self.status.render(loc));
 				fill_text(status.clone())
 					.id("status-text")
 					.tooltip(tip(status))

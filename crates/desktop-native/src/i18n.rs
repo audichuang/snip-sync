@@ -99,7 +99,8 @@ impl Msg {
 	pub fn heap_bytes(&self) -> usize {
 		self.args
 			.iter()
-			.map(|arg| std::mem::size_of::<String>() + arg.capacity())
+			// The String headers are in the args Vec's capacity below.
+			.map(|arg| arg.capacity())
 			.chain(self.inner.iter().map(|boxed| {
 				std::mem::size_of::<(usize, Msg)>() + boxed.1.heap_bytes()
 			}))

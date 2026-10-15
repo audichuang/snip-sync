@@ -41,7 +41,9 @@ pub struct FileTreeNode {
 	pub is_truncated: bool,
 	pub has_more: bool,
 	pub is_valid_utf8: bool,
-	pub read_error: Option<Msg>,
+	/// Boxed: an error is rare and `Msg` is large, and the node count
+	/// decides how many names the retained-tree budget admits.
+	pub read_error: Option<Box<Msg>>,
 	pub selected: bool,
 	pub children: Vec<FileTreeNode>,
 	pub depth: usize,
@@ -227,12 +229,25 @@ pub struct FlattenedTreeRow {
 	pub is_view_limit: bool,
 	pub is_error: bool,
 	/// The error an error row words when it is drawn, in the language then
-	/// in force; `name` holds it in the default language.
-	pub msg: Option<Msg>,
+	/// in force; `name` stays empty for such a row.
+	pub msg: Option<Box<Msg>>,
 	pub is_loading: bool,
 	pub is_valid_utf8: bool,
 	pub selected: bool,
-	pub depth: usize,
+	/// `u32`: with the boxed `msg` it keeps the row at its old size.
+	pub depth: u32,
+}
+
+impl FlattenedTreeRow {
+	/// The text a row shows or speed search matches, in `loc`: an error row
+	/// words its message now, any other row is its name. Nothing draws or
+	/// searches `name` of an error row, so a stale rendering cannot be read.
+	pub fn label(&self, loc: crate::i18n::Locale) -> String {
+		match &self.msg {
+			Some(msg) => msg.render(loc),
+			None => self.name.clone(),
+		}
+	}
 }
 
 pub const MAX_DIR_ENTRIES: usize = 100;
@@ -487,7 +502,8 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 		if item.utf8 == Some(false) {
 			node.is_valid_utf8 = false;
 			node.rel_path = String::new();
-			node.read_error = Some("non-UTF-8 filename: unselectable".into());
+			node.read_error =
+				Some(Box::new("non-UTF-8 filename: unselectable".into()));
 		}
 		let cost = node.retained_bytes();
 		if cost > MAX_RETAINED_WORKING_TREE_BYTES {
@@ -625,7 +641,7 @@ fn build_node(
 	let read_error = if is_utf8 {
 		None
 	} else {
-		Some(Msg::raw("non-UTF-8 filename: unselectable"))
+		Some(Box::new(Msg::raw("non-UTF-8 filename: unselectable")))
 	};
 	FileTreeNode {
 		name,
@@ -729,7 +745,9 @@ impl FileTreeNode {
 		total = total.saturating_add(self.full_path.capacity());
 		total = total.saturating_add(self.key.relative.capacity());
 		if let Some(err) = &self.read_error {
-			total = total.saturating_add(err.heap_bytes());
+			total = total
+				.saturating_add(std::mem::size_of::<Msg>())
+				.saturating_add(err.heap_bytes());
 		}
 		if let Some(scan) = &self.scan {
 			// The Option's inline cursor storage is already in Self.
@@ -840,7 +858,7 @@ impl FileTreeNode {
 			}
 			node.is_expanded = true;
 			node.is_loaded = true;
-			node.read_error = result.error.take();
+			node.read_error = result.error.take().map(Box::new);
 			// Truncation is sticky across a listing's LoadMore batches;
 			// a re-expand or retry cleared it in `begin_io`.
 			node.is_truncated |=
@@ -1014,7 +1032,7 @@ impl FileTreeNode {
 				if let Some(node) = self.find_mut(key) {
 					node.budget_blocked = true;
 					node.read_error =
-						Some(Msg::raw("無法繼續：目錄游標已不在"));
+						Some(Box::new(Msg::raw("無法繼續：目錄游標已不在")));
 				}
 			}
 			return TreeEffect::Idle;
@@ -1207,7 +1225,7 @@ impl FileTreeNode {
 			rows.push(self.loading_row());
 		}
 		if let Some(err) = &self.read_error {
-			rows.push(self.error_row(err.clone()));
+			rows.push(self.error_row((**err).clone()));
 		}
 		self.collect_window(rows);
 	}
@@ -1221,7 +1239,7 @@ impl FileTreeNode {
 			rows.push(self.loading_row());
 		}
 		if let Some(err) = &self.read_error {
-			rows.push(self.error_row(err.clone()));
+			rows.push(self.error_row((**err).clone()));
 		}
 		self.collect_window(rows);
 	}
@@ -1260,7 +1278,7 @@ impl FileTreeNode {
 			is_loading: false,
 			is_valid_utf8: self.is_valid_utf8,
 			selected: self.selected,
-			depth: self.depth,
+			depth: self.depth.min(u32::MAX as usize) as u32,
 		}
 	}
 
@@ -1272,11 +1290,12 @@ impl FileTreeNode {
 		}
 	}
 
-	fn marker_depth(&self) -> usize {
-		if self.depth == 0 {
+	fn marker_depth(&self) -> u32 {
+		let depth = self.depth.min(u32::MAX as usize - 1) as u32;
+		if depth == 0 {
 			0
 		} else {
-			self.depth + 1
+			depth + 1
 		}
 	}
 
@@ -1306,9 +1325,10 @@ impl FileTreeNode {
 	}
 
 	fn error_row(&self, err: Msg) -> FlattenedTreeRow {
-		let mut row = self
-			.marker(err.render(crate::i18n::Locale::ZhTw), MarkerKind::Error);
-		row.msg = Some(err);
+		// `name` stays empty: the error is worded when drawn or searched,
+		// in the language then in force, through `label`.
+		let mut row = self.marker(String::new(), MarkerKind::Error);
+		row.msg = Some(Box::new(err));
 		row
 	}
 
@@ -1341,6 +1361,15 @@ enum MarkerKind {
 
 #[cfg(test)]
 mod tests {
+	/// A boxed error keeps a node and a row no larger than when the error
+	/// was a `String`; the retained-tree budget admits as many names.
+	#[cfg(all(target_pointer_width = "64", not(windows)))]
+	#[test]
+	fn a_boxed_error_keeps_node_and_row_sizes() {
+		assert!(std::mem::size_of::<FileTreeNode>() <= 320);
+		assert!(std::mem::size_of::<FlattenedTreeRow>() <= 120);
+	}
+
 	use std::collections::HashSet;
 	/// A remote listing the byte budget cuts short keeps the dropped
 	/// entries in `held`, and LoadMore admits them through the ordinary

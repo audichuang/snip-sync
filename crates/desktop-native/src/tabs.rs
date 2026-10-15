@@ -1161,7 +1161,7 @@ impl TabsRoot {
 }
 
 /// A tab's tooltip: its full path, and what it is doing if not ready.
-fn tab_hover(label: &str, info: &TabInfo, loc: Locale) -> String {
+pub(crate) fn tab_hover(label: &str, info: &TabInfo, loc: Locale) -> String {
 	let hover = match info.conn {
 		Some(Conn::Connecting) | Some(Conn::Failed) => {
 			let what = match (&info.failed, info.conn) {
