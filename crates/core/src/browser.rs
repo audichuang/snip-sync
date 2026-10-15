@@ -893,7 +893,15 @@ fn finish_preview(
 	args.extend(revs.iter().cloned());
 	args.extend(["--".into(), format!(":(literal){path}")]);
 	let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
-	let diff = git.run_diff_with(&str_args, opts)?;
+	// The content already passed the limit before this point, so an
+	// overflow here is the diff's, not the file's (#214).
+	let diff = git.run_diff_with(&str_args, opts).map_err(|e| match e {
+		GitError::OutputLimit { limit, .. } => GitError::PatchLimit {
+			path: path.to_string(),
+			limit,
+		},
+		e => e,
+	})?;
 	let (mut patch, mut patch_truncated) = if diff.truncated {
 		(whole_hunks(diff.stdout), true)
 	} else {
@@ -906,8 +914,8 @@ fn finish_preview(
 		if let Some(content) = &content {
 			let (synth, cut) = new_file_patch(path, content, max);
 			if cut && opts.overflow == Overflow::Error {
-				return Err(GitError::OutputLimit {
-					args: format!("preview patch {path}"),
+				return Err(GitError::PatchLimit {
+					path: path.to_string(),
 					limit: max,
 				});
 			}
@@ -1229,22 +1237,23 @@ mod tests {
 		assert_hunks_consistent(&cut.patch);
 		assert_eq!(cut.content.as_deref(), Some(lines(8).as_str()));
 		// Content fits, the patch does not: the strict view refuses.
-		assert!(git_preview_with(&git, &source, "f.txt", &strict_preview())
-			.is_err());
+		assert!(matches!(
+			git_preview_with(&git, &source, "f.txt", &strict_preview()),
+			Err(GitError::PatchLimit { .. })
+		));
 
 		fs::write(root.join("f.txt"), "x".repeat(PREVIEW_LIMIT + 1)).unwrap();
 		let sha = commit(root, "huge");
 		let huge = GitSource::Commit(sha);
-		assert!(
-			git_preview_with(&git, &huge, "f.txt", &strict_preview()).is_err()
-		);
-		assert!(git_preview_with(
-			&git,
-			&huge,
-			"f.txt",
-			&RunOptions::preview(None)
-		)
-		.is_err());
+		// Over-limit content stays a file-too-large OutputLimit.
+		assert!(matches!(
+			git_preview_with(&git, &huge, "f.txt", &strict_preview()),
+			Err(GitError::OutputLimit { .. })
+		));
+		assert!(matches!(
+			git_preview_with(&git, &huge, "f.txt", &RunOptions::preview(None)),
+			Err(GitError::OutputLimit { .. })
+		));
 	}
 
 	#[test]
@@ -1282,13 +1291,16 @@ mod tests {
 		assert!(cut.patch.len() <= PREVIEW_LIMIT);
 		assert_hunks_consistent(&cut.patch);
 		// The only check of a synthesized patch cut under Overflow::Error.
-		assert!(git_preview_with(
-			&git,
-			&GitSource::Working,
-			"new.txt",
-			&strict_preview()
-		)
-		.is_err());
+		// It is the patch, not the file, that overflowed (#214).
+		assert!(matches!(
+			git_preview_with(
+				&git,
+				&GitSource::Working,
+				"new.txt",
+				&strict_preview()
+			),
+			Err(GitError::PatchLimit { ref path, .. }) if path == "new.txt"
+		));
 		assert!(git_preview_for(
 			&git,
 			&GitSource::Working,

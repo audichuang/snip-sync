@@ -32,6 +32,7 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Refusal {
 	Box::new(Response::Error {
 		code,
 		message: message.into(),
+		patch: false,
 	})
 }
 

@@ -1577,6 +1577,32 @@ impl Render for WorkbenchModel {
 					cx.notify();
 				}));
 		}
+		// One rule: while a popover is open, a bare Escape closes it first,
+		// whatever has the focus (a pane list, the reader, a text field, the
+		// find bar, the paste panel, a context menu). Each of those binds its
+		// own Escape action in a deeper key context, and actions run before
+		// any key-down listener, so only a keystroke interceptor, which runs
+		// ahead of both, can take the key for the root. It deliberately
+		// takes Escape ahead of an IME composition while a popover is open.
+		if self.escape_guard.is_none() {
+			let me = cx.weak_entity();
+			let win = window.window_handle().window_id();
+			self.escape_guard =
+				Some(cx.intercept_keystrokes(move |ev, window, cx| {
+					if ev.keystroke.key != "escape"
+						|| ev.keystroke.modifiers.modified()
+						|| window.window_handle().window_id() != win
+					{
+						return;
+					}
+					let closed = me
+						.update(cx, |this, cx| this.close_open_popovers(cx))
+						.unwrap_or(false);
+					if closed {
+						cx.stop_propagation();
+					}
+				}));
+		}
 		if window.focused(cx).is_none() {
 			window.focus(&self.focus_handle);
 		}
@@ -1849,7 +1875,9 @@ impl Render for WorkbenchModel {
 							.when(self.bottom_visible, |d| {
 								self.measure_log_chips(window);
 								d.child(self.splitter(Splitter::Bottom, cx))
-									.child(self.render_log(bottom_h, cx))
+									.child(
+										self.render_log(bottom_h, window, cx),
+									)
 							}),
 					),
 			)

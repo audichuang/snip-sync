@@ -1965,6 +1965,23 @@ impl WorkbenchModel {
 		self.pending_focus = Some(self.log_focus.clone());
 	}
 
+	/// Closes every workbench popover that is open: the workspace menu, the
+	/// log dropdown and the Repo/Ref selector. True when something was open.
+	/// Only a closed log dropdown hands the focus to the log list.
+	pub fn close_open_popovers(&mut self, cx: &mut Context<Self>) -> bool {
+		let open = self.workspace_menu
+			|| self.log_menu.is_some()
+			|| self.popover.is_some();
+		self.close_popover(cx);
+		if self.workspace_menu {
+			self.close_workspace_menu(cx);
+		}
+		if self.log_menu.is_some() {
+			self.dismiss_log_menu(cx);
+		}
+		open
+	}
+
 	pub fn close_log_menu(&mut self, cx: &mut Context<Self>) {
 		if let Some(menu) = self.log_menu.take() {
 			self.log_menu_dismissed = Some((menu, std::time::Instant::now()));

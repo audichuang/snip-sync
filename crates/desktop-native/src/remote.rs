@@ -663,10 +663,12 @@ pub fn describe(err: RemoteError) -> String {
 	}
 }
 
-/// [`describe`] as a message: a known start failure words itself when it
-/// is drawn, in the language then in force, so a result that outlives a
-/// switch of language never keeps the old one. Anything else keeps its own
-/// text.
+/// [`describe`] as a message: a known failure words itself when it is
+/// drawn, in the language then in force, so a result that outlives a
+/// switch of language never keeps the old one. Known failures are every
+/// start reason and every worker refusal code ([`refusal_key`]); only
+/// text that has no wording of its own stays raw. The worker's own
+/// message for a refusal is OS or protocol English and is never shown.
 pub fn describe_msg(err: RemoteError) -> Msg {
 	match err {
 		RemoteError::Start {
@@ -674,8 +676,51 @@ pub fn describe_msg(err: RemoteError) -> Msg {
 			detail,
 			..
 		} => start_msg(reason, &detail),
+		RemoteError::Refused { code, message } => match refusal_key(code) {
+			Some(key) => Msg::new(key, []),
+			None => Msg::raw(message),
+		},
 		other => Msg::raw(describe(other)),
 	}
+}
+
+/// [`describe_msg`] for a failure of the user's `path`: a worded refusal
+/// keeps the path as the detail, so the status line says which path failed.
+pub fn describe_msg_at(err: RemoteError, path: &str) -> Msg {
+	match err {
+		RemoteError::Refused { code, .. } if refusal_key(code).is_some() => {
+			let key = refusal_key(code).unwrap_or("err_raw");
+			Msg::with_key_arg(
+				"remote_start_detail",
+				[key.to_string(), path.to_string()],
+				0,
+			)
+		}
+		other => describe_msg(other),
+	}
+}
+
+/// The dictionary key of a worker refusal. The match is exhaustive: a new
+/// `ErrorCode` must be given a wording here, or `None` when its message is
+/// already the local paste's own wording (`Stale`, `Collision`).
+pub fn refusal_key(code: snip_remote::ErrorCode) -> Option<&'static str> {
+	use snip_remote::ErrorCode as C;
+	Some(match code {
+		C::Forbidden => "remote_refused_forbidden",
+		C::NotFound => "remote_not_found",
+		C::Unsupported => "remote_refused_unsupported",
+		C::BadRequest => "remote_refused_bad_request",
+		C::TooLarge => "remote_refused_too_large",
+		C::Io => "remote_refused_io",
+		C::VersionMismatch => "remote_refused_version",
+		C::NotARepository => "remote_refused_not_repo",
+		C::InvalidRevision => "remote_refused_bad_revision",
+		C::Timeout => "remote_refused_timeout",
+		C::Busy => "remote_refused_busy",
+		C::Cancelled => "remote_refused_cancelled",
+		C::OutsideShare => "remote_refused_outside_share",
+		C::Stale | C::Collision => return None,
+	})
 }
 
 /// The dictionary key of a known start failure's wording. A message that
@@ -712,6 +757,19 @@ pub fn git_error_msg(err: snip_core::gitsrc::GitError) -> Msg {
 	match err {
 		snip_core::gitsrc::GitError::HostStart { reason, detail, .. } => {
 			start_msg(reason, &detail)
+		}
+		// A worker refusal keeps its code, so it is worded like
+		// `describe_msg` words it; the worker's own text is not shown.
+		snip_core::gitsrc::GitError::HostRefused { code, message } => {
+			match serde_json::from_value::<snip_remote::ErrorCode>(
+				serde_json::Value::String(code),
+			)
+			.ok()
+			.and_then(refusal_key)
+			{
+				Some(key) => Msg::new(key, []),
+				None => Msg::raw(message),
+			}
 		}
 		other => Msg::raw(other.to_string()),
 	}
@@ -1050,6 +1108,7 @@ impl WorkbenchModel {
 				if let Some(delay) = open_delay {
 					hold_open(&mut async_app, delay, &token).await;
 				}
+				let shown_path = path.trim().to_string();
 				let result = bg
 					.spawn(async move {
 						let client = reuse.unwrap_or_else(|| {
@@ -1101,7 +1160,7 @@ impl WorkbenchModel {
 							let retryable = err.is_restore_retryable();
 							// The reason stays a message: worded when drawn, in
 							// the language then in force (#206 #208).
-							let err = describe_msg(err);
+							let err = describe_msg_at(err, &shown_path);
 							app_log!(
 								"[APP:REMOTE_OPEN_FAILED: {}]",
 								err.render(crate::i18n::Locale::En)
@@ -1670,10 +1729,94 @@ mod tests {
 		assert_eq!(boom.render(Locale::En), "boom");
 	}
 
-	/// A known start failure is worded in the interface language with the
-	/// transport's stderr as detail; an unknown one stays ssh's own words (#204).
+	/// Every worker refusal that reaches a Git view keeps its code: the ones
+	/// with a wording are worded in zh-TW, the rest keep the worker's text
+	/// (#213).
 	#[test]
-	fn known_start_failures_are_worded_in_the_interface_language() {
+	fn git_view_refusals_are_worded_for_every_error_code() {
+		use snip_remote::ErrorCode as C;
+		let all = [
+			C::Forbidden,
+			C::NotFound,
+			C::Unsupported,
+			C::BadRequest,
+			C::TooLarge,
+			C::Io,
+			C::VersionMismatch,
+			C::NotARepository,
+			C::InvalidRevision,
+			C::Timeout,
+			C::Busy,
+			C::Cancelled,
+			C::OutsideShare,
+			C::Stale,
+			C::Collision,
+		];
+		// Exhaustive: a new code fails to compile here until it is listed.
+		for code in all {
+			match code {
+				C::Forbidden
+				| C::NotFound
+				| C::Unsupported
+				| C::BadRequest
+				| C::TooLarge
+				| C::Io
+				| C::VersionMismatch
+				| C::NotARepository
+				| C::InvalidRevision
+				| C::Timeout
+				| C::Busy
+				| C::Cancelled
+				| C::OutsideShare
+				| C::Stale
+				| C::Collision => {}
+			}
+		}
+		// Codes that GitError gives a variant of their own are not this
+		// path; every other code must carry through.
+		let own_variant =
+			[C::TooLarge, C::InvalidRevision, C::Timeout, C::Cancelled];
+		let mut checked = 0;
+		for code in all {
+			if own_variant.contains(&code) {
+				continue;
+			}
+			let err = snip_core::gitsrc::GitError::from(RemoteError::Refused {
+				code,
+				message: "worker English".into(),
+			});
+			assert!(
+				matches!(err, snip_core::gitsrc::GitError::HostRefused { .. }),
+				"{code:?}: {err:?}"
+			);
+			let msg = git_error_msg(err);
+			match refusal_key(code) {
+				Some(key) => {
+					assert_eq!(msg.key, key, "{code:?}");
+					assert_eq!(
+						msg.render(Locale::ZhTw),
+						crate::i18n::t(key, Locale::ZhTw)
+					);
+					assert_ne!(
+						msg.render(Locale::ZhTw),
+						msg.render(Locale::En),
+						"{code:?} has a zh-TW wording"
+					);
+				}
+				None => {
+					assert_eq!(msg.render(Locale::ZhTw), "worker English")
+				}
+			}
+			checked += 1;
+		}
+		assert_eq!(checked, all.len() - own_variant.len());
+	}
+
+	/// A known failure (start reason or refusal) is worded in the interface
+	/// language with the transport's stderr as detail; an unknown one stays
+	/// ssh's own words (#204, #213).
+	#[test]
+	fn known_failures_are_worded_in_the_interface_language() {
 		let zh = |e| describe_msg(e).render(Locale::ZhTw);
 		let en = |e| describe_msg(e).render(Locale::En);
 		assert_eq!(
@@ -1699,6 +1842,102 @@ mod tests {
 		);
 		assert_eq!(zh(start(None, "")), "english text the CLI prints");
 		assert_eq!(zh(RemoteError::Protocol("x".into())), "protocol: x");
+		// A path that does not exist is worded, not the OS text (#213).
+		let gone = || RemoteError::Refused {
+			code: snip_remote::ErrorCode::NotFound,
+			message: "No such file or directory (os error 2)".into(),
+		};
+		assert_eq!(zh(gone()), "找不到遠端的資料夾或檔案，請確認路徑是否存在");
+		assert_eq!(
+			en(gone()),
+			"The remote folder or file was not found; check that the path exists"
+		);
+	}
+
+	/// Every refusal code a user can hit is worded in both languages; the
+	/// worker's English OS text never reaches the screen, and the user's
+	/// path stays as the detail (#213). The exhaustive match makes a new
+	/// `ErrorCode` a compile error here until it is decided.
+	#[test]
+	fn every_refusal_code_is_worded_without_raw_os_text() {
+		use snip_remote::ErrorCode as C;
+		// (index, worded?) - `Stale` and `Collision` carry the local
+		// paste's own wording and stay as sent.
+		fn decide(code: C) -> (usize, bool) {
+			match code {
+				C::Forbidden => (0, true),
+				C::NotFound => (1, true),
+				C::Unsupported => (2, true),
+				C::BadRequest => (3, true),
+				C::TooLarge => (4, true),
+				C::Io => (5, true),
+				C::VersionMismatch => (6, true),
+				C::NotARepository => (7, true),
+				C::InvalidRevision => (8, true),
+				C::Timeout => (9, true),
+				C::Busy => (10, true),
+				C::Cancelled => (11, true),
+				C::OutsideShare => (12, true),
+				C::Stale => (13, false),
+				C::Collision => (14, false),
+			}
+		}
+		let all = [
+			C::Forbidden,
+			C::NotFound,
+			C::Unsupported,
+			C::BadRequest,
+			C::TooLarge,
+			C::Io,
+			C::VersionMismatch,
+			C::NotARepository,
+			C::InvalidRevision,
+			C::Timeout,
+			C::Busy,
+			C::Cancelled,
+			C::OutsideShare,
+			C::Stale,
+			C::Collision,
+		];
+		for (i, code) in all.into_iter().enumerate() {
+			assert_eq!(decide(code).0, i, "{code:?} is listed out of order");
+		}
+		let os = "No such file or directory (os error 2)";
+		let refused = |code| RemoteError::Refused {
+			code,
+			message: os.into(),
+		};
+		for code in all {
+			let (_, worded) = decide(code);
+			for locale in [Locale::ZhTw, Locale::En] {
+				let plain = describe_msg(refused(code)).render(locale);
+				let at =
+					describe_msg_at(refused(code), "/srv/gone").render(locale);
+				if worded {
+					assert!(!plain.contains("os error"), "{code:?} {plain}");
+					assert!(!at.contains("os error"), "{code:?} {at}");
+					assert!(at.ends_with("/srv/gone"), "{code:?} {at}");
+					assert_ne!(plain, os);
+				} else {
+					assert_eq!(plain, os, "{code:?} keeps the local wording");
+				}
+			}
+			if worded {
+				// No English left in the zh-TW text.
+				let zh = describe_msg(refused(code)).render(Locale::ZhTw);
+				assert!(
+					!zh.replace("Git", "")
+						.chars()
+						.any(|c| c.is_ascii_alphabetic()),
+					"{code:?} zh-TW text is not translated: {zh}"
+				);
+			}
+		}
+		assert_eq!(
+			describe_msg_at(refused(C::NotFound), "/srv/gone")
+				.render(Locale::ZhTw),
+			"找不到遠端的資料夾或檔案，請確認路徑是否存在：/srv/gone"
+		);
 	}
 
 	/// Worker paths resolve by the worker's spelling, on any master OS.

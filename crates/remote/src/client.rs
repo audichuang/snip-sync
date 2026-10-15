@@ -459,9 +459,11 @@ impl Connection {
 				conn.version = max_version.unwrap_or(1).clamp(1, PROTOCOL_MAX);
 				Ok(conn)
 			}
-			Ok(Some(Response::Error { code, message })) => {
-				Err(RemoteError::Refused { code, message })
-			}
+			Ok(Some(Response::Error {
+				code,
+				message,
+				patch,
+			})) => Err(refusal(code, message, patch)),
 			Ok(Some(_)) => Err(RemoteError::Protocol("expected hello".into())),
 			Ok(None) | Err(RemoteError::Io(_)) | Err(RemoteError::TimedOut) => {
 				let cause = match &reply {
@@ -594,7 +596,8 @@ impl Connection {
 		});
 		self.in_flight.store(false, Ordering::SeqCst);
 		self.frames_seen = frames;
-		if res.is_err() && !matches!(res, Err(RemoteError::Refused { .. })) {
+		// A refusal is an answer: the connection is still good.
+		if res.as_ref().is_err_and(|e| e.code().is_none()) {
 			self.broken = true;
 		}
 		res
@@ -1071,9 +1074,11 @@ pub(crate) fn exchange(
 					}
 					Response::Joined => {
 						return match serde_json::from_str::<Response>(&text) {
-							Ok(Response::Error { code, message }) => {
-								Err(RemoteError::Refused { code, message })
-							}
+							Ok(Response::Error {
+								code,
+								message,
+								patch,
+							}) => Err(refusal(code, message, patch)),
 							Ok(
 								Response::Chunk { .. }
 								| Response::Joined
@@ -1105,8 +1110,12 @@ pub(crate) fn exchange(
 							return Err(RemoteError::Cancelled);
 						}
 					}
-					Response::Error { code, message } => {
-						return Err(RemoteError::Refused { code, message });
+					Response::Error {
+						code,
+						message,
+						patch,
+					} => {
+						return Err(refusal(code, message, patch));
 					}
 					response => return Ok(response),
 				}
@@ -2887,6 +2896,20 @@ impl RepoView for RemoteRepo {
 	}
 }
 
+/// The master's side of a worker refusal: a diff over its limit keeps its
+/// own variant, so it is not read as the file being too large.
+pub(crate) fn refusal(
+	code: ErrorCode,
+	message: String,
+	patch: bool,
+) -> RemoteError {
+	if patch && code == ErrorCode::TooLarge {
+		RemoteError::PatchTooLarge { message }
+	} else {
+		RemoteError::Refused { code, message }
+	}
+}
+
 impl From<RemoteError> for GitError {
 	fn from(err: RemoteError) -> Self {
 		match err {
@@ -2894,6 +2917,12 @@ impl From<RemoteError> for GitError {
 				code: ErrorCode::InvalidRevision,
 				message,
 			} => GitError::InvalidRevision(message),
+			// The worker names neither path nor limit; its limit is the
+			// preview limit, and the caller knows the path.
+			RemoteError::PatchTooLarge { .. } => GitError::PatchLimit {
+				path: String::new(),
+				limit: snip_core::browser::PREVIEW_LIMIT,
+			},
 			RemoteError::Refused {
 				code: ErrorCode::TooLarge,
 				..
@@ -2925,6 +2954,13 @@ impl From<RemoteError> for GitError {
 			} => GitError::HostStart {
 				reason,
 				detail,
+				message,
+			},
+			RemoteError::Refused { code, message } => GitError::HostRefused {
+				code: serde_json::to_value(code)
+					.ok()
+					.and_then(|v| v.as_str().map(str::to_owned))
+					.unwrap_or_default(),
 				message,
 			},
 			other => GitError::Host(other.to_string()),
@@ -3179,6 +3215,7 @@ mod tests {
 			Some(Response::Error {
 				code: ErrorCode::Stale,
 				message: "expired; preview again".into(),
+				patch: false,
 			}),
 		] {
 			let unknown = response.is_none();
@@ -3216,6 +3253,7 @@ mod tests {
 		fixture.answer(Some(Response::Error {
 			code: ErrorCode::Busy,
 			message: "busy".into(),
+			patch: false,
 		}));
 		assert!(matches!(
 			join_prepared(first),
@@ -3909,6 +3947,7 @@ mod tests {
 		let mut stream = FakeDuplex::new(&[Response::Error {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
+			patch: false,
 		}]);
 		let mut frames = 0;
 		let err = exchange(
@@ -3928,6 +3967,63 @@ mod tests {
 			other => panic!("expected Refused, got {other:?}"),
 		}
 		assert_eq!(frames, 1);
+	}
+
+	fn too_large(patch: bool) -> Response {
+		Response::Error {
+			code: ErrorCode::TooLarge,
+			message: "big".into(),
+			patch,
+		}
+	}
+
+	/// Runs one `call` on a connection whose worker answers with `frames`.
+	fn call_with_frames(
+		frames: Vec<Response>,
+	) -> (Result<Response, RemoteError>, bool) {
+		let (tx, rx) = mpsc::sync_channel(frames.len() + 1);
+		for f in frames {
+			tx.send(Ok(Some(f))).unwrap();
+		}
+		let mut conn = test_conn(
+			Box::new(std::io::sink()),
+			rx,
+			Arc::default(),
+			Arc::default(),
+		);
+		let req = Request::Stat {
+			workspace: "w".into(),
+			path: "a".into(),
+		};
+		let res = conn.call(&req, None, scaled(Duration::from_secs(10)));
+		(res, conn.broken)
+	}
+
+	/// A refusal is an answer on every reply path (direct frame and the
+	/// chunked/joined one): the connection stays poolable, and only the
+	/// worker's `patch` flag turns TooLarge into the diff-limit error (#214).
+	#[test]
+	fn too_large_refusals_keep_the_connection_and_keep_patch_apart() {
+		let joined = |patch: bool| {
+			let json = serde_json::to_string(&too_large(patch)).unwrap();
+			vec![Response::Chunk { data: json }, Response::Joined]
+		};
+		for (path, frames, patch) in [
+			("direct", vec![too_large(true)], true),
+			("direct", vec![too_large(false)], false),
+			("joined", joined(true), true),
+			("joined", joined(false), false),
+		] {
+			let (res, broken) = call_with_frames(frames);
+			let err = res.unwrap_err();
+			assert_eq!(err.code(), Some(ErrorCode::TooLarge), "{path} {err:?}");
+			assert!(!broken, "{path} patch={patch}: connection marked broken");
+			match (GitError::from(err), patch) {
+				(GitError::PatchLimit { .. }, true) => {}
+				(GitError::OutputLimit { .. }, false) => {}
+				(other, _) => panic!("{path} patch={patch}: {other:?}"),
+			}
+		}
 	}
 
 	#[test]
@@ -4009,7 +4105,11 @@ mod tests {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
 		};
-		assert!(matches!(GitError::from(err8), GitError::Host(_)));
+		assert!(matches!(
+			GitError::from(err8),
+			GitError::HostRefused { ref code, ref message }
+				if code == "not_found" && message == "missing"
+		));
 
 		// A worker that did not start keeps its known cause for the GUI, and
 		// the CLI's English text unchanged (#206).

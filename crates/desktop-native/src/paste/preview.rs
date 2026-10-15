@@ -328,6 +328,58 @@ impl PastePreview {
 		}
 	}
 
+	/// Brings an open, idle preview's mapping candidates up to date with the
+	/// repos found since it opened. A busy, loading or closed preview is left.
+	pub fn refresh_candidates(
+		&mut self,
+		known_roots: &[PathBuf],
+		ordinary: Option<&Preview>,
+	) -> Result<bool, Msg> {
+		if self.loading {
+			return Ok(false);
+		}
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		let Some(plan) = self.plan.as_mut() else {
+			return Ok(false);
+		};
+		if plan.is_applying {
+			return Ok(false);
+		}
+		// A refused refresh must cost nothing: find what is news and project
+		// its size first, and allocate only once the budget admits it.
+		let seen = plan.seen_roots;
+		let Some(found) = plan.new_roots(known_roots) else {
+			return Ok(false);
+		};
+		let headroom =
+			pending.ui_headroom(ordinary, plan, self.detail.as_ref());
+		if plan.candidate_growth_bytes(&found, headroom) > headroom {
+			// The set was not admitted, so it is still news next time.
+			plan.seen_roots = seen;
+			return Err(preview_budget_error());
+		}
+		// Build the additions on copies and keep the admitted allocations
+		// aside, so a refusal puts back exactly what was admitted (a truncate
+		// keeps the grown capacity, which the budget counts).
+		let Some(admitted) = plan.extend_candidates(&found) else {
+			// Nothing to add: the digest still moves on, as it always did.
+			return Ok(false);
+		};
+		if let Err(err) =
+			pending.admit_ui(ordinary, Some(&*plan), self.detail.as_ref())
+		{
+			for (choice, kept) in plan.prefix_choices.iter_mut().zip(admitted) {
+				if let Some(kept) = kept {
+					choice.candidates = kept;
+				}
+			}
+			plan.seen_roots = seen;
+			return Err(err);
+		}
+		Ok(true)
+	}
+
 	pub fn remap(
 		&mut self,
 		prefix: String,
@@ -914,6 +966,137 @@ mod tests {
 
 		let res2 = s.toggle_fold(0, Some(&o));
 		assert!(matches!(res2, Folded::Kept));
+	}
+
+	/// A refused landing of new repos rolls the candidates back, so the same
+	/// repo set must be tried again once there is room (#215).
+	#[test]
+	fn refused_candidates_are_retried_with_the_same_repo_set() {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		let repo = ws.join("repo01");
+		std::fs::create_dir_all(&repo).unwrap();
+		let mut o = small_ordinary();
+		let mut s = landed("// FILE: repo01/a.txt\nbody\n", &ws, Some(&o));
+		assert!(!s.plan().unwrap().prefix_choices.is_empty());
+		let count = |s: &PastePreview| {
+			s.plan().unwrap().prefix_choices[0].candidates.len()
+		};
+		let before = count(&s);
+		fill_budget(&s, &mut o);
+		let retained = s.plan().unwrap().retained_bytes();
+		let roots = [ws.clone(), repo.clone()];
+		let err = s.refresh_candidates(&roots, Some(&o)).unwrap_err();
+		assert_eq!(err.key, "preview_memory_limit");
+		assert_eq!(count(&s), before, "the refused candidates are gone");
+		assert_eq!(
+			s.plan().unwrap().retained_bytes(),
+			retained,
+			"a refusal restores the admitted plan, capacity included"
+		);
+		// Enter with unresolved mappings records an error against the same
+		// full budget; it must not trip the release assertion.
+		s.record_error(
+			Msg {
+				key: "paste_mapping_unresolved",
+				args: vec!["x".repeat(40)],
+				key_args: Vec::new(),
+				inner: None,
+			},
+			Some(&o),
+		);
+		// Room again: the same set is still news and is admitted.
+		let small = small_ordinary();
+		s.admit_ordinary(Some(&small)).unwrap();
+		assert!(s.refresh_candidates(&roots, Some(&small)).unwrap());
+		assert!(count(&s) > before);
+	}
+
+	/// Thousands of prefixes x hundreds of discovered repos would need
+	/// gigabytes of candidates. The refresh projects the size first and
+	/// refuses without allocating (#215).
+	#[test]
+	fn refresh_with_many_prefixes_refuses_before_allocating() {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		let long = "r".repeat(80);
+		let roots: Vec<PathBuf> = (0..256)
+			.map(|i| {
+				let d = ws.join(format!("{long}{i:03}"));
+				std::fs::create_dir_all(&d).unwrap();
+				d
+			})
+			.collect();
+		let mut payload = String::new();
+		for i in 0..5000 {
+			payload.push_str(&format!("// FILE: p{i}/a.txt\nx\n"));
+		}
+		let o = small_ordinary();
+		let mut s = landed(&payload, &ws, Some(&o));
+		assert_eq!(s.plan().unwrap().prefix_choices.len(), 5000);
+		let retained = s.plan().unwrap().retained_bytes();
+		let ptrs: Vec<*const PathBuf> = s
+			.plan()
+			.unwrap()
+			.prefix_choices
+			.iter()
+			.map(|c| c.candidates.as_ptr())
+			.collect();
+		crate::paste::GROWTH_CHOICES_VISITED.with(|c| c.set(0));
+		let started = std::time::Instant::now();
+		let err = s.refresh_candidates(&roots, Some(&o)).unwrap_err();
+		let took = started.elapsed();
+		assert_eq!(err.key, "preview_memory_limit");
+		assert_eq!(s.plan().unwrap().retained_bytes(), retained);
+		// Nothing was rebuilt: every choice still owns its allocation.
+		let after: Vec<*const PathBuf> = s
+			.plan()
+			.unwrap()
+			.prefix_choices
+			.iter()
+			.map(|c| c.candidates.as_ptr())
+			.collect();
+		assert_eq!(ptrs, after, "a candidate list was replaced");
+		// The projection stops at the budget: it looks at a few choices,
+		// not all 5000 (about 700 when written).
+		let visited = crate::paste::GROWTH_CHOICES_VISITED.with(|c| c.get());
+		assert!(
+			visited < 2500,
+			"the projection visited {visited} of 5000 choices"
+		);
+		// Backstop only; the old code needed about 23 s.
+		let limit = std::time::Duration::from_secs(
+			10 * std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+				.ok()
+				.and_then(|v| v.parse::<u64>().ok())
+				.unwrap_or(1),
+		);
+		assert!(took < limit, "the refusal took {took:?}");
+		// Still news: a smaller set is admitted afterwards.
+		assert!(s.refresh_candidates(&roots[..1], Some(&o)).unwrap());
+	}
+
+	#[test]
+	fn refresh_adds_new_repos_when_they_fit() {
+		let tmp = tempfile::tempdir().unwrap();
+		let ws = tmp.path().join("ws");
+		let repos: Vec<PathBuf> = (0..3)
+			.map(|i| {
+				let d = ws.join(format!("repo{i}"));
+				std::fs::create_dir_all(&d).unwrap();
+				d
+			})
+			.collect();
+		let o = small_ordinary();
+		let mut s = landed("// FILE: repo0/a.txt\nbody\n", &ws, Some(&o));
+		let before = s.plan().unwrap().prefix_choices[0].candidates.len();
+		let retained = s.plan().unwrap().retained_bytes();
+		assert!(s.refresh_candidates(&repos, Some(&o)).unwrap());
+		let after = s.plan().unwrap().prefix_choices[0].candidates.len();
+		assert!(after > before);
+		assert!(s.plan().unwrap().retained_bytes() > retained);
+		// Same set again: nothing to add.
+		assert!(!s.refresh_candidates(&repos, Some(&o)).unwrap());
 	}
 
 	#[test]

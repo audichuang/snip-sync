@@ -79,6 +79,14 @@ pub enum GitError {
 	WorktreeBusy { args: String },
 	#[error("git {args} output exceeds {limit} bytes")]
 	OutputLimit { args: String, limit: usize },
+	/// The synthesized preview patch of `path` passed `limit` bytes, while
+	/// the file itself may be within the preview limit. A remote worker does
+	/// not name the path, so it is empty there.
+	#[error(
+		"preview patch{} exceeds {limit} bytes",
+		if path.is_empty() { String::new() } else { format!(" of {path}") }
+	)]
+	PatchLimit { path: String, limit: usize },
 	#[error("git {args} exited but a detached process kept its output open")]
 	OutputHeldOpen { args: String },
 	#[error(
@@ -111,6 +119,11 @@ pub enum GitError {
 	VerifyLimit { what: &'static str },
 	#[error("{0}")]
 	Host(String),
+	/// A remote worker's refusal that has no variant of its own. `code` is
+	/// the worker's error code in its wire spelling (`snake_case`), so a
+	/// front end can word it without parsing `message`.
+	#[error("{message}")]
+	HostRefused { code: String, message: String },
 	/// A remote worker that did not start: the known cause, the transport's
 	/// stderr and the English text the CLI prints.
 	#[error("{message}")]

@@ -72,6 +72,10 @@ pub enum RemoteError {
 	/// The worker answered with an error.
 	#[error("{message}")]
 	Refused { code: ErrorCode, message: String },
+	/// A `TooLarge` refusal whose file is fine: the diff built from it is
+	/// over the limit (#214). The same wire code as [`Self::Refused`].
+	#[error("{message}")]
+	PatchTooLarge { message: String },
 	#[error("protocol: {0}")]
 	Protocol(String),
 	#[error("cancelled")]
@@ -163,6 +167,9 @@ impl RemoteError {
 	pub fn code(&self) -> Option<ErrorCode> {
 		match self {
 			Self::Refused { code, .. } => Some(*code),
+			// Same wire refusal as `Refused { TooLarge }`, so everything
+			// keyed on the code (a connection kept, a retry) agrees.
+			Self::PatchTooLarge { .. } => Some(ErrorCode::TooLarge),
 			_ => None,
 		}
 	}

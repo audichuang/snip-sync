@@ -584,50 +584,112 @@ fn row_base(list_w: f32, show_hash: bool) -> f32 {
 /// The graph gutter, author and date widths of every row in a `list_w` wide
 /// list, decided once per list. Pieces give way to the subject in this
 /// order: the gutter is clipped (only as far as a squeezed label group, when
-/// `has_labels`, and the subject need), then no further than
-/// [`MIN_GUTTER_W`]; below that the date and then the author cell shrink
-/// until the subject reaches [`MIN_SUBJECT_W`]. On a very narrow list the
-/// subject takes what is left. With `has_labels`, the room the gutter floor
-/// takes back from the label reserve is made up by the date and author when
-/// they can cover all of it (so the labels keep [`MIN_LABELS_W`]); otherwise
-/// the labels are dropped and only the subject's lack is taken.
+/// there are labels, and the subject need), then no further than
+/// [`MIN_GUTTER_W`]; below that the author and then the date cell shrink
+/// (one order for every shortfall) until the subject reaches
+/// [`MIN_SUBJECT_W`]. On a very narrow list the subject takes what is left.
+///
+/// `labels_w` is the widest ref-label group any row of the list has (0 for
+/// none, see [`ref_labels_width`]). Beside a short subject the group gets
+/// room only as far as it needs it (down to [`MIN_SUBJECT_BESIDE_LABELS`]
+/// for the subject): the author column gives way first, then the date, and
+/// for the labels the date never goes below `date_need`, the width of the
+/// longest date string of the current locale ([`date_need_w`]), so a list
+/// whose labels already fit keeps its columns (#216). The subject's shortfall
+/// uses the same routine (author first, then the date); only when even author
+/// at [`MIN_AUTHOR_W`] and date at that floor cannot reach the subject minimum
+/// does the date yield last, down to [`MIN_DATE_W`].
+///
 /// [`MIN_SUBJECT_W`] is not guaranteed on
 /// lists under about 520px with the hash column on (a 900 window with the
 /// hash shown leaves the subject about 97px).
 pub(super) fn list_cols(
 	list_w: f32,
 	gutter_w: f32,
-	has_labels: bool,
+	labels_w: f32,
+	date_need: f32,
 	show_hash: bool,
 ) -> ListCols {
+	let has_labels = labels_w > 0.;
 	let base = row_base(list_w, show_hash);
 	// The 6px before the labels only exists with labels.
 	let labels = if has_labels { MIN_LABELS_W + 6. } else { 0. };
 	let room = base - AUTHOR_W - DATE_W - MIN_SUBJECT_W - labels;
 	let gutter = gutter_w.min(room.max(MIN_GUTTER_W));
 	// What the subject still lacks with the gutter placed.
-	let mut lack =
-		(MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
-	// The gutter floor took back part of the label reserve; date and author
-	// give that room up so the labels still fit. When they cannot cover all
-	// of it the labels are dropped anyway, so they keep their width for the
-	// subject-only lack. The deficit already contains what the subject
-	// reserve needs, so it replaces the lack rather than adding to it.
-	if has_labels {
-		let deficit = (gutter - room).max(0.);
-		let give = (DATE_W - MIN_DATE_W) + (AUTHOR_W - MIN_AUTHOR_W);
-		if deficit <= give {
-			lack = lack.max(deficit);
-		}
-	}
-	let date = DATE_W - lack.min(DATE_W - MIN_DATE_W);
-	lack -= DATE_W - date;
-	let author = AUTHOR_W - lack.min(AUTHOR_W - MIN_AUTHOR_W);
+	let lack = (MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
+	// A short subject beside the labels: the room the whole group needs,
+	// taken from the author, then from the date down to what it needs. Where
+	// even all of that would leave the group under MIN_LABELS_W it is
+	// dropped anyway, so nothing is squeezed for it.
+	let date_floor = date_need.clamp(MIN_DATE_W, DATE_W);
+	let label_give = (AUTHOR_W - MIN_AUTHOR_W) + (DATE_W - date_floor);
+	let have = base - gutter - AUTHOR_W - DATE_W;
+	let label_lack = if has_labels
+		&& have + label_give >= MIN_SUBJECT_BESIDE_LABELS + 6. + MIN_LABELS_W
+	{
+		(MIN_SUBJECT_BESIDE_LABELS + 6. + labels_w - have).clamp(0., label_give)
+	} else {
+		0.
+	};
+	// One give-way order for both shortfalls: the author first, then the
+	// date. The labels' share stops at `date_floor`; only the subject's own
+	// minimum may push the date on to MIN_DATE_W.
+	let total = lack.max(label_lack);
+	let author_cut = total.min(AUTHOR_W - MIN_AUTHOR_W);
+	let date_cut = (total - author_cut).min(DATE_W - MIN_DATE_W);
 	ListCols {
 		gutter,
-		author,
-		date,
+		author: AUTHOR_W - author_cut,
+		date: DATE_W - date_cut,
 	}
+}
+
+/// The laid-out width of a row's ref labels, as [`ref_label_elements`] draws
+/// them (`measure` gives a name's text width): each label its icon allowance
+/// and text (at most 320), 8px between labels, then the `+N` badge.
+pub(super) fn ref_labels_width(
+	refs: &[snip_core::graph::RefInfo],
+	current_branch: Option<&str>,
+	measure: &dyn Fn(&str) -> f32,
+) -> f32 {
+	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
+	let mut width = 0.;
+	for (n, l) in graph_view::kind_labels(&shown, current_branch)
+		.into_iter()
+		.enumerate()
+	{
+		if n > 0 {
+			width += 8.;
+		}
+		width += (17. + measure(&l.text)).min(320.);
+	}
+	if hidden > 0 {
+		width += 8. + measure(&format!("+{hidden}"));
+	}
+	width
+}
+
+/// The width the date cell needs for the longest date string of `loc`
+/// (a double-digit month and day, the latest time, and the today and
+/// yesterday forms), measured with `measure`.
+pub(super) fn date_need_w(loc: Locale, measure: &dyn Fn(&str) -> f32) -> f32 {
+	let time = "23:59";
+	[
+		log_date_in(
+			"2026-12-28T23:59:00Z",
+			loc,
+			chrono::DateTime::parse_from_rfc3339("2027-06-01T00:00:00Z")
+				.unwrap()
+				.with_timezone(&chrono::Utc),
+			&chrono::Utc,
+		),
+		tf("log_today", loc, &[&time]),
+		tf("log_yesterday", loc, &[&time]),
+	]
+	.iter()
+	.map(|s| measure(s))
+	.fold(0., f32::max)
 }
 
 /// Divides a `list_w` wide row laid out with `cols`. A subject keeps only
@@ -814,16 +876,12 @@ pub(super) fn ref_label_elements(
 	measure: &dyn Fn(&str) -> f32,
 ) -> (Vec<AnyElement>, f32) {
 	let (shown, hidden) = graph_view::visible_refs(refs, current_branch);
-	let mut width = 0.;
+	let width = ref_labels_width(refs, current_branch, measure);
 	let mut out: Vec<AnyElement> = Vec::new();
 	for (n, l) in graph_view::kind_labels(&shown, current_branch)
 		.into_iter()
 		.enumerate()
 	{
-		if n > 0 {
-			width += 8.;
-		}
-		width += (17. + measure(&l.text)).min(320.);
 		let tooltip = shown
 			.iter()
 			.filter(|b| {
@@ -864,7 +922,6 @@ pub(super) fn ref_label_elements(
 		out.push(el.into_any_element());
 	}
 	if hidden > 0 {
-		width += 8. + measure(&format!("+{hidden}"));
 		let all = refs
 			.iter()
 			.map(|i| graph_view::format_ref_badge(i).0)
@@ -2330,8 +2387,12 @@ mod row_width_tests {
 	// A 24-lane gutter (the widest) and the widest combined label.
 	const WIDE_GUTTER: f32 = 24. * 16. + 8.;
 
+	// The widest zh-TW date ("2026/10/15 09:00") at 1080 measures ~110px.
+	const DATE_NEED: f32 = 110.;
+
 	fn cols(list_w: f32, gutter_w: f32, labels: bool, hash: bool) -> ListCols {
-		list_cols(list_w, gutter_w, labels, hash)
+		let labels_w = if labels { 180. } else { 0. };
+		list_cols(list_w, gutter_w, labels_w, DATE_NEED, hash)
 	}
 
 	#[test]
@@ -2407,23 +2468,22 @@ mod row_width_tests {
 	}
 
 	#[test]
-	fn a_narrow_list_squeezes_date_then_author_after_the_gutter() {
+	fn a_narrow_list_squeezes_author_then_date_after_the_gutter() {
 		// 433px (a 900 window): the gutter is at its floor, the date and the
 		// author cells give the subject its minimum.
 		let c = cols(433., WIDE_GUTTER, true, false);
 		assert_eq!(c.gutter, MIN_GUTTER_W);
 		assert!(c.date < DATE_W && c.date >= MIN_DATE_W);
 		assert!(c.author >= MIN_AUTHOR_W);
-		// The labels are dropped here anyway (the deficit is more than the
-		// date and author can give), so the author is not squeezed for them.
-		assert_eq!(c.author, 81.);
+		// The author goes first, to its floor, then the date.
+		assert_eq!(c.author, MIN_AUTHOR_W);
 		let w = row_widths(433., c, 337., 400., false);
 		assert_eq!(w.labels, 0.);
 		assert!(w.subject >= MIN_SUBJECT_W, "{w:?}");
-		// Only the date gives way while it alone is enough.
+		// Only the author gives way while it alone is enough.
 		let c = cols(FLOOR_W - 10., WIDE_GUTTER, false, false);
-		assert_eq!(c.author, AUTHOR_W);
-		assert!(c.date < DATE_W);
+		assert_eq!(c.date, DATE_W);
+		assert!(c.author < AUTHOR_W);
 	}
 
 	// Below this list width the gutter floor plus full author and date
@@ -2484,6 +2544,124 @@ mod row_width_tests {
 		let c = cols(574., 40., true, false);
 		let w = row_widths(574., c, 200., 30., false);
 		assert_eq!(w.labels, 200.);
+	}
+
+	#[test]
+	fn author_then_date_give_way_so_a_short_tag_is_not_cut() {
+		// #216: main, origin/main and a tag beside "empty replay" at 1080
+		// (the list is 574px; gutters from the real graph and its floor).
+		for (gutter, labels_w) in
+			[(40., 176.), (56., 190.), (MIN_GUTTER_W, 176.)]
+		{
+			let c = list_cols(574., gutter, labels_w, DATE_NEED, false);
+			let w = row_widths(574., c, labels_w, 75., false);
+			assert_eq!(w.labels, labels_w, "{gutter}: {c:?} {w:?}");
+			// The date keeps what its string needs.
+			assert!(c.date >= DATE_NEED, "{gutter}: {c:?}");
+		}
+	}
+
+	#[test]
+	fn labels_that_fit_cost_no_column_width() {
+		// Only "main" (~60px): nothing gives way, date and author stay full.
+		for date_need in [DATE_NEED, 97.] {
+			let c = list_cols(574., 56., 60., date_need, false);
+			assert_eq!((c.author, c.date), (AUTHOR_W, DATE_W), "{c:?}");
+		}
+	}
+
+	#[test]
+	fn the_date_is_kept_whole_at_1080_for_every_label_group() {
+		// zh-TW dates ("2026/3/7 09:00" ~97px, "2026/10/15 09:00" ~110px).
+		for need in [97., 110.] {
+			for labels_w in [0., 60., 120., 176., 190., 337.] {
+				for gutter in [40., 56., MIN_GUTTER_W] {
+					let c = list_cols(574., gutter, labels_w, need, false);
+					assert!(
+						c.date >= need,
+						"{need} {labels_w} {gutter}: {c:?}"
+					);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn every_shortfall_gives_way_author_first_and_keeps_the_date() {
+		// #216: the subject's shortfall and the labels' take the columns in
+		// one order across list widths, hash on/off, label groups and gutters,
+		// wherever the date floor is reachable.
+		let mut checked = 0;
+		for need in [97., 110.] {
+			for list_w in [600., 574., 540., 500., 480., 450.] {
+				for hash in [false, true] {
+					for labels_w in [0., 50., 120., 190.] {
+						for gutter in [40., 56., 72.] {
+							let c =
+								list_cols(list_w, gutter, labels_w, need, hash);
+							let base = row_base(list_w, hash);
+							// Subject need with the gutter at its real width.
+							let lack = (MIN_SUBJECT_W
+								- (base - c.gutter - AUTHOR_W - DATE_W))
+								.max(0.);
+							let give = (AUTHOR_W - MIN_AUTHOR_W)
+								+ (DATE_W - need.clamp(MIN_DATE_W, DATE_W));
+							if lack > give {
+								continue; // floor unreachable: fallback case
+							}
+							checked += 1;
+							let tag = format!(
+								"{need} {list_w} {hash} {labels_w} {gutter}: {c:?}"
+							);
+							assert!(c.date >= need, "{tag}");
+							assert!(c.author >= MIN_AUTHOR_W, "{tag}");
+							// The date is cut only once the author is at its floor.
+							assert!(
+								c.date == DATE_W || c.author == MIN_AUTHOR_W,
+								"{tag}"
+							);
+						}
+					}
+				}
+			}
+		}
+		assert!(checked > 100, "{checked}");
+	}
+
+	#[test]
+	fn the_author_gives_way_before_the_date() {
+		let c = list_cols(574., 40., 176., DATE_NEED, false);
+		assert!(c.author < AUTHOR_W && c.date == DATE_W, "{c:?}");
+	}
+
+	#[test]
+	fn a_ref_group_is_measured_as_it_is_drawn() {
+		use snip_core::graph::{RefInfo, RefKind};
+		let r = |raw: &str, display: &str, kind| RefInfo {
+			raw_name: raw.into(),
+			display_name: display.into(),
+			kind,
+		};
+		let refs = vec![
+			r("refs/heads/main", "main", RefKind::Branch),
+			r(
+				"refs/remotes/origin/main",
+				"origin/main",
+				RefKind::RemoteBranch {
+					remote: "origin".into(),
+					name: "main".into(),
+				},
+			),
+			r("refs/tags/v0.3.0", "v0.3.0", RefKind::Tag),
+		];
+		let m = |s: &str| s.chars().count() as f32 * 7.;
+		// "main, origin/main" and "v0.3.0", each with its 17px allowance.
+		let w = ref_labels_width(&refs, Some("main"), &m);
+		assert_eq!(w, (17. + 17. * 7.) + 8. + (17. + 6. * 7.));
+		assert_eq!(ref_labels_width(&[], None, &m), 0.);
+		// The date need is the widest string of the locale.
+		let d = date_need_w(Locale::ZhTw, &m);
+		assert_eq!(d, "2026/12/28 23:59".chars().count() as f32 * 7.);
 	}
 
 	#[test]

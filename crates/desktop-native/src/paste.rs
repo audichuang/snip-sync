@@ -263,6 +263,30 @@ impl PastePending {
 		Ok(())
 	}
 
+	/// How many more UI bytes `admit_ui` would accept for this state before
+	/// refusing it. Zero when it is already at or over the cap.
+	pub fn ui_headroom(
+		&self,
+		ordinary: Option<&Preview>,
+		plan: &PastePreviewPlan,
+		detail: Option<&Preview>,
+	) -> usize {
+		let bytes = preview_state_bytes(ordinary, Some(plan), detail);
+		let allowance = if plan.executable() {
+			plan.apply_clone_bytes()
+		} else {
+			0
+		};
+		let raw = Arc::downgrade(&plan.raw_payload);
+		let commit = plan.commit_preview.as_ref().map(Arc::downgrade);
+		MAX_RETAINED_PREVIEW_BYTES.saturating_sub(self.total_with_ui(
+			bytes,
+			allowance,
+			Some(&raw),
+			commit.as_ref(),
+		))
+	}
+
 	pub fn invalidate(&mut self, seq: u64) {
 		self.seq = seq;
 		self.latest = None;
@@ -834,6 +858,19 @@ fn destination_msg(
 				detail,
 				..
 			} => return start_destination_msg(shown, reason, detail),
+			// A worker refusal is worded by its code, like a start
+			// reason; the worker's own OS or protocol English is never
+			// shown (#213).
+			RemoteError::Refused { code, .. }
+				if crate::remote::refusal_key(code).is_some() =>
+			{
+				let key = crate::remote::refusal_key(code).unwrap_or("err_raw");
+				return Msg::with_key_arg(
+					"paste_err_destination",
+					[shown, key.to_string()],
+					1,
+				);
+			}
 			other => crate::remote::describe(other),
 		},
 		PasteError::Local(e) => e.to_string(),
@@ -918,13 +955,26 @@ fn commit_msg(
 		}
 		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
 		// Kept as before: any other worker refusal of a replay, Busy
-		// included, reads as a repository error (see Risks).
-		PasteError::Remote(RemoteError::Refused { message, .. }) => {
-			Msg::new("error_open_repo", [message])
+		// included, reads as a repository error (see Risks). A code with a
+		// wording of its own shows that wording, never the worker's text.
+		PasteError::Remote(RemoteError::Refused { code, message }) => {
+			match crate::remote::refusal_key(code) {
+				Some(key) => {
+					Msg::with_key_arg("error_open_repo", [key.to_string()], 0)
+				}
+				None => Msg::new("error_open_repo", [message]),
+			}
 		}
 		PasteError::OutcomeUnknown(_) => outcome_unknown(),
 		other => destination_msg(remote, dest, other),
 	}
+}
+
+fn roots_digest(roots: &[PathBuf]) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	roots.hash(&mut hasher);
+	hasher.finish()
 }
 
 #[derive(Debug, Clone)]
@@ -941,6 +991,9 @@ pub struct PastePreviewPlan {
 	/// Commits whose file rows are folded away (commit replay only).
 	pub collapsed_commits: BTreeSet<usize>,
 	pub prefix_choices: Vec<PrefixChoice>,
+	/// Digest of the repo roots the candidates were last built from, so a
+	/// landing that brings the same set skips the canonicalize.
+	seen_roots: u64,
 	/// Shared so starting an apply does not copy every file body.
 	pub plan: Arc<RestorePlan>,
 	pub items: Vec<PasteItem>,
@@ -1305,6 +1358,144 @@ impl PastePreviewPlan {
 			}
 	}
 
+	/// Adds repos discovered after this preview opened to every prefix
+	/// choice's candidates. Existing candidates keep their index and made
+	/// choices stay, so nothing the user did is invalidated. Returns whether
+	/// any candidate was added. Does nothing, and touches no file system,
+	/// when there is no mapping to extend or the repo set is the one the
+	/// plan last saw. A preview opened before the scan keeps the workspace
+	/// root as its primary destination (accepted): only candidates grow.
+	pub fn add_candidates(&mut self, known_roots: &[PathBuf]) -> bool {
+		match self.new_roots(known_roots) {
+			Some(found) => self.extend_candidates(&found).is_some(),
+			None => false,
+		}
+	}
+
+	/// The repo roots this plan has not seen, canonical (or as the worker
+	/// reported them, remotely). `None`, with no file system touched, when
+	/// there is no mapping to extend or the set is the one last seen. The
+	/// digest moves on.
+	pub(crate) fn new_roots(
+		&mut self,
+		known_roots: &[PathBuf],
+	) -> Option<Vec<PathBuf>> {
+		if self.prefix_choices.is_empty() {
+			return None;
+		}
+		let digest = roots_digest(known_roots);
+		if digest == self.seen_roots {
+			return None;
+		}
+		self.seen_roots = digest;
+		Some(if self.remote.is_some() {
+			known_roots.to_vec()
+		} else {
+			canonical_dirs(known_roots)
+		})
+	}
+
+	/// What [`Self::extend_candidates`] would add to the retained bytes of
+	/// the plan, counted the way [`Self::retained_bytes`] counts, without
+	/// allocating a path. Stops counting once it passes `limit`, so the work
+	/// is bounded by what the budget admits, not by prefixes x roots.
+	pub(crate) fn candidate_growth_bytes(
+		&self,
+		found: &[PathBuf],
+		limit: usize,
+	) -> usize {
+		let mut total = 0usize;
+		for choice in &self.prefix_choices {
+			#[cfg(test)]
+			GROWTH_CHOICES_VISITED.with(|c| c.set(c.get() + 1));
+			let have: std::collections::HashSet<&PathBuf> =
+				choice.candidates.iter().collect();
+			let mut seen: std::collections::HashSet<&PathBuf> =
+				std::collections::HashSet::new();
+			let mut added = 0usize;
+			let mut path_bytes = 0usize;
+			for root in found {
+				if !have.contains(root) && seen.insert(root) {
+					added += 1;
+					path_bytes =
+						path_bytes.saturating_add(root.as_os_str().len());
+					// Cheap early exit on a runaway choice.
+					if path_bytes > limit {
+						return usize::MAX;
+					}
+				}
+			}
+			if added == 0 {
+				continue;
+			}
+			let slots =
+				(choice.candidates.len() + added) * size_of::<PathBuf>();
+			let grown = slots
+				.saturating_sub(
+					choice.candidates.capacity() * size_of::<PathBuf>(),
+				)
+				.saturating_add(path_bytes);
+			total = total.saturating_add(grown);
+			if total > limit {
+				return usize::MAX;
+			}
+		}
+		// An executable plan is charged again in its apply clone.
+		if self.executable() {
+			total = total.saturating_mul(2);
+		}
+		total
+	}
+
+	/// Adds `found` to every choice's candidates, on exact-size copies.
+	/// Returns each grown choice's previous allocation (`None` for one left
+	/// as is), in order, so a refused admission can put exactly that back; `None` when nothing was added
+	/// (and nothing was copied).
+	pub(crate) fn extend_candidates(
+		&mut self,
+		found: &[PathBuf],
+	) -> Option<Vec<Option<Vec<PathBuf>>>> {
+		let mut grown: Vec<Option<Vec<PathBuf>>> =
+			Vec::with_capacity(self.prefix_choices.len());
+		let mut any = false;
+		for choice in &self.prefix_choices {
+			let have: std::collections::HashSet<&PathBuf> =
+				choice.candidates.iter().collect();
+			let mut fresh: Vec<&PathBuf> = Vec::new();
+			let mut seen: std::collections::HashSet<&PathBuf> =
+				std::collections::HashSet::new();
+			for root in found {
+				if !have.contains(root) && seen.insert(root) {
+					fresh.push(root);
+				}
+			}
+			if fresh.is_empty() {
+				grown.push(None);
+				continue;
+			}
+			any = true;
+			let mut next =
+				Vec::with_capacity(choice.candidates.len() + fresh.len());
+			next.extend(choice.candidates.iter().cloned());
+			next.extend(fresh.into_iter().cloned());
+			grown.push(Some(next));
+		}
+		if !any {
+			return None;
+		}
+		Some(
+			self.prefix_choices
+				.iter_mut()
+				.zip(grown)
+				.map(|(choice, next)| {
+					next.map(|next| {
+						std::mem::replace(&mut choice.candidates, next)
+					})
+				})
+				.collect(),
+		)
+	}
+
 	pub fn mapping_ready(&self) -> bool {
 		self.prefix_choices
 			.iter()
@@ -1421,6 +1612,7 @@ impl PastePreviewPlan {
 			whole_commit: false,
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
+			seen_roots: roots_digest(known_roots),
 			plan: empty_plan(),
 			items: Vec::new(),
 			selected_item_idx: 0,
@@ -1493,6 +1685,7 @@ impl PastePreviewPlan {
 			whole_commit: true,
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
+			seen_roots: 0,
 			plan: empty_plan(),
 			items: Vec::new(),
 			selected_item_idx: 0,
@@ -2747,6 +2940,124 @@ pub(crate) mod tests {
 		};
 		assert_eq!(key(None, cancelled(), true), "error_open_repo");
 		assert_eq!(key(None, cancelled(), false), "stale_modified");
+	}
+
+	/// Every user-facing surface that shows a remote refusal words it by
+	/// its code; the worker's OS or protocol English never reaches the
+	/// screen in any language (#213). The match is exhaustive, so a new
+	/// `ErrorCode` must be decided here.
+	#[test]
+	fn remote_refusals_are_worded_on_every_paste_surface() {
+		use snip_remote::{ErrorCode as C, RemoteError};
+		fn worded(code: C) -> bool {
+			match code {
+				C::Forbidden
+				| C::NotFound
+				| C::Unsupported
+				| C::BadRequest
+				| C::TooLarge
+				| C::Io
+				| C::VersionMismatch
+				| C::NotARepository
+				| C::InvalidRevision
+				| C::Timeout
+				| C::Busy
+				| C::Cancelled
+				| C::OutsideShare => true,
+				// The local paste's own wording stays as sent.
+				C::Stale | C::Collision => false,
+			}
+		}
+		let all = [
+			C::Forbidden,
+			C::NotFound,
+			C::Unsupported,
+			C::BadRequest,
+			C::TooLarge,
+			C::Io,
+			C::VersionMismatch,
+			C::NotARepository,
+			C::InvalidRevision,
+			C::Timeout,
+			C::Busy,
+			C::Cancelled,
+			C::OutsideShare,
+			C::Stale,
+			C::Collision,
+		];
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: "/w".into(),
+					name: "w".into(),
+					path: "/w".into(),
+				},
+			),
+		};
+		let dest = remote.session.root.join("sub");
+		let raw = "No such file or directory (os error 2)";
+		let refused = |code| RemoteError::Refused {
+			code,
+			message: raw.into(),
+		};
+		for code in all {
+			if !worded(code) {
+				continue;
+			}
+			let surfaces: Vec<(&str, Msg)> = vec![
+				("describe_msg", crate::remote::describe_msg(refused(code))),
+				(
+					"describe_msg_at",
+					crate::remote::describe_msg_at(refused(code), "/srv/x"),
+				),
+				(
+					"destination_msg",
+					destination_msg(
+						Some(&remote),
+						&dest,
+						PasteError::Remote(refused(code)),
+					),
+				),
+				(
+					"file_apply_msg",
+					file_apply_msg(
+						Some(&remote),
+						&dest,
+						PasteError::Remote(refused(code)),
+					),
+				),
+				(
+					"commit_msg check",
+					commit_msg(
+						Some(&remote),
+						&dest,
+						PasteError::Remote(refused(code)),
+						false,
+					),
+				),
+				(
+					"commit_msg replay",
+					commit_msg(
+						Some(&remote),
+						&dest,
+						PasteError::Remote(refused(code)),
+						true,
+					),
+				),
+			];
+			for (name, msg) in surfaces {
+				for loc in [Locale::ZhTw, Locale::En] {
+					let text = msg.render(loc);
+					assert!(
+						!text.contains("os error")
+							&& !text.contains("No such file"),
+						"{name} {code:?} {loc:?} shows worker text: {text}"
+					);
+				}
+			}
+		}
 	}
 
 	fn captured(text: String, dest: &Path) -> PasteRequest {
@@ -4474,6 +4785,41 @@ pub(crate) mod tests {
 		assert!(!trap.join("a.txt").exists());
 	}
 
+	/// A landing that brings the repo set the plan already saw does no work
+	/// (#215); a preview opened before the scan keeps the workspace root as
+	/// its primary destination (accepted) and only gains candidates.
+	#[test]
+	fn add_candidates_skips_an_unchanged_repo_set() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = tmp.path().join("ws");
+		let repo = tmp.path().join("ws").join("repo01");
+		fs::create_dir_all(&repo).unwrap();
+		let payload = "// FILE: repo01/a.txt\nbody\n";
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			&dest,
+			std::slice::from_ref(&dest),
+			1,
+		)
+		.unwrap();
+		let primary = plan.destination.clone();
+		let before = plan.prefix_choices[0].candidates.len();
+		// Same set as at build: nothing to do, even if a candidate is gone.
+		plan.prefix_choices[0].candidates.clear();
+		assert!(!plan.add_candidates(std::slice::from_ref(&dest)));
+		assert!(plan.prefix_choices[0].candidates.is_empty());
+		// The scan found a repo: it is added once, then the set is stale.
+		assert!(plan.add_candidates(&[dest.clone(), repo.clone()]));
+		assert!(plan.prefix_choices[0].candidates.len() <= before + 2);
+		plan.prefix_choices[0].candidates.clear();
+		assert!(!plan.add_candidates(&[dest.clone(), repo.clone()]));
+		assert!(plan.prefix_choices[0].candidates.is_empty());
+		assert_eq!(plan.destination, primary, "the primary destination stays");
+		// No mapping to extend: never any work.
+		plan.prefix_choices.clear();
+		assert!(!plan.add_candidates(&[repo]));
+	}
+
 	#[test]
 	fn same_basename_mapping_uses_the_chosen_canonical_path() {
 		let tmp = tempfile::tempdir().unwrap();
@@ -5188,4 +5534,12 @@ pub(crate) mod tests {
 		assert!(!make(PlannedOp::Skip(SkipCause::Binary)).writes_content());
 		assert!(!make(PlannedOp::Skip(SkipCause::Other)).writes_content());
 	}
+}
+
+#[cfg(test)]
+thread_local! {
+	/// Choices `candidate_growth_bytes` looked at on this thread: a test
+	/// counts work with it instead of timing it.
+	pub(crate) static GROWTH_CHOICES_VISITED: std::cell::Cell<usize> =
+		const { std::cell::Cell::new(0) };
 }

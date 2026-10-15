@@ -932,6 +932,7 @@ pub struct WorkbenchModel {
 	/// The frame's focus guard, registered once: a focused element that is
 	/// no longer drawn returns the keyboard to `focus_handle`.
 	pub(crate) focus_lost_guard: Option<gpui::Subscription>,
+	pub(crate) escape_guard: Option<gpui::Subscription>,
 	pub e2e_read_delay: Option<std::time::Duration>,
 	/// Test hook: holds a finished Log commit read before it installs.
 	pub e2e_log_read_delay: Option<std::time::Duration>,
@@ -1452,6 +1453,7 @@ impl WorkbenchModel {
 			probes,
 			pending_focus: None,
 			focus_lost_guard: None,
+			escape_guard: None,
 			e2e_read_delay: ui::e2e_read_delay(),
 			e2e_log_read_delay: None,
 			e2e_tree_hold: ui::e2e_tree_hold(),
@@ -2902,6 +2904,7 @@ impl WorkbenchModel {
 	) {
 		self.resume_focus = keep;
 		self.focus_lost_guard = None;
+		self.escape_guard = None;
 		self.chrome.menu = None;
 		self.dragging = None;
 		// A background tab keeps no browse ssh.
@@ -3263,6 +3266,23 @@ impl WorkbenchModel {
 		None
 	}
 
+	/// A paste preview opened (or remapped) before the scan finished lists
+	/// only the repos known then: add the ones found since. Runs when the
+	/// scan finishes and whenever a preview job lands, since a job in flight
+	/// at the scan's end hands back the old candidates.
+	fn refresh_paste_candidates(&mut self, cx: &mut Context<Self>) {
+		let roots: Vec<PathBuf> =
+			self.repos.iter().map(|r| r.root.clone()).collect();
+		match self.paste.refresh_candidates(&roots, self.preview.as_ref()) {
+			Ok(true) => {
+				app_log!("[APP:PASTE_CANDIDATES_REFRESHED]");
+				cx.notify();
+			}
+			Ok(false) => {}
+			Err(err) => self.set_status_msg(err),
+		}
+	}
+
 	fn finish_discovery(&mut self, cx: &mut Context<Self>) {
 		self.is_loading = false;
 		if self.discovery_error_overflow > 0 {
@@ -3319,6 +3339,7 @@ impl WorkbenchModel {
 		self.sync_change_slots();
 		self.start_changes_queue(false, cx);
 		self.sync_log_scope(cx);
+		self.refresh_paste_candidates(cx);
 		app_log!("[APP:READY_REPOS: {}]", self.repos.len());
 		if e2e_on() {
 			for r in &self.repos {
@@ -4958,6 +4979,7 @@ impl WorkbenchModel {
 		}
 		match landed {
 			Some(paste::preview::Landed::Shown { remap }) => {
+				self.refresh_paste_candidates(cx);
 				self.show_landed_plan(remap);
 				let selected_idx =
 					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
@@ -5947,6 +5969,8 @@ fn resolve_added_repo(
 pub enum PreviewErr {
 	/// Over the 1 MiB preview limit, on any host.
 	TooLarge,
+	/// The diff output, not the file, passed the preview limit.
+	PatchTooLarge,
 	Failed(Msg),
 }
 
@@ -5967,6 +5991,9 @@ impl PreviewErr {
 	pub(crate) fn git(e: snip_core::gitsrc::GitError) -> Self {
 		match e {
 			snip_core::gitsrc::GitError::OutputLimit { .. } => Self::TooLarge,
+			snip_core::gitsrc::GitError::PatchLimit { .. } => {
+				Self::PatchTooLarge
+			}
 			other => Self::Failed(remote::git_error_msg(other)),
 		}
 	}
@@ -5986,6 +6013,9 @@ impl std::fmt::Display for PreviewErr {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::TooLarge => f.write_str("over the 1 MiB preview limit"),
+			Self::PatchTooLarge => {
+				f.write_str("diff output over the preview limit")
+			}
 			Self::Failed(m) => f.write_str(&m.render(Locale::ZhTw)),
 		}
 	}
@@ -5996,6 +6026,9 @@ impl PreviewErr {
 	pub(crate) fn msg(self, path: String) -> Msg {
 		match self {
 			Self::TooLarge => Msg::new("error_preview_too_large", [path]),
+			Self::PatchTooLarge => {
+				Msg::new("error_preview_patch_too_large", [path])
+			}
 			Self::Failed(e) => {
 				Msg::with_msg_arg("error_preview", [path, String::new()], 1, e)
 			}
@@ -6604,6 +6637,33 @@ mod tests {
 			)),
 			PreviewErr::TooLarge
 		);
+		// The synthesized patch overflowing is not the file being too large
+		// (#214).
+		assert_eq!(
+			PreviewErr::git(GitError::PatchLimit {
+				path: "big.txt".into(),
+				limit: 1048576,
+			}),
+			PreviewErr::PatchTooLarge
+		);
+		// ...and from a remote worker too: the same refusal code, told apart
+		// by the worker's flag.
+		assert_eq!(
+			PreviewErr::git(GitError::from(
+				snip_remote::RemoteError::PatchTooLarge {
+					message: "the diff is too large to send".into(),
+				}
+			)),
+			PreviewErr::PatchTooLarge
+		);
+		let text = PreviewErr::PatchTooLarge
+			.msg("big.txt".into())
+			.render(crate::i18n::Locale::ZhTw);
+		assert!(text.contains("big.txt") && text.contains("差異"), "{text}");
+		let text = PreviewErr::PatchTooLarge
+			.msg("big.txt".into())
+			.render(crate::i18n::Locale::En);
+		assert!(text.contains("big.txt") && text.contains("diff"), "{text}");
 		assert!(matches!(
 			PreviewErr::git(GitError::Host("boom".into())),
 			PreviewErr::Failed(_)
@@ -11383,6 +11443,19 @@ mod tests {
 				assert!(!m.workspace_menu, "Escape in the path field");
 			});
 
+			// Opened by its button, nothing inside focused: Escape still closes.
+			let button = cx
+				.debug_bounds("btn-workspace-menu")
+				.expect("menu button drawn");
+			cx.simulate_click(button.center(), gpui::Modifiers::none());
+			settle(cx);
+			model.read_with(cx, |m, _| assert!(m.workspace_menu));
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_menu, "Escape with no field focused");
+			});
+
 			model.update(cx, |m, cx| m.toggle_workspace_menu(cx));
 			settle(cx);
 			let button = cx
@@ -12200,6 +12273,85 @@ mod tests {
 			assert_too_large_preview(&model, cx);
 		}
 
+		/// One fixture for both hosts (#214): a tracked file under the
+		/// preview limit whose every line changed, so its diff passes the
+		/// limit, and an untracked file of exactly the limit, whose
+		/// synthesized patch does. Both say the DIFF is too large, never
+		/// that the file is.
+		fn patch_limit_fixture(ws: &Path) {
+			let r = repo(ws, "big", &[]);
+			let old: String =
+				(0..52_000).map(|i| format!("old-{i:07}\n")).collect();
+			fs::write(r.join("tracked.txt"), &old).unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "tracked"]);
+			let new: String =
+				(0..52_000).map(|i| format!("new-{i:07}\n")).collect();
+			fs::write(r.join("tracked.txt"), &new).unwrap();
+			let limit = snip_core::browser::PREVIEW_LIMIT;
+			assert!(new.len() < limit && new.len() > limit / 2);
+			assert!(old.len() + new.len() > limit);
+			let untracked = "a\n".repeat(limit / 2);
+			assert_eq!(untracked.len(), limit);
+			fs::write(r.join("untracked.txt"), &untracked).unwrap();
+		}
+
+		fn assert_patch_too_large_previews(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			cx.simulate_keystrokes("alt-0");
+			settle(cx);
+			for (group, name) in
+				[("unstaged", "tracked.txt"), ("untracked", "untracked.txt")]
+			{
+				model.update(cx, |m, cx| {
+					m.preview_error = None;
+					cx.notify();
+				});
+				click_probed(
+					model,
+					cx,
+					&format!("change-row@big:{group}:{name}"),
+				);
+				settle_until(cx, "preview error", |cx| {
+					model.read_with(cx, |m, _| m.preview_error.is_some())
+				});
+				let err = model
+					.read_with(cx, |m, _| m.preview_error.clone())
+					.expect("preview error");
+				assert_eq!(err.key, "error_preview_patch_too_large", "{err:?}");
+				let text = err.render(crate::i18n::Locale::ZhTw);
+				assert!(text.contains(name), "{text}");
+			}
+		}
+
+		#[gpui::test]
+		fn local_changes_with_an_oversized_diff_say_the_diff_is_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			patch_limit_fixture(ws.path());
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+			assert_patch_too_large_previews(&model, cx);
+		}
+
+		#[gpui::test]
+		fn remote_changes_with_an_oversized_diff_say_the_diff_is_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let shared = tempfile::tempdir().unwrap();
+			patch_limit_fixture(shared.path());
+			let (model, cx, _worker) = open_remote(
+				cx,
+				shared.path(),
+				snip_remote::WorkerOptions::default(),
+			);
+			assert_patch_too_large_previews(&model, cx);
+		}
+
 		/// A connected remote workspace whose worker cannot be started again
 		/// (#206): the client reconnects in the middle of a request and the
 		/// restart fails, as when the worker was removed or the key revoked
@@ -12362,7 +12514,6 @@ mod tests {
 		/// Clicks the control `id` where its probe says it is drawn, the way
 		/// an operator reads `[APP:CTRL_BOUNDS]`: the probe is switched on
 		/// on first use and read after the next frame.
-		#[cfg(unix)]
 		fn click_probed(
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,
@@ -15390,6 +15541,84 @@ mod tests {
 			assert_protected_paste_mapping(cx, true);
 		}
 
+		/// A preview opened before the repo scan finished gains the repos the
+		/// scan found afterwards, keeping the existing candidates' indexes.
+		#[gpui::test]
+		fn paste_preview_candidates_follow_the_scan(cx: &mut TestAppContext) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let b = repo(ws.path(), "b", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			settle_until(cx, "both repos found", |cx| {
+				model.read_with(cx, |m, _| m.repos.len() == 2)
+			});
+			let late = model.update(cx, |m, _| m.repos.pop().unwrap());
+			paste(&model, cx, "// FILE: x/one.txt\n1\n// FILE: y/two.txt\n2\n");
+			let b = dunce::canonicalize(b).unwrap();
+			let before = model.read_with(cx, |m, _| {
+				let choices = &m.paste.plan().unwrap().prefix_choices;
+				assert!(!choices.is_empty());
+				assert!(choices.iter().all(|c| !c.candidates.contains(&b)));
+				choices[0].candidates.clone()
+			});
+			model.update_in(cx, |m, _, cx| {
+				m.repos.push(late);
+				m.finish_discovery(cx);
+			});
+			model.read_with(cx, |m, _| {
+				for choice in &m.paste.plan().unwrap().prefix_choices {
+					assert!(choice.candidates.contains(&b));
+					assert_eq!(
+						choice.candidates[..before.len()],
+						before[..],
+						"existing candidates keep their index"
+					);
+				}
+			});
+		}
+
+		/// The scan finishing while a remap job is in flight: the plan that
+		/// lands carries the old candidates, and still gains the new repo.
+		#[gpui::test]
+		fn paste_candidates_follow_the_scan_during_a_remap(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let b = repo(ws.path(), "b", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			settle_until(cx, "both repos found", |cx| {
+				model.read_with(cx, |m, _| m.repos.len() == 2)
+			});
+			let late = model.update(cx, |m, _| m.repos.pop().unwrap());
+			paste(&model, cx, "// FILE: x/one.txt\n1\n");
+			let b = dunce::canonicalize(b).unwrap();
+			model.update_in(cx, |m, _, cx| {
+				m.choose_paste_prefix("x", 0, cx);
+				assert!(m.paste.is_loading(), "remap job in flight");
+				m.repos.push(late);
+				m.finish_discovery(cx);
+				assert!(m.paste.is_loading(), "refresh skipped while loading");
+			});
+			for _ in 0..100 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+					break;
+				}
+				std::thread::sleep(snip_native_e2e::scaled(
+					Duration::from_millis(10),
+				));
+			}
+			model.read_with(cx, |m, _| {
+				assert!(!m.paste.is_loading(), "remap did not land");
+				for choice in &m.paste.plan().unwrap().prefix_choices {
+					assert!(choice.candidates.contains(&b));
+				}
+			});
+		}
+
 		fn assert_protected_paste_mapping(
 			cx: &mut TestAppContext,
 			remote: bool,
@@ -17048,6 +17277,256 @@ mod tests {
 					}
 				}
 			}
+		}
+
+		/// Escape closes the Log "more" menu opened by its chip, with no
+		/// text field focused (#212).
+		#[gpui::test]
+		fn log_more_menu_closes_on_escape(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+			let more_b = cx
+				.debug_bounds("log-filter-more")
+				.expect("log-filter-more drawn at 900w");
+			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_menu, Some(crate::ui::LogMenu::FilterMore));
+			});
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_menu, None, "Escape closes the more menu");
+			});
+		}
+
+		/// One rule (#212): while a workbench popover is open, Escape closes
+		/// it first, whatever pane had the focus when it was opened.
+		#[gpui::test]
+		fn escape_closes_every_popover_from_every_focus(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			// A dirty tracked file gives the Changes list a row to preview.
+			fs::write(r.join("base.txt"), "dirty").unwrap();
+			// A second repo makes the repo filter chip appear.
+			repo(ws.path(), "other-repo", &[]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				}) {
+					break;
+				}
+			}
+			settle(cx);
+			// Reader origin: a real preview, picked through the Changes list.
+			cx.simulate_keystrokes("alt-0");
+			settle(cx);
+			let row = model.read_with(cx, |m, _| {
+				m.files.iter().position(|f| f.path == "base.txt")
+			});
+			assert!(row.is_some(), "the dirty file is listed");
+			click_probed(&model, cx, "change-repo-toggle:unstaged:my-repo");
+			click_probed(&model, cx, "change-row@my-repo:unstaged:base.txt");
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| m.preview.is_some()),
+				"clicking the change opened a preview"
+			);
+			let popover_open = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.workspace_menu
+						|| m.log_menu.is_some()
+						|| m.popover.is_some()
+				})
+			};
+			let menus = [
+				"btn-workspace-menu",
+				"btn-repo-selector",
+				"btn-ref-selector",
+				"log-filter-more",
+				"log-filter-repo",
+			];
+			// At 900w the branch and paths chips fold into "more"; the exact
+			// set drawn is pinned so a layout change cannot drop a case.
+			let drawn: Vec<&str> = [
+				"btn-workspace-menu",
+				"btn-repo-selector",
+				"btn-ref-selector",
+				"log-filter-more",
+				"log-filter-branch",
+				"log-filter-paths",
+				"log-filter-repo",
+			]
+			.into_iter()
+			.filter(|id| cx.debug_bounds(id).is_some())
+			.collect();
+			assert_eq!(drawn, menus, "the popover openers drawn at 900w");
+			// Origins come from the Escape bindings in the key map: GitLog,
+			// ToolList, Reader, TextInput (Dismiss), the find bar (a
+			// TextInput) and the bare root. PastePanel and ContextMenu cannot
+			// be open together with these menus: opening either takes the
+			// focus and the click that opened the menu closes the other. The
+			// root rule covers them all the same.
+			let mut cases = 0;
+			for origin in [
+				"log-row",
+				"tree",
+				"reader",
+				"none",
+				"log-search",
+				"find-bar",
+				"goto-bar",
+			] {
+				for id in menus {
+					click(cx, id);
+					settle(cx);
+					assert!(popover_open(cx), "{id} opened");
+					// The menu is open; the focus is in `origin` (a click on a
+					// button leaves it at the root, a row or Alt+N moves it).
+					if origin == "find-bar" || origin == "goto-bar" {
+						let goto = origin == "goto-bar";
+						model
+							.update_in(cx, |m, w, cx| m.open_find(goto, w, cx));
+					}
+					let focused = cx.update(|window, cx| {
+						let m = model.read(cx);
+						let h = match origin {
+							"find-bar" | "goto-bar" => window
+								.focused(cx)
+								.unwrap_or_else(|| m.focus_handle.clone()),
+							"log-search" => {
+								m.log_search_input.read(cx).handle()
+							}
+							"log-row" => m.log_focus.clone(),
+							"tree" => m.tree_focus.clone(),
+							"reader" => m.reader_focus.clone(),
+							_ => m.focus_handle.clone(),
+						};
+						window.focus(&h);
+						(h.clone(), m.focus_handle.clone())
+					});
+					settle(cx);
+					cx.update(|window, _| {
+						assert!(
+							focused.0.is_focused(window),
+							"{origin} holds the focus before Escape ({id})"
+						);
+						if origin == "find-bar" || origin == "goto-bar" {
+							assert!(
+								focused.0 != focused.1,
+								"the {origin} field took the focus"
+							);
+						}
+					});
+					assert!(
+						popover_open(cx),
+						"{id} is still open with the focus in {origin}"
+					);
+					cx.simulate_keystrokes("escape");
+					settle(cx);
+					assert!(
+						!popover_open(cx),
+						"Escape closes {id} opened from {origin}"
+					);
+					cases += 1;
+				}
+			}
+			assert_eq!(cases, 7 * menus.len());
+		}
+
+		/// The same rule when only the user's gestures set the focus: click a
+		/// log row, click a popover opener (the click moves the focus to the
+		/// root), press Alt+1 (the tree takes the focus, the menu stays
+		/// open), then Escape (#212). The selector shortcuts move the focus
+		/// into the filter field, whose own Dismiss would close the selector
+		/// without the root rule, so they are not used here.
+		#[gpui::test]
+		fn escape_closes_a_menu_opened_by_click_after_a_click(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			repo(ws.path(), "other-repo", &[]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				}) {
+					break;
+				}
+			}
+			settle(cx);
+			let mut cases = 0;
+			for opener in [
+				"btn-workspace-menu",
+				"btn-repo-selector",
+				"btn-ref-selector",
+				"log-filter-more",
+				"log-filter-repo",
+			] {
+				let row =
+					cx.debug_bounds("log-subject:0").expect("a commit row");
+				cx.simulate_click(row.center(), gpui::Modifiers::none());
+				settle(cx);
+				click(cx, opener);
+				settle(cx);
+				cx.simulate_keystrokes("alt-1");
+				settle(cx);
+				let (open, focused) = cx.update(|window, cx| {
+					let m = model.read(cx);
+					(
+						m.workspace_menu
+							|| m.log_menu.is_some()
+							|| m.popover.is_some(),
+						m.tree_focus.is_focused(window),
+					)
+				});
+				assert!(open, "{opener} opened");
+				assert!(
+					focused,
+					"Alt+1 moves the focus to the tree with {opener} open"
+				);
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				model.read_with(cx, |m, _| {
+					assert!(
+						!(m.workspace_menu
+							|| m.log_menu.is_some()
+							|| m.popover.is_some()),
+						"Escape closes {opener} opened after a log click"
+					);
+				});
+				cases += 1;
+			}
+			assert_eq!(cases, 5);
 		}
 
 		/// At narrow window width (900x600), overflowing log filter chips do
