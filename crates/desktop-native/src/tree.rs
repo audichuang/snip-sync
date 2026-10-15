@@ -406,7 +406,8 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 		None if io.held.is_empty() => match DirectoryScan::open(&io.dir) {
 			Ok(scan) => Some(scan),
 			Err(err) => {
-				result.error = Some(Msg::raw(format!("無法讀取目錄: {err}")));
+				result.error =
+					Some(Msg::new("tree_read_dir_failed", [err.to_string()]));
 				return result;
 			}
 		},
@@ -447,13 +448,14 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 			let page = match scan.next_page(&budget) {
 				Ok(page) => page,
 				Err(ScanError::Changed) => {
-					result.error =
-						Some(Msg::raw("目錄在讀取期間改變了，請重試"));
+					result.error = Some(Msg::new("tree_dir_changed", []));
 					return result;
 				}
 				Err(ScanError::Io(err)) => {
-					result.error =
-						Some(Msg::raw(format!("無法讀取目錄: {err}")));
+					result.error = Some(Msg::new(
+						"tree_read_dir_failed",
+						[err.to_string()],
+					));
 					return result;
 				}
 			};
@@ -503,7 +505,7 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 			node.is_valid_utf8 = false;
 			node.rel_path = String::new();
 			node.read_error =
-				Some(Box::new("non-UTF-8 filename: unselectable".into()));
+				Some(Box::new(Msg::new("tree_name_not_utf8", [])));
 		}
 		let cost = node.retained_bytes();
 		if cost > MAX_RETAINED_WORKING_TREE_BYTES {
@@ -641,7 +643,7 @@ fn build_node(
 	let read_error = if is_utf8 {
 		None
 	} else {
-		Some(Box::new(Msg::raw("non-UTF-8 filename: unselectable")))
+		Some(Box::new(Msg::new("tree_name_not_utf8", [])))
 	};
 	FileTreeNode {
 		name,
@@ -1032,7 +1034,7 @@ impl FileTreeNode {
 				if let Some(node) = self.find_mut(key) {
 					node.budget_blocked = true;
 					node.read_error =
-						Some(Box::new(Msg::raw("無法繼續：目錄游標已不在")));
+						Some(Box::new(Msg::new("tree_cursor_gone", [])));
 				}
 			}
 			return TreeEffect::Idle;

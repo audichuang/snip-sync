@@ -2248,7 +2248,7 @@ fn read_new_side(
 	host.open(root, None, &read)?
 		.changed_file_text(source, path, MAX_PREVIEW_BYTES as u64, &read)
 		.map_err(crate::remote::git_error_msg)?
-		.ok_or_else(|| "no new-side text".into())
+		.ok_or_else(|| crate::i18n::Msg::new("err_no_new_side_text", []))
 }
 
 /// Space between the line-number gutter and the code.

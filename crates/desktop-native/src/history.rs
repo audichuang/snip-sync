@@ -468,7 +468,7 @@ impl RevTree {
 						self.order.clear();
 						self.note_error(
 							"".into(),
-							"listing exceeds the tree budget".into(),
+							Msg::new("err_tree_budget", []),
 						);
 						return;
 					}
@@ -616,7 +616,7 @@ impl RevTree {
 		if entries.is_empty()
 			&& listing_cost(&dir, &entries) > MAX_RETAINED_TREE_BYTES
 		{
-			self.note_error(dir, "listing exceeds the tree budget".into());
+			self.note_error(dir, Msg::new("err_tree_budget", []));
 			return;
 		}
 		self.put_dir(dir.clone(), (entries, truncated));
@@ -1023,9 +1023,10 @@ impl PreparedHistory {
 				.iter()
 				.any(|reference| reference.sha.len() > MAX_SHA_LEN)
 		{
-			return Err(GraphAdmissionError::Layout(
-				"Commit ID exceeds graph limit".into(),
-			));
+			return Err(GraphAdmissionError::Layout(Msg::new(
+				"graph_commit_id_too_long",
+				[],
+			)));
 		}
 		{
 			// Every graph page leaves a checkpoint; none means the previous
@@ -1058,6 +1059,7 @@ impl PreparedHistory {
 					filtered,
 					shallow.clone(),
 				)
+				// ALLOWED-RAW: pending #225: layout_page returns a String
 				.map_err(|e| GraphAdmissionError::Layout(Msg::raw(e)))
 			};
 			// Filtered results keep their graph, like IntelliJ: a parent the
