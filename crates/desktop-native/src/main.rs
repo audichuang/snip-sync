@@ -12435,7 +12435,6 @@ mod tests {
 		/// Clicks the control `id` where its probe says it is drawn, the way
 		/// an operator reads `[APP:CTRL_BOUNDS]`: the probe is switched on
 		/// on first use and read after the next frame.
-		#[cfg(unix)]
 		fn click_probed(
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,
@@ -17248,6 +17247,10 @@ mod tests {
 			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
 			git(&r, &["add", "."]);
 			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			// A dirty tracked file gives the Changes list a row to preview.
+			fs::write(r.join("base.txt"), "dirty").unwrap();
+			// A second repo makes the repo filter chip appear.
+			repo(ws.path(), "other-repo", &[]);
 			let (model, cx) =
 				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
 			for _ in 0..50 {
@@ -17259,20 +17262,56 @@ mod tests {
 				}
 			}
 			settle(cx);
+			// Reader origin: a real preview, picked through the Changes list.
+			cx.simulate_keystrokes("alt-0");
+			settle(cx);
+			let row = model.read_with(cx, |m, _| {
+				m.files.iter().position(|f| f.path == "base.txt")
+			});
+			assert!(row.is_some(), "the dirty file is listed");
+			click_probed(&model, cx, "change-repo-toggle:unstaged:my-repo");
+			click_probed(&model, cx, "change-row@my-repo:unstaged:base.txt");
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| m.preview.is_some()),
+				"clicking the change opened a preview"
+			);
+			let popover_open = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.workspace_menu
+						|| m.log_menu.is_some()
+						|| m.popover.is_some()
+				})
+			};
 			let menus = [
 				"btn-workspace-menu",
+				"btn-repo-selector",
+				"btn-ref-selector",
+				"log-filter-more",
+				"log-filter-repo",
+			];
+			// At 900w the branch and paths chips fold into "more"; the exact
+			// set drawn is pinned so a layout change cannot drop a case.
+			let drawn: Vec<&str> = [
+				"btn-workspace-menu",
+				"btn-repo-selector",
+				"btn-ref-selector",
 				"log-filter-more",
 				"log-filter-branch",
 				"log-filter-paths",
 				"log-filter-repo",
-			];
-			let mut seen = 0;
+			]
+			.into_iter()
+			.filter(|id| cx.debug_bounds(id).is_some())
+			.collect();
+			assert_eq!(drawn, menus, "the popover openers drawn at 900w");
 			// Origins come from the Escape bindings in the key map: GitLog,
 			// ToolList, Reader, TextInput (Dismiss), the find bar (a
 			// TextInput) and the bare root. PastePanel and ContextMenu cannot
 			// be open together with these menus: opening either takes the
 			// focus and the click that opened the menu closes the other. The
 			// root rule covers them all the same.
+			let mut cases = 0;
 			for origin in [
 				"log-row",
 				"tree",
@@ -17283,18 +17322,9 @@ mod tests {
 				"goto-bar",
 			] {
 				for id in menus {
-					if cx.debug_bounds(id).is_none() {
-						continue;
-					}
-					seen += 1;
 					click(cx, id);
 					settle(cx);
-					assert!(
-						model.read_with(cx, |m, _| {
-							m.workspace_menu || m.log_menu.is_some()
-						}),
-						"{id} opened"
-					);
+					assert!(popover_open(cx), "{id} opened");
 					// The menu is open; the focus is in `origin` (a click on a
 					// button leaves it at the root, a row or Alt+N moves it).
 					if origin == "find-bar" || origin == "goto-bar" {
@@ -17302,14 +17332,12 @@ mod tests {
 						model
 							.update_in(cx, |m, w, cx| m.open_find(goto, w, cx));
 					}
-					cx.update(|window, cx| {
+					let focused = cx.update(|window, cx| {
 						let m = model.read(cx);
 						let h = match origin {
-							"find-bar" | "goto-bar" => {
-								let focused = window.focused(cx);
-								focused
-									.unwrap_or_else(|| m.focus_handle.clone())
-							}
+							"find-bar" | "goto-bar" => window
+								.focused(cx)
+								.unwrap_or_else(|| m.focus_handle.clone()),
 							"log-search" => {
 								m.log_search_input.read(cx).handle()
 							}
@@ -17319,19 +17347,106 @@ mod tests {
 							_ => m.focus_handle.clone(),
 						};
 						window.focus(&h);
+						(h.clone(), m.focus_handle.clone())
 					});
 					settle(cx);
+					cx.update(|window, _| {
+						assert!(
+							focused.0.is_focused(window),
+							"{origin} holds the focus before Escape ({id})"
+						);
+						if origin == "find-bar" || origin == "goto-bar" {
+							assert!(
+								focused.0 != focused.1,
+								"the {origin} field took the focus"
+							);
+						}
+					});
+					assert!(
+						popover_open(cx),
+						"{id} is still open with the focus in {origin}"
+					);
+					cx.simulate_keystrokes("escape");
+					settle(cx);
+					assert!(
+						!popover_open(cx),
+						"Escape closes {id} opened from {origin}"
+					);
+					cases += 1;
+				}
+			}
+			assert_eq!(cases, 7 * menus.len());
+		}
+
+		/// The same rule when the user's own gesture put the focus there:
+		/// a click on a log row or a Changes row, then the selector's
+		/// shortcut, then Escape (#212).
+		#[gpui::test]
+		fn escape_closes_a_selector_opened_by_shortcut_after_a_click(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			fs::write(r.join("base.txt"), "dirty").unwrap();
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				}) {
+					break;
+				}
+			}
+			settle(cx);
+			for (shortcut, kind) in [
+				("alt-shift-r", crate::Popover::Repo),
+				("secondary-shift-`", crate::Popover::Ref),
+			] {
+				for gesture in ["log-row", "change-row"] {
+					if gesture == "log-row" {
+						let row = cx
+							.debug_bounds("log-subject:0")
+							.expect("a commit row");
+						cx.simulate_click(
+							row.center(),
+							gpui::Modifiers::none(),
+						);
+					} else {
+						cx.simulate_keystrokes("alt-0");
+						settle(cx);
+						click_probed(&model, cx, "change-row:base.txt");
+					}
+					settle(cx);
+					cx.simulate_keystrokes(shortcut);
+					settle(cx);
+					model.read_with(cx, |m, _| {
+						assert_eq!(
+							m.popover,
+							Some(kind),
+							"{shortcut} opens the selector after a {gesture} click"
+						);
+					});
+					cx.update(|window, cx| {
+						let h = model.read(cx).selector_input.read(cx).handle();
+						assert!(
+							h.is_focused(window),
+							"the filter field has it"
+						);
+					});
 					cx.simulate_keystrokes("escape");
 					settle(cx);
 					model.read_with(cx, |m, _| {
-						assert!(
-							!m.workspace_menu && m.log_menu.is_none(),
-							"Escape closes {id} opened from {origin}"
+						assert_eq!(
+							m.popover, None,
+							"Escape closes the selector after a {gesture} click"
 						);
 					});
 				}
 			}
-			assert!(seen >= 8, "enough menus drawn: {seen}");
 		}
 
 		/// At narrow window width (900x600), overflowing log filter chips do

@@ -1965,11 +1965,14 @@ impl WorkbenchModel {
 		self.pending_focus = Some(self.log_focus.clone());
 	}
 
-	/// Closes the workspace menu and the log dropdown, whichever is open.
-	/// True when something was open. Only a closed log dropdown hands the
-	/// focus to the log list.
+	/// Closes every workbench popover that is open: the workspace menu, the
+	/// log dropdown and the Repo/Ref selector. True when something was open.
+	/// Only a closed log dropdown hands the focus to the log list.
 	pub fn close_open_popovers(&mut self, cx: &mut Context<Self>) -> bool {
-		let open = self.workspace_menu || self.log_menu.is_some();
+		let open = self.workspace_menu
+			|| self.log_menu.is_some()
+			|| self.popover.is_some();
+		self.close_popover(cx);
 		if self.workspace_menu {
 			self.close_workspace_menu(cx);
 		}

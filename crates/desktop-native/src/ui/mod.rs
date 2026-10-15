@@ -1582,7 +1582,8 @@ impl Render for WorkbenchModel {
 		// find bar, the paste panel, a context menu). Each of those binds its
 		// own Escape action in a deeper key context, and actions run before
 		// any key-down listener, so only a keystroke interceptor, which runs
-		// ahead of both, can take the key for the root.
+		// ahead of both, can take the key for the root. It deliberately
+		// takes Escape ahead of an IME composition while a popover is open.
 		if self.escape_guard.is_none() {
 			let me = cx.weak_entity();
 			let win = window.window_handle().window_id();
