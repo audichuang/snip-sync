@@ -167,6 +167,9 @@ impl RemoteError {
 	pub fn code(&self) -> Option<ErrorCode> {
 		match self {
 			Self::Refused { code, .. } => Some(*code),
+			// Same wire refusal as `Refused { TooLarge }`, so everything
+			// keyed on the code (a connection kept, a retry) agrees.
+			Self::PatchTooLarge { .. } => Some(ErrorCode::TooLarge),
 			_ => None,
 		}
 	}

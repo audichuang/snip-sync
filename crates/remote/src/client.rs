@@ -596,7 +596,8 @@ impl Connection {
 		});
 		self.in_flight.store(false, Ordering::SeqCst);
 		self.frames_seen = frames;
-		if res.is_err() && !matches!(res, Err(RemoteError::Refused { .. })) {
+		// A refusal is an answer: the connection is still good.
+		if res.as_ref().is_err_and(|e| e.code().is_none()) {
 			self.broken = true;
 		}
 		res
@@ -3957,6 +3958,63 @@ mod tests {
 			other => panic!("expected Refused, got {other:?}"),
 		}
 		assert_eq!(frames, 1);
+	}
+
+	fn too_large(patch: bool) -> Response {
+		Response::Error {
+			code: ErrorCode::TooLarge,
+			message: "big".into(),
+			patch,
+		}
+	}
+
+	/// Runs one `call` on a connection whose worker answers with `frames`.
+	fn call_with_frames(
+		frames: Vec<Response>,
+	) -> (Result<Response, RemoteError>, bool) {
+		let (tx, rx) = mpsc::sync_channel(frames.len() + 1);
+		for f in frames {
+			tx.send(Ok(Some(f))).unwrap();
+		}
+		let mut conn = test_conn(
+			Box::new(std::io::sink()),
+			rx,
+			Arc::default(),
+			Arc::default(),
+		);
+		let req = Request::Stat {
+			workspace: "w".into(),
+			path: "a".into(),
+		};
+		let res = conn.call(&req, None, scaled(Duration::from_secs(10)));
+		(res, conn.broken)
+	}
+
+	/// A refusal is an answer on every reply path (direct frame and the
+	/// chunked/joined one): the connection stays poolable, and only the
+	/// worker's `patch` flag turns TooLarge into the diff-limit error (#214).
+	#[test]
+	fn too_large_refusals_keep_the_connection_and_keep_patch_apart() {
+		let joined = |patch: bool| {
+			let json = serde_json::to_string(&too_large(patch)).unwrap();
+			vec![Response::Chunk { data: json }, Response::Joined]
+		};
+		for (path, frames, patch) in [
+			("direct", vec![too_large(true)], true),
+			("direct", vec![too_large(false)], false),
+			("joined", joined(true), true),
+			("joined", joined(false), false),
+		] {
+			let (res, broken) = call_with_frames(frames);
+			let err = res.unwrap_err();
+			assert_eq!(err.code(), Some(ErrorCode::TooLarge), "{path} {err:?}");
+			assert!(!broken, "{path} patch={patch}: connection marked broken");
+			match (GitError::from(err), patch) {
+				(GitError::PatchLimit { .. }, true) => {}
+				(GitError::OutputLimit { .. }, false) => {}
+				(other, _) => panic!("{path} patch={patch}: {other:?}"),
+			}
+		}
 	}
 
 	#[test]
