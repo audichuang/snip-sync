@@ -60,16 +60,16 @@ pub(crate) fn last_drawn(surface: &'static str) -> Option<String> {
 
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
-	ApplyPaste, CancelPaste, CloseMenus, CloseWorkspace, CopySelection,
-	FindInFile, FindNext, FindPrev, FocusNext, FocusPrev, GotoLine,
-	HistoryNextPage, HistoryPrevPage, LogCopy, LogDown, LogExtendDown,
-	LogExtendUp, LogHead, LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle,
-	NavUp, OpenRefSelector, OpenRepoSelector, OpenWorkspace, PastePreview,
-	Popover, Quit, ReaderClear, ReaderCopy, ReaderDown, ReaderPageDown,
-	ReaderPageUp, ReaderSelectAll, ReaderUp, Refresh, RepoEntryKind,
-	SelectRepo1, SelectRepo2, ShowChanges, ShowProject, Splitter, ToggleLocale,
-	ToggleLog, ToggleTab, TreeCollapse, TreeDown, TreeExpand, TreeOpen,
-	TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
+	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
+	FindNext, FindPrev, FocusNext, FocusPrev, GotoLine, HistoryNextPage,
+	HistoryPrevPage, LogCopy, LogDown, LogExtendDown, LogExtendUp, LogHead,
+	LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle, NavUp, OpenRefSelector,
+	OpenRepoSelector, OpenWorkspace, PastePreview, Popover, Quit, ReaderClear,
+	ReaderCopy, ReaderDown, ReaderPageDown, ReaderPageUp, ReaderSelectAll,
+	ReaderUp, Refresh, RepoEntryKind, SelectRepo1, SelectRepo2, ShowChanges,
+	ShowProject, Splitter, ToggleLocale, ToggleLog, ToggleTab, TreeCollapse,
+	TreeDown, TreeExpand, TreeOpen, TreeToggle, TreeUp, WorkbenchModel,
+	WorkbenchTab,
 };
 use crate::{NextDiff, PrevDiff};
 
@@ -1577,6 +1577,31 @@ impl Render for WorkbenchModel {
 					cx.notify();
 				}));
 		}
+		// One rule: while a popover is open, a bare Escape closes it first,
+		// whatever has the focus (a pane list, the reader, a text field, the
+		// find bar, the paste panel, a context menu). Each of those binds its
+		// own Escape action in a deeper key context, and actions run before
+		// any key-down listener, so only a keystroke interceptor, which runs
+		// ahead of both, can take the key for the root.
+		if self.escape_guard.is_none() {
+			let me = cx.weak_entity();
+			let win = window.window_handle().window_id();
+			self.escape_guard =
+				Some(cx.intercept_keystrokes(move |ev, window, cx| {
+					if ev.keystroke.key != "escape"
+						|| ev.keystroke.modifiers.modified()
+						|| window.window_handle().window_id() != win
+					{
+						return;
+					}
+					let closed = me
+						.update(cx, |this, cx| this.close_open_popovers(cx))
+						.unwrap_or(false);
+					if closed {
+						cx.stop_propagation();
+					}
+				}));
+		}
 		if window.focused(cx).is_none() {
 			window.focus(&self.focus_handle);
 		}
@@ -1750,27 +1775,6 @@ impl Render for WorkbenchModel {
 			}))
 			.on_action(cx.listener(|this, _: &OpenRefSelector, window, cx| {
 				this.open_popover(Popover::Ref, window, cx)
-			}))
-			.on_action(cx.listener(|this, _: &CloseMenus, _, cx| {
-				// Escape closes an open popover; with none open it goes on.
-				if !this.close_open_popovers(cx) {
-					cx.propagate();
-				}
-			}))
-			// One rule: while a popover is open, Escape closes it first, whatever
-			// pane has focus. Panes bind their own Escape action in a deeper
-			// key context, so the root takes those in the capture phase.
-			.capture_action(cx.listener(
-				|this, _: &crate::FocusEditor, _, cx| {
-					if this.close_open_popovers(cx) {
-						cx.stop_propagation();
-					}
-				},
-			))
-			.capture_action(cx.listener(|this, _: &ReaderClear, _, cx| {
-				if this.close_open_popovers(cx) {
-					cx.stop_propagation();
-				}
 			}))
 			.on_action(cx.listener(|this, _: &ToggleLocale, _, cx| {
 				this.toggle_locale(cx)

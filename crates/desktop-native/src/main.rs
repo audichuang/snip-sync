@@ -268,7 +268,6 @@ actions!(
 		CloseWorkspace,
 		OpenWorkspace,
 		ToggleLocale,
-		CloseMenus,
 		HistoryNextPage,
 		HistoryPrevPage,
 		FindInFile,
@@ -933,6 +932,7 @@ pub struct WorkbenchModel {
 	/// The frame's focus guard, registered once: a focused element that is
 	/// no longer drawn returns the keyboard to `focus_handle`.
 	pub(crate) focus_lost_guard: Option<gpui::Subscription>,
+	pub(crate) escape_guard: Option<gpui::Subscription>,
 	pub e2e_read_delay: Option<std::time::Duration>,
 	/// Test hook: holds a finished Log commit read before it installs.
 	pub e2e_log_read_delay: Option<std::time::Duration>,
@@ -1453,6 +1453,7 @@ impl WorkbenchModel {
 			probes,
 			pending_focus: None,
 			focus_lost_guard: None,
+			escape_guard: None,
 			e2e_read_delay: ui::e2e_read_delay(),
 			e2e_log_read_delay: None,
 			e2e_tree_hold: ui::e2e_tree_hold(),
@@ -2903,6 +2904,7 @@ impl WorkbenchModel {
 	) {
 		self.resume_focus = keep;
 		self.focus_lost_guard = None;
+		self.escape_guard = None;
 		self.chrome.menu = None;
 		self.dragging = None;
 		// A background tab keeps no browse ssh.
@@ -6295,7 +6297,6 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("ctrl-shift-o", OpenWorkspace, None),
 		KeyBinding::new("cmd-shift-o", OpenWorkspace, None),
 		KeyBinding::new("alt-l", ToggleLocale, None),
-		KeyBinding::new("escape", CloseMenus, None),
 		KeyBinding::new("alt-n", HistoryNextPage, None),
 		KeyBinding::new("alt-p", HistoryPrevPage, None),
 		KeyBinding::new("ctrl-f", FindInFile, None),
@@ -17256,7 +17257,21 @@ mod tests {
 				"log-filter-repo",
 			];
 			let mut seen = 0;
-			for origin in ["log-row", "tree", "reader", "none"] {
+			// Origins come from the Escape bindings in the key map: GitLog,
+			// ToolList, Reader, TextInput (Dismiss), the find bar (a
+			// TextInput) and the bare root. PastePanel and ContextMenu cannot
+			// be open together with these menus: opening either takes the
+			// focus and the click that opened the menu closes the other. The
+			// root rule covers them all the same.
+			for origin in [
+				"log-row",
+				"tree",
+				"reader",
+				"none",
+				"log-search",
+				"find-bar",
+				"goto-bar",
+			] {
 				for id in menus {
 					if cx.debug_bounds(id).is_none() {
 						continue;
@@ -17272,9 +17287,22 @@ mod tests {
 					);
 					// The menu is open; the focus is in `origin` (a click on a
 					// button leaves it at the root, a row or Alt+N moves it).
+					if origin == "find-bar" || origin == "goto-bar" {
+						let goto = origin == "goto-bar";
+						model
+							.update_in(cx, |m, w, cx| m.open_find(goto, w, cx));
+					}
 					cx.update(|window, cx| {
 						let m = model.read(cx);
 						let h = match origin {
+							"find-bar" | "goto-bar" => {
+								let focused = window.focused(cx);
+								focused
+									.unwrap_or_else(|| m.focus_handle.clone())
+							}
+							"log-search" => {
+								m.log_search_input.read(cx).handle()
+							}
 							"log-row" => m.log_focus.clone(),
 							"tree" => m.tree_focus.clone(),
 							"reader" => m.reader_focus.clone(),
