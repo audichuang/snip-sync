@@ -51,8 +51,9 @@ pub(crate) fn drawn(surface: &'static str, text: String) -> String {
 	text
 }
 
-/// What `surface` drew last, if it has drawn at all.
-#[cfg(test)]
+/// What `surface` drew last, if it has drawn at all. Only the remote tests
+/// read it, and those are `cfg(unix)`.
+#[cfg(all(test, unix))]
 pub(crate) fn last_drawn(surface: &'static str) -> Option<String> {
 	DRAWN.with(|d| d.borrow().get(surface).cloned())
 }
