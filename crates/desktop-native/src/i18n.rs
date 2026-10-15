@@ -503,7 +503,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_not_utf8" => "[非 UTF-8 文字檔案: {}]",
 			"error_too_large" => "[檔案「{}」過大 ({} 位元組)，超出預覽上限]",
 			"error_preview_too_large" => "[檔案「{}」超過 1 MiB 預覽上限，無法預覽]",
-			"error_preview_patch_too_large" => "[「{}」的差異輸出超過預覽上限，無法預覽；請到 Project 檢視檔案內容]",
+			"error_preview_patch_too_large" => "[「{}」的差異輸出超過預覽上限，無法預覽；請到「專案」檢視檔案內容]",
 			"repo_error_short" => "異常",
 			"btn_back_to_working" => "返回工作目錄",
 			"btn_browse_tree" => "瀏覽檔案樹",

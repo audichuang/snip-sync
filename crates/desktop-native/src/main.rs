@@ -6646,6 +6646,16 @@ mod tests {
 			}),
 			PreviewErr::PatchTooLarge
 		);
+		// ...and from a remote worker too: the same refusal code, told apart
+		// by the worker's flag.
+		assert_eq!(
+			PreviewErr::git(GitError::from(
+				snip_remote::RemoteError::PatchTooLarge {
+					message: "the diff is too large to send".into(),
+				}
+			)),
+			PreviewErr::PatchTooLarge
+		);
 		let text = PreviewErr::PatchTooLarge
 			.msg("big.txt".into())
 			.render(crate::i18n::Locale::ZhTw);

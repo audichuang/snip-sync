@@ -295,6 +295,7 @@ pub(crate) fn write_response<W: Write>(
 			&Response::Error {
 				code: ErrorCode::TooLarge,
 				message: err.to_string(),
+				patch: false,
 			},
 		),
 		other => other,
@@ -402,6 +403,7 @@ fn past_deadline_reply<W: Write>(
 			&Response::Error {
 				code: ErrorCode::Timeout,
 				message: "the job timed out".into(),
+				patch: false,
 			},
 		);
 	}
@@ -784,7 +786,7 @@ mod tests {
 		while let Some(frame) = read_frame::<Response>(&mut cursor).unwrap() {
 			match frame {
 				Response::Pending => {}
-				Response::Error { code, message } => {
+				Response::Error { code, message, .. } => {
 					last_error = Some((code, message));
 				}
 				other => panic!("unexpected frame: {other:?}"),

@@ -23,6 +23,7 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Response {
 	Response::Error {
 		code,
 		message: message.into(),
+		patch: false,
 	}
 }
 

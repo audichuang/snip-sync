@@ -48,6 +48,7 @@ pub(crate) fn scan(
 				return Response::Error {
 					code: ErrorCode::BadRequest,
 					message: "invalid folder".into(),
+					patch: false,
 				};
 			}
 			let resolved = match snip_core::browser::inside(&root.path, u) {
@@ -58,6 +59,7 @@ pub(crate) fn scan(
 				return Response::Error {
 					code: ErrorCode::NotFound,
 					message: "not a directory".into(),
+					patch: false,
 				};
 			}
 			Some(resolved)
@@ -717,6 +719,7 @@ pub(crate) fn map_git_error_with_leaked(
 	share: &Path,
 	leaked: usize,
 ) -> Response {
+	let mut patch = false;
 	let (code, message) = match err {
 		GitError::NotARepository(_) | GitError::ToplevelAbove(_) => {
 			(ErrorCode::NotARepository, "not a git repository".into())
@@ -758,16 +761,27 @@ pub(crate) fn map_git_error_with_leaked(
 			ErrorCode::TooLarge,
 			scrub(&format!("repository too large to verify: {what}"), share),
 		),
-		GitError::OutputLimit { .. } | GitError::PatchLimit { .. } => (
+		GitError::OutputLimit { .. } => (
 			ErrorCode::TooLarge,
 			"the result is too large to send; narrow the request".into(),
 		),
+		GitError::PatchLimit { .. } => {
+			patch = true;
+			(
+				ErrorCode::TooLarge,
+				"the diff is too large to send; narrow the request".into(),
+			)
+		}
 		GitError::Failed { .. } => {
 			(ErrorCode::Io, "git could not read this repository".into())
 		}
 		other => (ErrorCode::Io, scrub(&other.to_string(), share)),
 	};
-	Response::Error { code, message }
+	Response::Error {
+		code,
+		message,
+		patch,
+	}
 }
 
 /// Resolves repo and answers a GitView request.
@@ -780,7 +794,13 @@ pub(crate) fn handle_git_view(
 ) -> Response {
 	let view = match open_repo(root, repo, read, cache) {
 		Ok(v) => v,
-		Err((code, message)) => return Response::Error { code, message },
+		Err((code, message)) => {
+			return Response::Error {
+				code,
+				message,
+				patch: false,
+			}
+		}
 	};
 	match answer(&view, query, read) {
 		Ok(reply) => Response::Git(reply),
@@ -841,7 +861,7 @@ fn open_repo(
 			Ok(view)
 		}
 		Err(err) => match map_git_error(err, &root.path) {
-			Response::Error { code, message } => Err((code, message)),
+			Response::Error { code, message, .. } => Err((code, message)),
 			_ => unreachable!(),
 		},
 	}
@@ -968,7 +988,7 @@ mod tests {
 			share,
 			0,
 		);
-		let Response::Error { code, message } = r_busy_clean else {
+		let Response::Error { code, message, .. } = r_busy_clean else {
 			panic!("expected Error");
 		};
 		assert_eq!(code, ErrorCode::Busy);
@@ -979,7 +999,7 @@ mod tests {
 			share,
 			1,
 		);
-		let Response::Error { code, message } = r_busy_leaked else {
+		let Response::Error { code, message, .. } = r_busy_leaked else {
 			panic!("expected Error");
 		};
 		assert_eq!(code, ErrorCode::Busy);
@@ -993,7 +1013,7 @@ mod tests {
 			share,
 			2,
 		);
-		let Response::Error { code, message } = r_qfull_leaked else {
+		let Response::Error { code, message, .. } = r_qfull_leaked else {
 			panic!("expected Error");
 		};
 		assert_eq!(code, ErrorCode::Busy);
@@ -1384,7 +1404,7 @@ mod tests {
 			},
 			share,
 		);
-		let Response::Error { code, message } = r_limit else {
+		let Response::Error { code, message, .. } = r_limit else {
 			panic!("expected Error");
 		};
 		assert_eq!(code, ErrorCode::TooLarge);
@@ -1415,6 +1435,56 @@ mod tests {
 				..
 			}
 		));
+
+		// A diff over its limit keeps its own meaning across the wire (#214):
+		// worker -> JSON -> master, for each size limit a git read can hit.
+		for (err, want_patch) in [
+			(
+				GitError::OutputLimit {
+					args: "cat-file".into(),
+					limit: 1,
+				},
+				false,
+			),
+			(
+				GitError::PatchLimit {
+					path: "big.txt".into(),
+					limit: 1,
+				},
+				true,
+			),
+		] {
+			let wire = serde_json::to_string(&map_git_error(err, share))
+				.expect("serialize");
+			assert_eq!(wire.contains("\"patch\""), want_patch, "{wire}");
+			let Response::Error {
+				code,
+				message,
+				patch,
+			} = serde_json::from_str(&wire).expect("deserialize")
+			else {
+				panic!("expected Error");
+			};
+			assert_eq!(code, ErrorCode::TooLarge);
+			let back =
+				GitError::from(crate::client::refusal(code, message, patch));
+			assert_eq!(
+				matches!(back, GitError::PatchLimit { .. }),
+				want_patch,
+				"{back:?}"
+			);
+			assert_eq!(
+				matches!(back, GitError::OutputLimit { .. }),
+				!want_patch,
+				"{back:?}"
+			);
+		}
+		// A worker that predates the field sends none: a plain TooLarge.
+		let old: Response = serde_json::from_str(
+			r#"{"reply":"error","code":"too_large","message":"x"}"#,
+		)
+		.expect("old frame");
+		assert!(matches!(old, Response::Error { patch: false, .. }));
 
 		// Failed
 		let r = map_git_error(
@@ -1491,7 +1561,7 @@ mod tests {
 			code: Some(128),
 		};
 		let resp = map_git_error(err, Path::new("/var/workspace"));
-		let Response::Error { code, message } = resp else {
+		let Response::Error { code, message, .. } = resp else {
 			panic!("expected Error response");
 		};
 		assert_eq!(code, ErrorCode::Io);

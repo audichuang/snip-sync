@@ -72,6 +72,10 @@ pub enum RemoteError {
 	/// The worker answered with an error.
 	#[error("{message}")]
 	Refused { code: ErrorCode, message: String },
+	/// A `TooLarge` refusal whose file is fine: the diff built from it is
+	/// over the limit (#214). The same wire code as [`Self::Refused`].
+	#[error("{message}")]
+	PatchTooLarge { message: String },
 	#[error("protocol: {0}")]
 	Protocol(String),
 	#[error("cancelled")]

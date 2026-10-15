@@ -1001,7 +1001,11 @@ fn serve_copy(
 }
 
 fn error(code: ErrorCode, message: String) -> Response {
-	Response::Error { code, message }
+	Response::Error {
+		code,
+		message,
+		patch: false,
+	}
 }
 
 fn map_admit_error(code: ErrorCode) -> Response {

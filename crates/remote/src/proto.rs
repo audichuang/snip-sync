@@ -711,6 +711,11 @@ pub enum Response {
 	Error {
 		code: ErrorCode,
 		message: String,
+		/// With [`ErrorCode::TooLarge`]: the file is fine, the diff built
+		/// from it is over the limit (#214). A peer that does not know the
+		/// field ignores it and reads a plain `TooLarge`.
+		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+		patch: bool,
 	},
 }
 
@@ -1288,10 +1293,12 @@ mod tests {
 			Response::Error {
 				code: ErrorCode::Stale,
 				message: "stale destination in '/w': gone".into(),
+				patch: false,
 			},
 			Response::Error {
 				code: ErrorCode::Collision,
 				message: "target collision".into(),
+				patch: false,
 			},
 			Response::Repos(RepoScan {
 				repos: vec![ScannedRepo {
@@ -1315,26 +1322,32 @@ mod tests {
 			Response::Error {
 				code: ErrorCode::NotARepository,
 				message: "not a git repo".into(),
+				patch: false,
 			},
 			Response::Error {
 				code: ErrorCode::InvalidRevision,
 				message: "invalid rev".into(),
+				patch: false,
 			},
 			Response::Error {
 				code: ErrorCode::Timeout,
 				message: "timed out".into(),
+				patch: false,
 			},
 			Response::Error {
 				code: ErrorCode::Busy,
 				message: "busy".into(),
+				patch: false,
 			},
 			Response::Error {
 				code: ErrorCode::Cancelled,
 				message: "cancelled".into(),
+				patch: false,
 			},
 			Response::Error {
 				code: ErrorCode::OutsideShare,
 				message: "outside share".into(),
+				patch: false,
 			},
 		];
 		for res in &responses {

@@ -459,9 +459,11 @@ impl Connection {
 				conn.version = max_version.unwrap_or(1).clamp(1, PROTOCOL_MAX);
 				Ok(conn)
 			}
-			Ok(Some(Response::Error { code, message })) => {
-				Err(RemoteError::Refused { code, message })
-			}
+			Ok(Some(Response::Error {
+				code,
+				message,
+				patch,
+			})) => Err(refusal(code, message, patch)),
 			Ok(Some(_)) => Err(RemoteError::Protocol("expected hello".into())),
 			Ok(None) | Err(RemoteError::Io(_)) | Err(RemoteError::TimedOut) => {
 				let cause = match &reply {
@@ -1071,9 +1073,11 @@ pub(crate) fn exchange(
 					}
 					Response::Joined => {
 						return match serde_json::from_str::<Response>(&text) {
-							Ok(Response::Error { code, message }) => {
-								Err(RemoteError::Refused { code, message })
-							}
+							Ok(Response::Error {
+								code,
+								message,
+								patch,
+							}) => Err(refusal(code, message, patch)),
 							Ok(
 								Response::Chunk { .. }
 								| Response::Joined
@@ -1105,8 +1109,12 @@ pub(crate) fn exchange(
 							return Err(RemoteError::Cancelled);
 						}
 					}
-					Response::Error { code, message } => {
-						return Err(RemoteError::Refused { code, message });
+					Response::Error {
+						code,
+						message,
+						patch,
+					} => {
+						return Err(refusal(code, message, patch));
 					}
 					response => return Ok(response),
 				}
@@ -2887,6 +2895,20 @@ impl RepoView for RemoteRepo {
 	}
 }
 
+/// The master's side of a worker refusal: a diff over its limit keeps its
+/// own variant, so it is not read as the file being too large.
+pub(crate) fn refusal(
+	code: ErrorCode,
+	message: String,
+	patch: bool,
+) -> RemoteError {
+	if patch && code == ErrorCode::TooLarge {
+		RemoteError::PatchTooLarge { message }
+	} else {
+		RemoteError::Refused { code, message }
+	}
+}
+
 impl From<RemoteError> for GitError {
 	fn from(err: RemoteError) -> Self {
 		match err {
@@ -2894,6 +2916,10 @@ impl From<RemoteError> for GitError {
 				code: ErrorCode::InvalidRevision,
 				message,
 			} => GitError::InvalidRevision(message),
+			RemoteError::PatchTooLarge { .. } => GitError::PatchLimit {
+				path: String::new(),
+				limit: 0,
+			},
 			RemoteError::Refused {
 				code: ErrorCode::TooLarge,
 				..
@@ -3179,6 +3205,7 @@ mod tests {
 			Some(Response::Error {
 				code: ErrorCode::Stale,
 				message: "expired; preview again".into(),
+				patch: false,
 			}),
 		] {
 			let unknown = response.is_none();
@@ -3216,6 +3243,7 @@ mod tests {
 		fixture.answer(Some(Response::Error {
 			code: ErrorCode::Busy,
 			message: "busy".into(),
+			patch: false,
 		}));
 		assert!(matches!(
 			join_prepared(first),
@@ -3909,6 +3937,7 @@ mod tests {
 		let mut stream = FakeDuplex::new(&[Response::Error {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
+			patch: false,
 		}]);
 		let mut frames = 0;
 		let err = exchange(
