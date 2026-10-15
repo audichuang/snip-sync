@@ -5094,6 +5094,10 @@ fn native_multi_repo_log_merges_and_filters_repositories() {
 		.unwrap();
 	assert!(st.success());
 	let rx = &app.rx;
+	// The layout is read from probes next: wait for the frame at the new size,
+	// or a slow first frame leaves the old splitter bounds to be dragged.
+	lines_until(rx, "[APP:VIEWPORT: 1280x860]", Duration::from_secs(8))
+		.expect("the window must reach 1280x860 before its layout is read");
 	let wait = |pattern: &str| {
 		lines_until(rx, pattern, Duration::from_secs(8))
 			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
@@ -5454,6 +5458,10 @@ fn log_multiselect(theme: &str) {
 			.success());
 	}
 	let rx = &app.rx;
+	// The layout is read from probes next: wait for the frame at the new size,
+	// or a slow first frame leaves the old splitter bounds to be dragged.
+	lines_until(rx, "[APP:VIEWPORT: 1280x860]", Duration::from_secs(8))
+		.expect("the window must reach 1280x860 before its layout is read");
 	let wait = |pattern: &str| {
 		lines_until(rx, pattern, Duration::from_secs(8))
 			.unwrap_or_else(|e| panic!("{pattern}: {e}"))
@@ -5785,6 +5793,10 @@ fn native_merged_graph_over_four_repositories() {
 			.success());
 	}
 	let rx = &app.rx;
+	// The layout is read from probes next: wait for the frame at the new size,
+	// or a slow first frame leaves the old splitter bounds to be dragged.
+	lines_until(rx, "[APP:VIEWPORT: 1280x900]", Duration::from_secs(8))
+		.expect("the window must reach 1280x900 before its layout is read");
 	let settled = || {
 		let deadline = Instant::now() + scaled(Duration::from_secs(8));
 		loop {
