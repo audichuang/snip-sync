@@ -316,6 +316,14 @@ impl Probes {
 		ids
 	}
 
+	/// Test only: where a control was last drawn, in physical pixels
+	/// `[x, y, w, h]`: what an operator reads from `[APP:CTRL_BOUNDS]`.
+	#[cfg(all(test, unix))]
+	pub fn bounds(&self, id: &str) -> Option<[i32; 4]> {
+		let f = self.0.borrow();
+		f.seen.get(id).or_else(|| f.shown.get(id)).copied()
+	}
+
 	/// Test only: runs end_frame_with_audit on the underlying ProbeFrame.
 	#[cfg(test)]
 	pub fn end_frame_with_audit(

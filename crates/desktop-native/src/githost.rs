@@ -105,7 +105,7 @@ pub(crate) fn refs_error(
 	{
 		crate::i18n::t("remote_refs_too_large", locale).to_string()
 	} else {
-		e.to_string()
+		crate::remote::git_error_loc(e, locale)
 	}
 }
 

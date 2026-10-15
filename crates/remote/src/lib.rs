@@ -51,22 +51,7 @@ pub enum ConnectFailureKind {
 	Other,
 }
 
-/// The known causes of a worker that did not start, for callers that word
-/// them in their own language. The English `message` stays the CLI's text.
-/// It follows `start_message`'s wording classes, so the CLI and the GUI
-/// agree; [`ConnectFailureKind`] (`kind`) drives retry policy instead and
-/// classifies differently, so the two are not interchangeable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartReason {
-	/// snip is missing on that machine or too old for `serve --stdio`.
-	NoWorker,
-	/// ssh was refused and cannot ask for a password.
-	KeyLogin,
-	/// The worker never sent its hello in time.
-	NoAnswer,
-	/// The far end closed before snip started.
-	Closed,
-}
+pub use snip_core::gitsrc::StartReason;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {

@@ -806,9 +806,11 @@ fn read_graph_page(
 				.map_err(|e| crate::githost::refs_error(host, e, locale))?;
 			let filter_tip =
 				match ref_filter.as_deref().filter(|r| !r.is_empty()) {
-					Some(r) => Some(
-						g.resolve_commit(r, read).map_err(|e| e.to_string())?,
-					),
+					Some(r) => {
+						Some(g.resolve_commit(r, read).map_err(|e| {
+							crate::remote::git_error_loc(e, locale)
+						})?)
+					}
 					None => None,
 				};
 			git = Some(g);
@@ -843,7 +845,7 @@ fn read_graph_page(
 		}
 		let (window, more) = g
 			.log_from_tips(&tips, start, HISTORY_WINDOW.max(size), read)
-			.map_err(|e| e.to_string())?;
+			.map_err(|e| crate::remote::git_error_loc(e, locale))?;
 		walk.start = start;
 		walk.window = window;
 		walk.more = more;
@@ -871,10 +873,11 @@ fn read_preview(
 	change: Option<snip_core::format::ChangeType>,
 	parents: Option<&[String]>,
 	read: &Read,
+	loc: crate::i18n::Locale,
 ) -> Result<browser::SourcePreview, crate::PreviewErr> {
 	let preview = g
 		.preview(source, path, change.map(|c| (c, parents)), read)
-		.map_err(crate::PreviewErr::from)?;
+		.map_err(|e| crate::PreviewErr::git(e, loc))?;
 	Ok(browser::SourcePreview {
 		content: preview.content,
 		patch: preview.patch,
@@ -1297,7 +1300,9 @@ impl WorkbenchModel {
 								page_size,
 								&read,
 							)
-							.map_err(|e| e.to_string())?;
+							.map_err(|e| {
+								crate::remote::git_error_loc(e, locale)
+							})?;
 						Ok((
 							browser::RepositoryHistory {
 								root: String::new(),
@@ -2058,6 +2063,7 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.details_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
+		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2073,7 +2079,8 @@ impl WorkbenchModel {
 							cancel: Some(cancel),
 						};
 						let g = host.open(&root, identity.as_ref(), &read)?;
-						g.commit_details(&sha, &read).map_err(|e| e.to_string())
+						g.commit_details(&sha, &read)
+							.map_err(|e| crate::remote::git_error_loc(e, loc))
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2342,6 +2349,7 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
+		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2366,7 +2374,7 @@ impl WorkbenchModel {
 								MAX_COMMIT_FILES,
 								&listing,
 							)
-							.map_err(|e| e.to_string())
+							.map_err(|e| crate::remote::git_error_loc(e, loc))
 						}))
 					})
 					.await;
@@ -2521,6 +2529,7 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
+		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2553,7 +2562,9 @@ impl WorkbenchModel {
 								MAX_COMMIT_FILES,
 								&listing_read,
 							)
-							.map_err(|e| e.to_string())?;
+							.map_err(|e| {
+								crate::remote::git_error_loc(e, loc)
+							})?;
 						// A merge lists the files changed against any parent.
 						// Those unchanged against the first parent are marked
 						// (#188): the same list as a Range from the first parent.
@@ -2602,6 +2613,7 @@ impl WorkbenchModel {
 									*change,
 									parents.as_deref(),
 									&preview_read,
+									loc,
 								),
 							)
 						});
@@ -2756,6 +2768,7 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
+		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2779,6 +2792,7 @@ impl WorkbenchModel {
 							change,
 							parents.as_deref(),
 							&read,
+							loc,
 						)
 					})
 					.await;
@@ -2947,6 +2961,7 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.rev_tree_cancel);
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
+		let loc = self.locale;
 		let identity = self.identity_for(&root);
 
 		let mut async_app = cx.to_async();
@@ -2971,7 +2986,7 @@ impl WorkbenchModel {
 							MAX_REV_ROWS,
 							&read,
 						)
-						.map_err(|e| e.to_string())
+						.map_err(|e| crate::remote::git_error_loc(e, loc))
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -3051,6 +3066,7 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
+		let loc = self.locale;
 		let identity = self.identity_for(&root);
 
 		self.selected_file = None;
@@ -3083,7 +3099,7 @@ impl WorkbenchModel {
 							browser::MAX_BLOB_BYTES,
 							&read,
 						)
-						.map_err(crate::PreviewErr::from)
+						.map_err(|e| crate::PreviewErr::git(e, loc))
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -3379,7 +3395,7 @@ fn read_feed_page(
 		}
 		None => g.log_from_tips(&out.tips, skip, multi_log::FEED_PAGE, read),
 	}
-	.map_err(|e| e.to_string())?;
+	.map_err(|e| crate::remote::git_error_loc(e, locale))?;
 	out.commits = commits;
 	out.more = more;
 	Ok(out)

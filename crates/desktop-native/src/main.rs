@@ -3491,6 +3491,7 @@ impl WorkbenchModel {
 		let ws_gen = self.lifecycle.generation();
 		let hold = self.e2e_tree_hold.clone();
 		let remote = self.remote_target();
+		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -3517,6 +3518,7 @@ impl WorkbenchModel {
 										&session_root,
 										io,
 										Some(&cancel_bg),
+										loc,
 									)
 								}
 								None => {
@@ -4257,6 +4259,7 @@ impl WorkbenchModel {
 		let delay = self.e2e_read_delay;
 		let remote = self.remote_target();
 		let host = self.git_host();
+		let loc = self.locale;
 		if e2e_on() {
 			app_log!("[APP:PREVIEW_LOADING: {file_path}]");
 		}
@@ -4280,6 +4283,7 @@ impl WorkbenchModel {
 									&prefix,
 									&for_bg,
 									Some(&cancel),
+									loc,
 								),
 								None => Err(PreviewErr::Failed(
 									"not under the workspace".into(),
@@ -4287,7 +4291,7 @@ impl WorkbenchModel {
 							}
 						}
 						_ => read_preview(
-							&host, &repo_root, &for_bg, &source, cancel,
+							&host, &repo_root, &for_bg, &source, cancel, loc,
 						),
 					}
 				})
@@ -4677,6 +4681,7 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 		let ws_gen = self.lifecycle.generation();
+		let loc = self.locale;
 		self.spawn_owned(
 			cx,
 			lifecycle::JobKind::CancellableRead,
@@ -4696,7 +4701,7 @@ impl WorkbenchModel {
 							.map_err(|e| {
 								Msg::new(
 									"error_payload",
-									[crate::remote::describe(e)],
+									[crate::remote::describe_loc(e, loc)],
 								)
 							})?;
 						if out.copied == 0 {
@@ -4774,6 +4779,7 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 		let ws_gen = self.lifecycle.generation();
+		let loc = self.locale;
 
 		self.spawn_owned(
 			cx,
@@ -4792,7 +4798,9 @@ impl WorkbenchModel {
 									selected,
 									Some(&run_token),
 								)
-								.map_err(crate::remote::describe)?;
+								.map_err(|e| {
+									crate::remote::describe_loc(e, loc)
+								})?;
 							let status = commit_copied_status(&out);
 							return Ok((out.text, out.commit_count, status));
 						}
@@ -5058,11 +5066,12 @@ impl WorkbenchModel {
 				dest: target_dest,
 				roots: known_roots,
 				generation: self.generation,
-				remote: self
-					.remote
-					.session
-					.clone()
-					.map(|session| paste::RemotePaste { session }),
+				remote: self.remote.session.clone().map(|session| {
+					paste::RemotePaste {
+						session,
+						locale: self.locale,
+					}
+				}),
 			},
 			cx,
 		);
@@ -5916,11 +5925,15 @@ impl From<String> for PreviewErr {
 	}
 }
 
-impl From<snip_core::gitsrc::GitError> for PreviewErr {
-	fn from(e: snip_core::gitsrc::GitError) -> Self {
+impl PreviewErr {
+	/// A Git read's failure, worded in the interface language.
+	pub(crate) fn git(
+		e: snip_core::gitsrc::GitError,
+		loc: crate::i18n::Locale,
+	) -> Self {
 		match e {
 			snip_core::gitsrc::GitError::OutputLimit { .. } => Self::TooLarge,
-			other => Self::Failed(other.to_string()),
+			other => Self::Failed(remote::git_error_loc(other, loc)),
 		}
 	}
 }
@@ -5960,6 +5973,7 @@ fn read_preview(
 	path: &str,
 	source: &SourceKind,
 	cancel: CancelToken,
+	loc: crate::i18n::Locale,
 ) -> Result<(browser::SourcePreview, PreviewSource), PreviewErr> {
 	if matches!(source, SourceKind::File) {
 		return browser::file_preview(repo_root, path)
@@ -5999,7 +6013,7 @@ fn read_preview(
 		)),
 		// A failed/cancelled Git source must never be replaced by current
 		// working-tree bytes. Explicit File/tree sources are handled above.
-		Err(e) => Err(e.into()),
+		Err(e) => Err(PreviewErr::git(e, loc)),
 	}
 }
 
@@ -6531,21 +6545,25 @@ mod tests {
 		use super::PreviewErr;
 		use snip_core::gitsrc::GitError;
 		assert_eq!(
-			PreviewErr::from(GitError::OutputLimit {
-				args: "cat-file x:big".into(),
-				limit: 1048576,
-			}),
+			PreviewErr::git(
+				GitError::OutputLimit {
+					args: "cat-file x:big".into(),
+					limit: 1048576,
+				},
+				crate::i18n::Locale::En
+			),
 			PreviewErr::TooLarge
 		);
 		assert_eq!(
-			PreviewErr::from(GitError::from(
-				snip_remote::RemoteError::Refused {
+			PreviewErr::git(
+				GitError::from(snip_remote::RemoteError::Refused {
 					code: snip_remote::ErrorCode::TooLarge,
 					message:
 						"the result is too large to send; narrow the request"
 							.into(),
-				}
-			)),
+				}),
+				crate::i18n::Locale::En
+			),
 			PreviewErr::TooLarge
 		);
 		assert_eq!(
@@ -6556,7 +6574,10 @@ mod tests {
 			PreviewErr::TooLarge
 		);
 		assert!(matches!(
-			PreviewErr::from(GitError::Host("boom".into())),
+			PreviewErr::git(
+				GitError::Host("boom".into()),
+				crate::i18n::Locale::En
+			),
 			PreviewErr::Failed(_)
 		));
 		let text = PreviewErr::TooLarge
@@ -11607,7 +11628,6 @@ mod tests {
 					);
 					cx.simulate_click(pos, gpui::Modifiers::none());
 					let menu = model.read_with(cx, |m, _| m.log_menu);
-					eprintln!("DBG offset ({dx},{dy}) -> menu={menu:?}");
 					if menu.is_some() {
 						break;
 					}
@@ -11838,6 +11858,345 @@ mod tests {
 				snip_remote::WorkerOptions::default(),
 			);
 			assert_too_large_preview(&model, cx);
+		}
+
+		/// A connected remote workspace whose worker cannot be started again
+		/// (#206): the client reconnects in the middle of a request and the
+		/// restart fails, as when the worker was removed or the key revoked
+		/// behind it. The restart is a real `Transport::Command` that exits
+		/// 127, the way a host without snip answers, so no ssh is involved.
+		#[cfg(unix)]
+		fn lose_the_worker(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			model.update(cx, |m, _| {
+				let session = m.remote.session.as_mut().expect("connected");
+				session.client = std::sync::Arc::new(snip_remote::Client::new(
+					snip_remote::RemoteHost {
+						name: "gone-host".into(),
+						transport: snip_remote::Transport::Command(vec![
+							"sh".into(),
+							"-c".into(),
+							"echo 'sh: snip: not found' >&2; exit 127".into(),
+						]),
+					},
+					"test-mac".into(),
+				));
+			});
+		}
+
+		/// The interface language's wording of a missing snip, and none of
+		/// the CLI's English.
+		#[cfg(unix)]
+		fn assert_no_snip_in_zh(text: &str) {
+			assert!(text.contains("那台機器沒有安裝 snip"), "{text}");
+			assert!(!text.contains("is not installed"), "{text}");
+		}
+
+		/// A two-repository workspace on an in-process worker, loaded: the
+		/// log has commits, the Project tree its folders.
+		#[cfg(unix)]
+		fn open_remote_to_lose(
+			cx: &mut TestAppContext,
+		) -> (
+			tempfile::TempDir,
+			Entity<WorkbenchModel>,
+			&mut VisualTestContext,
+			std::sync::Arc<snip_remote::Worker>,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			let beta = shared.join("beta");
+			fs::create_dir_all(&alpha).unwrap();
+			fs::create_dir_all(&beta).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "."]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+			fs::write(alpha.join("dirty.txt"), "dirty\n").unwrap();
+			crate::paste::tests::git_init(&beta);
+			fs::write(beta.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&beta, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&beta, &["commit", "-m", "init"]);
+			let notes = shared.join("notes");
+			fs::create_dir_all(notes.join("sub")).unwrap();
+			fs::write(notes.join("n.txt"), "N\n").unwrap();
+			let (model, cx, worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			settle_until(cx, "the remote workspace to load", |cx| {
+				model.read_with(cx, |m, _| {
+					m.change_repos.first().is_some_and(|r| {
+						r.state == crate::ChangeRepoState::Loaded
+					}) && !m.commits.is_empty()
+						&& m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
+				})
+			});
+			(tmp, model, cx, worker)
+		}
+
+		/// Remote copy (Cmd+C on the Project tree's repository) when the
+		/// worker cannot restart: the status says why in the interface
+		/// language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_copy_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			lose_the_worker(&model, cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let status = model.read_with(cx, |m, _| m.status.render(m.locale));
+			assert!(status.contains("產生 payload 失敗"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// Clicks the control `id` where its probe says it is drawn, the way
+		/// an operator reads `[APP:CTRL_BOUNDS]`: the probe is switched on
+		/// on first use and read after the next frame.
+		#[cfg(unix)]
+		fn click_probed(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			id: &str,
+		) {
+			if model.read_with(cx, |m, _| m.probes.is_none()) {
+				model.update(cx, |m, cx| {
+					m.probes = Some(crate::ui::Probes::for_test());
+					cx.notify();
+				});
+				settle(cx);
+			}
+			let b = model
+				.read_with(cx, |m, _| m.probes.as_ref().unwrap().bounds(id))
+				.unwrap_or_else(|| panic!("no probed control {id}"));
+			let scale = cx.update(|window, _| window.scale_factor());
+			cx.simulate_click(
+				gpui::point(
+					gpui::px((b[0] + b[2] / 2) as f32 / scale),
+					gpui::px((b[1] + b[3] / 2) as f32 / scale),
+				),
+				gpui::Modifiers::none(),
+			);
+			settle(cx);
+		}
+
+		/// The status line in the interface language.
+		#[cfg(unix)]
+		fn status_text(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> String {
+			model.read_with(cx, |m, _| m.status.render(m.locale))
+		}
+
+		/// Copying the selected commit (Cmd+C in the Git Log) when the worker
+		/// cannot restart (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_commit_copy_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			let row = cx.debug_bounds("log-subject:0").expect("a commit row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			settle_until(cx, "the commit to be selected", |cx| {
+				model.read_with(cx, |m, _| m.selected_commit.is_some())
+			});
+			lose_the_worker(&model, cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let status = status_text(&model, cx);
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// Pasting into a remote workspace (Cmd+V) when the worker cannot
+		/// restart: the destination message says why in the interface
+		/// language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_paste_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			lose_the_worker(&model, cx);
+			clip::write_text("// FILE: a.txt\nA\n").unwrap();
+			cx.simulate_keystrokes("cmd-v");
+			settle_until(cx, "the paste to fail", |cx| {
+				!model.read_with(cx, |m, _| m.paste.is_loading())
+			});
+			let status = status_text(&model, cx);
+			assert!(status.contains("無法使用貼上目的地"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// Opening a Project tree file when the worker cannot restart: the
+		/// editor's error says why in the interface language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_preview_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			eprintln!(
+				"DBG {:?} {:?} {:?} {:?} {:?}",
+				model.read_with(cx, |m, _| (m.left_visible, m.active_tab)),
+				cx.debug_bounds("repo-row:alpha"),
+				cx.debug_bounds("repo-row:beta"),
+				cx.debug_bounds("left-list"),
+				model.read_with(cx, |m, _| m.ws_tree.as_ref().map(|t| t
+					.flatten_visible(300)
+					.iter()
+					.map(|r| r.rel_path.clone())
+					.collect::<Vec<_>>()))
+			);
+			click_probed(&model, cx, "ws-tree-row:notes");
+			settle_until(cx, "the notes folder to open", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("ws-tree-row:notes/n.txt").is_some()
+					})
+				})
+			});
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "ws-tree-row:notes/n.txt");
+			settle_until(cx, "the preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.preview_error.as_ref().unwrap().render(m.locale)
+			});
+			assert!(err.contains("預覽"), "{err}");
+			assert_no_snip_in_zh(&err);
+		}
+
+		/// Expanding a Project tree folder when the worker cannot restart:
+		/// the row under it says why in the interface language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_tree_listing_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click_probed(&model, cx, "ws-tree-row:notes");
+			settle_until(cx, "the notes folder to open", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("ws-tree-row:notes/sub").is_some()
+					})
+				})
+			});
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "ws-tree-row:notes/sub");
+			settle_until(cx, "the listing error", |cx| {
+				model.read_with(cx, |m, _| {
+					m.ws_tree.as_ref().is_some_and(|t| {
+						t.flatten_visible(300).iter().any(|r| r.is_error)
+					})
+				})
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.ws_tree
+					.as_ref()
+					.unwrap()
+					.flatten_visible(300)
+					.into_iter()
+					.find(|r| r.is_error)
+					.unwrap()
+					.name
+			});
+			assert_no_snip_in_zh(&err);
+		}
+
+		/// Refreshing a remote workspace (Cmd+R) when the worker cannot
+		/// restart: the scan failure says why in the interface language
+		/// (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_scan_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			lose_the_worker(&model, cx);
+			cx.simulate_keystrokes("cmd-r");
+			settle_until(cx, "the scan to fail", |cx| {
+				model.read_with(cx, |m, _| m.remote.scan_error.is_some())
+			});
+			let text = model.read_with(cx, |m, _| {
+				m.remote.scan_error.as_ref().unwrap().render(m.locale)
+			});
+			assert!(text.contains("無法讀取遠端的 Git 儲存庫"), "{text}");
+			assert_no_snip_in_zh(&text);
+		}
+
+		/// Refreshing the Git Log of a remote workspace when the worker
+		/// cannot restart: the log's error says why in the interface
+		/// language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_git_view_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			lose_the_worker(&model, cx);
+			click(cx, "btn-log-refresh");
+			settle_until(cx, "the log error", |cx| {
+				model.read_with(cx, |m, _| m.history_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| m.history_error.clone());
+			assert_no_snip_in_zh(&err.unwrap());
+		}
+
+		/// Selecting a commit of a remote workspace when the worker cannot
+		/// restart: the file list's error says why in the interface language
+		/// (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_commit_files_with_a_lost_worker_say_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			lose_the_worker(&model, cx);
+			let row = cx.debug_bounds("log-subject:0").expect("a commit row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			settle_until(cx, "the preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.preview_error.as_ref().unwrap().render(m.locale)
+			});
+			assert_no_snip_in_zh(&err);
 		}
 
 		/// Every row shares one gutter, and the subject of each row keeps at
@@ -20214,6 +20573,7 @@ mod tests {
 				rev: "refs/heads/missing-preview-revision".into(),
 			},
 			super::CancelToken::new(),
+			crate::i18n::Locale::En,
 		);
 		assert!(
 			result.is_err(),
@@ -20225,6 +20585,7 @@ mod tests {
 			"a.txt",
 			&super::SourceKind::Staged,
 			super::CancelToken::new(),
+			crate::i18n::Locale::En,
 		)
 		.unwrap();
 		assert_eq!(source, super::PreviewSource::StagedChanges);
@@ -20236,6 +20597,7 @@ mod tests {
 			"a.txt",
 			&super::SourceKind::File,
 			super::CancelToken::new(),
+			crate::i18n::Locale::En,
 		)
 		.unwrap();
 		assert_eq!(source, super::PreviewSource::WorkingFile);
@@ -20247,6 +20609,7 @@ mod tests {
 			"a.txt",
 			&super::SourceKind::Staged,
 			super::CancelToken::new(),
+			crate::i18n::Locale::En,
 		)
 		.unwrap();
 		assert_eq!(source, super::PreviewSource::StagedChanges);
@@ -20374,6 +20737,7 @@ mod tests {
 			"notes.txt",
 			&super::SourceKind::Unstaged,
 			super::CancelToken::new(),
+			crate::i18n::Locale::En,
 		);
 		match result {
 			Err(err) => {

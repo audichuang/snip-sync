@@ -583,6 +583,7 @@ pub fn tree_io(
 	session_root: &Path,
 	io: TreeIo,
 	cancel: Option<&snip_core::gitrun::CancelToken>,
+	loc: crate::i18n::Locale,
 ) -> TreeIoResult {
 	if !io.held.is_empty() {
 		return crate::tree::execute_tree_io(
@@ -616,7 +617,7 @@ pub fn tree_io(
 						.collect();
 					(children, truncated)
 				})
-				.map_err(describe)
+				.map_err(|e| describe_loc(e, loc))
 		}
 		None => Err("non-UTF-8 folder name".to_string()),
 	};
@@ -632,6 +633,7 @@ pub fn read_preview(
 	prefix: &str,
 	path: &str,
 	cancel: Option<&snip_core::gitrun::CancelToken>,
+	loc: crate::i18n::Locale,
 ) -> Result<(SourcePreview, PreviewSource), crate::PreviewErr> {
 	let full_path = join_rel(prefix, path);
 	client
@@ -650,7 +652,7 @@ pub fn read_preview(
 				code: snip_remote::ErrorCode::TooLarge,
 				..
 			} => crate::PreviewErr::TooLarge,
-			other => crate::PreviewErr::Failed(describe(other)),
+			other => crate::PreviewErr::Failed(describe_loc(other, loc)),
 		})
 }
 
@@ -668,14 +670,22 @@ pub fn describe(err: RemoteError) -> String {
 /// it is the useful part (ssh's own refusal); a missing or old snip would
 /// drag in clap's usage text or ssh banners.
 pub fn describe_loc(err: RemoteError, loc: crate::i18n::Locale) -> String {
-	let RemoteError::Start {
-		reason: Some(reason),
-		detail,
-		..
-	} = &err
-	else {
-		return describe(err);
-	};
+	match err {
+		RemoteError::Start {
+			reason: Some(reason),
+			detail,
+			..
+		} => start_text(reason, &detail, loc),
+		other => describe(other),
+	}
+}
+
+/// The interface-language wording of a known start failure.
+pub fn start_text(
+	reason: StartReason,
+	detail: &str,
+	loc: crate::i18n::Locale,
+) -> String {
 	let key = match reason {
 		StartReason::NoWorker => "remote_start_no_worker",
 		StartReason::KeyLogin => "remote_start_key_login",
@@ -687,6 +697,20 @@ pub fn describe_loc(err: RemoteError, loc: crate::i18n::Locale) -> String {
 		text.to_string()
 	} else {
 		crate::i18n::tf("remote_start_detail", loc, &[text, detail])
+	}
+}
+
+/// A Git view's error in the interface language: a worker that did not start
+/// gets [`start_text`]; anything else keeps its own text.
+pub fn git_error_loc(
+	err: snip_core::gitsrc::GitError,
+	loc: crate::i18n::Locale,
+) -> String {
+	match err {
+		snip_core::gitsrc::GitError::HostStart { reason, detail, .. } => {
+			start_text(reason, &detail, loc)
+		}
+		other => other.to_string(),
 	}
 }
 

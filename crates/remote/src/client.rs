@@ -2866,6 +2866,16 @@ impl From<RemoteError> for GitError {
 				args: "remote view".into(),
 				secs: GIT_CALL_LIMIT.as_secs(),
 			},
+			RemoteError::Start {
+				reason: Some(reason),
+				detail,
+				message,
+				..
+			} => GitError::HostStart {
+				reason,
+				detail,
+				message,
+			},
 			other => GitError::Host(other.to_string()),
 		}
 	}
@@ -3949,6 +3959,34 @@ mod tests {
 			message: "missing".into(),
 		};
 		assert!(matches!(GitError::from(err8), GitError::Host(_)));
+
+		// A worker that did not start keeps its known cause for the GUI, and
+		// the CLI's English text unchanged (#206).
+		let started = RemoteError::Start {
+			kind: ConnectFailureKind::WorkerUnavailable,
+			reason: Some(StartReason::NoWorker),
+			detail: "sh: snip: not found".into(),
+			message: "snip is not installed on that machine".into(),
+		};
+		let git = GitError::from(started);
+		assert!(
+			matches!(
+				git,
+				GitError::HostStart {
+					reason: StartReason::NoWorker,
+					..
+				}
+			),
+			"{git:?}"
+		);
+		assert_eq!(git.to_string(), "snip is not installed on that machine");
+		let unknown = RemoteError::Start {
+			kind: ConnectFailureKind::Other,
+			reason: None,
+			detail: "boom".into(),
+			message: "boom".into(),
+		};
+		assert!(matches!(GitError::from(unknown), GitError::Host(_)));
 
 		let err_too_large = RemoteError::Refused {
 			code: ErrorCode::TooLarge,

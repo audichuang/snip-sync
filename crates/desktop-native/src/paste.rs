@@ -768,6 +768,8 @@ impl PasteApplyResult {
 #[derive(Clone)]
 pub struct RemotePaste {
 	pub session: crate::remote::RemoteSession,
+	/// The interface language its failures are worded in.
+	pub locale: crate::i18n::Locale,
 }
 
 impl std::fmt::Debug for RemotePaste {
@@ -835,7 +837,10 @@ fn destination_msg(
 		remote.map_or_else(|| path.display().to_string(), |r| r.shown(path));
 	let why = match err {
 		PasteError::Remote(e) | PasteError::OutcomeUnknown(e) => {
-			crate::remote::describe(e)
+			crate::remote::describe_loc(
+				e,
+				remote.map(|r| r.locale).unwrap_or_default(),
+			)
 		}
 		PasteError::Local(e) => e.to_string(),
 		PasteError::Destination { source, .. } => source.to_string(),
@@ -2497,6 +2502,7 @@ pub(crate) mod tests {
 					path: "/w".into(),
 				},
 			),
+			locale: crate::i18n::Locale::En,
 		};
 		let dest = remote.session.root.clone();
 		let lost = || {
@@ -2558,6 +2564,7 @@ pub(crate) mod tests {
 					path: "/w".into(),
 				},
 			),
+			locale: crate::i18n::Locale::En,
 		};
 		let dest = remote.session.root.clone();
 		let busy_git =
@@ -2622,6 +2629,7 @@ pub(crate) mod tests {
 					path: "/w".into(),
 				},
 			),
+			locale: crate::i18n::Locale::En,
 		};
 		let dest = remote.session.root.clone();
 		let busy_git =
