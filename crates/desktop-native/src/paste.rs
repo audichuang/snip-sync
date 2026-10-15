@@ -927,6 +927,13 @@ fn commit_msg(
 	}
 }
 
+fn roots_digest(roots: &[PathBuf]) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	roots.hash(&mut hasher);
+	hasher.finish()
+}
+
 #[derive(Debug, Clone)]
 pub struct PastePreviewPlan {
 	/// In a remote workspace, the tree path the user pasted into.
@@ -941,6 +948,9 @@ pub struct PastePreviewPlan {
 	/// Commits whose file rows are folded away (commit replay only).
 	pub collapsed_commits: BTreeSet<usize>,
 	pub prefix_choices: Vec<PrefixChoice>,
+	/// Digest of the repo roots the candidates were last built from, so a
+	/// landing that brings the same set skips the canonicalize.
+	seen_roots: u64,
 	/// Shared so starting an apply does not copy every file body.
 	pub plan: Arc<RestorePlan>,
 	pub items: Vec<PasteItem>,
@@ -1308,8 +1318,19 @@ impl PastePreviewPlan {
 	/// Adds repos discovered after this preview opened to every prefix
 	/// choice's candidates. Existing candidates keep their index and made
 	/// choices stay, so nothing the user did is invalidated. Returns whether
-	/// any candidate was added.
+	/// any candidate was added. Does nothing, and touches no file system,
+	/// when there is no mapping to extend or the repo set is the one the
+	/// plan last saw. A preview opened before the scan keeps the workspace
+	/// root as its primary destination (accepted): only candidates grow.
 	pub fn add_candidates(&mut self, known_roots: &[PathBuf]) -> bool {
+		if self.prefix_choices.is_empty() {
+			return false;
+		}
+		let digest = roots_digest(known_roots);
+		if digest == self.seen_roots {
+			return false;
+		}
+		self.seen_roots = digest;
 		let found = if self.remote.is_some() {
 			known_roots.to_vec()
 		} else {
@@ -1443,6 +1464,7 @@ impl PastePreviewPlan {
 			whole_commit: false,
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
+			seen_roots: roots_digest(known_roots),
 			plan: empty_plan(),
 			items: Vec::new(),
 			selected_item_idx: 0,
@@ -1515,6 +1537,7 @@ impl PastePreviewPlan {
 			whole_commit: true,
 			collapsed_commits: BTreeSet::new(),
 			prefix_choices: Vec::new(),
+			seen_roots: 0,
 			plan: empty_plan(),
 			items: Vec::new(),
 			selected_item_idx: 0,
@@ -4494,6 +4517,41 @@ pub(crate) mod tests {
 		assert_eq!(res.created_count, 1);
 		assert_eq!(fs::read_to_string(dest.join("lib/a.txt")).unwrap(), "body");
 		assert!(!trap.join("a.txt").exists());
+	}
+
+	/// A landing that brings the repo set the plan already saw does no work
+	/// (#215); a preview opened before the scan keeps the workspace root as
+	/// its primary destination (accepted) and only gains candidates.
+	#[test]
+	fn add_candidates_skips_an_unchanged_repo_set() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = tmp.path().join("ws");
+		let repo = tmp.path().join("ws").join("repo01");
+		fs::create_dir_all(&repo).unwrap();
+		let payload = "// FILE: repo01/a.txt\nbody\n";
+		let mut plan = PastePreviewPlan::build_from_clipboard_text(
+			payload,
+			&dest,
+			std::slice::from_ref(&dest),
+			1,
+		)
+		.unwrap();
+		let primary = plan.destination.clone();
+		let before = plan.prefix_choices[0].candidates.len();
+		// Same set as at build: nothing to do, even if a candidate is gone.
+		plan.prefix_choices[0].candidates.clear();
+		assert!(!plan.add_candidates(std::slice::from_ref(&dest)));
+		assert!(plan.prefix_choices[0].candidates.is_empty());
+		// The scan found a repo: it is added once, then the set is stale.
+		assert!(plan.add_candidates(&[dest.clone(), repo.clone()]));
+		assert!(plan.prefix_choices[0].candidates.len() <= before + 2);
+		plan.prefix_choices[0].candidates.clear();
+		assert!(!plan.add_candidates(&[dest.clone(), repo.clone()]));
+		assert!(plan.prefix_choices[0].candidates.is_empty());
+		assert_eq!(plan.destination, primary, "the primary destination stays");
+		// No mapping to extend: never any work.
+		plan.prefix_choices.clear();
+		assert!(!plan.add_candidates(&[repo]));
 	}
 
 	#[test]
