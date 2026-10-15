@@ -12273,6 +12273,85 @@ mod tests {
 			assert_too_large_preview(&model, cx);
 		}
 
+		/// One fixture for both hosts (#214): a tracked file under the
+		/// preview limit whose every line changed, so its diff passes the
+		/// limit, and an untracked file of exactly the limit, whose
+		/// synthesized patch does. Both say the DIFF is too large, never
+		/// that the file is.
+		fn patch_limit_fixture(ws: &Path) {
+			let r = repo(ws, "big", &[]);
+			let old: String =
+				(0..52_000).map(|i| format!("old-{i:07}\n")).collect();
+			fs::write(r.join("tracked.txt"), &old).unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "tracked"]);
+			let new: String =
+				(0..52_000).map(|i| format!("new-{i:07}\n")).collect();
+			fs::write(r.join("tracked.txt"), &new).unwrap();
+			let limit = snip_core::browser::PREVIEW_LIMIT;
+			assert!(new.len() < limit && new.len() > limit / 2);
+			assert!(old.len() + new.len() > limit);
+			let untracked = "a\n".repeat(limit / 2);
+			assert_eq!(untracked.len(), limit);
+			fs::write(r.join("untracked.txt"), &untracked).unwrap();
+		}
+
+		fn assert_patch_too_large_previews(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			cx.simulate_keystrokes("alt-0");
+			settle(cx);
+			for (group, name) in
+				[("unstaged", "tracked.txt"), ("untracked", "untracked.txt")]
+			{
+				model.update(cx, |m, cx| {
+					m.preview_error = None;
+					cx.notify();
+				});
+				click_probed(
+					model,
+					cx,
+					&format!("change-row@big:{group}:{name}"),
+				);
+				settle_until(cx, "preview error", |cx| {
+					model.read_with(cx, |m, _| m.preview_error.is_some())
+				});
+				let err = model
+					.read_with(cx, |m, _| m.preview_error.clone())
+					.expect("preview error");
+				assert_eq!(err.key, "error_preview_patch_too_large", "{err:?}");
+				let text = err.render(crate::i18n::Locale::ZhTw);
+				assert!(text.contains(name), "{text}");
+			}
+		}
+
+		#[gpui::test]
+		fn local_changes_with_an_oversized_diff_say_the_diff_is_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			patch_limit_fixture(ws.path());
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1600., 900.);
+			assert_patch_too_large_previews(&model, cx);
+		}
+
+		#[gpui::test]
+		fn remote_changes_with_an_oversized_diff_say_the_diff_is_too_large(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let shared = tempfile::tempdir().unwrap();
+			patch_limit_fixture(shared.path());
+			let (model, cx, _worker) = open_remote(
+				cx,
+				shared.path(),
+				snip_remote::WorkerOptions::default(),
+			);
+			assert_patch_too_large_previews(&model, cx);
+		}
+
 		/// A connected remote workspace whose worker cannot be started again
 		/// (#206): the client reconnects in the middle of a request and the
 		/// restart fails, as when the worker was removed or the key revoked

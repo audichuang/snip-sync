@@ -2917,9 +2917,11 @@ impl From<RemoteError> for GitError {
 				code: ErrorCode::InvalidRevision,
 				message,
 			} => GitError::InvalidRevision(message),
+			// The worker names neither path nor limit; its limit is the
+			// preview limit, and the caller knows the path.
 			RemoteError::PatchTooLarge { .. } => GitError::PatchLimit {
 				path: String::new(),
-				limit: 0,
+				limit: snip_core::browser::PREVIEW_LIMIT,
 			},
 			RemoteError::Refused {
 				code: ErrorCode::TooLarge,
