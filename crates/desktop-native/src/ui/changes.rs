@@ -723,12 +723,14 @@ impl WorkbenchModel {
 			.into_any_element()
 	}
 
-	/// A repo's read error or the notice that its list was cut at the cap.
-	pub(super) fn change_note_row(&self, slot: usize) -> AnyElement {
-		let loc = self.locale;
-		let Some(repo) = self.change_repos.get(slot) else {
-			return div().into_any_element();
-		};
+	/// The text and colour of a Changes note row, in `loc`. Both the row and
+	/// its live tooltip call this, so they cannot disagree.
+	pub(crate) fn change_note_text(
+		&self,
+		slot: usize,
+		loc: crate::i18n::Locale,
+	) -> Option<(String, u32)> {
+		let repo = self.change_repos.get(slot)?;
 		let kept = crate::slot_range(&self.files, slot).len();
 		let (text, color) = match &repo.state {
 			crate::ChangeRepoState::Failed(err) => (
@@ -750,14 +752,32 @@ impl WorkbenchModel {
 		// repo row, so it names its repo; with enough of them, under the
 		// unreadable-repos node.
 		let top = self.change_repos.len() > 1 && kept == 0;
-		let folded = top
-			&& unreadable_slots(&self.change_repos, &self.files).len()
-				>= UNREADABLE_MIN;
 		let text = if top {
 			format!("{}: {text}", repo.name)
 		} else {
 			text
 		};
+		Some((text, color))
+	}
+
+	/// A repo's read error or the notice that its list was cut at the cap.
+	pub(super) fn change_note_row(
+		&self,
+		slot: usize,
+		cx: &mut Context<Self>,
+	) -> AnyElement {
+		let loc = self.locale;
+		let Some(repo) = self.change_repos.get(slot) else {
+			return div().into_any_element();
+		};
+		let Some((text, color)) = self.change_note_text(slot, loc) else {
+			return div().into_any_element();
+		};
+		let kept = crate::slot_range(&self.files, slot).len();
+		let top = self.change_repos.len() > 1 && kept == 0;
+		let folded = top
+			&& unreadable_slots(&self.change_repos, &self.files).len()
+				>= UNREADABLE_MIN;
 		let id = format!("change-note:{}", repo.name);
 		div()
 			.id(SharedString::from(id.clone()))
@@ -782,9 +802,27 @@ impl WorkbenchModel {
 			.pr(px(6.))
 			.text_size(px(SMALL_TEXT))
 			.text_color(rgb(color))
-			.when(self.chrome.menu.is_none(), |d| d.tooltip(tip(text.clone())))
+			.when(self.chrome.menu.is_none(), |d| {
+				// Read again at draw time: the language can change under a
+				// tooltip that stays open (#208).
+				let model = cx.weak_entity();
+				d.tooltip(live_tip(move |cx| {
+					model
+						.upgrade()
+						.and_then(|m| {
+							let m = m.read(cx);
+							m.change_note_text(slot, m.locale)
+						})
+						.map(|(t, _)| t.into())
+						.unwrap_or_default()
+				}))
+			})
 			.child(icon(Icon::Warning, 12.))
 			.child(fill_text(text))
+			.debug_selector({
+				let id = id.clone();
+				move || id.clone()
+			})
 			.children(probe(&self.probes, id))
 			.into_any_element()
 	}
@@ -918,11 +956,20 @@ impl WorkbenchModel {
 			(None, None)
 		};
 		// Like the project tree, a name that is not UTF-8 cannot be copied.
-		let tooltip = if item.is_valid_utf8() {
-			format!("{path}  ({letter})")
-		} else {
-			format!("{path}  ({letter})\n{}", t("change_not_utf8", self.locale))
-		};
+		let utf8 = item.is_valid_utf8();
+		let tooltip_base = format!("{path}  ({letter})");
+		let model = cx.weak_entity();
+		let tooltip = live_tip(move |cx| {
+			let loc = model
+				.upgrade()
+				.map(|m| m.read(cx).locale)
+				.unwrap_or_default();
+			if utf8 {
+				tooltip_base.clone().into()
+			} else {
+				format!("{tooltip_base}\n{}", t("change_not_utf8", loc)).into()
+			}
+		});
 
 		div()
 			.id(SharedString::from(format!("change-row-el:{ix}:{path}")))
@@ -949,7 +996,7 @@ impl WorkbenchModel {
 					this.open_left_menu(items, ev, w, cx);
 				}),
 			)
-			.when(self.chrome.menu.is_none(), |d| d.tooltip(tip(tooltip)))
+			.when(self.chrome.menu.is_none(), |d| d.tooltip(tooltip))
 			.on_click(cx.listener(move |this, _, _, cx| {
 				this.selected_list_row = row_idx;
 				this.select_change(ix, cx);

@@ -10446,6 +10446,93 @@ mod tests {
 			});
 		}
 
+		/// A tooltip that stays open while the language changes rewords
+		/// itself (#208): the status bar's message and a Changes error
+		/// row's read error are worded when drawn, not when the tooltip
+		/// opened. The pointer does not move between the keystroke and the
+		/// read; what is read is the tooltip's drawn text.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn shown_error_tooltips_follow_a_language_switch_under_a_still_pointer(
+			cx: &mut TestAppContext,
+		) {
+			use crate::i18n::{Locale, Msg};
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&shared).unwrap();
+			let _alpha = repo(&shared, "alpha", &[]);
+			let beta = repo(&shared, "beta", &[]);
+			fs::write(beta.join(".git/HEAD"), "garbage not a ref\n").unwrap();
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "worker".into(),
+					max_protocol: None,
+				},
+			);
+			model.update(cx, |m, cx| {
+				m.set_status_msg(Msg::new(
+					"error_repo_status",
+					["boom".to_string()],
+				));
+				cx.notify();
+			});
+			settle(cx);
+			let slot = model.read_with(cx, |m, _| {
+				m.change_repos
+					.iter()
+					.position(|s| s.root.ends_with("beta"))
+					.expect("beta slot")
+			});
+			let status_in = |cx: &mut VisualTestContext, loc: Locale| {
+				model.read_with(cx, |m, _| m.status.render(loc))
+			};
+			let note_in = |cx: &mut VisualTestContext, loc: Locale| {
+				model.read_with(cx, |m, _| {
+					m.change_note_text(slot, loc).expect("a note").0
+				})
+			};
+			let up = |cx: &mut VisualTestContext, text: &str| {
+				cx.run_until_parked();
+				let key: &'static str =
+					Box::leak(format!("tooltip:{text}").into_boxed_str());
+				cx.debug_bounds(key).is_some()
+			};
+			let hover = |cx: &mut VisualTestContext, id: &'static str| {
+				cx.run_until_parked();
+				let at = cx
+					.debug_bounds(id)
+					.unwrap_or_else(|| panic!("no rendered control {id}"))
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+			};
+			let (zh_s, en_s) =
+				(status_in(cx, Locale::ZhTw), status_in(cx, Locale::En));
+			let (zh_n, en_n) =
+				(note_in(cx, Locale::ZhTw), note_in(cx, Locale::En));
+			assert_ne!(zh_s, en_s);
+			assert_ne!(zh_n, en_n);
+
+			// The status bar, Chinese up, then English with no mouse move.
+			hover(cx, "status-text");
+			assert!(up(cx, &zh_s), "status tooltip shown: {zh_s}");
+			to_english(&model, cx);
+			assert!(up(cx, &en_s), "status tooltip follows: {en_s}");
+			assert!(!up(cx, &zh_s), "the old status text is gone");
+
+			// The Changes error row, English up, then Chinese.
+			hover(cx, "change-note:beta");
+			assert!(up(cx, &en_n), "note tooltip shown: {en_n}");
+			cx.simulate_keystrokes("alt-l");
+			assert_eq!(locale_now(&model, cx), Locale::ZhTw);
+			assert!(up(cx, &zh_n), "note tooltip follows: {zh_n}");
+			assert!(!up(cx, &en_n), "the old note text is gone");
+		}
+
 		#[gpui::test]
 		fn remote_unreadable_repo_is_an_error_not_clean(
 			cx: &mut TestAppContext,
@@ -12438,6 +12525,29 @@ mod tests {
 					.label(m.locale)
 			});
 			assert_no_snip_in_zh(&err);
+			// Speed search words the error row in the current language: an
+			// English word finds it after Option+L, and not before.
+			let labels = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.tool_row_labels()
+						.into_iter()
+						.map(|l| l.to_lowercase())
+						.collect::<Vec<_>>()
+				})
+			};
+			assert!(
+				labels(cx).iter().any(|l| l.contains("那台機器")),
+				"the zh error row is searchable: {:?}",
+				labels(cx)
+			);
+			assert!(!labels(cx).iter().any(|l| l.contains("not installed")));
+			to_english(&model, cx);
+			assert!(
+				labels(cx).iter().any(|l| l.contains("not installed")),
+				"speed search matches the English error row: {:?}",
+				labels(cx)
+			);
+			assert!(!labels(cx).iter().any(|l| l.contains("那台機器")));
 		}
 
 		/// Refreshing a remote workspace (Cmd+R) when the worker cannot

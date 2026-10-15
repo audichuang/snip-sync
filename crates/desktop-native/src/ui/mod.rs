@@ -1180,7 +1180,7 @@ impl WorkbenchModel {
 	}
 
 	/// Row labels the speed search matches against.
-	fn tool_row_labels(&self) -> Vec<String> {
+	pub(crate) fn tool_row_labels(&self) -> Vec<String> {
 		if self.active_tab == WorkbenchTab::GitChanges {
 			self.change_item_rows()
 				.into_iter()

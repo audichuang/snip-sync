@@ -882,7 +882,22 @@ impl WorkbenchModel {
 					super::drawn("status-text", self.status.render(loc));
 				fill_text(status.clone())
 					.id("status-text")
-					.tooltip(tip(status))
+					.debug_selector(|| "status-text".into())
+					.tooltip({
+						// The status is a Msg: read it and the language at
+						// draw time, or an open tooltip keeps old text (#208).
+						let model = cx.weak_entity();
+						live_tip(move |cx| {
+							model
+								.upgrade()
+								.map(|m| {
+									let m = m.read(cx);
+									m.status.render(m.locale)
+								})
+								.unwrap_or_default()
+								.into()
+						})
+					})
 					.mr(px(8.))
 			})
 			.child(

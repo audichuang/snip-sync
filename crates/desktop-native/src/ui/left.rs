@@ -247,7 +247,7 @@ impl WorkbenchModel {
 									));
 								}
 								ChangeItemRow::Note { slot } => {
-									out.push(this.change_note_row(slot));
+									out.push(this.change_note_row(slot, cx));
 								}
 								ChangeItemRow::Unreadable { count } => {
 									out.push(this.change_unreadable_row(
@@ -592,7 +592,6 @@ impl WorkbenchModel {
 						);
 					}
 				}
-				let tooltip = self.project_repo_tooltip(repo);
 				let branch = match &repo.summary {
 					Ok(s) => {
 						if let Some(ref b) = s.branch {
@@ -635,7 +634,20 @@ impl WorkbenchModel {
 					.when(cursor, |d| d.bg(rgb(self.left_selection_bg())))
 					.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 					.when(self.chrome.menu.is_none(), |d| {
-						d.tooltip(tip(tooltip))
+						// Carries the locale-dependent counts legend (#208).
+						let model = cx.weak_entity();
+						d.tooltip(live_tip(move |cx| {
+							model
+								.upgrade()
+								.and_then(|m| {
+									let m = m.read(cx);
+									m.repos
+										.get(idx)
+										.map(|r| m.project_repo_tooltip(r))
+								})
+								.unwrap_or_default()
+								.into()
+						}))
 					})
 					.on_click(cx.listener(move |this, _, _, cx| {
 						this.tree_cursor = ix;
