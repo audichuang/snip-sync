@@ -60,16 +60,16 @@ pub(crate) fn last_drawn(surface: &'static str) -> Option<String> {
 
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
-	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
-	FindNext, FindPrev, FocusNext, FocusPrev, GotoLine, HistoryNextPage,
-	HistoryPrevPage, LogCopy, LogDown, LogExtendDown, LogExtendUp, LogHead,
-	LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle, NavUp, OpenRefSelector,
-	OpenRepoSelector, OpenWorkspace, PastePreview, Popover, Quit, ReaderClear,
-	ReaderCopy, ReaderDown, ReaderPageDown, ReaderPageUp, ReaderSelectAll,
-	ReaderUp, Refresh, RepoEntryKind, SelectRepo1, SelectRepo2, ShowChanges,
-	ShowProject, Splitter, ToggleLocale, ToggleLog, ToggleTab, TreeCollapse,
-	TreeDown, TreeExpand, TreeOpen, TreeToggle, TreeUp, WorkbenchModel,
-	WorkbenchTab,
+	ApplyPaste, CancelPaste, CloseMenus, CloseWorkspace, CopySelection,
+	FindInFile, FindNext, FindPrev, FocusNext, FocusPrev, GotoLine,
+	HistoryNextPage, HistoryPrevPage, LogCopy, LogDown, LogExtendDown,
+	LogExtendUp, LogHead, LogOpen, LogSearchFocus, LogUp, NavDown, NavToggle,
+	NavUp, OpenRefSelector, OpenRepoSelector, OpenWorkspace, PastePreview,
+	Popover, Quit, ReaderClear, ReaderCopy, ReaderDown, ReaderPageDown,
+	ReaderPageUp, ReaderSelectAll, ReaderUp, Refresh, RepoEntryKind,
+	SelectRepo1, SelectRepo2, ShowChanges, ShowProject, Splitter, ToggleLocale,
+	ToggleLog, ToggleTab, TreeCollapse, TreeDown, TreeExpand, TreeOpen,
+	TreeToggle, TreeUp, WorkbenchModel, WorkbenchTab,
 };
 use crate::{NextDiff, PrevDiff};
 
@@ -1750,6 +1750,15 @@ impl Render for WorkbenchModel {
 			}))
 			.on_action(cx.listener(|this, _: &OpenRefSelector, window, cx| {
 				this.open_popover(Popover::Ref, window, cx)
+			}))
+			.on_action(cx.listener(|this, _: &CloseMenus, _, cx| {
+				// Escape closes an open popover; with none open it goes on.
+				if this.workspace_menu || this.log_menu.is_some() {
+					this.close_workspace_menu(cx);
+					this.dismiss_log_menu(cx);
+				} else {
+					cx.propagate();
+				}
 			}))
 			.on_action(cx.listener(|this, _: &ToggleLocale, _, cx| {
 				this.toggle_locale(cx)

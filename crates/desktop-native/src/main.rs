@@ -268,6 +268,7 @@ actions!(
 		CloseWorkspace,
 		OpenWorkspace,
 		ToggleLocale,
+		CloseMenus,
 		HistoryNextPage,
 		HistoryPrevPage,
 		FindInFile,
@@ -6264,6 +6265,7 @@ fn key_bindings() -> Vec<KeyBinding> {
 		KeyBinding::new("ctrl-shift-o", OpenWorkspace, None),
 		KeyBinding::new("cmd-shift-o", OpenWorkspace, None),
 		KeyBinding::new("alt-l", ToggleLocale, None),
+		KeyBinding::new("escape", CloseMenus, None),
 		KeyBinding::new("alt-n", HistoryNextPage, None),
 		KeyBinding::new("alt-p", HistoryPrevPage, None),
 		KeyBinding::new("ctrl-f", FindInFile, None),
@@ -11381,6 +11383,19 @@ mod tests {
 			settle(cx);
 			model.read_with(cx, |m, _| {
 				assert!(!m.workspace_menu, "Escape in the path field");
+			});
+
+			// Opened by its button, nothing inside focused: Escape still closes.
+			let button = cx
+				.debug_bounds("btn-workspace-menu")
+				.expect("menu button drawn");
+			cx.simulate_click(button.center(), gpui::Modifiers::none());
+			settle(cx);
+			model.read_with(cx, |m, _| assert!(m.workspace_menu));
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(!m.workspace_menu, "Escape with no field focused");
 			});
 
 			model.update(cx, |m, cx| m.toggle_workspace_menu(cx));
@@ -17048,6 +17063,42 @@ mod tests {
 					}
 				}
 			}
+		}
+
+		/// Escape closes the Log "more" menu opened by its chip, with no
+		/// text field focused (#212).
+		#[gpui::test]
+		fn log_more_menu_closes_on_escape(cx: &mut TestAppContext) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				});
+				if ready {
+					break;
+				}
+			}
+			settle(cx);
+			let more_b = cx
+				.debug_bounds("log-filter-more")
+				.expect("log-filter-more drawn at 900w");
+			cx.simulate_click(more_b.center(), gpui::Modifiers::none());
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_menu, Some(crate::ui::LogMenu::FilterMore));
+			});
+			cx.simulate_keystrokes("escape");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_menu, None, "Escape closes the more menu");
+			});
 		}
 
 		/// At narrow window width (900x600), overflowing log filter chips do
