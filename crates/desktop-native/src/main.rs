@@ -650,6 +650,7 @@ impl PasteDiffOutcome {
 		request: paste::CommitDiffRequest,
 		cancel: CancelToken,
 		skip_notice: &'static str,
+		loc: Locale,
 	) -> Self {
 		use snip_core::transfer::ReplayPreviewUnavailable as Why;
 		let opts = snip_core::gitrun::RunOptions::preview(Some(cancel.clone()));
@@ -687,10 +688,18 @@ impl PasteDiffOutcome {
 					PasteDiffOutcome::Diff(patch, truncated)
 				}
 			},
-			Err(err) => PasteDiffOutcome::Notice(Msg::new(
-				"paste_diff_failed",
-				[err.to_string()],
-			)),
+			Err(err) => {
+				// A remote failure names its start reason in the interface
+				// language, as the other remote surfaces do (#206).
+				let why = match err {
+					snip_remote::PasteError::Remote(e)
+					| snip_remote::PasteError::OutcomeUnknown(e) => {
+						crate::remote::describe_loc(e, loc)
+					}
+					other => other.to_string(),
+				};
+				PasteDiffOutcome::Notice(Msg::new("paste_diff_failed", [why]))
+			}
 		}
 	}
 }
@@ -5281,6 +5290,7 @@ impl WorkbenchModel {
 		};
 
 		let cancel = arm_cancel(&mut self.paste_diff_cancel);
+		let loc = self.locale;
 		let task_gen = self.paste_diff_generation;
 		let selected_idx = idx;
 		let item_path = item.path.clone();
@@ -5316,6 +5326,7 @@ impl WorkbenchModel {
 							request,
 							cancel.clone(),
 							skip_notice,
+							loc,
 						)
 					} else if let Some(ref rem) = remote {
 						// The worker plans under its workspace's real path, which
@@ -11877,7 +11888,7 @@ mod tests {
 		) {
 			model.update(cx, |m, _| {
 				let session = m.remote.session.as_mut().expect("connected");
-				session.client = std::sync::Arc::new(snip_remote::Client::new(
+				let gone = std::sync::Arc::new(snip_remote::Client::new(
 					snip_remote::RemoteHost {
 						name: "gone-host".into(),
 						transport: snip_remote::Transport::Command(vec![
@@ -11888,6 +11899,13 @@ mod tests {
 					},
 					"test-mac".into(),
 				));
+				session.client = gone.clone();
+				// A paste plan keeps its own copy of the session.
+				if let Some(remote) =
+					m.paste.plan_mut().and_then(|p| p.remote.as_mut())
+				{
+					remote.session.client = gone;
+				}
 			});
 		}
 
@@ -14313,6 +14331,62 @@ mod tests {
 				fs::read(dest.join(".git/refs/heads/main")).unwrap(),
 				before_head
 			);
+		}
+
+		/// A commit pasted into a remote workspace (Cmd+V), then a click on a
+		/// file row when the worker cannot restart: the preview's notice
+		/// says why in the interface language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_commit_paste_diff_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.locale),
+				crate::i18n::Locale::ZhTw
+			);
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "C1".into(),
+						author_name: "Ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-10-13T12:00:00+00:00".into(),
+						files: vec![CommitFile {
+							path: "init.txt".into(),
+							old_path: None,
+							change: FileChange::Modified,
+							content: Some("c1\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			clip::write_text(&payload).unwrap();
+			cx.simulate_keystrokes("cmd-v");
+			settle_until(cx, "the commit paste to plan", |cx| {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				})
+			});
+			lose_the_worker(&model, cx);
+			click(cx, "paste-row:0:init.txt");
+			wait_paste_detail(&model, cx);
+			let notice = model.read_with(cx, |m, _| {
+				m.paste
+					.detail()
+					.and_then(|d| d.notice.clone())
+					.expect("a notice")
+			});
+			assert!(notice.contains("無法顯示差異"), "{notice}");
+			assert_no_snip_in_zh(&notice);
 		}
 
 		/// A ~9 MiB commit opens, and a small row's detail read must fit: the
