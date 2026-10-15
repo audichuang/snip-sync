@@ -1305,6 +1305,28 @@ impl PastePreviewPlan {
 			}
 	}
 
+	/// Adds repos discovered after this preview opened to every prefix
+	/// choice's candidates. Existing candidates keep their index and made
+	/// choices stay, so nothing the user did is invalidated. Returns whether
+	/// any candidate was added.
+	pub fn add_candidates(&mut self, known_roots: &[PathBuf]) -> bool {
+		let found = if self.remote.is_some() {
+			known_roots.to_vec()
+		} else {
+			canonical_dirs(known_roots)
+		};
+		let mut added = false;
+		for choice in &mut self.prefix_choices {
+			for root in &found {
+				if !choice.candidates.contains(root) {
+					choice.candidates.push(root.clone());
+					added = true;
+				}
+			}
+		}
+		added
+	}
+
 	pub fn mapping_ready(&self) -> bool {
 		self.prefix_choices
 			.iter()

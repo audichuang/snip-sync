@@ -3320,6 +3320,18 @@ impl WorkbenchModel {
 		self.sync_change_slots();
 		self.start_changes_queue(false, cx);
 		self.sync_log_scope(cx);
+		// A paste preview opened before this scan finished listed only the
+		// repos known then: add the ones found since.
+		let roots: Vec<PathBuf> =
+			self.repos.iter().map(|r| r.root.clone()).collect();
+		match self.paste.refresh_candidates(&roots, self.preview.as_ref()) {
+			Ok(true) => {
+				app_log!("[APP:PASTE_CANDIDATES_REFRESHED]");
+				cx.notify();
+			}
+			Ok(false) => {}
+			Err(err) => self.set_status_msg(err),
+		}
 		app_log!("[APP:READY_REPOS: {}]", self.repos.len());
 		if e2e_on() {
 			for r in &self.repos {
@@ -15431,6 +15443,43 @@ mod tests {
 		) {
 			let _remote = remote_lock();
 			assert_protected_paste_mapping(cx, true);
+		}
+
+		/// A preview opened before the repo scan finished gains the repos the
+		/// scan found afterwards, keeping the existing candidates' indexes.
+		#[gpui::test]
+		fn paste_preview_candidates_follow_the_scan(cx: &mut TestAppContext) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let b = repo(ws.path(), "b", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			settle_until(cx, "both repos found", |cx| {
+				model.read_with(cx, |m, _| m.repos.len() == 2)
+			});
+			let late = model.update(cx, |m, _| m.repos.pop().unwrap());
+			paste(&model, cx, "// FILE: x/one.txt\n1\n// FILE: y/two.txt\n2\n");
+			let b = dunce::canonicalize(b).unwrap();
+			let before = model.read_with(cx, |m, _| {
+				let choices = &m.paste.plan().unwrap().prefix_choices;
+				assert!(!choices.is_empty());
+				assert!(choices.iter().all(|c| !c.candidates.contains(&b)));
+				choices[0].candidates.clone()
+			});
+			model.update_in(cx, |m, _, cx| {
+				m.repos.push(late);
+				m.finish_discovery(cx);
+			});
+			model.read_with(cx, |m, _| {
+				for choice in &m.paste.plan().unwrap().prefix_choices {
+					assert!(choice.candidates.contains(&b));
+					assert_eq!(
+						choice.candidates[..before.len()],
+						before[..],
+						"existing candidates keep their index"
+					);
+				}
+			});
 		}
 
 		fn assert_protected_paste_mapping(

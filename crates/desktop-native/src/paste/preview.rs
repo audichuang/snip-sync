@@ -328,6 +328,43 @@ impl PastePreview {
 		}
 	}
 
+	/// Brings an open, idle preview's mapping candidates up to date with the
+	/// repos found since it opened. A busy, loading or closed preview is left.
+	pub fn refresh_candidates(
+		&mut self,
+		known_roots: &[PathBuf],
+		ordinary: Option<&Preview>,
+	) -> Result<bool, Msg> {
+		if self.loading {
+			return Ok(false);
+		}
+		let pool = self.pending.clone();
+		let mut pending = lock_pending(&pool);
+		let Some(plan) = self.plan.as_mut() else {
+			return Ok(false);
+		};
+		if plan.is_applying {
+			return Ok(false);
+		}
+		let before: Vec<usize> = plan
+			.prefix_choices
+			.iter()
+			.map(|c| c.candidates.len())
+			.collect();
+		if !plan.add_candidates(known_roots) {
+			return Ok(false);
+		}
+		if let Err(err) =
+			pending.admit_ui(ordinary, Some(&*plan), self.detail.as_ref())
+		{
+			for (choice, n) in plan.prefix_choices.iter_mut().zip(before) {
+				choice.candidates.truncate(n);
+			}
+			return Err(err);
+		}
+		Ok(true)
+	}
+
 	pub fn remap(
 		&mut self,
 		prefix: String,
