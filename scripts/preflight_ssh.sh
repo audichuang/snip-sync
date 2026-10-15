@@ -10,7 +10,7 @@
 # The tree must be committed: native-acceptance fails if the checkout changes. A git
 # worktree works, since only the commit is sent.
 # SNIP_PREFLIGHT_SSH_DIR (default ~/.cache/snip-preflight/repo), _CPUS (default 3/4 of the
-# host's), _MEMORY (16g), _LOCK_WAIT (seconds to wait for another run, 1800),
+# host's), _MEMORY (10g), _LOCK_WAIT (seconds to wait for another run, 1800),
 # _TARGET_MAX_GB (40: a bigger target volume is dropped after a run).
 set -euo pipefail
 
@@ -74,7 +74,11 @@ if [ "${1:-}" = --remote ]; then
 	fi
 
 	cpus="${SNIP_PREFLIGHT_SSH_CPUS:-$(($(nproc) * 3 / 4))}"
-	memory="${SNIP_PREFLIGHT_SSH_MEMORY:-16g}"
+	# A cap, not a reservation: a cold run peaked at about 6 GiB.
+	memory="${SNIP_PREFLIGHT_SSH_MEMORY:-10g}"
+	# As in CI's acceptance jobs: the gates share this machine's CPUs, and an unscaled 8 s
+	# wait for a drag's resize line missed once beside another gate.
+	export SNIP_E2E_TIMEOUT_SCALE="${SNIP_E2E_TIMEOUT_SCALE:-2}"
 	# As in linux_container.sh: acceptance with five gates at once misses fixed waits.
 	export SNIP_ACCEPTANCE_ARGS="${SNIP_ACCEPTANCE_ARGS---jobs 2 --collaboration-jobs 1}"
 	envs=()
