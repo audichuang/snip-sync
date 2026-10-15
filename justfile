@@ -60,6 +60,32 @@ preflight:
 	# clone, so it would only serve a rerun. A failure keeps it for an incremental rerun.
 	scripts/linux_container.sh --prune-all
 
+# The Linux jobs in Docker on another Linux machine over ssh (scripts/preflight_ssh.sh),
+# this OS's checks here meanwhile. Works from a worktree; the host's target volume is kept
+# for incremental runs. The host's output streams; this machine's is held back as in preflight.
+preflight-ssh host:
+	#!/usr/bin/env bash
+	set -uo pipefail
+	log="$(mktemp)"
+	trap 'rm -f "$log"' EXIT
+	{{just_executable()}} preflight-host >"$log" 2>&1 &
+	host=$!
+	rc=0
+	scripts/preflight_ssh.sh {{host}} || rc=$?
+	if wait "$host"; then
+		echo "preflight-host: passed"
+	else
+		hrc=$?
+		cat "$log"
+		echo "preflight-host: failed (exit $hrc)" >&2
+		[ "$rc" -ne 0 ] || rc=$hrc
+	fi
+	[ "$rc" -eq 0 ] || { echo "preflight-ssh: failed (the lines above say which side)" >&2; exit "$rc"; }
+
+# Removes what preflight-ssh left on the host: target/registry volumes, images, repo, evidence.
+preflight-ssh-clean host:
+	scripts/preflight_ssh.sh --clean {{host}}
+
 # CI's Linux jobs, run directly (Linux) or through scripts/linux_container.sh.
 preflight-linux: preflight-linux-checks preflight-acceptance
 
@@ -88,7 +114,7 @@ preflight-workflows:
 	@command -v shellcheck >/dev/null || { echo "shellcheck not on PATH: actionlint would skip the run: scripts CI lints (pip install shellcheck-py)" >&2; exit 1; }
 	actionlint
 	@# The scripts CI's Remote E2E and container jobs lint on their own.
-	shellcheck scripts/remote_e2e.sh scripts/linux_container.sh scripts/linux-container/entrypoint.sh scripts/check_test_refresh.sh
+	shellcheck scripts/remote_e2e.sh scripts/linux_container.sh scripts/linux-container/entrypoint.sh scripts/preflight_ssh.sh scripts/check_test_refresh.sh
 
 preflight-rust:
 	cargo fmt --all --check

@@ -310,7 +310,7 @@ jobs:
         steps:
             - uses: actions/checkout@v6
             - name: Lint the container scripts
-              run: shellcheck scripts/linux_container.sh scripts/linux-container/entrypoint.sh
+              run: shellcheck scripts/linux_container.sh scripts/linux-container/entrypoint.sh scripts/preflight_ssh.sh
             - name: Build the image
               run: docker build -t snip-preflight scripts/linux-container
             - name: Harness tests in the image
