@@ -828,6 +828,11 @@ pub struct WorkbenchModel {
 	// Reader.
 	pub preview: Option<Preview>,
 	pub preview_loading: bool,
+	/// The latest preview read came from the Log (commit, compare,
+	/// multi-selection, commit file or commit tree). Only a Project/Changes
+	/// read or `clear_commit_selection` resets it, so it outlives
+	/// `preview_loading` (#202).
+	pub preview_pending_from_log: bool,
 	pub preview_error: Option<Msg>,
 	pub reader: Reader,
 	pub find_input: Entity<TextInput>,
@@ -915,6 +920,8 @@ pub struct WorkbenchModel {
 	/// no longer drawn returns the keyboard to `focus_handle`.
 	pub(crate) focus_lost_guard: Option<gpui::Subscription>,
 	pub e2e_read_delay: Option<std::time::Duration>,
+	/// Test hook: holds a finished Log commit read before it installs.
+	pub e2e_log_read_delay: Option<std::time::Duration>,
 	/// Test-only hold file for project-tree reads, honoured only in E2E mode.
 	pub e2e_tree_hold: Option<PathBuf>,
 	/// Test-only hold file for copy export revalidation, honoured only in E2E mode.
@@ -1351,6 +1358,7 @@ impl WorkbenchModel {
 			selected_list_row: 0,
 			preview: None,
 			preview_loading: false,
+			preview_pending_from_log: false,
 			preview_error: None,
 			reader: Reader::default(),
 			find_input,
@@ -1425,6 +1433,7 @@ impl WorkbenchModel {
 			pending_focus: None,
 			focus_lost_guard: None,
 			e2e_read_delay: ui::e2e_read_delay(),
+			e2e_log_read_delay: None,
 			e2e_tree_hold: ui::e2e_tree_hold(),
 			e2e_export_hold: ui::e2e_export_hold(),
 			#[cfg(test)]
@@ -4234,6 +4243,7 @@ impl WorkbenchModel {
 		let shown_root = repo_root.clone();
 		let file_path = path.to_string();
 		self.preview_loading = true;
+		self.preview_pending_from_log = false;
 		self.preview_error = None;
 		self.preview_error_root = None;
 
@@ -4254,12 +4264,13 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
+		let hold = bg.clone();
 
 		self.spawn_owned(cx, kind, job_cancel, async move {
 			let for_bg = file_path.clone();
 			let result = bg
 				.spawn(async move {
-					let result = match remote {
+					match remote {
 						Some((client, ws, session_root)) if fs_only => {
 							match remote::remote_rel(&session_root, &repo_root)
 							{
@@ -4278,13 +4289,14 @@ impl WorkbenchModel {
 						_ => read_preview(
 							&host, &repo_root, &for_bg, &source, cancel,
 						),
-					};
-					if let Some(delay) = delay {
-						std::thread::sleep(delay);
 					}
-					result
 				})
 				.await;
+			// The executor's timer, not a thread sleep: a test's clock holds
+			// the finished read without blocking its gestures.
+			if let Some(delay) = delay {
+				hold.timer(delay).await;
+			}
 
 			let _ = this.update(&mut async_app, |model, cx| {
 				if model.preview_generation != task_generation {
@@ -7453,6 +7465,68 @@ mod tests {
 			});
 		}
 
+		/// A host without snip, picked from the menu: the listing and the
+		/// failed open both say so in the interface language, not in the
+		/// English text the CLI prints (#204).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn a_host_without_snip_is_reported_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_, model, cx) = remote_menu_hosts(cx, &["bare-host"]);
+			model.update(cx, |m, cx| {
+				m.remote.hosts = vec![snip_remote::RemoteHost {
+					name: "bare-host".into(),
+					transport: snip_remote::Transport::Command(vec![
+						"sh".into(),
+						"-c".into(),
+						"echo 'sh: snip: not found' >&2; exit 127".into(),
+					]),
+				}];
+				cx.notify();
+			});
+			cx.run_until_parked();
+			click(cx, "remote-host:0");
+			settle_until(cx, "the listing to fail", |cx| {
+				model.read_with(cx, |m, _| {
+					m.remote
+						.browse
+						.as_ref()
+						.is_some_and(|b| matches!(b.listing, Some(Err(_))))
+				})
+			});
+			let zh = "那台機器沒有安裝 snip";
+			model.read_with(cx, |m, _| {
+				let Some(Err(text)) =
+					&m.remote.browse.as_ref().unwrap().listing
+				else {
+					panic!("the listing failed");
+				};
+				assert!(text.starts_with(zh), "{text}");
+				assert!(!text.contains("not installed"), "{text}");
+			});
+			// The open of a typed path fails the same way.
+			model.update(cx, |m, cx| {
+				m.remote_path_input.update(cx, |f, cx| f.set_text("/x", cx))
+			});
+			click(cx, "btn-remote-open");
+			settle_until(cx, "the failed open", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.remote.busy
+						&& matches!(m.remote.message, Some((false, _)))
+				})
+			});
+			model.read_with(cx, |m, _| {
+				let Some((_, text)) = &m.remote.message else {
+					panic!("a failure message");
+				};
+				assert!(text.starts_with(zh), "{text}");
+				assert_eq!(m.status.key, "remote_open_failed");
+				assert!(m.status.args[0].starts_with(zh), "{:?}", m.status);
+			});
+		}
+
 		/// One browse connection per menu: it is handed to the open of the
 		/// folder shown, and it ends with the menu (#187).
 		#[gpui::test]
@@ -7693,6 +7767,34 @@ mod tests {
 				shown_folder(&model, cx).0.ends_with("folder-00"),
 				"clicking remote-folder:0 opens it"
 			);
+		}
+
+		/// An open host row has no tooltip (#203): it would cover the
+		/// open-here button of the folder list below it, even when the click
+		/// came before the tooltip showed.
+		#[gpui::test]
+		fn an_opened_host_row_has_no_tooltip(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let (_, _model, cx) = remote_menu_hosts(cx, &["one", "two"]);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+			settle(cx);
+			let shown = |cx: &mut VisualTestContext| {
+				cx.run_until_parked();
+				cx.debug_bounds("tooltip:one").is_some()
+			};
+			let at = cx
+				.debug_bounds("remote-host:0")
+				.expect("row drawn")
+				.center();
+			cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+			click(cx, "remote-host:0");
+			cx.executor().advance_clock(Duration::from_millis(700));
+			settle(cx);
+			assert!(
+				cx.debug_bounds("btn-remote-open-here").is_some(),
+				"the host's folder block is open"
+			);
+			assert!(!shown(cx), "the opened row keeps no tooltip");
 		}
 
 		/// Opening a host's folder list and switching hosts never moves the
@@ -15736,6 +15838,190 @@ mod tests {
 			assert_eq!(drawn, wanted, "the drawn split follows the new width");
 		}
 
+		/// At the default 1080x720 window with the details pane open, an
+		/// active repository and an active branch both stay on the bar:
+		/// their values are truncated before either goes into the overflow
+		/// chip (#205).
+		#[gpui::test]
+		fn two_active_log_chips_stay_on_the_bar_at_the_default_window(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 752.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.refs.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let (visible, hidden, repo_value) = model.read_with(cx, |m, _| {
+				let (on, off) = m.log_filter_split();
+				(on, off, m.log_scope_value())
+			});
+			assert_eq!(
+				repo_value.as_deref(),
+				Some("repo-01-core"),
+				"the repo chip shows the repo name"
+			);
+			assert!(
+				visible.contains(&crate::ui::LogMenu::Repo)
+					&& visible.contains(&crate::ui::LogMenu::Branch),
+				"both active chips stay on the bar: shown {visible:?}, \
+				 overflow {hidden:?}"
+			);
+			for id in ["log-filter-repo", "log-filter-branch"] {
+				assert!(cx.debug_bounds(id).is_some(), "{id} drawn");
+			}
+		}
+
+		/// The drawn text cap follows a resize that keeps the split mask: the
+		/// bar widened, so the truncated values get their room back with no
+		/// input (#205).
+		#[gpui::test]
+		fn log_chip_text_cap_follows_a_resize_that_keeps_the_mask(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 752.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.refs.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let before =
+				model.read_with(cx, |m, _| m.log_filter_layout.text_cap());
+			for w in [1110., 1140.] {
+				cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
+				for _ in 0..5 {
+					settle(cx);
+				}
+				let (drawn, wanted, mask) = model.read_with(cx, |m, _| {
+					let l = &m.log_filter_layout;
+					(
+						l.text_cap(),
+						l.text_cap_for(l.container_w.get()),
+						l.last_mask.get(),
+					)
+				});
+				assert_eq!(mask & 0b11, 0b11, "both chips stay on the bar");
+				assert!(
+					(drawn - wanted).abs() < 0.5,
+					"at {w}: drawn cap {drawn} follows the bar ({wanted})"
+				);
+				assert!(drawn >= before, "a wider bar never shrinks the cap");
+			}
+		}
+
+		/// The same as above in a remote workspace (#205): repositories nest
+		/// under the shared folder, and the chip names the repo without the
+		/// `host ▸ path ›` prefix, so both active chips stay on the bar.
+		#[gpui::test]
+		fn two_active_log_chips_stay_on_the_bar_in_a_remote_workspace(
+			cx: &mut TestAppContext,
+		) {
+			let _guard = remote_lock();
+			let ws = tempfile::tempdir().unwrap();
+			let shared = ws.path().join("shared");
+			fs::create_dir(&shared).unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(&shared, name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(752.)));
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.repos.len() >= 2
+						&& !m.refs.is_empty()
+						&& m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let (visible, hidden, repo_value) = model.read_with(cx, |m, _| {
+				let (on, off) = m.log_filter_split();
+				(on, off, m.log_scope_value())
+			});
+			assert_eq!(repo_value.as_deref(), Some("repo-01-core"));
+			assert!(
+				visible.contains(&crate::ui::LogMenu::Repo)
+					&& visible.contains(&crate::ui::LogMenu::Branch),
+				"both active chips stay on the bar: shown {visible:?}, \
+				 overflow {hidden:?}"
+			);
+		}
+
 		/// At a narrow window width with widened details pane and an active long user filter,
 		/// no filter chip intersects action buttons and user filter is reachable.
 		#[gpui::test]
@@ -15991,14 +16277,16 @@ mod tests {
 			cx.simulate_click(row.center(), gpui::Modifiers::none());
 			for _ in 0..50 {
 				settle(cx);
-				let loaded =
-					model.read_with(cx, |m, _| !m.commit_files.is_empty());
+				let loaded = model.read_with(cx, |m, _| {
+					!m.commit_files.is_empty() && m.preview.is_some()
+				});
 				if loaded {
 					break;
 				}
 			}
 			model.read_with(cx, |m, _| {
 				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(m.preview.is_some(), "the diff must load first");
 			});
 
 			model.update(cx, |m, cx| {
@@ -16020,6 +16308,289 @@ mod tests {
 				assert!(m.selected_commit.is_none(), "selection kept");
 				assert!(m.commit_files.is_empty(), "stale files kept");
 				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale commit diff kept after the branch filter",
+				);
+			});
+		}
+
+		/// True while the preview is a diff, file or compare from the Log.
+		fn commit_preview_shown(m: &WorkbenchModel) -> bool {
+			use crate::reader::PreviewSource;
+			matches!(
+				m.preview.as_ref().map(|p| &p.source),
+				Some(PreviewSource::CommitDiff { .. })
+					| Some(PreviewSource::CommitFile { .. })
+					| Some(PreviewSource::Compare { .. })
+			)
+		}
+
+		/// Changing the Log's repository scope drops the selected commit with
+		/// its files and diff, as a branch filter does (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_clears_the_selected_commit_and_its_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix = model
+				.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == "alpha commit")
+				})
+				.expect("alpha commit listed");
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			for _ in 0..50 {
+				settle(cx);
+				let loaded = model.read_with(cx, |m, _| {
+					!m.commit_files.is_empty() && commit_preview_shown(m)
+				});
+				if loaded {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(commit_preview_shown(m), "the diff must load first");
+			});
+
+			// The user's gestures: the repository chip, then beta.
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				let cleared =
+					model.read_with(cx, |m, _| m.selected_commit.is_none());
+				if cleared {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(m.commit_files.is_empty(), "stale files kept");
+				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale commit diff kept after the repository filter",
+				);
+			});
+		}
+
+		/// A file preview still loading (a slow read) is not the Log's: the
+		/// repository chip must not discard it (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_keeps_a_file_preview_still_loading(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			// Project-tree and Changes rows have no debug selector, so the
+			// read starts through the model; the chip is a real click.
+			let root = alpha.clone();
+			model.update(cx, |m, cx| {
+				m.select_file_in(
+					Some(root),
+					"a.txt",
+					crate::SourceKind::File,
+					cx,
+				);
+			});
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| m.preview_loading),
+				"the read must be held in flight",
+			);
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_repo_filter.len(), 1, "the chip applied");
+				assert!(
+					m.preview_loading,
+					"the repo filter dropped the file read in flight",
+				);
+			});
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_file.as_deref(), Some("a.txt"));
+				assert!(
+					m.preview.is_some() && !m.preview_loading,
+					"the requested preview was dropped by the repo filter",
+				);
+			});
+		}
+
+		/// A Log commit read still in flight when an error clears
+		/// `preview_loading` must still be dropped by a repository filter
+		/// change: the Log's read must not reinstall files or a diff for a
+		/// selection that is gone (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_drops_a_log_read_after_an_error_cleared_loading(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix = model
+				.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == "alpha commit")
+				})
+				.expect("alpha commit listed");
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_log_read_delay = Some(delay));
+			click(cx, id);
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| {
+					m.preview_loading && m.commit_files.is_empty()
+				}),
+				"the Log read must be held in flight",
+			);
+			// Another read fails first and clears the loading flag without
+			// touching the generation.
+			model.update(cx, |m, _| {
+				m.show_preview_error(crate::Msg::new(
+					"error_repo_changes",
+					["beta".to_string(), "boom".to_string()],
+				));
+			});
+			assert!(!model.read_with(cx, |m, _| m.preview_loading));
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.selected_commit.is_none()) {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(
+					m.commit_files.is_empty(),
+					"the late Log read reinstalled files",
+				);
+				assert!(
+					!commit_preview_shown(m),
+					"the late Log read reinstalled a commit diff",
+				);
+			});
+		}
+
+		/// A Shift-range selection previews a Compare; a repository filter
+		/// change drops it with the selection and the compare state (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_clears_a_shift_range_compare(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			for n in ["one", "two"] {
+				fs::write(alpha.join(format!("{n}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {n}")]);
+			}
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix_of = |subject: &str| {
+				model
+					.read_with(cx, |m, _| {
+						m.display_commits()
+							.iter()
+							.position(|c| c.subject == subject)
+					})
+					.expect("commit listed")
+			};
+			let newer = ix_of("alpha two");
+			let older = ix_of("alpha one");
+			let newer_id: &'static str =
+				Box::leak(format!("log-subject:{newer}").into_boxed_str());
+			let older_id: &'static str =
+				Box::leak(format!("log-subject:{older}").into_boxed_str());
+			click(cx, newer_id);
+			let bounds = cx.debug_bounds(older_id).expect("older row");
+			cx.simulate_click(
+				bounds.center(),
+				gpui::Modifiers {
+					shift: true,
+					..Default::default()
+				},
+			);
+			cx.run_until_parked();
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| commit_preview_shown(m)) {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "range must be selected");
+				assert!(
+					matches!(
+						m.preview.as_ref().map(|p| &p.source),
+						Some(crate::reader::PreviewSource::Compare { .. })
+					),
+					"the range must preview a compare first",
+				);
+			});
+
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.selected_commit.is_none()) {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.log_selected.is_empty(), "range kept");
+				assert!(m.compare.is_none(), "compare state kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale compare kept after the repository filter",
+				);
 			});
 		}
 
@@ -16264,11 +16835,11 @@ mod tests {
 				panic!("timed out waiting for {what}");
 			}
 
-			fn sel(id: String) -> &'static str {
+			pub(super) fn sel(id: String) -> &'static str {
 				Box::leak(id.into_boxed_str())
 			}
 
-			fn click_id(cx: &mut VisualTestContext, id: String) {
+			pub(super) fn click_id(cx: &mut VisualTestContext, id: String) {
 				cx.run_until_parked();
 				let id = sel(id);
 				let bounds = cx
@@ -17426,7 +17997,10 @@ mod tests {
 				at
 			}
 
-			fn tooltip_shown(cx: &mut VisualTestContext, text: &str) -> bool {
+			pub(super) fn tooltip_shown(
+				cx: &mut VisualTestContext,
+				text: &str,
+			) -> bool {
 				drawn(cx, &format!("tooltip:{text}"))
 			}
 
@@ -17582,6 +18156,123 @@ mod tests {
 				assert!(
 					!tooltip_shown(cx, &path),
 					"tab {k}'s tooltip stays over another tab"
+				);
+			}
+
+			/// Opening the workspace menu takes its button's tooltip away
+			/// (#203): left up, it covers the menu's first item.
+			#[gpui::test]
+			fn opening_the_workspace_menu_hides_its_buttons_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				let loc = tab(&root, cx, 0).read_with(cx, |m, _| m.locale);
+				let text = format!(
+					"{} · {}",
+					a.display(),
+					crate::ui::mac_keys(crate::i18n::t(
+						"tip_workspace_menu",
+						loc
+					))
+				);
+				// Clicked while the tooltip still waits to show: GPUI keeps
+				// that timer running past the mouse-down.
+				cx.run_until_parked();
+				let at = cx
+					.debug_bounds("btn-workspace-menu")
+					.expect("button drawn")
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+
+				click_id(cx, "btn-workspace-menu".into());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+				assert!(
+					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					"the menu is open"
+				);
+				assert!(
+					!tooltip_shown(cx, &text),
+					"the tooltip stays over the opened menu"
+				);
+				let row = workspace_menu_first_row(cx);
+				assert!(!covered_by_tooltip(cx, row, &text));
+			}
+
+			/// The tooltip `text` is drawn over the point `at`.
+			pub(super) fn covered_by_tooltip(
+				cx: &mut VisualTestContext,
+				at: gpui::Point<gpui::Pixels>,
+				text: &str,
+			) -> bool {
+				cx.run_until_parked();
+				cx.debug_bounds(sel(format!("tooltip:{text}")))
+					.is_some_and(|b| b.contains(&at))
+			}
+
+			/// The first row of the open workspace menu.
+			fn workspace_menu_first_row(
+				cx: &mut VisualTestContext,
+			) -> gpui::Point<gpui::Pixels> {
+				let panel = cx
+					.debug_bounds("workspace-menu")
+					.expect("the workspace menu is drawn");
+				gpui::point(panel.center().x, panel.origin.y + gpui::px(20.))
+			}
+
+			/// Hovered until its tooltip is up, then clicked: GPUI's own
+			/// MouseDown already drops a shown tooltip, so this guards that
+			/// existing behaviour for the workspace button (not the #203 fix).
+			#[gpui::test]
+			fn clicking_the_workspace_button_drops_its_shown_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				let loc = tab(&root, cx, 0).read_with(cx, |m, _| m.locale);
+				let text = format!(
+					"{} · {}",
+					a.display(),
+					crate::ui::mac_keys(crate::i18n::t(
+						"tip_workspace_menu",
+						loc
+					))
+				);
+				hover_id(cx, "btn-workspace-menu");
+				assert!(tooltip_shown(cx, &text), "the tooltip is up");
+				click_id(cx, "btn-workspace-menu".into());
+				assert!(
+					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					"the menu is open"
+				);
+				assert!(!tooltip_shown(cx, &text), "the tooltip stays");
+				let row = workspace_menu_first_row(cx);
+				assert!(!covered_by_tooltip(cx, row, &text));
+			}
+
+			/// A tooltip left up while a native dialog took the pointer
+			/// goes when the window gets its focus back (#203), without
+			/// waiting for the next mouse input.
+			#[gpui::test]
+			fn a_tooltip_goes_when_the_window_regains_focus(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, dirs, root, cx) = many_tabs(cx, 2);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(0));
+				hover_id(cx, "ws-tab:0");
+				let path = dirs[0].display().to_string();
+				assert!(tooltip_shown(cx, &path), "the tab tooltip is up");
+
+				cx.update(|window, _| window.activate_window());
+				settle(cx);
+				assert!(
+					!tooltip_shown(cx, &path),
+					"the pointer's place is unknown until it moves"
 				);
 			}
 
@@ -19177,6 +19868,61 @@ mod tests {
 					Some(2),
 					"the retry came after the stop"
 				);
+			}
+		}
+
+		/// Log toolbar tooltips.
+		mod log_tooltips {
+			use super::workspace_tabs::{
+				click_id, covered_by_tooltip, tooltip_shown,
+			};
+			use super::*;
+
+			/// The Log toolbar's More button opens a menu below itself:
+			/// its tooltip must not cover the first item (#203).
+			#[gpui::test]
+			fn opening_the_log_more_menu_hides_its_buttons_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				let r = repo(ws.path(), "my-repo", &[]);
+				fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "commit c1"]);
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+				for _ in 0..50 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.commits.is_empty()) {
+						break;
+					}
+				}
+				settle(cx);
+				let loc = model.read_with(cx, |m, _| m.locale);
+				let text = crate::i18n::t("tip_log_more", loc).to_string();
+				// Clicked while the tooltip still waits to show.
+				let at = cx
+					.debug_bounds("btn-log-more")
+					.expect("More drawn")
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+				click_id(cx, "btn-log-more".into());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+				assert_eq!(
+					model.read_with(cx, |m, _| m.log_menu),
+					Some(crate::ui::LogMenu::More),
+					"the menu is open"
+				);
+				assert!(
+					!tooltip_shown(cx, &text),
+					"the tooltip stays over the opened menu"
+				);
+				let item = cx
+					.debug_bounds("log-more:details")
+					.expect("first item drawn")
+					.center();
+				assert!(!covered_by_tooltip(cx, item, &text));
 			}
 		}
 	}

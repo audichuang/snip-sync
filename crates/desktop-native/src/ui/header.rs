@@ -305,10 +305,14 @@ impl WorkbenchModel {
 					.cursor_pointer()
 					.hover(|s| s.bg(rgb(pal().hover_bg)))
 					.when(self.workspace_menu, |d| d.bg(rgb(pal().hover_bg)))
-					.tooltip(tip(format!(
-						"{tip_text} · {}",
-						mac_keys(t("tip_workspace_menu", loc))
-					)))
+					// Open, the menu is what the pointer is after: a
+					// tooltip here covers its first item (#203).
+					.when(!self.workspace_menu, |d| {
+						d.tooltip(tip(format!(
+							"{tip_text} · {}",
+							mac_keys(t("tip_workspace_menu", loc))
+						)))
+					})
 					.on_click(cx.listener(|this, _, _, cx| {
 						this.toggle_workspace_menu(cx);
 					}))

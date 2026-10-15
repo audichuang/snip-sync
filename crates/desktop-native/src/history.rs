@@ -1499,7 +1499,16 @@ impl WorkbenchModel {
 	/// Drops every commit selection and the details, files and previews that
 	/// came from it, so a selection that left the list leaves nothing stale.
 	fn clear_commit_selection(&mut self) {
-		self.preview_generation += 1;
+		// `preview_pending_from_log` names the owner of the latest read and
+		// only a file read resets it, so it is not tied to `preview_loading`:
+		// an error that cleared the loading flag must not leave the Log's
+		// read able to install (#202). A Project or Changes read still
+		// loading has set it false and keeps its generation.
+		if self.preview_pending_from_log {
+			self.preview_generation += 1;
+			self.preview_pending_from_log = false;
+			self.preview_loading = false;
+		}
 		self.details_generation = self.details_generation.wrapping_add(1);
 		self.selected_commit = None;
 		self.range_head = None;
@@ -1510,7 +1519,25 @@ impl WorkbenchModel {
 		self.commit_files_first_parent_same = None;
 		self.selected_commit_file = None;
 		self.commit_file_sel.clear();
-		self.preview_loading = false;
+		self.compare = None;
+		self.clear_commit_preview();
+	}
+
+	/// Releases the preview only when it came from the Log selection: a
+	/// commit diff or file, or a compare of a range or an endpoint diff.
+	/// Working-tree and paste previews stay (#202). A file opened from the
+	/// commit tree is a `CommitFile` too and counts as Log-derived.
+	fn clear_commit_preview(&mut self) {
+		let from_commit = matches!(
+			self.preview.as_ref().map(|p| &p.source),
+			Some(PreviewSource::CommitDiff { .. })
+				| Some(PreviewSource::CommitFile { .. })
+				| Some(PreviewSource::Compare { .. })
+		);
+		if from_commit {
+			self.clear_preview();
+			self.reader.release_retained();
+		}
 	}
 
 	fn report_graph_error(&mut self, error: GraphAdmissionError) {
@@ -1987,6 +2014,7 @@ impl WorkbenchModel {
 		self.commit_files.clear();
 		self.clear_preview();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		let id = sha.to_string();
 		let Some((root, sha)) = self.log_root_for(&id) else {
@@ -2281,6 +2309,7 @@ impl WorkbenchModel {
 		self.commit_file_origin.clear();
 		self.clear_preview();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		let Some((root, _)) = self
 			.log_selected
@@ -2459,6 +2488,7 @@ impl WorkbenchModel {
 		self.commit_files.clear();
 		self.clear_preview();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		self.log_commit_root = Some(root.clone());
 		app_log!("[APP:COMPARE: from={} to={}]", &older[..7], &newer[..7]);
@@ -2494,6 +2524,8 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
+		let hold = bg.clone();
+		let delay = self.e2e_log_read_delay;
 		self.spawn_owned(
 			cx,
 			crate::lifecycle::JobKind::CancellableRead,
@@ -2582,6 +2614,9 @@ impl WorkbenchModel {
 						))
 					})
 					.await;
+				if let Some(delay) = delay {
+					hold.timer(delay).await;
+				}
 				let _ = this.update(&mut async_app, |model, cx| {
 					if model.preview_generation != task_generation {
 						return;
@@ -2713,6 +2748,7 @@ impl WorkbenchModel {
 		self.selected_commit_file = Some(path.to_string());
 		self.commit_file_sel.clear();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		self.preview_error_root = None;
 		let path = path.to_string();
@@ -3022,6 +3058,7 @@ impl WorkbenchModel {
 		self.selected_commit_file = Some(path.clone());
 		self.commit_file_sel.clear();
 		self.preview_loading = true;
+		self.preview_pending_from_log = true;
 		self.preview_error = None;
 		app_log!("[APP:TREE_FILE_SELECTED: {}]", path);
 		let (sha_bg, path_bg) = (sha.clone(), path.clone());
@@ -3441,6 +3478,18 @@ impl WorkbenchModel {
 			.unwrap_or_else(|| self.display_repo_path(root))
 	}
 
+	/// The Repository chip's name for a repository: its workspace name,
+	/// disambiguated like a local one (a remote entry's `name` is already
+	/// short), so a long remote prefix (`host ▸ path › `) does not crowd
+	/// the other chips.
+	pub fn log_repo_chip_name(&self, root: &std::path::Path) -> String {
+		self.repos
+			.iter()
+			.find(|r| r.root == root)
+			.map(|r| r.name.clone())
+			.unwrap_or_else(|| self.log_repo_name(root))
+	}
+
 	/// A repository's root-stripe color: its place in the workspace, so
 	/// it stays the same whatever the Repository chip shows.
 	pub fn log_repo_color(&self, root: &std::path::Path) -> usize {
@@ -3565,10 +3614,7 @@ impl WorkbenchModel {
 		app_log!("[APP:LOG_REPOS: n={}]", self.log_scope().len());
 		self.log_filter.paths.clear();
 		self.log_paths_expanded.clear();
-		self.selected_commit = None;
-		self.range_head = None;
-		self.log_selected.clear();
-		self.commit_details = None;
+		self.clear_commit_selection();
 		self.apply_log_filter(cx);
 	}
 
@@ -3901,9 +3947,7 @@ impl WorkbenchModel {
 				self.locate_merged_head(cx);
 			} else if let Some(anchor) = self.selected_commit.clone() {
 				if !self.reselect_after_load(&anchor, cx) {
-					self.selected_commit = None;
-					self.log_selected.clear();
-					self.commit_details = None;
+					self.clear_commit_selection();
 				}
 			}
 		}
