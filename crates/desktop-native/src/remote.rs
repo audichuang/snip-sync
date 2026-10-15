@@ -674,6 +674,10 @@ pub fn describe_msg(err: RemoteError) -> Msg {
 			detail,
 			..
 		} => start_msg(reason, &detail),
+		RemoteError::Refused {
+			code: snip_remote::ErrorCode::NotFound,
+			..
+		} => Msg::new("remote_not_found", []),
 		other => Msg::raw(describe(other)),
 	}
 }
@@ -1699,6 +1703,16 @@ mod tests {
 		);
 		assert_eq!(zh(start(None, "")), "english text the CLI prints");
 		assert_eq!(zh(RemoteError::Protocol("x".into())), "protocol: x");
+		// A path that does not exist is worded, not the OS text (#213).
+		let gone = || RemoteError::Refused {
+			code: snip_remote::ErrorCode::NotFound,
+			message: "No such file or directory (os error 2)".into(),
+		};
+		assert_eq!(zh(gone()), "找不到遠端的資料夾或檔案，請確認路徑是否存在");
+		assert_eq!(
+			en(gone()),
+			"The remote folder or file was not found; check that the path exists"
+		);
 	}
 
 	/// Worker paths resolve by the worker's spelling, on any master OS.
