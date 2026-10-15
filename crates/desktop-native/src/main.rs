@@ -536,6 +536,7 @@ fn read_change_list(
 	root: &std::path::Path,
 	known: Option<&RepoIdentity>,
 	cancel: CancelToken,
+	loc: crate::i18n::Locale,
 ) -> Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>, usize), String> {
 	let read = snip_core::gitview::Read {
 		profile: snip_core::gitview::ReadProfile::Interactive,
@@ -544,7 +545,7 @@ fn read_change_list(
 	let repo = host.open(root, known, &read)?;
 	let list = repo
 		.change_list(MAX_CHANGES_PER_REPO, &read)
-		.map_err(|e| e.to_string())?;
+		.map_err(|e| crate::remote::git_error_loc(e, loc))?;
 	let summary = match (known, list.summary) {
 		(Some(id), Some(s)) => Some(RepoSummary {
 			identity: id.clone(),
@@ -1792,6 +1793,7 @@ impl WorkbenchModel {
 				.find(|r| r.root == root)
 				.and_then(|r| r.identity.clone());
 			let host = self.git_host();
+			let loc = self.locale;
 			let mut async_app = cx.to_async();
 			let this = cx.weak_entity();
 			let bg = cx.background_executor().clone();
@@ -1809,6 +1811,7 @@ impl WorkbenchModel {
 								&read_root,
 								known.as_ref(),
 								cancel_bg,
+								loc,
 							)
 						})
 						.await;
@@ -4007,6 +4010,7 @@ impl WorkbenchModel {
 		let repo_root_for_update = repo_root.clone();
 		let known = self.repos[idx].identity.clone();
 		let host = self.git_host();
+		let loc = self.locale;
 		self.spawn_owned(
 			cx,
 			lifecycle::JobKind::CancellableRead,
@@ -4019,6 +4023,7 @@ impl WorkbenchModel {
 							&repo_root,
 							known.as_ref(),
 							cancel_bg,
+							loc,
 						)
 					})
 					.await;
@@ -11913,9 +11918,18 @@ mod tests {
 			fs::create_dir_all(&beta).unwrap();
 			crate::paste::tests::git_init(&alpha);
 			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
+			let long: String =
+				(1..=40).map(|i| format!("line {i}\n")).collect();
+			fs::write(alpha.join("long.txt"), &long).unwrap();
 			crate::paste::tests::git_run(&alpha, &["add", "."]);
 			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
 			fs::write(alpha.join("dirty.txt"), "dirty\n").unwrap();
+			// One edit in the middle: the diff folds the lines around it.
+			fs::write(
+				alpha.join("long.txt"),
+				long.replace("line 20\n", "edited\n"),
+			)
+			.unwrap();
 			crate::paste::tests::git_init(&beta);
 			fs::write(beta.join("init.txt"), "hello\n").unwrap();
 			crate::paste::tests::git_run(&beta, &["add", "init.txt"]);
@@ -12052,6 +12066,58 @@ mod tests {
 			assert_no_snip_in_zh(&status);
 		}
 
+		/// Selecting a repository (a click on its row) when the worker cannot
+		/// restart: the Changes read fails and the status says why in the
+		/// interface language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_changes_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "repo-row:beta");
+			settle_until(cx, "the changes error", |cx| {
+				model.read_with(cx, |m, _| m.status.key == "error_repo_changes")
+			});
+			let status = status_text(&model, cx);
+			assert!(status.contains("變更失敗"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// Expanding a diff's folded lines (a click on the fold) when the
+		/// worker cannot restart: the status says why in the interface
+		/// language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_fold_expansion_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-0");
+			settle(cx);
+			click_probed(&model, cx, "change-repo-toggle:unstaged:alpha");
+			click_probed(&model, cx, "change-row@alpha:unstaged:long.txt");
+			settle_until(cx, "the diff preview", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes
+						.as_ref()
+						.is_some_and(|p| p.bounds("diff-fold:end").is_some())
+				})
+			});
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "diff-fold:end");
+			settle_until(cx, "the fold error", |cx| {
+				model.read_with(cx, |m, _| m.status.key == "status_fold_failed")
+			});
+			let status = status_text(&model, cx);
+			assert_no_snip_in_zh(&status);
+		}
+
 		/// Opening a Project tree file when the worker cannot restart: the
 		/// editor's error says why in the interface language (#206).
 		#[cfg(unix)]
@@ -12063,18 +12129,6 @@ mod tests {
 			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
 			cx.simulate_keystrokes("alt-1");
 			settle(cx);
-			eprintln!(
-				"DBG {:?} {:?} {:?} {:?} {:?}",
-				model.read_with(cx, |m, _| (m.left_visible, m.active_tab)),
-				cx.debug_bounds("repo-row:alpha"),
-				cx.debug_bounds("repo-row:beta"),
-				cx.debug_bounds("left-list"),
-				model.read_with(cx, |m, _| m.ws_tree.as_ref().map(|t| t
-					.flatten_visible(300)
-					.iter()
-					.map(|r| r.rel_path.clone())
-					.collect::<Vec<_>>()))
-			);
 			click_probed(&model, cx, "ws-tree-row:notes");
 			settle_until(cx, "the notes folder to open", |cx| {
 				model.read_with(cx, |m, _| {
@@ -20653,6 +20707,7 @@ mod tests {
 			dir.path(),
 			None,
 			super::CancelToken::new(),
+			crate::i18n::Locale::En,
 		)
 		.unwrap();
 		let staged_items: Vec<_> = items
@@ -20783,6 +20838,7 @@ mod tests {
 			dir.path(),
 			None,
 			super::CancelToken::new(),
+			crate::i18n::Locale::En,
 		)
 		.unwrap();
 		assert_eq!(items.len(), MAX_CHANGES_PER_REPO);

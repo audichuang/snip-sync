@@ -1338,6 +1338,7 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let job_cancel = cancel.clone();
 		let host = self.git_host();
+		let loc = self.locale;
 		self.spawn_owned(
 			cx,
 			crate::lifecycle::JobKind::CancellableRead,
@@ -1345,7 +1346,7 @@ impl WorkbenchModel {
 			async move {
 				let result = bg
 					.spawn(async move {
-						read_new_side(&host, &root, &source, &path, cancel)
+						read_new_side(&host, &root, &source, &path, cancel, loc)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2224,6 +2225,7 @@ fn read_new_side(
 	source: &GitSource,
 	path: &str,
 	cancel: CancelToken,
+	loc: crate::i18n::Locale,
 ) -> Result<String, String> {
 	let read = Read {
 		profile: ReadProfile::InteractivePreview,
@@ -2231,7 +2233,7 @@ fn read_new_side(
 	};
 	host.open(root, None, &read)?
 		.changed_file_text(source, path, MAX_PREVIEW_BYTES as u64, &read)
-		.map_err(|e| e.to_string())?
+		.map_err(|e| crate::remote::git_error_loc(e, loc))?
 		.ok_or_else(|| "no new-side text".to_string())
 }
 
