@@ -13555,8 +13555,8 @@ mod tests {
 		/// so CJK is undercounted and truncation never shows (#224).
 		/// `use_real_text_system` swaps in the OS text system (CoreText on
 		/// macOS, cosmic-text on Linux; patch listed in vendor/gpui/SNIP_PATCH.md).
-		/// Windows has no windowless DirectWrite, so it is a real skip there,
-		/// and it also skips where no installed font has CJK glyphs.
+		/// Windows is skipped: building DirectWrite without a window was not
+		/// attempted. Without an installed CJK font the CJK check fails.
 		#[gpui::test]
 		fn real_text_system_measures_cjk_and_the_log_labels_stay_readable(
 			cx: &mut TestAppContext,
