@@ -16,6 +16,7 @@ use crate::fsutil::{must_not_overwrite, write_text_file};
 use crate::gitrun::{CancelToken, Overflow, RunOptions};
 use crate::gitsrc::{Git, GitError, RawZ};
 use crate::paths::{escapes_all_roots, lands_in_git_dir, resolve_write_target};
+use crate::reason::{io_reason, Reason};
 
 /// Replay replaces a symlink at the target instead of writing through it,
 /// so only the folder it lands in decides whether it is inside Git.
@@ -64,6 +65,48 @@ pub enum CommitError {
 		"commit export exceeds {limit} serialized bytes (at least {actual})"
 	)]
 	PayloadLimit { limit: usize, actual: usize },
+}
+
+impl CommitError {
+	/// Why this failed, as data for a front end to word. The `Display` text
+	/// stays the CLI's. An exhaustive match: a new variant must decide.
+	pub fn reason(&self) -> Reason {
+		match self {
+			Self::Git(e) => e.reason(),
+			Self::Empty => Reason::EmptySelection,
+			Self::NotEnoughCommits {
+				requested,
+				available,
+			} => Reason::NotEnoughCommits {
+				requested: *requested as u64,
+				available: *available as u64,
+			},
+			Self::Discontinuous {
+				base,
+				tip,
+				at,
+				first_parent,
+			} => Reason::Discontinuous {
+				base: base.clone(),
+				tip: tip.clone(),
+				at: at.clone(),
+				first_parent: first_parent.clone(),
+			},
+			Self::NotCommitPayload => Reason::NotCommitPayload,
+			Self::InvalidPayload(detail) => Reason::InvalidPayload {
+				detail: detail.clone(),
+			},
+			Self::OutsideScope { path, scope } => Reason::OutsideScope {
+				path: path.clone(),
+				scope: scope.display().to_string(),
+			},
+			Self::PayloadLimit { limit, actual } => Reason::PayloadTooLarge {
+				limit: *limit as u64,
+				actual: *actual as u64,
+				path: None,
+			},
+		}
+	}
 }
 
 /// Clipboard document produced by [`copy_commits_with`].
@@ -2154,6 +2197,14 @@ pub struct ReplayFailure {
 	pub error: String,
 	pub layout_conflict: Option<LayoutConflict>,
 	pub conflict_path: Option<String>,
+	/// Why, as data. `None` from a peer that does not send one (an old
+	/// worker, or a variant this build does not know).
+	#[serde(
+		default,
+		deserialize_with = "crate::reason::lenient",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub reason: Option<Reason>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2189,6 +2240,7 @@ impl ReplaySession {
 	pub(crate) fn refused(
 		payload: &CommitsPayload,
 		error: String,
+		reason: Reason,
 	) -> ReplayResult {
 		ReplayResult {
 			created: Vec::new(),
@@ -2198,6 +2250,7 @@ impl ReplaySession {
 				error,
 				layout_conflict: None,
 				conflict_path: None,
+				reason: Some(reason),
 			}),
 		}
 	}
@@ -2209,14 +2262,15 @@ impl ReplaySession {
 		scope: &Path,
 		payload: &CommitsPayload,
 		_guards: Vec<crate::workspace::HeavyGuard>,
-	) -> Result<Self, ReplayResult> {
+	) -> Result<Self, Box<ReplayResult>> {
 		let no_hooks = match NoHooks::create() {
 			Ok(h) => h,
 			Err(e) => {
-				return Err(Self::refused(
+				return Err(Box::new(Self::refused(
 					payload,
 					format!("cannot create an empty hooks directory: {e}"),
-				));
+					io_reason(&e, ""),
+				)));
 			}
 		};
 		Ok(Self {
@@ -2244,6 +2298,7 @@ impl ReplaySession {
 						error: err.error,
 						layout_conflict: err.layout_conflict,
 						conflict_path: err.conflict_path,
+						reason: Some(*err.reason),
 					});
 					break;
 				}
@@ -2257,11 +2312,13 @@ impl ReplaySession {
 pub(crate) fn replay(git: &Git, payload: &CommitsPayload) -> ReplayResult {
 	let guard = match ReplaySession::lock(git, &RunOptions::default()) {
 		Ok(g) => g,
-		Err(e) => return ReplaySession::refused(payload, e.to_string()),
+		Err(e) => {
+			return ReplaySession::refused(payload, e.to_string(), e.reason())
+		}
 	};
 	match ReplaySession::begin_in(git.root(), payload, vec![guard]) {
 		Ok(session) => session.run(git, payload),
-		Err(refused) => refused,
+		Err(refused) => *refused,
 	}
 }
 
@@ -2309,18 +2366,34 @@ impl Drop for NoHooks {
 
 struct ReplayCommitError {
 	error: String,
+	/// Boxed: `Reason` is large, and this rides in many `Result`s.
+	reason: Box<Reason>,
 	layout_conflict: Option<LayoutConflict>,
 	conflict_path: Option<String>,
 }
 
-impl From<String> for ReplayCommitError {
-	fn from(error: String) -> Self {
+impl ReplayCommitError {
+	fn new(error: String, reason: Reason) -> Self {
 		Self {
 			error,
+			reason: Box::new(reason),
 			layout_conflict: None,
 			conflict_path: None,
 		}
 	}
+}
+
+impl From<GitError> for ReplayCommitError {
+	fn from(e: GitError) -> Self {
+		Self::new(e.to_string(), e.reason())
+	}
+}
+
+fn unsafe_path_error(path: &str) -> ReplayCommitError {
+	ReplayCommitError::new(
+		format!("{path}: unsafe path"),
+		Reason::UnsafePath { path: path.into() },
+	)
 }
 
 fn replay_commit(
@@ -2332,8 +2405,7 @@ fn replay_commit(
 	let root = git.root();
 	// Replay plans against the disk and index as the earlier commits left
 	// them.
-	let layout = PlannedLayout::new(git, &RunOptions::default())
-		.map_err(|e| e.to_string())?;
+	let layout = PlannedLayout::new(git, &RunOptions::default())?;
 	let plan = plan_commit(root, commit, &layout);
 	// The preview skips these; replay refuses the commit before touching
 	// anything rather than stop halfway with a half-staged worktree.
@@ -2342,6 +2414,10 @@ fn replay_commit(
 	{
 		return Err(ReplayCommitError {
 			error: format!("{}: {}", plan.files[i].path, conflict.describe()),
+			// Never shown: a layout conflict is worded by its own key.
+			reason: Box::new(Reason::Internal {
+				detail: String::new(),
+			}),
 			layout_conflict: Some(conflict),
 			conflict_path: Some(plan.files[i].path.clone()),
 		});
@@ -2361,14 +2437,18 @@ fn replay_commit(
 			continue;
 		};
 		if unsafe_replay_target(scope, abs) {
-			return Err(format!("{}: unsafe path", f.path).into());
+			return Err(unsafe_path_error(&f.path));
 		}
 		if !is_symlink(abs) && must_not_overwrite(abs) {
-			return Err(format!(
-				"{}: target is not UTF-8 or cannot be verified",
-				f.path
-			)
-			.into());
+			return Err(ReplayCommitError::new(
+				format!(
+					"{}: target is not UTF-8 or cannot be verified",
+					f.path
+				),
+				Reason::Unverifiable {
+					path: f.path.clone(),
+				},
+			));
 		}
 	}
 
@@ -2384,8 +2464,6 @@ fn replay_commit(
 			deleted.push(rel);
 		}
 	}
-	let err = |e: GitError| e.to_string();
-
 	let mut paths: Vec<&str> = Vec::new();
 	for (f, src) in plan.files.iter().zip(&commit.files) {
 		let (ReplayAction::Write, Some(abs), Some(content)) =
@@ -2394,12 +2472,16 @@ fn replay_commit(
 			continue;
 		};
 		if unsafe_replay_target(root, abs) {
-			return Err(format!("{}: unsafe path", f.path).into());
+			return Err(unsafe_path_error(&f.path));
 		}
 		// The write replaces the entry: a symlink or a hard link here is
 		// itself replaced, never written through.
-		write_text_file(abs, content)
-			.map_err(|e| format!("{}: {e}", f.path))?;
+		write_text_file(abs, content).map_err(|e| {
+			ReplayCommitError::new(
+				format!("{}: {e}", f.path),
+				io_reason(&e, &f.path),
+			)
+		})?;
 		paths.push(&f.path);
 	}
 
@@ -2421,8 +2503,8 @@ fn replay_commit(
 		];
 		args.extend(&deleted);
 		// An unborn HEAD tracks nothing.
-		let out = if git.head().map_err(err)?.is_some() {
-			git.run(&args).map_err(err)?
+		let out = if git.head()?.is_some() {
+			git.run(&args)?
 		} else {
 			Vec::new()
 		};
@@ -2446,7 +2528,7 @@ fn replay_commit(
 			"--",
 		];
 		args.extend(&deleted_committed);
-		git.run(&args).map_err(err)?;
+		git.run(&args)?;
 	}
 	if !paths.is_empty() {
 		// `-f`: the source tracked it, even if it is ignored here.
@@ -2460,7 +2542,7 @@ fn replay_commit(
 			"--",
 		];
 		args.extend(&paths);
-		git.run(&args).map_err(err)?;
+		git.run(&args)?;
 	}
 	paths.extend(deleted_committed);
 	paths.sort_unstable();
@@ -2482,10 +2564,8 @@ fn replay_commit(
 		"--",
 	];
 	args.extend(&paths);
-	run_commit(git, &args, commit).map_err(err)?;
-	let head = git
-		.run(&["-c", no_hooks, "rev-parse", "HEAD"])
-		.map_err(err)?;
+	run_commit(git, &args, commit)?;
+	let head = git.run(&["-c", no_hooks, "rev-parse", "HEAD"])?;
 	Ok(String::from_utf8_lossy(&head).trim().to_string())
 }
 
@@ -2495,9 +2575,13 @@ fn replay_commit(
 /// bounded by the RESOLVED `scope` — the folder the user opened — and never
 /// removes the scope folder itself, however the scope was spelled (a
 /// symlinked spelling resolves to the same bound).
-fn delete(scope: &Path, abs: &Path, rel: &str) -> Result<(), String> {
+fn delete(
+	scope: &Path,
+	abs: &Path,
+	rel: &str,
+) -> Result<(), ReplayCommitError> {
 	if unsafe_replay_target(scope, abs) {
-		return Err(format!("{rel}: unsafe path"));
+		return Err(unsafe_path_error(rel));
 	}
 	match fs::remove_file(abs) {
 		Ok(()) => {}
@@ -2510,7 +2594,12 @@ fn delete(scope: &Path, abs: &Path, rel: &str) -> Result<(), String> {
 		{
 			return Ok(())
 		}
-		Err(e) => return Err(format!("{rel}: {e}")),
+		Err(e) => {
+			return Err(ReplayCommitError::new(
+				format!("{rel}: {e}"),
+				io_reason(&e, rel),
+			))
+		}
 	}
 	let bound =
 		dunce::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf());
@@ -2905,6 +2994,11 @@ mod tests {
 		let failure = result.failure.unwrap();
 		assert_eq!(failure.index, 1);
 		assert!(failure.error.contains("commit"), "{}", failure.error);
+		assert!(
+			matches!(failure.reason, Some(Reason::GitFailed { .. })),
+			"{:?}",
+			failure.reason
+		);
 		assert_eq!(failure.layout_conflict, None);
 		assert_eq!(failure.conflict_path, None);
 		assert_eq!(plan.commits[0].refused_by(), None);
@@ -4561,6 +4655,75 @@ mod tests {
 	}
 
 	#[test]
+	fn replay_errors_carry_their_reason_next_to_the_text() {
+		let e = unsafe_path_error("a/b.txt");
+		assert_eq!(e.error, "a/b.txt: unsafe path");
+		assert_eq!(
+			e.reason,
+			Box::new(Reason::UnsafePath {
+				path: "a/b.txt".into()
+			})
+		);
+		let e = ReplayCommitError::from(GitError::NotFound);
+		assert_eq!(e.error, GitError::NotFound.to_string());
+		assert_eq!(*e.reason, Reason::GitMissing);
+		let refused = ReplaySession::refused(
+			&bob("m\n", vec![]),
+			"x".into(),
+			Reason::Cancelled,
+		);
+		assert_eq!(
+			refused.failure.expect("one commit").reason,
+			Some(Reason::Cancelled)
+		);
+	}
+
+	#[test]
+	fn a_replay_failure_without_a_reason_still_decodes() {
+		let old = r#"{"index":0,"message":"m","error":"e","layoutConflict":null,"conflictPath":null}"#;
+		let f: ReplayFailure = serde_json::from_str(old).unwrap();
+		assert_eq!(f.reason, None);
+		let new = r#"{"index":0,"message":"m","error":"e","layoutConflict":null,"conflictPath":null,"reason":{"r":"from_the_future"}}"#;
+		let f: ReplayFailure = serde_json::from_str(new).unwrap();
+		assert_eq!(f.reason, None);
+		// None is omitted, so an old peer reads the same bytes as before.
+		assert!(!serde_json::to_string(&f).unwrap().contains("reason"));
+	}
+
+	#[test]
+	fn commit_error_reasons_are_data() {
+		assert_eq!(CommitError::Empty.reason(), Reason::EmptySelection);
+		assert_eq!(
+			CommitError::OutsideScope {
+				path: "src/a.rs".into(),
+				scope: PathBuf::from("/w/src"),
+			}
+			.reason(),
+			Reason::OutsideScope {
+				path: "src/a.rs".into(),
+				scope: PathBuf::from("/w/src").display().to_string(),
+			}
+		);
+		assert_eq!(
+			CommitError::PayloadLimit {
+				limit: 5,
+				actual: 9
+			}
+			.reason(),
+			Reason::PayloadTooLarge {
+				limit: 5,
+				actual: 9,
+				path: None
+			}
+		);
+		assert_eq!(
+			CommitError::Git(GitError::WorktreeBusy { args: "x".into() })
+				.reason(),
+			Reason::RepoBusy
+		);
+	}
+
+	#[test]
 	fn commits_replay_refuses_a_directory_at_a_write_target_up_front() {
 		let dst = Repo::new("main");
 		dst.write("a.txt", b"a\n");
@@ -4584,6 +4747,14 @@ mod tests {
 		let result = replay(&g, &payload);
 		let failure = result.failure.expect("refused");
 		assert!(failure.error.contains("directory"), "{}", failure.error);
+		// A layout conflict is worded by its own key; the reason is a
+		// placeholder that is never shown.
+		assert!(failure.layout_conflict.is_some());
+		assert!(
+			matches!(failure.reason, Some(Reason::Internal { .. })),
+			"{:?}",
+			failure.reason
+		);
 		assert_eq!(dst.git(&["rev-parse", "HEAD"]), head);
 		assert!(dst.path().join("a.txt").exists());
 		assert!(!dst.path().join("b.txt").exists());

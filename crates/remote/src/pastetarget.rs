@@ -17,6 +17,7 @@ use std::sync::Arc;
 use snip_core::commits::{CommitsPayload, ReplayResult};
 use snip_core::gitrun::RunOptions;
 use snip_core::gitsrc::GitError;
+use snip_core::reason::StaleChange;
 use snip_core::restore::{
 	suggest_restore_base, FsProbe, RestoreBaseSuggestion,
 	RestoreExecutionResult, RestorePlan, RestoreSelection,
@@ -478,6 +479,7 @@ impl PasteTarget {
 								.unwrap_or_default(),
 							reason: "the plan was made on another machine"
 								.into(),
+							change: StaleChange::Preview,
 						},
 					));
 				}
@@ -776,6 +778,7 @@ mod tests {
 			root: "/r".into(),
 			reason: "target file 'a' was created externally after preview"
 				.into(),
+			change: StaleChange::Created { rel: "a".into() },
 		});
 		assert_eq!(
 			local_stale.stale_reason().as_deref(),

@@ -1001,7 +1001,7 @@ mod tests {
 			format!("Snipcode refused to paste: {COLLISION}")
 		);
 		assert_eq!(
-			local(TransferError::StaleDestination { root: "/r".into(), reason: "target file 'a' was modified externally after preview".into() }),
+			local(TransferError::StaleDestination { root: "/r".into(), reason: "target file 'a' was modified externally after preview".into(), change: snip_core::reason::StaleChange::Modified { rel: "a".into() } }),
 			"Snipcode refused to paste: stale destination in '/r': target file 'a' was modified externally after preview; re-run to inspect updated destinations"
 		);
 		assert_eq!(

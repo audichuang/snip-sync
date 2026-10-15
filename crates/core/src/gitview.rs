@@ -631,6 +631,20 @@ pub fn identify_repos(
 	budget: &ScanBudget,
 	opts: &RunOptions,
 ) -> (Vec<FoundRepo>, Vec<(PathBuf, String)>) {
+	let (list, errors, _) =
+		identify_repos_stopped(found, boundary, budget, opts);
+	(list, errors)
+}
+
+/// [`identify_repos`], and the budget stop that left repos unread, if any:
+/// callers read that, never the "not read" text of a row.
+pub fn identify_repos_stopped(
+	found: Vec<DiscoveredRepo>,
+	boundary: Option<&Path>,
+	budget: &ScanBudget,
+	opts: &RunOptions,
+) -> (Vec<FoundRepo>, Vec<(PathBuf, String)>, Option<ScanStatus>) {
+	let mut stopped: Option<ScanStatus> = None;
 	let mut seen_identities: HashSet<(PathBuf, PathBuf)> = HashSet::new();
 	let mut seen_roots: HashSet<PathBuf> = HashSet::new();
 	let mut list = Vec::new();
@@ -641,6 +655,7 @@ pub fn identify_repos(
 	let mut iter = found.into_iter().enumerate();
 	while let Some((idx, r)) = iter.next() {
 		if let Some(stop) = budget.stop(idx) {
+			stopped = Some(stop);
 			let err_msg = match stop {
 				ScanStatus::Cancelled => "not read: cancelled".to_string(),
 				_ => "not read: time limit".to_string(),
@@ -830,7 +845,7 @@ pub fn identify_repos(
 		}
 	}
 
-	(list, errors)
+	(list, errors, stopped)
 }
 
 pub fn identify_repo(
@@ -998,7 +1013,8 @@ fn finish_scan(
 ) -> WorkspaceScan {
 	// Identified as a local workspace's repos are: a worktree whose main
 	// repository is elsewhere is still served.
-	let (repos, id_errors) = identify_repos(page.repos, None, budget, opts);
+	let (repos, id_errors, stopped) =
+		identify_repos_stopped(page.repos, None, budget, opts);
 
 	let mut all_errors = page.errors;
 	all_errors.extend(id_errors);
@@ -1022,14 +1038,10 @@ fn finish_scan(
 		};
 
 	let mut status = page.status;
-	if status == ScanStatus::Complete
-		&& repos.iter().any(|r| {
-			r.summary
-				.as_ref()
-				.err()
-				.is_some_and(|msg| msg.starts_with("not read: "))
-		}) {
-		status = budget.stop(0).unwrap_or(ScanStatus::TimedOut);
+	if status == ScanStatus::Complete {
+		if let Some(stop) = stopped {
+			status = stop;
+		}
 	}
 
 	WorkspaceScan {
@@ -1775,8 +1787,21 @@ mod tests {
 			),
 			cancel: None,
 		};
-		let (list, errors) =
-			identify_repos(disc, None, &budget, &RunOptions::default());
+		let (list, errors, stopped) = identify_repos_stopped(
+			disc.clone(),
+			None,
+			&budget,
+			&RunOptions::default(),
+		);
+		// The stop is data, not a row's text.
+		assert_eq!(stopped, Some(ScanStatus::TimedOut));
+		let (_, _, unstopped) = identify_repos_stopped(
+			disc,
+			None,
+			&ScanBudget::visits(usize::MAX),
+			&RunOptions::default(),
+		);
+		assert_eq!(unstopped, None);
 		assert!(errors.is_empty());
 		assert_eq!(list.len(), 2);
 		assert_eq!(list[0].root, PathBuf::from("/nonexistent/repo1"));

@@ -756,22 +756,24 @@ pub fn start_msg(reason: StartReason, detail: &str) -> Msg {
 /// A Git view's error as a message: a worker that did not start gets
 /// [`start_msg`]; anything else keeps its own text.
 pub fn git_error_msg(err: snip_core::gitsrc::GitError) -> Msg {
+	use snip_core::reason::Reason;
 	match err {
-		snip_core::gitsrc::GitError::HostStart { reason, detail, .. } => {
-			start_msg(reason, &detail)
-		}
-		// A worker refusal keeps its code, so it is worded like
-		// `describe_msg` words it; the worker's own text is not shown.
-		snip_core::gitsrc::GitError::HostRefused { code, message } => {
-			match serde_json::from_value::<snip_remote::ErrorCode>(
-				serde_json::Value::String(code),
-			)
-			.ok()
-			.and_then(refusal_key)
-			{
-				Some(key) => Msg::new(key, []),
-				// ALLOWED-RAW: worker message for a code with no wording
-				None => Msg::raw(message),
+		snip_core::gitsrc::GitError::Remote { reason, message } => {
+			match *reason {
+				Reason::Start {
+					start: Some(reason),
+					detail,
+				} => start_msg(reason, &detail),
+				// A worker refusal keeps its code, so it is worded like
+				// `describe_msg` words it; the worker's own text is not
+				// shown.
+				Reason::Refused { code } => match refusal_key(code) {
+					Some(key) => Msg::new(key, []),
+					// ALLOWED-RAW: worker message for a code with no wording
+					None => Msg::raw(message),
+				},
+				// ALLOWED-RAW: pending #225: git errors with no Reason yet
+				_ => Msg::raw(message),
 			}
 		}
 		// ALLOWED-RAW: pending #225: git errors with no Reason yet
@@ -1714,10 +1716,14 @@ mod tests {
 	#[test]
 	fn git_errors_word_a_lost_worker_in_the_interface_language() {
 		use snip_core::gitsrc::GitError;
-		let lost = || GitError::HostStart {
-			reason: StartReason::NoWorker,
-			detail: String::new(),
-			message: "snip is not installed".into(),
+		let lost = || {
+			GitError::remote(
+				snip_core::reason::Reason::Start {
+					start: Some(StartReason::NoWorker),
+					detail: String::new(),
+				},
+				"snip is not installed",
+			)
 		};
 		// One stored message, worded in whichever language draws it.
 		let msg = git_error_msg(lost());
@@ -1729,7 +1735,10 @@ mod tests {
 			msg.render(Locale::En),
 			crate::i18n::t("remote_start_no_worker", Locale::En)
 		);
-		let boom = git_error_msg(GitError::Host("boom".into()));
+		let boom = git_error_msg(GitError::remote(
+			snip_core::reason::Reason::Protocol,
+			"boom",
+		));
 		assert_eq!(boom.render(Locale::ZhTw), "boom");
 		assert_eq!(boom.render(Locale::En), "boom");
 	}
@@ -1791,7 +1800,14 @@ mod tests {
 				message: "worker English".into(),
 			});
 			assert!(
-				matches!(err, snip_core::gitsrc::GitError::HostRefused { .. }),
+				matches!(
+					&err,
+					snip_core::gitsrc::GitError::Remote { reason, .. }
+						if matches!(
+							**reason,
+							snip_core::reason::Reason::Refused { .. }
+						)
+				),
 				"{code:?}: {err:?}"
 			);
 			let msg = git_error_msg(err);

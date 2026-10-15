@@ -6671,7 +6671,10 @@ mod tests {
 			.render(crate::i18n::Locale::En);
 		assert!(text.contains("big.txt") && text.contains("diff"), "{text}");
 		assert!(matches!(
-			PreviewErr::git(GitError::Host("boom".into())),
+			PreviewErr::git(GitError::remote(
+				snip_core::reason::Reason::Protocol,
+				"boom",
+			)),
 			PreviewErr::Failed(_)
 		));
 		let text = PreviewErr::TooLarge

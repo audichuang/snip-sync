@@ -13,6 +13,7 @@ use super::*;
 use crate::i18n::Locale;
 use crate::PreviewErr;
 use snip_core::gitsrc::{GitError, StartReason};
+use snip_core::reason::Reason;
 use snip_remote::{ConnectFailureKind, ErrorCode, RemoteError};
 use std::collections::BTreeSet;
 
@@ -129,13 +130,11 @@ fn git_variant(e: &GitError) -> usize {
 		GitError::Malformed(_) => 16,
 		GitError::OutsideBoundary { .. } => 17,
 		GitError::VerifyLimit { .. } => 18,
-		GitError::Host(_) => 19,
-		GitError::HostRefused { .. } => 20,
-		GitError::HostStart { .. } => 21,
-		GitError::Io(_) => 22,
+		GitError::Remote { .. } => 19,
+		GitError::Io(_) => 20,
 	}
 }
-const GIT_VARIANTS: usize = 23;
+const GIT_VARIANTS: usize = 21;
 
 fn preview_variant(e: &PreviewErr) -> usize {
 	match e {
@@ -281,41 +280,27 @@ fn git_samples() -> Vec<(String, GitError)> {
 			"VerifyLimit".into(),
 			GitError::VerifyLimit { what: "datatoken" },
 		),
-		("Host".into(), GitError::Host(a())),
+		("Host".into(), GitError::remote(Reason::Protocol, a())),
 		("Io".into(), GitError::Io(std::io::Error::other(D))),
 	];
 	for reason in ALL_REASONS {
 		v.push((
 			format!("HostStart#{}", reason_index(reason)),
-			GitError::HostStart {
-				reason,
-				detail: a(),
-				message: W.into(),
-			},
+			GitError::remote(
+				Reason::Start {
+					start: Some(reason),
+					detail: a(),
+				},
+				W,
+			),
 		));
 	}
 	for code in ALL_CODES {
-		let wire = serde_json::to_value(code)
-			.unwrap()
-			.as_str()
-			.unwrap()
-			.to_string();
 		v.push((
 			format!("HostRefused#{}", code_index(code)),
-			GitError::HostRefused {
-				code: wire,
-				message: refusal_text(code).into(),
-			},
+			GitError::remote(Reason::Refused { code }, refusal_text(code)),
 		));
 	}
-	// A wire code this build does not know.
-	v.push((
-		"HostRefused#unknown".into(),
-		GitError::HostRefused {
-			code: "datatoken".into(),
-			message: a(),
-		},
-	));
 	v
 }
 
@@ -536,7 +521,6 @@ const ECHO_ONLY: &[&str] = &[
 	"PreviewErr::git/Host",
 	"PreviewErr::git/HostRefused#13",
 	"PreviewErr::git/HostRefused#14",
-	"PreviewErr::git/HostRefused#unknown",
 	"PreviewErr::git/Io",
 	"PreviewErr::git/OutputLimit",
 	"PreviewErr::git/PatchLimit",
@@ -555,7 +539,6 @@ const ECHO_ONLY: &[&str] = &[
 	"git_error_msg/Host",
 	"git_error_msg/HostRefused#13",
 	"git_error_msg/HostRefused#14",
-	"git_error_msg/HostRefused#unknown",
 	"git_error_msg/Io",
 ];
 

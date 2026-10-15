@@ -20,6 +20,7 @@ use snip_core::gitsrc::{GitError, GitSource};
 use snip_core::gitview::{
 	ChangeList, ChangedPathList, CommitDetails, Read, ReadProfile, RepoView,
 };
+use snip_core::reason::Reason;
 
 use sha2::{Digest, Sha256};
 use snip_core::commits::CommitCopyOutcome;
@@ -2611,7 +2612,7 @@ pub(crate) fn runs_git(request: &Request) -> bool {
 }
 
 fn unexpected_reply() -> GitError {
-	GitError::Host("unexpected reply from the worker".into())
+	GitError::remote(Reason::Protocol, "unexpected reply from the worker")
 }
 
 /// Client-side implementation of `RepoView` over `Client::git`.
@@ -2946,24 +2947,9 @@ impl From<RemoteError> for GitError {
 				args: "remote view".into(),
 				secs: GIT_CALL_LIMIT.as_secs(),
 			},
-			RemoteError::Start {
-				reason: Some(reason),
-				detail,
-				message,
-				..
-			} => GitError::HostStart {
-				reason,
-				detail,
-				message,
-			},
-			RemoteError::Refused { code, message } => GitError::HostRefused {
-				code: serde_json::to_value(code)
-					.ok()
-					.and_then(|v| v.as_str().map(str::to_owned))
-					.unwrap_or_default(),
-				message,
-			},
-			other => GitError::Host(other.to_string()),
+			// The rest has no typed variant of its own: the CLI prints the
+			// error's text, a front end words the reason.
+			other => GitError::remote(other.reason(), other.to_string()),
 		}
 	}
 }
@@ -4096,10 +4082,28 @@ mod tests {
 			have: 1,
 			need: 2,
 		};
-		assert!(matches!(GitError::from(err6), GitError::Host(_)));
+		let g6 = GitError::from(err6);
+		assert!(
+			matches!(
+				&g6,
+				GitError::Remote { reason, .. }
+					if matches!(**reason, Reason::WorkerTooOld {
+						have: 1,
+						need: 2,
+						..
+					})
+			),
+			"{g6:?}"
+		);
 
 		let err7 = RemoteError::Io(io::Error::other("disk error"));
-		assert!(matches!(GitError::from(err7), GitError::Host(_)));
+		let g7 = GitError::from(err7);
+		assert_eq!(g7.to_string(), "disk error");
+		assert!(matches!(
+			g7,
+			GitError::Remote { reason, .. }
+				if matches!(*reason, Reason::Disconnected { .. })
+		));
 
 		let err8 = RemoteError::Refused {
 			code: ErrorCode::NotFound,
@@ -4107,8 +4111,13 @@ mod tests {
 		};
 		assert!(matches!(
 			GitError::from(err8),
-			GitError::HostRefused { ref code, ref message }
-				if code == "not_found" && message == "missing"
+			GitError::Remote {
+				ref reason,
+				ref message,
+			} if matches!(
+				**reason,
+				Reason::Refused { code: ErrorCode::NotFound }
+			) && message == "missing"
 		));
 
 		// A worker that did not start keeps its known cause for the GUI, and
@@ -4123,10 +4132,14 @@ mod tests {
 		assert!(
 			matches!(
 				git,
-				GitError::HostStart {
-					reason: StartReason::NoWorker,
-					..
-				}
+				GitError::Remote { ref reason, .. }
+					if matches!(
+						**reason,
+						Reason::Start {
+							start: Some(StartReason::NoWorker),
+							..
+						}
+					)
 			),
 			"{git:?}"
 		);
@@ -4137,7 +4150,11 @@ mod tests {
 			detail: "boom".into(),
 			message: "boom".into(),
 		};
-		assert!(matches!(GitError::from(unknown), GitError::Host(_)));
+		assert!(matches!(
+			GitError::from(unknown),
+			GitError::Remote { reason, .. }
+				if matches!(*reason, Reason::Start { start: None, .. })
+		));
 
 		let err_too_large = RemoteError::Refused {
 			code: ErrorCode::TooLarge,

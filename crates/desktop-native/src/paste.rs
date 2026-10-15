@@ -2851,7 +2851,10 @@ pub(crate) mod tests {
 					root: "/r".into(),
 					reason:
 						"target file 'a' was deleted externally after preview"
-							.into()
+							.into(),
+					change: snip_core::reason::StaleChange::Deleted {
+						rel: "a".into()
+					}
 				})
 			),
 			"stale_deleted"

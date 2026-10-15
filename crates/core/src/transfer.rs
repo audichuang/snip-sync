@@ -33,6 +33,7 @@ use crate::gitsrc::{
 	Git, GitError, DELETED_FILE_MARKER, UNREADABLE_FILE_MARKER,
 };
 use crate::paths::{self, escapes_all_roots, sanitize_relative_path};
+use crate::reason::{io_reason, Reason, StaleChange};
 use crate::restore::{
 	self, CreateOperation, DeleteOperation, RestoreExecutionResult,
 	RestorePlan, RestoreSelection, SkipReason, SkippedOperation,
@@ -354,11 +355,24 @@ pub enum TransferError {
 		limit: usize,
 		actual: usize,
 		reason: String,
+		/// The file that did not fit (wire path), as data; `None` when the
+		/// wrapper overhead alone is over the limit.
+		path: Option<String>,
 	},
 	#[error("stale source in '{}': {reason}", .root.display())]
-	StaleSource { root: PathBuf, reason: String },
+	StaleSource {
+		root: PathBuf,
+		reason: String,
+		/// What changed, as data (`reason` is the English text).
+		change: StaleChange,
+	},
 	#[error("stale destination in '{}': {reason}", .root.display())]
-	StaleDestination { root: PathBuf, reason: String },
+	StaleDestination {
+		root: PathBuf,
+		reason: String,
+		/// What changed, as data (`reason` is the English text).
+		change: StaleChange,
+	},
 	#[error(
 		"unmapped entry: '{raw_path}' cannot be routed to any destination root"
 	)]
@@ -384,6 +398,77 @@ pub enum TransferError {
 }
 
 impl TransferError {
+	/// Why this failed, as data for a front end to word. The `Display` text
+	/// stays the CLI's. An exhaustive match: a new variant must decide.
+	pub fn reason(&self) -> Reason {
+		let shown = |p: &Path| p.display().to_string();
+		match self {
+			Self::EmptySelection => Reason::EmptySelection,
+			Self::UnsafePath(p) => Reason::UnsafePath { path: p.clone() },
+			Self::SpecialFile(p) | Self::DestinationNotRegular(p) => {
+				Reason::NotRegularFile { path: p.clone() }
+			}
+			Self::PathNotFound(p) => Reason::NotFound { path: shown(p) },
+			Self::PathOutsideRoot(p) | Self::UnknownRoot(p) => {
+				Reason::OutsideRoot { path: shown(p) }
+			}
+			Self::UnmappedEntry { raw_path } => Reason::OutsideRoot {
+				path: raw_path.clone(),
+			},
+			Self::StagedWorkingConflict { path, .. } => {
+				Reason::StagedAndWorking { path: path.clone() }
+			}
+			Self::MixedSourceCollision { path, .. } => {
+				Reason::Collision { path: path.clone() }
+			}
+			Self::WireHeaderCollision { wire_path } => Reason::Collision {
+				path: wire_path.clone(),
+			},
+			Self::TargetCollision { path, .. } => {
+				Reason::Collision { path: shown(path) }
+			}
+			Self::AmbiguousRootBasenames { basename, roots } => {
+				Reason::AmbiguousRoots {
+					basename: basename.clone(),
+					roots: roots.iter().map(|r| shown(r)).collect(),
+				}
+			}
+			Self::PayloadLimitExceeded {
+				limit,
+				actual,
+				path,
+				..
+			} => Reason::PayloadTooLarge {
+				limit: *limit as u64,
+				actual: *actual as u64,
+				path: path.clone(),
+			},
+			Self::StaleSource { change, .. } => Reason::SourceChanged {
+				change: change.clone(),
+			},
+			Self::StaleDestination { change, .. } => {
+				Reason::DestinationChanged {
+					change: change.clone(),
+				}
+			}
+			Self::CrossRepoCommitsNotSupported => Reason::CrossRepoCommits,
+			Self::DiscontinuousCommits {
+				base,
+				tip,
+				at,
+				first_parent,
+			} => Reason::Discontinuous {
+				base: base.clone(),
+				tip: tip.clone(),
+				at: at.clone(),
+				first_parent: first_parent.clone(),
+			},
+			Self::Git(e) => e.reason(),
+			Self::Commit(e) => e.reason(),
+			Self::Io(e) => io_reason(e, ""),
+		}
+	}
+
 	pub fn paste_message(&self) -> String {
 		match self {
 			Self::SpecialFile(path) | Self::DestinationNotRegular(path) => {
@@ -530,6 +615,9 @@ impl SourceFreshnessSnapshot {
 					reason: format!(
 						"working file '{rel}' was modified or deleted externally"
 					),
+					change: StaleChange::Modified {
+						rel: rel.to_string(),
+					},
 				});
 			}
 		}
@@ -838,6 +926,9 @@ impl DestinationFreshnessSnapshot {
 						"target file '{}' was created externally after preview",
 						target.relative_path
 					),
+					change: StaleChange::Created {
+						rel: target.relative_path.to_string(),
+					},
 				});
 			}
 			if target.existed && !current_exists {
@@ -847,6 +938,9 @@ impl DestinationFreshnessSnapshot {
 						"target file '{}' was deleted externally after preview",
 						target.relative_path
 					),
+					change: StaleChange::Deleted {
+						rel: target.relative_path.to_string(),
+					},
 				});
 			}
 			if target.existed && current_exists {
@@ -862,6 +956,9 @@ impl DestinationFreshnessSnapshot {
 							"target file '{}' was modified externally after preview",
 							target.relative_path
 						),
+						change: StaleChange::Modified {
+							rel: target.relative_path.to_string(),
+						},
 					});
 				}
 			}
@@ -1483,6 +1580,7 @@ fn revalidate_repo_freshness(
 				prev.head_commit.as_deref().unwrap_or("<none>"),
 				current.head_commit.as_deref().unwrap_or("<none>")
 			),
+			change: StaleChange::Repository,
 		});
 	}
 	if current.head_ref != prev.head_ref {
@@ -1493,12 +1591,14 @@ fn revalidate_repo_freshness(
 				prev.head_ref.as_deref().unwrap_or("<detached>"),
 				current.head_ref.as_deref().unwrap_or("<detached>")
 			),
+			change: StaleChange::Repository,
 		});
 	}
 	if current.index_hash != prev.index_hash {
 		return Err(TransferError::StaleSource {
 			root: root.to_path_buf(),
 			reason: "Git index changed".to_string(),
+			change: StaleChange::Repository,
 		});
 	}
 	Ok(())
@@ -1518,6 +1618,7 @@ fn revalidate_destination_repo_freshness(
 				prev.head_commit.as_deref().unwrap_or("<none>"),
 				current.head_commit.as_deref().unwrap_or("<none>")
 			),
+			change: StaleChange::Repository,
 		});
 	}
 	if current.head_ref != prev.head_ref {
@@ -1528,12 +1629,14 @@ fn revalidate_destination_repo_freshness(
 				prev.head_ref.as_deref().unwrap_or("<detached>"),
 				current.head_ref.as_deref().unwrap_or("<detached>")
 			),
+			change: StaleChange::Repository,
 		});
 	}
 	if current.index_hash != prev.index_hash {
 		return Err(TransferError::StaleDestination {
 			root: root.to_path_buf(),
 			reason: "destination Git index changed".to_string(),
+			change: StaleChange::Repository,
 		});
 	}
 	Ok(())
@@ -1882,6 +1985,7 @@ impl BlobBudget {
 			reason: format!(
 				"file '{wire_path}' exceeds remaining payload budget"
 			),
+			path: Some(wire_path.to_string()),
 		})
 	}
 }
@@ -2209,6 +2313,7 @@ pub fn plan_export_with(
 				reason:
 					"serialized wrapper overhead (pre/post-text, markers) exceeds payload budget"
 						.to_string(),
+				path: None,
 			});
 			}
 		}
@@ -2616,6 +2721,7 @@ pub fn plan_export_with(
 								reason: format!(
 									"file '{wire_path}' exceeds remaining payload budget"
 								),
+								path: Some(wire_path.to_string()),
 							});
 						}
 					} else if over_per_file {
@@ -2634,6 +2740,7 @@ pub fn plan_export_with(
 							reason: format!(
 								"file '{wire_path}' exceeds remaining payload budget"
 							),
+							path: Some(wire_path.to_string()),
 						});
 					} else {
 						let read_cap = match remaining_budget {
@@ -2687,6 +2794,7 @@ pub fn plan_export_with(
 										reason: format!(
 									"working file '{wire_path}' grew past limit during read"
 								),
+										path: Some(wire_path.to_string()),
 									},
 								);
 							}
@@ -2780,6 +2888,7 @@ pub fn plan_export_with(
 						"file '{}' serialized overhead exceeds remaining payload budget",
 						payload_file.path
 					),
+						path: Some(payload_file.path.clone()),
 					});
 				}
 			}
@@ -2820,6 +2929,7 @@ pub fn plan_export_with(
 					reason:
 						"serialized payload with headers/wrappers exceeds limit"
 							.to_string(),
+					path: None,
 				});
 			}
 		}
@@ -3591,6 +3701,7 @@ impl CommitReplayPreview {
 					{
 						return Err(TransferError::StaleDestination {
 							root: self.destination.clone(), reason: format!("target file '{path}' was modified externally after preview"),
+							change: StaleChange::Modified { rel: path.to_string() },
 						}.into());
 					}
 				}
@@ -3693,6 +3804,7 @@ impl CommitReplayPreview {
 				reason:
 					"destination changed while the replay preview was captured"
 						.into(),
+				change: StaleChange::Preview,
 			});
 		}
 		revalidate_replay_freshness(&freshness, opts)?;
@@ -3787,6 +3899,7 @@ impl CommitReplayPreview {
 				return Ok(commits::ReplaySession::refused(
 					&self.payload,
 					e.to_string(),
+					e.reason(),
 				));
 			}
 		};
@@ -3798,7 +3911,7 @@ impl CommitReplayPreview {
 			Ok(s) => s,
 			Err(refused) => {
 				cancelled_err(opts, "replay-apply")?;
-				return Ok(refused);
+				return Ok(*refused);
 			}
 		};
 		self.revalidate_with(opts)?; // under the heavy lock, right before the first write
@@ -3830,6 +3943,7 @@ impl CommitReplayPreview {
 			return Err(TransferError::StaleDestination {
 				root: self.destination.clone(),
 				reason: "replay eligibility changed after preview".into(),
+				change: StaleChange::Preview,
 			});
 		}
 		#[cfg(test)]
@@ -3966,25 +4080,21 @@ fn revalidate_replay_freshness(
 		if existed == target.existed && current == target.file_state {
 			continue;
 		}
-		let reason = if !target.existed && existed {
-			format!(
-				"target file '{}' was created externally after preview",
-				target.relative_path
-			)
+		let rel = target.relative_path.to_string();
+		let (what, change) = if !target.existed && existed {
+			("created", StaleChange::Created { rel })
 		} else if target.existed && !existed {
-			format!(
-				"target file '{}' was deleted externally after preview",
-				target.relative_path
-			)
+			("deleted", StaleChange::Deleted { rel })
 		} else {
-			format!(
-				"target file '{}' was modified externally after preview",
-				target.relative_path
-			)
+			("modified", StaleChange::Modified { rel })
 		};
 		return Err(TransferError::StaleDestination {
 			root: target.root.path().to_path_buf(),
-			reason,
+			reason: format!(
+				"target file '{}' was {what} externally after preview",
+				target.relative_path
+			),
+			change,
 		});
 	}
 	Ok(())
@@ -4957,6 +5067,50 @@ mod staged_index_spec_tests {
 #[cfg(test)]
 mod freshness_error_tests {
 	use super::*;
+
+	#[test]
+	fn transfer_error_reasons_keep_what_the_user_must_act_on() {
+		let amb = TransferError::AmbiguousRootBasenames {
+			basename: "src".into(),
+			roots: vec![PathBuf::from("/a/src"), PathBuf::from("/b/src")],
+		};
+		assert_eq!(
+			amb.reason(),
+			Reason::AmbiguousRoots {
+				basename: "src".into(),
+				roots: vec!["/a/src".into(), "/b/src".into()],
+			}
+		);
+		let stale = TransferError::StaleSource {
+			root: "/r".into(),
+			reason: "Git index changed".into(),
+			change: StaleChange::Repository,
+		};
+		assert_eq!(
+			stale.reason(),
+			Reason::SourceChanged {
+				change: StaleChange::Repository
+			}
+		);
+		assert_eq!(
+			TransferError::PayloadLimitExceeded {
+				limit: 1,
+				actual: 2,
+				reason: "x".into(),
+				path: Some("a/b.txt".into())
+			}
+			.reason(),
+			Reason::PayloadTooLarge {
+				limit: 1,
+				actual: 2,
+				path: Some("a/b.txt".into())
+			}
+		);
+		assert_eq!(
+			TransferError::Git(GitError::NotFound).reason(),
+			Reason::GitMissing
+		);
+	}
 
 	#[test]
 	fn non_regular_path_yields_special_file_on_export_and_destination_not_regular_on_import(

@@ -26,6 +26,7 @@ use crate::format::{
 use crate::fsutil::{decode_utf8_or_skip, read_text_file};
 use crate::gitrun::{self, CancelToken, RunOptions, RunOutput};
 use crate::paths::{source_root_name, to_clipboard_path_from_roots};
+use crate::reason::{io_reason, Reason};
 use crate::settings::Settings;
 use crate::workspace::RepoIdentity;
 
@@ -42,7 +43,8 @@ pub const UNREADABLE_FILE_MARKER: &str = "// Unable to read file content";
 /// It follows `start_message`'s wording classes, so the CLI and the GUI
 /// agree; the remote crate's `ConnectFailureKind` (`kind`) drives retry policy instead and
 /// classifies differently, so the two are not interchangeable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StartReason {
 	/// snip is missing on that machine or too old for `serve --stdio`.
 	NoWorker,
@@ -117,23 +119,68 @@ pub enum GitError {
 	OutsideBoundary { what: &'static str },
 	#[error("repository too large to verify: {what}")]
 	VerifyLimit { what: &'static str },
-	#[error("{0}")]
-	Host(String),
-	/// A remote worker's refusal that has no variant of its own. `code` is
-	/// the worker's error code in its wire spelling (`snake_case`), so a
-	/// front end can word it without parsing `message`.
+	/// A failure on the far side of a remote worker (or of the transport to
+	/// it) that has no variant of its own. `message` is the English text the
+	/// CLI prints; `reason` is what a front end words.
+	/// `reason` is boxed: `Reason` is large and `GitError` rides in many
+	/// `Result`s (use [`GitError::remote`]).
 	#[error("{message}")]
-	HostRefused { code: String, message: String },
-	/// A remote worker that did not start: the known cause, the transport's
-	/// stderr and the English text the CLI prints.
-	#[error("{message}")]
-	HostStart {
-		reason: StartReason,
-		detail: String,
+	Remote {
+		reason: Box<Reason>,
 		message: String,
 	},
 	#[error(transparent)]
 	Io(#[from] io::Error),
+}
+
+impl GitError {
+	/// A [`GitError::Remote`] (the reason is boxed, so build it here).
+	pub fn remote(reason: Reason, message: impl Into<String>) -> Self {
+		Self::Remote {
+			reason: Box::new(reason),
+			message: message.into(),
+		}
+	}
+
+	/// Why this failed, as data for a front end to word. The `Display` text
+	/// stays the CLI's. An exhaustive match: a new variant must decide.
+	pub fn reason(&self) -> Reason {
+		match self {
+			Self::NotFound => Reason::GitMissing,
+			Self::Failed { stderr, .. } => Reason::GitFailed {
+				stderr: stderr.clone(),
+			},
+			Self::Timeout { .. } => Reason::TimedOut,
+			Self::Cancelled { .. } => Reason::Cancelled,
+			Self::QueueTimeout { .. } | Self::QueueFull { .. } => {
+				Reason::GitBusy
+			}
+			Self::WorktreeBusy { .. } => Reason::RepoBusy,
+			Self::OutputLimit { .. } => Reason::TooLarge,
+			Self::PatchLimit { .. } => Reason::PatchTooLarge,
+			Self::OutputHeldOpen { .. }
+			| Self::NestedProcess { .. }
+			| Self::Cleanup { .. }
+			| Self::Malformed(_) => Reason::Internal {
+				detail: self.to_string(),
+			},
+			Self::NotARepository(p) => Reason::NotARepository {
+				path: p.display().to_string(),
+			},
+			Self::ToplevelAbove(p) => Reason::InsideParentRepo {
+				path: p.display().to_string(),
+			},
+			Self::InvalidRevision(rev) => {
+				Reason::InvalidRevision { rev: rev.clone() }
+			}
+			Self::Shallow(sha) => Reason::Shallow { sha: sha.clone() },
+			// `what` is an internal English noun ("git dir", "index"): dropped.
+			Self::OutsideBoundary { .. } => Reason::OutsideShare,
+			Self::VerifyLimit { .. } => Reason::VerifyLimit,
+			Self::Remote { reason, .. } => (**reason).clone(),
+			Self::Io(e) => io_reason(e, ""),
+		}
+	}
 }
 
 /// Runs the system git CLI inside one repository, never through a shell.
@@ -1708,6 +1755,43 @@ pub fn collect_payload_with_selection<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
+
+	#[test]
+	fn remote_displays_its_message_and_reasons_as_given() {
+		let e = GitError::remote(
+			Reason::Protocol,
+			"unexpected reply from the worker",
+		);
+		assert_eq!(e.to_string(), "unexpected reply from the worker");
+		assert_eq!(e.reason(), Reason::Protocol);
+	}
+
+	#[test]
+	fn git_error_reasons_follow_the_variant_not_the_text() {
+		assert_eq!(
+			GitError::QueueFull { args: "x".into() }.reason(),
+			Reason::GitBusy
+		);
+		assert_eq!(
+			GitError::VerifyLimit { what: "refs" }.reason(),
+			Reason::VerifyLimit
+		);
+		assert_eq!(
+			GitError::OutsideBoundary { what: "index" }.reason(),
+			Reason::OutsideShare
+		);
+		assert_eq!(
+			GitError::Shallow("abc".into()).reason(),
+			Reason::Shallow { sha: "abc".into() }
+		);
+		assert_eq!(
+			GitError::Io(io::Error::from(io::ErrorKind::PermissionDenied))
+				.reason(),
+			Reason::PermissionDenied {
+				path: String::new()
+			}
+		);
+	}
 
 	#[test]
 	fn open_outside_a_repository_says_so() {

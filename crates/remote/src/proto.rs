@@ -798,35 +798,8 @@ pub struct Stat {
 	pub modified: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-	/// Outside the workspace, or not readable.
-	Forbidden,
-	NotFound,
-	Unsupported,
-	BadRequest,
-	TooLarge,
-	Io,
-	VersionMismatch,
-	/// Target folder is not a valid git repository.
-	NotARepository,
-	/// Revision argument is invalid or malformed.
-	InvalidRevision,
-	/// Worker operation timed out.
-	Timeout,
-	/// Worker has reached concurrency limits.
-	Busy,
-	/// Worker operation was cancelled.
-	Cancelled,
-	/// Repository escapes shared boundary.
-	OutsideShare,
-	/// The paste destination changed since the preview; the message is
-	/// the local paste's wording.
-	Stale,
-	/// Two entries of a paste land on one file.
-	Collision,
-}
+/// Moved to core so `GitError` can name it; the wire spelling is unchanged.
+pub use snip_core::reason::{ErrorCode, Reason, StaleChange};
 
 pub fn write_frame<T: Serialize>(
 	w: &mut impl Write,

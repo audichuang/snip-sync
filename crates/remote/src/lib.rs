@@ -36,6 +36,7 @@ pub use proto::{
 	ImportPlanned, PasteMapping, RemoteWorkspace, ReplayExpect, RepoScan,
 	Request, Response, ScannedRepo, PROTOCOL_MAX,
 };
+pub use snip_core::reason::{Reason, StaleChange};
 pub use worker::{serve_stdio, SharedRoot, Worker, WorkerOptions};
 
 /// Typed reason a transport ended before the worker's hello. Keep this
@@ -100,6 +101,37 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
+	/// Why this failed, as data for a front end to word. The `Display` text
+	/// stays the CLI's. An exhaustive match: a new variant must decide.
+	pub fn reason(&self) -> Reason {
+		match self {
+			Self::Io(e) if e.kind() == io::ErrorKind::TimedOut => {
+				Reason::TimedOut
+			}
+			Self::Io(e) => Reason::Disconnected {
+				detail: e.to_string(),
+			},
+			Self::Connect(detail) => Reason::Start {
+				start: None,
+				detail: detail.clone(),
+			},
+			Self::Start { reason, detail, .. } => Reason::Start {
+				start: *reason,
+				detail: detail.clone(),
+			},
+			Self::Refused { code, .. } => Reason::Refused { code: *code },
+			Self::PatchTooLarge { .. } => Reason::PatchTooLarge,
+			Self::Protocol(_) => Reason::Protocol,
+			Self::Cancelled => Reason::Cancelled,
+			Self::TimedOut | Self::Stalled { .. } => Reason::TimedOut,
+			Self::WorkerTooOld { worker, have, need } => Reason::WorkerTooOld {
+				worker: worker.clone(),
+				have: *have,
+				need: *need,
+			},
+		}
+	}
+
 	/// Whether a caller may schedule another *read* attempt. This does
 	/// not authorize retrying a write whose outcome may be unknown.
 	pub fn is_transient_read_failure(&self) -> bool {

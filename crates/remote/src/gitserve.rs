@@ -1504,7 +1504,10 @@ mod tests {
 		));
 
 		// Host
-		let r = map_git_error(GitError::Host("host error".into()), share);
+		let r = map_git_error(
+			GitError::remote(snip_core::reason::Reason::Protocol, "host error"),
+			share,
+		);
 		assert!(matches!(
 			r,
 			Response::Error {

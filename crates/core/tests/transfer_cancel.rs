@@ -519,11 +519,13 @@ fn cumulative_payload_limit_is_unchanged() {
 				limit: left_limit,
 				actual: left_actual,
 				reason: left_reason,
+				path: left_path,
 			},
 			TransferError::PayloadLimitExceeded {
 				limit: right_limit,
 				actual: right_actual,
 				reason: right_reason,
+				path: right_path,
 			},
 		) => {
 			assert_eq!(left_limit, limit);
@@ -531,6 +533,7 @@ fn cumulative_payload_limit_is_unchanged() {
 			assert_eq!(left_actual, right_actual);
 			assert!(left_actual > limit, "actual {left_actual} limit {limit}");
 			assert_eq!(left_reason, right_reason);
+			assert_eq!(left_path, right_path);
 		}
 		other => panic!("expected matching payload limits, got {other:?}"),
 	}

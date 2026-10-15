@@ -13,6 +13,7 @@ use snip_core::commits;
 use snip_core::gitrun::{CancelToken, GitPool, RunOptions};
 use snip_core::gitsrc::Git;
 use snip_core::gitview::ReadProfile;
+use snip_core::reason::StaleChange;
 use snip_core::restore::{RestorePlan, RestoreSelection};
 use snip_core::transfer::{
 	plan_import_parsed_with, CanonicalRootId, CommitReplayPreview,
@@ -74,6 +75,7 @@ fn stale(root: &Path, reason: &str) -> Refusal {
 		TransferError::StaleDestination {
 			root: root.to_path_buf(),
 			reason: reason.into(),
+			change: StaleChange::Preview,
 		},
 		&CancelToken::new(),
 	)

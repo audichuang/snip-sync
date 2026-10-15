@@ -13,6 +13,7 @@ pub mod gitsrc;
 pub mod gitview;
 pub mod graph;
 pub mod paths;
+pub mod reason;
 pub mod restore;
 pub mod settings;
 pub mod stats;

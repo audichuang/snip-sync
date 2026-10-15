@@ -156,7 +156,10 @@ mod tests {
 		);
 
 		// Remote + other -> to_string()
-		let other_err = GitError::Host("server died".into());
+		let other_err = GitError::remote(
+			snip_core::reason::Reason::Protocol,
+			"server died",
+		);
 		let other_str = other_err.to_string();
 		assert_eq!(
 			refs_error(&remote_host, other_err).render(crate::i18n::Locale::En),
