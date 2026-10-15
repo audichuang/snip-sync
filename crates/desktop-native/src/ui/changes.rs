@@ -731,9 +731,16 @@ impl WorkbenchModel {
 		};
 		let kept = crate::slot_range(&self.files, slot).len();
 		let (text, color) = match &repo.state {
-			crate::ChangeRepoState::Failed(err) => {
-				(tf("changes_repo_error", loc, &[err]), pal().error)
-			}
+			crate::ChangeRepoState::Failed(err) => (
+				crate::i18n::Msg::with_msg_arg(
+					"changes_repo_error",
+					[String::new()],
+					0,
+					err.clone(),
+				)
+				.render(loc),
+				pal().error,
+			),
 			_ => (
 				tf("changes_truncated", loc, &[&kept, &repo.total]),
 				pal().text_muted,
@@ -1051,7 +1058,12 @@ impl WorkbenchModel {
 						_ => None,
 					}) {
 					return Some(ChangesEmpty::ScanFailed(
-						crate::i18n::Msg::new("error_repo_status", [err]),
+						crate::i18n::Msg::with_msg_arg(
+							"error_repo_status",
+							[String::new()],
+							0,
+							err,
+						),
 					));
 				}
 				if any_truncated {

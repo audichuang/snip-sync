@@ -31,6 +31,9 @@ pub struct Msg {
 	pub key: &'static str,
 	pub args: Vec<String>,
 	pub key_args: Vec<usize>,
+	/// An argument that is itself a message, worded with the message.
+	/// Boxed: `Msg` sits in many enums that must stay small.
+	pub inner: Option<Box<(usize, Msg)>>,
 }
 
 impl Msg {
@@ -39,6 +42,29 @@ impl Msg {
 			key,
 			args: args.into_args(),
 			key_args: Vec::new(),
+			inner: None,
+		}
+	}
+
+	/// Text with no wording of its own (an error from a tool, a path): it
+	/// shows as it is, in either language.
+	pub fn raw(text: impl Into<String>) -> Self {
+		Self::new("err_raw", [text.into()])
+	}
+
+	/// Argument `index` is a message: it is worded in the language the
+	/// outer message is drawn in.
+	pub fn with_msg_arg(
+		key: &'static str,
+		args: impl IntoMsgArgs,
+		index: usize,
+		inner: Msg,
+	) -> Self {
+		Self {
+			key,
+			args: args.into_args(),
+			key_args: Vec::new(),
+			inner: Some(Box::new((index, inner))),
 		}
 	}
 
@@ -51,6 +77,7 @@ impl Msg {
 			key,
 			args: args.into_args(),
 			key_args: vec![index],
+			inner: None,
 		}
 	}
 
@@ -63,7 +90,24 @@ impl Msg {
 			key,
 			args: args.into_args(),
 			key_args: indices.into_iter().collect(),
+			inner: None,
 		}
+	}
+
+	/// Heap bytes a retained message holds: its argument strings, nested
+	/// messages included.
+	pub fn heap_bytes(&self) -> usize {
+		self.args
+			.iter()
+			.map(|arg| std::mem::size_of::<String>() + arg.capacity())
+			.chain(self.inner.iter().map(|boxed| {
+				std::mem::size_of::<(usize, Msg)>() + boxed.1.heap_bytes()
+			}))
+			.chain([
+				self.key_args.capacity() * std::mem::size_of::<usize>(),
+				self.args.capacity() * std::mem::size_of::<String>(),
+			])
+			.fold(0usize, usize::saturating_add)
 	}
 
 	pub fn render(&self, loc: Locale) -> String {
@@ -72,7 +116,11 @@ impl Msg {
 			.iter()
 			.enumerate()
 			.map(|(i, s)| {
-				if self.key_args.contains(&i) {
+				if let Some((_, inner)) =
+					self.inner.as_deref().filter(|(at, _)| *at == i)
+				{
+					inner.render(loc)
+				} else if self.key_args.contains(&i) {
 					let translated = t(s, loc);
 					if !translated.is_empty() {
 						translated.to_string()
@@ -86,6 +134,18 @@ impl Msg {
 			.collect();
 		let arg_refs: Vec<&str> = arg_strs.iter().map(|s| s.as_str()).collect();
 		tf(self.key, loc, &arg_refs)
+	}
+}
+
+impl From<String> for Msg {
+	fn from(text: String) -> Self {
+		Self::raw(text)
+	}
+}
+
+impl From<&str> for Msg {
+	fn from(text: &str) -> Self {
+		Self::raw(text)
 	}
 }
 
@@ -432,6 +492,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_binary" => "[二進位檔案，無法顯示文字預覽: {}]",
 			"error_preview" => "預覽「{}」失敗: {}",
 			"error_open_repo" => "開啟儲存庫失敗: {}",
+			"err_raw" => "{}",
 			"error_payload" => "產生 payload 失敗: {}",
 			"error_tree" => "讀取 commit 檔案樹失敗: {}",
 			"status_loading" => "載入中...",
@@ -850,6 +911,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_binary" => "[Binary file, cannot display text preview: {}]",
 			"error_preview" => "Failed to preview '{}': {}",
 			"error_open_repo" => "Failed to open repository: {}",
+			"err_raw" => "{}",
 			"error_payload" => "Failed to generate payload: {}",
 			"error_tree" => "Failed to read commit tree: {}",
 			"status_loading" => "Loading...",
@@ -1169,6 +1231,7 @@ mod tests {
 			"remote_start_no_answer",
 			"remote_start_closed",
 			"remote_start_detail",
+			"err_raw",
 			"remote_scan_failed",
 			"remote_scan_incomplete",
 			"remote_refs_too_large",

@@ -23,7 +23,7 @@ use gpui::{
 	MouseButton, Pixels, ScrollHandle, SharedString, Subscription, Window,
 };
 
-use crate::i18n::{t, Locale};
+use crate::i18n::{t, Locale, Msg};
 use crate::icons::{icon_tinted, Icon};
 use crate::open_tabs::{OpenTabs, SavedTab};
 use crate::theme::*;
@@ -215,7 +215,7 @@ pub struct TabInfo {
 	pub conn: Option<Conn>,
 	pub pasting: bool,
 	/// Why the reconnect of a restored remote tab failed.
-	pub failed: Option<String>,
+	pub failed: Option<Msg>,
 }
 
 // ─────────────────────────────── labels ───────────────────────────────
@@ -1165,9 +1165,13 @@ fn tab_hover(label: &str, info: &TabInfo, loc: Locale) -> String {
 	let hover = match info.conn {
 		Some(Conn::Connecting) | Some(Conn::Failed) => {
 			let what = match (&info.failed, info.conn) {
-				(Some(why), Some(Conn::Failed)) => {
-					crate::i18n::tf("ws_tab_failed_why", loc, &[why])
-				}
+				(Some(why), Some(Conn::Failed)) => Msg::with_msg_arg(
+					"ws_tab_failed_why",
+					[String::new()],
+					0,
+					why.clone(),
+				)
+				.render(loc),
 				(_, Some(Conn::Failed)) => t("ws_tab_failed", loc).to_string(),
 				_ => t("ws_tab_connecting", loc).to_string(),
 			};

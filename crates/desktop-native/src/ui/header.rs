@@ -379,7 +379,7 @@ impl WorkbenchModel {
 									.id("workspace-closed-remote-error")
 									.relative()
 									.text_color(rgb(pal().error))
-									.child(text.clone())
+									.child(text.render(loc))
 									.children(probe(
 										&self.probes,
 										"workspace-closed-remote-error",

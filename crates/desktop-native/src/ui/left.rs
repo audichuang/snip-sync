@@ -770,7 +770,10 @@ impl WorkbenchModel {
 						cx,
 					);
 				}))
-				.child(clip_text(row.name))
+				.child(clip_text(match &row.msg {
+					Some(msg) => msg.render(self.locale),
+					None => row.name,
+				}))
 				.children(probe(log, marker_id))
 				.into_any_element();
 		}

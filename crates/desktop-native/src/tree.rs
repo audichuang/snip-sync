@@ -7,6 +7,8 @@
 //! flag that disappears when a page is evicted.
 
 use std::collections::VecDeque;
+
+use crate::i18n::Msg;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -39,7 +41,7 @@ pub struct FileTreeNode {
 	pub is_truncated: bool,
 	pub has_more: bool,
 	pub is_valid_utf8: bool,
-	pub read_error: Option<String>,
+	pub read_error: Option<Msg>,
 	pub selected: bool,
 	pub children: Vec<FileTreeNode>,
 	pub depth: usize,
@@ -195,7 +197,7 @@ pub struct TreeIoResult {
 	pub scan: Option<DirectoryScan>,
 	pub held: VecDeque<HeldEntry>,
 	pub has_more: bool,
-	pub error: Option<String>,
+	pub error: Option<Msg>,
 	pub truncated: bool,
 	pub skipped_oversize: usize,
 	pub budget_blocked: bool,
@@ -224,6 +226,9 @@ pub struct FlattenedTreeRow {
 	pub is_more_marker: bool,
 	pub is_view_limit: bool,
 	pub is_error: bool,
+	/// The error an error row words when it is drawn, in the language then
+	/// in force; `name` holds it in the default language.
+	pub msg: Option<Msg>,
 	pub is_loading: bool,
 	pub is_valid_utf8: bool,
 	pub selected: bool,
@@ -386,7 +391,7 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 		None if io.held.is_empty() => match DirectoryScan::open(&io.dir) {
 			Ok(scan) => Some(scan),
 			Err(err) => {
-				result.error = Some(format!("無法讀取目錄: {err}"));
+				result.error = Some(Msg::raw(format!("無法讀取目錄: {err}")));
 				return result;
 			}
 		},
@@ -428,11 +433,12 @@ pub fn execute_tree_io(io: TreeIo, cancel: &CancelToken) -> TreeIoResult {
 				Ok(page) => page,
 				Err(ScanError::Changed) => {
 					result.error =
-						Some("目錄在讀取期間改變了，請重試".to_string());
+						Some(Msg::raw("目錄在讀取期間改變了，請重試"));
 					return result;
 				}
 				Err(ScanError::Io(err)) => {
-					result.error = Some(format!("無法讀取目錄: {err}"));
+					result.error =
+						Some(Msg::raw(format!("無法讀取目錄: {err}")));
 					return result;
 				}
 			};
@@ -541,7 +547,7 @@ pub struct ListedChild {
 /// shows it.
 pub fn listed_tree_result(
 	io: TreeIo,
-	listed: Result<(Vec<ListedChild>, bool), String>,
+	listed: Result<(Vec<ListedChild>, bool), Msg>,
 ) -> TreeIoResult {
 	let (children, truncated) = match listed {
 		Ok((children, truncated)) if !children.is_empty() => {
@@ -616,14 +622,11 @@ fn build_node(
 	rel_path.shrink_to_fit();
 	let full = dir.join(&entry.name);
 	let is_dir = entry.directory;
-	let mut read_error = if is_utf8 {
+	let read_error = if is_utf8 {
 		None
 	} else {
-		Some("non-UTF-8 filename: unselectable".to_string())
+		Some(Msg::raw("non-UTF-8 filename: unselectable"))
 	};
-	if let Some(err) = read_error.as_mut() {
-		err.shrink_to_fit();
-	}
 	FileTreeNode {
 		name,
 		rel_path,
@@ -726,7 +729,7 @@ impl FileTreeNode {
 		total = total.saturating_add(self.full_path.capacity());
 		total = total.saturating_add(self.key.relative.capacity());
 		if let Some(err) = &self.read_error {
-			total = total.saturating_add(err.capacity());
+			total = total.saturating_add(err.heap_bytes());
 		}
 		if let Some(scan) = &self.scan {
 			// The Option's inline cursor storage is already in Self.
@@ -1011,7 +1014,7 @@ impl FileTreeNode {
 				if let Some(node) = self.find_mut(key) {
 					node.budget_blocked = true;
 					node.read_error =
-						Some("無法繼續：目錄游標已不在".to_string());
+						Some(Msg::raw("無法繼續：目錄游標已不在"));
 				}
 			}
 			return TreeEffect::Idle;
@@ -1253,6 +1256,7 @@ impl FileTreeNode {
 			is_more_marker: false,
 			is_view_limit: false,
 			is_error: false,
+			msg: None,
 			is_loading: false,
 			is_valid_utf8: self.is_valid_utf8,
 			selected: self.selected,
@@ -1289,6 +1293,7 @@ impl FileTreeNode {
 			is_more_marker: kind == MarkerKind::More,
 			is_view_limit: kind == MarkerKind::View,
 			is_error: kind == MarkerKind::Error,
+			msg: None,
 			is_loading: kind == MarkerKind::Loading,
 			is_valid_utf8: true,
 			selected: false,
@@ -1300,8 +1305,11 @@ impl FileTreeNode {
 		self.marker("[載入中…]".to_string(), MarkerKind::Loading)
 	}
 
-	fn error_row(&self, err: String) -> FlattenedTreeRow {
-		self.marker(err, MarkerKind::Error)
+	fn error_row(&self, err: Msg) -> FlattenedTreeRow {
+		let mut row = self
+			.marker(err.render(crate::i18n::Locale::ZhTw), MarkerKind::Error);
+		row.msg = Some(err);
+		row
 	}
 
 	fn more_row(&self) -> FlattenedTreeRow {

@@ -19,7 +19,7 @@ use snip_core::gitsrc::GitSource;
 use snip_core::gitview::{Read, ReadProfile};
 
 use crate::githost::GitHost;
-use crate::i18n::{t, tf};
+use crate::i18n::{t, tf, Msg};
 use crate::syntax::{highlight_line, Language, SyntaxTheme};
 use crate::theme::*;
 use crate::WorkbenchModel;
@@ -28,6 +28,17 @@ use crate::WorkbenchModel;
 pub const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
 /// Line cap per preview.
 pub const MAX_PREVIEW_LINES: usize = 50_000;
+
+/// The notice a preview cut at the line or byte cap carries.
+pub fn truncated_notice() -> Msg {
+	Msg::new(
+		"truncated_notice",
+		[
+			MAX_PREVIEW_LINES.to_string(),
+			(MAX_PREVIEW_BYTES / 1024).to_string(),
+		],
+	)
+}
 /// Find results kept (the count saturates visibly beyond this).
 pub const MAX_MATCHES: usize = 5_000;
 pub const LINE_H: f32 = 18.0;
@@ -62,7 +73,7 @@ pub struct Preview {
 	pub lines: Vec<Range<u32>>,
 	pub is_diff: bool,
 	pub lang: Language,
-	pub notice: Option<String>,
+	pub notice: Option<Msg>,
 	/// Index of the longest line, measured for horizontal scrolling.
 	pub widest: usize,
 	/// Diff layout, built once from `lines`.
@@ -91,7 +102,7 @@ impl Preview {
 			.saturating_add(
 				self.lines.capacity() * std::mem::size_of::<Range<u32>>(),
 			)
-			.saturating_add(self.notice.as_ref().map_or(0, String::capacity));
+			.saturating_add(self.notice.as_ref().map_or(0, Msg::heap_bytes));
 		if let Some(diff) = &self.diff {
 			bytes = bytes
 				.saturating_add(
@@ -121,7 +132,7 @@ impl Preview {
 				cut -= 1;
 			}
 			text.truncate(cut);
-			notice = Some("truncated".to_string());
+			notice = Some(truncated_notice());
 		}
 		let mut lines = Vec::new();
 		let mut start = 0usize;
@@ -130,7 +141,7 @@ impl Preview {
 				lines.push(start as u32..strip_cr(&text, start, i) as u32);
 				start = i + 1;
 				if lines.len() >= MAX_PREVIEW_LINES {
-					notice = Some("truncated".to_string());
+					notice = Some(truncated_notice());
 					break;
 				}
 			}
@@ -1338,7 +1349,6 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let job_cancel = cancel.clone();
 		let host = self.git_host();
-		let loc = self.locale;
 		self.spawn_owned(
 			cx,
 			crate::lifecycle::JobKind::CancellableRead,
@@ -1346,7 +1356,7 @@ impl WorkbenchModel {
 			async move {
 				let result = bg
 					.spawn(async move {
-						read_new_side(&host, &root, &source, &path, cancel, loc)
+						read_new_side(&host, &root, &source, &path, cancel)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -1361,7 +1371,7 @@ impl WorkbenchModel {
 		&mut self,
 		shown: usize,
 		only: Option<usize>,
-		result: Result<String, String>,
+		result: Result<String, crate::i18n::Msg>,
 		cx: &mut Context<Self>,
 	) {
 		self.reader.expanding = false;
@@ -1377,7 +1387,12 @@ impl WorkbenchModel {
 		let expanded = match result {
 			Ok(content) => expand_folds(p, &content, only)
 				.map_err(|key| crate::i18n::Msg::new(key, [])),
-			Err(e) => Err(crate::i18n::Msg::new("status_fold_failed", [e])),
+			Err(e) => Err(crate::i18n::Msg::with_msg_arg(
+				"status_fold_failed",
+				[String::new()],
+				0,
+				e,
+			)),
 		};
 		let tail_done = only.is_none_or(|o| o == TRAILING_FOLD)
 			|| p.diff.as_ref().is_some_and(|d| !d.trailing);
@@ -2225,16 +2240,15 @@ fn read_new_side(
 	source: &GitSource,
 	path: &str,
 	cancel: CancelToken,
-	loc: crate::i18n::Locale,
-) -> Result<String, String> {
+) -> Result<String, crate::i18n::Msg> {
 	let read = Read {
 		profile: ReadProfile::InteractivePreview,
 		cancel: Some(cancel),
 	};
 	host.open(root, None, &read)?
 		.changed_file_text(source, path, MAX_PREVIEW_BYTES as u64, &read)
-		.map_err(|e| crate::remote::git_error_loc(e, loc))?
-		.ok_or_else(|| "no new-side text".to_string())
+		.map_err(crate::remote::git_error_msg)?
+		.ok_or_else(|| "no new-side text".into())
 }
 
 /// Space between the line-number gutter and the code.

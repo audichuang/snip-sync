@@ -189,7 +189,7 @@ pub struct RevTree {
 	expanded: Vec<String>,
 	/// Oldest expanded key at the front. Not hash-map iteration order.
 	expanded_order: VecDeque<String>,
-	errors: Vec<(String, String)>,
+	errors: Vec<(String, Msg)>,
 	/// Oldest error key at the front.
 	error_order: VecDeque<String>,
 }
@@ -256,7 +256,7 @@ impl RevTree {
 			.saturating_add(
 				self.errors
 					.capacity()
-					.saturating_mul(std::mem::size_of::<(String, String)>()),
+					.saturating_mul(std::mem::size_of::<(String, Msg)>()),
 			)
 			.saturating_add(
 				self.expanded
@@ -290,7 +290,7 @@ impl RevTree {
 		for (key, err) in &self.errors {
 			total = total
 				.saturating_add(key.capacity())
-				.saturating_add(err.capacity());
+				.saturating_add(err.heap_bytes());
 		}
 		total
 	}
@@ -468,17 +468,11 @@ impl RevTree {
 		}
 	}
 
-	pub fn note_error(&mut self, dir: String, err: String) {
+	pub fn note_error(&mut self, dir: String, err: Msg) {
 		if string_cost(&dir) > MAX_RETAINED_TREE_BYTES {
 			return;
 		}
-		let err = if err.len() > MAX_STORED_ERROR_BYTES {
-			let mut clipped: String = err.chars().take(80).collect();
-			clipped.push('…');
-			clipped
-		} else {
-			err
-		};
+		let err = clip_tree_error(err);
 		self.error_order.retain(|key| key != &dir);
 		self.error_order.push_back(dir.clone());
 		match self.errors.binary_search_by(|(key, _)| key.cmp(&dir)) {
@@ -628,7 +622,15 @@ impl RevTree {
 			.iter()
 			.find_map(|(key, error)| (key == dir).then_some(error))
 		{
-			out.push(marker(depth, Msg::new("error_tree", [err.clone()])));
+			out.push(marker(
+				depth,
+				Msg::with_msg_arg(
+					"error_tree",
+					[String::new()],
+					0,
+					err.clone(),
+				),
+			));
 			return;
 		}
 		let Some((entries, truncated)) = self.dir(dir) else {
@@ -793,8 +795,7 @@ fn read_graph_page(
 	skip: usize,
 	size: usize,
 	read: &Read,
-	locale: crate::i18n::Locale,
-) -> Result<(browser::RepositoryHistory, HistoryWalk), String> {
+) -> Result<(browser::RepositoryHistory, HistoryWalk), Msg> {
 	let mut git: Option<Box<dyn RepoView>> = None;
 	let open = || host.open(repo_root, known, read);
 	let (mut walk, refs, head) = match walk {
@@ -803,14 +804,13 @@ fn read_graph_page(
 			let g = open()?;
 			let snap = g
 				.refs(read)
-				.map_err(|e| crate::githost::refs_error(host, e, locale))?;
+				.map_err(|e| crate::githost::refs_error(host, e))?;
 			let filter_tip =
 				match ref_filter.as_deref().filter(|r| !r.is_empty()) {
-					Some(r) => {
-						Some(g.resolve_commit(r, read).map_err(|e| {
-							crate::remote::git_error_loc(e, locale)
-						})?)
-					}
+					Some(r) => Some(
+						g.resolve_commit(r, read)
+							.map_err(crate::remote::git_error_msg)?,
+					),
 					None => None,
 				};
 			git = Some(g);
@@ -845,7 +845,7 @@ fn read_graph_page(
 		}
 		let (window, more) = g
 			.log_from_tips(&tips, start, HISTORY_WINDOW.max(size), read)
-			.map_err(|e| crate::remote::git_error_loc(e, locale))?;
+			.map_err(crate::remote::git_error_msg)?;
 		walk.start = start;
 		walk.window = window;
 		walk.more = more;
@@ -873,11 +873,10 @@ fn read_preview(
 	change: Option<snip_core::format::ChangeType>,
 	parents: Option<&[String]>,
 	read: &Read,
-	loc: crate::i18n::Locale,
 ) -> Result<browser::SourcePreview, crate::PreviewErr> {
 	let preview = g
 		.preview(source, path, change.map(|c| (c, parents)), read)
-		.map_err(|e| crate::PreviewErr::git(e, loc))?;
+		.map_err(crate::PreviewErr::git)?;
 	Ok(browser::SourcePreview {
 		content: preview.content,
 		patch: preview.patch,
@@ -911,7 +910,41 @@ struct PreparedHistory {
 #[derive(Debug)]
 enum GraphAdmissionError {
 	Budget,
-	Layout(String),
+	Layout(Msg),
+}
+
+/// A tree node's error with each long argument cut to its first 80
+/// characters.
+fn clip_tree_error(mut msg: Msg) -> Msg {
+	for arg in &mut msg.args {
+		if arg.len() > MAX_STORED_ERROR_BYTES {
+			let mut clipped: String = arg.chars().take(80).collect();
+			clipped.push('…');
+			*arg = clipped;
+		}
+	}
+	msg.inner = msg
+		.inner
+		.map(|boxed| Box::new((boxed.0, clip_tree_error(boxed.1))));
+	msg
+}
+
+/// A stored error's text, clipped: long Git errors are bounded before they
+/// are retained. Nested messages are clipped too.
+fn clip_msg(mut msg: Msg) -> Msg {
+	for arg in &mut msg.args {
+		let mut end = arg.len().min(MAX_STORED_ERROR_BYTES);
+		while !arg.is_char_boundary(end) {
+			end -= 1;
+		}
+		arg.truncate(end);
+		// Boxed str has no spare capacity; errors cannot consume page headroom.
+		*arg = std::mem::take(arg).into_boxed_str().into_string();
+	}
+	msg.inner = msg
+		.inner
+		.map(|boxed| Box::new((boxed.0, clip_msg(boxed.1))));
+	msg
 }
 
 impl PreparedHistory {
@@ -1008,7 +1041,7 @@ impl PreparedHistory {
 					filtered,
 					shallow.clone(),
 				)
-				.map_err(GraphAdmissionError::Layout)
+				.map_err(|e| GraphAdmissionError::Layout(Msg::raw(e)))
 			};
 			// Filtered results keep their graph, like IntelliJ: a parent the
 			// filter left out ends in a dashed "skipped" stub. (Path filters
@@ -1239,7 +1272,6 @@ impl WorkbenchModel {
 		let want_email = matches!(load, PageLoad::Replace(0));
 		let repo_identity = self.identity_for(&repo_root);
 		let host = self.git_host();
-		let locale = self.locale;
 
 		self.spawn_owned(
 			cx,
@@ -1274,7 +1306,6 @@ impl WorkbenchModel {
 								skip,
 								page_size,
 								&read,
-								locale,
 							)
 							.map(|(h, w)| (h, Some(w), email));
 						};
@@ -1288,7 +1319,7 @@ impl WorkbenchModel {
 							(snapshot.0, snapshot.1, None)
 						} else {
 							let snap = g.refs(&read).map_err(|e| {
-								crate::githost::refs_error(&host, e, locale)
+								crate::githost::refs_error(&host, e)
 							})?;
 							(snap.refs, snap.head, g.user_email(&read))
 						};
@@ -1300,9 +1331,7 @@ impl WorkbenchModel {
 								page_size,
 								&read,
 							)
-							.map_err(|e| {
-								crate::remote::git_error_loc(e, locale)
-							})?;
+							.map_err(crate::remote::git_error_msg)?;
 						Ok((
 							browser::RepositoryHistory {
 								root: String::new(),
@@ -1546,21 +1575,19 @@ impl WorkbenchModel {
 	}
 
 	fn report_graph_error(&mut self, error: GraphAdmissionError) {
-		let mut message = match error {
-			GraphAdmissionError::Budget => {
-				crate::i18n::t("error_graph_budget", self.locale).to_string()
-			}
-			GraphAdmissionError::Layout(message) => message,
+		// Kept as a message: worded when drawn, in the language then in
+		// force (#206 #208).
+		let message = match error {
+			GraphAdmissionError::Budget => Msg::new("error_graph_budget", []),
+			GraphAdmissionError::Layout(message) => clip_msg(message),
 		};
-		let mut end = message.len().min(MAX_STORED_ERROR_BYTES);
-		while !message.is_char_boundary(end) {
-			end -= 1;
-		}
-		message.truncate(end);
-		// Boxed str has no spare capacity; errors cannot consume page headroom.
-		let message = message.into_boxed_str().into_string();
 		self.history_error = Some(message.clone());
-		self.set_status("error_history", [message]);
+		self.set_status_msg(Msg::with_msg_arg(
+			"error_history",
+			[String::new()],
+			0,
+			message,
+		));
 		app_log!("[APP:HISTORY_ERROR]");
 	}
 
@@ -2063,7 +2090,6 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.details_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
-		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2080,7 +2106,7 @@ impl WorkbenchModel {
 						};
 						let g = host.open(&root, identity.as_ref(), &read)?;
 						g.commit_details(&sha, &read)
-							.map_err(|e| crate::remote::git_error_loc(e, loc))
+							.map_err(crate::remote::git_error_msg)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -2349,7 +2375,6 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
-		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2374,7 +2399,7 @@ impl WorkbenchModel {
 								MAX_COMMIT_FILES,
 								&listing,
 							)
-							.map_err(|e| crate::remote::git_error_loc(e, loc))
+							.map_err(crate::remote::git_error_msg)
 						}))
 					})
 					.await;
@@ -2421,8 +2446,12 @@ impl WorkbenchModel {
 								)),
 							}
 						}
-						Err(e) => model
-							.show_preview_error(Msg::new("error_history", [e])),
+						Err(e) => model.show_preview_error(Msg::with_msg_arg(
+							"error_history",
+							[String::new()],
+							0,
+							e,
+						)),
 					}
 					cx.notify();
 				});
@@ -2529,7 +2558,6 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
-		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2562,9 +2590,7 @@ impl WorkbenchModel {
 								MAX_COMMIT_FILES,
 								&listing_read,
 							)
-							.map_err(|e| {
-								crate::remote::git_error_loc(e, loc)
-							})?;
+							.map_err(crate::remote::git_error_msg)?;
 						// A merge lists the files changed against any parent.
 						// Those unchanged against the first parent are marked
 						// (#188): the same list as a Range from the first parent.
@@ -2613,11 +2639,10 @@ impl WorkbenchModel {
 									*change,
 									parents.as_deref(),
 									&preview_read,
-									loc,
 								),
 							)
 						});
-						Ok::<_, String>((
+						Ok::<_, Msg>((
 							list.paths,
 							list.gitlinks,
 							list.total,
@@ -2671,9 +2696,11 @@ impl WorkbenchModel {
 							}
 						}
 						Err(e) => {
-							model.show_preview_error(Msg::new(
+							model.show_preview_error(Msg::with_msg_arg(
 								"error_history",
-								[e],
+								[String::new()],
+								0,
+								e,
 							));
 						}
 					}
@@ -2768,7 +2795,6 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let identity = self.identity_for(&root);
 		let host = self.git_host();
-		let loc = self.locale;
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
@@ -2792,7 +2818,6 @@ impl WorkbenchModel {
 							change,
 							parents.as_deref(),
 							&read,
-							loc,
 						)
 					})
 					.await;
@@ -2961,7 +2986,6 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.rev_tree_cancel);
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
-		let loc = self.locale;
 		let identity = self.identity_for(&root);
 
 		let mut async_app = cx.to_async();
@@ -2986,7 +3010,7 @@ impl WorkbenchModel {
 							MAX_REV_ROWS,
 							&read,
 						)
-						.map_err(|e| crate::remote::git_error_loc(e, loc))
+						.map_err(crate::remote::git_error_msg)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -3066,7 +3090,6 @@ impl WorkbenchModel {
 		let cancel = arm_cancel(&mut self.preview_cancel);
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
-		let loc = self.locale;
 		let identity = self.identity_for(&root);
 
 		self.selected_file = None;
@@ -3099,7 +3122,7 @@ impl WorkbenchModel {
 							browser::MAX_BLOB_BYTES,
 							&read,
 						)
-						.map_err(|e| crate::PreviewErr::git(e, loc))
+						.map_err(crate::PreviewErr::git)
 					})
 					.await;
 				let _ = this.update(&mut async_app, |model, cx| {
@@ -3363,8 +3386,7 @@ fn read_feed_page(
 	skip: usize,
 	want_email: bool,
 	read: &Read,
-	locale: crate::i18n::Locale,
-) -> Result<FeedRead, String> {
+) -> Result<FeedRead, Msg> {
 	let g = host.open(root, known, read)?;
 	let mut out = FeedRead {
 		commits: Vec::new(),
@@ -3376,7 +3398,7 @@ fn read_feed_page(
 	if first {
 		let snap = g
 			.refs(read)
-			.map_err(|e| crate::githost::refs_error(host, e, locale))?;
+			.map_err(|e| crate::githost::refs_error(host, e))?;
 		let tips = match ref_filter.filter(|r| !r.is_empty()) {
 			// A branch filter picks that branch in every repository that
 			// has it; the others show nothing.
@@ -3395,7 +3417,7 @@ fn read_feed_page(
 		}
 		None => g.log_from_tips(&out.tips, skip, multi_log::FEED_PAGE, read),
 	}
-	.map_err(|e| crate::remote::git_error_loc(e, locale))?;
+	.map_err(crate::remote::git_error_msg)?;
 	out.commits = commits;
 	out.more = more;
 	Ok(out)
@@ -3763,7 +3785,6 @@ impl WorkbenchModel {
 		let bg = cx.background_executor().clone();
 		let cancel_bg = cancel.clone();
 		let host = self.git_host();
-		let locale = self.locale;
 		let identity = self.identity_for(&root);
 		self.spawn_owned(
 			cx,
@@ -3787,7 +3808,6 @@ impl WorkbenchModel {
 							skip,
 							want_email,
 							&read,
-							locale,
 						)
 					})
 					.await;
@@ -3817,8 +3837,8 @@ impl WorkbenchModel {
 	fn apply_feed_read(
 		&mut self,
 		i: usize,
-		res: Result<FeedRead, String>,
-	) -> Option<String> {
+		res: Result<FeedRead, Msg>,
+	) -> Option<Msg> {
 		let feed = self.log_feeds.get_mut(i)?;
 		let read = match res {
 			Ok(read) => read,
@@ -4056,7 +4076,7 @@ mod tests {
 				+ (tree.expanded.capacity() - expanded)
 					* std::mem::size_of::<String>()
 				+ (tree.errors.capacity() - errors)
-					* std::mem::size_of::<(String, String)>()
+					* std::mem::size_of::<(String, Msg)>()
 		);
 		for i in 0..100 {
 			tree.insert_dir(format!("dir-{i}"), Vec::new(), false);
@@ -4279,18 +4299,9 @@ mod tests {
 			cancel: None,
 		};
 		let host = crate::githost::GitHost::Local;
-		let (first, walk) = read_graph_page(
-			&host,
-			root,
-			None,
-			None,
-			None,
-			0,
-			2,
-			&read,
-			crate::i18n::Locale::default(),
-		)
-		.unwrap();
+		let (first, walk) =
+			read_graph_page(&host, root, None, None, None, 0, 2, &read)
+				.unwrap();
 		assert!(first.has_more);
 		// The repository moves on; later pages are sliced from the window
 		// page 0 fetched (frozen tips on refetch are covered in browser.rs).
@@ -4306,31 +4317,13 @@ mod tests {
 			"new",
 		]);
 		let reuse = Some((walk, first.refs.clone(), first.head.clone()));
-		let (second, walk) = read_graph_page(
-			&host,
-			root,
-			None,
-			reuse,
-			None,
-			2,
-			2,
-			&read,
-			crate::i18n::Locale::default(),
-		)
-		.unwrap();
+		let (second, walk) =
+			read_graph_page(&host, root, None, reuse, None, 2, 2, &read)
+				.unwrap();
 		let reuse = Some((walk, second.refs.clone(), second.head.clone()));
-		let (third, _) = read_graph_page(
-			&host,
-			root,
-			None,
-			reuse,
-			None,
-			4,
-			2,
-			&read,
-			crate::i18n::Locale::default(),
-		)
-		.unwrap();
+		let (third, _) =
+			read_graph_page(&host, root, None, reuse, None, 4, 2, &read)
+				.unwrap();
 		assert!(!third.has_more);
 		let seen: Vec<String> = [first, second, third]
 			.into_iter()
@@ -4376,35 +4369,17 @@ mod tests {
 			cancel: None,
 		};
 		let host = crate::githost::GitHost::Local;
-		let (first, walk) = read_graph_page(
-			&host,
-			root,
-			None,
-			None,
-			None,
-			0,
-			2,
-			&read,
-			crate::i18n::Locale::default(),
-		)
-		.unwrap();
+		let (first, walk) =
+			read_graph_page(&host, root, None, None, None, 0, 2, &read)
+				.unwrap();
 		assert!(first.has_more);
 		let reuse = Some((walk, first.refs.clone(), first.head.clone()));
 		let nonexistent = std::path::Path::new("/nonexistent/graph/page/test");
 		let before_flight = snip_core::gitrun::in_flight();
 		let before_queued = snip_core::gitrun::queued();
-		let (second, _) = read_graph_page(
-			&host,
-			nonexistent,
-			None,
-			reuse,
-			None,
-			2,
-			2,
-			&read,
-			crate::i18n::Locale::default(),
-		)
-		.unwrap();
+		let (second, _) =
+			read_graph_page(&host, nonexistent, None, reuse, None, 2, 2, &read)
+				.unwrap();
 		assert_eq!(second.commits.len(), 2);
 		assert_eq!(snip_core::gitrun::in_flight(), before_flight);
 		assert_eq!(snip_core::gitrun::queued(), before_queued);
@@ -5126,13 +5101,16 @@ mod tests {
 			.iter()
 			.map(|(key, _)| key)
 			.all(|key| key.len() <= MAX_RETAINED_TREE_BYTES));
-		tree.note_error("err".into(), "e".repeat(MAX_RETAINED_TREE_BYTES * 4));
+		tree.note_error(
+			"err".into(),
+			Msg::raw("e".repeat(MAX_RETAINED_TREE_BYTES * 4)),
+		);
 		assert!(tree.retained_bytes() <= MAX_RETAINED_TREE_BYTES);
 		assert!(tree
 			.errors
 			.iter()
-			.map(|(_, err)| err)
-			.all(|err| err.len() <= MAX_STORED_ERROR_BYTES));
+			.flat_map(|(_, err)| &err.args)
+			.all(|arg| arg.len() <= MAX_STORED_ERROR_BYTES));
 		for i in 0..80 {
 			tree.insert_dir(
 				format!("dir-{i}"),
