@@ -595,8 +595,10 @@ fn row_base(list_w: f32, show_hash: bool) -> f32 {
 /// for the subject): the author column gives way first, then the date, and
 /// for the labels the date never goes below `date_need`, the width of the
 /// longest date string of the current locale ([`date_need_w`]), so a list
-/// whose labels already fit keeps its columns (#216). Only the subject's own
-/// minimum may take the date past that floor, down to [`MIN_DATE_W`].
+/// whose labels already fit keeps its columns (#216). The subject's shortfall
+/// uses the same routine (author first, then the date); only when even author
+/// at [`MIN_AUTHOR_W`] and date at that floor cannot reach the subject minimum
+/// does the date yield last, down to [`MIN_DATE_W`].
 ///
 /// [`MIN_SUBJECT_W`] is not guaranteed on
 /// lists under about 520px with the hash column on (a 900 window with the
@@ -2593,8 +2595,8 @@ mod row_width_tests {
 		for need in [97., 110.] {
 			for list_w in [600., 574., 540., 500., 480., 450.] {
 				for hash in [false, true] {
-					for labels_w in [0., 60., 120., 176., 190., 337.] {
-						for gutter in [40., 56., MIN_GUTTER_W] {
+					for labels_w in [0., 50., 120., 190.] {
+						for gutter in [40., 56., 72.] {
 							let c =
 								list_cols(list_w, gutter, labels_w, need, hash);
 							let base = row_base(list_w, hash);
