@@ -595,7 +595,7 @@ pub fn tree_io(
 		None => {
 			return listed_tree_result(
 				io,
-				Err(Msg::raw("not under the workspace")),
+				Err(Msg::new("err_not_under_workspace", [])),
 			)
 		}
 	};
@@ -618,7 +618,7 @@ pub fn tree_io(
 				})
 				.map_err(describe_msg)
 		}
-		None => Err(Msg::raw("non-UTF-8 folder name")),
+		None => Err(Msg::new("err_folder_not_utf8", [])),
 	};
 	listed_tree_result(io, listed)
 }
@@ -678,8 +678,10 @@ pub fn describe_msg(err: RemoteError) -> Msg {
 		} => start_msg(reason, &detail),
 		RemoteError::Refused { code, message } => match refusal_key(code) {
 			Some(key) => Msg::new(key, []),
+			// ALLOWED-RAW: worker message for a code with no wording (Stale, Collision: the paste's own text)
 			None => Msg::raw(message),
 		},
+		// ALLOWED-RAW: pending #225: errors with no Reason yet (Io, Protocol, Stalled ...)
 		other => Msg::raw(describe(other)),
 	}
 }
@@ -688,14 +690,14 @@ pub fn describe_msg(err: RemoteError) -> Msg {
 /// keeps the path as the detail, so the status line says which path failed.
 pub fn describe_msg_at(err: RemoteError, path: &str) -> Msg {
 	match err {
-		RemoteError::Refused { code, .. } if refusal_key(code).is_some() => {
-			let key = refusal_key(code).unwrap_or("err_raw");
-			Msg::with_key_arg(
+		RemoteError::Refused { code, message } => match refusal_key(code) {
+			Some(key) => Msg::with_key_arg(
 				"remote_start_detail",
 				[key.to_string(), path.to_string()],
 				0,
-			)
-		}
+			),
+			None => describe_msg(RemoteError::Refused { code, message }),
+		},
 		other => describe_msg(other),
 	}
 }
@@ -768,9 +770,11 @@ pub fn git_error_msg(err: snip_core::gitsrc::GitError) -> Msg {
 			.and_then(refusal_key)
 			{
 				Some(key) => Msg::new(key, []),
+				// ALLOWED-RAW: worker message for a code with no wording
 				None => Msg::raw(message),
 			}
 		}
+		// ALLOWED-RAW: pending #225: git errors with no Reason yet
 		other => Msg::raw(other.to_string()),
 	}
 }
@@ -1372,6 +1376,7 @@ impl WorkbenchModel {
 								.restoring
 								.as_ref()
 								.and_then(|r| r.failed.clone())
+								// ALLOWED-RAW: empty placeholder, no text
 								.unwrap_or_else(|| Msg::raw("")),
 							true,
 							cx,

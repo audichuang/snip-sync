@@ -34,15 +34,16 @@ impl GitHost {
 		match self {
 			Self::Local => {
 				if root.to_string_lossy().starts_with("snip-remote://") {
-					return Err(Msg::raw(format!(
-						"local Git host cannot open remote repository '{}'",
-						root.display()
-					)));
+					return Err(Msg::new(
+						"err_local_host_remote_root",
+						[root.display().to_string()],
+					));
 				}
 				match known {
 					Some(id) => Ok(Box::new(LocalRepo::known(id))),
 					None => LocalRepo::open(root, read)
 						.map(|r| Box::new(r) as Box<dyn RepoView>)
+						// ALLOWED-RAW: pending #225: git error text shown verbatim
 						.map_err(|e| Msg::raw(e.to_string())),
 				}
 			}
@@ -52,11 +53,13 @@ impl GitHost {
 				root: session_root,
 			} => {
 				let rel = self.remote_rel(root).ok_or_else(|| {
-					Msg::raw(format!(
-						"repository '{}' is not under remote session root '{}'",
-						root.display(),
-						session_root.display()
-					))
+					Msg::new(
+						"err_repo_outside_session",
+						[
+							root.display().to_string(),
+							session_root.display().to_string(),
+						],
+					)
 				})?;
 				Ok(Box::new(snip_remote::RemoteRepo::new(
 					client.clone(),

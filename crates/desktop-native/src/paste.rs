@@ -861,15 +861,20 @@ fn destination_msg(
 			// A worker refusal is worded by its code, like a start
 			// reason; the worker's own OS or protocol English is never
 			// shown (#213).
-			RemoteError::Refused { code, .. }
-				if crate::remote::refusal_key(code).is_some() =>
-			{
-				let key = crate::remote::refusal_key(code).unwrap_or("err_raw");
-				return Msg::with_key_arg(
-					"paste_err_destination",
-					[shown, key.to_string()],
-					1,
-				);
+			RemoteError::Refused { code, message } => {
+				match crate::remote::refusal_key(code) {
+					Some(key) => {
+						return Msg::with_key_arg(
+							"paste_err_destination",
+							[shown, key.to_string()],
+							1,
+						);
+					}
+					None => crate::remote::describe(RemoteError::Refused {
+						code,
+						message,
+					}),
+				}
 			}
 			other => crate::remote::describe(other),
 		},
@@ -2587,6 +2592,9 @@ impl PastePreviewPlan {
 		})
 	}
 }
+
+#[cfg(test)]
+mod zh_leaks_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -138,18 +138,6 @@ impl Msg {
 	}
 }
 
-impl From<String> for Msg {
-	fn from(text: String) -> Self {
-		Self::raw(text)
-	}
-}
-
-impl From<&str> for Msg {
-	fn from(text: &str) -> Self {
-		Self::raw(text)
-	}
-}
-
 impl std::fmt::Display for Msg {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.render(Locale::ZhTw))
@@ -494,6 +482,16 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_preview" => "預覽「{}」失敗: {}",
 			"error_open_repo" => "開啟儲存庫失敗: {}",
 			"err_raw" => "{}",
+			"err_not_under_workspace" => "這個路徑不在目前的工作區內",
+			"err_tree_budget" => "清單超過樹狀檢視的容量上限",
+			"err_no_new_side_text" => "新版本沒有可顯示的文字",
+			"err_folder_not_utf8" => "資料夾名稱不是有效的 UTF-8，無法開啟",
+			"err_local_host_remote_root" => "本機的 Git 來源無法開啟遠端儲存庫「{}」",
+			"err_repo_outside_session" => "儲存庫「{0}」不在遠端工作階段的根目錄「{1}」之下",
+			"tree_read_dir_failed" => "無法讀取目錄: {}",
+			"tree_dir_changed" => "目錄在讀取期間改變了，請重試",
+			"tree_cursor_gone" => "無法繼續：目錄游標已不在",
+			"graph_commit_id_too_long" => "提交 ID 超過圖形上限",
 			"error_payload" => "產生 payload 失敗: {}",
 			"error_tree" => "讀取 commit 檔案樹失敗: {}",
 			"status_loading" => "載入中...",
@@ -927,6 +925,16 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_preview" => "Failed to preview '{}': {}",
 			"error_open_repo" => "Failed to open repository: {}",
 			"err_raw" => "{}",
+			"err_not_under_workspace" => "This path is not under the workspace",
+			"err_tree_budget" => "The listing exceeds the tree view budget",
+			"err_no_new_side_text" => "The new side has no text to show",
+			"err_folder_not_utf8" => "Folder name is not valid UTF-8 and cannot be opened",
+			"err_local_host_remote_root" => "The local Git source cannot open remote repository '{}'",
+			"err_repo_outside_session" => "Repository '{0}' is not under the remote session root '{1}'",
+			"tree_read_dir_failed" => "Cannot read directory: {}",
+			"tree_dir_changed" => "The directory changed while it was read; try again",
+			"tree_cursor_gone" => "Cannot continue: the directory cursor is gone",
+			"graph_commit_id_too_long" => "Commit ID exceeds the graph limit",
 			"error_payload" => "Failed to generate payload: {}",
 			"error_tree" => "Failed to read commit tree: {}",
 			"status_loading" => "Loading...",
@@ -1274,6 +1282,16 @@ mod tests {
 			"remote_refused_cancelled",
 			"remote_refused_outside_share",
 			"err_raw",
+			"err_not_under_workspace",
+			"err_tree_budget",
+			"err_no_new_side_text",
+			"err_folder_not_utf8",
+			"err_local_host_remote_root",
+			"err_repo_outside_session",
+			"tree_read_dir_failed",
+			"tree_dir_changed",
+			"tree_cursor_gone",
+			"graph_commit_id_too_long",
 			"remote_scan_failed",
 			"remote_scan_incomplete",
 			"remote_refs_too_large",

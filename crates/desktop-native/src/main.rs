@@ -694,6 +694,7 @@ impl PasteDiffOutcome {
 					| snip_remote::PasteError::OutcomeUnknown(e) => {
 						crate::remote::describe_msg(e)
 					}
+					// ALLOWED-RAW: pending #225: PasteError text with no Reason yet
 					other => Msg::raw(other.to_string()),
 				};
 				PasteDiffOutcome::Notice(Msg::with_msg_arg(
@@ -4332,9 +4333,10 @@ impl WorkbenchModel {
 									&for_bg,
 									Some(&cancel),
 								),
-								None => Err(PreviewErr::Failed(
-									"not under the workspace".into(),
-								)),
+								None => Err(PreviewErr::Failed(Msg::new(
+									"err_not_under_workspace",
+									[],
+								))),
 							}
 						}
 						_ => read_preview(
@@ -4859,6 +4861,7 @@ impl WorkbenchModel {
 						}
 						let opts = interactive_read_opts(run_token);
 						let git = Git::open_with(&repo_root, &opts)
+							// ALLOWED-RAW: pending #225: git error text shown verbatim
 							.map_err(|e| Msg::raw(e.to_string()))?;
 						let exported = plan_commit_export_exact_with(
 							&git,
@@ -4867,6 +4870,7 @@ impl WorkbenchModel {
 							&opts,
 							snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 						)
+						// ALLOWED-RAW: pending #225: git error text shown verbatim
 						.map_err(|e| Msg::raw(e.to_string()))?;
 						let out = exported.outcome();
 						let status = commit_copied_status(&out);
@@ -5982,6 +5986,7 @@ impl From<Msg> for PreviewErr {
 
 impl From<String> for PreviewErr {
 	fn from(s: String) -> Self {
+		// ALLOWED-RAW: pending #225: a String error with no Reason yet
 		Self::Failed(Msg::raw(s))
 	}
 }
@@ -6004,6 +6009,7 @@ impl From<std::io::Error> for PreviewErr {
 		if e.kind() == std::io::ErrorKind::FileTooLarge {
 			Self::TooLarge
 		} else {
+			// ALLOWED-RAW: OS error text, shown as the OS words it
 			Self::Failed(Msg::raw(e.to_string()))
 		}
 	}
@@ -8089,7 +8095,11 @@ mod tests {
 				m.enter_remote_folder("a", cx);
 				let stale = m.remote.browse.as_ref().unwrap().seq();
 				m.remote_up(cx);
-				m.remote_listing_landed(stale, Err("late failure".into()), cx);
+				m.remote_listing_landed(
+					stale,
+					Err(crate::i18n::Msg::raw("late failure")),
+					cx,
+				);
 				assert_eq!(m.remote.browse.as_ref().unwrap().listing, None);
 			});
 			settle(cx);
@@ -16852,7 +16862,7 @@ mod tests {
 						root: tmp.path().join("alpha"),
 						name: "alpha".into(),
 						state: crate::ChangeRepoState::Failed(
-							"git status failed".into(),
+							crate::i18n::Msg::raw("git status failed"),
 						),
 						total: 0,
 					},
@@ -17031,7 +17041,8 @@ mod tests {
 				m.discovery_status =
 					Some(snip_core::workspace::ScanStatus::Complete);
 				m.is_loading = false;
-				m.history_error = Some("git read failure".into());
+				m.history_error =
+					Some(crate::i18n::Msg::raw("git read failure"));
 			});
 			assert_eq!(
 				model.read_with(cx, |m, _| m.log_empty_state()),
@@ -22728,7 +22739,7 @@ mod tests {
 
 		// A failed repo with no rows gets a top-level note; a truncated
 		// list says so under each of its expanded repo rows.
-		slots[2].state = ChangeRepoState::Failed("boom".into());
+		slots[2].state = ChangeRepoState::Failed(Msg::raw("boom"));
 		slots[1].total = MAX_CHANGES_PER_REPO + 1;
 		let rows =
 			ui::change_rows(&slots, &files, |_| false, collapsed, "", &FLAT);
@@ -22751,7 +22762,7 @@ mod tests {
 			);
 		}
 		for slot in [2, 3, 4] {
-			slots[slot].state = ChangeRepoState::Failed("boom".into());
+			slots[slot].state = ChangeRepoState::Failed(Msg::raw("boom"));
 		}
 		// Three unreadable repos: one node after the changes, collapsed
 		// until opened, then one note per repo under it.
