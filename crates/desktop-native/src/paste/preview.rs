@@ -1035,15 +1035,43 @@ mod tests {
 		let mut s = landed(&payload, &ws, Some(&o));
 		assert_eq!(s.plan().unwrap().prefix_choices.len(), 5000);
 		let retained = s.plan().unwrap().retained_bytes();
+		let ptrs: Vec<*const PathBuf> = s
+			.plan()
+			.unwrap()
+			.prefix_choices
+			.iter()
+			.map(|c| c.candidates.as_ptr())
+			.collect();
+		crate::paste::GROWTH_CHOICES_VISITED.with(|c| c.set(0));
 		let started = std::time::Instant::now();
 		let err = s.refresh_candidates(&roots, Some(&o)).unwrap_err();
 		let took = started.elapsed();
 		assert_eq!(err.key, "preview_memory_limit");
 		assert_eq!(s.plan().unwrap().retained_bytes(), retained);
+		// Nothing was rebuilt: every choice still owns its allocation.
+		let after: Vec<*const PathBuf> = s
+			.plan()
+			.unwrap()
+			.prefix_choices
+			.iter()
+			.map(|c| c.candidates.as_ptr())
+			.collect();
+		assert_eq!(ptrs, after, "a candidate list was replaced");
+		// The projection stops at the budget: it looks at a few choices,
+		// not all 5000 (about 700 when written).
+		let visited = crate::paste::GROWTH_CHOICES_VISITED.with(|c| c.get());
 		assert!(
-			took < std::time::Duration::from_secs(2),
-			"the refusal took {took:?}; it must not build the candidates"
+			visited < 2500,
+			"the projection visited {visited} of 5000 choices"
 		);
+		// Backstop only; the old code needed about 23 s.
+		let limit = std::time::Duration::from_secs(
+			10 * std::env::var("SNIP_E2E_TIMEOUT_SCALE")
+				.ok()
+				.and_then(|v| v.parse::<u64>().ok())
+				.unwrap_or(1),
+		);
+		assert!(took < limit, "the refusal took {took:?}");
 		// Still news: a smaller set is admitted afterwards.
 		assert!(s.refresh_candidates(&roots[..1], Some(&o)).unwrap());
 	}

@@ -1406,6 +1406,8 @@ impl PastePreviewPlan {
 	) -> usize {
 		let mut total = 0usize;
 		for choice in &self.prefix_choices {
+			#[cfg(test)]
+			GROWTH_CHOICES_VISITED.with(|c| c.set(c.get() + 1));
 			let have: std::collections::HashSet<&PathBuf> =
 				choice.candidates.iter().collect();
 			let mut seen: std::collections::HashSet<&PathBuf> =
@@ -5532,4 +5534,12 @@ pub(crate) mod tests {
 		assert!(!make(PlannedOp::Skip(SkipCause::Binary)).writes_content());
 		assert!(!make(PlannedOp::Skip(SkipCause::Other)).writes_content());
 	}
+}
+
+#[cfg(test)]
+thread_local! {
+	/// Choices `candidate_growth_bytes` looked at on this thread: a test
+	/// counts work with it instead of timing it.
+	pub(crate) static GROWTH_CHOICES_VISITED: std::cell::Cell<usize> =
+		const { std::cell::Cell::new(0) };
 }
