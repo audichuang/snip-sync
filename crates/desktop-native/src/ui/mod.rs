@@ -1753,11 +1753,23 @@ impl Render for WorkbenchModel {
 			}))
 			.on_action(cx.listener(|this, _: &CloseMenus, _, cx| {
 				// Escape closes an open popover; with none open it goes on.
-				if this.workspace_menu || this.log_menu.is_some() {
-					this.close_workspace_menu(cx);
-					this.dismiss_log_menu(cx);
-				} else {
+				if !this.close_open_popovers(cx) {
 					cx.propagate();
+				}
+			}))
+			// One rule: while a popover is open, Escape closes it first, whatever
+			// pane has focus. Panes bind their own Escape action in a deeper
+			// key context, so the root takes those in the capture phase.
+			.capture_action(cx.listener(
+				|this, _: &crate::FocusEditor, _, cx| {
+					if this.close_open_popovers(cx) {
+						cx.stop_propagation();
+					}
+				},
+			))
+			.capture_action(cx.listener(|this, _: &ReaderClear, _, cx| {
+				if this.close_open_popovers(cx) {
+					cx.stop_propagation();
 				}
 			}))
 			.on_action(cx.listener(|this, _: &ToggleLocale, _, cx| {

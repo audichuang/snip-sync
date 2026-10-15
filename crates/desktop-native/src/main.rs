@@ -17226,6 +17226,76 @@ mod tests {
 			});
 		}
 
+		/// One rule (#212): while a workbench popover is open, Escape closes
+		/// it first, whatever pane had the focus when it was opened.
+		#[gpui::test]
+		fn escape_closes_every_popover_from_every_focus(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let r = repo(ws.path(), "my-repo", &[]);
+			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+			git(&r, &["add", "."]);
+			git(&r, &["commit", "-q", "-m", "commit c1"]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| {
+					!m.commits.is_empty() && m.log_width.get() > 0.
+				}) {
+					break;
+				}
+			}
+			settle(cx);
+			let menus = [
+				"btn-workspace-menu",
+				"log-filter-more",
+				"log-filter-branch",
+				"log-filter-paths",
+				"log-filter-repo",
+			];
+			let mut seen = 0;
+			for origin in ["log-row", "tree", "reader", "none"] {
+				for id in menus {
+					if cx.debug_bounds(id).is_none() {
+						continue;
+					}
+					seen += 1;
+					click(cx, id);
+					settle(cx);
+					assert!(
+						model.read_with(cx, |m, _| {
+							m.workspace_menu || m.log_menu.is_some()
+						}),
+						"{id} opened"
+					);
+					// The menu is open; the focus is in `origin` (a click on a
+					// button leaves it at the root, a row or Alt+N moves it).
+					cx.update(|window, cx| {
+						let m = model.read(cx);
+						let h = match origin {
+							"log-row" => m.log_focus.clone(),
+							"tree" => m.tree_focus.clone(),
+							"reader" => m.reader_focus.clone(),
+							_ => m.focus_handle.clone(),
+						};
+						window.focus(&h);
+					});
+					settle(cx);
+					cx.simulate_keystrokes("escape");
+					settle(cx);
+					model.read_with(cx, |m, _| {
+						assert!(
+							!m.workspace_menu && m.log_menu.is_none(),
+							"Escape closes {id} opened from {origin}"
+						);
+					});
+				}
+			}
+			assert!(seen >= 8, "enough menus drawn: {seen}");
+		}
+
 		/// At narrow window width (900x600), overflowing log filter chips do
 		/// not overlap action buttons; the overflow chip lists hidden filters,
 		/// and clicking the User item opens the User menu without triggering refresh.
