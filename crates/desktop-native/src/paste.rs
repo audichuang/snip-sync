@@ -834,6 +834,19 @@ fn destination_msg(
 				detail,
 				..
 			} => return start_destination_msg(shown, reason, detail),
+			// A worker refusal is worded by its code, like a start
+			// reason; the worker's own OS or protocol English is never
+			// shown (#213).
+			RemoteError::Refused { code, .. }
+				if crate::remote::refusal_key(code).is_some() =>
+			{
+				let key = crate::remote::refusal_key(code).unwrap_or("err_raw");
+				return Msg::with_key_arg(
+					"paste_err_destination",
+					[shown, key.to_string()],
+					1,
+				);
+			}
 			other => crate::remote::describe(other),
 		},
 		PasteError::Local(e) => e.to_string(),
@@ -918,9 +931,15 @@ fn commit_msg(
 		}
 		PasteError::Local(e) => Msg::new("stale_modified", [e.to_string()]),
 		// Kept as before: any other worker refusal of a replay, Busy
-		// included, reads as a repository error (see Risks).
-		PasteError::Remote(RemoteError::Refused { message, .. }) => {
-			Msg::new("error_open_repo", [message])
+		// included, reads as a repository error (see Risks). A code with a
+		// wording of its own shows that wording, never the worker's text.
+		PasteError::Remote(RemoteError::Refused { code, message }) => {
+			match crate::remote::refusal_key(code) {
+				Some(key) => {
+					Msg::with_key_arg("error_open_repo", [key.to_string()], 0)
+				}
+				None => Msg::new("error_open_repo", [message]),
+			}
 		}
 		PasteError::OutcomeUnknown(_) => outcome_unknown(),
 		other => destination_msg(remote, dest, other),
@@ -2792,6 +2811,124 @@ pub(crate) mod tests {
 		};
 		assert_eq!(key(None, cancelled(), true), "error_open_repo");
 		assert_eq!(key(None, cancelled(), false), "stale_modified");
+	}
+
+	/// Every user-facing surface that shows a remote refusal words it by
+	/// its code; the worker's OS or protocol English never reaches the
+	/// screen in any language (#213). The match is exhaustive, so a new
+	/// `ErrorCode` must be decided here.
+	#[test]
+	fn remote_refusals_are_worded_on_every_paste_surface() {
+		use snip_remote::{ErrorCode as C, RemoteError};
+		fn worded(code: C) -> bool {
+			match code {
+				C::Forbidden
+				| C::NotFound
+				| C::Unsupported
+				| C::BadRequest
+				| C::TooLarge
+				| C::Io
+				| C::VersionMismatch
+				| C::NotARepository
+				| C::InvalidRevision
+				| C::Timeout
+				| C::Busy
+				| C::Cancelled
+				| C::OutsideShare => true,
+				// The local paste's own wording stays as sent.
+				C::Stale | C::Collision => false,
+			}
+		}
+		let all = [
+			C::Forbidden,
+			C::NotFound,
+			C::Unsupported,
+			C::BadRequest,
+			C::TooLarge,
+			C::Io,
+			C::VersionMismatch,
+			C::NotARepository,
+			C::InvalidRevision,
+			C::Timeout,
+			C::Busy,
+			C::Cancelled,
+			C::OutsideShare,
+			C::Stale,
+			C::Collision,
+		];
+		let worker = Arc::new(snip_remote::Worker::new(Default::default()));
+		let remote = RemotePaste {
+			session: crate::remote::RemoteSession::new(
+				snip_remote::RemoteHost::in_process(worker),
+				snip_remote::RemoteWorkspace {
+					id: "/w".into(),
+					name: "w".into(),
+					path: "/w".into(),
+				},
+			),
+		};
+		let dest = remote.session.root.join("sub");
+		let raw = "No such file or directory (os error 2)";
+		let refused = |code| RemoteError::Refused {
+			code,
+			message: raw.into(),
+		};
+		for code in all {
+			if !worded(code) {
+				continue;
+			}
+			let surfaces: Vec<(&str, Msg)> = vec![
+				("describe_msg", crate::remote::describe_msg(refused(code))),
+				(
+					"describe_msg_at",
+					crate::remote::describe_msg_at(refused(code), "/srv/x"),
+				),
+				(
+					"destination_msg",
+					destination_msg(
+						Some(&remote),
+						&dest,
+						PasteError::Remote(refused(code)),
+					),
+				),
+				(
+					"file_apply_msg",
+					file_apply_msg(
+						Some(&remote),
+						&dest,
+						PasteError::Remote(refused(code)),
+					),
+				),
+				(
+					"commit_msg check",
+					commit_msg(
+						Some(&remote),
+						&dest,
+						PasteError::Remote(refused(code)),
+						false,
+					),
+				),
+				(
+					"commit_msg replay",
+					commit_msg(
+						Some(&remote),
+						&dest,
+						PasteError::Remote(refused(code)),
+						true,
+					),
+				),
+			];
+			for (name, msg) in surfaces {
+				for loc in [Locale::ZhTw, Locale::En] {
+					let text = msg.render(loc);
+					assert!(
+						!text.contains("os error")
+							&& !text.contains("No such file"),
+						"{name} {code:?} {loc:?} shows worker text: {text}"
+					);
+				}
+			}
+		}
 	}
 
 	fn captured(text: String, dest: &Path) -> PasteRequest {
