@@ -585,17 +585,18 @@ fn row_base(list_w: f32, show_hash: bool) -> f32 {
 /// list, decided once per list. Pieces give way to the subject in this
 /// order: the gutter is clipped (only as far as a squeezed label group, when
 /// there are labels, and the subject need), then no further than
-/// [`MIN_GUTTER_W`]; below that the date and then the author cell shrink
-/// until the subject reaches [`MIN_SUBJECT_W`]. On a very narrow list the
-/// subject takes what is left.
+/// [`MIN_GUTTER_W`]; below that the author and then the date cell shrink
+/// (one order for every shortfall) until the subject reaches
+/// [`MIN_SUBJECT_W`]. On a very narrow list the subject takes what is left.
 ///
 /// `labels_w` is the widest ref-label group any row of the list has (0 for
 /// none, see [`ref_labels_width`]). Beside a short subject the group gets
 /// room only as far as it needs it (down to [`MIN_SUBJECT_BESIDE_LABELS`]
-/// for the subject): the author column gives way first, then the date, but
-/// the date never below `date_need`, the width of the longest date string of
-/// the current locale ([`date_need_w`]), so a list whose labels already fit
-/// keeps its columns and no date is cut for labels (#216).
+/// for the subject): the author column gives way first, then the date, and
+/// for the labels the date never goes below `date_need`, the width of the
+/// longest date string of the current locale ([`date_need_w`]), so a list
+/// whose labels already fit keeps its columns (#216). Only the subject's own
+/// minimum may take the date past that floor, down to [`MIN_DATE_W`].
 ///
 /// [`MIN_SUBJECT_W`] is not guaranteed on
 /// lists under about 520px with the hash column on (a 900 window with the
@@ -614,8 +615,7 @@ pub(super) fn list_cols(
 	let room = base - AUTHOR_W - DATE_W - MIN_SUBJECT_W - labels;
 	let gutter = gutter_w.min(room.max(MIN_GUTTER_W));
 	// What the subject still lacks with the gutter placed.
-	let mut lack =
-		(MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
+	let lack = (MIN_SUBJECT_W - (base - gutter - AUTHOR_W - DATE_W)).max(0.);
 	// A short subject beside the labels: the room the whole group needs,
 	// taken from the author, then from the date down to what it needs. Where
 	// even all of that would leave the group under MIN_LABELS_W it is
@@ -630,22 +630,16 @@ pub(super) fn list_cols(
 	} else {
 		0.
 	};
-	if label_lack > lack {
-		// Author first, the date only for what the author cannot give.
-		let author_cut = label_lack.min(AUTHOR_W - MIN_AUTHOR_W);
-		return ListCols {
-			gutter,
-			author: AUTHOR_W - author_cut,
-			date: DATE_W - (label_lack - author_cut),
-		};
-	}
-	let date = DATE_W - lack.min(DATE_W - MIN_DATE_W);
-	lack -= DATE_W - date;
-	let author = AUTHOR_W - lack.min(AUTHOR_W - MIN_AUTHOR_W);
+	// One give-way order for both shortfalls: the author first, then the
+	// date. The labels' share stops at `date_floor`; only the subject's own
+	// minimum may push the date on to MIN_DATE_W.
+	let total = lack.max(label_lack);
+	let author_cut = total.min(AUTHOR_W - MIN_AUTHOR_W);
+	let date_cut = (total - author_cut).min(DATE_W - MIN_DATE_W);
 	ListCols {
 		gutter,
-		author,
-		date,
+		author: AUTHOR_W - author_cut,
+		date: DATE_W - date_cut,
 	}
 }
 
@@ -2472,23 +2466,22 @@ mod row_width_tests {
 	}
 
 	#[test]
-	fn a_narrow_list_squeezes_date_then_author_after_the_gutter() {
+	fn a_narrow_list_squeezes_author_then_date_after_the_gutter() {
 		// 433px (a 900 window): the gutter is at its floor, the date and the
 		// author cells give the subject its minimum.
 		let c = cols(433., WIDE_GUTTER, true, false);
 		assert_eq!(c.gutter, MIN_GUTTER_W);
 		assert!(c.date < DATE_W && c.date >= MIN_DATE_W);
 		assert!(c.author >= MIN_AUTHOR_W);
-		// The labels are dropped here anyway (the deficit is more than the
-		// date and author can give), so the author is not squeezed for them.
-		assert_eq!(c.author, 81.);
+		// The author goes first, to its floor, then the date.
+		assert_eq!(c.author, MIN_AUTHOR_W);
 		let w = row_widths(433., c, 337., 400., false);
 		assert_eq!(w.labels, 0.);
 		assert!(w.subject >= MIN_SUBJECT_W, "{w:?}");
-		// Only the date gives way while it alone is enough.
+		// Only the author gives way while it alone is enough.
 		let c = cols(FLOOR_W - 10., WIDE_GUTTER, false, false);
-		assert_eq!(c.author, AUTHOR_W);
-		assert!(c.date < DATE_W);
+		assert_eq!(c.date, DATE_W);
+		assert!(c.author < AUTHOR_W);
 	}
 
 	// Below this list width the gutter floor plus full author and date
@@ -2589,6 +2582,48 @@ mod row_width_tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn every_shortfall_gives_way_author_first_and_keeps_the_date() {
+		// #216: the subject's shortfall and the labels' take the columns in
+		// one order across list widths, hash on/off, label groups and gutters,
+		// wherever the date floor is reachable.
+		let mut checked = 0;
+		for need in [97., 110.] {
+			for list_w in [600., 574., 540., 500., 480., 450.] {
+				for hash in [false, true] {
+					for labels_w in [0., 60., 120., 176., 190., 337.] {
+						for gutter in [40., 56., MIN_GUTTER_W] {
+							let c =
+								list_cols(list_w, gutter, labels_w, need, hash);
+							let base = row_base(list_w, hash);
+							// Subject need with the gutter at its real width.
+							let lack = (MIN_SUBJECT_W
+								- (base - c.gutter - AUTHOR_W - DATE_W))
+								.max(0.);
+							let give = (AUTHOR_W - MIN_AUTHOR_W)
+								+ (DATE_W - need.clamp(MIN_DATE_W, DATE_W));
+							if lack > give {
+								continue; // floor unreachable: fallback case
+							}
+							checked += 1;
+							let tag = format!(
+								"{need} {list_w} {hash} {labels_w} {gutter}: {c:?}"
+							);
+							assert!(c.date >= need, "{tag}");
+							assert!(c.author >= MIN_AUTHOR_W, "{tag}");
+							// The date is cut only once the author is at its floor.
+							assert!(
+								c.date == DATE_W || c.author == MIN_AUTHOR_W,
+								"{tag}"
+							);
+						}
+					}
+				}
+			}
+		}
+		assert!(checked > 100, "{checked}");
 	}
 
 	#[test]
