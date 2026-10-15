@@ -17378,11 +17378,14 @@ mod tests {
 			assert_eq!(cases, 7 * menus.len());
 		}
 
-		/// The same rule when the user's own gesture put the focus there:
-		/// a click on a log row or a Changes row, then the selector's
-		/// shortcut, then Escape (#212).
+		/// The same rule when only the user's gestures set the focus: click a
+		/// log row, click a popover opener (the click moves the focus to the
+		/// root), press Alt+1 (the tree takes the focus, the menu stays
+		/// open), then Escape (#212). The selector shortcuts move the focus
+		/// into the filter field, whose own Dismiss would close the selector
+		/// without the root rule, so they are not used here.
 		#[gpui::test]
-		fn escape_closes_a_selector_opened_by_shortcut_after_a_click(
+		fn escape_closes_a_menu_opened_by_click_after_a_click(
 			cx: &mut TestAppContext,
 		) {
 			let ws = tempfile::tempdir().unwrap();
@@ -17390,7 +17393,7 @@ mod tests {
 			fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
 			git(&r, &["add", "."]);
 			git(&r, &["commit", "-q", "-m", "commit c1"]);
-			fs::write(r.join("base.txt"), "dirty").unwrap();
+			repo(ws.path(), "other-repo", &[]);
 			let (model, cx) =
 				open_sized(cx, ws.path().to_path_buf(), None, 900., 600.);
 			for _ in 0..50 {
@@ -17402,51 +17405,49 @@ mod tests {
 				}
 			}
 			settle(cx);
-			for (shortcut, kind) in [
-				("alt-shift-r", crate::Popover::Repo),
-				("secondary-shift-`", crate::Popover::Ref),
+			let mut cases = 0;
+			for opener in [
+				"btn-workspace-menu",
+				"btn-repo-selector",
+				"btn-ref-selector",
+				"log-filter-more",
+				"log-filter-repo",
 			] {
-				for gesture in ["log-row", "change-row"] {
-					if gesture == "log-row" {
-						let row = cx
-							.debug_bounds("log-subject:0")
-							.expect("a commit row");
-						cx.simulate_click(
-							row.center(),
-							gpui::Modifiers::none(),
-						);
-					} else {
-						cx.simulate_keystrokes("alt-0");
-						settle(cx);
-						click_probed(&model, cx, "change-row:base.txt");
-					}
-					settle(cx);
-					cx.simulate_keystrokes(shortcut);
-					settle(cx);
-					model.read_with(cx, |m, _| {
-						assert_eq!(
-							m.popover,
-							Some(kind),
-							"{shortcut} opens the selector after a {gesture} click"
-						);
-					});
-					cx.update(|window, cx| {
-						let h = model.read(cx).selector_input.read(cx).handle();
-						assert!(
-							h.is_focused(window),
-							"the filter field has it"
-						);
-					});
-					cx.simulate_keystrokes("escape");
-					settle(cx);
-					model.read_with(cx, |m, _| {
-						assert_eq!(
-							m.popover, None,
-							"Escape closes the selector after a {gesture} click"
-						);
-					});
-				}
+				let row =
+					cx.debug_bounds("log-subject:0").expect("a commit row");
+				cx.simulate_click(row.center(), gpui::Modifiers::none());
+				settle(cx);
+				click(cx, opener);
+				settle(cx);
+				cx.simulate_keystrokes("alt-1");
+				settle(cx);
+				let (open, focused) = cx.update(|window, cx| {
+					let m = model.read(cx);
+					(
+						m.workspace_menu
+							|| m.log_menu.is_some()
+							|| m.popover.is_some(),
+						m.tree_focus.is_focused(window),
+					)
+				});
+				assert!(open, "{opener} opened");
+				assert!(
+					focused,
+					"Alt+1 moves the focus to the tree with {opener} open"
+				);
+				cx.simulate_keystrokes("escape");
+				settle(cx);
+				model.read_with(cx, |m, _| {
+					assert!(
+						!(m.workspace_menu
+							|| m.log_menu.is_some()
+							|| m.popover.is_some()),
+						"Escape closes {opener} opened after a log click"
+					);
+				});
+				cases += 1;
 			}
+			assert_eq!(cases, 5);
 		}
 
 		/// At narrow window width (900x600), overflowing log filter chips do
