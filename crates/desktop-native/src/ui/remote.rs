@@ -174,7 +174,7 @@ impl WorkbenchModel {
 						.into_any_element(),
 				),
 				Some(Err(err)) => out.push(
-					muted(err.clone())
+					muted(err.render(loc))
 						.pl(px(32.))
 						.text_color(rgb(pal().error))
 						.into_any_element(),
@@ -232,7 +232,7 @@ impl WorkbenchModel {
 		}
 		if let Some((ok, text)) = &self.remote.message {
 			out.push(
-				muted(text.clone())
+				muted(text.render(loc))
 					.when(!ok, |d| d.text_color(rgb(pal().error)))
 					.into_any_element(),
 			);

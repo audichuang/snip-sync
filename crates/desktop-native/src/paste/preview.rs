@@ -129,6 +129,12 @@ impl PastePreview {
 		self.plan.as_ref()
 	}
 
+	/// A test swaps the client the plan's remote holds.
+	#[cfg(test)]
+	pub fn plan_mut(&mut self) -> Option<&mut PastePreviewPlan> {
+		self.plan.as_mut()
+	}
+
 	pub fn detail(&self) -> Option<&Preview> {
 		self.detail.as_ref()
 	}

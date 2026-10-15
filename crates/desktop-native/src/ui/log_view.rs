@@ -1,6 +1,7 @@
 //! Git Log list, commit details and changed files.
 
 use super::*;
+use crate::i18n::Msg;
 
 impl WorkbenchModel {
 	pub(super) fn render_log(
@@ -395,7 +396,16 @@ impl WorkbenchModel {
 						.bg(rgb(pal().error_bg))
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().error))
-						.child(tf("error_history", loc, &[&err]))
+						.child(super::drawn(
+							"log-error",
+							Msg::with_msg_arg(
+								"error_history",
+								[String::new()],
+								0,
+								err.clone(),
+							)
+							.render(loc),
+						))
 						.children(probe(log, "log-error")),
 				)
 			})

@@ -379,7 +379,7 @@ impl WorkbenchModel {
 									.id("workspace-closed-remote-error")
 									.relative()
 									.text_color(rgb(pal().error))
-									.child(text.clone())
+									.child(text.render(loc))
 									.children(probe(
 										&self.probes,
 										"workspace-closed-remote-error",
@@ -878,10 +878,26 @@ impl WorkbenchModel {
 			// The line clamps; a long status (per-file paste failures) shows
 			// in full on hover.
 			.child({
-				let status = self.status.render(loc);
+				let status =
+					super::drawn("status-text", self.status.render(loc));
 				fill_text(status.clone())
 					.id("status-text")
-					.tooltip(tip(status))
+					.debug_selector(|| "status-text".into())
+					.tooltip({
+						// The status is a Msg: read it and the language at
+						// draw time, or an open tooltip keeps old text (#208).
+						let model = cx.weak_entity();
+						live_tip(move |cx| {
+							model
+								.upgrade()
+								.map(|m| {
+									let m = m.read(cx);
+									m.status.render(m.locale)
+								})
+								.unwrap_or_default()
+								.into()
+						})
+					})
 					.mr(px(8.))
 			})
 			.child(

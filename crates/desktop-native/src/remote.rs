@@ -225,7 +225,7 @@ pub struct Browse {
 	pub host: usize,
 	/// The worker's real path once listed, else as asked for (`~`, `…/..`).
 	pub path: String,
-	pub listing: Option<Result<FolderListing, String>>,
+	pub listing: Option<Result<FolderListing, Msg>>,
 	/// A listing that lands with another number is for a folder no longer
 	/// shown.
 	seq: u64,
@@ -288,7 +288,7 @@ pub struct MasterState {
 	/// result landing with an older seq is dropped, workspace and status
 	/// bar untouched.
 	pub open_seq: u64,
-	pub message: Option<(bool, String)>,
+	pub message: Option<(bool, Msg)>,
 	/// The host whose folders are listed, and the folder shown.
 	pub browse: Option<Browse>,
 	pub(crate) browse_seq: u64,
@@ -350,7 +350,7 @@ pub(crate) fn scan_retry_delay(retries: u8) -> Option<std::time::Duration> {
 pub struct Restoring {
 	pub folder: RecentRemote,
 	/// Why the last attempt failed; the tab shows it until one succeeds.
-	pub failed: Option<String>,
+	pub failed: Option<Msg>,
 	/// The `open_seq` of the attempt in flight.
 	pub(crate) open_seq: Option<u64>,
 	/// Attempts made; the next one waits [`retry_delay`] of it.
@@ -595,7 +595,7 @@ pub fn tree_io(
 		None => {
 			return listed_tree_result(
 				io,
-				Err("not under the workspace".to_string()),
+				Err(Msg::raw("not under the workspace")),
 			)
 		}
 	};
@@ -616,9 +616,9 @@ pub fn tree_io(
 						.collect();
 					(children, truncated)
 				})
-				.map_err(describe)
+				.map_err(describe_msg)
 		}
-		None => Err("non-UTF-8 folder name".to_string()),
+		None => Err(Msg::raw("non-UTF-8 folder name")),
 	};
 	listed_tree_result(io, listed)
 }
@@ -650,7 +650,7 @@ pub fn read_preview(
 				code: snip_remote::ErrorCode::TooLarge,
 				..
 			} => crate::PreviewErr::TooLarge,
-			other => crate::PreviewErr::Failed(describe(other)),
+			other => crate::PreviewErr::Failed(describe_msg(other)),
 		})
 }
 
@@ -663,30 +663,57 @@ pub fn describe(err: RemoteError) -> String {
 	}
 }
 
-/// [`describe`] in the interface language: a known start failure gets its
-/// own wording. The transport's stderr is appended as the detail only where
-/// it is the useful part (ssh's own refusal); a missing or old snip would
-/// drag in clap's usage text or ssh banners.
-pub fn describe_loc(err: RemoteError, loc: crate::i18n::Locale) -> String {
-	let RemoteError::Start {
-		reason: Some(reason),
-		detail,
-		..
-	} = &err
-	else {
-		return describe(err);
-	};
-	let key = match reason {
+/// [`describe`] as a message: a known start failure words itself when it
+/// is drawn, in the language then in force, so a result that outlives a
+/// switch of language never keeps the old one. Anything else keeps its own
+/// text.
+pub fn describe_msg(err: RemoteError) -> Msg {
+	match err {
+		RemoteError::Start {
+			reason: Some(reason),
+			detail,
+			..
+		} => start_msg(reason, &detail),
+		other => Msg::raw(describe(other)),
+	}
+}
+
+/// The dictionary key of a known start failure's wording. A message that
+/// outlives the language it was made in carries this key (a `Msg` key
+/// argument) and is worded when it is drawn.
+pub fn start_reason_key(reason: StartReason) -> &'static str {
+	match reason {
 		StartReason::NoWorker => "remote_start_no_worker",
 		StartReason::KeyLogin => "remote_start_key_login",
 		StartReason::NoAnswer => "remote_start_no_answer",
 		StartReason::Closed => "remote_start_closed",
-	};
-	let text = crate::i18n::t(key, loc);
+	}
+}
+
+/// A known start failure as a message. The transport's stderr is appended
+/// as the detail only where it is the useful part (ssh's own refusal): a
+/// missing or old snip would drag in clap's usage text or ssh banners.
+pub fn start_msg(reason: StartReason, detail: &str) -> Msg {
+	let key = start_reason_key(reason);
 	if detail.is_empty() || !matches!(reason, StartReason::KeyLogin) {
-		text.to_string()
+		Msg::new(key, [])
 	} else {
-		crate::i18n::tf("remote_start_detail", loc, &[text, detail])
+		Msg::with_key_arg(
+			"remote_start_detail",
+			[key.to_string(), detail.to_string()],
+			0,
+		)
+	}
+}
+
+/// A Git view's error as a message: a worker that did not start gets
+/// [`start_msg`]; anything else keeps its own text.
+pub fn git_error_msg(err: snip_core::gitsrc::GitError) -> Msg {
+	match err {
+		snip_core::gitsrc::GitError::HostStart { reason, detail, .. } => {
+			start_msg(reason, &detail)
+		}
+		other => Msg::raw(other.to_string()),
 	}
 }
 
@@ -728,7 +755,7 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn remote_note(&mut self, ok: bool, text: String, cx: &mut Context<Self>) {
+	fn remote_note(&mut self, ok: bool, text: Msg, cx: &mut Context<Self>) {
 		self.remote.message = Some((ok, text));
 		cx.notify();
 	}
@@ -809,7 +836,6 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let mut async_app = cx.to_async();
 		let token = cancel.clone();
-		let loc = self.locale;
 		#[cfg(test)]
 		let open_delay = self.e2e_remote_open_delay;
 		// Like an open, the listing's ssh belongs to this tab: a close or
@@ -843,7 +869,7 @@ impl WorkbenchModel {
 						})
 					})
 					.await
-					.map_err(|e| describe_loc(e, loc));
+					.map_err(describe_msg);
 				let _ = this.update(&mut async_app, |this, cx| {
 					this.remote_listing_landed(seq, result, cx);
 				});
@@ -856,7 +882,7 @@ impl WorkbenchModel {
 	pub(crate) fn remote_listing_landed(
 		&mut self,
 		seq: u64,
-		result: Result<FolderListing, String>,
+		result: Result<FolderListing, Msg>,
 		cx: &mut Context<Self>,
 	) {
 		let Some(browse) = self.remote.browse.as_mut().filter(|b| b.seq == seq)
@@ -889,7 +915,10 @@ impl WorkbenchModel {
 				}
 			}
 			Err(err) => {
-				app_log!("[APP:REMOTE_HOST_FAILED: host={name} {err}]");
+				app_log!(
+					"[APP:REMOTE_HOST_FAILED: host={name} {}]",
+					err.render(crate::i18n::Locale::En)
+				);
 				browse.client = None;
 			}
 		}
@@ -947,8 +976,11 @@ impl WorkbenchModel {
 			return;
 		}
 		if path.trim().is_empty() {
-			let text = crate::i18n::t("remote_path_missing", self.locale);
-			return self.remote_note(false, text.into(), cx);
+			return self.remote_note(
+				false,
+				Msg::new("remote_path_missing", []),
+				cx,
+			);
 		}
 		self.remote.busy = true;
 		self.remote.message = None;
@@ -1067,14 +1099,21 @@ impl WorkbenchModel {
 						Err((client, err)) => {
 							this.return_browse_client(idx, client);
 							let retryable = err.is_restore_retryable();
-							let err = describe_loc(err, this.locale);
-							app_log!("[APP:REMOTE_OPEN_FAILED: {err}]");
+							// The reason stays a message: worded when drawn, in
+							// the language then in force (#206 #208).
+							let err = describe_msg(err);
+							app_log!(
+								"[APP:REMOTE_OPEN_FAILED: {}]",
+								err.render(crate::i18n::Locale::En)
+							);
 							// Also on the status bar: a reconnect on launch runs
 							// with the menu closed.
-							this.set_status(
+							this.set_status_msg(Msg::with_msg_arg(
 								"remote_open_failed",
-								[err.clone()],
-							);
+								[String::new()],
+								0,
+								err.clone(),
+							));
 							this.remote_note(false, err.clone(), cx);
 							if restore {
 								this.restore_failed(err, retryable, cx);
@@ -1222,8 +1261,7 @@ impl WorkbenchModel {
 		let host = folder.host.clone();
 		self.open_remote_folder(folder, cx);
 		if !self.remote.hosts.iter().any(|h| h.name == host) {
-			let why =
-				crate::i18n::tf("remote_host_missing", self.locale, &[&host]);
+			let why = Msg::new("remote_host_missing", [host]);
 			return self.restore_failed(why, true, cx);
 		}
 		if self.remote.busy {
@@ -1239,7 +1277,7 @@ impl WorkbenchModel {
 	/// [`retry_delay`]; a try during a drain waits until later.
 	fn restore_failed(
 		&mut self,
-		why: String,
+		why: Msg,
 		retryable: bool,
 		cx: &mut Context<Self>,
 	) {
@@ -1275,7 +1313,7 @@ impl WorkbenchModel {
 								.restoring
 								.as_ref()
 								.and_then(|r| r.failed.clone())
-								.unwrap_or_default(),
+								.unwrap_or_else(|| Msg::raw("")),
 							true,
 							cx,
 						);
@@ -1298,14 +1336,12 @@ impl WorkbenchModel {
 		match self.remote.hosts.iter().position(|h| h.name == folder.host) {
 			Some(idx) => self.open_remote_path(idx, folder.path, cx),
 			None => {
-				let text = crate::i18n::tf(
-					"remote_host_missing",
-					self.locale,
-					&[&folder.host],
-				);
-				self.set_status_msg(Msg::new(
+				let text = Msg::new("remote_host_missing", [folder.host]);
+				self.set_status_msg(Msg::with_msg_arg(
 					"remote_open_failed",
-					[text.clone()],
+					[String::new()],
+					0,
+					text.clone(),
 				));
 				self.remote_note(false, text, cx);
 			}
@@ -1502,11 +1538,16 @@ impl WorkbenchModel {
 									)
 								}
 								other => {
-									let text = describe_loc(other, model.locale);
+									// The reason stays a message: worded when
+									// drawn, in the language then in force.
+									let why = describe_msg(other);
+									let text = why.render(crate::i18n::Locale::En);
 									(
-										Msg::new(
+										Msg::with_msg_arg(
 											"remote_scan_failed",
-											[text.clone()],
+											[String::new()],
+											0,
+											why,
 										),
 										text,
 									)
@@ -1604,12 +1645,37 @@ mod tests {
 		}
 	}
 
+	/// A Git view's lost worker is worded in the interface language; any
+	/// other git error keeps its own text (#206).
+	#[test]
+	fn git_errors_word_a_lost_worker_in_the_interface_language() {
+		use snip_core::gitsrc::GitError;
+		let lost = || GitError::HostStart {
+			reason: StartReason::NoWorker,
+			detail: String::new(),
+			message: "snip is not installed".into(),
+		};
+		// One stored message, worded in whichever language draws it.
+		let msg = git_error_msg(lost());
+		assert_eq!(
+			msg.render(Locale::ZhTw),
+			crate::i18n::t("remote_start_no_worker", Locale::ZhTw)
+		);
+		assert_eq!(
+			msg.render(Locale::En),
+			crate::i18n::t("remote_start_no_worker", Locale::En)
+		);
+		let boom = git_error_msg(GitError::Host("boom".into()));
+		assert_eq!(boom.render(Locale::ZhTw), "boom");
+		assert_eq!(boom.render(Locale::En), "boom");
+	}
+
 	/// A known start failure is worded in the interface language with the
 	/// transport's stderr as detail; an unknown one stays ssh's own words (#204).
 	#[test]
 	fn known_start_failures_are_worded_in_the_interface_language() {
-		let zh = |e| describe_loc(e, Locale::ZhTw);
-		let en = |e| describe_loc(e, Locale::En);
+		let zh = |e| describe_msg(e).render(Locale::ZhTw);
+		let en = |e| describe_msg(e).render(Locale::En);
 		assert_eq!(
 			zh(start(Some(StartReason::NoWorker), "")),
 			"那台機器沒有安裝 snip，或版本太舊而不支援 ssh 連線；請在那台機器安裝或更新 snip-sync"

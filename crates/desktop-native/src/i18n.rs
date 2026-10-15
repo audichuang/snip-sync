@@ -31,6 +31,9 @@ pub struct Msg {
 	pub key: &'static str,
 	pub args: Vec<String>,
 	pub key_args: Vec<usize>,
+	/// An argument that is itself a message, worded with the message.
+	/// Boxed: `Msg` sits in many enums that must stay small.
+	pub inner: Option<Box<(usize, Msg)>>,
 }
 
 impl Msg {
@@ -39,6 +42,29 @@ impl Msg {
 			key,
 			args: args.into_args(),
 			key_args: Vec::new(),
+			inner: None,
+		}
+	}
+
+	/// Text with no wording of its own (an error from a tool, a path): it
+	/// shows as it is, in either language.
+	pub fn raw(text: impl Into<String>) -> Self {
+		Self::new("err_raw", [text.into()])
+	}
+
+	/// Argument `index` is a message: it is worded in the language the
+	/// outer message is drawn in.
+	pub fn with_msg_arg(
+		key: &'static str,
+		args: impl IntoMsgArgs,
+		index: usize,
+		inner: Msg,
+	) -> Self {
+		Self {
+			key,
+			args: args.into_args(),
+			key_args: Vec::new(),
+			inner: Some(Box::new((index, inner))),
 		}
 	}
 
@@ -51,6 +77,7 @@ impl Msg {
 			key,
 			args: args.into_args(),
 			key_args: vec![index],
+			inner: None,
 		}
 	}
 
@@ -63,7 +90,25 @@ impl Msg {
 			key,
 			args: args.into_args(),
 			key_args: indices.into_iter().collect(),
+			inner: None,
 		}
+	}
+
+	/// Heap bytes a retained message holds: its argument strings, nested
+	/// messages included.
+	pub fn heap_bytes(&self) -> usize {
+		self.args
+			.iter()
+			// The String headers are in the args Vec's capacity below.
+			.map(|arg| arg.capacity())
+			.chain(self.inner.iter().map(|boxed| {
+				std::mem::size_of::<(usize, Msg)>() + boxed.1.heap_bytes()
+			}))
+			.chain([
+				self.key_args.capacity() * std::mem::size_of::<usize>(),
+				self.args.capacity() * std::mem::size_of::<String>(),
+			])
+			.fold(0usize, usize::saturating_add)
 	}
 
 	pub fn render(&self, loc: Locale) -> String {
@@ -72,7 +117,11 @@ impl Msg {
 			.iter()
 			.enumerate()
 			.map(|(i, s)| {
-				if self.key_args.contains(&i) {
+				if let Some((_, inner)) =
+					self.inner.as_deref().filter(|(at, _)| *at == i)
+				{
+					inner.render(loc)
+				} else if self.key_args.contains(&i) {
 					let translated = t(s, loc);
 					if !translated.is_empty() {
 						translated.to_string()
@@ -86,6 +135,18 @@ impl Msg {
 			.collect();
 		let arg_refs: Vec<&str> = arg_strs.iter().map(|s| s.as_str()).collect();
 		tf(self.key, loc, &arg_refs)
+	}
+}
+
+impl From<String> for Msg {
+	fn from(text: String) -> Self {
+		Self::raw(text)
+	}
+}
+
+impl From<&str> for Msg {
+	fn from(text: &str) -> Self {
+		Self::raw(text)
 	}
 }
 
@@ -414,6 +475,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"paste_err_nothing" => "剪貼簿 payload 不包含任何檔案",
 			"paste_err_plan" => "無法建立貼上計畫: {}",
 			"paste_err_destination" => "無法使用貼上目的地「{}」: {}",
+			"paste_err_destination_detail" => "無法使用貼上目的地「{0}」: {1}：{2}",
 			"paste_err_destination_not_dir" => "貼上目的地「{}」不是資料夾",
 			"paste_outcome_unknown" => "連線中斷，無法確認貼上是否完成；請重新整理確認",
 			"preview_memory_limit" => "預覽資料超過 32 MiB 上限，未載入這次變更。請縮小預覽範圍。",
@@ -431,6 +493,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_binary" => "[二進位檔案，無法顯示文字預覽: {}]",
 			"error_preview" => "預覽「{}」失敗: {}",
 			"error_open_repo" => "開啟儲存庫失敗: {}",
+			"err_raw" => "{}",
 			"error_payload" => "產生 payload 失敗: {}",
 			"error_tree" => "讀取 commit 檔案樹失敗: {}",
 			"status_loading" => "載入中...",
@@ -831,6 +894,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"paste_err_nothing" => "Clipboard payload contains no files",
 			"paste_err_plan" => "Could not build the paste plan: {}",
 			"paste_err_destination" => "Cannot use paste destination \"{}\": {}",
+			"paste_err_destination_detail" => "Cannot use paste destination \"{0}\": {1}: {2}",
 			"paste_err_destination_not_dir" => "Paste destination \"{}\" is not a directory",
 			"paste_outcome_unknown" => "The connection was lost; whether the paste finished is unknown. Refresh to check.",
 			"preview_memory_limit" => "Preview data exceeds the 32 MiB limit. This change was not loaded. Choose a smaller preview.",
@@ -848,6 +912,7 @@ pub fn t(key: &str, loc: Locale) -> &'static str {
 			"error_binary" => "[Binary file, cannot display text preview: {}]",
 			"error_preview" => "Failed to preview '{}': {}",
 			"error_open_repo" => "Failed to open repository: {}",
+			"err_raw" => "{}",
 			"error_payload" => "Failed to generate payload: {}",
 			"error_tree" => "Failed to read commit tree: {}",
 			"status_loading" => "Loading...",
@@ -1167,6 +1232,7 @@ mod tests {
 			"remote_start_no_answer",
 			"remote_start_closed",
 			"remote_start_detail",
+			"err_raw",
 			"remote_scan_failed",
 			"remote_scan_incomplete",
 			"remote_refs_too_large",
@@ -1218,6 +1284,7 @@ mod tests {
 			"paste_err_plan",
 			"paste_err_destination",
 			"paste_err_destination_not_dir",
+			"paste_err_destination_detail",
 			"paste_commit_count",
 			"commit_no_message",
 			"commit_empty_note",

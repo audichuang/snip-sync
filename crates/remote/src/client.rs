@@ -1544,6 +1544,39 @@ impl Client {
 		}
 	}
 
+	/// Pools a connection whose transport died while idle: the next request
+	/// on it fails with a broken pipe before any reply and is resent on a
+	/// fresh worker (#206), for tests of that path.
+	#[doc(hidden)]
+	pub fn pool_a_dead_connection_for_tests(&self) {
+		struct Dead;
+		impl io::Write for Dead {
+			fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+				Err(io::Error::from(io::ErrorKind::BrokenPipe))
+			}
+			fn flush(&mut self) -> io::Result<()> {
+				Ok(())
+			}
+		}
+		self.keep(Connection {
+			writer: Box::new(Dead),
+			frames: mpsc::sync_channel(1).1,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: u32::MAX,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::default(),
+			in_flight: Arc::default(),
+			last_byte: StreamClock::new(),
+			call_started: Instant::now(),
+			call_base: 0,
+			frame_base: 0,
+		});
+	}
+
 	pub fn host(&self) -> &RemoteHost {
 		&self.host
 	}
@@ -1706,6 +1739,14 @@ impl Client {
 					Err(err @ RemoteError::WorkerTooOld { .. }) => {
 						return Err(err)
 					}
+					// A start failure with a known cause is what the user
+					// can act on; the dead pooled connection's I/O error is
+					// only how it showed.
+					Err(
+						err @ RemoteError::Start {
+							reason: Some(_), ..
+						},
+					) => return Err(err),
 					// Without a replacement, the original failure stands.
 					Err(_) => {}
 				}
@@ -1869,6 +1910,11 @@ impl Client {
 					Err(error @ RemoteError::WorkerTooOld { .. }) => {
 						return Err(error)
 					}
+					Err(
+						error @ RemoteError::Start {
+							reason: Some(_), ..
+						},
+					) => return Err(error),
 					Err(_) => {}
 				}
 			}
@@ -2093,6 +2139,11 @@ impl Client {
 					Err(error @ RemoteError::WorkerTooOld { .. }) => {
 						return Err(error)
 					}
+					Err(
+						error @ RemoteError::Start {
+							reason: Some(_), ..
+						},
+					) => return Err(error),
 					Err(_) => {}
 				}
 			}
@@ -2865,6 +2916,16 @@ impl From<RemoteError> for GitError {
 			| RemoteError::Stalled { .. } => GitError::Timeout {
 				args: "remote view".into(),
 				secs: GIT_CALL_LIMIT.as_secs(),
+			},
+			RemoteError::Start {
+				reason: Some(reason),
+				detail,
+				message,
+				..
+			} => GitError::HostStart {
+				reason,
+				detail,
+				message,
 			},
 			other => GitError::Host(other.to_string()),
 		}
@@ -3950,6 +4011,34 @@ mod tests {
 		};
 		assert!(matches!(GitError::from(err8), GitError::Host(_)));
 
+		// A worker that did not start keeps its known cause for the GUI, and
+		// the CLI's English text unchanged (#206).
+		let started = RemoteError::Start {
+			kind: ConnectFailureKind::WorkerUnavailable,
+			reason: Some(StartReason::NoWorker),
+			detail: "sh: snip: not found".into(),
+			message: "snip is not installed on that machine".into(),
+		};
+		let git = GitError::from(started);
+		assert!(
+			matches!(
+				git,
+				GitError::HostStart {
+					reason: StartReason::NoWorker,
+					..
+				}
+			),
+			"{git:?}"
+		);
+		assert_eq!(git.to_string(), "snip is not installed on that machine");
+		let unknown = RemoteError::Start {
+			kind: ConnectFailureKind::Other,
+			reason: None,
+			detail: "boom".into(),
+			message: "boom".into(),
+		};
+		assert!(matches!(GitError::from(unknown), GitError::Host(_)));
+
 		let err_too_large = RemoteError::Refused {
 			code: ErrorCode::TooLarge,
 			message: "refs payload exceeded frame limit".into(),
@@ -4241,6 +4330,102 @@ mod tests {
 			0,
 			"the queue is drained: a pooled connection is clean"
 		);
+	}
+
+	/// A pooled connection that dies mid-request, and a restart that fails
+	/// for a known reason: the caller gets the reason (it words it in its
+	/// own language), not the dead connection's English I/O text.
+	#[cfg(unix)]
+	#[test]
+	fn a_restart_that_fails_with_a_known_reason_outranks_the_dead_connection() {
+		struct DeadPipe;
+		impl io::Write for DeadPipe {
+			fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+				Err(io::Error::from(io::ErrorKind::BrokenPipe))
+			}
+			fn flush(&mut self) -> io::Result<()> {
+				Ok(())
+			}
+		}
+		let host = RemoteHost {
+			name: "gone".into(),
+			// The command exits 127 before any hello: snip is not there.
+			transport: Transport::Command(vec![
+				"/bin/sh".into(),
+				"-c".into(),
+				"exit 127".into(),
+			]),
+		};
+		let client = Client::new(host, "test".into());
+		let dead = test_conn(
+			Box::new(DeadPipe),
+			mpsc::sync_channel(1).1,
+			Arc::default(),
+			Arc::default(),
+		);
+		client.keep(dead);
+		let err = client
+			.call(&Request::Stat {
+				workspace: "w".into(),
+				path: "a".into(),
+			})
+			.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				RemoteError::Start {
+					reason: Some(StartReason::NoWorker),
+					..
+				}
+			),
+			"{err:?}"
+		);
+	}
+
+	/// The same precedence in the paste plans: a dead pooled connection,
+	/// then a restart that exits 127. Planning is read-only and resent once;
+	/// the known start reason outranks the dead connection's I/O error.
+	#[cfg(unix)]
+	#[test]
+	fn a_known_start_reason_outranks_the_dead_connection_in_paste_plans() {
+		let gone = || {
+			let client = Client::new(
+				RemoteHost {
+					name: "gone".into(),
+					transport: Transport::Command(vec![
+						"/bin/sh".into(),
+						"-c".into(),
+						"exit 127".into(),
+					]),
+				},
+				"test".into(),
+			);
+			client.pool_a_dead_connection_for_tests();
+			client
+		};
+		let no_worker = |err: &RemoteError| {
+			matches!(
+				err,
+				RemoteError::Start {
+					reason: Some(StartReason::NoWorker),
+					..
+				}
+			)
+		};
+		let err = gone()
+			.prepare_import("/w", "", "source", &PasteMapping::default(), None)
+			.unwrap_err();
+		assert!(no_worker(&err), "prepare_import: {err:?}");
+		let err = gone()
+			.prepare_replay(
+				"/w",
+				"",
+				"source",
+				snip_core::commits::CommitsPayload { commits: vec![] },
+				None,
+			)
+			.unwrap_err();
+		assert!(no_worker(&err), "prepare_replay: {err:?}");
 	}
 
 	/// A writer the write side can be parked inside, like `ChildStdin` on a
