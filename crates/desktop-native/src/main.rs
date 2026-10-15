@@ -5080,12 +5080,11 @@ impl WorkbenchModel {
 				dest: target_dest,
 				roots: known_roots,
 				generation: self.generation,
-				remote: self.remote.session.clone().map(|session| {
-					paste::RemotePaste {
-						session,
-						locale: self.locale,
-					}
-				}),
+				remote: self
+					.remote
+					.session
+					.clone()
+					.map(|session| paste::RemotePaste { session }),
 			},
 			cx,
 		);
@@ -12122,6 +12121,60 @@ mod tests {
 			assert_no_snip_in_zh(&status);
 		}
 
+		/// A paste preview opened in one language outlives a switch to the
+		/// other: when the worker is then lost and the mapping changes, the
+		/// replan's reason is worded in the language now in force, whole,
+		/// not as a wrapper in one language around the reason in the other
+		/// (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_paste_replan_after_a_language_switch_uses_the_new_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			// The preview opens in English...
+			cx.simulate_keystrokes("alt-l");
+			assert_eq!(
+				model.read_with(cx, |m, _| m.locale),
+				crate::i18n::Locale::En
+			);
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: .git/hooks/pre-commit\n#!/bin/sh\n// FILE: d.txt\nD\n",
+			);
+			// ...then the language is switched with the header button.
+			click_probed(&model, cx, "btn-locale");
+			assert_eq!(
+				model.read_with(cx, |m, _| m.locale),
+				crate::i18n::Locale::ZhTw
+			);
+			lose_the_worker(&model, cx);
+			model.update(cx, |m, cx| m.choose_paste_keep(".git", cx));
+			settle_until(cx, "the replan to fail", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.paste.is_loading()
+						&& m.status.key.starts_with("paste_err_destination")
+				})
+			});
+			let status = status_text(&model, cx);
+			assert!(status.contains("無法使用貼上目的地"), "{status}");
+			assert_no_snip_in_zh(&status);
+			// And back: the same stored message words itself in English.
+			cx.simulate_keystrokes("alt-l");
+			let status = status_text(&model, cx);
+			assert!(
+				status.contains("Cannot use paste destination"),
+				"{status}"
+			);
+			assert!(status.contains("is not installed"), "{status}");
+			assert!(!status.contains("沒有安裝"), "{status}");
+		}
+
 		/// Selecting a repository (a click on its row) when the worker cannot
 		/// restart: the Changes read fails and the status says why in the
 		/// interface language (#206).
@@ -12282,10 +12335,19 @@ mod tests {
 		) {
 			let _serial = remote_lock();
 			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
-			lose_the_worker(&model, cx);
+			// A pooled connection dies mid-request and the restart fails:
+			// the known start reason, not the dead connection's I/O error,
+			// is what the scan ends with.
+			lose_the_worker_at(&model, cx, true);
 			cx.simulate_keystrokes("cmd-r");
 			settle_until(cx, "the scan to fail", |cx| {
 				model.read_with(cx, |m, _| m.remote.scan_error.is_some())
+			});
+			// A known permanent start failure ends scan recovery at once:
+			// no delayed retry is left armed (the dead connection's I/O
+			// error would have kept one).
+			model.read_with(cx, |m, _| {
+				assert!(m.remote.scan_recovery.is_none(), "retry still armed");
 			});
 			let text = model.read_with(cx, |m, _| {
 				m.remote.scan_error.as_ref().unwrap().render(m.locale)

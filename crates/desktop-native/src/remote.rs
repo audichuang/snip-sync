@@ -680,19 +680,25 @@ pub fn describe_loc(err: RemoteError, loc: crate::i18n::Locale) -> String {
 	}
 }
 
+/// The dictionary key of a known start failure's wording. A message that
+/// outlives the language it was made in carries this key (a `Msg` key
+/// argument) and is worded when it is drawn.
+pub fn start_reason_key(reason: StartReason) -> &'static str {
+	match reason {
+		StartReason::NoWorker => "remote_start_no_worker",
+		StartReason::KeyLogin => "remote_start_key_login",
+		StartReason::NoAnswer => "remote_start_no_answer",
+		StartReason::Closed => "remote_start_closed",
+	}
+}
+
 /// The interface-language wording of a known start failure.
 pub fn start_text(
 	reason: StartReason,
 	detail: &str,
 	loc: crate::i18n::Locale,
 ) -> String {
-	let key = match reason {
-		StartReason::NoWorker => "remote_start_no_worker",
-		StartReason::KeyLogin => "remote_start_key_login",
-		StartReason::NoAnswer => "remote_start_no_answer",
-		StartReason::Closed => "remote_start_closed",
-	};
-	let text = crate::i18n::t(key, loc);
+	let text = crate::i18n::t(start_reason_key(reason), loc);
 	if detail.is_empty() || !matches!(reason, StartReason::KeyLogin) {
 		text.to_string()
 	} else {

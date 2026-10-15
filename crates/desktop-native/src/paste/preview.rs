@@ -787,7 +787,6 @@ mod tests {
 					path: ws.display().to_string(),
 				},
 			),
-			locale: crate::i18n::Locale::En,
 		};
 		let dest = remote.session.root.clone();
 		let mut s = PastePreview::new(None);

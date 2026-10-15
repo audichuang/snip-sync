@@ -4382,6 +4382,52 @@ mod tests {
 		);
 	}
 
+	/// The same precedence in the paste plans: a dead pooled connection,
+	/// then a restart that exits 127. Planning is read-only and resent once;
+	/// the known start reason outranks the dead connection's I/O error.
+	#[cfg(unix)]
+	#[test]
+	fn a_known_start_reason_outranks_the_dead_connection_in_paste_plans() {
+		let gone = || {
+			let client = Client::new(
+				RemoteHost {
+					name: "gone".into(),
+					transport: Transport::Command(vec![
+						"/bin/sh".into(),
+						"-c".into(),
+						"exit 127".into(),
+					]),
+				},
+				"test".into(),
+			);
+			client.pool_a_dead_connection_for_tests();
+			client
+		};
+		let no_worker = |err: &RemoteError| {
+			matches!(
+				err,
+				RemoteError::Start {
+					reason: Some(StartReason::NoWorker),
+					..
+				}
+			)
+		};
+		let err = gone()
+			.prepare_import("/w", "", "source", &PasteMapping::default(), None)
+			.unwrap_err();
+		assert!(no_worker(&err), "prepare_import: {err:?}");
+		let err = gone()
+			.prepare_replay(
+				"/w",
+				"",
+				"source",
+				snip_core::commits::CommitsPayload { commits: vec![] },
+				None,
+			)
+			.unwrap_err();
+		assert!(no_worker(&err), "prepare_replay: {err:?}");
+	}
+
 	/// A writer the write side can be parked inside, like `ChildStdin` on a
 	/// worker that stopped reading.
 	struct ParkedWriter(std::sync::Mutex<Option<mpsc::Receiver<()>>>);
