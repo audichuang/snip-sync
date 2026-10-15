@@ -89,3 +89,16 @@ Re-copy the new version's crate, re-apply the patches above, and rerun the deskt
 `scripts/check_native_ime.py` and `just native-lifecycle`. Drop the vendor
 copy once upstream resets the IC without relying on `composing`, stops the
 event loop when the X connection dies, truncates a copy of the text runs, checks a shown tooltip against its element's current bounds, and clears tooltips when the window is activated.
+
+`src/app/test_context.rs`, `TestAppContext::use_real_text_system` (with
+`src/app.rs`, `App::replace_text_system`, both `test-support` only): a test
+opts in to the OS text system (CoreText on macOS, cosmic-text on Linux)
+instead of `TestPlatform`'s `NoopTextSystem`, which measures every BMP char
+as 0.6em, so CJK is about 40% too narrow and truncation never shows in
+`#[gpui::test]`. Call it before opening a window; it returns `false` on
+Windows, where DirectWrite needs a GPU device (the caller skips there). No
+test is affected unless it calls it. CJK glyphs come from a system font
+(PingFang, fonts-noto-cjk), so widths are not equal across OSes: assert
+relations (wider than the Noop estimate, cut vs whole), not pixels. The
+test is `real_text_system_measures_cjk_and_the_log_labels_stay_readable`
+(#224); it runs in about 0.6 s, like its Noop siblings.

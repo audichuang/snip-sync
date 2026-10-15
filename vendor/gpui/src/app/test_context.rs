@@ -142,6 +142,28 @@ impl TestAppContext {
         }
     }
 
+    /// Replaces the test platform's `NoopTextSystem` (every BMP char 0.6em)
+    /// with the OS text system, so layout measures real glyph widths.
+    /// Opt-in per test; call before opening any window. Returns `false`
+    /// on Windows, where DirectWrite needs a GPU device and a window.
+    pub fn use_real_text_system(&mut self) -> bool {
+        #[cfg(target_os = "macos")]
+        let platform_ts: Arc<dyn crate::PlatformTextSystem> =
+            Arc::new(crate::platform::MacTextSystem::new());
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        let platform_ts: Arc<dyn crate::PlatformTextSystem> =
+            Arc::new(crate::platform::CosmicTextSystem::new());
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
+        return false;
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
+        {
+            let ts = Arc::new(TextSystem::new(platform_ts));
+            self.app.borrow_mut().replace_text_system(ts.clone());
+            self.text_system = ts;
+            true
+        }
+    }
+
     /// Create a single TestAppContext, for non-multi-client tests
     pub fn single() -> Self {
         let dispatcher = TestDispatcher::new(StdRng::seed_from_u64(0));

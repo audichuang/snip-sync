@@ -13551,6 +13551,58 @@ mod tests {
 			);
 		}
 
+		/// The test platform measures with `NoopTextSystem` (every char 0.6em),
+		/// so CJK is undercounted and truncation never shows (#224).
+		/// `use_real_text_system` swaps in the OS text system (CoreText on
+		/// macOS, cosmic-text on Linux; patch listed in vendor/gpui/SNIP_PATCH.md).
+		/// Windows is skipped: building DirectWrite without a window was not
+		/// attempted. Without an installed CJK font the CJK check fails.
+		#[gpui::test]
+		fn real_text_system_measures_cjk_and_the_log_labels_stay_readable(
+			cx: &mut TestAppContext,
+		) {
+			const TAG: &str = "\u{767c}\u{884c}\u{7248}\u{672c}-\u{4e2d}\u{6587}\u{6a19}\u{7c64}";
+			let size = crate::theme::SMALL_TEXT;
+			if !cx.use_real_text_system() {
+				assert!(
+					std::env::var_os("SNIP_REQUIRE_ALL_TESTS").is_none()
+						|| cfg!(windows),
+					"no real text system on this OS"
+				);
+				return;
+			}
+			let ws = tempfile::tempdir().unwrap();
+			head_with_labels(ws.path());
+			let r = ws.path().join("solo");
+			git(&r, &["tag", "-d", "v0.3.0"]);
+			git(&r, &["tag", TAG]);
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+			let cjk = cx.update(|w, _| crate::ui::text_width(w, TAG, size));
+			// What NoopTextSystem reports: 0.6em per char.
+			let noop = TAG.chars().count() as f32 * 0.6 * size;
+			assert!(cjk > noop * 1.3, "cjk {cjk} vs noop {noop}");
+			settle_until(cx, "the log rows", |cx| {
+				model.read_with(cx, |m, _| m.display_commits().len() >= 2)
+			});
+			settle(cx);
+			assert_eq!(
+				head_label_texts(&model, cx),
+				["main, origin/main", TAG]
+			);
+			let tag = cx.debug_bounds("log-ref-label:0:1").expect("tag label");
+			let natural =
+				cx.update(|w, _| 17. + crate::ui::text_width(w, TAG, size));
+			// The CJK tag is wider than the list leaves it, so it is
+			// ellipsized at 1080, yet keeps the icon and a few characters.
+			assert!(
+				f32::from(tag.size.width) >= 47. - 1.0,
+				"tag {:?}",
+				tag.size.width
+			);
+			assert!(f32::from(tag.size.width) < natural, "tag not cut");
+		}
+
 		/// A merge lists the files changed against any parent. Those the
 		/// first parent has as well are marked, and the marked set is keyed
 		/// by the merge (#188).

@@ -1442,6 +1442,12 @@ impl App {
         &self.asset_source
     }
 
+    /// Test-only: swaps the text system (snip patch, see SNIP_PATCH.md).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn replace_text_system(&mut self, text_system: Arc<TextSystem>) {
+        self.text_system = text_system;
+    }
+
     /// Accessor for the text system.
     pub fn text_system(&self) -> &Arc<TextSystem> {
         &self.text_system
