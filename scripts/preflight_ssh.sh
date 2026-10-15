@@ -34,7 +34,7 @@ if [ "${1:-}" = --remote ]; then
 
 	# The ssh session ending does not stop its container; kill it by name on any exit.
 	# A closed session shows as SIGPIPE on the next write.
-	# shellcheck disable=SC2329 # runs as the EXIT trap
+	# shellcheck disable=SC2317,SC2329 # runs as the EXIT trap (0.9 says SC2317, newer SC2329)
 	finish() {
 		local rc=$?
 		trap '' EXIT INT TERM HUP PIPE
@@ -155,7 +155,7 @@ name="snip-preflight-ssh-$run"
 
 # Killing the ssh client does not stop the host's container, so kill it there as well.
 finished=0
-# shellcheck disable=SC2329 # runs as the EXIT trap
+# shellcheck disable=SC2317,SC2329 # runs as the EXIT trap (0.9 says SC2317, newer SC2329)
 cleanup() {
 	if [ "$finished" = 0 ]; then
 		# shellcheck disable=SC2029 # expands here on purpose

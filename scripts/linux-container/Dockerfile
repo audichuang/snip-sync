@@ -38,7 +38,8 @@ RUN arch="$(dpkg --print-architecture)" \
     && curl -sSf https://just.systems/install.sh | bash -s -- --tag "${JUST_VERSION}" --to /usr/local/bin \
     && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
         --default-toolchain stable --component rustfmt,clippy \
-    && cargo install cargo-nextest --locked \
+    && nextest_os="$(echo "$arch" | sed 's/amd64/linux/; s/arm64/linux-arm/')" \
+    && curl -sSfL "https://get.nexte.st/latest/${nextest_os}" | tar -xz -C /opt/cargo/bin \
     && rm -rf /opt/rustup/toolchains/*/share/doc /opt/rustup/downloads /opt/rustup/tmp \
     && chown -R ubuntu:ubuntu /opt/cargo
 
