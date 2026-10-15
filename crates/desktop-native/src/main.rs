@@ -3264,6 +3264,23 @@ impl WorkbenchModel {
 		None
 	}
 
+	/// A paste preview opened (or remapped) before the scan finished lists
+	/// only the repos known then: add the ones found since. Runs when the
+	/// scan finishes and whenever a preview job lands, since a job in flight
+	/// at the scan's end hands back the old candidates.
+	fn refresh_paste_candidates(&mut self, cx: &mut Context<Self>) {
+		let roots: Vec<PathBuf> =
+			self.repos.iter().map(|r| r.root.clone()).collect();
+		match self.paste.refresh_candidates(&roots, self.preview.as_ref()) {
+			Ok(true) => {
+				app_log!("[APP:PASTE_CANDIDATES_REFRESHED]");
+				cx.notify();
+			}
+			Ok(false) => {}
+			Err(err) => self.set_status_msg(err),
+		}
+	}
+
 	fn finish_discovery(&mut self, cx: &mut Context<Self>) {
 		self.is_loading = false;
 		if self.discovery_error_overflow > 0 {
@@ -3320,18 +3337,7 @@ impl WorkbenchModel {
 		self.sync_change_slots();
 		self.start_changes_queue(false, cx);
 		self.sync_log_scope(cx);
-		// A paste preview opened before this scan finished listed only the
-		// repos known then: add the ones found since.
-		let roots: Vec<PathBuf> =
-			self.repos.iter().map(|r| r.root.clone()).collect();
-		match self.paste.refresh_candidates(&roots, self.preview.as_ref()) {
-			Ok(true) => {
-				app_log!("[APP:PASTE_CANDIDATES_REFRESHED]");
-				cx.notify();
-			}
-			Ok(false) => {}
-			Err(err) => self.set_status_msg(err),
-		}
+		self.refresh_paste_candidates(cx);
 		app_log!("[APP:READY_REPOS: {}]", self.repos.len());
 		if e2e_on() {
 			for r in &self.repos {
@@ -4971,6 +4977,7 @@ impl WorkbenchModel {
 		}
 		match landed {
 			Some(paste::preview::Landed::Shown { remap }) => {
+				self.refresh_paste_candidates(cx);
 				self.show_landed_plan(remap);
 				let selected_idx =
 					self.paste.plan().map(|p| p.selected_item_idx).unwrap_or(0);
@@ -15478,6 +15485,47 @@ mod tests {
 						before[..],
 						"existing candidates keep their index"
 					);
+				}
+			});
+		}
+
+		/// The scan finishing while a remap job is in flight: the plan that
+		/// lands carries the old candidates, and still gains the new repo.
+		#[gpui::test]
+		fn paste_candidates_follow_the_scan_during_a_remap(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let a = repo(ws.path(), "a", &[]);
+			let b = repo(ws.path(), "b", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), Some(a));
+			settle_until(cx, "both repos found", |cx| {
+				model.read_with(cx, |m, _| m.repos.len() == 2)
+			});
+			let late = model.update(cx, |m, _| m.repos.pop().unwrap());
+			paste(&model, cx, "// FILE: x/one.txt\n1\n");
+			let b = dunce::canonicalize(b).unwrap();
+			model.update_in(cx, |m, _, cx| {
+				m.choose_paste_prefix("x", 0, cx);
+				assert!(m.paste.is_loading(), "remap job in flight");
+				m.repos.push(late);
+				m.finish_discovery(cx);
+				assert!(m.paste.is_loading(), "refresh skipped while loading");
+			});
+			for _ in 0..100 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+					break;
+				}
+				std::thread::sleep(snip_native_e2e::scaled(
+					Duration::from_millis(10),
+				));
+			}
+			model.read_with(cx, |m, _| {
+				assert!(!m.paste.is_loading(), "remap did not land");
+				for choice in &m.paste.plan().unwrap().prefix_choices {
+					assert!(choice.candidates.contains(&b));
 				}
 			});
 		}
