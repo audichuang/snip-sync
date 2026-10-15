@@ -7,6 +7,7 @@ impl WorkbenchModel {
 	pub(super) fn render_log(
 		&self,
 		height: f32,
+		window: &Window,
 		cx: &mut Context<Self>,
 	) -> AnyElement {
 		let loc = self.locale;
@@ -305,6 +306,25 @@ impl WorkbenchModel {
 			.unwrap_or(40.0);
 		let rows = self.display_commits();
 		let n = rows.len();
+		// The widest ref-label group any row has: columns give way to it
+		// only as far as it needs (#216).
+		let measure = |s: &str| text_width(window, s, SMALL_TEXT);
+		let labels_w = self.graph_layout.as_ref().map_or(0., |l| {
+			l.rows
+				.iter()
+				.zip(rows.iter())
+				.filter(|(r, _)| !r.refs.is_empty())
+				.map(|(r, c)| {
+					ref_labels_width(
+						&r.refs,
+						self.log_current_branch(&c.sha).as_deref(),
+						&measure,
+					)
+				})
+				.fold(0., f32::max)
+		});
+		let date_need =
+			date_need_w(loc, &|s: &str| text_width(window, s, UI_TEXT));
 		// Tint rows on the current branch only when others are shown too.
 		let on_head: Rc<Vec<bool>> = {
 			let marks: HashMap<&str, bool> = self
@@ -328,12 +348,8 @@ impl WorkbenchModel {
 			self.log_scroll.0.borrow().base_handle.bounds().size.width,
 		);
 		// One set of column widths for every row, so lanes line up.
-		let has_labels = self
-			.graph_layout
-			.as_ref()
-			.is_some_and(|l| l.rows.iter().any(|r| !r.refs.is_empty()));
 		let cols = if list_w > 0. {
-			list_cols(list_w, gutter_w, has_labels, self.log_show_hash)
+			list_cols(list_w, gutter_w, labels_w, date_need, self.log_show_hash)
 		} else {
 			ListCols {
 				gutter: gutter_w,
