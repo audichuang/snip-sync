@@ -11886,6 +11886,18 @@ mod tests {
 			model: &Entity<WorkbenchModel>,
 			cx: &mut VisualTestContext,
 		) {
+			lose_the_worker_at(model, cx, false);
+		}
+
+		/// [`lose_the_worker`]; with `mid_request` the client also holds a
+		/// pooled connection that died, so the first request fails on it
+		/// and the failed restart follows in the same call.
+		#[cfg(unix)]
+		fn lose_the_worker_at(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			mid_request: bool,
+		) {
 			model.update(cx, |m, _| {
 				let session = m.remote.session.as_mut().expect("connected");
 				let gone = std::sync::Arc::new(snip_remote::Client::new(
@@ -11899,6 +11911,9 @@ mod tests {
 					},
 					"test-mac".into(),
 				));
+				if mid_request {
+					gone.pool_a_dead_connection_for_tests();
+				}
 				session.client = gone.clone();
 				// A paste plan keeps its own copy of the session.
 				if let Some(remote) =
@@ -11988,6 +12003,29 @@ mod tests {
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 			lose_the_worker(&model, cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let status = model.read_with(cx, |m, _| m.status.render(m.locale));
+			assert!(status.contains("產生 payload 失敗"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// The first failure of a request that was in flight when the worker
+		/// died (#206): the pooled connection breaks, the restart fails, and
+		/// the status still says why in the interface language.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_copy_losing_the_worker_mid_request_says_why_at_once(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			lose_the_worker_at(&model, cx, true);
 			cx.simulate_keystrokes("cmd-c");
 			settle_until(cx, "the copy to end", |cx| {
 				model.read_with(cx, |m, _| !m.is_copying)
