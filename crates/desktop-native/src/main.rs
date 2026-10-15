@@ -828,7 +828,10 @@ pub struct WorkbenchModel {
 	// Reader.
 	pub preview: Option<Preview>,
 	pub preview_loading: bool,
-	/// The read in flight came from the Log selection (commit, compare).
+	/// The latest preview read came from the Log (commit, compare,
+	/// multi-selection, commit file or commit tree). Only a Project/Changes
+	/// read or `clear_commit_selection` resets it, so it outlives
+	/// `preview_loading` (#202).
 	pub preview_pending_from_log: bool,
 	pub preview_error: Option<Msg>,
 	pub reader: Reader,
