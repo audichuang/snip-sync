@@ -5948,6 +5948,8 @@ fn resolve_added_repo(
 pub enum PreviewErr {
 	/// Over the 1 MiB preview limit, on any host.
 	TooLarge,
+	/// The diff output, not the file, passed the preview limit.
+	PatchTooLarge,
 	Failed(Msg),
 }
 
@@ -5968,6 +5970,9 @@ impl PreviewErr {
 	pub(crate) fn git(e: snip_core::gitsrc::GitError) -> Self {
 		match e {
 			snip_core::gitsrc::GitError::OutputLimit { .. } => Self::TooLarge,
+			snip_core::gitsrc::GitError::PatchLimit { .. } => {
+				Self::PatchTooLarge
+			}
 			other => Self::Failed(remote::git_error_msg(other)),
 		}
 	}
@@ -5987,6 +5992,9 @@ impl std::fmt::Display for PreviewErr {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::TooLarge => f.write_str("over the 1 MiB preview limit"),
+			Self::PatchTooLarge => {
+				f.write_str("diff output over the preview limit")
+			}
 			Self::Failed(m) => f.write_str(&m.render(Locale::ZhTw)),
 		}
 	}
@@ -5997,6 +6005,9 @@ impl PreviewErr {
 	pub(crate) fn msg(self, path: String) -> Msg {
 		match self {
 			Self::TooLarge => Msg::new("error_preview_too_large", [path]),
+			Self::PatchTooLarge => {
+				Msg::new("error_preview_patch_too_large", [path])
+			}
 			Self::Failed(e) => {
 				Msg::with_msg_arg("error_preview", [path, String::new()], 1, e)
 			}
@@ -6606,6 +6617,23 @@ mod tests {
 			)),
 			PreviewErr::TooLarge
 		);
+		// The synthesized patch overflowing is not the file being too large
+		// (#214).
+		assert_eq!(
+			PreviewErr::git(GitError::PatchLimit {
+				path: "big.txt".into(),
+				limit: 1048576,
+			}),
+			PreviewErr::PatchTooLarge
+		);
+		let text = PreviewErr::PatchTooLarge
+			.msg("big.txt".into())
+			.render(crate::i18n::Locale::ZhTw);
+		assert!(text.contains("big.txt") && text.contains("差異"), "{text}");
+		let text = PreviewErr::PatchTooLarge
+			.msg("big.txt".into())
+			.render(crate::i18n::Locale::En);
+		assert!(text.contains("big.txt") && text.contains("diff"), "{text}");
 		assert!(matches!(
 			PreviewErr::git(GitError::Host("boom".into())),
 			PreviewErr::Failed(_)

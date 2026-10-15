@@ -758,7 +758,7 @@ pub(crate) fn map_git_error_with_leaked(
 			ErrorCode::TooLarge,
 			scrub(&format!("repository too large to verify: {what}"), share),
 		),
-		GitError::OutputLimit { .. } => (
+		GitError::OutputLimit { .. } | GitError::PatchLimit { .. } => (
 			ErrorCode::TooLarge,
 			"the result is too large to send; narrow the request".into(),
 		),

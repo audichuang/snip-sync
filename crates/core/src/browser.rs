@@ -906,8 +906,8 @@ fn finish_preview(
 		if let Some(content) = &content {
 			let (synth, cut) = new_file_patch(path, content, max);
 			if cut && opts.overflow == Overflow::Error {
-				return Err(GitError::OutputLimit {
-					args: format!("preview patch {path}"),
+				return Err(GitError::PatchLimit {
+					path: path.to_string(),
 					limit: max,
 				});
 			}
@@ -1282,13 +1282,16 @@ mod tests {
 		assert!(cut.patch.len() <= PREVIEW_LIMIT);
 		assert_hunks_consistent(&cut.patch);
 		// The only check of a synthesized patch cut under Overflow::Error.
-		assert!(git_preview_with(
-			&git,
-			&GitSource::Working,
-			"new.txt",
-			&strict_preview()
-		)
-		.is_err());
+		// It is the patch, not the file, that overflowed (#214).
+		assert!(matches!(
+			git_preview_with(
+				&git,
+				&GitSource::Working,
+				"new.txt",
+				&strict_preview()
+			),
+			Err(GitError::PatchLimit { ref path, .. }) if path == "new.txt"
+		));
 		assert!(git_preview_for(
 			&git,
 			&GitSource::Working,

@@ -79,6 +79,10 @@ pub enum GitError {
 	WorktreeBusy { args: String },
 	#[error("git {args} output exceeds {limit} bytes")]
 	OutputLimit { args: String, limit: usize },
+	/// The synthesized preview patch of `path` passed `limit` bytes, while
+	/// the file itself may be within the preview limit.
+	#[error("preview patch of {path} exceeds {limit} bytes")]
+	PatchLimit { path: String, limit: usize },
 	#[error("git {args} exited but a detached process kept its output open")]
 	OutputHeldOpen { args: String },
 	#[error(
