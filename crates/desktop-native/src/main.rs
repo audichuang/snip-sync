@@ -10473,9 +10473,16 @@ mod tests {
 				},
 			);
 			model.update(cx, |m, cx| {
-				m.set_status_msg(Msg::new(
-					"error_repo_status",
-					["boom".to_string()],
+				// The exact #208 shape: a worker start failure wrapped as
+				// the remote scan failure, worded when drawn.
+				m.set_status_msg(Msg::with_msg_arg(
+					"remote_scan_failed",
+					[String::new()],
+					0,
+					crate::remote::start_msg(
+						snip_remote::StartReason::NoWorker,
+						"",
+					),
 				));
 				cx.notify();
 			});
@@ -10491,7 +10498,7 @@ mod tests {
 			};
 			let note_in = |cx: &mut VisualTestContext, loc: Locale| {
 				model.read_with(cx, |m, _| {
-					m.change_note_text(slot, loc).expect("a note").0
+					m.change_note_text(slot, loc).expect("a note").text
 				})
 			};
 			let up = |cx: &mut VisualTestContext, text: &str| {
@@ -10531,6 +10538,121 @@ mod tests {
 			assert_eq!(locale_now(&model, cx), Locale::ZhTw);
 			assert!(up(cx, &zh_n), "note tooltip follows: {zh_n}");
 			assert!(!up(cx, &en_n), "the old note text is gone");
+		}
+
+		/// A tooltip that stays open while the repo list is reordered or
+		/// shrunk under it must keep describing the same repo, or vanish,
+		/// never describe another (#208).
+		#[gpui::test]
+		fn an_open_note_tooltip_follows_its_repo_not_its_row_position(
+			cx: &mut TestAppContext,
+		) {
+			use crate::i18n::Msg;
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			let failed = |name: &str, why: &str| crate::ChangeRepo {
+				root: tmp.path().join(name),
+				name: name.into(),
+				state: crate::ChangeRepoState::Failed(Msg::new(
+					"error_repo_status",
+					[why.to_string()],
+				)),
+				total: 0,
+			};
+			model.update(cx, |m, cx| {
+				m.repos = vec![
+					make_test_repo(tmp.path().join("ra"), "ra"),
+					make_test_repo(tmp.path().join("rb"), "rb"),
+				];
+				m.change_repos =
+					vec![failed("ra", "why-alpha"), failed("rb", "why-beta")];
+				// Each repo keeps a row, so its note sits under it
+				// instead of folding into the unreadable node.
+				m.files = vec![
+					make_test_file("a.txt", 0),
+					make_test_file("b.txt", 1),
+				];
+				m.workspace_open = true;
+				m.active_tab = WorkbenchTab::GitChanges;
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+				// Repo rows start collapsed; open them to show the notes.
+				let open: Vec<_> = m
+					.change_item_rows()
+					.into_iter()
+					.filter_map(|r| match r {
+						crate::ui::ChangeItemRow::Repo {
+							slot,
+							group_id,
+							..
+						} => Some((group_id, m.change_repos[slot].root.clone())),
+						_ => None,
+					})
+					.collect();
+				m.chrome.expanded_repos.extend(open);
+				cx.notify();
+			});
+			settle(cx);
+			let note = |cx: &mut VisualTestContext, name: &str| {
+				model.read_with(cx, |m, _| {
+					m.change_note_text_for(&tmp.path().join(name), m.locale)
+						.expect("a note")
+						.text
+				})
+			};
+			let (a, b) = (note(cx, "ra"), note(cx, "rb"));
+			assert_ne!(a, b);
+			let up = |cx: &mut VisualTestContext, text: &str| {
+				cx.run_until_parked();
+				let key: &'static str =
+					Box::leak(format!("tooltip:{text}").into_boxed_str());
+				cx.debug_bounds(key).is_some()
+			};
+			cx.run_until_parked();
+			let at = cx
+				.debug_bounds("change-note:rb")
+				.expect("rb note row")
+				.center();
+			cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+			cx.executor().advance_clock(Duration::from_millis(700));
+			settle(cx);
+			let b_now = note(cx, "rb");
+			assert!(up(cx, &b_now), "rb tooltip shown: {b_now}");
+
+			// A clean repo found ahead of both (a rescan's new order): it
+			// draws no row, so rb's note stays under the pointer while its
+			// slot moves from 1 to 2, where a position would read ra's.
+			model.update(cx, |m, cx| {
+				m.change_repos.insert(
+					0,
+					crate::ChangeRepo {
+						root: tmp.path().join("r0"),
+						name: "r0".into(),
+						state: crate::ChangeRepoState::Loaded,
+						total: 0,
+					},
+				);
+				m.files = vec![
+					make_test_file("a.txt", 1),
+					make_test_file("b.txt", 2),
+				];
+				cx.notify();
+			});
+			settle(cx);
+			assert!(up(cx, &b_now), "still rb's text after a reorder");
+			assert!(!up(cx, &a), "never ra's text under rb's pointer");
+
+			// Shrunk: rb is gone, so its tooltip is too, and ra's does not
+			// take its place.
+			model.update(cx, |m, cx| {
+				m.change_repos.retain(|r| r.name != "rb");
+				m.files = vec![make_test_file("a.txt", 1)];
+				cx.notify();
+			});
+			settle(cx);
+			assert!(!up(cx, &b_now), "rb's text is gone with rb");
+			assert!(!up(cx, &a), "ra's text does not take over");
 		}
 
 		#[gpui::test]

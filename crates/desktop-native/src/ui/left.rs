@@ -635,14 +635,18 @@ impl WorkbenchModel {
 					.when(!cursor, |d| d.hover(|s| s.bg(rgb(pal().hover_bg))))
 					.when(self.chrome.menu.is_none(), |d| {
 						// Carries the locale-dependent counts legend (#208).
+						// Found by root, not row position: a rescan can
+						// reorder or shrink `repos` under an open tooltip.
 						let model = cx.weak_entity();
+						let root = repo.root.clone();
 						d.tooltip(live_tip(move |cx| {
 							model
 								.upgrade()
 								.and_then(|m| {
 									let m = m.read(cx);
 									m.repos
-										.get(idx)
+										.iter()
+										.find(|r| r.root == root)
 										.map(|r| m.project_repo_tooltip(r))
 								})
 								.unwrap_or_default()

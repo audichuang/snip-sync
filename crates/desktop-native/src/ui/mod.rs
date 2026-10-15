@@ -485,6 +485,10 @@ impl Render for Tip {
 		cx: &mut Context<Self>,
 	) -> impl IntoElement {
 		let text = (self.0)(cx);
+		if text.is_empty() {
+			// The thing it described is gone: no empty box.
+			return div();
+		}
 		div()
 			.px_2()
 			.py_1()

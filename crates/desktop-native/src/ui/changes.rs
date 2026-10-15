@@ -47,6 +47,13 @@ pub enum ChangeItemRow {
 	},
 }
 
+/// A Changes note row's text, colour and whether it sits at the top level.
+pub(crate) struct ChangeNote {
+	pub text: String,
+	pub color: u32,
+	pub top: bool,
+}
+
 impl ChangeItemRow {
 	/// Tree level: 0 for a group, `None` for a note (never a parent).
 	pub(crate) fn depth(&self) -> Option<usize> {
@@ -729,7 +736,7 @@ impl WorkbenchModel {
 		&self,
 		slot: usize,
 		loc: crate::i18n::Locale,
-	) -> Option<(String, u32)> {
+	) -> Option<ChangeNote> {
 		let repo = self.change_repos.get(slot)?;
 		let kept = crate::slot_range(&self.files, slot).len();
 		let (text, color) = match &repo.state {
@@ -757,7 +764,18 @@ impl WorkbenchModel {
 		} else {
 			text
 		};
-		Some((text, color))
+		Some(ChangeNote { text, color, top })
+	}
+
+	/// The same note found by its repo's root, for a tooltip that outlives
+	/// the row's position: a rescan can move or drop the slot (#208).
+	pub(crate) fn change_note_text_for(
+		&self,
+		root: &std::path::Path,
+		loc: crate::i18n::Locale,
+	) -> Option<ChangeNote> {
+		let slot = self.change_repos.iter().position(|r| r.root == root)?;
+		self.change_note_text(slot, loc)
 	}
 
 	/// A repo's read error or the notice that its list was cut at the cap.
@@ -770,11 +788,12 @@ impl WorkbenchModel {
 		let Some(repo) = self.change_repos.get(slot) else {
 			return div().into_any_element();
 		};
-		let Some((text, color)) = self.change_note_text(slot, loc) else {
+		let Some(ChangeNote { text, color, top }) =
+			self.change_note_text(slot, loc)
+		else {
 			return div().into_any_element();
 		};
-		let kept = crate::slot_range(&self.files, slot).len();
-		let top = self.change_repos.len() > 1 && kept == 0;
+		let root = repo.root.clone();
 		let folded = top
 			&& unreadable_slots(&self.change_repos, &self.files).len()
 				>= UNREADABLE_MIN;
@@ -811,9 +830,9 @@ impl WorkbenchModel {
 						.upgrade()
 						.and_then(|m| {
 							let m = m.read(cx);
-							m.change_note_text(slot, m.locale)
+							m.change_note_text_for(&root, m.locale)
 						})
-						.map(|(t, _)| t.into())
+						.map(|n| n.text.into())
 						.unwrap_or_default()
 				}))
 			})
