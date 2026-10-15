@@ -346,20 +346,31 @@ impl PastePreview {
 		if plan.is_applying {
 			return Ok(false);
 		}
-		let before: Vec<usize> = plan
+		// Never mutate the admitted plan before admission: build the additions
+		// on copies and keep the admitted allocations aside, so a refusal puts
+		// back exactly what was admitted (a truncate keeps the grown capacity,
+		// which the budget counts).
+		let admitted: Vec<Vec<PathBuf>> = plan
 			.prefix_choices
-			.iter()
-			.map(|c| c.candidates.len())
+			.iter_mut()
+			.map(|c| {
+				let copy = c.candidates.clone();
+				std::mem::replace(&mut c.candidates, copy)
+			})
 			.collect();
 		let seen = plan.seen_roots;
 		if !plan.add_candidates(known_roots) {
+			for (choice, kept) in plan.prefix_choices.iter_mut().zip(admitted) {
+				choice.candidates = kept;
+			}
+			// Nothing to add: the digest still moves on, as it always did.
 			return Ok(false);
 		}
 		if let Err(err) =
 			pending.admit_ui(ordinary, Some(&*plan), self.detail.as_ref())
 		{
-			for (choice, n) in plan.prefix_choices.iter_mut().zip(before) {
-				choice.candidates.truncate(n);
+			for (choice, kept) in plan.prefix_choices.iter_mut().zip(admitted) {
+				choice.candidates = kept;
 			}
 			// The set was not admitted, so it is still news next time.
 			plan.seen_roots = seen;
@@ -972,10 +983,27 @@ mod tests {
 		};
 		let before = count(&s);
 		fill_budget(&s, &mut o);
+		let retained = s.plan().unwrap().retained_bytes();
 		let roots = [ws.clone(), repo.clone()];
 		let err = s.refresh_candidates(&roots, Some(&o)).unwrap_err();
 		assert_eq!(err.key, "preview_memory_limit");
 		assert_eq!(count(&s), before, "the refused candidates are gone");
+		assert_eq!(
+			s.plan().unwrap().retained_bytes(),
+			retained,
+			"a refusal restores the admitted plan, capacity included"
+		);
+		// Enter with unresolved mappings records an error against the same
+		// full budget; it must not trip the release assertion.
+		s.record_error(
+			Msg {
+				key: "paste_mapping_unresolved",
+				args: vec!["x".repeat(40)],
+				key_args: Vec::new(),
+				inner: None,
+			},
+			Some(&o),
+		);
 		// Room again: the same set is still news and is admitted.
 		let small = small_ordinary();
 		s.admit_ordinary(Some(&small)).unwrap();
