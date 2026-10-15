@@ -346,7 +346,7 @@ impl Probes {
 
 	/// Test only: where a control was last drawn, in physical pixels
 	/// `[x, y, w, h]`: what an operator reads from `[APP:CTRL_BOUNDS]`.
-	#[cfg(all(test, unix))]
+	#[cfg(test)]
 	pub fn bounds(&self, id: &str) -> Option<[i32; 4]> {
 		let f = self.0.borrow();
 		f.seen.get(id).or_else(|| f.shown.get(id)).copied()
