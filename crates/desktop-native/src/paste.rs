@@ -133,18 +133,10 @@ impl PasteOutcome {
 	fn bytes(&self) -> usize {
 		match &self.result {
 			Ok(plan) => plan.retained_bytes(),
-			Err(err) => msg_heap_bytes(err),
+			Err(err) => err.heap_bytes(),
 		}
 		.saturating_add(self.remap.as_ref().map_or(0, |(p, _)| p.capacity()))
 	}
-}
-
-fn msg_heap_bytes(msg: &Msg) -> usize {
-	msg.args
-		.iter()
-		.fold(msg.args.capacity() * size_of::<String>(), |n, s| {
-			n.saturating_add(s.capacity())
-		})
 }
 
 /// One paste-specific mailbox, not a general job/resource manager. The UI's
@@ -834,9 +826,16 @@ fn destination_msg(
 	let shown =
 		remote.map_or_else(|| path.display().to_string(), |r| r.shown(path));
 	let why = match err {
-		PasteError::Remote(e) | PasteError::OutcomeUnknown(e) => {
-			crate::remote::describe(e)
-		}
+		PasteError::Remote(e) | PasteError::OutcomeUnknown(e) => match e {
+			// Worded when drawn, in the language then in force: a plan
+			// outlives a switch of language.
+			RemoteError::Start {
+				reason: Some(reason),
+				detail,
+				..
+			} => return start_destination_msg(shown, reason, detail),
+			other => crate::remote::describe(other),
+		},
 		PasteError::Local(e) => e.to_string(),
 		PasteError::Destination { source, .. } => source.to_string(),
 		// Worded as the app always did: a protocol error of the worker.
@@ -845,6 +844,29 @@ fn destination_msg(
 		),
 	};
 	Msg::new("paste_err_destination", [shown, why])
+}
+
+/// A destination whose worker did not start, for a known reason. The
+/// reason travels as its dictionary key, so the message is worded in the
+/// language in force when it is drawn.
+fn start_destination_msg(
+	shown: String,
+	reason: snip_core::gitsrc::StartReason,
+	detail: String,
+) -> Msg {
+	let key = crate::remote::start_reason_key(reason);
+	// The transport's detail is only the useful part of a key login.
+	if detail.is_empty()
+		|| !matches!(reason, snip_core::gitsrc::StartReason::KeyLogin)
+	{
+		Msg::with_key_arg("paste_err_destination", [shown, key.into()], 1)
+	} else {
+		Msg::with_key_arg(
+			"paste_err_destination_detail",
+			[shown, key.into(), detail],
+			1,
+		)
+	}
 }
 
 /// A stale destination's reason as the message the app shows.
@@ -1270,7 +1292,7 @@ impl PastePreviewPlan {
 				.saturating_add(item.dest_root_name.capacity())
 				.saturating_add(item.dest_path.capacity());
 		}
-		bytes.saturating_add(self.error.as_ref().map_or(0, msg_heap_bytes))
+		bytes.saturating_add(self.error.as_ref().map_or(0, Msg::heap_bytes))
 	}
 
 	/// A complete mapping shell alone does not authorize any write.
@@ -2543,6 +2565,43 @@ pub(crate) mod tests {
 			.key,
 			"paste_err_destination"
 		);
+	}
+
+	/// A known start failure words itself when drawn, in either language,
+	/// with a key login's transport detail kept.
+	#[test]
+	fn a_start_failure_in_a_destination_message_follows_the_drawing_language() {
+		use snip_core::gitsrc::StartReason;
+		use snip_remote::{ConnectFailureKind, RemoteError};
+		let start = |reason, detail: &str| {
+			destination_msg(
+				None,
+				Path::new("/w"),
+				PasteError::Remote(RemoteError::Start {
+					kind: ConnectFailureKind::Other,
+					reason: Some(reason),
+					detail: detail.into(),
+					message: "english".into(),
+				}),
+			)
+		};
+		let no_worker = start(StartReason::NoWorker, "");
+		assert!(no_worker.render(Locale::ZhTw).contains("沒有安裝 snip"));
+		assert!(no_worker.render(Locale::En).contains("is not installed"));
+		let login = start(StartReason::KeyLogin, "Permission denied");
+		for loc in [Locale::ZhTw, Locale::En] {
+			let text = login.render(loc);
+			assert!(text.contains("Permission denied"), "{text}");
+			assert!(text.contains("/w"), "{text}");
+			assert_ne!(
+				text,
+				login.render(if loc == Locale::En {
+					Locale::ZhTw
+				} else {
+					Locale::En
+				})
+			);
+		}
 	}
 
 	#[test]

@@ -63,6 +63,16 @@ WT31). The `#[gpui::test]`
 `a_tab_tooltip_goes_when_the_strip_scrolls_it_away` fails without this
 patch.
 
+`src/window.rs`, `Window::mouse_position_stale`, and `src/elements/div.rs`,
+`check_is_hovered` / `check_is_hovered_during_prepaint`: a native dialog moves
+the pointer without telling the window, so a tooltip stayed up after it and
+covered the control under the dialog's old position (#203). `on_active_status_change`
+sets the flag; a MouseMove, MouseDown, MouseUp or ScrollWheel in `dispatch_event`
+clears it; while it is set both tooltip hover checks fail. The `.hover(...)`
+style still uses the old hit test, so a tab or button can keep its hover
+background until the next mouse event (accepted). The `#[gpui::test]`
+`a_tooltip_goes_when_the_window_regains_focus` fails without this patch.
+
 `src/window.rs`, `Frame::clear`: under `test-support`, also clear
 `debug_bounds`. Upstream never cleared it, so `VisualTestContext::debug_bounds`
 kept every selector any earlier frame had painted. A test could not see that
@@ -78,4 +88,4 @@ errors on every CI platform. The in-source allow restores registry behaviour.
 Re-copy the new version's crate, re-apply the patches above, and rerun the desktop `#[gpui::test]`s,
 `scripts/check_native_ime.py` and `just native-lifecycle`. Drop the vendor
 copy once upstream resets the IC without relying on `composing`, stops the
-event loop when the X connection dies, truncates a copy of the text runs, and checks a shown tooltip against its element's current bounds.
+event loop when the X connection dies, truncates a copy of the text runs, checks a shown tooltip against its element's current bounds, and clears tooltips when the window is activated.

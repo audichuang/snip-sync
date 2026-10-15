@@ -359,7 +359,7 @@ pub const MAX_CHANGES_READS: usize = 2;
 pub enum ChangeRepoState {
 	Loading,
 	Loaded,
-	Failed(String),
+	Failed(Msg),
 }
 
 /// Failed repos the log's banner names before "…".
@@ -536,7 +536,7 @@ fn read_change_list(
 	root: &std::path::Path,
 	known: Option<&RepoIdentity>,
 	cancel: CancelToken,
-) -> Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>, usize), String> {
+) -> Result<(Option<RepoSummary>, Vec<WorkingChangeTuple>, usize), Msg> {
 	let read = snip_core::gitview::Read {
 		profile: snip_core::gitview::ReadProfile::Interactive,
 		cancel: Some(cancel),
@@ -544,7 +544,7 @@ fn read_change_list(
 	let repo = host.open(root, known, &read)?;
 	let list = repo
 		.change_list(MAX_CHANGES_PER_REPO, &read)
-		.map_err(|e| e.to_string())?;
+		.map_err(crate::remote::git_error_msg)?;
 	let summary = match (known, list.summary) {
 		(Some(id), Some(s)) => Some(RepoSummary {
 			identity: id.clone(),
@@ -686,10 +686,23 @@ impl PasteDiffOutcome {
 					PasteDiffOutcome::Diff(patch, truncated)
 				}
 			},
-			Err(err) => PasteDiffOutcome::Notice(Msg::new(
-				"paste_diff_failed",
-				[err.to_string()],
-			)),
+			Err(err) => {
+				// A remote failure keeps its start reason as a message,
+				// worded when drawn (#206 #208).
+				let why = match err {
+					snip_remote::PasteError::Remote(e)
+					| snip_remote::PasteError::OutcomeUnknown(e) => {
+						crate::remote::describe_msg(e)
+					}
+					other => Msg::raw(other.to_string()),
+				};
+				PasteDiffOutcome::Notice(Msg::with_msg_arg(
+					"paste_diff_failed",
+					[String::new()],
+					0,
+					why,
+				))
+			}
 		}
 	}
 }
@@ -711,7 +724,7 @@ pub struct WorkbenchModel {
 	pub commit_page: usize,
 	pub history_has_more: bool,
 	pub history_page_size: usize,
-	pub history_error: Option<String>,
+	pub history_error: Option<Msg>,
 	pub page_checkpoints: Vec<Option<snip_core::graph::GraphCheckpoint>>,
 	pub log_search: Option<LogQuery>,
 	pub collapsed_merges: Vec<String>,
@@ -828,6 +841,11 @@ pub struct WorkbenchModel {
 	// Reader.
 	pub preview: Option<Preview>,
 	pub preview_loading: bool,
+	/// The latest preview read came from the Log (commit, compare,
+	/// multi-selection, commit file or commit tree). Only a Project/Changes
+	/// read or `clear_commit_selection` resets it, so it outlives
+	/// `preview_loading` (#202).
+	pub preview_pending_from_log: bool,
 	pub preview_error: Option<Msg>,
 	pub reader: Reader,
 	pub find_input: Entity<TextInput>,
@@ -915,6 +933,8 @@ pub struct WorkbenchModel {
 	/// no longer drawn returns the keyboard to `focus_handle`.
 	pub(crate) focus_lost_guard: Option<gpui::Subscription>,
 	pub e2e_read_delay: Option<std::time::Duration>,
+	/// Test hook: holds a finished Log commit read before it installs.
+	pub e2e_log_read_delay: Option<std::time::Duration>,
 	/// Test-only hold file for project-tree reads, honoured only in E2E mode.
 	pub e2e_tree_hold: Option<PathBuf>,
 	/// Test-only hold file for copy export revalidation, honoured only in E2E mode.
@@ -923,6 +943,13 @@ pub struct WorkbenchModel {
 	/// result can land after a later user action.
 	#[cfg(test)]
 	pub(crate) e2e_remote_open_delay: Option<std::time::Duration>,
+	/// Test-only: holds a finished remote copy at the test clock before its
+	/// result lands, so the language can change while it is in flight.
+	#[cfg(test)]
+	pub(crate) e2e_copy_hold: Option<std::time::Duration>,
+	/// Test-only: the same hold for a paste row's diff read.
+	#[cfg(test)]
+	pub(crate) e2e_paste_diff_hold: Option<std::time::Duration>,
 	pub workspace_open: bool,
 	pub workspace_menu: bool,
 	/// Where the workspace menu button was drawn: a press there toggles the
@@ -1351,6 +1378,7 @@ impl WorkbenchModel {
 			selected_list_row: 0,
 			preview: None,
 			preview_loading: false,
+			preview_pending_from_log: false,
 			preview_error: None,
 			reader: Reader::default(),
 			find_input,
@@ -1425,10 +1453,15 @@ impl WorkbenchModel {
 			pending_focus: None,
 			focus_lost_guard: None,
 			e2e_read_delay: ui::e2e_read_delay(),
+			e2e_log_read_delay: None,
 			e2e_tree_hold: ui::e2e_tree_hold(),
 			e2e_export_hold: ui::e2e_export_hold(),
 			#[cfg(test)]
 			e2e_remote_open_delay: None,
+			#[cfg(test)]
+			e2e_copy_hold: None,
+			#[cfg(test)]
+			e2e_paste_diff_hold: None,
 			workspace_open: workspace.is_some(),
 			workspace_menu: false,
 			workspace_menu_button: Default::default(),
@@ -1640,9 +1673,11 @@ impl WorkbenchModel {
 				}
 			}
 			if let Some(err) = &self.history_error {
-				return Some(LogEmpty::Failed(Msg::new(
+				return Some(LogEmpty::Failed(Msg::with_msg_arg(
 					"error_history",
-					[err.clone()],
+					[String::new()],
+					0,
+					err.clone(),
 				)));
 			}
 			if !self.log_feeds.is_empty()
@@ -1693,7 +1728,7 @@ impl WorkbenchModel {
 	fn install_slot_changes(
 		&mut self,
 		slot: usize,
-		result: Result<(Vec<WorkingChangeTuple>, usize), String>,
+		result: Result<(Vec<WorkingChangeTuple>, usize), Msg>,
 	) {
 		let (changes, total) = match result {
 			Ok(pair) => pair,
@@ -1821,7 +1856,7 @@ impl WorkbenchModel {
 		root: &std::path::Path,
 		result: Result<
 			(Option<RepoSummary>, Vec<WorkingChangeTuple>, usize),
-			String,
+			Msg,
 		>,
 	) {
 		let Some(slot) = self.change_repos.iter().position(|s| s.root == root)
@@ -4115,10 +4150,12 @@ impl WorkbenchModel {
 								&repo_name,
 							);
 							model.install_slot_changes(slot, Err(err.clone()));
-							model.set_status(
+							model.set_status_msg(Msg::with_msg_arg(
 								"error_repo_changes",
-								[repo_name.clone(), err.clone()],
-							);
+								[repo_name.clone(), String::new()],
+								1,
+								err.clone(),
+							));
 							if let (true, Some(anchor)) = (
 								anchor_source.as_ref()
 									== Some(&SourceKind::File),
@@ -4142,9 +4179,11 @@ impl WorkbenchModel {
 									cx,
 								);
 							} else {
-								model.show_preview_error(Msg::new(
+								model.show_preview_error(Msg::with_msg_arg(
 									"error_repo_changes",
-									[repo_name.clone(), err],
+									[repo_name.clone(), String::new()],
+									1,
+									err,
 								));
 							}
 						}
@@ -4234,6 +4273,7 @@ impl WorkbenchModel {
 		let shown_root = repo_root.clone();
 		let file_path = path.to_string();
 		self.preview_loading = true;
+		self.preview_pending_from_log = false;
 		self.preview_error = None;
 		self.preview_error_root = None;
 
@@ -4254,12 +4294,13 @@ impl WorkbenchModel {
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
+		let hold = bg.clone();
 
 		self.spawn_owned(cx, kind, job_cancel, async move {
 			let for_bg = file_path.clone();
 			let result = bg
 				.spawn(async move {
-					let result = match remote {
+					match remote {
 						Some((client, ws, session_root)) if fs_only => {
 							match remote::remote_rel(&session_root, &repo_root)
 							{
@@ -4278,13 +4319,14 @@ impl WorkbenchModel {
 						_ => read_preview(
 							&host, &repo_root, &for_bg, &source, cancel,
 						),
-					};
-					if let Some(delay) = delay {
-						std::thread::sleep(delay);
 					}
-					result
 				})
 				.await;
+			// The executor's timer, not a thread sleep: a test's clock holds
+			// the finished read without blocking its gestures.
+			if let Some(delay) = delay {
+				hold.timer(delay).await;
+			}
 
 			let _ = this.update(&mut async_app, |model, cx| {
 				if model.preview_generation != task_generation {
@@ -4665,6 +4707,8 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 		let ws_gen = self.lifecycle.generation();
+		#[cfg(test)]
+		let copy_hold = self.e2e_copy_hold;
 		self.spawn_owned(
 			cx,
 			lifecycle::JobKind::CancellableRead,
@@ -4682,9 +4726,11 @@ impl WorkbenchModel {
 								Some(&run_token),
 							)
 							.map_err(|e| {
-								Msg::new(
+								Msg::with_msg_arg(
 									"error_payload",
-									[crate::remote::describe(e)],
+									[String::new()],
+									0,
+									crate::remote::describe_msg(e),
 								)
 							})?;
 						if out.copied == 0 {
@@ -4694,6 +4740,10 @@ impl WorkbenchModel {
 						Ok((out.payload, out.copied, msg))
 					})
 					.await;
+				#[cfg(test)]
+				if let Some(hold) = copy_hold {
+					bg.timer(hold).await;
+				}
 				if let Err(err) = this.update(&mut async_app, |model, cx| {
 					model.finish_copy(ws_gen, &cancel, result, cx)
 				}) {
@@ -4762,13 +4812,15 @@ impl WorkbenchModel {
 		let this = cx.weak_entity();
 		let bg = cx.background_executor().clone();
 		let ws_gen = self.lifecycle.generation();
+		#[cfg(test)]
+		let copy_hold = self.e2e_copy_hold;
 
 		self.spawn_owned(
 			cx,
 			lifecycle::JobKind::CancellableRead,
 			Some(job_token),
 			async move {
-				let result: Result<(String, usize, Msg), String> = bg
+				let result: Result<(String, usize, Msg), Msg> = bg
 					.spawn(async move {
 						if let Some((session, repo)) = remote {
 							let out = session
@@ -4780,13 +4832,13 @@ impl WorkbenchModel {
 									selected,
 									Some(&run_token),
 								)
-								.map_err(crate::remote::describe)?;
+								.map_err(crate::remote::describe_msg)?;
 							let status = commit_copied_status(&out);
 							return Ok((out.text, out.commit_count, status));
 						}
 						let opts = interactive_read_opts(run_token);
 						let git = Git::open_with(&repo_root, &opts)
-							.map_err(|e| e.to_string())?;
+							.map_err(|e| Msg::raw(e.to_string()))?;
 						let exported = plan_commit_export_exact_with(
 							&git,
 							&tip_sha,
@@ -4794,12 +4846,16 @@ impl WorkbenchModel {
 							&opts,
 							snip_core::transfer::CLIPBOARD_PAYLOAD_MAX,
 						)
-						.map_err(|e| e.to_string())?;
+						.map_err(|e| Msg::raw(e.to_string()))?;
 						let out = exported.outcome();
 						let status = commit_copied_status(&out);
 						Ok((out.text, out.commit_count, status))
 					})
 					.await;
+				#[cfg(test)]
+				if let Some(hold) = copy_hold {
+					bg.timer(hold).await;
+				}
 
 				let _ = this.update(&mut async_app, |model, cx| {
 					if !model.accept_copy_result(ws_gen, &cancel) {
@@ -4821,8 +4877,16 @@ impl WorkbenchModel {
 							}
 						}
 						Err(err) => {
-							app_log!("[APP:COPY_COMMITS_ERR: {err}]");
-							model.set_status("error_payload", [err]);
+							app_log!(
+								"[APP:COPY_COMMITS_ERR: {}]",
+								err.render(Locale::En)
+							);
+							model.set_status_msg(Msg::with_msg_arg(
+								"error_payload",
+								[String::new()],
+								0,
+								err,
+							));
 						}
 					}
 					let ok = matches!(
@@ -5276,6 +5340,8 @@ impl WorkbenchModel {
 		};
 		let job_cancel = cancellable.then(|| cancel.clone());
 		let delay = self.e2e_read_delay;
+		#[cfg(test)]
+		let paste_hold = self.e2e_paste_diff_hold;
 
 		let mut async_app = cx.to_async();
 		let this = cx.weak_entity();
@@ -5382,6 +5448,10 @@ impl WorkbenchModel {
 					outcome
 				})
 				.await;
+			#[cfg(test)]
+			if let Some(hold) = paste_hold {
+				bg.timer(hold).await;
+			}
 
 			let _ = this.update(&mut async_app, |model, cx| {
 				if model.paste_diff_generation != task_gen {
@@ -5409,7 +5479,7 @@ impl WorkbenchModel {
 							false,
 							Language::from_path_or_ext(&item.path, false),
 						);
-						p.notice = Some(notice.render(model.locale));
+						p.notice = Some(notice);
 						(p, "unavailable")
 					}
 					PasteDiffOutcome::Same => {
@@ -5420,10 +5490,7 @@ impl WorkbenchModel {
 							false,
 							Language::from_path_or_ext(&item.path, false),
 						);
-						p.notice = Some(
-							crate::i18n::t("paste_diff_same", model.locale)
-								.to_string(),
-						);
+						p.notice = Some(Msg::new("paste_diff_same", []));
 						(p, "same")
 					}
 					PasteDiffOutcome::Diff(patch, truncated) => {
@@ -5435,7 +5502,7 @@ impl WorkbenchModel {
 							Language::Diff,
 						);
 						if truncated {
-							p.notice = Some("truncated".to_string());
+							p.notice = Some(crate::reader::truncated_notice());
 						}
 						(p, "diff")
 					}
@@ -5447,10 +5514,7 @@ impl WorkbenchModel {
 							false,
 							Language::from_path_or_ext(&item.path, false),
 						);
-						p.notice = Some(
-							crate::i18n::t("paste_diff_binary", model.locale)
-								.to_string(),
-						);
+						p.notice = Some(Msg::new("paste_diff_binary", []));
 						(p, "unavailable")
 					}
 					PasteDiffOutcome::TooLarge => {
@@ -5461,13 +5525,7 @@ impl WorkbenchModel {
 							false,
 							Language::from_path_or_ext(&item.path, false),
 						);
-						p.notice = Some(
-							crate::i18n::t(
-								"paste_diff_too_large",
-								model.locale,
-							)
-							.to_string(),
-						);
+						p.notice = Some(Msg::new("paste_diff_too_large", []));
 						(p, "unavailable")
 					}
 					PasteDiffOutcome::Unreadable => {
@@ -5478,13 +5536,7 @@ impl WorkbenchModel {
 							false,
 							Language::from_path_or_ext(&item.path, false),
 						);
-						p.notice = Some(
-							crate::i18n::t(
-								"paste_diff_unreadable",
-								model.locale,
-							)
-							.to_string(),
-						);
+						p.notice = Some(Msg::new("paste_diff_unreadable", []));
 						(p, "unavailable")
 					}
 				};
@@ -5895,20 +5947,27 @@ fn resolve_added_repo(
 pub enum PreviewErr {
 	/// Over the 1 MiB preview limit, on any host.
 	TooLarge,
-	Failed(String),
+	Failed(Msg),
+}
+
+impl From<Msg> for PreviewErr {
+	fn from(m: Msg) -> Self {
+		Self::Failed(m)
+	}
 }
 
 impl From<String> for PreviewErr {
 	fn from(s: String) -> Self {
-		Self::Failed(s)
+		Self::Failed(Msg::raw(s))
 	}
 }
 
-impl From<snip_core::gitsrc::GitError> for PreviewErr {
-	fn from(e: snip_core::gitsrc::GitError) -> Self {
+impl PreviewErr {
+	/// A Git read's failure; a start failure is worded when drawn.
+	pub(crate) fn git(e: snip_core::gitsrc::GitError) -> Self {
 		match e {
 			snip_core::gitsrc::GitError::OutputLimit { .. } => Self::TooLarge,
-			other => Self::Failed(other.to_string()),
+			other => Self::Failed(remote::git_error_msg(other)),
 		}
 	}
 }
@@ -5918,7 +5977,7 @@ impl From<std::io::Error> for PreviewErr {
 		if e.kind() == std::io::ErrorKind::FileTooLarge {
 			Self::TooLarge
 		} else {
-			Self::Failed(e.to_string())
+			Self::Failed(Msg::raw(e.to_string()))
 		}
 	}
 }
@@ -5927,7 +5986,7 @@ impl std::fmt::Display for PreviewErr {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::TooLarge => f.write_str("over the 1 MiB preview limit"),
-			Self::Failed(s) => f.write_str(s),
+			Self::Failed(m) => f.write_str(&m.render(Locale::ZhTw)),
 		}
 	}
 }
@@ -5937,7 +5996,9 @@ impl PreviewErr {
 	pub(crate) fn msg(self, path: String) -> Msg {
 		match self {
 			Self::TooLarge => Msg::new("error_preview_too_large", [path]),
-			Self::Failed(e) => Msg::new("error_preview", [path, e]),
+			Self::Failed(e) => {
+				Msg::with_msg_arg("error_preview", [path, String::new()], 1, e)
+			}
 		}
 	}
 }
@@ -5987,7 +6048,7 @@ fn read_preview(
 		)),
 		// A failed/cancelled Git source must never be replaced by current
 		// working-tree bytes. Explicit File/tree sources are handled above.
-		Err(e) => Err(e.into()),
+		Err(e) => Err(PreviewErr::git(e)),
 	}
 }
 
@@ -6519,21 +6580,21 @@ mod tests {
 		use super::PreviewErr;
 		use snip_core::gitsrc::GitError;
 		assert_eq!(
-			PreviewErr::from(GitError::OutputLimit {
+			PreviewErr::git(GitError::OutputLimit {
 				args: "cat-file x:big".into(),
 				limit: 1048576,
-			}),
+			},),
 			PreviewErr::TooLarge
 		);
 		assert_eq!(
-			PreviewErr::from(GitError::from(
+			PreviewErr::git(GitError::from(
 				snip_remote::RemoteError::Refused {
 					code: snip_remote::ErrorCode::TooLarge,
 					message:
 						"the result is too large to send; narrow the request"
 							.into(),
 				}
-			)),
+			),),
 			PreviewErr::TooLarge
 		);
 		assert_eq!(
@@ -6544,7 +6605,7 @@ mod tests {
 			PreviewErr::TooLarge
 		);
 		assert!(matches!(
-			PreviewErr::from(GitError::Host("boom".into())),
+			PreviewErr::git(GitError::Host("boom".into())),
 			PreviewErr::Failed(_)
 		));
 		let text = PreviewErr::TooLarge
@@ -7453,6 +7514,152 @@ mod tests {
 			});
 		}
 
+		/// A host without snip, picked from the menu: the listing and the
+		/// failed open both say so in the interface language, not in the
+		/// English text the CLI prints (#204).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn a_host_without_snip_is_reported_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_, model, cx) = remote_menu_hosts(cx, &["bare-host"]);
+			model.update(cx, |m, cx| {
+				m.remote.hosts = vec![snip_remote::RemoteHost {
+					name: "bare-host".into(),
+					transport: snip_remote::Transport::Command(vec![
+						"sh".into(),
+						"-c".into(),
+						"echo 'sh: snip: not found' >&2; exit 127".into(),
+					]),
+				}];
+				cx.notify();
+			});
+			cx.run_until_parked();
+			click(cx, "remote-host:0");
+			settle_until(cx, "the listing to fail", |cx| {
+				model.read_with(cx, |m, _| {
+					m.remote
+						.browse
+						.as_ref()
+						.is_some_and(|b| matches!(b.listing, Some(Err(_))))
+				})
+			});
+			let zh = "那台機器沒有安裝 snip";
+			model.read_with(cx, |m, _| {
+				let Some(Err(text)) =
+					&m.remote.browse.as_ref().unwrap().listing
+				else {
+					panic!("the listing failed");
+				};
+				let text = text.render(m.locale);
+				assert!(text.starts_with(zh), "{text}");
+				assert!(!text.contains("not installed"), "{text}");
+			});
+			// The open of a typed path fails the same way.
+			model.update(cx, |m, cx| {
+				m.remote_path_input.update(cx, |f, cx| f.set_text("/x", cx))
+			});
+			click(cx, "btn-remote-open");
+			settle_until(cx, "the failed open", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.remote.busy
+						&& matches!(m.remote.message, Some((false, _)))
+				})
+			});
+			model.read_with(cx, |m, _| {
+				let Some((_, text)) = &m.remote.message else {
+					panic!("a failure message");
+				};
+				let text = text.render(m.locale);
+				assert!(text.starts_with(zh), "{text}");
+				assert_eq!(m.status.key, "remote_open_failed");
+				let status = m.status.render(m.locale);
+				assert!(status.contains(zh), "{status}");
+			});
+		}
+
+		/// A restored remote tab whose host has no snip: the status line, the
+		/// menu's note, the restore's reason and the tab's hover all word the
+		/// reason when read, so a switch to English rewords every one (#206
+		/// #208). The reason used to be fixed when the open failed.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn restoring_a_host_without_snip_follows_a_language_switch(
+			cx: &mut TestAppContext,
+		) {
+			use crate::remote::RecentRemote;
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let id = dunce::canonicalize(tmp.path())
+				.unwrap()
+				.display()
+				.to_string();
+			let (_, model, cx) = remote_menu_hosts(cx, &["bare-host"]);
+			model.update(cx, |m, cx| {
+				m.remote.hosts = vec![snip_remote::RemoteHost {
+					name: "bare-host".into(),
+					transport: snip_remote::Transport::Command(vec![
+						"sh".into(),
+						"-c".into(),
+						"echo 'sh: snip: not found' >&2; exit 127".into(),
+					]),
+				}];
+				m.restore_remote(
+					RecentRemote {
+						host: "bare-host".into(),
+						path: id,
+					},
+					cx,
+				);
+			});
+			settle_until(cx, "the restore to fail", |cx| {
+				model.read_with(cx, |m, _| {
+					m.remote
+						.restoring
+						.as_ref()
+						.is_some_and(|r| r.failed.is_some())
+				})
+			});
+			let zh = "那台機器沒有安裝 snip";
+			let en = "is not installed";
+			// Every surface, worded now in the current language.
+			let read = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					let note =
+						m.remote.message.as_ref().expect("a note").1.clone();
+					let failed = m
+						.remote
+						.restoring
+						.as_ref()
+						.and_then(|r| r.failed.clone())
+						.expect("a reason");
+					let hover =
+						crate::tabs::tab_hover("tab", &m.tab_info(), m.locale);
+					[
+						m.status.render(m.locale),
+						note.render(m.locale),
+						failed.render(m.locale),
+						hover,
+					]
+				})
+			};
+			assert_eq!(status_key(&model, cx), "remote_open_failed");
+			for text in read(cx) {
+				assert!(text.contains(zh), "{text}");
+				assert!(!text.contains(en), "{text}");
+			}
+			cx.simulate_keystrokes("alt-l");
+			assert_eq!(locale_now(&model, cx), crate::i18n::Locale::En);
+			for text in read(cx) {
+				assert!(text.contains(en), "{text}");
+				assert!(!text.contains(zh), "{text}");
+			}
+			// What the status bar drew follows too.
+			let drawn = crate::ui::last_drawn("status-text").unwrap();
+			assert!(drawn.contains(en), "{drawn}");
+		}
+
 		/// One browse connection per menu: it is handed to the open of the
 		/// folder shown, and it ends with the menu (#187).
 		#[gpui::test]
@@ -7695,6 +7902,34 @@ mod tests {
 			);
 		}
 
+		/// An open host row has no tooltip (#203): it would cover the
+		/// open-here button of the folder list below it, even when the click
+		/// came before the tooltip showed.
+		#[gpui::test]
+		fn an_opened_host_row_has_no_tooltip(cx: &mut TestAppContext) {
+			let _serial = remote_lock();
+			let (_, _model, cx) = remote_menu_hosts(cx, &["one", "two"]);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(720.)));
+			settle(cx);
+			let shown = |cx: &mut VisualTestContext| {
+				cx.run_until_parked();
+				cx.debug_bounds("tooltip:one").is_some()
+			};
+			let at = cx
+				.debug_bounds("remote-host:0")
+				.expect("row drawn")
+				.center();
+			cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+			click(cx, "remote-host:0");
+			cx.executor().advance_clock(Duration::from_millis(700));
+			settle(cx);
+			assert!(
+				cx.debug_bounds("btn-remote-open-here").is_some(),
+				"the host's folder block is open"
+			);
+			assert!(!shown(cx), "the opened row keeps no tooltip");
+		}
+
 		/// Opening a host's folder list and switching hosts never moves the
 		/// other host rows: the recent box keeps four whole rows (#197).
 		#[gpui::test]
@@ -7879,8 +8114,8 @@ mod tests {
 				let r = m.remote.restoring.as_ref().expect("the tab stays");
 				assert!(r
 					.failed
-					.as_deref()
-					.is_some_and(|w| w.contains("gone-host")));
+					.as_ref()
+					.is_some_and(|w| w.render(m.locale).contains("gone-host")));
 				assert_eq!(
 					m.ws_identity(),
 					Some(crate::tabs::WsIdentity::Remote {
@@ -10083,7 +10318,14 @@ mod tests {
 				assert!(m.paste.plan().expect("plan open").remote.is_some());
 				let detail = m.paste.detail().expect("detail present");
 				assert!(!detail.is_diff);
-				assert_eq!(detail.notice.as_deref(), Some(want.as_str()));
+				assert_eq!(
+					detail
+						.notice
+						.as_ref()
+						.map(|n| n.render(m.locale))
+						.as_deref(),
+					Some(want.as_str())
+				);
 			});
 		}
 
@@ -10202,6 +10444,224 @@ mod tests {
 				assert!(!m.is_loading);
 				assert_eq!(m.discovery_generation, gen_before);
 			});
+		}
+
+		/// A tooltip that stays open while the language changes rewords
+		/// itself (#208): the status bar's message and a Changes error
+		/// row's read error are worded when drawn, not when the tooltip
+		/// opened. The pointer does not move between the keystroke and the
+		/// read; what is read is the tooltip's drawn text.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn shown_error_tooltips_follow_a_language_switch_under_a_still_pointer(
+			cx: &mut TestAppContext,
+		) {
+			use crate::i18n::{Locale, Msg};
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			fs::create_dir_all(&shared).unwrap();
+			let _alpha = repo(&shared, "alpha", &[]);
+			let beta = repo(&shared, "beta", &[]);
+			fs::write(beta.join(".git/HEAD"), "garbage not a ref\n").unwrap();
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "worker".into(),
+					max_protocol: None,
+				},
+			);
+			model.update(cx, |m, cx| {
+				// The exact #208 shape: a worker start failure wrapped as
+				// the remote scan failure, worded when drawn.
+				m.set_status_msg(Msg::with_msg_arg(
+					"remote_scan_failed",
+					[String::new()],
+					0,
+					crate::remote::start_msg(
+						snip_remote::StartReason::NoWorker,
+						"",
+					),
+				));
+				cx.notify();
+			});
+			settle(cx);
+			let slot = model.read_with(cx, |m, _| {
+				m.change_repos
+					.iter()
+					.position(|s| s.root.ends_with("beta"))
+					.expect("beta slot")
+			});
+			let status_in = |cx: &mut VisualTestContext, loc: Locale| {
+				model.read_with(cx, |m, _| m.status.render(loc))
+			};
+			let note_in = |cx: &mut VisualTestContext, loc: Locale| {
+				model.read_with(cx, |m, _| {
+					m.change_note_text(slot, loc).expect("a note").text
+				})
+			};
+			let up = |cx: &mut VisualTestContext, text: &str| {
+				cx.run_until_parked();
+				let key: &'static str =
+					Box::leak(format!("tooltip:{text}").into_boxed_str());
+				cx.debug_bounds(key).is_some()
+			};
+			let hover = |cx: &mut VisualTestContext, id: &'static str| {
+				cx.run_until_parked();
+				let at = cx
+					.debug_bounds(id)
+					.unwrap_or_else(|| panic!("no rendered control {id}"))
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+			};
+			let (zh_s, en_s) =
+				(status_in(cx, Locale::ZhTw), status_in(cx, Locale::En));
+			let (zh_n, en_n) =
+				(note_in(cx, Locale::ZhTw), note_in(cx, Locale::En));
+			assert_ne!(zh_s, en_s);
+			assert_ne!(zh_n, en_n);
+			// The nested reason follows too, not just the wrapper.
+			let reason = crate::remote::start_msg(
+				snip_remote::StartReason::NoWorker,
+				"",
+			);
+			let (zh_r, en_r) =
+				(reason.render(Locale::ZhTw), reason.render(Locale::En));
+			assert!(zh_s.contains(&zh_r) && !zh_s.contains(&en_r), "{zh_s}");
+			assert!(en_s.contains(&en_r) && !en_s.contains(&zh_r), "{en_s}");
+
+			// The status bar, Chinese up, then English with no mouse move.
+			hover(cx, "status-text");
+			assert!(up(cx, &zh_s), "status tooltip shown: {zh_s}");
+			to_english(&model, cx);
+			assert!(up(cx, &en_s), "status tooltip follows: {en_s}");
+			assert!(!up(cx, &zh_s), "the old status text is gone");
+
+			// The Changes error row, English up, then Chinese.
+			hover(cx, "change-note:beta");
+			assert!(up(cx, &en_n), "note tooltip shown: {en_n}");
+			cx.simulate_keystrokes("alt-l");
+			assert_eq!(locale_now(&model, cx), Locale::ZhTw);
+			assert!(up(cx, &zh_n), "note tooltip follows: {zh_n}");
+			assert!(!up(cx, &en_n), "the old note text is gone");
+		}
+
+		/// A tooltip that stays open while the repo list is reordered or
+		/// shrunk under it must keep describing the same repo, or vanish,
+		/// never describe another (#208).
+		#[gpui::test]
+		fn an_open_note_tooltip_follows_its_repo_not_its_row_position(
+			cx: &mut TestAppContext,
+		) {
+			use crate::i18n::Msg;
+			let tmp = tempfile::tempdir().unwrap();
+			let (model, cx) = open(cx, tmp.path().to_path_buf(), None);
+			let failed = |name: &str, why: &str| crate::ChangeRepo {
+				root: tmp.path().join(name),
+				name: name.into(),
+				state: crate::ChangeRepoState::Failed(Msg::new(
+					"error_repo_status",
+					[why.to_string()],
+				)),
+				total: 0,
+			};
+			model.update(cx, |m, cx| {
+				m.repos = vec![
+					make_test_repo(tmp.path().join("ra"), "ra"),
+					make_test_repo(tmp.path().join("rb"), "rb"),
+				];
+				m.change_repos =
+					vec![failed("ra", "why-alpha"), failed("rb", "why-beta")];
+				// Each repo keeps a row, so its note sits under it
+				// instead of folding into the unreadable node.
+				m.files = vec![
+					make_test_file("a.txt", 0),
+					make_test_file("b.txt", 1),
+				];
+				m.workspace_open = true;
+				m.active_tab = WorkbenchTab::GitChanges;
+				m.discovery_status =
+					Some(snip_core::workspace::ScanStatus::Complete);
+				m.is_loading = false;
+				// Repo rows start collapsed; open them to show the notes.
+				let open: Vec<_> = m
+					.change_item_rows()
+					.into_iter()
+					.filter_map(|r| match r {
+						crate::ui::ChangeItemRow::Repo {
+							slot,
+							group_id,
+							..
+						} => Some((group_id, m.change_repos[slot].root.clone())),
+						_ => None,
+					})
+					.collect();
+				m.chrome.expanded_repos.extend(open);
+				cx.notify();
+			});
+			settle(cx);
+			let note = |cx: &mut VisualTestContext, name: &str| {
+				model.read_with(cx, |m, _| {
+					m.change_note_text_for(&tmp.path().join(name), m.locale)
+						.expect("a note")
+						.text
+				})
+			};
+			let (a, b) = (note(cx, "ra"), note(cx, "rb"));
+			assert_ne!(a, b);
+			let up = |cx: &mut VisualTestContext, text: &str| {
+				cx.run_until_parked();
+				let key: &'static str =
+					Box::leak(format!("tooltip:{text}").into_boxed_str());
+				cx.debug_bounds(key).is_some()
+			};
+			cx.run_until_parked();
+			let at = cx
+				.debug_bounds("change-note:rb")
+				.expect("rb note row")
+				.center();
+			cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+			cx.executor().advance_clock(Duration::from_millis(700));
+			settle(cx);
+			let b_now = note(cx, "rb");
+			assert!(up(cx, &b_now), "rb tooltip shown: {b_now}");
+
+			// A clean repo found ahead of both (a rescan's new order): it
+			// draws no row, so rb's note stays under the pointer while its
+			// slot moves from 1 to 2, where a position would read ra's.
+			model.update(cx, |m, cx| {
+				m.change_repos.insert(
+					0,
+					crate::ChangeRepo {
+						root: tmp.path().join("r0"),
+						name: "r0".into(),
+						state: crate::ChangeRepoState::Loaded,
+						total: 0,
+					},
+				);
+				m.files = vec![
+					make_test_file("a.txt", 1),
+					make_test_file("b.txt", 2),
+				];
+				cx.notify();
+			});
+			settle(cx);
+			assert!(up(cx, &b_now), "still rb's text after a reorder");
+			assert!(!up(cx, &a), "never ra's text under rb's pointer");
+
+			// Shrunk: rb is gone, so its tooltip is too, and ra's does not
+			// take its place.
+			model.update(cx, |m, cx| {
+				m.change_repos.retain(|r| r.name != "rb");
+				m.files = vec![make_test_file("a.txt", 1)];
+				cx.notify();
+			});
+			settle(cx);
+			assert!(!up(cx, &b_now), "rb's text is gone with rb");
+			assert!(!up(cx, &a), "ra's text does not take over");
 		}
 
 		#[gpui::test]
@@ -10662,6 +11122,7 @@ mod tests {
 					is_more_marker: false,
 					is_view_limit: false,
 					is_error: false,
+					msg: None,
 					is_loading: false,
 					is_valid_utf8: true,
 					selected: false,
@@ -10683,6 +11144,7 @@ mod tests {
 					is_more_marker: false,
 					is_view_limit: false,
 					is_error: false,
+					msg: None,
 					is_loading: false,
 					is_valid_utf8: true,
 					selected: false,
@@ -10746,6 +11208,7 @@ mod tests {
 					is_more_marker: false,
 					is_view_limit: false,
 					is_error: false,
+					msg: None,
 					is_loading: false,
 					is_valid_utf8: true,
 					selected: false,
@@ -11505,7 +11968,6 @@ mod tests {
 					);
 					cx.simulate_click(pos, gpui::Modifiers::none());
 					let menu = model.read_with(cx, |m, _| m.log_menu);
-					eprintln!("DBG offset ({dx},{dy}) -> menu={menu:?}");
 					if menu.is_some() {
 						break;
 					}
@@ -11736,6 +12198,976 @@ mod tests {
 				snip_remote::WorkerOptions::default(),
 			);
 			assert_too_large_preview(&model, cx);
+		}
+
+		/// A connected remote workspace whose worker cannot be started again
+		/// (#206): the client reconnects in the middle of a request and the
+		/// restart fails, as when the worker was removed or the key revoked
+		/// behind it. The restart is a real `Transport::Command` that exits
+		/// 127, the way a host without snip answers, so no ssh is involved.
+		#[cfg(unix)]
+		fn lose_the_worker(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			lose_the_worker_at(model, cx, false);
+		}
+
+		/// [`lose_the_worker`]; with `mid_request` the client also holds a
+		/// pooled connection that died, so the first request fails on it
+		/// and the failed restart follows in the same call.
+		#[cfg(unix)]
+		fn lose_the_worker_at(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			mid_request: bool,
+		) {
+			model.update(cx, |m, _| {
+				let session = m.remote.session.as_mut().expect("connected");
+				let gone = std::sync::Arc::new(snip_remote::Client::new(
+					snip_remote::RemoteHost {
+						name: "gone-host".into(),
+						transport: snip_remote::Transport::Command(vec![
+							"sh".into(),
+							"-c".into(),
+							"echo 'sh: snip: not found' >&2; exit 127".into(),
+						]),
+					},
+					"test-mac".into(),
+				));
+				if mid_request {
+					gone.pool_a_dead_connection_for_tests();
+				}
+				session.client = gone.clone();
+				// A paste plan keeps its own copy of the session.
+				if let Some(remote) =
+					m.paste.plan_mut().and_then(|p| p.remote.as_mut())
+				{
+					remote.session.client = gone;
+				}
+			});
+		}
+
+		/// The interface language's wording of a missing snip, and none of
+		/// the CLI's English.
+		#[cfg(unix)]
+		fn assert_no_snip_in_zh(text: &str) {
+			assert!(text.contains("那台機器沒有安裝 snip"), "{text}");
+			assert!(!text.contains("is not installed"), "{text}");
+		}
+
+		/// A two-repository workspace on an in-process worker, loaded: the
+		/// log has commits, the Project tree its folders.
+		#[cfg(unix)]
+		fn open_remote_to_lose(
+			cx: &mut TestAppContext,
+		) -> (
+			tempfile::TempDir,
+			Entity<WorkbenchModel>,
+			&mut VisualTestContext,
+			std::sync::Arc<snip_remote::Worker>,
+		) {
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let alpha = shared.join("alpha");
+			let beta = shared.join("beta");
+			fs::create_dir_all(&alpha).unwrap();
+			fs::create_dir_all(&beta).unwrap();
+			crate::paste::tests::git_init(&alpha);
+			fs::write(alpha.join("init.txt"), "hello\n").unwrap();
+			let long: String =
+				(1..=40).map(|i| format!("line {i}\n")).collect();
+			fs::write(alpha.join("long.txt"), &long).unwrap();
+			crate::paste::tests::git_run(&alpha, &["add", "."]);
+			crate::paste::tests::git_run(&alpha, &["commit", "-m", "init"]);
+			fs::write(alpha.join("dirty.txt"), "dirty\n").unwrap();
+			// One edit in the middle: the diff folds the lines around it.
+			fs::write(
+				alpha.join("long.txt"),
+				long.replace("line 20\n", "edited\n"),
+			)
+			.unwrap();
+			crate::paste::tests::git_init(&beta);
+			fs::write(beta.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&beta, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&beta, &["commit", "-m", "init"]);
+			let notes = shared.join("notes");
+			fs::create_dir_all(notes.join("sub")).unwrap();
+			fs::write(notes.join("n.txt"), "N\n").unwrap();
+			let (model, cx, worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			settle_until(cx, "the remote workspace to load", |cx| {
+				model.read_with(cx, |m, _| {
+					m.change_repos.first().is_some_and(|r| {
+						r.state == crate::ChangeRepoState::Loaded
+					}) && !m.commits.is_empty()
+						&& m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
+				})
+			});
+			(tmp, model, cx, worker)
+		}
+
+		/// Remote copy (Cmd+C on the Project tree's repository) when the
+		/// worker cannot restart: the status says why in the interface
+		/// language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_copy_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			lose_the_worker(&model, cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let status = model.read_with(cx, |m, _| m.status.render(m.locale));
+			assert!(status.contains("產生 payload 失敗"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// The first failure of a request that was in flight when the worker
+		/// died (#206): the pooled connection breaks, the restart fails, and
+		/// the status still says why in the interface language.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_copy_losing_the_worker_mid_request_says_why_at_once(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			lose_the_worker_at(&model, cx, true);
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let status = model.read_with(cx, |m, _| m.status.render(m.locale));
+			assert!(status.contains("產生 payload 失敗"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// Clicks the control `id` where its probe says it is drawn, the way
+		/// an operator reads `[APP:CTRL_BOUNDS]`: the probe is switched on
+		/// on first use and read after the next frame.
+		#[cfg(unix)]
+		fn click_probed(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+			id: &str,
+		) {
+			if model.read_with(cx, |m, _| m.probes.is_none()) {
+				model.update(cx, |m, cx| {
+					m.probes = Some(crate::ui::Probes::for_test());
+					cx.notify();
+				});
+				settle(cx);
+			}
+			let b = model
+				.read_with(cx, |m, _| m.probes.as_ref().unwrap().bounds(id))
+				.unwrap_or_else(|| panic!("no probed control {id}"));
+			let scale = cx.update(|window, _| window.scale_factor());
+			cx.simulate_click(
+				gpui::point(
+					gpui::px((b[0] + b[2] / 2) as f32 / scale),
+					gpui::px((b[1] + b[3] / 2) as f32 / scale),
+				),
+				gpui::Modifiers::none(),
+			);
+			settle(cx);
+		}
+
+		#[cfg(unix)]
+		fn status_key(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> &'static str {
+			model.read_with(cx, |m, _| m.status.key)
+		}
+
+		/// The status line in the interface language.
+		#[cfg(unix)]
+		fn status_text(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> String {
+			model.read_with(cx, |m, _| m.status.render(m.locale))
+		}
+
+		/// Copying the selected commit (Cmd+C in the Git Log) when the worker
+		/// cannot restart (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_commit_copy_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			let row = cx.debug_bounds("log-subject:0").expect("a commit row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			settle_until(cx, "the commit to be selected", |cx| {
+				model.read_with(cx, |m, _| m.selected_commit.is_some())
+			});
+			lose_the_worker(&model, cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let status = status_text(&model, cx);
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// Pasting into a remote workspace (Cmd+V) when the worker cannot
+		/// restart: the destination message says why in the interface
+		/// language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_paste_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			lose_the_worker(&model, cx);
+			clip::write_text("// FILE: a.txt\nA\n").unwrap();
+			cx.simulate_keystrokes("cmd-v");
+			settle_until(cx, "the paste to fail", |cx| {
+				!model.read_with(cx, |m, _| m.paste.is_loading())
+			});
+			let status = status_text(&model, cx);
+			assert!(status.contains("無法使用貼上目的地"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// A paste preview opened in one language outlives a switch to the
+		/// other: when the worker is then lost and the mapping changes, the
+		/// replan's reason is worded in the language now in force, whole,
+		/// not as a wrapper in one language around the reason in the other
+		/// (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_paste_replan_after_a_language_switch_uses_the_new_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			// The preview opens in English...
+			cx.simulate_keystrokes("alt-l");
+			assert_eq!(
+				model.read_with(cx, |m, _| m.locale),
+				crate::i18n::Locale::En
+			);
+			remote_paste_preview(
+				&model,
+				cx,
+				"// FILE: .git/hooks/pre-commit\n#!/bin/sh\n// FILE: d.txt\nD\n",
+			);
+			// ...then the language is switched with the header button.
+			click_probed(&model, cx, "btn-locale");
+			assert_eq!(
+				model.read_with(cx, |m, _| m.locale),
+				crate::i18n::Locale::ZhTw
+			);
+			lose_the_worker(&model, cx);
+			model.update(cx, |m, cx| m.choose_paste_keep(".git", cx));
+			settle_until(cx, "the replan to fail", |cx| {
+				model.read_with(cx, |m, _| {
+					!m.paste.is_loading()
+						&& m.status.key.starts_with("paste_err_destination")
+				})
+			});
+			let status = status_text(&model, cx);
+			assert!(status.contains("無法使用貼上目的地"), "{status}");
+			assert_no_snip_in_zh(&status);
+			// And back: the same stored message words itself in English.
+			cx.simulate_keystrokes("alt-l");
+			let status = status_text(&model, cx);
+			assert!(
+				status.contains("Cannot use paste destination"),
+				"{status}"
+			);
+			assert!(status.contains("is not installed"), "{status}");
+			assert!(!status.contains("沒有安裝"), "{status}");
+		}
+
+		/// Selecting a repository (a click on its row) when the worker cannot
+		/// restart: the Changes read fails and the status says why in the
+		/// interface language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_changes_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "repo-row:beta");
+			settle_until(cx, "the changes error", |cx| {
+				model.read_with(cx, |m, _| m.status.key == "error_repo_changes")
+			});
+			let status = status_text(&model, cx);
+			assert!(status.contains("變更失敗"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// Expanding a diff's folded lines (a click on the fold) when the
+		/// worker cannot restart: the status says why in the interface
+		/// language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_fold_expansion_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-0");
+			settle(cx);
+			click_probed(&model, cx, "change-repo-toggle:unstaged:alpha");
+			click_probed(&model, cx, "change-row@alpha:unstaged:long.txt");
+			settle_until(cx, "the diff preview", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes
+						.as_ref()
+						.is_some_and(|p| p.bounds("diff-fold:end").is_some())
+				})
+			});
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "diff-fold:end");
+			settle_until(cx, "the fold error", |cx| {
+				model.read_with(cx, |m, _| m.status.key == "status_fold_failed")
+			});
+			let status = status_text(&model, cx);
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// Previewing a Changes-pane file's diff when the worker cannot
+		/// restart: the editor's error says why in the interface language
+		/// (#206). This reaches `PreviewErr::git`, which also words the
+		/// commit-file diff and a revision-tree file.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_diff_preview_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-0");
+			settle(cx);
+			click_probed(&model, cx, "change-repo-toggle:unstaged:alpha");
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "change-row@alpha:unstaged:long.txt");
+			settle_until(cx, "the preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.preview_error.as_ref().unwrap().render(m.locale)
+			});
+			assert!(err.contains("預覽"), "{err}");
+			assert_no_snip_in_zh(&err);
+		}
+
+		/// Opening a Project tree file when the worker cannot restart: the
+		/// editor's error says why in the interface language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_preview_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click_probed(&model, cx, "ws-tree-row:notes");
+			settle_until(cx, "the notes folder to open", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("ws-tree-row:notes/n.txt").is_some()
+					})
+				})
+			});
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "ws-tree-row:notes/n.txt");
+			settle_until(cx, "the preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.preview_error.as_ref().unwrap().render(m.locale)
+			});
+			assert!(err.contains("預覽"), "{err}");
+			assert_no_snip_in_zh(&err);
+		}
+
+		/// Expanding a Project tree folder when the worker cannot restart:
+		/// the row under it says why in the interface language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_tree_listing_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click_probed(&model, cx, "ws-tree-row:notes");
+			settle_until(cx, "the notes folder to open", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("ws-tree-row:notes/sub").is_some()
+					})
+				})
+			});
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "ws-tree-row:notes/sub");
+			settle_until(cx, "the listing error", |cx| {
+				model.read_with(cx, |m, _| {
+					m.ws_tree.as_ref().is_some_and(|t| {
+						t.flatten_visible(300).iter().any(|r| r.is_error)
+					})
+				})
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.ws_tree
+					.as_ref()
+					.unwrap()
+					.flatten_visible(300)
+					.into_iter()
+					.find(|r| r.is_error)
+					.unwrap()
+					.label(m.locale)
+			});
+			assert_no_snip_in_zh(&err);
+			// Speed search words the error row in the current language: an
+			// English word finds it after Option+L, and not before.
+			let labels = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.tool_row_labels()
+						.into_iter()
+						.map(|l| l.to_lowercase())
+						.collect::<Vec<_>>()
+				})
+			};
+			assert!(
+				labels(cx).iter().any(|l| l.contains("那台機器")),
+				"the zh error row is searchable: {:?}",
+				labels(cx)
+			);
+			assert!(!labels(cx).iter().any(|l| l.contains("not installed")));
+			to_english(&model, cx);
+			assert!(
+				labels(cx).iter().any(|l| l.contains("not installed")),
+				"speed search matches the English error row: {:?}",
+				labels(cx)
+			);
+			assert!(!labels(cx).iter().any(|l| l.contains("那台機器")));
+		}
+
+		/// Refreshing a remote workspace (Cmd+R) when the worker cannot
+		/// restart: the scan failure says why in the interface language
+		/// (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_scan_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			// A pooled connection dies mid-request and the restart fails:
+			// the known start reason, not the dead connection's I/O error,
+			// is what the scan ends with.
+			lose_the_worker_at(&model, cx, true);
+			cx.simulate_keystrokes("cmd-r");
+			settle_until(cx, "the scan to fail", |cx| {
+				model.read_with(cx, |m, _| m.remote.scan_error.is_some())
+			});
+			// A known permanent start failure ends scan recovery at once:
+			// no delayed retry is left armed (the dead connection's I/O
+			// error would have kept one).
+			model.read_with(cx, |m, _| {
+				assert!(m.remote.scan_recovery.is_none(), "retry still armed");
+			});
+			let text = model.read_with(cx, |m, _| {
+				m.remote.scan_error.as_ref().unwrap().render(m.locale)
+			});
+			assert!(text.contains("無法讀取遠端的 Git 儲存庫"), "{text}");
+			assert_no_snip_in_zh(&text);
+		}
+
+		/// Refreshing the Git Log of a remote workspace when the worker
+		/// cannot restart: the log's error says why in the interface
+		/// language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_git_view_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			lose_the_worker(&model, cx);
+			click(cx, "btn-log-refresh");
+			settle_until(cx, "the log error", |cx| {
+				model.read_with(cx, |m, _| m.history_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.history_error.as_ref().map(|e| e.render(m.locale))
+			});
+			assert_no_snip_in_zh(&err.unwrap());
+		}
+
+		/// Selecting a commit of a remote workspace when the worker cannot
+		/// restart: the file list's error says why in the interface language
+		/// (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_commit_files_with_a_lost_worker_say_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			lose_the_worker(&model, cx);
+			let row = cx.debug_bounds("log-subject:0").expect("a commit row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			settle_until(cx, "the preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.preview_error.as_ref().unwrap().render(m.locale)
+			});
+			assert_no_snip_in_zh(&err);
+		}
+
+		/// The English wording of a missing snip, and none of the Chinese.
+		#[cfg(unix)]
+		fn assert_snip_in_en(text: &str) {
+			assert!(text.contains("is not installed"), "{text}");
+			assert!(!text.contains("沒有安裝"), "{text}");
+		}
+
+		#[cfg(unix)]
+		fn locale_now(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) -> crate::i18n::Locale {
+			model.read_with(cx, |m, _| m.locale)
+		}
+
+		/// Switches to English with Option+L (the app starts in 繁中).
+		#[cfg(unix)]
+		fn to_english(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			assert_eq!(locale_now(model, cx), crate::i18n::Locale::ZhTw);
+			cx.simulate_keystrokes("alt-l");
+			assert_eq!(locale_now(model, cx), crate::i18n::Locale::En);
+		}
+
+		/// Switches to 繁中 with the header button, a real click.
+		#[cfg(unix)]
+		fn to_chinese_by_button(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			assert_eq!(locale_now(model, cx), crate::i18n::Locale::En);
+			click_probed(model, cx, "btn-locale");
+			assert_eq!(locale_now(model, cx), crate::i18n::Locale::ZhTw);
+		}
+
+		/// A request started in English, held in flight, with the language
+		/// switched to 繁中 meanwhile: the reason it lands with is Chinese
+		/// (#206). The wording used to be fixed when the request started.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_copy_in_flight_across_a_language_switch_lands_in_the_new_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			let hold = Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_copy_hold = Some(hold));
+			to_english(&model, cx);
+			lose_the_worker(&model, cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle(cx);
+			assert!(model.read_with(cx, |m, _| m.is_copying), "held");
+			to_chinese_by_button(&model, cx);
+			cx.executor().advance_clock(hold);
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let status = status_text(&model, cx);
+			assert!(status.contains("產生 payload 失敗"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// [`remote_copy_in_flight_across_a_language_switch_lands_in_the_new_language`]
+		/// for a copied commit.
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_commit_copy_in_flight_across_a_language_switch_lands_in_the_new_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			let row = cx.debug_bounds("log-subject:0").expect("a commit row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			settle_until(cx, "the commit to be selected", |cx| {
+				model.read_with(cx, |m, _| m.selected_commit.is_some())
+			});
+			let hold = Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_copy_hold = Some(hold));
+			to_english(&model, cx);
+			lose_the_worker(&model, cx);
+			cx.simulate_keystrokes("cmd-c");
+			settle(cx);
+			assert!(model.read_with(cx, |m, _| m.is_copying), "held");
+			to_chinese_by_button(&model, cx);
+			cx.executor().advance_clock(hold);
+			settle_until(cx, "the copy to end", |cx| {
+				model.read_with(cx, |m, _| !m.is_copying)
+			});
+			let status = status_text(&model, cx);
+			assert!(status.contains("產生 payload 失敗"), "{status}");
+			assert_no_snip_in_zh(&status);
+		}
+
+		/// A commit's file list read in flight across a language switch
+		/// (a Git view): its error lands in the new language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_commit_files_in_flight_across_a_language_switch_land_in_the_new_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			let hold = Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_log_read_delay = Some(hold));
+			to_english(&model, cx);
+			lose_the_worker(&model, cx);
+			let row = cx.debug_bounds("log-subject:0").expect("a commit row");
+			cx.simulate_click(row.center(), gpui::Modifiers::none());
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| m.preview_error.is_none()),
+				"held"
+			);
+			to_chinese_by_button(&model, cx);
+			cx.executor().advance_clock(hold);
+			settle_until(cx, "the preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.preview_error.as_ref().unwrap().render(m.locale)
+			});
+			assert_no_snip_in_zh(&err);
+		}
+
+		/// A Project tree file read in flight across a language switch (a
+		/// preview): its error lands in the new language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_preview_in_flight_across_a_language_switch_lands_in_the_new_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click_probed(&model, cx, "ws-tree-row:notes");
+			settle_until(cx, "the notes folder to open", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("ws-tree-row:notes/n.txt").is_some()
+					})
+				})
+			});
+			let hold = Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(hold));
+			to_english(&model, cx);
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "ws-tree-row:notes/n.txt");
+			assert!(
+				model.read_with(cx, |m, _| m.preview_error.is_none()),
+				"held"
+			);
+			to_chinese_by_button(&model, cx);
+			cx.executor().advance_clock(hold);
+			settle_until(cx, "the preview error", |cx| {
+				model.read_with(cx, |m, _| m.preview_error.is_some())
+			});
+			let err = model.read_with(cx, |m, _| {
+				m.preview_error.as_ref().unwrap().render(m.locale)
+			});
+			assert!(err.contains("預覽"), "{err}");
+			assert_no_snip_in_zh(&err);
+		}
+
+		/// A scan failure shown in 繁中 follows a switch to English: the
+		/// banner and the status line word the reason again (#208).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_scan_failure_shown_follows_a_language_switch(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			lose_the_worker_at(&model, cx, true);
+			cx.simulate_keystrokes("cmd-r");
+			settle_until(cx, "the scan to fail", |cx| {
+				model.read_with(cx, |m, _| m.remote.scan_error.is_some())
+			});
+			let banner = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.remote.scan_error.as_ref().unwrap().render(m.locale)
+				})
+			};
+			let zh = banner(cx);
+			assert!(zh.contains("無法讀取遠端的 Git 儲存庫"), "{zh}");
+			assert_no_snip_in_zh(&zh);
+			to_english(&model, cx);
+			let en = banner(cx);
+			assert!(
+				en.contains("Failed to read remote Git repositories"),
+				"{en}"
+			);
+			assert_snip_in_en(&en);
+			let status = status_text(&model, cx);
+			assert_snip_in_en(&status);
+			// And back with the button.
+			to_chinese_by_button(&model, cx);
+			assert_no_snip_in_zh(&banner(cx));
+			assert_no_snip_in_zh(&status_text(&model, cx));
+		}
+
+		/// A log read that failed shows its reason in the log's banner and
+		/// the status line; a language switch rewords both (#208).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_log_error_shown_follows_a_language_switch(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			lose_the_worker(&model, cx);
+			click(cx, "btn-log-refresh");
+			settle_until(cx, "the log error", |cx| {
+				model.read_with(cx, |m, _| m.history_error.is_some())
+			});
+			// What the banner and the status bar drew, not a re-rendering
+			// of the model's fields.
+			let banner = |_: &mut VisualTestContext| {
+				crate::ui::last_drawn("log-error").expect("the banner drew")
+			};
+			let bar = |_: &mut VisualTestContext| {
+				crate::ui::last_drawn("status-text").expect("the bar drew")
+			};
+			assert_no_snip_in_zh(&banner(cx));
+			assert_no_snip_in_zh(&bar(cx));
+			to_english(&model, cx);
+			assert_snip_in_en(&banner(cx));
+			assert_snip_in_en(&bar(cx));
+		}
+
+		/// The row a failed Project tree listing leaves follows a switch of
+		/// language too (#208).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_tree_error_row_shown_follows_a_language_switch(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			cx.simulate_keystrokes("alt-1");
+			settle(cx);
+			click_probed(&model, cx, "ws-tree-row:notes");
+			settle_until(cx, "the notes folder to open", |cx| {
+				model.read_with(cx, |m, _| {
+					m.probes.as_ref().is_some_and(|p| {
+						p.bounds("ws-tree-row:notes/sub").is_some()
+					})
+				})
+			});
+			lose_the_worker(&model, cx);
+			click_probed(&model, cx, "ws-tree-row:notes/sub");
+			// The text the tree row drew, not the row's own fields.
+			let row =
+				|_: &mut VisualTestContext| crate::ui::last_drawn("tree-error");
+			settle_until(cx, "the listing error", |cx| row(cx).is_some());
+			assert_no_snip_in_zh(&row(cx).unwrap());
+			to_english(&model, cx);
+			assert_snip_in_en(&row(cx).unwrap());
+		}
+
+		/// A remote open that failed says so on the status bar and in the
+		/// menu's note; a language switch rewords both (#208).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_open_failure_shown_follows_a_language_switch(
+			cx: &mut TestAppContext,
+		) {
+			use crate::remote::RecentRemote;
+			let _serial = remote_lock();
+			let tmp = tempfile::tempdir().unwrap();
+			let id = dunce::canonicalize(tmp.path())
+				.unwrap()
+				.display()
+				.to_string();
+			let (model, cx) = remote_menu(cx);
+			model.update(cx, |m, cx| {
+				m.restore_remote(
+					RecentRemote {
+						host: "gone-host".into(),
+						path: id,
+					},
+					cx,
+				);
+			});
+			settle(cx);
+			assert!(status_text(&model, cx).contains("gone-host"));
+			assert!(status_text(&model, cx).contains("無法開啟遠端工作區"));
+			to_english(&model, cx);
+			let status = status_text(&model, cx);
+			assert!(
+				status.contains("Cannot open the remote workspace"),
+				"{status}"
+			);
+			assert!(!status.contains("已經沒有主機"), "{status}");
+			let note = model.read_with(cx, |m, _| {
+				m.remote.message.as_ref().map(|(_, n)| n.render(m.locale))
+			});
+			let note = note.expect("a note");
+			assert!(!note.contains("已經沒有主機"), "{note}");
+			assert!(note.contains("no longer names host"), "{note}");
+		}
+
+		/// A pasted commit's file row whose diff cannot be read, shown in
+		/// 繁中, words its reason in English after a switch (#208).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_paste_diff_failure_shown_follows_a_language_switch(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			paste_a_commit(&model, cx);
+			lose_the_worker(&model, cx);
+			click(cx, "paste-row:0:init.txt");
+			wait_paste_detail(&model, cx);
+			let notice = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.paste
+						.detail()
+						.and_then(|d| {
+							d.notice.as_ref().map(|n| n.render(m.locale))
+						})
+						.expect("a notice")
+				})
+			};
+			let zh = notice(cx);
+			assert!(zh.contains("無法顯示差異"), "{zh}");
+			assert_no_snip_in_zh(&zh);
+			to_english(&model, cx);
+			let en = notice(cx);
+			assert!(en.contains("Diff unavailable"), "{en}");
+			assert_snip_in_en(&en);
+		}
+
+		/// The same read in flight across a language switch (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_paste_diff_in_flight_across_a_language_switch_lands_in_the_new_language(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			paste_a_commit(&model, cx);
+			lose_the_worker(&model, cx);
+			let hold = Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_paste_diff_hold = Some(hold));
+			to_english(&model, cx);
+			click(cx, "paste-row:0:init.txt");
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| {
+					m.paste.detail().is_none_or(|d| d.notice.is_none())
+				}),
+				"held"
+			);
+			to_chinese_by_button(&model, cx);
+			cx.executor().advance_clock(hold);
+			wait_paste_detail(&model, cx);
+			let notice = model.read_with(cx, |m, _| {
+				m.paste
+					.detail()
+					.and_then(|d| d.notice.as_ref().map(|n| n.render(m.locale)))
+					.expect("a notice")
+			});
+			assert!(notice.contains("無法顯示差異"), "{notice}");
+			assert_no_snip_in_zh(&notice);
+		}
+
+		/// Pastes a one-file commit into the open remote workspace and waits
+		/// for its plan.
+		#[cfg(unix)]
+		fn paste_a_commit(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "C1".into(),
+						author_name: "Ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-10-13T12:00:00+00:00".into(),
+						files: vec![CommitFile {
+							path: "init.txt".into(),
+							old_path: None,
+							change: FileChange::Modified,
+							content: Some("c1\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			clip::write_text(&payload).unwrap();
+			cx.simulate_keystrokes("cmd-v");
+			settle_until(cx, "the commit paste to plan", |cx| {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				})
+			});
 		}
 
 		/// Every row shares one gutter, and the subject of each row keeps at
@@ -13738,7 +15170,13 @@ mod tests {
 			wait_paste_detail(&model, cx);
 			model.read_with(cx, |m, _| {
 				assert_eq!(
-					m.paste.detail().unwrap().notice.as_deref(),
+					m.paste
+						.detail()
+						.unwrap()
+						.notice
+						.as_ref()
+						.map(|n| n.render(m.locale))
+						.as_deref(),
 					Some(crate::i18n::t("reason_nc_binary", m.locale))
 				);
 				assert!(m.paste.plan().unwrap().overwrite_missing());
@@ -13772,6 +15210,62 @@ mod tests {
 				fs::read(dest.join(".git/refs/heads/main")).unwrap(),
 				before_head
 			);
+		}
+
+		/// A commit pasted into a remote workspace (Cmd+V), then a click on a
+		/// file row when the worker cannot restart: the preview's notice
+		/// says why in the interface language (#206).
+		#[cfg(unix)]
+		#[gpui::test]
+		fn remote_commit_paste_diff_with_a_lost_worker_says_why_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			use snip_core::commits::{
+				CommitFile, CommitRecord, CommitsPayload, FileChange,
+			};
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let (_tmp, model, cx, _worker) = open_remote_to_lose(cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+			assert_eq!(
+				model.read_with(cx, |m, _| m.locale),
+				crate::i18n::Locale::ZhTw
+			);
+			let payload =
+				snip_core::commits::to_clipboard_text(&CommitsPayload {
+					commits: vec![CommitRecord {
+						message: "C1".into(),
+						author_name: "Ann".into(),
+						author_email: "ann@example.invalid".into(),
+						author_date: "2026-10-13T12:00:00+00:00".into(),
+						files: vec![CommitFile {
+							path: "init.txt".into(),
+							old_path: None,
+							change: FileChange::Modified,
+							content: Some("c1\n".into()),
+							not_copied: None,
+						}],
+					}],
+				});
+			clip::write_text(&payload).unwrap();
+			cx.simulate_keystrokes("cmd-v");
+			settle_until(cx, "the commit paste to plan", |cx| {
+				model.read_with(cx, |m, _| {
+					m.paste.plan().is_some() && !m.paste.is_loading()
+				})
+			});
+			lose_the_worker(&model, cx);
+			click(cx, "paste-row:0:init.txt");
+			wait_paste_detail(&model, cx);
+			let notice = model.read_with(cx, |m, _| {
+				m.paste
+					.detail()
+					.and_then(|d| d.notice.as_ref().map(|n| n.render(m.locale)))
+					.expect("a notice")
+			});
+			assert!(notice.contains("無法顯示差異"), "{notice}");
+			assert_no_snip_in_zh(&notice);
 		}
 
 		/// A ~9 MiB commit opens, and a small row's detail read must fit: the
@@ -14232,7 +15726,10 @@ mod tests {
 				);
 				assert_eq!(detail.text.as_ref(), "exact content");
 				let notice = detail.notice.as_ref().expect("notice present");
-				assert_eq!(notice, crate::i18n::t("paste_diff_same", m.locale));
+				assert_eq!(
+					notice.render(m.locale),
+					crate::i18n::t("paste_diff_same", m.locale)
+				);
 			});
 		}
 
@@ -14260,7 +15757,11 @@ mod tests {
 				assert!(!detail.is_diff, "an oversized target has no diff");
 				assert_eq!(detail.text.as_ref(), "small now");
 				assert_eq!(
-					detail.notice.as_deref(),
+					detail
+						.notice
+						.as_ref()
+						.map(|n| n.render(m.locale))
+						.as_deref(),
 					Some(crate::i18n::t("paste_diff_too_large", m.locale))
 				);
 			});
@@ -14276,7 +15777,11 @@ mod tests {
 				let detail = m.paste.detail().expect("detail present");
 				assert!(!detail.is_diff, "a binary target has no diff");
 				assert_eq!(
-					detail.notice.as_deref(),
+					detail
+						.notice
+						.as_ref()
+						.map(|n| n.render(m.locale))
+						.as_deref(),
 					Some(crate::i18n::t("paste_diff_binary", m.locale))
 				);
 			});
@@ -15301,9 +16806,11 @@ mod tests {
 			});
 			assert_eq!(
 				model.read_with(cx, |m, _| m.log_empty_state()),
-				Some(LogEmpty::Failed(crate::i18n::Msg::new(
+				Some(LogEmpty::Failed(crate::i18n::Msg::with_msg_arg(
 					"error_history",
-					["git read failure".to_string()]
+					[String::new()],
+					0,
+					crate::i18n::Msg::raw("git read failure")
 				)))
 			);
 		}
@@ -15736,6 +17243,190 @@ mod tests {
 			assert_eq!(drawn, wanted, "the drawn split follows the new width");
 		}
 
+		/// At the default 1080x720 window with the details pane open, an
+		/// active repository and an active branch both stay on the bar:
+		/// their values are truncated before either goes into the overflow
+		/// chip (#205).
+		#[gpui::test]
+		fn two_active_log_chips_stay_on_the_bar_at_the_default_window(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 752.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.refs.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let (visible, hidden, repo_value) = model.read_with(cx, |m, _| {
+				let (on, off) = m.log_filter_split();
+				(on, off, m.log_scope_value())
+			});
+			assert_eq!(
+				repo_value.as_deref(),
+				Some("repo-01-core"),
+				"the repo chip shows the repo name"
+			);
+			assert!(
+				visible.contains(&crate::ui::LogMenu::Repo)
+					&& visible.contains(&crate::ui::LogMenu::Branch),
+				"both active chips stay on the bar: shown {visible:?}, \
+				 overflow {hidden:?}"
+			);
+			for id in ["log-filter-repo", "log-filter-branch"] {
+				assert!(cx.debug_bounds(id).is_some(), "{id} drawn");
+			}
+		}
+
+		/// The drawn text cap follows a resize that keeps the split mask: the
+		/// bar widened, so the truncated values get their room back with no
+		/// input (#205).
+		#[gpui::test]
+		fn log_chip_text_cap_follows_a_resize_that_keeps_the_mask(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(ws.path(), name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1080., 752.);
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					!m.refs.is_empty() && m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let before =
+				model.read_with(cx, |m, _| m.log_filter_layout.text_cap());
+			for w in [1110., 1140.] {
+				cx.simulate_resize(gpui::size(gpui::px(w), gpui::px(752.)));
+				for _ in 0..5 {
+					settle(cx);
+				}
+				let (drawn, wanted, mask) = model.read_with(cx, |m, _| {
+					let l = &m.log_filter_layout;
+					(
+						l.text_cap(),
+						l.text_cap_for(l.container_w.get()),
+						l.last_mask.get(),
+					)
+				});
+				assert_eq!(mask & 0b11, 0b11, "both chips stay on the bar");
+				assert!(
+					(drawn - wanted).abs() < 0.5,
+					"at {w}: drawn cap {drawn} follows the bar ({wanted})"
+				);
+				assert!(drawn >= before, "a wider bar never shrinks the cap");
+			}
+		}
+
+		/// The same as above in a remote workspace (#205): repositories nest
+		/// under the shared folder, and the chip names the repo without the
+		/// `host ▸ path ›` prefix, so both active chips stay on the bar.
+		#[gpui::test]
+		fn two_active_log_chips_stay_on_the_bar_in_a_remote_workspace(
+			cx: &mut TestAppContext,
+		) {
+			let _guard = remote_lock();
+			let ws = tempfile::tempdir().unwrap();
+			let shared = ws.path().join("shared");
+			fs::create_dir(&shared).unwrap();
+			for name in ["repo-01-core", "repo-02-api"] {
+				let r = repo(&shared, name, &[]);
+				fs::write(r.join("c1.txt"), "c1\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "c1"]);
+				git(&r, &["branch", "topic-03"]);
+			}
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			cx.simulate_resize(gpui::size(gpui::px(1080.), gpui::px(752.)));
+			model.update(cx, |m, cx| {
+				m.log_details_visible = true;
+				cx.notify();
+			});
+			for _ in 0..50 {
+				settle(cx);
+				let ready = model.read_with(cx, |m, _| {
+					m.repos.len() >= 2
+						&& !m.refs.is_empty()
+						&& m.log_width.get() > 1000.
+				});
+				if ready {
+					break;
+				}
+			}
+			click(cx, "log-filter-branch");
+			click(cx, "log-branch-group:refs_local");
+			click(cx, "log-branch:refs/heads/topic-03");
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:repo-01-core");
+			for _ in 0..5 {
+				settle(cx);
+			}
+			let (visible, hidden, repo_value) = model.read_with(cx, |m, _| {
+				let (on, off) = m.log_filter_split();
+				(on, off, m.log_scope_value())
+			});
+			assert_eq!(repo_value.as_deref(), Some("repo-01-core"));
+			assert!(
+				visible.contains(&crate::ui::LogMenu::Repo)
+					&& visible.contains(&crate::ui::LogMenu::Branch),
+				"both active chips stay on the bar: shown {visible:?}, \
+				 overflow {hidden:?}"
+			);
+		}
+
 		/// At a narrow window width with widened details pane and an active long user filter,
 		/// no filter chip intersects action buttons and user filter is reachable.
 		#[gpui::test]
@@ -15991,14 +17682,16 @@ mod tests {
 			cx.simulate_click(row.center(), gpui::Modifiers::none());
 			for _ in 0..50 {
 				settle(cx);
-				let loaded =
-					model.read_with(cx, |m, _| !m.commit_files.is_empty());
+				let loaded = model.read_with(cx, |m, _| {
+					!m.commit_files.is_empty() && m.preview.is_some()
+				});
 				if loaded {
 					break;
 				}
 			}
 			model.read_with(cx, |m, _| {
 				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(m.preview.is_some(), "the diff must load first");
 			});
 
 			model.update(cx, |m, cx| {
@@ -16020,6 +17713,289 @@ mod tests {
 				assert!(m.selected_commit.is_none(), "selection kept");
 				assert!(m.commit_files.is_empty(), "stale files kept");
 				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale commit diff kept after the branch filter",
+				);
+			});
+		}
+
+		/// True while the preview is a diff, file or compare from the Log.
+		fn commit_preview_shown(m: &WorkbenchModel) -> bool {
+			use crate::reader::PreviewSource;
+			matches!(
+				m.preview.as_ref().map(|p| &p.source),
+				Some(PreviewSource::CommitDiff { .. })
+					| Some(PreviewSource::CommitFile { .. })
+					| Some(PreviewSource::Compare { .. })
+			)
+		}
+
+		/// Changing the Log's repository scope drops the selected commit with
+		/// its files and diff, as a branch filter does (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_clears_the_selected_commit_and_its_diff(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix = model
+				.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == "alpha commit")
+				})
+				.expect("alpha commit listed");
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			click(cx, id);
+			for _ in 0..50 {
+				settle(cx);
+				let loaded = model.read_with(cx, |m, _| {
+					!m.commit_files.is_empty() && commit_preview_shown(m)
+				});
+				if loaded {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				assert!(!m.commit_files.is_empty(), "files must load first");
+				assert!(commit_preview_shown(m), "the diff must load first");
+			});
+
+			// The user's gestures: the repository chip, then beta.
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				let cleared =
+					model.read_with(cx, |m, _| m.selected_commit.is_none());
+				if cleared {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(m.commit_files.is_empty(), "stale files kept");
+				assert!(m.commit_details.is_none(), "stale details kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale commit diff kept after the repository filter",
+				);
+			});
+		}
+
+		/// A file preview still loading (a slow read) is not the Log's: the
+		/// repository chip must not discard it (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_keeps_a_file_preview_still_loading(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_read_delay = Some(delay));
+			// Project-tree and Changes rows have no debug selector, so the
+			// read starts through the model; the chip is a real click.
+			let root = alpha.clone();
+			model.update(cx, |m, cx| {
+				m.select_file_in(
+					Some(root),
+					"a.txt",
+					crate::SourceKind::File,
+					cx,
+				);
+			});
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| m.preview_loading),
+				"the read must be held in flight",
+			);
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_repo_filter.len(), 1, "the chip applied");
+				assert!(
+					m.preview_loading,
+					"the repo filter dropped the file read in flight",
+				);
+			});
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.selected_file.as_deref(), Some("a.txt"));
+				assert!(
+					m.preview.is_some() && !m.preview_loading,
+					"the requested preview was dropped by the repo filter",
+				);
+			});
+		}
+
+		/// A Log commit read still in flight when an error clears
+		/// `preview_loading` must still be dropped by a repository filter
+		/// change: the Log's read must not reinstall files or a diff for a
+		/// selection that is gone (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_drops_a_log_read_after_an_error_cleared_loading(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			fs::write(alpha.join("a.txt"), "alpha content\n").unwrap();
+			git(&alpha, &["add", "."]);
+			git(&alpha, &["commit", "-q", "-m", "alpha commit"]);
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix = model
+				.read_with(cx, |m, _| {
+					m.display_commits()
+						.iter()
+						.position(|c| c.subject == "alpha commit")
+				})
+				.expect("alpha commit listed");
+			let id: &'static str =
+				Box::leak(format!("log-subject:{ix}").into_boxed_str());
+			let delay = std::time::Duration::from_secs(60);
+			model.update(cx, |m, _| m.e2e_log_read_delay = Some(delay));
+			click(cx, id);
+			settle(cx);
+			assert!(
+				model.read_with(cx, |m, _| {
+					m.preview_loading && m.commit_files.is_empty()
+				}),
+				"the Log read must be held in flight",
+			);
+			// Another read fails first and clears the loading flag without
+			// touching the generation.
+			model.update(cx, |m, _| {
+				m.show_preview_error(crate::Msg::new(
+					"error_repo_changes",
+					["beta".to_string(), "boom".to_string()],
+				));
+			});
+			assert!(!model.read_with(cx, |m, _| m.preview_loading));
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.selected_commit.is_none()) {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			cx.executor().advance_clock(delay);
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.selected_commit.is_none(), "selection kept");
+				assert!(
+					m.commit_files.is_empty(),
+					"the late Log read reinstalled files",
+				);
+				assert!(
+					!commit_preview_shown(m),
+					"the late Log read reinstalled a commit diff",
+				);
+			});
+		}
+
+		/// A Shift-range selection previews a Compare; a repository filter
+		/// change drops it with the selection and the compare state (#202).
+		#[gpui::test]
+		fn a_repo_filter_change_clears_a_shift_range_compare(
+			cx: &mut TestAppContext,
+		) {
+			let ws = tempfile::tempdir().unwrap();
+			let alpha = repo(ws.path(), "alpha", &[]);
+			repo(ws.path(), "beta", &[]);
+			for n in ["one", "two"] {
+				fs::write(alpha.join(format!("{n}.txt")), "x\n").unwrap();
+				git(&alpha, &["add", "."]);
+				git(&alpha, &["commit", "-q", "-m", &format!("alpha {n}")]);
+			}
+
+			let (model, cx) =
+				open_sized(cx, ws.path().to_path_buf(), None, 1440., 900.);
+			settle(cx);
+			let ix_of = |subject: &str| {
+				model
+					.read_with(cx, |m, _| {
+						m.display_commits()
+							.iter()
+							.position(|c| c.subject == subject)
+					})
+					.expect("commit listed")
+			};
+			let newer = ix_of("alpha two");
+			let older = ix_of("alpha one");
+			let newer_id: &'static str =
+				Box::leak(format!("log-subject:{newer}").into_boxed_str());
+			let older_id: &'static str =
+				Box::leak(format!("log-subject:{older}").into_boxed_str());
+			click(cx, newer_id);
+			let bounds = cx.debug_bounds(older_id).expect("older row");
+			cx.simulate_click(
+				bounds.center(),
+				gpui::Modifiers {
+					shift: true,
+					..Default::default()
+				},
+			);
+			cx.run_until_parked();
+			for _ in 0..50 {
+				settle(cx);
+				if model.read_with(cx, |m, _| commit_preview_shown(m)) {
+					break;
+				}
+			}
+			model.read_with(cx, |m, _| {
+				assert_eq!(m.log_selected.len(), 2, "range must be selected");
+				assert!(
+					matches!(
+						m.preview.as_ref().map(|p| &p.source),
+						Some(crate::reader::PreviewSource::Compare { .. })
+					),
+					"the range must preview a compare first",
+				);
+			});
+
+			click(cx, "log-filter-repo");
+			click(cx, "log-repo:beta");
+			for _ in 0..1200 {
+				settle(cx);
+				if model.read_with(cx, |m, _| m.selected_commit.is_none()) {
+					break;
+				}
+				std::thread::sleep(std::time::Duration::from_millis(25));
+			}
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				assert!(m.log_selected.is_empty(), "range kept");
+				assert!(m.compare.is_none(), "compare state kept");
+				assert!(
+					!commit_preview_shown(m),
+					"stale compare kept after the repository filter",
+				);
 			});
 		}
 
@@ -16264,11 +18240,11 @@ mod tests {
 				panic!("timed out waiting for {what}");
 			}
 
-			fn sel(id: String) -> &'static str {
+			pub(super) fn sel(id: String) -> &'static str {
 				Box::leak(id.into_boxed_str())
 			}
 
-			fn click_id(cx: &mut VisualTestContext, id: String) {
+			pub(super) fn click_id(cx: &mut VisualTestContext, id: String) {
 				cx.run_until_parked();
 				let id = sel(id);
 				let bounds = cx
@@ -17426,7 +19402,10 @@ mod tests {
 				at
 			}
 
-			fn tooltip_shown(cx: &mut VisualTestContext, text: &str) -> bool {
+			pub(super) fn tooltip_shown(
+				cx: &mut VisualTestContext,
+				text: &str,
+			) -> bool {
 				drawn(cx, &format!("tooltip:{text}"))
 			}
 
@@ -17582,6 +19561,123 @@ mod tests {
 				assert!(
 					!tooltip_shown(cx, &path),
 					"tab {k}'s tooltip stays over another tab"
+				);
+			}
+
+			/// Opening the workspace menu takes its button's tooltip away
+			/// (#203): left up, it covers the menu's first item.
+			#[gpui::test]
+			fn opening_the_workspace_menu_hides_its_buttons_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				let loc = tab(&root, cx, 0).read_with(cx, |m, _| m.locale);
+				let text = format!(
+					"{} · {}",
+					a.display(),
+					crate::ui::mac_keys(crate::i18n::t(
+						"tip_workspace_menu",
+						loc
+					))
+				);
+				// Clicked while the tooltip still waits to show: GPUI keeps
+				// that timer running past the mouse-down.
+				cx.run_until_parked();
+				let at = cx
+					.debug_bounds("btn-workspace-menu")
+					.expect("button drawn")
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+
+				click_id(cx, "btn-workspace-menu".into());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+				assert!(
+					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					"the menu is open"
+				);
+				assert!(
+					!tooltip_shown(cx, &text),
+					"the tooltip stays over the opened menu"
+				);
+				let row = workspace_menu_first_row(cx);
+				assert!(!covered_by_tooltip(cx, row, &text));
+			}
+
+			/// The tooltip `text` is drawn over the point `at`.
+			pub(super) fn covered_by_tooltip(
+				cx: &mut VisualTestContext,
+				at: gpui::Point<gpui::Pixels>,
+				text: &str,
+			) -> bool {
+				cx.run_until_parked();
+				cx.debug_bounds(sel(format!("tooltip:{text}")))
+					.is_some_and(|b| b.contains(&at))
+			}
+
+			/// The first row of the open workspace menu.
+			fn workspace_menu_first_row(
+				cx: &mut VisualTestContext,
+			) -> gpui::Point<gpui::Pixels> {
+				let panel = cx
+					.debug_bounds("workspace-menu")
+					.expect("the workspace menu is drawn");
+				gpui::point(panel.center().x, panel.origin.y + gpui::px(20.))
+			}
+
+			/// Hovered until its tooltip is up, then clicked: GPUI's own
+			/// MouseDown already drops a shown tooltip, so this guards that
+			/// existing behaviour for the workspace button (not the #203 fix).
+			#[gpui::test]
+			fn clicking_the_workspace_button_drops_its_shown_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, a, _b, root, cx) = two_tabs(cx);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				let loc = tab(&root, cx, 0).read_with(cx, |m, _| m.locale);
+				let text = format!(
+					"{} · {}",
+					a.display(),
+					crate::ui::mac_keys(crate::i18n::t(
+						"tip_workspace_menu",
+						loc
+					))
+				);
+				hover_id(cx, "btn-workspace-menu");
+				assert!(tooltip_shown(cx, &text), "the tooltip is up");
+				click_id(cx, "btn-workspace-menu".into());
+				assert!(
+					tab(&root, cx, 0).read_with(cx, |m, _| m.workspace_menu),
+					"the menu is open"
+				);
+				assert!(!tooltip_shown(cx, &text), "the tooltip stays");
+				let row = workspace_menu_first_row(cx);
+				assert!(!covered_by_tooltip(cx, row, &text));
+			}
+
+			/// A tooltip left up while a native dialog took the pointer
+			/// goes when the window gets its focus back (#203), without
+			/// waiting for the next mouse input.
+			#[gpui::test]
+			fn a_tooltip_goes_when_the_window_regains_focus(
+				cx: &mut TestAppContext,
+			) {
+				let (_tmp, dirs, root, cx) = many_tabs(cx, 2);
+				cx.simulate_keystrokes("cmd-1");
+				settle(cx);
+				assert_eq!(active(&root, cx), Some(0));
+				hover_id(cx, "ws-tab:0");
+				let path = dirs[0].display().to_string();
+				assert!(tooltip_shown(cx, &path), "the tab tooltip is up");
+
+				cx.update(|window, _| window.activate_window());
+				settle(cx);
+				assert!(
+					!tooltip_shown(cx, &path),
+					"the pointer's place is unknown until it moves"
 				);
 			}
 
@@ -18686,6 +20782,7 @@ mod tests {
 				let views = root.read_with(cx, |r, cx| r.tab_views(cx));
 				assert_eq!(views[1].1.conn, Some(Conn::Failed));
 				let why = views[1].1.failed.clone().expect("a reason");
+				let why = why.render(crate::i18n::Locale::En);
 				assert!(why.contains(&host.name), "{why}");
 				click_id(cx, "ws-tab:1".into());
 				assert!(drawn(cx, "ws-tab-state:1:failed"));
@@ -19177,6 +21274,61 @@ mod tests {
 					Some(2),
 					"the retry came after the stop"
 				);
+			}
+		}
+
+		/// Log toolbar tooltips.
+		mod log_tooltips {
+			use super::workspace_tabs::{
+				click_id, covered_by_tooltip, tooltip_shown,
+			};
+			use super::*;
+
+			/// The Log toolbar's More button opens a menu below itself:
+			/// its tooltip must not cover the first item (#203).
+			#[gpui::test]
+			fn opening_the_log_more_menu_hides_its_buttons_tooltip(
+				cx: &mut TestAppContext,
+			) {
+				let ws = tempfile::tempdir().unwrap();
+				let r = repo(ws.path(), "my-repo", &[]);
+				fs::write(r.join("c1.txt"), "c1 content\n").unwrap();
+				git(&r, &["add", "."]);
+				git(&r, &["commit", "-q", "-m", "commit c1"]);
+				let (model, cx) =
+					open_sized(cx, ws.path().to_path_buf(), None, 1080., 720.);
+				for _ in 0..50 {
+					settle(cx);
+					if model.read_with(cx, |m, _| !m.commits.is_empty()) {
+						break;
+					}
+				}
+				settle(cx);
+				let loc = model.read_with(cx, |m, _| m.locale);
+				let text = crate::i18n::t("tip_log_more", loc).to_string();
+				// Clicked while the tooltip still waits to show.
+				let at = cx
+					.debug_bounds("btn-log-more")
+					.expect("More drawn")
+					.center();
+				cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+				click_id(cx, "btn-log-more".into());
+				cx.executor().advance_clock(Duration::from_millis(700));
+				settle(cx);
+				assert_eq!(
+					model.read_with(cx, |m, _| m.log_menu),
+					Some(crate::ui::LogMenu::More),
+					"the menu is open"
+				);
+				assert!(
+					!tooltip_shown(cx, &text),
+					"the tooltip stays over the opened menu"
+				);
+				let item = cx
+					.debug_bounds("log-more:details")
+					.expect("first item drawn")
+					.center();
+				assert!(!covered_by_tooltip(cx, item, &text));
 			}
 		}
 	}

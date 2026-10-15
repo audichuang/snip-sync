@@ -32,7 +32,7 @@ use crate::proto::{
 	JOINED_MAX, MAX_GIT_CALLS_IN_FLIGHT, PROTOCOL_MAX, PROTOCOL_VERSION,
 };
 use crate::worker::{Worker, PREAMBLE};
-use crate::{ConnectFailureKind, RemoteError};
+use crate::{ConnectFailureKind, RemoteError, StartReason};
 
 /// How long a new connection may take to reach the worker's hello: ssh
 /// resolves, authenticates and starts a shell first.
@@ -197,6 +197,8 @@ impl HandshakeGate {
 				// Nothing was sent: the wait was for a slot, not the worker.
 				return Err(RemoteError::Start {
 					kind: ConnectFailureKind::TimedOut,
+					reason: None,
+					detail: String::new(),
 					message: "timed out waiting for a connection slot to that \
 					          machine: other connections there are still \
 					          starting; try again"
@@ -543,6 +545,8 @@ impl Connection {
 		let code = status.and_then(|s| s.code());
 		RemoteError::Start {
 			kind: start_failure_kind(&cause, code, &stderr),
+			reason: start_reason(&cause, code, &stderr),
+			detail: stderr.clone(),
 			message: start_message(cause, code, &stderr),
 		}
 	}
@@ -760,40 +764,59 @@ pub(crate) enum StartCause {
 	Ended,
 }
 
+/// The known reason the worker did not start, when there is one.
+pub(crate) fn start_reason(
+	cause: &StartCause,
+	code: Option<i32>,
+	stderr: &str,
+) -> Option<StartReason> {
+	match cause {
+		StartCause::NoAnswer if stderr.is_empty() => {
+			Some(StartReason::NoAnswer)
+		}
+		StartCause::NoAnswer | StartCause::BadData(_) => None,
+		StartCause::Ended | StartCause::Io(_) => {
+			if code == Some(127) || stderr.contains("unrecognized subcommand") {
+				Some(StartReason::NoWorker)
+			} else if stderr.contains("Permission denied") {
+				Some(StartReason::KeyLogin)
+			} else if stderr.is_empty() {
+				Some(StartReason::Closed)
+			} else {
+				None
+			}
+		}
+	}
+}
+
 /// The user-facing reason a worker did not start.
 pub(crate) fn start_message(
 	cause: StartCause,
 	code: Option<i32>,
 	stderr: &str,
 ) -> String {
-	match cause {
-		StartCause::NoAnswer if stderr.is_empty() => {
+	match (start_reason(&cause, code, stderr), cause) {
+		(Some(StartReason::NoAnswer), _) => {
 			"the worker on that machine did not answer in time; check its \
 			 load and connection, then try again"
 				.into()
 		}
-		// Whatever the transport said outranks the bare timeout.
-		StartCause::NoAnswer => stderr.to_string(),
-		// The stream's own message: a banner, an out-of-step frame.
-		StartCause::BadData(message) => message,
-		StartCause::Ended | StartCause::Io(_) => {
-			if code == Some(127) || stderr.contains("unrecognized subcommand") {
-				return "snip is not installed on that machine, or is too old for \
-				        ssh connections; install snip-sync there"
-					.into();
-			}
-			if stderr.contains("Permission denied") {
-				return format!(
-					"ssh could not log in without a password; set up key login \
-					 (ssh-copy-id) first: {stderr}"
-				);
-			}
-			if stderr.is_empty() {
-				return "the remote end closed the connection before snip started"
-					.into();
-			}
-			stderr.to_string()
+		(Some(StartReason::NoWorker), _) => {
+			"snip is not installed on that machine, or is too old for \
+			 ssh connections; install snip-sync there"
+				.into()
 		}
+		(Some(StartReason::KeyLogin), _) => format!(
+			"ssh could not log in without a password; set up key login \
+			 (ssh-copy-id) first: {stderr}"
+		),
+		(Some(StartReason::Closed), _) => {
+			"the remote end closed the connection before snip started".into()
+		}
+		// The stream's own message: a banner, an out-of-step frame.
+		(None, StartCause::BadData(message)) => message,
+		// Whatever the transport said outranks the bare timeout.
+		(None, _) => stderr.to_string(),
 	}
 }
 
@@ -1521,6 +1544,39 @@ impl Client {
 		}
 	}
 
+	/// Pools a connection whose transport died while idle: the next request
+	/// on it fails with a broken pipe before any reply and is resent on a
+	/// fresh worker (#206), for tests of that path.
+	#[doc(hidden)]
+	pub fn pool_a_dead_connection_for_tests(&self) {
+		struct Dead;
+		impl io::Write for Dead {
+			fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+				Err(io::Error::from(io::ErrorKind::BrokenPipe))
+			}
+			fn flush(&mut self) -> io::Result<()> {
+				Ok(())
+			}
+		}
+		self.keep(Connection {
+			writer: Box::new(Dead),
+			frames: mpsc::sync_channel(1).1,
+			child: None,
+			stderr: Arc::default(),
+			worker_name: String::new(),
+			home: None,
+			version: u32::MAX,
+			broken: false,
+			frames_seen: 0,
+			retained: Arc::default(),
+			in_flight: Arc::default(),
+			last_byte: StreamClock::new(),
+			call_started: Instant::now(),
+			call_base: 0,
+			frame_base: 0,
+		});
+	}
+
 	pub fn host(&self) -> &RemoteHost {
 		&self.host
 	}
@@ -1683,6 +1739,14 @@ impl Client {
 					Err(err @ RemoteError::WorkerTooOld { .. }) => {
 						return Err(err)
 					}
+					// A start failure with a known cause is what the user
+					// can act on; the dead pooled connection's I/O error is
+					// only how it showed.
+					Err(
+						err @ RemoteError::Start {
+							reason: Some(_), ..
+						},
+					) => return Err(err),
 					// Without a replacement, the original failure stands.
 					Err(_) => {}
 				}
@@ -1846,6 +1910,11 @@ impl Client {
 					Err(error @ RemoteError::WorkerTooOld { .. }) => {
 						return Err(error)
 					}
+					Err(
+						error @ RemoteError::Start {
+							reason: Some(_), ..
+						},
+					) => return Err(error),
 					Err(_) => {}
 				}
 			}
@@ -2070,6 +2139,11 @@ impl Client {
 					Err(error @ RemoteError::WorkerTooOld { .. }) => {
 						return Err(error)
 					}
+					Err(
+						error @ RemoteError::Start {
+							reason: Some(_), ..
+						},
+					) => return Err(error),
 					Err(_) => {}
 				}
 			}
@@ -2843,6 +2917,16 @@ impl From<RemoteError> for GitError {
 				args: "remote view".into(),
 				secs: GIT_CALL_LIMIT.as_secs(),
 			},
+			RemoteError::Start {
+				reason: Some(reason),
+				detail,
+				message,
+				..
+			} => GitError::HostStart {
+				reason,
+				detail,
+				message,
+			},
 			other => GitError::Host(other.to_string()),
 		}
 	}
@@ -3540,6 +3624,8 @@ mod tests {
 		] {
 			let error = RemoteError::Start {
 				kind: start_failure_kind(&cause, code, stderr),
+				reason: start_reason(&cause, code, stderr),
+				detail: stderr.to_string(),
 				message: start_message(cause.clone(), code, stderr),
 			};
 			assert_eq!(
@@ -3602,6 +3688,8 @@ mod tests {
 			assert_eq!(kind, ConnectFailureKind::Other, "{stderr}");
 			let error = RemoteError::Start {
 				kind,
+				reason: None,
+				detail: stderr.to_string(),
 				message: start_message(StartCause::Ended, Some(255), stderr),
 			};
 			assert!(error.is_restore_retryable(), "{stderr}");
@@ -3613,6 +3701,8 @@ mod tests {
 				Some(255),
 				"user@box: Permission denied (publickey).",
 			),
+			reason: None,
+			detail: String::new(),
 			message: String::new(),
 		};
 		assert!(!denied.is_restore_retryable(), "{denied:?}");
@@ -3624,6 +3714,8 @@ mod tests {
 		] {
 			let error = RemoteError::Start {
 				kind,
+				reason: None,
+				detail: String::new(),
 				message: String::new(),
 			};
 			assert!(!error.is_restore_retryable(), "{error:?}");
@@ -3919,6 +4011,34 @@ mod tests {
 		};
 		assert!(matches!(GitError::from(err8), GitError::Host(_)));
 
+		// A worker that did not start keeps its known cause for the GUI, and
+		// the CLI's English text unchanged (#206).
+		let started = RemoteError::Start {
+			kind: ConnectFailureKind::WorkerUnavailable,
+			reason: Some(StartReason::NoWorker),
+			detail: "sh: snip: not found".into(),
+			message: "snip is not installed on that machine".into(),
+		};
+		let git = GitError::from(started);
+		assert!(
+			matches!(
+				git,
+				GitError::HostStart {
+					reason: StartReason::NoWorker,
+					..
+				}
+			),
+			"{git:?}"
+		);
+		assert_eq!(git.to_string(), "snip is not installed on that machine");
+		let unknown = RemoteError::Start {
+			kind: ConnectFailureKind::Other,
+			reason: None,
+			detail: "boom".into(),
+			message: "boom".into(),
+		};
+		assert!(matches!(GitError::from(unknown), GitError::Host(_)));
+
 		let err_too_large = RemoteError::Refused {
 			code: ErrorCode::TooLarge,
 			message: "refs payload exceeded frame limit".into(),
@@ -4210,6 +4330,102 @@ mod tests {
 			0,
 			"the queue is drained: a pooled connection is clean"
 		);
+	}
+
+	/// A pooled connection that dies mid-request, and a restart that fails
+	/// for a known reason: the caller gets the reason (it words it in its
+	/// own language), not the dead connection's English I/O text.
+	#[cfg(unix)]
+	#[test]
+	fn a_restart_that_fails_with_a_known_reason_outranks_the_dead_connection() {
+		struct DeadPipe;
+		impl io::Write for DeadPipe {
+			fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+				Err(io::Error::from(io::ErrorKind::BrokenPipe))
+			}
+			fn flush(&mut self) -> io::Result<()> {
+				Ok(())
+			}
+		}
+		let host = RemoteHost {
+			name: "gone".into(),
+			// The command exits 127 before any hello: snip is not there.
+			transport: Transport::Command(vec![
+				"/bin/sh".into(),
+				"-c".into(),
+				"exit 127".into(),
+			]),
+		};
+		let client = Client::new(host, "test".into());
+		let dead = test_conn(
+			Box::new(DeadPipe),
+			mpsc::sync_channel(1).1,
+			Arc::default(),
+			Arc::default(),
+		);
+		client.keep(dead);
+		let err = client
+			.call(&Request::Stat {
+				workspace: "w".into(),
+				path: "a".into(),
+			})
+			.unwrap_err();
+		assert!(
+			matches!(
+				err,
+				RemoteError::Start {
+					reason: Some(StartReason::NoWorker),
+					..
+				}
+			),
+			"{err:?}"
+		);
+	}
+
+	/// The same precedence in the paste plans: a dead pooled connection,
+	/// then a restart that exits 127. Planning is read-only and resent once;
+	/// the known start reason outranks the dead connection's I/O error.
+	#[cfg(unix)]
+	#[test]
+	fn a_known_start_reason_outranks_the_dead_connection_in_paste_plans() {
+		let gone = || {
+			let client = Client::new(
+				RemoteHost {
+					name: "gone".into(),
+					transport: Transport::Command(vec![
+						"/bin/sh".into(),
+						"-c".into(),
+						"exit 127".into(),
+					]),
+				},
+				"test".into(),
+			);
+			client.pool_a_dead_connection_for_tests();
+			client
+		};
+		let no_worker = |err: &RemoteError| {
+			matches!(
+				err,
+				RemoteError::Start {
+					reason: Some(StartReason::NoWorker),
+					..
+				}
+			)
+		};
+		let err = gone()
+			.prepare_import("/w", "", "source", &PasteMapping::default(), None)
+			.unwrap_err();
+		assert!(no_worker(&err), "prepare_import: {err:?}");
+		let err = gone()
+			.prepare_replay(
+				"/w",
+				"",
+				"source",
+				snip_core::commits::CommitsPayload { commits: vec![] },
+				None,
+			)
+			.unwrap_err();
+		assert!(no_worker(&err), "prepare_replay: {err:?}");
 	}
 
 	/// A writer the write side can be parked inside, like `ChildStdin` on a
@@ -4905,6 +5121,45 @@ mod tests {
 		for (request, git) in requests {
 			assert_eq!(runs_git(&request), git, "{request:?}");
 		}
+	}
+
+	/// The known start failures carry a reason for callers that word them
+	/// in their own language, and keep the transport's stderr untouched.
+	#[test]
+	fn start_reason_names_the_known_causes_and_keeps_stderr() {
+		let reason = |cause, code, stderr| start_reason(&cause, code, stderr);
+		assert_eq!(
+			reason(StartCause::Ended, Some(127), ""),
+			Some(StartReason::NoWorker)
+		);
+		assert_eq!(
+			reason(
+				StartCause::Ended,
+				Some(2),
+				"error: unrecognized subcommand 'serve'"
+			),
+			Some(StartReason::NoWorker)
+		);
+		assert_eq!(
+			reason(
+				StartCause::Ended,
+				Some(255),
+				"u@h: Permission denied (publickey)."
+			),
+			Some(StartReason::KeyLogin)
+		);
+		assert_eq!(
+			reason(StartCause::NoAnswer, None, ""),
+			Some(StartReason::NoAnswer)
+		);
+		assert_eq!(
+			reason(StartCause::Ended, Some(255), ""),
+			Some(StartReason::Closed)
+		);
+		// Unknown stderr and a stream's own message stay unclassified.
+		assert_eq!(reason(StartCause::Ended, Some(1), "boom"), None);
+		assert_eq!(reason(StartCause::NoAnswer, None, "ssh: x"), None);
+		assert_eq!(reason(StartCause::BadData("bad".into()), None, ""), None);
 	}
 
 	/// A transport that is alive but silent through the whole hello wait

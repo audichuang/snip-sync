@@ -51,6 +51,8 @@ pub enum ConnectFailureKind {
 	Other,
 }
 
+pub use snip_core::gitsrc::StartReason;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
 	#[error(transparent)]
@@ -61,6 +63,10 @@ pub enum RemoteError {
 	#[error("{message}")]
 	Start {
 		kind: ConnectFailureKind,
+		/// The known cause, when the start failure is one of them.
+		reason: Option<StartReason>,
+		/// The transport's own stderr, unchanged; empty when it said nothing.
+		detail: String,
 		message: String,
 	},
 	/// The worker answered with an error.

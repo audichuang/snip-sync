@@ -30,6 +30,34 @@ use crate::paste::{
 use crate::reader::{DiffMode, PreviewSource};
 use crate::selector::Pick;
 use crate::theme::*;
+/// Text a surface is about to draw. Release builds hand it back; a test
+/// build also remembers it per surface, so a test reads what was drawn
+/// instead of re-rendering the model's fields itself (#206 #208).
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn drawn(_surface: &'static str, text: String) -> String {
+	text
+}
+
+#[cfg(test)]
+thread_local! {
+	static DRAWN: std::cell::RefCell<std::collections::HashMap<&'static str, String>> =
+		std::cell::RefCell::default();
+}
+
+#[cfg(test)]
+pub(crate) fn drawn(surface: &'static str, text: String) -> String {
+	DRAWN.with(|d| d.borrow_mut().insert(surface, text.clone()));
+	text
+}
+
+/// What `surface` drew last, if it has drawn at all. Only the remote tests
+/// read it, and those are `cfg(unix)`.
+#[cfg(all(test, unix))]
+pub(crate) fn last_drawn(surface: &'static str) -> Option<String> {
+	DRAWN.with(|d| d.borrow().get(surface).cloned())
+}
+
 use crate::tree::{command_for_row, FlattenedTreeRow, RowGesture};
 use crate::{
 	ApplyPaste, CancelPaste, CloseWorkspace, CopySelection, FindInFile,
@@ -316,6 +344,14 @@ impl Probes {
 		ids
 	}
 
+	/// Test only: where a control was last drawn, in physical pixels
+	/// `[x, y, w, h]`: what an operator reads from `[APP:CTRL_BOUNDS]`.
+	#[cfg(all(test, unix))]
+	pub fn bounds(&self, id: &str) -> Option<[i32; 4]> {
+		let f = self.0.borrow();
+		f.seen.get(id).or_else(|| f.shown.get(id)).copied()
+	}
+
 	/// Test only: runs end_frame_with_audit on the underlying ProbeFrame.
 	#[cfg(test)]
 	pub fn end_frame_with_audit(
@@ -450,6 +486,10 @@ impl Render for Tip {
 		cx: &mut Context<Self>,
 	) -> impl IntoElement {
 		let text = (self.0)(cx);
+		if text.is_empty() {
+			// The thing it described is gone: no empty box.
+			return div();
+		}
 		div()
 			.px_2()
 			.py_1()
@@ -982,7 +1022,7 @@ impl WorkbenchModel {
 				match placed.get(&row.rel_path).filter(|_| row.is_dir) {
 					Some(&idx) => {
 						shown.push(idx);
-						self.push_repo_rows(idx, row.depth, &mut body);
+						self.push_repo_rows(idx, row.depth as usize, &mut body);
 					}
 					None if ws => body.push(ProjRow::Ws(row)),
 					None => body.push(ProjRow::Work(row)),
@@ -1049,7 +1089,7 @@ impl WorkbenchModel {
 				out.extend(
 					t.flatten_visible(t.visible_limit()).into_iter().map(
 						|mut row| {
-							row.depth += depth;
+							row.depth = row.depth.saturating_add(depth as u32);
 							ProjRow::Work(row)
 						},
 					),
@@ -1145,7 +1185,7 @@ impl WorkbenchModel {
 	}
 
 	/// Row labels the speed search matches against.
-	fn tool_row_labels(&self) -> Vec<String> {
+	pub(crate) fn tool_row_labels(&self) -> Vec<String> {
 		if self.active_tab == WorkbenchTab::GitChanges {
 			self.change_item_rows()
 				.into_iter()
@@ -1176,7 +1216,7 @@ impl WorkbenchModel {
 				.into_iter()
 				.map(|r| match r {
 					ProjRow::Repo(i, _) => self.repos[i].name.clone(),
-					ProjRow::Work(w) | ProjRow::Ws(w) => w.name,
+					ProjRow::Work(w) | ProjRow::Ws(w) => w.label(self.locale),
 					ProjRow::Rev(r) => r.name,
 				})
 				.collect()

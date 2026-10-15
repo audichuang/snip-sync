@@ -8,6 +8,7 @@ use snip_core::gitview::{LocalRepo, Read, RepoView};
 use snip_core::workspace::RepoIdentity;
 use snip_remote::Client;
 
+use crate::i18n::Msg;
 use crate::WorkbenchModel;
 
 /// Where the workbench's Git views read from.
@@ -29,20 +30,20 @@ impl GitHost {
 		root: &Path,
 		known: Option<&RepoIdentity>,
 		read: &Read,
-	) -> Result<Box<dyn RepoView>, String> {
+	) -> Result<Box<dyn RepoView>, Msg> {
 		match self {
 			Self::Local => {
 				if root.to_string_lossy().starts_with("snip-remote://") {
-					return Err(format!(
+					return Err(Msg::raw(format!(
 						"local Git host cannot open remote repository '{}'",
 						root.display()
-					));
+					)));
 				}
 				match known {
 					Some(id) => Ok(Box::new(LocalRepo::known(id))),
 					None => LocalRepo::open(root, read)
 						.map(|r| Box::new(r) as Box<dyn RepoView>)
-						.map_err(|e| e.to_string()),
+						.map_err(|e| Msg::raw(e.to_string())),
 				}
 			}
 			Self::Remote {
@@ -51,11 +52,11 @@ impl GitHost {
 				root: session_root,
 			} => {
 				let rel = self.remote_rel(root).ok_or_else(|| {
-					format!(
+					Msg::raw(format!(
 						"repository '{}' is not under remote session root '{}'",
 						root.display(),
 						session_root.display()
-					)
+					))
 				})?;
 				Ok(Box::new(snip_remote::RemoteRepo::new(
 					client.clone(),
@@ -92,20 +93,16 @@ impl WorkbenchModel {
 	}
 }
 
-/// Translates Git errors encountered while querying refs into a displayable string.
+/// Git errors encountered while querying refs as a displayable message.
 /// For remote hosts exceeding the worker's frame limit (`GitError::OutputLimit`),
-/// returns the localized message of `remote_refs_too_large`.
-pub(crate) fn refs_error(
-	host: &GitHost,
-	e: GitError,
-	locale: crate::i18n::Locale,
-) -> String {
+/// that is `remote_refs_too_large`; a start failure words itself when drawn.
+pub(crate) fn refs_error(host: &GitHost, e: GitError) -> Msg {
 	if matches!(host, GitHost::Remote { .. })
 		&& matches!(e, GitError::OutputLimit { .. })
 	{
-		crate::i18n::t("remote_refs_too_large", locale).to_string()
+		Msg::new("remote_refs_too_large", [])
 	} else {
-		e.to_string()
+		crate::remote::git_error_msg(e)
 	}
 }
 
@@ -134,8 +131,8 @@ mod tests {
 				args: "remote view".into(),
 				limit: 0,
 			},
-			crate::i18n::Locale::ZhTw,
 		);
+		let zh_err = zh_err.render(crate::i18n::Locale::ZhTw);
 		assert_eq!(zh_err, "遠端參照資料過大");
 		assert_eq!(
 			zh_err,
@@ -147,8 +144,8 @@ mod tests {
 				args: "remote view".into(),
 				limit: 0,
 			},
-			crate::i18n::Locale::En,
 		);
+		let en_err = en_err.render(crate::i18n::Locale::En);
 		assert_eq!(en_err, "Remote references too large");
 		assert_eq!(
 			en_err,
@@ -159,7 +156,7 @@ mod tests {
 		let other_err = GitError::Host("server died".into());
 		let other_str = other_err.to_string();
 		assert_eq!(
-			refs_error(&remote_host, other_err, crate::i18n::Locale::En),
+			refs_error(&remote_host, other_err).render(crate::i18n::Locale::En),
 			other_str
 		);
 
@@ -170,7 +167,7 @@ mod tests {
 		};
 		let local_str = local_err.to_string();
 		assert_eq!(
-			refs_error(&local_host, local_err, crate::i18n::Locale::En),
+			refs_error(&local_host, local_err).render(crate::i18n::Locale::En),
 			local_str
 		);
 	}

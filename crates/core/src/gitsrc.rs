@@ -37,6 +37,23 @@ pub const SHA256_EMPTY_TREE: &str =
 /// Stands in for content the requested revision could not supply.
 pub const UNREADABLE_FILE_MARKER: &str = "// Unable to read file content";
 
+/// The known causes of a worker that did not start, for callers that word
+/// them in their own language. The English `message` stays the CLI's text.
+/// It follows `start_message`'s wording classes, so the CLI and the GUI
+/// agree; the remote crate's `ConnectFailureKind` (`kind`) drives retry policy instead and
+/// classifies differently, so the two are not interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartReason {
+	/// snip is missing on that machine or too old for `serve --stdio`.
+	NoWorker,
+	/// ssh was refused and cannot ask for a password.
+	KeyLogin,
+	/// The worker never sent its hello in time.
+	NoAnswer,
+	/// The far end closed before snip started.
+	Closed,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
 	#[error(
@@ -94,6 +111,14 @@ pub enum GitError {
 	VerifyLimit { what: &'static str },
 	#[error("{0}")]
 	Host(String),
+	/// A remote worker that did not start: the known cause, the transport's
+	/// stderr and the English text the CLI prints.
+	#[error("{message}")]
+	HostStart {
+		reason: StartReason,
+		detail: String,
+		message: String,
+	},
 	#[error(transparent)]
 	Io(#[from] io::Error),
 }

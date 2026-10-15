@@ -1,6 +1,7 @@
 //! Git Log list, commit details and changed files.
 
 use super::*;
+use crate::i18n::Msg;
 
 impl WorkbenchModel {
 	pub(super) fn render_log(
@@ -45,10 +46,11 @@ impl WorkbenchModel {
 			)
 			.child(div().flex_1())
 			.child(
-				log_icon_button(
+				log_icon_button_tip(
 					"btn-log-more",
 					Icon::More,
-					t("tip_log_more", loc),
+					(self.log_menu != Some(LogMenu::More))
+						.then(|| t("tip_log_more", loc).into()),
 					true,
 					self.log_menu == Some(LogMenu::More),
 				)
@@ -204,7 +206,13 @@ impl WorkbenchModel {
 							}
 							let new_mask =
 								layout.compute_split(new_w, has_values);
-							if new_mask != layout.last_mask.get() {
+							// The cap for the new width: a resize that keeps
+							// the mask can still leave the chips truncated
+							// (or not) for the old width.
+							let stale_cap = (layout.text_cap_for(new_w)
+								- layout.text_cap())
+							.abs() > 0.5;
+							if new_mask != layout.last_mask.get() || stale_cap {
 								let ref_count = layout.refresh_count.get();
 								if ref_count < 3 {
 									layout.refresh_count.set(ref_count + 1);
@@ -388,7 +396,16 @@ impl WorkbenchModel {
 						.bg(rgb(pal().error_bg))
 						.text_size(px(SMALL_TEXT))
 						.text_color(rgb(pal().error))
-						.child(tf("error_history", loc, &[&err]))
+						.child(super::drawn(
+							"log-error",
+							Msg::with_msg_arg(
+								"error_history",
+								[String::new()],
+								0,
+								err.clone(),
+							)
+							.render(loc),
+						))
 						.children(probe(log, "log-error")),
 				)
 			})
