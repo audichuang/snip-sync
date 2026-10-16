@@ -1727,6 +1727,7 @@ mod tests {
 				freshness: DestinationFreshnessSnapshot {
 					roots: Default::default(),
 					target_files,
+					..Default::default()
 				},
 			},
 		};
@@ -1822,6 +1823,7 @@ mod tests {
 			freshness: DestinationFreshnessSnapshot {
 				roots: Default::default(),
 				target_files: Default::default(),
+				..Default::default()
 			},
 		};
 		let prepare = Request::PrepareReplay {

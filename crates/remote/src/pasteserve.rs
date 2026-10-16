@@ -124,7 +124,10 @@ fn destination(root: &SharedRoot, rel: &str) -> Result<PathBuf, Refusal> {
 }
 
 /// The paths a master sent back with a snapshot must be ones this paste
-/// could have recorded: under `base`.
+/// could have recorded: under `base`. The snapshot's `repos` keys are not
+/// checked here: a repository's top can lie above the workspace, and what
+/// the paste may lock is not known until it is planned again. `revalidate`
+/// compares them with the set it derives itself, before it runs git in any.
 fn check_snapshot(
 	base: &Path,
 	freshness: &DestinationFreshnessSnapshot,
@@ -134,7 +137,8 @@ fn check_snapshot(
 		&& freshness
 			.target_files
 			.iter()
-			.all(|(p, t)| inside(p) && inside(t.root.path()));
+			.all(|(p, t)| inside(p) && inside(t.root.path()))
+		&& freshness.missing_dirs.iter().flatten().all(|p| inside(p));
 	if ok {
 		Ok(())
 	} else {
@@ -392,7 +396,9 @@ pub(crate) fn import_apply(
 			.map_err(|e| transfer_refusal(e, cancel))?;
 		let Planned { plan, .. } = plan(root, dest, text, mapping, cancel)?;
 		if digest(plan.restore_plan())? != expect.digest
-			|| plan.destination_freshness() != &expect.freshness
+			|| !plan
+				.destination_freshness()
+				.matches_preview(&expect.freshness)
 		{
 			let at = plan.roots().first().cloned().unwrap_or_default();
 			return Err(stale(&at, "destination changed after preview"));

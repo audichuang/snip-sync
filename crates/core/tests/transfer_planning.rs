@@ -7777,3 +7777,70 @@ fn test_a_file_on_the_folder_path_is_refused_at_preview_on_every_platform() {
 		);
 	}
 }
+
+#[test]
+fn test_freshness_repo_set_is_not_doubled_for_a_repo_root_destination() {
+	let a = TestRepo::new("repoA");
+	a.write("seed.txt", "seed\n");
+	a.commit("seed");
+	let plan = plan_one(a.path(), "// file: x.txt\nx\n");
+	let snap = plan.destination_freshness();
+	let repos = snap.repos.as_ref().expect("a file paste records its repos");
+	let got: std::collections::HashSet<_> = repos.keys().collect();
+	let want: std::collections::HashSet<_> = snap.roots.keys().collect();
+	assert_eq!(got, want);
+	assert!(snap.missing_dirs.as_ref().unwrap().is_empty());
+}
+
+#[test]
+fn test_a_snapshot_without_the_new_fields_still_revalidates_and_matches() {
+	let a = TestRepo::new("repoA");
+	a.write("seed.txt", "seed\n");
+	a.commit("seed");
+	let ws = a.workspace();
+	assert_not_a_repo(&ws);
+
+	let plan = plan_one(&ws, "// file: repoA/new/x.txt\nx\n");
+	let new = plan.destination_freshness().clone();
+	let repo_id = a.canonical_id();
+	assert!(new.repos.as_ref().unwrap().contains_key(&repo_id));
+	assert_eq!(
+		new.missing_dirs.as_ref().unwrap().len(),
+		1,
+		"{:?}",
+		new.missing_dirs
+	);
+
+	// What an older master sends back: the fields it did not know are gone.
+	let mut json = serde_json::to_value(&new).unwrap();
+	let object = json.as_object_mut().unwrap();
+	object.remove("repos");
+	object.remove("missing_dirs");
+	let old: DestinationFreshnessSnapshot =
+		serde_json::from_value(json).unwrap();
+	assert_eq!((&old.repos, &old.missing_dirs), (&None, &None));
+	old.revalidate().unwrap();
+	assert!(new.matches_preview(&old));
+
+	// A repo the preview recorded must be the one captured again.
+	let mut changed = new.clone();
+	changed
+		.repos
+		.as_mut()
+		.unwrap()
+		.get_mut(&repo_id)
+		.unwrap()
+		.head_commit = Some("0".repeat(40));
+	assert!(!changed.matches_preview(&new));
+	assert!(new.matches_preview(&new));
+
+	// A folder planned as new that exists by Apply time does not make the
+	// capture differ.
+	let mut grown = new.clone();
+	grown.missing_dirs.as_mut().unwrap().clear();
+	assert!(grown.matches_preview(&new));
+
+	let back: DestinationFreshnessSnapshot =
+		serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+	assert_eq!(back, new);
+}

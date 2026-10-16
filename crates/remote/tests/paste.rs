@@ -1692,3 +1692,95 @@ fn a_folder_created_after_a_remote_preview_still_applies() {
 		.unwrap();
 	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "a");
 }
+
+#[test]
+fn a_forged_repo_key_is_refused_as_stale_before_git_runs_there() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = entry("a.txt", "a");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	let mut expect = planned.expect();
+	// A folder that does not exist: git cannot be opened in it, so a worker
+	// that ran git on it first would answer Io, not Stale.
+	expect.freshness.repos.get_or_insert_default().insert(
+		serde_json::from_value(serde_json::json!(ws.join("nowhere"))).unwrap(),
+		snip_core::transfer::RepoFreshness {
+			head_commit: None,
+			head_ref: None,
+			index_hash: None,
+		},
+	);
+	let code = refused(client.import_apply(
+		&id,
+		"",
+		&text,
+		&mapping,
+		&unchecked(&[]),
+		&expect,
+		None,
+	));
+	assert_eq!(code, ErrorCode::Stale);
+	assert!(!ws.join("a.txt").exists());
+}
+
+#[test]
+fn a_snapshot_naming_a_folder_outside_the_workspace_is_a_bad_request() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	fs::create_dir_all(&ws).unwrap();
+	let text = entry("a.txt", "a");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	let mut expect = planned.expect();
+	expect
+		.freshness
+		.missing_dirs
+		.get_or_insert_default()
+		.insert(tmp.path().join("elsewhere"));
+	let code = refused(client.import_apply(
+		&id,
+		"",
+		&text,
+		&mapping,
+		&unchecked(&[]),
+		&expect,
+		None,
+	));
+	assert_eq!(code, ErrorCode::BadRequest);
+	assert!(!ws.join("a.txt").exists());
+}
+
+#[test]
+fn an_older_masters_snapshot_without_the_new_fields_still_applies() {
+	let _serial = serial();
+	let tmp = tempfile::tempdir().unwrap();
+	let ws = tmp.path().join("ws");
+	// The workspace is itself a repository, so the worker's own capture has
+	// a non-empty `repos` to differ from the snapshot's absent one.
+	init_repo(&ws);
+	let text = entry("new/a.txt", "a");
+	let w = worker(None);
+	let (client, id) = open(&w, &ws);
+	let mapping = PasteMapping::default();
+	let planned = client.import_plan(&id, "", &text, &mapping, None).unwrap();
+	assert!(planned.expect().freshness.repos.is_some());
+	let mut json = serde_json::to_value(planned.expect()).unwrap();
+	let freshness = json["freshness"].as_object_mut().unwrap();
+	freshness.remove("repos");
+	freshness.remove("missing_dirs");
+	let expect: snip_remote::proto::ImportExpect =
+		serde_json::from_value(json).unwrap();
+	assert!(expect.freshness.repos.is_none());
+	client
+		.import_apply(&id, "", &text, &mapping, &unchecked(&[]), &expect, None)
+		.unwrap();
+	assert_eq!(fs::read_to_string(ws.join("new/a.txt")).unwrap(), "a");
+}

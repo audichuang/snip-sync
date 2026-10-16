@@ -3080,6 +3080,7 @@ mod tests {
 				freshness: snip_core::transfer::DestinationFreshnessSnapshot {
 					roots: Default::default(),
 					target_files: Default::default(),
+					..Default::default()
 				},
 			};
 			let token: String = "opaque-token".into();
@@ -5208,6 +5209,7 @@ mod tests {
 			freshness: snip_core::transfer::DestinationFreshnessSnapshot {
 				roots: Default::default(),
 				target_files: Default::default(),
+				..Default::default()
 			},
 		};
 		let requests = [
@@ -5373,6 +5375,7 @@ mod tests {
 							snip_core::transfer::DestinationFreshnessSnapshot {
 								roots: Default::default(),
 								target_files: Default::default(),
+								..Default::default()
 							},
 					},
 					check_only: false,
