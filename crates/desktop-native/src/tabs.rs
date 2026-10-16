@@ -1419,36 +1419,32 @@ mod tests {
 		assert_eq!(got, ["repo", "sub"]);
 	}
 
+	/// One rule for every line: the tag is the first field after `KIND: `, so
+	/// nothing the line ends in (a folder named `... ws_tab=2`, a free-text
+	/// id) can pass for it.
 	#[test]
-	fn background_lines_are_tagged_inside_the_brackets() {
-		assert_eq!(
-			tag_with("[APP:WORKSPACE: state=open generation=2]".into(), 3),
-			"[APP:WORKSPACE: state=open generation=2 ws_tab=3]"
-		);
-		assert_eq!(
-			tag_with("[APP:PASTE_APPLYING]".into(), 3),
-			"[APP:PASTE_APPLYING: ws_tab=3]"
-		);
-		assert_eq!(tag_with("[READY:IDLE]".into(), 3), "[READY:IDLE]");
-	}
-
-	/// A line that ends in an id the user can spell any way is tagged before
-	/// the `id=` field, which stays the last one: an id that is itself
-	/// `... ws_tab=2` is not the tag, and the tag is not part of the id.
-	#[test]
-	fn a_line_that_ends_in_an_id_is_tagged_before_it() {
+	fn background_lines_are_tagged_right_after_the_kind() {
 		for (line, tagged) in [
 			(
+				"[APP:WORKSPACE: state=open generation=2]",
+				"[APP:WORKSPACE: ws_tab=3 state=open generation=2]",
+			),
+			("[APP:PASTE_APPLYING]", "[APP:PASTE_APPLYING: ws_tab=3]"),
+			(
+				"[APP:WS_TAB_ACTIVE: id=2 ix=1]",
+				"[APP:WS_TAB_ACTIVE: ws_tab=3 id=2 ix=1]",
+			),
+			(
+				"[APP:REPO_SELECTING: 0 (name ws_tab=2) root=/w/name ws_tab=2]",
+				"[APP:REPO_SELECTING: ws_tab=3 0 (name ws_tab=2) root=/w/name ws_tab=2]",
+			),
+			(
 				"[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 id=report ws_tab=2]",
-				"[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 ws_tab=3 id=report ws_tab=2]",
+				"[APP:CTRL_BOUNDS: ws_tab=3 x=1 y=2 w=3 h=4 id=report ws_tab=2]",
 			),
 			(
 				"[APP:CTRL_GONE: id=a b]",
 				"[APP:CTRL_GONE: ws_tab=3 id=a b]",
-			),
-			(
-				"[APP:CTRL_GONE: id=report ws_tab=2]",
-				"[APP:CTRL_GONE: ws_tab=3 id=report ws_tab=2]",
 			),
 			(
 				"[APP:CTRL_DUPLICATE: id=x id=y]",
@@ -1456,7 +1452,7 @@ mod tests {
 			),
 			(
 				"[APP:CTRL_COVERED: by=b%20id=c id=a ws_tab=1]",
-				"[APP:CTRL_COVERED: by=b%20id=c ws_tab=3 id=a ws_tab=1]",
+				"[APP:CTRL_COVERED: ws_tab=3 by=b%20id=c id=a ws_tab=1]",
 			),
 			(
 				"[APP:TEXT_FIT_GONE: id=text-fit:a ws_tab=2]",
@@ -1464,16 +1460,12 @@ mod tests {
 			),
 			(
 				"[APP:TEXT_FIT_DRIFT: fit=1 drawn=2 id=t]",
-				"[APP:TEXT_FIT_DRIFT: fit=1 drawn=2 ws_tab=3 id=t]",
+				"[APP:TEXT_FIT_DRIFT: ws_tab=3 fit=1 drawn=2 id=t]",
 			),
 		] {
 			assert_eq!(tag_with(line.into(), 3), tagged);
 		}
-		// Lines that carry no free-text id keep their tag at the end.
-		assert_eq!(
-			tag_with("[APP:WS_TAB_ACTIVE: id=2 ix=1]".into(), 3),
-			"[APP:WS_TAB_ACTIVE: id=2 ix=1 ws_tab=3]"
-		);
+		assert_eq!(tag_with("[READY:IDLE]".into(), 3), "[READY:IDLE]");
 	}
 
 	#[test]
@@ -1484,7 +1476,7 @@ mod tests {
 		let root = tag_line("[APP:X: a=1]".into());
 		set_active_tab(None);
 		assert_eq!(shown, "[APP:X: a=1]");
-		assert_eq!(hidden, "[APP:X: a=1 ws_tab=2]");
+		assert_eq!(hidden, "[APP:X: ws_tab=2 a=1]");
 		assert_eq!(root, "[APP:X: a=1]");
 	}
 }

@@ -60,7 +60,7 @@ class TestBoundsOfOddIds(unittest.TestCase):
         ):
             for tab in ("", "ws_tab=2 "):
                 with self.subTest(id=control, tab=tab):
-                    lines = [f"[APP:CTRL_BOUNDS: x=7 y=-8 w=90 h=12 {tab}id={control}]"]
+                    lines = [f"[APP:CTRL_BOUNDS: {tab}x=7 y=-8 w=90 h=12 id={control}]"]
                     self.assertEqual(ime.parse_bounds(lines), {control: (7, -8, 90, 12)})
                     lines.append(f"[APP:CTRL_GONE: {tab}id={control}]")
                     self.assertEqual(ime.parse_bounds(lines), {})

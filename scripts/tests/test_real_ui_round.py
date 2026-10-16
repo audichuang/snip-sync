@@ -145,10 +145,10 @@ class TestLogParsing(unittest.TestCase):
 def fit_line(tid: str, rule: str = "readable6", natural: int = 100, floor: int = 50, fit: str = "100",
              drawn: int = 100, visible: int = 100, clipped: int = 0, cut: int = 0, shown: str = "10/10",
              tab: str = "") -> str:
-    """`tab` is a background tab's field (`ws_tab=2 `): before `id=`, which is the last field."""
+    """`tab` is a background tab's field (`ws_tab=2 `): the first one after `KIND: `."""
     return (
-        f"[APP:TEXT_FIT: rule={rule} natural={natural} floor={floor} fit={fit} drawn={drawn} "
-        f"visible={visible} clipped={clipped} cut={cut} shown={shown} {tab}id={tid}]"
+        f"[APP:TEXT_FIT: {tab}rule={rule} natural={natural} floor={floor} fit={fit} drawn={drawn} "
+        f"visible={visible} clipped={clipped} cut={cut} shown={shown} id={tid}]"
     )
 
 
@@ -322,11 +322,11 @@ class TestIdsWithAnyCharacter(unittest.TestCase):
         for tid in odd_text_ids("author"):
             for tab in ("", "ws_tab=2 "):
                 with self.subTest(id=tid, tab=tab):
-                    width = [fit_line(tid, tab=tab), f"[APP:TEXT_FIT_DRIFT: fit=100 drawn=90 {tab}id={tid}]"]
+                    width = [fit_line(tid, tab=tab), f"[APP:TEXT_FIT_DRIFT: {tab}fit=100 drawn=90 id={tid}]"]
                     self.assertEqual(rur.parse_text_fit(width)[1], [tid])
                     style = [
                         fit_line(tid, tab=tab),
-                        f"[APP:TEXT_FIT_STYLE_DRIFT: measured=JetBrains Mono/13/400 drawn=Inter/13/600 {tab}id={tid}]",
+                        f"[APP:TEXT_FIT_STYLE_DRIFT: {tab}measured=JetBrains Mono/13/400 drawn=Inter/13/600 id={tid}]",
                     ]
                     self.assertEqual(rur.parse_text_fit(style)[1], [tid])
                     gone = [*width, f"[APP:TEXT_FIT_GONE: {tab}id={tid}]"]
@@ -356,7 +356,7 @@ class TestIdsWithAnyCharacter(unittest.TestCase):
         for cid in odd_control_ids():
             for tab in ("", "ws_tab=2 "):
                 with self.subTest(id=cid, tab=tab):
-                    lines = [f"[APP:CTRL_BOUNDS: x=10 y=20 w=80 h=30 {tab}id={cid}]"]
+                    lines = [f"[APP:CTRL_BOUNDS: {tab}x=10 y=20 w=80 h=30 id={cid}]"]
                     match = rur.parse_control_bounds_from_lines(lines, cid)
                     self.assertEqual((match.control_id, match.x, match.w), (cid, 10.0, 80.0))
                     gone = [*lines, f"[APP:CTRL_GONE: {tab}id={cid}]"]

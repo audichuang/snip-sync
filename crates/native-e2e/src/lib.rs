@@ -321,7 +321,7 @@ mod tests {
 	fn any_character_in_an_id_is_read_back() {
 		for id in ODD_IDS {
 			for tag in TAGS {
-				let fit = format!("[APP:TEXT_FIT: rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79 {tag}id={id}]");
+				let fit = format!("[APP:TEXT_FIT: {tag}rule=readable6 natural=501 floor=91 fit=156 drawn=156 visible=140 clipped=1 cut=1 shown=23/79 id={id}]");
 				assert_eq!(
 					parse_text_fit(&fit),
 					Some((id.to_string(), true)),
@@ -333,14 +333,14 @@ mod tests {
 					"{fit}"
 				);
 				let drift = format!(
-					"[APP:TEXT_FIT_DRIFT: fit=126 drawn=120 {tag}id={id}]"
+					"[APP:TEXT_FIT_DRIFT: {tag}fit=126 drawn=120 id={id}]"
 				);
 				assert_eq!(
 					parse_text_fit_drift(&drift).as_deref(),
 					Some(id),
 					"{drift}"
 				);
-				let style = format!("[APP:TEXT_FIT_STYLE_DRIFT: measured=JetBrains Mono/13/400 drawn=Inter/13/600 {tag}id={id}]");
+				let style = format!("[APP:TEXT_FIT_STYLE_DRIFT: {tag}measured=JetBrains Mono/13/400 drawn=Inter/13/600 id={id}]");
 				assert_eq!(
 					parse_text_fit_drift(&style).as_deref(),
 					Some(id),
@@ -353,7 +353,7 @@ mod tests {
 					"{gone}"
 				);
 				let bounds = format!(
-					"[APP:CTRL_BOUNDS: x=12 y=-3 w=100 h=20 {tag}id={id}]"
+					"[APP:CTRL_BOUNDS: {tag}x=12 y=-3 w=100 h=20 id={id}]"
 				);
 				assert_eq!(
 					parse_bounds(&bounds),
@@ -399,7 +399,7 @@ mod tests {
 			for id in ODD_IDS {
 				for by in bys {
 					let line = format!(
-						"[APP:CTRL_COVERED: by={} {tag}id={id}]",
+						"[APP:CTRL_COVERED: {tag}by={} id={id}]",
 						encode_by(by)
 					);
 					assert_eq!(

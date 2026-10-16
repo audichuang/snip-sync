@@ -54,6 +54,7 @@ from bench_native_memory import (  # noqa: E402
     click_control,
     click_repo,
     close_shown_tab,
+    line_tab,
     open_repo_name,
     open_workspace_tab,
     change_row_group,
@@ -166,8 +167,40 @@ class TestOpenRepoName(unittest.TestCase):
         self.assertEqual(open_repo_name(lines), "repo-02")
         closed = [*lines, "[APP:WORKSPACE: state=closed generation=3]", "[APP:WS_TAB_ACTIVE: id=1 ix=0]"]
         self.assertEqual(open_repo_name(closed), "repo-01")
-        background = [*closed, "[APP:REPO_SELECTING: 3 (repo-04) root=/w/repo-04 ws_tab=2]"]
+        background = [*closed, "[APP:REPO_SELECTING: ws_tab=2 3 (repo-04) root=/w/repo-04]"]
         self.assertEqual(open_repo_name(background), "repo-01")
+
+
+class TestTabTagPosition(unittest.TestCase):
+    """`ws_tab=<n>` is the first field after `KIND: ` on every line a background tab prints."""
+
+    def test_a_folder_named_like_the_tag_is_not_the_tag(self) -> None:
+        shown = "[APP:REPO_SELECTING: 0 (name ws_tab=2) root=/w/name ws_tab=2]"
+        self.assertIsNone(line_tab(shown))
+        self.assertTrue(shown_tab_line(shown))
+        self.assertEqual(open_repo_name([shown]), "name ws_tab=2")
+        background = "[APP:REPO_SELECTING: ws_tab=2 0 (name ws_tab=2) root=/w/name ws_tab=2]"
+        self.assertEqual(line_tab(background), 2)
+        self.assertEqual(parse_repo_select(background), (0, "name ws_tab=2"))
+        # The background tab's selection is not the shown tab's.
+        self.assertEqual(open_repo_name([shown.replace("name", "other"), background]), "other ws_tab=2")
+
+    def test_every_kind_round_trips_its_tab(self) -> None:
+        for line in (
+            "[APP:WORKSPACE: state=open generation=2]",
+            "[APP:PASTE_APPLYING]",
+            "[APP:READY_REPOS: n=2]",
+            "[APP:REPO_SELECTING: 0 (a ws_tab=9) root=/w/a ws_tab=9]",
+            "[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 id=a ws_tab=9]",
+            "[APP:CTRL_GONE: id=a ws_tab=9]",
+            "[APP:CTRL_COVERED: by=b id=a ws_tab=9]",
+            "[APP:TEXT_FIT_GONE: id=a ws_tab=9]",
+        ):
+            kind, _, rest = line[len("[APP:"):-1].partition(": ")
+            tagged = f"[APP:{kind}: ws_tab=3" + (f" {rest}]" if rest else "]")
+            with self.subTest(line=line):
+                self.assertIsNone(line_tab(line))
+                self.assertEqual(line_tab(tagged), 3)
 
 
 class TestBoundsAndGone(unittest.TestCase):
@@ -222,7 +255,7 @@ class TestBoundsOfOddIds(unittest.TestCase):
         for control in self.IDS:
             for tab in ("", "ws_tab=2 "):
                 with self.subTest(id=control, tab=tab):
-                    lines = [f"[APP:CTRL_BOUNDS: x=7 y=-8 w=90 h=12 {tab}id={control}]"]
+                    lines = [f"[APP:CTRL_BOUNDS: {tab}x=7 y=-8 w=90 h=12 id={control}]"]
                     self.assertEqual(parse_bounds(lines), {control: (7, -8, 90, 12)})
                     lines.append(f"[APP:CTRL_GONE: {tab}id={control}]")
                     self.assertEqual(parse_bounds(lines), {})
@@ -234,15 +267,15 @@ class TestBoundsOfOddIds(unittest.TestCase):
             for by in ("btn-log-refresh", "pick-repo:my repo", "row: id=x ws_tab=2", "row ends in by=", "100% ] done"):
                 for tab in ("", "ws_tab=2 "):
                     with self.subTest(id=control, by=by, tab=tab):
-                        line = f"[APP:CTRL_COVERED: by={encode_by(by)} {tab}id={control}]"
+                        line = f"[APP:CTRL_COVERED: {tab}by={encode_by(by)} id={control}]"
                         self.assertEqual(parse_covered(line), (control, by))
 
     def test_a_shown_tab_line_whose_id_ends_in_a_tab_tag_is_a_shown_line(self) -> None:
         self.assertTrue(shown_tab_line("[APP:CTRL_GONE: id=change-row:report ws_tab=2]"))
         self.assertTrue(shown_tab_line("[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 id=row:ws_tab=2 id=x]"))
         self.assertFalse(shown_tab_line("[APP:CTRL_GONE: ws_tab=2 id=change-row:report ws_tab=2]"))
-        self.assertFalse(shown_tab_line("[APP:CTRL_BOUNDS: x=1 y=2 w=3 h=4 ws_tab=2 id=row:a]"))
-        self.assertFalse(shown_tab_line("[APP:READY_REPOS: n=2 ws_tab=3]"))
+        self.assertFalse(shown_tab_line("[APP:CTRL_BOUNDS: ws_tab=2 x=1 y=2 w=3 h=4 id=row:a]"))
+        self.assertFalse(shown_tab_line("[APP:READY_REPOS: ws_tab=3 n=2]"))
         self.assertTrue(shown_tab_line("[APP:READY_REPOS: n=2]"))
 
 
@@ -1796,14 +1829,14 @@ class TestWorkspaceTabDriver(unittest.TestCase):
                 "ws-tab-new": ["[APP:WS_TAB_OPENED: id=7 count=2]"],
                 "btn-workspace-open-confirm": [
                     f"[APP:WORKSPACE: state=open path={real} repos=1]",
-                    "[APP:READY_REPOS: n=1 ws_tab=3]",
+                    "[APP:READY_REPOS: ws_tab=3 n=1]",
                     "[APP:READY_REPOS: n=1]",
                 ],
             },
         )
 
     def test_shown_tab_line_rejects_background_tab_tags(self) -> None:
-        self.assertFalse(shown_tab_line("[APP:READY_REPOS: n=2 ws_tab=3]"))
+        self.assertFalse(shown_tab_line("[APP:READY_REPOS: ws_tab=3 n=2]"))
         self.assertTrue(shown_tab_line("[APP:READY_REPOS: n=2]"))
 
     def test_open_clicks_each_control_in_order_and_returns_tab_and_count(self) -> None:
@@ -1827,7 +1860,7 @@ class TestWorkspaceTabDriver(unittest.TestCase):
         open_workspace_tab(s, WIN, self.workspace)
         ready_preds = [pred for pred in s.preds if pred("[APP:READY_REPOS: n=1]")]
         self.assertEqual(len(ready_preds), 1)
-        self.assertFalse(ready_preds[0]("[APP:READY_REPOS: n=1 ws_tab=3]"))
+        self.assertFalse(ready_preds[0]("[APP:READY_REPOS: ws_tab=3 n=1]"))
 
     def test_close_reports_drained_when_the_close_drain_left_nothing(self) -> None:
         lifecycle = "[APP:LIFECYCLE: phase=drained intent=close-workspace jobs=0 inflight=0 queued=0 leaked=0 tab=7]"
