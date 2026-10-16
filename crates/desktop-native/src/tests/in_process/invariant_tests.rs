@@ -625,7 +625,7 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 	}
 	Some(match probe_prefix(id) {
 		"log-subject" | "repo-row" | "editor-tab" | "change-row"
-		| "change-repo" | "commit-row" => ROW,
+		| "change-repo" | "commit-row" | "change-unreadable" => ROW,
 		"commit-file" | "paste-row" | "tree-row" | "ws-tree-row" => ROW_L,
 		// Log toolbar and filters.
 		"btn-log-refresh"
@@ -680,11 +680,13 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		"repo-chevron"
 		| "btn-add-repo"
 		| "btn-discovery-retry"
+		| "btn-discovery-continue"
 		| "btn-leave-tree"
 		| "btn-changes-group-dir"
 		| "change-dir"
 		| "change-dir-toggle"
 		| "change-group-toggle"
+		| "change-unreadable-toggle"
 		| "change-repo-toggle" => BTN,
 		// The rail of tool windows.
 		"rail-project" | "rail-changes" | "rail-log" => BTN,
@@ -696,9 +698,11 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		}
 		// The editor.
 		"btn-tab-close" | "btn-find-prev" | "btn-find-next"
-		| "btn-find-close" | "tree-chevron" | "collapse" | "btn-find-case"
-		| "btn-find-regex" | "btn-prev-diff" | "btn-next-diff"
-		| "btn-expand-folds" | "btn-diff-mode" | "diff-fold" => BTN,
+		| "btn-find-close" | "tree-chevron" | "ws-tree-chevron"
+		| "tree-retry" | "ws-tree-retry" | "tree-more" | "ws-tree-more"
+		| "collapse" | "btn-find-case" | "btn-find-regex" | "btn-prev-diff"
+		| "btn-next-diff" | "btn-expand-folds" | "btn-diff-mode"
+		| "diff-fold" => BTN,
 		// The header and the status bar.
 		"btn-refresh" | "btn-paste" | "btn-repo-selector"
 		| "btn-ref-selector" | "pick-repo" | "pick-ref" | "selector-group"
@@ -745,6 +749,7 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		// Enter on this one opens the folder as the workspace.
 		"remote-path-input" => ProbeUse::Field { submit: false },
 		"remote-path"
+		| "changes-empty"
 		| "left-list"
 		| "log-list"
 		| "log-loading"
@@ -801,12 +806,17 @@ fn probe_use(id: &str) -> Option<ProbeUse> {
 		| "context-menu"
 		| "log-empty"
 		| "tree-loading"
+		| "tree-error"
+		| "tree-marker"
+		| "ws-tree-loading"
 		| "ref-name"
 		| "ref-repo"
 		| "log-failed-feeds"
 		| "log-filter-bar"
 		| "log-chips"
 		| "workspace-closed-remote-error" => ProbeUse::Surface,
+		// The Log's filter chips and their clear buttons.
+		p if p.starts_with("log-filter-") => BTN,
 		p if p.starts_with("commit-details-") || p.starts_with("text-fit") => {
 			ProbeUse::Surface
 		}
@@ -1042,16 +1052,18 @@ fn weights(lane: Lane) -> &'static [(ActKind, u32)] {
 			(ActKind::Advance, 6),
 			(ActKind::Fs, 6),
 		],
+		// A paste plan lands after a timer (the 40 ms watch), so this lane
+		// moves time on often: a preview is open for most of its steps.
 		Lane::Paste => &[
 			(ActKind::Click, 30),
-			(ActKind::Key, 16),
-			(ActKind::Type, 6),
+			(ActKind::Key, 12),
+			(ActKind::Type, 5),
 			(ActKind::Submit, 4),
-			(ActKind::Tick, 5),
+			(ActKind::Tick, 4),
 			(ActKind::Park, 8),
-			(ActKind::Advance, 6),
-			(ActKind::Clipboard, 10),
-			(ActKind::Paste, 10),
+			(ActKind::Advance, 14),
+			(ActKind::Clipboard, 8),
+			(ActKind::Paste, 12),
 		],
 		Lane::Remote => &[
 			(ActKind::Click, 36),
@@ -1104,6 +1116,8 @@ struct Control {
 }
 
 struct Cands {
+	/// The paste panel is drawn: its controls are what a paste lane wants.
+	paste_open: bool,
 	clicks: Vec<Control>,
 	fields: Vec<(String, [i32; 4], bool)>,
 	keys: Vec<String>,
@@ -1155,12 +1169,14 @@ fn gather(
 	let stack = cx.update(|w, _| w.context_stack());
 	let browsing = model.read_with(cx, |m, _| m.remote.browse.is_some());
 	let mut out = Cands {
+		paste_open: false,
 		clicks: Vec::new(),
 		fields: Vec::new(),
 		keys: Vec::new(),
 		unclassified: Vec::new(),
 	};
 	let frame = drawn(model, cx);
+	out.paste_open = frame.iter().any(|(id, _)| id == "paste-panel");
 	// Where a press would land on a hazard: a click on a control that a
 	// hazard covers does what the hazard does.
 	let hazards: Vec<[i32; 4]> = frame
@@ -1233,6 +1249,10 @@ struct Env {
 	/// The menu's path field was typed into since its browse began (M3).
 	typed_in_path_field: bool,
 	last_browse: Option<u64>,
+	/// The step before was a paste.
+	just_pasted: bool,
+	/// The step before armed a fault.
+	just_faulted: bool,
 }
 
 impl Env {
@@ -1265,6 +1285,74 @@ impl Env {
 				break;
 			}
 			roll -= w;
+		}
+		// A preview lands after a timer: time moves on right after the
+		// gesture that asked for one, most of the time.
+		if self.lane == Lane::Paste && self.just_pasted && rng.random_bool(0.7)
+		{
+			return Step::Advance(
+				*pick(rng, &[50, 200, 1000]).expect("a delay"),
+			);
+		}
+		// A fault waits for a request it matches: the gesture after it is
+		// mostly one that sends requests.
+		if self.lane == Lane::Remote
+			&& self.just_faulted
+			&& rng.random_bool(0.7)
+		{
+			let asks: Vec<&Control> = c
+				.clicks
+				.iter()
+				.filter(|x| {
+					[
+						"btn-refresh",
+						"btn-log-refresh",
+						"commit-row",
+						"tree-row",
+						"ws-tree-row",
+						"change-row",
+						"repo-row",
+						"tree-chevron",
+					]
+					.iter()
+					.any(|p| x.id.starts_with(p))
+				})
+				.collect();
+			if rng.random_bool(0.3) {
+				return Step::Key("ctrl-r".into());
+			}
+			if let Some(control) = pick(rng, &asks) {
+				return Step::Click {
+					id: control.id.clone(),
+					mods: Mods::None,
+					button: Button::Left,
+				};
+			}
+		}
+		// With a preview open, the lane mostly works its controls.
+		if self.lane == Lane::Paste
+			&& c.paste_open
+			&& kind == ActKind::Click
+			&& rng.random_bool(0.75)
+		{
+			let own: Vec<&Control> = c
+				.clicks
+				.iter()
+				.filter(|x| {
+					x.id.starts_with("paste-")
+						|| x.id == "btn-apply"
+						|| x.id == "btn-cancel"
+				})
+				.collect();
+			if let Some(control) = pick(rng, &own) {
+				let (mods, button) =
+					*pick(rng, &control.gestures).expect("a gesture");
+				return Step::Click {
+					id: control.id.clone(),
+					mods,
+					button,
+				};
+			}
 		}
 		match kind {
 			ActKind::Click => {
@@ -1323,7 +1411,7 @@ impl Env {
 					2 => FsEdit::Commit { repo },
 					_ => FsEdit::Checkout {
 						repo,
-						branch: *pick(rng, &["main", "feature"])
+						branch: pick(rng, &["main", "feature"])
 							.expect("a branch"),
 					},
 				});
@@ -1344,14 +1432,21 @@ impl Env {
 				}
 			}
 			ActKind::Fault => {
+				// What the screen asks the worker for most: Git views (the
+				// Log, the Changes, a commit), then the scan a Refresh makes,
+				// then the tree's listings and reads.
 				let on = *pick(
 					rng,
 					&[
 						RequestKind::GitView,
+						RequestKind::GitView,
+						RequestKind::GitView,
+						RequestKind::GitView,
+						RequestKind::ScanRepos,
+						RequestKind::ScanRepos,
 						RequestKind::ListDir,
 						RequestKind::Read,
 						RequestKind::Stat,
-						RequestKind::ScanRepos,
 					],
 				)
 				.expect("a kind");
@@ -1450,6 +1545,8 @@ impl Env {
 				.current_dir(self.ws.join(repo))
 				.args(["-c", "user.name=t", "-c", "user.email=t@t"])
 				.args(args)
+				.env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00+00:00")
+				.env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00+00:00")
 				.output();
 		};
 		match edit {
@@ -1486,10 +1583,8 @@ fn settle_all(
 	let mut last = None;
 	for _ in 0..200 {
 		cx.run_until_parked();
-		last = model.read_with(cx, |m, cx| busy(m, cx));
-		if last.is_none() {
-			return None;
-		}
+		last = model.read_with(cx, busy);
+		last.as_ref()?;
 		cx.executor().advance_clock(Duration::from_secs(1));
 		if lane == Lane::Remote {
 			// A worker is a thread of its own: let it answer.
@@ -1610,8 +1705,14 @@ fn drive(
 		let cands = gather(model, cx, &keys);
 		unclassified.extend(cands.unclassified.iter().cloned());
 		let step = env.choose(&mut rng, &cands);
+		env.just_pasted = matches!(&step, Step::Key(k) if k == "ctrl-v")
+			|| matches!(&step, Step::Click { id, .. } if id == "btn-paste");
+		env.just_faulted = matches!(&step, Step::Fault(_));
 		steps.push(step.clone());
 		env.apply(model, cx, &step);
+		if std::env::var_os("FUZZ_TRACE").is_some() {
+			eprintln!("TRACE {at} {step:?}");
+		}
 		let broken = if matches!(step, Step::Park) {
 			broken_quiet(env, model, cx)
 		} else {
@@ -1635,12 +1736,40 @@ fn drive(
 
 // ───────────────────────────── the lanes ─────────────────────────────
 
+/// A git command with every date fixed: the same fixture has the same commit
+/// ids in every run, so the candidates a lane sorts (probe ids carry short
+/// shas) come in the same order and a seed picks the same gestures.
+fn lane_git(dir: &Path, args: &[&str]) {
+	let out = Command::new("git")
+		.current_dir(dir)
+		.args(["-c", "user.name=t", "-c", "user.email=t@t"])
+		.args(args)
+		.env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00+00:00")
+		.env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00+00:00")
+		.output()
+		.expect("git must run");
+	assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// A repo with `base.txt` committed, and `untracked` on top.
+fn lane_repo(ws: &Path, name: &str, untracked: &[(&str, &str)]) -> PathBuf {
+	let dir = ws.join(name);
+	fs::create_dir(&dir).unwrap();
+	lane_git(&dir, &["init", "-q", "-b", "main"]);
+	fs::write(dir.join("base.txt"), "base").unwrap();
+	lane_git(&dir, &["add", "."]);
+	lane_git(&dir, &["commit", "-q", "-m", "base"]);
+	for (rel, body) in untracked {
+		fs::write(dir.join(rel), body).unwrap();
+	}
+	dir
+}
+
 /// `alpha` (main: four commits, one of them in a subfolder, one touching two
 /// files; a branch `feature`), `beta` (on `feature`, three commits) and
 /// `gamma` (one commit and an untracked file). Names have no space and no `:`.
 fn lane_repos() -> tempfile::TempDir {
 	let ws = tempfile::tempdir().unwrap();
-	let alpha = repo(ws.path(), "alpha", &[]);
 	let commit = |dir: &Path, files: &[(&str, &str)], msg: &str| {
 		for (name, body) in files {
 			if let Some(parent) = Path::new(name).parent() {
@@ -1648,22 +1777,23 @@ fn lane_repos() -> tempfile::TempDir {
 			}
 			fs::write(dir.join(name), body).unwrap();
 		}
-		git(dir, &["add", "."]);
-		git(dir, &["commit", "-q", "-m", msg]);
+		lane_git(dir, &["add", "."]);
+		lane_git(dir, &["commit", "-q", "-m", msg]);
 	};
+	let alpha = lane_repo(ws.path(), "alpha", &[]);
 	commit(&alpha, &[("a.txt", "one")], "add a");
-	git(&alpha, &["branch", "feature"]);
+	lane_git(&alpha, &["branch", "feature"]);
 	commit(
 		&alpha,
 		&[("a.txt", "two"), ("b.txt", "b")],
 		"change a, add b",
 	);
 	commit(&alpha, &[("src/a/b.txt", "deep")], "add src/a/b.txt");
-	let beta = repo(ws.path(), "beta", &[]);
-	git(&beta, &["checkout", "-q", "-b", "feature"]);
+	let beta = lane_repo(ws.path(), "beta", &[]);
+	lane_git(&beta, &["checkout", "-q", "-b", "feature"]);
 	commit(&beta, &[("f1.txt", "1")], "f1");
 	commit(&beta, &[("f2.txt", "2")], "f2");
-	repo(ws.path(), "gamma", &[("loose.txt", "untracked")]);
+	lane_repo(ws.path(), "gamma", &[("loose.txt", "untracked")]);
 	ws
 }
 
@@ -1696,6 +1826,8 @@ fn env(lane: Lane, ws: &Path) -> Env {
 		payloads: payloads(),
 		typed_in_path_field: false,
 		last_browse: None,
+		just_pasted: false,
+		just_faulted: false,
 	}
 }
 
@@ -1710,4 +1842,725 @@ fn fuzz_local_workbench_keeps_derived_state(
 	let (model, cx) = lane_window(cx, ws.path(), "no payload here");
 	let mut env = env(Lane::Local, ws.path());
 	drive(&mut env, &model, cx, rng);
+}
+
+/// Opens the window and starts acting before the first scan has been run:
+/// the repo set grows under the gestures. `open_sized` parks first.
+fn lane_window_unparked<'a>(
+	cx: &'a mut TestAppContext,
+	ws: &Path,
+	clipboard: &str,
+) -> (Entity<WorkbenchModel>, &'a mut VisualTestContext) {
+	use gpui::AppContext;
+	cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+	let bounds = gpui::Bounds::new(
+		gpui::Point::default(),
+		gpui::size(gpui::px(WINDOW.0), gpui::px(WINDOW.1)),
+	);
+	let (model, window) = crate::remote::with_test_hosts(Vec::new(), || {
+		cx.update(|cx| {
+			let window = cx
+				.open_window(
+					gpui::WindowOptions {
+						window_bounds: Some(gpui::WindowBounds::Windowed(
+							bounds,
+						)),
+						..Default::default()
+					},
+					|_, cx| {
+						cx.new(|cx| {
+							WorkbenchModel::new(
+								Some(ws.to_path_buf()),
+								None,
+								"normal".into(),
+								cx,
+							)
+						})
+					},
+				)
+				.unwrap();
+			let model = window.root(cx).unwrap();
+			(model, window)
+		})
+	});
+	let cx = VisualTestContext::from_window(*window, cx).into_mut();
+	cx.update(|window, cx| window.focus(&model.read(cx).focus_handle.clone()));
+	model.update(cx, |m, cx| {
+		m.probes = Some(crate::ui::Probes::for_test());
+		m.test_clipboard = Some(clipboard.to_string());
+		cx.notify();
+	});
+	(model, cx)
+}
+
+/// Random pastes over a repo set that changes under them: a scan that has
+/// not finished, a repo added by hand, Refresh, and the preview's own rows,
+/// folds, mapping and destination.
+#[gpui::test(iterations = 3)]
+fn fuzz_paste_preview_follows_the_repo_set(
+	cx: &mut TestAppContext,
+	rng: StdRng,
+) {
+	let ws = tempfile::tempdir().unwrap();
+	lane_repo(ws.path(), "a", &[]);
+	lane_repo(ws.path(), "b", &[]);
+	let (_ext_tmp, ext) = external_repo("ext");
+	let (model, cx) = lane_window_unparked(cx, ws.path(), "no payload here");
+	let mut env = env(Lane::Paste, ws.path());
+	env.external = Some(ext);
+	drive(&mut env, &model, cx, rng);
+}
+
+/// The window of the remote lane: two in-process workers as the only ssh
+/// hosts (`h0` opens the workspace, `h1` is another to browse), `shared`
+/// opened on `h0`, probes on. One window only: `open_remote` and the menu
+/// fixtures each borrow the test context.
+fn remote_lane_window<'a>(
+	cx: &'a mut TestAppContext,
+	shared: &Path,
+) -> (
+	Entity<WorkbenchModel>,
+	&'a mut VisualTestContext,
+	Vec<std::sync::Arc<snip_remote::Worker>>,
+) {
+	let workers: Vec<_> = (0..2)
+		.map(|_| {
+			std::sync::Arc::new(snip_remote::Worker::new(
+				snip_remote::WorkerOptions::default(),
+			))
+		})
+		.collect();
+	let hosts: Vec<_> = workers
+		.iter()
+		.zip(["h0", "h1"])
+		.map(|(worker, name)| {
+			let mut host = snip_remote::RemoteHost::in_process(worker.clone());
+			host.name = name.into();
+			host
+		})
+		.collect();
+	cx.update(|cx| cx.bind_keys(crate::key_bindings()));
+	let (model, cx) = cx.add_window_view(|_, cx| {
+		WorkbenchModel::new(None, None, "normal".into(), cx)
+	});
+	cx.run_until_parked();
+	let path = shared.display().to_string();
+	model.update(cx, |m, cx| {
+		m.open_overlay(
+			crate::overlay::OverlayKind::WorkspaceMenu,
+			crate::overlay::ReturnFocus::Root,
+			Some(crate::overlay::TriggerId::Workspace),
+			None,
+			cx,
+		);
+		m.remote.hosts = hosts;
+		m.remote.recent.clear();
+		m.browse_remote_host(0, cx);
+		m.open_remote_path(0, path, cx);
+	});
+	settle(cx);
+	land_remote_open(&model, cx);
+	for _ in 0..10 {
+		settle(cx);
+		let done = model.read_with(cx, |m, _| {
+			!m.is_loading
+				&& (m.ws_tree.as_ref().is_some_and(|t| t.is_loaded)
+					|| m.file_tree.as_ref().is_some_and(|t| t.is_loaded)
+					|| m.remote.scan_error.is_some())
+				&& (m.repos.is_empty()
+					|| m.change_repos.is_empty()
+					|| m.change_repos[0].state
+						!= crate::ChangeRepoState::Loading)
+		});
+		if done {
+			break;
+		}
+	}
+	model.update(cx, |m, cx| {
+		m.probes = Some(crate::ui::Probes::for_test());
+		m.test_clipboard = Some("no payload here".into());
+		cx.notify();
+	});
+	settle(cx);
+	(model, cx, workers)
+}
+
+/// The Log, Changes and Project of a remote workspace while its worker
+/// refuses, hangs up, cuts replies and garbles frames, and while the menu
+/// browses hosts.
+#[gpui::test(iterations = 3)]
+fn fuzz_remote_workspace_under_faults(cx: &mut TestAppContext, rng: StdRng) {
+	let _remote = remote_lock();
+	let shared = lane_repos();
+	let (model, cx, workers) = remote_lane_window(cx, shared.path());
+	let mut env = env(Lane::Remote, shared.path());
+	env.workers = workers;
+	drive(&mut env, &model, cx, rng);
+}
+
+// ───────────────────────────── the alphabet is whole ─────────────────────────────
+
+/// What a tour of the app found drawn and pressable: the kinds of control it
+/// met (a probe id's prefix, or the whole `menu-item:` id), and every key a
+/// lane could have pressed at some point.
+#[derive(Default)]
+struct Reach {
+	controls: std::collections::BTreeSet<String>,
+	keys: std::collections::BTreeSet<String>,
+	/// A tap whose control was not drawn: the tour itself is stale.
+	missed: Vec<String>,
+}
+
+/// The kind of a control: its prefix, with the item of a menu kept.
+fn control_kind(id: &str) -> String {
+	match id.strip_prefix("menu-item:") {
+		Some(item) => format!("menu-item:{item}"),
+		None => probe_prefix(id).to_string(),
+	}
+}
+
+/// Settles, then records what is drawn and which keys apply to the focus.
+fn visit(
+	model: &Entity<WorkbenchModel>,
+	cx: &mut VisualTestContext,
+	keys: &[KeyChoice],
+	reach: &mut Reach,
+) {
+	settle(cx);
+	for (id, _) in drawn(model, cx) {
+		reach.controls.insert(control_kind(&id));
+	}
+	reach.keys.extend(gather(model, cx, keys).keys);
+}
+
+/// One scripted gesture of a tour: press the `nth` control (by sorted id) of
+/// the last frame whose id starts with `prefix`, or a key.
+#[derive(Clone, Copy)]
+enum Move {
+	Press {
+		prefix: &'static str,
+		nth: usize,
+		mods: Mods,
+		button: Button,
+	},
+	Key(&'static str),
+	Clipboard(usize),
+}
+
+const fn tap(prefix: &'static str) -> Move {
+	Move::Press {
+		prefix,
+		nth: 0,
+		mods: Mods::None,
+		button: Button::Left,
+	}
+}
+
+const fn tap_nth(prefix: &'static str, nth: usize) -> Move {
+	Move::Press {
+		prefix,
+		nth,
+		mods: Mods::None,
+		button: Button::Left,
+	}
+}
+
+const fn right(prefix: &'static str) -> Move {
+	Move::Press {
+		prefix,
+		nth: 0,
+		mods: Mods::None,
+		button: Button::Right,
+	}
+}
+
+const fn with(prefix: &'static str, nth: usize, mods: Mods) -> Move {
+	Move::Press {
+		prefix,
+		nth,
+		mods,
+		button: Button::Left,
+	}
+}
+
+/// Runs `script` on a window, visiting after every move.
+fn tour(
+	model: &Entity<WorkbenchModel>,
+	cx: &mut VisualTestContext,
+	env: &mut Env,
+	script: &[Move],
+	reach: &mut Reach,
+) {
+	let keys = fuzz_keys();
+	visit(model, cx, &keys, reach);
+	for mv in script {
+		match *mv {
+			Move::Key(k) => key_np(cx, k),
+			Move::Clipboard(n) => {
+				let text = env.payloads[n].clone();
+				model.update(cx, |m, _| m.test_clipboard = Some(text));
+			}
+			Move::Press {
+				prefix,
+				nth,
+				mods,
+				button,
+			} => {
+				let scale = cx.update(|w, _| w.scale_factor());
+				// In screen order, top to bottom: the rows of a list are
+				// ordered by what they show, not by their ids.
+				let mut rows: Vec<(String, [i32; 4])> = drawn(model, cx)
+					.into_iter()
+					.filter(|(id, _)| id.starts_with(prefix))
+					.filter(|(id, _)| {
+						!matches!(probe_use(id), Some(ProbeUse::Hazard(_)))
+					})
+					.collect();
+				rows.sort_by_key(|(_, b)| (b[1], b[0]));
+				let hit =
+					rows.get(nth).and_then(|(_, b)| middle(*b, scale, WINDOW));
+				match hit {
+					Some(p) => click_np(cx, p, mods, button),
+					None => {
+						if std::env::var_os("TOUR_DEBUG").is_some() {
+							let kinds: std::collections::BTreeSet<_> =
+								drawn(model, cx)
+									.into_iter()
+									.map(|(id, _)| control_kind(&id))
+									.collect();
+							eprintln!("MISS {prefix}#{nth} among {kinds:?}");
+						}
+						reach.missed.push(format!("{prefix}#{nth}"))
+					}
+				}
+			}
+		}
+		visit(model, cx, &keys, reach);
+	}
+}
+
+/// The local fixture's tour: selections, every dropdown and selector, the
+/// Project and Changes windows, a commit file and the tree of a commit.
+fn local_tour(cx: &mut TestAppContext, reach: &mut Reach) {
+	let ws = lane_repos();
+	let (model, cx) = lane_window(cx, ws.path(), "no payload here");
+	settle_until(cx, "the Log", |cx| {
+		model.read_with(cx, |m, _| !m.commits.is_empty() && !m.is_loading)
+	});
+	let mut env = env(Lane::Local, ws.path());
+	use Mods::{Secondary, Shift};
+	tour(
+		&model,
+		cx,
+		&mut env,
+		&[
+			tap("commit-row:"),
+			tap("commit-file:"),
+			// One repo's rows: a range across repos is refused.
+			tap("commit-row:alpha:"),
+			with("commit-row:alpha:", 2, Shift),
+			tap("log-selection-toggle"),
+			tap("selection-commit"),
+			with("commit-row:alpha:", 1, Secondary),
+			right("commit-row:"),
+			Move::Key("escape"),
+			tap("commit-row:alpha:"),
+			tap("btn-browse-tree:"),
+			tap("rev-row"),
+			tap("btn-leave-tree"),
+			tap("log-filter-repo"),
+			Move::Key("escape"),
+			tap("log-filter-branch"),
+			Move::Key("escape"),
+			tap("log-filter-user"),
+			Move::Key("escape"),
+			tap("log-filter-date"),
+			Move::Key("escape"),
+			tap("btn-log-more"),
+			Move::Key("escape"),
+			tap("btn-ref-selector"),
+			Move::Key("escape"),
+			tap("btn-repo-selector"),
+			Move::Key("escape"),
+			tap("btn-workspace-menu"),
+			Move::Key("escape"),
+			tap("btn-head"),
+			tap("btn-compare"),
+			tap("branches-toggle"),
+			tap("branches-toggle"),
+			Move::Key("alt-1"),
+			tap("btn-add-repo"),
+			Move::Key("escape"),
+			right("repo-row:"),
+			Move::Key("escape"),
+			tap("tree-row:"),
+			tap("tree-chevron"),
+			right("editor-tab"),
+			Move::Key("escape"),
+			Move::Key("ctrl-f"),
+			Move::Key("escape"),
+			Move::Key("ctrl-g"),
+			Move::Key("escape"),
+			Move::Key("alt-0"),
+			tap("change-repo-toggle:"),
+			tap("change-row@"),
+			right("change-row@"),
+			Move::Key("escape"),
+			tap("btn-tab-close"),
+		],
+		reach,
+	);
+}
+
+/// The paste fixture's tour: each payload in turn, with its rows, folds,
+/// mapping and destination controls.
+fn paste_tour(cx: &mut TestAppContext, reach: &mut Reach) {
+	let ws = tempfile::tempdir().unwrap();
+	lane_repo(ws.path(), "a", &[]);
+	lane_repo(ws.path(), "b", &[]);
+	let (model, cx) = lane_window(cx, ws.path(), "no payload here");
+	let mut env = env(Lane::Paste, ws.path());
+	let keys = fuzz_keys();
+	for n in 0..env.payloads.len() {
+		// The preview lands after its timer, which a visit's settle moves on.
+		tour(
+			&model,
+			cx,
+			&mut env,
+			&[
+				Move::Clipboard(n),
+				tap("btn-paste"),
+				tap("paste-map-keep:"),
+				tap("paste-dir-toggle:"),
+				tap("paste-dir-include:"),
+				tap("paste-include:"),
+				tap("paste-overwrite:"),
+				tap("paste-commit:"),
+				tap("paste-commit-whole"),
+				tap("paste-adjust"),
+				tap("paste-as-is"),
+				tap("paste-dest-edit"),
+				Move::Key("escape"),
+				tap("paste-dest-root"),
+				tap("paste-dest-repo"),
+				tap("paste-dest-crumb:"),
+				tap("paste-row:"),
+				Move::Key("down"),
+				Move::Key("up"),
+				Move::Key("space"),
+				Move::Key("left"),
+				Move::Key("right"),
+				tap("btn-cancel"),
+			],
+			reach,
+		);
+		let _ = &keys;
+	}
+}
+
+/// The remote fixture's tour: the host menu, browsing both hosts.
+fn remote_tour(cx: &mut TestAppContext, reach: &mut Reach) {
+	let _remote = remote_lock();
+	let shared = lane_repos();
+	let (model, cx, workers) = remote_lane_window(cx, shared.path());
+	let mut env = env(Lane::Remote, shared.path());
+	env.workers = workers;
+	tour(
+		&model,
+		cx,
+		&mut env,
+		&[
+			tap("btn-workspace-menu"),
+			tap_nth("remote-host:", 1),
+			tap("remote-folder:"),
+			Move::Key("escape"),
+			Move::Key("alt-1"),
+			tap("tree-row:"),
+		],
+		reach,
+	);
+}
+
+/// Every key and every control that the tours met has a decision, and every
+/// action of the keymap too: a new binding or a new kind of control stops here
+/// until somebody says what a lane does with it.
+#[gpui::test]
+fn fuzz_alphabet_classifies_every_key_and_probe(cx: &mut TestAppContext) {
+	// The keys of a text field are typed through `Type`, not pressed.
+	let undecided: std::collections::BTreeSet<String> = crate::key_bindings()
+		.iter()
+		.filter(|b| {
+			!b.predicate()
+				.is_some_and(|p| p.to_string().contains("TextInput"))
+		})
+		.map(|b| b.action().name().to_string())
+		.filter(|name| key_use(name).is_none())
+		.collect();
+	let mut reach = Reach::default();
+	local_tour(cx, &mut reach);
+	paste_tour(cx, &mut reach);
+	remote_tour(cx, &mut reach);
+	let controls: Vec<_> = reach
+		.controls
+		.iter()
+		.filter(|k| probe_use(k).is_none())
+		.collect();
+	// A control left alone says why.
+	for kind in &reach.controls {
+		if let Some(ProbeUse::Hazard(why)) = probe_use(kind) {
+			assert!(!why.is_empty(), "{kind} is a hazard with no reason");
+		}
+	}
+	assert!(
+		undecided.is_empty() && controls.is_empty(),
+		"actions with no decision in `key_use`: {undecided:?}; controls with \
+		 no decision in `probe_use`: {controls:?}"
+	);
+}
+
+/// The kinds of control `probe_use` decides to press or type into, read from
+/// its own source: a literal is one when the function says so of it.
+fn pressable_kinds() -> Vec<String> {
+	let source = include_str!("invariant_tests.rs");
+	let body = source
+		.split("fn probe_use(id: &str)")
+		.nth(1)
+		.and_then(|rest| rest.split("/// What a key of the keymap").next())
+		.expect("the source of `probe_use`");
+	let mut kinds = std::collections::BTreeSet::new();
+	let mut rest = body;
+	while let Some(at) = rest.find('"') {
+		rest = &rest[at + 1..];
+		let Some(end) = rest.find('"') else { break };
+		let lit = &rest[..end];
+		rest = &rest[end + 1..];
+		// A stem (`log-filter-`) is a `starts_with`, not a kind.
+		if !lit.is_empty()
+			&& !lit.ends_with('-')
+			&& lit.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+			&& matches!(
+				probe_use(lit),
+				Some(ProbeUse::Click { .. } | ProbeUse::Field { .. })
+			) {
+			kinds.insert(lit.to_string());
+		}
+	}
+	for item in [
+		"paste-into",
+		"browse-tree",
+		"show-diff",
+		"go-parent",
+		"go-child",
+		"close-tab",
+		"close-all-tabs",
+		"close-other-tabs",
+	] {
+		kinds.insert(format!("menu-item:{item}"));
+	}
+	kinds.into_iter().collect()
+}
+
+/// Controls and keys the tours do not reach, and why: states the tours do not
+/// build (a failed scan, a truncated listing), or more than one repo
+/// anchor. A kind that a tour does reach does not belong here.
+const UNREACHED_CONTROLS: &[(&str, &str)] = &[
+	("btn-discovery-continue", "a scan that stopped at a limit"),
+	("btn-discovery-retry", "a scan that failed"),
+	("change-unreadable", "a repo whose status could not be read"),
+	(
+		"change-unreadable-toggle",
+		"a repo whose status could not be read",
+	),
+	(
+		"change-dir",
+		"Changes grouped by folder, with files in a subfolder",
+	),
+	(
+		"change-dir-toggle",
+		"Changes grouped by folder, with files in a subfolder",
+	),
+	("collapse", "a merge commit in the Log"),
+	(
+		"commit-dir-toggle",
+		"a commit that changes files in nested folders",
+	),
+	(
+		"btn-expand-folds",
+		"a diff with an unchanged stretch folded away",
+	),
+	("diff-fold", "a diff with an unchanged stretch folded away"),
+	(
+		"log-branch-input-clear",
+		"a branch filter typed in the Log's dropdown",
+	),
+	(
+		"log-collapsed",
+		"a Log with commits hidden by a collapsed merge",
+	),
+	(
+		"log-filter-branch-clear",
+		"a branch picked in the Log's filter",
+	),
+	(
+		"log-filter-date-clear",
+		"a date range picked in the Log's filter",
+	),
+	(
+		"log-filter-more",
+		"a Log filter bar too narrow for its chips",
+	),
+	("log-filter-path", "a path picked in the Log's filter"),
+	("log-filter-path-clear", "a path picked in the Log's filter"),
+	("log-filter-repo-clear", "a repo picked in the Log's filter"),
+	("log-filter-user-clear", "a user picked in the Log's filter"),
+	("log-since-input", "the Date chip's custom range"),
+	("log-until-input", "the Date chip's custom range"),
+	("log-subject", "a prefix of the older Log row ids"),
+	(
+		"paste-adjust",
+		"a restore-base hint (no mapping row, a repo destination)",
+	),
+	(
+		"paste-as-is",
+		"a restore-base hint (no mapping row, a repo destination)",
+	),
+	("paste-dest-left", "a destination in the left pane's folder"),
+	(
+		"ref-head",
+		"a checked-out branch group in the branches pane",
+	),
+	("ref-more", "a branches pane too long for its group"),
+	("selector-group", "a selector with grouped candidates"),
+	("tree-more", "a folder listing the budget cuts"),
+	("tree-retry", "a folder listing that failed"),
+	("ws-tree-chevron", "the workspace folder's own tree"),
+	("ws-tree-more", "a workspace listing the budget cuts"),
+	("ws-tree-retry", "a workspace listing that failed"),
+	("ws-tree-row", "the workspace folder's own tree"),
+];
+const UNREACHED_KEYS: &[(&str, &str)] = &[];
+
+/// A lane that cannot reach a control cannot test it: every control a lane
+/// presses, every field it types into and every key it presses is reached by
+/// the tours, except the listed ones, and a listed one that is reached is an
+/// error (the list says what the tours miss, no more).
+#[gpui::test]
+fn fuzz_alphabet_reaches_every_action(cx: &mut TestAppContext) {
+	let mut reach = Reach::default();
+	local_tour(cx, &mut reach);
+	remote_tour(cx, &mut reach);
+	// A paste script is one list for every payload: a control a payload does
+	// not draw is not a miss.
+	let missed = std::mem::take(&mut reach.missed);
+	paste_tour(cx, &mut reach);
+	reach.missed = missed;
+	assert!(
+		reach.missed.is_empty(),
+		"a tour pressed a control that was not drawn: {:?}",
+		reach.missed
+	);
+	let unreached_controls: Vec<String> = pressable_kinds()
+		.into_iter()
+		.filter(|k| !reach.controls.contains(k))
+		.collect();
+	let listed: std::collections::BTreeSet<&str> =
+		UNREACHED_CONTROLS.iter().map(|(k, _)| *k).collect();
+	let missing: Vec<&String> = unreached_controls
+		.iter()
+		.filter(|k| !listed.contains(k.as_str()))
+		.collect();
+	let stale: Vec<&str> = listed
+		.iter()
+		.copied()
+		.filter(|k| reach.controls.contains(*k))
+		.collect();
+	let fuzz_keys: std::collections::BTreeSet<String> =
+		fuzz_keys().into_iter().map(|k| k.keystroke).collect();
+	let unreached_keys: Vec<&String> = fuzz_keys
+		.iter()
+		.filter(|k| !reach.keys.contains(*k))
+		.collect();
+	let listed_keys: std::collections::BTreeSet<&str> =
+		UNREACHED_KEYS.iter().map(|(k, _)| *k).collect();
+	let missing_keys: Vec<&&String> = unreached_keys
+		.iter()
+		.filter(|k| !listed_keys.contains(k.as_str()))
+		.collect();
+	let stale_keys: Vec<&str> = listed_keys
+		.iter()
+		.copied()
+		.filter(|k| reach.keys.contains(*k))
+		.collect();
+	eprintln!("UNREACHED controls: {unreached_controls:?}");
+	eprintln!("UNREACHED keys: {unreached_keys:?}");
+	assert!(
+		missing.is_empty()
+			&& stale.is_empty()
+			&& missing_keys.is_empty()
+			&& stale_keys.is_empty(),
+		"controls the tours never met: {missing:?}; listed controls they did \
+		 meet: {stale:?}; keys never a candidate: {missing_keys:?}; listed keys \
+		 that were: {stale_keys:?}"
+	);
+}
+
+/// L6, L7 on the remote path: a Log reload the worker refuses leaves no
+/// selection it hid (PR-0 of #230 fixed the local path; this is the same
+/// property over a worker). A refusal is a `Refused`, which the client does
+/// not send again, so the failure reaches the screen.
+#[gpui::test]
+fn a_refused_remote_reload_drops_the_selection_it_hid(cx: &mut TestAppContext) {
+	use crate::invariants::Invariant::{L6, L7};
+	let _remote = remote_lock();
+	let ws = lane_repos();
+	let (model, cx, worker) =
+		open_remote(cx, ws.path(), snip_remote::WorkerOptions::default());
+	settle_until(cx, "the Log", |cx| {
+		model.read_with(cx, |m, _| !m.commits.is_empty() && !m.is_loading)
+	});
+	// Probes on, then the first row the Log drew, selected and shown.
+	click_probed(&model, cx, "btn-log-refresh");
+	let first = |cx: &mut VisualTestContext, prefix: &str| {
+		model.read_with(cx, |m, _| {
+			m.probes
+				.as_ref()
+				.unwrap()
+				.drawn()
+				.into_iter()
+				.find(|id| id.starts_with(prefix))
+				.unwrap_or_else(|| panic!("nothing drawn as {prefix}"))
+		})
+	};
+	let row = first(cx, "commit-row:");
+	click_probed(&model, cx, &row);
+	settle_until(cx, "the commit", |cx| {
+		model.read_with(cx, |m, _| {
+			m.selected_commit.is_some() && !m.preview_loading
+		})
+	});
+	// The user list is read before the fault is armed.
+	click_probed(&model, cx, "log-filter-user");
+	settle(cx);
+	let user = first(cx, "log-user:");
+	// A filter change sends a burst of Git views, the history's among them:
+	// the worker refuses all of them (the count is far above the burst).
+	worker.inject_fault_for_tests(FaultRule {
+		on: Match::Kind(RequestKind::GitView),
+		workspace: None,
+		skip: 0,
+		times: 64,
+		fault: Fault::Refuse(ErrorCode::Busy),
+	});
+	click_probed(&model, cx, &user);
+	settle(cx);
+	assert!(
+		worker.requests_seen_for_tests(RequestKind::GitView) >= 1,
+		"the reload asked the worker"
+	);
+	model.read_with(cx, |m, cx| {
+		assert!(m.history_error.is_some(), "the reload failed on screen");
+		assert!(m.selected_commit.is_none(), "{:?}", m.selected_commit);
+		assert!(m.commit_view.is_reset());
+		invariants::assert_holds(m, cx, &[L6, L7]);
+	});
 }
