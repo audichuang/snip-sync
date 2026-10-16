@@ -2655,6 +2655,71 @@ fn paste_commits_disallowed_flags_exit_two() {
 }
 
 #[test]
+fn paste_adjust_paths_ignores_a_clipcode_root_that_is_not_a_folder_name() {
+	// A TS copy that resolved no root writes `clipcode-root: ..`; `..` and
+	// `.` are directories under any folder, so they used to read as an
+	// existing wrapper to nest everything under.
+	let tmp = tempfile::tempdir().unwrap();
+	let repo = tmp.path().join("sub");
+	// No `src/` here, or the paths would count as already anchored.
+	fs::create_dir_all(&repo).unwrap();
+	init_repo(&repo);
+	let repo_s = repo.to_str().unwrap();
+
+	for root in ["..", ".", "a/b"] {
+		let payload =
+			format!("// clipcode-root: {root}\n// file: src/a.ts\nbody\n");
+		for adjust in [false, true] {
+			let mut args = vec!["--repo", repo_s, "paste", "--dry-run"];
+			if adjust {
+				args.push("--adjust-paths");
+			}
+			args.push("--stdin");
+			let out = snip(&args, Some(payload.as_bytes()));
+			assert_eq!(code(&out), 0, "{root:?}: {}", text(&out.stderr));
+			let stderr = text(&out.stderr);
+			assert!(
+				!stderr.contains("--adjust-paths")
+					&& !stderr.contains("Adjusting paths"),
+				"{root:?} adjust={adjust}: {stderr}"
+			);
+			assert!(
+				text(&out.stdout).contains("create\tsrc/a.ts"),
+				"{root:?} adjust={adjust}: {}",
+				text(&out.stdout)
+			);
+		}
+	}
+}
+
+#[test]
+fn paste_says_what_adjust_paths_would_do_when_the_plan_is_refused() {
+	// The same path twice: the plan is refused as it stands, and the
+	// suggestion that came with it is still the way out.
+	let tmp = tempfile::tempdir().unwrap();
+	let proj = tmp.path().join("proj");
+	fs::create_dir_all(&proj).unwrap();
+	init_repo(&proj);
+	let payload = "// clipcode-root: work\n// file: proj/a.txt\nA\n// file: proj/a.txt\nB\n";
+	let out = snip(
+		&[
+			"--repo",
+			proj.to_str().unwrap(),
+			"paste",
+			"--dry-run",
+			"--stdin",
+		],
+		Some(payload.as_bytes()),
+	);
+	assert_ne!(code(&out), 0, "{}", text(&out.stdout));
+	let stderr = text(&out.stderr);
+	assert!(
+		stderr.contains("Pass --adjust-paths to remove the leading \"proj/\""),
+		"{stderr}"
+	);
+}
+
+#[test]
 fn paste_adjust_paths_strip_and_add() {
 	let tmp = tempfile::tempdir().unwrap();
 

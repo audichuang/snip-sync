@@ -488,7 +488,8 @@ impl Connection {
 				message,
 				patch,
 				reason,
-			})) => Err(refusal(code, message, patch, reason)),
+				suggestion,
+			})) => Err(refusal_with(code, message, patch, reason, suggestion)),
 			Ok(Some(_)) => Err(RemoteError::Protocol("expected hello".into())),
 			Ok(None) | Err(RemoteError::Io(_)) | Err(RemoteError::TimedOut) => {
 				let cause = match &reply {
@@ -1124,7 +1125,10 @@ pub(crate) fn exchange(
 								message,
 								patch,
 								reason,
-							}) => Err(refusal(code, message, patch, reason)),
+								suggestion,
+							}) => Err(refusal_with(
+								code, message, patch, reason, suggestion,
+							)),
 							Ok(
 								Response::Chunk { .. }
 								| Response::Joined
@@ -1161,8 +1165,11 @@ pub(crate) fn exchange(
 						message,
 						patch,
 						reason,
+						suggestion,
 					} => {
-						return Err(refusal(code, message, patch, reason));
+						return Err(refusal_with(
+							code, message, patch, reason, suggestion,
+						));
 					}
 					response => return Ok(response),
 				}
@@ -1491,7 +1498,7 @@ impl PreparedImportLease {
 			self.state.lock().unwrap_or_else(PoisonError::into_inner);
 		match &*state {
 			PreparedImportState::Ready(_) => {}
-			PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into(), reason: None }),
+			PreparedImportState::Applying => return Err(RemoteError::Refused { code: ErrorCode::Busy, message: "the prepared paste is already applying".into(), reason: None, suggestion: None }),
 			PreparedImportState::Used => return Err(prepared_stale("the prepared paste has already been used; preview again")),
 			PreparedImportState::OutcomeUnknown => return Err(RemoteError::Protocol("the previous prepared paste has an unknown outcome; inspect the destination before pasting again".into())),
 		}
@@ -1576,6 +1583,7 @@ fn prepared_stale(message: &str) -> RemoteError {
 		reason: Some(Box::new(Reason::DestinationChanged {
 			change: StaleChange::Preview,
 		})),
+		suggestion: None,
 	}
 }
 
@@ -2950,11 +2958,24 @@ impl RepoView for RemoteRepo {
 
 /// The master's side of a worker refusal: a diff over its limit keeps its
 /// own variant, so it is not read as the file being too large.
+#[cfg(test)]
 pub(crate) fn refusal(
 	code: ErrorCode,
 	message: String,
 	patch: bool,
 	reason: Option<Reason>,
+) -> RemoteError {
+	refusal_with(code, message, patch, reason, None)
+}
+
+/// [`refusal`] for a reply that also carried the worker's restore-base
+/// suggestion (a refused paste plan).
+pub(crate) fn refusal_with(
+	code: ErrorCode,
+	message: String,
+	patch: bool,
+	reason: Option<Reason>,
+	suggestion: Option<Box<snip_core::restore::RestoreBaseSuggestion>>,
 ) -> RemoteError {
 	if patch && code == ErrorCode::TooLarge {
 		RemoteError::PatchTooLarge { message }
@@ -2963,6 +2984,7 @@ pub(crate) fn refusal(
 			code,
 			message,
 			reason: reason.map(Box::new),
+			suggestion,
 		}
 	}
 }
@@ -3311,6 +3333,7 @@ mod tests {
 				message: "expired; preview again".into(),
 				patch: false,
 				reason: None,
+				suggestion: None,
 			}),
 		] {
 			let unknown = response.is_none();
@@ -3350,6 +3373,7 @@ mod tests {
 			message: "busy".into(),
 			patch: false,
 			reason: None,
+			suggestion: None,
 		}));
 		assert!(matches!(
 			join_prepared(first),
@@ -3391,6 +3415,7 @@ mod tests {
 			code: ErrorCode::Stale,
 			message: "expired; preview again".into(),
 			reason: None,
+			suggestion: None,
 		});
 		fixture
 			.lease
@@ -3787,6 +3812,7 @@ mod tests {
 				code,
 				message: "irrelevant".into(),
 				reason: None,
+				suggestion: None,
 			}
 			.is_transient_read_failure());
 		}
@@ -3808,11 +3834,13 @@ mod tests {
 				code: ErrorCode::Forbidden,
 				message: "Connection reset".into(),
 				reason: None,
+				suggestion: None,
 			},
 			RemoteError::Refused {
 				code: ErrorCode::BadRequest,
 				message: "bad".into(),
 				reason: None,
+				suggestion: None,
 			},
 		] {
 			assert!(!error.is_transient_read_failure(), "{error:?}");
@@ -3870,6 +3898,7 @@ mod tests {
 				code,
 				message: String::new(),
 				reason: None,
+				suggestion: None,
 			};
 			assert!(error.is_restore_retryable(), "{error:?}");
 		}
@@ -3878,6 +3907,7 @@ mod tests {
 				code,
 				message: String::new(),
 				reason: None,
+				suggestion: None,
 			};
 			assert!(!error.is_restore_retryable(), "{error:?}");
 		}
@@ -4057,6 +4087,7 @@ mod tests {
 			message: "missing".into(),
 			patch: false,
 			reason: None,
+			suggestion: None,
 		}]);
 		let mut frames = 0;
 		let err = exchange(
@@ -4084,6 +4115,7 @@ mod tests {
 			message: "big".into(),
 			patch,
 			reason: None,
+			suggestion: None,
 		}
 	}
 
@@ -4187,6 +4219,7 @@ mod tests {
 			code: ErrorCode::InvalidRevision,
 			message: "bad rev".into(),
 			reason: None,
+			suggestion: None,
 		};
 		assert!(matches!(
 			GitError::from(err1),
@@ -4197,6 +4230,7 @@ mod tests {
 			code: ErrorCode::Cancelled,
 			message: "stop".into(),
 			reason: None,
+			suggestion: None,
 		};
 		assert!(matches!(
 			GitError::from(err2),
@@ -4213,6 +4247,7 @@ mod tests {
 			code: ErrorCode::Timeout,
 			message: "slow".into(),
 			reason: None,
+			suggestion: None,
 		};
 		assert!(matches!(
 			GitError::from(err4),
@@ -4263,6 +4298,7 @@ mod tests {
 			code: ErrorCode::NotFound,
 			message: "missing".into(),
 			reason: None,
+			suggestion: None,
 		};
 		assert!(matches!(
 			GitError::from(err8),
@@ -4347,6 +4383,7 @@ mod tests {
 			code: ErrorCode::TooLarge,
 			message: "refs payload exceeded frame limit".into(),
 			reason: None,
+			suggestion: None,
 		};
 		assert!(matches!(
 			GitError::from(err_too_large),
@@ -4390,6 +4427,7 @@ mod tests {
 			code: ErrorCode::Unsupported,
 			message: "no".into(),
 			reason: None,
+			suggestion: None,
 		};
 
 		// reused + 0 frames + ConnectionReset -> true

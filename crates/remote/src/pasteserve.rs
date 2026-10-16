@@ -46,7 +46,22 @@ fn refused_with(
 		message: message.into(),
 		patch: false,
 		reason,
+		suggestion: None,
 	})
+}
+
+/// `refusal` with the restore-base suggestion a refused paste plan carries.
+fn with_suggestion(
+	mut refusal: Refusal,
+	suggestion: Option<&snip_core::restore::RestoreBaseSuggestion>,
+) -> Refusal {
+	if let Response::Error {
+		suggestion: slot, ..
+	} = &mut *refusal
+	{
+		*slot = suggestion.cloned().map(Box::new);
+	}
+	refusal
 }
 
 /// Reads on the worker's own pool, cancelled with the job.
@@ -193,6 +208,10 @@ fn plan(
 	}
 	let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
 	let suggestion = crate::pastetarget::suggest(&primary, &paths, text);
+	// From here a refusal keeps the suggestion, as a local paste's note
+	// does: it names this payload against this destination, whatever the
+	// engine says to the plan after it.
+	let keep = |refusal: Refusal| with_suggestion(refusal, suggestion.as_ref());
 	let (import, roots) = crate::pastetarget::import_mapping(
 		primary,
 		primary_id,
@@ -206,10 +225,11 @@ fn plan(
 		|folder| {
 			CanonicalRootId::new(folder).map_err(|e| Box::new(io_error(e)))
 		},
-	)?;
+	)
+	.map_err(keep)?;
 	let (plan, create_entries) =
 		plan_import_parsed_with(entries, &roots, &import, &options(cancel))
-			.map_err(|e| transfer_refusal(e, cancel))?;
+			.map_err(|e| keep(transfer_refusal(e, cancel)))?;
 	Ok(Planned {
 		plan,
 		suggestion,
@@ -1083,6 +1103,65 @@ mod prepared_import_tests {
 		assert!(root.path.join("project/src/a.txt").is_file());
 		assert!(root.path.join("project/lib/b.txt").is_file());
 		assert!(!root.path.join("src/a.txt").exists());
+	}
+
+	#[test]
+	fn a_refused_plan_still_carries_the_restore_base_suggestion() {
+		let (_dir, root, cache) = fixture();
+		fs::create_dir(root.path.join("proj")).unwrap();
+		// Adjusted, `proj/a.txt` and `a.txt` are one file: the engine
+		// refuses the plan, but what it suggested for it is still true.
+		let text =
+			"// clipcode-root: work\n// FILE: proj/a.txt\nA\n// FILE: a.txt\nB\n";
+		let run = |adjust_paths| {
+			prepare_import(
+				&root,
+				"proj",
+				text.into(),
+				PasteMapping {
+					adjust_paths,
+					..Default::default()
+				},
+				false,
+				&cache,
+				&CancelToken::new(),
+			)
+		};
+		let strip = snip_core::restore::RestoreBase::Strip {
+			segment: "proj".into(),
+		};
+		match run(true) {
+			Response::Error {
+				code: ErrorCode::Collision,
+				suggestion: Some(s),
+				..
+			} => assert_eq!(s.base, strip),
+			other => {
+				panic!("expected a collision with a suggestion: {other:?}")
+			}
+		}
+		// As-is the plan stands, and says the same thing beside it.
+		match run(false) {
+			Response::ImportPrepared(p) => {
+				assert_eq!(p.suggestion.map(|s| s.base), Some(strip));
+			}
+			other => panic!("expected a plan: {other:?}"),
+		}
+		// A refusal before the destination is known has nothing to suggest.
+		match prepare_import(
+			&root,
+			"missing",
+			text.into(),
+			PasteMapping::default(),
+			false,
+			&cache,
+			&CancelToken::new(),
+		) {
+			Response::Error {
+				suggestion: None, ..
+			} => {}
+			other => panic!("expected a refusal without one: {other:?}"),
+		}
 	}
 
 	#[cfg(unix)]

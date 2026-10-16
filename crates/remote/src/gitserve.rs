@@ -119,6 +119,7 @@ pub(crate) fn scan(
 					message: "invalid folder".into(),
 					patch: false,
 					reason: None,
+					suggestion: None,
 				};
 			}
 			let resolved = match snip_core::browser::inside(&root.path, u) {
@@ -131,6 +132,7 @@ pub(crate) fn scan(
 					message: "not a directory".into(),
 					patch: false,
 					reason: None,
+					suggestion: None,
 				};
 			}
 			Some(resolved)
@@ -872,6 +874,7 @@ pub(crate) fn map_git_error_with_leaked(
 		message,
 		patch,
 		reason,
+		suggestion: None,
 	}
 }
 
@@ -905,6 +908,7 @@ fn open_repo(
 			message: message.into(),
 			patch: false,
 			reason: None,
+			suggestion: None,
 		})
 	};
 	let cached_id = {
@@ -1822,6 +1826,7 @@ mod tests {
 				message,
 				patch,
 				reason,
+				..
 			} = serde_json::from_str(&wire).expect("deserialize")
 			else {
 				panic!("expected Error");

@@ -5196,13 +5196,13 @@ impl WorkbenchModel {
 		}
 	}
 
-	fn show_landed_plan(&mut self, remap: Option<(String, bool)>) {
+	fn show_landed_plan(&mut self, remap: Option<paste::Remap>) {
 		// `Landed::Shown` guarantees an installed plan (see its doc).
 		let plan = self.paste.plan().expect("Shown installs a plan");
 		let items_count = plan.items.len();
-		if let Some((prefix, keep)) = remap {
-			let dest = prefix_target(plan, &prefix, keep);
-			let keep_note = if keep { " keep=primary" } else { "" };
+		if let Some(paste::Remap::Prefix { prefix, keep }) = &remap {
+			let dest = prefix_target(plan, prefix, *keep);
+			let keep_note = if *keep { " keep=primary" } else { "" };
 			app_log!(
 				"[APP:PASTE_MAPPED: prefix={}{} dest={} items={}]",
 				prefix,
@@ -5210,6 +5210,8 @@ impl WorkbenchModel {
 				dest,
 				items_count
 			);
+		} else if let Some(paste::Remap::AdjustPaths(on)) = &remap {
+			app_log!("[APP:PASTE_ADJUSTED: on={} items={}]", on, items_count);
 		} else {
 			for choice in &plan.prefix_choices {
 				for (idx, path) in choice.candidates.iter().enumerate() {
@@ -5227,6 +5229,21 @@ impl WorkbenchModel {
 				plan.shown(&plan.destination),
 				plan.mapping_ready()
 			);
+			if let Some(hint) = plan.restore_hint() {
+				let (kind, value) = match &hint.base {
+					snip_core::restore::RestoreBase::Strip { segment } => {
+						("strip", segment)
+					}
+					snip_core::restore::RestoreBase::Add { prefix } => {
+						("add", prefix)
+					}
+				};
+				app_log!(
+					"[APP:PASTE_RESTORE_BASE: kind={} value={}]",
+					kind,
+					value
+				);
+			}
 		}
 		self.set_status("status_paste_preview", [items_count.to_string()]);
 		if self.paste.collapse_log(&mut self.bottom_visible) {
@@ -5308,6 +5325,17 @@ impl WorkbenchModel {
 		self.rebuild_paste_plan(prefix.to_string(), None, cx);
 	}
 
+	/// The restore-base hint's [Adjust paths] (`true`) or [Use as-is]. The
+	/// choice re-plans like a prefix row does, and the focus comes back to
+	/// the panel once the new plan lands, so the next Enter applies it.
+	pub fn choose_paste_adjust(&mut self, on: bool, cx: &mut Context<Self>) {
+		if self.refuse_while_applying("mapping", cx) || !self.accepting_work() {
+			return;
+		}
+		let r = self.paste.adjust_paths(on, self.preview.as_ref());
+		self.queue_remapped(r, cx);
+	}
+
 	pub fn choose_paste_prefix(
 		&mut self,
 		prefix: &str,
@@ -5340,7 +5368,16 @@ impl WorkbenchModel {
 		if !self.accepting_work() {
 			return;
 		}
-		match self.paste.remap(prefix, destination, self.preview.as_ref()) {
+		let r = self.paste.remap(prefix, destination, self.preview.as_ref());
+		self.queue_remapped(r, cx);
+	}
+
+	fn queue_remapped(
+		&mut self,
+		remapped: paste::preview::Remapped,
+		cx: &mut Context<Self>,
+	) {
+		match remapped {
 			paste::preview::Remapped::NoPlan => {}
 			paste::preview::Remapped::Invalid(err) => {
 				// Idle again with its old mapping.
@@ -6925,6 +6962,7 @@ mod tests {
 						"the result is too large to send; narrow the request"
 							.into(),
 					reason: None,
+					suggestion: None,
 				}
 			),),
 			PreviewErr::TooLarge
@@ -7275,6 +7313,41 @@ mod tests {
 				folders.sort();
 				(listing.path.clone(), folders)
 			})
+		}
+
+		/// Settles until the one repo of the opened remote workspace has its
+		/// changes loaded. Fails with a message when it never does, rather
+		/// than leaving the test to a confusing panic further on.
+		fn wait_remote_repo_loaded(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			let loaded = |cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					m.repos.len() == 1
+						&& m.change_repos.first().is_some_and(|r| {
+							r.state == crate::ChangeRepoState::Loaded
+						})
+				})
+			};
+			for _ in 0..50 {
+				settle(cx);
+				if loaded(cx) {
+					return;
+				}
+			}
+			let (repos, states) = model.read_with(cx, |m, _| {
+				(
+					m.repos.len(),
+					m.change_repos
+						.iter()
+						.map(|r| r.state.clone())
+						.collect::<Vec<_>>(),
+				)
+			});
+			panic!(
+				"the remote repo never loaded: {repos} repo(s), states {states:?}"
+			);
 		}
 
 		/// Lists an in-process worker as the only ssh host, opens `shared`
@@ -10263,18 +10336,7 @@ mod tests {
 					..Default::default()
 				},
 			);
-			for _ in 0..50 {
-				settle(cx);
-				let done = model.read_with(cx, |m, _| {
-					m.repos.len() == 1
-						&& m.change_repos.first().is_some_and(|r| {
-							r.state == crate::ChangeRepoState::Loaded
-						})
-				});
-				if done {
-					break;
-				}
-			}
+			wait_remote_repo_loaded(&model, cx);
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 			let real = dunce::canonicalize(&alpha).unwrap();
@@ -10584,18 +10646,7 @@ mod tests {
 					..Default::default()
 				},
 			);
-			for _ in 0..50 {
-				settle(cx);
-				let done = model.read_with(cx, |m, _| {
-					m.repos.len() == 1
-						&& m.change_repos.first().is_some_and(|r| {
-							r.state == crate::ChangeRepoState::Loaded
-						})
-				});
-				if done {
-					break;
-				}
-			}
+			wait_remote_repo_loaded(&model, cx);
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 
@@ -10654,18 +10705,7 @@ mod tests {
 					..Default::default()
 				},
 			);
-			for _ in 0..50 {
-				settle(cx);
-				let done = model.read_with(cx, |m, _| {
-					m.repos.len() == 1
-						&& m.change_repos.first().is_some_and(|r| {
-							r.state == crate::ChangeRepoState::Loaded
-						})
-				});
-				if done {
-					break;
-				}
-			}
+			wait_remote_repo_loaded(&model, cx);
 			model.update(cx, |m, cx| m.select_repo(0, cx));
 			settle(cx);
 
@@ -15503,6 +15543,361 @@ mod tests {
 				run_copy(&model, cx, group),
 				entries(&[("good.txt", "g")])
 			);
+		}
+
+		/// A paste exported with `clipcode-root` from the folder above the
+		/// destination: the first path segment repeats the destination's name.
+		const RESTORE_BASE_PAYLOAD: &str =
+			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n";
+
+		/// The restore-base suggestion reaches the panel as a hint row with
+		/// [Adjust paths] and [Use as-is]; neither is applied unasked, and the
+		/// first Enter after a click still applies the plan (#240).
+		#[gpui::test]
+		fn restore_base_hint_adjusts_paths_and_the_next_enter_applies(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			let sub = repo(ws.path(), "sub", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			paste(&model, cx, RESTORE_BASE_PAYLOAD);
+			let paths = |model: &Entity<WorkbenchModel>,
+			             cx: &mut VisualTestContext| {
+				model.read_with(cx, |m, _| {
+					let plan = m.paste.plan().unwrap();
+					(
+						plan.items
+							.iter()
+							.map(|i| i.path.clone())
+							.collect::<Vec<_>>(),
+						plan.adjust_paths,
+					)
+				})
+			};
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_some(),
+				"no restore-base hint row"
+			);
+			assert_eq!(
+				paths(&model, cx),
+				(vec!["sub/a.ts".to_string()], false)
+			);
+
+			click(cx, "paste-adjust");
+			settle(cx);
+			assert_eq!(paths(&model, cx), (vec!["a.ts".to_string()], true));
+
+			click(cx, "paste-as-is");
+			settle(cx);
+			assert_eq!(
+				paths(&model, cx),
+				(vec!["sub/a.ts".to_string()], false)
+			);
+
+			click(cx, "paste-adjust");
+			settle(cx);
+			cx.simulate_keystrokes("enter");
+			settle(cx);
+			assert!(model.read_with(cx, |m, _| m.paste.plan().is_none()));
+			assert_eq!(fs::read_to_string(sub.join("a.ts")).unwrap(), "x");
+			assert!(!sub.join("sub").exists());
+		}
+
+		/// The hint is worded from the suggestion's data in the interface
+		/// language: core's English `label` never reaches a zh-TW screen.
+		#[gpui::test]
+		fn restore_base_hint_is_worded_in_the_interface_language(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "sub", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			paste(&model, cx, RESTORE_BASE_PAYLOAD);
+			assert!(cx.debug_bounds("paste-restore-base").is_some());
+			let zh = model.read_with(cx, |m, _| {
+				assert_eq!(m.locale, crate::i18n::Locale::ZhTw);
+				m.paste_hint_text().expect("a hint row")
+			});
+			assert!(zh.contains("sub/"), "{zh}");
+			assert!(zh.contains('路'), "{zh}");
+			assert!(!zh.contains("remove the leading"), "{zh}");
+
+			model.update(cx, |m, cx| m.toggle_locale(cx));
+			settle(cx);
+			let en = model.read_with(cx, |m, _| {
+				assert_eq!(m.locale, crate::i18n::Locale::En);
+				m.paste_hint_text().expect("a hint row")
+			});
+			assert!(en.contains("sub/"), "{en}");
+			assert!(en.contains("extra"), "{en}");
+			assert!(!en.contains('路'), "{en}");
+			assert!(cx.debug_bounds("paste-restore-base").is_some());
+		}
+
+		/// The worker's suggestion is shown too, adjusting re-plans on the
+		/// worker, and its Apply writes the adjusted path (#240).
+		#[gpui::test]
+		fn remote_paste_shows_the_worker_restore_base_hint_and_adjusts(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let sub = shared.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			crate::paste::tests::git_init(&sub);
+			fs::write(sub.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&sub, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&sub, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			wait_remote_repo_loaded(&model, cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			remote_paste_preview(&model, cx, RESTORE_BASE_PAYLOAD);
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_some(),
+				"no restore-base hint row for the worker's suggestion"
+			);
+			click(cx, "paste-adjust");
+			for _ in 0..300 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			assert!(
+				!model.read_with(cx, |m, _| m.paste.is_loading()),
+				"the adjusted re-plan never landed"
+			);
+			let paths: Vec<String> = model.read_with(cx, |m, _| {
+				m.paste
+					.plan()
+					.unwrap()
+					.items
+					.iter()
+					.map(|i| i.path.clone())
+					.collect()
+			});
+			assert_eq!(paths, ["a.ts"]);
+
+			remote_paste_apply(&model, cx);
+			assert_eq!(fs::read_to_string(sub.join("a.ts")).unwrap(), "x");
+			assert!(!sub.join("sub").exists());
+		}
+
+		/// Stripping `sub/` makes both items `a.ts`, which the engine
+		/// refuses.
+		const RESTORE_BASE_COLLIDING_PAYLOAD: &str =
+			"// clipcode-root: mono\n// FILE: a.ts\ny\n// FILE: sub/a.ts\nx\n";
+
+		/// An adjusted plan the engine refuses keeps the hint row, so
+		/// [Use as-is] can undo the choice (#240).
+		#[gpui::test]
+		fn a_refused_adjusted_plan_keeps_the_hint_and_as_is_recovers(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "sub", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			paste(&model, cx, RESTORE_BASE_COLLIDING_PAYLOAD);
+			assert!(cx.debug_bounds("paste-restore-base").is_some());
+			click(cx, "paste-adjust");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("paste_err_plan")
+				);
+				assert!(plan.adjust_paths);
+			});
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_some(),
+				"the hint row vanished after the engine refused the plan"
+			);
+			click(cx, "paste-as-is");
+			settle(cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.error.is_none(), "{:?}", plan.error);
+				assert!(!plan.adjust_paths);
+				let paths: Vec<&str> =
+					plan.items.iter().map(|i| i.path.as_str()).collect();
+				assert_eq!(paths, ["a.ts", "sub/a.ts"]);
+			});
+		}
+
+		/// The same on a worker, whose refusal carries its suggestion.
+		#[gpui::test]
+		fn a_remote_refused_adjusted_plan_keeps_the_hint_and_as_is_recovers(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let sub = shared.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			crate::paste::tests::git_init(&sub);
+			fs::write(sub.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&sub, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&sub, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			wait_remote_repo_loaded(&model, cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			remote_paste_preview(&model, cx, RESTORE_BASE_COLLIDING_PAYLOAD);
+			assert!(cx.debug_bounds("paste-restore-base").is_some());
+			let wait_landed =
+				|model: &Entity<WorkbenchModel>, cx: &mut VisualTestContext| {
+					for _ in 0..300 {
+						settle(cx);
+						if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+							break;
+						}
+						std::thread::sleep(Duration::from_millis(10));
+					}
+					assert!(
+						!model.read_with(cx, |m, _| m.paste.is_loading()),
+						"the re-plan never landed"
+					);
+				};
+			click(cx, "paste-adjust");
+			wait_landed(&model, cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert_eq!(
+					plan.error.as_ref().map(|e| e.key),
+					Some("paste_err_plan")
+				);
+			});
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_some(),
+				"the hint row vanished after the worker refused the plan"
+			);
+			click(cx, "paste-as-is");
+			wait_landed(&model, cx);
+			model.read_with(cx, |m, _| {
+				let plan = m.paste.plan().unwrap();
+				assert!(plan.error.is_none(), "{:?}", plan.error);
+				assert!(!plan.adjust_paths);
+				let paths: Vec<&str> =
+					plan.items.iter().map(|i| i.path.as_str()).collect();
+				assert_eq!(paths, ["a.ts", "sub/a.ts"]);
+			});
+		}
+
+		/// The same path twice: the engine refuses the plan as it stands,
+		/// before any adjustment is chosen.
+		const RESTORE_BASE_REFUSED_PAYLOAD: &str =
+			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n// FILE: sub/a.ts\ny\n";
+
+		/// A first plan the engine refuses opens no preview, so there is no
+		/// hint row to leave behind (#240): the panel needs a plan to hang
+		/// the hint on, and it says why on the status line.
+		fn assert_first_plan_refused_without_a_panel(
+			model: &Entity<WorkbenchModel>,
+			cx: &mut VisualTestContext,
+		) {
+			let (open, loading, status) = model.read_with(cx, |m, _| {
+				(
+					m.paste.plan().is_some(),
+					m.paste.is_loading(),
+					m.status.clone(),
+				)
+			});
+			assert!(!open, "a refused first plan opened a preview");
+			assert!(!loading, "the refused first plan is still loading");
+			assert_eq!(
+				status.key, "paste_err_plan",
+				"the status does not say the plan was refused: {status:?}"
+			);
+			assert!(
+				cx.debug_bounds("paste-restore-base").is_none(),
+				"a hint row without a preview"
+			);
+		}
+
+		/// A first plan the engine refuses says the same on a worker as in
+		/// the folder itself: neither opens a preview or a hint row.
+		#[gpui::test]
+		fn a_first_plan_the_engine_refuses_opens_no_preview(
+			cx: &mut TestAppContext,
+		) {
+			let Some(_clip) = clipboard() else { return };
+			let ws = tempfile::tempdir().unwrap();
+			repo(ws.path(), "sub", &[]);
+			let (model, cx) = open(cx, ws.path().to_path_buf(), None);
+			settle(cx);
+			clip::write_text(RESTORE_BASE_REFUSED_PAYLOAD).unwrap();
+			cx.simulate_keystrokes("ctrl-v");
+			settle(cx);
+			assert_first_plan_refused_without_a_panel(&model, cx);
+		}
+
+		#[gpui::test]
+		fn a_remote_first_plan_the_worker_refuses_opens_no_preview(
+			cx: &mut TestAppContext,
+		) {
+			let _serial = remote_lock();
+			let Some(_clip) = clipboard() else { return };
+			let tmp = tempfile::tempdir().unwrap();
+			let shared = tmp.path().join("shared");
+			let sub = shared.join("sub");
+			fs::create_dir_all(&sub).unwrap();
+			crate::paste::tests::git_init(&sub);
+			fs::write(sub.join("init.txt"), "hello\n").unwrap();
+			crate::paste::tests::git_run(&sub, &["add", "init.txt"]);
+			crate::paste::tests::git_run(&sub, &["commit", "-m", "init"]);
+
+			let (model, cx, _worker) = open_remote(
+				cx,
+				&shared,
+				snip_remote::WorkerOptions {
+					name: "test-worker".into(),
+					..Default::default()
+				},
+			);
+			wait_remote_repo_loaded(&model, cx);
+			model.update(cx, |m, cx| m.select_repo(0, cx));
+			settle(cx);
+
+			clip::write_text(RESTORE_BASE_REFUSED_PAYLOAD).unwrap();
+			model.update(cx, |m, cx| m.trigger_paste_preview(cx));
+			for _ in 0..300 {
+				settle(cx);
+				if !model.read_with(cx, |m, _| m.paste.is_loading()) {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+			assert_first_plan_refused_without_a_panel(&model, cx);
 		}
 
 		/// Click the centre of the rendered control `id`, the way a user

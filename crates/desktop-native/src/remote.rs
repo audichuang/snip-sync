@@ -1721,6 +1721,7 @@ mod tests {
 				code,
 				message: "worker English".into(),
 				reason: None,
+				suggestion: None,
 			});
 			assert!(
 				matches!(
@@ -1792,6 +1793,7 @@ mod tests {
 			code: snip_remote::ErrorCode::NotFound,
 			message: "No such file or directory (os error 2)".into(),
 			reason: None,
+			suggestion: None,
 		};
 		assert_eq!(zh(gone()), "找不到遠端的資料夾或檔案，請確認路徑是否存在");
 		assert_eq!(
@@ -1851,6 +1853,7 @@ mod tests {
 			code,
 			message: os.into(),
 			reason: None,
+			suggestion: None,
 		};
 		for code in all {
 			for locale in [Locale::ZhTw, Locale::En] {

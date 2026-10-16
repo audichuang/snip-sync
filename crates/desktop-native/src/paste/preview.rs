@@ -45,7 +45,7 @@ pub enum Landed {
 	///
 	/// Invariant: whenever `Landed::Shown` is produced, `self.plan` is guaranteed to be `Some`.
 	Shown {
-		remap: Option<(String, bool)>,
+		remap: Option<Remap>,
 	},
 	Refused {
 		err: Msg,
@@ -394,6 +394,23 @@ impl PastePreview {
 		ordinary: Option<&Preview>,
 	) -> Remapped {
 		let keep = destination.is_none();
+		self.replan(ordinary, |plan| {
+			match destination {
+				Some(dest) => plan.choose_prefix_destination(&prefix, &dest),
+				None => plan.choose_keep_relative(&prefix),
+			}?;
+			Ok(Remap::Prefix { prefix, keep })
+		})
+	}
+
+	/// Re-plans the shell with a changed choice. The one path every choice
+	/// takes, so an older plan can never be applied while the new one is
+	/// still being built: the file plan is cleared and the UI disarmed first.
+	fn replan(
+		&mut self,
+		ordinary: Option<&Preview>,
+		choose: impl FnOnce(&mut PastePreviewPlan) -> Result<Remap, Msg>,
+	) -> Remapped {
 		self.invalidate_job();
 		let pool = self.pending.clone();
 		let mut pending = lock_pending(&pool);
@@ -403,20 +420,33 @@ impl PastePreview {
 		plan.clear_file_plan();
 		plan.error = None;
 		self.detail = None;
-		let chosen = match destination {
-			Some(dest) => plan.choose_prefix_destination(&prefix, &dest),
-			None => plan.choose_keep_relative(&prefix),
+		let remap = match choose(plan) {
+			Ok(remap) => remap,
+			Err(err) => {
+				release(&mut pending, ordinary, Some(plan), None);
+				return Remapped::Invalid(err);
+			}
 		};
-		if let Err(err) = chosen {
-			release(&mut pending, ordinary, Some(plan), None);
-			return Remapped::Invalid(err);
-		}
 		if let Err(err) = pending.admit_ui(ordinary, Some(plan), None) {
 			self.plan = None;
 			release(&mut pending, ordinary, None, None);
 			return Remapped::Dropped(err);
 		}
-		Remapped::Ready(PasteRequest::Remap { prefix, keep })
+		Remapped::Ready(PasteRequest::Remap(remap))
+	}
+
+	/// Re-plans with the restore-base hint's choice. Goes through
+	/// [`Self::replan`] like a prefix choice, so the plan planned without it
+	/// cannot be applied while the new one is built.
+	pub fn adjust_paths(
+		&mut self,
+		on: bool,
+		ordinary: Option<&Preview>,
+	) -> Remapped {
+		self.replan(ordinary, |plan| {
+			plan.choose_adjust_paths(on)?;
+			Ok(Remap::AdjustPaths(on))
+		})
 	}
 
 	pub fn toggle_overwrite(&mut self, idx: usize) -> Option<bool> {
@@ -1159,6 +1189,7 @@ mod tests {
 				code: ErrorCode::Busy,
 				message: "the worker is busy".into(),
 				reason: None,
+				suggestion: None,
 			},
 			|| nav = Some(s.select(1, Some(&o))),
 		);
@@ -1574,8 +1605,57 @@ mod tests {
 		let res2 = s.remap("repo-a".into(), None, None);
 		assert!(matches!(
 			res2,
-			Remapped::Ready(PasteRequest::Remap { keep: true, .. })
+			Remapped::Ready(PasteRequest::Remap(Remap::Prefix {
+				keep: true,
+				..
+			}))
 		));
+	}
+
+	#[test]
+	fn adjusting_paths_disarms_the_old_plan_until_the_replan_lands() {
+		let tmp = tempfile::tempdir().unwrap();
+		let dest = tmp.path().join("sub");
+		fs::create_dir(&dest).unwrap();
+		let mut s = landed(
+			"// clipcode-root: mono\n// FILE: sub/a.ts\nx\n",
+			&dest,
+			None,
+		);
+		let paths = |s: &PastePreview| -> Vec<String> {
+			s.plan()
+				.unwrap()
+				.items
+				.iter()
+				.map(|i| i.path.clone())
+				.collect()
+		};
+		assert_eq!(paths(&s), ["sub/a.ts"]);
+
+		let Remapped::Ready(req) = s.adjust_paths(true, None) else {
+			panic!("the hint is there, so the choice is accepted");
+		};
+		assert!(matches!(req, PasteRequest::Remap(Remap::AdjustPaths(true))));
+		// The plan made without the adjustment cannot be applied meanwhile.
+		assert!(s.plan().unwrap().items.is_empty());
+		assert!(!s.plan().unwrap().executable());
+		assert_eq!(s.begin_apply().err(), Some(ApplyRefused::NotExecutable));
+
+		s.enqueue(req).unwrap();
+		let (work, cancel) = s.start_job().unwrap().expect("job");
+		work.run(&RunOptions::default());
+		s.bind_job(2, cancel);
+		assert!(matches!(
+			s.poll(false, None),
+			Polled::Settled {
+				landed: Some(Landed::Shown {
+					remap: Some(Remap::AdjustPaths(true))
+				}),
+				..
+			}
+		));
+		assert_eq!(paths(&s), ["a.ts"]);
+		assert!(s.plan().unwrap().executable());
 	}
 
 	#[test]
